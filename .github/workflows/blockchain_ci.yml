@@ -15,6 +15,8 @@ on:
       - '.github/actions/setup/action.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
 
 env:
   # go needs absolute directories, using the $HOME variable doesn't work here.
@@ -27,7 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Setup Environment
         uses: ./.github/actions/setup
@@ -37,7 +41,7 @@ jobs:
 
       - name: Check for Changed Files
         id: verify-changed
-        uses: tj-actions/verify-changed-files@v20.0.4
+        uses: tj-actions/verify-changed-files@a1c6acee9df209257a246f2cc6ae8cb6581c1edf # v20.0.4
 
       - name: Fail if files changed
         if: steps.verify-changed.outputs.files_changed == 'true'
@@ -54,7 +58,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Setup Environment
         uses: ./.github/actions/setup

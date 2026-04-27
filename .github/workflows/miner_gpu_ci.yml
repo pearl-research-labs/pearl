@@ -25,9 +25,11 @@ jobs:
     outputs:
       should_run: ${{ steps.filter.outputs.should_run }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
         with:
           filters: |
             should_run:
@@ -49,7 +51,9 @@ jobs:
       label: ${{ steps.start.outputs.label }}
       ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - id: start
         uses: ./.github/actions/start-ec2-runner
         with:
@@ -73,19 +77,20 @@ jobs:
 
     steps:
     - name: Check out the repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       with:
         submodules: recursive
         fetch-depth: 1
+        persist-credentials: false
 
     - name: Fix Git ownership
       run: git config --global --add safe.directory ${{ github.workspace }}
 
     - name: Install Rust stable toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
 
     - name: Install vllm-miner
       working-directory: miner/vllm-miner
@@ -104,14 +109,14 @@ jobs:
     if: always() && needs.start-runner.result != 'skipped'
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           aws-region: ${{ vars.EC2_GPU_REGION }}
           aws-access-key-id: ${{ secrets.EC2_AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.EC2_AWS_SECRET_ACCESS_KEY }}
       - name: Stop EC2 runner
         if: needs.start-runner.outputs.ec2-instance-id != ''
-        uses: machulav/ec2-github-runner@v2
+        uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2
         with:
           mode: stop
           github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
