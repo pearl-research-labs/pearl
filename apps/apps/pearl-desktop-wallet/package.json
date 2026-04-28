@@ -79,7 +79,7 @@
     "react-qrcode-pretty": "^3.3.1",
     "react-resizable-panels": "^3.0.4",
     "react-router-dom": "^7.7.1",
-    "recharts": "2.15.0",
+    "recharts": "3.8.1",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.3.1",
     "tailwindcss-animate": "^1.0.7",
