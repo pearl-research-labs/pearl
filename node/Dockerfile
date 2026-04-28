@@ -3,7 +3,7 @@
 FROM rust:1.95.0-alpine AS rust-toolchain
 
 # ===== Go + Rust + Task toolchain: rarely changes, fully cached =====
-FROM golang:1.26.1-alpine AS toolchain
+FROM golang:1.26.2-alpine AS toolchain
 
 RUN apk add --no-cache \
     curl \
