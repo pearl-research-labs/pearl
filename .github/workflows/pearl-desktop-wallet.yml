@@ -76,32 +76,29 @@ jobs:
           persist-credentials: false
           ref: ${{ env.PR_HEAD_SHA }}
 
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
       - name: Extract versions
         id: version
         shell: bash
         env:
           VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          cd wallet
+          # Extract Go/Pearl version from constants without executing PR code
           if [ -n "$VERSION_OVERRIDE" ]; then
             GO_VERSION="$VERSION_OVERRIDE"
           else
-            echo 'package main; import "fmt"; func main() { fmt.Println(version()) }' > pv.go
-            GO_VERSION="v$(go run pv.go version.go)"
-            rm pv.go
+            VER_FILE="version/version.go"
+            MAJOR=$(grep -oP 'Major\s+uint\s*=\s*\K[0-9]+' "$VER_FILE")
+            MINOR=$(grep -oP 'Minor\s+uint\s*=\s*\K[0-9]+' "$VER_FILE")
+            PATCH=$(grep -oP 'Patch\s+uint\s*=\s*\K[0-9]+' "$VER_FILE")
+            PRE=$(grep -oP 'PreRelease\s*=\s*"\K[^"]*' "$VER_FILE")
+            GO_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+            if [ -n "$PRE" ]; then
+              GO_VERSION="${GO_VERSION}-${PRE}"
+            fi
           fi
           
-          ELECTRON_VERSION=$(node -p "require('../${{ env.APP_DIR }}/package.json').version")
+          # Extract Electron version via jq (no code execution)
+          ELECTRON_VERSION=$(jq -r .version "${{ env.APP_DIR }}/package.json")
           RELEASE_TAG="pearl-wallet-v${ELECTRON_VERSION}"
           
           echo "go_version=${GO_VERSION}" >> $GITHUB_OUTPUT
@@ -238,8 +235,8 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: 'pnpm'
-          cache-dependency-path: apps/pnpm-lock.yaml
+          # No cache — pull_request_target runs with secrets so shared caches are unsafe
+          # (a fork PR could poison the cache key in an unprivileged workflow)
 
       - name: Install workspace dependencies
         working-directory: apps
@@ -252,10 +249,11 @@ jobs:
       - name: Verify Windows outputs
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          VERSION: ${{ env.ELECTRON_VERSION }}
+          DIST: ${{ env.APP_DIR }}/dist
         run: |
-          $v    = "${{ env.ELECTRON_VERSION }}"
-          $dist = "${{ env.APP_DIR }}/dist"
-          $x64  = Join-Path $dist "Pearl-Wallet-Setup-$v.exe"
+          $x64 = Join-Path $env:DIST "Pearl-Wallet-Setup-$env:VERSION.exe"
           if (!(Test-Path $x64)) { throw "Missing file: $x64" }
 
       - name: Upload Windows installers
@@ -269,14 +267,15 @@ jobs:
       - name: Verify macOS outputs
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          VERSION: ${{ env.ELECTRON_VERSION }}
+          DIST: ${{ env.APP_DIR }}/dist
+          ARCH: ${{ matrix.goarch }}
         run: |
-          v='${{ env.ELECTRON_VERSION }}'
-          dist="${{ env.APP_DIR }}/dist"
-          
-          if [ "${{ matrix.goarch }}" = "amd64" ]; then
-            test -f "${dist}/Pearl Wallet-${v}.dmg" || { echo "Missing dmg (x64): ${dist}/Pearl Wallet-${v}.dmg"; exit 1; }
+          if [ "$ARCH" = "amd64" ]; then
+            test -f "${DIST}/Pearl Wallet-${VERSION}.dmg" || { echo "Missing dmg (x64): ${DIST}/Pearl Wallet-${VERSION}.dmg"; exit 1; }
           else
-            test -f "${dist}/Pearl Wallet-${v}-arm64.dmg" || { echo "Missing dmg (arm64): ${dist}/Pearl Wallet-${v}-arm64.dmg"; exit 1; }
+            test -f "${DIST}/Pearl Wallet-${VERSION}-arm64.dmg" || { echo "Missing dmg (arm64): ${DIST}/Pearl Wallet-${VERSION}-arm64.dmg"; exit 1; }
           fi
 
       - name: Upload macOS Intel installer
@@ -298,10 +297,11 @@ jobs:
       - name: Verify Linux outputs
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          VERSION: ${{ env.ELECTRON_VERSION }}
+          DIST: ${{ env.APP_DIR }}/dist
         run: |
-          v='${{ env.ELECTRON_VERSION }}'
-          dist="${{ env.APP_DIR }}/dist"
-          test -f "${dist}/pearl-desktop-wallet_${v}_amd64.deb" || { echo "Missing deb (amd64): ${dist}/pearl-desktop-wallet_${v}_amd64.deb"; exit 1; }
+          test -f "${DIST}/pearl-desktop-wallet_${VERSION}_amd64.deb" || { echo "Missing deb (amd64): ${DIST}/pearl-desktop-wallet_${VERSION}_amd64.deb"; exit 1; }
 
       - name: Upload Linux installers
         if: runner.os == 'Linux'
