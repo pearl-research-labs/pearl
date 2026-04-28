@@ -1,9 +1,10 @@
-name: Integration Tests CI
+name: "Integration Tests CI"
 
 on:
-  pull_request:
   merge_group:
     types: [checks_requested]
+  pull_request_target:
+    types: [labeled]
 
 permissions:
   id-token: write
@@ -15,15 +16,30 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
+  gate:
+    name: Check Approval Gate
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'pull_request_target' &&
+       contains(github.event.pull_request.labels.*.name, 'safe-to-test'))
+    steps:
+      - run: echo "Gate passed — event=${{ github.event_name }}"
+
   detect-changes:
     runs-on: ubuntu-latest
+    needs: gate
     outputs:
       should_run: ${{ steps.filter.outputs.should_run }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
+          ref: ${{ env.PR_HEAD_SHA }}
       - id: filter
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
         with:
@@ -39,13 +55,13 @@ jobs:
   start-runner:
     name: Start EC2 GPU Runner
     needs: detect-changes
-    # Run on merge_group OR if paths changed in PR
-    if: github.event_name == 'merge_group' || needs.detect-changes.outputs.should_run == 'true'
+    if: needs.detect-changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     outputs:
       label: ${{ steps.start.outputs.label }}
       ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
     steps:
+      # Intentionally checks out base branch — EC2 provisioning must use trusted code
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
@@ -64,7 +80,7 @@ jobs:
   integration-tests:
     name: Integration Tests
     needs: [detect-changes, start-runner]
-    if: always() && !cancelled() && (github.event_name == 'merge_group' || needs.detect-changes.outputs.should_run == 'true')
+    if: always() && !cancelled() && needs.detect-changes.outputs.should_run == 'true'
     runs-on: ${{ needs.start-runner.outputs.label || 'h100-gpu' }}
     timeout-minutes: 30
     container:
@@ -79,6 +95,7 @@ jobs:
           fetch-depth: 1
           clean: true
           persist-credentials: false
+          ref: ${{ env.PR_HEAD_SHA }}
 
       - name: Setup environment
         uses: ./.github/actions/setup
@@ -193,7 +210,6 @@ jobs:
             echo "No orphan EC2 instance found for run ${{ github.run_id }}"
           fi
 
-  # This job is what should be marked as required in branch protection
   integration-tests-status:
     name: Integration Tests Status
     runs-on: ubuntu-latest
@@ -202,7 +218,6 @@ jobs:
     steps:
       - name: Check integration tests result
         run: |
-          # Pass if tests were skipped (paths didn't match in PR) OR if tests succeeded
           if [ "${{ needs.integration-tests.result }}" == "skipped" ] || [ "${{ needs.integration-tests.result }}" == "success" ]; then
             echo "Integration tests passed or were not required"
             exit 0

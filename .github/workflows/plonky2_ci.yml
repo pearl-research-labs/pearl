@@ -2,9 +2,6 @@ name: Plonky2 Tests
 
 on:
   pull_request:
-    branches:
-      - master
-      - main
     paths:
       - 'plonky2/**'
       - '.github/workflows/plonky2_ci.yml'

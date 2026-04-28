@@ -120,6 +120,7 @@ jobs:
   release:
     needs: [version, build]
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
     env:

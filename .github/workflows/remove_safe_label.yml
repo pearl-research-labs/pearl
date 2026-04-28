@@ -1,0 +1,31 @@
+name: Remove safe-to-test label on new push
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  remove-label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                name: 'safe-to-test'
+              });
+              core.info('Removed safe-to-test label after new push');
+            } catch (e) {
+              if (e.status === 404) {
+                core.info('Label safe-to-test was not present — nothing to remove');
+              } else {
+                throw e;
+              }
+            }
