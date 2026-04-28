@@ -43,10 +43,10 @@
     "url": "https://github.com/pearl-research-labs/pearl/apps/packages/pearl-address-validation"
   },
   "devDependencies": {
-    "@arethetypeswrong/cli": "^0.17.3",
-    "@changesets/cli": "^2.27.12",
+    "@arethetypeswrong/cli": "^0.18.2",
+    "@changesets/cli": "^2.31.0",
     "@types/sha.js": "^2.4.0",
-    "prettier": "^3.5.1",
+    "prettier": "^3.8.3",
     "typescript": "^5.7.3",
     "vitest": "^3.0.5"
   },

@@ -8,8 +8,8 @@
   "license": "MIT",
   "dependencies": {
     "@next/eslint-plugin-next": "^15.4.6",
-    "@typescript-eslint/eslint-plugin": "^8.39.1",
-    "@typescript-eslint/parser": "^8.39.1",
+    "@typescript-eslint/eslint-plugin": "^8.59.1",
+    "@typescript-eslint/parser": "^8.59.1",
     "eslint": "^9.33.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-react": "^7.37.5",
