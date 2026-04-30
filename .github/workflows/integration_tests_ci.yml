@@ -7,7 +7,6 @@ on:
     types: [labeled]
 
 permissions:
-  id-token: write
   contents: read
   pull-requests: read
   packages: read
