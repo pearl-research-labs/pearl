@@ -2,6 +2,8 @@ name: "Miner CI: Lint & Unit Tests"
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read

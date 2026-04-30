@@ -31,13 +31,15 @@ jobs:
   gate:
     name: Check Approval Gate
     runs-on: ubuntu-latest
-    if: >
-      github.event_name == 'merge_group' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request_target' &&
-       contains(github.event.pull_request.labels.*.name, 'safe-to-test'))
     steps:
-      - run: echo "Gate passed — event=${{ github.event_name }}"
+      - name: Verify approval
+        run: |
+          if [[ "${{ github.event_name }}" == "merge_group" ]]; then exit 0; fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then exit 0; fi
+          if [[ "${{ github.event_name }}" == "pull_request_target" ]] \
+             && [[ "${{ contains(github.event.pull_request.labels.*.name, 'safe-to-test') }}" == "true" ]]; then exit 0; fi
+          echo "::error::Tier 2 requires merge_group, workflow_dispatch, or 'safe-to-test' label"
+          exit 1
 
   check:
     runs-on: ubuntu-latest

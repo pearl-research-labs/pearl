@@ -69,13 +69,9 @@ jobs:
 
       - name: Build
         run: task build:blockchain
-        env:
-          GOPRIVATE: github.com/pearl-research-labs/*
 
       - name: Test
         run: task test:go GOTESTSUM_FORMAT=pkgname-and-test-fails
-        env:
-          GOPRIVATE: github.com/pearl-research-labs/*
 
   ci_status:
     name: Blockchain CI Status
