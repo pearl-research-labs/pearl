@@ -9,80 +9,40 @@ updates:
     open-pull-requests-limit: 5
     labels: ["dependencies", "ci"]
     groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
+      all-actions:
+        patterns:
+          - "*"
 
-  # --- Go modules ---
+  # --- Go modules (single PR for all Go directories) ---
   - package-ecosystem: "gomod"
-    directory: "/"
+    directories:
+      - "/"
+      - "/tools"
+      - "/proxy/caddy-jsonrpc-cache"
     schedule:
       interval: "monthly"
     open-pull-requests-limit: 5
     labels: ["dependencies"]
     groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
+      all-go:
+        patterns:
+          - "*"
 
-  - package-ecosystem: "gomod"
-    directory: "/tools"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 3
-    labels: ["dependencies"]
-    groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
-
-  - package-ecosystem: "gomod"
-    directory: "/proxy/caddy-jsonrpc-cache"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 3
-    labels: ["dependencies"]
-    groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
-
-  # --- Rust / Cargo ---
+  # --- Rust / Cargo (single PR for all Cargo directories) ---
   - package-ecosystem: "cargo"
-    directory: "/zk-pow"
+    directories:
+      - "/zk-pow"
+      - "/pearl-blake3"
+      - "/plonky2"
+      - "/py-pearl-mining"
     schedule:
       interval: "monthly"
     open-pull-requests-limit: 5
     labels: ["dependencies"]
     groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
-
-  - package-ecosystem: "cargo"
-    directory: "/pearl-blake3"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 3
-    labels: ["dependencies"]
-    groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
-
-  - package-ecosystem: "cargo"
-    directory: "/plonky2"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 5
-    labels: ["dependencies"]
-    groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
-
-  - package-ecosystem: "cargo"
-    directory: "/py-pearl-mining"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 3
-    labels: ["dependencies"]
-    groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
+      all-rust:
+        patterns:
+          - "*"
 
   # --- Node / pnpm ---
   - package-ecosystem: "npm"
@@ -92,8 +52,9 @@ updates:
     open-pull-requests-limit: 5
     labels: ["dependencies"]
     groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
+      all-node:
+        patterns:
+          - "*"
 
   # --- Python (uv) ---
   - package-ecosystem: "uv"
@@ -103,27 +64,21 @@ updates:
     open-pull-requests-limit: 5
     labels: ["dependencies"]
     groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
+      all-python:
+        patterns:
+          - "*"
 
-  # --- Docker (key services only) ---
+  # --- Docker (single PR for all Dockerfiles) ---
   - package-ecosystem: "docker"
-    directory: "/node"
+    directories:
+      - "/node"
+      - "/wallet"
+      - "/miner/vllm-miner"
     schedule:
       interval: "monthly"
     open-pull-requests-limit: 3
     labels: ["dependencies"]
-
-  - package-ecosystem: "docker"
-    directory: "/wallet"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 3
-    labels: ["dependencies"]
-
-  - package-ecosystem: "docker"
-    directory: "/miner/vllm-miner"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 3
-    labels: ["dependencies"]
+    groups:
+      all-docker:
+        patterns:
+          - "*"
