@@ -1,16 +1,8 @@
 name: Blockchain / Build and Test
 on:
   pull_request:
-    paths:
-      - 'node/**'
-      - 'wallet/**'
-      - 'spv/**'
-      - 'zk-pow/**'
-      - 'plonky2/**'
-      - 'Taskfile.yml'
-      - 'go.mod'
-      - '.github/workflows/blockchain_ci.yml'
-      - '.github/actions/setup/action.yml'
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
@@ -21,14 +13,38 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # go needs absolute directories, using the $HOME variable doesn't work here.
   GOCACHE: /home/runner/work/go/pkg/build
   GOPATH: /home/runner/work/go
 
 jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.filter.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - id: filter
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
+        with:
+          filters: |
+            should_run:
+              - 'node/**'
+              - 'wallet/**'
+              - 'spv/**'
+              - 'zk-pow/**'
+              - 'plonky2/**'
+              - 'Taskfile.yml'
+              - 'go.mod'
+              - '.github/workflows/blockchain_ci.yml'
+              - '.github/actions/setup/action.yml'
+
   format-tidy:
     name: Format and Tidy
     runs-on: ubuntu-latest
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.should_run == 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -58,6 +74,8 @@ jobs:
   build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.should_run == 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
