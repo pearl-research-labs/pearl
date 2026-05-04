@@ -63,6 +63,11 @@ updates:
       interval: "monthly"
     open-pull-requests-limit: 5
     labels: ["dependencies"]
+    ignore:
+      - dependency-name: "maturin"
+      - dependency-name: "torch"
+      - dependency-name: "torchvision"
+      - dependency-name: "torchaudio"
     groups:
       all-python:
         patterns:
