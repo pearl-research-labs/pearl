@@ -57,7 +57,7 @@
     "@zxcvbn-ts/core": "^3.0.4",
     "@zxcvbn-ts/language-common": "^3.0.4",
     "@zxcvbn-ts/language-en": "^3.0.2",
-    "axios": "^1.11.0",
+    "axios": "^1.15.2",
     "bip32": "5.0.0-rc.0",
     "bip39": "^3.1.0",
     "bitcoinjs-lib": "^6.1.7",
