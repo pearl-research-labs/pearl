@@ -99,7 +99,7 @@
     "electron": "^32.2.0",
     "electron-builder": "^26.0.12",
     "electron-vite": "^4.0.0",
-    "postcss": "^8.5.6",
+    "postcss": "^8.5.10",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.9.2",
     "vite": "^7.1.0"
