@@ -10,6 +10,11 @@ updates:
     labels: ["dependencies", "ci"]
     groups:
       all-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      all-actions-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -25,6 +30,11 @@ updates:
     labels: ["dependencies"]
     groups:
       all-go:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      all-go-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -41,6 +51,11 @@ updates:
     labels: ["dependencies"]
     groups:
       all-rust:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      all-rust-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -53,6 +68,11 @@ updates:
     labels: ["dependencies"]
     groups:
       all-node:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      all-node-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -70,6 +90,11 @@ updates:
       - dependency-name: "torchaudio"
     groups:
       all-python:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      all-python-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -85,5 +110,10 @@ updates:
     labels: ["dependencies"]
     groups:
       all-docker:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      all-docker-security:
+        applies-to: security-updates
         patterns:
           - "*"
