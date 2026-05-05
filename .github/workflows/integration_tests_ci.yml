@@ -42,7 +42,7 @@ jobs:
           persist-credentials: false
           ref: ${{ env.PR_HEAD_SHA }}
       - id: filter
-        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         with:
           filters: |
             should_run:
@@ -108,7 +108,7 @@ jobs:
         run: task build:blockchain
 
       - name: Install uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Install miner packages
         run: uv sync --package vllm-miner --package pearl-gemm --no-editable --refresh
@@ -156,7 +156,7 @@ jobs:
 
       - name: Upload vLLM logs on failure
         if: failure() && steps.vllm_tests.outcome == 'failure'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vllm-integration-logs
           path: /tmp/pytest-vllm/
@@ -182,7 +182,7 @@ jobs:
     if: always() && needs.start-runner.result != 'skipped'
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
           aws-region: ${{ vars.EC2_GPU_REGION }}
           aws-access-key-id: ${{ secrets.EC2_AWS_ACCESS_KEY_ID }}

@@ -59,6 +59,7 @@ jemallocator = "0.5.0"
 
 [[bin]]
 name = "generate_constants"
+path = "src/bin/generate_constants.rs"
 required-features = ["rand_chacha"]
 
 [[bench]]
