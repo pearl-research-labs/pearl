@@ -83,8 +83,9 @@ type GetBlockVerboseResult struct {
 	Time          int64         `json:"time"`
 	Bits          string        `json:"bits"`
 	Difficulty    float64       `json:"difficulty"`
-	PreviousHash  string        `json:"previousblockhash"`
-	NextHash      string        `json:"nextblockhash,omitempty"`
+	PreviousHash     string        `json:"previousblockhash"`
+	NextHash         string        `json:"nextblockhash,omitempty"`
+	ProofCommitment  string        `json:"proofcommitment"`
 }
 
 // GetBlockVerboseTxResult models the data from the getblock command when the
@@ -107,8 +108,9 @@ type GetBlockVerboseTxResult struct {
 	Time          int64         `json:"time"`
 	Bits          string        `json:"bits"`
 	Difficulty    float64       `json:"difficulty"`
-	PreviousHash  string        `json:"previousblockhash"`
-	NextHash      string        `json:"nextblockhash,omitempty"`
+	PreviousHash     string        `json:"previousblockhash"`
+	NextHash         string        `json:"nextblockhash,omitempty"`
+	ProofCommitment  string        `json:"proofcommitment"`
 }
 
 // GetChainTipsResult models the data from the getchaintips command.
