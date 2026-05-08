@@ -28,8 +28,9 @@ type GetBlockHeaderVerboseResult struct {
 	Time          int64   `json:"time"`
 	Bits          string  `json:"bits"`
 	Difficulty    float64 `json:"difficulty"`
-	PreviousHash  string  `json:"previousblockhash,omitempty"`
-	NextHash      string  `json:"nextblockhash,omitempty"`
+	PreviousHash     string  `json:"previousblockhash,omitempty"`
+	NextHash         string  `json:"nextblockhash,omitempty"`
+	ProofCommitment  string  `json:"proofcommitment"`
 }
 
 // GetBlockStatsResult models the data from the getblockstats command.

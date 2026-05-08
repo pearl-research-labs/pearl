@@ -1363,7 +1363,8 @@ func handleGetBlockHeader(s *rpcServer, cmd interface{}, closeChan <-chan struct
 		PreviousHash:  blockHeader.PrevBlock.String(),
 		Time:          blockHeader.Timestamp.Unix(),
 		Bits:          strconv.FormatInt(int64(blockHeader.Bits), 16),
-		Difficulty:    getDifficultyRatio(blockHeader.Bits, params),
+		Difficulty:      getDifficultyRatio(blockHeader.Bits, params),
+		ProofCommitment: blockHeader.ProofCommitment.String(),
 	}
 	return blockHeaderReply, nil
 }
