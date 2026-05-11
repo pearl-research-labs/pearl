@@ -330,7 +330,10 @@ func (sm *SyncManager) startSync() {
 	// but it is safe to use as a negative filter: a peer at our
 	// height (or below) has nothing to offer as a syncPeer.
 	if bestPeer != nil && bestPeer.LastBlock() <= best.Height {
-		bestPeer = nil
+		log.Debugf("Skipping sync: candidate %s advertises "+
+			"height %d, our best is %d",
+			bestPeer.Addr(), bestPeer.LastBlock(), best.Height)
+		return
 	}
 
 	// Start syncing from the best peer if one was selected.
