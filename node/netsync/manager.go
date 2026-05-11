@@ -325,6 +325,14 @@ func (sm *SyncManager) startSync() {
 	best := sm.chain.BestSnapshot()
 	bestPeer := sm.pickSyncCandidate()
 
+	// Skip peers that don't claim to have more blocks than us.
+	// LastBlock() is unauthenticated so it is not used for ranking,
+	// but it is safe to use as a negative filter: a peer at our
+	// height (or below) has nothing to offer as a syncPeer.
+	if bestPeer != nil && bestPeer.LastBlock() <= best.Height {
+		bestPeer = nil
+	}
+
 	// Start syncing from the best peer if one was selected.
 	if bestPeer != nil {
 		// Clear the requestedBlocks if the sync peer changes, otherwise
