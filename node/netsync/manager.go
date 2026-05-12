@@ -48,6 +48,14 @@ const (
 	// sync has stalled.
 	stallSampleInterval = 30 * time.Second
 
+	// headerProgressGrace is the amount of stall-budget credited per
+	// validated header received during headers-first sync. It is sized so
+	// that a full wire.MaxBlockHeadersPerMsg batch credits exactly
+	// maxStallDuration, while a malicious peer that trickle-feeds fewer
+	// headers per round only earns a proportional fraction of the budget
+	// and cannot indefinitely hold the sync slot.
+	headerProgressGrace = maxStallDuration / wire.MaxBlockHeadersPerMsg
+
 	// syncPeerCooldown is how long an address that stalled as syncnode
 	// is excluded from re-selection.
 	syncPeerCooldown = 10 * time.Minute
@@ -1025,14 +1033,22 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 	}
 
-	// Update the last progress time to prevent the stall handler from
-	// disconnecting the sync peer during the headers-only phase of
-	// headers-first sync. Without this, lastProgressTime only ticks when a
-	// full block is accepted (handleBlockMsg), so a headers-only window
-	// longer than maxStallDuration would trip the stall handler even though
-	// the peer is actively delivering valid, checkpoint-bound headers.
+	// Credit progress proportionally to the number of validated headers
+	// received, capped at time.Now(). A legitimate sync peer always fills
+	// batches to wire.MaxBlockHeadersPerMsg, so a full batch resets the
+	// stall window. A peer that trickle-feeds a small number of headers
+	// per round only earns a proportional fraction of the budget and is
+	// dropped by the stall handler instead of holding the sync slot
+	// indefinitely. Without any credit, lastProgressTime would only tick
+	// in handleBlockMsg, so legitimate headers-first sync to a far
+	// checkpoint would trip the stall handler before any block lands.
 	if peer == sm.syncPeer {
-		sm.lastProgressTime = time.Now()
+		grace := time.Duration(numHeaders) * headerProgressGrace
+		newProgress := sm.lastProgressTime.Add(grace)
+		if now := time.Now(); newProgress.After(now) {
+			newProgress = now
+		}
+		sm.lastProgressTime = newProgress
 	}
 
 	// When this header is a checkpoint, switch to fetching the blocks for
