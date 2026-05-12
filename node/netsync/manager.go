@@ -325,15 +325,24 @@ func (sm *SyncManager) startSync() {
 	best := sm.chain.BestSnapshot()
 	bestPeer := sm.pickSyncCandidate()
 
-	// Skip peers that don't claim to have more blocks than us.
-	// LastBlock() is unauthenticated so it is not used for ranking,
-	// but it is safe to use as a negative filter: a peer at our
-	// height (or below) has nothing to offer as a syncPeer.
-	if bestPeer != nil && bestPeer.LastBlock() <= best.Height {
-		log.Debugf("Skipping sync: candidate %s advertises "+
-			"height %d, our best is %d",
-			bestPeer.Addr(), bestPeer.LastBlock(), best.Height)
-		return
+	// Skip peers that have nothing new to offer. If the peer announced
+	// a block we already have, skip it. Otherwise fall back to the
+	// version-message height: a peer at or below our height is skipped.
+	if bestPeer != nil {
+		if announced := bestPeer.LastAnnouncedBlock(); announced != nil {
+			if have, _ := sm.chain.HaveBlock(announced); have {
+				log.Debugf("Skipping sync: candidate %s only "+
+					"announced blocks we already have",
+					bestPeer.Addr())
+				return
+			}
+		} else if bestPeer.LastBlock() <= best.Height {
+			log.Debugf("Skipping sync: candidate %s advertises "+
+				"height %d, our best is %d",
+				bestPeer.Addr(), bestPeer.LastBlock(),
+				best.Height)
+			return
+		}
 	}
 
 	// Start syncing from the best peer if one was selected.
