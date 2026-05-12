@@ -1114,6 +1114,20 @@ func (b *BlockChain) ChainParams() *chaincfg.Params {
 	return b.chainParams
 }
 
+// CheckHeaderSanity is the header-only equivalent of CheckBlockSanity,
+// wired with the chain's own time source and chain parameters.
+func (b *BlockChain) CheckHeaderSanity(header *wire.BlockHeader,
+	cert wire.BlockCertificate) error {
+
+	return CheckBlockHeaderSanity(
+		header, cert,
+		b.chainParams.PowLimit,
+		b.timeSource,
+		b.chainParams.MaxTimeOffsetMinutes,
+		BFNone,
+	)
+}
+
 // VerifyCheckpoint checks that the height and hash match the stored
 // checkpoints.
 //

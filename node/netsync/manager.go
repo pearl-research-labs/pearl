@@ -48,14 +48,6 @@ const (
 	// sync has stalled.
 	stallSampleInterval = 30 * time.Second
 
-	// headerProgressGrace is the amount of stall-budget credited per
-	// validated header received during headers-first sync. It is sized so
-	// that a full wire.MaxBlockHeadersPerMsg batch credits exactly
-	// maxStallDuration, while a malicious peer that trickle-feeds fewer
-	// headers per round only earns a proportional fraction of the budget
-	// and cannot indefinitely hold the sync slot.
-	headerProgressGrace = maxStallDuration / wire.MaxBlockHeadersPerMsg
-
 	// syncPeerCooldown is how long an address that stalled as syncnode
 	// is excluded from re-selection.
 	syncPeerCooldown = 10 * time.Minute
@@ -985,6 +977,18 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		blockHash := blockHeader.BlockHash()
 		finalHash = &blockHash
 
+		// Verify proof of work and certificate per header. getheaders
+		// always requests certificates, so a missing or invalid one
+		// is a protocol violation.
+		if err := sm.chain.CheckHeaderSanity(
+			blockHeader, msgHeader.BlockCertificate(),
+		); err != nil {
+			log.Warnf("Header from peer %s failed sanity check: "+
+				"%v -- disconnecting", peer.Addr(), err)
+			peer.Disconnect()
+			return
+		}
+
 		// Ensure there is a previous header to compare against.
 		prevNodeEl := sm.headerList.Back()
 		if prevNodeEl == nil {
@@ -1033,22 +1037,12 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 	}
 
-	// Credit progress proportionally to the number of validated headers
-	// received, capped at time.Now(). A legitimate sync peer always fills
-	// batches to wire.MaxBlockHeadersPerMsg, so a full batch resets the
-	// stall window. A peer that trickle-feeds a small number of headers
-	// per round only earns a proportional fraction of the budget and is
-	// dropped by the stall handler instead of holding the sync slot
-	// indefinitely. Without any credit, lastProgressTime would only tick
-	// in handleBlockMsg, so legitimate headers-first sync to a far
-	// checkpoint would trip the stall handler before any block lands.
+	// Tick the stall clock now that the sync peer has delivered a batch
+	// of fully verified headers. Otherwise the stall handler could
+	// disconnect the peer during a long headers-first window before any
+	// block lands.
 	if peer == sm.syncPeer {
-		grace := time.Duration(numHeaders) * headerProgressGrace
-		newProgress := sm.lastProgressTime.Add(grace)
-		if now := time.Now(); newProgress.After(now) {
-			newProgress = now
-		}
-		sm.lastProgressTime = newProgress
+		sm.lastProgressTime = time.Now()
 	}
 
 	// When this header is a checkpoint, switch to fetching the blocks for
