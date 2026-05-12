@@ -1025,6 +1025,16 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 	}
 
+	// Update the last progress time to prevent the stall handler from
+	// disconnecting the sync peer during the headers-only phase of
+	// headers-first sync. Without this, lastProgressTime only ticks when a
+	// full block is accepted (handleBlockMsg), so a headers-only window
+	// longer than maxStallDuration would trip the stall handler even though
+	// the peer is actively delivering valid, checkpoint-bound headers.
+	if peer == sm.syncPeer {
+		sm.lastProgressTime = time.Now()
+	}
+
 	// When this header is a checkpoint, switch to fetching the blocks for
 	// all of the headers since the last checkpoint.
 	if receivedCheckpoint {
