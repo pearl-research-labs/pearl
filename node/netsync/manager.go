@@ -980,6 +980,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
+	// Only the sync peer may drive the headers-first state machine;
+	// other peers' headers can race sm.headerList and break linkage for
+	// the sync peer's legitimate batches.
+	if peer != sm.syncPeer {
+		return
+	}
+
 	// Nothing to do for an empty headers message.
 	if numHeaders == 0 {
 		return
@@ -993,6 +1000,18 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		blockHeader := &msgHeader.BlockHeader
 		blockHash := blockHeader.BlockHash()
 		finalHash = &blockHash
+
+		// Verify proof of work and certificate per header. getheaders
+		// always requests certificates, so a missing or invalid one
+		// is a protocol violation.
+		if err := sm.chain.CheckHeaderSanity(
+			blockHeader, msgHeader.BlockCertificate(),
+		); err != nil {
+			log.Warnf("Header from peer %s failed sanity check: "+
+				"%v -- disconnecting", peer.Addr(), err)
+			peer.Disconnect()
+			return
+		}
 
 		// Ensure there is a previous header to compare against.
 		prevNodeEl := sm.headerList.Back()
@@ -1040,6 +1059,16 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			}
 			break
 		}
+	}
+
+	// Tick the stall clock only for full batches or the final batch that
+	// reaches the next checkpoint. The producer always fills batches to
+	// MaxBlockHeadersPerMsg until it runs into a stop condition, so an
+	// undersized non-final batch is the producer's signal that no real
+	// progress remains -- a peer trickling small batches to extend the
+	// stall window earns no credit and gets rotated by the stall handler.
+	if numHeaders == wire.MaxBlockHeadersPerMsg || receivedCheckpoint {
+		sm.lastProgressTime = time.Now()
 	}
 
 	// When this header is a checkpoint, switch to fetching the blocks for

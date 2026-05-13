@@ -22,6 +22,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testWaitTimeout bounds how long any single signal/message wait may block
+// before the test is failed. Sized generously so loaded CI runners don't
+// flake on goroutine scheduling delays -- locally these waits complete in
+// well under 10ms.
+const testWaitTimeout = 5 * time.Second
+
 // conn mocks a network connection by implementing the net.Conn interface.
 type conn struct {
 	io.Reader
@@ -216,7 +222,7 @@ func TestPeerConnection(t *testing.T) {
 	// Each peer fires 2 signals: OnVerAck (received) + OnWrite(verack sent).
 	// 2 peers x 2 signals = 4 total.
 	for i := 0; i < 4; i++ {
-		waitForSignal(t, verack, time.Second, "verack signal %d", i)
+		waitForSignal(t, verack, testWaitTimeout, "verack signal %d", i)
 	}
 
 	wantUA := wire.DefaultUserAgent + "peer:1.0(comment)/"
@@ -300,7 +306,7 @@ func TestPeerListeners(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 2; i++ {
-		waitForSignal(t, verack, time.Second, "verack timeout")
+		waitForSignal(t, verack, testWaitTimeout, "verack timeout")
 	}
 
 	// During the handshake, inPeer's OnVersion and OnSendAddrV2 listeners
@@ -367,7 +373,7 @@ func TestPeerListeners(t *testing.T) {
 			case msg := <-ok:
 				assert.Equal(t, tt.msg.Command(), msg.Command(),
 					"expected %s callback to fire", tt.listener)
-			case <-time.After(time.Second):
+			case <-time.After(testWaitTimeout):
 				t.Fatalf("timeout waiting for %s", tt.listener)
 			}
 		})
@@ -411,7 +417,7 @@ func TestOutboundPeer(t *testing.T) {
 			p.WaitForDisconnect()
 			close(disconnected)
 		}()
-		waitForSignal(t, disconnected, 5*time.Second, "peer did not disconnect")
+		waitForSignal(t, disconnected, testWaitTimeout, "peer did not disconnect")
 
 		assert.False(t, p.Connected())
 
@@ -532,19 +538,19 @@ func TestDuplicateVersionMsg(t *testing.T) {
 
 	// One verack per peer direction.
 	for i := 0; i < 2; i++ {
-		waitForSignal(t, verack, time.Second, "verack timeout")
+		waitForSignal(t, verack, testWaitTimeout, "verack timeout")
 	}
 
 	done := make(chan struct{})
 	outPeer.QueueMessage(&wire.MsgVersion{}, done)
-	waitForSignal(t, done, time.Second, "send duplicate version timeout")
+	waitForSignal(t, done, testWaitTimeout, "send duplicate version timeout")
 
 	disconnected := make(chan struct{}, 1)
 	go func() {
 		inPeer.WaitForDisconnect()
 		close(disconnected)
 	}()
-	waitForSignal(t, disconnected, time.Second,
+	waitForSignal(t, disconnected, testWaitTimeout,
 		"inPeer did not disconnect after receiving duplicate version")
 }
 
@@ -580,7 +586,7 @@ func TestUpdateLastBlockHeight(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 2; i++ {
-		waitForSignal(t, verack, time.Second, "verack timeout")
+		waitForSignal(t, verack, testWaitTimeout, "verack timeout")
 	}
 
 	assert.Equal(t, int32(remotePeerHeight), localPeer.LastBlock(),
