@@ -127,4 +127,19 @@ func TestProcessBlock_CheckpointDifficulty(t *testing.T) {
 					"with ErrDifficultyTooLow, got %v", okRuleErr.ErrorCode)
 		}
 	}
+
+	// Sub-checkpoint fork: a block whose parent is below the checkpoint
+	// height must be rejected with ErrForkTooOld, not the difficulty or
+	// timestamp floor.
+	subCheckpointParent := blocks[0].Hash()
+	_, _, err = chain.ProcessBlock(
+		makeTestBlock(chain.chainParams.PowLimitBits, *subCheckpointParent),
+		BFNoPoWCheck,
+	)
+	require.Error(t, err)
+	var subErr RuleError
+	require.ErrorAs(t, err, &subErr)
+	assert.Equal(t, ErrForkTooOld, subErr.ErrorCode,
+		"sub-checkpoint fork should be rejected with ErrForkTooOld, "+
+			"got %v", subErr.ErrorCode)
 }

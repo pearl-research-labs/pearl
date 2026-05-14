@@ -346,64 +346,81 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
-	best := sm.chain.BestSnapshot()
 	bestPeer := sm.pickSyncCandidate()
+	if bestPeer == nil {
+		log.Warnf("No sync peer candidates available")
+		return
+	}
 
-	// Start syncing from the best peer if one was selected.
-	if bestPeer != nil {
-		// Clear the requestedBlocks if the sync peer changes, otherwise
-		// we may ignore blocks we need that the last sync peer failed
-		// to send.
-		sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+	best := sm.chain.BestSnapshot()
 
-		locator, err := sm.chain.LatestBlockLocator()
-		if err != nil {
-			log.Errorf("Failed to get block locator for the "+
-				"latest block: %v", err)
+	// Skip peers that have nothing new to offer. If the peer announced
+	// a block we already have, skip it. Otherwise fall back to the
+	// version-message height: a peer at or below our height is skipped.
+	if announced := bestPeer.LastAnnouncedBlock(); announced != nil {
+		if have, _ := sm.chain.HaveBlock(announced); have {
+			log.Debugf("Skipping sync: candidate %s only "+
+				"announced blocks we already have",
+				bestPeer.Addr())
 			return
 		}
-
-		log.Infof("Syncing to block height %d from peer %v",
-			bestPeer.LastBlock(), bestPeer.Addr())
-
-		// When the current height is less than a known checkpoint we
-		// can use block headers to learn about which blocks comprise
-		// the chain up to the checkpoint and perform less validation
-		// for them.  This is possible since each header contains the
-		// hash of the previous header and a merkle root.  Therefore if
-		// we validate all of the received headers link together
-		// properly and the checkpoint hashes match, we can be sure the
-		// hashes for the blocks in between are accurate.  Further, once
-		// the full blocks are downloaded, the merkle root is computed
-		// and compared against the value in the header which proves the
-		// full block hasn't been tampered with.
-		//
-		// Once we have passed the final checkpoint, or checkpoints are
-		// disabled, use standard inv messages learn about the blocks
-		// and fully validate them.  Finally, regression test mode does
-		// not support the headers-first approach so do normal block
-		// downloads when in regression test mode.
-		if sm.nextCheckpoint != nil &&
-			best.Height < sm.nextCheckpoint.Height &&
-			sm.chainParams != &chaincfg.RegressionNetParams {
-
-			bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
-			sm.headersFirstMode = true
-			log.Infof("Downloading headers for blocks %d to "+
-				"%d from peer %s", best.Height+1,
-				sm.nextCheckpoint.Height, bestPeer.Addr())
-		} else {
-			bestPeer.PushGetBlocksMsg(locator, &zeroHash)
-		}
-		sm.syncPeer = bestPeer
-
-		// Reset the last progress time now that we have a non-nil
-		// syncPeer to avoid instantly detecting it as stalled in the
-		// event the progress time hasn't been updated recently.
-		sm.lastProgressTime = time.Now()
-	} else {
-		log.Warnf("No sync peer candidates available")
+	} else if bestPeer.LastBlock() <= best.Height {
+		log.Debugf("Skipping sync: candidate %s advertises "+
+			"height %d, our best is %d",
+			bestPeer.Addr(), bestPeer.LastBlock(), best.Height)
+		return
 	}
+
+	// Clear the requestedBlocks if the sync peer changes, otherwise
+	// we may ignore blocks we need that the last sync peer failed
+	// to send.
+	sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+
+	locator, err := sm.chain.LatestBlockLocator()
+	if err != nil {
+		log.Errorf("Failed to get block locator for the "+
+			"latest block: %v", err)
+		return
+	}
+
+	log.Infof("Syncing to block height %d from peer %v",
+		bestPeer.LastBlock(), bestPeer.Addr())
+
+	// When the current height is less than a known checkpoint we
+	// can use block headers to learn about which blocks comprise
+	// the chain up to the checkpoint and perform less validation
+	// for them.  This is possible since each header contains the
+	// hash of the previous header and a merkle root.  Therefore if
+	// we validate all of the received headers link together
+	// properly and the checkpoint hashes match, we can be sure the
+	// hashes for the blocks in between are accurate.  Further, once
+	// the full blocks are downloaded, the merkle root is computed
+	// and compared against the value in the header which proves the
+	// full block hasn't been tampered with.
+	//
+	// Once we have passed the final checkpoint, or checkpoints are
+	// disabled, use standard inv messages learn about the blocks
+	// and fully validate them.  Finally, regression test mode does
+	// not support the headers-first approach so do normal block
+	// downloads when in regression test mode.
+	if sm.nextCheckpoint != nil &&
+		best.Height < sm.nextCheckpoint.Height &&
+		sm.chainParams != &chaincfg.RegressionNetParams {
+
+		bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
+		sm.headersFirstMode = true
+		log.Infof("Downloading headers for blocks %d to "+
+			"%d from peer %s", best.Height+1,
+			sm.nextCheckpoint.Height, bestPeer.Addr())
+	} else {
+		bestPeer.PushGetBlocksMsg(locator, &zeroHash)
+	}
+	sm.syncPeer = bestPeer
+
+	// Reset the last progress time now that we have a non-nil
+	// syncPeer to avoid instantly detecting it as stalled in the
+	// event the progress time hasn't been updated recently.
+	sm.lastProgressTime = time.Now()
 }
 
 // isSyncCandidate returns whether or not the peer is a candidate to consider
