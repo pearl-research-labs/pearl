@@ -182,6 +182,19 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 		return false, false, err
 	}
 	if checkpointNode != nil {
+		// Reject blocks that fork the chain before the previous
+		// checkpoint. Orphans (parent not in our index) are deferred
+		// and re-evaluated when the parent arrives.
+		if prevNode := b.index.LookupNode(&blockHeader.PrevBlock); prevNode != nil &&
+			prevNode.height+1 < checkpointNode.height {
+
+			str := fmt.Sprintf("block at height %d forks the main "+
+				"chain before the previous checkpoint at "+
+				"height %d", prevNode.height+1,
+				checkpointNode.height)
+			return false, false, ruleError(ErrForkTooOld, str)
+		}
+
 		// Ensure the block timestamp is after the checkpoint timestamp.
 		checkpointTime := time.Unix(checkpointNode.timestamp, 0)
 		if blockHeader.Timestamp.Before(checkpointTime) {
