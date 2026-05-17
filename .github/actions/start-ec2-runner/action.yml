@@ -69,7 +69,7 @@ runs:
         # are interpreted by bash at write time, not at execution time.
         # Always use single quotes for strings and inline paths directly.
         #
-          # The AWS Deep Learning AMI initializes the p5.4xlarge ephemeral
+        # The AWS Deep Learning AMI initializes the p5.4xlarge ephemeral
         # NVMe SSD itself via dlami-nvme.service and mounts it at
         # /opt/dlami/nvme. Do not format /dev/nvme1n1 here: it is already
         # an LVM physical volume by the time this script runs.
