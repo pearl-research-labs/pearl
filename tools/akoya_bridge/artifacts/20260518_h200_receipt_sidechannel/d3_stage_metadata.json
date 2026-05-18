@@ -1,0 +1,74 @@
+{
+  "claimed_hash": "5a8906e9bea33eb8ef4217b085f684fcbf80ed34c8396acbdeb7cdb169b32fda",
+  "compact_result_bytes": 64,
+  "frame_bytes": 274476,
+  "frame_path": "/workspace/overnight/d3-hardy-split-20260518T181420Z/stage/type3_plain_proof_share.msgpack",
+  "frame_sha256": "068586f2edc38b1a13b3ed9010c9eaa647c730a2ca297c50e7f4ef8da0db4337",
+  "header_bytes": 76,
+  "mining_config_bytes": 52,
+  "note": "This stages serializer/protocol bytes only. A public-pool accepted share still requires share_verify.valid=true for the live job difficulty and a type-4 accepted response.",
+  "plain_proof_base64_bytes": 187648,
+  "plain_verify": {
+    "message": "Mining solution verified successfully",
+    "nbits": 507510783,
+    "valid": true
+  },
+  "roundtrip_validation": {
+    "a_leaf_count": 4,
+    "a_sibling_count": 15,
+    "b_leaf_count": 128,
+    "b_sibling_count": 71,
+    "cols_count": 64,
+    "cols_head": [
+      12032,
+      12033,
+      12040,
+      12041,
+      12048,
+      12049,
+      12056,
+      12057
+    ],
+    "common_dim": 2048,
+    "rank": 128,
+    "rows": [
+      339,
+      347
+    ],
+    "share_id": "00000000-0000-4000-8000-000000000005"
+  },
+  "schema": "akoya_type3_stage.v1",
+  "seed_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "share_difficulty": 507510783,
+  "share_id": "00000000-0000-4000-8000-000000000005",
+  "share_verify": {
+    "message": "Mining solution verified successfully",
+    "nbits": 507510783,
+    "valid": true
+  },
+  "summary": "/workspace/overnight/ako012-20260518T175107Z/direct_run/summary.json",
+  "validation": {
+    "a_leaf_count": 4,
+    "a_sibling_count": 15,
+    "b_leaf_count": 128,
+    "b_sibling_count": 71,
+    "cols_count": 64,
+    "cols_head": [
+      12032,
+      12033,
+      12040,
+      12041,
+      12048,
+      12049,
+      12056,
+      12057
+    ],
+    "common_dim": 2048,
+    "rank": 128,
+    "rows": [
+      339,
+      347
+    ],
+    "share_id": "00000000-0000-4000-8000-000000000005"
+  }
+}

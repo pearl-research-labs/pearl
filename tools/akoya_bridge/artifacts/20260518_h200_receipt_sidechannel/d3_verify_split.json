@@ -1,0 +1,13 @@
+{
+  "a_rows": 2,
+  "b_cols": 64,
+  "k": 2048,
+  "m": 8192,
+  "message": "Mining solution verified successfully",
+  "n": 32768,
+  "nbits": 507510783,
+  "ok": true,
+  "plain_proof_base64_bytes": 187648,
+  "rank": 128,
+  "summary": "/workspace/overnight/ako012-20260518T175107Z/direct_run/summary.json"
+}

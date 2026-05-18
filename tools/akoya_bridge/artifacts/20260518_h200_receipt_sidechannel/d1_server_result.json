@@ -1,0 +1,43 @@
+{
+  "accepted": true,
+  "client_addr": [
+    "127.0.0.1",
+    42178
+  ],
+  "finished_at": 1779126857.655383,
+  "host": "127.0.0.1",
+  "job": {
+    "height": 1,
+    "job_uuid": "a7541fdb-006d-4863-94d0-899f8ee87212",
+    "seed_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "message": "Mining solution verified successfully",
+  "network_nbits": 545259519,
+  "port": 3334,
+  "register": {
+    "gpu_name": "Codex H200 Direct",
+    "wallet": "",
+    "worker": ""
+  },
+  "schema": "akoya_soft_pool_server.v1",
+  "share_difficulty": 507510783,
+  "share_id": "f428aa13-f3f3-47a7-9737-69408106effe",
+  "started_at": 1779126667.9519358,
+  "verification": {
+    "a_noise_seed": "8340b7638909cb246a6041399035eed12ec0953024ff084d32ea9b6ad3577e8f",
+    "b_noise_seed": "3216506aa56105449dbcd73cb7ae677bf5cdda9e53720791bbe48ca99a1dc2ee",
+    "field6_matches_canonical_jackpot": true,
+    "field7_matches_canonical_hash": true,
+    "hash_a": "812fab55b5c825d14879dfd903be30026bcc479f32d425c7141d3b79beec4ca3",
+    "hash_b": "da9c9996483781d0637fc695416d67cbbce68231e3695a6e77071e91c518e048",
+    "job_key": "c18ae268d36170a398026290cdaf29426e54a32dcc367333cd0ac72e20763e03",
+    "k": 2048,
+    "m": 8192,
+    "message": "Mining solution verified successfully",
+    "n": 32768,
+    "ok": true,
+    "rank": 128,
+    "share_difficulty": 507510783,
+    "share_id": "f428aa13-f3f3-47a7-9737-69408106effe"
+  }
+}

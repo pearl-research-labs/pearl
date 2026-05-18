@@ -1,0 +1,464 @@
+{
+  "created_at_utc": "2026-05-18T18:13:05Z",
+  "paired_canary_artifact": "n/a",
+  "promotion_class": "diagnostic_only",
+  "proof_mode": "invalid_diagnostic",
+  "proof_provenance": {
+    "paired_canary_artifact": "n/a",
+    "promotion_class": "diagnostic_only",
+    "proof_mode": "invalid_diagnostic",
+    "validity_basis": "diagnostic-only run with proof work skipped or proof check skipped"
+  },
+  "repo_root": "/workspace/pearl-src",
+  "result": {
+    "diagnostic": {
+      "cpu_reference_noising": false,
+      "dummy_reduction": false,
+      "gpu_reference_noising": false,
+      "invalid_mining": true,
+      "mode": "native-global-journal-fill",
+      "noising_provenance_mode": "synthetic_precomputed_invalid",
+      "reason": "P1K165 two-phase diagnostic lets the hot GEMM fill scalar16 sideband journal words and then runs the P1K165 PoW finalizer outside the GEMM CTA.",
+      "skips_proof_setup": true,
+      "synthetic_precomputed_operands": true
+    },
+    "gpu": {
+      "capability": [
+        9,
+        0
+      ],
+      "device": "cuda:0",
+      "max_memory_allocated_bytes": 874696704,
+      "max_memory_reserved_bytes": 884998144,
+      "name": "NVIDIA H200"
+    },
+    "hash_input_mode": {
+      "A": "view_uint8",
+      "B": "view_uint8",
+      "cache_b_hash": false
+    },
+    "host_signal": {
+      "actual_receipt_cells": 0,
+      "actual_receipt_h": 0,
+      "actual_receipt_w": 0,
+      "mma_tile_k": 0,
+      "mma_tile_m": 0,
+      "mma_tile_n": 0,
+      "num_registers_per_thread": 0,
+      "status": "HostSignalStatus.kSignalIdle",
+      "tile_coord": [
+        0,
+        0,
+        0
+      ]
+    },
+    "noising_provenance_mode": "synthetic_precomputed_invalid",
+    "panel_partial_transcript_replay": null,
+    "proof_provenance": {
+      "paired_canary_artifact": "n/a",
+      "promotion_class": "diagnostic_only",
+      "proof_mode": "invalid_diagnostic",
+      "validity_basis": "diagnostic-only run with proof work skipped or proof check skipped"
+    },
+    "proof_result": {
+      "reason": "host signal was not triggered",
+      "status": "not_built"
+    },
+    "proof_validity_status": "invalid_diagnostic_not_mining",
+    "receipt_geometry": {
+      "actual_host_signal_receipt": {
+        "cells": null,
+        "h": null,
+        "idle_cells": 0,
+        "idle_h": 0,
+        "idle_w": 0,
+        "signal_triggered": false,
+        "status": "HostSignalStatus.kSignalIdle",
+        "w": null
+      },
+      "actual_matches_requested": null,
+      "paired_canary_receipt": {
+        "artifact": "",
+        "cells": null,
+        "h": null,
+        "loaded": false,
+        "loaded_artifact_json": null,
+        "plain_valid": null,
+        "proof_status": null,
+        "source": null,
+        "w": null
+      },
+      "requested_matches_paired": null,
+      "requested_or_configured_receipt": {
+        "cells": 128,
+        "h": 2,
+        "w": 64
+      },
+      "speed_promotion_allowed": true
+    },
+    "scoreboard": {
+      "benchmark_flags": {
+        "benchmark_only_precomputed_operands": true,
+        "coalesce_receipts": false,
+        "invalid_mining_diagnostic": true,
+        "pow_target": "0x0",
+        "precompute_noised_operands": true,
+        "proof_gemm_mode": "native-global-journal-fill",
+        "proof_gemm_only": true,
+        "proof_only": false
+      },
+      "candidate_accounting": {
+        "accounting_basis": null,
+        "active_check_warp_stride": null,
+        "candidate_effective_score_per_sec": null,
+        "candidate_proof_credit_tmad_s": null,
+        "candidate_receipts_per_tile": null,
+        "checked_candidate_cells_per_receipt": null,
+        "checked_candidate_receipts_per_call": null,
+        "checked_candidate_receipts_per_sec": null,
+        "checked_candidate_receipts_per_tile": null,
+        "dot_product_length": 2048,
+        "enabled": false,
+        "promotion_metric": null,
+        "raw_physical_tmad_promotable": null,
+        "required_fields_present": false,
+        "ticket": "P1K-166",
+        "tiles_per_call": 8192
+      },
+      "header_storage": {
+        "bits": 18432,
+        "bytes": 2304,
+        "source": "get_host_signal_header_size"
+      },
+      "pattern": {
+        "cells_per_receipt": 128,
+        "h": 2,
+        "max_col": 249,
+        "max_row": 8,
+        "w": 64
+      },
+      "receipt_geometry": {
+        "actual_host_signal_receipt": {
+          "cells": null,
+          "h": null,
+          "idle_cells": 0,
+          "idle_h": 0,
+          "idle_w": 0,
+          "signal_triggered": false,
+          "status": "HostSignalStatus.kSignalIdle",
+          "w": null
+        },
+        "actual_matches_requested": null,
+        "paired_canary_receipt": {
+          "artifact": "",
+          "cells": null,
+          "h": null,
+          "loaded": false,
+          "loaded_artifact_json": null,
+          "plain_valid": null,
+          "proof_status": null,
+          "source": null,
+          "w": null
+        },
+        "requested_matches_paired": null,
+        "requested_or_configured_receipt": {
+          "cells": 128,
+          "h": 2,
+          "w": 64
+        },
+        "speed_promotion_allowed": true
+      },
+      "receipt_math": {
+        "active_check_warp_stride": null,
+        "baseline_cells_per_receipt": 128,
+        "candidate_receipts_per_tile": null,
+        "cells_per_receipt": 128,
+        "checked_candidate_cells_per_receipt": null,
+        "coalesce_receipts": false,
+        "consumer_receipts_per_tile": 256,
+        "difficulty_factor": 262144,
+        "difficulty_factor_vs_default_2x64": 1.0,
+        "dot_product_length": 2048,
+        "normalized_128cell_receipt_eq_per_physical_receipt": 0.16666666666666666,
+        "receipts_per_call": 2097152,
+        "receipts_per_tile": 256
+      },
+      "run_kind": "direct_gpu_hotloop",
+      "scoreboard_schema_version": 1,
+      "shape": {
+        "cluster_m": 1,
+        "cluster_n": 1,
+        "k": 2048,
+        "m": 8192,
+        "n": 32768,
+        "noise_rank": 128,
+        "tile_k": 128,
+        "tile_m": 128,
+        "tile_n": 256
+      },
+      "throughput": {
+        "baseline_equivalent_gh_s": 0.25754251958091623,
+        "candidate_proof_credit_tmad_s": null,
+        "effective_score_per_sec": 405079357518118.25,
+        "physical_tmad_s": {
+          "hot_loop": 405.07935751811823,
+          "noisy_gemm": 438.3800647335797,
+          "prompt_token_estimate": null,
+          "wall": 392.3480568167924
+        },
+        "proof_credit_tmad_s": 405.07935751811823,
+        "receipts_per_sec": 1545255117.4854975,
+        "timing_ms": {
+          "hot_loop_avg": 1.357155835479498,
+          "noisy_gemm_avg": 1.2540620756149292
+        }
+      },
+      "verifier_validity": {
+        "canary_artifact": null,
+        "negative_controls": {
+          "failed": null,
+          "items": [],
+          "passed": null,
+          "required": []
+        },
+        "plain_valid": null,
+        "status": "invalid_diagnostic_not_mining",
+        "zk_valid": null
+      }
+    },
+    "stage_ms": {
+      "commitment_hash": {
+        "avg": 0.0,
+        "count": 50,
+        "max": 0.0,
+        "min": 0.0,
+        "p50": 0.0
+      },
+      "gpu_hot_loop_sum": {
+        "avg": 1.357155835479498,
+        "count": 50,
+        "max": 1.3654720410704613,
+        "min": 1.3503999710083008,
+        "p50": 1.3567040301859379
+      },
+      "noise_gen": {
+        "avg": 0.0,
+        "count": 50,
+        "max": 0.0,
+        "min": 0.0,
+        "p50": 0.0
+      },
+      "noisy_gemm": {
+        "avg": 1.2540620756149292,
+        "count": 50,
+        "max": 1.2626880407333374,
+        "min": 1.2480319738388062,
+        "p50": 1.253424048423767
+      },
+      "p1k117_global_finalizer": {
+        "avg": 0.0,
+        "count": 50,
+        "max": 0.0,
+        "min": 0.0,
+        "p50": 0.0
+      },
+      "p1k151_scalar16_finalizer": {
+        "avg": 0.0,
+        "count": 50,
+        "max": 0.0,
+        "min": 0.0,
+        "p50": 0.0
+      },
+      "p1k165_scalar16_two_phase_finalizer": {
+        "avg": 0.10309375986456872,
+        "count": 50,
+        "max": 0.10684800148010254,
+        "min": 0.1019200012087822,
+        "p50": 0.1029600016772747
+      },
+      "tensor_hash": {
+        "avg": 0.0,
+        "count": 50,
+        "max": 0.0,
+        "min": 0.0,
+        "p50": 0.0
+      }
+    },
+    "status": "invalid_diagnostic",
+    "throughput": {
+      "gpu_hot_loop_tmad_s_avg": 405.07935751811823,
+      "iterations_per_s_wall": 713.676957851553,
+      "mad_per_call": 549755813888,
+      "noisy_gemm_tmad_s_avg": 438.3800647335797,
+      "wall_s": 0.07005970901809633,
+      "wall_tmad_s_including_python_timing": 392.3480568167924
+    }
+  },
+  "safety": {
+    "gateway_submission": "none",
+    "mainnet_submission": "none",
+    "mining_validity": "invalid_diagnostic_not_mining",
+    "provider_actions": "none",
+    "wallet_actions": "none"
+  },
+  "schema_version": 1,
+  "settings": {
+    "active_check_warp_stride": null,
+    "cache_b_hash": false,
+    "candidate_receipts_per_tile": null,
+    "checked_candidate_cells_per_receipt": null,
+    "cluster_size_m": 1,
+    "cluster_size_n": 1,
+    "coalesce_receipts": false,
+    "cols": [
+      0,
+      1,
+      8,
+      9,
+      16,
+      17,
+      24,
+      25,
+      32,
+      33,
+      40,
+      41,
+      48,
+      49,
+      56,
+      57,
+      64,
+      65,
+      72,
+      73,
+      80,
+      81,
+      88,
+      89,
+      96,
+      97,
+      104,
+      105,
+      112,
+      113,
+      120,
+      121,
+      128,
+      129,
+      136,
+      137,
+      144,
+      145,
+      152,
+      153,
+      160,
+      161,
+      168,
+      169,
+      176,
+      177,
+      184,
+      185,
+      192,
+      193,
+      200,
+      201,
+      208,
+      209,
+      216,
+      217,
+      224,
+      225,
+      232,
+      233,
+      240,
+      241,
+      248,
+      249
+    ],
+    "cpu_reference_noising": false,
+    "cpu_reference_noising_max_elements": 1000000,
+    "device": "cuda:0",
+    "enable_canonical_transcript": false,
+    "enable_native_2x64_ring": false,
+    "enable_native_global_journal_fill": true,
+    "enable_p1k165_two_phase_pow_check": true,
+    "enable_panel_partial_transcript": false,
+    "enable_raw_deferred_ring_2x64": false,
+    "enable_raw_global_sink_2x64": false,
+    "enable_raw_ring_2x64": false,
+    "enable_raw_store_only_2x64": false,
+    "enable_raw_xor_only_2x64": false,
+    "enable_xq_journal": false,
+    "gpu_reference_noising": false,
+    "gpu_reference_noising_max_elements": 1000000000,
+    "incomplete_header_hex": null,
+    "int32_noising_a": false,
+    "int32_noising_b": false,
+    "invalid_mining_diagnostic": true,
+    "iterations": 50,
+    "k": 2048,
+    "k_blocks_per_split_noising_a": null,
+    "k_blocks_per_split_noising_b": null,
+    "m": 8192,
+    "n": 32768,
+    "native_sideband_fill_boundaries": 16,
+    "nbits": "0x207fffff",
+    "noise_threads": 64,
+    "noising_provenance_mode": "synthetic_precomputed_invalid",
+    "noisy_gemm_skip_denoising": false,
+    "noisy_gemm_skip_reduction": false,
+    "p1k117_global_finalizer_boundaries": -1,
+    "p1k117_global_finalizer_run_check": true,
+    "p1k151_scalar16_finalizer": false,
+    "p1k151_scalar16_finalizer_run_check": true,
+    "p1k165_scalar16_two_phase_finalizer": true,
+    "p1k165_scalar16_two_phase_finalizer_run_check": true,
+    "p1k165_two_phase_num_consumers": 256,
+    "paired_canary_artifact": "",
+    "paired_canary_receipt": {
+      "artifact": null,
+      "loaded": false,
+      "reason": "not_a_file_artifact"
+    },
+    "paired_receipt_cells": null,
+    "paired_receipt_h": null,
+    "paired_receipt_w": null,
+    "panel_partial_transcript_provenance": "disabled",
+    "panel_partial_transcript_records": "disabled",
+    "pipeline_stages": 3,
+    "pipeline_stages_noising_a": 2,
+    "pipeline_stages_noising_b": 2,
+    "pow_target": "0x0",
+    "precompute_noised_operands": true,
+    "promotion_class": "",
+    "proof_gemm_dummy_reduction": false,
+    "proof_gemm_mode": "native-global-journal-fill",
+    "proof_gemm_only": true,
+    "proof_gemm_skip_proof_check": true,
+    "proof_gemm_skip_reduction": false,
+    "proof_mode": "auto",
+    "proof_mutation_checks": false,
+    "proof_only": false,
+    "proof_only_noising": false,
+    "rank": 128,
+    "rows": [
+      0,
+      8
+    ],
+    "skips_proof_setup": true,
+    "swizzle": null,
+    "swizzle_n_maj": false,
+    "synthetic_precomputed_operands": true,
+    "tile_size_k": 128,
+    "tile_size_k_noising_a": null,
+    "tile_size_k_noising_b": null,
+    "tile_size_m": 128,
+    "tile_size_m_noising_a": null,
+    "tile_size_n": 256,
+    "tile_size_n_noising_b": null,
+    "validity_basis": "",
+    "warmup": 6
+  },
+  "validity_basis": "diagnostic-only run with proof work skipped or proof check skipped"
+}

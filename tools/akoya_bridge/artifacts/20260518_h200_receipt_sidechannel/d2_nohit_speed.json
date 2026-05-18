@@ -1,0 +1,470 @@
+{
+  "created_at_utc": "2026-05-18T18:12:35Z",
+  "paired_canary_artifact": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+  "promotion_class": "candidate_if_threshold_passes",
+  "proof_mode": "no_hit_proof",
+  "proof_provenance": {
+    "paired_canary_artifact": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+    "promotion_class": "candidate_if_threshold_passes",
+    "proof_mode": "no_hit_proof",
+    "validity_basis": "no-hit speed paired to verified forced-hit canary; same build also produced D1 soft-pool accepted=true"
+  },
+  "repo_root": "/workspace/pearl-src",
+  "result": {
+    "diagnostic": {
+      "cpu_reference_noising": false,
+      "dummy_reduction": false,
+      "gpu_reference_noising": true,
+      "invalid_mining": false,
+      "mode": "default",
+      "noising_provenance_mode": "gpu_reference_torch",
+      "reason": null,
+      "skips_proof_setup": false,
+      "synthetic_precomputed_operands": false
+    },
+    "gpu": {
+      "capability": [
+        9,
+        0
+      ],
+      "device": "cuda:0",
+      "max_memory_allocated_bytes": 1638059520,
+      "max_memory_reserved_bytes": 1790967808,
+      "name": "NVIDIA H200"
+    },
+    "hash_input_mode": {
+      "A": "view_uint8",
+      "B": "view_uint8",
+      "cache_b_hash": false
+    },
+    "host_signal": {
+      "actual_receipt_cells": 0,
+      "actual_receipt_h": 0,
+      "actual_receipt_w": 0,
+      "mma_tile_k": 0,
+      "mma_tile_m": 0,
+      "mma_tile_n": 0,
+      "num_registers_per_thread": 0,
+      "status": "HostSignalStatus.kSignalIdle",
+      "tile_coord": [
+        0,
+        0,
+        0
+      ]
+    },
+    "noising_provenance_mode": "gpu_reference_torch",
+    "panel_partial_transcript_replay": null,
+    "proof_provenance": {
+      "paired_canary_artifact": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+      "promotion_class": "candidate_if_threshold_passes",
+      "proof_mode": "no_hit_proof",
+      "validity_basis": "no-hit speed paired to verified forced-hit canary; same build also produced D1 soft-pool accepted=true"
+    },
+    "proof_result": {
+      "reason": "host signal was not triggered",
+      "status": "not_built"
+    },
+    "proof_validity_status": "unknown_missing_canary",
+    "receipt_geometry": {
+      "actual_host_signal_receipt": {
+        "cells": null,
+        "h": null,
+        "idle_cells": 0,
+        "idle_h": 0,
+        "idle_w": 0,
+        "signal_triggered": false,
+        "status": "HostSignalStatus.kSignalIdle",
+        "w": null
+      },
+      "actual_matches_requested": null,
+      "paired_canary_receipt": {
+        "artifact": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+        "cells": 128,
+        "h": 2,
+        "loaded": true,
+        "loaded_artifact_json": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+        "plain_valid": true,
+        "proof_status": "verified",
+        "source": "paired_forced_hit_artifact",
+        "w": 64
+      },
+      "requested_matches_paired": true,
+      "requested_or_configured_receipt": {
+        "cells": 128,
+        "h": 2,
+        "w": 64
+      },
+      "speed_promotion_allowed": true
+    },
+    "scoreboard": {
+      "benchmark_flags": {
+        "benchmark_only_precomputed_operands": true,
+        "coalesce_receipts": false,
+        "invalid_mining_diagnostic": false,
+        "pow_target": "0x0",
+        "precompute_noised_operands": true,
+        "proof_gemm_mode": "default",
+        "proof_gemm_only": true,
+        "proof_only": false
+      },
+      "candidate_accounting": {
+        "accounting_basis": null,
+        "active_check_warp_stride": null,
+        "candidate_effective_score_per_sec": null,
+        "candidate_proof_credit_tmad_s": null,
+        "candidate_receipts_per_tile": null,
+        "checked_candidate_cells_per_receipt": null,
+        "checked_candidate_receipts_per_call": null,
+        "checked_candidate_receipts_per_sec": null,
+        "checked_candidate_receipts_per_tile": null,
+        "dot_product_length": 2048,
+        "enabled": false,
+        "promotion_metric": null,
+        "raw_physical_tmad_promotable": null,
+        "required_fields_present": false,
+        "ticket": "P1K-166",
+        "tiles_per_call": 8192
+      },
+      "header_storage": {
+        "bits": 18432,
+        "bytes": 2304,
+        "source": "get_host_signal_header_size"
+      },
+      "pattern": {
+        "cells_per_receipt": 128,
+        "h": 2,
+        "max_col": 249,
+        "max_row": 8,
+        "w": 64
+      },
+      "receipt_geometry": {
+        "actual_host_signal_receipt": {
+          "cells": null,
+          "h": null,
+          "idle_cells": 0,
+          "idle_h": 0,
+          "idle_w": 0,
+          "signal_triggered": false,
+          "status": "HostSignalStatus.kSignalIdle",
+          "w": null
+        },
+        "actual_matches_requested": null,
+        "paired_canary_receipt": {
+          "artifact": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+          "cells": 128,
+          "h": 2,
+          "loaded": true,
+          "loaded_artifact_json": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+          "plain_valid": true,
+          "proof_status": "verified",
+          "source": "paired_forced_hit_artifact",
+          "w": 64
+        },
+        "requested_matches_paired": true,
+        "requested_or_configured_receipt": {
+          "cells": 128,
+          "h": 2,
+          "w": 64
+        },
+        "speed_promotion_allowed": true
+      },
+      "receipt_math": {
+        "active_check_warp_stride": null,
+        "baseline_cells_per_receipt": 128,
+        "candidate_receipts_per_tile": null,
+        "cells_per_receipt": 128,
+        "checked_candidate_cells_per_receipt": null,
+        "coalesce_receipts": false,
+        "consumer_receipts_per_tile": 256,
+        "difficulty_factor": 262144,
+        "difficulty_factor_vs_default_2x64": 1.0,
+        "dot_product_length": 2048,
+        "normalized_128cell_receipt_eq_per_physical_receipt": 0.16666666666666666,
+        "receipts_per_call": 2097152,
+        "receipts_per_tile": 256
+      },
+      "run_kind": "direct_gpu_hotloop",
+      "scoreboard_schema_version": 1,
+      "shape": {
+        "cluster_m": 1,
+        "cluster_n": 1,
+        "k": 2048,
+        "m": 8192,
+        "n": 32768,
+        "noise_rank": 128,
+        "tile_k": 128,
+        "tile_m": 128,
+        "tile_n": 256
+      },
+      "throughput": {
+        "baseline_equivalent_gh_s": 0.29512569038690734,
+        "candidate_proof_credit_tmad_s": null,
+        "effective_score_per_sec": 464192573884712.7,
+        "physical_tmad_s": {
+          "hot_loop": 464.1925738847127,
+          "noisy_gemm": 531.4241498740475,
+          "prompt_token_estimate": null,
+          "wall": 432.7388018793897
+        },
+        "proof_credit_tmad_s": 464.1925738847127,
+        "receipts_per_sec": 1770754142.3214443,
+        "timing_ms": {
+          "hot_loop_avg": 1.1843270332552494,
+          "noisy_gemm_avg": 1.0344953536987305
+        }
+      },
+      "verifier_validity": {
+        "canary_artifact": null,
+        "negative_controls": {
+          "failed": null,
+          "items": [],
+          "passed": null,
+          "required": []
+        },
+        "plain_valid": null,
+        "status": "unknown_missing_canary",
+        "zk_valid": null
+      }
+    },
+    "stage_ms": {
+      "commitment_hash": {
+        "avg": 0.01057215990498662,
+        "count": 50,
+        "max": 0.013887999579310417,
+        "min": 0.009920000098645687,
+        "p50": 0.010479999706149101
+      },
+      "gpu_hot_loop_sum": {
+        "avg": 1.1843270332552494,
+        "count": 50,
+        "max": 1.2062719967216253,
+        "min": 1.1763839880004525,
+        "p50": 1.1828640294261277
+      },
+      "noise_gen": {
+        "avg": 0.019857280030846594,
+        "count": 50,
+        "max": 0.0225600004196167,
+        "min": 0.019071999937295914,
+        "p50": 0.01945599913597107
+      },
+      "noisy_gemm": {
+        "avg": 1.0344953536987305,
+        "count": 50,
+        "max": 1.0462720394134521,
+        "min": 1.0284479856491089,
+        "p50": 1.033791959285736
+      },
+      "p1k117_global_finalizer": {
+        "avg": 0.0,
+        "count": 50,
+        "max": 0.0,
+        "min": 0.0,
+        "p50": 0.0
+      },
+      "p1k151_scalar16_finalizer": {
+        "avg": 0.0,
+        "count": 50,
+        "max": 0.0,
+        "min": 0.0,
+        "p50": 0.0
+      },
+      "p1k165_scalar16_two_phase_finalizer": {
+        "avg": 0.0,
+        "count": 50,
+        "max": 0.0,
+        "min": 0.0,
+        "p50": 0.0
+      },
+      "tensor_hash": {
+        "avg": 0.11940223962068558,
+        "count": 50,
+        "max": 0.1273919939994812,
+        "min": 0.11804799735546112,
+        "p50": 0.11897599697113037
+      }
+    },
+    "status": "measured_unverified",
+    "throughput": {
+      "gpu_hot_loop_tmad_s_avg": 464.1925738847127,
+      "iterations_per_s_wall": 787.1472951217396,
+      "mad_per_call": 549755813888,
+      "noisy_gemm_tmad_s_avg": 531.4241498740475,
+      "wall_s": 0.06352051300927997,
+      "wall_tmad_s_including_python_timing": 432.7388018793897
+    }
+  },
+  "safety": {
+    "gateway_submission": "none",
+    "mainnet_submission": "none",
+    "mining_validity": "normal_benchmark_path",
+    "provider_actions": "none",
+    "wallet_actions": "none"
+  },
+  "schema_version": 1,
+  "settings": {
+    "active_check_warp_stride": null,
+    "cache_b_hash": false,
+    "candidate_receipts_per_tile": null,
+    "checked_candidate_cells_per_receipt": null,
+    "cluster_size_m": 1,
+    "cluster_size_n": 1,
+    "coalesce_receipts": false,
+    "cols": [
+      0,
+      1,
+      8,
+      9,
+      16,
+      17,
+      24,
+      25,
+      32,
+      33,
+      40,
+      41,
+      48,
+      49,
+      56,
+      57,
+      64,
+      65,
+      72,
+      73,
+      80,
+      81,
+      88,
+      89,
+      96,
+      97,
+      104,
+      105,
+      112,
+      113,
+      120,
+      121,
+      128,
+      129,
+      136,
+      137,
+      144,
+      145,
+      152,
+      153,
+      160,
+      161,
+      168,
+      169,
+      176,
+      177,
+      184,
+      185,
+      192,
+      193,
+      200,
+      201,
+      208,
+      209,
+      216,
+      217,
+      224,
+      225,
+      232,
+      233,
+      240,
+      241,
+      248,
+      249
+    ],
+    "cpu_reference_noising": false,
+    "cpu_reference_noising_max_elements": 1000000,
+    "device": "cuda:0",
+    "enable_canonical_transcript": false,
+    "enable_native_2x64_ring": false,
+    "enable_native_global_journal_fill": false,
+    "enable_p1k165_two_phase_pow_check": false,
+    "enable_panel_partial_transcript": false,
+    "enable_raw_deferred_ring_2x64": false,
+    "enable_raw_global_sink_2x64": false,
+    "enable_raw_ring_2x64": false,
+    "enable_raw_store_only_2x64": false,
+    "enable_raw_xor_only_2x64": false,
+    "enable_xq_journal": false,
+    "gpu_reference_noising": true,
+    "gpu_reference_noising_max_elements": 1000000000,
+    "incomplete_header_hex": null,
+    "int32_noising_a": false,
+    "int32_noising_b": false,
+    "invalid_mining_diagnostic": false,
+    "iterations": 50,
+    "k": 2048,
+    "k_blocks_per_split_noising_a": null,
+    "k_blocks_per_split_noising_b": null,
+    "m": 8192,
+    "n": 32768,
+    "native_sideband_fill_boundaries": -1,
+    "nbits": "0x207fffff",
+    "noise_threads": 64,
+    "noising_provenance_mode": "gpu_reference_torch",
+    "noisy_gemm_skip_denoising": false,
+    "noisy_gemm_skip_reduction": false,
+    "p1k117_global_finalizer_boundaries": -1,
+    "p1k117_global_finalizer_run_check": true,
+    "p1k151_scalar16_finalizer": false,
+    "p1k151_scalar16_finalizer_run_check": true,
+    "p1k165_scalar16_two_phase_finalizer": false,
+    "p1k165_scalar16_two_phase_finalizer_run_check": true,
+    "p1k165_two_phase_num_consumers": 256,
+    "paired_canary_artifact": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+    "paired_canary_receipt": {
+      "artifact": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+      "cells": 128,
+      "h": 2,
+      "loaded": true,
+      "loaded_artifact_json": "/workspace/overnight/d2-proofgemm-canary-20260518T181141Z/direct_gpu_hotloop_benchmark_20260518T181142Z.json",
+      "plain_valid": true,
+      "proof_status": "verified",
+      "source": "paired_forced_hit_artifact",
+      "w": 64
+    },
+    "paired_receipt_cells": 128,
+    "paired_receipt_h": 2,
+    "paired_receipt_w": 64,
+    "panel_partial_transcript_provenance": "disabled",
+    "panel_partial_transcript_records": "disabled",
+    "pipeline_stages": 3,
+    "pipeline_stages_noising_a": 2,
+    "pipeline_stages_noising_b": 2,
+    "pow_target": "0x0",
+    "precompute_noised_operands": true,
+    "promotion_class": "candidate_if_threshold_passes",
+    "proof_gemm_dummy_reduction": false,
+    "proof_gemm_mode": "default",
+    "proof_gemm_only": true,
+    "proof_gemm_skip_proof_check": false,
+    "proof_gemm_skip_reduction": false,
+    "proof_mode": "auto",
+    "proof_mutation_checks": false,
+    "proof_only": false,
+    "proof_only_noising": true,
+    "rank": 128,
+    "rows": [
+      0,
+      8
+    ],
+    "skips_proof_setup": false,
+    "swizzle": null,
+    "swizzle_n_maj": false,
+    "synthetic_precomputed_operands": false,
+    "tile_size_k": 128,
+    "tile_size_k_noising_a": null,
+    "tile_size_k_noising_b": null,
+    "tile_size_m": 128,
+    "tile_size_m_noising_a": null,
+    "tile_size_n": 256,
+    "tile_size_n_noising_b": null,
+    "validity_basis": "no-hit speed paired to verified forced-hit canary; same build also produced D1 soft-pool accepted=true",
+    "warmup": 6
+  },
+  "validity_basis": "no-hit speed paired to verified forced-hit canary; same build also produced D1 soft-pool accepted=true"
+}

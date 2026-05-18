@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/nn/functional.h>
 #include <torch/python.h>
+#include <pybind11/stl.h>
 
 #include <cutlass/arch/arch.h>
 #include <cutlass/numeric_types.h>
@@ -13,6 +14,11 @@
 #include "heuristics.hpp"
 #include "host_signal_header.hpp"
 #include "inner_hash_kernel.h"
+#include "mining_only_hopper_kernel.h"
+#ifndef PEARL_GEMM_SKIP_MINING_ONLY_WGMMA_PROOF_SEARCH
+#include "mining_only_wgmma_proof_search_kernel.h"
+#endif
+#include "p1k061_persistent_wgmma_raw_stub.h"
 #include "pearl_api_params.h"
 #include "pearl_gemm_constants.hpp"
 #include "pearl_gemm_decl.h"
@@ -24,6 +30,7 @@
 #include "../tensor_hash/tensor_hash_api.hpp"
 
 #include <optional>
+#include <vector>
 
 #include <iostream>
 
@@ -53,6 +60,29 @@ int64_t get_host_signal_header_size() {
 int64_t get_host_signal_sync_size() {
   return sizeof(HostSignalSync);
 }
+
+#ifdef PEARL_GEMM_SKIP_MINING_ONLY_WGMMA_PROOF_SEARCH
+void mining_only_wgmma_proof_search(at::Tensor& A, at::Tensor& B,
+                                    at::Tensor& metadata,
+                                    at::Tensor& thread_checksums,
+                                    int64_t iterations, int64_t blocks,
+                                    int64_t diagnostic_mode) {
+  TORCH_CHECK(false,
+              "mining_only_wgmma_proof_search was disabled at build time by "
+              "PEARL_GEMM_SKIP_MINING_ONLY_WGMMA_PROOF_SEARCH=1");
+}
+#endif
+
+int64_t get_panel_partial_transcript_record_size() {
+  return panel_partial_transcript_record_size;
+}
+
+int64_t get_panel_partial_transcript_record_v2_size() {
+  return panel_partial_transcript_record_v2_size;
+}
+
+static constexpr char kPanelPartialTranscriptFinalizerKernelName[] =
+    "panel_partial_transcript_finalizer_kernel";
 
 std::string print_range(const auto& begin, const auto& end, const char* name) {
   using T =
@@ -111,6 +141,11 @@ void check_tensor(
   CHECK_SHAPE(tensor, x, y);
 }
 
+void check_r1024_noising_gate(int r, const char* caller) {
+  (void)r;
+  (void)caller;
+}
+
 void denoise_converter(
     const std::optional<at::Tensor>& EARxBpEB_in_,   //n x r, int32
     const std::optional<at::Tensor>& AxEBL_in_,      //m x r, int32
@@ -142,7 +177,7 @@ void denoise_converter(
     check_tensor(EARxBpEB_in, n, r, torch::kInt32);
     check_tensor(EARxBpEB_out, n, r, torch::kFloat16);
   }
-  PearlAPIParams params;
+  PearlAPIParams params{};
 
   params.ptr_AxEBL_int32 = convert_AxEBL ? AxEBL_in.data_ptr() : nullptr;
   params.ptr_AxEBL_mma = convert_AxEBL ? AxEBL_out.data_ptr() : nullptr;
@@ -159,6 +194,8 @@ void denoise_converter(
     run_denoise_converter<64>(params, stream);
   } else if (params.r == 128) {
     run_denoise_converter<128>(params, stream);
+  } else if (params.r == 256) {
+    run_denoise_converter<256>(params, stream);
   } else {
     TORCH_CHECK(false,
                 "No denoise converter kernel found with given config: R = ", r);
@@ -260,6 +297,9 @@ void noise_gen(const int64_t R, const int64_t num_threads,
   params.n = n;
   params.k = k;
   params.r = R;
+  TORCH_CHECK(R != 1024 || num_threads == 128,
+              "R=1024 noise_gen currently requires num_threads=128; "
+              "num_threads=64 cannot cover the fp16 R store layout.");
 
   int aux_buffer_size{};
   if (aux_buffer_.has_value()) {
@@ -283,13 +323,43 @@ void noise_gen(const int64_t R, const int64_t num_threads,
   bool kernel_found = false;
   NUM_THREADS_SWITCH(
       num_threads, NumThreads,
-      if (R == 64) {
+      if (false) {
+      }
+#ifndef DISABLE_R64
+      else if (R == 64) {
         kernel_found = true;
         run_noise_generation<64, NumThreads>(params, stream);
-      } else if (R == 128) {
+      }
+#endif
+#ifndef DISABLE_R128
+      else if (R == 128) {
         kernel_found = true;
         run_noise_generation<128, NumThreads>(params, stream);
-      });
+      }
+#endif
+#ifndef DISABLE_R256
+      else if (R == 256) {
+        kernel_found = true;
+        run_noise_generation<256, NumThreads>(params, stream);
+      }
+#endif
+#ifndef DISABLE_R512
+      else if (R == 512) {
+        if constexpr (NumThreads == 64 || NumThreads == 128) {
+          kernel_found = true;
+          run_noise_generation<512, NumThreads>(params, stream);
+        }
+      }
+#endif
+#ifndef DISABLE_R1024
+      else if (R == 1024) {
+        if constexpr (NumThreads == 128) {
+          kernel_found = true;
+          run_noise_generation<1024, NumThreads>(params, stream);
+        }
+      }
+#endif
+  );
 
   if (!kernel_found) {
     TORCH_CHECK(false, "No noise_gen kernel found with given config: R = ", R,
@@ -306,7 +376,14 @@ void noise_A(at::Tensor& A,                          // m x k
              std::optional<int64_t> tile_size_m_ = std::nullopt,
              std::optional<int64_t> tile_size_k_ = std::nullopt,
              int64_t pipeline_stages = 2,
-             std::optional<int64_t> k_blocks_per_split_ = std::nullopt) {
+             std::optional<int64_t> k_blocks_per_split_ = std::nullopt,
+             bool proof_only_noising = false) {
+
+#ifdef DISABLE_DENOISE_INTERMEDIATES
+  TORCH_CHECK(proof_only_noising,
+              "This build was compiled with DISABLE_DENOISE_INTERMEDIATES; "
+              "noise_A requires proof_only_noising=True.");
+#endif
 
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -317,11 +394,13 @@ void noise_A(at::Tensor& A,                          // m x k
   int n = 1;  // dummy value
   int k = int(A.size(1));
   int r = int(EAL.size(1));
+  check_r1024_noising_gate(r, "noise_A");
 
   TORCH_CHECK(
       k % 16 == 0,
       "K must be divisible by 16 (the size of a 128b vectorized copy atom)");
-  if (k_blocks_per_split_.has_value() && k_blocks_per_split_.value() > 0) {
+  if (!proof_only_noising && k_blocks_per_split_.has_value() &&
+      k_blocks_per_split_.value() > 0) {
     TORCH_CHECK(AxEBL.scalar_type() == torch::kInt32,
                 "AxEBL should have int32 dtype for split-K. It currently has ",
                 c10::toString(AxEBL.scalar_type()), ".");
@@ -342,7 +421,9 @@ void noise_A(at::Tensor& A,                          // m x k
   const int64_t tile_size_k = tile_size_k_.value_or(kDefaultNoisingTileSizeK);
 
   int k_blocks_per_split;
-  if (k_blocks_per_split_.has_value()) {
+  if (proof_only_noising) {
+    k_blocks_per_split = 0;
+  } else if (k_blocks_per_split_.has_value()) {
     k_blocks_per_split = k_blocks_per_split_.value();
   } else if (AxEBL.scalar_type() != torch::kInt32) {
     k_blocks_per_split = 0;
@@ -352,7 +433,7 @@ void noise_A(at::Tensor& A,                          // m x k
         get_num_k_blocks(m, tile_size_m, k, tile_size_k, dprops);
   }
 
-  PearlAPIParams params;
+  PearlAPIParams params{};
   params.m = m;
   params.n = n;
   params.k = k;
@@ -385,11 +466,13 @@ void noise_A(at::Tensor& A,                          // m x k
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   bool kernel_found = false;
-  NOISING_A_CONFIG_SWITCH(
-      tile_size_m, tile_size_k, r, pipeline_stages, AxEBL.scalar_type(),
-      kernel_found = true;
-      run_pearl_noising_A_<ElementDenoise_AxEBL, R_, bM_, bK_, stages_>(
-          params, stream););
+  PROOF_ONLY_NOISING_SWITCH(
+      proof_only_noising, ProofOnlyNoising,
+      NOISING_A_CONFIG_SWITCH(
+          tile_size_m, tile_size_k, r, pipeline_stages, AxEBL.scalar_type(),
+          kernel_found = true;
+          run_pearl_noising_A_<ElementDenoise_AxEBL, R_, bM_, bK_, stages_,
+                               !ProofOnlyNoising>(params, stream);););
 
   TORCH_CHECK(kernel_found,
               "No noise_A kernel found with given config: ", "R = ", r,
@@ -406,13 +489,21 @@ void noise_B(at::Tensor& B,                          // n x k
              std::optional<int64_t> tile_size_n_ = std::nullopt,
              std::optional<int64_t> tile_size_k_ = std::nullopt,
              int64_t pipeline_stages = 2,
-             std::optional<int64_t> k_blocks_per_split_ = std::nullopt) {
+             std::optional<int64_t> k_blocks_per_split_ = std::nullopt,
+             bool proof_only_noising = false) {
+
+#ifdef DISABLE_DENOISE_INTERMEDIATES
+  TORCH_CHECK(proof_only_noising,
+              "This build was compiled with DISABLE_DENOISE_INTERMEDIATES; "
+              "noise_B requires proof_only_noising=True.");
+#endif
 
   at::cuda::CUDAGuard device_guard{(char)B.get_device()};
   auto dprops = at::cuda::getCurrentDeviceProperties();
   at::Tensor EAR, EBL;
 
-  if (k_blocks_per_split_.has_value() && k_blocks_per_split_.value() > 0) {
+  if (!proof_only_noising && k_blocks_per_split_.has_value() &&
+      k_blocks_per_split_.value() > 0) {
     TORCH_CHECK(
         EARxBpEB.scalar_type() == torch::kInt32,
         "EARxBpEB should have int32 dtype for split-K. It currently has ",
@@ -423,6 +514,7 @@ void noise_B(at::Tensor& B,                          // n x k
   int n = int(B.size(0));
   int k = int(B.size(1));
   int r = int(EBR.size(1));
+  check_r1024_noising_gate(r, "noise_B");
   TORCH_CHECK(
       k % 16 == 0,
       "K must be divisible by 16 (the size of a 128b vectorized copy atom)");
@@ -442,7 +534,9 @@ void noise_B(at::Tensor& B,                          // n x k
   const int64_t tile_size_k = tile_size_k_.value_or(kDefaultNoisingTileSizeK);
 
   int k_blocks_per_split;
-  if (k_blocks_per_split_.has_value()) {
+  if (proof_only_noising) {
+    k_blocks_per_split = 0;
+  } else if (k_blocks_per_split_.has_value()) {
     k_blocks_per_split = k_blocks_per_split_.value();
   } else if (EARxBpEB.scalar_type() != torch::kInt32) {
     k_blocks_per_split = 0;
@@ -452,7 +546,7 @@ void noise_B(at::Tensor& B,                          // n x k
         get_num_k_blocks(n, tile_size_n, k, tile_size_k, dprops);
   }
 
-  PearlAPIParams params;
+  PearlAPIParams params{};
 
   params.m = m;
   params.n = n;
@@ -486,12 +580,13 @@ void noise_B(at::Tensor& B,                          // n x k
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   bool kernel_found = false;
-  NOISING_B_CONFIG_SWITCH(
-      tile_size_n, tile_size_k, r, pipeline_stages, EARxBpEB.scalar_type(),
-
-      kernel_found = true;
-      run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_, stages_>(
-          params, stream););
+  PROOF_ONLY_NOISING_SWITCH(
+      proof_only_noising, ProofOnlyNoising,
+      NOISING_B_CONFIG_SWITCH(
+          tile_size_n, tile_size_k, r, pipeline_stages, EARxBpEB.scalar_type(),
+          kernel_found = true;
+          run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_, stages_,
+                               !ProofOnlyNoising>(params, stream);););
 
   TORCH_CHECK(kernel_found,
               "No noise_B kernel found with given config: ", "R = ", r,
@@ -509,6 +604,12 @@ void gemm(at::Tensor& A,         // m x k
           std::optional<int64_t> swizzle = std::nullopt,
           bool swizzle_n_maj = true) {
 
+#ifdef DISABLE_NON_PROOF_ONLY
+  TORCH_CHECK(false,
+              "gemm is unavailable in builds compiled with "
+              "DISABLE_NON_PROOF_ONLY; use proof_only_gemm or noisy_gemm("
+              "proof_only=True).");
+#else
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   auto dprops = at::cuda::getCurrentDeviceProperties();
   CHECK_DEVICE(A);
@@ -535,7 +636,7 @@ void gemm(at::Tensor& A,         // m x k
 
   TORCH_CHECK(k % bK == 0, "K must be divisible by bK");
 
-  PearlAPIParams params;
+  PearlAPIParams params{};
   using ElementOut = cutlass::bfloat16_t;
 
   static constexpr int align_n = 128 / (sizeof(ElementOut) * 8);
@@ -593,18 +694,23 @@ void gemm(at::Tensor& A,         // m x k
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   constexpr bool SkipReduction = true;
   constexpr bool SkipDenoising = true;
+  constexpr bool ProofOnly = false;
+  constexpr bool SkipProofCheck = false;
   constexpr bool EnableDebug = false;
+  constexpr bool EnableXqJournal = false;
+  constexpr bool EnableCanonicalTranscript = false;
 
   // Awkwardly, the template signature and thus the existence of a compatible kernel
   // depends on R and the denoise dtypes, but these aren't used for noiseless gemm.
   // We iterate over all possibilities to try to find a compiled kernel.
   bool kernel_found = false;
-  for (int const R : {64, 128}) {
+  for (int const R : {64, 128, 256}) {
     MATMUL_CONFIG_SWITCH(
         bM, bN, bK, R, pipeline_stages, cM, cN, kernel_found = true;
         run_pearl_gemm_<ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
-                        SkipReduction, SkipDenoising, EnableDebug>(params,
-                                                                   stream);
+                        SkipReduction, SkipDenoising, ProofOnly, SkipProofCheck,
+                        EnableDebug, EnableXqJournal,
+                        EnableCanonicalTranscript>(params, stream);
         goto done;);
   }
 
@@ -613,6 +719,662 @@ void gemm(at::Tensor& A,         // m x k
               ", bN = ", bN, ", bK = ", bK, ", cM = ", cM, ", cN = ", cN,
               ", stages = ", pipeline_stages);
 done:;
+#endif
+}
+
+void proof_only_gemm(
+    at::Tensor& ApEA,  // m x k, already-noised A operand
+    at::Tensor& BpEB,  // n x k, already-noised B operand
+    at::Tensor& host_signal_header_pinned, at::Tensor& host_signal_sync,
+    at::Tensor& pow_target, at::Tensor& pow_key, int64_t rank, int64_t bM,
+    int64_t bN, int64_t bK, int64_t cM, int64_t cN,
+    std::optional<int64_t> pipeline_stages_ = std::nullopt,
+    std::optional<int64_t> swizzle = std::nullopt, bool swizzle_n_maj = true,
+	    std::optional<at::Tensor> inner_hash_counter = std::nullopt,
+	    bool enable_debug = false, bool coalesce_receipts = false,
+	    bool skip_reduction = false, bool skip_proof_check = false,
+	    bool enable_xq_journal = false,
+	    bool enable_canonical_transcript = false,
+	    bool enable_panel_partial_transcript = false,
+	    std::optional<at::Tensor> panel_partial_transcript_records =
+	        std::nullopt,
+	    bool dummy_reduction = false,
+	    bool enable_raw_ring_2x64 = false,
+	    bool enable_raw_xor_only_2x64 = false,
+		    bool enable_raw_store_only_2x64 = false,
+		    bool enable_raw_deferred_ring_2x64 = false,
+		    bool enable_raw_global_sink_2x64 = false,
+        bool enable_native_2x64_ring = false,
+        std::optional<at::Tensor> global_sideband_journal = std::nullopt,
+        bool enable_native_global_journal_fill = false,
+        bool enable_p1k165_two_phase_pow_check = false) {
+  at::cuda::CUDAGuard device_guard{(char)ApEA.get_device()};
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+
+  CHECK_DEVICE(ApEA);
+  CHECK_DEVICE(BpEB);
+  CHECK_DEVICE(pow_target);
+  CHECK_DEVICE(pow_key);
+  CHECK_CONTIGUOUS(ApEA);
+  CHECK_CONTIGUOUS(BpEB);
+  CHECK_CONTIGUOUS(pow_target);
+  CHECK_CONTIGUOUS(pow_key);
+
+  TORCH_CHECK(host_signal_header_pinned.scalar_type() == torch::kInt8,
+              "host_signal_header_pinned should have int8 dtype. It currently has ",
+              c10::toString(host_signal_header_pinned.scalar_type()), ".");
+  TORCH_CHECK(host_signal_sync.scalar_type() == torch::kInt8,
+              "host_signal_sync should have int8 dtype. It currently has ",
+              c10::toString(host_signal_sync.scalar_type()), ".");
+
+  TORCH_CHECK(pow_target.scalar_type() == torch::kUInt32,
+              "pow_target must be uint32 dtype. It currently has ",
+              c10::toString(pow_target.scalar_type()), ".");
+  CHECK_SHAPE(pow_target, blake3::CHAINING_VALUE_SIZE_U32);
+  TORCH_CHECK(pow_key.scalar_type() == torch::kUInt32,
+              "pow_key must be uint32 dtype. It currently has ",
+              c10::toString(pow_key.scalar_type()), ".");
+  CHECK_SHAPE(pow_key, blake3::CHAINING_VALUE_SIZE_U32);
+
+  int m = int(ApEA.size(0));
+  int k = int(ApEA.size(1));
+  int n = int(BpEB.size(0));
+  TORCH_CHECK(BpEB.dim() == 2, "BpEB must be 2D");
+  TORCH_CHECK(BpEB.size(1) == k, "BpEB must have the same K as ApEA");
+  check_tensor(ApEA, m, k, torch::kInt8);
+  check_tensor(BpEB, n, k, torch::kInt8);
+  CHECK_SHAPE(host_signal_header_pinned, get_host_signal_header_size());
+  CHECK_SHAPE(host_signal_sync, get_host_signal_sync_size());
+
+  TORCH_CHECK(rank == 64 || rank == 128 || rank == 256 || rank == 512 ||
+                  rank == 1024,
+              "proof_only_gemm currently supports rank 64, 128, 256, 512, or 1024. Got ",
+              rank);
+  TORCH_CHECK(k % bK == 0, "K must be divisible by bK");
+  TORCH_CHECK(bM <= 256,
+              "bM must be less than or equal to 256 for the current proof-only "
+              "kernel family");
+  TORCH_CHECK(bN <= 512,
+              "bN must be less than or equal to 512 for the current proof-only "
+              "wide-receipt canary path");
+
+  PearlAPIParams params{};
+  using ElementOut = cutlass::bfloat16_t;
+
+  params.m = m;
+  params.n = n;
+  params.k = k;
+  params.r = int(rank);
+
+  if (swizzle.has_value()) {
+    params.swizzle = static_cast<int>(swizzle.value());
+  } else {
+    int b_maj = swizzle_n_maj ? bN : bM;
+    params.swizzle = get_swizzle_size(params.k, b_maj, dprops);
+  }
+  params.swizzle_n_maj = swizzle_n_maj;
+
+  int const pipeline_stages =
+      pipeline_stages_.has_value()
+          ? pipeline_stages_.value()
+          : get_pipeline_stages(bM, bN, bK, rank, /*skip_denoising=*/true,
+                                dprops);
+
+  params.ptr_A = nullptr;
+  params.ptr_B = nullptr;
+  params.ptr_EAL = nullptr;
+  params.ptr_EAL_mma = nullptr;
+  params.ptr_EBR = nullptr;
+  params.ptr_EBR_mma = nullptr;
+  params.ptr_EAR_R_major = nullptr;
+  params.ptr_EBL_R_major = nullptr;
+  params.ptr_EAR_K_major = nullptr;
+  params.ptr_EBL_K_major = nullptr;
+  params.ptr_AxEBL = nullptr;
+  params.ptr_EARxBpEB = nullptr;
+  params.ptr_AxEBL_int32 = nullptr;
+  params.ptr_EARxBpEB_int32 = nullptr;
+  params.ptr_AxEBL_mma = nullptr;
+  params.ptr_EARxBpEB_mma = nullptr;
+  params.ptr_ApEA = ApEA.data_ptr();
+  params.ptr_BpEB = BpEB.data_ptr();
+  params.ptr_A_scales = nullptr;
+  params.ptr_B_scales = nullptr;
+  params.ptr_C = nullptr;
+  params.host_signal_header_pinned = host_signal_header_pinned.data_ptr();
+  params.host_signal_sync = host_signal_sync.data_ptr();
+  params.k_blocks_per_split_noising_A = 0;
+  params.k_blocks_per_split_noising_B = 0;
+  params.ptr_pow_target = pow_target.data_ptr();
+  params.ptr_pow_key = pow_key.data_ptr();
+
+  if (inner_hash_counter.has_value()) {
+    params.inner_hash_counter =
+        static_cast<uint64_t*>(inner_hash_counter.value().data_ptr());
+  } else {
+    params.inner_hash_counter = nullptr;
+  }
+  params.coalesce_receipts = coalesce_receipts;
+  params.enable_dummy_reduction = dummy_reduction;
+  params.enable_raw_ring_2x64 = enable_raw_ring_2x64;
+  params.enable_raw_xor_only_2x64 = enable_raw_xor_only_2x64;
+  params.enable_raw_store_only_2x64 = enable_raw_store_only_2x64;
+	  params.enable_raw_deferred_ring_2x64 = enable_raw_deferred_ring_2x64;
+	  params.enable_raw_global_sink_2x64 = enable_raw_global_sink_2x64;
+	  params.enable_native_2x64_ring = enable_native_2x64_ring;
+  params.ptr_global_sideband_journal = nullptr;
+  params.global_sideband_tiles = 0;
+  params.global_sideband_consumers = 0;
+  params.global_sideband_boundaries = 0;
+  params.enable_native_global_journal_fill = enable_native_global_journal_fill;
+	  params.enable_panel_partial_transcript = enable_panel_partial_transcript;
+  params.ptr_panel_partial_transcripts = nullptr;
+  params.panel_partial_transcript_capacity = 0;
+  params.panel_partial_panel_count = 0;
+	  TORCH_CHECK(!enable_debug || params.inner_hash_counter != nullptr,
+	              "inner_hash_counter must be provided when enable_debug is True");
+	  if (enable_panel_partial_transcript) {
+	    TORCH_CHECK(!coalesce_receipts,
+	                "reject_panel_partial_same_cta_fallback: "
+	                "enable_panel_partial_transcript requires panel "
+	                "producer/finalizer plumbing, not same-CTA coalescing");
+	    TORCH_CHECK(!skip_reduction && !skip_proof_check,
+	                "enable_panel_partial_transcript requires transcript "
+	                "reduction and proof checking");
+	    TORCH_CHECK(panel_partial_transcript_records.has_value(),
+	                "panel_partial_transcript_records must be provided when "
+	                "enable_panel_partial_transcript=True");
+	    at::Tensor& records = panel_partial_transcript_records.value();
+	    CHECK_DEVICE(records);
+	    CHECK_CONTIGUOUS(records);
+	    TORCH_CHECK(records.scalar_type() == torch::kInt8,
+	                "panel_partial_transcript_records must have int8 dtype. It currently has ",
+	                c10::toString(records.scalar_type()), ".");
+	    int64_t const record_size = get_panel_partial_transcript_record_v2_size();
+	    TORCH_CHECK(records.numel() >=
+	                    record_size * kPanelPartialTranscriptV2MinPanelCount,
+	                "panel_partial_transcript_records must hold at least two "
+	                "PanelPartialTranscriptRecordV2 objects");
+	    params.ptr_panel_partial_transcripts = records.data_ptr();
+	    params.panel_partial_transcript_capacity =
+	        static_cast<int>(records.numel() / record_size);
+	    params.panel_partial_panel_count = kPanelPartialTranscriptV2MinPanelCount;
+	  }
+	  if (enable_xq_journal) {
+#ifdef DISABLE_XQ_JOURNAL
+	    TORCH_CHECK(false,
+	                "enable_xq_journal requested, but this build was compiled "
+	                "with DISABLE_XQ_JOURNAL");
+#endif
+	    TORCH_CHECK(!skip_reduction,
+	                "enable_xq_journal requires skip_reduction=False");
+    TORCH_CHECK(rank == 128 || rank == 512,
+                "enable_xq_journal currently requires rank 128 or 512");
+	    TORCH_CHECK(k % rank == 0, "enable_xq_journal requires K divisible by rank");
+	    TORCH_CHECK(k / rank <= 32,
+	                "enable_xq_journal supports at most 32 proof boundaries. Got ",
+	                k / rank);
+	  }
+  if (enable_canonical_transcript) {
+#ifdef DISABLE_CANONICAL_TRANSCRIPT
+    TORCH_CHECK(false,
+                "enable_canonical_transcript requested, but this build was "
+                "compiled with DISABLE_CANONICAL_TRANSCRIPT");
+#endif
+    TORCH_CHECK(!skip_reduction,
+                "enable_canonical_transcript requires skip_reduction=False");
+    TORCH_CHECK(!enable_xq_journal,
+                "enable_canonical_transcript is mutually exclusive with "
+                "enable_xq_journal");
+    TORCH_CHECK(rank == 128,
+                "enable_canonical_transcript currently requires rank=128");
+    TORCH_CHECK(k % rank == 0,
+                "enable_canonical_transcript requires K divisible by rank");
+  }
+  if (dummy_reduction) {
+    TORCH_CHECK(!skip_reduction,
+                "dummy_reduction requires skip_reduction=False");
+    TORCH_CHECK(!enable_xq_journal && !enable_canonical_transcript,
+                "dummy_reduction only applies to the default TileHashAccumulator path");
+    TORCH_CHECK(!enable_panel_partial_transcript,
+                "dummy_reduction is mutually exclusive with panel partial transcript");
+    TORCH_CHECK(!coalesce_receipts,
+                "dummy_reduction is mutually exclusive with receipt coalescing");
+  }
+  if (enable_raw_ring_2x64) {
+    TORCH_CHECK(!skip_reduction,
+                "enable_raw_ring_2x64 requires skip_reduction=False");
+    TORCH_CHECK(skip_proof_check,
+                "enable_raw_ring_2x64 is an invalid diagnostic and requires "
+                "skip_proof_check=True");
+    TORCH_CHECK(rank == 128,
+                "enable_raw_ring_2x64 currently requires rank=128");
+    TORCH_CHECK(k % rank == 0,
+                "enable_raw_ring_2x64 requires K divisible by rank");
+    TORCH_CHECK(!enable_xq_journal && !enable_canonical_transcript,
+                "enable_raw_ring_2x64 is mutually exclusive with XQ journal "
+                "and canonical transcript modes");
+    TORCH_CHECK(!dummy_reduction,
+                "enable_raw_ring_2x64 is mutually exclusive with dummy_reduction");
+    TORCH_CHECK(!enable_panel_partial_transcript,
+                "enable_raw_ring_2x64 is mutually exclusive with panel partial transcript");
+    TORCH_CHECK(!coalesce_receipts,
+                "enable_raw_ring_2x64 is mutually exclusive with receipt coalescing");
+  }
+  if (enable_raw_xor_only_2x64 || enable_raw_store_only_2x64 ||
+      enable_raw_deferred_ring_2x64 || enable_raw_global_sink_2x64) {
+    TORCH_CHECK(!skip_reduction,
+                "raw 2x64 bisect diagnostics require skip_reduction=False");
+    TORCH_CHECK(skip_proof_check,
+                "raw 2x64 bisect diagnostics are invalid and require "
+                "skip_proof_check=True");
+    TORCH_CHECK(rank == 128,
+                "raw 2x64 bisect diagnostics currently require rank=128");
+    TORCH_CHECK(k % rank == 0,
+                "raw 2x64 bisect diagnostics require K divisible by rank");
+    TORCH_CHECK(!enable_xq_journal && !enable_canonical_transcript,
+                "raw 2x64 bisect diagnostics are mutually exclusive with XQ "
+                "journal and canonical transcript modes");
+    TORCH_CHECK(!dummy_reduction,
+                "raw 2x64 bisect diagnostics are mutually exclusive with dummy_reduction");
+    TORCH_CHECK(!enable_panel_partial_transcript,
+                "raw 2x64 bisect diagnostics are mutually exclusive with panel partial transcript");
+    TORCH_CHECK(!coalesce_receipts,
+                "raw 2x64 bisect diagnostics are mutually exclusive with receipt coalescing");
+  }
+  TORCH_CHECK((int)enable_raw_ring_2x64 + (int)enable_raw_xor_only_2x64 +
+                  (int)enable_raw_store_only_2x64 +
+                  (int)enable_raw_deferred_ring_2x64 +
+                  (int)enable_raw_global_sink_2x64 <=
+              1,
+              "raw 2x64 diagnostic modes are mutually exclusive");
+  if (enable_raw_global_sink_2x64) {
+    TORCH_CHECK(params.inner_hash_counter != nullptr,
+                "enable_raw_global_sink_2x64 requires inner_hash_counter global sink tensor");
+  }
+  if (enable_p1k165_two_phase_pow_check) {
+    TORCH_CHECK(enable_native_global_journal_fill,
+                "enable_p1k165_two_phase_pow_check requires "
+                "enable_native_global_journal_fill=True");
+  }
+	  if (enable_native_2x64_ring) {
+    TORCH_CHECK(!skip_reduction,
+                "enable_native_2x64_ring requires skip_reduction=False");
+    TORCH_CHECK(rank == 128,
+                "enable_native_2x64_ring currently requires rank=128");
+	    TORCH_CHECK(k % rank == 0,
+	                "enable_native_2x64_ring requires K divisible by rank");
+    TORCH_CHECK(k / rank <= 32,
+                "enable_native_2x64_ring supports at most 32 proof boundaries. Got ",
+                k / rank);
+	    TORCH_CHECK(bM == 128 && bN == 256 && bK == 128,
+	                "enable_native_2x64_ring currently requires tile 128x256x128");
+    TORCH_CHECK(cM == 1 && cN == 1,
+                "enable_native_2x64_ring currently requires cluster 1x1");
+    TORCH_CHECK(!enable_xq_journal && !enable_canonical_transcript,
+                "enable_native_2x64_ring is mutually exclusive with XQ "
+                "journal and canonical transcript modes");
+    TORCH_CHECK(!dummy_reduction,
+                "enable_native_2x64_ring is mutually exclusive with dummy_reduction");
+    TORCH_CHECK(!enable_panel_partial_transcript,
+                "enable_native_2x64_ring is mutually exclusive with panel partial transcript");
+    TORCH_CHECK(!coalesce_receipts,
+                "enable_native_2x64_ring is mutually exclusive with receipt coalescing");
+    TORCH_CHECK(!enable_raw_ring_2x64 && !enable_raw_xor_only_2x64 &&
+                    !enable_raw_store_only_2x64 &&
+                    !enable_raw_deferred_ring_2x64 &&
+                    !enable_raw_global_sink_2x64,
+                "enable_native_2x64_ring is mutually exclusive with raw "
+                "2x64 diagnostic modes");
+	  }
+  if (enable_native_global_journal_fill) {
+    TORCH_CHECK(!skip_reduction,
+                "enable_native_global_journal_fill requires skip_reduction=False");
+    TORCH_CHECK(skip_proof_check,
+                "enable_native_global_journal_fill is an invalid diagnostic and requires skip_proof_check=True");
+    TORCH_CHECK(rank == 128,
+                "enable_native_global_journal_fill currently requires rank=128");
+    TORCH_CHECK(k % rank == 0,
+                "enable_native_global_journal_fill requires K divisible by rank");
+    TORCH_CHECK(bM == 128 && (bN == 64 || bN == 256) && bK == 128,
+                "enable_native_global_journal_fill currently requires tile 128x64x128 or 128x256x128");
+    TORCH_CHECK(cM == 1 && cN == 1,
+                "enable_native_global_journal_fill currently requires cluster 1x1");
+    TORCH_CHECK(!enable_xq_journal && !enable_canonical_transcript,
+                "enable_native_global_journal_fill is mutually exclusive with XQ journal and canonical transcript modes");
+    TORCH_CHECK(!dummy_reduction,
+                "enable_native_global_journal_fill is mutually exclusive with dummy_reduction");
+    TORCH_CHECK(!enable_panel_partial_transcript,
+                "enable_native_global_journal_fill is mutually exclusive with panel partial transcript");
+    TORCH_CHECK(!coalesce_receipts,
+                "enable_native_global_journal_fill is mutually exclusive with receipt coalescing");
+    TORCH_CHECK(!enable_raw_ring_2x64 && !enable_raw_xor_only_2x64 &&
+                    !enable_raw_store_only_2x64 &&
+                    !enable_raw_deferred_ring_2x64 &&
+                    !enable_raw_global_sink_2x64 && !enable_native_2x64_ring,
+                "enable_native_global_journal_fill is mutually exclusive with raw/native 2x64 diagnostic modes");
+    TORCH_CHECK(global_sideband_journal.has_value(),
+                "global_sideband_journal must be provided when enable_native_global_journal_fill=True");
+    at::Tensor& journal = global_sideband_journal.value();
+    CHECK_DEVICE(journal);
+    CHECK_CONTIGUOUS(journal);
+    TORCH_CHECK(journal.scalar_type() == torch::kInt,
+                "global_sideband_journal must have torch.int32 dtype. It currently has ",
+                c10::toString(journal.scalar_type()), ".");
+    int64_t const num_blocks_m = (m + bM - 1) / bM;
+    int64_t const num_blocks_n = (n + bN - 1) / bN;
+    int64_t const num_tiles = num_blocks_m * num_blocks_n;
+    int64_t const num_consumers =
+        enable_p1k165_two_phase_pow_check ? (bM / 64) * 128 : 128;
+    int64_t const max_boundaries = k / rank;
+    int64_t const divisor = num_tiles * num_consumers;
+    TORCH_CHECK(divisor > 0,
+                "enable_native_global_journal_fill computed an empty tile/consumer domain");
+    TORCH_CHECK(journal.numel() % divisor == 0,
+                "global_sideband_journal size must be an exact multiple of "
+                "num_tiles * global sideband consumers");
+    int64_t const boundaries = journal.numel() / divisor;
+    TORCH_CHECK(boundaries > 0 && boundaries <= max_boundaries &&
+                    boundaries <= 32,
+                "enable_native_global_journal_fill supports 1..min(32, K/rank) "
+                "provided boundaries. Got ",
+                boundaries, ", max ", max_boundaries);
+    params.ptr_global_sideband_journal = journal.data_ptr();
+    params.global_sideband_tiles = static_cast<int>(num_tiles);
+    params.global_sideband_consumers = static_cast<int>(num_consumers);
+    params.global_sideband_boundaries = static_cast<int>(boundaries);
+  }
+
+	  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  constexpr bool SkipDenoising = true;
+  constexpr bool ProofOnly = true;
+
+  bool kernel_found = false;
+  for (int const R : {64, 128, 256, 512, 1024}) {
+    if (rank != R) {
+      continue;
+    }
+    if (skip_reduction) {
+      DEBUG_MODE_SWITCH(
+          enable_debug, EnableDebug,
+          constexpr static bool SkipReduction = true;
+          constexpr static bool SkipProofCheck = false;
+          constexpr static bool EnableXqJournal = false;
+          constexpr static bool EnableCanonicalTranscript = false;
+          MATMUL_CONFIG_SWITCH(
+              bM, bN, bK, R, pipeline_stages, cM, cN, kernel_found = true;
+              run_pearl_gemm_<ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                              SkipReduction, SkipDenoising, ProofOnly,
+                              SkipProofCheck, EnableDebug, EnableXqJournal,
+                              EnableCanonicalTranscript>(params, stream);
+              goto done;););
+	    } else if (enable_raw_ring_2x64 || enable_raw_xor_only_2x64 ||
+	               enable_raw_store_only_2x64 ||
+	               enable_raw_deferred_ring_2x64 ||
+	               enable_raw_global_sink_2x64) {
+      DEBUG_MODE_SWITCH(
+          enable_debug, EnableDebug,
+          constexpr static bool SkipReduction = false;
+          constexpr static bool SkipProofCheck = true;
+          constexpr static bool EnableXqJournal = false;
+          constexpr static bool EnableCanonicalTranscript = false;
+          constexpr static bool EnableDummyReduction = false;
+          if (enable_raw_ring_2x64) {
+            constexpr static bool EnableRawRing2x64 = true;
+            constexpr static bool EnableRawXorOnly2x64 = false;
+	            constexpr static bool EnableRawStoreOnly2x64 = false;
+	            constexpr static bool EnableRawDeferredRing2x64 = false;
+	            constexpr static bool EnableRawGlobalSink2x64 = false;
+	            MATMUL_CONFIG_SWITCH(
+                bM, bN, bK, R, pipeline_stages, cM, cN,
+                kernel_found = true;
+                run_pearl_gemm_<
+                    ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                    SkipReduction, SkipDenoising, ProofOnly, SkipProofCheck,
+                    EnableDebug, EnableXqJournal, EnableCanonicalTranscript,
+                    EnableDummyReduction, EnableRawRing2x64,
+	                    EnableRawXorOnly2x64,
+	                    EnableRawStoreOnly2x64,
+	                    EnableRawDeferredRing2x64,
+	                    EnableRawGlobalSink2x64>(params, stream);
+                goto done;);
+          } else if (enable_raw_xor_only_2x64) {
+            constexpr static bool EnableRawRing2x64 = false;
+            constexpr static bool EnableRawXorOnly2x64 = true;
+	            constexpr static bool EnableRawStoreOnly2x64 = false;
+	            constexpr static bool EnableRawDeferredRing2x64 = false;
+	            constexpr static bool EnableRawGlobalSink2x64 = false;
+            MATMUL_CONFIG_SWITCH(
+                bM, bN, bK, R, pipeline_stages, cM, cN,
+                kernel_found = true;
+                run_pearl_gemm_<
+                    ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                    SkipReduction, SkipDenoising, ProofOnly, SkipProofCheck,
+                    EnableDebug, EnableXqJournal, EnableCanonicalTranscript,
+                    EnableDummyReduction, EnableRawRing2x64,
+	                    EnableRawXorOnly2x64,
+	                    EnableRawStoreOnly2x64,
+	                    EnableRawDeferredRing2x64,
+	                    EnableRawGlobalSink2x64>(params, stream);
+                goto done;);
+          } else if (enable_raw_store_only_2x64) {
+            constexpr static bool EnableRawRing2x64 = false;
+            constexpr static bool EnableRawXorOnly2x64 = false;
+            constexpr static bool EnableRawStoreOnly2x64 = true;
+            constexpr static bool EnableRawDeferredRing2x64 = false;
+            constexpr static bool EnableRawGlobalSink2x64 = false;
+            MATMUL_CONFIG_SWITCH(
+                bM, bN, bK, R, pipeline_stages, cM, cN,
+                kernel_found = true;
+                run_pearl_gemm_<
+                    ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                    SkipReduction, SkipDenoising, ProofOnly, SkipProofCheck,
+                    EnableDebug, EnableXqJournal, EnableCanonicalTranscript,
+                    EnableDummyReduction, EnableRawRing2x64,
+                    EnableRawXorOnly2x64,
+                    EnableRawStoreOnly2x64,
+                    EnableRawDeferredRing2x64,
+                    EnableRawGlobalSink2x64>(params, stream);
+                goto done;);
+          } else if (enable_raw_deferred_ring_2x64) {
+            constexpr static bool EnableRawRing2x64 = false;
+            constexpr static bool EnableRawXorOnly2x64 = false;
+            constexpr static bool EnableRawStoreOnly2x64 = false;
+            constexpr static bool EnableRawDeferredRing2x64 = true;
+            constexpr static bool EnableRawGlobalSink2x64 = false;
+            MATMUL_CONFIG_SWITCH(
+                bM, bN, bK, R, pipeline_stages, cM, cN,
+                kernel_found = true;
+                run_pearl_gemm_<
+                    ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                    SkipReduction, SkipDenoising, ProofOnly, SkipProofCheck,
+                    EnableDebug, EnableXqJournal, EnableCanonicalTranscript,
+                    EnableDummyReduction, EnableRawRing2x64,
+                    EnableRawXorOnly2x64,
+                    EnableRawStoreOnly2x64,
+                    EnableRawDeferredRing2x64,
+                    EnableRawGlobalSink2x64>(params, stream);
+                goto done;);
+          } else {
+            constexpr static bool EnableRawRing2x64 = false;
+            constexpr static bool EnableRawXorOnly2x64 = false;
+            constexpr static bool EnableRawStoreOnly2x64 = false;
+            constexpr static bool EnableRawDeferredRing2x64 = false;
+            constexpr static bool EnableRawGlobalSink2x64 = true;
+            MATMUL_CONFIG_SWITCH(
+                bM, bN, bK, R, pipeline_stages, cM, cN,
+                kernel_found = true;
+                run_pearl_gemm_<
+                    ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                    SkipReduction, SkipDenoising, ProofOnly, SkipProofCheck,
+                    EnableDebug, EnableXqJournal, EnableCanonicalTranscript,
+                    EnableDummyReduction, EnableRawRing2x64,
+                    EnableRawXorOnly2x64,
+                    EnableRawStoreOnly2x64,
+                    EnableRawDeferredRing2x64,
+                    EnableRawGlobalSink2x64>(params, stream);
+                goto done;);
+          });
+#if !defined(PEARL_GEMM_DISABLE_NATIVE_DIAGNOSTIC_API)
+	    } else if (enable_native_2x64_ring) {
+	      DEBUG_MODE_SWITCH(
+	          enable_debug, EnableDebug,
+	          constexpr static bool SkipReduction = false;
+	          constexpr static bool EnableXqJournal = false;
+	          constexpr static bool EnableCanonicalTranscript = false;
+	          constexpr static bool EnableDummyReduction = false;
+	          constexpr static bool EnableRawRing2x64 = false;
+	          constexpr static bool EnableRawXorOnly2x64 = false;
+	          constexpr static bool EnableRawStoreOnly2x64 = false;
+	          constexpr static bool EnableRawDeferredRing2x64 = false;
+	          constexpr static bool EnableRawGlobalSink2x64 = false;
+	          constexpr static bool EnableNative2x64Ring = true;
+	          BOOL_SWITCH(
+	              skip_proof_check, SkipProofCheck,
+	              MATMUL_CONFIG_SWITCH(
+	                  bM, bN, bK, R, pipeline_stages, cM, cN,
+	                  kernel_found = true;
+	                  run_pearl_gemm_<
+	                      ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+	                      SkipReduction, SkipDenoising, ProofOnly,
+	                      SkipProofCheck, EnableDebug, EnableXqJournal,
+	                      EnableCanonicalTranscript, EnableDummyReduction,
+	                      EnableRawRing2x64, EnableRawXorOnly2x64,
+	                      EnableRawStoreOnly2x64, EnableRawDeferredRing2x64,
+	                      EnableRawGlobalSink2x64, EnableNative2x64Ring>(
+	                      params, stream);
+		                  goto done;);););
+        } else if (enable_native_global_journal_fill) {
+          DEBUG_MODE_SWITCH(
+              enable_debug, EnableDebug,
+              constexpr static bool SkipReduction = false;
+              constexpr static bool SkipProofCheck = true;
+              constexpr static bool EnableXqJournal = false;
+              constexpr static bool EnableCanonicalTranscript = false;
+              constexpr static bool EnableDummyReduction = false;
+              constexpr static bool EnableRawRing2x64 = false;
+              constexpr static bool EnableRawXorOnly2x64 = false;
+              constexpr static bool EnableRawStoreOnly2x64 = false;
+              constexpr static bool EnableRawDeferredRing2x64 = false;
+              constexpr static bool EnableRawGlobalSink2x64 = false;
+              constexpr static bool EnableNative2x64Ring = false;
+              constexpr static bool EnableNativeGlobalJournalFill = true;
+              MATMUL_CONFIG_SWITCH(
+                  bM, bN, bK, R, pipeline_stages, cM, cN,
+                  kernel_found = true;
+                  run_pearl_gemm_<
+                      ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                      SkipReduction, SkipDenoising, ProofOnly, SkipProofCheck,
+                      EnableDebug, EnableXqJournal, EnableCanonicalTranscript,
+                      EnableDummyReduction, EnableRawRing2x64,
+                      EnableRawXorOnly2x64, EnableRawStoreOnly2x64,
+                      EnableRawDeferredRing2x64, EnableRawGlobalSink2x64,
+                      EnableNative2x64Ring, EnableNativeGlobalJournalFill>(
+                      params, stream);
+                  goto done;););
+#endif
+		    } else if (enable_xq_journal) {
+	      DEBUG_MODE_SWITCH(
+	          enable_debug, EnableDebug,
+	          constexpr static bool SkipReduction = false;
+	          constexpr static bool EnableXqJournal = true;
+	          constexpr static bool EnableCanonicalTranscript = false;
+	          BOOL_SWITCH(
+	              skip_proof_check, SkipProofCheck,
+	              MATMUL_CONFIG_SWITCH(
+	                  bM, bN, bK, R, pipeline_stages, cM, cN,
+	                  kernel_found = true;
+	                  run_pearl_gemm_<
+	                      ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+	                      SkipReduction, SkipDenoising, ProofOnly,
+	                      SkipProofCheck, EnableDebug, EnableXqJournal,
+	                      EnableCanonicalTranscript>(params, stream);
+	                  goto done;);););
+    } else if (enable_canonical_transcript) {
+      DEBUG_MODE_SWITCH(
+          enable_debug, EnableDebug,
+          constexpr static bool SkipReduction = false;
+          constexpr static bool EnableXqJournal = false;
+          constexpr static bool EnableCanonicalTranscript = true;
+          BOOL_SWITCH(
+              skip_proof_check, SkipProofCheck,
+              MATMUL_CONFIG_SWITCH(
+                  bM, bN, bK, R, pipeline_stages, cM, cN,
+                  kernel_found = true;
+                  run_pearl_gemm_<
+                      ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                      SkipReduction, SkipDenoising, ProofOnly,
+                      SkipProofCheck, EnableDebug, EnableXqJournal,
+                      EnableCanonicalTranscript>(params, stream);
+                  goto done;);););
+		    } else {
+		      DEBUG_MODE_SWITCH(
+		          enable_debug, EnableDebug,
+		          constexpr static bool SkipReduction = false;
+		          constexpr static bool EnableXqJournal = false;
+		          constexpr static bool EnableCanonicalTranscript = false;
+			          if (dummy_reduction) {
+			            constexpr static bool EnableDummyReduction = true;
+			            BOOL_SWITCH(
+			                skip_proof_check, SkipProofCheck,
+			                MATMUL_CONFIG_SWITCH(
+			                    bM, bN, bK, R, pipeline_stages, cM, cN,
+			                    kernel_found = true;
+			                    run_pearl_gemm_<
+			                        ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+			                        SkipReduction, SkipDenoising, ProofOnly,
+			                        SkipProofCheck, EnableDebug, EnableXqJournal,
+			                        EnableCanonicalTranscript,
+			                        EnableDummyReduction>(params, stream);
+			                    goto done;););
+		          } else {
+		            constexpr static bool EnableDummyReduction = false;
+		            BOOL_SWITCH(
+		                skip_proof_check, SkipProofCheck,
+		                MATMUL_CONFIG_SWITCH(
+		                    bM, bN, bK, R, pipeline_stages, cM, cN,
+		                    kernel_found = true;
+		                    run_pearl_gemm_<
+		                        ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+		                        SkipReduction, SkipDenoising, ProofOnly,
+		                        SkipProofCheck, EnableDebug, EnableXqJournal,
+		                        EnableCanonicalTranscript,
+		                        EnableDummyReduction>(params, stream);
+		                    goto done;););
+		          });
+		    }
+  }
+
+done:
+  TORCH_CHECK(kernel_found,
+              "No proof_only_gemm kernel found with given config: ",
+              "bM = ", bM, ", bN = ", bN, ", bK = ", bK,
+              ", R = ", rank, ", stages = ", pipeline_stages,
+	              ", cM = ", cM, ", cN = ", cN,
+	              ", SkipReduction = ", skip_reduction ? "true" : "false",
+	              ", SkipProofCheck = ", skip_proof_check ? "true" : "false",
+	              ", DebugMode = ", enable_debug ? "true" : "false",
+	              ", XqJournal = ", enable_xq_journal ? "true" : "false",
+	              ", CanonicalTranscript = ",
+	              enable_canonical_transcript ? "true" : "false",
+	              ", EnablePanelPartialTranscript = ",
+	              enable_panel_partial_transcript ? "true" : "false",
+	              ", DummyReduction = ",
+	              dummy_reduction ? "true" : "false",
+	              ", RawRing2x64 = ",
+	              enable_raw_ring_2x64 ? "true" : "false",
+	              ", RawXorOnly2x64 = ",
+	              enable_raw_xor_only_2x64 ? "true" : "false",
+	              ", RawStoreOnly2x64 = ",
+	              enable_raw_store_only_2x64 ? "true" : "false",
+	              ", RawDeferredRing2x64 = ",
+	              enable_raw_deferred_ring_2x64 ? "true" : "false",
+	              ", EnableRawGlobalSink2x64 = ",
+	              enable_raw_global_sink_2x64 ? "true" : "false",
+		              ", EnableNative2x64Ring = ",
+              enable_native_2x64_ring ? "true" : "false",
+              ", EnableNativeGlobalJournalFill = ",
+              enable_native_global_journal_fill ? "true" : "false");
 }
 
 void noisy_gemm(
@@ -654,7 +1416,13 @@ void noisy_gemm(
     bool run_noising_a = true, bool run_noising_b = true,
     bool skip_reduction = false, bool skip_denoising = false,
     std::optional<at::Tensor> inner_hash_counter = std::nullopt,
-    bool enable_debug = false) {
+    bool enable_debug = false, bool proof_only = false) {
+#ifdef DISABLE_NON_PROOF_ONLY
+  TORCH_CHECK(proof_only,
+              "This build was compiled with DISABLE_NON_PROOF_ONLY; "
+              "noisy_gemm requires proof_only=True.");
+#endif
+
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
   at::Tensor EAL_fp16, EBR_fp16, EAR_R_major, EBL_R_major, EAR_K_major,
@@ -699,6 +1467,9 @@ void noisy_gemm(
   int n = int(B.size(0));
   int k = int(A.size(1));
   int r = int(EAL.size(1));
+  if (run_noising_a || run_noising_b) {
+    check_r1024_noising_gate(r, "noisy_gemm");
+  }
 
   TORCH_CHECK(
       EAR_R_major_.has_value() && EBL_R_major_.has_value() &&
@@ -790,10 +1561,11 @@ void noisy_gemm(
         c10::toString(EARxBpEB_noising_dtype), ".");
   }
 
+  bool const effective_skip_denoising = skip_denoising || proof_only;
   int const pipeline_stages = pipeline_stages_.value_or(
-      get_pipeline_stages(bM, bN, bK, r, skip_denoising, dprops));
+      get_pipeline_stages(bM, bN, bK, r, effective_skip_denoising, dprops));
 
-  PearlAPIParams params;
+  PearlAPIParams params{};
   using ElementOut = cutlass::bfloat16_t;
 
   static constexpr int align_n = 128 / (sizeof(ElementOut) * 8);
@@ -855,6 +1627,7 @@ void noisy_gemm(
   // PoW target and key
   params.ptr_pow_target = pow_target.data_ptr();
   params.ptr_pow_key = pow_key.data_ptr();
+  params.coalesce_receipts = false;
 
   // Validate that inner_hash_counter is provided when enable_debug is true
   TORCH_CHECK(!enable_debug || params.inner_hash_counter != nullptr,
@@ -867,14 +1640,19 @@ void noisy_gemm(
   bool kernel_found_noising_b = false;
 
   bool do_denoise_conversion =
-      (int32_noising_EARxBpEB || int32_noising_AxEBL) && (!skip_denoising);
+      (int32_noising_EARxBpEB || int32_noising_AxEBL) &&
+      (!effective_skip_denoising);
 
   DEBUG_MODE_SWITCH(
       enable_debug, EnableDebug,
       SKIP_REDUCTION_SWITCH(
           skip_reduction, SkipReduction,
           SKIP_DENOISING_SWITCH(
-              skip_denoising, SkipDenoising,
+              effective_skip_denoising, SkipDenoising,
+              PROOF_ONLY_SWITCH(
+                  proof_only, ProofOnly,
+
+              constexpr bool ComputeDenoiseIntermediates = !ProofOnly;
 
               if (run_noising_a) {
                 NOISING_A_CONFIG_SWITCH(
@@ -882,7 +1660,9 @@ void noisy_gemm(
                     pipeline_stages_noising_A, AxEBL_noising_dtype,
                     kernel_found_noising_a = true;
                     run_pearl_noising_A_<ElementDenoise_AxEBL, R_, bM_, bK_,
-                                         stages_>(params, stream););
+                                         stages_,
+                                         ComputeDenoiseIntermediates>(
+                        params, stream););
               } else { kernel_found_noising_a = true; }
 
               if (run_noising_b) {
@@ -891,7 +1671,9 @@ void noisy_gemm(
                     pipeline_stages_noising_B, EARxBpEB_noising_dtype,
                     kernel_found_noising_b = true;
                     run_pearl_noising_B_<ElementDenoise_EARxBpEB, R_, bN_, bK_,
-                                         stages_>(params, stream););
+                                         stages_,
+                                         ComputeDenoiseIntermediates>(
+                        params, stream););
               } else { kernel_found_noising_b = true; }
 
               if (do_denoise_conversion) {
@@ -899,6 +1681,8 @@ void noisy_gemm(
                   run_denoise_converter<64>(params, stream);
                 } else if (params.r == 128) {
                   run_denoise_converter<128>(params, stream);
+                } else if (params.r == 256) {
+                  run_denoise_converter<256>(params, stream);
                 } else {
                   TORCH_CHECK(false,
                               "No denoise converter kernel found with "
@@ -910,14 +1694,17 @@ void noisy_gemm(
                                      run_pearl_gemm_<
                                          ElementOut, R_, bM_, bN_, bK_, stages_,
                                          cM_, cN_, SkipReduction, SkipDenoising,
-                                         EnableDebug>(params, stream);););););
+                                         ProofOnly, false, EnableDebug, false,
+                                         false>(params, stream););););););
 
   TORCH_CHECK(kernel_found_matmul,
               "No noisy_gemm kernel found with given config: ", "bM = ", bM,
               ", bN = ", bN, ", bK = ", bK, ", R = ", r,
               ", stages = ", pipeline_stages, ", cM = ", cM, ", cN = ", cN,
               ", SkipReduction = ", skip_reduction ? "true" : "false",
-              ", SkipDenoising = ", skip_denoising ? "true" : "false",
+              ", SkipDenoising = ",
+              effective_skip_denoising ? "true" : "false",
+              ", ProofOnly = ", proof_only ? "true" : "false",
               ", DebugMode = ", enable_debug ? "true" : "false",
               ", AxEBL of type ", c10::toString(AxEBL_noising_dtype),
               ", EARxBpEB of type ", c10::toString(EARxBpEB_noising_dtype));
@@ -1053,6 +1840,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("denoise_converter", &denoise_converter,
         "Convert denoising factors from int32 to fp16");
   m.def("noisy_gemm", &noisy_gemm, "Noisy GEMM");
+  m.def("proof_only_gemm", &proof_only_gemm,
+        "Proof-only GEMM over pre-materialized noised operands");
+  m.def("mining_only_hopper_skeleton", &mining_only_hopper_skeleton,
+        "P1K-035 custom mining-only Hopper marker skeleton");
+  m.def("p1k149_native_lane_map_dump", &p1k149_native_lane_map_dump,
+        "P1K-149 native WGMMA accumulator lane-map dump");
+  m.def("mining_only_hopper_receipt_transcript",
+        &mining_only_hopper_receipt_transcript,
+        "P1K-035 direct receipt transcript skeleton");
+  m.def("mining_only_hopper_receipt_sweep",
+        &mining_only_hopper_receipt_sweep,
+        "P1K-035 batched direct receipt sweep skeleton");
+  m.def("panel_partial_transcript_finalizer",
+        &panel_partial_transcript_finalizer,
+        "P1K-056 panel partial transcript finalizer");
+  m.def("p1k117_global_journal_finalizer",
+        &p1k117_global_journal_finalizer,
+        "P1K-117 synthetic global-journal finalizer");
+  m.def("p1k151_scalar16_transcript_finalizer",
+        &p1k151_scalar16_transcript_finalizer,
+        "P1K-151 scalar16 transcript finalizer");
+  m.def("p1k165_scalar16_two_phase_finalizer",
+        &p1k165_scalar16_two_phase_finalizer,
+        "P1K-165 scalar16 two-phase PoW finalizer");
+  m.def("mining_only_wgmma_proof_search",
+        &mining_only_wgmma_proof_search,
+        "P1K-038 WGMMA-native custom mining proof-search source gate");
+  m.def("p1k061_persistent_wgmma_raw_stub",
+        &p1k061_persistent_wgmma_raw_stub,
+        "P1K-061 persistent cooperative ping-pong WGMMA raw stub");
   m.def("gemm", &gemm, "GEMM without noising steps");
   m.def("noise_A", &noise_A, "Noise A (activations)");
   m.def("noise_B", &noise_B, "Noise B (weights)");
@@ -1077,6 +1894,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Calculate host signal header buffer size");
   m.def("get_host_signal_sync_size", &get_host_signal_sync_size,
         "Calculate host signal sync buffer size");
+  m.def("get_panel_partial_transcript_record_size",
+        &get_panel_partial_transcript_record_size,
+        "Calculate panel partial transcript record buffer size");
+  m.def("get_panel_partial_transcript_record_v2_size",
+        &get_panel_partial_transcript_record_v2_size,
+        "Calculate panel partial transcript V2 record buffer size");
   m.def("get_required_scratchpad_bytes", &get_required_scratchpad_bytes,
         "Calculate required scratchpad bytes for given matrix size",
         py::arg("matrix_bytes"),
@@ -1102,22 +1925,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly(
           "thread_rows",
           [](const HostSignalHeader& self) {
-            return py::memoryview::from_memory(
-                self.thread_rows.data(),
-                self.num_registers_per_thread * sizeof(uint8_t));
+            return std::vector<uint16_t>(
+                self.thread_rows.begin(),
+                self.thread_rows.begin() + self.num_registers_per_thread);
           })
       .def_property_readonly(
           "thread_cols",
           [](const HostSignalHeader& self) {
-            return py::memoryview::from_memory(
-                self.thread_cols.data(),
-                self.num_registers_per_thread * sizeof(uint8_t));
+            return std::vector<uint16_t>(
+                self.thread_cols.begin(),
+                self.thread_cols.begin() + self.num_registers_per_thread);
           })
       .def_readonly("mma_size", &HostSignalHeader::mma_size)
       .def_readonly("mma_tile_size", &HostSignalHeader::mma_tile_size)
       .def_readonly("target", &HostSignalHeader::target)
       .def_readonly("num_registers_per_thread",
                     &HostSignalHeader::num_registers_per_thread)
+      .def_readonly("actual_receipt_h", &HostSignalHeader::actual_receipt_h)
+      .def_readonly("actual_receipt_w", &HostSignalHeader::actual_receipt_w)
+      .def_readonly("actual_receipt_cells",
+                    &HostSignalHeader::actual_receipt_cells)
       .def("__repr__", [](const HostSignalHeader& self) {
         std::stringstream ss;
         ss << "HostSignalHeader(status=" << self.status;
@@ -1143,6 +1970,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         ss << ", " << print_array(self.target, "target");
         ss << ", num_registers_per_thread="
            << static_cast<size_t>(self.num_registers_per_thread);
+        ss << ", actual_receipt=("
+           << static_cast<size_t>(self.actual_receipt_h) << "x"
+           << static_cast<size_t>(self.actual_receipt_w) << "="
+           << static_cast<size_t>(self.actual_receipt_cells) << ")";
         return ss.str();
       });
 }
@@ -1195,7 +2026,8 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "    bool skip_reduction = True, "
       "    bool skip_denoising = False, "
       "    Tensor(inner_hash_counter!)? inner_hash_counter = None, "
-      "    bool enable_debug = False"
+      "    bool enable_debug = False, "
+      "    bool proof_only = False"
       ") -> ()",
       {at::Tag::pt2_compliant_tag});
 
@@ -1210,6 +2042,167 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "bool swizzle_n_maj = True) -> "
       "()",
       {at::Tag::pt2_compliant_tag});
+  m.def(
+      "proof_only_gemm("
+      "    Tensor ApEA, "
+      "    Tensor BpEB, "
+      "    Tensor(host_signal_header_pinned!) host_signal_header_pinned, "
+      "    Tensor(host_signal_sync!) host_signal_sync, "
+      "    Tensor pow_target, "
+      "    Tensor pow_key, "
+      "    int rank = 128, "
+      "    int tile_size_m = 128, "
+      "    int tile_size_n = 256, "
+      "    int tile_size_k = 128, "
+      "    int cluster_size_m = 1, "
+      "    int cluster_size_n = 1, "
+      "    int? pipeline_stages = None, "
+      "    int? swizzle = None, "
+      "    bool swizzle_n_maj = True, "
+      "    Tensor(inner_hash_counter!)? inner_hash_counter = None, "
+	      "    bool enable_debug = False, "
+	      "    bool coalesce_receipts = False, "
+	      "    bool skip_reduction = False, "
+	      "    bool skip_proof_check = False, "
+	      "    bool enable_xq_journal = False, "
+	      "    bool enable_canonical_transcript = False, "
+	      "    bool enable_panel_partial_transcript = False, "
+	      "    Tensor(panel_partial_transcript_records!)? panel_partial_transcript_records = None, "
+	      "    bool dummy_reduction = False, "
+		      "    bool enable_raw_ring_2x64 = False, "
+		      "    bool enable_raw_xor_only_2x64 = False, "
+		      "    bool enable_raw_store_only_2x64 = False, "
+		      "    bool enable_raw_deferred_ring_2x64 = False, "
+			      "    bool enable_raw_global_sink_2x64 = False, "
+            "    bool enable_native_2x64_ring = False, "
+            "    Tensor(global_sideband_journal!)? global_sideband_journal = None, "
+            "    bool enable_native_global_journal_fill = False, "
+            "    bool enable_p1k165_two_phase_pow_check = False"
+				      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+
+  m.def("mining_only_hopper_skeleton(Tensor(marker!) marker) -> ()",
+        {at::Tag::pt2_compliant_tag});
+  m.def(
+      "p1k149_native_lane_map_dump("
+      "    Tensor(coords!) coords, "
+      "    Tensor(counts!) counts, "
+      "    Tensor(metadata!) metadata"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "mining_only_hopper_receipt_transcript("
+      "    Tensor A, "
+      "    Tensor B, "
+      "    Tensor(transcript!) transcript, "
+      "    Tensor(xq!) xq, "
+      "    Tensor(metadata!) metadata, "
+      "    int row_origin = 0, "
+      "    int col_origin = 0, "
+      "    int receipt_rows = 2, "
+      "    int receipt_cols = 128, "
+      "    int rank = 128"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "mining_only_hopper_receipt_sweep("
+      "    Tensor A, "
+      "    Tensor B, "
+      "    Tensor(transcripts!) transcripts, "
+      "    Tensor(xq!) xq, "
+      "    Tensor(metadata!) metadata, "
+      "    int row_origin = 0, "
+      "    int col_origin = 0, "
+      "    int receipt_rows = 2, "
+      "    int receipt_cols = 128, "
+      "    int rank = 128, "
+      "    int receipts_m = 1, "
+      "    int receipts_n = 1"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "panel_partial_transcript_finalizer("
+      "    Tensor records, "
+      "    Tensor(output_transcripts!) output_transcripts, "
+      "    Tensor(metadata!) metadata, "
+      "    int logical_receipt_base = 0, "
+      "    int logical_receipt_count = 1, "
+      "    int panel_count = 2, "
+      "    int expected_row_start = 0, "
+      "    int expected_row_count = 2, "
+      "    int expected_col_start = 0, "
+      "    int expected_col_count = 128, "
+      "    int expected_row_stride = 0"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "p1k117_global_journal_finalizer("
+      "    Tensor journal, "
+      "    Tensor(output_transcripts!) output_transcripts, "
+      "    Tensor(metadata!) metadata, "
+      "    Tensor pow_target, "
+      "    Tensor pow_key, "
+      "    int num_tiles, "
+      "    int num_consumers, "
+      "    int max_boundaries, "
+      "    int active_boundaries, "
+      "    bool run_check = True"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "p1k151_scalar16_transcript_finalizer("
+      "    Tensor journal, "
+      "    Tensor(output_transcripts!) output_transcripts, "
+      "    Tensor(metadata!) metadata, "
+      "    Tensor pow_target, "
+      "    Tensor pow_key, "
+      "    int num_tiles, "
+      "    int num_consumers, "
+      "    int journal_stride_words, "
+      "    bool run_check = True"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "p1k165_scalar16_two_phase_finalizer("
+      "    Tensor journal, "
+      "    Tensor(output_transcripts!) output_transcripts, "
+      "    Tensor(metadata!) metadata, "
+      "    Tensor(host_signal_header_pinned!) host_signal_header_pinned, "
+      "    Tensor(host_signal_sync!) host_signal_sync, "
+      "    Tensor pow_target, "
+      "    Tensor pow_key, "
+      "    int m, "
+      "    int n, "
+      "    int k, "
+      "    int rank, "
+      "    int num_tiles, "
+      "    int num_blocks_n, "
+      "    int num_consumers, "
+      "    int journal_stride_words, "
+      "    bool run_check = True"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "mining_only_wgmma_proof_search("
+      "    Tensor A, "
+      "    Tensor B, "
+      "    Tensor(metadata!) metadata, "
+      "    Tensor(thread_checksums!) thread_checksums, "
+      "    int iterations = 1, "
+      "    int blocks = 1, "
+      "    int diagnostic_mode = 0"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "p1k061_persistent_wgmma_raw_stub("
+      "    Tensor A, "
+      "    Tensor B, "
+      "    Tensor(metadata!) metadata, "
+      "    Tensor(thread_checksums!) thread_checksums, "
+      "    int work_tiles = 1, "
+      "    int blocks = 1"
+      ") -> ()",
+      {at::Tag::pt2_compliant_tag});
 
   m.def(
       "noise_A("
@@ -1222,7 +2215,8 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "    int? tile_size_m = None, "
       "    int? tile_size_k = None, "
       "    int pipeline_stages = 2, "
-      "    int? k_blocks_per_split = None"
+      "    int? k_blocks_per_split = None, "
+      "    bool proof_only_noising = False"
       ") -> ()",
       {at::Tag::pt2_compliant_tag});
 
@@ -1237,7 +2231,8 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "    int? tile_size_n = None, "
       "    int? tile_size_k = None, "
       "    int pipeline_stages = 2, "
-      "    int? k_blocks_per_split = None"
+      "    int? k_blocks_per_split = None, "
+      "    bool proof_only_noising = False"
       ") -> ()",
       {at::Tag::pt2_compliant_tag});
 
@@ -1290,6 +2285,25 @@ TORCH_LIBRARY(pearl_gemm, m) {
 
 TORCH_LIBRARY_IMPL(pearl_gemm, CUDA, m) {
   m.impl("noisy_gemm", &noisy_gemm);
+  m.impl("proof_only_gemm", &proof_only_gemm);
+  m.impl("mining_only_hopper_skeleton", &mining_only_hopper_skeleton);
+  m.impl("p1k149_native_lane_map_dump", &p1k149_native_lane_map_dump);
+  m.impl("mining_only_hopper_receipt_transcript",
+         &mining_only_hopper_receipt_transcript);
+  m.impl("mining_only_hopper_receipt_sweep",
+         &mining_only_hopper_receipt_sweep);
+  m.impl("panel_partial_transcript_finalizer",
+         &panel_partial_transcript_finalizer);
+  m.impl("p1k117_global_journal_finalizer",
+         &p1k117_global_journal_finalizer);
+  m.impl("p1k151_scalar16_transcript_finalizer",
+         &p1k151_scalar16_transcript_finalizer);
+  m.impl("p1k165_scalar16_two_phase_finalizer",
+         &p1k165_scalar16_two_phase_finalizer);
+  m.impl("mining_only_wgmma_proof_search",
+         &mining_only_wgmma_proof_search);
+  m.impl("p1k061_persistent_wgmma_raw_stub",
+         &p1k061_persistent_wgmma_raw_stub);
   m.impl("gemm", &gemm);
   m.impl("noise_A", &noise_A);
   m.impl("noise_B", &noise_B);

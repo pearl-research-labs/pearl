@@ -1,0 +1,38 @@
+{
+  "accepted": true,
+  "ack": {
+    "accepted": true,
+    "miner_id": "6887c0b5-9f7e-4712-a074-cbbcb9422129",
+    "pool_uuid": "42489154-413b-421b-b090-6f69194d6a1a",
+    "share_difficulty": 507510783
+  },
+  "frame_path": "/workspace/overnight/d3-hardy-split-20260518T181420Z/stage/type3_plain_proof_share.msgpack",
+  "job": {
+    "header_bytes": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "height": 1,
+    "job_uuid": "c53b06f5-6936-496b-bbce-ae4fde11803b",
+    "network_nbits": 545259519,
+    "reserved": "0000000000000000000000000000000000000000000000000000000000000000",
+    "seed_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "share_difficulty": 507510783
+  },
+  "message": "Mining solution verified successfully",
+  "outcome_code": 0,
+  "register": [
+    "4dedac34-28f4-446c-b5ab-003f3ddc427a",
+    "ako012-private-wallet",
+    "ako012-split-proof-node",
+    "proof-node-side",
+    2048,
+    "d3-split-submit",
+    "7199b8db59a0ec54caf72c23245576d3f59f9fb6+dirty"
+  ],
+  "result": {
+    "message": "Mining solution verified successfully",
+    "outcome_code": 0,
+    "share_id": "00000000-0000-4000-8000-000000000005"
+  },
+  "schema": "akoya_split_submit_client.v1",
+  "share_difficulty": 507510783,
+  "share_id": "00000000-0000-4000-8000-000000000005"
+}
