@@ -274,9 +274,9 @@ var MainNetParams = Params{
 	Net:         wire.MainNet,
 	DefaultPort: "44108",
 	DNSSeeds: []DNSSeed{
-		{"seeder1.pearlresearch.ai", true},
-		{"seeder2.pearlresearch.ai", true},
-		{"seeder3.pearlresearch.ai", true},
+		{"seeder1.pearlresearch.ai", false},
+		{"seeder2.pearlresearch.ai", false},
+		{"seeder3.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
