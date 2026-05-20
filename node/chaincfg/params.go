@@ -274,9 +274,9 @@ var MainNetParams = Params{
 	Net:         wire.MainNet,
 	DefaultPort: "44108",
 	DNSSeeds: []DNSSeed{
-		{"seeder1.pearlresearch.ai", true},
-		{"seeder2.pearlresearch.ai", true},
-		{"seeder3.pearlresearch.ai", true},
+		{"seeder1.pearlresearch.ai", false},
+		{"seeder2.pearlresearch.ai", false},
+		{"seeder3.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
@@ -293,7 +293,9 @@ var MainNetParams = Params{
 	MaxTimeOffsetMinutes: 5,
 
 	// Checkpoints ordered from oldest to newest.
-	Checkpoints: nil,
+	Checkpoints: []Checkpoint{
+		{50000, newHashFromStr("608f32e5390b2ae964c986a53e1be10ba4a640f3ccecf96d6b7838e06cb517ff")},
+	},
 
 	// Consensus rule change deployments.
 	//

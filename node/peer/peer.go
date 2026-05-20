@@ -936,11 +936,13 @@ func (p *Peer) PushGetBlocksMsg(locator blockchain.BlockLocator, stopHash *chain
 	return nil
 }
 
-// PushGetHeadersMsg sends a getblocks message for the provided block locator
+// PushGetHeadersMsg sends a getheaders message for the provided block locator
 // and stop hash.  It will ignore back-to-back duplicate requests.
+// When includeCerts is true the peer is asked to include certificates in
+// the response; when false only bare headers are returned.
 //
 // This function is safe for concurrent access.
-func (p *Peer) PushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chainhash.Hash) error {
+func (p *Peer) PushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chainhash.Hash, includeCerts bool) error {
 	// Extract the begin hash from the block locator, if one was specified,
 	// to use for filtering duplicate getheaders requests.
 	var beginHash *chainhash.Hash
@@ -964,6 +966,7 @@ func (p *Peer) PushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chai
 	// Construct the getheaders request and queue it to be sent.
 	msg := wire.NewMsgGetHeaders()
 	msg.HashStop = *stopHash
+	msg.IncludeCertificates = includeCerts
 	for _, hash := range locator {
 		err := msg.AddBlockLocatorHash(hash)
 		if err != nil {

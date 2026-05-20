@@ -387,7 +387,7 @@ func (b *blockManager) handleNewPeerMsg(peers *list.List, sp *ServerPeer) {
 			return
 		}
 		stopHash := &zeroHash
-		_ = sp.PushGetHeadersMsg(locator, stopHash)
+		_ = sp.PushGetHeadersMsg(locator, stopHash, true)
 	}
 
 	// Start syncing by choosing the best candidate if needed.
@@ -2154,7 +2154,7 @@ func (b *blockManager) startSync(peers *list.List) {
 
 		// With our stop hash selected, we'll kick off the sync from
 		// this peer with an initial GetHeaders message.
-		_ = b.SyncPeer().PushGetHeadersMsg(locator, stopHash)
+		_ = b.SyncPeer().PushGetHeadersMsg(locator, stopHash, true)
 	} else {
 		log.Warnf("No sync peer candidates available")
 	}
@@ -2322,7 +2322,7 @@ func (b *blockManager) handleInvMsg(imsg *invMsg) {
 
 			// Get headers based on locator.
 			err = imsg.peer.PushGetHeadersMsg(locator,
-				&invVects[lastBlock].Hash)
+				&invVects[lastBlock].Hash, true)
 			if err != nil {
 				log.Warnf("Failed to send getheaders message "+
 					"to peer %s: %s", imsg.peer.Addr(), err)
@@ -2407,7 +2407,7 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 			if b.nextCheckpoint != nil {
 				stopHash = *b.nextCheckpoint.Hash
 			}
-			err := hmsg.peer.PushGetHeadersMsg(locator, &stopHash)
+			err := hmsg.peer.PushGetHeadersMsg(locator, &stopHash, true)
 			if err != nil {
 				log.Warnf("Failed to send speculative "+
 					"getheaders to peer %s: %s",
@@ -2759,7 +2759,7 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 		if b.nextCheckpoint != nil {
 			nextHash = *b.nextCheckpoint.Hash
 		}
-		err := hmsg.peer.PushGetHeadersMsg(locator, &nextHash)
+		err := hmsg.peer.PushGetHeadersMsg(locator, &nextHash, true)
 		if err != nil {
 			log.Warnf("Failed to send getheaders message to "+
 				"peer %s: %s", hmsg.peer.Addr(), err)

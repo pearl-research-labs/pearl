@@ -107,14 +107,14 @@ func TestSyncManagerRaceCorruption(t *testing.T) {
 	require.NoError(t, newHarness.SetUp(true, 0))
 	defer func() { _ = newHarness.TearDown() }()
 
-	require.NoError(t, rpctest.ConnectNode(stressedHarness, newHarness),
-		"stressed node must connect to the new node")
+	_, err = newHarness.Client.Generate(syncRaceProofBlocks)
+	require.NoError(t, err)
 
 	_, heightBefore, err := stressedHarness.Client.GetBestBlock()
 	require.NoError(t, err)
 
-	_, err = newHarness.Client.Generate(syncRaceProofBlocks)
-	require.NoError(t, err)
+	require.NoError(t, rpctest.ConnectNode(stressedHarness, newHarness),
+		"stressed node must connect to the new node")
 
 	time.Sleep(syncRaceProofWait)
 
@@ -177,13 +177,13 @@ func TestPreVerackDisconnect(t *testing.T) {
 	require.NoError(t, helper.SetUp(true, 0))
 	defer func() { _ = helper.TearDown() }()
 
-	require.NoError(t, rpctest.ConnectNode(harness, helper))
+	_, err = helper.Client.Generate(3)
+	require.NoError(t, err)
 
 	_, heightBefore, err := harness.Client.GetBestBlock()
 	require.NoError(t, err)
 
-	_, err = helper.Client.Generate(3)
-	require.NoError(t, err)
+	require.NoError(t, rpctest.ConnectNode(harness, helper))
 
 	time.Sleep(5 * time.Second)
 

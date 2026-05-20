@@ -106,6 +106,11 @@ func (msg *MsgHeaders) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) 
 		msg.Headers = append(msg.Headers, *mh)
 	}
 
+	if HasInconsistentCertificates(msg.Headers) {
+		return messageError("MsgHeaders.PrlDecode",
+			"headers batch mixes certified and uncertified headers")
+	}
+
 	return nil
 }
 
@@ -157,4 +162,22 @@ func NewMsgHeaders() *MsgHeaders {
 	return &MsgHeaders{
 		Headers: make([]MsgHeader, 0, MaxBlockHeadersPerMsg),
 	}
+}
+
+// HasInconsistentCertificates reports whether a HEADERS batch mixes headers
+// with and without certificates. A peer that does this is violating the wire
+// protocol regardless of chain-state.
+func HasInconsistentCertificates(headers []MsgHeader) bool {
+	hasCert, noCert := false, false
+	for i := range headers {
+		if headers[i].BlockCertificate() != nil {
+			hasCert = true
+		} else {
+			noCert = true
+		}
+		if hasCert && noCert {
+			return true
+		}
+	}
+	return false
 }

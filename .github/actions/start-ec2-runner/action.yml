@@ -69,29 +69,42 @@ runs:
         # are interpreted by bash at write time, not at execution time.
         # Always use single quotes for strings and inline paths directly.
         #
-        # /dev/nvme1n1 is the 3.5T ephemeral NVMe SSD on p5.4xlarge
-        # (nvme0n1 is the 40G root EBS volume). If the instance type
-        # changes, update this path or bake detection into the AMI.
+        # The AWS Deep Learning AMI initializes the p5.4xlarge ephemeral
+        # NVMe SSD itself via dlami-nvme.service and mounts it at
+        # /opt/dlami/nvme. Do not format /dev/nvme1n1 here: it is already
+        # an LVM physical volume by the time this script runs.
         pre-runner-script: |
           echo '=== Dead man switch: self-stop in 3 hours if not terminated ==='
           shutdown -h +180
-          echo '=== Setting up ephemeral NVMe storage ==='
-          mkfs.xfs -f /dev/nvme1n1
-          mkdir -p /mnt/ephemeral
-          mount /dev/nvme1n1 /mnt/ephemeral
-          echo 'Relocating Docker storage to ephemeral NVMe...'
-          mkdir -p /mnt/ephemeral/docker
+          echo '=== Checking DLAMI ephemeral NVMe mount ==='
+          systemctl start dlami-nvme.service
+          mountpoint /opt/dlami/nvme 
+          df -h /opt/dlami/nvme
+          echo 'Relocating Docker and containerd storage to DLAMI ephemeral NVMe...'
+          mkdir -p /opt/dlami/nvme/docker
+          mkdir -p /opt/dlami/nvme/containerd
           systemctl stop docker
+          systemctl stop docker.socket
+          systemctl stop containerd
           rm -rf /var/lib/docker
+          rm -rf /var/lib/containerd
           mkdir -p /var/lib/docker
-          mount --bind /mnt/ephemeral/docker /var/lib/docker
+          mkdir -p /var/lib/containerd
+          mount --bind /opt/dlami/nvme/docker /var/lib/docker
+          mount --bind /opt/dlami/nvme/containerd /var/lib/containerd
+          mountpoint /var/lib/docker
+          mountpoint /var/lib/containerd
+          df -h /var/lib/docker
+          df -h /var/lib/containerd
+          systemctl start containerd
           systemctl start docker
-          echo 'Binding runner workspace to ephemeral NVMe...'
-          mkdir -p /mnt/ephemeral/work
+          echo 'Binding GitHub runner work directory to DLAMI ephemeral NVMe...'
+          mkdir -p /opt/dlami/nvme/work
           mkdir -p _work
-          mount --bind /mnt/ephemeral/work _work
-          df -h /mnt/ephemeral
-          echo '=== Ephemeral NVMe setup complete ==='
+          mount --bind /opt/dlami/nvme/work _work
+          mountpoint _work
+          df -h _work
+          echo '=== DLAMI ephemeral NVMe setup complete ==='
 
     - name: Check provisioning result
       id: result

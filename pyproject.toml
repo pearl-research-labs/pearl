@@ -5,14 +5,18 @@ description = "Pearl monorepo workspace"
 requires-python = "==3.12.*"
 
 [[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
-# vLLM 0.20.0+cu129 allows transformers 5.x (see wheel requires-dist); default resolution
+# vLLM 0.20.2+cu130 allows transformers 5.x (see wheel requires-dist); default resolution
 # stayed on 4.57.x. Gemma 4 checkpoints need transformers>=5.5 with model_type gemma4.
 [tool.uv]
-override-dependencies = ["transformers>=5.5.1,<6"]
+override-dependencies = [
+  "transformers>=5.5.1,<6",
+  "cuda-bindings>=13.0,<13.1",
+  "cuda-python>=13.0,<13.1",
+]
 
 # Workspace sources - these apply globally to all members
 [tool.uv.sources]
@@ -25,13 +29,13 @@ pearl-gemm-build-utils = {workspace = true}
 pearl-gemm = {workspace = true}
 # use torch compiled against nvidia runtime
 torch = [
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchvision = [
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchaudio = [
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 
 [tool.pytest.ini_options]

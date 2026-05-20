@@ -1114,6 +1114,28 @@ func (b *BlockChain) ChainParams() *chaincfg.Params {
 	return b.chainParams
 }
 
+// CheckHeaderSanity is the header-only equivalent of CheckBlockSanity,
+// wired with the chain's own time source and chain parameters. It mirrors
+// checkBlockSanity's SimNet special-case so that headers-only validation
+// stays consistent with full-block validation: SimNet uses dummy
+// certificates from SolveBlock and depends on PoW verification being
+// skipped at the validation layer.
+func (b *BlockChain) CheckHeaderSanity(header *wire.BlockHeader,
+	cert wire.BlockCertificate) error {
+
+	flags := BFNone
+	if b.chainParams.Net == wire.SimNet {
+		flags |= BFNoPoWCheck
+	}
+	return CheckBlockHeaderSanity(
+		header, cert,
+		b.chainParams.PowLimit,
+		b.timeSource,
+		b.chainParams.MaxTimeOffsetMinutes,
+		flags,
+	)
+}
+
 // VerifyCheckpoint checks that the height and hash match the stored
 // checkpoints.
 //
