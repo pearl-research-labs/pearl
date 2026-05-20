@@ -1,5 +1,6 @@
 import importlib
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -423,6 +424,12 @@ if not SKIP_CUDA_BUILD:
         cutlass_dir / "examples" / "common",
         cutlass_dir / "tools" / "util" / "include",
     ]
+    if sys.platform.startswith("linux"):
+        cuda_cccl_include_dir = (
+            Path(CUDA_HOME) / "targets" / f"{platform.machine()}-linux" / "include" / "cccl"
+        )
+        if cuda_cccl_include_dir.exists():
+            include_dirs.append(cuda_cccl_include_dir)
 
     # Get PyTorch library path for rpath
     torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
@@ -446,7 +453,7 @@ if not SKIP_CUDA_BUILD:
 def get_wheel_url() -> tuple[str, str]:
     torch_cuda_version = parse(torch.version.cuda)
     torch_version_raw = parse(torch.__version__)
-    MIN_CUDA_VERSION = parse("12.8")
+    MIN_CUDA_VERSION = parse("13.0")
     if torch_cuda_version < MIN_CUDA_VERSION:
         raise RuntimeError(
             f"CUDA >= {MIN_CUDA_VERSION} is required, but torch was built with CUDA {torch_cuda_version}"

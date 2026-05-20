@@ -6,6 +6,7 @@
 #include <cutlass/numeric_types.h>
 #include <torch/all.h>
 #include <cub/cub.cuh>
+#include <cuda/functional>
 #include "quantization_util.cuh"
 #include "quantize_kernel.hpp"
 
@@ -91,7 +92,8 @@ CUTLASS_GLOBAL void dynamic_scaled_quant_kernel(
   // CUB block reduction across all threads
   using BlockReduce = cub::BlockReduce<float, COMPILE_TIME_STRIDE>;
   __shared__ typename BlockReduce::TempStorage tmp;
-  float block_max = BlockReduce(tmp).Reduce(thread_max, cub::Max{}, blockDim.x);
+  float block_max =
+      BlockReduce(tmp).Reduce(thread_max, ::cuda::maximum<>{}, blockDim.x);
 
   __shared__ float scale;
   __shared__ bool is_zero;
