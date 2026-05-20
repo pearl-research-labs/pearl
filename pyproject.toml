@@ -12,7 +12,11 @@ explicit = true
 # vLLM 0.20.2+cu130 allows transformers 5.x (see wheel requires-dist); default resolution
 # stayed on 4.57.x. Gemma 4 checkpoints need transformers>=5.5 with model_type gemma4.
 [tool.uv]
-override-dependencies = ["transformers>=5.5.1,<6"]
+override-dependencies = [
+  "transformers>=5.5.1,<6",
+  "cuda-bindings>=13.0,<13.1",
+  "cuda-python>=13.0,<13.1",
+]
 
 # Workspace sources - these apply globally to all members
 [tool.uv.sources]
