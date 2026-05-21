@@ -88,10 +88,15 @@ CUTLASS_GLOBAL void dynamic_scaled_quant_kernel(
         });
   }
 
-  // CUB block reduction across all threads
+  // CUB block reduction across all threads.
+  // cub::Max was removed in CUB 2.8 / CUDA 13. Use a local functor that
+  // compiles cleanly on both CUDA 12.x and 13.x without an arch ladder.
+  struct FloatMaxOp {
+    __device__ float operator()(float a, float b) const { return fmaxf(a, b); }
+  };
   using BlockReduce = cub::BlockReduce<float, COMPILE_TIME_STRIDE>;
   __shared__ typename BlockReduce::TempStorage tmp;
-  float block_max = BlockReduce(tmp).Reduce(thread_max, cub::Max{}, blockDim.x);
+  float block_max = BlockReduce(tmp).Reduce(thread_max, FloatMaxOp{}, blockDim.x);
 
   __shared__ float scale;
   __shared__ bool is_zero;
