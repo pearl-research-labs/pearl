@@ -615,6 +615,254 @@ void gemm(at::Tensor& A,         // m x k
 done:;
 }
 
+// ----------------------------------------------------------------------------
+// gemm_persistent_multinonce
+// ----------------------------------------------------------------------------
+// Persistent-CTA multi-nonce noiseless GEMM. For B nonce slots, runs a single
+// kernel launch that fans across all slots: each persistent CTA claims one
+// (m_block, n_block) cohort and loops NonceCount=256 nonces inside, swapping
+// A pointers via the device-side NonceContext array. B operand is shared,
+// resident in L2 across the wave (and -- when the cohort + K-tile counts allow
+// -- shared in smem via the kPersistB hook).
+//
+// Activation requires PEARL_SM89_PERSISTENT_NONCE=1 in the environment AND the
+// number of K-tiles per CTA to fit in pipeline stages (single-cohort safe). At
+// production K=1024 with kStages=3 the kStages constraint is violated, so the
+// B-skip in smem can't activate — but the launch-overhead amortization +
+// device-side scheduling savings + L2 residency win still apply.
+//
+// Inputs match _nonce_batcher.py:
+//   A_batch:        (B, M, K) int8     -- per-nonce activations
+//   B:              (N, K)    int8     -- shared weight
+//   A_scales_batch: (B, M)    float32  -- per-nonce row scales
+//   B_scales:       (N,)      float32  -- shared col scales
+//   C_batch:        (B, M, N) bfloat16 -- per-nonce output
+//   contexts:       (B, 4)    int64    -- NonceContext[B], packed as
+//                                         [A_ptr, A_scales_ptr, C_ptr, nonce]
+//   nonces:         (B,)      int64    -- nonces (currently informational; the
+//                                         kernel reads A_ptr/A_scales_ptr/C_ptr
+//                                         from contexts on each iter)
+//
+// The next 14 scratch tensors mirror noisy_gemm but are NOT yet consumed by
+// the multinonce kernel (the per-nonce noise pipeline isn't wired in this
+// scaffolding iteration). They're accepted so the Python signature matches
+// _nonce_batcher.launch() — passing them through avoids a separate test scaffold
+// for the smoke path. Reserve for the follow-up where noise-gen-per-nonce
+// lands.
+void gemm_persistent_multinonce(
+    at::Tensor& A_batch,         // (B, M, K) int8
+    at::Tensor& B,               // (N, K)    int8
+    at::Tensor& A_scales_batch,  // (B, M)    float32
+    at::Tensor& B_scales,        // (N,)      float32
+    at::Tensor& C_batch,         // (B, M, N) bf16
+    at::Tensor& contexts,        // (B, 8)    int64  wave-13 layout
+    at::Tensor& /*nonces*/,      // (B,)      int64
+    // Scratch (accepted but not yet consumed — see header note above)
+    at::Tensor& EAL, at::Tensor& EAL_fp16,
+    at::Tensor& EBR, at::Tensor& EBR_fp16,
+    at::Tensor& EAR_R_major, at::Tensor& EBL_R_major,
+    at::Tensor& EAR_K_major, at::Tensor& EBL_K_major,
+    at::Tensor& AxEBL_fp16, at::Tensor& EARxBpEB_fp16,
+    at::Tensor& ApEA, at::Tensor& BpEB,
+    at::Tensor& /*host_signal_header*/, at::Tensor& /*host_signal_sync*/,
+    at::Tensor& /*pow_target*/, at::Tensor& /*pow_key*/,
+    at::Tensor& AxEBL_int32, at::Tensor& EARxBpEB_int32,
+    int64_t bM, int64_t bN, int64_t bK, int64_t cM, int64_t cN,
+    int64_t matmul_stages,
+    std::optional<int64_t> swizzle, bool swizzle_n_maj,
+    int64_t /*noise_tile_a_m*/, int64_t /*noise_tile_a_k*/,
+    int64_t /*noise_tile_b_n*/, int64_t /*noise_tile_b_k*/,
+    int64_t /*noise_stages_a*/, int64_t /*noise_stages_b*/,
+    std::optional<int64_t> /*k_blocks_per_split_a*/,
+    std::optional<int64_t> /*k_blocks_per_split_b*/,
+    bool /*run_noising_a*/, bool /*run_noising_b*/,
+    bool skip_reduction, bool skip_denoising,
+    std::optional<at::Tensor> /*inner_hash_counter*/,
+    bool /*enable_debug*/) {
+  at::cuda::CUDAGuard device_guard{(char)A_batch.get_device()};
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+  CHECK_DEVICE(A_batch);
+  CHECK_DEVICE(B);
+  CHECK_DEVICE(A_scales_batch);
+  CHECK_DEVICE(B_scales);
+  CHECK_DEVICE(C_batch);
+  CHECK_DEVICE(contexts);
+
+  CHECK_CONTIGUOUS(A_batch);
+  CHECK_CONTIGUOUS(B);
+  CHECK_CONTIGUOUS(A_scales_batch);
+  CHECK_CONTIGUOUS(B_scales);
+  CHECK_CONTIGUOUS(C_batch);
+  CHECK_CONTIGUOUS(contexts);
+
+  TORCH_CHECK(A_batch.dim() == 3, "A_batch must be 3D (B, M, K)");
+  TORCH_CHECK(A_scales_batch.dim() == 2, "A_scales_batch must be 2D (B, M)");
+  TORCH_CHECK(C_batch.dim() == 3, "C_batch must be 3D (B, M, N)");
+
+  int batch_size = int(A_batch.size(0));
+  int m = int(A_batch.size(1));
+  int k = int(A_batch.size(2));
+  int n = int(B.size(0));
+
+  TORCH_CHECK(B.size(1) == k, "B.size(1) must match A_batch.size(2)");
+  TORCH_CHECK(A_scales_batch.size(0) == batch_size, "batch sizes must match");
+  TORCH_CHECK(A_scales_batch.size(1) == m, "A_scales row count must match M");
+  TORCH_CHECK(B_scales.size(0) == n, "B_scales size must match N");
+  TORCH_CHECK(C_batch.size(0) == batch_size, "C_batch batch must match");
+  TORCH_CHECK(C_batch.size(1) == m && C_batch.size(2) == n,
+              "C_batch shape mismatch");
+  TORCH_CHECK(contexts.dim() == 2 && contexts.size(0) == batch_size &&
+                  contexts.size(1) == 8,
+              "contexts must be (batch_size, 8) wave-13 layout: "
+              "[A, A_scales, C, host_signal_header, host_signal_sync, "
+              "pow_target, pow_key, nonce_value]");
+  TORCH_CHECK(contexts.scalar_type() == torch::kInt64,
+              "contexts must be int64");
+
+  // Verify the dtype contracts.
+  TORCH_CHECK(A_batch.dtype() == torch::kInt8, "A_batch must be int8");
+  TORCH_CHECK(B.dtype() == torch::kInt8, "B must be int8");
+  TORCH_CHECK(A_scales_batch.dtype() == torch::kFloat32,
+              "A_scales_batch must be float32");
+  TORCH_CHECK(B_scales.dtype() == torch::kFloat32, "B_scales must be float32");
+  TORCH_CHECK(C_batch.dtype() == at::kBFloat16, "C_batch must be bfloat16");
+
+  TORCH_CHECK(k % bK == 0, "K must be divisible by bK");
+
+  PearlAPIParams params;
+  using ElementOut = cutlass::bfloat16_t;
+
+  static constexpr int align_n = 128 / (sizeof(ElementOut) * 8);
+  TORCH_CHECK(n % align_n == 0,
+              "N must be divisible by " + std::to_string(align_n));
+
+  params.m = m;
+  params.n = n;
+  params.k = k;
+  params.r = 64;  // matches the noiseless path
+
+  if (swizzle.has_value()) {
+    params.swizzle = static_cast<int>(swizzle.value());
+  } else {
+    int b_maj = swizzle_n_maj ? bN : bM;
+    params.swizzle = get_swizzle_size(params.k, b_maj, dprops);
+  }
+  params.swizzle_n_maj = swizzle_n_maj;
+
+  // Pointer wiring. For the multi-nonce path the MAINLOOP reads A through
+  // ptr_nonce_contexts[i].ptr_A at iteration i (see
+  // pearl_gemm_kernel_sm89.h's HasNonceContextsField override). The default
+  // ptr_ApEA = slot 0 is still required because the mainloop's Params struct
+  // carries `ptr_A`; the per-iteration override patches it for iters 1..N-1.
+  params.ptr_A         = nullptr;
+  params.ptr_B         = nullptr;
+  // Wave-13: noise factors + scratch are SHARED across the batch (the
+  // commitment_hash, and therefore noise_gen output, is constant across
+  // the 256 nonces of one launch). Wire them through from the args.
+  params.ptr_EAL          = EAL.data_ptr();
+  params.ptr_EAL_mma      = EAL_fp16.data_ptr();
+  params.ptr_EBR          = EBR.data_ptr();
+  params.ptr_EBR_mma      = EBR_fp16.data_ptr();
+  params.ptr_AxEBL        = AxEBL_fp16.data_ptr();
+  params.ptr_EARxBpEB     = EARxBpEB_fp16.data_ptr();
+  params.ptr_AxEBL_mma    = AxEBL_fp16.data_ptr();
+  params.ptr_EARxBpEB_mma = EARxBpEB_fp16.data_ptr();
+  params.ptr_AxEBL_int32  = AxEBL_int32.data_ptr();
+  params.ptr_EARxBpEB_int32 = EARxBpEB_int32.data_ptr();
+  params.ptr_EAR_R_major  = EAR_R_major.data_ptr();
+  params.ptr_EBL_R_major  = EBL_R_major.data_ptr();
+  params.ptr_EAR_K_major  = EAR_K_major.data_ptr();
+  params.ptr_EBL_K_major  = EBL_K_major.data_ptr();
+  params.ptr_ApEA         = A_batch.data_ptr();   // slot 0 base; per-iter override
+  params.ptr_BpEB         = B.data_ptr();
+  params.ptr_A_scales     = A_scales_batch.data_ptr();  // slot 0 base; override
+  params.ptr_B_scales     = B_scales.data_ptr();
+  params.ptr_C            = C_batch.data_ptr();   // slot 0 base; override
+  // host_signal + PoW are also per-iter from contexts; slot-0 defaults are
+  // ignored by the multinonce kernel (the per-iter override fires before
+  // the mainloop reads them).
+  params.host_signal_header_pinned = nullptr;
+  params.host_signal_sync          = nullptr;
+
+  params.k_blocks_per_split_noising_A = 0;
+  params.k_blocks_per_split_noising_B = 0;
+  params.inner_hash_counter = nullptr;
+  params.ptr_pow_target = nullptr;
+  params.ptr_pow_key    = nullptr;
+
+  // Wave-13 NonceContext layout: 7 pointers per slot, kept as a packed
+  // 56-byte stride device-side struct.
+  //
+  // The Python contexts tensor is (batch_size, 8) int64 with columns:
+  //   [0] A_ptr             [device]
+  //   [1] A_scales_ptr      [device]
+  //   [2] C_ptr             [device]
+  //   [3] host_signal_header_pinned_ptr [pinned host]
+  //   [4] host_signal_sync_ptr          [device]
+  //   [5] pow_target_ptr    [device, uint32_t[8]]
+  //   [6] pow_key_ptr       [device, uint32_t[8]]
+  //   [7] nonce_value       (kernel-side bookkeeping; not read by mainloop)
+  //
+  // We copy columns [0..6] into a packed pearl::sm89::NonceContext[batch_size]
+  // device buffer. NonceContext is 7 pointers, no explicit padding (each member
+  // is pointer-aligned, total is a multiple of 8), so writing 7 contiguous
+  // int64s per slot is bit-identical to what the kernel reads field-by-field.
+  params.ptr_nonce_contexts = nullptr;
+  params.nonce_batch_size   = batch_size;
+
+  static constexpr size_t kNonceCtxStride = 56;  // 7 pointers * 8 bytes
+  static thread_local void* d_nonce_ctx_buf = nullptr;
+  static thread_local int   d_nonce_ctx_cap = 0;
+  size_t const required_bytes =
+      static_cast<size_t>(batch_size) * kNonceCtxStride;
+  if (d_nonce_ctx_cap < batch_size) {
+    if (d_nonce_ctx_buf != nullptr) cudaFree(d_nonce_ctx_buf);
+    cudaMalloc(&d_nonce_ctx_buf, required_bytes);
+    d_nonce_ctx_cap = batch_size;
+  }
+  // Build the packed staging on the host (7 int64s per slot) then push.
+  std::vector<int64_t> h_ctxs(static_cast<size_t>(batch_size) * 7);
+  auto contexts_cpu = contexts.cpu();
+  auto contexts_acc = contexts_cpu.accessor<int64_t, 2>();
+  for (int i = 0; i < batch_size; ++i) {
+    h_ctxs[7 * i + 0] = contexts_acc[i][0];  // ptr_A
+    h_ctxs[7 * i + 1] = contexts_acc[i][1];  // ptr_A_scales
+    h_ctxs[7 * i + 2] = contexts_acc[i][2];  // ptr_C
+    h_ctxs[7 * i + 3] = contexts_acc[i][3];  // host_signal_header_pinned
+    h_ctxs[7 * i + 4] = contexts_acc[i][4];  // host_signal_sync
+    h_ctxs[7 * i + 5] = contexts_acc[i][5];  // ptr_pow_target
+    h_ctxs[7 * i + 6] = contexts_acc[i][6];  // ptr_pow_key
+  }
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  cudaMemcpyAsync(d_nonce_ctx_buf, h_ctxs.data(), required_bytes,
+                  cudaMemcpyHostToDevice, stream);
+  params.ptr_nonce_contexts = d_nonce_ctx_buf;
+
+  constexpr bool EnableDebug = false;
+
+  bool kernel_found = false;
+  SKIP_REDUCTION_SWITCH(
+      skip_reduction, SkipReduction,
+      SKIP_DENOISING_SWITCH(
+          skip_denoising, SkipDenoising,
+          for (int const R : {64, 128}) {
+            MATMUL_CONFIG_SWITCH(
+                bM, bN, bK, R, matmul_stages, cM, cN, kernel_found = true;
+                run_pearl_gemm_<ElementOut, R_, bM_, bN_, bK_, stages_, cM_, cN_,
+                                SkipReduction, SkipDenoising, EnableDebug>(params,
+                                                                           stream);
+                goto done;);
+          }
+      ));
+  TORCH_CHECK(kernel_found,
+              "No gemm_persistent_multinonce kernel found: bM=", bM,
+              " bN=", bN, " bK=", bK, " cM=", cM, " cN=", cN,
+              " stages=", matmul_stages,
+              " skip_reduction=", skip_reduction,
+              " skip_denoising=", skip_denoising);
+done:;
+}
+
 void noisy_gemm(
     at::Tensor& A,                                  // m x k
     at::Tensor& B,                                  // n x k
@@ -1054,6 +1302,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Convert denoising factors from int32 to fp16");
   m.def("noisy_gemm", &noisy_gemm, "Noisy GEMM");
   m.def("gemm", &gemm, "GEMM without noising steps");
+  m.def("gemm_persistent_multinonce", &gemm_persistent_multinonce,
+        "Persistent-CTA multi-nonce GEMM (sm_89). One launch fans across "
+        "all batch slots; B is reused, A varies per nonce via the contexts "
+        "array. Requires PEARL_SM89_PERSISTENT_NONCE=1 in the environment to "
+        "activate; otherwise this entry behaves like a regular single-nonce "
+        "GEMM on slot 0 of the batch.");
   m.def("noise_A", &noise_A, "Noise A (activations)");
   m.def("noise_B", &noise_B, "Noise B (weights)");
   m.def("get_host_signal_header", &get_host_signal_header,
@@ -1083,6 +1337,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("threads_per_block") = DEFAULT_THREADS_PER_BLOCK);
   m.attr("kEALScaleFactorDenoise") = pearl::kEALScaleFactorDenoise;
   m.attr("kEBRScaleFactorDenoise") = pearl::kEBRScaleFactorDenoise;
+
+  // Minimum CUDA compute capability supported by this build. Set by setup.py
+  // based on PEARL_GEMM_TARGET_ARCH. Read by vllm-miner's PearlKernel.get_min_capability().
+  //   PEARL_GEMM_BUILD_SM89                  -> 8  (Ampere/Ada baseline)
+  //   PEARL_GEMM_BUILD_SM120                 -> 8  (consumer Blackwell uses
+  //                                                  the sm_89 source path,
+  //                                                  which is sm_80-PTX based)
+  //   PEARL_GEMM_BUILD_SM89 + SM120          -> 8
+  //   PEARL_GEMM_BUILD_SM90A                 -> 9  (Hopper only)
+  //   SM89 + SM90A (legacy "all" fat binary) -> 8  (runtime dispatches)
+#if defined(PEARL_GEMM_BUILD_SM89) || defined(PEARL_GEMM_BUILD_SM120)
+  m.attr("_min_compute_capability") = 8;
+#elif defined(PEARL_GEMM_BUILD_SM90A)
+  m.attr("_min_compute_capability") = 9;
+#else
+  m.attr("_min_compute_capability") = 9;
+#endif
   py::enum_<HostSignalStatus>(m, "HostSignalStatus")
       .value("kSignalIdle", HostSignalStatus::kSignalIdle)
       .value("kSignalTriggered", HostSignalStatus::kSignalTriggered);
@@ -1118,6 +1389,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("target", &HostSignalHeader::target)
       .def_readonly("num_registers_per_thread",
                     &HostSignalHeader::num_registers_per_thread)
+      .def("block_in_bounds", &HostSignalHeader::block_in_bounds)
       .def("__repr__", [](const HostSignalHeader& self) {
         std::stringstream ss;
         ss << "HostSignalHeader(status=" << self.status;

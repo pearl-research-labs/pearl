@@ -85,7 +85,41 @@ CORES_PER_JOB = 1
 FALLBACK_MAX_JOBS = 4
 KB_PER_GB = 1024 * 1024
 NVCC_THREAD_COUNT = "4"
-COMPUTE_CAPABILITY = "arch=compute_90a,code=sm_90a"
+
+# Target architecture(s). Set via PEARL_GEMM_TARGET_ARCH env var.
+#   "90a"          (default): sm_90a only -- Hopper H100/H200. Existing behavior.
+#   "89"                   : sm_89 only -- Ada Lovelace (RTX 40-series, L40, etc.)
+#   "120"                  : sm_120 only -- consumer Blackwell (RTX 50-series).
+#   "all"                  : sm_89 + sm_90a fat binary (legacy combo).
+#   "all-consumer"         : sm_89 + sm_120 fat binary (covers all consumer GPUs
+#                            we ship MeowMiner on: Ada + Blackwell).
+#
+# sm_120 uses the same host/kernel/traits code path as sm_89 (see
+# pearl_gemm_launch_template.h). Consumer Blackwell is an sm_80-PTX superset,
+# so the existing sm_89 sources compile cleanly with the sm_120 gencode; only
+# the SASS variant in the fat binary differs.
+TARGET_ARCH = os.getenv("PEARL_GEMM_TARGET_ARCH", "90a").lower()
+_ARCH_GENCODES = {
+    "89":           ["arch=compute_89,code=sm_89"],
+    "90a":          ["arch=compute_90a,code=sm_90a"],
+    "120":          ["arch=compute_120,code=sm_120"],
+    "all":          ["arch=compute_89,code=sm_89",
+                     "arch=compute_90a,code=sm_90a"],
+    "all-consumer": ["arch=compute_89,code=sm_89",
+                     "arch=compute_120,code=sm_120"],
+}
+if TARGET_ARCH not in _ARCH_GENCODES:
+    raise ValueError(
+        f"PEARL_GEMM_TARGET_ARCH={TARGET_ARCH!r} not in {sorted(_ARCH_GENCODES)}"
+    )
+COMPUTE_CAPABILITIES = _ARCH_GENCODES[TARGET_ARCH]
+ENABLED_ARCHES = {
+    "89":           [89],
+    "90a":          [90],
+    "120":          [120],
+    "all":          [89, 90],
+    "all-consumer": [89, 120],
+}[TARGET_ARCH]
 
 
 def linux_total_ram_kb() -> int:
@@ -348,7 +382,11 @@ if not SKIP_CUDA_BUILD:
     warn_if_cuda_home_missing("pearl_gemm")
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     print(f"cuda version = {bare_metal_version}\n\n")
-    arch_flags = ["-gencode", COMPUTE_CAPABILITY]
+    print(f"target arch = {TARGET_ARCH} (enabled SMs: {ENABLED_ARCHES})\n")
+    arch_flags = []
+    for gencode in COMPUTE_CAPABILITIES:
+        arch_flags += ["-gencode", gencode]
+    arch_defs = [f"-DPEARL_GEMM_BUILD_SM{a if a != 90 else '90A'}" for a in ENABLED_ARCHES]
 
     if not SKIP_CPP_GENERATION:
         # Generate template instantiations for all possible kernels
@@ -391,6 +429,30 @@ if not SKIP_CUDA_BUILD:
         f"csrc/gemm/instantiations/noisingB_R{cfg.R}_{cfg.EARxBpEB_type}_{cfg.tile_size_n}x{cfg.tile_size_k}_{cfg.pipeline_stages}stages.cu"
         for cfg in NOISING_B_KERNELS
     )
+    # sm_120 (consumer Blackwell) reuses the same source files as sm_89: the
+    # mainloop / epilogue / kernel use only sm_80-class MMA + cp.async atoms,
+    # which sm_120 supports natively. nvcc emits both SASS variants from the
+    # gencode list when both are enabled.
+    if 89 in ENABLED_ARCHES or 120 in ENABLED_ARCHES:
+        sources.extend([
+            "csrc/gemm/pearl_gemm_sm89_inst.cu",
+            "csrc/gemm/pearl_gemm_sm89_denoise_inst.cu",
+            "csrc/gemm/pearl_gemm_sm89_pow_inst.cu",
+            "csrc/gemm/pearl_gemm_sm89_r128_bM64_inst.cu",
+            "csrc/gemm/pearl_gemm_sm89_r128_regresident_inst.cu",
+            # NOTE: pearl_gemm_sm89_r128_bN256_regresident_inst.cu intentionally
+            # NOT included — wave-3 bench (csv at pearl-investigation/
+            # bench_r128_bN256_regresident_2026_05_17.csv) showed 11-42× LOSS
+            # vs wave-2 R=128 bM=64 bN=128 smem-resident across all production
+            # sizes due to register-resident denoise inner-R loop dominating
+            # mainloop on CUDA 12.1 (13 KB spill). Kernel correctness validated
+            # bit-exact vs CPU ref and vs sister bM=128 bN=128 regres path; the
+            # instantiation file is kept on disk for future re-evaluation under
+            # a different CUDA toolchain.
+            # "csrc/gemm/pearl_gemm_sm89_r128_bN256_regresident_inst.cu",
+            "csrc/gemm/pearl_noisingA_sm89_inst.cu",
+            "csrc/gemm/pearl_noisingB_sm89_inst.cu",
+        ])
 
     feature_args = [f"-D{name}" for name, enabled in FEATURE_FLAGS.items() if enabled]
 
@@ -432,8 +494,8 @@ if not SKIP_CUDA_BUILD:
             name="pearl_gemm_cuda",
             sources=sources,
             extra_compile_args={
-                "cxx": gcc_flags + feature_args,
-                "nvcc": append_nvcc_threads(nvcc_flags + arch_flags + feature_args),
+                "cxx": gcc_flags + feature_args + arch_defs,
+                "nvcc": append_nvcc_threads(nvcc_flags + arch_flags + feature_args + arch_defs),
             },
             extra_link_args=[f"-Wl,-rpath,{torch_lib_path}", "-Wl,-rpath,$ORIGIN"],
             include_dirs=include_dirs,

@@ -9,7 +9,12 @@
 #include "commitment_hash_from_merkle_roots_kernel.hpp"
 #include "compute_blake_mt_kernel.hpp"
 #include "gemm/error_check.hpp"
+// sm_89 (Ada) and sm_120 (consumer Blackwell) share the non-TMA merkle path.
+#if defined(PEARL_GEMM_BUILD_SM89) || defined(PEARL_GEMM_BUILD_SM120)
+#include "merkle_tree_roots_kernel_sm89.hpp"
+#else
 #include "merkle_tree_roots_kernel.hpp"
+#endif
 #include "reduce_roots_kernel.h"
 #include "tensor_hash_constants.cuh"
 
@@ -19,7 +24,9 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#if !defined(PEARL_GEMM_BUILD_SM89) && !defined(PEARL_GEMM_BUILD_SM120)
 #include "cutlass/cluster_launch.hpp"
+#endif
 #include "cutlass/cutlass.h"
 #include "cutlass/device_kernel.h"  // For device_kernel
 #include "cutlass/kernel_hardware_info.h"
@@ -48,9 +55,15 @@ void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
   set_key(key);
   const u32 data_len = data_size;
 
+#if defined(PEARL_GEMM_BUILD_SM89) || defined(PEARL_GEMM_BUILD_SM120)
+  using MerkleTreeRootsKernel =
+      pearl::MerkleTreeRootsKernelSm89<kNumConsumerThreads, kNumStages,
+                                       kThreadLoadSize>;
+#else
   using MerkleTreeRootsKernel =
       pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages,
                                    kThreadLoadSize>;
+#endif
   constexpr static int merkle_roots_smem_size =
       MerkleTreeRootsKernel::SharedStorageSize;
   typename MerkleTreeRootsKernel::Arguments args{
