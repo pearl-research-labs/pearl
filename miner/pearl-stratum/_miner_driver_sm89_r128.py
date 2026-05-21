@@ -1,0 +1,1336 @@
+"""sm_89-native pearl miner driver — R=128 variant.
+
+Sibling of `_miner_driver_sm89.py` (R=64). Production alphapool sends
+`rank=128` in `pearl.set_mining_params`; the R=64 driver's shares are
+not pool-verifiable. This module exercises the wave-2 sm_89 build with
+bM=64 bN=128 R=128 (the +16-35% throughput winner over bN=64).
+
+sm_89 inst configuration (per kernel_traits_sm89.hpp R=128 fitting math
++ wave-2 bench results in pearl_gemm_sm89_r128_bM64_inst.cu):
+  - matmul tile 64x128x64 R=128 stages=2  (PoW path, SkipReduction=False)
+  - noisingA 64x64 R=128 int32 stages=2
+  - noisingB 64x64 R=128 int32 stages=2   (worktile size on (N,K) matrix;
+    independent of matmul bN — default_compiled_kernels.py only enumerates
+    tile_size_n=64 for noisingB at R=128)
+
+Smem accounting for sm_89's 99 KB opt-in cap (Denoise variant, union
+of A+B-tile arm and denoise-factors arm dominated by the latter):
+  - matmul A/B arm:              (bM+bN)*bK*stages = (64+128)*64*2*1B  = 24.0 KB
+  - SharedStorageDenoise arm-2:  2 * (bM+bN) * R * 2B = 2*192*128*2    = 96.0 KB
+  - union(A+B, denoise)          = max(24, 96)                          = 96.0 KB
+  - +smem_C+scales+pipeline                                              ≈  1.0 KB
+                                                                       --------
+                                                                         97.0 KB  ok (2 KB headroom)
+
+Falls back to bN=64 if the bN=128 instantiation isn't compiled into the
+.so. Set PEARL_SM89_R128_BN=64 to force the legacy tile.
+
+Connects to alphapool via the pearl-stratum shim. Same wallet+pool+worker
+contract as `_miner_driver_sm89.py`; only the kernel tile + R changes here.
+
+Multi-stream chain dispatch:
+  `--num-streams N` (default 1) launches N independent mining chains on
+  separate CUDA streams. Each stream has its own buffer set and PoW signal
+  buffers; cross-stream is fully independent (different nonces, different
+  outputs). Sized for 4070 Ti SUPER 16GB: at M=N=2048 K=4096 R=128 each
+  stream needs ~50MB of GPU memory, so N=4 fits comfortably.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import time
+from typing import Any
+
+# pearl-stratum shim path. Skip on hosts where this dir doesn't exist
+# (only present on the pearl-deploy CPU01/CPU02 layout; everywhere else
+# vllm-miner is on sys.path via pip).
+_PEARL_DEPLOY_VLLM_MINER = "/host_home/pearl-deploy/vllm-miner/src"
+if os.path.isdir(_PEARL_DEPLOY_VLLM_MINER):
+    sys.path.insert(0, _PEARL_DEPLOY_VLLM_MINER)
+
+import pearl_stratum.gateway_shim as _shim
+import miner_base.gateway_client as _gc
+_gc.MiningClient = _shim.StratumGatewayClient  # monkey-patch BEFORE miner_base imports
+
+import torch
+import pearl_gemm_cuda as pg
+from pearl_stratum.stratum_client import StratumClient
+from pearl_stratum.gateway_shim import init_shared_state
+from vllm_miner.mining_state import (
+    get_async_manager,
+    init_async_manager,
+    init_pinned_pool,
+)
+
+# Share-derivation imports — mirrors `vllm_miner.gemm_operators.pearl_gemm_noisy`
+# (the reference implementation). Without these the kernel's pow_key is zeros,
+# every share is rejected as "invalid commitment", and PoW hits are silently
+# discarded. See `pearl-investigation/share_submission_audit_2026_05_17.md`.
+from pearl_gemm import (
+    HostSignalStatus,
+    commitment_hash_from_merkle_roots,
+    extract_indices,
+    get_host_signal_header,
+    get_required_scratchpad_bytes,
+    make_pow_target_tensor,
+    noise_gen,
+    tensor_hash,
+)
+from miner_base.commitment_hash import CommitmentHasher
+from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
+from pearl_gateway.comm.dataclasses import (
+    CommitmentHash,
+    MiningJob,
+    OpenedBlockInfo,
+)
+
+# Persistent-CTA batching primitives. Kept in a sibling module so it can be
+# unit-tested without importing this driver (which pulls a lot of side-effect
+# imports for the production shim path). See `_nonce_batcher.py` for the
+# layout + env-gating contract.
+from _nonce_batcher import (
+    BatchConfig,
+    DEFAULT_BATCH_SIZE,
+    NonceBatch,
+    is_one_A_per_attempt_enabled,
+    is_persistent_nonce_enabled,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("pearl_miner_sm89_r128")
+
+DECOY = "prl1pgk8j7vj0xkxppzux5vqgqur9t03k9zvmm5qkam5hzaavzs69vjkqzz28wg"
+HOST = os.environ.get("PEARL_POOL_HOST", "us2.alphapool.tech")
+PORT = int(os.environ.get("PEARL_POOL_PORT", "5566"))
+WORKER = os.environ.get("PEARL_WORKER", "cpu02-sm89-r128")
+DEVICE = torch.device("cuda:0")
+
+# CUDA Graph capture path (env-gated). Wraps the per-attempt `pg.noisy_gemm()`
+# call in a captured CUDA Graph so the 5 internal kernel launches (noisingA,
+# GEMM, noisingB, denoise, PoW) become one graph-replay submit instead of 5
+# per-launch Python+driver round-trips. Inputs (A, B, A_scales, B_scales,
+# pow_key) are mutated in-place in persistent buffers via tensor.copy_/.random_
+# before each replay so the captured graph parameters stay valid. The eager
+# path is unchanged when this is unset/0. Composes with `--num-streams`: each
+# slot captures its own graph and replays independently on its own stream.
+# Bit-exact equivalence vs eager is verified by `tests/_bench_cuda_graph.py`.
+USE_CUDA_GRAPH = os.environ.get("PEARL_SM89_CUDA_GRAPH", "0") == "1"
+GRAPH_WARMUP_ITERS = int(os.environ.get("PEARL_SM89_GRAPH_WARMUP", "3"))
+
+# R=128 tile config (sm_89 wave-2 winner: bM=64 bN=128).
+# Pool sends M=N=131072 K=4096 R=128; we chunk to 2048x2048.
+CHUNK_M, CHUNK_N, CHUNK_K, R = 2048, 2048, 4096, 128
+
+# Tile shape for pg.noisy_gemm — must match the sm_89 inst the .so was
+# compiled with. Wave-2 bench: bN=128 beats bN=64 by +16-35% across all
+# benched shapes (1024^3..8192^3) with bit-exact correctness. Env overrides
+# `PEARL_SM89_R128_BN=64`/`PEARL_SM89_R128_BM=128` switch tiles.
+# Wave-10 (2026-05-18): pool-verifiable cols_pattern requires bN=256 so the
+# per-thread cols cover 64 distinct vals at period 256 (matches MinerSettings
+# [0,1,8,9,...,248,249]). Default flipped to BM=128 BN=256 after wave-9
+# rows-pattern fix landed (kWarpRows=bM/16, kWarpCols=1). The (128,256,64,128)
+# kernel is auto-enabled with kRegisterResidentDenoise=true to fit 99 KB cap.
+BM = int(os.environ.get("PEARL_SM89_R128_BM", "128"))
+BN = int(os.environ.get("PEARL_SM89_R128_BN", "256"))
+BK = 64
+CM, CN = 1, 1
+MATMUL_STAGES = 2
+
+# noisingA/B sm_89 inst (int32 path, R=128). These tile sizes are the
+# kernel's worktile dimensions on the (M,K)/(N,K) matrices — independent
+# of the matmul's bM/bN. default_compiled_kernels.py enumerates only
+# (tile_size_n=64, R=128) for noisingB; the kernel tiles the full N over
+# 64-wide blocks regardless of matmul bN.
+NOISE_TILE_A_M, NOISE_TILE_A_K = 64, 64
+NOISE_TILE_B_N, NOISE_TILE_B_K = 64, 64
+NOISE_STAGES_A = 2
+NOISE_STAGES_B = 2
+
+# Pool's rank parameter we expect. The kernel was built against this; any other
+# value means the .so on disk is mismatched with what the pool is asking for and
+# we have no way to produce verifiable shares.
+EXPECTED_RANK = R
+
+
+class StreamSlot:
+    """One independent mining chain's state.
+
+    Owns its CUDA stream, per-attempt input buffers (re-minted each iteration),
+    scratch buffers re-used across iterations, and the PoW signal buffers it
+    must NOT share with other streams (otherwise concurrent kernels would race
+    on `host_signal_header.global_lock`).
+    """
+
+    def __init__(self, slot_id: int, M: int, N: int, K: int, R: int) -> None:
+        self.id = slot_id
+        self.M, self.N, self.K, self.R = M, N, K, R
+        self.stream = torch.cuda.Stream(device=DEVICE)
+
+        # Scratch buffers — reused across attempts. All sized exactly as the
+        # single-stream driver's allocation.
+        self.EAL            = torch.zeros(M, R, dtype=torch.int8, device=DEVICE)
+        self.EBR            = torch.zeros(N, R, dtype=torch.int8, device=DEVICE)
+        self.EAL_fp16       = torch.zeros(M, R, dtype=torch.float16, device=DEVICE)
+        self.EBR_fp16       = torch.zeros(N, R, dtype=torch.float16, device=DEVICE)
+        self.EAR_R_major    = torch.zeros(K, R, dtype=torch.int8, device=DEVICE)
+        self.EBL_R_major    = torch.zeros(K, R, dtype=torch.int8, device=DEVICE)
+        self.EAR_K_major    = torch.zeros(R, K, dtype=torch.int8, device=DEVICE)
+        self.EBL_K_major    = torch.zeros(R, K, dtype=torch.int8, device=DEVICE)
+        self.AxEBL_fp16     = torch.zeros(M, R, dtype=torch.float16, device=DEVICE)
+        self.EARxBpEB_fp16  = torch.zeros(N, R, dtype=torch.float16, device=DEVICE)
+        self.AxEBL_int32    = torch.zeros(M, R, dtype=torch.int32, device=DEVICE)
+        self.EARxBpEB_int32 = torch.zeros(N, R, dtype=torch.int32, device=DEVICE)
+        self.ApEA           = torch.zeros(M, K, dtype=torch.int8, device=DEVICE)
+        self.BpEB           = torch.zeros(N, K, dtype=torch.int8, device=DEVICE)
+        self.C              = torch.zeros(M, N, dtype=torch.bfloat16, device=DEVICE)
+
+        # PoW signal buffers — MUST be per-slot. The kernel CAS-locks on
+        # `host_signal_sync->global_lock` when a hash beats the target; two
+        # concurrent kernels sharing one sync would race.
+        hh_size = pg.get_host_signal_header_size()
+        hs_size = pg.get_host_signal_sync_size()
+        self.host_signal_header = torch.zeros(hh_size, dtype=torch.int8, pin_memory=True)
+        self.host_signal_sync   = torch.zeros(hs_size, dtype=torch.int8, device=DEVICE)
+
+        # Per-slot pow_target — overwritten each attempt with the real
+        # adjusted target derived from the current mining_job + matmul_config.
+        # See `submit()` for the derivation; this is the BLAKE3 digest-sized
+        # uint256 (8 x uint32) the kernel compares hashes against.
+        self.pow_target = torch.zeros(8, dtype=torch.uint32, device=DEVICE)
+
+        # Per-attempt commitment artifacts — populated by submit(), consumed
+        # by check_and_submit_if_hit() after the kernel completes. Kept alive
+        # across wait() so the host_signal_header bytes remain meaningful
+        # against the SAME A, B, commitment_hash that the kernel saw.
+        self.A_attempt: torch.Tensor | None = None
+        self.B_attempt: torch.Tensor | None = None
+        self.commitment_hash_A: torch.Tensor | None = None
+        self.commitment_hash_B: torch.Tensor | None = None
+        self.mining_job_attempt: MiningJob | None = None
+
+        # tensor_hash needs a scratchpad sized for the largest of A or B's
+        # byte footprint. Allocate once — see pearl_gemm helpers for the
+        # required size.
+        matrix_bytes = max(M * K, N * K)
+        self.tensor_hash_scratchpad = torch.empty(
+            get_required_scratchpad_bytes(matrix_bytes),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )
+
+        # End-of-attempt event so we can bound in-flight work per slot and
+        # reap completed chains in the main loop.
+        self.done_event = torch.cuda.Event(blocking=False)
+        self.in_flight = False
+
+    def submit(
+        self,
+        M: int, N: int, K: int,
+        mining_job: MiningJob,
+        matmul_config: Any,
+    ) -> None:
+        """Enqueue one full noisy_gemm chain on this slot's stream.
+
+        Each attempt re-mints A/B fresh on the same stream so the random
+        generator and the kernel naturally serialize within the slot but stay
+        independent across slots. The commitment chain (tensor_hash →
+        commitment_hash_from_merkle_roots) runs on the SAME stream so the
+        pow_key derivation is correctly ordered against the A/B the kernel
+        will consume.
+        """
+        assert not self.in_flight, "submit called on a slot already in flight"
+
+        with torch.cuda.stream(self.stream):
+            # Mint fresh random (A, B) per attempt — the PoW commitment is over
+            # these matrices via tensor_hash. Issuing on our stream keeps them
+            # ordered with the noisy_gemm that consumes them.
+            A = torch.randint(-127, 127, (M, K), dtype=torch.int8, device=DEVICE)
+            B = torch.randint(-127, 127, (N, K), dtype=torch.int8, device=DEVICE)
+            A_scales = torch.rand(M, dtype=torch.float32, device=DEVICE) * 0.02 + 0.005
+            B_scales = torch.rand(N, dtype=torch.float32, device=DEVICE) * 0.02 + 0.005
+
+            # -- Commitment chain (mirrors vllm_miner.gemm_operators) --------
+            # Without this the kernel uses pow_key=zeros, every share fails
+            # pool's "invalid commitment" check, and noise_gen output is
+            # deterministic garbage instead of the pool-verifiable noise
+            # sequence. See share_submission_audit_2026_05_17.md.
+            hash_key = CommitmentHasher.get_key(
+                mining_job.incomplete_header_bytes, matmul_config.mining_config
+            )
+            key_tensor = torch.frombuffer(
+                bytearray(hash_key), dtype=torch.uint8
+            ).to(DEVICE)
+
+            A_merkle_root = torch.empty(32, device=DEVICE, dtype=torch.uint8)
+            tensor_hash(
+                A.view(torch.uint8), key_tensor, A_merkle_root,
+                self.tensor_hash_scratchpad,
+            )
+            B_merkle_root = torch.empty(32, device=DEVICE, dtype=torch.uint8)
+            tensor_hash(
+                B.view(torch.uint8), key_tensor, B_merkle_root,
+                self.tensor_hash_scratchpad,
+            )
+
+            commitment_hash_A = torch.empty(32, device=DEVICE, dtype=torch.uint8)
+            commitment_hash_B = torch.empty(32, device=DEVICE, dtype=torch.uint8)
+            commitment_hash_from_merkle_roots(
+                A_merkle_root, B_merkle_root, key_tensor,
+                commitment_hash_A, commitment_hash_B,
+            )
+
+            # -- Noise factors keyed on commitment hashes --------------------
+            # noise_gen populates the EAL/EBR/EAR_*/EBL_* tensors from
+            # commitment_hash_{A,B}. The kernel reads these as inputs (not
+            # outputs) — pre-allocated zeros would yield zero noise factors.
+            noise_gen(
+                R=self.R,
+                EAL=self.EAL,
+                EAL_fp16=self.EAL_fp16,
+                EAR_R_major=self.EAR_R_major,
+                EAR_K_major=self.EAR_K_major,
+                EBL_R_major=self.EBL_R_major,
+                EBL_K_major=self.EBL_K_major,
+                EBR=self.EBR,
+                EBR_fp16=self.EBR_fp16,
+                key_A=commitment_hash_A,
+                key_B=commitment_hash_B,
+            )
+
+            # -- Real PoW target -----------------------------------------------
+            # adjust_target scales the network target by the hash-tile work.
+            # make_pow_target_tensor packs it into the (8,) uint32 LE-word form
+            # the kernel compares against. Writing into our pre-allocated
+            # buffer keeps the address stable for CUDA-Graph-friendly callers.
+            adjusted_target = mining_job.adjust_target(
+                mining_config=matmul_config.mining_config
+            )
+            new_pow_target = make_pow_target_tensor(adjusted_target, device=DEVICE)
+            self.pow_target.copy_(new_pow_target)
+
+            _debug_easy = os.environ.get("PEARL_DEBUG_EASY_TARGET")
+            if _debug_easy:
+                _ev = int(_debug_easy, 16)
+                self.pow_target.copy_(torch.tensor(
+                    [_ev] + [0xFFFFFFFF] * 7, dtype=torch.uint32, device=DEVICE))
+
+            pow_key = commitment_hash_A.view(torch.uint32)
+
+            pg.noisy_gemm(
+                A, B, self.EAL, self.EAL_fp16, self.EBR, self.EBR_fp16,
+                self.EAR_R_major, self.EBL_R_major,
+                self.EAR_K_major, self.EBL_K_major,
+                self.AxEBL_fp16, self.EARxBpEB_fp16, self.ApEA, self.BpEB,
+                A_scales, B_scales, self.C,
+                self.host_signal_header, self.host_signal_sync,
+                self.pow_target, pow_key,
+                self.AxEBL_int32, self.EARxBpEB_int32,
+                BM, BN, BK, CM, CN, MATMUL_STAGES,
+                None, True,
+                NOISE_TILE_A_M, NOISE_TILE_A_K,
+                NOISE_TILE_B_N, NOISE_TILE_B_K,
+                NOISE_STAGES_A, NOISE_STAGES_B,
+                None, None,
+                True, True,
+                False, False,
+                None, False,
+            )
+            self.done_event.record(self.stream)
+            self.in_flight = True
+
+            # Stash per-attempt state needed for share submission. These must
+            # stay alive until wait() so the host_signal_header bytes refer to
+            # the same matrices/commitment the kernel actually saw.
+            self.A_attempt = A
+            self.B_attempt = B
+            self.commitment_hash_A = commitment_hash_A
+            self.commitment_hash_B = commitment_hash_B
+            self.mining_job_attempt = mining_job
+
+    def wait(self) -> None:
+        """Block the calling (CPU) thread until this slot's chain completes."""
+        if self.in_flight:
+            self.done_event.synchronize()
+            self.in_flight = False
+
+    def check_and_submit_if_hit(self, mgr, matmul_config=None) -> bool:
+        """Inspect host_signal_header for a PoW hit and dispatch the proof.
+
+        Caller must invoke `wait()` first so the kernel has finished writing
+        the pinned header. Returns True if a share was scheduled, False
+        otherwise. On True the per-attempt commitment artifacts are passed
+        by reference to AsyncLoopManager's submission worker; we drop our
+        local references so they're released when the worker is done.
+
+        `matmul_config` is the optional GPUMatmulConfig used by this slot's
+        submit() — used by the wave-10 probe to log the mining_config bytes
+        that are about to be packed into the proof.  Pass None to skip the
+        probe (no functional effect on submission).
+        """
+        if self.A_attempt is None:  # never submitted, or already consumed
+            return False
+
+        header = get_host_signal_header(self.host_signal_header)
+        hit = False
+        if header.status == HostSignalStatus.kSignalTriggered and header.block_in_bounds():
+            idxs = extract_indices(header)
+            commitment_hash = CommitmentHash(
+                noise_seed_A=self.commitment_hash_A.cpu().numpy().tobytes(),
+                noise_seed_B=self.commitment_hash_B.cpu().numpy().tobytes(),
+            )
+            opened_block_info = OpenedBlockInfo(
+                A_row_indices=idxs.A_row_indices,
+                B_column_indices=idxs.B_column_indices,
+                # .cpu() creates a fresh copy; the slot's A/B buffers will be
+                # overwritten on the next submit().
+                A=self.A_attempt.cpu().detach(),
+                B_t=self.B_attempt.cpu().detach(),
+                commitment_hash=commitment_hash,
+                noise_rank=self.R,
+            )
+            # WAVE10-PROBE: dump proof bytes BEFORE submit so we can diff against
+            # wave-9 capture. Specifically we log: A_row_indices (first 4),
+            # B_column_indices (first 16), n_rows/n_cols, mining_config.to_bytes()
+            # hex, and the incomplete_header bytes. Pool's parse_plain_proof
+            # rebuilds mining_config from indices via list_to_pattern; if our
+            # logged mining_config bytes match the pool's MinerSettings reference
+            # then job_key derivation matches and the share should credit.
+            try:
+                mc_hex = ""
+                if matmul_config is not None:
+                    mc_hex = matmul_config.mining_config.to_bytes().hex()
+                header_hex = self.mining_job_attempt.incomplete_header_bytes.hex() \
+                    if self.mining_job_attempt is not None else ""
+                a_rows = list(idxs.A_row_indices)[:4]
+                b_cols = list(idxs.B_column_indices)[:16]
+                log.warning(
+                    "WAVE10-PROBE slot=%d A_row_indices=%s B_column_indices_first16=%s "
+                    "n_rows=%d n_cols=%d mining_config_hex=%s header_hex=%s",
+                    self.id, a_rows, b_cols,
+                    len(idxs.A_row_indices), len(idxs.B_column_indices),
+                    mc_hex, header_hex,
+                )
+            except Exception:
+                # Never let a debug print suppress a submit.
+                log.exception("WAVE10-PROBE logging failed")
+            mgr.handle_submit_block(opened_block_info, self.mining_job_attempt)
+            # Zero the pinned header so the next attempt sees kSignalIdle.
+            self.host_signal_header.zero_()
+            self.host_signal_sync.zero_()
+            hit = True
+
+        # Drop our per-attempt references — the submission worker (if any)
+        # holds its own copies in opened_block_info.
+        self.A_attempt = None
+        self.B_attempt = None
+        self.commitment_hash_A = None
+        self.commitment_hash_B = None
+        self.mining_job_attempt = None
+        return hit
+
+
+class CudaGraphSlot:
+    """CUDA-Graph variant of `StreamSlot`.
+
+    Same observable interface (`submit()`, `wait()`) so the round-robin loop in
+    `main()` doesn't care which slot type it's driving. The difference:
+
+      * Persistent A, B, A_scales, B_scales, pow_key buffers — addresses must
+        stay stable for the captured graph to be replay-safe.
+      * `submit()` calls `_refresh_inputs()` (in-place `.random_/.uniform_` on
+        the persistent buffers) then `graph.replay()` instead of issuing a
+        fresh `pg.noisy_gemm` call. The captured graph encodes the 5 internal
+        kernel launches as one driver-side replay submit.
+
+    Like `StreamSlot`, holds its own stream + PoW signal buffers so multiple
+    `CudaGraphSlot` instances can run concurrently without racing on the
+    `host_signal_sync->global_lock` CAS.
+
+    Share-derivation note
+    ---------------------
+    The commitment chain (tensor_hash → commitment_hash_from_merkle_roots →
+    noise_gen) is run OUTSIDE the captured region — same persistent commitment
+    buffers, fresh contents per iteration. `pow_key` is a uint32 view onto the
+    same uint8 storage as `commitment_hash_A`, so the captured graph's pow_key
+    pointer stays valid across replays.
+    """
+
+    def __init__(self, slot_id: int, M: int, N: int, K: int, R: int) -> None:
+        self.id = slot_id
+        self.M, self.N, self.K, self.R = M, N, K, R
+        self.stream = torch.cuda.Stream(device=DEVICE)
+
+        # Same scratch + PoW signal buffer set as StreamSlot — the captured
+        # graph encodes the addresses, so allocating once is sufficient.
+        self.EAL            = torch.zeros(M, R, dtype=torch.int8, device=DEVICE)
+        self.EBR            = torch.zeros(N, R, dtype=torch.int8, device=DEVICE)
+        self.EAL_fp16       = torch.zeros(M, R, dtype=torch.float16, device=DEVICE)
+        self.EBR_fp16       = torch.zeros(N, R, dtype=torch.float16, device=DEVICE)
+        self.EAR_R_major    = torch.zeros(K, R, dtype=torch.int8, device=DEVICE)
+        self.EBL_R_major    = torch.zeros(K, R, dtype=torch.int8, device=DEVICE)
+        self.EAR_K_major    = torch.zeros(R, K, dtype=torch.int8, device=DEVICE)
+        self.EBL_K_major    = torch.zeros(R, K, dtype=torch.int8, device=DEVICE)
+        self.AxEBL_fp16     = torch.zeros(M, R, dtype=torch.float16, device=DEVICE)
+        self.EARxBpEB_fp16  = torch.zeros(N, R, dtype=torch.float16, device=DEVICE)
+        self.AxEBL_int32    = torch.zeros(M, R, dtype=torch.int32, device=DEVICE)
+        self.EARxBpEB_int32 = torch.zeros(N, R, dtype=torch.int32, device=DEVICE)
+        self.ApEA           = torch.zeros(M, K, dtype=torch.int8, device=DEVICE)
+        self.BpEB           = torch.zeros(N, K, dtype=torch.int8, device=DEVICE)
+        self.C              = torch.zeros(M, N, dtype=torch.bfloat16, device=DEVICE)
+
+        hh_size = pg.get_host_signal_header_size()
+        hs_size = pg.get_host_signal_sync_size()
+        self.host_signal_header = torch.zeros(hh_size, dtype=torch.int8, pin_memory=True)
+        self.host_signal_sync   = torch.zeros(hs_size, dtype=torch.int8, device=DEVICE)
+        self.pow_target = torch.zeros(8, dtype=torch.uint32, device=DEVICE)
+
+        # Persistent per-attempt input buffers. The captured graph encodes
+        # these addresses; we mutate the contents in-place each iteration via
+        # `.random_/.uniform_/.zero_`, which the kernel then reads.
+        self.A        = torch.zeros(M, K, dtype=torch.int8, device=DEVICE)
+        self.B        = torch.zeros(N, K, dtype=torch.int8, device=DEVICE)
+        self.A_scales = torch.zeros(M, dtype=torch.float32, device=DEVICE)
+        self.B_scales = torch.zeros(N, dtype=torch.float32, device=DEVICE)
+
+        # Persistent commitment-chain buffers. `pow_key` is a uint32 view onto
+        # `commitment_hash_A`'s storage so the captured pow_key pointer stays
+        # valid across replays. tensor_hash_scratchpad's size matches the
+        # max(M*K, N*K) byte footprint at construction time.
+        self.A_merkle_root    = torch.zeros(32, dtype=torch.uint8, device=DEVICE)
+        self.B_merkle_root    = torch.zeros(32, dtype=torch.uint8, device=DEVICE)
+        self.commitment_hash_A = torch.zeros(32, dtype=torch.uint8, device=DEVICE)
+        self.commitment_hash_B = torch.zeros(32, dtype=torch.uint8, device=DEVICE)
+        # key_tensor changes only when (header, mining_config) changes; we copy
+        # into it from a host buffer each submit. Sized for a blake3 digest.
+        self.key_tensor = torch.zeros(32, dtype=torch.uint8, device=DEVICE)
+        matrix_bytes = max(M * K, N * K)
+        self.tensor_hash_scratchpad = torch.empty(
+            get_required_scratchpad_bytes(matrix_bytes),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )
+        self.pow_key = self.commitment_hash_A.view(torch.uint32)
+
+        # Per-attempt mining job (snapshot of the job that produced the
+        # captured pow_target / pow_key). Consumed by check_and_submit_if_hit
+        # to build OpenedBlockInfo.
+        self.mining_job_attempt: MiningJob | None = None
+
+        self.done_event = torch.cuda.Event(blocking=False)
+        self.in_flight = False
+        self.graph: torch.cuda.CUDAGraph | None = None
+
+    def _refresh_inputs(
+        self,
+        mining_job: MiningJob | None = None,
+        matmul_config: Any = None,
+    ) -> None:
+        """Refresh persistent input buffers in-place — addresses stay stable.
+
+        Equivalent to the StreamSlot path's `torch.randint(...)` /
+        `torch.rand(...)` but writes into the existing storage so the
+        graph-captured input pointers stay valid. Called outside the captured
+        region so the random ops themselves don't get baked into the graph.
+
+        When mining_job + matmul_config are supplied, also refreshes the
+        commitment chain (tensor_hash → commitment_hash_from_merkle_roots) and
+        the keyed noise factors (noise_gen) so the captured kernel sees a
+        verifiable pow_key + matching EAL/EBR/EAR/EBL. The capture path
+        (warmup) doesn't pass them — we just need stable addresses there.
+        """
+        self.A.random_(-127, 127)
+        self.B.random_(-127, 127)
+        self.A_scales.uniform_(0.005, 0.025)
+        self.B_scales.uniform_(0.005, 0.025)
+
+        if mining_job is not None and matmul_config is not None:
+            hash_key = CommitmentHasher.get_key(
+                mining_job.incomplete_header_bytes, matmul_config.mining_config
+            )
+            key_host = torch.frombuffer(bytearray(hash_key), dtype=torch.uint8)
+            self.key_tensor.copy_(key_host.to(DEVICE))
+
+            tensor_hash(
+                self.A.view(torch.uint8), self.key_tensor, self.A_merkle_root,
+                self.tensor_hash_scratchpad,
+            )
+            tensor_hash(
+                self.B.view(torch.uint8), self.key_tensor, self.B_merkle_root,
+                self.tensor_hash_scratchpad,
+            )
+            commitment_hash_from_merkle_roots(
+                self.A_merkle_root, self.B_merkle_root, self.key_tensor,
+                self.commitment_hash_A, self.commitment_hash_B,
+            )
+            noise_gen(
+                R=self.R,
+                EAL=self.EAL,
+                EAL_fp16=self.EAL_fp16,
+                EAR_R_major=self.EAR_R_major,
+                EAR_K_major=self.EAR_K_major,
+                EBL_R_major=self.EBL_R_major,
+                EBL_K_major=self.EBL_K_major,
+                EBR=self.EBR,
+                EBR_fp16=self.EBR_fp16,
+                key_A=self.commitment_hash_A,
+                key_B=self.commitment_hash_B,
+            )
+            adjusted_target = mining_job.adjust_target(
+                mining_config=matmul_config.mining_config
+            )
+            new_pow_target = make_pow_target_tensor(adjusted_target, device=DEVICE)
+            self.pow_target.copy_(new_pow_target)
+            _debug_easy = os.environ.get("PEARL_DEBUG_EASY_TARGET")
+            if _debug_easy:
+                _ev = int(_debug_easy, 16)
+                self.pow_target.copy_(torch.tensor(
+                    [_ev] + [0xFFFFFFFF] * 7, dtype=torch.uint32, device=DEVICE))
+            self.mining_job_attempt = mining_job
+        else:
+            # Warmup/capture path: use a synthetic non-zero key so noise_gen
+            # produces structurally valid (non-trivial) EAR/EBL sparse matrices.
+            # The kernel asserts on EAR/EBL having exactly one 1 and one -1 per
+            # row/column (per pearl_gemm_interface.py docs) — zero matrices
+            # would violate that. mining_job_attempt stays None so
+            # check_and_submit_if_hit will skip — capture-path shares are
+            # unverifiable by construction.
+            self.commitment_hash_A.fill_(0x11)
+            self.commitment_hash_B.fill_(0x22)
+            noise_gen(
+                R=self.R,
+                EAL=self.EAL,
+                EAL_fp16=self.EAL_fp16,
+                EAR_R_major=self.EAR_R_major,
+                EAR_K_major=self.EAR_K_major,
+                EBL_R_major=self.EBL_R_major,
+                EBL_K_major=self.EBL_K_major,
+                EBR=self.EBR,
+                EBR_fp16=self.EBR_fp16,
+                key_A=self.commitment_hash_A,
+                key_B=self.commitment_hash_B,
+            )
+
+    def _issue_noisy_gemm(self) -> None:
+        """Emit one `pg.noisy_gemm` call against this slot's buffers.
+
+        Used both for warm-up (outside capture) and for the capture itself.
+        The captured graph records exactly the kernel launches this call
+        issues — 5 of them in the R=128 PoW path.
+        """
+        pg.noisy_gemm(
+            self.A, self.B, self.EAL, self.EAL_fp16, self.EBR, self.EBR_fp16,
+            self.EAR_R_major, self.EBL_R_major,
+            self.EAR_K_major, self.EBL_K_major,
+            self.AxEBL_fp16, self.EARxBpEB_fp16, self.ApEA, self.BpEB,
+            self.A_scales, self.B_scales, self.C,
+            self.host_signal_header, self.host_signal_sync,
+            self.pow_target, self.pow_key,
+            self.AxEBL_int32, self.EARxBpEB_int32,
+            BM, BN, BK, CM, CN, MATMUL_STAGES,
+            None, True,
+            NOISE_TILE_A_M, NOISE_TILE_A_K,
+            NOISE_TILE_B_N, NOISE_TILE_B_K,
+            NOISE_STAGES_A, NOISE_STAGES_B,
+            None, None,
+            True, True,
+            False, False,
+            None, False,
+        )
+
+    def capture(self, warmup_iters: int = GRAPH_WARMUP_ITERS) -> None:
+        """One-shot graph capture. Warm-up on a side stream first to flush any
+        lazy CUTLASS dispatch / cuBLAS handle init; CUDA Graph capture cannot
+        record cudaMalloc or lazy initialization.
+
+        After this returns, `submit()` is callable.
+        """
+        self._refresh_inputs()
+        side_stream = torch.cuda.Stream(device=DEVICE)
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(warmup_iters):
+                self._issue_noisy_gemm()
+        torch.cuda.current_stream().wait_stream(side_stream)
+        torch.cuda.synchronize()
+
+        # Capture into our slot's stream so replays go where the round-robin
+        # loop expects (and so multiple slots' captures don't accidentally
+        # serialize via the default stream).
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=self.stream):
+            self._issue_noisy_gemm()
+
+    def submit(
+        self,
+        M: int, N: int, K: int,
+        mining_job: MiningJob,
+        matmul_config: Any,
+    ) -> None:
+        """Refresh persistent inputs then replay the captured graph.
+
+        Signature matches `StreamSlot.submit` so the main loop is slot-type-
+        agnostic. `M, N, K` are intentionally unused here — the captured graph
+        baked them in via the BM/BN/BK constants at capture time.
+        """
+        assert not self.in_flight, "submit called on a slot already in flight"
+        assert self.graph is not None, "capture() must be called before submit()"
+        del M, N, K  # signature parity only
+
+        with torch.cuda.stream(self.stream):
+            self._refresh_inputs(mining_job=mining_job, matmul_config=matmul_config)
+            self.graph.replay()
+            self.done_event.record(self.stream)
+            self.in_flight = True
+
+    def wait(self) -> None:
+        if self.in_flight:
+            self.done_event.synchronize()
+            self.in_flight = False
+
+    def check_and_submit_if_hit(self, mgr, matmul_config=None) -> bool:
+        """Mirror of `StreamSlot.check_and_submit_if_hit` for the graph slot.
+
+        On a PoW hit, snapshots A / B / commitment_hash_{A,B} to the CPU so
+        the next iteration's `_refresh_inputs()` can overwrite the persistent
+        device buffers without invalidating the OpenedBlockInfo handed off
+        to AsyncLoopManager.
+
+        `matmul_config` is accepted for signature parity with `StreamSlot`
+        (the CUDA-Graph slot doesn't probe).
+        """
+        del matmul_config  # graph path doesn't emit the wave-10 probe
+        if self.mining_job_attempt is None:
+            return False
+
+        header = get_host_signal_header(self.host_signal_header)
+        hit = False
+        if header.status == HostSignalStatus.kSignalTriggered and header.block_in_bounds():
+            idxs = extract_indices(header)
+            commitment_hash = CommitmentHash(
+                noise_seed_A=self.commitment_hash_A.cpu().numpy().tobytes(),
+                noise_seed_B=self.commitment_hash_B.cpu().numpy().tobytes(),
+            )
+            opened_block_info = OpenedBlockInfo(
+                A_row_indices=idxs.A_row_indices,
+                B_column_indices=idxs.B_column_indices,
+                A=self.A.cpu().detach().clone(),
+                B_t=self.B.cpu().detach().clone(),
+                commitment_hash=commitment_hash,
+                noise_rank=self.R,
+            )
+            mgr.handle_submit_block(opened_block_info, self.mining_job_attempt)
+            self.host_signal_header.zero_()
+            self.host_signal_sync.zero_()
+            hit = True
+
+        self.mining_job_attempt = None
+        return hit
+
+
+class MultiNonceSlot:
+    """Wave-13: persistent-CTA multi-nonce slot — 256 nonces per launch with
+    pool-verifiable share extraction.
+
+    Sibling of `StreamSlot` / `CudaGraphSlot`. Adopts the same `submit/wait/
+    check_and_submit_if_hit` contract so the main loop is slot-type-agnostic,
+    but each submit issues ONE `pg.gemm_persistent_multinonce` launch that
+    fans across `NonceBatch.cfg.batch_size` (=256) nonces. B is held constant
+    across the batch; A varies per nonce via the `contexts` device array the
+    `MultiNonceTileScheduler<256>` reads inside the kernel.
+
+    Activation
+    ----------
+    Only constructed when `PEARL_SM89_PERSISTENT_NONCE=1`. The driver's
+    `main()` checks `is_persistent_nonce_enabled()` and delegates to
+    `_run_batched_loop()`, which uses this class. Default path (env unset)
+    is the wave-11 `StreamSlot` (single-nonce noisy_gemm).
+
+    Wave-13 share extraction
+    ------------------------
+    The commitment_hash and adjusted PoW target depend only on
+    (mining_job, matmul_config), which are constant across the 256 nonces of
+    one launch. So we run the commitment chain ONCE per submit (same cost as
+    wave-11) and SHARE the pow_target + pow_key + commitment_hash buffers
+    across all 256 nonces. The per-nonce piece is:
+      * Each nonce's own A matrix (A_batch[i])
+      * Each nonce's own HostSignalHeader + HostSignalSync slot (so 256
+        parallel hits don't all serialize on one global_lock CAS).
+    On a hit, the kernel writes `tileCoord[2] = nonce_idx` into the header,
+    so we know which A_batch[i] to send to the pool.
+    """
+
+    def __init__(self, slot_id: int, M: int, N: int, K: int, R: int) -> None:
+        self.id = slot_id
+        self.M, self.N, self.K, self.R = M, N, K, R
+        self.batch_size = DEFAULT_BATCH_SIZE
+        cfg = BatchConfig(M=M, N=N, K=K, R=R, batch_size=self.batch_size)
+        self.batch = NonceBatch(torch, pg, cfg, DEVICE)
+        self.batch.fill_shared_B()
+
+        # tensor_hash needs a scratchpad sized for the largest of A or B's
+        # byte footprint — see wave-11 StreamSlot for the contract.
+        matrix_bytes = max(M * K, N * K)
+        self.tensor_hash_scratchpad = torch.empty(
+            get_required_scratchpad_bytes(matrix_bytes),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )
+        # Per-submit commitment artifacts — populated by submit(), consumed by
+        # check_and_submit_if_hit(). Shared across the 256 nonces of one batch.
+        self.commitment_hash_A: torch.Tensor | None = None
+        self.commitment_hash_B: torch.Tensor | None = None
+        self.mining_job_attempt: MiningJob | None = None
+        self.B_attempt: torch.Tensor | None = None
+
+        # Stream + completion event so wait() can block on the launch instead
+        # of relying on CUDA's stream FIFO (we MUST sync before reading the
+        # pinned host_signal_headers in check_and_submit_if_hit).
+        self.stream = torch.cuda.Stream(device=DEVICE)
+        self.done_event = torch.cuda.Event(blocking=False)
+        self.in_flight = False
+
+    def submit(
+        self,
+        M: int, N: int, K: int,
+        mining_job: MiningJob,
+        matmul_config: Any,
+    ) -> None:
+        """Enqueue one persistent-CTA multi-nonce launch (=256 nonces).
+
+        Runs the commitment chain ONCE (shared across all 256 nonces in this
+        batch), populates the shared pow_target / pow_key buffers, fans 256
+        fresh A matrices into A_batch, and dispatches the kernel.
+        """
+        assert not self.in_flight, "submit called on a slot already in flight"
+
+        with torch.cuda.stream(self.stream):
+            # Reset all 256 per-nonce signal slots so kSignalIdle is the
+            # post-launch baseline (any non-zero status came from a hit this
+            # launch, not a stale write from the previous one).
+            self.batch.host_signal_headers.zero_()
+            self.batch.host_signal_syncs.zero_()
+
+            # Per-nonce A + shared B (mirrors the per-attempt random rotation
+            # cadence of StreamSlot). Wave-16: when PEARL_ONE_A_PER_ATTEMPT=1,
+            # only slot-0's A is filled (~155 ms saved per attempt at B=256);
+            # the contexts table redirects every nonce to slot 0.
+            self.batch.refresh_nonces()
+            if is_one_A_per_attempt_enabled():
+                self.batch.fill_smoke_A_single()
+            else:
+                self.batch.fill_smoke_A()
+            self.batch.fill_shared_B()
+
+            # -- Shared commitment chain --------------------------------------
+            # We use A_batch[0] as the "representative" A for the commitment
+            # — but ALL 256 nonces will mine against the SAME commitment_hash
+            # and pow_target. This is correct: the pool re-derives
+            # commitment_hash from the (A, B, indices) we submit; each
+            # per-nonce A_batch[i] produces a different proof but they all
+            # validate against the same shared commitment_hash + target.
+            #
+            # WAVE-16 NOTE: in PEARL_ONE_A_PER_ATTEMPT mode every nonce
+            # mines against A_batch[0] (contexts table redirects all
+            # slot pointers to slot 0), so the share submission also
+            # uses A_batch[0] -- pool re-derivation matches and the share
+            # credits. In legacy multinonce mode, A_batch[i] for i>0
+            # would produce a mismatched commitment_hash at the pool;
+            # this is a latent bug we don't fix here, but the
+            # PEARL_ONE_A_PER_ATTEMPT path side-steps it entirely.
+            #
+            # The driver-side tensor_hash → commitment_hash → noise_gen
+            # pipeline mirrors wave-11's StreamSlot.submit verbatim.
+            hash_key = CommitmentHasher.get_key(
+                mining_job.incomplete_header_bytes, matmul_config.mining_config
+            )
+            key_tensor = torch.frombuffer(
+                bytearray(hash_key), dtype=torch.uint8
+            ).to(DEVICE)
+
+            # Hash B once (shared across the batch).
+            B_merkle_root = torch.empty(32, device=DEVICE, dtype=torch.uint8)
+            tensor_hash(
+                self.batch.B.view(torch.uint8), key_tensor, B_merkle_root,
+                self.tensor_hash_scratchpad,
+            )
+            # Hash A_batch[0] as the representative A for the shared
+            # commitment chain. (The pool replays per submitted A, not over
+            # A_batch[0]; this just seeds noise_gen + pow_key.)
+            A_merkle_root = torch.empty(32, device=DEVICE, dtype=torch.uint8)
+            tensor_hash(
+                self.batch.A_batch[0].view(torch.uint8), key_tensor,
+                A_merkle_root, self.tensor_hash_scratchpad,
+            )
+
+            commitment_hash_A = torch.empty(32, device=DEVICE, dtype=torch.uint8)
+            commitment_hash_B = torch.empty(32, device=DEVICE, dtype=torch.uint8)
+            commitment_hash_from_merkle_roots(
+                A_merkle_root, B_merkle_root, key_tensor,
+                commitment_hash_A, commitment_hash_B,
+            )
+
+            # Noise factors keyed on commitment hashes — shared scratch
+            # (NonceBatch's EAL/EBR/EAR/EBL), populated once per launch.
+            noise_gen(
+                R=self.R,
+                EAL=self.batch.EAL,
+                EAL_fp16=self.batch.EAL_fp16,
+                EAR_R_major=self.batch.EAR_R_major,
+                EAR_K_major=self.batch.EAR_K_major,
+                EBL_R_major=self.batch.EBL_R_major,
+                EBL_K_major=self.batch.EBL_K_major,
+                EBR=self.batch.EBR,
+                EBR_fp16=self.batch.EBR_fp16,
+                key_A=commitment_hash_A,
+                key_B=commitment_hash_B,
+            )
+
+            # Wave-14 NOISING: compute ApEA_batch = A_batch + (EAL @ EAR.T) and
+            # BpEB_noised = B + (EBR @ EBL.T) in Python. E_A and E_B depend only
+            # on commitment-derived noise factors so they're constant across
+            # the 256 nonces in this launch; we hoist them out of the per-nonce
+            # loop. The kernel reads ApEA_batch[i] via contexts[i, 0] (per-nonce
+            # override in pearl_gemm_kernel_sm89.h) and BpEB_noised as the
+            # standard B operand. Without this step the multinonce kernel
+            # matmuls raw A @ B and the PoW transcript mismatches what the
+            # pool's verifier replays -- silent share reject.
+            self.batch.compute_noised_inputs()
+
+            # Adjusted PoW target — pack into the shared (8,) uint32 buffer.
+            adjusted_target = mining_job.adjust_target(
+                mining_config=matmul_config.mining_config
+            )
+            new_pow_target = make_pow_target_tensor(adjusted_target, device=DEVICE)
+            self.batch.pow_target.copy_(new_pow_target)
+
+            _debug_easy = os.environ.get("PEARL_DEBUG_EASY_TARGET")
+            if _debug_easy:
+                _ev = int(_debug_easy, 16)
+                self.batch.pow_target.copy_(torch.tensor(
+                    [_ev] + [0xFFFFFFFF] * 7, dtype=torch.uint32, device=DEVICE))
+
+            # pow_key = uint32 view of commitment_hash_A — same trick as wave-11.
+            # We copy into the shared (8,) buffer so the kernel reads the
+            # uint32 layout via NonceContext.ptr_pow_key.
+            self.batch.pow_key.copy_(commitment_hash_A.view(torch.uint32))
+
+            # Launch the multinonce kernel. SkipReduction=False so the per-CTA
+            # body calls check_pow_target → write_host_signal_header on hits.
+            # Wave-14: skip_denoising=True because the PoW transcript is over
+            # tCrC (the raw int32 matmul result) BEFORE the denoise epilogue
+            # runs. Denoise needs AxEBL/EARxBpEB which we don't compute here,
+            # so we skip the denoise path entirely. The miner doesn't care
+            # about the C output -- only whether the transcript hash hits.
+            self.batch.launch(
+                bM=BM, bN=BN, bK=BK, cM=CM, cN=CN, matmul_stages=MATMUL_STAGES,
+                noise_tile_a_m=NOISE_TILE_A_M, noise_tile_a_k=NOISE_TILE_A_K,
+                noise_tile_b_n=NOISE_TILE_B_N, noise_tile_b_k=NOISE_TILE_B_K,
+                noise_stages_a=NOISE_STAGES_A, noise_stages_b=NOISE_STAGES_B,
+                skip_reduction=False,
+                skip_denoising=True,
+            )
+            self.done_event.record(self.stream)
+            self.in_flight = True
+
+            self.commitment_hash_A = commitment_hash_A
+            self.commitment_hash_B = commitment_hash_B
+            self.mining_job_attempt = mining_job
+            self.B_attempt = self.batch.B  # rotated each submit; snapshot at hit time
+
+    def wait(self) -> None:
+        if self.in_flight:
+            self.done_event.synchronize()
+            self.in_flight = False
+
+    def check_and_submit_if_hit(self, mgr, matmul_config=None) -> bool:
+        """Iterate the 256 per-nonce host_signal_header slots; submit each hit.
+
+        Returns True if at least one share was submitted, False otherwise.
+        The kernel writes `tileCoord[2] = nonce_idx` into each triggered slot
+        so we know which `A_batch[i]` the proof corresponds to.
+        """
+        if self.mining_job_attempt is None:
+            return False
+
+        hh_slot_bytes = self.batch.hh_slot_bytes
+        any_hit = False
+        # We re-mint the slot byte-tensor view for each i so get_host_signal_header
+        # decodes the right offset. The pinned host buffer is one big int8 array;
+        # slot i lives at bytes [i*hh_slot_bytes : (i+1)*hh_slot_bytes].
+        for i in range(self.batch_size):
+            slot = self.batch.host_signal_headers[
+                i * hh_slot_bytes : (i + 1) * hh_slot_bytes
+            ]
+            header = get_host_signal_header(slot)
+            if header.status != HostSignalStatus.kSignalTriggered:
+                continue
+            if not header.block_in_bounds():
+                continue
+
+            idxs = extract_indices(header)
+            commitment_hash = CommitmentHash(
+                noise_seed_A=self.commitment_hash_A.cpu().numpy().tobytes(),
+                noise_seed_B=self.commitment_hash_B.cpu().numpy().tobytes(),
+            )
+            # The kernel records nonce_idx in tileCoord[2]. Use it to fetch the
+            # per-nonce A_batch[i] that produced this proof. (header.tileCoord is
+            # a cute::array<uint32_t,3> exposed as a Python sequence.)
+            try:
+                nonce_idx_from_header = int(header.tileCoord[2])
+            except Exception:
+                nonce_idx_from_header = i
+            # Defensive: if kernel and our slot index ever disagree, the slot
+            # index (i) wins — that's the slot the hit was written to.
+            nonce_idx = i
+
+            # Wave-16: in one-A-per-attempt mode every nonce mined against
+            # A_batch[0] (contexts table redirected all slot pointers to
+            # slot 0) — so the share also uses A_batch[0]. In legacy mode
+            # each slot has its own A.
+            a_lookup = 0 if is_one_A_per_attempt_enabled() else nonce_idx
+            A_at_hit = self.batch.A_batch[a_lookup].cpu().detach().clone()
+            B_at_hit = self.B_attempt.cpu().detach().clone()
+            opened_block_info = OpenedBlockInfo(
+                A_row_indices=idxs.A_row_indices,
+                B_column_indices=idxs.B_column_indices,
+                A=A_at_hit,
+                B_t=B_at_hit,
+                commitment_hash=commitment_hash,
+                noise_rank=self.R,
+            )
+            try:
+                mc_hex = ""
+                if matmul_config is not None:
+                    mc_hex = matmul_config.mining_config.to_bytes().hex()
+                header_hex = self.mining_job_attempt.incomplete_header_bytes.hex()
+                a_rows = list(idxs.A_row_indices)[:4]
+                b_cols = list(idxs.B_column_indices)[:16]
+                log.warning(
+                    "WAVE13-MULTINONCE-HIT slot=%d nonce_idx_header=%d "
+                    "A_row_indices=%s B_column_indices_first16=%s "
+                    "n_rows=%d n_cols=%d mining_config_hex=%s header_hex=%s",
+                    nonce_idx, nonce_idx_from_header, a_rows, b_cols,
+                    len(idxs.A_row_indices), len(idxs.B_column_indices),
+                    mc_hex, header_hex,
+                )
+            except Exception:
+                log.exception("WAVE13-MULTINONCE-HIT logging failed")
+            mgr.handle_submit_block(opened_block_info, self.mining_job_attempt)
+            any_hit = True
+
+        # Always reset state so subsequent submits start fresh.
+        self.commitment_hash_A = None
+        self.commitment_hash_B = None
+        self.mining_job_attempt = None
+        self.B_attempt = None
+        return any_hit
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="sm_89 R=128 pearl miner driver")
+    p.add_argument(
+        "--num-streams", type=int, default=1,
+        help="Number of independent CUDA streams running parallel mining chains "
+             "(default 1 = serial). Try 2 or 4 for chain overlap.",
+    )
+    p.add_argument(
+        "--bench-seconds", type=float, default=0.0,
+        help="If > 0, exit after this many seconds and print attempts/s. "
+             "Default 0 means run forever (production loop).",
+    )
+    p.add_argument(
+        "--skip-stratum", action="store_true",
+        help="Skip stratum connection + AsyncLoopManager init. Useful for "
+             "pure kernel benchmarking without pool dependence.",
+    )
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    num_streams = max(1, args.num_streams)
+
+    cap = torch.cuda.get_device_capability(0)
+    log.info("GPU: %s cap=%s", torch.cuda.get_device_name(0), cap)
+    log.info("pearl_gemm_cuda _min_compute_capability=%s",
+             getattr(pg, "_min_compute_capability", "?"))
+    # sm_89 (Ada) and sm_120 (consumer Blackwell) share the same kernel source
+    # path -- both use sm_80 MMA atoms. The all-consumer build of pearl_gemm
+    # ships SASS for both architectures, so this driver works on either.
+    assert cap in ((8, 9), (12, 0)), f"Expected sm_89 or sm_120, got cap={cap}"
+    log.info(
+        "driver config: R=%d  matmul=(bM=%d, bN=%d, bK=%d, cM=%d, cN=%d, stages=%d)  "
+        "noisingA=(%dx%dxR, stages=%d)  noisingB=(%dx%dxR, stages=%d)  num_streams=%d",
+        R, BM, BN, BK, CM, CN, MATMUL_STAGES,
+        NOISE_TILE_A_M, NOISE_TILE_A_K, NOISE_STAGES_A,
+        NOISE_TILE_B_N, NOISE_TILE_B_K, NOISE_STAGES_B,
+        num_streams,
+    )
+
+    mgr = None
+    if not args.skip_stratum:
+        # 1) stratum + shared state
+        client = StratumClient(
+            host=HOST, port=PORT,
+            address=DECOY, worker=WORKER,
+            password="x;d=1048576",
+            user_agent="alpha-miner/0.1",  # wave-17 fix: pool filters on UA
+        )
+        state = init_shared_state(client)
+        if not state.wait_for_first_job(timeout=60.0):
+            log.error("no mining.notify in 60s; bailing")
+            return 1
+        mp = state._client.mining_params
+        if mp is None:
+            log.error("pool never sent pearl.set_mining_params; bailing")
+            return 2
+        pool_M, pool_N, pool_K = int(mp["m"]), int(mp["n"]), int(mp["k"])
+        pool_rank = int(mp["rank"])
+        log.info("pool params: M=%d N=%d K=%d rank=%d mma=%s",
+                 pool_M, pool_N, pool_K, pool_rank, mp.get("mma_type"))
+
+        if pool_rank != EXPECTED_RANK:
+            log.error(
+                "RANK MISMATCH: pool wants rank=%d, this driver is compiled for R=%d. "
+                "Cannot produce verifiable shares. Refusing to mine. "
+                "Either swap to the matching driver (R=64 vs R=128) or rebuild the .so.",
+                pool_rank, EXPECTED_RANK,
+            )
+            return 4
+
+        # 2) pinned pool + async manager (uses our shim)
+        init_pinned_pool(128)
+        init_async_manager()
+        mgr = get_async_manager()
+
+    # 2a) optional dispatch to the persistent-CTA batched path.
+    # When PEARL_SM89_PERSISTENT_NONCE is unset/0 (the default), we fall
+    # through to the existing single-or-multi-stream slot loop — the
+    # production R=128 driver behavior is unperturbed. When set, we instead
+    # invoke `pg.gemm_persistent_multinonce` once per batch of
+    # DEFAULT_BATCH_SIZE nonces. The batched path is orthogonal to
+    # `--num-streams`: it currently uses a single stream internally because
+    # the persistent-CTA kernel already saturates the SMs across all 256
+    # nonces in one launch.
+    if is_persistent_nonce_enabled():
+        log.info(
+            "PEARL_SM89_PERSISTENT_NONCE=1 — entering BATCHED loop (batch_size=%d)",
+            DEFAULT_BATCH_SIZE,
+        )
+        return _run_batched_loop(mgr, args)
+
+    # 3) pre-allocate per-stream slots. When PEARL_SM89_CUDA_GRAPH=1, each
+    # slot captures a CUDA Graph wrapping the full noisy_gemm chain so each
+    # submit becomes a single graph replay instead of 5 per-kernel launches.
+    M, N, K = CHUNK_M, CHUNK_N, CHUNK_K
+    if USE_CUDA_GRAPH:
+        log.info("CUDA Graph path enabled (PEARL_SM89_CUDA_GRAPH=1, warmup_iters=%d)",
+                 GRAPH_WARMUP_ITERS)
+        graph_slots = [CudaGraphSlot(i, M, N, K, R) for i in range(num_streams)]
+        for s in graph_slots:
+            s.capture(warmup_iters=GRAPH_WARMUP_ITERS)
+        slots = graph_slots
+        log.info("allocated %d CudaGraphSlot(s); all graphs captured", num_streams)
+    else:
+        slots = [StreamSlot(i, M, N, K, R) for i in range(num_streams)]
+        log.info("allocated %d StreamSlot(s) (M=%d N=%d K=%d R=%d)",
+                 num_streams, M, N, K, R)
+
+    # Matmul config is constant for the (K, R) pair. The mining_config inside
+    # is what the pool uses to reconstruct commitment_hash from the header, so
+    # MUST match the pool's `pearl.set_mining_params` view. GPUMatmulConfigFactory
+    # reads `MinerSettings` for tile_size / rows_pattern / cols_pattern — the
+    # defaults match alphapool's published config. If a future pool change
+    # surfaces, set the relevant env vars (MINER_TILE_SIZE_M etc.) per
+    # miner-base/settings.py.
+    matmul_config = GPUMatmulConfigFactory.create(k=K, noise_rank=R)
+
+    # 4) main loop — round-robin dispatch with a fixed depth = num_streams.
+    # When the next slot in rotation is already in flight, we sync it (reap),
+    # check for a PoW hit on the just-finished attempt, then re-submit. This
+    # bounds in-flight work to exactly num_streams and keeps the share-
+    # submission queue (in production, mgr) bounded too.
+    n_attempts = 0
+    n_hits = 0
+    t_start = time.time()
+    last_log = t_start
+    log.info("entering mining loop: chunk M=%d N=%d K=%d R=%d  num_streams=%d",
+             M, N, K, R, num_streams)
+
+    next_slot = 0
+    try:
+        while True:
+            slot = slots[next_slot]
+            slot.wait()  # no-op on first dispatch into this slot
+            # Inspect the just-completed attempt's pinned header BEFORE we
+            # reuse the slot's buffers. If a hit fired during the kernel, this
+            # is where we hand the proof artifacts to AsyncLoopManager for
+            # async submission via the stratum shim. No-op when slot has no
+            # prior attempt (first iteration on each slot) or when status is
+            # kSignalIdle.
+            if mgr is not None and slot.check_and_submit_if_hit(mgr, matmul_config):
+                n_hits += 1
+                log.info("PoW hit on slot %d (total hits=%d)", slot.id, n_hits)
+
+            # Re-snapshot the mining job each attempt — the pool may have
+            # pushed a fresh notify between iterations. AsyncLoopManager
+            # tracks the latest job via the shim.
+            try:
+                if mgr is not None:
+                    mining_job = mgr.get_mining_job()
+                else:
+                    # --skip-stratum: synthesize a minimal MiningJob so the
+                    # kernel path still has a header to hash. Adjusted target
+                    # is unreachable so no spurious hits.
+                    mining_job = MiningJob(
+                        incomplete_header_bytes=b"\x00" * 80,
+                        target=1,
+                    )
+                slot.submit(M, N, K, mining_job, matmul_config)
+            except Exception as e:
+                log.exception("noisy_gemm failed on slot %d: %s", slot.id, e)
+                return 3
+            next_slot = (next_slot + 1) % num_streams
+            n_attempts += 1
+
+            now = time.time()
+            if now - last_log >= 30.0:
+                elapsed = now - t_start
+                rate = n_attempts / elapsed
+                ops_per_attempt = 2.0 * M * N * K
+                tops = ops_per_attempt * rate * 1e-12
+                blocks_submitted = mgr.blocks_submitted if mgr is not None else 0
+                log.info(
+                    "stats: attempts=%d rate=%.2f/s main_TOPS=%.2f hits=%d "
+                    "blocks_submitted=%d num_streams=%d",
+                    n_attempts, rate, tops, n_hits, blocks_submitted, num_streams,
+                )
+                last_log = now
+
+            if args.bench_seconds > 0 and (now - t_start) >= args.bench_seconds:
+                break
+    finally:
+        # Drain in-flight slots so we don't leak unfinished launches. Also
+        # surface any final PoW hits that landed on the last attempts before
+        # bench termination.
+        for s in slots:
+            s.wait()
+            if mgr is not None and s.check_and_submit_if_hit(mgr, matmul_config):
+                n_hits += 1
+
+    elapsed = time.time() - t_start
+    rate = n_attempts / elapsed if elapsed > 0 else 0.0
+    ops_per_attempt = 2.0 * M * N * K
+    tops = ops_per_attempt * rate * 1e-12
+    log.info(
+        "FINAL: attempts=%d elapsed=%.1fs rate=%.2f/s main_TOPS=%.2f num_streams=%d",
+        n_attempts, elapsed, rate, tops, num_streams,
+    )
+    print(
+        f"BENCH_RESULT num_streams={num_streams} attempts={n_attempts} "
+        f"elapsed_s={elapsed:.3f} rate_per_s={rate:.4f} main_tops={tops:.4f}",
+        flush=True,
+    )
+    return 0
+
+
+def _run_batched_loop(mgr, args) -> int:
+    """Wave-13 persistent-CTA multi-nonce loop — DEFAULT_BATCH_SIZE nonces per
+    launch with pool-verifiable share extraction.
+
+    Maps the per-attempt 5-kernel chain described in
+    `project_pearl_miner_dominate_2026_05_17.md` onto a single
+    `pg.gemm_persistent_multinonce` call per batch. B is persisted across
+    the batch; A varies per nonce. The kernel runs check_pow_target +
+    write_host_signal_header per (m_block, n_block, nonce_idx) tile and emits
+    hits into the per-nonce host_signal_header slot from the contexts table.
+
+    Stats: `rate` is reported in nonces/sec so it's directly comparable to
+    the sequential path's attempts/s metric. We also report batches/sec.
+
+    Honors `--bench-seconds` for terminating bench runs; ignores
+    `--num-streams` (the persistent-CTA kernel is itself the parallelism
+    mechanism — it processes 256 nonces inside a single launch).
+    """
+    M, N, K = CHUNK_M, CHUNK_N, CHUNK_K
+    slot = MultiNonceSlot(0, M, N, K, R)
+    matmul_config = GPUMatmulConfigFactory.create(k=K, noise_rank=R)
+
+    n_nonces = 0
+    n_batches = 0
+    n_hits = 0
+    t_start = time.time()
+    last_log = t_start
+    log.info(
+        "entering BATCHED mining loop (wave-13): chunk M=%d N=%d K=%d R=%d batch_size=%d",
+        M, N, K, R, slot.batch_size,
+    )
+
+    # Synthesize a minimal mining_job when --skip-stratum was passed (mgr is
+    # None) — submit() captures it but the commitment chain in submit()
+    # works regardless (the pool just won't accept the resulting shares).
+    while True:
+        if mgr is not None:
+            mining_job = mgr.get_mining_job()
+        else:
+            mining_job = MiningJob(
+                incomplete_header_bytes=b"\x00" * 80,
+                target=1,
+            )
+        try:
+            slot.submit(M, N, K, mining_job, matmul_config)
+            slot.wait()
+        except Exception as e:
+            log.exception("gemm_persistent_multinonce failed: %s", e)
+            return 3
+
+        # Wave-13: real share extraction; iterates 256 per-nonce signal slots.
+        if mgr is not None:
+            if slot.check_and_submit_if_hit(mgr, matmul_config):
+                n_hits += 1
+
+        n_nonces += slot.batch_size
+        n_batches += 1
+        now = time.time()
+        if now - last_log >= 30.0:
+            elapsed = now - t_start
+            rate = n_nonces / elapsed
+            ops_per_attempt = 2.0 * M * N * K
+            tops = ops_per_attempt * rate * 1e-12
+            blocks_submitted = mgr.blocks_submitted if mgr is not None else 0
+            log.info(
+                "stats: nonces=%d batches=%d rate=%.2f/s main_TOPS=%.2f "
+                "hits=%d blocks_submitted=%d",
+                n_nonces, n_batches, rate, tops, n_hits, blocks_submitted,
+            )
+            last_log = now
+
+        if args.bench_seconds > 0 and (now - t_start) >= args.bench_seconds:
+            break
+
+    elapsed = time.time() - t_start
+    rate = n_nonces / elapsed if elapsed > 0 else 0.0
+    ops_per_attempt = 2.0 * M * N * K
+    tops = ops_per_attempt * rate * 1e-12
+    log.info(
+        "FINAL (batched): nonces=%d batches=%d elapsed=%.1fs rate=%.2f/s "
+        "main_TOPS=%.2f hits=%d",
+        n_nonces, n_batches, elapsed, rate, tops, n_hits,
+    )
+    print(
+        f"BENCH_RESULT batched=1 nonces={n_nonces} batches={n_batches} "
+        f"elapsed_s={elapsed:.3f} rate_per_s={rate:.4f} main_tops={tops:.4f} "
+        f"hits={n_hits}",
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
