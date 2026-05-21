@@ -252,11 +252,46 @@ CUDA ≥ 12.8 is required (already enforced by `setup.py:get_wheel_url`).
 After building with `PEARL_GEMM_TARGET_ARCH=120` on a 5090 host:
 
 ```bash
-python miner/pearl-gemm/csrc/gemm/sm89_smoke.py        # noiseless GEMM
-python miner/pearl-gemm/csrc/gemm/sm89_smoke_r128.py   # R=128 bit-exact
-python miner/pearl-gemm/csrc/gemm/sm89_noisy_smoke.py  # full noisy_gemm pipeline
+python miner/pearl-gemm/csrc/gemm/sm120_smoke.py   # noiseless GEMM (sm_89 + sm_120 aware)
+python miner/pearl-gemm/csrc/gemm/sm120_bench.py   # production-shape TOPS bench
 ```
 
 `_min_compute_capability` should report `8` (sm_120 is treated as Ampere+
 because all atoms are sm_80-PTX). `pg._min_compute_capability` is exported
 from `pearl_gemm_api.cpp:1350`.
+
+### Verified bench data — RTX 5090 (sm_120), 2026-05-21
+
+Measured via `sm120_bench.py` on WSL2 Ubuntu-22.04, torch 2.11.0+cu130,
+CUDA 13.1 toolkit, noiseless `pg.gemm()` at R=64 tile 128×128×64, stages=3.
+
+| Shape (M×N×K) | TOPS (sm_120) | TOPS (sm_89 wave-18, 4070 Ti S) | ratio |
+|---|---|---|---|
+| 1024³ | 178.5 | — | — |
+| 2048³ | **471.3** | — | — |
+| 4096³ | 436.8 | 65.15 (production) | 6.7× |
+| 2048×2048×4096 | 464.3 | — | — |
+
+Peak utilization at 2048³: **~56% of 5090 dense int8 peak (838 TOPS)** —
+significantly higher than sm_89's ~18% on the 4070 Ti S, partly because
+the 5090's 170 SMs amortize fixed kernel overhead. The kernel is reusing
+the sm_89 tile config; a sm_120-specific retune (larger bN to exploit
+the 5090's larger register file and 96 MB L2) is open work.
+
+Caveat: this is the noiseless `pg.gemm()` path. Production mining uses
+`pg.noisy_gemm()` which adds noising A, noising B, denoise epilogue,
+and the PoW inner-hash accumulator. Expect 10-30% overhead vs the
+noiseless number.
+
+### Known build gotchas (CUDA 13.x)
+
+The first PEARL_GEMM_TARGET_ARCH=all-consumer build under CUDA 13
+surfaces two unrelated issues:
+1. `cub::Max` was removed in CUB 2.8 / CUDA 13.0. Patched in
+   `quantize_kernel.cu` to use a local `FloatMaxOp` functor (works on
+   both CUDA 12.x and 13.x).
+2. PyTorch's `cpp_extension._check_cuda_version` requires the toolkit's
+   CUDA major to match `torch.version.cuda`. Today's torch wheels
+   (`pip install --extra-index-url https://download.pytorch.org/whl/cu128`)
+   actually ship CUDA 13.0, not 12.8 — so use the CUDA 13.x toolkit at
+   build time. If you must use CUDA 12.8, pin to an older torch wheel.
