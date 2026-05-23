@@ -19,7 +19,8 @@ Package ffldb is licensed under the copyfree ISC license.
 
 This package is a driver to the database package and provides the database type
 of "ffldb".  The parameters the Open and Create functions take are the
-database path as a string and the block network.
+database path as a string, the block network, and an optional cache flush
+interval in seconds (defaults to 3600).
 
 ```Go
 db, err := database.Open("ffldb", "path/to/database", wire.MainNet)
