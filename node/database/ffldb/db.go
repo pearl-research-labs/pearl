@@ -2061,7 +2061,7 @@ func initDB(ldb *leveldb.DB) error {
 
 // openDB opens the database at the provided path.  database.ErrDbDoesNotExist
 // is returned if the database doesn't exist and the create flag is not set.
-func openDB(dbPath string, network wire.PearlNet, create bool) (database.DB, error) {
+func openDB(dbPath string, network wire.PearlNet, create bool, flushIntervalSecs uint32) (database.DB, error) {
 	// Error if the database doesn't exist and the create flag is not set.
 	metadataDbPath := filepath.Join(dbPath, metadataDbName)
 	dbExists := fileExists(metadataDbPath)
@@ -2099,7 +2099,7 @@ func openDB(dbPath string, network wire.PearlNet, create bool) (database.DB, err
 	if err != nil {
 		return nil, convertErr(err.Error(), err)
 	}
-	cache := newDbCache(ldb, store, defaultCacheSize, defaultFlushSecs)
+	cache := newDbCache(ldb, store, defaultCacheSize, flushIntervalSecs)
 	pdb := &db{store: store, cache: cache}
 
 	// Perform any reconciliation needed between the block and metadata as

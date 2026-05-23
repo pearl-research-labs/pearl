@@ -30,7 +30,7 @@ func TestCreateOpenFail(t *testing.T) {
 	// Ensure that attempting to open a database that doesn't exist returns
 	// the expected error.
 	wantErrCode := database.ErrDbDoesNotExist
-	_, err := database.Open(dbType, "noexist", blockDataNet)
+	_, err := database.Open(dbType, "noexist", blockDataNet, uint32(300))
 	if !checkDbError(t, "Open", err, wantErrCode) {
 		return
 	}
@@ -38,8 +38,8 @@ func TestCreateOpenFail(t *testing.T) {
 	// Ensure that attempting to open a database with the wrong number of
 	// parameters returns the expected error.
 	wantErr := fmt.Errorf("invalid arguments to %s.Open -- expected "+
-		"database path and block network", dbType)
-	_, err = database.Open(dbType, 1, 2, 3)
+		"database path, block network, and optional flush interval", dbType)
+	_, err = database.Open(dbType, 1, 2, 3, 4)
 	if err.Error() != wantErr.Error() {
 		t.Errorf("Open: did not receive expected error - got %v, "+
 			"want %v", err, wantErr)
@@ -71,8 +71,8 @@ func TestCreateOpenFail(t *testing.T) {
 	// Ensure that attempting to create a database with the wrong number of
 	// parameters returns the expected error.
 	wantErr = fmt.Errorf("invalid arguments to %s.Create -- expected "+
-		"database path and block network", dbType)
-	_, err = database.Create(dbType, 1, 2, 3)
+		"database path, block network, and optional flush interval", dbType)
+	_, err = database.Create(dbType, 1, 2, 3, 4)
 	if err.Error() != wantErr.Error() {
 		t.Errorf("Create: did not receive expected error - got %v, "+
 			"want %v", err, wantErr)
@@ -105,7 +105,7 @@ func TestCreateOpenFail(t *testing.T) {
 	// error.
 	dbPath := filepath.Join(t.TempDir(), "ffldb-createfail")
 	_ = os.RemoveAll(dbPath)
-	db, err := database.Create(dbType, dbPath, blockDataNet)
+	db, err := database.Create(dbType, dbPath, blockDataNet, uint32(300))
 	if err != nil {
 		t.Errorf("Create: unexpected error: %v", err)
 		return
@@ -155,7 +155,7 @@ func TestPersistence(t *testing.T) {
 	// Create a new database to run tests against.
 	dbPath := filepath.Join(t.TempDir(), "ffldb-persistencetest")
 	_ = os.RemoveAll(dbPath)
-	db, err := database.Create(dbType, dbPath, blockDataNet)
+	db, err := database.Create(dbType, dbPath, blockDataNet, uint32(300))
 	if err != nil {
 		t.Errorf("Failed to create test database (%s) %v", dbType, err)
 		return
@@ -206,7 +206,7 @@ func TestPersistence(t *testing.T) {
 
 	// Close and reopen the database to ensure the values persist.
 	db.Close()
-	db, err = database.Open(dbType, dbPath, blockDataNet)
+	db, err = database.Open(dbType, dbPath, blockDataNet, uint32(300))
 	if err != nil {
 		t.Errorf("Failed to open test database (%s) %v", dbType, err)
 		return
@@ -260,7 +260,7 @@ func TestPrune(t *testing.T) {
 
 	// Create a new database to run tests against.
 	dbPath := t.TempDir()
-	db, err := database.Create(dbType, dbPath, blockDataNet)
+	db, err := database.Create(dbType, dbPath, blockDataNet, uint32(300))
 	if err != nil {
 		t.Errorf("Failed to create test database (%s) %v", dbType, err)
 		return
@@ -449,7 +449,7 @@ func TestInterface(t *testing.T) {
 	// Create a new database to run tests against.
 	dbPath := filepath.Join(t.TempDir(), "ffldb-interfacetest")
 	_ = os.RemoveAll(dbPath)
-	db, err := database.Create(dbType, dbPath, blockDataNet)
+	db, err := database.Create(dbType, dbPath, blockDataNet, uint32(300))
 	if err != nil {
 		t.Errorf("Failed to create test database (%s) %v", dbType, err)
 		return

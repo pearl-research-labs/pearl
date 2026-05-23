@@ -597,8 +597,15 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
-	if cache.cachedEntries.length() != 0 {
-		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
+	if cache.cachedEntries.length() != len(outPoints1) {
+		t.Fatalf("Expected %d entries, has %d instead", len(outPoints1), cache.cachedEntries.length())
+	}
+	for _, m := range cache.cachedEntries.maps {
+		for _, entry := range m {
+			if entry != nil && entry.isModified() {
+				t.Fatalf("Expected entry to not be modified after periodic flush")
+			}
+		}
 	}
 
 	err = assertConsistencyState(chain, tip.Hash())

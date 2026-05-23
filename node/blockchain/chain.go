@@ -700,6 +700,10 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 
 	// Since we may have changed the UTXO cache, we make sure it didn't exceed its
 	// maximum size.  If we're pruned and have flushed already, this will be a no-op.
+	// Fast-path: skip db.Update if no flush is needed.
+	if !b.utxoCache.shouldFlush(FlushIfNeeded, state) {
+		return nil
+	}
 	return b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, FlushIfNeeded, state)
 	})
