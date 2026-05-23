@@ -255,7 +255,11 @@ def sample_pearl_block(sample_block_template):
         header,
         ZKProof(bytes(PUBLICDATA_SIZE), bytes(10000)),  # dummy proof
     )
-    return PearlBlock(header, sample_block_template.get_transactions(), zk_certificate)
+    return PearlBlock(
+        header,
+        raw_txns=sample_block_template.get_raw_transactions(),
+        zk_certificate=zk_certificate,
+    )
 
 
 @pytest.fixture

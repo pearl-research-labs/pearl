@@ -37,7 +37,7 @@ def different_block_template():
         coinbase_tx=Transaction.from_raw(
             "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0502a1050101ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000"
         ),
-        transactions=[],
+        raw_transactions=[],
     )
 
 

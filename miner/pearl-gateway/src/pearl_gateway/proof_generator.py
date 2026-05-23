@@ -35,7 +35,9 @@ class ProofGenerator:
         header = copy(template.header)
         zk_certificate = ZKCertificate.from_pearl_header(header, zk_proof)
         block = PearlBlock(
-            header=header, txns=template.get_transactions(), zk_certificate=zk_certificate
+            header=header,
+            raw_txns=template.get_raw_transactions(),
+            zk_certificate=zk_certificate,
         )
         _LOGGER.debug("Generated block")
         return block
