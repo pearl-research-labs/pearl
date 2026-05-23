@@ -527,18 +527,18 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, eraseCach
 				}
 			}
 
-		if eraseCache {
-			delete(s.cachedEntries.maps[i], outpoint)
-		} else {
-			if entry == nil {
+			if eraseCache {
 				delete(s.cachedEntries.maps[i], outpoint)
-			} else if entry.IsSpent() {
-				delete(s.cachedEntries.maps[i], outpoint)
-				deletedMem += entry.memoryUsage()
-			} else if entry.isModified() {
-				entry.packedFlags &^= tfModified | tfFresh
+			} else {
+				if entry == nil {
+					delete(s.cachedEntries.maps[i], outpoint)
+				} else if entry.IsSpent() {
+					delete(s.cachedEntries.maps[i], outpoint)
+					deletedMem += entry.memoryUsage()
+				} else if entry.isModified() {
+					entry.packedFlags &^= tfModified | tfFresh
+				}
 			}
-		}
 		}
 	}
 
