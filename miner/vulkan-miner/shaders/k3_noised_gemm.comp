@@ -1,0 +1,341 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// K3: Noised GEMM + XOR jackpot accumulation + PoW check
+//
+// Computes C = (A + EAL·EAR^T) × (B + EBL·EBR^T)
+// with C accumulated as int32 per output element.
+// After every `rank` K-iterations, XOR-reduces the workgroup's
+// C tile and accumulates into the jackpot[16] array.
+// After all K-tiles, computes the jackpot hash (BLAKE3 keyed
+// compression of jackpot[0..8] with commitment_hash_A) and
+// checks against the difficulty target.
+//
+// Tile layout: 16×16 output elements, 128 inner K-tile
+// Workgroup: 16×16 = 256 threads
+
+#include "common/blake3.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Input buffers
+layout(set = 0, binding = 0, std430) readonly buffer A_buf  { int8_t data[]; } A;
+layout(set = 0, binding = 1, std430) readonly buffer B_buf  { int8_t data[]; } B;
+layout(set = 0, binding = 2, std430) readonly buffer EAL_buf { int8_t data[]; } EAL;
+layout(set = 0, binding = 3, std430) readonly buffer EAR_buf { int8_t data[]; } EAR;
+layout(set = 0, binding = 4, std430) readonly buffer EBL_buf { int8_t data[]; } EBL;
+layout(set = 0, binding = 5, std430) readonly buffer EBR_buf { int8_t data[]; } EBR;
+
+// Output buffers
+layout(set = 0, binding = 6, std430) buffer Jackpot_buf  { uint data[16]; } jackpot;
+layout(set = 0, binding = 7, std430) readonly buffer HashA_buf { uint data[8]; } hash_a;
+layout(set = 0, binding = 8, std430) readonly buffer Target_buf { uint data[8]; } target;
+layout(set = 0, binding = 9, std430) buffer Result_buf {
+    uint found;      // 1 if PoW target met
+    uint tile_row;   // winning workgroup tile row
+    uint tile_col;   // winning workgroup tile col
+} result;
+
+layout(push_constant) uniform Params {
+    uint M;         // rows of A
+    uint N;         // cols of B^T (output cols)
+    uint K;         // common inner dimension
+    uint R;         // noise rank (64 or 128)
+    uint TILE_M;    // tile rows (16)
+    uint TILE_N;    // tile cols (16)
+    uint TILE_K;    // tile inner (128)
+    uint R_mask;    // rank mask (R - 1)
+} params;
+
+// Shared memory
+shared int8_t sh_A[4096];       // TILE_M × TILE_K = 16×128 = 2048 padded to 4096
+shared int8_t sh_B[4096];       // TILE_K × TILE_N = 128×16 = 2048 padded to 4096
+shared uint  sh_ear_pos[128];   // EAR +1 column indices per K element
+shared uint  sh_ear_neg[128];   // EAR -1 column indices per K element
+shared uint  sh_ebl_pos[128];   // EBL +1 column indices per K element
+shared uint  sh_ebl_neg[128];   // EBL -1 column indices per K element
+shared uint  sh_subgroup_xor[16]; // reduced per subgroup (max 16 subgroups)
+
+// Load EAR/EBL indices from global into shared memory
+// EAR[k * R + column] = +1 or -1; we encode position of +1/-1
+void load_noise_indices(uint k_start, uint k_count) {
+    uint tid = gl_LocalInvocationIndex;
+    uint items = k_count;
+
+    for (uint i = tid; i < items; i += 256u) {
+        uint k_abs = k_start + i;
+        if (k_abs < params.K) {
+            // Scan EAR row at k_abs for +1 and -1
+            uint base = k_abs * params.R;
+            uint pos_idx = 0u, neg_idx = 0u;
+            
+            for (uint r = 0u; r < min(params.R, 128u); r++) {
+                int8_t val = EAR.data[base + r];
+                if (val == int8_t(1))  pos_idx = r;
+                if (val == int8_t(-1)) neg_idx = r;
+            }
+            sh_ear_pos[i] = pos_idx;
+            sh_ear_neg[i] = neg_idx;
+
+            // Same for EBL
+            uint pos_idx_b = 0u, neg_idx_b = 0u;
+            
+            for (uint r = 0u; r < min(params.R, 128u); r++) {
+                int8_t val = EBL.data[base + r];
+                if (val == int8_t(1))  pos_idx_b = r;
+                if (val == int8_t(-1)) neg_idx_b = r;
+            }
+            sh_ebl_pos[i] = pos_idx_b;
+            sh_ebl_neg[i] = neg_idx_b;
+        }
+    }
+}
+
+// Cooperatively load a tile of matrix A into shared memory
+void load_A_tile(uint row_base, uint k_base, uint tile_m, uint tile_k) {
+    uint tid = gl_LocalInvocationIndex;
+    uint items = tile_m * tile_k;
+
+    for (uint i = tid; i < items; i += 256u) {
+        uint r = i / tile_k;
+        uint c = i % tile_k;
+        uint g_row = row_base + r;
+        uint g_col = k_base + c;
+        if (g_row < params.M && g_col < params.K) {
+            sh_A[r * tile_k + c] = A.data[g_row * params.K + g_col];
+        } else {
+            sh_A[r * tile_k + c] = int8_t(0);
+        }
+    }
+}
+
+// Cooperatively load a tile of matrix B into shared memory
+void load_B_tile(uint k_base, uint col_base, uint tile_k, uint tile_n) {
+    uint tid = gl_LocalInvocationIndex;
+    uint items = tile_k * tile_n;
+
+    for (uint i = tid; i < items; i += 256u) {
+        uint r = i / tile_n;
+        uint c = i % tile_n;
+        uint g_row = k_base + r;
+        uint g_col = col_base + c;
+        if (g_row < params.K && g_col < params.N) {
+            sh_B[r * tile_n + c] = B.data[g_row * params.N + g_col];
+        } else {
+            sh_B[r * tile_n + c] = int8_t(0);
+        }
+    }
+}
+
+// Preload EAL row and EBR column into local registers
+// Each thread reads R values from global EAL and EBR
+void main() {
+    uint local_row = gl_LocalInvocationID.y; // 0..15
+    uint local_col = gl_LocalInvocationID.x; // 0..15
+    uint tid = gl_LocalInvocationIndex;
+
+    uint tile_row = gl_WorkGroupID.y;
+    uint tile_col = gl_WorkGroupID.x;
+
+    uint row_base = tile_row * params.TILE_M;
+    uint col_base = tile_col * params.TILE_N;
+
+    // Bounds check: skip if this workgroup has no valid output
+    if (row_base >= params.M || col_base >= params.N) {
+        // Still need to contribute to noise index loading
+        // (other WGs handle other regions)
+        return;
+    }
+
+    uint actual_tile_m = min(params.TILE_M, params.M - row_base);
+    uint actual_tile_n = min(params.TILE_N, params.N - col_base);
+
+    // --- Phase 1: Load noise indices (EAR/EBL) into shared memory ---
+    // Each tile_K-sized chunk loads its corresponding noise indices
+    load_noise_indices(0u, params.TILE_K);
+
+    // --- Phase 2: Preload EAL row and EBR col into registers ---
+    // EAL[row][0..R-1] and EBR[col][0..R-1]
+    const uint R_MAX = 128u;
+    int8_t eal_row_vals[R_MAX];  // EAL[tile_row + local_row][0..R-1]
+    int8_t ebr_col_vals[R_MAX];  // EBR[tile_col + local_col][0..R-1]
+
+    uint g_row = row_base + local_row;
+    uint g_col = col_base + local_col;
+
+    if (g_row < params.M && g_col < params.N) {
+        uint eal_base = g_row * params.R;
+        uint ebr_base = g_col * params.R;
+        uint r_lim = min(params.R, R_MAX);
+        for (uint r = 0u; r < r_lim; r++) {
+            eal_row_vals[r] = (r < params.R) ? EAL.data[eal_base + r] : int8_t(0);
+            ebr_col_vals[r] = (r < params.R) ? EBR.data[ebr_base + r] : int8_t(0);
+        }
+    } else {
+        for (uint r = 0u; r < R_MAX; r++) {
+            eal_row_vals[r] = int8_t(0);
+            ebr_col_vals[r] = int8_t(0);
+        }
+    }
+
+    // Initialize jackpot in shared memory (from global buffer)
+    // We'll use a local jackpot copy to avoid global atomics
+    uint jp[16];
+    if (tile_row == 0u && tile_col == 0u) {
+        // Only first WG initializes; others accumulate
+        for (int i = 0; i < 16; i++) {
+            jp[i] = jackpot.data[i];
+        }
+    } else {
+        for (int i = 0; i < 16; i++) {
+            jp[i] = 0u;
+        }
+    }
+
+    // --- Phase 3: Tiled GEMM with noise fusion ---
+    int32_t acc = 0;
+
+    for (uint k_base = 0u; k_base < params.K; k_base += params.TILE_K) {
+        uint tile_k_eff = min(params.TILE_K, params.K - k_base);
+
+        // Barrier before loading new tiles
+        memoryBarrierShared();
+        barrier();
+
+        // Load A and B tiles into shared memory
+        // Cooperative load: each of 256 threads loads items
+        load_A_tile(row_base, k_base, actual_tile_m, tile_k_eff);
+        load_B_tile(k_base, col_base, tile_k_eff, actual_tile_n);
+
+        // Load noise indices for this K-tile segment
+        load_noise_indices(k_base, tile_k_eff);
+
+        memoryBarrierShared();
+        barrier();
+
+        // Inner GEMM loop
+        if (g_row < params.M && g_col < params.N) {
+            for (uint kk = 0u; kk < tile_k_eff; kk++) {
+                uint k_abs = k_base + kk;
+
+                // Load A element from shared
+                int8_t a_raw = sh_A[local_row * params.TILE_K + kk];
+
+                // Noise-A: EAL[row][EAR_pos[kk]] - EAL[row][EAR_neg[kk]]
+                // Use pre-loaded EAL row
+                uint ep = sh_ear_pos[kk];
+                uint en = sh_ear_neg[kk];
+                int8_t noise_a = int8_t(0);
+                if (ep < R_MAX && en < R_MAX) {
+                    noise_a = int8_t(int32_t(eal_row_vals[ep]) - int32_t(eal_row_vals[en]));
+                }
+                int8_t a_val = a_raw + noise_a;
+
+                // Load B element from shared
+                int8_t b_raw = sh_B[kk * params.TILE_N + local_col];
+
+                // Noise-B: EBR[col][EBL_pos[kk]] - EBR[col][EBL_neg[kk]]
+                uint bp = sh_ebl_pos[kk];
+                uint bn = sh_ebl_neg[kk];
+                int8_t noise_b = int8_t(0);
+                if (bp < R_MAX && bn < R_MAX) {
+                    noise_b = int8_t(int32_t(ebr_col_vals[bp]) - int32_t(ebr_col_vals[bn]));
+                }
+                int8_t b_val = b_raw + noise_b;
+
+                // Accumulate (int8 × int8 → int32)
+                acc += int32_t(a_val) * int32_t(b_val);
+            }
+
+            // After each K-tile: XOR-reduce this thread's accumulator into jackpot
+            // (reduction across the workgroup)
+            uint tid_idx = (k_base / params.R);
+            if (params.R > 0u && tid_idx > 0u) {
+                // XOR-reduce within subgroup first
+                uint xored = subgroupXor(uint(acc));
+
+                // Elect a leader per subgroup to write partial
+                if (subgroupElect()) {
+                    sh_subgroup_xor[gl_SubgroupID] = xored;
+                }
+                memoryBarrierShared();
+                barrier();
+
+                // Thread 0 does final reduction and jackpot update
+                if (tid == 0u) {
+                    uint total_xor = 0u;
+                    for (int sg = 0; sg < gl_NumSubgroups; sg++) {
+                        total_xor ^= sh_subgroup_xor[sg];
+                    }
+
+                    uint j_idx = (tid_idx - 1u) % 16u;
+
+                    // rotl(jp[j_idx], 13) ^ total_xor
+                    jp[j_idx] = (jp[j_idx] << 13u) | (jp[j_idx] >> 19u);
+                    jp[j_idx] ^= total_xor;
+                }
+                barrier();
+            }
+
+            // Reset accumulator for next K-tile
+            acc = 0;
+        }
+    }
+
+    // --- Phase 4: Write back jackpot ---
+    // Each thread writes back its one relevant jackpot slot
+    // (a more efficient approach: use subgroup broadcast)
+    // For correctness, thread 0 writes all 16 from shared
+    if (tid == 0u) {
+        for (int i = 0; i < 16; i++) {
+            jackpot.data[i] = jp[i];
+        }
+    }
+
+    // --- Phase 5: Jackpot hash + PoW check (only first tile of the grid) ---
+    // K4 is folded in here: one workgroup (0,0) computes the hash
+    if (tile_row == 0u && tile_col == 0u) {
+        uint[16] msg;
+        uint[8] key;
+        uint[8] hash_out;
+
+        // Build message from jackpot[0..15] = 64 bytes (16 uint32)
+        // The CUDA code uses all 16 jackpot values as the message block
+        for (int i = 0; i < 16; i++) {
+            msg[i] = jp[i];
+        }
+
+        // Key = commitment_hash_A
+        for (int i = 0; i < 8; i++) {
+            key[i] = hash_a.data[i];
+        }
+
+        b3_compress_keyed(msg, key, B3_FLAGS_SINGLE, hash_out);
+
+        // Compare hash_out (LE uint256) against target (LE uint256)
+        // MSW-first comparison, both in LE byte order
+        bool block_found = true;
+        for (int i = 7; i >= 0; i--) {
+            if (hash_out[i] > target.data[i]) {
+                block_found = false;
+                break;
+            }
+            if (hash_out[i] < target.data[i]) {
+                break;
+            }
+        }
+
+        if (block_found) {
+            result.found = 1u;
+            result.tile_row = tile_row;
+            result.tile_col = tile_col;
+        } else if (result.found == 0u) {
+            // Only clear if nobody else found it
+            result.found = 0u;
+        }
+    }
+}

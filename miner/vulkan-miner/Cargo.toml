@@ -1,0 +1,23 @@
+[package]
+name = "vulkan-miner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = { version = "0.38", features = ["linked"] }
+blake3 = "1.5"
+pearl-blake3 = { path = "../../pearl-blake3" }
+zk-pow = { path = "../../zk-pow" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.21"
+hex = "0.4"
+primitive-types = { version = "0.12", features = ["serde"] }
+
+[dev-dependencies]
+rand = "0.9"

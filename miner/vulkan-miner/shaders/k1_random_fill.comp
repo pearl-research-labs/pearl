@@ -1,0 +1,44 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+// K1: Fill matrices A (m×k) and B (k×n) with uniform random int8 in [-64, 63]
+// Uses xorshift32 RNG seeded per-element.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer A_buf { int8_t data[]; } A;
+layout(set = 0, binding = 1, std430) buffer B_buf { int8_t data[]; } B;
+
+layout(push_constant) uniform Params {
+    uint m;
+    uint n;
+    uint k;
+    uint seed;
+} params;
+
+// xorshift32 returning int8 in [-64, 63]
+int8_t xorshift_int8(inout uint state) {
+    state ^= state << 13u;
+    state ^= state >> 17u;
+    state ^= state << 5u;
+    return int8_t(state & 0x7Fu) - int8_t(64);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    uint state = params.seed ^ (idx * 0x9E3779B9u);
+
+    // Fill A[m×k]
+    uint a_size = params.m * params.k;
+    if (idx < a_size) {
+        A.data[idx] = xorshift_int8(state);
+    }
+
+    // Fill B[k×n] (continuing from same idx)
+    uint b_size = params.k * params.n;
+    if (idx < b_size) {
+        B.data[idx] = xorshift_int8(state);
+    }
+}

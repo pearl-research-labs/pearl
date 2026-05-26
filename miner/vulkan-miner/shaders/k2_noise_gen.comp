@@ -1,0 +1,175 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// K2: BLAKE3-based noise matrix generation
+// Generates 4 noise matrices via per-thread BLAKE3 keyed compression.
+// Each invocation produces 32 bytes = 32 values of one matrix.
+
+#include "common/blake3.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer EAL_buf { int8_t data[]; } eal;
+layout(set = 0, binding = 1, std430) buffer EAR_buf { int8_t data[]; } ear;
+layout(set = 0, binding = 2, std430) buffer EBL_buf { int8_t data[]; } ebl;
+layout(set = 0, binding = 3, std430) buffer EBR_buf { int8_t data[]; } ebr;
+layout(set = 0, binding = 4, std430) readonly buffer HashA_buf { uint data[8]; } hash_a;
+layout(set = 0, binding = 5, std430) readonly buffer HashB_buf { uint data[8]; } hash_b;
+
+layout(push_constant) uniform Params {
+    uint m;
+    uint n;
+    uint k;
+    uint rank;
+} params;
+
+// High 32 bits of 64-bit product of two uint32 values
+uint mul_hi_u32(uint a, uint b) {
+    uint a_hi = a >> 16u;
+    uint a_lo = a & 0xFFFFu;
+    uint b_hi = b >> 16u;
+    uint b_lo = b & 0xFFFFu;
+    uint cross_lo = a_lo * b_hi;
+    uint cross_hi = a_hi * b_lo;
+    uint cross_sum = cross_lo + cross_hi;
+    uint lower = a_lo * b_lo + (cross_sum << 16u);
+    uint upper = a_hi * b_hi + (cross_sum >> 16u);
+    if (lower < a_lo * b_lo) upper += 1u;
+    return upper;
+}
+
+// Dense noise: byte → int8 in [-32, 32)
+int8_t dense_val(uint byte_val) {
+    return int8_t(byte_val & 0x3Fu) - int8_t(32);
+}
+
+// Sparse: each uint32 produces (pos_idx, neg_idx) into noise rank dimension
+void sparse_pair(uint word, uint rank_mask, out uint pos, out uint neg) {
+    pos = word & rank_mask;
+    uint r1 = params.rank - 1u;
+    neg = pos ^ (1u + mul_hi_u32(r1, word));
+}
+
+void main() {
+    uint gidx = gl_GlobalInvocationID.x;
+
+    // Total elements across all 4 matrices
+    uint m_r = params.m * params.rank;
+    uint k_r = params.k * params.rank;
+    uint n_r = params.n * params.rank;
+    uint total = m_r + k_r + k_r + n_r;
+
+    if (gidx >= total) return;
+
+    // Determine which matrix element this thread handles
+    uint cursor = 0u;
+    uint mat;
+    uint local_idx;
+
+    if (gidx < m_r) {
+        mat = 0u;     // EAL
+        local_idx = gidx;
+    } else {
+        cursor += m_r;
+        if (gidx < cursor + k_r) {
+            mat = 1u; // EAR
+            local_idx = gidx - cursor;
+        } else {
+            cursor += k_r;
+            if (gidx < cursor + k_r) {
+                mat = 2u; // EBL
+                local_idx = gidx - cursor;
+            } else {
+                mat = 3u; // EBR
+                local_idx = gidx - cursor;
+            }
+        }
+    }
+
+    // Build message for BLAKE3 keyed compression
+    // msg[0..7] = zero + rule (*)
+    // msg[8..15] = seed label
+    uint[16] msg;
+    for (int i = 0; i < 16; i++) msg[i] = 0u;
+
+    // Rule (*): data[0] = r+1 for dense (EAL/EBR), data[1] = r+1 for sparse
+    if (mat == 0u || mat == 3u) {
+        msg[0] = local_idx + 1u;
+    } else {
+        msg[1] = local_idx + 1u;
+    }
+
+    // Seed in msg[8..15]: "A_tensor" for EAL/EAR, "B_tensor" for EBL/EBR
+    // LE encoding of "A_tensor" = 0x41,0x5F,0x74,0x65,0x6E,0x73,0x6F,0x72
+    // as uint32[2]: [0x65745F41, 0x726F736E]
+    if (mat == 0u || mat == 1u) {
+        msg[8]  = 0x65745F41u;
+        msg[9]  = 0x726F736Eu;
+    } else {
+        msg[8]  = 0x65745F42u;
+        msg[9]  = 0x726F736Eu;
+    }
+
+    // Key = hash_a for A-side, hash_b for B-side
+    uint[8] key;
+    if (mat == 0u || mat == 1u) {
+        for (int i = 0; i < 8; i++) key[i] = hash_a.data[i];
+    } else {
+        for (int i = 0; i < 8; i++) key[i] = hash_b.data[i];
+    }
+
+    uint[8] hash_out;
+    b3_compress_keyed(msg, key, B3_FLAGS_SINGLE, hash_out);
+
+    // Write to appropriate matrix
+    if (mat == 0u) {
+        // EAL: dense, m×r, row-major, each thread writes 32 consecutive values
+        uint base = local_idx * 32u;
+        uint limit = min(base + 32u, m_r);
+        for (int i = 0; i < 32; i++) {
+            uint idx = base + uint(i);
+            if (idx >= limit) break;
+            uint byte_val = (hash_out[i / 4] >> ((uint(i % 4)) * 8u)) & 0xFFu;
+            eal.data[idx] = dense_val(byte_val);
+        }
+    } else if (mat == 1u) {
+        // EAR: sparse, k×r row-major
+        // Each uint32 word → one row: +1 at pos, -1 at neg
+        uint row_base = local_idx * 8u;
+        uint rmask = params.rank - 1u;
+        for (int j = 0; j < 8; j++) {
+            uint row = row_base + uint(j);
+            if (row >= params.k) break;
+            uint word = hash_out[j];
+            uint pos, neg;
+            sparse_pair(word, rmask, pos, neg);
+            ear.data[row * params.rank + pos] = int8_t(1);
+            ear.data[row * params.rank + neg] = int8_t(-1);
+        }
+    } else if (mat == 2u) {
+        // EBL: sparse, same as EAR
+        uint row_base = local_idx * 8u;
+        uint rmask = params.rank - 1u;
+        for (int j = 0; j < 8; j++) {
+            uint row = row_base + uint(j);
+            if (row >= params.k) break;
+            uint word = hash_out[j];
+            uint pos, neg;
+            sparse_pair(word, rmask, pos, neg);
+            ebl.data[row * params.rank + pos] = int8_t(1);
+            ebl.data[row * params.rank + neg] = int8_t(-1);
+        }
+    } else {
+        // EBR: dense, n×r
+        uint base = local_idx * 32u;
+        uint limit = min(base + 32u, n_r);
+        for (int i = 0; i < 32; i++) {
+            uint idx = base + uint(i);
+            if (idx >= limit) break;
+            uint byte_val = (hash_out[i / 4] >> ((uint(i % 4)) * 8u)) & 0xFFu;
+            ebr.data[idx] = dense_val(byte_val);
+        }
+    }
+}
