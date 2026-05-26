@@ -56,6 +56,15 @@ struct KernelTraits {
   static constexpr int kNumThreads = kNumMmaThreads + 128;
   static constexpr int kNumWarps = kNumThreads / cutlass::NumThreadsPerWarp;
 
+  // Warp tiling constants. Used both for the SM80 mma.sync atom layout
+  // (Blackwell port) and for the reduce_buffer permutation. 4 warps per
+  // MMA warpgroup, each warp owning 16 rows of the per-WG accumulator.
+  static constexpr int kWarpRows = 4 * kNumMmaWarpgroups;
+  static constexpr int kWarpCols = 1;
+  using MMAWarpLayout = Layout<Shape<Int<kWarpRows>, Int<kWarpCols>, _1>>;
+  using MMAWarpTileShape = Shape<_16, _8, _32>;
+
+
   using TileShape_MNK = Shape<Int<bM>, Int<bN>, Int<bK>>;
   // used for denoising
   using TileShape_MNR = Shape<Int<bM>, Int<bN>, Int<R>>;
@@ -71,21 +80,22 @@ struct KernelTraits {
       std::conditional_t<(kClusterSizeM > 1), cute::SM90_TMA_LOAD_MULTICAST,
                          cute::SM90_TMA_LOAD>;
   // GEMM traits
-  using AtomLayoutMNK = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
+  //
+  // Blackwell port (sm_120a / sm_121a — GB10, RTX 50-series): WGMMA is not
+  // available on consumer Blackwell. Replace the Hopper SM90 WGMMA atom with a
+  // 4-warp-per-warpgroup tile of SM80 mma.sync 16x8x32 int8 atoms. The
+  // per-thread accumulator-fragment layout is bit-identical to Hopper because
+  // Hopper CLayout_64xN was constructed exactly this way (4 warps in M × N/8
+  // atoms across × interleaved (v1,v0) value packing). This preserves
+  // PoUW-relevant xor_reduction(tCrC) outputs bit-for-bit.
+  using AtomLayoutMNK = Layout<Shape<Int<kWarpRows>, _1, _1>>;
   using TiledMma = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<ElementIn, ElementIn, ElementAccum,
-                                 TileShape_MNK>(),
-      AtomLayoutMNK{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMNK{},
+      cute::Tile<cute::Underscore, cute::Int<bN>, cute::Underscore>{}));
   using MMATraits = typename TiledMma::Atom::Traits;
   using MMAAtomShape_MNK = typename TiledMma::AtomShape_MNK;
   using MMAAtom_K = decltype(get<2>(MMAAtomShape_MNK{}));
-
-  // Fake warp layout and warp tile shape for reduce_buffer permutation
-  // We assume <= 2 MMA warpgroups which are always tiled in the M direction.
-  static constexpr int kWarpRows = 4 * kNumMmaWarpgroups;
-  static constexpr int kWarpCols = 1;
-  using MMAWarpLayout = Layout<Shape<Int<kWarpRows>, Int<kWarpCols>, _1>>;
-  using MMAWarpTileShape = Shape<_16, _8, _32>;
 
   using SmemLayoutAtomA =
       decltype(cutlass::gemm::collective::detail::ss_smem_selector<
@@ -139,12 +149,14 @@ struct KernelTraits {
       Layout<Shape<_1>, Stride<_1>>{}));
 
   // Denoising
-  // MMA
-  using AtomLayoutMNR = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
+  // MMA — Blackwell SM80 mma.sync 16x8x16 fp16 atoms tiled the same way as
+  // the main GEMM (kWarpRows warps in M, bN expansion via permutation). See
+  // the main-GEMM commentary above for the bit-identicality argument.
+  using AtomLayoutMNR = Layout<Shape<Int<kWarpRows>, _1, _1>>;
   using TiledMmaDenoise = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<ElementDenoise, ElementDenoise,
-                                 ElementDenoiseAccum, TileShape_MNR>(),
-      AtomLayoutMNR{}));
+      cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>{},
+      AtomLayoutMNR{},
+      cute::Tile<cute::Underscore, cute::Int<bN>, cute::Underscore>{}));
   // SMEM layouts
   using SmemLayoutEAL_Atom =
       decltype(cutlass::gemm::collective::detail::ss_smem_selector<
@@ -194,15 +206,11 @@ struct KernelTraits {
             smem_B;
       };
 
+      // Denoise phase 1 (EAL x EARxBpEB) — held in SMEM only during the
+      // first denoise WGMMA. After consumer_release of EAxBpEB_pipeline +
+      // arrival on NamedBarriers::DenoisePhase1Consumed, the producer is
+      // allowed to reload this region for phase 2.
       struct {
-        cute::array_aligned<ElementDenoise, cute::cosize_v<SmemLayoutAxEBL>,
-                            cutlass::detail::alignment_for_swizzle(
-                                SmemLayoutAxEBL{})>
-            smem_AxEBL;
-        cute::array_aligned<ElementDenoise, cute::cosize_v<SmemLayoutEBR>,
-                            cutlass::detail::alignment_for_swizzle(
-                                SmemLayoutEBR{})>
-            smem_EBR;
         cute::array_aligned<ElementDenoise, cute::cosize_v<SmemLayoutEAL>,
                             cutlass::detail::alignment_for_swizzle(
                                 SmemLayoutEAL{})>
@@ -213,9 +221,20 @@ struct KernelTraits {
             smem_EARxBpEB;
       };
 
-      cute::array_aligned<ElementOut, cute::cosize_v<SmemLayoutC>,
-                          cutlass::detail::alignment_for_swizzle(SmemLayoutC{})>
-          smem_C;
+      // Denoise phase 2 (AxEBL x EBR) — alias of phase 1's SMEM. Producer
+      // waits for DenoisePhase1Consumed before loading.
+      struct {
+        cute::array_aligned<ElementDenoise, cute::cosize_v<SmemLayoutAxEBL>,
+                            cutlass::detail::alignment_for_swizzle(
+                                SmemLayoutAxEBL{})>
+            smem_AxEBL;
+        cute::array_aligned<ElementDenoise, cute::cosize_v<SmemLayoutEBR>,
+                            cutlass::detail::alignment_for_swizzle(
+                                SmemLayoutEBR{})>
+            smem_EBR;
+      };
+
+      // Path 3: smem_C removed; epilogue now writes registers directly to gmem.
     };
 
     cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScaleA>,
@@ -243,10 +262,7 @@ struct KernelTraits {
                           cutlass::detail::alignment_for_swizzle(SmemLayoutB{})>
           smem_B;
     };
-
-    cute::array_aligned<ElementOut, cute::cosize_v<SmemLayoutC>,
-                        cutlass::detail::alignment_for_swizzle(SmemLayoutC{})>
-        smem_C;
+    // Path 3: smem_C removed; epilogue does direct register->gmem stores.
 
     cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutScaleA>,
                         cutlass::detail::alignment_for_swizzle(
