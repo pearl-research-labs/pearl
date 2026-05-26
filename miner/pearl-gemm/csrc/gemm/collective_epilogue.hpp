@@ -313,6 +313,13 @@ struct CollectiveEpilogue {
 
     // AxEB pipeline
 
+    // Path 3: wait for consumer to release EAxBpEB SMEM before reusing the
+    // aliased region for AxEB TMA loads. All producer-warp threads participate.
+    cutlass::arch::NamedBarrier::sync(
+        kNumMmaThreads + cutlass::NumThreadsPerWarp,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(
+            pearl::NamedBarriers::DenoisePhase1Consumed));
+
     if (lane_predicate) {
 
       AxEB_pipeline.producer_acquire(AxEB_pipe_write);
@@ -423,28 +430,53 @@ struct CollectiveEpilogue {
     // Wait for TMA load of EAL, EARxBpEB
     EAxBpEB_pipeline.consumer_wait(EAxBpEB_pipe_read);
     // do GEMM
+    // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
     warpgroup_fence_operand(tCrD);
     warpgroup_arrive();
+#endif
     gemm(tiled_mma_denoise, tYrEAL, tYrEARxBpEB, tCrD);
+    // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
     warpgroup_commit_batch();
+#endif
     // wait for WGMMA to finish before releasing pipeline
+    // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
     warpgroup_wait<0>();
     warpgroup_fence_operand(tCrD);
+#endif
     cutlass::arch::fence_view_async_shared();
     EAxBpEB_pipeline.consumer_release(EAxBpEB_pipe_read);
     ++EAxBpEB_pipe_read;
+
+    // Path 3: signal producer that phase-1 SMEM is consumed; aliased SMEM
+    // may now be reused for phase-2 (AxEBL + EBR) TMA loads.
+    cutlass::arch::NamedBarrier::arrive(
+        kNumMmaThreads + cutlass::NumThreadsPerWarp,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(
+            pearl::NamedBarriers::DenoisePhase1Consumed));
 
     // X = -AxEBL * EBR
     // Wait for TMA load of AxEBL, EBR
     AxEB_pipeline.consumer_wait(AxEB_pipe_read);
     // do GEMM
+    // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
     warpgroup_fence_operand(tCrD);
     warpgroup_arrive();
+#endif
     gemm(tiled_mma_denoise, tXrAxEBL, tXrEBR, tCrD);
+    // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
     warpgroup_commit_batch();
+#endif
     // wait for WGMMA to finish before releasing pipeline
+    // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
     warpgroup_wait<0>();
     warpgroup_fence_operand(tCrD);
+#endif
     cutlass::arch::fence_view_async_shared();
     AxEB_pipeline.consumer_release(AxEB_pipe_read);
     ++AxEB_pipe_read;
@@ -468,11 +500,7 @@ struct CollectiveEpilogue {
     int const residual_M = M - m_block * bM;
     int const residual_N = N - n_block * bN;
 
-    Tensor sC =
-        make_tensor(make_smem_ptr(shared_storage.smem_C.data()), SmemLayoutC{});
-    auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomC{}, tiled_mma);
-    auto smem_thr_copy_C = smem_tiled_copy_C.get_thread_slice(thread_idx);
-
+    // Path 3: sC removed; epilogue no longer uses SMEM C buffer.
     Tensor AScales = make_tensor(make_gmem_ptr(epilogue_params.ptr_A_scales),
                                  epilogue_params.layout_A_scales);
     Tensor BScales = make_tensor(make_gmem_ptr(epilogue_params.ptr_B_scales),
@@ -542,58 +570,55 @@ struct CollectiveEpilogue {
 
     // cast from float to output type
     Tensor tCrC_out = convert_type<ElementOutput>(tCrD);
-    Tensor taccCrC =
-        smem_thr_copy_C.retile_S(tCrC_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
-    Tensor taccCsC =
-        smem_thr_copy_C.partition_D(sC);  // ((Atom,AtomNum),PIPE_M,PIPE_N)
-    cute::copy(smem_tiled_copy_C, taccCrC, taccCsC);
+
+    // Path 3 (Blackwell consumer SMEM-fit): bypass the SMEM C buffer and
+    // store directly from registers to gmem. Saves 64 KB of SMEM for the
+    // canonical 128x256 bf16 tile. Each thread writes its mma.sync C
+    // fragment slots predicated by M/N residue. Coalescing relies on the
+    // compiler issuing STG.E.{32,64,128} based on the layout of adjacent
+    // fragment elements; the SM80 16x8x16 atom packs 2 N-adjacent bf16 per
+    // thread so we get at minimum STG.E.32 (2x16-bit) per write.
+    Tensor mC_direct = make_tensor(
+        make_gmem_ptr(epilogue_params.ptr_C), epilogue_params.layout_C);
+    Tensor gC_direct = local_tile(mC_direct, select<0, 1>(TileShape_MNK{}),
+                                  make_coord(m_block, n_block));
+    Tensor tCgC_direct = thr_mma.partition_C(gC_direct);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int j = 0; j < size<2>(tCrC_out); ++j) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size<1>(tCrC_out); ++i) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int v = 0; v < size<0>(tCrC_out); ++v) {
+          int m_idx = get<0>(tCcD(v, i, j));
+          int n_idx = get<1>(tCcD(v, i, j));
+          if (m_idx < residual_M && n_idx < residual_N) {
+            tCgC_direct(v, i, j) = tCrC_out(v, i, j);
+          }
+        }
+      }
+    }
+
   }
 
   CUTLASS_DEVICE void store(
       Params const& epilogue_params, SharedStorage& shared_storage,
       int thread_idx,
       cute::tuple<int32_t, int32_t, int32_t> const& block_coord) {
-
-    auto [m_block, n_block, bidb] = block_coord;
-
-    Tensor sC =
-        make_tensor(make_smem_ptr(shared_storage.smem_C.data()), SmemLayoutC{});
+    // Path 3 (Blackwell consumer SMEM-fit): direct register->gmem stores
+    // happen in scale() now (no SMEM C buffer). This function is reduced
+    // to its barrier-arrival + early-return; the SM90_TMA_STORE block
+    // below is conditionally compiled out.
     cutlass::arch::NamedBarrier::arrive(
         kNumMmaThreads + cutlass::NumThreadsPerWarp,
         static_cast<cutlass::arch::ReservedNamedBarriers>(
             pearl::NamedBarriers::Epilogue));
-
-    // Prepare TMA store
-    Tensor mC = epilogue_params.tma_store.get_tma_tensor(
-        epilogue_params.layout_C.shape());
-    Tensor gC = local_tile(mC, select<0, 1>(TileShape_MNK{}),
-                           make_coord(m_block, n_block));
-
-    auto block_tma_store =
-        epilogue_params.tma_store.get_slice(_0{});  // CTA slice
-    Tensor tCgC = block_tma_store.partition_D(gC);  // (TMA, TMA_M, TMA_K)
-    Tensor tCsC = block_tma_store.partition_S(sC);  // (TMA, TMA_M, TMA_K)
-
-    // TMA STORE: SMEM -> GMEM
-    int write_warp_idx = kNumWarps - 1;
-    int const warp_idx = cutlass::canonical_warp_idx_sync();
-    int const lane_predicate = cute::elect_one_sync();
-    if (warp_idx == write_warp_idx) {
-      // Ensure RMEM -> SMEM copy completes before issuing TMA store
-      cutlass::arch::NamedBarrier::sync(
-          kNumMmaThreads + cutlass::NumThreadsPerWarp,
-          static_cast<cutlass::arch::ReservedNamedBarriers>(
-              pearl::NamedBarriers::Epilogue));
-    }
-    // ensure all smem work is visible to TMA
-    cutlass::arch::fence_view_async_shared();
-    if (warp_idx == write_warp_idx && lane_predicate) {
-      cute::copy(epilogue_params.tma_store, tCsC, tCgC);
-      tma_store_arrive();
-    }
+    return;
   }
 
-  CUTLASS_DEVICE void store_tail() { tma_store_wait<0>(); }
+  CUTLASS_DEVICE void store_tail() {
+    // Path 3: no TMA store was issued, so no wait needed.
+  }
 };
 
 }  // namespace pearl
