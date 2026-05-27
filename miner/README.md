@@ -129,5 +129,87 @@ docker run --rm -it --gpus all \
   --enforce-eager
 ```
 
+## Single-node launcher
 
+For repeatable single-machine deployments, use `miner/run_pearl_miner.py` from
+the repository root. It keeps the official container entrypoint flow:
+`pearl-gateway start` followed by `vllm serve`, while standardizing GPU
+selection, vLLM tuning flags, and optional LoRA adapter loading.
+
+Preview a two-GPU Docker run:
+
+```bash
+python3 miner/run_pearl_miner.py \
+  --mode docker \
+  --gpus 0,1 \
+  --pearld-rpc-url http://127.0.0.1:44107 \
+  --pearld-rpc-user rpcuser \
+  --pearld-rpc-password rpcpass \
+  --mining-address <your-mining-address> \
+  --model pearl-ai/Llama-3.3-70B-Instruct-pearl \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.9 \
+  --dry-run
+```
+
+Run it for real by removing `--dry-run`. The launcher automatically maps
+`--gpus 0,1` to `CUDA_VISIBLE_DEVICES=0,1` and
+`--tensor-parallel-size 2` unless you override `--tensor-parallel-size`.
+
+Load a fine-tuned LoRA adapter into vLLM:
+
+```bash
+python3 miner/run_pearl_miner.py \
+  --mode docker \
+  --gpus 0,1 \
+  --lora-adapter /host/adapters/pearl-lora \
+  --lora-name pearl_ft \
+  --pearld-rpc-url http://127.0.0.1:44107 \
+  --mining-address <your-mining-address>
+```
+
+For a local non-Docker run on a prepared machine:
+
+```bash
+python3 miner/run_pearl_miner.py \
+  --mode local \
+  --gpus 0 \
+  --pearld-rpc-url http://127.0.0.1:44107 \
+  --mining-address <your-mining-address>
+```
+
+Extra vLLM optimization flags can be appended repeatedly:
+
+```bash
+python3 miner/run_pearl_miner.py \
+  --mode docker \
+  --gpus 0,1 \
+  --extra-vllm-arg=--max-num-seqs \
+  --extra-vllm-arg 128
+```
+
+## Fine-tuning
+
+For a minimal LoRA/SFT fine-tune of a Pearl-compatible vLLM model, use
+`miner/fine_tune_lora.py` from the repository root. The script supports local
+JSON/JSONL/CSV files or Hugging Face datasets. Each row can contain one of
+`text`, `prompt` plus `completion`, or `messages` in chat-template format.
+
+```bash
+uv run \
+  --with transformers \
+  --with datasets \
+  --with peft \
+  --with accelerate \
+  --with bitsandbytes \
+  miner/fine_tune_lora.py \
+  --model pearl-ai/Llama-3.3-70B-Instruct-pearl \
+  --dataset ./train.jsonl \
+  --output-dir ./outputs/pearl-lora \
+  --load-in-4bit \
+  --bf16
+```
+
+The output directory contains the LoRA adapter and tokenizer files. Pass
+`--merge` to also write a merged model under `<output-dir>/merged`.
 
