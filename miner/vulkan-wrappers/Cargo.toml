@@ -1,0 +1,8 @@
+[package]
+name = "vulkan-wrappers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = { version = "0.38", features = ["linked"] }
+anyhow = "1"

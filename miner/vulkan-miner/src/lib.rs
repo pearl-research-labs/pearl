@@ -1,6 +1,5 @@
-pub mod context;
-pub mod buffers;
-pub mod pipelines;
+#![forbid(unsafe_code)]
+
 pub mod mining;
 pub mod proof;
 pub mod rng;

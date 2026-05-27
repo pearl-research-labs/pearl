@@ -17,6 +17,12 @@
 //
 // Tile layout: 16×16 output elements, 128 inner K-tile
 // Workgroup: 16×16 = 256 threads
+//
+// Constraints:
+//   R (noise rank) must be <= 128 (R_MAX). Shared memory arrays for noise
+//   indices and pre-loaded EAL/EBR values are hardcoded to 128 elements.
+//   K-tile size (TILE_K) must be <= 128 (constrained by shared memory
+//   for A/B tiles: TILE_M x TILE_K <= 4096, TILE_K x TILE_N <= 4096).
 
 #include "common/blake3.glsl"
 
@@ -333,9 +339,6 @@ void main() {
             result.found = 1u;
             result.tile_row = tile_row;
             result.tile_col = tile_col;
-        } else if (result.found == 0u) {
-            // Only clear if nobody else found it
-            result.found = 0u;
         }
     }
 }

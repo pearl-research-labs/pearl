@@ -2,17 +2,23 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
-    let shader_dir = Path::new("shaders");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shader_dir = manifest_dir.join("shaders");
     let out_dir_str = std::env::var("OUT_DIR").unwrap();
     let out_dir = Path::new(&out_dir_str);
 
     if !shader_dir.exists() {
-        return;
+        panic!(
+            "shaders/ directory not found at {:?}; cannot compile SPIR-V. \
+             Expected shaders/*.comp files in the vulkan-wrappers crate root.",
+            shader_dir
+        );
     }
 
+    println!("cargo:rerun-if-env-changed=GLSLC_PATH");
     let glslc_path = std::env::var("GLSLC_PATH").unwrap_or_else(|_| "glslc".to_string());
 
-    collect_shaders(shader_dir, shader_dir, out_dir, &glslc_path);
+    collect_shaders(&shader_dir, &shader_dir, out_dir, &glslc_path);
 }
 
 fn collect_shaders(base: &Path, dir: &Path, out_dir: &Path, glslc: &str) {
@@ -43,6 +49,16 @@ fn collect_shaders(base: &Path, dir: &Path, out_dir: &Path, glslc: &str) {
             assert!(status.success(), "Failed to compile {:?}", path);
 
             println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
+    // Watch include directory for changes
+    let inc_dir = base.join("common");
+    if inc_dir.is_dir() {
+        for entry in fs::read_dir(&inc_dir).unwrap() {
+            if let Ok(e) = entry {
+                println!("cargo:rerun-if-changed={}", e.path().display());
+            }
         }
     }
 }

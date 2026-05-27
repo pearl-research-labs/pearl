@@ -1,16 +1,16 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
-
-use vulkan_miner::buffers::MiningBuffers;
-use vulkan_miner::context::VulkanContext;
+use vulkan_wrappers::{Buffers, Pipelines, VulkanContext};
 use vulkan_miner::mining::MiningLoop;
-use vulkan_miner::pipelines::KernelPipelines;
 
 #[derive(Parser)]
 #[command(name = "vulkan-miner", about = "Vulkan 1.3 standalone PoW miner for pearl-gemm")]
 struct Cli {
-    /// Gateway Unix socket path
-    #[arg(long, default_value = "/tmp/pearl-gateway.sock")]
+    /// Gateway address (UDS path on Unix, "host:port" on Windows)
+    #[cfg_attr(unix, arg(long, default_value = "/tmp/pearl-gateway.sock"))]
+    #[cfg_attr(windows, arg(long, default_value = "127.0.0.1:8337"))]
     gateway: String,
 
     /// Matrix dimensions
@@ -56,58 +56,54 @@ async fn main() -> Result<()> {
     tracing::info!("Vulkan context created");
 
     // 2. Allocate buffers
-    let buffers = MiningBuffers::new(&ctx, cli.m, cli.n, cli.k, cli.rank)?;
-    tracing::info!("Buffers allocated ({:.2} MB)", buffers.allocation_size as f64 / 1_048_576.0);
+    let buffers = Buffers::new(&ctx, cli.m, cli.n, cli.k, cli.rank)?;
+    tracing::info!(
+        "Buffers allocated ({:.2} MB)",
+        buffers.allocation_size as f64 / 1_048_576.0
+    );
 
-    // 3. Create pipelines (load SPIR-V, create descriptor sets, create pipelines)
-    let sizes = MiningBuffers::buffer_sizes(cli.m, cli.n, cli.k, cli.rank);
-    let buffer_list = [
-        buffers.a, buffers.b, buffers.eal, buffers.ear,
-        buffers.ebl, buffers.ebr, buffers.jackpot, buffers.hash_a,
-        buffers.hash_b, buffers.target, buffers.result,
-    ];
-    let size_list: Vec<u64> = sizes.iter().map(|(s, _)| *s).collect();
-    let pipelines = KernelPipelines::new(&ctx, &buffer_list, &size_list)?;
+    // 3. Create pipelines
+    let pipelines = Pipelines::new(&ctx, &buffers)?;
     tracing::info!("Compute pipelines created");
 
-    // 4. Mining loop
-    let mut mining_loop = MiningLoop {
-        context: ctx,
-        pipelines,
-        buffers,
-        tile_m: cli.tile_m,
-        tile_n: cli.tile_n,
-        tile_k: cli.tile_k,
-    };
+    // 4. Mining loop state
+    let mut mining_loop = MiningLoop::new(ctx, pipelines, buffers, cli.tile_m, cli.tile_n, cli.tile_k);
 
-    // Connect to gateway
-    let mut gateway = vulkan_miner::gateway::client::GatewayClient::connect(&cli.gateway).await?;
+    // 5. Connect to gateway (retry until available)
+    let mut gateway = loop {
+        match vulkan_miner::gateway::client::GatewayClient::connect(&cli.gateway).await {
+            Ok(g) => break g,
+            Err(e) => {
+                tracing::warn!("Failed to connect to gateway: {}; retrying in 1s", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
     tracing::info!("Connected to gateway at {}", cli.gateway);
 
     // Main mining loop
     let mut iteration = 0u64;
     loop {
         let job = gateway.get_job().await?;
+        let job_key = blake3::hash(&job.prev_block);
+        let hash_a = blake3::keyed_hash(job_key.as_bytes(), b"hash_a");
+        let hash_b = blake3::keyed_hash(job_key.as_bytes(), b"hash_b");
         tracing::info!(
-            "Job received: m={} n={} k={} target={}...",
-            job.m,
-            job.n,
-            job.k,
+            "Job received: prev_block={} target={}...",
+            hex::encode(&job.prev_block[..4]),
             hex::encode(&job.target[..4])
         );
-
-        let job_key = blake3::hash(&job.header_prev_block); // simplified; actual job_key includes header+config
 
         loop {
             match mining_loop.run_iteration(
                 &job_key,
                 iteration,
-                job.m,
-                job.n,
-                job.k,
-                job.rank,
-                &[0u8; 32], // hash_a — placeholder
-                &[0u8; 32], // hash_b — placeholder
+                cli.m,
+                cli.n,
+                cli.k,
+                cli.rank,
+                hash_a.as_bytes(),
+                hash_b.as_bytes(),
                 &job.target,
             ) {
                 Ok(Some((tile_row, tile_col))) => {
@@ -117,16 +113,36 @@ async fn main() -> Result<()> {
                         tile_row,
                         tile_col
                     );
-                    // Build and submit proof
-                    let proof = build_dummy_proof(job.m, job.n, job.k, job.rank);
+                    let seed = vulkan_miner::rng::compute_seed(&job_key, iteration);
+                    let (a_bytes, bt_bytes) = vulkan_miner::proof::derive_matrix_bytes(seed, cli.m, cli.n, cli.k);
+                    let rows_pattern: Vec<u32> = (0..cli.tile_m).collect();
+                    let cols_pattern: Vec<u32> = (0..cli.tile_n).collect();
+                    let proof = vulkan_miner::proof::build_merkle_proof(
+                        &a_bytes,
+                        &bt_bytes,
+                        cli.m as usize,
+                        cli.n as usize,
+                        cli.k as usize,
+                        tile_row,
+                        tile_col,
+                        cli.tile_m,
+                        cli.tile_n,
+                        &rows_pattern,
+                        &cols_pattern,
+                        job_key.as_bytes(),
+                        cli.rank as usize,
+                    )?;
                     let proof_bytes = bincode::serialize(&proof)?;
-                    gateway.submit_block(&proof_bytes).await?;
+                    gateway.submit_plain_proof(&proof_bytes, &job).await?;
                     tracing::info!("Block submitted");
-                    break; // Get new job
+                    if cli.once {
+                        return Ok(());
+                    }
+                    break;
                 }
                 Ok(None) => {
                     iteration += 1;
-                    if cli.once && iteration >= 1 {
+                    if cli.once {
                         tracing::info!("One iteration completed (--once)");
                         return Ok(());
                     }
@@ -135,39 +151,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Iteration failed: {}", e);
-                    break; // Get new job
+                    tracing::error!("Iteration {} failed: {}; retrying after backoff", iteration, e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
             }
         }
     }
 }
 
-/// Temporary dummy proof for testing. Replace with real proof construction.
-fn build_dummy_proof(m: u32, n: u32, k: u32, noise_rank: u32) -> zk_pow::ffi::plain_proof::PlainProof {
-    use zk_pow::ffi::plain_proof::MatrixMerkleProof;
-    use zk_pow::ffi::plain_proof::PlainProof;
 
-    let empty_proof = pearl_blake3::MerkleProof {
-        leaf_data: vec![],
-        leaf_indices: vec![],
-        total_leaves: 0,
-        root: [0u8; 32],
-        siblings: vec![],
-    };
-
-    PlainProof {
-        m: m as usize,
-        n: n as usize,
-        k: k as usize,
-        noise_rank: noise_rank as usize,
-        a: MatrixMerkleProof {
-            proof: empty_proof.clone(),
-            row_indices: vec![],
-        },
-        bt: MatrixMerkleProof {
-            proof: empty_proof,
-            row_indices: vec![],
-        },
-    }
-}

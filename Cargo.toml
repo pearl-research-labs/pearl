@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "miner/vulkan-miner",
+    "miner/vulkan-wrappers",
+]
+exclude = ["plonky2"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/pearl-research-labs/pearl"
+repository = "https://github.com/pearl-research-labs/pearl"
+
+[profile.devr]
+inherits = "release"
+debug-assertions = true

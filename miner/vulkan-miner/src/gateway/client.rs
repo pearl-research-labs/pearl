@@ -1,73 +1,186 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use anyhow::{Context, Result};
+use base64::Engine;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
-/// Mining job received from the pearl gateway.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(windows)]
+use tokio::net::TcpStream;
+
+/// Mining job received from the pearl gateway via JSON-RPC 2.0.
+///
+/// The gateway sends `{ incomplete_header_bytes: "<base64>", target: <int> }`.
+#[derive(Debug, Clone)]
 pub struct MiningJob {
-    pub m: u32,
-    pub n: u32,
-    pub k: u32,
-    pub rank: u32,
-    pub header_version: u32,
-    pub header_prev_block: [u8; 32],
-    pub header_merkle_root: [u8; 32],
-    pub header_timestamp: u32,
-    pub header_nbits: u32,
+    /// Raw 80‑byte incomplete block header.
+    pub incomplete_header_bytes: [u8; 80],
+    /// PoW target as big‑endian u256.
     pub target: [u8; 32],
+    /// Extracted fields for convenience.
+    pub prev_block: [u8; 32],
+    pub merkle_root: [u8; 32],
 }
 
-/// Gateway RPC client over a Unix domain socket.
-/// Communicates with the pearl gateway daemon using bincode-encoded messages.
+/// Gateway RPC client speaking line‑delimited JSON-RPC 2.0.
+///
+/// On Unix connects via UDS; on Windows via TCP loopback.
 pub struct GatewayClient {
-    stream: UnixStream,
+    reader: BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
 }
 
 impl GatewayClient {
     pub async fn connect(path: &str) -> Result<Self> {
-        let stream = UnixStream::connect(path).await?;
-        Ok(Self { stream })
+        #[cfg(unix)]
+        {
+            let stream = UnixStream::connect(path).await?;
+            let (r, w) = tokio::io::split(stream);
+            Ok(Self {
+                reader: BufReader::new(Box::new(r)),
+                writer: Box::new(w),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let stream = TcpStream::connect(path).await?;
+            let (r, w) = tokio::io::split(stream);
+            Ok(Self {
+                reader: BufReader::new(Box::new(r)),
+                writer: Box::new(w),
+            })
+        }
     }
 
-    /// Request a new mining job from the gateway.
+    /// Request a new mining job via `getMiningInfo`.
     pub async fn get_job(&mut self) -> Result<MiningJob> {
-        // Send request (empty GET_JOB message)
-        let req = b"GET_JOB";
-        self.stream.write_all(req).await?;
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "getMiningInfo",
+            "params": {},
+            "id": 1,
+        });
 
-        // Read the response: first 4 bytes = length prefix
-        let mut len_buf = [0u8; 4];
-        self.stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut line = String::new();
+        self.writer
+            .write_all(serde_json::to_string(&req)?.as_bytes())
+            .await?;
+        self.writer.write_all(b"\n").await?;
+        self.writer.flush().await?;
 
-        let mut buf = vec![0u8; len];
-        self.stream.read_exact(&mut buf).await?;
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("gateway connection closed");
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let resp: serde_json::Value =
+                serde_json::from_str(line).context("failed to parse JSON-RPC response")?;
 
-        let job: MiningJob = bincode::deserialize(&buf)?;
-        Ok(job)
+            if let Some(err) = resp.get("error") {
+                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                anyhow::bail!("gateway error {}: {}", code, msg);
+            }
+
+            let result = &resp["result"];
+            let header_b64 = result["incomplete_header_bytes"]
+                .as_str()
+                .context("missing incomplete_header_bytes")?;
+            let target_val = result["target"]
+                .as_u64()
+                .context("missing or invalid target")?;
+
+            let incomplete_header_bytes: [u8; 80] =
+                Self::decode_b64_header(header_b64)?;
+
+            let mut prev_block = [0u8; 32];
+            let mut merkle_root = [0u8; 32];
+            prev_block.copy_from_slice(&incomplete_header_bytes[4..36]);
+            merkle_root.copy_from_slice(&incomplete_header_bytes[36..68]);
+
+            let mut target = [0u8; 32];
+            target[24..32].copy_from_slice(&target_val.to_be_bytes());
+
+            return Ok(MiningJob {
+                incomplete_header_bytes,
+                target,
+                prev_block,
+                merkle_root,
+            });
+        }
     }
 
-    /// Submit a solved block proof.
-    pub async fn submit_block(&mut self, proof_data: &[u8]) -> Result<()> {
-        let msg = bincode::serialize(&SubmitRequest {
-            msg_type: 1, // SUBMIT_BLOCK
-            data: proof_data.to_vec(),
-        })?;
+    /// Submit a solved `PlainProof` via `submitPlainProof`.
+    pub async fn submit_plain_proof(
+        &mut self,
+        plain_proof_bincode: &[u8],
+        mining_job: &MiningJob,
+    ) -> Result<()> {
+        let proof_b64 = base64::engine::general_purpose::STANDARD.encode(plain_proof_bincode);
+        let header_b64 =
+            base64::engine::general_purpose::STANDARD.encode(&mining_job.incomplete_header_bytes);
 
-        let len = (msg.len() as u32).to_le_bytes();
-        self.stream.write_all(&len).await?;
-        self.stream.write_all(&msg).await?;
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "submitPlainProof",
+            "params": {
+                "plain_proof": proof_b64,
+                "mining_job": {
+                    "incomplete_header_bytes": header_b64,
+                    "target": u64::from_be_bytes(mining_job.target[24..32].try_into().unwrap()),
+                },
+            },
+            "id": 1,
+        });
 
-        // Read acknowledgement
-        let mut ack = [0u8; 4];
-        self.stream.read_exact(&mut ack).await?;
-        Ok(())
+        self.writer
+            .write_all(serde_json::to_string(&req)?.as_bytes())
+            .await?;
+        self.writer.write_all(b"\n").await?;
+        self.writer.flush().await?;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("gateway connection closed on submit");
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let resp: serde_json::Value =
+                serde_json::from_str(line).context("failed to parse submit response")?;
+            if let Some(err) = resp.get("error") {
+                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                anyhow::bail!("gateway submit error {}: {}", code, msg);
+            }
+            return Ok(());
+        }
     }
-}
 
-#[derive(Serialize, Deserialize)]
-struct SubmitRequest {
-    msg_type: u32,
-    data: Vec<u8>,
+    fn decode_b64_header(s: &str) -> Result<[u8; 80]> {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .context("base64 decode failed")?;
+        let mut out = [0u8; 80];
+        if decoded.len() != out.len() {
+            anyhow::bail!("expected {} bytes, got {}", out.len(), decoded.len());
+        }
+        out.copy_from_slice(&decoded);
+        Ok(out)
+    }
 }
