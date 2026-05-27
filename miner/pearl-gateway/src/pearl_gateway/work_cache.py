@@ -14,10 +14,18 @@ class WorkCache:
     Acts as an in-memory store between the Pearl node and the miner.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        mining_config_bytes: bytes | None = None,
+        matrix_m: int | None = None,
+        matrix_n: int | None = None,
+    ):
         self.current_template: BlockTemplate | None = None
         self.last_update_time: float = 0
         self.lock = asyncio.Lock()  # For thread-safe access to template
+        self.mining_config_bytes = mining_config_bytes
+        self.matrix_m = matrix_m
+        self.matrix_n = matrix_n
 
     async def update_template(self, template: BlockTemplate) -> bool:
         """
@@ -52,7 +60,12 @@ class WorkCache:
                 raise MiningPausedError("no block template available")
 
             # Return a job with the current template
-            return MiningJob.from_template(template=self.current_template)
+            return MiningJob.from_template(
+                template=self.current_template,
+                mining_config_bytes=self.mining_config_bytes,
+                matrix_m=self.matrix_m,
+                matrix_n=self.matrix_n,
+            )
 
     async def get_template_age(self) -> float | None:
         """Get the age of the current template in seconds."""

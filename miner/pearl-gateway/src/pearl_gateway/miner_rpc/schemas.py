@@ -38,8 +38,30 @@ SUBMIT_PLAIN_PROOF_SCHEMA = {
             "properties": {
                 "incomplete_header_bytes": {"type": "string", "pattern": BASE64_PATTERN},
                 "target": {"type": "integer", "minimum": 0},
+                "mining_config_bytes": {"type": "string", "pattern": BASE64_PATTERN},
+                "matrix_m": {"type": "integer", "minimum": 1},
+                "matrix_n": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 0},
+                "alpha_notify_nbits": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4294967295,
+                },
             },
         },
+    },
+    "additionalProperties": False,
+}
+
+SUBMIT_CERTIFIED_BLOCK_SCHEMA = {
+    "type": "object",
+    "required": [
+        "zk_certificate",
+        "mining_job",
+    ],
+    "properties": {
+        "zk_certificate": {"type": "string", "pattern": BASE64_PATTERN},
+        "mining_job": SUBMIT_PLAIN_PROOF_SCHEMA["properties"]["mining_job"],
     },
     "additionalProperties": False,
 }
@@ -48,3 +70,4 @@ SUBMIT_PLAIN_PROOF_SCHEMA = {
 validate_jsonrpc = fastjsonschema.compile(JSON_RPC_SCHEMA)
 validate_get_mining_info = fastjsonschema.compile(GET_MINING_INFO_SCHEMA)
 validate_submit_plain_proof = fastjsonschema.compile(SUBMIT_PLAIN_PROOF_SCHEMA)
+validate_submit_certified_block = fastjsonschema.compile(SUBMIT_CERTIFIED_BLOCK_SCHEMA)

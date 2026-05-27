@@ -168,6 +168,22 @@ class TestSubmitPlainProofSchema:
         """Test valid submitPlainProof parameters."""
         validate_submit_plain_proof(submit_plain_proof_params)
 
+    def test_valid_submit_plain_proof_with_alpha_metadata(self, submit_plain_proof_params):
+        """Test optional AlphaPool compatibility metadata in mining_job."""
+        params = submit_plain_proof_params.copy()
+        params["mining_job"] = params["mining_job"].copy()
+        params["mining_job"].update(
+            {
+                "mining_config_bytes": "AA==",
+                "matrix_m": 131072,
+                "matrix_n": 196608,
+                "height": 100000,
+                "alpha_notify_nbits": 0x1B00FFFF,
+            }
+        )
+
+        validate_submit_plain_proof(params)
+
     def test_empty_params_invalid(self):
         """Test empty params for submitPlainProof are invalid."""
         invalid_params = {}
@@ -266,5 +282,16 @@ class TestSubmitPlainProofSchema:
         with pytest.raises(
             fastjsonschema.JsonSchemaException,
             match="must be bigger than or equal to 0",
+        ):
+            validate_submit_plain_proof(invalid_params)
+
+    def test_reject_zero_matrix_dimension(self, submit_plain_proof_params):
+        """Test zero Alpha matrix dimension is invalid when schema knows it."""
+        invalid_params = submit_plain_proof_params.copy()
+        invalid_params["mining_job"] = invalid_params["mining_job"].copy()
+        invalid_params["mining_job"]["matrix_m"] = 0
+        with pytest.raises(
+            fastjsonschema.JsonSchemaException,
+            match="must be bigger than or equal to 1",
         ):
             validate_submit_plain_proof(invalid_params)

@@ -3,11 +3,13 @@ Test configuration loading and validation.
 """
 
 import os
+import base64
 from unittest.mock import patch
 
 import pytest
 from pearl_gateway.config import (
     MinerRpcConfig,
+    MiningJobConfig,
     PearlConfig,
     PearlGatewayConfig,
     load_config,
@@ -134,6 +136,42 @@ class TestMinerRpcConfig:
             assert config.host == "192.168.1.100"
 
 
+class TestMiningJobConfig:
+    """Test optional mining job metadata configuration."""
+
+    def test_mining_job_config_defaults(self):
+        config = MiningJobConfig()
+
+        assert config.mining_config_bytes is None
+        assert config.decoded_mining_config_bytes() is None
+        assert config.matrix_m is None
+        assert config.matrix_n is None
+
+    def test_mining_job_config_env_override(self):
+        encoded_config = base64.b64encode(bytes(range(52))).decode("ascii")
+        with patch.dict(
+            os.environ,
+            {
+                "MINING_JOB_MINING_CONFIG_BYTES": encoded_config,
+                "MINING_JOB_MATRIX_M": "131072",
+                "MINING_JOB_MATRIX_N": "196608",
+            },
+        ):
+            config = MiningJobConfig()
+
+        assert config.decoded_mining_config_bytes() == bytes(range(52))
+        assert config.matrix_m == 131072
+        assert config.matrix_n == 196608
+
+    def test_mining_job_config_rejects_partial_matrix_metadata(self):
+        with pytest.raises(ValueError, match="MINING_JOB_MATRIX_M"):
+            MiningJobConfig(matrix_m=131072)
+
+    def test_mining_job_config_rejects_invalid_base64(self):
+        with pytest.raises(ValueError):
+            MiningJobConfig(mining_config_bytes="not base64!")
+
+
 class TestLoadConfig:
     """Test load_config function."""
 
@@ -148,6 +186,7 @@ class TestLoadConfig:
         assert isinstance(config, PearlGatewayConfig)
         assert isinstance(config.pearl, PearlConfig)
         assert isinstance(config.miner_rpc, MinerRpcConfig)
+        assert isinstance(config.mining_job, MiningJobConfig)
 
         # Verify some defaults
         assert config.pearl.rpc_url == "http://0.0.0.0:44107"
@@ -161,6 +200,8 @@ class TestLoadConfig:
                 "PEARLD_RPC_URL": "https://custom:8334",
                 "PEARLD_RPC_USER": "custom_user",
                 "PEARLD_MINING_ADDRESS": mining_address,
+                "MINING_JOB_MATRIX_M": "131072",
+                "MINING_JOB_MATRIX_N": "131072",
             },
         ):
             config = load_config()
@@ -168,3 +209,5 @@ class TestLoadConfig:
             assert config.pearl.rpc_url == "https://custom:8334"
             assert config.pearl.rpc_user == "custom_user"
             assert config.pearl.mining_address == mining_address
+            assert config.mining_job.matrix_m == 131072
+            assert config.mining_job.matrix_n == 131072

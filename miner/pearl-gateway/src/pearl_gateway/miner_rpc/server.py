@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -9,11 +10,13 @@ import fastjsonschema
 from miner_utils import get_logger
 from pearl_mining import PlainProof
 
+from pearl_gateway.blockchain_utils.zk_certificate import ZKCertificate
 from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
 from pearl_gateway.miner_rpc.schemas import (
     validate_get_mining_info,
     validate_jsonrpc,
+    validate_submit_certified_block,
     validate_submit_plain_proof,
 )
 from pearl_gateway.submission_service import SubmissionService
@@ -219,6 +222,20 @@ class MinerRpcServer:
                 asyncio.create_task(self.handle_submit_plain_proof(plain_proof, mining_job))
                 return self._jsonrpc_success("submitted", request_id)
 
+            elif method == "submitCertifiedBlock":
+                if error := self._validate_params(
+                    validate_submit_certified_block, params, request_id
+                ):
+                    return error
+                zk_certificate = ZKCertificate.deserialize(
+                    base64.b64decode(params["zk_certificate"])
+                )
+                mining_job = MiningJob.from_dict(params["mining_job"])
+                asyncio.create_task(
+                    self.handle_submit_certified_block(zk_certificate, mining_job)
+                )
+                return self._jsonrpc_success("submitted", request_id)
+
             else:
                 return self._jsonrpc_error(-32601, f"Method {method} not found", request_id)
 
@@ -257,3 +274,22 @@ class MinerRpcServer:
         )
 
         logger.info(f"Block submission result: {result}")
+
+    async def handle_submit_certified_block(
+        self, zk_certificate: ZKCertificate, mining_job: MiningJob
+    ) -> None:
+        """Handle submitCertifiedBlock requests."""
+        if self.work_cache.current_template is None:
+            raise MiningPausedError("no block template available")
+
+        current_header_bytes = (
+            self.work_cache.current_template.header.serialize_without_proof_commitment()
+        )
+        if mining_job.incomplete_header_bytes != current_header_bytes:
+            logger.warning("Submitted certified block with old header. Skipping submission.")
+            return
+
+        result = await self.submission_service.submit_certified_block(
+            zk_certificate, self.work_cache.current_template
+        )
+        logger.info(f"Certified block submission result: {result}")

@@ -1,9 +1,12 @@
 import asyncio
+from copy import copy
 from typing import Any
 
 from miner_utils import get_logger
 from pearl_mining import PlainProof
 
+from pearl_gateway.blockchain_utils.pearl_block import PearlBlock
+from pearl_gateway.blockchain_utils.zk_certificate import ZKCertificate
 from pearl_gateway.comm.dataclasses import BlockTemplate
 from pearl_gateway.pearl_client import PearlNodeClient
 from pearl_gateway.proof_generator import ProofGenerator
@@ -65,4 +68,39 @@ class SubmissionService:
                 logger.exception(
                     f"Error submitting block: {e=}, {type(e)=}, {plain_proof=}, {template=}"
                 )
+                return {"status": f"error: {str(e)}"}
+
+    async def submit_certified_block(
+        self, zk_certificate: ZKCertificate, template: BlockTemplate
+    ) -> dict[str, Any]:
+        """
+        Submit a block built from a miner/pool supplied ZKCertificate and the
+        current gateway template. This path intentionally does not run the
+        Plonky2 prover; pearld remains the final certificate verifier.
+        """
+        async with self.submission_lock:
+            try:
+                if template.header.serialize_without_proof_commitment() in self.submission_log:
+                    logger.warning("Block already submitted, skipping")
+                    return {"status": "already_submitted"}
+
+                block = PearlBlock(
+                    header=copy(template.header),
+                    raw_txns=template.get_raw_transactions(),
+                    zk_certificate=zk_certificate,
+                )
+
+                self.submitted_blocks += 1
+                result = await self.pearl_client.submit_block(block.serialize().hex())
+                if result == "accepted":
+                    self.accepted_blocks += 1
+                    self.submission_log.add(template.header.serialize_without_proof_commitment())
+                    logger.info("Certified block accepted by node!")
+                else:
+                    self.rejected_blocks += 1
+                    logger.warning(f"Certified block rejected: {result}")
+                return {"status": result}
+
+            except Exception as e:
+                logger.exception(f"Error submitting certified block: {e=}, {type(e)=}")
                 return {"status": f"error: {str(e)}"}

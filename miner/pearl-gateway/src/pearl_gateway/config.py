@@ -1,3 +1,5 @@
+import base64
+import binascii
 from typing import Literal
 
 from pydantic import BaseModel
@@ -49,6 +51,42 @@ class MinerRpcConfig(BaseSettings):
             raise ValueError("UDS transport requires socket_path")
 
 
+class MiningJobConfig(BaseSettings):
+    """Optional metadata published in getMiningInfo for stratum/pool bridges.
+
+    Environment variables override defaults:
+    - MINING_JOB_MINING_CONFIG_BYTES (base64)
+    - MINING_JOB_MATRIX_M
+    - MINING_JOB_MATRIX_N
+    """
+
+    model_config = SettingsConfigDict(env_prefix="MINING_JOB_")
+
+    mining_config_bytes: str | None = None
+    matrix_m: int | None = None
+    matrix_n: int | None = None
+
+    def model_post_init(self, __context) -> None:
+        match (self.matrix_m, self.matrix_n):
+            case (None, None):
+                pass
+            case (int(m), int(n)) if m > 0 and n > 0:
+                pass
+            case _:
+                raise ValueError("MINING_JOB_MATRIX_M and MINING_JOB_MATRIX_N must be paired")
+
+        if self.mining_config_bytes is not None:
+            self.decoded_mining_config_bytes()
+
+    def decoded_mining_config_bytes(self) -> bytes | None:
+        if self.mining_config_bytes is None:
+            return None
+        try:
+            return base64.b64decode(self.mining_config_bytes.encode("ascii"), validate=True)
+        except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
+            raise ValueError("MINING_JOB_MINING_CONFIG_BYTES must be valid base64") from exc
+
+
 class PearlGatewayConfig(BaseModel):
     """Complete PearlGateway configuration.
 
@@ -58,6 +96,7 @@ class PearlGatewayConfig(BaseModel):
 
     pearl: PearlConfig
     miner_rpc: MinerRpcConfig
+    mining_job: MiningJobConfig
 
 
 def load_config() -> PearlGatewayConfig:
@@ -73,4 +112,5 @@ def load_config() -> PearlGatewayConfig:
     return PearlGatewayConfig(
         pearl=PearlConfig(),
         miner_rpc=MinerRpcConfig(),
+        mining_job=MiningJobConfig(),
     )

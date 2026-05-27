@@ -151,16 +151,47 @@ class MiningJob:
 
     incomplete_header_bytes: bytes
     target: int
+    mining_config_bytes: bytes | None = None
+    matrix_m: int | None = None
+    matrix_n: int | None = None
+    height: int | None = None
+    alpha_notify_nbits: int | None = None
 
     INNER_HASH_LIMIT: ClassVar[int] = 42
     MAX_TARGET: ClassVar[int] = 2**256 - 1
 
+    def __post_init__(self) -> None:
+        match (self.matrix_m, self.matrix_n):
+            case (None, None):
+                pass
+            case (int(m), int(n)) if m > 0 and n > 0:
+                pass
+            case _:
+                raise ValueError("matrix_m and matrix_n must be provided together and nonzero")
+
+        if self.height is not None and self.height < 0:
+            raise ValueError("height must be non-negative")
+        if self.alpha_notify_nbits is not None and not _valid_compact_target(
+            self.alpha_notify_nbits
+        ):
+            raise ValueError("alpha_notify_nbits must be a positive compact target")
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
-        return {
+        result: dict[str, Any] = {
             "incomplete_header_bytes": b64_encode(self.incomplete_header_bytes),
             "target": self.target,
         }
+        if self.mining_config_bytes is not None:
+            result["mining_config_bytes"] = b64_encode(self.mining_config_bytes)
+        if self.matrix_m is not None and self.matrix_n is not None:
+            result["matrix_m"] = self.matrix_m
+            result["matrix_n"] = self.matrix_n
+        if self.height is not None:
+            result["height"] = self.height
+        if self.alpha_notify_nbits is not None:
+            result["alpha_notify_nbits"] = self.alpha_notify_nbits
+        return result
 
     @staticmethod
     def _get_difficulty_adjustment_factor(mining_config: MiningConfiguration) -> int:
@@ -172,17 +203,46 @@ class MiningJob:
     def from_dict(cls, data: dict[str, Any]) -> "MiningJob":
         """Create MiningJob from dictionary (JSON-RPC deserialization)."""
 
+        matrix_m = _merge_optional_int(data.get("matrix_m"), data.get("m"), "matrix_m", "m")
+        matrix_n = _merge_optional_int(data.get("matrix_n"), data.get("n"), "matrix_n", "n")
+        alpha_notify_nbits = _merge_optional_int(
+            data.get("alpha_notify_nbits"),
+            data.get("notify_nbits"),
+            "alpha_notify_nbits",
+            "notify_nbits",
+        )
+
         return cls(
             incomplete_header_bytes=b64_decode(data["incomplete_header_bytes"]),
             target=data["target"],
+            mining_config_bytes=(
+                b64_decode(data["mining_config_bytes"])
+                if data.get("mining_config_bytes") is not None
+                else None
+            ),
+            matrix_m=matrix_m,
+            matrix_n=matrix_n,
+            height=data.get("height"),
+            alpha_notify_nbits=alpha_notify_nbits,
         )
 
     @classmethod
-    def from_template(cls, template: BlockTemplate) -> "MiningJob":
+    def from_template(
+        cls,
+        template: BlockTemplate,
+        mining_config_bytes: bytes | None = None,
+        matrix_m: int | None = None,
+        matrix_n: int | None = None,
+    ) -> "MiningJob":
         """Create MiningJob from BlockTemplate."""
         return cls(
             incomplete_header_bytes=template.header.serialize_without_proof_commitment(),
             target=template.target,
+            mining_config_bytes=mining_config_bytes,
+            matrix_m=matrix_m,
+            matrix_n=matrix_n,
+            height=template.height,
+            alpha_notify_nbits=template.bits,
         )
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:
@@ -209,3 +269,21 @@ class MiningPausedError(Exception):
     def __init__(self, details: str = ""):
         self.details = details
         super().__init__(f"{self.message}: {details}" if details else self.message)
+
+
+def _merge_optional_int(
+    canonical: Any | None,
+    alias: Any | None,
+    canonical_name: str,
+    alias_name: str,
+) -> int | None:
+    if canonical is not None and alias is not None and canonical != alias:
+        raise ValueError(f"{canonical_name} conflicts with {alias_name}")
+    value = canonical if canonical is not None else alias
+    return int(value) if value is not None else None
+
+
+def _valid_compact_target(nbits: int) -> bool:
+    exponent = nbits >> 24
+    mantissa = nbits & 0x00FF_FFFF
+    return exponent != 0 and mantissa != 0 and mantissa & 0x0080_0000 == 0

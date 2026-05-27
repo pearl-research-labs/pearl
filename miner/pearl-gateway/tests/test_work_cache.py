@@ -130,6 +130,27 @@ class TestMiningJob:
             == sample_block_template.header.serialize_without_proof_commitment()
         )
         assert job.target == sample_block_template.target
+        assert job.height == sample_block_template.height
+        assert job.alpha_notify_nbits == sample_block_template.bits
+
+    @pytest.mark.asyncio
+    async def test_get_mining_job_with_configured_alpha_metadata(self, sample_block_template):
+        """Test configured AlphaPool metadata is published with template metadata."""
+        mining_config_bytes = bytes(range(52))
+        work_cache = WorkCache(
+            mining_config_bytes=mining_config_bytes,
+            matrix_m=131072,
+            matrix_n=196608,
+        )
+        await work_cache.update_template(sample_block_template)
+
+        job = await work_cache.get_mining_job()
+
+        assert job.mining_config_bytes == mining_config_bytes
+        assert job.matrix_m == 131072
+        assert job.matrix_n == 196608
+        assert job.height == sample_block_template.height
+        assert job.alpha_notify_nbits == sample_block_template.bits
 
     @pytest.mark.asyncio
     async def test_get_mining_job_multiple_calls(self, work_cache, sample_block_template):

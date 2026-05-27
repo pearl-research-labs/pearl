@@ -51,7 +51,11 @@ class PearlGateway:
             )
 
         # Initialize components (but don't start them yet)
-        self.work_cache = WorkCache()
+        self.work_cache = WorkCache(
+            mining_config_bytes=self.config.mining_job.decoded_mining_config_bytes(),
+            matrix_m=self.config.mining_job.matrix_m,
+            matrix_n=self.config.mining_job.matrix_n,
+        )
         self.pearl_client = PearlNodeClient(self.config.pearl)
         self.submission_service = SubmissionService(self.pearl_client, debug_mode=debug_mode)
         self.miner_rpc = MinerRpcServer(

@@ -3,6 +3,7 @@ import pytest
 from pearl_gateway.miner_rpc.schemas import (
     validate_get_mining_info,
     validate_jsonrpc,
+    validate_submit_certified_block,
     validate_submit_plain_proof,
 )
 
@@ -70,6 +71,24 @@ def test_invalid_get_mining_info_params():
 def test_valid_submit_plain_proof_params(submit_plain_proof_params):
     """Test that valid submitPlainProof params pass validation."""
     validate_submit_plain_proof(submit_plain_proof_params)
+
+
+def test_valid_submit_certified_block_params(submit_plain_proof_params):
+    """Test that valid submitCertifiedBlock params pass validation."""
+    params = {
+        "zk_certificate": "dGVzdA==",
+        "mining_job": submit_plain_proof_params["mining_job"],
+    }
+    validate_submit_certified_block(params)
+
+
+def test_invalid_submit_certified_block_params_missing_certificate(submit_plain_proof_params):
+    """Test submitCertifiedBlock rejects missing certificate."""
+    params = {
+        "mining_job": submit_plain_proof_params["mining_job"],
+    }
+    with pytest.raises(fastjsonschema.exceptions.JsonSchemaException):
+        validate_submit_certified_block(params)
 
 
 def test_invalid_submit_plain_proof_params_missing_field():
