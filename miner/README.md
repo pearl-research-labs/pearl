@@ -39,11 +39,23 @@ uv sync --package vllm-miner
 
 The `pearl-gemm` CUDA kernels are compiled automatically during sync. Set the `PEARL_GEMM_FORCE_BUILD` environment variable to `TRUE` to force a rebuild, or set `PEARL_GEMM_SKIP_CUDA_BUILD=TRUE` to skip the CUDA build entirely.
 
+### CUDA architecture selection
+
+`pearl-gemm` defaults to the existing Hopper `sm_90a` target. To override the build target, set `PEARL_GEMM_CUDA_ARCHS` to a comma, semicolon, or space separated list of CUDA architectures:
+
+```bash
+PEARL_GEMM_CUDA_ARCHS=90a uv sync --package vllm-miner
+PEARL_GEMM_CUDA_ARCHS=121 uv sync --package vllm-miner
+PEARL_GEMM_CUDA_ARCHS=native uv sync --package vllm-miner
+```
+
+When a Blackwell consumer GPU such as GB10 / `sm_121` is detected, the build target is selected explicitly and `setup.py` emits a warning. Hopper remains the optimized kernel path. GB10 uses a functional reference backend for GEMM/noising/hash operations plus a bounded CPU proof scan for local/easy mining jobs; a production-performance Blackwell kernel backend is still required for competitive mining.
+
 ## Tests
 
 All commands run from the **repository root**. Use `-n auto` to run tests in parallel (requires `pytest-xdist`).
 
-> **GPU requirement:** `pearl-gemm` and `vllm-miner` tests require an NVIDIA GPU. Currently only **sm90** (H100 / H200) GPUs are supported.
+> **GPU requirement:** `pearl-gemm` and `vllm-miner` tests require an NVIDIA GPU. Optimized kernels target **sm90** (H100 / H200); GB10 / `sm_121` is supported through the reference backend described above.
 
 ### Basic tests
 

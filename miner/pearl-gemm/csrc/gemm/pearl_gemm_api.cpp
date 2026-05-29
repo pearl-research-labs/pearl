@@ -2,6 +2,7 @@
 // of the torch headers.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/_int_mm_ops.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/nn/functional.h>
 #include <torch/python.h>
@@ -111,6 +112,164 @@ void check_tensor(
   CHECK_SHAPE(tensor, x, y);
 }
 
+namespace {
+
+constexpr int64_t kReferenceBackendPadMultiple = 128;
+
+bool use_reference_backend() {
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+  return dprops != nullptr && dprops->major >= 10;
+}
+
+int64_t round_up_to_multiple(int64_t value, int64_t multiple) {
+  return ((value + multiple - 1) / multiple) * multiple;
+}
+
+at::Tensor safe_int_mm(const at::Tensor& lhs, const at::Tensor& rhs) {
+  TORCH_CHECK(lhs.dim() == 2 && rhs.dim() == 2,
+              "safe_int_mm expects 2D tensors");
+  TORCH_CHECK(lhs.size(1) == rhs.size(0), "safe_int_mm shape mismatch");
+  TORCH_CHECK(lhs.scalar_type() == torch::kInt8 &&
+                  rhs.scalar_type() == torch::kInt8,
+              "safe_int_mm expects int8 inputs");
+
+  const int64_t m = lhs.size(0);
+  const int64_t k = lhs.size(1);
+  const int64_t n = rhs.size(1);
+  const int64_t padded_m = round_up_to_multiple(m, kReferenceBackendPadMultiple);
+  const int64_t padded_n = round_up_to_multiple(n, kReferenceBackendPadMultiple);
+
+  at::Tensor lhs_work = lhs.contiguous();
+  at::Tensor rhs_work = rhs.contiguous();
+
+  if (padded_m != m) {
+    lhs_work = at::zeros({padded_m, k}, lhs.options());
+    lhs_work.narrow(0, 0, m).copy_(lhs);
+  }
+
+  if (padded_n != n) {
+    rhs_work = at::zeros({k, padded_n}, rhs.options());
+    rhs_work.narrow(1, 0, n).copy_(rhs);
+  }
+
+  at::Tensor result = at::_ops::_int_mm::call(lhs_work, rhs_work);
+  if (padded_m != m || padded_n != n) {
+    result = result.narrow(0, 0, m).narrow(1, 0, n).contiguous();
+  }
+  return result;
+}
+
+void copy_scaled_int32_to_dtype(const at::Tensor& src, at::Tensor& dst,
+                                double scale) {
+  at::Tensor tmp = src.to(torch::kFloat32);
+  tmp.mul_(scale);
+  dst.copy_(tmp.to(dst.scalar_type()));
+}
+
+void reference_denoise_converter_impl(
+    const std::optional<at::Tensor>& EARxBpEB_in_,
+    const std::optional<at::Tensor>& AxEBL_in_,
+    const std::optional<at::Tensor>& EARxBpEB_out_,
+    const std::optional<at::Tensor>& AxEBL_out_) {
+  if (AxEBL_in_.has_value() && AxEBL_out_.has_value()) {
+    copy_scaled_int32_to_dtype(AxEBL_in_.value(),
+                               const_cast<at::Tensor&>(AxEBL_out_.value()),
+                               1.0 / static_cast<double>(pearl::kAxEBLScaleFactor));
+  }
+  if (EARxBpEB_in_.has_value() && EARxBpEB_out_.has_value()) {
+    copy_scaled_int32_to_dtype(
+        EARxBpEB_in_.value(), const_cast<at::Tensor&>(EARxBpEB_out_.value()),
+        1.0 / static_cast<double>(pearl::kEARxBpEBScaleFactor));
+  }
+}
+
+void reference_noise_A_impl(at::Tensor& A, at::Tensor& EAL, at::Tensor& AxEBL,
+                            at::Tensor& ApEA, at::Tensor& EAR,
+                            at::Tensor& EBL) {
+  at::Tensor EA = safe_int_mm(EAL, EAR.transpose(0, 1).contiguous());
+  at::Tensor ApEA_int32 = A.to(torch::kInt32).add(EA);
+  ApEA.copy_(ApEA_int32.to(torch::kInt8));
+
+  at::Tensor AxEBL_int32 = safe_int_mm(A, EBL.transpose(0, 1).contiguous());
+  if (AxEBL.scalar_type() == torch::kFloat16) {
+    copy_scaled_int32_to_dtype(
+        AxEBL_int32, AxEBL,
+        1.0 / static_cast<double>(pearl::kAxEBLScaleFactor));
+  } else {
+    AxEBL.copy_(AxEBL_int32);
+  }
+}
+
+void reference_noise_B_impl(at::Tensor& B, at::Tensor& EBR,
+                            at::Tensor& EARxBpEB, at::Tensor& BpEB,
+                            at::Tensor& EAR, at::Tensor& EBL) {
+  at::Tensor EB = safe_int_mm(EBR, EBL.transpose(0, 1).contiguous());
+  at::Tensor BpEB_int32 = B.to(torch::kInt32).add(EB);
+  BpEB.copy_(BpEB_int32.to(torch::kInt8));
+
+  at::Tensor EARxBpEB_int32 =
+      safe_int_mm(BpEB, EAR.transpose(0, 1).contiguous());
+  if (EARxBpEB.scalar_type() == torch::kFloat16) {
+    copy_scaled_int32_to_dtype(
+        EARxBpEB_int32, EARxBpEB,
+        1.0 / static_cast<double>(pearl::kEARxBpEBScaleFactor));
+  } else {
+    EARxBpEB.copy_(EARxBpEB_int32);
+  }
+}
+
+void reference_gemm_impl(at::Tensor& A, at::Tensor& B, at::Tensor& A_scales,
+                         at::Tensor& B_scales, at::Tensor& C) {
+  at::Tensor acc = safe_int_mm(A, B.transpose(0, 1).contiguous());
+  at::Tensor scaled = acc.to(torch::kFloat32);
+  scaled.mul_(A_scales.view({A.size(0), 1}));
+  scaled.mul_(B_scales.view({1, B.size(0)}));
+  C.copy_(scaled.to(C.scalar_type()));
+}
+
+void reference_noisy_gemm_impl(
+    at::Tensor& A, at::Tensor& B, at::Tensor& EAL, at::Tensor& EBR,
+    at::Tensor& EAR_R_major, at::Tensor& EBL_R_major, at::Tensor& EAR_K_major,
+    at::Tensor& EBL_K_major, at::Tensor& AxEBL_fp16,
+    at::Tensor& EARxBpEB_fp16, at::Tensor& ApEA, at::Tensor& BpEB,
+    at::Tensor& A_scales, at::Tensor& B_scales, at::Tensor& C,
+    at::Tensor& host_signal_header_pinned,
+    const std::optional<at::Tensor>& AxEBL_int32_,
+    const std::optional<at::Tensor>& EARxBpEB_int32_, bool run_noising_a,
+    bool run_noising_b, bool skip_denoising) {
+  at::Tensor AxEBL_target = AxEBL_int32_.has_value() ? AxEBL_int32_.value()
+                                                     : AxEBL_fp16;
+  at::Tensor EARxBpEB_target = EARxBpEB_int32_.has_value()
+                                   ? EARxBpEB_int32_.value()
+                                   : EARxBpEB_fp16;
+
+  if (run_noising_a) {
+    reference_noise_A_impl(A, EAL, AxEBL_target, ApEA, EAR_R_major,
+                           EBL_K_major);
+  }
+  if (run_noising_b) {
+    reference_noise_B_impl(B, EBR, EARxBpEB_target, BpEB, EAR_K_major,
+                           EBL_R_major);
+  }
+  if (!skip_denoising) {
+    reference_denoise_converter_impl(EARxBpEB_int32_, AxEBL_int32_,
+                                     EARxBpEB_fp16, AxEBL_fp16);
+  }
+
+  // The denoised result is mathematically identical to the original GEMM.
+  reference_gemm_impl(A, B, A_scales, B_scales, C);
+
+  // This reference path leaves PoW transcript extraction to the Python
+  // GB10 scan path, so leave the host signal idle.
+  if (!host_signal_header_pinned.is_cuda()) {
+    auto* header = reinterpret_cast<HostSignalHeader*>(
+        host_signal_header_pinned.data_ptr());
+    header->status = HostSignalStatus::kSignalIdle;
+  }
+}
+
+}  // namespace
+
 void denoise_converter(
     const std::optional<at::Tensor>& EARxBpEB_in_,   //n x r, int32
     const std::optional<at::Tensor>& AxEBL_in_,      //m x r, int32
@@ -142,6 +301,12 @@ void denoise_converter(
     check_tensor(EARxBpEB_in, n, r, torch::kInt32);
     check_tensor(EARxBpEB_out, n, r, torch::kFloat16);
   }
+  if (use_reference_backend()) {
+    reference_denoise_converter_impl(EARxBpEB_in_, AxEBL_in_, EARxBpEB_out_,
+                                     AxEBL_out_);
+    return;
+  }
+
   PearlAPIParams params;
 
   params.ptr_AxEBL_int32 = convert_AxEBL ? AxEBL_in.data_ptr() : nullptr;
@@ -352,6 +517,11 @@ void noise_A(at::Tensor& A,                          // m x k
         get_num_k_blocks(m, tile_size_m, k, tile_size_k, dprops);
   }
 
+  if (use_reference_backend()) {
+    reference_noise_A_impl(A, EAL, AxEBL, ApEA, EAR, EBL);
+    return;
+  }
+
   PearlAPIParams params;
   params.m = m;
   params.n = n;
@@ -452,6 +622,11 @@ void noise_B(at::Tensor& B,                          // n x k
         get_num_k_blocks(n, tile_size_n, k, tile_size_k, dprops);
   }
 
+  if (use_reference_backend()) {
+    reference_noise_B_impl(B, EBR, EARxBpEB, BpEB, EAR, EBL);
+    return;
+  }
+
   PearlAPIParams params;
 
   params.m = m;
@@ -531,7 +706,11 @@ void gemm(at::Tensor& A,         // m x k
   check_tensor(B, n, k, torch::kInt8);
   check_tensor(A_scales, m, torch::kFloat32);
   check_tensor(B_scales, n, torch::kFloat32);
-  check_tensor(C, m, n, at::kBFloat16);
+  if (use_reference_backend()) {
+    check_tensor(C, m, n, at::kBFloat16, torch::kFloat16);
+  } else {
+    check_tensor(C, m, n, at::kBFloat16);
+  }
 
   TORCH_CHECK(k % bK == 0, "K must be divisible by bK");
 
@@ -541,6 +720,11 @@ void gemm(at::Tensor& A,         // m x k
   static constexpr int align_n = 128 / (sizeof(ElementOut) * 8);
   TORCH_CHECK(n % align_n == 0,
               "N must be divisible by " + std::to_string(align_n));
+
+  if (use_reference_backend()) {
+    reference_gemm_impl(A, B, A_scales, B_scales, C);
+    return;
+  }
 
   params.m = m;
   params.n = n;
@@ -740,7 +924,11 @@ void noisy_gemm(
   check_tensor(EARxBpEB_fp16, n, r, torch::kFloat16);
   check_tensor(A_scales, m, torch::kFloat32);
   check_tensor(B_scales, n, torch::kFloat32);
-  check_tensor(C, m, n, at::kBFloat16);
+  if (use_reference_backend()) {
+    check_tensor(C, m, n, at::kBFloat16, torch::kFloat16);
+  } else {
+    check_tensor(C, m, n, at::kBFloat16);
+  }
 
   CHECK_SHAPE(host_signal_header_pinned, get_host_signal_header_size());
   CHECK_SHAPE(host_signal_sync, get_host_signal_sync_size());
@@ -792,6 +980,26 @@ void noisy_gemm(
 
   int const pipeline_stages = pipeline_stages_.value_or(
       get_pipeline_stages(bM, bN, bK, r, skip_denoising, dprops));
+
+  if (use_reference_backend()) {
+    reference_noisy_gemm_impl(
+        A, B, EAL, EBR, EAR_R_major, EBL_R_major, EAR_K_major, EBL_K_major,
+        AxEBL_fp16, EARxBpEB_fp16, ApEA, BpEB, A_scales, B_scales, C,
+        host_signal_header_pinned, AxEBL_int32_, EARxBpEB_int32_,
+        run_noising_a, run_noising_b, skip_denoising);
+
+    if (enable_debug && inner_hash_counter.has_value()) {
+      constexpr int64_t kReferenceHashTileH = 2;
+      constexpr int64_t kReferenceHashTileW = 64;
+      const int64_t num_tiles = ((m + bM - 1) / bM) * ((n + bN - 1) / bN);
+      const int64_t reductions_per_tile = k / r;
+      const int64_t num_threads_per_cta =
+          (bM / kReferenceHashTileH) * (bN / kReferenceHashTileW);
+      inner_hash_counter.value().add_(num_tiles * reductions_per_tile *
+                                      num_threads_per_cta);
+    }
+    return;
+  }
 
   PearlAPIParams params;
   using ElementOut = cutlass::bfloat16_t;

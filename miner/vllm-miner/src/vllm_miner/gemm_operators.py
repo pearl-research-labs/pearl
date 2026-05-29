@@ -1,7 +1,12 @@
+import os
+
+import numpy as np
 import torch
+from blake3 import blake3
 from miner_base.commitment_hash import CommitmentHasher
 from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 from miner_utils import get_logger
+from pearl_gateway.comm.dataclasses import CommitmentHash, OpenedBlockInfo
 from pearl_gemm import (
     commitment_hash_from_merkle_roots,
     gemm,
@@ -23,6 +28,156 @@ from .mining_state import (
 )
 
 _LOGGER = get_logger("vllm.pearl_miner")
+
+HASH_ACCUMULATE_ROTATION = 13
+JACKPOT_SIZE_U32 = 16
+REFERENCE_BACKEND_MIN_EXPECTED_HITS = float(
+    os.environ.get("PEARL_GB10_REFERENCE_MIN_EXPECTED_HITS", "0.25")
+)
+
+
+def _use_reference_cuda_backend(device: torch.device | str | None = None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+
+    cuda_device = torch.device("cuda" if device is None else device)
+    if cuda_device.type != "cuda":
+        return False
+
+    major, _minor = torch.cuda.get_device_capability(cuda_device)
+    return major >= 10
+
+
+def _rotl32(values: np.ndarray, shift: int) -> np.ndarray:
+    return ((values << np.uint32(shift)) | (values >> np.uint32(32 - shift))).astype(
+        np.uint32,
+        copy=False,
+    )
+
+
+def _pattern_partitions(pattern, total_dimension: int) -> np.ndarray:
+    base = np.asarray(pattern.to_list(), dtype=np.int64)
+    if base.size == 0:
+        return np.empty((0, 0), dtype=np.int64)
+
+    max_base = int(base.max())
+    if total_dimension <= max_base:
+        return np.empty((0, base.size), dtype=np.int64)
+
+    offsets = [
+        offset for offset in range(total_dimension - max_base) if pattern.offset_is_valid(offset)
+    ]
+    if not offsets:
+        return np.empty((0, base.size), dtype=np.int64)
+
+    return np.asarray(offsets, dtype=np.int64)[:, None] + base[None, :]
+
+
+def _find_reference_backend_opened_indices(
+    ApEA: torch.Tensor,
+    BpEB: torch.Tensor,
+    pow_key: bytes,
+    pow_target: int,
+    mining_config,
+) -> tuple[list[int], list[int]] | None:
+    m, k = ApEA.shape
+    n, b_k = BpEB.shape
+    if b_k != k:
+        raise ValueError(f"A/B common dimension mismatch: {k} != {b_k}")
+
+    rank = int(mining_config.rank)
+    rounded_k = (k // rank) * rank
+    if rounded_k == 0:
+        return None
+
+    row_partitions = _pattern_partitions(mining_config.rows_pattern, m)
+    col_partitions = _pattern_partitions(mining_config.cols_pattern, n)
+    if row_partitions.size == 0 or col_partitions.size == 0:
+        return None
+
+    num_rows = row_partitions.shape[0]
+    target = int(pow_target)
+    candidate_count = num_rows * col_partitions.shape[0]
+    expected_hits = candidate_count * target / float(1 << 256)
+    if expected_hits < REFERENCE_BACKEND_MIN_EXPECTED_HITS:
+        _LOGGER.debug(
+            "Skipping GB10 reference proof scan; expected_hits={:.3e}, candidates={}, target={}",
+            expected_hits,
+            candidate_count,
+            target,
+        )
+        return None
+
+    A_noised = ApEA.detach().cpu().numpy().astype(np.int32, copy=False)
+    B_noised_t = BpEB.detach().cpu().numpy().astype(np.int32, copy=False)
+
+    for col_indices in col_partitions:
+        B_cols = B_noised_t[col_indices]
+        jackpot_tile = np.zeros(
+            (num_rows, row_partitions.shape[1], col_indices.size), dtype=np.int32
+        )
+        jackpot = np.zeros((num_rows, JACKPOT_SIZE_U32), dtype=np.uint32)
+
+        for reduction_idx, start in enumerate(range(0, rounded_k, rank)):
+            end = start + rank
+            A_rows = A_noised[row_partitions, start:end]
+            partial = np.matmul(A_rows, B_cols[:, start:end].T)
+            jackpot_tile += partial
+
+            xored_tile = np.bitwise_xor.reduce(
+                jackpot_tile.view(np.uint32).reshape(num_rows, -1),
+                axis=1,
+            )
+            tid = reduction_idx % JACKPOT_SIZE_U32
+            jackpot[:, tid] = _rotl32(jackpot[:, tid], HASH_ACCUMULATE_ROTATION) ^ xored_tile
+
+        for row_idx, jackpot_words in enumerate(jackpot):
+            msg = jackpot_words.astype("<u4", copy=False).tobytes()
+            digest = blake3(msg, key=pow_key).digest()
+            if int.from_bytes(digest, "little") <= target:
+                return row_partitions[row_idx].astype(int).tolist(), col_indices.astype(
+                    int
+                ).tolist()
+
+    return None
+
+
+def _submit_reference_backend_block(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    ApEA: torch.Tensor,
+    BpEB: torch.Tensor,
+    commitment_hash_A_tensor: torch.Tensor,
+    commitment_hash_B_tensor: torch.Tensor,
+    mining_job,
+    matmul_config,
+    adjusted_target: int,
+) -> None:
+    commitment_hash = CommitmentHash(
+        noise_seed_A=commitment_hash_A_tensor.cpu().numpy().tobytes(),
+        noise_seed_B=commitment_hash_B_tensor.cpu().numpy().tobytes(),
+    )
+
+    opened_indices = _find_reference_backend_opened_indices(
+        ApEA=ApEA,
+        BpEB=BpEB,
+        pow_key=commitment_hash.noise_seed_A,
+        pow_target=adjusted_target,
+        mining_config=matmul_config.mining_config,
+    )
+    if opened_indices is None:
+        return
+
+    A_row_indices, B_column_indices = opened_indices
+    opened_block_info = OpenedBlockInfo(
+        A_row_indices=A_row_indices,
+        B_column_indices=B_column_indices,
+        A=A.cpu().detach(),
+        B_t=B.cpu().detach(),
+        commitment_hash=commitment_hash,
+        noise_rank=config.settings.noise_rank,
+    )
+    get_async_manager().handle_submit_block(opened_block_info, mining_job)
 
 
 def pearl_gemm_vanilla(
@@ -216,26 +371,46 @@ def pearl_gemm_noisy(
     )
 
     if submit_block:
-        # Record a CUDA event after the kernel launch - will complete when kernel finishes
-        cuda_event = torch.cuda.Event()
-        cuda_event.record()
+        if _use_reference_cuda_backend(a.device):
+            try:
+                torch.cuda.synchronize()
+                _submit_reference_backend_block(
+                    A=A,
+                    B=B,
+                    ApEA=ApEA,
+                    BpEB=BpEB,
+                    commitment_hash_A_tensor=commitment_hash_A_tensor,
+                    commitment_hash_B_tensor=commitment_hash_B_tensor,
+                    mining_job=mining_job,
+                    matmul_config=matmul_config,
+                    adjusted_target=adjusted_target,
+                )
+            finally:
+                get_pinned_pool().release(host_signal_header_pinned)
+                host_signal_header_pinned = None
+                commitment_hash_A_tensor = None
+                commitment_hash_B_tensor = None
+        else:
+            # Record a CUDA event after the kernel launch - will complete when kernel finishes
+            cuda_event = torch.cuda.Event()
+            cuda_event.record()
 
-        # Create callback for processing the status check
-        callback = StatusCheckCallback(
-            host_signal_header_pinned=host_signal_header_pinned,
-            commitment_hash_A_tensor=commitment_hash_A_tensor,
-            commitment_hash_B_tensor=commitment_hash_B_tensor,
-            A=A,
-            B=B,
-            mining_job=mining_job,
-        )
+            # Create callback for processing the status check
+            callback = StatusCheckCallback(
+                host_signal_header_pinned=host_signal_header_pinned,
+                commitment_hash_A_tensor=commitment_hash_A_tensor,
+                commitment_hash_B_tensor=commitment_hash_B_tensor,
+                A=A,
+                B=B,
+                mining_job=mining_job,
+            )
 
-        get_async_manager().schedule_status_check(cuda_event, callback)
+            get_async_manager().schedule_status_check(cuda_event, callback)
 
-        # Callback owns these tensors
-        host_signal_header_pinned = None
-        commitment_hash_A_tensor = None
-        commitment_hash_B_tensor = None
+            # Callback owns these tensors
+            host_signal_header_pinned = None
+            commitment_hash_A_tensor = None
+            commitment_hash_B_tensor = None
     else:
         get_pinned_pool().release(host_signal_header_pinned)
         del host_signal_header_pinned

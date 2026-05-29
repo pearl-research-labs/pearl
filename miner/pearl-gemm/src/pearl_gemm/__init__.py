@@ -4,6 +4,8 @@ pearl_gemm package
 This package provides CUDA kernels for Pearl GEMM with noising/denoising and PoW extraction.
 """
 
+import torch  # noqa: F401 - load PyTorch shared libraries before pearl_gemm_cuda
+
 # Re-export pearl_gemm_cuda utilities for cleaner API
 from pearl_gemm_cuda import (
     HostSignalStatus,
