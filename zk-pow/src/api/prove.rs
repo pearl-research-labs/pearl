@@ -1,7 +1,11 @@
 use std::time::Instant;
 
 use anyhow::Result;
+use plonky2::hash::hash_types::HashOut;
+use plonky2::plonk::config::PoseidonGoldilocksConfig;
+use plonky2_field::extension::quadratic::QuadraticExtension;
 use plonky2_field::goldilocks_field::GoldilocksField;
+use starky::proof::StarkProofWithPublicInputs;
 
 use crate::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams};
 use crate::api::proof::{PrivateProofParams, ZKProof};
@@ -133,12 +137,26 @@ pub fn prove_block_split(
         pearl_prove_stark(circuit_params, (trace_rows, stark_pis, hash_public_data))?;
     let miner = t_miner.elapsed();
 
-    // === ship across the wire: serialize the STARK proof (size demonstrates the ~58 KB payload) ===
-    let ship_bytes = bincode::serialize(&stark_proof).map(|b| b.len()).unwrap_or(0);
+    // === ship across the wire: serialize the FULL intermediate the pool needs, then
+    // RECONSTRUCT it pool-side from the bytes (a true round-trip — proves the wire
+    // carries the STARK proof + zeta + public inputs byte-accurately). ===
+    let pis_vec: Vec<GoldilocksField> = stark_pis2.to_vec();
+    let ship = bincode::serialize(&(&stark_proof, &zeta, &pis_vec, &hpd))
+        .expect("serialize miner intermediate");
+    let ship_bytes = ship.len();
+    type Sp = StarkProofWithPublicInputs<GoldilocksField, PoseidonGoldilocksConfig, 2>;
+    let (sp2, zeta2, pis_vec2, hpd2): (Sp, QuadraticExtension<GoldilocksField>, Vec<GoldilocksField>, HashOut<GoldilocksField>) =
+        bincode::deserialize(&ship).expect("deserialize miner intermediate");
+    // BYTE-ACCURATE wire check: re-serializing the pool-reconstructed intermediate
+    // must reproduce the exact shipped bytes (round-trip is byte-identical).
+    let reship = bincode::serialize(&(&sp2, &zeta2, &pis_vec2, &hpd2)).expect("reserialize");
+    assert_eq!(reship, ship, "miner->pool wire round-trip is NOT byte-exact");
+    let pis2_arr: [GoldilocksField; pearl_public::TOTAL] =
+        pis_vec2.try_into().expect("shipped public-input length mismatch");
 
-    // === POOL: recursion only (no STARK#0) ===
+    // === POOL: recursion only (no STARK#0), from the SHIPPED + RECONSTRUCTED proof ===
     let t_pool = std::time::Instant::now();
-    let proof = pearl_prove_recursion_from_stark(circuit_params, cache, stark_proof, zeta, stark_pis2, hpd)?;
+    let proof = pearl_prove_recursion_from_stark(circuit_params, cache, sp2, zeta2, pis2_arr, hpd2)?;
     let pool = t_pool.elapsed();
 
     Ok((proof, miner, pool, ship_bytes))
