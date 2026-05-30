@@ -107,6 +107,7 @@ use plonky2::{
 };
 use starky::{
     config::StarkConfig,
+    proof::StarkProofWithPublicInputs,
     prover::prove_and_get_zeta,
     recursive_verifier::{
         PreprocessedDataTarget, add_virtual_stark_proof_with_pis, set_stark_proof_with_pis_target, verify_stark_proof_circuit,
@@ -233,6 +234,151 @@ pub trait RecursionCircuit: Clone + Default {
 /// Pearl Recursion implementation for three-layered circuit architecture
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PearlRecursion;
+
+/// MINER half of the prove: produce the inner STARK#0 proof (the heavy ~76% of
+/// the work; commitment GPU-accelerated under `PEARL_GPU_COMMIT`). The returned
+/// `StarkProofWithPublicInputs` (~58 KB) is what a miner would ship to the pool.
+pub fn pearl_prove_stark(
+    circuit_params: PearlCircuitParams,
+    stark_trace: (
+        Vec<[GoldilocksField; pearl_columns::TOTAL]>,
+        [GoldilocksField; pearl_public::TOTAL],
+        HashOut<GoldilocksField>,
+    ),
+) -> Result<(
+    StarkProofWithPublicInputs<GoldilocksField, PoseidonGoldilocksConfig, 2>,
+    QuadraticExtension<GoldilocksField>,
+    [GoldilocksField; pearl_public::TOTAL],
+    HashOut<GoldilocksField>,
+)> {
+    let (trace_rows, stark_public_inputs, hash_public_data) = stark_trace;
+    let num_rows = trace_rows.len();
+    let stark_timer = std::time::Instant::now();
+    let stark_config = <PearlRecursion as RecursionCircuit>::stark_config(circuit_params);
+    let stark = PearlStark::<GoldilocksField, 2>::default();
+    let mut stark_timing = TimingTree::new("STARK#0", log::Level::Info);
+    let (stark_proof, zeta) = prove_and_get_zeta::<GoldilocksField, PoseidonGoldilocksConfig, _, 2>(
+        stark,
+        &stark_config,
+        trace_rows_to_poly_values(trace_rows),
+        &stark_public_inputs,
+        None,
+        &mut stark_timing,
+        &hash_public_data.elements,
+    )?;
+    if std::env::var("PEARL_PROVE_TIMING").is_ok() {
+        stark_timing.filter(std::time::Duration::from_millis(2)).print();
+    }
+    info!("Stark #0 proof time: {:?} || num_rows: {}", stark_timer.elapsed(), num_rows);
+    Ok((stark_proof, zeta, stark_public_inputs, hash_public_data))
+}
+
+/// POOL half of the prove: from the miner's STARK#0 proof, run Recursion#1 +
+/// Recursion#2 to the final certificate. The pool no longer does STARK#0 — it
+/// only runs the two (cheap, ~1–1.5 s on a Zen4) recursion proofs.
+pub fn pearl_prove_recursion_from_stark(
+    circuit_params: PearlCircuitParams,
+    cache: &mut CircuitCache,
+    stark_proof: StarkProofWithPublicInputs<GoldilocksField, PoseidonGoldilocksConfig, 2>,
+    zeta: QuadraticExtension<GoldilocksField>,
+    stark_public_inputs: [GoldilocksField; pearl_public::TOTAL],
+    hash_public_data: HashOut<GoldilocksField>,
+) -> Result<ZKProof> {
+    let stark_config = <PearlRecursion as RecursionCircuit>::stark_config(circuit_params);
+    let circuit_1_timer = std::time::Instant::now();
+
+    let first_key = CircuitCache::make_first_circuit_key(circuit_params);
+    let first_circuit_data = cache
+        .prover_circuits_1
+        .get_mut(&first_key)
+        .ok_or_else(|| anyhow::anyhow!("First prover circuit not found in cache. Params: {:?}", first_key))?;
+
+    let mut pw_1 = PartialWitness::new();
+    set_stark_proof_with_pis_target(
+        &mut pw_1,
+        &first_circuit_data.proof_0_target,
+        &stark_proof,
+        circuit_params.stark_degree_bits,
+    )?;
+
+    let openings = &stark_proof.proof.openings;
+    let prep_evals = |vals: &[QuadraticExtension<GoldilocksField>]| -> Vec<GoldilocksField> {
+        stark_config.preprocessed_columns.iter().flat_map(|&i| vals[i].0).collect()
+    };
+    let proof_1_pi_values = stark_public_inputs
+        .iter()
+        .copied()
+        .chain(hash_public_data.elements)
+        .chain(zeta.0)
+        .chain(prep_evals(&openings.local_values))
+        .chain(prep_evals(&openings.next_values))
+        .collect_vec();
+
+    let proof_1_pis = &first_circuit_data.circuit.prover_only.public_inputs;
+    for (pi_t, pi) in proof_1_pis.iter().zip_eq(proof_1_pi_values.iter()) {
+        pw_1.set_target(*pi_t, *pi)?;
+    }
+
+    let mut rec1_timing = TimingTree::new("Recursion#1", log::Level::Info);
+    let proof_1 = plonky2::plonk::prover::prove_maybe_warmup::<GoldilocksField, PoseidonGoldilocksConfig, 2>(
+        &mut first_circuit_data.circuit.prover_only,
+        &first_circuit_data.circuit.common,
+        pw_1,
+        &mut rec1_timing,
+    )?;
+    if std::env::var("PEARL_PROVE_TIMING").is_ok() {
+        rec1_timing.filter(std::time::Duration::from_millis(2)).print();
+    }
+    info!("Recursion Circuit #1 prove time: {:?}", circuit_1_timer.elapsed());
+
+    let circuit_2_timer = std::time::Instant::now();
+    let second_key = CircuitCache::make_second_circuit_key(first_circuit_data.circuit.common.clone(), circuit_params);
+    let second_circuit_data = cache
+        .prover_circuits_2
+        .get_mut(&second_key)
+        .ok_or_else(|| anyhow::anyhow!("Second prover circuit not found in cache. Params: {:?}", second_key))?;
+
+    let mut pw_2 = PartialWitness::new();
+    pw_2.set_proof_with_pis_target(&second_circuit_data.proof_1_target, &proof_1)?;
+
+    let first_verifier_data = cache
+        .verifier_circuits_1
+        .get(&first_key)
+        .ok_or_else(|| anyhow::anyhow!("First verifier circuit not found in cache. Params: {:?}", first_key))?;
+
+    let proof_2_pis = &second_circuit_data.circuit.prover_only.public_inputs;
+    let circuit_2_pi_values: Vec<GoldilocksField> = proof_1_pi_values
+        .iter()
+        .copied()
+        .chain(first_verifier_data.verifier_only.constants_sigmas_cap.0.iter().flat_map(|h| h.elements))
+        .chain(first_verifier_data.verifier_only.circuit_digest.elements)
+        .collect();
+    for (pi_t, pi) in proof_2_pis.iter().zip_eq(circuit_2_pi_values.iter()) {
+        pw_2.set_target(*pi_t, *pi)?;
+    }
+
+    let mut rec2_timing = TimingTree::new("Recursion#2", log::Level::Info);
+    let proof = plonky2::plonk::prover::prove_maybe_warmup::<GoldilocksField, Blake3GoldilocksConfig, 2>(
+        &mut second_circuit_data.circuit.prover_only,
+        &second_circuit_data.circuit.common,
+        pw_2,
+        &mut rec2_timing,
+    )?;
+    if std::env::var("PEARL_PROVE_TIMING").is_ok() {
+        rec2_timing.filter(std::time::Duration::from_millis(2)).print();
+    }
+
+    let compact: CompactProofWithPublicInputs<GoldilocksField, Blake3GoldilocksConfig, 2> = proof.into();
+    let plonky2_proof = compact.to_proof_bytes();
+    info!("Second recursion prove time: {:?} || proof size: {:?}", circuit_2_timer.elapsed(), plonky2_proof.len());
+
+    Ok(ZKProof::new(
+        circuit_params.pow_bits.map(|b| b as u8),
+        circuit_params.rate_bits.map(|b| b as u8),
+        zeta,
+        plonky2_proof,
+    ))
+}
 
 // Type definitions for PearlRecursion
 impl RecursionCircuit for PearlRecursion {
@@ -467,15 +613,22 @@ impl RecursionCircuit for PearlRecursion {
         let stark_config = Self::stark_config(circuit_params);
 
         let stark = PearlStark::<Self::F, { Self::EXT_D }>::default();
+        // Gate 0: the inner `timed!` spans already record into this tree; we just
+        // name it and print the per-substage breakdown when PEARL_PROVE_TIMING is set
+        // (off by default so the rayon-sweep bench doesn't spam).
+        let mut stark_timing = TimingTree::new("STARK#0", log::Level::Info);
         let (stark_proof, zeta) = prove_and_get_zeta::<Self::F, Self::InnerC, _, { Self::EXT_D }>(
             stark,
             &stark_config,
             trace_rows_to_poly_values(trace_rows),
             &stark_public_inputs,
             None,
-            &mut TimingTree::default(),
+            &mut stark_timing,
             &hash_public_data.elements,
         )?;
+        if std::env::var("PEARL_PROVE_TIMING").is_ok() {
+            stark_timing.filter(std::time::Duration::from_millis(2)).print();
+        }
 
         info!("Stark #0 proof time: {:?} || num_rows: {}", stark_timer.elapsed(), num_rows);
 
@@ -521,12 +674,16 @@ impl RecursionCircuit for PearlRecursion {
         }
 
         // Compile proof for verifier circuit #1
+        let mut rec1_timing = TimingTree::new("Recursion#1", log::Level::Info);
         let proof_1 = plonky2::plonk::prover::prove_maybe_warmup::<Self::F, Self::InnerC, { Self::EXT_D }>(
             &mut first_circuit_data.circuit.prover_only,
             &first_circuit_data.circuit.common,
             pw_1,
-            &mut TimingTree::default(),
+            &mut rec1_timing,
         )?;
+        if std::env::var("PEARL_PROVE_TIMING").is_ok() {
+            rec1_timing.filter(std::time::Duration::from_millis(2)).print();
+        }
 
         {
             let mut proof_1_bytes = Vec::new();
@@ -580,12 +737,16 @@ impl RecursionCircuit for PearlRecursion {
             pw_2.set_target(*pi_t, *pi)?;
         }
 
+        let mut rec2_timing = TimingTree::new("Recursion#2", log::Level::Info);
         let proof = plonky2::plonk::prover::prove_maybe_warmup::<Self::F, Self::OuterC, { Self::EXT_D }>(
             &mut second_circuit_data.circuit.prover_only,
             &second_circuit_data.circuit.common,
             pw_2,
-            &mut TimingTree::default(),
+            &mut rec2_timing,
         )?;
+        if std::env::var("PEARL_PROVE_TIMING").is_ok() {
+            rec2_timing.filter(std::time::Duration::from_millis(2)).print();
+        }
 
         let compact: CompactProofWithPublicInputs<Self::F, Self::OuterC, { Self::EXT_D }> = proof.into();
         let plonky2_proof = compact.to_proof_bytes();

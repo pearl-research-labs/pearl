@@ -62,6 +62,18 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
+        #[cfg(feature = "gpu_commit")]
+        {
+            if !blinding && std::env::var("PEARL_GPU_COMMIT").is_ok() {
+                if let Some(pb) = timed!(
+                    timing,
+                    "GPU from_values",
+                    crate::gpu::try_gpu_from_values::<F, C, D>(&values, rate_bits, cap_height)
+                ) {
+                    return pb;
+                }
+            }
+        }
         let coeffs = timed!(
             timing,
             "IFFT",

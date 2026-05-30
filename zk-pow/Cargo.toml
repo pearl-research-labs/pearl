@@ -17,10 +17,17 @@ base64 = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3.3"
 primitive-types = { version = "0.12.1", features = ["serde"] }
-plonky2 = { path = "../plonky2/plonky2" }
+# `parallel` lights up the Rayon-backed code paths in plonky2 / starky.
+# Without it the entire prove call graph runs on a single thread despite
+# the `par_iter()` call sites in the circuit and trace modules, because
+# `plonky2_maybe_rayon` falls back to serial `.iter()` when the feature
+# is absent. Enabling it is the §A4 fix from
+# `icemining/spec/PROOF_SPEEDUP.md` — the measured 9.6 s steady prove
+# on Zen 2 drops to ~2 s once the existing par_iter sites engage.
+plonky2 = { path = "../plonky2/plonky2", features = ["parallel"] }
 plonky2_field = { path = "../plonky2/field" }
-plonky2_maybe_rayon = { path = "../plonky2/maybe_rayon" }
-starky = { path = "../plonky2/starky" }
+plonky2_maybe_rayon = { path = "../plonky2/maybe_rayon", features = ["parallel"] }
+starky = { path = "../plonky2/starky", features = ["parallel"] }
 env_logger = "0.10.0"
 thiserror = "1.0"
 log = "0.4.27"

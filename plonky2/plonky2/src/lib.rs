@@ -13,6 +13,8 @@ pub use plonky2_field as field;
 
 pub mod fri;
 pub mod gadgets;
+#[cfg(feature = "gpu_commit")]
+pub(crate) mod gpu;
 pub mod gates;
 pub mod hash;
 pub mod iop;

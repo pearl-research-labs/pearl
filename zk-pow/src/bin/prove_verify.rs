@@ -142,6 +142,37 @@ fn bench_double_prove_profile() {
     info!("Prove time: {:?}", prove_time);
 }
 
+fn bench_split() {
+    info!("\n========== Architecture C: miner STARK#0 / pool recursion split ==========");
+    // Mine a REAL solution (so the block difficulty / jackpot check passes), then
+    // split-prove it across the miner/pool boundary. Production-size config.
+    let rank: u16 = 128;
+    let block_header = test_block_header(0x1D2FFFFF);
+    let (m, n, k) = (6144usize, 4096usize, 32768usize);
+    let mining_config = default_mining_config(k as u32, rank);
+    info!("Mining a real solution (m={} n={} k={} rank={})...", m, n, k, rank);
+    let plain_proof = mine(m, n, k, block_header, mining_config, None, false).expect("mining failed");
+    let (private_params, mut public_params) =
+        parse_plain_proof(block_header, &plain_proof).expect("parse_plain_proof failed");
+
+    let mut cache = CircuitCache::default();
+    let (proof, miner, pool, ship) =
+        prove::prove_block_split(&mut public_params, private_params, &mut cache).unwrap();
+    let total = miner + pool;
+    info!("MINER (STARK#0 only, GPU-accel under PEARL_GPU_COMMIT): {:?}  ships {} bytes", miner, ship);
+    info!("POOL  (Recursion#1+#2 only, no STARK#0):                {:?}", pool);
+    info!(
+        ">>> Pool sheds {:.0}% of the prove to the miner GPU (pool now does only {:?} of {:?})",
+        100.0 * miner.as_secs_f64() / total.as_secs_f64(),
+        pool,
+        total
+    );
+
+    let start = Instant::now();
+    verify::verify_block(&public_params, &proof, &mut cache).unwrap();
+    info!("Verify pool-assembled cert (from miner's shipped STARK proof): {:?} — SUCCESS", start.elapsed());
+}
+
 fn bench() {
     info!("\n========== Benchmark: Prove Time vs Problem Size ==========");
 
@@ -279,6 +310,7 @@ fn main() {
     match args[1].as_str() {
         "correctness" => test_correctness(),
         "profile" => bench_double_prove_profile(),
+        "split" => bench_split(),
         "bench" => bench(),
         "invalid" => test_invalid_with_cache(),
         "cache" => bench_fill_cache(),

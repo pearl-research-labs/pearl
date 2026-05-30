@@ -17,6 +17,7 @@ gate_testing = []
 parallel = ["hashbrown/rayon", "plonky2_maybe_rayon/parallel"]
 std = ["anyhow/std", "rand/std", "itertools/use_std"]
 timing = ["std", "dep:web-time"]
+gpu_commit = ["std", "parallel"]
 
 [dependencies]
 ahash = { workspace = true }
