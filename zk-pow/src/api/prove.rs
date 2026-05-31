@@ -113,7 +113,7 @@ pub fn prove_block_split(
     private_params: PrivateProofParams,
     cache: &mut CircuitCache,
 ) -> Result<(ZKProof, std::time::Duration, std::time::Duration, usize)> {
-    use crate::circuit::pearl_circuit::{pearl_prove_recursion_from_stark, pearl_prove_stark};
+    use crate::circuit::pearl_circuit::pearl_prove_stark;
 
     let stark = PearlStark::<GoldilocksField, 2>::new_with_params(public_params);
     let compiled_params = &stark.config.as_ref().unwrap().compiled_public_params;
@@ -151,15 +151,68 @@ pub fn prove_block_split(
     // must reproduce the exact shipped bytes (round-trip is byte-identical).
     let reship = bincode::serialize(&(&sp2, &zeta2, &pis_vec2, &hpd2)).expect("reserialize");
     assert_eq!(reship, ship, "miner->pool wire round-trip is NOT byte-exact");
-    let pis2_arr: [GoldilocksField; pearl_public::TOTAL] =
-        pis_vec2.try_into().expect("shipped public-input length mismatch");
 
-    // === POOL: recursion only (no STARK#0), from the SHIPPED + RECONSTRUCTED proof ===
+    // === POOL: recursion only — via the production E.2 pool-finisher API, fed the exact
+    // wire bytes the miner ships. This exercises pearl_pool_cert_from_intermediate e2e. ===
     let t_pool = std::time::Instant::now();
-    let proof = pearl_prove_recursion_from_stark(circuit_params, cache, sp2, zeta2, pis2_arr, hpd2)?;
+    let proof = pearl_pool_cert_from_intermediate(&ship, circuit_params, cache)?;
     let pool = t_pool.elapsed();
 
     Ok((proof, miner, pool, ship_bytes))
+}
+
+/// E.2 pool-finisher — step 1: prepare the recursion circuits for a job.
+///
+/// The pool host calls this once per job (it can cache the returned params).
+/// Derives `PearlCircuitParams` from the public params and compiles Rec#1/#2 into
+/// `cache`. After this, `pearl_pool_cert_from_intermediate` is a pure prove.
+pub fn pearl_pool_prepare_circuits(
+    public_params: &PublicProofParams,
+    cache: &mut CircuitCache,
+) -> Result<PearlCircuitParams> {
+    let stark = PearlStark::<GoldilocksField, 2>::new_with_params(public_params);
+    let degree_bits = stark.config.as_ref().unwrap().compiled_public_params.degree_bits();
+    let rate_bits = if degree_bits >= 15 { [1usize, 3, 7] } else { [2, 3, 7] };
+    let circuit_params = PearlCircuitParams {
+        stark_degree_bits: degree_bits,
+        pow_bits: [18, 18, 22],
+        rate_bits,
+    };
+    PearlRecursion::compile_circuits(circuit_params, cache, true)?;
+    Ok(circuit_params)
+}
+
+/// E.2 pool-finisher — step 2: turn a miner's shipped STARK#0 intermediate into the cert.
+///
+/// `intermediate_bytes` is exactly the wire payload the miner ships in the stratum
+/// `stark_intermediate_bytes` field: bincode of
+/// `(StarkProofWithPublicInputs, zeta, public_inputs, hash_public_data)`.
+/// Runs ONLY Recursion#1+#2 (STARK#0 was done on the miner GPU) → the `ZKProof`
+/// certificate, which the host serializes for the wire exactly as the full-prove path.
+/// `circuit_params` comes from [`pearl_pool_prepare_circuits`]; circuits must be in `cache`.
+///
+/// This is the entire pool side of Architecture C/E — the single call the coin-proxy
+/// host makes when a submit carries a STARK#0 intermediate instead of a full cert.
+pub fn pearl_pool_cert_from_intermediate(
+    intermediate_bytes: &[u8],
+    circuit_params: PearlCircuitParams,
+    cache: &mut CircuitCache,
+) -> Result<ZKProof> {
+    use crate::circuit::pearl_circuit::pearl_prove_recursion_from_stark;
+    type Sp = StarkProofWithPublicInputs<GoldilocksField, PoseidonGoldilocksConfig, 2>;
+    let (sp, zeta, pis_vec, hpd): (
+        Sp,
+        QuadraticExtension<GoldilocksField>,
+        Vec<GoldilocksField>,
+        HashOut<GoldilocksField>,
+    ) = bincode::deserialize(intermediate_bytes)
+        .map_err(|e| anyhow::anyhow!("deserialize STARK#0 intermediate: {e}"))?;
+    let pis_arr: [GoldilocksField; pearl_public::TOTAL] = pis_vec
+        .try_into()
+        .map_err(|v: Vec<GoldilocksField>| {
+            anyhow::anyhow!("shipped public-input length {} != {}", v.len(), pearl_public::TOTAL)
+        })?;
+    pearl_prove_recursion_from_stark(circuit_params, cache, sp, zeta, pis_arr, hpd)
 }
 
 /// Warms up the circuit cache by running a proof with the given parameters.
