@@ -34,9 +34,12 @@ $NVCC "${FLAGS[@]}" \
 echo "built $OUT/bench_sm89_gemmonly_re2_sm${ARCH}_${SUFFIX}"
 
 # ---- Full-PoUW bench (noisingA + noisingB + GEMM+denoise+PoW) -------------
+# Links BOTH the C-store inst (verify / legacy) and the no-C-store mining inst
+# (Lever A). The bench selects at runtime via PEARL_BENCH_CSTORE.
 $NVCC "${FLAGS[@]}" \
   bench_sm89_pouw_re2.cu \
   pearl_gemm_sm89_pow_inst_128x256x128.cu \
+  pearl_gemm_sm89_pow_inst_128x256x128_nostore.cu \
   pearl_noisingA_sm89_inst.cu \
   pearl_noisingB_sm89_inst.cu \
   -o "$OUT/bench_sm89_pouw_re2_sm${ARCH}_${SUFFIX}"

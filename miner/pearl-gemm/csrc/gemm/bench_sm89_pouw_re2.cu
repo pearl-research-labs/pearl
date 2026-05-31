@@ -75,6 +75,24 @@ extern "C" void pearl_gemm_sm89_pow_128x256x128_R256(
     uint64_t* inner_hash_counter,
     int M, int N, int K, cudaStream_t stream);
 
+// ---- Lever A: mining no-C-store variant (no M*N output materialized) ------
+extern "C" void pearl_gemm_sm89_pow_128x256x128_R256_nostore(
+    int8_t const* A, int64_t lda,
+    int8_t const* B, int64_t ldb,
+    cutlass::half_t* C, int64_t ldc,
+    float const* A_scales,
+    float const* B_scales,
+    cutlass::half_t const* EAL,
+    cutlass::half_t const* EBR,
+    cutlass::half_t const* AxEBL,
+    cutlass::half_t const* EARxBpEB,
+    uint32_t const* pow_target,
+    uint32_t const* pow_key,
+    void* host_signal_sync,
+    void* host_signal_header_pinned,
+    uint64_t* inner_hash_counter,
+    int M, int N, int K, cudaStream_t stream);
+
 // Trait alias (must match pearl_gemm_sm89_pow_inst_128x256x128.cu) so we can
 // statically probe sizeof(SharedStorage) for the PoW tile vs the 99 KB cap.
 using PowTraits128x256x128_R256 = KernelTraitsSm89<
@@ -93,7 +111,8 @@ static constexpr int R_DIM = 256;
 
 // One full-PoUW pipeline pass at (M,N,K). Returns tmac_s; on the first shape
 // optionally sanity-checks the output is finite + non-zero (5090 smoke).
-static double bench(int M, int N, int K, int iters, bool sanity_check) {
+static double bench(int M, int N, int K, int iters, bool sanity_check,
+                    bool no_store) {
     // ---- host buffers (int7-style random fill; bench times, denoise factor
     //      values don't affect timing or the finiteness of the main GEMM) ----
     std::vector<int8_t> hA(size_t(M)*K), hB(size_t(N)*K);
@@ -132,7 +151,11 @@ static double bench(int M, int N, int K, int iters, bool sanity_check) {
     CUCHK(cudaMalloc(&dEARxBpEB_fp16, size_t(N)*R_DIM*2));
     CUCHK(cudaMalloc(&dAs, size_t(M)*4));
     CUCHK(cudaMalloc(&dBs, size_t(N)*4));
-    CUCHK(cudaMalloc(&dC, size_t(M)*N*2));
+    // Lever A: in no-store mode the M*N output C is NEVER materialized (the
+    // transcript is the output), so we don't allocate the (M*N*2)-byte buffer
+    // — that is what lets M=N=131072 fit in 16 GB (full C would be 32 GB).
+    dC = nullptr;
+    if (!no_store) CUCHK(cudaMalloc(&dC, size_t(M)*N*2));
     CUCHK(cudaMalloc(&dTarget, 8*4));
     CUCHK(cudaMalloc(&dKey, 8*4));
     CUCHK(cudaMalloc(&dSignalSync, 64));
@@ -184,11 +207,19 @@ static double bench(int M, int N, int K, int iters, bool sanity_check) {
                 dEARxBpEB_i32 + size_t(0)*R_DIM + roff,
                 N, K, 0);
         }
-        pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256(
-            dApEA, K, dBpEB, K, dC, N, dAs, dBs,
-            dEAL_fp16, dEBR_fp16, dAxEBL_fp16, dEARxBpEB_fp16,
-            dTarget, dKey, dSignalSync, dSignalHeader, nullptr,
-            M, N, K, 0);
+        if (no_store) {
+            pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nostore(
+                dApEA, K, dBpEB, K, dC, N, dAs, dBs,
+                dEAL_fp16, dEBR_fp16, dAxEBL_fp16, dEARxBpEB_fp16,
+                dTarget, dKey, dSignalSync, dSignalHeader, nullptr,
+                M, N, K, 0);
+        } else {
+            pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256(
+                dApEA, K, dBpEB, K, dC, N, dAs, dBs,
+                dEAL_fp16, dEBR_fp16, dAxEBL_fp16, dEARxBpEB_fp16,
+                dTarget, dKey, dSignalSync, dSignalHeader, nullptr,
+                M, N, K, 0);
+        }
     };
 
     for (int i = 0; i < 3; ++i) run_iter();
@@ -200,7 +231,7 @@ static double bench(int M, int N, int K, int iters, bool sanity_check) {
         return -1.0;
     }
 
-    if (sanity_check) {
+    if (sanity_check && !no_store) {
         std::vector<cutlass::half_t> hC(16);
         CUCHK(cudaMemcpy(hC.data(), dC, 16*2, cudaMemcpyDeviceToHost));
         int nonzero = 0, finite = 0;
@@ -231,8 +262,9 @@ static double bench(int M, int N, int K, int iters, bool sanity_check) {
     double attempts_per_sec = 1.0 / seconds;
 
     printf("  M=%6d N=%6d K=%5d  %.3f ms/attempt  full_PoUW=%7.2f tmac_s  "
-           "main_gemm=%7.2f TOPS  %.3f attempts/s\n",
-           M, N, K, ms / iters, tmac_s, main_tops, attempts_per_sec);
+           "main_gemm=%7.2f TOPS  %.3f attempts/s  [%s]\n",
+           M, N, K, ms / iters, tmac_s, main_tops, attempts_per_sec,
+           no_store ? "no-C-store" : "C-store");
 
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     cudaFree(dA); cudaFree(dB); cudaFree(dApEA); cudaFree(dBpEB);
@@ -265,39 +297,57 @@ int main(int argc, char** argv) {
            SMEM_POW, SMEM_POW / 1024.0, ADA_CAP,
            SMEM_POW <= ADA_CAP ? "FITS" : "EXCEEDS CAP");
 
-    // ---- Mining shape + a couple smaller shapes ----
-    // C = M*N*half is the largest buffer; 131072^2 * 2 = 32 GB does NOT fit in
-    // 16 GB. The full mining shape only fits on >=34 GB cards (5090=32 GB also
-    // cannot hold 131072^2 C). We therefore run the true mining shape ONLY if it
-    // fits, else the user runs it on the 4070 Ti SUPER (16 GB) — wait, C alone
-    // is 32 GB there too. lpminer does NOT materialize full C: it streams C per
-    // tile and never stores 131072^2. Our epilogue DOES store C, so for the
-    // bench we use the largest M=N that fits the card while keeping K=4096,R=256
-    // (the per-attempt tmac_s is shape-stable once the GEMM is large enough to
-    // saturate). The user can pass a custom shape via argv.
+    // ---- Lever A: no-C-store mining mode ----
+    // Default ON (apples-to-apples with lpminer, which never materializes the
+    // M*N output C). Set PEARL_BENCH_CSTORE=1 to force the legacy C-store path
+    // (needed to bound the shape since full C is M*N*2 bytes — 131072^2 = 32 GB).
+    const char* cstore_env = std::getenv("PEARL_BENCH_CSTORE");
+    bool no_store = !(cstore_env && std::atoi(cstore_env) != 0);
+    printf("\nMode: %s (Lever A: %s)\n",
+           no_store ? "MINING no-C-store" : "legacy C-store",
+           no_store ? "C never materialized -> true mining shape fits"
+                    : "C materialized -> shape bounded by free DRAM");
+
     printf("Full-PoUW pipeline sweep (noisingA + noisingB + GEMM+denoise+PoW):\n");
 
     // Custom single shape: argv[2]=M argv[3]=N argv[4]=K [argv[5]=iters].
-    // When provided, runs ONLY this shape (useful for a watchdog-safe smoke or
-    // to bench the exact mining shape on a card that can hold C).
+    // When provided, runs ONLY this shape (e.g. the exact mining shape).
     if (argc >= 5) {
         int M = std::atoi(argv[2]), N = std::atoi(argv[3]), K = std::atoi(argv[4]);
         int it = (argc >= 6) ? std::atoi(argv[5]) : 3;
-        bench(M, N, K, it, true);
+        bench(M, N, K, it, true, no_store);
         return 0;
     }
 
     struct Shape { int M, N, K, iters; };
-    // C buffer sizes: M*N*2 bytes. 16384^2*2 = 512 MB; 24576^2*2 = 1.1 GB.
+    // No-store mode: the only large buffers are A/B/ApEA/BpEB (M*K + N*K int8)
+    // + the (M/N,R) factor buffers, all linear in M+N — so M=N=131072 K=4096
+    // fits easily (A+B+ApEA+BpEB = 4*131072*4096 = 2 GB; factors ~ a few GB).
+    // We therefore add the TRUE mining shape as the final entry. In legacy
+    // C-store mode the 131072^2 C (32 GB) would OOM, so that entry is gated.
     Shape shapes[] = {
-        { 4096,  4096, 4096, 10},
-        { 8192,  8192, 4096,  5},
-        {16384, 16384, 4096,  3},
-        {24576, 24576, 4096,  2},
+        {  4096,   4096, 4096, 10},
+        {  8192,   8192, 4096,  5},
+        { 16384,  16384, 4096,  3},
+        { 24576,  24576, 4096,  2},
+        { 32768,  32768, 4096,  2},
+        { 65536,  65536, 4096,  2},
+        {131072, 131072, 4096,  2},   // TRUE mining shape (apples-to-apples vs lpminer)
     };
     bool first = true;
     for (auto& s : shapes) {
-        bench(s.M, s.N, s.K, s.iters, first);
+        // In legacy C-store mode skip shapes whose C would not fit in DRAM.
+        if (!no_store) {
+            size_t c_bytes = size_t(s.M) * size_t(s.N) * 2;
+            size_t budget  = size_t(p.totalGlobalMem * 0.85);
+            if (c_bytes > budget) {
+                printf("  M=%6d N=%6d K=%5d  SKIPPED (C=%.1f GB > budget in "
+                       "C-store mode; use no-C-store)\n",
+                       s.M, s.N, s.K, c_bytes / 1073741824.0);
+                continue;
+            }
+        }
+        bench(s.M, s.N, s.K, s.iters, first, no_store);
         first = false;
     }
     return 0;

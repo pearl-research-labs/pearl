@@ -538,13 +538,20 @@ struct CollectiveEpilogueSm89 {
     }
 
     // ----- fp32 -> bf16, R2S stage into smem_C -----
-    auto tCrC_out = convert_type<ElementOut>(tCrD);
-    auto sC = make_tensor(make_smem_ptr(smem.smem_C.data()), SmemLayoutC{});
-    auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomC{}, tiled_mma);
-    auto smem_thr_copy_C = smem_tiled_copy_C.get_thread_slice(thread_idx);
-    auto taccCrC = smem_thr_copy_C.retile_S(tCrC_out);
-    auto taccCsC = smem_thr_copy_C.partition_D(sC);
-    cute::copy(smem_tiled_copy_C, taccCrC, taccCsC);
+    // Mining no-C-store mode (Lever A): the transcript already consumed the
+    // accumulator in the mainloop; the materialized C is never read, so skip
+    // the R2S stage entirely (and store() below is a no-op). The scale
+    // arithmetic above still runs so the denoise/scale work is timed and not
+    // dead-code-eliminated.
+    if constexpr (!KTraits::kMiningNoStore) {
+      auto tCrC_out = convert_type<ElementOut>(tCrD);
+      auto sC = make_tensor(make_smem_ptr(smem.smem_C.data()), SmemLayoutC{});
+      auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomC{}, tiled_mma);
+      auto smem_thr_copy_C = smem_tiled_copy_C.get_thread_slice(thread_idx);
+      auto taccCrC = smem_thr_copy_C.retile_S(tCrC_out);
+      auto taccCsC = smem_thr_copy_C.partition_D(sC);
+      cute::copy(smem_tiled_copy_C, taccCrC, taccCsC);
+    }
   }
 
   // ===========================================================================
@@ -557,6 +564,12 @@ struct CollectiveEpilogueSm89 {
   CUTLASS_DEVICE void store(Params const& params, SharedStorage& smem,
                             int thread_idx,
                             cute::tuple<int, int, int> const& block_coord) {
+    // Mining no-C-store mode (Lever A): no smem_C was staged and no gmem C is
+    // written. Skip the whole S2G path (and its preceding __syncthreads()).
+    if constexpr (KTraits::kMiningNoStore) {
+      (void)params; (void)smem; (void)thread_idx; (void)block_coord;
+      return;
+    }
     auto m_block = cute::get<0>(block_coord);
     auto n_block = cute::get<1>(block_coord);
 

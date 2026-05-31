@@ -49,7 +49,8 @@ template <typename ElementIn_, typename ElementOut_, typename ElementDenoise_,
           typename ElementScale_, typename TileShape_MNKR_, bool Is_Even_M_,
           bool Is_Even_N_, int cM_, int cN_, bool SkipReduction_,
           bool SkipDenoising_, int kStages_, bool EnableDebug_,
-          bool kRegisterResidentDenoise_ = false>
+          bool kRegisterResidentDenoise_ = false,
+          bool kMiningNoStore_ = false>
 struct KernelTraitsSm89 {
 
   // ---------- element types (unchanged from sm_90a) ----------
@@ -69,6 +70,23 @@ struct KernelTraitsSm89 {
   static constexpr int  kStages       = kStages_;
   static constexpr bool EnableDebug   = EnableDebug_;
   static constexpr int  srcLane       = 0;
+  // Mining "no-C-store" mode (Lever A). When true, the epilogue does NOT
+  // R2S-stage the scaled accumulator into smem_C nor write the (M,N) output to
+  // gmem. In the full-PoUW mining path the BLAKE3 transcript (folded over the
+  // raw int32 accumulator per k_block inside the mainloop, before the epilogue
+  // ever runs) IS the real output; the materialized C is never consumed. This
+  // mirrors lpminer's mining kernel, which streams the accumulator into the
+  // hash and never allocates the M*N output — letting the bench run at the true
+  // mining shape (M=N=131072) within 16 GB and removing the wasted C bandwidth
+  // on every attempt. Only valid with SkipReduction=false (PoW transcript on).
+  // The denoise + scale arithmetic still execute (they are part of the PoUW
+  // pipeline and cost a fixed amount); only the smem_C R2S + gmem store are
+  // elided. The separate verify build keeps kMiningNoStore=false so C is
+  // materialized and bit-exactness can be checked.
+  static constexpr bool kMiningNoStore = kMiningNoStore_;
+  static_assert(!kMiningNoStore || !SkipReduction_,
+                "kMiningNoStore is only meaningful in PoW mode "
+                "(SkipReduction=false): the transcript is the output.");
   // When true, the denoise epilogue does NOT stage EAL/EBR/AxEBL/EARxBpEB
   // tiles in shared memory. Instead, each thread streams its own (M, R) and
   // (N, R) factor rows directly from gmem (cached in L1) and computes the
