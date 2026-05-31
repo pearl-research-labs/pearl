@@ -15,12 +15,13 @@
 //   PROLOGUE   : issue (kStages - 1) cp.async stages of A, B; fence each
 //   REG PREFETCH: wait for stage 0; ldmatrix the k_block=0 frags for A, B
 //   STEADY STATE: for each k_tile:
+//                  ldmatrix ALL k_block A frags from smem into regs (A preload)
 //                  for each k_block:
-//                    if last k_block: advance pipe_read, cp.async_wait
-//                    ldmatrix k_block_next from smem into regs
+//                    ldmatrix this k_block's B frag from smem into regs
 //                    if first k_block of tile: issue cp.async for next gmem tile
-//                    gemm(tiled_mma, tCrA[k_block], tCrB[k_block], tCrC)
+//                    gemm(tiled_mma, tCrA[k_block], tCrB[0], tCrC)
 //                    hash_accumulator.accumulate(tCrC, k_block)
+//                    if last k_block: advance pipe_read, cp.async_wait
 //                  hash_accumulator.writeback(transcript)
 //   EPILOGUE   : NamedBarrier signal MmaComplete (consumed by epilogue collective)
 
@@ -191,8 +192,10 @@ struct CollectiveMainloopSm89 {
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
 
-    // Register fragments (per-k_block sized — we hold one k_block in regs
-    // at a time, double-buffered via tCrA/tCrA_next pattern). Use Int<0>{}
+    // Register fragments. tCrA is sized for ALL K_BLOCK_MAX k_blocks (A is the
+    // small operand and is fully preloaded per tile, see lever 2 in the steady
+    // state). tCrB is consumed one k_block at a time from slot 0 (B at bN=256 is
+    // too large to multi-buffer without spilling the accumulator). Use Int<0>{}
     // (compile-time literal) for the pipeline-dim slice so partition_fragment_A
     // sees a 2D Tensor view, not an element access.
     auto tCrA = thr_mma.partition_fragment_A(sA(_, _, Int<0>{}));
@@ -265,17 +268,24 @@ struct CollectiveMainloopSm89 {
         hash_accumulator.preload(transcript_extraction_tensor);
       }
 
+      // ----- Lever 2: 1-deep A-operand register prefetch -----
+      // A is the small operand (bM=128/8warps → 1 LDSM.x4 per k_block, ~4 regs).
+      // Preload ALL K_BLOCK_MAX A fragments for this tile up front into the
+      // distinct slots of tXrA so each k_block's IMMA reads an already-resident
+      // A fragment (LDSM→IMMA latency for A is hidden by the prior tile's MMAs /
+      // the B LDSM issued just below). B stays single-buffered (slot 0 only):
+      // a second full B operand buffer (bN=256 → 32 atoms) is what spilled the
+      // accumulator at STACK:272, so B is still loaded just-in-time per k_block.
+      // Cost: K_BLOCK_MAX-1 extra A slots (~12 regs at bK=128), well inside the
+      // 33-reg headroom; STACK stays 0.
+      CUTE_UNROLL
+      for (int ka = 0; ka < K_BLOCK_MAX; ++ka) {
+        copy(s2r_a, tXsA(_, _, ka, smem_pipe_read), tXrA(_, _, ka));
+      }
+
       CUTE_UNROLL
       for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
-        // Single-buffered operand load: ldmatrix THIS k_block's A/B fragments
-        // from the CURRENT smem stage into the SINGLE register fragment
-        // immediately before the MMA that consumes them. The prior design
-        // prefetched k_block+1 into a separate register slot, keeping TWO sets
-        // of B operand fragments (bN=256 → 32 atoms each) co-resident with the
-        // 128-int32 accumulator and forcing ptxas to spill the top accumulators
-        // (STACK:272). Loading just-in-time halves the live B-operand footprint;
-        // the kStages smem cp.async double-buffer still hides global latency.
-        copy(s2r_a, tXsA(_, _, k_block, smem_pipe_read), tXrA(_, _, 0));
+        // B single-buffered, just-in-time into slot 0; A already resident.
         copy(s2r_b, tXsB(_, _, k_block, smem_pipe_read), tXrB(_, _, 0));
 
         // First k_block of tile: issue cp.async for next tile
@@ -298,8 +308,9 @@ struct CollectiveMainloopSm89 {
         }
 
         // Compute mma for this k_block (sm_80 mma.sync is synchronous;
-        // no warpgroup_arrive/commit_batch needed).
-        cute::gemm(tiled_mma, tCrA(_, _, 0), tCrB(_, _, 0), tCrC);
+        // no warpgroup_arrive/commit_batch needed). A reads its preloaded
+        // per-k_block slot; B reads the just-loaded slot 0.
+        cute::gemm(tiled_mma, tCrA(_, _, k_block), tCrB(_, _, 0), tCrC);
 
         if constexpr (!KTraits::SkipReduction) {
           hash_accumulator.accumulate(tCrC, k_block);
