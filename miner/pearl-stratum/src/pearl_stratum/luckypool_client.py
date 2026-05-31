@@ -251,7 +251,7 @@ class LuckyPoolStratumClient:
         *,
         wallet: str,
         worker: str,
-        agent: str = "pearl-stratum-luckypool/0.1",
+        agent: str = "lpminer/0.1.9-552bdfe",
         on_new_job: Callable[[LuckyPoolJob], None] | None = None,
         on_disconnect: Callable[[str], None] | None = None,
     ) -> None:
@@ -371,13 +371,17 @@ class LuckyPoolStratumClient:
         except Exception:
             logger.debug("Could not set TCP_NODELAY/SO_KEEPALIVE", exc_info=True)
 
-        # subscribe {agent}
-        sub = await self._handshake_call("mining.subscribe", {"agent": self.agent})
-        logger.info("mining.subscribe -> %r", sub)
-        # authorize {wallet, worker, agent}
+        # Captured from lpminer 0.1.9 (strace, 2026-05-31): NO mining.subscribe;
+        # authorize is the FIRST message (id:1). The `wallet` field carries the
+        # worker appended after a dot, alongside a separate `worker` field.
+        auth_wallet = (
+            self.wallet
+            if self.wallet.endswith(f".{self.worker}")
+            else f"{self.wallet}.{self.worker}"
+        )
         auth = await self._handshake_call(
             "mining.authorize",
-            {"wallet": self.wallet, "worker": self.worker, "agent": self.agent},
+            {"wallet": auth_wallet, "worker": self.worker, "agent": self.agent},
         )
         if auth is not True:
             raise LuckyPoolStratumError(f"authorize rejected: {auth!r}")
