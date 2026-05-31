@@ -347,8 +347,24 @@ class LuckyPoolStratumClient:
         try:
             raw_result = await self._call("mining.submit", params)
             latency_ms = (time.monotonic() - t0) * 1000
+            # A no-error JSON-RPC reply is NOT proof of acceptance: stratum pools
+            # return result:false (or a falsey status) for a REJECTED share without
+            # raising. Gate on the actual result so a silent-reject (which would
+            # zero farm revenue while the dashboard reads green) is visible.
+            rejected_tokens = (False, None, 0, "", "false", "False", "rejected", "REJECTED")
+            accepted = raw_result not in rejected_tokens
+            if not accepted:
+                logger.warning(
+                    "mining.submit REJECTED (pool result=%r): job_id=%s latency=%.1fms proof_b64_len=%d",
+                    raw_result, job_id, latency_ms, len(plain_proof_b64),
+                )
+                self.stats.rejected += 1
+                return SubmitResult(
+                    accepted=False, latency_ms=latency_ms,
+                    error=f"pool returned result={raw_result!r}", error_code=None,
+                )
             logger.info(
-                "mining.submit OK: job_id=%s latency=%.1fms raw_result=%r proof_b64_len=%d",
+                "mining.submit ACCEPTED: job_id=%s latency=%.1fms raw_result=%r proof_b64_len=%d",
                 job_id, latency_ms, raw_result, len(plain_proof_b64),
             )
             self.stats.accepted += 1
