@@ -111,51 +111,119 @@ def make_rust_cpu_backend(m: int = 256, n: int = 256,
 # ---------------------------------------------------------------------------
 
 
+# Path to the standalone sm_89 miner binary. Overridable via env.
+PEARL_MINER_SM89_BIN = os.environ.get(
+    "PEARL_MINER_SM89_BIN",
+    "/opt/pearl/pearl_miner_sm89",  # default rig install path
+)
+
+
+def _splitmix64_fill(n: int, seed: int) -> "object":
+    """Regenerate the binary's seed-derived int8 operand stream (numpy int8).
+
+    Bit-exact with `fill_AB`/`splitmix64` in pearl_miner_sm89.cu: per element,
+    advance splitmix64 and map `r % 127 - 63` to [-63,63]. The binary reports the
+    `seed` it used for A; B uses `seed ^ 0xD1B54A32D192ED03`. The driver replays
+    the SAME operands so `create_proof` can build the merkle tree over them.
+    """
+    import numpy as np
+
+    MASK = (1 << 64) - 1
+    out = np.empty(n, dtype=np.int8)
+    s = seed & MASK
+    for i in range(n):
+        s = (s + 0x9E3779B97F4A7C15) & MASK
+        z = s
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK
+        z = z ^ (z >> 31)
+        out[i] = int(z % 127) - 63
+    return out
+
+
 def gpu_sm89_mine(
     header_bytes: bytes,
     mining_config: "object",
     target: int,
     nonce_range: range,
 ) -> Optional[bytes]:
-    """Drive the sm_89 GPU kernel for one attempt-batch and serialize a hit.
+    """Drive the standalone sm_89 GPU miner (`pearl_miner_sm89`) for one job and
+    serialize a hit into proof.bin bytes.
 
-    REQUIRES torch + `pearl_gemm_cuda` (the sm_89 .so) + `miner_base` to be
-    importable AND a compatible GPU (sm_89). Not usable in the offline test env
-    (those deps are intentionally absent there). The transcript the GPU emits
-    is arch-independent and matches `rust_cpu_mine` by construction (integer
-    GEMM + XOR-reduce + rotate); the CPU reference `cpuminer/ref/pearl_ref.py`
-    is the bit-exact oracle both share.
+    REQUIRES the prebuilt sm_89 binary (`$PEARL_MINER_SM89_BIN`) + a compatible
+    GPU (sm_89), plus `pearl_mining` (the authoritative proof serializer). The
+    binary does the GPU-arch-specific work (noised GEMM + on-device PoW); this
+    function does the arch-independent proof serialization with `pearl_mining`.
+    Not runnable in the offline env (no GPU / no binary there) — `rust_cpu_mine`
+    is the offline-validated path.
 
-    Flow (per report 07 §"How the driver invokes the kernel"):
-      1. job_key = blake3(header || mining_config.to_bytes())  -> merkle key.
-      2. Build a `NonceBatch` over `nonce_range`; fill A (per nonce) + shared B.
-      3. Set `pow_target` from the wire `target` (32 LE bytes); `pow_key` from
-         the commitment-A seed the kernel derives from job_key.
-      4. Launch `gemm_persistent_multinonce`; on a hit the kernel writes the
-         winning tile coords + opened rows/cols into the per-nonce
-         `host_signal_header`.
-      5. Build `OpenedBlockInfo` (A_row_indices, B_column_indices, raw A, B^T,
-         commitment, noise_rank) and call
-         `miner_base.block_submission.create_proof(opened, header)`.
-      6. Return `PlainProof.to_base64()` decoded to bytes.
+    Flow:
+      1. Shell out to `pearl_miner_sm89 mode=mine header=… config=… target=… …`.
+         The binary derives job_key/seeds (blake3, validated bit-exact vs the
+         oracle), generates seed-derived noised operands, runs the sm_89 PoW
+         kernel, and on a hit prints JSON:
+           HIT {"seed":S,"a_rows":[…8…],"b_cols":[…16…],"transcript":[…],"gpu_hash":…}
+      2. Regenerate the SAME A / B^T operands from `seed` (splitmix64) so the
+         merkle tree matches what the binary mined.
+      3. Build `OpenedBlockInfo` and call `create_proof(opened, header)` ->
+         `PlainProof.to_base64()` -> proof bytes.  The caller `verify_plain_proof`s
+         before submitting.
     """
-    import torch  # noqa: F401  (presence gates this backend)
-    import pearl_gemm_cuda  # noqa: F401
-    from miner_base.block_submission import create_proof  # noqa: F401
-    from pearl_mining import PlainProof  # noqa: F401
+    import json
+    import subprocess
 
-    # The concrete kernel-launch + signal-readback wiring lives in the existing
-    # sm_89 driver (`_miner_driver_sm89.py`) and `_nonce_batcher.NonceBatch`.
-    # This function is the integration seam: the offline gate validates the
-    # SAME proof bytes via `rust_cpu_mine`, and the kernel transcript is proven
-    # arch-independent, so the GPU path differs only in WHERE the transcript is
-    # computed, not WHAT it computes.
-    raise NotImplementedError(
-        "gpu_sm89_mine requires the sm_89 pearl_gemm_cuda .so + torch + miner_base "
-        "on a compatible GPU rig; it is not runnable in the offline test env. "
-        "Use rust_cpu_mine for offline validation; on a rig, wire NonceBatch "
-        "(see _nonce_batcher.py) + create_proof here."
+    import torch
+    from miner_base.block_submission import create_proof
+    from pearl_gateway.comm.dataclasses import OpenedBlockInfo
+
+    m = 131072
+    n = 131072
+    k = int(mining_config.common_dim)
+    r = int(getattr(mining_config, "rank", 256))
+
+    target_le_hex = int(target).to_bytes(32, "little").hex()
+    args = (
+        f"header={header_bytes.hex()} config={mining_config.to_bytes().hex()} "
+        f"target={target_le_hex} mode=mine m={m} n={n} k={k} r={r} "
+        f"nonce_start={nonce_range.start} "
+        f"nonce_count={max(1, len(nonce_range))} dev={os.environ.get('PEARL_GPU_DEV', '0')}"
     )
+    proc = subprocess.run(
+        [PEARL_MINER_SM89_BIN],
+        input=args.encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=float(os.environ.get("PEARL_MINER_SM89_TIMEOUT", "120")),
+    )
+    out = proc.stdout.decode(errors="replace").strip()
+    if not out.startswith("HIT"):
+        if out and not out.startswith("NOHIT"):
+            logger.warning("pearl_miner_sm89: %s | stderr=%s", out, proc.stderr.decode(errors="replace")[-400:])
+        return None  # NOHIT (range exhausted) or error
+
+    hit = json.loads(out[len("HIT"):].strip())
+    seed = int(hit["seed"])
+    a_rows = list(map(int, hit["a_rows"]))
+    b_cols = list(map(int, hit["b_cols"]))
+
+    # Regenerate the FULL A / B^T operands the binary mined (splitmix64). The
+    # B fill produces (n, k) rows = the columns of B = the rows of B^T, which is
+    # exactly the `B_t` create_proof expects. create_proof builds the merkle tree
+    # over the full matrices (it needs the multiproof siblings), so full A/B^T are
+    # required, not just the disclosed strips.
+    A = torch.from_numpy(_splitmix64_fill(m * k, seed)).reshape(m, k)
+    B_t = torch.from_numpy(_splitmix64_fill(n * k, seed ^ 0xD1B54A32D192ED03)).reshape(n, k)
+
+    opened = OpenedBlockInfo(
+        A_row_indices=a_rows,
+        B_column_indices=b_cols,
+        A=A,
+        B_t=B_t,
+        commitment_hash=None,
+        noise_rank=r,
+    )
+    proof = create_proof(opened, header_bytes)
+    return base64.b64decode(proof.to_base64())
 
 
 def select_backend() -> MineFn:
