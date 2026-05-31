@@ -23,6 +23,14 @@
 //            hardware. Self-checks job_key/seeds/gpu_hash on the host first.
 //   mine   : iterate nonce in [nonce_start, nonce_start+nonce_count); return on
 //            the first hit (target cleared) or after the range is exhausted.
+//            NOTE: `mine`/`serve` mutate header[72,76) per attempt — that field
+//            is `nbits` (difficulty), so the proof header != the job header and
+//            the pool REJECTS. Use `jobmine` for pool-valid mining.
+//   jobmine: POOL-VALID miner. Mines the EXACT job header UNCHANGED and varies
+//            ONLY the A/B operand seed ab_seed = nonce_start+i (the real search
+//            freedom). On the first hit prints HIT {ab_seed,a_rows,b_cols,...}
+//            and exits. The driver regenerates A,B from ab_seed (splitmix64) and
+//            builds the proof against the JOB header -> verify_plain_proof True.
 //   bench  : run a FIXED nonce_count of full attempts at the given shape and do
 //            NOT return on a hit. CUDA init + buffer alloc happen ONCE, then the
 //            attempt loop is timed; prints attempts/sec + tmac_s (same MAC
@@ -865,7 +873,8 @@ int main(int argc, char** argv) {
   // bench/serve-mode run the same fully-on-device attempt as mine-mode (no host
   // operand materialization, no (M,N) C buffer) so the measured rate reflects
   // the production mine path.
-  bool on_device = (a.mode == "mine" || a.mode == "bench" || a.mode == "serve");
+  bool on_device = (a.mode == "mine" || a.mode == "bench" || a.mode == "serve"
+                    || a.mode == "jobmine");
   GpuBufs g;
   alloc_bufs(g, a.m, a.n, a.k, /*mine=*/on_device);
 
@@ -874,6 +883,61 @@ int main(int argc, char** argv) {
   // itself. (The upfront target memcpy below is skipped for serve.)
   if (a.mode == "serve")
     return run_serve(g, a, config, aroot, broot);
+
+  // -------------------------------------------------------------------------
+  // JOBMINE mode — the POOL-VALID miner. Mines the EXACT job header UNCHANGED
+  // (never touches header[72:76), which is `nbits`/difficulty — mutating it
+  // would make the proof's header != the job header and the pool would reject)
+  // and searches ONLY by varying the A/B operand seed `ab_seed` per attempt.
+  //
+  // This is the real search freedom: A,B are seed-derived (splitmix64 fill),
+  // so a different ab_seed -> different operands -> different commitment-keyed
+  // noise -> a fresh noised C / transcript / PoW digest, exactly like the CPU
+  // miner's per-attempt random A,B. The noise KEYS (job_key/a_noise_seed/
+  // b_noise_seed) are derived ONCE from the fixed header+config and reused for
+  // every attempt (the header doesn't change), matching commitment().
+  //
+  // ab_seed = nonce_start + i (so the Python driver regenerates A,B directly
+  // from the reported `ab_seed` via the same splitmix64). On the FIRST winning
+  // tile it prints one HIT line (with ab_seed + absolute a_rows/b_cols + the
+  // gpu_hash) and exits; the proven loop re-invokes per job for the next nonce
+  // window. target_le already carries the verifier's h*w*k difficulty
+  // adjustment (decoded above) — keep it.
+  // -------------------------------------------------------------------------
+  if (a.mode == "jobmine") {
+    CUCHK(cudaMemcpy(g.dTarget, target_le.data(), 32, cudaMemcpyHostToDevice));
+    // Noise seeds depend ONLY on the (fixed) header + config: derive once.
+    Seeds s;
+    derive_seeds_for_header(header, config, aroot, broot, s);
+    uint64_t start = a.nonce_start, count = a.nonce_count ? a.nonce_count : 1;
+    for (uint64_t i = 0; i < count; ++i) {
+      uint64_t ab_seed = start + i;  // search var: A/B operand seed (header fixed)
+      uint32_t ix = 0, iy = 0;
+      int hit = run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy);
+      if (hit) {
+        int a_rows[8], b_cols[16]; uint32_t T[16]; uint8_t gpu_hash[32];
+        read_transcript_and_indices(g, s, a.k, ix, iy, a_rows, b_cols, T);
+        transcript_hash(T, s.a_noise_seed, gpu_hash);
+        // `nonce` field == ab_seed here (header is never nonce-mutated); the
+        // load-bearing field for the proven proof path is `ab_seed`.
+        printf("HIT {\"ab_seed\":%llu,\"nonce\":%llu,\"tile\":[%u,%u],\"a_rows\":[",
+               (unsigned long long)ab_seed, (unsigned long long)ab_seed, ix, iy);
+        for (int j = 0; j < 8; ++j)  printf("%s%d", j ? "," : "", a_rows[j]);
+        printf("],\"b_cols\":[");
+        for (int j = 0; j < 16; ++j) printf("%s%d", j ? "," : "", b_cols[j]);
+        printf("],\"transcript\":[");
+        for (int j = 0; j < 16; ++j) printf("%s\"%08x\"", j ? "," : "", T[j]);
+        printf("],\"gpu_hash\":\"");
+        for (int j = 0; j < 32; ++j) printf("%02x", gpu_hash[j]);
+        printf("\"}\n");
+        fflush(stdout);
+        return 0;
+      }
+    }
+    printf("NOHIT\n");
+    return 0;
+  }
+
   // BENCH-MODE TARGET: force the HARDEST target (T=0, all-zero words) so the PoW
   // check is (essentially) never satisfied. The default target for mine/verify is
   // the EASIEST (0xFF..FF, T=2^256-1), which makes check_pow_target true for EVERY
