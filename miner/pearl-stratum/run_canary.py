@@ -196,7 +196,7 @@ def _gpu_stdin(header_bytes: bytes, mining_config, target: int, nonce_start: int
     target_be_hex = int(target).to_bytes(32, "big").hex()
     line = (
         f"header={header_bytes.hex()} config={mining_config.to_bytes().hex()} "
-        f"target={target_be_hex} m={m} n={n} k={k} r={r} mode=mine "
+        f"target={target_be_hex} m={m} n={n} k={k} r={r} mode=mine real_commit=1 "
         f"nonce_start={nonce_start} nonce_count={nonce_count} dev={dev}"
     )
     return line.encode()
