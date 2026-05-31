@@ -12,6 +12,49 @@ static inline int ceil_div(int a, int b) {
 static constexpr int64_t kDefaultNoisingTileSizeMN = 64;
 static constexpr int64_t kDefaultNoisingTileSizeK = 64;
 
+// =============================================================================
+// Shape classification helpers for the sm_89 tile scheduler.
+//
+// Used by pearl_gemm_sm89_host.h's `pearl_gemm_sm89_run` and by bench harnesses
+// that want to mirror the launcher's scheduler selection. Centralized here so
+// downstream tooling (Python heuristic doctors, future arch.hpp dispatch)
+// doesn't reimplement the classification.
+//
+// Threshold chosen at 4 because empirically:
+//   - aspect 1..2:  PersistentSwizzled S=32 wins (balanced, big L2 group)
+//   - aspect 3:     PersistentSwizzled S=4  marginally wins (skew but enough
+//                   tiles for the persistent stride to share B effectively)
+//   - aspect >=4:   short-axis-fastest rasterization (SkinnyShape) can win at
+//                   the cost of giving up the persistent stride's per-CTA
+//                   L2 amortization. The PEARL_SM89_STREAMK gate makes this
+//                   opt-in until A/B'd at every production shape.
+// =============================================================================
+namespace pearl { namespace sm89 {
+
+// Aspect ratio of the tile grid: max(num_blocks_m, num_blocks_n) /
+// min(num_blocks_m, num_blocks_n). Returns 1 for degenerate (single-tile) grids.
+inline int tile_grid_aspect_ratio(int num_blocks_m, int num_blocks_n) {
+  int const lo = std::max(1, std::min(num_blocks_m, num_blocks_n));
+  int const hi = std::max(num_blocks_m, num_blocks_n);
+  return hi / lo;
+}
+
+// "Skinny" = aspect ratio of the tile grid >= 4. SkinnyShapeTileScheduler is
+// designed for this regime.
+inline bool is_skinny_aspect(int num_blocks_m, int num_blocks_n) {
+  return tile_grid_aspect_ratio(num_blocks_m, num_blocks_n) >= 4;
+}
+
+// "Partial wave" = grid total tiles less than num_sm, i.e. less than one
+// full GPU-wide wave. This is where CUTLASS StreamK would partial-K-split to
+// fill the missing SMs; pearl's hash transcript prevents that, so callers
+// can use this signal to log a warning or pick a smaller bM/bN tile.
+inline bool is_partial_wave(int num_blocks_m, int num_blocks_n, int num_sm) {
+  return num_blocks_m * num_blocks_n < num_sm;
+}
+
+}}  // namespace pearl::sm89
+
 static inline int get_swizzle_size(int K, int tile_size_n,
                                    cudaDeviceProp const* const dprops) {
   // heuristic: allocate approximately 2/3 of L2 cache for tiles of B

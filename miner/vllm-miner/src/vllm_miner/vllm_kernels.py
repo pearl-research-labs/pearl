@@ -66,8 +66,15 @@ class PearlKernel(Int8ScaledMMLinearKernel):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Pearl GEMM kernels require Hopper or newer
-        return 9
+        # Determined at build time by pearl-gemm's setup.py (PEARL_GEMM_TARGET_ARCH).
+        #   sm_90a only build => 9 (Hopper)
+        #   sm_89 only or fat build => 8 (Ampere/Ada accepted; sm_89 the validated target)
+        # Falls back to 9 (existing behavior) if the attribute is absent.
+        try:
+            import pearl_gemm_cuda  # type: ignore[import-not-found]
+            return int(getattr(pearl_gemm_cuda, "_min_compute_capability", 9))
+        except ImportError:
+            return 9
 
     @override
     @classmethod

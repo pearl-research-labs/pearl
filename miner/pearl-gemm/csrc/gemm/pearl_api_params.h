@@ -5,6 +5,13 @@
 #include <vector>
 #include "cutlass/numeric_types.h"
 
+// Forward-declared NonceContext for the multi-nonce persistent-CTA path. The
+// real definition lives in pearl_gemm_sm89_multinonce_scheduler.hpp. We only
+// need to know it's a struct so we can carry a pointer field through
+// PearlAPIParams + the launch_template; the kernel template instantiation is
+// the only place where the layout actually matters.
+namespace pearl { namespace sm89 { struct NonceContext; } }
+
 struct PearlAPIParams {
   using index_t = int64_t;
 
@@ -48,6 +55,15 @@ struct PearlAPIParams {
   // PoW target and key (uint256, LE word order)
   void const* __restrict__ ptr_pow_target;  // uint32_t[8]
   void const* __restrict__ ptr_pow_key;     // uint32_t[8]
+
+  // ---- Multi-nonce persistent-CTA support (sm_89 only) -------------------
+  // Device pointer to an array of NonceContext structs (one per batch slot).
+  // When non-null AND PEARL_SM89_PERSISTENT_NONCE=1 is set in the environment,
+  // pearl_gemm_sm89_run dispatches to the MultiNonceTileScheduler<256> kernel
+  // template and the kernel reads per-nonce A/A_scales/C pointers from this
+  // array. nullptr → single-nonce path (production R=64).
+  void const* ptr_nonce_contexts;   // pearl::sm89::NonceContext const*
+  int         nonce_batch_size;     // = 256 by default; ignored when ptr_nonce_contexts==nullptr
 };
 
 struct Noise_gen_params {

@@ -892,7 +892,14 @@ class NoisingKernelB {
     if (lane_predicate) {
       ProducerBarType::init(EBR_mbar, 1);
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // mbarrier-init fence is Hopper sm_90+ only. On Ada/sm_89 the fat-binary
+    // dispatch never reaches this kernel (template branch in
+    // pearl_gemm_launch_template.h routes to NoisingKernelBSm89), but guarding
+    // here keeps the kernel safe if it is ever compiled into a multi-arch
+    // binary and accidentally launched on a pre-Hopper target.
     cutlass::arch::fence_barrier_init();
+#endif
 
     // TMA load pipeline for B: WG0 is producer, WG2 is consumer
     LoadPipelineParams pipeline_params_B;
