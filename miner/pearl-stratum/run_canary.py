@@ -154,9 +154,9 @@ def _build_proof_from_hit(hit: dict, header_bytes: bytes, mining_config) -> byte
     multiproof siblings are available), builds OpenedBlockInfo, and serializes
     with the authoritative miner_base serializer. Returns proof.bin bytes.
     """
-    import torch
-    from miner_base.block_submission import create_proof
-    from pearl_gateway.comm.dataclasses import OpenedBlockInfo
+    # Torch-free proof builder (rig-deployable: numpy + pearl_mining only).
+    # Bit-exact with miner_base.create_proof; verify_plain_proof gates submit.
+    from pearl_proof_numpy import OpenedBlockInfo, create_proof
 
     m = 131072
     n = 131072
@@ -167,8 +167,8 @@ def _build_proof_from_hit(hit: dict, header_bytes: bytes, mining_config) -> byte
     a_rows = list(map(int, hit["a_rows"]))
     b_cols = list(map(int, hit["b_cols"]))
 
-    A = torch.from_numpy(_splitmix64_fill(m * k, seed)).reshape(m, k)
-    B_t = torch.from_numpy(_splitmix64_fill(n * k, seed ^ B_SEED_MIX)).reshape(n, k)
+    A = _splitmix64_fill(m * k, seed).reshape(m, k)
+    B_t = _splitmix64_fill(n * k, seed ^ B_SEED_MIX).reshape(n, k)
 
     opened = OpenedBlockInfo(
         A_row_indices=a_rows,
