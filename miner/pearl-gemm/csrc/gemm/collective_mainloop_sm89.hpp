@@ -235,12 +235,12 @@ struct CollectiveMainloopSm89 {
     int smem_pipe_read  = 0;
     int smem_pipe_write = K_PIPE_MAX - 1;
 
-    // --------- Prefetch first k_block to regs --------------------------
+    // --------- Wait for the first smem stage to be ready ----------------
+    // (No register prefetch here: operands are loaded just-in-time per
+    // k_block inside the loop. See the single-buffered-B note below.)
     if (K_BLOCK_MAX > 1) {
       cp_async_wait<K_PIPE_MAX - 2>();
       __syncthreads();
-      copy(s2r_a, tXsA(_, _, 0, smem_pipe_read), tXrA(_, _, 0));
-      copy(s2r_b, tXsB(_, _, 0, smem_pipe_read), tXrB(_, _, 0));
     }
 
     // --------- Hash accumulator -----------------------------------------
@@ -267,21 +267,16 @@ struct CollectiveMainloopSm89 {
 
       CUTE_UNROLL
       for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
-        // Last k_block: advance read pipe, wait for next stage
-        if (k_block == K_BLOCK_MAX - 1) {
-          smem_pipe_read = (smem_pipe_read + 1) % K_PIPE_MAX;
-          cp_async_wait<K_PIPE_MAX - 2>();
-          __syncthreads();
-        }
-
-        // Prefetch next k_block to regs (overlap with current MMA)
-        int k_block_next = (k_block + 1) % K_BLOCK_MAX;
-        int rd_stage = (k_block == K_BLOCK_MAX - 1) ? smem_pipe_read
-                                                    : smem_pipe_read;
-        copy(s2r_a, tXsA(_, _, k_block_next, rd_stage),
-             tXrA(_, _, k_block_next));
-        copy(s2r_b, tXsB(_, _, k_block_next, rd_stage),
-             tXrB(_, _, k_block_next));
+        // Single-buffered operand load: ldmatrix THIS k_block's A/B fragments
+        // from the CURRENT smem stage into the SINGLE register fragment
+        // immediately before the MMA that consumes them. The prior design
+        // prefetched k_block+1 into a separate register slot, keeping TWO sets
+        // of B operand fragments (bN=256 → 32 atoms each) co-resident with the
+        // 128-int32 accumulator and forcing ptxas to spill the top accumulators
+        // (STACK:272). Loading just-in-time halves the live B-operand footprint;
+        // the kStages smem cp.async double-buffer still hides global latency.
+        copy(s2r_a, tXsA(_, _, k_block, smem_pipe_read), tXrA(_, _, 0));
+        copy(s2r_b, tXsB(_, _, k_block, smem_pipe_read), tXrB(_, _, 0));
 
         // First k_block of tile: issue cp.async for next tile
         if (k_block == 0) {
@@ -304,10 +299,19 @@ struct CollectiveMainloopSm89 {
 
         // Compute mma for this k_block (sm_80 mma.sync is synchronous;
         // no warpgroup_arrive/commit_batch needed).
-        cute::gemm(tiled_mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
+        cute::gemm(tiled_mma, tCrA(_, _, 0), tCrB(_, _, 0), tCrC);
 
         if constexpr (!KTraits::SkipReduction) {
           hash_accumulator.accumulate(tCrC, k_block);
+        }
+
+        // Last k_block: advance read pipe to the next smem stage and wait
+        // for it (the cp.async issued above / in prior tiles). Done AFTER the
+        // MMA so the current k_block's load read the correct (current) stage.
+        if (k_block == K_BLOCK_MAX - 1) {
+          smem_pipe_read = (smem_pipe_read + 1) % K_PIPE_MAX;
+          cp_async_wait<K_PIPE_MAX - 2>();
+          __syncthreads();
         }
       }  // end k_block loop
 
