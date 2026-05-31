@@ -59,6 +59,9 @@
 #include <random>
 #include <chrono>
 
+#include <poll.h>     // serve-mode non-blocking stdin
+#include <unistd.h>   // read(2)
+
 #include "pearl_miner_host.hpp"
 #include "host_signal_header.hpp"
 
@@ -553,11 +556,233 @@ static std::string read_stdin_args() {
   return all;
 }
 
+// Decode a wire target (32 raw bytes, MSB-first when big-endian) into the 32 LE
+// `pow_target` words the device kernel compares against, applying the SAME
+// difficulty adjustment as main() (threshold = wire_target * h*w*k, saturating
+// at 2^256-1). Factored out of main() so serve-mode can re-decode per JOB.
+// Returns false on malformed target hex.
+static bool decode_target(const std::string& target_hex, bool big_endian,
+                          int k, int r, std::vector<uint8_t>& target_le) {
+  target_le.assign(32, 0xFF);  // default easiest (T = 2^256 - 1)
+  if (target_hex.empty()) return true;
+  std::vector<uint8_t> traw;
+  if (!from_hex(target_hex, traw) || traw.size() != 32) return false;
+  for (int i = 0; i < 32; ++i)
+    target_le[i] = big_endian ? traw[31 - i] : traw[i];
+  // difficulty adjustment: device threshold = wire_target * (h*w*k).
+  const uint64_t hh = 8, ww = 16;
+  const uint64_t dpl = (r > 0) ? (uint64_t)(k - k % r) : (uint64_t)k;
+  const uint64_t adj = hh * ww * dpl;
+  __uint128_t carry = 0;
+  bool overflow = false;
+  for (int i = 0; i < 32; ++i) {
+    __uint128_t prod = (__uint128_t)target_le[i] * adj + carry;
+    target_le[i] = (uint8_t)(prod & 0xFF);
+    carry = prod >> 8;
+  }
+  if (carry != 0) overflow = true;
+  if (overflow) target_le.assign(32, 0xFF);
+  return true;
+}
+
+// Derive the noise seeds for a (possibly nonce-mutated) header. Mirrors the
+// seed derivation in the mine loop: with real merkle roots use derive_seeds;
+// otherwise the self-consistent job_key chain (smoke / serve). `header` must be
+// 76 bytes (the nonce already written into [72,76)).
+static void derive_seeds_for_header(const std::vector<uint8_t>& header,
+                                    const std::vector<uint8_t>& config,
+                                    const std::vector<uint8_t>& aroot,
+                                    const std::vector<uint8_t>& broot,
+                                    Seeds& s) {
+  if (!aroot.empty() && !broot.empty()) {
+    s = derive_seeds(header.data(), header.size(), config.data(), config.size(),
+                     aroot.data(), broot.data());
+  } else {
+    pearl_miner::blake3::hash_concat(header.data(), header.size(),
+                                     config.data(), config.size(), nullptr, s.job_key);
+    pearl_miner::blake3::hash_concat(s.job_key, 32, s.job_key, 32, nullptr, s.b_noise_seed);
+    pearl_miner::blake3::hash_concat(s.b_noise_seed, 32, s.job_key, 32, nullptr, s.a_noise_seed);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SERVE mode — the definitive non-stale miner.
+//
+// Inits CUDA + all device buffers ONCE, then loops forever mining the MOST
+// RECENT job fed on stdin. Each stdin line is one job update:
+//     JOB <header_76B_hex> <target_64hex>
+// stdin is read NON-BLOCKING (poll) and fully drained each iteration so we
+// always mine the newest JOB (never stall waiting for input). For the current
+// header we derive the seeds ONCE, then mine successive small nonce batches so
+// a freshly-arrived JOB is picked up within ~1 batch (~1s). On a tile hit we
+// print one HIT line — echoing the 76B header the hit was mined against so the
+// driver can map it back to a job_id — and KEEP mining (do not exit on hit).
+// Exits cleanly on stdin EOF.
+//
+// Why this lands a FRESH share where one-shot ssh produces stale hits: a single
+// persistent process re-derives noise for the LATEST header continuously at the
+// full ~1.9 att/s, so when it hits (~1/57 per attempt) the share is for a
+// ~current job (jobs rotate ~7s) instead of a long-dead fixed header.
+// ---------------------------------------------------------------------------
+static int run_serve(GpuBufs& g, const Args& a,
+                     const std::vector<uint8_t>& config,
+                     const std::vector<uint8_t>& aroot,
+                     const std::vector<uint8_t>& broot) {
+  const int M = a.m, N = a.n, K = a.k;
+  const bool big_endian = (a.target_endian != "little");
+  // Mine in small batches so a new JOB on stdin preempts within ~1 batch.
+  const uint64_t BATCH = 2;
+
+  std::vector<uint8_t> cur_header;     // 76B working header (nonce mutated in loop)
+  std::string cur_header_hex;          // ORIGINAL job header hex (unmutated) to echo
+  std::vector<uint8_t> cur_target_le;  // decoded pow_target for cur job
+  bool have_job = false;
+  uint64_t nonce = 0;
+
+  // Line-buffered non-blocking stdin reader. We accumulate bytes into `inbuf`
+  // and split on '\n'; only the LAST complete JOB line in a drain is applied
+  // (older queued jobs are stale the instant a newer one is present).
+  std::string inbuf;
+  bool eof = false;
+
+  auto apply_job_line = [&](const std::string& line) -> bool {
+    // Expect: JOB <header_hex> <target_hex>
+    if (line.compare(0, 4, "JOB ") != 0) return false;
+    size_t p1 = line.find(' ', 4);
+    if (p1 == std::string::npos) return false;
+    std::string hhex = line.substr(4, p1 - 4);
+    std::string thex = line.substr(p1 + 1);
+    // trim trailing whitespace/CR on target
+    while (!thex.empty() && (thex.back()=='\r'||thex.back()=='\n'||thex.back()==' '||thex.back()=='\t'))
+      thex.pop_back();
+    std::vector<uint8_t> h;
+    if (!from_hex(hhex, h) || h.size() != 76) {
+      fprintf(stderr, "serve: bad JOB header (need 76B hex), ignoring\n");
+      return false;
+    }
+    std::vector<uint8_t> tle;
+    if (!decode_target(thex, big_endian, K, a.r, tle)) {
+      fprintf(stderr, "serve: bad JOB target, ignoring\n");
+      return false;
+    }
+    cur_header = std::move(h);
+    cur_target_le = std::move(tle);
+    // Echo the ORIGINAL job header (with the pool's [72,76) suffix), NOT the
+    // per-nonce mutated working header — so the driver can map a HIT back to the
+    // exact job by header. The winning nonce is reported separately.
+    cur_header_hex = hhex;
+    return true;
+  };
+
+  // Drain all currently-available stdin into inbuf; split complete lines; apply
+  // the NEWEST valid JOB line (re-derive seeds + reset nonce). Sets eof on EOF.
+  auto drain_stdin = [&]() {
+    struct pollfd pfd; pfd.fd = 0; pfd.events = POLLIN;
+    for (;;) {
+      int pr = poll(&pfd, 1, 0);  // 0ms timeout: non-blocking
+      if (pr <= 0) break;
+      if (!(pfd.revents & (POLLIN | POLLHUP))) break;
+      char buf[8192];
+      ssize_t n = read(0, buf, sizeof(buf));
+      if (n == 0) { eof = true; break; }
+      if (n < 0) break;
+      inbuf.append(buf, (size_t)n);
+      if ((size_t)n < sizeof(buf)) {
+        // likely drained the pipe for now; still loop once more via poll
+      }
+    }
+    // Split inbuf into lines; keep the trailing partial line in inbuf.
+    std::string newest;  // the last complete valid-prefixed JOB line
+    size_t start = 0, nl;
+    size_t consumed = 0;
+    while ((nl = inbuf.find('\n', start)) != std::string::npos) {
+      std::string line = inbuf.substr(start, nl - start);
+      if (line.compare(0, 4, "JOB ") == 0) newest = line;  // keep last JOB
+      start = nl + 1;
+      consumed = start;
+    }
+    if (consumed) inbuf.erase(0, consumed);
+    if (!newest.empty()) {
+      if (apply_job_line(newest)) {
+        // Upload the per-job target; seeds are re-derived PER nonce in the mine
+        // loop (each nonce mutates header[72,76) -> a fresh job_key), so there
+        // is nothing job-global to derive here.
+        CUCHK(cudaMemcpy(g.dTarget, cur_target_le.data(), 32, cudaMemcpyHostToDevice));
+        nonce = 0;
+        have_job = true;
+        fprintf(stderr, "serve: new JOB header[0..4]=%02x%02x%02x%02x target_msb=%02x nonce reset\n",
+                cur_header[0], cur_header[1], cur_header[2], cur_header[3],
+                cur_target_le[31]);
+      }
+    }
+  };
+
+  fprintf(stderr, "serve: ready (M=%d N=%d K=%d R=%d) — awaiting JOB lines on stdin\n",
+          M, N, K, a.r);
+
+  while (true) {
+    drain_stdin();
+    if (eof && inbuf.empty()) {
+      fprintf(stderr, "serve: stdin EOF — exiting\n");
+      break;
+    }
+    if (!have_job) {
+      // No job yet: brief blocking poll so we don't spin.
+      struct pollfd pfd; pfd.fd = 0; pfd.events = POLLIN;
+      poll(&pfd, 1, 200);
+      continue;
+    }
+
+    // Echo the ORIGINAL (unmutated) job header so the driver maps the HIT to its
+    // job_id; the winning nonce is in the HIT's `nonce` field.
+    const std::string& header_hex_echo = cur_header_hex;
+
+    // Mine BATCH nonces of the current header, returning per-nonce so a new JOB
+    // preempts quickly. The nonce mutates header[72,76) -> fresh job_key ->
+    // fresh noise each attempt (the production attempt-rate path).
+    for (uint64_t b = 0; b < BATCH; ++b, ++nonce) {
+      cur_header[72] = (uint8_t)(nonce);
+      cur_header[73] = (uint8_t)(nonce >> 8);
+      cur_header[74] = (uint8_t)(nonce >> 16);
+      cur_header[75] = (uint8_t)(nonce >> 24);
+      // Re-derive seeds for THIS nonce-mutated header (the job_key includes the
+      // nonce suffix, exactly like mine/bench mode).
+      Seeds s;
+      derive_seeds_for_header(cur_header, config, aroot, broot, s);
+      uint64_t ab_seed = nonce * 0x100000001B3ULL + 0xCBF29CE484222325ULL;
+      uint32_t ix = 0, iy = 0;
+      int hit = run_attempt(g, s, M, N, K, ab_seed, &ix, &iy);
+      if (hit) {
+        int a_rows[8], b_cols[16]; uint32_t T[16]; uint8_t gpu_hash[32];
+        read_transcript_and_indices(g, s, K, ix, iy, a_rows, b_cols, T);
+        transcript_hash(T, s.a_noise_seed, gpu_hash);
+        printf("HIT {\"nonce\":%llu,\"seed\":%llu,\"tile\":[%u,%u],\"a_rows\":[",
+               (unsigned long long)nonce, (unsigned long long)ab_seed, ix, iy);
+        for (int i=0;i<8;++i) printf("%s%d", i?",":"", a_rows[i]);
+        printf("],\"b_cols\":[");
+        for (int i=0;i<16;++i) printf("%s%d", i?",":"", b_cols[i]);
+        printf("],\"transcript\":[");
+        for (int i=0;i<16;++i) printf("%s\"%08x\"", i?",":"", T[i]);
+        printf("],\"gpu_hash\":\"");
+        for (int i=0;i<32;++i) printf("%02x", gpu_hash[i]);
+        printf("\",\"header\":\"%s\"}\n", header_hex_echo.c_str());
+        fflush(stdout);
+        // KEEP mining — do not exit on hit.
+      }
+    }
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   Args a;
   for (int i = 1; i < argc; ++i) parse_kv(argv[i], a);
-  // also accept whitespace-separated key=value pairs on stdin
-  if (a.header_hex.empty()) {
+  // SERVE mode reads JOB updates from stdin line-by-line (NOT key=value args),
+  // so it MUST take its config from argv and must NOT slurp stdin here. Detect
+  // it from argv before the (blocking) stdin-args fallback below.
+  bool serve_mode = (a.mode == "serve");
+  // also accept whitespace-separated key=value pairs on stdin (non-serve only)
+  if (!serve_mode && a.header_hex.empty()) {
     std::string in = read_stdin_args();
     std::string tok;
     for (char c : in) {
@@ -565,11 +790,15 @@ int main(int argc, char** argv) {
       else tok += c;
     }
     if (!tok.empty()) parse_kv(tok, a);
+    serve_mode = (a.mode == "serve");
   }
 
   std::vector<uint8_t> header, config, target_le;
-  if (!from_hex(a.header_hex, header) || header.size() != 76) {
-    fprintf(stderr, "bad header (need 76B hex)\n"); return 1;
+  // serve-mode receives the header per-JOB on stdin; it is not required on argv.
+  if (!serve_mode) {
+    if (!from_hex(a.header_hex, header) || header.size() != 76) {
+      fprintf(stderr, "bad header (need 76B hex)\n"); return 1;
+    }
   }
   if (!from_hex(a.config_hex, config) || config.size() != 52) {
     fprintf(stderr, "bad config (need 52B hex)\n"); return 1;
@@ -633,12 +862,18 @@ int main(int argc, char** argv) {
   fprintf(stderr, "pearl_miner_sm89 dev%d %s sm_%d%d  mode=%s M=%d N=%d K=%d R=%d\n",
           a.dev, p.name, p.major, p.minor, a.mode.c_str(), a.m, a.n, a.k, a.r);
 
-  // bench-mode runs the same fully-on-device attempt as mine-mode (no host
+  // bench/serve-mode run the same fully-on-device attempt as mine-mode (no host
   // operand materialization, no (M,N) C buffer) so the measured rate reflects
   // the production mine path.
-  bool on_device = (a.mode == "mine" || a.mode == "bench");
+  bool on_device = (a.mode == "mine" || a.mode == "bench" || a.mode == "serve");
   GpuBufs g;
   alloc_bufs(g, a.m, a.n, a.k, /*mine=*/on_device);
+
+  // SERVE: CUDA + buffers are now initialized ONCE. Hand off to the persistent
+  // mine loop, which reads JOB lines from stdin and uploads the per-job target
+  // itself. (The upfront target memcpy below is skipped for serve.)
+  if (a.mode == "serve")
+    return run_serve(g, a, config, aroot, broot);
   // BENCH-MODE TARGET: force the HARDEST target (T=0, all-zero words) so the PoW
   // check is (essentially) never satisfied. The default target for mine/verify is
   // the EASIEST (0xFF..FF, T=2^256-1), which makes check_pow_target true for EVERY

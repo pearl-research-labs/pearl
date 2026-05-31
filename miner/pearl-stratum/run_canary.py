@@ -175,6 +175,10 @@ def _build_proof_from_hit(hit: dict, header_bytes: bytes, mining_config) -> byte
         commitment_hash=None,
         noise_rank=r,
     )
+    # NOTE on the nonce: the GPU mutates header[72:76) per attempt to search, but
+    # the proof/verify path uses the ORIGINAL job header here, byte-for-byte
+    # identical to the validated `mine`-mode driver (luckypool_miner_driver.py).
+    # Serve mode reuses this exact path so its proof semantics match mine-mode.
     proof = create_proof(opened, header_bytes)
     return base64.b64decode(proof.to_base64())
 
@@ -203,6 +207,33 @@ def _parse_gpu_output(out: str) -> Optional[dict]:
     if out.startswith("HIT"):
         return json.loads(out[len("HIT"):].strip())
     return None
+
+
+# ---------------------------------------------------------------------------
+# Serve-mode stdin contract (persistent binary; one JOB line per pool notify)
+# ---------------------------------------------------------------------------
+
+# Per-job nonce window cap (serve mode). Unused by the binary — serve mines an
+# UNBOUNDED nonce stream of the current header until a newer JOB preempts it, so
+# there is no per-window cursor to advance here.
+
+SERVE_BIN_ARGS = ["mode=serve", "m=131072", "n=131072", "r=256"]
+
+
+def _serve_argv_remote(bin_path: str, k: int, dev: int) -> str:
+    """The remote command for the persistent serve-mode binary (ssh-rig)."""
+    env_prefix = " ".join(f"{kk}={vv}" for kk, vv in GPU_ENV.items())
+    args = " ".join(SERVE_BIN_ARGS + [f"k={k}", f"dev={dev}"])
+    return f"env {env_prefix} {bin_path} {args}"
+
+
+def _serve_job_line(header_bytes: bytes, target: int) -> bytes:
+    """One serve-mode stdin line: `JOB <header_76B_hex> <target_64hex>`.
+
+    The target is the raw per-share wire target as big-endian hex (the binary
+    re-applies the `* h*w*k` difficulty adjustment, same as mine-mode)."""
+    target_be_hex = int(target).to_bytes(32, "big").hex()
+    return f"JOB {header_bytes.hex()} {target_be_hex}\n".encode()
 
 
 # ---------------------------------------------------------------------------
@@ -822,6 +853,270 @@ class LandShareLoop:
 
 
 # ---------------------------------------------------------------------------
+# Serve mode (DEFINITIVE non-stale miner: one persistent pool conn + one
+# persistent ssh pipe to a serve-mode binary)
+# ---------------------------------------------------------------------------
+
+
+class ServeLoop:
+    """Drive the PERSISTENT serve-mode binary over ONE persistent ssh pipe.
+
+    Unlike the one-shot backends (which spawn a fresh ssh+binary per nonce
+    window, paying CUDA init each time and mining a FIXED header that goes stale
+    before it hits), this loop:
+
+      * spawns ONE long-lived `ssh root@<rig> 'env ... <bin> mode=serve ...'`
+        with stdin/stdout pipes kept open for the whole run (asyncio subprocess);
+      * on each `mining.notify`, writes a single `JOB <header> <target>` line to
+        the ssh stdin (the binary switches to the newest job, re-derives noise,
+        and keeps mining at full ~1.9 att/s with CUDA initialized ONCE);
+      * async-reads HIT lines from ssh stdout, maps each HIT's echoed `header`
+        back to its job_id, builds + verifies the proof, and (if --submit and
+        verify True) submits immediately. Because the binary always mines the
+        CURRENT header, a HIT is for a ~current job -> accepted (not stale).
+
+    Exits 0 on the first SHARE ACCEPTED. Kills the ssh + reaps the remote binary
+    on stop / atexit.
+    """
+
+    def __init__(self, *, mining_config, submit, client, loop, rig, ssh_user,
+                 bin_path, dev, on_accepted=None):
+        self.mining_config = mining_config
+        self.submit = submit
+        self.client = client
+        self.loop = loop
+        self.rig = rig
+        self.ssh_user = ssh_user
+        self.bin_path = bin_path
+        self.dev = dev
+        self.on_accepted = on_accepted
+
+        # header_hex -> (job_id, target, received_at). The binary echoes the
+        # ORIGINAL job header in each HIT, so an exact-hex lookup resolves the
+        # job_id + the live target + when we received it (staleness).
+        self._jobs: dict[str, tuple] = {}
+        self._proc = None  # asyncio subprocess
+        self.accepted = False
+        self._stop = asyncio.Event()
+
+    # ---- ssh process lifecycle ------------------------------------------
+
+    def _ssh_argv(self) -> list[str]:
+        k = int(self.mining_config.common_dim)
+        remote = _serve_argv_remote(self.bin_path, k, self.dev)
+        return [
+            "ssh", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ServerAliveInterval=30",
+            f"{self.ssh_user}@{self.rig}", remote,
+        ]
+
+    async def start(self) -> None:
+        argv = self._ssh_argv()
+        logger.info("serve: spawning persistent ssh pipe: %s", " ".join(argv))
+        self._proc = await asyncio.create_subprocess_exec(
+            *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        self.loop.create_task(self._read_stdout())
+        self.loop.create_task(self._drain_stderr())
+
+    # ---- called from the stratum read loop (event-loop thread) ----------
+
+    def on_new_job(self, job) -> None:
+        """Record the job and push a JOB line to the persistent binary."""
+        self._jobs[job.header_bytes.hex()] = (job.job_id, job.target,
+                                              __import__("time").time())
+        logger.info("NEW JOB job_id=%s height=%s target=%#x header=%s... -> JOB line",
+                    job.job_id, job.height, job.target, job.header_bytes.hex()[:32])
+        proc = self._proc
+        if proc is None or proc.stdin is None or proc.stdin.is_closing():
+            logger.warning("serve: ssh stdin not ready; dropping JOB push")
+            return
+        try:
+            proc.stdin.write(_serve_job_line(job.header_bytes, job.target))
+            # fire-and-forget drain (we're on the event loop)
+            self.loop.create_task(self._safe_drain(proc.stdin))
+        except Exception:
+            logger.exception("serve: failed writing JOB line")
+
+    @staticmethod
+    async def _safe_drain(writer) -> None:
+        try:
+            await writer.drain()
+        except Exception:
+            logger.debug("serve: stdin drain raised", exc_info=True)
+
+    # ---- stdout HIT reader ----------------------------------------------
+
+    async def _read_stdout(self) -> None:
+        proc = self._proc
+        assert proc is not None and proc.stdout is not None
+        while not self._stop.is_set():
+            line = await proc.stdout.readline()
+            if not line:
+                logger.warning("serve: ssh stdout EOF (binary exited?)")
+                break
+            text = line.decode(errors="replace").strip()
+            if not text.startswith("HIT"):
+                continue
+            try:
+                await self._handle_hit(text)
+            except Exception:
+                logger.exception("serve: error handling HIT line")
+            if self.accepted:
+                break
+
+    async def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        while not self._stop.is_set():
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            logger.debug("serve[binary]: %s",
+                         line.decode(errors="replace").rstrip())
+
+    async def _handle_hit(self, text: str) -> None:
+        import json
+        import time as _time
+
+        import pearl_mining as pm
+
+        hit = json.loads(text[len("HIT"):].strip())
+        header_hex = hit.get("header", "")
+        entry = self._jobs.get(header_hex)
+        if entry is None:
+            logger.warning("serve: HIT for UNKNOWN header %s... (no job map) — drop",
+                           header_hex[:32])
+            return
+        job_id, target, received_at = entry
+        staleness = _time.time() - received_at
+        header_bytes = bytes.fromhex(header_hex)
+
+        # Build + verify the proof (CPU; on THIS box). verify_plain_proof is the
+        # fail-safe: an unverifiable proof is never submitted.
+        proof_bytes = await asyncio.to_thread(
+            _build_proof_from_hit, hit, header_bytes, self.mining_config)
+        bh = pm.IncompleteBlockHeader.from_bytes(header_bytes)
+        proof = pm.PlainProof.from_base64(
+            base64.b64encode(proof_bytes).decode())
+        ok, msg = await asyncio.to_thread(pm.verify_plain_proof, bh, proof)
+        logger.info("serve: HIT job_id=%s nonce=%s staleness=%.1fs "
+                    "verify_plain_proof=%s (%s)",
+                    job_id, hit.get("nonce"), staleness, ok, msg)
+        if not ok:
+            logger.error("serve: job %s NOT submitting (verify failed): %s",
+                         job_id, msg)
+            return
+
+        b64 = base64.b64encode(proof_bytes).decode()
+        if not self.submit:
+            logger.info("serve: job %s DRY-RUN would submit, verify=%s "
+                        "staleness=%.1fs (proof_b64_len=%d)",
+                        job_id, ok, staleness, len(b64))
+            return
+
+        res = await self.client.submit_share(job_id, b64, hashrate=0.0)
+        if res.accepted:
+            logger.info("serve: job %s SHARE ACCEPTED latency=%.1fms staleness=%.1fs",
+                        job_id, res.latency_ms, staleness)
+            self.accepted = True
+            if self.on_accepted is not None:
+                self.on_accepted()
+            await self.stop()
+        else:
+            emsg = (res.error or "").lower()
+            kind = ("STALE/job-not-found" if any(t in emsg for t in
+                    ("stale", "not found", "unknown job", "expired"))
+                    else "FORMAT/other")
+            logger.warning("serve: job %s SHARE REJECTED [%s] code=%s err=%s "
+                           "staleness=%.1fs", job_id, kind, res.error_code,
+                           res.error, staleness)
+
+    # ---- teardown --------------------------------------------------------
+
+    async def stop(self) -> None:
+        self._stop.set()
+        proc = self._proc
+        if proc is not None:
+            try:
+                if proc.stdin is not None and not proc.stdin.is_closing():
+                    proc.stdin.close()  # EOF -> binary exits cleanly
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self.kill_remote_orphans()
+
+    def kill_remote_orphans(self) -> None:
+        """Reap the remote serve binary (best-effort) so it doesn't hold the GPU."""
+        argv = [
+            "ssh", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            f"{self.ssh_user}@{self.rig}",
+            "pkill -9 -f pearl_miner_sm89; true",
+        ]
+        try:
+            subprocess.run(argv, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15.0)
+            logger.info("serve: kill_remote_orphans pkill on %s", self.rig)
+        except Exception:
+            logger.warning("serve: kill_remote_orphans ssh pkill failed",
+                           exc_info=True)
+
+
+async def _run_serve(args, mining_config, loop, client_cls) -> int:
+    """Drive the persistent ServeLoop against ONE stable pool connection.
+
+    One persistent pool socket (no reconnect churn) + one persistent ssh pipe to
+    the serve-mode binary (CUDA initialized ONCE). Exits 0 on first accepted
+    share; reaps the remote binary on exit/atexit.
+    """
+    import atexit
+
+    if not args.rig:
+        raise SystemExit("--serve requires --backend ssh-rig and --rig <host>")
+
+    serve = ServeLoop(
+        mining_config=mining_config, submit=args.submit, client=None, loop=loop,
+        rig=args.rig, ssh_user=args.ssh_user, bin_path=RIG_BIN_PATH,
+        dev=args.dev)
+
+    # Reap any stale remote binary BEFORE we start, and on exit.
+    serve.kill_remote_orphans()
+    atexit.register(lambda: serve.kill_remote_orphans())
+
+    stop_box: dict = {}
+
+    def _on_accepted():
+        client = stop_box.get("client")
+        if client is not None:
+            loop.call_soon_threadsafe(lambda: loop.create_task(client.stop()))
+
+    serve.on_accepted = _on_accepted
+
+    client = client_cls(
+        host=args.host, port=args.port, wallet=args.wallet, worker=args.worker,
+        agent=args.agent, on_new_job=serve.on_new_job)
+    stop_box["client"] = client
+    serve.client = client
+
+    mode = "SUBMIT" if args.submit else "DRY-RUN (no submit)"
+    logger.info("Canary SERVE: pool=%s:%d rig=%s mode=%s wallet=%s worker=%s",
+                args.host, args.port, args.rig, mode, args.wallet, args.worker)
+
+    await serve.start()
+    try:
+        rc = await client.run()
+    finally:
+        await serve.stop()
+    return 0 if serve.accepted else rc
+
+
+# ---------------------------------------------------------------------------
 # Live runner
 # ---------------------------------------------------------------------------
 
@@ -832,8 +1127,14 @@ async def run_live(args) -> int:
     from pearl_stratum.luckypool_client import LuckyPoolStratumClient
 
     mining_config = pm.MiningConfiguration.from_bytes(bytes.fromhex(args.config_hex))
-    backend = make_backend(args.backend, args)
     loop = asyncio.get_running_loop()
+
+    # SERVE mode owns its own persistent ssh pipe (no per-window backend), so it
+    # is dispatched before make_backend.
+    if args.serve:
+        return await _run_serve(args, mining_config, loop, LuckyPoolStratumClient)
+
+    backend = make_backend(args.backend, args)
 
     if args.land_share:
         return await _run_land_share(args, mining_config, backend, loop,
@@ -999,6 +1300,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "kill orphans, mine one-shot windows of the CURRENT job "
                         "(no preemption), and submit a verified HIT even if the "
                         "job rotated (exploit pool grace). Exits on first accept.")
+    p.add_argument("--serve", action="store_true", default=False,
+                   help="DEFINITIVE non-stale mode: ONE persistent pool conn + "
+                        "ONE persistent ssh pipe to the serve-mode binary (CUDA "
+                        "init ONCE). Each notify pushes a JOB line; HITs are "
+                        "mapped to the live job, verified, and submitted. Always "
+                        "mines the CURRENT header so the share is fresh. Requires "
+                        "--backend ssh-rig + --rig. Exits 0 on first accept.")
     p.add_argument("--nonce-count", type=int, default=LAND_SHARE_NONCE_COUNT,
                    help="nonces per one-shot mine in --land-share mode (returns "
                         "on the first HIT; hits arrive ~nonce 8). Default 48.")
