@@ -13,7 +13,7 @@ pearl-blake3 = { path = "../pearl-blake3", features = ["serde", "pyo3"] }
 zk-pow = { path = "../zk-pow", features = ["pyo3"] }
 blake3 = "1.8"
 rayon = "1.10"
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py312"] }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"] }
 lazy_static = "1.5"
 env_logger = "0.10.0"
 

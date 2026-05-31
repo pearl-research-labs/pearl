@@ -83,7 +83,10 @@ SELFTEST_EASY_NBITS = 0x207FFFFF
 
 # GPU binary stdin/env contract (full speed needs the swizzle/L2 env).
 GPU_ENV = {
-    "PEARL_SM89_SWIZZLE": "2",
+    # SWIZZLE=24 (no L2BLOCK) is the measured-best full-shape config: ~166 tmac_s
+    # on a 4070 Ti SUPER, vs ~133 at SWIZZLE=2. Wide plain swizzle keeps the B
+    # panel L2-resident at 131072^2; the L2Block scheduler HURTS the light kernel.
+    "PEARL_SM89_SWIZZLE": "24",
     "PEARL_SM89_SWIZZLE_NMAJ": "1",
     "PEARL_SM89_NO_L2_POLICY": "1",
 }
