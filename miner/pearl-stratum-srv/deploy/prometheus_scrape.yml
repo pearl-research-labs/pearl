@@ -1,0 +1,50 @@
+# Drop-in for prometheus.yml — scrape the solo pool's /metrics endpoint.
+# Edit the `targets` to point at wherever pearl-stratum-srv is running.
+
+scrape_configs:
+  - job_name: pearl-stratum-srv
+    scrape_interval: 15s
+    scrape_timeout: 5s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - cpu02.lan:9101    # primary pool host
+          # - cpu01.lan:9101  # uncomment if you bring up a standby
+        labels:
+          pool: solo-cpu02
+
+# Optional: alerting rules — drop this file at /etc/prometheus/rules/pearl_pool.yml
+# and reference it from prometheus.yml `rule_files`.
+#
+# groups:
+#   - name: pearl-pool
+#     interval: 30s
+#     rules:
+#       - alert: PearlPoolTemplateStale
+#         expr: pearl_stratum_srv_template_age_seconds > 120
+#         for: 1m
+#         labels: {severity: page}
+#         annotations:
+#           summary: "Pool template age {{$value}}s — pearld stopped delivering work"
+#
+#       - alert: PearlPoolNoMiners
+#         expr: pearl_stratum_srv_connected_miners == 0
+#         for: 2m
+#         labels: {severity: page}
+#         annotations:
+#           summary: "No miners connected to pool {{$labels.instance}}"
+#
+#       - alert: PearlRigIdle
+#         expr: rate(pearl_stratum_srv_shares_total{outcome="accepted"}[5m]) == 0
+#         for: 2m
+#         labels: {severity: page}
+#         annotations:
+#           summary: "Worker {{$labels.worker}} stopped submitting shares"
+#           description: "Likely GPU IDLE, miner crash, or driver hang. SSH the rig."
+#
+#       - alert: PearlBlockSubmitError
+#         expr: increase(pearl_stratum_srv_blocks_total{outcome="error"}[10m]) > 0
+#         for: 0m
+#         labels: {severity: page}
+#         annotations:
+#           summary: "Block submission errored — we may have lost a block"

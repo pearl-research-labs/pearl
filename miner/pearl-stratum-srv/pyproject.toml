@@ -1,0 +1,28 @@
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "pytest-asyncio>=1.2.0",
+  "pytest>=8.3.0",
+  "ruff>=0.13.0",
+]
+
+[project]
+name = "pearl-stratum-srv"
+version = "0.1.0"
+description = "Solo Pearl mining pool: stratum TCP listener on top of pearl-gateway."
+requires-python = ">=3.10"
+dependencies = [
+  "miner-utils",
+  "pearl-gateway",
+  "py-pearl-mining",
+  "pydantic-settings>=2.12.0",
+]
+
+[project.scripts]
+pearl-stratum-srv = "pearl_stratum_srv.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

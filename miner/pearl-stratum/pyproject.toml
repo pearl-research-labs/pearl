@@ -1,0 +1,30 @@
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "pytest-asyncio>=1.2.0",
+  "pytest>=8.3.0",
+  "ruff>=0.13.0"
+]
+
+[project]
+name = "pearl-stratum"
+version = "0.1.0"
+description = "Stratum-pool shim for the Pearl miner; masquerades as MiningClient."
+requires-python = ">=3.10"
+dependencies = [
+  "blake3>=1.0.0",
+  "miner-base",
+  "miner-utils",
+  "pearl-gateway",
+  "py-pearl-mining",
+  "pydantic-settings>=2.12.0",
+]
+
+[project.scripts]
+pearl-stratum = "pearl_stratum.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

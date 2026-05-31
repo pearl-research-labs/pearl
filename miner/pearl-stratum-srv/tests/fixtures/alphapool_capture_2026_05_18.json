@@ -1,0 +1,70 @@
+{
+  "capture_metadata": {
+    "source": "us2.alphapool.tech:5566 (also matches us1.alphapool.tech:5566)",
+    "captured_via": "C:/Source/pearl-investigation/STRATUM_CAPTURE.md tcpdump session",
+    "captured_at": "2026-05-18",
+    "decoy_wallet": "prl1pgk8j7vj0xkxppzux5vqgqur9t03k9zvmm5qkam5hzaavzs69vjkqzz28wg",
+    "notes": [
+      "These are the actual server-pushed frames recorded off the wire.",
+      "Replicated in pearl-stratum/tests/test_stratum_dialogue.py FakePool and",
+      "pearl-stratum/tests/test_job_parser.py SAMPLE_PARAMS — single source of truth.",
+      "Our PoolServer output must be structurally identical so alpha-miner v1.5",
+      "treats us indistinguishably from alphapool."
+    ]
+  },
+  "subscribe_response_template": {
+    "jsonrpc": "2.0",
+    "id": null,
+    "result": [
+      [["mining.set_difficulty", "<session-tag>"], ["mining.notify", "<session-tag>"]],
+      "",
+      0
+    ],
+    "error": null
+  },
+  "set_mining_params_push": {
+    "id": null,
+    "method": "pearl.set_mining_params",
+    "params": [{
+      "m": 131072,
+      "n": 131072,
+      "k": 4096,
+      "rank": 128,
+      "rows_pattern": [0, 32],
+      "cols_pattern": [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+      ],
+      "mma_type": "Int7xInt7ToInt32"
+    }]
+  },
+  "notify_sample": {
+    "id": null,
+    "method": "mining.notify",
+    "params": [
+      "0000d446-3061",
+      "46b849bae7551681283f02a20080cd3f0fd0dfad5e320b09b6af901291bfc554",
+      "0000402054c5bf911290afb6090b325eaddfd00f3fcd8000a2023f28811655e7ba49b846d262d62ab2f3dbbf2ddd73a2c00a9ccd9838264c4298998096ef5602b0bfec3b6130096a99a00618",
+      54342,
+      "6a093061",
+      "1a0ffff0",
+      true
+    ],
+    "field_semantics": [
+      "job_id (string, format HEIGHT_HEX-SEQ_HEX, observed `0000d446-3061`)",
+      "prev_hash (32B hex)",
+      "incomplete_header_bytes (variable hex)",
+      "opaque seq int",
+      "ntime (4B Unix epoch as hex)",
+      "nbits (4B compact target as hex)",
+      "clean_jobs (bool)"
+    ]
+  },
+  "set_difficulty_push": {
+    "id": null,
+    "method": "mining.set_difficulty",
+    "params": [1048576.0]
+  }
+}

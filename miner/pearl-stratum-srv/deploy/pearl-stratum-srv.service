@@ -1,0 +1,46 @@
+[Unit]
+Description=Pearl solo mining pool (stratum-srv)
+Documentation=file:///opt/pearl/pearl-stratum-srv/README.md
+After=network-online.target pearld.service oyster.service
+Wants=network-online.target
+Requires=pearld.service
+
+[Service]
+Type=simple
+User=pearl
+Group=pearl
+WorkingDirectory=/opt/pearl/pearl-stratum-srv
+
+# All knobs come from this file (chmod 600, root:pearl).
+# Required: PEARL_SRV_RPC_URL, PEARL_SRV_RPC_USER, PEARL_SRV_RPC_PASSWORD, PEARL_SRV_MINING_ADDRESS
+EnvironmentFile=/etc/pearl-stratum-srv/env
+
+ExecStart=/opt/pearl/pearl-stratum-srv/.venv/bin/pearl-stratum-srv
+
+# Restart policy: keep coming back, but back off if we're crashing hard.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+# Resource limits (these are a single Python process; numbers are generous).
+LimitNOFILE=65536
+TasksMax=512
+
+# Hardening — read-only fs except /var/log/pearl-stratum-srv.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log/pearl-stratum-srv
+
+# Logging to journald (stderr captured automatically; INFO+ from python logging).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pearl-stratum-srv
+
+[Install]
+WantedBy=multi-user.target

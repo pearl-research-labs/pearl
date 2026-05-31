@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pearl-stratum-proxy"
+version = "0.1.0"
+description = "Transparent TCP/stratum proxy that hides alpha-miner's reconnect_drop_share bug from the pool."
+requires-python = ">=3.12"
+# Standard library asyncio only. The proxy must be installable on a bare rig
+# without dragging in pearl-gemm/torch/CUDA. Do NOT add third-party deps.
+dependencies = []
+
+[project.scripts]
+pearl-stratum-proxy = "pearl_stratum_proxy.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
