@@ -168,13 +168,16 @@ struct TileHashAccumulator {
     ++m_k_block_count;
     if ((m_k_block_count % ReduceEveryK == 0) &&
         (m_k_block_count <= m_last_full_k_block)) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-      // wgmma is async on Hopper — drain before reading the accumulator.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000)
+      // wgmma is async on Hopper (sm_90/sm_90a only) — drain before reading the
+      // accumulator. sm_100+ (Blackwell, incl. sm_120 consumer) does NOT provide
+      // wgmma.wait_group; emitting it there triggers a runtime "wgmma.wait_group
+      // without CUTE_ARCH_MMA_SM90A_ENABLED" stub + illegal launch.
       warpgroup_wait<0>();
       warpgroup_fence_operand(tensor);
 #endif
-      // sm_80/sm_89: mma.sync is synchronous; the accumulator is settled
-      // immediately after `cute::gemm(...)` returns, no fence needed.
+      // sm_80/sm_89 and sm_120: mma.sync is synchronous; the accumulator is
+      // settled immediately after `cute::gemm(...)` returns, no fence needed.
       if constexpr (EnableDebug) {
         atomicAdd((unsigned long long*)m_debug_counter, 1ULL);
       }
