@@ -14,6 +14,7 @@
 // mining shape; the tree still handles arbitrary length correctly.
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace pearl_miner {
 namespace b3tree {
@@ -100,28 +101,63 @@ inline Output parent_output(const uint32_t l[8], const uint32_t r[8], const uint
   o.counter = 0; o.block_len = BLOCK_LEN; o.flags = flags | PARENT; return o;
 }
 
+// Chaining value of one chunk (counter = chunk index). NO root flag.
+inline void chunk_cv(const uint32_t key[8], const uint8_t* data, size_t len,
+                     uint64_t counter, uint32_t cv_out[8]) {
+  ChunkState cs; chunk_init(&cs, key, counter, KEYED_HASH);
+  chunk_update(&cs, data, len);
+  Output o = chunk_output(&cs);
+  output_cv(&o, cv_out);
+}
+
 // Keyed BLAKE3 of `data[0..len)` -> 32-byte digest. == pearl_mining.MerkleTree.root
 // when `data` is the (chunk-padded) matrix bytes and key is the job_key.
+//
+// The chunk chaining values are independent, so they are computed in parallel
+// (OpenMP) — that is ~94% of the work for a 512 MB matrix. The tree reduce that
+// folds them is the SAME left-balanced merge as the streaming reference (replayed
+// over the precomputed CVs), so the result is bit-identical. The final chunk keeps
+// its full Output for the root fold (the ROOT flag must land on the top node).
 inline void blake3_keyed_tree(const uint8_t key32[32], const uint8_t* data, size_t len, uint8_t out32[32]) {
   uint32_t key[8]; for (int i = 0; i < 8; ++i) key[i] = ld32(key32 + 4 * i);
-  uint32_t cv_stack[54][8]; int stack_len = 0;
-  ChunkState cs; chunk_init(&cs, key, 0, KEYED_HASH);
-  size_t pos = 0;
-  while (pos < len) {
-    if (chunk_len(&cs) == CHUNK_LEN) {
-      Output o = chunk_output(&cs); uint32_t cv[8]; output_cv(&o, cv);
-      uint64_t total_chunks = cs.counter + 1;
-      while ((total_chunks & 1) == 0) {
-        Output p = parent_output(cv_stack[stack_len - 1], cv, key, KEYED_HASH);
-        output_cv(&p, cv); stack_len--; total_chunks >>= 1;
-      }
-      for (int i = 0; i < 8; ++i) cv_stack[stack_len][i] = cv[i];
-      stack_len++; chunk_init(&cs, key, cs.counter + 1, KEYED_HASH);
-    }
-    size_t want = CHUNK_LEN - chunk_len(&cs), rem = len - pos, take = want < rem ? want : rem;
-    chunk_update(&cs, data + pos, take); pos += take;
+  // number of chunks (each up to CHUNK_LEN; last may be short). >=1 always.
+  size_t n_chunks = len == 0 ? 1 : (len + CHUNK_LEN - 1) / CHUNK_LEN;
+  size_t last_len = len == 0 ? 0 : (len - (n_chunks - 1) * CHUNK_LEN);
+
+  if (n_chunks == 1) {
+    ChunkState cs; chunk_init(&cs, key, 0, KEYED_HASH);
+    chunk_update(&cs, data, len);
+    Output o = chunk_output(&cs);
+    output_root(&o, out32);
+    return;
   }
-  Output o = chunk_output(&cs);
+
+  // Parallel: CV of every chunk EXCEPT the last (the last is folded with ROOT).
+  std::vector<uint32_t> cvs((n_chunks - 1) * 8);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (long c = 0; c < (long)(n_chunks - 1); ++c) {
+    chunk_cv(key, data + (size_t)c * CHUNK_LEN, CHUNK_LEN, (uint64_t)c, &cvs[(size_t)c * 8]);
+  }
+
+  // Sequential left-balanced merge over the precomputed chunk CVs (identical to
+  // the streaming reference's add_chunk_chaining_value).
+  uint32_t cv_stack[54][8]; int stack_len = 0;
+  for (size_t c = 0; c < n_chunks - 1; ++c) {
+    uint32_t cv[8]; for (int i = 0; i < 8; ++i) cv[i] = cvs[c * 8 + i];
+    uint64_t total = c + 1;
+    while ((total & 1) == 0) {
+      Output p = parent_output(cv_stack[stack_len - 1], cv, key, KEYED_HASH);
+      output_cv(&p, cv); stack_len--; total >>= 1;
+    }
+    for (int i = 0; i < 8; ++i) cv_stack[stack_len][i] = cv[i];
+    stack_len++;
+  }
+  // Fold the final chunk's Output through the stack, applying ROOT at the top.
+  ChunkState last; chunk_init(&last, key, n_chunks - 1, KEYED_HASH);
+  chunk_update(&last, data + (n_chunks - 1) * CHUNK_LEN, last_len);
+  Output o = chunk_output(&last);
   for (int i = stack_len - 1; i >= 0; --i) {
     uint32_t right[8]; output_cv(&o, right);
     o = parent_output(cv_stack[i], right, key, KEYED_HASH);
