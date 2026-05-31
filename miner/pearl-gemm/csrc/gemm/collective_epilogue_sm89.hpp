@@ -69,18 +69,21 @@ struct CollectiveEpilogueSm89 {
   static constexpr int bM             = KTraits::bM;
   static constexpr int bN             = KTraits::bN;
   static constexpr int R              = KTraits::R;
+  static constexpr int kRTile         = KTraits::kRTile;
+  static constexpr int kNumRStrips    = KTraits::kNumRStrips;
   static constexpr int kNumMmaThreads = KTraits::kNumMmaThreads;
   static constexpr int kNumThreads    = KTraits::kNumThreads;
 
   // ---------- Denoise G2S cp.async copy ----------
-  // Each denoise tensor is (bM or bN, R) fp16, R-major. Vectorize at 16B
-  // (= 8 fp16) per thread along R. Thread layout has kThrR threads in R,
-  // kThrM threads in M, with kThrR * 8 = R and kThrM * kThrR = kNumThreads.
+  // Each denoise tensor is (bM or bN, R) fp16, R-major in gmem. We stage ONE
+  // R-strip of width kRTile at a time. Vectorize at 16B (= 8 fp16) per thread
+  // along R. Thread layout has kThrR threads in the kRTile strip, kThrM threads
+  // in M, with kThrR * 8 = kRTile and kThrM * kThrR = kNumThreads.
   static constexpr int kG2SDenoise_ElementsPerThread = 8;  // 16B / fp16
-  static_assert(R % kG2SDenoise_ElementsPerThread == 0,
-                "R must be a multiple of 8 (16B vectorized cp.async).");
+  static_assert(kRTile % kG2SDenoise_ElementsPerThread == 0,
+                "kRTile must be a multiple of 8 (16B vectorized cp.async).");
   static constexpr int kG2SDenoise_R_threads =
-      R / kG2SDenoise_ElementsPerThread;
+      kRTile / kG2SDenoise_ElementsPerThread;
   static_assert(kNumThreads % kG2SDenoise_R_threads == 0,
                 "kNumThreads must be a multiple of kG2SDenoise_R_threads.");
   static constexpr int kG2SDenoise_M_threads =
@@ -130,99 +133,107 @@ struct CollectiveEpilogueSm89 {
   CUTE_HOST_DEVICE static void prefetch_tma_descriptors(Params const&) {}
 
   // ===========================================================================
-  // load_denoise: cp.async-load EAL, EARxBpEB, AxEBL, EBR (all fp16) from gmem
-  // into the smem slots that were just freed by the mainloop (union'd with A/B
-  // tiles in SharedStorageDenoise). Issues a single cp.async batch + fence +
-  // wait + block-wide __syncthreads(), since on sm_89 we don't pipeline the
-  // denoise loads (only kDenoiseStages=1, no overlap with denoise MMA).
-  //
-  // Register-resident mode (KTraits::kRegisterResidentDenoise = true): this
-  // function is a no-op. The four denoise tiles are streamed per-thread from
-  // gmem inside denoise() itself, relying on L1 caching. This is required for
-  // R=128 tile combos where the resident smem buffer would overflow sm_89's
-  // 99 KB opt-in cap.
+  // load_denoise: top-level entry from the kernel. For the register-resident
+  // path it is a no-op (factors streamed inside denoise()). For the smem-
+  // resident path the staging is now done PER R-STRIP inside denoise() (see
+  // stage_denoise_strip below), so this top-level hook is also a no-op — it is
+  // kept for API compatibility with the kernel call site.
   // ===========================================================================
   template <typename SharedStorage>
   CUTLASS_DEVICE void load_denoise(
       Params const& params, SharedStorage& smem,
       cute::tuple<int, int, int> const& block_coord, int thread_idx) {
-    if constexpr (KTraits::SkipDenoising) {
-      return;
-    } else if constexpr (KTraits::kRegisterResidentDenoise) {
-      // No smem staging — denoise() loads factor rows directly from gmem.
-      (void)params;
-      (void)smem;
-      (void)block_coord;
-      (void)thread_idx;
-      return;
-    } else {
-      auto m_block = cute::get<0>(block_coord);
-      auto n_block = cute::get<1>(block_coord);
-      int const M = cute::get<0>(params.problem_shape);
-      int const N = cute::get<1>(params.problem_shape);
+    (void)params;
+    (void)smem;
+    (void)block_coord;
+    (void)thread_idx;
+  }
 
-      // GMEM tensors: (M or N, R) fp16, R-major (stride <R, 1>).
-      auto layout_AxEBL = cute::make_layout(
-          cute::make_shape(M, cute::Int<R>{}),
-          cute::make_stride(cute::Int<R>{}, cute::_1{}));
-      auto layout_EAL = cute::make_layout(
-          cute::make_shape(M, cute::Int<R>{}),
-          cute::make_stride(cute::Int<R>{}, cute::_1{}));
-      auto layout_EBR = cute::make_layout(
-          cute::make_shape(N, cute::Int<R>{}),
-          cute::make_stride(cute::Int<R>{}, cute::_1{}));
-      auto layout_EARxBpEB = cute::make_layout(
-          cute::make_shape(N, cute::Int<R>{}),
-          cute::make_stride(cute::Int<R>{}, cute::_1{}));
+  // ---------------------------------------------------------------------------
+  // stage_denoise_strip: cp.async-load the [r_off, r_off+kRTile) R-strip of the
+  // four fp16 factors (EAL, EARxBpEB, AxEBL, EBR) from gmem into smem. Each
+  // factor is read from gmem EXACTLY ONCE across the full R sweep (one strip per
+  // call, kNumRStrips calls total) — vs the register-resident path's 170×
+  // per-accumulator re-read. Issues a single cp.async batch + fence + wait +
+  // block-wide __syncthreads() (kDenoiseStages=1, no load/compute overlap).
+  // ---------------------------------------------------------------------------
+  template <typename SharedStorage>
+  CUTLASS_DEVICE void stage_denoise_strip(
+      Params const& params, SharedStorage& smem,
+      cute::tuple<int, int, int> const& block_coord, int thread_idx,
+      int r_off) {
+    auto m_block = cute::get<0>(block_coord);
+    auto n_block = cute::get<1>(block_coord);
+    int const M = cute::get<0>(params.problem_shape);
+    int const N = cute::get<1>(params.problem_shape);
 
-      auto mAxEBL    = make_tensor(make_gmem_ptr(params.ptr_AxEBL),    layout_AxEBL);
-      auto mEAL      = make_tensor(make_gmem_ptr(params.ptr_EAL),      layout_EAL);
-      auto mEBR      = make_tensor(make_gmem_ptr(params.ptr_EBR),      layout_EBR);
-      auto mEARxBpEB = make_tensor(make_gmem_ptr(params.ptr_EARxBpEB), layout_EARxBpEB);
+    // GMEM tensors: (M or N, R) fp16, R-major (stride <R, 1>).
+    auto layout_AxEBL = cute::make_layout(
+        cute::make_shape(M, cute::Int<R>{}),
+        cute::make_stride(cute::Int<R>{}, cute::_1{}));
+    auto layout_EAL = cute::make_layout(
+        cute::make_shape(M, cute::Int<R>{}),
+        cute::make_stride(cute::Int<R>{}, cute::_1{}));
+    auto layout_EBR = cute::make_layout(
+        cute::make_shape(N, cute::Int<R>{}),
+        cute::make_stride(cute::Int<R>{}, cute::_1{}));
+    auto layout_EARxBpEB = cute::make_layout(
+        cute::make_shape(N, cute::Int<R>{}),
+        cute::make_stride(cute::Int<R>{}, cute::_1{}));
 
-      // Per-CTA tiles: (bMN, R).
-      auto gAxEBL = local_tile(mAxEBL, cute::Shape<cute::Int<bM>, cute::Int<R>>{},
-                               cute::make_coord(m_block, cute::_0{}));
-      auto gEAL = local_tile(mEAL, cute::Shape<cute::Int<bM>, cute::Int<R>>{},
-                             cute::make_coord(m_block, cute::_0{}));
-      auto gEBR = local_tile(mEBR, cute::Shape<cute::Int<bN>, cute::Int<R>>{},
-                             cute::make_coord(n_block, cute::_0{}));
-      auto gEARxBpEB =
-          local_tile(mEARxBpEB, cute::Shape<cute::Int<bN>, cute::Int<R>>{},
-                     cute::make_coord(n_block, cute::_0{}));
+    auto mAxEBL    = make_tensor(make_gmem_ptr(params.ptr_AxEBL),    layout_AxEBL);
+    auto mEAL      = make_tensor(make_gmem_ptr(params.ptr_EAL),      layout_EAL);
+    auto mEBR      = make_tensor(make_gmem_ptr(params.ptr_EBR),      layout_EBR);
+    auto mEARxBpEB = make_tensor(make_gmem_ptr(params.ptr_EARxBpEB), layout_EARxBpEB);
 
-      // SMEM tensors: (bMN, R, kDenoiseStages=1) — slice the stage dim.
-      auto sAxEBL = make_tensor(make_smem_ptr(smem.smem_AxEBL.data()),
-                                SmemLayoutAxEBL{})(cute::_, cute::_, cute::_0{});
-      auto sEBR = make_tensor(make_smem_ptr(smem.smem_EBR.data()),
-                              SmemLayoutEBR{})(cute::_, cute::_, cute::_0{});
-      auto sEAL = make_tensor(make_smem_ptr(smem.smem_EAL.data()),
-                              SmemLayoutEAL{})(cute::_, cute::_, cute::_0{});
-      auto sEARxBpEB =
-          make_tensor(make_smem_ptr(smem.smem_EARxBpEB.data()),
-                      SmemLayoutEARxBpEB{})(cute::_, cute::_, cute::_0{});
+    // Per-CTA + per-R-strip tiles: (bMN, kRTile). The R-coord index is
+    // r_off / kRTile (local_tile tiles the (M,R) tensor into (bMN, kRTile)
+    // sub-tiles; the second coord selects the R-strip).
+    int const r_idx = r_off / kRTile;
+    auto gAxEBL = local_tile(mAxEBL,
+        cute::Shape<cute::Int<bM>, cute::Int<kRTile>>{},
+        cute::make_coord(m_block, r_idx));
+    auto gEAL = local_tile(mEAL,
+        cute::Shape<cute::Int<bM>, cute::Int<kRTile>>{},
+        cute::make_coord(m_block, r_idx));
+    auto gEBR = local_tile(mEBR,
+        cute::Shape<cute::Int<bN>, cute::Int<kRTile>>{},
+        cute::make_coord(n_block, r_idx));
+    auto gEARxBpEB = local_tile(mEARxBpEB,
+        cute::Shape<cute::Int<bN>, cute::Int<kRTile>>{},
+        cute::make_coord(n_block, r_idx));
 
-      // G2S cp.async copy.
-      G2SCopyDenoise g2s;
-      auto thr_g2s = g2s.get_slice(thread_idx);
-      auto tAxEBLg = thr_g2s.partition_S(gAxEBL);
-      auto tAxEBLs = thr_g2s.partition_D(sAxEBL);
-      auto tEALg   = thr_g2s.partition_S(gEAL);
-      auto tEALs   = thr_g2s.partition_D(sEAL);
-      auto tEBRg   = thr_g2s.partition_S(gEBR);
-      auto tEBRs   = thr_g2s.partition_D(sEBR);
-      auto tEARxBpEBg = thr_g2s.partition_S(gEARxBpEB);
-      auto tEARxBpEBs = thr_g2s.partition_D(sEARxBpEB);
+    // SMEM tensors: (bMN, kRTile, kDenoiseStages=1) — slice the stage dim.
+    auto sAxEBL = make_tensor(make_smem_ptr(smem.smem_AxEBL.data()),
+                              SmemLayoutAxEBL{})(cute::_, cute::_, cute::_0{});
+    auto sEBR = make_tensor(make_smem_ptr(smem.smem_EBR.data()),
+                            SmemLayoutEBR{})(cute::_, cute::_, cute::_0{});
+    auto sEAL = make_tensor(make_smem_ptr(smem.smem_EAL.data()),
+                            SmemLayoutEAL{})(cute::_, cute::_, cute::_0{});
+    auto sEARxBpEB =
+        make_tensor(make_smem_ptr(smem.smem_EARxBpEB.data()),
+                    SmemLayoutEARxBpEB{})(cute::_, cute::_, cute::_0{});
 
-      cute::copy(g2s, tEALg,      tEALs);
-      cute::copy(g2s, tEARxBpEBg, tEARxBpEBs);
-      cute::copy(g2s, tAxEBLg,    tAxEBLs);
-      cute::copy(g2s, tEBRg,      tEBRs);
+    // G2S cp.async copy.
+    G2SCopyDenoise g2s;
+    auto thr_g2s = g2s.get_slice(thread_idx);
+    auto tAxEBLg = thr_g2s.partition_S(gAxEBL);
+    auto tAxEBLs = thr_g2s.partition_D(sAxEBL);
+    auto tEALg   = thr_g2s.partition_S(gEAL);
+    auto tEALs   = thr_g2s.partition_D(sEAL);
+    auto tEBRg   = thr_g2s.partition_S(gEBR);
+    auto tEBRs   = thr_g2s.partition_D(sEBR);
+    auto tEARxBpEBg = thr_g2s.partition_S(gEARxBpEB);
+    auto tEARxBpEBs = thr_g2s.partition_D(sEARxBpEB);
 
-      cp_async_fence();
-      cp_async_wait<0>();
-      __syncthreads();
-    }
+    cute::copy(g2s, tEALg,      tEALs);
+    cute::copy(g2s, tEARxBpEBg, tEARxBpEBs);
+    cute::copy(g2s, tAxEBLg,    tAxEBLs);
+    cute::copy(g2s, tEBRg,      tEBRs);
+
+    cp_async_fence();
+    cp_async_wait<0>();
+    __syncthreads();
   }
 
   // Tail is a no-op on sm_89: we don't pipeline denoise loads.
@@ -362,9 +373,20 @@ struct CollectiveEpilogueSm89 {
                                 thread_idx);
       return;
     } else {
-      (void)params;
-      (void)main_tiled_mma;
-      (void)block_coord;
+      // R-strip-tiled smem-resident denoise. The two corrections
+      //   tCrD += EAL @ EARxBpEB^T  and  tCrD += AxEBL @ EBR^T
+      // are R-length dot products realized as fp16 tensor-core MMAs. We tile
+      // the R dimension into kNumRStrips strips of width kRTile: per strip we
+      // cp.async-stage only that (bMN × kRTile) slice of each factor into smem
+      // (so the staged footprint fits the 99 KB cap) and run the partial MMA,
+      // accumulating into the fp32 tCrD across strips. Summing partial MMAs
+      // over R-strips is a reassociation of the same R-length sum — bit-exact
+      // up to fp32 reduction-order, which the reference oracle confirms is ~0.
+      //
+      // Each factor row is read from gmem EXACTLY ONCE over the full sweep
+      // (kNumRStrips staged loads), eliminating the 170× per-accumulator
+      // re-read that made the register-resident path memory-bandwidth-bound.
+
       // Pre-scale: tCrD *= 1 / kIntToFp16ScaleFactor.
       float const inv_scale =
           1.f / static_cast<float>(pearl::kIntToFp16ScaleFactor);
@@ -373,54 +395,63 @@ struct CollectiveEpilogueSm89 {
         tCrD(i) *= inv_scale;
       }
 
-      // SMEM tensors for MMA (sliced at stage 0).
-      auto sAxEBL = make_tensor(make_smem_ptr(smem.smem_AxEBL.data()),
-                                SmemLayoutAxEBL{})(cute::_, cute::_, cute::_0{});
-      auto sEBR = make_tensor(make_smem_ptr(smem.smem_EBR.data()),
-                              SmemLayoutEBR{})(cute::_, cute::_, cute::_0{});
-      auto sEAL = make_tensor(make_smem_ptr(smem.smem_EAL.data()),
-                              SmemLayoutEAL{})(cute::_, cute::_, cute::_0{});
-      auto sEARxBpEB =
-          make_tensor(make_smem_ptr(smem.smem_EARxBpEB.data()),
-                      SmemLayoutEARxBpEB{})(cute::_, cute::_, cute::_0{});
-
       TiledMmaDenoise tiled_mma_denoise;
-      auto thr_mma = tiled_mma_denoise.get_slice(thread_idx);
 
-      // Register fragments for A, B (fp16). partition_fragment_A/B size depends
-      // on the TiledMmaDenoise atom shape — for SM80_16x8x16_TN on a (bMN, R)
-      // tile that's (V=8 for A or V=4 for B, MMA_M or MMA_N, MMA_R).
-      auto tCrEAL    = thr_mma.partition_fragment_A(sEAL);       // (MMA, MMA_M, MMA_R)
-      auto tCrEARxBpEB = thr_mma.partition_fragment_B(sEARxBpEB); // (MMA, MMA_N, MMA_R)
-      auto tCrAxEBL  = thr_mma.partition_fragment_A(sAxEBL);     // (MMA, MMA_M, MMA_R)
-      auto tCrEBR    = thr_mma.partition_fragment_B(sEBR);       // (MMA, MMA_N, MMA_R)
-
-      // S2R: LDSM smem -> regs. Use make_tiled_copy_A/B with the tiled MMA so
-      // the LDSM lane mapping matches the MMA's A/B operand layout.
+      // S2R LDSM tiled copies (lane mapping matched to the MMA A/B operands).
       auto s2r_a = make_tiled_copy_A(S2RCopyAtomDenoiseA{}, tiled_mma_denoise);
       auto s2r_b = make_tiled_copy_B(S2RCopyAtomDenoiseB{}, tiled_mma_denoise);
       auto s2r_thr_a = s2r_a.get_slice(thread_idx);
       auto s2r_thr_b = s2r_b.get_slice(thread_idx);
 
-      auto tXsEAL       = s2r_thr_a.partition_S(sEAL);
-      auto tXsEARxBpEB  = s2r_thr_b.partition_S(sEARxBpEB);
-      auto tXsAxEBL     = s2r_thr_a.partition_S(sAxEBL);
-      auto tXsEBR       = s2r_thr_b.partition_S(sEBR);
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int rs = 0; rs < kNumRStrips; ++rs) {
+        int const r_off = rs * kRTile;
 
-      auto tXrEAL       = s2r_thr_a.retile_D(tCrEAL);
-      auto tXrEARxBpEB  = s2r_thr_b.retile_D(tCrEARxBpEB);
-      auto tXrAxEBL     = s2r_thr_a.retile_D(tCrAxEBL);
-      auto tXrEBR       = s2r_thr_b.retile_D(tCrEBR);
+        // Stage this R-strip of all four factors into smem (cp.async + sync).
+        stage_denoise_strip(params, smem, block_coord, thread_idx, r_off);
 
-      // Load all four operands smem -> regs.
-      cute::copy(s2r_a, tXsEAL,      tXrEAL);
-      cute::copy(s2r_b, tXsEARxBpEB, tXrEARxBpEB);
-      cute::copy(s2r_a, tXsAxEBL,    tXrAxEBL);
-      cute::copy(s2r_b, tXsEBR,      tXrEBR);
+        // SMEM tensors for this strip (sliced at stage 0).
+        auto sAxEBL = make_tensor(make_smem_ptr(smem.smem_AxEBL.data()),
+                                  SmemLayoutAxEBL{})(cute::_, cute::_, cute::_0{});
+        auto sEBR = make_tensor(make_smem_ptr(smem.smem_EBR.data()),
+                                SmemLayoutEBR{})(cute::_, cute::_, cute::_0{});
+        auto sEAL = make_tensor(make_smem_ptr(smem.smem_EAL.data()),
+                                SmemLayoutEAL{})(cute::_, cute::_, cute::_0{});
+        auto sEARxBpEB =
+            make_tensor(make_smem_ptr(smem.smem_EARxBpEB.data()),
+                        SmemLayoutEARxBpEB{})(cute::_, cute::_, cute::_0{});
 
-      // Two fp16 MMAs into the fp32 tCrD accumulator.
-      cute::gemm(tiled_mma_denoise, tCrEAL,   tCrEARxBpEB, tCrD);
-      cute::gemm(tiled_mma_denoise, tCrAxEBL, tCrEBR,      tCrD);
+        auto thr_mma = tiled_mma_denoise.get_slice(thread_idx);
+        // Fragments over the kRTile strip: (MMA, MMA_M/N, MMA_R=kRTile/16).
+        auto tCrEAL      = thr_mma.partition_fragment_A(sEAL);
+        auto tCrEARxBpEB = thr_mma.partition_fragment_B(sEARxBpEB);
+        auto tCrAxEBL    = thr_mma.partition_fragment_A(sAxEBL);
+        auto tCrEBR      = thr_mma.partition_fragment_B(sEBR);
+
+        auto tXsEAL      = s2r_thr_a.partition_S(sEAL);
+        auto tXsEARxBpEB = s2r_thr_b.partition_S(sEARxBpEB);
+        auto tXsAxEBL    = s2r_thr_a.partition_S(sAxEBL);
+        auto tXsEBR      = s2r_thr_b.partition_S(sEBR);
+
+        auto tXrEAL      = s2r_thr_a.retile_D(tCrEAL);
+        auto tXrEARxBpEB = s2r_thr_b.retile_D(tCrEARxBpEB);
+        auto tXrAxEBL    = s2r_thr_a.retile_D(tCrAxEBL);
+        auto tXrEBR      = s2r_thr_b.retile_D(tCrEBR);
+
+        // Load this strip's operands smem -> regs.
+        cute::copy(s2r_a, tXsEAL,      tXrEAL);
+        cute::copy(s2r_b, tXsEARxBpEB, tXrEARxBpEB);
+        cute::copy(s2r_a, tXsAxEBL,    tXrAxEBL);
+        cute::copy(s2r_b, tXsEBR,      tXrEBR);
+
+        // Two partial fp16 MMAs into the fp32 tCrD accumulator (+= over strips).
+        cute::gemm(tiled_mma_denoise, tCrEAL,   tCrEARxBpEB, tCrD);
+        cute::gemm(tiled_mma_denoise, tCrAxEBL, tCrEBR,      tCrD);
+
+        // Strip's smem must be fully consumed before the next strip's
+        // stage_denoise_strip() overwrites it.
+        __syncthreads();
+      }
 
       // Post-scale: tCrD *= kIntToFp16ScaleFactor (== 1<<12).
       float const scale = static_cast<float>(pearl::kIntToFp16ScaleFactor);

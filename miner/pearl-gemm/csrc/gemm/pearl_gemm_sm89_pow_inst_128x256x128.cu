@@ -4,17 +4,19 @@
 //   (bM,bN,bK,R) = (128,256,128,256), kStages=2,
 //   SkipReduction=false (PoW transcript accumulator ON),
 //   SkipDenoising=false (denoise epilogue ON),
-//   kRegisterResidentDenoise=true (REQUIRED: the smem-resident denoise arm at
-//     R=256 would need 4*(bM+bN)*R*sizeof(fp16) = 4*384*256*2 = 768 KB, far over
-//     the sm_89 99 KB cap. Reg-resident streams the four (M/N x R) fp16 factor
-//     rows from gmem per-thread, so SharedStorage collapses to union{A,B | C} +
-//     scales + pipelines — identical footprint to the noiseless 128x256x128
-//     inst, which already measures ~98-100 KB).
+//   kRegisterResidentDenoise=false (R-strip-tiled smem-resident denoise — the
+//     fix for the 30x denoise slowdown). Staging all four FULL R=256 factor
+//     tiles would need 4*(bM+bN)*R*sizeof(fp16) = 768 KB, far over the 99 KB
+//     cap; the register-resident path avoided that but re-read every factor row
+//     from gmem PER accumulator entry (~170x redundant traffic → memory-bound,
+//     ~5 tmac_s). The smem-resident path now tiles R into strips of kRTile (64):
+//     per strip only 4*(bM+bN)*kRTile*2 bytes are staged (unions with the
+//     mainloop A/B smem under the cap) and each factor row is read from gmem
+//     exactly once, with the corrections done as fp16 tensor-core MMAs.
 //
 // The PoW transcript accumulator (TileHashAccumulator in pow_utils.hpp) operates
 // entirely on the register fragment tCrC + a small per-thread transcript tensor;
-// it adds ZERO shared-memory cost vs the noiseless tile. So if the noiseless
-// 128x256x128 inst fits the 99 KB opt-in cap, this PoW inst fits too.
+// it adds ZERO shared-memory cost vs the noiseless tile.
 //
 // This is the kernel benched by bench_sm89_pouw_re2.cu for the full-PoUW
 // tmac_s comparison against lpminer's ~134.
@@ -47,7 +49,13 @@ using PowTraits128x256x128_R256 = KernelTraitsSm89<
     /*SkipDenoising=*/  false,   // denoise epilogue ON
     /*kStages=*/        2,
     /*EnableDebug=*/    false,
-    /*kRegisterResidentDenoise=*/ true>;   // REQUIRED at R=256 (see header)
+    /*kRegisterResidentDenoise=*/ false>;  // R-strip-tiled smem-resident denoise
+                                           // (the 30x-slowdown fix): stages each
+                                           // R-strip of the four factors in smem
+                                           // once and does the corrections as
+                                           // fp16 tensor-core MMAs, instead of
+                                           // re-reading every factor row from
+                                           // gmem per accumulator entry.
 
 template void pearl_gemm_sm89_run<PowTraits128x256x128_R256>(
     typename pearl::CollectiveMainloopSm89<

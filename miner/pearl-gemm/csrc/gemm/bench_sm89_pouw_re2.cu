@@ -81,7 +81,7 @@ using PowTraits128x256x128_R256 = KernelTraitsSm89<
     int8_t, cutlass::half_t, cutlass::half_t, float,
     cute::Shape<cute::Int<128>, cute::Int<256>, cute::Int<128>, cute::Int<256>>,
     true, true, 1, 1, /*SkipReduction=*/false, /*SkipDenoising=*/false,
-    /*kStages=*/2, /*EnableDebug=*/false, /*kRegisterResidentDenoise=*/true>;
+    /*kStages=*/2, /*EnableDebug=*/false, /*kRegisterResidentDenoise=*/false>;
 }  // namespace sm89
 }  // namespace pearl
 

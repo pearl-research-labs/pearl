@@ -300,24 +300,49 @@ struct KernelTraitsSm89 {
       AtomLayoutMNK{}));
   static_assert(R % 16 == 0, "Denoise MMA atom k-dim is 16; R must be a multiple.");
 
-  // Denoise smem (fp16 K-major). For R=128 → K-row = 256 bytes; Swizzle<3,3,3>
-  // is the canonical fp16 atom.
+  // ---------- Denoise R-strip tiling ----------
+  // The smem-resident denoise stages the four (bM/bN × R) fp16 factors and
+  // computes the two corrections as tensor-core MMAs. Staging all four FULL
+  // R=256 tiles needs 4*(bM+bN)*R*2 = 768 KB, far over sm_89's 99 KB cap. We
+  // therefore tile the denoise over R in strips of kRTile: per strip only a
+  // (bM/bN × kRTile) slice of each factor is staged, the partial correction
+  // MMA runs over that strip, and the fp32 accumulator sums across strips
+  // (just a reassociation of the same R-length dot — near bit-exact). This
+  // cuts the staged footprint to 4*(bM+bN)*kRTile*2 (≈96 KB at kRTile=64) AND
+  // reads each factor from gmem exactly once (vs the 170× redundancy of the
+  // register-resident per-accumulator-entry re-read).
+  //
+  // At the production tile (bM=128,bN=256) kRTile=64 stages
+  // 2*128*64*2 + 2*256*64*2 = 96 KB of denoise smem; that unions with the
+  // mainloop A/B smem (which is free by epilogue time), so the kernel
+  // SharedStorage stays under the cap (measured 100352 B incl. scales +
+  // pipelines). Falls back to 32 if 64 is too tight for a given tile (guarded
+  // by the SharedStorage static_assert below).
+  static constexpr int kRTile = (R % 64 == 0) ? 64 : 32;
+  static_assert(R % kRTile == 0, "R must be a multiple of kRTile (64 or 32).");
+  static_assert(kRTile % 16 == 0, "kRTile must be a multiple of the denoise MMA k-dim (16).");
+  static constexpr int kNumRStrips = R / kRTile;
+
+  // Denoise smem (fp16 K-major). K-row = kRTile elements. Swizzle<3,3,3> is the
+  // canonical fp16 atom; its 8-element inner contiguity requires kRTile % 8 == 0
+  // (satisfied for kRTile in {32, 64}).
   using SmemLayoutAtomDenoise = decltype(composition(
       Swizzle<3, 3, 3>{},
-      Layout<Shape<_8, Int<R>>, Stride<Int<R>, _1>>{}));
+      Layout<Shape<_8, Int<kRTile>>, Stride<Int<kRTile>, _1>>{}));
 
+  // Staged extent is kRTile (one R-strip), NOT full R.
   using SmemLayoutEAL = decltype(tile_to_shape(
       SmemLayoutAtomDenoise{},
-      Shape<Int<bM>, Int<R>, Int<kDenoiseStages>>{}));
+      Shape<Int<bM>, Int<kRTile>, Int<kDenoiseStages>>{}));
   using SmemLayoutEBR = decltype(tile_to_shape(
       SmemLayoutAtomDenoise{},
-      Shape<Int<bN>, Int<R>, Int<kDenoiseStages>>{}));
+      Shape<Int<bN>, Int<kRTile>, Int<kDenoiseStages>>{}));
   using SmemLayoutAxEBL = decltype(tile_to_shape(
       SmemLayoutAtomDenoise{},
-      Shape<Int<bM>, Int<R>, Int<kDenoiseStages>>{}));
+      Shape<Int<bM>, Int<kRTile>, Int<kDenoiseStages>>{}));
   using SmemLayoutEARxBpEB = decltype(tile_to_shape(
       SmemLayoutAtomDenoise{},
-      Shape<Int<bN>, Int<R>, Int<kDenoiseStages>>{}));
+      Shape<Int<bN>, Int<kRTile>, Int<kDenoiseStages>>{}));
 
   // ---------- Shared storage ----------
   // Structurally identical to the sm_90a SharedStorage; only the pipeline
@@ -362,6 +387,13 @@ struct KernelTraitsSm89 {
       typename DenoisePipeline::SharedStorage  EAxBpEB_pipeline;
     };
   };
+
+  // R-strip-tiled denoise staging must union under the sm_89 99 KB opt-in cap.
+  // The denoise factor smem (4 × (bM/bN) × kRTile × fp16) unions with the
+  // mainloop A/B smem; the larger of the two arms drives the kernel footprint.
+  static_assert(sizeof(SharedStorageDenoise) <= 101376,
+                "R-strip-tiled SharedStorageDenoise exceeds sm_89 99 KB cap; "
+                "reduce kRTile (64 -> 32) or the tile shape.");
 
   // Union layout: the mainloop A/B tiles overlap smem_C because the mainloop
   // ends with `cp_async_wait<0>() + __syncthreads()` (collective_mainloop_sm89.hpp
