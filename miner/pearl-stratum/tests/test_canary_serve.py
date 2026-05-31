@@ -72,10 +72,14 @@ class _FakeClient:
 class _FakeStdin:
     def __init__(self):
         self.buf = b""
+        self.flushed = 0
         self._closing = False
 
     def write(self, b):
         self.buf += b
+
+    def flush(self):
+        self.flushed += 1
 
     def is_closing(self):
         return self._closing
@@ -207,7 +211,6 @@ def test_serve_on_new_job_writes_job_line():
         stdin = _FakeStdin()
         serve._proc = types.SimpleNamespace(stdin=stdin, stdout=None, stderr=None)
         serve.on_new_job(_Job("job1", H1, target=0x1234))
-        await asyncio.sleep(0)  # let the fire-and-forget drain task run
         return serve, stdin
 
     serve, stdin = asyncio.run(body())
@@ -218,6 +221,8 @@ def test_serve_on_new_job_writes_job_line():
     assert parts[1] == H1, "header must be the 76B job header hex"
     assert parts[2] == (0x1234).to_bytes(32, "big").hex()
     assert H1 in serve._jobs and serve._jobs[H1][0] == "job1"
+    # THE FIX: the JOB line is flushed synchronously (not a fire-and-forget drain)
+    assert stdin.flushed >= 1, "JOB line must be flushed to the pipe"
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +237,103 @@ def test_serve_job_line_helper():
 
 
 def test_serve_remote_argv_has_mode_serve_and_env():
-    remote = run_canary._serve_argv_remote(run_canary.RIG_BIN_PATH, k=4096, dev=0)
+    remote = run_canary._serve_argv_remote(
+        run_canary.RIG_BIN_PATH, k=4096, dev=0, config_hex=run_canary.DEFAULT_CONFIG_HEX)
     assert "mode=serve" in remote
+    assert f"config={run_canary.DEFAULT_CONFIG_HEX}" in remote
     assert "m=131072" in remote and "n=131072" in remote and "k=4096" in remote
     assert "PEARL_SM89_SWIZZLE=2" in remote
     assert run_canary.RIG_BIN_PATH in remote
+
+
+# ---------------------------------------------------------------------------
+# 6) REAL Popen+flush+pipe delivery against a LOCAL fake serve binary.
+#
+# This is the regression test for the actual bug: the asyncio transport pushed
+# JOB lines but never flushed them through to the binary's blocking stdin, so it
+# emitted ZERO HITs. Here we run the ServeLoop's REAL subprocess.Popen + the REAL
+# write+flush in on_new_job against a local fake binary (a python script). If the
+# flush works, the fake binary RECEIVES the JOB lines and emits HITs; the daemon
+# reader thread parses them, maps them to the right job_id, and (on --submit)
+# the mock client's submit_share is called. No GPU, no ssh, no pool.
+# ---------------------------------------------------------------------------
+
+
+_FAKE_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "fake_serve_binary.py")
+
+
+class _LocalServeLoop(run_canary.ServeLoop):
+    """ServeLoop whose persistent process is the LOCAL fake binary, not ssh."""
+
+    def _argv(self):
+        return [sys.executable, _FAKE_BIN]
+
+    def kill_remote_orphans(self):  # no rig to ssh into
+        pass
+
+
+def test_serve_real_popen_flush_delivers_jobs_and_hits():
+    """End-to-end: real Popen + real flush -> fake binary receives JOB lines and
+    emits HITs -> reader thread maps to job_id -> submit_share called."""
+
+    async def body():
+        _install_fake_pearl_mining(verify_ok=True)
+        client = _FakeClient(accepted=False)  # don't stop after first; want 2
+        loop = asyncio.get_event_loop()
+        serve = _LocalServeLoop(
+            mining_config=_MiningConfig(), submit=True, client=client, loop=loop,
+            rig="local", ssh_user="root", bin_path=run_canary.RIG_BIN_PATH, dev=0)
+
+        await serve.start()
+        # Feed two JOBs via the REAL notify path (synchronous write+flush).
+        serve.on_new_job(_Job("job1", H1, target=0x1234))
+        serve.on_new_job(_Job("job2", H2, target=0x5678))
+
+        # Wait (bounded) for the reader thread to marshal both HITs back and for
+        # the async handlers to call submit. Poll the event loop so scheduled
+        # tasks (_handle_hit) actually run.
+        for _ in range(200):  # up to ~2s
+            await asyncio.sleep(0.01)
+            if len(client.submitted) >= 2:
+                break
+
+        await serve.stop()
+        return client
+
+    client = asyncio.run(body())
+    submitted_job_ids = [jid for jid, _b64 in client.submitted]
+    # Both JOB lines were DELIVERED (flush worked) -> binary emitted 2 HITs ->
+    # reader thread mapped each echoed header to the right job_id -> submit.
+    assert len(client.submitted) == 2, (
+        f"expected 2 submitted shares, got {client.submitted!r} "
+        "(if 0: the JOB lines never reached the binary == the original bug)")
+    assert set(submitted_job_ids) == {"job1", "job2"}, submitted_job_ids
+
+
+def test_serve_real_popen_dry_run_delivers_but_no_submit():
+    """Same real delivery, but dry-run: the binary still RECEIVES the JOB and
+    emits a HIT (proving flush delivery), yet nothing is submitted."""
+
+    async def body():
+        _install_fake_pearl_mining(verify_ok=True)
+        client = _FakeClient(accepted=True)
+        loop = asyncio.get_event_loop()
+        serve = _LocalServeLoop(
+            mining_config=_MiningConfig(), submit=False, client=client, loop=loop,
+            rig="local", ssh_user="root", bin_path=run_canary.RIG_BIN_PATH, dev=0)
+
+        await serve.start()
+        serve.on_new_job(_Job("job1", H1, target=0x1234))
+
+        # Wait for the HIT to be processed (the handler logs the dry-run line).
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if H1 in serve._jobs and serve._hits_seen:
+                break
+        await serve.stop()
+        return client, serve
+
+    client, serve = asyncio.run(body())
+    assert serve._hits_seen >= 1, "the fake binary must have received the JOB and HIT-ed"
+    assert client.submitted == [], "dry-run must not submit even though the HIT arrived"

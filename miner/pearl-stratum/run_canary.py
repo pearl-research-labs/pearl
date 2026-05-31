@@ -871,21 +871,32 @@ class ServeLoop:
     before it hits), this loop:
 
       * spawns ONE long-lived `ssh root@<rig> 'env ... <bin> mode=serve ...'`
-        with stdin/stdout pipes kept open for the whole run (asyncio subprocess);
+        via a SYNCHRONOUS `subprocess.Popen` (bufsize=0, unbuffered), keeping
+        stdin/stdout/stderr pipes open for the whole run;
       * on each `mining.notify`, writes a single `JOB <header> <target>` line to
-        the ssh stdin (the binary switches to the newest job, re-derives noise,
-        and keeps mining at full ~1.9 att/s with CUDA initialized ONCE);
-      * async-reads HIT lines from ssh stdout, maps each HIT's echoed `header`
-        back to its job_id, builds + verifies the proof, and (if --submit and
-        verify True) submits immediately. Because the binary always mines the
-        CURRENT header, a HIT is for a ~current job -> accepted (not stale).
+        the ssh stdin and IMMEDIATELY `flush()`es it under a lock — exactly like
+        the proven manual `( printf 'JOB ...'; sleep ) | ssh rig 'binary ...'`
+        bash pipe. The fragile asyncio `proc.stdin.write` + fire-and-forget
+        `create_task(drain)` transport NEVER flushed the JOB bytes through to
+        the remote binary's non-blocking `poll` stdin, so the binary received
+        nothing and emitted zero HITs. A synchronous write+flush fixes that.
+      * a daemon HIT-reader THREAD does a blocking `for line in proc.stdout`,
+        parses each `HIT {...}`, maps its echoed `header` back to the job_id, and
+        marshals a proof-build+verify+submit back onto the event loop (where the
+        async pool client lives) via `loop.call_soon_threadsafe`. Because the
+        binary always mines the CURRENT header, a HIT is for a ~current job ->
+        accepted (not stale).
+      * a daemon stderr-reader THREAD drains the binary's stderr to the logger so
+        `serve: ready` / `serve: new JOB` surface at INFO.
 
-    Exits 0 on the first SHARE ACCEPTED. Kills the ssh + reaps the remote binary
-    on stop / atexit.
+    Exits 0 on the first SHARE ACCEPTED. Kills the ssh proc + reaps the remote
+    binary on stop / atexit.
     """
 
     def __init__(self, *, mining_config, submit, client, loop, rig, ssh_user,
                  bin_path, dev, on_accepted=None):
+        import threading
+
         self.mining_config = mining_config
         self.submit = submit
         self.client = client
@@ -900,13 +911,22 @@ class ServeLoop:
         # ORIGINAL job header in each HIT, so an exact-hex lookup resolves the
         # job_id + the live target + when we received it (staleness).
         self._jobs: dict[str, tuple] = {}
-        self._proc = None  # asyncio subprocess
+        self._proc = None  # synchronous subprocess.Popen
         self.accepted = False
+        self._hits_seen = 0  # HIT lines the reader thread has pulled off stdout
         self._stop = asyncio.Event()
+        # Guards stdin write+flush so the (possible) HIT-thread resubmit path and
+        # the notify path never interleave bytes on the pipe.
+        self._stdin_lock = threading.Lock()
+        self._threads: list = []
 
     # ---- ssh process lifecycle ------------------------------------------
 
-    def _ssh_argv(self) -> list[str]:
+    def _argv(self) -> list[str]:
+        """The full argv for the persistent serve process (ssh + remote cmd).
+
+        Overridable in tests to point at a LOCAL fake serve binary instead of
+        ssh, so the real Popen+flush+pipe delivery is exercised with no rig."""
         k = int(self.mining_config.common_dim)
         remote = _serve_argv_remote(
             self.bin_path, k, self.dev, self.mining_config.to_bytes().hex()
@@ -919,70 +939,99 @@ class ServeLoop:
         ]
 
     async def start(self) -> None:
-        argv = self._ssh_argv()
-        logger.info("serve: spawning persistent ssh pipe: %s", " ".join(argv))
-        self._proc = await asyncio.create_subprocess_exec(
-            *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
-        self.loop.create_task(self._read_stdout())
-        self.loop.create_task(self._drain_stderr())
+        import threading
+
+        argv = self._argv()
+        logger.info("serve: spawning persistent pipe: %s", " ".join(argv))
+        # Synchronous, UNBUFFERED Popen (bufsize=0): a write+flush hits the OS
+        # pipe immediately, mirroring the working bash pipe.
+        self._proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, bufsize=0)
+        t_out = threading.Thread(target=self._read_stdout, name="serve-stdout",
+                                 daemon=True)
+        t_err = threading.Thread(target=self._read_stderr, name="serve-stderr",
+                                 daemon=True)
+        self._threads = [t_out, t_err]
+        t_out.start()
+        t_err.start()
 
     # ---- called from the stratum read loop (event-loop thread) ----------
 
     def on_new_job(self, job) -> None:
-        """Record the job and push a JOB line to the persistent binary."""
+        """Record the job and push a JOB line to the persistent binary.
+
+        Runs on the event-loop thread. The synchronous `stdin.write + flush`
+        under the lock is a quick OS write — safe to call directly here."""
         self._jobs[job.header_bytes.hex()] = (job.job_id, job.target,
                                               __import__("time").time())
         logger.info("NEW JOB job_id=%s height=%s target=%#x header=%s... -> JOB line",
                     job.job_id, job.height, job.target, job.header_bytes.hex()[:32])
+        self._write_job_line(_serve_job_line(job.header_bytes, job.target))
+
+    def _write_job_line(self, line: bytes) -> None:
+        """Synchronous write+flush of one JOB line under the stdin lock.
+
+        THE FIX: explicit `flush()` pushes the bytes to the remote binary's
+        non-blocking `poll` stdin immediately (the old asyncio fire-and-forget
+        drain never reliably did)."""
         proc = self._proc
-        if proc is None or proc.stdin is None or proc.stdin.is_closing():
-            logger.warning("serve: ssh stdin not ready; dropping JOB push")
+        if proc is None or proc.stdin is None:
+            logger.warning("serve: stdin not ready; dropping JOB push")
             return
-        try:
-            proc.stdin.write(_serve_job_line(job.header_bytes, job.target))
-            # fire-and-forget drain (we're on the event loop)
-            self.loop.create_task(self._safe_drain(proc.stdin))
-        except Exception:
-            logger.exception("serve: failed writing JOB line")
+        with self._stdin_lock:
+            try:
+                proc.stdin.write(line)
+                proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                logger.warning("serve: stdin write/flush failed (binary gone?)",
+                               exc_info=True)
 
-    @staticmethod
-    async def _safe_drain(writer) -> None:
-        try:
-            await writer.drain()
-        except Exception:
-            logger.debug("serve: stdin drain raised", exc_info=True)
+    # ---- stdout HIT reader (daemon thread) ------------------------------
 
-    # ---- stdout HIT reader ----------------------------------------------
+    def _read_stdout(self) -> None:
+        """Blocking readline loop on the binary's stdout (own daemon thread).
 
-    async def _read_stdout(self) -> None:
+        Marshals each HIT back to the event loop (where the async pool client
+        lives) via `call_soon_threadsafe`; never touches the loop directly."""
         proc = self._proc
-        assert proc is not None and proc.stdout is not None
-        while not self._stop.is_set():
-            line = await proc.stdout.readline()
-            if not line:
-                logger.warning("serve: ssh stdout EOF (binary exited?)")
+        if proc is None or proc.stdout is None:
+            return
+        for raw in iter(proc.stdout.readline, b""):
+            if self._stop.is_set() or self.accepted:
                 break
-            text = line.decode(errors="replace").strip()
+            text = raw.decode(errors="replace").strip()
             if not text.startswith("HIT"):
                 continue
-            try:
-                await self._handle_hit(text)
-            except Exception:
-                logger.exception("serve: error handling HIT line")
-            if self.accepted:
-                break
+            self._hits_seen += 1
+            # Hand the HIT to the event loop: the proof-build/verify/submit path
+            # uses the asyncio pool client and must run there.
+            self.loop.call_soon_threadsafe(self._schedule_hit, text)
+        else:
+            logger.warning("serve: stdout EOF (binary exited?)")
 
-    async def _drain_stderr(self) -> None:
+    def _schedule_hit(self, text: str) -> None:
+        """(event-loop thread) launch the async HIT handler as a task."""
+        self.loop.create_task(self._handle_hit_guarded(text))
+
+    async def _handle_hit_guarded(self, text: str) -> None:
+        try:
+            await self._handle_hit(text)
+        except Exception:
+            logger.exception("serve: error handling HIT line")
+
+    def _read_stderr(self) -> None:
+        """Drain the binary's stderr to the logger (own daemon thread) so
+        `serve: ready` / `serve: new JOB` are visible at INFO."""
         proc = self._proc
         if proc is None or proc.stderr is None:
             return
-        while not self._stop.is_set():
-            line = await proc.stderr.readline()
-            if not line:
+        for raw in iter(proc.stderr.readline, b""):
+            if self._stop.is_set():
                 break
-            logger.debug("serve[binary]: %s",
-                         line.decode(errors="replace").rstrip())
+            msg = raw.decode(errors="replace").rstrip()
+            if msg:
+                logger.info("serve[binary]: %s", msg)
 
     async def _handle_hit(self, text: str) -> None:
         import json
@@ -1048,7 +1097,7 @@ class ServeLoop:
         proc = self._proc
         if proc is not None:
             try:
-                if proc.stdin is not None and not proc.stdin.is_closing():
+                if proc.stdin is not None:
                     proc.stdin.close()  # EOF -> binary exits cleanly
             except Exception:
                 pass
