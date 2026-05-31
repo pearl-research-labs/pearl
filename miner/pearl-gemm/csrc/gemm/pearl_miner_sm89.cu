@@ -23,11 +23,17 @@
 //            hardware. Self-checks job_key/seeds/gpu_hash on the host first.
 //   mine   : iterate nonce in [nonce_start, nonce_start+nonce_count); return on
 //            the first hit (target cleared) or after the range is exhausted.
+//   bench  : run a FIXED nonce_count of full attempts at the given shape and do
+//            NOT return on a hit. CUDA init + buffer alloc happen ONCE, then the
+//            attempt loop is timed; prints attempts/sec + tmac_s (same MAC
+//            formula as bench_sm89_pouw_re2). This measures the miner's real
+//            steady-state attempt rate (vs mine-mode which returns on first hit).
 //
 // I/O contract (stdin/argv JSON-ish key=value, keeps it dep-free):
-//   header=<hex 76B>  config=<hex 52B>  target=<hex 64 chars, LE uint256>
+//   header=<hex 76B>  config=<hex 52B>  target=<hex 64 chars, BIG-endian uint256>
+//   target_endian=big|little (default big = pool/human MSB-first convention)
 //   m=<int> n=<int> k=<int> r=256  nonce_start=<u64> nonce_count=<u64>
-//   mode=verify|mine  dev=<int>
+//   mode=verify|mine|bench  dev=<int>
 // On a hit, prints a single line:
 //   HIT {"nonce":N,"tile":[ix,iy],"a_rows":[...8...],"b_cols":[...16...],
 //        "transcript":["%08x"...16...],"gpu_hash":"<64hex>","seed":N}
@@ -48,6 +54,7 @@
 #include <string>
 #include <vector>
 #include <random>
+#include <chrono>
 
 #include "pearl_miner_host.hpp"
 #include "host_signal_header.hpp"
@@ -121,6 +128,7 @@ static const int CP[16] = {0, 1, 32, 33, 64, 65, 96, 97,
 struct Args {
   std::string header_hex, config_hex, target_hex, mode = "mine";
   std::string aroot_hex, broot_hex;  // optional: real A/B merkle roots (hash_a/hash_b)
+  std::string target_endian = "big";  // "big" (pool/human, MSB-first) or "little"
   int m = 131072, n = 131072, k = 4096, r = 256, dev = 0;
   uint64_t nonce_start = 0, nonce_count = 1;
 };
@@ -144,6 +152,7 @@ static void parse_kv(const std::string& tok, Args& a) {
   if (k == "header") a.header_hex = v;
   else if (k == "config") a.config_hex = v;
   else if (k == "target") a.target_hex = v;
+  else if (k == "target_endian") a.target_endian = v;
   else if (k == "aroot") a.aroot_hex = v;
   else if (k == "broot") a.broot_hex = v;
   else if (k == "mode") a.mode = v;
@@ -523,8 +532,30 @@ int main(int argc, char** argv) {
   if (!from_hex(a.config_hex, config) || config.size() != 52) {
     fprintf(stderr, "bad config (need 52B hex)\n"); return 1;
   }
-  target_le.assign(32, 0xFF);  // default easiest
-  if (!a.target_hex.empty()) { if (!from_hex(a.target_hex, target_le) || target_le.size() != 32) { fprintf(stderr, "bad target (need 64hex LE)\n"); return 1; } }
+  // --- target -> 32 LE bytes for the device `pow_target` ---------------------
+  // The wire/pool and human convention is BIG-ENDIAN hex (MSB-first): the same
+  // 256-bit threshold parse_target_hex(... big_endian=True) yields, i.e. the
+  // integer T = int.from_bytes(hex, "big"). The authoritative on-device /
+  // verify_plain_proof comparison is `int.from_bytes(blake3_digest, "little") <= T`.
+  // The device kernel reads pow_target as uint32[8] words where word 0 is the
+  // LEAST-significant word (matching the LE digest word order). So we must hand
+  // it T serialized LITTLE-endian: target_le[0] = LSByte(T). We therefore parse
+  // the hex bytes in the requested endianness, normalize to the integer T, then
+  // re-emit T as 32 LE bytes. (target_endian=little keeps the legacy raw-LE
+  // contract for callers that already pass LE hex.)
+  //   target=00..01  (big-endian)  -> T = 1            -> hardest non-zero -> NOHIT
+  //   target=ff..ff                 -> T = 2^256 - 1    -> easiest          -> HIT
+  target_le.assign(32, 0xFF);  // default easiest (T = 2^256 - 1)
+  if (!a.target_hex.empty()) {
+    std::vector<uint8_t> traw;
+    if (!from_hex(a.target_hex, traw) || traw.size() != 32) {
+      fprintf(stderr, "bad target (need 64 hex chars)\n"); return 1;
+    }
+    bool big = (a.target_endian != "little");
+    // traw is MSB-first when big-endian. Re-emit T as little-endian bytes.
+    for (int i = 0; i < 32; ++i)
+      target_le[i] = big ? traw[31 - i] : traw[i];
+  }
   std::vector<uint8_t> aroot, broot;
   if (!a.aroot_hex.empty()) { if (!from_hex(a.aroot_hex, aroot) || aroot.size() != 32) { fprintf(stderr, "bad aroot (need 64hex)\n"); return 1; } }
   if (!a.broot_hex.empty()) { if (!from_hex(a.broot_hex, broot) || broot.size() != 32) { fprintf(stderr, "bad broot (need 64hex)\n"); return 1; } }
@@ -534,9 +565,62 @@ int main(int argc, char** argv) {
   fprintf(stderr, "pearl_miner_sm89 dev%d %s sm_%d%d  mode=%s M=%d N=%d K=%d R=%d\n",
           a.dev, p.name, p.major, p.minor, a.mode.c_str(), a.m, a.n, a.k, a.r);
 
+  // bench-mode runs the same fully-on-device attempt as mine-mode (no host
+  // operand materialization, no (M,N) C buffer) so the measured rate reflects
+  // the production mine path.
+  bool on_device = (a.mode == "mine" || a.mode == "bench");
   GpuBufs g;
-  alloc_bufs(g, a.m, a.n, a.k, /*mine=*/a.mode == "mine");
+  alloc_bufs(g, a.m, a.n, a.k, /*mine=*/on_device);
   CUCHK(cudaMemcpy(g.dTarget, target_le.data(), 32, cudaMemcpyHostToDevice));
+
+  // -------------------------------------------------------------------------
+  // bench-mode: fixed nonce_count of full attempts, no early return. CUDA init
+  // + alloc already amortized above. Time the attempt loop and report the rate.
+  // -------------------------------------------------------------------------
+  if (a.mode == "bench") {
+    uint64_t bcount = a.nonce_count ? a.nonce_count : 1;
+    std::vector<uint8_t> bheader = header;
+    // one warm-up attempt (first launch pays JIT/module-load + caches) — not timed.
+    {
+      Seeds s;
+      pearl_miner::blake3::hash_concat(bheader.data(), bheader.size(),
+                                       config.data(), config.size(), nullptr, s.job_key);
+      pearl_miner::blake3::hash_concat(s.job_key, 32, s.job_key, 32, nullptr, s.b_noise_seed);
+      pearl_miner::blake3::hash_concat(s.b_noise_seed, 32, s.job_key, 32, nullptr, s.a_noise_seed);
+      uint32_t ix=0, iy=0;
+      run_attempt(g, s, a.m, a.n, a.k, /*ab_seed=*/0xABCDEF, &ix, &iy);
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    uint64_t hits = 0;
+    for (uint64_t i = 0; i < bcount; ++i) {
+      uint64_t nonce = a.nonce_start + i;
+      bheader[72] = (uint8_t)(nonce);       bheader[73] = (uint8_t)(nonce >> 8);
+      bheader[74] = (uint8_t)(nonce >> 16); bheader[75] = (uint8_t)(nonce >> 24);
+      Seeds s;
+      pearl_miner::blake3::hash_concat(bheader.data(), bheader.size(),
+                                       config.data(), config.size(), nullptr, s.job_key);
+      pearl_miner::blake3::hash_concat(s.job_key, 32, s.job_key, 32, nullptr, s.b_noise_seed);
+      pearl_miner::blake3::hash_concat(s.b_noise_seed, 32, s.job_key, 32, nullptr, s.a_noise_seed);
+      uint64_t ab_seed = nonce * 0x100000001B3ULL + 0xCBF29CE484222325ULL;
+      uint32_t ix=0, iy=0;
+      hits += run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+    double avg = secs / (double)bcount;
+    double att_s = (double)bcount / secs;
+    // MAC formula matches bench_sm89_pouw_re2:
+    //   total = 2*K*R*(M+N) + M*N*(K+2*R)
+    long double M = a.m, N = a.n, K = a.k, R = a.r;
+    long double total = 2.0L*K*R*(M+N) + M*N*(K + 2.0L*R);
+    double tmac_s = (double)(total / (long double)avg / 1e12L);
+    printf("BENCH {\"attempts\":%llu,\"hits\":%llu,\"seconds\":%.6f,"
+           "\"avg_attempt_sec\":%.6f,\"attempts_per_sec\":%.4f,\"tmac_s\":%.3f,"
+           "\"m\":%d,\"n\":%d,\"k\":%d,\"r\":%d}\n",
+           (unsigned long long)bcount, (unsigned long long)hits, secs, avg,
+           att_s, tmac_s, a.m, a.n, a.k, a.r);
+    return 0;
+  }
 
   auto print_hit = [&](uint64_t nonce, uint64_t ab_seed, uint32_t ix, uint32_t iy,
                        const int* a_rows, const int* b_cols,

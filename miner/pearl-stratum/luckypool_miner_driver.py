@@ -181,10 +181,13 @@ def gpu_sm89_mine(
     k = int(mining_config.common_dim)
     r = int(getattr(mining_config, "rank", 256))
 
-    target_le_hex = int(target).to_bytes(32, "little").hex()
+    # The standalone binary parses `target=` as big-endian (MSB-first), the same
+    # human/pool convention parse_target_hex uses; it converts to the kernel's
+    # little-endian pow_target words internally.
+    target_be_hex = int(target).to_bytes(32, "big").hex()
     args = (
         f"header={header_bytes.hex()} config={mining_config.to_bytes().hex()} "
-        f"target={target_le_hex} mode=mine m={m} n={n} k={k} r={r} "
+        f"target={target_be_hex} mode=mine m={m} n={n} k={k} r={r} "
         f"nonce_start={nonce_range.start} "
         f"nonce_count={max(1, len(nonce_range))} dev={os.environ.get('PEARL_GPU_DEV', '0')}"
     )
