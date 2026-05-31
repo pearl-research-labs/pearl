@@ -89,9 +89,17 @@ GPU_ENV = {
 }
 RIG_BIN_PATH = "/tmp/pearl_miner_sm89_sm89"
 
-# Per-call GPU nonce window; the driver walks successive windows until HIT or a
-# new job arrives.
-NONCE_WINDOW = 1 << 20
+# Per-call GPU nonce window. LuckyPool rotates jobs every ~7s, so each mine call
+# must return FAST: the binary returns on the first HIT, else NOHIT once the
+# window is exhausted. A small window keeps the mine-loop responsive so a new
+# `mining.notify` can preempt the in-flight job within ~1 window. The mine loop
+# advances the nonce cursor across successive windows for the SAME job.
+NONCE_WINDOW = 32
+
+# Per-mine-attempt subprocess timeout. Sized so one short window comfortably
+# completes on a ~130 TH/s rig (which clears tens of attempts/window in well
+# under this) while still bounding a wedged ssh/binary.
+MINE_TIMEOUT_S = 25.0
 
 
 # ---------------------------------------------------------------------------
@@ -194,24 +202,107 @@ def _parse_gpu_output(out: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
-class SshRigBackend:
-    """Offload GPU mining to a rig over SSH; serialize+verify on THIS box.
+class _SubprocessMineBackend:
+    """Shared base for the ssh-rig and local subprocess backends.
 
-    Maintains a rolling nonce cursor so successive calls (same job) walk
-    forward; the driver resets the cursor when a new job arrives.
+    Each call runs the GPU binary for ONE short nonce window via `Popen` so the
+    in-flight process can be KILLED the instant a newer job arrives (see
+    `cancel()`). The mine loop owns the nonce cursor — it passes an explicit
+    `nonce_start`/`nonce_count` per window so we don't keep stale per-job state
+    here.
     """
 
-    def __init__(self, rig: str, dev: int = 0, ssh_user: str = "root",
-                 timeout_s: float = 120.0, bin_path: str = RIG_BIN_PATH):
-        self.rig = rig
+    def __init__(self, dev: int = 0, timeout_s: float = MINE_TIMEOUT_S):
         self.dev = dev
-        self.ssh_user = ssh_user
         self.timeout_s = timeout_s
-        self.bin_path = bin_path
-        self._cursor = 0
-        self._cursor_job: Optional[str] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._proc_lock = __import__("threading").Lock()
+        self._cancelled = False
 
-    def _ssh_argv(self) -> list[str]:
+    # ---- cancellation ----------------------------------------------------
+
+    def cancel(self) -> None:
+        """Kill any in-flight mine subprocess (called from the notify handler
+        on the event loop thread when a new job preempts the current one)."""
+        with self._proc_lock:
+            self._cancelled = True
+            proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                logger.debug("backend cancel: proc.kill raised", exc_info=True)
+
+    def reset_cancel(self) -> None:
+        """Clear the cancel flag before starting a window for a fresh job."""
+        with self._proc_lock:
+            self._cancelled = False
+
+    def _argv(self) -> list[str]:
+        raise NotImplementedError
+
+    def _popen_kwargs(self) -> dict:
+        return {}
+
+    def _run_window(self, header_bytes: bytes, mining_config, target: int,
+                    nonce_start: int, nonce_count: int) -> Optional[bytes]:
+        stdin = _gpu_stdin(header_bytes, mining_config, target, nonce_start,
+                           nonce_count, dev=self.dev)
+        argv = self._argv()
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, **self._popen_kwargs())
+        with self._proc_lock:
+            if self._cancelled:
+                # Preempted between the cancel() call and starting this window.
+                proc.kill()
+                self._proc = None
+                return None
+            self._proc = proc
+        try:
+            out_b, err_b = proc.communicate(input=stdin, timeout=self.timeout_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            logger.warning("mine window timed out after %.0fs", self.timeout_s)
+            return None
+        finally:
+            with self._proc_lock:
+                self._proc = None
+        if self._cancelled:
+            return None
+        out = out_b.decode(errors="replace")
+        if proc.returncode != 0 and not out.strip().startswith(("HIT", "NOHIT")):
+            logger.warning("mine nonzero rc=%d stderr=%s",
+                           proc.returncode, err_b.decode(errors="replace")[-400:])
+            return None
+        hit = _parse_gpu_output(out)
+        if hit is None:
+            logger.info("NOHIT (window exhausted)")
+            return None
+        return _build_proof_from_hit(hit, header_bytes, mining_config)
+
+    def __call__(self, header_bytes: bytes, mining_config, target: int,
+                 nonce_range: range, job_id: Optional[str] = None) -> Optional[bytes]:
+        nonce_start = nonce_range.start
+        nonce_count = len(nonce_range)
+        logger.info("mine window: nonce=[%d,+%d) job=%s",
+                    nonce_start, nonce_count, job_id)
+        return self._run_window(header_bytes, mining_config, target,
+                                nonce_start, nonce_count)
+
+
+class SshRigBackend(_SubprocessMineBackend):
+    """Offload GPU mining to a rig over SSH; serialize+verify on THIS box."""
+
+    def __init__(self, rig: str, dev: int = 0, ssh_user: str = "root",
+                 timeout_s: float = MINE_TIMEOUT_S, bin_path: str = RIG_BIN_PATH):
+        super().__init__(dev=dev, timeout_s=timeout_s)
+        self.rig = rig
+        self.ssh_user = ssh_user
+        self.bin_path = bin_path
+
+    def _argv(self) -> list[str]:
         env_prefix = " ".join(f"{k}={v}" for k, v in GPU_ENV.items())
         remote = f"env {env_prefix} {self.bin_path}"
         return [
@@ -222,63 +313,23 @@ class SshRigBackend:
             remote,
         ]
 
-    def __call__(self, header_bytes: bytes, mining_config, target: int,
-                 nonce_range: range, job_id: Optional[str] = None) -> Optional[bytes]:
-        if job_id != self._cursor_job:
-            self._cursor = 0
-            self._cursor_job = job_id
-        nonce_start = self._cursor
-        nonce_count = NONCE_WINDOW
-        self._cursor += nonce_count
 
-        stdin = _gpu_stdin(header_bytes, mining_config, target, nonce_start,
-                           nonce_count, dev=self.dev)
-        argv = self._ssh_argv()
-        logger.info("ssh-rig mine: %s nonce=[%d,+%d) job=%s",
-                    self.rig, nonce_start, nonce_count, job_id)
-        proc = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, timeout=self.timeout_s)
-        out = proc.stdout.decode(errors="replace")
-        if proc.returncode != 0 and not out.strip().startswith(("HIT", "NOHIT")):
-            logger.warning("ssh-rig nonzero rc=%d stderr=%s",
-                           proc.returncode, proc.stderr.decode(errors="replace")[-400:])
-            return None
-        hit = _parse_gpu_output(out)
-        if hit is None:
-            logger.info("ssh-rig NOHIT (window exhausted)")
-            return None
-        return _build_proof_from_hit(hit, header_bytes, mining_config)
-
-
-class LocalGpuBackend:
+class LocalGpuBackend(_SubprocessMineBackend):
     """Run the GPU binary on THIS box ($PEARL_MINER_SM89_BIN). Same hit->proof."""
 
-    def __init__(self, dev: int = 0, timeout_s: float = 120.0,
+    def __init__(self, dev: int = 0, timeout_s: float = MINE_TIMEOUT_S,
                  bin_path: Optional[str] = None):
-        self.dev = dev
-        self.timeout_s = timeout_s
+        super().__init__(dev=dev, timeout_s=timeout_s)
         self.bin_path = bin_path or os.environ.get(
             "PEARL_MINER_SM89_BIN", "/opt/pearl/pearl_miner_sm89")
-        self._cursor = 0
-        self._cursor_job: Optional[str] = None
 
-    def __call__(self, header_bytes: bytes, mining_config, target: int,
-                 nonce_range: range, job_id: Optional[str] = None) -> Optional[bytes]:
-        if job_id != self._cursor_job:
-            self._cursor = 0
-            self._cursor_job = job_id
-        nonce_start = self._cursor
-        self._cursor += NONCE_WINDOW
-        stdin = _gpu_stdin(header_bytes, mining_config, target, nonce_start,
-                           NONCE_WINDOW, dev=self.dev)
+    def _argv(self) -> list[str]:
+        return [self.bin_path]
+
+    def _popen_kwargs(self) -> dict:
         env = dict(os.environ)
         env.update(GPU_ENV)
-        proc = subprocess.run([self.bin_path], input=stdin, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, timeout=self.timeout_s, env=env)
-        hit = _parse_gpu_output(proc.stdout.decode(errors="replace"))
-        if hit is None:
-            return None
-        return _build_proof_from_hit(hit, header_bytes, mining_config)
+        return {"env": env}
 
 
 class RustCpuBackend:
@@ -322,30 +373,42 @@ def make_backend(name: str, args: argparse.Namespace):
 
 
 def handle_job(job, *, mining_config, backend, submit: bool,
-               client=None, loop=None) -> dict:
-    """Mine one job: returns a result dict (verify bool, submitted, accepted).
+               client=None, loop=None, nonce_range: Optional[range] = None,
+               is_current=None) -> dict:
+    """Mine ONE nonce window of `job`: returns a result dict.
 
-    Iterates the backend across nonce windows until a verifying proof is found,
-    a None (window exhausted) is returned, or the job changes. Pure-sync; the
-    async driver runs this in a thread. `client`/`loop` are only needed when
-    submit=True (the submit is dispatched back onto the event loop).
+    Runs a single short window through the backend, then (on HIT) verifies and
+    optionally submits. Pure-sync; the driver runs it in a thread. The caller
+    (the live mine loop) advances `nonce_range` across windows for the same job
+    and preempts in-flight windows by calling `backend.cancel()` on a new job.
+
+    `is_current(job_id) -> bool` is the staleness guard: it is checked AFTER the
+    (potentially slow) proof build / verify and BEFORE submit, so a share whose
+    job rotated mid-proof is dropped ("stale, skipping submit") instead of being
+    submitted late. `client`/`loop` are only needed when submit=True.
     """
     import pearl_mining as pm
 
+    if nonce_range is None:
+        nonce_range = range(0, NONCE_WINDOW)
+    if is_current is None:
+        def is_current(_job_id):  # default: always current (selftest path)
+            return True
+
     bh = pm.IncompleteBlockHeader.from_bytes(job.header_bytes)
     result = {"job_id": job.job_id, "verify": None, "submitted": False,
-              "accepted": None, "error": None}
+              "accepted": None, "error": None, "stale": False}
 
     try:
         proof_bytes = backend(job.header_bytes, mining_config, job.target,
-                              range(0, NONCE_WINDOW), job_id=job.job_id)
+                              nonce_range, job_id=job.job_id)
     except Exception as e:
         logger.exception("mining backend raised")
         result["error"] = f"backend: {e}"
         return result
 
     if proof_bytes is None:
-        logger.info("job %s: NOHIT this attempt", job.job_id)
+        logger.info("job %s: NOHIT this window", job.job_id)
         return result
 
     proof = pm.PlainProof.from_base64(base64.b64encode(proof_bytes).decode())
@@ -358,6 +421,14 @@ def handle_job(job, *, mining_config, backend, submit: bool,
         # is also how a stale/mismatched mining_config surfaces — verify fails
         # BEFORE we burn a submit slot.
         logger.error("job %s: NOT submitting (verify failed): %s", job.job_id, msg)
+        return result
+
+    # Staleness guard: a HIT for a job that has since rotated is worthless — the
+    # pool rejects a stale job_id. Drop it rather than submit late.
+    if not is_current(job.job_id):
+        logger.warning("job %s: HIT but job rotated during proof-build — "
+                       "stale, skipping submit", job.job_id)
+        result["stale"] = True
         return result
 
     b64 = base64.b64encode(proof_bytes).decode()
@@ -385,6 +456,124 @@ def handle_job(job, *, mining_config, backend, submit: bool,
 
 
 # ---------------------------------------------------------------------------
+# Live mine loop (preemptive: current-job mining with new-job preemption)
+# ---------------------------------------------------------------------------
+
+
+class CanaryMineLoop:
+    """Drives the GPU backend against the CURRENT LuckyPool job, preemptively.
+
+    A single background asyncio task runs short nonce windows against whatever
+    `self._job` currently is. The stratum `on_new_job` callback (event-loop
+    thread) just sets the new job, bumps `self._gen`, and `cancel()`s the
+    in-flight backend subprocess so the GPU drops the stale job and restarts on
+    the fresh one within ~one window. Results from an OLD generation are
+    discarded; a HIT is only submitted if its job is STILL current.
+
+    Lifecycle per window:
+      1. snapshot (job, gen) under the lock
+      2. run ONE short window in a worker thread (handle_job)
+      3. if gen changed mid-window -> drop the result (stale)
+      4. else: HIT -> verify -> (is_current guard) -> submit; NOHIT -> advance
+         the nonce cursor and loop.
+    """
+
+    def __init__(self, *, mining_config, backend, submit: bool, client, loop,
+                 window: int = NONCE_WINDOW):
+        self.mining_config = mining_config
+        self.backend = backend
+        self.submit = submit
+        self.client = client
+        self.loop = loop
+        self.window = window
+
+        self._job = None
+        self._gen = 0
+        self._cursor = 0
+        self._job_ready = asyncio.Event()
+        self._stop = asyncio.Event()
+
+    # ---- called from the stratum read loop (event-loop thread) ----------
+
+    def on_new_job(self, job) -> None:
+        logger.info("NEW JOB job_id=%s height=%s target=%#x header=%s... (gen->%d)",
+                    job.job_id, job.height, job.target,
+                    job.header_bytes.hex()[:32], self._gen + 1)
+        self._job = job
+        self._gen += 1
+        self._cursor = 0
+        # Drop the GPU's in-flight stale window so it restarts on the fresh job.
+        cancel = getattr(self.backend, "cancel", None)
+        if cancel is not None:
+            cancel()
+        self._job_ready.set()
+
+    def current_gen(self) -> int:
+        return self._gen
+
+    def is_current(self, gen: int):
+        """Return a predicate(job_id)->bool that is True iff `gen` is still the
+        live generation (job_id is accepted for log symmetry)."""
+        return lambda _job_id: self._gen == gen
+
+    # ---- the background mine loop ---------------------------------------
+
+    async def run(self) -> None:
+        while not self._stop.is_set():
+            if self._job is None:
+                # Wait for the first job (or stop).
+                await self._wait_job_or_stop()
+                continue
+
+            job = self._job
+            gen = self._gen
+            nonce_range = range(self._cursor, self._cursor + self.window)
+
+            reset = getattr(self.backend, "reset_cancel", None)
+            if reset is not None:
+                reset()
+
+            res = await asyncio.to_thread(
+                handle_job, job, mining_config=self.mining_config,
+                backend=self.backend, submit=self.submit,
+                client=self.client, loop=self.loop,
+                nonce_range=nonce_range, is_current=self.is_current(gen))
+
+            if gen != self._gen:
+                # A new job arrived during this window; the backend was
+                # cancelled and on_new_job already reset self._cursor to 0 for
+                # the new job. Drop whatever came back and re-loop on it.
+                logger.info("window for job %s gen=%d superseded by gen=%d — dropped",
+                            job.job_id, gen, self._gen)
+                continue
+
+            # Still the current job (HIT submitted/verified, NOHIT, or a stale
+            # drop that raced just under the gen check): advance the nonce
+            # cursor and keep mining successive windows of the SAME job until it
+            # rotates.
+            self._cursor += self.window
+
+    async def _wait_job_or_stop(self) -> None:
+        stop_task = asyncio.ensure_future(self._stop.wait())
+        job_task = asyncio.ensure_future(self._job_ready.wait())
+        try:
+            await asyncio.wait({stop_task, job_task},
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (stop_task, job_task):
+                if not t.done():
+                    t.cancel()
+        self._job_ready.clear()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._job_ready.set()
+        cancel = getattr(self.backend, "cancel", None)
+        if cancel is not None:
+            cancel()
+
+
+# ---------------------------------------------------------------------------
 # Live runner
 # ---------------------------------------------------------------------------
 
@@ -392,28 +581,33 @@ def handle_job(job, *, mining_config, backend, submit: bool,
 async def run_live(args) -> int:
     import pearl_mining as pm
 
-    from pearl_stratum.luckypool_client import LuckyPoolStratumClient, LuckyPoolJob
+    from pearl_stratum.luckypool_client import LuckyPoolStratumClient
 
     mining_config = pm.MiningConfiguration.from_bytes(bytes.fromhex(args.config_hex))
     backend = make_backend(args.backend, args)
     loop = asyncio.get_running_loop()
     box: dict = {}
 
-    def on_new_job(job: "LuckyPoolJob") -> None:
-        logger.info("NEW JOB job_id=%s height=%s target=%#x header=%s...",
-                    job.job_id, job.height, job.target, job.header_bytes.hex()[:32])
-        loop.create_task(asyncio.to_thread(
-            handle_job, job, mining_config=mining_config, backend=backend,
-            submit=args.submit, client=box.get("client"), loop=loop))
+    mine_loop = CanaryMineLoop(
+        mining_config=mining_config, backend=backend, submit=args.submit,
+        client=None, loop=loop)
 
     client = LuckyPoolStratumClient(
         host=args.host, port=args.port, wallet=args.wallet, worker=args.worker,
-        agent=args.agent, on_new_job=on_new_job)
+        agent=args.agent, on_new_job=mine_loop.on_new_job)
     box["client"] = client
+    mine_loop.client = client
+
     mode = "SUBMIT" if args.submit else "DRY-RUN (no submit)"
     logger.info("Canary starting: pool=%s:%d backend=%s mode=%s wallet=%s worker=%s",
                 args.host, args.port, args.backend, mode, args.wallet, args.worker)
-    return await client.run()
+
+    mine_task = loop.create_task(mine_loop.run())
+    try:
+        return await client.run()
+    finally:
+        mine_loop.stop()
+        mine_task.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -490,8 +684,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rig", help="rig host/IP for --backend ssh-rig (e.g. 192.168.70.6)")
     p.add_argument("--ssh-user", default="root")
     p.add_argument("--dev", type=int, default=0, help="GPU device index on the rig")
-    p.add_argument("--mine-timeout", type=float, default=120.0,
-                   help="per-mine-attempt timeout seconds")
+    p.add_argument("--mine-timeout", type=float, default=MINE_TIMEOUT_S,
+                   help="per-mine-window subprocess timeout seconds (short, so a "
+                        "new job can preempt the in-flight window)")
 
     p.add_argument("--host", default="pearl-ca1.luckypool.io")
     p.add_argument("--port", type=int, default=3360)
