@@ -55,15 +55,15 @@ __global__ void chunk_cvs_kernel(const uint8_t* __restrict__ data, uint32_t n_ch
   uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_chunks) return;
   uint32_t cv[8] = {k0, k1, k2, k3, k4, k5, k6, k7};
-  const uint8_t* p = data + (size_t)c * 1024;
+  // 1024B chunk is 1024-aligned (cudaMalloc) so read message words as aligned
+  // little-endian uint32 via the read-only cache (4x fewer loads than byte-wise;
+  // GPU is LE so a uint32 load == the byte-assembled word).
+  const uint32_t* pw = reinterpret_cast<const uint32_t*>(data + (size_t)c * 1024);
 #pragma unroll 1
   for (int b = 0; b < 16; ++b) {
     uint32_t m[16];
 #pragma unroll
-    for (int w = 0; w < 16; ++w) {
-      const uint8_t* q = p + b * 64 + w * 4;
-      m[w] = (uint32_t)q[0] | ((uint32_t)q[1] << 8) | ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
-    }
+    for (int w = 0; w < 16; ++w) m[w] = __ldg(pw + b * 16 + w);
     uint32_t flags = KEYED_HASH | (b == 0 ? CHUNK_START : 0) | (b == 15 ? CHUNK_END : 0);
     uint32_t out[8];
     compress(cv, m, (uint64_t)c, 64, flags, out);
