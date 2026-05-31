@@ -336,8 +336,17 @@ struct KernelTraitsSm89 {
   // SharedStorage stays under the cap (measured 100352 B incl. scales +
   // pipelines). Falls back to 32 if 64 is too tight for a given tile (guarded
   // by the SharedStorage static_assert below).
+  // kRTile may be overridden at build time (PEARL_SM89_KRTILE) for tuning the
+  // denoise R-strip count: a larger strip means fewer __syncthreads in the
+  // denoise loop (kNumRStrips = R/kRTile) but a larger staged smem footprint
+  // (4*(bM+bN)*kRTile*2 B), which must stay under the 99 KB cap (checked by the
+  // SharedStorageDenoise static_assert below).
+#ifdef PEARL_SM89_KRTILE
+  static constexpr int kRTile = PEARL_SM89_KRTILE;
+#else
   static constexpr int kRTile = (R % 64 == 0) ? 64 : 32;
-  static_assert(R % kRTile == 0, "R must be a multiple of kRTile (64 or 32).");
+#endif
+  static_assert(R % kRTile == 0, "R must be a multiple of kRTile.");
   static_assert(kRTile % 16 == 0, "kRTile must be a multiple of the denoise MMA k-dim (16).");
   static constexpr int kNumRStrips = R / kRTile;
 
