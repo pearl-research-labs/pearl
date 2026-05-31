@@ -273,11 +273,43 @@ static void alloc_bufs(GpuBufs& g, int M, int N, int K, bool mine) {
 //       R-half survived. Chaining the output->input fixes that.)
 //   4. zero the four fp16 denoise factors (they don't enter the transcript/PoW),
 //      then launch the no-C-store PoW kernel.
+// ---- optional per-phase profiling (PEARL_MINER_PROFILE=1) ----
+// Times the 4 phase groups of run_attempt_mine with cudaEvents. Each phase is
+// bracketed by a device sync (via the events) so the reported ms isolate that
+// phase; this adds syncs that are NOT present in production timing, so it is
+// gated behind the env flag and off by default.
+struct PhaseProf {
+  bool on=false;
+  static constexpr int NE = 7;
+  cudaEvent_t e[NE];  // e[0]=start, e[1..6]=after phases 1..6
+  PhaseProf() {
+    const char* v = std::getenv("PEARL_MINER_PROFILE");
+    on = (v && v[0] && v[0] != '0');
+    if (on) for (int i = 0; i < NE; ++i) CUCHK(cudaEventCreate(&e[i]));
+  }
+  void mark(int i) { if (on) CUCHK(cudaEventRecord(e[i], 0)); }
+  void report() {
+    if (!on) return;
+    CUCHK(cudaEventSynchronize(e[NE-1]));
+    const char* names[6] = {"fill_AB", "noisegen", "split_rmajor",
+                            "noisingAB", "memset_fp16", "PoW_kernel"};
+    float tot = 0;
+    for (int i = 0; i < 6; ++i) {
+      float ms = 0; CUCHK(cudaEventElapsedTime(&ms, e[i], e[i+1])); tot += ms;
+      fprintf(stderr, "PROFILE phase%d %-13s %9.3f ms\n", i+1, names[i], ms);
+    }
+    fprintf(stderr, "PROFILE total %25.3f ms\n", tot);
+  }
+};
+
 static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
                             uint64_t ab_seed, uint32_t* tile_ix, uint32_t* tile_iy) {
+  PhaseProf prof;
+  prof.mark(0);
   // 1. seed-derived A/B on device.
   pearl_miner_fill_AB_sm89(g.dA, size_t(M)*K, ab_seed, 0);
   pearl_miner_fill_AB_sm89(g.dB, size_t(N)*K, ab_seed ^ 0xD1B54A32D192ED03ULL, 0);
+  prof.mark(1);
 
   // 2. on-device noise factors (R=256) from a/b_noise_seed.
   CUCHK(cudaMemcpy(g.dKeyA, s.a_noise_seed, 32, cudaMemcpyHostToDevice));
@@ -285,6 +317,7 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
   pearl_miner_noisegen_sm89_R256(
       g.dEAL_i8, g.dEBR_i8, g.dEAR_R, g.dEAR_K, g.dEBL_R, g.dEBL_K,
       g.dKeyA, g.dKeyB, M, N, K, 0);
+  prof.mark(2);
 
   // 2b. Repack the R-major factors (EAL/EAR for A, EBR/EBL for B) into two
   //     contiguous (rows,128) R-halves. The R=128 noising kernel hard-codes
@@ -295,6 +328,7 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
   pearl_miner_split_rmajor_256_sm89(g.dEAR_R,  g.dEAR_h[0], g.dEAR_h[1], K, 0);
   pearl_miner_split_rmajor_256_sm89(g.dEBR_i8, g.dEBR_h[0], g.dEBR_h[1], N, 0);
   pearl_miner_split_rmajor_256_sm89(g.dEBL_R,  g.dEBL_h[0], g.dEBL_h[1], K, 0);
+  prof.mark(3);
 
   // 3. chained two-pass noisingA/B (R-halves). Half h uses the contiguous
   //    (rows,128) half of the dense/R-major-sparse factors and the row-block
@@ -323,6 +357,7 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
         g.dEAR_K + size_t(roff)*K,   // EAR_K_major row-block [roff:, :] (ld=K)
         g.dBpEB, g.dEARxBpEB_i32, N, K, 0);
   }
+  prof.mark(4);
 
   // 4. denoise fp16 factors are irrelevant to the transcript/PoW (see verify
   // path comment) -> zero them.
@@ -335,14 +370,17 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
   HostSignalSync zsync{};
   CUCHK(cudaMemcpy(g.dSync, &zsync, sizeof(zsync), cudaMemcpyHostToDevice));
   memset(g.hHeader, 0, host_signal_header_size);
+  prof.mark(5);
 
   pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nostore(
       g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
       g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
       g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, 0);
+  prof.mark(6);
   CUCHK(cudaDeviceSynchronize());
   cudaError_t le = cudaGetLastError();
   if (le != cudaSuccess) { fprintf(stderr, "PoW(nostore) launch: %s\n", cudaGetErrorString(le)); std::exit(2); }
+  prof.report();
 
   if (g.hHeader->status == kSignalTriggered) {
     *tile_ix = g.hHeader->tileCoord[0];
@@ -571,6 +609,17 @@ int main(int argc, char** argv) {
   bool on_device = (a.mode == "mine" || a.mode == "bench");
   GpuBufs g;
   alloc_bufs(g, a.m, a.n, a.k, /*mine=*/on_device);
+  // BENCH-MODE TARGET: force the HARDEST target (T=0, all-zero words) so the PoW
+  // check is (essentially) never satisfied. The default target for mine/verify is
+  // the EASIEST (0xFF..FF, T=2^256-1), which makes check_pow_target true for EVERY
+  // hash-tile -> every CTA thread takes write_host_signal_header's grid-wide
+  // global_lock atomicCAS + __threadfence_system + pinned-memory writeback path,
+  // serializing the entire grid on one lock and flooding PCIe. That is the
+  // ~13000x "memory-bound 49W/100%-util 50s" stall: it is the host-signal hit
+  // path, NOT the GEMM/noising. The reference bench (bench_sm89_pouw_re2) uses an
+  // all-zero target for exactly this reason. mine-mode keeps the real pool target
+  // (rare hits), so this only changes the throughput benchmark, matching prod.
+  if (a.mode == "bench") target_le.assign(32, 0x00);
   CUCHK(cudaMemcpy(g.dTarget, target_le.data(), 32, cudaMemcpyHostToDevice));
 
   // -------------------------------------------------------------------------
