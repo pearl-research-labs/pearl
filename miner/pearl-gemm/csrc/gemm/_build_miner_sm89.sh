@@ -24,15 +24,28 @@ FLAGS=(
   --expt-relaxed-constexpr --expt-extended-lambda -DNDEBUG
 )
 
-# Noise + noised operands (ApEA/BpEB) are computed host-side (pearl_miner_host.hpp,
-# validated bit-exact vs miner-base). The on-device noise_generation.cu /
-# denoise_converter.cu / noisingA/B are NOT linked: the first two pull c10/torch
-# via error_check.hpp, and the R<=128 noising kernels cannot do a correct R=256
-# noise in a single pass. Only the load-bearing PoW mainloop kernel is linked.
-# OpenMP parallelizes the host noising.
+# Linked translation units:
+#   pearl_miner_sm89.cu                          driver + host derivation + verify
+#   pearl_gemm_sm89_pow_inst_128x256x128.cu      C-store PoW kernel (verify-mode)
+#   pearl_gemm_sm89_pow_inst_128x256x128_nostore.cu  no-C-store PoW (mine-mode;
+#                                                fixes the 131072^2 32 GB OOM)
+#   pearl_miner_noisegen_sm89.cu                 torch-free R=256 noise-gen +
+#                                                device fill_AB (mine-mode)
+#   pearl_noisingA_sm89_inst.cu / ...B_inst.cu   validated R=128 noising kernels,
+#                                                run as two CHAINED R-halves to
+#                                                build the R=256 noised operands
+#                                                on device (bit-exact; mod-256
+#                                                wrap is associative).
+# verify-mode still materializes the noised operands host-side (OpenMP) and
+# cross-checks the GPU transcript; mine-mode is fully on-device (no host
+# materialization, no (M,N) C buffer). None of these TUs pull c10/torch.
 $NVCC "${FLAGS[@]}" \
   -Xcompiler -fopenmp \
   pearl_miner_sm89.cu \
   pearl_gemm_sm89_pow_inst_128x256x128.cu \
+  pearl_gemm_sm89_pow_inst_128x256x128_nostore.cu \
+  pearl_miner_noisegen_sm89.cu \
+  pearl_noisingA_sm89_inst.cu \
+  pearl_noisingB_sm89_inst.cu \
   -o "$OUT/pearl_miner_sm89_sm${ARCH}"
 echo "built $OUT/pearl_miner_sm89_sm${ARCH}"

@@ -53,8 +53,10 @@
 #include "host_signal_header.hpp"
 
 // The full-PoUW main GEMM (denoise + BLAKE3 transcript + on-device target check).
-// This is the load-bearing sm_89 mining kernel; noising is done host-side (see
-// run_attempt) because the GPU noising kernels are R<=128 only.
+// This is the load-bearing sm_89 mining kernel.
+//   * verify-mode  uses the C-store variant (host cross-check of the denoise/C).
+//   * mine-mode    uses the no-C-store variant (Lever A): the (M,N) output C is
+//     NEVER materialized, so the 131072^2 attempt fits in 16 GB (full C = 32 GB).
 namespace pearl { namespace sm89 {
 extern "C" void pearl_gemm_sm89_pow_128x256x128_R256(
     int8_t const* A, int64_t lda, int8_t const* B, int64_t ldb,
@@ -64,7 +66,40 @@ extern "C" void pearl_gemm_sm89_pow_128x256x128_R256(
     uint32_t const* pow_target, uint32_t const* pow_key,
     void* host_signal_sync, void* host_signal_header_pinned,
     uint64_t* inner_hash_counter, int M, int N, int K, cudaStream_t stream);
+extern "C" void pearl_gemm_sm89_pow_128x256x128_R256_nostore(
+    int8_t const* A, int64_t lda, int8_t const* B, int64_t ldb,
+    cutlass::half_t* C, int64_t ldc, float const* A_scales, float const* B_scales,
+    cutlass::half_t const* EAL, cutlass::half_t const* EBR,
+    cutlass::half_t const* AxEBL, cutlass::half_t const* EARxBpEB,
+    uint32_t const* pow_target, uint32_t const* pow_key,
+    void* host_signal_sync, void* host_signal_header_pinned,
+    uint64_t* inner_hash_counter, int M, int N, int K, cudaStream_t stream);
+// noisingB lives in namespace pearl::sm89; noisingA in the global namespace.
+extern "C" void pearl_noisingB_sm89_64x128x64_R128_int32(
+    int8_t const* B, int8_t const* EBR, int8_t const* EBL, int8_t const* EAR,
+    int8_t* BpEB, int32_t* EARxBpEB, int N, int K, cudaStream_t stream);
 }}  // namespace pearl::sm89
+
+// On-device noise-factor generator (R=256, torch-free wrapper of the production
+// NoiseGenerationKernel). Produces EAL/EBR (dense) + EAR/EBL (sparse, R- and
+// K-major) bit-exactly from a/b_noise_seed. See pearl_miner_noisegen_sm89.cu.
+extern "C" void pearl_miner_noisegen_sm89_R256(
+    int8_t* EAL, int8_t* EBR,
+    int8_t* EAR_R_major, int8_t* EAR_K_major,
+    int8_t* EBL_R_major, int8_t* EBL_K_major,
+    const uint8_t* key_A, const uint8_t* key_B,
+    int M, int N, int K, cudaStream_t stream);
+// noisingA (global namespace, R=128 int32 variant).
+extern "C" void pearl_noisingA_sm89_64x128x64_R128_int32(
+    int8_t const* A, int8_t const* EAL, int8_t const* EAR, int8_t const* EBL,
+    int8_t* ApEA, int32_t* AxEBL, int M, int K, cudaStream_t stream);
+// Device-side seed-derived A/B fill (bit-exact with host fill_AB).
+extern "C" void pearl_miner_fill_AB_sm89(int8_t* dst, size_t n, uint64_t seed,
+                                         cudaStream_t stream);
+// Split an R-major (rows,256) int8 matrix into two contiguous (rows,128) halves.
+extern "C" void pearl_miner_split_rmajor_256_sm89(
+    const int8_t* in, int8_t* out_lo, int8_t* out_hi, size_t rows,
+    cudaStream_t stream);
 
 using pearl_miner::Seeds;
 using pearl_miner::derive_seeds;
@@ -153,9 +188,21 @@ struct GpuBufs {
   uint32_t *dTarget=0,*dKey=0;
   HostSignalSync* dSync=0;
   HostSignalHeader* hHeader=0;  // pinned
+  bool mine=false;
+  // ---- mine-mode on-device noising scratch (allocated only when mine=true) ----
+  int8_t  *dA=0,*dB=0;                       // seed-derived int8 source operands
+  int8_t  *dEAL_i8=0,*dEBR_i8=0;             // dense noise factors (M,R)/(N,R)
+  int8_t  *dEAR_R=0,*dEAR_K=0,*dEBL_R=0,*dEBL_K=0;  // sparse factors (K,R)/(R,K)
+  int32_t *dAxEBL_i32=0,*dEARxBpEB_i32=0;    // noising denoise scratch (ignored)
+  uint8_t *dKeyA=0,*dKeyB=0;                 // a/b_noise_seed on device
+  // Contiguous (rows,128) R-halves of the R-major factors (the R=128 noising
+  // kernels require ld=128 — a strided slice of the (rows,256) buffer is wrong).
+  int8_t  *dEAL_h[2]={0,0}, *dEAR_h[2]={0,0};   // noisingA: EAL(M), EAR(K)
+  int8_t  *dEBR_h[2]={0,0}, *dEBL_h[2]={0,0};   // noisingB: EBR(N), EBL(K)
 };
 
-static void alloc_bufs(GpuBufs& g, int M, int N, int K) {
+static void alloc_bufs(GpuBufs& g, int M, int N, int K, bool mine) {
+  g.mine = mine;
   CUCHK(cudaMalloc(&g.dApEA, size_t(M)*K));
   CUCHK(cudaMalloc(&g.dBpEB, size_t(N)*K));
   CUCHK(cudaMalloc(&g.dEAL_fp16,      size_t(M)*R_DIM*2));
@@ -164,7 +211,10 @@ static void alloc_bufs(GpuBufs& g, int M, int N, int K) {
   CUCHK(cudaMalloc(&g.dEARxBpEB_fp16, size_t(N)*R_DIM*2));
   CUCHK(cudaMalloc(&g.dAs, size_t(M)*4));
   CUCHK(cudaMalloc(&g.dBs, size_t(N)*4));
-  CUCHK(cudaMalloc(&g.dC, size_t(M)*N*2));  // C-store path (verify); mine could no-store
+  // The (M,N) output C is the OOM at the mining shape (131072^2 -> 32 GB). It is
+  // ONLY needed for verify-mode's host denoise cross-check; mine-mode uses the
+  // no-C-store PoW kernel and never materializes it.
+  if (!mine) CUCHK(cudaMalloc(&g.dC, size_t(M)*N*2));
   CUCHK(cudaMalloc(&g.dTarget, 8*4));
   CUCHK(cudaMalloc(&g.dKey, 8*4));
   CUCHK(cudaMalloc(&g.dSync, sizeof(HostSignalSync)));
@@ -172,12 +222,130 @@ static void alloc_bufs(GpuBufs& g, int M, int N, int K) {
   std::vector<float> as(M, 0.01f), bs(N, 0.01f);
   CUCHK(cudaMemcpy(g.dAs, as.data(), size_t(M)*4, cudaMemcpyHostToDevice));
   CUCHK(cudaMemcpy(g.dBs, bs.data(), size_t(N)*4, cudaMemcpyHostToDevice));
+
+  if (mine) {
+    CUCHK(cudaMalloc(&g.dA, size_t(M)*K));
+    CUCHK(cudaMalloc(&g.dB, size_t(N)*K));
+    CUCHK(cudaMalloc(&g.dEAL_i8, size_t(M)*R_DIM));
+    CUCHK(cudaMalloc(&g.dEBR_i8, size_t(N)*R_DIM));
+    CUCHK(cudaMalloc(&g.dEAR_R,  size_t(K)*R_DIM));
+    CUCHK(cudaMalloc(&g.dEAR_K,  size_t(R_DIM)*K));
+    CUCHK(cudaMalloc(&g.dEBL_R,  size_t(K)*R_DIM));
+    CUCHK(cudaMalloc(&g.dEBL_K,  size_t(R_DIM)*K));
+    CUCHK(cudaMalloc(&g.dAxEBL_i32,    size_t(M)*R_DIM*4));
+    CUCHK(cudaMalloc(&g.dEARxBpEB_i32, size_t(N)*R_DIM*4));
+    CUCHK(cudaMalloc(&g.dKeyA, 32));
+    CUCHK(cudaMalloc(&g.dKeyB, 32));
+    for (int h = 0; h < 2; ++h) {
+      CUCHK(cudaMalloc(&g.dEAL_h[h], size_t(M)*128));
+      CUCHK(cudaMalloc(&g.dEAR_h[h], size_t(K)*128));
+      CUCHK(cudaMalloc(&g.dEBR_h[h], size_t(N)*128));
+      CUCHK(cudaMalloc(&g.dEBL_h[h], size_t(K)*128));
+    }
+  }
 }
 
 // Generate seed-derived noise on device, run noisingA/B (two R=128 passes), the
 // denoise int32->fp16 conversion, and the PoW kernel. Returns 1 if a tile hit.
+// ---------------------------------------------------------------------------
+// MINE-mode attempt: fully on-device. No host materialization of the full
+// operands, no (M,N) C buffer. Footprint is linear in (M+N) -> 131072^2 fits
+// in 16 GB. Steps:
+//   1. fill dA/dB from ab_seed on device (bit-exact with host fill_AB).
+//   2. generate EAL/EBR/EAR/EBL on device from a/b_noise_seed (noise-gen kernel,
+//      R=256, bit-exact with miner-base/noise_generation.py).
+//   3. noisingA/B as TWO CHAINED R=128 passes: pass-1 reads the seed operand,
+//      pass-0's int8-wrapped output feeds pass-1 as the "A" input. Because the
+//      kernel's int8 cast + A-add are both mod-256 and mod-256 addition is
+//      associative, chaining the R-halves is bit-exact with a single R=256 pass:
+//        wrap(wrap(EAL_hi@EAR_hi) + wrap(wrap(EAL_lo@EAR_lo)+A))
+//          == wrap(A + EAL_lo@EAR_lo + EAL_hi@EAR_hi).
+//      (The bench fed the SAME A to both halves and overwrote ApEA -> only one
+//       R-half survived. Chaining the output->input fixes that.)
+//   4. zero the four fp16 denoise factors (they don't enter the transcript/PoW),
+//      then launch the no-C-store PoW kernel.
+static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
+                            uint64_t ab_seed, uint32_t* tile_ix, uint32_t* tile_iy) {
+  // 1. seed-derived A/B on device.
+  pearl_miner_fill_AB_sm89(g.dA, size_t(M)*K, ab_seed, 0);
+  pearl_miner_fill_AB_sm89(g.dB, size_t(N)*K, ab_seed ^ 0xD1B54A32D192ED03ULL, 0);
+
+  // 2. on-device noise factors (R=256) from a/b_noise_seed.
+  CUCHK(cudaMemcpy(g.dKeyA, s.a_noise_seed, 32, cudaMemcpyHostToDevice));
+  CUCHK(cudaMemcpy(g.dKeyB, s.b_noise_seed, 32, cudaMemcpyHostToDevice));
+  pearl_miner_noisegen_sm89_R256(
+      g.dEAL_i8, g.dEBR_i8, g.dEAR_R, g.dEAR_K, g.dEBL_R, g.dEBL_K,
+      g.dKeyA, g.dKeyB, M, N, K, 0);
+
+  // 2b. Repack the R-major factors (EAL/EAR for A, EBR/EBL for B) into two
+  //     contiguous (rows,128) R-halves. The R=128 noising kernel hard-codes
+  //     ld=128, so it cannot consume a strided slice of the (rows,256) buffer.
+  //     The K-major sparse factors (EBL_K for A, EAR_K for B) are already
+  //     contiguous per half (row-blocks), so they are sliced directly.
+  pearl_miner_split_rmajor_256_sm89(g.dEAL_i8, g.dEAL_h[0], g.dEAL_h[1], M, 0);
+  pearl_miner_split_rmajor_256_sm89(g.dEAR_R,  g.dEAR_h[0], g.dEAR_h[1], K, 0);
+  pearl_miner_split_rmajor_256_sm89(g.dEBR_i8, g.dEBR_h[0], g.dEBR_h[1], N, 0);
+  pearl_miner_split_rmajor_256_sm89(g.dEBL_R,  g.dEBL_h[0], g.dEBL_h[1], K, 0);
+
+  // 3. chained two-pass noisingA/B (R-halves). Half h uses the contiguous
+  //    (rows,128) half of the dense/R-major-sparse factors and the row-block
+  //    [h*128,..) of the K-major sparse factors. Pass-0 reads the seed operand
+  //    (dA/dB) and writes the noised half into dApEA/dBpEB; pass-1 reads
+  //    dApEA/dBpEB and writes the final R=256 noised operand back into
+  //    dApEA/dBpEB (in place). Each CTA owns one m-block (n-block) and reads its
+  //    A k-tiles before writing the same ApEA k-tiles, so the in-place pass-1 is
+  //    race-free. Final noised operands therefore always live in dApEA/dBpEB.
+  //    Chaining is bit-exact with a single R=256 pass: mod-256 wrap distributes
+  //    over the R-halves' addition (validated vs host, 0 diff).
+  for (int h = 0; h < 2; ++h) {
+    int roff = h * 128;
+    const int8_t* aIn = (h == 0) ? g.dA : g.dApEA;
+    const int8_t* bIn = (h == 0) ? g.dB : g.dBpEB;
+    pearl_noisingA_sm89_64x128x64_R128_int32(
+        aIn,
+        g.dEAL_h[h],                 // EAL half h, contiguous (M,128)
+        g.dEAR_h[h],                 // EAR half h, contiguous (K,128)
+        g.dEBL_K + size_t(roff)*K,   // EBL_K_major row-block [roff:, :] (ld=K)
+        g.dApEA, g.dAxEBL_i32, M, K, 0);
+    pearl::sm89::pearl_noisingB_sm89_64x128x64_R128_int32(
+        bIn,
+        g.dEBR_h[h],                 // EBR half h, contiguous (N,128)
+        g.dEBL_h[h],                 // EBL_R half h, contiguous (K,128)
+        g.dEAR_K + size_t(roff)*K,   // EAR_K_major row-block [roff:, :] (ld=K)
+        g.dBpEB, g.dEARxBpEB_i32, N, K, 0);
+  }
+
+  // 4. denoise fp16 factors are irrelevant to the transcript/PoW (see verify
+  // path comment) -> zero them.
+  CUCHK(cudaMemset(g.dEAL_fp16, 0, size_t(M)*R_DIM*2));
+  CUCHK(cudaMemset(g.dEBR_fp16, 0, size_t(N)*R_DIM*2));
+  CUCHK(cudaMemset(g.dAxEBL_fp16, 0, size_t(M)*R_DIM*2));
+  CUCHK(cudaMemset(g.dEARxBpEB_fp16, 0, size_t(N)*R_DIM*2));
+
+  CUCHK(cudaMemcpy(g.dKey, s.a_noise_seed, 32, cudaMemcpyHostToDevice));
+  HostSignalSync zsync{};
+  CUCHK(cudaMemcpy(g.dSync, &zsync, sizeof(zsync), cudaMemcpyHostToDevice));
+  memset(g.hHeader, 0, host_signal_header_size);
+
+  pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nostore(
+      g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
+      g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
+      g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, 0);
+  CUCHK(cudaDeviceSynchronize());
+  cudaError_t le = cudaGetLastError();
+  if (le != cudaSuccess) { fprintf(stderr, "PoW(nostore) launch: %s\n", cudaGetErrorString(le)); std::exit(2); }
+
+  if (g.hHeader->status == kSignalTriggered) {
+    *tile_ix = g.hHeader->tileCoord[0];
+    *tile_iy = g.hHeader->tileCoord[1];
+    return 1;
+  }
+  return 0;
+}
+
 static int run_attempt(GpuBufs& g, const Seeds& s, int M, int N, int K,
                        uint64_t ab_seed, uint32_t* tile_ix, uint32_t* tile_iy) {
+  if (g.mine) return run_attempt_mine(g, s, M, N, K, ab_seed, tile_ix, tile_iy);
   // ---- compute the FULL-R256 noised operands ApEA/BpEB on HOST and upload ----
   // ApEA[m] = i8wrap(A[m]   + EAL[m]   @ EAR^T)   (EAR sparse: per-k = EAL[k0]-EAL[k1])
   // BpEB[n] = i8wrap(B^T[n] + EBR[n]   @ EBL^T)
@@ -367,7 +535,7 @@ int main(int argc, char** argv) {
           a.dev, p.name, p.major, p.minor, a.mode.c_str(), a.m, a.n, a.k, a.r);
 
   GpuBufs g;
-  alloc_bufs(g, a.m, a.n, a.k);
+  alloc_bufs(g, a.m, a.n, a.k, /*mine=*/a.mode == "mine");
   CUCHK(cudaMemcpy(g.dTarget, target_le.data(), 32, cudaMemcpyHostToDevice));
 
   auto print_hit = [&](uint64_t nonce, uint64_t ab_seed, uint32_t ix, uint32_t iy,
