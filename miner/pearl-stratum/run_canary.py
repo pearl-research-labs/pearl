@@ -101,6 +101,14 @@ NONCE_WINDOW = 32
 # under this) while still bounding a wedged ssh/binary.
 MINE_TIMEOUT_S = 25.0
 
+# --- land-share mode defaults --------------------------------------------
+# A moderate per-mine nonce count: hits arrive ~nonce 8, so 48 nonces makes a
+# HIT very likely while the binary still returns on the FIRST hit (~6s). The
+# mine-timeout must cover a full 48-nonce sweep (worst case ~30s) so a no-hit
+# sweep isn't cut off mid-way; default 45s.
+LAND_SHARE_NONCE_COUNT = 48
+LAND_SHARE_MINE_TIMEOUT_S = 45.0
+
 
 # ---------------------------------------------------------------------------
 # A/B regeneration (numpy splitmix64) — identical to gpu_sm89_mine in the driver
@@ -238,6 +246,17 @@ class _SubprocessMineBackend:
         with self._proc_lock:
             self._cancelled = False
 
+    # ---- orphan cleanup --------------------------------------------------
+
+    def kill_orphans(self) -> None:
+        """Kill any stale GPU-binary process holding the device.
+
+        Base impl is a no-op (the rust backend has no GPU process). Subprocess
+        backends that spawn the sm_89 binary override this to reap orphans that
+        a prior cancel()/timeout left behind — orphans hold the GPU so the next
+        mine fails fast (NOHIT in <1s). Best-effort; never raises."""
+        return None
+
     def _argv(self) -> list[str]:
         raise NotImplementedError
 
@@ -302,16 +321,35 @@ class SshRigBackend(_SubprocessMineBackend):
         self.ssh_user = ssh_user
         self.bin_path = bin_path
 
-    def _argv(self) -> list[str]:
-        env_prefix = " ".join(f"{k}={v}" for k, v in GPU_ENV.items())
-        remote = f"env {env_prefix} {self.bin_path}"
+    def _ssh_prefix(self) -> list[str]:
         return [
             "ssh",
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             f"{self.ssh_user}@{self.rig}",
-            remote,
         ]
+
+    def _argv(self) -> list[str]:
+        env_prefix = " ".join(f"{k}={v}" for k, v in GPU_ENV.items())
+        remote = f"env {env_prefix} {self.bin_path}"
+        return self._ssh_prefix() + [remote]
+
+    def kill_orphans(self) -> None:
+        """Reap any orphaned `pearl_miner_sm89` on the rig (best-effort).
+
+        A cancelled/timed-out mine kills the local ssh client but leaves the
+        REMOTE binary running and holding the GPU; the next mine then NOHITs in
+        <1s. `pkill -9 -f pearl_miner_sm89` matches the binary regardless of the
+        `env ...` prefix in its argv. rc=1 (no match) is the normal/healthy
+        case, so we don't log it as an error."""
+        argv = self._ssh_prefix() + ["pkill -9 -f pearl_miner_sm89; true"]
+        try:
+            subprocess.run(argv, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15.0)
+            logger.info("kill_orphans: pkill pearl_miner_sm89 on %s", self.rig)
+        except Exception:
+            logger.warning("kill_orphans: ssh pkill failed (continuing)",
+                           exc_info=True)
 
 
 class LocalGpuBackend(_SubprocessMineBackend):
@@ -330,6 +368,17 @@ class LocalGpuBackend(_SubprocessMineBackend):
         env = dict(os.environ)
         env.update(GPU_ENV)
         return {"env": env}
+
+    def kill_orphans(self) -> None:
+        """Reap any orphaned local `pearl_miner_sm89` holding the GPU."""
+        try:
+            subprocess.run(["pkill", "-9", "-f", "pearl_miner_sm89"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15.0)
+            logger.info("kill_orphans: local pkill pearl_miner_sm89")
+        except Exception:
+            logger.warning("kill_orphans: local pkill failed (continuing)",
+                           exc_info=True)
 
 
 class RustCpuBackend:
@@ -574,6 +623,205 @@ class CanaryMineLoop:
 
 
 # ---------------------------------------------------------------------------
+# Land-share mode (orphan-free serial mining; exploits pool grace)
+# ---------------------------------------------------------------------------
+
+
+def land_share_mine(job, *, mining_config, backend, submit, client, loop,
+                    nonce_range, current_job_id=None):
+    """Mine ONE one-shot window of `job`, then submit a verified HIT EVEN IF the
+    job has since rotated (exploit pool grace). Returns a result dict.
+
+    This is the orphan-free, grace-exploiting twin of `handle_job`: there is NO
+    staleness guard — a verified proof for an already-rotated job is still
+    submitted, because the whole point of this mode is to discover whether the
+    pool grants grace for a recently-rotated job_id. `current_job_id` is the
+    live job at submit time and is logged only so we can see HOW stale the mined
+    job was. Pure-sync; the loop runs it in a worker thread.
+    """
+    import pearl_mining as pm
+
+    bh = pm.IncompleteBlockHeader.from_bytes(job.header_bytes)
+    result = {"job_id": job.job_id, "verify": None, "submitted": False,
+              "accepted": None, "error": None, "stale": False,
+              "nonce_start": nonce_range.start}
+
+    try:
+        proof_bytes = backend(job.header_bytes, mining_config, job.target,
+                              nonce_range, job_id=job.job_id)
+    except Exception as e:
+        logger.exception("mining backend raised")
+        result["error"] = f"backend: {e}"
+        return result
+
+    if proof_bytes is None:
+        logger.info("job %s: NOHIT this window (nonce_start=%d)",
+                    job.job_id, nonce_range.start)
+        return result
+
+    proof = pm.PlainProof.from_base64(base64.b64encode(proof_bytes).decode())
+    ok, msg = pm.verify_plain_proof(bh, proof)
+    result["verify"] = bool(ok)
+    logger.info("job %s: HIT -> verify_plain_proof=%s (%s)", job.job_id, ok, msg)
+
+    if not ok:
+        logger.error("job %s: NOT submitting (verify failed): %s", job.job_id, msg)
+        return result
+
+    # How stale is this HIT? Log mined job_id vs the current live job_id.
+    stale = current_job_id is not None and current_job_id != job.job_id
+    result["stale"] = stale
+    if stale:
+        logger.warning("job %s: job rotated to %s during mine — submitting ANYWAY "
+                       "(land-share: exploit pool grace)", job.job_id, current_job_id)
+    else:
+        logger.info("job %s: still the current job at submit time", job.job_id)
+
+    b64 = base64.b64encode(proof_bytes).decode()
+    if not submit:
+        logger.info("job %s: DRY-RUN would submit, verify_plain_proof=%s stale=%s "
+                    "(proof_b64_len=%d)", job.job_id, ok, stale, len(b64))
+        return result
+
+    if client is None or loop is None:
+        logger.error("submit requested but no client/loop bound")
+        result["error"] = "no client"
+        return result
+
+    fut = asyncio.run_coroutine_threadsafe(
+        client.submit_share(job.job_id, b64, hashrate=0.0), loop)
+    res = fut.result()
+    result["submitted"] = True
+    result["accepted"] = res.accepted
+    if res.accepted:
+        logger.info("job %s: SHARE ACCEPTED latency=%.1fms (stale=%s)",
+                    job.job_id, res.latency_ms, stale)
+    else:
+        # Distinguish a grace-miss (stale/job-not-found) from a real format error
+        # so we learn whether grace exists at all.
+        emsg = (res.error or "").lower()
+        kind = ("STALE/job-not-found" if any(t in emsg for t in
+                ("stale", "not found", "unknown job", "expired"))
+                else "FORMAT/other")
+        logger.warning("job %s: SHARE REJECTED [%s] code=%s err=%s (mined_stale=%s)",
+                       job.job_id, kind, res.error_code, res.error, stale)
+    return result
+
+
+class LandShareLoop:
+    """Serial, orphan-free mine loop that lands an ACCEPTED share.
+
+    Distinct from CanaryMineLoop's preemptive design: there is NO preemption and
+    only ONE GPU subprocess is ever in flight, so the bug that orphaned the
+    remote binary (and starved subsequent windows) cannot occur.
+
+    Per iteration:
+      1. kill_orphans() on the backend (reap any stale binary holding the GPU).
+      2. snapshot the CURRENT job (set by on_new_job); if none yet, wait.
+      3. run ONE one-shot mine (moderate nonce_count, returns on first HIT).
+         A new job arriving mid-mine does NOT cancel it — we let it finish.
+      4. on a verified HIT: submit EVEN IF the job rotated (grace), then on
+         SHARE ACCEPTED -> stop. On NOHIT, advance the nonce cursor for the
+         same job (reset to 0 when the job changes) and loop.
+
+    Stops on the first accepted share (sets self.accepted=True and signals the
+    pool client to stop).
+    """
+
+    def __init__(self, *, mining_config, backend, submit, client, loop,
+                 nonce_count, on_accepted=None):
+        self.mining_config = mining_config
+        self.backend = backend
+        self.submit = submit
+        self.client = client
+        self.loop = loop
+        self.nonce_count = nonce_count
+        self.on_accepted = on_accepted
+
+        self._job = None
+        self._last_job_id = None
+        self._cursor = 0
+        self._job_ready = asyncio.Event()
+        self._stop = asyncio.Event()
+        self.accepted = False
+
+    # ---- called from the stratum read loop (event-loop thread) ----------
+
+    def on_new_job(self, job) -> None:
+        # No cancel(): an in-flight one-shot mine is allowed to finish. We just
+        # record the latest job; the loop picks it up on its next iteration.
+        logger.info("NEW JOB job_id=%s height=%s target=%#x header=%s...",
+                    job.job_id, job.height, job.target, job.header_bytes.hex()[:32])
+        self._job = job
+        self._job_ready.set()
+
+    # ---- the background mine loop ---------------------------------------
+
+    async def run(self) -> None:
+        while not self._stop.is_set():
+            if self._job is None:
+                await self._wait_job_or_stop()
+                continue
+
+            job = self._job
+            current_id = job.job_id
+            if job.job_id != self._last_job_id:
+                self._cursor = 0
+                self._last_job_id = job.job_id
+
+            # Reap any orphaned binary BEFORE mining so the GPU is free.
+            ko = getattr(self.backend, "kill_orphans", None)
+            if ko is not None:
+                await asyncio.to_thread(ko)
+
+            nonce_range = range(self._cursor, self._cursor + self.nonce_count)
+            reset = getattr(self.backend, "reset_cancel", None)
+            if reset is not None:
+                reset()
+
+            res = await asyncio.to_thread(
+                land_share_mine, job, mining_config=self.mining_config,
+                backend=self.backend, submit=self.submit, client=self.client,
+                loop=self.loop, nonce_range=nonce_range,
+                current_job_id=self._job.job_id)
+
+            if res.get("accepted"):
+                self.accepted = True
+                logger.info("land-share: SHARE ACCEPTED on job %s — done", current_id)
+                if self.on_accepted is not None:
+                    self.on_accepted()
+                self.stop()
+                return
+
+            # NOHIT or rejected: advance the cursor for the SAME job and retry.
+            # (If the job changed meanwhile, the next iteration resets to 0.)
+            self._cursor += self.nonce_count
+
+    async def _wait_job_or_stop(self) -> None:
+        stop_task = asyncio.ensure_future(self._stop.wait())
+        job_task = asyncio.ensure_future(self._job_ready.wait())
+        try:
+            await asyncio.wait({stop_task, job_task},
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (stop_task, job_task):
+                if not t.done():
+                    t.cancel()
+        self._job_ready.clear()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._job_ready.set()
+        # Final orphan reap so we don't leave the GPU held on exit.
+        ko = getattr(self.backend, "kill_orphans", None)
+        if ko is not None:
+            try:
+                ko()
+            except Exception:
+                logger.debug("stop: kill_orphans raised", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Live runner
 # ---------------------------------------------------------------------------
 
@@ -586,7 +834,10 @@ async def run_live(args) -> int:
     mining_config = pm.MiningConfiguration.from_bytes(bytes.fromhex(args.config_hex))
     backend = make_backend(args.backend, args)
     loop = asyncio.get_running_loop()
-    box: dict = {}
+
+    if args.land_share:
+        return await _run_land_share(args, mining_config, backend, loop,
+                                     LuckyPoolStratumClient)
 
     mine_loop = CanaryMineLoop(
         mining_config=mining_config, backend=backend, submit=args.submit,
@@ -595,7 +846,6 @@ async def run_live(args) -> int:
     client = LuckyPoolStratumClient(
         host=args.host, port=args.port, wallet=args.wallet, worker=args.worker,
         agent=args.agent, on_new_job=mine_loop.on_new_job)
-    box["client"] = client
     mine_loop.client = client
 
     mode = "SUBMIT" if args.submit else "DRY-RUN (no submit)"
@@ -608,6 +858,61 @@ async def run_live(args) -> int:
     finally:
         mine_loop.stop()
         mine_task.cancel()
+
+
+async def _run_land_share(args, mining_config, backend, loop, client_cls) -> int:
+    """Drive the orphan-free LandShareLoop against ONE stable pool connection.
+
+    Reaps GPU orphans at startup and on exit (atexit), runs serial one-shot
+    mines, and stops the pool client the moment a share is ACCEPTED.
+    """
+    import atexit
+
+    # 1) Kill orphans BEFORE anything else, and register a final reap on exit.
+    ko = getattr(backend, "kill_orphans", None)
+    if ko is not None:
+        ko()
+        atexit.register(lambda: _safe_kill_orphans(ko))
+
+    mine_loop = LandShareLoop(
+        mining_config=mining_config, backend=backend, submit=args.submit,
+        client=None, loop=loop, nonce_count=args.nonce_count)
+
+    stop_box: dict = {}
+
+    def _on_accepted():
+        client = stop_box.get("client")
+        if client is not None:
+            loop.call_soon_threadsafe(lambda: loop.create_task(client.stop()))
+
+    mine_loop.on_accepted = _on_accepted
+
+    client = client_cls(
+        host=args.host, port=args.port, wallet=args.wallet, worker=args.worker,
+        agent=args.agent, on_new_job=mine_loop.on_new_job)
+    stop_box["client"] = client
+    mine_loop.client = client
+
+    mode = "SUBMIT" if args.submit else "DRY-RUN (no submit)"
+    logger.info("Canary LAND-SHARE: pool=%s:%d backend=%s mode=%s nonce_count=%d "
+                "wallet=%s worker=%s", args.host, args.port, args.backend, mode,
+                args.nonce_count, args.wallet, args.worker)
+
+    mine_task = loop.create_task(mine_loop.run())
+    try:
+        rc = await client.run()
+    finally:
+        mine_loop.stop()
+        mine_task.cancel()
+    # Exit 0 if we landed a share; otherwise propagate the client's rc.
+    return 0 if mine_loop.accepted else rc
+
+
+def _safe_kill_orphans(ko) -> None:
+    try:
+        ko()
+    except Exception:
+        logger.debug("atexit kill_orphans raised", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -684,9 +989,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rig", help="rig host/IP for --backend ssh-rig (e.g. 192.168.70.6)")
     p.add_argument("--ssh-user", default="root")
     p.add_argument("--dev", type=int, default=0, help="GPU device index on the rig")
-    p.add_argument("--mine-timeout", type=float, default=MINE_TIMEOUT_S,
-                   help="per-mine-window subprocess timeout seconds (short, so a "
-                        "new job can preempt the in-flight window)")
+    p.add_argument("--mine-timeout", type=float, default=None,
+                   help="per-mine subprocess timeout seconds. For --land-share "
+                        "this must comfortably exceed a full nonce_count sweep "
+                        "(default 45s); for the preempt loop it is short "
+                        "(default 25s).")
+    p.add_argument("--land-share", action="store_true", default=False,
+                   help="orphan-free serial mode that lands an ACCEPTED share: "
+                        "kill orphans, mine one-shot windows of the CURRENT job "
+                        "(no preemption), and submit a verified HIT even if the "
+                        "job rotated (exploit pool grace). Exits on first accept.")
+    p.add_argument("--nonce-count", type=int, default=LAND_SHARE_NONCE_COUNT,
+                   help="nonces per one-shot mine in --land-share mode (returns "
+                        "on the first HIT; hits arrive ~nonce 8). Default 48.")
 
     p.add_argument("--host", default="pearl-ca1.luckypool.io")
     p.add_argument("--port", type=int, default=3360)
@@ -718,6 +1033,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.selftest:
         return run_selftest(args)
+
+    # Resolve the per-mine timeout default by mode (land-share needs a longer
+    # window to fit a full nonce_count sweep; the preempt loop wants it short).
+    if args.mine_timeout is None:
+        args.mine_timeout = (LAND_SHARE_MINE_TIMEOUT_S if args.land_share
+                             else MINE_TIMEOUT_S)
 
     if not args.wallet:
         raise SystemExit("--wallet is required for the live canary "
