@@ -95,6 +95,17 @@ extern "C" void pearl_gemm_sm89_pow_128x256x128_R256_nostore(
     uint32_t const* pow_target, uint32_t const* pow_key,
     void* host_signal_sync, void* host_signal_header_pinned,
     uint64_t* inner_hash_counter, int M, int N, int K, cudaStream_t stream);
+// DENOISE-OFF search variant: bit-identical transcript/PoW digest (the digest is
+// folded from the int32 accumulator in the mainloop, before denoise; denoise only
+// builds the useful-work C, which the share proof does not use). ~1.6x faster.
+extern "C" void pearl_gemm_sm89_pow_128x256x128_R256_nodenoise_nostore(
+    int8_t const* A, int64_t lda, int8_t const* B, int64_t ldb,
+    cutlass::half_t* C, int64_t ldc, float const* A_scales, float const* B_scales,
+    cutlass::half_t const* EAL, cutlass::half_t const* EBR,
+    cutlass::half_t const* AxEBL, cutlass::half_t const* EARxBpEB,
+    uint32_t const* pow_target, uint32_t const* pow_key,
+    void* host_signal_sync, void* host_signal_header_pinned,
+    uint64_t* inner_hash_counter, int M, int N, int K, cudaStream_t stream);
 // noisingB lives in namespace pearl::sm89; noisingA in the global namespace.
 extern "C" void pearl_noisingB_sm89_64x128x64_R128_int32(
     int8_t const* B, int8_t const* EBR, int8_t const* EBL, int8_t const* EAR,
@@ -386,10 +397,24 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
   memset(g.hHeader, 0, host_signal_header_size);
   prof.mark(5);
 
-  pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nostore(
-      g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
-      g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
-      g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, 0);
+  // Default to the denoise-OFF search kernel (~1.6x faster, bit-identical
+  // transcript/digest). Set PEARL_MINER_DENOISE=1 to force the legacy denoise-ON
+  // path (e.g. for an on-rig A/B or if a future proof needs the useful-work C).
+  static const bool force_denoise = [](){
+    const char* v = std::getenv("PEARL_MINER_DENOISE");
+    return v && v[0] && v[0] != '0';
+  }();
+  if (force_denoise) {
+    pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nostore(
+        g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
+        g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
+        g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, 0);
+  } else {
+    pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nodenoise_nostore(
+        g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
+        g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
+        g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, 0);
+  }
   prof.mark(6);
   CUCHK(cudaDeviceSynchronize());
   cudaError_t le = cudaGetLastError();

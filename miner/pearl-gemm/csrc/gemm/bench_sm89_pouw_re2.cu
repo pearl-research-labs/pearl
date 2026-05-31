@@ -93,6 +93,25 @@ extern "C" void pearl_gemm_sm89_pow_128x256x128_R256_nostore(
     uint64_t* inner_hash_counter,
     int M, int N, int K, cudaStream_t stream);
 
+// ---- Lever: DENOISE-OFF search variant (transcript ON, fp16 denoise elided);
+//      bit-identical transcript/digest, used for the mining search loop. -------
+extern "C" void pearl_gemm_sm89_pow_128x256x128_R256_nodenoise_nostore(
+    int8_t const* A, int64_t lda,
+    int8_t const* B, int64_t ldb,
+    cutlass::half_t* C, int64_t ldc,
+    float const* A_scales,
+    float const* B_scales,
+    cutlass::half_t const* EAL,
+    cutlass::half_t const* EBR,
+    cutlass::half_t const* AxEBL,
+    cutlass::half_t const* EARxBpEB,
+    uint32_t const* pow_target,
+    uint32_t const* pow_key,
+    void* host_signal_sync,
+    void* host_signal_header_pinned,
+    uint64_t* inner_hash_counter,
+    int M, int N, int K, cudaStream_t stream);
+
 // Trait alias (must match pearl_gemm_sm89_pow_inst_128x256x128.cu) so we can
 // statically probe sizeof(SharedStorage) for the PoW tile vs the 99 KB cap.
 using PowTraits128x256x128_R256 = KernelTraitsSm89<
@@ -113,6 +132,10 @@ static constexpr int R_DIM = 256;
 // optionally sanity-checks the output is finite + non-zero (5090 smoke).
 static double bench(int M, int N, int K, int iters, bool sanity_check,
                     bool no_store) {
+    // DENOISE-OFF search variant (transcript ON): set PEARL_BENCH_NODENOISE=1.
+    // Only meaningful with no_store (the search path); bit-identical digest.
+    const char* nd_env = std::getenv("PEARL_BENCH_NODENOISE");
+    const bool nodenoise = no_store && nd_env && std::atoi(nd_env) != 0;
     // ---- host buffers (int7-style random fill; bench times, denoise factor
     //      values don't affect timing or the finiteness of the main GEMM) ----
     std::vector<int8_t> hA(size_t(M)*K), hB(size_t(N)*K);
@@ -207,7 +230,13 @@ static double bench(int M, int N, int K, int iters, bool sanity_check,
                 dEARxBpEB_i32 + size_t(0)*R_DIM + roff,
                 N, K, 0);
         }
-        if (no_store) {
+        if (no_store && nodenoise) {
+            pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nodenoise_nostore(
+                dApEA, K, dBpEB, K, dC, N, dAs, dBs,
+                dEAL_fp16, dEBR_fp16, dAxEBL_fp16, dEARxBpEB_fp16,
+                dTarget, dKey, dSignalSync, dSignalHeader, nullptr,
+                M, N, K, 0);
+        } else if (no_store) {
             pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nostore(
                 dApEA, K, dBpEB, K, dC, N, dAs, dBs,
                 dEAL_fp16, dEBR_fp16, dAxEBL_fp16, dEARxBpEB_fp16,
@@ -264,7 +293,8 @@ static double bench(int M, int N, int K, int iters, bool sanity_check,
     printf("  M=%6d N=%6d K=%5d  %.3f ms/attempt  full_PoUW=%7.2f tmac_s  "
            "main_gemm=%7.2f TOPS  %.3f attempts/s  [%s]\n",
            M, N, K, ms / iters, tmac_s, main_tops, attempts_per_sec,
-           no_store ? "no-C-store" : "C-store");
+           nodenoise ? "no-denoise no-C-store"
+                     : (no_store ? "no-C-store" : "C-store"));
 
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     cudaFree(dA); cudaFree(dB); cudaFree(dApEA); cudaFree(dBpEB);
