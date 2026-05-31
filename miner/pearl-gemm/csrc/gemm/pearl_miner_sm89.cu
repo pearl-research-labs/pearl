@@ -133,6 +133,8 @@ extern "C" void pearl_miner_split_rmajor_256_sm89(
     const int8_t* in, int8_t* out_lo, int8_t* out_hi, size_t rows,
     cudaStream_t stream);
 
+#include "blake3_tree_host.hpp"  // canonical keyed-BLAKE3 matrix root (== pearl_mining)
+
 using pearl_miner::Seeds;
 using pearl_miner::derive_seeds;
 using pearl_miner::transcript_hash;
@@ -156,6 +158,7 @@ struct Args {
   std::string target_endian = "big";  // "big" (pool/human, MSB-first) or "little"
   int m = 131072, n = 131072, k = 4096, r = 256, dev = 0;
   uint64_t nonce_start = 0, nonce_count = 1;
+  int real_commit = 0;  // 1 = search with the real per-nonce A/B merkle-root commitment
 };
 
 static bool from_hex(const std::string& s, std::vector<uint8_t>& out) {
@@ -188,6 +191,7 @@ static void parse_kv(const std::string& tok, Args& a) {
   else if (k == "dev") a.dev = atoi(v.c_str());
   else if (k == "nonce_start") a.nonce_start = strtoull(v.c_str(), nullptr, 0);
   else if (k == "nonce_count") a.nonce_count = strtoull(v.c_str(), nullptr, 0);
+  else if (k == "real_commit") a.real_commit = atoi(v.c_str());
 }
 
 // Deterministic A/B fill from a 64-bit seed (splitmix64 -> int8 in [-64,63]).
@@ -233,6 +237,11 @@ struct GpuBufs {
   // kernels require ld=128 — a strided slice of the (rows,256) buffer is wrong).
   int8_t  *dEAL_h[2]={0,0}, *dEAR_h[2]={0,0};   // noisingA: EAL(M), EAR(K)
   int8_t  *dEBR_h[2]={0,0}, *dEBL_h[2]={0,0};   // noisingB: EBR(N), EBL(K)
+  // ---- real-commitment mining (per-nonce A/B keyed-BLAKE3 merkle roots) ----
+  bool real_commit=false;                    // search with the verifier's real key
+  std::vector<uint8_t> header, config;       // job header(76)+config(52) for derive_seeds
+  uint8_t *hA_host=0, *hB_host=0;            // pinned D2H staging for the merkle roots
+  Seeds cur_seeds;                           // seeds actually used this attempt (real or fallback)
 };
 
 static void alloc_bufs(GpuBufs& g, int M, int N, int K, bool mine) {
@@ -276,6 +285,9 @@ static void alloc_bufs(GpuBufs& g, int M, int N, int K, bool mine) {
       CUCHK(cudaMalloc(&g.dEBR_h[h], size_t(N)*128));
       CUCHK(cudaMalloc(&g.dEBL_h[h], size_t(K)*128));
     }
+    // Pinned host staging for the per-nonce A/B merkle roots (real commitment).
+    CUCHK(cudaMallocHost(&g.hA_host, size_t(M)*K));
+    CUCHK(cudaMallocHost(&g.hB_host, size_t(N)*K));
   }
 }
 
@@ -336,9 +348,29 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
   pearl_miner_fill_AB_sm89(g.dB, size_t(N)*K, ab_seed ^ 0xD1B54A32D192ED03ULL, 0);
   prof.mark(1);
 
+  // Establish this attempt's seeds. Real-commitment mode computes the verifier's
+  // key from the ACTUAL A/B: A_root/B_root = keyed-BLAKE3(job_key, raw A / raw B^T)
+  // (== pearl_mining.MerkleTree.root), then derive_seeds runs the commitment chain.
+  // Without it the search uses header-only fallback seeds -> spurious hits the pool
+  // rejects. (D2H of A/B per attempt; dominant cost until an on-device root lands.)
+  if (g.real_commit) {
+    CUCHK(cudaMemcpy(g.hA_host, g.dA, size_t(M)*K, cudaMemcpyDeviceToHost));
+    CUCHK(cudaMemcpy(g.hB_host, g.dB, size_t(N)*K, cudaMemcpyDeviceToHost));
+    uint8_t job_key[32], a_root[32], b_root[32];
+    pearl_miner::blake3::hash_concat(g.header.data(), g.header.size(),
+                                     g.config.data(), g.config.size(), nullptr, job_key);
+    pearl_miner::b3tree::blake3_keyed_tree(job_key, g.hA_host, size_t(M)*K, a_root);
+    pearl_miner::b3tree::blake3_keyed_tree(job_key, g.hB_host, size_t(N)*K, b_root);
+    g.cur_seeds = derive_seeds(g.header.data(), g.header.size(),
+                               g.config.data(), g.config.size(), a_root, b_root);
+  } else {
+    g.cur_seeds = s;
+  }
+  const Seeds& cs = g.cur_seeds;
+
   // 2. on-device noise factors (R=256) from a/b_noise_seed.
-  CUCHK(cudaMemcpy(g.dKeyA, s.a_noise_seed, 32, cudaMemcpyHostToDevice));
-  CUCHK(cudaMemcpy(g.dKeyB, s.b_noise_seed, 32, cudaMemcpyHostToDevice));
+  CUCHK(cudaMemcpy(g.dKeyA, cs.a_noise_seed, 32, cudaMemcpyHostToDevice));
+  CUCHK(cudaMemcpy(g.dKeyB, cs.b_noise_seed, 32, cudaMemcpyHostToDevice));
   pearl_miner_noisegen_sm89_R256(
       g.dEAL_i8, g.dEBR_i8, g.dEAR_R, g.dEAR_K, g.dEBL_R, g.dEBL_K,
       g.dKeyA, g.dKeyB, M, N, K, 0);
@@ -391,7 +423,7 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
   CUCHK(cudaMemset(g.dAxEBL_fp16, 0, size_t(M)*R_DIM*2));
   CUCHK(cudaMemset(g.dEARxBpEB_fp16, 0, size_t(N)*R_DIM*2));
 
-  CUCHK(cudaMemcpy(g.dKey, s.a_noise_seed, 32, cudaMemcpyHostToDevice));
+  CUCHK(cudaMemcpy(g.dKey, cs.a_noise_seed, 32, cudaMemcpyHostToDevice));
   HostSignalSync zsync{};
   CUCHK(cudaMemcpy(g.dSync, &zsync, sizeof(zsync), cudaMemcpyHostToDevice));
   memset(g.hHeader, 0, host_signal_header_size);
@@ -1040,16 +1072,24 @@ int main(int argc, char** argv) {
     printf("\"}\n");
   };
 
-  // Mining loop: nonce -> header[72:76] -> seeds -> attempt.
+  // Mining loop: nonce -> seeds -> attempt.
+  // Real-commitment mining keeps the job header FIXED (mutating header[72:76]
+  // would make the proof header != the job header -> pool reject) and searches by
+  // varying ab_seed; run_attempt_mine derives the verifier's real key from each A/B.
+  g.real_commit = (a.real_commit != 0);
+  g.header = header; g.config = config;
   uint64_t start = a.nonce_start, count = a.nonce_count;
   if (a.mode == "verify" && count == 0) count = 1;
   for (uint64_t i = 0; i < count; ++i) {
     uint64_t nonce = start + i;
-    // mutate the 4-byte nonce suffix of the header.
-    header[72] = (uint8_t)(nonce);
-    header[73] = (uint8_t)(nonce >> 8);
-    header[74] = (uint8_t)(nonce >> 16);
-    header[75] = (uint8_t)(nonce >> 24);
+    // Smoke/self-consistent mode varies the header nonce; real-commitment mode
+    // keeps the header fixed (search diversity comes from ab_seed -> A/B).
+    if (!g.real_commit) {
+      header[72] = (uint8_t)(nonce);
+      header[73] = (uint8_t)(nonce >> 8);
+      header[74] = (uint8_t)(nonce >> 16);
+      header[75] = (uint8_t)(nonce >> 24);
+    }
 
     // Seeds: job_key = blake3(header||config). The full-matrix merkle roots
     // (hash_a/hash_b) depend on the private A/B and are computed by the driver
@@ -1075,8 +1115,11 @@ int main(int argc, char** argv) {
     int hit = run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy);
     if (hit) {
       int a_rows[8], b_cols[16]; uint32_t T[16]; uint8_t gpu_hash[32];
-      read_transcript_and_indices(g, s, a.k, ix, iy, a_rows, b_cols, T);
-      transcript_hash(T, s.a_noise_seed, gpu_hash);
+      // Use the seeds the kernel ACTUALLY searched with (real per-nonce commitment
+      // when real_commit, else the fallback s) so gpu_hash/opened indices match.
+      const Seeds& hs = g.real_commit ? g.cur_seeds : s;
+      read_transcript_and_indices(g, hs, a.k, ix, iy, a_rows, b_cols, T);
+      transcript_hash(T, hs.a_noise_seed, gpu_hash);
 
       // VERIFY cross-check: independently recompute the transcript from the RAW
       // (un-noised) seed-derived A/B strips using the HOST noise reference, and
