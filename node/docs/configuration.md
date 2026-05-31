@@ -126,8 +126,7 @@ It is a flat, binary file containing Pearl blockchain data starting from the
 genesis block and continuing through a relatively recent block height depending
 on the last time it was updated.
 
-See [this](https://bitcointalk.org/index.php?topic=145386.0) thread on
-bitcointalk for more details.
+See the Pearl block explorer at [explorer.pearlresearch.ai](https://explorer.pearlresearch.ai) for more details.
 
 **NOTE:** Using bootstrap.dat is entirely optional.  Pearld will download the
 block chain from other peers through the Pearl protocol with no extra
@@ -152,8 +151,8 @@ Cons:
 
 ### Where do I get bootstrap.dat?
 
-The bootstrap.dat file is made available via a torrent.  See
-[this](https://bitcointalk.org/index.php?topic=145386.0) thread on bitcointalk
+The bootstrap.dat file is made available via a torrent. Check the
+[Pearl Discord](https://discord.gg/joinpearl) or [explorer.pearlresearch.ai](https://explorer.pearlresearch.ai)
 for the torrent download details.
 
 ### How do I know I can trust the bootstrap.dat I downloaded?
