@@ -268,7 +268,7 @@ struct CollectiveMainloopSm89 {
         hash_accumulator.preload(transcript_extraction_tensor);
       }
 
-      // ----- Lever 2: 1-deep A-operand register prefetch -----
+      // ----- Lever 2: full per-tile A-operand register preload -----
       // A is the small operand (bM=128/8warps → 1 LDSM.x4 per k_block, ~4 regs).
       // Preload ALL K_BLOCK_MAX A fragments for this tile up front into the
       // distinct slots of tXrA so each k_block's IMMA reads an already-resident
