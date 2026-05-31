@@ -220,10 +220,15 @@ def _parse_gpu_output(out: str) -> Optional[dict]:
 SERVE_BIN_ARGS = ["mode=serve", "m=131072", "n=131072", "r=256"]
 
 
-def _serve_argv_remote(bin_path: str, k: int, dev: int) -> str:
-    """The remote command for the persistent serve-mode binary (ssh-rig)."""
+def _serve_argv_remote(bin_path: str, k: int, dev: int, config_hex: str) -> str:
+    """The remote command for the persistent serve-mode binary (ssh-rig).
+
+    serve mode still requires the 52-byte mining `config` on argv (the header
+    arrives per-JOB on stdin, but config does not) — without it the binary
+    exits with "bad config (need 52B hex)" before the serve loop starts.
+    """
     env_prefix = " ".join(f"{kk}={vv}" for kk, vv in GPU_ENV.items())
-    args = " ".join(SERVE_BIN_ARGS + [f"k={k}", f"dev={dev}"])
+    args = " ".join(SERVE_BIN_ARGS + [f"k={k}", f"dev={dev}", f"config={config_hex}"])
     return f"env {env_prefix} {bin_path} {args}"
 
 
@@ -903,7 +908,9 @@ class ServeLoop:
 
     def _ssh_argv(self) -> list[str]:
         k = int(self.mining_config.common_dim)
-        remote = _serve_argv_remote(self.bin_path, k, self.dev)
+        remote = _serve_argv_remote(
+            self.bin_path, k, self.dev, self.mining_config.to_bytes().hex()
+        )
         return [
             "ssh", "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
