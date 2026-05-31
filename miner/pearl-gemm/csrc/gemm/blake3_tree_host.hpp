@@ -101,6 +101,29 @@ inline Output parent_output(const uint32_t l[8], const uint32_t r[8], const uint
   o.counter = 0; o.block_len = BLOCK_LEN; o.flags = flags | PARENT; return o;
 }
 
+// Reduce precomputed per-chunk output-CVs (cvs[c*8..]) to the keyed-BLAKE3 root.
+// Requires n_chunks to be a power of two >= 2 (the mining shape: M*K/1024 = 2^19,
+// N*K/1024 = 2^19). For a perfect binary tree this pairwise reduce is bit-identical
+// to blake3_keyed_tree (verified): internal nodes use output_cv(parent), the single
+// top node uses output_root(parent). Lets the expensive chunk hashing run on-GPU
+// (only the 16 MB CV array is copied back, not the 512 MB matrix).
+inline void blake3_root_from_chunk_cvs(const uint8_t key32[32], const uint32_t* cvs,
+                                       size_t n_chunks, uint8_t out32[32]) {
+  uint32_t key[8]; for (int i = 0; i < 8; ++i) key[i] = ld32(key32 + 4 * i);
+  std::vector<uint32_t> cur(cvs, cvs + n_chunks * 8);
+  size_t n = n_chunks;
+  while (n > 1) {
+    size_t half = n / 2;
+    for (size_t i = 0; i < half; ++i) {
+      Output p = parent_output(&cur[(2 * i) * 8], &cur[(2 * i + 1) * 8], key, KEYED_HASH);
+      if (n == 2) { output_root(&p, out32); return; }
+      uint32_t cv[8]; output_cv(&p, cv);
+      for (int j = 0; j < 8; ++j) cur[i * 8 + j] = cv[j];
+    }
+    n = half;
+  }
+}
+
 // Chaining value of one chunk (counter = chunk index). NO root flag.
 inline void chunk_cv(const uint32_t key[8], const uint8_t* data, size_t len,
                      uint64_t counter, uint32_t cv_out[8]) {

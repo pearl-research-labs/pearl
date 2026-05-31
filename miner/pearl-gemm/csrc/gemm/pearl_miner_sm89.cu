@@ -128,6 +128,10 @@ extern "C" void pearl_noisingA_sm89_64x128x64_R128_int32(
 // Device-side seed-derived A/B fill (bit-exact with host fill_AB).
 extern "C" void pearl_miner_fill_AB_sm89(int8_t* dst, size_t n, uint64_t seed,
                                          cudaStream_t stream);
+// On-GPU keyed-BLAKE3 per-chunk CVs (matrix stays in VRAM); host reduces to root.
+extern "C" void pearl_blake3_chunk_cvs_sm89(const uint8_t* d_data, size_t n_bytes,
+                                            const uint8_t key[32], uint32_t* d_cvs,
+                                            cudaStream_t stream);
 // Split an R-major (rows,256) int8 matrix into two contiguous (rows,128) halves.
 extern "C" void pearl_miner_split_rmajor_256_sm89(
     const int8_t* in, int8_t* out_lo, int8_t* out_hi, size_t rows,
@@ -240,7 +244,8 @@ struct GpuBufs {
   // ---- real-commitment mining (per-nonce A/B keyed-BLAKE3 merkle roots) ----
   bool real_commit=false;                    // search with the verifier's real key
   std::vector<uint8_t> header, config;       // job header(76)+config(52) for derive_seeds
-  uint8_t *hA_host=0, *hB_host=0;            // pinned D2H staging for the merkle roots
+  uint32_t *d_cvs=0;                          // device per-chunk CVs (on-GPU root)
+  uint8_t  *h_cvs=0;                          // pinned host CV array (16MB, reduced to root)
   Seeds cur_seeds;                           // seeds actually used this attempt (real or fallback)
 };
 
@@ -285,9 +290,10 @@ static void alloc_bufs(GpuBufs& g, int M, int N, int K, bool mine) {
       CUCHK(cudaMalloc(&g.dEBR_h[h], size_t(N)*128));
       CUCHK(cudaMalloc(&g.dEBL_h[h], size_t(K)*128));
     }
-    // Pinned host staging for the per-nonce A/B merkle roots (real commitment).
-    CUCHK(cudaMallocHost(&g.hA_host, size_t(M)*K));
-    CUCHK(cudaMallocHost(&g.hB_host, size_t(N)*K));
+    // On-GPU merkle-root scratch: per-chunk CVs (32B each). 1 CV per 1024 bytes.
+    size_t max_chunks = (size_t(M)*K > size_t(N)*K ? size_t(M)*K : size_t(N)*K) / 1024;
+    CUCHK(cudaMalloc(&g.d_cvs, max_chunks * 32));
+    CUCHK(cudaMallocHost(&g.h_cvs, max_chunks * 32));
   }
 }
 
@@ -354,13 +360,18 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
   // Without it the search uses header-only fallback seeds -> spurious hits the pool
   // rejects. (D2H of A/B per attempt; dominant cost until an on-device root lands.)
   if (g.real_commit) {
-    CUCHK(cudaMemcpy(g.hA_host, g.dA, size_t(M)*K, cudaMemcpyDeviceToHost));
-    CUCHK(cudaMemcpy(g.hB_host, g.dB, size_t(N)*K, cudaMemcpyDeviceToHost));
     uint8_t job_key[32], a_root[32], b_root[32];
     pearl_miner::blake3::hash_concat(g.header.data(), g.header.size(),
                                      g.config.data(), g.config.size(), nullptr, job_key);
-    pearl_miner::b3tree::blake3_keyed_tree(job_key, g.hA_host, size_t(M)*K, a_root);
-    pearl_miner::b3tree::blake3_keyed_tree(job_key, g.hB_host, size_t(N)*K, b_root);
+    // A_root / B_root: per-chunk CVs computed ON-GPU (A/B stay in VRAM), only the
+    // ~16MB CV array is copied back and reduced to the root on host (cheap).
+    size_t a_chunks = size_t(M)*K / 1024, b_chunks = size_t(N)*K / 1024;
+    pearl_blake3_chunk_cvs_sm89((const uint8_t*)g.dA, size_t(M)*K, job_key, g.d_cvs, 0);
+    CUCHK(cudaMemcpy(g.h_cvs, g.d_cvs, a_chunks*32, cudaMemcpyDeviceToHost));
+    pearl_miner::b3tree::blake3_root_from_chunk_cvs(job_key, (const uint32_t*)g.h_cvs, a_chunks, a_root);
+    pearl_blake3_chunk_cvs_sm89((const uint8_t*)g.dB, size_t(N)*K, job_key, g.d_cvs, 0);
+    CUCHK(cudaMemcpy(g.h_cvs, g.d_cvs, b_chunks*32, cudaMemcpyDeviceToHost));
+    pearl_miner::b3tree::blake3_root_from_chunk_cvs(job_key, (const uint32_t*)g.h_cvs, b_chunks, b_root);
     g.cur_seeds = derive_seeds(g.header.data(), g.header.size(),
                                g.config.data(), g.config.size(), a_root, b_root);
   } else {

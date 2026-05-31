@@ -45,6 +45,7 @@ $NVCC "${FLAGS[@]}" \
   pearl_gemm_sm89_pow_inst_128x256x128.cu \
   pearl_gemm_sm89_pow_inst_128x256x128_nostore.cu \
   pearl_gemm_sm89_pow_inst_128x256x128_nodenoise_nostore.cu \
+  pearl_blake3_root_sm89.cu \
   pearl_miner_noisegen_sm89.cu \
   pearl_noisingA_sm89_inst.cu \
   pearl_noisingB_sm89_inst.cu \
