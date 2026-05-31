@@ -303,9 +303,134 @@ struct SkinnyShapeTileScheduler {
 };
 
 // ===========================================================================
+// PersistentL2BlockTileScheduler — 2D super-block (block-cyclic) rasterization.
+//
+// The 1D swizzle in PersistentSwizzledTileScheduler keeps ONE operand panel
+// (the non-major-axis tile) hot across a group of `swizzle` major-axis tiles.
+// At the huge 131072² mining shape both A and B are 512 MB each — far past the
+// 48 MB L2 — and a 1D swizzle still streams the OTHER operand's full panel from
+// DRAM. This scheduler instead partitions the M×N output-tile grid into 2D
+// super-blocks of (bm × bn) tiles and has every CTA finish one super-block
+// before moving to the next. Across a super-block the touched footprint is:
+//
+//     A row-panel : bm · bM · K · sizeof(int8)   (bm M-tiles, full K)
+//     B col-panel : bn · bN · K · sizeof(int8)   (bn N-tiles, full K)
+//
+// Choosing bm,bn so (A-panel + B-panel) ≲ 2/3·L2 (~32 MB) keeps BOTH operands'
+// panels resident in L2 for the duration of the super-block instead of
+// streaming. The host picks bm,bn from L2 size (see launcher); env vars
+// PEARL_SM89_L2BLOCK / _BM / _BN override.
+//
+// MAPPING (linear tile_idx -> (m,n)) is a strict bijection over
+// [0, num_blocks_m*num_blocks_n), so the persistent grid-stride loop covers
+// every tile exactly once (no skip / no dup) for ANY bm,bn and any grid size:
+//
+//   Super-blocks are swept row-major over the super-block grid; tiles within a
+//   super-block are swept row-major. Bands (super-block rows) of height bm
+//   partition M; within a band, col-super-blocks of width bn partition N. Edge
+//   super-blocks are clamped via min() but the running counts stay exact
+//   because every super-block before a clamped one is full-size.
+//
+//     band   = idx / (bm * N)          ; r_band = idx % (bm * N)
+//     m0     = band * bm ; h = min(bm, M - m0)
+//     sbcol  = r_band / (h * bn)        ; r_sb  = r_band % (h * bn)
+//     n0     = sbcol * bn ; w = min(bn, N - n0)
+//     m = m0 + r_sb / w ; n = n0 + r_sb % w
+//
+// Plain integer div/mod (not FastDivmod): the divisors h*bn / w vary per
+// super-block so they can't be precomputed, and this runs at most a few
+// thousand times per CTA in the grid-stride loop — utterly negligible next to
+// the K=4096 mainloop. Bit-exact identical math to every other scheduler; only
+// WHICH tile a CTA computes changes.
+//
+// Compatibility: same Params/WorkTileInfo interface as PersistentSwizzled, so
+// it binds to the same `ada_gemm<KTraits, Scheduler>` kernel with no kernel
+// changes.
+// ===========================================================================
+struct PersistentL2BlockTileScheduler {
+  struct Arguments {
+    int num_blocks_m;
+    int num_blocks_n;
+    int block_m;  // super-block height in tiles (bm)
+    int block_n;  // super-block width  in tiles (bn)
+  };
+  struct Params {
+    int total_blocks;
+    int num_blocks_m;
+    int num_blocks_n;
+    int block_m;
+    int block_n;
+  };
+
+  static Params to_underlying_arguments(Arguments const& a) {
+    int bm = (a.block_m > 0) ? a.block_m : 1;
+    int bn = (a.block_n > 0) ? a.block_n : 1;
+    if (bm > a.num_blocks_m) bm = a.num_blocks_m;
+    if (bn > a.num_blocks_n) bn = a.num_blocks_n;
+    if (bm < 1) bm = 1;
+    if (bn < 1) bn = 1;
+    return Params{
+      a.num_blocks_m * a.num_blocks_n,
+      a.num_blocks_m, a.num_blocks_n, bm, bn};
+  }
+
+  static dim3 get_grid_dim(Arguments const& a, int num_sm) {
+    int const total = a.num_blocks_m * a.num_blocks_n;
+    int grid = (num_sm < total) ? num_sm : total;
+    if (grid < 1) grid = 1;
+    return dim3(static_cast<uint32_t>(grid), 1u, 1u);
+  }
+
+  struct WorkTileInfo {
+    int tile_idx;
+    CUTLASS_DEVICE bool is_valid(Params const& p) const {
+      return tile_idx < p.total_blocks;
+    }
+    template <typename ClusterShape>
+    CUTLASS_DEVICE cute::tuple<int32_t, int32_t, int32_t>
+    get_block_coord(Params const& p) const {
+      int const M  = p.num_blocks_m;
+      int const N  = p.num_blocks_n;
+      int const bm = p.block_m;
+      int const bn = p.block_n;
+
+      int const band_tiles = bm * N;
+      int const band   = tile_idx / band_tiles;   // super-block row
+      int const r_band = tile_idx - band * band_tiles;
+      int const m0     = band * bm;
+      int const h      = (bm < (M - m0)) ? bm : (M - m0);  // clamped height
+
+      int const col_tiles = h * bn;
+      int const sbcol = r_band / col_tiles;        // super-block column
+      int const r_sb  = r_band - sbcol * col_tiles;
+      int const n0    = sbcol * bn;
+      int const w     = (bn < (N - n0)) ? bn : (N - n0);   // clamped width
+
+      int const m_block = m0 + r_sb / w;
+      int const n_block = n0 + r_sb % w;
+      return cute::make_tuple(m_block, n_block, 0);
+    }
+  };
+
+  CUTLASS_DEVICE PersistentL2BlockTileScheduler() {}
+  CUTLASS_DEVICE WorkTileInfo get_initial_work(Params const&) const {
+    return WorkTileInfo{int(blockIdx.x)};
+  }
+  CUTLASS_DEVICE void init_consumer() const {}
+  CUTLASS_DEVICE void prefetch_next_work(Params const&, WorkTileInfo&) const {}
+  CUTLASS_DEVICE void broadcast_next_work(WorkTileInfo&) const {}
+  template <bool IsProducer = false>
+  CUTLASS_DEVICE WorkTileInfo
+  get_next_work(Params const&, WorkTileInfo const& cur) const {
+    return WorkTileInfo{cur.tile_idx + int(gridDim.x)};
+  }
+};
+
+// ===========================================================================
 // Production launcher. Picks PersistentSwizzledTileScheduler with a swizzle
 // width chosen from device L2 cache size. PEARL_SM89_STREAMK=1 + skinny shape
 // (aspect ratio ≥ 4) selects SkinnyShapeTileScheduler instead.
+// PEARL_SM89_L2BLOCK[_BM/_BN] selects PersistentL2BlockTileScheduler.
 // ===========================================================================
 template <typename KTraits>
 void pearl_gemm_sm89_run(
@@ -500,6 +625,53 @@ void pearl_gemm_sm89_run(
   bool use_streamk = cached_streamk && skinny_aspect && enough_tiles &&
                      !use_multinonce;
 
+  // ---------------------------------------------------------------------------
+  // PEARL_SM89_L2BLOCK: env-gated PersistentL2BlockTileScheduler dispatch.
+  //
+  // 2D super-block (block-cyclic) rasterization for the huge 131072² mining
+  // shape, where A and B are each 512 MB ≫ 48 MB L2 and the 1D swizzle still
+  // streams one operand from DRAM. A super-block of (bm × bn) tiles touches an
+  // A row-panel of bm·bM·K bytes + a B col-panel of bn·bN·K bytes; sizing them
+  // to fit ~2/3 of L2 keeps both operands hot for the whole super-block.
+  //
+  //   PEARL_SM89_L2BLOCK    = N  -> square super-block, bm = bn = N (tiles/side)
+  //   PEARL_SM89_L2BLOCK_BM = N  -> override super-block height (tiles)
+  //   PEARL_SM89_L2BLOCK_BN = N  -> override super-block width  (tiles)
+  // Any of the three present activates the scheduler. _BM/_BN take precedence
+  // over the square _L2BLOCK for their respective axis. Takes precedence over
+  // StreamK; multi-nonce still wins (its own L2-reuse story). Default unset =>
+  // PersistentSwizzled (no regression).
+  static int const cached_l2block = []() {
+    char const* e = std::getenv("PEARL_SM89_L2BLOCK");
+    if (e == nullptr) return 0;
+    int v = std::atoi(e);
+    return (v >= 1 && v <= 4096) ? v : 0;
+  }();
+  static int const cached_l2block_bm = []() {
+    char const* e = std::getenv("PEARL_SM89_L2BLOCK_BM");
+    if (e == nullptr) return 0;
+    int v = std::atoi(e);
+    return (v >= 1 && v <= 4096) ? v : 0;
+  }();
+  static int const cached_l2block_bn = []() {
+    char const* e = std::getenv("PEARL_SM89_L2BLOCK_BN");
+    if (e == nullptr) return 0;
+    int v = std::atoi(e);
+    return (v >= 1 && v <= 4096) ? v : 0;
+  }();
+  bool use_l2block = (cached_l2block > 0 || cached_l2block_bm > 0 ||
+                      cached_l2block_bn > 0) && !use_multinonce;
+  // Resolve super-block extents (tiles). Square base from _L2BLOCK, per-axis
+  // overrides on top. If only _BM or only _BN is given, the other defaults to
+  // the same value (square) so the footprint stays balanced.
+  int l2b_bm = cached_l2block;
+  int l2b_bn = cached_l2block;
+  if (cached_l2block_bm > 0) l2b_bm = cached_l2block_bm;
+  if (cached_l2block_bn > 0) l2b_bn = cached_l2block_bn;
+  if (l2b_bm < 1) l2b_bm = (l2b_bn > 0 ? l2b_bn : 1);
+  if (l2b_bn < 1) l2b_bn = (l2b_bm > 0 ? l2b_bm : 1);
+  if (use_streamk && use_l2block) use_streamk = false;  // L2BLOCK wins
+
   typename Scheduler::Arguments sched_args{
       num_blocks_m, num_blocks_n, swizzle, swizzle_n_maj_eff};
   auto sched_params    = Scheduler::to_underlying_arguments(sched_args);
@@ -551,6 +723,27 @@ void pearl_gemm_sm89_run(
       use_streamk = false;
     } else {
       sk_attr_set = true;
+    }
+  }
+
+  // L2Block kernel's smem requirement is identical (same KTraits::SharedStorage)
+  // but it's a different __global__ symbol, so set the attribute for its binding.
+  using L2BlockSched = PersistentL2BlockTileScheduler;
+  static bool l2b_attr_set = false;
+  if (use_l2block && !l2b_attr_set) {
+    cudaError_t e = cudaFuncSetAttribute(
+        (void const*)&pearl::ada_gemm<KTraits, L2BlockSched>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_size));
+    if (e != cudaSuccess) {
+      std::fprintf(stderr,
+                   "pearl_gemm_sm89_run: l2block cudaFuncSetAttribute"
+                   "(MaxDynamicSmem=%zu) failed: %s — falling back to "
+                   "PersistentSwizzled.\n",
+                   smem_size, cudaGetErrorString(e));
+      use_l2block = false;
+    } else {
+      l2b_attr_set = true;
     }
   }
 
@@ -671,6 +864,27 @@ void pearl_gemm_sm89_run(
       }
       return;
     }
+  }
+
+  if (use_l2block) {
+    // ---- 2D L2 super-block launch path ----
+    // Persistent grid (= min(num_sm, total_tiles)), grid-stride loop. Each CTA
+    // completes one (bm × bn)-tile super-block before the next, keeping both
+    // operands' panels hot in L2 across the super-block.
+    typename L2BlockSched::Arguments l2b_args{
+        num_blocks_m, num_blocks_n, l2b_bm, l2b_bn};
+    auto l2b_params = L2BlockSched::to_underlying_arguments(l2b_args);
+    dim3 l2b_grid   = L2BlockSched::get_grid_dim(l2b_args, num_sm);
+
+    pearl::ada_gemm<KTraits, L2BlockSched>
+        <<<l2b_grid, block, smem_size, stream>>>(
+            mainloop_params, epilogue_params, l2b_params);
+
+    if (restore_attr) {
+      cudaStreamSetAttribute(
+          stream, cudaStreamAttributeAccessPolicyWindow, &prev_attr);
+    }
+    return;
   }
 
   if (use_streamk) {
