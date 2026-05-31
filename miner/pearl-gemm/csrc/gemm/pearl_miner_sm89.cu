@@ -32,6 +32,9 @@
 // I/O contract (stdin/argv JSON-ish key=value, keeps it dep-free):
 //   header=<hex 76B>  config=<hex 52B>  target=<hex 64 chars, BIG-endian uint256>
 //   target_endian=big|little (default big = pool/human MSB-first convention)
+//   NOTE: `target` is the raw per-SHARE wire target. The binary multiplies it by
+//   the verifier's difficulty_adjustment_factor (h*w*k) before the on-device
+//   comparison, matching extract_difficulty_bound / verify_plain_proof.
 //   m=<int> n=<int> k=<int> r=256  nonce_start=<u64> nonce_count=<u64>
 //   mode=verify|mine|bench  dev=<int>
 // On a hit, prints a single line:
@@ -457,7 +460,8 @@ static int run_attempt(GpuBufs& g, const Seeds& s, int M, int N, int K,
   CUCHK(cudaMemset(g.dEARxBpEB_fp16, 0, size_t(N)*R_DIM*2));
 
   // ---- target/key + reset signal ----
-  // pow_key = a_noise_seed (uint32[8] LE). pow_target = wire target (uint256 LE).
+  // pow_key = a_noise_seed (uint32[8] LE). pow_target = adjusted threshold
+  // (wire_target * h*w*k) as uint256 LE — see the target-adjustment block in main().
   CUCHK(cudaMemcpy(g.dKey, s.a_noise_seed, 32, cudaMemcpyHostToDevice));
   HostSignalSync zsync{};
   CUCHK(cudaMemcpy(g.dSync, &zsync, sizeof(zsync), cudaMemcpyHostToDevice));
@@ -593,6 +597,32 @@ int main(int argc, char** argv) {
     // traw is MSB-first when big-endian. Re-emit T as little-endian bytes.
     for (int i = 0; i < 32; ++i)
       target_le[i] = big ? traw[31 - i] : traw[i];
+
+    // --- difficulty adjustment: device threshold = wire_target * (h*w*k) ------
+    // The wire `target` is the per-SHARE difficulty target only. The PoW the
+    // device compares against is the verifier's adjusted bound:
+    //   accept iff  int.from_bytes(jackpot_hash,"little") <= target * (h*w*k)
+    // This is EXACTLY `extract_difficulty_bound` in zk-pow/src/api/sanity_checks.rs
+    // (target_difficulty * difficulty_adjustment_factor, factor = h*w*dot_product_length),
+    // which `verify_plain_proof` enforces. Without this factor the on-device
+    // threshold is h*w*k (~2^19) times too HARD and the miner finds ZERO shares.
+    //   h = rows_pattern.size() = 8   (RP), w = cols_pattern.size() = 16 (CP),
+    //   k = dot_product_length = common_dim - common_dim % rank.
+    // The product fits in 256 bits for any live target (2^206 * 2^19 = 2^225),
+    // and is clamped to 2^256-1 (matching the verifier's U256::MAX saturation).
+    const uint64_t hh = 8, ww = 16;
+    const uint64_t dpl = (a.r > 0) ? (uint64_t)(a.k - a.k % a.r) : (uint64_t)a.k;
+    const uint64_t adj = hh * ww * dpl;  // difficulty_adjustment_factor
+    // 256-bit (target_le, little-endian) *= adj, saturating at 2^256-1.
+    __uint128_t carry = 0;
+    bool overflow = false;
+    for (int i = 0; i < 32; ++i) {
+      __uint128_t prod = (__uint128_t)target_le[i] * adj + carry;
+      target_le[i] = (uint8_t)(prod & 0xFF);
+      carry = prod >> 8;
+    }
+    if (carry != 0) overflow = true;  // result exceeded 256 bits
+    if (overflow) target_le.assign(32, 0xFF);  // saturate to 2^256-1
   }
   std::vector<uint8_t> aroot, broot;
   if (!a.aroot_hex.empty()) { if (!from_hex(a.aroot_hex, aroot) || aroot.size() != 32) { fprintf(stderr, "bad aroot (need 64hex)\n"); return 1; } }

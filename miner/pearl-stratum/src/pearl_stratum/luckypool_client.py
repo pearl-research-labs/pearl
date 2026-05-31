@@ -29,12 +29,21 @@ Notes vs alphapool:
     header already embeds `nbits` (the *block* difficulty). `nbits` is read
     out of the header by `IncompleteBlockHeader.from_bytes`.
   * `mining.notify.target` is the *share* threshold sent DIRECTLY (not nbits).
-    The miner compares the GPU jackpot-hash against this to decide whether to
-    submit. Endianness: lpminer sends it as a hex string of the 256-bit target;
-    we parse it big-endian (most-significant first, the human-readable form)
-    by default and expose `target_le` (32 LE bytes) for the kernel's
-    `pow_target` input. If a live capture shows little-endian, flip
-    `TARGET_HEX_BIG_ENDIAN`.
+    Endianness: lpminer sends it as a hex string of the 256-bit target; we parse
+    it big-endian (most-significant first, the human-readable form) by default.
+    If a live capture shows little-endian, flip `TARGET_HEX_BIG_ENDIAN`.
+
+    IMPORTANT — this raw wire target is NOT the on-device comparison threshold.
+    The verifier (`zk-pow/src/api/sanity_checks.rs::extract_difficulty_bound`,
+    enforced by `verify_plain_proof`) accepts a share iff
+        int.from_bytes(jackpot_hash, "little") <= target * (h*w*k)
+    where the difficulty_adjustment_factor `h*w*k` = rows_pattern.size (h=8) *
+    cols_pattern.size (w=16) * dot_product_length (k - k%rank). The GPU binary
+    `pearl_miner_sm89.cu` applies this `* h*w*k` multiply when it converts the
+    wire target to the 32 LE `pow_target` words; this module therefore passes the
+    raw share target through unchanged. (Confirmed against the live diff=262144
+    job: wire_target = 2^206, target*difficulty = 0xffff<<208 = diff1, and
+    wire_target*h*w*k = 2^225 — the empirically-correct ~2^225..2^232 threshold.)
   * `mining.submit.hs` is the claimed hashrate (float, hashes/s) — telemetry
     only; the pool does not gate on it.
 
