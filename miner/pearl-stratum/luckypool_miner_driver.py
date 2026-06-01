@@ -39,10 +39,14 @@ Two backends ship here:
     miner_base are installed (a real rig), NOT in the offline test env.
 
 The `target` from the wire is the SHARE threshold (used to set the kernel's
-`pow_target` and to gate submission). The header's embedded `nbits` is the
-BLOCK difficulty that `verify_plain_proof` checks; the pool always sends a
-share target <= the block target so a share that clears `nbits` also clears the
-pool target.
+`pow_target` AND to gate submission). Both the kernel and the pool scale it by
+the hash-tile work factor h*w*k (= `MiningJob.adjust_target`), so a share is
+accepted iff jackpot_hash <= wire_target * h*w*k. The header's embedded `nbits`
+is the harder BLOCK target; it is EASIER (numerically larger) on the wire, i.e.
+wire_target >= block_target. Submission must NOT be gated on `verify_plain_proof`
+(which derives its bound from `nbits`, the block target) — that rejects valid
+shares with the pool's own "hash does not meet difficulty target" (stratum
+code 23).
 """
 
 from __future__ import annotations
@@ -301,12 +305,20 @@ async def run_luckypool_miner(
                 return
             if proof_bytes is None:
                 continue
-            # Sanity: the proof must verify before we burn a submit slot.
+            # Gate on the SHARE bound (wire_target * h*w*k = the pool's
+            # adjust_target), NOT verify_plain_proof (which uses the header-nbits
+            # block bound and rejects valid shares -> stratum code 23). dump_jackpot
+            # recomputes the jackpot via the same path the verifier uses, so this
+            # match is bit-exact with the pool's check.
             bh = pm.IncompleteBlockHeader.from_bytes(job.header_bytes)
             proof = pm.PlainProof.from_base64(base64.b64encode(proof_bytes).decode())
-            ok, msg = pm.verify_plain_proof(bh, proof)
-            if not ok:
-                logger.error("backend produced invalid proof, not submitting: %s", msg)
+            jh_le, h, w, dot, _nbits = pm.dump_jackpot(bh, proof)
+            jackpot = int.from_bytes(jh_le, "little")
+            share_bound = job.target * h * w * dot
+            if share_bound > (1 << 256) - 1 or jackpot > share_bound:
+                logger.error("backend candidate misses share target "
+                             "(jackpot=2^%d bound=2^%d), not submitting",
+                             jackpot.bit_length(), share_bound.bit_length())
                 continue
             b64 = base64.b64encode(proof_bytes).decode()
             res = await client.submit_share(job.job_id, b64, hashrate=0.0)

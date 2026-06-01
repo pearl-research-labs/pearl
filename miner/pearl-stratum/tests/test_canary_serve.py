@@ -88,7 +88,7 @@ class _FakeStdin:
         self._closing = True
 
 
-def _install_fake_pearl_mining(verify_ok=True, verify_msg="ok"):
+def _install_fake_pearl_mining(verify_ok=True):
     fake = types.ModuleType("pearl_mining")
 
     class _BH:
@@ -103,7 +103,11 @@ def _install_fake_pearl_mining(verify_ok=True, verify_msg="ok"):
 
     fake.IncompleteBlockHeader = _BH
     fake.PlainProof = _Proof
-    fake.verify_plain_proof = lambda bh, proof: (verify_ok, verify_msg)
+    # The SHARE gate recomputes the jackpot via dump_jackpot -> (hash_le, h, w,
+    # dot, nbits). h=w=dot=1 with the job's target (0x1234) gives bound=0x1234,
+    # so a zero jackpot MEETS the target and an all-ones one does NOT.
+    jackpot_le = (b"\x00" * 32) if verify_ok else (b"\xff" * 32)
+    fake.dump_jackpot = lambda bh, proof: (jackpot_le, 1, 1, 1, 0x207FFFFF)
     sys.modules["pearl_mining"] = fake
 
 

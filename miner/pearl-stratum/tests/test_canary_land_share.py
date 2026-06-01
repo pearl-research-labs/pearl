@@ -68,13 +68,18 @@ def run_canary_submit_result(accepted, error, error_code):
                                  error=error, error_code=error_code)
 
 
-def _install_fake_pearl_mining(monkeypatch, verify_ok=True, verify_msg="ok"):
+def _install_fake_pearl_mining(monkeypatch, verify_ok=True):
     """Inject a fake `pearl_mining` so land_share_mine runs with no native lib.
 
     Only the symbols land_share_mine uses are provided:
       - IncompleteBlockHeader.from_bytes
       - PlainProof.from_base64
-      - verify_plain_proof
+      - dump_jackpot  (the SHARE gate recomputes the jackpot via this)
+
+    `dump_jackpot` returns (hash_le[32], h, w, dot, nbits). With h=w=dot=1 and
+    the job's target=1 the share bound is 1, so a zero jackpot MEETS the target
+    and an all-ones jackpot (2^256-1) does NOT — letting `verify_ok` drive the
+    gate decision exactly as the old verify mock did.
     """
     fake = types.ModuleType("pearl_mining")
 
@@ -90,7 +95,8 @@ def _install_fake_pearl_mining(monkeypatch, verify_ok=True, verify_msg="ok"):
 
     fake.IncompleteBlockHeader = _BH
     fake.PlainProof = _Proof
-    fake.verify_plain_proof = lambda bh, proof: (verify_ok, verify_msg)
+    jackpot_le = (b"\x00" * 32) if verify_ok else (b"\xff" * 32)
+    fake.dump_jackpot = lambda bh, proof: (jackpot_le, 1, 1, 1, 0x207FFFFF)
     monkeypatch.setitem(sys.modules, "pearl_mining", fake)
 
 
@@ -149,7 +155,7 @@ async def test_land_share_dry_run_does_not_submit(monkeypatch):
 @pytest.mark.asyncio
 async def test_land_share_verify_fail_never_submits(monkeypatch):
     """Fail-safe: an unverifiable proof is never submitted, even in land-share."""
-    _install_fake_pearl_mining(monkeypatch, verify_ok=False, verify_msg="bad")
+    _install_fake_pearl_mining(monkeypatch, verify_ok=False)
 
     mined = _Job("job1")
     backend = lambda hb, mc, tgt, nr, job_id=None: b"PROOF"  # noqa: E731

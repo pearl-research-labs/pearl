@@ -178,7 +178,9 @@ def _build_proof_from_hit(hit: dict, header_bytes: bytes, mining_config) -> byte
     k = int(mining_config.common_dim)
     r = int(getattr(mining_config, "rank", 256))
 
-    seed = int(hit["seed"])
+    # jobmine reports the A/B operand seed as "ab_seed"; mine/serve report it as
+    # "seed". Both name the SAME splitmix64 fill seed used to regenerate A/B^T.
+    seed = int(hit.get("ab_seed", hit.get("seed")))
     a_rows = list(map(int, hit["a_rows"]))
     b_cols = list(map(int, hit["b_cols"]))
 
@@ -209,9 +211,14 @@ def _gpu_stdin(header_bytes: bytes, mining_config, target: int, nonce_start: int
     k = int(mining_config.common_dim)
     r = int(getattr(mining_config, "rank", 256))
     target_be_hex = int(target).to_bytes(32, "big").hex()
+    # mode=jobmine is the POOL-VALID search: it keeps the job header UNCHANGED
+    # (never mutates header[72:76)=nbits) and searches the A/B operand seed, so
+    # the proof's header == the job header and the recomputed commitment matches
+    # the pool. (mode=mine mutates the nonce into header[72:76), producing a
+    # proof whose header != the job header -> the pool rejects with code 23.)
     line = (
         f"header={header_bytes.hex()} config={mining_config.to_bytes().hex()} "
-        f"target={target_be_hex} m={m} n={n} k={k} r={r} mode=mine real_commit=1 "
+        f"target={target_be_hex} m={m} n={n} k={k} r={r} mode=jobmine real_commit=1 "
         f"nonce_start={nonce_start} nonce_count={nonce_count} dev={dev}"
     )
     try:
@@ -480,6 +487,36 @@ def make_backend(name: str, args: argparse.Namespace):
 
 
 # ---------------------------------------------------------------------------
+# Share-acceptance gate
+# ---------------------------------------------------------------------------
+
+
+def meets_share_target(pm, bh, proof, wire_target: int) -> tuple[bool, int, int]:
+    """The pool's SHARE check, replicated locally. Returns (ok, jackpot, bound).
+
+    The pool accepts a share iff the recomputed jackpot hash (little-endian) is
+    <= the SHARE bound = wire_target * h * w * dot_product_length — exactly the
+    pearl-gateway `MiningJob.adjust_target` formula. `wire_target` is the share
+    `target` from `mining.notify` (NOT the header's nbits).
+
+    Gating on `verify_plain_proof` instead is WRONG: it derives its bound from
+    the header's nbits (the much harder *block* target), so it rejects perfectly
+    valid pool shares with the same "hash does not meet difficulty target"
+    message the pool returns as stratum code 23. We recompute the jackpot via
+    `dump_jackpot`, which uses the identical compute_noise -> compute_jackpot ->
+    compute_jackpot_hash path as the verifier, so this match is bit-exact.
+    """
+    jh_le, h, w, dot, _nbits = pm.dump_jackpot(bh, proof)
+    jackpot = int.from_bytes(jh_le, "little")
+    bound = wire_target * h * w * dot
+    if bound > (1 << 256) - 1:
+        # Mirror adjust_target's "Target is too easy" clamp: a bound past 2^256
+        # is rejected pool-side, so never submit against it.
+        return False, jackpot, bound
+    return jackpot <= bound, jackpot, bound
+
+
+# ---------------------------------------------------------------------------
 # Job handler (notify -> mine -> serialize -> verify -> [submit])
 # ---------------------------------------------------------------------------
 
@@ -524,15 +561,18 @@ def handle_job(job, *, mining_config, backend, submit: bool,
         return result
 
     proof = pm.PlainProof.from_base64(base64.b64encode(proof_bytes).decode())
-    ok, msg = pm.verify_plain_proof(bh, proof)
+    ok, jackpot, bound = meets_share_target(pm, bh, proof, job.target)
     result["verify"] = bool(ok)
-    logger.info("job %s: verify_plain_proof=%s (%s)", job.job_id, ok, msg)
+    logger.info("job %s: meets_share_target=%s jackpot=2^%d share_bound=2^%d",
+                job.job_id, ok, jackpot.bit_length(), bound.bit_length())
 
     if not ok:
-        # Fail-safe: never submit an unverifiable proof. On the live pool this
-        # is also how a stale/mismatched mining_config surfaces — verify fails
+        # Fail-safe: only submit shares that actually meet the SHARE target
+        # (wire_target * h*w*k). A miss here means the backend returned a
+        # non-winning candidate (or a stale/mismatched mining_config) — drop it
         # BEFORE we burn a submit slot.
-        logger.error("job %s: NOT submitting (verify failed): %s", job.job_id, msg)
+        logger.error("job %s: NOT submitting (jackpot exceeds share target)",
+                     job.job_id)
         return result
 
     # Staleness guard: a HIT for a job that has since rotated is worthless — the
@@ -545,7 +585,7 @@ def handle_job(job, *, mining_config, backend, submit: bool,
 
     b64 = base64.b64encode(proof_bytes).decode()
     if not submit:
-        logger.info("job %s: would submit, verify_plain_proof=%s (proof_b64_len=%d)",
+        logger.info("job %s: would submit, meets_share_target=%s (proof_b64_len=%d)",
                     job.job_id, ok, len(b64))
         return result
 
@@ -723,16 +763,18 @@ def land_share_mine(job, *, mining_config, backend, submit, client, loop,
         return result
 
     proof = pm.PlainProof.from_base64(base64.b64encode(proof_bytes).decode())
-    ok, msg = pm.verify_plain_proof(bh, proof)
+    ok, jackpot, bound = meets_share_target(pm, bh, proof, job.target)
     result["verify"] = bool(ok)
-    logger.info("job %s: HIT -> verify_plain_proof=%s (%s)", job.job_id, ok, msg)
+    logger.info("job %s: HIT -> meets_share_target=%s jackpot=2^%d share_bound=2^%d",
+                job.job_id, ok, jackpot.bit_length(), bound.bit_length())
 
     if not ok:
-        # verify_plain_proof IS the pool's check (same code-23 message). A failure
-        # here means the share is genuinely invalid — do NOT submit (avoid pool
-        # abuse flags). The binary's on-device target must match the verifier's
-        # bound = _bits_to_target(header.nbits) * h*w*k; until it does, hits fail.
-        logger.error("job %s: NOT submitting (verify failed): %s", job.job_id, msg)
+        # The SHARE gate is wire_target * h*w*k (pool's adjust_target), NOT the
+        # header-nbits block bound — gating on the latter (the old code-23 bug)
+        # rejected valid shares. A miss here means a genuine non-winning
+        # candidate; do NOT submit (avoid pool abuse flags).
+        logger.error("job %s: NOT submitting (jackpot exceeds share target)",
+                     job.job_id)
         return result
 
     # How stale is this HIT? Log mined job_id vs the current live job_id.
@@ -746,7 +788,7 @@ def land_share_mine(job, *, mining_config, backend, submit, client, loop,
 
     b64 = base64.b64encode(proof_bytes).decode()
     if not submit:
-        logger.info("job %s: DRY-RUN would submit, verify_plain_proof=%s stale=%s "
+        logger.info("job %s: DRY-RUN would submit, meets_share_target=%s stale=%s "
                     "(proof_b64_len=%d)", job.job_id, ok, stale, len(b64))
         return result
 
@@ -1081,20 +1123,24 @@ class ServeLoop:
         staleness = _time.time() - received_at
         header_bytes = bytes.fromhex(header_hex)
 
-        # Build + verify the proof (CPU; on THIS box). verify_plain_proof is the
-        # fail-safe: an unverifiable proof is never submitted.
+        # Build the proof (CPU; on THIS box) and gate on the SHARE target
+        # (wire_target * h*w*k, the pool's adjust_target bound) — NOT the
+        # header-nbits block bound. Fail-safe: a non-winning candidate is never
+        # submitted.
         proof_bytes = await asyncio.to_thread(
             _build_proof_from_hit, hit, header_bytes, self.mining_config)
         bh = pm.IncompleteBlockHeader.from_bytes(header_bytes)
         proof = pm.PlainProof.from_base64(
             base64.b64encode(proof_bytes).decode())
-        ok, msg = await asyncio.to_thread(pm.verify_plain_proof, bh, proof)
+        ok, jackpot, bound = await asyncio.to_thread(
+            meets_share_target, pm, bh, proof, target)
         logger.info("serve: HIT job_id=%s nonce=%s staleness=%.1fs "
-                    "verify_plain_proof=%s (%s)",
-                    job_id, hit.get("nonce"), staleness, ok, msg)
+                    "meets_share_target=%s jackpot=2^%d share_bound=2^%d",
+                    job_id, hit.get("nonce"), staleness, ok,
+                    jackpot.bit_length(), bound.bit_length())
         if not ok:
-            logger.error("serve: job %s NOT submitting (verify failed): %s",
-                         job_id, msg)
+            logger.error("serve: job %s NOT submitting (jackpot exceeds share "
+                         "target)", job_id)
             return
 
         b64 = base64.b64encode(proof_bytes).decode()
@@ -1346,8 +1392,14 @@ def run_selftest(args) -> int:
           f"(body 72B preserved={easy_header[:-4] == real[:-4]})")
 
     # Build the easy-target job object the SAME way the driver gets one, then
-    # run it through the runner's job handler (rust backend, dry-run).
-    easy_notify = dict(notify_params, header=easy_header.hex())
+    # run it through the runner's job handler (rust backend, dry-run). The gate
+    # is now the SHARE bound (wire_target * h*w*dot); the rust backend mines to
+    # the easy header nbits, so size the wire target to saturate the bound near
+    # 2^256 — i.e. make the share gate behave like the old easy-nbits pass.
+    factor = (mining_config.hash_tile_h * mining_config.hash_tile_w
+              * (mining_config.common_dim - mining_config.common_dim % mining_config.rank))
+    max_wire = ((1 << 256) - 1) // factor
+    easy_notify = dict(notify_params, header=easy_header.hex(), target=f"{max_wire:064x}")
     easy_job = parse_luckypool_notify(easy_notify)
     backend = RustCpuBackend()
     res = handle_job(easy_job, mining_config=mining_config, backend=backend,
