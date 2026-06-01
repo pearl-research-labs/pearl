@@ -123,19 +123,34 @@ def _splitmix64_fill(n: int, seed: int):
 
     Bit-exact with fill_AB/splitmix64 in pearl_miner_sm89.cu: advance
     splitmix64, map r % 127 - 63 into [-63, 63]. B uses seed ^ MIX_CONST.
+
+    VECTORIZED (numpy uint64, wraps mod 2^64): the per-element accumulator
+    `s += GOLDEN` means element i (0-based) uses s = seed + (i+1)*GOLDEN, so the
+    whole stream is computable without a Python loop. The pure-Python loop took
+    MINUTES for the full M*K=536M operand (it hung the canary's proof build);
+    this runs in ~1s.
     """
     import numpy as np
 
-    MASK = (1 << 64) - 1
+    GOLDEN = np.uint64(0x9E3779B97F4A7C15)
+    C1 = np.uint64(0xBF58476D1CE4E5B9)
+    C2 = np.uint64(0x94D049BB133111EB)
+    seed_u = np.uint64(seed)
     out = np.empty(n, dtype=np.int8)
-    s = seed & MASK
-    for i in range(n):
-        s = (s + 0x9E3779B97F4A7C15) & MASK
-        z = s
-        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK
-        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK
-        z = z ^ (z >> 31)
-        out[i] = int(z % 127) - 63
+    # Chunked so the full M*K=536M operand fits in a rig's RAM (the one-shot
+    # uint64 arrays would be ~20GB; 16M-element chunks peak ~0.5GB). Each element
+    # is independent (s_i = seed + (i+1)*GOLDEN), so chunking is value-identical.
+    CHUNK = 1 << 26
+    with np.errstate(over="ignore"):  # uint64 overflow IS the mod-2^64 wrap
+        for start in range(0, n, CHUNK):
+            end = min(start + CHUNK, n)
+            z = np.arange(start + 1, end + 1, dtype=np.uint64)
+            z *= GOLDEN
+            z += seed_u
+            z = (z ^ (z >> np.uint64(30))) * C1
+            z = (z ^ (z >> np.uint64(27))) * C2
+            z ^= z >> np.uint64(31)
+            out[start:end] = (z % np.uint64(127)).astype(np.int64) - 63
     return out
 
 
@@ -199,6 +214,10 @@ def _gpu_stdin(header_bytes: bytes, mining_config, target: int, nonce_start: int
         f"target={target_be_hex} m={m} n={n} k={k} r={r} mode=mine real_commit=1 "
         f"nonce_start={nonce_start} nonce_count={nonce_count} dev={dev}"
     )
+    try:
+        open("/tmp/last_stdin.txt", "w").write(line)
+    except Exception:
+        pass
     return line.encode()
 
 
@@ -330,6 +349,11 @@ class _SubprocessMineBackend:
         if self._cancelled:
             return None
         out = out_b.decode(errors="replace")
+        try:
+            with open("/tmp/last_out.txt", "w") as _f:
+                _f.write(f"rc={proc.returncode}\n--STDOUT--\n{out}\n--STDERR--\n{err_b.decode(errors='replace')}")
+        except Exception:
+            pass
         if proc.returncode != 0 and not out.strip().startswith(("HIT", "NOHIT")):
             logger.warning("mine nonzero rc=%d stderr=%s",
                            proc.returncode, err_b.decode(errors="replace")[-400:])
@@ -704,6 +728,10 @@ def land_share_mine(job, *, mining_config, backend, submit, client, loop,
     logger.info("job %s: HIT -> verify_plain_proof=%s (%s)", job.job_id, ok, msg)
 
     if not ok:
+        # verify_plain_proof IS the pool's check (same code-23 message). A failure
+        # here means the share is genuinely invalid — do NOT submit (avoid pool
+        # abuse flags). The binary's on-device target must match the verifier's
+        # bound = _bits_to_target(header.nbits) * h*w*k; until it does, hits fail.
         logger.error("job %s: NOT submitting (verify failed): %s", job.job_id, msg)
         return result
 
