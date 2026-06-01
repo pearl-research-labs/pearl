@@ -150,10 +150,18 @@ using pearl_miner::transcript_from_strips;
 
 static constexpr int R_DIM = 256;
 static constexpr int TILE_M = 128, TILE_N = 256;  // PoW kernel tile
-// Production hash-tile strided pattern (mining_config / oracle).
-static const int RP[8]  = {0, 8, 32, 40, 64, 72, 96, 104};
-static const int CP[16] = {0, 1, 32, 33, 64, 65, 96, 97,
-                           128, 129, 160, 161, 192, 193, 224, 225};
+// Production hash-tile strided pattern. Authoritative geometry = miner-base
+// settings.py: rows_pattern=[0,8] (h=2), cols_pattern length-64 (w=64), which the
+// verifier (TILE_H=2) scores; matches the GPU's per-thread 2-row x 64-col MMA
+// fragment. (The old RP[8]/CP[16] = h=8/w=16 did NOT match the GPU fold -> the
+// reconstructed proof transcript was a non-winner = zero accepted shares.)
+static constexpr int HASH_H = 2, HASH_W = 64;
+static const int RP[HASH_H] = {0, 8};
+static const int CP[HASH_W] = {
+  0,1,8,9,16,17,24,25,32,33,40,41,48,49,56,57,
+  64,65,72,73,80,81,88,89,96,97,104,105,112,113,120,121,
+  128,129,136,137,144,145,152,153,160,161,168,169,176,177,184,185,
+  192,193,200,201,208,209,216,217,224,225,232,233,240,241,248,249};
 
 // ---- tiny arg parsing ----
 struct Args {
@@ -372,6 +380,15 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
     pearl_blake3_chunk_cvs_sm89((const uint8_t*)g.dB, size_t(N)*K, job_key, g.d_cvs, 0);
     CUCHK(cudaMemcpy(g.h_cvs, g.d_cvs, b_chunks*32, cudaMemcpyDeviceToHost));
     pearl_miner::b3tree::blake3_root_from_chunk_cvs(job_key, (const uint32_t*)g.h_cvs, b_chunks, b_root);
+    if (std::getenv("PEARL_DEBUG_ROOT")) {
+      fprintf(stderr, "DEBUG_ROOT ab_seed=%llu a_chunks=%zu job_key=", (unsigned long long)ab_seed, a_chunks);
+      for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x", job_key[i]);
+      fprintf(stderr, " a_root=");
+      for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x", a_root[i]);
+      fprintf(stderr, " b_root=");
+      for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x", b_root[i]);
+      fprintf(stderr, "\n");
+    }
     g.cur_seeds = derive_seeds(g.header.data(), g.header.size(),
                                g.config.data(), g.config.size(), a_root, b_root);
   } else {
@@ -589,36 +606,55 @@ static void read_transcript_and_indices(
     if (g.hHeader->thread_rows[j] < ro) ro = g.hHeader->thread_rows[j];
     if (g.hHeader->thread_cols[j] < co) co = g.hHeader->thread_cols[j];
   }
-  if (ro + RP[7] >= TILE_M) ro = TILE_M - 1 - RP[7];   // keep 8 rows in-tile
-  if (co + CP[15] >= TILE_N) co = TILE_N - 1 - CP[15];  // keep 16 cols in-tile
+  if (std::getenv("PEARL_DEBUG_CELLS")) {
+    bool rseen[128] = {false}, cseen[256] = {false};
+    int nr = 0, nc = 0;
+    for (int j = 0; j < nreg; ++j) {
+      int r = g.hHeader->thread_rows[j], c = g.hHeader->thread_cols[j];
+      if (r >= 0 && r < 128 && !rseen[r]) { rseen[r] = true; ++nr; }
+      if (c >= 0 && c < 256 && !cseen[c]) { cseen[c] = true; ++nc; }
+    }
+    fprintf(stderr, "DEBUG_CELLS nreg=%d uniq_rows=%d uniq_cols=%d ro=%d co=%d\n  rows(rel):", nreg, nr, nc, ro, co);
+    for (int r = 0; r < 128; ++r) if (rseen[r]) fprintf(stderr, " %d", r - ro);
+    fprintf(stderr, "\n  cols(rel):");
+    for (int c = 0; c < 256; ++c) if (cseen[c]) fprintf(stderr, " %d", c - co);
+    fprintf(stderr, "\n");
+  }
+  if (ro + RP[HASH_H-1] >= TILE_M) ro = TILE_M - 1 - RP[HASH_H-1];   // keep H rows in-tile
+  if (co + CP[HASH_W-1] >= TILE_N) co = TILE_N - 1 - CP[HASH_W-1];   // keep W cols in-tile
   if (ro < 0) ro = 0; if (co < 0) co = 0;
   int row0 = (int)tile_ix * TILE_M + ro;
   int col0 = (int)tile_iy * TILE_N + co;
-  for (int a = 0; a < 8; ++a)  a_rows[a] = row0 + RP[a];
-  for (int b = 0; b < 16; ++b) b_cols[b] = col0 + CP[b];
+  for (int a = 0; a < HASH_H; ++a) a_rows[a] = row0 + RP[a];
+  for (int b = 0; b < HASH_W; ++b) b_cols[b] = col0 + CP[b];
 
-  // Copy the 8 noised-A rows (ApEA) + 16 noised-B cols (BpEB) back to host.
-  std::vector<int8_t> An(8 * K), Bn(16 * K);
-  for (int a = 0; a < 8; ++a)
+  // Copy the H noised-A rows (ApEA) + W noised-B cols (BpEB) back to host.
+  std::vector<int8_t> An((size_t)HASH_H * K), Bn((size_t)HASH_W * K);
+  for (int a = 0; a < HASH_H; ++a)
     CUCHK(cudaMemcpy(&An[(size_t)a*K], g.dApEA + (size_t)a_rows[a]*K, K, cudaMemcpyDeviceToHost));
-  for (int b = 0; b < 16; ++b)
+  for (int b = 0; b < HASH_W; ++b)
     CUCHK(cudaMemcpy(&Bn[(size_t)b*K], g.dBpEB + (size_t)b_cols[b]*K, K, cudaMemcpyDeviceToHost));
 
-  // Transcript over the NOISED operands directly (the GPU's integer GEMM path):
-  //   per R-chunk: tile = An[:,p:p+R] @ Bn[:,p:p+R]^T ; x=XOR-reduce ; T[rc%16]=rotl13(T)^x
+  // Transcript over the NOISED operands — CUMULATIVE across R-chunks, exactly as
+  // the verifier (zk-pow jackpot/helper.rs: the jackpot tile is declared OUTSIDE
+  // the R-step loop and `+=` accumulates, never reset). Per R-chunk rc:
+  //   acc_tile[i][j] += An[i][p:p+R] . Bn[j][p:p+R] ; x = XOR-reduce(cumulative
+  //   acc_tile) ; T[rc%16] = rotl13(T[rc%16]) ^ x.   (H=2 x W=64 = 128 cells.)
   for (int i = 0; i < 16; ++i) transcript[i] = 0;
+  std::vector<int32_t> acc_tile((size_t)HASH_H * HASH_W, 0);
   int nK = K / R_DIM;
   for (int rc = 0; rc < nK; ++rc) {
     int p = rc * R_DIM;
-    uint32_t x = 0;
-    for (int i = 0; i < 8; ++i)
-      for (int j = 0; j < 16; ++j) {
+    for (int i = 0; i < HASH_H; ++i)
+      for (int j = 0; j < HASH_W; ++j) {
         int32_t acc = 0;
         const int8_t* ar = &An[(size_t)i*K + p];
         const int8_t* br = &Bn[(size_t)j*K + p];
         for (int r = 0; r < R_DIM; ++r) acc += (int32_t)ar[r] * (int32_t)br[r];
-        x ^= (uint32_t)acc;
+        acc_tile[(size_t)i*HASH_W + j] += acc;   // cumulative prefix (helper.rs:25)
       }
+    uint32_t x = 0;
+    for (size_t t = 0; t < acc_tile.size(); ++t) x ^= (uint32_t)acc_tile[t];
     int idx = rc % 16;
     transcript[idx] = ((transcript[idx] << 13) | (transcript[idx] >> 19)) ^ x;
   }
@@ -646,7 +682,7 @@ static bool decode_target(const std::string& target_hex, bool big_endian,
   for (int i = 0; i < 32; ++i)
     target_le[i] = big_endian ? traw[31 - i] : traw[i];
   // difficulty adjustment: device threshold = wire_target * (h*w*k).
-  const uint64_t hh = 8, ww = 16;
+  const uint64_t hh = HASH_H, ww = HASH_W;  // 2*64 == old 8*16 == 128
   const uint64_t dpl = (r > 0) ? (uint64_t)(k - k % r) : (uint64_t)k;
   const uint64_t adj = hh * ww * dpl;
   __uint128_t carry = 0;
@@ -829,14 +865,14 @@ static int run_serve(GpuBufs& g, const Args& a,
       uint32_t ix = 0, iy = 0;
       int hit = run_attempt(g, s, M, N, K, ab_seed, &ix, &iy);
       if (hit) {
-        int a_rows[8], b_cols[16]; uint32_t T[16]; uint8_t gpu_hash[32];
+        int a_rows[HASH_H], b_cols[HASH_W]; uint32_t T[16]; uint8_t gpu_hash[32];
         read_transcript_and_indices(g, s, K, ix, iy, a_rows, b_cols, T);
         transcript_hash(T, s.a_noise_seed, gpu_hash);
         printf("HIT {\"nonce\":%llu,\"seed\":%llu,\"tile\":[%u,%u],\"a_rows\":[",
                (unsigned long long)nonce, (unsigned long long)ab_seed, ix, iy);
-        for (int i=0;i<8;++i) printf("%s%d", i?",":"", a_rows[i]);
+        for (int i=0;i<HASH_H;++i) printf("%s%d", i?",":"", a_rows[i]);
         printf("],\"b_cols\":[");
-        for (int i=0;i<16;++i) printf("%s%d", i?",":"", b_cols[i]);
+        for (int i=0;i<HASH_W;++i) printf("%s%d", i?",":"", b_cols[i]);
         printf("],\"transcript\":[");
         for (int i=0;i<16;++i) printf("%s\"%08x\"", i?",":"", T[i]);
         printf("],\"gpu_hash\":\"");
@@ -915,7 +951,7 @@ int main(int argc, char** argv) {
     //   k = dot_product_length = common_dim - common_dim % rank.
     // The product fits in 256 bits for any live target (2^206 * 2^19 = 2^225),
     // and is clamped to 2^256-1 (matching the verifier's U256::MAX saturation).
-    const uint64_t hh = 8, ww = 16;
+    const uint64_t hh = HASH_H, ww = HASH_W;  // 2*64 == old 8*16 == 128
     const uint64_t dpl = (a.r > 0) ? (uint64_t)(a.k - a.k % a.r) : (uint64_t)a.k;
     const uint64_t adj = hh * ww * dpl;  // difficulty_adjustment_factor
     // 256-bit (target_le, little-endian) *= adj, saturating at 2^256-1.
@@ -974,7 +1010,14 @@ int main(int argc, char** argv) {
   // -------------------------------------------------------------------------
   if (a.mode == "jobmine") {
     CUCHK(cudaMemcpy(g.dTarget, target_le.data(), 32, cudaMemcpyHostToDevice));
-    // Noise seeds depend ONLY on the (fixed) header + config: derive once.
+    // real_commit=1: run_attempt_mine computes the verifier's commitment per
+    // ab_seed from the ACTUAL A/B merkle roots (ON-GPU, fast). Without this the
+    // search uses the header-only fallback seed (or externally-passed aroot/broot)
+    // -> wrong commitment -> the pool rejects every share.
+    g.real_commit = (a.real_commit != 0);
+    g.header = header; g.config = config;  // run_attempt_mine keys the on-GPU root
+                                           // (job_key=blake3(header||config)) on these.
+    // Fallback / external-root seeds (used only when real_commit==0).
     Seeds s;
     derive_seeds_for_header(header, config, aroot, broot, s);
     uint64_t start = a.nonce_start, count = a.nonce_count ? a.nonce_count : 1;
@@ -983,16 +1026,20 @@ int main(int argc, char** argv) {
       uint32_t ix = 0, iy = 0;
       int hit = run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy);
       if (hit) {
-        int a_rows[8], b_cols[16]; uint32_t T[16]; uint8_t gpu_hash[32];
-        read_transcript_and_indices(g, s, a.k, ix, iy, a_rows, b_cols, T);
-        transcript_hash(T, s.a_noise_seed, gpu_hash);
+        // Use the seeds the kernel ACTUALLY searched with (real per-ab_seed
+        // commitment when real_commit, else the fallback s) so the read-back
+        // transcript + gpu_hash match what was gated.
+        const Seeds& hs = g.real_commit ? g.cur_seeds : s;
+        int a_rows[HASH_H], b_cols[HASH_W]; uint32_t T[16]; uint8_t gpu_hash[32];
+        read_transcript_and_indices(g, hs, a.k, ix, iy, a_rows, b_cols, T);
+        transcript_hash(T, hs.a_noise_seed, gpu_hash);
         // `nonce` field == ab_seed here (header is never nonce-mutated); the
         // load-bearing field for the proven proof path is `ab_seed`.
         printf("HIT {\"ab_seed\":%llu,\"nonce\":%llu,\"tile\":[%u,%u],\"a_rows\":[",
                (unsigned long long)ab_seed, (unsigned long long)ab_seed, ix, iy);
-        for (int j = 0; j < 8; ++j)  printf("%s%d", j ? "," : "", a_rows[j]);
+        for (int j = 0; j < HASH_H; ++j)  printf("%s%d", j ? "," : "", a_rows[j]);
         printf("],\"b_cols\":[");
-        for (int j = 0; j < 16; ++j) printf("%s%d", j ? "," : "", b_cols[j]);
+        for (int j = 0; j < HASH_W; ++j) printf("%s%d", j ? "," : "", b_cols[j]);
         printf("],\"transcript\":[");
         for (int j = 0; j < 16; ++j) printf("%s\"%08x\"", j ? "," : "", T[j]);
         printf("],\"gpu_hash\":\"");
@@ -1073,9 +1120,9 @@ int main(int argc, char** argv) {
                        const uint32_t* T, const uint8_t* gpu_hash) {
     printf("HIT {\"nonce\":%llu,\"seed\":%llu,\"tile\":[%u,%u],\"a_rows\":[",
            (unsigned long long)nonce, (unsigned long long)ab_seed, ix, iy);
-    for (int i=0;i<8;++i) printf("%s%d", i?",":"", a_rows[i]);
+    for (int i=0;i<HASH_H;++i) printf("%s%d", i?",":"", a_rows[i]);
     printf("],\"b_cols\":[");
-    for (int i=0;i<16;++i) printf("%s%d", i?",":"", b_cols[i]);
+    for (int i=0;i<HASH_W;++i) printf("%s%d", i?",":"", b_cols[i]);
     printf("],\"transcript\":[");
     for (int i=0;i<16;++i) printf("%s\"%08x\"", i?",":"", T[i]);
     printf("],\"gpu_hash\":\"");
@@ -1125,7 +1172,7 @@ int main(int argc, char** argv) {
     uint32_t ix=0, iy=0;
     int hit = run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy);
     if (hit) {
-      int a_rows[8], b_cols[16]; uint32_t T[16]; uint8_t gpu_hash[32];
+      int a_rows[HASH_H], b_cols[HASH_W]; uint32_t T[16]; uint8_t gpu_hash[32];
       // Use the seeds the kernel ACTUALLY searched with (real per-nonce commitment
       // when real_commit, else the fallback s) so gpu_hash/opened indices match.
       const Seeds& hs = g.real_commit ? g.cur_seeds : s;
@@ -1140,13 +1187,13 @@ int main(int argc, char** argv) {
       // hardware self-check; on real sm_89 the user additionally diffs T against
       // a known oracle transcript.
       if (a.mode == "verify") {
-        std::vector<int8_t> rawA((size_t)8 * a.k), rawB((size_t)16 * a.k);
+        std::vector<int8_t> rawA((size_t)HASH_H * a.k), rawB((size_t)HASH_W * a.k);
         std::vector<int8_t> fullA((size_t)a.m * a.k), fullB((size_t)a.n * a.k);
         fill_AB(fullA.data(), fullA.size(), ab_seed);
         fill_AB(fullB.data(), fullB.size(), ab_seed ^ 0xD1B54A32D192ED03ULL);
-        for (int r = 0; r < 8; ++r)
+        for (int r = 0; r < HASH_H; ++r)
           memcpy(&rawA[(size_t)r*a.k], &fullA[(size_t)a_rows[r]*a.k], a.k);
-        for (int c = 0; c < 16; ++c)
+        for (int c = 0; c < HASH_W; ++c)
           memcpy(&rawB[(size_t)c*a.k], &fullB[(size_t)b_cols[c]*a.k], a.k);
         // Direct device-vs-host noised-operand diff for the first opened row/col,
         // to localize any noise/orientation discrepancy.
@@ -1158,10 +1205,10 @@ int main(int argc, char** argv) {
           const uint8_t SA[32]={'A','_','t','e','n','s','o','r'};
           const uint8_t SB[32]={'B','_','t','e','n','s','o','r'};
           std::vector<int8_t> EAR, EBL; int8_t eal[256], ebr[256];
-          pearl_miner::noise_sparse(a.k, a.r, SA, s.a_noise_seed, EAR);
-          pearl_miner::noise_sparse(a.k, a.r, SB, s.b_noise_seed, EBL);
-          pearl_miner::noise_dense_row(a_rows[0], a.r, SA, s.a_noise_seed, eal);
-          pearl_miner::noise_dense_row(b_cols[0], a.r, SB, s.b_noise_seed, ebr);
+          pearl_miner::noise_sparse(a.k, a.r, SA, hs.a_noise_seed, EAR);
+          pearl_miner::noise_sparse(a.k, a.r, SB, hs.b_noise_seed, EBL);
+          pearl_miner::noise_dense_row(a_rows[0], a.r, SA, hs.a_noise_seed, eal);
+          pearl_miner::noise_dense_row(b_cols[0], a.r, SB, hs.b_noise_seed, ebr);
           int adiff=0, bdiff=0;
           for (int kk=0; kk<a.k; ++kk) {
             int32_t ea=0, eb=0;
@@ -1175,8 +1222,8 @@ int main(int argc, char** argv) {
                   adiff, a.k, bdiff, a.k, gpuArow[0],gpuArow[1],gpuArow[2],gpuArow[3]);
         }
         uint32_t Tref[16];
-        transcript_from_strips(rawA, rawB, a_rows, b_cols, 8, 16, a.k, a.r,
-                               s.a_noise_seed, s.b_noise_seed, Tref);
+        transcript_from_strips(rawA, rawB, a_rows, b_cols, HASH_H, HASH_W, a.k, a.r,
+                               hs.a_noise_seed, hs.b_noise_seed, Tref);
         bool match = memcmp(Tref, T, sizeof(T)) == 0;
         fprintf(stderr, "VERIFY gpu_vs_host_transcript=%s\n  host_ref:",
                 match ? "MATCH" : "MISMATCH");

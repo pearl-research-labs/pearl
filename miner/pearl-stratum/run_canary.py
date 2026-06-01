@@ -61,8 +61,12 @@ logger = logging.getLogger("canary")
 # does NOT push this on the wire — it is fixed / derived. Parses to
 # common_dim=4096, rank=256, mma=Int7xInt7ToInt32, hash_tile 8x16 (== the GPU
 # contract k=4096 r=256).
+# mining_config: rows_pattern=[0,8] (h=2), cols_pattern length-64 (w=64) — the
+# authoritative geometry (miner-base settings.py) that matches the GPU's 2x64 MMA
+# fragment. (Was h=8/w=16 = ...07010103...010f07..., which did NOT match the GPU
+# fold -> reconstructed proof was a non-winner -> zero accepted shares.)
 DEFAULT_CONFIG_HEX = (
-    "001000000001000007010103000000010f07"
+    "00100000000100000701000000000001031f"
     "00000000000000000000000000000000000000000000000000000000000000000000"
 )
 

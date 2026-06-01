@@ -336,19 +336,23 @@ inline void transcript_from_strips(
   }
 
   for (int i = 0; i < 16; ++i) transcript[i] = 0;
+  // CUMULATIVE across R-chunks (verifier helper.rs: jackpot tile declared outside
+  // the R-step loop, += accumulates, never reset).
+  std::vector<int32_t> acc_tile((size_t)n_arows * n_bcols, 0);
   int nK = K / R;
   for (int rc = 0; rc < nK; ++rc) {
     int p = rc * R;
-    uint32_t x = 0;
     for (int i = 0; i < n_arows; ++i) {
       for (int j = 0; j < n_bcols; ++j) {
         int32_t acc = 0;
         const int8_t* ar = &A_n[(size_t)i * K + p];
         const int8_t* br = &B_n[(size_t)j * K + p];
         for (int r = 0; r < R; ++r) acc += (int32_t)ar[r] * (int32_t)br[r];
-        x ^= (uint32_t)acc;
+        acc_tile[(size_t)i * n_bcols + j] += acc;
       }
     }
+    uint32_t x = 0;
+    for (size_t t = 0; t < acc_tile.size(); ++t) x ^= (uint32_t)acc_tile[t];
     int idx = rc % 16;
     transcript[idx] = ((transcript[idx] << 13) | (transcript[idx] >> 19)) ^ x;
   }
