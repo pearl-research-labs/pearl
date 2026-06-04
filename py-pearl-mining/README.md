@@ -33,6 +33,9 @@ from pearl_mining import IncompleteBlockHeader, verify_plain_proof
 
 header = IncompleteBlockHeader.from_bytes(header_bytes)
 is_valid, message = verify_plain_proof(header, plain_proof)
+
+# Pool shares: verify at share difficulty from mining.set_difficulty, not header nbits
+is_valid, message = verify_plain_proof(header, plain_proof, nbits_override=share_bits)
 ```
 
 ## ZK Proof Generation and Verification

@@ -140,6 +140,26 @@ class TestVerifyPlainProof:
         is_valid, message = pearl_mining.verify_plain_proof(block_header, plain_proof)
         assert not is_valid, "verify_plain_proof accepted out-of-range matrices -- soundness issue!"
 
+    def test_nbits_override_for_pool_share_difficulty(self):
+        """Share proofs can be verified at pool difficulty even when header nbits is network."""
+        easy_nbits = DEFAULT_NBITS
+        hard_nbits = 0x1D000001
+        m, n, k = 256, 128, DEFAULT_K
+        easy_header = create_test_block_header(nbits=easy_nbits)
+        plain_proof = generate_plain_proof(m, n, k, easy_header)
+
+        is_valid, message = pearl_mining.verify_plain_proof(easy_header, plain_proof)
+        assert is_valid, message
+
+        hard_header = create_test_block_header(nbits=hard_nbits)
+        is_valid, message = pearl_mining.verify_plain_proof(hard_header, plain_proof)
+        assert not is_valid, "proof mined at easy difficulty should fail network nbits check"
+
+        is_valid, message = pearl_mining.verify_plain_proof(
+            hard_header, plain_proof, nbits_override=easy_nbits
+        )
+        assert is_valid, f"nbits_override should verify at share difficulty: {message}"
+
 
 class TestSoundness:
     """Negative tests: proofs from invalid inputs must fail verification."""
