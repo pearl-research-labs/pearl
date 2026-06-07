@@ -9,6 +9,37 @@ use anyhow::{Result, ensure};
 use log::info;
 use primitive_types::U256;
 
+/// Reject wrapped/out-of-bounds tile offsets and non-monotonic derived strip indices.
+pub fn validate_tile_offsets(
+    mining_config: &MiningConfiguration,
+    m: u32,
+    n: u32,
+    t_rows: u32,
+    t_cols: u32,
+) -> Result<()> {
+    let row_indices = mining_config.rows_pattern.indices_with_offset(t_rows);
+    let col_indices = mining_config.cols_pattern.indices_with_offset(t_cols);
+    ensure!(
+        row_indices.windows(2).all(|w| w[0] < w[1]),
+        "derived row indices must be strictly increasing"
+    );
+    ensure!(
+        col_indices.windows(2).all(|w| w[0] < w[1]),
+        "derived col indices must be strictly increasing"
+    );
+    let rmax = mining_config.rows_pattern.max() as u64;
+    let cmax = mining_config.cols_pattern.max() as u64;
+    ensure!(
+        (t_rows as u64).saturating_add(rmax) < m as u64,
+        "row tile must fit within matrix height m={m}"
+    );
+    ensure!(
+        (t_cols as u64).saturating_add(cmax) < n as u64,
+        "col tile must fit within matrix width n={n}"
+    );
+    Ok(())
+}
+
 pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<()> {
     let k = public_params.common_dim();
     let r = public_params.rank();
@@ -37,6 +68,7 @@ pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<(
         "Inner hash tile dimensions must be divisible by {TILE_H} || h={h} w={w}"
     );
     ensure!(h * w >= 32, "Inner hash size must be >= 32 || h={h} w={w}");
+    ensure!(h * w <= 256, "Inner hash tile h*w must be <= 256 for ZK circuit || h={h} w={w}");
     ensure!(
         dot_product_len.is_multiple_of(DWORD_SIZE),
         "dot_product_length must be divisible by DWORD_SIZE={DWORD_SIZE} || got {dot_product_len}"
@@ -48,10 +80,13 @@ pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<(
         "Worker input supported up to 4 MiB, got {} bytes",
         worker_input_size
     );
-    let rmax = public_params.mining_config.rows_pattern.max();
-    let cmax = public_params.mining_config.cols_pattern.max();
-    ensure!(t_rows + rmax < m, "t_rows={t_rows} + pattern max={rmax} must be < m={m}");
-    ensure!(t_cols + cmax < n, "t_cols={t_cols} + pattern max={cmax} must be < n={n}");
+    validate_tile_offsets(
+        &public_params.mining_config,
+        m,
+        n,
+        t_rows,
+        t_cols,
+    )?;
     ensure_eq!(
         public_params.mining_config.reserved,
         MiningConfiguration::RESERVED_VALUE,

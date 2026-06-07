@@ -10,6 +10,7 @@ use crate::api::proof::{
     Hash256, IncompleteBlockHeader, MINING_CONFIG_RESERVED_SIZE, MMAType, MiningConfiguration, PeriodicPattern,
     PrivateProofParams, PublicProofParams, ZKProof,
 };
+use crate::api::sanity_checks::validate_tile_offsets;
 use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLocation, BlakeProgram};
 use crate::circuit::pearl_circuit::PearlCircuitParams;
 use crate::ensure_eq;
@@ -939,6 +940,7 @@ impl PublicProofParams {
             mining_config.cols_pattern.offset_is_valid(t_cols),
             "t_cols must be a valid offset for cols_pattern"
         );
+        validate_tile_offsets(&mining_config, m, n, t_rows, t_cols)?;
 
         Ok(Self {
             block_header,

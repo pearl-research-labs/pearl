@@ -189,6 +189,20 @@ fn compute_external_cvs(
         .collect()
 }
 
+fn usize_to_u32(field: &str, value: usize) -> Result<u32> {
+    u32::try_from(value).with_context(|| format!("{field}={value} does not fit in u32"))
+}
+
+fn usize_indices_to_u32(field: &str, indices: &[usize]) -> Result<Vec<u32>> {
+    indices
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            u32::try_from(value).with_context(|| format!("{field}[{i}]={value} does not fit in u32"))
+        })
+        .collect()
+}
+
 /// Converts indices to a PeriodicPattern and base offset.
 pub fn list_to_pattern(indices: &[u32]) -> Result<(PeriodicPattern, u32)> {
     if indices.is_empty() {
@@ -211,18 +225,21 @@ pub fn list_to_pattern(indices: &[u32]) -> Result<(PeriodicPattern, u32)> {
 
 /// Converts plain proof to Rust proof types, checks a,bt merkle roots match provided hashes.
 pub fn parse_plain_proof(header: IncompleteBlockHeader, p: &PlainProof) -> Result<(PrivateProofParams, PublicProofParams)> {
-    let (m, n, k) = (p.m, p.n, p.k);
+    let m = usize_to_u32("m", p.m)?;
+    let n = usize_to_u32("n", p.n)?;
+    let k = usize_to_u32("k", p.k)?;
+    let noise_rank = usize_to_u32("noise_rank", p.noise_rank)?;
 
-    let a_indices: Vec<u32> = p.a.row_indices.iter().map(|&x| x as u32).collect();
-    let bt_indices: Vec<u32> = p.bt.row_indices.iter().map(|&x| x as u32).collect();
+    let a_indices = usize_indices_to_u32("a.row_indices", &p.a.row_indices)?;
+    let bt_indices = usize_indices_to_u32("bt.row_indices", &p.bt.row_indices)?;
     let (rows_pattern, t_rows) = list_to_pattern(&a_indices)?;
     let (cols_pattern, t_cols) = list_to_pattern(&bt_indices)?;
 
     let public = PublicProofParams {
         block_header: header,
         mining_config: MiningConfiguration {
-            common_dim: k as u32,
-            rank: p.noise_rank as u16,
+            common_dim: k,
+            rank: noise_rank as u16,
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern,
             cols_pattern,
@@ -231,21 +248,23 @@ pub fn parse_plain_proof(header: IncompleteBlockHeader, p: &PlainProof) -> Resul
         hash_a: p.a.proof.root,
         hash_b: p.bt.proof.root,
         hash_jackpot: [0xFFu8; 32], // Consumed only by ZK verifier
-        m: m as u32,
-        n: n as u32,
+        m,
+        n,
         t_rows,
         t_cols,
     };
+
+    crate::api::sanity_checks::validate_tile_offsets(&public.mining_config, m, n, t_rows, t_cols)?;
 
     let (compiled, msg_locs, cv_locs) = public.compile();
 
     let strip_len = public.dot_product_length();
 
     let private = PrivateProofParams {
-        s_a: extract_strips(&p.a.row_indices, k, strip_len, &p.a.proof)?,
-        s_b: extract_strips(&p.bt.row_indices, k, strip_len, &p.bt.proof)?,
+        s_a: extract_strips(&p.a.row_indices, p.k, strip_len, &p.a.proof)?,
+        s_b: extract_strips(&p.bt.row_indices, p.k, strip_len, &p.bt.proof)?,
         external_msgs: extract_external_messages(&msg_locs, p)?,
-        external_cvs: compute_external_cvs(&cv_locs, p, m, n, k, public.job_key())?,
+        external_cvs: compute_external_cvs(&cv_locs, p, p.m, p.n, p.k, public.job_key())?,
     };
 
     let (hash_a, hash_b) = compiled.blake_proof.evaluate_blake(compiled.job_key, &private)?;

@@ -262,13 +262,12 @@ class AsyncLoopManager:
         plain_proof = create_proof(opened_block_info, mining_job.incomplete_header_bytes)
         _LOGGER.debug("Created plain proof")
 
+        block_header = IncompleteBlockHeader.from_bytes(mining_job.incomplete_header_bytes)
+        is_valid, message = verify_plain_proof(block_header, plain_proof)
+        if not is_valid:
+            raise AssertionError(f"Plain proof verification failed: {message}")
         if miner_settings.debug:
-            _LOGGER.debug("Verifying plain proof in debug mode")
-            block_header = IncompleteBlockHeader.from_bytes(mining_job.incomplete_header_bytes)
-            is_valid, message = verify_plain_proof(block_header, plain_proof)
-            if not is_valid:
-                raise AssertionError(f"Plain proof verification failed: {message}")
-            _LOGGER.debug("Plain proof verified")
+            _LOGGER.debug("Plain proof verified before gateway submission")
 
         with _make_client(miner_settings, miner_rpc_config) as client:
             client.submit_plain_proof(plain_proof, mining_job)
