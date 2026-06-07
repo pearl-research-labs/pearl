@@ -6,7 +6,7 @@ use crate::{
     api::{
         proof::{IncompleteBlockHeader, PublicProofParams, ZKProof},
         proof_utils::{CompiledPublicParams, compute_jackpot_hash, hash_to_u32_field_array},
-        sanity_checks::{check_jackpot_difficulty, check_jackpot_difficulty_with_nbits, public_params_sanity_check},
+        sanity_checks::{check_jackpot_difficulty_with_nbits, public_params_sanity_check},
     },
     circuit::{
         chip::compute_jackpot,
