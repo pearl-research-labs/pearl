@@ -149,8 +149,6 @@ fn plain_proof_high_usize_k_is_blocked_by_original_strip_extraction() {
 #[test]
 #[ignore = "expensive: compiles circuits and attempts a full offline prove/verify"]
 fn direct_public_wrapped_offset_proof_is_rejected_by_verifier() {
-    assert!(!cfg!(debug_assertions), "run with cargo test --release");
-
     let params = wrapped_public_params();
     assert!(public_params_sanity_check(&params).is_err());
 }
