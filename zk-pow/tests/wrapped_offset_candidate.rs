@@ -55,10 +55,7 @@ fn direct_public_wrapped_offset_params_are_rejected_at_deserialize() {
     let params = wrapped_public_params();
     let bytes = params.to_bytes();
     let err = PublicProofParams::from_bytes(params.block_header, &bytes).unwrap_err();
-    assert!(
-        err.to_string().contains("strictly increasing")
-            || err.to_string().contains("fit within matrix")
-    );
+    assert!(err.to_string().contains("strictly increasing") || err.to_string().contains("fit within matrix"));
 }
 
 #[test]

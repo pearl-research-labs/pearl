@@ -197,9 +197,7 @@ fn usize_indices_to_u32(field: &str, indices: &[usize]) -> Result<Vec<u32>> {
     indices
         .iter()
         .enumerate()
-        .map(|(i, &value)| {
-            u32::try_from(value).with_context(|| format!("{field}[{i}]={value} does not fit in u32"))
-        })
+        .map(|(i, &value)| u32::try_from(value).with_context(|| format!("{field}[{i}]={value} does not fit in u32")))
         .collect()
 }
 

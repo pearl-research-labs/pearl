@@ -10,13 +10,7 @@ use log::info;
 use primitive_types::U256;
 
 /// Reject wrapped/out-of-bounds tile offsets and non-monotonic derived strip indices.
-pub fn validate_tile_offsets(
-    mining_config: &MiningConfiguration,
-    m: u32,
-    n: u32,
-    t_rows: u32,
-    t_cols: u32,
-) -> Result<()> {
+pub fn validate_tile_offsets(mining_config: &MiningConfiguration, m: u32, n: u32, t_rows: u32, t_cols: u32) -> Result<()> {
     let row_indices = mining_config.rows_pattern.indices_with_offset(t_rows);
     let col_indices = mining_config.cols_pattern.indices_with_offset(t_cols);
     ensure!(
@@ -68,7 +62,10 @@ pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<(
         "Inner hash tile dimensions must be divisible by {TILE_H} || h={h} w={w}"
     );
     ensure!(h * w >= 32, "Inner hash size must be >= 32 || h={h} w={w}");
-    ensure!(h * w <= 256, "Inner hash tile h*w must be <= 256 for ZK circuit || h={h} w={w}");
+    ensure!(
+        h * w <= 256,
+        "Inner hash tile h*w must be <= 256 for ZK circuit || h={h} w={w}"
+    );
     ensure!(
         dot_product_len.is_multiple_of(DWORD_SIZE),
         "dot_product_length must be divisible by DWORD_SIZE={DWORD_SIZE} || got {dot_product_len}"
@@ -80,13 +77,7 @@ pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<(
         "Worker input supported up to 4 MiB, got {} bytes",
         worker_input_size
     );
-    validate_tile_offsets(
-        &public_params.mining_config,
-        m,
-        n,
-        t_rows,
-        t_cols,
-    )?;
+    validate_tile_offsets(&public_params.mining_config, m, n, t_rows, t_cols)?;
     ensure_eq!(
         public_params.mining_config.reserved,
         MiningConfiguration::RESERVED_VALUE,
