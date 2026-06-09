@@ -542,7 +542,7 @@ func testNamespaceAndTxInterfaces(tc *testContext, namespaceKey string) bool {
 
 	// Test that we can read the top level buckets.
 	var topLevelBuckets []string
-	walletdb.View(tc.db, func(tx walletdb.ReadTx) error {
+	err = walletdb.View(tc.db, func(tx walletdb.ReadTx) error {
 		return tx.ForEachBucket(func(key []byte) error {
 			topLevelBuckets = append(topLevelBuckets, string(key))
 			return nil

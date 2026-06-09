@@ -108,25 +108,39 @@ type observedTransaction struct {
 	mined int32
 }
 
-func (o *observedTransaction) Serialize(w io.Writer) {
-	binary.Write(w, binary.BigEndian, o.hash)
-	binary.Write(w, binary.BigEndian, o.feeRate)
-	binary.Write(w, binary.BigEndian, o.observed)
-	binary.Write(w, binary.BigEndian, o.mined)
+func (o *observedTransaction) Serialize(w io.Writer) error {
+	if err := binary.Write(w, binary.BigEndian, o.hash); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.BigEndian, o.feeRate); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.BigEndian, o.observed); err != nil {
+		return err
+	}
+	return binary.Write(w, binary.BigEndian, o.mined)
 }
 
 func deserializeObservedTransaction(r io.Reader) (*observedTransaction, error) {
 	ot := observedTransaction{}
 
 	// The first 32 bytes should be a hash.
-	binary.Read(r, binary.BigEndian, &ot.hash)
+	if err := binary.Read(r, binary.BigEndian, &ot.hash); err != nil {
+		return nil, err
+	}
 
 	// The next 8 are GrainPerByte
-	binary.Read(r, binary.BigEndian, &ot.feeRate)
+	if err := binary.Read(r, binary.BigEndian, &ot.feeRate); err != nil {
+		return nil, err
+	}
 
 	// And next there are two uint32's.
-	binary.Read(r, binary.BigEndian, &ot.observed)
-	binary.Read(r, binary.BigEndian, &ot.mined)
+	if err := binary.Read(r, binary.BigEndian, &ot.observed); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.BigEndian, &ot.mined); err != nil {
+		return nil, err
+	}
 
 	return &ot, nil
 }
@@ -140,13 +154,19 @@ type registeredBlock struct {
 	transactions []*observedTransaction
 }
 
-func (rb *registeredBlock) serialize(w io.Writer, txs map[*observedTransaction]uint32) {
-	binary.Write(w, binary.BigEndian, rb.hash)
-
-	binary.Write(w, binary.BigEndian, uint32(len(rb.transactions)))
-	for _, o := range rb.transactions {
-		binary.Write(w, binary.BigEndian, txs[o])
+func (rb *registeredBlock) serialize(w io.Writer, txs map[*observedTransaction]uint32) error {
+	if err := binary.Write(w, binary.BigEndian, rb.hash); err != nil {
+		return err
 	}
+	if err := binary.Write(w, binary.BigEndian, uint32(len(rb.transactions))); err != nil {
+		return err
+	}
+	for _, o := range rb.transactions {
+		if err := binary.Write(w, binary.BigEndian, txs[o]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // FeeEstimator manages the data necessary to create
@@ -636,15 +656,15 @@ func (ef *FeeEstimator) Save() FeeEstimatorState {
 	// TODO figure out what the capacity should be.
 	w := bytes.NewBuffer(make([]byte, 0))
 
-	binary.Write(w, binary.BigEndian, uint32(estimateFeeSaveVersion))
+	binary.Write(w, binary.BigEndian, uint32(estimateFeeSaveVersion)) //nolint:errcheck // bytes.Buffer.Write never returns an error
 
 	// Insert basic parameters.
-	binary.Write(w, binary.BigEndian, &ef.maxRollback)
-	binary.Write(w, binary.BigEndian, &ef.binSize)
-	binary.Write(w, binary.BigEndian, &ef.maxReplacements)
-	binary.Write(w, binary.BigEndian, &ef.minRegisteredBlocks)
-	binary.Write(w, binary.BigEndian, &ef.lastKnownHeight)
-	binary.Write(w, binary.BigEndian, &ef.numBlocksRegistered)
+	binary.Write(w, binary.BigEndian, &ef.maxRollback)         //nolint:errcheck // bytes.Buffer.Write never returns an error
+	binary.Write(w, binary.BigEndian, &ef.binSize)               //nolint:errcheck
+	binary.Write(w, binary.BigEndian, &ef.maxReplacements)       //nolint:errcheck
+	binary.Write(w, binary.BigEndian, &ef.minRegisteredBlocks)   //nolint:errcheck
+	binary.Write(w, binary.BigEndian, &ef.lastKnownHeight)       //nolint:errcheck
+	binary.Write(w, binary.BigEndian, &ef.numBlocksRegistered)   //nolint:errcheck
 
 	// Put all the observed transactions in a sorted list.
 	var txCount uint32
@@ -658,9 +678,11 @@ func (ef *FeeEstimator) Save() FeeEstimatorState {
 
 	txCount = 0
 	observed := make(map[*observedTransaction]uint32)
-	binary.Write(w, binary.BigEndian, uint32(len(ef.observed)))
+	binary.Write(w, binary.BigEndian, uint32(len(ef.observed))) //nolint:errcheck // bytes.Buffer.Write never returns an error
 	for _, ot := range ots {
-		ot.Serialize(w)
+		if err := ot.Serialize(w); err != nil {
+			panic(fmt.Sprintf("unexpected error serializing observed tx: %v", err))
+		}
 		observed[ot] = txCount
 		txCount++
 	}
@@ -668,17 +690,19 @@ func (ef *FeeEstimator) Save() FeeEstimatorState {
 	// Save all the right bins.
 	for _, list := range ef.bin {
 
-		binary.Write(w, binary.BigEndian, uint32(len(list)))
+		binary.Write(w, binary.BigEndian, uint32(len(list)))      //nolint:errcheck // bytes.Buffer.Write never returns an error
 
 		for _, o := range list {
-			binary.Write(w, binary.BigEndian, observed[o])
+			binary.Write(w, binary.BigEndian, observed[o]) //nolint:errcheck
 		}
 	}
 
 	// Dropped transactions.
-	binary.Write(w, binary.BigEndian, uint32(len(ef.dropped)))
+	binary.Write(w, binary.BigEndian, uint32(len(ef.dropped))) //nolint:errcheck // bytes.Buffer.Write never returns an error
 	for _, registered := range ef.dropped {
-		registered.serialize(w, observed)
+		if err := registered.serialize(w, observed); err != nil {
+			panic(fmt.Sprintf("unexpected error serializing registered block: %v", err))
+		}
 	}
 
 	// Commit the tx and return.

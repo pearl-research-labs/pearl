@@ -710,7 +710,9 @@ func (a *AddrManager) reset() {
 	a.addrIndex = make(map[string]*KnownAddress)
 
 	// fill key with bytes from a good random source.
-	io.ReadFull(crand.Reader, a.key[:])
+	if _, err := io.ReadFull(crand.Reader, a.key[:]); err != nil {
+		panic(fmt.Sprintf("failed to read random key: %v", err))
+	}
 	for i := range a.addrNew {
 		a.addrNew[i] = make(map[string]*KnownAddress)
 	}

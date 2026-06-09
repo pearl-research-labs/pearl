@@ -68,7 +68,7 @@ func calcWitnessSignatureHashRaw(subScript []byte, sigHashes *TxSigHashes,
 		// First write out, then encode the transaction's version
 		// number.
 		binary.LittleEndian.PutUint32(scratch[:], uint32(tx.Version))
-		w.Write(scratch[:4])
+		w.Write(scratch[:4]) //nolint:errcheck // sha256 writer never returns an error
 
 		// Next write out the possibly pre-calculated hashes for the
 		// sequence numbers of all inputs, and the hashes of the
@@ -79,9 +79,9 @@ func calcWitnessSignatureHashRaw(subScript []byte, sigHashes *TxSigHashes,
 		// hashPrevOuts, otherwise we just write zeroes for the prev
 		// outs.
 		if hashType&SigHashAnyOneCanPay == 0 {
-			w.Write(sigHashes.HashPrevOutsV0[:])
+			w.Write(sigHashes.HashPrevOutsV0[:]) //nolint:errcheck // sha256 writer never returns an error
 		} else {
-			w.Write(zeroHash[:])
+			w.Write(zeroHash[:]) //nolint:errcheck // sha256 writer never returns an error
 		}
 
 		// If the sighash isn't anyone can pay, single, or none, the
@@ -91,31 +91,31 @@ func calcWitnessSignatureHashRaw(subScript []byte, sigHashes *TxSigHashes,
 			hashType&sigHashMask != SigHashSingle &&
 			hashType&sigHashMask != SigHashNone {
 
-			w.Write(sigHashes.HashSequenceV0[:])
+			w.Write(sigHashes.HashSequenceV0[:]) //nolint:errcheck // sha256 writer never returns an error
 		} else {
-			w.Write(zeroHash[:])
+			w.Write(zeroHash[:]) //nolint:errcheck // sha256 writer never returns an error
 		}
 
 		txIn := tx.TxIn[idx]
 
 		// Next, write the outpoint being spent.
-		w.Write(txIn.PreviousOutPoint.Hash[:])
+		w.Write(txIn.PreviousOutPoint.Hash[:]) //nolint:errcheck // sha256 writer never returns an error
 		var bIndex [4]byte
 		binary.LittleEndian.PutUint32(
 			bIndex[:], txIn.PreviousOutPoint.Index,
 		)
-		w.Write(bIndex[:])
+		w.Write(bIndex[:]) //nolint:errcheck // sha256 writer never returns an error
 
 		// The script code is the original script, with all code
 		// separators removed, serialized with a var int length prefix.
-		wire.WriteVarBytes(w, 0, subScript)
+		wire.WriteVarBytes(w, 0, subScript) //nolint:errcheck // sha256 writer never returns an error
 
 		// Next, add the input amount, and sequence number of the input
 		// being signed.
 		binary.LittleEndian.PutUint64(scratch[:], uint64(amt))
-		w.Write(scratch[:])
+		w.Write(scratch[:]) //nolint:errcheck // sha256 writer never returns an error
 		binary.LittleEndian.PutUint32(scratch[:], txIn.Sequence)
-		w.Write(scratch[:4])
+		w.Write(scratch[:4]) //nolint:errcheck // sha256 writer never returns an error
 
 		// If the current signature mode isn't single, or none, then we
 		// can re-use the pre-generated hashoutputs sighash fragment.
@@ -124,25 +124,25 @@ func calcWitnessSignatureHashRaw(subScript []byte, sigHashes *TxSigHashes,
 		if hashType&sigHashMask != SigHashSingle &&
 			hashType&sigHashMask != SigHashNone {
 
-			w.Write(sigHashes.HashOutputsV0[:])
+			w.Write(sigHashes.HashOutputsV0[:]) //nolint:errcheck // sha256 writer never returns an error
 		} else if hashType&sigHashMask == SigHashSingle &&
 			idx < len(tx.TxOut) {
 
 			h := chainhash.DoubleHashRaw(func(tw io.Writer) error {
-				wire.WriteTxOut(tw, 0, 0, tx.TxOut[idx])
+				wire.WriteTxOut(tw, 0, 0, tx.TxOut[idx]) //nolint:errcheck // sha256 writer never returns an error
 				return nil
 			})
-			w.Write(h[:])
+			w.Write(h[:]) //nolint:errcheck // sha256 writer never returns an error
 		} else {
-			w.Write(zeroHash[:])
+			w.Write(zeroHash[:]) //nolint:errcheck // sha256 writer never returns an error
 		}
 
 		// Finally, write out the transaction's locktime, and the sig
 		// hash type.
 		binary.LittleEndian.PutUint32(scratch[:], tx.LockTime)
-		w.Write(scratch[:4])
+		w.Write(scratch[:4]) //nolint:errcheck // sha256 writer never returns an error
 		binary.LittleEndian.PutUint32(scratch[:], uint32(hashType))
-		w.Write(scratch[:4])
+		w.Write(scratch[:4]) //nolint:errcheck // sha256 writer never returns an error
 
 		return nil
 	})

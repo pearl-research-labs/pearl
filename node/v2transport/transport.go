@@ -337,7 +337,10 @@ func (p *Peer) InitiateV2Handshake(garbageLen int) error {
 	log.Debugf("Sending ellswift pubkey and garbage (total_len=%d)",
 		len(data))
 
-	p.Send(data)
+	if _, err = p.Send(data); err != nil {
+		log.Errorf("Failed to send ellswift pubkey and garbage: %v", err)
+		return err
+	}
 
 	return nil
 }
@@ -363,7 +366,11 @@ func (p *Peer) RespondV2Handshake(garbageLen int) error {
 
 	log.Debugf("Sending ellswift pubkey and garbage (total_len=%d)",
 		len(data))
-	p.Send(data)
+
+	if _, err = p.Send(data); err != nil {
+		log.Errorf("Failed to send ellswift pubkey and garbage: %v", err)
+		return err
+	}
 
 	return nil
 }
@@ -444,7 +451,10 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 
 	// Send garbage terminator.
 	log.Debugf("Sending garbage terminator: %x", p.sendGarbageTerm)
-	p.Send(p.sendGarbageTerm[:])
+	if _, err = p.Send(p.sendGarbageTerm[:]); err != nil {
+		log.Errorf("Failed to send garbage terminator: %v", err)
+		return err
+	}
 
 	// Optionally send decoy packets after garbage terminator.
 	aad := p.sentGarbage
@@ -461,7 +471,10 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 			return err
 		}
 
-		p.Send(encPacket)
+		if _, err = p.Send(encPacket); err != nil {
+			log.Errorf("Failed to send decoy packet %d: %v", i+1, err)
+			return err
+		}
 
 		// AAD is only used for the first packet after the handshake.
 		aad = nil

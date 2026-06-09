@@ -1679,7 +1679,10 @@ out:
 					iv.Type == wire.InvTypeWitnessBlock {
 
 					invMsg := wire.NewMsgInvSizeHint(1)
-					invMsg.AddInvVect(iv)
+					if err := invMsg.AddInvVect(iv); err != nil {
+						log.Warnf("Failed to add inv vect: %v", err)
+						continue
+					}
 					waiting = queuePacket(outMsg{msg: invMsg},
 						pendingMsgs, waiting)
 				} else {
@@ -1708,7 +1711,10 @@ out:
 					continue
 				}
 
-				invMsg.AddInvVect(iv)
+				if err := invMsg.AddInvVect(iv); err != nil {
+					log.Warnf("Failed to add inv vect to trickle: %v", err)
+					continue
+				}
 				if len(invMsg.InvList) >= maxInvTrickleSize {
 					waiting = queuePacket(
 						outMsg{msg: invMsg},
@@ -2097,8 +2103,11 @@ func (p *Peer) localVersionMsg() (*wire.MsgVersion, error) {
 
 	// Version message.
 	msg := wire.NewMsgVersion(ourNA, theirNA, nonce, blockNum)
-	msg.AddUserAgent(p.cfg.UserAgentName, p.cfg.UserAgentVersion,
-		p.cfg.UserAgentComments...)
+	if err := msg.AddUserAgent(p.cfg.UserAgentName, p.cfg.UserAgentVersion,
+		p.cfg.UserAgentComments...); err != nil {
+		log.Errorf("Failed to add user agent: %v", err)
+		return nil, err
+	}
 
 	// Advertise local services.
 	msg.Services = p.cfg.Services

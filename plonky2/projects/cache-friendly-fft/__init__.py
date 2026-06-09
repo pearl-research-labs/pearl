@@ -1,5 +1,4 @@
 import numpy as np
-
 from transpose import transpose_square
 from util import lb_exact
 
@@ -14,7 +13,7 @@ def _interleave(x, scratch):
     `x` and whose length is at least half the length of `x`.
     """
     assert len(x.shape) == len(scratch.shape) == 1
-    
+
     n, = x.shape
     assert n % 2 == 0
 
@@ -23,7 +22,7 @@ def _interleave(x, scratch):
 
     assert x.dtype == scratch.dtype
     scratch = scratch[:half_n]
-    
+
     scratch[:] = x[:half_n]  # Save the first half of `x`.
     for i in range(half_n):
         x[2 * i] = scratch[i]
@@ -40,7 +39,7 @@ def _deinterleave(x, scratch):
     `x` and whose length is at least half the length of `x`.
     """
     assert len(x.shape) == len(scratch.shape) == 1
-    
+
     n, = x.shape
     assert n % 2 == 0
 
@@ -156,7 +155,7 @@ def _fft_inplace(x, scratch):
     # This does not copy the buffer.
     x = x.view()
     assert x.flags['C_CONTIGUOUS']
-    
+
     n, = x.shape
     if n == 1:
         return
@@ -166,7 +165,7 @@ def _fft_inplace(x, scratch):
         x[1] = x0 - x1
         return
 
-    lb_n = lb_exact(n)    
+    lb_n = lb_exact(n)
     is_odd = lb_n & 1 != 0
     if is_odd:
         _fft_inplace_oddpow(x, scratch)

@@ -375,7 +375,9 @@ func replaceCoinbaseSigScript(script []byte) func(*wire.MsgBlock) {
 // adding the provided transaction.
 func additionalTx(tx *wire.MsgTx) func(*wire.MsgBlock) {
 	return func(b *wire.MsgBlock) {
-		b.AddTransaction(tx)
+		if err := b.AddTransaction(tx); err != nil {
+			panic(fmt.Sprintf("AddTransaction: %v", err))
+		}
 	}
 }
 
@@ -657,12 +659,18 @@ func nonCanonicalVarInt(val uint32) []byte {
 func encodeNonCanonicalBlock(b *wire.MsgBlock) []byte {
 	var buf bytes.Buffer
 	// Encode certificate first (certificate-first architecture)
-	b.MsgHeader.MsgCertificate.PrlEncode(&buf, 0)
+	if err := b.MsgHeader.MsgCertificate.PrlEncode(&buf, 0); err != nil {
+		panic(fmt.Sprintf("MsgCertificate.PrlEncode: %v", err))
+	}
 	// Then encode header
-	b.BlockHeader().PrlEncode(&buf, 0, wire.BaseEncoding)
+	if err := b.BlockHeader().PrlEncode(&buf, 0, wire.BaseEncoding); err != nil {
+		panic(fmt.Sprintf("BlockHeader.PrlEncode: %v", err))
+	}
 	buf.Write(nonCanonicalVarInt(uint32(len(b.Transactions))))
 	for _, tx := range b.Transactions {
-		tx.PrlEncode(&buf, 0, wire.BaseEncoding)
+		if err := tx.PrlEncode(&buf, 0, wire.BaseEncoding); err != nil {
+			panic(fmt.Sprintf("tx.PrlEncode: %v", err))
+		}
 	}
 	return buf.Bytes()
 }
@@ -672,7 +680,9 @@ func cloneBlock(b *wire.MsgBlock) wire.MsgBlock {
 	var blockCopy wire.MsgBlock
 	blockCopy.MsgHeader = b.MsgHeader
 	for _, tx := range b.Transactions {
-		blockCopy.AddTransaction(tx.Copy())
+		if err := blockCopy.AddTransaction(tx.Copy()); err != nil {
+			panic(fmt.Sprintf("blockCopy.AddTransaction: %v", err))
+		}
 	}
 	return blockCopy
 }
