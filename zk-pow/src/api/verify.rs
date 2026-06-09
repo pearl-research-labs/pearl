@@ -6,7 +6,7 @@ use crate::{
     api::{
         proof::{IncompleteBlockHeader, PublicProofParams, ZKProof},
         proof_utils::{CompiledPublicParams, compute_jackpot_hash, hash_to_u32_field_array},
-        sanity_checks::{check_jackpot_difficulty, check_jackpot_difficulty_with_nbits, public_params_sanity_check},
+        sanity_checks::{check_jackpot_difficulty_with_nbits, public_params_sanity_check},
     },
     circuit::{
         chip::compute_jackpot,
@@ -91,7 +91,14 @@ fn build_verifier_pis(
 
 /// Verifies a plain proof (mining solution) without generating a ZK proof.
 /// Returns `Ok(())` if valid, `Err(message)` if invalid.
-pub fn verify_plain_proof(block_header: &IncompleteBlockHeader, plain_proof: &PlainProof) -> Result<()> {
+///
+/// `nbits_override`: when set (e.g. pool share difficulty from `mining.set_difficulty`),
+/// jackpot difficulty is checked against this compact target instead of `block_header.nbits`.
+pub fn verify_plain_proof(
+    block_header: &IncompleteBlockHeader,
+    plain_proof: &PlainProof,
+    nbits_override: Option<u32>,
+) -> Result<()> {
     // Parse the plain proof to get private and public params
     let (private_params, mut public_params) = parse_plain_proof(*block_header, plain_proof)?;
 
@@ -116,7 +123,7 @@ pub fn verify_plain_proof(block_header: &IncompleteBlockHeader, plain_proof: &Pl
 
     // Compute the actual jackpot hash and check the difficulty condition
     public_params.hash_jackpot = compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
-    check_jackpot_difficulty(&public_params)?;
+    check_jackpot_difficulty_with_nbits(&public_params, nbits_override)?;
 
     Ok(())
 }

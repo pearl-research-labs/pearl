@@ -63,11 +63,7 @@ pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<(
 }
 
 /// Checks that `hash_jackpot` meets the difficulty requirement derived from the block header.
-pub fn check_jackpot_difficulty(public_params: &PublicProofParams) -> Result<()> {
-    check_jackpot_difficulty_with_nbits(public_params, None)
-}
-
-/// Like `check_jackpot_difficulty` but uses `nbits_override` as the difficulty target when provided.
+/// Uses `nbits_override` as the difficulty target when provided.
 pub fn check_jackpot_difficulty_with_nbits(public_params: &PublicProofParams, nbits_override: Option<u32>) -> Result<()> {
     let nbits = nbits_override.unwrap_or(public_params.block_header.nbits);
     let jackpot_hash_bound = extract_difficulty_bound(nbits, &public_params.mining_config);

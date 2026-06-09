@@ -126,11 +126,13 @@ fn warmup_prove(mining_config: MiningConfiguration) -> PyResult<()> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (block_header, plain_proof, nbits_override=None))]
 fn verify_plain_proof(
     block_header: IncompleteBlockHeader,
     plain_proof: PlainProof,
+    nbits_override: Option<u32>,
 ) -> PyResult<(bool, String)> {
-    match verify::verify_plain_proof(&block_header, &plain_proof) {
+    match verify::verify_plain_proof(&block_header, &plain_proof, nbits_override) {
         Ok(()) => Ok((true, "Mining solution verified successfully".into())),
         Err(e) => Ok((false, e.to_string())),
     }
