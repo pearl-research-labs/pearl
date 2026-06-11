@@ -49,7 +49,7 @@ var (
 
 	// UserAgentVersion is the user agent version and is used to help
 	// identify ourselves to other peers.
-	UserAgentVersion = "0.12.0-beta"
+	UserAgentVersion = "1.1.0"
 
 	// Services describes the services that are supported by the server.
 	Services = wire.SFNodeWitness | wire.SFNodeCF
