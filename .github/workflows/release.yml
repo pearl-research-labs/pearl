@@ -108,7 +108,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp bin/pearld.exe bin/prlctl.exe bin/oyster.exe dist/
+          cp bin/pearld dist/pearld.exe
+          cp bin/prlctl dist/prlctl.exe
+          cp bin/oyster dist/oyster.exe
           cd dist && 7z a ../${{ matrix.artifact_name }}-${{ env.VERSION }}.zip *
 
       - name: Upload artifact
