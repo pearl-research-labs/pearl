@@ -68,7 +68,7 @@ var (
 
 	// userAgentVersion is the user agent version and is used to help
 	// identify ourselves to other peers on the network.
-	userAgentVersion = fmt.Sprintf("%d.%d.%d", pearlversion.Major, pearlversion.Minor, pearlversion.Patch)
+	userAgentVersion = pearlversion.UserAgent()
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
