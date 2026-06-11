@@ -107,6 +107,22 @@ impl<F: Field> CrossTableLookup<F> {
         }
     }
 
+    /// Returns all trace column indices referenced by this `CrossTableLookup`
+    /// (from both looking and looked tables, including columns and filters).
+    pub fn all_column_indices(&self) -> Vec<usize> {
+        self.looking_tables
+            .iter()
+            .chain(once(&self.looked_table))
+            .flat_map(|twc| {
+                twc.columns
+                    .iter()
+                    .flat_map(|c| c.relevant_columns())
+                    .chain(twc.filter.relevant_columns())
+            })
+            .unique()
+            .collect()
+    }
+
     /// Given a table, returns:
     /// - the total number of helper columns for this table, over all Cross-table lookups,
     /// - the total number of z polynomials for this table, over all Cross-table lookups,
@@ -121,15 +137,22 @@ impl<F: Field> CrossTableLookup<F> {
         let mut num_ctls = 0;
         let mut num_helpers_by_ctl = vec![0; ctls.len()];
         for (i, ctl) in ctls.iter().enumerate() {
-            let all_tables = once(&ctl.looked_table).chain(&ctl.looking_tables);
-            let num_appearances = all_tables.filter(|twc| twc.table == table).count();
-            let is_helpers = num_appearances > 1;
+            let num_looking = ctl
+                .looking_tables
+                .iter()
+                .filter(|twc| twc.table == table)
+                .count();
+            let looked_appearance = ctl.looked_table.table == table;
+            let is_helpers = num_looking > 1;
             if is_helpers {
-                num_helpers_by_ctl[i] = num_appearances.div_ceil(constraint_degree - 1);
+                num_helpers_by_ctl[i] = num_looking.div_ceil(constraint_degree - 1);
                 num_helpers += num_helpers_by_ctl[i];
             }
 
-            if num_appearances > 0 {
+            if num_looking > 0 {
+                num_ctls += 1;
+            }
+            if looked_appearance {
                 num_ctls += 1;
             }
         }

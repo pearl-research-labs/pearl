@@ -13,7 +13,7 @@ logic through three layers:
 
 1. MsgCertificate: Wrapper handling version-based polymorphic encoding/decoding
 2. BlockCertificate: Interface defining symmetric Serialize/Deserialize methods
-3. Certificate types: Concrete implementations (currently only ZKCertificate)
+3. Certificate types: Concrete implementations (CertificateV1 and CertificateV2)
 
 # WIRE FORMAT
 
@@ -21,9 +21,14 @@ Version-first design enables polymorphic decoding:
 
 	MsgCertificate: Version(4) + certificate-specific fields
 
-	ZKCertificate: BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData
-	  Size: 238 + len(ProofData) bytes
+	CertificateV1: BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData
+	  Size: 200 + len(ProofData) bytes
 	  PublicData: committed public fields
+	  ProofData: Plonky2 proof bytes
+
+	CertificateV2: BlockHash(32) + PublicDataLen(4) + PublicData(PublicDataLen) + ProofLen(4) + ProofData
+	  Size: 40 + PublicDataLen + len(ProofData) bytes
+	  PublicData: committed public fields (variable-length, up to PublicDataMaxSizeV2)
 	  ProofData: Plonky2 proof bytes
 
 KEY DESIGN: SYMMETRIC SERIALIZATION
@@ -35,13 +40,12 @@ Certificate types implement perfectly mirrored Serialize/Deserialize methods:
 
 # NETWORK RESTRICTIONS
 
-Only CertificateVersionZK is allowed. IsCertVersionAllowed(net, v) returns true
-only for CertificateVersionZK. blockchain.checkBlockSanity also validates via
-IsCertVersionAllowed.
+CertificateVersionV1 and CertificateVersionV2 are allowed. IsCertVersionAllowed(v)
+returns true for both. blockchain.checkBlockSanity also validates via IsCertVersionAllowed.
 
 # GENESIS BLOCKS
 
-All genesis blocks use empty ZKCertificate (all fields zero except hash).
+All genesis blocks use empty CertificateV1 (all fields zero except hash).
 Genesis blocks are never verified (hardcoded and trusted), only serialized.
 
 # IMPLEMENTATION NOTES
@@ -71,7 +75,8 @@ type CertificateVersion uint32
 
 const (
 	CertificateVersionNull CertificateVersion = 0
-	CertificateVersionZK   CertificateVersion = 1
+	CertificateVersionV1   CertificateVersion = 1
+	CertificateVersionV2   CertificateVersion = 2
 )
 
 // BlockCertificate is the interface that all certificate types must implement.
@@ -83,7 +88,7 @@ type BlockCertificate interface {
 	BlockHash() chainhash.Hash
 
 	// ProofCommitment returns the commitment hash for this certificate.
-	// For ZK certificates: SHA256d(CertificateVersion_LE(4) || PublicData(164))
+	// SHA256d(CertificateVersion_LE(4) || PublicData)
 	ProofCommitment() chainhash.Hash
 
 	// Serialize writes certificate fields (excludes version - handled by MsgCertificate).
@@ -98,7 +103,7 @@ type BlockCertificate interface {
 
 // IsCertVersionAllowed reports whether certificate version v is permitted.
 func IsCertVersionAllowed(v CertificateVersion) bool {
-	return v == CertificateVersionZK
+	return v == CertificateVersionV1 || v == CertificateVersionV2
 }
 
 // MsgCertificate wraps a BlockCertificate and handles polymorphic
@@ -115,9 +120,8 @@ func (m *MsgCertificate) PrlEncode(w io.Writer, pver uint32) error {
 	}
 
 	// Check size limit
-	if m.SerializeSize() > CertificateMaxSize {
-		return fmt.Errorf("certificate too large: %d bytes (max %d)",
-			m.SerializeSize(), CertificateMaxSize)
+	if size := m.SerializeSize(); size > CertificateMaxSize {
+		return fmt.Errorf("certificate too large: %d bytes (max %d)", size, CertificateMaxSize)
 	}
 
 	// Write version first for polymorphic decoding
@@ -141,8 +145,11 @@ func (m *MsgCertificate) PrlDecode(r io.Reader, pver uint32) error {
 		m.Certificate = nil
 		return nil
 
-	case CertificateVersionZK:
-		m.Certificate = &ZKCertificate{}
+	case CertificateVersionV1:
+		m.Certificate = &CertificateV1{}
+
+	case CertificateVersionV2:
+		m.Certificate = &CertificateV2{}
 
 	default:
 		return fmt.Errorf("unsupported certificate version: %d", version)

@@ -12,34 +12,32 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
-// PublicDataSize is the size of the committed PublicData prefix.
+// PublicDataSizeV1 is the fixed size of PublicData in V1 certificates.
 // config(52) + hash_a(32) + hash_b(32) + hash_jackpot(32) + m(4) + n(4) + t_rows(4) + t_cols(4)
-// Must match PublicProofParams::PUBLICDATA_SIZE in zk-pow/src/api/proof_utils.rs.
-const PublicDataSize = 164
+const PublicDataSizeV1 = 164
 
-// ZKCertificate contains a ZK proof for production networks.
-type ZKCertificate struct {
-	// Block Hash
+// CertificateV1 is a version-1 (V1) block certificate.
+type CertificateV1 struct {
 	Hash chainhash.Hash
 
-	// PublicData contains the committed public fields.
-	PublicData [PublicDataSize]byte
+	// PublicData contains the committed public fields (fixed size).
+	PublicData [PublicDataSizeV1]byte
 
-	// ProofData contains the plonky2 proof.
+	// ProofData contains the Plonky2 proof.
 	ProofData []byte
 }
 
-func (c *ZKCertificate) Version() CertificateVersion {
-	return CertificateVersionZK
+func (c *CertificateV1) Version() CertificateVersion {
+	return CertificateVersionV1
 }
 
-func (c *ZKCertificate) BlockHash() chainhash.Hash {
+func (c *CertificateV1) BlockHash() chainhash.Hash {
 	return c.Hash
 }
 
 // ProofCommitment computes SHA256d(CertificateVersion_LE(4) || PublicData(164)).
-func (c *ZKCertificate) ProofCommitment() chainhash.Hash {
-	var buf [4 + PublicDataSize]byte
+func (c *CertificateV1) ProofCommitment() chainhash.Hash {
+	var buf [4 + PublicDataSizeV1]byte
 	binary.LittleEndian.PutUint32(buf[:4], uint32(c.Version()))
 	copy(buf[4:], c.PublicData[:])
 	return chainhash.DoubleHashH(buf[:])
@@ -47,27 +45,25 @@ func (c *ZKCertificate) ProofCommitment() chainhash.Hash {
 
 // Serialize: BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData
 // Version excluded - handled by MsgCertificate.
-func (c *ZKCertificate) Serialize(w io.Writer) error {
+func (c *CertificateV1) Serialize(w io.Writer) error {
 	if _, err := w.Write(c.Hash[:]); err != nil {
 		return err
 	}
 	if _, err := w.Write(c.PublicData[:]); err != nil {
 		return err
 	}
-
 	if err := binary.Write(w, binary.LittleEndian, uint32(len(c.ProofData))); err != nil {
 		return err
 	}
 	if _, err := w.Write(c.ProofData); err != nil {
 		return err
 	}
-
 	return nil
 }
 
 // Deserialize: BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData
 // Version excluded - handled by MsgCertificate.
-func (c *ZKCertificate) Deserialize(r io.Reader) error {
+func (c *CertificateV1) Deserialize(r io.Reader) error {
 	if _, err := io.ReadFull(r, c.Hash[:]); err != nil {
 		return err
 	}
@@ -82,18 +78,15 @@ func (c *ZKCertificate) Deserialize(r io.Reader) error {
 	if proofLen > MaxZKProofSize {
 		return fmt.Errorf("proof data too large: %d bytes (max %d)", proofLen, MaxZKProofSize)
 	}
-
 	c.ProofData = make([]byte, proofLen)
 	if _, err := io.ReadFull(r, c.ProofData); err != nil {
 		return err
 	}
-
 	return nil
 }
 
 // SerializedSize returns the number of bytes needed to serialize the certificate fields.
 // Format: BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData
-// Note: Does NOT include version (4 bytes) - that's handled by MsgCertificate.
-func (c *ZKCertificate) SerializedSize() int {
-	return 32 + PublicDataSize + 4 + len(c.ProofData)
+func (c *CertificateV1) SerializedSize() int {
+	return 32 + PublicDataSizeV1 + 4 + len(c.ProofData)
 }

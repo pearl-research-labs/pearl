@@ -9,6 +9,7 @@ use log::info;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::time::Instant;
+use zk_pow::api::proof::MoEConfig;
 use zk_pow::api::{
     proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern, PrivateProofParams, PublicProofParams},
     prove, verify,
@@ -16,8 +17,8 @@ use zk_pow::api::{
 use zk_pow::circuit::circuit_utils::CircuitCache;
 use zk_pow::circuit::embedded_cache;
 use zk_pow::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
-use zk_pow::ffi::mine::mine;
-use zk_pow::ffi::plain_proof::parse_plain_proof;
+use zk_pow::ffi::mine::mine_moe;
+use zk_pow::ffi::plain_proof::PlainProof;
 
 fn test_block_header(nbits: u32) -> IncompleteBlockHeader {
     IncompleteBlockHeader {
@@ -36,7 +37,7 @@ fn default_mining_config(common_dim: u32, rank: u16) -> MiningConfiguration {
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 64, 65, 72, 73]).unwrap(),
         cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 64, 65, 72, 73]).unwrap(),
-        reserved: MiningConfiguration::RESERVED_VALUE,
+        moe: None,
     }
 }
 
@@ -48,7 +49,7 @@ fn bench_mining_config(common_dim: u32, rank: u16) -> MiningConfiguration {
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&(0..64).collect::<Vec<_>>()).unwrap(),
         cols_pattern: PeriodicPattern::from_list(&(0..2).collect::<Vec<_>>()).unwrap(),
-        reserved: MiningConfiguration::RESERVED_VALUE,
+        moe: None,
     }
 }
 
@@ -73,6 +74,7 @@ fn setup(
     let private_params = PrivateProofParams {
         s_a,
         s_b,
+        s_routing: vec![],
         external_msgs: vec![],
         external_cvs: vec![],
     };
@@ -206,7 +208,7 @@ fn bench_fill_cache() {
 }
 
 /// Test using FFI mine path with a specific rank
-fn test_ffi_mine_prove_verify_with_rank(rank: u16) {
+fn test_ffi_mine_prove_verify_with_rank(rank: u16, is_moe: bool) {
     info!("\n========== Testing FFI Mine -> Prove -> Verify (rank={}) ==========", rank);
 
     let block_header = test_block_header(0x1D2FFFFF);
@@ -214,26 +216,37 @@ fn test_ffi_mine_prove_verify_with_rank(rank: u16) {
     let m = 6144;
     let n = 4096;
     let k = (16 * rank).max(1024) as usize + 192;
+    let mut mining_config = default_mining_config(k as u32, rank);
 
-    let mining_config = default_mining_config(k as u32, rank);
+    if is_moe {
+        mining_config.moe = Some(MoEConfig { e: 5, top_k: 2 });
+    }
 
     info!("Mining with FFI: m={}, n={}, k={}, rank={}", m, n, k, mining_config.rank);
 
     // Step 1: Mine using FFI (same path as Python)
     let start = Instant::now();
-    let plain_proof = mine(m, n, k, block_header, mining_config, None, false).expect("Mining failed");
+    let pow_proof: PlainProof = mine_moe(m, n, k, block_header, mining_config, None, false).expect("Mining failed");
+
     info!("Mining took {:?}", start.elapsed());
 
-    info!(
-        "PlainProof: m={}, n={}, k={}, noise_rank={}",
-        plain_proof.m, plain_proof.n, plain_proof.k, plain_proof.noise_rank
-    );
-    info!("  A row indices: {:?}", plain_proof.a.row_indices);
-    info!("  B col indices: {:?}", plain_proof.bt.row_indices);
+    if let Some(moe) = &pow_proof.moe {
+        info!(
+            "MoE : m={}, n_e={}, k={}, e={}, expert_idx={}",
+            pow_proof.m, pow_proof.n, pow_proof.k, moe.e, moe.expert_idx
+        );
+    } else {
+        info!(
+            "PlainProof: m={}, n={}, k={}, noise_rank={}",
+            pow_proof.m, pow_proof.n, pow_proof.k, pow_proof.noise_rank
+        );
+    }
+    info!("  A row indices: {:?}", pow_proof.a.row_indices);
+    info!("  B col indices: {:?}", pow_proof.bt.row_indices);
 
     // Step 2: Parse plain proof to get private/public params
     let start = Instant::now();
-    let (private_params, mut public_params) = parse_plain_proof(block_header, &plain_proof).expect("Failed to parse plain proof");
+    let (private_params, mut public_params) = pow_proof.parse_proof(block_header).expect("Failed to parse plain proof");
     info!("Parsing took {:?}", start.elapsed());
 
     // Step 3: Prove
@@ -257,9 +270,9 @@ fn test_ffi_mine_prove_verify_with_rank(rank: u16) {
 }
 
 /// Test using FFI mine path (same as Python tests use)
-fn test_correctness() {
+fn test_correctness(is_moe: bool) {
     for rank in [32, 64, 128] {
-        test_ffi_mine_prove_verify_with_rank(rank);
+        test_ffi_mine_prove_verify_with_rank(rank, is_moe);
     }
 }
 
@@ -269,7 +282,8 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        test_correctness();
+        test_correctness(false);
+        test_correctness(true);
         test_invalid_with_cache();
         bench_double_prove_profile();
         bench_fill_cache();
@@ -277,7 +291,8 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "correctness" => test_correctness(),
+        "correctness" => test_correctness(false),
+        "correctness_moe" => test_correctness(true),
         "profile" => bench_double_prove_profile(),
         "bench" => bench(),
         "invalid" => test_invalid_with_cache(),

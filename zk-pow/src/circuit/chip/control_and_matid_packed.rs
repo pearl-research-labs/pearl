@@ -12,7 +12,7 @@ use plonky2_field::extension::Extendable;
 
 use crate::circuit::{
     chip::{JackpotControlFields, MatmulControlFields, blake3::Blake3ControlFields},
-    pearl_layout::{BITS_PER_LIMB, pearl_columns},
+    pearl_layout::{BITS_PER_LIMB, BITS_PER_OUTER_INDEX, pearl_columns},
     utils::{
         air_utils::RowView,
         evaluator::Evaluator,
@@ -34,6 +34,16 @@ impl ControlAndMatIDPackedChip {
         F: RichField + Extendable<D>,
     {
         let limb_mask = (1usize << BITS_PER_LIMB) - 1;
+        let outer_mask = (1usize << BITS_PER_OUTER_INDEX) - 1;
+
+        let extract_and_dump = |packed: u64, row_builder: &mut RowBuilder<'a, F>| {
+            let limb0 = packed & limb_mask as u64;
+            let limb1 = (packed >> BITS_PER_LIMB) & limb_mask as u64;
+            row_builder.dump_u64(limb0);
+            row_builder.dump_u64(limb1);
+
+            (limb0, limb1)
+        };
 
         ///////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Fill control flags + MAT_ID_LIMBS
@@ -49,10 +59,7 @@ impl ControlAndMatIDPackedChip {
 
         // Fill MAT_ID_LIMBS
         let mat_id_from_control = control >> bits.len();
-        let mat_id_limb0 = mat_id_from_control & limb_mask as u64;
-        let mat_id_limb1 = (mat_id_from_control >> BITS_PER_LIMB) & limb_mask as u64;
-        row_builder.dump_u64(mat_id_limb0);
-        row_builder.dump_u64(mat_id_limb1);
+        let (mat_id_limb0, mat_id_limb1) = extract_and_dump(mat_id_from_control, row_builder);
         debug_assert_eq!(row_builder.offset, pearl_columns::MAT_ID_LIMBS_END);
 
         // Fill MAT_ID
@@ -60,7 +67,20 @@ impl ControlAndMatIDPackedChip {
         let mat_id = mat_id_limb0 + (mat_id_limb1 << BITS_PER_LIMB);
         row_builder.dump_u64(mat_id);
         debug_assert_eq!(row_builder.offset, pearl_columns::MAT_ID_END);
+
+        // Fill OUTER_INDICES_PACKED_PREP, OUTER_INDEX_FIRST and OUTER_INDEX_SECOND
+        let packed = row_builder.dump_noop().to_canonical_u64();
+        // First outer index. We then split it into two 13-bits limbs.
+        let outer_index_first = packed & outer_mask as u64;
+        let _ = extract_and_dump(outer_index_first, row_builder);
+
+        // Second outer index. We then split it into two 13-bits limbs.
+        let outer_index_second = packed >> BITS_PER_OUTER_INDEX as u64;
+        let _ = extract_and_dump(outer_index_second, row_builder);
+
+        debug_assert_eq!(row_builder.offset, pearl_columns::OUTER_INDEX_SECOND_END);
     }
+
     pub(crate) fn eval_constraints<V, S, E>(
         &self,
         row_view: &mut RowView<V>,
@@ -73,6 +93,7 @@ impl ControlAndMatIDPackedChip {
     {
         let consts: [V; 17] = std::array::from_fn(|i| eval.u64(i as u64));
         let climb = eval.i32(1 << BITS_PER_LIMB); // 2^13
+        let cu26 = eval.u64(1 << BITS_PER_OUTER_INDEX); // 2^26
 
         debug_assert_eq!(row_view.offset, pearl_columns::CONTROL_PREP);
         let control_prep = row_view.consume_single();
@@ -92,20 +113,21 @@ impl ControlAndMatIDPackedChip {
                 blake3_cf.is_use_commitment_hash,
                 blake3_cf.is_hash_a,
                 blake3_cf.is_hash_b,
+                blake3_cf.is_hash_routing,
                 blake3_cf.is_hash_jackpot,
                 blake3_cf.is_cv_in,
                 blake3_cf.is_new_blake,
                 blake3_cf.is_last_round,
-                blake3_cf.is_msg_mat,
-                blake3_cf.is_msg_jackpot,
-                blake3_cf.is_msg_aux_data,
-                blake3_cf.is_msg_cv,
+                blake3_cf.is_msg_bits[0],
+                blake3_cf.is_msg_bits[1],
+                blake3_cf.is_msg_bits[2],
+                blake3_cf.is_first_outer,
+                blake3_cf.is_second_outer,
                 jackpot_cf.is_load,
                 jackpot_cf.is_xor,
                 jackpot_cf.is_shift3,
-                jackpot_cf.is_store0,
-                jackpot_cf.is_store1,
-                jackpot_cf.is_store2,
+                jackpot_cf.store_bit0,
+                jackpot_cf.store_bit1,
                 jackpot_cf.is_dump_cumsum_buffer,
             ][..],
             &jackpot_cf.jackpot_idx,
@@ -127,6 +149,21 @@ impl ControlAndMatIDPackedChip {
         eval.constraint_eq(mat_id, expected_mat_id);
         debug_assert_eq!(row_view.offset, pearl_columns::MAT_ID_END);
 
-        (matmul_cf, blake3_cf, jackpot_cf)
+        debug_assert_eq!(row_view.offset, pearl_columns::OUTER_INDICES_PACKED_PREP);
+        let outer_indices_packed = row_view.consume_single();
+        let outer_index_firsts = row_view.consume_few(2);
+        let outer_index_seconds = row_view.consume_few(2);
+
+        let outer_index_first = eval.polyval(outer_index_firsts, climb);
+        let outer_index_second = eval.polyval(outer_index_seconds, climb);
+        let expected_outer_indices_packed = eval.polyval(&[outer_index_first, outer_index_second], cu26);
+        eval.constraint_eq(outer_indices_packed, expected_outer_indices_packed);
+        debug_assert_eq!(row_view.offset, pearl_columns::OUTER_INDEX_SECOND_END);
+
+        (
+            matmul_cf,
+            blake3_cf.with_outer_indices(outer_index_first, outer_index_second),
+            jackpot_cf,
+        )
     }
 }

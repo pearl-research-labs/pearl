@@ -6,7 +6,7 @@ use crate::{
     api::{
         proof::{IncompleteBlockHeader, PublicProofParams, ZKProof},
         proof_utils::{CompiledPublicParams, compute_jackpot_hash, hash_to_u32_field_array},
-        sanity_checks::{check_jackpot_difficulty_with_nbits, public_params_sanity_check},
+        sanity_checks::check_jackpot_against_nbits,
     },
     circuit::{
         chip::compute_jackpot,
@@ -15,7 +15,7 @@ use crate::{
         pearl_noise::compute_noise,
         pearl_stark::PearlStark,
     },
-    ffi::plain_proof::{PlainProof, parse_plain_proof},
+    ffi::plain_proof::PlainProof,
 };
 
 /// Verifies a block proof, compiling circuits into cache if needed.
@@ -50,8 +50,8 @@ fn prepare_verification(
     proof: &ZKProof,
     nbits_override: Option<u32>,
 ) -> Result<(PearlCircuitParams, PearlVerifierPIs)> {
-    public_params_sanity_check(public_params)?;
-    check_jackpot_difficulty_with_nbits(public_params, nbits_override)?;
+    public_params.sanity_check()?;
+    check_jackpot_against_nbits(public_params, nbits_override)?;
 
     let compiled_params = CompiledPublicParams::from(public_params);
     let circuit_params = PearlCircuitParams {
@@ -80,16 +80,20 @@ fn build_verifier_pis(
     Ok(PearlVerifierPIs {
         job_key: hash_to_u32_field_array(&compiled_params.job_key),
         commitment_hash: hash_to_u32_field_array(&commitment_hash),
-        hash_a: hash_to_u32_field_array(&public_params.hash_a),
-        hash_b: hash_to_u32_field_array(&public_params.hash_b),
-        hash_jackpot: hash_to_u32_field_array(&public_params.hash_jackpot),
-        public_data_commitment: public_params.public_data_commitment(circuit_params),
-        zeta,
+        hash_a: hash_to_u32_field_array(&public_params.hash_a()),
+        hash_b: hash_to_u32_field_array(&public_params.hash_b()),
+        hash_routing: public_params
+            .moe
+            .as_ref()
+            .map(|moe| hash_to_u32_field_array(&moe.hash_routing)),
+        hash_jackpot: hash_to_u32_field_array(&public_params.hash_jackpot()),
+        public_data_commitment: public_params.public_data_commitment(circuit_params)?,
+        zeta: proof.zeta()?,
         preprocessed_columns: PearlStark::<GoldilocksField, 2>::preprocessed_columns(compiled_params)?,
     })
 }
 
-/// Verifies a plain proof (mining solution) without generating a ZK proof.
+/// Verifies a plain proof (mining solution, whether MoE or not) without generating a ZK proof.
 /// Returns `Ok(())` if valid, `Err(message)` if invalid.
 ///
 /// `nbits_override`: when set (e.g. pool share difficulty from `mining.set_difficulty`),
@@ -100,10 +104,10 @@ pub fn verify_plain_proof(
     nbits_override: Option<u32>,
 ) -> Result<()> {
     // Parse the plain proof to get private and public params
-    let (private_params, mut public_params) = parse_plain_proof(*block_header, plain_proof)?;
+    let (private_params, mut public_params) = plain_proof.parse_proof(*block_header)?;
 
     // Perform public params sanity check
-    public_params_sanity_check(&public_params)?;
+    public_params.sanity_check()?;
 
     // Verify all strip values are in [-64, 64] (matching the ZK circuit's IRANGE7P1 range check)
     for strip in private_params.s_a.iter().chain(private_params.s_b.iter()) {
@@ -123,7 +127,7 @@ pub fn verify_plain_proof(
 
     // Compute the actual jackpot hash and check the difficulty condition
     public_params.hash_jackpot = compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
-    check_jackpot_difficulty_with_nbits(&public_params, nbits_override)?;
+    check_jackpot_against_nbits(&public_params, nbits_override)?;
 
     Ok(())
 }

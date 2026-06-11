@@ -1,6 +1,10 @@
 {
-  "test_vllm_mining_explicitly_enabled": "A useful proof of work (PoW) is a concept in cryptography that helps secure a network by requiring users to perform a complex mathematical calculation before they can validate a transaction or access certain resources. Here's a simplified explanation:\n\n**What is Proof of Work?**\n\nImagine you're trying to get into a locked room. To open the door, you need to solve a puzzle that requires a lot of effort and time to complete. Once you solve the puzzle, you get a key that allows you to",
-  "test_vllm_mining_disabled": "A useful proof of work (PoW) is a concept in cryptography that helps secure a network by requiring users to perform a complex mathematical calculation before they can validate a transaction or access certain resources. Here's a simplified explanation:\n\n**What is Proof of Work?**\n\nImagine you're trying to get into a locked room. To open the door, you need to solve a puzzle that requires a lot of effort and time to complete. Once you solve the puzzle, you get a key that allows you to",
-  "test_vllm_consistency_check_with_mining": "2 + 2 = 4",
-  "test_vllm_consistency_check_without_mining": "2 + 2 = 4"
+  "qwen3_moe_mining": "Le chat est sur la table.",
+  "llama_8b_no_mining": "Le chat est sur la table.",
+  "qwen3_moe_consistency_mining": "2 + 2 = 4.",
+  "qwen3_moe_consistency_no_mining": "2 + 2 = 4.",
+  "llama_8b_mining": "Le chat est sur la table.",
+  "llama_8b_consistency_mining": "2 + 2 = 4",
+  "llama_8b_consistency_no_mining": "2 + 2 = 4",
+  "qwen3_moe_no_mining": "Le chat est sur la table."
 }

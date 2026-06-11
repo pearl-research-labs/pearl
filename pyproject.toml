@@ -48,6 +48,8 @@ markers = [
     "https: marks tests as HTTPS/TLS connectivity tests",
     "performance: marks tests as performance tests (throughput, latency, memory)",
     "slow: marks tests as slow running tests (typically >30 seconds)",
+    "gpu: marks tests that require a CUDA GPU",
+    "moe: marks Mixture-of-Experts (MoE) mining tests",
 ]
 python_files = ["test_*.py", "*_test.py"]
 norecursedirs = [".git", ".venv", "venv", ".github", ".pytest_cache", ".mypy_cache", ".ruff_cache", "build", "dist", "third_party"]

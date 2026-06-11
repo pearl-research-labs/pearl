@@ -18,9 +18,9 @@ import (
 )
 
 // solveBlock generates a certificate for the given block header using the
-// network-aware SolveBlock: real mining on RegTest/MainNet, dummy cert on SimNet.
-func solveBlock(header *wire.BlockHeader, net wire.PearlNet) (wire.BlockCertificate, error) {
-	return blockchain.SolveBlock(header, net)
+// height-aware SolveBlock which selects the correct certificate version.
+func solveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32) (wire.BlockCertificate, error) {
+	return blockchain.SolveBlock(header, params, height)
 }
 
 // standardCoinbaseScript returns a standard script suitable for use as the
@@ -149,7 +149,7 @@ func CreateBlock(prevBlock *btcutil.Block, inclusionTxs []*btcutil.Tx,
 		}
 	}
 
-	cert, solveErr := solveBlock(block.BlockHeader(), net.Net)
+	cert, solveErr := solveBlock(block.BlockHeader(), net, blockHeight)
 	if solveErr != nil {
 		return nil, fmt.Errorf("unable to solve block: %w", solveErr)
 	}

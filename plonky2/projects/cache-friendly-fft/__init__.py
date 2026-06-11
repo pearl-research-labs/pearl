@@ -1,5 +1,4 @@
 import numpy as np
-
 from transpose import transpose_square
 from util import lb_exact
 
@@ -14,8 +13,8 @@ def _interleave(x, scratch):
     `x` and whose length is at least half the length of `x`.
     """
     assert len(x.shape) == len(scratch.shape) == 1
-    
-    n, = x.shape
+
+    (n,) = x.shape
     assert n % 2 == 0
 
     half_n = n // 2
@@ -23,7 +22,7 @@ def _interleave(x, scratch):
 
     assert x.dtype == scratch.dtype
     scratch = scratch[:half_n]
-    
+
     scratch[:] = x[:half_n]  # Save the first half of `x`.
     for i in range(half_n):
         x[2 * i] = scratch[i]
@@ -40,8 +39,8 @@ def _deinterleave(x, scratch):
     `x` and whose length is at least half the length of `x`.
     """
     assert len(x.shape) == len(scratch.shape) == 1
-    
-    n, = x.shape
+
+    (n,) = x.shape
     assert n % 2 == 0
 
     half_n = n // 2
@@ -116,7 +115,7 @@ def _fft_inplace_oddpow(x, scratch):
     for i, row_pair in enumerate(x):
         # `row_pair` represents two columns of the original matrix.
         # Their values must be deinterleaved to recover the columns.
-        row_pair.shape = row_len,
+        row_pair.shape = (row_len,)
         _deinterleave(row_pair, scratch)
         # The below are rows of the transposed matrix(/cols of the
         # original matrix.
@@ -139,14 +138,14 @@ def _fft_inplace_oddpow(x, scratch):
     # Recursively apply FFT to each row of the matrix.
     for row in x:
         # Turn vec of 2-tuples into vec of single elements.
-        row.shape = row_len,
+        row.shape = (row_len,)
         _fft_inplace(row, scratch)
 
     # Transpose again before returning. This again involves
     # deinterleaving.
     transpose_square(x)
     for row_pair in x:
-        row_pair.shape = row_len,
+        row_pair.shape = (row_len,)
         _deinterleave(row_pair, scratch)
 
 
@@ -155,9 +154,9 @@ def _fft_inplace(x, scratch):
     # Avoid modifying the shape of the original.
     # This does not copy the buffer.
     x = x.view()
-    assert x.flags['C_CONTIGUOUS']
-    
-    n, = x.shape
+    assert x.flags["C_CONTIGUOUS"]
+
+    (n,) = x.shape
     if n == 1:
         return
     if n == 2:
@@ -166,7 +165,7 @@ def _fft_inplace(x, scratch):
         x[1] = x0 - x1
         return
 
-    lb_n = lb_exact(n)    
+    lb_n = lb_exact(n)
     is_odd = lb_n & 1 != 0
     if is_odd:
         _fft_inplace_oddpow(x, scratch)
@@ -201,7 +200,7 @@ def fft(x):
     This is a wrapper around an in-place routine, provided for user
     convenience.
     """
-    n, = x.shape
+    (n,) = x.shape
     lb_n = lb_exact(n)  # Raises if not a power of 2.
     # We have one scratch buffer for the whole algorithm. If we were to
     # parallelize it, we'd need one thread-local buffer for each worker
@@ -210,9 +209,9 @@ def fft(x):
     if scratch_len == 0:
         scratch = None
     else:
-        scratch = np.empty_like(x, shape=scratch_len, order='C', subok=False)
+        scratch = np.empty_like(x, shape=scratch_len, order="C", subok=False)
 
-    res = x.copy(order='C')
+    res = x.copy(order="C")
     _fft_inplace(res, scratch)
 
     return res

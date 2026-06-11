@@ -41,13 +41,17 @@ enum class TensorHashBarriers : uint32_t {
 //   kNumConsumerThreads: Number of consumer threads (must be multiple of 128)
 //   kNumStages: Number of pipeline stages (typically 2-4)
 //   kThreadLoadSize: Bytes loaded per TMA operation (64, 128, 256, 512)
+//   kApplyRoot: Whether the kernel applies BLAKE3's ROOT flag itself (set by the
+//               host only when the whole input fits in a single CTA; otherwise
+//               ROOT is applied downstream by ComputeBlakeMTKernel/ReduceRootsKernel).
 //
 // When kNumConsumerThreads > 256, the kernel uses dual pipelines:
 //   - TMA descriptor dimensions are limited to 256, so we split into two groups
 //   - Each group of 256 consumers has its own TMA region and pipeline
 //   - Producer warpgroup issues TMA loads to both regions
 //   - Consumer groups operate independently on their respective pipelines
-template <int kNumConsumerThreads, int kNumStages, int kThreadLoadSize>
+template <int kNumConsumerThreads, int kNumStages, int kThreadLoadSize,
+          bool kApplyRoot>
 class MerkleTreeRootsKernel {
  public:
   using Element = uint8_t;
@@ -299,6 +303,13 @@ class MerkleTreeRootsKernel {
     const size_t num_grid_blocks =
         (num_chunks + kNumConsumerThreads - 1) / kNumConsumerThreads;
 
+    // kApplyRoot (compile-time) is set by the host only when this is the single
+    // CTA of the whole input, so the kernel must apply BLAKE3's ROOT
+    // finalization (otherwise ROOT is applied later by ComputeBlakeMTKernel /
+    // ReduceRootsKernel). When the entire message is a single chunk, BLAKE3 sets
+    // ROOT on that chunk's last block (no Merkle parent compression happens).
+    const bool is_single_chunk = (num_chunks == 1);
+
     // Output tensor - use stride (1, CHAINING_VALUE_SIZE_U32) for coalesced writes
     // Each block writes 8 consecutive uint32_t values, blocks are spaced 8 words apart
     Tensor mRoots = make_tensor(
@@ -386,11 +397,21 @@ class MerkleTreeRootsKernel {
                          smem_pipe_write_1);
         }
       } else if (consumer_group == 0) {
-        consumer_loop_dual(params, pipeline_0, sA_0, sLeaves, tid_in_group,
-                           consumer_tid, 0);
+        if (is_single_chunk) {
+          consumer_loop_dual<kApplyRoot>(params, pipeline_0, sA_0, sLeaves,
+                                         tid_in_group, consumer_tid, 0);
+        } else {
+          consumer_loop_dual<false>(params, pipeline_0, sA_0, sLeaves,
+                                    tid_in_group, consumer_tid, 0);
+        }
       } else {
-        consumer_loop_dual(params, pipeline_1, sA_1, sLeaves, tid_in_group,
-                           consumer_tid, 1);
+        if (is_single_chunk) {
+          consumer_loop_dual<kApplyRoot>(params, pipeline_1, sA_1, sLeaves,
+                                         tid_in_group, consumer_tid, 1);
+        } else {
+          consumer_loop_dual<false>(params, pipeline_1, sA_1, sLeaves,
+                                    tid_in_group, consumer_tid, 1);
+        }
       }
     } else /* !kUseDualPipelines */ {
       // ============ SINGLE PIPELINE MODE (up to 256 consumers) ============
@@ -435,7 +456,12 @@ class MerkleTreeRootsKernel {
         // ============ CONSUMER WARPGROUPS (128 threads each) ============
         // Consumer thread index (0 to kNumConsumerThreads-1)
         const int consumer_tid = tid - kNumProducerThreads;
-        consumer_loop(params, pipeline, sA, sLeaves, consumer_tid);
+        if (is_single_chunk) {
+          consumer_loop<kApplyRoot>(params, pipeline, sA, sLeaves,
+                                    consumer_tid);
+        } else {
+          consumer_loop<false>(params, pipeline, sA, sLeaves, consumer_tid);
+        }
         // Note: consumer_loop syncs all consumer warpgroups after each pipeline stage
       }
     }
@@ -447,29 +473,18 @@ class MerkleTreeRootsKernel {
     const size_t bid = blockIdx.x;
     const bool is_last_block = (bid == num_grid_blocks - 1);
 
-    // Determine actual number of leaves in this block
-    const u32 num_leaves = [is_last_block, num_chunks, &params]() -> u32 {
+    // Determine actual number of leaves in this block.
+    // The Python reference zero-pads any non-empty trailing data up to a full
+    // 1024-byte chunk, so every chunk counted by the ceiling division (including
+    // a partial last chunk of any size, even < 64 bytes) contributes one leaf.
+    const u32 num_leaves = [is_last_block, num_chunks]() -> u32 {
       if (!is_last_block) {
         return static_cast<u32>(kNumConsumerThreads);
       }
-
-      // For the last block, calculate actual chunks in this block
       // num_chunks already includes partial chunks (ceiling division)
       const u32 chunks_in_this_block = num_chunks % kNumConsumerThreads;
-      const u32 actual_chunks_in_block =
-          (chunks_in_this_block == 0) ? static_cast<u32>(kNumConsumerThreads)
-                                      : chunks_in_this_block;
-
-      // Check if the very last chunk is too small (< 64 bytes)
-      // If so, it shouldn't contribute a leaf to the merkle tree
-      const u32 remainder_bytes = params.data_len % blake3::CHUNK_SIZE;
-      const bool last_chunk_too_small =
-          (remainder_bytes > 0) && (remainder_bytes < blake3::MSG_BLOCK_SIZE);
-
-      // If the last chunk is too small, exclude it from the leaf count
-      return last_chunk_too_small
-                 ? (actual_chunks_in_block > 0 ? actual_chunks_in_block - 1 : 0)
-                 : actual_chunks_in_block;
+      return (chunks_in_this_block == 0) ? static_cast<u32>(kNumConsumerThreads)
+                                         : chunks_in_this_block;
     }();
 
     // Reduce into a Merkle Tree (all threads participate for __syncthreads)
@@ -478,15 +493,13 @@ class MerkleTreeRootsKernel {
       // Non-last blocks always have power-of-2 leaves (kNumConsumerThreads is power of 2)
       merkle_tree_utils::compute_perfect_mt<false>(sLeaves,
                                                    kNumConsumerThreads);
+    } else if ((num_leaves & (num_leaves - 1)) == 0) {
+      // Last block, power of 2: use perfect merkle tree.
+      // If this is the only block, the final parent compression must apply ROOT.
+      merkle_tree_utils::compute_perfect_mt<kApplyRoot>(sLeaves, num_leaves);
     } else {
-      // Last block: check if num_leaves is a power of 2
-      if ((num_leaves & (num_leaves - 1)) == 0) {
-        // Power of 2: use perfect merkle tree
-        merkle_tree_utils::compute_perfect_mt<false>(sLeaves, num_leaves);
-      } else {
-        // Not a power of 2: use BLAKE3's merkle tree structure
-        merkle_tree_utils::compute_blake_mt<false>(sLeaves, num_leaves);
-      }
+      // Last block, not a power of 2: use BLAKE3's merkle tree structure.
+      merkle_tree_utils::compute_blake_mt<kApplyRoot>(sLeaves, num_leaves);
     }
 
     // Copy the root to the output (use first 8 threads)
@@ -682,7 +695,7 @@ class MerkleTreeRootsKernel {
     }
   }
 
-  template <class SmemTensorA, class SmemTensorLeaves>
+  template <bool IsSingleChunk, class SmemTensorA, class SmemTensorLeaves>
   CUTLASS_DEVICE void consumer_loop_dual(Params const& params,
                                          Pipeline& pipeline, SmemTensorA& sA,
                                          SmemTensorLeaves const& sLeaves,
@@ -732,8 +745,9 @@ class MerkleTreeRootsKernel {
                         block_in_load;  // Global block index (0-15)
         // Use tid_in_group for shared memory access (0-255 within the group's smem region)
         // Use consumer_tid for counter calculation (global index 0-511)
-        compress_block_dual(sA, rChainingValue, tid_in_group, consumer_tid,
-                            stage, block_in_load, block_idx);
+        compress_block_dual<IsSingleChunk>(sA, rChainingValue, tid_in_group,
+                                           consumer_tid, stage, block_in_load,
+                                           block_idx);
       }
 
       // Sync all consumers within this group after processing this stage
@@ -758,7 +772,7 @@ class MerkleTreeRootsKernel {
 
   // ==================== SINGLE PIPELINE MODE FUNCTIONS ====================
 
-  template <class SmemTensorA, class SmemTensorLeaves>
+  template <bool IsSingleChunk, class SmemTensorA, class SmemTensorLeaves>
   CUTLASS_DEVICE void consumer_loop(Params const& params, Pipeline& pipeline,
                                     SmemTensorA& sA,
                                     SmemTensorLeaves const& sLeaves,
@@ -805,8 +819,8 @@ class MerkleTreeRootsKernel {
            ++block_in_load) {
         int block_idx = load_idx * kNumBlocksPerLoad +
                         block_in_load;  // Global block index (0-15)
-        compress_block(sA, rChainingValue, consumer_tid, stage, block_in_load,
-                       block_idx);
+        compress_block<IsSingleChunk>(sA, rChainingValue, consumer_tid, stage,
+                                      block_in_load, block_idx);
       }
 
       // Sync all consumer warpgroups after processing this stage
@@ -827,7 +841,8 @@ class MerkleTreeRootsKernel {
     }
   }
 
-  template <class SmemTensorA, class RmemTensorChainingValue>
+  template <bool IsSingleChunk, class SmemTensorA,
+            class RmemTensorChainingValue>
   CUTLASS_DEVICE void compress_block(SmemTensorA const& sA,
                                      RmemTensorChainingValue& rChainingValue,
                                      int consumer_tid, int stage,
@@ -864,6 +879,11 @@ class MerkleTreeRootsKernel {
     // Set CHUNK_END on the last block (block_idx == kNumBlocksPerChunk - 1)
     if (block_idx == kNumBlocksPerChunk - 1) {
       params.flags |= blake3::CHUNK_END;
+      // If the entire message is this single chunk, this is also the final
+      // compression that produces the digest, so it must be flagged ROOT.
+      if constexpr (IsSingleChunk) {
+        params.flags |= blake3::ROOT;
+      }
     }
 
     blake3::compress_msg_block_u32(rBlock, rChainingValue, params);
@@ -872,7 +892,8 @@ class MerkleTreeRootsKernel {
   // Dual pipeline version of compress_block
   // Uses tid_in_group (0-255) for shared memory access
   // Uses global_consumer_tid (0-511) for counter calculation
-  template <class SmemTensorA, class RmemTensorChainingValue>
+  template <bool IsSingleChunk, class SmemTensorA,
+            class RmemTensorChainingValue>
   CUTLASS_DEVICE void compress_block_dual(
       SmemTensorA const& sA, RmemTensorChainingValue& rChainingValue,
       int tid_in_group, int global_consumer_tid, int stage, int block_in_load,
@@ -911,6 +932,11 @@ class MerkleTreeRootsKernel {
     // Set CHUNK_END on the last block (block_idx == kNumBlocksPerChunk - 1)
     if (block_idx == kNumBlocksPerChunk - 1) {
       params.flags |= blake3::CHUNK_END;
+      // If the entire message is this single chunk, this is also the final
+      // compression that produces the digest, so it must be flagged ROOT.
+      if constexpr (IsSingleChunk) {
+        params.flags |= blake3::ROOT;
+      }
     }
 
     blake3::compress_msg_block_u32(rBlock, rChainingValue, params);
