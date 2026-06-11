@@ -136,7 +136,7 @@ func TestMoEForkDisabled(t *testing.T) {
 }
 
 // TestShippedNetworksMoEForkHeights pins the MoE hardfork activation heights
-// for the shipped networks so they cannot change accidentally. 
+// for the shipped networks so they cannot change accidentally.
 func TestShippedNetworksMoEForkHeights(t *testing.T) {
 	heights := map[string]struct {
 		params *Params
