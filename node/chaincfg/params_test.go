@@ -135,18 +135,20 @@ func TestMoEForkDisabled(t *testing.T) {
 	}
 }
 
-// TestShippedNetworksMoEForkDisabled enforces that every shipped network ships
-// with the MoE hardfork disabled until the verifier is finalized and an
-// activation height is chosen.
-func TestShippedNetworksMoEForkDisabled(t *testing.T) {
-	networks := map[string]*Params{
-		"mainnet":  &MainNetParams,
-		"testnet":  &TestNetParams,
-		"testnet2": &TestNet2Params,
+// TestShippedNetworksMoEForkHeights pins the MoE hardfork activation heights
+// for the shipped networks so they cannot change accidentally. 
+func TestShippedNetworksMoEForkHeights(t *testing.T) {
+	heights := map[string]struct {
+		params *Params
+		want   int32
+	}{
+		"mainnet":  {&MainNetParams, 71935},
+		"testnet":  {&TestNetParams, 38405},
+		"testnet2": {&TestNet2Params, 54869},
 	}
-	for name, p := range networks {
-		require.Zerof(t, p.MoEForkHeight,
-			"%s must ship with the MoE fork disabled", name)
+	for name, tt := range heights {
+		require.Equalf(t, tt.want, tt.params.MoEForkHeight,
+			"%s must ship with MoEForkHeight %d", name, tt.want)
 	}
 }
 

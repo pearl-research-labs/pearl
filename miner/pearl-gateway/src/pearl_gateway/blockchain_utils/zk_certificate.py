@@ -41,6 +41,7 @@ _MOE_PREAMBLE_DTYPE = np.dtype(
     ]
 )
 
+_CERT_VERSION_SIZE = 4  # u32 LE
 _PROOF_DATA_LEN_SIZE = 4  # u32 LE
 
 
@@ -52,7 +53,7 @@ class ZKCertificate:
 
     ZK_MAX_PROOF_DATA_SIZE: ClassVar[int] = 60000
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if len(self.proof.proof_data) > self.ZK_MAX_PROOF_DATA_SIZE:
             raise ValueError(
                 f"Proof data is too large: {len(self.proof.proof_data)} bytes "
@@ -145,7 +146,9 @@ class ZKCertificate:
         public_data: bytes | bytearray,
         cert_version: CertificateVersion = CertificateVersion.ZK_DENSE,
     ) -> bytes:
-        return double_sha256(int(cert_version).to_bytes(4, "little") + bytes(public_data))
+        return double_sha256(
+            int(cert_version).to_bytes(_CERT_VERSION_SIZE, "little") + bytes(public_data)
+        )
 
     def get_proof_commitment(self) -> bytes:
         return self._get_proof_commitment(self.proof.public_data, cert_version=self.cert_version)

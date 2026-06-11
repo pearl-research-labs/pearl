@@ -316,6 +316,8 @@ var MainNetParams = Params{
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
 
+	MoEForkHeight: 71935,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: []Checkpoint{
 		{50000, newHashFromStr("608f32e5390b2ae964c986a53e1be10ba4a640f3ccecf96d6b7838e06cb517ff")},
@@ -583,6 +585,8 @@ var TestNet2Params = Params{
 	MinDiffReductionTime: time.Hour * 4, // 4 hours
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
+
+	MoEForkHeight: 54869,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
