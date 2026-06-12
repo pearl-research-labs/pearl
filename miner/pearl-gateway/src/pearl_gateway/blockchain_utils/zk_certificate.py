@@ -18,15 +18,11 @@ def _validate_mining_config_trailer(public_data: bytes | bytearray) -> None:
     a free nonce that changes ProofCommitment without affecting the ZK proof.
     """
     if len(public_data) < 24:
-        raise ValueError(
-            f"public_data too short for mining config: {len(public_data)} bytes"
-        )
+        raise ValueError(f"public_data too short for mining config: {len(public_data)} bytes")
     e = int.from_bytes(public_data[20:22], "little")
     top_k = int.from_bytes(public_data[22:24], "little")
     if e == 0 and top_k != 0:
-        raise ValueError(
-            f"invalid mining config: e=0 but top_k={top_k} (must be 0 for non-MoE)"
-        )
+        raise ValueError(f"invalid mining config: e=0 but top_k={top_k} (must be 0 for non-MoE)")
 
 
 class CertificateVersion(IntEnum):
