@@ -114,14 +114,6 @@ func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error 
 	return verifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
 }
 
-// VerifyCertificateV1WithNbits verifies a V1 certificate using nbitsOverride
-// as the difficulty target instead of the block header's nbits field.
-//
-// WARNING: This bypasses the header's embedded difficulty. Do not use it in block acceptance or relay paths.
-func VerifyCertificateV1WithNbits(header *wire.BlockHeader, c *wire.CertificateV1, nbitsOverride uint32) error {
-	return verifyZKProofFFI(header, c.Hash, c.ProofCommitment(), c.PublicData[:], c.ProofData, &nbitsOverride)
-}
-
 func verifyZKProofFFI(
 	header *wire.BlockHeader,
 	certHash chainhash.Hash,
