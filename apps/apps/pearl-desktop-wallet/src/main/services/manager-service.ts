@@ -7,6 +7,7 @@ import dns from 'dns';
 import { ManagerApi } from '../../types/app-bridge.ts';
 import { WalletService } from './wallet-service/wallet-service.ts';
 import { WalletProcess } from './wallet-process.ts';
+import { readEncryptedSeed, writeEncryptedSeed } from './wallet-seed-store.ts';
 import { displayToFs, fsToDisplay } from '../../utils/filename-utils.ts';
 import { getCurrentNetworkConfig, getCurrentNetwork, setCurrentNetwork, getAllNetworks, type Network } from '../config/network-config';
 import { getPeerAddress, getPeerPort, getPeerSettings as getConfigPeerSettings, setCustomPeer, resetToDefaultPeer } from '../config/peer-settings';
@@ -48,6 +49,57 @@ class ManagerService implements ManagerApi {
   private walletService: WalletService | null = null;
   private currentWallet: WalletData | null = null;
   private walletProcess: WalletProcess | null = null;
+  private currentSeed: string | null = null;
+
+  private getWalletSeedPath(walletName: string) {
+    return path.join(baseWalletDir, displayToFs(walletName), 'wallet-seed.enc.json');
+  }
+
+  private persistCurrentSeed(seed: string, password: string) {
+    if (!this.currentWallet) {
+      return;
+    }
+    const seedPath = this.getWalletSeedPath(this.currentWallet.name);
+    writeEncryptedSeed(seedPath, seed, password);
+    this.currentSeed = seed.trim();
+  }
+
+  private loadCurrentSeed(password: string): string | null {
+    if (!this.currentWallet) {
+      return null;
+    }
+    const seedPath = this.getWalletSeedPath(this.currentWallet.name);
+    const seed = readEncryptedSeed(seedPath, password);
+    this.currentSeed = seed ? seed.trim() : null;
+    return this.currentSeed;
+  }
+
+  clearCurrentSeed() {
+    this.currentSeed = null;
+  }
+
+  getCurrentSeed() {
+    return this.currentSeed;
+  }
+
+  async unlockCurrentWalletSeed(password: string): Promise<{ seed?: string }> {
+    if (this.currentSeed) {
+      return { seed: this.currentSeed };
+    }
+    const seed = this.loadCurrentSeed(password);
+    return seed ? { seed } : {};
+  }
+
+  async rotateCurrentWalletSeedPassword(oldPassword: string, newPassword: string): Promise<void> {
+    if (!this.currentWallet) {
+      return;
+    }
+    const seed = this.currentSeed ?? this.loadCurrentSeed(oldPassword);
+    if (!seed) {
+      return;
+    }
+    this.persistCurrentSeed(seed, newPassword);
+  }
 
   private async loadWallet(walletName: string, mode: 'create' | 'open') {
     const walletDataDir = path.join(baseWalletDir, displayToFs(walletName));
@@ -109,6 +161,7 @@ class ManagerService implements ManagerApi {
     }
     await this.stopWalletProcess();
     this.currentWallet = null;
+    this.clearCurrentSeed();
   }
 
   // Fast path for the Lock button while the wallet is mid-block-recovery. The
@@ -119,6 +172,7 @@ class ManagerService implements ManagerApi {
   async forceLockWallet() {
     await this.stopWalletProcess({ force: true });
     this.currentWallet = null;
+    this.clearCurrentSeed();
   }
 
   ensureWalletService() {
@@ -169,6 +223,7 @@ class ManagerService implements ManagerApi {
     }
 
     this.currentWallet = { name: walletName };
+    this.clearCurrentSeed();
   }
 
   async create(options: { name: string; password: string }) {
@@ -186,10 +241,10 @@ class ManagerService implements ManagerApi {
     }
 
     const generatedSeed = createResult.seed;
-
     await this.startWalletProcess();
 
     this.currentWallet = { name };
+    this.persistCurrentSeed(generatedSeed, password);
 
     return { seed: generatedSeed };
   }
@@ -221,6 +276,7 @@ class ManagerService implements ManagerApi {
     }
 
     this.currentWallet = { name };
+    this.persistCurrentSeed(seed, finalPassword);
     return { name, seed };
   }
 

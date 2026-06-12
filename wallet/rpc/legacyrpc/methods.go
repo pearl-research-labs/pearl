@@ -32,6 +32,10 @@ import (
 const (
 	// defaultAccountName is the name of the wallet's default account.
 	defaultAccountName = "default"
+
+	// pearlMultisigAccountPrefix is the hardened account segment reserved for
+	// Pearl multisig cosigner derivations.
+	pearlMultisigAccountPrefix = 100
 )
 
 // confirms returns the number of confirmations for a transaction in a block at
@@ -126,6 +130,7 @@ var rpcHandlers = map[string]struct {
 	"chainsynced":      {handler: chainSynced},
 	"getsyncprogress":  {handler: getSyncProgress},
 	"createnewaccount": {handler: createNewAccount},
+	"derivemultisigkey": {handler: deriveMultisigKey},
 	"getbestblock":     {handler: getBestBlock},
 	// This was an extension but the reference implementation added it as
 	// well, but with a different API (no account parameter).  It's listed
@@ -302,6 +307,33 @@ func dumpPrivKey(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		return nil, &ErrWalletUnlockNeeded
 	}
 	return key, err
+}
+
+// deriveMultisigKey derives the wallet's Pearl multisig cosigner key at the
+// requested vault account / key index, returning both the x-only pubkey and
+// the raw private key for local signing flows.
+func deriveMultisigKey(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
+	cmd := icmd.(*btcjson.DeriveMultisigKeyCmd)
+	path := waddrmgr.DerivationPath{
+		InternalAccount: pearlMultisigAccountPrefix,
+		Account:         pearlMultisigAccountPrefix,
+		Branch:          uint32(cmd.VaultAccount),
+		Index:           uint32(cmd.KeyIndex),
+	}
+
+	privKey, err := w.DeriveFromKeyPathAddAccount(waddrmgr.KeyScopeBIP0086, path)
+	if err != nil {
+		return nil, err
+	}
+
+	pubKey := privKey.PubKey().SerializeCompressed()
+	xOnly := pubKey[1:]
+
+	return map[string]string{
+		"pubkeyHex":  hex.EncodeToString(xOnly),
+		"privKeyHex": hex.EncodeToString(privKey.Serialize()),
+		"originPath": fmt.Sprintf("m/86'/%d'/%d'/%d'/%d", w.ChainParams().HDCoinType, pearlMultisigAccountPrefix, cmd.VaultAccount, cmd.KeyIndex),
+	}, nil
 }
 
 // getAddressesByAccount handles a getaddressesbyaccount request by returning

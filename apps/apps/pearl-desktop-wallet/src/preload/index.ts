@@ -25,6 +25,8 @@ const windowIpc: Ipc<WindowApi> = {
 const walletIpc: Ipc<WalletApi> = {
   getNewAddress: () => ipcRenderer.invoke('wallet-get-new-address'),
   unlockWallet: (passphrase, timeout) => ipcRenderer.invoke('wallet-unlock', passphrase, timeout),
+  deriveMultisigKey: (vaultAccount, keyIndex) =>
+    ipcRenderer.invoke('wallet-derive-multisig-key', vaultAccount, keyIndex),
   lockWallet: () => ipcRenderer.invoke('wallet-lock'),
   forceLockWallet: () => ipcRenderer.invoke('wallet-force-lock'),
   changeWalletPassphrase: (currentPassword, newPassword) =>
@@ -34,6 +36,10 @@ const walletIpc: Ipc<WalletApi> = {
   listAllTransactions: () => ipcRenderer.invoke('wallet-list-all-transactions'),
   listTransactions: (count, from) => ipcRenderer.invoke('wallet-list-transactions', count, from),
   getBalance: (account, minconf) => ipcRenderer.invoke('wallet-get-balance', account, minconf),
+  getVaultBalance: address => ipcRenderer.invoke('wallet-get-vault-balance', address),
+  getVaultUtxos: address => ipcRenderer.invoke('wallet-get-vault-utxos', address),
+  broadcastPearlTx: rawHex => ipcRenderer.invoke('wallet-broadcast-pearl-tx', rawHex),
+  getTransactionInfo: txid => ipcRenderer.invoke('wallet-get-transaction-info', txid),
   validateAddress: address => ipcRenderer.invoke('wallet-validate-address', address),
   estimateFee: numBlocks => ipcRenderer.invoke('wallet-estimate-fee', numBlocks),
 };
