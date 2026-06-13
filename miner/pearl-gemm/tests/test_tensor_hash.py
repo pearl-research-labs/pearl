@@ -217,6 +217,40 @@ class TestTensorHash:
             f"Hash mismatch for shape {shape} with 512 threads: CUDA result doesn't match Python reference"
         )
 
+    @pytest.mark.parametrize("threads_per_block", [128, 512])
+    @pytest.mark.parametrize(
+        "nbytes",
+        [
+            512,  # single sub-chunk input
+            1056,  # one full chunk + 32-byte remainder
+            128 * 1024 + 512,  # partial chunk alone in the second CTA @128 threads
+        ],
+    )
+    def test_tensor_hash_unaligned_tail_of_allocation(self, nbytes, threads_per_block):
+        backing_bytes = 2 * 1024 * 1024
+        backing = torch.randint(0, 255, (backing_bytes,), dtype=torch.uint8, device="cuda")
+        matrix = backing[-nbytes:].reshape(1, nbytes)
+        assert matrix.is_contiguous()
+
+        scratchpad_size = get_required_scratchpad_bytes(matrix.numel())
+        scratchpad = torch.empty(scratchpad_size, dtype=torch.uint8, device="cuda")
+
+        cuda_result = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        key_tensor = torch.randint(0, 255, (blake3.digest_size,), dtype=torch.uint8, device="cuda")
+        key_bytes = key_tensor.cpu().numpy().tobytes()
+
+        tensor_hash(
+            matrix, key_tensor, cuda_result, scratchpad, threads_per_block=threads_per_block
+        )
+        torch.cuda.synchronize()
+
+        python_result = hash_matrix(matrix.cpu(), key_bytes)
+
+        assert torch.equal(cuda_result, python_result), (
+            f"Hash mismatch for {nbytes}-byte tail input with {threads_per_block} threads: "
+            "CUDA result doesn't match Python reference"
+        )
+
     def test_tensor_hash_deterministic(self):
         """Test that tensor hash produces deterministic results."""
         shape = (8192, 8192)
