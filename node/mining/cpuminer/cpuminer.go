@@ -144,7 +144,7 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32) bool {
 	}
 
 	// Generate certificate using solve method
-	cert, err := blockchain.SolveBlock(msgBlock.BlockHeader(), m.cfg.ChainParams.Net)
+	cert, err := blockchain.SolveBlock(msgBlock.BlockHeader(), m.cfg.ChainParams, blockHeight)
 	if err != nil {
 		log.Errorf("Failed to solve block: %v", err)
 		return false

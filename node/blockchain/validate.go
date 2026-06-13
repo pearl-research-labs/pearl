@@ -512,6 +512,22 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 	return checkBlockSanity(block, chainParams, timeSource, BFNone)
 }
 
+// CheckCertificateVersion enforces the MoE certificate fork:
+//   - At and after MoEForkHeight: only V2 accepted
+//   - Before MoEForkHeight (or fork disabled): only V1 accepted
+func CheckCertificateVersion(cert wire.BlockCertificate, height int32, params *chaincfg.Params) error {
+	if cert == nil {
+		return ruleError(ErrCertificateMissing, "block has no certificate")
+	}
+	want := params.RequiredCertVersion(height)
+	if cert.Version() != want {
+		str := fmt.Sprintf("certificate version %d is not allowed at height %d "+
+			"(require version %d)", cert.Version(), height, want)
+		return ruleError(ErrDisallowedCertVersion, str)
+	}
+	return nil
+}
+
 // ExtractCoinbaseHeight attempts to extract the height of the block from the
 // scriptSig of a coinbase transaction.  Coinbase heights are only present in
 // blocks of version 2 or later.  This was added as part of BIP0034.
@@ -701,13 +717,17 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 		return err
 	}
 
+	// Enforce the V1/V2 certificate version policy (consensus-critical,
+	// runs regardless of BFFastAdd).
+	blockHeight := prevNode.height + 1
+	if err := CheckCertificateVersion(block.MsgBlock().BlockCertificate(),
+		blockHeight, b.chainParams); err != nil {
+		return err
+	}
+
 	fastAdd := flags&BFFastAdd == BFFastAdd
 	if !fastAdd {
 		blockTime := CalcPastMedianTime(prevNode)
-
-		// The height of this block is one more than the referenced
-		// previous block.
-		blockHeight := prevNode.height + 1
 
 		// Ensure all transactions in the block are finalized.
 		for _, tx := range block.Transactions() {

@@ -579,19 +579,37 @@ def tensor_hash(
 
 
 def commitment_hash_from_merkle_roots(
-    A_merkle_root, B_merkle_root, key, A_commitment_hash, B_commitment_hash
+    A_merkle_root,
+    B_merkle_root,
+    key,
+    A_commitment_hash,
+    B_commitment_hash,
+    routing_root=None,
+    offsets_hash=None,
 ):
     """
     Compute the commitment hash from merkle roots of a 2D tensor.
     """
     return pearl_gemm_cuda.commitment_hash_from_merkle_roots(
-        A_merkle_root, B_merkle_root, key, A_commitment_hash, B_commitment_hash
+        A_merkle_root,
+        B_merkle_root,
+        key,
+        A_commitment_hash,
+        B_commitment_hash,
+        routing_root,
+        offsets_hash,
     )
 
 
 @torch.library.register_fake("pearl_gemm::commitment_hash_from_merkle_roots")
 def _abstract_commitment_hash_from_merkle_roots(
-    A_merkle_root, B_merkle_root, key, A_commitment_hash, B_commitment_hash
+    A_merkle_root,
+    B_merkle_root,
+    key,
+    A_commitment_hash,
+    B_commitment_hash,
+    routing_root=None,
+    offsets_hash=None,
 ):
     return None
 

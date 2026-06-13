@@ -90,7 +90,7 @@ var genesisMerkleRoot = chainhash.Hash([chainhash.HashSize]byte{
 var genesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      genesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -125,7 +125,7 @@ var regTestGenesisMerkleRoot = genesisMerkleRoot
 var regTestGenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      regTestGenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -205,7 +205,7 @@ var testNetGenesisMerkleRoot = chainhash.Hash([chainhash.HashSize]byte{
 var testNetGenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      testNetGenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -240,7 +240,7 @@ var testNet2GenesisMerkleRoot = testNetGenesisMerkleRoot
 var testNet2GenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      testNet2GenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -275,7 +275,7 @@ var simNetGenesisMerkleRoot = genesisMerkleRoot
 var simNetGenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      simNetGenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -310,7 +310,7 @@ var sigNetGenesisMerkleRoot = genesisMerkleRoot
 var sigNetGenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      sigNetGenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},

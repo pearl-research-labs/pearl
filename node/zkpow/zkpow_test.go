@@ -7,6 +7,7 @@
 package zkpow
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 	"time"
@@ -42,8 +43,8 @@ func testBlockHeader(nbits ...uint32) *wire.BlockHeader {
 	}
 }
 
-// mineZKCertificate mines a block and returns the header and ZKCertificate.
-func mineZKCertificate(t *testing.T) (*wire.BlockHeader, *wire.ZKCertificate) {
+// mineCertificate mines a block and returns the header and certificate.
+func mineCertificate(t *testing.T) (*wire.BlockHeader, *wire.CertificateV2) {
 	t.Helper()
 	header := testBlockHeader()
 
@@ -65,12 +66,24 @@ func copyBlockHeader(h *wire.BlockHeader) *wire.BlockHeader {
 	}
 }
 
-// copyZKCertificate creates a deep copy of ZKCertificate for tampering tests
-func copyZKCertificate(c *wire.ZKCertificate) *wire.ZKCertificate {
-	cp := &wire.ZKCertificate{
+// copyCertificateV1 creates a deep copy of CertificateV1 for tampering tests
+func copyCertificateV1(c *wire.CertificateV1) *wire.CertificateV1 {
+	cp := &wire.CertificateV1{
 		Hash:       c.Hash,
 		PublicData: c.PublicData,
 		ProofData:  make([]byte, len(c.ProofData)),
+	}
+	copy(cp.ProofData, c.ProofData)
+	return cp
+}
+
+// copyCertificateV2 creates a deep copy of CertificateV2 for tampering tests
+func copyCertificateV2(c *wire.CertificateV2) *wire.CertificateV2 {
+	cp := &wire.CertificateV2{
+		Hash:          c.Hash,
+		PublicDataLen: c.PublicDataLen,
+		PublicData:    c.PublicData,
+		ProofData:     make([]byte, len(c.ProofData)),
 	}
 	copy(cp.ProofData, c.ProofData)
 	return cp
@@ -84,7 +97,7 @@ func TestMineAndVerifyProof(t *testing.T) {
 		DefaultM, DefaultN, header.Bits)
 
 	startMine := time.Now()
-	header, cert := mineZKCertificate(t)
+	header, cert := mineCertificate(t)
 	t.Logf("Mining completed in %v, proof size: %d bytes", time.Since(startMine), len(cert.ProofData))
 
 	startVerify := time.Now()
@@ -97,7 +110,7 @@ func TestMineAndVerifyProof(t *testing.T) {
 // PublicData layout: config(0..52) | hash_a(52..84) | hash_b(84..116) | hash_jackpot(116..148) |
 // m,n,t_rows,t_cols(148..164)
 func TestTamperedParams(t *testing.T) {
-	header, cert := mineZKCertificate(t)
+	header, cert := mineCertificate(t)
 
 	// Block header field tampering.
 	headerTampers := []struct {
@@ -121,10 +134,10 @@ func TestTamperedParams(t *testing.T) {
 	}
 
 	// Every byte of PublicData must individually cause rejection when flipped.
-	for i := 0; i < wire.PublicDataSize; i++ {
+	for i := 0; i < int(cert.PublicDataLen); i++ {
 		i := i
 		t.Run(fmt.Sprintf("PublicData[%d]", i), func(t *testing.T) {
-			tamperedCert := copyZKCertificate(cert)
+			tamperedCert := copyCertificateV2(cert)
 			tamperedCert.PublicData[i] ^= 0xFF
 			err := VerifyCertificate(header, tamperedCert)
 			require.Error(t, err, "proof should be rejected when PublicData[%d] is tampered", i)
@@ -134,7 +147,7 @@ func TestTamperedParams(t *testing.T) {
 
 	// ProofData tampering.
 	t.Run("ProofData", func(t *testing.T) {
-		tamperedCert := copyZKCertificate(cert)
+		tamperedCert := copyCertificateV2(cert)
 		tamperedCert.ProofData[20] ^= 0xFF
 		err := VerifyCertificate(header, tamperedCert)
 		require.Error(t, err, "proof should be rejected when ProofData is tampered")
@@ -144,9 +157,9 @@ func TestTamperedParams(t *testing.T) {
 
 // TestTamperedProof verifies that overwriting the metadata fields in proof_data is rejected.
 func TestTamperedProof(t *testing.T) {
-	header, cert := mineZKCertificate(t)
+	header, cert := mineCertificate(t)
 
-	tamperedCert := copyZKCertificate(cert)
+	tamperedCert := copyCertificateV2(cert)
 	for i := 0; i < 50; i++ {
 		tamperedCert.ProofData[i] ^= 0xFF
 	}
@@ -160,7 +173,7 @@ func TestTamperedProof(t *testing.T) {
 func TestVerifyProof_InvalidInput(t *testing.T) {
 	header := testBlockHeader()
 
-	// Generate a random 70400-byte proof (the native size of a valid ZKCertificate)
+	// Generate a random 70400-byte proof (the native size of a valid V1 certificate)
 	randomProof := make([]byte, 70400)
 	for i := range randomProof {
 		randomProof[i] = byte(i % 256)
@@ -169,11 +182,11 @@ func TestVerifyProof_InvalidInput(t *testing.T) {
 	testCases := []struct {
 		name   string
 		header *wire.BlockHeader
-		cert   *wire.ZKCertificate
+		cert   *wire.CertificateV1
 	}{
-		{"EmptyProofData", header, &wire.ZKCertificate{ProofData: nil}},
-		{"ZeroLengthProofData", header, &wire.ZKCertificate{ProofData: []byte{}}},
-		{"Random70400ByteProof", header, &wire.ZKCertificate{ProofData: randomProof}},
+		{"EmptyProofData", header, &wire.CertificateV1{ProofData: nil}},
+		{"ZeroLengthProofData", header, &wire.CertificateV1{ProofData: []byte{}}},
+		{"Random70400ByteProof", header, &wire.CertificateV1{ProofData: randomProof}},
 	}
 
 	for _, tc := range testCases {
@@ -183,6 +196,96 @@ func TestVerifyProof_InvalidInput(t *testing.T) {
 			t.Logf("%s: %v", tc.name, err)
 		})
 	}
+}
+
+// ================================================================================
+// MoE VERIFICATION TESTS
+// ================================================================================
+
+const (
+	DefaultMoEM    = 1024
+	DefaultMoEN    = 256
+	DefaultMoEE    = 4
+	DefaultMoETopK = 2
+)
+
+// mineMoECertificate mines an MoE block and returns the header and CertificateV2.
+func mineMoECertificate(t *testing.T) (*wire.BlockHeader, *wire.CertificateV2) {
+	t.Helper()
+	header := testBlockHeader()
+
+	cert, err := MineMoE(header, DefaultMoEM, DefaultMoEN, DefaultMoEE, DefaultMoETopK)
+	require.NoError(t, err, "MoE mining should succeed")
+
+	return header, cert
+}
+
+// TestMoEMineAndVerifyProof tests the full MoE mining and verification flow.
+func TestMoEMineAndVerifyProof(t *testing.T) {
+	header := testBlockHeader()
+
+	t.Logf("MoE mining: M=%d, N=%d, E=%d, TopK=%d, nbits=0x%08X",
+		DefaultMoEM, DefaultMoEN, DefaultMoEE, DefaultMoETopK, header.Bits)
+
+	startMine := time.Now()
+	header, cert := mineMoECertificate(t)
+	t.Logf("MoE mining completed in %v, proof size: %d bytes, public_data_len: %d",
+		time.Since(startMine), len(cert.ProofData), cert.PublicDataLen)
+
+	require.Greater(t, cert.PublicDataLen, uint32(wire.PublicDataSizeV1),
+		"MoE public_data should be larger than the fixed-size core prefix")
+
+	startVerify := time.Now()
+	err := VerifyCertificate(header, cert)
+	require.NoError(t, err, "MoE proof verification should succeed")
+	t.Logf("MoE verification completed in %v", time.Since(startVerify))
+}
+
+// TestMoESerializeDeserializeVerify tests that an MoE certificate survives serialization round-trip.
+func TestMoESerializeDeserializeVerify(t *testing.T) {
+	header, cert := mineMoECertificate(t)
+
+	err := VerifyCertificate(header, cert)
+	require.NoError(t, err, "original MoE cert should verify")
+
+	// Serialize + deserialize
+	var buf bytes.Buffer
+	err = cert.Serialize(&buf)
+	require.NoError(t, err, "MoE cert serialization should succeed")
+
+	deserialized := &wire.CertificateV2{}
+	err = deserialized.Deserialize(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err, "MoE cert deserialization should succeed")
+
+	require.Equal(t, cert.Hash, deserialized.Hash)
+	require.Equal(t, cert.PublicDataLen, deserialized.PublicDataLen)
+	require.Equal(t, cert.PublicData, deserialized.PublicData)
+	require.Equal(t, cert.ProofData, deserialized.ProofData)
+
+	err = VerifyCertificate(header, deserialized)
+	require.NoError(t, err, "deserialized MoE cert should verify")
+}
+
+// TestMoETamperedParams tests that tampering any byte of MoE PublicData causes rejection.
+func TestMoETamperedParams(t *testing.T) {
+	header, cert := mineMoECertificate(t)
+
+	for i := 0; i < int(cert.PublicDataLen); i++ {
+		i := i
+		t.Run(fmt.Sprintf("PublicData[%d]", i), func(t *testing.T) {
+			tamperedCert := copyCertificateV2(cert)
+			tamperedCert.PublicData[i] ^= 0xFF
+			err := VerifyCertificate(header, tamperedCert)
+			require.Error(t, err, "MoE proof should be rejected when PublicData[%d] is tampered", i)
+		})
+	}
+
+	t.Run("ProofData", func(t *testing.T) {
+		tamperedCert := copyCertificateV2(cert)
+		tamperedCert.ProofData[20] ^= 0xFF
+		err := VerifyCertificate(header, tamperedCert)
+		require.Error(t, err, "MoE proof should be rejected when ProofData is tampered")
+	})
 }
 
 // ================================================================================

@@ -3,7 +3,7 @@ from copy import copy
 from typing import Any
 
 from miner_utils import get_logger
-from pearl_mining import PlainProof
+from pearl_mining import PlainProof, check_cert_version_eligible
 
 from pearl_gateway.blockchain_utils.pearl_block import PearlBlock
 from pearl_gateway.blockchain_utils.zk_certificate import ZKCertificate
@@ -46,7 +46,13 @@ class SubmissionService:
                     f"Received PlainProof submission for template time {template.header.timestamp}"
                 )
 
-                # Generate the complete block from PlainProof and template
+                # Reject proofs that cannot be certified at the version the block requires.
+                try:
+                    check_cert_version_eligible(template.required_cert_version, plain_proof)
+                except ValueError as e:
+                    logger.warning("Rejecting proof: %s", e)
+                    return {"status": f"error: {e}"}
+
                 block = ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
 
                 # Submit to the Pearl node

@@ -12,7 +12,8 @@
 //! Preprocessed Columns
 //! --------------------
 //! 1. CONTROL_PREP: Control logic specifying what each row does across all chips. Also
-//!    contains MAT_ID, an identifier for the original location of this row's matrix input.
+//!    contains MAT_ID, an identifier for the original location of this row's matrix input,
+//!    as well as indices and flags related to outer_indices (in the MoE case).
 //! 2. NOISE_PACKED_PREP: The precomputed noise to add to the matrix data fed to this row.
 //! 3. CV_OR_TWEAK_PREP: Additional Blake3 control. Either a row index to read a previous
 //!    blake3 output from (parsed as CV, or as message for a parent compression), or the
@@ -106,6 +107,13 @@ pub(crate) fn eval_constraints<V, S, E>(
         let pub_hash_jackpot = eval.scalar(public_inputs[pearl_public::HASH_JACKPOT + i]);
         let out_cv = blake3_output[i];
         eval.constraint_eq_if(blake3_cf.is_hash_jackpot, pub_hash_jackpot, out_cv);
+    }
+
+    // Check HASH_ROUTING agrees with blake3_output
+    for i in 0..pearl_public::HASH_ROUTING_LEN {
+        let pub_hash_routing = eval.scalar(public_inputs[pearl_public::HASH_ROUTING + i]);
+        let out_cv = blake3_output[i];
+        eval.constraint_eq_if(blake3_cf.is_hash_routing, pub_hash_routing, out_cv);
     }
 
     debug_assert_eq!(row_view.offset, pearl_columns::TOTAL);

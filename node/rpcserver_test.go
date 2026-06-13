@@ -4,14 +4,88 @@ import (
 	"encoding/hex"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/pearl-research-labs/pearl/node/blockchain"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/mempool"
+	"github.com/pearl-research-labs/pearl/node/mining"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/require"
 )
+
+// TestBlockTemplateResultRequiredCertVersion asserts the getblocktemplate
+// result surfaces the certificate version carried by the template's placeholder
+// certificate. Combined with the MoE fork template selection (covered by
+// blockchain.TestMoEForkBlockTemplateVersion), this is how miners learn whether
+// a V1 or V2 certificate is required for the next block.
+func TestBlockTemplateResultRequiredCertVersion(t *testing.T) {
+	t.Parallel()
+
+	const (
+		coinbaseValue        = 5_000_000_000
+		maxTimeOffsetMinutes = 60
+		templateBits         = 0x207fffff
+	)
+
+	testCases := []struct {
+		name string
+		cert wire.BlockCertificate
+		want uint32
+	}{
+		{
+			name: "v1 placeholder before crossover",
+			cert: &wire.CertificateV1{},
+			want: uint32(wire.CertificateVersionV1),
+		},
+		{
+			name: "v2 placeholder at/after crossover",
+			cert: &wire.CertificateV2{},
+			want: uint32(wire.CertificateVersionV2),
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			coinbase := wire.NewMsgTx(wire.TxVersion)
+			coinbase.AddTxOut(wire.NewTxOut(coinbaseValue, []byte{0x51}))
+
+			msgBlock := &wire.MsgBlock{
+				MsgHeader: wire.MsgHeader{
+					MsgCertificate: wire.MsgCertificate{Certificate: tc.cert},
+					BlockHeader: wire.BlockHeader{
+						Timestamp: time.Now(),
+						Bits:      templateBits,
+					},
+				},
+				Transactions: []*wire.MsgTx{coinbase},
+			}
+
+			prevHash := &chainhash.Hash{}
+			state := &gbtWorkState{
+				template: &mining.BlockTemplate{
+					Block:  msgBlock,
+					Fees:   []int64{0},
+					Height: 1,
+				},
+				timeSource:           blockchain.NewMedianTime(),
+				maxTimeOffsetMinutes: maxTimeOffsetMinutes,
+				prevHash:             prevHash,
+				lastGenerated:        time.Now(),
+				minTimestamp:         time.Now(),
+			}
+
+			result, err := state.blockTemplateResult(true, nil)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, result.RequiredCertVersion)
+		})
+	}
+}
 
 // TestHandleTestMempoolAcceptFailDecode checks that when invalid hex string is
 // used as the raw txns, the corresponding error is returned.

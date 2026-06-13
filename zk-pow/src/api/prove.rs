@@ -14,7 +14,7 @@ use crate::circuit::circuit_utils::CircuitCache;
 use crate::circuit::pearl_circuit::{PearlCircuitParams, PearlRecursion, RecursionCircuit};
 use crate::circuit::pearl_layout::pearl_public;
 use crate::circuit::pearl_stark::PearlStark;
-use crate::ffi::plain_proof::{PlainProof, parse_plain_proof};
+use crate::ffi::plain_proof::PlainProof;
 
 /// Configured worker count visible to the prove call graph. Exported
 /// so callers (icemining stratum, benchmark harnesses) can report it
@@ -46,18 +46,20 @@ fn log_prove_stage(enabled: bool, stage: &'static str, started: Instant) {
 }
 
 pub struct ProveResult {
-    pub public_data: [u8; PublicProofParams::PUBLICDATA_SIZE],
+    /// [`PublicProofParams::WIRE_SIZE`] bytes for non-MoE; longer for MoE proof.
+    pub public_data: Vec<u8>,
     pub proof_data: Vec<u8>,
 }
 
+/// Parse a proof (plain or MoE), generate a ZK proof, and return the serialized result.
 pub fn zk_prove_plain_proof(
     block_header: IncompleteBlockHeader,
-    plain_proof: &PlainProof,
+    proof: &PlainProof,
     cache: &mut CircuitCache,
     sanity_check: bool,
 ) -> Result<ProveResult> {
     // Convert PlainProof to proof parameters
-    let (private, public) = parse_plain_proof(block_header, plain_proof)?;
+    let (private, public) = proof.parse_proof(block_header)?;
     if sanity_check {
         public.sanity_check_private_params(&private)?;
     }
@@ -79,7 +81,7 @@ pub fn zk_prove_plain_proof(
         prove_workers,
     );
 
-    let (public_data, proof_data) = proof.serialize(&public);
+    let (public_data, proof_data) = proof.serialize(&public)?;
 
     Ok(ProveResult { public_data, proof_data })
 }
@@ -127,7 +129,7 @@ pub fn prove_block(
     log_prove_stage(timing_enabled, "compile_recursion_circuits", stage_started);
 
     let stage_started = Instant::now();
-    let hash_public_data = public_params.public_data_commitment(&circuit_params);
+    let hash_public_data = public_params.public_data_commitment(&circuit_params)?;
     log_prove_stage(timing_enabled, "public_data_commitment", stage_started);
 
     let stage_started = Instant::now();
@@ -167,7 +169,7 @@ pub fn prove_block_split(
         rate_bits: default_rate_bits.map(|b| b as usize),
     };
     PearlRecursion::compile_circuits(circuit_params, cache, true)?;
-    let hash_public_data = public_params.public_data_commitment(&circuit_params);
+    let hash_public_data = public_params.public_data_commitment(&circuit_params)?;
 
     // === MINER: STARK#0 only ===
     let t_miner = std::time::Instant::now();
@@ -266,6 +268,7 @@ pub fn warmup_prove(mining_configuration: MiningConfiguration, cache: &mut Circu
     let private_params = PrivateProofParams {
         s_a: vec![vec![0i8; common_dim]; tile_h],
         s_b: vec![vec![0i8; common_dim]; tile_w],
+        s_routing: vec![],
         external_msgs: vec![],
         external_cvs: vec![],
     };

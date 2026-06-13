@@ -7,13 +7,33 @@ use plonky2_field::goldilocks_field::GoldilocksField;
 use primitive_types::U256;
 
 use crate::api::proof::{
-    Hash256, IncompleteBlockHeader, MINING_CONFIG_RESERVED_SIZE, MMAType, MiningConfiguration, PeriodicPattern,
-    PrivateProofParams, PublicProofParams, ZKProof,
+    Hash256, IncompleteBlockHeader, MINING_CONFIG_RESERVED_SIZE, MMAType, MiningConfiguration, MoEConfig, MoEParams,
+    PeriodicPattern, PrivateProofParams, PublicProofParams, ZKProof,
 };
+use crate::api::sanity_checks::public_params_sanity_check;
 use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLocation, BlakeProgram};
 use crate::circuit::pearl_circuit::PearlCircuitParams;
 use crate::ensure_eq;
+
 use pearl_blake3::blake3_digest;
+
+/// Computes `hash_activations = H(hash_a || hash_router)` where
+/// `hash_router = H(hash_routing_data || hash_offsets)` and
+/// `hash_offsets = H(pad_1024(routing_offsets_le), key=job_key)`.
+///
+/// This folds the routing commitment into A's noise seed in the MoE setting.
+pub fn compute_hash_activations(
+    hash_a: &Hash256,
+    hash_routing_data: &Hash256,
+    routing_offsets: &[u32],
+    job_key: &[u8; 32],
+) -> Hash256 {
+    let offsets_bytes: Vec<u8> = routing_offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+    let padded = pearl_blake3::pad_to_chunk_boundary(&offsets_bytes);
+    let hash_offsets = blake3_digest(&padded, Some(*job_key));
+    let hash_routing = blake3_digest(&[hash_routing_data.as_slice(), &hash_offsets].concat(), None);
+    blake3_digest(&[hash_a.as_slice(), &hash_routing].concat(), None)
+}
 
 /// Convert Bitcoin's compact nbits format to an absolute difficulty target as U256
 ///
@@ -225,11 +245,67 @@ impl PeriodicPattern {
 }
 
 impl PublicProofParams {
-    pub fn a_rows_indices(&self) -> Vec<u32> {
+    pub fn sanity_check(&self) -> Result<()> {
+        public_params_sanity_check(self)
+    }
+    pub fn mining_config(&self) -> MiningConfiguration {
+        self.mining_config
+    }
+    pub fn a_inner_indices(&self) -> Vec<u32> {
         self.mining_config.rows_pattern.indices_with_offset(self.t_rows)
     }
+    pub fn a_rows_indices(&self) -> Vec<u32> {
+        // In MoE the tokens indices are given as outer indices
+        self.moe
+            .as_ref()
+            .map(|m| m.outer_indices.clone())
+            .unwrap_or_else(|| self.a_inner_indices())
+    }
     pub fn b_cols_indices(&self) -> Vec<u32> {
-        self.mining_config.cols_pattern.indices_with_offset(self.t_cols)
+        let inner_indices = self.mining_config.cols_pattern.indices_with_offset(self.t_cols);
+        if let Some(moe) = &self.moe {
+            // Expert weight matrices are stacked on top of each other, so we can compute global indices by offsetting with expert_idx * n.
+            let first_expert_col = self.n * moe.expert_idx as u32;
+            inner_indices.iter().map(|&idx| first_expert_col + idx).collect()
+        } else {
+            inner_indices
+        }
+    }
+    pub fn block_header(&self) -> IncompleteBlockHeader {
+        self.block_header
+    }
+    pub fn hash_jackpot(&self) -> Hash256 {
+        self.hash_jackpot
+    }
+    pub fn hash_jackpot_mut(&mut self) -> &mut Hash256 {
+        &mut self.hash_jackpot
+    }
+    pub fn m(&self) -> u32 {
+        self.m
+    }
+    pub fn n(&self) -> u32 {
+        self.n
+    }
+    pub fn total_b_cols(&self) -> usize {
+        if let Some(moe) = &self.mining_config.moe {
+            (self.n as usize) * moe.e as usize
+        } else {
+            self.n as usize
+        }
+    }
+    /// Number of real (unpadded) u32 entries in the flattened routing: `m * top_k`.
+    /// Each of the `m` tokens is routed to exactly `top_k` experts, so the jagged
+    /// per-expert lists always sum to this. `None` outside the MoE case.
+    pub fn routing_entries(&self) -> Option<usize> {
+        self.mining_config.moe.map(|moe_cfg| self.m as usize * moe_cfg.top_k as usize)
+    }
+    /// [`Self::routing_entries`] rounded up so the routing byte length is a multiple of
+    /// the BLAKE3 block size (64 bytes) — i.e. the entry count is rounded to a multiple
+    /// of 16. The Blake commitment models routing as 64-byte rows, so the byte length
+    /// must tile evenly into blocks. The extra trailing entries are zero padding that no
+    /// sampled routing index is allowed to address. `None` outside the MoE case.
+    pub fn padded_routing_entries(&self) -> Option<usize> {
+        self.routing_entries().map(|n| n.next_multiple_of(16))
     }
     pub fn h(&self) -> usize {
         self.mining_config.rows_pattern.size() as usize
@@ -240,11 +316,24 @@ impl PublicProofParams {
     pub fn rank(&self) -> usize {
         self.mining_config.rank as usize
     }
-
     pub fn common_dim(&self) -> usize {
         self.mining_config.common_dim as usize
     }
-
+    pub fn hash_a(&self) -> Hash256 {
+        self.hash_a
+    }
+    pub fn hash_b(&self) -> Hash256 {
+        self.hash_b
+    }
+    pub fn hash_a_mut(&mut self) -> &mut Hash256 {
+        &mut self.hash_a
+    }
+    pub fn hash_b_mut(&mut self) -> &mut Hash256 {
+        &mut self.hash_b
+    }
+    pub fn dot_product_length(&self) -> usize {
+        self.mining_config.dot_product_length()
+    }
     pub fn job_key(&self) -> Hash256 {
         blake3_digest(
             &[&self.block_header.to_bytes()[..], &self.mining_config.to_bytes()[..]].concat(),
@@ -253,92 +342,93 @@ impl PublicProofParams {
     }
 
     /// Compute commitment hash (B's noise seed, A's noise seed).
+    ///
+    /// In the MoE setting `hash_a` is replaced by `hash_activations = blake3(hash_a || hash_router)`,
+    /// so the routing affects A's noise seed without an extra chained hash.
     pub fn commitment_hash(&self, job_key: Hash256) -> (Hash256, Hash256) {
+        let hash_activations = match &self.moe {
+            Some(moe) => compute_hash_activations(&self.hash_a, &moe.hash_routing, &moe.routing_offsets, &job_key),
+            None => self.hash_a,
+        };
         let b_noise_seed = blake3_digest(&[&job_key[..], &self.hash_b[..]].concat(), None);
-        let a_noise_seed = blake3_digest(&[&b_noise_seed[..], &self.hash_a[..]].concat(), None);
+        let a_noise_seed = blake3_digest(&[&b_noise_seed[..], &hash_activations[..]].concat(), None);
+
         (b_noise_seed, a_noise_seed)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        block_header: IncompleteBlockHeader,
-        mining_config: MiningConfiguration,
-        hash_a: Hash256,
-        hash_b: Hash256,
-        hash_jackpot: Hash256,
-        m: u32,
-        n: u32,
-        t_rows: u32,
-        t_cols: u32,
-    ) -> Self {
-        Self {
-            block_header,
-            mining_config,
-            hash_a,
-            hash_b,
-            hash_jackpot,
-            m,
-            n,
-            t_rows,
-            t_cols,
-        }
+    // Returns the compiled program and a list giving expected order of external data.
+    pub fn compile(&self) -> (CompiledPublicParams, Vec<AuxiliaryMsgLocation>, Vec<AuxiliaryCvLocation>) {
+        compilation(self)
     }
 
-    // Without hash_a, hash_b and jackpot
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_dummy(
-        block_header: IncompleteBlockHeader,
-        mining_configuration: MiningConfiguration,
-        m: u32,
-        n: u32,
-        t_rows: u32,
-        t_cols: u32,
-    ) -> Self {
-        Self::new(
-            block_header,
-            mining_configuration,
-            [1; 32], // dummy hash_a
-            [2; 32], // dummy hash_b
-            [3; 32], // dummy hash_jackpot
-            m,
-            n,
-            t_rows,
-            t_cols,
-        )
+    /// Verifies that the hashes in the witness match the computed hashes from private_params.
+    /// This is for production use where the prover has real witness data.
+    pub fn sanity_check_private_params(&self, private_params: &PrivateProofParams) -> Result<()> {
+        let (compiled, external_msgs, external_cvs) = self.compile();
+        ensure_eq!(
+            external_msgs.len(),
+            private_params.external_msgs.len(),
+            "external_msgs length mismatch expected={}, found={}",
+            external_msgs.len(),
+            private_params.external_msgs.len()
+        );
+        ensure_eq!(
+            external_cvs.len(),
+            private_params.external_cvs.len(),
+            "external_cvs length mismatch expected={}, found={}",
+            external_cvs.len(),
+            private_params.external_cvs.len()
+        );
+
+        let opt_hash_routing = self.moe.as_ref().map(|m| m.hash_routing);
+        let (hash_a, hash_b) = compiled
+            .blake_proof
+            .evaluate_blake(compiled.job_key, private_params, opt_hash_routing)?;
+        ensure_eq!(self.hash_a(), hash_a, "hash_a mismatch");
+        ensure_eq!(self.hash_b(), hash_b, "hash_b mismatch");
+
+        Ok(())
     }
 
-    #[cfg(test)]
-    pub fn new_for_tests(m: u32, n: u32, k: u32) -> Self {
-        Self::new_dummy(
-            IncompleteBlockHeader::new_for_test(0x207FFFFF),
-            MiningConfiguration {
-                common_dim: k,
-                rank: 128,
-                mma_type: MMAType::Int7xInt7ToInt32,
-                rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
-                cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105])
-                    .unwrap(),
-                reserved: MiningConfiguration::RESERVED_VALUE,
-            },
-            m,
-            n,
-            0, // t_rows - offset aligned to rows_pattern
-            0, // t_cols - offset aligned to cols_pattern
-        )
+    /// Computes hashes using dummy witness data. For tests and warmup only.
+    /// This fills external_msgs and external_cvs with zeros of the correct size,
+    /// then computes and sets the hashes in the witness.
+    /// Returns the PrivateProofParams with correctly-sized external data.
+    pub fn fill_dummy_merkle_proof(&mut self, mut private_params: PrivateProofParams) -> Result<PrivateProofParams> {
+        let (compiled, external_msgs, external_cvs) = self.compile();
+
+        // Fill external_msgs and external_cvs with zeros of correct size
+        private_params.external_msgs = vec![[0u8; 64]; external_msgs.len()];
+        private_params.external_cvs = vec![[0u8; 32]; external_cvs.len()];
+
+        let opt_hash_routing = self.moe.as_ref().map(|m| m.hash_routing);
+        let hashes = compiled
+            .blake_proof
+            .evaluate_blake(self.job_key(), &private_params, opt_hash_routing)?;
+        (*self.hash_a_mut(), *self.hash_b_mut()) = hashes;
+        Ok(private_params)
     }
 }
 
 impl MiningConfiguration {
-    /// Size of reserved field in bytes.
+    /// Size of the trailing region in bytes (MoE config + zero padding).
     pub const RESERVED_SIZE: usize = MINING_CONFIG_RESERVED_SIZE;
 
-    /// Default reserved bytes (all zeros).
-    pub const RESERVED_VALUE: [u8; Self::RESERVED_SIZE] = [0u8; Self::RESERVED_SIZE];
-
     /// Size of serialized MiningConfiguration in bytes.
-    /// 4 (common_dim) + 2 (rank) + 2 (mma_type) + 6 (rows_pattern) + 6 (cols_pattern) + 32 (reserved) = 52
+    /// 4 (common_dim) + 2 (rank) + 2 (mma_type) + 6 (rows_pattern) + 6 (cols_pattern) + 32 (trailer) = 52
     /// Note: IncompleteBlockHeader (76) + MiningConfiguration (52) = 128 bytes = 2 blake3 blocks.
     pub const SERIALIZED_SIZE: usize = 52;
+
+    /// Encodes the 32-byte trailer: `e(2) | top_k(2) | zero-padding(28)`.
+    fn trailer_bytes(&self) -> [u8; Self::RESERVED_SIZE] {
+        let mut trailer = [0u8; Self::RESERVED_SIZE];
+        if let Some(moe) = self.moe {
+            debug_assert!(moe.e != 0, "GROUPED_GEMM mining config must have e > 0");
+            trailer[0..2].copy_from_slice(&moe.e.to_le_bytes());
+            trailer[2..4].copy_from_slice(&moe.top_k.to_le_bytes());
+        }
+        trailer
+    }
 
     pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
         let mut bytes = Vec::with_capacity(Self::SERIALIZED_SIZE);
@@ -347,7 +437,7 @@ impl MiningConfiguration {
         bytes.extend_from_slice(&(self.mma_type as u16).to_le_bytes()); // 2 bytes
         bytes.extend_from_slice(&self.rows_pattern.to_bytes()); // 6 bytes
         bytes.extend_from_slice(&self.cols_pattern.to_bytes()); // 6 bytes
-        bytes.extend_from_slice(&self.reserved); // 24 bytes
+        bytes.extend_from_slice(&self.trailer_bytes()); // 32 bytes
         bytes.try_into().unwrap()
     }
 
@@ -368,15 +458,20 @@ impl MiningConfiguration {
         };
         let rows_pattern = PeriodicPattern::from_bytes(&data[8..14])?;
         let cols_pattern = PeriodicPattern::from_bytes(&data[14..20])?;
-        let reserved: [u8; Self::RESERVED_SIZE] = data[20..52].try_into().unwrap();
-        ensure!(reserved == Self::RESERVED_VALUE, "Reserved field must be all zeros");
+
+        // Trailer: e(2) | top_k(2) | zero-padding(28). e == 0 denotes a standard job, e > 0 GROUPED_GEMM.
+        let trailer = &data[20..52];
+        let e = u16::from_le_bytes(trailer[0..2].try_into().unwrap());
+        let top_k = u16::from_le_bytes(trailer[2..4].try_into().unwrap());
+        ensure!(trailer[4..].iter().all(|&b| b == 0), "Reserved trailer bytes must be zero");
+        let moe = if e == 0 { None } else { Some(MoEConfig { e, top_k }) };
         Ok(Self {
             common_dim,
             rank,
             mma_type,
             rows_pattern,
             cols_pattern,
-            reserved,
+            moe,
         })
     }
 
@@ -542,6 +637,49 @@ pub struct CompiledPublicParams {
     pub a_rows_indices: Vec<usize>,
     pub b_cols_indices: Vec<usize>,
     pub commitment_hash: (Hash256, Hash256), // (b_noise_seed, a_noise_seed)
+    pub moe: Option<CompiledMoE>,            // Some iff `params.moe.is_some()`.
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledMoE {
+    pub routing_start_offset: u32,
+    pub inner_indices: Vec<u32>,
+}
+
+fn compilation(params: &PublicProofParams) -> (CompiledPublicParams, Vec<AuxiliaryMsgLocation>, Vec<AuxiliaryCvLocation>) {
+    debug_assert!(
+        params.a_rows_indices().windows(2).all(|w| w[0] < w[1]),
+        "a_rows_indices must be strictly ascending"
+    );
+    debug_assert!(
+        params.b_cols_indices().windows(2).all(|w| w[0] < w[1]),
+        "b_cols_indices must be strictly ascending"
+    );
+
+    let (blake_program, msgs, cvs) = BlakeProgram::new(params);
+    let job_key = params.job_key();
+
+    let moe = params.moe.as_ref().map(|moe| CompiledMoE {
+        routing_start_offset: moe.expert_start_offset(),
+        inner_indices: params.a_inner_indices(),
+    });
+
+    (
+        CompiledPublicParams {
+            job_key,
+            k: params.common_dim(),
+            h: params.h(),
+            w: params.w(),
+            r: params.rank(),
+            blake_proof: blake_program,
+            a_rows_indices: params.a_rows_indices().iter().map(|&x| x as usize).collect(),
+            b_cols_indices: params.b_cols_indices().iter().map(|&x| x as usize).collect(),
+            commitment_hash: params.commitment_hash(job_key),
+            moe,
+        },
+        msgs,
+        cvs,
+    )
 }
 
 impl From<&PublicProofParams> for CompiledPublicParams {
@@ -552,82 +690,73 @@ impl From<&PublicProofParams> for CompiledPublicParams {
 }
 
 impl PublicProofParams {
-    pub fn dot_product_length(&self) -> usize {
-        self.mining_config.dot_product_length()
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        block_header: IncompleteBlockHeader,
+        mining_config: MiningConfiguration,
+        hash_a: Hash256,
+        hash_b: Hash256,
+        hash_jackpot: Hash256,
+        m: u32,
+        n: u32,
+        t_rows: u32,
+        t_cols: u32,
+    ) -> Self {
+        Self {
+            block_header,
+            mining_config,
+            hash_a,
+            hash_b,
+            hash_jackpot,
+            m,
+            n,
+            t_rows,
+            t_cols,
+            moe: None,
+        }
     }
 
-    // Returns the compiled program and a list giving expected order of external data.
-    pub fn compile(&self) -> (CompiledPublicParams, Vec<AuxiliaryMsgLocation>, Vec<AuxiliaryCvLocation>) {
-        debug_assert!(
-            self.a_rows_indices().windows(2).all(|w| w[0] < w[1]),
-            "a_rows_indices must be strictly ascending"
-        );
-        debug_assert!(
-            self.b_cols_indices().windows(2).all(|w| w[0] < w[1]),
-            "b_cols_indices must be strictly ascending"
-        );
-
-        let (blake_program, msgs, cvs) = BlakeProgram::new(self);
-        let job_key = self.job_key();
-
-        (
-            CompiledPublicParams {
-                job_key,
-                k: self.common_dim(),
-                h: self.h(),
-                w: self.w(),
-                r: self.rank(),
-                blake_proof: blake_program,
-                a_rows_indices: self.a_rows_indices().iter().map(|&x| x as usize).collect(),
-                b_cols_indices: self.b_cols_indices().iter().map(|&x| x as usize).collect(),
-                commitment_hash: self.commitment_hash(job_key),
-            },
-            msgs,
-            cvs,
+    // Without hash_a, hash_b and jackpot
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_dummy(
+        block_header: IncompleteBlockHeader,
+        mining_configuration: MiningConfiguration,
+        m: u32,
+        n: u32,
+        t_rows: u32,
+        t_cols: u32,
+    ) -> Self {
+        Self::new(
+            block_header,
+            mining_configuration,
+            [1; 32], // dummy hash_a
+            [2; 32], // dummy hash_b
+            [3; 32], // dummy hash_jackpot
+            m,
+            n,
+            t_rows,
+            t_cols,
         )
     }
 
-    /// Verifies that the hashes in the witness match the computed hashes from private_params.
-    /// This is for production use where the prover has real witness data.
-    pub fn sanity_check_private_params(&self, private_params: &PrivateProofParams) -> Result<()> {
-        let (compiled, external_msgs, external_cvs) = self.compile();
-        ensure_eq!(
-            external_msgs.len(),
-            private_params.external_msgs.len(),
-            "external_msgs length mismatch expected={}, found={}",
-            external_msgs.len(),
-            private_params.external_msgs.len()
-        );
-        ensure_eq!(
-            external_cvs.len(),
-            private_params.external_cvs.len(),
-            "external_cvs length mismatch expected={}, found={}",
-            external_cvs.len(),
-            private_params.external_cvs.len()
-        );
-
-        let (hash_a, hash_b) = compiled.blake_proof.evaluate_blake(compiled.job_key, private_params)?;
-        ensure_eq!(self.hash_a, hash_a, "hash_a mismatch");
-        ensure_eq!(self.hash_b, hash_b, "hash_b mismatch");
-
-        Ok(())
-    }
-
-    /// Computes hashes using dummy witness data. For tests and warmup only.
-    /// This fills external_msgs and external_cvs with zeros of the correct size,
-    /// then computes and sets the hashes in the witness. hash_jackpot is set to a dummy value.
-    /// Returns the PrivateProofParams with correctly-sized external data.
-    pub fn fill_dummy_merkle_proof(&mut self, mut private_params: PrivateProofParams) -> Result<PrivateProofParams> {
-        let (compiled, external_msgs, external_cvs) = self.compile();
-
-        // Fill external_msgs and external_cvs with zeros of correct size
-        private_params.external_msgs = vec![[0u8; 64]; external_msgs.len()];
-        private_params.external_cvs = vec![[0u8; 32]; external_cvs.len()];
-
-        let hashes = compiled.blake_proof.evaluate_blake(self.job_key(), &private_params)?;
-        (self.hash_a, self.hash_b) = hashes;
-
-        Ok(private_params)
+    #[cfg(test)]
+    pub fn new_for_tests(m: u32, n: u32, k: u32) -> Self {
+        Self::new_dummy(
+            IncompleteBlockHeader::new_for_test(0x207FFFFF),
+            MiningConfiguration {
+                common_dim: k,
+                rank: 128,
+                mma_type: MMAType::Int7xInt7ToInt32,
+                rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
+                cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105])
+                    .unwrap(),
+                moe: None,
+            },
+            m,
+            n,
+            0, // t_rows - offset aligned to rows_pattern
+            0, // t_cols - offset aligned to cols_pattern
+        )
     }
 }
 
@@ -654,7 +783,7 @@ mod tests {
                 rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
                 cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105])
                     .unwrap(),
-                reserved: MiningConfiguration::RESERVED_VALUE,
+                moe: None,
             },
             256, // m: rows of A
             128, // n: columns of B
@@ -686,7 +815,7 @@ mod tests {
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
             cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9]).unwrap(),
-            reserved: MiningConfiguration::RESERVED_VALUE,
+            moe: None,
         };
         assert_eq!(config.to_bytes().len(), MiningConfiguration::SERIALIZED_SIZE);
     }
@@ -699,7 +828,7 @@ mod tests {
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern: PeriodicPattern::from_list(&[0, 8]).unwrap(),
             cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41]).unwrap(),
-            reserved: MiningConfiguration::RESERVED_VALUE,
+            moe: None,
         };
         let serialized = original.to_bytes();
         let restored = MiningConfiguration::from_bytes(&serialized).unwrap();
@@ -707,7 +836,7 @@ mod tests {
         assert_eq!(restored.rank, original.rank);
         assert_eq!(restored.rows_pattern.to_list(), original.rows_pattern.to_list());
         assert_eq!(restored.cols_pattern.to_list(), original.cols_pattern.to_list());
-        assert_eq!(restored.reserved, original.reserved);
+        assert_eq!(restored.moe, original.moe);
     }
 
     #[test]
@@ -893,6 +1022,7 @@ mod tests {
         let private_params = PrivateProofParams {
             s_a: vec![vec![0i8; strip_len]; params.h()],
             s_b: vec![vec![0i8; strip_len]; params.w()],
+            s_routing: vec![],
             external_msgs: vec![],
             external_cvs: vec![],
         };
@@ -900,36 +1030,173 @@ mod tests {
             .fill_dummy_merkle_proof(private_params)
             .expect("hash round-trip should succeed for non-aligned dimensions");
     }
+
+    #[test]
+    fn test_zk_proof_public_data_non_moe_roundtrip() {
+        let mut params = PublicProofParams::new_for_tests(64, 64, 256);
+        params.hash_a = [0xabu8; 32];
+        params.hash_b = [0xbcu8; 32];
+        params.hash_jackpot = [0xcdu8; 32];
+
+        let bytes = params.to_wire_bytes().unwrap();
+        assert_eq!(bytes.len(), PublicProofParams::WIRE_SIZE);
+
+        let proof_blob = [0u8; ZKProof::PROOFDATA_PREAMBLE];
+        let (parsed, _) = ZKProof::deserialize(params.block_header, &bytes, &proof_blob).unwrap();
+        assert!(parsed.moe.is_none());
+        assert_eq!(parsed.hash_a, params.hash_a);
+        assert_eq!(parsed.hash_b, params.hash_b);
+        assert_eq!(parsed.hash_jackpot, params.hash_jackpot);
+        assert_eq!(parsed.m, params.m);
+        assert_eq!(parsed.n, params.n);
+    }
+
+    #[test]
+    fn test_zk_proof_public_data_moe_roundtrip() {
+        use crate::api::proof::MoEParams;
+
+        let mut params = PublicProofParams::new_for_tests(64, 64, 256);
+        // e and top_k are committed in the mining_config trailer.
+        params.mining_config.moe = Some(MoEConfig { e: 4, top_k: 4 });
+        // Exclusive ends (cumulative counts) for 4 experts; last == m * top_k = 64 * 4 = 256.
+        let routing_offsets = vec![64u32, 128, 192, 256];
+        params.moe = Some(MoEParams {
+            routing_offsets: routing_offsets.clone(),
+            expert_idx: 1,
+            hash_routing: [0x11u8; 32],
+            outer_indices: vec![3u32, 7, 42],
+        });
+
+        let bytes = params.to_wire_bytes().unwrap();
+        assert!(bytes.len() > PublicProofParams::WIRE_SIZE);
+
+        let proof_blob = [0u8; ZKProof::PROOFDATA_PREAMBLE];
+        let (parsed, _) = ZKProof::deserialize(params.block_header, &bytes, &proof_blob).unwrap();
+        let moe_config = parsed.mining_config.moe.as_ref().unwrap();
+        assert_eq!(moe_config.e, 4);
+        assert_eq!(moe_config.top_k, 4);
+        let moe = parsed.moe.as_ref().unwrap();
+        assert_eq!(moe.routing_offsets, routing_offsets);
+        assert_eq!(moe.hash_routing, [0x11u8; 32]);
+        assert_eq!(moe.outer_indices, vec![3u32, 7, 42]);
+    }
 }
 
 impl PublicProofParams {
-    /// Fixed-size public_data: config(52) | hash_a(32) | hash_b(32) | hash_jackpot(32) | m(4) | n(4) | t_rows(4) | t_cols(4)
-    pub const PUBLICDATA_SIZE: usize = 164;
+    /// Minimum / non-MoE wire byte length: `mining_config(52) | hash_a(32) | hash_b(32) | hash_jackpot(32) | m(4) | n(4) | t_rows(4) | t_cols(4)`.
+    pub const WIRE_SIZE: usize = 164;
 
-    /// Serialize as wire format.
-    pub fn to_bytes(&self) -> [u8; Self::PUBLICDATA_SIZE] {
-        let mut buf = [0u8; Self::PUBLICDATA_SIZE];
-        buf[0..52].copy_from_slice(&self.mining_config.to_bytes());
-        buf[52..84].copy_from_slice(&self.hash_a);
-        buf[84..116].copy_from_slice(&self.hash_b);
-        buf[116..148].copy_from_slice(&self.hash_jackpot);
-        buf[148..152].copy_from_slice(&self.m.to_le_bytes());
-        buf[152..156].copy_from_slice(&self.n.to_le_bytes());
-        buf[156..160].copy_from_slice(&self.t_rows.to_le_bytes());
-        buf[160..164].copy_from_slice(&self.t_cols.to_le_bytes());
-        buf
+    /// Minimum wire byte length in the MoE case (zero routing offsets, zero outer indices).
+    /// Wire order: (WIRE_SIZE) | expert_idx (2) | routing_offsets (variable) | hash_routing (32) | outer_count (1).
+    pub const MIN_MOE_WIRE_SIZE: usize = 199;
+
+    pub const MAX_NUM_EXPERTS: usize = 1024;
+
+    /// Maximum number of `outer_indices` entries in serialized MoE wire bytes (bounds work and FFI buffers).
+    pub const MAX_OUTER_INDICES: usize = 128;
+
+    /// On-wire byte width of a single routing offset (u32 LE).
+    /// Offsets are bounded by `m * top_k < 2^32` (enforced in sanity_checks).
+    pub const ROUTING_OFFSET_BYTES: usize = 4;
+
+    /// Largest supported wire byte length (core + MoE tail with max outer indices and routing offsets).
+    pub const MAX_WIRE_SIZE: usize =
+        Self::MIN_MOE_WIRE_SIZE + Self::MAX_OUTER_INDICES * 4 + Self::MAX_NUM_EXPERTS * Self::ROUTING_OFFSET_BYTES;
+
+    /// Returns true if `len` is a valid `public_data` wire length (non-MoE or MoE).
+    pub fn is_valid_wire_size(len: usize) -> bool {
+        len == Self::WIRE_SIZE || (Self::MIN_MOE_WIRE_SIZE..=Self::MAX_WIRE_SIZE).contains(&len)
     }
 
-    /// Deserialize from a 164-byte wire `public_data` blob plus the block header.
-    pub fn from_bytes(block_header: IncompleteBlockHeader, bytes: &[u8; Self::PUBLICDATA_SIZE]) -> Result<Self> {
-        let mining_config = MiningConfiguration::from_bytes(&bytes[0..52])?;
-        let hash_a: [u8; 32] = bytes[52..84].try_into().unwrap();
-        let hash_b: [u8; 32] = bytes[84..116].try_into().unwrap();
-        let hash_jackpot: [u8; 32] = bytes[116..148].try_into().unwrap();
-        let m = u32::from_le_bytes(bytes[148..152].try_into().unwrap());
-        let n = u32::from_le_bytes(bytes[152..156].try_into().unwrap());
-        let t_rows = u32::from_le_bytes(bytes[156..160].try_into().unwrap());
-        let t_cols = u32::from_le_bytes(bytes[160..164].try_into().unwrap());
+    /// Deserialize from the wire `public_data` bytes produced by [`Self::to_wire_bytes`].
+    ///
+    /// `public_data` layout (non-MoE): [`Self::WIRE_SIZE`] bytes — core prefix only.
+    ///
+    /// MoE: core | `expert_idx(u16)` | `routing_offsets(4 LE bytes each)` |
+    /// `hash_routing(32)` | `outer_count(u8)` | `outer_indices(u32 LE each)`.
+    /// `e` and `top_k` come from `mining_config.moe` (committed in the job_key).
+    /// Each routing offset is a `u32` bounded by `m * top_k < 2^32`, serialized as 4 LE bytes.
+    pub fn from_wire_bytes(block_header: IncompleteBlockHeader, public_data: &[u8]) -> Result<Self> {
+        ensure!(
+            public_data.len() >= Self::WIRE_SIZE,
+            "public_data too short: need at least {} bytes",
+            Self::WIRE_SIZE
+        );
+
+        let mining_config = MiningConfiguration::from_bytes(&public_data[0..52])?;
+        let hash_a: [u8; 32] = public_data[52..84].try_into().unwrap();
+        let hash_b: [u8; 32] = public_data[84..116].try_into().unwrap();
+        let hash_jackpot: [u8; 32] = public_data[116..148].try_into().unwrap();
+        let m = u32::from_le_bytes(public_data[148..152].try_into().unwrap());
+        let n = u32::from_le_bytes(public_data[152..156].try_into().unwrap());
+        let t_rows = u32::from_le_bytes(public_data[156..160].try_into().unwrap());
+        let t_cols = u32::from_le_bytes(public_data[160..164].try_into().unwrap());
+
+        let moe = if public_data.len() == Self::WIRE_SIZE {
+            ensure!(
+                mining_config.moe.is_none(),
+                "mining_config selects GROUPED_GEMM but public_data has no MoE tail"
+            );
+            None
+        } else {
+            let moe_config = mining_config
+                .moe
+                .ok_or_else(|| anyhow::anyhow!("public_data has a MoE tail but mining_config is not GROUPED_GEMM"))?;
+            let num_experts = moe_config.e as usize;
+            ensure!(
+                num_experts <= Self::MAX_NUM_EXPERTS,
+                "number of experts {} exceeds maximum {}",
+                num_experts,
+                Self::MAX_NUM_EXPERTS
+            );
+
+            ensure!(
+                public_data.len() >= Self::MIN_MOE_WIRE_SIZE + Self::ROUTING_OFFSET_BYTES * num_experts,
+                "MoE public_data truncated (need {} bytes after core)",
+                Self::MIN_MOE_WIRE_SIZE + Self::ROUTING_OFFSET_BYTES * num_experts
+            );
+            let moe_data = &public_data[Self::WIRE_SIZE..];
+
+            let expert_idx = u16::from_le_bytes(moe_data[0..2].try_into().unwrap());
+            let mut offset = 2;
+
+            let mut routing_offsets = vec![0u32; num_experts];
+            for r_offset in routing_offsets.iter_mut() {
+                let bytes: [u8; 4] = moe_data[offset..offset + 4].try_into().unwrap();
+                *r_offset = u32::from_le_bytes(bytes);
+                offset += 4;
+            }
+            let hash_routing: [u8; 32] = moe_data[offset..offset + 32].try_into().unwrap();
+            let num_outer_indices = moe_data[offset + 32] as usize;
+            offset += 33;
+            ensure!(
+                num_outer_indices <= Self::MAX_OUTER_INDICES,
+                "outer_indices length {} exceeds max {}",
+                num_outer_indices,
+                Self::MAX_OUTER_INDICES
+            );
+            let indices_bytes = num_outer_indices
+                .checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("outer_count * 4 overflows usize"))?;
+            let expected_len = Self::MIN_MOE_WIRE_SIZE + indices_bytes + num_experts * Self::ROUTING_OFFSET_BYTES;
+            ensure!(
+                public_data.len() == expected_len,
+                "MoE public_data length mismatch: expected {} bytes, got {}",
+                expected_len,
+                public_data.len()
+            );
+            let outer_indices_bytes = &moe_data[offset..];
+            let outer_indices: Vec<u32> = outer_indices_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            Some(MoEParams {
+                routing_offsets,
+                expert_idx,
+                hash_routing,
+                outer_indices,
+            })
+        };
 
         ensure!(
             mining_config.rows_pattern.offset_is_valid(t_rows),
@@ -939,6 +1206,8 @@ impl PublicProofParams {
             mining_config.cols_pattern.offset_is_valid(t_cols),
             "t_cols must be a valid offset for cols_pattern"
         );
+        ensure!(t_rows < m, "t_rows={t_rows} must be < m={m}");
+        ensure!(t_cols < n, "t_cols={t_cols} must be < n={n}");
 
         Ok(Self {
             block_header,
@@ -950,15 +1219,62 @@ impl PublicProofParams {
             n,
             t_rows,
             t_cols,
+            moe,
         })
+    }
+
+    /// Serialize to the wire `public_data` format (164 bytes non-MoE; longer when `moe` is set).
+    pub fn to_wire_bytes(&self) -> Result<Vec<u8>> {
+        let mut public_data = vec![0u8; Self::WIRE_SIZE];
+        public_data[0..52].copy_from_slice(&self.mining_config.to_bytes());
+        public_data[52..84].copy_from_slice(&self.hash_a);
+        public_data[84..116].copy_from_slice(&self.hash_b);
+        public_data[116..148].copy_from_slice(&self.hash_jackpot);
+        public_data[148..152].copy_from_slice(&self.m.to_le_bytes());
+        public_data[152..156].copy_from_slice(&self.n.to_le_bytes());
+        public_data[156..160].copy_from_slice(&self.t_rows.to_le_bytes());
+        public_data[160..164].copy_from_slice(&self.t_cols.to_le_bytes());
+
+        match (&self.moe, &self.mining_config.moe) {
+            (Some(moe), Some(moe_config)) => {
+                ensure!(
+                    moe.outer_indices.len() <= Self::MAX_OUTER_INDICES,
+                    "outer_indices length {} exceeds max {}",
+                    moe.outer_indices.len(),
+                    Self::MAX_OUTER_INDICES
+                );
+                ensure!(
+                    moe.routing_offsets.len() == moe_config.e as usize,
+                    "routing_offsets length {} must equal the number of experts {}",
+                    moe.routing_offsets.len(),
+                    moe_config.e
+                );
+                ensure!(moe.routing_offsets.len() <= Self::MAX_NUM_EXPERTS);
+
+                public_data.extend_from_slice(&moe.expert_idx.to_le_bytes());
+                for offset in &moe.routing_offsets {
+                    public_data.extend_from_slice(&offset.to_le_bytes());
+                }
+
+                public_data.extend_from_slice(&moe.hash_routing);
+                public_data.extend_from_slice(&(moe.outer_indices.len() as u8).to_le_bytes());
+                for &idx in &moe.outer_indices {
+                    public_data.extend_from_slice(&idx.to_le_bytes());
+                }
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("MoEParams presence must match mining_config.moe presence"),
+        }
+
+        Ok(public_data)
     }
 
     /// Compute the HASH_PUBLIC_DATA identifier for the preprocessed columns.
     ///
-    /// This is `blake3("V1" || block_header_bytes || public_data_bytes || pow_bits || rate_bits)`,
+    /// This is `blake3("V2" || block_header_bytes || public_data_bytes || pow_bits || rate_bits)`,
     /// interpreted as 4 Goldilocks field elements.  The result is fed into the STARK Fiat-Shamir
     /// challenger before the trace commitment, binding zeta to the preprocessed data (grinding
-    /// resistance).  The `"V1"` prefix is a domain separator that disambiguates this hash from
+    /// resistance).  The `"V2"` prefix is a domain separator that disambiguates this hash from
     /// other blake3 uses in the protocol.
     ///
     /// `stark_degree_bits` is fully determined by the public params (via
@@ -967,13 +1283,14 @@ impl PublicProofParams {
     ///
     /// The 32-byte hash is reduced into 4 Goldilocks field elements via
     /// [`bytes32_to_goldilocks_quartet`].
-    pub fn public_data_commitment(&self, circuit_params: &PearlCircuitParams) -> HashOut<GoldilocksField> {
+    pub fn public_data_commitment(&self, circuit_params: &PearlCircuitParams) -> Result<HashOut<GoldilocksField>> {
         let block_header_bytes = self.block_header.to_bytes();
-        let public_data = self.to_bytes();
+        let public_data = self.to_wire_bytes()?;
         let pow_bytes: [u8; 3] = circuit_params.pow_bits.map(|b| b as u8);
         let rate_bytes: [u8; 3] = circuit_params.rate_bits.map(|b| b as u8);
+
         let input = [
-            b"V1",
+            b"V2",
             &block_header_bytes[..],
             &public_data[..],
             &pow_bytes[..],
@@ -982,14 +1299,14 @@ impl PublicProofParams {
         .concat();
         let hash = blake3_digest(&input, None);
 
-        HashOut {
+        Ok(HashOut {
             elements: hash256_to_goldilocks_quartet(&hash),
-        }
+        })
     }
 }
 
 impl ZKProof {
-    /// Fixed-size preamble: pow_bits(3) | rate_bits(3) | zeta(16)
+    /// Fixed-size preamble: pow_bits(3) | rate_bits(3) | preprocessed_digest(32)
     pub const PROOFDATA_PREAMBLE: usize = 22;
 
     /// Create a new ZKProof from circuit params and raw proof outputs.
@@ -1019,7 +1336,6 @@ impl ZKProof {
         assert!(stage < 3, "Stage must be 0, 1, or 2, got {}", stage);
         self.pow_bits[stage] as usize
     }
-
     /// Deserialize proof_data bytes into a `ZKProof`.
     /// `proof_data` layout: `pow_bits(3) | rate_bits(3) | zeta(16) | plonky2_proof`
     pub fn from_bytes(proof_data: &[u8]) -> Result<Self> {
@@ -1052,17 +1368,17 @@ impl ZKProof {
     /// `proof_data` layout: `pow_bits(3) | rate_bits(3) | zeta(16) | plonky2_proof`
     pub fn deserialize(
         block_header: IncompleteBlockHeader,
-        public_data: &[u8; PublicProofParams::PUBLICDATA_SIZE],
+        public_data: &[u8],
         proof_data: &[u8],
     ) -> Result<(PublicProofParams, Self)> {
-        let params = PublicProofParams::from_bytes(block_header, public_data)?;
+        let params = PublicProofParams::from_wire_bytes(block_header, public_data)?;
         let zk_proof = Self::from_bytes(proof_data)?;
         Ok((params, zk_proof))
     }
 
     /// Serialize both halves. Mirror of [`ZKProof::deserialize`].
-    pub fn serialize(&self, params: &PublicProofParams) -> ([u8; PublicProofParams::PUBLICDATA_SIZE], Vec<u8>) {
-        (params.to_bytes(), self.to_bytes())
+    pub fn serialize(&self, params: &PublicProofParams) -> Result<(Vec<u8>, Vec<u8>)> {
+        Ok((params.to_wire_bytes()?, self.to_bytes()))
     }
 
     /// Get the STARK challenge point zeta as a QuadraticExtension (2 field elements, 8 bytes each, little-endian).

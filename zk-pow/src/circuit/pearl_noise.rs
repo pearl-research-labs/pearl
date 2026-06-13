@@ -7,6 +7,7 @@ use pearl_blake3::{BLAKE3_DIGEST_SIZE, blake3_digest};
 pub struct MMSlice {
     pub a: Vec<Vec<i8>>, // a
     pub b: Vec<Vec<i8>>, // b^t
+    pub routing: Vec<Vec<u8>>,
 }
 
 const NOISE_RANGE: usize = 128;
@@ -154,6 +155,7 @@ pub fn compute_noise_for_indices(
     MMSlice {
         a: noise_a,
         b: noise_b_t,
+        routing: vec![],
     }
 }
 
@@ -263,7 +265,7 @@ mod tests {
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
             cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105]).unwrap(),
-            reserved: MiningConfiguration::RESERVED_VALUE,
+            moe: None,
         };
 
         let params = PublicProofParams::new_dummy(block_header, mining_configuration, 1024, 768, 0, 0);
@@ -283,7 +285,7 @@ mod tests {
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
             cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105]).unwrap(),
-            reserved: MiningConfiguration::RESERVED_VALUE,
+            moe: None,
         };
 
         let params = PublicProofParams::new_dummy(block_header, mining_configuration, 1024, 768, 0, 0);

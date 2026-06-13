@@ -21,6 +21,7 @@
 
 #include <cstdio>
 #include "../blake3/blake3_constants.hpp"
+#include "../moe/build_routing_data.cuh"
 #include "../tensor_hash/tensor_hash_api.hpp"
 
 #include <optional>
@@ -1072,7 +1073,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("leaves_per_mt_block") = DEFAULT_LEAVES_PER_MT_BLOCK);
   m.def("commitment_hash_from_merkle_roots",
         &run_commitment_hash_from_merkle_roots,
-        "Commitment hash from Merkle roots");
+        "Commitment hash from Merkle roots", py::arg("A_merkle_root"),
+        py::arg("B_merkle_root"), py::arg("key"), py::arg("A_commitment_hash"),
+        py::arg("B_commitment_hash"), py::arg("routing_root") = py::none(),
+        py::arg("offsets_hash") = py::none());
   m.def("get_host_signal_header_size", &get_host_signal_header_size,
         "Calculate host signal header buffer size");
   m.def("get_host_signal_sync_size", &get_host_signal_sync_size,
@@ -1081,6 +1085,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Calculate required scratchpad bytes for given matrix size",
         py::arg("matrix_bytes"),
         py::arg("threads_per_block") = DEFAULT_THREADS_PER_BLOCK);
+  m.def("build_routing_data", &build_routing_data,
+        "Stable counting sort for MoE routing data");
+  m.def("get_build_routing_data_scratchpad_bytes",
+        &get_build_routing_data_scratchpad_bytes,
+        "Required scratchpad size for build_routing_data", py::arg("numel"));
   m.attr("kEALScaleFactorDenoise") = pearl::kEALScaleFactorDenoise;
   m.attr("kEBRScaleFactorDenoise") = pearl::kEBRScaleFactorDenoise;
   py::enum_<HostSignalStatus>(m, "HostSignalStatus")
@@ -1284,7 +1293,18 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "    Tensor B_merkle_root, "
       "    Tensor key, "
       "    Tensor(A_commitment_hash!) A_commitment_hash, "
-      "    Tensor(B_commitment_hash!) B_commitment_hash"
+      "    Tensor(B_commitment_hash!) B_commitment_hash, "
+      "    Tensor? routing_root=None, "
+      "    Tensor? offsets_hash=None"
+      ") -> ()");
+  m.def(
+      "build_routing_data("
+      "    Tensor topk_ids, "
+      "    Tensor(routing_data!) routing_data, "
+      "    Tensor(slot_indices!) slot_indices, "
+      "    Tensor(routing_offsets!) routing_offsets, "
+      "    Tensor(scratchpad!) scratchpad, "
+      "    int num_experts"
       ") -> ()");
 }
 
@@ -1300,4 +1320,5 @@ TORCH_LIBRARY_IMPL(pearl_gemm, CUDA, m) {
   m.impl("tensor_hash", &run_tensor_hash);
   m.impl("commitment_hash_from_merkle_roots",
          &run_commitment_hash_from_merkle_roots);
+  m.impl("build_routing_data", &build_routing_data);
 }

@@ -249,6 +249,13 @@ type Params struct {
 	MinerConfirmationWindow       uint32
 	Deployments                   [DefinedDeployments]ConsensusDeployment
 
+	// MoEForkHeight is the block height at which the MoE hardfork activates.
+	// At and after this height blocks must carry a V2 certificate
+	// (wire.CertificateVersionV2); before it, a V1 certificate
+	// (wire.CertificateVersionV1). A value of 0 disables the fork (V1 at
+	// every height).
+	MoEForkHeight int32
+
 	// Mempool parameters
 	RelayNonStdTxs bool
 
@@ -266,6 +273,23 @@ type Params struct {
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType uint32
+}
+
+// IsMoEForkActive reports whether the MoE hardfork is active at the given block
+// height. The fork is disabled when MoEForkHeight is 0.
+func (p *Params) IsMoEForkActive(height int32) bool {
+	return p.MoEForkHeight != 0 && height >= p.MoEForkHeight
+}
+
+// RequiredCertVersion returns the block certificate version that a block at the
+// given height must use under the strict MoE hardfork cutover: the V2
+// certificate at and after the activation height, the V1 certificate before it
+// (and always, when the fork is disabled).
+func (p *Params) RequiredCertVersion(height int32) wire.CertificateVersion {
+	if p.IsMoEForkActive(height) {
+		return wire.CertificateVersionV2
+	}
+	return wire.CertificateVersionV1
 }
 
 // MainNetParams defines the network parameters for the main Pearl network.
@@ -291,6 +315,8 @@ var MainNetParams = Params{
 	MinDiffReductionTime: 0,
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
+
+	MoEForkHeight: 71935,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: []Checkpoint{
@@ -365,6 +391,10 @@ var RegressionNetParams = Params{
 	Net:         wire.RegTest,
 	DefaultPort: "18444",
 	DNSSeeds:    []DNSSeed{},
+
+	// MoE hardfork active from genesis on local test networks so the gateway's
+	// V2 (MoE) certificates are accepted at every mined height.
+	MoEForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &regTestGenesisBlock,
@@ -467,6 +497,8 @@ var TestNetParams = Params{
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
 
+	MoEForkHeight: 38405,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
@@ -554,6 +586,8 @@ var TestNet2Params = Params{
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
 
+	MoEForkHeight: 54869,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
@@ -629,6 +663,10 @@ var SimNetParams = Params{
 	Net:         wire.SimNet,
 	DefaultPort: "18555",
 	DNSSeeds:    []DNSSeed{}, // NOTE: There must NOT be any seeds.
+
+	// MoE hardfork active from genesis on local test networks so the gateway's
+	// V2 (MoE) certificates are accepted at every mined height.
+	MoEForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &simNetGenesisBlock,

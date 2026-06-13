@@ -378,6 +378,7 @@ if not SKIP_CUDA_BUILD:
         "csrc/gemm/quantize_kernel.cu",
         "csrc/blake3/blake3.cu",
         "csrc/tensor_hash/tensor_hash.cu",
+        "csrc/moe/build_routing_data.cu",
     ]
     sources.extend(
         f"csrc/gemm/instantiations/gemm_R{cfg.R}_{out_type}_{cfg.tile_size_m}x{cfg.tile_size_n}x{cfg.tile_size_k}_{cfg.pipeline_stages}stages_cluster{cfg.cM}x{cfg.cN}.cu"

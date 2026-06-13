@@ -1,7 +1,7 @@
 //! Python bindings for core proof types.
 
 #[cfg(feature = "pyo3")]
-use crate::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern};
+use crate::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern};
 
 // =============================================================================
 // Python bindings (constructors for core types with #[pyclass] attribute)
@@ -119,6 +119,15 @@ impl IncompleteBlockHeader {
 
 #[cfg(feature = "pyo3")]
 #[pyo3::pymethods]
+impl MoEConfig {
+    #[new]
+    fn py_new(e: u16, top_k: u16) -> Self {
+        Self { e, top_k }
+    }
+}
+
+#[cfg(feature = "pyo3")]
+#[pyo3::pymethods]
 impl MiningConfiguration {
     /// Size of serialized MiningConfiguration in bytes.
     #[classattr]
@@ -127,42 +136,25 @@ impl MiningConfiguration {
         Self::SERIALIZED_SIZE
     }
 
-    /// Size of reserved field in bytes.
-    #[classattr]
-    #[pyo3(name = "RESERVED_SIZE")]
-    fn py_reserved_size() -> usize {
-        Self::RESERVED_SIZE
-    }
-
-    /// Default reserved bytes (all zeros).
-    #[classattr]
-    #[pyo3(name = "RESERVED")]
-    fn py_reserved() -> [u8; Self::RESERVED_SIZE] {
-        Self::RESERVED_VALUE
-    }
-
+    /// Construct a mining configuration. Pass `moe=None` for a standard job, or a
+    /// `MoEConfig` to select GROUPED_GEMM mode (committed in the job_key).
     #[new]
+    #[pyo3(signature = (common_dim, rank, mma_type, rows_pattern, cols_pattern, moe=None))]
     fn py_new(
         common_dim: u32,
         rank: u16,
         mma_type: MMAType,
         rows_pattern: PeriodicPattern,
         cols_pattern: PeriodicPattern,
-        reserved: Vec<u8>,
+        moe: Option<MoEConfig>,
     ) -> pyo3::PyResult<Self> {
-        if reserved.len() != Self::RESERVED_SIZE {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "reserved must be {} bytes",
-                Self::RESERVED_SIZE
-            )));
-        }
         Ok(Self {
             common_dim,
             rank,
             mma_type,
             rows_pattern,
             cols_pattern,
-            reserved: reserved.try_into().unwrap(),
+            moe,
         })
     }
 
