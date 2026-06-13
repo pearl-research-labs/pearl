@@ -20,6 +20,22 @@ use crate::timed;
 use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
 
+fn pearl_worker_count(work_items: usize) -> usize {
+    if work_items <= 1 {
+        return 1;
+    }
+    let requested = std::env::var("PEARL_PROVER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0);
+    let available = requested.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+    });
+    available.clamp(1, work_items)
+}
+
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],

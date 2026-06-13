@@ -13,9 +13,15 @@ pub use plonky2_field as field;
 
 pub mod fri;
 pub mod gadgets;
-#[cfg(feature = "gpu_commit")]
-pub(crate) mod gpu;
 pub mod gates;
+#[cfg(any(feature = "gpu_commit", feature = "gpu_quotient"))]
+pub(crate) mod gpu;
+// [M3 cold-start trim] minimal public surface for the GPU `cs_leaves` marshal cache so a fresh process
+// that LOADS a pre-warmed recursion circuit cache can prime the (host-only, consensus-neutral) marshal
+// off the per-prove path (`prime_rec_cs_leaves`) — and so the cold-process harness can simulate a fresh
+// process by dropping the in-memory marshal warmth (`clear_cs_leaves_caches`). Prover-side only.
+#[cfg(feature = "gpu_quotient")]
+pub use gpu::{clear_cs_leaves_caches, prime_rec_cs_leaves};
 pub mod hash;
 pub mod iop;
 pub mod plonk;

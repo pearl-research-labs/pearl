@@ -152,6 +152,7 @@ pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
             // We have `1 << cap_height` sub-trees, one for each entry in `cap`. They are totally
             // independent, so we schedule one task for each. `digests_buf` and `leaves` are split
             // into `1 << cap_height` slices, one for each sub-tree.
+            //
             subtree_cap.write(fill_subtree::<F, H>(subtree_digests, subtree_leaves));
         },
     );
@@ -199,7 +200,29 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
 }
 
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
-    pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+    pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self
+    where
+        F: 'static,
+        H: 'static,
+    {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+        {
+            // Check type match first (cheap, no ownership transfer)
+            use core::any::TypeId;
+            use crate::field::goldilocks_field::GoldilocksField;
+            use crate::hash::poseidon::PoseidonHash;
+
+            if TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+                && TypeId::of::<H>() == TypeId::of::<PoseidonHash>() {
+                return Self::new_batched_goldilocks(leaves, cap_height);
+            }
+        }
+
+        // Generic fallback path
+        Self::new_generic(leaves, cap_height)
+    }
+
+    fn new_generic(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
         let log2_leaves_len = log2_strict(leaves.len());
         assert!(
             cap_height <= log2_leaves_len,
@@ -214,6 +237,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
         let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
         let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
+
         fill_digests_buf::<F, H>(digests_buf, cap_buf, &leaves[..], cap_height);
 
         unsafe {
@@ -234,6 +258,38 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         &self.leaves[i]
     }
 
+    /// Try to construct using batched Poseidon hashing.
+    /// Only succeeds for GoldilocksField + PoseidonHash on AVX-512 targets.
+    /// Returns None otherwise, falling back to the generic path.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    fn new_batched_goldilocks(leaves: Vec<Vec<F>>, cap_height: usize) -> Self
+    where
+        F: 'static,
+        H: 'static,
+    {
+        use crate::field::goldilocks_field::GoldilocksField;
+        use crate::hash::merkle_tree::batched_merkle::merkle_tree_new_batched;
+
+        // Safety: Caller verified F is GoldilocksField and H is PoseidonHash.
+        // Since F and GoldilocksField are the same type, this transmute is safe.
+        let goldilocks_leaves: Vec<Vec<GoldilocksField>> =
+            unsafe { core::mem::transmute(leaves) };
+
+        let (goldilocks_leaves, digests, cap) =
+            merkle_tree_new_batched(goldilocks_leaves, cap_height);
+
+        // Transmute the results back to the generic types
+        let leaves: Vec<Vec<F>> = unsafe { core::mem::transmute(goldilocks_leaves) };
+        let digests: Vec<H::Hash> = unsafe { core::mem::transmute(digests) };
+        let cap: Vec<H::Hash> = unsafe { core::mem::transmute(cap) };
+
+        Self {
+            leaves,
+            digests,
+            cap: MerkleCap(cap),
+        }
+    }
+
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
@@ -241,6 +297,137 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             merkle_tree_prove::<F, H>(leaf_index, self.leaves.len(), cap_height, &self.digests);
 
         MerkleProof { siblings }
+    }
+}
+
+/// Batched Merkle tree construction for GoldilocksField + PoseidonHash.
+/// Uses AVX-512 batched Poseidon to process 8 leaf hashes simultaneously.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+pub(crate) mod batched_merkle {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::hash::poseidon::PoseidonHash;
+    use crate::hash::poseidon_goldilocks::batched_poseidon::hash_batch_8;
+
+    /// Build Merkle tree with batched Poseidon for GoldilocksField.
+    /// Returns (leaves, digests, cap) in the same interleaved DFS format as the generic builder.
+    pub fn merkle_tree_new_batched(
+        leaves: Vec<Vec<GoldilocksField>>,
+        cap_height: usize,
+    ) -> (Vec<Vec<GoldilocksField>>, Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>) {
+        let n = leaves.len();
+        let log2_n = log2_strict(n);
+        assert!(cap_height <= log2_n);
+        let num_subtrees = 1usize << cap_height;
+        let subtree_size = n / num_subtrees;
+
+        // Step 1: Batch-hash ALL leaves in batches of 8.
+        // All leaves have the same number of elements (LDE rows).
+        let leaf_hashes: Vec<HashOut<GoldilocksField>> = if !leaves.is_empty() && !leaves[0].is_empty() {
+            leaves
+                .par_chunks(256)
+                .flat_map(|big_chunk| {
+                    let mut results: Vec<HashOut<GoldilocksField>> = Vec::with_capacity(big_chunk.len());
+                    for chunk in big_chunk.chunks(8) {
+                        if chunk.len() == 8 {
+                            let u64_inputs: [&[u64]; 8] = core::array::from_fn(|i| {
+                                unsafe { core::slice::from_raw_parts(
+                                    chunk[i].as_ptr() as *const u64,
+                                    chunk[i].len()
+                                ) }
+                            });
+                            let batch_results = hash_batch_8(u64_inputs);
+                            for r in batch_results {
+                                results.push(HashOut {
+                                    elements: [
+                                        GoldilocksField(r[0]),
+                                        GoldilocksField(r[1]),
+                                        GoldilocksField(r[2]),
+                                        GoldilocksField(r[3]),
+                                    ],
+                                });
+                            }
+                        } else {
+                            for leaf in chunk {
+                                results.push(<PoseidonHash as Hasher<GoldilocksField>>::hash_or_noop(leaf));
+                            }
+                        }
+                    }
+                    results
+                })
+                .collect()
+        } else {
+            leaves.iter().map(|leaf| {
+                <PoseidonHash as Hasher<GoldilocksField>>::hash_or_noop(leaf)
+            }).collect()
+        };
+
+        // Step 2: Build internal tree from leaf hashes in DFS interleaved format.
+        let num_digests = 2 * (n - num_subtrees);
+        let mut digests = Vec::with_capacity(num_digests);
+        let mut cap = Vec::with_capacity(num_subtrees);
+
+        let subtree_digests_len = 2 * (subtree_size - 1);
+
+        if subtree_digests_len == 0 {
+            // All cap: each leaf is its own subtree root
+            let cap_buf = capacity_up_to_mut(&mut cap, num_subtrees);
+            cap_buf
+                .par_iter_mut()
+                .zip(leaf_hashes)
+                .for_each(|(c, h)| {
+                    c.write(h);
+                });
+        } else {
+            let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
+            let cap_buf = capacity_up_to_mut(&mut cap, num_subtrees);
+
+            digests_buf
+                .par_chunks_exact_mut(subtree_digests_len)
+                .zip(cap_buf)
+                .zip(leaf_hashes.par_chunks_exact(subtree_size))
+                .for_each(|((sub_digests, sub_cap), sub_hashes)| {
+                    let root = build_subtree_from_hashes(sub_digests, sub_hashes);
+                    sub_cap.write(root);
+                });
+        }
+
+        unsafe {
+            digests.set_len(num_digests);
+            cap.set_len(num_subtrees);
+        }
+
+        (leaves, digests, cap)
+    }
+
+    /// Build subtree from pre-computed leaf hashes in DFS interleaved format.
+    /// Uses the same layout as fill_subtree: [left_digests | left_root | right_root | right_digests]
+    fn build_subtree_from_hashes(
+        digests_buf: &mut [MaybeUninit<HashOut<GoldilocksField>>],
+        leaf_hashes: &[HashOut<GoldilocksField>],
+    ) -> HashOut<GoldilocksField> {
+        let n = leaf_hashes.len();
+        assert_eq!(digests_buf.len(), 2 * (n - 1));
+
+        if n == 1 {
+            return leaf_hashes[0];
+        }
+
+        // Same split as fill_subtree: half/half, then take last of left and first of right
+        let (left_buf, right_buf) = digests_buf.split_at_mut(digests_buf.len() / 2);
+        let (left_mem, left_buf) = left_buf.split_last_mut().unwrap();
+        let (right_mem, right_buf) = right_buf.split_first_mut().unwrap();
+        let (left_hashes, right_hashes) = leaf_hashes.split_at(n / 2);
+
+        let (left_root, right_root) = plonky2_maybe_rayon::join(
+            || build_subtree_from_hashes(left_buf, left_hashes),
+            || build_subtree_from_hashes(right_buf, right_hashes),
+        );
+
+        left_mem.write(left_root);
+        right_mem.write(right_root);
+
+        <PoseidonHash as Hasher<GoldilocksField>>::two_to_one(left_root, right_root)
     }
 }
 

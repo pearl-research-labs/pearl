@@ -23,11 +23,11 @@ pub struct Avx512GoldilocksField(pub [GoldilocksField; 8]);
 
 impl Avx512GoldilocksField {
     #[inline]
-    fn new(x: __m512i) -> Self {
+    pub fn new(x: __m512i) -> Self {
         unsafe { transmute(x) }
     }
     #[inline]
-    fn get(&self) -> __m512i {
+    pub fn get(&self) -> __m512i {
         unsafe { transmute(*self) }
     }
 }
@@ -239,7 +239,7 @@ impl Sum for Avx512GoldilocksField {
 }
 
 const FIELD_ORDER: __m512i = unsafe { transmute([GoldilocksField::ORDER; 8]) };
-const EPSILON: __m512i = unsafe { transmute([GoldilocksField::ORDER.wrapping_neg(); 8]) };
+pub const EPSILON: __m512i = unsafe { transmute([GoldilocksField::ORDER.wrapping_neg(); 8]) };
 
 #[inline]
 unsafe fn canonicalize(x: __m512i) -> __m512i {
@@ -248,7 +248,7 @@ unsafe fn canonicalize(x: __m512i) -> __m512i {
 }
 
 #[inline]
-unsafe fn add_no_double_overflow_64_64(x: __m512i, y: __m512i) -> __m512i {
+pub unsafe fn add_no_double_overflow_64_64(x: __m512i, y: __m512i) -> __m512i {
     let res_wrapped = _mm512_add_epi64(x, y);
     let mask = _mm512_cmplt_epu64_mask(res_wrapped, y); // mask set if add overflowed
     let res = _mm512_mask_sub_epi64(res_wrapped, mask, res_wrapped, FIELD_ORDER);
@@ -256,7 +256,7 @@ unsafe fn add_no_double_overflow_64_64(x: __m512i, y: __m512i) -> __m512i {
 }
 
 #[inline]
-unsafe fn sub_no_double_overflow_64_64(x: __m512i, y: __m512i) -> __m512i {
+pub unsafe fn sub_no_double_overflow_64_64(x: __m512i, y: __m512i) -> __m512i {
     let mask = _mm512_cmplt_epu64_mask(x, y); // mask set if sub will underflow (x < y)
     let res_wrapped = _mm512_sub_epi64(x, y);
     let res = _mm512_mask_add_epi64(res_wrapped, mask, res_wrapped, FIELD_ORDER);
@@ -281,7 +281,7 @@ unsafe fn neg(y: __m512i) -> __m512i {
 const LO_32_BITS_MASK: __mmask16 = unsafe { transmute(0b0101010101010101u16) };
 
 #[inline]
-unsafe fn mul64_64(x: __m512i, y: __m512i) -> (__m512i, __m512i) {
+pub unsafe fn mul64_64(x: __m512i, y: __m512i) -> (__m512i, __m512i) {
     // We want to move the high 32 bits to the low position. The multiplication instruction ignores
     // the high 32 bits, so it's ok to just duplicate it into the low position. This duplication can
     // be done on port 5; bitshifts run on port 0, competing with multiplication.
@@ -345,7 +345,7 @@ unsafe fn square64(x: __m512i) -> (__m512i, __m512i) {
 }
 
 #[inline]
-unsafe fn reduce128(x: (__m512i, __m512i)) -> __m512i {
+pub unsafe fn reduce128(x: (__m512i, __m512i)) -> __m512i {
     let (hi0, lo0) = x;
     let hi_hi0 = _mm512_srli_epi64::<32>(hi0);
     let lo1 = sub_no_double_overflow_64_64(lo0, hi_hi0);

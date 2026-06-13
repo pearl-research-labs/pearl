@@ -18,7 +18,7 @@ use plonky2::{
         config::{Blake3GoldilocksConfig, PoseidonGoldilocksConfig},
         proof::ProofWithPublicInputsTarget,
     },
-    util::serialization::{Buffer, DefaultGateSerializer, Read, Remaining},
+    util::serialization::{Buffer, DefaultGateSerializer, Read, Remaining, Write},
 };
 use plonky2_field::types::PrimeField64;
 use starky::proof::StarkProofWithPublicInputsTarget;
@@ -339,6 +339,151 @@ impl CircuitCache {
 
         Ok(cache)
     }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // [M3 cold-start trim] WARM-UP ORDERING persistence (consensus-neutral, prover-only).
+    //
+    // The recursion prover circuits (prover_circuits_1 / _2) are NOT in the on-disk verifier cache —
+    // they are rebuilt in-process by `compile_circuits(.., true)` on EVERY process. The FIRST prove in
+    // a process then pays a ~412ms "warm-up": `generate_partial_witness(track_order=true)` computes the
+    // topological generator ORDERING (`ProverOnlyCircuitData::layered_generators`, a Vec<Vec<u32>> of
+    // plain generator indices) which later proves reuse via `generate_partial_witness_fast`. A
+    // rare-solution worker is COLD every time, so it eats that 412ms on every solution.
+    //
+    // These two methods persist JUST that ordering (a few KB) so a fresh process can LOAD it (via the
+    // plonky2 layered_generators serialization added in serialization/mod.rs) and inject it into its
+    // freshly-compiled prover circuits — skipping the warm-up entirely. We deliberately do NOT serialize
+    // the full ProverCircuitData: (a) its constants_sigmas_commitment merkle tree is ~hundreds of MB per
+    // circuit, and (b) the Rec#2 prover circuit uses Blake3GoldilocksConfig whose outer Hasher is NOT an
+    // AlgebraicHasher, so `DefaultGeneratorSerializer<Blake3GoldilocksConfig, 2>` does not satisfy the
+    // generator-serializer bound. The ordering is the only expensive-to-compute, cheap-to-store artifact,
+    // and it is prover-only scheduling that NEVER enters the cert ⇒ CONSENSUS-NEUTRAL.
+    //
+    // `warmup_to_bytes` snapshots the ordering of every PROVER circuit currently in the cache (keyed by
+    // its circuit key). `import_warmup` matches each saved ordering to an already-compiled prover circuit
+    // (same key) and injects it, returning how many circuits were warmed. Call order in a fresh process:
+    // load verifier cache → compile_circuits(.., true) → import_warmup(saved) → prove (no warm-up).
+    pub fn warmup_to_bytes(&self) -> Result<Vec<u8>> {
+        let ioerr = |_| anyhow::anyhow!("warm-up: write error");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&WARMUP_MAGIC);
+
+        // Rec#1: fixed-size FirstCircuitKey (bincode) + ordering. Sorted for deterministic output.
+        let mut first_keys: Vec<_> = self.prover_circuits_1.keys().collect();
+        first_keys.sort_by_key(|k| (k.stark_degree_bits, k.rate_bits_0, k.pow_bits_0));
+        buf.write_usize(first_keys.len()).map_err(ioerr)?;
+        for key in first_keys {
+            let key_bytes = bincode::serialize(key)?;
+            buf.write_usize(key_bytes.len()).map_err(ioerr)?;
+            buf.extend_from_slice(&key_bytes);
+            write_layered_generators(&mut buf, &self.prover_circuits_1[key].circuit.prover_only.layered_generators)?;
+        }
+
+        // Rec#2: variable-size SecondCircuitKey (its own to_bytes) + ordering. Sorted deterministically.
+        let mut second_keys: Vec<_> = self.prover_circuits_2.keys().collect();
+        second_keys.sort_by_key(|k| (k.first_circuit.degree_bits(), k.pow_bits_2, k.rate_bits_2));
+        buf.write_usize(second_keys.len()).map_err(ioerr)?;
+        for key in second_keys {
+            let key_bytes = key.to_bytes()?;
+            buf.write_usize(key_bytes.len()).map_err(ioerr)?;
+            buf.extend_from_slice(&key_bytes);
+            write_layered_generators(&mut buf, &self.prover_circuits_2[key].circuit.prover_only.layered_generators)?;
+        }
+
+        Ok(buf)
+    }
+
+    /// Inject saved warm-up orderings (from [`Self::warmup_to_bytes`]) into the already-compiled prover
+    /// circuits, matched by key. Returns the number of circuits warmed. Orderings for keys not present in
+    /// the cache are skipped (no error); compile the circuits FIRST. Idempotent / safe to call once.
+    pub fn import_warmup(&mut self, data: &[u8]) -> Result<usize> {
+        if data.len() < WARMUP_MAGIC.len() {
+            bail!("truncated warm-up data");
+        }
+        let mut reader = Buffer::new(data);
+        let magic = reader
+            .read_bytes(WARMUP_MAGIC.len())
+            .map_err(|_| anyhow::anyhow!("unexpected end of warm-up data"))?;
+        if magic != WARMUP_MAGIC {
+            bail!("Invalid warm-up magic bytes or version mismatch.");
+        }
+        let mut warmed = 0usize;
+
+        let first_count = reader.read_usize().map_err(|_| anyhow::anyhow!("warm-up: bad rec1 count"))?;
+        for _ in 0..first_count {
+            let klen = reader
+                .read_usize()
+                .map_err(|_| anyhow::anyhow!("warm-up: bad rec1 key len"))?;
+            let kbytes = reader
+                .read_bytes(klen)
+                .map_err(|_| anyhow::anyhow!("warm-up: truncated rec1 key"))?;
+            let key: FirstCircuitKey = bincode::deserialize(kbytes)?;
+            let order = read_layered_generators(&mut reader)?;
+            if let Some(fd) = self.prover_circuits_1.get_mut(&key) {
+                fd.circuit.prover_only.layered_generators = order;
+                warmed += 1;
+            }
+        }
+
+        let second_count = reader.read_usize().map_err(|_| anyhow::anyhow!("warm-up: bad rec2 count"))?;
+        for _ in 0..second_count {
+            let klen = reader
+                .read_usize()
+                .map_err(|_| anyhow::anyhow!("warm-up: bad rec2 key len"))?;
+            let kbytes = reader
+                .read_bytes(klen)
+                .map_err(|_| anyhow::anyhow!("warm-up: truncated rec2 key"))?;
+            let key = SecondCircuitKey::from_bytes(kbytes)?;
+            let order = read_layered_generators(&mut reader)?;
+            if let Some(sd) = self.prover_circuits_2.get_mut(&key) {
+                sd.circuit.prover_only.layered_generators = order;
+                warmed += 1;
+            }
+        }
+
+        Ok(warmed)
+    }
+}
+
+const WARMUP_MAGIC: [u8; 4] = *b"PRLW"; // Pearl Recursion warm-up ordering, v1
+
+/// Serialize a `layered_generators` ordering (Vec<Vec<u32>>) using the SAME wire format as plonky2's
+/// `write_prover_only_circuit_data`: outer len (usize) then per layer inner len (usize) + the u32s.
+/// (plonky2's `Write` returns a no_std `IoResult` whose error does not impl `std::error::Error`, so the
+/// writes are bridged to `anyhow` via `map_err` — matching the existing CircuitCache serializers.)
+fn write_layered_generators(buf: &mut Vec<u8>, layers: &[Vec<u32>]) -> Result<()> {
+    let ioerr = |_| anyhow::anyhow!("warm-up: write error");
+    buf.write_usize(layers.len()).map_err(ioerr)?;
+    for layer in layers {
+        buf.write_usize(layer.len()).map_err(ioerr)?;
+        for &gen_idx in layer {
+            buf.write_u32(gen_idx).map_err(ioerr)?;
+        }
+    }
+    Ok(())
+}
+
+/// Inverse of [`write_layered_generators`].
+fn read_layered_generators(reader: &mut Buffer) -> Result<Vec<Vec<u32>>> {
+    let outer = reader
+        .read_usize()
+        .map_err(|_| anyhow::anyhow!("warm-up: bad ordering outer len"))?;
+    let mut layers = Vec::with_capacity(outer);
+    for _ in 0..outer {
+        let inner = reader
+            .read_usize()
+            .map_err(|_| anyhow::anyhow!("warm-up: bad ordering inner len"))?;
+        let mut layer = Vec::with_capacity(inner);
+        for _ in 0..inner {
+            layer.push(
+                reader
+                    .read_u32()
+                    .map_err(|_| anyhow::anyhow!("warm-up: bad ordering index"))?,
+            );
+        }
+        layers.push(layer);
+    }
+    Ok(layers)
 }
 
 fn bytes_for_max_value(max_val: usize) -> usize {

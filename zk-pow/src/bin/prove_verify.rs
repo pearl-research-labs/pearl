@@ -10,7 +10,9 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::time::Instant;
 use zk_pow::api::{
-    proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern, PrivateProofParams, PublicProofParams},
+    proof::{
+        IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern, PrivateProofParams, PublicProofParams, ZKProof,
+    },
     prove, verify,
 };
 use zk_pow::circuit::circuit_utils::CircuitCache;
@@ -52,11 +54,34 @@ fn bench_mining_config(common_dim: u32, rank: u16) -> MiningConfiguration {
     }
 }
 
+fn public_alpha_mining_config(common_dim: u32, rank: u16) -> MiningConfiguration {
+    MiningConfiguration {
+        common_dim,
+        rank,
+        mma_type: MMAType::Int7xInt7ToInt32,
+        rows_pattern: PeriodicPattern::from_list(&[0, 1]).unwrap(),
+        cols_pattern: PeriodicPattern::from_list(&(0..64).collect::<Vec<_>>()).unwrap(),
+        reserved: MiningConfiguration::RESERVED_VALUE,
+    }
+}
+
 // for benchmarking
 fn setup(
     common_dim: usize,
     nbits: Option<u32>,
     mining_configuration: MiningConfiguration,
+) -> (PublicProofParams, PrivateProofParams) {
+    setup_with_shape(common_dim, nbits, mining_configuration, 6144, 4096, 128, 256)
+}
+
+fn setup_with_shape(
+    common_dim: usize,
+    nbits: Option<u32>,
+    mining_configuration: MiningConfiguration,
+    m: u32,
+    n: u32,
+    t_rows: u32,
+    t_cols: u32,
 ) -> (PublicProofParams, PrivateProofParams) {
     let mut rng = StdRng::seed_from_u64(0x0);
     let tile_h = mining_configuration.rows_pattern.size() as usize;
@@ -79,14 +104,7 @@ fn setup(
 
     let block_header = test_block_header(nbits.unwrap_or(0x1D2FFFFF));
 
-    let mut public_params = PublicProofParams::new_dummy(
-        block_header,
-        mining_configuration,
-        6144, // m: rows of A
-        4096, // n: columns of B
-        128,
-        256,
-    );
+    let mut public_params = PublicProofParams::new_dummy(block_header, mining_configuration, m, n, t_rows, t_cols);
     let private_params = public_params.fill_dummy_merkle_proof(private_params).unwrap();
 
     (public_params, private_params)
@@ -142,6 +160,45 @@ fn bench_double_prove_profile() {
     info!("Prove time: {:?}", prove_time);
 }
 
+fn bench_public_alpha_rank256_profile() {
+    info!("\n========== Benchmark: Public Alpha rank-256 exact shape ==========");
+
+    let mut cache = CircuitCache::default();
+    let rank: u16 = 256;
+    let common_dim = 4096usize;
+    let m = 131072u32;
+    let n = 131072u32;
+    let config = public_alpha_mining_config(common_dim as u32, rank);
+    let h = config.rows_pattern.size();
+    let w = config.cols_pattern.size();
+    info!(
+        "shape=m:{} n:{} k:{} rank:{} h:{} w:{} nbits:{:#x} workers:{}",
+        m,
+        n,
+        common_dim,
+        rank,
+        h,
+        w,
+        0x207FFFFFu32,
+        prove::current_prove_thread_count(),
+    );
+
+    let (mut warm_public, warm_private) = setup_with_shape(common_dim, Some(0x207FFFFF), config, m, n, 0, 0);
+    let start = Instant::now();
+    let _warm_proof = prove::prove_block(&mut warm_public, warm_private, &mut cache).unwrap();
+    info!("warmup_same_shape_prove={:?}", start.elapsed());
+
+    let (mut public_params, private_params) = setup_with_shape(common_dim, Some(0x207FFFFF), config, m, n, 0, 0);
+    let start = Instant::now();
+    let proof = prove::prove_block(&mut public_params, private_params, &mut cache).unwrap();
+    let prove_time = start.elapsed();
+    info!("cached_public_rank256_prove={:?}", prove_time);
+
+    let start = Instant::now();
+    verify::verify_block(&public_params, &proof, &mut cache).unwrap();
+    info!("verify={:?}", start.elapsed());
+}
+
 fn bench_split() {
     info!("\n========== Architecture C: miner STARK#0 / pool recursion split ==========");
     // Mine a REAL solution (so the block difficulty / jackpot check passes), then
@@ -152,14 +209,15 @@ fn bench_split() {
     let mining_config = default_mining_config(k as u32, rank);
     info!("Mining a real solution (m={} n={} k={} rank={})...", m, n, k, rank);
     let plain_proof = mine(m, n, k, block_header, mining_config, None, false).expect("mining failed");
-    let (private_params, mut public_params) =
-        parse_plain_proof(block_header, &plain_proof).expect("parse_plain_proof failed");
+    let (private_params, mut public_params) = parse_plain_proof(block_header, &plain_proof).expect("parse_plain_proof failed");
 
     let mut cache = CircuitCache::default();
-    let (proof, miner, pool, ship) =
-        prove::prove_block_split(&mut public_params, private_params, &mut cache).unwrap();
+    let (proof, miner, pool, ship) = prove::prove_block_split(&mut public_params, private_params, &mut cache).unwrap();
     let total = miner + pool;
-    info!("MINER (STARK#0 only, GPU-accel under PEARL_GPU_COMMIT): {:?}  ships {} bytes", miner, ship);
+    info!(
+        "MINER (STARK#0 only, GPU-accel under PEARL_GPU_COMMIT): {:?}  ships {} bytes",
+        miner, ship
+    );
     info!("POOL  (Recursion#1+#2 only, no STARK#0):                {:?}", pool);
     info!(
         ">>> Pool sheds {:.0}% of the prove to the miner GPU (pool now does only {:?} of {:?})",
@@ -170,7 +228,28 @@ fn bench_split() {
 
     let start = Instant::now();
     verify::verify_block(&public_params, &proof, &mut cache).unwrap();
-    info!("Verify pool-assembled cert (from miner's shipped STARK proof): {:?} — SUCCESS", start.elapsed());
+    info!(
+        "Verify pool-assembled cert (from miner's shipped STARK proof): {:?} — SUCCESS",
+        start.elapsed()
+    );
+
+    // === FULL WIRE-CERT round-trip: the pool serializes the cert to the EXACT bytes it
+    // submits to pearld (public_data(164) | proof_data = pow_bits|rate_bits|zeta|plonky2_proof),
+    // and the reconstructed-from-bytes cert must verify. Proves E.2 output is wire-valid. ===
+    let (public_data, proof_data) = proof.serialize(&public_params);
+    let wire_len = public_data.len() + proof_data.len();
+    let (params_rt, proof_rt) = ZKProof::deserialize(public_params.block_header.clone(), &public_data, &proof_data).unwrap();
+    // byte-exact: re-serializing the reconstructed cert reproduces the same wire bytes.
+    let (pd2, prd2) = proof_rt.serialize(&params_rt);
+    assert_eq!(pd2, public_data, "cert public_data wire round-trip not byte-exact");
+    assert_eq!(prd2, proof_data, "cert proof_data wire round-trip not byte-exact");
+    let start = Instant::now();
+    verify::verify_block(&params_rt, &proof_rt, &mut cache).unwrap();
+    info!(
+        "Verify RECONSTRUCTED wire cert ({} bytes, public_data+proof_data, byte-exact round-trip): {:?} — SUCCESS",
+        wire_len,
+        start.elapsed()
+    );
 }
 
 fn bench() {
@@ -314,9 +393,10 @@ fn main() {
         "bench" => bench(),
         "invalid" => test_invalid_with_cache(),
         "cache" => bench_fill_cache(),
+        "public-rank256" => bench_public_alpha_rank256_profile(),
         _ => {
             info!("Unknown test: {}", args[1]);
-            info!("Available tests: correctness, profile, bench, invalid, cache, ffi");
+            info!("Available tests: correctness, profile, split, bench, invalid, cache, public-rank256");
         }
     }
 }

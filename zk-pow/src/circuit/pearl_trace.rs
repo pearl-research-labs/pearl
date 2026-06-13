@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use hashbrown::HashMap;
 
 use plonky2::field::extension::Extendable;
@@ -17,6 +19,23 @@ use crate::circuit::pearl_preprocess::{generate_preprocessed, read_dword_from_ma
 use crate::circuit::pearl_program::{TILE_D, TILE_H};
 use crate::circuit::pearl_stark::{PearlStarkChips, PearlStarkConfig};
 use crate::circuit::utils::trace_utils::{RowBuilder, read_from_trace, u64_pack_le};
+
+fn trace_stage_timing_enabled() -> bool {
+    std::env::var_os("PEARL_TRACE_STAGE_TIMING").is_some() || std::env::var_os("PEARL_PROVE_STAGE_TIMING").is_some()
+}
+
+fn log_trace_stage(enabled: bool, stage: &'static str, rows: usize, started: Instant) {
+    if enabled {
+        let elapsed = started.elapsed();
+        log::info!(
+            "pearl_trace_stage stage={} rows={} duration_us={} duration_ms={:.3}",
+            stage,
+            rows,
+            elapsed.as_micros(),
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+}
 
 // returns TILE_H × TILE_D flattened row major
 pub fn read_tile(strips: &MMSlice, dword_id: MatDwordId) -> [i8; TILE_H * TILE_D] {
@@ -48,9 +67,14 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
     private_params: PrivateProofParams,
 ) -> (Vec<[F; pearl_columns::TOTAL]>, [F; pearl_public::TOTAL]) {
     debug_assert!(F::BITS == 64, "Goldilocks field is assumed");
+    let timing_enabled = trace_stage_timing_enabled();
+    let total_started = Instant::now();
     let compiled_params = &config.compiled_public_params;
     let circuit = &config.structured_circuit;
+
+    let stage_started = Instant::now();
     let (preprocessed, noise) = generate_preprocessed(compiled_params, Some(circuit)).unwrap();
+    log_trace_stage(timing_enabled, "preprocess", circuit.len(), stage_started);
 
     // Debug only: compute expected jackpot before private_params is consumed
     #[cfg(debug_assertions)]
@@ -71,13 +95,16 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
     };
 
     // Initialize empty trace (parallel for NUMA locality and memory bandwidth)
+    let stage_started = Instant::now();
     let mut trace: Vec<[F; pearl_columns::TOTAL]> = (0..num_rows)
         .into_par_iter()
         .map(|_| [F::ZERO; pearl_columns::TOTAL])
         .collect();
+    log_trace_stage(timing_enabled, "allocate_zero_trace", num_rows, stage_started);
 
     let mut matmul_chip = chips.matmul_chip.clone();
 
+    let stage_started = Instant::now();
     for row_idx in 0..num_rows {
         ///////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Fill preprocessed columns
@@ -127,33 +154,43 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
 
         row_builder.assert_end();
     }
+    log_trace_stage(timing_enabled, "row_fill", num_rows, stage_started);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Fill CUMSUM_BUFFER, BIT_REG, JACKPOT_MSG
     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+    let stage_started = Instant::now();
     chips
         .jackpot_chip
         .fill_full_trace(&config.jackpot_chip_config, config, &mut trace);
+    log_trace_stage(timing_enabled, "jackpot_full_trace", num_rows, stage_started);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Fill Blake3-related columns (CV_IN, BLAKE3_CV, CV_OUT, BLAKE3_MSG, BLAKE3_MSG_BUFFER)
     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+    let stage_started = Instant::now();
     chips
         .blake3_chip
         .fill_full_trace(&config.blake3_chip_config, config, &mut trace);
+    log_trace_stage(timing_enabled, "blake3_full_trace", num_rows, stage_started);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Blind 192 bits of the trace so that zeta reveals no additional information about witness
     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+    let stage_started = Instant::now();
     blind_trace(&mut trace, compiled_params.expected_num_rows());
+    log_trace_stage(timing_enabled, "blind_trace", num_rows, stage_started);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Fill lookup table frequencies after processing all rows
     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+    let stage_started = Instant::now();
     fill_lookup_table_frequencies(lookup_data, &mut trace, num_rows);
+    log_trace_stage(timing_enabled, "lookup_frequencies", num_rows, stage_started);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Fill PUBLIC_INPUTS
+    let stage_started = Instant::now();
     let mut public_inputs = [F::ZERO; pearl_public::TOTAL];
     let mut public_inputs_builder = RowBuilder {
         row: &mut public_inputs,
@@ -225,6 +262,8 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
     }
 
     public_inputs_builder.assert_end();
+    log_trace_stage(timing_enabled, "public_inputs", num_rows, stage_started);
+    log_trace_stage(timing_enabled, "total", num_rows, total_started);
 
     (trace, public_inputs)
 }
@@ -310,12 +349,9 @@ fn fill_lookup_table_frequencies<F: RichField + Extendable<D>, const D: usize>(
             // Build reverse index: table value -> array index
             let value_to_idx: HashMap<F, usize> = table_values.iter().enumerate().map(|(i, v)| (*v, i)).collect();
 
-            // Count frequencies in parallel over columns, then reduce
-            let freq_counts: Vec<u64> = col_evals
-                .par_iter()
-                .zip(filter_evals.par_iter())
-                .map(|(col_vals, filter_vals)| {
-                    let mut counts = vec![0u64; table_values.len()];
+            let freq_counts: Vec<u64> = {
+                let mut counts = vec![0u64; table_values.len()];
+                for (col_vals, filter_vals) in col_evals.iter().zip(filter_evals.iter()) {
                     for i in 0..num_rows {
                         if filter_vals[i] == F::ONE
                             && let Some(&idx) = value_to_idx.get(&col_vals[i])
@@ -323,15 +359,9 @@ fn fill_lookup_table_frequencies<F: RichField + Extendable<D>, const D: usize>(
                             counts[idx] += 1;
                         }
                     }
-                    counts
-                })
-                .reduce(
-                    || vec![0u64; table_values.len()],
-                    |mut a, b| {
-                        a.iter_mut().zip(b.iter()).for_each(|(x, y)| *x += *y);
-                        a
-                    },
-                );
+                }
+                counts
+            };
 
             let freq_col_idx = lookup
                 .frequencies_column

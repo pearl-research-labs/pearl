@@ -6,7 +6,7 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::extension::Extendable;
-use crate::field::fft::FftRootTable;
+use crate::field::fft::{fft_root_table, ifft_with_options, FftRootTable};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::FriProof;
@@ -74,20 +74,66 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 }
             }
         }
-        let coeffs = timed!(
+        // Precompute root table for IFFT so all polynomials share the same table.
+        let ifft_root_table = if !values.is_empty() {
+            Some(plonky2_field::fft::fft_root_table(values[0].len()))
+        } else {
+            None
+        };
+        let degree = values[0].len();
+        // Fused IFFT + LDE + coset FFT in a single parallel pass.
+        let salt_size = if blinding { SALT_SIZE } else { 0 };
+        let ifft_rt = ifft_root_table.as_ref();
+        let lde_size = degree << rate_bits;
+        let (polynomials, mut lde_vals): (Vec<PolynomialCoeffs<F>>, Vec<Vec<F>>) = values
+            .into_par_iter()
+            .map(|v| {
+                let coeffs = ifft_with_options(v, None, ifft_rt);
+                let mut lde_buf = Vec::with_capacity(lde_size);
+                unsafe { lde_buf.set_len(degree); }
+                lde_buf.copy_from_slice(&coeffs.coeffs);
+                let shift = F::coset_shift();
+                let shift2 = shift * shift;
+                let mut pe = F::ONE;
+                let mut po = shift;
+                let full_chunks = degree & !1;
+                for i in (0..full_chunks).step_by(2) {
+                    lde_buf[i] *= pe;
+                    lde_buf[i + 1] *= po;
+                    pe *= shift2;
+                    po *= shift2;
+                }
+                if degree & 1 != 0 {
+                    lde_buf[degree - 1] *= pe;
+                }
+                lde_buf.resize(lde_size, F::ZERO);
+                let lde_coeffs = PolynomialCoeffs::new(lde_buf);
+                let lde_vals = lde_coeffs
+                    .fft_with_options(Some(rate_bits), fft_root_table)
+                    .values;
+                (coeffs, lde_vals)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .unzip();
+        lde_vals.extend((0..salt_size).into_par_iter().map(|_| {
+            F::rand_vec(degree << rate_bits)
+        }).collect::<Vec<_>>());
+        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_vals));
+        reverse_index_bits_in_place(&mut leaves);
+        let merkle_tree = timed!(
             timing,
-            "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+            "build Merkle tree",
+            MerkleTree::new(leaves, cap_height)
         );
-
-        Self::from_coeffs(
-            coeffs,
+        drop(lde_vals);
+        Self {
+            polynomials,
+            merkle_tree,
+            degree_log: log2_strict(degree),
             rate_bits,
             blinding,
-            cap_height,
-            timing,
-            fft_root_table,
-        )
+        }
     }
 
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
@@ -113,10 +159,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             "build Merkle tree",
             MerkleTree::new(leaves, cap_height)
         );
-        // Frees lde_values in parallel to the main job
-        rayon::spawn(move || {
-            drop(lde_values);
-        });
+        drop(lde_values);
 
         Self {
             polynomials,
@@ -142,8 +185,26 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                p.lde(rate_bits)
-                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                // Shift-multiply only degree non-zero coefficients before zero-padding.
+                let shift = F::coset_shift();
+                let shift2 = shift * shift;
+                let mut pe = F::ONE;
+                let mut po = shift;
+                let mut shifted = p.coeffs.clone();
+                let full_chunks = degree & !1;
+                for i in (0..full_chunks).step_by(2) {
+                    shifted[i] *= pe;
+                    shifted[i + 1] *= po;
+                    pe *= shift2;
+                    po *= shift2;
+                }
+                if degree & 1 != 0 {
+                    shifted[degree - 1] *= pe;
+                }
+                // Pad with zeros and FFT (no shift-multiply needed on zeros)
+                shifted.resize(degree << rate_bits, F::ZERO);
+                PolynomialCoeffs::new(shifted)
+                    .fft_with_options(Some(rate_bits), fft_root_table)
                     .values
             })
             .chain(

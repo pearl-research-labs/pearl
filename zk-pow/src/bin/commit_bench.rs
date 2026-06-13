@@ -24,7 +24,10 @@ type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 
 fn line(xs: &[F]) -> String {
-    xs.iter().map(|x| format!("{:016x}", x.to_canonical_u64())).collect::<Vec<_>>().join(" ")
+    xs.iter()
+        .map(|x| format!("{:016x}", x.to_canonical_u64()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn main() {
@@ -51,35 +54,72 @@ fn main() {
     for _ in 0..reps {
         let t0 = Instant::now();
         let pb = PolynomialBatch::<F, C, D>::from_values(
-            trace.clone(), rate_bits, false, cap_height, &mut TimingTree::default(), Some(&rt_lde));
+            trace.clone(),
+            rate_bits,
+            false,
+            cap_height,
+            &mut TimingTree::default(),
+            Some(&rt_lde),
+        );
         let dt = t0.elapsed();
-        if dt < best { best = dt; }
+        if dt < best {
+            best = dt;
+        }
         if emit && cap_hex.is_empty() {
-            cap_hex = pb.merkle_tree.cap.0.iter().map(|h| line(&h.elements)).collect::<Vec<_>>().join("\n");
+            cap_hex = pb
+                .merkle_tree
+                .cap
+                .0
+                .iter()
+                .map(|h| line(&h.elements))
+                .collect::<Vec<_>>()
+                .join("\n");
         }
     }
     eprintln!(
         "CPU from_values: lg_n={} n={} num_cols={} rate_bits={} cap_height={} threads={} -> best {:?}",
-        lg_n, n, num_cols, rate_bits, cap_height, threads, best);
+        lg_n, n, num_cols, rate_bits, cap_height, threads, best
+    );
 
     if emit {
         let rt_n = fft_root_table::<F>(n);
         let n_inv = F::inverse_2exp(lg_n);
         // All hex (the GPU side parses every header token as base-16).
-        println!("{:x} {:x} {:x} {:x} {:016x} {:016x}", lg_n, num_cols, rate_bits, cap_height,
-                 F::coset_shift().to_canonical_u64(), n_inv.to_canonical_u64());
+        println!(
+            "{:x} {:x} {:x} {:x} {:016x} {:016x}",
+            lg_n,
+            num_cols,
+            rate_bits,
+            cap_height,
+            F::coset_shift().to_canonical_u64(),
+            n_inv.to_canonical_u64()
+        );
         println!("TRACE");
-        for col in &trace { println!("{}", line(&col.values)); }
-        println!("RT_N");                       // ifft root table (size n)
-        for row in &rt_n { println!("{}", line(row)); }
-        println!("RT_LDE");                      // coset-fft root table (size n<<r)
-        for row in &rt_lde { println!("{}", line(row)); }
+        for col in &trace {
+            println!("{}", line(&col.values));
+        }
+        println!("RT_N"); // ifft root table (size n)
+        for row in &rt_n {
+            println!("{}", line(row));
+        }
+        println!("RT_LDE"); // coset-fft root table (size n<<r)
+        for row in &rt_lde {
+            println!("{}", line(row));
+        }
         println!("CAP");
         println!("{}", cap_hex);
         // Full digests vec (plonky2 layout) for FFI byte-exact validation.
         let pb = PolynomialBatch::<F, C, D>::from_values(
-            trace.clone(), rate_bits, false, cap_height, &mut TimingTree::default(), Some(&rt_lde));
+            trace.clone(),
+            rate_bits,
+            false,
+            cap_height,
+            &mut TimingTree::default(),
+            Some(&rt_lde),
+        );
         println!("DIGESTS {}", pb.merkle_tree.digests.len());
-        for h in &pb.merkle_tree.digests { println!("{}", line(&h.elements)); }
+        for h in &pb.merkle_tree.digests {
+            println!("{}", line(&h.elements));
+        }
     }
 }

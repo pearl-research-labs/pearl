@@ -214,9 +214,10 @@ impl Poseidon for GoldilocksField {
          0xdcedab70f40718ba, 0xe796d293a47a64cb, 0x80772dc2645b280b, ],
     ];
 
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    /// AVX-512 mds_layer: same algorithm but compiled with AVX-512 enabled
+    /// so the compiler can use zmm registers for the i64 arithmetic.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
     #[inline(always)]
-    #[unroll::unroll_for_loops]
     fn mds_layer(state: &[Self; 12]) -> [Self; 12] {
         let mut result = [GoldilocksField::ZERO; 12];
 
@@ -247,45 +248,260 @@ impl Poseidon for GoldilocksField {
         result
     }
 
-    // #[cfg(all(target_arch="x86_64", target_feature="avx2", target_feature="bmi2"))]
-    // #[inline]
-    // fn poseidon(input: [Self; 12]) -> [Self; 12] {
-    //     unsafe {
-    //         crate::hash::arch::x86_64::poseidon_goldilocks_avx2_bmi2::poseidon(&input)
-    //     }
-    // }
+    /// Override poseidon using AVX-512 packed sbox for speed.
+    /// The sbox (x^7) is 20% of permutation time. AVX-512 processes 8 field
+    /// multiplications in parallel, giving ~2x sbox speedup.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[inline]
+    fn poseidon(input: [Self; 12]) -> [Self; 12] {
+        let mut state = input;
+        let mut round_ctr = 0;
 
-    // #[cfg(all(target_arch="x86_64", target_feature="avx2", target_feature="bmi2"))]
-    // #[inline(always)]
-    // fn constant_layer(state: &mut [Self; 12], round_ctr: usize) {
-    //     unsafe {
-    //         crate::hash::arch::x86_64::poseidon_goldilocks_avx2_bmi2::constant_layer(state, round_ctr);
-    //     }
-    // }
+        // First 4 full rounds (uses overrides below)
+        Self::full_rounds(&mut state, &mut round_ctr);
 
-    // #[cfg(all(target_arch="x86_64", target_feature="avx2", target_feature="bmi2"))]
-    // #[inline(always)]
-    // fn sbox_layer(state: &mut [Self; 12]) {
-    //     unsafe {
-    //         crate::hash::arch::x86_64::poseidon_goldilocks_avx2_bmi2::sbox_layer(state);
-    //     }
-    // }
+        // 22 partial rounds (uses AVX-512 override below)
+        Self::partial_rounds(&mut state, &mut round_ctr);
 
-    // #[cfg(all(target_arch="x86_64", target_feature="avx2", target_feature="bmi2"))]
-    // #[inline(always)]
-    // fn mds_layer(state: &[Self; 12]) -> [Self; 12] {
-    //     unsafe {
-    //         crate::hash::arch::x86_64::poseidon_goldilocks_avx2_bmi2::mds_layer(state)
-    //     }
-    // }
+        // Last 4 full rounds
+        Self::full_rounds(&mut state, &mut round_ctr);
 
-    // #[cfg(all(target_arch="aarch64", target_feature="neon"))]
-    // #[inline]
-    // fn poseidon(input: [Self; 12]) -> [Self; 12] {
-    //     unsafe {
-    //         crate::hash::arch::aarch64::poseidon_goldilocks_neon::poseidon(input)
-    //     }
-    // }
+        state
+    }
+
+    /// AVX-512 optimized partial rounds: fuses partial_first_constant_layer,
+    /// mds_partial_layer_init, and the 22 sparse MDS rounds with packed ops.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[inline(always)]
+    fn partial_rounds(state: &mut [Self; 12], round_ctr: &mut usize) {
+        use crate::hash::poseidon::{Poseidon, N_PARTIAL_ROUNDS};
+        use crate::field::types::{Field, Field64};
+        use plonky2_field::ops::Square;
+        use plonky2_field::arch::x86_64::avx512_goldilocks_field::Avx512GoldilocksField as P;
+        use plonky2_field::packed::PackedField;
+
+        // partial_first_constant_layer: add constants to all 12 elements
+        for i in 0..12 {
+            let c = GoldilocksField::from_canonical_u64(Self::FAST_PARTIAL_FIRST_ROUND_CONSTANT[i]);
+            state[i] += c;
+        }
+
+        // mds_partial_layer_init: AVX-512 optimized 11x11 matrix-vector multiply
+        // result[0] = state[0], result[c] = Σ_{r=1}^{11} state[r] * matrix[r-1][c-1]
+        // Process columns 1..8 with AVX-512, 9..11 scalar
+        let mut result = [Self::ZERO; 12];
+        result[0] = state[0];
+
+        // Accumulate into packed result for columns 1..8
+        let mut acc = P::ZEROS;
+        for r in 1..12 {
+            // Broadcast state[r] to all 8 lanes
+            let sr = P([state[r]; 8]);
+            // Pack matrix[r-1][0..8] (columns 1-8)
+            let mut mat_row = P::ZEROS;
+            for c in 0..8 {
+                mat_row.0[c] = GoldilocksField::from_canonical_u64(
+                    Self::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c]
+                );
+            }
+            // Multiply-accumulate: acc += state[r] * matrix_row
+            acc = acc + sr * mat_row;
+        }
+        // Store packed result
+        for c in 0..8 {
+            result[c + 1] = acc.0[c];
+        }
+
+        // Scalar for columns 9..11
+        for c in 8..11 {
+            for r in 1..12 {
+                let t = Self::from_canonical_u64(
+                    Self::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c]
+                );
+                result[c + 1] += state[r] * t;
+            }
+        }
+        *state = result;
+
+        // 22 sparse partial rounds (uses AVX-512 mds_partial_layer_fast override)
+        for i in 0..N_PARTIAL_ROUNDS {
+            state[0] = Self::sbox_monomial(state[0]);
+            unsafe {
+                state[0] = state[0].add_canonical_u64(Self::FAST_PARTIAL_ROUND_CONSTANTS[i]);
+            }
+            *state = Self::mds_partial_layer_fast(state, i);
+        }
+        *round_ctr += N_PARTIAL_ROUNDS;
+    }
+
+    /// AVX-512 fused constant+sbox+mds for full rounds.
+    /// Fuses constant_layer + sbox_layer into a single pass over state,
+    /// keeping values in zmm registers between add-constant and x^7.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[inline(always)]
+    fn full_rounds(state: &mut [Self; 12], round_ctr: &mut usize) {
+        use crate::hash::poseidon::{ALL_ROUND_CONSTANTS, HALF_N_FULL_ROUNDS};
+        use plonky2_field::arch::x86_64::avx512_goldilocks_field::Avx512GoldilocksField as P;
+        use plonky2_field::packed::PackedField;
+        use plonky2_field::ops::Square;
+
+        for _ in 0..HALF_N_FULL_ROUNDS {
+            let base = *round_ctr * 12;
+
+            // --- Interleaved constant + sbox for all 12 elements ---
+            // Load scalar constants and start scalar add for 8..12 (independent of packed load)
+            let c8 = GoldilocksField(ALL_ROUND_CONSTANTS[base + 8]);
+            let c9 = GoldilocksField(ALL_ROUND_CONSTANTS[base + 9]);
+            let c10 = GoldilocksField(ALL_ROUND_CONSTANTS[base + 10]);
+            let c11 = GoldilocksField(ALL_ROUND_CONSTANTS[base + 11]);
+            let sx8 = state[8] + c8;
+            let sx9 = state[9] + c9;
+            let sx10 = state[10] + c10;
+            let sx11 = state[11] + c11;
+
+            // Load packed constants and start packed add for 0..8
+            let mut packed = *P::from_slice(&state[0..8]);
+            let mut constants = P::ZEROS;
+            for i in 0..8 {
+                constants.0[i] = GoldilocksField(ALL_ROUND_CONSTANTS[base + i]);
+            }
+            packed = packed + constants;
+
+            // Interleave packed sbox with scalar sbox to use both FMA and integer mul units
+            let px2 = packed.square();
+            let sx8_2 = sx8.square();
+            let sx9_2 = sx9.square();
+
+            let px4 = px2.square();
+            let sx10_2 = sx10.square();
+            let sx11_2 = sx11.square();
+
+            let px3 = packed * px2;
+            let sx8_4 = sx8_2.square();
+            let sx9_4 = sx9_2.square();
+
+            let px7 = px3 * px4;
+            let sx10_4 = sx10_2.square();
+            let sx11_4 = sx11_2.square();
+
+            // Store packed results
+            state[0] = px7.0[0];
+            state[1] = px7.0[1];
+            state[2] = px7.0[2];
+            state[3] = px7.0[3];
+            state[4] = px7.0[4];
+            state[5] = px7.0[5];
+            state[6] = px7.0[6];
+            state[7] = px7.0[7];
+
+            // Finish scalar sbox
+            let sx8_3 = sx8 * sx8_2;
+            let sx9_3 = sx9 * sx9_2;
+            let sx10_3 = sx10 * sx10_2;
+            let sx11_3 = sx11 * sx11_2;
+            state[8] = sx8_3 * sx8_4;
+            state[9] = sx9_3 * sx9_4;
+            state[10] = sx10_3 * sx10_4;
+            state[11] = sx11_3 * sx11_4;
+
+            // MDS layer (unchanged)
+            *state = Self::mds_layer(state);
+            *round_ctr += 1;
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[inline(always)]
+    #[unroll::unroll_for_loops]
+    fn sbox_layer(state: &mut [Self; 12]) {
+        use plonky2_field::arch::x86_64::avx512_goldilocks_field::Avx512GoldilocksField as P;
+        use plonky2_field::packed::PackedField;
+        use plonky2_field::ops::Square;
+
+        // Process first 8 elements using AVX-512 packed field (8-wide SIMD)
+        let packed = *P::from_slice(&state[0..8]);
+        let x2 = packed.square();
+        let x4 = x2.square();
+        let x3 = packed * x2;
+        let x7 = x3 * x4;
+        state[0] = x7.0[0];
+        state[1] = x7.0[1];
+        state[2] = x7.0[2];
+        state[3] = x7.0[3];
+        state[4] = x7.0[4];
+        state[5] = x7.0[5];
+        state[6] = x7.0[6];
+        state[7] = x7.0[7];
+
+        // Process last 4 elements scalar (padding overhead exceeds SIMD benefit)
+        for i in 8..12 {
+            let x = state[i];
+            let x2 = x.square();
+            let x4 = x2.square();
+            let x3 = x * x2;
+            state[i] = x3 * x4;
+        }
+    }
+
+    /// AVX-512 optimized sparse MDS for partial rounds.
+    /// The multiply-accumulate step (result[i] = state[i] + state[0] * v[i])
+    /// processes 8 elements at a time using packed field multiplication.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[inline(always)]
+    fn mds_partial_layer_fast(state: &[Self; 12], r: usize) -> [Self; 12] {
+        use crate::field::types::{Field, PrimeField64};
+
+        // Step 1: Compute d using scalar u160 accumulation (unchanged)
+        let mut d_sum = (0u128, 0u32);
+        for i in 1..12 {
+            let t = Self::FAST_PARTIAL_ROUND_W_HATS[r][i - 1] as u128;
+            let si = state[i].to_noncanonical_u64() as u128;
+            d_sum = crate::hash::poseidon::add_u160_u128(d_sum, si * t);
+        }
+        let s0 = state[0].to_noncanonical_u64() as u128;
+        let mds0to0 = (Self::MDS_MATRIX_CIRC[0] + Self::MDS_MATRIX_DIAG[0]) as u128;
+        d_sum = crate::hash::poseidon::add_u160_u128(d_sum, s0 * mds0to0);
+        let d = crate::hash::poseidon::reduce_u160::<Self>(d_sum);
+
+        // Step 2: AVX-512 packed multiply-accumulate for result[1..12]
+        use plonky2_field::arch::x86_64::avx512_goldilocks_field::Avx512GoldilocksField as P;
+        use plonky2_field::packed::PackedField;
+
+        let mut result = [Self::ZERO; 12];
+        result[0] = d;
+
+        let v = Self::FAST_PARTIAL_ROUND_VS[r];
+
+        // Broadcast state[0] to all 8 lanes
+        let s0_broadcast = P([state[0]; 8]);
+
+        // Pack v[1..9] into a zmm
+        let mut v_packed = P::ZEROS;
+        for i in 0..8 {
+            v_packed.0[i] = GoldilocksField::from_canonical_u64(v[i]);
+        }
+
+        // Pack state[1..9] into a zmm
+        let mut st_packed = P::ZEROS;
+        for i in 0..8 {
+            st_packed.0[i] = state[i + 1];
+        }
+
+        // Compute s0 * v[1..9] + state[1..9] using packed field ops
+        let prod = s0_broadcast * v_packed;
+        let result_packed = prod + st_packed;
+        for i in 0..8 {
+            result[i + 1] = result_packed.0[i];
+        }
+
+        // Last 3 elements: scalar
+        for i in 9..12 {
+            let t = Self::from_canonical_u64(v[i - 1]);
+            result[i] = state[i].multiply_accumulate(state[0], t);
+        }
+
+        result
+    }
 
     #[cfg(all(target_arch="aarch64", target_feature="neon"))]
     #[inline(always)]
@@ -309,9 +525,9 @@ impl Poseidon for GoldilocksField {
 // located at https://github.com/facebook/winterfell.
 #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
 mod poseidon12_mds {
-    const MDS_FREQ_BLOCK_ONE: [i64; 3] = [16, 32, 16];
-    const MDS_FREQ_BLOCK_TWO: [(i64, i64); 3] = [(2, -1), (-4, 1), (16, 1)];
-    const MDS_FREQ_BLOCK_THREE: [i64; 3] = [-1, -8, 2];
+    pub(crate) const MDS_FREQ_BLOCK_ONE: [i64; 3] = [16, 32, 16];
+    pub(crate) const MDS_FREQ_BLOCK_TWO: [(i64, i64); 3] = [(2, -1), (-4, 1), (16, 1)];
+    pub(crate) const MDS_FREQ_BLOCK_THREE: [i64; 3] = [-1, -8, 2];
 
     /// Split 3 x 4 FFT-based MDS vector-multiplication with the Poseidon circulant MDS matrix.
     #[inline(always)]
@@ -343,7 +559,7 @@ mod poseidon12_mds {
     }
 
     #[inline(always)]
-    const fn block1(x: [i64; 3], y: [i64; 3]) -> [i64; 3] {
+    pub(crate) const fn block1(x: [i64; 3], y: [i64; 3]) -> [i64; 3] {
         let [x0, x1, x2] = x;
         let [y0, y1, y2] = y;
         let z0 = x0 * y0 + x1 * y2 + x2 * y1;
@@ -354,7 +570,7 @@ mod poseidon12_mds {
     }
 
     #[inline(always)]
-    const fn block2(x: [(i64, i64); 3], y: [(i64, i64); 3]) -> [(i64, i64); 3] {
+    pub(crate) const fn block2(x: [(i64, i64); 3], y: [(i64, i64); 3]) -> [(i64, i64); 3] {
         let [(x0r, x0i), (x1r, x1i), (x2r, x2i)] = x;
         let [(y0r, y0i), (y1r, y1i), (y2r, y2i)] = y;
         let x0s = x0r + x0i;
@@ -392,7 +608,7 @@ mod poseidon12_mds {
     }
 
     #[inline(always)]
-    const fn block3(x: [i64; 3], y: [i64; 3]) -> [i64; 3] {
+    pub(crate) const fn block3(x: [i64; 3], y: [i64; 3]) -> [i64; 3] {
         let [x0, x1, x2] = x;
         let [y0, y1, y2] = y;
         let z0 = x0 * y0 - x1 * y2 - x2 * y1;
@@ -439,6 +655,661 @@ mod poseidon12_mds {
         let [x1, x3] = ifft2_real_unreduced([z1, z3]);
 
         [x0, x1, x2, x3]
+    }
+}
+
+/// Batched Poseidon permutation processing 8 states simultaneously using AVX-512 SoA layout.
+///
+/// Layout: 8 independent [u64; 12] states are stored as 12 __m512i registers,
+/// where zmm[j] holds element j from all 8 states.
+///
+/// All operations (constant add, sbox, MDS) are element-wise and parallelize
+/// across the 8 lanes.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+pub(crate) mod batched_poseidon {
+    use super::{GoldilocksField, poseidon12_mds, N_PARTIAL_ROUNDS};
+    use crate::hash::poseidon::{ALL_ROUND_CONSTANTS, HALF_N_FULL_ROUNDS, SPONGE_WIDTH, Poseidon};
+    use crate::field::types::Field;
+    use crate::field::goldilocks_field::GoldilocksField as F;
+    use crate::field::ops::Square;
+    use plonky2_field::arch::x86_64::avx512_goldilocks_field::Avx512GoldilocksField as P;
+    use plonky2_field::packed::PackedField;
+    use core::arch::x86_64::{__m512i, _mm512_add_epi64, _mm512_set1_epi64, _mm512_sub_epi64,
+                                _mm512_mullo_epi64, _mm512_and_si512, _mm512_srli_epi64,
+                                _mm512_slli_epi64, _mm512_loadu_si512, _mm512_storeu_si512};
+
+    /// Broadcast a single u64 constant to all 8 lanes of a zmm register.
+    #[inline(always)]
+    fn broadcast_i64(val: i64) -> __m512i {
+        unsafe { _mm512_set1_epi64(val) }
+    }
+
+    /// Broadcast a single u64 constant as u64 to all 8 lanes.
+    #[inline(always)]
+    fn broadcast_u64(val: u64) -> __m512i {
+        // Safety: bit pattern is the same for u64 and i64 in two's complement
+        broadcast_i64(val as i64)
+    }
+
+    /// Packed FFT4 on 8 independent 4-element u64 arrays.
+    /// Input: 4 __m512i registers, each holding 8 u64 values.
+    /// Output: (y0, (y1r, y1i), y2) as packed i64 values.
+    #[inline(always)]
+    fn fft4_real_packed(x: [__m512i; 4]) -> (__m512i, (__m512i, __m512i), __m512i) {
+        unsafe {
+            // fft2_real([x[0], x[2]]): cast u64 to i64, then z0=x[0]+x[2], z2=x[0]-x[2]
+            let z0_02 = _mm512_add_epi64(x[0], x[2]);
+            let z2_02 = _mm512_sub_epi64(x[0], x[2]);
+            // fft2_real([x[1], x[3]]): z1=x[1]+x[3], z3=x[1]-x[3]
+            let z1_13 = _mm512_add_epi64(x[1], x[3]);
+            let z3_13 = _mm512_sub_epi64(x[1], x[3]);
+            // y0 = z0_02 + z1_13
+            // y1 = (z2_02, -z3_13)
+            // y2 = z0_02 - z1_13
+            let y0 = _mm512_add_epi64(z0_02, z1_13);
+            let y1r = z2_02;
+            let y1i = _mm512_sub_epi64(_mm512_set1_epi64(0), z3_13); // -z3_13
+            let y2 = _mm512_sub_epi64(z0_02, z1_13);
+            (y0, (y1r, y1i), y2)
+        }
+    }
+
+    /// Packed IFFT4 on 8 independent triples.
+    /// Division by four is NOT performed (unreduced).
+    #[inline(always)]
+    fn ifft4_real_unreduced_packed(y: (__m512i, (__m512i, __m512i), __m512i)) -> [__m512i; 4] {
+        unsafe {
+            let z0 = _mm512_add_epi64(y.0, y.2);
+            let z1 = _mm512_sub_epi64(y.0, y.2);
+            let z2 = (y.1).0;
+            let z3 = _mm512_sub_epi64(_mm512_set1_epi64(0), (y.1).1); // -y.1.1
+            // ifft2_real_unreduced([z0, z2]): x0 = z0 + z2, x2 = z0 - z2
+            let x0 = _mm512_add_epi64(z0, z2);
+            let x2 = _mm512_sub_epi64(z0, z2);
+            // ifft2_real_unreduced([z1, z3]): x1 = z1 + z3, x3 = z1 - z3
+            let x1 = _mm512_add_epi64(z1, z3);
+            let x3 = _mm512_sub_epi64(z1, z3);
+            [x0, x1, x2, x3]
+        }
+    }
+
+    /// Packed block1: circulant multiply in frequency domain.
+    /// z0 = x0*y0 + x1*y2 + x2*y1
+    /// z1 = x0*y1 + x1*y0 + x2*y2
+    /// z2 = x0*y2 + x1*y1 + x2*y0
+    /// Using mullo_epi64 for low-64-bit multiply.
+    #[inline(always)]
+    fn block1_packed(x: [__m512i; 3], y: [i64; 3]) -> [__m512i; 3] {
+        unsafe {
+            let y0 = broadcast_i64(y[0]);
+            let y1 = broadcast_i64(y[1]);
+            let y2 = broadcast_i64(y[2]);
+            // Use mullo for low-64-bit product (same as wrapping i64 mul)
+            let x0_y0 = _mm512_mullo_epi64(x[0], y0);
+            let x1_y2 = _mm512_mullo_epi64(x[1], y2);
+            let x2_y1 = _mm512_mullo_epi64(x[2], y1);
+            let z0 = _mm512_add_epi64(_mm512_add_epi64(x0_y0, x1_y2), x2_y1);
+
+            let x0_y1 = _mm512_mullo_epi64(x[0], y1);
+            let x1_y0 = _mm512_mullo_epi64(x[1], y0);
+            let x2_y2 = _mm512_mullo_epi64(x[2], y2);
+            let z1 = _mm512_add_epi64(_mm512_add_epi64(x0_y1, x1_y0), x2_y2);
+
+            let x0_y2 = _mm512_mullo_epi64(x[0], y2);
+            let x1_y1 = _mm512_mullo_epi64(x[1], y1);
+            let x2_y0 = _mm512_mullo_epi64(x[2], y0);
+            let z2 = _mm512_add_epi64(_mm512_add_epi64(x0_y2, x1_y1), x2_y0);
+
+            [z0, z1, z2]
+        }
+    }
+
+    /// Packed block3: circulant multiply with subtraction.
+    /// z0 = x0*y0 - x1*y2 - x2*y1
+    /// z1 = x0*y1 + x1*y0 - x2*y2
+    /// z2 = x0*y2 + x1*y1 + x2*y0
+    #[inline(always)]
+    fn block3_packed(x: [__m512i; 3], y: [i64; 3]) -> [__m512i; 3] {
+        unsafe {
+            let y0 = broadcast_i64(y[0]);
+            let y1 = broadcast_i64(y[1]);
+            let y2 = broadcast_i64(y[2]);
+
+            let x0_y0 = _mm512_mullo_epi64(x[0], y0);
+            let x1_y2 = _mm512_mullo_epi64(x[1], y2);
+            let x2_y1 = _mm512_mullo_epi64(x[2], y1);
+            let z0 = _mm512_sub_epi64(_mm512_sub_epi64(x0_y0, x1_y2), x2_y1);
+
+            let x0_y1 = _mm512_mullo_epi64(x[0], y1);
+            let x1_y0 = _mm512_mullo_epi64(x[1], y0);
+            let x2_y2 = _mm512_mullo_epi64(x[2], y2);
+            let z1 = _mm512_add_epi64(_mm512_add_epi64(x0_y1, x1_y0), _mm512_sub_epi64(_mm512_set1_epi64(0), x2_y2));
+
+            let x0_y2 = _mm512_mullo_epi64(x[0], y2);
+            let x1_y1 = _mm512_mullo_epi64(x[1], y1);
+            let x2_y0 = _mm512_mullo_epi64(x[2], y0);
+            let z2 = _mm512_add_epi64(_mm512_add_epi64(x0_y2, x1_y1), x2_y0);
+
+            [z0, z1, z2]
+        }
+    }
+
+    /// Packed block2: complex-valued circulant multiply with Karatsuba.
+    /// Same logic as scalar block2 but on packed i64.
+    #[inline(always)]
+    fn block2_packed(
+        x: [(__m512i, __m512i); 3],
+        y: [(i64, i64); 3],
+    ) -> [(__m512i, __m512i); 3] {
+        unsafe {
+            let [(x0r, x0i), (x1r, x1i), (x2r, x2i)] = x;
+            let [(y0r, y0i), (y1r, y1i), (y2r, y2i)] = y;
+
+            let x0s = _mm512_add_epi64(x0r, x0i);
+            let x1s = _mm512_add_epi64(x1r, x1i);
+            let x2s = _mm512_add_epi64(x2r, x2i);
+            let y0s = broadcast_i64(y0r + y0i);
+            let y1s = broadcast_i64(y1r + y1i);
+            let y2s = broadcast_i64(y2r + y2i);
+
+            let by0r = broadcast_i64(y0r);
+            let by0i = broadcast_i64(y0i);
+            let by1r = broadcast_i64(y1r);
+            let by1i = broadcast_i64(y1i);
+            let by2r = broadcast_i64(y2r);
+            let by2i = broadcast_i64(y2i);
+
+            // z0 computation
+            let m0r = _mm512_mullo_epi64(x0r, by0r);
+            let m0i = _mm512_mullo_epi64(x0i, by0i);
+            let m1r = _mm512_mullo_epi64(x1r, by2r);
+            let m1i = _mm512_mullo_epi64(x1i, by2i);
+            let m2r = _mm512_mullo_epi64(x2r, by1r);
+            let m2i = _mm512_mullo_epi64(x2i, by1i);
+            let x1s_y2s = _mm512_mullo_epi64(x1s, y2s);
+            let x2s_y1s = _mm512_mullo_epi64(x2s, y1s);
+            let x0s_y0s = _mm512_mullo_epi64(x0s, y0s);
+            let z0r = _mm512_add_epi64(
+                _mm512_sub_epi64(m0r, m0i),
+                _mm512_add_epi64(
+                    _mm512_sub_epi64(x1s_y2s, _mm512_add_epi64(m1r, m1i)),
+                    _mm512_sub_epi64(x2s_y1s, _mm512_add_epi64(m2r, m2i)),
+                ),
+            );
+            let z0i = _mm512_add_epi64(
+                _mm512_sub_epi64(x0s_y0s, _mm512_add_epi64(m0r, m0i)),
+                _mm512_add_epi64(
+                    _mm512_sub_epi64(m1i, m1r),
+                    _mm512_sub_epi64(m2i, m2r),
+                ),
+            );
+
+            // z1 computation
+            let m0r = _mm512_mullo_epi64(x0r, by1r);
+            let m0i = _mm512_mullo_epi64(x0i, by1i);
+            let m1r = _mm512_mullo_epi64(x1r, by0r);
+            let m1i = _mm512_mullo_epi64(x1i, by0i);
+            let m2r = _mm512_mullo_epi64(x2r, by2r);
+            let m2i = _mm512_mullo_epi64(x2i, by2i);
+            let x2s_y2s = _mm512_mullo_epi64(x2s, y2s);
+            let x1s_y0s = _mm512_mullo_epi64(x1s, y0s);
+            let x0s_y1s = _mm512_mullo_epi64(x0s, y1s);
+            let z1r = _mm512_add_epi64(
+                _mm512_add_epi64(
+                    _mm512_sub_epi64(m0r, m0i),
+                    _mm512_sub_epi64(m1r, m1i),
+                ),
+                _mm512_sub_epi64(x2s_y2s, _mm512_add_epi64(m2r, m2i)),
+            );
+            let z1i = _mm512_add_epi64(
+                _mm512_sub_epi64(x0s_y1s, _mm512_add_epi64(m0r, m0i)),
+                _mm512_add_epi64(
+                    _mm512_sub_epi64(x1s_y0s, _mm512_add_epi64(m1r, m1i)),
+                    _mm512_sub_epi64(m2i, m2r),
+                ),
+            );
+
+            // z2 computation
+            let m0r = _mm512_mullo_epi64(x0r, by2r);
+            let m0i = _mm512_mullo_epi64(x0i, by2i);
+            let m1r = _mm512_mullo_epi64(x1r, by1r);
+            let m1i = _mm512_mullo_epi64(x1i, by1i);
+            let m2r = _mm512_mullo_epi64(x2r, by0r);
+            let m2i = _mm512_mullo_epi64(x2i, by0i);
+            let x0s_y2s = _mm512_mullo_epi64(x0s, y2s);
+            let x1s_y1s = _mm512_mullo_epi64(x1s, y1s);
+            let x2s_y0s = _mm512_mullo_epi64(x2s, y0s);
+            let z2r = _mm512_add_epi64(
+                _mm512_add_epi64(
+                    _mm512_sub_epi64(m0r, m0i),
+                    _mm512_sub_epi64(m1r, m1i),
+                ),
+                _mm512_sub_epi64(m2r, m2i),
+            );
+            let z2i = _mm512_add_epi64(
+                _mm512_add_epi64(
+                    _mm512_sub_epi64(x0s_y2s, _mm512_add_epi64(m0r, m0i)),
+                    _mm512_sub_epi64(x1s_y1s, _mm512_add_epi64(m1r, m1i)),
+                ),
+                _mm512_sub_epi64(x2s_y0s, _mm512_add_epi64(m2r, m2i)),
+            );
+
+            [(z0r, z0i), (z1r, z1i), (z2r, z2i)]
+        }
+    }
+
+    /// Packed MDS frequency-domain circulant multiply on 8 states simultaneously.
+    /// Input/Output: 12 __m512i registers in SoA layout (zmm[j] = element j from 8 states).
+    /// Operates on u64 values split into low/high 32-bit halves.
+    #[inline(always)]
+    #[allow(dead_code)]
+    fn mds_multiply_freq_packed(state: &[__m512i; 12]) -> [__m512i; 12] {
+        // Split each u64 into low 32 bits and high 32 bits
+        let mask32 = unsafe { _mm512_set1_epi64(0xFFFFFFFF) };
+        let mut lo = [unsafe { _mm512_set1_epi64(0) }; 12];
+        let mut hi = [unsafe { _mm512_set1_epi64(0) }; 12];
+        for i in 0..12 {
+            // lo[i] = state[i] & 0xFFFFFFFF
+            lo[i] = unsafe { _mm512_and_si512(state[i], mask32) };
+            // hi[i] = state[i] >> 32 (arithmetic shift)
+            hi[i] = unsafe { _mm512_srli_epi64::<32>(state[i]) };
+        }
+
+        // Apply MDS multiply to both halves
+        let lo = mds_multiply_freq_raw(&lo);
+        let hi = mds_multiply_freq_raw(&hi);
+
+        // Combine: result = lo + (hi << 32)
+        let mut result = [unsafe { _mm512_set1_epi64(0) }; 12];
+        for i in 0..12 {
+            // Shift hi left by 32 bits
+            let hi_shifted = unsafe { _mm512_slli_epi64(hi[i], 32) };
+            result[i] = unsafe { _mm512_add_epi64(lo[i], hi_shifted) };
+        }
+        result
+    }
+
+    /// Raw packed MDS frequency multiply on 12 i64 values.
+    /// This is the same as poseidon12_mds::mds_multiply_freq but on packed data.
+    #[inline(always)]
+    fn mds_multiply_freq_raw(state: &[__m512i; 12]) -> [__m512i; 12] {
+        use poseidon12_mds::{MDS_FREQ_BLOCK_ONE, MDS_FREQ_BLOCK_TWO, MDS_FREQ_BLOCK_THREE};
+
+        // FFT4 on groups [0,3,6,9], [1,4,7,10], [2,5,8,11]
+        // fft4_real returns (y0, (y1r, y1i), y2)
+        let (u0, (u1r, u1i), u2) = fft4_real_packed([state[0], state[3], state[6], state[9]]);
+        let (u4, (u5r, u5i), u6) = fft4_real_packed([state[1], state[4], state[7], state[10]]);
+        let (u8, (u9r, u9i), u10) = fft4_real_packed([state[2], state[5], state[8], state[11]]);
+
+        // Block multiplies
+        // block1: real-valued circulant on (u0, u4, u8)
+        let [v0, v4, v8] = block1_packed([u0, u4, u8], MDS_FREQ_BLOCK_ONE);
+        // block2: complex-valued circulant on ((u1r,u1i), (u5r,u5i), (u9r,u9i))
+        let [(v1r, v1i), (v5r, v5i), (v9r, v9i)] = block2_packed(
+            [(u1r, u1i), (u5r, u5i), (u9r, u9i)],
+            MDS_FREQ_BLOCK_TWO,
+        );
+        // block3: real-valued circulant on (u2, u6, u10)
+        let [v2, v6, v10] = block3_packed([u2, u6, u10], MDS_FREQ_BLOCK_THREE);
+
+        // IFFT4
+        let [s0, s3, s6, s9] = ifft4_real_unreduced_packed((v0, (v1r, v1i), v2));
+        let [s1, s4, s7, s10] = ifft4_real_unreduced_packed((v4, (v5r, v5i), v6));
+        let [s2, s5, s8, s11] = ifft4_real_unreduced_packed((v8, (v9r, v9i), v10));
+
+        [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11]
+    }
+
+    /// Complete batched MDS layer: circulant multiply + diagonal + field reduction.
+    /// Works on 8 states in SoA layout using Avx512GoldilocksField (packed field ops).
+    #[inline(always)]
+    pub fn mds_layer_batch(packed: &[P; 12]) -> [P; 12] {
+        use plonky2_field::arch::x86_64::avx512_goldilocks_field::{reduce128, mul64_64, EPSILON};
+        use crate::field::goldilocks_field::GoldilocksField;
+
+        // Extract raw u64 values from packed field elements
+        let raw: [__m512i; 12] = core::array::from_fn(|j| packed[j].get());
+
+        // Store original state[0] for diagonal addition
+        let orig_s0 = raw[0];
+
+        // Split each u64 into low 32 bits and high 32 bits
+        let mask32 = unsafe { _mm512_set1_epi64(0xFFFFFFFF) };
+        let mut lo = [unsafe { _mm512_set1_epi64(0) }; 12];
+        let mut hi = [unsafe { _mm512_set1_epi64(0) }; 12];
+        for i in 0..12 {
+            lo[i] = unsafe { _mm512_and_si512(raw[i], mask32) };
+            hi[i] = unsafe { _mm512_srli_epi64::<32>(raw[i]) };
+        }
+
+        // Apply circulant MDS to both halves
+        let lo = mds_multiply_freq_raw(&lo);
+        let hi = mds_multiply_freq_raw(&hi);
+
+        // Combine and reduce using proper 128-bit arithmetic.
+        // Scalar: s = lo + (hi << 32) as u128; from_noncanonical_u96((s as u64, (s >> 64) as u32))
+        // Packed: split hi into lo_32 and hi_above_32, construct 128-bit (hi_above_32, lo + hi_lo_32 << 32)
+        let mask32 = unsafe { _mm512_set1_epi64(0xFFFFFFFF) };
+        let mut result = [P::ZEROS; 12];
+        for i in 0..12 {
+            // hi_lo32 = hi[i] & 0xFFFFFFFF (lower 32 bits of hi_result)
+            let hi_lo32 = unsafe { _mm512_and_si512(hi[i], mask32) };
+            // hi_above32 = hi[i] >> 32 (upper bits of hi_result, fits in 32 bits for MDS)
+            let hi_above32 = unsafe { _mm512_srli_epi64::<32>(hi[i]) };
+            // combined_lo = lo[i] + (hi_lo32 << 32) — both fit in 64 bits
+            let hi_lo32_shifted = unsafe { _mm512_slli_epi64::<32>(hi_lo32) };
+            let combined_lo = unsafe { _mm512_add_epi64(lo[i], hi_lo32_shifted) };
+            // combined_hi = hi_above32 (no carry possible since MDS outputs are bounded)
+            // The scalar code does from_noncanonical_u96((s as u64, (s >> 64) as u32))
+            // which is reduce96((combined_lo, combined_hi as u32))
+            // We can use reduce128 which does the same thing for 128-bit values
+            let reduced = unsafe { reduce128((hi_above32, combined_lo)) };
+            result[i] = P::new(reduced);
+        }
+
+        use crate::hash::poseidon::Poseidon;
+        // Add diagonal: result[0] += from_noncanonical_u96(MDS_MATRIX_DIAG[0] * state[0])
+        let diag_val = <super::GoldilocksField as Poseidon>::MDS_MATRIX_DIAG[0];
+        let diag = unsafe { broadcast_u64(diag_val) };
+        let diag_times_s0 = unsafe { reduce128(mul64_64(diag, orig_s0)) };
+        result[0] = result[0] + P::new(diag_times_s0);
+
+        result
+    }
+
+    /// Batched full rounds: constant_layer + sbox_layer + mds_layer for 8 states.
+    /// Processes `n_rounds` full Poseidon rounds on packed SoA data.
+    #[inline(always)]
+    fn full_rounds_batch(packed: &mut [P; 12], round_ctr: &mut usize, n_rounds: usize) {
+        for _ in 0..n_rounds {
+            let base = *round_ctr * 12;
+
+            // Fused constant + sbox for all 12 elements
+            // Interleave: do constant add and sbox together to keep data in zmm registers
+            for j in 0..12 {
+                let c = GoldilocksField(ALL_ROUND_CONSTANTS[base + j]);
+                packed[j] = packed[j] + P([c, c, c, c, c, c, c, c]);
+                // Sbox: x^7
+                let x2 = packed[j].square();
+                let x4 = x2.square();
+                let x3 = packed[j] * x2;
+                packed[j] = x3 * x4;
+            }
+
+            // MDS layer: packed circulant multiply + diagonal + reduce
+            let new_state = mds_layer_batch(packed);
+            *packed = new_state;
+
+            *round_ctr += 1;
+        }
+    }
+
+    /// Batched partial rounds for 8 states simultaneously.
+    /// Processes: partial_first_constant_layer + mds_partial_layer_init + 22 sparse rounds.
+    #[inline(always)]
+    fn partial_rounds_batch(packed: &mut [P; 12], round_ctr: &mut usize) {
+        // 1. partial_first_constant_layer: add FAST_PARTIAL_FIRST_ROUND_CONSTANT to all elements
+        for j in 0..12 {
+            let c = GoldilocksField::from_canonical_u64(
+                <GoldilocksField as Poseidon>::FAST_PARTIAL_FIRST_ROUND_CONSTANT[j]
+            );
+            packed[j] = packed[j] + P([c, c, c, c, c, c, c, c]);
+        }
+
+        // 2. mds_partial_layer_init: 11x11 matrix-vector multiply
+        // result[0] = state[0], result[c] = Σ_{r=1}^{11} state[r] * matrix[r-1][c-1]
+        // Process using packed field operations on all 8 states simultaneously
+        let mut result: [P; 12] = [P::ZEROS; 12];
+        result[0] = packed[0]; // result[0] = state[0] (no change)
+
+        // For columns 1..8: use packed multiply-accumulate
+        // Pre-compute packed matrix values
+        // Matrix is [11][8] for columns 1..8 of rows 1..11
+        let mut packed_matrix: [[P; 8]; 11] = [[P::ZEROS; 8]; 11];
+        for r in 1..12 {
+            for c in 0..8 {
+                let mat_val = GoldilocksField::from_canonical_u64(
+                    <GoldilocksField as Poseidon>::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c]
+                );
+                packed_matrix[r - 1][c] = P([mat_val, mat_val, mat_val, mat_val, mat_val, mat_val, mat_val, mat_val]);
+            }
+        }
+
+        let mut acc = [P::ZEROS; 8]; // 8 accumulators for columns 1..8
+        for r in 1..12 {
+            for c in 0..8 {
+                acc[c] = acc[c] + packed[r] * packed_matrix[r - 1][c];
+            }
+        }
+        // Store packed results for columns 1..8
+        for c in 0..8 {
+            result[c + 1] = acc[c];
+        }
+
+        // For columns 9..11: scalar matrix multiply (3 extra columns per state)
+        for c in 8..11 {
+            for r in 1..12 {
+                let mat_val = GoldilocksField::from_canonical_u64(
+                    <GoldilocksField as Poseidon>::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c]
+                );
+                result[c + 1] = result[c + 1] + packed[r] * P([mat_val, mat_val, mat_val, mat_val, mat_val, mat_val, mat_val, mat_val]);
+            }
+        }
+        *packed = result;
+
+        // 3. 22 sparse partial rounds
+        for i in 0..N_PARTIAL_ROUNDS {
+            // Sbox on element 0: x^7
+            let x2 = packed[0].square();
+            let x4 = x2.square();
+            let x3 = packed[0] * x2;
+            packed[0] = x3 * x4;
+
+            // Add round constant to element 0 (using add_canonical_u64 semantics)
+            // FAST_PARTIAL_ROUND_CONSTANTS are already canonical Goldilocks values.
+            // The scalar code uses state[0].add_canonical_u64(c) which is just += c
+            // when c < field modulus. Since these constants are pre-reduced, += is fine.
+            let c = GoldilocksField(<GoldilocksField as Poseidon>::FAST_PARTIAL_ROUND_CONSTANTS[i]);
+            packed[0] = packed[0] + P([c, c, c, c, c, c, c, c]);
+
+            // Sparse MDS (mds_partial_layer_fast):
+            // d = state[0] * mds0to0 + Σ_{r=1}^{11} state[r] * w_hats[r-1]
+            // result[0] = d
+            // result[r] = state[r] + state[0] * v[r-1] for r=1..11
+            let mds0to0 = GoldilocksField::from_canonical_u64(
+                <GoldilocksField as Poseidon>::MDS_MATRIX_CIRC[0]
+                + <GoldilocksField as Poseidon>::MDS_MATRIX_DIAG[0]
+            );
+
+            // Compute d using packed multiply-accumulate
+            let mut d = packed[0] * P([mds0to0, mds0to0, mds0to0, mds0to0, mds0to0, mds0to0, mds0to0, mds0to0]);
+            for r in 1..12 {
+                let w = GoldilocksField::from_canonical_u64(
+                    <GoldilocksField as Poseidon>::FAST_PARTIAL_ROUND_W_HATS[i][r - 1]
+                );
+                d = d + packed[r] * P([w, w, w, w, w, w, w, w]);
+            }
+
+            // Apply sparse MDS
+            let old_s0 = packed[0];
+            packed[0] = d;
+            let v = <GoldilocksField as Poseidon>::FAST_PARTIAL_ROUND_VS[i];
+            for r in 1..12 {
+                let v_val = GoldilocksField::from_canonical_u64(v[r - 1]);
+                packed[r] = packed[r] + old_s0 * P([v_val, v_val, v_val, v_val, v_val, v_val, v_val, v_val]);
+            }
+        }
+
+        *round_ctr += N_PARTIAL_ROUNDS;
+    }
+
+    /// Batched permutation for 8 states simultaneously.
+    /// Takes 8 × [u64; 12] raw state values and returns 8 permuted states.
+    pub fn permute_batch_8(states: &[[u64; 12]; 8]) -> [[u64; 12]; 8] {
+        // Convert AoS → SoA: 12 × P (each P holds 8 values at same position)
+        let mut packed: [P; 12] = core::array::from_fn(|j| {
+            let vals: [GoldilocksField; 8] = core::array::from_fn(|i| GoldilocksField(states[i][j]));
+            P(vals)
+        });
+
+        let mut round_ctr = 0;
+
+        // First 4 full rounds
+        full_rounds_batch(&mut packed, &mut round_ctr, HALF_N_FULL_ROUNDS);
+
+        // Batched partial rounds
+        partial_rounds_batch(&mut packed, &mut round_ctr);
+
+        // Last 4 full rounds
+        full_rounds_batch(&mut packed, &mut round_ctr, HALF_N_FULL_ROUNDS);
+
+        // Convert SoA → AoS
+        let mut result = [[0u64; 12]; 8];
+        for j in 0..12 {
+            for i in 0..8 {
+                result[i][j] = packed[j].0[i].0;
+            }
+        }
+        result
+    }
+
+    /// Packed permutation: takes state already in SoA form (packed), returns packed result.
+    /// Avoids AoS→SoA→AoS conversion overhead.
+    #[inline]
+    pub fn permute_packed_8(packed: &[P; 12]) -> [P; 12] {
+        let mut packed = *packed;
+        let mut round_ctr = 0;
+
+        // First 4 full rounds
+        full_rounds_batch(&mut packed, &mut round_ctr, HALF_N_FULL_ROUNDS);
+
+        // Batched partial rounds
+        partial_rounds_batch(&mut packed, &mut round_ctr);
+
+        // Last 4 full rounds
+        full_rounds_batch(&mut packed, &mut round_ctr, HALF_N_FULL_ROUNDS);
+
+        packed
+    }
+
+    /// Test entry: batch MDS (circulant part only) for 8 states.
+    /// Returns the raw circulant MDS output for comparison with scalar.
+    #[allow(dead_code)]
+    pub fn mds_circulant_batch_8(states: &[[u64; 12]; 8]) -> [[u64; 12]; 8] {
+        // AoS to SoA
+        let mut packed = [unsafe { _mm512_set1_epi64(0) }; 12];
+        for j in 0..12 {
+            let mut vals = [0u64; 8];
+            for i in 0..8 { vals[i] = states[i][j]; }
+            packed[j] = unsafe { _mm512_loadu_si512(vals.as_ptr() as *const __m512i) };
+        }
+        let result_packed = mds_multiply_freq_packed(&packed);
+        // SoA to AoS
+        let mut result = [[0u64; 12]; 8];
+        for j in 0..12 {
+            let mut vals = [0u64; 8];
+            unsafe { _mm512_storeu_si512(vals.as_mut_ptr() as *mut __m512i, result_packed[j]); }
+            for i in 0..8 { result[i][j] = vals[i]; }
+        }
+        result
+    }
+
+    /// Batched hash_n_to_hash_no_pad for 8 inputs simultaneously.
+    /// All 8 inputs MUST have the same length (required for lock-step processing).
+    /// Returns 8 HashOut values (4 elements each).
+    /// This processes the sponge absorb-permute loop in lock-step,
+    /// keeping the state in packed SoA form between permute calls.
+    #[inline]
+    pub fn hash_batch_8(inputs: [&[u64]; 8]) -> [[u64; 4]; 8] {
+        let len = inputs[0].len();
+        let num_steps = (len + 7) / 8;
+
+        if num_steps == 0 {
+            // Empty inputs: permute zero state once
+            let states = [[0u64; 12]; 8];
+            let result = permute_batch_8(&states);
+            let mut results = [[0u64; 4]; 8];
+            for i in 0..8 {
+                results[i] = [result[i][0], result[i][1], result[i][2], result[i][3]];
+            }
+            return results;
+        }
+
+        // Keep state in packed SoA form throughout the loop
+        let mut packed: [P; 12] = [P::ZEROS; 12];
+
+        for step in 0..num_steps {
+            let start = step * 8;
+            let end = (start + 8).min(len);
+            let chunk_len = end - start;
+
+            // Absorb: overwrite rate positions with input chunk
+            // Directly update the packed state in SoA form
+            // Only overwrite positions 0..chunk_len; leave the rest unchanged
+            // Use direct load from each input slice
+            for j in 0..chunk_len {
+                let idx = start + j;
+                // Load 8 values from inputs[0..8][idx] into a packed register
+                // Safety: idx = start + j where j < chunk_len = min(8, len - start),
+                // so idx < len. All inputs have the same length.
+                let mut vals = [GoldilocksField::ZERO; 8];
+                vals[0] = GoldilocksField(unsafe { *inputs[0].get_unchecked(idx) });
+                vals[1] = GoldilocksField(unsafe { *inputs[1].get_unchecked(idx) });
+                vals[2] = GoldilocksField(unsafe { *inputs[2].get_unchecked(idx) });
+                vals[3] = GoldilocksField(unsafe { *inputs[3].get_unchecked(idx) });
+                vals[4] = GoldilocksField(unsafe { *inputs[4].get_unchecked(idx) });
+                vals[5] = GoldilocksField(unsafe { *inputs[5].get_unchecked(idx) });
+                vals[6] = GoldilocksField(unsafe { *inputs[6].get_unchecked(idx) });
+                vals[7] = GoldilocksField(unsafe { *inputs[7].get_unchecked(idx) });
+                packed[j] = P(vals);
+            }
+
+            // Packed permute: process all 8 states in SoA form
+            packed = permute_packed_8(&packed);
+        }
+
+        // Extract hash output (first 4 elements of each packed state)
+        let mut results = [[0u64; 4]; 8];
+        for j in 0..4 {
+            for i in 0..8 {
+                results[i][j] = packed[j].0[i].0;
+            }
+        }
+        results
+    }
+
+    /// Batched compress for 8 pairs of hashes simultaneously.
+    /// Each pair is (left_hash, right_hash), each 4 u64 elements.
+    /// Returns 8 compressed HashOut values.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn compress_batch_8(
+        left_hashes: &[[u64; 4]; 8],
+        right_hashes: &[[u64; 4]; 8],
+    ) -> [[u64; 4]; 8] {
+        // Build 8 permutation states: state[0..4] = left, state[4..8] = right
+        let mut states: [[u64; 12]; 8] = [[0; 12]; 8];
+        for i in 0..8 {
+            states[i][0] = left_hashes[i][0];
+            states[i][1] = left_hashes[i][1];
+            states[i][2] = left_hashes[i][2];
+            states[i][3] = left_hashes[i][3];
+            states[i][4] = right_hashes[i][0];
+            states[i][5] = right_hashes[i][1];
+            states[i][6] = right_hashes[i][2];
+            states[i][7] = right_hashes[i][3];
+            // state[8..12] = 0 (capacity)
+        }
+
+        // Batched permute
+        states = permute_batch_8(&states);
+
+        // Extract hash output (first 4 elements)
+        let mut results = [[0u64; 4]; 8];
+        for i in 0..8 {
+            results[i] = [states[i][0], states[i][1], states[i][2], states[i][3]];
+        }
+        results
     }
 }
 
@@ -492,5 +1363,254 @@ mod tests {
     #[test]
     fn consistency() {
         check_consistency::<F>();
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[test]
+    fn batched_permute_correctness() {
+        use super::batched_poseidon::permute_batch_8;
+        use super::GoldilocksField;
+        use crate::field::types::Field;
+        use crate::hash::poseidon::Poseidon;
+
+        // Test with 8 different states
+        let test_inputs: [[u64; 12]; 8] = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200],
+            [0xFFFFFFFF00000001, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            [0; 12],
+            [1; 12],
+            [0xFFFFFFFF00000000; 12],
+            [0x8ccbbbea4fe5d2b7, 0xc2af59ee9ec49970, 0x90f7e1a9e658446a, 0xdcc0630a3ab8b1b8,
+             0x7ff8256bca20588c, 0x5d99a7ca0c44ecfb, 0x48452b17a70fbee3, 0xeb09d654690b6c88,
+             0x4a55d3a39c676a88, 0xc0407a38d2285139, 0xa234bac9356386d1, 0xe1633f2bad98a52f],
+            [0x123456789ABCDEF0, 0xFEDCBA9876543210, 0xDEADBEEFCAFEBABE, 0x13579BDF2468ACE0,
+             0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444,
+             0x5555555555555555, 0x6666666666666666, 0x7777777777777777, 0x8888888888888888],
+        ];
+
+        let batch_result = permute_batch_8(&test_inputs);
+
+        // Compare with scalar permutation for each state
+        for i in 0..8 {
+            let state: [GoldilocksField; 12] = core::array::from_fn(|j| GoldilocksField(test_inputs[i][j]));
+            let scalar_result = <GoldilocksField as Poseidon>::poseidon(state);
+
+            for j in 0..12 {
+                assert_eq!(batch_result[i][j], scalar_result[j].0,
+                    "Mismatch at state {} element {}: batch={:016x} scalar={:016x}",
+                    i, j, batch_result[i][j], scalar_result[j].0);
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[test]
+    fn batched_hash_correctness() {
+        use super::batched_poseidon::hash_batch_8;
+        use super::GoldilocksField;
+        use crate::hash::hash_types::{HashOut, RichField};
+        use crate::hash::hashing::hash_n_to_hash_no_pad;
+        use crate::hash::poseidon::{PoseidonHash, PoseidonPermutation};
+        use crate::plonk::config::Hasher;
+
+        // Test with 8 inputs of the same length (required for lock-step batching)
+        let input_8_elems: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let input_16_elems: [u64; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let input_9_elems: [u64; 9] = [100, 200, 300, 400, 500, 600, 700, 800, 900];
+
+        // Test case 1: 8 elements each (1 absorb step)
+        {
+            let inputs: [&[u64]; 8] = [&input_8_elems; 8];
+            let batch_results = hash_batch_8(inputs);
+            let scalar_hash = <PoseidonHash as Hasher<GoldilocksField>>::hash_no_pad(
+                &input_8_elems.map(GoldilocksField)
+            );
+            for i in 0..8 {
+                for j in 0..4 {
+                    assert_eq!(batch_results[i][j], scalar_hash.elements[j].0,
+                        "Mismatch 8-elem input {} element {}: batch={:016x} scalar={:016x}",
+                        i, j, batch_results[i][j], scalar_hash.elements[j].0);
+                }
+            }
+        }
+
+        // Test case 2: 16 elements each (2 absorb steps)
+        {
+            let inputs: [&[u64]; 8] = [&input_16_elems; 8];
+            let batch_results = hash_batch_8(inputs);
+            let scalar_hash = <PoseidonHash as Hasher<GoldilocksField>>::hash_no_pad(
+                &input_16_elems.map(GoldilocksField)
+            );
+            for i in 0..8 {
+                for j in 0..4 {
+                    assert_eq!(batch_results[i][j], scalar_hash.elements[j].0,
+                        "Mismatch 16-elem input {} element {}", i, j);
+                }
+            }
+        }
+
+        // Test case 3: 9 elements each (2 absorb steps, partial second)
+        {
+            let inputs: [&[u64]; 8] = [&input_9_elems; 8];
+            let batch_results = hash_batch_8(inputs);
+            let scalar_hash = <PoseidonHash as Hasher<GoldilocksField>>::hash_no_pad(
+                &input_9_elems.map(GoldilocksField)
+            );
+            for i in 0..8 {
+                for j in 0..4 {
+                    assert_eq!(batch_results[i][j], scalar_hash.elements[j].0,
+                        "Mismatch 9-elem input {} element {}", i, j);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[test]
+    fn batched_compress_correctness() {
+        use super::batched_poseidon::compress_batch_8;
+        use super::GoldilocksField;
+        use crate::hash::hash_types::HashOut;
+        use crate::hash::hashing::compress;
+        use crate::hash::poseidon::PoseidonPermutation;
+
+        // Test with 8 different pairs
+        let left: [[u64; 4]; 8] = [
+            [1, 2, 3, 4],
+            [100, 200, 300, 400],
+            [0xFFFFFFFF00000001, 2, 3, 4],
+            [0; 4],
+            [1; 4],
+            [0xFFFFFFFF00000000; 4],
+            [0x8ccbbbea4fe5d2b7, 0xc2af59ee9ec49970, 0x90f7e1a9e658446a, 0xdcc0630a3ab8b1b8],
+            [0x123456789ABCDEF0, 0xFEDCBA9876543210, 0xDEADBEEFCAFEBABE, 0x13579BDF2468ACE0],
+        ];
+        let right: [[u64; 4]; 8] = [
+            [5, 6, 7, 8],
+            [500, 600, 700, 800],
+            [5, 6, 7, 8],
+            [1; 4],
+            [2; 4],
+            [0x123456789ABCDEF0; 4],
+            [0x7ff8256bca20588c, 0x5d99a7ca0c44ecfb, 0x48452b17a70fbee3, 0xeb09d654690b6c88],
+            [0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444],
+        ];
+
+        let batch_results = compress_batch_8(&left, &right);
+
+        // Compare with scalar compress for each pair
+        for i in 0..8 {
+            let l = HashOut { elements: [GoldilocksField(left[i][0]), GoldilocksField(left[i][1]), GoldilocksField(left[i][2]), GoldilocksField(left[i][3])] };
+            let r = HashOut { elements: [GoldilocksField(right[i][0]), GoldilocksField(right[i][1]), GoldilocksField(right[i][2]), GoldilocksField(right[i][3])] };
+            let scalar_result = compress::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(l, r);
+
+            for j in 0..4 {
+                assert_eq!(batch_results[i][j], scalar_result.elements[j].0,
+                    "Mismatch at pair {} element {}: batch={:016x} scalar={:016x}",
+                    i, j, batch_results[i][j], scalar_result.elements[j].0);
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[test]
+    fn batched_mds_layer_correctness() {
+        use super::batched_poseidon::mds_layer_batch;
+        use super::GoldilocksField;
+        use crate::hash::poseidon::Poseidon;
+        use crate::field::types::Field;
+        use plonky2_field::arch::x86_64::avx512_goldilocks_field::Avx512GoldilocksField as P;
+        use plonky2_field::packed::PackedField;
+
+        // Test with 8 different states
+        let test_inputs: [[u64; 12]; 8] = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200],
+            [0xFFFFFFFF00000001, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            [0; 12],
+            [1; 12],
+            [0xFFFFFFFF00000000; 12],
+            [0x8ccbbbea4fe5d2b7, 0xc2af59ee9ec49970, 0x90f7e1a9e658446a, 0xdcc0630a3ab8b1b8,
+             0x7ff8256bca20588c, 0x5d99a7ca0c44ecfb, 0x48452b17a70fbee3, 0xeb09d654690b6c88,
+             0x4a55d3a39c676a88, 0xc0407a38d2285139, 0xa234bac9356386d1, 0xe1633f2bad98a52f],
+            [0x123456789ABCDEF0, 0xFEDCBA9876543210, 0xDEADBEEFCAFEBABE, 0x13579BDF2468ACE0,
+             0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444,
+             0x5555555555555555, 0x6666666666666666, 0x7777777777777777, 0x8888888888888888],
+        ];
+
+        // Convert to SoA packed format
+        let mut packed = [P::ZEROS; 12];
+        for j in 0..12 {
+            let mut vals = [GoldilocksField::ZERO; 8];
+            for i in 0..8 {
+                vals[i] = GoldilocksField(test_inputs[i][j]);
+            }
+            packed[j] = P(vals);
+        }
+
+        let batch_result = mds_layer_batch(&packed);
+
+        // Compare with scalar MDS for each state
+        for i in 0..8 {
+            let state: [GoldilocksField; 12] = core::array::from_fn(|j| GoldilocksField(test_inputs[i][j]));
+            let scalar_result = GoldilocksField::mds_layer(&state);
+
+            for j in 0..12 {
+                let batch_val = batch_result[j].0[i];
+                assert_eq!(batch_val, scalar_result[j],
+                    "Mismatch at state {} element {}: batch={:?} scalar={:?}",
+                    i, j, batch_val, scalar_result[j]);
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    #[test]
+    fn batched_mds_correctness() {
+        use super::batched_poseidon::mds_circulant_batch_8;
+        use crate::hash::poseidon_goldilocks::poseidon12_mds;
+        use crate::field::types::Field;
+
+        // Test with 8 different states
+        let test_states: [[u64; 12]; 8] = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200],
+            [0xFFFFFFFF00000001, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            [0; 12],
+            [1; 12],
+            [0xFFFFFFFF00000000, 0xFFFFFFFF00000000, 0xFFFFFFFF00000000, 0xFFFFFFFF00000000,
+             0xFFFFFFFF00000000, 0xFFFFFFFF00000000, 0xFFFFFFFF00000000, 0xFFFFFFFF00000000,
+             0xFFFFFFFF00000000, 0xFFFFFFFF00000000, 0xFFFFFFFF00000000, 0xFFFFFFFF00000000],
+            [0x8ccbbbea4fe5d2b7, 0xc2af59ee9ec49970, 0x90f7e1a9e658446a, 0xdcc0630a3ab8b1b8,
+             0x7ff8256bca20588c, 0x5d99a7ca0c44ecfb, 0x48452b17a70fbee3, 0xeb09d654690b6c88,
+             0x4a55d3a39c676a88, 0xc0407a38d2285139, 0xa234bac9356386d1, 0xe1633f2bad98a52f],
+            [0x123456789ABCDEF0, 0xFEDCBA9876543210, 0xDEADBEEFCAFEBABE, 0x13579BDF2468ACE0,
+             0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444,
+             0x5555555555555555, 0x6666666666666666, 0x7777777777777777, 0x8888888888888888],
+        ];
+
+        let batch_result = mds_circulant_batch_8(&test_states);
+
+        for i in 0..8 {
+            // Split into lo/hi and apply scalar mds_multiply_freq to each half
+            let mut lo = [0u64; 12];
+            let mut hi = [0u64; 12];
+            for r in 0..12 {
+                hi[r] = test_states[i][r] >> 32;
+                lo[r] = (test_states[i][r] as u32) as u64;
+            }
+            let scalar_lo = poseidon12_mds::mds_multiply_freq(lo);
+            let scalar_hi = poseidon12_mds::mds_multiply_freq(hi);
+
+            // Combine
+            let mut expected = [0u64; 12];
+            for r in 0..12 {
+                let s = scalar_lo[r] as u128 + ((scalar_hi[r] as u128) << 32);
+                expected[r] = s as u64; // Low 64 bits (the non-canonical form before reduction)
+            }
+
+            assert_eq!(batch_result[i], expected, "Mismatch at state {}", i);
+        }
     }
 }

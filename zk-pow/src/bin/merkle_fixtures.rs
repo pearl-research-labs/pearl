@@ -31,11 +31,7 @@ fn main() {
 
     let mut rng = StdRng::seed_from_u64(0xC1_4E_47_1E);
     let leaves: Vec<Vec<F>> = (0..n)
-        .map(|_| {
-            (0..k)
-                .map(|_| F::from_canonical_u64(rng.next_u64() % F::ORDER))
-                .collect()
-        })
+        .map(|_| (0..k).map(|_| F::from_canonical_u64(rng.next_u64() % F::ORDER)).collect())
         .collect();
 
     let t0 = Instant::now();

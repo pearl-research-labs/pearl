@@ -764,12 +764,10 @@ fn check_constraints<'a, F, C, S, const D: usize>(
 
     // Get the evaluations of a batch of polynomials over our subgroup.
     let get_subgroup_evals = |comm: &PolynomialBatch<F, C, D>| -> Vec<Vec<F>> {
-        let values = comm
-            .polynomials
+        comm.polynomials
             .par_iter()
             .map(|coeffs| coeffs.clone().fft().values)
-            .collect::<Vec<_>>();
-        values
+            .collect::<Vec<_>>()
     };
 
     // Get batch evaluations of all trace columns from the single commitment.

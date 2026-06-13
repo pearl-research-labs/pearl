@@ -25,9 +25,18 @@ pub(crate) fn transpose_poly_values<F: Field>(polys: Vec<PolynomialValues<F>>) -
 
 pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
     let len = matrix[0].len();
+    let width = matrix.len();
     (0..len)
         .into_par_iter()
-        .map(|i| matrix.iter().map(|row| row[i]).collect())
+        .map(|i| {
+            let mut col = Vec::with_capacity(width);
+            unsafe { col.set_len(width); }
+            let dst: *mut T = col.as_mut_ptr();
+            for (j, row) in matrix.iter().enumerate() {
+                unsafe { *dst.add(j) = *row.as_ptr().add(i); }
+            }
+            col
+        })
         .collect()
 }
 

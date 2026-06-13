@@ -126,6 +126,7 @@ pub fn eval_columns_at_point<F: RichField + Extendable<D>, const D: usize>(
     // for all columns locally, then reduce combines the per-thread totals.
     let col_slices: Vec<&[F]> = columns.iter().map(|c| c.values.as_slice()).collect();
 
+    #[cfg(feature = "parallel")]
     let sums: Vec<(F, F)> = (0..n)
         .into_par_iter()
         .fold(
@@ -151,6 +152,17 @@ pub fn eval_columns_at_point<F: RichField + Extendable<D>, const D: usize>(
                 va
             },
         );
+    #[cfg(not(feature = "parallel"))]
+    let sums: Vec<(F, F)> = (0..n).fold(vec![(F::ZERO, F::ZERO); num_cols], |mut acc, i| {
+        let op = omega_pows[i];
+        let base = inv_norms[i] * op; // inv_norm_i * omega^i
+        for (j, col) in col_slices.iter().enumerate() {
+            let q = base * col[i]; // inv_norm_i * y_ij * omega^i
+            acc[j].0 += q;
+            acc[j].1 += q * op; // * omega^i -> omega^{2i} term
+        }
+        acc
+    });
 
     let scale = zn_minus_one * F::Extension::from(n_inv);
 

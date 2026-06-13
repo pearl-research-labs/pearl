@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-pub(crate) mod arch;
+pub mod arch;
 
 pub mod batch_util;
 pub mod cosets;

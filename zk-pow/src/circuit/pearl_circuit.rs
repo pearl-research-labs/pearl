@@ -103,7 +103,7 @@ use plonky2::{
         config::{Blake3GoldilocksConfig, PoseidonGoldilocksConfig},
         proof::CompactProofWithPublicInputs,
     },
-    util::{serialization::Write, timing::TimingTree},
+    util::timing::TimingTree,
 };
 use starky::{
     config::StarkConfig,
@@ -287,6 +287,24 @@ pub fn pearl_prove_recursion_from_stark(
     let stark_config = <PearlRecursion as RecursionCircuit>::stark_config(circuit_params);
     let circuit_1_timer = std::time::Instant::now();
 
+    // [m3-prof2] sub-1s plumbing profiler (timing-only; NO behavior change). Attributes the ~434ms
+    // of `pearl_prove_recursion_from_stark` span that sits OUTSIDE the two GPU prove hooks (the
+    // hooks themselves are covered by `[m3-prof]` rec*.gpu_hook_total in plonky2 prover.rs). Active
+    // whenever the capstone GPU path is requested OR PEARL_M3_PROF is set. Reads env once.
+    let m3_prof2 = std::env::var("PEARL_M3_PROF").is_ok()
+        || std::env::var("PEARL_GPU_REC1").is_ok()
+        || std::env::var("PEARL_GPU_REC2").is_ok();
+    macro_rules! m3p2 {
+        ($t:expr, $label:literal) => {
+            if m3_prof2 {
+                eprintln!("[m3-prof2] {}: {} ms", $label, $t.elapsed().as_secs_f64() * 1e3);
+            }
+        };
+    }
+
+    // (a) Rec#1 cache lookup + witness construction: set_stark_proof_with_pis_target + the layer-1
+    //     PI chain (stark_pis | hpd | zeta | prep_evals@ζ | prep_evals@gζ) + set_target plumbing.
+    let m3p2_w1 = std::time::Instant::now();
     let first_key = CircuitCache::make_first_circuit_key(circuit_params);
     let first_circuit_data = cache
         .prover_circuits_1
@@ -318,8 +336,20 @@ pub fn pearl_prove_recursion_from_stark(
     for (pi_t, pi) in proof_1_pis.iter().zip_eq(proof_1_pi_values.iter()) {
         pw_1.set_target(*pi_t, *pi)?;
     }
+    m3p2!(
+        m3p2_w1,
+        "rec1.witness_build (cache.get + set_stark_proof_with_pis_target + PI set_target)"
+    );
 
     let mut rec1_timing = TimingTree::new("Recursion#1", log::Level::Info);
+    // WS-R4 STAGE 8 CAPSTONE: this is the Rec#1 prove. With `--features gpu_quotient` +
+    // env `PEARL_GPU_REC1`, `prove_maybe_warmup` → `prove_with_partition_witness` REPLACES
+    // the entire Rec#1 prove with the fully-fused on-GPU prover (`gpu::try_gpu_prove_rec1_full`),
+    // returning a complete `ProofWithPublicInputs` that the UNMODIFIED verifier accepts
+    // (CONSENSUS-NEUTRAL). It falls through to the CPU prove if the GPU path is unavailable.
+    // No code change is needed here — the hook lives at the commitment seam in plonky2 prover.rs,
+    // where the 4 live committed oracle trees (needed to rebuild the FRI initial_trees_proof at
+    // the GPU query indices) exist. `proof_1` then recurses into Rec#2 (CPU) below.
     let proof_1 = plonky2::plonk::prover::prove_maybe_warmup::<GoldilocksField, PoseidonGoldilocksConfig, 2>(
         &mut first_circuit_data.circuit.prover_only,
         &first_circuit_data.circuit.common,
@@ -332,6 +362,12 @@ pub fn pearl_prove_recursion_from_stark(
     info!("Recursion Circuit #1 prove time: {:?}", circuit_1_timer.elapsed());
 
     let circuit_2_timer = std::time::Instant::now();
+    // (b) Rec#1→Rec#2 witness construction: cache.get(second/first) + the BIG host span
+    //     pw_2.set_proof_with_pis_target(&proof_1) (copies the full Rec#1 proof into the Rec#2
+    //     partial witness — the host Rec#1→Rec#2 handoff) + the circuit_2 PI chain (proof_1 PIs ++
+    //     first-circuit constants_sigmas_cap ++ circuit_digest) + set_target plumbing. This is the
+    //     core of the "inherent host witness plumbing" that the GPU-resident chain would remove.
+    let m3p2_w2 = std::time::Instant::now();
     let second_key = CircuitCache::make_second_circuit_key(first_circuit_data.circuit.common.clone(), circuit_params);
     let second_circuit_data = cache
         .prover_circuits_2
@@ -339,7 +375,12 @@ pub fn pearl_prove_recursion_from_stark(
         .ok_or_else(|| anyhow::anyhow!("Second prover circuit not found in cache. Params: {:?}", second_key))?;
 
     let mut pw_2 = PartialWitness::new();
+    let m3p2_setp1 = std::time::Instant::now();
     pw_2.set_proof_with_pis_target(&second_circuit_data.proof_1_target, &proof_1)?;
+    m3p2!(
+        m3p2_setp1,
+        "rec2.set_proof_with_pis_target (copy Rec#1 proof -> Rec#2 witness)"
+    );
 
     let first_verifier_data = cache
         .verifier_circuits_1
@@ -350,12 +391,23 @@ pub fn pearl_prove_recursion_from_stark(
     let circuit_2_pi_values: Vec<GoldilocksField> = proof_1_pi_values
         .iter()
         .copied()
-        .chain(first_verifier_data.verifier_only.constants_sigmas_cap.0.iter().flat_map(|h| h.elements))
+        .chain(
+            first_verifier_data
+                .verifier_only
+                .constants_sigmas_cap
+                .0
+                .iter()
+                .flat_map(|h| h.elements),
+        )
         .chain(first_verifier_data.verifier_only.circuit_digest.elements)
         .collect();
     for (pi_t, pi) in proof_2_pis.iter().zip_eq(circuit_2_pi_values.iter()) {
         pw_2.set_target(*pi_t, *pi)?;
     }
+    m3p2!(
+        m3p2_w2,
+        "rec2.witness_build_total (cache.get + set_proof_with_pis_target + PI set_target)"
+    );
 
     let mut rec2_timing = TimingTree::new("Recursion#2", log::Level::Info);
     let proof = plonky2::plonk::prover::prove_maybe_warmup::<GoldilocksField, Blake3GoldilocksConfig, 2>(
@@ -368,9 +420,19 @@ pub fn pearl_prove_recursion_from_stark(
         rec2_timing.filter(std::time::Duration::from_millis(2)).print();
     }
 
+    // (c) cert serialize: Proof -> CompactProofWithPublicInputs -> to_proof_bytes (the 59KB cert).
+    let m3p2_ser = std::time::Instant::now();
     let compact: CompactProofWithPublicInputs<GoldilocksField, Blake3GoldilocksConfig, 2> = proof.into();
     let plonky2_proof = compact.to_proof_bytes();
-    info!("Second recursion prove time: {:?} || proof size: {:?}", circuit_2_timer.elapsed(), plonky2_proof.len());
+    m3p2!(
+        m3p2_ser,
+        "rec2.compact_to_proof_bytes (Proof -> Compact -> 59KB cert serialize)"
+    );
+    info!(
+        "Second recursion prove time: {:?} || proof size: {:?}",
+        circuit_2_timer.elapsed(),
+        plonky2_proof.len()
+    );
 
     Ok(ZKProof::new(
         circuit_params.pow_bits.map(|b| b as u8),
@@ -674,6 +736,11 @@ impl RecursionCircuit for PearlRecursion {
         }
 
         // Compile proof for verifier circuit #1
+        // WS-R4 STAGE 8 CAPSTONE: with `--features gpu_quotient` + env `PEARL_GPU_REC1`, this
+        // Rec#1 `prove_maybe_warmup` is REPLACED by the fully-fused on-GPU prover inside
+        // plonky2's `prove_with_partition_witness` (see the sibling call in
+        // `pearl_prove_recursion_from_stark` for the full rationale); CONSENSUS-NEUTRAL, falls
+        // through to CPU if unavailable.
         let mut rec1_timing = TimingTree::new("Recursion#1", log::Level::Info);
         let proof_1 = plonky2::plonk::prover::prove_maybe_warmup::<Self::F, Self::InnerC, { Self::EXT_D }>(
             &mut first_circuit_data.circuit.prover_only,
@@ -685,17 +752,7 @@ impl RecursionCircuit for PearlRecursion {
             rec1_timing.filter(std::time::Duration::from_millis(2)).print();
         }
 
-        {
-            let mut proof_1_bytes = Vec::new();
-            proof_1_bytes
-                .write_proof(&proof_1.proof, &[])
-                .map_err(|e| anyhow::anyhow!("Failed to serialize proof: {:?}", e))?;
-            info!(
-                "Recursion Circuit #1 prove time: {:?} || proof size: {:?}",
-                circuit_1_timer.elapsed(),
-                proof_1_bytes.len()
-            );
-        }
+        info!("Recursion Circuit #1 prove time: {:?}", circuit_1_timer.elapsed());
 
         // Create witness for the second recursion
         let circuit_2_timer = std::time::Instant::now();

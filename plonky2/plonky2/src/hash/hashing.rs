@@ -100,6 +100,7 @@ pub trait PlonkyPermutation<T: Copy + Default>:
 }
 
 /// A one-way compression function which takes two ~256 bit inputs and returns a ~256 bit output.
+#[inline(always)]
 pub fn compress<F: Field, P: PlonkyPermutation<F>>(x: HashOut<F>, y: HashOut<F>) -> HashOut<F> {
     // TODO: With some refactoring, this function could be implemented as
     // hash_n_to_m_no_pad(chain(x.elements, y.elements), NUM_HASH_OUT_ELTS).
@@ -146,6 +147,19 @@ pub fn hash_n_to_m_no_pad<F: RichField, P: PlonkyPermutation<F>>(
     }
 }
 
+#[inline(always)]
 pub fn hash_n_to_hash_no_pad<F: RichField, P: PlonkyPermutation<F>>(inputs: &[F]) -> HashOut<F> {
-    HashOut::from_vec(hash_n_to_m_no_pad::<F, P>(inputs, NUM_HASH_OUT_ELTS))
+    // Inline the hash to avoid Vec allocation in the squeeze phase.
+    let mut perm = P::new(core::iter::repeat(F::ZERO));
+
+    for input_chunk in inputs.chunks(P::RATE) {
+        perm.set_from_slice(input_chunk, 0);
+        perm.permute();
+    }
+
+    // NUM_HASH_OUT_ELTS (4) <= RATE (8), so one squeeze suffices.
+    let squeeze = perm.squeeze();
+    HashOut {
+        elements: squeeze[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    }
 }

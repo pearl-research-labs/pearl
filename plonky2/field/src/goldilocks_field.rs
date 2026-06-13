@@ -61,7 +61,7 @@ impl Debug for GoldilocksField {
 }
 
 impl Sample for GoldilocksField {
-    #[inline]
+    #[inline(always)]
     fn sample<R>(rng: &mut R) -> Self
     where
         R: rand::RngCore + ?Sized,
@@ -70,7 +70,7 @@ impl Sample for GoldilocksField {
         Self::from_canonical_u64(rng.gen_range(0..Self::ORDER))
     }
 
-    #[inline]
+    #[inline(always)]
     fn rand() -> Self {
         use core::cell::{Cell, RefCell};
         const SZ: usize = 64;
@@ -94,7 +94,7 @@ impl Sample for GoldilocksField {
     }
 
     // Optimized to make only one syscall to OsRng
-    #[inline]
+    #[inline(always)]
     fn rand_vec(n: usize) -> Vec<Self> {
         let mut rng = OsRng;
         let mut bytes = vec![0u8; n * 8];
@@ -211,12 +211,12 @@ impl Field for GoldilocksField {
         reduce128(n)
     }
 
-    #[inline]
+    #[inline(always)]
     fn from_noncanonical_u64(n: u64) -> Self {
         Self(n)
     }
 
-    #[inline]
+    #[inline(always)]
     fn from_noncanonical_i64(n: i64) -> Self {
         Self::from_canonical_u64(if n < 0 {
             // If n < 0, then this is guaranteed to overflow since
@@ -228,7 +228,7 @@ impl Field for GoldilocksField {
         })
     }
 
-    #[inline]
+    #[inline(always)]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
         // u64 + u64 * u64 cannot overflow.
         reduce128((self.0 as u128) + (x.0 as u128) * (y.0 as u128))
@@ -244,14 +244,14 @@ impl PrimeField for GoldilocksField {
 impl Field64 for GoldilocksField {
     const ORDER: u64 = 0xFFFFFFFF00000001;
 
-    #[inline]
+    #[inline(always)]
     unsafe fn add_canonical_u64(&self, rhs: u64) -> Self {
         let (res_wrapped, carry) = self.0.overflowing_add(rhs);
         // Add EPSILON * carry cannot overflow unless rhs is not in canonical form.
         Self(res_wrapped + EPSILON * (carry as u64))
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn sub_canonical_u64(&self, rhs: u64) -> Self {
         let (res_wrapped, borrow) = self.0.overflowing_sub(rhs);
         // Sub EPSILON * carry cannot underflow unless rhs is not in canonical form.
@@ -260,7 +260,7 @@ impl Field64 for GoldilocksField {
 }
 
 impl PrimeField64 for GoldilocksField {
-    #[inline]
+    #[inline(always)]
     fn to_canonical_u64(&self) -> u64 {
         let mut c = self.0;
         // We only need one condition subtraction, since 2 * ORDER would not fit in a u64.
@@ -277,7 +277,7 @@ impl PrimeField64 for GoldilocksField {
 }
 
 impl Square for GoldilocksField {
-    #[inline]
+    #[inline(always)]
     fn square(&self) -> Self {
         *self * *self
     }
@@ -286,7 +286,7 @@ impl Square for GoldilocksField {
 impl Neg for GoldilocksField {
     type Output = Self;
 
-    #[inline]
+    #[inline(always)]
     fn neg(self) -> Self {
         if self.is_zero() {
             Self::ZERO
@@ -299,7 +299,7 @@ impl Neg for GoldilocksField {
 impl Add for GoldilocksField {
     type Output = Self;
 
-    #[inline]
+    #[inline(always)]
     #[allow(clippy::suspicious_arithmetic_impl)]
     fn add(self, rhs: Self) -> Self {
         let (sum, over) = self.0.overflowing_add(rhs.0);
@@ -321,7 +321,7 @@ impl Add for GoldilocksField {
 }
 
 impl AddAssign for GoldilocksField {
-    #[inline]
+    #[inline(always)]
     fn add_assign(&mut self, rhs: Self) {
         *self = *self + rhs;
     }
@@ -336,7 +336,7 @@ impl Sum for GoldilocksField {
 impl Sub for GoldilocksField {
     type Output = Self;
 
-    #[inline]
+    #[inline(always)]
     #[allow(clippy::suspicious_arithmetic_impl)]
     fn sub(self, rhs: Self) -> Self {
         let (diff, under) = self.0.overflowing_sub(rhs.0);
@@ -358,7 +358,7 @@ impl Sub for GoldilocksField {
 }
 
 impl SubAssign for GoldilocksField {
-    #[inline]
+    #[inline(always)]
     fn sub_assign(&mut self, rhs: Self) {
         *self = *self - rhs;
     }
@@ -367,14 +367,14 @@ impl SubAssign for GoldilocksField {
 impl Mul for GoldilocksField {
     type Output = Self;
 
-    #[inline]
+    #[inline(always)]
     fn mul(self, rhs: Self) -> Self {
         reduce128((self.0 as u128) * (rhs.0 as u128))
     }
 }
 
 impl MulAssign for GoldilocksField {
-    #[inline]
+    #[inline(always)]
     fn mul_assign(&mut self, rhs: Self) {
         *self = *self * rhs;
     }
@@ -443,7 +443,7 @@ const unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
 
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the
 /// field order and `2^64`.
-#[inline]
+#[inline(always)]
 fn reduce96((x_lo, x_hi): (u64, u32)) -> GoldilocksField {
     let t1 = x_hi as u64 * EPSILON;
     let t2 = unsafe { add_no_canonicalize_trashing_input(x_lo, t1) };
@@ -452,7 +452,7 @@ fn reduce96((x_lo, x_hi): (u64, u32)) -> GoldilocksField {
 
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the
 /// field order and `2^64`.
-#[inline]
+#[inline(always)]
 fn reduce128(x: u128) -> GoldilocksField {
     let (x_lo, x_hi) = split(x); // This is a no-op
     let x_hi_hi = x_hi >> 32;
@@ -468,7 +468,7 @@ fn reduce128(x: u128) -> GoldilocksField {
     GoldilocksField(t2)
 }
 
-#[inline]
+#[inline(always)]
 const fn split(x: u128) -> (u64, u64) {
     (x as u64, (x >> 64) as u64)
 }

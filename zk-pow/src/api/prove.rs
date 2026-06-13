@@ -16,14 +16,33 @@ use crate::circuit::pearl_layout::pearl_public;
 use crate::circuit::pearl_stark::PearlStark;
 use crate::ffi::plain_proof::{PlainProof, parse_plain_proof};
 
-/// Active Rayon thread count visible to the prove call graph. Exported
-/// so callers (icemining stratum, A4 benchmark) can report it
-/// alongside the prove duration. The thread pool is owned by Rayon's
-/// global, which initialises on first use from either an explicit
-/// `ThreadPoolBuilder` or the `RAYON_NUM_THREADS` env var, falling
-/// back to logical CPU count.
+/// Configured worker count visible to the prove call graph. Exported
+/// so callers (icemining stratum, benchmark harnesses) can report it
+/// alongside the prove duration. Rayon is deliberately not part of the
+/// Pearl public-proof execution model; stage-local workers read
+/// `PEARL_PROVER_THREADS`, falling back to hardware parallelism.
 pub fn current_prove_thread_count() -> usize {
-    plonky2_maybe_rayon::rayon::current_num_threads()
+    std::env::var("PEARL_PROVER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|threads| threads.get()).unwrap_or(1))
+}
+
+fn prove_stage_timing_enabled() -> bool {
+    std::env::var_os("PEARL_PROVE_STAGE_TIMING").is_some()
+}
+
+fn log_prove_stage(enabled: bool, stage: &'static str, started: Instant) {
+    if enabled {
+        let elapsed = started.elapsed();
+        log::info!(
+            "pearl_prove_stage stage={} duration_us={} duration_ms={:.3}",
+            stage,
+            elapsed.as_micros(),
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
 }
 
 pub struct ProveResult {
@@ -46,18 +65,18 @@ pub fn zk_prove_plain_proof(
     // Generate ZK proof
     let mut public = public;
     let started = Instant::now();
-    let rayon_threads = current_prove_thread_count();
+    let prove_workers = current_prove_thread_count();
     let proof = prove_block(&mut public, private, cache)?;
     let elapsed = started.elapsed();
-    // §A4 of icemining/spec/PROOF_SPEEDUP.md: every prove call must
-    // record the active Rayon thread count alongside the wall-clock
-    // duration so dashboards can split prove latency by configured
-    // parallelism. Structured as `key=value` so the icemining
-    // stratum reporter can scrape this line without parsing prose.
+    // Every prove call records the active worker count alongside the
+    // wall-clock duration so dashboards can split prove latency by
+    // configured stage parallelism. Structured as `key=value` so the
+    // icemining stratum reporter can scrape this line without parsing
+    // prose.
     log::info!(
-        "pearl_zk_prove_complete duration_ms={} rayon_threads={}",
+        "pearl_zk_prove_complete duration_ms={} prove_workers={}",
         elapsed.as_millis(),
-        rayon_threads,
+        prove_workers,
     );
 
     let (public_data, proof_data) = proof.serialize(&public);
@@ -70,10 +89,17 @@ pub fn prove_block(
     private_params: PrivateProofParams,
     cache: &mut CircuitCache,
 ) -> Result<ZKProof> {
+    let timing_enabled = prove_stage_timing_enabled();
+    let total_started = Instant::now();
+
+    let stage_started = Instant::now();
     let stark = PearlStark::<GoldilocksField, 2>::new_with_params(public_params);
     let compiled_params = &stark.config.as_ref().unwrap().compiled_public_params;
+    log_prove_stage(timing_enabled, "stark_config", stage_started);
 
+    let stage_started = Instant::now();
     let (trace_rows, stark_pis) = stark.generate_trace(public_params, private_params);
+    log_prove_stage(timing_enabled, "trace_generation", stage_started);
 
     let default_pow_bits = [18, 18, 22];
     // §A5 measured 2026-05-27 on coin-devnet-a (3970X, 8 vCPU): forcing
@@ -95,11 +121,20 @@ pub fn prove_block(
         pow_bits: default_pow_bits.map(|b| b as usize),
         rate_bits: default_rate_bits.map(|b| b as usize),
     };
+
+    let stage_started = Instant::now();
     PearlRecursion::compile_circuits(circuit_params, cache, true)?;
+    log_prove_stage(timing_enabled, "compile_recursion_circuits", stage_started);
 
+    let stage_started = Instant::now();
     let hash_public_data = public_params.public_data_commitment(&circuit_params);
+    log_prove_stage(timing_enabled, "public_data_commitment", stage_started);
 
+    let stage_started = Instant::now();
     let proof = PearlRecursion::prove(circuit_params, cache, (trace_rows, stark_pis, hash_public_data))?;
+    log_prove_stage(timing_enabled, "recursive_certificate", stage_started);
+    log_prove_stage(timing_enabled, "total", total_started);
+
     Ok(proof)
 }
 
@@ -120,9 +155,12 @@ pub fn prove_block_split(
     let (trace_rows, stark_pis) = stark.generate_trace(public_params, private_params);
 
     let default_pow_bits = [18, 18, 22];
-    let default_rate_bits = if compiled_params.degree_bits() >= 15 { [1, 3, 7] } else { [2, 3, 7] };
-    public_params.hash_jackpot =
-        u32_field_array_to_hash(&stark_pis[pearl_public::HASH_JACKPOT_RANGE].try_into().unwrap());
+    let default_rate_bits = if compiled_params.degree_bits() >= 15 {
+        [1, 3, 7]
+    } else {
+        [2, 3, 7]
+    };
+    public_params.hash_jackpot = u32_field_array_to_hash(&stark_pis[pearl_public::HASH_JACKPOT_RANGE].try_into().unwrap());
     let circuit_params = PearlCircuitParams {
         stark_degree_bits: compiled_params.degree_bits(),
         pow_bits: default_pow_bits.map(|b| b as usize),
@@ -133,20 +171,22 @@ pub fn prove_block_split(
 
     // === MINER: STARK#0 only ===
     let t_miner = std::time::Instant::now();
-    let (stark_proof, zeta, stark_pis2, hpd) =
-        pearl_prove_stark(circuit_params, (trace_rows, stark_pis, hash_public_data))?;
+    let (stark_proof, zeta, stark_pis2, hpd) = pearl_prove_stark(circuit_params, (trace_rows, stark_pis, hash_public_data))?;
     let miner = t_miner.elapsed();
 
     // === ship across the wire: serialize the FULL intermediate the pool needs, then
     // RECONSTRUCT it pool-side from the bytes (a true round-trip — proves the wire
     // carries the STARK proof + zeta + public inputs byte-accurately). ===
     let pis_vec: Vec<GoldilocksField> = stark_pis2.to_vec();
-    let ship = bincode::serialize(&(&stark_proof, &zeta, &pis_vec, &hpd))
-        .expect("serialize miner intermediate");
+    let ship = bincode::serialize(&(&stark_proof, &zeta, &pis_vec, &hpd)).expect("serialize miner intermediate");
     let ship_bytes = ship.len();
     type Sp = StarkProofWithPublicInputs<GoldilocksField, PoseidonGoldilocksConfig, 2>;
-    let (sp2, zeta2, pis_vec2, hpd2): (Sp, QuadraticExtension<GoldilocksField>, Vec<GoldilocksField>, HashOut<GoldilocksField>) =
-        bincode::deserialize(&ship).expect("deserialize miner intermediate");
+    let (sp2, zeta2, pis_vec2, hpd2): (
+        Sp,
+        QuadraticExtension<GoldilocksField>,
+        Vec<GoldilocksField>,
+        HashOut<GoldilocksField>,
+    ) = bincode::deserialize(&ship).expect("deserialize miner intermediate");
     // BYTE-ACCURATE wire check: re-serializing the pool-reconstructed intermediate
     // must reproduce the exact shipped bytes (round-trip is byte-identical).
     let reship = bincode::serialize(&(&sp2, &zeta2, &pis_vec2, &hpd2)).expect("reserialize");
@@ -166,10 +206,7 @@ pub fn prove_block_split(
 /// The pool host calls this once per job (it can cache the returned params).
 /// Derives `PearlCircuitParams` from the public params and compiles Rec#1/#2 into
 /// `cache`. After this, `pearl_pool_cert_from_intermediate` is a pure prove.
-pub fn pearl_pool_prepare_circuits(
-    public_params: &PublicProofParams,
-    cache: &mut CircuitCache,
-) -> Result<PearlCircuitParams> {
+pub fn pearl_pool_prepare_circuits(public_params: &PublicProofParams, cache: &mut CircuitCache) -> Result<PearlCircuitParams> {
     let stark = PearlStark::<GoldilocksField, 2>::new_with_params(public_params);
     let degree_bits = stark.config.as_ref().unwrap().compiled_public_params.degree_bits();
     let rate_bits = if degree_bits >= 15 { [1usize, 3, 7] } else { [2, 3, 7] };
@@ -205,13 +242,10 @@ pub fn pearl_pool_cert_from_intermediate(
         QuadraticExtension<GoldilocksField>,
         Vec<GoldilocksField>,
         HashOut<GoldilocksField>,
-    ) = bincode::deserialize(intermediate_bytes)
-        .map_err(|e| anyhow::anyhow!("deserialize STARK#0 intermediate: {e}"))?;
-    let pis_arr: [GoldilocksField; pearl_public::TOTAL] = pis_vec
-        .try_into()
-        .map_err(|v: Vec<GoldilocksField>| {
-            anyhow::anyhow!("shipped public-input length {} != {}", v.len(), pearl_public::TOTAL)
-        })?;
+    ) = bincode::deserialize(intermediate_bytes).map_err(|e| anyhow::anyhow!("deserialize STARK#0 intermediate: {e}"))?;
+    let pis_arr: [GoldilocksField; pearl_public::TOTAL] = pis_vec.try_into().map_err(|v: Vec<GoldilocksField>| {
+        anyhow::anyhow!("shipped public-input length {} != {}", v.len(), pearl_public::TOTAL)
+    })?;
     pearl_prove_recursion_from_stark(circuit_params, cache, sp, zeta, pis_arr, hpd)
 }
 

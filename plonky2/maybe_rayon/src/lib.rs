@@ -19,6 +19,30 @@ use rayon::{
         ChunksMut as ParChunksMut,
     },
 };
+
+#[cfg(not(feature = "parallel"))]
+pub mod rayon {
+    pub mod iter {
+        pub use crate::ParallelIteratorMock as ParallelIterator;
+    }
+
+    pub mod slice {
+        pub use crate::MaybeParChunks as ParallelSlice;
+        pub use crate::MaybeParChunksMut as ParallelSliceMut;
+    }
+
+    pub fn spawn<F>(oper: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        oper();
+    }
+
+    pub fn current_num_threads() -> usize {
+        1
+    }
+}
+
 #[cfg(not(feature = "parallel"))]
 use {
     alloc::vec::Vec,
@@ -240,11 +264,28 @@ pub trait ParallelIteratorMock {
     where
         P: Fn(&Self::Item) -> bool + Sync + Send;
 
+    fn find_map_any<P, R>(self, predicate: P) -> Option<R>
+    where
+        Self: Sized,
+        P: Fn(Self::Item) -> Option<R> + Sync + Send;
+
+    fn for_each_init<INIT, OP, T>(self, init: INIT, op: OP)
+    where
+        Self: Sized,
+        INIT: Fn() -> T + Sync + Send,
+        OP: Fn(&mut T, Self::Item) + Sync + Send;
+
     fn flat_map_iter<U, F>(self, map_op: F) -> FlatMap<Self, U, F>
     where
         Self: Sized,
         U: IntoIterator,
         F: Fn(Self::Item) -> U;
+
+    fn reduce<ID, OP>(self, identity: ID, op: OP) -> Self::Item
+    where
+        Self: Sized,
+        ID: Fn() -> Self::Item + Sync + Send,
+        OP: Fn(Self::Item, Self::Item) -> Self::Item + Sync + Send;
 }
 
 #[cfg(not(feature = "parallel"))]
@@ -258,6 +299,26 @@ impl<T: Iterator> ParallelIteratorMock for T {
         self.find(predicate)
     }
 
+    fn find_map_any<P, R>(mut self, predicate: P) -> Option<R>
+    where
+        Self: Sized,
+        P: Fn(Self::Item) -> Option<R> + Sync + Send,
+    {
+        self.find_map(predicate)
+    }
+
+    fn for_each_init<INIT, OP, U>(self, init: INIT, op: OP)
+    where
+        Self: Sized,
+        INIT: Fn() -> U + Sync + Send,
+        OP: Fn(&mut U, Self::Item) + Sync + Send,
+    {
+        let mut state = init();
+        for item in self {
+            op(&mut state, item);
+        }
+    }
+
     fn flat_map_iter<U, F>(self, map_op: F) -> FlatMap<Self, U, F>
     where
         Self: Sized,
@@ -265,6 +326,15 @@ impl<T: Iterator> ParallelIteratorMock for T {
         F: Fn(Self::Item) -> U,
     {
         self.flat_map(map_op)
+    }
+
+    fn reduce<ID, OP>(self, identity: ID, op: OP) -> Self::Item
+    where
+        Self: Sized,
+        ID: Fn() -> Self::Item + Sync + Send,
+        OP: Fn(Self::Item, Self::Item) -> Self::Item + Sync + Send,
+    {
+        self.fold(identity(), op)
     }
 }
 

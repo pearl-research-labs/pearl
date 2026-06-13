@@ -15,6 +15,7 @@ use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{fft, fft_with_options, ifft, FftRootTable};
 use crate::types::Field;
 
+
 /// A polynomial in point-value form.
 ///
 /// The points are implicitly `g^i`, where `g` generates the subgroup whose size equals the number
@@ -77,7 +78,7 @@ impl<F: Field> PolynomialValues<F> {
     }
 
     pub fn lde(self, rate_bits: usize) -> Self {
-        let coeffs = ifft(self).lde(rate_bits);
+        let coeffs = ifft(self).lde_into(rate_bits);
         fft_with_options(coeffs, Some(rate_bits), None)
     }
 
@@ -200,6 +201,12 @@ impl<F: Field> PolynomialCoeffs<F> {
         self.padded(self.len() << rate_bits)
     }
 
+    /// Like `lde` but takes ownership for in-place resize.
+    pub fn lde_into(mut self, rate_bits: usize) -> Self {
+        self.coeffs.resize(self.coeffs.len() << rate_bits, F::ZERO);
+        self
+    }
+
     pub fn pad(&mut self, new_len: usize) -> Result<()> {
         ensure!(
             new_len >= self.len(),
@@ -276,6 +283,41 @@ impl<F: Field> PolynomialCoeffs<F> {
         self.coset_fft_with_options(shift, None, None)
     }
 
+    /// Like `coset_fft` but takes ownership for in-place modification.
+    pub fn coset_fft_into(self, shift: F) -> PolynomialValues<F> {
+        self.coset_fft_with_options_into(shift, None, None)
+    }
+
+    /// Returns the evaluation of the polynomial on the coset `shift*H`.
+    /// Takes ownership to allow in-place modification, avoiding an extra allocation.
+    pub fn coset_fft_with_options_into(
+        mut self,
+        shift: F,
+        zero_factor: Option<usize>,
+        root_table: Option<&FftRootTable<F>>,
+    ) -> PolynomialValues<F> {
+        // In-place shift-multiply with dual-chain ILP.
+        // Split into even/odd chains to allow the CPU to pipeline
+        // the independent multiply chains in parallel.
+        let shift2 = shift * shift;
+        let mut pe = F::ONE;   // even powers: 1, shift^2, shift^4, ...
+        let mut po = shift;     // odd powers: shift, shift^3, shift^5, ...
+        let coeffs = &mut self.coeffs;
+        let len = coeffs.len();
+        let full_chunks = len & !1; // round down to even
+        for i in (0..full_chunks).step_by(2) {
+            coeffs[i] *= pe;
+            coeffs[i + 1] *= po;
+            pe *= shift2;
+            po *= shift2;
+        }
+        // Handle trailing element if length is odd
+        if len & 1 != 0 {
+            coeffs[len - 1] *= pe;
+        }
+        self.fft_with_options(zero_factor, root_table)
+    }
+
     /// Returns the evaluation of the polynomial on the coset `shift*H`.
     pub fn coset_fft_with_options(
         &self,
@@ -283,13 +325,7 @@ impl<F: Field> PolynomialCoeffs<F> {
         zero_factor: Option<usize>,
         root_table: Option<&FftRootTable<F>>,
     ) -> PolynomialValues<F> {
-        let modified_poly: Self = shift
-            .powers()
-            .zip(&self.coeffs)
-            .map(|(r, &c)| r * c)
-            .collect::<Vec<_>>()
-            .into();
-        modified_poly.fft_with_options(zero_factor, root_table)
+        self.clone().coset_fft_with_options_into(shift, zero_factor, root_table)
     }
 
     pub fn to_extension<const D: usize>(&self) -> PolynomialCoeffs<F::Extension>

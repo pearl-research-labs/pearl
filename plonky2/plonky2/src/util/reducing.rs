@@ -2,8 +2,6 @@
 use alloc::{vec, vec::Vec};
 use core::borrow::Borrow;
 
-use plonky2_maybe_rayon::*;
-
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::PolynomialCoeffs;
@@ -15,6 +13,49 @@ use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
 use crate::plonk::circuit_builder::CircuitBuilder;
+
+fn pearl_worker_count(work_items: usize) -> usize {
+    if work_items <= 1 {
+        return 1;
+    }
+    let requested = std::env::var("PEARL_PROVER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0);
+    let available = requested.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+    });
+    available.clamp(1, work_items)
+}
+
+fn pearl_parallel_map_indices<U, FN>(len: usize, f: FN) -> Vec<U>
+where
+    U: Send,
+    FN: Fn(usize) -> U + Sync,
+{
+    let workers = pearl_worker_count(len);
+    if workers == 1 {
+        return (0..len).map(f).collect();
+    }
+    let chunk_len = len.div_ceil(workers);
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .filter_map(|worker| {
+                let start = worker * chunk_len;
+                let end = ((worker + 1) * chunk_len).min(len);
+                (start < end).then(|| scope.spawn(move || (start..end).map(f).collect::<Vec<U>>()))
+            })
+            .collect::<Vec<_>>();
+        let mut out = Vec::with_capacity(len);
+        for handle in handles {
+            out.extend(handle.join().expect("Pearl reducing worker panicked"));
+        }
+        out
+    })
+}
 
 /// When verifying the composition polynomial in FRI we have to compute sums of the form
 /// `(sum_0^k a^i * x_i)/d_0 + (sum_k^r a^i * y_i)/d_1`
@@ -94,18 +135,13 @@ impl<F: Field> ReducingFactor<F> {
         let num_coeffs = polys.first().map_or(0, |p| p.len());
 
         // result[i] = sum_j (alpha^j * polys[j].coeffs[i])
-        PolynomialCoeffs::new(
-            (0..num_coeffs)
-                .into_par_iter()
-                .map(|i| {
-                    polys
-                        .iter()
-                        .zip(&alpha_powers)
-                        .map(|(p, &alpha_j)| alpha_j.scalar_mul(p.coeffs[i]))
-                        .sum()
-                })
-                .collect(),
-        )
+        PolynomialCoeffs::new(pearl_parallel_map_indices(num_coeffs, |i| {
+            polys
+                .iter()
+                .zip(&alpha_powers)
+                .map(|(p, &alpha_j)| alpha_j.scalar_mul(p.coeffs[i]))
+                .sum()
+        }))
     }
 
     pub fn shift(&mut self, x: F) -> F {
