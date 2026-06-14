@@ -92,6 +92,12 @@ pub struct CZKProof {
     pub proof_blob: *mut u8,
 }
 
+/// Returns the FFI crate version (from Cargo.toml) as a null-terminated C string.
+#[no_mangle]
+pub extern "C" fn zk_pow_ffi_version() -> *const c_char {
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+}
+
 /// Writes an error message into a caller-allocated buffer of ERROR_MSG_MAX_SIZE bytes.
 /// The message is always null-terminated. Truncation respects UTF-8 char boundaries.
 /// # Safety
