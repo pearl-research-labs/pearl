@@ -4,7 +4,10 @@ pub type Hash256 = [u8; 32];
 /// Serialized by miner/node field by field in little endian and with hash bytes reversed.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "IncompleteBlockHeader", get_all, set_all, from_py_object))]
+#[cfg_attr(
+    feature = "pyo3",
+    pyo3::pyclass(name = "IncompleteBlockHeader", get_all, set_all, from_py_object)
+)]
 pub struct IncompleteBlockHeader {
     pub version: u32,         // Version of the blockchain protocol
     pub prev_block: Hash256,  // commitment hash of previous block header
@@ -39,7 +42,10 @@ pub const MINING_CONFIG_RESERVED_SIZE: usize = 32;
 /// rows_pattern and cols_pattern define periodic index patterns that partition
 /// the A rows and B columns respectively.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MiningConfiguration", get_all, set_all, from_py_object))]
+#[cfg_attr(
+    feature = "pyo3",
+    pyo3::pyclass(name = "MiningConfiguration", get_all, set_all, from_py_object)
+)]
 pub struct MiningConfiguration {
     pub common_dim: u32,                             // common dimension of the matmul, k. (4 bytes)
     pub rank: u16,                                   // Denotes length of inner product per inner hash invocation. (2 bytes)
