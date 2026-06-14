@@ -35,28 +35,16 @@ void set_key(const uint8_t d_key[blake3::KEY_SIZE]) {
                                cudaMemcpyDeviceToDevice));
 }
 
-// kNumConsumerThreads: number of consumer threads for merkle_tree_roots_kernel
-// kNumStages: pipeline stages for merkle_tree_roots_kernel
-// kLeavesPerMTBlock: threads for compute_blake_mt_kernel
-// kThreadLoadSize: bytes loaded per TMA operation (defaults to 128)
-template <int kNumConsumerThreads, int kNumStages, int kLeavesPerMTBlock,
-          int kThreadLoadSize = 128>
-void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
-                      const uint8_t key[blake3::KEY_SIZE], uint32_t num_blocks,
-                      uint8_t* roots, cudaDeviceProp& deviceProp,
-                      cudaStream_t stream) {
-  set_key(key);
-  const u32 data_len = data_size;
-
-  using MerkleTreeRootsKernel =
-      pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages,
-                                   kThreadLoadSize>;
+// Launch a specific MerkleTreeRootsKernel instantiation.
+template <typename MerkleTreeRootsKernel>
+void launch_merkle_tree_roots(const uint8_t* data, uint32_t data_len,
+                              uint8_t* roots, cudaStream_t stream) {
   constexpr static int merkle_roots_smem_size =
       MerkleTreeRootsKernel::SharedStorageSize;
   typename MerkleTreeRootsKernel::Arguments args{
       data,
       data_len,
-      reinterpret_cast<uint8_t*>(roots),
+      roots,
   };
   typename MerkleTreeRootsKernel::Params kernel_params =
       MerkleTreeRootsKernel::to_underlying_arguments(args);
@@ -70,6 +58,35 @@ void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
   }
   roots_kernel<<<grid, block, merkle_roots_smem_size, stream>>>(kernel_params);
   gpuErrchk(cudaGetLastError());
+}
+
+// kNumConsumerThreads: number of consumer threads for merkle_tree_roots_kernel
+// kNumStages: pipeline stages for merkle_tree_roots_kernel
+// kLeavesPerMTBlock: threads for compute_blake_mt_kernel
+// kThreadLoadSize: bytes loaded per TMA operation (defaults to 128)
+template <int kNumConsumerThreads, int kNumStages, int kLeavesPerMTBlock,
+          int kThreadLoadSize = 128>
+void tensor_hash_impl(const uint8_t* data, uint32_t data_size, uint8_t* out,
+                      const uint8_t key[blake3::KEY_SIZE], uint32_t num_blocks,
+                      uint8_t* roots, cudaDeviceProp& deviceProp,
+                      cudaStream_t stream) {
+  set_key(key);
+  const u32 data_len = data_size;
+
+  // When the whole input fits in a single block, the roots kernel produces the
+  // final digest and must apply BLAKE3's ROOT flag itself (kApplyRoot=true).
+  // Dispatching on a compile-time flag keeps the common multi-block kernel
+  // identical to the original (no ROOT) code path, so there is no slowdown.
+  if (num_blocks == 1) {
+    launch_merkle_tree_roots<pearl::MerkleTreeRootsKernel<
+        kNumConsumerThreads, kNumStages, kThreadLoadSize, /*kApplyRoot=*/true>>(
+        data, data_len, roots, stream);
+  } else {
+    launch_merkle_tree_roots<
+        pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages,
+                                     kThreadLoadSize, /*kApplyRoot=*/false>>(
+        data, data_len, roots, stream);
+  }
 
   // 4. Compute MT as per BLAKE structure on global
   // We do this in two steps:
@@ -263,6 +280,7 @@ void tensor_hash(
 void commitment_hash_from_merkle_roots(
     const uint8_t* A_merkle_root, const uint8_t* B_merkle_root,
     const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
+    const uint8_t* routing_root, const uint8_t* offsets_hash,
     cudaDeviceProp& deviceProp, cudaStream_t stream) {
 
   using CommitmentHashFromMerkleRootsKernel =
@@ -273,7 +291,9 @@ void commitment_hash_from_merkle_roots(
       static_cast<const uint8_t*>(B_merkle_root),
       static_cast<const uint8_t*>(key),
       static_cast<uint8_t*>(A_commitment_hash),
-      static_cast<uint8_t*>(B_commitment_hash)};
+      static_cast<uint8_t*>(B_commitment_hash),
+      static_cast<const uint8_t*>(routing_root),
+      static_cast<const uint8_t*>(offsets_hash)};
 
   typename CommitmentHashFromMerkleRootsKernel::Params kernel_params =
       CommitmentHashFromMerkleRootsKernel::to_underlying_arguments(args);

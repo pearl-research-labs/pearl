@@ -1741,6 +1741,10 @@ func (state *gbtWorkState) blockTemplateResult(useCoinbaseValue bool, submitOld 
 		NonceRange:   gbtNonceRange,
 		Capabilities: gbtCapabilities,
 	}
+
+	if cert := msgBlock.BlockCertificate(); cert != nil {
+		reply.RequiredCertVersion = uint32(cert.Version())
+	}
 	// SegWit is always active; include the witness commitment in the GBT result.
 	if template.WitnessCommitment != nil {
 		reply.DefaultWitnessCommitment = hex.EncodeToString(template.WitnessCommitment)

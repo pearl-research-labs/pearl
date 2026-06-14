@@ -1,0 +1,389 @@
+from typing import Any
+
+import torch
+import triton.language as tl
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from pearl_gemm import get_host_signal_sync_size
+from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    FusedMoEQuantConfig,
+)
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    invoke_fused_moe_triton_kernel,
+    try_get_optimal_moe_config,
+)
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size,
+)
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceNoOP,
+)
+from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm.platforms import current_platform
+
+from .callbacks import MoEStatusCheckCallback
+from .config import config as pearl_config
+from .mining_state import get_async_manager, get_pinned_pool
+from .moe_gemm_operators import (
+    pearl_moe_expert_gemm,
+    permute_a_side_to_expert_order,
+    prepare_moe_noising,
+)
+from .pearl_moe_method import W13_SMOOTH_SHARED_EXPERT_INDEX
+from .quantization_operators import quant_7bit, quant_7bit_smooth
+
+_GEMM2_TOP_K = 1
+# MoE noise kernels require at least Hopper (matches dense PearlKernel min capability).
+_MIN_COMPUTE_CAPABILITY_MAJOR = 9
+# vLLM sentinel meaning "infer expert count from the weight tensor".
+GLOBAL_NUM_EXPERTS_INFER_FROM_WEIGHTS = -1
+
+_SUPPORTED_ACTIVATIONS = frozenset(
+    {
+        MoEActivation.SILU,
+        MoEActivation.GELU,
+        MoEActivation.SILU_NO_MUL,
+        MoEActivation.GELU_NO_MUL,
+    }
+)
+
+_TORCH_TO_TRITON_DTYPE: dict[torch.dtype, tl.dtype] = {
+    torch.bfloat16: tl.bfloat16,
+    torch.float16: tl.float16,
+    torch.float32: tl.float32,
+}
+
+
+def _torch_dtype_to_triton_compute_type(dtype: torch.dtype) -> tl.dtype:
+    result = _TORCH_TO_TRITON_DTYPE.get(dtype)
+    if result is None:
+        raise ValueError(f"Unsupported activation dtype for MoE compute_type: {dtype}")
+    return result
+
+
+class PearlMoEExperts(mk.FusedMoEExpertsModular):
+    """Pearl MoE experts: per-expert noisy GEMM1 (mining) + vanilla GEMM2."""
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        layer: torch.nn.Module | None = None,
+    ):
+        super().__init__(moe_config, quant_config)
+        self._layer = layer
+
+    @staticmethod
+    def activation_format() -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.Standard
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        if not current_platform.is_cuda_alike():
+            return False
+        return current_platform.get_device_capability()[0] >= _MIN_COMPUTE_CAPABILITY_MAJOR
+
+    @staticmethod
+    def _supports_no_act_and_mul() -> bool:
+        return True
+
+    @staticmethod
+    def _supports_quant_scheme(weight_key: Any, activation_key: Any) -> bool:
+        return (weight_key, activation_key) == (None, None)
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation in _SUPPORTED_ACTIVATIONS
+
+    @staticmethod
+    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        return not (
+            moe_parallel_config.use_fi_nvl_two_sided_kernels
+            or moe_parallel_config.use_fi_nvl_one_sided_kernels
+        )
+
+    def supports_expert_map(self) -> bool:
+        return True
+
+    def workspace_dtype(self, act_dtype: torch.dtype) -> torch.dtype:
+        return act_dtype
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        return TopKWeightAndReduceNoOP()
+
+    def _get_smooth_scale(self, attr: str) -> torch.Tensor | None:
+        if self._layer is None:
+            return None
+        scale = getattr(self._layer, attr, None)
+        if scale is None or scale.numel() == 0:
+            return None
+        return scale
+
+    def _int8_w8a8_triton_kwargs(self) -> dict[str, Any]:
+        return {
+            "use_fp8_w8a8": False,
+            "use_int8_w8a8": True,
+            "use_int8_w8a16": False,
+            "use_int4_w4a16": False,
+            "per_channel_quant": self.per_act_token_quant,
+        }
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        activation_out_dim = self.adjust_N_for_activation(N, activation)
+        workspace1 = (M, topk, max(activation_out_dim, K))
+        workspace2 = (M, topk, max(N, K))
+        output = (M, K)
+        return (workspace1, workspace2, output)
+
+    def _quant_a_7bit(self, hidden_states: torch.Tensor, K: int):
+        """Quantize activations with the shared gate/up smooth scale when present."""
+        w13_smooth = self._get_smooth_scale("w13_smooth_quant_scale")
+        if w13_smooth is not None:
+            smooth = w13_smooth[W13_SMOOTH_SHARED_EXPERT_INDEX, :K]
+            return quant_7bit_smooth(hidden_states, smooth_scale=smooth)
+        return quant_7bit(hidden_states)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        assert hidden_states.is_contiguous()
+        assert hidden_states.dim() == 2
+
+        E, num_tokens, N, K, top_k_num = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
+        if global_num_experts == GLOBAL_NUM_EXPERTS_INFER_FROM_WEIGHTS:
+            global_num_experts = E
+
+        should_mine = (
+            not get_async_manager()._conf.no_mining
+        ) and pearl_config.should_use_noisy_gemm(num_tokens, N, K)
+
+        A_q, A_scales, _ = self._quant_a_7bit(hidden_states, K)
+
+        intermediate_cache1 = _resize_cache(workspace2, (num_tokens, top_k_num, N))
+        cache2_dim = self.adjust_N_for_activation(N, activation)
+        intermediate_cache2 = _resize_cache(workspace13, (num_tokens * top_k_num, cache2_dim))
+        intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+
+        triton_config = try_get_optimal_moe_config(w1.shape, w2.shape, top_k_num, None, num_tokens)
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            triton_config["BLOCK_SIZE_M"],
+            global_num_experts,
+            expert_map,
+        )
+
+        gemm1_compute_type = _torch_dtype_to_triton_compute_type(hidden_states.dtype)
+        if should_mine:
+            self._apply_per_expert_gemm1(
+                A_q=A_q,
+                A_scales=A_scales,
+                intermediate_cache1=intermediate_cache1,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                w1=w1,
+                E=E,
+                N=N,
+                K=K,
+                num_tokens=num_tokens,
+                top_k_num=top_k_num,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        else:
+            # Vanilla int8 grouped GEMM1 (no mining / no denoise).
+            invoke_fused_moe_triton_kernel(
+                A=A_q,
+                B=w1,
+                C=intermediate_cache1,
+                A_scale=A_scales,
+                B_scale=self.w1_scale,
+                topk_weights=topk_weights if apply_router_weight_on_input else None,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                mul_routed_weight=apply_router_weight_on_input,
+                top_k=top_k_num,
+                config=triton_config,
+                compute_type=gemm1_compute_type,
+                **self._int8_w8a8_triton_kwargs(),
+            )
+
+        self.activation(activation, intermediate_cache2, intermediate_cache1.view(-1, N))
+
+        gemm2_input = self._apply_w2_smooth_quant(intermediate_cache2, topk_ids)
+        qintermediate_cache2, a2q_scale, _ = quant_7bit(gemm2_input)
+
+        gemm2_compute_type = _torch_dtype_to_triton_compute_type(hidden_states.dtype)
+        invoke_fused_moe_triton_kernel(
+            qintermediate_cache2,
+            w2,
+            intermediate_cache3,
+            a2q_scale,
+            self.w2_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            _GEMM2_TOP_K,
+            triton_config,
+            compute_type=gemm2_compute_type,
+            **self._int8_w8a8_triton_kwargs(),
+        )
+
+        ops.moe_sum(intermediate_cache3, output)
+
+    def _apply_per_expert_gemm1(
+        self,
+        *,
+        A_q: torch.Tensor,
+        A_scales: torch.Tensor,
+        intermediate_cache1: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        w1: torch.Tensor,
+        E: int,
+        N: int,
+        K: int,
+        num_tokens: int,
+        top_k_num: int,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        """GEMM1: per-expert ``noisy_gemm`` with PoW extraction"""
+        B_stacked = w1.reshape(E * N, K)
+        ctx = prepare_moe_noising(A_q, A_scales, topk_ids, B_stacked, E)
+        layout = ctx.routing_layout
+
+        (
+            A_q_by_expert,
+            A_scales_by_expert,
+            EAL_by_expert,
+            EAL_fp16_by_expert,
+        ) = permute_a_side_to_expert_order(layout, A_q, A_scales, ctx.EAL, ctx.EAL_fp16)
+
+        cache_flat = intermediate_cache1.view(-1, N)
+        out_dtype = cache_flat.dtype
+        num_routed_slots = num_tokens * top_k_num
+        gemm1_output_by_slot = torch.empty((num_routed_slots, N), dtype=out_dtype, device=w1.device)
+        host_signal_sync = torch.zeros(
+            get_host_signal_sync_size(), dtype=torch.int8, device=w1.device
+        )
+
+        submit = not get_async_manager()._conf.skip_block_submission
+        pow_headers = [get_pinned_pool().acquire() for _ in range(E)]
+
+        tile_m = pearl_config.settings.tile_size_m
+        tile_n = pearl_config.settings.tile_size_n
+        tile_k = pearl_config.settings.tile_size_k
+
+        try:
+            for expert_index in range(E):
+                routing_start, expert_slot_count = layout.expert_slice(expert_index)
+                if expert_slot_count == 0:
+                    continue
+                expert_weight_start = expert_index * N
+                expert_weight_end = expert_weight_start + N
+                expert_output = gemm1_output_by_slot[:expert_slot_count]
+
+                pearl_moe_expert_gemm(
+                    A_q_e=A_q_by_expert[routing_start : routing_start + expert_slot_count],
+                    B_e=B_stacked[expert_weight_start:expert_weight_end],
+                    A_scales_e=A_scales_by_expert[
+                        routing_start : routing_start + expert_slot_count
+                    ],
+                    B_scales_e=self.w1_scale[expert_index],
+                    EAL_e=EAL_by_expert[routing_start : routing_start + expert_slot_count],
+                    EAL_fp16_e=EAL_fp16_by_expert[
+                        routing_start : routing_start + expert_slot_count
+                    ],
+                    EBR_e=ctx.EBR[expert_weight_start:expert_weight_end],
+                    EBR_fp16_e=ctx.EBR_fp16[expert_weight_start:expert_weight_end],
+                    EAR_R_major=ctx.EAR_R_major,
+                    EBL_R_major=ctx.EBL_R_major,
+                    EAR_K_major=ctx.EAR_K_major,
+                    EBL_K_major=ctx.EBL_K_major,
+                    C_e=expert_output,
+                    host_signal_header_pinned=pow_headers[expert_index],
+                    host_signal_sync=host_signal_sync,
+                    pow_target=ctx.pow_target,
+                    pow_key=ctx.pow_key,
+                    tile_size_m=tile_m,
+                    tile_size_n=tile_n,
+                    tile_size_k=tile_k,
+                )
+
+                expert_slot_indices = layout.slot_indices[
+                    routing_start : routing_start + expert_slot_count
+                ]
+                if apply_router_weight_on_input:
+                    expert_weights = topk_weights.reshape(-1)[expert_slot_indices]
+                    expert_output = expert_output * expert_weights.unsqueeze(-1)
+                cache_flat[expert_slot_indices] = expert_output
+        except Exception:
+            for header_tensor in pow_headers:
+                get_pinned_pool().release(header_tensor)
+            raise
+
+        if not submit:
+            for header_tensor in pow_headers:
+                get_pinned_pool().release(header_tensor)
+            return
+
+        cuda_event = torch.cuda.Event()
+        cuda_event.record()
+        callback = MoEStatusCheckCallback(
+            pow_headers=pow_headers,
+            commitment_hash_A_tensor=ctx.commitment_hash_A,
+            commitment_hash_B_tensor=ctx.commitment_hash_B,
+            A_q=A_q,
+            B_stacked=B_stacked,
+            routing_data=ctx.routing_data,
+            routing_hash=ctx.routing_hash,
+            mining_job=get_async_manager().get_mining_job(),
+            noise_rank=ctx.noise_rank,
+            num_experts=E,
+            n_per_expert=N,
+            top_k=top_k_num,
+            routing_offsets=layout.routing_offsets_host,
+        )
+        get_async_manager().schedule_status_check(cuda_event, callback)
+
+    def _apply_w2_smooth_quant(
+        self,
+        intermediate: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply per-expert w2 smooth quant scale to the GEMM2 input."""
+        w2_smooth = self._get_smooth_scale("w2_smooth_quant_scale")
+        if w2_smooth is None:
+            return intermediate
+        smooth_per_token = w2_smooth[topk_ids.reshape(-1)]
+        return intermediate * smooth_per_token

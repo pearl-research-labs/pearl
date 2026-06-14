@@ -6,13 +6,14 @@ env:
 
 tasks:
   build:zk-cache:
-    desc: Generate verifier circuit cache (one-time, ~20s)
+    desc: Generate verifier circuit caches (main + v1, one-time)
     run: once
     dir: zk-pow
     status:
-      - test -s src/circuit/cache.bin
+      - test -s src/circuit/v2_cache.bin
+      - test -s src/v1/v1_cache.bin
     cmds:
-      - cargo run --release --no-default-features --bin build_cache src/circuit/cache.bin
+      - cargo run --release --no-default-features --bin build_cache src/circuit/v2_cache.bin src/v1/v1_cache.bin
 
   build:zk-gobind:
     desc: Build the Rust ZK verification library for Go FFI
@@ -78,7 +79,7 @@ tasks:
     cmds:
       - rm -rf bin
       - rm -f xmss/libxmss.a
-      - rm -f zk-pow/src/circuit/cache.bin
+      - rm -f zk-pow/src/circuit/v2_cache.bin zk-pow/src/v1/v1_cache.bin
       - rm -rf pearl-blake3/target py-pearl-mining/target zk-pow/target zk-pow/bindings/go/target
       - find . -name coverage.txt -type f -delete
 

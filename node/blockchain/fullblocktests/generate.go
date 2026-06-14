@@ -552,7 +552,7 @@ func (g *testGenerator) nextBlock(blockName string, spend *testhelper.SpendableO
 
 	// Attach a certificate unless the munger already set one.
 	if block.BlockCertificate() == nil {
-		cert, err := blockchain.SolveBlock(block.BlockHeader(), g.params.Net)
+		cert, err := blockchain.SolveBlock(block.BlockHeader(), g.params, nextHeight)
 		if err != nil {
 			panic(fmt.Sprintf("failed to solve block %q: %v", blockName, err))
 		}
@@ -721,7 +721,7 @@ func (g *testGenerator) padBlockToVsize(b *wire.MsgBlock, targetVsize int) {
 	updateWitnessCommitment(b)
 
 	b.BlockHeader().MerkleRoot = calcMerkleRoot(b.Transactions)
-	cert, _ := blockchain.SolveBlock(b.BlockHeader(), g.params.Net)
+	cert, _ := blockchain.SolveBlock(b.BlockHeader(), g.params, g.tipHeight+1)
 	b.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: cert}
 }
 
@@ -1406,10 +1406,10 @@ func Generate(includeLargeReorg bool) (tests [][]TestInstance, err error) {
 	b46a := g.nextBlock("b46a", outs[14])
 	{
 		origHash := b46a.BlockHash()
-		// Set a ZKCertificate with ProofData exceeding MaxSize
+		// Set a V1 certificate with ProofData exceeding MaxSize
 		oversizedProof := make([]byte, wire.CertificateMaxSize+1)
 		b46a.MsgHeader.MsgCertificate = wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      b46a.BlockHash(),
 				ProofData: oversizedProof,
 			},

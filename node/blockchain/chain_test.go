@@ -469,7 +469,7 @@ func addNodes(t *testing.T, chain *BlockChain, tip *blockNode, numNodes int) []*
 		// Create a certificate for the block.
 		// These are synthetic blocks for testing the chain index, not going through
 		// full validation, so they don't need valid PoW certificates.
-		cert := &wire.ZKCertificate{
+		cert := &wire.CertificateV1{
 			Hash:      header.BlockHash(),
 			ProofData: []byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe},
 		}

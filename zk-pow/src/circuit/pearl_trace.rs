@@ -64,6 +64,7 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
     let secret_strips = MMSlice {
         a: private_params.s_a,
         b: private_params.s_b,
+        routing: private_params.s_routing,
     };
     let aux_data = AuxData {
         external_msgs: private_params.external_msgs,
@@ -190,6 +191,15 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
         public_inputs_builder.dump_u64(u64_pack_le(chunk, 8));
     }
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_B_END);
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // Fill HASH_ROUTING (PUBLIC). Zero-filled for non-MoE proofs.
+    debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_ROUTING);
+    let hash_routing = public_params.moe.as_ref().map(|moe| moe.hash_routing).unwrap_or_default();
+    for chunk in hash_routing.chunks_exact(BYTES_PER_GOLDILOCKS) {
+        public_inputs_builder.dump_u64(u64_pack_le(chunk, 8));
+    }
+    debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_ROUTING_END);
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Fill HASH_JACKPOT (PUBLIC)

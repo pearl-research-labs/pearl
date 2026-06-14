@@ -54,6 +54,17 @@ def init_pinned_pool(pool_size: int = 128) -> None:
         _LOGGER.info(f"Pinned pool initialized, {pool_size=}")
 
 
+def ensure_pinned_pool_at_least(min_size: int) -> None:
+    global _pinned_pool
+
+    if _pinned_pool is None:
+        init_pinned_pool(min_size)
+        return
+    if _pinned_pool._pool_size < min_size:
+        _pinned_pool = HostSignalHeaderPinnedPool(min_size)
+        _LOGGER.info(f"Pinned pool grown to {min_size=}")
+
+
 def delete_state() -> None:
     global _async_manager
     global _pinned_pool

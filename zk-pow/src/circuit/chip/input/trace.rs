@@ -11,7 +11,7 @@ use crate::{
         },
         pearl_layout::{BYTES_PER_GOLDILOCKS, NOISE_PACKING_BASE, pearl_columns},
         pearl_noise::MMSlice,
-        pearl_preprocess::read_dword_from_matrix,
+        pearl_preprocess::{read_dword_from_matrix, read_routing_dword},
         utils::trace_utils::{RowBuilder, field_to_i64, i64_pack_base, i64_unpack_base},
     },
 };
@@ -68,6 +68,12 @@ pub fn fill_row_trace<'a, F, const D: usize>(
     debug_assert_eq!(row_builder.offset, pearl_columns::UINT8_DATA);
     let uint8_data = if let MessageDataType::Matrix { .. } = row_logic.data_source {
         mat_unpack.map(|i8_byte| i8_byte as u8)
+    } else if let MessageDataType::RoutingData {
+        hotspot_idx,
+        idx_in_block,
+    } = row_logic.data_source
+    {
+        read_routing_dword(secret_strips, hotspot_idx, idx_in_block)
     } else if let MessageDataType::AuxiliaryData { aux_type, dword_idx } = row_logic.data_source {
         aux_data.read_dword(aux_type, dword_idx)
     } else {

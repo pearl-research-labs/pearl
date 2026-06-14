@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, Field
 
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
+
 
 class BlockTemplateTx(BaseModel):
     """Regular transaction in getblocktemplate response."""
@@ -41,3 +43,9 @@ class GetBlockTemplateResponse(BaseModel):
     coinbaseaux: CoinbaseAux
     coinbasevalue: int = Field(ge=0)
     default_witness_commitment: str | None = None
+    # Optional for backward compatibility
+    requiredcertversion: int = Field(
+        default=int(CertificateVersion.ZK_DENSE),
+        ge=int(CertificateVersion.ZK_DENSE),
+        le=int(CertificateVersion.ZK_MOE),
+    )

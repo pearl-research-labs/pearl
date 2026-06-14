@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/python.h>
 #include <cstddef>
+#include <optional>
 // Include only the host function declaration
 #include "blake3/blake3_constants.hpp"
 #include "tensor_hash_decl.hpp"
@@ -87,9 +88,7 @@ void run_tensor_hash(
                                            data.numel(), threads_per_block),
               "roots must have at least ", num_blocks, " * ",
               blake3::CHAINING_VALUE_SIZE, "bytes");
-  TORCH_CHECK((size_t)data.numel() > (1u << 17),
-              "data must have more than 2^17 = 131072 bytes, got ",
-              data.numel());
+  TORCH_CHECK(data.numel() > 0, "data must be non-empty");
 
   auto stream = at::cuda::getCurrentCUDAStream();
   auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -104,11 +103,15 @@ void run_tensor_hash(
 
 // Computes both A and B commitment hashes from their merkle roots
 // Should be the same as commitment_hash_from_merkle_roots from Commitment_hash.py
-void run_commitment_hash_from_merkle_roots(at::Tensor& A_merkle_root,
-                                           at::Tensor& B_merkle_root,
-                                           at::Tensor& key,
-                                           at::Tensor& A_commitment_hash,
-                                           at::Tensor& B_commitment_hash) {
+//
+// routing_root and offsets_hash are optional. When both are provided the MoE
+// routing commitment is folded into A's seed (see the kernel); they must be
+// supplied together or not at all (the dense case passes neither).
+void run_commitment_hash_from_merkle_roots(
+    at::Tensor& A_merkle_root, at::Tensor& B_merkle_root, at::Tensor& key,
+    at::Tensor& A_commitment_hash, at::Tensor& B_commitment_hash,
+    std::optional<at::Tensor> routing_root = std::nullopt,
+    std::optional<at::Tensor> offsets_hash = std::nullopt) {
   CHECK_DEVICE(A_merkle_root);
   CHECK_DEVICE(B_merkle_root);
   CHECK_DEVICE(key);
@@ -143,13 +146,40 @@ void run_commitment_hash_from_merkle_roots(at::Tensor& A_merkle_root,
               "B_commitment_hash must have exactly",
               blake3::CHAINING_VALUE_SIZE, "bytes");
 
+  TORCH_CHECK(routing_root.has_value() == offsets_hash.has_value(),
+              "routing_root and offsets_hash must be provided together");
+
+  const uint8_t* routing_root_ptr = nullptr;
+  const uint8_t* offsets_hash_ptr = nullptr;
+  if (routing_root.has_value()) {
+    auto& routing_root_tensor = routing_root.value();
+    auto& offsets_hash_tensor = offsets_hash.value();
+    CHECK_DEVICE(routing_root_tensor);
+    CHECK_DEVICE(offsets_hash_tensor);
+    CHECK_CONTIGUOUS(routing_root_tensor);
+    CHECK_CONTIGUOUS(offsets_hash_tensor);
+    TORCH_CHECK(routing_root_tensor.dtype() == at::kByte,
+                "routing_root must be uint8");
+    TORCH_CHECK(offsets_hash_tensor.dtype() == at::kByte,
+                "offsets_hash must be uint8");
+    TORCH_CHECK(routing_root_tensor.numel() == blake3::CHAINING_VALUE_SIZE,
+                "routing_root must have exactly", blake3::CHAINING_VALUE_SIZE,
+                "bytes");
+    TORCH_CHECK(offsets_hash_tensor.numel() == blake3::CHAINING_VALUE_SIZE,
+                "offsets_hash must have exactly", blake3::CHAINING_VALUE_SIZE,
+                "bytes");
+    routing_root_ptr = routing_root_tensor.data_ptr<uint8_t>();
+    offsets_hash_ptr = offsets_hash_tensor.data_ptr<uint8_t>();
+  }
+
   auto stream = at::cuda::getCurrentCUDAStream();
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
   commitment_hash_from_merkle_roots(
       A_merkle_root.data_ptr<uint8_t>(), B_merkle_root.data_ptr<uint8_t>(),
       key.data_ptr<uint8_t>(), A_commitment_hash.data_ptr<uint8_t>(),
-      B_commitment_hash.data_ptr<uint8_t>(), *dprops, stream);
+      B_commitment_hash.data_ptr<uint8_t>(), routing_root_ptr, offsets_hash_ptr,
+      *dprops, stream);
 }
 
 #undef CHECK_DEVICE

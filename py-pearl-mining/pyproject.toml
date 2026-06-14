@@ -11,7 +11,7 @@ dev = [
 
 [project]
 name = "py-pearl-mining"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.12"
 description = "Unified Python bindings for Pearl mining"
 authors = [

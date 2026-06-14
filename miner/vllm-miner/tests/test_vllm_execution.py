@@ -2,11 +2,10 @@
 """
 Tests for vLLM execution with PearlMiner mining control.
 
-These tests verify that:
-1. vLLM can be initialized with PearlMiner support
+Parametrized over both dense (Llama-8B) and MoE (Qwen3-30B-A3B) models. Verifies that:
+1. vLLM can be initialized with Pearl plugin support
 2. Mining can be controlled (enabled/disabled) globally
 3. The model generates outputs correctly in both mining and non-mining modes
-4. VLLM calls work exactly as in the reference mining example
 """
 
 import asyncio
@@ -16,6 +15,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -24,16 +24,60 @@ from miner_base.settings import MinerSettings
 from vllm import LLM, SamplingParams
 from vllm_miner.mining_state import get_async_manager, init_async_manager
 
-# Test configuration
-TEST_MODEL = "pearl-ai/Llama-3.1-8B-Instruct-pearl"
-TEST_MAX_MODEL_LEN = 2048
-TEST_PROMPT = (
-    "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
-    "You are a helpful assistant.<|eot_id|>"
-    "<|start_header_id|>user<|end_header_id|>\n"
-    "Explain *useful proof of work* simply<|eot_id|>"
-    "<|start_header_id|>assistant<|end_header_id|>\n"
+# ---------------------------------------------------------------------------
+# Model configurations
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelTestConfig:
+    """Inputs and expected initialization marker for one vLLM execution model."""
+
+    id: str
+    model: str
+    prompt: str
+    consistency_prompt: str
+    plugin_log_msg: str
+    max_model_len: int = 2048
+    gpu_memory_utilization: float = 0.9
+
+
+LLAMA_8B = ModelTestConfig(
+    id="llama_8b",
+    model="pearl-ai/Llama-3.1-8B-Instruct-pearl",
+    prompt=(
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+        "You are a French translator. Reply with ONLY the French translation of the user's "
+        "sentence. No preamble, no quotes, no explanation, no follow-up.<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n"
+        "The cat is on the table.<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n"
+    ),
+    consistency_prompt=(
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n"
+        "What is 2+2?<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n"
+    ),
+    plugin_log_msg="Using PearlKernel (mining_enabled=True) for mining layer",
 )
+
+QWEN3_MOE = ModelTestConfig(
+    id="qwen3_moe",
+    model="pearl-ai/Qwen3-30B-A3B-Instruct-2507-pearl",
+    prompt=(
+        "<|im_start|>system\n"
+        "You are a French translator. Reply with ONLY the French translation of the user's "
+        "sentence. No preamble, no quotes, no explanation, no follow-up.<|im_end|>\n"
+        "<|im_start|>user\n"
+        "The cat is on the table.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    ),
+    consistency_prompt="<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n",
+    plugin_log_msg="Using PearlMoEExperts for MoE layer",
+)
+
+MODELS = [LLAMA_8B, QWEN3_MOE]
+_model_param = pytest.mark.parametrize("model_config", MODELS, ids=lambda c: c.id)
 
 # Path to reference outputs for regression testing
 REFERENCE_OUTPUTS_FILE = Path(__file__).parent / "reference_outputs.json"
@@ -44,6 +88,15 @@ REGENERATE_REFERENCES = os.getenv("REGENERATE_VLLM_REFERENCES", "false").lower()
     "1",
     "yes",
 )
+
+# FlashAttention 3 (Hopper warp-specialization) is non-deterministic across NVIDIA
+# driver versions. TRITON_ATTN is bitwise-reproducible.
+_ATTENTION_CONFIG = {"backend": "TRITON_ATTN"}
+
+
+def _reference_key(model_config: ModelTestConfig, suffix: str) -> str:
+    """Key into ``reference_outputs.json`` (Pearl only targets H100, so no GPU-family bucket)."""
+    return f"{model_config.id}_{suffix}"
 
 
 class ReferenceOutputManager:
@@ -124,10 +177,8 @@ def cleanup_llm(llm):
         llm.llm_engine.engine_core.shutdown()
 
 
-def create_llm_instance(tmp_path_factory, no_mining: bool):
-    """
-    Create a new LLM instance with specified mining configuration.
-    """
+def _create_llm_instance(tmp_path_factory, model_config: ModelTestConfig, no_mining: bool):
+    """Create an LLM instance for ``model_config`` with the given mining configuration."""
     # Set environment variables BEFORE creating LLM
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     os.environ["MINER_DEBUG"] = "true"
@@ -137,32 +188,30 @@ def create_llm_instance(tmp_path_factory, no_mining: bool):
     os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
     os.environ["PEARL_LOG_LEVEL"] = "DEBUG"
 
-    cache_key = "no_mining" if no_mining else "with_mining"
-    tmp_dir = tmp_path_factory.mktemp(f"vllm_logs_{cache_key}")
-    log_file = tmp_dir / "vllm_init.log"
-    print(f"Logging to {log_file}")
+    mode_tag = "no_mining" if no_mining else "with_mining"
+    log_dir = tmp_path_factory.mktemp(f"vllm_logs_{model_config.id}_{mode_tag}")
+    log_file = log_dir / "vllm_init.log"
 
-    print(f"\n🚀 Creating LLM instance with MINER_NO_MINING={no_mining}")
+    print(f"\n🚀 Creating LLM instance [{model_config.id}] with MINER_NO_MINING={no_mining}")
     print(f"   Logging to {log_file}")
 
     # Redirect file descriptors at OS level to capture subprocess output
-    old_stdout_fd = os.dup(1)  # Save original stdout
-    old_stderr_fd = os.dup(2)  # Save original stderr
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
 
-    with open(log_file, "w", buffering=1) as log_f:
+    with open(log_file, "w", buffering=1) as log_stream:
         # Redirect both stdout and stderr to the log file at OS level
-        os.dup2(log_f.fileno(), 1)
-        os.dup2(log_f.fileno(), 2)
+        os.dup2(log_stream.fileno(), 1)
+        os.dup2(log_stream.fileno(), 2)
 
         try:
             # the plugin is initialized via vLLM's plugin mechanism, see pyproject.toml
-
-            # Initialize LLM with PearlMiner support
             llm = LLM(
-                model=TEST_MODEL,
-                max_model_len=TEST_MAX_MODEL_LEN,
+                model=model_config.model,
+                max_model_len=model_config.max_model_len,
                 enforce_eager=True,
-                gpu_memory_utilization=0.9,  # We want to allow 2 LLM instances
+                gpu_memory_utilization=model_config.gpu_memory_utilization,
+                attention_config=_ATTENTION_CONFIG,
             )
         finally:
             # Flush and restore original file descriptors
@@ -171,16 +220,20 @@ def create_llm_instance(tmp_path_factory, no_mining: bool):
             os.fsync(1)
             os.fsync(2)
 
-            os.dup2(old_stdout_fd, 1)
-            os.dup2(old_stderr_fd, 2)
-            os.close(old_stdout_fd)
-            os.close(old_stderr_fd)
+            os.dup2(saved_stdout_fd, 1)
+            os.dup2(saved_stderr_fd, 2)
+            os.close(saved_stdout_fd)
+            os.close(saved_stderr_fd)
 
-    # Store metadata as an attribute on the llm object
+    # Store metadata as attributes on the llm object
     llm._init_log_file = str(log_file)
     llm._no_mining = no_mining
+    llm._model_config = model_config
 
-    print("✅ LLM instance created")
+    # A throwaway generate ensures subsequent calls all hit the stable autotuned path.
+    llm.generate(model_config.prompt, SamplingParams(max_tokens=1))
+
+    print(f"✅ LLM instance [{model_config.id}] created")
 
     return llm
 
@@ -195,13 +248,12 @@ def get_llm_instance(tmp_path_factory):
     """
     created_llms = []
 
-    def _get_llm_instance(is_mining_enabled: bool):
-        no_mining = not is_mining_enabled
-        llm = create_llm_instance(tmp_path_factory, no_mining)
+    def _factory(model_config: ModelTestConfig, is_mining_enabled: bool):
+        llm = _create_llm_instance(tmp_path_factory, model_config, no_mining=not is_mining_enabled)
         created_llms.append(llm)
         return llm
 
-    yield _get_llm_instance
+    yield _factory
 
     # Automatic cleanup after test
     for llm in created_llms:
@@ -213,6 +265,7 @@ def get_llm_instance(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def manage_mining_state(pearl_gateway_process):
+    """Reset mining manager state and CUDA cache around each test."""
     manager = get_async_manager()
     previous_state = manager._conf.no_mining
 
@@ -334,106 +387,87 @@ def deterministic_params():
     return SamplingParams(temperature=0.0, max_tokens=100, seed=42)
 
 
-@pytest.mark.parametrize("is_mining_enabled", [True, False])
-def test_pearl_plugin_loaded(get_llm_instance, is_mining_enabled):
-    """
-    Test that the PearlMiner plugin is properly loaded by checking vLLM initialization logs.
+# ---------------------------------------------------------------------------
+# Parametrized tests (run for every model in MODELS)
+# ---------------------------------------------------------------------------
 
-    Expected: "PearlScaledMMLinearKernel for CompressedTensorsW8A8Int8"
-    """
-    llm_instance = get_llm_instance(is_mining_enabled)
-    # Read the initialization log file
-    log_file = llm_instance._init_log_file
-    with open(log_file) as f:
+
+@_model_param
+@pytest.mark.parametrize("is_mining_enabled", [True, False])
+def test_plugin_loaded(model_config, get_llm_instance, is_mining_enabled):
+    """The Pearl plugin's per-layer log message appears during vLLM init."""
+    llm = get_llm_instance(model_config, is_mining_enabled)
+
+    with open(llm._init_log_file) as f:
         log_content = f.read()
 
-    # Check for Pearl kernel (plugin loaded)
-    pearl_kernel_msg = "Using PearlKernel (mining_enabled=True) for mining layer"
-
-    if pearl_kernel_msg not in log_content:
-        # Check if default kernel is being used instead
-        default_kernel_msg = "Using CutlassScaledMMLinearKernel for CompressedTensorsW8A8Int8"
-
-        if default_kernel_msg in log_content:
-            pytest.fail(
-                f"PearlMiner plugin NOT loaded!\nFound: {default_kernel_msg}\nExpected: {pearl_kernel_msg}"
-            )
-        else:
-            pytest.fail(
-                f"Could not find kernel selection message in logs.\nLog file: {log_file} ({len(log_content)} bytes)"
-            )
+    if model_config.plugin_log_msg not in log_content:
+        pytest.fail(
+            f"Expected log message not found: {model_config.plugin_log_msg!r}\n"
+            f"Log file: {llm._init_log_file} ({len(log_content)} bytes)"
+        )
 
 
-def test_vllm_mining_explicitly_enabled(get_llm_instance, deterministic_params, reference_outputs):
-    """Test that model generates correct outputs with mining enabled."""
-    llm = get_llm_instance(is_mining_enabled=True)
-
+@_model_param
+def test_mining_generates_text(
+    model_config, get_llm_instance, deterministic_params, reference_outputs
+):
+    """Mining-enabled path produces correct, non-empty text."""
+    llm = get_llm_instance(model_config, is_mining_enabled=True)
     manager = get_async_manager()
 
-    outputs = llm.generate(TEST_PROMPT, deterministic_params)
-    generated_text = outputs[0].outputs[0].text
+    text = llm.generate(model_config.prompt, deterministic_params)[0].outputs[0].text
 
     # Wait for all blocks to be submitted before assertions
     manager.wait_until_done_submitting_blocks()
 
-    assert len(generated_text) > 0, "Generated text should not be empty"
-    reference_outputs.validate_or_record("test_vllm_mining_explicitly_enabled", generated_text)
+    assert len(text) > 0, "Generated text should not be empty"
+    reference_outputs.validate_or_record(_reference_key(model_config, "mining"), text)
 
 
-def test_vllm_mining_disabled(get_llm_instance, deterministic_params, reference_outputs):
-    """Test that model generates correct outputs with mining disabled."""
-    llm = get_llm_instance(is_mining_enabled=False)
-
-    outputs = llm.generate(TEST_PROMPT, deterministic_params)
-    generated_text = outputs[0].outputs[0].text
-
-    assert len(generated_text) > 0, "Generated text should not be empty"
-    reference_outputs.validate_or_record("test_vllm_mining_disabled", generated_text)
-
-
-def test_vllm_consistency_check(
-    deterministic_params,
-    reference_outputs,
-    get_llm_instance,
+@_model_param
+def test_no_mining_generates_text(
+    model_config, get_llm_instance, deterministic_params, reference_outputs
 ):
-    """Test that both mining modes produce deterministic outputs."""
+    """No-mining path produces correct, non-empty text."""
+    llm = get_llm_instance(model_config, is_mining_enabled=False)
+
+    text = llm.generate(model_config.prompt, deterministic_params)[0].outputs[0].text
+
+    assert len(text) > 0, "Generated text should not be empty"
+    reference_outputs.validate_or_record(_reference_key(model_config, "no_mining"), text)
+
+
+@_model_param
+def test_consistency(model_config, deterministic_params, reference_outputs, get_llm_instance):
+    """Both mining modes produce deterministic output on the same prompt."""
     manager = get_async_manager()
 
-    simple_prompt = (
-        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n"
-        "What is 2+2?<|eot_id|>"
-        "<|start_header_id|>assistant<|end_header_id|>\n"
+    # Phase 1: mining enabled
+    print(f"\n📝 [{model_config.id}] Phase 1: mining ENABLED")
+    llm_on = get_llm_instance(model_config, is_mining_enabled=True)
+    text_on = (
+        llm_on.generate(model_config.consistency_prompt, deterministic_params)[0].outputs[0].text
     )
-
-    # Phase 1: Test with mining enabled
-    print("\n📝 Phase 1: Testing with mining ENABLED")
-    llm_enabled = get_llm_instance(is_mining_enabled=True)
-
-    text_with_mining = llm_enabled.generate(simple_prompt, deterministic_params)[0].outputs[0].text
-
-    # Wait for all blocks to be submitted
     manager.wait_until_done_submitting_blocks()
 
-    assert len(text_with_mining) > 0, "Mining mode should produce output"
+    assert len(text_on) > 0, "Mining mode should produce output"
     reference_outputs.validate_or_record(
-        "test_vllm_consistency_check_with_mining", text_with_mining
+        _reference_key(model_config, "consistency_mining"), text_on
     )
 
-    # Clean up first LLM to free GPU memory before creating the second one
-    cleanup_llm(llm_enabled)
+    # Free the first LLM before creating the second so both fit in GPU memory.
+    cleanup_llm(llm_on)
 
-    # Phase 2: Test with mining disabled
-    print("\n📝 Phase 2: Testing with mining DISABLED")
-    llm_disabled = get_llm_instance(is_mining_enabled=False)
-
-    text_without_mining = (
-        llm_disabled.generate(simple_prompt, deterministic_params)[0].outputs[0].text
+    # Phase 2: mining disabled
+    print(f"\n📝 [{model_config.id}] Phase 2: mining DISABLED")
+    llm_off = get_llm_instance(model_config, is_mining_enabled=False)
+    text_off = (
+        llm_off.generate(model_config.consistency_prompt, deterministic_params)[0].outputs[0].text
     )
-
-    # Wait to ensure no async submissions pending
     manager.wait_until_done_submitting_blocks()
 
-    assert len(text_without_mining) > 0, "Non-mining mode should produce output"
+    assert len(text_off) > 0, "Non-mining mode should produce output"
     reference_outputs.validate_or_record(
-        "test_vllm_consistency_check_without_mining", text_without_mining
+        _reference_key(model_config, "consistency_no_mining"), text_off
     )

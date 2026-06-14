@@ -3,9 +3,11 @@ Test submission service functionality.
 """
 
 import asyncio
+import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.submission_service import SubmissionService
 
 
@@ -145,6 +147,58 @@ class TestBlockSubmission:
         assert len(call_order) == 2
         assert call_order[0].startswith("start_")
         assert call_order[1].startswith("end_")
+
+
+class TestCrossoverEnforcement:
+    """Test certificate-version crossover enforcement at submission time."""
+
+    @pytest.mark.asyncio
+    async def test_moe_proof_before_crossover_rejected(
+        self,
+        submission_service,
+        mock_pearl_client,
+        sample_block_template,
+        dummy_moe_proof,
+    ):
+        """An MoE proof submitted for a V1-required block is rejected clearly."""
+        v1_template = dataclasses.replace(
+            sample_block_template,
+            required_cert_version=CertificateVersion.ZK_DENSE,
+        )
+
+        result = await submission_service.submit_plain_proof(dummy_moe_proof, v1_template)
+
+        assert result["status"].startswith("error:")
+        assert "crossover" in result["status"].lower()
+        # The proof must never reach the node.
+        mock_pearl_client.submit_block.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dense_proof_before_crossover_accepted(
+        self,
+        submission_service,
+        mock_pearl_client,
+        sample_plain_proof,
+        sample_block_template,
+        sample_pearl_block,
+    ):
+        """A dense proof is eligible for a V1-required block."""
+        v1_template = dataclasses.replace(
+            sample_block_template,
+            required_cert_version=CertificateVersion.ZK_DENSE,
+        )
+        mock_pearl_client.submit_block.return_value = "accepted"
+
+        with patch(
+            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            return_value=sample_pearl_block,
+        ) as mock_generate:
+            result = await submission_service.submit_plain_proof(sample_plain_proof, v1_template)
+
+        assert result["status"] == "accepted"
+        # The block must be generated for the V1-required template.
+        passed_template = mock_generate.call_args.args[1]
+        assert passed_template.required_cert_version == CertificateVersion.ZK_DENSE
 
 
 class TestSubmissionServiceIntegration:
