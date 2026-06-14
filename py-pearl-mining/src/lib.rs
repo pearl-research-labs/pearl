@@ -36,7 +36,7 @@ fn py_err(msg: &str, e: impl std::fmt::Display) -> PyErr {
 // ZK Proof (only type defined in the binding crate)
 // ============================================================================
 
-#[pyclass(name = "ZKProof", get_all)]
+#[pyclass(name = "ZKProof", get_all, from_py_object)]
 #[derive(Clone)]
 struct PyProof {
     public_data: Vec<u8>,

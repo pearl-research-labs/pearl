@@ -6,7 +6,7 @@ pub type Hash256 = [u8; 32];
 /// Serialized by miner/node field by field in little endian and with hash bytes reversed.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "IncompleteBlockHeader", get_all, set_all))]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "IncompleteBlockHeader", get_all, set_all, from_py_object))]
 pub struct IncompleteBlockHeader {
     pub version: u32,         // Version of the blockchain protocol
     pub prev_block: Hash256,  // commitment hash of previous block header
@@ -19,7 +19,7 @@ pub struct IncompleteBlockHeader {
 /// Initial blockchain version only support 0 denoting Int7xInt7ToInt32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(eq, eq_int))]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(eq, eq_int, from_py_object))]
 pub enum MMAType {
     Int7xInt7ToInt32 = 0,
 }
@@ -28,7 +28,7 @@ pub enum MMAType {
 /// Shape is a fixed-size array of (stride, length) tuples that define the 3D arithmetic progression.
 /// a * stride[0] + b * stride[1] + c * stride[2] for a < length[0], b < length[1], c < length[2].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "PeriodicPattern"))]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "PeriodicPattern", from_py_object))]
 pub struct PeriodicPattern {
     pub shape: [(u32, u32); 3],
 }
@@ -44,7 +44,7 @@ pub const MINING_CONFIG_RESERVED_SIZE: usize = 32;
 /// fields are committed in the `job_key` because they live inside the serialized
 /// [`MiningConfiguration`] trailer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MoEConfig", get_all, set_all))]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MoEConfig", get_all, set_all, from_py_object))]
 pub struct MoEConfig {
     pub e: u16,     // number of experts
     pub top_k: u16, // number of experts each token is routed to
@@ -59,7 +59,7 @@ pub struct MoEConfig {
 /// `e` doubles as the mode discriminant — `e == 0` is a standard job (`moe == None`),
 /// `e > 0` is GROUPED_GEMM. Both `e` and `top_k` are committed in the `job_key`.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MiningConfiguration", get_all, set_all))]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MiningConfiguration", get_all, set_all, from_py_object))]
 pub struct MiningConfiguration {
     pub common_dim: u32,               // common dimension of the matmul, k. (4 bytes)
     pub rank: u16,                     // Denotes length of inner product per inner hash invocation. (2 bytes)
