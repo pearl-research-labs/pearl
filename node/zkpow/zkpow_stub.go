@@ -20,6 +20,10 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
 }
 
+func VerifyCertificateWithNbits(header *wire.BlockHeader, cert wire.BlockCertificate, nbitsOverride uint32) error {
+	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
+}
+
 func Mine(header *wire.BlockHeader) (*wire.CertificateV2, error) {
 	return nil, fmt.Errorf("zkpow: build with -tags zkpow to enable mining")
 }

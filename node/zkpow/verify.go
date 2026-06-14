@@ -44,6 +44,27 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	}
 }
 
+// VerifyCertificateWithNbits verifies a certificate using nbitsOverride as the
+// difficulty target instead of the block header's nbits field. It mirrors
+// VerifyCertificate and is intended for off-chain pool share validation, where a
+// proof is checked against a lower (share) target than the network target.
+//
+// WARNING: This bypasses the header's embedded difficulty. Never use it in block
+// acceptance or relay paths.
+//
+// Only V2 certificates support an nbits override; V1 has no override-capable
+// verification path and is rejected.
+func VerifyCertificateWithNbits(header *wire.BlockHeader, cert wire.BlockCertificate, nbitsOverride uint32) error {
+	switch c := cert.(type) {
+	case *wire.CertificateV2:
+		return verifyCertificateV2WithOverride(header, c, &nbitsOverride)
+	case *wire.CertificateV1:
+		return fmt.Errorf("nbits override not supported for V1 certificates")
+	default:
+		return fmt.Errorf("unknown certificate type: %T", cert)
+	}
+}
+
 // ================================================================================
 // V1 CERTIFICATE VERIFICATION
 // ================================================================================
@@ -96,6 +117,13 @@ func verifyCertificateV1(header *wire.BlockHeader, c *wire.CertificateV1) error 
 // ================================================================================
 
 func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error {
+	return verifyCertificateV2WithOverride(header, c, nil)
+}
+
+// verifyCertificateV2WithOverride runs the V2 sanity checks and proof verification.
+// When nbitsOverride is non-nil, the difficulty target is taken from it instead of
+// the block header's nbits field (used for pool share-difficulty checks).
+func verifyCertificateV2WithOverride(header *wire.BlockHeader, c *wire.CertificateV2, nbitsOverride *uint32) error {
 	// Guard against directly-constructed structs that bypassed Deserialize.
 	if c.PublicDataLen > wire.PublicDataMaxSizeV2 {
 		return fmt.Errorf("invalid public_data_len %d (max %d)", c.PublicDataLen, wire.PublicDataMaxSizeV2)
@@ -111,7 +139,7 @@ func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error 
 	if e == 0 && topK != 0 {
 		return fmt.Errorf("invalid mining config: e=0 but top_k=%d (must be 0 for non-MoE)", topK)
 	}
-	return verifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
+	return verifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nbitsOverride)
 }
 
 func verifyZKProofFFI(
