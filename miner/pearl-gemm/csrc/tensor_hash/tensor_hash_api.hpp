@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/python.h>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 // Include only the host function declaration
 #include "blake3/blake3_constants.hpp"
@@ -18,6 +19,10 @@
 constexpr size_t DEFAULT_THREADS_PER_BLOCK = 128;    // merkle_tree_roots_kernel
 constexpr size_t DEFAULT_NUM_STAGES = 2;             // merkle_tree_roots_kernel
 constexpr size_t DEFAULT_LEAVES_PER_MT_BLOCK = 512;  // compute_blake_mt_kernel
+
+// merkle_tree_roots_kernel builds a TMA descriptor over `data`;
+// cuTensorMapEncodeTiled requires the global address to be 16-byte aligned.
+constexpr uintptr_t TMA_GLOBAL_ALIGNMENT_BYTES = 16;
 
 size_t get_required_scratchpad_bytes(
     size_t matrix_bytes, size_t threads_per_block = DEFAULT_THREADS_PER_BLOCK) {
@@ -50,6 +55,11 @@ void run_tensor_hash(
   TORCH_CHECK(out.dtype() == at::kByte, "out must be uint8");
   TORCH_CHECK(roots.dtype() == at::kByte, "roots must be uint8");
   TORCH_CHECK(data.dim() == 2, "data must be 2D tensor");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(data.data_ptr()) %
+                      TMA_GLOBAL_ALIGNMENT_BYTES ==
+                  0,
+              "data must be ", TMA_GLOBAL_ALIGNMENT_BYTES,
+              "-byte aligned for TMA");
   TORCH_CHECK(key.numel() == blake3::KEY_SIZE, "key must have exactly",
               blake3::KEY_SIZE, "bytes");
   TORCH_CHECK(out.numel() == blake3::CHAINING_VALUE_SIZE,
