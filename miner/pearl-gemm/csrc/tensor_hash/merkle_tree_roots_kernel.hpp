@@ -259,7 +259,7 @@ class MerkleTreeRootsKernel {
     const u32 num_full_chunks = compute_num_full_chunks(args.data_len);
     // cuTensorMapEncodeTiled requires extents >= 1. When there is no full chunk
     // the producer issues no TMA loads, so the descriptor is never dereferenced.
-    const size_t tma_chunk_rows = num_full_chunks > 0 ? num_full_chunks : 1;
+    const size_t tma_chunk_rows = max(num_full_chunks, 1);
 
     Tensor mA = make_tensor(
         make_gmem_ptr(reinterpret_cast<uint32_t const*>(args.ptr_data)),
@@ -312,10 +312,10 @@ class MerkleTreeRootsKernel {
     // Calculate number of blocks for output tensor
     // Use ceiling division to include partial chunks
     const u32 num_chunks = compute_num_chunks(params.data_len);
+    const u32 num_full_chunks = compute_num_full_chunks(params.data_len);
     const size_t num_grid_blocks =
         (num_chunks + kNumConsumerThreads - 1) / kNumConsumerThreads;
 
-    const u32 num_full_chunks = compute_num_full_chunks(params.data_len);
     const u32 tma_transaction_bytes =
         num_full_chunks > 0 ? TmaTransactionBytesA : 0;
 
