@@ -10,41 +10,19 @@ def double_sha256(data: bytes) -> bytes:
     return sha256(sha256(data).digest()).digest()
 
 
-def is_coinbase(transaction: Transaction) -> bool:
-    """Check if a transaction is a coinbase transaction."""
-    return (
-        hasattr(transaction.inputs[0], "txid")
-        and transaction.inputs[0].txid == "0" * 64
-        and hasattr(transaction.inputs[0], "txout_index")
-        and transaction.inputs[0].txout_index == 0xFFFFFFFF
-    )
-
-
-def calculate_merkle_root(transactions: list[Transaction]) -> bytes:
+def calculate_merkle_root(txids: list[str]) -> bytes:
     """
-    Calculate the merkle root of transactions.
-
-    This function implements the standard merkle tree algorithm:
-    1. Hash all transactions (coinbase first, then regular transactions)
-    2. If odd number of hashes, duplicate the last one
-    3. Pair up hashes and double SHA256 them
-    4. Repeat until only one hash remains (the merkle root)
+    Calculate the merkle root from a list of txid hex strings.
 
     Args:
-        transactions: List of transactions with coinbase first
+        txids: List of txid hex strings in display order (big-endian),
+               with the coinbase txid first.
 
     Returns:
         bytes: The 32-byte merkle root hash
     """
-    # Collect all transaction hashes starting with coinbase
-    tx_hashes = []
-    assert is_coinbase(transactions[0]), "First transaction must be coinbase"
-
-    # Add regular transaction hashes
-    for tx in transactions:
-        # bitcoin-utils get_txid() returns hex string of txid in display order (big-endian)
-        # We need to reverse it to little-endian for merkle tree calculation
-        tx_hashes.append(bytes.fromhex(tx.get_txid())[::-1])
+    # Txids are in display order (big-endian); reverse to little-endian for merkle calc
+    tx_hashes = [bytes.fromhex(txid)[::-1] for txid in txids]
 
     # Calculate merkle root using the standard algorithm
     return _compute_merkle_root(tx_hashes)

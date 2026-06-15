@@ -296,6 +296,12 @@ type GetBlockTemplateResult struct {
 	// Block proposal from BIP 0023.
 	Capabilities []string `json:"capabilities,omitempty"`
 	RejectReason string   `json:"reject-reason,omitempty"`
+
+	// RequiredCertVersion is the block certificate version that a block built
+	// from this template must carry under the MoE hardfork cutover (V1 before
+	// the activation height, V2 at and after it). It is the single source of
+	// truth for miners selecting which proof/certificate to produce.
+	RequiredCertVersion uint32 `json:"requiredcertversion"`
 }
 
 // GetMempoolEntryResult models the data returned from the getmempoolentry's

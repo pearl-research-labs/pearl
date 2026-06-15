@@ -10,8 +10,10 @@ Both kernels handle smooth_quant_scale internally.
 
 from typing import Any, override
 
+import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from miner_utils import get_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -89,6 +91,32 @@ class PearlConfig(CompressedTensorsConfig):
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
+
+    def _moe_quant_args(self) -> tuple[QuantizationArgs | None, QuantizationArgs | None]:
+        for key in ("FusedMoE", "Linear"):
+            scheme_dict = self.target_scheme_map.get(key)
+            if scheme_dict:
+                return scheme_dict.get("weights"), scheme_dict.get("input_activations")
+        return None, None
+
+    @override
+    def get_quant_method(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+    ) -> "QuantizeMethodBase | None":
+        """Route 7-bit FusedMoE layers to the Pearl MoE mining method."""
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        from .pearl_moe_method import PearlMoEMethod
+
+        if isinstance(layer, FusedMoE):
+            weight_quant, input_quant = self._moe_quant_args()
+            if self._is_mining_layer(weight_quant, input_quant):
+                _LOGGER.debug(f"Mining MoE layer (7-bit) detected for {prefix}")
+                return PearlMoEMethod(layer.moe_config)
+
+        return super().get_quant_method(layer, prefix)
 
     @override
     def _get_scheme_from_parts(

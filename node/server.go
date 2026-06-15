@@ -68,7 +68,7 @@ var (
 
 	// userAgentVersion is the user agent version and is used to help
 	// identify ourselves to other peers on the network.
-	userAgentVersion = pearlversion.Version()
+	userAgentVersion = pearlversion.UserAgent()
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.

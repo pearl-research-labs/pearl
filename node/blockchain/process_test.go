@@ -92,7 +92,7 @@ func TestProcessBlock_CheckpointDifficulty(t *testing.T) {
 		blk := &wire.MsgBlock{
 			MsgHeader: wire.MsgHeader{
 				BlockHeader: header,
-				MsgCertificate: wire.MsgCertificate{Certificate: &wire.ZKCertificate{
+				MsgCertificate: wire.MsgCertificate{Certificate: &wire.CertificateV1{
 					Hash:      header.BlockHash(),
 					ProofData: []byte{0xde, 0xad},
 				}},

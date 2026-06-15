@@ -2,6 +2,7 @@ use layout_macro::define_layout;
 
 pub(crate) const BYTES_PER_GOLDILOCKS: usize = 4; // Packing factor of i7/i8/u8 into Goldilocks.
 pub(crate) const BITS_PER_LIMB: usize = 13;
+pub(crate) const BITS_PER_OUTER_INDEX: usize = 2 * BITS_PER_LIMB; // Number of bits in the outer index
 pub(crate) const NOISE_PACKING_BASE: i64 = 129; // Range [-64, 64] has 129 values
 
 define_layout! {
@@ -25,24 +26,26 @@ define_layout! {
         IS_USE_COMMITMENT_HASH: 1, // if true we use COMMITMENT_HASH, otherwise prev row's CV_OUT.
         IS_HASH_A: 1, // whether this row outputs hash A.
         IS_HASH_B: 1, // whether this row outputs hash B.
+        IS_HASH_ROUTING: 1, // whether this row outputs hash of routing.
         IS_HASH_JACKPOT: 1, // whether this row outputs hash of jackpot.
         IS_CV_IN: 1, // Do we even want to load CV_IN?
         IS_NEW_BLAKE: 1, // Is blake3 in current not continuing previous row's blake3? (either IS_LAST_ROUND in previous row, or it did not compute blake3)
         IS_LAST_ROUND: 1, // Is this the 8th (last) round of a blake3 compression?
-        IS_MSG_MAT: 1, // Load UINT8_DATA from matrix (MAT_UNPACK converted to u8)
-        IS_MSG_JACKPOT: 1, // Load BLAKE3_MSG_BUFFER from jackpot slice
-        IS_MSG_AUX_DATA: 1, // Load UINT8_DATA from auxiliary data (msg or cv)
-        IS_MSG_CV: 1, // Load 4 dwords from CV_IN into BLAKE3_MSG_BUFFER
+        IS_MSG_BITS: 3, // 3-bit encoding of the data source loaded into BLAKE3_MSG_BUFFER. See encode_is_msg_bits / decode_is_msg_bits in blake3/logic.rs for the full table.
+        IS_FIRST_OUTER: 1, // set to 1 when, during routing, the first UINT8_DATA u32 limb is an outer index
+        IS_SECOND_OUTER: 1, // set to 1 when, during routing, the second UINT8_DATA u32 limb is an outer index
         IS_LOAD: 1, // load jackpot to BIT_REG and CUMSUM_TILE to CUMSUM_BUFFER?
         IS_XOR: 1, // XOR CUMSUM_BUFFER intermediate to BIT_REG?
         IS_SHIFT3: 1, // shift BIT_REG >>>= 3?
-        IS_STORE0: 1, // store BIT_REG >>> 0 to jackpot?
-        IS_STORE1: 1, // store BIT_REG >>> 1 to jackpot?
-        IS_STORE2: 1, // store BIT_REG >>> 2 to jackpot?
+        STORE_BITS: 2, // 2-bit encoding of store rotation: Store0=1, Store1=2, Store2=3
         IS_DUMP_CUMSUM_BUFFER: 1, // dump CUMSUM_TILE to CUMSUM_BUFFER?
         JACKPOT_IDX: 8, // indicators: is_store[i] for i in 0..16 || is_load[i] for i in 0..16
         MAT_ID_LIMBS: 2, // range check for MAT_ID
         MAT_ID: 1, // Compact matrix index, derived from CONTROL_PREP.
+
+        OUTER_INDICES_PACKED_PREP: 1, // preprocessed column. Holds a tight encoding of `UINT8_DATA`, in case this row is hashing outer indices, as part of the routing Merkle proof.
+        OUTER_INDEX_FIRST: 2, // Unpacking half of OUTER_INDICES_PACKED. Equal to first u32 in UINT8_DATA in case IS_FIRST_OUTER=true.
+        OUTER_INDEX_SECOND: 2, // Unpacking half of OUTER_INDICES_PACKED. Equal to second u32 in UINT8_DATA in case IS_SECOND_OUTER=true.
 
         STARK_ROW_IDX: 1,
 
@@ -77,6 +80,7 @@ define_layout! {
         CUMSUM_BUFFER: 4, // Buffering of CUMSUM_TILE. int32.
         JACKPOT_MSG: 16, // jackpot blake3 message. uint32.
         BIT_REG: 32, // Bitwise representation. Helps xoring 32-bit integers between rows.
+
     }
 }
 
@@ -86,6 +90,7 @@ define_layout! {
         COMMITMENT_HASH: 8, // Commitment hash a.k.a. a_noise_seed
         HASH_A: 8, // Blake3(A, key=JOB_KEY).
         HASH_B: 8, // Blake3(B^t, key=JOB_KEY).
+        HASH_ROUTING: 8, // Blake3(routing, key=JOB_KEY).
         HASH_JACKPOT: 8, // Blake3(JACKPOT_MSG, key=COMMITMENT_HASH).
     }
 }

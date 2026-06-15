@@ -41,13 +41,17 @@ enum class TensorHashBarriers : uint32_t {
 //   kNumConsumerThreads: Number of consumer threads (must be multiple of 128)
 //   kNumStages: Number of pipeline stages (typically 2-4)
 //   kThreadLoadSize: Bytes loaded per TMA operation (64, 128, 256, 512)
+//   kApplyRoot: Whether the kernel applies BLAKE3's ROOT flag itself (set by the
+//               host only when the whole input fits in a single CTA; otherwise
+//               ROOT is applied downstream by ComputeBlakeMTKernel/ReduceRootsKernel).
 //
 // When kNumConsumerThreads > 256, the kernel uses dual pipelines:
 //   - TMA descriptor dimensions are limited to 256, so we split into two groups
 //   - Each group of 256 consumers has its own TMA region and pipeline
 //   - Producer warpgroup issues TMA loads to both regions
 //   - Consumer groups operate independently on their respective pipelines
-template <int kNumConsumerThreads, int kNumStages, int kThreadLoadSize>
+template <int kNumConsumerThreads, int kNumStages, int kThreadLoadSize,
+          bool kApplyRoot>
 class MerkleTreeRootsKernel {
  public:
   using Element = uint8_t;
@@ -231,19 +235,35 @@ class MerkleTreeRootsKernel {
     TMA_A tma_load_A;
   };
 
+  // Total chunks spanned by the input, including a trailing partial chunk
+  // (ceiling). This is the logical chunk domain used for grid shape, leaf
+  // counts, and the last-chunk predicate.
+  CUTLASS_HOST_DEVICE
+  static u32 compute_num_chunks(u32 data_len) {
+    return (data_len + kChunkSize - 1) / kChunkSize;
+  }
+
+  // Chunks fully backed by input bytes (floor). The TMA descriptor covers
+  // exactly these rows; any trailing partial chunk is loaded from gmem instead.
+  CUTLASS_HOST_DEVICE
+  static u32 compute_num_full_chunks(u32 data_len) {
+    return data_len / kChunkSize;
+  }
+
   static Params to_underlying_arguments(Arguments const& args) {
     Params params;
     params.ptr_data = args.ptr_data;
     params.data_len = args.data_len;
     params.ptr_roots = args.ptr_roots;
 
-    // Use ceiling division to include partial chunks in TMA descriptor
-    // TMA will read the full chunk size, and we'll zero-pad OOB data in the kernel
-    const size_t num_chunks = (args.data_len + kChunkSize - 1) / kChunkSize;
+    const u32 num_full_chunks = compute_num_full_chunks(args.data_len);
+    // cuTensorMapEncodeTiled requires extents >= 1. When there is no full chunk
+    // the producer issues no TMA loads, so the descriptor is never dereferenced.
+    const size_t tma_chunk_rows = max(num_full_chunks, 1);
 
     Tensor mA = make_tensor(
         make_gmem_ptr(reinterpret_cast<uint32_t const*>(args.ptr_data)),
-        make_shape(num_chunks, Int<kChunkSize / kWordSize>{}),
+        make_shape(tma_chunk_rows, Int<kChunkSize / kWordSize>{}),
         make_stride(Int<kChunkSize / kWordSize>{}, Int<1>{}));
     params.tma_load_A = make_tma_copy(
         cute::SM90_TMA_LOAD{}, mA, SmemLayoutA_PerGroup{}(_, _, _0{}),
@@ -253,10 +273,7 @@ class MerkleTreeRootsKernel {
   }
 
   static dim3 get_grid_shape(Params const& params) {
-    // Each block processes kNumConsumerThreads chunks
-    // Use ceiling division to include partial chunks
-    const size_t num_chunks =
-        (params.data_len + blake3::CHUNK_SIZE - 1) / blake3::CHUNK_SIZE;
+    const u32 num_chunks = compute_num_chunks(params.data_len);
 
     return dim3((num_chunks + kNumConsumerThreads - 1) / kNumConsumerThreads);
   }
@@ -294,10 +311,20 @@ class MerkleTreeRootsKernel {
 
     // Calculate number of blocks for output tensor
     // Use ceiling division to include partial chunks
-    const size_t num_chunks =
-        (params.data_len + blake3::CHUNK_SIZE - 1) / blake3::CHUNK_SIZE;
+    const u32 num_chunks = compute_num_chunks(params.data_len);
+    const u32 num_full_chunks = compute_num_full_chunks(params.data_len);
     const size_t num_grid_blocks =
         (num_chunks + kNumConsumerThreads - 1) / kNumConsumerThreads;
+
+    const u32 tma_transaction_bytes =
+        num_full_chunks > 0 ? TmaTransactionBytesA : 0;
+
+    // kApplyRoot (compile-time) is set by the host only when this is the single
+    // CTA of the whole input, so the kernel must apply BLAKE3's ROOT
+    // finalization (otherwise ROOT is applied later by ComputeBlakeMTKernel /
+    // ReduceRootsKernel). When the entire message is a single chunk, BLAKE3 sets
+    // ROOT on that chunk's last block (no Merkle parent compression happens).
+    const bool is_single_chunk = (num_chunks == 1);
 
     // Output tensor - use stride (1, CHAINING_VALUE_SIZE_U32) for coalesced writes
     // Each block writes 8 consecutive uint32_t values, blocks are spaced 8 words apart
@@ -329,7 +356,7 @@ class MerkleTreeRootsKernel {
       // For producers: participate in both pipelines
       // For consumers: participate only in their group's pipeline
       typename Pipeline::Params pipeline_params_0;
-      pipeline_params_0.transaction_bytes = TmaTransactionBytesA;
+      pipeline_params_0.transaction_bytes = tma_transaction_bytes;
       pipeline_params_0.role =
           is_producer_warpgroup
               ? Pipeline::ThreadCategory::Producer
@@ -344,7 +371,7 @@ class MerkleTreeRootsKernel {
       pipeline_params_0.num_consumers = kConsumersPerGroup;
 
       typename Pipeline::Params pipeline_params_1;
-      pipeline_params_1.transaction_bytes = TmaTransactionBytesA;
+      pipeline_params_1.transaction_bytes = tma_transaction_bytes;
       pipeline_params_1.role =
           is_producer_warpgroup
               ? Pipeline::ThreadCategory::Producer
@@ -386,18 +413,28 @@ class MerkleTreeRootsKernel {
                          smem_pipe_write_1);
         }
       } else if (consumer_group == 0) {
-        consumer_loop_dual(params, pipeline_0, sA_0, sLeaves, tid_in_group,
-                           consumer_tid, 0);
+        if (is_single_chunk) {
+          consumer_loop_dual<kApplyRoot>(params, pipeline_0, sA_0, sLeaves,
+                                         tid_in_group, consumer_tid, 0);
+        } else {
+          consumer_loop_dual<false>(params, pipeline_0, sA_0, sLeaves,
+                                    tid_in_group, consumer_tid, 0);
+        }
       } else {
-        consumer_loop_dual(params, pipeline_1, sA_1, sLeaves, tid_in_group,
-                           consumer_tid, 1);
+        if (is_single_chunk) {
+          consumer_loop_dual<kApplyRoot>(params, pipeline_1, sA_1, sLeaves,
+                                         tid_in_group, consumer_tid, 1);
+        } else {
+          consumer_loop_dual<false>(params, pipeline_1, sA_1, sLeaves,
+                                    tid_in_group, consumer_tid, 1);
+        }
       }
     } else /* !kUseDualPipelines */ {
       // ============ SINGLE PIPELINE MODE (up to 256 consumers) ============
       // Initialize pipeline with warpgroup-specialized roles
       // ONE leader per warpgroup (thread 0 of each warpgroup)
       typename Pipeline::Params pipeline_params;
-      pipeline_params.transaction_bytes = TmaTransactionBytesA;
+      pipeline_params.transaction_bytes = tma_transaction_bytes;
       pipeline_params.role = is_producer_warpgroup
                                  ? Pipeline::ThreadCategory::Producer
                                  : Pipeline::ThreadCategory::Consumer;
@@ -435,7 +472,12 @@ class MerkleTreeRootsKernel {
         // ============ CONSUMER WARPGROUPS (128 threads each) ============
         // Consumer thread index (0 to kNumConsumerThreads-1)
         const int consumer_tid = tid - kNumProducerThreads;
-        consumer_loop(params, pipeline, sA, sLeaves, consumer_tid);
+        if (is_single_chunk) {
+          consumer_loop<kApplyRoot>(params, pipeline, sA, sLeaves,
+                                    consumer_tid);
+        } else {
+          consumer_loop<false>(params, pipeline, sA, sLeaves, consumer_tid);
+        }
         // Note: consumer_loop syncs all consumer warpgroups after each pipeline stage
       }
     }
@@ -447,29 +489,18 @@ class MerkleTreeRootsKernel {
     const size_t bid = blockIdx.x;
     const bool is_last_block = (bid == num_grid_blocks - 1);
 
-    // Determine actual number of leaves in this block
-    const u32 num_leaves = [is_last_block, num_chunks, &params]() -> u32 {
+    // Determine actual number of leaves in this block.
+    // The Python reference zero-pads any non-empty trailing data up to a full
+    // 1024-byte chunk, so every chunk counted by the ceiling division (including
+    // a partial last chunk of any size, even < 64 bytes) contributes one leaf.
+    const u32 num_leaves = [is_last_block, num_chunks]() -> u32 {
       if (!is_last_block) {
         return static_cast<u32>(kNumConsumerThreads);
       }
-
-      // For the last block, calculate actual chunks in this block
       // num_chunks already includes partial chunks (ceiling division)
       const u32 chunks_in_this_block = num_chunks % kNumConsumerThreads;
-      const u32 actual_chunks_in_block =
-          (chunks_in_this_block == 0) ? static_cast<u32>(kNumConsumerThreads)
-                                      : chunks_in_this_block;
-
-      // Check if the very last chunk is too small (< 64 bytes)
-      // If so, it shouldn't contribute a leaf to the merkle tree
-      const u32 remainder_bytes = params.data_len % blake3::CHUNK_SIZE;
-      const bool last_chunk_too_small =
-          (remainder_bytes > 0) && (remainder_bytes < blake3::MSG_BLOCK_SIZE);
-
-      // If the last chunk is too small, exclude it from the leaf count
-      return last_chunk_too_small
-                 ? (actual_chunks_in_block > 0 ? actual_chunks_in_block - 1 : 0)
-                 : actual_chunks_in_block;
+      return (chunks_in_this_block == 0) ? static_cast<u32>(kNumConsumerThreads)
+                                         : chunks_in_this_block;
     }();
 
     // Reduce into a Merkle Tree (all threads participate for __syncthreads)
@@ -478,15 +509,13 @@ class MerkleTreeRootsKernel {
       // Non-last blocks always have power-of-2 leaves (kNumConsumerThreads is power of 2)
       merkle_tree_utils::compute_perfect_mt<false>(sLeaves,
                                                    kNumConsumerThreads);
+    } else if ((num_leaves & (num_leaves - 1)) == 0) {
+      // Last block, power of 2: use perfect merkle tree.
+      // If this is the only block, the final parent compression must apply ROOT.
+      merkle_tree_utils::compute_perfect_mt<kApplyRoot>(sLeaves, num_leaves);
     } else {
-      // Last block: check if num_leaves is a power of 2
-      if ((num_leaves & (num_leaves - 1)) == 0) {
-        // Power of 2: use perfect merkle tree
-        merkle_tree_utils::compute_perfect_mt<false>(sLeaves, num_leaves);
-      } else {
-        // Not a power of 2: use BLAKE3's merkle tree structure
-        merkle_tree_utils::compute_blake_mt<false>(sLeaves, num_leaves);
-      }
+      // Last block, not a power of 2: use BLAKE3's merkle tree structure.
+      merkle_tree_utils::compute_blake_mt<kApplyRoot>(sLeaves, num_leaves);
     }
 
     // Copy the root to the output (use first 8 threads)
@@ -501,9 +530,8 @@ class MerkleTreeRootsKernel {
                                     SharedStorage& shared_storage,
                                     PipelineState& smem_pipe_write) {
     const int bid = blockIdx.x;
-    // Use ceiling division to match TMA descriptor (includes partial chunks)
-    const int num_chunks =
-        (params.data_len + blake3::CHUNK_SIZE - 1) / blake3::CHUNK_SIZE;
+    const u32 num_chunks = compute_num_chunks(params.data_len);
+    const u32 num_full_chunks = compute_num_full_chunks(params.data_len);
 
     // View of our CTA's tile of A
     Tensor mA = params.tma_load_A.get_tma_tensor(
@@ -527,15 +555,20 @@ class MerkleTreeRootsKernel {
       for (int load_idx = 0; load_idx < kNumLoads; ++load_idx) {
         pipeline.producer_acquire(smem_pipe_write);
 
-        PipelineBarrierType* tma_barrier =
-            pipeline.producer_get_barrier(smem_pipe_write);
-        auto stage = smem_pipe_write.index();
+        // With no full chunk the descriptor covers no backed memory; skip the
+        // copy entirely (the barrier expects 0 transaction bytes in that case
+        // and completes on the producer's arrival alone).
+        if (num_full_chunks > 0) {
+          PipelineBarrierType* tma_barrier =
+              pipeline.producer_get_barrier(smem_pipe_write);
+          auto stage = smem_pipe_write.index();
 
-        // Issue TMA copy with barrier
-        copy(params.tma_load_A.with(*tma_barrier, 0 /*mcast_mask*/),
-             tAgA(_, load_idx), tAsA(_, stage));
+          // Issue TMA copy with barrier
+          copy(params.tma_load_A.with(*tma_barrier, 0 /*mcast_mask*/),
+               tAgA(_, load_idx), tAsA(_, stage));
 
-        pipeline.producer_commit(smem_pipe_write, TmaTransactionBytesA);
+          pipeline.producer_commit(smem_pipe_write, TmaTransactionBytesA);
+        }
         ++smem_pipe_write;
       }
     }
@@ -554,50 +587,38 @@ class MerkleTreeRootsKernel {
     }
   }
 
-  // ==================== ZERO-PADDING HELPER ====================
+  // ==================== PARTIAL-CHUNK LOAD HELPER ====================
 
-  /// Zero-pad partial chunks in shared memory (per-load iteration)
-  /// Each TMA load brings in kThreadLoadSize bytes into one stage
-  /// We need to zero the out-of-bounds parts within that loaded data
+  /// Load one slice of the trailing partial chunk straight from global memory
+  /// into shared memory, zero-filling past the end of the data. At most one
+  /// chunk (1 KiB) per hash is read this way.
   template <class SmemTensorA>
-  CUTLASS_DEVICE void zero_pad_partial_chunk_load(SmemTensorA& sA,
-                                                  int consumer_tid, int stage,
-                                                  int load_idx,
-                                                  u32 last_chunk_len) {
-    // This load brought in bytes [load_start_byte, load_start_byte + kThreadLoadSize)
-    // from the chunk into sA(consumer_tid, 0..kNumWordsPerLoad-1, stage)
+  CUTLASS_DEVICE void load_partial_chunk(Params const& params, SmemTensorA& sA,
+                                         int smem_row, int stage, int load_idx,
+                                         u32 last_chunk_len) {
+    // The partial chunk starts right after the last full chunk.
+    const u32 chunk_start_byte = (params.data_len / kChunkSize) * kChunkSize;
+    // This load covers bytes [load_start_byte, load_start_byte + kThreadLoadSize)
+    // of the chunk, i.e. sA(smem_row, 0..kNumWordsPerLoad-1, stage).
     const u32 load_start_byte = load_idx * kThreadLoadSize;
+    const Element* chunk_ptr = params.ptr_data + chunk_start_byte;
 
-    // If this entire load is beyond valid data, zero everything
-    if (load_start_byte >= last_chunk_len) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int w = 0; w < kNumWordsPerLoad; ++w) {
-        sA(consumer_tid, w, stage) = 0;
-      }
-      return;
-    }
-
-    // Some or all of this load contains valid data
-    // Process each word in the load
     CUTLASS_PRAGMA_UNROLL
     for (int w = 0; w < kNumWordsPerLoad; ++w) {
       const u32 word_start_byte = load_start_byte + w * sizeof(uint32_t);
-      const u32 word_end_byte = word_start_byte + sizeof(uint32_t);
-
-      if (word_start_byte >= last_chunk_len) {
-        // Entire word is OOB - zero it
-        sA(consumer_tid, w, stage) = 0;
-      } else if (word_end_byte > last_chunk_len) {
-        // Partial word - some bytes valid, some OOB
-        const u32 valid_bytes = last_chunk_len - word_start_byte;
-        // Mask: valid_bytes=1 -> 0xFF, =2 -> 0xFFFF, =3 -> 0xFFFFFF
-        const u32 mask = (1u << (valid_bytes * 8)) - 1;
-
-        // Read, mask, write back
-        uint32_t val = sA(consumer_tid, w, stage);
-        sA(consumer_tid, w, stage) = val & mask;
+      u32 word = 0;
+      if (word_start_byte < last_chunk_len) {
+        const u32 remaining = last_chunk_len - word_start_byte;
+        const Element* src = chunk_ptr + word_start_byte;
+        if (remaining >= sizeof(uint32_t)) {
+          word = *reinterpret_cast<const uint32_t*>(src);
+        } else {
+          for (u32 b = 0; b < remaining; ++b) {
+            word |= u32(src[b]) << (8 * b);
+          }
+        }
       }
-      // else: word is fully valid, no action needed
+      sA(smem_row, w, stage) = word;
     }
   }
 
@@ -609,9 +630,8 @@ class MerkleTreeRootsKernel {
       SmemTensorA_0& sA_0, SmemTensorA_1& sA_1, SharedStorage& shared_storage,
       PipelineState& smem_pipe_write_0, PipelineState& smem_pipe_write_1) {
     const int bid = blockIdx.x;
-    // Use ceiling division to match TMA descriptor (includes partial chunks)
-    const int num_chunks =
-        (params.data_len + blake3::CHUNK_SIZE - 1) / blake3::CHUNK_SIZE;
+    const u32 num_chunks = compute_num_chunks(params.data_len);
+    const u32 num_full_chunks = compute_num_full_chunks(params.data_len);
 
     // View of our CTA's tile of A (global memory)
     Tensor mA = params.tma_load_A.get_tma_tensor(
@@ -646,25 +666,29 @@ class MerkleTreeRootsKernel {
         pipeline_0.producer_acquire(smem_pipe_write_0);
         pipeline_1.producer_acquire(smem_pipe_write_1);
 
-        // Get barriers for both pipelines
-        PipelineBarrierType* tma_barrier_0 =
-            pipeline_0.producer_get_barrier(smem_pipe_write_0);
-        PipelineBarrierType* tma_barrier_1 =
-            pipeline_1.producer_get_barrier(smem_pipe_write_1);
-        auto stage_0 = smem_pipe_write_0.index();
-        auto stage_1 = smem_pipe_write_1.index();
+        // With no full chunk the descriptor covers no backed memory; skip the
+        // copies entirely.
+        if (num_full_chunks > 0) {
+          // Get barriers for both pipelines
+          PipelineBarrierType* tma_barrier_0 =
+              pipeline_0.producer_get_barrier(smem_pipe_write_0);
+          PipelineBarrierType* tma_barrier_1 =
+              pipeline_1.producer_get_barrier(smem_pipe_write_1);
+          auto stage_0 = smem_pipe_write_0.index();
+          auto stage_1 = smem_pipe_write_1.index();
 
-        // Issue TMA copy to group 0
-        copy(params.tma_load_A.with(*tma_barrier_0, 0 /*mcast_mask*/),
-             tAgA_0(_, load_idx), tAsA_0(_, stage_0));
+          // Issue TMA copy to group 0
+          copy(params.tma_load_A.with(*tma_barrier_0, 0 /*mcast_mask*/),
+               tAgA_0(_, load_idx), tAsA_0(_, stage_0));
 
-        // Issue TMA copy to group 1
-        copy(params.tma_load_A.with(*tma_barrier_1, 0 /*mcast_mask*/),
-             tAgA_1(_, load_idx), tAsA_1(_, stage_1));
+          // Issue TMA copy to group 1
+          copy(params.tma_load_A.with(*tma_barrier_1, 0 /*mcast_mask*/),
+               tAgA_1(_, load_idx), tAsA_1(_, stage_1));
 
-        // Commit both pipelines
-        pipeline_0.producer_commit(smem_pipe_write_0, TmaTransactionBytesA);
-        pipeline_1.producer_commit(smem_pipe_write_1, TmaTransactionBytesA);
+          // Commit both pipelines
+          pipeline_0.producer_commit(smem_pipe_write_0, TmaTransactionBytesA);
+          pipeline_1.producer_commit(smem_pipe_write_1, TmaTransactionBytesA);
+        }
         ++smem_pipe_write_0;
         ++smem_pipe_write_1;
       }
@@ -682,7 +706,7 @@ class MerkleTreeRootsKernel {
     }
   }
 
-  template <class SmemTensorA, class SmemTensorLeaves>
+  template <bool IsSingleChunk, class SmemTensorA, class SmemTensorLeaves>
   CUTLASS_DEVICE void consumer_loop_dual(Params const& params,
                                          Pipeline& pipeline, SmemTensorA& sA,
                                          SmemTensorLeaves const& sLeaves,
@@ -702,8 +726,7 @@ class MerkleTreeRootsKernel {
 
     // Calculate if this thread is processing the last (potentially partial) chunk
     // Use ceiling division to include partial chunks in the count
-    const size_t num_chunks =
-        (params.data_len + blake3::CHUNK_SIZE - 1) / blake3::CHUNK_SIZE;
+    const u32 num_chunks = compute_num_chunks(params.data_len);
     const u32 remainder = params.data_len % blake3::CHUNK_SIZE;
     const u32 last_chunk_size =
         (remainder == 0) ? blake3::CHUNK_SIZE : remainder;
@@ -718,10 +741,9 @@ class MerkleTreeRootsKernel {
       pipeline.consumer_wait(smem_pipe_read);
       auto stage = smem_pipe_read.index();
 
-      // Zero-pad OOB data in this load if processing the last (partial) chunk
       if (is_last_chunk) {
-        zero_pad_partial_chunk_load(sA, tid_in_group, stage, load_idx,
-                                    last_chunk_size);
+        load_partial_chunk(params, sA, tid_in_group, stage, load_idx,
+                           last_chunk_size);
       }
 
       // Process kNumBlocksPerLoad blocks from this load
@@ -732,8 +754,9 @@ class MerkleTreeRootsKernel {
                         block_in_load;  // Global block index (0-15)
         // Use tid_in_group for shared memory access (0-255 within the group's smem region)
         // Use consumer_tid for counter calculation (global index 0-511)
-        compress_block_dual(sA, rChainingValue, tid_in_group, consumer_tid,
-                            stage, block_in_load, block_idx);
+        compress_block_dual<IsSingleChunk>(sA, rChainingValue, tid_in_group,
+                                           consumer_tid, stage, block_in_load,
+                                           block_idx);
       }
 
       // Sync all consumers within this group after processing this stage
@@ -758,7 +781,7 @@ class MerkleTreeRootsKernel {
 
   // ==================== SINGLE PIPELINE MODE FUNCTIONS ====================
 
-  template <class SmemTensorA, class SmemTensorLeaves>
+  template <bool IsSingleChunk, class SmemTensorA, class SmemTensorLeaves>
   CUTLASS_DEVICE void consumer_loop(Params const& params, Pipeline& pipeline,
                                     SmemTensorA& sA,
                                     SmemTensorLeaves const& sLeaves,
@@ -777,8 +800,7 @@ class MerkleTreeRootsKernel {
 
     // Calculate if this thread is processing the last (potentially partial) chunk
     // Use ceiling division to include partial chunks in the count
-    const size_t num_chunks =
-        (params.data_len + blake3::CHUNK_SIZE - 1) / blake3::CHUNK_SIZE;
+    const u32 num_chunks = compute_num_chunks(params.data_len);
     const u32 remainder = params.data_len % blake3::CHUNK_SIZE;
     const u32 last_chunk_size =
         (remainder == 0) ? blake3::CHUNK_SIZE : remainder;
@@ -793,10 +815,9 @@ class MerkleTreeRootsKernel {
       pipeline.consumer_wait(smem_pipe_read);
       auto stage = smem_pipe_read.index();
 
-      // Zero-pad OOB data in this load if processing the last (partial) chunk
       if (is_last_chunk) {
-        zero_pad_partial_chunk_load(sA, consumer_tid, stage, load_idx,
-                                    last_chunk_size);
+        load_partial_chunk(params, sA, consumer_tid, stage, load_idx,
+                           last_chunk_size);
       }
 
       // Process kNumBlocksPerLoad blocks from this load
@@ -805,8 +826,8 @@ class MerkleTreeRootsKernel {
            ++block_in_load) {
         int block_idx = load_idx * kNumBlocksPerLoad +
                         block_in_load;  // Global block index (0-15)
-        compress_block(sA, rChainingValue, consumer_tid, stage, block_in_load,
-                       block_idx);
+        compress_block<IsSingleChunk>(sA, rChainingValue, consumer_tid, stage,
+                                      block_in_load, block_idx);
       }
 
       // Sync all consumer warpgroups after processing this stage
@@ -827,7 +848,8 @@ class MerkleTreeRootsKernel {
     }
   }
 
-  template <class SmemTensorA, class RmemTensorChainingValue>
+  template <bool IsSingleChunk, class SmemTensorA,
+            class RmemTensorChainingValue>
   CUTLASS_DEVICE void compress_block(SmemTensorA const& sA,
                                      RmemTensorChainingValue& rChainingValue,
                                      int consumer_tid, int stage,
@@ -864,6 +886,11 @@ class MerkleTreeRootsKernel {
     // Set CHUNK_END on the last block (block_idx == kNumBlocksPerChunk - 1)
     if (block_idx == kNumBlocksPerChunk - 1) {
       params.flags |= blake3::CHUNK_END;
+      // If the entire message is this single chunk, this is also the final
+      // compression that produces the digest, so it must be flagged ROOT.
+      if constexpr (IsSingleChunk) {
+        params.flags |= blake3::ROOT;
+      }
     }
 
     blake3::compress_msg_block_u32(rBlock, rChainingValue, params);
@@ -872,7 +899,8 @@ class MerkleTreeRootsKernel {
   // Dual pipeline version of compress_block
   // Uses tid_in_group (0-255) for shared memory access
   // Uses global_consumer_tid (0-511) for counter calculation
-  template <class SmemTensorA, class RmemTensorChainingValue>
+  template <bool IsSingleChunk, class SmemTensorA,
+            class RmemTensorChainingValue>
   CUTLASS_DEVICE void compress_block_dual(
       SmemTensorA const& sA, RmemTensorChainingValue& rChainingValue,
       int tid_in_group, int global_consumer_tid, int stage, int block_in_load,
@@ -911,6 +939,11 @@ class MerkleTreeRootsKernel {
     // Set CHUNK_END on the last block (block_idx == kNumBlocksPerChunk - 1)
     if (block_idx == kNumBlocksPerChunk - 1) {
       params.flags |= blake3::CHUNK_END;
+      // If the entire message is this single chunk, this is also the final
+      // compression that produces the digest, so it must be flagged ROOT.
+      if constexpr (IsSingleChunk) {
+        params.flags |= blake3::ROOT;
+      }
     }
 
     blake3::compress_msg_block_u32(rBlock, rChainingValue, params);

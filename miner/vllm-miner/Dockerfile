@@ -1,6 +1,6 @@
 # Version pins for reproducible builds (override with docker build --build-arg)
-# CUDA 12.9 user-space + PyTorch cu129 + vLLM 0.20.0+cu129 (see miner/vllm-miner/pyproject.toml).
-ARG CUDA_VERSION=12.9.1
+# CUDA 13.0 user-space + PyTorch cu130 + vLLM 0.20.2 (see miner/vllm-miner/pyproject.toml).
+ARG CUDA_VERSION=13.0.3
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS builder
 
@@ -19,7 +19,7 @@ ENV UV_PYTHON_INSTALL_DIR=/usr/local/uv-python \
     UV_PYTHON_BIN_DIR=/usr/local/bin \
     UV_PROJECT_ENVIRONMENT=/usr/local/venv \
     UV_LINK_MODE=copy \
-    UV_TORCH_BACKEND=cu129 \
+    UV_TORCH_BACKEND=cu130 \
     UV_COMPILE_BYTECODE=true
 
 # Install Python via uv
@@ -70,14 +70,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/git \
     uv sync --package vllm-miner --no-install-package pearl-gemm --no-editable --no-dev --inexact
 
-# Runtime image, discard dev packages and caches
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
-
-# Need a C compiler for Triton, and curl for the entrypoint
-RUN --mount=type=cache,target=/var/cache/apt \
-    --mount=type=cache,target=/var/lib/apt/lists \
-    apt-get update && \
-    apt-get install -y --no-install-recommends gcc libc-dev curl
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
 
 WORKDIR /app
 

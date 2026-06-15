@@ -54,12 +54,24 @@ def commitment_hash_from_merkle_roots(
     key: torch.Tensor,
     commitment_hash_A: torch.Tensor,
     commitment_hash_B: torch.Tensor,
+    routing_root: torch.Tensor | None = None,
+    offsets_hash: torch.Tensor | None = None,
 ):
     """
     Compute the commitment hash from merkle roots of a 2D tensor.
+
+    routing_root and offsets_hash are optional MoE inputs (provided together)
+    that fold the routing commitment into A's seed; omitting both is the dense
+    case.
     """
     return torch.ops.pearl_gemm.commitment_hash_from_merkle_roots(
-        A_merkle_root, B_merkle_root, key, commitment_hash_A, commitment_hash_B
+        A_merkle_root,
+        B_merkle_root,
+        key,
+        commitment_hash_A,
+        commitment_hash_B,
+        routing_root,
+        offsets_hash,
     )  # type: ignore
 
 

@@ -27,13 +27,22 @@ const _: () = assert!(MINING_CONFIG_RESERVED_SIZE == MiningConfiguration::RESERV
 const _: () = assert!(MINING_CONFIG_SERIALIZED_SIZE == MiningConfiguration::SERIALIZED_SIZE);
 
 type CircuitCache = <PearlRecursion as RecursionCircuit>::CircuitCache;
+type V1CircuitCache = zk_pow::v1::circuit::circuit_utils::CircuitCache;
 
 lazy_static::lazy_static! {
     /// Global circuit cache shared across Go FFI functions (verify and prove).
     /// Protected by a Mutex for thread-safe access from multiple Go goroutines.
     pub static ref CIRCUIT_CACHE: Mutex<CircuitCache> = {
         use zk_pow::circuit::embedded_cache;
-        Mutex::new(CircuitCache::from_bytes(embedded_cache::CACHE_DATA).unwrap_or_default())
+        Mutex::new(CircuitCache::from_bytes(embedded_cache::CACHE_DATA)
+            .expect("V2 circuit cache is missing or corrupt; cannot verify proofs"))
+    };
+
+    /// V1 circuit cache for verifying version-1 (master-format) proofs.
+    pub static ref V1_CIRCUIT_CACHE: Mutex<V1CircuitCache> = {
+        use zk_pow::v1::embedded_cache;
+        Mutex::new(V1CircuitCache::from_bytes(embedded_cache::CACHE_DATA)
+            .expect("V1 circuit cache is missing or corrupt; cannot verify V1 proofs"))
     };
 }
 
@@ -41,6 +50,11 @@ lazy_static::lazy_static! {
 /// The cache data is still valid for verifier after a panic, since the CircuitCache is read only.
 pub(crate) fn acquire_cache() -> std::sync::MutexGuard<'static, CircuitCache> {
     CIRCUIT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Acquires the V1 circuit cache for version-1 proof verification.
+pub(crate) fn acquire_v1_cache() -> std::sync::MutexGuard<'static, V1CircuitCache> {
+    V1_CIRCUIT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Catches panics from a closure and returns Ok(result) or Err(panic_message).
@@ -60,14 +74,20 @@ where
     })
 }
 
-/// Size of the committed public data in bytes (exported to C header).
+/// Size of the committed public data in bytes for a standard (non-MoE) ZK proof (exported to C header).
 pub const PUBLICDATA_SIZE: usize = 164;
-const _: () = assert!(PUBLICDATA_SIZE == PublicProofParams::PUBLICDATA_SIZE);
+const _: () = assert!(PUBLICDATA_SIZE == PublicProofParams::WIRE_SIZE);
 
-/// Go-owned ZK proof structure.
+/// Maximum `public_data` buffer length, sized for largest MoE proofs (exported to C header).
+pub const PUBLICDATA_MAX_SIZE: usize = 4807;
+const _: () = assert!(PUBLICDATA_MAX_SIZE == PublicProofParams::MAX_WIRE_SIZE);
+
+/// Go-owned ZK proof structure. Buffer is sized for the largest MoE proof;
+/// `public_data_len` indicates how many bytes are actually used.
 #[repr(C)]
 pub struct CZKProof {
-    pub public_data: [u8; PUBLICDATA_SIZE],
+    pub public_data_len: usize,
+    pub public_data: [u8; PUBLICDATA_MAX_SIZE],
     pub proof_blob_len: usize,
     pub proof_blob: *mut u8,
 }

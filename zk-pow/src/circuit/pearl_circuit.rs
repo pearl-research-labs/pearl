@@ -105,6 +105,7 @@ use plonky2::{
     },
     util::{serialization::Write, timing::TimingTree},
 };
+use plonky2_field::types::Field;
 use starky::{
     config::StarkConfig,
     prover::prove_and_get_zeta,
@@ -147,7 +148,7 @@ impl PearlCircuitParams {
         }
         // Check that RAM lookups used in the STARK fit 2*BITS_PER_LIMB bits
         ensure!(
-            compiled_params.expected_num_rows() < (2 << (2 * BITS_PER_LIMB)),
+            compiled_params.expected_num_rows() < (1 << (2 * BITS_PER_LIMB)),
             "Too many rows for RAM lookup"
         );
         ensure!(
@@ -189,6 +190,7 @@ pub struct PearlVerifierPIs {
     pub commitment_hash: [GoldilocksField; 8],
     pub hash_a: [GoldilocksField; 8],
     pub hash_b: [GoldilocksField; 8],
+    pub hash_routing: Option<[GoldilocksField; 8]>,
     pub hash_jackpot: [GoldilocksField; 8],
     pub public_data_commitment: HashOut<GoldilocksField>,
     /// STARK challenge point zeta extracted from the proof.
@@ -295,7 +297,7 @@ impl RecursionCircuit for PearlRecursion {
 
             // Layer-1 PI layout: pearl_public | hash_public_data (4) | zeta (2) |
             //                    evals_at_zeta (2*N) | evals_at_g_zeta (2*N)
-            // pearl_public (JOB_KEY, COMMITMENT_HASH, HASH_A, HASH_B, HASH_JACKPOT) of stark must PIs given outside
+            // pearl_public (JOB_KEY, COMMITMENT_HASH, HASH_A, HASH_B, HASH_ROUTING, HASH_JACKPOT) of stark must PIs given outside
             for inner_pi in proof_0_target.public_inputs.iter_mut() {
                 let outer_pi = builder_1.add_virtual_public_input();
                 builder_1.connect(*inner_pi, outer_pi);
@@ -352,7 +354,7 @@ impl RecursionCircuit for PearlRecursion {
                     },
                 );
             }
-        }
+        };
 
         /////////////////////////////////////////
         ///// build second recursion circuit ////
@@ -632,12 +634,17 @@ impl RecursionCircuit for PearlRecursion {
             eval_columns_at_zeta_and_next::<GoldilocksField, 2>(&poly_refs, pis.zeta, circuit_params.stark_degree_bits);
 
         // Layer-1 PI Layout matches `compile_circuits` and `prove`.
+        let hash_routing = match &pis.hash_routing {
+            Some(h) => h,
+            None => &[GoldilocksField::ZERO; 8],
+        };
         let public_inputs = pis
             .job_key
             .into_iter()
             .chain(pis.commitment_hash)
             .chain(pis.hash_a)
             .chain(pis.hash_b)
+            .chain(*hash_routing)
             .chain(pis.hash_jackpot)
             .chain(pis.public_data_commitment.elements)
             .chain(pis.zeta.0)

@@ -99,7 +99,7 @@ jobs:
       - name: Build project and generate verifier cache
         run: |
           cargo build --release
-          cargo run --release --bin build_cache src/circuit/cache.bin
+          cargo run --release --bin build_cache src/circuit/v2_cache.bin src/v1/v1_cache.bin
           cargo build --release --features embedded_cache
 
       - name: Run tests
@@ -129,7 +129,7 @@ jobs:
           go-version: '1.26.1'
 
       - name: Regenerate verifier circuit cache for Go FFI
-        run: cargo run --release --bin build_cache src/circuit/cache.bin
+        run: cargo run --release --bin build_cache src/circuit/v2_cache.bin src/v1/v1_cache.bin
 
       - name: Build zk_pow_ffi library for Go FFI
         run: |

@@ -156,7 +156,7 @@ fn load_buffer<F: RichField>(
     trace: &[[F; pearl_columns::TOTAL]],
 ) {
     match *data_source {
-        MessageDataType::Matrix { .. } | MessageDataType::AuxiliaryData { .. } => {
+        MessageDataType::Matrix { .. } | MessageDataType::AuxiliaryData { .. } | MessageDataType::RoutingData { .. } => {
             // Read from UINT8_DATA which was already filled by the main loop
             let bytes: [u8; 8] = read_from_trace(&trace[row_idx], pearl_columns::UINT8_DATA);
             buffer[14] = u64_pack_le(&bytes[..BYTES_PER_GOLDILOCKS], 8) as u32;

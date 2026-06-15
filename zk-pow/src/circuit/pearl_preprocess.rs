@@ -1,9 +1,12 @@
-use crate::circuit::chip::blake3::logic::MessageDataType;
-use crate::circuit::chip::blake3::program::{Blake3Tweak, BlakeMsg, DWORD_SIZE, MatDwordId};
-use crate::circuit::chip::{BitRegDst, BitRegSrc};
+use std::mem;
 
+use crate::circuit::chip::BitRegSrc;
+use crate::circuit::chip::blake3::logic::{MessageDataType, encode_is_msg_bits};
+use crate::circuit::chip::blake3::program::{Blake3Tweak, BlakeMsg, DWORD_SIZE, MatDwordId, routing_blake_hotspot_rows};
+
+use crate::circuit::pearl_layout::BITS_PER_OUTER_INDEX;
 use crate::{
-    api::proof_utils::CompiledPublicParams,
+    api::proof_utils::{CompiledMoE, CompiledPublicParams},
     circuit::{
         pearl_layout::{BITS_PER_LIMB, NOISE_PACKING_BASE, pearl_columns},
         pearl_noise::{MMSlice, compute_noise},
@@ -12,6 +15,7 @@ use crate::{
     },
 };
 use anyhow::Result;
+use blake3::BLOCK_LEN;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2_maybe_rayon::*;
 
@@ -36,6 +40,46 @@ pub fn read_dword_from_matrix(strips: &MMSlice, dword_id: MatDwordId) -> [i8; DW
     strip[dword_id.idx_in_strip..dword_id.idx_in_strip + DWORD_SIZE]
         .try_into()
         .unwrap()
+}
+
+pub fn read_routing_dword(strips: &MMSlice, strip_idx: usize, idx_in_strip: usize) -> [u8; DWORD_SIZE] {
+    let strip = &strips.routing[strip_idx];
+    std::array::from_fn(|i| strip[idx_in_strip + i])
+}
+
+/// For a routing-data Blake message slot, return the packed `(outer_first | outer_second << BITS_PER_OUTER_INDEX)`
+/// along with `(is_first, is_second)` flags indicating which of the two u32 sub-slots fall inside this expert.
+///
+/// Each routing dword spans two consecutive u32 slots; when `routing_start_offset` is not aligned to a
+/// dword boundary, the first slot may belong to the previous expert while the second already falls within ours,
+/// so each slot is checked independently.
+///
+/// Returns `(0, false, false)` for non-routing data sources. Panics if invoked on `RoutingData` without an MoE.
+fn compute_outer_index_packed(
+    data_source: MessageDataType,
+    hotspots: Option<&[u32]>,
+    moe: Option<&CompiledMoE>,
+    outer_indices: &[usize],
+) -> (u64, bool, bool) {
+    let MessageDataType::RoutingData {
+        hotspot_idx,
+        idx_in_block,
+    } = data_source
+    else {
+        return (0, false, false);
+    };
+    let hotspots = hotspots.expect("RoutingData requires MoE hotspots");
+    let moe = moe.expect("RoutingData requires MoE params");
+    let abs_u32_idx = ((hotspots[hotspot_idx] as usize * BLOCK_LEN + idx_in_block) / mem::size_of::<u32>()) as u32;
+    let lookup = |slot: u32| -> Option<u64> {
+        slot.checked_sub(moe.routing_start_offset)
+            .and_then(|inner| moe.inner_indices.binary_search(&inner).ok())
+            .map(|idx| outer_indices[idx] as u64)
+    };
+    let first = lookup(abs_u32_idx);
+    let second = lookup(abs_u32_idx + 1);
+    let packed = first.unwrap_or(0) + (second.unwrap_or(0) << BITS_PER_OUTER_INDEX);
+    (packed, first.is_some(), second.is_some())
 }
 
 pub fn read_blake_msg_from_matrix(strips: &MMSlice, blake_msg: BlakeMsg) -> [i8; 64] {
@@ -68,15 +112,22 @@ pub(crate) fn generate_preprocessed(
 
     let num_rows = circuit.len();
 
-    // Fake MAT_ID base for non-matrix rows (beyond all real dword indices)
+    // Fake MAT_ID base for non-matrix rows (beyond all real dword indices).
     let fake_mat_id_base = (public_params.num_dwords(false) + public_params.num_dwords(true)) as u64;
+
+    // Generate OUTER_FIRST and OUTER_SECOND.
+    let hotspots = public_params
+        .moe
+        .as_ref()
+        .map(|moe| routing_blake_hotspot_rows(moe.routing_start_offset, &moe.inner_indices));
+    let outer_indices = &public_params.a_rows_indices;
 
     // Noise matrices are needed by the NOISE_PACKED_PREP column; compute once up front.
     let noise_prep_slice = compute_noise(public_params);
 
     // Number of bit slots in the CONTROL_PREP packed layout before MAT_ID:
-    // 21 static flags + JACKPOT_IDX_LEN muxer bits.
-    const STATIC_BITS_LEN: usize = 21;
+    // 22 static flags + JACKPOT_IDX_LEN muxer bits.
+    const STATIC_BITS_LEN: usize = 22;
     const CONTROL_BITS_LEN: usize = STATIC_BITS_LEN + pearl_columns::JACKPOT_IDX_LEN;
 
     // Pre-allocate the four output columns and fill them in a single parallel
@@ -87,117 +138,124 @@ pub(crate) fn generate_preprocessed(
     let mut noise_packed_prep = vec![0u64; num_rows];
     let mut cv_or_tweak_prep = vec![0u64; num_rows];
     let mut ab_id_prep = vec![0u64; num_rows];
+    let mut outer_indices_packed_prep = vec![0u64; num_rows];
 
     control_prep
         .par_iter_mut()
         .zip(noise_packed_prep.par_iter_mut())
         .zip(cv_or_tweak_prep.par_iter_mut())
         .zip(ab_id_prep.par_iter_mut())
+        .zip(outer_indices_packed_prep.par_iter_mut())
         .enumerate()
-        .for_each(|(row_idx, (((control_out, noise_out), cv_or_tweak_out), ab_id_out))| {
-            let RowLogic {
-                blake: blake_data,
-                matmul: matmul_data,
-                jackpot: jackpot_data,
-            } = circuit[row_idx];
+        .for_each(
+            |(row_idx, ((((control_out, noise_out), cv_or_tweak_out), ab_id_out), outer_index))| {
+                let RowLogic {
+                    blake: blake_data,
+                    matmul: matmul_data,
+                    jackpot: jackpot_data,
+                } = circuit[row_idx];
 
-            // Single match on `blake.data_source` covers the IS_MSG_* flags, the MAT_ID
-            // lookup, and the noise-dword lookup for NOISE_PACKED_PREP.
-            let (is_msg_mat, is_msg_jackpot, is_msg_aux_data, is_msg_cv, mat_id, noise_dword_id) = match blake_data.data_source {
-                MessageDataType::Matrix { dword_id } => (
-                    true,
-                    false,
-                    false,
-                    false,
-                    public_params.dword_to_index(dword_id) as u64,
-                    Some(dword_id),
-                ),
-                MessageDataType::Jackpot => (false, true, false, false, fake_mat_id_base + row_idx as u64, None),
-                MessageDataType::AuxiliaryData { .. } => (false, false, true, false, fake_mat_id_base + row_idx as u64, None),
-                MessageDataType::PreviousCv { .. } => (false, false, false, true, fake_mat_id_base + row_idx as u64, None),
-                MessageDataType::None => (false, false, false, false, fake_mat_id_base + row_idx as u64, None),
-            };
+                // IS_MSG_BITS encoding: See encode_is_msg_bits / decode_is_msg_bits for the full table.
+                let [is_msg_bit_0, is_msg_bit_1, is_msg_bit_2] = encode_is_msg_bits(&blake_data.data_source);
+                // MAT_ID / noise-dword lookup for NOISE_PACKED_PREP.
+                let (mat_id, noise_dword_id) = match blake_data.data_source {
+                    MessageDataType::Matrix { dword_id } => (public_params.dword_to_index(dword_id) as u64, Some(dword_id)),
+                    _ => (fake_mat_id_base + row_idx as u64, None),
+                };
 
-            let is_bitreg_load = matches!(jackpot_data.src, BitRegSrc::Jackpot);
+                let is_bitreg_load = matches!(jackpot_data.src, BitRegSrc::Jackpot);
 
-            // ---- CONTROL_PREP: pack 21 static flags + JACKPOT_IDX muxer bits + MAT_ID.
-            let static_bits: [bool; STATIC_BITS_LEN] = [
-                matmul_data.is_reset_cumsum,
-                matmul_data.is_update_cumsum(),
-                blake_data.is_use_job_key(),
-                blake_data.is_use_commitment_hash(),
-                blake_data.is_hash_a,
-                blake_data.is_hash_b,
-                blake_data.is_hash_jackpot,
-                blake_data.idx_of_row_whence_to_read_cv.is_some(), // IS_CV_IN
-                blake_data.round_idx == 1,                         // IS_NEW_BLAKE
-                blake_data.round_idx == 8,                         // IS_LAST_ROUND
-                is_msg_mat,
-                is_msg_jackpot,
-                is_msg_aux_data,
-                is_msg_cv,
-                is_bitreg_load,                                // IS_LOAD
-                matches!(jackpot_data.src, BitRegSrc::Xor),    // IS_XOR
-                matches!(jackpot_data.src, BitRegSrc::Shift3), // IS_SHIFT3
-                matches!(jackpot_data.dst, BitRegDst::Store0),
-                matches!(jackpot_data.dst, BitRegDst::Store1),
-                matches!(jackpot_data.dst, BitRegDst::Store2),
-                jackpot_data.is_dump_cumsum_buffer,
-            ];
-            // JACKPOT_IDX encoding: 0..15 for load, 16..31 for store.
-            let muxer_bits = deg2_muxer_bits::<{ pearl_columns::JACKPOT_IDX_LEN }>(Some(if is_bitreg_load {
-                jackpot_data.jackpot_idx
-            } else {
-                jackpot_data.jackpot_idx + 16
-            }));
-            let mut bits_packed: u64 = 0;
-            for (i, &b) in static_bits.iter().enumerate() {
-                bits_packed |= (b as u64) << i;
-            }
-            for (i, &b) in muxer_bits.iter().enumerate() {
-                bits_packed |= (b as u64) << (STATIC_BITS_LEN + i);
-            }
-            *control_out = bits_packed + (mat_id << CONTROL_BITS_LEN);
+                let (packed_outer, is_first, is_second) = compute_outer_index_packed(
+                    blake_data.data_source,
+                    hotspots.as_deref(),
+                    public_params.moe.as_ref(),
+                    outer_indices,
+                );
+                *outer_index = packed_outer;
 
-            // ---- NOISE_PACKED_PREP: only matrix rows have non-zero noise.
-            *noise_out = match noise_dword_id {
-                Some(dword_id) => {
-                    let noise_dword = read_dword_from_matrix(&noise_prep_slice, dword_id);
-                    i64_to_u64::<F>(i64_pack_base(&noise_dword, NOISE_PACKING_BASE))
+                let [store_bit0, store_bit1] = deg2_muxer_bits(Some(jackpot_data.dst as usize));
+
+                // ---- CONTROL_PREP: pack 22 static flags + JACKPOT_IDX muxer bits + MAT_ID.
+                let static_bits: [bool; STATIC_BITS_LEN] = [
+                    matmul_data.is_reset_cumsum,
+                    matmul_data.is_update_cumsum(),
+                    blake_data.is_use_job_key(),
+                    blake_data.is_use_commitment_hash(),
+                    blake_data.is_hash_a,
+                    blake_data.is_hash_b,
+                    blake_data.is_hash_routing,
+                    blake_data.is_hash_jackpot,
+                    blake_data.idx_of_row_whence_to_read_cv.is_some(), // IS_CV_IN
+                    blake_data.round_idx == 1,                         // IS_NEW_BLAKE
+                    blake_data.round_idx == 8,                         // IS_LAST_ROUND
+                    is_msg_bit_0,
+                    is_msg_bit_1,
+                    is_msg_bit_2,
+                    is_first,
+                    is_second,
+                    is_bitreg_load,                                // IS_LOAD
+                    matches!(jackpot_data.src, BitRegSrc::Xor),    // IS_XOR
+                    matches!(jackpot_data.src, BitRegSrc::Shift3), // IS_SHIFT3
+                    store_bit0,
+                    store_bit1,
+                    jackpot_data.is_dump_cumsum_buffer,
+                ];
+                // JACKPOT_IDX encoding: 0..15 for load, 16..31 for store.
+                let muxer_bits = deg2_muxer_bits::<{ pearl_columns::JACKPOT_IDX_LEN }>(Some(if is_bitreg_load {
+                    jackpot_data.jackpot_idx
+                } else {
+                    jackpot_data.jackpot_idx + 16
+                }));
+                let mut bits_packed: u64 = 0;
+                for (i, &b) in static_bits.iter().enumerate() {
+                    bits_packed |= (b as u64) << i;
                 }
-                None => 0,
-            };
+                for (i, &b) in muxer_bits.iter().enumerate() {
+                    bits_packed |= (b as u64) << (STATIC_BITS_LEN + i);
+                }
+                *control_out = bits_packed + (mat_id << CONTROL_BITS_LEN);
 
-            // ---- CV_OR_TWEAK_PREP: CV_IDX when reading CV, else blake3_tweak of prev row.
-            let cv_idx = blake_data.idx_of_row_whence_to_read_cv;
-            let prev_row_idx = if row_idx == 0 { num_rows - 1 } else { row_idx - 1 };
-            let prev_tweak = circuit[prev_row_idx].blake.blake3_tweak;
-            debug_assert!(
-                cv_idx.is_none() || prev_tweak.is_none(),
-                "CV_IDX and blake3_tweak cases must be disjoint"
-            );
-            *cv_or_tweak_out = match cv_idx {
-                Some(idx) => idx as u64,
-                None => pack_blake3_tweak(&prev_tweak.unwrap_or_default()),
-            };
+                // ---- NOISE_PACKED_PREP: only matrix rows have non-zero noise.
+                *noise_out = match noise_dword_id {
+                    Some(dword_id) => {
+                        let noise_dword = read_dword_from_matrix(&noise_prep_slice, dword_id);
+                        i64_to_u64::<F>(i64_pack_base(&noise_dword, NOISE_PACKING_BASE))
+                    }
+                    None => 0,
+                };
 
-            // ---- AB_ID_PREP: A_ID || (B_ID << 2*BITS_PER_LIMB).
-            let a_id = matmul_data
-                .a_dword
-                .map(|d| public_params.dword_to_index(d) as u64)
-                .unwrap_or(0);
-            let b_id = matmul_data
-                .b_dword
-                .map(|d| public_params.dword_to_index(d) as u64)
-                .unwrap_or(0);
-            *ab_id_out = a_id + (b_id << (2 * BITS_PER_LIMB));
-        });
+                // ---- CV_OR_TWEAK_PREP: CV_IDX when reading CV, else blake3_tweak of prev row.
+                let cv_idx = blake_data.idx_of_row_whence_to_read_cv;
+                let prev_row_idx = if row_idx == 0 { num_rows - 1 } else { row_idx - 1 };
+                let prev_tweak = circuit[prev_row_idx].blake.blake3_tweak;
+                debug_assert!(
+                    cv_idx.is_none() || prev_tweak.is_none(),
+                    "CV_IDX and blake3_tweak cases must be disjoint"
+                );
+                *cv_or_tweak_out = match cv_idx {
+                    Some(idx) => idx as u64,
+                    None => pack_blake3_tweak(&prev_tweak.unwrap_or_default()),
+                };
+
+                // ---- AB_ID_PREP: A_ID || (B_ID << 2*BITS_PER_LIMB).
+                let a_id = matmul_data
+                    .a_dword
+                    .map(|d| public_params.dword_to_index(d) as u64)
+                    .unwrap_or(0);
+                let b_id = matmul_data
+                    .b_dword
+                    .map(|d| public_params.dword_to_index(d) as u64)
+                    .unwrap_or(0);
+                *ab_id_out = a_id + (b_id << (2 * BITS_PER_LIMB));
+            },
+        );
 
     // The returned (index, column) pairs are not ordered; consumers that care
     // about ordering (e.g. `PearlStark::preprocessed_columns`) must sort / look
     // up by the column index.
     let res = vec![
         (pearl_columns::CONTROL_PREP, control_prep),
+        (pearl_columns::OUTER_INDICES_PACKED_PREP, outer_indices_packed_prep),
         (pearl_columns::NOISE_PACKED_PREP, noise_packed_prep),
         (pearl_columns::CV_OR_TWEAK_PREP, cv_or_tweak_prep),
         (pearl_columns::AB_ID_PREP, ab_id_prep),

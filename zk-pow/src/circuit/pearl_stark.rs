@@ -136,7 +136,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for PearlStark<F,
             unfiltered_lookup(
                 Column::<F>::single(pearl_columns::URANGE13_TABLE),
                 Column::<F>::single(pearl_columns::URANGE13_FREQ),
-                Column::<F>::singles(pearl_columns::MAT_ID_LIMBS_RANGE.chain(pearl_columns::AB_ID_LIMBS_RANGE)).collect(),
+                Column::<F>::singles(
+                    pearl_columns::MAT_ID_LIMBS_RANGE
+                        .chain(pearl_columns::AB_ID_LIMBS_RANGE)
+                        .chain(pearl_columns::OUTER_INDEX_FIRST_RANGE)
+                        .chain(pearl_columns::OUTER_INDEX_SECOND_RANGE),
+                )
+                .collect(),
             ),
             // Signal is in [-64, 64].
             unfiltered_lookup(
@@ -158,7 +164,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for PearlStark<F,
                 table_column: Column::<F>::single(pearl_columns::I8U8_TABLE),
                 frequencies_column: Column::<F>::single(pearl_columns::I8U8_FREQ),
                 filter_columns: vec![
-                    Filter::<F>::from_column(Column::<F>::single(pearl_columns::IS_MSG_MAT));
+                    Filter::<F>::from_column(Column::<F>::single(pearl_columns::IS_MSG_BITS)); // IS_MSG_BIT_0 corresponds to IS_MSG_MAT
                     pearl_columns::UINT8_DATA_LEN
                 ],
             },
@@ -170,8 +176,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for PearlStark<F,
             let out_col = word_idx + num_words * (row_idx + num_rows * strip_idx);
             let idx_shift = strip_idx + row_idx * num_strips;
             [
-                indexed_column::<F>(pearl_columns::A_NOISED + out_col, pearl_columns::A_ID, 1u64 << 32, idx_shift),
-                indexed_column::<F>(pearl_columns::B_NOISED + out_col, pearl_columns::B_ID, 1u64 << 32, idx_shift),
+                indexed_column::<F>(pearl_columns::A_NOISED + out_col, pearl_columns::A_ID, 1u64 << 34, idx_shift),
+                indexed_column::<F>(pearl_columns::B_NOISED + out_col, pearl_columns::B_ID, 1u64 << 34, idx_shift),
             ]
         };
         for word_idx in 0..num_words {
@@ -179,7 +185,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for PearlStark<F,
                 columns: (0..num_rows)
                     .flat_map(|row| (0..num_strips).flat_map(move |strip| noised_a_b(word_idx, row, strip)))
                     .collect(),
-                table_column: indexed_column::<F>(pearl_columns::NOISED_PACKED + word_idx, pearl_columns::MAT_ID, 1u64 << 32, 0),
+                table_column: indexed_column::<F>(pearl_columns::NOISED_PACKED + word_idx, pearl_columns::MAT_ID, 1u64 << 34, 0),
                 frequencies_column: Column::<F>::single(pearl_columns::MAT_FREQ),
                 filter_columns: vec![
                     Filter::<F>::from_column(Column::<F>::single(pearl_columns::IS_UPDATE_CUMSUM));
@@ -193,11 +199,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for PearlStark<F,
                 columns: vec![indexed_column::<F>(
                     pearl_columns::CV_IN + i,
                     pearl_columns::CV_OR_TWEAK_PREP, // CV_OR_TWEAK_PREP serves as cv_idx
-                    1u64 << 32,
+                    1u64 << 34,
                     0,
                 )],
                 frequencies_column: Column::<F>::single(pearl_columns::CV_OUT_FREQ),
-                table_column: indexed_column::<F>(pearl_columns::CV_OUT + i, pearl_columns::STARK_ROW_IDX, 1u64 << 32, 0),
+                table_column: indexed_column::<F>(pearl_columns::CV_OUT + i, pearl_columns::STARK_ROW_IDX, 1u64 << 34, 0),
                 filter_columns: vec![Filter::<F>::from_column(Column::<F>::single(pearl_columns::IS_CV_IN)); 1],
             });
         }
@@ -222,6 +228,7 @@ impl<F: RichField + Extendable<D>, const D: usize> PearlStark<F, D> {
     pub fn preprocessed_indices() -> SortedSet<usize> {
         SortedSet::from_unsorted(vec![
             pearl_columns::CONTROL_PREP,
+            pearl_columns::OUTER_INDICES_PACKED_PREP,
             pearl_columns::NOISE_PACKED_PREP,
             pearl_columns::CV_OR_TWEAK_PREP,
             pearl_columns::AB_ID_PREP,

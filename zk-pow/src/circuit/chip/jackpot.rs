@@ -52,9 +52,8 @@ pub struct JackpotControlFields<V: Copy> {
     pub is_load: V,
     pub is_xor: V,
     pub is_shift3: V,
-    pub is_store0: V,
-    pub is_store1: V,
-    pub is_store2: V,
+    pub store_bit0: V,
+    pub store_bit1: V,
     pub is_dump_cumsum_buffer: V,
     pub jackpot_idx: [V; pearl_columns::JACKPOT_IDX_LEN],
 }
@@ -64,9 +63,8 @@ impl<V: Copy> JackpotControlFields<V> {
         let is_load = row_view.consume_single();
         let is_xor = row_view.consume_single();
         let is_shift3 = row_view.consume_single();
-        let is_store0 = row_view.consume_single();
-        let is_store1 = row_view.consume_single();
-        let is_store2 = row_view.consume_single();
+        let store_bit0 = row_view.consume_single();
+        let store_bit1 = row_view.consume_single();
         let is_dump_cumsum_buffer = row_view.consume_single();
         let jackpot_idx = row_view.consume_few(pearl_columns::JACKPOT_IDX_LEN).try_into().unwrap();
 
@@ -74,9 +72,8 @@ impl<V: Copy> JackpotControlFields<V> {
             is_load,
             is_xor,
             is_shift3,
-            is_store0,
-            is_store1,
-            is_store2,
+            store_bit0,
+            store_bit1,
             is_dump_cumsum_buffer,
             jackpot_idx,
         }

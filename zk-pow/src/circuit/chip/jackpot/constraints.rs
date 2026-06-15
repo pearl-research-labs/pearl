@@ -2,7 +2,10 @@ use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 
 use crate::circuit::{
     chip::jackpot::JackpotControlFields,
-    pearl_layout::{pearl_columns, pearl_public},
+    pearl_layout::{
+        pearl_columns::{self, STORE_BITS_RANGE},
+        pearl_public,
+    },
     pearl_program::{JACKPOT_SIZE, LROT_PER_TILE},
     utils::{
         air_utils::{RowView, degree_2_indicators},
@@ -112,10 +115,11 @@ pub fn eval_constraints<V, S, E>(
     }
 
     // Store constraint: selected jackpot value must equal rotated bitreg
-    // IS_STORE0/1/2 select which rotation to store (0, LROT_PER_TILE, 2*LROT_PER_TILE bits right)
-    let next_is_store_rot0 = next_trace[pearl_columns::IS_STORE0];
-    let next_is_store_rot1 = next_trace[pearl_columns::IS_STORE1];
-    let next_is_store_rot2 = next_trace[pearl_columns::IS_STORE2];
+    // STORE_BITS encode the rotation: Store0=(0,1), Store1=(1,0), Store2=(1,1)
+    let next_store_indicators = degree_2_indicators(eval, &next_trace[STORE_BITS_RANGE], 0..3);
+    let next_is_store_rot0 = next_store_indicators[0];
+    let next_is_store_rot1 = next_store_indicators[1];
+    let next_is_store_rot2 = next_store_indicators[2];
     let next_bitreg_to_store = eval.inner_product(
         &[next_is_store_rot0, next_is_store_rot1, next_is_store_rot2],
         &[next_bitreg_rot0, next_bitreg_rot1, next_bitreg_rot2],

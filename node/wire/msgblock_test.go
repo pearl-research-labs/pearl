@@ -6,6 +6,7 @@ package wire
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"reflect"
 	"testing"
@@ -220,19 +221,20 @@ func TestBlockWireErrors(t *testing.T) {
 		writeErr error           // Expected write error
 		readErr  error           // Expected read error
 	}{
+		// Certificate size: Version(4) + Hash(32) + PublicData(164) + ProofLen(4) + ProofData(8) = 212
 		// Force error in certificate version (first 4 bytes).
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 0, io.ErrShortWrite, io.EOF},
-		// Force error in header version (after 212-byte ZKCertificate, at offset 212).
+		// Force error in header version (after 212-byte CertificateV1).
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 212, io.ErrShortWrite, io.EOF},
-		// Force error in prev block hash (partial read).
+		// Force error in prev block hash (partial read): cert(212) + version(4) + 4 bytes into prevBlock.
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 220, io.ErrShortWrite, io.ErrUnexpectedEOF},
-		// Force error in merkle root (partial read).
+		// Force error in merkle root (partial read): cert(212) + version(4) + prevBlock(32) + 4 bytes into merkleRoot.
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 256, io.ErrShortWrite, io.ErrUnexpectedEOF},
-		// Force error at start of proof commitment (offset 288 = cert(212) + header fields before proofcommitment(76): version(4) + prevBlock(32) + merkleRoot(32) + timestamp(4) + bits(4)).
+		// Force error at start of proof commitment: cert(212) + version(4) + prevBlock(32) + merkleRoot(32) + timestamp(4) + bits(4) = 288.
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 288, io.ErrShortWrite, io.EOF},
-		// Force error in middle of proof commitment (partial read).
+		// Force error in middle of proof commitment (partial read): 288 + 10 bytes into 32-byte commitment.
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 298, io.ErrShortWrite, io.ErrUnexpectedEOF},
-		// Force error in transactions (offset 321 = cert(212) + header(108) + varint(1)).
+		// Force error in transactions: cert(212) + header(108) + varint(1) = 321.
 		{&blockOne, blockOneBytes, pver, BaseEncoding, 321, io.ErrShortWrite, io.EOF},
 	}
 
@@ -340,19 +342,20 @@ func TestBlockSerializeErrors(t *testing.T) {
 		writeErr error     // Expected write error
 		readErr  error     // Expected read error
 	}{
+		// Certificate size: Version(4) + Hash(32) + PublicData(164) + ProofLen(4) + ProofData(8) = 212
 		// Force error in certificate version.
 		{&blockOne, blockOneBytes, 0, io.ErrShortWrite, io.EOF},
-		// Force error in header version (after 212-byte ZKCertificate).
+		// Force error in header version (after 212-byte CertificateV1).
 		{&blockOne, blockOneBytes, 212, io.ErrShortWrite, io.EOF},
-		// Force error in prev block hash (partial read).
+		// Force error in prev block hash (partial read): cert(212) + version(4) + 4 bytes into prevBlock.
 		{&blockOne, blockOneBytes, 220, io.ErrShortWrite, io.ErrUnexpectedEOF},
-		// Force error in merkle root (partial read).
+		// Force error in merkle root (partial read): cert(212) + version(4) + prevBlock(32) + 4 bytes into merkleRoot.
 		{&blockOne, blockOneBytes, 256, io.ErrShortWrite, io.ErrUnexpectedEOF},
-		// Force error at start of proof commitment (offset 288 = cert(212) + header fields before proofcommitment(76): version(4) + prevBlock(32) + merkleRoot(32) + timestamp(4) + bits(4)).
+		// Force error at start of proof commitment: cert(212) + version(4) + prevBlock(32) + merkleRoot(32) + timestamp(4) + bits(4) = 288.
 		{&blockOne, blockOneBytes, 288, io.ErrShortWrite, io.EOF},
-		// Force error in middle of proof commitment (partial read).
+		// Force error in middle of proof commitment (partial read): 288 + 10 bytes into 32-byte commitment.
 		{&blockOne, blockOneBytes, 298, io.ErrShortWrite, io.ErrUnexpectedEOF},
-		// Force error in transactions (offset 321 = cert(212) + header(108) + varint(1)).
+		// Force error in transactions: cert(212) + header(108) + varint(1) = 321.
 		{&blockOne, blockOneBytes, 321, io.ErrShortWrite, io.EOF},
 	}
 
@@ -406,46 +409,27 @@ func TestBlockOverflowErrors(t *testing.T) {
 	}{
 		// Block that claims to have ~uint64(0) transactions.
 		{
-			[]byte{
-				// Certificate (212 bytes): Version(4) + Hash(32) + PublicData(164) + ProofLen(4) + ProofData(8)
-				0x01, 0x00, 0x00, 0x00, // Version (1 = ZK)
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BlockHash (32 bytes)
-				// PublicData (164 bytes)
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00,
-				0x08, 0x00, 0x00, 0x00, // ProofLen (8)
-				0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, // ProofData (8 bytes)
-				// Then header (116 bytes):
-				0x01, 0x00, 0x00, 0x00, // Version 1
-				0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72,
-				0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f,
-				0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c,
-				0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00, // PrevBlock
-				0x98, 0x20, 0x51, 0xfd, 0x1e, 0x4b, 0xa7, 0x44,
-				0xbb, 0xbe, 0x68, 0x0e, 0x1f, 0xee, 0x14, 0x67,
-				0x7b, 0xa1, 0xa3, 0xc3, 0x54, 0x0b, 0xf7, 0xb1,
-				0xcd, 0xb6, 0x06, 0xe8, 0x57, 0x23, 0x3e, 0x0e, // MerkleRoot
-				0x61, 0xbc, 0x66, 0x49, // Timestamp
-				0xff, 0xff, 0x00, 0x1d, // Bits
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ProofCommitment (32 zero bytes)
-				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-				0xff, // TxnCount
-			}, pver, BaseEncoding, &MessageError{},
+			func() []byte {
+				// Build a valid certificate + header + overflow txn count programmatically
+				// to avoid fragile hardcoded byte arrays.
+				cert := &CertificateV1{
+					ProofData: []byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe},
+				}
+				var certBuf bytes.Buffer
+				// Version
+				binary.Write(&certBuf, binary.LittleEndian, uint32(CertificateVersionV1))
+				cert.Serialize(&certBuf)
+				// Header
+				binary.Write(&certBuf, binary.LittleEndian, uint32(1))          // Version
+				certBuf.Write(make([]byte, 32))                                 // PrevBlock
+				certBuf.Write(make([]byte, 32))                                 // MerkleRoot
+				binary.Write(&certBuf, binary.LittleEndian, uint32(0x4966bc61)) // Timestamp
+				binary.Write(&certBuf, binary.LittleEndian, uint32(0x1d00ffff)) // Bits
+				certBuf.Write(make([]byte, 32))                                 // ProofCommitment
+				// Overflow varint for TxnCount
+				certBuf.Write([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+				return certBuf.Bytes()
+			}(), pver, BaseEncoding, &MessageError{},
 		},
 	}
 
@@ -492,7 +476,7 @@ func TestBlockSerializeSize(t *testing.T) {
 		in   *MsgBlock // Block to encode
 		size int       // Expected serialized size
 	}{
-		// Block with no transactions: 212 (ZKCertificate with 8-byte proof) + 108 (header) + 1 (varint tx count)
+		// Block with no transactions: 212 (CertificateV1 with 8-byte proof) + 108 (header) + 1 (varint tx count)
 		{noTxBlock, 321},
 
 		// First block in the mainnet block chain: 212 (cert) + 108 (header) + 1 (varint) + 134 (tx)
@@ -511,7 +495,7 @@ func TestBlockSerializeSize(t *testing.T) {
 }
 
 // blockOne is the first block in the mainnet block chain.
-// Uses ZKCertificate with sample data for wire encoding tests (mainnet format).
+// Uses CertificateV1 with sample data for wire encoding tests (mainnet format).
 var blockOne = MsgBlock{
 	MsgHeader: MsgHeader{
 		BlockHeader: BlockHeader{
@@ -533,7 +517,7 @@ var blockOne = MsgBlock{
 			Bits:      0x1d00ffff,               // 486604799
 		},
 		MsgCertificate: MsgCertificate{
-			Certificate: &ZKCertificate{
+			Certificate: &CertificateV1{
 				Hash: chainhash.Hash([chainhash.HashSize]byte{
 					0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 					0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
@@ -595,6 +579,7 @@ func init() {
 
 // Transaction location information for block one transactions.
 // After certificate(212) + header(108) + varint(1) = 321
+// certificate = version(4) + hash(32) + pubdata(164) + prooflen(4) + proofdata(8) = 212
 var blockOneTxLocs = []TxLoc{
 	{TxStart: 321, TxLen: 134},
 }

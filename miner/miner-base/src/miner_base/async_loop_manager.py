@@ -19,7 +19,11 @@ from threading import Thread
 import torch
 from miner_utils import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob, OpenedBlockInfo
-from pearl_mining import IncompleteBlockHeader, verify_plain_proof
+from pearl_mining import (
+    IncompleteBlockHeader,
+    check_cert_version_eligible,
+    verify_plain_proof_for_cert_version,
+)
 
 from .block_submission import create_proof
 from .gateway_client import DummyMiningClient, MinerRpcConfig, MiningClient
@@ -262,10 +266,19 @@ class AsyncLoopManager:
         plain_proof = create_proof(opened_block_info, mining_job.incomplete_header_bytes)
         _LOGGER.debug("Created plain proof")
 
+        # Crossover guard: an MoE proof cannot be certified before the fork.
+        try:
+            check_cert_version_eligible(mining_job.cert_version, plain_proof)
+        except ValueError as e:
+            _LOGGER.warning("Skipping block submission: %s", e)
+            return False
+
         if miner_settings.debug:
             _LOGGER.debug("Verifying plain proof in debug mode")
             block_header = IncompleteBlockHeader.from_bytes(mining_job.incomplete_header_bytes)
-            is_valid, message = verify_plain_proof(block_header, plain_proof)
+            is_valid, message = verify_plain_proof_for_cert_version(
+                mining_job.cert_version, block_header, plain_proof
+            )
             if not is_valid:
                 raise AssertionError(f"Plain proof verification failed: {message}")
             _LOGGER.debug("Plain proof verified")

@@ -13,11 +13,11 @@ import (
 	"github.com/pearl-research-labs/pearl/wallet/chain"
 )
 
-// Block100000 uses ZKCertificate with stub proof (not valid for PoW verification).
+// Block100000 uses a V1 certificate with stub proof (not valid for PoW verification).
 var Block100000 = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash: chainhash.Hash([32]byte{
 					0x06, 0xe5, 0x33, 0xfd, 0x1a, 0xda, 0x86, 0x39,
 					0x1f, 0x3f, 0x6c, 0x34, 0x32, 0x04, 0xb0, 0xd2,

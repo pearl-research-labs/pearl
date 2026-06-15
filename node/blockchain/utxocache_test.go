@@ -597,8 +597,15 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
-	if cache.cachedEntries.length() != 0 {
-		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
+	if cache.cachedEntries.length() != len(outPoints1) {
+		t.Fatalf("Expected %d entries, has %d instead", len(outPoints1), cache.cachedEntries.length())
+	}
+	for _, m := range cache.cachedEntries.maps {
+		for _, entry := range m {
+			if entry != nil && entry.isModified() {
+				t.Fatalf("Expected entry to not be modified after periodic flush")
+			}
+		}
 	}
 
 	err = assertConsistencyState(chain, tip.Hash())
@@ -609,6 +616,204 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestShouldFlush(t *testing.T) {
+	require := require.New(t)
+	cache := newUtxoCache(nil, 1*1024*1024)
+
+	bestState := &BestState{Hash: chainhash.Hash{0x01}}
+	otherState := &BestState{Hash: chainhash.Hash{0x02}}
+
+	// FlushRequired always returns true, even with an empty cache.
+	require.True(cache.shouldFlush(FlushRequired, bestState))
+
+	// FlushIfNeeded returns false when bestState hash matches lastFlushHash.
+	cache.lastFlushHash = bestState.Hash
+	require.False(cache.shouldFlush(FlushIfNeeded, bestState))
+
+	// FlushIfNeeded returns false when cache is below max and hash differs.
+	cache.lastFlushHash = chainhash.Hash{}
+	require.False(cache.shouldFlush(FlushIfNeeded, otherState))
+
+	// FlushIfNeeded returns true when cache exceeds max.
+	cache.maxTotalMemoryUsage = 1
+	require.True(cache.shouldFlush(FlushIfNeeded, otherState))
+	cache.maxTotalMemoryUsage = 1 * 1024 * 1024
+
+	// FlushPeriodic returns false when timer is recent and cache is below max.
+	cache.lastFlushTime = time.Now()
+	require.False(cache.shouldFlush(FlushPeriodic, bestState))
+
+	// FlushPeriodic returns true when timer has expired.
+	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
+	require.True(cache.shouldFlush(FlushPeriodic, bestState))
+
+	// FlushPeriodic returns false again after timer is reset.
+	cache.lastFlushTime = time.Now()
+	require.False(cache.shouldFlush(FlushPeriodic, bestState))
+}
+
+func TestNonErasingFlushWithSpentEntries(t *testing.T) {
+	require := require.New(t)
+	chain, _, tearDown := utxoCacheTestChain("TestNonErasingFlushSpent")
+	defer tearDown()
+	cache := chain.utxoCache
+
+	// Add 10 entries and seed the database with an erasing flush.
+	outPoints := make([]wire.OutPoint, 10)
+	for i := range outPoints {
+		op := outpointFromInt(i)
+		outPoints[i] = op
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		cache.addTxOut(op, &txOut, true, int32(i))
+	}
+
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+	})
+	require.NoError(err)
+	require.Equal(0, cache.cachedEntries.length())
+	require.NoError(assertNbEntriesOnDisk(chain, 10))
+
+	// Fetch entries back from DB so they're cached as non-fresh, non-modified.
+	entries, err := cache.fetchEntries(outPoints)
+	require.NoError(err)
+	for _, e := range entries {
+		require.NotNil(e)
+		require.False(e.isFresh())
+		require.False(e.isModified())
+	}
+
+	// Spend 3 entries. They're not fresh, so they stay in cache as spent.
+	for i := 0; i < 3; i++ {
+		cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[i]}, nil)
+	}
+	require.Equal(10, cache.cachedEntries.length(),
+		"spent non-fresh entries should remain in cache until flushed")
+
+	// Add 2 new fresh entries.
+	newOutPoints := make([]wire.OutPoint, 2)
+	for i := range newOutPoints {
+		op := outpointFromInt(100 + i)
+		newOutPoints[i] = op
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		cache.addTxOut(op, &txOut, true, 100+int32(i))
+	}
+	require.Equal(12, cache.cachedEntries.length())
+	memBefore := cache.totalEntryMemory
+
+	// Trigger a non-erasing periodic flush.
+	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
+	err = chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+	})
+	require.NoError(err)
+
+	// Spent entries (3) removed; unspent fetched (7) + new flushed (2) = 9 remain.
+	require.Equal(9, cache.cachedEntries.length())
+
+	// Memory should have decreased by the spent entries' memory.
+	require.Less(cache.totalEntryMemory, memBefore)
+
+	// All remaining entries should have modified and fresh flags cleared.
+	for _, m := range cache.cachedEntries.maps {
+		for _, entry := range m {
+			if entry == nil {
+				continue
+			}
+			require.False(entry.isModified())
+			require.False(entry.isFresh())
+		}
+	}
+
+	// DB should have 10 - 3 spent + 2 new = 9 entries.
+	require.NoError(assertNbEntriesOnDisk(chain, 9))
+}
+
+func TestNonErasingFlushThenSpend(t *testing.T) {
+	require := require.New(t)
+	chain, _, tearDown := utxoCacheTestChain("TestNonErasingFlushThenSpend")
+	defer tearDown()
+	cache := chain.utxoCache
+
+	// Add 5 entries.
+	outPoints := make([]wire.OutPoint, 5)
+	for i := range outPoints {
+		op := outpointFromInt(i)
+		outPoints[i] = op
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		cache.addTxOut(op, &txOut, true, int32(i))
+	}
+
+	// Non-erasing periodic flush writes entries to DB but keeps them in cache.
+	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+	})
+	require.NoError(err)
+	require.Equal(5, cache.cachedEntries.length())
+	require.NoError(assertNbEntriesOnDisk(chain, 5))
+
+	// Verify tfFresh was cleared (critical: without this, spending would
+	// delete the entry from cache but leave it orphaned in the database).
+	for _, m := range cache.cachedEntries.maps {
+		for _, entry := range m {
+			if entry != nil {
+				require.False(entry.isFresh())
+			}
+		}
+	}
+
+	// Spend 2 entries. Since tfFresh was cleared by the non-erasing flush,
+	// addTxIn keeps them in cache as spent markers so writeCache can delete
+	// them from the database on the next flush.
+	cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[0]}, nil)
+	cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[1]}, nil)
+	require.Equal(5, cache.cachedEntries.length(),
+		"spent non-fresh entries must remain in cache until flushed to DB")
+
+	// Erasing flush removes spent entries from DB and clears cache.
+	err = chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+	})
+	require.NoError(err)
+	require.Equal(0, cache.cachedEntries.length())
+	require.Equal(uint64(0), cache.totalEntryMemory)
+
+	// DB should have 5 - 2 spent = 3 entries.
+	require.NoError(assertNbEntriesOnDisk(chain, 3))
+}
+
+func TestPeriodicFlushErasesWhenCacheFull(t *testing.T) {
+	require := require.New(t)
+	chain, _, tearDown := utxoCacheTestChain("TestPeriodicFlushErasesWhenFull")
+	defer tearDown()
+	cache := chain.utxoCache
+
+	numEntries := 10
+	for i := 0; i < numEntries; i++ {
+		op := outpointFromInt(i)
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		cache.addTxOut(op, &txOut, true, int32(i))
+	}
+
+	// Lower the threshold below current usage to simulate a full cache.
+	cache.maxTotalMemoryUsage = cache.totalMemoryUsage() - 1
+	cache.cachedEntries.maxTotalMemoryUsage = cache.maxTotalMemoryUsage
+
+	// Periodic flush with expired timer AND cache exceeding max should
+	// perform an erasing flush (eraseCache = true).
+	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+	})
+	require.NoError(err)
+
+	require.Equal(0, cache.cachedEntries.length(),
+		"periodic flush should erase cache when memory exceeds max")
+	require.Equal(uint64(0), cache.totalEntryMemory)
+	require.NoError(assertNbEntriesOnDisk(chain, numEntries))
 }
 
 func TestFlushNeededAfterPrune(t *testing.T) {

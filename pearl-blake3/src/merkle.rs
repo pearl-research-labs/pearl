@@ -195,6 +195,18 @@ pub struct MerkleProof {
     pub siblings: Vec<Digest>,
 }
 
+impl std::fmt::Debug for MerkleProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MerkleProof")
+            .field("leaf_indices", &self.leaf_indices)
+            .field("total_leaves", &self.total_leaves)
+            .field("root", &self.root)
+            .field("leaf_count", &self.leaf_data.len())
+            .field("sibling_count", &self.siblings.len())
+            .finish()
+    }
+}
+
 impl MerkleProof {
     /// Validate proof structure.
     pub fn sanity_check(&self) -> Result<()> {
