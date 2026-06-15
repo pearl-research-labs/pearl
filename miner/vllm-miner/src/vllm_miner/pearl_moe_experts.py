@@ -367,7 +367,7 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
             B_stacked=B_stacked,
             routing_data=ctx.routing_data,
             routing_hash=ctx.routing_hash,
-            mining_job=get_async_manager().get_mining_job(),
+            mining_job=ctx.mining_job,
             noise_rank=ctx.noise_rank,
             num_experts=E,
             n_per_expert=N,

@@ -110,10 +110,10 @@ func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error 
 		return fmt.Errorf("invalid public_data_len %d (max %d)", c.PublicDataLen, wire.PublicDataMaxSizeV2)
 	}
 	publicData := c.PublicData[:c.PublicDataLen]
-	return verifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
+	return VerifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
 }
 
-func verifyZKProofFFI(
+func VerifyZKProofFFI(
 	header *wire.BlockHeader,
 	certHash chainhash.Hash,
 	proofCommitment chainhash.Hash,
