@@ -386,7 +386,7 @@ var MainNetParams = Params{
 	// address generation.
 	HDCoinType: HDCoinTypePearl,
 
-	MinimumChainWork: new(big.Int).Lsh(big.NewInt(1), 82),
+	MinimumChainWork: new(big.Int).Lsh(big.NewInt(1), 85),
 }
 
 // RegressionNetParams defines the network parameters for the regression test
