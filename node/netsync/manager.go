@@ -909,16 +909,18 @@ func (sm *SyncManager) feedPresync(
 		}
 	}
 
-	// If we transitioned to REDOWNLOAD or are in REDOWNLOAD, drive getdata.
-	sm.drivePresyncGetdata(peer, state)
-
-	// If the state machine wants more headers, send getheaders.
+	// Send getheaders BEFORE getdata so the peer reads and responds to
+	// getheaders before its OnGetData blocks the read goroutine for the
+	// duration of block serving.
 	if result.RequestMore {
 		locator := state.presync.NextHeadersRequestLocator()
 		if locator != nil {
 			_ = peer.PushGetHeadersMsg(locator, &zeroHash, false)
 		}
 	}
+
+	// If we transitioned to REDOWNLOAD or are in REDOWNLOAD, drive getdata.
+	sm.drivePresyncGetdata(peer, state)
 
 	// Check if presync is fully done.
 	if state.presync.Done() {
