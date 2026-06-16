@@ -136,6 +136,58 @@ fn verify_plain_proof(
     }
 }
 
+/// Like `verify_plain_proof` but grades the solution at `nbits` (a Bitcoin-compact
+/// u32 SHARE target) instead of the header's block nbits, so a P2Pool-style pool
+/// can accept shares that clear the easy share target. All other checks (header
+/// binding, strip range, noise/jackpot recompute) are identical. Returns
+/// `(true, msg)` on accept and `(false, msg)` on reject (never raises for a
+/// rejected proof). Share-grading only -- never use for block acceptance.
+#[pyfunction]
+fn verify_plain_proof_with_nbits(
+    block_header: IncompleteBlockHeader,
+    plain_proof: PlainProof,
+    nbits: u32,
+) -> PyResult<(bool, String)> {
+    match verify::verify_plain_proof_with_nbits(&block_header, &plain_proof, Some(nbits)) {
+        Ok(()) => Ok((true, "Mining solution verified successfully".into())),
+        Err(e) => Ok((false, e.to_string())),
+    }
+}
+
+/// Debug: recompute the jackpot PoW hash for a plain proof and return it as a
+/// 32-byte little-endian value (hex string), plus the header-nbits difficulty bound.
+/// Returns (hash_le_hex, bound_hex, hash_bits, bound_bits, h, w, dot).
+#[pyfunction]
+fn dump_jackpot<'py>(
+    py: Python<'py>,
+    block_header: IncompleteBlockHeader,
+    plain_proof: PlainProof,
+) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, usize, usize, usize, u32)> {
+    use zk_pow::api::proof_utils::{compute_jackpot_hash, CompiledPublicParams};
+    use zk_pow::circuit::chip::compute_jackpot;
+    use zk_pow::circuit::pearl_noise::compute_noise;
+    use zk_pow::ffi::plain_proof::parse_plain_proof;
+
+    let (private_params, mut public_params) =
+        parse_plain_proof(block_header, &plain_proof).map_err(|e| py_err("parse", e))?;
+    let compiled = CompiledPublicParams::from(&public_params);
+    let noise = compute_noise(&compiled);
+    let jackpot = compute_jackpot(&compiled, &private_params.s_a, &private_params.s_b, &noise);
+    public_params.hash_jackpot = compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
+
+    // Return hash_jackpot as raw 32 little-endian bytes; Python does the U256 math.
+    let h = public_params.h();
+    let w = public_params.w();
+    let dot = public_params.dot_product_length();
+    Ok((
+        pyo3::types::PyBytes::new(py, &public_params.hash_jackpot),
+        h,
+        w,
+        dot,
+        block_header.nbits,
+    ))
+}
+
 #[pyfunction]
 #[pyo3(signature = (m, n, k, block_header, mining_config, signal_range=None, wrong_jackpot_hash=false))]
 fn mine(
@@ -191,9 +243,11 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<PlainProof>()?;
     m.add_class::<PyProof>()?;
     m.add_function(wrap_pyfunction!(mine, m)?)?;
+    m.add_function(wrap_pyfunction!(dump_jackpot, m)?)?;
     m.add_function(wrap_pyfunction!(generate_proof, m)?)?;
     m.add_function(wrap_pyfunction!(verify_proof, m)?)?;
     m.add_function(wrap_pyfunction!(verify_plain_proof, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_plain_proof_with_nbits, m)?)?;
     m.add_function(wrap_pyfunction!(clear_circuit_cache, m)?)?;
     m.add_function(wrap_pyfunction!(warmup_prove, m)?)?;
     m.add_function(wrap_pyfunction!(py_pad_to_chunk_boundary, m)?)?;

@@ -679,6 +679,30 @@ void pearl_gemm_sm89_run(
   auto epilogue_params = Epilogue::to_underlying_arguments(epilogue_args);
 
   dim3 grid  = Scheduler::get_grid_dim(sched_args, num_sm);
+  static int const cached_grid_mult = []() {
+    char const* e = std::getenv("PEARL_SM89_GRID_MULT");
+    if (e == nullptr) return 1;
+    int v = std::atoi(e);
+    return (v >= 1 && v <= 8) ? v : 1;
+  }();
+  if (cached_grid_mult > 1) {
+    int const total_tiles = num_blocks_m * num_blocks_n;
+    int scaled = static_cast<int>(grid.x) * cached_grid_mult;
+    if (scaled > total_tiles) scaled = total_tiles;
+    if (scaled < 1) scaled = 1;
+    grid.x = static_cast<uint32_t>(scaled);
+  }
+  static int const cached_grid_x = []() {
+    char const* e = std::getenv("PEARL_SM89_GRID_X");
+    if (e == nullptr) return 0;
+    int v = std::atoi(e);
+    return (v >= 1) ? v : 0;
+  }();
+  if (cached_grid_x > 0) {
+    int exact = cached_grid_x;
+    if (exact > total_tiles) exact = total_tiles;
+    grid.x = static_cast<uint32_t>(exact);
+  }
   dim3 block(KTraits::kNumThreads, 1, 1);
 
   size_t smem_size = sizeof(typename KTraits::SharedStorage);
@@ -700,6 +724,12 @@ void pearl_gemm_sm89_run(
                      return int(p2.sharedMemPerBlockOptin / 1024);
                    }());
       return;
+    }
+    if (std::getenv("PEARL_SM89_CARVEOUT_MAX") != nullptr) {
+      (void)cudaFuncSetAttribute(
+          (void const*)&pearl::ada_gemm<KTraits, Scheduler>,
+          cudaFuncAttributePreferredSharedMemoryCarveout,
+          cudaSharedmemCarveoutMaxShared);
     }
     attr_set = true;
   }

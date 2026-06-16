@@ -18,7 +18,7 @@ __constant__ uint8_t d_MSG[7][16] = {
     {12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4},
     {9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7},
     {11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13}};
-enum { CHUNK_START = 1, CHUNK_END = 2, KEYED_HASH = 16 };
+enum { CHUNK_START = 1, CHUNK_END = 2, PARENT = 4, ROOT = 8, KEYED_HASH = 16 };
 
 __device__ __forceinline__ uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
 __device__ __forceinline__ void g(uint32_t* s, int a, int b, int c, int d, uint32_t x, uint32_t y) {
@@ -73,7 +73,59 @@ __global__ void chunk_cvs_kernel(const uint8_t* __restrict__ data, uint32_t n_ch
 #pragma unroll
   for (int i = 0; i < 8; ++i) cvs[(size_t)c * 8 + i] = cv[i];
 }
+// One thread per parent node: out[i] = parent of (in[2i], in[2i+1]). Internal nodes
+// use KEYED_HASH|PARENT and keep the 8-word CV; the single top node (is_top) also sets
+// ROOT so out[0..7] (LE) IS the 32-byte merkle root. Bit-identical to the host fold
+// blake3_root_from_chunk_cvs (same pairwise order, same compress, ROOT only on top).
+__global__ void reduce_level_kernel(const uint32_t* __restrict__ in, uint32_t* __restrict__ out,
+                                    uint32_t half, uint32_t k0, uint32_t k1, uint32_t k2,
+                                    uint32_t k3, uint32_t k4, uint32_t k5, uint32_t k6,
+                                    uint32_t k7, int is_top) {
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= half) return;
+  uint32_t key[8] = {k0, k1, k2, k3, k4, k5, k6, k7};
+  uint32_t m[16];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) m[j]     = in[(size_t)(2 * i) * 8 + j];      // left child CV
+#pragma unroll
+  for (int j = 0; j < 8; ++j) m[8 + j] = in[(size_t)(2 * i + 1) * 8 + j];  // right child CV
+  uint32_t flags = KEYED_HASH | PARENT | (is_top ? ROOT : 0u);
+  uint32_t o[8];
+  compress(key, m, 0, 64, flags, o);
+#pragma unroll
+  for (int j = 0; j < 8; ++j) out[(size_t)i * 8 + j] = o[j];
+}
 }  // namespace
+
+// On-GPU tree reduce of the per-chunk CVs in `d_cvs` (n_chunks*8 u32, n_chunks a power
+// of 2 >= 2) to the 32-byte keyed-BLAKE3 root, written to host `out_root`. Ping-pongs
+// between d_cvs (CLOBBERED — caller's per-attempt scratch) and d_scratch (>= n_chunks*4
+// u32). Replaces the 16MB D2H + single-threaded host fold: only 32 bytes leave the GPU.
+extern "C" void pearl_blake3_root_sm89(uint32_t* d_cvs, uint32_t n_chunks,
+                                       const uint8_t key[32], uint32_t* d_scratch,
+                                       uint8_t out_root[32], cudaStream_t stream) {
+  uint32_t kw[8];
+  for (int i = 0; i < 8; ++i)
+    kw[i] = (uint32_t)key[4 * i] | ((uint32_t)key[4 * i + 1] << 8) |
+            ((uint32_t)key[4 * i + 2] << 16) | ((uint32_t)key[4 * i + 3] << 24);
+  uint32_t* in = d_cvs;
+  uint32_t* out = d_scratch;
+  uint32_t n = n_chunks;
+  int t = 256;
+  while (n > 2) {
+    uint32_t half = n / 2;
+    int b = (int)((half + t - 1) / t);
+    reduce_level_kernel<<<b, t, 0, stream>>>(in, out, half, kw[0], kw[1], kw[2], kw[3],
+                                             kw[4], kw[5], kw[6], kw[7], 0);
+    uint32_t* tmp = in; in = out; out = tmp;
+    n = half;
+  }
+  // n == 2: single top node carries the ROOT flag -> out[0..7] = root (LE = 32 bytes).
+  reduce_level_kernel<<<1, 1, 0, stream>>>(in, out, 1, kw[0], kw[1], kw[2], kw[3],
+                                           kw[4], kw[5], kw[6], kw[7], 1);
+  cudaMemcpyAsync(out_root, out, 32, cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+}
 
 // Compute per-chunk output CVs of `d_data` (n_bytes, multiple of 1024) keyed by
 // `key` (host 32B), into d_cvs (device, n_chunks*32 bytes). Caller reduces to root.

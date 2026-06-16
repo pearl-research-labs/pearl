@@ -39,14 +39,21 @@ FLAGS=(
 # verify-mode still materializes the noised operands host-side (OpenMP) and
 # cross-checks the GPU transcript; mine-mode is fully on-device (no host
 # materialization, no (M,N) C buffer). None of these TUs pull c10/torch.
+# -fopenmp: parallel host Merkle reduce (blake3_root_from_chunk_cvs) + verify-mode materialize.
+# NO -mavx2 / -march: rig04 & rig05 are Intel Pentium G4560 (Kaby Lake) which have AVX/AVX2
+#   FUSED OFF (Intel segments it out of Pentium/Celeron). -mavx2 emits illegal instructions ->
+#   SIGILL core dump on those rigs. Keep the portable x86-64 (SSE2) baseline so ONE binary runs
+#   on the whole fleet (Ryzen, EPYC, AND Pentium). The OpenMP parallel fold is the dominant win.
 $NVCC "${FLAGS[@]}" \
   -Xcompiler -fopenmp \
   pearl_miner_sm89.cu \
   pearl_gemm_sm89_pow_inst_128x256x128.cu \
   pearl_gemm_sm89_pow_inst_128x256x128_nostore.cu \
   pearl_gemm_sm89_pow_inst_128x256x128_nodenoise_nostore.cu \
+  pearl_gemm_sm89_pow_inst_128x256x64_nodenoise_nostore.cu \
   pearl_blake3_root_sm89.cu \
   pearl_miner_noisegen_sm89.cu \
+  pearl_noising_fused_sm89.cu \
   pearl_noisingA_sm89_inst.cu \
   pearl_noisingB_sm89_inst.cu \
   -o "$OUT/pearl_miner_sm89_sm${ARCH}"

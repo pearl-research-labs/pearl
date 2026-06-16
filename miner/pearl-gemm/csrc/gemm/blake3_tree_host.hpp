@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <set>
 
 namespace pearl_miner {
 namespace b3tree {
@@ -110,17 +111,79 @@ inline Output parent_output(const uint32_t l[8], const uint32_t r[8], const uint
 inline void blake3_root_from_chunk_cvs(const uint8_t key32[32], const uint32_t* cvs,
                                        size_t n_chunks, uint8_t out32[32]) {
   uint32_t key[8]; for (int i = 0; i < 8; ++i) key[i] = ld32(key32 + 4 * i);
-  std::vector<uint32_t> cur(cvs, cvs + n_chunks * 8);
+  // PING-PONG between two buffers so each level folds in PARALLEL (OpenMP). An
+  // in-place fold races (slot i is written while another thread reads it as the
+  // left child of slot i/2). Bit-exact with the serial reduce: same pairwise
+  // (2i,2i+1) order, same output_cv on internal nodes, output_root only on the
+  // single top (n==2) node. This fold is ~1M compresses/attempt (2x 2^19-leaf
+  // trees), historically the single-threaded ~200ms/attempt commit cost.
+  std::vector<uint32_t> bufA(cvs, cvs + n_chunks * 8);
+  std::vector<uint32_t> bufB(n_chunks * 4);          // holds the first (largest) folded level: n_chunks/2 nodes
+  uint32_t* in = bufA.data();
+  uint32_t* out = bufB.data();
   size_t n = n_chunks;
-  while (n > 1) {
+  while (n > 2) {
     size_t half = n / 2;
-    for (size_t i = 0; i < half; ++i) {
-      Output p = parent_output(&cur[(2 * i) * 8], &cur[(2 * i + 1) * 8], key, KEYED_HASH);
-      if (n == 2) { output_root(&p, out32); return; }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < (long)half; ++i) {
+      Output p = parent_output(&in[(size_t)(2 * i) * 8], &in[(size_t)(2 * i + 1) * 8], key, KEYED_HASH);
       uint32_t cv[8]; output_cv(&p, cv);
-      for (int j = 0; j < 8; ++j) cur[i * 8 + j] = cv[j];
+      for (int j = 0; j < 8; ++j) out[(size_t)i * 8 + j] = cv[j];
     }
+    uint32_t* tmp = in; in = out; out = tmp;       // swap: this level's output is next level's input
     n = half;
+  }
+  // n == 2: the single top node carries the ROOT flag.
+  Output top = parent_output(&in[0], &in[8], key, KEYED_HASH);
+  output_root(&top, out32);
+}
+
+// Build the full keyed-BLAKE3 tree from precomputed chunk CVs and return the root
+// plus the multileaf-proof siblings for `leaf_indices` (sorted, unique) — bit-exact
+// with pearl_blake3 MerkleTree::get_multileaf_proof (same level-walk + sibling order).
+// `out_siblings` is appended with 32 bytes per sibling. n_chunks must be a power of 2.
+inline void multileaf_proof_from_chunk_cvs(
+    const uint8_t key32[32], const uint32_t* cvs, size_t n_chunks,
+    const std::vector<size_t>& leaf_indices,
+    uint8_t out_root32[32], std::vector<uint8_t>& out_siblings) {
+  uint32_t key[8]; for (int i = 0; i < 8; ++i) key[i] = ld32(key32 + 4 * i);
+  // layers[level] = flat array of 32-byte digests (level 0 = chunk CVs).
+  std::vector<std::vector<uint8_t>> layers;
+  { std::vector<uint8_t> l0(n_chunks * 32);
+    for (size_t c = 0; c < n_chunks; ++c)
+      for (int j = 0; j < 8; ++j) st32(&l0[c * 32 + 4 * j], cvs[c * 8 + j]);
+    layers.push_back(std::move(l0)); }
+  while (layers.back().size() / 32 > 1) {
+    const std::vector<uint8_t>& prev = layers.back();
+    size_t n = prev.size() / 32, half = n / 2;
+    std::vector<uint8_t> next(half * 32);
+    for (size_t i = 0; i < half; ++i) {
+      uint32_t l[8], r[8];
+      for (int j = 0; j < 8; ++j) { l[j] = ld32(&prev[(2*i)*32 + 4*j]); r[j] = ld32(&prev[(2*i+1)*32 + 4*j]); }
+      Output p = parent_output(l, r, key, KEYED_HASH);
+      if (n == 2) { output_root(&p, &next[0]); }
+      else { uint32_t cv[8]; output_cv(&p, cv); for (int j = 0; j < 8; ++j) st32(&next[i*32 + 4*j], cv[j]); }
+    }
+    layers.push_back(std::move(next));
+  }
+  memcpy(out_root32, &layers.back()[0], 32);
+  // Level-walk collecting missing siblings (matches get_multileaf_proof).
+  std::set<size_t> cur(leaf_indices.begin(), leaf_indices.end());
+  size_t level_len = n_chunks, level = 0;
+  while (level_len > 1 && !cur.empty()) {
+    const std::vector<uint8_t>& nodes = layers[level];
+    for (size_t i : cur) {
+      if (i % 2 == 1) {
+        if (!cur.count(i - 1)) out_siblings.insert(out_siblings.end(), &nodes[(i-1)*32], &nodes[(i-1)*32 + 32]);
+      } else if (!cur.count(i + 1) && (i + 1) < level_len) {
+        out_siblings.insert(out_siblings.end(), &nodes[(i+1)*32], &nodes[(i+1)*32 + 32]);
+      }
+    }
+    std::set<size_t> nxt; for (size_t i : cur) nxt.insert(i / 2);
+    cur = std::move(nxt);
+    level_len = (level_len + 1) / 2; level++;
   }
 }
 

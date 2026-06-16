@@ -170,21 +170,35 @@ struct KernelTraitsSm89 {
 
   // ---------- Main int8 TiledMMA ----------
   // SM80 atom: 1 warp = m16 x n8 x k32, int8 x int8 -> int32.
-  // Warp grid: kWarpRows (M) x kWarpCols (N) = (bM/16, 1).  Every warp owns
-  // exactly ONE atom-row in M and SWEEPS all atoms in N.  This produces a
-  // per-thread output footprint with M-cardinality = 2 (matching the Hopper
-  // GMMA footprint and `MinerSettings.rows_pattern=[0, 8]` the pool advertises
-  // via `pearl.set_mining_params`).  See `pearl-investigation/wave8_proof_diff_2026_05_18.md`
-  // for the static analysis that pinned the prior <2,2,1>/<2,4,1> layout as
-  // the silent-async-drop cause: per-thread thread_rows = {r,r+8,r+16,r+24}
-  // (size 4) drove `PearlMiningConfigurationFactory.create()` to a rows_pattern
-  // length-4 byte sequence at offset 9 of mining_config, which no longer
-  // matched the pool's `[0,8]` expectation → job_key mismatch → merkle root
-  // verification failed → pool silently dropped every share.
-  //   bM=128 -> 8 warps in 8x1 layout, per-warp footprint 16M x bN int32
-  //   bM=64  -> 4 warps in 4x1 layout, per-warp footprint 16M x bN int32
-  static constexpr int kWarpRows = bM / 16;   // one atom per warp in M
-  static constexpr int kWarpCols = 1;         // all atoms in single N-column
+  //
+  // Warp grid (pearlhash-150 watts-per-MAC diet, 2026-06-09): (2, 4) at bM=128.
+  // Per-warp atom-block = 32M x 32N; cute's Tile<bM,bN,_32> permutation repeats
+  // that block CONTIGUOUSLY at stride 32, so each thread's accumulator
+  // footprint is rows {r,r+8}+32a (a<4) x cols {c,c+1}+32b (b<8) — an 8x16
+  // jackpot ticket BYTE-IDENTICAL to lpminer's proven mining_config
+  // (rows_pattern [0,8,32,40,64,72,96,104], cols_pattern [0,1,32,33,...,224,225];
+  // see _lpminer_re/re_2026_05_30/reports/07_integration_gap.md:100).
+  //
+  // WHY: at the old (8,1) grid every warp swept ALL of bN, so B LDSM fragments
+  // were replicated 8x (~256 KB smem reads per K-tile for B vs 16 KB for A;
+  // 68 LDSM per k-iter). At (2,4), B replicates 2x and A 4x (64+64 KB,
+  // ~32 LDSM per k-iter) — smem-read energy halves, matching lpminer's
+  // measured cadence (re report 01: 32 LDSM : 128 IMMA). Register pressure is
+  // net-neutral: the full-tile A preload grows 16->64 regs while the
+  // just-in-time B slot shrinks 64->16.
+  //
+  // CONSENSUS COUPLING: the per-thread fragment IS the jackpot ticket. The
+  // pool re-derives mining_config from the proof's declared indices
+  // (zk-pow PeriodicPattern::from_list), so this layout, the miner's RP/CP
+  // tables (pearl_miner_sm89.cu), and the daemon's PEARL_CONFIG_HEX MUST
+  // change together. The wave-8 silent-share-drop
+  // (pearl-investigation/wave8_proof_diff_2026_05_18.md) was an INCONSISTENT
+  // flip of this knob — kernel fold vs declared pattern — not a protocol
+  // rejection of (2,4): lpminer's accepted 8x16 shares prove the shape verifies.
+  //   bM=128 -> 8 warps in 2x4 layout, per-warp footprint 64M x 64N (strided)
+  //   bM=64  -> 4 warps in 4x1 layout (UNCHANGED legacy alphapool R=128 path)
+  static constexpr int kWarpRows = (bM == 128) ? 2 : bM / 16;
+  static constexpr int kWarpCols = kNumWarps / kWarpRows;
   static_assert(kWarpRows * kWarpCols == kNumWarps,
                 "kWarpRows * kWarpCols must equal kNumWarps");
   using AtomLayoutMNK = Layout<Shape<Int<kWarpRows>, Int<kWarpCols>, _1>>;

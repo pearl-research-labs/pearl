@@ -62,13 +62,72 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>      // emit_plain_proof_b64 (was relying on a transitive include)
 #include <string>
 #include <vector>
+#include <ctime>    // time(2) for the random ab_seed job start
 #include <random>
 #include <chrono>
+#include <array>    // deferred HIT emission (2026-06-11)
+#include <atomic>
+#include <memory>
+#include <thread>
+#include <utility>  // std::swap (pipelined noising double-buffer, 2026-06-12)
 
-#include <poll.h>     // serve-mode non-blocking stdin
-#include <unistd.h>   // read(2)
+// ── serve-mode stdin portability (Linux poll/read vs Windows pipe peek) ──
+// The serve loop drains JOB lines from a parent-piped stdin without blocking
+// the GPU. On Linux this is poll(fd0)+read(2); on Windows the daemon pipes
+// into us, so we PeekNamedPipe for available bytes + ReadFile. The Linux
+// branch is byte-identical to the original (the fleet binary builds from this).
+#ifdef _WIN32
+  #ifndef NOMINMAX
+  #define NOMINMAX            // keep windows.h from clobbering std::min/max (CUTLASS uses them)
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN // trim windows.h to avoid macro collisions with CuTe
+  #endif
+  #include <windows.h>
+  #include <process.h>
+  #define getpid _getpid
+  using ssize_t_compat = long long;
+  // The target-adjust multiply (byte*adj + carry, adj = h*w*k < 2^23) never
+  // exceeds ~2^57, so 64 bits is exact — MSVC has no __uint128_t.
+  using pm_wide_t = unsigned long long;
+  // >0 data available, 0 nothing yet, <0 EOF/broken pipe.
+  static inline int pm_stdin_ready() {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == INVALID_HANDLE_VALUE || h == NULL) return -1;
+    if (GetFileType(h) == FILE_TYPE_PIPE) {
+      DWORD avail = 0;
+      if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) return -1;  // broken => EOF
+      return avail > 0 ? 1 : 0;
+    }
+    return (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) ? 1 : 0;  // console fallback
+  }
+  static inline ssize_t_compat pm_stdin_read(char* buf, size_t n) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD got = 0;
+    if (!ReadFile(h, buf, (DWORD)n, &got, NULL)) return 0;  // EOF/broken
+    return (ssize_t_compat)got;
+  }
+  static inline void pm_idle_wait(int ms) { Sleep((DWORD)ms); }
+#else
+  #include <poll.h>     // serve-mode non-blocking stdin
+  #include <unistd.h>   // read(2)
+  using ssize_t_compat = ssize_t;
+  using pm_wide_t = __uint128_t;
+  static inline int pm_stdin_ready() {
+    struct pollfd pfd; pfd.fd = 0; pfd.events = POLLIN;
+    int pr = poll(&pfd, 1, 0);
+    if (pr <= 0) return 0;
+    if (!(pfd.revents & (POLLIN | POLLHUP))) return 0;
+    return 1;
+  }
+  static inline ssize_t_compat pm_stdin_read(char* buf, size_t n) { return read(0, buf, n); }
+  static inline void pm_idle_wait(int ms) {
+    struct pollfd pfd; pfd.fd = 0; pfd.events = POLLIN; poll(&pfd, 1, ms);
+  }
+#endif
 
 #include "pearl_miner_host.hpp"
 #include "host_signal_header.hpp"
@@ -106,6 +165,22 @@ extern "C" void pearl_gemm_sm89_pow_128x256x128_R256_nodenoise_nostore(
     uint32_t const* pow_target, uint32_t const* pow_key,
     void* host_signal_sync, void* host_signal_header_pinned,
     uint64_t* inner_hash_counter, int M, int N, int K, cudaStream_t stream);
+extern "C" void pearl_gemm_sm89_pow_128x256x64_R256_nodenoise_nostore_s2(
+    int8_t const* A, int64_t lda, int8_t const* B, int64_t ldb,
+    cutlass::half_t* C, int64_t ldc, float const* A_scales, float const* B_scales,
+    cutlass::half_t const* EAL, cutlass::half_t const* EBR,
+    cutlass::half_t const* AxEBL, cutlass::half_t const* EARxBpEB,
+    uint32_t const* pow_target, uint32_t const* pow_key,
+    void* host_signal_sync, void* host_signal_header_pinned,
+    uint64_t* inner_hash_counter, int M, int N, int K, cudaStream_t stream);
+extern "C" void pearl_gemm_sm89_pow_128x256x64_R256_nodenoise_nostore_s3(
+    int8_t const* A, int64_t lda, int8_t const* B, int64_t ldb,
+    cutlass::half_t* C, int64_t ldc, float const* A_scales, float const* B_scales,
+    cutlass::half_t const* EAL, cutlass::half_t const* EBR,
+    cutlass::half_t const* AxEBL, cutlass::half_t const* EARxBpEB,
+    uint32_t const* pow_target, uint32_t const* pow_key,
+    void* host_signal_sync, void* host_signal_header_pinned,
+    uint64_t* inner_hash_counter, int M, int N, int K, cudaStream_t stream);
 // noisingB lives in namespace pearl::sm89; noisingA in the global namespace.
 extern "C" void pearl_noisingB_sm89_64x128x64_R128_int32(
     int8_t const* B, int8_t const* EBR, int8_t const* EBL, int8_t const* EAR,
@@ -132,10 +207,27 @@ extern "C" void pearl_miner_fill_AB_sm89(int8_t* dst, size_t n, uint64_t seed,
 extern "C" void pearl_blake3_chunk_cvs_sm89(const uint8_t* d_data, size_t n_bytes,
                                             const uint8_t key[32], uint32_t* d_cvs,
                                             cudaStream_t stream);
+// On-GPU tree reduce of those CVs -> 32-byte root (clobbers d_cvs; d_scratch >= n_chunks*4 u32).
+extern "C" void pearl_blake3_root_sm89(uint32_t* d_cvs, uint32_t n_chunks, const uint8_t key[32],
+                                       uint32_t* d_scratch, uint8_t out_root[32], cudaStream_t stream);
 // Split an R-major (rows,256) int8 matrix into two contiguous (rows,128) halves.
 extern "C" void pearl_miner_split_rmajor_256_sm89(
     const int8_t* in, int8_t* out_lo, int8_t* out_hi, size_t rows,
     cudaStream_t stream);
+// Single-pass R=256 noising (2026-06-12): out = i8wrap(X + D@S^T) consuming the
+// noisegen R-major outputs directly — replaces the chained 2x R128 passes, the
+// 4 repack kernels, and the dead denoise-scratch outputs (~16.9ms -> ~7ms).
+extern "C" void pearl_noising_fused_r256(
+    const int8_t* X, const int8_t* D, const int8_t* S, int8_t* out,
+    int rows, int K, cudaStream_t stream);
+// PEARL_LEGACY_NOISING=1 restores the chained R128 noising path (A/B fallback).
+static bool pm_use_fused_noising() {
+  static const bool legacy = [](){
+    const char* v = std::getenv("PEARL_LEGACY_NOISING");
+    return v && v[0] && v[0] != '0';
+  }();
+  return !legacy;
+}
 
 #include "blake3_tree_host.hpp"  // canonical keyed-BLAKE3 matrix root (== pearl_mining)
 
@@ -150,18 +242,21 @@ using pearl_miner::transcript_from_strips;
 
 static constexpr int R_DIM = 256;
 static constexpr int TILE_M = 128, TILE_N = 256;  // PoW kernel tile
-// Production hash-tile strided pattern. Authoritative geometry = miner-base
-// settings.py: rows_pattern=[0,8] (h=2), cols_pattern length-64 (w=64), which the
-// verifier (TILE_H=2) scores; matches the GPU's per-thread 2-row x 64-col MMA
-// fragment. (The old RP[8]/CP[16] = h=8/w=16 did NOT match the GPU fold -> the
-// reconstructed proof transcript was a non-winner = zero accepted shares.)
-static constexpr int HASH_H = 2, HASH_W = 64;
-static const int RP[HASH_H] = {0, 8};
+// Production hash-tile strided pattern (pearlhash-150, 2026-06-09): h=8 x w=16,
+// matching the (2,4) warp grid in kernel_traits_sm89.hpp — per-thread fragment
+// rows {r,r+8}+32a (a<4), cols {c,c+1}+32b (b<8). BYTE-IDENTICAL to lpminer's
+// pool-accepted mining_config (rows [0,8,32,40,64,72,96,104],
+// cols [0,1,32,33,...,224,225]) so the pool's PeriodicPattern::from_list
+// derivation reproduces the same 52-byte config the daemon passes as
+// PEARL_CONFIG_HEX (rows bytes 070101030000, cols bytes 00010f070000).
+// MUST stay consistent with the kernel warp grid AND the daemon config hex —
+// an inconsistent flip = silent share drops (wave-8 failure mode).
+// (Pre-2026-06-09 history: h=2 x w=64 with RP={0,8}, CP={0,1,8,9,...,249}
+// matched the old (8,1) warp grid; config hex rows 070100000000 cols 0001031f0000.)
+static constexpr int HASH_H = 8, HASH_W = 16;
+static const int RP[HASH_H] = {0, 8, 32, 40, 64, 72, 96, 104};
 static const int CP[HASH_W] = {
-  0,1,8,9,16,17,24,25,32,33,40,41,48,49,56,57,
-  64,65,72,73,80,81,88,89,96,97,104,105,112,113,120,121,
-  128,129,136,137,144,145,152,153,160,161,168,169,176,177,184,185,
-  192,193,200,201,208,209,216,217,224,225,232,233,240,241,248,249};
+  0,1,32,33,64,65,96,97,128,129,160,161,192,193,224,225};
 
 // ---- tiny arg parsing ----
 struct Args {
@@ -253,8 +348,36 @@ struct GpuBufs {
   bool real_commit=false;                    // search with the verifier's real key
   std::vector<uint8_t> header, config;       // job header(76)+config(52) for derive_seeds
   uint32_t *d_cvs=0;                          // device per-chunk CVs (on-GPU root)
-  uint8_t  *h_cvs=0;                          // pinned host CV array (16MB, reduced to root)
+  uint32_t *d_root_scratch=0;                 // device ping-pong scratch for the on-GPU tree reduce
+  uint8_t  *h_cvs=0;                          // pinned host CV array (16MB; HIT-proof + debug oracle)
   Seeds cur_seeds;                           // seeds actually used this attempt (real or fallback)
+  // ---- prep-ahead overlap (2026-06-10): derive attempt i+1's operands +
+  //      commitment seeds on a non-blocking stream WHILE attempt i's PoW kernel
+  //      runs on the legacy stream (hides the ~15-17ms fill_AB + merkle commit
+  //      of the ~450ms attempt). State below carries the prep across calls. ----
+  cudaStream_t pow_stream=0;                 // optional high-priority current-attempt stream
+  cudaStream_t prep_stream=0;                // cudaStreamNonBlocking (mine mode only)
+  bool prep_valid=false;                     // dA/dB + prep_seeds hold prep_seed's data
+  uint64_t prep_seed=0;                      // ab_seed the prep-ahead ran for
+  std::vector<uint8_t> prep_header;          // job header the prep seeds were derived for
+  Seeds prep_seeds;                          // commitment-chain seeds for prep_seed
+  // ---- fixed-B search experiment -------------------------------------------
+  // PEARL_MINER_FIXED_B=1: hold raw B/BpEB fixed for the current job header
+  // and vary only A. This is protocol-legal because
+  //   b_noise_seed = blake3(job_key || B_root)
+  // is independent of A_root; a_noise_seed still varies per A_root.
+  bool fixed_b_valid=false;
+  uint64_t fixed_b_seed=0;
+  std::vector<uint8_t> fixed_b_header;
+  uint8_t fixed_b_root[32]{};
+  uint8_t fixed_b_noise_seed[32]{};
+  // ---- pipelined noising (2026-06-12): the prep-ahead ALSO runs the full
+  //      noisegen -> split -> chained noisingA/B for the NEXT attempt on the
+  //      prep stream, writing into the ALT operand pair below while the PoW
+  //      kernel reads the current pair (~17ms of formerly-serial GPU work
+  //      hidden under the ~418ms kernel). On adoption the pairs swap. ----
+  int8_t  *dApEA2=0,*dBpEB2=0;               // alt noised-operand pair (mine mode only)
+  bool prep_noised=false;                    // dApEA2/dBpEB2 hold prep_seed's noised operands
 };
 
 static void alloc_bufs(GpuBufs& g, int M, int N, int K, bool mine) {
@@ -278,6 +401,15 @@ static void alloc_bufs(GpuBufs& g, int M, int N, int K, bool mine) {
   std::vector<float> as(M, 0.01f), bs(N, 0.01f);
   CUCHK(cudaMemcpy(g.dAs, as.data(), size_t(M)*4, cudaMemcpyHostToDevice));
   CUCHK(cudaMemcpy(g.dBs, bs.data(), size_t(N)*4, cudaMemcpyHostToDevice));
+  // Zero the four fp16 denoise factors ONCE at alloc. In mine/serve/bench mode
+  // nothing ever writes them again (noisegen passes nullptr for fp16 outputs;
+  // the PoW kernels take them const) — hoisted out of run_attempt_mine, where
+  // re-zeroing cost 256 MiB of memset (~0.5 ms) per attempt. Verify mode still
+  // re-zeros per attempt in its own path.
+  CUCHK(cudaMemset(g.dEAL_fp16, 0, size_t(M)*R_DIM*2));
+  CUCHK(cudaMemset(g.dEBR_fp16, 0, size_t(N)*R_DIM*2));
+  CUCHK(cudaMemset(g.dAxEBL_fp16, 0, size_t(M)*R_DIM*2));
+  CUCHK(cudaMemset(g.dEARxBpEB_fp16, 0, size_t(N)*R_DIM*2));
 
   if (mine) {
     CUCHK(cudaMalloc(&g.dA, size_t(M)*K));
@@ -301,7 +433,22 @@ static void alloc_bufs(GpuBufs& g, int M, int N, int K, bool mine) {
     // On-GPU merkle-root scratch: per-chunk CVs (32B each). 1 CV per 1024 bytes.
     size_t max_chunks = (size_t(M)*K > size_t(N)*K ? size_t(M)*K : size_t(N)*K) / 1024;
     CUCHK(cudaMalloc(&g.d_cvs, max_chunks * 32));
+    CUCHK(cudaMalloc(&g.d_root_scratch, max_chunks * 16));  // ping-pong: holds n_chunks/2 nodes (n_chunks*4 u32)
     CUCHK(cudaMallocHost(&g.h_cvs, max_chunks * 32));
+    if (const char* v = std::getenv("PEARL_MINER_HIGH_PRIORITY_POW");
+        v && v[0] && v[0] != '0') {
+      int least_priority = 0, greatest_priority = 0;
+      CUCHK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+      CUCHK(cudaStreamCreateWithPriority(
+          &g.pow_stream, cudaStreamNonBlocking, greatest_priority));
+    }
+    // Non-blocking stream for the prep-ahead overlap: kernels on it run
+    // concurrently with legacy-default-stream work (a plain stream would
+    // implicitly serialize against stream 0 and void the overlap).
+    CUCHK(cudaStreamCreateWithFlags(&g.prep_stream, cudaStreamNonBlocking));
+    // Alt noised-operand pair for the pipelined noising double-buffer (+1 GB).
+    CUCHK(cudaMalloc(&g.dApEA2, size_t(M)*K));
+    CUCHK(cudaMalloc(&g.dBpEB2, size_t(N)*K));
   }
 }
 
@@ -342,8 +489,8 @@ struct PhaseProf {
   void report() {
     if (!on) return;
     CUCHK(cudaEventSynchronize(e[NE-1]));
-    const char* names[6] = {"fill_AB", "noisegen", "split_rmajor",
-                            "noisingAB", "memset_fp16", "PoW_kernel"};
+    const char* names[6] = {"operands+seeds", "noisegen", "split_rmajor",
+                            "noisingAB", "sync_upload", "PoW_kernel"};
     float tot = 0;
     for (int i = 0; i < 6; ++i) {
       float ms = 0; CUCHK(cudaEventElapsedTime(&ms, e[i], e[i+1])); tot += ms;
@@ -353,66 +500,215 @@ struct PhaseProf {
   }
 };
 
+// Real-commitment seed derivation for `ab_seed` on `stream`: fill dA/dB
+// (deterministic splitmix64), compute the keyed-BLAKE3 merkle roots ON-GPU
+// (per-chunk CVs + tree reduce; only 32 bytes leave the device per root, ==
+// pearl_mining.MerkleTree.root), then run the host commitment chain.
+// Touches ONLY dA/dB + d_cvs/d_root_scratch — disjoint from every buffer the
+// PoW kernel reads — so on the non-blocking prep stream this runs CONCURRENTLY
+// with the legacy-stream PoW kernel (the prep-ahead overlap, 2026-06-10).
+// Blocks the host until the roots are back (the root helper syncs `stream`
+// only). PEARL_DEBUG_ROOT's host-oracle cross-check is only wired for the
+// serial path (dbg=true implies stream 0; its sync memcpys would serialize the
+// legacy stream and void the overlap).
+static Seeds derive_real_seeds_on(GpuBufs& g, int M, int N, int K,
+                                  uint64_t ab_seed, cudaStream_t stream, bool dbg) {
+  pearl_miner_fill_AB_sm89(g.dA, size_t(M)*K, ab_seed, stream);
+  pearl_miner_fill_AB_sm89(g.dB, size_t(N)*K, ab_seed ^ 0xD1B54A32D192ED03ULL, stream);
+  uint8_t job_key[32], a_root[32], b_root[32];
+  pearl_miner::blake3::hash_concat(g.header.data(), g.header.size(),
+                                   g.config.data(), g.config.size(), nullptr, job_key);
+  size_t a_chunks = size_t(M)*K / 1024, b_chunks = size_t(N)*K / 1024;
+  uint8_t a_root_ref[32], b_root_ref[32]; int a_ok = 1, b_ok = 1;
+
+  pearl_blake3_chunk_cvs_sm89((const uint8_t*)g.dA, size_t(M)*K, job_key, g.d_cvs, stream);
+  if (dbg) {  // host oracle BEFORE the GPU reduce clobbers d_cvs
+    CUCHK(cudaStreamSynchronize(stream));
+    CUCHK(cudaMemcpy(g.h_cvs, g.d_cvs, a_chunks*32, cudaMemcpyDeviceToHost));
+    pearl_miner::b3tree::blake3_root_from_chunk_cvs(job_key, (const uint32_t*)g.h_cvs, a_chunks, a_root_ref);
+  }
+  pearl_blake3_root_sm89(g.d_cvs, (uint32_t)a_chunks, job_key, g.d_root_scratch, a_root, stream);
+
+  pearl_blake3_chunk_cvs_sm89((const uint8_t*)g.dB, size_t(N)*K, job_key, g.d_cvs, stream);
+  if (dbg) {
+    CUCHK(cudaStreamSynchronize(stream));
+    CUCHK(cudaMemcpy(g.h_cvs, g.d_cvs, b_chunks*32, cudaMemcpyDeviceToHost));
+    pearl_miner::b3tree::blake3_root_from_chunk_cvs(job_key, (const uint32_t*)g.h_cvs, b_chunks, b_root_ref);
+  }
+  pearl_blake3_root_sm89(g.d_cvs, (uint32_t)b_chunks, job_key, g.d_root_scratch, b_root, stream);
+
+  if (dbg) {
+    a_ok = memcmp(a_root, a_root_ref, 32) == 0; b_ok = memcmp(b_root, b_root_ref, 32) == 0;
+    fprintf(stderr, "DEBUG_ROOT ab_seed=%llu a_chunks=%zu gpu_a_match=%d gpu_b_match=%d a_root=",
+            (unsigned long long)ab_seed, a_chunks, a_ok, b_ok);
+    for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x", a_root[i]);
+    fprintf(stderr, " b_root=");
+    for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x", b_root[i]);
+    fprintf(stderr, "\n");
+  }
+  return derive_seeds(g.header.data(), g.header.size(),
+                      g.config.data(), g.config.size(), a_root, b_root);
+}
+
+static void compute_matrix_root_on(GpuBufs& g, const int8_t* d_matrix,
+                                   size_t bytes, const uint8_t job_key[32],
+                                   uint8_t out_root[32], cudaStream_t stream) {
+  size_t chunks = bytes / 1024;
+  pearl_blake3_chunk_cvs_sm89((const uint8_t*)d_matrix, bytes, job_key,
+                              g.d_cvs, stream);
+  pearl_blake3_root_sm89(g.d_cvs, (uint32_t)chunks, job_key,
+                         g.d_root_scratch, out_root, stream);
+}
+
+static bool fixed_b_enabled() {
+  static const bool enabled = [](){
+    const char* v = std::getenv("PEARL_MINER_FIXED_B");
+    return v && v[0] && v[0] != '0';
+  }();
+  return enabled && pm_use_fused_noising();
+}
+
+static void prepare_fixed_b_for_job(GpuBufs& g, int M, int N, int K,
+                                    uint64_t b_seed, cudaStream_t stream) {
+  if (g.fixed_b_valid && g.fixed_b_header == g.header &&
+      g.fixed_b_seed == b_seed) {
+    return;
+  }
+
+  uint8_t job_key[32];
+  pearl_miner::blake3::hash_concat(g.header.data(), g.header.size(),
+                                   g.config.data(), g.config.size(), nullptr,
+                                   job_key);
+  pearl_miner_fill_AB_sm89(g.dB, size_t(N) * K, b_seed, stream);
+  compute_matrix_root_on(g, g.dB, size_t(N) * K, job_key,
+                         g.fixed_b_root, stream);
+  pearl_miner::blake3::hash_concat(job_key, 32, g.fixed_b_root, 32, nullptr,
+                                   g.fixed_b_noise_seed);
+
+  CUCHK(cudaMemcpyAsync(g.dKeyB, g.fixed_b_noise_seed, 32,
+                        cudaMemcpyHostToDevice, stream));
+  pearl_miner_noisegen_sm89_R256(
+      nullptr, g.dEBR_i8, nullptr, nullptr, g.dEBL_R, nullptr,
+      g.dKeyA, g.dKeyB, M, N, K, stream);
+  pearl_noising_fused_r256(g.dB, g.dEBR_i8, g.dEBL_R, g.dBpEB, N, K, stream);
+
+  g.fixed_b_valid = true;
+  g.fixed_b_seed = b_seed;
+  g.fixed_b_header = g.header;
+}
+
+static Seeds derive_fixed_b_a_seed_on(GpuBufs& g, int M, int K,
+                                      uint64_t ab_seed, cudaStream_t stream) {
+  Seeds s{};
+  uint8_t a_root[32];
+  pearl_miner::blake3::hash_concat(g.header.data(), g.header.size(),
+                                   g.config.data(), g.config.size(), nullptr,
+                                   s.job_key);
+  pearl_miner_fill_AB_sm89(g.dA, size_t(M) * K, ab_seed, stream);
+  compute_matrix_root_on(g, g.dA, size_t(M) * K, s.job_key, a_root, stream);
+  memcpy(s.b_noise_seed, g.fixed_b_noise_seed, 32);
+  pearl_miner::blake3::hash_concat(s.b_noise_seed, 32, a_root, 32, nullptr,
+                                   s.a_noise_seed);
+  return s;
+}
+
+static void noising_fixed_b_a_on(GpuBufs& g, const Seeds& s, int M, int N, int K,
+                                 int8_t* out_A, cudaStream_t stream) {
+  (void)N;
+  CUCHK(cudaMemcpyAsync(g.dKeyA, s.a_noise_seed, 32,
+                        cudaMemcpyHostToDevice, stream));
+  pearl_miner_noisegen_sm89_R256(
+      g.dEAL_i8, nullptr, g.dEAR_R, nullptr, nullptr, nullptr,
+      g.dKeyA, g.dKeyB, M, N, K, stream);
+  pearl_noising_fused_r256(g.dA, g.dEAL_i8, g.dEAR_R, out_A, M, K, stream);
+}
+
 static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
-                            uint64_t ab_seed, uint32_t* tile_ix, uint32_t* tile_iy) {
+                            uint64_t ab_seed, uint32_t* tile_ix, uint32_t* tile_iy,
+                            bool prep_next = false, uint64_t next_seed = 0) {
   PhaseProf prof;
   prof.mark(0);
-  // 1. seed-derived A/B on device.
-  pearl_miner_fill_AB_sm89(g.dA, size_t(M)*K, ab_seed, 0);
-  pearl_miner_fill_AB_sm89(g.dB, size_t(N)*K, ab_seed ^ 0xD1B54A32D192ED03ULL, 0);
-  prof.mark(1);
+  const bool dbg = std::getenv("PEARL_DEBUG_ROOT") != nullptr;
+  static const bool stream_sync_only = [](){
+    const char* v = std::getenv("PEARL_MINER_STREAM_SYNC");
+    return v && v[0] && v[0] != '0';
+  }();
+  cudaStream_t const cur_stream = g.pow_stream ? g.pow_stream : cudaStream_t(0);
 
-  // Establish this attempt's seeds. Real-commitment mode computes the verifier's
-  // key from the ACTUAL A/B: A_root/B_root = keyed-BLAKE3(job_key, raw A / raw B^T)
-  // (== pearl_mining.MerkleTree.root), then derive_seeds runs the commitment chain.
-  // Without it the search uses header-only fallback seeds -> spurious hits the pool
-  // rejects. (D2H of A/B per attempt; dominant cost until an on-device root lands.)
+  // 1. operands + this attempt's seeds. Real-commitment mode computes the
+  // verifier's key from the ACTUAL A/B (without it the search uses header-only
+  // fallback seeds -> spurious hits the pool rejects). If the PREVIOUS call's
+  // prep-ahead already derived this (seed, header)'s operands + seeds during
+  // its PoW window, reuse them — dA/dB already hold this seed's data (the
+  // prior call's cudaDeviceSynchronize ordered the prep-stream writes).
+  bool adopted_noised = false;   // pipelined prep already noised this attempt's operands
+  bool const use_fixed_b = g.real_commit && fixed_b_enabled() && !dbg;
   if (g.real_commit) {
-    uint8_t job_key[32], a_root[32], b_root[32];
-    pearl_miner::blake3::hash_concat(g.header.data(), g.header.size(),
-                                     g.config.data(), g.config.size(), nullptr, job_key);
-    // A_root / B_root: per-chunk CVs computed ON-GPU (A/B stay in VRAM), only the
-    // ~16MB CV array is copied back and reduced to the root on host (cheap).
-    size_t a_chunks = size_t(M)*K / 1024, b_chunks = size_t(N)*K / 1024;
-    pearl_blake3_chunk_cvs_sm89((const uint8_t*)g.dA, size_t(M)*K, job_key, g.d_cvs, 0);
-    CUCHK(cudaMemcpy(g.h_cvs, g.d_cvs, a_chunks*32, cudaMemcpyDeviceToHost));
-    pearl_miner::b3tree::blake3_root_from_chunk_cvs(job_key, (const uint32_t*)g.h_cvs, a_chunks, a_root);
-    pearl_blake3_chunk_cvs_sm89((const uint8_t*)g.dB, size_t(N)*K, job_key, g.d_cvs, 0);
-    CUCHK(cudaMemcpy(g.h_cvs, g.d_cvs, b_chunks*32, cudaMemcpyDeviceToHost));
-    pearl_miner::b3tree::blake3_root_from_chunk_cvs(job_key, (const uint32_t*)g.h_cvs, b_chunks, b_root);
-    if (std::getenv("PEARL_DEBUG_ROOT")) {
-      fprintf(stderr, "DEBUG_ROOT ab_seed=%llu a_chunks=%zu job_key=", (unsigned long long)ab_seed, a_chunks);
-      for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x", job_key[i]);
-      fprintf(stderr, " a_root=");
-      for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x", a_root[i]);
-      fprintf(stderr, " b_root=");
-      for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x", b_root[i]);
-      fprintf(stderr, "\n");
+    if (use_fixed_b) {
+      uint64_t const b_seed =
+          (g.fixed_b_valid && g.fixed_b_header == g.header)
+              ? g.fixed_b_seed
+              : (ab_seed ^ 0xD1B54A32D192ED03ULL);
+      prepare_fixed_b_for_job(g, M, N, K, b_seed, cur_stream);
     }
-    g.cur_seeds = derive_seeds(g.header.data(), g.header.size(),
-                               g.config.data(), g.config.size(), a_root, b_root);
+    if (stream_sync_only && g.prep_valid && !dbg) {
+      CUCHK(cudaStreamSynchronize(g.prep_stream));
+    }
+    if (g.prep_valid && g.prep_seed == ab_seed && g.prep_header == g.header && !dbg) {
+      g.cur_seeds = g.prep_seeds;
+      if (g.prep_noised) {
+        // Pipelined noising (2026-06-12): the previous call's prep stream
+        // already produced this attempt's noised operands in the ALT pair
+        // (ordered by its cudaDeviceSynchronize). Swap pairs and skip the
+        // serial noisegen/split/noising phases entirely.
+        std::swap(g.dApEA, g.dApEA2);
+        if (!use_fixed_b) std::swap(g.dBpEB, g.dBpEB2);
+        adopted_noised = true;
+      }
+    } else {
+      g.cur_seeds = use_fixed_b
+          ? derive_fixed_b_a_seed_on(g, M, K, ab_seed, cur_stream)
+          : derive_real_seeds_on(g, M, N, K, ab_seed, cur_stream, dbg);
+    }
+    g.prep_valid = false; g.prep_noised = false;
   } else {
+    pearl_miner_fill_AB_sm89(g.dA, size_t(M)*K, ab_seed, cur_stream);
+    pearl_miner_fill_AB_sm89(g.dB, size_t(N)*K, ab_seed ^ 0xD1B54A32D192ED03ULL, cur_stream);
     g.cur_seeds = s;
   }
+  prof.mark(1);
   const Seeds& cs = g.cur_seeds;
 
+  if (!adopted_noised) {
+  if (use_fixed_b) {
+    noising_fixed_b_a_on(g, cs, M, N, K, g.dApEA, cur_stream);
+    prof.mark(2);
+    prof.mark(3);
+  } else {
   // 2. on-device noise factors (R=256) from a/b_noise_seed.
   CUCHK(cudaMemcpy(g.dKeyA, cs.a_noise_seed, 32, cudaMemcpyHostToDevice));
   CUCHK(cudaMemcpy(g.dKeyB, cs.b_noise_seed, 32, cudaMemcpyHostToDevice));
   pearl_miner_noisegen_sm89_R256(
       g.dEAL_i8, g.dEBR_i8, g.dEAR_R, g.dEAR_K, g.dEBL_R, g.dEBL_K,
-      g.dKeyA, g.dKeyB, M, N, K, 0);
+      g.dKeyA, g.dKeyB, M, N, K, cur_stream);
   prof.mark(2);
 
+  if (pm_use_fused_noising()) {
+    // Fused single-pass noising: consumes EAL/EBR (rows,256) + EAR_R/EBL_R
+    // (K,256) directly — no repack, no chaining, no denoise scratch.
+    prof.mark(3);
+    pearl_noising_fused_r256(g.dA, g.dEAL_i8, g.dEAR_R, g.dApEA, M, K, cur_stream);
+    pearl_noising_fused_r256(g.dB, g.dEBR_i8, g.dEBL_R, g.dBpEB, N, K, cur_stream);
+  } else {
   // 2b. Repack the R-major factors (EAL/EAR for A, EBR/EBL for B) into two
   //     contiguous (rows,128) R-halves. The R=128 noising kernel hard-codes
   //     ld=128, so it cannot consume a strided slice of the (rows,256) buffer.
   //     The K-major sparse factors (EBL_K for A, EAR_K for B) are already
   //     contiguous per half (row-blocks), so they are sliced directly.
-  pearl_miner_split_rmajor_256_sm89(g.dEAL_i8, g.dEAL_h[0], g.dEAL_h[1], M, 0);
-  pearl_miner_split_rmajor_256_sm89(g.dEAR_R,  g.dEAR_h[0], g.dEAR_h[1], K, 0);
-  pearl_miner_split_rmajor_256_sm89(g.dEBR_i8, g.dEBR_h[0], g.dEBR_h[1], N, 0);
-  pearl_miner_split_rmajor_256_sm89(g.dEBL_R,  g.dEBL_h[0], g.dEBL_h[1], K, 0);
+  pearl_miner_split_rmajor_256_sm89(g.dEAL_i8, g.dEAL_h[0], g.dEAL_h[1], M, cur_stream);
+  pearl_miner_split_rmajor_256_sm89(g.dEAR_R,  g.dEAR_h[0], g.dEAR_h[1], K, cur_stream);
+  pearl_miner_split_rmajor_256_sm89(g.dEBR_i8, g.dEBR_h[0], g.dEBR_h[1], N, cur_stream);
+  pearl_miner_split_rmajor_256_sm89(g.dEBL_R,  g.dEBL_h[0], g.dEBL_h[1], K, cur_stream);
   prof.mark(3);
 
   // 3. chained two-pass noisingA/B (R-halves). Half h uses the contiguous
@@ -434,22 +730,24 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
         g.dEAL_h[h],                 // EAL half h, contiguous (M,128)
         g.dEAR_h[h],                 // EAR half h, contiguous (K,128)
         g.dEBL_K + size_t(roff)*K,   // EBL_K_major row-block [roff:, :] (ld=K)
-        g.dApEA, g.dAxEBL_i32, M, K, 0);
+        g.dApEA, g.dAxEBL_i32, M, K, cur_stream);
     pearl::sm89::pearl_noisingB_sm89_64x128x64_R128_int32(
         bIn,
         g.dEBR_h[h],                 // EBR half h, contiguous (N,128)
         g.dEBL_h[h],                 // EBL_R half h, contiguous (K,128)
         g.dEAR_K + size_t(roff)*K,   // EAR_K_major row-block [roff:, :] (ld=K)
-        g.dBpEB, g.dEARxBpEB_i32, N, K, 0);
+        g.dBpEB, g.dEARxBpEB_i32, N, K, cur_stream);
+  }
+  }  // end legacy (non-fused) noising path
+  }
+  } else {
+    prof.mark(2); prof.mark(3);    // phases hidden under the previous PoW kernel
   }
   prof.mark(4);
 
-  // 4. denoise fp16 factors are irrelevant to the transcript/PoW (see verify
-  // path comment) -> zero them.
-  CUCHK(cudaMemset(g.dEAL_fp16, 0, size_t(M)*R_DIM*2));
-  CUCHK(cudaMemset(g.dEBR_fp16, 0, size_t(N)*R_DIM*2));
-  CUCHK(cudaMemset(g.dAxEBL_fp16, 0, size_t(M)*R_DIM*2));
-  CUCHK(cudaMemset(g.dEARxBpEB_fp16, 0, size_t(N)*R_DIM*2));
+  // 4. denoise fp16 factors are irrelevant to the transcript/PoW and are never
+  // written in mine mode — zeroed ONCE in alloc_bufs (hoisted 2026-06-10; was
+  // 256 MiB of per-attempt memset).
 
   CUCHK(cudaMemcpy(g.dKey, cs.a_noise_seed, 32, cudaMemcpyHostToDevice));
   HostSignalSync zsync{};
@@ -464,24 +762,124 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
     const char* v = std::getenv("PEARL_MINER_DENOISE");
     return v && v[0] && v[0] != '0';
   }();
+  static const int pow_bk64_stage = [](){
+    const char* v = std::getenv("PEARL_SM89_POW_BK64_STAGE");
+    if (!v || !v[0]) return 0;
+    int stage = std::atoi(v);
+    return (stage == 2 || stage == 3) ? stage : 0;
+  }();
   if (force_denoise) {
     pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nostore(
         g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
         g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
-        g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, 0);
+        g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, cur_stream);
+  } else if (pow_bk64_stage == 2) {
+    pearl::sm89::pearl_gemm_sm89_pow_128x256x64_R256_nodenoise_nostore_s2(
+        g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
+        g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
+        g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, cur_stream);
+  } else if (pow_bk64_stage == 3) {
+    pearl::sm89::pearl_gemm_sm89_pow_128x256x64_R256_nodenoise_nostore_s3(
+        g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
+        g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
+        g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, cur_stream);
   } else {
     pearl::sm89::pearl_gemm_sm89_pow_128x256x128_R256_nodenoise_nostore(
         g.dApEA, K, g.dBpEB, K, nullptr, N, g.dAs, g.dBs,
         g.dEAL_fp16, g.dEBR_fp16, g.dAxEBL_fp16, g.dEARxBpEB_fp16,
-        g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, 0);
+        g.dTarget, g.dKey, g.dSync, g.hHeader, nullptr, M, N, K, cur_stream);
+  }
+  // PREP-AHEAD (overlap lever, 2026-06-10): while the PoW kernel runs on the
+  // legacy stream (~424ms), derive the NEXT attempt's operands + commitment
+  // seeds on the non-blocking prep stream (~15-17ms): fill_AB + on-GPU merkle
+  // roots touch only dA/dB + d_cvs/d_root_scratch, which the PoW kernel never
+  // reads. The host blocks briefly on the prep stream's two 32B root copies,
+  // then waits out the remaining PoW time in the device sync below.
+  static const bool no_prep = [](){          // PEARL_NO_PREP=1: serial A/B knob
+    const char* v = std::getenv("PEARL_NO_PREP");
+    return v && v[0] && v[0] != '0';
+  }();
+  bool prepped = false;
+  if (g.real_commit && prep_next && !dbg && !no_prep) {
+    g.prep_seeds = use_fixed_b
+        ? derive_fixed_b_a_seed_on(g, M, K, next_seed, g.prep_stream)
+        : derive_real_seeds_on(g, M, N, K, next_seed, g.prep_stream, false);
+    // PIPELINED NOISING (2026-06-12): with next_seed's commitment seeds in
+    // hand, run its ENTIRE noise chain (key upload -> noisegen -> split ->
+    // chained noisingA/B) on the prep stream into the ALT operand pair, all
+    // overlapped with the PoW kernel still running on stream 0. The PoW kernel
+    // reads only dApEA/dBpEB (current pair) + the never-written fp16 zeros, so
+    // every buffer touched here (factors, i32 scratch, dKeyA/B, alt pair,
+    // dA/dB) is disjoint from its reads. The end-of-call device sync below
+    // orders everything; the next call adopts via pointer swap and skips its
+    // serial phases (~17ms/attempt formerly serial, now hidden).
+    if (use_fixed_b) {
+      noising_fixed_b_a_on(g, g.prep_seeds, M, N, K, g.dApEA2, g.prep_stream);
+    } else {
+      CUCHK(cudaMemcpyAsync(g.dKeyA, g.prep_seeds.a_noise_seed, 32,
+                            cudaMemcpyHostToDevice, g.prep_stream));
+      CUCHK(cudaMemcpyAsync(g.dKeyB, g.prep_seeds.b_noise_seed, 32,
+                            cudaMemcpyHostToDevice, g.prep_stream));
+      pearl_miner_noisegen_sm89_R256(
+          g.dEAL_i8, g.dEBR_i8, g.dEAR_R, g.dEAR_K, g.dEBL_R, g.dEBL_K,
+          g.dKeyA, g.dKeyB, M, N, K, g.prep_stream);
+      if (pm_use_fused_noising()) {
+      pearl_noising_fused_r256(g.dA, g.dEAL_i8, g.dEAR_R, g.dApEA2, M, K, g.prep_stream);
+      pearl_noising_fused_r256(g.dB, g.dEBR_i8, g.dEBL_R, g.dBpEB2, N, K, g.prep_stream);
+      } else {
+    pearl_miner_split_rmajor_256_sm89(g.dEAL_i8, g.dEAL_h[0], g.dEAL_h[1], M, g.prep_stream);
+    pearl_miner_split_rmajor_256_sm89(g.dEAR_R,  g.dEAR_h[0], g.dEAR_h[1], K, g.prep_stream);
+    pearl_miner_split_rmajor_256_sm89(g.dEBR_i8, g.dEBR_h[0], g.dEBR_h[1], N, g.prep_stream);
+    pearl_miner_split_rmajor_256_sm89(g.dEBL_R,  g.dEBL_h[0], g.dEBL_h[1], K, g.prep_stream);
+    for (int h = 0; h < 2; ++h) {
+      int roff = h * 128;
+      const int8_t* aIn = (h == 0) ? g.dA : g.dApEA2;
+      const int8_t* bIn = (h == 0) ? g.dB : g.dBpEB2;
+      pearl_noisingA_sm89_64x128x64_R128_int32(
+          aIn, g.dEAL_h[h], g.dEAR_h[h], g.dEBL_K + size_t(roff)*K,
+          g.dApEA2, g.dAxEBL_i32, M, K, g.prep_stream);
+      pearl::sm89::pearl_noisingB_sm89_64x128x64_R128_int32(
+          bIn, g.dEBR_h[h], g.dEBL_h[h], g.dEAR_K + size_t(roff)*K,
+          g.dBpEB2, g.dEARxBpEB_i32, N, K, g.prep_stream);
+    }
+    }  // end legacy (non-fused) prep noising
+    }
+    g.prep_seed = next_seed;
+    g.prep_header = g.header;
+    g.prep_valid = true;
+    g.prep_noised = true;
+    prepped = true;
   }
   prof.mark(6);
-  CUCHK(cudaDeviceSynchronize());
+  if (stream_sync_only) {
+    CUCHK(cudaStreamSynchronize(cur_stream));
+  } else {
+    CUCHK(cudaDeviceSynchronize());
+  }
   cudaError_t le = cudaGetLastError();
   if (le != cudaSuccess) { fprintf(stderr, "PoW(nostore) launch: %s\n", cudaGetErrorString(le)); std::exit(2); }
   prof.report();
 
   if (g.hHeader->status == kSignalTriggered) {
+    if (prepped) {
+      if (stream_sync_only) {
+        CUCHK(cudaStreamSynchronize(g.prep_stream));
+      }
+      // The prep-ahead overwrote dA/dB with the NEXT seed's operands, but the
+      // HIT path (emit_plain_proof_b64) re-reads THIS attempt's raw A/B.
+      // Restore them (deterministic fill, ~3ms; hits are ~1/60 attempts) and
+      // invalidate the prep — the next call falls back to the serial path.
+      // (The prep stream is already idle here — the device sync above ordered
+      // its noising writes — so the refill cannot race the pipelined reads;
+      // the alt pair's contents are simply discarded with the prep.)
+      pearl_miner_fill_AB_sm89(g.dA, size_t(M)*K, ab_seed, cur_stream);
+      if (!use_fixed_b) {
+        pearl_miner_fill_AB_sm89(g.dB, size_t(N)*K,
+                                 ab_seed ^ 0xD1B54A32D192ED03ULL, cur_stream);
+      }
+      CUCHK(cudaDeviceSynchronize());
+      g.prep_valid = false; g.prep_noised = false;
+    }
     *tile_ix = g.hHeader->tileCoord[0];
     *tile_iy = g.hHeader->tileCoord[1];
     return 1;
@@ -490,8 +888,10 @@ static int run_attempt_mine(GpuBufs& g, const Seeds& s, int M, int N, int K,
 }
 
 static int run_attempt(GpuBufs& g, const Seeds& s, int M, int N, int K,
-                       uint64_t ab_seed, uint32_t* tile_ix, uint32_t* tile_iy) {
-  if (g.mine) return run_attempt_mine(g, s, M, N, K, ab_seed, tile_ix, tile_iy);
+                       uint64_t ab_seed, uint32_t* tile_ix, uint32_t* tile_iy,
+                       bool prep_next = false, uint64_t next_seed = 0) {
+  if (g.mine) return run_attempt_mine(g, s, M, N, K, ab_seed, tile_ix, tile_iy,
+                                      prep_next, next_seed);
   // ---- compute the FULL-R256 noised operands ApEA/BpEB on HOST and upload ----
   // ApEA[m] = i8wrap(A[m]   + EAL[m]   @ EAR^T)   (EAR sparse: per-k = EAL[k0]-EAL[k1])
   // BpEB[n] = i8wrap(B^T[n] + EBR[n]   @ EBL^T)
@@ -639,7 +1039,7 @@ static void read_transcript_and_indices(
   // the verifier (zk-pow jackpot/helper.rs: the jackpot tile is declared OUTSIDE
   // the R-step loop and `+=` accumulates, never reset). Per R-chunk rc:
   //   acc_tile[i][j] += An[i][p:p+R] . Bn[j][p:p+R] ; x = XOR-reduce(cumulative
-  //   acc_tile) ; T[rc%16] = rotl13(T[rc%16]) ^ x.   (H=2 x W=64 = 128 cells.)
+  //   acc_tile) ; T[rc%16] = rotl13(T[rc%16]) ^ x.   (H x W = 128 cells.)
   for (int i = 0; i < 16; ++i) transcript[i] = 0;
   std::vector<int32_t> acc_tile((size_t)HASH_H * HASH_W, 0);
   int nK = K / R_DIM;
@@ -659,6 +1059,152 @@ static void read_transcript_and_indices(
     transcript[idx] = ((transcript[idx] << 13) | (transcript[idx] >> 19)) ^ x;
   }
 }
+
+// --- standard base64 ---
+static std::string b64_encode(const uint8_t* d, size_t n) {
+  static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out; out.reserve((n + 2) / 3 * 4);
+  size_t i = 0;
+  for (; i + 3 <= n; i += 3) {
+    uint32_t v = ((uint32_t)d[i] << 16) | ((uint32_t)d[i+1] << 8) | d[i+2];
+    out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]);
+    out.push_back(T[(v>>6)&63]);  out.push_back(T[v&63]);
+  }
+  if (n - i == 1) { uint32_t v = (uint32_t)d[i] << 16;
+    out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]); out.push_back('='); out.push_back('='); }
+  else if (n - i == 2) { uint32_t v = ((uint32_t)d[i] << 16) | ((uint32_t)d[i+1] << 8);
+    out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]); out.push_back(T[(v>>6)&63]); out.push_back('='); }
+  return out;
+}
+
+// Build the full bincode-serialized PlainProof (== pearl_mining PlainProof.to_base64)
+// directly in the binary, from the on-GPU A/B + per-chunk merkle CVs. Lets the daemon
+// submit with ZERO host proof-build. Field order is the Rust struct order:
+//   PlainProof{ m,n,k,noise_rank, a:MMProof, bt:MMProof }
+//   MMProof{ proof:MerkleProof{ leaf_data, leaf_indices, total_leaves, root, siblings }, row_indices }
+// bincode default: fixint LE; Vec = u64 len + elems; usize = u64; [u8;N] = N raw bytes.
+//
+// DEFERRED EMISSION SPLIT (2026-06-11): the build is two halves —
+//   1. extract_hit_device_data: everything that touches the GPU (opened leaf
+//      bytes + the full per-chunk CV arrays of A and B). MUST run before the
+//      next attempt overwrites dA/dB. ~15-25ms.
+//   2. plain_proof_b64_from_host: pure host work (two 524K-leaf multileaf
+//      merkle proofs + bincode + base64), measured ~47ms per tree on an idle
+//      core and far more under CPU-miner contention. serve-mode runs this on a
+//      detached worker thread so the GPU starts the next attempt immediately;
+//      jobmine keeps the old synchronous behavior via the same two calls.
+struct HitHostData {
+  std::vector<size_t>  a_leaf_idx, b_leaf_idx;
+  std::vector<uint8_t> a_leaf_data, b_leaf_data;   // 1024B per leaf, opened rows/cols only
+  std::vector<uint8_t> a_cvs, b_cvs;               // full chunk-CV arrays (total_leaves*32)
+  size_t a_total_leaves = 0, b_total_leaves = 0;
+  uint8_t job_key[32];
+  int a_rows[HASH_H], b_cols[HASH_W];
+  int M = 0, N = 0, K = 0, R = 0;
+};
+
+static void leaf_indices_for_rows(const int* rows, int n_rows, int K,
+                                  std::vector<size_t>& out) {
+  const int lpr = K / 1024;                 // leaves per row (K=4096 -> 4)
+  std::set<size_t> liset;
+  for (int r = 0; r < n_rows; ++r)
+    for (int j = 0; j < lpr; ++j) liset.insert((size_t)rows[r]*lpr + j);
+  out.assign(liset.begin(), liset.end());
+}
+
+// GPU half: opened leaf bytes + full chunk-CV arrays for A and B. Synchronous
+// on stream 0; after it returns, the next attempt may freely overwrite dA/dB.
+static void extract_hit_device_data(GpuBufs& g, const int* a_rows, const int* b_cols,
+                                    int M, int N, int K, int R, HitHostData& h) {
+  h.M = M; h.N = N; h.K = K; h.R = R;
+  memcpy(h.a_rows, a_rows, sizeof(h.a_rows));
+  memcpy(h.b_cols, b_cols, sizeof(h.b_cols));
+  pearl_miner::blake3::hash_concat(g.header.data(), g.header.size(),
+                                   g.config.data(), g.config.size(), nullptr, h.job_key);
+  leaf_indices_for_rows(a_rows, HASH_H, K, h.a_leaf_idx);
+  leaf_indices_for_rows(b_cols, HASH_W, K, h.b_leaf_idx);
+  auto grab = [&](const int8_t* dMat, size_t mat_rows, const std::vector<size_t>& li,
+                  std::vector<uint8_t>& leaf_data, std::vector<uint8_t>& cvs,
+                  size_t& total_leaves) {
+    total_leaves = mat_rows * (size_t)K / 1024;
+    leaf_data.resize(li.size() * 1024);
+    for (size_t i = 0; i < li.size(); ++i)
+      CUCHK(cudaMemcpy(&leaf_data[i*1024], (const uint8_t*)dMat + li[i]*1024, 1024,
+                       cudaMemcpyDeviceToHost));
+    pearl_blake3_chunk_cvs_sm89((const uint8_t*)dMat, mat_rows*(size_t)K, h.job_key,
+                                g.d_cvs, 0);
+    CUCHK(cudaMemcpy(g.h_cvs, g.d_cvs, total_leaves*32, cudaMemcpyDeviceToHost));
+    cvs.assign(g.h_cvs, g.h_cvs + total_leaves*32);   // own copy: g.h_cvs is reused
+  };
+  grab(g.dA, (size_t)M, h.a_leaf_idx, h.a_leaf_data, h.a_cvs, h.a_total_leaves);
+  grab(g.dB, (size_t)N, h.b_leaf_idx, h.b_leaf_data, h.b_cvs, h.b_total_leaves);
+}
+
+// Host half: pure CPU, no GPU/GpuBufs access — safe on a worker thread.
+static std::string plain_proof_b64_from_host(const HitHostData& h) {
+  std::vector<uint8_t> buf;
+  auto wu64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) buf.push_back((uint8_t)(v >> (8*i))); };
+  auto wbytes = [&](const uint8_t* p, size_t n) { buf.insert(buf.end(), p, p + n); };
+  wu64((uint64_t)h.M); wu64((uint64_t)h.N); wu64((uint64_t)h.K); wu64((uint64_t)h.R);
+  auto emit_matrix = [&](const std::vector<size_t>& li, const std::vector<uint8_t>& leaf_data,
+                         const std::vector<uint8_t>& cvs, size_t total_leaves,
+                         const int* rows, int n_rows) {
+    uint8_t root[32]; std::vector<uint8_t> siblings;
+    pearl_miner::b3tree::multileaf_proof_from_chunk_cvs(h.job_key, (const uint32_t*)cvs.data(),
+                                                        total_leaves, li, root, siblings);
+    // MerkleProof: leaf_data, leaf_indices, total_leaves, root, siblings.
+    // bincode serializes each [u8;1024] (N>32) as a length-prefixed seq: u64(1024)+bytes.
+    wu64(li.size());
+    for (size_t i = 0; i < li.size(); ++i) { wu64(1024); wbytes(&leaf_data[i*1024], 1024); }
+    wu64(li.size()); for (size_t idx : li) wu64((uint64_t)idx);
+    wu64(total_leaves);
+    wbytes(root, 32);
+    wu64(siblings.size() / 32); wbytes(siblings.data(), siblings.size());
+    // row_indices
+    wu64((uint64_t)n_rows); for (int r = 0; r < n_rows; ++r) wu64((uint64_t)rows[r]);
+  };
+  emit_matrix(h.a_leaf_idx, h.a_leaf_data, h.a_cvs, h.a_total_leaves, h.a_rows, HASH_H);
+  emit_matrix(h.b_leaf_idx, h.b_leaf_data, h.b_cvs, h.b_total_leaves, h.b_cols, HASH_W);
+  return b64_encode(buf.data(), buf.size());
+}
+
+static std::string emit_plain_proof_b64(GpuBufs& g, const int* a_rows, int n_arows,
+                                        const int* b_cols, int n_bcols,
+                                        int M, int N, int K, int R) {
+  (void)n_arows; (void)n_bcols;   // always HASH_H/HASH_W (the mining_config ticket shape)
+  HitHostData h;
+  extract_hit_device_data(g, a_rows, b_cols, M, N, K, R, h);
+  return plain_proof_b64_from_host(h);
+}
+
+// Compose the full serve-mode HIT line into ONE string so it is written with a
+// single stdio call — line-atomic vs the main loop's STAT printf even when the
+// write happens on the deferred-emission worker thread (stdio locks per call).
+static std::string build_serve_hit_line(uint64_t ab_seed, uint32_t ix, uint32_t iy,
+                                        const int* a_rows, const int* b_cols,
+                                        const uint32_t* T, const uint8_t* gpu_hash,
+                                        const std::string& proof_b64,
+                                        const std::string& header_hex) {
+  char tmp[128];
+  std::string out;
+  out.reserve(proof_b64.size() + header_hex.size() + 1024);
+  snprintf(tmp, sizeof(tmp), "HIT {\"ab_seed\":%llu,\"tile\":[%u,%u],\"a_rows\":[",
+           (unsigned long long)ab_seed, ix, iy);
+  out += tmp;
+  for (int i = 0; i < HASH_H; ++i) { snprintf(tmp, sizeof(tmp), "%s%d", i ? "," : "", a_rows[i]); out += tmp; }
+  out += "],\"b_cols\":[";
+  for (int i = 0; i < HASH_W; ++i) { snprintf(tmp, sizeof(tmp), "%s%d", i ? "," : "", b_cols[i]); out += tmp; }
+  out += "],\"transcript\":[";
+  for (int i = 0; i < 16; ++i) { snprintf(tmp, sizeof(tmp), "%s\"%08x\"", i ? "," : "", T[i]); out += tmp; }
+  out += "],\"gpu_hash\":\"";
+  for (int i = 0; i < 32; ++i) { snprintf(tmp, sizeof(tmp), "%02x", gpu_hash[i]); out += tmp; }
+  out += "\",\"proof\":\"" + proof_b64 + "\",\"header\":\"" + header_hex + "\"}\n";
+  return out;
+}
+
+// Deferred-emission backpressure: >2 proof builds in flight falls back to a
+// synchronous build (never queue unbounded host work; hits are ~1/min).
+static std::atomic<int> g_hit_emit_inflight{0};
 
 static std::string read_stdin_args() {
   std::string all, line;
@@ -685,10 +1231,10 @@ static bool decode_target(const std::string& target_hex, bool big_endian,
   const uint64_t hh = HASH_H, ww = HASH_W;  // 2*64 == old 8*16 == 128
   const uint64_t dpl = (r > 0) ? (uint64_t)(k - k % r) : (uint64_t)k;
   const uint64_t adj = hh * ww * dpl;
-  __uint128_t carry = 0;
+  pm_wide_t carry = 0;
   bool overflow = false;
   for (int i = 0; i < 32; ++i) {
-    __uint128_t prod = (__uint128_t)target_le[i] * adj + carry;
+    pm_wide_t prod = (pm_wide_t)target_le[i] * adj + carry;
     target_le[i] = (uint8_t)(prod & 0xFF);
     carry = prod >> 8;
   }
@@ -742,14 +1288,26 @@ static int run_serve(GpuBufs& g, const Args& a,
                      const std::vector<uint8_t>& broot) {
   const int M = a.m, N = a.n, K = a.k;
   const bool big_endian = (a.target_endian != "little");
-  // Mine in small batches so a new JOB on stdin preempts within ~1 batch.
-  const uint64_t BATCH = 2;
+  // POOL-VALID persistent miner: FIXED job header, search ab_seed with the REAL
+  // on-GPU commitment (real_commit) and emit the full plain_proof per HIT — the
+  // exact valid path as jobmine, but the process stays RESIDENT (no ~335ms CUDA
+  // re-init per window) and preempts on a new JOB so shares are never stale.
+  g.real_commit = (a.real_commit != 0);
+  g.config = config;                   // fixed for the session; keys the on-GPU root
 
-  std::vector<uint8_t> cur_header;     // 76B working header (nonce mutated in loop)
-  std::string cur_header_hex;          // ORIGINAL job header hex (unmutated) to echo
+  std::vector<uint8_t> cur_header;     // 76B job header (FIXED — never mutated)
+  std::string cur_header_hex;          // job header hex to echo in the HIT
+  std::string cur_target_hex;          // normalized target hex for duplicate JOB suppression
   std::vector<uint8_t> cur_target_le;  // decoded pow_target for cur job
   bool have_job = false;
-  uint64_t nonce = 0;
+  uint64_t ab_seed = 0;                // per-job A/B operand search seed
+  uint64_t total_attempts = 0;         // cumulative; emitted as STAT for the daemon's hashrate
+  const bool serve_log_jobs = (std::getenv("PEARL_SM89_SERVE_LOG_JOBS") != nullptr);
+  int stat_interval = 32;
+  if (const char* e = std::getenv("PEARL_SM89_STAT_INTERVAL")) {
+    int v = std::atoi(e);
+    if (v >= 1 && v <= 1024) stat_interval = v;
+  }
 
   // Line-buffered non-blocking stdin reader. We accumulate bytes into `inbuf`
   // and split on '\n'; only the LAST complete JOB line in a drain is applied
@@ -767,6 +1325,9 @@ static int run_serve(GpuBufs& g, const Args& a,
     // trim trailing whitespace/CR on target
     while (!thex.empty() && (thex.back()=='\r'||thex.back()=='\n'||thex.back()==' '||thex.back()=='\t'))
       thex.pop_back();
+    if (have_job && hhex == cur_header_hex && thex == cur_target_hex) {
+      return false;
+    }
     std::vector<uint8_t> h;
     if (!from_hex(hhex, h) || h.size() != 76) {
       fprintf(stderr, "serve: bad JOB header (need 76B hex), ignoring\n");
@@ -779,6 +1340,7 @@ static int run_serve(GpuBufs& g, const Args& a,
     }
     cur_header = std::move(h);
     cur_target_le = std::move(tle);
+    cur_target_hex = std::move(thex);
     // Echo the ORIGINAL job header (with the pool's [72,76) suffix), NOT the
     // per-nonce mutated working header — so the driver can map a HIT back to the
     // exact job by header. The winning nonce is reported separately.
@@ -789,18 +1351,17 @@ static int run_serve(GpuBufs& g, const Args& a,
   // Drain all currently-available stdin into inbuf; split complete lines; apply
   // the NEWEST valid JOB line (re-derive seeds + reset nonce). Sets eof on EOF.
   auto drain_stdin = [&]() {
-    struct pollfd pfd; pfd.fd = 0; pfd.events = POLLIN;
     for (;;) {
-      int pr = poll(&pfd, 1, 0);  // 0ms timeout: non-blocking
-      if (pr <= 0) break;
-      if (!(pfd.revents & (POLLIN | POLLHUP))) break;
+      int ready = pm_stdin_ready();  // non-blocking: >0 data, 0 none, <0 EOF
+      if (ready < 0) { eof = true; break; }
+      if (ready == 0) break;
       char buf[8192];
-      ssize_t n = read(0, buf, sizeof(buf));
+      ssize_t_compat n = pm_stdin_read(buf, sizeof(buf));
       if (n == 0) { eof = true; break; }
       if (n < 0) break;
       inbuf.append(buf, (size_t)n);
       if ((size_t)n < sizeof(buf)) {
-        // likely drained the pipe for now; still loop once more via poll
+        // likely drained the pipe for now; still loop once more
       }
     }
     // Split inbuf into lines; keep the trailing partial line in inbuf.
@@ -815,16 +1376,42 @@ static int run_serve(GpuBufs& g, const Args& a,
     }
     if (consumed) inbuf.erase(0, consumed);
     if (!newest.empty()) {
+      std::string prev_header_hex = cur_header_hex;  // before apply overwrites it
       if (apply_job_line(newest)) {
-        // Upload the per-job target; seeds are re-derived PER nonce in the mine
-        // loop (each nonce mutates header[72,76) -> a fresh job_key), so there
-        // is nothing job-global to derive here.
+        // Upload the per-job target; the on-GPU commitment is keyed on g.header/
+        // g.config (set here), and the A/B operands vary per ab_seed.
         CUCHK(cudaMemcpy(g.dTarget, cur_target_le.data(), 32, cudaMemcpyHostToDevice));
-        nonce = 0;
+        g.header = cur_header;   // FIXED job header for run_attempt_mine's job_key
+        if (have_job && cur_header_hex == prev_header_hex) {
+          // SAME-HEADER re-notify (daemon reconnect, pool re-send, or a
+          // target-only vardiff retarget): keep the ab_seed search position.
+          // The seed->A/B schedule is deterministic, so resetting to 0 would
+          // re-mine already-covered seed space and re-find the IDENTICAL hits
+          // -> pool code-22 duplicate rejects (the ~0.9% dup leak).
+          if (serve_log_jobs) {
+            fprintf(stderr, "serve: same-header JOB target_msb=%02x ab_seed kept at %llu\n",
+                    cur_target_le[31], (unsigned long long)ab_seed);
+          }
+        } else {
+          // Fresh search space for the new job. Start at a RANDOM 64-bit seed
+          // (not 0): the seed->share map is uniform so any start point has
+          // equal share probability, and a random start makes the residual
+          // duplicate windows (binary restart re-feeding the same job, A->B->A
+          // job bounce, any cross-process same-header overlap) statistically
+          // impossible — a restart from 0 deterministically re-found the same
+          // early-seed hits (code-22 duplicate rejects).
+          uint64_t t = (uint64_t)time(nullptr) ^ ((uint64_t)getpid() << 32) ^ ab_seed;
+          t += 0x9E3779B97F4A7C15ULL;
+          t = (t ^ (t >> 30)) * 0xBF58476D1CE4E5B9ULL;
+          t = (t ^ (t >> 27)) * 0x94D049BB133111EBULL;
+          ab_seed = t ^ (t >> 31);
+          if (serve_log_jobs) {
+            fprintf(stderr, "serve: new JOB header[0..4]=%02x%02x%02x%02x target_msb=%02x ab_seed=%llu (random start)\n",
+                    cur_header[0], cur_header[1], cur_header[2], cur_header[3],
+                    cur_target_le[31], (unsigned long long)ab_seed);
+          }
+        }
         have_job = true;
-        fprintf(stderr, "serve: new JOB header[0..4]=%02x%02x%02x%02x target_msb=%02x nonce reset\n",
-                cur_header[0], cur_header[1], cur_header[2], cur_header[3],
-                cur_target_le[31]);
       }
     }
   };
@@ -835,52 +1422,80 @@ static int run_serve(GpuBufs& g, const Args& a,
   while (true) {
     drain_stdin();
     if (eof && inbuf.empty()) {
+      // Drain any in-flight deferred HIT emission before exiting so the final
+      // line is never torn by exit-time stream cleanup racing the worker.
+      while (g_hit_emit_inflight.load() > 0) pm_idle_wait(50);
       fprintf(stderr, "serve: stdin EOF — exiting\n");
       break;
     }
     if (!have_job) {
-      // No job yet: brief blocking poll so we don't spin.
-      struct pollfd pfd; pfd.fd = 0; pfd.events = POLLIN;
-      poll(&pfd, 1, 200);
+      // No job yet: brief wait so we don't spin.
+      pm_idle_wait(200);
       continue;
     }
 
-    // Echo the ORIGINAL (unmutated) job header so the driver maps the HIT to its
-    // job_id; the winning nonce is in the HIT's `nonce` field.
-    const std::string& header_hex_echo = cur_header_hex;
-
-    // Mine BATCH nonces of the current header, returning per-nonce so a new JOB
-    // preempts quickly. The nonce mutates header[72,76) -> fresh job_key ->
-    // fresh noise each attempt (the production attempt-rate path).
-    for (uint64_t b = 0; b < BATCH; ++b, ++nonce) {
-      cur_header[72] = (uint8_t)(nonce);
-      cur_header[73] = (uint8_t)(nonce >> 8);
-      cur_header[74] = (uint8_t)(nonce >> 16);
-      cur_header[75] = (uint8_t)(nonce >> 24);
-      // Re-derive seeds for THIS nonce-mutated header (the job_key includes the
-      // nonce suffix, exactly like mine/bench mode).
-      Seeds s;
-      derive_seeds_for_header(cur_header, config, aroot, broot, s);
-      uint64_t ab_seed = nonce * 0x100000001B3ULL + 0xCBF29CE484222325ULL;
-      uint32_t ix = 0, iy = 0;
-      int hit = run_attempt(g, s, M, N, K, ab_seed, &ix, &iy);
-      if (hit) {
-        int a_rows[HASH_H], b_cols[HASH_W]; uint32_t T[16]; uint8_t gpu_hash[32];
-        read_transcript_and_indices(g, s, K, ix, iy, a_rows, b_cols, T);
-        transcript_hash(T, s.a_noise_seed, gpu_hash);
-        printf("HIT {\"nonce\":%llu,\"seed\":%llu,\"tile\":[%u,%u],\"a_rows\":[",
-               (unsigned long long)nonce, (unsigned long long)ab_seed, ix, iy);
-        for (int i=0;i<HASH_H;++i) printf("%s%d", i?",":"", a_rows[i]);
-        printf("],\"b_cols\":[");
-        for (int i=0;i<HASH_W;++i) printf("%s%d", i?",":"", b_cols[i]);
-        printf("],\"transcript\":[");
-        for (int i=0;i<16;++i) printf("%s\"%08x\"", i?",":"", T[i]);
-        printf("],\"gpu_hash\":\"");
-        for (int i=0;i<32;++i) printf("%02x", gpu_hash[i]);
-        printf("\",\"header\":\"%s\"}\n", header_hex_echo.c_str());
+    // One attempt on the FIXED job header at the current ab_seed. real_commit=1
+    // makes run_attempt_mine compute the verifier's commitment ON-GPU from the
+    // actual (seed-derived) A/B merkle roots — the pool-valid path (s unused when
+    // real_commit; zero-init so a real_commit=0 misconfig can't mine on garbage
+    // seeds). drain_stdin ran this iteration, so a new JOB preempts within
+    // one attempt (~0.5s) -> shares are for the ~current job, never stale.
+    // prep_next/ab_seed+1: while this attempt's PoW kernel runs, the NEXT
+    // attempt's operands + commitment seeds are derived on the prep stream
+    // (the overlap lever) — wasted only when a new JOB preempts (~1/300).
+    Seeds s{};
+    uint32_t ix = 0, iy = 0;
+    int hit = run_attempt(g, s, M, N, K, ab_seed, &ix, &iy,
+                          /*prep_next=*/true, /*next_seed=*/ab_seed + 1);
+    if (hit) {
+      const Seeds& hs = g.real_commit ? g.cur_seeds : s;
+      int a_rows[HASH_H], b_cols[HASH_W]; uint32_t T[16]; uint8_t gpu_hash[32];
+      read_transcript_and_indices(g, hs, K, ix, iy, a_rows, b_cols, T);
+      transcript_hash(T, hs.a_noise_seed, gpu_hash);
+      // The HIT line echoes the job header so the daemon maps it to a job_id
+      // (an in-flight HIT for a just-superseded job still carries that job's
+      // header).
+      if (g.real_commit) {
+        // DEFERRED EMISSION (2026-06-11): pull the proof's device data NOW
+        // (the next attempt overwrites dA/dB and the noised operands), then
+        // run the pure-host half (two 524K-leaf multileaf merkle proofs +
+        // bincode + base64 + the stdout write, ~100ms+, worse under CPU-miner
+        // contention) on a detached worker thread so the GPU starts the next
+        // attempt immediately instead of idling behind host proof-build.
+        auto h = std::make_shared<HitHostData>();
+        extract_hit_device_data(g, a_rows, b_cols, M, N, K, a.r, *h);
+        std::array<uint32_t,16> Tc; memcpy(Tc.data(), T, sizeof(T));
+        std::array<uint8_t,32> gh; memcpy(gh.data(), gpu_hash, sizeof(gpu_hash));
+        std::string hdr_hex = cur_header_hex;
+        uint64_t hseed = ab_seed; uint32_t hix = ix, hiy = iy;
+        auto emit_fn = [h, Tc, gh, hdr_hex, hseed, hix, hiy]() {
+          std::string proof = plain_proof_b64_from_host(*h);
+          std::string line = build_serve_hit_line(hseed, hix, hiy, h->a_rows, h->b_cols,
+                                                  Tc.data(), gh.data(), proof, hdr_hex);
+          fwrite(line.data(), 1, line.size(), stdout);
+          fflush(stdout);
+          g_hit_emit_inflight.fetch_sub(1);
+        };
+        bool spawned = false;
+        if (g_hit_emit_inflight.fetch_add(1) < 2) {
+          try { std::thread(emit_fn).detach(); spawned = true; }
+          catch (...) { /* thread creation failed -> synchronous fallback */ }
+        }
+        if (!spawned) emit_fn();
+      } else {
+        // smoke path (no proof) — cheap, emit inline.
+        std::string line = build_serve_hit_line(ab_seed, ix, iy, a_rows, b_cols,
+                                                T, gpu_hash, std::string(), cur_header_hex);
+        fwrite(line.data(), 1, line.size(), stdout);
         fflush(stdout);
-        // KEEP mining — do not exit on hit.
       }
+      // KEEP mining — persistent process, do not exit on hit.
+    }
+    ++ab_seed; ++total_attempts;
+    // Periodic cumulative attempt count -> the daemon computes the attempt-rate hashrate.
+    if ((total_attempts % (uint64_t)stat_interval) == 0) {
+      printf("STAT %llu\n", (unsigned long long)total_attempts);
+      fflush(stdout);
     }
   }
   return 0;
@@ -955,10 +1570,10 @@ int main(int argc, char** argv) {
     const uint64_t dpl = (a.r > 0) ? (uint64_t)(a.k - a.k % a.r) : (uint64_t)a.k;
     const uint64_t adj = hh * ww * dpl;  // difficulty_adjustment_factor
     // 256-bit (target_le, little-endian) *= adj, saturating at 2^256-1.
-    __uint128_t carry = 0;
+    pm_wide_t carry = 0;
     bool overflow = false;
     for (int i = 0; i < 32; ++i) {
-      __uint128_t prod = (__uint128_t)target_le[i] * adj + carry;
+      pm_wide_t prod = (pm_wide_t)target_le[i] * adj + carry;
       target_le[i] = (uint8_t)(prod & 0xFF);
       carry = prod >> 8;
     }
@@ -970,6 +1585,20 @@ int main(int argc, char** argv) {
   if (!a.broot_hex.empty()) { if (!from_hex(a.broot_hex, broot) || broot.size() != 32) { fprintf(stderr, "bad broot (need 64hex)\n"); return 1; } }
 
   CUCHK(cudaSetDevice(a.dev));
+  // PEARL_MINER_BLOCKING_SYNC=1: yield the CPU during device syncs instead of
+  // the default spin-wait (~93% of a core per GPU process at the ~0.45s attempt
+  // cadence). Keep the lower-latency spin default on big-CPU minis; enable on
+  // the 2C/4T Pentium 6-GPU rigs (rig04/rig05) where six spinning serve
+  // processes saturate the CPU. On CUDA 12 cudaSetDevice already initializes
+  // the primary context; cudaSetDeviceFlags is documented to OVERWRITE the
+  // flags of an initialized device, so this ordering (after cudaSetDevice, so
+  // the flags land on a.dev and not device 0) is correct and cannot fail with
+  // cudaErrorSetOnActiveProcess on 12.x.
+  if (const char* bsync = std::getenv("PEARL_MINER_BLOCKING_SYNC");
+      bsync && bsync[0] && bsync[0] != '0') {
+    CUCHK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+    fprintf(stderr, "pearl_miner_sm89: blocking-sync host waits enabled\n");
+  }
   cudaDeviceProp p; CUCHK(cudaGetDeviceProperties(&p, a.dev));
   fprintf(stderr, "pearl_miner_sm89 dev%d %s sm_%d%d  mode=%s M=%d N=%d K=%d R=%d\n",
           a.dev, p.name, p.major, p.minor, a.mode.c_str(), a.m, a.n, a.k, a.r);
@@ -1024,7 +1653,10 @@ int main(int argc, char** argv) {
     for (uint64_t i = 0; i < count; ++i) {
       uint64_t ab_seed = start + i;  // search var: A/B operand seed (header fixed)
       uint32_t ix = 0, iy = 0;
-      int hit = run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy);
+      // prep_next mirrors serve-mode (sequential seeds), so jobmine exercises —
+      // and the deterministic replay test validates — the pipelined prep path.
+      int hit = run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy,
+                            /*prep_next=*/(i + 1 < count), /*next_seed=*/ab_seed + 1);
       if (hit) {
         // Use the seeds the kernel ACTUALLY searched with (real per-ab_seed
         // commitment when real_commit, else the fallback s) so the read-back
@@ -1033,8 +1665,12 @@ int main(int argc, char** argv) {
         int a_rows[HASH_H], b_cols[HASH_W]; uint32_t T[16]; uint8_t gpu_hash[32];
         read_transcript_and_indices(g, hs, a.k, ix, iy, a_rows, b_cols, T);
         transcript_hash(T, hs.a_noise_seed, gpu_hash);
-        // `nonce` field == ab_seed here (header is never nonce-mutated); the
-        // load-bearing field for the proven proof path is `ab_seed`.
+        // Build the FULL submittable plain_proof in-binary (only when real_commit,
+        // where the on-GPU A/B + commitment match the verifier). The daemon submits
+        // this directly — no host proof build. Empty otherwise (diag/Python path).
+        std::string proof_b64 = g.real_commit
+            ? emit_plain_proof_b64(g, a_rows, HASH_H, b_cols, HASH_W, a.m, a.n, a.k, a.r)
+            : std::string();
         printf("HIT {\"ab_seed\":%llu,\"nonce\":%llu,\"tile\":[%u,%u],\"a_rows\":[",
                (unsigned long long)ab_seed, (unsigned long long)ab_seed, ix, iy);
         for (int j = 0; j < HASH_H; ++j)  printf("%s%d", j ? "," : "", a_rows[j]);
@@ -1044,7 +1680,7 @@ int main(int argc, char** argv) {
         for (int j = 0; j < 16; ++j) printf("%s\"%08x\"", j ? "," : "", T[j]);
         printf("],\"gpu_hash\":\"");
         for (int j = 0; j < 32; ++j) printf("%02x", gpu_hash[j]);
-        printf("\"}\n");
+        printf("\",\"proof\":\"%s\"}\n", proof_b64.c_str());
         fflush(stdout);
         return 0;
       }
@@ -1073,6 +1709,11 @@ int main(int argc, char** argv) {
   if (a.mode == "bench") {
     uint64_t bcount = a.nonce_count ? a.nonce_count : 1;
     std::vector<uint8_t> bheader = header;
+    // bench real_commit=1: measure the PRODUCTION serve path (per-attempt
+    // on-GPU merkle commit + the prep-ahead overlap). Default real_commit=0
+    // keeps the historical bench semantics (no commit, no prep).
+    g.real_commit = (a.real_commit != 0);
+    g.header = header; g.config = config;
     // one warm-up attempt (first launch pays JIT/module-load + caches) — not timed.
     {
       Seeds s;
@@ -1095,8 +1736,10 @@ int main(int argc, char** argv) {
       pearl_miner::blake3::hash_concat(s.job_key, 32, s.job_key, 32, nullptr, s.b_noise_seed);
       pearl_miner::blake3::hash_concat(s.b_noise_seed, 32, s.job_key, 32, nullptr, s.a_noise_seed);
       uint64_t ab_seed = nonce * 0x100000001B3ULL + 0xCBF29CE484222325ULL;
+      uint64_t next_ab = (nonce + 1) * 0x100000001B3ULL + 0xCBF29CE484222325ULL;
       uint32_t ix=0, iy=0;
-      hits += run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy);
+      hits += run_attempt(g, s, a.m, a.n, a.k, ab_seed, &ix, &iy,
+                          /*prep_next=*/(i + 1 < bcount), next_ab);
     }
     auto t1 = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();

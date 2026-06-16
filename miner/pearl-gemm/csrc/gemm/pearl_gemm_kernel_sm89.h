@@ -208,28 +208,32 @@ ada_gemm(CUTE_GRID_CONSTANT
         local_block_found, block_found_k_tile, thread_idx,
         first_nonce_in_cohort);
 
-    // int32 -> float32 for scale (and optionally denoise).
-    auto tCrD_fp32 = make_tensor_like<float>(tCrC);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCrD_fp32); ++i) {
-      tCrD_fp32(i) = static_cast<float>(tCrC(i));
-    }
+    if constexpr (!(KTraits::kMiningNoStore && SkipDenoising)) {
+      // int32 -> float32 for scale (and optionally denoise). The mining
+      // nodenoise/no-store search path consumes only the int32 transcript, so
+      // this epilogue work is skipped there.
+      auto tCrD_fp32 = make_tensor_like<float>(tCrC);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tCrD_fp32); ++i) {
+        tCrD_fp32(i) = static_cast<float>(tCrC(i));
+      }
 
-    if constexpr (!SkipDenoising) {
-      __syncthreads();  // mainloop smem free -> denoise loads can land
-      collective_epilogue.load_denoise(epilogue_params_local, shared_storage,
-                                       block_coord, thread_idx);
-      collective_epilogue.denoise(epilogue_params_local, tCrD_fp32,
-                                  shared_storage, tiled_mma, block_coord,
-                                  thread_idx);
-    }
+      if constexpr (!SkipDenoising) {
+        __syncthreads();  // mainloop smem free -> denoise loads can land
+        collective_epilogue.load_denoise(epilogue_params_local, shared_storage,
+                                         block_coord, thread_idx);
+        collective_epilogue.denoise(epilogue_params_local, tCrD_fp32,
+                                    shared_storage, tiled_mma, block_coord,
+                                    thread_idx);
+      }
 
-    // NB: scale takes the MAIN int8 TiledMma (defines per-thread accumulator
-    // layout), not the denoise TiledMma.
-    collective_epilogue.scale(epilogue_params_local, tCrD_fp32, shared_storage,
-                              tiled_mma, thread_idx, block_coord);
-    collective_epilogue.store(epilogue_params_local, shared_storage, thread_idx,
-                              block_coord);
+      // NB: scale takes the MAIN int8 TiledMma (defines per-thread accumulator
+      // layout), not the denoise TiledMma.
+      collective_epilogue.scale(epilogue_params_local, tCrD_fp32, shared_storage,
+                                tiled_mma, thread_idx, block_coord);
+      collective_epilogue.store(epilogue_params_local, shared_storage, thread_idx,
+                                block_coord);
+    }
 
     if constexpr (!SkipReduction) {
       local_block_found = check_pow_target(
@@ -246,7 +250,11 @@ ada_gemm(CUTE_GRID_CONSTANT
       }
     }
 
-    collective_epilogue.store_tail();
+    if constexpr (KTraits::kMiningNoStore && SkipDenoising) {
+      __syncthreads();
+    } else {
+      collective_epilogue.store_tail();
+    }
     work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(
         scheduler_params, work_tile_info);
   }

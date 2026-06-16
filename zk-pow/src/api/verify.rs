@@ -120,3 +120,48 @@ pub fn verify_plain_proof(block_header: &IncompleteBlockHeader, plain_proof: &Pl
 
     Ok(())
 }
+
+/// Like `verify_plain_proof` but grades the recomputed jackpot difficulty
+/// against `nbits_override` (the easy SHARE target) when provided, instead of
+/// the block header's nbits. `None` behaves identically to `verify_plain_proof`.
+/// Only the final difficulty bound changes; the header/coinbase Merkle binding,
+/// strip range check, noise re-derivation and jackpot/jackpot-hash recomputation
+/// are all still enforced.
+///
+/// WARNING: the nbits override bypasses the header's embedded block difficulty
+/// and MUST be used only for share-target grading, never for block
+/// acceptance/relay (mirrors Go `VerifyZKCertificateWithNbits`).
+pub fn verify_plain_proof_with_nbits(
+    block_header: &IncompleteBlockHeader,
+    plain_proof: &PlainProof,
+    nbits_override: Option<u32>,
+) -> Result<()> {
+    // Parse the plain proof to get private and public params
+    let (private_params, mut public_params) = parse_plain_proof(*block_header, plain_proof)?;
+
+    // Perform public params sanity check
+    public_params_sanity_check(&public_params)?;
+
+    // Verify all strip values are in [-64, 64] (matching the ZK circuit's IRANGE7P1 range check)
+    for strip in private_params.s_a.iter().chain(private_params.s_b.iter()) {
+        for &val in strip {
+            ensure!((-64..=64).contains(&val), "Matrix value {} out of range [-64, 64]", val);
+        }
+    }
+
+    // Create CompiledPublicParams to compute noise
+    let compiled = CompiledPublicParams::from(&public_params);
+
+    // Compute noise matrices from commitment hash
+    let noise = compute_noise(&compiled);
+
+    // Compute the jackpot message (strips + noise -> msg)
+    let jackpot = compute_jackpot(&compiled, &private_params.s_a, &private_params.s_b, &noise);
+
+    // Compute the actual jackpot hash and check the difficulty condition against
+    // the (optional) overridden nbits instead of the header's nbits.
+    public_params.hash_jackpot = compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
+    check_jackpot_difficulty_with_nbits(&public_params, nbits_override)?;
+
+    Ok(())
+}

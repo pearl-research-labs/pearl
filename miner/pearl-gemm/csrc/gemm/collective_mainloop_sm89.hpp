@@ -262,6 +262,18 @@ struct CollectiveMainloopSm89 {
     // fails the check). The canonical sm_80 multistage uses a while loop on
     // `k_tile_count > -(K_PIPE_MAX-1)`; we capture the equivalent bound here.
     int const k_tile_total = k_tile_count + (K_PIPE_MAX - 1);
+    // NB (pearlhash-150, 2026-06-10): a 2x-unrolled variant of this loop
+    // (static stage indices + the transcript fold de-predicated into one
+    // uniform branch per 2-tile trip) was implemented, validated bit-exact
+    // (verify MATCH + verify_plain_proof True), and MEASURED 4.9% SLOWER on a
+    // 4070 Ti Super (175.7 vs 183.8 tmac_s, mini29) despite cutting static
+    // issue slots 21% (620->488 per 2 tiles: fold LOP3 128->64, stage math
+    // ~70->16, dead transcript LDL/STL halved; REG 252, no spill). The rolled
+    // predicated body is branch-free and scheduler-friendly; the unrolled
+    // body's per-trip branches + 2x i-footprint hurt the pipeline seams more
+    // than the predicated-off slots cost. Do NOT re-attempt without a
+    // fundamentally different structure (e.g. fold interleaved into the next
+    // tile's IMMA stream). Details: memory project-pearlhash-150-kernel-diet.
     CUTE_NO_UNROLL
     for (int k_tile = 0; k_tile < k_tile_total; ++k_tile) {
       if constexpr (!KTraits::SkipReduction) {
