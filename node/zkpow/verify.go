@@ -111,10 +111,10 @@ func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error 
 	if e == 0 && topK != 0 {
 		return fmt.Errorf("invalid mining config: e=0 but top_k=%d (must be 0 for non-MoE)", topK)
 	}
-	return verifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
+	return VerifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
 }
 
-func verifyZKProofFFI(
+func VerifyZKProofFFI(
 	header *wire.BlockHeader,
 	certHash chainhash.Hash,
 	proofCommitment chainhash.Hash,

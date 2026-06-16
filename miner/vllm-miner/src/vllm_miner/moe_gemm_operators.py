@@ -5,6 +5,7 @@ from blake3 import blake3
 from miner_base.commitment_hash import CommitmentHasher
 from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 from miner_utils import get_logger
+from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gateway.comm.mining_configuration import MoEConfig
 from pearl_gemm import (
     commitment_hash_from_merkle_roots,
@@ -68,6 +69,7 @@ class MoERoutingLayout:
 class MoENoiseContext:
     """Pre-computed tensors for one MoE forward pass (shared across experts)."""
 
+    mining_job: MiningJob  # job whose header/target the PoW key was derived from
     commitment_hash_A: torch.Tensor  # (32,) uint8
     commitment_hash_B: torch.Tensor  # (32,) uint8
     EAL: torch.Tensor  # (m, r) int8
@@ -203,6 +205,7 @@ def prepare_moe_noising(
     )
 
     return MoENoiseContext(
+        mining_job=mining_job,
         commitment_hash_A=commitment_hash_A,
         commitment_hash_B=commitment_hash_B,
         EAL=EAL,
