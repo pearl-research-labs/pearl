@@ -165,3 +165,4 @@ open-source projects:
 - [btcd](https://github.com/btcsuite/btcd) — full node implementation
 - [btcwallet](https://github.com/btcsuite/btcwallet) — wallet daemon
 - [neutrino](https://github.com/lightninglabs/neutrino) — SPV light client
+
