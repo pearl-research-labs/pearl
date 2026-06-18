@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from compressed_tensors.quantization import QuantizationArgs
 from miner_utils import get_logger
 from vllm import envs
 from vllm.model_executor.layers.fused_moe import (
@@ -40,9 +41,6 @@ MOE_POW_HEADER_POOL_DEPTH = 16
 
 # Down projection (GEMM2): not mined, kept in the original fp8 block quantization.
 W2_WEIGHT_DTYPE = torch.float8_e4m3fn
-W2_BLOCK_N = 128
-W2_BLOCK_K = 128
-W2_BLOCK_SHAPE = [W2_BLOCK_N, W2_BLOCK_K]
 
 MOE_BACKEND_AUTO = "auto"
 MOE_BACKEND_TRITON = "triton"
@@ -72,12 +70,31 @@ def _shared_w13_loader(
 
 
 class PearlMoEMethod(FusedMoEMethodBase):
-    def __init__(self, moe_config: FusedMoEConfig):
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        down_weight_quant: QuantizationArgs,
+        down_input_quant: QuantizationArgs,
+    ):
         super().__init__(moe_config)
+        block_shape = down_weight_quant.block_structure
+        if not block_shape:
+            raise ValueError(
+                "PearlMoE down projection requires a fp8 weight block_structure "
+                f"in the quantization config; got {block_shape!r}"
+            )
+        self.block_n, self.block_k = int(block_shape[0]), int(block_shape[1])
 
-    @classmethod
-    def from_config(cls, moe_config: FusedMoEConfig) -> "PearlMoEMethod":
-        return cls(moe_config)
+        group_size = down_input_quant.group_size
+        if group_size is None:
+            raise ValueError(
+                "PearlMoE down projection requires an activation group_size in "
+                "the quantization config; got None"
+            )
+        self.act_group_size = int(group_size)
+
+    def _w2_block_shape(self) -> list[int]:
+        return [self.block_n, self.block_k]
 
     def create_weights(
         self,
@@ -106,10 +123,10 @@ class PearlMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        # Down projection: fp8 weights block-wise scales.
-        layer.weight_block_size = W2_BLOCK_SHAPE
-        n_tiles = (hidden_size + W2_BLOCK_N - 1) // W2_BLOCK_N
-        k_tiles = (intermediate_size_per_partition + W2_BLOCK_K - 1) // W2_BLOCK_K
+        # Down projection: fp8 weights with block-wise scales.
+        layer.weight_block_size = self._w2_block_shape()
+        n_tiles = (hidden_size + self.block_n - 1) // self.block_n
+        k_tiles = (intermediate_size_per_partition + self.block_k - 1) // self.block_k
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
@@ -207,6 +224,8 @@ class PearlMoEMethod(FusedMoEMethodBase):
                 moe_config=self.moe,
                 quant_config=self.moe_quant_config,
                 layer=layer,
+                w2_block_shape=self._w2_block_shape(),
+                act_group_size=self.act_group_size,
             )
             self.moe_kernel = mk.FusedMoEKernel(
                 prepare_finalize=prepare_finalize,
@@ -256,4 +275,6 @@ class PearlMoEMethod(FusedMoEMethodBase):
             moe_config=self.moe,
             quant_config=self.moe_quant_config,
             layer=layer,
+            w2_block_shape=self._w2_block_shape(),
+            act_group_size=self.act_group_size,
         )

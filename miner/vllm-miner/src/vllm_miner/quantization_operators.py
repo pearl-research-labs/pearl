@@ -49,17 +49,12 @@ def quant_8bit(
     return quantize_kernel(x, max_val=MAX_VAL_8BIT, smooth_scale=smooth_scale)
 
 
-def quant_fp8_block(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quant_fp8_block(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamic per-token-group fp8 quantization for the block-scaled GEMM2."""
-
-    FP8_DTYPE = torch.float8_e4m3fn
-    FP8_GROUP_SIZE = 128
-    FP8_BLOCK = [FP8_GROUP_SIZE, FP8_GROUP_SIZE]
-
     return moe_kernel_quantize_input(
         A=x,
         A_scale=None,
-        quant_dtype=FP8_DTYPE,
+        quant_dtype=torch.float8_e4m3fn,
         per_act_token_quant=False,
-        block_shape=FP8_BLOCK,
+        block_shape=[group_size, group_size],
     )

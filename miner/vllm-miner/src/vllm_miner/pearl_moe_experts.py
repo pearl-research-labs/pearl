@@ -32,10 +32,10 @@ from .moe_gemm_operators import (
     permute_a_side_to_expert_order,
     prepare_moe_noising,
 )
-from .pearl_moe_method import W2_BLOCK_SHAPE
 from .quantization_operators import quant_7bit, quant_fp8_block
 
 _GEMM2_TOP_K = 1
+_GEMM2_QUANT_SCHEME = "fp8_w8a8"
 # MoE noise kernels require at least Hopper (matches dense PearlKernel min capability).
 _MIN_COMPUTE_CAPABILITY_MAJOR = 9
 # vLLM sentinel meaning "infer expert count from the weight tensor".
@@ -71,10 +71,14 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         self,
         moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
+        w2_block_shape: list[int],
+        act_group_size: int,
         layer: torch.nn.Module | None = None,
     ):
         super().__init__(moe_config, quant_config)
         self._layer = layer
+        self._w2_block_shape = w2_block_shape
+        self._act_group_size = act_group_size
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -386,11 +390,18 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         w1: torch.Tensor,
     ) -> None:
         """Down projection via the Triton fp8 block grouped GEMM."""
-        quantized_intermediate, activation_scale = quant_fp8_block(intermediate_cache2)
+        quantized_intermediate, activation_scale = quant_fp8_block(
+            intermediate_cache2, group_size=self._act_group_size
+        )
 
         gemm2_config = dict(
             try_get_optimal_moe_config(
-                w1.shape, w2.shape, _GEMM2_TOP_K, "fp8_w8a8", num_tokens, W2_BLOCK_SHAPE
+                w1.shape,
+                w2.shape,
+                _GEMM2_TOP_K,
+                _GEMM2_QUANT_SCHEME,
+                num_tokens,
+                self._w2_block_shape,
             )
         )
         # Reuse the token alignment that produced sorted_token_ids/expert_ids.
@@ -415,7 +426,7 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
             use_int8_w8a16=False,
             use_int4_w4a16=False,
             per_channel_quant=False,
-            block_shape=W2_BLOCK_SHAPE,
+            block_shape=self._w2_block_shape,
         )
 
         ops.moe_sum(intermediate_cache3, output)

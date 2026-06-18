@@ -145,9 +145,7 @@ def make_moe_tensors(
     w2_weight = (
         torch.randn(num_experts, hidden_dim, intermediate_size, device=device) * weight_scale
     ).to(_MOE_TEST_W2_DTYPE)
-    w2_weight_scale = torch.ones(
-        num_experts, n_tiles, k_tiles, dtype=torch.float32, device=device
-    )
+    w2_weight_scale = torch.ones(num_experts, n_tiles, k_tiles, dtype=torch.float32, device=device)
 
     hidden_states = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=device)
 

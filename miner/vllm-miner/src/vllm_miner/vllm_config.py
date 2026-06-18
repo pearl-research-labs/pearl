@@ -161,7 +161,7 @@ class PearlConfig(CompressedTensorsConfig):
                 down_weight, down_input
             ):
                 _LOGGER.debug(f"Pearl MoE (int7 gate/up + fp8 block down) detected for {prefix}")
-                return PearlMoEMethod(layer.moe_config)
+                return PearlMoEMethod(layer.moe_config, down_weight, down_input)
 
         return super().get_quant_method(layer, prefix)
 
