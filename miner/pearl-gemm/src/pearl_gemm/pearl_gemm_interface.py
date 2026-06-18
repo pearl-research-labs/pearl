@@ -614,49 +614,6 @@ def _abstract_commitment_hash_from_merkle_roots(
     return None
 
 
-def quantize(input_tensor, output, scales, max_val=63, smooth_scale=None, fast_math=False):
-    """
-    Perform dynamic per-token quantization on input tensor.
-
-    This function quantizes each row of the input tensor independently using
-    dynamic scaling. Supports 7-bit ([-63, 63]) and 8-bit ([-127, 127]) ranges.
-
-    Args:
-        input_tensor (Tensor): Input tensor to quantize, shape (num_tokens, hidden_size).
-                              Must be float16 or bfloat16 dtype.
-        output (Tensor): Output tensor for quantized values, shape (num_tokens, hidden_size).
-                        Must be int8 dtype.
-        scales (Tensor): Output tensor for per-row scales, shape (num_tokens, 1).
-                        Must be float32 dtype.
-        max_val (int): Maximum quantization value. Must be 63 (7-bit) or 127 (8-bit).
-                      Default: 63.
-        smooth_scale (Tensor, optional): Per-channel scale tensor, shape (hidden_size,).
-                                        Must be float32, float16, or bfloat16 dtype.
-                                        When provided, input is divided by smooth_scale
-                                        before quantization. Default: None.
-        fast_math (bool): If True, use div.approx.ftz (standard division) for division.
-                         If False, use IEEE754 compatible div.rn.ftz.
-                         Default: False.
-
-    The quantization formula:
-        If smooth_scale is None:
-            scale[i] = max(abs(input[i, :])) / max_val
-            output[i, j] = round(input[i, j] / scale[i])
-        If smooth_scale is provided:
-            scaled_input[i, j] = input[i, j] / smooth_scale[j]
-            scale[i] = max(abs(scaled_input[i, :])) / max_val
-            output[i, j] = round(scaled_input[i, j] / scale[i])
-    """
-    return pearl_gemm_cuda.quantize(input_tensor, output, scales, max_val, smooth_scale, fast_math)
-
-
-@torch.library.register_fake("pearl_gemm::quantize")
-def _abstract_quantize(
-    input_tensor, output, scales, max_val=63, smooth_scale=None, fast_math=False
-):
-    return None
-
-
 # Fake Tensor function for torch.compile support
 @torch.library.register_fake("pearl_gemm::tensor_hash")
 def _abstract_tensor_hash(

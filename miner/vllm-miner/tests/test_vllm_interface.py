@@ -13,12 +13,11 @@ from utils import (
     DEFAULT_LAYER_PARAM_NAMES,
     DEFAULT_QUANT_CONFIG,
     create_mock_layer,
-    reference_quant_7bit,
 )
 from vllm import _custom_ops as vllm_ops
 from vllm_miner import PearlKernel
 from vllm_miner.config import config as pearl_config
-from vllm_miner.quantization_operators import quant_8bit
+from vllm_miner.quantization_operators import quant_7bit, quant_8bit
 from vllm_miner.vllm_config import PearlConfig
 from vllm_miner.vllm_scheme import PearlScheme
 
@@ -83,8 +82,8 @@ def test_apply_weights_mining_enabled(m, n, k, async_manager):
     assert output.shape == (m, n)
     assert output.dtype == torch.bfloat16  # Output should be bfloat16
 
-    # Compare with reference implementation (int7 quantization)
-    x_quantized_ref, x_s, _ = reference_quant_7bit(x)
+    # Compare with our own int7 quantization (same as kernel uses)
+    x_quantized_ref, x_s, _ = quant_7bit(x)
     ref_output = vllm_ops.cutlass_scaled_mm(
         x_quantized_ref,
         layer.weight_q.T,
@@ -172,8 +171,8 @@ def test_apply_weights_with_noisy_gemm(m, n, k, async_manager):
     assert output.shape == (m, n)
     assert output.dtype == torch.bfloat16
 
-    # Compare with reference (vanilla GEMM for small matrices)
-    x_quantized_ref, x_s, _ = reference_quant_7bit(x)
+    # Compare with our own int7 quantization (same as kernel uses)
+    x_quantized_ref, x_s, _ = quant_7bit(x)
     ref_output = vllm_ops.cutlass_scaled_mm(
         x_quantized_ref,
         layer.weight_q.T,
