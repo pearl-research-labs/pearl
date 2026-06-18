@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from .mining_state import ensure_pinned_pool_at_least
+from .quantization_operators import NO_HADAMARD_BLOCK_SIZE
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
@@ -92,6 +93,9 @@ class PearlMoEMethod(FusedMoEMethodBase):
                 "the quantization config; got None"
             )
         self.act_group_size = int(group_size)
+
+        # Resolved from the loaded weights in process_weights_after_loading.
+        self.hadamard_block_size = NO_HADAMARD_BLOCK_SIZE
 
     def _w2_block_shape(self) -> list[int]:
         return [self.block_n, self.block_k]
@@ -169,11 +173,21 @@ class PearlMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_smooth_quant_scale", w13_smooth_quant_scale)
         set_weight_attrs(w13_smooth_quant_scale, {"weight_loader": _shared_w13_loader})
 
+        w13_hadamard_block_size = torch.nn.Parameter(
+            torch.zeros(1, dtype=torch.int32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_hadamard_block_size", w13_hadamard_block_size)
+        set_weight_attrs(w13_hadamard_block_size, {"weight_loader": _shared_w13_loader})
+
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self._warn_if_backend_overridden()
+
+        # Cache the shared gate/up Hadamard block size
+        self.hadamard_block_size = int(layer.w13_hadamard_block_size.reshape(-1)[0].item())
 
         num_experts = layer.w13_weight.shape[0]
         ensure_pinned_pool_at_least(num_experts * MOE_POW_HEADER_POOL_DEPTH)
@@ -226,6 +240,7 @@ class PearlMoEMethod(FusedMoEMethodBase):
                 layer=layer,
                 w2_block_shape=self._w2_block_shape(),
                 act_group_size=self.act_group_size,
+                hadamard_block_size=self.hadamard_block_size,
             )
             self.moe_kernel = mk.FusedMoEKernel(
                 prepare_finalize=prepare_finalize,
@@ -277,4 +292,5 @@ class PearlMoEMethod(FusedMoEMethodBase):
             layer=layer,
             w2_block_shape=self._w2_block_shape(),
             act_group_size=self.act_group_size,
+            hadamard_block_size=self.hadamard_block_size,
         )
