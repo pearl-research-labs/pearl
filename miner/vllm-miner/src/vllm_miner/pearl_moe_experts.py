@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 import torch
@@ -26,8 +27,11 @@ from vllm.platforms import current_platform
 
 from .callbacks import MoEStatusCheckCallback
 from .config import config as pearl_config
+from .gemm_operators import pearl_gemm_vanilla
 from .mining_state import get_async_manager, get_pinned_pool
 from .moe_gemm_operators import (
+    MoERoutingLayout,
+    build_moe_routing_layout,
     pearl_moe_expert_gemm,
     permute_a_side_to_expert_order,
     prepare_moe_noising,
@@ -40,6 +44,8 @@ _GEMM2_QUANT_SCHEME = "fp8_w8a8"
 _MIN_COMPUTE_CAPABILITY_MAJOR = 9
 # vLLM sentinel meaning "infer expert count from the weight tensor".
 GLOBAL_NUM_EXPERTS_INFER_FROM_WEIGHTS = -1
+_EXPERT_LOCAL_MINING_ENV = "MINER_MOE_EXPERT_LOCAL_MINING"
+_EXPERT_LOCAL_MIN_M_ENV = "MINER_MOE_EXPERT_LOCAL_MIN_M"
 
 _SUPPORTED_ACTIVATIONS = frozenset(
     {
@@ -55,6 +61,33 @@ _TORCH_TO_TRITON_DTYPE: dict[torch.dtype, tl.dtype] = {
     torch.float16: tl.float16,
     torch.float32: tl.float32,
 }
+
+
+def _use_expert_local_mining_threshold() -> bool:
+    value = os.getenv(_EXPERT_LOCAL_MINING_ENV, "1").lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _expert_local_min_m() -> int:
+    gemm_config = pearl_config.matrix_multiplication_config["use_simplified_gemm"]
+    global_min_m = int(gemm_config["min_m"])
+    value = os.getenv(_EXPERT_LOCAL_MIN_M_ENV)
+    if value is None or value == "":
+        return global_min_m
+
+    try:
+        min_m = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{_EXPERT_LOCAL_MIN_M_ENV} must be an integer") from exc
+
+    if min_m < global_min_m:
+        raise ValueError(f"{_EXPERT_LOCAL_MIN_M_ENV} must be >= {global_min_m}")
+
+    tile_size_m = int(pearl_config.settings.tile_size_m)
+    if min_m % tile_size_m != 0:
+        raise ValueError(f"{_EXPERT_LOCAL_MIN_M_ENV} must be a multiple of {tile_size_m}")
+
+    return min_m
 
 
 def _torch_dtype_to_triton_compute_type(dtype: torch.dtype) -> tl.dtype:
@@ -158,6 +191,17 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         smooth = w13_smooth[:K] if w13_smooth is not None else None
         return quant_7bit(hidden_states, smooth_scale=smooth)
 
+    @staticmethod
+    def _expert_mining_mask(layout: MoERoutingLayout, n: int, k: int) -> list[bool]:
+        gemm_config = pearl_config.matrix_multiplication_config["use_simplified_gemm"]
+        min_n = int(gemm_config["min_n"])
+        min_k = int(gemm_config["min_k"])
+        if (n == 1) or (k == 1) or (n < min_n) or (k < min_k):
+            return [False] * layout.num_experts
+
+        min_m = _expert_local_min_m()
+        return [layout.expert_slice(i)[1] >= min_m for i in range(layout.num_experts)]
+
     def apply(
         self,
         output: torch.Tensor,
@@ -183,7 +227,7 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         if global_num_experts == GLOBAL_NUM_EXPERTS_INFER_FROM_WEIGHTS:
             global_num_experts = E
 
-        should_mine = (
+        should_try_mining = (
             not get_async_manager()._conf.no_mining
         ) and pearl_config.should_use_noisy_gemm(num_tokens, N, K)
 
@@ -204,7 +248,20 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         )
 
         gemm1_compute_type = _torch_dtype_to_triton_compute_type(hidden_states.dtype)
+        routing_layout = None
+        mine_expert_mask = None
+        should_mine = False
+        if should_try_mining:
+            routing_layout = build_moe_routing_layout(topk_ids, E)
+            if _use_expert_local_mining_threshold():
+                mine_expert_mask = self._expert_mining_mask(routing_layout, N, K)
+            else:
+                mine_expert_mask = [True] * E
+            should_mine = any(mine_expert_mask)
+
         if should_mine:
+            assert routing_layout is not None
+            assert mine_expert_mask is not None
             self._apply_per_expert_gemm1(
                 A_q=A_q,
                 A_scales=A_scales,
@@ -218,6 +275,8 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
                 num_tokens=num_tokens,
                 top_k_num=top_k_num,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                routing_layout=routing_layout,
+                mine_expert_mask=mine_expert_mask,
             )
         else:
             # Vanilla int8 grouped GEMM1 (no mining / no denoise).
@@ -272,10 +331,19 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         num_tokens: int,
         top_k_num: int,
         apply_router_weight_on_input: bool,
+        routing_layout: MoERoutingLayout,
+        mine_expert_mask: list[bool],
     ) -> None:
-        """GEMM1: per-expert ``noisy_gemm`` with PoW extraction"""
+        """GEMM1: per-expert noisy GEMM for hot experts, vanilla for smaller ones."""
         B_stacked = w1.reshape(E * N, K)
-        ctx = prepare_moe_noising(A_q, A_scales, topk_ids, B_stacked, E)
+        ctx = prepare_moe_noising(
+            A_q,
+            A_scales,
+            topk_ids,
+            B_stacked,
+            E,
+            routing_layout=routing_layout,
+        )
         layout = ctx.routing_layout
 
         (
@@ -307,34 +375,45 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
                     continue
                 expert_weight_start = expert_index * N
                 expert_weight_end = expert_weight_start + N
-                expert_output = gemm1_output_by_slot[:expert_slot_count]
+                A_q_e = A_q_by_expert[routing_start : routing_start + expert_slot_count]
+                A_scales_e = A_scales_by_expert[routing_start : routing_start + expert_slot_count]
+                B_e = B_stacked[expert_weight_start:expert_weight_end]
+                B_scales_e = self.w1_scale[expert_index]
 
-                pearl_moe_expert_gemm(
-                    A_q_e=A_q_by_expert[routing_start : routing_start + expert_slot_count],
-                    B_e=B_stacked[expert_weight_start:expert_weight_end],
-                    A_scales_e=A_scales_by_expert[
-                        routing_start : routing_start + expert_slot_count
-                    ],
-                    B_scales_e=self.w1_scale[expert_index],
-                    EAL_e=EAL_by_expert[routing_start : routing_start + expert_slot_count],
-                    EAL_fp16_e=EAL_fp16_by_expert[
-                        routing_start : routing_start + expert_slot_count
-                    ],
-                    EBR_e=ctx.EBR[expert_weight_start:expert_weight_end],
-                    EBR_fp16_e=ctx.EBR_fp16[expert_weight_start:expert_weight_end],
-                    EAR_R_major=ctx.EAR_R_major,
-                    EBL_R_major=ctx.EBL_R_major,
-                    EAR_K_major=ctx.EAR_K_major,
-                    EBL_K_major=ctx.EBL_K_major,
-                    C_e=expert_output,
-                    host_signal_header_pinned=pow_headers[expert_index],
-                    host_signal_sync=host_signal_sync,
-                    pow_target=ctx.pow_target,
-                    pow_key=ctx.pow_key,
-                    tile_size_m=tile_m,
-                    tile_size_n=tile_n,
-                    tile_size_k=tile_k,
-                )
+                if mine_expert_mask[expert_index]:
+                    expert_output = gemm1_output_by_slot[:expert_slot_count]
+                    pearl_moe_expert_gemm(
+                        A_q_e=A_q_e,
+                        B_e=B_e,
+                        A_scales_e=A_scales_e,
+                        B_scales_e=B_scales_e,
+                        EAL_e=EAL_by_expert[routing_start : routing_start + expert_slot_count],
+                        EAL_fp16_e=EAL_fp16_by_expert[
+                            routing_start : routing_start + expert_slot_count
+                        ],
+                        EBR_e=ctx.EBR[expert_weight_start:expert_weight_end],
+                        EBR_fp16_e=ctx.EBR_fp16[expert_weight_start:expert_weight_end],
+                        EAR_R_major=ctx.EAR_R_major,
+                        EBL_R_major=ctx.EBL_R_major,
+                        EAR_K_major=ctx.EAR_K_major,
+                        EBL_K_major=ctx.EBL_K_major,
+                        C_e=expert_output,
+                        host_signal_header_pinned=pow_headers[expert_index],
+                        host_signal_sync=host_signal_sync,
+                        pow_target=ctx.pow_target,
+                        pow_key=ctx.pow_key,
+                        tile_size_m=tile_m,
+                        tile_size_n=tile_n,
+                        tile_size_k=tile_k,
+                    )
+                else:
+                    expert_output = pearl_gemm_vanilla(
+                        A_q_e.contiguous(),
+                        B_e.contiguous(),
+                        scale_a=A_scales_e.squeeze(-1).contiguous(),
+                        scale_b=B_scales_e.squeeze(-1).contiguous(),
+                        out_dtype=out_dtype,
+                    )
 
                 expert_slot_indices = layout.slot_indices[
                     routing_start : routing_start + expert_slot_count

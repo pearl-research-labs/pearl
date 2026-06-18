@@ -140,16 +140,35 @@ def test_block_found_and_proof_verifies(pearl_moe_layer, get_mining_job, async_m
         mock_mining_client.get_mining_info.return_value = mining_job
         am._mining_job = am._client.get_mining_info()
 
-        moe_method.apply(
-            layer,
-            tensors.hidden_states,
-            tensors.topk_weights,
-            tensors.topk_ids,
-            None,
-        )
+        hot_experts = torch.arange(_TOP_K, dtype=torch.int32, device="cuda").expand(_NUM_TOKENS, -1)
+        tensors.topk_ids.copy_(hot_experts)
 
-        am.wait_until_done_submitting_blocks()
-        assert am.blocks_submitted == 1
+        start_time = time.time()
+        forward_count = 0
+        while am.blocks_submitted == 0:
+            if time.time() - start_time > _MINING_LOOP_TIMEOUT_SECONDS:
+                pytest.fail(
+                    f"Timeout ({_MINING_LOOP_TIMEOUT_SECONDS}s) waiting for block. "
+                    f"Performed {forward_count} forwards, "
+                    f"blocks_submitted={am.blocks_submitted}"
+                )
+
+            hidden_states = (
+                tensors.hidden_states
+                if forward_count == 0
+                else torch.randn_like(tensors.hidden_states)
+            )
+            moe_method.apply(
+                layer,
+                hidden_states,
+                tensors.topk_weights,
+                tensors.topk_ids,
+                None,
+            )
+            forward_count += 1
+            am.wait_until_done_submitting_blocks()
+
+        assert am.blocks_submitted >= 1
 
 
 @pytest.fixture

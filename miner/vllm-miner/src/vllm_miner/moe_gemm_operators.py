@@ -115,12 +115,40 @@ def _offsets_hash(
     return _hash_2d(offsets_bytes.reshape(1, -1), key_tensor, device)
 
 
+def build_moe_routing_layout(topk_ids: torch.Tensor, num_experts: int) -> MoERoutingLayout:
+    """Build canonical routing data without committing or generating noise."""
+    top_k = topk_ids.shape[1]
+    num_routed_slots = topk_ids.shape[0] * top_k
+    device = topk_ids.device
+
+    routing_data = torch.empty(num_routed_slots, dtype=torch.int32, device=device)
+    slot_indices = torch.empty(num_routed_slots, dtype=torch.int32, device=device)
+    routing_offsets = torch.empty(num_experts, dtype=torch.int32, device=device)
+    routing_scratchpad = torch.empty(
+        get_build_routing_data_scratchpad_bytes(num_routed_slots),
+        dtype=torch.uint8,
+        device=device,
+    )
+    build_routing_data(
+        topk_ids.to(torch.int32).contiguous(),
+        routing_data,
+        slot_indices,
+        routing_offsets,
+        routing_scratchpad,
+        num_experts,
+    )
+    return MoERoutingLayout.from_kernel_outputs(
+        routing_data, slot_indices, routing_offsets, num_experts, top_k
+    )
+
+
 def prepare_moe_noising(
     A_q: torch.Tensor,
     A_scales: torch.Tensor,
     topk_ids: torch.Tensor,
     B_stacked: torch.Tensor,
     num_experts: int,
+    routing_layout: MoERoutingLayout | None = None,
 ) -> MoENoiseContext:
     """Compute hashes, MoE commitment, routing, and noise factors for one pass."""
 
@@ -150,26 +178,10 @@ def prepare_moe_noising(
     A_hash = _hash_2d(A_q.contiguous().view(torch.uint8), key_tensor, device)
     B_hash = _hash_2d(B_stacked.contiguous().view(torch.uint8), key_tensor, device)
 
-    num_routed_slots = num_tokens * top_k
-    routing_data = torch.empty(num_routed_slots, dtype=torch.int32, device=device)
-    slot_indices = torch.empty(num_routed_slots, dtype=torch.int32, device=device)
-    routing_offsets = torch.empty(num_experts, dtype=torch.int32, device=device)
-    routing_scratchpad = torch.empty(
-        get_build_routing_data_scratchpad_bytes(num_routed_slots),
-        dtype=torch.uint8,
-        device=device,
-    )
-    build_routing_data(
-        topk_ids.to(torch.int32).contiguous(),
-        routing_data,
-        slot_indices,
-        routing_offsets,
-        routing_scratchpad,
-        num_experts,
-    )
-    routing_layout = MoERoutingLayout.from_kernel_outputs(
-        routing_data, slot_indices, routing_offsets, num_experts, top_k
-    )
+    if routing_layout is None:
+        routing_layout = build_moe_routing_layout(topk_ids, num_experts)
+    routing_data = routing_layout.token_indices
+    routing_offsets = routing_layout.routing_offsets
     routing_hash = _routing_hash(routing_data, key_tensor, device)
 
     offsets_hash = _offsets_hash(routing_offsets, key_tensor, device)
