@@ -108,6 +108,7 @@ tasks:
 
   unit:
     desc: Run unit tests
+    deps: [build:zk-gobind]
     cmds:
       - go test -v -tags={{.DEV_TAGS}} ./... -test.timeout={{.TEST_TIMEOUT}}
       - task unit:btcec
@@ -134,6 +135,7 @@ tasks:
 
   unit-cover:
     desc: Run unit tests with coverage
+    deps: [build:zk-gobind]
     cmds:
       - go test -v -coverprofile=coverage.txt -covermode=atomic -coverpkg={{.PKG}}/... ./...
       - task unit-cover:btcec
@@ -161,6 +163,7 @@ tasks:
 
   unit-race:
     desc: Run unit tests with race detection
+    deps: [build:zk-gobind]
     env:
       CGO_ENABLED: 1
       GORACE: "{{.RACE_FLAGS}}"
@@ -199,6 +202,7 @@ tasks:
 
   integration:
     desc: Run integration tests
+    deps: [build:zk-gobind]
     cmds:
       - go test -v -tags={{.DEV_TAGS}} ./integration/... -test.timeout={{.TEST_TIMEOUT}}
 

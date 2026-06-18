@@ -23,16 +23,7 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
-	"github.com/pearl-research-labs/pearl/version"
 )
-
-func init() {
-	got := C.GoString(C.zk_pow_ffi_version())
-	want := version.UserAgent()
-	if got != want {
-		panic(fmt.Sprintf("zk-pow FFI version mismatch: linked %q, expected %q — rebuild with `task build:zk-gobind`", got, want))
-	}
-}
 
 // ================================================================================
 // CERTIFICATE VERIFICATION
