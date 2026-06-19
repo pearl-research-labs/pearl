@@ -25,12 +25,7 @@ from vllm.platforms import current_platform
 from .config import config
 from .gemm_operators import pearl_gemm_noisy, pearl_gemm_vanilla
 from .mining_state import get_async_manager
-from .quantization_operators import (
-    quant_7bit,
-    quant_7bit_smooth,
-    quant_8bit,
-    quant_8bit_smooth,
-)
+from .quantization_operators import quant_7bit, quant_8bit
 
 _LOGGER = get_logger("vllm.pearl_miner")
 
@@ -193,11 +188,7 @@ class PearlKernel(Int8ScaledMMLinearKernel):
         Uses noisy GEMM for large matrices (proof-of-work), vanilla GEMM for small ones.
         """
         # INT7 quantization with optional smooth scale
-        if smooth_scale is not None:
-            x_q, x_s, _ = quant_7bit_smooth(x, smooth_scale=smooth_scale)
-        else:
-            # Use CUDA-optimized int7 quantization when no smooth scale
-            x_q, x_s, _ = quant_7bit(x)
+        x_q, x_s, _ = quant_7bit(x, smooth_scale=smooth_scale)
 
         m, k, n = x_q.shape[0], x_q.shape[1], w_q.shape[0]
 
@@ -234,10 +225,7 @@ class PearlKernel(Int8ScaledMMLinearKernel):
         Apply weights in non-mining mode: int8 quantization + vanilla GEMM only.
         """
         # INT8 quantization with optional smooth scale
-        if smooth_scale is not None:
-            x_q, x_s, _ = quant_8bit_smooth(x, smooth_scale=smooth_scale)
-        else:
-            x_q, x_s, _ = quant_8bit(x)
+        x_q, x_s, _ = quant_8bit(x, smooth_scale=smooth_scale)
 
         return pearl_gemm_vanilla(
             x_q.contiguous(),

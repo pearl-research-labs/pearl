@@ -9,6 +9,9 @@ from vllm_miner.moe_gemm_operators import MoERoutingLayout
 MOE_TEST_INT8_LOW = -63
 MOE_TEST_INT8_HIGH = 64
 _MOE_TEST_WEIGHT_SCALE_DIVISOR = 64.0
+# Down projection is fp8 e4m3 with [128, 128] block-wise scales.
+_MOE_TEST_W2_DTYPE = torch.float8_e4m3fn
+_MOE_TEST_W2_BLOCK = 128
 
 
 class RoutingSkew(Enum):
@@ -108,9 +111,9 @@ def make_moe_tensors(
 
     Shapes and dtypes:
       - w13_weight: (num_experts, 2*intermediate_size, hidden_dim) int8
-      - w2_weight: (num_experts, hidden_dim, intermediate_size) int8
+      - w2_weight: (num_experts, hidden_dim, intermediate_size) fp8 e4m3
       - w13_weight_scale: (num_experts, 2*intermediate_size, 1) float32
-      - w2_weight_scale: (num_experts, hidden_dim, 1) float32
+      - w2_weight_scale: (num_experts, ceil(hidden/128), ceil(intermediate/128)) float32
       - hidden_states: (num_tokens, hidden_dim) bf16
       - topk_ids: (num_tokens, top_k) int32
       - topk_weights: (num_tokens, top_k) float32 - normalized to sum to 1
@@ -120,13 +123,6 @@ def make_moe_tensors(
         MOE_TEST_INT8_LOW,
         MOE_TEST_INT8_HIGH,
         (num_experts, 2 * intermediate_size, hidden_dim),
-        dtype=torch.int8,
-        device=device,
-    )
-    w2_weight = torch.randint(
-        MOE_TEST_INT8_LOW,
-        MOE_TEST_INT8_HIGH,
-        (num_experts, hidden_dim, intermediate_size),
         dtype=torch.int8,
         device=device,
     )
@@ -141,9 +137,15 @@ def make_moe_tensors(
         )
         * weight_scale
     )
-    w2_weight_scale = (
-        torch.ones(num_experts, hidden_dim, 1, dtype=torch.float32, device=device) * weight_scale
-    )
+
+    # Down projection: fp8 e4m3 weights with [128, 128] block-wise scales.
+    block = _MOE_TEST_W2_BLOCK
+    n_tiles = (hidden_dim + block - 1) // block
+    k_tiles = (intermediate_size + block - 1) // block
+    w2_weight = (
+        torch.randn(num_experts, hidden_dim, intermediate_size, device=device) * weight_scale
+    ).to(_MOE_TEST_W2_DTYPE)
+    w2_weight_scale = torch.ones(num_experts, n_tiles, k_tiles, dtype=torch.float32, device=device)
 
     hidden_states = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=device)
 

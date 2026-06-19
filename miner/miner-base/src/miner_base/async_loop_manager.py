@@ -270,7 +270,7 @@ class AsyncLoopManager:
         try:
             check_cert_version_eligible(mining_job.cert_version, plain_proof)
         except ValueError as e:
-            _LOGGER.warning("Skipping block submission: %s", e)
+            _LOGGER.warning(f"Skipping block submission: {e}")
             return False
 
         if miner_settings.debug:

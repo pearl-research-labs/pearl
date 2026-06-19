@@ -1,5 +1,6 @@
 import torch
 from pearl_gemm import quantize
+from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
 from .mining_state import get_async_manager
 
@@ -7,7 +8,11 @@ MAX_VAL_7BIT = 63
 MAX_VAL_8BIT = 127
 
 
-def quantize_kernel(x: torch.Tensor, max_val: int = 63, smooth_scale: torch.Tensor | None = None):
+def quantize_kernel(
+    x: torch.Tensor,
+    max_val: int = MAX_VAL_7BIT,
+    smooth_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, None]:
     """
     Symmetric per-token quantization with optional smooth scaling (CUDA kernel version)
 
@@ -30,26 +35,26 @@ def quantize_kernel(x: torch.Tensor, max_val: int = 63, smooth_scale: torch.Tens
 
 
 # Convenience wrappers
-def quant_7bit(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
-    """7-bit symmetric quantization (range: [-63, 63])."""
-    return quantize_kernel(x, max_val=MAX_VAL_7BIT, smooth_scale=None)
-
-
-def quant_8bit(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
-    """8-bit symmetric quantization (range: [-127, 127])."""
-
-    return quantize_kernel(x, max_val=MAX_VAL_8BIT, smooth_scale=None)
-
-
-def quant_7bit_smooth(
+def quant_7bit(
     x: torch.Tensor, smooth_scale: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, None]:
-    """7-bit symmetric quantization (range: [-63, 63]) with smooth scale."""
+    """7-bit symmetric quantization (range: [-63, 63]), optional smooth scale."""
     return quantize_kernel(x, max_val=MAX_VAL_7BIT, smooth_scale=smooth_scale)
 
 
-def quant_8bit_smooth(
+def quant_8bit(
     x: torch.Tensor, smooth_scale: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, None]:
-    """8-bit symmetric quantization (range: [-127, 127]) with smooth scale."""
+    """8-bit symmetric quantization (range: [-127, 127]), optional smooth scale."""
     return quantize_kernel(x, max_val=MAX_VAL_8BIT, smooth_scale=smooth_scale)
+
+
+def quant_fp8_block(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dynamic per-token-group fp8 quantization for the block-scaled GEMM2."""
+    return moe_kernel_quantize_input(
+        A=x,
+        A_scale=None,
+        quant_dtype=torch.float8_e4m3fn,
+        per_act_token_quant=False,
+        block_shape=[group_size, group_size],
+    )

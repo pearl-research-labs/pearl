@@ -32,10 +32,10 @@ from .moe_gemm_operators import (
     permute_a_side_to_expert_order,
     prepare_moe_noising,
 )
-from .pearl_moe_method import W13_SMOOTH_SHARED_EXPERT_INDEX
-from .quantization_operators import quant_7bit, quant_7bit_smooth
+from .quantization_operators import quant_7bit, quant_fp8_block
 
 _GEMM2_TOP_K = 1
+_GEMM2_QUANT_SCHEME = "fp8_w8a8"
 # MoE noise kernels require at least Hopper (matches dense PearlKernel min capability).
 _MIN_COMPUTE_CAPABILITY_MAJOR = 9
 # vLLM sentinel meaning "infer expert count from the weight tensor".
@@ -71,10 +71,14 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         self,
         moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
+        w2_block_shape: list[int],
+        act_group_size: int,
         layer: torch.nn.Module | None = None,
     ):
         super().__init__(moe_config, quant_config)
         self._layer = layer
+        self._w2_block_shape = w2_block_shape
+        self._act_group_size = act_group_size
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -151,10 +155,8 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
     def _quant_a_7bit(self, hidden_states: torch.Tensor, K: int):
         """Quantize activations with the shared gate/up smooth scale when present."""
         w13_smooth = self._get_smooth_scale("w13_smooth_quant_scale")
-        if w13_smooth is not None:
-            smooth = w13_smooth[W13_SMOOTH_SHARED_EXPERT_INDEX, :K]
-            return quant_7bit_smooth(hidden_states, smooth_scale=smooth)
-        return quant_7bit(hidden_states)
+        smooth = w13_smooth[:K] if w13_smooth is not None else None
+        return quant_7bit(hidden_states, smooth_scale=smooth)
 
     def apply(
         self,
@@ -238,28 +240,22 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
 
         self.activation(activation, intermediate_cache2, intermediate_cache1.view(-1, N))
 
-        gemm2_input = self._apply_w2_smooth_quant(intermediate_cache2, topk_ids)
-        qintermediate_cache2, a2q_scale, _ = quant_7bit(gemm2_input)
-
-        gemm2_compute_type = _torch_dtype_to_triton_compute_type(hidden_states.dtype)
-        invoke_fused_moe_triton_kernel(
-            qintermediate_cache2,
-            w2,
-            intermediate_cache3,
-            a2q_scale,
-            self.w2_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            _GEMM2_TOP_K,
-            triton_config,
-            compute_type=gemm2_compute_type,
-            **self._int8_w8a8_triton_kwargs(),
+        # GEMM2 (down projection): not mined, kept in the original fp8 block
+        self._gemm2_triton(
+            intermediate_cache2=intermediate_cache2,
+            w2=w2,
+            intermediate_cache3=intermediate_cache3,
+            output=output,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            align_block_size_m=triton_config["BLOCK_SIZE_M"],
+            num_tokens=num_tokens,
+            compute_type=_torch_dtype_to_triton_compute_type(hidden_states.dtype),
+            w1=w1,
         )
-
-        ops.moe_sum(intermediate_cache3, output)
 
     def _apply_per_expert_gemm1(
         self,
@@ -376,14 +372,61 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         )
         get_async_manager().schedule_status_check(cuda_event, callback)
 
-    def _apply_w2_smooth_quant(
+    def _gemm2_triton(
         self,
-        intermediate: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply per-expert w2 smooth quant scale to the GEMM2 input."""
-        w2_smooth = self._get_smooth_scale("w2_smooth_quant_scale")
-        if w2_smooth is None:
-            return intermediate
-        smooth_per_token = w2_smooth[topk_ids.reshape(-1)]
-        return intermediate * smooth_per_token
+        *,
+        intermediate_cache2: torch.Tensor,
+        w2: torch.Tensor,
+        intermediate_cache3: torch.Tensor,
+        output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        align_block_size_m: int,
+        num_tokens: int,
+        compute_type: tl.dtype,
+        w1: torch.Tensor,
+    ) -> None:
+        """Down projection via the Triton fp8 block grouped GEMM."""
+        quantized_intermediate, activation_scale = quant_fp8_block(
+            intermediate_cache2, group_size=self._act_group_size
+        )
+
+        gemm2_config = dict(
+            try_get_optimal_moe_config(
+                w1.shape,
+                w2.shape,
+                _GEMM2_TOP_K,
+                _GEMM2_QUANT_SCHEME,
+                num_tokens,
+                self._w2_block_shape,
+            )
+        )
+        # Reuse the token alignment that produced sorted_token_ids/expert_ids.
+        gemm2_config["BLOCK_SIZE_M"] = align_block_size_m
+
+        invoke_fused_moe_triton_kernel(
+            quantized_intermediate,
+            w2,
+            intermediate_cache3,
+            activation_scale,
+            self.w2_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            _GEMM2_TOP_K,
+            gemm2_config,
+            compute_type=compute_type,
+            use_fp8_w8a8=True,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            block_shape=self._w2_block_shape,
+        )
+
+        ops.moe_sum(intermediate_cache3, output)

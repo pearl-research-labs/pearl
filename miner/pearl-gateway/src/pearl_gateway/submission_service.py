@@ -47,7 +47,7 @@ class SubmissionService:
                 try:
                     check_cert_version_eligible(template.required_cert_version, plain_proof)
                 except ValueError as e:
-                    logger.warning("Rejecting proof: %s", e)
+                    logger.warning(f"Rejecting proof: {e}")
                     return {"status": f"error: {e}"}
 
                 block = ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
