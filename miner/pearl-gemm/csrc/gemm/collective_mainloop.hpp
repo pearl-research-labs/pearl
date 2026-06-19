@@ -263,9 +263,35 @@ struct CollectiveMainloop {
     Tensor tCsA = thr_mma.partition_A(sA);  // (MMA,MMA_M,MMA_K,PIPE)
     Tensor tCsB = thr_mma.partition_B(sB);  // (MMA,MMA_N,MMA_K,PIPE)
 
-    // Allocate "fragments" -- these are WGMMA matrix descriptors
+    // Allocate "fragments". On Hopper (sm_90), these are WGMMA matrix
+    // descriptors that the wgmma instruction reads SMEM through directly.
+    // On Blackwell consumer (sm_120/121), they are register fragments that
+    // must be populated via ldmatrix (SMEM->Register copy) before each
+    // mma.sync call (see SM80 staging path below).
     Tensor tCrA = thr_mma.make_fragment_A(tCsA);  // (MMA,MMA_M,MMA_K,PIPE)
     Tensor tCrB = thr_mma.make_fragment_B(tCsB);  // (MMA,MMA_N,MMA_K,PIPE)
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // SM80 SMEM->register staging via ldmatrix. The tiled_copy is built to
+    // match the tiled_mma's per-thread fragment layout (retile_D), and the
+    // SMEM source partition matches the original tCsA/tCsB layouts.
+    using S2RCopyAtomMain_A =
+        Copy_Atom<SM75_U32x4_LDSM_N, typename KTraits::ElementIn>;
+    using S2RCopyAtomMain_B =
+        Copy_Atom<SM75_U32x4_LDSM_N, typename KTraits::ElementIn>;
+    auto s2r_tiled_copy_A_main =
+        make_tiled_copy_A(S2RCopyAtomMain_A{}, tiled_mma);
+    auto s2r_tiled_copy_B_main =
+        make_tiled_copy_B(S2RCopyAtomMain_B{}, tiled_mma);
+    auto s2r_thr_copy_A_main =
+        s2r_tiled_copy_A_main.get_thread_slice(thread_idx);
+    auto s2r_thr_copy_B_main =
+        s2r_tiled_copy_B_main.get_thread_slice(thread_idx);
+    Tensor tCsA_s2r = s2r_thr_copy_A_main.partition_S(sA);  // (CPY, CPY_M, CPY_K, PIPE)
+    Tensor tCsB_s2r = s2r_thr_copy_B_main.partition_S(sB);
+    Tensor tCrA_view = s2r_thr_copy_A_main.retile_D(tCrA); // view of tCrA in copy layout
+    Tensor tCrB_view = s2r_thr_copy_B_main.retile_D(tCrB);
+#endif
 
     const uint32_t last_full_k_block =
         shape<1>(mainloop_params.layout_A) / MMAAtom_K{};
@@ -293,12 +319,29 @@ struct CollectiveMainloop {
 
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < k_blocks_per_tile; ++k_block) {
+        // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
         warpgroup_fence_operand(tCrC);
         warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        // SM80: ldmatrix this k_block's A and B from SMEM into registers
+        // before mma.sync. PIPE dim of tCrA_view selects the stage of the
+        // pipeline that's currently held in SMEM.
+        cute::copy(s2r_tiled_copy_A_main,
+                   tCsA_s2r(_, _, k_block, stage),
+                   tCrA_view(_, _, k_block, stage));
+        cute::copy(s2r_tiled_copy_B_main,
+                   tCsB_s2r(_, _, k_block, stage),
+                   tCrB_view(_, _, k_block, stage));
+#endif
         // WGMMA with dispatch mode (V,M,K) x (V,N,K) => (V,M,N)
         gemm(tiled_mma, tCrA(_, _, k_block, stage), tCrB(_, _, k_block, stage),
              tCrC);
+        // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
         warpgroup_commit_batch();
+#endif
 
         if constexpr (!SkipReduction) {
           hash_accumulator.accumulate(tCrC, k_block);
@@ -310,7 +353,10 @@ struct CollectiveMainloop {
         hash_accumulator.writeback(transcript_extraction_tensor);
       }
 
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_wait<0>();
+#endif
       // Release the stage of the pipeline for TMA
       pipeline.consumer_release(smem_pipe_read);
       ++smem_pipe_read;
