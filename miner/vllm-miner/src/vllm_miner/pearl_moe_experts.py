@@ -158,9 +158,7 @@ class PearlMoEExperts(mk.FusedMoEExpertsModular):
         """Quantize activations with the shared gate/up smooth scale and Hadamard."""
         w13_smooth = self._get_smooth_scale("w13_smooth_quant_scale")
         smooth = w13_smooth[:K] if w13_smooth is not None else None
-        return quant_7bit(
-            hidden_states, smooth_scale=smooth, block_size=self._hadamard_block_size
-        )
+        return quant_7bit(hidden_states, smooth_scale=smooth, block_size=self._hadamard_block_size)
 
     def apply(
         self,
