@@ -18,10 +18,15 @@ export interface NetworkConfig {
     defaultPeerPort: number;
 }
 
-const nodeIndex = Math.floor(Math.random() * 3);
+// Pick a random default peer per network. The two lists can differ in length,
+// so index into each independently using its own length instead of sharing a
+// single `Math.random() * 3` index (which never selected peers beyond the
+// third entry, and reused one index across both lists).
+const pickRandomPeer = (peers: readonly string[]): string =>
+    peers[Math.floor(Math.random() * peers.length)];
 
-const mainnetDefaultPeerAddress = MAINNET_DEFAULT_PEER_ADDRESSES[nodeIndex];
-const testnetDefaultPeerAddress = TESTNET_DEFAULT_PEER_ADDRESSES[nodeIndex];
+const mainnetDefaultPeerAddress = pickRandomPeer(MAINNET_DEFAULT_PEER_ADDRESSES);
+const testnetDefaultPeerAddress = pickRandomPeer(TESTNET_DEFAULT_PEER_ADDRESSES);
 
 const NETWORK_CONFIGS: Record<Network, NetworkConfig> = {
     mainnet: {
