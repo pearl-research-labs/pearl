@@ -13,13 +13,13 @@ dependencies = [
     "packaging>=21.0",
     "pydantic>=2.12.0,<3.0.0",
     "sortedcontainers>=2.4.0",
-    "torch==2.11.0",
+    "torch==2.12.1",
     "wheel>=0.38.0",
 ]
 
 
 [build-system]
-requires = ["setuptools>=61", "torch==2.11.0", "numpy", "ninja", "pydantic", "pearl-gemm-build-utils"]
+requires = ["setuptools>=61", "torch==2.12.1", "numpy", "ninja", "pydantic", "pearl-gemm-build-utils"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -38,6 +38,6 @@ dev = [
     "pytest>=7.0.0",
     "ruff>=0.7.0",
     "tqdm>=4.66.1",
-    "vllm>=0.20.2",
+    "vllm>=0.23.0",
 ]
 
