@@ -16,20 +16,23 @@ from pearl_gemm_build_utils.kernel_configs import (
 _matmul_kernels = []
 
 # 128x256x128 stages=3 — the original Hopper-optimal config (~210 KB SMEM).
-# Does NOT fit on Blackwell consumer / GB10 (99 KB SMEM cap per CTA), but
-# keep it as the default for sm_90 (H100/H200) builds.
-for R in [64, 128]:
-    _matmul_kernels.append(
-        MatmulKernelConfig(
-            tile_size_m=128,
-            tile_size_n=256,
-            tile_size_k=128,
-            R=R,
-            pipeline_stages=3,
-            cM=1,
-            cN=1,
-        )
-    )
+# Does NOT fit on Blackwell consumer / GB10 (99 KB SMEM cap per CTA); the
+# runtime hits cudaFuncSetAttribute(MaxDynamicSharedMemorySize) -> invalid
+# argument and TORCH_CHECK(false) crashes at launch (pearl_gemm_host.h L100).
+# DISABLED for the sm_120 build — its stage=2 twin (below, ~98 KB) covers the
+# same tile shape and fits. Re-enable ONLY for sm_90 (H100/H200) builds.
+# for R in [64, 128]:
+#     _matmul_kernels.append(
+#         MatmulKernelConfig(
+#             tile_size_m=128,
+#             tile_size_n=256,
+#             tile_size_k=128,
+#             R=R,
+#             pipeline_stages=3,
+#             cM=1,
+#             cN=1,
+#         )
+#     )
 
 # 64x128x64 stages=2 — Blackwell consumer config (~50 KB SMEM). Required
 # for sm_120/121 (RTX 50-series, GB10) which have a 99 KB SMEM-per-CTA cap.
