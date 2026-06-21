@@ -270,7 +270,7 @@ class TestNoisyGemmSelectionThresholds:
 
     def test_should_use_noisy_gemm_all_above_threshold(self):
         """Test that noisy GEMM is selected when all dimensions >= threshold."""
-        # Default thresholds are min_m=1024, min_n=1024, min_k=1024
+        # Default thresholds are min_m=1024, min_n=256, min_k=1024
         # All dimensions at or above threshold
         assert pearl_config.should_use_noisy_gemm(1024, 1024, 1024) is True
         assert pearl_config.should_use_noisy_gemm(2048, 2048, 2048) is True
@@ -285,7 +285,7 @@ class TestNoisyGemmSelectionThresholds:
     def test_should_use_noisy_gemm_below_n_threshold(self):
         """Test that vanilla GEMM is selected when n < threshold."""
         # n below threshold
-        assert pearl_config.should_use_noisy_gemm(1024, 512, 1024) is False
+        assert pearl_config.should_use_noisy_gemm(1024, 128, 1024) is False
         assert pearl_config.should_use_noisy_gemm(2048, 1, 2048) is False
 
     def test_should_use_noisy_gemm_below_k_threshold(self):
@@ -305,10 +305,11 @@ class TestNoisyGemmSelectionThresholds:
         """Test boundary cases at exactly the threshold."""
         # Exactly at threshold - should use noisy GEMM
         assert pearl_config.should_use_noisy_gemm(1024, 1024, 1024) is True
+        assert pearl_config.should_use_noisy_gemm(1024, 256, 1024) is True
 
         # Just below threshold - should use vanilla GEMM
         assert pearl_config.should_use_noisy_gemm(1023, 1024, 1024) is False
-        assert pearl_config.should_use_noisy_gemm(1024, 1023, 1024) is False
+        assert pearl_config.should_use_noisy_gemm(1024, 255, 1024) is False
         assert pearl_config.should_use_noisy_gemm(1024, 1024, 1023) is False
 
 
