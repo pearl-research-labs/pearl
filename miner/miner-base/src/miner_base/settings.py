@@ -25,6 +25,7 @@ class MinerSettings(BaseSettings):
     # fmt: on
 
     pinned_pool_size: int = 128
+    prepared_b_cache_bytes: int = 1 << 30
 
     debug: bool = False
     print_header_hash: bool = False

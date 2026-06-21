@@ -1077,6 +1077,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("B_merkle_root"), py::arg("key"), py::arg("A_commitment_hash"),
         py::arg("B_commitment_hash"), py::arg("routing_root") = py::none(),
         py::arg("offsets_hash") = py::none());
+  m.def("commitment_hash_from_b_commitment",
+        &run_commitment_hash_from_b_commitment,
+        "Commitment hash A from Merkle root A and cached commitment B",
+        py::arg("A_merkle_root"), py::arg("B_commitment_hash"),
+        py::arg("A_commitment_hash"), py::arg("routing_root") = py::none(),
+        py::arg("offsets_hash") = py::none());
   m.def("get_host_signal_header_size", &get_host_signal_header_size,
         "Calculate host signal header buffer size");
   m.def("get_host_signal_sync_size", &get_host_signal_sync_size,
@@ -1298,6 +1304,14 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "    Tensor? offsets_hash=None"
       ") -> ()");
   m.def(
+      "commitment_hash_from_b_commitment("
+      "    Tensor A_merkle_root, "
+      "    Tensor B_commitment_hash, "
+      "    Tensor(A_commitment_hash!) A_commitment_hash, "
+      "    Tensor? routing_root=None, "
+      "    Tensor? offsets_hash=None"
+      ") -> ()");
+  m.def(
       "build_routing_data("
       "    Tensor topk_ids, "
       "    Tensor(routing_data!) routing_data, "
@@ -1320,5 +1334,7 @@ TORCH_LIBRARY_IMPL(pearl_gemm, CUDA, m) {
   m.impl("tensor_hash", &run_tensor_hash);
   m.impl("commitment_hash_from_merkle_roots",
          &run_commitment_hash_from_merkle_roots);
+  m.impl("commitment_hash_from_b_commitment",
+         &run_commitment_hash_from_b_commitment);
   m.impl("build_routing_data", &build_routing_data);
 }

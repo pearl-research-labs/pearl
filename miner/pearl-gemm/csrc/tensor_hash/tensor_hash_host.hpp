@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "blake3/blake3_constants.hpp"
+#include "commitment_hash_from_b_commitment_kernel.hpp"
 #include "commitment_hash_from_merkle_roots_kernel.hpp"
 #include "compute_blake_mt_kernel.hpp"
 #include "gemm/error_check.hpp"
@@ -313,4 +314,36 @@ void commitment_hash_from_merkle_roots(
   dim3 block = dim3(1);
 
   kernel<<<grid, block, commitment_hash_smem_size, stream>>>(kernel_params);
+}
+
+void commitment_hash_from_b_commitment(
+    const uint8_t* A_merkle_root, const uint8_t* B_commitment_hash,
+    uint8_t* A_commitment_hash, const uint8_t* routing_root,
+    const uint8_t* offsets_hash, cudaDeviceProp& deviceProp, cudaStream_t stream) {
+
+  using CommitmentHashFromBCommitmentKernel =
+      pearl::CommitmentHashFromBCommitmentKernel;
+
+  typename CommitmentHashFromBCommitmentKernel::Arguments args{
+      static_cast<const uint8_t*>(A_merkle_root),
+      static_cast<const uint8_t*>(B_commitment_hash),
+      static_cast<uint8_t*>(A_commitment_hash),
+      static_cast<const uint8_t*>(routing_root),
+      static_cast<const uint8_t*>(offsets_hash)};
+
+  typename CommitmentHashFromBCommitmentKernel::Params kernel_params =
+      CommitmentHashFromBCommitmentKernel::to_underlying_arguments(args);
+
+  auto kernel = cutlass::device_kernel<CommitmentHashFromBCommitmentKernel>;
+
+  constexpr static int commitment_hash_smem_size =
+      CommitmentHashFromBCommitmentKernel::SharedStorageSize;
+
+  if (commitment_hash_smem_size >= 48 * 1024) {
+    gpuErrchk(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   commitment_hash_smem_size));
+  }
+
+  kernel<<<dim3(1), dim3(1), commitment_hash_smem_size, stream>>>(kernel_params);
 }

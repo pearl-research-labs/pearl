@@ -54,6 +54,8 @@ void run_tensor_hash(
   TORCH_CHECK(key.dtype() == at::kByte, "key must be uint8");
   TORCH_CHECK(out.dtype() == at::kByte, "out must be uint8");
   TORCH_CHECK(roots.dtype() == at::kByte, "roots must be uint8");
+  TORCH_CHECK(data.dtype() == at::kByte || data.dtype() == at::kChar,
+              "data must be uint8 or int8");
   TORCH_CHECK(data.dim() == 2, "data must be 2D tensor");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(data.data_ptr()) %
                       TMA_GLOBAL_ALIGNMENT_BYTES ==
@@ -103,8 +105,10 @@ void run_tensor_hash(
   auto stream = at::cuda::getCurrentCUDAStream();
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
-  tensor_hash(data.data_ptr<uint8_t>(), data.numel(), out.data_ptr<uint8_t>(),
-              key.data_ptr<uint8_t>(), num_blocks,
+  // Hash the tensor storage bytes. int8 and uint8 are both one byte per
+  // element, so they must commit to identical roots for identical bit patterns.
+  tensor_hash(reinterpret_cast<uint8_t const*>(data.data_ptr()), data.numel(),
+              out.data_ptr<uint8_t>(), key.data_ptr<uint8_t>(), num_blocks,
               static_cast<uint32_t>(threads_per_block),
               static_cast<uint32_t>(num_stages),
               static_cast<uint32_t>(leaves_per_mt_block),
@@ -189,6 +193,68 @@ void run_commitment_hash_from_merkle_roots(
       A_merkle_root.data_ptr<uint8_t>(), B_merkle_root.data_ptr<uint8_t>(),
       key.data_ptr<uint8_t>(), A_commitment_hash.data_ptr<uint8_t>(),
       B_commitment_hash.data_ptr<uint8_t>(), routing_root_ptr, offsets_hash_ptr,
+      *dprops, stream);
+}
+
+void run_commitment_hash_from_b_commitment(
+    at::Tensor& A_merkle_root, at::Tensor& B_commitment_hash,
+    at::Tensor& A_commitment_hash,
+    std::optional<at::Tensor> routing_root = std::nullopt,
+    std::optional<at::Tensor> offsets_hash = std::nullopt) {
+  CHECK_DEVICE(A_merkle_root);
+  CHECK_DEVICE(B_commitment_hash);
+  CHECK_DEVICE(A_commitment_hash);
+  CHECK_CONTIGUOUS(A_merkle_root);
+  CHECK_CONTIGUOUS(B_commitment_hash);
+  CHECK_CONTIGUOUS(A_commitment_hash);
+
+  TORCH_CHECK(A_merkle_root.dtype() == at::kByte,
+              "A_merkle_root must be uint8");
+  TORCH_CHECK(B_commitment_hash.dtype() == at::kByte,
+              "B_commitment_hash must be uint8");
+  TORCH_CHECK(A_commitment_hash.dtype() == at::kByte,
+              "A_commitment_hash must be uint8");
+  TORCH_CHECK(A_merkle_root.numel() == blake3::CHAINING_VALUE_SIZE,
+              "A_merkle_root must have exactly", blake3::CHAINING_VALUE_SIZE,
+              "bytes");
+  TORCH_CHECK(B_commitment_hash.numel() == blake3::CHAINING_VALUE_SIZE,
+              "B_commitment_hash must have exactly",
+              blake3::CHAINING_VALUE_SIZE, "bytes");
+  TORCH_CHECK(A_commitment_hash.numel() == blake3::CHAINING_VALUE_SIZE,
+              "A_commitment_hash must have exactly",
+              blake3::CHAINING_VALUE_SIZE, "bytes");
+  TORCH_CHECK(routing_root.has_value() == offsets_hash.has_value(),
+              "routing_root and offsets_hash must be provided together");
+
+  const uint8_t* routing_root_ptr = nullptr;
+  const uint8_t* offsets_hash_ptr = nullptr;
+  if (routing_root.has_value()) {
+    auto& routing_root_tensor = routing_root.value();
+    auto& offsets_hash_tensor = offsets_hash.value();
+    CHECK_DEVICE(routing_root_tensor);
+    CHECK_DEVICE(offsets_hash_tensor);
+    CHECK_CONTIGUOUS(routing_root_tensor);
+    CHECK_CONTIGUOUS(offsets_hash_tensor);
+    TORCH_CHECK(routing_root_tensor.dtype() == at::kByte,
+                "routing_root must be uint8");
+    TORCH_CHECK(offsets_hash_tensor.dtype() == at::kByte,
+                "offsets_hash must be uint8");
+    TORCH_CHECK(routing_root_tensor.numel() == blake3::CHAINING_VALUE_SIZE,
+                "routing_root must have exactly", blake3::CHAINING_VALUE_SIZE,
+                "bytes");
+    TORCH_CHECK(offsets_hash_tensor.numel() == blake3::CHAINING_VALUE_SIZE,
+                "offsets_hash must have exactly", blake3::CHAINING_VALUE_SIZE,
+                "bytes");
+    routing_root_ptr = routing_root_tensor.data_ptr<uint8_t>();
+    offsets_hash_ptr = offsets_hash_tensor.data_ptr<uint8_t>();
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+
+  commitment_hash_from_b_commitment(
+      A_merkle_root.data_ptr<uint8_t>(), B_commitment_hash.data_ptr<uint8_t>(),
+      A_commitment_hash.data_ptr<uint8_t>(), routing_root_ptr, offsets_hash_ptr,
       *dprops, stream);
 }
 

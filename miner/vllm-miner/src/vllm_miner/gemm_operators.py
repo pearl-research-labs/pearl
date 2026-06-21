@@ -3,6 +3,7 @@ from miner_base.commitment_hash import CommitmentHasher
 from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
 from miner_utils import get_logger
 from pearl_gemm import (
+    commitment_hash_from_b_commitment,
     commitment_hash_from_merkle_roots,
     gemm,
     get_host_signal_sync_size,
@@ -20,6 +21,10 @@ from .config import config
 from .mining_state import (
     get_async_manager,
     get_pinned_pool,
+)
+from .prepared_b_mining_state import (
+    PreparedBMiningState,
+    get_or_prepare_b_mining_state,
 )
 
 _LOGGER = get_logger("vllm.pearl_miner")
@@ -123,50 +128,63 @@ def pearl_gemm_noisy(
 
     A_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
     tensor_hash(
-        A.to(torch.uint8),
+        A,
         key_tensor,
         A_tensor_hash,
         tensor_hash_scratchpad,
     )
 
-    B_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
-    tensor_hash(
-        B.to(torch.uint8),
-        key_tensor,
-        B_tensor_hash,
-        tensor_hash_scratchpad,
+    def _prepare_b_state(
+        B: torch.Tensor = B,
+        key_tensor: torch.Tensor = key_tensor,
+        tensor_hash_scratchpad: torch.Tensor = tensor_hash_scratchpad,
+        n: int = n,
+        k: int = k,
+        r: int = r,
+        device: torch.device = a.device,
+    ) -> PreparedBMiningState:
+        return prepare_b_mining_state(
+            B,
+            key_tensor,
+            tensor_hash_scratchpad,
+            n,
+            k,
+            r,
+            device,
+        )
+
+    prepared_b_state = get_or_prepare_b_mining_state(
+        B,
+        hash_key,
+        r,
+        config.settings.prepared_b_cache_bytes,
+        _prepare_b_state,
     )
 
-    # Generate commitment hash for noise generation
     commitment_hash_A_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
-    commitment_hash_B_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
-    commitment_hash_from_merkle_roots(
+    commitment_hash_from_b_commitment(
         A_tensor_hash,
-        B_tensor_hash,
-        key_tensor,
+        prepared_b_state.commitment_b,
         commitment_hash_A_tensor,
-        commitment_hash_B_tensor,
     )
+    commitment_hash_B_tensor = prepared_b_state.commitment_b
 
-    # Generate noise factors from commitment hashes
     (
         EAL,
         EAR_R_major,
-        EBL_R_major,
         EAR_K_major,
-        EBL_K_major,
-        EBR,
         EAL_fp16,
-        EBR_fp16,
-    ) = generate_noise_factors(
+    ) = generate_a_noise_factors(
         m,
-        n,
         k,
         r,
         commitment_hash_A_tensor,
-        commitment_hash_B_tensor,
         a.device,
     )
+    EBL_R_major = prepared_b_state.ebl_r_major
+    EBL_K_major = prepared_b_state.ebl_k_major
+    EBR = prepared_b_state.ebr
+    EBR_fp16 = prepared_b_state.ebr_fp16
 
     # Always compute B noising (depends on A through EAR)
     BpEB = torch.empty((n, k), dtype=torch.int8, device=a.device)
@@ -256,11 +274,101 @@ def pearl_gemm_noisy(
     del EBR_fp16
     del key_tensor
     del A_tensor_hash
-    del B_tensor_hash
     del tensor_hash_scratchpad
     del host_signal_sync
     del EARxBpEB
     return C
+
+
+def prepare_b_mining_state(
+    B: torch.Tensor,
+    key_tensor: torch.Tensor,
+    tensor_hash_scratchpad: torch.Tensor,
+    n: int,
+    k: int,
+    r: int,
+    device: torch.device,
+) -> PreparedBMiningState:
+    B_tensor_hash = torch.empty(32, device=device, dtype=torch.uint8)
+    tensor_hash(
+        B,
+        key_tensor,
+        B_tensor_hash,
+        tensor_hash_scratchpad,
+    )
+
+    dummy_A_tensor_hash = torch.zeros(32, device=device, dtype=torch.uint8)
+    dummy_commitment_hash_A = torch.empty(32, device=device, dtype=torch.uint8)
+    commitment_hash_B_tensor = torch.empty(32, device=device, dtype=torch.uint8)
+    commitment_hash_from_merkle_roots(
+        dummy_A_tensor_hash,
+        B_tensor_hash,
+        key_tensor,
+        dummy_commitment_hash_A,
+        commitment_hash_B_tensor,
+    )
+
+    EBL_R_major, EBL_K_major, EBR, EBR_fp16 = generate_b_noise_factors(
+        n,
+        k,
+        r,
+        commitment_hash_B_tensor,
+        device,
+    )
+    return PreparedBMiningState(
+        b_hash=B_tensor_hash,
+        commitment_b=commitment_hash_B_tensor,
+        ebl_r_major=EBL_R_major,
+        ebl_k_major=EBL_K_major,
+        ebr=EBR,
+        ebr_fp16=EBR_fp16,
+    )
+
+
+def generate_a_noise_factors(
+    m: int,
+    k: int,
+    r: int,
+    commitment_hash_A: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    EAL = torch.empty((m, r), dtype=torch.int8, device=device)
+    EAR_R_major = torch.empty((k, r), dtype=torch.int8, device=device)
+    EAR_K_major = torch.empty((r, k), dtype=torch.int8, device=device)
+    EAL_fp16 = torch.empty((m, r), dtype=torch.float16, device=device)
+
+    noise_gen(
+        R=r,
+        EAL=EAL,
+        EAL_fp16=EAL_fp16,
+        EAR_R_major=EAR_R_major,
+        EAR_K_major=EAR_K_major,
+        key_A=commitment_hash_A,
+    )
+    return EAL, EAR_R_major, EAR_K_major, EAL_fp16
+
+
+def generate_b_noise_factors(
+    n: int,
+    k: int,
+    r: int,
+    commitment_hash_B: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    EBL_R_major = torch.empty((k, r), dtype=torch.int8, device=device)
+    EBL_K_major = torch.empty((r, k), dtype=torch.int8, device=device)
+    EBR = torch.empty((n, r), dtype=torch.int8, device=device)
+    EBR_fp16 = torch.empty((n, r), dtype=torch.float16, device=device)
+
+    noise_gen(
+        R=r,
+        EBL_R_major=EBL_R_major,
+        EBL_K_major=EBL_K_major,
+        EBR=EBR,
+        EBR_fp16=EBR_fp16,
+        key_B=commitment_hash_B,
+    )
+    return EBL_R_major, EBL_K_major, EBR, EBR_fp16
 
 
 def generate_noise_factors(
@@ -297,28 +405,19 @@ def generate_noise_factors(
     :return: Tuple of noise tensors (EAL, EAR_R_major, EBL_R_major,
              EAR_K_major, EBL_K_major, EBR, EAL_fp16, EBR_fp16)
     """
-    EAL = torch.empty((m, r), dtype=torch.int8, device=device)
-    EBR = torch.empty((n, r), dtype=torch.int8, device=device)
-
-    EAR_R_major = torch.empty((k, r), dtype=torch.int8, device=device)
-    EBL_R_major = torch.empty((k, r), dtype=torch.int8, device=device)
-    EAR_K_major = torch.empty((r, k), dtype=torch.int8, device=device)
-    EBL_K_major = torch.empty((r, k), dtype=torch.int8, device=device)
-    EAL_fp16 = torch.empty((m, r), dtype=torch.float16, device=device)
-    EBR_fp16 = torch.empty((n, r), dtype=torch.float16, device=device)
-
-    noise_gen(
-        R=r,
-        EAL=EAL,
-        EAL_fp16=EAL_fp16,
-        EAR_R_major=EAR_R_major,
-        EAR_K_major=EAR_K_major,
-        EBL_R_major=EBL_R_major,
-        EBL_K_major=EBL_K_major,
-        EBR=EBR,
-        EBR_fp16=EBR_fp16,
-        key_A=commitment_hash_A,
-        key_B=commitment_hash_B,
+    EAL, EAR_R_major, EAR_K_major, EAL_fp16 = generate_a_noise_factors(
+        m,
+        k,
+        r,
+        commitment_hash_A,
+        device,
+    )
+    EBL_R_major, EBL_K_major, EBR, EBR_fp16 = generate_b_noise_factors(
+        n,
+        k,
+        r,
+        commitment_hash_B,
+        device,
     )
     return (
         EAL,

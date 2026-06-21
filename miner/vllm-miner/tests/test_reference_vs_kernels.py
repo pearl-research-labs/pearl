@@ -77,8 +77,8 @@ class TestMatrixMerkleTreeVsTensorHash:
         # Create random int8 tensor for MatrixMerkleTree
         matrix_int8 = torch.randint(-128, 127, (m, n), dtype=torch.int8)
 
-        # Convert to uint8 for tensor_hash (CUDA implementation expects uint8)
-        matrix_uint8 = matrix_int8.to(torch.uint8).cuda()
+        matrix_cuda = matrix_int8.cuda()
+        matrix_uint8 = matrix_cuda.to(torch.uint8)
 
         # Create key tensor for CUDA implementation
         key_tensor = _to_cuda_u8(test_noise_seed_A)
@@ -89,16 +89,19 @@ class TestMatrixMerkleTreeVsTensorHash:
 
         # Compute hash using tensor_hash (CUDA implementation)
         cuda_result = torch.empty(blake3.digest_size, device="cuda", dtype=torch.uint8)
+        cast_result = torch.empty(blake3.digest_size, device="cuda", dtype=torch.uint8)
         tensor_hash_scratchpad = torch.empty(
-            pearl_gemm.get_required_scratchpad_bytes(matrix_uint8.numel()),
+            pearl_gemm.get_required_scratchpad_bytes(matrix_cuda.numel()),
             device="cuda",
             dtype=torch.uint8,
         )
-        pearl_gemm.tensor_hash(matrix_uint8, key_tensor, cuda_result, tensor_hash_scratchpad)
+        pearl_gemm.tensor_hash(matrix_cuda, key_tensor, cuda_result, tensor_hash_scratchpad)
+        pearl_gemm.tensor_hash(matrix_uint8, key_tensor, cast_result, tensor_hash_scratchpad)
         torch.cuda.synchronize()
 
         # Convert CUDA result back to bytes for comparison
         cuda_root = cuda_result.cpu().numpy().tobytes()
+        cast_root = cast_result.cpu().numpy().tobytes()
 
         blake3_result = blake3(matrix_int8.cpu().numpy().tobytes(), key=test_noise_seed_A).digest()
 
@@ -109,6 +112,9 @@ class TestMatrixMerkleTreeVsTensorHash:
         # Compare results
         assert python_root == cuda_root, (
             f"Hash mismatch for shape {m, n}: MatrixMerkleTree root doesn't match tensor_hash result"
+        )
+        assert cuda_root == cast_root, (
+            f"Hash mismatch for shape {m, n}: direct int8 tensor_hash differs from uint8 cast path"
         )
 
     def test_commitment_hash_reference_vs_cuda(self, test_noise_seed_A):

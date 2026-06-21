@@ -3,7 +3,12 @@ import torch
 from blake3 import blake3
 from miner_base.commitment_hash import CommitmentHasher
 from miner_base.matrix_merkle_tree import MatrixMerkleTree
-from pearl_gemm import commitment_hash_from_merkle_roots, get_required_scratchpad_bytes, tensor_hash
+from pearl_gemm import (
+    commitment_hash_from_b_commitment,
+    commitment_hash_from_merkle_roots,
+    get_required_scratchpad_bytes,
+    tensor_hash,
+)
 
 
 def hash_matrix(matrix: torch.Tensor, key: bytes) -> torch.Tensor:
@@ -115,6 +120,40 @@ class TestTensorHash:
             "Commitment hash from merkle roots mismatch: CUDA result doesn't match Python reference"
         )
 
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (16, 16),
+            (257, 1024),
+            (1024, 1024),
+            (2048, 3072),
+        ],
+    )
+    def test_tensor_hash_int8_hashes_raw_bytes(self, shape):
+        """Dense mining hashes int8 A/B tensors directly without uint8 casts."""
+        matrix = torch.randint(-63, 64, shape, dtype=torch.int8, device="cuda")
+        scratchpad = torch.empty(
+            get_required_scratchpad_bytes(matrix.numel()),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        direct_result = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        cast_result = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        key_tensor = torch.randint(0, 255, (blake3.digest_size,), dtype=torch.uint8, device="cuda")
+        key_bytes = key_tensor.cpu().numpy().tobytes()
+
+        tensor_hash(matrix, key_tensor, direct_result, scratchpad)
+        tensor_hash(matrix.to(torch.uint8), key_tensor, cast_result, scratchpad)
+        torch.cuda.synchronize()
+
+        python_result = hash_matrix(matrix.cpu(), key_bytes)
+        assert torch.equal(direct_result, python_result), (
+            f"tensor_hash must hash the raw int8 bytes used by MatrixMerkleTree for {shape}"
+        )
+        assert torch.equal(direct_result, cast_result), (
+            f"direct int8 hashing must match the previous uint8 cast path for {shape}"
+        )
+
     def test_commitment_hash_from_merkle_roots_moe(self):
         """MoE folding path matches the CommitmentHasher reference."""
         # Cumulative exclusive ends per expert; last == m * top_k.
@@ -159,6 +198,26 @@ class TestTensorHash:
         assert cuda_result_B.cpu().numpy().tobytes() == reference.noise_seed_B, (
             "MoE commitment hash mismatch: CUDA result doesn't match Python reference"
         )
+
+    def test_commitment_hash_from_b_commitment_matches_full_commitment(self):
+        """Warm-path A commitment matches the full A/B root commitment kernel."""
+        A_merkle_root = torch.randint(
+            0, 255, (blake3.digest_size,), dtype=torch.uint8, device="cuda"
+        )
+        B_merkle_root = torch.randint(
+            0, 255, (blake3.digest_size,), dtype=torch.uint8, device="cuda"
+        )
+        key = torch.randint(0, 255, (blake3.digest_size,), dtype=torch.uint8, device="cuda")
+
+        full_A = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        full_B = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        commitment_hash_from_merkle_roots(A_merkle_root, B_merkle_root, key, full_A, full_B)
+
+        warm_A = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
+        commitment_hash_from_b_commitment(A_merkle_root, full_B, warm_A)
+        torch.cuda.synchronize()
+
+        assert torch.equal(warm_A, full_A)
 
     @pytest.mark.parametrize(
         "shape",

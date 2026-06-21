@@ -23,6 +23,7 @@ from .helpers import (
     make_pow_target_tensor,
 )
 from .pearl_gemm_interface import (
+    commitment_hash_from_b_commitment,
     commitment_hash_from_merkle_roots,
     denoise_converter,
     gemm,
@@ -39,6 +40,7 @@ __all__ = [
     "HostSignalStatus",
     "ProofTileIndices",
     "commitment_hash_from_merkle_roots",
+    "commitment_hash_from_b_commitment",
     "denoise_converter",
     "extract_indices",
     "gemm",

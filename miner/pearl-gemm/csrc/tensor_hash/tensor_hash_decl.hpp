@@ -25,3 +25,8 @@ void commitment_hash_from_merkle_roots(
     const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
     const uint8_t* routing_root, const uint8_t* offsets_hash,
     cudaDeviceProp& deviceProp, cudaStream_t stream);
+
+void commitment_hash_from_b_commitment(
+    const uint8_t* A_merkle_root, const uint8_t* B_commitment_hash,
+    uint8_t* A_commitment_hash, const uint8_t* routing_root,
+    const uint8_t* offsets_hash, cudaDeviceProp& deviceProp, cudaStream_t stream);
