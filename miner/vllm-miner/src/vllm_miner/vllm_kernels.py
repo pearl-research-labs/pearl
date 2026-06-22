@@ -143,10 +143,12 @@ class PearlKernel(Int8ScaledMMLinearKernel):
             if scale is not None and not isinstance(scale, torch.nn.Parameter):
                 layer.smooth_quant_scale = torch.nn.Parameter(scale.data, requires_grad=False)
 
-        hadamard_block_size = NO_HADAMARD_BLOCK_SIZE
-        if hasattr(layer, "hadamard_block_size") and layer.hadamard_block_size is not None:
-            hadamard_block_size = int(layer.hadamard_block_size.item())
-        layer._hadamard_block_size = hadamard_block_size
+        hadamard_block_size_param = getattr(layer, "hadamard_block_size", None)
+        layer._hadamard_block_size = (
+            int(hadamard_block_size_param.item())
+            if hadamard_block_size_param is not None
+            else NO_HADAMARD_BLOCK_SIZE
+        )
 
     @override
     def apply_weights(
