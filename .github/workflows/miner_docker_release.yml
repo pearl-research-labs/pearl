@@ -2,10 +2,6 @@ name: Release Miner Docker Image
 on:
   workflow_dispatch:
     inputs:
-      node_major_version:
-        description: "Compatible node major version to stamp on the image (e.g. 1)"
-        required: true
-        type: string
       image_tag:
         description: "Extra image tag to publish (e.g. v0.1.0). Leave empty to tag by commit sha only."
         required: false
@@ -50,15 +46,13 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.RELEASE_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract image metadata (tags & labels)
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          labels: |
-            ai.pearlresearch.node.compatible-major-version=${{ inputs.node_major_version }}
           tags: |
             type=sha
             type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' }}
