@@ -228,33 +228,6 @@ func lazyApplyHandler(request *btcjson.Request, w *wallet.Wallet, chainClient ch
 	}
 }
 
-// makeResponse makes the JSON-RPC response struct for the result and error
-// returned by a requestHandler.  The returned response is not ready for
-// marshaling and sending off to a client, but must be
-func makeResponse(id, result interface{}, err error) btcjson.Response {
-	idPtr := idPointer(id)
-	if err != nil {
-		return btcjson.Response{
-			ID:    idPtr,
-			Error: jsonError(err),
-		}
-	}
-	resultBytes, err := json.Marshal(result)
-	if err != nil {
-		return btcjson.Response{
-			ID: idPtr,
-			Error: &btcjson.RPCError{
-				Code:    btcjson.ErrRPCInternal.Code,
-				Message: "Unexpected error marshalling result",
-			},
-		}
-	}
-	return btcjson.Response{
-		ID:     idPtr,
-		Result: json.RawMessage(resultBytes),
-	}
-}
-
 // jsonError creates a JSON-RPC error from the Go error.
 func jsonError(err error) *btcjson.RPCError {
 	if err == nil {
