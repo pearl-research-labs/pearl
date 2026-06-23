@@ -7,10 +7,16 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/websocket"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
+	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/require"
 )
 
@@ -136,65 +142,163 @@ func TestAuthorizeRequest(t *testing.T) {
 	})
 }
 
-// TestAuthorizeRequestBatchSequence locks in the sequential auth behavior that
-// inHandler relies on for batched requests: a failed authenticate in an
-// unauthenticated batch must not let a following privileged command run, while
-// a valid authenticate lets the following command proceed.
-func TestAuthorizeRequestBatchSequence(t *testing.T) {
+// startWSClient drives a real websocket connection through the node's
+// inHandler/notificationQueueHandler/outHandler goroutines against a minimal
+// rpcServer. It returns the client-side connection and a channel that is
+// closed once the server-side client has fully shut down. The wsClient is
+// constructed directly (rather than via newWebsocketClient/WebsocketHandler)
+// to avoid the global daemon config those paths require.
+func startWSClient(t *testing.T, s *rpcServer, authenticated, isAdmin bool) (*websocket.Conn, <-chan struct{}) {
+	t.Helper()
+
+	done := make(chan struct{})
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(*http.Request) bool { return true },
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		c := &wsClient{
+			conn:              conn,
+			addr:              r.RemoteAddr,
+			authenticated:     authenticated,
+			isAdmin:           isAdmin,
+			sessionID:         1,
+			server:            s,
+			addrRequests:      make(map[string]struct{}),
+			spentRequests:     make(map[wire.OutPoint]struct{}),
+			serviceRequestSem: makeSemaphore(10),
+			ntfnChan:          make(chan []byte, 1),
+			sendChan:          make(chan wsResponse, websocketSendBufferSize),
+			quit:              make(chan struct{}),
+		}
+		c.wg.Add(3)
+		go c.inHandler()
+		go c.notificationQueueHandler()
+		go c.outHandler()
+		c.WaitForShutdown()
+		close(done)
+	}))
+	t.Cleanup(srv.Close)
+
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+	conn, resp, err := dialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	require.NoError(t, err)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	return conn, done
+}
+
+// TestWebsocketBatchHandling exercises the real websocket batch path:
+// notification-only batches emit no frame, mixed batches reply only to the
+// requests, and a failed authenticate in an unauthenticated batch disconnects
+// before any following command runs.
+func TestWebsocketBatchHandling(t *testing.T) {
 	t.Parallel()
 
 	s := &rpcServer{
 		adminCredHash: sha256.Sum256([]byte("admin:adminpass")),
 		limitCredHash: sha256.Sum256([]byte("limit:limitpass")),
 	}
-	mustRequest := func(raw string) btcjson.Request {
-		t.Helper()
 
-		var req btcjson.Request
-		require.NoError(t, json.Unmarshal([]byte(raw), &req))
-		return req
-	}
+	t.Run("notification-only batch produces no frame", func(t *testing.T) {
+		conn, _ := startWSClient(t, s, true, true)
 
-	t.Run("failed authenticate blocks following command", func(t *testing.T) {
-		c := &wsClient{server: s}
-		bad := mustRequest(`{"jsonrpc":"1.0","method":"authenticate","params":["admin","wrong"],"id":1}`)
-		require.True(t, c.authorizeRequest(&bad).disconnect)
-		require.False(t, c.authenticated)
+		// A batch of only a notification (no id) must produce no frame.
+		// Follow it with a real request; the first frame received must be
+		// that request's reply, proving the notification batch sent nothing.
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage,
+			[]byte(`[{"jsonrpc":"1.0","method":"session","params":[]}]`)))
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage,
+			[]byte(`{"jsonrpc":"1.0","method":"session","params":[],"id":42}`)))
 
-		// The still-unauthenticated client's privileged command is also
-		// rejected (inHandler stops on the first disconnect outcome).
-		stop := mustRequest(`{"jsonrpc":"1.0","method":"stop","params":[],"id":2}`)
-		require.True(t, c.authorizeRequest(&stop).disconnect)
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, msg, err := conn.ReadMessage()
+		require.NoError(t, err)
+
+		var reply struct {
+			Result *btcjson.SessionResult `json:"result"`
+			ID     json.RawMessage        `json:"id"`
+		}
+		require.NoError(t, json.Unmarshal(msg, &reply))
+		require.Equal(t, "42", string(reply.ID))
+		require.NotNil(t, reply.Result)
 	})
 
-	t.Run("valid authenticate lets following command proceed", func(t *testing.T) {
-		c := &wsClient{server: s}
-		auth := mustRequest(`{"jsonrpc":"1.0","method":"authenticate","params":["admin","adminpass"],"id":1}`)
-		first := c.authorizeRequest(&auth)
-		require.False(t, first.disconnect)
-		require.NotNil(t, first.reply)
-		require.True(t, c.authenticated)
+	t.Run("mixed batch replies only to requests", func(t *testing.T) {
+		conn, _ := startWSClient(t, s, true, true)
 
-		stop := mustRequest(`{"jsonrpc":"1.0","method":"stop","params":[],"id":2}`)
-		second := c.authorizeRequest(&stop)
-		require.False(t, second.disconnect)
-		require.NotNil(t, second.cmd)
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage,
+			[]byte(`[{"jsonrpc":"1.0","method":"session","params":[]},`+
+				`{"jsonrpc":"1.0","method":"session","params":[],"id":7}]`)))
+
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, msg, err := conn.ReadMessage()
+		require.NoError(t, err)
+
+		var batch []struct {
+			ID json.RawMessage `json:"id"`
+		}
+		require.NoError(t, json.Unmarshal(msg, &batch))
+		require.Len(t, batch, 1, "only the request should get a reply")
+		require.Equal(t, "7", string(batch[0].ID))
+	})
+
+	t.Run("failed unauthenticated batch disconnects", func(t *testing.T) {
+		conn, done := startWSClient(t, s, false, false)
+
+		// The first element is an invalid authenticate; the client must be
+		// disconnected before the second (privileged) command is run.
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage,
+			[]byte(`[{"jsonrpc":"1.0","method":"authenticate","params":["admin","wrong"],"id":1},`+
+				`{"jsonrpc":"1.0","method":"session","params":[],"id":2}]`)))
+
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, _, err := conn.ReadMessage()
+		require.Error(t, err, "server should disconnect rather than reply")
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("server did not shut the client down after failed auth")
+		}
 	})
 }
 
-// TestRunCommand verifies that an authorized command is executed and its
-// response marshalled - the dispatch step that authorizeRequest leaves to the
-// caller.
-func TestRunCommand(t *testing.T) {
+// TestWebsocketClientCloseUnblocksShutdown verifies that a client-side close
+// unblocks the server's per-client goroutines (WaitForShutdown returns).
+func TestWebsocketClientCloseUnblocksShutdown(t *testing.T) {
 	t.Parallel()
 
-	c := &wsClient{server: &rpcServer{}, sessionID: 7}
+	conn, done := startWSClient(t, &rpcServer{}, true, true)
+	require.NoError(t, conn.Close())
 
-	var req btcjson.Request
-	require.NoError(t, json.Unmarshal(
-		[]byte(`{"jsonrpc":"1.0","method":"session","params":[],"id":1}`), &req))
-	cmd := parseCmd(&req)
-	require.Nil(t, cmd.err)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server client did not shut down after the client closed")
+	}
+}
 
-	require.NotNil(t, c.runCommand(cmd))
+// TestQueueNotificationAfterDisconnect verifies that queuing a notification on
+// a disconnected client returns ErrClientQuit immediately instead of blocking.
+func TestQueueNotificationAfterDisconnect(t *testing.T) {
+	t.Parallel()
+
+	c := &wsClient{disconnected: true}
+
+	result := make(chan error, 1)
+	go func() { result <- c.QueueNotification([]byte(`{"method":"x"}`)) }()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, ErrClientQuit)
+	case <-time.After(5 * time.Second):
+		t.Fatal("QueueNotification blocked after disconnect")
+	}
 }
