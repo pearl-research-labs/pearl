@@ -144,6 +144,38 @@ func TestWriteTLSCertPair(t *testing.T) {
 	})
 }
 
+// TestWriteTLSCertPairCleansUpOnKeyRemoveFailure ensures that if the existing
+// key cannot be removed before the new key is written, the freshly written
+// certificate is cleaned up rather than left mismatched with the old key.
+func TestWriteTLSCertPairCleansUpOnKeyRemoveFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory write permissions are not meaningful on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("read-only directory permissions do not apply to root")
+	}
+
+	validUntil := time.Now().Add(time.Hour)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "rpc.cert")
+
+	// Seed a stale key in its own directory, then make that directory
+	// read-only so os.Remove(keyFile) fails (removing a file needs a
+	// writable parent) while the cert's directory stays writable.
+	keyDir := filepath.Join(dir, "keys")
+	require.NoError(t, os.Mkdir(keyDir, 0700))
+	keyFile := filepath.Join(keyDir, "rpc.key")
+	require.NoError(t, os.WriteFile(keyFile, []byte("stale"), 0600))
+	require.NoError(t, os.Chmod(keyDir, 0500))
+	t.Cleanup(func() { _ = os.Chmod(keyDir, 0700) })
+
+	_, err := btcutil.WriteTLSCertPair(certFile, keyFile, "test",
+		validUntil, nil, true)
+	require.Error(t, err)
+	assert.NoFileExists(t, certFile,
+		"cert must be removed when the key cannot be persisted")
+}
+
 func assertFileMode(t *testing.T, name string, want os.FileMode) {
 	t.Helper()
 	info, err := os.Stat(name)

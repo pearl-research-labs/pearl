@@ -178,6 +178,9 @@ func WriteTLSCertPair(certFile, keyFile, org string, validUntil time.Time, extra
 		// os.WriteFile keeps an existing file's mode, so remove any stale
 		// key first to guarantee the new one is created owner-only (0600).
 		if err := os.Remove(keyFile); err != nil && !os.IsNotExist(err) {
+			// Don't leave the freshly written cert without a matching
+			// key.
+			_ = os.Remove(certFile)
 			return tls.Certificate{}, err
 		}
 		if err := os.WriteFile(keyFile, key, 0600); err != nil {
