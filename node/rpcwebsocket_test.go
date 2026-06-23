@@ -136,6 +136,52 @@ func TestAuthorizeRequest(t *testing.T) {
 	})
 }
 
+// TestAuthorizeRequestBatchSequence locks in the sequential auth behavior that
+// inHandler relies on for batched requests: a failed authenticate in an
+// unauthenticated batch must not let a following privileged command run, while
+// a valid authenticate lets the following command proceed.
+func TestAuthorizeRequestBatchSequence(t *testing.T) {
+	t.Parallel()
+
+	s := &rpcServer{
+		adminCredHash: sha256.Sum256([]byte("admin:adminpass")),
+		limitCredHash: sha256.Sum256([]byte("limit:limitpass")),
+	}
+	mustRequest := func(raw string) btcjson.Request {
+		t.Helper()
+
+		var req btcjson.Request
+		require.NoError(t, json.Unmarshal([]byte(raw), &req))
+		return req
+	}
+
+	t.Run("failed authenticate blocks following command", func(t *testing.T) {
+		c := &wsClient{server: s}
+		bad := mustRequest(`{"jsonrpc":"1.0","method":"authenticate","params":["admin","wrong"],"id":1}`)
+		require.True(t, c.authorizeRequest(&bad).disconnect)
+		require.False(t, c.authenticated)
+
+		// The still-unauthenticated client's privileged command is also
+		// rejected (inHandler stops on the first disconnect outcome).
+		stop := mustRequest(`{"jsonrpc":"1.0","method":"stop","params":[],"id":2}`)
+		require.True(t, c.authorizeRequest(&stop).disconnect)
+	})
+
+	t.Run("valid authenticate lets following command proceed", func(t *testing.T) {
+		c := &wsClient{server: s}
+		auth := mustRequest(`{"jsonrpc":"1.0","method":"authenticate","params":["admin","adminpass"],"id":1}`)
+		first := c.authorizeRequest(&auth)
+		require.False(t, first.disconnect)
+		require.NotNil(t, first.reply)
+		require.True(t, c.authenticated)
+
+		stop := mustRequest(`{"jsonrpc":"1.0","method":"stop","params":[],"id":2}`)
+		second := c.authorizeRequest(&stop)
+		require.False(t, second.disconnect)
+		require.NotNil(t, second.cmd)
+	})
+}
+
 // TestRunCommand verifies that an authorized command is executed and its
 // response marshalled - the dispatch step that authorizeRequest leaves to the
 // caller.

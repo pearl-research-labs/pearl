@@ -1541,7 +1541,11 @@ func (c *wsClient) inHandler() {
 				}
 			}
 
-			c.SendMessage(payload, nil)
+			// A notification (no id) or an all-notification batch
+			// produces no results; don't emit an empty websocket frame.
+			if len(payload) > 0 {
+				c.SendMessage(payload, nil)
+			}
 			c.serviceRequestSem.release()
 		}
 	}
