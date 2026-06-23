@@ -4043,8 +4043,8 @@ type rpcServer struct {
 	started                int32
 	shutdown               int32
 	cfg                    rpcserverConfig
-	authsha                [sha256.Size]byte
-	limitauthsha           [sha256.Size]byte
+	adminCredHash          [sha256.Size]byte
+	limitCredHash          [sha256.Size]byte
 	ntfnMgr                *wsNotificationManager
 	numClients             int32
 	statusLines            map[int]string
@@ -4200,8 +4200,8 @@ func (s *rpcServer) decrementClients() {
 // of the server (true) or whether the user is limited (false). The second is
 // always false if the first is.
 func (s *rpcServer) checkAuth(r *http.Request, require bool) (bool, bool, error) {
-	authhdr := r.Header["Authorization"]
-	if len(authhdr) <= 0 {
+	user, pass, ok := r.BasicAuth()
+	if !ok {
 		if require {
 			rpcsLog.Warnf("RPC authentication failure from %s",
 				r.RemoteAddr)
@@ -4211,24 +4211,27 @@ func (s *rpcServer) checkAuth(r *http.Request, require bool) (bool, bool, error)
 		return false, false, nil
 	}
 
-	authsha := sha256.Sum256([]byte(authhdr[0]))
-
-	// Check for limited auth first as in environments with limited users, those
-	// are probably expected to have a higher volume of calls
-	limitcmp := subtle.ConstantTimeCompare(authsha[:], s.limitauthsha[:])
-	if limitcmp == 1 {
-		return true, false, nil
+	authenticated, isAdmin := s.checkCredentials(user, pass)
+	if !authenticated {
+		rpcsLog.Warnf("RPC authentication failure from %s", r.RemoteAddr)
+		return false, false, errors.New("auth failure")
 	}
 
-	// Check for admin-level auth
-	cmp := subtle.ConstantTimeCompare(authsha[:], s.authsha[:])
-	if cmp == 1 {
-		return true, true, nil
-	}
+	return true, isAdmin, nil
+}
 
-	// Request's auth doesn't match either user
-	rpcsLog.Warnf("RPC authentication failure from %s", r.RemoteAddr)
-	return false, false, errors.New("auth failure")
+// checkCredentials reports whether the supplied username and passphrase match
+// the configured admin or limited RPC credentials.  The second return value is
+// true only for the admin user.  Each comparison is constant time.
+func (s *rpcServer) checkCredentials(user, pass string) (authenticated, isAdmin bool) {
+	h := sha256.Sum256([]byte(user + ":" + pass))
+	if subtle.ConstantTimeCompare(h[:], s.adminCredHash[:]) == 1 {
+		return true, true
+	}
+	if subtle.ConstantTimeCompare(h[:], s.limitCredHash[:]) == 1 {
+		return true, false
+	}
+	return false, false
 }
 
 // parsedRPCCmd represents a JSON-RPC request object that has been parsed into
@@ -4899,14 +4902,10 @@ func newRPCServer(config *rpcserverConfig) (*rpcServer, error) {
 		quit:                   make(chan int),
 	}
 	if cfg.RPCUser != "" && cfg.RPCPass != "" {
-		login := cfg.RPCUser + ":" + cfg.RPCPass
-		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
-		rpc.authsha = sha256.Sum256([]byte(auth))
+		rpc.adminCredHash = sha256.Sum256([]byte(cfg.RPCUser + ":" + cfg.RPCPass))
 	}
 	if cfg.RPCLimitUser != "" && cfg.RPCLimitPass != "" {
-		login := cfg.RPCLimitUser + ":" + cfg.RPCLimitPass
-		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
-		rpc.limitauthsha = sha256.Sum256([]byte(auth))
+		rpc.limitCredHash = sha256.Sum256([]byte(cfg.RPCLimitUser + ":" + cfg.RPCLimitPass))
 	}
 	rpc.ntfnMgr = newWsNotificationManager(&rpc)
 	rpc.cfg.Chain.Subscribe(rpc.handleBlockchainNotification)
