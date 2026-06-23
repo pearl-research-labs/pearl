@@ -50,15 +50,14 @@ required to generate Go bindings.
 package main
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 
+	"github.com/pearl-research-labs/pearl/node/btcutil"
 	pb "github.com/pearl-research-labs/pearl/wallet/rpc/walletrpc"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-
-	"github.com/pearl-research-labs/pearl/node/btcutil"
 )
 
 var certificateFile = filepath.Join(btcutil.AppDataDir("Oyster", false), "rpc.cert")
