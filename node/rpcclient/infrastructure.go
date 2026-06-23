@@ -781,7 +781,10 @@ func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
 		return
 	}
 
-	tries := 10
+	tries := c.config.HTTPPostTries
+	if tries < 1 {
+		tries = 10
+	}
 	for i := 0; i < tries; i++ {
 		var httpReq *http.Request
 
@@ -797,10 +800,12 @@ func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
 			httpReq.Header.Set(key, value)
 		}
 
-		// Configure basic access authorization.
-		user, pass, err := c.config.getAuth()
-		if err != nil {
-			jReq.responseChan <- &Response{result: nil, err: err}
+		// Configure basic access authorization.  Use a distinct error
+		// variable so the outer err (used to decide retries and the
+		// final result below) is not shadowed by this short-lived :=.
+		user, pass, authErr := c.config.getAuth()
+		if authErr != nil {
+			jReq.responseChan <- &Response{result: nil, err: authErr}
 			return
 		}
 		httpReq.SetBasicAuth(user, pass)
@@ -1245,6 +1250,11 @@ type ConnConfig struct {
 	// is true.
 	Certificates []byte
 
+	// TLSSkipVerify disables verification of the server's certificate chain
+	// and host name when set.  It has no effect if DisableTLS is true.  This
+	// is insecure and intended only for testing.
+	TLSSkipVerify bool
+
 	// Proxy specifies to connect through a SOCKS 5 proxy server.  It may
 	// be an empty string if a proxy is not required.
 	Proxy string
@@ -1276,6 +1286,12 @@ type ConnConfig struct {
 	// however, not all servers support the websocket extensions, so this
 	// flag can be set to true to use basic HTTP POST requests instead.
 	HTTPPostMode bool
+
+	// HTTPPostTries is the number of times an HTTP POST request is attempted
+	// before giving up.  Values less than one fall back to the default of
+	// 10.  A value of one disables retries, which is appropriate for
+	// one-shot clients that prefer to fail fast.
+	HTTPPostTries int
 
 	// ExtraHeaders specifies the extra headers when perform request. It's
 	// useful when RPC provider need customized headers.
@@ -1326,25 +1342,27 @@ func (config *ConnConfig) retrieveCookie() (username, passphrase string, err err
 // newHTTPClient returns a new http client that is configured according to the
 // proxy and TLS settings in the associated connection configuration.
 func newHTTPClient(config *ConnConfig) (*http.Client, error) {
-	// Set proxy function if there is a proxy configured.
-	var proxyFunc func(*http.Request) (*url.URL, error)
+	// Set up the SOCKS5 proxy if one is configured.
+	var proxy *socks.Proxy
 	if config.Proxy != "" {
-		proxyURL, err := url.Parse(config.Proxy)
-		if err != nil {
-			return nil, err
+		proxy = &socks.Proxy{
+			Addr:     config.Proxy,
+			Username: config.ProxyUser,
+			Password: config.ProxyPass,
 		}
-		proxyFunc = http.ProxyURL(proxyURL)
 	}
 
 	// Configure TLS if needed.
 	var tlsConfig *tls.Config
 	if !config.DisableTLS {
+		tlsConfig = &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: config.TLSSkipVerify,
+		}
 		if len(config.Certificates) > 0 {
 			pool := x509.NewCertPool()
 			pool.AppendCertsFromPEM(config.Certificates)
-			tlsConfig = &tls.Config{
-				RootCAs: pool,
-			}
+			tlsConfig.RootCAs = pool
 		}
 	}
 
@@ -1352,19 +1370,28 @@ func newHTTPClient(config *ConnConfig) (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	dialContext := func(ctx context.Context, _,
+		_ string) (net.Conn, error) {
+
+		network := parsedDialAddr.Network()
+		address := parsedDialAddr.String()
+		if proxy == nil {
+			d := &net.Dialer{}
+			return d.DialContext(ctx, network, address)
+		}
+		if network != "tcp" && network != "tcp4" && network != "tcp6" {
+			return nil, fmt.Errorf("SOCKS proxy cannot dial %s address %q",
+				network, address)
+		}
+		// go-socks has no context-aware dial, but net/http abandons the
+		// dial (and closes any late connection) once ctx is done, so the
+		// request still honors the client timeout.
+		return proxy.Dial(network, address)
+	}
 	client := http.Client{
 		Transport: &http.Transport{
-			Proxy:           proxyFunc,
 			TLSClientConfig: tlsConfig,
-			DialContext: func(ctx context.Context, _,
-				_ string) (net.Conn, error) {
-				d := &net.Dialer{}
-				return d.DialContext(
-					ctx,
-					parsedDialAddr.Network(),
-					parsedDialAddr.String(),
-				)
-			},
+			DialContext:     dialContext,
 		},
 		Timeout: defaultHTTPTimeout,
 	}
@@ -1406,7 +1433,8 @@ func dial(config *ConnConfig) (*websocket.Conn, error) {
 	var scheme = "ws"
 	if !config.DisableTLS {
 		tlsConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: config.TLSSkipVerify,
 		}
 		if len(config.Certificates) > 0 {
 			pool := x509.NewCertPool()
