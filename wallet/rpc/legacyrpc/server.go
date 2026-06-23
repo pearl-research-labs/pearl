@@ -363,6 +363,24 @@ func (s *Server) websocketClientRespond(wsc *websocketClient) {
 				s.requestProcessShutdown()
 				return
 
+			case "authenticate":
+				// The client already authenticated via HTTP Basic
+				// auth during the websocket handshake.  Answer
+				// locally with success so the request is never
+				// proxied to pearld, which would disconnect the
+				// wallet's upstream RPC connection on a redundant
+				// authenticate.
+				mresp, err := btcjson.MarshalResponse(
+					btcjson.RpcVersion1, req.ID, nil, nil,
+				)
+				if err != nil {
+					log.Errorf("Unable to marshal response: %v", err)
+					return
+				}
+				if err := wsc.send(mresp); err != nil {
+					return
+				}
+
 			default:
 				req := req // Copy for the closure
 				f := s.handlerClosure(&req)

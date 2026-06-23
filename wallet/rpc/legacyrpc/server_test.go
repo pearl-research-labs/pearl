@@ -7,9 +7,11 @@ package legacyrpc
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +100,97 @@ func TestWebsocketHandshakeAuth(t *testing.T) {
 	// Correct credentials handshake should succeed.
 	_, err = dial("user", "pass", true)
 	require.NoError(t, err)
+}
+
+// TestWebsocketAuthenticateHandledLocally is the regression test for the
+// authenticate fallthrough: a redundant in-band authenticate from an
+// already-authenticated websocket client must be answered locally with
+// success and never proxied to the chain server.  With no chain client
+// configured, a passthrough would instead report "Chain RPC is inactive".
+func TestWebsocketAuthenticateHandledLocally(t *testing.T) {
+	t.Parallel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	opts := &Options{
+		Username:            "user",
+		Password:            "pass",
+		MaxPOSTClients:      10,
+		MaxWebsocketClients: 10,
+	}
+	srv := NewServer(opts, nil, []net.Listener{lis})
+	srv.Start()
+	defer srv.Stop()
+
+	h := http.Header{}
+	cred := base64.StdEncoding.EncodeToString([]byte("user:pass"))
+	h.Set("Authorization", "Basic "+cred)
+
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+	conn, resp, err := dialer.Dial("ws://"+lis.Addr().String()+"/ws", h)
+	require.NoError(t, err)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	defer conn.Close()
+
+	req := `{"jsonrpc":"1.0","id":7,"method":"authenticate","params":["user","pass"]}`
+	require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(req)))
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, msg, err := conn.ReadMessage()
+	require.NoError(t, err)
+
+	var got struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+		ID     json.RawMessage `json:"id"`
+	}
+	require.NoError(t, json.Unmarshal(msg, &got))
+	assert.Equal(t, "null", string(got.Error),
+		"authenticate must be answered locally, not proxied to the chain server")
+	assert.Equal(t, "7", string(got.ID))
+}
+
+// TestPostHandshakeAuth checks route-level HTTP Basic auth on the POST
+// endpoint: missing or wrong credentials are rejected with 401 before the
+// request is processed, and correct credentials are accepted.
+func TestPostHandshakeAuth(t *testing.T) {
+	t.Parallel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	opts := &Options{
+		Username:            "user",
+		Password:            "pass",
+		MaxPOSTClients:      10,
+		MaxWebsocketClients: 10,
+	}
+	srv := NewServer(opts, nil, []net.Listener{lis})
+	srv.Start()
+	defer srv.Stop()
+
+	endpoint := "http://" + lis.Addr().String() + "/"
+	body := `{"jsonrpc":"1.0","id":1,"method":"getinfo","params":[]}`
+
+	post := func(user, pass string, withAuth bool) int {
+		req, err := http.NewRequest(http.MethodPost, endpoint,
+			strings.NewReader(body))
+		require.NoError(t, err)
+		if withAuth {
+			req.SetBasicAuth(user, pass)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	assert.Equal(t, http.StatusUnauthorized, post("", "", false))
+	assert.Equal(t, http.StatusUnauthorized, post("user", "wrong", true))
+	assert.Equal(t, http.StatusOK, post("user", "pass", true))
 }
 
 func TestThrottle(t *testing.T) {
