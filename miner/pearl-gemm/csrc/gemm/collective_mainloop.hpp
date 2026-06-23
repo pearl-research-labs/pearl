@@ -263,34 +263,45 @@ struct CollectiveMainloop {
     Tensor tCsA = thr_mma.partition_A(sA);  // (MMA,MMA_M,MMA_K,PIPE)
     Tensor tCsB = thr_mma.partition_B(sB);  // (MMA,MMA_N,MMA_K,PIPE)
 
-    // Allocate "fragments". On Hopper (sm_90), these are WGMMA matrix
-    // descriptors that the wgmma instruction reads SMEM through directly.
-    // On Blackwell consumer (sm_120/121), they are register fragments that
-    // must be populated via ldmatrix (SMEM->Register copy) before each
-    // mma.sync call (see SM80 staging path below).
+    // Allocate MMA operand fragments. On Hopper (sm_90), these are WGMMA
+    // matrix descriptors that read SMEM directly. On Blackwell consumer
+    // (sm_120/121), they are register fragments for SM80 mma.sync.
     Tensor tCrA = thr_mma.make_fragment_A(tCsA);  // (MMA,MMA_M,MMA_K,PIPE)
     Tensor tCrB = thr_mma.make_fragment_B(tCsB);  // (MMA,MMA_N,MMA_K,PIPE)
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    // SM80 SMEM->register staging via ldmatrix. The tiled_copy is built to
-    // match the tiled_mma's per-thread fragment layout (retile_D), and the
-    // SMEM source partition matches the original tCsA/tCsB layouts.
+    // SM80 SMEM->register staging (Blackwell consumer sm_120/121).
+    //
+    // Match CUTLASS's own cooperative_gemm_no_predication() pattern exactly:
+    //   1. copy SMEM into an input-typed register buffer (tCrAi/tCrBi), using
+    //      make_tiled_copy_{A,B}(AutoVectorizingCopy..., thr_mma)
+    //   2. transform/cast that input buffer into the MMA compute fragment
+    //      (tCrA/tCrB)
+    //   3. feed tCrA/tCrB to mma.sync
+    //
+    // This avoids ldmatrix's 16-bit transpose (wrong for int8) while preserving
+    // the MMA atom's expected register layout. Do NOT as_position_independent()
+    // the source here; CUTLASS's passing int8 test copies directly from the
+    // swizzled SMEM tensor with the tiled copy partition.
+    Tensor tCrAi = make_fragment_like<ElementIn>(tCrA);
+    Tensor tCrBi = make_fragment_like<ElementIn>(tCrB);
+
     using S2RCopyAtomMain_A =
-        Copy_Atom<SM75_U32x4_LDSM_N, typename KTraits::ElementIn>;
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementIn>;
     using S2RCopyAtomMain_B =
-        Copy_Atom<SM75_U32x4_LDSM_N, typename KTraits::ElementIn>;
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementIn>;
     auto s2r_tiled_copy_A_main =
-        make_tiled_copy_A(S2RCopyAtomMain_A{}, tiled_mma);
+        make_tiled_copy_A(S2RCopyAtomMain_A{}, thr_mma);
     auto s2r_tiled_copy_B_main =
-        make_tiled_copy_B(S2RCopyAtomMain_B{}, tiled_mma);
+        make_tiled_copy_B(S2RCopyAtomMain_B{}, thr_mma);
     auto s2r_thr_copy_A_main =
         s2r_tiled_copy_A_main.get_thread_slice(thread_idx);
     auto s2r_thr_copy_B_main =
         s2r_tiled_copy_B_main.get_thread_slice(thread_idx);
-    Tensor tCsA_s2r = s2r_thr_copy_A_main.partition_S(sA);  // (CPY, CPY_M, CPY_K, PIPE)
+    Tensor tCsA_s2r = s2r_thr_copy_A_main.partition_S(sA);
     Tensor tCsB_s2r = s2r_thr_copy_B_main.partition_S(sB);
-    Tensor tCrA_view = s2r_thr_copy_A_main.retile_D(tCrA); // view of tCrA in copy layout
-    Tensor tCrB_view = s2r_thr_copy_B_main.retile_D(tCrB);
+    Tensor tCrAi_view = s2r_thr_copy_A_main.retile_D(tCrAi);
+    Tensor tCrBi_view = s2r_thr_copy_B_main.retile_D(tCrBi);
 #endif
 
     const uint32_t last_full_k_block =
@@ -325,15 +336,18 @@ struct CollectiveMainloop {
         warpgroup_arrive();
 #endif
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-        // SM80: ldmatrix this k_block's A and B from SMEM into registers
-        // before mma.sync. PIPE dim of tCrA_view selects the stage of the
-        // pipeline that's currently held in SMEM.
+        // SM80: stage this k_block exactly like CUTLASS cooperative_gemm:
+        // SMEM -> input-typed RMEM buffer -> MMA compute fragment.
         cute::copy(s2r_tiled_copy_A_main,
                    tCsA_s2r(_, _, k_block, stage),
-                   tCrA_view(_, _, k_block, stage));
+                   tCrAi_view(_, _, k_block, stage));
         cute::copy(s2r_tiled_copy_B_main,
                    tCsB_s2r(_, _, k_block, stage),
-                   tCrB_view(_, _, k_block, stage));
+                   tCrBi_view(_, _, k_block, stage));
+        cute::transform(tCrAi(_, _, k_block, stage),
+                        tCrA(_, _, k_block, stage), cute::identity{});
+        cute::transform(tCrBi(_, _, k_block, stage),
+                        tCrB(_, _, k_block, stage), cute::identity{});
 #endif
         // WGMMA with dispatch mode (V,M,K) x (V,N,K) => (V,M,N)
         gemm(tiled_mma, tCrA(_, _, k_block, stage), tCrB(_, _, k_block, stage),

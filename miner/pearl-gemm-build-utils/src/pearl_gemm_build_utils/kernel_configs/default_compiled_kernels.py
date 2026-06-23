@@ -121,20 +121,28 @@ _noising_b_kernels = [
     for dtype in ["fp16", "int32"]
 ]
 
-# Path 3: canonical 128x256x128 stages=2 — now fits GB10 after Step 1-3 SMEM
-# restructuring (denoise serialized, smem_C removed). ~98 KB SMEM usage.
-for R in [64, 128]:
-    _matmul_kernels.append(
-        MatmulKernelConfig(
-            tile_size_m=128,
-            tile_size_n=256,
-            tile_size_k=128,
-            R=R,
-            pipeline_stages=2,
-            cM=1,
-            cN=1,
-        )
-    )
+# Path 3: 128x256x128 stages=2. INTENDED to fit GB10 after Step 1-3 SMEM
+# restructuring, but the runtime sizeof(SharedStorage) is 149504 B (146 KB) for
+# this tile — int8 smem_A(128x128x2)=32KB + smem_B(256x128x2)=64KB = 96KB of
+# mainloop alone, and the denoise union region pushes the total to 146 KB, well
+# over the sm_120/121 99 KB SMEM-per-CTA cap. cudaFuncSetAttribute(
+# MaxDynamicSharedMemorySize) -> invalid argument and TORCH_CHECK(false) at
+# launch (pearl_gemm_host.h L100). The "~98 KB" estimate in the original comment
+# was incorrect for this tile. DISABLED for the sm_120 build — the 128x128x64
+# and 64x128x64 tiles (below the cap) cover the same shapes. Re-enable only for
+# sm_90 (H100/H200) builds, or re-add at stages=1 if a large-N tile is needed.
+# for R in [64, 128]:
+#     _matmul_kernels.append(
+#         MatmulKernelConfig(
+#             tile_size_m=128,
+#             tile_size_n=256,
+#             tile_size_k=128,
+#             R=R,
+#             pipeline_stages=2,
+#             cM=1,
+#             cN=1,
+#         )
+#     )
 
 KERNEL_CONFIGS = KernelCompilationGrid(
     matmul_kernels=_matmul_kernels,

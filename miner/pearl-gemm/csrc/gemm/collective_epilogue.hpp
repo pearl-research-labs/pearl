@@ -415,7 +415,9 @@ struct CollectiveEpilogue {
     Tensor tYsEARxBpEB = thr_mma_denoise.partition_B(
         sEARxBpEB_mma(_, _, _0{}));  // (MMA, MMA_N, MMA_R)
 
-    // Allocate "fragments" -- these are WGMMA matrix descriptors
+    // Allocate fragments. On Hopper these are WGMMA descriptors; on sm_120
+    // these are SM80 mma.sync register fragments and must be explicitly staged
+    // from SMEM before gemm().
     Tensor tXrAxEBL =
         thr_mma_denoise.make_fragment_A(tXsAxEBL);  // (MMA, MMA_M, MMA_R)
     Tensor tXrEBR =
@@ -426,6 +428,31 @@ struct CollectiveEpilogue {
     Tensor tYrEARxBpEB =
         thr_mma_denoise.make_fragment_B(tYsEARxBpEB);  // (MMA, MMA_N, MMA_R)
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    using S2RCopyAtomDenoise_A =
+        Copy_Atom<SM75_U32x4_LDSM_N, ElementDenoise>;
+    using S2RCopyAtomDenoise_B =
+        Copy_Atom<SM75_U32x2_LDSM_N, ElementDenoise>;
+    auto s2r_tiled_copy_A_denoise =
+        make_tiled_copy_A(S2RCopyAtomDenoise_A{}, thr_mma_denoise);
+    auto s2r_tiled_copy_B_denoise =
+        make_tiled_copy_B(S2RCopyAtomDenoise_B{}, thr_mma_denoise);
+    auto s2r_thr_copy_A_denoise =
+        s2r_tiled_copy_A_denoise.get_thread_slice(thread_idx);
+    auto s2r_thr_copy_B_denoise =
+        s2r_tiled_copy_B_denoise.get_thread_slice(thread_idx);
+
+    Tensor tXsAxEBL_s2r = s2r_thr_copy_A_denoise.partition_S(sAxEBL_mma(_, _, _0{}));
+    Tensor tXsEBR_s2r = s2r_thr_copy_B_denoise.partition_S(sEBR_mma(_, _, _0{}));
+    Tensor tYsEAL_s2r = s2r_thr_copy_A_denoise.partition_S(sEAL_mma(_, _, _0{}));
+    Tensor tYsEARxBpEB_s2r = s2r_thr_copy_B_denoise.partition_S(sEARxBpEB_mma(_, _, _0{}));
+
+    Tensor tXrAxEBL_view = s2r_thr_copy_A_denoise.retile_D(tXrAxEBL);
+    Tensor tXrEBR_view = s2r_thr_copy_B_denoise.retile_D(tXrEBR);
+    Tensor tYrEAL_view = s2r_thr_copy_A_denoise.retile_D(tYrEAL);
+    Tensor tYrEARxBpEB_view = s2r_thr_copy_B_denoise.retile_D(tYrEARxBpEB);
+#endif
+
     // Y = -EAL * EARxBpEB
     // Wait for TMA load of EAL, EARxBpEB
     EAxBpEB_pipeline.consumer_wait(EAxBpEB_pipe_read);
@@ -434,6 +461,10 @@ struct CollectiveEpilogue {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
     warpgroup_fence_operand(tCrD);
     warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    cute::copy(s2r_tiled_copy_A_denoise, tYsEAL_s2r, tYrEAL_view);
+    cute::copy(s2r_tiled_copy_B_denoise, tYsEARxBpEB_s2r, tYrEARxBpEB_view);
 #endif
     gemm(tiled_mma_denoise, tYrEAL, tYrEARxBpEB, tCrD);
     // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
@@ -465,6 +496,10 @@ struct CollectiveEpilogue {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
     warpgroup_fence_operand(tCrD);
     warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    cute::copy(s2r_tiled_copy_A_denoise, tXsAxEBL_s2r, tXrAxEBL_view);
+    cute::copy(s2r_tiled_copy_B_denoise, tXsEBR_s2r, tXrEBR_view);
 #endif
     gemm(tiled_mma_denoise, tXrAxEBL, tXrEBR, tCrD);
     // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
