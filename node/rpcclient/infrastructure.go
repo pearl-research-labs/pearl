@@ -1366,27 +1366,32 @@ func newHTTPClient(config *ConnConfig) (*http.Client, error) {
 		}
 	}
 
-	parsedDialAddr, err := ParseAddressString(config.Host)
-	if err != nil {
-		return nil, err
-	}
-	dialContext := func(ctx context.Context, _,
-		_ string) (net.Conn, error) {
-
-		network := parsedDialAddr.Network()
-		address := parsedDialAddr.String()
-		if proxy == nil {
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	if proxy != nil {
+		// Hand the SOCKS proxy the unresolved host so the proxy performs
+		// name resolution. This mirrors the websocket dial path, supports
+		// .onion / proxy-only hostnames, and avoids leaking a local DNS
+		// query for the destination.
+		host, err := hostPort(config.Host)
+		if err != nil {
+			return nil, err
+		}
+		dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			// go-socks has no context-aware dial, but net/http abandons
+			// the dial (and closes any late connection) once ctx is done,
+			// so the request still honors the client timeout.
+			return proxy.Dial("tcp", host)
+		}
+	} else {
+		parsedDialAddr, err := ParseAddressString(config.Host)
+		if err != nil {
+			return nil, err
+		}
+		dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			d := &net.Dialer{}
-			return d.DialContext(ctx, network, address)
+			return d.DialContext(ctx, parsedDialAddr.Network(),
+				parsedDialAddr.String())
 		}
-		if network != "tcp" && network != "tcp4" && network != "tcp6" {
-			return nil, fmt.Errorf("SOCKS proxy cannot dial %s address %q",
-				network, address)
-		}
-		// go-socks has no context-aware dial, but net/http abandons the
-		// dial (and closes any late connection) once ctx is done, so the
-		// request still honors the client timeout.
-		return proxy.Dial(network, address)
 	}
 	client := http.Client{
 		Transport: &http.Transport{
@@ -1406,23 +1411,16 @@ func (config *ConnConfig) httpURL() (string, error) {
 		protocol = "https"
 	}
 
-	parsedAddr, err := ParseAddressString(config.Host)
-	if err != nil {
-		return "", fmt.Errorf("error parsing host '%v': %v",
-			config.Host, err)
-	}
-
-	var httpURL string
-	switch parsedAddr.Network() {
-	case "unix", "unixpacket":
+	// Detect unix sockets by scheme prefix rather than resolving the host,
+	// so proxy-only / .onion destinations are not looked up locally.
+	if strings.HasPrefix(config.Host, "unix://") ||
+		strings.HasPrefix(config.Host, "unixpacket://") {
 		// Using a placeholder URL because a non-empty URL is required.
 		// The Unix domain socket is specified in the DialContext.
-		httpURL = protocol + "://unix"
-	default:
-		httpURL = protocol + "://" + config.Host
+		return protocol + "://unix", nil
 	}
 
-	return httpURL, nil
+	return protocol + "://" + config.Host, nil
 }
 
 // dial opens a websocket connection using the passed connection configuration
@@ -1808,22 +1806,15 @@ func cutPrefix(s, prefix string) (after string, found bool) {
 	return s[len(prefix):], true
 }
 
-// ParseAddressString converts an address in string format to a net.Addr that is
-// compatible with pearld. UDP is not supported because the node needs reliable
-// connections.
-func ParseAddressString(strAddress string) (net.Addr, error) {
-	// Addresses can either be in unix://address, unixpacket://address URL
-	// format, or just address:port host format for tcp.
-	if after, ok := cutPrefix(strAddress, "unix://"); ok {
-		return net.ResolveUnixAddr("unix", after)
-	}
-	if after, ok := cutPrefix(strAddress, "unixpacket://"); ok {
-		return net.ResolveUnixAddr("unixpacket", after)
-	}
-
+// hostPort normalizes a tcp address to host:port form without resolving it.
+// URL-scheme inputs (unix://, etc.) are rejected. This is used for SOCKS proxy
+// dialing, where the proxy -- not the local resolver -- must resolve the host
+// so that .onion and other proxy-only names work and no DNS query for the
+// destination leaks locally.
+func hostPort(strAddress string) (string, error) {
 	if strings.Contains(strAddress, "://") {
 		// Not supporting :// anywhere in the host or path.
-		return nil, fmt.Errorf("unsupported protocol in address: %s",
+		return "", fmt.Errorf("unsupported protocol in address: %s",
 			strAddress)
 	}
 
@@ -1837,9 +1828,29 @@ func ParseAddressString(strAddress string) (net.Addr, error) {
 	// Parse it as a dummy URL to get the host and port.
 	u, err := url.Parse("dummy://" + addr)
 	if err != nil {
+		return "", err
+	}
+	return verifyPort(u.Host), nil
+}
+
+// ParseAddressString converts an address in string format to a net.Addr that is
+// compatible with pearld. UDP is not supported because the node needs reliable
+// connections.
+func ParseAddressString(strAddress string) (net.Addr, error) {
+	// Addresses can either be in unix://address, unixpacket://address URL
+	// format, or just address:port host format for tcp.
+	if after, ok := cutPrefix(strAddress, "unix://"); ok {
+		return net.ResolveUnixAddr("unix", after)
+	}
+	if after, ok := cutPrefix(strAddress, "unixpacket://"); ok {
+		return net.ResolveUnixAddr("unixpacket", after)
+	}
+
+	hp, err := hostPort(strAddress)
+	if err != nil {
 		return nil, err
 	}
-	return net.ResolveTCPAddr("tcp", verifyPort(u.Host))
+	return net.ResolveTCPAddr("tcp", hp)
 }
 
 // verifyPort makes sure that an address string has both a host and a port.
