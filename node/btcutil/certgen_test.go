@@ -144,10 +144,11 @@ func TestWriteTLSCertPair(t *testing.T) {
 	})
 }
 
-// TestWriteTLSCertPairCleansUpOnKeyRemoveFailure ensures that if the existing
-// key cannot be removed before the new key is written, the freshly written
-// certificate is cleaned up rather than left mismatched with the old key.
-func TestWriteTLSCertPairCleansUpOnKeyRemoveFailure(t *testing.T) {
+// TestWriteTLSCertPairCleansUpOnKeyFailure ensures that if the private key
+// cannot be persisted -- whether the stale key cannot be removed or the new
+// key cannot be written -- the freshly written certificate is cleaned up
+// rather than left mismatched with (or orphaned without) a key.
+func TestWriteTLSCertPairCleansUpOnKeyFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("directory write permissions are not meaningful on Windows")
 	}
@@ -156,24 +157,34 @@ func TestWriteTLSCertPairCleansUpOnKeyRemoveFailure(t *testing.T) {
 	}
 
 	validUntil := time.Now().Add(time.Hour)
-	dir := t.TempDir()
-	certFile := filepath.Join(dir, "rpc.cert")
 
-	// Seed a stale key in its own directory, then make that directory
-	// read-only so os.Remove(keyFile) fails (removing a file needs a
-	// writable parent) while the cert's directory stays writable.
-	keyDir := filepath.Join(dir, "keys")
-	require.NoError(t, os.Mkdir(keyDir, 0700))
-	keyFile := filepath.Join(keyDir, "rpc.key")
-	require.NoError(t, os.WriteFile(keyFile, []byte("stale"), 0600))
-	require.NoError(t, os.Chmod(keyDir, 0500))
-	t.Cleanup(func() { _ = os.Chmod(keyDir, 0700) })
+	// Each case makes the key's directory read-only so the key cannot be
+	// persisted, while the cert's directory stays writable. With a stale
+	// key present, os.Remove(keyFile) fails; without one, os.Remove is a
+	// no-op and os.WriteFile(keyFile) fails instead. Either way the cert
+	// must be removed.
+	run := func(t *testing.T, seedStaleKey bool) {
+		dir := t.TempDir()
+		certFile := filepath.Join(dir, "rpc.cert")
 
-	_, err := btcutil.WriteTLSCertPair(certFile, keyFile, "test",
-		validUntil, nil, true)
-	require.Error(t, err)
-	assert.NoFileExists(t, certFile,
-		"cert must be removed when the key cannot be persisted")
+		keyDir := filepath.Join(dir, "keys")
+		require.NoError(t, os.Mkdir(keyDir, 0700))
+		keyFile := filepath.Join(keyDir, "rpc.key")
+		if seedStaleKey {
+			require.NoError(t, os.WriteFile(keyFile, []byte("stale"), 0600))
+		}
+		require.NoError(t, os.Chmod(keyDir, 0500))
+		t.Cleanup(func() { _ = os.Chmod(keyDir, 0700) })
+
+		_, err := btcutil.WriteTLSCertPair(certFile, keyFile, "test",
+			validUntil, nil, true)
+		require.Error(t, err)
+		assert.NoFileExists(t, certFile,
+			"cert must be removed when the key cannot be persisted")
+	}
+
+	t.Run("key removal fails", func(t *testing.T) { run(t, true) })
+	t.Run("key write fails", func(t *testing.T) { run(t, false) })
 }
 
 func assertFileMode(t *testing.T, name string, want os.FileMode) {
