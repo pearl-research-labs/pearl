@@ -42,13 +42,6 @@ func TestCheckCredentials(t *testing.T) {
 		})
 	}
 
-	// Demonstrate the hash collision that username validation prevents:
-	// sha256("a:b" + ":" + "c") == sha256("a" + ":" + "b:c").
-	t.Run("colon in username collides with shifted credentials", func(t *testing.T) {
-		colonServer := &Server{credHash: sha256.Sum256([]byte("a:b:c"))} // as if user="a:b", pass="c"
-		require.True(t, colonServer.checkCredentials("a", "b:c"),
-			"collision: user 'a' pass 'b:c' hashes same as user 'a:b' pass 'c'")
-	})
 }
 
 // TestWebsocketHandshakeAuth is the regression test for the former

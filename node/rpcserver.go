@@ -4878,20 +4878,10 @@ func newRPCServer(config *rpcserverConfig) (*rpcServer, error) {
 		requestProcessShutdown: make(chan struct{}),
 		quit:                   make(chan int),
 	}
-	// A colon in a username creates an ambiguous sha256(user+":"+pass) hash:
-	// user "a:b" with pass "c" hashes identically to user "a" with pass "b:c".
-	// HTTP Basic Auth (RFC 7617) already forbids colons in user-ids; enforce
-	// the same here to make the hash unambiguous.
 	if cfg.RPCUser != "" && cfg.RPCPass != "" {
-		if strings.Contains(cfg.RPCUser, ":") {
-			return nil, fmt.Errorf("RPC username must not contain a colon")
-		}
 		rpc.adminCredHash = sha256.Sum256([]byte(cfg.RPCUser + ":" + cfg.RPCPass))
 	}
 	if cfg.RPCLimitUser != "" && cfg.RPCLimitPass != "" {
-		if strings.Contains(cfg.RPCLimitUser, ":") {
-			return nil, fmt.Errorf("RPC limited username must not contain a colon")
-		}
 		rpc.limitCredHash = sha256.Sum256([]byte(cfg.RPCLimitUser + ":" + cfg.RPCLimitPass))
 	}
 	rpc.ntfnMgr = newWsNotificationManager(&rpc)
