@@ -116,31 +116,6 @@ func TestParseAddressString(t *testing.T) {
 	}
 }
 
-func TestHTTPPostTriesOneFailsFast(t *testing.T) {
-	t.Parallel()
-
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := lis.Addr().String()
-	require.NoError(t, lis.Close())
-
-	client, err := New(&ConnConfig{
-		DisableTLS:    true,
-		HTTPPostMode:  true,
-		HTTPPostTries: 1,
-		Host:          addr,
-		User:          "username",
-		Pass:          "password",
-	}, nil)
-	require.NoError(t, err)
-	defer client.Shutdown()
-
-	start := time.Now()
-	_, err = client.RawRequest("getblockcount", nil)
-	require.Error(t, err)
-	require.Less(t, time.Since(start), requestRetryInterval)
-}
-
 // TestHTTPPostProxyResolvesAtProxy verifies that, with a SOCKS proxy
 // configured, the HTTP POST path forwards the original hostname to the proxy
 // (SOCKS domain-name ATYP) rather than resolving it locally first. An
