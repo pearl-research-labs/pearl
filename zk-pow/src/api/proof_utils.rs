@@ -17,6 +17,14 @@ use crate::ensure_eq;
 
 use pearl_blake3::blake3_digest;
 
+fn ensure_roundtrip(original: &[u8], reserialized: &[u8], label: &str) -> Result<()> {
+    ensure!(
+        reserialized == original,
+        "{label} round-trip mismatch: deserialized form does not re-serialize to the original bytes"
+    );
+    Ok(())
+}
+
 /// Computes `hash_activations = H(hash_a || hash_router)` where
 /// `hash_router = H(hash_routing_data || hash_offsets)` and
 /// `hash_offsets = H(pad_1024(routing_offsets_le), key=job_key)`.
@@ -125,7 +133,9 @@ impl PeriodicPattern {
             min_stride = stride * length;
         }
 
-        Ok(Self { shape })
+        let result = Self { shape };
+        ensure_roundtrip(data, &result.to_bytes(), "PeriodicPattern")?;
+        Ok(result)
     }
 
     /// Serialize to exactly 2 * PeriodicPattern::NUM_DIMS bytes (6 bytes).
@@ -464,15 +474,18 @@ impl MiningConfiguration {
         let e = u16::from_le_bytes(trailer[0..2].try_into().unwrap());
         let top_k = u16::from_le_bytes(trailer[2..4].try_into().unwrap());
         ensure!(trailer[4..].iter().all(|&b| b == 0), "Reserved trailer bytes must be zero");
+        ensure!(e != 0 || top_k == 0, "top_k must be 0 when e == 0 (non-MoE)");
         let moe = if e == 0 { None } else { Some(MoEConfig { e, top_k }) };
-        Ok(Self {
+        let result = Self {
             common_dim,
             rank,
             mma_type,
             rows_pattern,
             cols_pattern,
             moe,
-        })
+        };
+        ensure_roundtrip(data, &result.to_bytes(), "MiningConfiguration")?;
+        Ok(result)
     }
 
     pub fn dot_product_length(&self) -> usize {
@@ -524,13 +537,15 @@ impl IncompleteBlockHeader {
         let timestamp = u32::from_le_bytes(data[68..72].try_into().unwrap());
         let nbits = u32::from_le_bytes(data[72..76].try_into().unwrap());
 
-        Ok(Self {
+        let result = Self {
             version,
             prev_block,
             merkle_root,
             timestamp,
             nbits,
-        })
+        };
+        ensure_roundtrip(data, &result.to_bytes(), "IncompleteBlockHeader")?;
+        Ok(result)
     }
 }
 
@@ -1209,7 +1224,7 @@ impl PublicProofParams {
         ensure!(t_rows < m, "t_rows={t_rows} must be < m={m}");
         ensure!(t_cols < n, "t_cols={t_cols} must be < n={n}");
 
-        Ok(Self {
+        let result = Self {
             block_header,
             mining_config,
             hash_a,
@@ -1220,7 +1235,10 @@ impl PublicProofParams {
             t_rows,
             t_cols,
             moe,
-        })
+        };
+        // ensure that from_wire_bytes(public_data).to_wire_bytes() is injective
+        ensure_roundtrip(public_data, &result.to_wire_bytes()?, "PublicProofParams")?;
+        Ok(result)
     }
 
     /// Serialize to the wire `public_data` format (164 bytes non-MoE; longer when `moe` is set).

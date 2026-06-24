@@ -7,7 +7,6 @@ package mempool
 import (
 	"container/list"
 	"fmt"
-	"maps"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -671,86 +670,44 @@ func (mp *TxPool) signalsReplacement(tx *btcutil.Tx,
 	return false
 }
 
-// txAncestors returns all of the unconfirmed ancestors of the given
-// transaction. Given transactions A, B, and C where C spends B and B spends A,
-// A and B are considered ancestors of C.
-//
-// The cache is optional and serves as an optimization to avoid visiting
-// transactions we've already determined ancestors of.
-//
-// This function MUST be called with the mempool lock held (for reads).
-func (mp *TxPool) txAncestors(tx *btcutil.Tx,
-	cache map[chainhash.Hash]map[chainhash.Hash]*btcutil.Tx) map[chainhash.Hash]*btcutil.Tx {
-
-	// If a cache was not provided, we'll initialize one now to use for the
-	// recursive calls.
-	if cache == nil {
-		cache = make(map[chainhash.Hash]map[chainhash.Hash]*btcutil.Tx)
-	}
-
-	ancestors := make(map[chainhash.Hash]*btcutil.Tx)
-	for _, txIn := range tx.MsgTx().TxIn {
-		parent, ok := mp.pool[txIn.PreviousOutPoint.Hash]
-		if !ok {
-			continue
-		}
-		ancestors[*parent.Tx.Hash()] = parent.Tx
-
-		// Determine if the ancestors of this ancestor have already been
-		// computed. If they haven't, we'll do so now and cache them to
-		// use them later on if necessary.
-		moreAncestors, ok := cache[*parent.Tx.Hash()]
-		if !ok {
-			moreAncestors = mp.txAncestors(parent.Tx, cache)
-			cache[*parent.Tx.Hash()] = moreAncestors
-		}
-
-		maps.Copy(ancestors, moreAncestors)
-	}
-
-	return ancestors
-}
-
 // txDescendants returns all of the unconfirmed descendants of the given
 // transaction. Given transactions A, B, and C where C spends B and B spends A,
-// B and C are considered descendants of A. A cache can be provided in order to
-// easily retrieve the descendants of transactions we've already determined the
-// descendants of.
+// B and C are considered descendants of A.
+//
+// Results accumulate into descendants; if nil a new map is allocated.
+// At most MaxReplacementEvictions entries are collected.
 //
 // This function MUST be called with the mempool lock held (for reads).
 func (mp *TxPool) txDescendants(tx *btcutil.Tx,
-	cache map[chainhash.Hash]map[chainhash.Hash]*btcutil.Tx) map[chainhash.Hash]*btcutil.Tx {
-
-	// If a cache was not provided, we'll initialize one now to use for the
-	// recursive calls.
-	if cache == nil {
-		cache = make(map[chainhash.Hash]map[chainhash.Hash]*btcutil.Tx)
-	}
+	descendants map[chainhash.Hash]*btcutil.Tx) map[chainhash.Hash]*btcutil.Tx {
 
 	// We'll go through all of the outputs of the transaction to determine
 	// if they are spent by any other mempool transactions.
-	descendants := make(map[chainhash.Hash]*btcutil.Tx)
+	if descendants == nil {
+		descendants = make(map[chainhash.Hash]*btcutil.Tx)
+	}
+
 	op := wire.OutPoint{Hash: *tx.Hash()}
 	for i := range tx.MsgTx().TxOut {
+		if len(descendants) > MaxReplacementEvictions {
+			break
+		}
+
 		op.Index = uint32(i)
 		descendant, ok := mp.outpoints[op]
 		if !ok {
 			continue
 		}
-		descendants[*descendant.Hash()] = descendant
 
-		// Determine if the descendants of this descendant have already
-		// been computed. If they haven't, we'll do so now and cache
-		// them to use them later on if necessary.
-		moreDescendants, ok := cache[*descendant.Hash()]
-		if !ok {
-			moreDescendants = mp.txDescendants(descendant, cache)
-			cache[*descendant.Hash()] = moreDescendants
+		// The map is a visited set. If this descendant is already present,
+		// its descendants have already been expanded.
+		descendantHash := *descendant.Hash()
+		if _, ok := descendants[descendantHash]; ok {
+			continue
 		}
 
-		for _, moreDescendant := range moreDescendants {
-			descendants[*moreDescendant.Hash()] = moreDescendant
-		}
+		descendants[descendantHash] = descendant
+		mp.txDescendants(descendant, descendants)
 	}
 
 	return descendants
@@ -772,9 +729,9 @@ func (mp *TxPool) txConflicts(tx *btcutil.Tx) map[chainhash.Hash]*btcutil.Tx {
 		if !ok {
 			continue
 		}
+
 		conflicts[*conflict.Hash()] = conflict
-		descendants := mp.txDescendants(conflict, nil)
-		maps.Copy(conflicts, descendants)
+		mp.txDescendants(conflict, conflicts)
 	}
 	return conflicts
 }
@@ -858,15 +815,20 @@ func (mp *TxPool) validateReplacement(tx *btcutil.Tx,
 		return nil, txRuleError(wire.RejectNonstandard, str)
 	}
 
-	// The set of conflicts (transactions we'll replace) and ancestors
-	// should not overlap, otherwise the replacement would be spending an
-	// output that no longer exists.
-	for ancestorHash := range mp.txAncestors(tx, nil) {
-		if _, ok := conflicts[ancestorHash]; !ok {
+	// A replacement must not spend an output of a transaction it would
+	// evict: that conflict (and therefore the output) is about to be
+	// removed, so the replacement would be left spending an output that no
+	// longer exists.
+	//
+	// The conflict set is closed under descendants, hence it is sufficient
+	// to check that there are no conflicting immediate ancestors of tx.
+	for _, txIn := range tx.MsgTx().TxIn {
+		parentHash := txIn.PreviousOutPoint.Hash
+		if _, ok := conflicts[parentHash]; !ok {
 			continue
 		}
 		str := fmt.Sprintf("%v: replacement transaction spends parent "+
-			"transaction %v", tx.Hash(), ancestorHash)
+			"transaction %v", tx.Hash(), parentHash)
 		return nil, txRuleError(wire.RejectInvalid, str)
 	}
 
