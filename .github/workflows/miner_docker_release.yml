@@ -1,0 +1,76 @@
+name: Release Miner Docker Image
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Extra image tag to publish (e.g. v0.1.0). Leave empty to tag by commit sha only."
+        required: false
+        type: string
+      mark_latest:
+        description: "Also tag this image as :latest"
+        required: false
+        type: boolean
+        default: false
+      push:
+        description: "Push to GHCR (uncheck to only build, e.g. to validate the Dockerfile)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/vllm-miner
+
+jobs:
+  build-and-push:
+    name: Build & Push vLLM Miner Image
+    runs-on: large-runner
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push }}
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' }}
+            type=raw,value=latest,enable=${{ inputs.mark_latest }}
+
+      - name: Build and push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./miner/vllm-miner/Dockerfile
+          platforms: linux/amd64
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
