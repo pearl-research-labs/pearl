@@ -39,7 +39,7 @@ var (
 
 // listCommands categorizes and lists all of the usable commands along with
 // their one-line usage.
-func listCommands(w io.Writer) {
+func listCommands() {
 	const (
 		categoryChain uint8 = iota
 		categoryWallet
@@ -82,11 +82,11 @@ func listCommands(w io.Writer) {
 	categoryTitles[categoryChain] = "Chain Server Commands:"
 	categoryTitles[categoryWallet] = "Wallet Server Commands (--wallet):"
 	for category := uint8(0); category < numCategories; category++ {
-		fmt.Fprintln(w, categoryTitles[category])
+		fmt.Println(categoryTitles[category])
 		for _, usage := range categorized[category] {
-			fmt.Fprintln(w, usage)
+			fmt.Println(usage)
 		}
-		fmt.Fprintln(w)
+		fmt.Println()
 	}
 }
 

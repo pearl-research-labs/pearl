@@ -44,7 +44,7 @@ func usage(errorMessage string) string {
 }
 
 func main() {
-	if err := run(os.Stdout); err != nil {
+	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -53,21 +53,21 @@ func main() {
 // run executes prlctl, returning an error on failure.  main is responsible for
 // reporting the error and setting the exit code, keeping all process exit
 // handling in a single place.
-func run(stdout io.Writer) error {
+func run() error {
 	cfg, args, err := loadConfig()
 	if err != nil {
 		return err
 	}
 	if cfg.ShowHelp {
-		writeHelp(stdout, cfg)
+		writeHelp(cfg)
 		return nil
 	}
 	if cfg.ShowVersion {
-		fmt.Fprintln(stdout, filepath.Base(os.Args[0]), "version", version())
+		fmt.Println(filepath.Base(os.Args[0]), "version", version())
 		return nil
 	}
 	if cfg.ListCommands {
-		listCommands(stdout)
+		listCommands()
 		return nil
 	}
 	if len(args) < 1 {
@@ -155,30 +155,30 @@ func run(stdout io.Writer) error {
 		if err := json.Indent(&dst, result, "", "  "); err != nil {
 			return fmt.Errorf("failed to format result: %w", err)
 		}
-		fmt.Fprintln(stdout, dst.String())
+		fmt.Println(dst.String())
 
 	case strings.HasPrefix(strResult, `"`):
 		var str string
 		if err := json.Unmarshal(result, &str); err != nil {
 			return fmt.Errorf("failed to unmarshal result: %w", err)
 		}
-		fmt.Fprintln(stdout, str)
+		fmt.Println(str)
 
 	case strResult != "null":
-		fmt.Fprintln(stdout, strResult)
+		fmt.Println(strResult)
 	}
 
 	return nil
 }
 
 // writeHelp writes the go-flags generated help plus prlctl's stdin convention.
-func writeHelp(w io.Writer, cfg *config) {
+func writeHelp(cfg *config) {
 	parser := flags.NewParser(cfg, flags.Default)
-	parser.WriteHelp(w)
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "The special parameter `-` "+
-		"indicates that a parameter should be read "+
-		"from the\nnext unread line from standard "+
+	parser.WriteHelp(os.Stdout)
+	fmt.Println()
+	fmt.Println("The special parameter `-` " +
+		"indicates that a parameter should be read " +
+		"from the\nnext unread line from standard " +
 		"input.")
 }
 
