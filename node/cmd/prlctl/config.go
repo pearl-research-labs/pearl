@@ -207,7 +207,7 @@ func loadConfig() (*config, []string, error) {
 	// they will be caught by the final parse below.
 	preCfg := cfg
 	preParser := flags.NewParser(&preCfg, flags.HelpFlag)
-	remainingArgs, err := preParser.Parse()
+	_, err := preParser.Parse()
 	if err != nil {
 		if e, ok := err.(*flags.Error); ok && e.Type == flags.ErrHelp {
 			preCfg.ShowHelp = true
@@ -215,7 +215,7 @@ func loadConfig() (*config, []string, error) {
 		}
 	}
 	if preCfg.ShowVersion || preCfg.ListCommands {
-		return &preCfg, remainingArgs, nil
+		return &preCfg, nil, nil
 	}
 
 	appName := filepath.Base(os.Args[0])
@@ -251,7 +251,8 @@ func loadConfig() (*config, []string, error) {
 	}
 
 	// Parse command line options again to ensure they take precedence.
-	remainingArgs, err = parser.Parse()
+	// args holds the positional arguments (the RPC command and its params).
+	args, err := parser.Parse()
 	if err != nil {
 		if e, ok := err.(*flags.Error); ok && e.Type == flags.ErrHelp {
 			cfg.ShowHelp = true
@@ -309,7 +310,7 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	return &cfg, remainingArgs, nil
+	return &cfg, args, nil
 }
 
 // createDefaultConfigFile creates a basic config file at the given destination path.
