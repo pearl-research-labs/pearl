@@ -1336,9 +1336,13 @@ func (c *wsClient) inHandler() {
 		} else {
 			var req btcjson.Request
 			if err := json.Unmarshal(msg, &req); err != nil {
+				// Unauthenticated clients sending unparseable messages
+				// are disconnected immediately.
 				if !c.authenticated {
 					return
 				}
+				// Authenticated clients get a parse-error reply; the
+				// connection stays open.
 				jsonErr := &btcjson.RPCError{
 					Code:    btcjson.ErrRPCParse.Code,
 					Message: "Failed to parse request: " + err.Error(),
