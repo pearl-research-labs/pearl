@@ -1332,9 +1332,7 @@ func (c *wsClient) inHandler() {
 		}
 
 		if bytes.HasPrefix(msg, batchedRequestPrefix) {
-			if c.handleBatchedMsg(msg) {
-				return
-			}
+			c.handleBatchedMsg(msg)
 		} else {
 			var req btcjson.Request
 			if err := json.Unmarshal(msg, &req); err != nil {
@@ -1375,8 +1373,9 @@ func (c *wsClient) inHandler() {
 
 // handleBatchedMsg processes a JSON-RPC batch message, running each request
 // synchronously and sending the assembled reply. The service semaphore is held
-// for the duration. Returns true if the client should be disconnected.
-func (c *wsClient) handleBatchedMsg(msg []byte) bool {
+// for the duration. On authentication or command failure the client is
+// disconnected; inHandler will exit on the next iteration's quit check.
+func (c *wsClient) handleBatchedMsg(msg []byte) {
 	c.serviceRequestSem.acquire()
 	defer c.serviceRequestSem.release()
 
@@ -1385,7 +1384,8 @@ func (c *wsClient) handleBatchedMsg(msg []byte) bool {
 	var requests []json.RawMessage
 	if err := json.Unmarshal(msg, &requests); err != nil {
 		if !c.authenticated {
-			return true
+			c.Disconnect()
+			return
 		}
 		jsonErr := &btcjson.RPCError{
 			Code:    btcjson.ErrRPCParse.Code,
@@ -1398,12 +1398,13 @@ func (c *wsClient) handleBatchedMsg(msg []byte) bool {
 		if reply != nil {
 			c.SendMessage(reply, nil)
 		}
-		return false
+		return
 	}
 
 	if len(requests) == 0 {
 		if !c.authenticated {
-			return true
+			c.Disconnect()
+			return
 		}
 		jsonErr := &btcjson.RPCError{
 			Code:    btcjson.ErrRPCInvalidRequest.Code,
@@ -1416,7 +1417,7 @@ func (c *wsClient) handleBatchedMsg(msg []byte) bool {
 		if reply != nil {
 			c.SendMessage(reply, nil)
 		}
-		return false
+		return
 	}
 
 	var results []json.RawMessage
@@ -1424,7 +1425,8 @@ func (c *wsClient) handleBatchedMsg(msg []byte) bool {
 		var req btcjson.Request
 		if err := json.Unmarshal(rawReq, &req); err != nil {
 			if !c.authenticated {
-				return true
+				c.Disconnect()
+				return
 			}
 			jsonErr := &btcjson.RPCError{
 				Code:    btcjson.ErrRPCInvalidRequest.Code,
@@ -1443,20 +1445,22 @@ func (c *wsClient) handleBatchedMsg(msg []byte) bool {
 
 		switch outcome := c.authorizeRequest(&req); {
 		case outcome.disconnect:
-			return true
+			c.Disconnect()
+			return
 		case outcome.reply != nil:
 			results = append(results, outcome.reply)
 		case outcome.cmd != nil:
 			reply := c.runCommand(outcome.cmd)
 			if reply == nil {
-				return true
+				c.Disconnect()
+				return
 			}
 			results = append(results, reply)
 		}
 	}
 
 	if len(results) == 0 {
-		return false
+		return
 	}
 
 	var buf bytes.Buffer
@@ -1469,7 +1473,6 @@ func (c *wsClient) handleBatchedMsg(msg []byte) bool {
 	}
 	buf.WriteByte(']')
 	c.SendMessage(buf.Bytes(), nil)
-	return false
 }
 
 // runCommand executes the handler for a parsed command and returns its
