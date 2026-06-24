@@ -48,8 +48,16 @@ func TestAuthorizeRequest(t *testing.T) {
 		return req
 	}
 
-	t.Run("malformed returns reply", func(t *testing.T) {
+	t.Run("malformed disconnects unauthenticated client", func(t *testing.T) {
+		// An unauthenticated client whose first message is malformed must
+		// be disconnected, not told what it did wrong.
 		c := &wsClient{server: s}
+		req := btcjson.Request{Jsonrpc: btcjson.RpcVersion1, ID: 1}
+		require.True(t, c.authorizeRequest(&req).disconnect)
+	})
+
+	t.Run("malformed returns reply to authenticated client", func(t *testing.T) {
+		c := &wsClient{server: s, authenticated: true}
 		req := btcjson.Request{Jsonrpc: btcjson.RpcVersion1, ID: 1}
 		outcome := c.authorizeRequest(&req)
 		require.False(t, outcome.disconnect)

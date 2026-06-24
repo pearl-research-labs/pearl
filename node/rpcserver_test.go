@@ -590,8 +590,6 @@ func TestCheckCredentials(t *testing.T) {
 		{"admin wrong pass", "admin", "nope", false, false},
 		{"unknown user", "nobody", "adminpass", false, false},
 		{"empty", "", "", false, false},
-		// Hashing user + ":" + pass must not let a shifted colon collide.
-		{"colon shift", "admi", "n:adminpass", false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -600,4 +598,16 @@ func TestCheckCredentials(t *testing.T) {
 			require.Equal(t, tc.wantIsAdmin, isAdmin)
 		})
 	}
+
+	// Demonstrate the hash collision that username validation prevents:
+	// sha256("a:b" + ":" + "c") == sha256("a" + ":" + "b:c").  In production
+	// newRPCServer rejects usernames containing a colon, so this case cannot
+	// be reached through normal configuration.
+	t.Run("colon in username collides with shifted credentials", func(t *testing.T) {
+		colonServer := &rpcServer{
+			adminCredHash: sha256.Sum256([]byte("a:b:c")), // as if user="a:b", pass="c"
+		}
+		auth, _ := colonServer.checkCredentials("a", "b:c")
+		require.True(t, auth, "collision: user 'a' pass 'b:c' hashes same as user 'a:b' pass 'c'")
+	})
 }

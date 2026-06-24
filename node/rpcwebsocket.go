@@ -1244,6 +1244,9 @@ func marshalReply(version btcjson.RPCVersion, id interface{}, replyErr error) js
 // while already authenticated, or if credentials are incorrect.
 func (c *wsClient) authorizeRequest(req *btcjson.Request) requestOutcome {
 	if req.Method == "" || req.Params == nil {
+		if !c.authenticated {
+			return requestOutcome{disconnect: true}
+		}
 		jsonErr := &btcjson.RPCError{
 			Code:    btcjson.ErrRPCInvalidRequest.Code,
 			Message: "Invalid request: malformed",

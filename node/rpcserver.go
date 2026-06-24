@@ -4224,11 +4224,13 @@ func (s *rpcServer) checkAuth(r *http.Request, require bool) (bool, bool, error)
 // true only for the admin user.  Each comparison is constant time.
 func (s *rpcServer) checkCredentials(user, pass string) (authenticated, isAdmin bool) {
 	h := sha256.Sum256([]byte(user + ":" + pass))
-	if subtle.ConstantTimeCompare(h[:], s.adminCredHash[:]) == 1 {
-		return true, true
-	}
+	// Check limited credentials first: in high-traffic deployments limited
+	// users typically issue more requests than admins.
 	if subtle.ConstantTimeCompare(h[:], s.limitCredHash[:]) == 1 {
 		return true, false
+	}
+	if subtle.ConstantTimeCompare(h[:], s.adminCredHash[:]) == 1 {
+		return true, true
 	}
 	return false, false
 }
@@ -4876,10 +4878,20 @@ func newRPCServer(config *rpcserverConfig) (*rpcServer, error) {
 		requestProcessShutdown: make(chan struct{}),
 		quit:                   make(chan int),
 	}
+	// A colon in a username creates an ambiguous sha256(user+":"+pass) hash:
+	// user "a:b" with pass "c" hashes identically to user "a" with pass "b:c".
+	// HTTP Basic Auth (RFC 7617) already forbids colons in user-ids; enforce
+	// the same here to make the hash unambiguous.
 	if cfg.RPCUser != "" && cfg.RPCPass != "" {
+		if strings.Contains(cfg.RPCUser, ":") {
+			return nil, fmt.Errorf("RPC username must not contain a colon")
+		}
 		rpc.adminCredHash = sha256.Sum256([]byte(cfg.RPCUser + ":" + cfg.RPCPass))
 	}
 	if cfg.RPCLimitUser != "" && cfg.RPCLimitPass != "" {
+		if strings.Contains(cfg.RPCLimitUser, ":") {
+			return nil, fmt.Errorf("RPC limited username must not contain a colon")
+		}
 		rpc.limitCredHash = sha256.Sum256([]byte(cfg.RPCLimitUser + ":" + cfg.RPCLimitPass))
 	}
 	rpc.ntfnMgr = newWsNotificationManager(&rpc)
