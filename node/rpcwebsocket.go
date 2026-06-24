@@ -1155,7 +1155,7 @@ type wsResponse struct {
 // data flow is split into three goroutines: inHandler reads inbound requests,
 // notificationQueueHandler queues async notifications, and outHandler
 // serializes all outbound messages.  Individual non-batched requests may be
-// handled by short-lived goroutines, limited by serviceRequestSem.  A
+// handled by short-lived goroutines, limited by serviceRequestSem.  The
 // websocket manager broadcasts requested notifications to
 // connected clients.  Responses use SendMessage, while async notifications use
 // QueueNotification so other subsystems are not blocked by slow clients.
@@ -1216,11 +1216,9 @@ type wsClient struct {
 }
 
 // requestOutcome is the result of validating and authorizing one parsed
-// request.  At most one field is set: reply is an immediate response to emit (a
-// JSON-RPC error or the authenticate acknowledgement), cmd is an authorized
-// command to dispatch, and disconnect tears the client down.  The zero value
-// means no response is needed (a notification, or a reply that failed to
-// marshal and was dropped).
+// request.  At most one field is set: reply is an immediate response to emit,
+// cmd is a command ready to dispatch, and disconnect tears the client down.
+// The zero value means no response is needed (e.g. a notification).
 type requestOutcome struct {
 	disconnect bool
 	reply      json.RawMessage
@@ -1229,8 +1227,7 @@ type requestOutcome struct {
 
 // marshalReply marshals a JSON-RPC response.  A nil replyErr produces a success
 // response; otherwise the error is included.  If marshalling fails it logs the
-// failure and returns a nil reply so the caller can drop the response without
-// disconnecting the client.
+// failure and returns nil; callers must check.
 func marshalReply(version btcjson.RPCVersion, id interface{}, replyErr error) json.RawMessage {
 	reply, err := createMarshalledReply(version, id, nil, replyErr)
 	if err != nil {
@@ -1240,16 +1237,11 @@ func marshalReply(version btcjson.RPCVersion, id interface{}, replyErr error) js
 	return reply
 }
 
-// authorizeRequest validates a parsed request, runs the in-band authenticate
-// state machine, and enforces the limited-user method allowlist, returning how
-// the caller should handle it.  It never dispatches the command, so callers can
-// run it asynchronously (single requests) or synchronously (batched requests).
-// The client's authenticated/isAdmin state is updated on a successful
-// authenticate.
-//
-// A client is disconnected if its first message is not a valid authenticate
-// request, if it authenticates while already authenticated, or if its
-// credentials are incorrect.
+// authorizeRequest validates req, runs the in-band authenticate state machine,
+// and enforces the limited-user method allowlist.  Sets the client's
+// authenticated/isAdmin state on a successful authenticate.  Disconnects the
+// client if its first message is not a valid authenticate, if it authenticates
+// while already authenticated, or if credentials are incorrect.
 func (c *wsClient) authorizeRequest(req *btcjson.Request) requestOutcome {
 	if req.Method == "" || req.Params == nil {
 		jsonErr := &btcjson.RPCError{

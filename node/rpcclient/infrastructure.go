@@ -1808,10 +1808,7 @@ func cutPrefix(s, prefix string) (after string, found bool) {
 }
 
 // hostPort normalizes a tcp address to host:port form without resolving it.
-// URL-scheme inputs (unix://, etc.) are rejected. This is used for SOCKS proxy
-// dialing, where the proxy -- not the local resolver -- must resolve the host
-// so that .onion and other proxy-only names work and no DNS query for the
-// destination leaks locally.
+// URL-scheme addresses (unix://, etc.) are rejected.
 func hostPort(strAddress string) (string, error) {
 	if strings.Contains(strAddress, "://") {
 		// Not supporting :// anywhere in the host or path.
