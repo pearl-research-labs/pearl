@@ -1336,13 +1336,9 @@ func (c *wsClient) inHandler() {
 		} else {
 			var req btcjson.Request
 			if err := json.Unmarshal(msg, &req); err != nil {
-				// Unauthenticated clients sending unparseable messages
-				// are disconnected immediately.
 				if !c.authenticated {
-					return
+					return // unauthenticated clients sending garbage are disconnected
 				}
-				// Authenticated clients get a parse-error reply; the
-				// connection stays open.
 				jsonErr := &btcjson.RPCError{
 					Code:    btcjson.ErrRPCParse.Code,
 					Message: "Failed to parse request: " + err.Error(),
@@ -1350,10 +1346,10 @@ func (c *wsClient) inHandler() {
 				reply, err := createMarshalledReply(btcjson.RpcVersion1, nil, nil, jsonErr)
 				if err != nil {
 					rpcsLog.Errorf("Failed to marshal reply: %v", err)
-					continue
+					continue // can't send a reply, skip this message
 				}
 				c.SendMessage(reply, nil)
-				continue
+				continue // skip authorizeRequest — there's no valid req to authorize
 			}
 
 			switch outcome := c.authorizeRequest(&req); {
