@@ -1307,8 +1307,6 @@ func (c *wsClient) authorizeRequest(req *btcjson.Request) requestOutcome {
 // inHandler handles all incoming messages for the websocket connection.  It
 // must be run as a goroutine.
 func (c *wsClient) inHandler() {
-	// Ensure the connection is closed and the handler is marked done on
-	// every exit path.
 	defer func() {
 		rpcsLog.Tracef("Websocket client input handler done for %s", c.addr)
 		c.Disconnect()
@@ -1326,7 +1324,6 @@ func (c *wsClient) inHandler() {
 
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
-			// Log the error if it's not due to disconnecting.
 			if err != io.EOF {
 				rpcsLog.Errorf("Websocket receive error from "+
 					"%s: %v", c.addr, err)
@@ -1334,22 +1331,20 @@ func (c *wsClient) inHandler() {
 			return
 		}
 
-		var batchedRequest bool
-
-		// Determine request type
 		if bytes.HasPrefix(msg, batchedRequestPrefix) {
-			batchedRequest = true
-		}
-
-		if !batchedRequest {
+			payload, disconnect := c.handleBatchedMsg(msg)
+			if disconnect {
+				return
+			}
+			if len(payload) > 0 {
+				c.SendMessage(payload, nil)
+			}
+		} else {
 			var req btcjson.Request
-			err = json.Unmarshal(msg, &req)
-			if err != nil {
-				// only process requests from authenticated clients
+			if err := json.Unmarshal(msg, &req); err != nil {
 				if !c.authenticated {
 					return
 				}
-
 				jsonErr := &btcjson.RPCError{
 					Code:    btcjson.ErrRPCParse.Code,
 					Message: "Failed to parse request: " + err.Error(),
@@ -1370,8 +1365,6 @@ func (c *wsClient) inHandler() {
 				c.SendMessage(outcome.reply, nil)
 			case outcome.cmd != nil:
 				cmd := outcome.cmd
-				// Service the command in a short-lived goroutine,
-				// limiting concurrency with a semaphore.
 				c.serviceRequestSem.acquire()
 				go func() {
 					if reply := c.runCommand(cmd); reply != nil {
@@ -1381,166 +1374,100 @@ func (c *wsClient) inHandler() {
 				}()
 			}
 		}
+	}
+}
 
-		// Process a batched request
-		if batchedRequest {
-			var batchedRequests []interface{}
-			var results []json.RawMessage
-			var batchSize int
-			var reply json.RawMessage
-			c.serviceRequestSem.acquire()
-			err = json.Unmarshal(msg, &batchedRequests)
+// handleBatchedMsg processes a JSON-RPC batch message, running each request
+// synchronously and returning the assembled reply payload and whether the
+// client should be disconnected. The service semaphore is held for the
+// duration and released via defer, fixing a prior leak on early-return paths.
+func (c *wsClient) handleBatchedMsg(msg []byte) (payload []byte, disconnect bool) {
+	c.serviceRequestSem.acquire()
+	defer c.serviceRequestSem.release()
+
+	// Decode directly as []json.RawMessage to avoid a marshal round-trip
+	// per entry.
+	var requests []json.RawMessage
+	if err := json.Unmarshal(msg, &requests); err != nil {
+		if !c.authenticated {
+			return nil, true
+		}
+		jsonErr := &btcjson.RPCError{
+			Code:    btcjson.ErrRPCParse.Code,
+			Message: fmt.Sprintf("Failed to parse request: %v", err),
+		}
+		reply, err := btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
+		if err != nil {
+			rpcsLog.Errorf("Failed to create reply: %v", err)
+		}
+		return reply, false
+	}
+
+	if len(requests) == 0 {
+		if !c.authenticated {
+			return nil, true
+		}
+		jsonErr := &btcjson.RPCError{
+			Code:    btcjson.ErrRPCInvalidRequest.Code,
+			Message: "Invalid request: empty batch",
+		}
+		reply, err := btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
+		if err != nil {
+			rpcsLog.Errorf("Failed to marshal reply: %v", err)
+		}
+		return reply, false
+	}
+
+	var results []json.RawMessage
+	for _, rawReq := range requests {
+		var req btcjson.Request
+		if err := json.Unmarshal(rawReq, &req); err != nil {
+			if !c.authenticated {
+				return nil, true
+			}
+			jsonErr := &btcjson.RPCError{
+				Code:    btcjson.ErrRPCInvalidRequest.Code,
+				Message: fmt.Sprintf("Invalid request: %v", err),
+			}
+			reply, err := btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
 			if err != nil {
-				// Only process requests from authenticated clients
-				if !c.authenticated {
-					return
-				}
-
-				jsonErr := &btcjson.RPCError{
-					Code: btcjson.ErrRPCParse.Code,
-					Message: fmt.Sprintf("Failed to parse request: %v",
-						err),
-				}
-				reply, err = btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
-				if err != nil {
-					rpcsLog.Errorf("Failed to create reply: %v", err)
-				}
-
-				if reply != nil {
-					results = append(results, reply)
-				}
+				rpcsLog.Errorf("Failed to create reply: %v", err)
+				continue
 			}
-
-			if err == nil {
-				// Response with an empty batch error if the batch size is zero
-				if len(batchedRequests) == 0 {
-					if !c.authenticated {
-						return
-					}
-
-					jsonErr := &btcjson.RPCError{
-						Code:    btcjson.ErrRPCInvalidRequest.Code,
-						Message: "Invalid request: empty batch",
-					}
-					reply, err = btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
-					if err != nil {
-						rpcsLog.Errorf("Failed to marshal reply: %v", err)
-					}
-
-					if reply != nil {
-						results = append(results, reply)
-					}
-				}
-
-				// Process each batch entry individually
-				if len(batchedRequests) > 0 {
-					batchSize = len(batchedRequests)
-					for _, entry := range batchedRequests {
-						var reqBytes []byte
-						reqBytes, err = json.Marshal(entry)
-						if err != nil {
-							// Only process requests from authenticated clients
-							if !c.authenticated {
-								return
-							}
-
-							jsonErr := &btcjson.RPCError{
-								Code: btcjson.ErrRPCInvalidRequest.Code,
-								Message: fmt.Sprintf("Invalid request: %v",
-									err),
-							}
-							reply, err = btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
-							if err != nil {
-								rpcsLog.Errorf("Failed to create reply: %v", err)
-								continue
-							}
-
-							if reply != nil {
-								results = append(results, reply)
-							}
-							continue
-						}
-
-						var req btcjson.Request
-						err := json.Unmarshal(reqBytes, &req)
-						if err != nil {
-							// Only process requests from authenticated clients
-							if !c.authenticated {
-								return
-							}
-
-							jsonErr := &btcjson.RPCError{
-								Code: btcjson.ErrRPCInvalidRequest.Code,
-								Message: fmt.Sprintf("Invalid request: %v",
-									err),
-							}
-							reply, err = btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
-							if err != nil {
-								rpcsLog.Errorf("Failed to create reply: %v", err)
-								continue
-							}
-
-							if reply != nil {
-								results = append(results, reply)
-							}
-							continue
-						}
-
-						switch outcome := c.authorizeRequest(&req); {
-						case outcome.disconnect:
-							return
-						case outcome.reply != nil:
-							results = append(results, outcome.reply)
-						case outcome.cmd != nil:
-							// Batched commands run synchronously
-							// so the reply joins the batch
-							// response; a marshal failure yields a
-							// nil reply and disconnects the client.
-							reply := c.runCommand(outcome.cmd)
-							if reply == nil {
-								return
-							}
-							results = append(results, reply)
-						}
-					}
-				}
+			if reply != nil {
+				results = append(results, reply)
 			}
+			continue
+		}
 
-			// generate reply
-			var payload = []byte{}
-			if batchedRequest && batchSize > 0 {
-				if len(results) > 0 {
-					// Form the batched response json
-					var buffer bytes.Buffer
-					buffer.WriteByte('[')
-					for idx, marshalledReply := range results {
-						if idx == len(results)-1 {
-							buffer.Write(marshalledReply)
-							buffer.WriteByte(']')
-							break
-						}
-						buffer.Write(marshalledReply)
-						buffer.WriteByte(',')
-					}
-					payload = buffer.Bytes()
-				}
+		switch outcome := c.authorizeRequest(&req); {
+		case outcome.disconnect:
+			return nil, true
+		case outcome.reply != nil:
+			results = append(results, outcome.reply)
+		case outcome.cmd != nil:
+			reply := c.runCommand(outcome.cmd)
+			if reply == nil {
+				return nil, true
 			}
-
-			if !batchedRequest || batchSize == 0 {
-				// Respond with the first results entry for single requests
-				if len(results) > 0 {
-					payload = results[0]
-				}
-			}
-
-			// A notification (no id) or an all-notification batch
-			// produces no results; don't emit an empty websocket frame.
-			if len(payload) > 0 {
-				c.SendMessage(payload, nil)
-			}
-			c.serviceRequestSem.release()
+			results = append(results, reply)
 		}
 	}
+
+	if len(results) == 0 {
+		return nil, false
+	}
+
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, r := range results {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.Write(r)
+	}
+	buf.WriteByte(']')
+	return buf.Bytes(), false
 }
 
 // runCommand executes the handler for a parsed command and returns its
