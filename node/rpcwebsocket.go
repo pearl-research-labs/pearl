@@ -1383,40 +1383,18 @@ func (c *wsClient) handleBatchedMsg(msg []byte) {
 	// per entry.
 	var requests []json.RawMessage
 	if err := json.Unmarshal(msg, &requests); err != nil {
-		if !c.authenticated {
-			c.Disconnect()
-			return
-		}
-		jsonErr := &btcjson.RPCError{
+		c.rejectBatch(&btcjson.RPCError{
 			Code:    btcjson.ErrRPCParse.Code,
 			Message: fmt.Sprintf("Failed to parse request: %v", err),
-		}
-		reply, err := btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
-		if err != nil {
-			rpcsLog.Errorf("Failed to create reply: %v", err)
-		}
-		if reply != nil {
-			c.SendMessage(reply, nil)
-		}
+		})
 		return
 	}
 
 	if len(requests) == 0 {
-		if !c.authenticated {
-			c.Disconnect()
-			return
-		}
-		jsonErr := &btcjson.RPCError{
+		c.rejectBatch(&btcjson.RPCError{
 			Code:    btcjson.ErrRPCInvalidRequest.Code,
 			Message: "Invalid request: empty batch",
-		}
-		reply, err := btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
-		if err != nil {
-			rpcsLog.Errorf("Failed to marshal reply: %v", err)
-		}
-		if reply != nil {
-			c.SendMessage(reply, nil)
-		}
+		})
 		return
 	}
 
@@ -1435,9 +1413,7 @@ func (c *wsClient) handleBatchedMsg(msg []byte) {
 			reply, err := btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
 			if err != nil {
 				rpcsLog.Errorf("Failed to create reply: %v", err)
-				continue
-			}
-			if reply != nil {
+			} else {
 				results = append(results, reply)
 			}
 			continue
@@ -1463,16 +1439,27 @@ func (c *wsClient) handleBatchedMsg(msg []byte) {
 		return
 	}
 
-	var buf bytes.Buffer
-	buf.WriteByte('[')
-	for i, r := range results {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		buf.Write(r)
+	payload, err := json.Marshal(results)
+	if err != nil {
+		rpcsLog.Errorf("Failed to marshal batch response: %v", err)
+		return
 	}
-	buf.WriteByte(']')
-	c.SendMessage(buf.Bytes(), nil)
+	c.SendMessage(payload, nil)
+}
+
+// rejectBatch handles a batch-level error: disconnects the client if it is not
+// yet authenticated, or sends a single JSON-RPC error reply otherwise.
+func (c *wsClient) rejectBatch(jsonErr *btcjson.RPCError) {
+	if !c.authenticated {
+		c.Disconnect()
+		return
+	}
+	reply, err := btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
+	if err != nil {
+		rpcsLog.Errorf("Failed to marshal batch error: %v", err)
+		return
+	}
+	c.SendMessage(reply, nil)
 }
 
 // runCommand executes the handler for a parsed command and returns its
