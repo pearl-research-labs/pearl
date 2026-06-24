@@ -800,9 +800,10 @@ func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
 			httpReq.Header.Set(key, value)
 		}
 
-		// Configure basic access authorization.  Use a distinct error
-		// variable so the outer err (used to decide retries and the
-		// final result below) is not shadowed by this short-lived :=.
+		// Configure basic access authorization.  A distinct variable
+		// avoids shadowing the outer err: a := here would make the
+		// subsequent Do() assignment also write to a loop-scoped err,
+		// silently losing the transport error from the post-loop check.
 		user, pass, authErr := c.config.getAuth()
 		if authErr != nil {
 			jReq.responseChan <- &Response{result: nil, err: authErr}
