@@ -32,6 +32,5 @@ class MinerSettings(BaseSettings):
     no_mining: bool = False
     skip_block_submission: bool = False
     no_vllm_plugin: bool = False
-    quantization_fast_math: bool = False
 
     enable_async_cuda_event_processing: bool = True

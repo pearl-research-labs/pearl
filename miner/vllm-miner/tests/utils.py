@@ -10,14 +10,6 @@ DEFAULT_QUANT_CONFIG = Int8ScaledMMLinearLayerConfig(
 DEFAULT_LAYER_PARAM_NAMES = ["weight_q", "weight_s", "input_s", "input_zp", "azp_adj"]
 
 
-# vLLM test fixtures
-def reference_quant_7bit(x):
-    x = x.to(torch.float32)
-    xq_scales = x.abs().max(dim=-1, keepdims=True).values / 63
-    xq = (x / xq_scales).round()
-    return xq.to(torch.int8), xq_scales.to(torch.float32), None
-
-
 class DummyLayer(torch.nn.Module):
     def __init__(self, n, k, device="cuda"):
         super().__init__()

@@ -16,7 +16,6 @@
 #include "pearl_api_params.h"
 #include "pearl_gemm_constants.hpp"
 #include "pearl_gemm_decl.h"
-#include "quantize_kernel.hpp"
 #include "static_switch.h"
 
 #include <cstdio>
@@ -936,76 +935,6 @@ void noisy_gemm(
               ", EARxBpEB of type ", c10::toString(EARxBpEB_noising_dtype));
 }
 
-void quantize(const at::Tensor& input, const at::Tensor& output,
-              const at::Tensor& scales, int64_t max_val,
-              const std::optional<at::Tensor>& smooth_scale_, bool fast_math) {
-  CHECK_DEVICE(input);
-  CHECK_DEVICE(output);
-  CHECK_DEVICE(scales);
-  CHECK_CONTIGUOUS(input);
-  CHECK_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(scales);
-
-  TORCH_CHECK(
-      input.dtype() == torch::kFloat16 || input.dtype() == torch::kBFloat16,
-      "Input must be float16 or bfloat16");
-  TORCH_CHECK(output.dtype() == torch::kInt8, "Output must be int8");
-  TORCH_CHECK(scales.dtype() == torch::kFloat32, "Scales must be float32");
-  TORCH_CHECK(max_val == MAX_VAL_7BIT || max_val == MAX_VAL_8BIT,
-              "max_val must be ", MAX_VAL_7BIT, " or ", MAX_VAL_8BIT);
-
-  const int num_tokens = input.size(0);
-  const int hidden_size = input.size(1);
-
-  CHECK_SHAPE(input, num_tokens, hidden_size);
-  CHECK_SHAPE(output, num_tokens, hidden_size);
-  CHECK_SHAPE(scales, num_tokens, 1);
-
-  TORCH_CHECK(input.sizes() == output.sizes(),
-              "Input and output shapes must match");
-
-  TORCH_CHECK(num_tokens > 0 && hidden_size > 0,
-              "Invalid tensor dimensions for quantization");
-
-  const void* smooth_scale_ptr = nullptr;
-  bool use_smooth_scale = false;
-  at::ScalarType smooth_scale_dtype = at::ScalarType::Float;  // default
-  if (smooth_scale_.has_value()) {
-    const at::Tensor& smooth_scale = smooth_scale_.value();
-    CHECK_DEVICE(smooth_scale);
-    CHECK_CONTIGUOUS(smooth_scale);
-    smooth_scale_dtype = smooth_scale.scalar_type();
-    TORCH_CHECK(smooth_scale_dtype == torch::kFloat32 ||
-                    smooth_scale_dtype == torch::kFloat16 ||
-                    smooth_scale_dtype == torch::kBFloat16,
-                "Smooth scale must be float32, float16, or bfloat16, but got ",
-                c10::toString(smooth_scale_dtype));
-    TORCH_CHECK(smooth_scale.dim() == 1 && smooth_scale.size(0) == hidden_size,
-                "Smooth scale size must match hidden_size");
-    smooth_scale_ptr = smooth_scale.data_ptr();
-    use_smooth_scale = true;
-  }
-
-  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  const at::ScalarType input_dtype = input.scalar_type();
-
-  QUANTIZE_CONFIG_SWITCH(
-      fast_math, use_smooth_scale, max_val,
-      SCALAR_TYPE_SWITCH(
-          input_dtype, scalar_t,
-          SMOOTH_SCALE_TYPE_SWITCH(
-              use_smooth_scale, smooth_scale_dtype, input_dtype, smooth_scale_t,
-              run_quantize_kernel<scalar_t, smooth_scale_t, FastMath_,
-                                  UseSmoothScale_, MaxVal_>(
-                  static_cast<const scalar_t*>(input.data_ptr()),
-                  static_cast<const smooth_scale_t*>(smooth_scale_ptr),
-                  static_cast<int8_t*>(output.data_ptr()),
-                  static_cast<float*>(scales.data_ptr()), num_tokens,
-                  hidden_size, stream););););
-}
-
 HostSignalHeader get_host_signal_header(at::Tensor& host_signal_header_pinned) {
   HostSignalHeader* header =
       reinterpret_cast<HostSignalHeader*>(host_signal_header_pinned.data_ptr());
@@ -1060,10 +989,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("get_host_signal_header", &get_host_signal_header,
         "Get host signal header");
   m.def("noise_gen", &noise_gen, "Noise generation");
-  m.def("quantize", &quantize,
-        "Dynamic quantization with optional smooth scale", py::arg("input"),
-        py::arg("output"), py::arg("scales"), py::arg("max_val") = 63,
-        py::arg("smooth_scale") = py::none(), py::arg("fast_math") = false);
   m.def("inner_hash", &inner_hash, "Inner hash function");
   m.def("tensor_hash", &run_tensor_hash,
         "CUDA hash function with configurable kernel parameters",
@@ -1284,10 +1209,6 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "int num_threads = 128, int num_stages = 2, "
       "int leaves_per_mt_block = 512) -> ()");
   m.def(
-      "quantize(Tensor input, Tensor(output!) output, Tensor(scales!) scales, "
-      "int max_val = 63, Tensor? smooth_scale = None, "
-      "bool fast_math = False) -> ()");
-  m.def(
       "commitment_hash_from_merkle_roots("
       "    Tensor A_merkle_root, "
       "    Tensor B_merkle_root, "
@@ -1315,7 +1236,6 @@ TORCH_LIBRARY_IMPL(pearl_gemm, CUDA, m) {
   m.impl("noise_B", &noise_B);
   m.impl("denoise_converter", &denoise_converter);
   m.impl("noise_gen", &noise_gen);
-  m.impl("quantize", &quantize);
   m.impl("inner_hash", &inner_hash);
   m.impl("tensor_hash", &run_tensor_hash);
   m.impl("commitment_hash_from_merkle_roots",

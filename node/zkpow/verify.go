@@ -101,16 +101,6 @@ func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error 
 		return fmt.Errorf("invalid public_data_len %d (max %d)", c.PublicDataLen, wire.PublicDataMaxSizeV2)
 	}
 	publicData := c.PublicData[:c.PublicDataLen]
-	if len(publicData) < 24 {
-		return fmt.Errorf("public_data too short for mining config: %d bytes", len(publicData))
-	}
-	// MiningConfiguration trailer: e is at bytes 20-21 (u16 LE), top_k at bytes 22-23 (u16 LE).
-	// If e == 0 (non-MoE), top_k must also be 0.
-	e := uint16(publicData[20]) | uint16(publicData[21])<<8
-	topK := uint16(publicData[22]) | uint16(publicData[23])<<8
-	if e == 0 && topK != 0 {
-		return fmt.Errorf("invalid mining config: e=0 but top_k=%d (must be 0 for non-MoE)", topK)
-	}
 	return VerifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
 }
 

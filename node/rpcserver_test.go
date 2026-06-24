@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"testing"
@@ -568,4 +569,34 @@ func TestGetTxSpendingPrevOut(t *testing.T) {
 	results, err = handleGetTxSpendingPrevOut(s, cmd, closeChan)
 	require.NoError(err)
 	require.Equal(expectedResults, results)
+}
+
+func TestCheckCredentials(t *testing.T) {
+	t.Parallel()
+
+	s := &rpcServer{
+		adminCredHash: sha256.Sum256([]byte("admin:adminpass")),
+		limitCredHash: sha256.Sum256([]byte("limit:limitpass")),
+	}
+
+	cases := []struct {
+		name        string
+		user, pass  string
+		wantAuth    bool
+		wantIsAdmin bool
+	}{
+		{"admin", "admin", "adminpass", true, true},
+		{"limited", "limit", "limitpass", true, false},
+		{"admin wrong pass", "admin", "nope", false, false},
+		{"unknown user", "nobody", "adminpass", false, false},
+		{"empty", "", "", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth, isAdmin := s.checkCredentials(tc.user, tc.pass)
+			require.Equal(t, tc.wantAuth, auth)
+			require.Equal(t, tc.wantIsAdmin, isAdmin)
+		})
+	}
+
 }

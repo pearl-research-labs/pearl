@@ -781,7 +781,10 @@ func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
 		return
 	}
 
-	tries := 10
+	tries := c.config.HTTPPostTries
+	if tries < 1 {
+		tries = 10
+	}
 	for i := 0; i < tries; i++ {
 		var httpReq *http.Request
 
@@ -797,10 +800,13 @@ func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
 			httpReq.Header.Set(key, value)
 		}
 
-		// Configure basic access authorization.
-		user, pass, err := c.config.getAuth()
-		if err != nil {
-			jReq.responseChan <- &Response{result: nil, err: err}
+		// Configure basic access authorization.  A distinct variable
+		// avoids shadowing the outer err: a := here would make the
+		// subsequent Do() assignment also write to a loop-scoped err,
+		// silently losing the transport error from the post-loop check.
+		user, pass, authErr := c.config.getAuth()
+		if authErr != nil {
+			jReq.responseChan <- &Response{result: nil, err: authErr}
 			return
 		}
 		httpReq.SetBasicAuth(user, pass)
@@ -1245,6 +1251,11 @@ type ConnConfig struct {
 	// is true.
 	Certificates []byte
 
+	// TLSSkipVerify disables verification of the server's certificate chain
+	// and host name when set.  It has no effect if DisableTLS is true.  This
+	// is insecure and intended only for testing.
+	TLSSkipVerify bool
+
 	// Proxy specifies to connect through a SOCKS 5 proxy server.  It may
 	// be an empty string if a proxy is not required.
 	Proxy string
@@ -1276,6 +1287,12 @@ type ConnConfig struct {
 	// however, not all servers support the websocket extensions, so this
 	// flag can be set to true to use basic HTTP POST requests instead.
 	HTTPPostMode bool
+
+	// HTTPPostTries is the number of times an HTTP POST request is attempted
+	// before giving up.  Values less than one fall back to the default of
+	// 10.  A value of one disables retries, which is appropriate for
+	// one-shot clients that prefer to fail fast.
+	HTTPPostTries int
 
 	// ExtraHeaders specifies the extra headers when perform request. It's
 	// useful when RPC provider need customized headers.
@@ -1326,45 +1343,61 @@ func (config *ConnConfig) retrieveCookie() (username, passphrase string, err err
 // newHTTPClient returns a new http client that is configured according to the
 // proxy and TLS settings in the associated connection configuration.
 func newHTTPClient(config *ConnConfig) (*http.Client, error) {
-	// Set proxy function if there is a proxy configured.
-	var proxyFunc func(*http.Request) (*url.URL, error)
+	// Set up the SOCKS5 proxy if one is configured.
+	var proxy *socks.Proxy
 	if config.Proxy != "" {
-		proxyURL, err := url.Parse(config.Proxy)
-		if err != nil {
-			return nil, err
+		proxy = &socks.Proxy{
+			Addr:     config.Proxy,
+			Username: config.ProxyUser,
+			Password: config.ProxyPass,
 		}
-		proxyFunc = http.ProxyURL(proxyURL)
 	}
 
 	// Configure TLS if needed.
 	var tlsConfig *tls.Config
 	if !config.DisableTLS {
+		tlsConfig = &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: config.TLSSkipVerify,
+		}
 		if len(config.Certificates) > 0 {
 			pool := x509.NewCertPool()
 			pool.AppendCertsFromPEM(config.Certificates)
-			tlsConfig = &tls.Config{
-				RootCAs: pool,
-			}
+			tlsConfig.RootCAs = pool
 		}
 	}
 
-	parsedDialAddr, err := ParseAddressString(config.Host)
-	if err != nil {
-		return nil, err
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	if proxy != nil {
+		// Hand the SOCKS proxy the unresolved host so the proxy performs
+		// name resolution. This mirrors the websocket dial path, supports
+		// .onion / proxy-only hostnames, and avoids leaking a local DNS
+		// query for the destination.
+		host, err := hostPort(config.Host)
+		if err != nil {
+			return nil, err
+		}
+		dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			// go-socks has no context-aware dial, but net/http abandons
+			// the dial (and closes any late connection) once ctx is done,
+			// so the request still honors the client timeout.
+			return proxy.Dial("tcp", host)
+		}
+	} else {
+		parsedDialAddr, err := ParseAddressString(config.Host)
+		if err != nil {
+			return nil, err
+		}
+		dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			d := &net.Dialer{}
+			return d.DialContext(ctx, parsedDialAddr.Network(),
+				parsedDialAddr.String())
+		}
 	}
 	client := http.Client{
 		Transport: &http.Transport{
-			Proxy:           proxyFunc,
 			TLSClientConfig: tlsConfig,
-			DialContext: func(ctx context.Context, _,
-				_ string) (net.Conn, error) {
-				d := &net.Dialer{}
-				return d.DialContext(
-					ctx,
-					parsedDialAddr.Network(),
-					parsedDialAddr.String(),
-				)
-			},
+			DialContext:     dialContext,
 		},
 		Timeout: defaultHTTPTimeout,
 	}
@@ -1379,23 +1412,16 @@ func (config *ConnConfig) httpURL() (string, error) {
 		protocol = "https"
 	}
 
-	parsedAddr, err := ParseAddressString(config.Host)
-	if err != nil {
-		return "", fmt.Errorf("error parsing host '%v': %v",
-			config.Host, err)
-	}
-
-	var httpURL string
-	switch parsedAddr.Network() {
-	case "unix", "unixpacket":
+	// Detect unix sockets by scheme prefix rather than resolving the host,
+	// so proxy-only / .onion destinations are not looked up locally.
+	if strings.HasPrefix(config.Host, "unix://") ||
+		strings.HasPrefix(config.Host, "unixpacket://") {
 		// Using a placeholder URL because a non-empty URL is required.
 		// The Unix domain socket is specified in the DialContext.
-		httpURL = protocol + "://unix"
-	default:
-		httpURL = protocol + "://" + config.Host
+		return protocol + "://unix", nil
 	}
 
-	return httpURL, nil
+	return protocol + "://" + config.Host, nil
 }
 
 // dial opens a websocket connection using the passed connection configuration
@@ -1406,7 +1432,8 @@ func dial(config *ConnConfig) (*websocket.Conn, error) {
 	var scheme = "ws"
 	if !config.DisableTLS {
 		tlsConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: config.TLSSkipVerify,
 		}
 		if len(config.Certificates) > 0 {
 			pool := x509.NewCertPool()
@@ -1780,22 +1807,12 @@ func cutPrefix(s, prefix string) (after string, found bool) {
 	return s[len(prefix):], true
 }
 
-// ParseAddressString converts an address in string format to a net.Addr that is
-// compatible with pearld. UDP is not supported because the node needs reliable
-// connections.
-func ParseAddressString(strAddress string) (net.Addr, error) {
-	// Addresses can either be in unix://address, unixpacket://address URL
-	// format, or just address:port host format for tcp.
-	if after, ok := cutPrefix(strAddress, "unix://"); ok {
-		return net.ResolveUnixAddr("unix", after)
-	}
-	if after, ok := cutPrefix(strAddress, "unixpacket://"); ok {
-		return net.ResolveUnixAddr("unixpacket", after)
-	}
-
+// hostPort normalizes a tcp address to host:port form without resolving it.
+// URL-scheme addresses (unix://, etc.) are rejected.
+func hostPort(strAddress string) (string, error) {
 	if strings.Contains(strAddress, "://") {
 		// Not supporting :// anywhere in the host or path.
-		return nil, fmt.Errorf("unsupported protocol in address: %s",
+		return "", fmt.Errorf("unsupported protocol in address: %s",
 			strAddress)
 	}
 
@@ -1809,9 +1826,29 @@ func ParseAddressString(strAddress string) (net.Addr, error) {
 	// Parse it as a dummy URL to get the host and port.
 	u, err := url.Parse("dummy://" + addr)
 	if err != nil {
+		return "", err
+	}
+	return verifyPort(u.Host), nil
+}
+
+// ParseAddressString converts an address in string format to a net.Addr that is
+// compatible with pearld. UDP is not supported because the node needs reliable
+// connections.
+func ParseAddressString(strAddress string) (net.Addr, error) {
+	// Addresses can either be in unix://address, unixpacket://address URL
+	// format, or just address:port host format for tcp.
+	if after, ok := cutPrefix(strAddress, "unix://"); ok {
+		return net.ResolveUnixAddr("unix", after)
+	}
+	if after, ok := cutPrefix(strAddress, "unixpacket://"); ok {
+		return net.ResolveUnixAddr("unixpacket", after)
+	}
+
+	hp, err := hostPort(strAddress)
+	if err != nil {
 		return nil, err
 	}
-	return net.ResolveTCPAddr("tcp", verifyPort(u.Host))
+	return net.ResolveTCPAddr("tcp", hp)
 }
 
 // verifyPort makes sure that an address string has both a host and a port.

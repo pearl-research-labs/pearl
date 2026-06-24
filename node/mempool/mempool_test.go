@@ -1403,9 +1403,9 @@ func TestConflicts(t *testing.T) {
 	}
 }
 
-// TestAncestorsDescendants ensures that we can properly retrieve the
-// unconfirmed ancestors and descendants of a transaction.
-func TestAncestorsDescendants(t *testing.T) {
+// TestDescendants ensures that we can properly retrieve the unconfirmed
+// descendants of a transaction.
+func TestDescendants(t *testing.T) {
 	t.Parallel()
 
 	// We'll start the test by initializing our mempool harness.
@@ -1443,26 +1443,8 @@ func TestAncestorsDescendants(t *testing.T) {
 	}
 	e := ctx.addSignedTx(eInputs, 1, minTestFee, false, false)
 
-	// We'll be querying for the ancestors of E. We should expect to see all
-	// of the transactions that it depends on.
-	expectedAncestors := map[chainhash.Hash]struct{}{
-		*a.Hash(): {}, *b.Hash(): {},
-		*c.Hash(): {}, *d.Hash(): {},
-	}
-	ancestors := ctx.harness.txPool.txAncestors(e, nil)
-	if len(ancestors) != len(expectedAncestors) {
-		ctx.t.Fatalf("expected %d ancestors, got %d",
-			len(expectedAncestors), len(ancestors))
-	}
-	for ancestorHash := range ancestors {
-		if _, ok := expectedAncestors[ancestorHash]; !ok {
-			ctx.t.Fatalf("found unexpected ancestor %v",
-				ancestorHash)
-		}
-	}
-
-	// Then, we'll query for the descendants of A. We should expect to see
-	// all of the transactions that depend on it.
+	// We'll query for the descendants of A. We should expect to see all of
+	// the transactions that depend on it.
 	expectedDescendants := map[chainhash.Hash]struct{}{
 		*b.Hash(): {}, *c.Hash(): {},
 		*d.Hash(): {}, *e.Hash(): {},
@@ -1478,6 +1460,91 @@ func TestAncestorsDescendants(t *testing.T) {
 				descendantHash)
 		}
 	}
+}
+
+// TestDescendantsBounded ensures that the descendant traversal stays bounded
+// by MaxReplacementEvictions even when fed a chain of unconfirmed transactions
+// that is much longer than the cap.
+func TestDescendantsBounded(t *testing.T) {
+	t.Parallel()
+
+	harness, outputs, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	ctx := &testContext{t, harness}
+
+	// Build a single linear chain of unconfirmed transactions, each one
+	// spending the sole output of the previous transaction. The chain is
+	// deliberately longer than the cap.
+	const chainLen = MaxReplacementEvictions + 50
+
+	chain := make([]*btcutil.Tx, 0, chainLen)
+	prevOut := outputs[0]
+	for i := 0; i < chainLen; i++ {
+		tx := ctx.addSignedTx(
+			[]spendableOutput{prevOut}, 1, minTestFee, false, false,
+		)
+		chain = append(chain, tx)
+		prevOut = txOutToSpendableOut(tx, 0)
+	}
+
+	// The root's descendants would, uncapped, span almost the entire
+	// chain. The traversal must instead stop at MaxReplacementEvictions + 1.
+	root := chain[0]
+	descendants := ctx.harness.txPool.txDescendants(root, nil)
+	if len(descendants) > MaxReplacementEvictions+1 {
+		t.Fatalf("descendants not bounded: got %d, want <= %d",
+			len(descendants), MaxReplacementEvictions+1)
+	}
+	if len(descendants) < MaxReplacementEvictions {
+		t.Fatalf("expected descendant traversal to reach the cap, "+
+			"got %d", len(descendants))
+	}
+}
+
+// TestRBFSpendsParentBeyondAncestorCap ensures a replacement that spends an
+// output of a transaction it would evict is rejected even when an earlier
+// input pulls in more unconfirmed ancestors than MaxReplacementEvictions. It
+// guards against the overlap check walking a bounded ancestor set, where a
+// long chain of cheap transactions on an earlier input could hide the
+// conflicting parent.
+func TestRBFSpendsParentBeyondAncestorCap(t *testing.T) {
+	t.Parallel()
+
+	harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
+	require.NoError(t, err)
+	ctx := &testContext{t, harness}
+
+	coinbase := ctx.addCoinbaseTx(2)
+	chainTip := txOutToSpendableOut(coinbase, 0)
+	conflictOut := txOutToSpendableOut(coinbase, 1)
+
+	// An unconfirmed chain longer than the cap; walking its tip's ancestors
+	// alone would exhaust MaxReplacementEvictions.
+	for i := 0; i < MaxReplacementEvictions+5; i++ {
+		tx := ctx.addSignedTx(
+			[]spendableOutput{chainTip}, 1, minTestFee, false, false,
+		)
+		chainTip = txOutToSpendableOut(tx, 0)
+	}
+
+	// conflictTx both conflicts with the replacement (shares conflictOut)
+	// and is spent by it (the overlap).
+	conflictTx := ctx.addSignedTx(
+		[]spendableOutput{conflictOut}, 1, minTestFee, true, false,
+	)
+
+	// Spend the chain tip first so a bounded ancestor walk fills up before
+	// reaching the conflicting parent, then the conflict's output (overlap)
+	// and the conflicting outpoint itself.
+	replacement, err := ctx.harness.CreateSignedTx([]spendableOutput{
+		chainTip, txOutToSpendableOut(conflictTx, 0), conflictOut,
+	}, 1, minTestFee*100, false)
+	require.NoError(t, err)
+
+	_, err = harness.txPool.ProcessTransaction(replacement, false, false, 0)
+	require.ErrorContains(t, err, "spends parent transaction")
 }
 
 // TestRBF tests the different cases required for a transaction to properly
