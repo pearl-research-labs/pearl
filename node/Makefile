@@ -65,7 +65,7 @@ build:
 	@$(call print, "Building all binaries")
 	mkdir -p bin
 	$(GOBUILD) -o bin/pearld $(PKG)
-	$(GOBUILD) -o bin/prlctl $(PKG)/cmd/btcctl
+	$(GOBUILD) -o bin/prlctl $(PKG)/cmd/prlctl
 	$(GOBUILD) -o bin/gencerts $(PKG)/cmd/gencerts
 	$(GOBUILD) -o bin/findcheckpoint $(PKG)/cmd/findcheckpoint
 	$(GOBUILD) -o bin/addblock $(PKG)/cmd/addblock
@@ -74,7 +74,7 @@ build:
 install:
 	@$(call print, "Installing all binaries")
 	$(GOBUILD) -o $(GOPATH)/bin/pearld $(PKG)
-	$(GOBUILD) -o $(GOPATH)/bin/prlctl $(PKG)/cmd/btcctl
+	$(GOBUILD) -o $(GOPATH)/bin/prlctl $(PKG)/cmd/prlctl
 	$(GOBUILD) -o $(GOPATH)/bin/gencerts $(PKG)/cmd/gencerts
 	$(GOBUILD) -o $(GOPATH)/bin/findcheckpoint $(PKG)/cmd/findcheckpoint
 	$(GOBUILD) -o $(GOPATH)/bin/addblock $(PKG)/cmd/addblock
@@ -83,7 +83,7 @@ install:
 release-install:
 	@$(call print, "Installing pearld and prlctl release binaries")
 	env CGO_ENABLED=1 $(GOBUILD) -trimpath -ldflags="-s -w -buildid=" -o $(GOPATH)/bin/pearld $(PKG)
-	env CGO_ENABLED=1 $(GOBUILD) -trimpath -ldflags="-s -w -buildid=" -o $(GOPATH)/bin/prlctl $(PKG)/cmd/btcctl
+	env CGO_ENABLED=1 $(GOBUILD) -trimpath -ldflags="-s -w -buildid=" -o $(GOPATH)/bin/prlctl $(PKG)/cmd/prlctl
 
 # =======
 # TESTING
