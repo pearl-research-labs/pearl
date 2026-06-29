@@ -153,7 +153,7 @@ func TestCheckConnectBlockTemplate(t *testing.T) {
 // TestCheckBlockSanity tests the CheckBlockSanity function to ensure it works
 // as expected.
 func TestCheckBlockSanity(t *testing.T) {
-	// Create a block with a valid ZKCertificate.
+	// Create a block with a valid V1 certificate.
 	// Use RegTest chainParams so PoW is actually verified (SimNet auto-skips PoW).
 	chainParams := &chaincfg.RegressionNetParams
 	header := wire.BlockHeader{
@@ -164,7 +164,7 @@ func TestCheckBlockSanity(t *testing.T) {
 		Bits:       chainParams.PowLimitBits,
 	}
 
-	// Mine a valid ZKCertificate (only 1 block, so longer ZK proof time is acceptable)
+	// Mine a valid certificate (only 1 block, so longer ZK proof time is acceptable)
 	cert, err := zkpow.Mine(&header)
 	if err != nil {
 		t.Fatalf("Mine failed: %v", err)
@@ -336,7 +336,7 @@ func TestCheckTransactionSanityOutputScriptTypes(t *testing.T) {
 var Block100000 = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash: chainhash.Hash([32]byte{ // Block hash placeholder
 					0xb4, 0x66, 0x51, 0x7c, 0x4c, 0xa8, 0x50, 0xc5,
 					0x7c, 0x21, 0x9c, 0x77, 0xbe, 0xe8, 0xdf, 0xcb,

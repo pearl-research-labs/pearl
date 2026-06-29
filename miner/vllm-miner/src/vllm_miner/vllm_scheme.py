@@ -120,13 +120,20 @@ class PearlScheme(CompressedTensorsScheme):
                     "Please use symmetric quantization (input_symmetric=True)."
                 )
 
-        # SMOOTH QUANT SCALE (bfloat16 to match model dtype)
+        # SmoothQuant scale
         smooth_quant_scale = RowvLLMParameter(
             data=torch.ones(input_size_per_partition, dtype=torch.bfloat16),
             input_dim=0,
             weight_loader=weight_loader,
         )
         layer.register_parameter("smooth_quant_scale", smooth_quant_scale)
+
+        # Hadamard block size
+        hadamard_block_size = BasevLLMParameter(
+            data=torch.zeros(1, dtype=torch.int32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("hadamard_block_size", hadamard_block_size)
 
         # Create kernel
         self.kernel = PearlKernel(

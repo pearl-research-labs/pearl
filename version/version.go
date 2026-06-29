@@ -19,8 +19,8 @@ const semanticAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 // versioning 2.0.0 spec (http://semver.org/).
 const (
 	Major uint = 1
-	Minor uint = 0
-	Patch uint = 6
+	Minor uint = 1
+	Patch uint = 5
 
 	// PreRelease MUST only contain characters from semanticAlphabet
 	// per the semantic versioning spec.
@@ -34,14 +34,25 @@ var Build string
 // Version returns the application version as a properly formed string per the
 // semantic versioning 2.0.0 spec (http://semver.org/).
 func Version() string {
+	v := UserAgent()
+
+	if build := normalizeVerString(Build); build != "" {
+		v = fmt.Sprintf("%s+%s", v, build)
+	}
+
+	return v
+}
+
+// UserAgent returns the version string to advertise in p2p user agents:
+// "major.minor.patch" plus the pre-release tag if one is set (e.g.
+// "1.2.0-beta"). Build metadata is deliberately excluded so the user agent
+// is stable across builds of the same release and does not leak build
+// details to peers.
+func UserAgent() string {
 	v := fmt.Sprintf("%d.%d.%d", Major, Minor, Patch)
 
 	if preRelease := normalizeVerString(PreRelease); preRelease != "" {
 		v = fmt.Sprintf("%s-%s", v, preRelease)
-	}
-
-	if build := normalizeVerString(Build); build != "" {
-		v = fmt.Sprintf("%s+%s", v, build)
 	}
 
 	return v

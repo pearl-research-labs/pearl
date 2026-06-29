@@ -17,7 +17,11 @@ void tensor_hash(
     uint32_t leaves_per_mt_block,  // compute_blake_mt_kernel threads
     uint8_t* roots, cudaDeviceProp& deviceProp, cudaStream_t stream);
 
+// routing_root and offsets_hash are optional (nullptr in the dense case). When
+// both are provided the MoE routing commitment is folded into A's seed before
+// computing the A commitment hash.
 void commitment_hash_from_merkle_roots(
     const uint8_t* A_merkle_root, const uint8_t* B_merkle_root,
     const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
+    const uint8_t* routing_root, const uint8_t* offsets_hash,
     cudaDeviceProp& deviceProp, cudaStream_t stream);

@@ -30,6 +30,7 @@ import (
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
 	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/pearl-research-labs/pearl/spv/query"
+	pearlversion "github.com/pearl-research-labs/pearl/version"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 )
 
@@ -48,8 +49,9 @@ var (
 	UserAgentName = "neutrino"
 
 	// UserAgentVersion is the user agent version and is used to help
-	// identify ourselves to other peers.
-	UserAgentVersion = "0.12.0-beta"
+	// identify ourselves to other peers. It is derived from the canonical
+	// monorepo version so it never drifts from version/version.go.
+	UserAgentVersion = pearlversion.UserAgent()
 
 	// Services describes the services that are supported by the server.
 	Services = wire.SFNodeWitness | wire.SFNodeCF

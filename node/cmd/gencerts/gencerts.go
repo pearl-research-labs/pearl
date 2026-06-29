@@ -57,20 +57,10 @@ func main() {
 	}
 
 	validUntil := time.Now().Add(time.Duration(cfg.Years) * 365 * 24 * time.Hour)
-	cert, key, err := btcutil.NewTLSCertPair(cfg.Organization, validUntil, cfg.ExtraHosts)
+	_, err = btcutil.WriteTLSCertPair(certFile, keyFile, cfg.Organization,
+		validUntil, cfg.ExtraHosts, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot generate certificate pair: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Write cert and key files.
-	if err = os.WriteFile(certFile, cert, 0666); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot write cert: %v\n", err)
-		os.Exit(1)
-	}
-	if err = os.WriteFile(keyFile, key, 0600); err != nil {
-		os.Remove(certFile)
-		fmt.Fprintf(os.Stderr, "cannot write key: %v\n", err)
 		os.Exit(1)
 	}
 }

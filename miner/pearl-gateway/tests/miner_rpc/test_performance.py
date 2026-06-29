@@ -93,6 +93,7 @@ def _create_sample_plain_proof_for_performance() -> PlainProof:
         noise_rank=128,
         a_merkle_proof=a_matrix_proof,
         bt_merkle_proof=bt_matrix_proof,
+        moe=None,
     )
 
 

@@ -28,8 +28,9 @@ type GetBlockHeaderVerboseResult struct {
 	Time          int64   `json:"time"`
 	Bits          string  `json:"bits"`
 	Difficulty    float64 `json:"difficulty"`
-	PreviousHash  string  `json:"previousblockhash,omitempty"`
-	NextHash      string  `json:"nextblockhash,omitempty"`
+	PreviousHash     string  `json:"previousblockhash,omitempty"`
+	NextHash         string  `json:"nextblockhash,omitempty"`
+	ProofCommitment  string  `json:"proofcommitment"`
 }
 
 // GetBlockStatsResult models the data from the getblockstats command.
@@ -83,8 +84,9 @@ type GetBlockVerboseResult struct {
 	Time          int64         `json:"time"`
 	Bits          string        `json:"bits"`
 	Difficulty    float64       `json:"difficulty"`
-	PreviousHash  string        `json:"previousblockhash"`
-	NextHash      string        `json:"nextblockhash,omitempty"`
+	PreviousHash     string        `json:"previousblockhash"`
+	NextHash         string        `json:"nextblockhash,omitempty"`
+	ProofCommitment  string        `json:"proofcommitment"`
 }
 
 // GetBlockVerboseTxResult models the data from the getblock command when the
@@ -107,8 +109,9 @@ type GetBlockVerboseTxResult struct {
 	Time          int64         `json:"time"`
 	Bits          string        `json:"bits"`
 	Difficulty    float64       `json:"difficulty"`
-	PreviousHash  string        `json:"previousblockhash"`
-	NextHash      string        `json:"nextblockhash,omitempty"`
+	PreviousHash     string        `json:"previousblockhash"`
+	NextHash         string        `json:"nextblockhash,omitempty"`
+	ProofCommitment  string        `json:"proofcommitment"`
 }
 
 // GetChainTipsResult models the data from the getchaintips command.
@@ -296,6 +299,12 @@ type GetBlockTemplateResult struct {
 	// Block proposal from BIP 0023.
 	Capabilities []string `json:"capabilities,omitempty"`
 	RejectReason string   `json:"reject-reason,omitempty"`
+
+	// RequiredCertVersion is the block certificate version that a block built
+	// from this template must carry under the MoE hardfork cutover (V1 before
+	// the activation height, V2 at and after it). It is the single source of
+	// truth for miners selecting which proof/certificate to produce.
+	RequiredCertVersion uint32 `json:"requiredcertversion"`
 }
 
 // GetMempoolEntryResult models the data returned from the getmempoolentry's

@@ -3,7 +3,7 @@
 This module re-exports MiningConfiguration and related types from the pearl_mining library,
 """
 
-from pearl_mining import MiningConfiguration, MMAType, PeriodicPattern
+from pearl_mining import MiningConfiguration, MMAType, MoEConfig, PeriodicPattern
 
 
 class PearlMiningConfigurationFactory:
@@ -11,7 +11,12 @@ class PearlMiningConfigurationFactory:
 
     @classmethod
     def create(
-        cls, common_dim: int, rank: int, row_indices: list[int], col_indices: list[int]
+        cls,
+        common_dim: int,
+        rank: int,
+        row_indices: list[int],
+        col_indices: list[int],
+        moe: MoEConfig | None = None,
     ) -> MiningConfiguration:
         row_offset = min(row_indices)
         col_offset = min(col_indices)
@@ -23,8 +28,14 @@ class PearlMiningConfigurationFactory:
             mma_type=MMAType.Int7xInt7ToInt32,
             rows_pattern=rows_pattern,
             cols_pattern=cols_pattern,
-            reserved=MiningConfiguration.RESERVED,
+            moe=moe,
         )
 
 
-__all__ = ["MiningConfiguration", "MMAType", "PeriodicPattern", "PearlMiningConfigurationFactory"]
+__all__ = [
+    "MiningConfiguration",
+    "MMAType",
+    "MoEConfig",
+    "PeriodicPattern",
+    "PearlMiningConfigurationFactory",
+]

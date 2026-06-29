@@ -1,6 +1,6 @@
 [package]
 name = "py-pearl-mining"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Unified Python bindings for Pearl mining (blake3 merkle trees + ZK proof)"
 

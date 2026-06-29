@@ -42,6 +42,7 @@ const (
 	defaultLogLevel                 = "info"
 	defaultLogDirname               = "logs"
 	defaultLogFilename              = "pearld.log"
+	defaultLogSizeKB                = 10 * 1024
 	defaultMaxPeers                 = 125
 	defaultBanDuration              = time.Hour * 24
 	defaultBanThreshold             = 100
@@ -121,6 +122,7 @@ type config struct {
 	FreeTxRelayLimit         float64       `long:"limitfreerelay" description:"Limit relay of transactions with no transaction fee to the given amount in thousands of bytes per minute"`
 	Listeners                []string      `long:"listen" description:"Add an interface/port to listen for connections (default all interfaces port: 44108, testnet: 44110)"`
 	LogDir                   string        `long:"logdir" description:"Directory to log output."`
+	LogSize                  uint32        `long:"logsize" description:"Maximum size in KB of the log file before it is rotated (default: 10240, ~10MB)"`
 	MaxMempool               uint64        `long:"maxmempool" description:"Maximum mempool size in MB (default: 300)"`
 	MaxOrphanTxs             int           `long:"maxorphantx" description:"Max number of orphan transactions to keep in memory"`
 	MaxPeers                 int           `long:"maxpeers" description:"Max number of inbound and outbound peers"`
@@ -421,6 +423,7 @@ func loadConfig() (*config, []string, error) {
 		RPCMaxConcurrentReqs:     defaultMaxRPCConcurrentReqs,
 		DataDir:                  defaultDataDir,
 		LogDir:                   defaultLogDir,
+		LogSize:                  defaultLogSizeKB,
 		DbType:                   defaultDbType,
 		RPCKey:                   defaultRPCKeyFile,
 		RPCCert:                  defaultRPCCertFile,
@@ -656,9 +659,18 @@ func loadConfig() (*config, []string, error) {
 		os.Exit(0)
 	}
 
+	// The log file size threshold must be positive.  A zero threshold would
+	// cause the log to rotate on every write.
+	if cfg.LogSize == 0 {
+		err := fmt.Errorf("%s: the logsize option may not be 0", funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
 	// Initialize log rotation.  After log rotation has been initialized, the
 	// logger variables may be used.
-	initLogRotator(filepath.Join(cfg.LogDir, defaultLogFilename))
+	initLogRotator(filepath.Join(cfg.LogDir, defaultLogFilename), int64(cfg.LogSize))
 
 	// Parse, validate, and set debug log level(s).
 	if err := parseAndSetDebugLevels(cfg.DebugLevel); err != nil {

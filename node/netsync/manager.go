@@ -1083,6 +1083,18 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		prevNode := prevNodeEl.Value.(*headerNode)
 		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
 			node.height = prevNode.height + 1
+
+			if err := blockchain.CheckCertificateVersion(
+				msgHeader.BlockCertificate(), node.height,
+				sm.chainParams,
+			); err != nil {
+				log.Warnf("Header from peer %s has a disallowed "+
+					"certificate version: %v -- disconnecting",
+					peer.Addr(), err)
+				peer.Disconnect()
+				return
+			}
+
 			e := sm.headerList.PushBack(&node)
 			if sm.startHeader == nil {
 				sm.startHeader = e

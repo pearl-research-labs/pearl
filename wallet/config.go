@@ -32,6 +32,7 @@ const (
 	defaultLogLevel         = "info"
 	defaultLogDirname       = "logs"
 	defaultLogFilename      = "oyster.log"
+	defaultLogSizeKB        = 10 * 1024
 	defaultRPCMaxClients    = 10
 	defaultRPCMaxWebsockets = 25
 )
@@ -64,6 +65,7 @@ type config struct {
 	NoInitialLoad   bool                    `long:"noinitialload" description:"Defer wallet creation/opening on startup and enable loading wallets over RPC"`
 	DebugLevel      string                  `short:"d" long:"debuglevel" description:"Logging level {trace, debug, info, warn, error, critical}"`
 	LogDir          string                  `long:"logdir" description:"Directory to log output."`
+	LogSize         uint32                  `long:"logsize" description:"Maximum size in KB of the log file before it is rotated (default: 10240, ~10MB)"`
 	Profile         string                  `long:"profile" description:"Enable HTTP profiling on given port -- NOTE port must be between 1024 and 65536"`
 	DBTimeout       time.Duration           `long:"dbtimeout" description:"The timeout value to use when opening the wallet database."`
 
@@ -272,6 +274,7 @@ func loadConfig() (*config, []string, error) {
 		ConfigFile:             cfgutil.NewExplicitString(defaultConfigFile),
 		AppDataDir:             cfgutil.NewExplicitString(defaultAppDataDir),
 		LogDir:                 defaultLogDir,
+		LogSize:                defaultLogSizeKB,
 		WalletPass:             wallet.InsecurePubPassphrase,
 		CAFile:                 cfgutil.NewExplicitString(""),
 		RPCKey:                 cfgutil.NewExplicitString(defaultRPCKeyFile),
@@ -451,9 +454,18 @@ func loadConfig() (*config, []string, error) {
 		os.Exit(0)
 	}
 
+	// The log file size threshold must be positive.  A zero threshold would
+	// cause the log to rotate on every write.
+	if cfg.LogSize == 0 {
+		err := fmt.Errorf("%s: the logsize option may not be 0", funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
 	// Initialize log rotation.  After log rotation has been initialized, the
 	// logger variables may be used.
-	initLogRotator(filepath.Join(cfg.LogDir, defaultLogFilename))
+	initLogRotator(filepath.Join(cfg.LogDir, defaultLogFilename), int64(cfg.LogSize))
 
 	// Parse, validate, and set debug log level(s).
 	if err := parseAndSetDebugLevels(cfg.DebugLevel); err != nil {

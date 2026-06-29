@@ -17,10 +17,10 @@ import (
 
 func TestMerkleBlock3(t *testing.T) {
 	blockStr := "" +
-		// ZKCertificate (212 bytes): Version(4) + BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData(8)
+		// CertificateV1 (212 bytes): Version(4) + BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData(8)
 		"01000000" + // Version (1 = ZK)
 		"0000000000000000000000000000000000000000000000000000000000000000" + // BlockHash (32 zeros)
-		// PublicData (164 bytes = 5×32 + 4 bytes, all zeros)
+		// PublicData (164 bytes = 5×32 + 4 bytes,, all zeros)
 		"0000000000000000000000000000000000000000000000000000000000000000" +
 		"0000000000000000000000000000000000000000000000000000000000000000" +
 		"0000000000000000000000000000000000000000000000000000000000000000" +

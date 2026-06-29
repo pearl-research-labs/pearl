@@ -8,7 +8,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 from pearl_gateway.blockchain_utils.pearl_block import PearlBlock
-from pearl_gateway.blockchain_utils.zk_certificate import PUBLICDATA_SIZE, ZKCertificate
+from pearl_gateway.blockchain_utils.zk_certificate import (
+    PUBLICDATA_SIZE,
+    CertificateVersion,
+    ZKCertificate,
+)
 from pearl_gateway.comm.dataclasses import (
     BlockTemplate,
     CommitmentHash,
@@ -69,6 +73,7 @@ def sample_block_template_data():
         "mutable": ["time", "transactions/add", "prevblock", "coinbase/append"],
         "noncerange": "00000000ffffffff",
         "capabilities": ["proposal"],
+        "requiredcertversion": 2,
     }
 
 
@@ -217,6 +222,7 @@ def sample_plain_proof():
         noise_rank=64,
         a_merkle_proof=a_matrix_proof,
         bt_merkle_proof=bt_matrix_proof,
+        moe=None,
     )
 
 
@@ -226,6 +232,7 @@ def sample_mining_job():
         {
             "incomplete_header_bytes": "AAAAICcOqViZtp4qeqp5mnm0R3Yl7+D2GJ/5coUqW1OAhhKyiYZG4kAi7Bg+/A440ZG+21mb+7on6Nyg4JUtABGkU8SLg39pAAABHg==",
             "target": 6901746346790563787434755862277025452451108972170386555162524223799296,
+            "cert_version": int(CertificateVersion.ZK_MOE),
         }
     )
 

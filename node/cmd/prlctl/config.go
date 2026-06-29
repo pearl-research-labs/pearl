@@ -94,6 +94,7 @@ func listCommands() {
 //
 // See loadConfig for details on the configuration load process.
 type config struct {
+	ShowHelp       bool   `no-flag:"true"`
 	ConfigFile     string `short:"C" long:"configfile" description:"Path to configuration file"`
 	ListCommands   bool   `short:"l" long:"listcommands" description:"List all of the supported commands and exit"`
 	NoTLS          bool   `long:"notls" description:"Disable TLS"`
@@ -209,31 +210,17 @@ func loadConfig() (*config, []string, error) {
 	_, err := preParser.Parse()
 	if err != nil {
 		if e, ok := err.(*flags.Error); ok && e.Type == flags.ErrHelp {
-			fmt.Fprintln(os.Stderr, err)
-			fmt.Fprintln(os.Stderr, "")
-			fmt.Fprintln(os.Stderr, "The special parameter `-` "+
-				"indicates that a parameter should be read "+
-				"from the\nnext unread line from standard "+
-				"input.")
-			return nil, nil, err
+			preCfg.ShowHelp = true
+			return &preCfg, nil, nil
 		}
 	}
+	if preCfg.ShowVersion || preCfg.ListCommands {
+		return &preCfg, nil, nil
+	}
 
-	// Show the version and exit if the version flag was specified.
 	appName := filepath.Base(os.Args[0])
 	appName = strings.TrimSuffix(appName, filepath.Ext(appName))
 	usageMessage := fmt.Sprintf("Use %s -h to show options", appName)
-	if preCfg.ShowVersion {
-		fmt.Println(appName, "version", version())
-		os.Exit(0)
-	}
-
-	// Show the available commands and exit if the associated flag was
-	// specified.
-	if preCfg.ListCommands {
-		listCommands()
-		os.Exit(0)
-	}
 
 	if _, err := os.Stat(preCfg.ConfigFile); os.IsNotExist(err) {
 		// Use config file for RPC server to create default prlctl config
@@ -250,25 +237,28 @@ func loadConfig() (*config, []string, error) {
 		}
 	}
 
-	// Load additional config from file.
-	parser := flags.NewParser(&cfg, flags.Default)
+	// Load additional config from file.  PrintErrors is intentionally
+	// omitted (unlike flags.Default) so that this function owns all error
+	// reporting via the returned error instead of go-flags also writing to
+	// stderr, which would print parse errors twice.
+	parser := flags.NewParser(&cfg, flags.HelpFlag|flags.PassDoubleDash)
 	err = flags.NewIniParser(parser).ParseFile(preCfg.ConfigFile)
 	if err != nil {
 		if _, ok := err.(*os.PathError); !ok {
-			fmt.Fprintf(os.Stderr, "Error parsing config file: %v\n",
-				err)
-			fmt.Fprintln(os.Stderr, usageMessage)
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("error parsing config file: %w\n%s",
+				err, usageMessage)
 		}
 	}
 
 	// Parse command line options again to ensure they take precedence.
-	remainingArgs, err := parser.Parse()
+	// args holds the positional arguments (the RPC command and its params).
+	args, err := parser.Parse()
 	if err != nil {
-		if e, ok := err.(*flags.Error); !ok || e.Type != flags.ErrHelp {
-			fmt.Fprintln(os.Stderr, usageMessage)
+		if e, ok := err.(*flags.Error); ok && e.Type == flags.ErrHelp {
+			cfg.ShowHelp = true
+			return &cfg, nil, nil
 		}
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%w\n%s", err, usageMessage)
 	}
 
 	// default network is mainnet
@@ -301,7 +291,6 @@ func loadConfig() (*config, []string, error) {
 		str := "%s: Multiple network params (testnet, testnet2, " +
 			"simnet, regtest, signet) can't be used together -- choose one"
 		err := fmt.Errorf(str, "loadConfig")
-		fmt.Fprintln(os.Stderr, err)
 		return nil, nil, err
 	}
 
@@ -321,7 +310,7 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	return &cfg, remainingArgs, nil
+	return &cfg, args, nil
 }
 
 // createDefaultConfigFile creates a basic config file at the given destination path.
@@ -379,7 +368,9 @@ func createDefaultConfigFile(destinationPath, serverConfigPath string) error {
 		destString += fmt.Sprintf("notls=%s\n", noTLSSubmatches[1])
 	}
 
-	dest.WriteString(destString)
+	if _, err := dest.WriteString(destString); err != nil {
+		return err
+	}
 
 	return nil
 }

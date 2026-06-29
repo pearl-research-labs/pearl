@@ -1,0 +1,102 @@
+use crate::v1::circuit::chip::blake3::program::DWORD_SIZE;
+use crate::v1::{
+    api::proof::{MiningConfiguration, PublicProofParams},
+    api::proof_utils::nbits_to_difficulty,
+    circuit::pearl_program::{TILE_D, TILE_H},
+    ensure_eq,
+};
+use anyhow::{Result, ensure};
+use log::info;
+use primitive_types::U256;
+
+pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<()> {
+    let k = public_params.common_dim();
+    let r = public_params.rank();
+    let h = public_params.h();
+    let w = public_params.w();
+    let m = public_params.m;
+    let n = public_params.n;
+    let t_rows = public_params.t_rows;
+    let t_cols = public_params.t_cols;
+    let dot_product_len = public_params.dot_product_length();
+    let worker_input_size = h.saturating_add(w).saturating_mul(dot_product_len);
+
+    // Currently, noise generation supports only these ranks: powers of 2 from 2^5 to 2^10.
+    ensure!(
+        r.is_power_of_two() && (32..=1024).contains(&r),
+        "Rank must be 2^5..2^10 || r={r}"
+    );
+    ensure!(r.is_multiple_of(TILE_D), "r must be divisible by {TILE_D} || r={r}");
+    ensure!(k <= (1 << 16), "k must be <= 2^16 || k={k}");
+    ensure!(k.is_multiple_of(64), "k must be divisible by 64 || k={k}");
+    ensure!(k <= 4 * r * r, "k must be no more than 4r^2 || k={k} r={r}");
+    ensure!(k >= 16 * r, "k must be >= 16r || k={k} r={r}");
+    ensure!(k >= 1024, "k must be >= 1024 || k={k}"); // required for collision resistance since matrices are padded to a multiple 1024
+    ensure!(
+        h.is_multiple_of(TILE_H) && w.is_multiple_of(TILE_H),
+        "Inner hash tile dimensions must be divisible by {TILE_H} || h={h} w={w}"
+    );
+    ensure!(h * w >= 32, "Inner hash size must be >= 32 || h={h} w={w}");
+    ensure!(
+        dot_product_len.is_multiple_of(DWORD_SIZE),
+        "dot_product_length must be divisible by DWORD_SIZE={DWORD_SIZE} || got {dot_product_len}"
+    );
+    ensure!(m <= (1 << 24), "m must be <= 2^24 || m={m}");
+    ensure!(n <= (1 << 24), "n must be <= 2^24 || n={n}");
+    ensure!(
+        worker_input_size <= (1 << 22),
+        "Worker input supported up to 4 MiB, got {} bytes",
+        worker_input_size
+    );
+    let rmax = public_params.mining_config.rows_pattern.max();
+    let cmax = public_params.mining_config.cols_pattern.max();
+    ensure!(t_rows + rmax < m, "t_rows={t_rows} + pattern max={rmax} must be < m={m}");
+    ensure!(t_cols + cmax < n, "t_cols={t_cols} + pattern max={cmax} must be < n={n}");
+    ensure_eq!(
+        public_params.mining_config.reserved,
+        MiningConfiguration::RESERVED_VALUE,
+        "Reserved must be {} bytes and all zeros",
+        MiningConfiguration::RESERVED_SIZE
+    );
+
+    Ok(())
+}
+
+/// Checks that `hash_jackpot` meets the difficulty requirement, using
+/// `nbits_override` instead of the header's nbits when provided.
+pub fn check_jackpot_difficulty_with_nbits(public_params: &PublicProofParams, nbits_override: Option<u32>) -> Result<()> {
+    let nbits = nbits_override.unwrap_or(public_params.block_header.nbits);
+    let jackpot_hash_bound = extract_difficulty_bound(nbits, &public_params.mining_config);
+    // hash_jackpot is interpreted as a little-endian 256-bit integer for the difficulty check
+    ensure!(
+        U256::from_little_endian(&public_params.hash_jackpot) <= jackpot_hash_bound,
+        "Jackpot condition not satisfied: hash does not meet difficulty target"
+    );
+    Ok(())
+}
+
+/// Computes difficulty bound for proof verification.
+///
+/// # Arguments
+/// * `nbits` - Bitcoin compact difficulty target
+/// * `config` - Mining configuration containing rank and pattern dimensions
+///
+/// # Returns
+/// * Adjusted difficulty bound as U256
+pub fn extract_difficulty_bound(nbits: u32, config: &MiningConfiguration) -> U256 {
+    let target_difficulty = nbits_to_difficulty(nbits);
+    let h = config.rows_pattern.size() as usize;
+    let w = config.cols_pattern.size() as usize;
+    let tile_size = h * w;
+    let difficulty_adjustment_factor = tile_size * config.dot_product_length();
+    if target_difficulty > U256::MAX / difficulty_adjustment_factor {
+        info!(
+            "Difficulty is too easy: hardness={} h*w*k={}",
+            U256::MAX / target_difficulty,
+            difficulty_adjustment_factor
+        );
+        U256::MAX
+    } else {
+        target_difficulty * difficulty_adjustment_factor
+    }
+}

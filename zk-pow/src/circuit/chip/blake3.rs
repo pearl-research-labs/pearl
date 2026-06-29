@@ -44,14 +44,17 @@ pub struct Blake3ControlFields<V: Copy> {
     pub is_use_commitment_hash: V,
     pub is_hash_a: V,
     pub is_hash_b: V,
+    pub is_hash_routing: V,
     pub is_hash_jackpot: V,
     pub is_cv_in: V,
     pub is_new_blake: V,
     pub is_last_round: V,
-    pub is_msg_mat: V,
-    pub is_msg_jackpot: V,
-    pub is_msg_aux_data: V,
-    pub is_msg_cv: V,
+    pub is_msg_bits: [V; 3],
+    pub is_first_outer: V,
+    pub is_second_outer: V,
+    /// Reconstructed outer index values from OUTER_INDICES_PACKED_PREP; set by the control packer.
+    pub outer_index_first: V,
+    pub outer_index_second: V,
 }
 
 impl<V: Copy> Blake3ControlFields<V> {
@@ -60,28 +63,39 @@ impl<V: Copy> Blake3ControlFields<V> {
         let is_use_commitment_hash = row_view.consume_single();
         let is_hash_a = row_view.consume_single();
         let is_hash_b = row_view.consume_single();
+        let is_hash_routing = row_view.consume_single();
         let is_hash_jackpot = row_view.consume_single();
         let is_cv_in = row_view.consume_single();
         let is_new_blake = row_view.consume_single();
         let is_last_round = row_view.consume_single();
-        let is_msg_mat = row_view.consume_single();
-        let is_msg_jackpot = row_view.consume_single();
-        let is_msg_aux_data = row_view.consume_single();
-        let is_msg_cv = row_view.consume_single();
+        let is_msg_bits = row_view.consume_few(3).try_into().unwrap();
+        let is_first_outer = row_view.consume_single();
+        let is_second_outer = row_view.consume_single();
+
         Self {
             is_use_job_key,
             is_use_commitment_hash,
             is_hash_a,
             is_hash_b,
+            is_hash_routing,
             is_hash_jackpot,
             is_cv_in,
             is_new_blake,
             is_last_round,
-            is_msg_mat,
-            is_msg_jackpot,
-            is_msg_aux_data,
-            is_msg_cv,
+            is_msg_bits,
+            is_first_outer,
+            is_second_outer,
+            // Placeholder values; must be completed via with_outer_indices before use.
+            outer_index_first: is_first_outer,
+            outer_index_second: is_second_outer,
         }
+    }
+
+    /// Returns a copy of self with the outer index values replaced by the given computed values.
+    pub(crate) fn with_outer_indices(mut self, first: V, second: V) -> Self {
+        self.outer_index_first = first;
+        self.outer_index_second = second;
+        self
     }
 }
 

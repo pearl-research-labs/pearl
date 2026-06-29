@@ -333,6 +333,7 @@ var helpDescsEnUS = map[string]string{
 	"getblocktemplateresult-capabilities":               "List of server capabilities including 'proposal' to indicate support for block proposals",
 	"getblocktemplateresult-reject-reason":              "Reason the proposal was invalid as-is (only applies to proposal responses)",
 	"getblocktemplateresult-default_witness_commitment": "The witness commitment itself. Will be populated if the block has witness data",
+	"getblocktemplateresult-requiredcertversion":        "Certificate version a block built on this template must carry under the MoE hardfork cutover (1 before the activation height, 2 at and after)",
 
 	// GetBlockTemplateCmd help.
 	"getblocktemplate--synopsis": "Returns a JSON object with information necessary to construct a block to mine or accepts a proposal to validate.\n" +
