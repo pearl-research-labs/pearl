@@ -497,7 +497,7 @@ var TestNetParams = Params{
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
 
-	MoEForkHeight: 38405,
+	MoEForkHeight: 1,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,

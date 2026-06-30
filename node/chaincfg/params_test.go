@@ -143,7 +143,7 @@ func TestShippedNetworksMoEForkHeights(t *testing.T) {
 		want   int32
 	}{
 		"mainnet":  {&MainNetParams, 71935},
-		"testnet":  {&TestNetParams, 38405},
+		"testnet":  {&TestNetParams, 1},
 		"testnet2": {&TestNet2Params, 54869},
 	}
 	for name, tt := range heights {
