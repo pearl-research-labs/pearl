@@ -255,6 +255,7 @@ var helpDescsEnUS = map[string]string{
 	"getblockverboseresult-previousblockhash": "The hash of the previous block",
 	"getblockverboseresult-nextblockhash":     "The hash of the next block (only if there is one)",
 	"getblockverboseresult-strippedsize":      "The size of the block without witness data",
+	"getblockverboseresult-proofcommitment":   "The proof commitment of the block",
 
 	// GetBlockCountCmd help.
 	"getblockcount--synopsis": "Returns the number of blocks in the longest block chain.",
@@ -286,6 +287,7 @@ var helpDescsEnUS = map[string]string{
 	"getblockheaderverboseresult-proofofwork":       "The proof-of-work of the block",
 	"getblockheaderverboseresult-previousblockhash": "The hash of the previous block",
 	"getblockheaderverboseresult-nextblockhash":     "The hash of the next block (only if there is one)",
+	"getblockheaderverboseresult-proofcommitment":   "The proof commitment of the block",
 
 	// TemplateRequest help.
 	"templaterequest-mode":         "This is 'template', 'proposal', or omitted",
