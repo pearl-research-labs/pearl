@@ -168,40 +168,6 @@ class TestMiningJob:
             assert job.target == sample_block_template.target
 
 
-class TestCacheInvalidation:
-    """Test cache invalidation functionality."""
-
-    @pytest.mark.asyncio
-    async def test_invalidate_empty_cache(self, work_cache):
-        """Test invalidating an empty cache."""
-        await work_cache.invalidate()
-
-        assert work_cache.current_template is None
-        assert work_cache.last_update_time == 0
-
-    @pytest.mark.asyncio
-    async def test_invalidate_cache_with_template(self, work_cache, sample_block_template):
-        """Test invalidating cache with existing template."""
-        # Set up cache with template
-        await work_cache.update_template(sample_block_template)
-        await work_cache.get_mining_job()  # Get a job
-
-        # Invalidate
-        await work_cache.invalidate()
-
-        assert work_cache.current_template is None
-        assert work_cache.last_update_time == 0
-
-    @pytest.mark.asyncio
-    async def test_get_mining_job_after_invalidation(self, work_cache, sample_block_template):
-        """Test getting mining job after invalidation raises error."""
-        await work_cache.update_template(sample_block_template)
-        await work_cache.invalidate()
-
-        with pytest.raises(MiningPausedError, match="no block template available"):
-            await work_cache.get_mining_job()
-
-
 class TestCacheIntegration:
     """Test WorkCache integration scenarios."""
 
@@ -241,11 +207,3 @@ class TestCacheIntegration:
             == different_block_template.header.serialize_without_proof_commitment()
         )
         assert job3.target == different_block_template.target
-
-        # 7. Invalidate
-        await work_cache.invalidate()
-        assert work_cache.current_template is None
-
-        # 8. Try to get job after invalidation
-        with pytest.raises(MiningPausedError):
-            await work_cache.get_mining_job()

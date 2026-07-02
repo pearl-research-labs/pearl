@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -49,6 +49,23 @@ class MinerRpcConfig(BaseSettings):
             raise ValueError("UDS transport requires socket_path")
 
 
+class ProofConfig(BaseSettings):
+    """ZK proof generation worker configuration.
+
+    Proof generation is CPU-bound and holds the GIL, so it runs in a warmed
+    worker process off the gateway's event loop.
+
+    Environment variables override defaults:
+    - GATEWAY_PROOF_MAX_PENDING
+    """
+
+    model_config = SettingsConfigDict(env_prefix="GATEWAY_PROOF_")
+
+    # Max proof submissions queued before new ones are rejected (enforced at
+    # the RPC boundary), bounding gateway memory when miners outpace the worker.
+    max_pending: int = Field(default=64, ge=1)
+
+
 class PearlGatewayConfig(BaseModel):
     """Complete PearlGateway configuration.
 
@@ -58,6 +75,7 @@ class PearlGatewayConfig(BaseModel):
 
     pearl: PearlConfig
     miner_rpc: MinerRpcConfig
+    proof: ProofConfig
 
 
 def load_config() -> PearlGatewayConfig:
@@ -73,4 +91,5 @@ def load_config() -> PearlGatewayConfig:
     return PearlGatewayConfig(
         pearl=PearlConfig(),
         miner_rpc=MinerRpcConfig(),
+        proof=ProofConfig(),
     )

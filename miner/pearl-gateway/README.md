@@ -48,6 +48,7 @@ sequenceDiagram
     participant Miner
     participant AsyncLoopManager
     participant Gateway
+    participant ProofPool
     participant ProofGenerator
     participant PearlNode
 
@@ -55,9 +56,16 @@ sequenceDiagram
     AsyncLoopManager->>AsyncLoopManager: secondary_testing (uses noised)
     AsyncLoopManager->>AsyncLoopManager: create_proof (uses non-noised A, B)
     AsyncLoopManager->>Gateway: submitPlainProof(base64_string)
-    Gateway->>ProofGenerator: generate_block(PlainProof)
-    ProofGenerator->>PearlNode: submit block
+    Gateway->>ProofPool: prove(cert_version, header, plain_proof) [worker process]
+    ProofPool-->>Gateway: (public_data, proof_data)
+    Gateway->>ProofGenerator: build_block(public_data, proof_data, template)
+    ProofGenerator-->>Gateway: PearlBlock
+    Gateway->>PearlNode: submit block
 ```
+
+ZK proof generation is CPU-bound and holds the GIL, so it runs in a separate
+worker process (the `ProofPool`) rather than on the gateway's event loop; the
+loop assembles and submits the block from the returned proof bytes.
 
 
 ### Installation
@@ -97,6 +105,16 @@ All configuration can be set via environment variables:
 
 **Logging:**
 - `LOGGING_LEVEL` - Log level: `debug`, `info`, `warning`, `error` (default: `info`)
+
+**Proof Generation:**
+
+ZK proof generation is CPU-bound and holds the GIL, so it runs in a warmed
+worker process off the gateway's event loop.
+
+- `GATEWAY_PROOF_MAX_PENDING` - Max proof submissions queued before new ones
+  are rejected (positive integer, default: `64`). Enforced when a submission
+  arrives, bounding gateway memory if a miner outpaces the worker; excess
+  submissions are rejected rather than queued unboundedly.
 
 ## Usage
 

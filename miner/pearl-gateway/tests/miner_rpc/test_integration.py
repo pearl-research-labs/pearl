@@ -55,7 +55,7 @@ class TestMinerRpcIntegrationTcp:
             port=18446,
         )
 
-        server = MinerRpcServer(work_cache, submission_service, config)
+        server = MinerRpcServer(work_cache, submission_service, config, max_pending_submissions=64)
         await server.start()
 
         yield server, work_cache, submission_service
@@ -79,7 +79,7 @@ class TestMinerRpcIntegrationTcp:
             port=18447,
         )
 
-        server = MinerRpcServer(work_cache, submission_service, config)
+        server = MinerRpcServer(work_cache, submission_service, config, max_pending_submissions=64)
         await server.start()
 
         yield server, work_cache, submission_service
@@ -227,7 +227,7 @@ class TestMinerRpcIntegrationUds:
             socket_path=socket_path,
         )
 
-        server = MinerRpcServer(work_cache, submission_service, config)
+        server = MinerRpcServer(work_cache, submission_service, config, max_pending_submissions=64)
         await server.start()
 
         yield server, work_cache, submission_service, socket_path
@@ -300,7 +300,7 @@ class TestMinerRpcStressTests:
 
         config = MinerRpcConfig(transport="tcp", socket_path="", port=18448)
 
-        server = MinerRpcServer(work_cache, submission_service, config)
+        server = MinerRpcServer(work_cache, submission_service, config, max_pending_submissions=64)
         await server.start()
 
         yield server, work_cache, submission_service
@@ -376,7 +376,7 @@ class TestMinerRpcErrorScenarios:
 
         config = MinerRpcConfig(transport="tcp", socket_path="", port=18449)
 
-        server = MinerRpcServer(work_cache, submission_service, config)
+        server = MinerRpcServer(work_cache, submission_service, config, max_pending_submissions=64)
         await server.start()
 
         yield server, work_cache, submission_service

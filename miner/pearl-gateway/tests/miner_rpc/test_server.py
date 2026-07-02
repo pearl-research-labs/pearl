@@ -3,6 +3,7 @@ Unit tests for MinerRpcServer.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
@@ -71,7 +72,9 @@ class TestMinerRpcServerInit:
 
     def test_init_with_tcp_config(self, mock_work_cache, mock_submission_service, tcp_config):
         """Test server initialization with TCP config."""
-        server = MinerRpcServer(mock_work_cache, mock_submission_service, tcp_config)
+        server = MinerRpcServer(
+            mock_work_cache, mock_submission_service, tcp_config, max_pending_submissions=64
+        )
 
         assert server.work_cache == mock_work_cache
         assert server.submission_service == mock_submission_service
@@ -81,7 +84,9 @@ class TestMinerRpcServerInit:
 
     def test_init_with_uds_config(self, mock_work_cache, mock_submission_service, uds_config):
         """Test server initialization with UDS config."""
-        server = MinerRpcServer(mock_work_cache, mock_submission_service, uds_config)
+        server = MinerRpcServer(
+            mock_work_cache, mock_submission_service, uds_config, max_pending_submissions=64
+        )
 
         assert server.work_cache == mock_work_cache
         assert server.submission_service == mock_submission_service
@@ -91,7 +96,9 @@ class TestMinerRpcServerInit:
 
     def test_init_without_auth(self, mock_work_cache, mock_submission_service, no_auth_config):
         """Test server initialization without authentication."""
-        server = MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
+        server = MinerRpcServer(
+            mock_work_cache, mock_submission_service, no_auth_config, max_pending_submissions=64
+        )
 
         assert server.work_cache == mock_work_cache
         assert server.submission_service == mock_submission_service
@@ -105,7 +112,9 @@ class TestMinerRpcServerTransport:
 
     @pytest.fixture
     def server(self, mock_work_cache, mock_submission_service, tcp_config):
-        return MinerRpcServer(mock_work_cache, mock_submission_service, tcp_config)
+        return MinerRpcServer(
+            mock_work_cache, mock_submission_service, tcp_config, max_pending_submissions=64
+        )
 
     @pytest.fixture
     def uds_server(self, mock_work_cache, mock_submission_service):
@@ -113,7 +122,9 @@ class TestMinerRpcServerTransport:
             transport="uds",
             socket_path=tempfile.mktemp(suffix=".sock"),
         )
-        return MinerRpcServer(mock_work_cache, mock_submission_service, config)
+        return MinerRpcServer(
+            mock_work_cache, mock_submission_service, config, max_pending_submissions=64
+        )
 
     async def test_start_stop_tcp(self, server):
         """Test starting and stopping TCP server."""
@@ -156,7 +167,9 @@ class TestMinerRpcServerHandlers:
 
     @pytest.fixture
     def server(self, mock_work_cache, mock_submission_service, no_auth_config):
-        return MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
+        return MinerRpcServer(
+            mock_work_cache, mock_submission_service, no_auth_config, max_pending_submissions=64
+        )
 
     async def test_handle_submit_plain_proof(
         self, server, sample_plain_proof, sample_mining_job, sample_block_template
@@ -173,13 +186,78 @@ class TestMinerRpcServerHandlers:
             sample_plain_proof, sample_block_template
         )
 
+    async def test_handle_submit_plain_proof_drops_stale_job(
+        self, server, sample_plain_proof, sample_block_template
+    ):
+        """A submission whose job no longer matches the current template is dropped."""
+        server.work_cache.current_template = sample_block_template
+        stale_job = MiningJob(incomplete_header_bytes=b"\x00" * 76, target=1)
+
+        await server.handle_submit_plain_proof(sample_plain_proof, stale_job)
+
+        server.submission_service.submit_plain_proof.assert_not_called()
+
+    async def test_handle_submit_plain_proof_drops_without_template(
+        self, server, sample_plain_proof, sample_mining_job
+    ):
+        """A queued submission is dropped (not raised) when no template is available."""
+        server.work_cache.current_template = None
+
+        await server.handle_submit_plain_proof(sample_plain_proof, sample_mining_job)
+
+        server.submission_service.submit_plain_proof.assert_not_called()
+
+    async def test_submission_consumer_processes_queued_submissions(
+        self, server, sample_plain_proof, sample_mining_job, sample_block_template
+    ):
+        """The consumer drains the queue and hands each submission to the service."""
+        server.work_cache.current_template = sample_block_template
+        server.submission_service.submit_plain_proof.return_value = {"status": "accepted"}
+
+        server._submission_queue.put_nowait((sample_plain_proof, sample_mining_job))
+        consumer = asyncio.create_task(server._consume_submissions())
+        try:
+            await asyncio.wait_for(server._submission_queue.join(), timeout=5)
+        finally:
+            consumer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer
+
+        server.submission_service.submit_plain_proof.assert_called_once_with(
+            sample_plain_proof, sample_block_template
+        )
+
+    async def test_submission_consumer_survives_handler_errors(
+        self, server, sample_plain_proof, sample_mining_job, sample_block_template
+    ):
+        """One failing submission must not stall the consumer for later ones."""
+        server.work_cache.current_template = sample_block_template
+        server.submission_service.submit_plain_proof.side_effect = [
+            RuntimeError("proof worker died"),
+            {"status": "accepted"},
+        ]
+
+        server._submission_queue.put_nowait((sample_plain_proof, sample_mining_job))
+        server._submission_queue.put_nowait((sample_plain_proof, sample_mining_job))
+        consumer = asyncio.create_task(server._consume_submissions())
+        try:
+            await asyncio.wait_for(server._submission_queue.join(), timeout=5)
+        finally:
+            consumer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer
+
+        assert server.submission_service.submit_plain_proof.call_count == 2
+
 
 class TestMinerRpcServerJsonRpc:
     """Test JSON-RPC request handling."""
 
     @pytest.fixture
     def server(self, mock_work_cache, mock_submission_service, no_auth_config):
-        return MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
+        return MinerRpcServer(
+            mock_work_cache, mock_submission_service, no_auth_config, max_pending_submissions=64
+        )
 
     @pytest.fixture
     def mock_client(self):
@@ -234,6 +312,31 @@ class TestMinerRpcServerJsonRpc:
         assert response["id"] == 2
         assert response.get("error") is None
         assert response["result"] == "submitted"
+
+    async def test_submit_plain_proof_rejected_when_queue_full(
+        self, server, sample_block_template, submit_plain_proof_params, mock_client
+    ):
+        """A flood of submissions is rejected once the queue capacity is reached."""
+        server.work_cache.current_template = sample_block_template
+        while not server._submission_queue.full():
+            server._submission_queue.put_nowait((None, None))
+
+        request_line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "submitPlainProof",
+                "params": submit_plain_proof_params,
+                "id": 3,
+            }
+        )
+
+        response = await server._process_request(request_line, mock_client)
+
+        assert response["id"] == 3
+        assert response.get("result") is None
+        assert response["error"]["message"] == "proof submission queue full"
+        # Rejected before anything was enqueued for processing.
+        server.submission_service.submit_plain_proof.assert_not_called()
 
     async def test_invalid_json_request(self, server, mock_client):
         """Test handling of invalid JSON."""
@@ -342,7 +445,9 @@ class TestMinerRpcServerIntegration:
             socket_path="",  # Required field
             port=18445,  # Use different port to avoid conflicts
         )
-        server = MinerRpcServer(mock_work_cache, mock_submission_service, config)
+        server = MinerRpcServer(
+            mock_work_cache, mock_submission_service, config, max_pending_submissions=64
+        )
         await server.start()
         yield server
         await server.stop()

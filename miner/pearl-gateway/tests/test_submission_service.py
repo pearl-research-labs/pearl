@@ -20,9 +20,17 @@ def mock_pearl_client():
 
 
 @pytest.fixture
-def submission_service(mock_pearl_client):
+def fake_proof_pool():
+    """A stand-in ProofPool whose prove() returns dummy proof bytes."""
+    pool = MagicMock()
+    pool.prove = AsyncMock(return_value=(b"public-data", b"proof-data"))
+    return pool
+
+
+@pytest.fixture
+def submission_service(mock_pearl_client, fake_proof_pool):
     """Create a SubmissionService instance for testing."""
-    return SubmissionService(mock_pearl_client)
+    return SubmissionService(mock_pearl_client, fake_proof_pool)
 
 
 def create_mock_block(hex_data: str):
@@ -40,6 +48,7 @@ class TestBlockSubmission:
         self,
         submission_service,
         mock_pearl_client,
+        fake_proof_pool,
         sample_plain_proof,
         sample_block_template,
         sample_pearl_block,
@@ -48,15 +57,26 @@ class TestBlockSubmission:
         mock_pearl_client.submit_block.return_value = "accepted"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
             return_value=sample_pearl_block,
-        ):
+        ) as mock_build_block:
             result = await submission_service.submit_plain_proof(
                 sample_plain_proof, sample_block_template
             )
 
         assert result["status"] == "accepted"
 
+        # The proof is generated in the worker via the serialized boundary args.
+        fake_proof_pool.prove.assert_awaited_once_with(
+            int(sample_block_template.required_cert_version),
+            sample_block_template.header.serialize_without_proof_commitment(),
+            sample_plain_proof.to_base64(),
+            False,
+        )
+        # The block is assembled in-process from the worker's proof bytes.
+        mock_build_block.assert_called_once_with(
+            b"public-data", b"proof-data", sample_block_template
+        )
         mock_pearl_client.submit_block.assert_called_once_with(sample_pearl_block.serialize().hex())
 
     @pytest.mark.asyncio
@@ -72,7 +92,7 @@ class TestBlockSubmission:
         mock_pearl_client.submit_block.return_value = "rejected: invalid proof"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
             return_value=sample_pearl_block,
         ):
             result = await submission_service.submit_plain_proof(
@@ -95,7 +115,7 @@ class TestBlockSubmission:
 
         with (
             patch(
-                "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+                "pearl_gateway.proof_generator.ProofGenerator.build_block",
                 return_value=sample_pearl_block,
             ),
         ):
@@ -129,7 +149,7 @@ class TestBlockSubmission:
         mock_pearl_client.submit_block.side_effect = mock_submit_with_delay
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
             side_effect=[sample_pearl_block, sample_pearl_block],
         ):
             # Submit two blocks concurrently with same template
@@ -190,14 +210,15 @@ class TestCrossoverEnforcement:
         mock_pearl_client.submit_block.return_value = "accepted"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
             return_value=sample_pearl_block,
         ) as mock_generate:
             result = await submission_service.submit_plain_proof(sample_plain_proof, v1_template)
 
         assert result["status"] == "accepted"
-        # The block must be generated for the V1-required template.
-        passed_template = mock_generate.call_args.args[1]
+        # The block must be assembled for the V1-required template
+        # (build_block signature: public_data, proof_data, template).
+        passed_template = mock_generate.call_args.args[2]
         assert passed_template.required_cert_version == CertificateVersion.ZK_DENSE
 
 
@@ -228,7 +249,7 @@ class TestSubmissionServiceIntegration:
         for _ in range(4):
             submission_service.submission_log.clear()  # Clear to simulate different blocks
             with patch(
-                "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+                "pearl_gateway.proof_generator.ProofGenerator.build_block",
                 return_value=sample_pearl_block,
             ):
                 try:
