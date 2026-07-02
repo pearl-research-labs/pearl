@@ -2,6 +2,7 @@ import { ipcMain } from 'electron';
 import { ManagerService } from '../services/manager-service';
 import { BlockbookClient } from '../clients/blockbook-client';
 import { broadcastPearlTx, fetchPrlBalanceGrains, fetchPrlUtxos } from '../services/pearl-rpc';
+import { loadMultisigState, saveMultisigState } from '../services/multisig-store';
 
 function registerWalletIpc(ms: ManagerService) {
   ipcMain.handle('wallet-unlock', async (_event, passphrase: string, timeout: number = 60) => {
@@ -62,6 +63,8 @@ function registerWalletIpc(ms: ManagerService) {
   ipcMain.handle('wallet-estimate-fee', (_event, numBlocks: number) =>
     BlockbookClient.estimateFee(numBlocks)
   );
+  ipcMain.handle('wallet-get-multisig-state', () => loadMultisigState());
+  ipcMain.handle('wallet-save-multisig-state', (_event, state) => saveMultisigState(state));
 }
 
 export { registerWalletIpc };

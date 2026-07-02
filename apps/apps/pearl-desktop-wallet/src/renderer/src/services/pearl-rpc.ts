@@ -1,4 +1,4 @@
-import { PEARL_RPC_POOL, pearlParams, type PearlNetwork } from "../chains/pearl/network";
+import { PEARL_MAINNET } from "../chains/pearl/network";
 
 interface RpcResult<T> {
   jsonrpc?: string;
@@ -29,46 +29,43 @@ interface RawTx {
   confirmations?: number;
 }
 
-const ENDPOINT_COOLDOWN_MS = 60_000;
-const endpointUnhealthyUntil = new Map<string, number>();
-
-function isEndpointHealthy(url: string, now: number): boolean {
-  return now >= (endpointUnhealthyUntil.get(url) ?? 0);
-}
-
-function markEndpointUnhealthy(url: string, now: number): void {
-  endpointUnhealthyUntil.set(url, now + ENDPOINT_COOLDOWN_MS);
-}
-
-function candidateEndpoints(): string[] {
-  return [...PEARL_RPC_POOL];
-}
-
-function orderedAttempts(candidates: string[], now: number): string[] {
-  const healthy: string[] = [];
-  const cooled: string[] = [];
-  for (const url of candidates) {
-    if (isEndpointHealthy(url, now)) healthy.push(url);
-    else cooled.push(url);
-  }
-  return healthy.length > 0 ? [...healthy, ...cooled] : cooled;
-}
-
-function isTransientHttpStatus(status: number): boolean {
-  if (status >= 500 && status < 600) return true;
-  if (status === 408 || status === 429) return true;
-  return false;
-}
-
 const PER_ENDPOINT_ATTEMPTS = 2;
 const INTRA_ENDPOINT_BACKOFF_MS = 250;
+const PEARL_RPC_URL = PEARL_MAINNET.rpcUrl;
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    const parts = [err.name, err.message].filter(Boolean);
+    const cause = (err as Error & { cause?: unknown }).cause;
+    if (cause instanceof Error) {
+      parts.push(`cause=${cause.name}: ${cause.message}`);
+    } else if (cause && typeof cause === "object") {
+      const c = cause as Record<string, unknown>;
+      const extra = [c.code, c.errno, c.syscall, c.address, c.port, c.path]
+        .filter((value) => value !== undefined && value !== null && value !== "")
+        .map(String);
+      if (extra.length > 0) {
+        parts.push(`cause=${extra.join(" ")}`);
+      } else {
+        parts.push(`cause=${JSON.stringify(cause)}`);
+      }
+    }
+    return parts.join(": ");
+  }
+  return String(err);
+}
 
 async function fetchOnce<T>(url: string, method: string, params: unknown[]): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
+    });
+  } catch (err) {
+    throw new Error(`rpc fetch ${url} failed for ${method}: ${describeError(err)}`);
+  }
   if (!res.ok) {
     throw new Error(`rpc http ${res.status}`);
   }
@@ -80,42 +77,23 @@ async function fetchOnce<T>(url: string, method: string, params: unknown[]): Pro
   return body.result;
 }
 
-function isRetryableSameEndpoint(err: unknown): boolean {
-  if (err instanceof TypeError) return true;
-  if (err instanceof Error) {
-    const m = /^rpc http (\d+)$/.exec(err.message);
-    if (m) return isTransientHttpStatus(Number(m[1]));
-  }
-  return false;
-}
-
-function isChainLevelError(err: unknown): boolean {
-  return err instanceof Error && /^rpc -?\d+:/.test(err.message);
-}
-
 async function call<T>(method: string, params: unknown[]): Promise<T> {
-  const now = Date.now();
-  const attempts = orderedAttempts(candidateEndpoints(), now);
   let lastErr: unknown;
-  for (const url of attempts) {
-    let endpointFailedAllAttempts = true;
-    for (let attempt = 0; attempt < PER_ENDPOINT_ATTEMPTS; attempt++) {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, INTRA_ENDPOINT_BACKOFF_MS));
-      try {
-        return await fetchOnce<T>(url, method, params);
-      } catch (err) {
-        lastErr = err;
-        if (isChainLevelError(err)) throw err;
-        if (isRetryableSameEndpoint(err)) continue;
-        endpointFailedAllAttempts = false;
-        throw err;
-      }
+  for (let attempt = 0; attempt < PER_ENDPOINT_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, INTRA_ENDPOINT_BACKOFF_MS));
     }
-    if (endpointFailedAllAttempts) {
-      markEndpointUnhealthy(url, Date.now());
+    try {
+      return await fetchOnce<T>(PEARL_RPC_URL, method, params);
+    } catch (err) {
+      lastErr = err;
+      if (err instanceof Error && /^rpc -?\d+:/.test(err.message)) throw err;
+      if (err instanceof Error && /^rpc fetch .* failed for /.test(err.message)) continue;
+      if (err instanceof TypeError) continue;
+      throw err;
     }
   }
-  throw lastErr ?? new Error("rpc pool exhausted");
+  throw lastErr ?? new Error("rpc endpoint exhausted");
 }
 
 function prlToGrains(value: number): bigint {

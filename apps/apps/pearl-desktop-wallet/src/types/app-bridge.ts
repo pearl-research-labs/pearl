@@ -78,6 +78,18 @@ interface WalletApi {
   validateAddress: (address: string) => Promise<{ isValid: boolean }>;
 
   estimateFee: (numBlocks: number) => Promise<number>;
+
+  getMultisigState: () => Promise<{
+    vaults: unknown[];
+    pendingTxs: unknown[];
+    sentTxs: unknown[];
+  }>;
+
+  saveMultisigState: (state: {
+    vaults: unknown[];
+    pendingTxs: unknown[];
+    sentTxs: unknown[];
+  }) => Promise<void>;
 }
 
 interface ManagerApi {

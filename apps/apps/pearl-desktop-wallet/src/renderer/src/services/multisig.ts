@@ -25,6 +25,7 @@ const PER_INPUT_VBYTES_MULTISIG = 100n;
 const PER_P2TR_OUTPUT_VBYTES = 43n;
 const FIXED_OVERHEAD_VBYTES = 11n;
 const DUST_LIMIT_GRAINS = 546n;
+const EMPTY_STATE: PersistedState = { vaults: [], pendingTxs: [], sentTxs: [] };
 
 export interface VaultRecord {
   id: string;
@@ -178,32 +179,56 @@ function newUuid(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 }
 
-function loadState(): PersistedState {
+function normalizePersistedState(value: unknown): PersistedState {
+  if (!value || typeof value !== "object") {
+    return EMPTY_STATE;
+  }
+  const parsed = value as Partial<PersistedState>;
+  return {
+    vaults: Array.isArray(parsed.vaults) ? (parsed.vaults as VaultRecord[]) : [],
+    pendingTxs: Array.isArray(parsed.pendingTxs) ? (parsed.pendingTxs as VaultPendingTxRecord[]) : [],
+    sentTxs: Array.isArray(parsed.sentTxs) ? (parsed.sentTxs as VaultSentTxRecord[]) : [],
+  };
+}
+
+function readLegacyLocalState(): PersistedState | null {
   if (typeof localStorage === "undefined") {
-    return { vaults: [], pendingTxs: [], sentTxs: [] };
+    return null;
   }
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { vaults: [], pendingTxs: [], sentTxs: [] };
-    const parsed = JSON.parse(raw) as Partial<PersistedState>;
-    return {
-      vaults: Array.isArray(parsed.vaults) ? (parsed.vaults as VaultRecord[]) : [],
-      pendingTxs: Array.isArray(parsed.pendingTxs) ? (parsed.pendingTxs as VaultPendingTxRecord[]) : [],
-      sentTxs: Array.isArray(parsed.sentTxs) ? (parsed.sentTxs as VaultSentTxRecord[]) : [],
-    };
+    if (!raw) return null;
+    return normalizePersistedState(JSON.parse(raw));
   } catch {
-    return { vaults: [], pendingTxs: [], sentTxs: [] };
+    return null;
   }
 }
 
-function saveState(state: PersistedState): void {
-  if (typeof localStorage === "undefined") return;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+async function loadState(): Promise<PersistedState> {
+  if (typeof window === "undefined" || !window.appBridge?.wallet?.getMultisigState) {
+    return EMPTY_STATE;
+  }
+  const state = normalizePersistedState(await window.appBridge.wallet.getMultisigState());
+  if (state.vaults.length === 0 && state.pendingTxs.length === 0 && state.sentTxs.length === 0) {
+    const legacy = readLegacyLocalState();
+    if (legacy && (legacy.vaults.length > 0 || legacy.pendingTxs.length > 0 || legacy.sentTxs.length > 0)) {
+      await saveState(legacy);
+      return legacy;
+    }
+  }
+  return state;
 }
 
-function updateState(mutator: (state: PersistedState) => PersistedState): PersistedState {
-  const next = mutator(loadState());
-  saveState(next);
+async function saveState(state: PersistedState): Promise<void> {
+  if (typeof window === "undefined" || !window.appBridge?.wallet?.saveMultisigState) {
+    return;
+  }
+  await window.appBridge.wallet.saveMultisigState(state);
+}
+
+async function updateState(mutator: (state: PersistedState) => PersistedState): Promise<PersistedState> {
+  const next = mutator(await loadState());
+  await saveState(next);
   return next;
 }
 
@@ -458,11 +483,13 @@ export function importCosignerDescriptor(json: string): {
 }
 
 export async function listVaults(): Promise<VaultRecord[]> {
-  return [...loadState().vaults].sort((a, b) => b.createdAt - a.createdAt);
+  const state = await loadState();
+  return [...state.vaults].sort((a, b) => b.createdAt - a.createdAt);
 }
 
 export async function getVault(id: string): Promise<VaultRecord | undefined> {
-  return loadState().vaults.find((v) => v.id === id);
+  const state = await loadState();
+  return state.vaults.find((v) => v.id === id);
 }
 
 async function getBroadcastTxInfo(txid: string): Promise<BroadcastTxInfo | null> {
@@ -484,7 +511,7 @@ async function getBroadcastTxInfo(txid: string): Promise<BroadcastTxInfo | null>
 }
 
 async function syncBroadcastTxs(vaultId: string): Promise<void> {
-  const state = loadState();
+  const state = await loadState();
   const trackedTxids = new Set<string>();
   const expectedTxidUpdates = new Map<string, string>();
   const pendingIdsToRemove = new Set<string>();
@@ -516,7 +543,7 @@ async function syncBroadcastTxs(vaultId: string): Promise<void> {
 
   if (trackedTxids.size === 0) {
     if (changed) {
-      updateState((current) => {
+      await updateState((current) => {
         let next = current;
         if (expectedTxidUpdates.size > 0) {
           next = {
@@ -579,7 +606,7 @@ async function syncBroadcastTxs(vaultId: string): Promise<void> {
   }
 
   if (changed) {
-    updateState((current) => {
+    await updateState((current) => {
       let next = current;
       if (expectedTxidUpdates.size > 0) {
         next = {
@@ -609,7 +636,7 @@ async function syncBroadcastTxs(vaultId: string): Promise<void> {
 }
 
 export async function deleteVault(id: string): Promise<void> {
-  updateState((state) => ({
+  await updateState((state) => ({
     vaults: state.vaults.filter((v) => v.id !== id),
     pendingTxs: state.pendingTxs.filter((p) => p.vaultId !== id),
     sentTxs: state.sentTxs.filter((p) => p.vaultId !== id),
@@ -656,7 +683,7 @@ export async function createVault(input: {
     createdAt: Date.now(),
   };
 
-  updateState((state) => ({ ...state, vaults: [record, ...state.vaults.filter((v) => v.id !== record.id)] }));
+  await updateState((state) => ({ ...state, vaults: [record, ...state.vaults.filter((v) => v.id !== record.id)] }));
   return record;
 }
 
@@ -1039,39 +1066,43 @@ export async function broadcastVaultTx(rawHex: string): Promise<string> {
 
 export async function listPendingTxs(vaultId: string): Promise<VaultPendingTxRecord[]> {
   await syncBroadcastTxs(vaultId);
-  return [...loadState().pendingTxs.filter((p) => p.vaultId === vaultId)].sort((a, b) => b.createdAt - a.createdAt);
+  const state = await loadState();
+  return [...state.pendingTxs.filter((p) => p.vaultId === vaultId)].sort((a, b) => b.createdAt - a.createdAt);
 }
 
 export async function listSentTxs(vaultId: string): Promise<VaultSentTxRecord[]> {
-  return [...loadState().sentTxs.filter((p) => p.vaultId === vaultId)].sort((a, b) => b.time - a.time);
+  const state = await loadState();
+  return [...state.sentTxs.filter((p) => p.vaultId === vaultId)].sort((a, b) => b.time - a.time);
 }
 
 export async function getPendingTx(id: string): Promise<VaultPendingTxRecord | undefined> {
-  const pending = loadState().pendingTxs.find((p) => p.id === id);
+  const state = await loadState();
+  const pending = state.pendingTxs.find((p) => p.id === id);
   if (!pending || (!pending.expectedTxid && !pending.txid)) {
     return pending;
   }
   await syncBroadcastTxs(pending.vaultId);
-  return loadState().pendingTxs.find((p) => p.id === id);
+  return (await loadState()).pendingTxs.find((p) => p.id === id);
 }
 
 export async function getSentTx(id: string): Promise<VaultSentTxRecord | undefined> {
-  return loadState().sentTxs.find((p) => p.id === id);
+  const state = await loadState();
+  return state.sentTxs.find((p) => p.id === id);
 }
 
 export async function savePendingTx(rec: VaultPendingTxRecord): Promise<void> {
-  updateState((state) => ({
+  await updateState((state) => ({
     ...state,
     pendingTxs: [rec, ...state.pendingTxs.filter((p) => p.id !== rec.id)],
   }));
 }
 
 export async function saveSentTx(rec: VaultSentTxRecord): Promise<void> {
-  updateState((state) => upsertSentTx(state, rec));
+  await updateState((state) => upsertSentTx(state, rec));
 }
 
 export async function deletePendingTx(id: string): Promise<void> {
-  updateState((state) => ({ ...state, pendingTxs: state.pendingTxs.filter((p) => p.id !== id) }));
+  await updateState((state) => ({ ...state, pendingTxs: state.pendingTxs.filter((p) => p.id !== id) }));
 }
 
 export async function persistComposedAsPending(opts: {

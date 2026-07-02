@@ -1,9 +1,4 @@
-const PEARL_RPC_POOL: readonly string[] = [
-  "https://rpc.pearlbridge.xyz/",
-  "https://pearl-sentry-fsn1-1.pearlbridge.xyz/rpc",
-  "https://pearl-sentry-nbg1-1.pearlbridge.xyz/rpc",
-  "https://pearl-sentry-hel1-1.pearlbridge.xyz/rpc",
-];
+import { PEARL_MAINNET } from "../../shared/chains/pearl/network";
 
 interface RpcResult<T> {
   result: T | null;
@@ -31,38 +26,46 @@ interface RawTx {
   vout: RawTxVout[];
 }
 
-const ENDPOINT_COOLDOWN_MS = 60_000;
-const endpointUnhealthyUntil = new Map<string, number>();
+const PEARL_RPC_URL = PEARL_MAINNET.rpcUrl;
 const PER_ENDPOINT_ATTEMPTS = 2;
 const INTRA_ENDPOINT_BACKOFF_MS = 250;
 const MAX_UTXO_WALK_PAGES = 60;
 const MAX_UTXO_WALK_PAGES_HARD = 200;
 const MAX_RPC_PAGE_LENGTH = 500;
 
-function isEndpointHealthy(url: string, now: number): boolean {
-  return now >= (endpointUnhealthyUntil.get(url) ?? 0);
-}
-
-function markEndpointUnhealthy(url: string, now: number): void {
-  endpointUnhealthyUntil.set(url, now + ENDPOINT_COOLDOWN_MS);
-}
-
-function orderedAttempts(now: number): string[] {
-  const healthy: string[] = [];
-  const cooled: string[] = [];
-  for (const url of PEARL_RPC_POOL) {
-    if (isEndpointHealthy(url, now)) healthy.push(url);
-    else cooled.push(url);
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    const parts = [err.name, err.message].filter(Boolean);
+    const cause = (err as Error & { cause?: unknown }).cause;
+    if (cause instanceof Error) {
+      parts.push(`cause=${cause.name}: ${cause.message}`);
+    } else if (cause && typeof cause === "object") {
+      const c = cause as Record<string, unknown>;
+      const extra = [c.code, c.errno, c.syscall, c.address, c.port, c.path]
+        .filter((value) => value !== undefined && value !== null && value !== "")
+        .map(String);
+      if (extra.length > 0) {
+        parts.push(`cause=${extra.join(" ")}`);
+      } else {
+        parts.push(`cause=${JSON.stringify(cause)}`);
+      }
+    }
+    return parts.join(": ");
   }
-  return healthy.length > 0 ? [...healthy, ...cooled] : cooled;
+  return String(err);
 }
 
-async function fetchOnce<T>(url: string, method: string, params: unknown[]): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
-  });
+async function fetchOnce<T>(method: string, params: unknown[]): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(PEARL_RPC_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
+    });
+  } catch (err) {
+    throw new Error(`rpc fetch ${PEARL_RPC_URL} failed for ${method}: ${describeError(err)}`);
+  }
   if (!res.ok) {
     throw new Error(`rpc http ${res.status}`);
   }
@@ -74,9 +77,10 @@ async function fetchOnce<T>(url: string, method: string, params: unknown[]): Pro
   return body.result;
 }
 
-function isRetryableSameEndpoint(err: unknown): boolean {
+function isRetryableFetchError(err: unknown): boolean {
   if (err instanceof TypeError) return true;
   if (err instanceof Error) {
+    if (/^rpc fetch .* failed for /.test(err.message)) return true;
     const m = /^rpc http (\d+)$/.exec(err.message);
     if (m) {
       const status = Number(m[1]);
@@ -91,33 +95,25 @@ function isChainLevelError(err: unknown): boolean {
 }
 
 async function call<T>(method: string, params: unknown[]): Promise<T> {
-  const attempts = orderedAttempts(Date.now());
   let lastErr: unknown;
-  for (const url of attempts) {
-    let endpointFailedAllAttempts = true;
-    for (let attempt = 0; attempt < PER_ENDPOINT_ATTEMPTS; attempt++) {
-      if (attempt > 0) {
-        await new Promise((resolve) => setTimeout(resolve, INTRA_ENDPOINT_BACKOFF_MS));
-      }
-      try {
-        return await fetchOnce<T>(url, method, params);
-      } catch (err) {
-        lastErr = err;
-        if (isChainLevelError(err)) {
-          throw err;
-        }
-        if (isRetryableSameEndpoint(err)) {
-          continue;
-        }
-        endpointFailedAllAttempts = false;
+  for (let attempt = 0; attempt < PER_ENDPOINT_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, INTRA_ENDPOINT_BACKOFF_MS));
+    }
+    try {
+      return await fetchOnce<T>(method, params);
+    } catch (err) {
+      lastErr = err;
+      if (isChainLevelError(err)) {
         throw err;
       }
-    }
-    if (endpointFailedAllAttempts) {
-      markEndpointUnhealthy(url, Date.now());
+      if (isRetryableFetchError(err)) {
+        continue;
+      }
+      throw err;
     }
   }
-  throw lastErr ?? new Error("rpc pool exhausted");
+  throw lastErr ?? new Error("rpc endpoint exhausted");
 }
 
 function prlToGrains(value: number): bigint {
@@ -152,9 +148,26 @@ export interface PrlUtxoSet {
   droppedNoScript: number;
 }
 
-export async function fetchPrlUtxos(address: string): Promise<PrlUtxoSet> {
+export interface FetchUtxosOptions {
+  maxPages?: number;
+}
+
+export async function fetchPrlBalanceGrains(
+  address: string,
+  opts: FetchUtxosOptions = {},
+): Promise<PrlBalanceResult> {
+  const { utxos, degraded, droppedNoScript } = await fetchPrlUtxos(address, opts);
+  let total = 0n;
+  for (const u of utxos) total += u.valueGrains;
+  return { grains: total, degraded: degraded || droppedNoScript > 0 };
+}
+
+export async function fetchPrlUtxos(
+  address: string,
+  opts: FetchUtxosOptions = {},
+): Promise<PrlUtxoSet> {
   const PAGE = 100;
-  const maxPages = Math.min(MAX_UTXO_WALK_PAGES, MAX_UTXO_WALK_PAGES_HARD);
+  const maxPages = Math.min(Math.max(1, opts.maxPages ?? MAX_UTXO_WALK_PAGES), MAX_UTXO_WALK_PAGES_HARD);
   let skip = 0;
   const utxo = new Map<string, { valueGrains: bigint; scriptHex: string }>();
   const seenOutputs = new Set<string>();
@@ -223,13 +236,9 @@ export async function fetchPrlUtxos(address: string): Promise<PrlUtxoSet> {
   return { utxos: out, degraded, droppedNoScript };
 }
 
-export async function fetchPrlBalanceGrains(address: string): Promise<PrlBalanceResult> {
-  const { utxos, degraded, droppedNoScript } = await fetchPrlUtxos(address);
-  let total = 0n;
-  for (const u of utxos) total += u.valueGrains;
-  return { grains: total, degraded: degraded || droppedNoScript > 0 };
-}
-
 export async function broadcastPearlTx(rawHex: string): Promise<string> {
+  if (typeof window !== "undefined" && window.appBridge?.wallet?.broadcastPearlTx) {
+    return await window.appBridge.wallet.broadcastPearlTx(rawHex);
+  }
   return await call<string>("sendrawtransaction", [rawHex]);
 }

@@ -42,6 +42,8 @@ const walletIpc: Ipc<WalletApi> = {
   getTransactionInfo: txid => ipcRenderer.invoke('wallet-get-transaction-info', txid),
   validateAddress: address => ipcRenderer.invoke('wallet-validate-address', address),
   estimateFee: numBlocks => ipcRenderer.invoke('wallet-estimate-fee', numBlocks),
+  getMultisigState: () => ipcRenderer.invoke('wallet-get-multisig-state'),
+  saveMultisigState: state => ipcRenderer.invoke('wallet-save-multisig-state', state),
 };
 
 const managerIpc: Ipc<ManagerApi> = {
