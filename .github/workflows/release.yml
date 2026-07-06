@@ -7,6 +7,11 @@ on:
         description: "Version override (leave empty to extract from source)"
         required: false
         type: string
+      push_image:
+        description: "Push the pearld Docker image to GHCR (uncheck to only build, e.g. to validate the Dockerfile)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -151,3 +156,37 @@ jobs:
           files: artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  docker:
+    needs: version
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    with:
+      output: image
+      context: .
+      file: ./node/Dockerfile
+      platforms: linux/amd64,linux/arm64
+      # The node image compiles Rust + Go from source, so amd64 needs large-runner
+      # and arm64 builds natively (rather than under QEMU on the default runner).
+      runner: |
+        default=large-runner
+        linux/arm64=ubuntu-24.04-arm
+      push: ${{ inputs.push_image }}
+      cache: true
+      cache-mode: max
+      sbom: ${{ inputs.push_image }}
+      set-meta-labels: true
+      set-meta-annotations: true
+      meta-images: ghcr.io/${{ github.repository }}/pearld
+      meta-tags: |
+        type=sha
+        type=raw,value=${{ needs.version.outputs.version }}
+        type=raw,value=latest
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
