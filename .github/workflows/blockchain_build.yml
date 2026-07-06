@@ -1,4 +1,4 @@
-name: Build Artifacts
+name: Blockchain / Build & Publish
 
 on:
   push:

@@ -1,4 +1,4 @@
-name: Release
+name: Blockchain / Release
 
 on:
   workflow_dispatch:
@@ -51,9 +51,9 @@ jobs:
         id: sha
         run: echo "sha_short=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
-  # Promote the binaries built by build.yml for this exact commit: download the
-  # tested artifacts (no rebuild), rename them from their commit-hash names to
-  # clean version names, then publish the GitHub Release.
+  # Promote the binaries built by blockchain_build.yml for this exact commit:
+  # download the tested artifacts (no rebuild), rename them from their commit-hash
+  # names to clean version names, then publish the GitHub Release.
   release:
     needs: version
     runs-on: ubuntu-latest
@@ -66,13 +66,13 @@ jobs:
       SHA_SHORT: ${{ needs.version.outputs.sha_short }}
 
     steps:
-      # Fetch the binaries build.yml already produced for this commit. Fails if
-      # no successful build.yml run exists for the commit (if_no_artifact_found).
-      - name: Download tested binaries from build.yml run
+      # Fetch the binaries blockchain_build.yml already produced for this commit.
+      # Fails if no successful run exists for the commit (if_no_artifact_found).
+      - name: Download tested binaries from blockchain_build.yml run
         uses: dawidd6/action-download-artifact@8305c0f1062bb0d184d09ef4493ecb9288447732 # v20
         with:
           github_token: ${{ github.token }}
-          workflow: build.yml
+          workflow: blockchain_build.yml
           commit: ${{ github.sha }}
           workflow_conclusion: success
           path: artifacts
@@ -82,8 +82,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # build.yml uploads one artifact dir per platform; each contains a
-          # file suffixed with the commit sha. Rename that suffix to the version.
+          # blockchain_build.yml uploads one artifact dir per platform; each has
+          # a file suffixed with the commit sha. Rename that suffix to the version.
           find artifacts -type f -name "pearl-*-${SHA_SHORT}.*" -print0 | while IFS= read -r -d '' f; do
             base=$(basename "$f")
             renamed="${base/-${SHA_SHORT}./-${VERSION}.}"
@@ -109,9 +109,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
-  # Promote the image built by build.yml for this commit (tagged sha-<commit>)
-  # to the official :vX.Y.Z + :latest tags by re-tagging the existing manifest,
-  # so the released image is bit-for-bit what was tested (no rebuild).
+  # Promote the image built by blockchain_build.yml for this commit (tagged
+  # sha-<commit>) to the official :vX.Y.Z + :latest tags by re-tagging the
+  # existing manifest, so the released image is bit-for-bit what was tested.
   docker-promote:
     needs: version
     runs-on: ubuntu-latest
@@ -136,7 +136,7 @@ jobs:
       - name: Verify source image exists
         run: |
           if ! docker buildx imagetools inspect "${IMAGE_NAME}:sha-${SHA_SHORT}" >/dev/null 2>&1; then
-            echo "::error::Source image ${IMAGE_NAME}:sha-${SHA_SHORT} not found. build.yml must publish it (merge to master or dispatch build.yml on this ref) before promoting."
+            echo "::error::Source image ${IMAGE_NAME}:sha-${SHA_SHORT} not found. blockchain_build.yml must publish it (merge to master or dispatch it on this ref) before promoting."
             exit 1
           fi
 
