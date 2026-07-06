@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       push_image:
-        description: "Push the pearld Docker image to GHCR (uncheck to only build, e.g. to validate the Dockerfile)"
+        description: "Build and publish the pearld Docker image to GHCR (requires release environment approval; uncheck to release binaries only)"
         required: false
         type: boolean
         default: true
@@ -157,8 +157,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
-  docker:
+  docker-approval:
     needs: version
+    if: ${{ inputs.push_image }}
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - run: echo "Release environment approved; publishing pearld image."
+
+  docker:
+    needs: [version, docker-approval]
     permissions:
       contents: read
       packages: write
@@ -169,10 +177,10 @@ jobs:
       context: .
       file: ./node/Dockerfile
       platforms: linux/amd64,linux/arm64
-      push: ${{ inputs.push_image }}
+      push: true
       cache: true
       cache-mode: max
-      sbom: ${{ inputs.push_image }}
+      sbom: true
       set-meta-labels: true
       set-meta-annotations: true
       meta-images: ghcr.io/${{ github.repository }}/pearld
