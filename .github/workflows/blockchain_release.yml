@@ -67,7 +67,11 @@ jobs:
 
     steps:
       # Fetch the binaries blockchain_build.yml already produced for this commit.
-      # Fails if no successful run exists for the commit (if_no_artifact_found).
+      # Restricted to the pearl-<os>-<arch> binary artifacts: the build run also
+      # uploads *.dockerbuild build-record artifacts (from docker/build-push-action
+      # inside docker/github-builder) which are not standard zips and break
+      # extraction if downloaded. Fails if no matching artifact exists for the
+      # commit (if_no_artifact_found).
       - name: Download tested binaries from blockchain_build.yml run
         uses: dawidd6/action-download-artifact@8305c0f1062bb0d184d09ef4493ecb9288447732 # v20
         with:
@@ -75,6 +79,8 @@ jobs:
           workflow: blockchain_build.yml
           commit: ${{ github.sha }}
           workflow_conclusion: success
+          name: '^pearl-(linux|darwin|windows)-'
+          name_is_regexp: true
           path: artifacts
           if_no_artifact_found: fail
 
