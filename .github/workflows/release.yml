@@ -69,27 +69,19 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
       SHA_SHORT: ${{ needs.version.outputs.sha_short }}
-      GH_TOKEN: ${{ github.token }}
 
     steps:
+      # Fetch the binaries build.yml already produced for this commit. Fails if
+      # no successful build.yml run exists for the commit (if_no_artifact_found).
       - name: Download tested binaries from build.yml run
-        run: |
-          set -euo pipefail
-          run_id=$(gh run list \
-            --repo "${{ github.repository }}" \
-            --workflow build.yml \
-            --commit "${{ github.sha }}" \
-            --status success \
-            --limit 1 \
-            --json databaseId \
-            --jq '.[0].databaseId')
-          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-            echo "::error::No successful build.yml run found for commit ${{ github.sha }} (${SHA_SHORT}). Merge the commit to master (or dispatch build.yml on this ref) before releasing."
-            exit 1
-          fi
-          echo "Using build.yml run $run_id"
-          mkdir -p artifacts
-          gh run download "$run_id" --repo "${{ github.repository }}" --dir artifacts
+        uses: dawidd6/action-download-artifact@8305c0f1062bb0d184d09ef4493ecb9288447732 # v20
+        with:
+          github_token: ${{ github.token }}
+          workflow: build.yml
+          commit: ${{ github.sha }}
+          workflow_conclusion: success
+          path: artifacts
+          if_no_artifact_found: fail
 
       - name: Rename artifacts to version and collect
         run: |
