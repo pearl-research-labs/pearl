@@ -7,11 +7,6 @@ on:
         description: "Version override (leave empty to extract from source)"
         required: false
         type: string
-      push_image:
-        description: "Promote the pearld Docker image to :vX.Y.Z + :latest (requires release environment approval; uncheck to release binaries only)"
-        required: false
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -114,20 +109,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
-  docker-approval:
-    needs: version
-    if: ${{ inputs.push_image }}
-    runs-on: ubuntu-latest
-    environment: release
-    steps:
-      - run: echo "Release environment approved; promoting pearld image."
-
   # Promote the image built by build.yml for this commit (tagged sha-<commit>)
   # to the official :vX.Y.Z + :latest tags by re-tagging the existing manifest,
   # so the released image is bit-for-bit what was tested (no rebuild).
   docker-promote:
-    needs: [version, docker-approval]
+    needs: version
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
       packages: write
