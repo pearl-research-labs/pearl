@@ -1,4 +1,4 @@
-name: Release Binaries
+name: Release
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       push_image:
-        description: "Build and publish the pearld Docker image to GHCR (requires release environment approval; uncheck to release binaries only)"
+        description: "Promote the pearld Docker image to :vX.Y.Z + :latest (requires release environment approval; uncheck to release binaries only)"
         required: false
         type: boolean
         default: true
@@ -16,11 +16,15 @@ on:
 permissions:
   contents: read
 
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/pearld
+
 jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      sha_short: ${{ steps.sha.outputs.sha_short }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -48,101 +52,62 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Detected version: ${VERSION}"
 
-  build:
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            artifact_name: pearl-linux-amd64
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-            artifact_name: pearl-linux-arm64
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-            artifact_name: pearl-darwin-amd64
-          - os: macos-latest
-            goos: darwin
-            goarch: arm64
-            artifact_name: pearl-darwin-arm64
-          - os: windows-latest
-            goos: windows
-            goarch: amd64
-            artifact_name: pearl-windows-amd64
+      - name: Compute short SHA
+        id: sha
+        run: echo "sha_short=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
-    runs-on: ${{ matrix.os }}
-    env:
-      VERSION: ${{ needs.version.outputs.version }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-
-      - name: Setup
-        uses: ./.github/actions/setup
-
-      - name: Add Rust GNU target (Windows)
-        if: matrix.goos == 'windows'
-        shell: bash
-        run: rustup target add x86_64-pc-windows-gnu
-
-      - name: Build with Task
-        shell: bash
-        run: |
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            export CARGO_BUILD_TARGET=x86_64-pc-windows-gnu
-          fi
-          task build:blockchain
-
-      - name: Package binaries (Unix)
-        if: matrix.goos != 'windows'
-        run: |
-          mkdir -p dist
-          cp bin/pearld bin/prlctl bin/oyster dist/
-          tar -czvf ${{ matrix.artifact_name }}-${{ env.VERSION }}.tar.gz -C dist .
-
-      - name: Package binaries (Windows)
-        if: matrix.goos == 'windows'
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp bin/pearld dist/pearld.exe
-          cp bin/prlctl dist/prlctl.exe
-          cp bin/oyster dist/oyster.exe
-          cd dist && 7z a ../${{ matrix.artifact_name }}-${{ env.VERSION }}.zip *
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}-${{ env.VERSION }}.*
-
+  # Promote the binaries built by build.yml for this exact commit: download the
+  # tested artifacts (no rebuild), rename them from their commit-hash names to
+  # clean version names, then publish the GitHub Release.
   release:
-    needs: [version, build]
+    needs: version
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: write
+      actions: read
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      SHA_SHORT: ${{ needs.version.outputs.sha_short }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: artifacts
-          merge-multiple: true
+      - name: Download tested binaries from build.yml run
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow build.yml \
+            --commit "${{ github.sha }}" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "::error::No successful build.yml run found for commit ${{ github.sha }} (${SHA_SHORT}). Merge the commit to master (or dispatch build.yml on this ref) before releasing."
+            exit 1
+          fi
+          echo "Using build.yml run $run_id"
+          mkdir -p artifacts
+          gh run download "$run_id" --repo "${{ github.repository }}" --dir artifacts
+
+      - name: Rename artifacts to version and collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # build.yml uploads one artifact dir per platform; each contains a
+          # file suffixed with the commit sha. Rename that suffix to the version.
+          find artifacts -type f -name "pearl-*-${SHA_SHORT}.*" -print0 | while IFS= read -r -d '' f; do
+            base=$(basename "$f")
+            renamed="${base/-${SHA_SHORT}./-${VERSION}.}"
+            cp "$f" "dist/${renamed}"
+          done
+          echo "Release assets:"
+          ls -1 dist
 
       - name: Generate checksums
         run: |
-          cd artifacts
+          cd dist
           sha256sum * > checksums.txt
           cat checksums.txt
 
@@ -153,7 +118,7 @@ jobs:
           name: Release ${{ env.VERSION }}
           draft: true
           generate_release_notes: true
-          files: artifacts/*
+          files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
@@ -163,33 +128,44 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - run: echo "Release environment approved; publishing pearld image."
+      - run: echo "Release environment approved; promoting pearld image."
 
-  docker:
+  # Promote the image built by build.yml for this commit (tagged sha-<commit>)
+  # to the official :vX.Y.Z + :latest tags by re-tagging the existing manifest,
+  # so the released image is bit-for-bit what was tested (no rebuild).
+  docker-promote:
     needs: [version, docker-approval]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      id-token: write
-    uses: docker/github-builder/.github/workflows/build.yml@v1
-    with:
-      output: image
-      context: .
-      file: ./node/Dockerfile
-      platforms: linux/amd64,linux/arm64
-      push: true
-      cache: true
-      cache-mode: max
-      sbom: true
-      set-meta-labels: true
-      set-meta-annotations: true
-      meta-images: ghcr.io/${{ github.repository }}/pearld
-      meta-tags: |
-        type=sha
-        type=raw,value=${{ needs.version.outputs.version }}
-        type=raw,value=latest
-    secrets:
-      registry-auths: |
-        - registry: ghcr.io
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA_SHORT: ${{ needs.version.outputs.sha_short }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify source image exists
+        run: |
+          if ! docker buildx imagetools inspect "${IMAGE_NAME}:sha-${SHA_SHORT}" >/dev/null 2>&1; then
+            echo "::error::Source image ${IMAGE_NAME}:sha-${SHA_SHORT} not found. build.yml must publish it (merge to master or dispatch build.yml on this ref) before promoting."
+            exit 1
+          fi
+
+      - name: Promote to version and latest
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${VERSION}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${IMAGE_NAME}:sha-${SHA_SHORT}"
+
+      - name: Inspect promoted manifest
+        run: docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}"

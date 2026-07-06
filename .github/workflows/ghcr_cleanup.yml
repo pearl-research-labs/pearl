@@ -1,0 +1,26 @@
+name: GHCR Cleanup
+
+# Prune old per-commit pearld image versions so sha-<commit> builds published by
+# build.yml don't accumulate forever. Release tags (:vX.Y.Z / :latest) are kept
+# because they point at retained versions; only old/untagged versions are pruned.
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete old untagged pearld versions
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
+        with:
+          package-name: pearl/pearld
+          package-type: container
+          min-versions-to-keep: 50
+          delete-only-untagged-versions: true

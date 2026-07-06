@@ -14,7 +14,12 @@
 
 With Docker you can easily set up *pearld* to run your Pearl full node. The official *pearld* Docker images are published to the GitHub Container Registry (GHCR) at `ghcr.io/pearl-research-labs/pearl/pearld`. Images are multi-arch and run natively on both `linux/amd64` and `linux/arm64`. The Docker source file of this image is located at [Dockerfile](https://github.com/pearl-research-labs/pearl/blob/master/node/Dockerfile).
 
-Available tags: `:latest` (most recent release), `:vX.Y.Z` (a specific release version), and `:sha-<commit>` (a specific commit). Any *pearld* flag can be appended to the container `command` (see the examples below), so indexing options such as `--txindex`/`--addrindex` or network options such as `--testnet` are added simply by extending `command`.
+Image tags follow a strict naming discipline so you can always tell an official release from a build artifact:
+
+- **Official releases** — `:latest` (most recent release) and `:vX.Y.Z` (a specific release version). Version-shaped tags are only ever produced by the release process.
+- **Build artifacts** — `:sha-<commit>` is a per-commit build published on every merge to `master` (and on manual side-branch builds), intended for internal and testnet testing. These are not releases; pin to a `:sha-<commit>` tag when you need a specific pre-release commit.
+
+Any *pearld* flag can be appended to the container `command` (see the examples below), so indexing options such as `--txindex`/`--addrindex` or network options such as `--testnet` are added simply by extending `command`.
 
 This documentation focuses on running Docker container with *docker-compose.yml* files. These files are better to read and you can use them as a template for your own use. For more information about Docker and Docker compose visit the official [Docker documentation](https://docs.docker.com/).
 
