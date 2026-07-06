@@ -1,8 +1,14 @@
 name: GHCR Cleanup
 
-# Prune old per-commit pearld image versions so sha-<commit> builds published by
-# build.yml don't accumulate forever. Release tags (:vX.Y.Z / :latest) are kept
-# because they point at retained versions; only old/untagged versions are pruned.
+# Prune old non-release pearld image versions so the per-commit sha-<commit>
+# builds from build.yml don't accumulate forever. Release versions (any version
+# tagged :vX.Y.Z or :latest) are always kept; of the rest, the newest
+# KEEP_NON_RELEASE are kept and older ones are deleted oldest-first.
+#
+# Uses the GitHub Packages REST API directly (no third-party action). Only
+# tagged build versions are deleted (by version id); their untagged multi-arch
+# child manifests are left as harmless orphans, which avoids the "manifest
+# unknown" corruption that blind untagged deletion causes on live images.
 on:
   schedule:
     - cron: "0 3 * * 0"
@@ -11,16 +17,48 @@ on:
 permissions:
   contents: read
 
+env:
+  PACKAGE: pearld
+  KEEP_NON_RELEASE: "30"
+
 jobs:
   cleanup:
     runs-on: ubuntu-latest
     permissions:
       packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ORG: ${{ github.repository_owner }}
     steps:
-      - name: Delete old untagged pearld versions
-        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
-        with:
-          package-name: pearl/pearld
-          package-type: container
-          min-versions-to-keep: 50
-          delete-only-untagged-versions: true
+      - name: Prune old non-release versions
+        run: |
+          set -euo pipefail
+
+          # All versions as "id<TAB>tag1,tag2,..." rows, explicitly sorted
+          # newest-first by created_at (don't rely on the API's default order).
+          versions=$(gh api --paginate \
+            "/orgs/${ORG}/packages/container/${PACKAGE}/versions?per_page=100" \
+            --slurp \
+            --jq 'add | sort_by(.created_at) | reverse | .[] | [.id, (.metadata.container.tags | join(","))] | @tsv')
+
+          kept_non_release=0
+          while IFS=$'\t' read -r id tags; do
+            [ -z "$id" ] && continue
+
+            # Keep any version carrying a release tag (vX.Y.Z or latest).
+            if echo ",${tags}," | grep -Eq ',(latest|v[0-9][^,]*),'; then
+              echo "keep (release): $id [$tags]"
+              continue
+            fi
+
+            # Keep the newest KEEP_NON_RELEASE non-release versions.
+            if [ "$kept_non_release" -lt "${KEEP_NON_RELEASE}" ]; then
+              kept_non_release=$((kept_non_release + 1))
+              echo "keep (recent): $id [$tags]"
+              continue
+            fi
+
+            echo "delete: $id [$tags]"
+            gh api --method DELETE \
+              "/orgs/${ORG}/packages/container/${PACKAGE}/versions/${id}"
+          done <<< "$versions"
