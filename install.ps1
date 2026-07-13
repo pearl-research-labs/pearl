@@ -32,7 +32,7 @@ function Write-Info {
 
 function Die {
 	param([string]$Message)
-	Write-Error "pearl-install: $Message"
+	[Console]::Error.WriteLine("pearl-install: $Message")
 	exit 1
 }
 
