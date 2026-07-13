@@ -33,6 +33,7 @@ jobs:
               - 'node/**'
               - 'wallet/**'
               - 'spv/**'
+              - 'prlmon/**'
               - 'zk-pow/**'
               - 'plonky2/**'
               - 'Taskfile.yml'

@@ -1,0 +1,47 @@
+name: Prlmon / Build & Publish
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'prlmon/**'
+      - 'node/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/prlmon_build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    with:
+      output: image
+      context: .
+      file: ./prlmon/Dockerfile
+      platforms: linux/amd64,linux/arm64
+      push: true
+      cache: true
+      cache-mode: max
+      sbom: true
+      set-meta-labels: true
+      set-meta-annotations: true
+      meta-images: ghcr.io/${{ github.repository }}/prlmon
+      meta-tags: |
+        type=sha
+        type=raw,value=latest,enable={{is_default_branch}}
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}

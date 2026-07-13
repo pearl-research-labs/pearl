@@ -24,6 +24,7 @@ system, vLLM miner, and supporting tools.
 | [`dnsseeder/`](dnsseeder/) | DNS seeder for the Pearl network |
 | [`coredns-dnsseed/`](coredns-dnsseed/) | CoreDNS plugin — production DNS seeder |
 | [`proxy/`](proxy/) | Caddy reverse-proxy sidecar for RPC TLS termination and rate limiting |
+| [`prlmon/`](prlmon/) | **prlmon** — Prometheus monitoring sidecar for pearld |
 | [`xmss/`](xmss/) | XMSS post-quantum signature scheme (C + Go FFI) |
 | [`zk-pow/`](zk-pow/) | ZK proof-of-work circuit and verifier (Rust, Plonky2/STARKy) |
 | [`pearl-blake3/`](pearl-blake3/) | Blake3 hashing utilities (Rust) |
@@ -32,6 +33,60 @@ system, vLLM miner, and supporting tools.
 | [`py-pearl-mining/`](py-pearl-mining/) | Python bindings for Pearl mining (Rust/PyO3) |
 | [`apps/`](apps/) | Frontend applications (website, desktop wallet — pnpm/Turborepo) |
 | [`tools/`](tools/) | Go development tool dependencies |
+
+## Install (prebuilt binaries)
+
+Download, inspect, then run the checksum-verified installer (recommended):
+
+```bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh
+less install.sh   # review before running
+sh install.sh
+```
+
+Convenience one-liner (pipes the script into `sh`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh | sh
+```
+
+This installs `pearld`, `prlctl`, and `oyster` into `${XDG_BIN_HOME:-$HOME/.local/bin}`,
+and writes mainnet default configs into the OS default app-data paths (shared
+auto-generated RPC credentials). Oyster defaults to SPV sync (`usespv=1`), so a
+local pearld is optional for the wallet. No `-u` / `-P` / `-C` needed afterward —
+`prlctl getinfo` talks to pearld, and `prlctl --wallet getinfo` talks to oyster.
+
+| Tool | Linux | macOS |
+|------|-------|-------|
+| pearld | `~/.pearld/pearld.conf` | `~/Library/Application Support/Pearld/pearld.conf` |
+| oyster | `~/.oyster/oyster.conf` | `~/Library/Application Support/Oyster/oyster.conf` |
+| prlctl | `~/.prlctl/prlctl.conf` | `~/Library/Application Support/Prlctl/prlctl.conf` |
+
+Rerun the same command to upgrade binaries; existing configs are left unchanged.
+Pin a release or choose a destination:
+
+```bash
+sh install.sh --version v0.1.0
+sh install.sh --bin-dir "$HOME/bin"
+```
+
+Remove the binaries with:
+
+```bash
+rm -f "${XDG_BIN_HOME:-$HOME/.local/bin}/pearld" \
+      "${XDG_BIN_HOME:-$HOME/.local/bin}/prlctl" \
+      "${XDG_BIN_HOME:-$HOME/.local/bin}/oyster" \
+      "${XDG_BIN_HOME:-$HOME/.local/bin}/sample-pearld.conf"
+```
+
+Configs are not removed automatically; delete them from the paths above if desired.
+Curl-based installs normally avoid macOS browser quarantine. Directly
+browser-downloaded archives can still be blocked by Gatekeeper unless Apple
+Developer ID signing/notarization is present; the installer never strips
+quarantine attributes.
+
+See [node/docs/installation.md](node/docs/installation.md) for full details.
+To build from source instead, see **Building** below.
 
 ## Prerequisites
 
@@ -46,7 +101,7 @@ system, vLLM miner, and supporting tools.
 
 ```bash
 task build              # build everything (blockchain + vLLM miner)
-task build:blockchain   # pearld, prlctl, oyster → bin/
+task build:blockchain   # pearld, prlctl, oyster, prlmon → bin/
 task build:miner        # install vLLM miner Python packages
 task build:pearld       # pearld only
 ```

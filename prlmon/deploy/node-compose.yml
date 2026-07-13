@@ -1,0 +1,82 @@
+# Docker Compose template for deploying a pearld node with a prlmon sidecar.
+# Deploy this on each node host.
+#
+# Usage:
+#   export RPC_PASS=secret
+#   docker compose -f node-compose.yml up -d
+#
+# Services:
+#   - pearld: Blockchain node (P2P :44110, RPC :44109)
+#   - node-exporter: System metrics (:9100)
+#   - prlmon: Blockchain metrics + diagnostic API (:9105)
+#
+# A central Prometheus server scrapes :9100 and :9105 from each node.
+
+services:
+  pearld:
+    image: ghcr.io/pearl-research-labs/pearl/pearld:latest
+    container_name: pearld
+    ports:
+      - "44110:44110"   # P2P
+      - "44109:44109"   # RPC
+    # Data and logs are mounted at explicit paths so the prlmon sidecar can
+    # tail the same log directory read-only via a shared volume.
+    command:
+      - '--datadir=/var/lib/pearld/data'
+      - '--logdir=/var/lib/pearld/logs'
+    volumes:
+      - pearld_data:/var/lib/pearld/data
+      - pearld_logs:/var/lib/pearld/logs
+      - ./rpc.cert:/etc/node/rpc.cert:ro
+    restart: unless-stopped
+    networks:
+      - node
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    restart: unless-stopped
+    networks:
+      - node
+
+  prlmon:
+    image: ghcr.io/pearl-research-labs/pearl/prlmon:latest
+    container_name: prlmon
+    ports:
+      - "9105:9105"
+    command:
+      - '--listen=:9105'
+      - '--rpchost=pearld:44109'
+      - '--rpcuser=${RPC_USER:-monitor}'
+      - '--rpcpass=${RPC_PASS}'
+      - '--rpccert=/etc/node/rpc.cert'
+      # Pearld writes logs under a network-named subdir; ${NETWORK:-mainnet}
+      # selects which one /node/logs and /node/logs/files surface.
+      - '--node-log-file=/var/lib/pearld/logs/${NETWORK:-mainnet}/pearld.log'
+    volumes:
+      - ./rpc.cert:/etc/node/rpc.cert:ro
+      - pearld_logs:/var/lib/pearld/logs:ro
+    depends_on:
+      - pearld
+    restart: unless-stopped
+    networks:
+      - node
+
+volumes:
+  pearld_data:
+  pearld_logs:
+
+networks:
+  node:
+    driver: bridge
