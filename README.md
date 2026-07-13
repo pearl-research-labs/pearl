@@ -35,6 +35,8 @@ system, vLLM miner, and supporting tools.
 
 ## Install (prebuilt binaries)
 
+### macOS / Linux
+
 Download, inspect, then run the checksum-verified installer (recommended):
 
 ```bash
@@ -49,17 +51,38 @@ Convenience one-liner (pipes the script into `sh`):
 curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh | sh
 ```
 
-This installs `pearld`, `prlctl`, and `oyster` into `${XDG_BIN_HOME:-$HOME/.local/bin}`,
+### Windows
+
+Download, inspect, then run:
+
+```powershell
+irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 -OutFile install.ps1
+notepad install.ps1   # review before running
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Convenience one-liner:
+
+```powershell
+irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 | iex
+```
+
+### After install
+
+This installs `pearld`, `prlctl`, and `oyster` into:
+- macOS/Linux: `${XDG_BIN_HOME:-$HOME/.local/bin}`
+- Windows: `%LOCALAPPDATA%\Pearl\bin`
+
 and writes mainnet default configs into the OS default app-data paths (shared
 auto-generated RPC credentials). Oyster defaults to SPV sync (`usespv=1`), so a
 local pearld is optional for the wallet. No `-u` / `-P` / `-C` needed afterward —
 `prlctl getinfo` talks to pearld, and `prlctl --wallet getinfo` talks to oyster.
 
-| Tool | Linux | macOS |
-|------|-------|-------|
-| pearld | `~/.pearld/pearld.conf` | `~/Library/Application Support/Pearld/pearld.conf` |
-| oyster | `~/.oyster/oyster.conf` | `~/Library/Application Support/Oyster/oyster.conf` |
-| prlctl | `~/.prlctl/prlctl.conf` | `~/Library/Application Support/Prlctl/prlctl.conf` |
+| Tool | Linux | macOS | Windows |
+|------|-------|-------|---------|
+| pearld | `~/.pearld/pearld.conf` | `~/Library/Application Support/Pearld/pearld.conf` | `%LOCALAPPDATA%\Pearld\pearld.conf` |
+| oyster | `~/.oyster/oyster.conf` | `~/Library/Application Support/Oyster/oyster.conf` | `%LOCALAPPDATA%\Oyster\oyster.conf` |
+| prlctl | `~/.prlctl/prlctl.conf` | `~/Library/Application Support/Prlctl/prlctl.conf` | `%LOCALAPPDATA%\Prlctl\prlctl.conf` |
 
 Rerun the same command to upgrade binaries; existing configs are left unchanged.
 Pin a release or choose a destination:
@@ -67,6 +90,11 @@ Pin a release or choose a destination:
 ```bash
 sh install.sh --version v0.1.0
 sh install.sh --bin-dir "$HOME/bin"
+```
+
+```powershell
+.\install.ps1 -Version v0.1.0
+.\install.ps1 -BinDir "$env:USERPROFILE\bin"
 ```
 
 Remove the binaries with:
@@ -78,11 +106,18 @@ rm -f "${XDG_BIN_HOME:-$HOME/.local/bin}/pearld" \
       "${XDG_BIN_HOME:-$HOME/.local/bin}/sample-pearld.conf"
 ```
 
+```powershell
+Remove-Item "$env:LOCALAPPDATA\Pearl\bin\pearld.exe", `
+            "$env:LOCALAPPDATA\Pearl\bin\prlctl.exe", `
+            "$env:LOCALAPPDATA\Pearl\bin\oyster.exe", `
+            "$env:LOCALAPPDATA\Pearl\bin\sample-pearld.conf" -ErrorAction SilentlyContinue
+```
+
 Configs are not removed automatically; delete them from the paths above if desired.
 Curl-based installs normally avoid macOS browser quarantine. Directly
-browser-downloaded archives can still be blocked by Gatekeeper unless Apple
-Developer ID signing/notarization is present; the installer never strips
-quarantine attributes.
+browser-downloaded archives can still be blocked by Gatekeeper / SmartScreen
+unless platform signing is present; the installer never strips quarantine
+attributes or Mark-of-the-Web.
 
 See [node/docs/installation.md](node/docs/installation.md) for full details.
 To build from source instead, see **Building** below.

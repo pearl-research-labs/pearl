@@ -4,7 +4,10 @@
 
 The release installer downloads the platform archive from GitHub Releases,
 verifies its SHA-256 against `checksums.txt`, and installs `pearld`, `prlctl`,
-and `oyster` into `${XDG_BIN_HOME:-$HOME/.local/bin}`.
+and `oyster`:
+
+- macOS/Linux: `install.sh` → `${XDG_BIN_HOME:-$HOME/.local/bin}`
+- Windows: `install.ps1` → `%LOCALAPPDATA%\Pearl\bin`
 
 It also writes mainnet default configs into the OS default app-data paths when
 missing, with shared auto-generated RPC credentials. Oyster defaults to SPV
@@ -13,15 +16,15 @@ no `-u` / `-P` / `-C` is required: `prlctl getinfo` targets local pearld, and
 `prlctl --wallet getinfo` targets local oyster. Existing configs that already
 have credentials are left unchanged. RPC stays localhost-only.
 
-| Tool | Linux | macOS |
-|------|-------|-------|
-| pearld | `~/.pearld/pearld.conf` | `~/Library/Application Support/Pearld/pearld.conf` |
-| oyster | `~/.oyster/oyster.conf` | `~/Library/Application Support/Oyster/oyster.conf` |
-| prlctl | `~/.prlctl/prlctl.conf` | `~/Library/Application Support/Prlctl/prlctl.conf` |
+| Tool | Linux | macOS | Windows |
+|------|-------|-------|---------|
+| pearld | `~/.pearld/pearld.conf` | `~/Library/Application Support/Pearld/pearld.conf` | `%LOCALAPPDATA%\Pearld\pearld.conf` |
+| oyster | `~/.oyster/oyster.conf` | `~/Library/Application Support/Oyster/oyster.conf` | `%LOCALAPPDATA%\Oyster\oyster.conf` |
+| prlctl | `~/.prlctl/prlctl.conf` | `~/Library/Application Support/Prlctl/prlctl.conf` | `%LOCALAPPDATA%\Prlctl\prlctl.conf` |
 
-Supported platforms: macOS and Linux on amd64 and arm64.
+Supported platforms: macOS and Linux on amd64 and arm64; Windows on amd64.
 
-### Download, inspect, then run
+### macOS / Linux — download, inspect, then run
 
 ```bash
 curl -fsSL -o install.sh https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh
@@ -29,10 +32,24 @@ less install.sh
 sh install.sh
 ```
 
-### One-line convenience form
+### macOS / Linux — one-line convenience form
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh | sh
+```
+
+### Windows — download, inspect, then run
+
+```powershell
+irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 -OutFile install.ps1
+notepad install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+### Windows — one-line convenience form
+
+```powershell
+irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 | iex
 ```
 
 ### Pin a version or install directory
@@ -42,10 +59,16 @@ sh install.sh --version v0.1.0
 sh install.sh --bin-dir "$HOME/bin"
 ```
 
+```powershell
+.\install.ps1 -Version v0.1.0
+.\install.ps1 -BinDir "$env:USERPROFILE\bin"
+```
+
 ### Upgrade
 
-Rerun the installer (with the same `--bin-dir` if you customized it). Existing
-binaries are replaced atomically. Existing config files are left unchanged.
+Rerun the installer (with the same `--bin-dir` / `-BinDir` if you customized it).
+Existing binaries are replaced atomically. Existing config files are left
+unchanged.
 
 ### Remove
 
@@ -56,15 +79,24 @@ rm -f "${XDG_BIN_HOME:-$HOME/.local/bin}/pearld" \
       "${XDG_BIN_HOME:-$HOME/.local/bin}/sample-pearld.conf"
 ```
 
+```powershell
+Remove-Item "$env:LOCALAPPDATA\Pearl\bin\pearld.exe", `
+            "$env:LOCALAPPDATA\Pearl\bin\prlctl.exe", `
+            "$env:LOCALAPPDATA\Pearl\bin\oyster.exe", `
+            "$env:LOCALAPPDATA\Pearl\bin\sample-pearld.conf" -ErrorAction SilentlyContinue
+```
+
 Configs are not removed automatically. Delete them from the paths in the table
 above if you also want to discard RPC credentials and settings.
-### macOS Gatekeeper / quarantine
 
-Installing via `curl`/`sh` normally does not attach the browser quarantine
-flag, so Gatekeeper typically does not block the binaries. Archives downloaded
-in a browser can still be quarantined when the app is not Developer ID signed
-and notarized. The installer never deletes quarantine metadata or otherwise
-bypasses Gatekeeper.
+### macOS Gatekeeper / Windows SmartScreen
+
+Installing via `curl`/`sh` or `irm` normally does not attach browser quarantine
+/ Mark-of-the-Web the same way a browser download does, so Gatekeeper and
+SmartScreen typically do not block the binaries. Archives downloaded in a
+browser can still be blocked when the app is not platform-signed. The installer
+never deletes quarantine metadata, Zone.Identifier streams, or otherwise
+bypasses OS protections.
 
 ## Requirements (build from source)
 
