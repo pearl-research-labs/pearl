@@ -33,6 +33,35 @@ system, vLLM miner, and supporting tools.
 | [`apps/`](apps/) | Frontend applications (website, desktop wallet — pnpm/Turborepo) |
 | [`tools/`](tools/) | Go development tool dependencies |
 
+## Install (prebuilt binaries)
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh | sh
+```
+
+Windows:
+
+```powershell
+irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 | iex
+```
+
+Installs `pearld`, `prlctl`, and `oyster` with localhost-only mainnet defaults and
+shared RPC credentials (oyster uses SPV by default). Binaries go to
+`${XDG_BIN_HOME:-$HOME/.local/bin}` on macOS/Linux, or `%LOCALAPPDATA%\Pearl\bin`
+on Windows.
+
+| Tool | Linux | macOS | Windows |
+|------|-------|-------|---------|
+| pearld | `~/.pearld/pearld.conf` | `~/Library/Application Support/Pearld/pearld.conf` | `%LOCALAPPDATA%\Pearld\pearld.conf` |
+| oyster | `~/.oyster/oyster.conf` | `~/Library/Application Support/Oyster/oyster.conf` | `%LOCALAPPDATA%\Oyster\oyster.conf` |
+| prlctl | `~/.prlctl/prlctl.conf` | `~/Library/Application Support/Prlctl/prlctl.conf` | `%LOCALAPPDATA%\Prlctl\prlctl.conf` |
+
+Pin a version or install directory with `--version` / `--bin-dir` (or `-Version` /
+`-BinDir` on Windows). See [node/docs/installation.md](node/docs/installation.md)
+for upgrade, removal, and other details. To build from source, see **Building** below.
+
 ## Prerequisites
 
 - [Go](https://golang.org) 1.26 or newer
