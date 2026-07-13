@@ -154,12 +154,13 @@ function Assert-Checksum {
 	)
 	$name = Split-Path -Leaf $Archive
 	$expected = $null
-	Get-Content -LiteralPath $ChecksumsFile | ForEach-Object {
-		$line = $_.Trim()
-		if (-not $line) { return }
-		$parts = $line -split '\s+', 2
+	foreach ($line in Get-Content -LiteralPath $ChecksumsFile) {
+		$trimmed = $line.Trim()
+		if (-not $trimmed) { continue }
+		$parts = $trimmed -split '\s+', 2
 		if ($parts.Count -eq 2 -and $parts[1] -eq $name) {
 			$expected = $parts[0].ToLowerInvariant()
+			break
 		}
 	}
 	if (-not $expected) {
