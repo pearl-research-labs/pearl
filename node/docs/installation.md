@@ -75,15 +75,13 @@ unchanged.
 ```bash
 rm -f "${XDG_BIN_HOME:-$HOME/.local/bin}/pearld" \
       "${XDG_BIN_HOME:-$HOME/.local/bin}/prlctl" \
-      "${XDG_BIN_HOME:-$HOME/.local/bin}/oyster" \
-      "${XDG_BIN_HOME:-$HOME/.local/bin}/sample-pearld.conf"
+      "${XDG_BIN_HOME:-$HOME/.local/bin}/oyster"
 ```
 
 ```powershell
 Remove-Item "$env:LOCALAPPDATA\Pearl\bin\pearld.exe", `
             "$env:LOCALAPPDATA\Pearl\bin\prlctl.exe", `
-            "$env:LOCALAPPDATA\Pearl\bin\oyster.exe", `
-            "$env:LOCALAPPDATA\Pearl\bin\sample-pearld.conf" -ErrorAction SilentlyContinue
+            "$env:LOCALAPPDATA\Pearl\bin\oyster.exe" -ErrorAction SilentlyContinue
 ```
 
 Configs are not removed automatically. Delete them from the paths in the table
