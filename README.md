@@ -58,7 +58,7 @@ Download, inspect, then run:
 ```powershell
 irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 -OutFile install.ps1
 notepad install.ps1   # review before running
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+pwsh -File .\install.ps1
 ```
 
 Convenience one-liner:

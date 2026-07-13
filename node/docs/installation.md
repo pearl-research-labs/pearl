@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/master/in
 ```powershell
 irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 -OutFile install.ps1
 notepad install.ps1
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+pwsh -File .\install.ps1
 ```
 
 ### Windows — one-line convenience form
