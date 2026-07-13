@@ -441,8 +441,22 @@ install_default_configs() {
 	created=0
 	ensure_rpc_credentials
 
-	# pearld bootstraps missing pearld.conf from sample-pearld.conf beside the binary.
-	write_config pearld "${BIN_DIR}/sample-pearld.conf" 644
+	# pearld bootstraps missing pearld.conf from sample-pearld.conf beside the
+	# binary, replacing rpcuser=/rpcpass= with freshly generated values. Keep
+	# this template secret-free — bin dirs are often world-readable.
+	write_file "${BIN_DIR}/sample-pearld.conf" 644 << 'EOF'
+[Application Options]
+
+; Template used by pearld when creating a missing pearld.conf.
+; Do not put real credentials here; the installer writes those to the OS
+; app-data pearld.conf with mode 0600.
+
+rpcuser=
+rpcpass=
+rpclisten=127.0.0.1:44107
+rpclisten=[::1]:44107
+txindex=1
+EOF
 	info "default config template -> ${BIN_DIR}/sample-pearld.conf"
 
 	for name in $CONFIGS; do

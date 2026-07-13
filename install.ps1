@@ -277,8 +277,24 @@ Examples:
 	}
 
 	Initialize-RpcCredentials
+
+	# pearld bootstraps missing pearld.conf from sample-pearld.conf beside the
+	# binary, replacing rpcuser=/rpcpass= with freshly generated values. Keep
+	# this template secret-free — bin dirs are often readable by other users.
 	$sample = Join-Path $BinDir 'sample-pearld.conf'
-	Write-FileAtomic $sample (Get-ConfigBody 'pearld')
+	Write-FileAtomic $sample @'
+[Application Options]
+
+; Template used by pearld when creating a missing pearld.conf.
+; Do not put real credentials here; the installer writes those to the OS
+; app-data pearld.conf.
+
+rpcuser=
+rpcpass=
+rpclisten=127.0.0.1:44107
+rpclisten=[::1]:44107
+txindex=1
+'@
 	Write-InstallLog "default config template -> $sample"
 
 	$created = $false
