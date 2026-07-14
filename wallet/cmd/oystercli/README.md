@@ -4,10 +4,23 @@ An interactive terminal client for the [oyster](../../README.md) wallet
 daemon. It puts the core wallet workflows behind a menu-driven UI and, since
 it is aimed at technical users, doubles as a troubleshooting tool.
 
+Installed by the release installers (`install.sh` / `install.ps1`) alongside
+the daemon, with both on `$PATH`:
+
+```
+oystercli
+```
+
+For a source checkout:
+
 ```
 task build:oystercli
-./bin/oystercli
+cd bin && ./oystercli
 ```
+
+(When oyster is not on `$PATH`, the create-wallet and start-daemon flows ask
+for its exact location — point them at the built `oyster`, or pass
+`--oysterbin`.)
 
 ## What it does
 
@@ -68,10 +81,14 @@ the matching next step:
   path are printed), waits for its RPC to come up, and connects.
 - **Retry / Doctor / Quit.**
 
-The daemon binary is discovered automatically: `--oysterbin` if given, then
-`$PATH`, then next to the `oystercli` executable (release archives ship them
-side by side), then `./bin`. If none of that works, the CLI asks for the
-location instead of dead-ending, and remembers the answer for the session.
+The daemon binary is resolved from `--oysterbin` if given, otherwise from
+`$PATH` — the release installers put it there, which is the supported setup.
+There is deliberately no implicit lookup in the current directory or next to
+the executable: oystercli hands wallet passphrases and seeds to the binary it
+runs, so it only executes explicitly trusted paths. When oyster is not on
+`$PATH` (e.g. a `task build` tree), the CLI asks for its exact location and
+remembers it for the session; the chosen binary and its origin are always
+printed before use.
 
 If something is listening on `127.0.0.1:8335`, triage points out that this is
 the desktop wallet's private oyster instance (random per-session credentials)

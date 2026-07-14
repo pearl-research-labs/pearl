@@ -146,7 +146,7 @@ func checkOysterBinary(cfg *config) checkResult {
 		return checkResult{"oyster binary", checkPass, p + " (" + src + ")"}
 	}
 	return checkResult{"oyster binary", checkWarn,
-		"not found in $PATH, next to " + appName + ", or ./bin — only needed to create wallets or start the daemon from here"}
+		"not on $PATH — only needed to create wallets or start the daemon from here (use --oysterbin or the prompt)"}
 }
 
 func checkCertificate(cfg *config) checkResult {

@@ -24,7 +24,7 @@ func TestFindOysterBinary(t *testing.T) {
 		p, src, err := findOysterBinary(cfg)
 		require.NoError(t, err)
 		assert.Equal(t, bin, p)
-		assert.Equal(t, "--oysterbin", src)
+		assert.Equal(t, srcFlag, src)
 	})
 
 	t.Run("explicit path missing errors", func(t *testing.T) {
@@ -42,10 +42,22 @@ func TestFindOysterBinary(t *testing.T) {
 		p, src, err := findOysterBinary(cfg)
 		require.NoError(t, err)
 		assert.Equal(t, filepath.Join(dir, "oyster"), p)
-		assert.Equal(t, "PATH", src)
+		assert.Equal(t, srcPath, src)
 	})
 
-	t.Run("found next to the running executable", func(t *testing.T) {
+	// Binaries in untrusted implicit locations must never be picked up:
+	// oystercli passes wallet passphrases and seeds to the daemon it runs.
+	t.Run("cwd is not searched", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFakeBinary(t, filepath.Join(dir, "oyster"))
+		writeFakeBinary(t, filepath.Join(dir, "bin", "oyster"))
+		t.Chdir(dir)
+		cfg := &config{OysterBin: "oyster"}
+		_, _, err := findOysterBinary(cfg)
+		require.Error(t, err)
+	})
+
+	t.Run("executable dir is not searched", func(t *testing.T) {
 		exe, err := os.Executable()
 		require.NoError(t, err)
 		sibling := filepath.Join(filepath.Dir(exe), "oyster")
@@ -53,29 +65,16 @@ func TestFindOysterBinary(t *testing.T) {
 		t.Cleanup(func() { os.Remove(sibling) })
 
 		cfg := &config{OysterBin: "oyster"}
-		p, src, err := findOysterBinary(cfg)
-		require.NoError(t, err)
-		assert.Equal(t, sibling, p)
-		assert.Contains(t, src, "next to")
+		_, _, err = findOysterBinary(cfg)
+		require.Error(t, err)
 	})
 
-	t.Run("found in ./bin", func(t *testing.T) {
-		dir := t.TempDir()
-		writeFakeBinary(t, filepath.Join(dir, "bin", "oyster"))
-		t.Chdir(dir)
-		cfg := &config{OysterBin: "oyster"}
-		p, src, err := findOysterBinary(cfg)
-		require.NoError(t, err)
-		assert.Equal(t, filepath.Join("bin", "oyster"), p)
-		assert.Equal(t, "./bin", src)
-	})
-
-	t.Run("not found anywhere", func(t *testing.T) {
-		t.Chdir(t.TempDir())
+	t.Run("not found reports remedies", func(t *testing.T) {
 		cfg := &config{OysterBin: "oyster"}
 		_, _, err := findOysterBinary(cfg)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "cannot find the oyster binary")
+		assert.Contains(t, err.Error(), "not on your $PATH")
+		assert.Contains(t, err.Error(), "--oysterbin")
 	})
 
 	t.Run("result is cached", func(t *testing.T) {

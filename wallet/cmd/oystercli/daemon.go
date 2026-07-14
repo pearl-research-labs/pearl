@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -24,11 +23,21 @@ import (
 // daemon's RPC to come up.
 const spawnReadyTimeout = 30 * time.Second
 
-// findOysterBinary resolves the daemon binary and reports where it was
-// found. Search order: an explicit --oysterbin path, $PATH, the directory of
-// the running oystercli executable (release archives and the repo bin/ ship
-// the binaries side by side), and finally ./bin relative to the working
-// directory. The result is cached on the config.
+// Binary discovery source labels, also shown to the user in the resolution
+// story, the doctor, and before the binary is executed.
+const (
+	srcFlag    = "--oysterbin"
+	srcPath    = "PATH"
+	srcEntered = "provided path"
+)
+
+// findOysterBinary resolves the daemon binary: an explicit --oysterbin path,
+// then $PATH — nothing else. The release installers put oyster on PATH; that
+// is the supported setup. Deliberately no cwd or executable-relative lookup:
+// implicitly running a binary from the working directory is an untrusted
+// search path (this binary receives wallet passphrases and seeds), and
+// developers running from a `task build` tree can pass --oysterbin or answer
+// the prompt. The result is cached on the config.
 func findOysterBinary(cfg *config) (path, source string, err error) {
 	if cfg.resolvedOysterBin != "" {
 		return cfg.resolvedOysterBin, cfg.resolvedOysterSrc, nil
@@ -43,100 +52,57 @@ func findOysterBinary(cfg *config) (path, source string, err error) {
 		if !isExecutableFile(cfg.OysterBin) {
 			return "", "", fmt.Errorf("no executable oyster binary at %s (from --oysterbin)", cfg.OysterBin)
 		}
-		return remember(cfg.OysterBin, "--oysterbin")
+		return remember(cfg.OysterBin, srcFlag)
 	}
 
 	if p, lerr := exec.LookPath(cfg.OysterBin); lerr == nil {
-		return remember(p, "PATH")
-	}
-	for _, candidate := range siblingCandidates(cfg.OysterBin) {
-		if isExecutableFile(candidate) {
-			return remember(candidate, "next to "+appName)
-		}
-	}
-	for _, name := range windowsAware(cfg.OysterBin) {
-		if p := filepath.Join("bin", name); isExecutableFile(p) {
-			return remember(p, "./bin")
-		}
+		return remember(p, srcPath)
 	}
 
-	return "", "", fmt.Errorf("cannot find the oyster binary; searched $PATH, %s, and ./bin — point --oysterbin at it or locate it when asked",
-		strings.Join(siblingDirs(), ", "))
+	return "", "", fmt.Errorf("%s is not on your $PATH; install it with the release installer, pass --oysterbin, or provide its path when asked",
+		cfg.OysterBin)
 }
 
-// locateOysterBinary resolves the daemon binary, and when automatic
-// discovery fails, asks the user for its location instead of dead-ending.
-// The answer is remembered for the rest of the session.
+// locateOysterBinary resolves the daemon binary, and when it is not on
+// $PATH, asks for its exact location instead of dead-ending (developers
+// running from a `task build` tree point it at bin/oyster). The answer is
+// remembered for the rest of the session, and the chosen binary is always
+// announced with its origin so there is no ambiguity about what will run.
 func locateOysterBinary(cfg *config) (string, error) {
-	path, _, err := findOysterBinary(cfg)
-	if err == nil {
-		return path, nil
-	}
-	printError(err)
-
-	var entered string
-	ok, ferr := runForm(newForm(huh.NewGroup(
-		huh.NewInput().
-			Title("Path to the oyster binary").
-			Description("It ships next to " + appName + " in release archives, or build it with `task build:oyster`.").
-			Placeholder("/path/to/oyster").
-			Validate(func(s string) error {
-				p := cleanAndExpandPath(strings.TrimSpace(s))
-				if p == "" || !isExecutableFile(p) {
-					return fmt.Errorf("no executable file there")
-				}
-				return nil
-			}).
-			Value(&entered),
-	)))
-	if ferr != nil {
-		return "", ferr
-	}
-	// Re-check outside the form: huh's accessible mode skips field
-	// validators when stdin reaches EOF, handing back an empty value.
-	path = cleanAndExpandPath(strings.TrimSpace(entered))
-	if !ok || !isExecutableFile(path) {
-		return "", err
-	}
-	cfg.resolvedOysterBin, cfg.resolvedOysterSrc = path, "located interactively"
-	return path, nil
-}
-
-// siblingCandidates lists possible daemon locations in the directory of the
-// running executable (following a symlinked oystercli to its real home).
-func siblingCandidates(name string) []string {
-	var candidates []string
-	for _, dir := range siblingDirs() {
-		for _, n := range windowsAware(name) {
-			candidates = append(candidates, filepath.Join(dir, n))
-		}
-	}
-	return candidates
-}
-
-// siblingDirs returns the directories the running executable lives in, both
-// as invoked and with symlinks resolved.
-func siblingDirs() []string {
-	exe, err := os.Executable()
+	path, source, err := findOysterBinary(cfg)
 	if err != nil {
-		return nil
-	}
-	dirs := []string{filepath.Dir(exe)}
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		if dir := filepath.Dir(resolved); dir != dirs[0] {
-			dirs = append(dirs, dir)
-		}
-	}
-	return dirs
-}
+		printError(err)
 
-// windowsAware returns the file names to try for a binary: as-is, plus the
-// .exe form on Windows.
-func windowsAware(name string) []string {
-	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(name), ".exe") {
-		return []string{name + ".exe", name}
+		var entered string
+		ok, ferr := runForm(newForm(huh.NewGroup(
+			huh.NewInput().
+				Title("Path to the oyster binary").
+				Description("Installed by install.sh/install.ps1, or built with `task build:oyster` into bin/.").
+				Placeholder("/path/to/oyster").
+				Validate(func(s string) error {
+					p := cleanAndExpandPath(strings.TrimSpace(s))
+					if p == "" || !isExecutableFile(p) {
+						return fmt.Errorf("no executable file there")
+					}
+					return nil
+				}).
+				Value(&entered),
+		)))
+		if ferr != nil {
+			return "", ferr
+		}
+		// Re-check outside the form: huh's accessible mode skips field
+		// validators when stdin reaches EOF, handing back an empty value.
+		path = cleanAndExpandPath(strings.TrimSpace(entered))
+		if !ok || !isExecutableFile(path) {
+			return "", err
+		}
+		source = srcEntered
+		cfg.resolvedOysterBin, cfg.resolvedOysterSrc = path, source
 	}
-	return []string{name}
+
+	lipgloss.Println(th.subtle.Render("Using oyster binary: ") + th.accent.Render(path) + th.subtle.Render(" (from "+source+")"))
+	return path, nil
 }
 
 // isExecutableFile reports whether path is a regular file the current user

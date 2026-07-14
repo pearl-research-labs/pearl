@@ -143,7 +143,7 @@ func triageAdvice(cfg *config, kind triageKind) string {
 		case findErr == nil:
 			advice += fmt.Sprintf("\nStart it below, or manually with:\n\n    %s", oysterStartCommand(cfg))
 		default:
-			advice += "\nThe oyster binary was not found automatically either; \"Start oyster now\"\nbelow will ask where it is."
+			advice += "\noyster is not on your $PATH; \"Start oyster now\" below will ask for its path."
 		}
 		return advice
 	case triageTLS:

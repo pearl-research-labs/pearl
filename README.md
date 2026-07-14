@@ -88,10 +88,11 @@ The setup flow: **build** > **create wallet** > **start node** > **start vLLM mi
 
 The interactive way — [`oystercli`](wallet/cmd/oystercli/) walks you through
 config, wallet creation, starting the daemon, and generating an address
-(Receive menu):
+(Receive menu). With the release installer it is already on your PATH
+(`oystercli`); from a source build:
 
 ```bash
-./bin/oystercli
+cd bin && ./oystercli
 ```
 
 Or manually:
