@@ -1,4 +1,4 @@
-# Install pearld, prlctl, and oyster from Pearl GitHub Releases (Windows).
+# Install pearld, prlctl, oyster, and oystercli from Pearl GitHub Releases (Windows).
 # Prefer: download, inspect, then run.
 #   irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 -OutFile install.ps1
 #   pwsh -File .\install.ps1
@@ -35,7 +35,10 @@ $ErrorActionPreference = 'Stop'
 
 $Repo = 'pearl-research-labs/pearl'
 $Binaries = @('pearld', 'prlctl', 'oyster')
-$AllowedArchiveBins = $Binaries + 'prlmon'
+# Present only in releases that ship the interactive wallet CLI; skipped
+# gracefully when installing older versions.
+$OptionalBinaries = @('oystercli')
+$AllowedArchiveBins = $Binaries + $OptionalBinaries + 'prlmon'
 $TempDir = $null
 $RpcUser = $null
 $RpcPass = $null
@@ -275,6 +278,19 @@ Examples:
 		Write-InstallLog "installing binary -> $dest"
 		Install-FileAtomic $src $dest
 	}
+	foreach ($bin in $OptionalBinaries) {
+		$src = Join-Path $extract "$bin.exe"
+		if (-not (Test-Path -LiteralPath $src)) {
+			Write-InstallLog "$bin.exe is not part of $Version; skipping"
+			continue
+		}
+		if ((Get-Item -LiteralPath $src).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+			throw "refusing symlink/reparse point in archive: $bin.exe"
+		}
+		$dest = Join-Path $BinDir "$bin.exe"
+		Write-InstallLog "installing binary -> $dest"
+		Install-FileAtomic $src $dest
+	}
 
 	Initialize-RpcCredentials
 
@@ -293,8 +309,13 @@ Examples:
 		Write-InstallLog 'RPC username/password were auto-generated; no -u/-P flags needed'
 	}
 
-	$binLines = ($Binaries | ForEach-Object { "  $(Join-Path $BinDir "$_.exe")" }) -join "`n"
+	$installedBins = $Binaries + ($OptionalBinaries | Where-Object { Test-Path -LiteralPath (Join-Path $BinDir "$_.exe") })
+	$binLines = ($installedBins | ForEach-Object { "  $(Join-Path $BinDir "$_.exe")" }) -join "`n"
 	$configLines = (@('pearld', 'oyster', 'prlctl') | ForEach-Object { "  $(Get-AppConfigPath $_)" }) -join "`n"
+	$oystercliLine = ''
+	if (Test-Path -LiteralPath (Join-Path $BinDir 'oystercli.exe')) {
+		$oystercliLine = "`n  oystercli              # interactive wallet UI"
+	}
 	@"
 
 pearl-install: done ($Version)
@@ -310,7 +331,7 @@ Next steps (no -u/-P/-C needed):
   oyster --create
   oyster                 # SPV sync by default
   prlctl getinfo
-  prlctl --wallet getinfo
+  prlctl --wallet getinfo$oystercliLine
 "@ | Write-Host
 
 	$normalizedBin = [IO.Path]::GetFullPath($BinDir).TrimEnd('\')

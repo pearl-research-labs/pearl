@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install pearld, prlctl, and oyster from Pearl GitHub Releases.
+# Install pearld, prlctl, oyster, and oystercli from Pearl GitHub Releases.
 # Usage: curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh | sh
 # Prefer: download, inspect, then run with sh.
 
@@ -9,6 +9,9 @@ REPO="pearl-research-labs/pearl"
 GITHUB_BASE="https://github.com/${REPO}"
 RELEASE_BASE="${GITHUB_BASE}/releases"
 BINARIES="pearld prlctl oyster"
+# Present only in releases that ship the interactive wallet CLI; skipped
+# gracefully when installing older versions.
+OPTIONAL_BINARIES="oystercli"
 CONFIGS="pearld oyster prlctl"
 
 PRINT_HELP=0
@@ -21,7 +24,7 @@ RPC_PASS=""
 
 usage() {
 	cat << 'EOF'
-Install Pearl release binaries (pearld, prlctl, oyster) and mainnet configs.
+Install Pearl release binaries (pearld, prlctl, oyster, oystercli) and mainnet configs.
 
 Usage:
   install.sh [options]
@@ -263,7 +266,7 @@ extract_binaries() {
 		case "$_name" in
 			'' | */) continue ;;
 			*/*) die "refusing nested archive path: $_member" ;;
-			pearld | prlctl | oyster | prlmon) ;;
+			pearld | prlctl | oyster | oystercli | prlmon) ;;
 			*) die "unexpected archive member: $_member" ;;
 		esac
 	done < "$_list"
@@ -272,10 +275,20 @@ extract_binaries() {
 		tar -xzf "$_archive" -C "$_staging" ./pearld ./prlctl ./oyster \
 			|| die "archive is missing one or more of: ${BINARIES}"
 	fi
+	for _bin in $OPTIONAL_BINARIES; do
+		tar -xzf "$_archive" -C "$_staging" "$_bin" 2> /dev/null \
+			|| tar -xzf "$_archive" -C "$_staging" "./${_bin}" 2> /dev/null \
+			|| true
+	done
 
-	for _bin in $BINARIES; do
+	for _bin in $BINARIES $OPTIONAL_BINARIES; do
 		_path="${_staging}/${_bin}"
-		[ -e "$_path" ] || die "missing ${_bin} after extraction"
+		if [ ! -e "$_path" ]; then
+			case " ${OPTIONAL_BINARIES} " in
+				*" ${_bin} "*) continue ;;
+			esac
+			die "missing ${_bin} after extraction"
+		fi
 		[ ! -L "$_path" ] || die "refusing symlink in archive: ${_bin}"
 		[ -f "$_path" ] || die "refusing non-regular file: ${_bin}"
 	done
@@ -465,7 +478,7 @@ pearl-install: done (${VERSION})
 Binaries:
   ${BIN_DIR}/pearld
   ${BIN_DIR}/prlctl
-  ${BIN_DIR}/oyster
+  ${BIN_DIR}/oyster$([ -f "${BIN_DIR}/oystercli" ] && printf '\n  %s' "${BIN_DIR}/oystercli")
 
 Configs (OS default locations, shared RPC credentials):
   $(config_path pearld)
@@ -477,7 +490,7 @@ Next steps (no -u/-P/-C needed):
   oyster --create
   oyster                 # SPV sync by default
   prlctl getinfo
-  prlctl --wallet getinfo
+  prlctl --wallet getinfo$([ -f "${BIN_DIR}/oystercli" ] && printf '\n  %s' 'oystercli              # interactive wallet UI')
 EOF
 
 	if ! path_contains "$BIN_DIR"; then
@@ -539,6 +552,14 @@ main() {
 	for bin in $BINARIES; do
 		info "installing binary -> ${BIN_DIR}/${bin}"
 		install_binary "${TMP_DIR}/staging/${bin}" "$BIN_DIR"
+	done
+	for bin in $OPTIONAL_BINARIES; do
+		if [ -f "${TMP_DIR}/staging/${bin}" ]; then
+			info "installing binary -> ${BIN_DIR}/${bin}"
+			install_binary "${TMP_DIR}/staging/${bin}" "$BIN_DIR"
+		else
+			info "${bin} is not part of ${VERSION}; skipping"
+		fi
 	done
 
 	install_default_configs

@@ -47,7 +47,7 @@ Windows:
 irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 | iex
 ```
 
-Installs `pearld`, `prlctl`, and `oyster` with localhost-only mainnet defaults and
+Installs `pearld`, `prlctl`, `oyster`, and `oystercli` with localhost-only mainnet defaults and
 shared RPC credentials (oyster uses SPV by default). Binaries go to
 `${XDG_BIN_HOME:-$HOME/.local/bin}` on macOS/Linux, or `%LOCALAPPDATA%\Pearl\bin`
 on Windows.
