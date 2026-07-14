@@ -19,7 +19,7 @@ system, vLLM miner, and supporting tools.
 | Directory | Description |
 |-----------|-------------|
 | [`node/`](node/) | **pearld** — reference implementation of the Pearl Protocol (full node) |
-| [`wallet/`](wallet/) | **Oyster** — HD wallet daemon with JSON-RPC and gRPC interfaces |
+| [`wallet/`](wallet/) | **Oyster** — HD wallet daemon with JSON-RPC and gRPC interfaces, plus [**oystercli**](wallet/cmd/oystercli/), an interactive terminal client for it |
 | [`spv/`](spv/) | **Pearl light client** — privacy-preserving SPV client using compact block filters |
 | [`dnsseeder/`](dnsseeder/) | DNS seeder for the Pearl network |
 | [`coredns-dnsseed/`](coredns-dnsseed/) | CoreDNS plugin — production DNS seeder |
@@ -75,7 +75,7 @@ for upgrade, removal, and other details. To build from source, see **Building** 
 
 ```bash
 task build              # build everything (blockchain + vLLM miner)
-task build:blockchain   # pearld, prlctl, oyster → bin/
+task build:blockchain   # pearld, prlctl, oyster, oystercli → bin/
 task build:miner        # install vLLM miner Python packages
 task build:pearld       # pearld only
 ```
@@ -85,6 +85,16 @@ task build:pearld       # pearld only
 The setup flow: **build** > **create wallet** > **start node** > **start vLLM miner**.
 
 ### 1. Create a wallet and get a mining address
+
+The interactive way — [`oystercli`](wallet/cmd/oystercli/) walks you through
+config, wallet creation, starting the daemon, and generating an address
+(Receive menu):
+
+```bash
+./bin/oystercli
+```
+
+Or manually:
 
 ```bash
 ./bin/oyster -u rpcuser -P rpcpass --create

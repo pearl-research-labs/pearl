@@ -117,6 +117,7 @@ Binaries are placed in `bin/`:
 - `pearld` — full node
 - `prlctl` — CLI control tool
 - `oyster` — wallet daemon
+- `oystercli` — interactive wallet CLI
 
 To build only the node:
 
