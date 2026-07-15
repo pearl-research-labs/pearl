@@ -14,7 +14,7 @@ require (
 	github.com/coredns/caddy v1.1.4
 	github.com/coredns/coredns v1.14.6
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/decred/dcrd/lru v1.1.3
 	github.com/golang/protobuf v1.5.4
 	github.com/golangci/golangci-lint v1.64.8
@@ -26,7 +26,7 @@ require (
 	github.com/lightningnetwork/lnd/fn/v2 v2.0.9
 	github.com/lightningnetwork/lnd/queue v1.2.0
 	github.com/lightningnetwork/lnd/ticker v1.1.1
-	github.com/lightningnetwork/lnd/tlv v1.3.2
+	github.com/lightningnetwork/lnd/tlv v1.4.0
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/miekg/dns v1.1.72
 	github.com/ory/go-acc v0.2.8
@@ -74,9 +74,9 @@ require (
 	github.com/bombsimon/wsl/v4 v4.5.0 // indirect
 	github.com/breml/bidichk v0.3.2 // indirect
 	github.com/breml/errchkjson v0.4.0 // indirect
-	github.com/btcsuite/btcd v0.24.3-0.20250318170759-4f4ea81776d6 // indirect
-	github.com/btcsuite/btcd/btcec/v2 v2.3.6 // indirect
-	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
+	github.com/btcsuite/btcd/btcec/v2 v2.5.0 // indirect
+	github.com/btcsuite/btcd/chainhash/v2 v2.0.0 // indirect
+	github.com/btcsuite/btcd/wire/v2 v2.0.0 // indirect
 	github.com/butuzov/ireturn v0.3.1 // indirect
 	github.com/butuzov/mirror v1.3.0 // indirect
 	github.com/catenacyber/perfsprint v0.8.2 // indirect
