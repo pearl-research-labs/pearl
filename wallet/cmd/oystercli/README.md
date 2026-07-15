@@ -26,7 +26,8 @@ for its exact location — point them at the built `oyster`, or pass
 
 - **Overview** — per-account balances, pending funds, recent activity.
 - **Send** — guided flow with address/amount validation, a review step, and
-  automatic unlock prompting.
+  automatic unlock prompting; the fee rate defaults to the network's minimum
+  relay fee (0.00001 PRL/kB).
 - **Receive** — fresh or current addresses, rendered with a scannable QR code.
 - **Transactions** — paged history browser with filtering and full detail view.
 - **Accounts** — list, create, rename, and inspect addresses.

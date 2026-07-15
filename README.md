@@ -86,10 +86,10 @@ The setup flow: **build** > **create wallet** > **start node** > **start vLLM mi
 
 ### 1. Create a wallet and get a mining address
 
-The interactive way — [`oystercli`](wallet/cmd/oystercli/) walks you through
-config, wallet creation, starting the daemon, and generating an address
-(Receive menu). With the release installer it is already on your PATH
-(`oystercli`); from a source build:
+The interactive way — [`oystercli`](wallet/cmd/oystercli/) configures oyster
+automatically and walks you through wallet creation, starting the daemon, and
+generating an address (Receive menu). With the release installer it is already
+on your PATH (`oystercli`); from a source build:
 
 ```bash
 cd bin && ./oystercli

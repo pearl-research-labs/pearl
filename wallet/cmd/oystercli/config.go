@@ -39,7 +39,7 @@ type config struct {
 	SimNet      bool   `long:"simnet" description:"Connect to the simulation test network"`
 	SigNet      bool   `long:"signet" description:"Connect to the signet test network"`
 	Verbose     bool   `short:"v" long:"verbose" description:"Trace every RPC call to stderr"`
-	OysterBin   string `long:"oysterbin" description:"Path to the oyster binary (for wallet creation and starting the daemon; default: search PATH, next to this binary, then ./bin)"`
+	OysterBin   string `long:"oysterbin" description:"Path to the oyster binary (for wallet creation and starting the daemon; default: search PATH)"`
 
 	activeNet *netparams.Params
 	src       sources
