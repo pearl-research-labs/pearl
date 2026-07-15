@@ -4,7 +4,8 @@
 
 The release installer downloads the platform archive from GitHub Releases,
 verifies its SHA-256 against `checksums.txt`, and installs `pearld`, `prlctl`,
-and `oyster`:
+`oyster`, and `oystercli` (the interactive wallet CLI, in releases that
+include it):
 
 - macOS/Linux: `install.sh` → `${XDG_BIN_HOME:-$HOME/.local/bin}`
 - Windows: `install.ps1` → `%LOCALAPPDATA%\Pearl\bin`
@@ -75,13 +76,15 @@ unchanged.
 ```bash
 rm -f "${XDG_BIN_HOME:-$HOME/.local/bin}/pearld" \
       "${XDG_BIN_HOME:-$HOME/.local/bin}/prlctl" \
-      "${XDG_BIN_HOME:-$HOME/.local/bin}/oyster"
+      "${XDG_BIN_HOME:-$HOME/.local/bin}/oyster" \
+      "${XDG_BIN_HOME:-$HOME/.local/bin}/oystercli"
 ```
 
 ```powershell
 Remove-Item "$env:LOCALAPPDATA\Pearl\bin\pearld.exe", `
             "$env:LOCALAPPDATA\Pearl\bin\prlctl.exe", `
-            "$env:LOCALAPPDATA\Pearl\bin\oyster.exe" -ErrorAction SilentlyContinue
+            "$env:LOCALAPPDATA\Pearl\bin\oyster.exe", `
+            "$env:LOCALAPPDATA\Pearl\bin\oystercli.exe" -ErrorAction SilentlyContinue
 ```
 
 Configs are not removed automatically. Delete them from the paths in the table
@@ -117,6 +120,7 @@ Binaries are placed in `bin/`:
 - `pearld` — full node
 - `prlctl` — CLI control tool
 - `oyster` — wallet daemon
+- `oystercli` — interactive wallet CLI
 
 To build only the node:
 
