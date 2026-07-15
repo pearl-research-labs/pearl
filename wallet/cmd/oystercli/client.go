@@ -251,8 +251,14 @@ func (c *client) send(fromAccount, toAddress string, amount btcutil.Amount, feeR
 	if err != nil {
 		return nil, err
 	}
-	return traced(c, "sendfrom", func() (*chainhash.Hash, error) {
-		return c.rpc.SendFromMinConf(fromAccount, addr, amount, feeRatePerKb, minConf)
+	// Use sendmany rather than sendfrom: oyster gates sendfrom on an
+	// RPC-typed chain client, so it fails with "Chain RPC is inactive" in
+	// SPV mode even though the broadcast itself goes out over P2P. sendmany
+	// takes the same from-account, fee rate, and minconf and works with
+	// either backend (it is also what the desktop wallet uses).
+	amounts := map[btcutil.Address]btcutil.Amount{addr: amount}
+	return traced(c, "sendmany", func() (*chainhash.Hash, error) {
+		return c.rpc.SendManyMinConf(fromAccount, amounts, feeRatePerKb, minConf)
 	})
 }
 
