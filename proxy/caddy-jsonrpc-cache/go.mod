@@ -1,6 +1,6 @@
 module github.com/pearl-research-labs/pearl/proxy/caddy-jsonrpc-cache
 
-go 1.26.1
+go 1.26.5
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
