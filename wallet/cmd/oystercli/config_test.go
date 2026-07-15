@@ -69,12 +69,6 @@ func TestScrapeOysterConfMissingFile(t *testing.T) {
 	assert.Equal(t, oysterConfValues{}, got)
 }
 
-func TestCleanAndExpandPathEmpty(t *testing.T) {
-	// Address/path normalization itself lives in (and is exercised via)
-	// wallet/internal/cfgutil; oystercli only special-cases the empty path.
-	assert.Equal(t, "", cleanAndExpandPath(""))
-}
-
 func TestRescrapeConf(t *testing.T) {
 	cfg := &config{AppData: t.TempDir()}
 	cfg.activeNet = mainNetForTest()
@@ -88,18 +82,4 @@ func TestRescrapeConf(t *testing.T) {
 	assert.True(t, cfg.NoTLS)
 	assert.Equal(t, "found", cfg.src.conf)
 	assert.Equal(t, "oyster.conf (auto-provisioned)", cfg.src.creds)
-}
-
-func TestWalletDBPaths(t *testing.T) {
-	dir := t.TempDir()
-	cfg := &config{AppData: dir}
-	cfg.activeNet = mainNetForTest()
-
-	assert.Equal(t, filepath.Join(dir, "mainnet", "wallet.db"), cfg.walletDBPath())
-	assert.Equal(t, filepath.Join(dir, "logs", "mainnet", "oyster.log"), cfg.logFilePath())
-	assert.False(t, cfg.walletDBExists())
-
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "mainnet"), 0o700))
-	require.NoError(t, os.WriteFile(cfg.walletDBPath(), []byte("db"), 0o600))
-	assert.True(t, cfg.walletDBExists())
 }

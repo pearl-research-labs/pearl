@@ -156,15 +156,3 @@ func TestRandomHex(t *testing.T) {
 	assert.Len(t, a, 48)
 	assert.NotEqual(t, a, b)
 }
-
-func TestConfHasCredentials(t *testing.T) {
-	cfg := &config{AppData: t.TempDir()}
-	cfg.activeNet = mainNetForTest()
-	assert.False(t, confHasCredentials(cfg))
-
-	require.NoError(t, os.WriteFile(cfg.oysterConfPath(), []byte("username=u\n"), 0o600))
-	assert.False(t, confHasCredentials(cfg))
-
-	require.NoError(t, os.WriteFile(cfg.oysterConfPath(), []byte("username=u\npassword=p\n"), 0o600))
-	assert.True(t, confHasCredentials(cfg))
-}

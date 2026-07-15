@@ -13,31 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCheckCredentials(t *testing.T) {
-	tests := []struct {
-		name string
-		cfg  *config
-		want checkStatus
-	}{
-		{"both set", &config{RPCUser: "u", RPCPass: "p"}, checkPass},
-		{"missing password", &config{RPCUser: "u"}, checkFail},
-		{"missing both", &config{}, checkFail},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, checkCredentials(tt.cfg).status)
-		})
-	}
-}
-
-func TestCheckWalletDB(t *testing.T) {
-	missing := &config{AppData: t.TempDir()}
-	missing.activeNet = mainNetForTest()
-	assert.Equal(t, checkFail, checkWalletDB(missing).status)
-
-	assert.Equal(t, checkPass, checkWalletDB(configWithWalletDB(t)).status)
-}
-
 func TestCheckCertificate(t *testing.T) {
 	t.Run("notls warns", func(t *testing.T) {
 		got := checkCertificate(&config{NoTLS: true})

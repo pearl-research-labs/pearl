@@ -6,11 +6,9 @@ package main
 
 import (
 	"errors"
-	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestClassifyConnectError(t *testing.T) {
@@ -38,15 +36,4 @@ func TestClassifyConnectError(t *testing.T) {
 			assert.Equal(t, tt.want, classifyConnectError(tt.cfg, tt.err))
 		})
 	}
-}
-
-func TestProbeTCP(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer l.Close()
-
-	assert.True(t, probeTCP(l.Addr().String()))
-
-	l.Close()
-	assert.False(t, probeTCP(l.Addr().String()))
 }

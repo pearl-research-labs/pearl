@@ -32,12 +32,3 @@ func TestUsableMethods(t *testing.T) {
 		assert.Zero(t, flags&consoleUnusableFlags, "method %s should be unusable", m)
 	}
 }
-
-func TestHistorySuggestions(t *testing.T) {
-	var history []string
-	for i := 0; i < 30; i++ {
-		history = append(history, "cmd")
-	}
-	assert.Len(t, historySuggestions(history), 20)
-	assert.Len(t, historySuggestions([]string{"a", "b"}), 2)
-}

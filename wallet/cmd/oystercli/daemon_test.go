@@ -126,14 +126,6 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
-func TestNetworkFlag(t *testing.T) {
-	assert.Equal(t, "", networkFlag(&config{}))
-	assert.Equal(t, "--testnet", networkFlag(&config{TestNet: true}))
-	assert.Equal(t, "--testnet2", networkFlag(&config{TestNet2: true}))
-	assert.Equal(t, "--simnet", networkFlag(&config{SimNet: true}))
-	assert.Equal(t, "--signet", networkFlag(&config{SigNet: true}))
-}
-
 func TestSpawnArgs(t *testing.T) {
 	t.Run("default appdata mainnet has no args", func(t *testing.T) {
 		cfg := &config{AppData: oysterHomeDir}

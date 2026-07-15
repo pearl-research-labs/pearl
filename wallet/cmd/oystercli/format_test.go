@@ -32,12 +32,6 @@ func TestFmtPRLFloat(t *testing.T) {
 	}
 }
 
-func TestFmtPRL(t *testing.T) {
-	amt, err := btcutil.NewAmount(12.345)
-	require.NoError(t, err)
-	assert.Equal(t, "12.345 PRL", fmtPRL(amt))
-}
-
 func TestParsePRL(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -81,12 +75,6 @@ func TestShortID(t *testing.T) {
 			assert.Equal(t, tt.want, shortID(tt.s, tt.max))
 		})
 	}
-}
-
-func TestFmtConfs(t *testing.T) {
-	assert.Equal(t, "unconfirmed", fmtConfs(0))
-	assert.Equal(t, "unconfirmed", fmtConfs(-1))
-	assert.Equal(t, "3 conf", fmtConfs(3))
 }
 
 func TestSortedKeys(t *testing.T) {

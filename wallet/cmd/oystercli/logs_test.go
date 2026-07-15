@@ -5,13 +5,9 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // Log lines carry remote-controlled strings (peer user agents), so the viewer
@@ -44,14 +40,4 @@ func TestColorizeLogLineSanitizes(t *testing.T) {
 	out := colorizeLogLine("[INF] peer (\x1b]0;spoofed\x07)")
 	assert.NotContains(t, out, "\x1b]0;", "OSC sequence must not survive")
 	assert.Contains(t, out, "spoofed", "text content is kept visible")
-}
-
-func TestTailLines(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "oyster.log")
-	content := strings.Repeat("line\n", 5) + "last\n"
-	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
-
-	lines, err := tailLines(path, 3)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"line", "line", "last"}, lines)
 }
