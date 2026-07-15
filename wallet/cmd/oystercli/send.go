@@ -103,7 +103,11 @@ func sendScreen(c *client) error {
 		{"Network", c.cfg.activeNet.Params.Name},
 	}))
 
-	confirmed := false
+	// Default to Send: this confirm is the final step of a transaction the
+	// user just built and reviewed, so Enter should commit it (matching the
+	// Enter-to-advance rhythm of the fields above). When the wallet is
+	// locked, the passphrase prompt in withAutoUnlock is the real gate.
+	confirmed := true
 	ok, err := runForm(newForm(huh.NewGroup(
 		huh.NewConfirm().
 			Title("Broadcast this transaction?").
@@ -114,7 +118,7 @@ func sendScreen(c *client) error {
 	)))
 	if err != nil || !ok || !confirmed {
 		if err == nil {
-			printWarn("Send cancelled.")
+			printWarn("Send cancelled. Nothing was broadcast.")
 		}
 		return err
 	}

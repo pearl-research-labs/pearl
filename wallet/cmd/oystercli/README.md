@@ -108,6 +108,39 @@ and steers toward running a dedicated daemon instead.
 | `-v, --verbose` | Trace every RPC call (method, duration, outcome) to stderr |
 | `-V, --version` | Print the version |
 
+## Handling of secrets
+
+oystercli deals with two secrets: the **RPC password** (authenticates to the
+daemon) and the **wallet passphrase** (unlocks the wallet). How they are
+handled:
+
+- **The wallet's decryption key never enters oystercli.** The passphrase is
+  forwarded to the daemon via the `walletpassphrase` RPC; oyster holds the
+  derived key. oystercli keeps the passphrase only as a short-lived local
+  while a single unlock/create/sign call runs — it is never cached, and it is
+  never written to the config.
+- **Prompts are masked** (`EchoModePassword`); typed secrets are not echoed.
+- **Nothing secret is logged.** `--verbose` traces method name, duration, and
+  error code only — never parameters. The doctor report is credential-free by
+  construction.
+- **No secrets on the command line.** The daemon is spawned with only
+  `--appdata`/network flags; credentials come from `oyster.conf`. Wallet
+  creation passes the passphrase/seed to `oyster --createfromfile` through a
+  file in a private `0700` temp directory (file mode `0600`), removed
+  immediately after.
+- **On-disk credentials** live only in `oyster.conf` (mode `0600`), which the
+  daemon itself requires; the guided setup writes it and never widens its
+  permissions.
+- **The wallet is re-locked on exit** if this session unlocked it.
+- Use TLS (the default) so the RPC password and passphrase are encrypted in
+  transit; `--notls` is only appropriate for a loopback-only daemon.
+
+Two inherent limits worth knowing: Go strings cannot be reliably zeroed in
+memory, so secrets may persist in the heap until garbage collected; and the
+RPC password is held for the whole session because HTTP POST auth needs it on
+every call. Passing `-P`/`--rpcpass` on the command line also exposes it via
+`ps` — prefer `oyster.conf` discovery or the interactive prompt.
+
 ## Accessibility
 
 Set `ACCESSIBLE=1` to switch every prompt to plain, screen-reader friendly

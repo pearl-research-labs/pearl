@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -130,23 +131,27 @@ func createWalletWizard(cfg *config) error {
 // runOysterCreate writes the wallet-setup JSON to a private temp file, runs
 // the daemon in --createfromfile mode, and extracts the seed it prints.
 func runOysterCreate(cfg *config, binPath string, setup map[string]string) (string, error) {
-	f, err := os.CreateTemp("", "oystercli-setup-*.json")
+	// The setup blob carries the private passphrase and seed, and
+	// oyster --createfromfile only accepts a file path. Put it in a
+	// private 0700 directory (so other users cannot even observe the
+	// filename), write the file 0600, and remove the whole directory
+	// afterwards. It exists only for the brief lifetime of the create call.
+	dir, err := os.MkdirTemp("", "oystercli-setup-")
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(f.Name())
+	defer os.RemoveAll(dir)
+
 	blob, err := json.Marshal(setup)
 	if err != nil {
-		f.Close()
 		return "", err
 	}
-	if _, err := f.Write(blob); err != nil {
-		f.Close()
+	setupPath := filepath.Join(dir, "wallet-setup.json")
+	if err := os.WriteFile(setupPath, blob, 0o600); err != nil {
 		return "", err
 	}
-	f.Close()
 
-	args := []string{"--appdata=" + cfg.AppData, "--createfromfile=" + f.Name()}
+	args := []string{"--appdata=" + cfg.AppData, "--createfromfile=" + setupPath}
 	if flag := networkFlag(cfg); flag != "" {
 		args = append(args, flag)
 	}
