@@ -15,7 +15,7 @@ type sources struct {
 	network string
 	appData string
 	conf    string // "found" / "not found"
-	creds   string // e.g. "oyster.conf", "flags", "entered at prompt", "none found"
+	creds   string // e.g. "flags", "oyster.conf", "oyster.conf (auto-provisioned)", "none found"
 	tls     string
 	connect string
 }

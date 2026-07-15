@@ -68,34 +68,19 @@ func traced[T any](c *client, method string, fn func() (T, error)) (T, error) {
 	if c.cfg.Verbose {
 		status := "ok"
 		if err != nil {
-			status = errString(err)
+			status = rawErrorDetail(err)
 		}
 		fmt.Fprintf(os.Stderr, "rpc %-24s %8s  %s\n", method, time.Since(start).Round(time.Millisecond), status)
 	}
 	return v, err
 }
 
-func errString(err error) string {
-	var rpcErr *btcjson.RPCError
-	if errors.As(err, &rpcErr) {
-		return fmt.Sprintf("error %d: %s", rpcErr.Code, rpcErr.Message)
-	}
-	return "error: " + err.Error()
-}
-
-// rawCall invokes an RPC method with JSON-encoded params and decodes the
-// result into out (skipped when out is nil).
-func (c *client) rawCall(method string, params []interface{}, out interface{}) error {
-	rawParams := make([]json.RawMessage, 0, len(params))
-	for _, p := range params {
-		b, err := json.Marshal(p)
-		if err != nil {
-			return err
-		}
-		rawParams = append(rawParams, b)
-	}
+// rawCall invokes a parameterless RPC method and decodes the result into out
+// (skipped when out is nil). It exists for the oyster extension methods that
+// have no typed rpcclient binding.
+func (c *client) rawCall(method string, out interface{}) error {
 	res, err := traced(c, method, func() (json.RawMessage, error) {
-		return c.rpc.RawRequest(method, rawParams)
+		return c.rpc.RawRequest(method, nil)
 	})
 	if err != nil {
 		return err
@@ -119,7 +104,7 @@ func isRPCErrorCode(err error, code btcjson.RPCErrorCode) bool {
 // snake_case field names, so hand-rolled mirror structs decode to zeros.
 func (c *client) syncStatus() (*btcjson.GetSyncProgressResult, error) {
 	var sp btcjson.GetSyncProgressResult
-	if err := c.rawCall("getsyncprogress", nil, &sp); err != nil {
+	if err := c.rawCall("getsyncprogress", &sp); err != nil {
 		return nil, err
 	}
 	return &sp, nil
@@ -127,7 +112,7 @@ func (c *client) syncStatus() (*btcjson.GetSyncProgressResult, error) {
 
 func (c *client) walletLocked() (bool, error) {
 	var locked bool
-	err := c.rawCall("walletislocked", nil, &locked)
+	err := c.rawCall("walletislocked", &locked)
 	return locked, err
 }
 
@@ -135,7 +120,7 @@ func (c *client) walletLocked() (bool, error) {
 // getsyncprogress it works for both SPV and pearld-backed daemons.
 func (c *client) chainSynced() (bool, error) {
 	var synced bool
-	err := c.rawCall("chainsynced", nil, &synced)
+	err := c.rawCall("chainsynced", &synced)
 	return synced, err
 }
 
