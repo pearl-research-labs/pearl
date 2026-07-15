@@ -101,6 +101,10 @@ func TestSortedKeys(t *testing.T) {
 
 func TestSyncPercent(t *testing.T) {
 	assert.Equal(t, "50.0% (50/100)", syncPercent(&syncInfo{height: 50, peerHeight: 100}))
+	// Nearly-but-not-fully synced must not round up to 100.0%.
+	assert.Equal(t, "99.9% (86840/86864)", syncPercent(&syncInfo{height: 86840, peerHeight: 86864}))
+	// Genuinely at the tip shows 100.0%; ahead of the peer is capped.
+	assert.Equal(t, "100.0% (100/100)", syncPercent(&syncInfo{height: 100, peerHeight: 100}))
 	assert.Equal(t, "100.0% (120/100)", syncPercent(&syncInfo{height: 120, peerHeight: 100}))
 	assert.Equal(t, "height 42", syncPercent(&syncInfo{height: 42}))
 }

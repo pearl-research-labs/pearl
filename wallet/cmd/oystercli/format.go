@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,10 +77,13 @@ func fmtConfs(confs int64) string {
 }
 
 // syncPercent formats sync progress as a percentage of the best known peer
-// height, falling back to raw heights when peers haven't reported yet.
+// height, falling back to raw heights when peers haven't reported yet. The
+// value is truncated (not rounded) to one decimal so it never displays
+// "100.0%" while still behind — e.g. 86840/86864 shows 99.9%, not 100.0%.
 func syncPercent(si *syncInfo) string {
 	if si.peerHeight > 0 {
 		pct := float64(si.height) / float64(si.peerHeight) * 100
+		pct = math.Floor(pct*10) / 10
 		if pct > 100 {
 			pct = 100
 		}
