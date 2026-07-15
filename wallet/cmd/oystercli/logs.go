@@ -171,8 +171,13 @@ func printLogDelta(path string, offset int64) int64 {
 	return fi.Size()
 }
 
-// colorizeLogLine highlights btclog level tags.
+// colorizeLogLine highlights btclog level tags. The line is sanitized first:
+// logs contain remote-controlled strings (e.g. peer user agents, which the
+// wire protocol only length-limits), so raw control characters would let a
+// peer inject terminal escapes — prompt spoofing, OSC clipboard writes —
+// into the viewer.
 func colorizeLogLine(line string) string {
+	line = stripControlRunes(line)
 	switch {
 	case strings.Contains(line, "[ERR]"), strings.Contains(line, "[CRT]"):
 		return th.bad.Render(line)
@@ -183,4 +188,19 @@ func colorizeLogLine(line string) string {
 	default:
 		return th.value.Render(line)
 	}
+}
+
+// stripControlRunes replaces C0/C1 control characters (except tab) with the
+// Unicode replacement character, keeping injected sequences visible rather
+// than silently dropping them.
+func stripControlRunes(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return '\uFFFD'
+		}
+		return r
+	}, s)
 }

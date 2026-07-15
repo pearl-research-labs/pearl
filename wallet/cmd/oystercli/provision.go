@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -101,6 +102,13 @@ func writeProvisionedConf(path string, existing oysterConfValues, pc provisioned
 	}
 	if len(add) == 0 {
 		return false, nil
+	}
+
+	// os.WriteFile only applies the mode when creating a file, so a
+	// pre-existing world-readable config must be tightened before secrets
+	// are written into it. Refuse to proceed if that fails.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return false, fmt.Errorf("cannot make %s private before adding credentials: %w", path, err)
 	}
 
 	var b strings.Builder

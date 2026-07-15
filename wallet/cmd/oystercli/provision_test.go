@@ -80,6 +80,26 @@ func TestAutoProvisionAppendsOnlyMissingCreds(t *testing.T) {
 	assert.NotContains(t, text, "rpclisten")
 }
 
+func TestAutoProvisionTightensPermsBeforeAppendingCreds(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("chmod semantics differ for root")
+	}
+	initUI(true)
+	cfg := &config{AppData: t.TempDir()}
+	cfg.activeNet = mainNetForTest()
+	// A world-readable conf without credentials: os.WriteFile alone would
+	// leave the generated password readable by every local user.
+	require.NoError(t, os.WriteFile(cfg.oysterConfPath(),
+		[]byte("[Application Options]\nusespv=1\n"), 0o644))
+
+	require.NoError(t, autoProvision(cfg))
+
+	fi, err := os.Stat(cfg.oysterConfPath())
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm())
+	assert.True(t, confHasCredentials(cfg))
+}
+
 func TestInsecureConfWarnings(t *testing.T) {
 	tests := []struct {
 		name    string
