@@ -69,48 +69,10 @@ func TestScrapeOysterConfMissingFile(t *testing.T) {
 	assert.Equal(t, oysterConfValues{}, got)
 }
 
-func TestNormalizeAddress(t *testing.T) {
-	tests := []struct {
-		name string
-		addr string
-		want string
-	}{
-		{"bare host", "localhost", "localhost:44207"},
-		{"host with port", "localhost:1234", "localhost:1234"},
-		{"empty defaults to localhost", "", "localhost:44207"},
-		{"ipv4", "10.0.0.5", "10.0.0.5:44207"},
-		{"ipv6 with port", "[::1]:9999", "[::1]:9999"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := normalizeAddress(tt.addr, "44207")
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestCleanAndExpandPath(t *testing.T) {
-	t.Setenv("OYSTERCLI_TEST_DIR", "/tmp/oystercli")
-
-	home, err := os.UserHomeDir()
-	require.NoError(t, err)
-
-	tests := []struct {
-		name string
-		path string
-		want string
-	}{
-		{"plain path", "/var/log/oyster.log", "/var/log/oyster.log"},
-		{"env expansion", "$OYSTERCLI_TEST_DIR/logs", "/tmp/oystercli/logs"},
-		{"tilde expansion", "~/wallet", filepath.Join(home, "wallet")},
-		{"empty", "", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, cleanAndExpandPath(tt.path))
-		})
-	}
+func TestCleanAndExpandPathEmpty(t *testing.T) {
+	// Address/path normalization itself lives in (and is exercised via)
+	// wallet/internal/cfgutil; oystercli only special-cases the empty path.
+	assert.Equal(t, "", cleanAndExpandPath(""))
 }
 
 func TestRescrapeConf(t *testing.T) {

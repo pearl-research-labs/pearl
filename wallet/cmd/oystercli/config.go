@@ -7,15 +7,14 @@ package main
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 
 	flags "github.com/jessevdk/go-flags"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/version"
+	"github.com/pearl-research-labs/pearl/wallet/internal/cfgutil"
 	"github.com/pearl-research-labs/pearl/wallet/netparams"
 )
 
@@ -147,7 +146,7 @@ func loadConfig() (*config, error) {
 		cfg.src.connect = fmt.Sprintf("default %s port", cfg.activeNet.Params.Name)
 	}
 	var err error
-	cfg.Connect, err = normalizeAddress(cfg.Connect, cfg.activeNet.RPCServerPort)
+	cfg.Connect, err = cfgutil.NormalizeAddress(cfg.Connect, cfg.activeNet.RPCServerPort)
 	if err != nil {
 		return nil, fmt.Errorf("invalid RPC connect address %q: %w", cfg.Connect, err)
 	}
@@ -238,30 +237,12 @@ func scrapeOysterConf(path string) oysterConfValues {
 	return vals
 }
 
-// normalizeAddress appends the default port to addr if it doesn't already
-// include one.
-func normalizeAddress(addr, defaultPort string) (string, error) {
-	if addr == "" {
-		addr = "localhost"
-	}
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		return net.JoinHostPort(addr, defaultPort), nil
-	}
-	return addr, nil
-}
-
-// cleanAndExpandPath expands environment variables and a leading ~ in path.
+// cleanAndExpandPath expands environment variables and leading ~ in path.
 func cleanAndExpandPath(path string) string {
 	if path == "" {
 		return path
 	}
-	if strings.HasPrefix(path, "~") {
-		home, err := os.UserHomeDir()
-		if err == nil && home != "" {
-			path = filepath.Join(home, strings.TrimPrefix(path[1:], string(os.PathSeparator)))
-		}
-	}
-	return filepath.Clean(os.ExpandEnv(path))
+	return cfgutil.CleanAndExpandPath(path)
 }
 
 // fileExists reports whether path exists and is a regular file.
