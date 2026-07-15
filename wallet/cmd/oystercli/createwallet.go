@@ -61,8 +61,8 @@ func createWalletWizard(cfg *config) error {
 				Value(&seedInput),
 			huh.NewInput().
 				Title("Wallet birthday (optional)").
-				Description("Approximate creation date, YYYY-MM-DD. Speeds up the initial scan.").
-				Placeholder("2026-01-31").
+				Description("Date of the wallet's first use, YYYY-MM-DD; narrows the recovery scan.\nLeave empty to scan the whole chain.").
+				Placeholder("2026-05-01").
 				Validate(validateBirthday).
 				Value(&birthday),
 		)))
@@ -96,10 +96,7 @@ func createWalletWizard(cfg *config) error {
 	setup := map[string]string{"PrivatePassphrase": passphrase}
 	if mode == modeImport {
 		setup["Seed"] = strings.TrimSpace(seedInput)
-		if b := strings.TrimSpace(birthday); b != "" {
-			t, _ := time.Parse("2006-01-02", b)
-			setup["Bday"] = fmt.Sprintf("%d", t.Unix())
-		}
+		setup["Bday"] = fmt.Sprintf("%d", importBirthday(cfg, birthday).Unix())
 	}
 
 	var seed string
@@ -253,6 +250,20 @@ func wrapWords(s string, perLine int) string {
 		fmt.Fprintf(&b, "%2d.%s", i+1, w)
 	}
 	return b.String()
+}
+
+// importBirthday resolves the recovery start time for a restore. A restored
+// wallet only finds its addresses and balance by rescanning the chain from
+// the birthday, and oyster defaults a missing Bday to time.Now() — which
+// skips all history and leaves the wallet empty. An omitted birthday must
+// therefore mean "scan everything": the chain's genesis time.
+func importBirthday(cfg *config, input string) time.Time {
+	if s := strings.TrimSpace(input); s != "" {
+		if t, err := time.Parse("2006-01-02", s); err == nil {
+			return t
+		}
+	}
+	return cfg.activeNet.Params.GenesisBlock.BlockHeader().Timestamp
 }
 
 // validateBirthday accepts empty or YYYY-MM-DD dates in the past.

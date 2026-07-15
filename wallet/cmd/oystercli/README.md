@@ -74,7 +74,8 @@ When no daemon is reachable, oystercli provisions and manages one for you:
   non-loopback listener), oystercli warns but respects it.
 - **Create a wallet** (when none exists) — drives `oyster --createfromfile`
   (the desktop wallet's mechanism), with a seed backup ceremony for new
-  wallets.
+  wallets. Restores recover funds by rescanning from the wallet birthday you
+  enter, or from the chain's genesis when you leave it empty.
 - **Start oyster now** — spawns the daemon detached (it keeps running after
   oystercli exits; the PID and log path are printed), waits for its RPC, and
   connects.
