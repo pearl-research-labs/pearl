@@ -82,7 +82,7 @@ jobs:
         if: matrix.goos != 'windows'
         run: |
           mkdir -p dist
-          cp bin/pearld bin/prlctl bin/oyster dist/
+          cp bin/pearld bin/prlctl bin/oyster bin/oystercli dist/
           tar -czvf ${{ matrix.artifact_name }}-${{ env.SHA_SHORT }}.tar.gz -C dist .
 
       - name: Package binaries (Windows)
@@ -93,6 +93,7 @@ jobs:
           cp bin/pearld dist/pearld.exe
           cp bin/prlctl dist/prlctl.exe
           cp bin/oyster dist/oyster.exe
+          cp bin/oystercli dist/oystercli.exe
           cd dist && 7z a ../${{ matrix.artifact_name }}-${{ env.SHA_SHORT }}.zip *
 
       - name: Upload artifact
