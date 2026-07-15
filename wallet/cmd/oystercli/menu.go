@@ -5,12 +5,17 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
 )
+
+// errQuit is returned by a screen to request a clean exit of the whole CLI
+// (e.g. after stopping the daemon), as opposed to just returning to the menu.
+var errQuit = errors.New("quit")
 
 // menuAction identifies a top level menu destination.
 type menuAction int
@@ -84,8 +89,13 @@ func runMenu(c *client) error {
 		case actTroubleshoot:
 			screenErr = troubleshootScreen(c)
 		}
-		// Screen errors are shown, not fatal: the user stays in the menu
-		// and can retry or investigate via Troubleshoot.
+		// A screen may ask for a clean exit (e.g. after stopping the
+		// daemon); anything else is shown but non-fatal, so the user stays
+		// in the menu and can retry or investigate via Troubleshoot.
+		if errors.Is(screenErr, errQuit) {
+			lipgloss.Println(th.subtle.Render("\nGoodbye.\n"))
+			return nil
+		}
 		if screenErr != nil {
 			printError(screenErr)
 		}

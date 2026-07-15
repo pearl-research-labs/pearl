@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 
+	"charm.land/huh/v2"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
@@ -84,5 +85,50 @@ func nodeStatusScreen(c *client) error {
 
 	printTitle("Node & sync")
 	printBox(kvLines(rows))
-	return nil
+
+	return nodeActions(c)
+}
+
+// nodeActions offers the daemon-lifecycle actions that belong with the
+// node status: currently just stopping the daemon.
+func nodeActions(c *client) error {
+	const (
+		opBack = "back"
+		opStop = "stop"
+	)
+	choice := opBack
+	submitted, err := runForm(newForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("").
+			Options(
+				huh.NewOption("Back", opBack),
+				huh.NewOption("Stop the daemon and quit", opStop),
+			).
+			Value(&choice),
+	)))
+	if err != nil || !submitted || choice == opBack {
+		return err
+	}
+
+	confirmed := false
+	ok, err := runForm(newForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Stop the oyster daemon?").
+			Description("It goes offline for every client (prlctl, the desktop wallet, this CLI),\nkeys are unloaded from memory, and oystercli will exit. Restart later by\nrunning oystercli again and choosing \"Start oyster now\".").
+			Affirmative("Stop it").
+			Negative("Cancel").
+			Value(&confirmed),
+	)))
+	if err != nil || !ok || !confirmed {
+		if err == nil {
+			printWarn("Left the daemon running.")
+		}
+		return err
+	}
+
+	if err := c.stopDaemon(); err != nil {
+		return err
+	}
+	printSuccess("oyster is stopping.")
+	return errQuit
 }

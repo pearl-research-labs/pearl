@@ -349,6 +349,19 @@ func (c *client) verifyMessage(addr, signature, message string) (bool, error) {
 	})
 }
 
+// stopDaemon asks oyster to shut down gracefully via its authenticated
+// "stop" RPC (wallet unload + clean exit). Only a client holding the
+// daemon's credentials can stop it, so this only ever affects "our" daemon.
+func (c *client) stopDaemon() error {
+	if err := c.rawCall("stop", nil); err != nil {
+		return err
+	}
+	// The daemon is exiting, so there is nothing left to re-lock on our way
+	// out; a stopped process holds no decrypted keys.
+	c.unlockedByUs = false
+	return nil
+}
+
 // lockOnExitIfNeeded locks the wallet again if this session unlocked it.
 func (c *client) lockOnExitIfNeeded() {
 	if c.unlockedByUs {

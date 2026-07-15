@@ -207,8 +207,8 @@ func startOysterNow(cfg *config) error {
 		return fmt.Errorf("oyster (pid %d) failed to become ready", pid)
 	}
 
-	printSuccess(fmt.Sprintf("oyster is running (pid %d). It keeps running after you quit; stop it with: kill %d", pid, pid))
-	lipgloss.Println(th.subtle.Render("Logs: " + cfg.logFilePath()))
+	printSuccess(fmt.Sprintf("oyster is running (pid %d). It keeps running after you quit.", pid))
+	lipgloss.Println(th.subtle.Render(fmt.Sprintf("Stop it later from Node & sync, or with: kill %d  ·  Logs: %s", pid, cfg.logFilePath())))
 	return nil
 }
 

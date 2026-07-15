@@ -77,6 +77,10 @@ When no daemon is reachable, oystercli provisions and manages one for you:
 - **Start oyster now** — spawns the daemon detached (it keeps running after
   oystercli exits; the PID and log path are printed), waits for its RPC, and
   connects.
+- **Stop the daemon** — from the **Node & sync** screen, sends oyster's
+  authenticated `stop` RPC (graceful shutdown, keys unloaded) and exits the
+  CLI. Only a client holding the daemon's credentials can stop it. Restart by
+  running oystercli again and choosing "Start oyster now".
 
 The daemon binary is resolved from `--oysterbin` if given, otherwise from
 `$PATH` — the release installers put it there, which is the supported setup.
