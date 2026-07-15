@@ -14,6 +14,13 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
+// minRelayFeeRate is the network's minimum relay fee rate in PRL/kB
+// (1000 grain/kB, mempool.DefaultMinRelayTxFee). oyster's send RPCs treat the
+// fee rate as a literal value with no daemon-side default — passing 0 builds
+// a zero-fee transaction that every mempool rejects — so this floor is what
+// an empty fee field selects.
+const minRelayFeeRate = 1e-5
+
 // sendScreen walks through paying a single recipient: pick the source
 // account, enter and validate the destination and amount, review a summary,
 // then sign and broadcast (unlocking on demand).
@@ -74,8 +81,8 @@ func sendScreen(c *client) error {
 				Value(&amountStr),
 			huh.NewInput().
 				Title("Fee rate (optional)").
-				Description("PRL per kB; leave empty for the wallet default.").
-				Placeholder("default").
+				Description("PRL per kB; leave empty for the network minimum (0.00001).").
+				Placeholder("0.00001").
 				Validate(validateFeeRate).
 				Value(&feeRateStr),
 		),
@@ -161,25 +168,29 @@ func validateRecipient(c *client, s string) error {
 	return nil
 }
 
-// validateFeeRate accepts an empty value (wallet default) or a positive
-// PRL/kB value.
+// validateFeeRate accepts an empty value (network minimum) or a rate at or
+// above the relay floor; anything lower is guaranteed to be rejected at
+// broadcast, so it is refused here instead.
 func validateFeeRate(s string) error {
 	if strings.TrimSpace(s) == "" {
 		return nil
 	}
 	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil || v < 0 {
-		return fmt.Errorf("must be a non-negative number")
+	if err != nil {
+		return fmt.Errorf("must be a number")
+	}
+	if v < minRelayFeeRate {
+		return fmt.Errorf("below the network minimum relay fee (%.5f PRL/kB)", minRelayFeeRate)
 	}
 	return nil
 }
 
-// parseFeeRate converts optional fee input to the RPC value, where 0 selects
-// the wallet's default relay fee.
+// parseFeeRate converts optional fee input to the RPC value, defaulting to
+// the minimum relay fee when left empty.
 func parseFeeRate(s string) (float64, string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return 0, "wallet default", nil
+		return minRelayFeeRate, fmtPRLFloat(minRelayFeeRate) + "/kB (network minimum)", nil
 	}
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
