@@ -119,7 +119,7 @@ func checkConfigFile(cfg *config) checkResult {
 	if fileExists(path) {
 		return checkResult{"oyster.conf", checkPass, path}
 	}
-	return checkResult{"oyster.conf", checkWarn, path + " not found (guided setup can write it)"}
+	return checkResult{"oyster.conf", checkWarn, path + " not found (a secure one is written automatically)"}
 }
 
 func checkCredentials(cfg *config) checkResult {

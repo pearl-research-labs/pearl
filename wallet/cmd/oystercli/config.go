@@ -161,8 +161,8 @@ func (c *config) oysterConfPath() string {
 	return filepath.Join(c.AppData, "oyster.conf")
 }
 
-// rescrapeConf re-reads oyster.conf after it was created or amended (e.g. by
-// the bootstrap wizard) and adopts any newly available settings.
+// rescrapeConf re-reads oyster.conf after oystercli created or amended it and
+// adopts any newly available settings.
 func (c *config) rescrapeConf() {
 	fileCfg := scrapeOysterConf(c.oysterConfPath())
 	if fileCfg.username != "" {
@@ -176,7 +176,7 @@ func (c *config) rescrapeConf() {
 		c.src.tls = "oyster.conf (noservertls=1)"
 	}
 	c.src.conf = "found"
-	c.src.creds = "oyster.conf (guided setup)"
+	c.src.creds = "oyster.conf (auto-provisioned)"
 }
 
 // walletDBPath returns the location of the wallet database for the active
@@ -203,19 +203,22 @@ type oysterConfValues struct {
 	username    string
 	password    string
 	noServerTLS bool
+	rpcListen   []string
 }
 
 var (
 	// Oyster names its wallet RPC auth options username/password, but accept
 	// the pearld-style rpcuser/rpcpass spelling as well since both appear in
 	// the wild (prlctl scrapes the latter).
-	confUserRe  = regexp.MustCompile(`(?m)^\s*(?:username|rpcuser)\s*=\s*(\S+)`)
-	confPassRe  = regexp.MustCompile(`(?m)^\s*(?:password|rpcpass)\s*=\s*(\S+)`)
-	confNoTLSRe = regexp.MustCompile(`(?m)^\s*noservertls\s*=\s*(1|true)(?:\s|$)`)
+	confUserRe   = regexp.MustCompile(`(?m)^\s*(?:username|rpcuser)\s*=\s*(\S+)`)
+	confPassRe   = regexp.MustCompile(`(?m)^\s*(?:password|rpcpass)\s*=\s*(\S+)`)
+	confNoTLSRe  = regexp.MustCompile(`(?m)^\s*noservertls\s*=\s*(1|true)(?:\s|$)`)
+	confListenRe = regexp.MustCompile(`(?m)^\s*rpclisten\s*=\s*(\S+)`)
 )
 
-// scrapeOysterConf extracts RPC credentials and server TLS configuration from
-// an oyster.conf file. Missing files or fields simply yield zero values.
+// scrapeOysterConf extracts RPC credentials and server TLS/listener
+// configuration from an oyster.conf file. Missing files or fields simply
+// yield zero values.
 func scrapeOysterConf(path string) oysterConfValues {
 	var vals oysterConfValues
 	content, err := os.ReadFile(path)
@@ -229,6 +232,9 @@ func scrapeOysterConf(path string) oysterConfValues {
 		vals.password = string(m[1])
 	}
 	vals.noServerTLS = confNoTLSRe.Match(content)
+	for _, m := range confListenRe.FindAllSubmatch(content, -1) {
+		vals.rpcListen = append(vals.rpcListen, string(m[1]))
+	}
 	return vals
 }
 

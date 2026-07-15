@@ -39,24 +39,22 @@ func runTriage(cfg *config, connectErr error) (bool, error) {
 	if note := desktopWalletNote(cfg, kind); note != "" {
 		printWarn(note)
 	}
+	for _, w := range insecureConfWarnings(cfg) {
+		printWarn(w)
+	}
 
 	const (
-		opBootstrap = "bootstrap"
-		opCreate    = "create"
-		opStart     = "start"
-		opRetry     = "retry"
-		opDoctor    = "doctor"
-		opQuit      = "quit"
+		opCreate = "create"
+		opStart  = "start"
+		opRetry  = "retry"
+		opDoctor = "doctor"
+		opQuit   = "quit"
 	)
-	confReady := confHasCredentials(cfg)
 	opts := []huh.Option[string]{}
-	if !confReady {
-		opts = append(opts, huh.NewOption("Guided setup      write oyster.conf with credentials and chain backend", opBootstrap))
-	}
 	if !cfg.walletDBExists() {
 		opts = append(opts, huh.NewOption("Create a wallet   new or restored from seed", opCreate))
 	}
-	if confReady && cfg.walletDBExists() && kind != triageAuth {
+	if confHasCredentials(cfg) && cfg.walletDBExists() && kind != triageAuth {
 		opts = append(opts, huh.NewOption("Start oyster now  spawn the daemon and connect", opStart))
 	}
 	opts = append(opts,
@@ -79,11 +77,6 @@ func runTriage(cfg *config, connectErr error) (bool, error) {
 	}
 
 	switch choice {
-	case opBootstrap:
-		if err := bootstrapConfigWizard(cfg); err != nil {
-			printError(err)
-		}
-		return true, nil
 	case opCreate:
 		if err := createWalletWizard(cfg); err != nil {
 			printError(err)
@@ -138,8 +131,6 @@ func triageAdvice(cfg *config, kind triageKind) string {
 		advice := fmt.Sprintf("Nothing is listening at %s, so the daemon is most likely not running.", cfg.Connect)
 		_, _, findErr := findOysterBinary(cfg)
 		switch {
-		case !confHasCredentials(cfg):
-			advice += "\nThere is also no oyster.conf with credentials, so a bare `oyster` would not\nbe reachable either — use the guided setup below to write one first."
 		case findErr == nil:
 			advice += fmt.Sprintf("\nStart it below, or manually with:\n\n    %s", oysterStartCommand(cfg))
 		default:
@@ -170,7 +161,7 @@ func desktopWalletNote(cfg *config, kind triageKind) string {
 	}
 	return "Something is listening on " + desktopAddr + " — that looks like the desktop wallet's\n" +
 		"private oyster instance. It uses random per-session credentials, so other clients\n" +
-		"cannot attach to it; run a dedicated daemon instead (guided setup below)."
+		"cannot attach to it; run a dedicated daemon instead."
 }
 
 // probeTCP reports whether something accepts connections at addr.

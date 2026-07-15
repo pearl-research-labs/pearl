@@ -173,8 +173,7 @@ func spawnArgs(cfg *config) []string {
 
 // startOysterNow launches the daemon detached from this process (it keeps
 // running after oystercli exits) and waits until its RPC answers. Requires
-// oyster.conf to carry the credentials, which the caller guarantees via the
-// bootstrap wizard.
+// oyster.conf to carry the credentials, which autoProvision guarantees.
 func startOysterNow(cfg *config) error {
 	binPath, err := locateOysterBinary(cfg)
 	if err != nil {

@@ -120,11 +120,7 @@ func createWalletWizard(cfg *config) error {
 		}
 	}
 
-	if confHasCredentials(cfg) {
-		lipgloss.Println(th.subtle.Render("Next: pick \"Start oyster now\" to launch the daemon and connect."))
-	} else {
-		lipgloss.Println(th.subtle.Render("Next: run the guided setup to write oyster.conf, then start the daemon."))
-	}
+	lipgloss.Println(th.subtle.Render("Next: pick \"Start oyster now\" to launch the daemon and connect."))
 	return nil
 }
 

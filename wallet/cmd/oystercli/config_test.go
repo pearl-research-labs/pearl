@@ -125,7 +125,7 @@ func TestRescrapeConf(t *testing.T) {
 	assert.Equal(t, "secret", cfg.RPCPass)
 	assert.True(t, cfg.NoTLS)
 	assert.Equal(t, "found", cfg.src.conf)
-	assert.Equal(t, "oyster.conf (guided setup)", cfg.src.creds)
+	assert.Equal(t, "oyster.conf (auto-provisioned)", cfg.src.creds)
 }
 
 func TestWalletDBPaths(t *testing.T) {
