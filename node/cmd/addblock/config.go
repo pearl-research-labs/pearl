@@ -42,6 +42,7 @@ type config struct {
 	RegressionTest bool   `long:"regtest" description:"Use the regression test network"`
 	SimNet         bool   `long:"simnet" description:"Use the simulation test network"`
 	TestNet        bool   `long:"testnet" description:"Use the test network"`
+	TestNet2       bool   `long:"testnet2" description:"Use the test network v2"`
 	TxIndex        bool   `long:"txindex" description:"Build a full hash-based transaction index which makes all transactions available via the getrawtransaction RPC"`
 }
 
@@ -93,6 +94,10 @@ func loadConfig() (*config, []string, error) {
 	if cfg.TestNet {
 		numNets++
 		activeNetParams = &chaincfg.TestNetParams
+	}
+	if cfg.TestNet2 {
+		numNets++
+		activeNetParams = &chaincfg.TestNet2Params
 	}
 	if cfg.RegressionTest {
 		numNets++

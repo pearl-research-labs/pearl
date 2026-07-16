@@ -42,6 +42,7 @@ func errContext(err error, context string) error {
 // Flags.
 var opts = struct {
 	TestNet               bool                `long:"testnet" description:"Use the test Pearl network"`
+	TestNet2              bool                `long:"testnet2" description:"Use the test Pearl network v2"`
 	SimNet                bool                `long:"simnet" description:"Use the simulation Pearl network"`
 	RegressionNet         bool                `long:"regtest" description:"Use the regression Pearl network"`
 	RPCConnect            string              `short:"c" long:"connect" description:"Hostname[:port] of wallet RPC server"`
@@ -53,6 +54,7 @@ var opts = struct {
 	RequiredConfirmations int64               `long:"minconf" description:"Required confirmations to include an output"`
 }{
 	TestNet:               false,
+	TestNet2:              false,
 	SimNet:                false,
 	RegressionNet:         false,
 	RPCConnect:            "localhost",
@@ -85,6 +87,9 @@ func init() {
 	if opts.TestNet {
 		numNets++
 	}
+	if opts.TestNet2 {
+		numNets++
+	}
 	if opts.SimNet {
 		numNets++
 	}
@@ -97,6 +102,8 @@ func init() {
 	var activeNet = &netparams.MainNetParams
 	if opts.TestNet {
 		activeNet = &netparams.TestNetParams
+	} else if opts.TestNet2 {
+		activeNet = &netparams.TestNet2Params
 	} else if opts.SimNet {
 		activeNet = &netparams.SimNetParams
 	} else if opts.RegressionNet {
