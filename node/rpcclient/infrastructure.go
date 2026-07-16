@@ -1557,6 +1557,8 @@ func New(config *ConnConfig, ntfnHandlers *NotificationHandlers) (*Client, error
 		client.chainParams = &chaincfg.MainNetParams
 	case chaincfg.TestNetParams.Name:
 		client.chainParams = &chaincfg.TestNetParams
+	case chaincfg.TestNet2Params.Name:
+		client.chainParams = &chaincfg.TestNet2Params
 	case chaincfg.RegressionNetParams.Name:
 		client.chainParams = &chaincfg.RegressionNetParams
 	case chaincfg.SigNetParams.Name:
