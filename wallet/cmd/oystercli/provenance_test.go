@@ -11,7 +11,6 @@ import (
 )
 
 func TestResolutionStory(t *testing.T) {
-	initUI(true)
 
 	cfg := &config{
 		AppData: t.TempDir(),

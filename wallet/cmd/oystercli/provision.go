@@ -10,6 +10,7 @@
 package main
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -24,10 +25,9 @@ import (
 // provisionedConf is the secure configuration oystercli writes when none
 // exists.
 type provisionedConf struct {
-	username  string
-	password  string
-	rpcListen string // loopback listener, e.g. 127.0.0.1:44207
-	useSPV    bool
+	username string
+	password string
+	useSPV   bool
 }
 
 // autoProvision ensures oystercli has RPC credentials to connect with or
@@ -35,10 +35,15 @@ type provisionedConf struct {
 //
 //   - If credentials are already resolved (flags or an existing oyster.conf),
 //     do nothing.
-//   - Otherwise write a secure oyster.conf: generated credentials, loopback
-//     rpclisten, TLS on (the oyster default), and SPV so no pearld is needed.
-//     A missing file is created; an existing file only has the missing
-//     credential keys appended — other settings are never touched.
+//   - Otherwise write a secure oyster.conf: generated credentials, TLS on
+//     (the oyster default), and SPV so no pearld is needed. A missing file
+//     is created; an existing file only has the missing credential keys
+//     appended — other settings are never touched.
+//
+// No rpclisten is written: oyster's own default is loopback-only listeners
+// on the active network's RPC port, so omitting it keeps the wallet
+// unreachable off-host while letting one conf serve every network (a pinned
+// port would make a --testnet daemon listen on the mainnet port).
 func autoProvision(cfg *config) error {
 	if cfg.RPCUser != "" && cfg.RPCPass != "" {
 		return nil
@@ -47,10 +52,9 @@ func autoProvision(cfg *config) error {
 	confPath := cfg.oysterConfPath()
 	existing := scrapeOysterConf(confPath)
 	pc := provisionedConf{
-		username:  firstNonEmpty(existing.username, appName+"-"+randomHex(4)),
-		password:  firstNonEmpty(existing.password, randomHex(24)),
-		rpcListen: net.JoinHostPort("127.0.0.1", cfg.activeNet.RPCServerPort),
-		useSPV:    true,
+		username: cmp.Or(existing.username, appName+"-"+randomHex(4)),
+		password: cmp.Or(existing.password, randomHex(24)),
+		useSPV:   true,
 	}
 
 	created, err := writeProvisionedConf(confPath, existing, pc)
@@ -83,9 +87,10 @@ func writeProvisionedConf(path string, existing oysterConfValues, pc provisioned
 		if pc.useSPV {
 			lines = append(lines, "usespv=1")
 		}
-		// Pin the RPC listener to loopback so the wallet is never
-		// reachable off-host; TLS stays on (oyster's default).
-		lines = append(lines, "rpclisten="+pc.rpcListen)
+		// TLS and rpclisten are deliberately left at oyster's defaults
+		// (TLS on, loopback-only listeners on the active network's
+		// port), so this one conf serves mainnet and testnet alike.
+		lines = append(lines, "; rpc listeners default to loopback on the active network's port")
 		return true, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 	case readErr != nil:
 		return false, readErr
@@ -156,14 +161,6 @@ func isLoopbackListener(listen string) bool {
 		return ip.IsLoopback()
 	}
 	return false
-}
-
-// firstNonEmpty returns a if it is non-empty, otherwise b.
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }
 
 // randomHex returns n random bytes hex-encoded (2n characters).

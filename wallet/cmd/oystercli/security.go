@@ -51,7 +51,7 @@ func promptUnlock(c *client) (bool, error) {
 		huh.NewInput().
 			Title("Wallet passphrase").
 			EchoMode(huh.EchoModePassword).
-			Validate(nonEmpty("passphrase")).
+			Validate(huh.ValidateNotEmpty()).
 			Value(&passphrase),
 		huh.NewSelect[int64]().
 			Title("Stay unlocked for").
@@ -146,12 +146,12 @@ func changePassphraseFlow(c *client) error {
 		huh.NewInput().
 			Title("Current passphrase").
 			EchoMode(huh.EchoModePassword).
-			Validate(nonEmpty("passphrase")).
+			Validate(huh.ValidateNotEmpty()).
 			Value(&oldPass),
 		huh.NewInput().
 			Title("New passphrase").
 			EchoMode(huh.EchoModePassword).
-			Validate(nonEmpty("passphrase")).
+			Validate(huh.ValidateNotEmpty()).
 			Value(&newPass),
 		huh.NewInput().
 			Title("Repeat new passphrase").
@@ -183,7 +183,7 @@ func importKeyFlow(c *client) error {
 		huh.NewInput().
 			Title("Private key (WIF)").
 			EchoMode(huh.EchoModePassword).
-			Validate(nonEmpty("key")).
+			Validate(huh.ValidateNotEmpty()).
 			Value(&wif),
 		huh.NewConfirm().
 			Title("Rescan the chain for its history?").
@@ -254,7 +254,7 @@ func signMessageFlow(c *client) error {
 			Value(&address),
 		huh.NewText().
 			Title("Message").
-			Validate(nonEmpty("message")).
+			Validate(huh.ValidateNotEmpty()).
 			Value(&message),
 	)))
 	if err != nil || !ok {
@@ -283,11 +283,11 @@ func verifyMessageFlow(c *client) error {
 			Value(&address),
 		huh.NewInput().
 			Title("Signature (base64)").
-			Validate(nonEmpty("signature")).
+			Validate(huh.ValidateNotEmpty()).
 			Value(&signature),
 		huh.NewText().
 			Title("Message").
-			Validate(nonEmpty("message")).
+			Validate(huh.ValidateNotEmpty()).
 			Value(&message),
 	)))
 	if err != nil || !ok {
