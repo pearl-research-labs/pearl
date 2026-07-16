@@ -120,6 +120,8 @@ func New(activeNet *chaincfg.Params, handlers *rpcclient.NotificationHandlers,
 		// No extra flags since mainnet is the default
 	case wire.TestNet:
 		extraArgs = append(extraArgs, "--testnet")
+	case wire.TestNet2:
+		extraArgs = append(extraArgs, "--testnet2")
 	case wire.RegTest:
 		extraArgs = append(extraArgs, "--regtest")
 	case wire.SimNet:

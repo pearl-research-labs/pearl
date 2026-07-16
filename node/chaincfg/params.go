@@ -479,9 +479,9 @@ var TestNetParams = Params{
 	Net:         wire.TestNet,
 	DefaultPort: "44110",
 	DNSSeeds: []DNSSeed{
-		{"seeder1.internal.pearlresearch.ai", true},
-		{"seeder2.internal.pearlresearch.ai", true},
-		{"seeder3.internal.pearlresearch.ai", true},
+		{"seeder1.internal.pearlresearch.ai", false},
+		{"seeder2.internal.pearlresearch.ai", false},
+		{"seeder3.internal.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
@@ -561,16 +561,16 @@ var TestNetParams = Params{
 	HDCoinType: HDCoinTypeTestnet,
 }
 
-// TestNet2Params defines the network parameters for the Pearl test network v2.
-// Based on TestNetParams but with a fresh genesis block.
+// TestNet2Params defines the network parameters for the Pearl test network v2,
+// a restart of the test network from its own genesis block.
 var TestNet2Params = Params{
 	Name:        "testnet2",
 	Net:         wire.TestNet2,
 	DefaultPort: "44112",
 	DNSSeeds: []DNSSeed{
-		{"seeder1.testnet.pearlresearch.ai", true},
-		{"seeder2.testnet.pearlresearch.ai", true},
-		{"seeder3.testnet.pearlresearch.ai", true},
+		{"seeder1.testnet.pearlresearch.ai", false},
+		{"seeder2.testnet.pearlresearch.ai", false},
+		{"seeder3.testnet.pearlresearch.ai", false},
 	},
 
 	// Chain parameters

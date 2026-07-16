@@ -5,11 +5,12 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 
 	flags "github.com/jessevdk/go-flags"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
@@ -144,6 +145,16 @@ func loadConfig() (*config, error) {
 	cfg.src.connect = "--connect"
 	if cfg.Connect == "localhost" {
 		cfg.src.connect = fmt.Sprintf("default %s port", cfg.activeNet.Params.Name)
+		// The daemon listens where oyster.conf's rpclisten says, so an
+		// explicit listener there is the address to dial — same
+		// flags > conf > default order as every other setting.
+		for _, listen := range fileCfg.rpcListen {
+			if target := dialTarget(listen, cfg.activeNet.RPCServerPort); target != "" {
+				cfg.Connect = target
+				cfg.src.connect = "oyster.conf (rpclisten)"
+				break
+			}
+		}
 	}
 	var err error
 	cfg.Connect, err = cfgutil.NormalizeAddress(cfg.Connect, cfg.activeNet.RPCServerPort)
@@ -158,6 +169,45 @@ func loadConfig() (*config, error) {
 // resolved appdata directory.
 func (c *config) oysterConfPath() string {
 	return filepath.Join(c.AppData, "oyster.conf")
+}
+
+// remoteTarget reports whether the connect target points at another machine.
+// Local bootstrapping — provisioning a config, creating a wallet, spawning
+// the daemon — only makes sense when the daemon runs here; a remote target
+// gets connection triage only, and its operator owns that machine's config.
+func (c *config) remoteTarget() bool {
+	host, _, err := net.SplitHostPort(c.Connect)
+	if err != nil {
+		host = c.Connect
+	}
+	switch host {
+	case "", "localhost":
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsLoopback()
+	}
+	return true
+}
+
+// dialTarget converts an rpclisten value from oyster.conf into an address a
+// client can dial, or "" for listeners that cannot be translated. Wildcard
+// and empty hosts mean "every interface" on the daemon side; loopback is the
+// right way to reach them from the same machine.
+func dialTarget(listen, defaultPort string) string {
+	norm, err := cfgutil.NormalizeAddress(listen, defaultPort)
+	if err != nil {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(norm)
+	if err != nil {
+		return ""
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "*":
+		host = "localhost"
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // rescrapeConf re-reads oyster.conf after oystercli created or amended it and
@@ -205,36 +255,32 @@ type oysterConfValues struct {
 	rpcListen   []string
 }
 
-var (
-	// Oyster names its wallet RPC auth options username/password, but accept
-	// the pearld-style rpcuser/rpcpass spelling as well since both appear in
-	// the wild (prlctl scrapes the latter).
-	confUserRe   = regexp.MustCompile(`(?m)^\s*(?:username|rpcuser)\s*=\s*(\S+)`)
-	confPassRe   = regexp.MustCompile(`(?m)^\s*(?:password|rpcpass)\s*=\s*(\S+)`)
-	confNoTLSRe  = regexp.MustCompile(`(?m)^\s*noservertls\s*=\s*(1|true)(?:\s|$)`)
-	confListenRe = regexp.MustCompile(`(?m)^\s*rpclisten\s*=\s*(\S+)`)
-)
-
 // scrapeOysterConf extracts RPC credentials and server TLS/listener
-// configuration from an oyster.conf file. Missing files or fields simply
+// configuration from an oyster.conf file, parsing it with the same ini
+// machinery the daemon itself uses (go-flags), so quoting, comments, and
+// sections behave identically. Oyster names the auth options
+// username/password, but the pearld-style rpcuser/rpcpass spelling appears in
+// the wild too (prlctl scrapes the latter). Missing files or fields simply
 // yield zero values.
 func scrapeOysterConf(path string) oysterConfValues {
-	var vals oysterConfValues
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return vals
+	var opts struct {
+		Username    string   `long:"username"`
+		RPCUser     string   `long:"rpcuser"`
+		Password    string   `long:"password"`
+		RPCPass     string   `long:"rpcpass"`
+		NoServerTLS bool     `long:"noservertls"`
+		RPCListen   []string `long:"rpclisten"`
 	}
-	if m := confUserRe.FindSubmatch(content); m != nil {
-		vals.username = string(m[1])
+	parser := flags.NewParser(&opts, flags.IgnoreUnknown)
+	if err := flags.NewIniParser(parser).ParseFile(path); err != nil {
+		return oysterConfValues{}
 	}
-	if m := confPassRe.FindSubmatch(content); m != nil {
-		vals.password = string(m[1])
+	return oysterConfValues{
+		username:    cmp.Or(opts.Username, opts.RPCUser),
+		password:    cmp.Or(opts.Password, opts.RPCPass),
+		noServerTLS: opts.NoServerTLS,
+		rpcListen:   opts.RPCListen,
 	}
-	vals.noServerTLS = confNoTLSRe.Match(content)
-	for _, m := range confListenRe.FindAllSubmatch(content, -1) {
-		vals.rpcListen = append(vals.rpcListen, string(m[1]))
-	}
-	return vals
 }
 
 // cleanAndExpandPath expands environment variables and leading ~ in path.

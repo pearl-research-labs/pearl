@@ -6,6 +6,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -34,6 +35,22 @@ func TestWrapWords(t *testing.T) {
 	got := wrapWords("alpha beta gamma delta epsilon", 2)
 	want := " 1.alpha   2.beta\n 3.gamma   4.delta\n 5.epsilon"
 	assert.Equal(t, want, got)
+}
+
+// An omitted birthday must resolve to genesis, not "now": oyster starts the
+// restore recovery scan at the birthday, so a too-recent one silently skips
+// all history and the wallet comes up with no addresses and no balance.
+func TestImportBirthday(t *testing.T) {
+	cfg := &config{}
+	cfg.activeNet = mainNetForTest()
+	genesis := cfg.activeNet.Params.GenesisBlock.BlockHeader().Timestamp
+
+	assert.Equal(t, genesis, importBirthday(cfg, ""))
+	assert.Equal(t, genesis, importBirthday(cfg, "   "))
+
+	want, err := time.Parse("2006-01-02", "2026-05-01")
+	assert.NoError(t, err)
+	assert.Equal(t, want, importBirthday(cfg, " 2026-05-01 "))
 }
 
 func TestValidateBirthday(t *testing.T) {

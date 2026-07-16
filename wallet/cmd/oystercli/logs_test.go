@@ -36,7 +36,6 @@ func TestStripControlRunes(t *testing.T) {
 }
 
 func TestColorizeLogLineSanitizes(t *testing.T) {
-	initUI(true)
 	out := colorizeLogLine("[INF] peer (\x1b]0;spoofed\x07)")
 	assert.NotContains(t, out, "\x1b]0;", "OSC sequence must not survive")
 	assert.Contains(t, out, "spoofed", "text content is kept visible")
