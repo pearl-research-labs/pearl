@@ -9,7 +9,7 @@ import { WalletService } from './wallet-service/wallet-service.ts';
 import { WalletProcess } from './wallet-process.ts';
 import { displayToFs, fsToDisplay } from '../../utils/filename-utils.ts';
 import { getCurrentNetworkConfig, getCurrentNetwork, setCurrentNetwork, getAllNetworks, type Network } from '../config/network-config';
-import { getPeerAddress, getPeerPort, getPeerSettings as getConfigPeerSettings, setCustomPeer, resetToDefaultPeer } from '../config/peer-settings';
+import { getCustomPeer, getPeerSettings as getConfigPeerSettings, setCustomPeer, resetToDefaultPeer } from '../config/peer-settings';
 import { randomBytes } from 'crypto';
 
 
@@ -34,13 +34,14 @@ const baseWalletDir = path.join(os.homedir(), '.pearl-wallet', 'wallet-data');
 
 function getBaseConfig() {
   const networkConfig = getCurrentNetworkConfig();
+  const customPeer = getCustomPeer();
   return {
     rpcHost: 'http://127.0.0.1',
     ...getSessionRpcCreds(),
     rpcPort: networkConfig.rpcPort,
     network: networkConfig.name,
-    peerAddress: getPeerAddress(),
-    peerPort: getPeerPort(),
+    peerAddress: customPeer?.address,
+    peerPort: customPeer?.port,
   };
 }
 
@@ -136,19 +137,24 @@ class ManagerService implements ManagerApi {
   }
 
   async selectWallet(walletName: string) {
-    // Validate peer before starting wallet
-    const peerAddress = getPeerAddress();
-    const peerPort = getPeerPort();
+    // Validate custom peer before starting wallet (if one is configured).
+    // When no custom peer is set the daemon falls back to DNS seeding, so
+    // there is nothing to pre-validate here.
+    const customPeer = getCustomPeer();
 
-    console.log(`[ManagerService] Validating peer before starting wallet: ${peerAddress}:${peerPort}`);
-    const validation = await this.validatePeerAddress(peerAddress, peerPort);
+    if (customPeer) {
+      console.log(`[ManagerService] Validating custom peer before starting wallet: ${customPeer.address}:${customPeer.port}`);
+      const validation = await this.validatePeerAddress(customPeer.address, customPeer.port);
 
-    if (!validation.valid) {
-      console.error(`[ManagerService] ❌ Peer validation failed: ${validation.error}`);
-      throw new Error(validation.error || 'Cannot connect to peer node');
+      if (!validation.valid) {
+        console.error(`[ManagerService] ❌ Peer validation failed: ${validation.error}`);
+        throw new Error(validation.error || 'Cannot connect to peer node');
+      }
+
+      console.log(`[ManagerService] ✅ Peer validation passed, starting wallet...`);
+    } else {
+      console.log(`[ManagerService] No custom peer configured — relying on DNS seeders for peer discovery`);
     }
-
-    console.log(`[ManagerService] ✅ Peer validation passed, starting wallet...`);
 
     try {
       await this.stopWalletProcess();

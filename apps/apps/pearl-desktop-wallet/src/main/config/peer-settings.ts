@@ -1,11 +1,16 @@
 /**
- * Peer settings management - allows users to configure custom peer addresses per network
+ * Peer settings management.
+ *
+ * By default the wallet relies on the oyster daemon's built-in DNS seeding
+ * (seeder1/2/3.pearlresearch.ai) — no --addpeer flag is passed. Users can
+ * optionally configure a custom peer (IPv4 or CNAME) that is forwarded to the
+ * daemon via --addpeer, matching the legacy behaviour.
  */
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { getCurrentNetwork, getCurrentNetworkConfig } from './network-config';
-import { MAINNET_DEFAULT_PEER_ADDRESSES, TESTNET_DEFAULT_PEER_ADDRESSES } from './consts';
+import { LEGACY_MAINNET_PEER_ADDRESSES, LEGACY_TESTNET_PEER_ADDRESSES } from './consts';
 
 interface NetworkPeerSettings {
   customPeerAddress?: string;
@@ -66,26 +71,33 @@ function savePeerSettings(settings: NetworkPeerSettings) {
   }
 }
 
-// Get current peer address (custom or default) for active network
-export function getPeerAddress(): string {
-  const settings = loadPeerSettings();
-  if (settings.customPeerAddress) {
-    return settings.customPeerAddress;
-  }
-
-  const networkConfig = getCurrentNetworkConfig();
-  return networkConfig.defaultPeerAddress;
+// Returns true when the saved custom peer is one of the legacy hardcoded
+// hosts. Those addresses are no longer valid defaults, so we treat them as
+// "no custom peer" and fall back to DNS-seeder-based discovery.
+function isLegacyPeer(address: string): boolean {
+  const network = getCurrentNetwork();
+  const legacy =
+    network === 'mainnet' ? LEGACY_MAINNET_PEER_ADDRESSES : LEGACY_TESTNET_PEER_ADDRESSES;
+  return legacy.includes(address);
 }
 
-// Get current peer port (custom or default) for active network
-export function getPeerPort(): number {
+export interface CustomPeer {
+  address: string;
+  port: number;
+}
+
+// Get the user-configured custom peer, or null when none is set (in which case
+// the daemon falls back to DNS seeding).
+export function getCustomPeer(): CustomPeer | null {
   const settings = loadPeerSettings();
-  if (settings.customPeerPort) {
-    return settings.customPeerPort;
+  const address = settings.customPeerAddress?.trim();
+  const port = settings.customPeerPort;
+
+  if (!address || !port || isLegacyPeer(address)) {
+    return null;
   }
 
-  const networkConfig = getCurrentNetworkConfig();
-  return networkConfig.defaultPeerPort;
+  return { address, port };
 }
 
 // Set custom peer address for the active network only
@@ -96,7 +108,7 @@ export function setCustomPeer(address: string, port: number) {
   savePeerSettings(settings);
 }
 
-// Reset to default peer for the active network only
+// Reset to default (DNS seeders) for the active network only
 export function resetToDefaultPeer() {
   const settings = loadPeerSettings();
   delete settings.customPeerAddress;
@@ -108,18 +120,13 @@ export function resetToDefaultPeer() {
 export function getPeerSettings() {
   const network = getCurrentNetwork();
   const networkConfig = getCurrentNetworkConfig();
-  const settings = loadPeerSettings();
-
-  const defaultAddresses =
-    network === 'mainnet' ? MAINNET_DEFAULT_PEER_ADDRESSES : TESTNET_DEFAULT_PEER_ADDRESSES;
-  const isDefaultFoundationNode = defaultAddresses.includes(settings.customPeerAddress ?? '');
+  const customPeer = getCustomPeer();
 
   return {
     network,
-    currentAddress: getPeerAddress(),
-    currentPort: getPeerPort(),
-    defaultAddress: networkConfig.defaultPeerAddress,
-    defaultPort: networkConfig.defaultPeerPort,
-    isCustom: (settings.customPeerAddress && !isDefaultFoundationNode) || false,
+    dnsSeeders: networkConfig.dnsSeeders,
+    customPeerAddress: customPeer?.address ?? '',
+    customPeerPort: customPeer?.port,
+    isCustom: customPeer !== null,
   };
 }
