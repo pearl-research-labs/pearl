@@ -139,7 +139,9 @@ class ManagerService implements ManagerApi {
   async selectWallet(walletName: string) {
     // Validate custom peer before starting wallet (if one is configured).
     // When no custom peer is set the daemon falls back to DNS seeding, so
-    // there is nothing to pre-validate here.
+    // there is nothing to pre-validate here. If a custom peer is set but
+    // unreachable, we warn and continue — the daemon still discovers peers
+    // via DNS seeding.
     const customPeer = getCustomPeer();
 
     if (customPeer) {
@@ -147,11 +149,10 @@ class ManagerService implements ManagerApi {
       const validation = await this.validatePeerAddress(customPeer.address, customPeer.port);
 
       if (!validation.valid) {
-        console.error(`[ManagerService] ❌ Peer validation failed: ${validation.error}`);
-        throw new Error(validation.error || 'Cannot connect to peer node');
+        console.warn(`[ManagerService] ⚠️ Custom peer unreachable: ${validation.error}. Falling back to DNS seeders.`);
+      } else {
+        console.log(`[ManagerService] ✅ Peer validation passed, starting wallet...`);
       }
-
-      console.log(`[ManagerService] ✅ Peer validation passed, starting wallet...`);
     } else {
       console.log(`[ManagerService] No custom peer configured — relying on DNS seeders for peer discovery`);
     }

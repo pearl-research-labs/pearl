@@ -85,7 +85,6 @@ interface ManagerApi {
 
   getPeerSettings: () => Promise<{
     network: string;
-    dnsSeeders: string[];
     customPeerAddress: string;
     customPeerPort?: number;
     isCustom: boolean;

@@ -3,8 +3,6 @@
  * All network-specific settings should be consumed from here
  */
 
-import { MAINNET_DNS_SEEDERS, TESTNET_DNS_SEEDERS } from "./consts";
-
 export type Network = 'mainnet' | 'testnet';
 
 export interface NetworkConfig {
@@ -14,7 +12,6 @@ export interface NetworkConfig {
     walletFlag: string;
     dataSubdir: string;
     addressPrefix: string;
-    dnsSeeders: string[];
 }
 
 const NETWORK_CONFIGS: Record<Network, NetworkConfig> = {
@@ -25,7 +22,6 @@ const NETWORK_CONFIGS: Record<Network, NetworkConfig> = {
         walletFlag: '',  // No flag for mainnet (default)
         dataSubdir: 'mainnet',
         addressPrefix: 'prl1',
-        dnsSeeders: MAINNET_DNS_SEEDERS,
     },
     testnet: {
         name: 'testnet',
@@ -34,7 +30,6 @@ const NETWORK_CONFIGS: Record<Network, NetworkConfig> = {
         walletFlag: '--testnet2',
         dataSubdir: 'testnet2',
         addressPrefix: 'tprl1',
-        dnsSeeders: TESTNET_DNS_SEEDERS,
     },
 };
 

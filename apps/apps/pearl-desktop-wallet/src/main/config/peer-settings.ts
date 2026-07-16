@@ -2,14 +2,13 @@
  * Peer settings management.
  *
  * By default the wallet relies on the oyster daemon's built-in DNS seeding
- * (seeder1/2/3.pearlresearch.ai) — no --addpeer flag is passed. Users can
- * optionally configure a custom peer (IPv4 or CNAME) that is forwarded to the
- * daemon via --addpeer, matching the legacy behaviour.
+ * — no --addpeer flag is passed. Users can optionally configure a custom peer
+ * (IPv4 or CNAME) that is forwarded to the daemon via --addpeer.
  */
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { getCurrentNetwork, getCurrentNetworkConfig } from './network-config';
+import { getCurrentNetwork } from './network-config';
 import { LEGACY_MAINNET_PEER_ADDRESSES, LEGACY_TESTNET_PEER_ADDRESSES } from './consts';
 
 interface NetworkPeerSettings {
@@ -32,6 +31,16 @@ function ensureSettingsDir() {
   }
 }
 
+// Returns true when the saved custom peer is one of the legacy hardcoded
+// hosts. Those addresses are no longer valid defaults, so stale
+// peer-settings.json entries are cleared on load (migration).
+function isLegacyPeer(address: string): boolean {
+  const network = getCurrentNetwork();
+  const legacy =
+    network === 'mainnet' ? LEGACY_MAINNET_PEER_ADDRESSES : LEGACY_TESTNET_PEER_ADDRESSES;
+  return legacy.includes(address);
+}
+
 function loadAllNetworksPeerSettings(): AllNetworksPeerSettings {
   ensureSettingsDir();
 
@@ -51,10 +60,20 @@ function loadAllNetworksPeerSettings(): AllNetworksPeerSettings {
   return { mainnet: {}, testnet: {} };
 }
 
-// Load peer settings for the current network
+// Load peer settings for the current network, migrating stale legacy entries.
 function loadPeerSettings(): NetworkPeerSettings {
-  const peerSettings = loadAllNetworksPeerSettings();
-  return peerSettings[getCurrentNetwork()] ?? {};
+  const allSettings = loadAllNetworksPeerSettings();
+  const settings = allSettings[getCurrentNetwork()] ?? {};
+
+  // Migration: if the saved custom peer is a legacy hardcoded host, clear it
+  // so the wallet falls back to DNS seeding. This only runs on load — the
+  // user can still intentionally save any address afterwards.
+  if (settings.customPeerAddress && isLegacyPeer(settings.customPeerAddress)) {
+    delete settings.customPeerAddress;
+    delete settings.customPeerPort;
+  }
+
+  return settings;
 }
 
 // Save peer settings for the current network
@@ -71,16 +90,6 @@ function savePeerSettings(settings: NetworkPeerSettings) {
   }
 }
 
-// Returns true when the saved custom peer is one of the legacy hardcoded
-// hosts. Those addresses are no longer valid defaults, so we treat them as
-// "no custom peer" and fall back to DNS-seeder-based discovery.
-function isLegacyPeer(address: string): boolean {
-  const network = getCurrentNetwork();
-  const legacy =
-    network === 'mainnet' ? LEGACY_MAINNET_PEER_ADDRESSES : LEGACY_TESTNET_PEER_ADDRESSES;
-  return legacy.includes(address);
-}
-
 export interface CustomPeer {
   address: string;
   port: number;
@@ -93,7 +102,7 @@ export function getCustomPeer(): CustomPeer | null {
   const address = settings.customPeerAddress?.trim();
   const port = settings.customPeerPort;
 
-  if (!address || !port || isLegacyPeer(address)) {
+  if (!address || !port) {
     return null;
   }
 
@@ -119,12 +128,10 @@ export function resetToDefaultPeer() {
 // Get peer settings info for the active network
 export function getPeerSettings() {
   const network = getCurrentNetwork();
-  const networkConfig = getCurrentNetworkConfig();
   const customPeer = getCustomPeer();
 
   return {
     network,
-    dnsSeeders: networkConfig.dnsSeeders,
     customPeerAddress: customPeer?.address ?? '',
     customPeerPort: customPeer?.port,
     isCustom: customPeer !== null,
