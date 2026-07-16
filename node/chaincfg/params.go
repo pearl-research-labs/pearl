@@ -561,8 +561,8 @@ var TestNetParams = Params{
 	HDCoinType: HDCoinTypeTestnet,
 }
 
-// TestNet2Params defines the network parameters for the Pearl test network v2.
-// Based on TestNetParams but with a fresh genesis block.
+// TestNet2Params defines the network parameters for the Pearl test network v2,
+// a restart of the test network from its own genesis block.
 var TestNet2Params = Params{
 	Name:        "testnet2",
 	Net:         wire.TestNet2,

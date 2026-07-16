@@ -140,7 +140,7 @@ const (
 	// TestNet represents the Pearl test network.
 	TestNet PearlNet = 0x50524C31 // "PRL1" in ASCII
 
-	// TestNet2 represents the Pearl test network v2 (fresh genesis).
+	// TestNet2 represents the Pearl test network v2.
 	TestNet2 PearlNet = 0x50524C32 // "PRL2" in ASCII
 
 	// SigNet represents the public default SigNet. For custom signets,
