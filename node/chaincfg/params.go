@@ -479,9 +479,9 @@ var TestNetParams = Params{
 	Net:         wire.TestNet,
 	DefaultPort: "44110",
 	DNSSeeds: []DNSSeed{
-		{"seeder1.internal.pearlresearch.ai", true},
-		{"seeder2.internal.pearlresearch.ai", true},
-		{"seeder3.internal.pearlresearch.ai", true},
+		{"seeder1.internal.pearlresearch.ai", false},
+		{"seeder2.internal.pearlresearch.ai", false},
+		{"seeder3.internal.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
@@ -568,9 +568,9 @@ var TestNet2Params = Params{
 	Net:         wire.TestNet2,
 	DefaultPort: "44112",
 	DNSSeeds: []DNSSeed{
-		{"seeder1.testnet.pearlresearch.ai", true},
-		{"seeder2.testnet.pearlresearch.ai", true},
-		{"seeder3.testnet.pearlresearch.ai", true},
+		{"seeder1.testnet.pearlresearch.ai", false},
+		{"seeder2.testnet.pearlresearch.ai", false},
+		{"seeder3.testnet.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
