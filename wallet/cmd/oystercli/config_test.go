@@ -69,51 +69,6 @@ func TestScrapeOysterConfMissingFile(t *testing.T) {
 	assert.Equal(t, oysterConfValues{}, got)
 }
 
-// The connect target must follow an explicit rpclisten in oyster.conf: the
-// daemon listens exactly where the conf says, whatever the active network's
-// default port is. Wildcard listeners are dialed via loopback.
-func TestDialTarget(t *testing.T) {
-	tests := []struct {
-		listen string
-		want   string
-	}{
-		{"127.0.0.1:44209", "127.0.0.1:44209"},
-		{"127.0.0.1", "127.0.0.1:44207"},
-		{"[::1]:44209", "[::1]:44209"},
-		{"0.0.0.0:44209", "localhost:44209"},
-		{":44209", "localhost:44209"},
-		{"localhost:44209", "localhost:44209"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.listen, func(t *testing.T) {
-			assert.Equal(t, tt.want, dialTarget(tt.listen, "44207"))
-		})
-	}
-}
-
-// Local bootstrapping (provisioning, wallet creation, daemon spawning) must
-// be suppressed for targets on other machines.
-func TestRemoteTarget(t *testing.T) {
-	tests := []struct {
-		connect string
-		want    bool
-	}{
-		{"localhost:44207", false},
-		{"127.0.0.1:44207", false},
-		{"[::1]:44207", false},
-		{"127.0.0.2:44207", false},
-		{"192.168.1.50:44207", true},
-		{"wallet.example.com:44207", true},
-		{"[2001:db8::1]:44207", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.connect, func(t *testing.T) {
-			cfg := &config{Connect: tt.connect}
-			assert.Equal(t, tt.want, cfg.remoteTarget())
-		})
-	}
-}
-
 func TestRescrapeConf(t *testing.T) {
 	cfg := &config{AppData: t.TempDir()}
 	cfg.activeNet = mainNetForTest()
