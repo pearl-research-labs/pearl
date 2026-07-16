@@ -51,11 +51,15 @@ func runTriage(cfg *config, connectErr error) (bool, error) {
 		opQuit   = "quit"
 	)
 	opts := []huh.Option[string]{}
-	if !cfg.walletDBExists() {
-		opts = append(opts, huh.NewOption("Create a wallet   new or restored from seed", opCreate))
-	}
-	if confHasCredentials(cfg) && cfg.walletDBExists() && kind != triageAuth {
-		opts = append(opts, huh.NewOption("Start oyster now  spawn the daemon and connect", opStart))
+	// Wallet creation and daemon spawning act on this machine, so they are
+	// only offered for local targets.
+	if !cfg.remoteTarget() {
+		if !cfg.walletDBExists() {
+			opts = append(opts, huh.NewOption("Create a wallet   new or restored from seed", opCreate))
+		}
+		if confHasCredentials(cfg) && cfg.walletDBExists() && kind != triageAuth {
+			opts = append(opts, huh.NewOption("Start oyster now  spawn the daemon and connect", opStart))
+		}
 	}
 	opts = append(opts,
 		huh.NewOption("Retry connection", opRetry),
@@ -99,7 +103,9 @@ func runTriage(cfg *config, connectErr error) (bool, error) {
 // classifyConnectError distinguishes the common cold start failures so the
 // advice can be specific.
 func classifyConnectError(cfg *config, err error) triageKind {
-	if !cfg.walletDBExists() {
+	// A missing local wallet.db only explains local failures; a remote
+	// daemon has its own wallet.
+	if !cfg.remoteTarget() && !cfg.walletDBExists() {
 		return triageNoWallet
 	}
 	msg := strings.ToLower(err.Error())
@@ -128,6 +134,11 @@ func triageAdvice(cfg *config, kind triageKind) string {
 			"No wallet database found at %s.\nIt looks like this machine has no %s wallet yet.",
 			cfg.walletDBPath(), cfg.activeNet.Params.Name)
 	case triageNotRunning:
+		if cfg.remoteTarget() {
+			return fmt.Sprintf(
+				"Nothing is answering at %s.\nOn the remote machine, check that oyster is running with an rpclisten\ncovering this address and that its firewall allows the port. The\ncredentials and --cafile certificate must be that daemon's.",
+				cfg.Connect)
+		}
 		advice := fmt.Sprintf("Nothing is listening at %s, so the daemon is most likely not running.", cfg.Connect)
 		_, _, findErr := findOysterBinary(cfg)
 		switch {
@@ -153,6 +164,9 @@ func triageAdvice(cfg *config, kind triageKind) string {
 // make it unreachable for other clients.
 func desktopWalletNote(cfg *config, kind triageKind) string {
 	const desktopAddr = "127.0.0.1:8335"
+	if cfg.remoteTarget() {
+		return ""
+	}
 	if kind != triageNotRunning && kind != triageNoWallet {
 		return ""
 	}

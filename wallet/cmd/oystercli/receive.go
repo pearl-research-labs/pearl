@@ -9,6 +9,7 @@ import (
 
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/compat"
 	qrterminal "github.com/mdp/qrterminal/v3"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 )
@@ -80,7 +81,7 @@ func printQR(text string) {
 		HalfBlocks: true,
 		QuietZone:  2,
 	}
-	if th.isDark {
+	if compat.HasDarkBackground {
 		// Foreground blocks are light on dark terminals, so draw the QR
 		// background cells with blocks and leave the modules dark.
 		cfg.BlackChar = qrterminal.BLACK_BLACK

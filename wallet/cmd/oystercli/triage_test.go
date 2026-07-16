@@ -17,6 +17,9 @@ func TestClassifyConnectError(t *testing.T) {
 
 	cfgWithWallet := configWithWalletDB(t)
 
+	cfgRemote := &config{AppData: t.TempDir(), Connect: "wallet.example.com:44207"}
+	cfgRemote.activeNet = mainNetForTest()
+
 	tests := []struct {
 		name string
 		cfg  *config
@@ -24,6 +27,9 @@ func TestClassifyConnectError(t *testing.T) {
 		want triageKind
 	}{
 		{"missing wallet wins", cfgNoWallet, errors.New("connection refused"), triageNoWallet},
+		// A remote daemon has its own wallet: the local wallet.db must
+		// not steer triage toward creating one here.
+		{"remote ignores local wallet", cfgRemote, errors.New("connection refused"), triageNotRunning},
 		{"refused", cfgWithWallet, errors.New("dial tcp 127.0.0.1:44207: connection refused"), triageNotRunning},
 		{"timeout", cfgWithWallet, errors.New("i/o timeout"), triageNotRunning},
 		{"tls", cfgWithWallet, errors.New("x509: certificate signed by unknown authority"), triageTLS},

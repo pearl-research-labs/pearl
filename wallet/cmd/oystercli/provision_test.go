@@ -13,7 +13,6 @@ import (
 )
 
 func TestAutoProvisionWritesSecureConfWhenAbsent(t *testing.T) {
-	initUI(true)
 	cfg := &config{AppData: t.TempDir()}
 	cfg.activeNet = mainNetForTest()
 
@@ -30,15 +29,15 @@ func TestAutoProvisionWritesSecureConfWhenAbsent(t *testing.T) {
 	content, err := os.ReadFile(cfg.oysterConfPath())
 	require.NoError(t, err)
 	text := string(content)
-	// Secure defaults: SPV, loopback-only RPC listener, TLS left on.
+	// Secure defaults: SPV on, TLS untouched, and no pinned listener —
+	// oyster defaults to loopback on the active network's port, so the
+	// same conf must serve mainnet and testnet.
 	assert.Contains(t, text, "usespv=1")
-	assert.Contains(t, text, "rpclisten=127.0.0.1:"+cfg.activeNet.RPCServerPort)
+	assert.NotContains(t, text, "rpclisten=")
 	assert.NotContains(t, text, "noservertls")
-	assert.NotContains(t, text, "0.0.0.0")
 }
 
 func TestAutoProvisionRespectsExistingCredentials(t *testing.T) {
-	initUI(true)
 	cfg := &config{AppData: t.TempDir()}
 	cfg.activeNet = mainNetForTest()
 	original := "[Application Options]\nusername=existing\npassword=secret\nnoservertls=1\nlogdir=/custom\n"
@@ -54,7 +53,6 @@ func TestAutoProvisionRespectsExistingCredentials(t *testing.T) {
 }
 
 func TestAutoProvisionAppendsOnlyMissingCreds(t *testing.T) {
-	initUI(true)
 	cfg := &config{AppData: t.TempDir()}
 	cfg.activeNet = mainNetForTest()
 	// A conf that configures the backend but has no credentials (the
@@ -84,7 +82,6 @@ func TestAutoProvisionTightensPermsBeforeAppendingCreds(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("chmod semantics differ for root")
 	}
-	initUI(true)
 	cfg := &config{AppData: t.TempDir()}
 	cfg.activeNet = mainNetForTest()
 	// A world-readable conf without credentials: os.WriteFile alone would

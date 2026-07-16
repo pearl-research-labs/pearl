@@ -52,7 +52,9 @@ optimistically and needs no configuration from you:
 1. Flags win: `--connect`, `--rpcuser`, `--rpcpass`, `--cafile`, `--notls`,
    `--testnet`/`--testnet2`/`--simnet`/`--signet`, `--appdata`.
 2. Otherwise it reads the existing `~/.oyster/oyster.conf`
-   (`username=`/`password=`, `noservertls=`, `rpclisten=`) and connects.
+   (`username=`/`password=`, `noservertls=`, `rpclisten=`) and connects. An
+   explicit `rpclisten=` is where the daemon actually listens, so oystercli
+   dials it — whatever the active network's default port would be.
 3. If there is no config at all, oystercli **writes a secure one itself**
    (see below) — you are never asked to make configuration choices.
 
@@ -66,12 +68,14 @@ connect target, wallet, oyster binary), and always under `--verbose`.
 When no daemon is reachable, oystercli provisions and manages one for you:
 
 - **Auto-provisioned config.** If `~/.oyster/oyster.conf` is missing, oystercli
-  writes a secure one — generated RPC credentials, `usespv=1` (no pearld
-  needed), a **loopback-only** `rpclisten=127.0.0.1:<port>`, and TLS left on
-  (oyster's default). An existing config is never overridden: if it merely
-  lacks credentials, only those are appended; any other settings are left
-  exactly as they are. If an existing config is insecure (`noservertls`, a
-  non-loopback listener), oystercli warns but respects it.
+  writes a secure one — generated RPC credentials and `usespv=1` (no pearld
+  needed). TLS and listeners are left at oyster's defaults, which are TLS on
+  and **loopback-only** listeners on the active network's RPC port — so the
+  same conf serves mainnet and testnet. An existing config is never
+  overridden: if it merely lacks credentials, only those are appended; any
+  other settings are left exactly as they are. If an existing config is
+  insecure (`noservertls`, a non-loopback listener), oystercli warns but
+  respects it.
 - **Create a wallet** (when none exists) — drives `oyster --createfromfile`
   (the desktop wallet's mechanism), with a seed backup ceremony for new
   wallets. Restores recover funds by rescanning from the wallet birthday you
@@ -96,6 +100,43 @@ before use.
 If something is listening on `127.0.0.1:8335`, triage points out that this is
 the desktop wallet's private oyster instance (random per-session credentials)
 and steers toward running a dedicated daemon instead.
+
+## Remote daemons
+
+oystercli can drive an oyster running on another machine:
+
+```
+oystercli -c wallet-host:44207 -u <user> -P <pass> --cafile <copied rpc.cert>
+```
+
+- On the daemon's machine: set a non-loopback `rpclisten=` in its
+  `oyster.conf` and open the port in the firewall. The auto-generated
+  certificate already covers that machine's hostname and interface IPs; if
+  its address changed since generation, delete `rpc.cert`/`rpc.key` and
+  restart oyster to regenerate.
+- On the client: copy the daemon's `rpc.cert` and point `--cafile` at it —
+  or skip both by tunnelling (`ssh -L 44207:127.0.0.1:44207 wallet-host`)
+  and connecting to `localhost`, which every generated certificate covers.
+- Flag-free alternative: keep a dedicated client appdata dir
+  (`oystercli -A ~/.oyster-remote`) whose `oyster.conf` holds the remote
+  daemon's credentials and `rpclisten=wallet-host:44207` (oystercli dials
+  the listener address), with the copied `rpc.cert` beside it.
+
+With a remote target the local bootstrapping steps — config provisioning,
+wallet creation, starting or stopping-and-restarting the daemon from triage —
+are not offered; that machine's operator owns its configuration.
+
+## Testnet
+
+`oystercli --testnet` runs the exact same flow against the test network:
+credentials come from the shared `oyster.conf`, the wallet lives in the
+per-network directory (`~/.oyster/testnet/wallet.db`), "Create a wallet" and
+"Start oyster now" pass `--testnet` through to the daemon, and the RPC port
+defaults to the testnet port (`44209`). Mainnet and testnet daemons can run
+side by side from the same config. The one caveat: a config with an explicit
+`rpclisten=` pins the daemon (and oystercli) to that address on every
+network, so port-sharing setups should drop the line and rely on the
+per-network defaults.
 
 ## Flags
 

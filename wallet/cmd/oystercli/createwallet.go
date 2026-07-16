@@ -57,7 +57,7 @@ func createWalletWizard(cfg *config) error {
 			huh.NewText().
 				Title("Recovery seed").
 				Description("The 12-word BIP39 mnemonic (or legacy hex seed) to restore from.").
-				Validate(nonEmpty("seed")).
+				Validate(huh.ValidateNotEmpty()).
 				Value(&seedInput),
 			huh.NewInput().
 				Title("Wallet birthday (optional)").
@@ -76,7 +76,7 @@ func createWalletWizard(cfg *config) error {
 			Title("Private passphrase").
 			Description("Encrypts your keys; required for every spend. There is no recovery if lost.").
 			EchoMode(huh.EchoModePassword).
-			Validate(nonEmpty("passphrase")).
+			Validate(huh.ValidateNotEmpty()).
 			Value(&passphrase),
 		huh.NewInput().
 			Title("Repeat passphrase").
