@@ -192,7 +192,10 @@ func colorizeLogLine(line string) string {
 
 // stripControlRunes replaces C0/C1 control characters (except tab) with the
 // Unicode replacement character, keeping injected sequences visible rather
-// than silently dropping them.
+// than silently dropping them. ansi.Strip is deliberately not used here: it
+// removes well-formed escape sequences but passes bare C0 controls through
+// (its Execute action keeps them), so carriage-return and backspace spoofing
+// would survive it.
 func stripControlRunes(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\t' {

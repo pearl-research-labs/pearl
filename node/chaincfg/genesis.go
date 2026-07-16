@@ -222,7 +222,7 @@ var testNetGenesisBlock = wire.MsgBlock{
 }
 
 // testNet2GenesisHash is the hash of the first block in the block chain for the
-// test network v2 (fresh genesis).
+// test network v2.
 var testNet2GenesisHash = chainhash.Hash([chainhash.HashSize]byte{
 	0x96, 0x6f, 0x33, 0xa0, 0x2e, 0x2e, 0x5f, 0x2b,
 	0xd8, 0xd5, 0x11, 0x38, 0x41, 0xce, 0xee, 0x29,

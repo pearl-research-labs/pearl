@@ -48,16 +48,6 @@ func runForm(f *huh.Form) (bool, error) {
 	return false, err
 }
 
-// nonEmpty validates required text inputs.
-func nonEmpty(what string) func(string) error {
-	return func(s string) error {
-		if len(s) == 0 {
-			return fmt.Errorf("%s is required", what)
-		}
-		return nil
-	}
-}
-
 // spinnerDelay is how long an operation may run before a spinner appears.
 const spinnerDelay = 150 * time.Millisecond
 

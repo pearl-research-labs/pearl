@@ -37,7 +37,6 @@ func run() error {
 		return fmt.Errorf("%s is an interactive tool and needs a terminal (set ACCESSIBLE=1 for screen-reader prompts)", appName)
 	}
 
-	initUI(detectDarkBackground())
 	printBanner(cfg)
 	if cfg.Verbose {
 		lipgloss.Println("\n" + resolutionStory(cfg))
@@ -46,8 +45,9 @@ func run() error {
 	// Zero-config: if no credentials were discovered (flags or an existing
 	// oyster.conf), write a secure config ourselves rather than asking the
 	// user to choose anything. An existing config is respected, not
-	// overridden.
-	if cfg.RPCUser == "" || cfg.RPCPass == "" {
+	// overridden. Remote targets are excluded: locally generated
+	// credentials cannot match a daemon provisioned elsewhere.
+	if !cfg.remoteTarget() && (cfg.RPCUser == "" || cfg.RPCPass == "") {
 		if err := autoProvision(cfg); err != nil {
 			return err
 		}
