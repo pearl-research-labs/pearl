@@ -18,6 +18,7 @@
     "preview": "electron-vite preview",
     "pack": "pnpm run build && electron-builder --dir",
     "dist": "pnpm run build && electron-builder",
+    "test": "pnpm run build && node --test \"test/*.test.mjs\"",
     "logs": "tail -f ~/Library/Logs/@pearl/pearl-desktop-wallet/main.log",
     "logs:open": "open ~/Library/Logs/@pearl/pearl-desktop-wallet/"
   },
