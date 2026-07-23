@@ -238,4 +238,42 @@ func TestCheckCertificateVersionDenseOnlyFork(t *testing.T) {
 	require.NoError(t, CheckCertificateVersion(dense, denseOnlyTestHeight, params))
 	requireRuleError(t, CheckCertificateVersion(moe, denseOnlyTestHeight, params),
 		ErrDisallowedCertVersion)
+
+	// The zero-length placeholder proof used by block templates is not MoE
+	// and must stay valid at and after the fork. Regression guard for the
+	// template-generation failure caused by detecting MoE-ness with "!=".
+	placeholder := &wire.CertificateV2{}
+	require.NoError(t, CheckCertificateVersion(placeholder, denseOnlyTestHeight, params))
+}
+
+// TestDenseOnlyForkAcceptsTemplatesAndBlocks builds a SimNet chain across the
+// dense-only activation height. SolveBlock emits V2 certificates with a
+// zero-length (placeholder) proof on SimNet; both freshly built templates and
+// processed blocks must be accepted under the dense-only rule, since a
+// placeholder is not a MoE proof. This reproduces the "failed to create new
+// block template" failure observed once the fork activated.
+func TestDenseOnlyForkAcceptsTemplatesAndBlocks(t *testing.T) {
+	params := moeSimNetParams()
+	params.DenseOnlyForkHeight = moeForkTestHeight + 2
+	chain, teardown, err := chainSetup("dense_only_template", &params)
+	require.NoError(t, err)
+	defer teardown()
+
+	tip := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	tip.SetHeight(0)
+
+	// Extend past the dense-only fork height; every block must be accepted
+	// (its placeholder V2 certificate is non-MoE).
+	for h := int32(1); h <= params.DenseOnlyForkHeight+1; h++ {
+		block, _, err := addBlock(chain, tip, nil)
+		require.NoErrorf(t, err,
+			"block at height %d must be accepted after the dense-only fork", h)
+		tip = block
+	}
+
+	// A fresh template on top of a post-fork tip must also be accepted.
+	template, _, err := newBlock(chain, tip, nil)
+	require.NoError(t, err)
+	require.NoError(t, chain.CheckConnectBlockTemplate(template),
+		"post-fork block template must be accepted")
 }

@@ -37,8 +37,12 @@ func (c *CertificateV2) Version() CertificateVersion {
 	return CertificateVersionV2
 }
 
+// IsMoE reports whether the certificate carries a MoE proof. MoE proofs are
+// strictly larger than a dense proof (PublicDataSizeDenseV2); using ">" rather
+// than "!=" keeps the zero-length placeholder proof used in block templates
+// valid under the dense-only fork.
 func (c *CertificateV2) IsMoE() bool {
-	return c.PublicDataLen != PublicDataSizeDenseV2
+	return c.PublicDataLen > PublicDataSizeDenseV2
 }
 
 func (c *CertificateV2) BlockHash() chainhash.Hash {
