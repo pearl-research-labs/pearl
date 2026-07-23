@@ -215,3 +215,27 @@ func TestCheckCertificateVersion(t *testing.T) {
 	requireRuleError(t, CheckCertificateVersion(nil, 1, enabled),
 		ErrCertificateMissing)
 }
+
+// TestCheckCertificateVersionDenseOnlyFork exercises the dense-only fork: at
+// and after DenseOnlyForkHeight a V2 certificate must carry a dense (non-MoE)
+// proof. MoE-ness is detected by the public data length (dense proofs are
+// exactly wire.PublicDataSizeDenseV2 bytes, MoE proofs are longer).
+func TestCheckCertificateVersionDenseOnlyFork(t *testing.T) {
+	const denseOnlyTestHeight = moeForkTestHeight + 2
+	params := &chaincfg.Params{
+		MoEForkHeight:       moeForkTestHeight,
+		DenseOnlyForkHeight: denseOnlyTestHeight,
+	}
+
+	dense := &wire.CertificateV2{PublicDataLen: wire.PublicDataSizeDenseV2}
+	moe := &wire.CertificateV2{PublicDataLen: wire.PublicDataSizeDenseV2 + 1}
+
+	// Before the dense-only fork both proof kinds are accepted.
+	require.NoError(t, CheckCertificateVersion(dense, denseOnlyTestHeight-1, params))
+	require.NoError(t, CheckCertificateVersion(moe, denseOnlyTestHeight-1, params))
+
+	// At and after the fork only dense proofs are accepted.
+	require.NoError(t, CheckCertificateVersion(dense, denseOnlyTestHeight, params))
+	requireRuleError(t, CheckCertificateVersion(moe, denseOnlyTestHeight, params),
+		ErrDisallowedCertVersion)
+}
