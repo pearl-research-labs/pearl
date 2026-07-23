@@ -512,9 +512,11 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 	return checkBlockSanity(block, chainParams, timeSource, BFNone)
 }
 
-// CheckCertificateVersion enforces the MoE certificate fork:
-//   - At and after MoEForkHeight: only V2 accepted
-//   - Before MoEForkHeight (or fork disabled): only V1 accepted
+// CheckCertificateVersion enforces the certificate fork schedule:
+//   - Before MoEForkHeight (or with the fork disabled): only V1 accepted
+//   - At and after MoEForkHeight (hardfork): only V2 accepted
+//   - At and after DenseOnlyForkHeight (softfork): V2 certificates must
+//     carry a dense (non-MoE) proof
 func CheckCertificateVersion(cert wire.BlockCertificate, height int32, params *chaincfg.Params) error {
 	if cert == nil {
 		return ruleError(ErrCertificateMissing, "block has no certificate")
@@ -523,6 +525,13 @@ func CheckCertificateVersion(cert wire.BlockCertificate, height int32, params *c
 	if cert.Version() != want {
 		str := fmt.Sprintf("certificate version %d is not allowed at height %d "+
 			"(require version %d)", cert.Version(), height, want)
+		return ruleError(ErrDisallowedCertVersion, str)
+	}
+	if c, ok := cert.(*wire.CertificateV2); ok && c.IsMoE() &&
+		params.IsDenseOnlyForkActive(height) {
+		str := fmt.Sprintf("MoE certificate is not allowed at height %d "+
+			"(dense-only fork active from height %d)",
+			height, params.DenseOnlyForkHeight)
 		return ruleError(ErrDisallowedCertVersion, str)
 	}
 	return nil

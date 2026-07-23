@@ -256,6 +256,13 @@ type Params struct {
 	// every height).
 	MoEForkHeight int32
 
+	// DenseOnlyForkHeight is the block height at which the dense-only
+	// softfork activates. At and after this height V2 certificates must
+	// carry a dense (non-MoE) proof; the rule only tightens V2 validity,
+	// so pre-fork nodes accept every post-fork block. A value of 0
+	// disables the fork.
+	DenseOnlyForkHeight int32
+
 	// Mempool parameters
 	RelayNonStdTxs bool
 
@@ -279,6 +286,12 @@ type Params struct {
 // height. The fork is disabled when MoEForkHeight is 0.
 func (p *Params) IsMoEForkActive(height int32) bool {
 	return p.MoEForkHeight != 0 && height >= p.MoEForkHeight
+}
+
+// IsDenseOnlyForkActive reports whether the dense-only softfork is active at
+// the given block height. The fork is disabled when DenseOnlyForkHeight is 0.
+func (p *Params) IsDenseOnlyForkActive(height int32) bool {
+	return p.DenseOnlyForkHeight != 0 && height >= p.DenseOnlyForkHeight
 }
 
 // RequiredCertVersion returns the block certificate version that a block at the
@@ -317,6 +330,9 @@ var MainNetParams = Params{
 	MaxTimeOffsetMinutes: 5,
 
 	MoEForkHeight: 71935,
+
+	// Dense-only softfork: MoE proofs are rejected from this height on.
+	DenseOnlyForkHeight: 91600,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: []Checkpoint{
@@ -499,6 +515,9 @@ var TestNetParams = Params{
 
 	MoEForkHeight: 1,
 
+	// Dense-only softfork: MoE proofs are rejected from this height on.
+	DenseOnlyForkHeight: 28235,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
@@ -587,6 +606,9 @@ var TestNet2Params = Params{
 	MaxTimeOffsetMinutes: 5,
 
 	MoEForkHeight: 54869,
+
+	// Dense-only softfork: MoE proofs are rejected from this height on.
+	DenseOnlyForkHeight: 75104,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,

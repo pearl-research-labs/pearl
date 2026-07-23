@@ -16,6 +16,11 @@ import (
 // Must match PublicProofParams::MAX_WIRE_SIZE in zk-pow/src/api/proof_utils.rs.
 const PublicDataMaxSizeV2 = 4807
 
+// PublicDataSizeDenseV2 is the exact PublicData size of a dense (non-MoE) V2
+// proof. Must match PublicProofParams::WIRE_SIZE in zk-pow/src/api/proof_utils.rs;
+// MoE proofs are strictly longer.
+const PublicDataSizeDenseV2 = 164
+
 // CertificateV2 is a version-2 (V2) block certificate. It supports MoE (Mixture-of-Experts)
 // proofs as well as standard non-MoE proofs. PublicData is variable-length; PublicDataLen
 // tracks how many bytes are meaningful.
@@ -30,6 +35,10 @@ type CertificateV2 struct {
 
 func (c *CertificateV2) Version() CertificateVersion {
 	return CertificateVersionV2
+}
+
+func (c *CertificateV2) IsMoE() bool {
+	return c.PublicDataLen != PublicDataSizeDenseV2
 }
 
 func (c *CertificateV2) BlockHash() chainhash.Hash {
