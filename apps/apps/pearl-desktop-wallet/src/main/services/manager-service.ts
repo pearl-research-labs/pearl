@@ -105,9 +105,12 @@ class ManagerService implements ManagerApi {
   }
 
   async lockWallet() {
-    if (this.walletService) {
-      await this.walletService.lockWallet();
-    }
+    // Locking from the desktop always tears down the daemon. Calling the
+    // walletlock RPC first can block behind an active seed-recovery batch,
+    // preventing the process from ever receiving the shutdown signal that
+    // cleanly interrupts recovery. Stopping the daemon clears private key
+    // material from memory and lets recovery resume from its last committed
+    // batch on the next unlock.
     await this.stopWalletProcess();
     this.currentWallet = null;
   }
@@ -163,17 +166,8 @@ class ManagerService implements ManagerApi {
       console.log('Failed to stop wallet process:', error);
     }
 
-    try {
-      await this.loadWallet(walletName, 'open');
-    } catch (error) {
-      console.log('Failed to load wallet:', error);
-    }
-
-    try {
-      await this.startWalletProcess();
-    } catch (error) {
-      console.log('Failed to start wallet process:', error);
-    }
+    await this.loadWallet(walletName, 'open');
+    await this.startWalletProcess();
 
     this.currentWallet = { name: walletName };
   }
