@@ -18,6 +18,7 @@ import (
 	"charm.land/huh/v2/spinner"
 	"charm.land/lipgloss/v2"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
+	"golang.org/x/term"
 )
 
 // accessibleMode reports whether the user asked for screen-reader friendly
@@ -46,6 +47,27 @@ func runForm(f *huh.Form) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// Row bounds for list screens. huh renders inline rather than in an alternate
+// screen, so a field taller than the window cannot be drawn at all: the
+// terminal scrolls and the cursor ends up out of view. Every list screen must
+// therefore cap its own height.
+const (
+	fallbackPageRows = 15
+	minPageRows      = 5
+	maxPageRows      = 40
+)
+
+// listPageSize returns how many list rows fit the terminal, reserving chrome
+// lines for the surrounding title, description, help line, and any sibling
+// fields in the same group.
+func listPageSize(chrome int) int {
+	_, height, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || height <= 0 {
+		return fallbackPageRows
+	}
+	return min(max(height-chrome, minPageRows), maxPageRows)
 }
 
 // spinnerDelay is how long an operation may run before a spinner appears.
