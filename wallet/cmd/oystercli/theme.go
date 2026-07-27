@@ -79,6 +79,18 @@ func oysterTheme() huh.Theme {
 func oysterKeyMap() *huh.KeyMap {
 	km := huh.NewDefaultKeyMap()
 	km.Quit = key.NewBinding(key.WithKeys("ctrl+c", "esc"), key.WithHelp("esc", "back"))
+
+	// Long lists are easier to move through with the page keys, but some
+	// terminals (macOS Terminal.app among them) scroll their own scrollback
+	// on Page Up instead of forwarding it, so ctrl+u/ctrl+d stay bound as a
+	// fallback. Both step half a screen: huh has no full-page binding.
+	km.MultiSelect.HalfPageUp = key.NewBinding(
+		key.WithKeys("ctrl+u", "pgup"), key.WithHelp("pgup", "page up"),
+	)
+	km.MultiSelect.HalfPageDown = key.NewBinding(
+		key.WithKeys("ctrl+d", "pgdown"), key.WithHelp("pgdown", "page down"),
+	)
+
 	appendBackHint(
 		&km.Input.Next, &km.Input.Submit,
 		&km.Text.Next, &km.Text.Submit,
