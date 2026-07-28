@@ -24,18 +24,18 @@
     "manypkg:fix": "manypkg fix"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.29.7",
-    "@esbuild/darwin-arm64": "0.25.12",
+    "@changesets/cli": "^2.31.0",
+    "@esbuild/darwin-arm64": "0.28.0",
     "@manypkg/cli": "^0.25.1",
-    "eslint": "^9.33.0",
+    "eslint": "^10.4.1",
     "husky": "^9.1.7",
-    "lint-staged": "^16.1.5",
-    "prettier": "^3.6.2",
-    "prettier-plugin-tailwindcss": "^0.6.14",
+    "lint-staged": "^17.0.7",
+    "prettier": "^3.8.3",
+    "prettier-plugin-tailwindcss": "^0.8.0",
     "tailwindcss-animate": "^1.0.7",
     "tslib": "^2.8.1",
-    "turbo": "^2.5.5",
-    "vite-plugin-node-polyfills": "^0.22.0"
+    "turbo": "^2.9.16",
+    "vite-plugin-node-polyfills": "^0.28.0"
   },
   "packageManager": "pnpm@8.15.6",
   "name": "with-vite",
