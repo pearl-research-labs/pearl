@@ -734,6 +734,12 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 		return err
 	}
 
+	// Witness data is outside the header's merkle root, so checkpoints cannot
+	// authenticate it (runs regardless of BFFastAdd).
+	if err := ValidateWitnessCommitment(block); err != nil {
+		return err
+	}
+
 	fastAdd := flags&BFFastAdd == BFFastAdd
 	if !fastAdd {
 		blockTime := CalcPastMedianTime(prevNode)
@@ -752,17 +758,6 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 		coinbaseTx := block.Transactions()[0]
 		// BIP-34 is enforced for all blocks; this validates correct height encoding.
 		if err := CheckSerializedHeight(coinbaseTx, blockHeight); err != nil {
-			return err
-		}
-
-		// Validate the witness commitment (if any) within the
-		// block.  This involves asserting that if the coinbase
-		// contains the special commitment output, then this
-		// merkle root matches a computed merkle root of all
-		// the wtxid's of the transactions within the block. In
-		// addition, various other checks against the
-		// coinbase's witness stack.
-		if err := ValidateWitnessCommitment(block); err != nil {
 			return err
 		}
 
