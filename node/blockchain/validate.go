@@ -734,6 +734,8 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 		return err
 	}
 
+	// Witness data is outside the header's merkle root, so checkpoints cannot
+	// authenticate it (runs regardless of BFFastAdd).
 	if err := ValidateWitnessCommitment(block); err != nil {
 		return err
 	}
