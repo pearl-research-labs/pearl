@@ -22,12 +22,12 @@ jobs:
       sha_short: ${{ steps.sha.outputs.sha_short }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6
         with:
           go-version: "1.26.5"
 
@@ -73,7 +73,7 @@ jobs:
       # extraction if downloaded. Fails if no matching artifact exists for the
       # commit (if_no_artifact_found).
       - name: Download tested binaries from blockchain_build.yml run
-        uses: dawidd6/action-download-artifact@8305c0f1062bb0d184d09ef4493ecb9288447732 # v20
+        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
         with:
           github_token: ${{ github.token }}
           workflow: blockchain_build.yml
@@ -105,7 +105,7 @@ jobs:
           cat checksums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ env.VERSION }}
           name: Release ${{ env.VERSION }}
@@ -130,10 +130,10 @@ jobs:
       SHA_SHORT: ${{ needs.version.outputs.sha_short }}
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

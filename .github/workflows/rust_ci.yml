@@ -20,11 +20,11 @@ jobs:
       zk_pow: ${{ steps.filter.outputs.common == 'true' || steps.filter.outputs.pearl_blake3_src == 'true' || steps.filter.outputs.zk_pow_src == 'true' }}
       py_pearl_mining: ${{ steps.filter.outputs.common == 'true' || steps.filter.outputs.pearl_blake3_src == 'true' || steps.filter.outputs.zk_pow_src == 'true' || steps.filter.outputs.py_pearl_mining_src == 'true' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
       - id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           filters: |
             common:
@@ -43,7 +43,7 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.pearl_blake3 == 'true' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -74,7 +74,7 @@ jobs:
       run:
         working-directory: zk-pow
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -124,7 +124,7 @@ jobs:
         run: cargo run --release --bin prove_verify -- performance
 
       # Go FFI Build
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6
         with:
           go-version: '1.26.5'
 
@@ -147,7 +147,7 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.py_pearl_mining == 'true' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           submodules: recursive
           persist-credentials: false
@@ -156,7 +156,7 @@ jobs:
         with:
           workspaces: "py-pearl-mining -> target"
           cache-on-failure: true
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Install system dependencies (jemalloc)
         run: |
           sudo apt-get update

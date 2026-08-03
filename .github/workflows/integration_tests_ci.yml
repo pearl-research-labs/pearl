@@ -37,12 +37,12 @@ jobs:
     outputs:
       should_run: ${{ steps.filter.outputs.should_run }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
           ref: ${{ env.PR_HEAD_SHA }}
       - id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           filters: |
             should_run:
@@ -63,7 +63,7 @@ jobs:
       ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
     steps:
       # Intentionally checks out base branch — EC2 provisioning must use trusted code
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
       - id: start
@@ -90,7 +90,7 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           submodules: recursive
           fetch-depth: 1
@@ -108,7 +108,7 @@ jobs:
         run: task build:blockchain
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Install miner packages
         run: uv sync --package vllm-miner --package pearl-gemm --no-editable --refresh
@@ -182,7 +182,7 @@ jobs:
     if: always() && needs.start-runner.result != 'skipped'
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           aws-region: ${{ vars.EC2_GPU_REGION }}
           aws-access-key-id: ${{ secrets.EC2_AWS_ACCESS_KEY_ID }}

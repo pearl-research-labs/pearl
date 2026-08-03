@@ -19,11 +19,11 @@ jobs:
       pearl_gateway: ${{ steps.filter.outputs.common == 'true' || steps.filter.outputs.pearl_gateway_src == 'true' }}
       miner_base: ${{ steps.filter.outputs.common == 'true' || steps.filter.outputs.pearl_gateway_src == 'true' || steps.filter.outputs.miner_base_src == 'true' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
       - id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           filters: |
             common:
@@ -46,11 +46,11 @@ jobs:
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Check Python formatting with Ruff
         run: |
           PY_FILES=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA"...HEAD -- '*.py')
@@ -79,11 +79,11 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.pearl_gateway == 'true' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Install dependencies
         run: uv sync --package pearl-gateway --no-editable
       - name: Test with pytest
@@ -95,11 +95,11 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.miner_base == 'true' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Install dependencies
         run: uv sync --package miner-base --no-editable
       - name: Test with pytest
