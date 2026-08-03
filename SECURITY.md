@@ -37,6 +37,41 @@ initial report before publicly disclosing any findings, so we have time to
 develop and release a fix. We will credit reporters in the release notes
 unless anonymity is requested.
 
+## Bug Bounty
+
+Pearl Research Labs may, at its sole discretion, offer rewards in PRL for
+qualifying security reports. This is a voluntary recognition program, not a
+contractual offer, contest, or guarantee of payment.
+
+### Reward guidelines
+
+Indicative reward ranges by severity (as determined by us):
+
+| Severity | Reward |
+| --- | --- |
+| Low | 500 PRL |
+| Medium | 1,000 PRL |
+| High | 2,000 PRL |
+| Critical | 10,000 PRL |
+
+### Terms
+
+- **Internal triage.** We assess severity, validity, novelty, and impact
+  internally. Our classification is final.
+- **Discretionary awards.** Whether to reward a report, at what severity
+  tier, and in what amount is entirely at our discretion. The guidelines
+  above are non-binding and may be adjusted or withheld for any reason.
+- **Basis for reward.** An award, if any, may be based on responsible
+  disclosure, assistance with remediation, demonstration of a fix, or any
+  other contribution we consider valuable. There is no single required
+  trigger for payment.
+- **No entitlement.** Submission of a report does not create any right,
+  claim, or expectation to a reward. Duplicate, out-of-scope, low-quality,
+  or previously known issues may receive no award.
+
+Submit reports through the process described in
+[Reporting a Vulnerability](#reporting-a-vulnerability).
+
 ## Contact
 
 - [Report a vulnerability](https://github.com/pearl-research-labs/pearl/security/advisories/new)
