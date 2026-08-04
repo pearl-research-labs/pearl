@@ -52,7 +52,7 @@ Indicative reward ranges by severity (as determined by us):
 | Low | 500 PRL |
 | Medium | 1,000 PRL |
 | High | 2,000 PRL |
-| Critical | 10,000 PRL |
+| Critical | 50,000 PRL |
 
 ### Terms
 
