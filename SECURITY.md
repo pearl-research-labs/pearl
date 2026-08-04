@@ -54,14 +54,14 @@ contractual offer, contest, or guarantee of payment.
 
 ### Bounty scope
 
-Bounty rewards apply only to vulnerabilities in the core protocol and
+Bounty rewards apply only to vulnerabilities in the protocol, the node, and the
 wallet components:
 
 - **pearld** — full node and protocol (`node/`)
 - **ZK proof-of-work** circuits and verifier (`zk-pow/`, `plonky2/`)
-- **XMSS** post-quantum signatures — consensus signature scheme (`xmss/`)
-- **Oyster** wallet daemon (`wallet/`) and its SPV light-client backend
-  (`spv/`)
+- **XMSS** post-quantum signatures (`xmss/`)
+- **Oyster** - wallet daemon (`wallet/`)
+- **SPV** - light client (`spv/`)
 
 Reports against other components in the repo (`miner/`, `py-pearl-mining/`,
 `dnsseeder/`, `apps/`) are **not bounty-eligible** and should be filed as
