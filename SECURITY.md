@@ -13,6 +13,10 @@ This policy covers all components in the Pearl monorepo:
 - **DNS seeder** (`dnsseeder/`)
 - **Frontend applications** (`apps/`)
 
+All components are covered by this policy for vulnerability reporting and
+coordinated disclosure. Bounty rewards, however, apply only to a subset of
+components — see [Bounty scope](#bounty-scope).
+
 ## Supported Versions
 
 Only the latest release is actively supported. Critical fixes may be
@@ -21,6 +25,11 @@ backported to prior releases at the team's discretion.
 ## Reporting a Vulnerability
 
 **Do not open a public issue for security vulnerabilities.**
+
+Private vulnerability reporting is for **security vulnerabilities only**.
+Non-security bugs, crashes without security impact, and feature requests
+should be filed as regular [GitHub issues](https://github.com/pearl-research-labs/pearl/issues)
+instead.
 
 Use [GitHub's private vulnerability reporting](https://github.com/pearl-research-labs/pearl/security/advisories/new)
 to submit a report. Include:
@@ -43,16 +52,34 @@ Pearl Research Labs may, at its sole discretion, offer rewards in PRL for
 qualifying security reports. This is a voluntary recognition program, not a
 contractual offer, contest, or guarantee of payment.
 
+### Bounty scope
+
+Bounty rewards apply only to vulnerabilities in the core protocol and
+wallet components:
+
+- **pearld** — full node and protocol (`node/`)
+- **ZK proof-of-work** circuits and verifier (`zk-pow/`, `plonky2/`)
+- **XMSS** post-quantum signatures — consensus signature scheme (`xmss/`)
+- **Oyster** wallet daemon (`wallet/`) and its SPV light-client backend
+  (`spv/`)
+
+Reports against other components in the repo (`miner/`, `py-pearl-mining/`,
+`dnsseeder/`, `apps/`) are **not bounty-eligible** and should be filed as
+regular [GitHub issues](https://github.com/pearl-research-labs/pearl/issues).
+Severe vulnerabilities in those components may still be reported privately
+via [Reporting a Vulnerability](#reporting-a-vulnerability), but no reward
+is implied.
+
 ### Reward guidelines
 
-Indicative reward ranges by severity (as determined by us):
+Indicative rewards by severity (as determined by us):
 
 | Severity | Reward |
 | --- | --- |
-| Low | 500 PRL |
-| Medium | 1,000 PRL |
-| High | 2,000 PRL |
-| Critical | 50,000 PRL |
+| Low | 1,000 PRL |
+| Medium | 2,000 PRL |
+| High | 10,000 PRL |
+| Critical | 50,000+ PRL |
 
 ### Terms
 
