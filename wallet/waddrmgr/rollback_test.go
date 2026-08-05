@@ -126,4 +126,15 @@ func TestManagerRollbackPastPrunedHistory(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+
+	// The manager has to be able to move forward again afterwards, which
+	// requires the rollback to have recorded its own target: SetSyncedTo
+	// looks up the preceding block before advancing.
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		return mgr.SetSyncedTo(ns, blockAt(0xbb, 51))
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(51), mgr.SyncedTo().Height)
 }
