@@ -475,68 +475,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	// Compare previously-seen blocks against the current chain. If any of
 	// these blocks no longer exist, rollback all of the missing blocks
 	// before catching up with the rescan.
-	rollback := false
-	rollbackStamp := w.Manager.SyncedTo()
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-		for height := rollbackStamp.Height; true; height-- {
-			hash, err := w.Manager.BlockHash(addrmgrNs, height)
-			if err != nil {
-				return err
-			}
-			chainHash, err := chainClient.GetBlockHash(int64(height))
-			if err != nil {
-				return err
-			}
-			header, err := chainClient.GetBlockHeader(chainHash)
-			if err != nil {
-				return err
-			}
-
-			rollbackStamp.Hash = *chainHash
-			rollbackStamp.Height = height
-			rollbackStamp.Timestamp = header.Timestamp
-
-			if bytes.Equal(hash[:], chainHash[:]) {
-				break
-			}
-			rollback = true
-		}
-
-		// If a rollback did not happen, we can proceed safely.
-		if !rollback {
-			return nil
-		}
-
-		// Otherwise, we'll mark this as our new synced height.
-		err := w.Manager.SetSyncedTo(addrmgrNs, &rollbackStamp)
-		if err != nil {
-			return err
-		}
-
-		// If the rollback happened to go beyond our birthday stamp,
-		// we'll need to find a new one by syncing with the chain again
-		// until finding one.
-		if rollbackStamp.Height <= birthdayStamp.Height &&
-			rollbackStamp.Hash != birthdayStamp.Hash {
-
-			err := w.Manager.SetBirthdayBlock(
-				addrmgrNs, rollbackStamp, true,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Finally, we'll roll back our transaction store to reflect the
-		// stale state. `Rollback` unconfirms transactions at and beyond
-		// the passed height, so add one to the new synced-to height to
-		// prevent unconfirming transactions in the synced-to block.
-		return w.TxStore.Rollback(txmgrNs, rollbackStamp.Height+1)
-	})
-	if err != nil {
+	if err := w.rollbackToChain(chainClient, birthdayStamp); err != nil {
 		return err
 	}
 
@@ -568,6 +507,170 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	}
 
 	return w.rescanWithTarget(addrs, unspent, nil)
+}
+
+// rollbackToChain compares the blocks the wallet has previously seen against
+// the current chain and rolls back the ones that are no longer part of it, so
+// that the rescan which follows re-applies the canonical chain.
+func (w *Wallet) rollbackToChain(chainClient chainConn,
+	birthdayStamp *waddrmgr.BlockStamp) error {
+
+	// The address manager's hash history is overwritten with canonical
+	// hashes as blocks are connected, so a reorg the wallet never applied
+	// survives only in the transaction store.
+	var blocks []wtxmgr.Block
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		var err error
+		blocks, err = w.TxStore.Blocks(
+			tx.ReadBucket(wtxmgrNamespaceKey),
+		)
+
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	// Verify those blocks with no database transaction held, as this
+	// queries the backend once per recorded block.
+	staleHeight, err := lowestStaleBlockHeight(chainClient, blocks)
+	if err != nil {
+		return err
+	}
+
+	rewindManager := false
+	rollbackStamp := w.Manager.SyncedTo()
+
+	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+
+		for height := rollbackStamp.Height; true; height-- {
+			hash, err := w.Manager.BlockHash(addrmgrNs, height)
+			if err != nil {
+				return err
+			}
+			stamp, err := canonicalStampAt(chainClient, height)
+			if err != nil {
+				return err
+			}
+
+			rollbackStamp = stamp
+			if bytes.Equal(hash[:], stamp.Hash[:]) {
+				break
+			}
+			rewindManager = true
+		}
+
+		// A stale block the address manager no longer remembers has to
+		// be detached as well, which means rewinding the manager below
+		// it so that the rescan replays those heights.
+		if staleHeight > 0 && staleHeight <= rollbackStamp.Height {
+			stamp, err := canonicalStampAt(
+				chainClient, staleHeight-1,
+			)
+			if err != nil {
+				return err
+			}
+
+			rollbackStamp = stamp
+			rewindManager = true
+		}
+
+		// If nothing diverged, we can proceed safely.
+		if !rewindManager && staleHeight == 0 {
+			return nil
+		}
+
+		if rewindManager {
+			err := w.Manager.SetSyncedTo(addrmgrNs, &rollbackStamp)
+			if err != nil {
+				return err
+			}
+
+			// If the rollback happened to go beyond our birthday
+			// stamp, we'll need to find a new one by syncing with
+			// the chain again until finding one.
+			if rollbackStamp.Height <= birthdayStamp.Height &&
+				rollbackStamp.Hash != birthdayStamp.Hash {
+
+				err := w.Manager.SetBirthdayBlock(
+					addrmgrNs, rollbackStamp, true,
+				)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		// Finally, we'll roll back our transaction store to reflect the
+		// stale state. `Rollback` unconfirms transactions at and beyond
+		// the passed height, so add one to the new synced-to height to
+		// prevent unconfirming transactions in the synced-to block.
+		return w.TxStore.Rollback(txmgrNs, rollbackStamp.Height+1)
+	})
+}
+
+// canonicalStampAt returns the block stamp the chain has at the given height.
+func canonicalStampAt(chainClient chainConn,
+	height int32) (waddrmgr.BlockStamp, error) {
+
+	hash, err := chainClient.GetBlockHash(int64(height))
+	if err != nil {
+		return waddrmgr.BlockStamp{}, err
+	}
+	header, err := chainClient.GetBlockHeader(hash)
+	if err != nil {
+		return waddrmgr.BlockStamp{}, err
+	}
+
+	return waddrmgr.BlockStamp{
+		Hash:      *hash,
+		Height:    height,
+		Timestamp: header.Timestamp,
+	}, nil
+}
+
+// lowestStaleBlockHeight returns the height of the lowest given block that the
+// chain no longer has, or zero when the chain still has all of them. The
+// blocks must be ordered by ascending height.
+func lowestStaleBlockHeight(chainClient chainConn,
+	blocks []wtxmgr.Block) (int32, error) {
+
+	_, bestHeight, err := chainClient.GetBestBlock()
+	if err != nil {
+		return 0, err
+	}
+
+	started := time.Now()
+	for _, b := range blocks {
+		// Genesis cannot be reorged out, and skipping it keeps the
+		// parent of a stale block a real height.
+		if b.Height <= 0 {
+			continue
+		}
+
+		if b.Height <= bestHeight {
+			hash, err := chainClient.GetBlockHash(int64(b.Height))
+			if err != nil {
+				return 0, err
+			}
+			if *hash == b.Hash {
+				continue
+			}
+		}
+
+		log.Warnf("Block %v at height %d is no longer part of the "+
+			"chain, rolling back a reorg that was never applied",
+			b.Hash, b.Height)
+
+		return b.Height, nil
+	}
+
+	log.Infof("Verified the wallet's %d recorded blocks against the chain "+
+		"in %v", len(blocks), time.Since(started))
+
+	return 0, nil
 }
 
 // isDevEnv determines whether the wallet is currently under a local developer

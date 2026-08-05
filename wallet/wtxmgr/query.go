@@ -456,3 +456,18 @@ func (s *Store) PreviousPkScripts(ns walletdb.ReadBucket, rec *TxRecord, block *
 
 	return pkScripts, nil
 }
+
+// Blocks returns every block the store has recorded transactions for, ordered
+// by ascending height.
+func (s *Store) Blocks(ns walletdb.ReadBucket) ([]Block, error) {
+	var blocks []Block
+	it := makeReadBlockIterator(ns, 0)
+	for it.next() {
+		blocks = append(blocks, it.elem.Block)
+	}
+	if it.err != nil {
+		return nil, it.err
+	}
+
+	return blocks, nil
+}
