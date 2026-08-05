@@ -458,8 +458,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 			return w.Manager.SetBirthdayBlock(ns, *birthdayStamp, true)
 		})
 		if err != nil {
-			return fmt.Errorf("unable to persist initial sync "+
-				"data: %w", err)
+			return fmt.Errorf("unable to persist initial sync data: %w", err)
 		}
 	}
 
@@ -467,8 +466,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	// so now.
 	if w.recoveryWindow > 0 {
 		if err := w.recovery(chainClient, birthdayStamp); err != nil {
-			return fmt.Errorf("unable to perform wallet recovery: "+
-				"%w", err)
+			return fmt.Errorf("unable to perform wallet recovery: %w", err)
 		}
 	}
 
@@ -702,9 +700,7 @@ func (w *Wallet) waitUntilBackendSynced(chainClient chain.Interface) error {
 // locateBirthdayBlock returns a block that meets the given birthday timestamp
 // by a margin of +/-2 hours. This is safe to do as the timestamp is already 2
 // days in the past of the actual timestamp.
-func locateBirthdayBlock(chainClient chainConn,
-	birthday time.Time) (*waddrmgr.BlockStamp, error) {
-
+func locateBirthdayBlock(chainClient chainConn, birthday time.Time) (*waddrmgr.BlockStamp, error) {
 	// Retrieve the lookup range for our block.
 	startHeight := int32(0)
 	_, bestHeight, err := chainClient.GetBestBlock()
@@ -712,8 +708,7 @@ func locateBirthdayBlock(chainClient chainConn,
 		return nil, err
 	}
 
-	log.Debugf("Locating suitable block for birthday %v between blocks "+
-		"%v-%v", birthday, startHeight, bestHeight)
+	log.Debugf("Locating suitable block for birthday %v between blocks %v-%v", birthday, startHeight, bestHeight)
 
 	var (
 		birthdayBlock *waddrmgr.BlockStamp
@@ -735,8 +730,7 @@ func locateBirthdayBlock(chainClient chainConn,
 			return nil, err
 		}
 
-		log.Debugf("Checking candidate block: height=%v, hash=%v, "+
-			"timestamp=%v", mid, hash, header.Timestamp)
+		log.Debugf("Checking candidate block: height=%v, hash=%v, timestamp=%v", mid, hash, header.Timestamp)
 
 		// If the search happened to reach either of our range extremes,
 		// then we'll just use that as there's nothing left to search.
@@ -790,11 +784,8 @@ type recoverySyncer struct {
 // recovery attempts to recover any unspent outputs that pay to any of our
 // addresses starting from our birthday, or the wallet's tip (if higher), which
 // would indicate resuming a recovery after a restart.
-func (w *Wallet) recovery(chainClient chain.Interface,
-	birthdayBlock *waddrmgr.BlockStamp) error {
-
-	log.Infof("RECOVERY MODE ENABLED -- rescanning for used addresses "+
-		"with recovery_window=%d", w.recoveryWindow)
+func (w *Wallet) recovery(chainClient chain.Interface, birthdayBlock *waddrmgr.BlockStamp) error {
+	log.Infof("RECOVERY MODE ENABLED -- rescanning for used addresses with recovery_window=%d", w.recoveryWindow)
 
 	// Wallet locking must synchronize with the end of recovery, since use of
 	// keys in recovery is racy with manager IsLocked checks, which could
@@ -910,8 +901,7 @@ func (w *Wallet) recovery(chainClient chain.Interface,
 			}
 
 			if len(recoveryBatch) > 0 {
-				log.Infof("Recovered addresses from blocks "+
-					"%d-%d", recoveryBatch[0].Height,
+				log.Infof("Recovered addresses from blocks %d-%d", recoveryBatch[0].Height,
 					recoveryBatch[len(recoveryBatch)-1].Height)
 			}
 
@@ -1264,9 +1254,7 @@ func extendFoundAddresses(ns walletdb.ReadWriteBucket,
 
 // logFilterBlocksResp provides useful logging information when filtering
 // succeeded in finding relevant transactions.
-func logFilterBlocksResp(block wtxmgr.BlockMeta,
-	resp *chain.FilterBlocksResponse) {
-
+func logFilterBlocksResp(block wtxmgr.BlockMeta, resp *chain.FilterBlocksResponse) {
 	// Log the number of external addresses found in this block.
 	var nFoundExternal int
 	for _, indexes := range resp.FoundExternalAddrs {
@@ -1290,8 +1278,7 @@ func logFilterBlocksResp(block wtxmgr.BlockMeta,
 	// Log the number of outpoints found in this block.
 	nFoundOutPoints := len(resp.FoundOutPoints)
 	if nFoundOutPoints > 0 {
-		log.Infof("Found %d spends from watched outpoints at "+
-			"height=%d hash=%v",
+		log.Infof("Found %d spends from watched outpoints at height=%d hash=%v",
 			nFoundOutPoints, block.Height, block.Hash)
 	}
 }
@@ -1690,9 +1677,7 @@ func (w *Wallet) ChangePublicPassphrase(old, new []byte) error {
 
 // ChangePassphrases modifies the public and private passphrase of the wallet
 // atomically.
-func (w *Wallet) ChangePassphrases(publicOld, publicNew, privateOld,
-	privateNew []byte) error {
-
+func (w *Wallet) ChangePassphrases(publicOld, publicNew, privateOld, privateNew []byte) error {
 	err := make(chan error, 1)
 	w.changePassphrases <- changePassphrasesRequest{
 		publicOld:  publicOld,
@@ -1923,9 +1908,7 @@ func (w *Wallet) PubKeyForAddress(a btcutil.Address) (*btcec.PublicKey, error) {
 // LabelTransaction adds a label to the transaction with the hash provided. The
 // call will fail if the label is too long, or if the transaction already has
 // a label and the overwrite boolean is not set.
-func (w *Wallet) LabelTransaction(hash chainhash.Hash, label string,
-	overwrite bool) error {
-
+func (w *Wallet) LabelTransaction(hash chainhash.Hash, label string, overwrite bool) error {
 	// Check that the transaction is known to the wallet, and fail if it is
 	// unknown. If the transaction is known, check whether it already has
 	// a label.
@@ -2089,9 +2072,7 @@ func (w *Wallet) AccountProperties(scope waddrmgr.KeyScope, acct uint32) (*waddr
 // AccountPropertiesByName returns the properties of an account by its name. It
 // first fetches the desynced information from the address manager, then updates
 // the indexes based on the address pools.
-func (w *Wallet) AccountPropertiesByName(scope waddrmgr.KeyScope,
-	name string) (*waddrmgr.AccountProperties, error) {
-
+func (w *Wallet) AccountPropertiesByName(scope waddrmgr.KeyScope, name string) (*waddrmgr.AccountProperties, error) {
 	manager, err := w.Manager.FetchScopedKeyManager(scope)
 	if err != nil {
 		return nil, err
@@ -2175,8 +2156,7 @@ func (w *Wallet) NextAccount(scope waddrmgr.KeyScope, name string) (uint32, erro
 		return err
 	})
 	if err != nil {
-		log.Errorf("Cannot fetch new account properties for notification "+
-			"after account creation: %v", err)
+		log.Errorf("Cannot fetch new account properties for notification after account creation: %v", err)
 	} else {
 		w.NtfnServer.notifyAccountProperties(props)
 	}
@@ -2672,9 +2652,7 @@ type GetTransactionResult struct {
 
 // GetTransaction returns detailed data of a transaction given its id. In
 // addition it returns properties about its block.
-func (w *Wallet) GetTransaction(txHash chainhash.Hash) (*GetTransactionResult,
-	error) {
-
+func (w *Wallet) GetTransaction(txHash chainhash.Hash) (*GetTransactionResult, error) {
 	var res GetTransactionResult
 	err := walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
 		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
@@ -2813,9 +2791,7 @@ type AccountBalanceResult struct {
 // AccountBalances returns all accounts in the wallet and their balances.
 // Balances are determined by excluding transactions that have not met
 // requiredConfs confirmations.
-func (w *Wallet) AccountBalances(scope waddrmgr.KeyScope,
-	requiredConfs int32) ([]AccountBalanceResult, error) {
-
+func (w *Wallet) AccountBalances(scope waddrmgr.KeyScope, requiredConfs int32) ([]AccountBalanceResult, error) {
 	manager, err := w.Manager.FetchScopedKeyManager(scope)
 	if err != nil {
 		return nil, err
@@ -2933,9 +2909,7 @@ func (s creditSlice) Swap(i, j int) {
 // minconf, less than maxconf and if addresses is populated only the addresses
 // contained within it will be considered.  If we know nothing about a
 // transaction an empty array will be returned.
-func (w *Wallet) ListUnspent(minconf, maxconf int32,
-	accountName string) ([]*btcjson.ListUnspentResult, error) {
-
+func (w *Wallet) ListUnspent(minconf, maxconf int32, accountName string) ([]*btcjson.ListUnspentResult, error) {
 	var results []*btcjson.ListUnspentResult
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
@@ -3062,8 +3036,7 @@ func (w *Wallet) ListLeasedOutputs() ([]*ListLeasedOutputResult, error) {
 			}
 
 			if details == nil {
-				log.Infof("unable to find tx details for "+
-					"%v:%v", output.Outpoint.Hash,
+				log.Infof("unable to find tx details for %v:%v", output.Outpoint.Hash,
 					output.Outpoint.Index)
 				continue
 			}
@@ -3216,9 +3189,7 @@ func (w *Wallet) LockedOutpoints() []btcjson.TransactionInput {
 //
 // NOTE: This differs from LockOutpoint in that outputs are locked for a limited
 // amount of time and their locks are persisted to disk.
-func (w *Wallet) LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
-	duration time.Duration) (time.Time, error) {
-
+func (w *Wallet) LeaseOutput(id wtxmgr.LockID, op wire.OutPoint, duration time.Duration) (time.Time, error) {
 	var expiry time.Time
 	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
@@ -3251,8 +3222,7 @@ func (w *Wallet) resendUnminedTxs() {
 		return err
 	})
 	if err != nil {
-		log.Errorf("Unable to retrieve unconfirmed transactions to "+
-			"resend: %v", err)
+		log.Errorf("Unable to retrieve unconfirmed transactions to resend: %v", err)
 		return
 	}
 
@@ -3289,9 +3259,7 @@ func (w *Wallet) SortedActivePaymentAddresses() ([]string, error) {
 }
 
 // NewAddress returns the next external chained address for a wallet.
-func (w *Wallet) NewAddress(account uint32,
-	scope waddrmgr.KeyScope, includePQTapscript bool) (btcutil.Address, error) {
-
+func (w *Wallet) NewAddress(account uint32, scope waddrmgr.KeyScope, includePQTapscript bool) (btcutil.Address, error) {
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return nil, err
@@ -3346,8 +3314,7 @@ func (w *Wallet) newAddress(addrmgrNs walletdb.ReadWriteBucket, account uint32,
 
 	props, err := manager.AccountProperties(addrmgrNs, account)
 	if err != nil {
-		log.Errorf("Cannot fetch account properties for notification "+
-			"after deriving next external address: %v", err)
+		log.Errorf("Cannot fetch account properties for notification after deriving next external address: %v", err)
 		return nil, nil, err
 	}
 
@@ -3763,9 +3730,7 @@ func (w *Wallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 // relevant database state, and finally possible removing the transaction from
 // the database (along with cleaning up all inputs used, and outputs created) if
 // the transaction is rejected by the backend.
-func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx,
-	label string) (*chainhash.Hash, error) {
-
+func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx, label string) (*chainhash.Hash, error) {
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return nil, err
@@ -3869,8 +3834,7 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 			return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
 		})
 		if dbErr != nil {
-			log.Warnf("Unable to remove confirmed transaction %v "+
-				"from unconfirmed store: %v", tx.TxHash(), dbErr)
+			log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", tx.TxHash(), dbErr)
 		}
 
 		log.Infof("%v: tx already confirmed", txid)
@@ -3999,9 +3963,7 @@ func (w *Wallet) AddScopeManager(scope waddrmgr.KeyScope,
 
 // InitAccounts creates a number of accounts specified by `num`, with account
 // number ranges from 1 to `num`.
-func (w *Wallet) InitAccounts(scope *waddrmgr.ScopedKeyManager,
-	watchOnly bool, num uint32) error {
-
+func (w *Wallet) InitAccounts(scope *waddrmgr.ScopedKeyManager, watchOnly bool, num uint32) error {
 	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
@@ -4043,13 +4005,10 @@ func (w *Wallet) InitAccounts(scope *waddrmgr.ScopedKeyManager,
 
 // DeriveFromKeyPath derives a private key using the given derivation path.
 // Uses PQ signatures by default.
-func (w *Wallet) DeriveFromKeyPath(scope waddrmgr.KeyScope,
-	path waddrmgr.DerivationPath) (*btcec.PrivateKey, error) {
-
+func (w *Wallet) DeriveFromKeyPath(scope waddrmgr.KeyScope, path waddrmgr.DerivationPath) (*btcec.PrivateKey, error) {
 	scopedMgr, err := w.Manager.FetchScopedKeyManager(scope)
 	if err != nil {
-		return nil, fmt.Errorf("error fetching manager for scope %v: "+
-			"%w", scope, err)
+		return nil, fmt.Errorf("error fetching manager for scope %v: %w", scope, err)
 	}
 
 	// Let's see if we can hit the private key cache.
@@ -4071,8 +4030,7 @@ func (w *Wallet) DeriveFromKeyPath(scope waddrmgr.KeyScope,
 
 		mpka, ok := addr.(waddrmgr.ManagedPubKeyAddress)
 		if !ok {
-			err := fmt.Errorf("managed address type for %v is "+
-				"`%T` but want waddrmgr.ManagedPubKeyAddress",
+			err := fmt.Errorf("managed address type for %v is `%T` but want waddrmgr.ManagedPubKeyAddress",
 				addr, addr)
 
 			return err
@@ -4095,8 +4053,7 @@ func (w *Wallet) DeriveFromKeyPathAddAccount(scope waddrmgr.KeyScope,
 
 	scopedMgr, err := w.Manager.FetchScopedKeyManager(scope)
 	if err != nil {
-		return nil, fmt.Errorf("error fetching manager for scope %v: "+
-			"%w", scope, err)
+		return nil, fmt.Errorf("error fetching manager for scope %v: %w", scope, err)
 	}
 
 	// Let's see if we can hit the private key cache.
@@ -4216,9 +4173,7 @@ func Create(db walletdb.DB, pubPass, privPass []byte,
 // an empty database. No root key can be provided as this wallet will be
 // watching only.  Likewise no private passphrase may be provided
 // either.
-func CreateWatchingOnly(db walletdb.DB, pubPass []byte,
-	params *chaincfg.Params, birthday time.Time) error {
-
+func CreateWatchingOnly(db walletdb.DB, pubPass []byte, params *chaincfg.Params, birthday time.Time) error {
 	return create(
 		db, pubPass, nil, nil, params, birthday, true, nil,
 	)
