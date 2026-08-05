@@ -94,9 +94,7 @@ func (c *reorgChainConn) GetBlockHash(height int64) (*chainhash.Hash, error) {
 	return &hash, nil
 }
 
-func (c *reorgChainConn) GetBlockHeader(
-	hash *chainhash.Hash) (*wire.BlockHeader, error) {
-
+func (c *reorgChainConn) GetBlockHeader(hash *chainhash.Hash) (*wire.BlockHeader, error) {
 	height := int32(hash[1])<<24 | int32(hash[2])<<16 |
 		int32(hash[3])<<8 | int32(hash[4])
 
@@ -141,21 +139,15 @@ func syncManagerTo(t *testing.T, w *Wallet, branch byte, from, to int32) {
 
 // mineCoinbase records a coinbase paying the wallet in the block at the given
 // height on the given branch.
-func mineCoinbase(t *testing.T, w *Wallet, branch byte,
-	height int32) wire.OutPoint {
-
+func mineCoinbase(t *testing.T, w *Wallet, branch byte, height int32) wire.OutPoint {
 	t.Helper()
 
 	coinbase := &wire.MsgTx{
 		TxIn: []*wire.TxIn{{
 			PreviousOutPoint: wire.OutPoint{Index: math.MaxUint32},
-			SignatureScript: []byte{
-				branch, byte(height >> 8), byte(height),
-			},
+			SignatureScript:  []byte{branch, byte(height >> 8), byte(height)},
 		}},
-		TxOut: []*wire.TxOut{
-			wire.NewTxOut(5_000_000_000, []byte{txscript.OP_TRUE}),
-		},
+		TxOut: []*wire.TxOut{wire.NewTxOut(5_000_000_000, []byte{txscript.OP_TRUE})},
 	}
 	rec, err := wtxmgr.NewTxRecordFromMsgTx(coinbase, branchTime(height))
 	require.NoError(t, err)
@@ -176,25 +168,19 @@ func mineCoinbase(t *testing.T, w *Wallet, branch byte,
 
 // spendCoinbase records a transaction spending the given outpoint in the block
 // at the given height on the given branch.
-func spendCoinbase(t *testing.T, w *Wallet, branch byte, height int32,
-	op wire.OutPoint) chainhash.Hash {
-
+func spendCoinbase(t *testing.T, w *Wallet, branch byte, height int32, op wire.OutPoint) chainhash.Hash {
 	t.Helper()
 
 	spend := &wire.MsgTx{
-		TxIn: []*wire.TxIn{{PreviousOutPoint: op}},
-		TxOut: []*wire.TxOut{
-			wire.NewTxOut(4_000_000_000, []byte{txscript.OP_TRUE}),
-		},
+		TxIn:  []*wire.TxIn{{PreviousOutPoint: op}},
+		TxOut: []*wire.TxOut{wire.NewTxOut(4_000_000_000, []byte{txscript.OP_TRUE})},
 	}
 	rec, err := wtxmgr.NewTxRecordFromMsgTx(spend, branchTime(height))
 	require.NoError(t, err)
 
 	block := blockMeta(branch, height)
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		return w.TxStore.InsertTx(
-			tx.ReadWriteBucket(wtxmgrNamespaceKey), rec, &block,
-		)
+		return w.TxStore.InsertTx(tx.ReadWriteBucket(wtxmgrNamespaceKey), rec, &block)
 	})
 	require.NoError(t, err)
 
@@ -233,9 +219,7 @@ func lowestStaleHeight(t *testing.T, w *Wallet, conn chainConn) int32 {
 	var blocks []wtxmgr.Block
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		var err error
-		blocks, err = w.TxStore.Blocks(
-			tx.ReadBucket(wtxmgrNamespaceKey),
-		)
+		blocks, err = w.TxStore.Blocks(tx.ReadBucket(wtxmgrNamespaceKey))
 
 		return err
 	})
@@ -247,9 +231,7 @@ func lowestStaleHeight(t *testing.T, w *Wallet, conn chainConn) int32 {
 	return height
 }
 
-func txDetails(t *testing.T, w *Wallet,
-	hash chainhash.Hash) *wtxmgr.TxDetails {
-
+func txDetails(t *testing.T, w *Wallet, hash chainhash.Hash) *wtxmgr.TxDetails {
 	t.Helper()
 
 	details, err := UnstableAPI(w).TxDetails(&hash)
@@ -319,13 +301,9 @@ func TestLowestStaleBlockHeight(t *testing.T) {
 				mineCoinbase(t, w, rec.branch, rec.height)
 			}
 
-			conn := &reorgChainConn{
-				branch: canonicalBranch, tip: tt.tip,
-			}
+			conn := &reorgChainConn{branch: canonicalBranch, tip: tt.tip}
 
-			assert.Equal(
-				t, tt.wantHeight, lowestStaleHeight(t, w, conn),
-			)
+			assert.Equal(t, tt.wantHeight, lowestStaleHeight(t, w, conn))
 			assert.Equal(t, tt.wantCalls, conn.blockHashCalls)
 		})
 	}
@@ -356,8 +334,7 @@ func TestRollbackToChainOrphanedCoinbase(t *testing.T) {
 	// manager is rewound so that the rescan replays both.
 	assert.False(t, hasStoredCredit(t, w, canonical))
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
-	assert.Equal(t, branchHash(canonicalBranch, forkHeight-1),
-		w.Manager.SyncedTo().Hash)
+	assert.Equal(t, branchHash(canonicalBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
 }
 
 // TestRollbackToChainSpentOnlyBlock covers an orphaned block that holds no
@@ -368,9 +345,7 @@ func TestRollbackToChainSpentOnlyBlock(t *testing.T) {
 	defer cleanup()
 
 	spendable := mineCoinbase(t, w, canonicalBranch, forkHeight-5)
-	spender := spendCoinbase(
-		t, w, orphanedBranch, forkHeight, spendable,
-	)
+	spender := spendCoinbase(t, w, orphanedBranch, forkHeight, spendable)
 	syncManagerTo(t, w, canonicalBranch, forkHeight, tipHeight)
 
 	// The spend removed the coinbase from the store's unspent set.
@@ -446,9 +421,7 @@ func TestDisconnectBlockNotChainSynced(t *testing.T) {
 	w.SetChainSynced(false)
 
 	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		return w.disconnectBlock(
-			tx, blockMeta(orphanedBranch, forkHeight),
-		)
+		return w.disconnectBlock(tx, blockMeta(orphanedBranch, forkHeight))
 	})
 	require.NoError(t, err)
 

@@ -268,9 +268,7 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
 
 	if !w.ChainSynced() {
-		log.Warnf("Ignoring disconnected block %v at height %d "+
-			"because the wallet is not chain synced", b.Hash,
-			b.Height)
+		log.Warnf("Ignoring disconnected block %v at height %d: wallet is not chain synced", b.Hash, b.Height)
 
 		return nil
 	}
@@ -284,8 +282,7 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 			return err
 		}
 		if bytes.Equal(hash[:], b.Hash[:]) {
-			log.Infof("Rolling the wallet back to height %d after "+
-				"block %v was disconnected", b.Height-1, b.Hash)
+			log.Infof("Rolling the wallet back to height %d after block %v was disconnected", b.Height-1, b.Hash)
 
 			bs := waddrmgr.BlockStamp{
 				Height: b.Height - 1,
@@ -313,14 +310,11 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 				return err
 			}
 		} else {
-			log.Warnf("Ignoring disconnected block %v at height "+
-				"%d because the wallet recorded %v there",
-				b.Hash, b.Height, hash)
+			log.Warnf("Ignoring disconnected block %v at height %d: wallet recorded %v there", b.Hash, b.Height, hash)
 		}
 	} else {
-		log.Warnf("Ignoring disconnected block %v at height %d "+
-			"because the wallet tip is at height %d", b.Hash,
-			b.Height, syncedTo.Height)
+		log.Warnf("Ignoring disconnected block %v at height %d: wallet tip is at height %d",
+			b.Hash, b.Height, syncedTo.Height)
 	}
 
 	// Notify interested clients of the disconnected block.

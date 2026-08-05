@@ -753,9 +753,7 @@ func TestBlocks(t *testing.T) {
 
 	// Record a transaction in three blocks, inserted out of order, plus an
 	// unmined one which must not show up as a block.
-	mined := []BlockMeta{
-		makeBlockMeta(105), makeBlockMeta(100), makeBlockMeta(101),
-	}
+	mined := []BlockMeta{makeBlockMeta(105), makeBlockMeta(100), makeBlockMeta(101)}
 	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(namespaceKey)
 		for i, block := range mined {

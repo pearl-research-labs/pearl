@@ -512,32 +512,26 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 // rollbackToChain compares the blocks the wallet has previously seen against
 // the current chain and rolls back the ones that are no longer part of it, so
 // that the rescan which follows re-applies the canonical chain.
-func (w *Wallet) rollbackToChain(chainClient chainConn,
-	birthdayStamp *waddrmgr.BlockStamp) error {
-
+func (w *Wallet) rollbackToChain(chainClient chainConn, birthdayStamp *waddrmgr.BlockStamp) error {
 	// The address manager's hash history is overwritten with canonical
 	// hashes as blocks are connected, so a reorg the wallet never applied
 	// survives only in the transaction store.
 	var blocks []wtxmgr.Block
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		var err error
-		blocks, err = w.TxStore.Blocks(
-			tx.ReadBucket(wtxmgrNamespaceKey),
-		)
+		blocks, err = w.TxStore.Blocks(tx.ReadBucket(wtxmgrNamespaceKey))
 
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("unable to read the wallet's recorded "+
-			"blocks: %w", err)
+		return fmt.Errorf("unable to read the wallet's recorded blocks: %w", err)
 	}
 
 	// Verify those blocks with no database transaction held, as this
 	// queries the backend once per recorded block.
 	staleHeight, err := lowestStaleBlockHeight(chainClient, blocks)
 	if err != nil {
-		return fmt.Errorf("unable to verify the wallet's %d recorded "+
-			"blocks against the chain: %w", len(blocks), err)
+		return fmt.Errorf("unable to verify the wallet's %d recorded blocks against the chain: %w", len(blocks), err)
 	}
 
 	rewindManager := false
@@ -554,10 +548,8 @@ func (w *Wallet) rollbackToChain(chainClient chainConn,
 			}
 			stamp, err := canonicalStampAt(chainClient, height)
 			if err != nil {
-				return fmt.Errorf("unable to fetch the "+
-					"chain's block at height %d while "+
-					"looking for the wallet's fork point: "+
-					"%w", height, err)
+				return fmt.Errorf("unable to fetch the chain's block at height %d while finding the fork point: %w",
+					height, err)
 			}
 
 			rollbackStamp = stamp
@@ -571,13 +563,9 @@ func (w *Wallet) rollbackToChain(chainClient chainConn,
 		// be detached as well, which means rewinding the manager below
 		// it so that the rescan replays those heights.
 		if staleHeight > 0 && staleHeight <= rollbackStamp.Height {
-			stamp, err := canonicalStampAt(
-				chainClient, staleHeight-1,
-			)
+			stamp, err := canonicalStampAt(chainClient, staleHeight-1)
 			if err != nil {
-				return fmt.Errorf("unable to fetch the parent "+
-					"of stale block at height %d: %w",
-					staleHeight, err)
+				return fmt.Errorf("unable to fetch the parent of stale block at height %d: %w", staleHeight, err)
 			}
 
 			rollbackStamp = stamp
@@ -616,9 +604,7 @@ func (w *Wallet) rollbackToChain(chainClient chainConn,
 		// prevent unconfirming transactions in the synced-to block.
 		height := rollbackStamp.Height + 1
 		if err := w.TxStore.Rollback(txmgrNs, height); err != nil {
-			return fmt.Errorf("unable to roll back the "+
-				"transaction store to height %d: %w", height,
-				err)
+			return fmt.Errorf("unable to roll back the transaction store to height %d: %w", height, err)
 		}
 
 		return nil
@@ -626,9 +612,7 @@ func (w *Wallet) rollbackToChain(chainClient chainConn,
 }
 
 // canonicalStampAt returns the block stamp the chain has at the given height.
-func canonicalStampAt(chainClient chainConn,
-	height int32) (waddrmgr.BlockStamp, error) {
-
+func canonicalStampAt(chainClient chainConn, height int32) (waddrmgr.BlockStamp, error) {
 	hash, err := chainClient.GetBlockHash(int64(height))
 	if err != nil {
 		return waddrmgr.BlockStamp{}, err
@@ -648,9 +632,7 @@ func canonicalStampAt(chainClient chainConn,
 // lowestStaleBlockHeight returns the height of the lowest given block that the
 // chain no longer has, or zero when the chain still has all of them. The
 // blocks must be ordered by ascending height.
-func lowestStaleBlockHeight(chainClient chainConn,
-	blocks []wtxmgr.Block) (int32, error) {
-
+func lowestStaleBlockHeight(chainClient chainConn, blocks []wtxmgr.Block) (int32, error) {
 	_, bestHeight, err := chainClient.GetBestBlock()
 	if err != nil {
 		return 0, err
@@ -674,15 +656,13 @@ func lowestStaleBlockHeight(chainClient chainConn,
 			}
 		}
 
-		log.Warnf("Block %v at height %d is no longer part of the "+
-			"chain, rolling back a reorg that was never applied",
+		log.Warnf("Block %v at height %d is no longer on the chain, rolling back a reorg that was never applied",
 			b.Hash, b.Height)
 
 		return b.Height, nil
 	}
 
-	log.Infof("Verified the wallet's %d recorded blocks against the chain "+
-		"in %v", len(blocks), time.Since(started))
+	log.Infof("Verified the wallet's %d recorded blocks against the chain in %v", len(blocks), time.Since(started))
 
 	return 0, nil
 }
