@@ -539,7 +539,7 @@ var TestNetParams = Params{
 	// Dense-only softfork: MoE proofs are rejected from this height on.
 	DenseOnlyForkHeight: 28262,
 
-	RankPenaltyForkHeight: 36757,
+	RankPenaltyForkHeight: 36761,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
@@ -633,7 +633,7 @@ var TestNet2Params = Params{
 	// Dense-only softfork: MoE proofs are rejected from this height on.
 	DenseOnlyForkHeight: 75122,
 
-	RankPenaltyForkHeight: 80638,
+	RankPenaltyForkHeight: 80627,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
