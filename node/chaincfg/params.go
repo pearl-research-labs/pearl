@@ -631,12 +631,6 @@ var TestNet2Params = Params{
 	MoEForkHeight: 54869,
 
 	// Dense-only softfork: MoE proofs are rejected from this height on.
-	//
-	// Rescheduled from 75122 to clear 12 MoE blocks between 78309 and 80050
-	// that the chain accepted while this fleet was still on a pre-fork build,
-	// so 75122 made the canonical chain unsyncable from genesis. Blocks 80051
-	// to the tip are all dense, so activating here both validates the existing
-	// chain and keeps the rule in force at the tip.
 	DenseOnlyForkHeight: 80051,
 
 	RankPenaltyForkHeight: 80627,
