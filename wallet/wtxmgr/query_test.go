@@ -16,6 +16,8 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type queryState struct {
@@ -740,4 +742,50 @@ func TestPreviousPkScripts(t *testing.T) {
 	if t.Failed() {
 		t.Fatal("Failed after inserting tx D")
 	}
+}
+
+func TestBlocks(t *testing.T) {
+	t.Parallel()
+
+	s, db, err := testStore(t)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Record a transaction in three blocks, inserted out of order, plus an
+	// unmined one which must not show up as a block.
+	mined := []BlockMeta{makeBlockMeta(105), makeBlockMeta(100), makeBlockMeta(101)}
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(namespaceKey)
+		for i, block := range mined {
+			msgTx := spendOutput(&chainhash.Hash{}, uint32(i), 10e8)
+			rec, err := NewTxRecordFromMsgTx(msgTx, timeNow())
+			if err != nil {
+				return err
+			}
+			if err := s.InsertTx(ns, rec, &block); err != nil {
+				return err
+			}
+		}
+
+		unmined := spendOutput(&chainhash.Hash{}, 99, 10e8)
+		rec, err := NewTxRecordFromMsgTx(unmined, timeNow())
+		if err != nil {
+			return err
+		}
+
+		return s.InsertTx(ns, rec, nil)
+	})
+	require.NoError(t, err)
+
+	var blocks []Block
+	err = walletdb.View(db, func(tx walletdb.ReadTx) error {
+		var err error
+		blocks, err = s.Blocks(tx.ReadBucket(namespaceKey))
+
+		return err
+	})
+	require.NoError(t, err)
+
+	want := []Block{mined[1].Block, mined[2].Block, mined[0].Block}
+	assert.Equal(t, want, blocks)
 }
