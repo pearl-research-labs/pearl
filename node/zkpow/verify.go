@@ -25,6 +25,11 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
+// MinNoiseRank is the minimum accepted by the rank-penalty rule, taken from the
+// Rust implementation of the rule, which asserts at compile time that the value it
+// exports matches the one it enforces.
+const MinNoiseRank = C.MIN_NOISE_RANK
+
 // ================================================================================
 // CERTIFICATE VERIFICATION
 // ================================================================================
@@ -96,12 +101,8 @@ func verifyCertificateV1(header *wire.BlockHeader, c *wire.CertificateV1) error 
 // ================================================================================
 
 func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error {
-	// Guard against directly-constructed structs that bypassed Deserialize.
-	if c.PublicDataLen > wire.PublicDataMaxSizeV2 {
-		return fmt.Errorf("invalid public_data_len %d (max %d)", c.PublicDataLen, wire.PublicDataMaxSizeV2)
-	}
-	publicData := c.PublicData[:c.PublicDataLen]
-	return VerifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
+	return VerifyZKProofFFI(header, c.Hash, c.ProofCommitment(), c.PublicDataBytes(),
+		c.ProofData, nil)
 }
 
 func VerifyZKProofFFI(
@@ -164,6 +165,35 @@ func VerifyZKProofFFI(
 		return fmt.Errorf("verification system error: %s", msg)
 	default:
 		return fmt.Errorf("unknown verification result %d: %s", result, msg)
+	}
+}
+
+// CheckRankPenalty checks public data against the rank-penalty rule, measuring the
+// jackpot against bits: a block header's Bits for consensus, or a share target for
+// pool accounting. Callers decide whether the height-gated rule is active.
+func CheckRankPenalty(bits uint32, publicData []byte) error {
+	if len(publicData) == 0 { // avoid publicData[0] index below
+		return fmt.Errorf("empty public data")
+	}
+
+	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
+	result := C.check_rank_penalty(
+		C.uint32_t(bits),
+		(*C.uint8_t)(unsafe.Pointer(&publicData[0])),
+		C.uintptr_t(len(publicData)),
+		&errorBuf[0],
+	)
+	msg := C.GoString(&errorBuf[0])
+
+	switch result {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("rank penalty rule violated: %s", msg)
+	case 2:
+		return fmt.Errorf("rank penalty check system error: %s", msg)
+	default:
+		return fmt.Errorf("unknown rank penalty check result %d: %s", result, msg)
 	}
 }
 

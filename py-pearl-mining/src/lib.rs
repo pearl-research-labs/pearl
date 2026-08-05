@@ -13,10 +13,12 @@ use std::sync::Mutex;
 
 use blake3::CHUNK_LEN;
 use pearl_blake3::{pad_to_chunk_boundary, MerkleProof, MerkleTree};
+use primitive_types::U256;
 use zk_pow::api::proof::{
     IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern,
     PublicProofParams, ZKProof,
 };
+use zk_pow::api::sanity_checks;
 use zk_pow::api::{prove, verify};
 use zk_pow::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
 use zk_pow::ffi::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
@@ -147,6 +149,32 @@ fn verify_plain_proof_v2(
         Ok(()) => Ok((true, "Mining solution verified successfully".into())),
         Err(e) => Ok((false, e.to_string())),
     }
+}
+
+#[pyfunction]
+fn penalized_target_bound<'py>(
+    py: Python<'py>,
+    target: &Bound<'_, PyAny>,
+    mining_config: &MiningConfiguration,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    // target (int) -> 32 little-endian bytes
+    let target_bytes = target.call_method1("to_bytes", (32usize, "little"))?;
+    let target_bytes: &[u8] = target_bytes.extract()?;
+    let bound = match sanity_checks::penalized_target_bound(
+        U256::from_little_endian(target_bytes),
+        mining_config,
+    ) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let mut out = [0u8; 32];
+    bound.to_little_endian(&mut out);
+    // 32 little-endian bytes -> int
+    let py_bytes = pyo3::types::PyBytes::new(py, &out);
+    let bound_int = py
+        .get_type::<pyo3::types::PyInt>()
+        .call_method1("from_bytes", (py_bytes, "little"))?;
+    Ok(Some(bound_int))
 }
 
 #[pyfunction]
@@ -397,6 +425,10 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
         PublicProofParams::MIN_MOE_WIRE_SIZE,
     )?;
     m.add("PUBLICDATA_MAX_SIZE", PublicProofParams::MAX_WIRE_SIZE)?;
+    m.add(
+        "PENALTY_BASE_RANK",
+        zk_pow::api::sanity_checks::PENALTY_BASE_RANK,
+    )?;
     m.add_class::<MerkleTree>()?;
     m.add_class::<MerkleProof>()?;
     m.add_class::<PeriodicPattern>()?;
@@ -410,6 +442,7 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<PyProof>()?;
     m.add_function(wrap_pyfunction!(mine, m)?)?;
     m.add_function(wrap_pyfunction!(mine_moe, m)?)?;
+    m.add_function(wrap_pyfunction!(penalized_target_bound, m)?)?;
     m.add_function(wrap_pyfunction!(py_pad_to_chunk_boundary, m)?)?;
     // V2 functions (current circuit; MoE and dense proofs)
     m.add_function(wrap_pyfunction!(generate_proof_v2, m)?)?;

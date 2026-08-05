@@ -19,7 +19,7 @@ from pearl_gateway.comm.mining_configuration import (
 from pearl_gateway.rpc_types import (
     GetBlockTemplateResponse,
 )
-from pearl_mining import IncompleteBlockHeader
+from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
 
 
 def get_bytes(data: str | bytes) -> bytes:
@@ -182,9 +182,6 @@ class MiningJob:
     # Certificate version required for this block;
     cert_version: CertificateVersion = CertificateVersion.ZK_MOE
 
-    INNER_HASH_LIMIT: ClassVar[int] = 42
-    MAX_TARGET: ClassVar[int] = 2**256 - 1
-
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
         return {
@@ -192,12 +189,6 @@ class MiningJob:
             "target": self.target,
             "cert_version": int(self.cert_version),
         }
-
-    @staticmethod
-    def _get_difficulty_adjustment_factor(mining_config: MiningConfiguration) -> int:
-        return (
-            mining_config.hash_tile_h * mining_config.hash_tile_w * mining_config.rounded_common_dim
-        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MiningJob":
@@ -219,18 +210,19 @@ class MiningJob:
         )
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:
-        """Calculate the adjusted PoW target for the mining job.
-
-        The target is scaled based on the work represented by the hash tile dimensions
-        and noise rank.
-        """
-        # We reduce difficulty for larger hash tiles (as they represent more work)
-        # and for larger rank (as it's the k dimension of the hash tile)
-        difficulty_adjustment_factor = self._get_difficulty_adjustment_factor(mining_config)
-        adjusted_target = self.target * difficulty_adjustment_factor
-        if adjusted_target > self.MAX_TARGET:
-            raise ValueError(f"Target is too easy: {self.target=}, {adjusted_target=}")
-        return adjusted_target
+        """Calculate the rank-penalized PoW target for the mining job."""
+        if mining_config.rank < PENALTY_BASE_RANK:
+            raise ValueError(
+                f"noise rank {mining_config.rank} is below the minimum "
+                f"{PENALTY_BASE_RANK}; blocks would be rejected by consensus"
+            )
+        bound = penalized_target_bound(self.target, mining_config)
+        if bound is None:
+            raise ValueError(
+                f"no penalized target for {self.target=} at rank "
+                f"{mining_config.rank}: degenerate config or target too easy"
+            )
+        return bound
 
 
 class MiningPausedError(Exception):

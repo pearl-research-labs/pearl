@@ -263,6 +263,16 @@ type Params struct {
 	// disables the fork.
 	DenseOnlyForkHeight int32
 
+	// RankPenaltyForkHeight is the block height at which the rank-penalty
+	// softfork activates. At and after this height a proof's noise rank must
+	// meet a minimum and its jackpot must meet a difficulty bound scaled down
+	// in proportion to that rank; the rule only tightens validity, so pre-fork
+	// nodes accept every post-fork block. A value of 0 disables the fork.
+	//
+	// Must not activate before MoEForkHeight: only V2 certificates carry a
+	// noise rank (enforced in blockchain.New).
+	RankPenaltyForkHeight int32
+
 	// Mempool parameters
 	RelayNonStdTxs bool
 
@@ -292,6 +302,12 @@ func (p *Params) IsMoEForkActive(height int32) bool {
 // the given block height. The fork is disabled when DenseOnlyForkHeight is 0.
 func (p *Params) IsDenseOnlyForkActive(height int32) bool {
 	return p.DenseOnlyForkHeight != 0 && height >= p.DenseOnlyForkHeight
+}
+
+// IsRankPenaltyForkActive reports whether the rank-penalty softfork is active at
+// the given block height. The fork is disabled when RankPenaltyForkHeight is 0.
+func (p *Params) IsRankPenaltyForkActive(height int32) bool {
+	return p.RankPenaltyForkHeight != 0 && height >= p.RankPenaltyForkHeight
 }
 
 // RequiredCertVersion returns the block certificate version that a block at the
@@ -333,6 +349,8 @@ var MainNetParams = Params{
 
 	// Dense-only softfork: MoE proofs are rejected from this height on.
 	DenseOnlyForkHeight: 91630,
+
+	RankPenaltyForkHeight: 96251,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: []Checkpoint{
@@ -411,6 +429,9 @@ var RegressionNetParams = Params{
 	// MoE hardfork active from genesis on local test networks so the gateway's
 	// V2 (MoE) certificates are accepted at every mined height.
 	MoEForkHeight: 1,
+
+	// Active from genesis because regtest verifies proofs.
+	RankPenaltyForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &regTestGenesisBlock,
@@ -518,6 +539,8 @@ var TestNetParams = Params{
 	// Dense-only softfork: MoE proofs are rejected from this height on.
 	DenseOnlyForkHeight: 28262,
 
+	RankPenaltyForkHeight: 36761,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
@@ -609,6 +632,8 @@ var TestNet2Params = Params{
 
 	// Dense-only softfork: MoE proofs are rejected from this height on.
 	DenseOnlyForkHeight: 75122,
+
+	RankPenaltyForkHeight: 80627,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,

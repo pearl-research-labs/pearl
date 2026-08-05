@@ -2,16 +2,79 @@
 
 use std::os::raw::c_char;
 
-use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration};
+use zk_pow::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern};
 use zk_pow::api::prove;
 use zk_pow::ffi::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
 use zk_pow::ffi::plain_proof::PlainProof;
 
-use crate::common::{catch_panic, copy_prove_result, set_error_msg, zk_prove, CZKProof};
+use crate::common::{catch_panic, copy_prove_result, set_error_msg, zk_prove, CZKProof, MIN_NOISE_RANK};
+
+// ============================================================================
+// Default mining configuration
+// ============================================================================
+
+/// Noise rank the default configuration mines at. Sitting on the rank-penalty
+/// floor keeps mined blocks valid once that rule activates, without paying the
+/// penalty a larger rank would.
+const DEFAULT_RANK: u16 = MIN_NOISE_RANK;
+
+/// Smallest common dimension the sanity checks allow for [`DEFAULT_RANK`] (`k >= 16 * r`).
+const DEFAULT_COMMON_DIM: u32 = 16 * DEFAULT_RANK as u32;
+
+/// Index patterns partitioning the jackpot tile: 4 rows of A by 8 columns of B.
+const DEFAULT_ROWS_PATTERN: [u32; 4] = [0, 8, 64, 72];
+const DEFAULT_COLS_PATTERN: [u32; 8] = [0, 1, 8, 9, 32, 33, 40, 41];
 
 // ============================================================================
 // Public FFI
 // ============================================================================
+
+/// Serializes the default mining configuration.
+///
+/// `e == 0` selects a standard job; otherwise it selects a GROUPED_GEMM job
+/// routing each token to `top_k` experts.
+///
+/// # Returns
+/// - 0: configuration written to `mining_config_out`
+/// - 2: System error
+///
+/// # Safety
+/// - `mining_config_out` must be a valid pointer to `MINING_CONFIG_SERIALIZED_SIZE` bytes
+/// - `error_msg_out` must be null or a valid pointer to a caller-allocated buffer of `ERROR_MSG_MAX_SIZE` bytes
+#[no_mangle]
+pub unsafe extern "C" fn default_mining_config(
+    e: u16,
+    top_k: u16,
+    mining_config_out: *mut [u8; crate::common::MINING_CONFIG_SERIALIZED_SIZE],
+    error_msg_out: *mut c_char,
+) -> i32 {
+    let result = catch_panic(|| {
+        if mining_config_out.is_null() {
+            set_error_msg(error_msg_out, "Null pointer");
+            return 2;
+        }
+
+        match build_default_config(e, top_k) {
+            Ok(config) => {
+                *mining_config_out = config.to_bytes();
+                set_error_msg(error_msg_out, "Default mining config written");
+                0
+            }
+            Err(err) => {
+                set_error_msg(error_msg_out, &format!("Invalid default mining config: {err}"));
+                2
+            }
+        }
+    });
+
+    match result {
+        Ok(code) => code,
+        Err(panic_msg) => {
+            set_error_msg(error_msg_out, &format!("Internal panic: {panic_msg}"));
+            2
+        }
+    }
+}
 
 /// Perform mining and generate a standard (non-MoE) ZK proof in one step.
 ///
@@ -84,6 +147,17 @@ pub unsafe extern "C" fn mine_moe(
 // ============================================================================
 // Shared helpers
 // ============================================================================
+
+fn build_default_config(e: u16, top_k: u16) -> anyhow::Result<MiningConfiguration> {
+    Ok(MiningConfiguration {
+        common_dim: DEFAULT_COMMON_DIM,
+        rank: DEFAULT_RANK,
+        mma_type: MMAType::Int7xInt7ToInt32,
+        rows_pattern: PeriodicPattern::from_list(&DEFAULT_ROWS_PATTERN)?,
+        cols_pattern: PeriodicPattern::from_list(&DEFAULT_COLS_PATTERN)?,
+        moe: (e != 0).then_some(MoEConfig { e, top_k }),
+    })
+}
 
 /// Shared boilerplate for both `mine` and `mine_moe`.
 ///

@@ -2843,10 +2843,7 @@ func (b *blockManager) checkHeaderSanity(blockHeader *wire.BlockHeader,
 		&b.cfg.ChainParams,
 	)
 
-	var flags blockchain.BehaviorFlags
-	if b.cfg.ChainParams.Net == wire.SimNet {
-		flags |= blockchain.BFNoPoWCheck
-	}
+	flags := blockchain.NetBehaviorFlags(&b.cfg.ChainParams)
 
 	err := blockchain.CheckBlockHeaderContext(
 		blockHeader, parentHeaderCtx, flags, chainCtx, true,
@@ -2855,8 +2852,8 @@ func (b *blockManager) checkHeaderSanity(blockHeader *wire.BlockHeader,
 		return err
 	}
 
-	if err := blockchain.CheckCertificateVersion(
-		cert, prevNodeHeight+1, &b.cfg.ChainParams,
+	if err := blockchain.CheckCertificateRules(
+		blockHeader, cert, prevNodeHeight+1, &b.cfg.ChainParams, flags,
 	); err != nil {
 		return err
 	}

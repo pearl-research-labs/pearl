@@ -1,3 +1,5 @@
+from pearl_mining import PENALTY_BASE_RANK
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,3 +36,13 @@ class MinerSettings(BaseSettings):
     no_vllm_plugin: bool = False
 
     enable_async_cuda_event_processing: bool = True
+
+    @field_validator("noise_rank")
+    @classmethod
+    def _noise_rank_at_least_base(cls, noise_rank: int) -> int:
+        if noise_rank < PENALTY_BASE_RANK:
+            raise ValueError(
+                f"noise_rank {noise_rank} is below the minimum {PENALTY_BASE_RANK}; "
+                f"blocks would be rejected by consensus"
+            )
+        return noise_rank

@@ -23,30 +23,35 @@ import (
 )
 
 const (
-	DefaultNBits     = 0x1E01FFFF
-	DefaultM         = 256
-	DefaultN         = 512
-	DefaultNoiseRank = 32
-	DefaultMMAType   = 0
+	DefaultNBits = 0x1E01FFFF
+	DefaultM     = 256
+	DefaultN     = 512
 )
 
 // ================================================================================
 // MINER (Rust FFI)
 // ================================================================================
 
-// miningConfigSize matches MINING_CONFIG_SERIALIZED_SIZE in the FFI header.
-const miningConfigSize = 52
+const miningConfigSize = C.MINING_CONFIG_SERIALIZED_SIZE
 
-// defaultMiningConfigV1 is the serialized MiningConfiguration passed to the Rust FFI.
-// Corresponds to: common_dim=1024, rank=32, mma_type=Int7xInt7ToInt32,
-// rows_pattern=[0,8,64,72], cols_pattern=[0,1,8,9,32,33,40,41]
-var defaultMiningConfigV1 = [miningConfigSize]byte{
-	0x00, 0x04, 0x00, 0x00, // common_dim = 1024
-	0x20, 0x00, // rank = 32
-	0x00, 0x00, // mma_type = 0
-	0x07, 0x01, 0x03, 0x01, 0x00, 0x00, // rows_pattern
-	0x00, 0x01, 0x03, 0x01, 0x01, 0x01, // cols_pattern
-	// reserved (32 bytes) are zero
+// defaultMiningConfig retrieves Rust's canonical serialized mining configuration.
+//
+// e == 0 selects a standard job; otherwise it selects a GROUPED_GEMM (MoE) job
+// routing each token to topK experts.
+func defaultMiningConfig(e, topK uint32) ([miningConfigSize]byte, error) {
+	var config [miningConfigSize]byte
+	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
+
+	result := C.default_mining_config(
+		C.uint16_t(e), C.uint16_t(topK),
+		(*[miningConfigSize]C.uint8_t)(unsafe.Pointer(&config)),
+		&errorBuf[0],
+	)
+	if result != 0 {
+		return config, fmt.Errorf("building mining config failed (code %d): %s",
+			result, C.GoString(&errorBuf[0]))
+	}
+	return config, nil
 }
 
 // Mine mines a standard (non-MoE) block using the default dimensions.
@@ -99,16 +104,9 @@ func MineMoE(header *wire.BlockHeader, m, n, e, topK uint32) (*wire.CertificateV
 // callMineFFI invokes the Rust mine function and returns the public data and proof data as Go slices.
 // No C types or raw pointers escape this function.
 func callMineFFI(cHeader C.IncompleteBlockHeader, m, n, e, topK uint32) (publicData, proofData []byte, err error) {
-	// The MoE config is committed in the mining config trailer (and thus the
-	// job_key). Trailer layout: [20:22] e (u16 LE), [22:24] top_k (u16 LE), [24:52] zero padding.
-	// e doubles as the mode discriminant: e == 0 is a standard job, e > 0 is GROUPED_GEMM.
-	// miningConfig is a value copy of the package default.
-	miningConfig := defaultMiningConfigV1
-	if e != 0 {
-		miningConfig[20] = byte(e)
-		miningConfig[21] = byte(e >> 8)
-		miningConfig[22] = byte(topK)
-		miningConfig[23] = byte(topK >> 8)
+	miningConfig, err := defaultMiningConfig(e, topK)
+	if err != nil {
+		return nil, nil, err
 	}
 	cMiningConfig := (*[miningConfigSize]C.uint8_t)(unsafe.Pointer(&miningConfig))
 
