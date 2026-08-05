@@ -528,14 +528,16 @@ func (w *Wallet) rollbackToChain(chainClient chainConn,
 		return err
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to read the wallet's recorded "+
+			"blocks: %w", err)
 	}
 
 	// Verify those blocks with no database transaction held, as this
 	// queries the backend once per recorded block.
 	staleHeight, err := lowestStaleBlockHeight(chainClient, blocks)
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to verify the wallet's %d recorded "+
+			"blocks against the chain: %w", len(blocks), err)
 	}
 
 	rewindManager := false
@@ -552,7 +554,10 @@ func (w *Wallet) rollbackToChain(chainClient chainConn,
 			}
 			stamp, err := canonicalStampAt(chainClient, height)
 			if err != nil {
-				return err
+				return fmt.Errorf("unable to fetch the "+
+					"chain's block at height %d while "+
+					"looking for the wallet's fork point: "+
+					"%w", height, err)
 			}
 
 			rollbackStamp = stamp
@@ -570,7 +575,9 @@ func (w *Wallet) rollbackToChain(chainClient chainConn,
 				chainClient, staleHeight-1,
 			)
 			if err != nil {
-				return err
+				return fmt.Errorf("unable to fetch the parent "+
+					"of stale block at height %d: %w",
+					staleHeight, err)
 			}
 
 			rollbackStamp = stamp
@@ -607,7 +614,14 @@ func (w *Wallet) rollbackToChain(chainClient chainConn,
 		// stale state. `Rollback` unconfirms transactions at and beyond
 		// the passed height, so add one to the new synced-to height to
 		// prevent unconfirming transactions in the synced-to block.
-		return w.TxStore.Rollback(txmgrNs, rollbackStamp.Height+1)
+		height := rollbackStamp.Height + 1
+		if err := w.TxStore.Rollback(txmgrNs, height); err != nil {
+			return fmt.Errorf("unable to roll back the "+
+				"transaction store to height %d: %w", height,
+				err)
+		}
+
+		return nil
 	})
 }
 
