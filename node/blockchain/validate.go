@@ -707,6 +707,30 @@ func CheckBlockHeaderContext(header *wire.BlockHeader, prevNode chaincfg.HeaderC
 	return nil
 }
 
+// CheckBlockHeaderContextFromValues runs CheckBlockHeaderContext against
+// scalar parent state, mirroring the convenience pattern of
+// CalcNextRequiredDifficultyFromValues. parentPrevTs may be -1 to
+// indicate genesis (no grandparent timestamp known). Checkpoints are
+// always skipped; callers without a chain index cannot enforce them.
+func CheckBlockHeaderContextFromValues(params *chaincfg.Params,
+	header *wire.BlockHeader, parentHeight int32, parentBits uint32,
+	parentTs, parentPrevTs int64, flags BehaviorFlags) error {
+
+	parent := &valuesHeaderCtx{
+		height:    parentHeight,
+		bits:      parentBits,
+		timestamp: parentTs,
+	}
+	if parentPrevTs >= 0 {
+		parent.parent = &valuesHeaderCtx{
+			height:    parentHeight - 1,
+			timestamp: parentPrevTs,
+		}
+	}
+	return CheckBlockHeaderContext(header, parent, flags,
+		paramsChainCtx{p: params}, true)
+}
+
 // checkBlockContext performs several validation checks on the block which depend
 // on its position within the block chain.
 //

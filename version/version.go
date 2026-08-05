@@ -24,7 +24,7 @@ const (
 
 	// PreRelease MUST only contain characters from semanticAlphabet
 	// per the semantic versioning spec.
-	PreRelease = ""
+	PreRelease = "presync"
 )
 
 // Build may be overridden at link time via

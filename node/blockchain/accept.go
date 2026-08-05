@@ -6,6 +6,7 @@ package blockchain
 
 import (
 	"fmt"
+	"math/big"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/database"
@@ -32,6 +33,20 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	} else if b.index.NodeStatus(prevNode).KnownInvalid() {
 		str := fmt.Sprintf("previous block %s is known to be invalid", prevHash)
 		return false, ruleError(ErrInvalidAncestorBlock, str)
+	}
+
+	// Anti-DoS: refuse to store a block whose candidate chain has not yet
+	// proven enough cumulative work. BFNoAntiDoSWork is set during
+	// presync REDOWNLOAD where anti-DoS is achieved through commitment bits.
+	if flags&BFNoAntiDoSWork != BFNoAntiDoSWork {
+		candidateWork := new(big.Int).Add(prevNode.workSum, CalcWork(block.MsgBlock().BlockHeader().Bits))
+		threshold := b.GetAntiDoSWorkThreshold()
+		if candidateWork.Cmp(threshold) < 0 {
+			str := fmt.Sprintf("block %s candidate chain work %s below "+
+				"anti-DoS threshold %s", block.Hash(), candidateWork,
+				threshold)
+			return false, ruleError(ErrLowWorkBlock, str)
+		}
 	}
 
 	blockHeight := prevNode.height + 1

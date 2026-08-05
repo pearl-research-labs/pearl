@@ -24,6 +24,11 @@ const (
 	// maxOrphanBlocks is the maximum number of orphan blocks that can be
 	// queued.
 	maxOrphanBlocks = 25
+
+	// antiDoSBufferBlocks is the number of blocks of work subtracted from
+	// the tip's cumulative work to compute the presync threshold. Forks
+	// within this many blocks of the tip bypass anti-DoS protection.
+	antiDoSBufferBlocks int64 = 100
 )
 
 // BlockLocator is used to help locate a specific block.  The algorithm for
@@ -70,6 +75,7 @@ type BestState struct {
 	TotalTxns  uint64         // The total number of txns in the chain.
 	MedianTime time.Time      // Median time as per CalcPastMedianTime.
 	BlockTime  time.Time      // Timestamp of the block (for WTEMA monotonicity).
+	WorkSum    *big.Int       // Cumulative work of the best chain.
 }
 
 // newBestState returns a new best stats instance for the given parameters.
@@ -86,6 +92,7 @@ func newBestState(node *blockNode, blockSize, blockVsize, numTxns,
 		TotalTxns:  totalTxns,
 		MedianTime: medianTime,
 		BlockTime:  blockTime,
+		WorkSum:    new(big.Int).Set(node.workSum),
 	}
 }
 
@@ -2300,6 +2307,64 @@ func New(config *Config) (*BlockChain, error) {
 		bestNode.workSum)
 
 	return &b, nil
+}
+
+// ChainStartInfo captures the publicly visible state of a block index entry
+// for use as a fork point in the headers presync protocol.
+type ChainStartInfo struct {
+	Hash          chainhash.Hash
+	Height        int32
+	Bits          uint32
+	Timestamp     int64
+	WorkSum       *big.Int
+	PrevTimestamp int64 // parent's timestamp, or -1 if genesis
+}
+
+// LookupChainStartInfo returns chain-start information for the block at the
+// given hash, or nil if not found. Used by the presync state machine to
+// initialise from a fork point in the block index.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) LookupChainStartInfo(hash *chainhash.Hash) *ChainStartInfo {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	node := b.index.LookupNode(hash)
+	if node == nil {
+		return nil
+	}
+	var prevTs int64 = -1
+	if node.parent != nil {
+		prevTs = node.parent.timestamp
+	}
+	return &ChainStartInfo{
+		Hash:          node.hash,
+		Height:        node.height,
+		Bits:          node.bits,
+		Timestamp:     node.timestamp,
+		WorkSum:       new(big.Int).Set(node.workSum),
+		PrevTimestamp: prevTs,
+	}
+}
+
+// GetAntiDoSWorkThreshold returns the minimum cumulative chain work a chain
+// must demonstrate before its headers are accepted without presync.
+//
+//	threshold = max(tip.WorkSum - antiDoSBufferBlocks * tipBlockWork,
+//	               chainParams.MinimumChainWork)
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) GetAntiDoSWorkThreshold() *big.Int {
+	best := b.BestSnapshot()
+	tipWork := CalcWork(best.Bits)
+
+	deduction := new(big.Int).Mul(tipWork, big.NewInt(antiDoSBufferBlocks))
+	nearTipWork := new(big.Int).Sub(best.WorkSum, deduction)
+	if nearTipWork.Sign() < 0 {
+		nearTipWork.SetInt64(0)
+	}
+
+	return MaxBigInt(nearTipWork, b.chainParams.MinimumChainWork)
 }
 
 // CachedStateSize returns the total size of the cached state of the blockchain

@@ -29,6 +29,11 @@ const (
 	// not be performed.
 	BFNoPoWCheck
 
+	// BFNoAntiDoSWork may be set to skip the anti-DoS cumulative work
+	// check in maybeAcceptBlock. Used during presync REDOWNLOAD where
+	// anti-DoS is enforced through commitment bits.
+	BFNoAntiDoSWork
+
 	// BFNone is a convenience value to specifically indicate no flags.
 	BFNone BehaviorFlags = 0
 )

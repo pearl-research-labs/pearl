@@ -222,3 +222,69 @@ func (b *BlockChain) CalcNextRequiredDifficulty(timestamp time.Time) (uint32, er
 	b.chainLock.Unlock()
 	return difficulty, err
 }
+
+// paramsChainCtx is a minimal ChainCtx backed only by *chaincfg.Params, used
+// by callers that maintain lightweight state and do not have a full
+// *BlockChain (e.g. CalcNextRequiredDifficultyFromValues).
+type paramsChainCtx struct{ p *chaincfg.Params }
+
+func (c paramsChainCtx) ChainParams() *chaincfg.Params { return c.p }
+func (paramsChainCtx) VerifyCheckpoint(_ int32, _ *chainhash.Hash) bool {
+	return false
+}
+func (paramsChainCtx) FindPreviousCheckpoint() (chaincfg.HeaderCtx, error) {
+	return nil, nil
+}
+
+// CalcNextRequiredDifficultyFromValues computes the next required difficulty
+// from raw scalar values (height, bits, timestamps) rather than a full
+// HeaderCtx. Convenience wrapper for callers that maintain only lightweight
+// state (e.g. the headers presync state machine).
+//
+// prevTs should be -1 when no parent timestamp is available (e.g. genesis).
+func CalcNextRequiredDifficultyFromValues(params *chaincfg.Params, height int32,
+	bits uint32, ts, prevTs int64) (uint32, error) {
+
+	ctx := &valuesHeaderCtx{
+		height:    height,
+		bits:      bits,
+		timestamp: ts,
+	}
+	if prevTs >= 0 {
+		ctx.parent = &valuesHeaderCtx{
+			height:    height - 1,
+			timestamp: prevTs,
+		}
+	}
+	return calcNextRequiredDifficulty(ctx, time.Unix(ts, 0), paramsChainCtx{p: params})
+}
+
+// valuesHeaderCtx is a minimal HeaderCtx backed by scalar values, used by
+// CalcNextRequiredDifficultyFromValues.
+type valuesHeaderCtx struct {
+	height    int32
+	bits      uint32
+	timestamp int64
+	parent    *valuesHeaderCtx
+}
+
+func (c *valuesHeaderCtx) Hash() chainhash.Hash { return chainhash.Hash{} }
+func (c *valuesHeaderCtx) Height() int32        { return c.height }
+func (c *valuesHeaderCtx) Bits() uint32         { return c.bits }
+func (c *valuesHeaderCtx) Timestamp() int64     { return c.timestamp }
+func (c *valuesHeaderCtx) Parent() chaincfg.HeaderCtx {
+	if c.parent == nil {
+		return nil
+	}
+	return c.parent
+}
+func (c *valuesHeaderCtx) RelativeAncestorCtx(distance int32) chaincfg.HeaderCtx {
+	cur := c
+	for i := int32(0); i < distance; i++ {
+		if cur.parent == nil {
+			return nil
+		}
+		cur = cur.parent
+	}
+	return cur
+}

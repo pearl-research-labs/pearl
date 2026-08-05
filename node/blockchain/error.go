@@ -230,6 +230,11 @@ const (
 	// ErrTimewarpAttack indicates a timewarp attack i.e.
 	// when block's timestamp is too early on diff adjustment block.
 	ErrTimewarpAttack
+
+	// ErrLowWorkBlock indicates that the cumulative chain work for the
+	// block is below the anti-DoS threshold. Such a block is not stored
+	// to disk and the peer is not punished.
+	ErrLowWorkBlock
 )
 
 // Map of ErrorCode values back to their constant names for pretty printing.
@@ -278,6 +283,7 @@ var errorCodeStrings = map[ErrorCode]string{
 	ErrPreviousBlockUnknown:      "ErrPreviousBlockUnknown",
 	ErrInvalidAncestorBlock:      "ErrInvalidAncestorBlock",
 	ErrPrevBlockNotBest:          "ErrPrevBlockNotBest",
+	ErrLowWorkBlock:              "ErrLowWorkBlock",
 }
 
 // String returns the ErrorCode as a human-readable name.

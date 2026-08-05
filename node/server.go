@@ -181,6 +181,20 @@ type peerState struct {
 	outboundGroups  map[string]int
 }
 
+// lookupPeer finds a serverPeer by its peer ID across all peer maps.
+func (ps *peerState) lookupPeer(id int32) *serverPeer {
+	if sp, ok := ps.inboundPeers[id]; ok {
+		return sp
+	}
+	if sp, ok := ps.outboundPeers[id]; ok {
+		return sp
+	}
+	if sp, ok := ps.persistentPeers[id]; ok {
+		return sp
+	}
+	return nil
+}
+
 // Count returns the count of all known peers.
 func (ps *peerState) Count() int {
 	return len(ps.inboundPeers) + len(ps.outboundPeers) +
@@ -239,6 +253,7 @@ type server struct {
 	modifyRebroadcastInv chan interface{}
 	peerLifecycle        chan peerLifecycleEvent
 	banPeers             chan *serverPeer
+	peerVerdicts         chan netsync.PeerVerdict
 	query                chan interface{}
 	relayInv             chan relayMsg
 	broadcast            chan broadcastMsg
@@ -1973,6 +1988,39 @@ func (s *server) handleBanPeerMsg(state *peerState, sp *serverPeer) {
 	state.banned[host] = time.Now().Add(cfg.BanDuration)
 }
 
+// handlePeerVerdict applies a presync punishment verdict delivered by the
+// SyncManager. It is invoked from the peerHandler goroutine.
+func (s *server) handlePeerVerdict(state *peerState, v netsync.PeerVerdict) {
+	sp := state.lookupPeer(v.PeerID)
+	if sp == nil {
+		return
+	}
+
+	switch e := v.Err.(type) {
+	case *netsync.PeerActionError:
+		switch e.Action {
+		case netsync.PeerActionBan:
+			srvrLog.Warnf("Banning peer %s for presync violation: %v",
+				sp, e.Unwrap())
+			sp.addBanScore(101, 0, e.Unwrap().Error())
+		case netsync.PeerActionDisconnect:
+			srvrLog.Warnf("Disconnecting peer %s for presync violation: %v",
+				sp, e.Unwrap())
+			sp.Disconnect()
+		}
+
+	case blockchain.RuleError:
+		srvrLog.Warnf("Disconnecting peer %s for rule error during presync: %v",
+			sp, e)
+		sp.Disconnect()
+
+	default:
+		srvrLog.Warnf("Disconnecting peer %s for presync error: %v",
+			sp, v.Err)
+		sp.Disconnect()
+	}
+}
+
 // handleRelayInvMsg deals with relaying inventory to peers that are not already
 // known to have it.  It is invoked from the peerHandler goroutine.
 func (s *server) handleRelayInvMsg(state *peerState, msg relayMsg) {
@@ -2396,6 +2444,10 @@ out:
 		case p := <-s.banPeers:
 			s.handleBanPeerMsg(state, p)
 
+		// Presync verdict from the sync manager.
+		case v := <-s.peerVerdicts:
+			s.handlePeerVerdict(state, v)
+
 		// New inventory to potentially be relayed to other peers.
 		case invMsg := <-s.relayInv:
 			s.handleRelayInvMsg(state, invMsg)
@@ -2432,6 +2484,7 @@ cleanup:
 		case <-s.relayInv:
 		case <-s.broadcast:
 		case <-s.query:
+		case <-s.peerVerdicts:
 		default:
 			break cleanup
 		}
@@ -2885,6 +2938,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		addrManager:          amgr,
 		peerLifecycle:        make(chan peerLifecycleEvent, cfg.MaxPeers*2),
 		banPeers:             make(chan *serverPeer, cfg.MaxPeers),
+		peerVerdicts:         make(chan netsync.PeerVerdict, cfg.MaxPeers),
 		query:                make(chan interface{}),
 		relayInv:             make(chan relayMsg, cfg.MaxPeers),
 		broadcast:            make(chan broadcastMsg, cfg.MaxPeers),
@@ -3034,6 +3088,12 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		DisableCheckpoints: cfg.DisableCheckpoints,
 		MaxPeers:           cfg.MaxPeers,
 		FeeEstimator:       s.feeEstimator,
+		OnPeerVerdict: func(v netsync.PeerVerdict) {
+			select {
+			case s.peerVerdicts <- v:
+			default:
+			}
+		},
 	})
 	if err != nil {
 		return nil, err

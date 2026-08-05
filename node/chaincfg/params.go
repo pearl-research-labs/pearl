@@ -280,6 +280,11 @@ type Params struct {
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType uint32
+
+	// MinimumChainWork is the minimum amount of cumulative work a chain
+	// must have before the node will fully accept its headers without
+	// anti-DoS presync.
+	MinimumChainWork *big.Int
 }
 
 // IsMoEForkActive reports whether the MoE hardfork is active at the given block
@@ -396,6 +401,8 @@ var MainNetParams = Params{
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType: HDCoinTypePearl,
+
+	MinimumChainWork: new(big.Int).Lsh(big.NewInt(1), 85),
 }
 
 // RegressionNetParams defines the network parameters for the regression test
@@ -486,6 +493,8 @@ var RegressionNetParams = Params{
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType: HDCoinTypeTestnet,
+
+	MinimumChainWork: big.NewInt(0),
 }
 
 // TestNetParams defines the network parameters for the test Pearl network.
@@ -578,6 +587,8 @@ var TestNetParams = Params{
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType: HDCoinTypeTestnet,
+
+	MinimumChainWork: big.NewInt(0),
 }
 
 // TestNet2Params defines the network parameters for the Pearl test network v2,
@@ -670,6 +681,8 @@ var TestNet2Params = Params{
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType: HDCoinTypeTestnet,
+
+	MinimumChainWork: big.NewInt(0),
 }
 
 // SimNetParams defines the network parameters for the simulation test Pearl
@@ -763,6 +776,8 @@ var SimNetParams = Params{
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType: HDCoinTypeTestnet,
+
+	MinimumChainWork: big.NewInt(0),
 }
 
 // SigNetParams defines the network parameters for the default public signet
@@ -865,6 +880,8 @@ func CustomSignetParams(challenge []byte, dnsSeeds []DNSSeed) Params {
 		// BIP44 coin type used in the hierarchical deterministic path for
 		// address generation.
 		HDCoinType: HDCoinTypeTestnet,
+
+		MinimumChainWork: big.NewInt(0),
 	}
 }
 
