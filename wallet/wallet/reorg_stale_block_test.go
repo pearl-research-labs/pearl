@@ -114,6 +114,20 @@ func testBirthdayStamp() *waddrmgr.BlockStamp {
 	}
 }
 
+// setBirthdayBlock persists a birthday block. Production always has one by the
+// time a rollback runs, and its presence turns on the continuity check in
+// PutSyncedTo, so the tests have to set it to exercise the same path.
+func setBirthdayBlock(t *testing.T, w *Wallet) {
+	t.Helper()
+
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		return w.Manager.SetBirthdayBlock(ns, *testBirthdayStamp(), true)
+	})
+	require.NoError(t, err)
+}
+
 // syncManagerTo records the given branch's hash at every height in the range
 // and leaves the address manager synced to the last one.
 func syncManagerTo(t *testing.T, w *Wallet, branch byte, from, to int32) {
@@ -322,10 +336,11 @@ func TestRollbackToChainOrphanedCoinbase(t *testing.T) {
 	// Connects on the new branch overwrote the manager's hash history, so
 	// nothing but the store remembers the orphaned block.
 	syncManagerTo(t, w, canonicalBranch, forkHeight, tipHeight)
+	setBirthdayBlock(t, w)
 	require.True(t, hasStoredCredit(t, w, orphan))
 
 	conn := &reorgChainConn{branch: canonicalBranch, tip: tipHeight}
-	require.NoError(t, w.rollbackToChain(conn, testBirthdayStamp()))
+	require.NoError(t, w.rollbackToChain(conn))
 
 	assert.False(t, hasStoredCredit(t, w, orphan))
 	assert.Nil(t, txDetails(t, w, orphan.Hash))
@@ -347,12 +362,13 @@ func TestRollbackToChainSpentOnlyBlock(t *testing.T) {
 	spendable := mineCoinbase(t, w, canonicalBranch, forkHeight-5)
 	spender := spendCoinbase(t, w, orphanedBranch, forkHeight, spendable)
 	syncManagerTo(t, w, canonicalBranch, forkHeight, tipHeight)
+	setBirthdayBlock(t, w)
 
 	// The spend removed the coinbase from the store's unspent set.
 	require.False(t, hasStoredCredit(t, w, spendable))
 
 	conn := &reorgChainConn{branch: canonicalBranch, tip: tipHeight}
-	require.NoError(t, w.rollbackToChain(conn, testBirthdayStamp()))
+	require.NoError(t, w.rollbackToChain(conn))
 
 	assert.True(t, hasStoredCredit(t, w, spendable))
 
@@ -370,9 +386,10 @@ func TestRollbackToChainDeepStaleBlock(t *testing.T) {
 	tip := forkHeight + waddrmgr.MaxReorgDepth
 	orphan := mineCoinbase(t, w, orphanedBranch, forkHeight)
 	syncManagerTo(t, w, canonicalBranch, tip, tip)
+	setBirthdayBlock(t, w)
 
 	conn := &reorgChainConn{branch: canonicalBranch, tip: tip}
-	require.NoError(t, w.rollbackToChain(conn, testBirthdayStamp()))
+	require.NoError(t, w.rollbackToChain(conn))
 
 	assert.False(t, hasStoredCredit(t, w, orphan))
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
@@ -386,9 +403,10 @@ func TestRollbackToChainCanonicalStore(t *testing.T) {
 
 	coinbase := mineCoinbase(t, w, canonicalBranch, forkHeight+10)
 	syncManagerTo(t, w, canonicalBranch, forkHeight, tipHeight)
+	setBirthdayBlock(t, w)
 
 	conn := &reorgChainConn{branch: canonicalBranch, tip: tipHeight}
-	require.NoError(t, w.rollbackToChain(conn, testBirthdayStamp()))
+	require.NoError(t, w.rollbackToChain(conn))
 
 	assert.True(t, hasStoredCredit(t, w, coinbase))
 	assert.Equal(t, tipHeight, w.Manager.SyncedTo().Height)
@@ -402,9 +420,10 @@ func TestRollbackToChainStaleManager(t *testing.T) {
 
 	coinbase := mineCoinbase(t, w, canonicalBranch, forkHeight+10)
 	syncManagerTo(t, w, orphanedBranch, forkHeight-1, forkHeight+20)
+	setBirthdayBlock(t, w)
 
 	conn := &reorgChainConn{branch: canonicalBranch, tip: tipHeight}
-	require.NoError(t, w.rollbackToChain(conn, testBirthdayStamp()))
+	require.NoError(t, w.rollbackToChain(conn))
 
 	assert.False(t, hasStoredCredit(t, w, coinbase))
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)

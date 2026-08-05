@@ -473,7 +473,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	// Compare previously-seen blocks against the current chain. If any of
 	// these blocks no longer exist, rollback all of the missing blocks
 	// before catching up with the rescan.
-	if err := w.rollbackToChain(chainClient, birthdayStamp); err != nil {
+	if err := w.rollbackToChain(chainClient); err != nil {
 		return err
 	}
 
@@ -510,7 +510,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 // rollbackToChain compares the blocks the wallet has previously seen against
 // the current chain and rolls back the ones that are no longer part of it, so
 // that the rescan which follows re-applies the canonical chain.
-func (w *Wallet) rollbackToChain(chainClient chainConn, birthdayStamp *waddrmgr.BlockStamp) error {
+func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 	// The address manager's hash history is overwritten with canonical
 	// hashes as blocks are connected, so a reorg the wallet never applied
 	// survives only in the transaction store.
@@ -576,23 +576,10 @@ func (w *Wallet) rollbackToChain(chainClient chainConn, birthdayStamp *waddrmgr.
 		}
 
 		if rewindManager {
-			err := w.Manager.SetSyncedTo(addrmgrNs, &rollbackStamp)
+			err := w.Manager.Rollback(addrmgrNs, &rollbackStamp)
 			if err != nil {
-				return err
-			}
-
-			// If the rollback happened to go beyond our birthday
-			// stamp, we'll need to find a new one by syncing with
-			// the chain again until finding one.
-			if rollbackStamp.Height <= birthdayStamp.Height &&
-				rollbackStamp.Hash != birthdayStamp.Hash {
-
-				err := w.Manager.SetBirthdayBlock(
-					addrmgrNs, rollbackStamp, true,
-				)
-				if err != nil {
-					return err
-				}
+				return fmt.Errorf("unable to roll back the address manager to height %d: %w",
+					rollbackStamp.Height, err)
 			}
 		}
 
