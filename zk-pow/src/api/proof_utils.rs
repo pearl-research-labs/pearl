@@ -1,4 +1,5 @@
 use anyhow::{Result, bail, ensure};
+use core::ops::Range;
 use plonky2::field::extension::quadratic::QuadraticExtension;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::HashOut;
@@ -1095,6 +1096,36 @@ mod tests {
         assert_eq!(moe.hash_routing, [0x11u8; 32]);
         assert_eq!(moe.outer_indices, vec![3u32, 7, 42]);
     }
+
+    #[test]
+    fn mining_config_and_jackpot_parse_from_moe_wire_bytes() {
+        // The rank-penalty FFI parses only the shared prefix (config + jackpot)
+        // and accepts any MoE-sized blob, since the MoE tail is irrelevant to
+        // the rule. Pin that the dense and MoE layouts agree on the prefix the
+        // rule reads (common_dim, rank, and the jackpot hash), even though the
+        // mining-config trailer (e, top_k) differs.
+        let mut dense = PublicProofParams::new_for_tests(64, 64, 256);
+        dense.hash_jackpot = [0xcdu8; 32];
+        let dense_bytes = dense.to_wire_bytes().unwrap();
+
+        let mut moe = dense.clone();
+        moe.mining_config.moe = Some(MoEConfig { e: 4, top_k: 4 });
+        moe.moe = Some(MoEParams {
+            routing_offsets: vec![64u32, 128, 192, 256],
+            expert_idx: 1,
+            hash_routing: [0x11u8; 32],
+            outer_indices: vec![3u32, 7, 42],
+        });
+        let moe_bytes = moe.to_wire_bytes().unwrap();
+        assert!(moe_bytes.len() > PublicProofParams::WIRE_SIZE);
+
+        let (dense_cfg, dense_jp) = PublicProofParams::mining_config_and_jackpot_from_wire_bytes(&dense_bytes).unwrap();
+        let (moe_cfg, moe_jp) = PublicProofParams::mining_config_and_jackpot_from_wire_bytes(&moe_bytes).unwrap();
+        assert_eq!(dense_cfg.common_dim, moe_cfg.common_dim);
+        assert_eq!(dense_cfg.rank, moe_cfg.rank);
+        assert_eq!(dense_jp, moe_jp);
+        assert_eq!(dense_jp, [0xcdu8; 32]);
+    }
 }
 
 impl PublicProofParams {
@@ -1123,6 +1154,47 @@ impl PublicProofParams {
         len == Self::WIRE_SIZE || (Self::MIN_MOE_WIRE_SIZE..=Self::MAX_WIRE_SIZE).contains(&len)
     }
 
+    /// Byte range of the serialized [`MiningConfiguration`] within wire `public_data`.
+    pub const MINING_CONFIG_RANGE: Range<usize> = 0..MiningConfiguration::SERIALIZED_SIZE;
+
+    /// Length of each `Hash256` field in the wire layout.
+    pub const HASH_LEN: usize = 32;
+
+    /// Byte range of `hash_a` within wire `public_data`.
+    pub const HASH_A_RANGE: Range<usize> =
+        MiningConfiguration::SERIALIZED_SIZE..MiningConfiguration::SERIALIZED_SIZE + Self::HASH_LEN;
+
+    /// Byte range of `hash_b` within wire `public_data`.
+    pub const HASH_B_RANGE: Range<usize> = {
+        let start = MiningConfiguration::SERIALIZED_SIZE + Self::HASH_LEN;
+        start..start + Self::HASH_LEN
+    };
+
+    /// Byte range of `hash_jackpot` within wire `public_data`.
+    ///
+    /// Follows the serialized [`MiningConfiguration`] and the two preceding hashes
+    /// (`hash_a`, `hash_b`), each [`Self::HASH_LEN`] bytes.
+    pub const HASH_JACKPOT_RANGE: Range<usize> = {
+        let start = MiningConfiguration::SERIALIZED_SIZE + 2 * Self::HASH_LEN;
+        start..start + Self::HASH_LEN
+    };
+
+    /// Parses just the mining configuration and jackpot hash from wire `public_data`.
+    ///
+    /// Both live in the core prefix that dense and MoE proofs share, so this needs
+    /// neither the MoE tail nor a block header — unlike [`Self::from_wire_bytes`],
+    /// which reconstructs the full parameters.
+    pub fn mining_config_and_jackpot_from_wire_bytes(public_data: &[u8]) -> Result<(MiningConfiguration, Hash256)> {
+        ensure!(
+            public_data.len() >= Self::WIRE_SIZE,
+            "public_data too short: need at least {} bytes",
+            Self::WIRE_SIZE
+        );
+        let mining_config = MiningConfiguration::from_bytes(&public_data[Self::MINING_CONFIG_RANGE])?;
+        let hash_jackpot: Hash256 = public_data[Self::HASH_JACKPOT_RANGE].try_into().unwrap();
+        Ok((mining_config, hash_jackpot))
+    }
+
     /// Deserialize from the wire `public_data` bytes produced by [`Self::to_wire_bytes`].
     ///
     /// `public_data` layout (non-MoE): [`Self::WIRE_SIZE`] bytes — core prefix only.
@@ -1138,10 +1210,10 @@ impl PublicProofParams {
             Self::WIRE_SIZE
         );
 
-        let mining_config = MiningConfiguration::from_bytes(&public_data[0..52])?;
-        let hash_a: [u8; 32] = public_data[52..84].try_into().unwrap();
-        let hash_b: [u8; 32] = public_data[84..116].try_into().unwrap();
-        let hash_jackpot: [u8; 32] = public_data[116..148].try_into().unwrap();
+        let mining_config = MiningConfiguration::from_bytes(&public_data[Self::MINING_CONFIG_RANGE])?;
+        let hash_a: [u8; 32] = public_data[Self::HASH_A_RANGE].try_into().unwrap();
+        let hash_b: [u8; 32] = public_data[Self::HASH_B_RANGE].try_into().unwrap();
+        let hash_jackpot: [u8; 32] = public_data[Self::HASH_JACKPOT_RANGE].try_into().unwrap();
         let m = u32::from_le_bytes(public_data[148..152].try_into().unwrap());
         let n = u32::from_le_bytes(public_data[152..156].try_into().unwrap());
         let t_rows = u32::from_le_bytes(public_data[156..160].try_into().unwrap());
@@ -1244,10 +1316,10 @@ impl PublicProofParams {
     /// Serialize to the wire `public_data` format (164 bytes non-MoE; longer when `moe` is set).
     pub fn to_wire_bytes(&self) -> Result<Vec<u8>> {
         let mut public_data = vec![0u8; Self::WIRE_SIZE];
-        public_data[0..52].copy_from_slice(&self.mining_config.to_bytes());
-        public_data[52..84].copy_from_slice(&self.hash_a);
-        public_data[84..116].copy_from_slice(&self.hash_b);
-        public_data[116..148].copy_from_slice(&self.hash_jackpot);
+        public_data[Self::MINING_CONFIG_RANGE].copy_from_slice(&self.mining_config.to_bytes());
+        public_data[Self::HASH_A_RANGE].copy_from_slice(&self.hash_a);
+        public_data[Self::HASH_B_RANGE].copy_from_slice(&self.hash_b);
+        public_data[Self::HASH_JACKPOT_RANGE].copy_from_slice(&self.hash_jackpot);
         public_data[148..152].copy_from_slice(&self.m.to_le_bytes());
         public_data[152..156].copy_from_slice(&self.n.to_le_bytes());
         public_data[156..160].copy_from_slice(&self.t_rows.to_le_bytes());

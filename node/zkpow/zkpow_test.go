@@ -104,6 +104,11 @@ func TestMineAndVerifyProof(t *testing.T) {
 	err := VerifyCertificate(header, cert)
 	require.NoError(t, err, "VerifyProof should succeed for valid proof")
 	t.Logf("Verification completed in %v", time.Since(startVerify))
+
+	// The default mining configuration must also satisfy the rank-penalty rule,
+	// so a node mining with it stays valid once that fork activates.
+	require.NoError(t, CheckRankPenalty(header.Bits, cert.PublicData[:cert.PublicDataLen]),
+		"the mined certificate should satisfy the rank penalty rule")
 }
 
 // TestTamperedParams tests that tampering any header or certificate field causes rejection.

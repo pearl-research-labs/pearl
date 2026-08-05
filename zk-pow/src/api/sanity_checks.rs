@@ -1,6 +1,6 @@
 use crate::circuit::chip::blake3::program::DWORD_SIZE;
 use crate::{
-    api::proof::{MiningConfiguration, PublicProofParams},
+    api::proof::{Hash256, MiningConfiguration, PublicProofParams},
     api::proof_utils::nbits_to_difficulty,
     circuit::pearl_program::{TILE_D, TILE_H},
     ensure_eq,
@@ -8,6 +8,9 @@ use crate::{
 use anyhow::{Result, ensure};
 use log::info;
 use primitive_types::U256;
+
+/// Minimum accepted noise rank and normalization point for the rank penalty.
+pub const PENALTY_BASE_RANK: usize = 128;
 
 pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<()> {
     let k = public_params.common_dim();
@@ -153,6 +156,68 @@ pub fn check_jackpot_against_nbits(public_params: &PublicProofParams, nbits_over
     Ok(())
 }
 
+/// Checks a mining configuration and jackpot hash against the rank-penalty rule.
+///
+/// Deciding *when* the rule applies is the caller's job: this crate has no notion of
+/// block height or fork activation. `nbits` is the difficulty target to measure the
+/// jackpot against — a block header's nbits for consensus, or a pool's share target.
+pub fn check_rank_penalty(config: &MiningConfiguration, hash_jackpot: &Hash256, nbits: u32) -> Result<()> {
+    let rank = config.rank as usize;
+    ensure!(rank >= PENALTY_BASE_RANK, "Rank must be >= {PENALTY_BASE_RANK} || r={rank}");
+    // Reject zero rather than passing it to scale_target.
+    let adjustment_factor = penalized_adjustment_factor(config);
+    ensure!(
+        adjustment_factor > 0,
+        "Degenerate mining configuration: h*w={} dot_product_length={}",
+        tile_size(config),
+        config.dot_product_length()
+    );
+    ensure!(
+        U256::from_little_endian(hash_jackpot) <= scale_target(nbits, adjustment_factor),
+        "Jackpot condition not satisfied: hash does not meet the rank-penalized difficulty target"
+    );
+    Ok(())
+}
+
+/// Number of hashed output elements per jackpot attempt.
+fn tile_size(config: &MiningConfiguration) -> usize {
+    config.rows_pattern.size() as usize * config.cols_pattern.size() as usize
+}
+
+/// How much easier the jackpot bound is made for a given configuration, in
+/// proportion to the work one attempt costs: the hashed tile size times the
+/// dot product length.
+fn difficulty_adjustment_factor(config: &MiningConfiguration) -> usize {
+    tile_size(config) * config.dot_product_length()
+}
+
+fn penalized_adjustment_factor(config: &MiningConfiguration) -> usize {
+    tile_size(config) * (config.dot_product_length() / config.rank as usize) * PENALTY_BASE_RANK
+}
+
+fn scale_target(nbits: u32, adjustment_factor: usize) -> U256 {
+    scale(nbits_to_difficulty(nbits), adjustment_factor)
+}
+
+/// Scales `base` by `adjustment_factor`, saturating at [`U256::MAX`] on overflow.
+///
+/// Caller must ensure `adjustment_factor > 0`: [`check_rank_penalty`] checks it
+/// outright, and [`public_params_sanity_check`] rules it out for a verified proof
+/// by requiring `k >= 16r`.
+fn scale(base: U256, adjustment_factor: usize) -> U256 {
+    debug_assert!(adjustment_factor > 0, "scale: zero adjustment factor");
+    if base > U256::MAX / adjustment_factor {
+        info!(
+            "Difficulty is too easy: hardness={} adjustment_factor={}",
+            U256::MAX / base,
+            adjustment_factor
+        );
+        U256::MAX
+    } else {
+        base * adjustment_factor
+    }
+}
+
 /// Computes difficulty bound for proof verification.
 ///
 /// # Arguments
@@ -162,19 +227,130 @@ pub fn check_jackpot_against_nbits(public_params: &PublicProofParams, nbits_over
 /// # Returns
 /// * Adjusted difficulty bound as U256
 pub fn extract_difficulty_bound(nbits: u32, config: &MiningConfiguration) -> U256 {
-    let target_difficulty = nbits_to_difficulty(nbits);
-    let h = config.rows_pattern.size() as usize;
-    let w = config.cols_pattern.size() as usize;
-    let tile_size = h * w;
-    let difficulty_adjustment_factor = tile_size * config.dot_product_length();
-    if target_difficulty > U256::MAX / difficulty_adjustment_factor {
-        info!(
-            "Difficulty is too easy: hardness={} h*w*k={}",
-            U256::MAX / target_difficulty,
-            difficulty_adjustment_factor
+    scale_target(nbits, difficulty_adjustment_factor(config))
+}
+
+/// [`extract_difficulty_bound`] with the rank penalty applied, or `None` when the
+/// configuration is degenerate or the bound does not fit in 256 bits.
+///
+/// Unlike the consensus path this does not saturate: a miner scaling a share
+/// target must be told the target is unusable rather than handed [`U256::MAX`],
+/// which every hash satisfies.
+pub fn penalized_target_bound(target: U256, config: &MiningConfiguration) -> Option<U256> {
+    let factor = penalized_adjustment_factor(config);
+    if factor == 0 || target > U256::MAX / factor {
+        return None;
+    }
+    Some(target * factor)
+}
+
+#[cfg(test)]
+mod rank_penalty_tests {
+    use super::*;
+    use crate::api::proof::{MMAType, PeriodicPattern};
+
+    const TEST_NBITS: u32 = 0x1d00ffff;
+
+    fn test_config(rank: usize, common_dim: u32) -> MiningConfiguration {
+        MiningConfiguration {
+            common_dim,
+            rank: rank as u16,
+            mma_type: MMAType::Int7xInt7ToInt32,
+            rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
+            cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41]).unwrap(),
+            moe: None,
+        }
+    }
+
+    fn jackpot_of(value: U256) -> Hash256 {
+        let mut bytes = [0u8; 32];
+        value.to_little_endian(&mut bytes);
+        bytes
+    }
+
+    /// The penalized counterpart of [`extract_difficulty_bound`], for the nbits
+    /// these tests compare against.
+    fn penalized_bound(nbits: u32, config: &MiningConfiguration) -> U256 {
+        penalized_target_bound(nbits_to_difficulty(nbits), config).unwrap()
+    }
+
+    #[test]
+    fn penalty_is_neutral_at_base_rank() {
+        let config = test_config(PENALTY_BASE_RANK, 4096);
+        assert_eq!(
+            penalized_bound(TEST_NBITS, &config),
+            extract_difficulty_bound(TEST_NBITS, &config)
         );
-        U256::MAX
-    } else {
-        target_difficulty * difficulty_adjustment_factor
+    }
+
+    #[test]
+    fn penalty_divides_bound_in_proportion_to_rank() {
+        for multiple in [2usize, 4, 8] {
+            let config = test_config(PENALTY_BASE_RANK * multiple, 65536);
+            assert_eq!(
+                penalized_bound(TEST_NBITS, &config),
+                extract_difficulty_bound(TEST_NBITS, &config) / multiple,
+                "rank {} should be penalized {}x",
+                config.rank,
+                multiple
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_rank_below_base() {
+        let config = test_config(PENALTY_BASE_RANK / 2, 4096);
+        let err = check_rank_penalty(&config, &[0u8; 32], TEST_NBITS).unwrap_err();
+        assert!(err.to_string().contains("Rank must be"), "unexpected error: {err}");
+    }
+
+    /// The bound is inclusive, and the comparison uses the penalized bound: above
+    /// the base rank, an unpenalized comparison would accept `bound + 1`.
+    #[test]
+    fn accepts_jackpot_at_the_bound_and_rejects_above_it() {
+        for rank in [PENALTY_BASE_RANK, PENALTY_BASE_RANK * 2] {
+            let config = test_config(rank, 65536);
+            let bound = penalized_bound(TEST_NBITS, &config);
+            check_rank_penalty(&config, &jackpot_of(bound), TEST_NBITS).unwrap();
+            check_rank_penalty(&config, &jackpot_of(bound + 1), TEST_NBITS).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn rejects_degenerate_config_without_panicking() {
+        let config = test_config(PENALTY_BASE_RANK, 64);
+        check_rank_penalty(&config, &[0u8; 32], TEST_NBITS).unwrap_err();
+    }
+
+    #[test]
+    fn penalized_target_bound_scales_the_target() {
+        // At the base rank the penalized factor equals the unpenalized one, so
+        // penalized_target_bound(target) == target * difficulty_adjustment_factor.
+        let config = test_config(PENALTY_BASE_RANK, 4096);
+        let target = U256::from(1u64) << 200;
+        let bound = penalized_target_bound(target, &config).unwrap();
+        assert_eq!(bound, target * difficulty_adjustment_factor(&config));
+
+        // Doubling the rank halves the bound when common_dim is held fixed (the
+        // penalty's purpose): dot/rank halves, and BASE*rank doubles, net 1/2.
+        let bigger = test_config(PENALTY_BASE_RANK * 2, 4096);
+        let smaller_bound = penalized_target_bound(target, &bigger).unwrap();
+        assert_eq!(smaller_bound, bound / 2);
+    }
+
+    /// Neither input a miner can be handed may come back as a usable bound: a
+    /// degenerate configuration has no bound, and a target easy enough to overflow
+    /// must not be clamped to U256::MAX, which every hash satisfies.
+    #[test]
+    fn penalized_target_bound_rejects_unusable_inputs() {
+        let degenerate = test_config(PENALTY_BASE_RANK, 64);
+        assert_eq!(penalized_adjustment_factor(&degenerate), 0);
+        assert_eq!(penalized_target_bound(U256::from(1u64) << 200, &degenerate), None);
+
+        let config = test_config(PENALTY_BASE_RANK, 4096);
+        let largest = U256::MAX / penalized_adjustment_factor(&config);
+        assert!(penalized_target_bound(largest, &config).is_some());
+        assert_eq!(penalized_target_bound(largest + 1, &config), None);
+        assert_eq!(penalized_target_bound(U256::MAX, &config), None);
     }
 }

@@ -417,10 +417,7 @@ func checkBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 	header := msgBlock.BlockHeader()
 	cert := msgBlock.BlockCertificate()
 
-	// Skip proof of work verification on simnet, to enable fast no-op mining in tests.
-	if chainParams.Net == wire.SimNet {
-		flags |= BFNoPoWCheck
-	}
+	flags |= NetBehaviorFlags(chainParams)
 
 	err := CheckBlockHeaderSanity(header, cert, chainParams.PowLimit, timeSource, chainParams.MaxTimeOffsetMinutes, flags)
 	if err != nil {
@@ -512,12 +509,29 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 	return checkBlockSanity(block, chainParams, timeSource, BFNone)
 }
 
-// CheckCertificateVersion enforces the certificate fork schedule:
+// CheckCertificateRules enforces the height-gated rules a block certificate
+// must satisfy:
 //   - Before MoEForkHeight (or with the fork disabled): only V1 accepted
 //   - At and after MoEForkHeight (hardfork): only V2 accepted
 //   - At and after DenseOnlyForkHeight (softfork): V2 certificates must
 //     carry a dense (non-MoE) proof
-func CheckCertificateVersion(cert wire.BlockCertificate, height int32, params *chaincfg.Params) error {
+//   - At and after RankPenaltyForkHeight (softfork): the proof's noise rank
+//     must meet a minimum and its jackpot must meet a difficulty bound scaled
+//     for that rank
+//
+// These rules run here rather than alongside the proof verification in
+// checkProofOfWork because activation depends on the block height, which the
+// context-free sanity checks do not have. Reading the certificate apart from
+// its proof is sound: the header's proof commitment covers the certificate
+// version and public data, so the proof verified there binds everything these
+// rules read.
+//
+// The rank-penalty rule reads the proof's public data, so it is skipped
+// whenever proof of work is not verified (BFNoPoWCheck), which covers block
+// templates and the networks NetBehaviorFlags exempts.
+func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
+	height int32, params *chaincfg.Params, flags BehaviorFlags) error {
+
 	if cert == nil {
 		return ruleError(ErrCertificateMissing, "block has no certificate")
 	}
@@ -527,13 +541,29 @@ func CheckCertificateVersion(cert wire.BlockCertificate, height int32, params *c
 			"(require version %d)", cert.Version(), height, want)
 		return ruleError(ErrDisallowedCertVersion, str)
 	}
-	if c, ok := cert.(*wire.CertificateV2); ok && c.IsMoE() &&
-		params.IsDenseOnlyForkActive(height) {
+
+	// The remaining rules read fields only a V2 certificate has.
+	c, ok := cert.(*wire.CertificateV2)
+	if !ok {
+		return nil
+	}
+
+	if c.IsMoE() && params.IsDenseOnlyForkActive(height) {
 		str := fmt.Sprintf("MoE certificate is not allowed at height %d "+
 			"(dense-only fork active from height %d)",
 			height, params.DenseOnlyForkHeight)
 		return ruleError(ErrDisallowedCertVersion, str)
 	}
+
+	if params.IsRankPenaltyForkActive(height) && flags&BFNoPoWCheck != BFNoPoWCheck {
+		if err := zkpow.CheckRankPenalty(header.Bits, c.PublicDataBytes()); err != nil {
+			str := fmt.Sprintf("certificate fails the rank penalty rule at "+
+				"height %d (fork active from height %d): %v",
+				height, params.RankPenaltyForkHeight, err)
+			return ruleError(ErrRankPenalty, str)
+		}
+	}
+
 	return nil
 }
 
@@ -719,6 +749,8 @@ func CheckBlockHeaderContext(header *wire.BlockHeader, prevNode chaincfg.HeaderC
 //
 // This function MUST be called with the chain state lock held (for writes).
 func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode, flags BehaviorFlags) error {
+	flags |= NetBehaviorFlags(b.chainParams)
+
 	// Perform all block header related validation checks.
 	header := block.MsgBlock().BlockHeader()
 	err := CheckBlockHeaderContext(header, prevNode, flags, b, false)
@@ -726,11 +758,13 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 		return err
 	}
 
-	// Enforce the V1/V2 certificate version policy (consensus-critical,
-	// runs regardless of BFFastAdd).
+	// Enforce the height-gated certificate rules (consensus-critical, run
+	// regardless of BFFastAdd).
 	blockHeight := prevNode.height + 1
-	if err := CheckCertificateVersion(block.MsgBlock().BlockCertificate(),
-		blockHeight, b.chainParams); err != nil {
+	cert := block.MsgBlock().BlockCertificate()
+	if err := CheckCertificateRules(
+		header, cert, blockHeight, b.chainParams, flags,
+	); err != nil {
 		return err
 	}
 
@@ -1139,24 +1173,16 @@ func (b *BlockChain) ChainParams() *chaincfg.Params {
 }
 
 // CheckHeaderSanity is the header-only equivalent of CheckBlockSanity,
-// wired with the chain's own time source and chain parameters. It mirrors
-// checkBlockSanity's SimNet special-case so that headers-only validation
-// stays consistent with full-block validation: SimNet uses dummy
-// certificates from SolveBlock and depends on PoW verification being
-// skipped at the validation layer.
+// wired with the chain's own time source and chain parameters.
 func (b *BlockChain) CheckHeaderSanity(header *wire.BlockHeader,
 	cert wire.BlockCertificate) error {
 
-	flags := BFNone
-	if b.chainParams.Net == wire.SimNet {
-		flags |= BFNoPoWCheck
-	}
 	return CheckBlockHeaderSanity(
 		header, cert,
 		b.chainParams.PowLimit,
 		b.timeSource,
 		b.chainParams.MaxTimeOffsetMinutes,
-		flags,
+		NetBehaviorFlags(b.chainParams),
 	)
 }
 

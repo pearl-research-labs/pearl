@@ -72,17 +72,14 @@ func (e *emptyTxSource) LastUpdated() time.Time               { return time.Time
 func (e *emptyTxSource) MiningDescs() []*TxDesc               { return nil }
 func (e *emptyTxSource) HaveTransaction(*chainhash.Hash) bool { return false }
 
-// TestNewBlockTemplateNilAddress exercises the full NewBlockTemplate code path
-// with no mining address (payToAddress == nil). This is the exact path taken by
-// the getblocktemplate RPC when useCoinbaseValue is true (the default), which
-// builds a placeholder coinbase that is later replaced by external mining
-// software. The coinbase must comply with Taproot-only consensus rules.
-func TestNewBlockTemplateNilAddress(t *testing.T) {
-	params := chaincfg.SimNetParams
+// newTestGenerator builds a template generator on a fresh chain holding only
+// the genesis block, so the next template sits at height 1.
+func newTestGenerator(t *testing.T, params *chaincfg.Params) *BlkTmplGenerator {
+	t.Helper()
 
-	db, err := database.Create("ffldb", t.TempDir(), wire.SimNet)
+	db, err := database.Create("ffldb", t.TempDir(), params.Net)
 	require.NoError(t, err)
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
 
 	timeSource := blockchain.NewMedianTime()
 	sigCache := txscript.NewSigCache(100)
@@ -90,25 +87,35 @@ func TestNewBlockTemplateNilAddress(t *testing.T) {
 
 	chain, err := blockchain.New(&blockchain.Config{
 		DB:          db,
-		ChainParams: &params,
+		ChainParams: params,
 		TimeSource:  timeSource,
 		SigCache:    sigCache,
 		HashCache:   hashCache,
 	})
 	require.NoError(t, err)
 
-	generator := NewBlkTmplGenerator(
+	return NewBlkTmplGenerator(
 		&Policy{
 			BlockMinVsize: 0,
 			BlockMaxVsize: blockchain.MaxBlockVsize,
 		},
-		&params,
+		params,
 		&emptyTxSource{},
 		chain,
 		timeSource,
 		sigCache,
 		hashCache,
 	)
+}
+
+// TestNewBlockTemplateNilAddress exercises the full NewBlockTemplate code path
+// with no mining address (payToAddress == nil). This is the exact path taken by
+// the getblocktemplate RPC when useCoinbaseValue is true (the default), which
+// builds a placeholder coinbase that is later replaced by external mining
+// software. The coinbase must comply with Taproot-only consensus rules.
+func TestNewBlockTemplateNilAddress(t *testing.T) {
+	params := chaincfg.SimNetParams
+	generator := newTestGenerator(t, &params)
 
 	template, err := generator.NewBlockTemplate(nil)
 	require.NoError(t, err, "NewBlockTemplate(nil) should succeed with a placeholder coinbase")
@@ -118,4 +125,28 @@ func TestNewBlockTemplateNilAddress(t *testing.T) {
 	coinbaseTx := btcutil.NewTx(template.Block.Transactions[0])
 	require.NoError(t, blockchain.CheckTransactionSanity(coinbaseTx),
 		"placeholder coinbase must pass Taproot-only consensus validation")
+}
+
+// TestNewBlockTemplateForkRulesActive builds a template on regtest, which
+// verifies proofs and activates the MoE and rank-penalty forks from height 1.
+// The template carries a placeholder certificate with no proof in it, so it is
+// only accepted because CheckConnectBlockTemplate passes BFNoPoWCheck down to
+// the certificate rules. Without that, getblocktemplate returns an internal
+// error from the activation height on and every miner on the network stalls,
+// which is how the dense-only fork broke once already.
+func TestNewBlockTemplateForkRulesActive(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	require.NotEqual(t, wire.SimNet, params.Net,
+		"the network under test must be one that verifies proofs")
+	require.True(t, params.IsMoEForkActive(1))
+	require.True(t, params.IsRankPenaltyForkActive(1))
+
+	generator := newTestGenerator(t, &params)
+
+	template, err := generator.NewBlockTemplate(nil)
+	require.NoError(t, err,
+		"template generation must survive the rank-penalty fork activation")
+	require.Equal(t, int32(1), template.Height)
+	require.Equal(t, wire.CertificateVersionV2,
+		template.Block.BlockCertificate().Version())
 }

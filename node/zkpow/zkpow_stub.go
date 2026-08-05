@@ -9,12 +9,13 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
+// Mining parameters the node passes to the miner. The rest of the mining
+// configuration, including the noise rank, comes from the Rust FFI and so is only
+// available in the zkpow build.
 const (
-	DefaultNBits     = 0x1E01FFFF
-	DefaultM         = 256
-	DefaultN         = 512
-	DefaultNoiseRank = 32
-	DefaultMMAType   = 0
+	DefaultNBits = 0x1E01FFFF
+	DefaultM     = 256
+	DefaultN     = 512
 )
 
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
@@ -29,6 +30,10 @@ func VerifyZKProofFFI(
 	proofData []byte,
 	nbitsOverride *uint32,
 ) error {
+	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
+}
+
+func CheckRankPenalty(bits uint32, publicData []byte) error {
 	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
 }
 

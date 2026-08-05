@@ -1,11 +1,11 @@
 //! C-compatible structs and utilities for Go FFI.
 
-use anyhow::Result;
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::slice;
 use std::sync::Mutex;
 
+use anyhow::Result;
 use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams};
 use zk_pow::api::prove;
 use zk_pow::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
@@ -24,9 +24,13 @@ pub const ERROR_MSG_MAX_SIZE: usize = 128;
 /// Maximum size of a serialized ZK proof blob (excluding IncompleteBlockHeader and MiningConfiguration, including everything else).
 pub const MAX_ZK_PROOF_SIZE: usize = 60000;
 
+/// Smallest noise rank the rank-penalty rule accepts (exported to C header).
+pub const MIN_NOISE_RANK: u16 = 128;
+
 // Compile-time assertions to ensure constants stay in sync
 const _: () = assert!(MINING_CONFIG_RESERVED_SIZE == MiningConfiguration::RESERVED_SIZE);
 const _: () = assert!(MINING_CONFIG_SERIALIZED_SIZE == MiningConfiguration::SERIALIZED_SIZE);
+const _: () = assert!(MIN_NOISE_RANK as usize == zk_pow::api::sanity_checks::PENALTY_BASE_RANK);
 
 type CircuitCache = <PearlRecursion as RecursionCircuit>::CircuitCache;
 type V1CircuitCache = zk_pow::v1::circuit::circuit_utils::CircuitCache;

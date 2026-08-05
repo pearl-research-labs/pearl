@@ -8,6 +8,7 @@ use std::slice;
 
 use crate::common::MAX_ZK_PROOF_SIZE;
 use zk_pow::api::proof::{IncompleteBlockHeader, PublicProofParams, ZKProof};
+use zk_pow::api::sanity_checks;
 use zk_pow::api::verify;
 
 use crate::common::{acquire_cache, catch_panic, set_error_msg, CZKProof};
@@ -141,6 +142,63 @@ pub unsafe extern "C" fn verify_zk_proof_v2_with_nbits(
     error_msg_out: *mut c_char,
 ) -> i32 {
     verify_zk_proof_inner(block_header, zk_proof, Some(nbits_override), error_msg_out)
+}
+
+/// Check wire `public_data` against the rank-penalty rule.
+///
+/// # Returns
+/// - 0: rule satisfied
+/// - 1: rule violated (the block must be rejected)
+/// - 2: System error (could not run the check)
+///
+/// # Safety
+/// - `public_data` must be a valid pointer to `public_data_len` bytes
+/// - `error_msg_out` must be null or a valid pointer to a caller-allocated buffer of `ERROR_MSG_MAX_SIZE` bytes
+#[no_mangle]
+pub unsafe extern "C" fn check_rank_penalty(
+    nbits: u32,
+    public_data: *const u8,
+    public_data_len: usize,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    let result = catch_panic(|| {
+        if public_data.is_null() {
+            set_error_msg(error_msg_out, "Null pointer");
+            return 2;
+        }
+        if !PublicProofParams::is_valid_wire_size(public_data_len) {
+            set_error_msg(error_msg_out, &format!("invalid public_data_len {}", public_data_len));
+            return 1;
+        }
+
+        let public_data = slice::from_raw_parts(public_data, public_data_len);
+        let (mining_config, hash_jackpot) = match PublicProofParams::mining_config_and_jackpot_from_wire_bytes(public_data) {
+            Ok(fields) => fields,
+            Err(e) => {
+                set_error_msg(error_msg_out, &format!("{}", e));
+                return 1;
+            }
+        };
+
+        match sanity_checks::check_rank_penalty(&mining_config, &hash_jackpot, nbits) {
+            Ok(()) => {
+                set_error_msg(error_msg_out, "Rank penalty rule satisfied");
+                0
+            }
+            Err(e) => {
+                set_error_msg(error_msg_out, &format!("{}", e));
+                1
+            }
+        }
+    });
+
+    match result {
+        Ok(code) => code,
+        Err(panic_msg) => {
+            set_error_msg(error_msg_out, &format!("Internal panic: {}", panic_msg));
+            2
+        }
+    }
 }
 
 /// Verify a V1 (version 1, master-format) ZK proof.

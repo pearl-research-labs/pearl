@@ -21,7 +21,7 @@ from pearl_gateway.comm.dataclasses import (
     OpenedBlockInfo,
 )
 from pearl_gateway.config import MinerRpcConfig, PearlConfig
-from pearl_mining import MatrixMerkleProof, MerkleProof, PlainProof, ZKProof
+from pearl_mining import MatrixMerkleProof, MerkleProof, PlainProof, ZKProof, penalized_target_bound
 
 
 @pytest.fixture(scope="session")
@@ -343,7 +343,10 @@ def _adjust_mining_job_target(
     mining_config: MiningConfiguration,
     target: int,
 ) -> MiningJob:
-    target //= MiningJob._get_difficulty_adjustment_factor(mining_config)
+    bound = penalized_target_bound(1, mining_config)
+    if bound is None:
+        raise ValueError("degenerate mining config in test scaffolding")
+    target //= bound
     return MiningJob(incomplete_header_bytes=incomplete_header_bytes, target=target)
 
 

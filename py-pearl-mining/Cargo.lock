@@ -952,6 +952,7 @@ dependencies = [
  "env_logger 0.10.2",
  "lazy_static",
  "pearl-blake3",
+ "primitive-types 0.12.2",
  "pyo3",
  "rayon",
  "tikv-jemallocator",

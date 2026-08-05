@@ -2215,6 +2215,16 @@ func New(config *Config) (*BlockChain, error) {
 	if config.ChainParams.MoEForkHeight < 0 {
 		return nil, AssertError("blockchain.New MoEForkHeight must be >= 0")
 	}
+	if config.ChainParams.RankPenaltyForkHeight < 0 {
+		return nil, AssertError("blockchain.New RankPenaltyForkHeight must be >= 0")
+	}
+	// Only V2 certificates carry a noise rank, so the rank-penalty rule cannot
+	// start before the V2 cutover.
+	if config.ChainParams.RankPenaltyForkHeight != 0 &&
+		config.ChainParams.RankPenaltyForkHeight < config.ChainParams.MoEForkHeight {
+		return nil, AssertError("blockchain.New RankPenaltyForkHeight must not " +
+			"precede MoEForkHeight")
+	}
 
 	// Generate a checkpoint by height map from the provided checkpoints
 	// and assert the provided checkpoints are sorted by height as required.

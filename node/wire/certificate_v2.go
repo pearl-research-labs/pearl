@@ -49,11 +49,20 @@ func (c *CertificateV2) BlockHash() chainhash.Hash {
 	return c.Hash
 }
 
+// PublicDataBytes returns the meaningful prefix of PublicData. Every producer
+// bounds PublicDataLen against the array (Deserialize here, Mine and MineMoE in
+// the zkpow package), so a larger value is a corrupt struct and left for the
+// bounds check to catch.
+func (c *CertificateV2) PublicDataBytes() []byte {
+	return c.PublicData[:c.PublicDataLen]
+}
+
 // ProofCommitment computes SHA256d(CertificateVersion_LE(4) || PublicData[:PublicDataLen]).
 func (c *CertificateV2) ProofCommitment() chainhash.Hash {
-	buf := make([]byte, 4+c.PublicDataLen)
+	publicData := c.PublicDataBytes()
+	buf := make([]byte, 4+len(publicData))
 	binary.LittleEndian.PutUint32(buf[:4], uint32(c.Version()))
-	copy(buf[4:], c.PublicData[:c.PublicDataLen])
+	copy(buf[4:], publicData)
 	return chainhash.DoubleHashH(buf)
 }
 
@@ -66,7 +75,7 @@ func (c *CertificateV2) Serialize(w io.Writer) error {
 	if err := binary.Write(w, binary.LittleEndian, c.PublicDataLen); err != nil {
 		return err
 	}
-	if _, err := w.Write(c.PublicData[:c.PublicDataLen]); err != nil {
+	if _, err := w.Write(c.PublicDataBytes()); err != nil {
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, uint32(len(c.ProofData))); err != nil {
