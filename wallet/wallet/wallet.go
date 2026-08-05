@@ -532,68 +532,68 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 		return fmt.Errorf("unable to verify the wallet's %d recorded blocks against the chain: %w", len(blocks), err)
 	}
 
-	rewindManager := false
-	rollbackStamp := w.Manager.SyncedTo()
+	syncedTo := w.Manager.SyncedTo()
 
 	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 
-		for height := rollbackStamp.Height; true; height-- {
-			hash, err := w.Manager.BlockHash(addrmgrNs, height)
-			if err != nil {
-				return err
-			}
-			stamp, err := canonicalStampAt(chainClient, height)
-			if err != nil {
-				return fmt.Errorf("unable to fetch the chain's block at height %d while finding the fork point: %w",
-					height, err)
-			}
-
-			rollbackStamp = stamp
-			if bytes.Equal(hash[:], stamp.Hash[:]) {
-				break
-			}
-			rewindManager = true
+		target, err := w.forkPoint(addrmgrNs, chainClient, syncedTo.Height)
+		if err != nil {
+			return err
 		}
 
-		// A stale block the address manager no longer remembers has to
-		// be detached as well, which means rewinding the manager below
-		// it so that the rescan replays those heights.
-		if staleHeight > 0 && staleHeight <= rollbackStamp.Height {
-			stamp, err := canonicalStampAt(chainClient, staleHeight-1)
+		// A stale block at or below the fork point has to be detached
+		// as well, so rewind under it and let the rescan replay those
+		// heights from the canonical chain.
+		if staleHeight > 0 && staleHeight <= target.Height {
+			target, err = canonicalStampAt(chainClient, staleHeight-1)
 			if err != nil {
 				return fmt.Errorf("unable to fetch the parent of stale block at height %d: %w", staleHeight, err)
 			}
-
-			rollbackStamp = stamp
-			rewindManager = true
 		}
 
-		// If nothing diverged, we can proceed safely.
-		if !rewindManager && staleHeight == 0 {
+		// Nothing diverged, so there is nothing to detach.
+		if target.Height == syncedTo.Height && staleHeight == 0 {
 			return nil
 		}
 
-		if rewindManager {
-			err := w.Manager.Rollback(addrmgrNs, &rollbackStamp)
-			if err != nil {
-				return fmt.Errorf("unable to roll back the address manager to height %d: %w",
-					rollbackStamp.Height, err)
-			}
+		if err := w.Manager.Rollback(addrmgrNs, &target); err != nil {
+			return fmt.Errorf("unable to roll back the address manager to height %d: %w", target.Height, err)
 		}
 
-		// Finally, we'll roll back our transaction store to reflect the
-		// stale state. `Rollback` unconfirms transactions at and beyond
-		// the passed height, so add one to the new synced-to height to
-		// prevent unconfirming transactions in the synced-to block.
-		height := rollbackStamp.Height + 1
-		if err := w.TxStore.Rollback(txmgrNs, height); err != nil {
-			return fmt.Errorf("unable to roll back the transaction store to height %d: %w", height, err)
+		// Rollback unconfirms transactions at and beyond the height it
+		// is given, so start one above the wallet's new tip to leave
+		// that block's transactions confirmed.
+		if err := w.TxStore.Rollback(txmgrNs, target.Height+1); err != nil {
+			return fmt.Errorf("unable to roll back the transaction store to height %d: %w", target.Height+1, err)
 		}
 
 		return nil
 	})
+}
+
+// forkPoint returns the highest block at or below the given height that both
+// the address manager and the chain have recorded.
+func (w *Wallet) forkPoint(ns walletdb.ReadBucket, chainClient chainConn, height int32) (waddrmgr.BlockStamp, error) {
+	for {
+		hash, err := w.Manager.BlockHash(ns, height)
+		if err != nil {
+			return waddrmgr.BlockStamp{}, err
+		}
+
+		stamp, err := canonicalStampAt(chainClient, height)
+		if err != nil {
+			return waddrmgr.BlockStamp{}, fmt.Errorf(
+				"unable to fetch the chain's block at height %d while finding the fork point: %w", height, err)
+		}
+
+		if *hash == stamp.Hash {
+			return stamp, nil
+		}
+
+		height--
+	}
 }
 
 // canonicalStampAt returns the block stamp the chain has at the given height.
