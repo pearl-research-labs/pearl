@@ -91,20 +91,33 @@ func (m *Manager) Rollback(ns walletdb.ReadWriteBucket, bs *BlockStamp) error {
 		return err
 	}
 
-	birthday, err := FetchBirthdayBlock(ns)
-	switch {
-	case IsError(err, ErrBirthdayBlockNotSet):
-	case err != nil:
+	if err := m.rollbackBirthday(ns, bs); err != nil {
 		return err
-	case bs.Height <= birthday.Height && bs.Hash != birthday.Hash:
-		if err := m.SetBirthdayBlock(ns, *bs, true); err != nil {
-			return err
-		}
 	}
 
+	// Assigned last so that a failure above, which rolls back the caller's
+	// transaction, cannot leave this ahead of what the database holds.
 	m.syncState.syncedTo = *bs
 
 	return nil
+}
+
+// rollbackBirthday moves a birthday block that is no longer part of the chain
+// back to the given block, so that the next sync locates a new one.
+func (m *Manager) rollbackBirthday(ns walletdb.ReadWriteBucket, bs *BlockStamp) error {
+	birthday, err := FetchBirthdayBlock(ns)
+	if IsError(err, ErrBirthdayBlockNotSet) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if bs.Height > birthday.Height || bs.Hash == birthday.Hash {
+		return nil
+	}
+
+	return m.SetBirthdayBlock(ns, *bs, true)
 }
 
 // SyncedTo returns details about the block height and hash that the address
