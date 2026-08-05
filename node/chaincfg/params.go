@@ -631,7 +631,7 @@ var TestNet2Params = Params{
 	MoEForkHeight: 54869,
 
 	// Dense-only softfork: MoE proofs are rejected from this height on.
-	DenseOnlyForkHeight: 75122,
+	DenseOnlyForkHeight: 80051,
 
 	RankPenaltyForkHeight: 80627,
 
