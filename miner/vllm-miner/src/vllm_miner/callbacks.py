@@ -66,17 +66,17 @@ class StatusCheckCallback:
 
 @dataclass
 class MoEStatusCheckCallback:
-    """Check PoW results across all MoE expert headers for one forward pass.
+    """Check PoW results across mined MoE expert headers for one forward pass.
 
-    Headers are acquired from the global pinned pool in ``PearlMoEExperts.apply``
-    (one per expert) and released back here in the ``finally`` block. On a hit,
-    the expert-local (inner) row indices are mapped to global outer token indices
-    via ``routing_data`` so the proof can be built against the full activation.
-    The routing hash tensor is retained for lifetime symmetry with the scheduled
-    GPU work even though the CPU callback does not inspect it directly.
+    Headers are acquired from the global pinned pool only for experts that run a
+    mined GEMM and released back here in the ``finally`` block. On a hit, the
+    expert-local (inner) row indices are mapped to global outer token indices via
+    ``routing_data`` so the proof can be built against the full activation. The
+    routing hash tensor is retained for lifetime symmetry with the scheduled GPU
+    work even though the CPU callback does not inspect it directly.
     """
 
-    pow_headers: list[torch.Tensor]
+    pow_headers: list[tuple[int, torch.Tensor]]
     commitment_hash_A_tensor: torch.Tensor
     commitment_hash_B_tensor: torch.Tensor
     A_q: torch.Tensor  # (m, k) int8, original token order (non-noised)
@@ -93,8 +93,8 @@ class MoEStatusCheckCallback:
     def __call__(self, handle_submit_block) -> None:
         """Submit the first triggered expert block and release all pinned headers."""
         try:
-            for expert_index in range(self.num_experts):
-                header = get_host_signal_header(self.pow_headers[expert_index])
+            for expert_index, header_tensor in self.pow_headers:
+                header = get_host_signal_header(header_tensor)
                 if header.status != HostSignalStatus.kSignalTriggered:
                     continue
 
@@ -150,7 +150,7 @@ class MoEStatusCheckCallback:
                 handle_submit_block(opened_block_info, self.mining_job)
                 break
         finally:
-            for header_tensor in self.pow_headers:
+            for _, header_tensor in self.pow_headers:
                 get_pinned_pool().release(header_tensor)
             self.pow_headers = []
             del self.commitment_hash_A_tensor

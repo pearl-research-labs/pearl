@@ -99,7 +99,7 @@ class TestMoEStatusCheckCallbackRelease:
         delete_state()
 
     @staticmethod
-    def _make_callback(headers: list[torch.Tensor]) -> MoEStatusCheckCallback:
+    def _make_callback(headers: list[tuple[int, torch.Tensor]]) -> MoEStatusCheckCallback:
         device = "cuda"
         return MoEStatusCheckCallback(
             pow_headers=headers,
@@ -119,10 +119,10 @@ class TestMoEStatusCheckCallbackRelease:
 
     def test_releases_all_headers_to_pool(self) -> None:
         pool = get_pinned_pool()
-        headers = [pool.acquire() for _ in range(_NUM_EXPERTS)]
-        assert len(pool._used_buffers) == _NUM_EXPERTS
+        mined_expert_headers = [(1, pool.acquire()), (4, pool.acquire()), (7, pool.acquire())]
+        assert len(pool._used_buffers) == len(mined_expert_headers)
 
-        callback = self._make_callback(headers)
-        # No expert triggered (zeroed headers): callback must still release them.
+        callback = self._make_callback(mined_expert_headers)
+        # No expert triggered (zeroed headers): callback must still release sparse headers.
         callback(lambda opened_block_info, mining_job: None)
         assert len(pool._used_buffers) == 0
