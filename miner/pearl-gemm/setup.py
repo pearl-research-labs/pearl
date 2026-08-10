@@ -86,7 +86,9 @@ CORES_PER_JOB = 1
 FALLBACK_MAX_JOBS = 4
 KB_PER_GB = 1024 * 1024
 NVCC_THREAD_COUNT = "4"
-COMPUTE_CAPABILITY = "arch=compute_90a,code=sm_90a"
+DEFAULT_CUDA_ARCHS = "90a"
+CUDA_ARCHS_ENV = "PEARL_GEMM_CUDA_ARCHS"
+BLACKWELL_CONSUMER_ARCHS = {"120", "121"}
 
 
 def linux_total_ram_kb() -> int:
@@ -141,7 +143,16 @@ NOISING_B_KERNELS = [k for k in kernel_configs.noising_b_kernels if k.R in ENABL
 def get_platform() -> str:
     """Returns the platform name as used in wheel filenames."""
     if sys.platform.startswith("linux"):
-        return "linux_x86_64"
+        machine = platform.machine().lower()
+        platform_tags = {
+            "amd64": "linux_x86_64",
+            "x86_64": "linux_x86_64",
+            "aarch64": "linux_aarch64",
+            "arm64": "linux_aarch64",
+        }
+        if machine in platform_tags:
+            return platform_tags[machine]
+        raise ValueError(f"Unsupported Linux machine architecture: {machine}")
     raise ValueError(f"Unsupported platform: {sys.platform}")
 
 
@@ -151,6 +162,99 @@ def get_cuda_bare_metal_version(cuda_dir: str) -> tuple[str, Version]:
     release_idx = output.index("release") + 1
     bare_metal_version = parse(output[release_idx].split(",")[0])
     return raw_output, bare_metal_version
+
+
+def _split_cuda_archs(raw_archs: str) -> list[str]:
+    return [part for part in re.split(r"[,;\s]+", raw_archs.strip()) if part]
+
+
+def normalize_cuda_arch(raw_arch: str) -> str:
+    arch = raw_arch.strip().lower()
+    if not arch:
+        raise ValueError("empty CUDA architecture")
+
+    arch = arch.removeprefix("compute_")
+    arch = arch.removeprefix("compute")
+    arch = arch.removeprefix("sm_")
+    arch = arch.removeprefix("sm")
+    arch = arch.replace(".", "")
+
+    if not re.fullmatch(r"[0-9]+a?", arch):
+        raise ValueError(
+            f"Invalid CUDA architecture {raw_arch!r}. Expected values like 90a, sm_90a, 121, or native."
+        )
+    return arch
+
+
+def detect_native_cuda_arch() -> str | None:
+    try:
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability()
+    except Exception as exc:
+        warnings.warn(
+            f"Could not query CUDA device capability: {exc!r}",
+            category=RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+
+    arch = f"{major}{minor}"
+    # Pearl's current kernels use Hopper architecture-accelerated instructions,
+    # so Hopper native builds should keep the existing sm_90a target.
+    return "90a" if arch == "90" else arch
+
+
+def warn_if_experimental_blackwell_arch(archs: list[str], source: str) -> None:
+    blackwell_archs = sorted(set(archs) & BLACKWELL_CONSUMER_ARCHS)
+    if not blackwell_archs:
+        return
+
+    warnings.warn(
+        f"{source} selected Blackwell consumer CUDA architecture(s) "
+        f"{', '.join('sm_' + arch for arch in blackwell_archs)}. "
+        "pearl-gemm's main NoisyGEMM/vLLM kernels are still Hopper sm_90a-specific; "
+        "this build target is experimental and does not imply production-performance Blackwell kernel support.",
+        category=RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def resolve_cuda_archs() -> list[str]:
+    raw_archs = os.getenv(CUDA_ARCHS_ENV)
+    source = CUDA_ARCHS_ENV
+
+    if raw_archs:
+        archs = []
+        for raw_arch in _split_cuda_archs(raw_archs):
+            if raw_arch.strip().lower() == "native":
+                native_arch = detect_native_cuda_arch()
+                if native_arch is None:
+                    raise RuntimeError(
+                        f"{CUDA_ARCHS_ENV}=native was requested, but no CUDA device is visible"
+                    )
+                archs.append(native_arch)
+            else:
+                archs.append(normalize_cuda_arch(raw_arch))
+    else:
+        native_arch = detect_native_cuda_arch()
+        if native_arch in BLACKWELL_CONSUMER_ARCHS:
+            source = "detected CUDA device"
+            archs = [native_arch]
+        else:
+            source = "default"
+            archs = [normalize_cuda_arch(DEFAULT_CUDA_ARCHS)]
+
+    deduped_archs = list(dict.fromkeys(archs))
+    warn_if_experimental_blackwell_arch(deduped_archs, source)
+    return deduped_archs
+
+
+def cuda_gencode_flags(archs: list[str]) -> list[str]:
+    flags = []
+    for arch in archs:
+        flags.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
+    return flags
 
 
 def warn_if_cuda_home_missing(global_option: str) -> None:
@@ -349,7 +453,9 @@ if not SKIP_CUDA_BUILD:
     warn_if_cuda_home_missing("pearl_gemm")
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     print(f"cuda version = {bare_metal_version}\n\n")
-    arch_flags = ["-gencode", COMPUTE_CAPABILITY]
+    cuda_archs = resolve_cuda_archs()
+    print(f"cuda archs = {', '.join('sm_' + arch for arch in cuda_archs)}\n\n")
+    arch_flags = cuda_gencode_flags(cuda_archs)
 
     if not SKIP_CPP_GENERATION:
         # Generate template instantiations for all possible kernels
@@ -425,11 +531,11 @@ if not SKIP_CUDA_BUILD:
         cutlass_dir / "tools" / "util" / "include",
     ]
     if sys.platform.startswith("linux"):
-        cuda_cccl_include_dir = (
-            Path(CUDA_HOME) / "targets" / f"{platform.machine()}-linux" / "include" / "cccl"
-        )
-        if cuda_cccl_include_dir.exists():
-            include_dirs.append(cuda_cccl_include_dir)
+        cuda_cccl_include_dirs = [
+            Path(CUDA_HOME) / "targets" / f"{platform.machine()}-linux" / "include" / "cccl",
+            Path(CUDA_HOME) / "include" / "cccl",
+        ]
+        include_dirs.extend(path for path in cuda_cccl_include_dirs if path.exists())
 
     # Get PyTorch library path for rpath
     torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")

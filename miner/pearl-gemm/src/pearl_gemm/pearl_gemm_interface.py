@@ -1,7 +1,31 @@
-import pearl_gemm_cuda
+# ruff: noqa: I001
+from blake3 import blake3
+
 import torch
+import pearl_gemm_cuda
 
 BLAKE3_DIGEST_SIZE_U32 = 8
+BLAKE3_CHUNK_LEN = 1024
+
+
+def _use_reference_cuda_backend(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability(device)
+    except Exception:
+        return False
+    return major >= 10
+
+
+def _pad_to_blake3_chunk_boundary(raw: bytes) -> bytes:
+    pad_len = (-len(raw)) % BLAKE3_CHUNK_LEN
+    return raw if pad_len == 0 else raw + (b"\x00" * pad_len)
+
+
+def _copy_digest_to_cuda_out(digest: bytes, out: torch.Tensor) -> None:
+    digest_tensor = torch.frombuffer(bytearray(digest), dtype=torch.uint8).to(out.device)
+    out.copy_(digest_tensor)
 
 
 def make_pow_target_tensor(value: int, device="cuda") -> torch.Tensor:
@@ -573,6 +597,13 @@ def tensor_hash(
     Returns:
         Tensor: Hash output tensor
     """
+    if _use_reference_cuda_backend(data.device):
+        key_bytes = key.detach().cpu().numpy().tobytes()
+        raw = data.flatten().detach().cpu().numpy().tobytes()
+        digest = blake3(_pad_to_blake3_chunk_boundary(raw), key=key_bytes).digest()
+        _copy_digest_to_cuda_out(digest, out)
+        return None
+
     return pearl_gemm_cuda.tensor_hash(
         data, key, out, roots, threads_per_block, num_stages, leaves_per_mt_block
     )
@@ -590,6 +621,16 @@ def commitment_hash_from_merkle_roots(
     """
     Compute the commitment hash from merkle roots of a 2D tensor.
     """
+    if _use_reference_cuda_backend(A_merkle_root.device):
+        key_bytes = key.detach().cpu().numpy().tobytes()
+        a_root = A_merkle_root.detach().cpu().numpy().tobytes()
+        b_root = B_merkle_root.detach().cpu().numpy().tobytes()
+        b_digest = blake3(key_bytes + b_root).digest()
+        a_digest = blake3(b_digest + a_root).digest()
+        _copy_digest_to_cuda_out(a_digest, A_commitment_hash)
+        _copy_digest_to_cuda_out(b_digest, B_commitment_hash)
+        return None
+
     return pearl_gemm_cuda.commitment_hash_from_merkle_roots(
         A_merkle_root,
         B_merkle_root,
