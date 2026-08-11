@@ -5,7 +5,7 @@ from the V2 (MoE) ZK certificate to the new V3 (salted noise-seed) certificate.
 
 | Network  | Fork height (`SaltedSeedForkHeight`) |
 | -------- | ------------------------------------ |
-| Mainnet  | `98900`                              |
+| Mainnet  | `99000`                              |
 | Testnet  | `38648`                              |
 | Testnet2 | `83109`                              |
 
