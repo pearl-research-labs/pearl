@@ -40,14 +40,10 @@ const MinNoiseRank = C.MIN_NOISE_RANK
 // V2 certificates (CertificateV2) handle both MoE and non-MoE new proofs.
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
-	switch cert.Version() {
-	case wire.CertificateVersionV1:
-		c, ok := cert.(*wire.CertificateV1)
-		if !ok {
-			return fmt.Errorf("invalid V1 certificate type: %T", cert)
-		}
+	switch c := cert.(type) {
+	case *wire.CertificateV1:
 		return verifyCertificateV1(header, c)
-	case wire.CertificateVersionV2, wire.CertificateVersionV3:
+	case *wire.CertificateV2, *wire.CertificateV3:
 		return VerifyZKProofFFI(header, cert, nil)
 	default:
 		return fmt.Errorf("unknown certificate type: %T", cert)
