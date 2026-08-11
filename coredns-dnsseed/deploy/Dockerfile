@@ -1,48 +1,49 @@
+# syntax=docker/dockerfile:1
+
 ARG GO_VERSION=1.26.5
 ARG ALPINE_VERSION=3.24
-ARG COREDNS_VERSION=1.11.3
 
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 
-RUN apk --no-cache add ca-certificates libcap git make
+WORKDIR /pearl
 
-ARG COREDNS_VERSION
+# Warm the module cache in its own layer so source edits don't re-download.
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
-RUN git clone --depth 1 --branch v${COREDNS_VERSION} \
-    https://github.com/coredns/coredns /coredns
+COPY . .
 
-COPY . /pearl
-
-WORKDIR /coredns
-
-RUN echo "dnsseed:github.com/pearl-research-labs/pearl/coredns-dnsseed/dnsseed" \
-    >> plugin.cfg
-
-RUN echo "replace github.com/pearl-research-labs/pearl => /pearl" >> go.mod
-
-RUN go get github.com/pearl-research-labs/pearl/coredns-dnsseed/dnsseed && \
-    make all && \
-    setcap cap_net_bind_service=+ep ./coredns
+# GIT_COMMIT stamps `coredns -version` output; CI passes the build SHA.
+# CoreDNS version and plugin set are defined by go.mod and
+# coredns-dnsseed/cmd/coredns; -s -w matches upstream's stripped releases.
+ARG GIT_COMMIT=""
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X github.com/coredns/coredns/coremain.GitCommit=${GIT_COMMIT}" \
+    -o /out/coredns ./coredns-dnsseed/cmd/coredns
 
 # ---
 
-FROM alpine:${ALPINE_VERSION}
+# scratch keeps the runtime surface to the static binary and CA bundle,
+# mirroring upstream CoreDNS images. There is no shell: debug with an
+# ephemeral container (kubectl debug). The image binds only unprivileged
+# ports (:1053 by convention); map to :53 at the Service.
+FROM scratch
 
 LABEL maintainer="Pearl Research Labs"
 LABEL org.opencontainers.image.source="https://github.com/pearl-research-labs/pearl"
 LABEL org.opencontainers.image.description="Pearl DNS Seeder - CoreDNS with dnsseed plugin"
 
-RUN apk --no-cache add bind-tools
-
-COPY --from=builder /coredns/coredns /usr/bin/coredns
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
+COPY --from=builder /out/coredns /coredns
 
-USER nobody:nobody
+USER 65534:65534
 
-EXPOSE 53 53/udp
+EXPOSE 1053 1053/udp
 
-HEALTHCHECK --interval=5s --retries=10 \
-    CMD dig @0.0.0.0 localhost +short +time=1 >/dev/null || exit 1
+# No Docker HEALTHCHECK: Kubernetes ignores it. Use the CoreDNS `health`
+# (liveness) and `ready` (readiness) plugin endpoints as probes instead.
 
-ENTRYPOINT ["coredns"]
+ENTRYPOINT ["/coredns"]
 CMD ["-conf", "/etc/coredns/Corefile"]

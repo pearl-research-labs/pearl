@@ -2,145 +2,135 @@ package dnsseed
 
 import (
 	"context"
-	crypto_rand "crypto/rand"
-	"math"
 	"net"
-	"net/url"
-	"strconv"
 	"time"
 
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
 	clog "github.com/coredns/coredns/plugin/pkg/log"
-
-	"github.com/pearl-research-labs/pearl/coredns-dnsseed/crawler"
 )
 
 const pluginName = "dnsseed"
 
-var (
-	log                          = clog.NewWithPlugin(pluginName)
-	defaultUpdateInterval        = 15 * time.Minute
-	defaultTTL            uint32 = 3600
-	defaultMaxAnswers     uint32 = 25
+const (
+	// defaultUpdateInterval is how often the network is re-crawled unless
+	// crawl_interval overrides it.
+	defaultUpdateInterval = 15 * time.Minute
+
+	// bootstrapRetryInterval is how long the crawl loop waits before
+	// retrying when no bootstrap peer is reachable.
+	bootstrapRetryInterval = 30 * time.Second
 )
+
+var log = clog.NewWithPlugin(pluginName)
 
 func init() { plugin.Register(pluginName, setup) }
 
 type options struct {
 	networkName    string
 	updateInterval time.Duration
-	recordTTL      uint32
-	maxAnswers     uint32
 	bootstrapPeers []string
 }
 
+// setup validates configuration and registers the plugin. It performs no
+// network I/O: bootstrapping and crawling run in a background loop with
+// retries, and the ready plugin gates traffic until addresses are served.
 func setup(c *caddy.Controller) error {
-	zone, err := url.Parse(c.Key)
-	if err != nil {
-		return c.Errf("couldn't parse zone from block identifier: %s", c.Key)
-	}
+	zones := plugin.OriginsFromArgsOrServerBlock(nil, c.ServerBlockKeys)
 
-	opts, err := parseConfig(c)
+	opts, err := parse(c)
 	if err != nil {
 		return err
 	}
 
-	if len(opts.bootstrapPeers) == 0 {
-		return plugin.Error(pluginName, c.Err("config supplied no bootstrap peers"))
-	}
-
-	seeder, err := crawler.NewSeeder(opts.networkName)
+	s, err := newSeeder(opts.networkName)
 	if err != nil {
 		return plugin.Error(pluginName, err)
 	}
 
-	log.Infof("Connecting to bootstrap peers %v", opts.bootstrapPeers)
-
-	connectedToBootstrap := false
-	for _, s := range opts.bootstrapPeers {
-		address, port, err := net.SplitHostPort(s)
-		if err != nil {
-			return plugin.Error(pluginName, c.Errf("config error: expected 'host:port', got %s", s))
-		}
-
-		addresses, err := net.LookupHost(address)
-		if err != nil {
-			log.Errorf("error looking up host %s: %v", address, err)
-			continue
-		}
-
-		for _, addr := range addresses {
-			_, err = seeder.Connect(addr, port)
-			if err != nil {
-				log.Errorf("error connecting to %s:%s: %v", addr, port, err)
-			} else {
-				log.Infof("connected to bootstrap peer %s:%s", addr, port)
-				connectedToBootstrap = true
-			}
-		}
-	}
-
-	if !connectedToBootstrap {
-		return plugin.Error(pluginName, c.Err("failed to connect to any bootstrap peers"))
-	}
+	log.Infof("Serving verified %s full nodes for zones %v", opts.networkName, zones)
 
 	ctx, cancel := context.WithCancel(context.Background())
-
-	go crawlLoop(ctx, opts.networkName, seeder, opts.updateInterval)
-
-	err = seeder.WaitForAddresses(1, 30*time.Second)
-	if err != nil {
-		cancel()
-		return plugin.Error(pluginName, c.Err("timed out waiting for initial addresses"))
-	}
+	go crawlLoop(ctx, s, opts)
 
 	c.OnShutdown(func() error {
 		cancel()
-		seeder.DisconnectAllPeers()
+		s.disconnectAllPeers()
 		return nil
 	})
 
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-		return PearlSeeder{
+		return Dnsseed{
 			Next:   next,
-			Zones:  []string{zone.Hostname()},
-			seeder: seeder,
-			opts:   opts,
+			Zones:  zones,
+			seeder: s,
 		}
 	})
 
 	return nil
 }
 
-func crawlLoop(ctx context.Context, name string, seeder *crawler.Seeder, interval time.Duration) {
-	runCrawl(name, seeder)
-	log.Infof("Starting crawl timer on %s, interval %.1fm", name, interval.Minutes())
+// crawlLoop bootstraps the seeder (retrying until at least one bootstrap
+// peer is reachable), then crawls the network on a fixed interval until ctx
+// is cancelled. Each crawl is bounded to the interval so a pathological
+// crawl cannot outlive its slot.
+func crawlLoop(ctx context.Context, s *seeder, opts *options) {
+	for !s.bootstrap(ctx, opts.bootstrapPeers) {
+		log.Warningf("No bootstrap peer reachable, retrying in %s", bootstrapRetryInterval)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(bootstrapRetryInterval):
+		}
+	}
 
-	ticker := time.NewTicker(interval)
+	crawl := func() {
+		crawlCtx, cancel := context.WithTimeout(ctx, opts.updateInterval)
+		defer cancel()
+		// An empty book means every known peer died (or the pod lost
+		// egress); gossip has no live source, so start over from the
+		// bootstrap peers.
+		if s.peerCount() == 0 {
+			log.Warningf("Address book is empty, re-bootstrapping")
+			s.bootstrap(crawlCtx, opts.bootstrapPeers)
+		}
+		runCrawl(crawlCtx, opts.networkName, s)
+	}
+
+	crawl()
+	log.Infof("Starting crawl timer on %s, interval %.1fm",
+		opts.networkName, opts.updateInterval.Minutes())
+
+	ticker := time.NewTicker(opts.updateInterval)
 	defer ticker.Stop()
 
-	randByte := []byte{0}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runCrawl(name, seeder)
-			crypto_rand.Read(randByte[:])
-			if randByte[0] >= 192 {
-				seeder.RetryBlacklist()
-			}
+			crawl()
 		}
 	}
 }
 
-func parseConfig(c *caddy.Controller) (*options, error) {
+func runCrawl(ctx context.Context, name string, s *seeder) {
+	start := time.Now()
+	s.addrBook.pruneCooldown()
+	before := s.peerCount()
+	s.refreshAddresses(ctx)
+	s.requestAddresses(ctx)
+	s.disconnectAllPeers()
+	addressCount.Set(float64(s.peerCount()))
+	elapsed := time.Since(start).Truncate(time.Second).Seconds()
+	log.Infof("[%s] crawl complete, %d new peers of %d total in %.0fs",
+		name, s.peerCount()-before, s.peerCount(), elapsed)
+}
+
+func parse(c *caddy.Controller) (*options, error) {
 	opts := &options{
 		updateInterval: defaultUpdateInterval,
-		recordTTL:      defaultTTL,
-		maxAnswers:     defaultMaxAnswers,
 	}
 	c.Next() // skip "dnsseed"
 
@@ -151,16 +141,11 @@ func parseConfig(c *caddy.Controller) (*options, error) {
 	for loaded := true; loaded; loaded = c.NextBlock() {
 		switch c.Val() {
 		case "network":
+			// Validated by newSeeder, which owns the network list.
 			if !c.NextArg() {
 				return nil, plugin.Error(pluginName, c.SyntaxErr("no network specified"))
 			}
 			opts.networkName = c.Val()
-			switch opts.networkName {
-			case "mainnet", "testnet", "testnet2", "regtest", "signet", "simnet":
-			default:
-				return nil, plugin.Error(pluginName, c.SyntaxErr(
-					"networks are {mainnet, testnet, testnet2, regtest, signet, simnet}"))
-			}
 
 		case "crawl_interval":
 			if !c.NextArg() {
@@ -177,42 +162,25 @@ func parseConfig(c *caddy.Controller) (*options, error) {
 			if len(bootstrap) == 0 {
 				return nil, plugin.Error(pluginName, c.SyntaxErr("no bootstrap peers specified"))
 			}
+			for _, bp := range bootstrap {
+				if _, _, err := net.SplitHostPort(bp); err != nil {
+					return nil, plugin.Error(pluginName,
+						c.Errf("bad bootstrap peer %q: expected host:port", bp))
+				}
+			}
 			opts.bootstrapPeers = bootstrap
-
-		case "record_ttl":
-			if !c.NextArg() {
-				return nil, plugin.Error(pluginName, c.SyntaxErr("no ttl specified"))
-			}
-			ttl, err := strconv.Atoi(c.Val())
-			if err != nil || ttl <= 0 || ttl > math.MaxUint32 {
-				return nil, plugin.Error(pluginName, c.SyntaxErr("bad ttl"))
-			}
-			opts.recordTTL = uint32(ttl)
-
-		case "max_answers":
-			if !c.NextArg() {
-				return nil, plugin.Error(pluginName, c.SyntaxErr("no max_answers specified"))
-			}
-			n, err := strconv.Atoi(c.Val())
-			if err != nil || n <= 0 || n > 100 {
-				return nil, plugin.Error(pluginName, c.SyntaxErr("bad max_answers (1-100)"))
-			}
-			opts.maxAnswers = uint32(n)
 
 		default:
 			return nil, plugin.Error(pluginName, c.SyntaxErr("unsupported option"))
 		}
 	}
 
-	return opts, nil
-}
+	if opts.networkName == "" {
+		return nil, plugin.Error(pluginName, c.Err("network is required"))
+	}
+	if len(opts.bootstrapPeers) == 0 {
+		return nil, plugin.Error(pluginName, c.Err("bootstrap_peers is required"))
+	}
 
-func runCrawl(name string, seeder *crawler.Seeder) {
-	start := time.Now()
-	seeder.RefreshAddresses(false)
-	newPeerCount := seeder.RequestAddresses()
-	seeder.DisconnectAllPeers()
-	elapsed := time.Since(start).Truncate(time.Second).Seconds()
-	log.Infof("[%s] crawl complete, met %d new peers of %d total in %.0fs",
-		name, newPeerCount, seeder.GetPeerCount(), elapsed)
+	return opts, nil
 }
