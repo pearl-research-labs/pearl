@@ -118,3 +118,36 @@ func TestCheckCertificateRulesDenseOnlyAppliesToV3(t *testing.T) {
 	requireRuleError(t, checkCertVersion(moe, 2, params),
 		ErrDisallowedCertVersion)
 }
+
+// TestSaltedSeedForkBlockTemplateVersion verifies CheckConnectBlockTemplate enforces
+// the required cert version on unmined templates (BFNoPoWCheck) at the fork height.
+func TestSaltedSeedForkBlockTemplateVersion(t *testing.T) {
+	params := saltedSimNetParams()
+	chain, teardown, err := chainSetup("salted_fork_template", &params)
+	require.NoError(t, err)
+	defer teardown()
+
+	tip := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	tip.SetHeight(0)
+
+	// Advance until the next block is at the activation height.
+	for h := int32(1); h < saltedForkTestHeight; h++ {
+		block, _, err := addBlock(chain, tip, nil)
+		require.NoError(t, err)
+		tip = block
+	}
+
+	// At the fork height, a template carrying a V3 certificate must connect.
+	v3Template := newBlockForcedCert(t, chain, tip,
+		&wire.CertificateV3{CertificateV2: wire.CertificateV2{Hash: *tip.Hash()}})
+	require.Equal(t, wire.CertificateVersionV3,
+		v3Template.MsgBlock().BlockCertificate().Version())
+	require.NoError(t, chain.CheckConnectBlockTemplate(v3Template),
+		"V3 template must be accepted at the fork height")
+
+	// The same template carrying a V2 certificate must be rejected.
+	v2Template := newBlockForcedCert(t, chain, tip,
+		&wire.CertificateV2{Hash: *tip.Hash()})
+	requireRuleError(t, chain.CheckConnectBlockTemplate(v2Template),
+		ErrDisallowedCertVersion)
+}
