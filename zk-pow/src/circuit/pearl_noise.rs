@@ -176,7 +176,7 @@ pub fn compute_noise(params: &CompiledPublicParams) -> MMSlice {
 mod tests {
     use crate::api::proof::PublicProofParams;
     #[cfg(debug_assertions)]
-    use crate::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern};
+    use crate::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern, SeedDerivation};
 
     use super::*;
 
@@ -268,7 +268,7 @@ mod tests {
             moe: None,
         };
 
-        let params = PublicProofParams::new_dummy(block_header, mining_configuration, 1024, 768, 0, 0);
+        let params = PublicProofParams::new_dummy(block_header, SeedDerivation::Legacy, mining_configuration, 1024, 768, 0, 0);
 
         compute_noise(&CompiledPublicParams::from(&params)); // Should panic in debug mode
     }
@@ -288,7 +288,7 @@ mod tests {
             moe: None,
         };
 
-        let params = PublicProofParams::new_dummy(block_header, mining_configuration, 1024, 768, 0, 0);
+        let params = PublicProofParams::new_dummy(block_header, SeedDerivation::Legacy, mining_configuration, 1024, 768, 0, 0);
 
         compute_noise(&CompiledPublicParams::from(&params)); // Should panic in debug mode
     }

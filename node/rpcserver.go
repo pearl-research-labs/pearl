@@ -73,7 +73,7 @@ const (
 	gbtRegenerateSeconds = 60
 
 	// maxProtocolVersion is the max protocol version the server supports.
-	maxProtocolVersion = 1
+	maxProtocolVersion = wire.ProtocolVersion
 
 	// defaultMaxFeeRate is the default value to use(0.1 PRL/kvB) when the
 	// `MaxFee` field is not set when calling `testmempoolaccept`.

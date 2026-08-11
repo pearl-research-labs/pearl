@@ -43,15 +43,23 @@ func testBlockHeader(nbits ...uint32) *wire.BlockHeader {
 	}
 }
 
+// requireV2 asserts cert is a CertificateV2 and returns it.
+func requireV2(t *testing.T, cert wire.BlockCertificate) *wire.CertificateV2 {
+	t.Helper()
+	v2, ok := cert.(*wire.CertificateV2)
+	require.True(t, ok, "mined certificate should be CertificateV2")
+	return v2
+}
+
 // mineCertificate mines a block and returns the header and certificate.
 func mineCertificate(t *testing.T) (*wire.BlockHeader, *wire.CertificateV2) {
 	t.Helper()
 	header := testBlockHeader()
 
-	cert, err := Mine(header)
+	cert, err := Mine(header, wire.CertificateVersionV2)
 	require.NoError(t, err, "mining should succeed")
 
-	return header, cert
+	return header, requireV2(t, cert)
 }
 
 // copyBlockHeader creates a copy of BlockHeader for tampering tests
@@ -219,10 +227,11 @@ func mineMoECertificate(t *testing.T) (*wire.BlockHeader, *wire.CertificateV2) {
 	t.Helper()
 	header := testBlockHeader()
 
-	cert, err := MineMoE(header, DefaultMoEM, DefaultMoEN, DefaultMoEE, DefaultMoETopK)
+	cert, err := MineMoE(header, DefaultMoEM, DefaultMoEN, DefaultMoEE, DefaultMoETopK,
+		wire.CertificateVersionV2)
 	require.NoError(t, err, "MoE mining should succeed")
 
-	return header, cert
+	return header, requireV2(t, cert)
 }
 
 // TestMoEMineAndVerifyProof tests the full MoE mining and verification flow.
@@ -317,7 +326,7 @@ func BenchmarkMine(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				cert, err := Mine(header)
+				cert, err := Mine(header, wire.CertificateVersionV2)
 				if err != nil {
 					b.Fatalf("mining failed: %v", err)
 				}
@@ -336,7 +345,7 @@ func BenchmarkMine(b *testing.B) {
 func BenchmarkVerifyProof(b *testing.B) {
 	header := testBlockHeader()
 
-	cert, err := Mine(header)
+	cert, err := Mine(header, wire.CertificateVersionV2)
 	if err != nil {
 		b.Fatalf("mining failed during setup: %v", err)
 	}

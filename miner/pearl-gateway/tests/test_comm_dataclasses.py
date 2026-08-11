@@ -8,6 +8,7 @@ from pearl_gateway.comm.dataclasses import (
 )
 from pearl_gateway.comm.mining_configuration import PearlMiningConfigurationFactory
 from pearl_mining import PENALTY_BASE_RANK
+from pydantic import ValidationError
 
 
 class TestMiningJob:
@@ -89,9 +90,15 @@ class TestAdjustTarget:
             col_indices=self.COL_INDICES,
         )
 
+    def _mining_job(self, target: int) -> MiningJob:
+        return MiningJob(
+            incomplete_header_bytes=b"",
+            target=target,
+            cert_version=CertificateVersion.ZK_MOE,
+        )
+
     def _adjusted_target(self, rank: int) -> int:
-        job = MiningJob(incomplete_header_bytes=b"", target=self.BLOCK_TARGET)
-        return job.adjust_target(self._mining_config(rank))
+        return self._mining_job(self.BLOCK_TARGET).adjust_target(self._mining_config(rank))
 
     def test_base_rank_is_unpenalized(self):
         """A miner at the base rank searches the plain hash-tile-scaled target."""
@@ -122,17 +129,15 @@ class TestAdjustTarget:
             row_indices=self.ROW_INDICES,
             col_indices=self.COL_INDICES,
         )
-        job = MiningJob(incomplete_header_bytes=b"", target=self.BLOCK_TARGET)
         with pytest.raises(ValueError, match="degenerate"):
-            job.adjust_target(config)
+            self._mining_job(self.BLOCK_TARGET).adjust_target(config)
 
     def test_target_too_easy_is_rejected(self):
         """A target whose penalized bound exceeds 256 bits must raise. Clamping it
         to the maximum target would have the miner search a target every hash
         satisfies."""
-        job = MiningJob(incomplete_header_bytes=b"", target=2**240)
         with pytest.raises(ValueError, match="too easy"):
-            job.adjust_target(self._mining_config(PENALTY_BASE_RANK))
+            self._mining_job(2**240).adjust_target(self._mining_config(PENALTY_BASE_RANK))
 
 
 class TestBlockTemplateCertVersion:
@@ -143,7 +148,7 @@ class TestBlockTemplateCertVersion:
     ):
         from pearl_gateway.rpc_types import GetBlockTemplateResponse
 
-        for version in (CertificateVersion.ZK_DENSE, CertificateVersion.ZK_MOE):
+        for version in CertificateVersion:
             data = {**sample_block_template_data, "requiredcertversion": int(version)}
             template = BlockTemplate.from_get_block_template(
                 GetBlockTemplateResponse.model_validate(data),
@@ -167,3 +172,13 @@ class TestBlockTemplateCertVersion:
             mining_address=mining_address,
         )
         assert template.required_cert_version == CertificateVersion.ZK_DENSE
+
+    def test_unknown_required_cert_version_is_rejected(self, sample_block_template_data):
+        """A version this build has no derivation for must fail loudly rather than
+        be mined under the wrong one."""
+        from pearl_gateway.rpc_types import GetBlockTemplateResponse
+
+        unknown = max(CertificateVersion) + 1
+        data = {**sample_block_template_data, "requiredcertversion": unknown}
+        with pytest.raises(ValidationError):
+            GetBlockTemplateResponse.model_validate(data)

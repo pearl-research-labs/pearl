@@ -21,7 +21,6 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
@@ -36,10 +35,13 @@ const MinNoiseRank = C.MIN_NOISE_RANK
 
 // VerifyCertificate performs sanity checks followed by cryptographic proof verification.
 // It returns an error if the certificate is invalid or does not match the header.
+// V3 certificates (CertificateV3) share the V2 layout but use the salted noise-seed derivation.
 // V2 certificates (CertificateV2) handle both MoE and non-MoE new proofs.
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
 	switch c := cert.(type) {
+	case *wire.CertificateV3:
+		return verifyCertificateV3(header, c)
 	case *wire.CertificateV2:
 		return verifyCertificateV2(header, c)
 	case *wire.CertificateV1:
@@ -97,36 +99,42 @@ func verifyCertificateV1(header *wire.BlockHeader, c *wire.CertificateV1) error 
 }
 
 // ================================================================================
-// V2 CERTIFICATE VERIFICATION
+// V2/V3 CERTIFICATE VERIFICATION
 // ================================================================================
 
 func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error {
-	return VerifyZKProofFFI(header, c.Hash, c.ProofCommitment(), c.PublicDataBytes(),
-		c.ProofData, nil)
+	return VerifyZKProofFFI(header, c, nil)
 }
 
+func verifyCertificateV3(header *wire.BlockHeader, c *wire.CertificateV3) error {
+	return VerifyZKProofFFI(header, c, nil)
+}
+
+// VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.
 func VerifyZKProofFFI(
 	header *wire.BlockHeader,
-	certHash chainhash.Hash,
-	proofCommitment chainhash.Hash,
-	publicData []byte,
-	proofData []byte,
+	cert wire.BlockCertificate,
 	nbitsOverride *uint32,
 ) error {
+	certHash := cert.BlockHash()
 	blockHash := header.BlockHash()
 	if !certHash.IsEqual(&blockHash) {
 		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
 			certHash, blockHash)
 	}
 
+	proofCommitment := cert.ProofCommitment()
 	if header.ProofCommitment != proofCommitment {
 		return fmt.Errorf("proof commitment mismatch: header has %s, certificate has %s",
 			header.ProofCommitment, proofCommitment)
 	}
 
+	publicData := cert.PublicDataBytes()
 	if len(publicData) == 0 { // avoid publicData[0] index below
 		return fmt.Errorf("empty public data")
 	}
+
+	proofData := cert.ProofBytes()
 	if len(proofData) == 0 { // avoid proofData[0] index below
 		return fmt.Errorf("empty proof data")
 	}
@@ -149,10 +157,21 @@ func VerifyZKProofFFI(
 	// Call Rust FFI
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
 	var result C.int32_t
-	if nbitsOverride != nil {
-		result = C.verify_zk_proof_v2_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
-	} else {
-		result = C.verify_zk_proof_v2(&cBlockHeader, &cZKProof, &errorBuf[0])
+	switch cert.Version() {
+	case wire.CertificateVersionV2:
+		if nbitsOverride != nil {
+			result = C.verify_zk_proof_v2_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
+		} else {
+			result = C.verify_zk_proof_v2(&cBlockHeader, &cZKProof, &errorBuf[0])
+		}
+	case wire.CertificateVersionV3:
+		if nbitsOverride != nil {
+			result = C.verify_zk_proof_v3_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
+		} else {
+			result = C.verify_zk_proof_v3(&cBlockHeader, &cZKProof, &errorBuf[0])
+		}
+	default:
+		return fmt.Errorf("unsupported certificate version %d for FFI verification", cert.Version())
 	}
 	msg := C.GoString(&errorBuf[0])
 

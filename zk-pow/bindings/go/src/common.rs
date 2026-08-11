@@ -6,7 +6,7 @@ use std::slice;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams};
+use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams, SeedDerivation};
 use zk_pow::api::prove;
 use zk_pow::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
 use zk_pow::ffi::plain_proof::PlainProof;
@@ -124,9 +124,10 @@ pub(crate) unsafe fn zk_prove(
     error_msg_out: *mut c_char,
     header: IncompleteBlockHeader,
     proof: &PlainProof,
+    seed_derivation: SeedDerivation,
 ) -> Option<prove::ProveResult> {
     let mut cache = acquire_cache();
-    match catch_panic(|| prove::zk_prove_plain_proof(header, proof, &mut cache, false)) {
+    match catch_panic(|| prove::zk_prove_plain_proof(header, proof, &mut cache, false, seed_derivation)) {
         Ok(Ok(r)) => Some(r),
         Ok(Err(e)) => {
             set_error_msg(error_msg_out, &format!("Prove failed: {}", e));

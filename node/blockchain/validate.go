@@ -513,7 +513,8 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 // must satisfy:
 //   - Before MoEForkHeight (or with the fork disabled): only V1 accepted
 //   - At and after MoEForkHeight (hardfork): only V2 accepted
-//   - At and after DenseOnlyForkHeight (softfork): V2 certificates must
+//   - At and after SaltedSeedForkHeight (hardfork): only V3 accepted
+//   - At and after DenseOnlyForkHeight (softfork): V2/V3 certificates must
 //     carry a dense (non-MoE) proof
 //   - At and after RankPenaltyForkHeight (softfork): the proof's noise rank
 //     must meet a minimum and its jackpot must meet a difficulty bound scaled
@@ -542,13 +543,7 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 		return ruleError(ErrDisallowedCertVersion, str)
 	}
 
-	// The remaining rules read fields only a V2 certificate has.
-	c, ok := cert.(*wire.CertificateV2)
-	if !ok {
-		return nil
-	}
-
-	if c.IsMoE() && params.IsDenseOnlyForkActive(height) {
+	if cert.IsMoE() && params.IsDenseOnlyForkActive(height) {
 		str := fmt.Sprintf("MoE certificate is not allowed at height %d "+
 			"(dense-only fork active from height %d)",
 			height, params.DenseOnlyForkHeight)
@@ -556,7 +551,7 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 	}
 
 	if params.IsRankPenaltyForkActive(height) && flags&BFNoPoWCheck != BFNoPoWCheck {
-		if err := zkpow.CheckRankPenalty(header.Bits, c.PublicDataBytes()); err != nil {
+		if err := zkpow.CheckRankPenalty(header.Bits, cert.PublicDataBytes()); err != nil {
 			str := fmt.Sprintf("certificate fails the rank penalty rule at "+
 				"height %d (fork active from height %d): %v",
 				height, params.RankPenaltyForkHeight, err)

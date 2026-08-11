@@ -34,10 +34,11 @@ SUBMIT_PLAIN_PROOF_SCHEMA = {
         "plain_proof": {"type": "string", "pattern": BASE64_PATTERN},
         "mining_job": {
             "type": "object",
-            "required": ["incomplete_header_bytes", "target"],
+            "required": ["incomplete_header_bytes", "target", "cert_version"],
             "properties": {
                 "incomplete_header_bytes": {"type": "string", "pattern": BASE64_PATTERN},
                 "target": {"type": "integer", "minimum": 0},
+                "cert_version": {"type": "integer", "minimum": 1},
             },
         },
     },

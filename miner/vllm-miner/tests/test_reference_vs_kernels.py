@@ -18,6 +18,10 @@ from miner_base.matrix_merkle_tree import MatrixMerkleTree
 from miner_base.noise_generation import NoiseGenerator
 from pearl_gemm.test_components import inner_hash as inner_hash_cuda
 
+# Arbitrary (m, n) for the V3 salted derivation; any positive pair exercises
+# the same path.
+SALTED_DIMS = (192, 320)
+
 
 def _to_cuda_u8(data: bytes) -> torch.Tensor:
     return torch.frombuffer(bytearray(data), dtype=torch.uint8).cuda()
@@ -111,7 +115,8 @@ class TestMatrixMerkleTreeVsTensorHash:
             f"Hash mismatch for shape {m, n}: MatrixMerkleTree root doesn't match tensor_hash result"
         )
 
-    def test_commitment_hash_reference_vs_cuda(self, test_noise_seed_A):
+    @pytest.mark.parametrize("salted_dims", [None, SALTED_DIMS])
+    def test_commitment_hash_reference_vs_cuda(self, test_noise_seed_A, salted_dims):
         """Test that Python reference commitment hash matches CUDA implementation."""
         # Generate random 32-byte merkle roots directly
         A_merkle_root = secrets.token_bytes(blake3.digest_size)
@@ -127,6 +132,7 @@ class TestMatrixMerkleTreeVsTensorHash:
             A_merkle_root,
             B_merkle_root,
             test_noise_seed_A,
+            salted_dims=salted_dims,
         )
 
         # Compute commitment hash using CUDA implementation
@@ -138,6 +144,7 @@ class TestMatrixMerkleTreeVsTensorHash:
             key_tensor,
             cuda_commitment_A_tensor,
             cuda_commitment_B_tensor,
+            salted_dims=salted_dims,
         )
         torch.cuda.synchronize()
 
@@ -153,7 +160,8 @@ class TestMatrixMerkleTreeVsTensorHash:
             "Commitment hash mismatch: Python reference doesn't match CUDA implementation"
         )
 
-    def test_commitment_hash_moe_reference_vs_cuda(self, test_noise_seed_A):
+    @pytest.mark.parametrize("salted_dims", [None, SALTED_DIMS])
+    def test_commitment_hash_moe_reference_vs_cuda(self, test_noise_seed_A, salted_dims):
         """MoE folding: kernel routing_root/offsets_hash path matches CommitmentHasher."""
         # Cumulative exclusive ends per expert; last == m * top_k.
         routing_offsets = [3, 5, 9, 12]
@@ -173,6 +181,7 @@ class TestMatrixMerkleTreeVsTensorHash:
             test_noise_seed_A,
             routing_root=routing_root,
             offsets_root=offsets_root,
+            salted_dims=salted_dims,
         )
 
         cuda_commitment_A_tensor = torch.empty(blake3.digest_size, device="cuda", dtype=torch.uint8)
@@ -185,6 +194,7 @@ class TestMatrixMerkleTreeVsTensorHash:
             cuda_commitment_B_tensor,
             routing_root=_to_cuda_u8(routing_root),
             offsets_hash=_to_cuda_u8(offsets_root),
+            salted_dims=salted_dims,
         )
         torch.cuda.synchronize()
 

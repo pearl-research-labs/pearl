@@ -1001,7 +1001,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Commitment hash from Merkle roots", py::arg("A_merkle_root"),
         py::arg("B_merkle_root"), py::arg("key"), py::arg("A_commitment_hash"),
         py::arg("B_commitment_hash"), py::arg("routing_root") = py::none(),
-        py::arg("offsets_hash") = py::none());
+        py::arg("offsets_hash") = py::none(),
+        py::arg("salted_dim_a") = py::none(),
+        py::arg("salted_dim_b") = py::none());
   m.def("get_host_signal_header_size", &get_host_signal_header_size,
         "Calculate host signal header buffer size");
   m.def("get_host_signal_sync_size", &get_host_signal_sync_size,
@@ -1216,7 +1218,9 @@ TORCH_LIBRARY(pearl_gemm, m) {
       "    Tensor(A_commitment_hash!) A_commitment_hash, "
       "    Tensor(B_commitment_hash!) B_commitment_hash, "
       "    Tensor? routing_root=None, "
-      "    Tensor? offsets_hash=None"
+      "    Tensor? offsets_hash=None, "
+      "    int? salted_dim_a=None, "
+      "    int? salted_dim_b=None"
       ") -> ()");
   m.def(
       "build_routing_data("

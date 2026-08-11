@@ -2368,7 +2368,9 @@ version = "0.0.1"
 source = { editable = "miner/pearl-gemm" }
 dependencies = [
     { name = "blake3" },
+    { name = "cuda-python" },
     { name = "numpy" },
+    { name = "nvidia-cutlass-dsl" },
     { name = "packaging" },
     { name = "pearl-gemm-build-utils" },
     { name = "pydantic" },
@@ -2397,7 +2399,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "blake3", specifier = ">=1.0.7" },
+    { name = "cuda-python", specifier = ">=13.0,<13.1" },
     { name = "numpy", specifier = ">=1.24.0" },
+    { name = "nvidia-cutlass-dsl", specifier = ">=4.4" },
     { name = "packaging", specifier = ">=21.0" },
     { name = "pearl-gemm-build-utils", editable = "miner/pearl-gemm-build-utils" },
     { name = "pydantic", specifier = ">=2.12.0,<3.0.0" },
@@ -2575,7 +2579,7 @@ wheels = [
 
 [[package]]
 name = "py-pearl-mining"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "py-pearl-mining" }
 
 [package.dev-dependencies]

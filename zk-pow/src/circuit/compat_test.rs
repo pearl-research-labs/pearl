@@ -6,7 +6,7 @@ mod test {
     use std::io::Write;
     use std::path::Path;
 
-    use crate::api::proof::{PublicProofParams, ZKProof};
+    use crate::api::proof::{PublicProofParams, SeedDerivation, ZKProof};
     use crate::api::{prove, verify};
     use crate::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
     use crate::circuit::pearl_stark::PearlStark;
@@ -147,7 +147,9 @@ mod test {
     fn starky_hash(block_header: IncompleteBlockHeader, plain_proof: &PlainProof) -> String {
         use starky::stark::Stark;
 
-        let (private_params, public_params) = plain_proof.parse_proof(block_header).expect("Failed to parse plain proof");
+        let (private_params, public_params) = plain_proof
+            .parse_proof(block_header, SeedDerivation::Legacy)
+            .expect("Failed to parse plain proof");
 
         let mut hasher = blake3::Hasher::new();
 
@@ -243,9 +245,19 @@ mod test {
 
     fn generate_plain_proof(p: &Params) -> PlainProof {
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xdeadbeef);
-        try_mine_one(&mut rng, p.m, p.n, p.k, p.block_header, p.mining_config, None, false)
-            .unwrap()
-            .unwrap()
+        try_mine_one(
+            &mut rng,
+            p.m,
+            p.n,
+            p.k,
+            p.block_header,
+            p.mining_config,
+            None,
+            false,
+            SeedDerivation::Legacy,
+        )
+        .unwrap()
+        .unwrap()
     }
 
     fn starky_fingerprint() -> String {
@@ -260,7 +272,8 @@ mod test {
 
         let p = params();
         let plain_proof = generate_plain_proof(&p);
-        let result = prove::zk_prove_plain_proof(p.block_header, &plain_proof, &mut cache, false).expect("Proving failed");
+        let result = prove::zk_prove_plain_proof(p.block_header, &plain_proof, &mut cache, false, SeedDerivation::Legacy)
+            .expect("Proving failed");
 
         let mut f = std::fs::File::create(proof_path).unwrap();
         f.write_all(&result.public_data).unwrap();
@@ -283,7 +296,8 @@ mod test {
         let public_data = &buffer[..PublicProofParams::WIRE_SIZE];
         let proof_data = &buffer[PublicProofParams::WIRE_SIZE..];
 
-        let (public_params, proof) = ZKProof::deserialize(params.block_header, public_data, proof_data).unwrap();
+        let (public_params, proof) =
+            ZKProof::deserialize(params.block_header, SeedDerivation::Legacy, public_data, proof_data).unwrap();
 
         let mut cache = <PearlRecursion as RecursionCircuit>::CircuitCache::default();
         verify::verify_block(&public_params, &proof, &mut cache).expect("Proof must verify");
@@ -332,14 +346,15 @@ mod test {
         let (header, config, m, n, k) = moe_params();
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xcafe_babe);
         let plain_proof = loop {
-            let proof = try_mine_one_moe(&mut rng, m, n, k, header, config, None, false).unwrap();
+            let proof = try_mine_one_moe(&mut rng, m, n, k, header, config, None, false, SeedDerivation::Legacy).unwrap();
             if let Some(p) = proof {
                 break p;
             }
         };
 
         let mut cache = <PearlRecursion as RecursionCircuit>::CircuitCache::default();
-        let result = prove::zk_prove_plain_proof(header, &plain_proof, &mut cache, false).expect("MoE proving failed");
+        let result = prove::zk_prove_plain_proof(header, &plain_proof, &mut cache, false, SeedDerivation::Legacy)
+            .expect("MoE proving failed");
 
         let mut f = std::fs::File::create(proof_path).unwrap();
         f.write_all(&(result.public_data.len() as u32).to_le_bytes()).unwrap();
@@ -364,7 +379,7 @@ mod test {
         let public_data = &buffer[4..4 + public_data_len];
         let proof_data = &buffer[4 + public_data_len..];
 
-        let (public_params, proof) = ZKProof::deserialize(header, public_data, proof_data).unwrap();
+        let (public_params, proof) = ZKProof::deserialize(header, SeedDerivation::Legacy, public_data, proof_data).unwrap();
         assert!(public_params.moe.is_some(), "MoE fixture must have moe params");
 
         let mut cache = <PearlRecursion as RecursionCircuit>::CircuitCache::default();

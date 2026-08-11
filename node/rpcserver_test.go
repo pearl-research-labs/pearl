@@ -46,6 +46,11 @@ func TestBlockTemplateResultRequiredCertVersion(t *testing.T) {
 			cert: &wire.CertificateV2{},
 			want: uint32(wire.CertificateVersionV2),
 		},
+		{
+			name: "v3 placeholder at/after the salted-seed fork",
+			cert: &wire.CertificateV3{},
+			want: uint32(wire.CertificateVersionV3),
+		},
 	}
 
 	for _, tc := range testCases {

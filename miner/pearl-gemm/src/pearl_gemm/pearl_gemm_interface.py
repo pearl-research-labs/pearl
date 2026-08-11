@@ -586,10 +586,10 @@ def commitment_hash_from_merkle_roots(
     B_commitment_hash,
     routing_root=None,
     offsets_hash=None,
+    salted_dims: tuple[int, int] | None = None,
 ):
-    """
-    Compute the commitment hash from merkle roots of a 2D tensor.
-    """
+    """Compute commitment hashes from 2D-tensor Merkle roots."""
+    salted_dim_a, salted_dim_b = salted_dims if salted_dims is not None else (None, None)
     return pearl_gemm_cuda.commitment_hash_from_merkle_roots(
         A_merkle_root,
         B_merkle_root,
@@ -598,6 +598,8 @@ def commitment_hash_from_merkle_roots(
         B_commitment_hash,
         routing_root,
         offsets_hash,
+        salted_dim_a,
+        salted_dim_b,
     )
 
 
@@ -610,6 +612,8 @@ def _abstract_commitment_hash_from_merkle_roots(
     B_commitment_hash,
     routing_root=None,
     offsets_hash=None,
+    salted_dim_a=None,
+    salted_dim_b=None,
 ):
     return None
 

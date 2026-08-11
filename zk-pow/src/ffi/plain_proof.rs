@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::proof::{
     IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, MoEParams, PeriodicPattern, PrivateProofParams,
-    PublicProofParams,
+    PublicProofParams, SeedDerivation,
 };
 use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLocation, ProofSource, routing_blake_hotspot_rows};
 use crate::circuit::utils::macros::ensure_eq;
@@ -162,6 +162,19 @@ pub enum CertificateVersion {
     ZkDense = 1,
     /// V2: MoE and dense proofs.
     ZkMoe = 2,
+    /// V3: same wire layout as V2, salted noise-seed derivation.
+    ZkV3 = 3,
+}
+
+impl CertificateVersion {
+    /// The noise-seed derivation this certificate version mandates. This is the
+    /// single version→derivation mapping; the `api` layer only sees [`SeedDerivation`].
+    pub fn seed_derivation(self) -> SeedDerivation {
+        match self {
+            Self::ZkDense | Self::ZkMoe => SeedDerivation::Legacy,
+            Self::ZkV3 => SeedDerivation::Salted,
+        }
+    }
 }
 
 impl TryFrom<u32> for CertificateVersion {
@@ -171,6 +184,7 @@ impl TryFrom<u32> for CertificateVersion {
         match version {
             v if v == Self::ZkDense as u32 => Ok(Self::ZkDense),
             v if v == Self::ZkMoe as u32 => Ok(Self::ZkMoe),
+            v if v == Self::ZkV3 as u32 => Ok(Self::ZkV3),
             v => bail!("unknown certificate version: {v}"),
         }
     }
@@ -453,7 +467,11 @@ impl PlainProof {
     }
 
     /// Converts plain proof to Rust proof types, checks a,bt merkle roots match provided hashes.
-    pub fn parse_proof(&self, header: IncompleteBlockHeader) -> Result<(PrivateProofParams, PublicProofParams)> {
+    pub fn parse_proof(
+        &self,
+        header: IncompleteBlockHeader,
+        seed_derivation: SeedDerivation,
+    ) -> Result<(PrivateProofParams, PublicProofParams)> {
         let (m, n, k) = (self.m, self.n, self.k);
 
         for &tok in &self.a.row_indices {
@@ -466,6 +484,7 @@ impl PlainProof {
 
         let public = PublicProofParams {
             block_header: header,
+            seed_derivation,
             mining_config: MiningConfiguration {
                 common_dim: k as u32,
                 rank: self.noise_rank as u16,
@@ -647,8 +666,25 @@ mod tests {
     }
 
     #[test]
+    fn both_proof_kinds_eligible_under_v3() {
+        for proof in [dense_proof(), moe_proof()] {
+            assert_eq!(
+                check_cert_version_eligible(CertificateVersion::ZkV3 as u32, &proof).unwrap(),
+                CertificateVersion::ZkV3
+            );
+        }
+    }
+
+    #[test]
+    fn seed_derivation_mapping() {
+        assert_eq!(CertificateVersion::ZkDense.seed_derivation(), SeedDerivation::Legacy);
+        assert_eq!(CertificateVersion::ZkMoe.seed_derivation(), SeedDerivation::Legacy);
+        assert_eq!(CertificateVersion::ZkV3.seed_derivation(), SeedDerivation::Salted);
+    }
+
+    #[test]
     fn unknown_cert_versions_rejected() {
-        for version in [0u32, 3, u32::MAX] {
+        for version in [0u32, 4, u32::MAX] {
             assert!(check_cert_version_eligible(version, &dense_proof()).is_err());
         }
     }

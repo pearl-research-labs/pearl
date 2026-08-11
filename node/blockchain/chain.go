@@ -2225,6 +2225,15 @@ func New(config *Config) (*BlockChain, error) {
 		return nil, AssertError("blockchain.New RankPenaltyForkHeight must not " +
 			"precede MoEForkHeight")
 	}
+	if config.ChainParams.SaltedSeedForkHeight < 0 {
+		return nil, AssertError("blockchain.New SaltedSeedForkHeight must be >= 0")
+	}
+	// V3 supersedes V2, so the salted-seed cutover cannot precede the V2 cutover.
+	if config.ChainParams.SaltedSeedForkHeight != 0 &&
+		config.ChainParams.SaltedSeedForkHeight < config.ChainParams.MoEForkHeight {
+		return nil, AssertError("blockchain.New SaltedSeedForkHeight must not " +
+			"precede MoEForkHeight")
+	}
 
 	// Generate a checkpoint by height map from the provided checkpoints
 	// and assert the provided checkpoints are sorted by height as required.

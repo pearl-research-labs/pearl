@@ -71,6 +71,8 @@ pub struct MiningConfiguration {
     pub moe: Option<MoEConfig>,
 }
 
+pub use crate::api::seed::SeedDerivation;
+
 /// Plaintext public parameters associated with a proof and are required for verification.
 ///
 /// On the wire (`to_wire_bytes` / `from_wire_bytes`) serialized in little-endian:
@@ -82,6 +84,8 @@ pub struct MiningConfiguration {
 #[derive(Debug, Clone)]
 pub struct PublicProofParams {
     pub block_header: IncompleteBlockHeader,
+    /// Noise-seed derivation context (from the certificate version); not on the wire.
+    pub seed_derivation: SeedDerivation,
     pub mining_config: MiningConfiguration,
     // job_key = blake3(block_header || mining_config)
     pub hash_a: Hash256, // blake3(A, key=job_key)

@@ -90,6 +90,7 @@ def test_invalid_submit_plain_proof_params_wrong_type():
         "mining_job": {
             "incomplete_header_bytes": "dGVzdA==",
             "target": 1000,
+            "cert_version": 2,
         },
     }
 
@@ -104,6 +105,7 @@ def test_invalid_submit_plain_proof_params_invalid_base64():
         "mining_job": {
             "incomplete_header_bytes": "dGVzdA==",
             "target": 1000,
+            "cert_version": 2,
         },
     }
 
@@ -118,8 +120,23 @@ def test_invalid_submit_plain_proof_params_negative_target():
         "mining_job": {
             "incomplete_header_bytes": "dGVzdA==",
             "target": -1,  # Should be non-negative
+            "cert_version": 2,
         },
     }
 
     with pytest.raises(fastjsonschema.exceptions.JsonSchemaException):
+        validate_submit_plain_proof(params)
+
+
+def test_invalid_submit_plain_proof_params_missing_cert_version():
+    """A share must state the certificate version it was mined for."""
+    params = {
+        "plain_proof": "dGVzdA==",
+        "mining_job": {
+            "incomplete_header_bytes": "dGVzdA==",
+            "target": 1000,
+        },
+    }
+
+    with pytest.raises(fastjsonschema.exceptions.JsonSchemaException, match="cert_version"):
         validate_submit_plain_proof(params)

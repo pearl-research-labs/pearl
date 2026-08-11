@@ -57,11 +57,21 @@ func (c *CertificateV2) PublicDataBytes() []byte {
 	return c.PublicData[:c.PublicDataLen]
 }
 
+// ProofBytes returns the raw ZK proof bytes.
+func (c *CertificateV2) ProofBytes() []byte {
+	return c.ProofData
+}
+
 // ProofCommitment computes SHA256d(CertificateVersion_LE(4) || PublicData[:PublicDataLen]).
 func (c *CertificateV2) ProofCommitment() chainhash.Hash {
-	publicData := c.PublicDataBytes()
+	return proofCommitment(c.Version(), c.PublicDataBytes())
+}
+
+// proofCommitment computes SHA256d(CertificateVersion_LE(4) || publicData).
+// V3 overrides ProofCommitment to hash version 3 (domain separation from V2).
+func proofCommitment(version CertificateVersion, publicData []byte) chainhash.Hash {
 	buf := make([]byte, 4+len(publicData))
-	binary.LittleEndian.PutUint32(buf[:4], uint32(c.Version()))
+	binary.LittleEndian.PutUint32(buf[:4], uint32(version))
 	copy(buf[4:], publicData)
 	return chainhash.DoubleHashH(buf)
 }

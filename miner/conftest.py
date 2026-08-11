@@ -347,7 +347,11 @@ def _adjust_mining_job_target(
     if bound is None:
         raise ValueError("degenerate mining config in test scaffolding")
     target //= bound
-    return MiningJob(incomplete_header_bytes=incomplete_header_bytes, target=target)
+    return MiningJob(
+        incomplete_header_bytes=incomplete_header_bytes,
+        target=target,
+        cert_version=CertificateVersion.ZK_MOE,
+    )
 
 
 @pytest.fixture
