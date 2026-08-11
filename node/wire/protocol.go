@@ -12,7 +12,7 @@ import (
 
 const (
 	// ProtocolVersion is the latest protocol version this package supports.
-	ProtocolVersion uint32 = 1
+	ProtocolVersion uint32 = 2
 )
 
 const (

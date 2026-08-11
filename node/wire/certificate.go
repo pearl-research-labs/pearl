@@ -96,6 +96,15 @@ type BlockCertificate interface {
 	// SHA256d(CertificateVersion_LE(4) || PublicData)
 	ProofCommitment() chainhash.Hash
 
+	// PublicDataBytes returns the meaningful public data bytes.
+	PublicDataBytes() []byte
+
+	// ProofBytes returns the raw ZK proof bytes.
+	ProofBytes() []byte
+
+	// IsMoE reports whether the certificate carries a MoE proof.
+	IsMoE() bool
+
 	// Serialize writes certificate fields (excludes version - handled by MsgCertificate).
 	Serialize(w io.Writer) error
 
@@ -108,7 +117,12 @@ type BlockCertificate interface {
 
 // IsCertVersionAllowed reports whether certificate version v is permitted.
 func IsCertVersionAllowed(v CertificateVersion) bool {
-	return v == CertificateVersionV1 || v == CertificateVersionV2 || v == CertificateVersionV3
+	switch v {
+	case CertificateVersionV1, CertificateVersionV2, CertificateVersionV3:
+		return true
+	default:
+		return false
+	}
 }
 
 // MsgCertificate wraps a BlockCertificate and handles polymorphic

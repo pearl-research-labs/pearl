@@ -5,7 +5,6 @@ package zkpow
 import (
 	"fmt"
 
-	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
@@ -24,11 +23,7 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 
 func VerifyZKProofFFI(
 	header *wire.BlockHeader,
-	certVersion wire.CertificateVersion,
-	certHash chainhash.Hash,
-	proofCommitment chainhash.Hash,
-	publicData []byte,
-	proofData []byte,
+	cert wire.BlockCertificate,
 	nbitsOverride *uint32,
 ) error {
 	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")

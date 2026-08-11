@@ -543,18 +543,7 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 		return ruleError(ErrDisallowedCertVersion, str)
 	}
 
-	// The remaining rules read V2-layout fields (V3 shares the layout via embedding).
-	var c *wire.CertificateV2
-	switch v := cert.(type) {
-	case *wire.CertificateV2:
-		c = v
-	case *wire.CertificateV3:
-		c = &v.CertificateV2
-	default:
-		return nil
-	}
-
-	if c.IsMoE() && params.IsDenseOnlyForkActive(height) {
+	if cert.IsMoE() && params.IsDenseOnlyForkActive(height) {
 		str := fmt.Sprintf("MoE certificate is not allowed at height %d "+
 			"(dense-only fork active from height %d)",
 			height, params.DenseOnlyForkHeight)
@@ -562,7 +551,7 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 	}
 
 	if params.IsRankPenaltyForkActive(height) && flags&BFNoPoWCheck != BFNoPoWCheck {
-		if err := zkpow.CheckRankPenalty(header.Bits, c.PublicDataBytes()); err != nil {
+		if err := zkpow.CheckRankPenalty(header.Bits, cert.PublicDataBytes()); err != nil {
 			str := fmt.Sprintf("certificate fails the rank penalty rule at "+
 				"height %d (fork active from height %d): %v",
 				height, params.RankPenaltyForkHeight, err)

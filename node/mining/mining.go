@@ -658,9 +658,7 @@ mempoolLoop:
 	var certificate wire.BlockCertificate
 	switch g.chainParams.RequiredCertVersion(nextBlockHeight) {
 	case wire.CertificateVersionV3:
-		cert := &wire.CertificateV3{}
-		cert.Hash = msgBlock.BlockHash()
-		certificate = cert
+		certificate = &wire.CertificateV3{CertificateV2: wire.CertificateV2{Hash: msgBlock.BlockHash()}}
 	case wire.CertificateVersionV2:
 		certificate = &wire.CertificateV2{Hash: msgBlock.BlockHash()}
 	default:
