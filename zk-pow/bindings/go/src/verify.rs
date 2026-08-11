@@ -7,7 +7,7 @@ use std::os::raw::c_char;
 use std::slice;
 
 use crate::common::MAX_ZK_PROOF_SIZE;
-use zk_pow::api::proof::{IncompleteBlockHeader, PublicProofParams, ZKProof};
+use zk_pow::api::proof::{IncompleteBlockHeader, PublicProofParams, SeedDerivation, ZKProof};
 use zk_pow::api::sanity_checks;
 use zk_pow::api::verify;
 
@@ -27,6 +27,7 @@ unsafe fn verify_zk_proof_inner(
     block_header: *const IncompleteBlockHeader,
     zk_proof: *const CZKProof,
     nbits_override: Option<u32>,
+    seed_derivation: SeedDerivation,
     error_msg_out: *mut c_char,
 ) -> i32 {
     // Wrap in catch_unwind to prevent panics from crossing FFI boundary
@@ -58,7 +59,7 @@ unsafe fn verify_zk_proof_inner(
 
         let plonky2_proof = slice::from_raw_parts(zk_proof_ref.proof_blob, zk_proof_ref.proof_blob_len);
         let public_data = &zk_proof_ref.public_data[..zk_proof_ref.public_data_len];
-        let (params, zk_proof) = match ZKProof::deserialize(*block_header, public_data, plonky2_proof) {
+        let (params, zk_proof) = match ZKProof::deserialize(*block_header, seed_derivation, public_data, plonky2_proof) {
             Ok(r) => r,
             Err(e) => {
                 set_error_msg(error_msg_out, &format!("{}", e));
@@ -117,7 +118,7 @@ pub unsafe extern "C" fn verify_zk_proof_v2(
     zk_proof: *const CZKProof,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    verify_zk_proof_inner(block_header, zk_proof, None, error_msg_out)
+    verify_zk_proof_inner(block_header, zk_proof, None, SeedDerivation::Legacy, error_msg_out)
 }
 
 /// Verify a ZK proof against public parameters, overriding the difficulty with the given nbits.
@@ -141,7 +142,40 @@ pub unsafe extern "C" fn verify_zk_proof_v2_with_nbits(
     nbits_override: u32,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    verify_zk_proof_inner(block_header, zk_proof, Some(nbits_override), error_msg_out)
+    verify_zk_proof_inner(
+        block_header,
+        zk_proof,
+        Some(nbits_override),
+        SeedDerivation::Legacy,
+        error_msg_out,
+    )
+}
+
+/// `verify_zk_proof_v2` with the salted (V3) noise-seed derivation.
+#[no_mangle]
+pub unsafe extern "C" fn verify_zk_proof_v3(
+    block_header: *const IncompleteBlockHeader,
+    zk_proof: *const CZKProof,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    verify_zk_proof_inner(block_header, zk_proof, None, SeedDerivation::Salted, error_msg_out)
+}
+
+/// `verify_zk_proof_v3` with the difficulty from `nbits_override`.
+#[no_mangle]
+pub unsafe extern "C" fn verify_zk_proof_v3_with_nbits(
+    block_header: *const IncompleteBlockHeader,
+    zk_proof: *const CZKProof,
+    nbits_override: u32,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    verify_zk_proof_inner(
+        block_header,
+        zk_proof,
+        Some(nbits_override),
+        SeedDerivation::Salted,
+        error_msg_out,
+    )
 }
 
 /// Check wire `public_data` against the rank-penalty rule.

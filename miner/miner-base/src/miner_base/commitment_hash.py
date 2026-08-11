@@ -5,6 +5,27 @@ from pearl_mining import MiningConfiguration
 
 from .matrix_merkle_tree import MatrixMerkleTree
 
+# Domain-separation salts for the V3 (salted noise-seed) certificate derivation:
+SEED_SALT_A = blake3(b"pearl/cert-v3/noise-seed/A").digest()
+SEED_SALT_B = blake3(b"pearl/cert-v3/noise-seed/B").digest()
+
+# root(32) || dim u32 LE(4) || zero padding(28) = one 64-byte BLAKE3 block.
+_BIND_PAD = b"\x00" * 28
+
+
+def _bind_root(merkle_root: bytes, dim: int, salt: bytes) -> bytes:
+    return blake3(merkle_root + dim.to_bytes(4, "little") + _BIND_PAD, key=salt).digest()
+
+
+def bind_root_a(a_merkle_root: bytes, m: int) -> bytes:
+    """V3 salting of A's Merkle root; commits the row count ``m``."""
+    return _bind_root(a_merkle_root, m, SEED_SALT_A)
+
+
+def bind_root_b(b_merkle_root: bytes, n: int) -> bytes:
+    """V3 salting of B's Merkle root; commits the column count ``n``."""
+    return _bind_root(b_merkle_root, n, SEED_SALT_B)
+
 
 class CommitmentHasher:
     """
@@ -60,7 +81,14 @@ class CommitmentHasher:
         *,
         routing_root: bytes | None = None,
         offsets_root: bytes | None = None,
+        salted_dims: tuple[int, int] | None = None,
     ) -> CommitmentHash:
+        # V3 (salted) derivation: salt each root before the MoE routing fold.
+        if salted_dims is not None:
+            m, n = salted_dims
+            A_merkle_root = bind_root_a(A_merkle_root, m)
+            B_merkle_root = bind_root_b(B_merkle_root, n)
+
         moe_args = (routing_root, offsets_root)
         if any(arg is not None for arg in moe_args):
             if any(arg is None for arg in moe_args):

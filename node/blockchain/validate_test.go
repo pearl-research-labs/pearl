@@ -164,8 +164,9 @@ func TestCheckBlockSanity(t *testing.T) {
 		Bits:       chainParams.PowLimitBits,
 	}
 
-	// Mine a valid certificate (only 1 block, so longer ZK proof time is acceptable)
-	cert, err := zkpow.Mine(&header)
+	// Mine a valid certificate (only 1 block, so longer ZK proof time is
+	// acceptable), of the version regtest requires at height 1.
+	cert, err := zkpow.Mine(&header, chainParams.RequiredCertVersion(1))
 	if err != nil {
 		t.Fatalf("Mine failed: %v", err)
 	}

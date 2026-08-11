@@ -140,6 +140,7 @@ func TestNewBlockTemplateForkRulesActive(t *testing.T) {
 		"the network under test must be one that verifies proofs")
 	require.True(t, params.IsMoEForkActive(1))
 	require.True(t, params.IsRankPenaltyForkActive(1))
+	require.True(t, params.IsSaltedSeedForkActive(1))
 
 	generator := newTestGenerator(t, &params)
 
@@ -147,6 +148,7 @@ func TestNewBlockTemplateForkRulesActive(t *testing.T) {
 	require.NoError(t, err,
 		"template generation must survive the rank-penalty fork activation")
 	require.Equal(t, int32(1), template.Height)
-	require.Equal(t, wire.CertificateVersionV2,
-		template.Block.BlockCertificate().Version())
+	require.Equal(t, wire.CertificateVersionV3,
+		template.Block.BlockCertificate().Version(),
+		"regtest requires V3 certificates from genesis")
 }

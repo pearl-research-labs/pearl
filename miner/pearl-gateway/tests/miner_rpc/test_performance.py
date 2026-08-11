@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from bitcoinutils.transactions import Transaction
 from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import BlockTemplate
 from pearl_gateway.config import MinerRpcConfig
 from pearl_gateway.miner_rpc.server import MinerRpcServer
@@ -186,6 +187,7 @@ class RawJsonRpcClient:
             "mining_job": {
                 "incomplete_header_bytes": "AAAAIDhiU/6qm0m0dHuhR3D/4amWtlumgYWBWHROIlcW1ln7CH+YUAYaAOJx8e9+e/LT+8Crf85o3D8eDKcHVk0PLvP3ZF5p//8PHQAAAAAAAAAA",
                 "target": 431358735298270906413161702650018451440568065076682751302691926835200,
+                "cert_version": int(CertificateVersion.ZK_MOE),
             },
         }
 
@@ -316,6 +318,7 @@ async def mock_work_cache():
         coinbase_tx=Transaction.from_raw(
             "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0502a1050101ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000"
         ),
+        required_cert_version=CertificateVersion.ZK_MOE,
     )
 
     await cache.update_template(template)

@@ -4,7 +4,7 @@ use plonky2_field::goldilocks_field::GoldilocksField;
 
 use crate::{
     api::{
-        proof::{IncompleteBlockHeader, PublicProofParams, ZKProof},
+        proof::{IncompleteBlockHeader, PublicProofParams, SeedDerivation, ZKProof},
         proof_utils::{CompiledPublicParams, compute_jackpot_hash, hash_to_u32_field_array},
         sanity_checks::check_jackpot_against_nbits,
     },
@@ -102,9 +102,10 @@ pub fn verify_plain_proof(
     block_header: &IncompleteBlockHeader,
     plain_proof: &PlainProof,
     nbits_override: Option<u32>,
+    seed_derivation: SeedDerivation,
 ) -> Result<()> {
     // Parse the plain proof to get private and public params
-    let (private_params, mut public_params) = plain_proof.parse_proof(*block_header)?;
+    let (private_params, mut public_params) = plain_proof.parse_proof(*block_header, seed_derivation)?;
 
     // Perform public params sanity check
     public_params.sanity_check()?;

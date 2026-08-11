@@ -42,6 +42,16 @@ func testBlockHeader(nbits ...uint32) wire.BlockHeader {
 	}
 }
 
+// mineV2 mines a real V2 certificate and returns its concrete type.
+func mineV2(t *testing.T, header *wire.BlockHeader) *wire.CertificateV2 {
+	t.Helper()
+	cert, err := zkpow.Mine(header, wire.CertificateVersionV2)
+	require.NoError(t, err, "mining should succeed")
+	v2, ok := cert.(*wire.CertificateV2)
+	require.True(t, ok, "mined certificate should be CertificateV2")
+	return v2
+}
+
 // ============================================================================
 // CertificateV1 Tests
 // ============================================================================
@@ -49,11 +59,10 @@ func testBlockHeader(nbits ...uint32) wire.BlockHeader {
 func TestCertificateV2_SerializeDeserialize(t *testing.T) {
 	header := testBlockHeader()
 
-	cert, err := zkpow.Mine(&header)
-	require.NoError(t, err, "mining should succeed")
+	cert := mineV2(t, &header)
 
 	var buf bytes.Buffer
-	err = cert.Serialize(&buf)
+	err := cert.Serialize(&buf)
 	require.NoError(t, err, "serialization should succeed")
 
 	serialized := buf.Bytes()
@@ -73,18 +82,16 @@ func TestCertificateV2_SerializeDeserialize(t *testing.T) {
 func TestCertificateV2_Verify(t *testing.T) {
 	header := testBlockHeader()
 
-	cert, err := zkpow.Mine(&header)
-	require.NoError(t, err, "mining should succeed")
+	cert := mineV2(t, &header)
 
-	err = zkpow.VerifyCertificate(&header, cert)
+	err := zkpow.VerifyCertificate(&header, cert)
 	require.NoError(t, err, "valid CertificateV2 should verify")
 }
 
 func TestCertificateV1_VerifyErrors(t *testing.T) {
 	header := testBlockHeader()
 
-	origCert, err := zkpow.Mine(&header)
-	require.NoError(t, err, "mining should succeed")
+	origCert := mineV2(t, &header)
 
 	createCert := func() *wire.CertificateV2 {
 		proofDataCopy := make([]byte, len(origCert.ProofData))
@@ -151,15 +158,14 @@ func TestCertificateV1_BlockHash(t *testing.T) {
 func TestMsgCertificate_MoE_RoundTrip(t *testing.T) {
 	header := testBlockHeader()
 
-	cert, err := zkpow.Mine(&header)
-	require.NoError(t, err, "mining should succeed")
+	cert := mineV2(t, &header)
 
 	msg := &wire.MsgCertificate{Certificate: cert}
 	require.NotNil(t, msg)
 	require.Equal(t, wire.CertificateVersionV2, msg.Certificate.Version())
 
 	var buf bytes.Buffer
-	err = msg.PrlEncode(&buf, wire.ProtocolVersion)
+	err := msg.PrlEncode(&buf, wire.ProtocolVersion)
 	require.NoError(t, err, "encoding should succeed")
 
 	decoded := &wire.MsgCertificate{}
@@ -170,4 +176,51 @@ func TestMsgCertificate_MoE_RoundTrip(t *testing.T) {
 	decodedMoE, ok := decoded.Certificate.(*wire.CertificateV2)
 	require.True(t, ok, "decoded certificate should be CertificateV2")
 	require.Equal(t, cert.Hash, decodedMoE.Hash)
+}
+
+// ============================================================================
+// CertificateV3 Tests
+// ============================================================================
+
+// TestCertificateV3_MineVerifyRoundTrip mines a real V3 (salted noise-seed)
+// certificate and verifies it, its wire round-trip, and its domain separation
+// from V2.
+func TestCertificateV3_MineVerifyRoundTrip(t *testing.T) {
+	header := testBlockHeader()
+
+	cert, err := zkpow.Mine(&header, wire.CertificateVersionV3)
+	require.NoError(t, err, "V3 mining should succeed")
+	v3, ok := cert.(*wire.CertificateV3)
+	require.True(t, ok, "mined certificate should be CertificateV3")
+	require.Equal(t, wire.CertificateVersionV3, v3.Version())
+
+	require.NoError(t, zkpow.VerifyCertificate(&header, v3),
+		"valid CertificateV3 should verify")
+
+	// The commitment must hash version 3, not the embedded V2's version.
+	require.NotEqual(t, v3.CertificateV2.ProofCommitment(), v3.ProofCommitment(),
+		"V3 proof commitment must be domain-separated from V2")
+
+	// Wire round-trip through MsgCertificate.
+	msg := &wire.MsgCertificate{Certificate: v3}
+	var buf bytes.Buffer
+	require.NoError(t, msg.PrlEncode(&buf, wire.ProtocolVersion))
+	decoded := &wire.MsgCertificate{}
+	require.NoError(t, decoded.PrlDecode(bytes.NewReader(buf.Bytes()), wire.ProtocolVersion))
+	decodedV3, ok := decoded.Certificate.(*wire.CertificateV3)
+	require.True(t, ok, "decoded certificate should be CertificateV3")
+	require.Equal(t, v3.Hash, decodedV3.Hash)
+	require.Equal(t, v3.PublicDataLen, decodedV3.PublicDataLen)
+
+	// A V3 proof re-labeled as V2 must be rejected (salted vs legacy seeds).
+	asV2 := &wire.CertificateV2{
+		PublicDataLen: v3.PublicDataLen,
+		PublicData:    v3.PublicData,
+		ProofData:     v3.ProofData,
+	}
+	relabeledHeader := header
+	relabeledHeader.ProofCommitment = asV2.ProofCommitment()
+	asV2.Hash = relabeledHeader.BlockHash()
+	require.Error(t, zkpow.VerifyCertificate(&relabeledHeader, asV2),
+		"V3 proof must not verify under the legacy (V2) derivation")
 }

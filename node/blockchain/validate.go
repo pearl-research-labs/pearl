@@ -513,7 +513,8 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 // must satisfy:
 //   - Before MoEForkHeight (or with the fork disabled): only V1 accepted
 //   - At and after MoEForkHeight (hardfork): only V2 accepted
-//   - At and after DenseOnlyForkHeight (softfork): V2 certificates must
+//   - At and after SaltedSeedForkHeight (hardfork): only V3 accepted
+//   - At and after DenseOnlyForkHeight (softfork): V2/V3 certificates must
 //     carry a dense (non-MoE) proof
 //   - At and after RankPenaltyForkHeight (softfork): the proof's noise rank
 //     must meet a minimum and its jackpot must meet a difficulty bound scaled
@@ -542,9 +543,14 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 		return ruleError(ErrDisallowedCertVersion, str)
 	}
 
-	// The remaining rules read fields only a V2 certificate has.
-	c, ok := cert.(*wire.CertificateV2)
-	if !ok {
+	// The remaining rules read V2-layout fields (V3 shares the layout via embedding).
+	var c *wire.CertificateV2
+	switch v := cert.(type) {
+	case *wire.CertificateV2:
+		c = v
+	case *wire.CertificateV3:
+		c = &v.CertificateV2
+	default:
 		return nil
 	}
 

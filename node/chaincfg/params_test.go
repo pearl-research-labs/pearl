@@ -135,6 +135,41 @@ func TestMoEForkDisabled(t *testing.T) {
 	}
 }
 
+// TestSaltedSeedForkActivation verifies the strict cutover at the salted
+// noise-seed hardfork activation height: V2 before the fork (with the MoE fork
+// active), V3 at and after it.
+func TestSaltedSeedForkActivation(t *testing.T) {
+	const forkHeight = int32(200)
+	p := Params{MoEForkHeight: 100, SaltedSeedForkHeight: forkHeight}
+
+	tests := []struct {
+		name        string
+		height      int32
+		wantActive  bool
+		wantVersion wire.CertificateVersion
+	}{
+		{"just before fork", forkHeight - 1, false, wire.CertificateVersionV2},
+		{"at fork height", forkHeight, true, wire.CertificateVersionV3},
+		{"after fork height", forkHeight + 1, true, wire.CertificateVersionV3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, p.IsSaltedSeedForkActive(tt.height))
+			require.Equal(t, tt.wantVersion, p.RequiredCertVersion(tt.height))
+		})
+	}
+}
+
+// TestSaltedSeedForkDisabled verifies that a zero SaltedSeedForkHeight disables
+// the fork at every height (the version follows the MoE fork schedule).
+func TestSaltedSeedForkDisabled(t *testing.T) {
+	p := Params{MoEForkHeight: 1, SaltedSeedForkHeight: 0}
+	for _, height := range []int32{1, 100, 1_000_000} {
+		require.False(t, p.IsSaltedSeedForkActive(height))
+		require.Equal(t, wire.CertificateVersionV2, p.RequiredCertVersion(height))
+	}
+}
+
 // TestRankPenaltyForkActivation verifies the activation boundary of the
 // rank-penalty softfork, including the disabled case.
 func TestRankPenaltyForkActivation(t *testing.T) {

@@ -16,7 +16,7 @@ use pearl_blake3::{pad_to_chunk_boundary, MerkleProof, MerkleTree};
 use primitive_types::U256;
 use zk_pow::api::proof::{
     IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern,
-    PublicProofParams, ZKProof,
+    PublicProofParams, SeedDerivation, ZKProof,
 };
 use zk_pow::api::sanity_checks;
 use zk_pow::api::{prove, verify};
@@ -80,14 +80,20 @@ fn acquire_cache() -> PyResult<std::sync::MutexGuard<'static, CircuitCache>> {
         .map_err(|_| py_err("Cache poisoned by prior panic", "restart required"))
 }
 
-#[pyfunction]
-fn generate_proof_v2(
+fn generate_proof_impl(
     block_header: IncompleteBlockHeader,
     plain_proof: PlainProof,
+    seed_derivation: SeedDerivation,
 ) -> PyResult<PyProof> {
     let mut cache = acquire_cache()?;
-    let result = prove::zk_prove_plain_proof(block_header, &plain_proof, &mut cache, true)
-        .map_err(|e| py_err("Prove failed", e))?;
+    let result = prove::zk_prove_plain_proof(
+        block_header,
+        &plain_proof,
+        &mut cache,
+        true,
+        seed_derivation,
+    )
+    .map_err(|e| py_err("Prove failed", e))?;
 
     Ok(PyProof {
         public_data: result.public_data,
@@ -96,9 +102,26 @@ fn generate_proof_v2(
 }
 
 #[pyfunction]
-fn verify_proof_v2(
+fn generate_proof_v2(
+    block_header: IncompleteBlockHeader,
+    plain_proof: PlainProof,
+) -> PyResult<PyProof> {
+    generate_proof_impl(block_header, plain_proof, SeedDerivation::Legacy)
+}
+
+/// V3 proving: same circuits as V2, salted noise-seed derivation.
+#[pyfunction]
+fn generate_proof_v3(
+    block_header: IncompleteBlockHeader,
+    plain_proof: PlainProof,
+) -> PyResult<PyProof> {
+    generate_proof_impl(block_header, plain_proof, SeedDerivation::Salted)
+}
+
+fn verify_proof_impl(
     block_header: IncompleteBlockHeader,
     proof: &PyProof,
+    seed_derivation: SeedDerivation,
 ) -> PyResult<(bool, String)> {
     if !PublicProofParams::is_valid_wire_size(proof.public_data.len()) {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -109,15 +132,36 @@ fn verify_proof_v2(
         )));
     }
 
-    let (params, zk_proof) =
-        ZKProof::deserialize(block_header, &proof.public_data, &proof.proof_data)
-            .map_err(|e| py_err("Deserialize failed", e))?;
+    let (params, zk_proof) = ZKProof::deserialize(
+        block_header,
+        seed_derivation,
+        &proof.public_data,
+        &proof.proof_data,
+    )
+    .map_err(|e| py_err("Deserialize failed", e))?;
 
     let mut cache = acquire_cache()?;
     match verify::verify_block(&params, &zk_proof, &mut cache) {
         Ok(_) => Ok((true, "Verified".into())),
         Err(e) => Ok((false, format!("Rejected: {}", e))),
     }
+}
+
+#[pyfunction]
+fn verify_proof_v2(
+    block_header: IncompleteBlockHeader,
+    proof: &PyProof,
+) -> PyResult<(bool, String)> {
+    verify_proof_impl(block_header, proof, SeedDerivation::Legacy)
+}
+
+/// V3 (salted noise-seed) verification: same circuits and cache as V2.
+#[pyfunction]
+fn verify_proof_v3(
+    block_header: IncompleteBlockHeader,
+    proof: &PyProof,
+) -> PyResult<(bool, String)> {
+    verify_proof_impl(block_header, proof, SeedDerivation::Salted)
 }
 
 #[pyfunction]
@@ -138,6 +182,18 @@ fn warmup_prove_v2(mining_config: MiningConfiguration) -> PyResult<()> {
     prove::warmup_prove(mining_config, &mut cache).map_err(|e| py_err("Warmup prove failed", e))
 }
 
+fn verify_plain_proof_impl(
+    block_header: IncompleteBlockHeader,
+    plain_proof: PlainProof,
+    nbits_override: Option<u32>,
+    seed_derivation: SeedDerivation,
+) -> PyResult<(bool, String)> {
+    match verify::verify_plain_proof(&block_header, &plain_proof, nbits_override, seed_derivation) {
+        Ok(()) => Ok((true, "Mining solution verified successfully".into())),
+        Err(e) => Ok((false, e.to_string())),
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (block_header, plain_proof, nbits_override=None))]
 fn verify_plain_proof_v2(
@@ -145,10 +201,28 @@ fn verify_plain_proof_v2(
     plain_proof: PlainProof,
     nbits_override: Option<u32>,
 ) -> PyResult<(bool, String)> {
-    match verify::verify_plain_proof(&block_header, &plain_proof, nbits_override) {
-        Ok(()) => Ok((true, "Mining solution verified successfully".into())),
-        Err(e) => Ok((false, e.to_string())),
-    }
+    verify_plain_proof_impl(
+        block_header,
+        plain_proof,
+        nbits_override,
+        SeedDerivation::Legacy,
+    )
+}
+
+/// V3 (salted noise-seed) plain-proof verification.
+#[pyfunction]
+#[pyo3(signature = (block_header, plain_proof, nbits_override=None))]
+fn verify_plain_proof_v3(
+    block_header: IncompleteBlockHeader,
+    plain_proof: PlainProof,
+    nbits_override: Option<u32>,
+) -> PyResult<(bool, String)> {
+    verify_plain_proof_impl(
+        block_header,
+        plain_proof,
+        nbits_override,
+        SeedDerivation::Salted,
+    )
 }
 
 #[pyfunction]
@@ -177,8 +251,16 @@ fn penalized_target_bound<'py>(
     Ok(Some(bound_int))
 }
 
+/// Map a certificate version to its noise-seed derivation (errors on unknown versions).
+fn seed_derivation_for(cert_version: u32) -> PyResult<SeedDerivation> {
+    Ok(CertificateVersion::try_from(cert_version)
+        .map_err(value_err)?
+        .seed_derivation())
+}
+
 #[pyfunction]
-#[pyo3(signature = (m, n, k, block_header, mining_config, signal_range=None, wrong_jackpot_hash=false))]
+#[pyo3(signature = (m, n, k, block_header, mining_config, signal_range=None, wrong_jackpot_hash=false, *, cert_version))]
+#[allow(clippy::too_many_arguments)]
 fn mine(
     m: usize,
     n: usize,
@@ -187,6 +269,7 @@ fn mine(
     mining_config: MiningConfiguration,
     signal_range: Option<(i8, i8)>,
     wrong_jackpot_hash: bool,
+    cert_version: u32,
 ) -> PyResult<PlainProof> {
     ffi_mine(
         m,
@@ -196,12 +279,14 @@ fn mine(
         mining_config,
         signal_range,
         wrong_jackpot_hash,
+        seed_derivation_for(cert_version)?,
     )
     .map_err(|e| py_err("Mining failed", e))
 }
 
 #[pyfunction]
-#[pyo3(signature = (m, n, k, block_header, mining_config, signal_range=None, wrong_jackpot_hash=false))]
+#[pyo3(signature = (m, n, k, block_header, mining_config, signal_range=None, wrong_jackpot_hash=false, *, cert_version))]
+#[allow(clippy::too_many_arguments)]
 fn mine_moe(
     m: usize,
     n: usize,
@@ -210,6 +295,7 @@ fn mine_moe(
     mining_config: MiningConfiguration,
     signal_range: Option<(i8, i8)>,
     wrong_jackpot_hash: bool,
+    cert_version: u32,
 ) -> PyResult<PlainProof> {
     // Both `e` and `top_k` are committed in `mining_config` (via its `moe` field), so
     // the caller selects GROUPED_GEMM by passing a config with `moe` set.
@@ -221,6 +307,7 @@ fn mine_moe(
         mining_config,
         signal_range,
         wrong_jackpot_hash,
+        seed_derivation_for(cert_version)?,
     )
     .map_err(|e| py_err("MoE mining failed", e))
 }
@@ -363,6 +450,7 @@ fn generate_proof_for_cert_version(
     match core_check_cert_version_eligible(cert_version, &plain_proof).map_err(value_err)? {
         CertificateVersion::ZkDense => generate_proof_v1(block_header, plain_proof),
         CertificateVersion::ZkMoe => generate_proof_v2(block_header, plain_proof),
+        CertificateVersion::ZkV3 => generate_proof_v3(block_header, plain_proof),
     }
 }
 
@@ -376,6 +464,7 @@ fn verify_proof_for_cert_version(
     match CertificateVersion::try_from(cert_version).map_err(value_err)? {
         CertificateVersion::ZkDense => verify_proof_v1(block_header, proof),
         CertificateVersion::ZkMoe => verify_proof_v2(block_header, proof),
+        CertificateVersion::ZkV3 => verify_proof_v3(block_header, proof),
     }
 }
 
@@ -393,6 +482,9 @@ fn verify_plain_proof_for_cert_version(
         }
         CertificateVersion::ZkMoe => {
             verify_plain_proof_v2(block_header, plain_proof, nbits_override)
+        }
+        CertificateVersion::ZkV3 => {
+            verify_plain_proof_v3(block_header, plain_proof, nbits_override)
         }
     }
 }
@@ -450,6 +542,10 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(verify_plain_proof_v2, m)?)?;
     m.add_function(wrap_pyfunction!(clear_circuit_cache_v2, m)?)?;
     m.add_function(wrap_pyfunction!(warmup_prove_v2, m)?)?;
+    // V3 functions (same circuits as V2; salted noise-seed derivation)
+    m.add_function(wrap_pyfunction!(generate_proof_v3, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_proof_v3, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_plain_proof_v3, m)?)?;
     // V1 functions (legacy circuit; dense proofs only)
     m.add(
         "V1_PUBLICDATA_SIZE",
@@ -463,6 +559,7 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     // Certificate-version dispatchers (recommended entry points)
     m.add("CERT_VERSION_ZK_DENSE", CertificateVersion::ZkDense as u32)?;
     m.add("CERT_VERSION_ZK_MOE", CertificateVersion::ZkMoe as u32)?;
+    m.add("CERT_VERSION_ZK_V3", CertificateVersion::ZkV3 as u32)?;
     m.add_function(wrap_pyfunction!(py_check_cert_version_eligible, m)?)?;
     m.add_function(wrap_pyfunction!(generate_proof_for_cert_version, m)?)?;
     m.add_function(wrap_pyfunction!(verify_proof_for_cert_version, m)?)?;

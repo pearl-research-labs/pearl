@@ -2,10 +2,10 @@
 
 use std::os::raw::c_char;
 
-use zk_pow::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern};
+use zk_pow::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, SeedDerivation};
 use zk_pow::api::prove;
 use zk_pow::ffi::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
-use zk_pow::ffi::plain_proof::PlainProof;
+use zk_pow::ffi::plain_proof::{CertificateVersion, PlainProof};
 
 use crate::common::{catch_panic, copy_prove_result, set_error_msg, zk_prove, CZKProof, MIN_NOISE_RANK};
 
@@ -78,6 +78,8 @@ pub unsafe extern "C" fn default_mining_config(
 
 /// Perform mining and generate a standard (non-MoE) ZK proof in one step.
 ///
+/// `cert_version` (from the node's `RequiredCertVersion`) selects the noise-seed derivation.
+///
 /// # Returns
 /// - 0: Mining and proof generation successful
 /// - 1: Invalid input
@@ -91,22 +93,31 @@ pub unsafe extern "C" fn default_mining_config(
 pub unsafe extern "C" fn mine(
     m: u32,
     n: u32,
+    cert_version: u32,
     block_header: *const IncompleteBlockHeader,
     mining_config: *const [u8; crate::common::MINING_CONFIG_SERIALIZED_SIZE],
     zk_proof_out: *mut CZKProof,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    mine_inner(block_header, mining_config, zk_proof_out, error_msg_out, |header, config| {
-        ffi_mine(
-            m as usize,
-            n as usize,
-            config.common_dim as usize,
-            header,
-            config,
-            None,
-            false,
-        )
-    })
+    mine_inner(
+        cert_version,
+        block_header,
+        mining_config,
+        zk_proof_out,
+        error_msg_out,
+        |header, config, seed_derivation| {
+            ffi_mine(
+                m as usize,
+                n as usize,
+                config.common_dim as usize,
+                header,
+                config,
+                None,
+                false,
+                seed_derivation,
+            )
+        },
+    )
 }
 
 /// Perform MoE mining and generate a ZK proof in one step.
@@ -122,26 +133,36 @@ pub unsafe extern "C" fn mine(
 /// - `error_msg_out` must be null or a valid pointer to a caller-allocated buffer of `ERROR_MSG_MAX_SIZE` bytes
 ///
 /// `e` and `top_k` are read from the serialized `mining_config` trailer (committed in the job_key).
+/// `cert_version` selects the noise-seed derivation (see `mine`).
 #[no_mangle]
 pub unsafe extern "C" fn mine_moe(
     m: u32,
     n: u32,
+    cert_version: u32,
     block_header: *const IncompleteBlockHeader,
     mining_config: *const [u8; crate::common::MINING_CONFIG_SERIALIZED_SIZE],
     zk_proof_out: *mut CZKProof,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    mine_inner(block_header, mining_config, zk_proof_out, error_msg_out, |header, config| {
-        ffi_mine_moe(
-            m as usize,
-            n as usize,
-            config.common_dim as usize,
-            header,
-            config,
-            None,
-            false,
-        )
-    })
+    mine_inner(
+        cert_version,
+        block_header,
+        mining_config,
+        zk_proof_out,
+        error_msg_out,
+        |header, config, seed_derivation| {
+            ffi_mine_moe(
+                m as usize,
+                n as usize,
+                config.common_dim as usize,
+                header,
+                config,
+                None,
+                false,
+                seed_derivation,
+            )
+        },
+    )
 }
 
 // ============================================================================
@@ -164,16 +185,25 @@ fn build_default_config(e: u16, top_k: u16) -> anyhow::Result<MiningConfiguratio
 /// Parses the mining config, validates pointers, calls the provided mining
 /// closure, then copies the result into `zk_proof_out`.
 unsafe fn mine_inner(
+    cert_version: u32,
     block_header: *const IncompleteBlockHeader,
     mining_config: *const [u8; crate::common::MINING_CONFIG_SERIALIZED_SIZE],
     zk_proof_out: *mut CZKProof,
     error_msg_out: *mut c_char,
-    do_mine: impl FnOnce(IncompleteBlockHeader, MiningConfiguration) -> anyhow::Result<PlainProof>,
+    do_mine: impl FnOnce(IncompleteBlockHeader, MiningConfiguration, SeedDerivation) -> anyhow::Result<PlainProof>,
 ) -> i32 {
     if block_header.is_null() || mining_config.is_null() || zk_proof_out.is_null() {
         set_error_msg(error_msg_out, "Null pointer");
         return 2;
     }
+
+    let seed_derivation = match CertificateVersion::try_from(cert_version) {
+        Ok(v) => v.seed_derivation(),
+        Err(e) => {
+            set_error_msg(error_msg_out, &format!("Invalid cert version: {}", e));
+            return 2;
+        }
+    };
 
     let config = match MiningConfiguration::from_bytes(&*mining_config) {
         Ok(c) => c,
@@ -190,7 +220,9 @@ unsafe fn mine_inner(
         return 2;
     }
 
-    let result = match mine_and_prove(error_msg_out, header, || do_mine(header, config)) {
+    let result = match mine_and_prove(error_msg_out, header, seed_derivation, || {
+        do_mine(header, config, seed_derivation)
+    }) {
         Some(r) => r,
         None => return 2,
     };
@@ -208,6 +240,7 @@ unsafe fn mine_inner(
 unsafe fn mine_and_prove(
     error_msg_out: *mut c_char,
     header: IncompleteBlockHeader,
+    seed_derivation: SeedDerivation,
     mine_fn: impl FnOnce() -> anyhow::Result<PlainProof>,
 ) -> Option<prove::ProveResult> {
     let proof = match catch_panic(mine_fn) {
@@ -222,5 +255,5 @@ unsafe fn mine_and_prove(
         }
     };
 
-    zk_prove(error_msg_out, header, &proof)
+    zk_prove(error_msg_out, header, &proof, seed_derivation)
 }

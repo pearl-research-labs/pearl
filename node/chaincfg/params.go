@@ -273,6 +273,13 @@ type Params struct {
 	// noise rank (enforced in blockchain.New).
 	RankPenaltyForkHeight int32
 
+	// SaltedSeedForkHeight is the block height at which the salted noise-seed
+	// hardfork activates: at and after it blocks must carry a V3 certificate
+	// (wire.CertificateVersionV3). A value of 0 disables the fork.
+	//
+	// Must not activate before MoEForkHeight: V3 supersedes V2.
+	SaltedSeedForkHeight int32
+
 	// Mempool parameters
 	RelayNonStdTxs bool
 
@@ -310,11 +317,20 @@ func (p *Params) IsRankPenaltyForkActive(height int32) bool {
 	return p.RankPenaltyForkHeight != 0 && height >= p.RankPenaltyForkHeight
 }
 
+// IsSaltedSeedForkActive reports whether the salted noise-seed hardfork is active
+// at the given block height. The fork is disabled when SaltedSeedForkHeight is 0.
+func (p *Params) IsSaltedSeedForkActive(height int32) bool {
+	return p.SaltedSeedForkHeight != 0 && height >= p.SaltedSeedForkHeight
+}
+
 // RequiredCertVersion returns the block certificate version that a block at the
-// given height must use under the strict MoE hardfork cutover: the V2
-// certificate at and after the activation height, the V1 certificate before it
-// (and always, when the fork is disabled).
+// given height must use under the strict hardfork cutovers: V3 at and after the
+// salted noise-seed fork, V2 at and after the MoE fork, V1 before both (and
+// always, when the forks are disabled).
 func (p *Params) RequiredCertVersion(height int32) wire.CertificateVersion {
+	if p.IsSaltedSeedForkActive(height) {
+		return wire.CertificateVersionV3
+	}
 	if p.IsMoEForkActive(height) {
 		return wire.CertificateVersionV2
 	}
@@ -351,6 +367,8 @@ var MainNetParams = Params{
 	DenseOnlyForkHeight: 91630,
 
 	RankPenaltyForkHeight: 96251,
+
+	SaltedSeedForkHeight: 98830,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: []Checkpoint{
@@ -432,6 +450,9 @@ var RegressionNetParams = Params{
 
 	// Active from genesis because regtest verifies proofs.
 	RankPenaltyForkHeight: 1,
+
+	// Salted noise-seed (V3) fork active from genesis.
+	SaltedSeedForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &regTestGenesisBlock,
@@ -541,6 +562,8 @@ var TestNetParams = Params{
 
 	RankPenaltyForkHeight: 36761,
 
+	SaltedSeedForkHeight: 38648,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
@@ -635,6 +658,8 @@ var TestNet2Params = Params{
 
 	RankPenaltyForkHeight: 80627,
 
+	SaltedSeedForkHeight: 83109,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
@@ -714,6 +739,9 @@ var SimNetParams = Params{
 	// MoE hardfork active from genesis on local test networks so the gateway's
 	// V2 (MoE) certificates are accepted at every mined height.
 	MoEForkHeight: 1,
+
+	// Salted noise-seed (V3) fork active from genesis.
+	SaltedSeedForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &simNetGenesisBlock,

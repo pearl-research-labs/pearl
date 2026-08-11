@@ -50,7 +50,7 @@ class BlockTemplate:
     raw_transactions: list[bytes]
     coinbase_tx: Transaction
     # Certificate version this block must carry under the crossover cutover.
-    required_cert_version: CertificateVersion = CertificateVersion.ZK_MOE
+    required_cert_version: CertificateVersion
 
     @classmethod
     def from_get_block_template(
@@ -179,8 +179,8 @@ class MiningJob:
 
     incomplete_header_bytes: bytes
     target: int
-    # Certificate version required for this block;
-    cert_version: CertificateVersion = CertificateVersion.ZK_MOE
+    # Certificate version required for this block.
+    cert_version: CertificateVersion
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
