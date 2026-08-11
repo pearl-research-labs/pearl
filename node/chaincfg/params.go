@@ -368,7 +368,7 @@ var MainNetParams = Params{
 
 	RankPenaltyForkHeight: 96251,
 
-	SaltedSeedForkHeight: 98830,
+	SaltedSeedForkHeight: 98900,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: []Checkpoint{
