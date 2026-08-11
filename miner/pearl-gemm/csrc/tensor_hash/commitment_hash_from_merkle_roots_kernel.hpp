@@ -177,7 +177,10 @@ class CommitmentHashFromMerkleRootsKernel {
       rBlock(i) = root[i];
       out(i) = salt[i];
     }
-    rBlock(blake3::CHAINING_VALUE_SIZE_U32) = dim;
+    // Local copy: passing the host constexpr straight into the tensor's
+    // const-ref operator() ODR-uses it, which nvcc rejects in device code.
+    constexpr int kDimWordIdx = blake3::CHAINING_VALUE_SIZE_U32;
+    rBlock(kDimWordIdx) = dim;
     blake3::compress_msg_block_u32(rBlock, out,
                                    blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
   }
