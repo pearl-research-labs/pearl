@@ -23,7 +23,7 @@ from the V2 (MoE) ZK certificate to the new V3 (salted noise-seed) certificate.
 
 ---
 
-## Step 1: Upgrade your node to v1.4.0
+## Step 1: Upgrade your node to v1.4.1
 
 Safe to do at any time before the fork. The node stays fully compatible with V2 blocks
 and shares until the fork height.
