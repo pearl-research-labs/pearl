@@ -3,10 +3,11 @@
 Pearl is doing a hard fork. At a fixed block height (the **fork height**), blocks switch
 from the V2 (MoE) ZK certificate to the new V3 (salted noise-seed) certificate.
 
-| Network | Fork height (`SaltedSeedForkHeight`) |
-| ------- | ------------------------------------ |
-| Testnet | TBD                                  |
-| Mainnet | TBD                                  |
+| Network  | Fork height (`SaltedSeedForkHeight`) |
+| -------- | ------------------------------------ |
+| Mainnet  | `98900`                              |
+| Testnet  | `38648`                              |
+| Testnet2 | `83109`                              |
 
 **The short version:**
 
