@@ -177,8 +177,8 @@ class CommitmentHashFromMerkleRootsKernel {
       rBlock(i) = root[i];
       out(i) = salt[i];
     }
-    constexpr int kDimWordIdx = blake3::CHAINING_VALUE_SIZE_U32;
-    rBlock(kDimWordIdx) = dim;
+    // Int<> index: any odr-use of the host constexpr trips nvcc in device code.
+    rBlock(Int<blake3::CHAINING_VALUE_SIZE_U32>{}) = dim;
     blake3::compress_msg_block_u32(rBlock, out,
                                    blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
   }
