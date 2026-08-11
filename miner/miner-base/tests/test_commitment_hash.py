@@ -28,7 +28,9 @@ class TestCommitmentHasher:
         A = torch.randint(-128, 127, (8, 8), dtype=torch.int8)
         B = torch.randint(-128, 127, (8, 8), dtype=torch.int8)
 
-        result = CommitmentHasher.commitment_hash(A, B, incomplete_header_bytes, mining_config)
+        result = CommitmentHasher.commitment_hash(
+            A, B, incomplete_header_bytes, mining_config, salted_dims=None
+        )
 
         assert isinstance(result, CommitmentHash)
         assert len(result.noise_seed_A) == 32
@@ -39,8 +41,12 @@ class TestCommitmentHasher:
         A = torch.randint(-128, 127, (8, 8), dtype=torch.int8)
         B = torch.randint(-128, 127, (8, 8), dtype=torch.int8)
 
-        result1 = CommitmentHasher.commitment_hash(A, B, incomplete_header_bytes, mining_config)
-        result2 = CommitmentHasher.commitment_hash(A, B, incomplete_header_bytes, mining_config)
+        result1 = CommitmentHasher.commitment_hash(
+            A, B, incomplete_header_bytes, mining_config, salted_dims=None
+        )
+        result2 = CommitmentHasher.commitment_hash(
+            A, B, incomplete_header_bytes, mining_config, salted_dims=None
+        )
 
         assert result1 == result2
 
@@ -50,8 +56,12 @@ class TestCommitmentHasher:
         A = torch.zeros((8, 8), dtype=torch.int8)
         B = torch.ones((8, 8), dtype=torch.int8)
 
-        result1 = CommitmentHasher.commitment_hash(A, B, incomplete_header_bytes, mining_config)
-        result2 = CommitmentHasher.commitment_hash(B, A, incomplete_header_bytes, mining_config)
+        result1 = CommitmentHasher.commitment_hash(
+            A, B, incomplete_header_bytes, mining_config, salted_dims=None
+        )
+        result2 = CommitmentHasher.commitment_hash(
+            B, A, incomplete_header_bytes, mining_config, salted_dims=None
+        )
 
         assert result1 != result2
 
@@ -62,14 +72,14 @@ class TestCommitmentHasher:
         tensor_1d = torch.randint(-128, 127, (8,), dtype=torch.int8)
         with pytest.raises(ValueError, match="Expected 2D tensor"):
             CommitmentHasher.commitment_hash(
-                tensor_1d, tensor_1d, incomplete_header_bytes, mining_config
+                tensor_1d, tensor_1d, incomplete_header_bytes, mining_config, salted_dims=None
             )
 
         # 3D tensor
         tensor_3d = torch.randint(-128, 127, (8, 8, 3), dtype=torch.int8)
         with pytest.raises(ValueError, match="Expected 2D tensor"):
             CommitmentHasher.commitment_hash(
-                tensor_3d, tensor_3d, incomplete_header_bytes, mining_config
+                tensor_3d, tensor_3d, incomplete_header_bytes, mining_config, salted_dims=None
             )
 
 
@@ -115,6 +125,7 @@ class TestSaltedSeedDerivation:
             root_a,
             root_b,
             job_key,
+            salted_dims=None,
         )
         assert (
             result.noise_seed_B.hex()
@@ -175,6 +186,7 @@ class TestSaltedSeedDerivation:
             bind_root_a(root_a, matrix_rows),
             bind_root_b(root_b, matrix_columns),
             job_key,
+            salted_dims=None,
             **moe_roots,
         )
         salted = CommitmentHasher.commitment_hash_from_merkle_roots(
