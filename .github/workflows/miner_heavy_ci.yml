@@ -93,9 +93,6 @@ jobs:
       - name: Build Docker image
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
-          # Build the approved checkout above. Without this the action uses the
-          # Git context, which on pull_request_target is the base branch, so the
-          # job never tested PR code.
           context: .
           file: ./miner/vllm-miner/Dockerfile
           push: false
