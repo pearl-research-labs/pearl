@@ -41,10 +41,12 @@ const MinNoiseRank = C.MIN_NOISE_RANK
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
 	switch c := cert.(type) {
+	case *wire.CertificateV3:
+		return verifyCertificateV3(header, c)
+	case *wire.CertificateV2:
+		return verifyCertificateV2(header, c)
 	case *wire.CertificateV1:
 		return verifyCertificateV1(header, c)
-	case *wire.CertificateV2, *wire.CertificateV3:
-		return VerifyZKProofFFI(header, cert, nil)
 	default:
 		return fmt.Errorf("unknown certificate type: %T", cert)
 	}
@@ -100,6 +102,14 @@ func verifyCertificateV1(header *wire.BlockHeader, c *wire.CertificateV1) error 
 // ================================================================================
 // V2/V3 CERTIFICATE VERIFICATION
 // ================================================================================
+
+func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error {
+	return VerifyZKProofFFI(header, c, nil)
+}
+
+func verifyCertificateV3(header *wire.BlockHeader, c *wire.CertificateV3) error {
+	return VerifyZKProofFFI(header, c, nil)
+}
 
 // VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.
 func VerifyZKProofFFI(
