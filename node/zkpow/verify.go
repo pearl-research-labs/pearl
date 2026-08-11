@@ -21,7 +21,6 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
