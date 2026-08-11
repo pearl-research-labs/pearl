@@ -8,6 +8,7 @@ from pearl_gateway.comm.dataclasses import (
 )
 from pearl_gateway.comm.mining_configuration import PearlMiningConfigurationFactory
 from pearl_mining import PENALTY_BASE_RANK
+from pydantic import ValidationError
 
 
 class TestMiningJob:
@@ -147,7 +148,7 @@ class TestBlockTemplateCertVersion:
     ):
         from pearl_gateway.rpc_types import GetBlockTemplateResponse
 
-        for version in (CertificateVersion.ZK_DENSE, CertificateVersion.ZK_MOE):
+        for version in CertificateVersion:
             data = {**sample_block_template_data, "requiredcertversion": int(version)}
             template = BlockTemplate.from_get_block_template(
                 GetBlockTemplateResponse.model_validate(data),
@@ -171,3 +172,13 @@ class TestBlockTemplateCertVersion:
             mining_address=mining_address,
         )
         assert template.required_cert_version == CertificateVersion.ZK_DENSE
+
+    def test_unknown_required_cert_version_is_rejected(self, sample_block_template_data):
+        """A version this build has no derivation for must fail loudly rather than
+        be mined under the wrong one."""
+        from pearl_gateway.rpc_types import GetBlockTemplateResponse
+
+        unknown = max(CertificateVersion) + 1
+        data = {**sample_block_template_data, "requiredcertversion": unknown}
+        with pytest.raises(ValidationError):
+            GetBlockTemplateResponse.model_validate(data)
