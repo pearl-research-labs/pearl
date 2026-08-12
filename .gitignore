@@ -183,6 +183,9 @@ simnet_data
 .cursor
 .aider*
 
+# OpenCode (OhMyOpenCode) work plans/state
+.omo/
+
 # Library .lock file
 miner/blake3-utils/*.lock
 
