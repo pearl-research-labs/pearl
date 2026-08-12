@@ -8,6 +8,7 @@ import { useWalletStore } from '../store/walletStore';
 import { getErrorMessage } from '../lib/utils';
 import { parseSeedInput } from '../lib/seed-input';
 import PasswordStrength from './create-wallet/PasswordStrength';
+import { setActiveWalletName, setSessionWalletSeed } from '../services/wallet-seed';
 
 type ImportStep = 'seed-input' | 'passphrase-setup';
 
@@ -121,8 +122,14 @@ export default function ImportAccount() {
         password: passphrase,
       });
 
+      setSessionWalletSeed(walletName, normalizedSeed || seed.trim());
+      setActiveWalletName(walletName);
+
       try {
-        await window.appBridge.wallet.unlockWallet(passphrase, 3600);
+        const result = await window.appBridge.wallet.unlockWallet(passphrase, 3600);
+        if (result.seed) {
+          setSessionWalletSeed(walletName, result.seed);
+        }
       } catch (unlockError) {
         console.warn('⚠️ Could not unlock wallet after import:', unlockError);
       }

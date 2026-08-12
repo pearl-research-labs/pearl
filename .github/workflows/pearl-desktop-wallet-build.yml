@@ -1,0 +1,153 @@
+name: Pearl Desktop Wallet Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+  PNPM_VERSION: '8.15.6'
+  GO_VERSION: '1.26.1'
+  APP_DIR: 'apps/apps/pearl-desktop-wallet'
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            goos: linux
+            bin_name: oyster-linux-x64
+            electron_build_cmd: pnpm run build:linux
+            artifact_name: pearl-wallet-linux
+            artifact_glob: apps/apps/pearl-desktop-wallet/dist/*.deb
+          - name: macOS Intel
+            os: macos-15-intel
+            goos: darwin
+            bin_name: oyster-darwin-x64
+            electron_build_cmd: pnpm run build:mac
+            artifact_name: pearl-wallet-macos-x64
+            artifact_glob: apps/apps/pearl-desktop-wallet/dist/*.dmg
+          - name: macOS ARM
+            os: macos-15
+            goos: darwin
+            bin_name: oyster-darwin-arm64
+            electron_build_cmd: pnpm run build:mac
+            artifact_name: pearl-wallet-macos-arm64
+            artifact_glob: apps/apps/pearl-desktop-wallet/dist/*-arm64.dmg
+          - name: Windows
+            os: windows-latest
+            goos: windows
+            bin_name: oyster-windows-x64
+            electron_build_cmd: pnpm run build:win
+            artifact_name: pearl-wallet-windows
+            artifact_glob: apps/apps/pearl-desktop-wallet/dist/*.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go and Rust
+        uses: ./.github/actions/setup
+
+      - name: Add Rust GNU target (Windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Build Go binaries
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+        run: |
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            export CARGO_BUILD_TARGET=x86_64-pc-windows-gnu
+          fi
+          task build:blockchain
+
+      - name: Copy oyster binary to Electron app
+        shell: bash
+        run: |
+          mkdir -p "${{ env.APP_DIR }}/bin"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cp ./bin/oyster.exe "${{ env.APP_DIR }}/bin/${{ matrix.bin_name }}.exe"
+          else
+            cp ./bin/oyster "${{ env.APP_DIR }}/bin/${{ matrix.bin_name }}"
+          fi
+          ls -lh "${{ env.APP_DIR }}/bin/"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0 # v6.0.7
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: apps/pnpm-lock.yaml
+
+      - name: Install workspace dependencies
+        working-directory: apps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Electron app
+        working-directory: ${{ env.APP_DIR }}
+        run: ${{ matrix.electron_build_cmd }}
+
+      - name: Verify Linux output
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          test -n "$(find "${{ env.APP_DIR }}/dist" -maxdepth 1 -name '*.deb' -print -quit)" || {
+            echo "Missing Linux installer"
+            ls -lah "${{ env.APP_DIR }}/dist"
+            exit 1
+          }
+
+      - name: Verify macOS output
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ls -lah "${{ env.APP_DIR }}/dist"
+          test -n "$(find "${{ env.APP_DIR }}/dist" -maxdepth 1 -name '*.dmg' -print -quit)" || {
+            echo "Missing macOS installer"
+            exit 1
+          }
+
+      - name: Verify Windows output
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          DIST: ${{ env.APP_DIR }}/dist
+        run: |
+          $exe = Get-ChildItem $env:DIST -Filter *.exe | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "Missing Windows installer"
+            Get-ChildItem $env:DIST | Format-Table Name, Length
+            exit 1
+          }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_glob }}
+          if-no-files-found: error
