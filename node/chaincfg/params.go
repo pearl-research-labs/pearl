@@ -370,9 +370,20 @@ var MainNetParams = Params{
 
 	SaltedSeedForkHeight: 99000,
 
-	// Checkpoints ordered from oldest to newest.
+	// Checkpoints ordered from oldest to newest, one per 10000 blocks.
+	// Add the next multiple once it is at least CheckpointConfirmations
+	// deep; denser checkpoints cap how much headers-first sync progress a
+	// peer disconnect can throw away.
 	Checkpoints: []Checkpoint{
+		{10000, newHashFromStr("a3c196fb1c3f7837bbebd69b98fc451d88d48083af98c318c78486d7f1888490")},
+		{20000, newHashFromStr("513270b25c6d538f38b26ecdc014f2a809639ec7ebd3c09e4685675311420273")},
+		{30000, newHashFromStr("fd61132c2ad6c22fa48a8df483bc6b885c12ceeb3fe0a9fa55eb5beb849fac7b")},
+		{40000, newHashFromStr("35aac0e2a1e7f2d54924d584cf423b56f0d72d6770ee8365dc1667dbb5b5b320")},
 		{50000, newHashFromStr("608f32e5390b2ae964c986a53e1be10ba4a640f3ccecf96d6b7838e06cb517ff")},
+		{60000, newHashFromStr("5a7f0590c3a89099b2d0f1509d2186c73bc3d8e2e4a60e7ce4ec236856900dad")},
+		{70000, newHashFromStr("281a3469d55226bb9e1b3ccee06eeb923177817b4cdead75131074b171b215c1")},
+		{80000, newHashFromStr("69d40caca39b3c04ee55589d13cd1c5c546a3eb8712a3367840c5f67ab707cfc")},
+		{90000, newHashFromStr("0738b30bb353820a4f97331d805d134de4321a5fc5c8b2955988e7291a0c8562")},
 	},
 
 	// Consensus rule change deployments.

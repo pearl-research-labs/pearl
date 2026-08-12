@@ -37,8 +37,10 @@ const (
 	DefaultTrickleInterval = 10 * time.Second
 
 	// MinAcceptableProtocolVersion is the lowest protocol version that a
-	// connected peer may support.
-	MinAcceptableProtocolVersion = 1
+	// connected peer may support. Raise it only after a protocol upgrade
+	// activates; raising it together with wire.ProtocolVersion would
+	// disconnect not-yet-upgraded peers that still share our chain.
+	MinAcceptableProtocolVersion = 2
 
 	// outputBufferSize is the number of elements the output channels use.
 	outputBufferSize = 50
