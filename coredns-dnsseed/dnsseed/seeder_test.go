@@ -27,9 +27,10 @@ const secondListenerPort = "12345"
 // pre-fork wire protocol version.
 const preforkListenerPort = "12346"
 
-// compliantBlockHeight is the chain height the compliant mock peers report,
-// comfortably above any network checkpoint height.
-const compliantBlockHeight = 80000
+// compliantBlockHeight is the chain height the compliant mock peers report.
+// Derived from the mainnet checkpoints, which are the highest of any
+// network, so it stays above every height gate as checkpoints are added.
+var compliantBlockHeight = latestCheckpointHeight(&chaincfg.MainNetParams) + 1000
 
 func newestBlockFn(height int32) peer.HashFunc {
 	return func() (*chainhash.Hash, int32, error) {
