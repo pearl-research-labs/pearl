@@ -108,10 +108,11 @@ func startMockPeers() error {
 	return nil
 }
 
-// newTestSeeder creates a seeder that allows self-connections for testing.
+// newTestSeeder creates a seeder with the default protocol floor that allows
+// self-connections for testing.
 func newTestSeeder(t *testing.T, networkName string) *seeder {
 	t.Helper()
-	s, err := newSeeder(networkName)
+	s, err := newSeeder(networkName, peer.MinAcceptableProtocolVersion)
 	require.NoError(t, err)
 	s.config.AllowSelfConns = true
 	return s
@@ -132,7 +133,7 @@ func expireCooldown(ab *addressBook, pk peerKey) {
 }
 
 func TestNewSeederRejectsUnknownNetwork(t *testing.T) {
-	_, err := newSeeder("fakenet")
+	_, err := newSeeder("fakenet", peer.MinAcceptableProtocolVersion)
 	require.ErrorContains(t, err, "unknown network")
 }
 
@@ -312,26 +313,30 @@ func TestBootstrapBypassesCooldown(t *testing.T) {
 
 func TestSeederMeetsMinimum(t *testing.T) {
 	// MainNetParams defines a checkpoint, so the height gate is active.
-	s, err := newSeeder("mainnet")
+	s, err := newSeeder("mainnet", peer.MinAcceptableProtocolVersion)
 	require.NoError(t, err)
 
 	minHeight := latestCheckpointHeight(s.config.ChainParams)
+	pver := int32(wire.ProtocolVersion)
 
 	tests := []struct {
 		name      string
+		pver      int32
 		services  wire.ServiceFlag
 		lastBlock int32
 		want      bool
 	}{
-		{"compliant", requiredServices, compliantBlockHeight, true},
-		{"exactly minimum height", requiredServices, minHeight, true},
-		{"low height", requiredServices, minHeight - 1, false},
-		{"missing network service", wire.SFNodeP2PV2, compliantBlockHeight, false},
-		{"missing p2pv2 service", wire.SFNodeNetwork, compliantBlockHeight, false},
+		{"compliant", pver, requiredServices, compliantBlockHeight, true},
+		{"exactly minimum height", pver, requiredServices, minHeight, true},
+		{"exactly minimum protocol", peer.MinAcceptableProtocolVersion, requiredServices, compliantBlockHeight, true},
+		{"below minimum protocol", peer.MinAcceptableProtocolVersion - 1, requiredServices, compliantBlockHeight, false},
+		{"low height", pver, requiredServices, minHeight - 1, false},
+		{"missing network service", pver, wire.SFNodeP2PV2, compliantBlockHeight, false},
+		{"missing p2pv2 service", pver, wire.SFNodeNetwork, compliantBlockHeight, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ok, reason := s.meetsMinimum(tt.services, tt.lastBlock)
+			ok, reason := s.meetsMinimum(tt.pver, tt.services, tt.lastBlock)
 			require.Equal(t, tt.want, ok, "reason: %s", reason)
 		})
 	}
@@ -340,12 +345,32 @@ func TestSeederMeetsMinimum(t *testing.T) {
 // TestSeederMeetsMinimumHeightGateDisabled verifies that networks without a
 // checkpoint (e.g. regtest) impose no height gate.
 func TestSeederMeetsMinimumHeightGateDisabled(t *testing.T) {
-	s, err := newSeeder("regtest")
+	s, err := newSeeder("regtest", peer.MinAcceptableProtocolVersion)
 	require.NoError(t, err)
 	require.Zero(t, latestCheckpointHeight(s.config.ChainParams))
 
-	ok, reason := s.meetsMinimum(requiredServices, 0)
+	ok, reason := s.meetsMinimum(int32(wire.ProtocolVersion), requiredServices, 0)
 	require.True(t, ok, "reason: %s", reason)
+}
+
+// TestConfiguredProtocolFloorRejectsPeer verifies that a floor configured
+// above the library default is enforced by the serving policy: a peer
+// speaking today's protocol fails the handshake against a seeder configured
+// for a future version.
+func TestConfiguredProtocolFloorRejectsPeer(t *testing.T) {
+	s, err := newSeeder("regtest", wire.ProtocolVersion+1)
+	require.NoError(t, err)
+	s.config.AllowSelfConns = true
+	ctx := context.Background()
+	defer s.disconnectAllPeers()
+
+	compliantPeer := peerKey("127.0.0.1:" + regtestPort)
+	_, err = s.connect(ctx, compliantPeer)
+	require.Error(t, err, "seeder must reject a peer below the configured floor")
+
+	assert.Nil(t, s.livePeer(compliantPeer),
+		"below-floor peer must not enter the live peer set")
+	require.Zero(t, s.peerCount(), "below-floor peer must not be served")
 }
 
 // TestRejectsPreForkProtocolPeer verifies that a peer advertising a wire

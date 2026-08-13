@@ -54,6 +54,7 @@ dnsseed {
     network NETWORK
     bootstrap_peers PEER...
     crawl_interval DURATION
+    min_protocol_version VERSION
 }
 ~~~
 
@@ -63,6 +64,14 @@ dnsseed {
   to join the P2P network. Unreachable peers are retried every 30 seconds.
 * `crawl_interval` **DURATION** - how often to re-crawl the network.
   Defaults to `15m`.
+* `min_protocol_version` **VERSION** - the lowest wire protocol version
+  served. Defaults to the node's own peering floor
+  (`peer.MinAcceptableProtocolVersion`); values below it are rejected since
+  such peers cannot complete the handshake anyway. Raise it during a protocol
+  upgrade window to stop handing pre-upgrade peers to bootstrapping nodes
+  before the node floor rises. CoreDNS substitutes environment variables in
+  the Corefile, so the floor can be set per deployment with
+  `min_protocol_version {$SEEDER_MIN_PROTOCOL_VERSION}`.
 
 ## Metrics
 

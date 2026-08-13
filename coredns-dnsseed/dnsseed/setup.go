@@ -3,12 +3,15 @@ package dnsseed
 import (
 	"context"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
 	clog "github.com/coredns/coredns/plugin/pkg/log"
+
+	"github.com/pearl-research-labs/pearl/node/peer"
 )
 
 const pluginName = "dnsseed"
@@ -28,9 +31,10 @@ var log = clog.NewWithPlugin(pluginName)
 func init() { plugin.Register(pluginName, setup) }
 
 type options struct {
-	networkName    string
-	updateInterval time.Duration
-	bootstrapPeers []string
+	networkName        string
+	updateInterval     time.Duration
+	bootstrapPeers     []string
+	minProtocolVersion uint32
 }
 
 // setup validates configuration and registers the plugin. It performs no
@@ -44,7 +48,7 @@ func setup(c *caddy.Controller) error {
 		return err
 	}
 
-	s, err := newSeeder(opts.networkName)
+	s, err := newSeeder(opts.networkName, opts.minProtocolVersion)
 	if err != nil {
 		return plugin.Error(pluginName, err)
 	}
@@ -130,7 +134,8 @@ func runCrawl(ctx context.Context, name string, s *seeder) {
 
 func parse(c *caddy.Controller) (*options, error) {
 	opts := &options{
-		updateInterval: defaultUpdateInterval,
+		updateInterval:     defaultUpdateInterval,
+		minProtocolVersion: peer.MinAcceptableProtocolVersion,
 	}
 	c.Next() // skip "dnsseed"
 
@@ -156,6 +161,23 @@ func parse(c *caddy.Controller) (*options, error) {
 				return nil, plugin.Error(pluginName, c.SyntaxErr("bad crawl_interval duration"))
 			}
 			opts.updateInterval = interval
+
+		case "min_protocol_version":
+			if !c.NextArg() {
+				return nil, plugin.Error(pluginName, c.SyntaxErr("no minimum protocol version specified"))
+			}
+			pver, err := strconv.ParseUint(c.Val(), 10, 32)
+			if err != nil {
+				return nil, plugin.Error(pluginName, c.SyntaxErr("bad min_protocol_version number"))
+			}
+			// The peer library refuses handshakes below its own floor,
+			// so a lower serving floor could never match a peer.
+			if pver < peer.MinAcceptableProtocolVersion {
+				return nil, plugin.Error(pluginName,
+					c.Errf("min_protocol_version %d below the peer library floor %d",
+						pver, uint32(peer.MinAcceptableProtocolVersion)))
+			}
+			opts.minProtocolVersion = uint32(pver)
 
 		case "bootstrap_peers":
 			bootstrap := c.RemainingArgs()

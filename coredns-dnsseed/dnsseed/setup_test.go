@@ -1,15 +1,19 @@
 package dnsseed
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/coredns/caddy"
+	"github.com/pearl-research-labs/pearl/node/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestParse(t *testing.T) {
+	minProtoAboveFloor := strconv.Itoa(peer.MinAcceptableProtocolVersion + 1)
+
 	tests := []struct {
 		name      string
 		config    string
@@ -17,6 +21,7 @@ func TestParse(t *testing.T) {
 		network   string
 		interval  time.Duration
 		bootstrap []string
+		minProto  uint32
 	}{
 		{
 			name:   "bare dnsseed",
@@ -110,6 +115,30 @@ func TestParse(t *testing.T) {
 			config: "dnsseed {\n  network mainnet\n  min_client_version 1.2.0\n}",
 			valid:  false,
 		},
+		{
+			name:      "min_protocol_version above library floor accepted",
+			config:    "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version " + minProtoAboveFloor + "\n}",
+			valid:     true,
+			network:   "mainnet",
+			interval:  defaultUpdateInterval,
+			bootstrap: []string{"127.0.0.1:44108"},
+			minProto:  peer.MinAcceptableProtocolVersion + 1,
+		},
+		{
+			name:   "min_protocol_version without value rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version\n}",
+			valid:  false,
+		},
+		{
+			name:   "non-numeric min_protocol_version rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version two\n}",
+			valid:  false,
+		},
+		{
+			name:   "min_protocol_version below library floor rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version 0\n}",
+			valid:  false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -126,6 +155,10 @@ func TestParse(t *testing.T) {
 			assert.Equal(t, tt.network, opts.networkName)
 			assert.Equal(t, tt.interval, opts.updateInterval)
 			assert.Equal(t, tt.bootstrap, opts.bootstrapPeers)
+			if tt.minProto == 0 {
+				tt.minProto = peer.MinAcceptableProtocolVersion
+			}
+			assert.Equal(t, tt.minProto, opts.minProtocolVersion)
 		})
 	}
 }

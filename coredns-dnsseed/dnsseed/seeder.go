@@ -47,15 +47,17 @@ var (
 	errHandshakeTimeout = errors.New("peer handshake timed out")
 )
 
-// DNS seed serving policy. Peers must carry the required service bits to be
-// served; non-compliant peers are rejected during the version handshake and
-// never enter the live peer set or the served address book. The wire
-// protocol floor is inherited from the peer library
-// (peer.MinAcceptableProtocolVersion), which fails the handshake before a
-// peer could be booked. The minimum chain height is derived per-network from
-// the latest checkpoint (see latestCheckpointHeight), which also weeds out
-// nodes stranded on a pre-fork chain. Every value is self-reported, so the
-// policy is bootstrap hygiene, not consensus enforcement.
+// DNS seed serving policy. Peers must carry the required service bits and
+// speak at least the configured wire protocol version to be served;
+// non-compliant peers are rejected during the version handshake and never
+// enter the live peer set or the served address book. The protocol floor
+// defaults to peer.MinAcceptableProtocolVersion and is raised per deployment
+// via the min_protocol_version directive (values below the library floor are
+// unsatisfiable: the handshake fails before policy runs). The minimum chain
+// height is derived per-network from the latest checkpoint (see
+// latestCheckpointHeight), which also weeds out nodes stranded on a pre-fork
+// chain. Every value is self-reported, so the policy is bootstrap hygiene,
+// not consensus enforcement.
 const requiredServices = wire.SFNodeNetwork | wire.SFNodeP2PV2
 
 // latestCheckpointHeight returns the height of the network's most recent
@@ -106,6 +108,8 @@ type pendingHandshake struct {
 type seeder struct {
 	config *peer.Config
 
+	minProtocolVersion uint32
+
 	// peersMu guards pending and livePeers. A single mutex covers both
 	// because onVerAck atomically promotes a peer from pending to live,
 	// and it is the arbiter of the handshake-completed-versus-failed race
@@ -118,8 +122,9 @@ type seeder struct {
 	addrQueue chan peerKey
 }
 
-// newSeeder creates a seeder configured for the given network name.
-func newSeeder(networkName string) (*seeder, error) {
+// newSeeder creates a seeder for the given network name that serves peers
+// speaking at least minProtocolVersion.
+func newSeeder(networkName string, minProtocolVersion uint32) (*seeder, error) {
 	params, err := networkParams(networkName)
 	if err != nil {
 		return nil, err
@@ -128,11 +133,12 @@ func newSeeder(networkName string) (*seeder, error) {
 	cfg.ChainParams = params
 
 	s := &seeder{
-		config:    &cfg,
-		pending:   make(map[peerKey]*pendingHandshake),
-		livePeers: make(map[peerKey]*peer.Peer),
-		addrBook:  newAddressBook(params.DefaultPort),
-		addrQueue: make(chan peerKey, addrQueueBufferSize),
+		config:             &cfg,
+		minProtocolVersion: minProtocolVersion,
+		pending:            make(map[peerKey]*pendingHandshake),
+		livePeers:          make(map[peerKey]*peer.Peer),
+		addrBook:           newAddressBook(params.DefaultPort),
+		addrQueue:          make(chan peerKey, addrQueueBufferSize),
 	}
 
 	s.config.Listeners.OnVersion = s.onVersion
@@ -143,15 +149,20 @@ func newSeeder(networkName string) (*seeder, error) {
 }
 
 // meetsMinimum reports whether a peer satisfies the DNS seed serving policy:
-// it must advertise all required service bits and report a chain height of
-// at least the network's latest checkpoint. The returned string explains the
-// failure and is suitable for logging.
+// it must advertise all required service bits, speak at least the configured
+// wire protocol version, and report a chain height of at least the network's
+// latest checkpoint. The returned string explains the failure and is
+// suitable for logging.
 func (s *seeder) meetsMinimum(
-	services wire.ServiceFlag, lastBlock int32) (bool, string) {
+	pver int32, services wire.ServiceFlag, lastBlock int32) (bool, string) {
 
 	if !services.HasFlag(requiredServices) {
 		return false, fmt.Sprintf("services %s missing required %s",
 			services, requiredServices)
+	}
+	if uint32(pver) < s.minProtocolVersion {
+		return false, fmt.Sprintf("protocol version %d below minimum %d",
+			pver, s.minProtocolVersion)
 	}
 	if minHeight := latestCheckpointHeight(s.config.ChainParams); minHeight > 0 && lastBlock < minHeight {
 		return false, fmt.Sprintf("reported height %d below minimum %d",
@@ -328,7 +339,7 @@ func (s *seeder) promotePeer(pk peerKey, p *peer.Peer) bool {
 // verack, so non-compliant nodes never enter the live peer set or the served
 // address book, and we never request addresses from them.
 func (s *seeder) onVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgReject {
-	if ok, reason := s.meetsMinimum(msg.Services, msg.LastBlock); !ok {
+	if ok, reason := s.meetsMinimum(msg.ProtocolVersion, msg.Services, msg.LastBlock); !ok {
 		log.Infof("Rejecting deprecated peer %s: %s", p.Addr(), reason)
 		return wire.NewMsgReject(msg.Command(), wire.RejectObsolete, reason)
 	}
