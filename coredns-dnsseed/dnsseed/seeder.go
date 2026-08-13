@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/pearl-research-labs/pearl/node/addrmgr"
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/peer"
@@ -520,33 +522,29 @@ func (s *seeder) requestAddresses(ctx context.Context) {
 	wg.Wait()
 }
 
-// refreshAddresses re-verifies all known-good addresses. Verified peers
-// tolerate up to maxFailures consecutive failures before entering cooldown
-// (see addressBook.markFailed).
+// refreshAddresses re-verifies all known-good addresses, dialing up to
+// crawlerWorkerCount peers concurrently. Verified peers tolerate up to
+// maxFailures consecutive failures before entering cooldown (see
+// addressBook.markFailed).
 func (s *seeder) refreshAddresses(ctx context.Context) {
 	log.Debugf("Refreshing address book")
 
-	refreshQueue := s.addrBook.enqueueAddrs()
-	if len(refreshQueue) == 0 {
-		return
-	}
-
-	var wg sync.WaitGroup
-	for range crawlerWorkerCount {
-		wg.Go(func() {
-			for next := range refreshQueue {
-				if ctx.Err() != nil {
-					return
-				}
-				pk := next.asPeerKey()
-				_, err := s.connect(ctx, pk)
-				if err != nil && !errors.Is(err, errRepeatConnection) && ctx.Err() == nil {
-					s.addrBook.markFailed(pk)
-				}
+	var g errgroup.Group
+	g.SetLimit(crawlerWorkerCount)
+	for _, next := range s.addrBook.snapshot() {
+		g.Go(func() error {
+			if ctx.Err() != nil {
+				return nil
 			}
+			pk := next.asPeerKey()
+			_, err := s.connect(ctx, pk)
+			if err != nil && !errors.Is(err, errRepeatConnection) && ctx.Err() == nil {
+				s.addrBook.markFailed(pk)
+			}
+			return nil
 		})
 	}
-	wg.Wait()
+	g.Wait()
 }
 
 // ready reports whether the seeder has at least one servable address. The

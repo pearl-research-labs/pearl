@@ -186,17 +186,16 @@ func (ab *addressBook) pruneCooldown() {
 	})
 }
 
-// enqueueAddrs returns a closed, buffered channel containing all known-good
-// addresses. Consumers can safely range over it.
-func (ab *addressBook) enqueueAddrs() <-chan *address {
+// snapshot returns a copy of all known-good addresses, so callers can
+// iterate them without holding the book lock.
+func (ab *addressBook) snapshot() []*address {
 	ab.mu.RLock()
 	defer ab.mu.RUnlock()
-	ch := make(chan *address, len(ab.peers))
+	addrs := make([]*address, 0, len(ab.peers))
 	for _, v := range ab.peers {
-		ch <- v
+		addrs = append(addrs, v)
 	}
-	close(ch)
-	return ch
+	return addrs
 }
 
 // shuffleAddressList returns up to n IPv4 or IPv6 addresses, uniformly
