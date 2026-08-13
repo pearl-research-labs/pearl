@@ -4,6 +4,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -32,24 +33,24 @@ type address struct {
 	failures int
 }
 
-func (a *address) String() string {
+func (a address) String() string {
 	return net.JoinHostPort(a.ip.String(), strconv.Itoa(int(a.port)))
 }
 
-func (a *address) asPeerKey() peerKey {
+func (a address) asPeerKey() peerKey {
 	return peerKey(a.String())
 }
 
-func addressFromPeerKey(s peerKey) (*address, error) {
+func addressFromPeerKey(s peerKey) (address, error) {
 	host, portString, err := net.SplitHostPort(s.String())
 	if err != nil {
-		return nil, err
+		return address{}, err
 	}
 	port, err := strconv.ParseUint(portString, 10, 16)
 	if err != nil {
-		return nil, err
+		return address{}, err
 	}
-	return &address{ip: net.ParseIP(host), port: uint16(port)}, nil
+	return address{ip: net.ParseIP(host), port: uint16(port)}, nil
 }
 
 // addressBook tracks known-good peer addresses and a failure cooldown set.
@@ -59,7 +60,7 @@ type addressBook struct {
 	defaultPort uint16
 
 	mu    sync.RWMutex
-	peers map[peerKey]*address
+	peers map[peerKey]address
 
 	// failedAt maps addresses that recently failed verification to the
 	// failure time; they are not re-dialed until failureCooldown elapses.
@@ -77,7 +78,7 @@ func newAddressBook(defaultPort string) *addressBook {
 	port, _ := strconv.ParseUint(defaultPort, 10, 16)
 	return &addressBook{
 		defaultPort: uint16(port),
-		peers:       make(map[peerKey]*address),
+		peers:       make(map[peerKey]address),
 		failedAt:    make(map[peerKey]time.Time),
 	}
 }
@@ -127,6 +128,7 @@ func (ab *addressBook) markFailed(pk peerKey) {
 	if addr, ok := ab.peers[pk]; ok {
 		addr.failures++
 		if addr.failures < maxFailures {
+			ab.peers[pk] = addr
 			return
 		}
 		delete(ab.peers, pk)
@@ -141,8 +143,9 @@ func (ab *addressBook) touch(pk peerKey) bool {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
 	addr, ok := ab.peers[pk]
-	if ok {
+	if ok && addr.failures != 0 {
 		addr.failures = 0
+		ab.peers[pk] = addr
 	}
 	return ok
 }
@@ -188,14 +191,10 @@ func (ab *addressBook) pruneCooldown() {
 
 // snapshot returns a copy of all known-good addresses, so callers can
 // iterate them without holding the book lock.
-func (ab *addressBook) snapshot() []*address {
+func (ab *addressBook) snapshot() []address {
 	ab.mu.RLock()
 	defer ab.mu.RUnlock()
-	addrs := make([]*address, 0, len(ab.peers))
-	for _, v := range ab.peers {
-		addrs = append(addrs, v)
-	}
-	return addrs
+	return slices.Collect(maps.Values(ab.peers))
 }
 
 // shuffleAddressList returns up to n IPv4 or IPv6 addresses, uniformly
