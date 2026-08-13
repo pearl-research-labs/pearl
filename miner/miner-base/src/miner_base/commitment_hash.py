@@ -43,6 +43,8 @@ class CommitmentHasher:
         B: torch.Tensor,
         incomplete_header_bytes: bytes,
         mining_config: MiningConfiguration,
+        *,
+        salted_dims: tuple[int, int] | None,
     ) -> CommitmentHash:
         key = cls.get_key(incomplete_header_bytes, mining_config)
         merkle_tree_A = MatrixMerkleTree(A, key)
@@ -50,7 +52,9 @@ class CommitmentHasher:
         # We hash B.T because we would like to expose a column strip of B
         merkle_tree_B = MatrixMerkleTree(B.T, key)
 
-        return cls.commitment_hash_from_merkle_roots(merkle_tree_A.root, merkle_tree_B.root, key)
+        return cls.commitment_hash_from_merkle_roots(
+            merkle_tree_A.root, merkle_tree_B.root, key, salted_dims=salted_dims
+        )
 
     @staticmethod
     def get_commitment_B_key(key: bytes, B_merkle_root: bytes) -> bytes:
@@ -81,8 +85,10 @@ class CommitmentHasher:
         *,
         routing_root: bytes | None = None,
         offsets_root: bytes | None = None,
-        salted_dims: tuple[int, int] | None = None,
+        salted_dims: tuple[int, int] | None,
     ) -> CommitmentHash:
+        # salted_dims has no default so callers must choose a derivation explicitly:
+        # (m, n) for V3 salted seeds, None for the legacy (V1/V2) chain.
         # V3 (salted) derivation: salt each root before the MoE routing fold.
         if salted_dims is not None:
             m, n = salted_dims
