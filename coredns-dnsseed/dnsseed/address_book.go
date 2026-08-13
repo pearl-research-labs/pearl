@@ -4,6 +4,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"sync"
@@ -26,48 +27,24 @@ const (
 	failureCooldown = 3 * time.Hour
 )
 
-// address is a booked peer address with its consecutive-failure count.
-type address struct {
-	ip       net.IP
-	port     uint16
-	failures int
-}
-
-func (a address) String() string {
-	return net.JoinHostPort(a.ip.String(), strconv.Itoa(int(a.port)))
-}
-
-func (a address) asPeerKey() peerKey {
-	return peerKey(a.String())
-}
-
-func addressFromPeerKey(s peerKey) (address, error) {
-	host, portString, err := net.SplitHostPort(s.String())
-	if err != nil {
-		return address{}, err
-	}
-	port, err := strconv.ParseUint(portString, 10, 16)
-	if err != nil {
-		return address{}, err
-	}
-	return address{ip: net.ParseIP(host), port: uint16(port)}, nil
-}
-
 // addressBook tracks known-good peer addresses and a failure cooldown set.
 // Only peers on the network's default port are booked as good, because DNS
 // answers cannot carry a port.
 type addressBook struct {
 	defaultPort uint16
 
-	mu    sync.RWMutex
-	peers map[peerKey]address
+	mu sync.RWMutex
+
+	// peers maps each booked address to its consecutive-failure count.
+	peers map[netip.AddrPort]int
 
 	// failedAt maps addresses that recently failed verification to the
 	// failure time; they are not re-dialed until failureCooldown elapses.
-	failedAt map[peerKey]time.Time
+	failedAt map[netip.AddrPort]time.Time
 
 	// v4 and v6 are the servable IPs per address family, rebuilt on every
 	// good-set mutation so the DNS hot path never scans or copies the book.
+	// They are net.IP because that is the form DNS answers carry.
 	v4, v6 []net.IP
 }
 
@@ -78,8 +55,8 @@ func newAddressBook(defaultPort string) *addressBook {
 	port, _ := strconv.ParseUint(defaultPort, 10, 16)
 	return &addressBook{
 		defaultPort: uint16(port),
-		peers:       make(map[peerKey]address),
-		failedAt:    make(map[peerKey]time.Time),
+		peers:       make(map[netip.AddrPort]int),
+		failedAt:    make(map[netip.AddrPort]time.Time),
 	}
 }
 
@@ -87,33 +64,30 @@ func newAddressBook(defaultPort string) *addressBook {
 // held whenever the good set changes.
 func (ab *addressBook) rebuildServable() {
 	ab.v4, ab.v6 = ab.v4[:0], ab.v6[:0]
-	for _, addr := range ab.peers {
-		if addr.ip.To4() != nil {
-			ab.v4 = append(ab.v4, addr.ip)
+	for addr := range ab.peers {
+		ip := net.IP(addr.Addr().AsSlice())
+		if addr.Addr().Is4() {
+			ab.v4 = append(ab.v4, ip)
 		} else {
-			ab.v6 = append(ab.v6, addr.ip)
+			ab.v6 = append(ab.v6, ip)
 		}
 	}
 }
 
 // add books a peer. Peers on non-default ports are skipped, and the book is
 // capped at maxAddressBookSize.
-func (ab *addressBook) add(pk peerKey) {
-	addr, err := addressFromPeerKey(pk)
-	if err != nil {
-		return
-	}
+func (ab *addressBook) add(addr netip.AddrPort) {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
-	if addr.port != ab.defaultPort || len(ab.peers) >= maxAddressBookSize {
+	if addr.Port() != ab.defaultPort || len(ab.peers) >= maxAddressBookSize {
 		return
 	}
-	ab.peers[pk] = addr
+	ab.peers[addr] = 0
 	// A booked peer is verified, so any cooldown record (e.g. from a
 	// bootstrap dial while cooling down) is obsolete. Left in place it
 	// would make connect refuse the peer on the next refresh and strike
 	// it right back out of the book.
-	delete(ab.failedAt, pk)
+	delete(ab.failedAt, addr)
 	ab.rebuildServable()
 }
 
@@ -121,31 +95,30 @@ func (ab *addressBook) add(pk peerKey) {
 // peers tolerate up to maxFailures consecutive failures before they stop
 // being served and enter cooldown; unverified gossiped addresses enter
 // cooldown immediately.
-func (ab *addressBook) markFailed(pk peerKey) {
+func (ab *addressBook) markFailed(addr netip.AddrPort) {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
 
-	if addr, ok := ab.peers[pk]; ok {
-		addr.failures++
-		if addr.failures < maxFailures {
-			ab.peers[pk] = addr
+	if failures, ok := ab.peers[addr]; ok {
+		failures++
+		if failures < maxFailures {
+			ab.peers[addr] = failures
 			return
 		}
-		delete(ab.peers, pk)
+		delete(ab.peers, addr)
 		ab.rebuildServable()
 	}
-	ab.failedAt[pk] = time.Now()
+	ab.failedAt[addr] = time.Now()
 }
 
 // touch marks a successful re-verification of a booked peer, resetting its
 // failure counter, and reports whether the peer was found in the book.
-func (ab *addressBook) touch(pk peerKey) bool {
+func (ab *addressBook) touch(addr netip.AddrPort) bool {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
-	addr, ok := ab.peers[pk]
-	if ok && addr.failures != 0 {
-		addr.failures = 0
-		ab.peers[pk] = addr
+	failures, ok := ab.peers[addr]
+	if ok && failures != 0 {
+		ab.peers[addr] = 0
 	}
 	return ok
 }
@@ -159,22 +132,22 @@ func (ab *addressBook) count() int {
 
 // isKnown reports whether the peer is booked or in un-expired cooldown.
 // Known peers are not re-dialed by the gossip crawl.
-func (ab *addressBook) isKnown(pk peerKey) bool {
+func (ab *addressBook) isKnown(addr netip.AddrPort) bool {
 	ab.mu.RLock()
 	defer ab.mu.RUnlock()
-	if _, good := ab.peers[pk]; good {
+	if _, good := ab.peers[addr]; good {
 		return true
 	}
-	failed, ok := ab.failedAt[pk]
+	failed, ok := ab.failedAt[addr]
 	return ok && time.Since(failed) < failureCooldown
 }
 
 // isCoolingDown reports whether the peer failed verification less than
 // failureCooldown ago.
-func (ab *addressBook) isCoolingDown(pk peerKey) bool {
+func (ab *addressBook) isCoolingDown(addr netip.AddrPort) bool {
 	ab.mu.RLock()
 	defer ab.mu.RUnlock()
-	failed, ok := ab.failedAt[pk]
+	failed, ok := ab.failedAt[addr]
 	return ok && time.Since(failed) < failureCooldown
 }
 
@@ -184,17 +157,17 @@ func (ab *addressBook) isCoolingDown(pk peerKey) bool {
 func (ab *addressBook) pruneCooldown() {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
-	maps.DeleteFunc(ab.failedAt, func(_ peerKey, failed time.Time) bool {
+	maps.DeleteFunc(ab.failedAt, func(_ netip.AddrPort, failed time.Time) bool {
 		return time.Since(failed) >= failureCooldown
 	})
 }
 
-// snapshot returns a copy of all known-good addresses, so callers can
-// iterate them without holding the book lock.
-func (ab *addressBook) snapshot() []address {
+// snapshot returns all known-good addresses, so callers can iterate them
+// without holding the book lock.
+func (ab *addressBook) snapshot() []netip.AddrPort {
 	ab.mu.RLock()
 	defer ab.mu.RUnlock()
-	return slices.Collect(maps.Values(ab.peers))
+	return slices.Collect(maps.Keys(ab.peers))
 }
 
 // shuffleAddressList returns up to n IPv4 or IPv6 addresses, uniformly

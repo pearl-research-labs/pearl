@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"testing"
 	"time"
@@ -31,6 +32,13 @@ const preforkListenerPort = "12346"
 // Derived from the mainnet checkpoints, which are the highest of any
 // network, so it stays above every height gate as checkpoints are added.
 var compliantBlockHeight = latestCheckpointHeight(&chaincfg.MainNetParams) + 1000
+
+// Addresses of the three mock peers.
+var (
+	compliantAddr = netip.MustParseAddrPort("127.0.0.1:" + regtestPort)
+	secondAddr    = netip.MustParseAddrPort("127.0.0.1:" + secondListenerPort)
+	preforkAddr   = netip.MustParseAddrPort("127.0.0.1:" + preforkListenerPort)
+)
 
 func newestBlockFn(height int32) peer.HashFunc {
 	return func() (*chainhash.Hash, int32, error) {
@@ -118,18 +126,18 @@ func newTestSeeder(t *testing.T, networkName string) *seeder {
 	return s
 }
 
-// livePeer returns the live peer for pk, or nil if there is none.
-func (s *seeder) livePeer(pk peerKey) *peer.Peer {
+// livePeer returns the live peer at addr, or nil if there is none.
+func (s *seeder) livePeer(addr netip.AddrPort) *peer.Peer {
 	s.peersMu.Lock()
 	defer s.peersMu.Unlock()
-	return s.livePeers[pk]
+	return s.livePeers[addr]
 }
 
 // expireCooldown backdates a cooldown entry so the peer is dialable again.
-func expireCooldown(ab *addressBook, pk peerKey) {
+func expireCooldown(ab *addressBook, addr netip.AddrPort) {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
-	ab.failedAt[pk] = time.Now().Add(-failureCooldown)
+	ab.failedAt[addr] = time.Now().Add(-failureCooldown)
 }
 
 func TestNewSeederRejectsUnknownNetwork(t *testing.T) {
@@ -141,16 +149,15 @@ func TestOutboundPeerSync(t *testing.T) {
 	s := newTestSeeder(t, "regtest")
 	ctx := context.Background()
 
-	_, err := s.connect(ctx, peerKey("127.0.0.1:"+regtestPort))
+	_, err := s.connect(ctx, compliantAddr)
 	require.NoError(t, err)
 
-	pk := peerKey("127.0.0.1:" + regtestPort)
-	p := s.livePeer(pk)
+	p := s.livePeer(compliantAddr)
 	require.NotNil(t, p)
 	assert.True(t, p.Connected())
 
-	s.disconnectPeer(pk)
-	assert.Nil(t, s.livePeer(pk))
+	s.disconnectPeer(compliantAddr)
+	assert.Nil(t, s.livePeer(compliantAddr))
 }
 
 func TestOutboundPeerAsync(t *testing.T) {
@@ -160,7 +167,7 @@ func TestOutboundPeerAsync(t *testing.T) {
 	errs := make(chan error, 4)
 	for range 4 {
 		go func() {
-			_, err := s.connect(ctx, peerKey("127.0.0.1:"+regtestPort))
+			_, err := s.connect(ctx, compliantAddr)
 			errs <- err
 		}()
 	}
@@ -170,12 +177,11 @@ func TestOutboundPeerAsync(t *testing.T) {
 		}
 	}
 
-	pk := peerKey("127.0.0.1:" + regtestPort)
-	p := s.livePeer(pk)
+	p := s.livePeer(compliantAddr)
 	require.NotNil(t, p)
 	assert.True(t, p.Connected())
 
-	_, err := s.connect(ctx, peerKey("127.0.0.1:"+regtestPort))
+	_, err := s.connect(ctx, compliantAddr)
 	assert.ErrorIs(t, err, errRepeatConnection)
 
 	s.disconnectAllPeers()
@@ -186,9 +192,8 @@ func TestBootstrap(t *testing.T) {
 	ctx := context.Background()
 	defer s.disconnectAllPeers()
 
-	peerAddr := "127.0.0.1:" + regtestPort
-	assert.True(t, s.bootstrap(ctx, []string{peerAddr}))
-	assert.True(t, s.addrBook.isKnown(peerKey(peerAddr)),
+	assert.True(t, s.bootstrap(ctx, []string{compliantAddr.String()}))
+	assert.True(t, s.addrBook.isKnown(compliantAddr),
 		"bootstrap peer must be booked after the handshake")
 }
 
@@ -211,14 +216,14 @@ func TestVerAckBooksOnlyDefaultPortPeers(t *testing.T) {
 
 	require.False(t, s.ready(), "empty seeder must not be ready")
 
-	_, err := s.connect(ctx, peerKey("127.0.0.1:"+regtestPort))
+	_, err := s.connect(ctx, compliantAddr)
 	require.NoError(t, err)
-	assert.True(t, s.addrBook.isKnown(peerKey("127.0.0.1:"+regtestPort)))
+	assert.True(t, s.addrBook.isKnown(compliantAddr))
 	assert.True(t, s.ready(), "one servable address must make the seeder ready")
 
-	_, err = s.connect(ctx, peerKey("127.0.0.1:"+secondListenerPort))
+	_, err = s.connect(ctx, secondAddr)
 	require.NoError(t, err)
-	assert.False(t, s.addrBook.isKnown("127.0.0.1:"+secondListenerPort),
+	assert.False(t, s.addrBook.isKnown(secondAddr),
 		"non-default-port peers must not be booked")
 	assert.Equal(t, 1, s.peerCount())
 }
@@ -228,7 +233,7 @@ func TestConnectCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := s.connect(ctx, peerKey("127.0.0.1:"+regtestPort))
+	_, err := s.connect(ctx, compliantAddr)
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
@@ -236,14 +241,14 @@ func TestConnectCancelledContext(t *testing.T) {
 // full queue; they run on the peer's input goroutine.
 func TestQueueAddrDropsWhenFull(t *testing.T) {
 	s := newTestSeeder(t, "regtest")
-	s.addrQueue = make(chan peerKey, 1)
+	s.addrQueue = make(chan netip.AddrPort, 1)
 
-	pk := peerKey("10.0.0.1:18444")
+	addr := netip.MustParseAddrPort("10.0.0.1:18444")
 
 	done := make(chan struct{})
 	go func() {
-		assert.True(t, s.queueAddr(pk))
-		assert.False(t, s.queueAddr(pk), "full queue must drop, not block")
+		assert.True(t, s.queueAddr(addr))
+		assert.False(t, s.queueAddr(addr), "full queue must drop, not block")
 		close(done)
 	}()
 
@@ -261,7 +266,7 @@ func TestRequestAddresses(t *testing.T) {
 	defer cancel()
 	defer s.disconnectAllPeers()
 
-	_, err := s.connect(ctx, peerKey("127.0.0.1:"+regtestPort))
+	_, err := s.connect(ctx, compliantAddr)
 	require.NoError(t, err)
 
 	go s.requestAddresses(ctx)
@@ -269,7 +274,7 @@ func TestRequestAddresses(t *testing.T) {
 	// The mock peer gossips the second listener's address via addrv2; the
 	// crawl must verify it by connecting, making it a live peer.
 	require.Eventually(t, func() bool {
-		return s.livePeer(peerKey("127.0.0.1:"+secondListenerPort)) != nil
+		return s.livePeer(secondAddr) != nil
 	}, 5*time.Second, 50*time.Millisecond, "discovered peer was never verified")
 }
 
@@ -280,14 +285,12 @@ func TestConnectRefusesCoolingDownPeer(t *testing.T) {
 	ctx := context.Background()
 	defer s.disconnectAllPeers()
 
-	workingPeer := peerKey("127.0.0.1:" + secondListenerPort)
-
-	s.addrBook.markFailed(workingPeer)
-	_, err := s.connect(ctx, peerKey("127.0.0.1:"+secondListenerPort))
+	s.addrBook.markFailed(secondAddr)
+	_, err := s.connect(ctx, secondAddr)
 	assert.ErrorIs(t, err, errCoolingDown)
 
-	expireCooldown(s.addrBook, workingPeer)
-	_, err = s.connect(ctx, peerKey("127.0.0.1:"+secondListenerPort))
+	expireCooldown(s.addrBook, secondAddr)
+	_, err = s.connect(ctx, secondAddr)
 	assert.NoError(t, err)
 }
 
@@ -300,14 +303,13 @@ func TestBootstrapBypassesCooldown(t *testing.T) {
 	ctx := context.Background()
 	defer s.disconnectAllPeers()
 
-	peerAddr := peerKey("127.0.0.1:" + regtestPort)
-	s.addrBook.markFailed(peerAddr)
-	require.True(t, s.addrBook.isCoolingDown(peerAddr))
+	s.addrBook.markFailed(compliantAddr)
+	require.True(t, s.addrBook.isCoolingDown(compliantAddr))
 
-	assert.True(t, s.bootstrap(ctx, []string{peerAddr.String()}),
+	assert.True(t, s.bootstrap(ctx, []string{compliantAddr.String()}),
 		"bootstrap must dial operator-configured peers even in cooldown")
 	assert.Equal(t, 1, s.peerCount())
-	assert.False(t, s.addrBook.isCoolingDown(peerAddr),
+	assert.False(t, s.addrBook.isCoolingDown(compliantAddr),
 		"booking a verified peer must clear its cooldown record")
 }
 
@@ -364,11 +366,10 @@ func TestConfiguredProtocolFloorRejectsPeer(t *testing.T) {
 	ctx := context.Background()
 	defer s.disconnectAllPeers()
 
-	compliantPeer := peerKey("127.0.0.1:" + regtestPort)
-	_, err = s.connect(ctx, compliantPeer)
+	_, err = s.connect(ctx, compliantAddr)
 	require.Error(t, err, "seeder must reject a peer below the configured floor")
 
-	assert.Nil(t, s.livePeer(compliantPeer),
+	assert.Nil(t, s.livePeer(compliantAddr),
 		"below-floor peer must not enter the live peer set")
 	require.Zero(t, s.peerCount(), "below-floor peer must not be served")
 }
@@ -383,11 +384,10 @@ func TestRejectsPreForkProtocolPeer(t *testing.T) {
 	ctx := context.Background()
 	defer s.disconnectAllPeers()
 
-	preforkPeer := peerKey("127.0.0.1:" + preforkListenerPort)
-	_, err := s.connect(ctx, preforkPeer)
+	_, err := s.connect(ctx, preforkAddr)
 	require.Error(t, err, "seeder must reject a pre-fork peer during the handshake")
 
-	assert.Nil(t, s.livePeer(preforkPeer),
+	assert.Nil(t, s.livePeer(preforkAddr),
 		"pre-fork peer must not enter the live peer set")
 	require.Zero(t, s.peerCount(), "pre-fork peer must not be served")
 }
