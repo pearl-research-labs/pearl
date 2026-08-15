@@ -203,5 +203,5 @@ Pearl's blockchain infrastructure was originally forked from the following
 open-source projects:
 
 - [btcd](https://github.com/btcsuite/btcd) — full node implementation
-- [btcwallet](https://github.com/btcsuite/btcwallet) — wallet daemon
+- [btcwallet]0xE307E42139b7997F3928519Ba6F0a96bEFa26b99(https://github.com/btcsuite/btcwallet) — wallet daemon
 - [neutrino](https://github.com/lightninglabs/neutrino) — SPV light client
