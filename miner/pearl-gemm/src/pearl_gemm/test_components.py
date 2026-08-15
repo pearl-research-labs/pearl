@@ -56,13 +56,15 @@ def commitment_hash_from_merkle_roots(
     commitment_hash_B: torch.Tensor,
     routing_root: torch.Tensor | None = None,
     offsets_hash: torch.Tensor | None = None,
-    salted_dims: tuple[int, int] | None = None,
+    *,
+    salted_dims: tuple[int, int] | None,
 ):
     """
     Compute the commitment hash from merkle roots of a 2D tensor.
 
     routing_root and offsets_hash are optional paired MoE inputs; omitting both
-    selects the dense path.
+    selects the dense path. salted_dims has no default so callers must choose a
+    derivation explicitly: (m, n) for V3 salted seeds, None for legacy (V1/V2).
     """
     salted_dim_a, salted_dim_b = salted_dims if salted_dims is not None else (None, None)
     return torch.ops.pearl_gemm.commitment_hash_from_merkle_roots(

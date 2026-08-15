@@ -586,9 +586,14 @@ def commitment_hash_from_merkle_roots(
     B_commitment_hash,
     routing_root=None,
     offsets_hash=None,
-    salted_dims: tuple[int, int] | None = None,
+    *,
+    salted_dims: tuple[int, int] | None,
 ):
-    """Compute commitment hashes from 2D-tensor Merkle roots."""
+    """Compute commitment hashes from 2D-tensor Merkle roots.
+
+    salted_dims has no default so callers must choose a derivation explicitly:
+    (m, n) for V3 salted seeds, None for the legacy (V1/V2) chain.
+    """
     salted_dim_a, salted_dim_b = salted_dims if salted_dims is not None else (None, None)
     return pearl_gemm_cuda.commitment_hash_from_merkle_roots(
         A_merkle_root,

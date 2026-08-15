@@ -177,7 +177,7 @@ class CommitmentHashFromMerkleRootsKernel {
       rBlock(i) = root[i];
       out(i) = salt[i];
     }
-    rBlock(blake3::CHAINING_VALUE_SIZE_U32) = dim;
+    rBlock(Int<blake3::CHAINING_VALUE_SIZE_U32>{}) = dim;
     blake3::compress_msg_block_u32(rBlock, out,
                                    blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
   }

@@ -413,6 +413,63 @@ impl PlainProof {
         if let Some(moe) = &self.moe { self.n * moe.e } else { self.n }
     }
 
+    /// Leaf count the Merkle tree of a row-major byte buffer whose length is the
+    /// product of `dims` must declare. Errors if the product overflows `usize`.
+    fn expected_merkle_leaves(dims: &[usize]) -> Result<usize> {
+        let bytes = dims
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| anyhow::anyhow!("declared dimensions {dims:?} overflow usize"))?;
+        Ok(pearl_blake3::padded_chunk_len(bytes) / BLAKE3_CHUNK_LEN)
+    }
+
+    /// Rejects a proof whose committed Merkle trees don't have the leaf count
+    /// implied by the declared dimensions.
+    ///
+    /// The V3 noise seed is salted with the declared `m`/`n`, making them
+    /// consensus-critical: without pinning each tree's `total_leaves` to those
+    /// dimensions a miner could open one committed tree under several dimension
+    /// interpretations. The A/B trees are row-major `m*k` / `total_b_cols*k`
+    /// int8 bytes; the MoE routing tree is `m*top_k` little-endian `u32`s.
+    fn check_declared_tree_sizes(&self) -> Result<()> {
+        let a_expected = Self::expected_merkle_leaves(&[self.m, self.k])?;
+        ensure_eq!(
+            self.a.proof.total_leaves,
+            a_expected,
+            "A Merkle tree declares {} leaves but m={} k={} imply {}",
+            self.a.proof.total_leaves,
+            self.m,
+            self.k,
+            a_expected
+        );
+
+        let b_expected = Self::expected_merkle_leaves(&[self.total_b_cols(), self.k])?;
+        ensure_eq!(
+            self.bt.proof.total_leaves,
+            b_expected,
+            "B^T Merkle tree declares {} leaves but n={} k={} (total columns {}) imply {}",
+            self.bt.proof.total_leaves,
+            self.n,
+            self.k,
+            self.total_b_cols(),
+            b_expected
+        );
+
+        if let Some(moe) = &self.moe {
+            let routing_expected = Self::expected_merkle_leaves(&[self.m, moe.top_k, std::mem::size_of::<u32>()])?;
+            ensure_eq!(
+                moe.routing_proof.total_leaves,
+                routing_expected,
+                "routing Merkle tree declares {} leaves but m={} top_k={} imply {}",
+                moe.routing_proof.total_leaves,
+                self.m,
+                moe.top_k,
+                routing_expected
+            );
+        }
+        Ok(())
+    }
+
     /// Derives the inner A/B index lists used to build the periodic patterns,
     /// plus the public `MoEParams` (when this is an MoE proof).
     fn moe_inner_indices(&self) -> Result<(Vec<u32>, Vec<u32>, Option<MoEParams>)> {
@@ -473,6 +530,10 @@ impl PlainProof {
         seed_derivation: SeedDerivation,
     ) -> Result<(PrivateProofParams, PublicProofParams)> {
         let (m, n, k) = (self.m, self.n, self.k);
+
+        // Pin the committed trees to the declared dimensions before those
+        // dimensions flow into the (salted) noise-seed derivation.
+        self.check_declared_tree_sizes()?;
 
         for &tok in &self.a.row_indices {
             ensure!(tok < m, "routing entry {} out of range for t={}", tok, m);
@@ -719,5 +780,36 @@ mod tests {
         let mut bytes = bincode::serialize(&dense_proof()).unwrap();
         bytes.extend_from_slice(&[0x01, 0x02]);
         assert!(PlainProof::deserialize_compat(&bytes).is_err());
+    }
+
+    #[test]
+    fn declared_tree_sizes_must_match_padded_leaf_counts() {
+        // m*k = 200*16 = 3200 bytes -> ceil(3200/1024) = 4 leaves for A;
+        // n*k = 4*16 = 64 bytes -> 1 leaf for B^T.
+        let mut proof = PlainProof { m: 200, ..dense_proof() };
+        proof.a.proof.total_leaves = 4;
+        proof.bt.proof.total_leaves = 1;
+        proof.check_declared_tree_sizes().unwrap();
+
+        // Off-by-one in either tree is rejected.
+        proof.a.proof.total_leaves = 3;
+        assert!(proof.check_declared_tree_sizes().is_err());
+        proof.a.proof.total_leaves = 4;
+        proof.bt.proof.total_leaves = 2;
+        assert!(proof.check_declared_tree_sizes().is_err());
+    }
+
+    #[test]
+    fn declared_tree_sizes_check_routing_tree_for_moe() {
+        // m*k = 8*16 = 128 -> 1 leaf; total_b_cols*k = (4*4)*16 = 256 -> 1 leaf;
+        // routing m*top_k*4 = 8*2*4 = 64 -> 1 leaf.
+        let mut proof = moe_proof();
+        proof.a.proof.total_leaves = 1;
+        proof.bt.proof.total_leaves = 1;
+        proof.moe.as_mut().unwrap().routing_proof.total_leaves = 1;
+        proof.check_declared_tree_sizes().unwrap();
+
+        proof.moe.as_mut().unwrap().routing_proof.total_leaves = 3;
+        assert!(proof.check_declared_tree_sizes().is_err());
     }
 }

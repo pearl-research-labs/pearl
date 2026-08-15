@@ -37,7 +37,7 @@ hardcode the fork height.
 Deploy before the fork height, or every block you build after the fork is rejected.
 
 If you followed the MoE fork guide and use the certificate-version dispatchers, you
-only need the new `pearl-mining` package (v0.3.0) — the dispatchers accept version 3:
+only need the new `pearl-mining` package (v0.3.1) — the dispatchers accept version 3:
 
 - `check_cert_version_eligible`, `generate_proof_for_cert_version`,
   `verify_proof_for_cert_version`, and `verify_plain_proof_for_cert_version` handle
