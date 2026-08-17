@@ -1,6 +1,6 @@
 module github.com/pearl-research-labs/pearl/tools
 
-go 1.26.5
+go 1.26.6
 
 tool (
 	github.com/golangci/golangci-lint/cmd/golangci-lint
