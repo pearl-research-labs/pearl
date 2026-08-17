@@ -8,6 +8,7 @@ package peer
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -87,6 +88,10 @@ var (
 	// sentNonces houses the unique nonces that are generated when pushing
 	// version messages that are used to detect self connections.
 	sentNonces = lru.NewCache(50)
+
+	// ErrHandshakeIncomplete is returned by WaitForHandshake when the peer
+	// disconnects before a verack is received.
+	ErrHandshakeIncomplete = errors.New("peer disconnected before handshake completed")
 )
 
 // MessageListeners defines callback function pointers to invoke with message
@@ -495,6 +500,7 @@ type Peer struct {
 	queueQuit     chan struct{}
 	outQuit       chan struct{}
 	quit          chan struct{}
+	handshakeDone chan struct{}
 }
 
 // String returns the peer's address and directionality as a human-readable
@@ -2036,8 +2042,12 @@ func (p *Peer) readRemoteVersionMsg() error {
 // processRemoteVerAckMsg takes the verack from the remote peer and handles it.
 func (p *Peer) processRemoteVerAckMsg(msg *wire.MsgVerAck) {
 	p.flagsMtx.Lock()
+	already := p.verAckReceived
 	p.verAckReceived = true
 	p.flagsMtx.Unlock()
+	if !already {
+		close(p.handshakeDone)
+	}
 
 	if p.cfg.Listeners.OnVerAck != nil {
 		p.cfg.Listeners.OnVerAck(p, msg)
@@ -2367,6 +2377,28 @@ func (p *Peer) Done() <-chan struct{} {
 	return p.quit
 }
 
+// WaitForHandshake blocks until a verack has been received, the peer
+// disconnects, or ctx is done. A completed handshake wins over a
+// simultaneous disconnect or cancellation.
+//
+// This function is safe for concurrent access.
+func (p *Peer) WaitForHandshake(ctx context.Context) error {
+	select {
+	case <-p.handshakeDone:
+		return nil
+	case <-p.quit:
+		if p.VerAckReceived() {
+			return nil
+		}
+		return ErrHandshakeIncomplete
+	case <-ctx.Done():
+		if p.VerAckReceived() {
+			return nil
+		}
+		return context.Cause(ctx)
+	}
+}
+
 // newPeerBase returns a new base peer based on the inbound flag.  This
 // is used by the NewInboundPeer and NewOutboundPeer functions to perform base
 // setup needed by both types of peers.
@@ -2401,6 +2433,7 @@ func newPeerBase(origCfg *Config, inbound bool) *Peer {
 		queueQuit:       make(chan struct{}),
 		outQuit:         make(chan struct{}),
 		quit:            make(chan struct{}),
+		handshakeDone:   make(chan struct{}),
 		cfg:             cfg, // Copy so caller can't mutate.
 		services:        cfg.Services,
 		protocolVersion: cfg.ProtocolVersion,
