@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"net"
 	"net/netip"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -105,26 +103,17 @@ const (
 	addrQueueBufferSize   = 4096
 )
 
-// pendingHandshake tracks an in-flight outbound connection: the peer and the
-// channel promotePeer closes when the handshake completes.
-type pendingHandshake struct {
-	peer *peer.Peer
-	done chan struct{}
-}
-
 // seeder discovers Pearl peers and maintains an address book for DNS serving.
 type seeder struct {
 	config *peer.Config
 
 	minProtocolVersion uint32
 
-	// peersMu guards pending and livePeers. A single mutex covers both
-	// because onVerAck atomically promotes a peer from pending to live,
-	// and it is the arbiter of the handshake-completed-versus-failed race
-	// (see promotePeer and releasePeer).
-	peersMu   sync.Mutex
-	pending   map[netip.AddrPort]*pendingHandshake
-	livePeers map[netip.AddrPort]*peer.Peer
+	// peersMu guards peers, the reserved outbound connections (in-flight
+	// and handshake-complete). An address is reserved before TCP dial so a
+	// second worker cannot open a parallel connection to the same peer.
+	peersMu sync.Mutex
+	peers   map[netip.AddrPort]*peer.Peer
 
 	addrBook  *addressBook
 	addrQueue chan netip.AddrPort
@@ -143,14 +132,12 @@ func newSeeder(networkName string, minProtocolVersion uint32) (*seeder, error) {
 	s := &seeder{
 		config:             &cfg,
 		minProtocolVersion: minProtocolVersion,
-		pending:            make(map[netip.AddrPort]*pendingHandshake),
-		livePeers:          make(map[netip.AddrPort]*peer.Peer),
+		peers:              make(map[netip.AddrPort]*peer.Peer),
 		addrBook:           newAddressBook(params.DefaultPort),
 		addrQueue:          make(chan netip.AddrPort, addrQueueBufferSize),
 	}
 
 	s.config.Listeners.OnVersion = s.onVersion
-	s.config.Listeners.OnVerAck = s.onVerAck
 	s.config.Listeners.OnAddrV2 = s.onAddrV2
 
 	return s, nil
@@ -255,15 +242,14 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 		return nil, err
 	}
 
-	sig, err := s.reservePeer(addr, p)
-	if err != nil {
+	if err := s.reservePeer(addr, p); err != nil {
 		return nil, err
 	}
 
 	dialer := net.Dialer{Timeout: connectionDialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
-		s.releasePeer(addr)
+		s.unreservePeer(addr, p)
 		return nil, err
 	}
 
@@ -274,78 +260,43 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 	hctx, cancel := context.WithTimeoutCause(ctx, maximumHandshakeWait, errHandshakeTimeout)
 	defer cancel()
 
-	var failure error
-	select {
-	case <-sig:
-		log.Debugf("Handshake completed with peer %s", p.Addr())
-		return p, nil
-	case <-p.Done():
-		failure = errors.New("peer disconnected before handshake completed")
-	case <-hctx.Done():
-		failure = context.Cause(hctx)
+	if err := p.WaitForHandshake(hctx); err != nil && !p.VerAckReceived() {
+		s.unreservePeer(addr, p)
+		p.Disconnect()
+		p.WaitForDisconnect()
+		return nil, err
 	}
 
-	// Losing the pending entry to promotePeer means the handshake completed
-	// in the same instant the failure fired; the peer is live, so reporting
-	// failure would falsely mark it failed. Disconnect and WaitForDisconnect
-	// are no-ops on a peer that is already down.
-	if !s.releasePeer(addr) {
-		return p, nil
+	log.Debugf("Handshake completed with peer %s", p.Addr())
+	// Book here so bootstrap peers, which gossip never verifies, enter the
+	// served set. add itself drops non-default ports.
+	if !s.addrBook.touch(addr) {
+		s.addrBook.add(addr)
 	}
-	p.Disconnect()
-	p.WaitForDisconnect()
-	return nil, failure
+	return p, nil
 }
 
-// reservePeer atomically checks that addr is not already pending or live, then
-// registers the in-flight handshake. Returns its done channel on success or
-// errRepeatConnection.
-func (s *seeder) reservePeer(addr netip.AddrPort, p *peer.Peer) (chan struct{}, error) {
+// reservePeer atomically refuses a second connection to addr, then registers
+// the in-flight attempt.
+func (s *seeder) reservePeer(addr netip.AddrPort, p *peer.Peer) error {
 	s.peersMu.Lock()
 	defer s.peersMu.Unlock()
 
-	if _, exists := s.pending[addr]; exists {
-		return nil, errRepeatConnection
+	if _, exists := s.peers[addr]; exists {
+		return errRepeatConnection
 	}
-	if _, exists := s.livePeers[addr]; exists {
-		return nil, errRepeatConnection
-	}
-
-	ph := &pendingHandshake{peer: p, done: make(chan struct{})}
-	s.pending[addr] = ph
-	return ph.done, nil
+	s.peers[addr] = p
+	return nil
 }
 
-// releasePeer removes a peer from pending, reporting whether it was still
-// there. A false return means promotePeer won the race: the peer completed
-// its handshake and is live.
-func (s *seeder) releasePeer(addr netip.AddrPort) bool {
+// unreservePeer drops addr only if it still names this attempt, so a
+// timeout cannot delete a later reservation.
+func (s *seeder) unreservePeer(addr netip.AddrPort, p *peer.Peer) {
 	s.peersMu.Lock()
 	defer s.peersMu.Unlock()
-
-	_, ok := s.pending[addr]
-	delete(s.pending, addr)
-	return ok
-}
-
-// promotePeer atomically moves a peer from pending to live and closes its
-// handshake-done channel, reporting whether it did. Promotion and signal
-// share the lock so dial's failure path can never observe one without the
-// other. A verack for a peer object other than the reserved one is a stale
-// callback from an earlier connection and must not promote the new dial.
-func (s *seeder) promotePeer(addr netip.AddrPort, p *peer.Peer) bool {
-	s.peersMu.Lock()
-	defer s.peersMu.Unlock()
-
-	ph, ok := s.pending[addr]
-	if !ok || ph.peer != p {
-		return false
+	if s.peers[addr] == p {
+		delete(s.peers, addr)
 	}
-
-	s.livePeers[addr] = p
-	delete(s.pending, addr)
-	close(ph.done)
-	return true
 }
 
 // onVersion enforces the serving policy during the handshake. Returning a
@@ -360,30 +311,15 @@ func (s *seeder) onVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgReject {
 	return nil
 }
 
-func (s *seeder) onVerAck(p *peer.Peer, msg *wire.MsgVerAck) {
-	addr, ok := addrPortFromPeer(p)
-	if !ok {
-		return
-	}
-
-	if !s.promotePeer(addr, p) {
-		log.Debugf("Got verack from unexpected peer %s", p.Addr())
-		return
-	}
-
-	// A completed handshake means the peer passed the version policy: reset
-	// its failure counter if it is already booked, otherwise book it (the
-	// book filters out non-default ports itself). This is also the only
-	// path that books bootstrap peers, which gossip never verifies.
-	if !s.addrBook.touch(addr) {
-		s.addrBook.add(addr)
-	}
-}
-
-// disconnectPeer disconnects and removes a live peer; unknown peers are a
+// disconnectPeer disconnects and removes a reserved peer; unknown peers are a
 // no-op.
 func (s *seeder) disconnectPeer(addr netip.AddrPort) {
-	p, ok := s.removeLivePeer(addr)
+	s.peersMu.Lock()
+	p, ok := s.peers[addr]
+	if ok {
+		delete(s.peers, addr)
+	}
+	s.peersMu.Unlock()
 	if !ok {
 		return
 	}
@@ -393,51 +329,33 @@ func (s *seeder) disconnectPeer(addr netip.AddrPort) {
 	p.WaitForDisconnect()
 }
 
-// removeLivePeer atomically removes and returns a peer from livePeers.
-func (s *seeder) removeLivePeer(addr netip.AddrPort) (*peer.Peer, bool) {
-	s.peersMu.Lock()
-	defer s.peersMu.Unlock()
-
-	p, ok := s.livePeers[addr]
-	if ok {
-		delete(s.livePeers, addr)
-	}
-	return p, ok
-}
-
-// disconnectAllPeers terminates all live and pending connections.
+// disconnectAllPeers terminates every reserved connection.
 func (s *seeder) disconnectAllPeers() {
-	pending, liveKeys := s.snapshotAndClearPending()
+	s.peersMu.Lock()
+	peers := make([]*peer.Peer, 0, len(s.peers))
+	for _, p := range s.peers {
+		peers = append(peers, p)
+	}
+	clear(s.peers)
+	s.peersMu.Unlock()
 
-	for _, p := range pending {
+	for _, p := range peers {
 		p.Disconnect()
 		p.WaitForDisconnect()
 	}
-	for _, k := range liveKeys {
-		s.disconnectPeer(k)
-	}
 }
 
-// snapshotAndClearPending returns all pending peers (clearing the map) and
-// all live peer addresses, under a single lock.
-func (s *seeder) snapshotAndClearPending() ([]*peer.Peer, []netip.AddrPort) {
-	s.peersMu.Lock()
-	defer s.peersMu.Unlock()
-
-	pending := make([]*peer.Peer, 0, len(s.pending))
-	for _, ph := range s.pending {
-		pending = append(pending, ph.peer)
-	}
-	clear(s.pending)
-
-	return pending, slices.Collect(maps.Keys(s.livePeers))
-}
-
-// livePeerSnapshot returns a snapshot of all live peers.
+// livePeerSnapshot returns handshake-complete, still-connected peers.
 func (s *seeder) livePeerSnapshot() []*peer.Peer {
 	s.peersMu.Lock()
 	defer s.peersMu.Unlock()
-	return slices.Collect(maps.Values(s.livePeers))
+	out := make([]*peer.Peer, 0, len(s.peers))
+	for _, p := range s.peers {
+		if p.VerAckReceived() && p.Connected() {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // queueAddr enqueues a gossiped peer address for verification, reporting
@@ -488,7 +406,8 @@ func (s *seeder) onAddrV2(p *peer.Peer, msg *wire.MsgAddrV2) {
 }
 
 // requestAddresses sends getaddr to all live peers, then verifies incoming
-// addresses by connecting to them. Verified peers are booked by onVerAck.
+// addresses by connecting to them. Verified peers are booked after a
+// successful handshake.
 func (s *seeder) requestAddresses(ctx context.Context) {
 	for _, p := range s.livePeerSnapshot() {
 		log.Debugf("Requesting addresses from peer %s", p.Addr())

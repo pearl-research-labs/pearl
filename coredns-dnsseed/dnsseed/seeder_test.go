@@ -130,7 +130,11 @@ func newTestSeeder(t *testing.T, networkName string) *seeder {
 func (s *seeder) livePeer(addr netip.AddrPort) *peer.Peer {
 	s.peersMu.Lock()
 	defer s.peersMu.Unlock()
-	return s.livePeers[addr]
+	p := s.peers[addr]
+	if p == nil || !p.VerAckReceived() {
+		return nil
+	}
+	return p
 }
 
 // expireCooldown backdates a cooldown entry so the peer is dialable again.
