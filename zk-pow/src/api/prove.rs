@@ -1,28 +1,31 @@
 use anyhow::Result;
 use plonky2_field::goldilocks_field::GoldilocksField;
 
-use crate::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams};
+use crate::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams, SeedDerivation};
 use crate::api::proof::{PrivateProofParams, ZKProof};
 use crate::api::proof_utils::u32_field_array_to_hash;
 use crate::circuit::circuit_utils::CircuitCache;
 use crate::circuit::pearl_circuit::{PearlCircuitParams, PearlRecursion, RecursionCircuit};
 use crate::circuit::pearl_layout::pearl_public;
 use crate::circuit::pearl_stark::PearlStark;
-use crate::ffi::plain_proof::{PlainProof, parse_plain_proof};
+use crate::ffi::plain_proof::PlainProof;
 
 pub struct ProveResult {
-    pub public_data: [u8; PublicProofParams::PUBLICDATA_SIZE],
+    /// [`PublicProofParams::WIRE_SIZE`] bytes for non-MoE; longer for MoE proof.
+    pub public_data: Vec<u8>,
     pub proof_data: Vec<u8>,
 }
 
+/// Parse a proof (plain or MoE), generate a ZK proof, and return the serialized result.
 pub fn zk_prove_plain_proof(
     block_header: IncompleteBlockHeader,
-    plain_proof: &PlainProof,
+    proof: &PlainProof,
     cache: &mut CircuitCache,
     sanity_check: bool,
+    seed_derivation: SeedDerivation,
 ) -> Result<ProveResult> {
     // Convert PlainProof to proof parameters
-    let (private, public) = parse_plain_proof(block_header, plain_proof)?;
+    let (private, public) = proof.parse_proof(block_header, seed_derivation)?;
     if sanity_check {
         public.sanity_check_private_params(&private)?;
     }
@@ -31,7 +34,7 @@ pub fn zk_prove_plain_proof(
     let mut public = public;
     let proof = prove_block(&mut public, private, cache)?;
 
-    let (public_data, proof_data) = proof.serialize(&public);
+    let (public_data, proof_data) = proof.serialize(&public)?;
 
     Ok(ProveResult { public_data, proof_data })
 }
@@ -62,7 +65,7 @@ pub fn prove_block(
     };
     PearlRecursion::compile_circuits(circuit_params, cache, true)?;
 
-    let hash_public_data = public_params.public_data_commitment(&circuit_params);
+    let hash_public_data = public_params.public_data_commitment(&circuit_params)?;
 
     let proof = PearlRecursion::prove(circuit_params, cache, (trace_rows, stark_pis, hash_public_data))?;
     Ok(proof)
@@ -85,6 +88,7 @@ pub fn warmup_prove(mining_configuration: MiningConfiguration, cache: &mut Circu
     let private_params = PrivateProofParams {
         s_a: vec![vec![0i8; common_dim]; tile_h],
         s_b: vec![vec![0i8; common_dim]; tile_w],
+        s_routing: vec![],
         external_msgs: vec![],
         external_cvs: vec![],
     };
@@ -99,7 +103,8 @@ pub fn warmup_prove(mining_configuration: MiningConfiguration, cache: &mut Circu
 
     let m = mining_configuration.rows_pattern.max() + 1;
     let n = mining_configuration.cols_pattern.max() + 1;
-    let mut public_params = PublicProofParams::new_dummy(block_header, mining_configuration, m, n, 0, 0);
+    // Seed values don't affect circuit shape, so warming up under Legacy covers both derivations.
+    let mut public_params = PublicProofParams::new_dummy(block_header, SeedDerivation::Legacy, mining_configuration, m, n, 0, 0);
     let private_params = public_params.fill_dummy_merkle_proof(private_params)?;
 
     let _ = prove_block(&mut public_params, private_params, cache)?;

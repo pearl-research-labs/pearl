@@ -653,11 +653,18 @@ mempoolLoop:
 		Timestamp:  ts,
 		Bits:       reqDifficulty,
 	}}
-	msgBlock.MsgHeader.MsgCertificate = wire.MsgCertificate{
-		Certificate: &wire.ZKCertificate{
-			Hash: msgBlock.BlockHash(),
-		},
+	// Use a certificate placeholder whose version matches what consensus
+	// requires at this height, otherwise CheckConnectBlockTemplate rejects it.
+	var certificate wire.BlockCertificate
+	switch g.chainParams.RequiredCertVersion(nextBlockHeight) {
+	case wire.CertificateVersionV3:
+		certificate = &wire.CertificateV3{CertificateV2: wire.CertificateV2{Hash: msgBlock.BlockHash()}}
+	case wire.CertificateVersionV2:
+		certificate = &wire.CertificateV2{Hash: msgBlock.BlockHash()}
+	default:
+		certificate = &wire.CertificateV1{Hash: msgBlock.BlockHash()}
 	}
+	msgBlock.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: certificate}
 	for _, tx := range blockTxns {
 		if err := msgBlock.AddTransaction(tx.MsgTx()); err != nil {
 			return nil, err

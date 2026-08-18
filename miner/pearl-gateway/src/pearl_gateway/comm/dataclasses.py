@@ -10,14 +10,16 @@ from pearl_gateway.blockchain_utils.blockchain_utils import (
     create_coinbase_transaction,
 )
 from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.mining_configuration import (
     MiningConfiguration,
+    MoEConfig,
     PearlMiningConfigurationFactory,
 )
 from pearl_gateway.rpc_types import (
     GetBlockTemplateResponse,
 )
-from pearl_mining import IncompleteBlockHeader
+from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
 
 
 def get_bytes(data: str | bytes) -> bytes:
@@ -47,6 +49,8 @@ class BlockTemplate:
     height: int
     raw_transactions: list[bytes]
     coinbase_tx: Transaction
+    # Certificate version this block must carry under the crossover cutover.
+    required_cert_version: CertificateVersion
 
     @classmethod
     def from_get_block_template(
@@ -88,6 +92,7 @@ class BlockTemplate:
             height=height,
             raw_transactions=raw_transactions,
             coinbase_tx=coinbase_tx,
+            required_cert_version=CertificateVersion(data.requiredcertversion),
         )
 
     def get_raw_transactions(self) -> list[bytes]:
@@ -125,6 +130,20 @@ class CommitmentHash:
 
 
 @dataclass
+class MoEBlockInfo:
+    """MoE-specific data for block submission"""
+
+    expert_index: int
+    num_experts: int
+    n_per_expert: int
+    top_k: int
+    inner_a_rows: list[int]
+    inner_b_cols: list[int]
+    routing_data: torch.Tensor  # (m*top_k,) int32, expert-sorted token indices
+    expert_routing_offsets: list[int]  # routing exclusive end offsets as per ZK verifier
+
+
+@dataclass
 class OpenedBlockInfo:
     A_row_indices: list[int]
     B_column_indices: list[int]
@@ -132,11 +151,20 @@ class OpenedBlockInfo:
     B_t: torch.Tensor | None  # Non-noised matrix B transposed, for PlainProof creation
     commitment_hash: CommitmentHash | None
     noise_rank: int
+    moe: MoEBlockInfo | None = None
     noise_range: ClassVar[int] = 128
 
     def get_mining_config(self) -> MiningConfiguration:
         if self.A is None or self.B_t is None:
             raise ValueError("A and B must be provided")
+        if self.moe is not None:
+            return PearlMiningConfigurationFactory.create(
+                common_dim=self.A.shape[1],
+                rank=self.noise_rank,
+                row_indices=self.moe.inner_a_rows,
+                col_indices=self.moe.inner_b_cols,
+                moe=MoEConfig(e=self.moe.num_experts, top_k=self.moe.top_k),
+            )
         return PearlMiningConfigurationFactory.create(
             common_dim=self.A.shape[1],
             rank=self.noise_rank,
@@ -151,22 +179,16 @@ class MiningJob:
 
     incomplete_header_bytes: bytes
     target: int
-
-    INNER_HASH_LIMIT: ClassVar[int] = 42
-    MAX_TARGET: ClassVar[int] = 2**256 - 1
+    # Certificate version required for this block.
+    cert_version: CertificateVersion
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
         return {
             "incomplete_header_bytes": b64_encode(self.incomplete_header_bytes),
             "target": self.target,
+            "cert_version": int(self.cert_version),
         }
-
-    @staticmethod
-    def _get_difficulty_adjustment_factor(mining_config: MiningConfiguration) -> int:
-        return (
-            mining_config.hash_tile_h * mining_config.hash_tile_w * mining_config.rounded_common_dim
-        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MiningJob":
@@ -175,6 +197,7 @@ class MiningJob:
         return cls(
             incomplete_header_bytes=b64_decode(data["incomplete_header_bytes"]),
             target=data["target"],
+            cert_version=CertificateVersion(data["cert_version"]),
         )
 
     @classmethod
@@ -183,21 +206,23 @@ class MiningJob:
         return cls(
             incomplete_header_bytes=template.header.serialize_without_proof_commitment(),
             target=template.target,
+            cert_version=template.required_cert_version,
         )
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:
-        """Calculate the adjusted PoW target for the mining job.
-
-        The target is scaled based on the work represented by the hash tile dimensions
-        and noise rank.
-        """
-        # We reduce difficulty for larger hash tiles (as they represent more work)
-        # and for larger rank (as it's the k dimension of the hash tile)
-        difficulty_adjustment_factor = self._get_difficulty_adjustment_factor(mining_config)
-        adjusted_target = self.target * difficulty_adjustment_factor
-        if adjusted_target > self.MAX_TARGET:
-            raise ValueError(f"Target is too easy: {self.target=}, {adjusted_target=}")
-        return adjusted_target
+        """Calculate the rank-penalized PoW target for the mining job."""
+        if mining_config.rank < PENALTY_BASE_RANK:
+            raise ValueError(
+                f"noise rank {mining_config.rank} is below the minimum "
+                f"{PENALTY_BASE_RANK}; blocks would be rejected by consensus"
+            )
+        bound = penalized_target_bound(self.target, mining_config)
+        if bound is None:
+            raise ValueError(
+                f"no penalized target for {self.target=} at rank "
+                f"{mining_config.rank}: degenerate config or target too easy"
+            )
+        return bound
 
 
 class MiningPausedError(Exception):

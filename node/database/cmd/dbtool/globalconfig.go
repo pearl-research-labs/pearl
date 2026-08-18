@@ -36,6 +36,7 @@ type config struct {
 	RegressionTest bool   `long:"regtest" description:"Use the regression test network"`
 	SimNet         bool   `long:"simnet" description:"Use the simulation test network"`
 	TestNet        bool   `long:"testnet" description:"Use the test network"`
+	TestNet2       bool   `long:"testnet2" description:"Use the test network v2"`
 }
 
 // fileExists reports whether the named file or directory exists.
@@ -69,6 +70,10 @@ func setupGlobalConfig() error {
 	if cfg.TestNet {
 		numNets++
 		activeNetParams = &chaincfg.TestNetParams
+	}
+	if cfg.TestNet2 {
+		numNets++
+		activeNetParams = &chaincfg.TestNet2Params
 	}
 	if cfg.RegressionTest {
 		numNets++

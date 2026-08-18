@@ -19,7 +19,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,7 +73,7 @@ const (
 	gbtRegenerateSeconds = 60
 
 	// maxProtocolVersion is the max protocol version the server supports.
-	maxProtocolVersion = 1
+	maxProtocolVersion = wire.ProtocolVersion
 
 	// defaultMaxFeeRate is the default value to use(0.1 PRL/kvB) when the
 	// `MaxFee` field is not set when calling `testmempoolaccept`.
@@ -1100,20 +1099,21 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 	params := s.cfg.ChainParams
 	blockHeader := blk.MsgBlock().BlockHeader()
 	blockReply := btcjson.GetBlockVerboseResult{
-		Hash:          c.Hash,
-		Version:       blockHeader.Version,
-		VersionHex:    fmt.Sprintf("%08x", blockHeader.Version),
-		MerkleRoot:    blockHeader.MerkleRoot.String(),
-		PreviousHash:  blockHeader.PrevBlock.String(),
-		Time:          blockHeader.Timestamp.Unix(),
-		Confirmations: int64(1 + best.Height - blockHeight),
-		Height:        int64(blockHeight),
-		Size:          int32(len(blkBytes)),
-		Vsize:         int32(blockchain.GetBlockVsize(blk)),
-		StrippedSize:  int32(blk.MsgBlock().SerializeSizeStripped()),
-		Bits:          strconv.FormatInt(int64(blockHeader.Bits), 16),
-		Difficulty:    getDifficultyRatio(blockHeader.Bits, params),
-		NextHash:      nextHashString,
+		Hash:            c.Hash,
+		Version:         blockHeader.Version,
+		VersionHex:      fmt.Sprintf("%08x", blockHeader.Version),
+		MerkleRoot:      blockHeader.MerkleRoot.String(),
+		PreviousHash:    blockHeader.PrevBlock.String(),
+		Time:            blockHeader.Timestamp.Unix(),
+		Confirmations:   int64(1 + best.Height - blockHeight),
+		Height:          int64(blockHeight),
+		Size:            int32(len(blkBytes)),
+		Vsize:           int32(blockchain.GetBlockVsize(blk)),
+		StrippedSize:    int32(blk.MsgBlock().SerializeSizeStripped()),
+		Bits:            strconv.FormatInt(int64(blockHeader.Bits), 16),
+		Difficulty:      getDifficultyRatio(blockHeader.Bits, params),
+		NextHash:        nextHashString,
+		ProofCommitment: blockHeader.ProofCommitment.String(),
 	}
 
 	if *c.Verbosity == 1 {
@@ -1353,17 +1353,18 @@ func handleGetBlockHeader(s *rpcServer, cmd interface{}, closeChan <-chan struct
 
 	params := s.cfg.ChainParams
 	blockHeaderReply := btcjson.GetBlockHeaderVerboseResult{
-		Hash:          c.Hash,
-		Confirmations: int64(1 + best.Height - blockHeight),
-		Height:        blockHeight,
-		Version:       blockHeader.Version,
-		VersionHex:    fmt.Sprintf("%08x", blockHeader.Version),
-		MerkleRoot:    blockHeader.MerkleRoot.String(),
-		NextHash:      nextHashString,
-		PreviousHash:  blockHeader.PrevBlock.String(),
-		Time:          blockHeader.Timestamp.Unix(),
-		Bits:          strconv.FormatInt(int64(blockHeader.Bits), 16),
-		Difficulty:    getDifficultyRatio(blockHeader.Bits, params),
+		Hash:            c.Hash,
+		Confirmations:   int64(1 + best.Height - blockHeight),
+		Height:          blockHeight,
+		Version:         blockHeader.Version,
+		VersionHex:      fmt.Sprintf("%08x", blockHeader.Version),
+		MerkleRoot:      blockHeader.MerkleRoot.String(),
+		NextHash:        nextHashString,
+		PreviousHash:    blockHeader.PrevBlock.String(),
+		Time:            blockHeader.Timestamp.Unix(),
+		Bits:            strconv.FormatInt(int64(blockHeader.Bits), 16),
+		Difficulty:      getDifficultyRatio(blockHeader.Bits, params),
+		ProofCommitment: blockHeader.ProofCommitment.String(),
 	}
 	return blockHeaderReply, nil
 }
@@ -1741,6 +1742,10 @@ func (state *gbtWorkState) blockTemplateResult(useCoinbaseValue bool, submitOld 
 		NonceRange:   gbtNonceRange,
 		Capabilities: gbtCapabilities,
 	}
+
+	if cert := msgBlock.BlockCertificate(); cert != nil {
+		reply.RequiredCertVersion = uint32(cert.Version())
+	}
 	// SegWit is always active; include the witness commitment in the GBT result.
 	if template.WitnessCommitment != nil {
 		reply.DefaultWitnessCommitment = hex.EncodeToString(template.WitnessCommitment)
@@ -1933,7 +1938,7 @@ func handleGetBlockTemplateRequest(s *rpcServer, request *btcjson.TemplateReques
 
 	// No point in generating or accepting work before the chain is synced.
 	currentHeight := s.cfg.Chain.BestSnapshot().Height
-	if currentHeight != 0 && !s.cfg.SyncMgr.IsCurrent() {
+	if currentHeight != 0 && !s.cfg.Chain.IsCurrent() {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCClientInInitialDownload,
 			Message: "Pearl is downloading blocks...",
@@ -4043,8 +4048,8 @@ type rpcServer struct {
 	started                int32
 	shutdown               int32
 	cfg                    rpcserverConfig
-	authsha                [sha256.Size]byte
-	limitauthsha           [sha256.Size]byte
+	adminCredHash          [sha256.Size]byte
+	limitCredHash          [sha256.Size]byte
 	ntfnMgr                *wsNotificationManager
 	numClients             int32
 	statusLines            map[int]string
@@ -4200,8 +4205,8 @@ func (s *rpcServer) decrementClients() {
 // of the server (true) or whether the user is limited (false). The second is
 // always false if the first is.
 func (s *rpcServer) checkAuth(r *http.Request, require bool) (bool, bool, error) {
-	authhdr := r.Header["Authorization"]
-	if len(authhdr) <= 0 {
+	user, pass, ok := r.BasicAuth()
+	if !ok {
 		if require {
 			rpcsLog.Warnf("RPC authentication failure from %s",
 				r.RemoteAddr)
@@ -4211,24 +4216,29 @@ func (s *rpcServer) checkAuth(r *http.Request, require bool) (bool, bool, error)
 		return false, false, nil
 	}
 
-	authsha := sha256.Sum256([]byte(authhdr[0]))
-
-	// Check for limited auth first as in environments with limited users, those
-	// are probably expected to have a higher volume of calls
-	limitcmp := subtle.ConstantTimeCompare(authsha[:], s.limitauthsha[:])
-	if limitcmp == 1 {
-		return true, false, nil
+	authenticated, isAdmin := s.checkCredentials(user, pass)
+	if !authenticated {
+		rpcsLog.Warnf("RPC authentication failure from %s", r.RemoteAddr)
+		return false, false, errors.New("auth failure")
 	}
 
-	// Check for admin-level auth
-	cmp := subtle.ConstantTimeCompare(authsha[:], s.authsha[:])
-	if cmp == 1 {
-		return true, true, nil
-	}
+	return true, isAdmin, nil
+}
 
-	// Request's auth doesn't match either user
-	rpcsLog.Warnf("RPC authentication failure from %s", r.RemoteAddr)
-	return false, false, errors.New("auth failure")
+// checkCredentials reports whether the supplied username and passphrase match
+// the configured admin or limited RPC credentials.  The second return value is
+// true only for the admin user.  Each comparison is constant time.
+func (s *rpcServer) checkCredentials(user, pass string) (authenticated, isAdmin bool) {
+	h := sha256.Sum256([]byte(user + ":" + pass))
+	// Check limited credentials first: in high-traffic deployments limited
+	// users typically issue more requests than admins.
+	if subtle.ConstantTimeCompare(h[:], s.limitCredHash[:]) == 1 {
+		return true, false
+	}
+	if subtle.ConstantTimeCompare(h[:], s.adminCredHash[:]) == 1 {
+		return true, true
+	}
+	return false, false
 }
 
 // parsedRPCCmd represents a JSON-RPC request object that has been parsed into
@@ -4699,30 +4709,6 @@ func (s *rpcServer) Start() {
 	s.ntfnMgr.Start()
 }
 
-// genCertPair generates a key/cert pair to the paths provided.
-func genCertPair(certFile, keyFile string) error {
-	rpcsLog.Infof("Generating TLS certificates...")
-
-	org := "pearld autogenerated cert"
-	validUntil := time.Now().Add(10 * 365 * 24 * time.Hour)
-	cert, key, err := btcutil.NewTLSCertPair(org, validUntil, nil)
-	if err != nil {
-		return err
-	}
-
-	// Write cert and key files.
-	if err = os.WriteFile(certFile, cert, 0666); err != nil {
-		return err
-	}
-	if err = os.WriteFile(keyFile, key, 0600); err != nil {
-		os.Remove(certFile)
-		return err
-	}
-
-	rpcsLog.Infof("Done generating TLS certificates")
-	return nil
-}
-
 // rpcserverPeer represents a peer for use with the RPC server.
 //
 // The interface contract requires that all of these methods are safe for
@@ -4899,14 +4885,10 @@ func newRPCServer(config *rpcserverConfig) (*rpcServer, error) {
 		quit:                   make(chan int),
 	}
 	if cfg.RPCUser != "" && cfg.RPCPass != "" {
-		login := cfg.RPCUser + ":" + cfg.RPCPass
-		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
-		rpc.authsha = sha256.Sum256([]byte(auth))
+		rpc.adminCredHash = sha256.Sum256([]byte(cfg.RPCUser + ":" + cfg.RPCPass))
 	}
 	if cfg.RPCLimitUser != "" && cfg.RPCLimitPass != "" {
-		login := cfg.RPCLimitUser + ":" + cfg.RPCLimitPass
-		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
-		rpc.limitauthsha = sha256.Sum256([]byte(auth))
+		rpc.limitCredHash = sha256.Sum256([]byte(cfg.RPCLimitUser + ":" + cfg.RPCLimitPass))
 	}
 	rpc.ntfnMgr = newWsNotificationManager(&rpc)
 	rpc.cfg.Chain.Subscribe(rpc.handleBlockchainNotification)

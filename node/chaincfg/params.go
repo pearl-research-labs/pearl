@@ -249,6 +249,37 @@ type Params struct {
 	MinerConfirmationWindow       uint32
 	Deployments                   [DefinedDeployments]ConsensusDeployment
 
+	// MoEForkHeight is the block height at which the MoE hardfork activates.
+	// At and after this height blocks must carry a V2 certificate
+	// (wire.CertificateVersionV2); before it, a V1 certificate
+	// (wire.CertificateVersionV1). A value of 0 disables the fork (V1 at
+	// every height).
+	MoEForkHeight int32
+
+	// DenseOnlyForkHeight is the block height at which the dense-only
+	// softfork activates. At and after this height V2 certificates must
+	// carry a dense (non-MoE) proof; the rule only tightens V2 validity,
+	// so pre-fork nodes accept every post-fork block. A value of 0
+	// disables the fork.
+	DenseOnlyForkHeight int32
+
+	// RankPenaltyForkHeight is the block height at which the rank-penalty
+	// softfork activates. At and after this height a proof's noise rank must
+	// meet a minimum and its jackpot must meet a difficulty bound scaled down
+	// in proportion to that rank; the rule only tightens validity, so pre-fork
+	// nodes accept every post-fork block. A value of 0 disables the fork.
+	//
+	// Must not activate before MoEForkHeight: only V2 certificates carry a
+	// noise rank (enforced in blockchain.New).
+	RankPenaltyForkHeight int32
+
+	// SaltedSeedForkHeight is the block height at which the salted noise-seed
+	// hardfork activates: at and after it blocks must carry a V3 certificate
+	// (wire.CertificateVersionV3). A value of 0 disables the fork.
+	//
+	// Must not activate before MoEForkHeight: V3 supersedes V2.
+	SaltedSeedForkHeight int32
+
 	// Mempool parameters
 	RelayNonStdTxs bool
 
@@ -266,6 +297,44 @@ type Params struct {
 	// BIP44 coin type used in the hierarchical deterministic path for
 	// address generation.
 	HDCoinType uint32
+}
+
+// IsMoEForkActive reports whether the MoE hardfork is active at the given block
+// height. The fork is disabled when MoEForkHeight is 0.
+func (p *Params) IsMoEForkActive(height int32) bool {
+	return p.MoEForkHeight != 0 && height >= p.MoEForkHeight
+}
+
+// IsDenseOnlyForkActive reports whether the dense-only softfork is active at
+// the given block height. The fork is disabled when DenseOnlyForkHeight is 0.
+func (p *Params) IsDenseOnlyForkActive(height int32) bool {
+	return p.DenseOnlyForkHeight != 0 && height >= p.DenseOnlyForkHeight
+}
+
+// IsRankPenaltyForkActive reports whether the rank-penalty softfork is active at
+// the given block height. The fork is disabled when RankPenaltyForkHeight is 0.
+func (p *Params) IsRankPenaltyForkActive(height int32) bool {
+	return p.RankPenaltyForkHeight != 0 && height >= p.RankPenaltyForkHeight
+}
+
+// IsSaltedSeedForkActive reports whether the salted noise-seed hardfork is active
+// at the given block height. The fork is disabled when SaltedSeedForkHeight is 0.
+func (p *Params) IsSaltedSeedForkActive(height int32) bool {
+	return p.SaltedSeedForkHeight != 0 && height >= p.SaltedSeedForkHeight
+}
+
+// RequiredCertVersion returns the block certificate version that a block at the
+// given height must use under the strict hardfork cutovers: V3 at and after the
+// salted noise-seed fork, V2 at and after the MoE fork, V1 before both (and
+// always, when the forks are disabled).
+func (p *Params) RequiredCertVersion(height int32) wire.CertificateVersion {
+	if p.IsSaltedSeedForkActive(height) {
+		return wire.CertificateVersionV3
+	}
+	if p.IsMoEForkActive(height) {
+		return wire.CertificateVersionV2
+	}
+	return wire.CertificateVersionV1
 }
 
 // MainNetParams defines the network parameters for the main Pearl network.
@@ -292,9 +361,30 @@ var MainNetParams = Params{
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
 
-	// Checkpoints ordered from oldest to newest.
+	MoEForkHeight: 71935,
+
+	// Dense-only softfork: MoE proofs are rejected from this height on.
+	DenseOnlyForkHeight: 91630,
+
+	RankPenaltyForkHeight: 96251,
+
+	SaltedSeedForkHeight: 99000,
+
+	// Checkpoints ordered from oldest to newest, one per 10000 blocks.
+	// Add the next multiple once it is at least CheckpointConfirmations
+	// deep; denser checkpoints cap how much headers-first sync progress a
+	// peer disconnect can throw away.
 	Checkpoints: []Checkpoint{
+		{10000, newHashFromStr("a3c196fb1c3f7837bbebd69b98fc451d88d48083af98c318c78486d7f1888490")},
+		{20000, newHashFromStr("513270b25c6d538f38b26ecdc014f2a809639ec7ebd3c09e4685675311420273")},
+		{30000, newHashFromStr("fd61132c2ad6c22fa48a8df483bc6b885c12ceeb3fe0a9fa55eb5beb849fac7b")},
+		{40000, newHashFromStr("35aac0e2a1e7f2d54924d584cf423b56f0d72d6770ee8365dc1667dbb5b5b320")},
 		{50000, newHashFromStr("608f32e5390b2ae964c986a53e1be10ba4a640f3ccecf96d6b7838e06cb517ff")},
+		{60000, newHashFromStr("5a7f0590c3a89099b2d0f1509d2186c73bc3d8e2e4a60e7ce4ec236856900dad")},
+		{70000, newHashFromStr("281a3469d55226bb9e1b3ccee06eeb923177817b4cdead75131074b171b215c1")},
+		{80000, newHashFromStr("69d40caca39b3c04ee55589d13cd1c5c546a3eb8712a3367840c5f67ab707cfc")},
+		{90000, newHashFromStr("0738b30bb353820a4f97331d805d134de4321a5fc5c8b2955988e7291a0c8562")},
+		{100000, newHashFromStr("ca8d5f604a9021e538f31472d9a9641c7bc46a6b8d591748e2869429571edbfb")},
 	},
 
 	// Consensus rule change deployments.
@@ -365,6 +455,16 @@ var RegressionNetParams = Params{
 	Net:         wire.RegTest,
 	DefaultPort: "18444",
 	DNSSeeds:    []DNSSeed{},
+
+	// MoE hardfork active from genesis on local test networks so the gateway's
+	// V2 (MoE) certificates are accepted at every mined height.
+	MoEForkHeight: 1,
+
+	// Active from genesis because regtest verifies proofs.
+	RankPenaltyForkHeight: 1,
+
+	// Salted noise-seed (V3) fork active from genesis.
+	SaltedSeedForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &regTestGenesisBlock,
@@ -449,9 +549,9 @@ var TestNetParams = Params{
 	Net:         wire.TestNet,
 	DefaultPort: "44110",
 	DNSSeeds: []DNSSeed{
-		{"seeder1.internal.pearlresearch.ai", true},
-		{"seeder2.internal.pearlresearch.ai", true},
-		{"seeder3.internal.pearlresearch.ai", true},
+		{"seeder1.internal.pearlresearch.ai", false},
+		{"seeder2.internal.pearlresearch.ai", false},
+		{"seeder3.internal.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
@@ -466,6 +566,15 @@ var TestNetParams = Params{
 	MinDiffReductionTime: time.Hour * 4, // 4 hours
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
+
+	MoEForkHeight: 1,
+
+	// Dense-only softfork: MoE proofs are rejected from this height on.
+	DenseOnlyForkHeight: 28262,
+
+	RankPenaltyForkHeight: 36761,
+
+	SaltedSeedForkHeight: 38648,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
@@ -529,16 +638,16 @@ var TestNetParams = Params{
 	HDCoinType: HDCoinTypeTestnet,
 }
 
-// TestNet2Params defines the network parameters for the Pearl test network v2.
-// Based on TestNetParams but with a fresh genesis block.
+// TestNet2Params defines the network parameters for the Pearl test network v2,
+// a restart of the test network from its own genesis block.
 var TestNet2Params = Params{
 	Name:        "testnet2",
 	Net:         wire.TestNet2,
 	DefaultPort: "44112",
 	DNSSeeds: []DNSSeed{
-		{"seeder1.testnet.pearlresearch.ai", true},
-		{"seeder2.testnet.pearlresearch.ai", true},
-		{"seeder3.testnet.pearlresearch.ai", true},
+		{"seeder1.testnet.pearlresearch.ai", false},
+		{"seeder2.testnet.pearlresearch.ai", false},
+		{"seeder3.testnet.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
@@ -553,6 +662,15 @@ var TestNet2Params = Params{
 	MinDiffReductionTime: time.Hour * 4, // 4 hours
 	GenerateSupported:    false,
 	MaxTimeOffsetMinutes: 5,
+
+	MoEForkHeight: 54869,
+
+	// Dense-only softfork: MoE proofs are rejected from this height on.
+	DenseOnlyForkHeight: 80051,
+
+	RankPenaltyForkHeight: 80627,
+
+	SaltedSeedForkHeight: 83109,
 
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
@@ -629,6 +747,13 @@ var SimNetParams = Params{
 	Net:         wire.SimNet,
 	DefaultPort: "18555",
 	DNSSeeds:    []DNSSeed{}, // NOTE: There must NOT be any seeds.
+
+	// MoE hardfork active from genesis on local test networks so the gateway's
+	// V2 (MoE) certificates are accepted at every mined height.
+	MoEForkHeight: 1,
+
+	// Salted noise-seed (V3) fork active from genesis.
+	SaltedSeedForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &simNetGenesisBlock,

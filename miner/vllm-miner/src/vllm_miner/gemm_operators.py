@@ -137,7 +137,7 @@ def pearl_gemm_noisy(
         tensor_hash_scratchpad,
     )
 
-    # Generate commitment hash for noise generation
+    # Generate commitment hashes for noise generation.
     commitment_hash_A_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
     commitment_hash_B_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
     commitment_hash_from_merkle_roots(
@@ -146,6 +146,7 @@ def pearl_gemm_noisy(
         key_tensor,
         commitment_hash_A_tensor,
         commitment_hash_B_tensor,
+        salted_dims=(m, n) if mining_job.cert_version.uses_salted_seeds else None,
     )
 
     # Generate noise factors from commitment hashes

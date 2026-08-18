@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 from bitcoinutils.transactions import Transaction
 from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import BlockTemplate, MiningJob, MiningPausedError
 from pearl_gateway.work_cache import WorkCache
 from pearl_mining import IncompleteBlockHeader
@@ -38,6 +39,7 @@ def different_block_template():
             "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0502a1050101ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000"
         ),
         raw_transactions=[],
+        required_cert_version=CertificateVersion.ZK_MOE,
     )
 
 

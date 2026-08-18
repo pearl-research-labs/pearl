@@ -1083,6 +1083,19 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		prevNode := prevNodeEl.Value.(*headerNode)
 		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
 			node.height = prevNode.height + 1
+
+			if err := blockchain.CheckCertificateRules(
+				blockHeader, msgHeader.BlockCertificate(), node.height,
+				sm.chainParams,
+				blockchain.NetBehaviorFlags(sm.chainParams),
+			); err != nil {
+				log.Warnf("Header from peer %s has a certificate that "+
+					"violates the rules at height %d: %v -- disconnecting",
+					peer.Addr(), node.height, err)
+				peer.Disconnect()
+				return
+			}
+
 			e := sm.headerList.PushBack(&node)
 			if sm.startHeader == nil {
 				sm.startHeader = e

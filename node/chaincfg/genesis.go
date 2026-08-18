@@ -90,7 +90,7 @@ var genesisMerkleRoot = chainhash.Hash([chainhash.HashSize]byte{
 var genesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      genesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -125,7 +125,7 @@ var regTestGenesisMerkleRoot = genesisMerkleRoot
 var regTestGenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      regTestGenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -185,10 +185,10 @@ var testNetGenesisTx = wire.MsgTx{
 // testNetGenesisHash is the hash of the first block in the block chain for the
 // test network.
 var testNetGenesisHash = chainhash.Hash([chainhash.HashSize]byte{
-	0x2f, 0x3a, 0xf9, 0x10, 0xc5, 0x24, 0x39, 0x45,
-	0x4b, 0xe1, 0xb6, 0xc9, 0x52, 0x1d, 0x35, 0x4b,
-	0x17, 0x42, 0x9e, 0x6f, 0xcd, 0x7e, 0xba, 0x3d,
-	0x77, 0xa9, 0x22, 0x71, 0x50, 0xbd, 0x6a, 0x47,
+	0x18, 0x3d, 0xb4, 0x64, 0x98, 0x67, 0x61, 0x4e,
+	0xb7, 0x95, 0x3c, 0x6f, 0xd4, 0xc4, 0x41, 0x25,
+	0x1e, 0x9d, 0x98, 0x62, 0x7c, 0x0f, 0x1d, 0x02,
+	0x74, 0x0f, 0x95, 0xe9, 0x7b, 0xbe, 0xf0, 0x10,
 })
 
 // testNetGenesisMerkleRoot is the hash of the first transaction in the genesis
@@ -205,7 +205,7 @@ var testNetGenesisMerkleRoot = chainhash.Hash([chainhash.HashSize]byte{
 var testNetGenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      testNetGenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -214,7 +214,7 @@ var testNetGenesisBlock = wire.MsgBlock{
 			Version:    1,
 			PrevBlock:  chainhash.Hash{},         // 0000000000000000000000000000000000000000000000000000000000000000
 			MerkleRoot: testNetGenesisMerkleRoot, // 7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e
-			Timestamp:  time.Unix(1777215600, 0), // 2026-04-26 15:00:00 +0000 UTC
+			Timestamp:  time.Unix(1782810515, 0), // 2026-06-30 09:08:35 +0000 UTC
 			Bits:       0x1b00ffff,               // [000000000000ffff000000000000000000000000000000000000000000000000]
 		},
 	},
@@ -222,7 +222,7 @@ var testNetGenesisBlock = wire.MsgBlock{
 }
 
 // testNet2GenesisHash is the hash of the first block in the block chain for the
-// test network v2 (fresh genesis).
+// test network v2.
 var testNet2GenesisHash = chainhash.Hash([chainhash.HashSize]byte{
 	0x96, 0x6f, 0x33, 0xa0, 0x2e, 0x2e, 0x5f, 0x2b,
 	0xd8, 0xd5, 0x11, 0x38, 0x41, 0xce, 0xee, 0x29,
@@ -240,7 +240,7 @@ var testNet2GenesisMerkleRoot = testNetGenesisMerkleRoot
 var testNet2GenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      testNet2GenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -275,7 +275,7 @@ var simNetGenesisMerkleRoot = genesisMerkleRoot
 var simNetGenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      simNetGenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},
@@ -310,7 +310,7 @@ var sigNetGenesisMerkleRoot = genesisMerkleRoot
 var sigNetGenesisBlock = wire.MsgBlock{
 	MsgHeader: wire.MsgHeader{
 		MsgCertificate: wire.MsgCertificate{
-			Certificate: &wire.ZKCertificate{
+			Certificate: &wire.CertificateV1{
 				Hash:      sigNetGenesisHash,
 				ProofData: []byte{0xde, 0xad, 0xbe, 0xef}, // Vanity proof for genesis block
 			},

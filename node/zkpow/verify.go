@@ -24,75 +24,154 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
+// MinNoiseRank is the minimum accepted by the rank-penalty rule, taken from the
+// Rust implementation of the rule, which asserts at compile time that the value it
+// exports matches the one it enforces.
+const MinNoiseRank = C.MIN_NOISE_RANK
+
 // ================================================================================
 // CERTIFICATE VERIFICATION
 // ================================================================================
 
 // VerifyCertificate performs sanity checks followed by cryptographic proof verification.
 // It returns an error if the certificate is invalid or does not match the header.
+// V3 certificates (CertificateV3) share the V2 layout but use the salted noise-seed derivation.
+// V2 certificates (CertificateV2) handle both MoE and non-MoE new proofs.
+// V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
 	switch c := cert.(type) {
-	case *wire.ZKCertificate:
-		return verifyZKCertificate(header, c)
+	case *wire.CertificateV3:
+		return verifyCertificateV3(header, c)
+	case *wire.CertificateV2:
+		return verifyCertificateV2(header, c)
+	case *wire.CertificateV1:
+		return verifyCertificateV1(header, c)
 	default:
 		return fmt.Errorf("unknown certificate type: %T", cert)
 	}
 }
 
 // ================================================================================
-// ZK CERTIFICATE VERIFICATION
+// V1 CERTIFICATE VERIFICATION
 // ================================================================================
 
-func verifyZKCertificate(header *wire.BlockHeader, c *wire.ZKCertificate) error {
-	return verifyZKCertificateInner(header, c, nil)
-}
-
-// VerifyZKCertificateWithNbits verifies a ZK certificate using nbitsOverride
-// as the difficulty target instead of the block header's nbits field.
-//
-// WARNING: This bypasses the header's embedded difficulty, Do not use it in block acceptance or relay paths.
-func VerifyZKCertificateWithNbits(header *wire.BlockHeader, c *wire.ZKCertificate, nbitsOverride uint32) error {
-	return verifyZKCertificateInner(header, c, &nbitsOverride)
-}
-
-func verifyZKCertificateInner(header *wire.BlockHeader, c *wire.ZKCertificate, nbitsOverride *uint32) error {
+func verifyCertificateV1(header *wire.BlockHeader, c *wire.CertificateV1) error {
 	blockHash := header.BlockHash()
 	if !c.Hash.IsEqual(&blockHash) {
 		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
 			c.Hash, blockHash)
 	}
-
-	certCommitment := c.ProofCommitment()
-	if header.ProofCommitment != certCommitment {
+	if header.ProofCommitment != c.ProofCommitment() {
 		return fmt.Errorf("proof commitment mismatch: header has %s, certificate has %s",
-			header.ProofCommitment, certCommitment)
+			header.ProofCommitment, c.ProofCommitment())
 	}
-
-	if len(c.ProofData) == 0 { // avoid this case because of c.ProofData[0] access below
+	if len(c.ProofData) == 0 {
 		return fmt.Errorf("empty proof data")
 	}
 
 	cBlockHeader := blockHeaderToC(header)
 
 	var cZKProof C.CZKProof
-	C.memcpy(unsafe.Pointer(&cZKProof.public_data[0]), unsafe.Pointer(&c.PublicData[0]), C.size_t(wire.PublicDataSize))
+	cZKProof.public_data_len = C.uintptr_t(len(c.PublicData))
+	C.memcpy(unsafe.Pointer(&cZKProof.public_data[0]), unsafe.Pointer(&c.PublicData[0]), C.size_t(len(c.PublicData)))
 
-	// Pin the ProofData memory to prevent GC from moving it during the C call
 	var pinner runtime.Pinner
 	pinner.Pin(&c.ProofData[0])
 	defer pinner.Unpin()
 
-	proofBlobPtr := (*C.uint8_t)(unsafe.Pointer(&c.ProofData[0]))
 	cZKProof.proof_blob_len = C.uintptr_t(len(c.ProofData))
+	cZKProof.proof_blob = (*C.uint8_t)(unsafe.Pointer(&c.ProofData[0]))
+
+	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
+	result := C.verify_zk_proof_v1(&cBlockHeader, &cZKProof, &errorBuf[0])
+	msg := C.GoString(&errorBuf[0])
+
+	switch result {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("v1 proof rejected: %s", msg)
+	case 2:
+		return fmt.Errorf("v1 verification system error: %s", msg)
+	default:
+		return fmt.Errorf("unknown v1 verification result %d: %s", result, msg)
+	}
+}
+
+// ================================================================================
+// V2/V3 CERTIFICATE VERIFICATION
+// ================================================================================
+
+func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error {
+	return VerifyZKProofFFI(header, c, nil)
+}
+
+func verifyCertificateV3(header *wire.BlockHeader, c *wire.CertificateV3) error {
+	return VerifyZKProofFFI(header, c, nil)
+}
+
+// VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.
+func VerifyZKProofFFI(
+	header *wire.BlockHeader,
+	cert wire.BlockCertificate,
+	nbitsOverride *uint32,
+) error {
+	certHash := cert.BlockHash()
+	blockHash := header.BlockHash()
+	if !certHash.IsEqual(&blockHash) {
+		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
+			certHash, blockHash)
+	}
+
+	proofCommitment := cert.ProofCommitment()
+	if header.ProofCommitment != proofCommitment {
+		return fmt.Errorf("proof commitment mismatch: header has %s, certificate has %s",
+			header.ProofCommitment, proofCommitment)
+	}
+
+	publicData := cert.PublicDataBytes()
+	if len(publicData) == 0 { // avoid publicData[0] index below
+		return fmt.Errorf("empty public data")
+	}
+
+	proofData := cert.ProofBytes()
+	if len(proofData) == 0 { // avoid proofData[0] index below
+		return fmt.Errorf("empty proof data")
+	}
+
+	cBlockHeader := blockHeaderToC(header)
+
+	var cZKProof C.CZKProof
+	cZKProof.public_data_len = C.uintptr_t(len(publicData))
+	C.memcpy(unsafe.Pointer(&cZKProof.public_data[0]), unsafe.Pointer(&publicData[0]), C.size_t(len(publicData)))
+
+	// Pin the proofData memory to prevent GC from moving it during the C call
+	var pinner runtime.Pinner
+	pinner.Pin(&proofData[0])
+	defer pinner.Unpin()
+
+	proofBlobPtr := (*C.uint8_t)(unsafe.Pointer(&proofData[0]))
+	cZKProof.proof_blob_len = C.uintptr_t(len(proofData))
 	cZKProof.proof_blob = proofBlobPtr
 
 	// Call Rust FFI
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
 	var result C.int32_t
-	if nbitsOverride != nil {
-		result = C.verify_zk_proof_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
-	} else {
-		result = C.verify_zk_proof(&cBlockHeader, &cZKProof, &errorBuf[0])
+	switch cert.Version() {
+	case wire.CertificateVersionV2:
+		if nbitsOverride != nil {
+			result = C.verify_zk_proof_v2_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
+		} else {
+			result = C.verify_zk_proof_v2(&cBlockHeader, &cZKProof, &errorBuf[0])
+		}
+	case wire.CertificateVersionV3:
+		if nbitsOverride != nil {
+			result = C.verify_zk_proof_v3_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
+		} else {
+			result = C.verify_zk_proof_v3(&cBlockHeader, &cZKProof, &errorBuf[0])
+		}
+	default:
+		return fmt.Errorf("unsupported certificate version %d for FFI verification", cert.Version())
 	}
 	msg := C.GoString(&errorBuf[0])
 
@@ -105,6 +184,35 @@ func verifyZKCertificateInner(header *wire.BlockHeader, c *wire.ZKCertificate, n
 		return fmt.Errorf("verification system error: %s", msg)
 	default:
 		return fmt.Errorf("unknown verification result %d: %s", result, msg)
+	}
+}
+
+// CheckRankPenalty checks public data against the rank-penalty rule, measuring the
+// jackpot against bits: a block header's Bits for consensus, or a share target for
+// pool accounting. Callers decide whether the height-gated rule is active.
+func CheckRankPenalty(bits uint32, publicData []byte) error {
+	if len(publicData) == 0 { // avoid publicData[0] index below
+		return fmt.Errorf("empty public data")
+	}
+
+	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
+	result := C.check_rank_penalty(
+		C.uint32_t(bits),
+		(*C.uint8_t)(unsafe.Pointer(&publicData[0])),
+		C.uintptr_t(len(publicData)),
+		&errorBuf[0],
+	)
+	msg := C.GoString(&errorBuf[0])
+
+	switch result {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("rank penalty rule violated: %s", msg)
+	case 2:
+		return fmt.Errorf("rank penalty check system error: %s", msg)
+	default:
+		return fmt.Errorf("unknown rank penalty check result %d: %s", result, msg)
 	}
 }
 

@@ -5,6 +5,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/python.h>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
 // Include only the host function declaration
 #include "blake3/blake3_constants.hpp"
 #include "tensor_hash_decl.hpp"
@@ -17,6 +20,19 @@
 constexpr size_t DEFAULT_THREADS_PER_BLOCK = 128;    // merkle_tree_roots_kernel
 constexpr size_t DEFAULT_NUM_STAGES = 2;             // merkle_tree_roots_kernel
 constexpr size_t DEFAULT_LEAVES_PER_MT_BLOCK = 512;  // compute_blake_mt_kernel
+
+// merkle_tree_roots_kernel builds a TMA descriptor over `data`;
+// cuTensorMapEncodeTiled requires the global address to be 16-byte aligned.
+constexpr uintptr_t TMA_GLOBAL_ALIGNMENT_BYTES = 16;
+
+// V3 salting writes the matrix dimension into the hashed block as a u32.
+constexpr int64_t MAX_SALTED_DIM = std::numeric_limits<uint32_t>::max();
+
+uint32_t to_salted_dim(int64_t dim, const char* name) {
+  TORCH_CHECK(dim > 0 && dim <= MAX_SALTED_DIM, name, " must be in [1, ",
+              MAX_SALTED_DIM, "], got ", dim);
+  return static_cast<uint32_t>(dim);
+}
 
 size_t get_required_scratchpad_bytes(
     size_t matrix_bytes, size_t threads_per_block = DEFAULT_THREADS_PER_BLOCK) {
@@ -49,6 +65,11 @@ void run_tensor_hash(
   TORCH_CHECK(out.dtype() == at::kByte, "out must be uint8");
   TORCH_CHECK(roots.dtype() == at::kByte, "roots must be uint8");
   TORCH_CHECK(data.dim() == 2, "data must be 2D tensor");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(data.data_ptr()) %
+                      TMA_GLOBAL_ALIGNMENT_BYTES ==
+                  0,
+              "data must be ", TMA_GLOBAL_ALIGNMENT_BYTES,
+              "-byte aligned for TMA");
   TORCH_CHECK(key.numel() == blake3::KEY_SIZE, "key must have exactly",
               blake3::KEY_SIZE, "bytes");
   TORCH_CHECK(out.numel() == blake3::CHAINING_VALUE_SIZE,
@@ -87,9 +108,7 @@ void run_tensor_hash(
                                            data.numel(), threads_per_block),
               "roots must have at least ", num_blocks, " * ",
               blake3::CHAINING_VALUE_SIZE, "bytes");
-  TORCH_CHECK((size_t)data.numel() > (1u << 17),
-              "data must have more than 2^17 = 131072 bytes, got ",
-              data.numel());
+  TORCH_CHECK(data.numel() > 0, "data must be non-empty");
 
   auto stream = at::cuda::getCurrentCUDAStream();
   auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -102,13 +121,15 @@ void run_tensor_hash(
               roots.data_ptr<uint8_t>(), *dprops, stream);
 }
 
-// Computes both A and B commitment hashes from their merkle roots
-// Should be the same as commitment_hash_from_merkle_roots from Commitment_hash.py
-void run_commitment_hash_from_merkle_roots(at::Tensor& A_merkle_root,
-                                           at::Tensor& B_merkle_root,
-                                           at::Tensor& key,
-                                           at::Tensor& A_commitment_hash,
-                                           at::Tensor& B_commitment_hash) {
+// Computes both commitment hashes from their Merkle roots.
+// Optional routing inputs and V3 dimensions must each be supplied as a pair.
+void run_commitment_hash_from_merkle_roots(
+    at::Tensor& A_merkle_root, at::Tensor& B_merkle_root, at::Tensor& key,
+    at::Tensor& A_commitment_hash, at::Tensor& B_commitment_hash,
+    std::optional<at::Tensor> routing_root = std::nullopt,
+    std::optional<at::Tensor> offsets_hash = std::nullopt,
+    std::optional<int64_t> salted_dim_a = std::nullopt,
+    std::optional<int64_t> salted_dim_b = std::nullopt) {
   CHECK_DEVICE(A_merkle_root);
   CHECK_DEVICE(B_merkle_root);
   CHECK_DEVICE(key);
@@ -143,13 +164,51 @@ void run_commitment_hash_from_merkle_roots(at::Tensor& A_merkle_root,
               "B_commitment_hash must have exactly",
               blake3::CHAINING_VALUE_SIZE, "bytes");
 
+  TORCH_CHECK(routing_root.has_value() == offsets_hash.has_value(),
+              "routing_root and offsets_hash must be provided together");
+
+  const uint8_t* routing_root_ptr = nullptr;
+  const uint8_t* offsets_hash_ptr = nullptr;
+  if (routing_root.has_value()) {
+    auto& routing_root_tensor = routing_root.value();
+    auto& offsets_hash_tensor = offsets_hash.value();
+    CHECK_DEVICE(routing_root_tensor);
+    CHECK_DEVICE(offsets_hash_tensor);
+    CHECK_CONTIGUOUS(routing_root_tensor);
+    CHECK_CONTIGUOUS(offsets_hash_tensor);
+    TORCH_CHECK(routing_root_tensor.dtype() == at::kByte,
+                "routing_root must be uint8");
+    TORCH_CHECK(offsets_hash_tensor.dtype() == at::kByte,
+                "offsets_hash must be uint8");
+    TORCH_CHECK(routing_root_tensor.numel() == blake3::CHAINING_VALUE_SIZE,
+                "routing_root must have exactly", blake3::CHAINING_VALUE_SIZE,
+                "bytes");
+    TORCH_CHECK(offsets_hash_tensor.numel() == blake3::CHAINING_VALUE_SIZE,
+                "offsets_hash must have exactly", blake3::CHAINING_VALUE_SIZE,
+                "bytes");
+    routing_root_ptr = routing_root_tensor.data_ptr<uint8_t>();
+    offsets_hash_ptr = offsets_hash_tensor.data_ptr<uint8_t>();
+  }
+
+  TORCH_CHECK(salted_dim_a.has_value() == salted_dim_b.has_value(),
+              "salted_dim_a and salted_dim_b must be provided together");
+
+  const bool apply_salt = salted_dim_a.has_value();
+  uint32_t salted_dim_a_u32 = 0;
+  uint32_t salted_dim_b_u32 = 0;
+  if (apply_salt) {
+    salted_dim_a_u32 = to_salted_dim(salted_dim_a.value(), "salted_dim_a");
+    salted_dim_b_u32 = to_salted_dim(salted_dim_b.value(), "salted_dim_b");
+  }
+
   auto stream = at::cuda::getCurrentCUDAStream();
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
   commitment_hash_from_merkle_roots(
       A_merkle_root.data_ptr<uint8_t>(), B_merkle_root.data_ptr<uint8_t>(),
       key.data_ptr<uint8_t>(), A_commitment_hash.data_ptr<uint8_t>(),
-      B_commitment_hash.data_ptr<uint8_t>(), *dprops, stream);
+      B_commitment_hash.data_ptr<uint8_t>(), routing_root_ptr, offsets_hash_ptr,
+      apply_salt, salted_dim_a_u32, salted_dim_b_u32, *dprops, stream);
 }
 
 #undef CHECK_DEVICE

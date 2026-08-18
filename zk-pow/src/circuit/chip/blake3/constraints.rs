@@ -1,7 +1,7 @@
 use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 
 use crate::circuit::{
-    chip::blake3::{Blake3ControlFields, blake3_air, blake3_compress::blake3_permute_msg},
+    chip::blake3::{Blake3ControlFields, blake3_air, blake3_compress::blake3_permute_msg, logic::decode_is_msg_bits},
     pearl_layout::{BYTES_PER_GOLDILOCKS, pearl_columns, pearl_public},
     utils::{air_utils::RowView, evaluator::Evaluator},
 };
@@ -46,16 +46,17 @@ where
 
     // Check BLAKE3_MSG_BUFFER correctness (shift + data loading)
     let jackpot: [V; pearl_columns::JACKPOT_MSG_LEN] = local_trace[pearl_columns::JACKPOT_MSG_RANGE].try_into().unwrap();
+
+    let (is_msg_jackpot, is_msg_uint8_data, is_msg_cv) = decode_is_msg_bits(eval, one, cf.is_msg_bits);
     verify_buffer_advancement(
         blake3_msg_buffer,
         &next_trace[pearl_columns::BLAKE3_MSG_BUFFER_RANGE],
         uint8_data,
         cv_in,
         &jackpot,
-        cf.is_msg_mat,
-        cf.is_msg_aux_data,
-        cf.is_msg_cv,
-        cf.is_msg_jackpot,
+        is_msg_uint8_data,
+        is_msg_cv,
+        is_msg_jackpot,
         c256,
         eval,
     );
@@ -119,6 +120,13 @@ where
     let _cv_out_freq = row_view.consume_single();
     debug_assert_eq!(row_view.offset, pearl_columns::CV_OUT_FREQ_END);
 
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // Check data when is_first_outer or is_second_outer: the first two limbs in UINT8_DATA should be the outer indices, and OUTER_INDEX_FIRST and OUTER_INDEX_SECOND should match.
+    let first_limb = eval.polyval(&uint8_data[0..4], c256);
+    let second_limb = eval.polyval(&uint8_data[4..8], c256);
+    eval.constraint_eq_if(cf.is_first_outer, first_limb, cf.outer_index_first);
+    eval.constraint_eq_if(cf.is_second_outer, second_limb, cf.outer_index_second);
+
     blake3_output
 }
 
@@ -152,7 +160,7 @@ where
 
 /// Check BLAKE3_MSG_BUFFER advancement constraints.
 /// The buffer shifts by 2 elements (1 dword) per round, and new data is loaded into the tail.
-/// - If IS_MSG_MAT or IS_MSG_AUX_DATA: load uint8_data_packed into msg_buffer[14..16]
+/// - If is_msg_uint8_data (Matrix or Aux/Routing): load uint8_data_packed into msg_buffer[14..16]
 /// - If IS_MSG_CV: load CV_IN (8 elements) into msg_buffer[8..16]
 /// - If IS_MSG_JACKPOT: verify entire buffer equals the selected jackpot slice
 #[allow(clippy::too_many_arguments)]
@@ -162,8 +170,7 @@ fn verify_buffer_advancement<V, S, E>(
     uint8_data: &[V],
     cv_in: &[V],
     jackpot: &[V],
-    is_msg_mat: V,
-    is_msg_aux_data: V,
+    is_msg_uint8_data: V,
     is_msg_cv: V,
     is_msg_jackpot: V,
     c256: V,
@@ -184,9 +191,8 @@ fn verify_buffer_advancement<V, S, E>(
     let uint8_data_packed: [V; 2] =
         std::array::from_fn(|i| eval.polyval(&uint8_data[i * BYTES_PER_GOLDILOCKS..(i + 1) * BYTES_PER_GOLDILOCKS], c256));
 
-    let is_load_uint8 = eval.add(is_msg_mat, is_msg_aux_data);
     for i in 0..shift_len {
-        eval.constraint_eq_if(is_load_uint8, msg_buffer[14 + i], uint8_data_packed[i]);
+        eval.constraint_eq_if(is_msg_uint8_data, msg_buffer[14 + i], uint8_data_packed[i]);
     }
 
     for i in 0..pearl_columns::CV_IN_LEN {

@@ -99,7 +99,7 @@ jobs:
       - name: Build project and generate verifier cache
         run: |
           cargo build --release
-          cargo run --release --bin build_cache src/circuit/cache.bin
+          cargo run --release --bin build_cache src/circuit/v2_cache.bin src/v1/v1_cache.bin
           cargo build --release --features embedded_cache
 
       - name: Run tests
@@ -126,15 +126,20 @@ jobs:
       # Go FFI Build
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
-          go-version: '1.26.1'
+          go-version: '1.26.6'
 
       - name: Regenerate verifier circuit cache for Go FFI
-        run: cargo run --release --bin build_cache src/circuit/cache.bin
+        run: cargo run --release --bin build_cache src/circuit/v2_cache.bin src/v1/v1_cache.bin
 
       - name: Build zk_pow_ffi library for Go FFI
         run: |
           cd bindings/go
           cargo build --release
+
+      - name: Test zk_pow_ffi library for Go FFI
+        run: |
+          cd bindings/go
+          cargo test --release
 
   py-pearl-mining-tests:
     name: py-pearl-mining Tests

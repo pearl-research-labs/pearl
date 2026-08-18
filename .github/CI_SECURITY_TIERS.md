@@ -23,6 +23,13 @@ This repository uses a 3-tier CI system to safely support open-source contributi
 - **`integration_tests_ci.yml`** — Full integration tests (pearld + vLLM + miner)
 - **`miner_heavy_ci.yml`** — Performance tests + vLLM Docker image build
 - **`pearl-desktop-wallet.yml`** — Cross-platform Electron + Go builds
+- **`blockchain_build.yml`** — Continuous per-commit build (on `push` to master +
+  manual `workflow_dispatch`, including side branches). Publishes commit-hash-only
+  `pearld` images (`ghcr.io/.../pearld:sha-<commit>`, needs `packages: write`)
+  and commit-hash-named binary artifacts for internal/testnet testing. Never
+  produces version/`latest` tags — those are release-only. Because it holds
+  `packages: write`, keep `workflow_dispatch` maintainer-triggered so untrusted
+  forks cannot push to GHCR.
 
 ### How Tier 2 gating works
 
@@ -32,5 +39,9 @@ This repository uses a 3-tier CI system to safely support open-source contributi
 
 ## Tier 3 Workflows (release only)
 
-- **`release.yml`** — Binary builds + GitHub Release (workflow_dispatch, `release` environment)
+- **`blockchain_release.yml`** — Promotion-only (workflow_dispatch, `release`
+  environment). Does not rebuild: it promotes the artifacts `blockchain_build.yml`
+  already produced for the release commit — re-tagging the `sha-<commit>` image to
+  `:vX.Y.Z` + `:latest`, and renaming the tested binaries to their version names
+  for the GitHub Release.
 - **`pearl-desktop-wallet.yml`** release job — Wallet release (protected by `release` environment)

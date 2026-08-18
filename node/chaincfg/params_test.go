@@ -100,6 +100,141 @@ func TestSigNetMagic(t *testing.T) {
 	require.Equal(t, wire.SigNet, SigNetParams.Net)
 }
 
+// TestMoEForkActivation verifies the strict cutover at the MoE hardfork
+// activation height: V1 before the fork, V2 at and after it.
+func TestMoEForkActivation(t *testing.T) {
+	const forkHeight = int32(100)
+	p := Params{MoEForkHeight: forkHeight}
+
+	tests := []struct {
+		name        string
+		height      int32
+		wantActive  bool
+		wantVersion wire.CertificateVersion
+	}{
+		{"genesis", 0, false, wire.CertificateVersionV1},
+		{"just before fork", forkHeight - 1, false, wire.CertificateVersionV1},
+		{"at fork height", forkHeight, true, wire.CertificateVersionV2},
+		{"after fork height", forkHeight + 1, true, wire.CertificateVersionV2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, p.IsMoEForkActive(tt.height))
+			require.Equal(t, tt.wantVersion, p.RequiredCertVersion(tt.height))
+		})
+	}
+}
+
+// TestMoEForkDisabled verifies that a zero MoEForkHeight disables the fork at
+// every height (the V1 certificate is always required).
+func TestMoEForkDisabled(t *testing.T) {
+	p := Params{MoEForkHeight: 0}
+	for _, height := range []int32{0, 1, 100, 1_000_000} {
+		require.False(t, p.IsMoEForkActive(height))
+		require.Equal(t, wire.CertificateVersionV1, p.RequiredCertVersion(height))
+	}
+}
+
+// TestSaltedSeedForkActivation verifies the strict cutover at the salted
+// noise-seed hardfork activation height: V2 before the fork (with the MoE fork
+// active), V3 at and after it.
+func TestSaltedSeedForkActivation(t *testing.T) {
+	const forkHeight = int32(200)
+	p := Params{MoEForkHeight: 100, SaltedSeedForkHeight: forkHeight}
+
+	tests := []struct {
+		name        string
+		height      int32
+		wantActive  bool
+		wantVersion wire.CertificateVersion
+	}{
+		{"just before fork", forkHeight - 1, false, wire.CertificateVersionV2},
+		{"at fork height", forkHeight, true, wire.CertificateVersionV3},
+		{"after fork height", forkHeight + 1, true, wire.CertificateVersionV3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, p.IsSaltedSeedForkActive(tt.height))
+			require.Equal(t, tt.wantVersion, p.RequiredCertVersion(tt.height))
+		})
+	}
+}
+
+// TestSaltedSeedForkDisabled verifies that a zero SaltedSeedForkHeight disables
+// the fork at every height (the version follows the MoE fork schedule).
+func TestSaltedSeedForkDisabled(t *testing.T) {
+	p := Params{MoEForkHeight: 1, SaltedSeedForkHeight: 0}
+	for _, height := range []int32{1, 100, 1_000_000} {
+		require.False(t, p.IsSaltedSeedForkActive(height))
+		require.Equal(t, wire.CertificateVersionV2, p.RequiredCertVersion(height))
+	}
+}
+
+// TestRankPenaltyForkActivation verifies the activation boundary of the
+// rank-penalty softfork, including the disabled case.
+func TestRankPenaltyForkActivation(t *testing.T) {
+	const forkHeight = int32(100)
+	enabled := Params{RankPenaltyForkHeight: forkHeight}
+
+	tests := []struct {
+		name       string
+		height     int32
+		wantActive bool
+	}{
+		{"genesis", 0, false},
+		{"just before fork", forkHeight - 1, false},
+		{"at fork height", forkHeight, true},
+		{"after fork height", forkHeight + 1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, enabled.IsRankPenaltyForkActive(tt.height))
+		})
+	}
+
+	disabled := Params{RankPenaltyForkHeight: 0}
+	for _, height := range []int32{0, 1, 100, 1_000_000} {
+		require.False(t, disabled.IsRankPenaltyForkActive(height))
+	}
+}
+
+// TestShippedNetworksRankPenaltyOrdering asserts the invariant the rule relies
+// on: only V2 certificates carry a noise rank, so the rank-penalty softfork must
+// never activate before the V2 cutover. blockchain.New rejects params that
+// violate this.
+func TestShippedNetworksRankPenaltyOrdering(t *testing.T) {
+	for name, params := range map[string]*Params{
+		"mainnet":  &MainNetParams,
+		"testnet":  &TestNetParams,
+		"testnet2": &TestNet2Params,
+		"regtest":  &RegressionNetParams,
+		"simnet":   &SimNetParams,
+	} {
+		if params.RankPenaltyForkHeight == 0 {
+			continue
+		}
+		require.GreaterOrEqualf(t, params.RankPenaltyForkHeight, params.MoEForkHeight,
+			"%s must not activate the rank-penalty fork before the MoE fork", name)
+	}
+}
+
+// TestShippedNetworksMoEForkHeights pins the MoE hardfork activation heights
+// for the shipped networks so they cannot change accidentally.
+func TestShippedNetworksMoEForkHeights(t *testing.T) {
+	heights := map[string]struct {
+		params *Params
+		want   int32
+	}{
+		"mainnet":  {&MainNetParams, 71935},
+		"testnet":  {&TestNetParams, 1},
+		"testnet2": {&TestNet2Params, 54869},
+	}
+	for name, tt := range heights {
+		require.Equalf(t, tt.want, tt.params.MoEForkHeight,
+			"%s must ship with MoEForkHeight %d", name, tt.want)
+	}
+}
+
 // compactToBig is a copy of the blockchain.CompactToBig function. We copy it
 // here so we don't run into a circular dependency just because of a test.
 func compactToBig(compact uint32) *big.Int {

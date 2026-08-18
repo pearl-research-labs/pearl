@@ -17,11 +17,11 @@ package rpcserver
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -54,7 +54,7 @@ const (
 // recognized errors.
 //
 // This function is by no means complete and should be expanded based on other
-// known errors.  Any RPC handler not returning a gRPC error (with grpc.Errorf)
+// known errors.  Any RPC handler not returning a gRPC error (using status.Errorf)
 // should return this result instead.
 func translateError(err error) error {
 	code := errorCode(err)

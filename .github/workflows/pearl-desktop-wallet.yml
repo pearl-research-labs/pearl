@@ -23,7 +23,7 @@ permissions:
 env:
   NODE_VERSION: '22'
   PNPM_VERSION: '8.15.6'
-  GO_VERSION: '1.26.1'
+  GO_VERSION: '1.26.6'
   APP_DIR: 'apps/apps/pearl-desktop-wallet'
   PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 

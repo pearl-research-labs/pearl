@@ -1,0 +1,157 @@
+name: Blockchain / Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: "Version override (leave empty to extract from source)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/pearld
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha_short: ${{ steps.sha.outputs.sha_short }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: "1.26.6"
+
+      - name: Extract version
+        id: version
+        working-directory: node
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: |
+          if [ -n "$VERSION_OVERRIDE" ]; then
+            VERSION="$VERSION_OVERRIDE"
+          else
+            echo 'package main; import "fmt"; func main() { fmt.Println(version()) }' > pv.go
+            VERSION="v$(go run pv.go version.go)"
+            rm pv.go
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${VERSION}"
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "sha_short=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+  # Promote the binaries built by blockchain_build.yml for this exact commit:
+  # download the tested artifacts (no rebuild), rename them from their commit-hash
+  # names to clean version names, then publish the GitHub Release.
+  release:
+    needs: version
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA_SHORT: ${{ needs.version.outputs.sha_short }}
+
+    steps:
+      # Fetch the binaries blockchain_build.yml already produced for this commit.
+      # Restricted to the pearl-<os>-<arch> binary artifacts: the build run also
+      # uploads *.dockerbuild build-record artifacts (from docker/build-push-action
+      # inside docker/github-builder) which are not standard zips and break
+      # extraction if downloaded. Fails if no matching artifact exists for the
+      # commit (if_no_artifact_found).
+      - name: Download tested binaries from blockchain_build.yml run
+        uses: dawidd6/action-download-artifact@8305c0f1062bb0d184d09ef4493ecb9288447732 # v20
+        with:
+          github_token: ${{ github.token }}
+          workflow: blockchain_build.yml
+          commit: ${{ github.sha }}
+          workflow_conclusion: success
+          name: '^pearl-(linux|darwin|windows)-'
+          name_is_regexp: true
+          path: artifacts
+          if_no_artifact_found: fail
+
+      - name: Rename artifacts to version and collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # blockchain_build.yml uploads one artifact dir per platform; each has
+          # a file suffixed with the commit sha. Rename that suffix to the version.
+          find artifacts -type f -name "pearl-*-${SHA_SHORT}.*" -print0 | while IFS= read -r -d '' f; do
+            base=$(basename "$f")
+            renamed="${base/-${SHA_SHORT}./-${VERSION}.}"
+            cp "$f" "dist/${renamed}"
+          done
+          echo "Release assets:"
+          ls -1 dist
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          draft: true
+          generate_release_notes: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  # Promote the image built by blockchain_build.yml for this commit (tagged
+  # sha-<commit>) to the official :vX.Y.Z + :latest tags by re-tagging the
+  # existing manifest, so the released image is bit-for-bit what was tested.
+  docker-promote:
+    needs: version
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA_SHORT: ${{ needs.version.outputs.sha_short }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify source image exists
+        run: |
+          if ! docker buildx imagetools inspect "${IMAGE_NAME}:sha-${SHA_SHORT}" >/dev/null 2>&1; then
+            echo "::error::Source image ${IMAGE_NAME}:sha-${SHA_SHORT} not found. blockchain_build.yml must publish it (merge to master or dispatch it on this ref) before promoting."
+            exit 1
+          fi
+
+      - name: Promote to version and latest
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${VERSION}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${IMAGE_NAME}:sha-${SHA_SHORT}"
+
+      - name: Inspect promoted manifest
+        run: docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}"

@@ -348,7 +348,7 @@ func newBlock(chain *BlockChain, prev *btcutil.Block,
 		Bits:       chain.chainParams.PowLimitBits,
 		Timestamp:  ts,
 	}
-	cert, err := SolveBlock(&header, chain.chainParams.Net)
+	cert, err := SolveBlock(&header, chain.chainParams, blockHeight)
 	if err != nil {
 		return nil, nil, err
 	}

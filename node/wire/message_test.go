@@ -88,7 +88,7 @@ func TestMessage(t *testing.T) {
 		{msgGetAddr, msgGetAddr, pver, MainNet, 24},
 		{msgAddr, msgAddr, pver, MainNet, 25},
 		{msgGetBlocks, msgGetBlocks, pver, MainNet, 61},
-		{msgBlock, msgBlock, pver, MainNet, 479}, // 24 msg header + 212 cert (ZKCertificate with 8-byte proof) + 108 header + 1 varint + 134 tx
+		{msgBlock, msgBlock, pver, MainNet, 479}, // 24 msg header + 212 cert (CertificateV1 with 8-byte proof) + 108 header + 1 varint + 134 tx
 		{msgInv, msgInv, pver, MainNet, 25},
 		{msgGetData, msgGetData, pver, MainNet, 25},
 		{msgNotFound, msgNotFound, pver, MainNet, 25},

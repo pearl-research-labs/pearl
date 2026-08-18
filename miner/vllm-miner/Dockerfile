@@ -70,14 +70,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/git \
     uv sync --package vllm-miner --no-install-package pearl-gemm --no-editable --no-dev --inexact
 
-# Runtime image, discard dev packages and caches
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
-
-# Need a C compiler for Triton, and curl for the entrypoint
-RUN --mount=type=cache,target=/var/cache/apt \
-    --mount=type=cache,target=/var/lib/apt/lists \
-    apt-get update && \
-    apt-get install -y --no-install-recommends gcc libc-dev curl
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
 
 WORKDIR /app
 

@@ -15,19 +15,19 @@ from utils import DEFAULT_LAYER_PARAM_NAMES, DEFAULT_QUANT_CONFIG
 # Quantization Operator Tests
 # =============================================================================
 from vllm_miner.quantization_operators import (
-    quant_7bit_smooth,
-    quant_8bit_smooth,
+    quant_7bit,
+    quant_8bit,
 )
 
 # Parametrize: (quant_func, max_val, name)
 QUANT_FUNCS = [
-    pytest.param(quant_7bit_smooth, 63, id="int7"),
-    pytest.param(quant_8bit_smooth, 127, id="int8"),
+    pytest.param(quant_7bit, 63, id="int7"),
+    pytest.param(quant_8bit, 127, id="int8"),
 ]
 
 
 class TestQuantWithSmoothScale:
-    """Tests for quant_7bit_smooth and quant_8bit_smooth."""
+    """Tests for quant_7bit and quant_8bit with an optional smooth scale."""
 
     @pytest.mark.parametrize("quant_func,max_val", QUANT_FUNCS)
     def test_smooth_scale_applied(self, quant_func, max_val):

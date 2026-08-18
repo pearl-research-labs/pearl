@@ -140,7 +140,7 @@ func genBlockChain(numBlocks uint32) ([]*chainhash.Hash, map[chainhash.Hash]*wir
 			Timestamp:  prevHeader.Timestamp.Add(chainParams.TargetTimePerBlock),
 			Bits:       chainParams.PowLimitBits,
 		}
-		cert, err := blockchain.SolveBlock(header, chainParams.Net)
+		cert, err := blockchain.SolveBlock(header, &chainParams, int32(i+1))
 		if err != nil {
 			panic(fmt.Sprintf("could not solve block at idx %v: %v", i, err))
 		}

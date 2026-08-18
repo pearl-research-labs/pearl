@@ -7,7 +7,15 @@ language = "C"
 
 [export]
 # Include these items in the generated header
-include = ["IncompleteBlockHeader", "MiningConfiguration", "CMatrixMerkleProof", "CPlainProof", "CZKProof", "PUBLICDATA_SIZE", "PUBLICDATA_SIZE"]
+include = [
+    "IncompleteBlockHeader",
+    "MiningConfiguration",
+    "CMatrixMerkleProof",
+    "CPlainProof",
+    "CZKProof",
+    "PUBLICDATA_SIZE",
+    "PUBLICDATA_MAX_SIZE",
+]
 
 [export.rename]
 # Keep the names as-is
@@ -20,4 +28,3 @@ include = ["zk-pow"]
 [enum]
 # Use plain integers for enums in C
 rename_variants = "None"
-

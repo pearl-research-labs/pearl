@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, RotateCcw, Save } from 'lucide-react';
+import { X, RotateCcw, Save, Globe, Server } from 'lucide-react';
 import { Button } from '@pearl/ui/components/button';
 
 interface PeerSettingsModalProps {
@@ -10,8 +10,6 @@ interface PeerSettingsModalProps {
 export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
     const [peerAddress, setPeerAddress] = useState('');
     const [peerPort, setPeerPort] = useState('');
-    const [defaultAddress, setDefaultAddress] = useState('');
-    const [defaultPort, setDefaultPort] = useState('');
     const [isCustom, setIsCustom] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
     const [network, setNetwork] = useState('');
@@ -25,10 +23,8 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
     const loadPeerSettings = async () => {
         try {
             const settings = await window.appBridge.manager.getPeerSettings();
-            setPeerAddress(settings.currentAddress);
-            setPeerPort(String(settings.currentPort));
-            setDefaultAddress(settings.defaultAddress);
-            setDefaultPort(String(settings.defaultPort));
+            setPeerAddress(settings.customPeerAddress ?? '');
+            setPeerPort(settings.customPeerPort ? String(settings.customPeerPort) : '');
             setIsCustom(settings.isCustom);
             setNetwork(settings.network);
         } catch (error) {
@@ -37,15 +33,42 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
     };
 
     const handleSave = async () => {
+        const address = peerAddress.trim();
+        const portStr = peerPort.trim();
+
+        // Both fields empty → clear the custom peer and fall back to DNS seeders
+        if (!address && !portStr) {
+            setIsSaving(true);
+            try {
+                await window.appBridge.manager.resetPeerToDefault();
+                await loadPeerSettings();
+                alert('Custom peer cleared. Peers will be discovered automatically via DNS seeders. Please restart the wallet for changes to take effect.');
+                onClose();
+            } catch (error) {
+                console.error('Failed to clear peer settings:', error);
+                alert('Failed to clear settings');
+            } finally {
+                setIsSaving(false);
+            }
+            return;
+        }
+
+        // If one field is filled, the other must be too
+        if (!address || !portStr) {
+            alert('Please fill in both peer address and port, or leave both empty to use automatic discovery.');
+            return;
+        }
+
+        const port = parseInt(portStr, 10);
+        if (isNaN(port) || port < 1 || port > 65535) {
+            alert('Invalid port number');
+            return;
+        }
+
         setIsSaving(true);
         try {
-            const port = parseInt(peerPort, 10);
-            if (isNaN(port) || port < 1 || port > 65535) {
-                alert('Invalid port number');
-                return;
-            }
-
-            await window.appBridge.manager.setCustomPeerAddress(peerAddress, port);
+            await window.appBridge.manager.setCustomPeerAddress(address, port);
+            await loadPeerSettings();
             alert('Peer settings saved! Please restart the wallet for changes to take effect.');
             onClose();
         } catch (error) {
@@ -61,7 +84,7 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
         try {
             await window.appBridge.manager.resetPeerToDefault();
             await loadPeerSettings();
-            alert('Peer settings reset to default! Please restart the wallet for changes to take effect.');
+            alert('Reset to automatic discovery. Please restart the wallet for changes to take effect.');
         } catch (error) {
             console.error('Failed to reset peer settings:', error);
             alert('Failed to reset settings');
@@ -95,32 +118,48 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
 
                 {/* Form */}
                 <div className="space-y-4">
-                    <div>
-                        <label className="mb-1 block text-sm font-medium text-gray-700">Peer Address</label>
-                        <input
-                            type="text"
-                            value={peerAddress}
-                            onChange={(e) => setPeerAddress(e.target.value)}
-                            placeholder="127.0.0.1 or IP address"
-                            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-gray-900 focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500/20"
-                        />
+                    {/* Default Peer Discovery */}
+                    <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+                        <div className="mb-1 flex items-center gap-2">
+                            <Globe className="h-4 w-4 text-green-600" />
+                            <span className="text-sm font-semibold text-gray-700">Default Peer Discovery</span>
+                        </div>
+                        <p className="text-xs text-gray-500">
+                            By default, the wallet automatically discovers peers via Pearl DNS seeders.
+                        </p>
                     </div>
 
+                    {/* Custom Peer (optional) */}
                     <div>
-                        <label className="mb-1 block text-sm font-medium text-gray-700">Peer Port</label>
-                        <input
-                            type="number"
-                            value={peerPort}
-                            onChange={(e) => setPeerPort(e.target.value)}
-                            placeholder="8333"
-                            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-gray-900 focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500/20"
-                        />
+                        <div className="mb-2 flex items-center gap-2">
+                            <Server className="h-4 w-4 text-gray-500" />
+                            <label className="text-sm font-medium text-gray-700">Custom Peer (optional)</label>
+                        </div>
+                        <p className="mb-2 text-xs text-gray-500">
+                            Add a specific peer (IP address or hostname) to connect to at startup. Leave empty to use automatic discovery.
+                        </p>
+                        <div className="space-y-2">
+                            <input
+                                type="text"
+                                value={peerAddress}
+                                onChange={(e) => setPeerAddress(e.target.value)}
+                                placeholder="e.g. 192.168.1.1 or my-node.example.com"
+                                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-gray-900 focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500/20"
+                            />
+                            <input
+                                type="number"
+                                value={peerPort}
+                                onChange={(e) => setPeerPort(e.target.value)}
+                                placeholder="Port (e.g. 44108)"
+                                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-gray-900 focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500/20"
+                            />
+                        </div>
                     </div>
 
                     {isCustom && (
                         <div className="rounded-lg bg-blue-50 p-3">
                             <p className="text-sm text-blue-700">
-                                <strong>Default:</strong> {defaultAddress}:{defaultPort}
+                                A custom peer is currently configured. The wallet will connect to it in addition to DNS-discovered peers.
                             </p>
                         </div>
                     )}
@@ -130,16 +169,16 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
                         <Button
                             onClick={handleReset}
                             variant="outline"
-                            disabled={isSaving}
+                            disabled={isSaving || !isCustom}
                             className="flex-1"
                         >
                             <RotateCcw className="mr-2 h-4 w-4" />
-                            Reset to Default
+                            Use Automatic Discovery
                         </Button>
 
                         <Button
                             onClick={handleSave}
-                            disabled={isSaving || !peerAddress.trim() || !peerPort.trim()}
+                            disabled={isSaving}
                             className="flex-1 bg-green-600 hover:bg-green-700"
                         >
                             <Save className="mr-2 h-4 w-4" />
@@ -155,4 +194,3 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
         </div>
     );
 }
-
