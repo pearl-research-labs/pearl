@@ -2579,7 +2579,7 @@ wheels = [
 
 [[package]]
 name = "py-pearl-mining"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "py-pearl-mining" }
 
 [package.dev-dependencies]
