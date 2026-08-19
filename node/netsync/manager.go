@@ -1496,6 +1496,7 @@ func (sm *SyncManager) processMessage(m interface{}) {
 				isOrphan: false,
 				err:      err,
 			}
+			return
 		}
 
 		msg.reply <- processBlockResponse{
