@@ -31,8 +31,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
-    uses: docker/github-builder/.github/workflows/build.yml@v1
+      id-token: write # github-builder OIDC attestations and cache
+    uses: docker/github-builder/.github/workflows/build.yml@a492c6d04fd3315f67230809b44d60cc0acd50b3 # v1
     with:
       output: image
       context: .
