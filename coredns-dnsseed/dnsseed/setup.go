@@ -2,7 +2,6 @@ package dnsseed
 
 import (
 	"context"
-	"net"
 	"strconv"
 	"time"
 
@@ -157,7 +156,7 @@ func parse(c *caddy.Controller) (*options, error) {
 				return nil, plugin.Error(pluginName, c.SyntaxErr("no crawl interval specified"))
 			}
 			interval, err := time.ParseDuration(c.Val())
-			if err != nil || interval == 0 {
+			if err != nil || interval <= 0 {
 				return nil, plugin.Error(pluginName, c.SyntaxErr("bad crawl_interval duration"))
 			}
 			opts.updateInterval = interval
@@ -166,7 +165,7 @@ func parse(c *caddy.Controller) (*options, error) {
 			if !c.NextArg() {
 				return nil, plugin.Error(pluginName, c.SyntaxErr("no minimum protocol version specified"))
 			}
-			pver, err := strconv.ParseUint(c.Val(), 10, 32)
+			pver, err := strconv.ParseInt(c.Val(), 10, 32)
 			if err != nil {
 				return nil, plugin.Error(pluginName, c.SyntaxErr("bad min_protocol_version number"))
 			}
@@ -175,7 +174,7 @@ func parse(c *caddy.Controller) (*options, error) {
 			if pver < peer.MinAcceptableProtocolVersion {
 				return nil, plugin.Error(pluginName,
 					c.Errf("min_protocol_version %d below the peer library floor %d",
-						pver, uint32(peer.MinAcceptableProtocolVersion)))
+						pver, peer.MinAcceptableProtocolVersion))
 			}
 			opts.minProtocolVersion = uint32(pver)
 
@@ -185,9 +184,9 @@ func parse(c *caddy.Controller) (*options, error) {
 				return nil, plugin.Error(pluginName, c.SyntaxErr("no bootstrap peers specified"))
 			}
 			for _, bp := range bootstrap {
-				if _, _, err := net.SplitHostPort(bp); err != nil {
+				if _, _, err := parseBootstrapPeer(bp); err != nil {
 					return nil, plugin.Error(pluginName,
-						c.Errf("bad bootstrap peer %q: expected host:port", bp))
+						c.Errf("bad bootstrap peer %q: %v", bp, err))
 				}
 			}
 			opts.bootstrapPeers = bootstrap

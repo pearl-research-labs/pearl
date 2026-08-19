@@ -46,6 +46,21 @@ func newestBlockFn(height int32) peer.HashFunc {
 	}
 }
 
+func TestAddrPortFromNAV2(t *testing.T) {
+	ipv4 := wire.NetAddressV2FromBytes(
+		time.Now(), 0, net.ParseIP("192.0.2.1"), 44108,
+	)
+	got, ok := addrPortFromNAV2(ipv4)
+	require.True(t, ok)
+	assert.Equal(t, netip.MustParseAddrPort("192.0.2.1:44108"), got)
+
+	torV2 := wire.NetAddressV2FromBytes(
+		time.Now(), 0, net.ParseIP("fd87:d87e:eb43::1"), 44108,
+	)
+	_, ok = addrPortFromNAV2(torV2)
+	assert.False(t, ok)
+}
+
 func TestMain(m *testing.M) {
 	if err := startMockPeers(); err != nil {
 		fmt.Printf("Failed to start mock peers: %v\n", err)
@@ -160,7 +175,7 @@ func TestOutboundPeerSync(t *testing.T) {
 	require.NotNil(t, p)
 	assert.True(t, p.Connected())
 
-	s.disconnectPeer(compliantAddr)
+	s.disconnectPeer(p)
 	assert.Nil(t, s.livePeer(compliantAddr))
 }
 
@@ -239,6 +254,16 @@ func TestConnectCancelledContext(t *testing.T) {
 
 	_, err := s.connect(ctx, compliantAddr)
 	assert.ErrorIs(t, err, context.Canceled)
+	assert.False(t, s.addrBook.isCoolingDown(compliantAddr))
+}
+
+func TestConnectMarksFailedPeer(t *testing.T) {
+	s := newTestSeeder(t, "regtest")
+	addr := netip.MustParseAddrPort("127.0.0.1:1")
+
+	_, err := s.connect(context.Background(), addr)
+	require.Error(t, err)
+	assert.True(t, s.addrBook.isCoolingDown(addr))
 }
 
 // TestQueueAddrDropsWhenFull verifies that address callbacks never block on a
@@ -336,6 +361,7 @@ func TestSeederMeetsMinimum(t *testing.T) {
 		{"exactly minimum height", pver, requiredServices, minHeight, true},
 		{"exactly minimum protocol", peer.MinAcceptableProtocolVersion, requiredServices, compliantBlockHeight, true},
 		{"below minimum protocol", peer.MinAcceptableProtocolVersion - 1, requiredServices, compliantBlockHeight, false},
+		{"negative protocol", -1, requiredServices, compliantBlockHeight, false},
 		{"low height", pver, requiredServices, minHeight - 1, false},
 		{"missing network service", pver, wire.SFNodeP2PV2, compliantBlockHeight, false},
 		{"missing p2pv2 service", pver, wire.SFNodeNetwork, compliantBlockHeight, false},

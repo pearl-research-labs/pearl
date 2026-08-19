@@ -67,8 +67,28 @@ func TestParse(t *testing.T) {
 			valid:  false,
 		},
 		{
+			name:   "bootstrap peer with empty host rejected",
+			config: "dnsseed {\n  network testnet\n  bootstrap_peers :44110\n}",
+			valid:  false,
+		},
+		{
+			name:   "bootstrap peer with invalid port rejected",
+			config: "dnsseed {\n  network testnet\n  bootstrap_peers node.example.com:http\n}",
+			valid:  false,
+		},
+		{
+			name:   "bootstrap peer with zero port rejected",
+			config: "dnsseed {\n  network testnet\n  bootstrap_peers node.example.com:0\n}",
+			valid:  false,
+		},
+		{
 			name:   "crawl_interval without value",
 			config: "dnsseed {\n  network testnet\n  crawl_interval\n  bootstrap_peers 127.0.0.1:44110\n}",
+			valid:  false,
+		},
+		{
+			name:   "negative crawl_interval rejected",
+			config: "dnsseed {\n  network testnet\n  crawl_interval -1s\n  bootstrap_peers 127.0.0.1:44110\n}",
 			valid:  false,
 		},
 		{
@@ -137,6 +157,11 @@ func TestParse(t *testing.T) {
 		{
 			name:   "min_protocol_version below library floor rejected",
 			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version 0\n}",
+			valid:  false,
+		},
+		{
+			name:   "min_protocol_version above wire range rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version 2147483648\n}",
 			valid:  false,
 		},
 	}

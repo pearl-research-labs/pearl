@@ -90,25 +90,17 @@ func TestAddressBook_TwoStrikes(t *testing.T) {
 	assert.Empty(t, ab.shuffleAddressList(10, false))
 }
 
-// TestAddressBook_TouchResetsFailures verifies that a successful handshake
-// resets the failure counter, so failures must be consecutive to unserve.
-func TestAddressBook_TouchResetsFailures(t *testing.T) {
+func TestAddressBook_AddResetsFailures(t *testing.T) {
 	ab := newAddressBook(testDefaultPort)
 	addr := mustAddr("127.0.0.1:44108")
 	ab.add(addr)
 
 	ab.markFailed(addr)
-	assert.True(t, ab.touch(addr))
+	ab.add(addr)
 
 	ab.markFailed(addr)
 	assert.Equal(t, 1, ab.count(),
 		"failures separated by a successful handshake must not accumulate")
-}
-
-func TestAddressBook_TouchUnknownPeer(t *testing.T) {
-	ab := newAddressBook(testDefaultPort)
-	assert.False(t, ab.touch(mustAddr("10.0.0.1:44108")))
-	assert.Equal(t, 0, ab.count())
 }
 
 // TestAddressBook_CooldownExpires verifies that expired cooldown entries are

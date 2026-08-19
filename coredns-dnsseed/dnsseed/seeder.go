@@ -19,16 +19,8 @@ import (
 	"github.com/pearl-research-labs/pearl/version"
 )
 
-// addrPortFromPeer recovers the address a peer was dialed on. Outbound peers
-// carry back the exact string they were dialed with, so the parse only fails
-// for inbound peers, which the seeder never accepts.
-func addrPortFromPeer(p *peer.Peer) (netip.AddrPort, bool) {
-	addr, err := netip.ParseAddrPort(p.Addr())
-	if err != nil {
-		log.Debugf("Ignoring peer with unparsable address %q: %v", p.Addr(), err)
-		return netip.AddrPort{}, false
-	}
-	return addr, true
+func addrPortFromPeer(p *peer.Peer) netip.AddrPort {
+	return netip.MustParseAddrPort(p.Addr())
 }
 
 // addrPortFromNAV2 extracts an address from a v2 network address, reporting
@@ -36,15 +28,14 @@ func addrPortFromPeer(p *peer.Peer) (netip.AddrPort, bool) {
 // addresses are unmapped so that a peer has the same identity however it was
 // gossiped.
 func addrPortFromNAV2(na *wire.NetAddressV2) (netip.AddrPort, bool) {
-	legacy := na.ToLegacy()
-	if legacy == nil {
+	if na == nil || na.Addr == nil {
 		return netip.AddrPort{}, false
 	}
-	ip, ok := netip.AddrFromSlice(legacy.IP)
-	if !ok {
+	ip, err := netip.ParseAddr(na.Addr.String())
+	if err != nil {
 		return netip.AddrPort{}, false
 	}
-	return netip.AddrPortFrom(ip.Unmap(), legacy.Port), true
+	return netip.AddrPortFrom(ip.Unmap(), na.Port), true
 }
 
 var (
@@ -74,14 +65,6 @@ func latestCheckpointHeight(p *chaincfg.Params) int32 {
 		return p.Checkpoints[n-1].Height
 	}
 	return 0
-}
-
-func newDefaultPeerConfig() peer.Config {
-	return peer.Config{
-		UserAgentName:    "pearl-seeder",
-		UserAgentVersion: version.UserAgent(),
-		Services:         wire.SFNodeP2PV2,
-	}
 }
 
 const (
@@ -126,8 +109,12 @@ func newSeeder(networkName string, minProtocolVersion uint32) (*seeder, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := newDefaultPeerConfig()
-	cfg.ChainParams = params
+	cfg := peer.Config{
+		UserAgentName:    "pearl-seeder",
+		UserAgentVersion: version.UserAgent(),
+		ChainParams:      params,
+		Services:         wire.SFNodeP2PV2,
+	}
 
 	s := &seeder{
 		config:             &cfg,
@@ -155,7 +142,7 @@ func (s *seeder) meetsMinimum(
 		return false, fmt.Sprintf("services %s missing required %s",
 			services, requiredServices)
 	}
-	if uint32(pver) < s.minProtocolVersion {
+	if pver < 0 || uint32(pver) < s.minProtocolVersion {
 		return false, fmt.Sprintf("protocol version %d below minimum %d",
 			pver, s.minProtocolVersion)
 	}
@@ -186,20 +173,30 @@ func networkParams(name string) (*chaincfg.Params, error) {
 	}
 }
 
+func parseBootstrapPeer(addr string) (string, uint16, error) {
+	host, portString, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, err
+	}
+	if host == "" {
+		return "", 0, errors.New("host is empty")
+	}
+	port, err := strconv.ParseUint(portString, 10, 16)
+	if err != nil || port == 0 {
+		return "", 0, fmt.Errorf("invalid port %q", portString)
+	}
+	return host, uint16(port), nil
+}
+
 // bootstrap resolves each "host:port" bootstrap peer and connects to every
 // resolved address, reporting whether at least one new connection succeeded.
 // It only fails on network conditions, which the caller is expected to retry.
 func (s *seeder) bootstrap(ctx context.Context, peers []string) bool {
 	connected := false
 	for _, bootstrapPeer := range peers {
-		host, portString, err := net.SplitHostPort(bootstrapPeer)
+		host, port, err := parseBootstrapPeer(bootstrapPeer)
 		if err != nil {
 			log.Warningf("Invalid bootstrap peer %q: %v", bootstrapPeer, err)
-			continue
-		}
-		port, err := strconv.ParseUint(portString, 10, 16)
-		if err != nil {
-			log.Warningf("Invalid bootstrap peer %q: bad port: %v", bootstrapPeer, err)
 			continue
 		}
 
@@ -210,7 +207,7 @@ func (s *seeder) bootstrap(ctx context.Context, peers []string) bool {
 		}
 
 		for _, ip := range addrs {
-			addr := netip.AddrPortFrom(ip.Unmap(), uint16(port))
+			addr := netip.AddrPortFrom(ip.Unmap(), port)
 			if _, err := s.dial(ctx, addr); err != nil {
 				log.Infof("Connecting to bootstrap peer %s: %v", addr, err)
 				continue
@@ -222,13 +219,17 @@ func (s *seeder) bootstrap(ctx context.Context, peers []string) bool {
 	return connected
 }
 
-// connect establishes an outbound connection to a discovered peer, refusing
-// addresses in failure cooldown.
+// connect verifies a discovered peer, refusing addresses in cooldown and
+// recording failed attempts.
 func (s *seeder) connect(ctx context.Context, addr netip.AddrPort) (*peer.Peer, error) {
 	if s.addrBook.isCoolingDown(addr) {
 		return nil, errCoolingDown
 	}
-	return s.dial(ctx, addr)
+	p, err := s.dial(ctx, addr)
+	if err != nil && !errors.Is(err, errRepeatConnection) && ctx.Err() == nil {
+		s.addrBook.markFailed(addr)
+	}
+	return p, err
 }
 
 // dial establishes an outbound v2 encrypted connection and completes the
@@ -260,7 +261,7 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 	hctx, cancel := context.WithTimeoutCause(ctx, maximumHandshakeWait, errHandshakeTimeout)
 	defer cancel()
 
-	if err := p.WaitForHandshake(hctx); err != nil && !p.VerAckReceived() {
+	if err := p.WaitForHandshake(hctx); err != nil {
 		s.unreservePeer(addr, p)
 		p.Disconnect()
 		p.WaitForDisconnect()
@@ -270,9 +271,7 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 	log.Debugf("Handshake completed with peer %s", p.Addr())
 	// Book here so bootstrap peers, which gossip never verifies, enter the
 	// served set. add itself drops non-default ports.
-	if !s.addrBook.touch(addr) {
-		s.addrBook.add(addr)
-	}
+	s.addrBook.add(addr)
 	return p, nil
 }
 
@@ -311,18 +310,17 @@ func (s *seeder) onVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgReject {
 	return nil
 }
 
-// disconnectPeer disconnects and removes a reserved peer; unknown peers are a
-// no-op.
-func (s *seeder) disconnectPeer(addr netip.AddrPort) {
+// disconnectPeer removes p from the reservation map and tears the connection
+// down. A no-op if p is not the currently reserved peer for its address.
+func (s *seeder) disconnectPeer(p *peer.Peer) {
+	addr := addrPortFromPeer(p)
 	s.peersMu.Lock()
-	p, ok := s.peers[addr]
-	if ok {
-		delete(s.peers, addr)
-	}
-	s.peersMu.Unlock()
-	if !ok {
+	if s.peers[addr] != p {
+		s.peersMu.Unlock()
 		return
 	}
+	delete(s.peers, addr)
+	s.peersMu.Unlock()
 
 	log.Debugf("Disconnecting from peer %s", p.Addr())
 	p.Disconnect()
@@ -379,9 +377,7 @@ func (s *seeder) queueAddr(addr netip.AddrPort) bool {
 func (s *seeder) onAddrV2(p *peer.Peer, msg *wire.MsgAddrV2) {
 	if len(msg.AddrList) == 0 {
 		log.Debugf("Got empty addrv2 from peer %s, disconnecting", p.Addr())
-		if addr, ok := addrPortFromPeer(p); ok {
-			s.disconnectPeer(addr)
-		}
+		s.disconnectPeer(p)
 		return
 	}
 
@@ -414,48 +410,33 @@ func (s *seeder) requestAddresses(ctx context.Context) {
 		p.QueueMessage(wire.NewMsgGetAddr(), nil)
 	}
 
-	var wg sync.WaitGroup
-	for range crawlerWorkerCount {
-		wg.Go(func() {
-			// Reset is race-free with the Go 1.23+ timer semantics this
-			// module requires, so one timer serves the whole loop.
-			idle := time.NewTimer(crawlerIdleTimeout)
-			defer idle.Stop()
-			for {
-				var addr netip.AddrPort
-				idle.Reset(crawlerIdleTimeout)
-				select {
-				case <-ctx.Done():
-					return
-				case next := <-s.addrQueue:
-					addr = next
-				case <-idle.C:
-					return
-				}
+	var g errgroup.Group
+	g.SetLimit(crawlerWorkerCount)
+	defer g.Wait()
 
-				// Re-check: multiple peers gossip the same address, and
-				// another worker may have verified it since it was queued.
-				if s.addrBook.isKnown(addr) {
-					continue
-				}
-
-				newPeer, err := s.connect(ctx, addr)
-				if err != nil {
-					// Cancellation and repeat connections say nothing
-					// about the peer's health, so don't mark it failed.
-					if errors.Is(err, errRepeatConnection) || ctx.Err() != nil {
-						continue
+	idle := time.NewTimer(crawlerIdleTimeout)
+	defer idle.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case addr := <-s.addrQueue:
+			// Re-check: multiple peers gossip the same address, and
+			// another dial may have verified it since it was queued.
+			if !s.addrBook.isKnown(addr) {
+				g.Go(func() error {
+					newPeer, err := s.connect(ctx, addr)
+					if err == nil {
+						newPeer.QueueMessage(wire.NewMsgGetAddr(), nil)
 					}
-					s.addrBook.markFailed(addr)
-					continue
-				}
-
-				newPeer.QueueMessage(wire.NewMsgGetAddr(), nil)
+					return nil
+				})
 			}
-		})
+			idle.Reset(crawlerIdleTimeout)
+		case <-idle.C:
+			return
+		}
 	}
-
-	wg.Wait()
 }
 
 // refreshAddresses re-verifies all known-good addresses, dialing up to
@@ -468,14 +449,11 @@ func (s *seeder) refreshAddresses(ctx context.Context) {
 	var g errgroup.Group
 	g.SetLimit(crawlerWorkerCount)
 	for _, addr := range s.addrBook.snapshot() {
+		if ctx.Err() != nil {
+			break
+		}
 		g.Go(func() error {
-			if ctx.Err() != nil {
-				return nil
-			}
-			_, err := s.connect(ctx, addr)
-			if err != nil && !errors.Is(err, errRepeatConnection) && ctx.Err() == nil {
-				s.addrBook.markFailed(addr)
-			}
+			_, _ = s.connect(ctx, addr)
 			return nil
 		})
 	}

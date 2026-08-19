@@ -74,21 +74,24 @@ func (ab *addressBook) rebuildServable() {
 	}
 }
 
-// add books a peer. Peers on non-default ports are skipped, and the book is
-// capped at maxAddressBookSize.
+// add records a successful verification. Peers on non-default ports are
+// skipped, and the book is capped at maxAddressBookSize.
 func (ab *addressBook) add(addr netip.AddrPort) {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
-	if addr.Port() != ab.defaultPort || len(ab.peers) >= maxAddressBookSize {
+	if addr.Port() != ab.defaultPort {
+		return
+	}
+
+	_, exists := ab.peers[addr]
+	if !exists && len(ab.peers) >= maxAddressBookSize {
 		return
 	}
 	ab.peers[addr] = 0
-	// A booked peer is verified, so any cooldown record (e.g. from a
-	// bootstrap dial while cooling down) is obsolete. Left in place it
-	// would make connect refuse the peer on the next refresh and strike
-	// it right back out of the book.
 	delete(ab.failedAt, addr)
-	ab.rebuildServable()
+	if !exists {
+		ab.rebuildServable()
+	}
 }
 
 // markFailed records a verification failure. Booked (previously verified)
@@ -109,18 +112,6 @@ func (ab *addressBook) markFailed(addr netip.AddrPort) {
 		ab.rebuildServable()
 	}
 	ab.failedAt[addr] = time.Now()
-}
-
-// touch marks a successful re-verification of a booked peer, resetting its
-// failure counter, and reports whether the peer was found in the book.
-func (ab *addressBook) touch(addr netip.AddrPort) bool {
-	ab.mu.Lock()
-	defer ab.mu.Unlock()
-	failures, ok := ab.peers[addr]
-	if ok && failures != 0 {
-		ab.peers[addr] = 0
-	}
-	return ok
 }
 
 // count returns the number of known-good peers.
