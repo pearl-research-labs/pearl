@@ -39,9 +39,10 @@ func addrPortFromNAV2(na *wire.NetAddressV2) (netip.AddrPort, bool) {
 }
 
 var (
-	errRepeatConnection = errors.New("attempted repeat connection to existing peer")
-	errCoolingDown      = errors.New("peer is in failure cooldown")
-	errHandshakeTimeout = errors.New("peer handshake timed out")
+	errRepeatConnection    = errors.New("attempted repeat connection to existing peer")
+	errCoolingDown         = errors.New("peer is in failure cooldown")
+	errHandshakeTimeout    = errors.New("peer handshake timed out")
+	errHandshakeIncomplete = errors.New("peer disconnected before handshake completed")
 )
 
 // DNS seed serving policy. Peers must carry the required service bits and
@@ -237,8 +238,17 @@ func (s *seeder) connect(ctx context.Context, addr netip.AddrPort) (*peer.Peer, 
 // directly: bootstrap peers are operator-configured, so they are re-dialed
 // even while cooling down.
 func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, error) {
-	// NewOutboundPeer copies the config, so the shared one can be passed.
-	p, err := peer.NewOutboundPeer(s.config, addr.String())
+	cfg := *s.config
+	done := make(chan struct{})
+	cfg.Listeners.OnVerAck = func(*peer.Peer, *wire.MsgVerAck) {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+
+	p, err := peer.NewOutboundPeer(&cfg, addr.String())
 	if err != nil {
 		return nil, err
 	}
@@ -255,13 +265,16 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 	}
 
 	p.AssociateConnection(conn)
+	// Drop the reservation when the socket dies so refresh can re-dial.
+	go func() {
+		p.WaitForDisconnect()
+		s.unreservePeer(addr, p)
+	}()
 
-	// The handshake gets its own deadline so caller cancellation and
-	// timeout share one exit path.
 	hctx, cancel := context.WithTimeoutCause(ctx, maximumHandshakeWait, errHandshakeTimeout)
 	defer cancel()
 
-	if err := p.WaitForHandshake(hctx); err != nil {
+	if err := waitForHandshake(hctx, p, done); err != nil {
 		s.unreservePeer(addr, p)
 		p.Disconnect()
 		p.WaitForDisconnect()
@@ -273,6 +286,25 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 	// served set. add itself drops non-default ports.
 	s.addrBook.add(addr)
 	return p, nil
+}
+
+// waitForHandshake prefers a completed verack over a simultaneous
+// disconnect or cancellation.
+func waitForHandshake(ctx context.Context, p *peer.Peer, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	case <-p.Done():
+		if p.VerAckReceived() {
+			return nil
+		}
+		return errHandshakeIncomplete
+	case <-ctx.Done():
+		if p.VerAckReceived() {
+			return nil
+		}
+		return context.Cause(ctx)
+	}
 }
 
 // reservePeer atomically refuses a second connection to addr, then registers

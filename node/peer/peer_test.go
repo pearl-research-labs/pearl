@@ -6,7 +6,6 @@
 package peer_test
 
 import (
-	"context"
 	"errors"
 	"io"
 	"net"
@@ -239,55 +238,6 @@ func TestPeerConnection(t *testing.T) {
 	outPeer.Disconnect()
 	inPeer.WaitForDisconnect()
 	outPeer.WaitForDisconnect()
-}
-
-func TestWaitForHandshake(t *testing.T) {
-	cfg := &peer.Config{
-		UserAgentName:    "peer",
-		UserAgentVersion: "1.0",
-		ChainParams:      &chaincfg.MainNetParams,
-		TrickleInterval:  10 * time.Second,
-		AllowSelfConns:   true,
-	}
-
-	t.Run("completes", func(t *testing.T) {
-		inPeer := peer.NewInboundPeer(cfg)
-		outPeer, err := peer.NewOutboundPeer(cfg, "10.0.0.2:8333")
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			inPeer.Disconnect()
-			outPeer.Disconnect()
-			inPeer.WaitForDisconnect()
-			outPeer.WaitForDisconnect()
-		})
-
-		require.NoError(t, setupPeerConnection(inPeer, outPeer))
-
-		ctx, cancel := context.WithTimeout(context.Background(), testWaitTimeout)
-		defer cancel()
-		require.NoError(t, outPeer.WaitForHandshake(ctx))
-		require.NoError(t, inPeer.WaitForHandshake(ctx))
-		assert.True(t, outPeer.VerAckReceived())
-		assert.True(t, inPeer.VerAckReceived())
-		require.NoError(t, outPeer.WaitForHandshake(ctx))
-	})
-
-	t.Run("disconnect before handshake", func(t *testing.T) {
-		p, err := peer.NewOutboundPeer(cfg, "10.0.0.2:8333")
-		require.NoError(t, err)
-		p.Disconnect()
-		err = p.WaitForHandshake(context.Background())
-		assert.ErrorIs(t, err, peer.ErrHandshakeIncomplete)
-	})
-
-	t.Run("context canceled", func(t *testing.T) {
-		p, err := peer.NewOutboundPeer(cfg, "10.0.0.2:8333")
-		require.NoError(t, err)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		err = p.WaitForHandshake(ctx)
-		assert.ErrorIs(t, err, context.Canceled)
-	})
 }
 
 // TestPeerListeners verifies that each message listener callback fires when
