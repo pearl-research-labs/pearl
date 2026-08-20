@@ -222,7 +222,7 @@ func TestBootstrapAllUnreachable(t *testing.T) {
 
 	// Port 1 is closed, and the malformed entry must be skipped.
 	assert.False(t, s.bootstrap(ctx, []string{"127.0.0.1:1", "not-a-host-port"}))
-	assert.Zero(t, s.peerCount())
+	assert.Zero(t, s.addrBook.count())
 }
 
 // TestVerAckBooksOnlyDefaultPortPeers verifies that every verified handshake
@@ -244,7 +244,7 @@ func TestVerAckBooksOnlyDefaultPortPeers(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, s.addrBook.isKnown(secondAddr),
 		"non-default-port peers must not be booked")
-	assert.Equal(t, 1, s.peerCount())
+	assert.Equal(t, 1, s.addrBook.count())
 }
 
 func TestConnectCancelledContext(t *testing.T) {
@@ -337,7 +337,7 @@ func TestBootstrapBypassesCooldown(t *testing.T) {
 
 	assert.True(t, s.bootstrap(ctx, []string{compliantAddr.String()}),
 		"bootstrap must dial operator-configured peers even in cooldown")
-	assert.Equal(t, 1, s.peerCount())
+	assert.Equal(t, 1, s.addrBook.count())
 	assert.False(t, s.addrBook.isCoolingDown(compliantAddr),
 		"booking a verified peer must clear its cooldown record")
 }
@@ -401,7 +401,7 @@ func TestConfiguredProtocolFloorRejectsPeer(t *testing.T) {
 
 	assert.Nil(t, s.livePeer(compliantAddr),
 		"below-floor peer must not enter the live peer set")
-	require.Zero(t, s.peerCount(), "below-floor peer must not be served")
+	require.Zero(t, s.addrBook.count(), "below-floor peer must not be served")
 }
 
 // TestRejectsPreForkProtocolPeer verifies that a peer advertising a wire
@@ -419,5 +419,5 @@ func TestRejectsPreForkProtocolPeer(t *testing.T) {
 
 	assert.Nil(t, s.livePeer(preforkAddr),
 		"pre-fork peer must not enter the live peer set")
-	require.Zero(t, s.peerCount(), "pre-fork peer must not be served")
+	require.Zero(t, s.addrBook.count(), "pre-fork peer must not be served")
 }

@@ -69,12 +69,6 @@ func latestCheckpointHeight(p *chaincfg.Params) int32 {
 }
 
 const (
-	// minimumReadyAddresses is the number of servable addresses required
-	// before the seeder reports ready. One verified address is enough to
-	// bootstrap a node, and serving a short answer beats being pulled from
-	// the load balancer entirely.
-	minimumReadyAddresses = 1
-
 	// crawlerWorkerCount bounds concurrent connection attempts during
 	// crawls. A fixed count is used deliberately: runtime.NumCPU reports
 	// host cores rather than the container CPU limit, and the work is
@@ -495,20 +489,5 @@ func (s *seeder) refreshAddresses(ctx context.Context) {
 // ready reports whether the seeder has at least one servable address. The
 // book only holds verified default-port peers, so any entry is servable.
 func (s *seeder) ready() bool {
-	return s.addrBook.count() >= minimumReadyAddresses
-}
-
-// addresses returns up to n shuffled IPv4 addresses.
-func (s *seeder) addresses(n int) []net.IP {
-	return s.addrBook.shuffleAddressList(n, false)
-}
-
-// addressesV6 returns up to n shuffled IPv6 addresses.
-func (s *seeder) addressesV6(n int) []net.IP {
-	return s.addrBook.shuffleAddressList(n, true)
-}
-
-// peerCount returns the number of known-good peers.
-func (s *seeder) peerCount() int {
-	return s.addrBook.count()
+	return s.addrBook.count() > 0
 }

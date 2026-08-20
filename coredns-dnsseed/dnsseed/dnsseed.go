@@ -5,7 +5,6 @@ package dnsseed
 
 import (
 	"context"
-	"net"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/metrics"
@@ -13,22 +12,8 @@ import (
 	"github.com/miekg/dns"
 )
 
-const (
-	// recordTTL is the fixed TTL served for all DNS records.
-	recordTTL uint32 = 3600
-
-	// maxAnswers is the fixed maximum of addresses per DNS response. It
-	// keeps UDP answers comfortably inside one datagram while giving a
-	// joining node more peers than it has outbound slots.
-	maxAnswers = 25
-)
-
-// addressProvider is the view of the crawler that DNS serving needs.
-type addressProvider interface {
-	addresses(n int) []net.IP
-	addressesV6(n int) []net.IP
-	ready() bool
-}
+// recordTTL is the fixed TTL served for all DNS records.
+const recordTTL uint32 = 3600
 
 // Dnsseed serves peer IP addresses discovered by crawling the Pearl P2P
 // network. Records exist only at the zone apex: A and AAAA queries answer
@@ -39,7 +24,7 @@ type addressProvider interface {
 type Dnsseed struct {
 	Next   plugin.Handler
 	Zones  []string
-	seeder addressProvider
+	seeder *seeder
 }
 
 func (d Dnsseed) Name() string { return pluginName }
@@ -69,14 +54,14 @@ func (d Dnsseed) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
 
 	switch state.QType() {
 	case dns.TypeA:
-		for _, ip := range d.seeder.addresses(maxAnswers) {
+		for _, ip := range d.seeder.addrBook.shuffledAddresses(false) {
 			a.Answer = append(a.Answer, &dns.A{
 				Hdr: dns.RR_Header{Name: state.QName(), Rrtype: dns.TypeA, Class: state.QClass(), Ttl: recordTTL},
 				A:   ip,
 			})
 		}
 	case dns.TypeAAAA:
-		for _, ip := range d.seeder.addressesV6(maxAnswers) {
+		for _, ip := range d.seeder.addrBook.shuffledAddresses(true) {
 			a.Answer = append(a.Answer, &dns.AAAA{
 				Hdr:  dns.RR_Header{Name: state.QName(), Rrtype: dns.TypeAAAA, Class: state.QClass(), Ttl: recordTTL},
 				AAAA: ip,

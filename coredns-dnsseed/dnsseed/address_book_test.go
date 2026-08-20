@@ -82,12 +82,12 @@ func TestAddressBook_TwoStrikes(t *testing.T) {
 	ab.markFailed(addr)
 	assert.Equal(t, 1, ab.count(), "one failure must not unserve a verified peer")
 	assert.False(t, ab.isCoolingDown(addr))
-	assert.Len(t, ab.shuffleAddressList(10, false), 1)
+	assert.Len(t, ab.shuffledAddresses(false), 1)
 
 	ab.markFailed(addr)
 	assert.Equal(t, 0, ab.count(), "second consecutive failure must unserve the peer")
 	assert.True(t, ab.isCoolingDown(addr))
-	assert.Empty(t, ab.shuffleAddressList(10, false))
+	assert.Empty(t, ab.shuffledAddresses(false))
 }
 
 func TestAddressBook_AddResetsFailures(t *testing.T) {
@@ -134,29 +134,26 @@ func TestAddressBook_PruneCooldown(t *testing.T) {
 	assert.Contains(t, ab.failedAt, active)
 }
 
-func TestAddressBook_ShuffleAddressList(t *testing.T) {
+func TestAddressBook_ShuffledAddresses(t *testing.T) {
 	ab := newAddressBook(testDefaultPort)
 	ab.add(mustAddr("127.0.0.1:44108"))
 	ab.add(mustAddr("127.0.0.2:44108"))
 	ab.add(mustAddr("127.0.0.3:44108"))
 
-	ips := ab.shuffleAddressList(10, false)
-	assert.Len(t, ips, 3)
-
-	for range 20 {
-		ips = ab.shuffleAddressList(2, false)
-		assert.Len(t, ips, 2)
-		assert.NotEqual(t, ips[0].String(), ips[1].String())
-	}
+	ips := ab.shuffledAddresses(false)
+	require.Len(t, ips, 3)
+	assert.NotEqual(t, ips[0].String(), ips[1].String())
+	assert.NotEqual(t, ips[0].String(), ips[2].String())
+	assert.NotEqual(t, ips[1].String(), ips[2].String())
 }
 
-func TestAddressBook_ShuffleAddressListV6(t *testing.T) {
+func TestAddressBook_ShuffledAddressesV6(t *testing.T) {
 	ab := newAddressBook(testDefaultPort)
 	ab.add(mustAddr("127.0.0.1:44108"))
 	ab.add(mustAddr("[::1]:44108"))
 
-	v4 := ab.shuffleAddressList(10, false)
-	v6 := ab.shuffleAddressList(10, true)
+	v4 := ab.shuffledAddresses(false)
+	v6 := ab.shuffledAddresses(true)
 
 	assert.Len(t, v4, 1)
 	assert.Len(t, v6, 1)

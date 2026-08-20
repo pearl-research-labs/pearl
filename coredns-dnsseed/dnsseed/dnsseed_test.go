@@ -19,25 +19,14 @@ const testZone = "seed.example.org."
 // testSOA is the SOA record the plugin synthesizes for testZone.
 var testSOA = test.SOA(testZone + " 3600 IN SOA " + testZone + " hostmaster." + testZone + " 1 7200 1800 86400 3600")
 
-type fakeProvider struct {
-	v4, v6 []net.IP
-	isUp   bool
-}
-
-func (f fakeProvider) addresses(n int) []net.IP {
-	return f.v4[:min(n, len(f.v4))]
-}
-
-func (f fakeProvider) addressesV6(n int) []net.IP {
-	return f.v6[:min(n, len(f.v6))]
-}
-
-func (f fakeProvider) ready() bool { return f.isUp }
-
-func newTestHandler(provider addressProvider) Dnsseed {
+func newTestHandler(ips ...string) Dnsseed {
+	s := &seeder{addrBook: newAddressBook(testDefaultPort)}
+	for _, ip := range ips {
+		s.addrBook.add(mustAddr(net.JoinHostPort(ip, testDefaultPort)))
+	}
 	return Dnsseed{
 		Zones:  []string{testZone},
-		seeder: provider,
+		seeder: s,
 	}
 }
 
@@ -53,11 +42,7 @@ func query(t *testing.T, d Dnsseed, qname string, qtype uint16) (int, *dns.Msg) 
 }
 
 func TestServeDNSApexA(t *testing.T) {
-	provider := fakeProvider{
-		v4: []net.IP{net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2")},
-		v6: []net.IP{net.ParseIP("::1")},
-	}
-	d := newTestHandler(provider)
+	d := newTestHandler("10.0.0.1", "10.0.0.2", "::1")
 
 	rcode, msg := query(t, d, testZone, dns.TypeA)
 
@@ -74,8 +59,7 @@ func TestServeDNSApexA(t *testing.T) {
 }
 
 func TestServeDNSApexAAAA(t *testing.T) {
-	provider := fakeProvider{v6: []net.IP{net.ParseIP("2001:db8::1")}}
-	d := newTestHandler(provider)
+	d := newTestHandler("2001:db8::1")
 
 	rcode, msg := query(t, d, testZone, dns.TypeAAAA)
 
@@ -89,8 +73,7 @@ func TestServeDNSApexAAAA(t *testing.T) {
 }
 
 func TestServeDNSApexSOA(t *testing.T) {
-	provider := fakeProvider{v4: []net.IP{net.ParseIP("10.0.0.1")}}
-	d := newTestHandler(provider)
+	d := newTestHandler()
 
 	rcode, msg := query(t, d, testZone, dns.TypeSOA)
 
@@ -102,11 +85,11 @@ func TestServeDNSApexSOA(t *testing.T) {
 }
 
 func TestServeDNSRespectsMaxAnswers(t *testing.T) {
-	var provider fakeProvider
+	ips := make([]string, 0, maxAnswers+5)
 	for i := range maxAnswers + 5 {
-		provider.v4 = append(provider.v4, net.ParseIP(fmt.Sprintf("10.0.%d.%d", i/256, i%256)))
+		ips = append(ips, fmt.Sprintf("10.0.%d.%d", i/256, i%256))
 	}
-	d := newTestHandler(provider)
+	d := newTestHandler(ips...)
 
 	_, msg := query(t, d, testZone, dns.TypeA)
 	assert.Len(t, msg.Answer, maxAnswers)
@@ -116,7 +99,7 @@ func TestServeDNSRespectsMaxAnswers(t *testing.T) {
 // book gets an empty NOERROR carrying the SOA, so it can be negatively
 // cached.
 func TestServeDNSEmptyBookIsNoData(t *testing.T) {
-	d := newTestHandler(fakeProvider{})
+	d := newTestHandler()
 
 	rcode, msg := query(t, d, testZone, dns.TypeA)
 
@@ -128,8 +111,7 @@ func TestServeDNSEmptyBookIsNoData(t *testing.T) {
 }
 
 func TestServeDNSSubdomainIsNXDOMAIN(t *testing.T) {
-	provider := fakeProvider{v4: []net.IP{net.ParseIP("10.0.0.1")}}
-	d := newTestHandler(provider)
+	d := newTestHandler("10.0.0.1")
 
 	rcode, msg := query(t, d, "sub."+testZone, dns.TypeA)
 
@@ -143,8 +125,7 @@ func TestServeDNSSubdomainIsNXDOMAIN(t *testing.T) {
 }
 
 func TestServeDNSUnsupportedQtypeIsNoData(t *testing.T) {
-	provider := fakeProvider{v4: []net.IP{net.ParseIP("10.0.0.1")}}
-	d := newTestHandler(provider)
+	d := newTestHandler("10.0.0.1")
 
 	rcode, msg := query(t, d, testZone, dns.TypeTXT)
 
@@ -156,7 +137,7 @@ func TestServeDNSUnsupportedQtypeIsNoData(t *testing.T) {
 }
 
 func TestServeDNSNonMatchingZoneFallsThrough(t *testing.T) {
-	d := newTestHandler(fakeProvider{})
+	d := newTestHandler()
 	d.Next = test.NextHandler(dns.RcodeRefused, nil)
 
 	r := new(dns.Msg)
@@ -169,12 +150,12 @@ func TestServeDNSNonMatchingZoneFallsThrough(t *testing.T) {
 }
 
 func TestReadyDelegatesToSeeder(t *testing.T) {
-	assert.True(t, newTestHandler(fakeProvider{isUp: true}).Ready())
-	assert.False(t, newTestHandler(fakeProvider{isUp: false}).Ready())
+	assert.True(t, newTestHandler("10.0.0.1").Ready())
+	assert.False(t, newTestHandler().Ready())
 }
 
 func TestServeDNSCountsRequests(t *testing.T) {
-	d := newTestHandler(fakeProvider{})
+	d := newTestHandler()
 
 	before := testutil.ToFloat64(requestCount)
 	query(t, d, testZone, dns.TypeA)

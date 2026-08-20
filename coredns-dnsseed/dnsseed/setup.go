@@ -94,7 +94,7 @@ func crawlLoop(ctx context.Context, s *seeder, opts *options) {
 		// An empty book means every known peer died (or the pod lost
 		// egress); gossip has no live source, so start over from the
 		// bootstrap peers.
-		if s.peerCount() == 0 {
+		if s.addrBook.count() == 0 {
 			log.Warningf("Address book is empty, re-bootstrapping")
 			s.bootstrap(crawlCtx, opts.bootstrapPeers)
 		}
@@ -121,14 +121,15 @@ func crawlLoop(ctx context.Context, s *seeder, opts *options) {
 func runCrawl(ctx context.Context, name string, s *seeder) {
 	start := time.Now()
 	s.addrBook.pruneCooldown()
-	before := s.peerCount()
+	before := s.addrBook.count()
 	s.refreshAddresses(ctx)
 	s.requestAddresses(ctx)
 	s.disconnectAllPeers()
-	addressCount.Set(float64(s.peerCount()))
+	after := s.addrBook.count()
+	addressCount.Set(float64(after))
 	elapsed := time.Since(start).Truncate(time.Second).Seconds()
 	log.Infof("[%s] crawl complete, %d new peers of %d total in %.0fs",
-		name, s.peerCount()-before, s.peerCount(), elapsed)
+		name, after-before, after, elapsed)
 }
 
 func parse(c *caddy.Controller) (*options, error) {

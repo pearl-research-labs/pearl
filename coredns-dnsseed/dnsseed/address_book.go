@@ -12,6 +12,10 @@ import (
 )
 
 const (
+	// maxAnswers keeps DNS responses inside one datagram while returning
+	// more peers than a joining node has outbound slots.
+	maxAnswers = 25
+
 	// maxAddressBookSize caps the good set to bound memory and, since every
 	// crawl reconnects to the whole book, per-crawl connection load.
 	maxAddressBookSize = 2000
@@ -41,11 +45,6 @@ type addressBook struct {
 	// failedAt maps addresses that recently failed verification to the
 	// failure time; they are not re-dialed until failureCooldown elapses.
 	failedAt map[netip.AddrPort]time.Time
-
-	// v4 and v6 are the servable IPs per address family, rebuilt on every
-	// good-set mutation so the DNS hot path never scans or copies the book.
-	// They are net.IP because that is the form DNS answers carry.
-	v4, v6 []net.IP
 }
 
 // newAddressBook returns an empty addressBook serving peers on defaultPort
@@ -60,20 +59,6 @@ func newAddressBook(defaultPort string) *addressBook {
 	}
 }
 
-// rebuildServable recomputes the per-family IP slices. Must be called with mu
-// held whenever the good set changes.
-func (ab *addressBook) rebuildServable() {
-	ab.v4, ab.v6 = ab.v4[:0], ab.v6[:0]
-	for addr := range ab.peers {
-		ip := net.IP(addr.Addr().AsSlice())
-		if addr.Addr().Is4() {
-			ab.v4 = append(ab.v4, ip)
-		} else {
-			ab.v6 = append(ab.v6, ip)
-		}
-	}
-}
-
 // add records a successful verification. Peers on non-default ports are
 // skipped, and the book is capped at maxAddressBookSize.
 func (ab *addressBook) add(addr netip.AddrPort) {
@@ -83,15 +68,11 @@ func (ab *addressBook) add(addr netip.AddrPort) {
 		return
 	}
 
-	_, exists := ab.peers[addr]
-	if !exists && len(ab.peers) >= maxAddressBookSize {
+	if _, exists := ab.peers[addr]; !exists && len(ab.peers) >= maxAddressBookSize {
 		return
 	}
 	ab.peers[addr] = 0
 	delete(ab.failedAt, addr)
-	if !exists {
-		ab.rebuildServable()
-	}
 }
 
 // markFailed records a verification failure. Booked (previously verified)
@@ -109,7 +90,6 @@ func (ab *addressBook) markFailed(addr netip.AddrPort) {
 			return
 		}
 		delete(ab.peers, addr)
-		ab.rebuildServable()
 	}
 	ab.failedAt[addr] = time.Now()
 }
@@ -161,33 +141,20 @@ func (ab *addressBook) snapshot() []netip.AddrPort {
 	return slices.Collect(maps.Keys(ab.peers))
 }
 
-// shuffleAddressList returns up to n IPv4 or IPv6 addresses, uniformly
-// sampled without replacement. This is the DNS hot path: it reads the
-// prebuilt per-family slice and does O(n) work regardless of book size.
-func (ab *addressBook) shuffleAddressList(n int, v6 bool) []net.IP {
+// shuffledAddresses returns up to maxAnswers IPv4 or IPv6 addresses, uniformly
+// sampled without replacement.
+func (ab *addressBook) shuffledAddresses(v6 bool) []net.IP {
 	ab.mu.RLock()
 	defer ab.mu.RUnlock()
 
-	ips := ab.v4
-	if v6 {
-		ips = ab.v6
-	}
-	n = min(n, len(ips))
-
-	// Virtual partial Fisher-Yates: draw n distinct entries while recording
-	// displaced indices in a small map instead of mutating or copying ips.
-	swapped := make(map[int]int, n)
-	at := func(k int) int {
-		if v, ok := swapped[k]; ok {
-			return v
+	ips := make([]net.IP, 0, len(ab.peers))
+	for addr := range ab.peers {
+		if addr.Addr().Is6() == v6 {
+			ips = append(ips, net.IP(addr.Addr().AsSlice()))
 		}
-		return k
 	}
-	out := make([]net.IP, n)
-	for i := range n {
-		j := i + rand.IntN(len(ips)-i)
-		out[i] = ips[at(j)]
-		swapped[j] = at(i)
-	}
-	return out
+	rand.Shuffle(len(ips), func(i, j int) {
+		ips[i], ips[j] = ips[j], ips[i]
+	})
+	return ips[:min(maxAnswers, len(ips))]
 }
