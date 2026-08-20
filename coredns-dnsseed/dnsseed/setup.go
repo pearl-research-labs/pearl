@@ -123,7 +123,8 @@ func runCrawl(ctx context.Context, name string, s *seeder) {
 	s.addrBook.pruneCooldown()
 	before := s.addrBook.count()
 	s.refreshAddresses(ctx)
-	s.requestAddresses(ctx)
+	s.discoverAddresses(ctx)
+	// Connections are crawl-scoped; the verified address book persists.
 	s.disconnectAllPeers()
 	after := s.addrBook.count()
 	addressCount.Set(float64(after))

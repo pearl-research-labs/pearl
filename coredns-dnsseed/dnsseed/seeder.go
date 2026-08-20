@@ -427,10 +427,10 @@ func (s *seeder) onAddrV2(p *peer.Peer, msg *wire.MsgAddrV2) {
 		len(msg.AddrList), p.Addr(), dropped)
 }
 
-// requestAddresses sends getaddr to all live peers, then verifies incoming
-// addresses by connecting to them. Verified peers are booked after a
-// successful handshake.
-func (s *seeder) requestAddresses(ctx context.Context) {
+// discoverAddresses asks live peers for addresses, verifies each new address,
+// and repeats from newly verified peers. It returns after the queue stays idle
+// for crawlerIdleTimeout or ctx expires, once in-flight verification is done.
+func (s *seeder) discoverAddresses(ctx context.Context) {
 	for _, p := range s.livePeerSnapshot() {
 		log.Debugf("Requesting addresses from peer %s", p.Addr())
 		p.QueueMessage(wire.NewMsgGetAddr(), nil)

@@ -289,7 +289,7 @@ func TestQueueAddrDropsWhenFull(t *testing.T) {
 	assert.Len(t, s.addrQueue, 1)
 }
 
-func TestRequestAddresses(t *testing.T) {
+func TestDiscoverAddresses(t *testing.T) {
 	s := newTestSeeder(t, "regtest")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -298,7 +298,7 @@ func TestRequestAddresses(t *testing.T) {
 	_, err := s.connect(ctx, compliantAddr)
 	require.NoError(t, err)
 
-	go s.requestAddresses(ctx)
+	go s.discoverAddresses(ctx)
 
 	// The mock peer gossips the second listener's address via addrv2; the
 	// crawl must verify it by connecting, making it a live peer.

@@ -17,6 +17,13 @@ the network's latest checkpoint (which weeds out nodes stranded on a pre-fork
 chain), and listens on the network's default P2P port. The policy is fixed in
 code, not configurable.
 
+Each crawl re-verifies the served addresses, sends `getaddr` to the live peers,
+and verifies addresses received through `addrv2`. Newly verified peers are
+queried during the same crawl, so discovery continues until no candidate
+address arrives for 30 seconds or the crawl interval expires. Peer connections
+are then closed; the verified address book remains in memory for DNS serving
+and the next crawl.
+
 A served peer that fails re-verification on two consecutive crawls stops being
 served and enters a three-hour cooldown; a gossiped address that fails its
 first verification enters the cooldown immediately. Cooled-down addresses are
@@ -62,8 +69,8 @@ dnsseed {
   `testnet`, `testnet2`, `regtest`, `signet` or `simnet`.
 * `bootstrap_peers` **PEER...** - required. One or more `host:port` peers used
   to join the P2P network. Unreachable peers are retried every 30 seconds.
-* `crawl_interval` **DURATION** - how often to re-crawl the network.
-  Defaults to `15m`.
+* `crawl_interval` **DURATION** - how often to re-crawl the network and the
+  maximum duration of one crawl. Defaults to `15m`.
 * `min_protocol_version` **VERSION** - the lowest wire protocol version
   served. Defaults to the node's own peering floor
   (`peer.MinAcceptableProtocolVersion`); values below it are rejected since
