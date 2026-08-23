@@ -124,7 +124,6 @@ func runCrawl(ctx context.Context, name string, s *seeder) {
 	before := s.addrBook.count()
 	s.refreshAddresses(ctx)
 	s.discoverAddresses(ctx)
-	// Connections are crawl-scoped; the verified address book persists.
 	s.disconnectAllPeers()
 	after := s.addrBook.count()
 	addressCount.Set(float64(after))
