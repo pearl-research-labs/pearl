@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -606,37 +607,23 @@ func TestCheckCredentials(t *testing.T) {
 
 }
 
-// TestSearchRawTransactionsCountClamping verifies that the count parameter for
-// searchrawtransactions is clamped to the maximum allowed value, preventing
-// allocation-based DoS via oversized count values.
+// TestSearchRawTransactionsCountClamping verifies the count used as
+// searchrawtransactions slice capacity is bounded.
 func TestSearchRawTransactionsCountClamping(t *testing.T) {
 	t.Parallel()
-
-	// Create a minimal server that will reject the request early (no
-	// addrindex) so we can observe the clamping without needing a full
-	// blockchain setup. The validation still happens before the error.
-	s := &rpcServer{}
 
 	testCases := []struct {
 		name  string
 		count int
+		want  int
 	}{
-		{
-			name:  "oversized count must not panic",
-			count: 1 << 30, // 1 billion - would cause makeslice panic
-		},
-		{
-			name:  "max int count must not panic",
-			count: 1<<31 - 1, // max int32
-		},
-		{
-			name:  "exactly at limit",
-			count: maxSearchRawTransactionsCount,
-		},
-		{
-			name:  "one over limit",
-			count: maxSearchRawTransactionsCount + 1,
-		},
+		{name: "negative becomes 1", count: -5, want: 1},
+		{name: "zero unchanged", count: 0, want: 0},
+		{name: "default-sized count unchanged", count: 100, want: 100},
+		{name: "exactly at limit", count: maxSearchRawTransactionsCount, want: maxSearchRawTransactionsCount},
+		{name: "one over limit", count: maxSearchRawTransactionsCount + 1, want: maxSearchRawTransactionsCount},
+		{name: "oversized count", count: 1 << 30, want: maxSearchRawTransactionsCount},
+		{name: "max int", count: math.MaxInt, want: maxSearchRawTransactionsCount},
 	}
 
 	for _, tc := range testCases {
@@ -644,24 +631,14 @@ func TestSearchRawTransactionsCountClamping(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			cmd := btcjson.NewSearchRawTransactionsCmd(
-				"1Address", // address (invalid, but validates after count)
-				nil,        // verbose
-				nil,        // skip
-				&tc.count,  // count
-				nil,        // vinExtra
-				nil,        // reverse
-				nil,        // filterAddrs
-			)
+			got := clampSearchRawTransactionsCount(tc.count)
+			require.Equal(t, tc.want, got)
+			require.LessOrEqual(t, got, maxSearchRawTransactionsCount)
+			require.GreaterOrEqual(t, got, 0)
 
-			closeChan := make(chan struct{})
-
-			// The handler should NOT panic even with an absurdly
-			// large count. It will return an error (no addrindex)
-			// but the important thing is no panic.
 			require.NotPanics(t, func() {
-				_, _ = handleSearchRawTransactions(s, cmd, closeChan)
-			}, "handleSearchRawTransactions panicked with count=%d", tc.count)
+				_ = make([]retrievedTx, 0, got)
+			}, "clamped count=%d is not a safe slice capacity", got)
 		})
 	}
 }
