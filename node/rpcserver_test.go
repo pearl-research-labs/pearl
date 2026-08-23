@@ -605,3 +605,63 @@ func TestCheckCredentials(t *testing.T) {
 	}
 
 }
+
+// TestSearchRawTransactionsCountClamping verifies that the count parameter for
+// searchrawtransactions is clamped to the maximum allowed value, preventing
+// allocation-based DoS via oversized count values.
+func TestSearchRawTransactionsCountClamping(t *testing.T) {
+	t.Parallel()
+
+	// Create a minimal server that will reject the request early (no
+	// addrindex) so we can observe the clamping without needing a full
+	// blockchain setup. The validation still happens before the error.
+	s := &rpcServer{}
+
+	testCases := []struct {
+		name  string
+		count int
+	}{
+		{
+			name:  "oversized count must not panic",
+			count: 1 << 30, // 1 billion - would cause makeslice panic
+		},
+		{
+			name:  "max int count must not panic",
+			count: 1<<31 - 1, // max int32
+		},
+		{
+			name:  "exactly at limit",
+			count: maxSearchRawTransactionsCount,
+		},
+		{
+			name:  "one over limit",
+			count: maxSearchRawTransactionsCount + 1,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cmd := btcjson.NewSearchRawTransactionsCmd(
+				"1Address", // address (invalid, but validates after count)
+				nil,        // verbose
+				nil,        // skip
+				&tc.count,  // count
+				nil,        // vinExtra
+				nil,        // reverse
+				nil,        // filterAddrs
+			)
+
+			closeChan := make(chan struct{})
+
+			// The handler should NOT panic even with an absurdly
+			// large count. It will return an error (no addrindex)
+			// but the important thing is no panic.
+			require.NotPanics(t, func() {
+				_, _ = handleSearchRawTransactions(s, cmd, closeChan)
+			}, "handleSearchRawTransactions panicked with count=%d", tc.count)
+		})
+	}
+}

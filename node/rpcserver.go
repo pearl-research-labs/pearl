@@ -78,6 +78,10 @@ const (
 	// defaultMaxFeeRate is the default value to use(0.1 PRL/kvB) when the
 	// `MaxFee` field is not set when calling `testmempoolaccept`.
 	defaultMaxFeeRate = 0.1
+
+	// maxSearchRawTransactionsCount is the upper bound on the count
+	// parameter for searchrawtransactions. Prevents allocation-based DoS.
+	maxSearchRawTransactionsCount = 10000
 )
 
 var (
@@ -3287,6 +3291,9 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 		numRequested = *c.Count
 		if numRequested < 0 {
 			numRequested = 1
+		}
+		if numRequested > maxSearchRawTransactionsCount {
+			numRequested = maxSearchRawTransactionsCount
 		}
 	}
 	if numRequested == 0 {
