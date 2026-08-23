@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"maps"
 	"math"
-	"sync"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
@@ -299,55 +298,46 @@ func NewTxSigHashes(tx *wire.MsgTx,
 // multiple goroutines can safely re-use the pre-computed partial sighashes
 // speeding up validation time amongst all inputs found within a block.
 type HashCache struct {
-	sigHashes map[chainhash.Hash]*TxSigHashes
-
-	sync.RWMutex
+	sigHashes *randEvictCache[chainhash.Hash, *TxSigHashes]
 }
 
 // NewHashCache returns a new instance of the HashCache given a maximum number
-// of entries which may exist within it at anytime.
+// of entries which may exist within it at anytime. Random entries are evicted
+// to make room for new entries that would cause the number of entries in the
+// cache to exceed the max. A maxSize of zero disables the cache entirely.
 func NewHashCache(maxSize uint) *HashCache {
 	return &HashCache{
-		sigHashes: make(map[chainhash.Hash]*TxSigHashes, maxSize),
+		sigHashes: newRandEvictCache[chainhash.Hash, *TxSigHashes](
+			maxSize,
+		),
 	}
 }
 
-// AddSigHashes computes, then adds the partial sighashes for the passed
-// transaction.
-func (h *HashCache) AddSigHashes(tx *wire.MsgTx,
-	inputFetcher PrevOutputFetcher) {
+// LoadOrCreateSigHashes returns the partial sighashes for the passed
+// transaction. It returns the cached value when present, otherwise it computes
+// and caches a new value before returning it.
+func (h *HashCache) LoadOrCreateSigHashes(tx *wire.MsgTx,
+	inputFetcher PrevOutputFetcher) *TxSigHashes {
 
-	h.Lock()
-	h.sigHashes[tx.TxHash()] = NewTxSigHashes(tx, inputFetcher)
-	h.Unlock()
+	txid := tx.TxHash()
+	if sigHashes, ok := h.sigHashes.get(txid); ok {
+		return sigHashes
+	}
+
+	sigHashes := NewTxSigHashes(tx, inputFetcher)
+	h.sigHashes.put(txid, sigHashes)
+
+	return sigHashes
 }
 
-// ContainsHashes returns true if the partial sighashes for the passed
-// transaction currently exist within the HashCache, and false otherwise.
+// ContainsHashes returns whether the partial sighashes for the passed
+// transaction currently exist within the HashCache.
 func (h *HashCache) ContainsHashes(txid *chainhash.Hash) bool {
-	h.RLock()
-	_, found := h.sigHashes[*txid]
-	h.RUnlock()
-
-	return found
-}
-
-// GetSigHashes possibly returns the previously cached partial sighashes for
-// the passed transaction. This function also returns an additional boolean
-// value indicating if the sighashes for the passed transaction were found to
-// be present within the HashCache.
-func (h *HashCache) GetSigHashes(txid *chainhash.Hash) (*TxSigHashes, bool) {
-	h.RLock()
-	item, found := h.sigHashes[*txid]
-	h.RUnlock()
-
-	return item, found
+	return h.sigHashes.contains(*txid)
 }
 
 // PurgeSigHashes removes all partial sighashes from the HashCache belonging to
 // the passed transaction.
 func (h *HashCache) PurgeSigHashes(txid *chainhash.Hash) {
-	h.Lock()
-	delete(h.sigHashes, *txid)
-	h.Unlock()
+	h.sigHashes.remove(*txid)
 }

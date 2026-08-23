@@ -194,19 +194,11 @@ func ValidateTransactionScripts(tx *btcutil.Tx, utxoView *UtxoViewpoint,
 	flags txscript.ScriptFlags, sigCache *txscript.SigCache,
 	hashCache *txscript.HashCache) error {
 
-	// If the hashcache doesn't yet have the sighash midstate for this
-	// transaction, then we'll compute them now so we can re-use them
-	// amongst all worker validation goroutines.
-	if tx.MsgTx().HasWitness() &&
-		!hashCache.ContainsHashes(tx.Hash()) {
-		hashCache.AddSigHashes(tx.MsgTx(), utxoView)
-	}
-
 	// Re-use the same pre-computed sighash midstate across all validation
 	// goroutines so the sighashes are only computed once.
 	var cachedHashes *txscript.TxSigHashes
 	if tx.MsgTx().HasWitness() {
-		cachedHashes, _ = hashCache.GetSigHashes(tx.Hash())
+		cachedHashes = hashCache.LoadOrCreateSigHashes(tx.MsgTx(), utxoView)
 	}
 
 	// Collect all of the transaction inputs and required information for
@@ -247,20 +239,14 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 	}
 	txValItems := make([]*txValidateItem, 0, numInputs)
 	for _, tx := range block.Transactions() {
-		hash := tx.Hash()
-
 		// Pre-compute sighash midstates for witness transactions so
 		// they can be re-used across validation goroutines.
-		if tx.HasWitness() && hashCache != nil &&
-			!hashCache.ContainsHashes(hash) {
-
-			hashCache.AddSigHashes(tx.MsgTx(), utxoView)
-		}
-
 		var cachedHashes *txscript.TxSigHashes
 		if tx.HasWitness() {
 			if hashCache != nil {
-				cachedHashes, _ = hashCache.GetSigHashes(hash)
+				cachedHashes = hashCache.LoadOrCreateSigHashes(
+					tx.MsgTx(), utxoView,
+				)
 			} else {
 				cachedHashes = txscript.NewTxSigHashes(
 					tx.MsgTx(), utxoView,
