@@ -1,0 +1,54 @@
+name: DNS Seeder / Build & Publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: End-to-End Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup
+
+      - name: Run seeder end-to-end test
+        run: go test -tags e2e -v -timeout 10m -count=1 ./coredns-dnsseed/integration
+
+  docker:
+    needs: e2e
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # github-builder OIDC attestations and cache
+    uses: docker/github-builder/.github/workflows/build.yml@a492c6d04fd3315f67230809b44d60cc0acd50b3 # v1
+    with:
+      output: image
+      context: .
+      file: ./coredns-dnsseed/deploy/Dockerfile
+      platforms: linux/amd64,linux/arm64
+      push: true
+      cache: true
+      cache-mode: max
+      sbom: true
+      set-meta-labels: true
+      set-meta-annotations: true
+      meta-images: ghcr.io/${{ github.repository }}/pearl-seeder
+      meta-tags: |
+        type=sha
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
