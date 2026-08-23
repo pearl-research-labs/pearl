@@ -19,10 +19,6 @@ import (
 	"github.com/pearl-research-labs/pearl/version"
 )
 
-func addrPortFromPeer(p *peer.Peer) netip.AddrPort {
-	return netip.MustParseAddrPort(p.Addr())
-}
-
 // addrPortFromNAV2 extracts an address from a v2 network address, reporting
 // false for unsupported address types (tor, i2p, cjdns). IPv4-mapped
 // addresses are unmapped so that a peer has the same identity however it was
@@ -87,9 +83,9 @@ type seeder struct {
 
 	minProtocolVersion uint32
 
-	// peersMu guards peers, the reserved outbound connections (in-flight
-	// and handshake-complete). An address is reserved before TCP dial so a
-	// second worker cannot open a parallel connection to the same peer.
+	// peersMu guards peers, the tracked outbound attempts and live
+	// connections. An address is tracked before TCP dial so a second worker
+	// cannot open a parallel connection to the same peer.
 	peersMu sync.Mutex
 	peers   map[netip.AddrPort]*peer.Peer
 
@@ -247,31 +243,24 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 		return nil, err
 	}
 
-	if err := s.reservePeer(addr, p); err != nil {
+	if err := s.trackPeer(addr, p); err != nil {
 		return nil, err
 	}
 
 	dialer := net.Dialer{Timeout: connectionDialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
-		s.unreservePeer(addr, p)
+		s.disconnectPeer(p)
 		return nil, err
 	}
 
 	p.AssociateConnection(conn)
-	// Drop the reservation when the socket dies so refresh can re-dial.
-	go func() {
-		p.WaitForDisconnect()
-		s.unreservePeer(addr, p)
-	}()
 
 	hctx, cancel := context.WithTimeoutCause(ctx, maximumHandshakeWait, errHandshakeTimeout)
 	defer cancel()
 
 	if err := waitForHandshake(hctx, p, done); err != nil {
-		s.unreservePeer(addr, p)
-		p.Disconnect()
-		p.WaitForDisconnect()
+		s.disconnectPeer(p)
 		return nil, err
 	}
 
@@ -301,27 +290,26 @@ func waitForHandshake(ctx context.Context, p *peer.Peer, done <-chan struct{}) e
 	}
 }
 
-// reservePeer atomically refuses a second connection to addr, then registers
-// the in-flight attempt.
-func (s *seeder) reservePeer(addr netip.AddrPort, p *peer.Peer) error {
+// trackPeer atomically refuses a duplicate connection and keeps p registered
+// until it disconnects.
+func (s *seeder) trackPeer(addr netip.AddrPort, p *peer.Peer) error {
 	s.peersMu.Lock()
-	defer s.peersMu.Unlock()
-
 	if _, exists := s.peers[addr]; exists {
+		s.peersMu.Unlock()
 		return errRepeatConnection
 	}
 	s.peers[addr] = p
-	return nil
-}
+	s.peersMu.Unlock()
 
-// unreservePeer drops addr only if it still names this attempt, so a
-// timeout cannot delete a later reservation.
-func (s *seeder) unreservePeer(addr netip.AddrPort, p *peer.Peer) {
-	s.peersMu.Lock()
-	defer s.peersMu.Unlock()
-	if s.peers[addr] == p {
-		delete(s.peers, addr)
-	}
+	go func() {
+		p.WaitForDisconnect()
+		s.peersMu.Lock()
+		defer s.peersMu.Unlock()
+		if s.peers[addr] == p {
+			delete(s.peers, addr)
+		}
+	}()
+	return nil
 }
 
 // onVersion enforces the serving policy during the handshake. Returning a
@@ -335,25 +323,12 @@ func (s *seeder) onVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgReject {
 	}
 	return nil
 }
-
-// disconnectPeer removes p from the reservation map and tears the connection
-// down. A no-op if p is not the currently reserved peer for its address.
 func (s *seeder) disconnectPeer(p *peer.Peer) {
-	addr := addrPortFromPeer(p)
-	s.peersMu.Lock()
-	if s.peers[addr] != p {
-		s.peersMu.Unlock()
-		return
-	}
-	delete(s.peers, addr)
-	s.peersMu.Unlock()
-
 	log.Debugf("Disconnecting from peer %s", p.Addr())
 	p.Disconnect()
-	p.WaitForDisconnect()
 }
 
-// disconnectAllPeers terminates every reserved connection.
+// disconnectAllPeers terminates every tracked connection.
 func (s *seeder) disconnectAllPeers() {
 	s.peersMu.Lock()
 	peers := make([]*peer.Peer, 0, len(s.peers))
