@@ -311,33 +311,16 @@ func TestQueueNotificationAfterDisconnect(t *testing.T) {
 	}
 }
 
-// TestRunCommandPanicRecovery verifies the WebSocket command wrapper recovers
-// from a handler panic and returns an internal RPC error.
-func TestRunCommandPanicRecovery(t *testing.T) {
+func TestRunWSHandlerPanicRecovery(t *testing.T) {
 	t.Parallel()
 
-	cmd := &parsedRPCCmd{
-		jsonrpc: btcjson.RpcVersion1,
-		id:      float64(1),
-		method:  "panictest",
-	}
-
-	var reply json.RawMessage
+	var result interface{}
+	var err error
 	require.NotPanics(t, func() {
-		reply = runWithWSPanicRecover(cmd, "test-client", func() (interface{}, error) {
+		result, err = runWSHandler("panictest", "test-client", func() (interface{}, error) {
 			panic("intentional test panic")
 		})
-	}, "runWithWSPanicRecover should recover from panics")
-
-	require.NotNil(t, reply, "wrapper should return an error reply")
-
-	var resp struct {
-		Error *btcjson.RPCError `json:"error"`
-		ID    interface{}       `json:"id"`
-	}
-	require.NoError(t, json.Unmarshal(reply, &resp))
-	require.NotNil(t, resp.Error, "reply should contain an error")
-	require.Equal(t, btcjson.ErrRPCInternal.Code, resp.Error.Code)
-	require.Equal(t, "Internal error", resp.Error.Message)
-	require.Equal(t, float64(1), resp.ID)
+	})
+	require.Nil(t, result)
+	require.ErrorIs(t, err, btcjson.ErrRPCInternal)
 }

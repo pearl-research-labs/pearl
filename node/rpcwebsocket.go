@@ -1465,44 +1465,24 @@ func (c *wsClient) rejectBatch(jsonErr *btcjson.RPCError) {
 	c.SendMessage(reply, nil)
 }
 
-// runWithWSPanicRecover runs fn and marshals its result. Handler panics are
-// recovered and converted to an internal RPC error so they cannot crash the
-// process (HTTP is already covered by net/http).
-func runWithWSPanicRecover(cmd *parsedRPCCmd, addr string, fn func() (interface{}, error)) (reply json.RawMessage) {
+func runWSHandler(method, addr string, handler func() (interface{}, error)) (result interface{}, err error) {
+	// WebSocket commands run outside net/http's panic recovery.
 	defer func() {
 		if r := recover(); r != nil {
 			rpcsLog.Errorf("Panic in websocket handler for <%s> from %s: %v",
-				cmd.method, addr, r)
-			jsonErr := &btcjson.RPCError{
-				Code:    btcjson.ErrRPCInternal.Code,
-				Message: "Internal error",
-			}
-			var err error
-			reply, err = createMarshalledReply(cmd.jsonrpc, cmd.id, nil, jsonErr)
-			if err != nil {
-				rpcsLog.Errorf("Failed to marshal panic reply: %v", err)
-				reply = nil
-			}
+				method, addr, r)
+			err = btcjson.ErrRPCInternal
 		}
 	}()
 
-	result, err := fn()
-	reply, err = createMarshalledReply(cmd.jsonrpc, cmd.id, result, err)
-	if err != nil {
-		rpcsLog.Errorf("Failed to marshal reply for <%s> command: %v",
-			cmd.method, err)
-		return nil
-	}
-	return reply
+	return handler()
 }
 
 // runCommand executes the handler for a parsed command and returns its
 // marshalled reply.  If the reply cannot be marshalled it logs the failure and
 // returns a nil reply, leaving delivery and failure policy to the caller.
-// Handler panics are recovered and converted to internal RPC errors rather than
-// crashing the server.
 func (c *wsClient) runCommand(cmd *parsedRPCCmd) json.RawMessage {
-	return runWithWSPanicRecover(cmd, c.addr, func() (interface{}, error) {
+	result, err := runWSHandler(cmd.method, c.addr, func() (interface{}, error) {
 		// Look up the websocket extension for the command and if it
 		// doesn't exist fall back to handling the command as a
 		// standard command.
@@ -1511,6 +1491,14 @@ func (c *wsClient) runCommand(cmd *parsedRPCCmd) json.RawMessage {
 		}
 		return c.server.standardCmdResult(cmd, nil)
 	})
+
+	reply, err := createMarshalledReply(cmd.jsonrpc, cmd.id, result, err)
+	if err != nil {
+		rpcsLog.Errorf("Failed to marshal reply for <%s> command: %v",
+			cmd.method, err)
+		return nil
+	}
+	return reply
 }
 
 // notificationQueueHandler handles the queuing of outgoing notifications for
