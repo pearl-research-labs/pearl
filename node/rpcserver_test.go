@@ -607,38 +607,59 @@ func TestCheckCredentials(t *testing.T) {
 
 }
 
-// TestSearchRawTransactionsCountClamping verifies the count used as
-// searchrawtransactions slice capacity is bounded.
-func TestSearchRawTransactionsCountClamping(t *testing.T) {
+// TestHandleSearchRawTransactionsCount verifies oversized count values are
+// rejected before any result-slice allocation.
+func TestHandleSearchRawTransactionsCount(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name  string
-		count int
-		want  int
-	}{
-		{name: "negative becomes 1", count: -5, want: 1},
-		{name: "zero unchanged", count: 0, want: 0},
-		{name: "default-sized count unchanged", count: 100, want: 100},
-		{name: "exactly at limit", count: maxSearchRawTransactionsCount, want: maxSearchRawTransactionsCount},
-		{name: "one over limit", count: maxSearchRawTransactionsCount + 1, want: maxSearchRawTransactionsCount},
-		{name: "oversized count", count: 1 << 30, want: maxSearchRawTransactionsCount},
-		{name: "max int", count: math.MaxInt, want: maxSearchRawTransactionsCount},
+	s := &rpcServer{}
+	closeChan := make(chan struct{})
+	newCmd := func(count int) *btcjson.SearchRawTransactionsCmd {
+		return btcjson.NewSearchRawTransactionsCmd(
+			"1Address", nil, nil, &count, nil, nil, nil,
+		)
 	}
 
-	for _, tc := range testCases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := clampSearchRawTransactionsCount(tc.count)
-			require.Equal(t, tc.want, got)
-			require.LessOrEqual(t, got, maxSearchRawTransactionsCount)
-			require.GreaterOrEqual(t, got, 0)
-
+	t.Run("oversized count is rejected", func(t *testing.T) {
+		t.Parallel()
+		for _, count := range []int{
+			maxSearchRawTransactionsCount + 1,
+			1 << 30,
+			math.MaxInt,
+		} {
+			var err error
 			require.NotPanics(t, func() {
-				_ = make([]retrievedTx, 0, got)
-			}, "clamped count=%d is not a safe slice capacity", got)
+				_, err = handleSearchRawTransactions(s, newCmd(count), closeChan)
+			})
+			require.Error(t, err)
+			rpcErr, ok := err.(*btcjson.RPCError)
+			require.True(t, ok)
+			require.Equal(t, btcjson.ErrRPCInvalidParameter, rpcErr.Code)
+		}
+	})
+
+	t.Run("count at limit is not a count error", func(t *testing.T) {
+		t.Parallel()
+		var err error
+		require.NotPanics(t, func() {
+			_, err = handleSearchRawTransactions(
+				s, newCmd(maxSearchRawTransactionsCount), closeChan,
+			)
 		})
-	}
+		require.Error(t, err)
+		rpcErr, ok := err.(*btcjson.RPCError)
+		require.True(t, ok)
+		require.Equal(t, btcjson.ErrRPCMisc, rpcErr.Code)
+	})
+
+	t.Run("zero count returns empty", func(t *testing.T) {
+		t.Parallel()
+		var result interface{}
+		var err error
+		require.NotPanics(t, func() {
+			result, err = handleSearchRawTransactions(s, newCmd(0), closeChan)
+		})
+		require.NoError(t, err)
+		require.Nil(t, result)
+	})
 }

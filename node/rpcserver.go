@@ -79,20 +79,10 @@ const (
 	// `MaxFee` field is not set when calling `testmempoolaccept`.
 	defaultMaxFeeRate = 0.1
 
-	// maxSearchRawTransactionsCount is the upper bound on the count
-	// parameter for searchrawtransactions. Prevents allocation-based DoS.
+	// maxSearchRawTransactionsCount is the maximum allowed count for
+	// searchrawtransactions. Larger values are rejected.
 	maxSearchRawTransactionsCount = 10000
 )
-
-func clampSearchRawTransactionsCount(count int) int {
-	if count < 0 {
-		return 1
-	}
-	if count > maxSearchRawTransactionsCount {
-		return maxSearchRawTransactionsCount
-	}
-	return count
-}
 
 var (
 	// gbtMutableFields are the manipulations the server allows to be made
@@ -3255,6 +3245,29 @@ func handleReconsiderBlock(s *rpcServer, cmd interface{}, closeChan <-chan struc
 
 // handleSearchRawTransactions implements the searchrawtransactions command.
 func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
+	c := cmd.(*btcjson.SearchRawTransactionsCmd)
+
+	// Override the default number of requested entries if needed.  Also,
+	// just return now if the number of requested entries is zero to avoid
+	// extra work.
+	numRequested := 100
+	if c.Count != nil {
+		numRequested = *c.Count
+		if numRequested < 0 {
+			numRequested = 1
+		}
+		if numRequested > maxSearchRawTransactionsCount {
+			return nil, &btcjson.RPCError{
+				Code: btcjson.ErrRPCInvalidParameter,
+				Message: fmt.Sprintf("Count exceeds maximum allowed (%d)",
+					maxSearchRawTransactionsCount),
+			}
+		}
+	}
+	if numRequested == 0 {
+		return nil, nil
+	}
+
 	// Respond with an error if the address index is not enabled.
 	addrIndex := s.cfg.AddrIndex
 	if addrIndex == nil {
@@ -3266,7 +3279,6 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 
 	// Override the flag for including extra previous output information in
 	// each input if needed.
-	c := cmd.(*btcjson.SearchRawTransactionsCmd)
 	vinExtra := false
 	if c.VinExtra != nil {
 		vinExtra = *c.VinExtra != 0
@@ -3291,17 +3303,6 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 			Code:    btcjson.ErrRPCInvalidAddressOrKey,
 			Message: "Invalid address or key: " + err.Error(),
 		}
-	}
-
-	// Override the default number of requested entries if needed.  Also,
-	// just return now if the number of requested entries is zero to avoid
-	// extra work.
-	numRequested := 100
-	if c.Count != nil {
-		numRequested = clampSearchRawTransactionsCount(*c.Count)
-	}
-	if numRequested == 0 {
-		return nil, nil
 	}
 
 	// Override the default number of entries to skip if needed.
