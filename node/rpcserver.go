@@ -79,6 +79,10 @@ const (
 	// `MaxFee` field is not set when calling `testmempoolaccept`.
 	defaultMaxFeeRate = 0.1
 
+	// defaultSearchRawTransactionsCount is used when the client omits
+	// count. Must match SearchRawTransactionsCmd's jsonrpcdefault.
+	defaultSearchRawTransactionsCount = 100
+
 	// maxSearchRawTransactionsCount is the maximum allowed count for
 	// searchrawtransactions. Larger values are rejected.
 	maxSearchRawTransactionsCount = 10000
@@ -3247,22 +3251,19 @@ func handleReconsiderBlock(s *rpcServer, cmd interface{}, closeChan <-chan struc
 func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	c := cmd.(*btcjson.SearchRawTransactionsCmd)
 
-	// Override the default number of requested entries if needed.  Also,
-	// just return now if the number of requested entries is zero to avoid
-	// extra work.
-	numRequested := 100
+	numRequested := defaultSearchRawTransactionsCount
 	if c.Count != nil {
 		numRequested = *c.Count
-		if numRequested < 0 {
-			numRequested = 1
+	}
+	if numRequested > maxSearchRawTransactionsCount {
+		return nil, &btcjson.RPCError{
+			Code: btcjson.ErrRPCInvalidParameter,
+			Message: fmt.Sprintf("Count exceeds maximum allowed (%d)",
+				maxSearchRawTransactionsCount),
 		}
-		if numRequested > maxSearchRawTransactionsCount {
-			return nil, &btcjson.RPCError{
-				Code: btcjson.ErrRPCInvalidParameter,
-				Message: fmt.Sprintf("Count exceeds maximum allowed (%d)",
-					maxSearchRawTransactionsCount),
-			}
-		}
+	}
+	if numRequested < 0 {
+		numRequested = 1
 	}
 	if numRequested == 0 {
 		return nil, nil
