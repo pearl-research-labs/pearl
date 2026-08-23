@@ -311,16 +311,45 @@ func TestQueueNotificationAfterDisconnect(t *testing.T) {
 	}
 }
 
-func TestRunWSHandlerPanicRecovery(t *testing.T) {
-	t.Parallel()
+type panicJSONMarshaler struct{}
 
-	var result interface{}
-	var err error
-	require.NotPanics(t, func() {
-		result, err = runWSHandler("panictest", "test-client", func() (interface{}, error) {
+func (panicJSONMarshaler) MarshalJSON() ([]byte, error) {
+	panic("intentional marshal panic")
+}
+
+func TestRunCommandPanicRecovery(t *testing.T) {
+	originalHandlers := wsHandlers
+	wsHandlers = map[string]wsCommandHandler{
+		"handlerpanic": func(*wsClient, interface{}) (interface{}, error) {
 			panic("intentional test panic")
-		})
+		},
+		"marshalpanic": func(*wsClient, interface{}) (interface{}, error) {
+			return panicJSONMarshaler{}, nil
+		},
+	}
+	t.Cleanup(func() {
+		wsHandlers = originalHandlers
 	})
-	require.Nil(t, result)
-	require.ErrorIs(t, err, btcjson.ErrRPCInternal)
+
+	client := &wsClient{addr: "test-client"}
+	for _, method := range []string{"handlerpanic", "marshalpanic"} {
+		t.Run(method, func(t *testing.T) {
+			cmd := &parsedRPCCmd{
+				jsonrpc: btcjson.RpcVersion1,
+				id:      float64(1),
+				method:  method,
+			}
+
+			var reply json.RawMessage
+			require.NotPanics(t, func() {
+				reply = client.runCommand(cmd)
+			})
+
+			var response struct {
+				Error *btcjson.RPCError `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(reply, &response))
+			require.Equal(t, btcjson.ErrRPCInternal, response.Error)
+		})
+	}
 }

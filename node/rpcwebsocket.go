@@ -1465,34 +1465,30 @@ func (c *wsClient) rejectBatch(jsonErr *btcjson.RPCError) {
 	c.SendMessage(reply, nil)
 }
 
-func runWSHandler(method, addr string, handler func() (interface{}, error)) (result interface{}, err error) {
-	// WebSocket commands run outside net/http's panic recovery.
-	defer func() {
-		if r := recover(); r != nil {
-			rpcsLog.Errorf("Panic in websocket handler for <%s> from %s: %v",
-				method, addr, r)
-			err = btcjson.ErrRPCInternal
-		}
-	}()
-
-	return handler()
-}
-
 // runCommand executes the handler for a parsed command and returns its
 // marshalled reply.  If the reply cannot be marshalled it logs the failure and
 // returns a nil reply, leaving delivery and failure policy to the caller.
-func (c *wsClient) runCommand(cmd *parsedRPCCmd) json.RawMessage {
-	result, err := runWSHandler(cmd.method, c.addr, func() (interface{}, error) {
-		// Look up the websocket extension for the command and if it
-		// doesn't exist fall back to handling the command as a
-		// standard command.
-		if wsHandler, ok := wsHandlers[cmd.method]; ok {
-			return wsHandler(c, cmd.cmd)
+func (c *wsClient) runCommand(cmd *parsedRPCCmd) (reply json.RawMessage) {
+	// WebSocket commands run outside net/http's panic recovery.
+	defer func() {
+		if r := recover(); r != nil {
+			rpcsLog.Errorf("Panic processing websocket command <%s> from %s: %v",
+				cmd.method, c.addr, r)
+			reply = marshalReply(cmd.jsonrpc, cmd.id, btcjson.ErrRPCInternal)
 		}
-		return c.server.standardCmdResult(cmd, nil)
-	})
+	}()
 
-	reply, err := createMarshalledReply(cmd.jsonrpc, cmd.id, result, err)
+	var (
+		result interface{}
+		err    error
+	)
+	if wsHandler, ok := wsHandlers[cmd.method]; ok {
+		result, err = wsHandler(c, cmd.cmd)
+	} else {
+		result, err = c.server.standardCmdResult(cmd, nil)
+	}
+
+	reply, err = createMarshalledReply(cmd.jsonrpc, cmd.id, result, err)
 	if err != nil {
 		rpcsLog.Errorf("Failed to marshal reply for <%s> command: %v",
 			cmd.method, err)
