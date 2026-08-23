@@ -250,7 +250,7 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 	dialer := net.Dialer{Timeout: connectionDialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr.String())
 	if err != nil {
-		s.disconnectPeer(p)
+		p.Disconnect()
 		return nil, err
 	}
 
@@ -260,7 +260,7 @@ func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, err
 	defer cancel()
 
 	if err := waitForHandshake(hctx, p, done); err != nil {
-		s.disconnectPeer(p)
+		p.Disconnect()
 		return nil, err
 	}
 
@@ -323,10 +323,6 @@ func (s *seeder) onVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgReject {
 	}
 	return nil
 }
-func (s *seeder) disconnectPeer(p *peer.Peer) {
-	log.Debugf("Disconnecting from peer %s", p.Addr())
-	p.Disconnect()
-}
 
 // disconnectAllPeers terminates every tracked connection.
 func (s *seeder) disconnectAllPeers() {
@@ -378,7 +374,7 @@ func (s *seeder) queueAddr(addr netip.AddrPort) bool {
 func (s *seeder) onAddrV2(p *peer.Peer, msg *wire.MsgAddrV2) {
 	if len(msg.AddrList) == 0 {
 		log.Debugf("Got empty addrv2 from peer %s, disconnecting", p.Addr())
-		s.disconnectPeer(p)
+		p.Disconnect()
 		return
 	}
 

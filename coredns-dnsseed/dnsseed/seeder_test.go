@@ -175,7 +175,7 @@ func TestOutboundPeerSync(t *testing.T) {
 	require.NotNil(t, p)
 	assert.True(t, p.Connected())
 
-	s.disconnectPeer(p)
+	p.Disconnect()
 	require.Eventually(t, func() bool {
 		return s.livePeer(compliantAddr) == nil
 	}, time.Second, 10*time.Millisecond)
