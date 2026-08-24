@@ -3265,9 +3265,6 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 	if numRequested < 0 {
 		numRequested = 1
 	}
-	if numRequested == 0 {
-		return nil, nil
-	}
 
 	// Respond with an error if the address index is not enabled.
 	addrIndex := s.cfg.AddrIndex
@@ -3304,6 +3301,10 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 			Code:    btcjson.ErrRPCInvalidAddressOrKey,
 			Message: "Invalid address or key: " + err.Error(),
 		}
+	}
+
+	if numRequested == 0 {
+		return nil, nil
 	}
 
 	// Override the default number of entries to skip if needed.
