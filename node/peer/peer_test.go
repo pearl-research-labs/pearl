@@ -644,3 +644,73 @@ func TestSendAddrV2Handshake(t *testing.T) {
 	inPeer.WaitForDisconnect()
 	outPeer.WaitForDisconnect()
 }
+
+// TestPushAddrV2MsgShuffleNoDuplicates is a regression test for issue #292.
+// It verifies that PushAddrV2Msg preserves the address set as a permutation
+// when the input contains more than wire.MaxV2AddrPerMsg distinct addresses:
+// the returned list is capped to MaxV2AddrPerMsg, contains no duplicates, and
+// every returned address was part of the original input.
+func TestPushAddrV2MsgShuffleNoDuplicates(t *testing.T) {
+	// Use more than the maximum so the shuffle+truncate path is exercised.
+	// With the buggy swap, duplicates appeared and addresses were lost.
+	const numAddrs = wire.MaxV2AddrPerMsg + 250
+
+	peerCfg := &peer.Config{
+		UserAgentName:     "peer",
+		UserAgentVersion:  "1.0",
+		UserAgentComments: []string{"comment"},
+		ChainParams:       &chaincfg.MainNetParams,
+		Services:          0,
+		TrickleInterval:   10 * time.Second,
+		AllowSelfConns:    true,
+	}
+
+	// Self-loopback pipe so queued writes are drained on the read side and
+	// don't block the peer's output goroutine.
+	r, w := io.Pipe()
+	c := &conn{raddr: "10.0.0.1:8333", Writer: w, Reader: r}
+	p, err := peer.NewOutboundPeer(peerCfg, "10.0.0.1:8333")
+	require.NoError(t, err)
+	p.AssociateConnection(c)
+	defer func() {
+		p.Disconnect()
+		r.Close()
+		w.Close()
+	}()
+
+	// Build numAddrs distinct IPv4 addrv2 addresses.
+	addrs := make([]*wire.NetAddressV2, numAddrs)
+	for i := 0; i < numAddrs; i++ {
+		ip := net.IPv4(10, 0, byte(i>>8), byte(i))
+		addrs[i] = wire.NetAddressV2FromBytes(
+			time.Unix(int64(i), 0), 0, ip.To4(), 8333,
+		)
+	}
+
+	sent, err := p.PushAddrV2Msg(addrs)
+	require.NoError(t, err)
+
+	// The result must be capped to the maximum.
+	require.Equal(t, wire.MaxV2AddrPerMsg, len(sent),
+		"returned list must be capped to MaxV2AddrPerMsg")
+
+	// Index the originals by their string form for membership checks.
+	original := make(map[string]struct{}, numAddrs)
+	for _, a := range addrs {
+		original[a.Addr.String()] = struct{}{}
+	}
+
+	// No duplicates may be present in the shuffled/truncated result.
+	seen := make(map[string]struct{}, len(sent))
+	for _, a := range sent {
+		key := a.Addr.String()
+		_, dup := seen[key]
+		require.Falsef(t, dup, "duplicate address %q in returned list", key)
+		_, ok := original[key]
+		require.Truef(t, ok, "returned address %q was not in the input set", key)
+		seen[key] = struct{}{}
+	}
+
+	// The result must be a subset of the originals (no fabricated addresses).
+	require.Len(t, seen, len(sent), "seen set size must match returned list size")
+}
