@@ -597,7 +597,7 @@ var helpDescsEnUS = map[string]string{
 	"searchrawtransactions--condition0": "verbose=0",
 	"searchrawtransactions--condition1": "verbose=1",
 	"searchrawtransactions-skip":        "The number of leading transactions to leave out of the final response",
-	"searchrawtransactions-count":       "The maximum number of transactions to return",
+	"searchrawtransactions-count":       "The maximum number of transactions to return (must not exceed 10000)",
 	"searchrawtransactions-vinextra":    "Specify that extra data from previous output will be returned in vin",
 	"searchrawtransactions-reverse":     "Specifies that the transactions should be returned in reverse chronological order",
 	"searchrawtransactions-filteraddrs": "Address list.  Only inputs or outputs with matching address will be returned",

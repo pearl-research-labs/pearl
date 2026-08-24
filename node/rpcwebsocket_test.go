@@ -310,3 +310,46 @@ func TestQueueNotificationAfterDisconnect(t *testing.T) {
 		t.Fatal("QueueNotification blocked after disconnect")
 	}
 }
+
+type panicJSONMarshaler struct{}
+
+func (panicJSONMarshaler) MarshalJSON() ([]byte, error) {
+	panic("intentional marshal panic")
+}
+
+func TestRunCommandPanicRecovery(t *testing.T) {
+	originalHandlers := wsHandlers
+	wsHandlers = map[string]wsCommandHandler{
+		"handlerpanic": func(*wsClient, interface{}) (interface{}, error) {
+			panic("intentional test panic")
+		},
+		"marshalpanic": func(*wsClient, interface{}) (interface{}, error) {
+			return panicJSONMarshaler{}, nil
+		},
+	}
+	t.Cleanup(func() {
+		wsHandlers = originalHandlers
+	})
+
+	client := &wsClient{addr: "test-client"}
+	for _, method := range []string{"handlerpanic", "marshalpanic"} {
+		t.Run(method, func(t *testing.T) {
+			cmd := &parsedRPCCmd{
+				jsonrpc: btcjson.RpcVersion1,
+				id:      float64(1),
+				method:  method,
+			}
+
+			var reply json.RawMessage
+			require.NotPanics(t, func() {
+				reply = client.runCommand(cmd)
+			})
+
+			var response struct {
+				Error *btcjson.RPCError `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(reply, &response))
+			require.Equal(t, btcjson.ErrRPCInternal, response.Error)
+		})
+	}
+}
