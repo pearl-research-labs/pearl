@@ -39,7 +39,8 @@ func TestCheckBlockScripts(t *testing.T) {
 	}
 
 	scriptFlags := txscript.StandardVerifyFlags
-	err = checkBlockScripts(blocks[0], view, scriptFlags, nil, nil)
+	hashCache := txscript.NewHashCache(0)
+	err = checkBlockScripts(blocks[0], view, scriptFlags, nil, hashCache)
 	if err != nil {
 		t.Errorf("Transaction script validation failed: %v\n", err)
 		return

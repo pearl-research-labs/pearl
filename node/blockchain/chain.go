@@ -2211,6 +2211,13 @@ func New(config *Config) (*BlockChain, error) {
 	if config.TimeSource == nil {
 		return nil, AssertError("blockchain.New timesource is nil")
 	}
+	// hashCache is non-nil by contract; callers that don't care pass nil
+	// and get a no-op cache (maxEntries == 0), which is equivalent to
+	// computing sighash midstates per tx without storing them.
+	if config.HashCache == nil {
+		config.HashCache = txscript.NewHashCache(0)
+	}
+
 	// 0 means the fork is not scheduled.
 	if config.ChainParams.MoEForkHeight < 0 {
 		return nil, AssertError("blockchain.New MoEForkHeight must be >= 0")

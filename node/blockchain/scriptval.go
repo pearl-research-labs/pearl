@@ -6,7 +6,6 @@ package blockchain
 
 import (
 	"fmt"
-	"math"
 	"runtime"
 	"time"
 
@@ -194,23 +193,20 @@ func ValidateTransactionScripts(tx *btcutil.Tx, utxoView *UtxoViewpoint,
 	flags txscript.ScriptFlags, sigCache *txscript.SigCache,
 	hashCache *txscript.HashCache) error {
 
+	// The coinbase spends nothing, so there are no scripts to validate.
+	if IsCoinBase(tx) {
+		return nil
+	}
+
 	// Re-use the same pre-computed sighash midstate across all validation
 	// goroutines so the sighashes are only computed once.
-	var cachedHashes *txscript.TxSigHashes
-	if tx.MsgTx().HasWitness() {
-		cachedHashes = hashCache.LoadOrCreateSigHashes(tx.MsgTx(), utxoView)
-	}
+	cachedHashes := hashCache.LoadOrCreateSigHashes(tx.MsgTx(), utxoView)
 
 	// Collect all of the transaction inputs and required information for
 	// validation.
 	txIns := tx.MsgTx().TxIn
 	txValItems := make([]*txValidateItem, 0, len(txIns))
 	for txInIdx, txIn := range txIns {
-		// Skip coinbases.
-		if txIn.PreviousOutPoint.Index == math.MaxUint32 {
-			continue
-		}
-
 		txVI := &txValidateItem{
 			txInIndex: txInIdx,
 			txIn:      txIn,
@@ -245,27 +241,11 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 			continue
 		}
 
-		// Pre-compute sighash midstates for witness transactions so
-		// they can be re-used across validation goroutines.
-		var cachedHashes *txscript.TxSigHashes
-		if tx.HasWitness() {
-			if hashCache != nil {
-				cachedHashes = hashCache.LoadOrCreateSigHashes(
-					tx.MsgTx(), utxoView,
-				)
-			} else {
-				cachedHashes = txscript.NewTxSigHashes(
-					tx.MsgTx(), utxoView,
-				)
-			}
-		}
+		// Pre-compute sighash midstates so they can be re-used
+		// across validation goroutines.
+		cachedHashes := hashCache.LoadOrCreateSigHashes(tx.MsgTx(), utxoView)
 
 		for txInIdx, txIn := range tx.MsgTx().TxIn {
-			// Skip coinbases.
-			if txIn.PreviousOutPoint.Index == math.MaxUint32 {
-				continue
-			}
-
 			txVI := &txValidateItem{
 				txInIndex: txInIdx,
 				txIn:      txIn,
@@ -286,15 +266,10 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 
 	log.Tracef("block %v took %v to verify", block.Hash(), elapsed)
 
-	// If the HashCache is present, once we have validated the block, we no
-	// longer need the cached hashes for these transactions, so we purge
-	// them from the cache.
-	if hashCache != nil {
-		for _, tx := range block.Transactions() {
-			if tx.MsgTx().HasWitness() {
-				hashCache.PurgeSigHashes(tx.Hash())
-			}
-		}
+	// Once we have validated the block, we no longer need the cached
+	// hashes for these transactions, so we purge them from the cache.
+	for _, tx := range block.Transactions() {
+		hashCache.PurgeSigHashes(tx.Hash())
 	}
 
 	return nil

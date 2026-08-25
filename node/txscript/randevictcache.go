@@ -29,6 +29,11 @@ func newRandEvictCache[K comparable, V any](maxEntries uint) *randEvictCache[K, 
 // get returns the value stored under the passed key, along with a boolean
 // indicating whether the key was found.
 func (c *randEvictCache[K, V]) get(key K) (V, bool) {
+	if c.maxEntries == 0 {
+		var zero V
+		return zero, false
+	}
+
 	c.mtx.RLock()
 	value, ok := c.entries[key]
 	c.mtx.RUnlock()
@@ -38,6 +43,10 @@ func (c *randEvictCache[K, V]) get(key K) (V, bool) {
 
 // contains returns true if the passed key currently has an entry in the cache.
 func (c *randEvictCache[K, V]) contains(key K) bool {
+	if c.maxEntries == 0 {
+		return false
+	}
+
 	c.mtx.RLock()
 	_, ok := c.entries[key]
 	c.mtx.RUnlock()
@@ -81,6 +90,10 @@ func (c *randEvictCache[K, V]) put(key K, value V) {
 
 // remove deletes the entry stored under the passed key, if any.
 func (c *randEvictCache[K, V]) remove(key K) {
+	if c.maxEntries == 0 {
+		return
+	}
+
 	c.mtx.Lock()
 	delete(c.entries, key)
 	c.mtx.Unlock()
