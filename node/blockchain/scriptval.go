@@ -239,6 +239,12 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 	}
 	txValItems := make([]*txValidateItem, 0, numInputs)
 	for _, tx := range block.Transactions() {
+		// The coinbase spends nothing, so there are no scripts to
+		// validate and no sighash midstates are needed.
+		if IsCoinBase(tx) {
+			continue
+		}
+
 		// Pre-compute sighash midstates for witness transactions so
 		// they can be re-used across validation goroutines.
 		var cachedHashes *txscript.TxSigHashes

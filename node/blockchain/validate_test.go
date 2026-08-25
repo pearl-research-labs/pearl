@@ -195,6 +195,57 @@ func TestCheckBlockSanity(t *testing.T) {
 	}
 }
 
+// TestCheckBlockSanityRejectsMultipleCoinbases ensures that CheckBlockSanity
+// rejects a block containing more than one coinbase transaction with
+// ErrMultipleCoinbases. This invariant is relied upon by checkBlockScripts,
+// which skips Transactions()[0] as the only coinbase when pre-computing
+// sighash midstates.
+func TestCheckBlockSanityRejectsMultipleCoinbases(t *testing.T) {
+	chainParams := &chaincfg.RegressionNetParams
+	header := wire.BlockHeader{
+		Version:    1,
+		PrevBlock:  chainhash.Hash{},
+		MerkleRoot: Block100000.BlockHeader().MerkleRoot,
+		Timestamp:  time.Unix(time.Now().Unix(), 0),
+		Bits:       chainParams.PowLimitBits,
+	}
+
+	cert, err := zkpow.Mine(&header, chainParams.RequiredCertVersion(1))
+	if err != nil {
+		t.Fatalf("Mine failed: %v", err)
+	}
+
+	// Append a duplicate of the coinbase so the block contains two
+	// coinbase transactions.
+	dupCoinbase := Block100000.Transactions[0].Copy()
+	transactions := make([]*wire.MsgTx, 0, len(Block100000.Transactions)+1)
+	transactions = append(transactions, Block100000.Transactions...)
+	transactions = append(transactions, dupCoinbase)
+	msgBlock := &wire.MsgBlock{
+		MsgHeader: wire.MsgHeader{
+			BlockHeader:    header,
+			MsgCertificate: wire.MsgCertificate{Certificate: cert},
+		},
+		Transactions: transactions,
+	}
+	block := btcutil.NewBlock(msgBlock)
+
+	timeSource := NewMedianTime()
+	err = CheckBlockSanity(block, chainParams, timeSource)
+	if err == nil {
+		t.Fatalf("CheckBlockSanity accepted a block with two coinbases")
+	}
+
+	rerr, ok := err.(RuleError)
+	if !ok {
+		t.Fatalf("expected RuleError, got %T: %v", err, err)
+	}
+	if rerr.ErrorCode != ErrMultipleCoinbases {
+		t.Fatalf("expected ErrMultipleCoinbases, got %v: %v",
+			rerr.ErrorCode, err)
+	}
+}
+
 // TestCheckSerializedHeight tests the CheckSerializedHeight function with
 // various serialized heights and also does negative tests to ensure errors
 // and handled properly.
