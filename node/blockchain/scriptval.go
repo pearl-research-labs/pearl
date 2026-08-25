@@ -32,7 +32,6 @@ type txValidator struct {
 	utxoView     *UtxoViewpoint
 	flags        txscript.ScriptFlags
 	sigCache     *txscript.SigCache
-	hashCache    *txscript.HashCache
 }
 
 // sendResult sends the result of a script pair validation on the internal
@@ -50,7 +49,6 @@ func (v *txValidator) sendResult(result error) {
 // and returns the result of the validation on the internal result channel. It
 // must be run as a goroutine.
 func (v *txValidator) validateHandler() {
-out:
 	for {
 		select {
 		case txVI := <-v.validateChan:
@@ -65,7 +63,8 @@ out:
 					txVI.txInIndex)
 				err := ruleError(ErrMissingTxOut, str)
 				v.sendResult(err)
-				break out
+
+				return
 			}
 
 			// Create a new script engine for the script pair.
@@ -88,7 +87,7 @@ out:
 					sigScript, pkScript)
 				err := ruleError(ErrScriptMalformed, str)
 				v.sendResult(err)
-				break out
+				return
 			}
 
 			// Execute the script pair.
@@ -102,14 +101,14 @@ out:
 					sigScript, pkScript)
 				err := ruleError(ErrScriptValidation, str)
 				v.sendResult(err)
-				break out
+				return
 			}
 
 			// Validation succeeded.
 			v.sendResult(nil)
 
 		case <-v.quitChan:
-			break out
+			return
 		}
 	}
 }
@@ -175,14 +174,13 @@ func (v *txValidator) Validate(items []*txValidateItem) error {
 // newTxValidator returns a new instance of txValidator to be used for
 // validating transaction scripts asynchronously.
 func newTxValidator(utxoView *UtxoViewpoint, flags txscript.ScriptFlags,
-	sigCache *txscript.SigCache, hashCache *txscript.HashCache) *txValidator {
+	sigCache *txscript.SigCache) *txValidator {
 	return &txValidator{
 		validateChan: make(chan *txValidateItem),
 		quitChan:     make(chan struct{}),
 		resultChan:   make(chan error),
 		utxoView:     utxoView,
 		sigCache:     sigCache,
-		hashCache:    hashCache,
 		flags:        flags,
 	}
 }
@@ -217,7 +215,7 @@ func ValidateTransactionScripts(tx *btcutil.Tx, utxoView *UtxoViewpoint,
 	}
 
 	// Validate all of the inputs.
-	validator := newTxValidator(utxoView, flags, sigCache, hashCache)
+	validator := newTxValidator(utxoView, flags, sigCache)
 	return validator.Validate(txValItems)
 }
 
@@ -257,7 +255,7 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 	}
 
 	// Validate all of the inputs.
-	validator := newTxValidator(utxoView, scriptFlags, sigCache, hashCache)
+	validator := newTxValidator(utxoView, scriptFlags, sigCache)
 	start := time.Now()
 	if err := validator.Validate(txValItems); err != nil {
 		return err
