@@ -78,6 +78,14 @@ const (
 	// defaultMaxFeeRate is the default value to use(0.1 PRL/kvB) when the
 	// `MaxFee` field is not set when calling `testmempoolaccept`.
 	defaultMaxFeeRate = 0.1
+
+	// defaultSearchRawTransactionsCount is used when the client omits
+	// count. Must match SearchRawTransactionsCmd's jsonrpcdefault.
+	defaultSearchRawTransactionsCount = 100
+
+	// maxSearchRawTransactionsCount is the maximum allowed count for
+	// searchrawtransactions. Larger values are rejected.
+	maxSearchRawTransactionsCount = 10000
 )
 
 var (
@@ -3241,6 +3249,23 @@ func handleReconsiderBlock(s *rpcServer, cmd interface{}, closeChan <-chan struc
 
 // handleSearchRawTransactions implements the searchrawtransactions command.
 func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
+	c := cmd.(*btcjson.SearchRawTransactionsCmd)
+
+	numRequested := defaultSearchRawTransactionsCount
+	if c.Count != nil {
+		numRequested = *c.Count
+	}
+	if numRequested > maxSearchRawTransactionsCount {
+		return nil, &btcjson.RPCError{
+			Code: btcjson.ErrRPCInvalidParameter,
+			Message: fmt.Sprintf("Count exceeds maximum allowed (%d)",
+				maxSearchRawTransactionsCount),
+		}
+	}
+	if numRequested < 0 {
+		numRequested = 1
+	}
+
 	// Respond with an error if the address index is not enabled.
 	addrIndex := s.cfg.AddrIndex
 	if addrIndex == nil {
@@ -3252,7 +3277,6 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 
 	// Override the flag for including extra previous output information in
 	// each input if needed.
-	c := cmd.(*btcjson.SearchRawTransactionsCmd)
 	vinExtra := false
 	if c.VinExtra != nil {
 		vinExtra = *c.VinExtra != 0
@@ -3279,16 +3303,6 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 		}
 	}
 
-	// Override the default number of requested entries if needed.  Also,
-	// just return now if the number of requested entries is zero to avoid
-	// extra work.
-	numRequested := 100
-	if c.Count != nil {
-		numRequested = *c.Count
-		if numRequested < 0 {
-			numRequested = 1
-		}
-	}
 	if numRequested == 0 {
 		return nil, nil
 	}
