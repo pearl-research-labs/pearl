@@ -59,10 +59,10 @@ func genTestTx() (*wire.MsgTx, *MultiPrevOutFetcher, error) {
 	return tx, prevOuts, nil
 }
 
-// TestHashCacheLoadOrCreateContains tests that after items have been loaded
+// TestHashCacheLoadOrComputeContains tests that after items have been loaded
 // into the hash cache, they are all present. Conversely, transactions that
 // have not been loaded should not be present.
-func TestHashCacheLoadOrCreateContains(t *testing.T) {
+func TestHashCacheLoadOrComputeContains(t *testing.T) {
 	t.Parallel()
 
 	cache := NewHashCache(10)
@@ -89,7 +89,7 @@ func TestHashCacheLoadOrCreateContains(t *testing.T) {
 	// With the transactions generated, we'll add each of them to the hash
 	// cache.
 	for _, tx := range txns {
-		cache.LoadOrCreateSigHashes(tx, prevOuts)
+		cache.LoadOrComputeSigHashes(tx, prevOuts)
 	}
 
 	// Next, we'll ensure that each of the transactions inserted into the
@@ -116,9 +116,9 @@ func TestHashCacheLoadOrCreateContains(t *testing.T) {
 	}
 }
 
-// TestHashCacheLoadOrCreate tests that the sighashes for a transaction are
+// TestHashCacheLoadOrCompute tests that the sighashes for a transaction are
 // computed on a miss and reused on a hit.
-func TestHashCacheLoadOrCreate(t *testing.T) {
+func TestHashCacheLoadOrCompute(t *testing.T) {
 	t.Parallel()
 
 	cache := NewHashCache(10)
@@ -131,7 +131,7 @@ func TestHashCacheLoadOrCreate(t *testing.T) {
 	}
 	sigHashes := NewTxSigHashes(randTx, prevOuts)
 
-	cacheHashes := cache.LoadOrCreateSigHashes(randTx, prevOuts)
+	cacheHashes := cache.LoadOrComputeSigHashes(randTx, prevOuts)
 
 	// inspecting they have the same underlying data
 	if *sigHashes != *cacheHashes {
@@ -140,7 +140,7 @@ func TestHashCacheLoadOrCreate(t *testing.T) {
 	}
 
 	// verify the same pointer is returned (not a new computation).
-	if loaded := cache.LoadOrCreateSigHashes(randTx, prevOuts); loaded != cacheHashes {
+	if loaded := cache.LoadOrComputeSigHashes(randTx, prevOuts); loaded != cacheHashes {
 		t.Fatal("sighashes were recomputed instead of loaded from cache")
 	}
 }
@@ -172,7 +172,7 @@ func TestHashCacheEviction(t *testing.T) {
 
 	// insert more txns than the cache can hold.
 	for i, tx := range txns {
-		cache.LoadOrCreateSigHashes(tx, prevOuts)
+		cache.LoadOrComputeSigHashes(tx, prevOuts)
 
 		// assert the cache is still bounded.
 		if numEntries := cache.sigHashes.len(); numEntries > maxEntries {
@@ -193,7 +193,7 @@ func TestHashCacheEviction(t *testing.T) {
 
 	lastTx := txns[len(txns)-1]
 	for i := 0; i < maxEntries; i++ {
-		cache.LoadOrCreateSigHashes(lastTx, prevOuts)
+		cache.LoadOrComputeSigHashes(lastTx, prevOuts)
 	}
 
 	if newNumEntries := cache.sigHashes.len(); newNumEntries != numEntries {
@@ -215,9 +215,9 @@ func TestHashCacheDisabled(t *testing.T) {
 		t.Fatalf("unable to generate test tx: %v", err)
 	}
 
-	hashes := cache.LoadOrCreateSigHashes(tx, prevOuts)
+	hashes := cache.LoadOrComputeSigHashes(tx, prevOuts)
 	if hashes == nil {
-		t.Fatal("LoadOrCreateSigHashes returned nil for a disabled cache")
+		t.Fatal("LoadOrComputeSigHashes returned nil for a disabled cache")
 	}
 
 	txid := tx.TxHash()
@@ -251,7 +251,7 @@ func TestHashCachePurge(t *testing.T) {
 		prevOuts.Merge(randPrevOuts)
 	}
 	for _, tx := range txns {
-		cache.LoadOrCreateSigHashes(tx, prevOuts)
+		cache.LoadOrComputeSigHashes(tx, prevOuts)
 	}
 
 	// Once all the transactions have been inserted, we'll purge them from

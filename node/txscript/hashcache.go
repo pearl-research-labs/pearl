@@ -313,10 +313,10 @@ func NewHashCache(maxSize uint) *HashCache {
 	}
 }
 
-// LoadOrCreateSigHashes returns the partial sighashes for the passed
+// LoadOrComputeSigHashes returns the partial sighashes for the passed
 // transaction. It returns the cached value when present, otherwise it computes
 // and caches a new value before returning it.
-func (h *HashCache) LoadOrCreateSigHashes(tx *wire.MsgTx,
+func (h *HashCache) LoadOrComputeSigHashes(tx *wire.MsgTx,
 	inputFetcher PrevOutputFetcher) *TxSigHashes {
 
 	txid := tx.TxHash()

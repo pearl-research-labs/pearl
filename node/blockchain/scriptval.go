@@ -200,7 +200,7 @@ func ValidateTransactionScripts(tx *btcutil.Tx, utxoView *UtxoViewpoint,
 
 	// Re-use the same pre-computed sighash midstate across all validation
 	// goroutines so the sighashes are only computed once.
-	cachedHashes := hashCache.LoadOrCreateSigHashes(tx.MsgTx(), utxoView)
+	cachedHashes := hashCache.LoadOrComputeSigHashes(tx.MsgTx(), utxoView)
 
 	// Collect all of the transaction inputs and required information for
 	// validation.
@@ -243,7 +243,7 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 
 		// Pre-compute sighash midstates so they can be re-used
 		// across validation goroutines.
-		cachedHashes := hashCache.LoadOrCreateSigHashes(tx.MsgTx(), utxoView)
+		cachedHashes := hashCache.LoadOrComputeSigHashes(tx.MsgTx(), utxoView)
 
 		for txInIdx, txIn := range tx.MsgTx().TxIn {
 			txVI := &txValidateItem{
