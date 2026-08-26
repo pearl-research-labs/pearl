@@ -119,6 +119,7 @@ func chainSetup(dbName string, params *chaincfg.Params) (*blockchain.BlockChain,
 		Checkpoints: nil,
 		TimeSource:  blockchain.NewMedianTime(),
 		SigCache:    txscript.NewSigCache(1000),
+		HashCache:   txscript.NewHashCache(1000),
 	})
 	if err != nil {
 		teardown()
