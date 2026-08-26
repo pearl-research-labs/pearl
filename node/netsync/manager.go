@@ -1491,16 +1491,9 @@ func (sm *SyncManager) processMessage(m interface{}) {
 	case processBlockMsg:
 		_, isOrphan, err := sm.chain.ProcessBlock(
 			msg.block, msg.flags)
-		if err != nil {
-			msg.reply <- processBlockResponse{
-				isOrphan: false,
-				err:      err,
-			}
-		}
-
 		msg.reply <- processBlockResponse{
 			isOrphan: isOrphan,
-			err:      nil,
+			err:      err,
 		}
 
 	case isCurrentMsg:

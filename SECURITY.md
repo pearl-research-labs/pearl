@@ -95,6 +95,9 @@ Indicative rewards by severity (as determined by us):
 - **No entitlement.** Submission of a report does not create any right,
   claim, or expectation to a reward. Duplicate, out-of-scope, low-quality,
   or previously known issues may receive no award.
+- **Identity verification.** To comply with applicable U.S. sanctions laws
+  and regulations, Contributors may be required to disclose and verify their
+  identity.
 
 Submit reports through the process described in
 [Reporting a Vulnerability](#reporting-a-vulnerability).
