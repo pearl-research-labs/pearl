@@ -473,8 +473,18 @@ impl PlainProof {
     /// Derives the inner A/B index lists used to build the periodic patterns,
     /// plus the public `MoEParams` (when this is an MoE proof).
     fn moe_inner_indices(&self) -> Result<(Vec<u32>, Vec<u32>, Option<MoEParams>)> {
-        let a_indices: Vec<u32> = self.a.row_indices.iter().map(|&x| x as u32).collect();
-        let bt_indices: Vec<u32> = self.bt.row_indices.iter().map(|&x| x as u32).collect();
+        let a_indices: Vec<u32> = self
+            .a
+            .row_indices
+            .iter()
+            .map(|&x| x.try_into().context("A row index exceeds u32"))
+            .collect::<Result<_>>()?;
+        let bt_indices: Vec<u32> = self
+            .bt
+            .row_indices
+            .iter()
+            .map(|&x| x.try_into().context("B row index exceeds u32"))
+            .collect::<Result<_>>()?;
 
         let Some(moe) = &self.moe else {
             return Ok((a_indices, bt_indices, None));
@@ -505,8 +515,21 @@ impl PlainProof {
 
         ensure!(moe.routing_end_offsets.len() == moe.e);
 
-        let inner_a: Vec<u32> = moe.inner_a_rows.iter().map(|&x| x as u32).collect();
-        let inner_b: Vec<u32> = bt_indices.iter().map(|&idx| idx - weight_col_offset as u32).collect();
+        let inner_a: Vec<u32> = moe
+            .inner_a_rows
+            .iter()
+            .map(|&x| x.try_into().context("MoE inner A row index exceeds u32"))
+            .collect::<Result<_>>()?;
+        let weight_col_offset_u32: u32 = weight_col_offset
+            .try_into()
+            .context("expert weight column offset exceeds u32")?;
+        let inner_b: Vec<u32> = bt_indices
+            .iter()
+            .map(|&idx| {
+                idx.checked_sub(weight_col_offset_u32)
+                    .context("B row index below expert offset")
+            })
+            .collect::<Result<_>>()?;
 
         ensure!(
             moe.e <= PublicProofParams::MAX_NUM_EXPERTS,
@@ -529,14 +552,35 @@ impl PlainProof {
         header: IncompleteBlockHeader,
         seed_derivation: SeedDerivation,
     ) -> Result<(PrivateProofParams, PublicProofParams)> {
-        let (m, n, k) = (self.m, self.n, self.k);
+        // Reject every attacker-controlled `usize` dimension that does not fit its
+        // wire/public type *before* `check_declared_tree_sizes` validates the inflated
+        // values. On 64-bit targets, an unchecked `as` cast would otherwise truncate
+        // (wrap) an out-of-range dimension, letting a miner add a multiple of 2^width
+        // to a declared dimension, satisfy the leaf-count check on the wide value, and
+        // then have it silently wrap back to the intended public value (CWE-681).
+        let m: u32 = self.m.try_into().context("m exceeds u32")?;
+        let n: u32 = self.n.try_into().context("n exceeds u32")?;
+        let k: u32 = self.k.try_into().context("k exceeds u32")?;
+        let noise_rank: u16 = self.noise_rank.try_into().context("noise_rank exceeds u16")?;
+
+        // Reject out-of-range MoE dimensions before the tree-size check below,
+        // which operates on the wide `usize` values (via `total_b_cols` and the
+        // routing leaf count). Otherwise an inflated `e`/`top_k` could satisfy the
+        // leaf-count check on the wide value and then wrap at the `u16` narrowing.
+        let moe_config = match &self.moe {
+            Some(mp) => Some(MoEConfig {
+                e: mp.e.try_into().context("e exceeds u16")?,
+                top_k: mp.top_k.try_into().context("top_k exceeds u16")?,
+            }),
+            None => None,
+        };
 
         // Pin the committed trees to the declared dimensions before those
         // dimensions flow into the (salted) noise-seed derivation.
         self.check_declared_tree_sizes()?;
 
         for &tok in &self.a.row_indices {
-            ensure!(tok < m, "routing entry {} out of range for t={}", tok, m);
+            ensure!(tok < m as usize, "routing entry {} out of range for t={}", tok, m);
         }
 
         let (inner_a_indices, inner_b_indices, moe_params) = self.moe_inner_indices()?;
@@ -547,21 +591,18 @@ impl PlainProof {
             block_header: header,
             seed_derivation,
             mining_config: MiningConfiguration {
-                common_dim: k as u32,
-                rank: self.noise_rank as u16,
+                common_dim: k,
+                rank: noise_rank,
                 mma_type: MMAType::Int7xInt7ToInt32,
                 rows_pattern,
                 cols_pattern,
-                moe: self.moe.as_ref().map(|m| MoEConfig {
-                    e: m.e as u16,
-                    top_k: m.top_k as u16,
-                }),
+                moe: moe_config,
             },
             hash_a: self.a.proof.root,
             hash_b: self.bt.proof.root,
             hash_jackpot: [0xFFu8; 32], // Consumed only by ZK verifier
-            m: m as u32,
-            n: n as u32,
+            m,
+            n,
             t_rows,
             t_cols,
             moe: moe_params,
@@ -582,6 +623,7 @@ impl PlainProof {
             vec![]
         };
 
+        let k = k as usize;
         let private = PrivateProofParams {
             s_a: extract_strips(&self.a.row_indices, k, strip_len, &self.a.proof)?,
             s_b: extract_strips(&self.bt.row_indices, k, strip_len, &self.bt.proof)?,
