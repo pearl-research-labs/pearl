@@ -28,6 +28,10 @@ import (
 	"github.com/pearl-research-labs/pearl/spv/query"
 )
 
+func hashesOf(loc blockchain.BlockLocator) []*chainhash.Hash {
+	return []*chainhash.Hash(loc)
+}
+
 const (
 	// numMaxMemHeaders is the max number of headers to store in memory for
 	// a particular peer. By bounding this value, we're able to closely
@@ -387,7 +391,7 @@ func (b *blockManager) handleNewPeerMsg(peers *list.List, sp *ServerPeer) {
 			return
 		}
 		stopHash := &zeroHash
-		_ = sp.PushGetHeadersMsg(locator, stopHash, true)
+		_ = sp.PushGetHeadersMsg(hashesOf(locator), stopHash, true)
 	}
 
 	// Start syncing by choosing the best candidate if needed.
@@ -2154,7 +2158,7 @@ func (b *blockManager) startSync(peers *list.List) {
 
 		// With our stop hash selected, we'll kick off the sync from
 		// this peer with an initial GetHeaders message.
-		_ = b.SyncPeer().PushGetHeadersMsg(locator, stopHash, true)
+		_ = b.SyncPeer().PushGetHeadersMsg(hashesOf(locator), stopHash, true)
 	} else {
 		log.Warnf("No sync peer candidates available")
 	}
@@ -2321,7 +2325,7 @@ func (b *blockManager) handleInvMsg(imsg *invMsg) {
 			}
 
 			// Get headers based on locator.
-			err = imsg.peer.PushGetHeadersMsg(locator,
+			err = imsg.peer.PushGetHeadersMsg(hashesOf(locator),
 				&invVects[lastBlock].Hash, true)
 			if err != nil {
 				log.Warnf("Failed to send getheaders message "+
@@ -2407,7 +2411,7 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 			if b.nextCheckpoint != nil {
 				stopHash = *b.nextCheckpoint.Hash
 			}
-			err := hmsg.peer.PushGetHeadersMsg(locator, &stopHash, true)
+			err := hmsg.peer.PushGetHeadersMsg(hashesOf(locator), &stopHash, true)
 			if err != nil {
 				log.Warnf("Failed to send speculative "+
 					"getheaders to peer %s: %s",
@@ -2759,7 +2763,7 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 		if b.nextCheckpoint != nil {
 			nextHash = *b.nextCheckpoint.Hash
 		}
-		err := hmsg.peer.PushGetHeadersMsg(locator, &nextHash, true)
+		err := hmsg.peer.PushGetHeadersMsg(hashesOf(locator), &nextHash, true)
 		if err != nil {
 			log.Warnf("Failed to send getheaders message to "+
 				"peer %s: %s", hmsg.peer.Addr(), err)

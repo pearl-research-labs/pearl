@@ -22,6 +22,10 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
+func hashesOf(loc blockchain.BlockLocator) []*chainhash.Hash {
+	return []*chainhash.Hash(loc)
+}
+
 const (
 	// minInFlightBlocks is the minimum number of blocks that should be
 	// in the request queue for headers-first mode before requesting
@@ -402,13 +406,13 @@ func (sm *SyncManager) startSync() {
 		best.Height < sm.nextCheckpoint.Height &&
 		sm.chainParams != &chaincfg.RegressionNetParams {
 
-		bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
+		bestPeer.PushGetHeadersMsg(hashesOf(locator), sm.nextCheckpoint.Hash, true)
 		sm.headersFirstMode = true
 		log.Infof("Downloading headers for blocks %d to "+
 			"%d from peer %s", best.Height+1,
 			sm.nextCheckpoint.Height, bestPeer.Addr())
 	} else {
-		bestPeer.PushGetBlocksMsg(locator, &zeroHash)
+		bestPeer.PushGetBlocksMsg(hashesOf(locator), &zeroHash)
 	}
 	sm.syncPeer = bestPeer
 
@@ -847,7 +851,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 
 		orphanRoot := sm.chain.GetOrphanRoot(blockHash)
 		locator, _ := sm.chain.LatestBlockLocator()
-		peer.PushGetBlocksMsg(locator, orphanRoot)
+		peer.PushGetBlocksMsg(hashesOf(locator), orphanRoot)
 	} else {
 		if peer == sm.syncPeer {
 			sm.lastProgressTime = time.Now()
@@ -909,7 +913,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
 	if sm.nextCheckpoint != nil {
 		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
-		err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
+		err := peer.PushGetHeadersMsg(hashesOf(locator), sm.nextCheckpoint.Hash, true)
 		if err != nil {
 			log.Warnf("Failed to send getheaders message to "+
 				"peer %s: %v", peer.Addr(), err)
@@ -928,7 +932,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 	sm.headerList.Init()
 	log.Infof("Reached the final checkpoint -- switching to normal mode")
 	locator := blockchain.BlockLocator([]*chainhash.Hash{blockHash})
-	err = peer.PushGetBlocksMsg(locator, &zeroHash)
+	err = peer.PushGetBlocksMsg(hashesOf(locator), &zeroHash)
 	if err != nil {
 		log.Warnf("Failed to send getblocks message to peer %s: %v",
 			peer.Addr(), err)
@@ -1158,7 +1162,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// headers starting from the latest known header and ending with the
 	// next checkpoint.
 	locator := blockchain.BlockLocator([]*chainhash.Hash{finalHash})
-	err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
+	err := peer.PushGetHeadersMsg(hashesOf(locator), sm.nextCheckpoint.Hash, true)
 	if err != nil {
 		log.Warnf("Failed to send getheaders message to "+
 			"peer %s: %v", peer.Addr(), err)
@@ -1302,7 +1306,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		if have, _ := sm.haveInventory(invVects[lastBlock]); !have {
 			locator, _ := sm.chain.LatestBlockLocator()
 			_ = peer.PushGetHeadersMsg(
-				locator, &invVects[lastBlock].Hash, false)
+				hashesOf(locator), &invVects[lastBlock].Hash, false)
 		}
 	}
 
@@ -1378,7 +1382,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 				// in.
 				orphanRoot := sm.chain.GetOrphanRoot(&iv.Hash)
 				locator, _ := sm.chain.LatestBlockLocator()
-				peer.PushGetBlocksMsg(locator, orphanRoot)
+				peer.PushGetBlocksMsg(hashesOf(locator), orphanRoot)
 				continue
 			}
 
@@ -1401,7 +1405,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 					continue
 				}
 				locator := sm.chain.BlockLocatorFromHash(&iv.Hash)
-				peer.PushGetBlocksMsg(locator, &zeroHash)
+				peer.PushGetBlocksMsg(hashesOf(locator), &zeroHash)
 			}
 		}
 	}
