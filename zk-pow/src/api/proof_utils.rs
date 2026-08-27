@@ -1288,8 +1288,10 @@ impl PublicProofParams {
             );
             let outer_indices_bytes = &moe_data[offset..];
             let outer_indices: Vec<u32> = outer_indices_bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             Some(MoEParams {
                 routing_offsets,

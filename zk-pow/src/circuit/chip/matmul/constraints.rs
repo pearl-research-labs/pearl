@@ -15,7 +15,7 @@ where
     E: Evaluator<V, S>,
 {
     debug_assert_eq!(unpacked.len(), packed.len() * BYTES_PER_GOLDILOCKS);
-    for (unpacked_chunk, &packed_elem) in unpacked.chunks_exact(BYTES_PER_GOLDILOCKS).zip_eq(packed) {
+    for (unpacked_chunk, &packed_elem) in unpacked.as_chunks::<BYTES_PER_GOLDILOCKS>().0.iter().zip_eq(packed) {
         let repacked = eval.polyval(unpacked_chunk, c256);
         eval.constraint_eq(packed_elem, repacked);
     }
