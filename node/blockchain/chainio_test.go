@@ -8,8 +8,10 @@ import (
 	"bytes"
 	"errors"
 	"math/big"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
@@ -38,6 +40,101 @@ func TestErrNotInMainChain(t *testing.T) {
 	err = errors.New("something else")
 	if isNotInMainChainErr(err) {
 		t.Fatalf("isNotInMainChainErr detected incorrect type")
+	}
+}
+
+func setupTestDB(tb testing.TB, name string) database.DB {
+	tb.Helper()
+
+	if !isSupportedDbType(testDbType) {
+		tb.Fatalf("unsupported db type %v", testDbType)
+	}
+
+	dbPath := filepath.Join(tb.TempDir(), name)
+	db, err := database.Create(testDbType, dbPath, blockDataNet)
+	if err != nil {
+		tb.Fatalf("error creating db: %v", err)
+	}
+	tb.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			tb.Fatalf("error closing db: %v", err)
+		}
+	})
+
+	return db
+}
+
+func TestDbFetchCertificate(t *testing.T) {
+	db := setupTestDB(t, "certfetch")
+
+	tests := []struct {
+		name string
+		cert wire.BlockCertificate
+	}{
+		{
+			name: "null",
+		},
+		{
+			name: "v1",
+			cert: &wire.CertificateV1{
+				ProofData: []byte{0x01, 0x02, 0x03},
+			},
+		},
+		{
+			name: "v2",
+			cert: &wire.CertificateV2{
+				PublicDataLen: wire.PublicDataSizeDenseV2,
+				ProofData:     []byte{0x04, 0x05, 0x06, 0x07},
+			},
+		},
+		{
+			name: "v3",
+			cert: &wire.CertificateV3{
+				CertificateV2: wire.CertificateV2{
+					PublicDataLen: wire.PublicDataSizeDenseV2 + 1,
+					ProofData:     []byte{0x08, 0x09},
+				},
+			},
+		},
+	}
+
+	for i, test := range tests {
+		header := wire.BlockHeader{
+			Version:   int32(i + 1),
+			Timestamp: time.Unix(int64(i+1), 0),
+		}
+		block := btcutil.NewBlock(&wire.MsgBlock{
+			MsgHeader: wire.MsgHeader{
+				BlockHeader: header,
+				MsgCertificate: wire.MsgCertificate{
+					Certificate: test.cert,
+				},
+			},
+		})
+		blockHash := *block.Hash()
+
+		err := db.Update(func(dbTx database.Tx) error {
+			return dbTx.StoreBlock(block)
+		})
+		if err != nil {
+			t.Fatalf("StoreBlock (%s): unexpected error: %v", test.name, err)
+		}
+
+		err = db.View(func(dbTx database.Tx) error {
+			gotCert, err := dbFetchCertificate(dbTx, blockHash)
+			if err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(gotCert, test.cert) {
+				t.Fatalf("dbFetchCertificate (%s): got %#v, want %#v",
+					test.name, gotCert, test.cert)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("dbFetchCertificate (%s): unexpected error: %v",
+				test.name, err)
+		}
 	}
 }
 

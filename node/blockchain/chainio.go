@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math/big"
 	"sync"
 	"time"
@@ -1410,24 +1411,49 @@ func dbFetchBlockVsize(dbTx database.Tx, blockHash chainhash.Hash) (int64, error
 	return vsize, nil
 }
 
-// dbFetchCertificate retrieves a certificate for a block from the database.
-// It fetches the full block and extracts the certificate from it.
-func dbFetchCertificate(dbTx database.Tx, blockHash chainhash.Hash) (wire.BlockCertificate, error) {
-	// Fetch the block data from database
-	blockBytes, err := dbTx.FetchBlock(&blockHash)
+type dbBlockRegionReader struct {
+	dbTx      database.Tx
+	blockHash chainhash.Hash
+	offset    uint32
+}
+
+func (r *dbBlockRegionReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	regionBytes, err := r.dbTx.FetchBlockRegion(&database.BlockRegion{
+		Hash:   &r.blockHash,
+		Offset: r.offset,
+		Len:    uint32(len(p)),
+	})
+
 	if err != nil {
+		return 0, err
+	}
+
+	n := copy(p, regionBytes)
+	r.offset += uint32(n)
+
+	return n, nil
+}
+
+// dbFetchCertificate retrieves a certificate for a block from the database
+// without fetching the full block.
+func dbFetchCertificate(dbTx database.Tx, blockHash chainhash.Hash) (wire.BlockCertificate, error) {
+	blockReader := &dbBlockRegionReader{
+		dbTx:      dbTx,
+		blockHash: blockHash,
+	}
+
+	bufferedCertReader := io.LimitReader(blockReader, wire.CertificateMaxSize)
+
+	var cert wire.MsgCertificate
+	if err := cert.PrlDecode(bufferedCertReader, 0); err != nil {
 		return nil, err
 	}
 
-	// Deserialize the block to extract certificate
-	var block wire.MsgBlock
-	err = block.Deserialize(bytes.NewReader(blockBytes))
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize block: %w", err)
-	}
-
-	// Return the certificate from the block header
-	return block.BlockCertificate(), nil
+	return cert.Certificate, nil
 }
 
 // dbStoreBlock stores the provided block in the database. The block header is
