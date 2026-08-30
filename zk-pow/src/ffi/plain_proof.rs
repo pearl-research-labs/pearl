@@ -552,13 +552,12 @@ impl PlainProof {
         header: IncompleteBlockHeader,
         seed_derivation: SeedDerivation,
     ) -> Result<(PrivateProofParams, PublicProofParams)> {
-        // Reject oversized usize dims before tree-size checks so wraparound can't satisfy then truncate (CWE-681).
+        // Leaf-count binds usize; public dims are u32/u16 — wrap would unbind them.
         let m: u32 = self.m.try_into().context("m exceeds u32")?;
         let n: u32 = self.n.try_into().context("n exceeds u32")?;
         let k: u32 = self.k.try_into().context("k exceeds u32")?;
         let noise_rank: u16 = self.noise_rank.try_into().context("noise_rank exceeds u16")?;
 
-        // MoE e/top_k also feed the tree-size check; reject overflow before wrap can hide it.
         let moe_config = match &self.moe {
             Some(mp) => Some(MoEConfig {
                 e: mp.e.try_into().context("e exceeds u16")?,
