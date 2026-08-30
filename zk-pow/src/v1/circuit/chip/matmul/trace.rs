@@ -46,7 +46,7 @@ pub fn fill_row_trace<'a, F, const D: usize>(
         ([0i8; TILE_H * TILE_D], [0i8; TILE_H * TILE_D])
     };
     let a_noised = a_tile.iter().zip(a_noise.iter()).map(|(a, n)| a + n).collect_vec();
-    for a_n_chunk in a_noised.chunks_exact(BYTES_PER_GOLDILOCKS) {
+    for a_n_chunk in a_noised.as_chunks::<BYTES_PER_GOLDILOCKS>().0 {
         row_builder.dump_i64(i64_pack_base(a_n_chunk, 256));
     }
     for &a_n_unpack in &a_noised {
@@ -63,7 +63,7 @@ pub fn fill_row_trace<'a, F, const D: usize>(
         ([0i8; TILE_H * TILE_D], [0i8; TILE_H * TILE_D])
     };
     let b_noised = b_tile.iter().zip(b_noise.iter()).map(|(b, n)| b + n).collect_vec();
-    for b_n_chunk in b_noised.chunks_exact(BYTES_PER_GOLDILOCKS) {
+    for b_n_chunk in b_noised.as_chunks::<BYTES_PER_GOLDILOCKS>().0 {
         row_builder.dump_i64(i64_pack_base(b_n_chunk, 256));
     }
     for &b_n_unpack in &b_noised {
