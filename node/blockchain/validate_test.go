@@ -16,6 +16,8 @@ import (
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/node/zkpow"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestSequenceLocksActive tests the SequenceLockActive function to ensure it
@@ -195,12 +197,13 @@ func TestCheckBlockSanity(t *testing.T) {
 	}
 }
 
-// TestCheckBlockSanityRejectsMultipleCoinbases ensures that CheckBlockSanity
+// TestCheckBlockSanityRejectsMultipleCoinbases ensures that checkBlockSanity
 // rejects a block containing more than one coinbase transaction with
 // ErrMultipleCoinbases. This invariant is relied upon by checkBlockScripts,
-// which skips Transactions()[0] as the only coinbase when pre-computing
-// sighash midstates.
+// which skips any IsCoinBase transaction when pre-computing sighash midstates.
 func TestCheckBlockSanityRejectsMultipleCoinbases(t *testing.T) {
+	t.Parallel()
+
 	chainParams := &chaincfg.RegressionNetParams
 	header := wire.BlockHeader{
 		Version:    1,
@@ -210,40 +213,35 @@ func TestCheckBlockSanityRejectsMultipleCoinbases(t *testing.T) {
 		Bits:       chainParams.PowLimitBits,
 	}
 
-	cert, err := zkpow.Mine(&header, chainParams.RequiredCertVersion(1))
-	if err != nil {
-		t.Fatalf("Mine failed: %v", err)
-	}
-
 	// Append a duplicate of the coinbase so the block contains two
 	// coinbase transactions.
 	dupCoinbase := Block100000.Transactions[0].Copy()
 	transactions := make([]*wire.MsgTx, 0, len(Block100000.Transactions)+1)
 	transactions = append(transactions, Block100000.Transactions...)
 	transactions = append(transactions, dupCoinbase)
+
+	// A vanity certificate is enough for the header's structural checks.
+	// checkBlockSanity is called with BFNoPoWCheck so this does not need a
+	// mined proof or the zkpow build tag; CheckBlockSanity hardcodes BFNone.
 	msgBlock := &wire.MsgBlock{
 		MsgHeader: wire.MsgHeader{
-			BlockHeader:    header,
-			MsgCertificate: wire.MsgCertificate{Certificate: cert},
+			BlockHeader: header,
+			MsgCertificate: wire.MsgCertificate{
+				Certificate: &wire.CertificateV1{
+					ProofData: []byte{0xde, 0xad, 0xbe, 0xef},
+				},
+			},
 		},
 		Transactions: transactions,
 	}
 	block := btcutil.NewBlock(msgBlock)
 
-	timeSource := NewMedianTime()
-	err = CheckBlockSanity(block, chainParams, timeSource)
-	if err == nil {
-		t.Fatalf("CheckBlockSanity accepted a block with two coinbases")
-	}
+	err := checkBlockSanity(block, chainParams, NewMedianTime(), BFNoPoWCheck)
+	require.Error(t, err)
 
-	rerr, ok := err.(RuleError)
-	if !ok {
-		t.Fatalf("expected RuleError, got %T: %v", err, err)
-	}
-	if rerr.ErrorCode != ErrMultipleCoinbases {
-		t.Fatalf("expected ErrMultipleCoinbases, got %v: %v",
-			rerr.ErrorCode, err)
-	}
+	var rerr RuleError
+	require.ErrorAs(t, err, &rerr)
+	require.Equal(t, ErrMultipleCoinbases, rerr.ErrorCode)
 }
 
 // TestCheckSerializedHeight tests the CheckSerializedHeight function with
