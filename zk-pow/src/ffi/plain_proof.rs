@@ -552,21 +552,13 @@ impl PlainProof {
         header: IncompleteBlockHeader,
         seed_derivation: SeedDerivation,
     ) -> Result<(PrivateProofParams, PublicProofParams)> {
-        // Reject every attacker-controlled `usize` dimension that does not fit its
-        // wire/public type *before* `check_declared_tree_sizes` validates the inflated
-        // values. On 64-bit targets, an unchecked `as` cast would otherwise truncate
-        // (wrap) an out-of-range dimension, letting a miner add a multiple of 2^width
-        // to a declared dimension, satisfy the leaf-count check on the wide value, and
-        // then have it silently wrap back to the intended public value (CWE-681).
+        // Reject oversized usize dims before tree-size checks so wraparound can't satisfy then truncate (CWE-681).
         let m: u32 = self.m.try_into().context("m exceeds u32")?;
         let n: u32 = self.n.try_into().context("n exceeds u32")?;
         let k: u32 = self.k.try_into().context("k exceeds u32")?;
         let noise_rank: u16 = self.noise_rank.try_into().context("noise_rank exceeds u16")?;
 
-        // Reject out-of-range MoE dimensions before the tree-size check below,
-        // which operates on the wide `usize` values (via `total_b_cols` and the
-        // routing leaf count). Otherwise an inflated `e`/`top_k` could satisfy the
-        // leaf-count check on the wide value and then wrap at the `u16` narrowing.
+        // MoE e/top_k also feed the tree-size check; reject overflow before wrap can hide it.
         let moe_config = match &self.moe {
             Some(mp) => Some(MoEConfig {
                 e: mp.e.try_into().context("e exceeds u16")?,
