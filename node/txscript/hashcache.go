@@ -330,12 +330,6 @@ func (h *HashCache) LoadOrComputeSigHashes(tx *wire.MsgTx,
 	return sigHashes
 }
 
-// ContainsHashes returns whether the partial sighashes for the passed
-// transaction currently exist within the HashCache.
-func (h *HashCache) ContainsHashes(txid *chainhash.Hash) bool {
-	return h.sigHashes.contains(*txid)
-}
-
 // PurgeSigHashes removes all partial sighashes from the HashCache belonging to
 // the passed transaction.
 func (h *HashCache) PurgeSigHashes(txid *chainhash.Hash) {
