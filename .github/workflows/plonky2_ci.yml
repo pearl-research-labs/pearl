@@ -31,7 +31,7 @@ jobs:
     
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
       
@@ -47,7 +47,7 @@ jobs:
         run: cargo clippy --release --all-features --all-targets -- -D warnings -A incomplete-features
       
       - name: Set up rust cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: "plonky2 -> target"
           cache-on-failure: true
