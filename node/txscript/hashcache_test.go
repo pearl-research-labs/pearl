@@ -59,11 +59,10 @@ func genTestTx() (*wire.MsgTx, *MultiPrevOutFetcher, error) {
 	return tx, prevOuts, nil
 }
 
-// TestHashCacheAddContainsHashes tests that after items have been added to the
-// hash cache, the ContainsHashes method returns true for all the items
-// inserted.  Conversely, ContainsHashes should return false for any items
-// _not_ in the hash cache.
-func TestHashCacheAddContainsHashes(t *testing.T) {
+// TestHashCacheLoadOrComputeContains tests that after items have been loaded
+// into the hash cache, they are all present. Conversely, transactions that
+// have not been loaded should not be present.
+func TestHashCacheLoadOrComputeContains(t *testing.T) {
 	t.Parallel()
 
 	cache := NewHashCache(10)
@@ -90,14 +89,14 @@ func TestHashCacheAddContainsHashes(t *testing.T) {
 	// With the transactions generated, we'll add each of them to the hash
 	// cache.
 	for _, tx := range txns {
-		cache.AddSigHashes(tx, prevOuts)
+		cache.LoadOrComputeSigHashes(tx, prevOuts)
 	}
 
 	// Next, we'll ensure that each of the transactions inserted into the
-	// cache are properly located by the ContainsHashes method.
+	// cache is present.
 	for _, tx := range txns {
 		txid := tx.TxHash()
-		if ok := cache.ContainsHashes(&txid); !ok {
+		if ok := cache.sigHashes.contains(txid); !ok {
 			t.Fatalf("txid %v not found in cache but should be: ",
 				txid)
 		}
@@ -109,18 +108,17 @@ func TestHashCacheAddContainsHashes(t *testing.T) {
 	}
 
 	// Finally, we'll assert that a transaction that wasn't added to the
-	// cache won't be reported as being present by the ContainsHashes
-	// method.
+	// cache won't be reported as being present.
 	randTxid := randTx.TxHash()
-	if ok := cache.ContainsHashes(&randTxid); ok {
+	if ok := cache.sigHashes.contains(randTxid); ok {
 		t.Fatalf("txid %v wasn't inserted into cache but was found",
 			randTxid)
 	}
 }
 
-// TestHashCacheAddGet tests that the sighashes for a particular transaction
-// are properly retrieved by the GetSigHashes function.
-func TestHashCacheAddGet(t *testing.T) {
+// TestHashCacheLoadOrCompute tests that the sighashes for a transaction are
+// computed on a miss and reused on a hit.
+func TestHashCacheLoadOrCompute(t *testing.T) {
 	t.Parallel()
 
 	cache := NewHashCache(10)
@@ -133,21 +131,98 @@ func TestHashCacheAddGet(t *testing.T) {
 	}
 	sigHashes := NewTxSigHashes(randTx, prevOuts)
 
-	// Next, add the transaction to the hash cache.
-	cache.AddSigHashes(randTx, prevOuts)
+	cacheHashes := cache.LoadOrComputeSigHashes(randTx, prevOuts)
 
-	// The transaction inserted into the cache above should be found.
-	txid := randTx.TxHash()
-	cacheHashes, ok := cache.GetSigHashes(&txid)
-	if !ok {
-		t.Fatalf("tx %v wasn't found in cache", txid)
-	}
-
-	// Finally, the sighashes retrieved should exactly match the sighash
-	// originally inserted into the cache.
+	// inspecting they have the same underlying data
 	if *sigHashes != *cacheHashes {
 		t.Fatalf("sighashes don't match: expected %v, got %v",
 			spew.Sdump(sigHashes), spew.Sdump(cacheHashes))
+	}
+
+	// verify the same pointer is returned (not a new computation).
+	if loaded := cache.LoadOrComputeSigHashes(randTx, prevOuts); loaded != cacheHashes {
+		t.Fatal("sighashes were recomputed instead of loaded from cache")
+	}
+}
+
+// TestHashCacheEviction tests that the hash cache never grows beyond the
+// maximum number of entries it was created with, evicting existing entries to
+// make room for new ones.
+func TestHashCacheEviction(t *testing.T) {
+	t.Parallel()
+
+	const (
+		maxEntries = 10
+		numTxns    = maxEntries * 3
+	)
+
+	cache := NewHashCache(maxEntries)
+
+	prevOuts := NewMultiPrevOutFetcher(nil)
+	txns := make([]*wire.MsgTx, numTxns)
+	for i := 0; i < numTxns; i++ {
+		tx, randPrevOuts, err := genTestTx()
+		if err != nil {
+			t.Fatalf("unable to generate test tx: %v", err)
+		}
+
+		txns[i] = tx
+		prevOuts.Merge(randPrevOuts)
+	}
+
+	// insert more txns than the cache can hold.
+	for i, tx := range txns {
+		cache.LoadOrComputeSigHashes(tx, prevOuts)
+
+		// assert the cache is still bounded.
+		if numEntries := cache.sigHashes.len(); numEntries > maxEntries {
+			t.Fatalf("cache holds %v entries after %v insertions, "+
+				"but the max is %v", numEntries, i+1, maxEntries)
+		}
+
+		// assert the latest inserted txid is present in the cache.
+		txid := tx.TxHash()
+		if ok := cache.sigHashes.contains(txid); !ok {
+			t.Fatalf("txid %v not found in cache but should be",
+				txid)
+		}
+	}
+
+	// ensure re-adding a cached tx doesn't evict any other txs.
+	numEntries := cache.sigHashes.len()
+
+	lastTx := txns[len(txns)-1]
+	for i := 0; i < maxEntries; i++ {
+		cache.LoadOrComputeSigHashes(lastTx, prevOuts)
+	}
+
+	if newNumEntries := cache.sigHashes.len(); newNumEntries != numEntries {
+		t.Fatalf("re-adding a cached tx changed the number of "+
+			"entries: expected %v, got %v", numEntries,
+			newNumEntries)
+	}
+}
+
+// TestHashCacheDisabled tests that a hash cache created with a maximum size of
+// zero doesn't cache anything at all.
+func TestHashCacheDisabled(t *testing.T) {
+	t.Parallel()
+
+	cache := NewHashCache(0)
+
+	tx, prevOuts, err := genTestTx()
+	if err != nil {
+		t.Fatalf("unable to generate test tx: %v", err)
+	}
+
+	hashes := cache.LoadOrComputeSigHashes(tx, prevOuts)
+	if hashes == nil {
+		t.Fatal("LoadOrComputeSigHashes returned nil for a disabled cache")
+	}
+
+	txid := tx.TxHash()
+	if ok := cache.sigHashes.contains(txid); ok {
+		t.Fatalf("txid %v was cached, but the cache is disabled", txid)
 	}
 }
 
@@ -176,7 +251,7 @@ func TestHashCachePurge(t *testing.T) {
 		prevOuts.Merge(randPrevOuts)
 	}
 	for _, tx := range txns {
-		cache.AddSigHashes(tx, prevOuts)
+		cache.LoadOrComputeSigHashes(tx, prevOuts)
 	}
 
 	// Once all the transactions have been inserted, we'll purge them from
@@ -190,7 +265,7 @@ func TestHashCachePurge(t *testing.T) {
 	// should be found within the cache.
 	for _, tx := range txns {
 		txid := tx.TxHash()
-		if ok := cache.ContainsHashes(&txid); ok {
+		if ok := cache.sigHashes.contains(txid); ok {
 			t.Fatalf("tx %v found in cache but should have "+
 				"been purged: ", txid)
 		}

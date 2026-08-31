@@ -16,6 +16,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
+	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
@@ -345,6 +346,8 @@ func newBlockImporter(db database.DB, r io.ReadSeeker) (*blockImporter, error) {
 		ChainParams:  activeNetParams,
 		TimeSource:   blockchain.NewMedianTime(),
 		IndexManager: indexManager,
+		SigCache:     txscript.NewSigCache(0),
+		HashCache:    txscript.NewHashCache(0),
 	})
 	if err != nil {
 		return nil, err

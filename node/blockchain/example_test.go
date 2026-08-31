@@ -15,6 +15,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/database"
 	_ "github.com/pearl-research-labs/pearl/node/database/ffldb"
+	"github.com/pearl-research-labs/pearl/node/txscript"
 )
 
 // This example demonstrates how to create a new chain instance and use
@@ -49,6 +50,8 @@ func ExampleBlockChain_ProcessBlock() {
 		DB:          db,
 		ChainParams: &chaincfg.MainNetParams,
 		TimeSource:  blockchain.NewMedianTime(),
+		SigCache:    txscript.NewSigCache(0),
+		HashCache:   txscript.NewHashCache(0),
 	})
 	if err != nil {
 		fmt.Printf("Failed to create chain instance: %v\n", err)
