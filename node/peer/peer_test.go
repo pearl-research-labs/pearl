@@ -644,3 +644,43 @@ func TestSendAddrV2Handshake(t *testing.T) {
 	inPeer.WaitForDisconnect()
 	outPeer.WaitForDisconnect()
 }
+
+// TestPushAddrV2MsgShuffleNoDuplicates is a regression test for issue #292.
+// It verifies that PushAddrV2Msg preserves the address set as a permutation
+// when the input contains more than wire.MaxV2AddrPerMsg distinct addresses:
+// the returned list is capped to MaxV2AddrPerMsg, contains no duplicates, and
+// every returned address was part of the original input.
+func TestPushAddrV2MsgShuffleNoDuplicates(t *testing.T) {
+	const numAddrs = wire.MaxV2AddrPerMsg + 250
+
+	peerCfg := &peer.Config{
+		UserAgentName:    "peer",
+		UserAgentVersion: "1.0",
+	}
+	p, err := peer.NewOutboundPeer(peerCfg, "10.0.0.1:8333")
+	require.NoError(t, err)
+
+	addrs := make([]*wire.NetAddressV2, numAddrs)
+	original := make(map[string]struct{}, numAddrs)
+	for i := range addrs {
+		ip := net.IPv4(10, 0, byte(i>>8), byte(i))
+		addrs[i] = wire.NetAddressV2FromBytes(
+			time.Unix(int64(i), 0), 0, ip.To4(), 8333,
+		)
+		original[addrs[i].Addr.String()] = struct{}{}
+	}
+
+	sent, err := p.PushAddrV2Msg(addrs)
+	require.NoError(t, err)
+	require.Len(t, sent, wire.MaxV2AddrPerMsg)
+
+	seen := make(map[string]struct{}, len(sent))
+	for _, a := range sent {
+		key := a.Addr.String()
+		_, dup := seen[key]
+		require.Falsef(t, dup, "duplicate address %q", key)
+		_, ok := original[key]
+		require.Truef(t, ok, "address %q was not in the input set", key)
+		seen[key] = struct{}{}
+	}
+}

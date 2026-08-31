@@ -1468,22 +1468,27 @@ func (c *wsClient) rejectBatch(jsonErr *btcjson.RPCError) {
 // runCommand executes the handler for a parsed command and returns its
 // marshalled reply.  If the reply cannot be marshalled it logs the failure and
 // returns a nil reply, leaving delivery and failure policy to the caller.
-func (c *wsClient) runCommand(cmd *parsedRPCCmd) json.RawMessage {
+func (c *wsClient) runCommand(cmd *parsedRPCCmd) (reply json.RawMessage) {
+	// WebSocket commands run outside net/http's panic recovery.
+	defer func() {
+		if r := recover(); r != nil {
+			rpcsLog.Errorf("Panic processing websocket command <%s> from %s: %v",
+				cmd.method, c.addr, r)
+			reply = marshalReply(cmd.jsonrpc, cmd.id, btcjson.ErrRPCInternal)
+		}
+	}()
+
 	var (
 		result interface{}
 		err    error
 	)
-
-	// Look up the websocket extension for the command and if it doesn't
-	// exist fall back to handling the command as a standard command.
-	wsHandler, ok := wsHandlers[cmd.method]
-	if ok {
+	if wsHandler, ok := wsHandlers[cmd.method]; ok {
 		result, err = wsHandler(c, cmd.cmd)
 	} else {
 		result, err = c.server.standardCmdResult(cmd, nil)
 	}
 
-	reply, err := createMarshalledReply(cmd.jsonrpc, cmd.id, result, err)
+	reply, err = createMarshalledReply(cmd.jsonrpc, cmd.id, result, err)
 	if err != nil {
 		rpcsLog.Errorf("Failed to marshal reply for <%s> command: %v",
 			cmd.method, err)
