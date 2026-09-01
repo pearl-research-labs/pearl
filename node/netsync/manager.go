@@ -228,9 +228,19 @@ type SyncManager struct {
 
 	// The following fields are used for headers-first mode.
 	headersFirstMode bool
-	headerList       *list.List
-	startHeader      *list.Element
-	nextCheckpoint   *chaincfg.Checkpoint
+
+	// headerList records every header currently being synced in
+	// headers-first mode, in chain order. It serves three roles:
+	// (1) a chain-linkage anchor, seeded with the latest known block so
+	// each incoming header can prove it connects, (2) a download work
+	// queue that fetchHeaderBlocks walks from startHeader to issue getdata
+	// for each block the headers describe, and (3) an arrival matcher in
+	// handleBlockMsg that fast-adds already-verified headers as
+	// their blocks arrive.
+	headerList *list.List
+
+	startHeader    *list.Element
+	nextCheckpoint *chaincfg.Checkpoint
 
 	// An optional fee estimator.
 	feeEstimator *mempool.FeeEstimator
@@ -1056,56 +1066,64 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		blockHash := blockHeader.BlockHash()
 		finalHash = &blockHash
 
-		// Verify proof of work and certificate per header. getheaders
-		// always requests certificates, so a missing or invalid one
-		// is a protocol violation.
+		// The anchor seeded by resetHeaderState makes an empty list
+		// unreachable here. This is a broken-invariant guard, not a peer
+		// misbehavior check.
+		prevNodeEl := sm.headerList.Back()
+		if prevNodeEl == nil {
+			log.Warnf("Header list does not contain a previous " +
+				"element as expected -- disconnecting peer")
+
+			// Syncing cannot continue without the anchor.
+			// Disconnecting the sync peer resets the header state and restarts the sync.
+			peer.Disconnect()
+
+			return
+		}
+
+		// Ensure the header properly connects to the previous one before
+		// doing any expensive validation.
+		node := headerNode{hash: &blockHash}
+		prevNode := prevNodeEl.Value.(*headerNode)
+		if !prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
+			log.Warnf("Received block header that does not "+
+				"properly connect to the chain from peer %s "+
+				"-- disconnecting", peer.Addr())
+			peer.Disconnect()
+
+			return
+		}
+
+		node.height = prevNode.height + 1
+
+		// Enforce the cheap, height-gated certificate rules
+		if err := blockchain.CheckCertificateRules(
+			blockHeader, msgHeader.BlockCertificate(), node.height,
+			sm.chainParams,
+			blockchain.NetBehaviorFlags(sm.chainParams),
+		); err != nil {
+			log.Warnf("Header from peer %s has a certificate that "+
+				"violates the rules at height %d: %v -- disconnecting",
+				peer.Addr(), node.height, err)
+			peer.Disconnect()
+
+			return
+		}
+
+		// Verify proof of work and certificate per header.
 		if err := sm.chain.CheckHeaderSanity(
 			blockHeader, msgHeader.BlockCertificate(),
 		); err != nil {
 			log.Warnf("Header from peer %s failed sanity check: "+
 				"%v -- disconnecting", peer.Addr(), err)
 			peer.Disconnect()
+
 			return
 		}
 
-		// Ensure there is a previous header to compare against.
-		prevNodeEl := sm.headerList.Back()
-		if prevNodeEl == nil {
-			log.Warnf("Header list does not contain a previous" +
-				"element as expected -- disconnecting peer")
-			peer.Disconnect()
-			return
-		}
-
-		// Ensure the header properly connects to the previous one and
-		// add it to the list of headers.
-		node := headerNode{hash: &blockHash}
-		prevNode := prevNodeEl.Value.(*headerNode)
-		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
-			node.height = prevNode.height + 1
-
-			if err := blockchain.CheckCertificateRules(
-				blockHeader, msgHeader.BlockCertificate(), node.height,
-				sm.chainParams,
-				blockchain.NetBehaviorFlags(sm.chainParams),
-			); err != nil {
-				log.Warnf("Header from peer %s has a certificate that "+
-					"violates the rules at height %d: %v -- disconnecting",
-					peer.Addr(), node.height, err)
-				peer.Disconnect()
-				return
-			}
-
-			e := sm.headerList.PushBack(&node)
-			if sm.startHeader == nil {
-				sm.startHeader = e
-			}
-		} else {
-			log.Warnf("Received block header that does not "+
-				"properly connect to the chain from peer %s "+
-				"-- disconnecting", peer.Addr())
-			peer.Disconnect()
-			return
+		e := sm.headerList.PushBack(&node)
+		if sm.startHeader == nil {
+			sm.startHeader = e
 		}
 
 		// Verify the header at the next checkpoint height matches.
