@@ -24,6 +24,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
+	"github.com/pearl-research-labs/pearl/node/metrics"
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"golang.org/x/crypto/ripemd160"
@@ -1100,12 +1101,14 @@ func (*wsNotificationManager) removeAddrRequest(addrs map[string]map[chan struct
 
 // AddClient adds the passed websocket client to the notification manager.
 func (m *wsNotificationManager) AddClient(wsc *wsClient) {
+	metrics.AddWSClient()
 	m.queueNotification <- (*notificationRegisterClient)(wsc)
 }
 
 // RemoveClient removes the passed websocket client and all notifications
 // registered for it.
 func (m *wsNotificationManager) RemoveClient(wsc *wsClient) {
+	metrics.RemoveWSClient()
 	select {
 	case m.queueNotification <- (*notificationUnregisterClient)(wsc):
 	case <-m.quit:
