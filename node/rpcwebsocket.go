@@ -1269,6 +1269,11 @@ func (c *wsClient) authorizeRequest(req *btcjson.Request) requestOutcome {
 		if !c.authenticated {
 			return requestOutcome{disconnect: true}
 		}
+		// Record metric for method not found errors that happen
+		// during parsing (e.g., unregistered methods).
+		if cmd.err == btcjson.ErrRPCMethodNotFound {
+			metrics.RecordRPCMethodNotFound(req.Method)
+		}
 		return requestOutcome{reply: marshalReply(cmd.jsonrpc, cmd.id, cmd.err)}
 	}
 
