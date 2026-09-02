@@ -4381,6 +4381,11 @@ func (s *rpcServer) processRequest(request *btcjson.Request, isAdmin bool, close
 		parsedCmd := parseCmd(request)
 		if parsedCmd.err != nil {
 			jsonErr = parsedCmd.err
+			// Record metric for method not found errors that happen
+			// during parsing (e.g., unregistered methods).
+			if jsonErr == btcjson.ErrRPCMethodNotFound {
+				metrics.RecordRPCMethodNotFound(request.Method)
+			}
 		} else {
 			result, err = s.standardCmdResult(parsedCmd,
 				closeChan)
@@ -4917,7 +4922,6 @@ func newRPCServer(config *rpcserverConfig) (*rpcServer, error) {
 func (s *rpcServer) handleBlockchainNotification(notification *blockchain.Notification) {
 	switch notification.Type {
 	case blockchain.NTBlockAccepted:
-		metrics.RecordBlockAccepted()
 		block, ok := notification.Data.(*btcutil.Block)
 		if !ok {
 			rpcsLog.Warnf("Chain accepted notification is not a block.")
@@ -4930,7 +4934,6 @@ func (s *rpcServer) handleBlockchainNotification(notification *blockchain.Notifi
 		s.gbtWorkState.NotifyBlockConnected(block.Hash())
 
 	case blockchain.NTBlockConnected:
-		metrics.RecordBlockConnected()
 		block, ok := notification.Data.(*btcutil.Block)
 		if !ok {
 			rpcsLog.Warnf("Chain connected notification is not a block.")
@@ -4941,7 +4944,6 @@ func (s *rpcServer) handleBlockchainNotification(notification *blockchain.Notifi
 		s.ntfnMgr.NotifyBlockConnected(block)
 
 	case blockchain.NTBlockDisconnected:
-		metrics.RecordBlockDisconnected()
 		block, ok := notification.Data.(*btcutil.Block)
 		if !ok {
 			rpcsLog.Warnf("Chain disconnected notification is not a block.")

@@ -3004,6 +3004,20 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		return nil, err
 	}
 
+	// Subscribe to blockchain notifications for metrics recording.
+	// This is done here (independent of RPC) so that metrics are
+	// recorded even when RPC is disabled.
+	s.chain.Subscribe(func(notification *blockchain.Notification) {
+		switch notification.Type {
+		case blockchain.NTBlockAccepted:
+			metrics.RecordBlockAccepted()
+		case blockchain.NTBlockConnected:
+			metrics.RecordBlockConnected()
+		case blockchain.NTBlockDisconnected:
+			metrics.RecordBlockDisconnected()
+		}
+	})
+
 	// Search for a FeeEstimator state in the database. If none can be found
 	// or if it cannot be loaded, create a new one.
 	db.Update(func(tx database.Tx) error {
@@ -3571,17 +3585,25 @@ func (s *server) MetricsSource() metrics.Source {
 		},
 		PeerCount: func() (int64, int64) {
 			replyChan := make(chan []*serverPeer, 1)
-			s.query <- getPeersMsg{reply: replyChan}
-			peers := <-replyChan
-			var inbound, outbound int64
-			for _, p := range peers {
-				if p.Inbound() {
-					inbound++
-				} else {
-					outbound++
-				}
+			select {
+			case s.query <- getPeersMsg{reply: replyChan}:
+			case <-s.quit:
+				return 0, 0
 			}
-			return inbound, outbound
+			select {
+			case peers := <-replyChan:
+				var inbound, outbound int64
+				for _, p := range peers {
+					if p.Inbound() {
+						inbound++
+					} else {
+						outbound++
+					}
+				}
+				return inbound, outbound
+			case <-s.quit:
+				return 0, 0
+			}
 		},
 		NetTotals: func() (uint64, uint64) {
 			return atomic.LoadUint64(&s.bytesReceived), atomic.LoadUint64(&s.bytesSent)
