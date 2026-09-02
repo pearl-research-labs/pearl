@@ -342,7 +342,14 @@ var MainNetParams = Params{
 	Name:        "mainnet",
 	Net:         wire.MainNet,
 	DefaultPort: "44108",
+	// Both seed families are listed while the seeders migrate. The
+	// pearlresearch.ai names must stay until the nodes already deployed
+	// against them are retired, or those nodes lose their only way to
+	// bootstrap.
 	DNSSeeds: []DNSSeed{
+		{"reef.seeder.pearlnetwork.net", false},
+		{"tide.seeder.pearlnetwork.net", false},
+		{"stream.seeder.pearlnetwork.net", false},
 		{"seeder1.pearlresearch.ai", false},
 		{"seeder2.pearlresearch.ai", false},
 		{"seeder3.pearlresearch.ai", false},
@@ -549,6 +556,9 @@ var TestNetParams = Params{
 	Net:         wire.TestNet,
 	DefaultPort: "44110",
 	DNSSeeds: []DNSSeed{
+		{"reef.seeder.testnet.pearlnetwork.net", false},
+		{"tide.seeder.testnet.pearlnetwork.net", false},
+		{"stream.seeder.testnet.pearlnetwork.net", false},
 		{"seeder1.internal.pearlresearch.ai", false},
 		{"seeder2.internal.pearlresearch.ai", false},
 		{"seeder3.internal.pearlresearch.ai", false},
@@ -645,6 +655,9 @@ var TestNet2Params = Params{
 	Net:         wire.TestNet2,
 	DefaultPort: "44112",
 	DNSSeeds: []DNSSeed{
+		{"reef.seeder.testnet2.pearlnetwork.net", false},
+		{"tide.seeder.testnet2.pearlnetwork.net", false},
+		{"stream.seeder.testnet2.pearlnetwork.net", false},
 		{"seeder1.testnet.pearlresearch.ai", false},
 		{"seeder2.testnet.pearlresearch.ai", false},
 		{"seeder3.testnet.pearlresearch.ai", false},
