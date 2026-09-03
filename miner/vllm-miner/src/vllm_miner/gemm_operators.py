@@ -123,7 +123,7 @@ def pearl_gemm_noisy(
 
     A_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
     tensor_hash(
-        A.to(torch.uint8),
+        A,
         key_tensor,
         A_tensor_hash,
         tensor_hash_scratchpad,
@@ -131,7 +131,7 @@ def pearl_gemm_noisy(
 
     B_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
     tensor_hash(
-        B.to(torch.uint8),
+        B,
         key_tensor,
         B_tensor_hash,
         tensor_hash_scratchpad,

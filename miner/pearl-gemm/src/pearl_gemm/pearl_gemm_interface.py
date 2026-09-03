@@ -559,7 +559,8 @@ def tensor_hash(
     """Hash a tensor using a key with configurable kernel parameters.
 
     Args:
-        data (Tensor): Input tensor to hash
+        data (Tensor): 2D uint8 or int8 tensor to hash as raw storage bytes.
+            int8 and uint8 inputs with the same bit pattern produce the same root.
         key (Tensor): Key tensor used for hashing
         out (Tensor): Output tensor for hash result
         roots (Tensor): Scratchpad tensor for intermediate results

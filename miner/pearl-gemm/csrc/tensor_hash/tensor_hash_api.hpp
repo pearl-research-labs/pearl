@@ -64,6 +64,8 @@ void run_tensor_hash(
   TORCH_CHECK(key.dtype() == at::kByte, "key must be uint8");
   TORCH_CHECK(out.dtype() == at::kByte, "out must be uint8");
   TORCH_CHECK(roots.dtype() == at::kByte, "roots must be uint8");
+  TORCH_CHECK(data.dtype() == at::kByte || data.dtype() == at::kChar,
+              "data must be uint8 or int8");
   TORCH_CHECK(data.dim() == 2, "data must be 2D tensor");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(data.data_ptr()) %
                       TMA_GLOBAL_ALIGNMENT_BYTES ==
@@ -113,8 +115,10 @@ void run_tensor_hash(
   auto stream = at::cuda::getCurrentCUDAStream();
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
-  tensor_hash(data.data_ptr<uint8_t>(), data.numel(), out.data_ptr<uint8_t>(),
-              key.data_ptr<uint8_t>(), num_blocks,
+  // Hash the tensor storage bytes. int8 and uint8 are both one byte per
+  // element, so they must commit to identical roots for identical bit patterns.
+  tensor_hash(reinterpret_cast<uint8_t const*>(data.data_ptr()), data.numel(),
+              out.data_ptr<uint8_t>(), key.data_ptr<uint8_t>(), num_blocks,
               static_cast<uint32_t>(threads_per_block),
               static_cast<uint32_t>(num_stages),
               static_cast<uint32_t>(leaves_per_mt_block),
