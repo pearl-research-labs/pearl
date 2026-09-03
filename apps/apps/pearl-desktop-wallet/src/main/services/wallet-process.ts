@@ -1,7 +1,6 @@
 import { spawn, ChildProcess } from 'child_process';
 import { join } from 'path';
 import { app } from 'electron';
-import log from 'electron-log';
 import fs from 'fs';
 import path from 'path';
 import { WalletService } from './wallet-service/wallet-service';
@@ -321,7 +320,7 @@ class WalletProcess {
                 cleanup();
                 resolve({ success: true, message: 'Wallet started successfully' });
               }
-            } catch (e: any) {
+            } catch (e: unknown) {
               // Wallet not ready yet, keep trying
               if (elapsed >= maxWaitMs && !isResolved) {
                 isResolved = true;

@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { app, BrowserWindow } from 'electron';
 import { electronApp, optimizer } from '@electron-toolkit/utils';
 import log from 'electron-log';
@@ -26,14 +27,14 @@ const MAX_LOG_SIZE = 5 * 1024 * 1024; // 5MB
 function enforceLogSizeLimit() {
   try {
     const logFile = log.transports.file.getFile().path;
-    const stat = require('fs').statSync(logFile);
+    const stat = fs.statSync(logFile);
     if (stat.size > MAX_LOG_SIZE) {
-      const content = require('fs').readFileSync(logFile, 'utf8');
+      const content = fs.readFileSync(logFile, 'utf8');
       // Keep only the last 100KB of logs (most recent entries)
       const trimmed = content.slice(-MAX_LOG_SIZE);
       // Find the first complete line to avoid cutting mid-line
       const firstNewline = trimmed.indexOf('\n');
-      require('fs').writeFileSync(logFile, firstNewline > -1 ? trimmed.slice(firstNewline + 1) : trimmed);
+      fs.writeFileSync(logFile, firstNewline > -1 ? trimmed.slice(firstNewline + 1) : trimmed);
     }
   } catch {
     // ignore errors
@@ -125,7 +126,7 @@ app.on('window-all-closed', async () => {
     if (process.platform !== 'darwin') {
       app.quit();
     }
-  } catch (error) {
+  } catch {
     // Do nothing
   }
 });

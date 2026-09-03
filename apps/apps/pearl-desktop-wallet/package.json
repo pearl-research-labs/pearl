@@ -14,7 +14,7 @@
     "build:mac": "pnpm run build && electron-builder --mac",
     "build:linux": "pnpm run build && electron-builder --linux",
     "dev": "electron-vite dev --watch",
-    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore",
+    "lint": "eslint . --fix",
     "preview": "electron-vite preview",
     "pack": "pnpm run build && electron-builder --dir",
     "dist": "pnpm run build && electron-builder",
@@ -103,7 +103,8 @@
     "postcss": "^8.5.6",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.9.2",
-    "vite": "^7.1.0"
+    "vite": "^7.1.0",
+    "@pearl/eslint-config": "workspace:*"
   },
   "main": "./out/main/index.js",
   "homepage": "./"

@@ -124,6 +124,7 @@ export default function SendTransaction() {
         form.setFieldValue('amount', spendableAmount.toString());
       }
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- form is stable
   }, [currentFee, spendableAmount, isMaxSelected]);
 
   // Field validators
