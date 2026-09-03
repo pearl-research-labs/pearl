@@ -1,5 +1,7 @@
 # Pearl
 
+**English** | [简体中文](README.zh-CN.md)
+
 [![Blockchain / Build and Test](https://github.com/pearl-research-labs/pearl/actions/workflows/blockchain_ci.yml/badge.svg)](https://github.com/pearl-research-labs/pearl/actions/workflows/blockchain_ci.yml)
 [![Integration Tests CI](https://github.com/pearl-research-labs/pearl/actions/workflows/integration_tests_ci.yml/badge.svg)](https://github.com/pearl-research-labs/pearl/actions/workflows/integration_tests_ci.yml)
 [![Miner CI](https://github.com/pearl-research-labs/pearl/actions/workflows/miner_ci.yml/badge.svg)](https://github.com/pearl-research-labs/pearl/actions/workflows/miner_ci.yml)
