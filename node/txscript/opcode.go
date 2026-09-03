@@ -2018,8 +2018,8 @@ func opcodeCheckSig(op *opcode, data []byte, vm *Engine) error {
 }
 
 // opcodeCheckXmssSig verifies an XMSS post-quantum signature.
-// The signature is split into 5 chunks of 468 bytes each to fit within
-// the 520-byte stack element limit.
+// The signature is split into XMSSSigChunks chunks of XMSSSigChunkSize bytes
+// each to fit within the 520-byte stack element limit.
 // Stack transformation: [... sig1 sig2 sig3 sig4 sig5 pubkey] -> [... bool]
 func opcodeCheckXmssSig(op *opcode, data []byte, vm *Engine) error {
 	// OP_CHECKXMSSSIG is only valid in tapscript context.
@@ -2029,23 +2029,21 @@ func opcodeCheckXmssSig(op *opcode, data []byte, vm *Engine) error {
 		return scriptError(ErrReservedOpcode, str)
 	}
 
-	const numSigChunks = 5
-	const sigChunkSize = xmss.SignatureLen / numSigChunks // 468 bytes = 2340 / 5
-
 	// Pop the public key (64 bytes for XMSS).
 	pkBytes, err := vm.dstack.PopByteArray()
 	if err != nil {
 		return err
 	}
 
-	// Pop the 5 signature chunks [sig1, sig2, sig3, sig4, sig5]
-	sigChunks := make([][]byte, numSigChunks)
-	for i := range numSigChunks {
+	// Pop the XMSSSigChunks signature chunks in reverse so sigChunks[0]
+	// is the bottom-of-stack element and sigChunks[last] is the top.
+	var sigChunks [XMSSSigChunks][]byte
+	for i := range XMSSSigChunks {
 		chunk, err := vm.dstack.PopByteArray()
 		if err != nil {
 			return err
 		}
-		sigChunks[numSigChunks-1-i] = chunk
+		sigChunks[XMSSSigChunks-1-i] = chunk
 	}
 
 	// Validate public key length.
@@ -2054,9 +2052,9 @@ func opcodeCheckXmssSig(op *opcode, data []byte, vm *Engine) error {
 		return nil
 	}
 
-	// Validate each signature chunk is exactly sigChunkSize bytes.
+	// Validate each signature chunk is exactly XMSSSigChunkSize bytes.
 	for _, chunk := range sigChunks {
-		if len(chunk) != sigChunkSize {
+		if len(chunk) != XMSSSigChunkSize {
 			vm.dstack.PushBool(false)
 			return nil
 		}

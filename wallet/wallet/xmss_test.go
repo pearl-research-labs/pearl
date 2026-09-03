@@ -148,14 +148,11 @@ func TestXMSSScriptPathSigning(t *testing.T) {
 	sig, err := xmss.Sign(0, s.xmssSK, msg)
 	require.NoError(t, err)
 
-	// Build witness: [sig_chunks..., script, control_block]
-	// XMSS signature is 2340 bytes, split into 5 chunks of 468 bytes each
 	ctrlBlock := s.tapTree.LeafMerkleProofs[0].ToControlBlock(s.internalKey)
 	ctrlBytes, _ := ctrlBlock.ToBytes()
-	tx.TxIn[0].Witness = wire.TxWitness{
-		sig[0:468], sig[468:936], sig[936:1404], sig[1404:1872], sig[1872:2340],
-		s.xmssScript, ctrlBytes,
-	}
+	tx.TxIn[0].Witness = txscript.XMSSScriptPathWitness(
+		sig, s.xmssScript, ctrlBytes,
+	)
 
 	// Verify XMSS signature via script engine
 	flags := txscript.StandardVerifyFlags
@@ -163,9 +160,10 @@ func TestXMSSScriptPathSigning(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, vm.Execute(), "XMSS script-path spend should succeed")
 
-	// Verify corrupted signature is rejected
-	sig[467] ^= 0x01
-	tx.TxIn[0].Witness[0] = sig[0:468]
+	// Verify corrupted signature is rejected (flip a bit in the last byte
+	// of the first chunk).
+	sig[txscript.XMSSSigChunkSize-1] ^= 0x01
+	tx.TxIn[0].Witness[0] = sig[:txscript.XMSSSigChunkSize]
 	vm, _ = txscript.NewEngine(s.pkScript, tx, 0, flags, nil, sigHashes, prevOut.Value, prevFetcher)
 	require.Error(t, vm.Execute(), "corrupted signature should be rejected")
 }
