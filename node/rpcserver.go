@@ -2353,6 +2353,9 @@ func handleGetMiningInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct{
 	}
 
 	best := s.cfg.Chain.BestSnapshot()
+	subsidyGrains := blockchain.CalcBlockSubsidy(best.Height+1, s.cfg.ChainParams)
+	subsidyPRL := float64(subsidyGrains) / 1e8
+
 	result := btcjson.GetMiningInfoResult{
 		Blocks:            int64(best.Height),
 		CurrentBlockSize:  best.BlockSize,
@@ -2364,6 +2367,7 @@ func handleGetMiningInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct{
 		NetworkHashPS:     networkHashesPerSec,
 		PooledTx:          uint64(s.cfg.TxMemPool.Count()),
 		TestNet:           cfg.TestNet,
+		BlockSubsidy:      subsidyPRL,
 	}
 	return &result, nil
 }
