@@ -419,11 +419,6 @@ func checkBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 
 	flags |= NetBehaviorFlags(chainParams)
 
-	err := CheckBlockHeaderSanity(header, cert, chainParams.PowLimit, timeSource, chainParams.MaxTimeOffsetMinutes, flags)
-	if err != nil {
-		return err
-	}
-
 	// A block must have at least one transaction.
 	numTx := len(msgBlock.Transactions)
 	if numTx == 0 {
@@ -500,7 +495,8 @@ func checkBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 		existingTxHashes[*hash] = struct{}{}
 	}
 
-	return nil
+	// certificate verification is compute intensive, so we ensure it is performed last.
+	return CheckBlockHeaderSanity(header, cert, chainParams.PowLimit, timeSource, chainParams.MaxTimeOffsetMinutes, flags)
 }
 
 // CheckBlockSanity performs some preliminary checks on a block to ensure it is
