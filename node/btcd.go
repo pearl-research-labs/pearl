@@ -19,7 +19,9 @@ import (
 	"github.com/pearl-research-labs/pearl/node/blockchain/indexers"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/limits"
+	"github.com/pearl-research-labs/pearl/node/metrics"
 	"github.com/pearl-research-labs/pearl/node/ossec"
+	"github.com/pearl-research-labs/pearl/node/peer"
 )
 
 const (
@@ -74,6 +76,30 @@ func pearldMain(serverChan chan<- *server) error {
 				http.StatusSeeOther)
 			http.Handle("/", profileRedirect)
 			prldLog.Errorf("%v", http.ListenAndServe(listenAddr, nil))
+		}()
+	}
+
+	// Enable Prometheus metrics server if requested.
+	var metricsServer *metrics.Server
+	if len(cfg.MetricsListeners) > 0 {
+		var err error
+		metricsServer, err = metrics.NewServer(cfg.MetricsListeners)
+		if err != nil {
+			prldLog.Errorf("Unable to start metrics server on %v: %v",
+				cfg.MetricsListeners, err)
+			return err
+		}
+		metrics.SetInfo(version(), activeNetParams.Name, fmt.Sprintf("%d", peer.MaxProtocolVersion))
+		metricsServer.Start()
+		prldLog.Infof("Metrics server listening on %v", metricsServer.ListenAddrs())
+		go func() {
+			for err := range metricsServer.Errors() {
+				prldLog.Errorf("Metrics server error: %v", err)
+			}
+		}()
+		defer func() {
+			prldLog.Infof("Gracefully shutting down the metrics server...")
+			metricsServer.Stop()
 		}()
 	}
 
@@ -272,6 +298,9 @@ func pearldMain(serverChan chan<- *server) error {
 		srvrLog.Infof("Server shutdown complete")
 	}()
 	server.Start()
+	if metricsServer != nil {
+		metricsServer.SetSource(server.MetricsSource())
+	}
 	if serverChan != nil {
 		serverChan <- server
 	}

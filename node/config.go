@@ -50,6 +50,7 @@ const (
 	defaultMaxRPCClients            = 10
 	defaultMaxRPCWebsockets         = 25
 	defaultMaxRPCConcurrentReqs     = 20
+	defaultMetricsPort              = "9105"
 	defaultDbType                   = "ffldb"
 	defaultFreeTxRelayLimit         = 15.0
 	defaultTrickleInterval          = peer.DefaultTrickleInterval
@@ -126,6 +127,7 @@ type config struct {
 	MaxMempool               uint64        `long:"maxmempool" description:"Maximum mempool size in MB (default: 300)"`
 	MaxOrphanTxs             int           `long:"maxorphantx" description:"Max number of orphan transactions to keep in memory"`
 	MaxPeers                 int           `long:"maxpeers" description:"Max number of inbound and outbound peers"`
+	MetricsListeners         []string      `long:"metricslisten" description:"Add an interface/port to listen for Prometheus metrics (default port: 9105)"`
 	MiningAddrs              []string      `long:"miningaddr" description:"Add the specified payment address to the list of addresses to use for generated blocks -- At least one address is required if the generate option is set"`
 	MinRelayTxFee            float64       `long:"minrelaytxfee" description:"The minimum transaction fee in PRL/kB to be considered a non-zero fee."`
 	DisableBanning           bool          `long:"nobanning" description:"Disable banning of misbehaving peers"`
@@ -319,6 +321,18 @@ func normalizeAddress(addr, defaultPort string) string {
 		return net.JoinHostPort(addr, defaultPort)
 	}
 	return addr
+}
+
+// isLoopbackHost reports whether host refers to the local machine only.  An
+// empty host means the wildcard address, which is not loopback.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // normalizeAddresses returns a new slice with all the passed peer addresses
@@ -700,6 +714,14 @@ func loadConfig() (*config, []string, error) {
 			fmt.Fprintln(os.Stderr, usageMessage)
 			return nil, nil, err
 		}
+
+		// The profile server takes a port rather than an address, so it always
+		// binds every interface.  net/http/pprof also serves
+		// /debug/pprof/cmdline, which discloses the process arguments, and
+		// those commonly include --rpcpass.
+		prldLog.Warnf("Profile server on port %s binds all interfaces and is "+
+			"unauthenticated -- it exposes heap dumps and the process command "+
+			"line, so restrict access with a firewall", cfg.Profile)
 	}
 
 	// Don't allow ban durations that are too short.
@@ -957,13 +979,31 @@ func loadConfig() (*config, []string, error) {
 	cfg.RPCListeners = normalizeAddresses(cfg.RPCListeners,
 		activeNetParams.rpcPort)
 
+	// Add default port to all metrics listener addresses if needed and remove
+	// duplicate addresses.
+	cfg.MetricsListeners = normalizeAddresses(cfg.MetricsListeners,
+		defaultMetricsPort)
+
+	// Remote scrapers (a central Prometheus, or a PodMonitor hitting the pod
+	// IP) require a routable bind address, so this is expected in most
+	// deployments rather than a misconfiguration. The endpoint is
+	// unauthenticated either way, hence the reminder.
+	for _, addr := range cfg.MetricsListeners {
+		host, _, err := net.SplitHostPort(addr)
+		if err == nil && !isLoopbackHost(host) {
+			prldLog.Warnf("Metrics endpoint %s is reachable beyond localhost "+
+				"and is unauthenticated -- restrict access with a firewall or "+
+				"network policy", addr)
+		}
+	}
+
 	if !cfg.DisableRPC && cfg.DisableTLS {
 		if activeNetParams.Params.Net == wire.MainNet {
 			rpcsLog.Warnf("Running on mainnet with --notls is not recommended")
 		}
 
 		for _, addr := range cfg.RPCListeners {
-			_, _, err := net.SplitHostPort(addr)
+			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				str := "%s: RPC listen interface '%s' is " +
 					"invalid: %v"
@@ -971,6 +1011,13 @@ func loadConfig() (*config, []string, error) {
 				fmt.Fprintln(os.Stderr, err)
 				fmt.Fprintln(os.Stderr, usageMessage)
 				return nil, nil, err
+			}
+
+			// Basic-auth credentials cross the network in the clear here
+			// regardless of which chain the node follows.
+			if !isLoopbackHost(host) {
+				rpcsLog.Warnf("RPC listener %s has TLS disabled -- "+
+					"credentials will be sent in cleartext", addr)
 			}
 		}
 	}
