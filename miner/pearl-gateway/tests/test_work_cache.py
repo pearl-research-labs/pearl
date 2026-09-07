@@ -21,6 +21,32 @@ def work_cache():
     return WorkCache()
 
 
+def _template_with_header(
+    template: BlockTemplate,
+    *,
+    version: int | None = None,
+    merkle_root: bytes | None = None,
+    timestamp: int | None = None,
+    target_bits: int | None = None,
+    required_cert_version: CertificateVersion | None = None,
+) -> BlockTemplate:
+    return BlockTemplate(
+        header=PearlHeader(
+            incomplete_header=IncompleteBlockHeader(
+                version=version if version is not None else template.header.version,
+                prev_block=template.header.previous_block_hash,
+                merkle_root=merkle_root if merkle_root is not None else template.header.merkle_root,
+                timestamp=timestamp if timestamp is not None else template.header.timestamp,
+                nbits=target_bits if target_bits is not None else template.header.target_bits,
+            ),
+        ),
+        height=template.height,
+        coinbase_tx=template.coinbase_tx,
+        raw_transactions=list(template.raw_transactions),
+        required_cert_version=required_cert_version or template.required_cert_version,
+    )
+
+
 @pytest.fixture
 def different_block_template():
     """Create a different BlockTemplate for testing updates."""
@@ -85,6 +111,87 @@ class TestTemplateUpdate:
 
         assert result is True
         assert work_cache.current_template == different_block_template
+        assert work_cache.last_update_time == 1010.0
+
+    @pytest.mark.asyncio
+    async def test_update_template_same_tip_different_merkle_root(
+        self, work_cache, sample_block_template
+    ):
+        """Same previous block can still be a new mining template."""
+        updated_template = _template_with_header(
+            sample_block_template,
+            merkle_root=bytes.fromhex("22" * 32),
+        )
+
+        with patch("time.time", return_value=1000.0):
+            await work_cache.update_template(sample_block_template)
+
+        with patch("time.time", return_value=1010.0):
+            result = await work_cache.update_template(updated_template)
+
+        assert result is True
+        assert work_cache.current_template == updated_template
+        assert work_cache.last_update_time == 1010.0
+
+    @pytest.mark.asyncio
+    async def test_update_template_ignores_timestamp_only_refresh(
+        self, work_cache, sample_block_template
+    ):
+        """Do not invalidate in-flight miner jobs for node timestamp churn."""
+        updated_template = _template_with_header(
+            sample_block_template,
+            timestamp=sample_block_template.header.timestamp + 1,
+        )
+
+        with patch("time.time", return_value=1000.0):
+            await work_cache.update_template(sample_block_template)
+
+        with patch("time.time", return_value=1010.0):
+            result = await work_cache.update_template(updated_template)
+
+        assert result is False
+        assert work_cache.current_template == sample_block_template
+        assert work_cache.last_update_time == 1000.0
+
+    @pytest.mark.asyncio
+    async def test_update_template_same_tip_different_target_bits(
+        self, work_cache, sample_block_template
+    ):
+        """Difficulty changes alter the miner target even on the same tip."""
+        updated_template = _template_with_header(
+            sample_block_template,
+            target_bits=sample_block_template.header.target_bits + 1,
+            timestamp=sample_block_template.header.timestamp + 1,
+        )
+
+        with patch("time.time", return_value=1000.0):
+            await work_cache.update_template(sample_block_template)
+
+        with patch("time.time", return_value=1010.0):
+            result = await work_cache.update_template(updated_template)
+
+        assert result is True
+        assert work_cache.current_template == updated_template
+        assert work_cache.last_update_time == 1010.0
+
+    @pytest.mark.asyncio
+    async def test_update_template_same_header_different_cert_version(
+        self, work_cache, sample_block_template
+    ):
+        """Certificate version is part of the mining job contract."""
+        updated_template = _template_with_header(
+            sample_block_template,
+            required_cert_version=CertificateVersion.ZK_DENSE,
+        )
+
+        with patch("time.time", return_value=1000.0):
+            await work_cache.update_template(sample_block_template)
+
+        with patch("time.time", return_value=1010.0):
+            result = await work_cache.update_template(updated_template)
+
+        assert result is True
+        assert work_cache.current_template == updated_template
         assert work_cache.last_update_time == 1010.0
 
     @pytest.mark.asyncio
