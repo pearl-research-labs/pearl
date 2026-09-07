@@ -59,9 +59,20 @@ class PearlKernel(Int8ScaledMMLinearKernel):
         """Return whether mining is enabled for this kernel."""
         return self.mining_enabled
 
+    # Supported NVIDIA GPU architectures:
+    #   sm_90 / sm_90a — Hopper (H100, H200)              v supported
+    #
+    # Unsupported architectures (common user confusion):
+    #   sm_70           — Volta   (V100)                   x not supported
+    #   sm_75           — Turing  (RTX 20-series)          x not supported
+    #   sm_80 / sm_86   — Ampere  (A100, RTX 30-series)    x not supported
+    #   sm_89           — Ada     (RTX 40-series, L40)     x not supported
+    #   sm_100/sm_120   — Blackwell (RTX 50-series, B200)  x not yet supported
+    _SUPPORTED_ARCHITECTURES = "H100, H200 (sm_90/sm_90a)"
+
     @classmethod
     def get_min_capability(cls) -> int:
-        # Pearl GEMM kernels require Hopper or newer
+        # Pearl GEMM kernels require Hopper (sm_90) or newer
         return 9
 
     @override
@@ -74,7 +85,13 @@ class PearlKernel(Int8ScaledMMLinearKernel):
     @override
     @classmethod
     def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
-        """Check if PearlKernel is supported on the current hardware."""
+        """Check if PearlKernel is supported on the current hardware.
+
+        Pearl GEMM kernels are compiled for sm_90/sm_90a (Hopper) only.
+        Volta (V100/sm_70), Ampere (A100/sm_80, RTX 30xx/sm_86),
+        Ada (RTX 40xx/sm_89), and Blackwell (RTX 50xx/sm_100, sm_120)
+        GPUs are not currently supported.
+        """
         if compute_capability is None:
             if not current_platform.is_cuda():
                 return False, "PearlKernel requires CUDA."
@@ -83,7 +100,9 @@ class PearlKernel(Int8ScaledMMLinearKernel):
         if compute_capability < cls.get_min_capability():
             return (
                 False,
-                f"PearlKernel requires compute capability >= {cls.get_min_capability()}, got {compute_capability}.",
+                f"PearlKernel requires a Hopper GPU (sm_90/sm_90a, e.g. H100 or H200). "
+                f"Detected compute capability sm_{compute_capability}0, which is not supported. "
+                f"Supported GPUs: {cls._SUPPORTED_ARCHITECTURES}.",
             )
 
         return True, None
