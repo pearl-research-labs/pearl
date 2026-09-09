@@ -348,6 +348,13 @@ type outMsg struct {
 	encoding wire.MessageEncoding
 }
 
+// signalDone signals the message's done channel, if any.
+func (m outMsg) signalDone() {
+	if m.doneChan != nil {
+		m.doneChan <- struct{}{}
+	}
+}
+
 // stallControlCmd represents the command of a stall control message.
 type stallControlCmd uint8
 
@@ -1619,143 +1626,178 @@ out:
 	log.Tracef("Peer input handler done for %s", p)
 }
 
+// sendScheduler decides what queueHandler hands to outHandler and when.  At
+// most one message is in flight: next hands it out and markSent retires it.
+// pending never holds the in-flight message, so teardown can signal pending
+// without racing the writer over who owns a done channel.  Methods never
+// touch channels so the policy can be tested without goroutines.
+type sendScheduler struct {
+	pending    *list.List // outMsg waiting for the writer, FIFO
+	invPending *list.List // *wire.InvVect waiting for the trickle tick
+	known      *lru.Cache // peer's known inventory
+	inflight   bool       // a message has been handed to the writer
+}
+
+// newSendScheduler returns a sendScheduler that tracks the peer's inventory
+// in the passed known cache.
+func newSendScheduler(known *lru.Cache) *sendScheduler {
+	return &sendScheduler{
+		pending:    list.New(),
+		invPending: list.New(),
+		known:      known,
+	}
+}
+
+// queueMsg queues the passed message to be written by the outHandler.
+func (s *sendScheduler) queueMsg(msg outMsg) {
+	s.pending.PushBack(msg)
+}
+
+// markSent records that the writer finished the in-flight message,
+// making the scheduler ready to hand out the next one.
+func (s *sendScheduler) markSent() {
+	s.inflight = false
+}
+
+// next pops the message the writer should take, if it is idle and one is
+// waiting.
+func (s *sendScheduler) next() (outMsg, bool) {
+	if s.inflight || s.pending.Len() == 0 {
+		return outMsg{}, false
+	}
+
+	s.inflight = true
+	return s.pending.Remove(s.pending.Front()).(outMsg), true
+}
+
+// queueInv queues the passed inventory for relaying to the peer.  New
+// blocks are queued immediately in their own inv message while all other
+// inventory is held for the trickle tick.
+func (s *sendScheduler) queueInv(iv *wire.InvVect) {
+	if iv.Type == wire.InvTypeBlock || iv.Type == wire.InvTypeWitnessBlock {
+		invMsg := wire.NewMsgInvSizeHint(1)
+		invMsg.AddInvVect(iv)
+		s.queueMsg(outMsg{msg: invMsg})
+		return
+	}
+
+	s.invPending.PushBack(iv)
+}
+
+// trickleInv queues the buffered inventory as inv messages of at most
+// maxInvTrickleSize entries each.  Inventory the peer is already known to
+// have is skipped and everything relayed is added to the known cache.
+func (s *sendScheduler) trickleInv() {
+	if s.invPending.Len() == 0 {
+		return
+	}
+
+	invMsg := wire.NewMsgInvSizeHint(uint(s.invPending.Len()))
+	for e := s.invPending.Front(); e != nil; e = s.invPending.Front() {
+		iv := s.invPending.Remove(e).(*wire.InvVect)
+
+		// Don't send inventory that became known after the initial
+		// check.
+		if s.known.Contains(iv) {
+			continue
+		}
+
+		invMsg.AddInvVect(iv)
+		if len(invMsg.InvList) >= maxInvTrickleSize {
+			s.queueMsg(outMsg{msg: invMsg})
+			invMsg = wire.NewMsgInvSizeHint(uint(s.invPending.Len()))
+		}
+
+		// Add the inventory that is being relayed to the known
+		// inventory for the peer.
+		s.known.Add(iv)
+	}
+	if len(invMsg.InvList) > 0 {
+		s.queueMsg(outMsg{msg: invMsg})
+	}
+}
+
+// drainPending removes and returns every message still waiting in pending.
+// It is only used at teardown.
+func (s *sendScheduler) drainPending() []outMsg {
+	pending := make([]outMsg, 0, s.pending.Len())
+	for e := s.pending.Front(); e != nil; e = s.pending.Front() {
+		pending = append(pending, s.pending.Remove(e).(outMsg))
+	}
+
+	return pending
+}
+
 // queueHandler handles the queuing of outgoing data for the peer. This runs as
 // a muxer for various sources of input so we can ensure that server and peer
 // handlers will not block on us sending a message.  That data is then passed on
 // to outHandler to be actually written.
 func (p *Peer) queueHandler() {
-	pendingMsgs := list.New()
-	invSendQueue := list.New()
+	sched := newSendScheduler(&p.knownInventory)
+	defer p.teardownQueueHandler(sched)
+
 	trickleTicker := time.NewTicker(p.cfg.TrickleInterval)
 	defer trickleTicker.Stop()
 
-	// We keep the waiting flag so that we know if we have a message queued
-	// to the outHandler or not.  We could use the presence of a head of
-	// the list for this but then we have rather racy concerns about whether
-	// it has gotten it at cleanup time - and thus who sends on the
-	// message's done channel.  To avoid such confusion we keep a different
-	// flag and pendingMsgs only contains messages that we have not yet
-	// passed to outHandler.
-	waiting := false
-
-	// To avoid duplication below.
-	queuePacket := func(msg outMsg, list *list.List, waiting bool) bool {
-		if !waiting {
-			p.sendQueue <- msg
-		} else {
-			list.PushBack(msg)
-		}
-		// we are always waiting now.
-		return true
-	}
-out:
 	for {
 		select {
 		case msg := <-p.outputQueue:
-			waiting = queuePacket(msg, pendingMsgs, waiting)
+			sched.queueMsg(msg)
 
 		// This channel is notified when a message has been sent across
 		// the network socket.
 		case <-p.sendDoneQueue:
-			// No longer waiting if there are no more messages
-			// in the pending messages queue.
-			next := pendingMsgs.Front()
-			if next == nil {
-				waiting = false
-				continue
-			}
-
-			// Notify the outHandler about the next item to
-			// asynchronously send.
-			val := pendingMsgs.Remove(next)
-			p.sendQueue <- val.(outMsg)
+			sched.markSent()
 
 		case iv := <-p.outputInvChan:
-			// No handshake?  They'll find out soon enough.
+			// No handshake? They'll find out soon enough.
 			if p.VersionKnown() {
-				// If this is a new block, then we'll blast it
-				// out immediately, sipping the inv trickle
-				// queue.
-				if iv.Type == wire.InvTypeBlock ||
-					iv.Type == wire.InvTypeWitnessBlock {
-
-					invMsg := wire.NewMsgInvSizeHint(1)
-					invMsg.AddInvVect(iv)
-					waiting = queuePacket(outMsg{msg: invMsg},
-						pendingMsgs, waiting)
-				} else {
-					invSendQueue.PushBack(iv)
-				}
+				sched.queueInv(iv)
 			}
 
 		case <-trickleTicker.C:
-			// Don't send anything if we're disconnecting or there
-			// is no queued inventory.
-			// version is known if send queue has any entries.
-			if atomic.LoadInt32(&p.disconnect) != 0 ||
-				invSendQueue.Len() == 0 {
-				continue
-			}
-
-			// Create and send as many inv messages as needed to
-			// drain the inventory send queue.
-			invMsg := wire.NewMsgInvSizeHint(uint(invSendQueue.Len()))
-			for e := invSendQueue.Front(); e != nil; e = invSendQueue.Front() {
-				iv := invSendQueue.Remove(e).(*wire.InvVect)
-
-				// Don't send inventory that became known after
-				// the initial check.
-				if p.knownInventory.Contains(iv) {
-					continue
-				}
-
-				invMsg.AddInvVect(iv)
-				if len(invMsg.InvList) >= maxInvTrickleSize {
-					waiting = queuePacket(
-						outMsg{msg: invMsg},
-						pendingMsgs, waiting)
-					invMsg = wire.NewMsgInvSizeHint(uint(invSendQueue.Len()))
-				}
-
-				// Add the inventory that is being relayed to
-				// the known inventory for the peer.
-				p.AddKnownInventory(iv)
-			}
-			if len(invMsg.InvList) > 0 {
-				waiting = queuePacket(outMsg{msg: invMsg},
-					pendingMsgs, waiting)
+			// Don't send anything if we're disconnecting.
+			if atomic.LoadInt32(&p.disconnect) == 0 {
+				sched.trickleInv()
 			}
 
 		case <-p.quit:
-			break out
+			return
 		}
-	}
 
-	// Drain any wait channels before we go away so we don't leave something
-	// waiting for us.
-	for e := pendingMsgs.Front(); e != nil; e = pendingMsgs.Front() {
-		val := pendingMsgs.Remove(e)
-		msg := val.(outMsg)
-		if msg.doneChan != nil {
-			msg.doneChan <- struct{}{}
+		if msg, ok := sched.next(); ok {
+			p.sendQueue <- msg
 		}
 	}
-cleanup:
-	for {
-		select {
-		case msg := <-p.outputQueue:
-			if msg.doneChan != nil {
-				msg.doneChan <- struct{}{}
-			}
-		case <-p.outputInvChan:
-			// Just drain channel
-		// sendDoneQueue is buffered so doesn't need draining.
-		default:
-			break cleanup
-		}
+}
+
+// teardownQueueHandler signals everything the queueHandler will never write,
+// then tells the outHandler it can drain the send queue and exit.
+func (p *Peer) teardownQueueHandler(sched *sendScheduler) {
+	for _, msg := range sched.drainPending() {
+		msg.signalDone()
+	}
+	drainOutMsgs(p.outputQueue)
+
+	// Inventory has no done channel to signal.
+	for len(p.outputInvChan) > 0 {
+		<-p.outputInvChan
 	}
 	close(p.queueQuit)
 	log.Tracef("Peer queue handler done for %s", p)
+}
+
+// drainOutMsgs signals the done channel of every message still waiting in the
+// passed queue without blocking, leaving the channel empty.
+func drainOutMsgs(ch <-chan outMsg) {
+	for {
+		select {
+		case msg := <-ch:
+			msg.signalDone()
+		default:
+			return
+		}
+	}
 }
 
 // shouldLogWriteError returns whether or not the passed error, which is
@@ -1804,9 +1846,7 @@ out:
 					log.Errorf("Failed to send message to "+
 						"%s: %v", p, err)
 				}
-				if msg.doneChan != nil {
-					msg.doneChan <- struct{}{}
-				}
+				msg.signalDone()
 				continue
 			}
 
@@ -1816,9 +1856,7 @@ out:
 			// signal the send queue to the deliver the next queued
 			// message.
 			atomic.StoreInt64(&p.lastSend, time.Now().Unix())
-			if msg.doneChan != nil {
-				msg.doneChan <- struct{}{}
-			}
+			msg.signalDone()
 			p.sendDoneQueue <- struct{}{}
 
 		case <-p.quit:
@@ -1830,20 +1868,9 @@ out:
 
 	// Drain any wait channels before we go away so we don't leave something
 	// waiting for us. We have waited on queueQuit and thus we can be sure
-	// that we will not miss anything sent on sendQueue.
-cleanup:
-	for {
-		select {
-		case msg := <-p.sendQueue:
-			if msg.doneChan != nil {
-				msg.doneChan <- struct{}{}
-			}
-			// no need to send on sendDoneQueue since queueHandler
-			// has been waited on and already exited.
-		default:
-			break cleanup
-		}
-	}
+	// that we will not miss anything sent on sendQueue.  There is no need
+	// to send on sendDoneQueue since queueHandler has already exited.
+	drainOutMsgs(p.sendQueue)
 	close(p.outQuit)
 	log.Tracef("Peer output handler done for %s", p)
 }
