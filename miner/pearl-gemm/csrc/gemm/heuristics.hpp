@@ -46,7 +46,14 @@ static inline int get_pipeline_stages(int tile_size_m, int tile_size_n,
 
   int const pipeline_stages =
       (smem_size - (C_union_size + scale_size + rest_size)) / AB_one_stage_size;
-  return std::max(1, pipeline_stages);
+  // Blackwell consumer (sm_120/121) has a 99 KB SMEM cap per CTA. With
+  // skip_denoising=false the kernel also keeps 4 denoise buffers
+  // (EAL+EBR+AxEBL+EARxBpEB) live, totalling 4*sizeof(half)*max(M,N)*R bytes,
+  // which the original heuristic doesn't account for. Clamp to a stage count
+  // we know fits and have compiled kernels for on consumer Blackwell.
+  // Cap stages at our compiled set (2). Avoids "no kernel found" at runtime.
+  int const safe_stages = std::min(pipeline_stages, 2);
+  return std::max(2, safe_stages);  // floor at 2 — every compiled config has stages >= 2
 }
 
 static inline int get_num_k_blocks(int MN, int tile_size_mn, int K,
