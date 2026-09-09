@@ -121,8 +121,9 @@ wallet and generate a Taproot mining address:
 ```
 
 Key flags: `--testnet` / `--simnet` for non-mainnet, `--notls` to disable TLS,
-`--debuglevel=debug` for verbose logs. See `node/sample-pearld.conf` for all
-options.
+`--debuglevel=debug` for verbose logs, `--metricslisten=127.0.0.1:9105` to
+serve [Prometheus metrics](node/metrics/). See `node/sample-pearld.conf` for
+all options.
 
 | Network  | RPC   | P2P   | Wallet Server |
 |----------|-------|-------|---------------|

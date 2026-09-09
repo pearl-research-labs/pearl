@@ -24,6 +24,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
+	"github.com/pearl-research-labs/pearl/node/metrics"
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"golang.org/x/crypto/ripemd160"
@@ -1100,12 +1101,14 @@ func (*wsNotificationManager) removeAddrRequest(addrs map[string]map[chan struct
 
 // AddClient adds the passed websocket client to the notification manager.
 func (m *wsNotificationManager) AddClient(wsc *wsClient) {
+	metrics.AddWSClient()
 	m.queueNotification <- (*notificationRegisterClient)(wsc)
 }
 
 // RemoveClient removes the passed websocket client and all notifications
 // registered for it.
 func (m *wsNotificationManager) RemoveClient(wsc *wsClient) {
+	metrics.RemoveWSClient()
 	select {
 	case m.queueNotification <- (*notificationUnregisterClient)(wsc):
 	case <-m.quit:
@@ -1265,6 +1268,11 @@ func (c *wsClient) authorizeRequest(req *btcjson.Request) requestOutcome {
 		// Only process requests from authenticated clients.
 		if !c.authenticated {
 			return requestOutcome{disconnect: true}
+		}
+		// Record metric for method not found errors that happen
+		// during parsing (e.g., unregistered methods).
+		if cmd.err == btcjson.ErrRPCMethodNotFound {
+			metrics.RecordRPCMethodNotFound(req.Method)
 		}
 		return requestOutcome{reply: marshalReply(cmd.jsonrpc, cmd.id, cmd.err)}
 	}
