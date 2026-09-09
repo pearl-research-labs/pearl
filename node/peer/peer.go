@@ -1653,8 +1653,8 @@ func (s *sendScheduler) queueMsg(msg outMsg) {
 	s.pending.PushBack(msg)
 }
 
-// markSent records that the writer finished the in-flight message.
-// making the scheduler ready to output a new element.
+// markSent records that the writer finished the in-flight message,
+// making the scheduler ready to hand out the next one.
 func (s *sendScheduler) markSent() {
 	s.inflight = false
 }
@@ -1688,6 +1688,10 @@ func (s *sendScheduler) queueInv(iv *wire.InvVect) {
 // maxInvTrickleSize entries each.  Inventory the peer is already known to
 // have is skipped and everything relayed is added to the known cache.
 func (s *sendScheduler) trickleInv() {
+	if s.invPending.Len() == 0 {
+		return
+	}
+
 	invMsg := wire.NewMsgInvSizeHint(uint(s.invPending.Len()))
 	for e := s.invPending.Front(); e != nil; e = s.invPending.Front() {
 		iv := s.invPending.Remove(e).(*wire.InvVect)
@@ -1741,7 +1745,7 @@ func (p *Peer) queueHandler() {
 			sched.queueMsg(msg)
 
 		// This channel is notified when a message has been sent across
-		// the network socket. Allowing this handler to prepare for the next send.
+		// the network socket.
 		case <-p.sendDoneQueue:
 			sched.markSent()
 
