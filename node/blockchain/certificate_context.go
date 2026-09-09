@@ -7,13 +7,9 @@ package blockchain
 import (
 	"bytes"
 	"fmt"
-	"time"
 
-	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
-
-const IncompleteBlockHeaderSize = wire.IncompleteBlockHeaderSize
 
 // CertificateHeaderContext contains the available ancestor headers needed
 // to validate the certificate of a proposed block header. Parent and
@@ -26,7 +22,8 @@ type CertificateHeaderContext struct {
 // Advance moves the ancestor window forward after a header is accepted.
 func (headers *CertificateHeaderContext) Advance(accepted *wire.BlockHeader) {
 	headers.Grandparent = headers.Parent
-	parent := *accepted // necessary copy, so that the pointer will not vanish
+	// Retain a snapshot if the caller later reuses or modifies accepted.
+	parent := *accepted
 	headers.Parent = &parent
 }
 
@@ -40,20 +37,23 @@ func CheckCertificateContext(proposed *wire.BlockHeader,
 		return nil
 	}
 
-	v4, ok := cert.(*wire.CertificateV4)
-	if !ok || v4 == nil {
+	if cert == nil || cert.Version() != wire.CertificateVersionV4 {
+		return nil
+	}
+	// Preserve the absent-certificate case when the interface holds a nil V4.
+	if cert == (*wire.CertificateV4)(nil) {
 		return nil
 	}
 
-	publicData := v4.PublicDataBytes()
-	if len(publicData) < IncompleteBlockHeaderSize {
+	publicData := cert.PublicDataBytes()
+	if len(publicData) < wire.IncompleteBlockHeaderSize {
 		str := fmt.Sprintf("v4 public data is %d bytes, want at least %d",
-			len(publicData), IncompleteBlockHeaderSize)
+			len(publicData), wire.IncompleteBlockHeaderSize)
 		return ruleError(ErrHighHash, str)
 	}
 	// The v4 certificate's public data is expected to start with the
 	// serialized ancestor header, checked against the recent headers context.
-	ancestorHeader := publicData[:IncompleteBlockHeaderSize]
+	ancestorHeader := publicData[:wire.IncompleteBlockHeaderSize]
 
 	for _, candidate := range [...]*wire.BlockHeader{
 		proposed, headers.Parent, headers.Grandparent,
@@ -70,23 +70,4 @@ func CheckCertificateContext(proposed *wire.BlockHeader,
 	str := "v4 ancestor header is not the proposed header, its parent, " +
 		"or its grandparent"
 	return ruleError(ErrHighHash, str)
-}
-
-// header reconstructs a wire.BlockHeader from the blockNode's stored
-// header fields; prev_block is the node's parent hash (genesis carries
-// the zero hash). It is used to recover parent and grandparent headers
-// for CheckCertificateContext without a database fetch.
-func (node *blockNode) header() wire.BlockHeader {
-	var prevBlock chainhash.Hash
-	if node.parent != nil {
-		prevBlock = node.parent.hash
-	}
-	return wire.BlockHeader{
-		Version:         node.version,
-		PrevBlock:       prevBlock,
-		MerkleRoot:      node.merkleRoot,
-		Timestamp:       time.Unix(node.timestamp, 0),
-		Bits:            node.bits,
-		ProofCommitment: node.proofCommitment,
-	}
 }

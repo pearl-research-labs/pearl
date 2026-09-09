@@ -77,16 +77,15 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 	return nil
 }
 
-// readBlob reads one length-prefixed (4-byte LE) blob, enforcing the V4
-// per-blob size cap. A zero length decodes as nil. `tooLarge` is the
-// violation message for this blob, matching each blob's legacy wording.
-func readBlob(r io.Reader, tooLarge func(length uint32) error) ([]byte, error) {
+// readFp8Blob reads one length-prefixed (4-byte LE) blob, enforcing the V4
+// per-blob size cap. A zero length decodes as nil.
+func readFp8Blob(r io.Reader, fieldName string) ([]byte, error) {
 	var length uint32
 	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return nil, err
 	}
 	if length > MaxFp8ProofSize {
-		return nil, tooLarge(length)
+		return nil, fmt.Errorf("fp8 %s_len %d exceeds max %d", fieldName, length, MaxFp8ProofSize)
 	}
 	if length == 0 {
 		return nil, nil
@@ -102,15 +101,11 @@ func (c *CertificateV4) Deserialize(r io.Reader) error {
 	if _, err := io.ReadFull(r, c.Hash[:]); err != nil {
 		return err
 	}
-	publicData, err := readBlob(r, func(n uint32) error {
-		return fmt.Errorf("fp8 public_data_len %d exceeds max %d", n, MaxFp8ProofSize)
-	})
+	publicData, err := readFp8Blob(r, "public_data")
 	if err != nil {
 		return err
 	}
-	proofData, err := readBlob(r, func(n uint32) error {
-		return fmt.Errorf("fp8 proof data too large: %d bytes (max %d)", n, MaxFp8ProofSize)
-	})
+	proofData, err := readFp8Blob(r, "proof_data")
 	if err != nil {
 		return err
 	}

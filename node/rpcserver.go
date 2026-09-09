@@ -896,19 +896,21 @@ func handleGenerate(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 		}
 	}
 
-	// Create a reply
-	reply := make([]string, c.NumBlocks)
-
 	blockHashes, err := s.cfg.CPUMiner.GenerateNBlocks(c.NumBlocks)
 	if err != nil {
+		code := btcjson.ErrRPCInternal.Code
+		if errors.Is(err, blockchain.ErrCPUMiningUnsupported) {
+			code = btcjson.ErrRPCDifficulty
+		}
 		return nil, &btcjson.RPCError{
-			Code:    btcjson.ErrRPCInternal.Code,
+			Code:    code,
 			Message: err.Error(),
 		}
 	}
 
 	// Mine the correct number of blocks, assigning the hex representation of the
 	// hash of each one to its place in the reply.
+	reply := make([]string, len(blockHashes))
 	for i, hash := range blockHashes {
 		reply[i] = hash.String()
 	}
@@ -3644,9 +3646,9 @@ func handleSetGenerate(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
 			}
 		}
 
-		// It's safe to call start even if it's already started.
-		s.cfg.CPUMiner.SetNumWorkers(int32(genProcLimit))
-		s.cfg.CPUMiner.Start()
+		if err := s.cfg.CPUMiner.StartWithNumWorkers(int32(genProcLimit)); err != nil {
+			return nil, btcjson.NewRPCError(btcjson.ErrRPCDifficulty, err.Error())
+		}
 	}
 	return nil, nil
 }

@@ -83,11 +83,14 @@ func copyCertificateV4(c *wire.CertificateV4) *wire.CertificateV4 {
 func TestVerifyCertificateV4(t *testing.T) {
 	header, cert := loadFp8Fixture(t)
 
+	// The fixture's repeated hash bytes cannot detect byte-order reversals.
+	// Independent Go vectors check wire encoding and blockHeaderToC; this
+	// assertion only checks that the fixture carries its loaded header.
 	var serialized bytes.Buffer
 	require.NoError(t, header.Serialize(&serialized))
 	size := wire.MaxBlockHeaderPayload - chainhash.HashSize
 	require.Equal(t, serialized.Bytes()[:size], cert.PublicData[:size],
-		"Rust and Go must encode the ancestor header identically")
+		"fixture ancestor header must match the loaded header prefix")
 
 	require.NoError(t, VerifyCertificate(header, cert), "the mined fp8 certificate should verify")
 }
