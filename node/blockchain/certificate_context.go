@@ -33,15 +33,10 @@ func CheckCertificateContext(proposed *wire.BlockHeader,
 	headers CertificateHeaderContext,
 	cert wire.BlockCertificate, flags BehaviorFlags) error {
 
-	if flags&BFNoPoWCheck == BFNoPoWCheck {
+	if flags&BFNoPoWCheck != 0 || cert == nil || cert == (*wire.CertificateV4)(nil) {
 		return nil
 	}
-
-	if cert == nil || cert.Version() != wire.CertificateVersionV4 {
-		return nil
-	}
-	// Preserve the absent-certificate case when the interface holds a nil V4.
-	if cert == (*wire.CertificateV4)(nil) {
+	if cert.Version() != wire.CertificateVersionV4 {
 		return nil
 	}
 

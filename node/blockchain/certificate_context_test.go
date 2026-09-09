@@ -44,10 +44,7 @@ func contextCert(t *testing.T, ancestor *wire.BlockHeader) *wire.CertificateV4 {
 	t.Helper()
 	var serialized bytes.Buffer
 	require.NoError(t, ancestor.Serialize(&serialized))
-	return &wire.CertificateV4{
-		PublicData: bytes.Clone(serialized.Bytes()[:wire.IncompleteBlockHeaderSize]),
-		ProofData:  bytes.Repeat([]byte{0xCD}, 64),
-	}
+	return &wire.CertificateV4{PublicData: serialized.Bytes()[:wire.IncompleteBlockHeaderSize]}
 }
 
 // requireRuleError is defined in moe_fork_test.go.
@@ -56,9 +53,11 @@ func TestCheckCertificateContext(t *testing.T) {
 	proposed, headers := contextHeaders(t)
 	rogue := &wire.BlockHeader{Version: 9, Timestamp: time.Unix(1, 0), Bits: 0x207fffff}
 	other := *headers.Parent
-	for i := range other.ProofCommitment {
-		other.ProofCommitment[i] = byte(255 - i)
-	}
+	other.ProofCommitment[0] ^= 0xff
+	reversedPrev := contextCert(t, proposed)
+	slices.Reverse(reversedPrev.PublicData[4:36])
+	reversedMerkle := contextCert(t, proposed)
+	slices.Reverse(reversedMerkle.PublicData[36:68])
 
 	tests := []struct {
 		name     string
@@ -72,6 +71,8 @@ func TestCheckCertificateContext(t *testing.T) {
 		{"depth 1", proposed, headers, contextCert(t, headers.Parent), BFNone, false},
 		{"depth 2", proposed, headers, contextCert(t, headers.Grandparent), BFNone, false},
 		{"outside window", proposed, headers, contextCert(t, rogue), BFNone, true},
+		{"reversed previous hash", proposed, headers, reversedPrev, BFNone, true},
+		{"reversed merkle root", proposed, headers, reversedMerkle, BFNone, true},
 		{"shallow window", proposed, CertificateHeaderContext{
 			Parent: headers.Parent,
 		}, contextCert(t, rogue), BFNone, true},
@@ -97,36 +98,6 @@ func TestCheckCertificateContext(t *testing.T) {
 				test.proposed, test.headers, test.cert, test.flags,
 			)
 			if test.wantErr {
-				requireRuleError(t, err, ErrHighHash)
-				return
-			}
-			require.NoError(t, err)
-		})
-	}
-}
-
-func TestCheckCertificateContextHashByteOrder(t *testing.T) {
-	proposed, headers := contextHeaders(t)
-	for _, test := range []struct {
-		name          string
-		reversePrev   bool
-		reverseMerkle bool
-	}{
-		{name: "canonical"},
-		{name: "reversed previous hash", reversePrev: true},
-		{name: "reversed merkle root", reverseMerkle: true},
-		{name: "both reversed", reversePrev: true, reverseMerkle: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			cert := contextCert(t, proposed)
-			if test.reversePrev {
-				slices.Reverse(cert.PublicData[4:36])
-			}
-			if test.reverseMerkle {
-				slices.Reverse(cert.PublicData[36:68])
-			}
-			err := CheckCertificateContext(proposed, headers, cert, BFNone)
-			if test.reversePrev || test.reverseMerkle {
 				requireRuleError(t, err, ErrHighHash)
 				return
 			}

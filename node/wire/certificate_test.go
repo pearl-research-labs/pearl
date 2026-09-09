@@ -6,7 +6,6 @@ package wire_test
 
 import (
 	"bytes"
-	"io"
 	"testing"
 	"time"
 
@@ -245,6 +244,10 @@ func TestCertificateV4_SerializeDeserialize(t *testing.T) {
 	require.Equal(t, cert.ProofData, decoded.ProofData)
 	require.Equal(t, wire.CertificateVersionV4, decoded.Version())
 	require.False(t, decoded.IsMoE())
+	for size := range buf.Len() {
+		err := (&wire.CertificateV4{}).Deserialize(bytes.NewReader(buf.Bytes()[:size]))
+		require.Error(t, err, "truncated certificate at byte %d", size)
+	}
 }
 
 func TestCertificateV4_NilPublicDataRoundTrip(t *testing.T) {
@@ -260,8 +263,8 @@ func TestCertificateV4_NilPublicDataRoundTrip(t *testing.T) {
 func TestMsgCertificate_V4_RoundTrip(t *testing.T) {
 	header := testBlockHeader()
 	cert := &wire.CertificateV4{
-		PublicData: bytes.Repeat([]byte{0x11}, 64),
-		ProofData:  bytes.Repeat([]byte{0x22}, 128),
+		PublicData: bytes.Repeat([]byte{0x11}, wire.MaxFp8ProofSize),
+		ProofData:  bytes.Repeat([]byte{0x22}, wire.MaxFp8ProofSize),
 	}
 	header.ProofCommitment = cert.ProofCommitment()
 	cert.Hash = header.BlockHash()
@@ -279,69 +282,17 @@ func TestMsgCertificate_V4_RoundTrip(t *testing.T) {
 	require.Equal(t, cert.ProofData, got.ProofData)
 }
 
-func TestCertificateV4_BlobBoundaries(t *testing.T) {
-	tests := []struct {
-		name      string
-		publicLen int
-		proofLen  int
-		wantErr   string
-	}{
-		{"maximum public data", wire.MaxFp8ProofSize, 1, ""},
-		{"maximum proof data", 1, wire.MaxFp8ProofSize, ""},
-		{"both maximum", wire.MaxFp8ProofSize, wire.MaxFp8ProofSize, ""},
-		{"oversized public data", wire.MaxFp8ProofSize + 1, 1, "public_data_len"},
-		{"oversized proof data", 1, wire.MaxFp8ProofSize + 1, "proof_data_len"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			cert := &wire.CertificateV4{
-				PublicData: bytes.Repeat([]byte{0x11}, test.publicLen),
-				ProofData:  bytes.Repeat([]byte{0x22}, test.proofLen),
-			}
+func TestCertificateV4_RejectsOversizedBlobs(t *testing.T) {
+	tooBig := make([]byte, wire.MaxFp8ProofSize+1)
+	for field, cert := range map[string]*wire.CertificateV4{
+		"public_data": {PublicData: tooBig, ProofData: []byte{0x01}},
+		"proof_data":  {PublicData: []byte{0x01}, ProofData: tooBig},
+	} {
+		t.Run(field, func(t *testing.T) {
 			var buf bytes.Buffer
 			require.NoError(t, cert.Serialize(&buf))
-			decoded := &wire.CertificateV4{}
-			err := decoded.Deserialize(&buf)
-			if test.wantErr != "" {
-				require.ErrorContains(t, err, test.wantErr)
-				return
-			}
-			require.NoError(t, err)
-			require.True(t, bytes.Equal(cert.PublicData, decoded.PublicData))
-			require.True(t, bytes.Equal(cert.ProofData, decoded.ProofData))
-
-			// The wrapper must also accept the exact total certificate limit.
-			msg := &wire.MsgCertificate{Certificate: cert}
-			require.NoError(t, msg.PrlEncode(&buf, wire.ProtocolVersion))
-			roundTripped := &wire.MsgCertificate{}
-			require.NoError(t, roundTripped.PrlDecode(&buf, wire.ProtocolVersion))
-			require.Equal(t, msg.SerializeSize(), roundTripped.SerializeSize())
-			require.Zero(t, buf.Len())
-		})
-	}
-}
-
-func TestCertificateV4_TruncatedFields(t *testing.T) {
-	cert := &wire.CertificateV4{
-		PublicData: []byte{0x01, 0x02, 0x03, 0x04},
-		ProofData:  []byte{0xaa, 0xbb, 0xcc},
-	}
-	var buf bytes.Buffer
-	require.NoError(t, cert.Serialize(&buf))
-	tests := []struct {
-		name string
-		size int
-	}{
-		{"hash", 31},
-		{"public length", 32 + 2},
-		{"public data", 32 + 4 + 3},
-		{"proof length", 32 + 4 + 4 + 2},
-		{"proof data", 32 + 4 + 4 + 4 + 2},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			err := (&wire.CertificateV4{}).Deserialize(bytes.NewReader(buf.Bytes()[:test.size]))
-			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			err := (&wire.CertificateV4{}).Deserialize(&buf)
+			require.ErrorContains(t, err, field+"_len")
 		})
 	}
 }

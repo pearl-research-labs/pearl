@@ -83,9 +83,7 @@ func copyCertificateV4(c *wire.CertificateV4) *wire.CertificateV4 {
 func TestVerifyCertificateV4(t *testing.T) {
 	header, cert := loadFp8Fixture(t)
 
-	// The fixture's repeated hash bytes cannot detect byte-order reversals.
-	// Independent Go vectors check wire encoding and blockHeaderToC; this
-	// assertion only checks that the fixture carries its loaded header.
+	// Repeated fixture hashes cannot detect byte-order reversals.
 	var serialized bytes.Buffer
 	require.NoError(t, header.Serialize(&serialized))
 	size := wire.MaxBlockHeaderPayload - chainhash.HashSize

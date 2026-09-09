@@ -8,7 +8,6 @@ package zkpow
 
 import (
 	"bytes"
-	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
@@ -19,29 +18,15 @@ import (
 )
 
 func TestBlockHeaderToCByteOrder(t *testing.T) {
-	header := &wire.BlockHeader{
-		Version:   0x01020304,
-		Timestamp: time.Unix(0x11121314, 0),
-		Bits:      0x21222324,
-	}
-	for i := range header.PrevBlock {
-		header.PrevBlock[i] = byte(i)
-		header.MerkleRoot[i] = 0x80 + byte(i)
-	}
-
+	header := testBlockHeader()
+	header.Version = 1
+	header.PrevBlock[0] = 1 // Both hashes must differ from their reversed bytes.
 	got := blockHeaderToC(header)
-	var prevBlock, merkleRoot [chainhash.HashSize]byte
-	for i := range got.prev_block {
-		prevBlock[i] = byte(got.prev_block[i])
-		merkleRoot[i] = byte(got.merkle_root[i])
-	}
-	require.Equal(t, "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
-		hex.EncodeToString(prevBlock[:]))
-	require.Equal(t, "9f9e9d9c9b9a999897969594939291908f8e8d8c8b8a89888786858483828180",
-		hex.EncodeToString(merkleRoot[:]))
-	require.Equal(t, uint32(0x01020304), uint32(got.version))
-	require.Equal(t, uint32(0x11121314), uint32(got.timestamp))
-	require.Equal(t, uint32(0x21222324), uint32(got.nbits))
+	require.Equal(t, header.PrevBlock.String(), fmt.Sprintf("%x", got.prev_block))
+	require.Equal(t, header.MerkleRoot.String(), fmt.Sprintf("%x", got.merkle_root))
+	require.Equal(t, uint32(header.Version), uint32(got.version))
+	require.Equal(t, uint32(header.Timestamp.Unix()), uint32(got.timestamp))
+	require.Equal(t, header.Bits, uint32(got.nbits))
 }
 
 // Test block header values from mainnet genesis block (chaincfg/genesis.go)
@@ -367,21 +352,25 @@ func BenchmarkMine(b *testing.B) {
 	}
 }
 
-// TestVerifyCertificateV4RejectsGarbage checks a structurally-bound but
-// meaningless proof pair is rejected by the FFI (there is no setup to install:
-// the trusted setups ship in the Rust library's embedded fp8 cache).
 func TestVerifyCertificateV4RejectsGarbage(t *testing.T) {
-	header := testBlockHeader()
-	cert := &wire.CertificateV4{
-		PublicData: []byte{0x01},
-		ProofData:  []byte{0x02},
+	for _, test := range []struct {
+		publicLen int
+		wantErr   string
+	}{
+		{1, "invalid public_data_len"},
+		{wire.MaxFp8ProofSize, "fp8 public data too large"}, // Reject before the C-buffer copy.
+	} {
+		t.Run(test.wantErr, func(t *testing.T) {
+			header := testBlockHeader()
+			cert := &wire.CertificateV4{
+				PublicData: make([]byte, test.publicLen),
+				ProofData:  []byte{0x02},
+			}
+			header.ProofCommitment = cert.ProofCommitment()
+			cert.Hash = header.BlockHash()
+			require.ErrorContains(t, VerifyCertificate(header, cert), test.wantErr)
+		})
 	}
-	header.ProofCommitment = cert.ProofCommitment()
-	cert.Hash = header.BlockHash()
-
-	err := VerifyCertificate(header, cert)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid public_data_len")
 }
 
 func TestVerifyCertificateV4HeaderMismatch(t *testing.T) {
@@ -394,20 +383,6 @@ func TestVerifyCertificateV4HeaderMismatch(t *testing.T) {
 	err := VerifyCertificate(header, cert)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "block hash mismatch")
-}
-
-func TestVerifyCertificateV4OversizedPublicData(t *testing.T) {
-	header := testBlockHeader()
-	cert := &wire.CertificateV4{
-		// The wire cap exceeds the fixed C statement buffer. This must be
-		// rejected by Go before copying into that buffer or calling the FFI.
-		PublicData: make([]byte, wire.MaxFp8ProofSize),
-		ProofData:  []byte{0x01},
-	}
-	header.ProofCommitment = cert.ProofCommitment()
-	cert.Hash = header.BlockHash()
-
-	require.ErrorContains(t, VerifyCertificate(header, cert), "fp8 public data too large")
 }
 
 // BenchmarkVerifyProof benchmarks the ZK proof verification phase.
