@@ -10,6 +10,7 @@ from miner_utils import get_logger
 from pearl_gateway.config import MinerRpcConfig, load_config
 from pearl_gateway.miner_rpc.server import MinerRpcServer
 from pearl_gateway.pearl_client import PearlNodeClient
+from pearl_gateway.proof_pool import ProofPool
 from pearl_gateway.scheduler import TemplateScheduler
 from pearl_gateway.submission_service import SubmissionService
 from pearl_gateway.work_cache import WorkCache
@@ -53,7 +54,10 @@ class PearlGateway:
         # Initialize components (but don't start them yet)
         self.work_cache = WorkCache()
         self.pearl_client = PearlNodeClient(self.config.pearl)
-        self.submission_service = SubmissionService(self.pearl_client, debug_mode=debug_mode)
+        self.proof_pool = ProofPool()
+        self.submission_service = SubmissionService(
+            self.pearl_client, debug_mode=debug_mode, proof_pool=self.proof_pool
+        )
         self.miner_rpc = MinerRpcServer(
             self.work_cache,
             self.submission_service,
@@ -78,6 +82,9 @@ class PearlGateway:
         # Start the scheduler (which will immediately fetch a block template)
         await self.scheduler.start()
 
+        # Warm the proving worker before serving miner RPC.
+        await self.proof_pool.start()
+
         # Start the Miner RPC server
         await self.miner_rpc.start()
 
@@ -94,8 +101,9 @@ class PearlGateway:
         self.logger.info("Stopping PearlGateway")
         self.running = False
 
-        # Stop components in reverse order
+        # Stop components in reverse order. Intake first so no proof is left in flight.
         await self.miner_rpc.stop()
+        await self.proof_pool.stop()
         await self.scheduler.stop()
         await self.pearl_client.__aexit__(None, None, None)
 

@@ -164,7 +164,9 @@ where
     F: Field + Extendable<D>,
 {
     debug_assert_eq!(l.len() % D, 0);
-    l.chunks_exact(D)
+    l.as_chunks::<D>()
+        .0
+        .iter()
         .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
         .collect()
 }

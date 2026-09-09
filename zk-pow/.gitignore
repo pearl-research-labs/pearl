@@ -1,6 +1,7 @@
 /target
-src/circuit/v2_cache.bin
+src/v2/circuit/v2_cache.bin
 src/v1/v1_cache.bin
+src/api/fp8/fp8_cache.bin
 
 # Auto-generated C header (cbindgen)
 bindings/go/zk_pow_ffi.h

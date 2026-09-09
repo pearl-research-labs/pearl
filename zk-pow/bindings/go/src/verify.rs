@@ -6,12 +6,14 @@
 use std::os::raw::c_char;
 use std::slice;
 
-use crate::common::MAX_ZK_PROOF_SIZE;
-use zk_pow::api::proof::{IncompleteBlockHeader, PublicProofParams, SeedDerivation, ZKProof};
-use zk_pow::api::sanity_checks;
-use zk_pow::api::verify;
+use crate::common::{MAX_FP8_PROOF_SIZE, MAX_ZK_PROOF_SIZE};
+use zk_pow::api::fp8::public_params::PublicParams;
+use zk_pow::api::seed::SeedDerivation;
+use zk_pow::v2::api::proof::{IncompleteBlockHeader, PublicProofParams, ZKProof};
+use zk_pow::v2::api::sanity_checks;
+use zk_pow::v2::api::verify;
 
-use crate::common::{acquire_cache, catch_panic, set_error_msg, CZKProof};
+use crate::common::{acquire_cache, catch_panic, fp8_cache, set_error_msg, CZKProof};
 
 // ============================================================================
 // ZK Proof Verification FFI
@@ -233,6 +235,154 @@ pub unsafe extern "C" fn check_rank_penalty(
             2
         }
     }
+}
+
+// ============================================================================
+// FP8 ZK Proof Verification FFI
+// ============================================================================
+
+/// The FFI block-header type is the frozen v2 clone; the fp8 (v4) API binds
+/// the mainline type. The two structs are field-identical.
+fn header_to_v4(header: &IncompleteBlockHeader) -> zk_pow::api::primitives::IncompleteBlockHeader {
+    zk_pow::api::primitives::IncompleteBlockHeader {
+        version: header.version,
+        prev_block: header.prev_block,
+        merkle_root: header.merkle_root,
+        timestamp: header.timestamp,
+        nbits: header.nbits,
+    }
+}
+
+/// Shared implementation for fp8 proof verification — the same shape as
+/// [`verify_zk_proof_inner`]: pointer and size validation, then a single call into the
+/// fp8 API, which deserializes both blobs (header binding included) and runs the full
+/// verification.
+///
+/// # Safety
+/// Same contract as [`verify_zk_proof_v4`].
+unsafe fn verify_zk_proof_v4_inner(
+    block_header: *const IncompleteBlockHeader,
+    zk_proof: *const CZKProof,
+    nbits_override: Option<u32>,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    let result = catch_panic(|| {
+        if block_header.is_null() || zk_proof.is_null() {
+            set_error_msg(error_msg_out, "Null pointer");
+            return 2;
+        }
+
+        let zk_proof_ref = &*zk_proof;
+
+        if zk_proof_ref.proof_blob.is_null() || zk_proof_ref.proof_blob_len == 0 {
+            set_error_msg(error_msg_out, "Null or empty proof blob");
+            return 1;
+        }
+        if zk_proof_ref.proof_blob_len > MAX_FP8_PROOF_SIZE {
+            set_error_msg(error_msg_out, "FP8 proof too large");
+            return 1;
+        }
+        if !PublicParams::is_valid_wire_size(zk_proof_ref.public_data_len) {
+            set_error_msg(
+                error_msg_out,
+                &format!("invalid public_data_len {}", zk_proof_ref.public_data_len),
+            );
+            return 1;
+        }
+
+        let proof_data = slice::from_raw_parts(zk_proof_ref.proof_blob, zk_proof_ref.proof_blob_len);
+        let public_data = &zk_proof_ref.public_data[..zk_proof_ref.public_data_len];
+
+        // The statement's trusted setup comes from the global read-only cache: the
+        // embedded `fp8_cache.bin` preloads the universal (D1) wrapper circuits,
+        // which cover every envelope-legal geometry and degree profile. A device
+        // missing from a stale cache rejects the proof — setups are never compiled
+        // on demand, so no proof can force that cost.
+        let cache = fp8_cache();
+        let header = header_to_v4(&*block_header);
+        // The statement carries its own `ancestor_header` (σ_Δ) inside
+        // `public_data`'s 76-byte prefix, so the single `block_header`
+        // argument (σ̂) is all the binding the FFI needs. Authenticating
+        // σ_Δ against the caller's blockchain context (hash-walking the
+        // `prev_block` chain) is the caller's responsibility — see
+        // `verify_zk_proof_v4`'s docs.
+        let verdict = match nbits_override {
+            None => cache.verify_block(&header, public_data, proof_data),
+            Some(nbits) => cache.verify_share(&header, public_data, proof_data, nbits),
+        };
+        match verdict {
+            Ok(()) => {
+                set_error_msg(error_msg_out, "Proof verified successfully");
+                0
+            }
+            Err(e) => {
+                set_error_msg(error_msg_out, &format!("{}", e));
+                1
+            }
+        }
+    });
+
+    match result {
+        Ok(code) => code,
+        Err(panic_msg) => {
+            set_error_msg(error_msg_out, &format!("Internal panic: {}", panic_msg));
+            2
+        }
+    }
+}
+
+/// Verify an FP8 ZK block proof: the published `public_data` / `proof_data` pair carried
+/// by `zk_proof` against the caller's expected block header (`block_header` = σ̂).
+///
+/// **Caller responsibility — `ancestor_header` (σ_Δ) authentication.** The statement
+/// carries its own 76-byte `ancestor_header` (σ_Δ) in the `public_data` prefix; the
+/// proof's B side is keyed by it, but the proof does *not* establish that this header
+/// is the caller's real ancestor. The caller must hash-walk `prev_block` links from
+/// the proposed header's parent and confirm the proof-carried σ_Δ appears in that
+/// window before accepting the block.
+///
+/// The trusted verifier setup is not an argument: setups live in a global read-only
+/// cache preloaded from the embedded `fp8_cache.bin`, resolved by the statement's
+/// device byte. A device outside the cache rejects the proof (code 1) — setups are
+/// never compiled on demand, so no proof can force an expensive circuit build. The
+/// verdict is binary: the jackpot policy accepts or rejects, nothing else is reported.
+///
+/// # Returns
+/// - 0: Proof verified and accepted
+/// - 1: Proof rejected (malformed, oversized, wrong header, or verification failure)
+/// - 2: System error (null pointers or internal panic)
+///
+/// # Safety
+/// - `block_header` must be a valid pointer
+/// - `zk_proof` must be a valid pointer; `zk_proof.proof_blob` must be a valid pointer to
+///   `proof_blob_len` bytes
+/// - `error_msg_out` must be null or a valid pointer to a caller-allocated buffer of `ERROR_MSG_MAX_SIZE` bytes
+#[no_mangle]
+pub unsafe extern "C" fn verify_zk_proof_v4(
+    block_header: *const IncompleteBlockHeader,
+    zk_proof: *const CZKProof,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    verify_zk_proof_v4_inner(block_header, zk_proof, None, error_msg_out)
+}
+
+/// Verify an FP8 ZK share proof: identical to [`verify_zk_proof_v4`] except the
+/// difficulty target is derived from `nbits_override` (e.g. a pool share target) instead of
+/// the block header's own nbits field.
+///
+/// # Returns
+/// Same as [`verify_zk_proof_v4`].
+///
+/// # Safety
+/// Same as [`verify_zk_proof_v4`].
+#[no_mangle]
+pub unsafe extern "C" fn verify_zk_proof_v4_with_nbits(
+    block_header: *const IncompleteBlockHeader,
+    zk_proof: *const CZKProof,
+    nbits_override: u32,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    verify_zk_proof_v4_inner(block_header, zk_proof, Some(nbits_override), error_msg_out)
 }
 
 /// Verify a V1 (version 1, master-format) ZK proof.

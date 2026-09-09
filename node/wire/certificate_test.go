@@ -224,3 +224,72 @@ func TestCertificateV3_MineVerifyRoundTrip(t *testing.T) {
 	require.Error(t, zkpow.VerifyCertificate(&relabeledHeader, asV2),
 		"V3 proof must not verify under the legacy (V2) derivation")
 }
+
+func TestCertificateV4_SerializeDeserialize(t *testing.T) {
+	header := testBlockHeader()
+	cert := &wire.CertificateV4{
+		PublicData: []byte{0x01, 0x02, 0x03, 0x04},
+		ProofData:  []byte{0xaa, 0xbb, 0xcc},
+	}
+	header.ProofCommitment = cert.ProofCommitment()
+	cert.Hash = header.BlockHash()
+
+	var buf bytes.Buffer
+	require.NoError(t, cert.Serialize(&buf))
+
+	decoded := &wire.CertificateV4{}
+	require.NoError(t, decoded.Deserialize(bytes.NewReader(buf.Bytes())))
+	require.Equal(t, cert.Hash, decoded.Hash)
+	require.Equal(t, cert.PublicData, decoded.PublicData)
+	require.Equal(t, cert.ProofData, decoded.ProofData)
+	require.Equal(t, wire.CertificateVersionV4, decoded.Version())
+	require.False(t, decoded.IsMoE())
+}
+
+func TestCertificateV4_NilPublicDataRoundTrip(t *testing.T) {
+	cert := &wire.CertificateV4{ProofData: []byte{0x00}}
+	var buf bytes.Buffer
+	require.NoError(t, cert.Serialize(&buf))
+
+	decoded := &wire.CertificateV4{}
+	require.NoError(t, decoded.Deserialize(bytes.NewReader(buf.Bytes())))
+	require.Equal(t, cert, decoded)
+}
+
+func TestMsgCertificate_V4_RoundTrip(t *testing.T) {
+	header := testBlockHeader()
+	cert := &wire.CertificateV4{
+		PublicData: bytes.Repeat([]byte{0x11}, 64),
+		ProofData:  bytes.Repeat([]byte{0x22}, 128),
+	}
+	header.ProofCommitment = cert.ProofCommitment()
+	cert.Hash = header.BlockHash()
+
+	msg := &wire.MsgCertificate{Certificate: cert}
+	var buf bytes.Buffer
+	require.NoError(t, msg.PrlEncode(&buf, wire.ProtocolVersion))
+
+	decoded := &wire.MsgCertificate{}
+	require.NoError(t, decoded.PrlDecode(bytes.NewReader(buf.Bytes()), wire.ProtocolVersion))
+	got, ok := decoded.Certificate.(*wire.CertificateV4)
+	require.True(t, ok)
+	require.Equal(t, cert.Hash, got.Hash)
+	require.Equal(t, cert.PublicData, got.PublicData)
+	require.Equal(t, cert.ProofData, got.ProofData)
+}
+
+func TestCertificateV4_RejectsOversizedBlobs(t *testing.T) {
+	tooBig := make([]byte, wire.MaxFp8ProofSize+1)
+	cert := &wire.CertificateV4{PublicData: tooBig, ProofData: []byte{0x01}}
+
+	var buf bytes.Buffer
+	require.NoError(t, cert.Serialize(&buf))
+	err := (&wire.CertificateV4{}).Deserialize(bytes.NewReader(buf.Bytes()))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "public_data_len")
+}
+
+func TestIsCertVersionAllowedV4(t *testing.T) {
+	require.True(t, wire.IsCertVersionAllowed(wire.CertificateVersionV4))
+	require.False(t, wire.IsCertVersionAllowed(wire.CertificateVersion(5)))
+}

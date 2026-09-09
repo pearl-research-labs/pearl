@@ -6,6 +6,7 @@ package netsync
 
 import (
 	"container/list"
+	"fmt"
 	"math/rand"
 	"net"
 	"sync"
@@ -242,6 +243,10 @@ type SyncManager struct {
 	startHeader    *list.Element
 	nextCheckpoint *chaincfg.Checkpoint
 
+	// syncHeaderCtx is the rolling (parent, grandparent) window backing the
+	// v4 ancestor-context check during headers-first sync.
+	syncHeaderCtx blockchain.CertificateHeaderContext
+
 	// An optional fee estimator.
 	feeEstimator *mempool.FeeEstimator
 
@@ -257,6 +262,7 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	sm.headersFirstMode = false
 	sm.headerList.Init()
 	sm.startHeader = nil
+	sm.syncHeaderCtx = blockchain.CertificateHeaderContext{}
 
 	// When there is a next checkpoint, add an entry for the latest known
 	// block into the header pool.  This allows the next downloaded header
@@ -265,6 +271,43 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 		node := headerNode{height: newestHeight, hash: newestHash}
 		sm.headerList.PushBack(&node)
 	}
+}
+
+// seedHeaderCtx initializes syncHeaderCtx, the rolling (parent, grandparent)
+// window used by CheckCertificateContext, from the chain. parentHash is the
+// header the next batch builds on (the last accepted or checkpoint header);
+// it and its parent become the window. The seed is idempotent and run lazily
+// before the first check after a reset; a local read failure aborts the batch
+// rather than blaming the peer.
+func (sm *SyncManager) seedHeaderCtx(parentHash *chainhash.Hash,
+	headerByHash func(*chainhash.Hash) (wire.BlockHeader, error)) error {
+
+	if sm.syncHeaderCtx.Parent != nil {
+		return nil
+	}
+
+	parent, err := headerByHash(parentHash)
+	if err != nil {
+		return fmt.Errorf("unable to fetch parent header %s for "+
+			"ancestor context: %w", parentHash, err)
+	}
+
+	// Seed the grandparent unless the parent is genesis.
+	var grandparent *wire.BlockHeader
+	if !parentHash.IsEqual(sm.chainParams.GenesisHash) {
+		gp, err := headerByHash(&parent.PrevBlock)
+		if err != nil {
+			return fmt.Errorf("unable to fetch grandparent header "+
+				"%s for ancestor context: %w", &parent.PrevBlock, err)
+		}
+		grandparent = &gp
+	}
+
+	sm.syncHeaderCtx = blockchain.CertificateHeaderContext{
+		Parent:      &parent,
+		Grandparent: grandparent,
+	}
+	return nil
 }
 
 // findNextHeaderCheckpoint returns the next checkpoint after the passed height.
@@ -1110,6 +1153,28 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			return
 		}
 
+		// Authenticate the v4 proof-carried ancestor header
+		// against the rolling (parent, grandparent) window,
+		// seeded lazily from the chain once per reset.
+		if err := sm.seedHeaderCtx(
+			&blockHeader.PrevBlock, sm.chain.HeaderByHash,
+		); err != nil {
+			log.Errorf("Header sync: %v -- aborting batch", err)
+			return
+		}
+		if err := blockchain.CheckCertificateContext(
+			blockHeader, sm.syncHeaderCtx,
+			msgHeader.BlockCertificate(),
+			blockchain.NetBehaviorFlags(sm.chainParams),
+		); err != nil {
+			log.Warnf("Header from peer %s has a v4 "+
+				"certificate whose ancestor header is "+
+				"outside its context window: %v -- "+
+				"disconnecting", peer.Addr(), err)
+			peer.Disconnect()
+			return
+		}
+
 		// Verify proof of work and certificate per header.
 		if err := sm.chain.CheckHeaderSanity(
 			blockHeader, msgHeader.BlockCertificate(),
@@ -1120,6 +1185,10 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 
 			return
 		}
+
+		// The header passed every check: advance the rolling
+		// ancestor-context window and record it in the header list.
+		sm.syncHeaderCtx.Advance(blockHeader)
 
 		e := sm.headerList.PushBack(&node)
 		if sm.startHeader == nil {

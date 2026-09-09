@@ -152,7 +152,9 @@ pub fn flatten_target<const D: usize>(l: &[ExtensionTarget<D>]) -> Vec<Target> {
 /// Batch every D-sized chunks into extension targets.
 pub fn unflatten_target<const D: usize>(l: &[Target]) -> Vec<ExtensionTarget<D>> {
     debug_assert_eq!(l.len() % D, 0);
-    l.chunks_exact(D)
+    l.as_chunks::<D>()
+        .0
+        .iter()
         .map(|c| c.to_vec().try_into().unwrap())
         .collect()
 }

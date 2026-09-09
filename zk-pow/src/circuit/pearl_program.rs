@@ -2,11 +2,12 @@ use log::debug;
 use pearl_blake3::{B3F_CHUNK_END, B3F_CHUNK_START, B3F_KEYED_HASH, B3F_ROOT};
 use plonky2_maybe_rayon::*;
 
-use crate::api::proof::Hash256;
 use crate::api::proof_utils::CompiledPublicParams;
 use crate::circuit::chip::blake3::blake3_compress::Blake3Tweak;
 use crate::circuit::chip::blake3::logic::{BlakeRoundLogic, MessageDataType};
-use crate::circuit::chip::blake3::program::{BLOCK_LEN, DWORD_SIZE, MatDwordId, MessageType, ROUNDS_PER_BLAKE_INSTRUCTION};
+use crate::circuit::chip::blake3::program::{
+    BLOCK_LEN, DWORD_SIZE, HashOut, KeySource, MatDwordId, MessageType, ROUNDS_PER_BLAKE_INSTRUCTION,
+};
 use crate::circuit::chip::{BitRegDst, BitRegSrc, JackpotLogic, MatmulLogic};
 use anyhow::{Result, ensure};
 
@@ -155,14 +156,6 @@ impl CompiledPublicParams {
 
         Ok(res)
     }
-
-    pub fn a_noise_seed(&self) -> Hash256 {
-        self.commitment_hash.1
-    }
-
-    pub fn b_noise_seed(&self) -> Hash256 {
-        self.commitment_hash.0
-    }
 }
 
 /// Compute the number of shift3 operations and store type needed to achieve a given back-shift.
@@ -186,12 +179,12 @@ impl CompiledPublicParams {
 
         let (mut has_a, mut has_b, mut has_routing) = (false, false, false);
         for inst in instructions {
-            has_a |= inst.is_hash_a;
-            has_b |= inst.is_hash_b;
-            has_routing |= inst.is_hash_routing;
+            has_a |= inst.out == HashOut::A;
+            has_b |= inst.out == HashOut::B;
+            has_routing |= inst.out == HashOut::Routing;
 
             if matches!(inst.msg, MessageType::Parent { .. }) {
-                ensure!(inst.is_cv_key, "Parent instruction should use cv_key");
+                ensure!(inst.key_source != KeySource::Prev, "Parent instruction should use cv_key");
             }
         }
         ensure!(has_a && has_b, "Blake program must output hash of A and B");
@@ -212,8 +205,11 @@ impl CompiledPublicParams {
         res.par_chunks_exact_mut(ROUNDS_PER_BLAKE_INSTRUCTION)
             .zip(instructions.par_iter().enumerate())
             .for_each(|(chunk, (i, inst))| {
-                debug_assert!(i > 0 || inst.is_cv_key, "first instruction must be cv_key");
-                let read_cv_from = (!inst.is_cv_key).then(|| inst_to_row[i - 1]);
+                debug_assert!(
+                    i > 0 || inst.key_source != KeySource::Prev,
+                    "first instruction must be cv_key"
+                );
+                let read_cv_from = (inst.key_source == KeySource::Prev).then(|| inst_to_row[i - 1]);
                 chunk.copy_from_slice(&inst.emit_instruction_rounds(&inst_to_row, read_cv_from));
             });
 
@@ -390,13 +386,13 @@ impl CompiledPublicParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::circuit::chip::blake3::program::BlakeProgram;
 
     /// Minimal params for exercising `structure_matmul_in_stark` row counting.
     /// Only `h`, `w`, `k`, `r` affect the matmul/jackpot streams.
     fn matmul_params(h: usize, w: usize, k: usize, r: usize) -> CompiledPublicParams {
         CompiledPublicParams {
-            job_key: [0u8; 32],
             k,
             h,
             w,
@@ -406,13 +402,11 @@ mod tests {
                 num_b_cols: w,
                 strip_length: k,
                 num_routing_strips: 0,
+                num_offsets_strips: 0,
                 num_auxiliary_msgs: 0,
                 num_auxiliary_cvs: 0,
                 instructions: vec![],
             },
-            a_rows_indices: vec![],
-            b_cols_indices: vec![],
-            commitment_hash: ([0u8; 32], [0u8; 32]),
             moe: None,
         }
     }
@@ -451,7 +445,7 @@ mod tests {
 
     /// Exhaustively check `matmul_and_jackpot_num_rows` against the actual
     /// emitted stream lengths over the full parameter grid permitted by
-    /// `public_params_sanity_check`.
+    /// the Int7 envelope.
     #[test]
     fn matmul_and_jackpot_num_rows_matches_structure_exhaustively() {
         let hw_cases = [(2usize, 16usize), (16, 16)];

@@ -1,45 +1,64 @@
 [project]
 name = "pearl-gemm"
 version = "0.0.1"
-description = "CUDA kernels for Pearl GEMM with noising/denoising and PoW extraction"
+description = "CuTe DSL kernels for Pearl's FP8 scheme"
 readme = "README.md"
-authors = [
-]
-requires-python = ">=3.12"
+requires-python = "==3.12.*"
 dependencies = [
-    "blake3>=1.0.7",
+    # 4.6.0 is the supported floor (the kernels need cute.nvgpu.OperandMajorMode,
+    # introduced in 4.5.0). quack-kernels 0.6.4 below pins 4.6.2 in practice; the
+    # [cu13] extra is declared here so pearl_gemm-only resolutions get it too.
+    "nvidia-cutlass-dsl[cu13]>=4.6.0",
+    # <0.1.12 mirrors the declared upstream caps: tilelang 0.1.12 requires
+    # <=0.1.11, and vLLM 0.28.0 / sglang 0.5.18 pin ==0.1.11. A standalone
+    # pearl_gemm resolution would otherwise float past them.
+    "apache-tvm-ffi>=0.1.11,<0.1.12",
     "cuda-python>=13.0,<13.1",
-    "nvidia-cutlass-dsl>=4.4",
-    "pearl-gemm-build-utils",
+    "blake3>=1.0.7",
     "numpy>=1.24.0",
-    "packaging>=21.0",
-    "pydantic>=2.12.0,<3.0.0",
-    "sortedcontainers>=2.4.0",
-    "torch==2.11.0",
-    "wheel>=0.38.0",
+    # The mixed_gemm substrate. The SM100 pieces (gemm_sm100,
+    # PipelineUmmaAsync, CLC tile scheduler) shipped in 0.6.1, but 0.6.4 is
+    # the first release with the epilogue package (quack.epilogue.ops /
+    # .frontend) this kernel imports — and it is vLLM 0.28.0's exact pin.
+    "quack-kernels>=0.6.4",
 ]
 
+[project.optional-dependencies]
+cuda = ["torch==2.13.0"]
+
+[dependency-groups]
+dev = [
+    # miner-base protocol modules drive kernel tests that need
+    # commitments, noise, and the hardware compute contract.
+    "miner-base",
+    # Merkle-tree oracle used by tensor-hash tests.
+    "py-pearl-mining>=0.2.0",
+    "pytest>=7.0.0",
+    "pytest-xdist>=3.0.0",
+    "ruff>=0.7.0",
+]
+
+[tool.ruff]
+# Inherit the repo-wide rule selection. Without this, ruff stops config
+# discovery at this file and the package silently gets only the default
+# rule set.
+extend = "../../ruff.toml"
 
 [build-system]
-requires = ["setuptools>=61", "torch==2.11.0", "numpy", "ninja", "pydantic", "pearl-gemm-build-utils"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[dependency-groups]
-dev = [
-    "miner-utils",
-    "miner-base",
-    "loguru-caplog>=0.2.0",
-    "matplotlib>=3.7.2",
-    "pandas>=2.1.1",
-    "pytest-randomly>=3.16.0",
-    "pytest-rerunfailures>=14.0",
-    "pytest-xdist>=3.3.1",
-    "pytest>=7.0.0",
-    "ruff>=0.7.0",
-    "tqdm>=4.66.1",
-    "vllm>=0.20.2",
-]
+[tool.setuptools.package-data]
+pearl_gemm = ["autotune_configs/*.json"]
 
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+miner-base = { workspace = true }
+torch = [{ index = "pytorch-cu130" }]

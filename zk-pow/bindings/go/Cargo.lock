@@ -2038,6 +2038,7 @@ dependencies = [
  "plonky2_maybe_rayon",
  "primitive-types 0.12.2",
  "rand 0.9.4",
+ "rand_chacha 0.9.0",
  "serde",
  "serde_json",
  "serde_with",

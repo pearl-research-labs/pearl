@@ -7,7 +7,7 @@ from typing import Any
 
 import fastjsonschema
 from miner_utils import get_logger
-from pearl_mining import PlainProof
+from pearl_mining import CERT_VERSION_PLAIN_FP8, PlainProof, PlainProofV4
 
 from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
@@ -21,8 +21,8 @@ from pearl_gateway.work_cache import WorkCache
 
 logger = get_logger(__name__)
 
-# max proof size should be smaller than this
-READER_BUFFER_LIMIT = 2**20
+# max proof size should be smaller than this (V4 FP8 proofs are larger than Int7)
+READER_BUFFER_LIMIT = 4 * 2**20
 
 
 @dataclass
@@ -214,8 +214,15 @@ class MinerRpcServer:
             elif method == "submitPlainProof":
                 if error := self._validate_params(validate_submit_plain_proof, params, request_id):
                     return error
-                plain_proof = PlainProof.from_base64(params["plain_proof"])
                 mining_job = MiningJob.from_dict(params["mining_job"])
+                # Certificate v4 (plain FP8) proofs ride their own wire type; the
+                # Int7 ZK certificate versions keep the legacy ``PlainProof``.
+                proof_type = (
+                    PlainProofV4
+                    if int(mining_job.cert_version) == CERT_VERSION_PLAIN_FP8
+                    else PlainProof
+                )
+                plain_proof = proof_type.from_base64(params["plain_proof"])
                 asyncio.create_task(self.handle_submit_plain_proof(plain_proof, mining_job))
                 return self._jsonrpc_success("submitted", request_id)
 
@@ -235,7 +242,7 @@ class MinerRpcServer:
             return self._jsonrpc_error(-32000, str(e), request_id)
 
     async def handle_submit_plain_proof(
-        self, plain_proof: PlainProof, mining_job: MiningJob
+        self, plain_proof: PlainProof | PlainProofV4, mining_job: MiningJob
     ) -> None:
         """Handle submitPlainProof requests."""
         # Get the current template (needed to build the full block)
