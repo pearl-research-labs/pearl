@@ -7,7 +7,6 @@ package netsync
 import (
 	"container/list"
 	"math/rand"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -400,7 +399,7 @@ func (sm *SyncManager) startSync() {
 	// downloads when in regression test mode.
 	if sm.nextCheckpoint != nil &&
 		best.Height < sm.nextCheckpoint.Height &&
-		sm.chainParams != &chaincfg.RegressionNetParams {
+		sm.chainParams.Name != chaincfg.RegressionNetParams.Name {
 
 		bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
 		sm.headersFirstMode = true
@@ -421,25 +420,6 @@ func (sm *SyncManager) startSync() {
 // isSyncCandidate returns whether or not the peer is a candidate to consider
 // syncing from.
 func (sm *SyncManager) isSyncCandidate(peer *peerpkg.Peer) bool {
-	// Typically a peer is not a candidate for sync if it's not a full node,
-	// however regression test is special in that the regression tool is
-	// not a full node and still needs to be considered a sync candidate.
-	if sm.chainParams == &chaincfg.RegressionNetParams {
-		// The peer is not a candidate if it's not coming from localhost
-		// or the hostname can't be determined for some reason.
-		host, _, err := net.SplitHostPort(peer.Addr())
-		if err != nil {
-			return false
-		}
-
-		if host != "127.0.0.1" && host != "localhost" {
-			return false
-		}
-
-		// Candidate if all checks passed.
-		return true
-	}
-
 	var (
 		nodeServices = peer.Services()
 		fullNode     = nodeServices.HasFlag(wire.SFNodeNetwork)
@@ -743,7 +723,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 		// the peer or ignore the block when we're in regression test
 		// mode in this case so the chain code is actually fed the
 		// duplicate blocks.
-		if sm.chainParams != &chaincfg.RegressionNetParams {
+		if sm.chainParams.Name != chaincfg.RegressionNetParams.Name {
 			log.Warnf("Got unrequested block %v from %s -- "+
 				"disconnecting", blockHash, peer.Addr())
 			peer.Disconnect()
@@ -1278,9 +1258,10 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		peer.UpdateLastAnnouncedBlock(&invVects[lastBlock].Hash)
 	}
 
-	// Ignore invs from peers that aren't the sync if we are not current.
-	// Helps prevent fetching a mass of orphans.
-	if peer != sm.syncPeer && !sm.current() {
+	// Ignore invs from peers that aren't the sync peer if we are not
+	// current. Helps prevent fetching a mass of orphans. When syncPeer
+	// is nil, accept invs from any peer.
+	if sm.syncPeer != nil && peer != sm.syncPeer && !sm.current() {
 		return
 	}
 

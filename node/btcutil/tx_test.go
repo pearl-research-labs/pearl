@@ -134,3 +134,17 @@ func TestTxWitnessHash(t *testing.T) {
 		}
 	}
 }
+
+func TestNewTxFromBytesRejectsTrailing(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Block100000.Transactions[0].Serialize(&buf); err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	if _, err := btcutil.NewTxFromBytes(buf.Bytes()); err != nil {
+		t.Fatalf("NewTxFromBytes: %v", err)
+	}
+	trailing := append(buf.Bytes(), 0x00)
+	if _, err := btcutil.NewTxFromBytes(trailing); err == nil {
+		t.Fatal("NewTxFromBytes: expected trailing-byte error")
+	}
+}

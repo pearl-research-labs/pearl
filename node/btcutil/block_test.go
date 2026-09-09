@@ -205,6 +205,11 @@ func TestNewBlockFromBytes(t *testing.T) {
 		t.Errorf("MsgBlock: mismatched MsgBlock - got %v, want %v",
 			spew.Sdump(msgBlock), spew.Sdump(&Block100000))
 	}
+
+	trailing := append(append([]byte{}, block100000Bytes...), 0x00)
+	if _, err := btcutil.NewBlockFromBytes(trailing); err == nil {
+		t.Fatal("NewBlockFromBytes: expected trailing-byte error")
+	}
 }
 
 // TestNewBlockFromBlockAndBytes tests creation of a Block from a MsgBlock and

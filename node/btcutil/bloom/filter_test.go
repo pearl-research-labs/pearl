@@ -291,11 +291,12 @@ func TestFilterBloomMatch(t *testing.T) {
 		t.Errorf("TestFilterBloomMatch DecodeString failure: %v", err)
 		return
 	}
-	tx, err := btcutil.NewTxFromBytes(strBytes)
-	if err != nil {
-		t.Errorf("TestFilterBloomMatch NewTxFromBytes failure: %v", err)
+	var msgTx wire.MsgTx
+	if err := msgTx.Deserialize(bytes.NewReader(strBytes)); err != nil {
+		t.Errorf("TestFilterBloomMatch Deserialize failure: %v", err)
 		return
 	}
+	tx := btcutil.NewTx(&msgTx)
 	spendingTxBytes := []byte{0x01, 0x00, 0x00, 0x00, 0x01, 0x6b, 0xff, 0x7f,
 		0xcd, 0x4f, 0x85, 0x65, 0xef, 0x40, 0x6d, 0xd5, 0xd6,
 		0x3d, 0x4f, 0xf9, 0x4f, 0x31, 0x8f, 0xe8, 0x20, 0x27,
@@ -326,11 +327,12 @@ func TestFilterBloomMatch(t *testing.T) {
 		0xf5, 0xfe, 0x95, 0xe7, 0x25, 0x59, 0xf2, 0xcc, 0x70,
 		0x43, 0xf9, 0x88, 0xac, 0x00, 0x00, 0x00, 0x00, 0x00}
 
-	spendingTx, err := btcutil.NewTxFromBytes(spendingTxBytes)
-	if err != nil {
-		t.Errorf("TestFilterBloomMatch NewTxFromBytes failure: %v", err)
+	var spendingMsgTx wire.MsgTx
+	if err := spendingMsgTx.Deserialize(bytes.NewReader(spendingTxBytes)); err != nil {
+		t.Errorf("TestFilterBloomMatch Deserialize failure: %v", err)
 		return
 	}
+	spendingTx := btcutil.NewTx(&spendingMsgTx)
 
 	f := bloom.NewFilter(10, 0, 0.000001, wire.BloomUpdateAll)
 	inputStr := "b4749f017444b051c44dfd2720e88f314ff94f3dd6d56d40ef65854fcd7fff6b"

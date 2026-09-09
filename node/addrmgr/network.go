@@ -48,6 +48,10 @@ var (
 	// RFC4843 (2001:10::/28).
 	rfc4843Net = ipNet("2001:10::", 28, 128)
 
+	// rfc7343Net specifies the IPv6 ORCHIDv2 address block as defined by
+	// RFC7343 (2001:20::/28).
+	rfc7343Net = ipNet("2001:20::", 28, 128)
+
 	// rfc4862Net specifies the IPv6 stateless address autoconfiguration
 	// address block as defined by RFC4862 (FE80::/64).
 	rfc4862Net = ipNet("FE80::", 64, 128)
@@ -88,6 +92,11 @@ var (
 	// (0.0.0.0/8).
 	zero4Net = ipNet("0.0.0.0", 8, 32)
 
+	// zero6Net defines the IPv6 address block for addresses with a zero
+	// first 16-bit group (0000::/16). /16 rather than the full /8
+	// reservation avoids catching allocated sub-ranges like 0064:ff9b::/96.
+	zero6Net = ipNet("::", 16, 128)
+
 	// heNet defines the Hurricane Electric IPv6 address block.
 	heNet = ipNet("2001:470::", 32, 128)
 )
@@ -107,6 +116,23 @@ func IsIPv4(na *wire.NetAddress) bool {
 // IsLocal returns whether or not the given address is a local address.
 func IsLocal(na *wire.NetAddress) bool {
 	return na.IP.IsLoopback() || zero4Net.Contains(na.IP)
+}
+
+// IsZero returns whether the address is in a reserved zero address block.
+// RFC 6145 translated IPv4 addresses (::ffff:0:0:0/96) are excluded.
+func IsZero(na *wire.NetAddress) bool {
+	if zero4Net.Contains(na.IP) {
+		return true
+	}
+
+	if zero6Net.Contains(na.IP) {
+		if rfc6145Net.Contains(na.IP) {
+			return false
+		}
+		return true
+	}
+
+	return false
 }
 
 // IsOnionCatTor returns whether or not the passed address is in the IPv6 range
@@ -171,6 +197,12 @@ func IsRFC4843(na *wire.NetAddress) bool {
 	return rfc4843Net.Contains(na.IP)
 }
 
+// IsRFC7343 returns whether the address is in the IPv6 ORCHIDv2 range
+// defined by RFC7343 (2001:20::/28).
+func IsRFC7343(na *wire.NetAddress) bool {
+	return rfc7343Net.Contains(na.IP)
+}
+
 // IsRFC4862 returns whether or not the passed address is part of the IPv6
 // stateless address autoconfiguration range as defined by RFC4862 (FE80::/64).
 func IsRFC4862(na *wire.NetAddress) bool {
@@ -233,9 +265,9 @@ func IsRoutable(na *wire.NetAddressV2) bool {
 	lna := na.ToLegacy()
 	return IsValid(lna) && !(IsRFC1918(lna) || IsRFC2544(lna) ||
 		IsRFC3927(lna) || IsRFC4862(lna) || IsRFC3849(lna) ||
-		IsRFC4843(lna) || IsRFC5737(lna) || IsRFC6598(lna) ||
-		IsLocal(lna) || (IsRFC4193(lna) &&
-		!IsOnionCatTor(lna)))
+		IsRFC4843(lna) || IsRFC7343(lna) || IsRFC5737(lna) ||
+		IsRFC6598(lna) || IsLocal(lna) || IsZero(lna) ||
+		(IsRFC4193(lna) && !IsOnionCatTor(lna)))
 }
 
 // GroupKey returns a string representing the network group an address is part

@@ -121,6 +121,17 @@ func DecodeWIF(wif string) (*WIF, error) {
 
 	netID := decoded[0]
 	privKeyBytes := decoded[1 : 1+btcec.PrivKeyBytesLen]
+
+	// PrivKeyFromBytes reduces modulo n; keys outside [1, n-1] would
+	// decode as a different (or zero) scalar with no error.
+	var keyScalar btcec.ModNScalar
+	defer keyScalar.Zero()
+	if overflow := keyScalar.SetByteSlice(privKeyBytes); overflow ||
+		keyScalar.IsZero() {
+
+		return nil, ErrMalformedPrivateKey
+	}
+
 	privKey, _ := btcec.PrivKeyFromBytes(privKeyBytes)
 	return &WIF{privKey, compress, netID}, nil
 }

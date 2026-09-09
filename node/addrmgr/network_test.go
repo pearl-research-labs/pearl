@@ -76,7 +76,7 @@ func TestIPTypes(t *testing.T) {
 		newIPTest("64:ff9b::1", false, false, false, false, false, false,
 			false, false, false, false, true, false, false, false, true, true),
 		newIPTest("::ffff:abcd:ef12:1", false, false, false, false, false, false,
-			false, false, false, false, false, false, false, false, true, true),
+			false, false, false, false, false, false, false, false, true, false),
 		newIPTest("::1", false, false, false, false, false, false, false, false,
 			false, false, false, false, false, true, true, false),
 		newIPTest("198.18.0.1", false, true, false, false, false, false, false,
@@ -204,5 +204,40 @@ func TestGroupKey(t *testing.T) {
 				"- got '%s', want '%s'", i, test.name,
 				key, test.expected)
 		}
+	}
+}
+
+func TestRFC7343AndZeroRoutable(t *testing.T) {
+	t.Parallel()
+
+	orchid := wire.NewNetAddressIPPort(
+		net.ParseIP("2001:20:abcd::1:1"), 8333, wire.SFNodeNetwork,
+	)
+	if !addrmgr.IsRFC7343(orchid) {
+		t.Fatal("expected ORCHIDv2 address to match RFC7343")
+	}
+	if addrmgr.IsRoutable(wire.NetAddressV2FromBytes(
+		time.Now(), wire.SFNodeNetwork, orchid.IP, 8333,
+	)) {
+		t.Fatal("expected ORCHIDv2 address to be unroutable")
+	}
+
+	zero6 := wire.NewNetAddressIPPort(
+		net.ParseIP("0:9881:8181:8181:fe00:a:9e:9801"), 8333, wire.SFNodeNetwork,
+	)
+	if !addrmgr.IsZero(zero6) {
+		t.Fatal("expected 0000::/16 address to be IsZero")
+	}
+	if addrmgr.IsRoutable(wire.NetAddressV2FromBytes(
+		time.Now(), wire.SFNodeNetwork, zero6.IP, 8333,
+	)) {
+		t.Fatal("expected 0000::/16 address to be unroutable")
+	}
+
+	rfc6145 := wire.NewNetAddressIPPort(
+		net.ParseIP("::ffff:0:0:1"), 8333, wire.SFNodeNetwork,
+	)
+	if addrmgr.IsZero(rfc6145) {
+		t.Fatal("RFC6145 addresses must not be treated as zero")
 	}
 }

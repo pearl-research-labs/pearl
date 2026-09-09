@@ -81,6 +81,23 @@ var (
 	errGarbageTooLarge = fmt.Errorf("garbage too large")
 )
 
+// HandshakeAdmission gates the CPU-bound phases of an inbound v2 handshake
+// so a flood of accepted sockets cannot pin ECDH.
+type HandshakeAdmission interface {
+	Acquire() (release func(), err error)
+}
+
+type PeerOption func(*Peer)
+
+func WithResponderHandshakeAdmission(
+	admission HandshakeAdmission,
+) PeerOption {
+
+	return func(p *Peer) {
+		p.responderAdmission = admission
+	}
+}
+
 // Peer defines the components necessary for sending/receiving data over the v2
 // transport.
 type Peer struct {
@@ -131,6 +148,8 @@ type Peer struct {
 	// rw is the underlying object that will be read from / written to in
 	// calls to V2EncPacket and V2ReceivePacket.
 	rw io.ReadWriter
+
+	responderAdmission HandshakeAdmission
 }
 
 // NewPeer returns a new instance of Peer.
@@ -145,6 +164,30 @@ func NewPeer() *Peer {
 		responderP: make([]byte, 32),
 		sessionID:  make([]byte, 32),
 	}
+}
+
+func NewPeerWithOptions(options ...PeerOption) *Peer {
+	p := NewPeer()
+	for _, option := range options {
+		option(p)
+	}
+	return p
+}
+
+func (p *Peer) acquireResponderAdmission() (func(), error) {
+	if p.responderAdmission == nil {
+		return func() {}, nil
+	}
+
+	release, err := p.responderAdmission.Acquire()
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+
+	return release, nil
 }
 
 // createV2Ciphers constructs the packet-length and packet encryption ciphers.
@@ -347,16 +390,12 @@ func (p *Peer) InitiateV2Handshake(garbageLen int) error {
 func (p *Peer) RespondV2Handshake(garbageLen int) error {
 	log.Debugf("Responding to v2 handshake (garbageLen=%d)", garbageLen)
 
-	var err error
-	p.privkeyOurs, p.ellswiftOurs, err = ellswift.EllswiftCreate()
+	release, err := p.acquireResponderAdmission()
 	if err != nil {
-		log.Errorf("Failed to create ellswift keypair: %v", err)
 		return err
 	}
 
-	log.Tracef("Created ellswift keypair, pubkey=%x", p.ellswiftOurs)
-
-	data, err := p.generateKeyAndGarbage(garbageLen)
+	data, err := p.generateResponderKey(garbageLen, release)
 	if err != nil {
 		return err
 	}
@@ -366,6 +405,21 @@ func (p *Peer) RespondV2Handshake(garbageLen int) error {
 	p.Send(data)
 
 	return nil
+}
+
+func (p *Peer) generateResponderKey(garbageLen int, release func()) ([]byte, error) {
+	defer release()
+
+	var err error
+	p.privkeyOurs, p.ellswiftOurs, err = ellswift.EllswiftCreate()
+	if err != nil {
+		log.Errorf("Failed to create ellswift keypair: %v", err)
+		return nil, err
+	}
+
+	log.Tracef("Created ellswift keypair, pubkey=%x", p.ellswiftOurs)
+
+	return p.generateKeyAndGarbage(garbageLen)
 }
 
 // generateKeyAndGarbage returns a byte slice containing our ellswift-encoded
@@ -425,12 +479,21 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 
 	log.Debug("Calculating ECDH shared secret")
 
+	release := func() {}
+	if !initiating {
+		release, err = p.acquireResponderAdmission()
+		if err != nil {
+			return err
+		}
+	}
+
 	// Calculate the shared secret to be used in creating the packet
 	// ciphers.
 	ecdhSecret, err := ellswift.V2Ecdh(
 		p.privkeyOurs, ellswiftTheirs, p.ellswiftOurs, initiating,
 	)
 	if err != nil {
+		release()
 		log.Errorf("Failed to calculate ECDH shared secret: %v", err)
 		return err
 	}
@@ -438,6 +501,7 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 	log.Tracef("Calculated ECDH shared secret: %x", ecdhSecret)
 
 	err = p.createV2Ciphers(ecdhSecret[:], initiating, prlnet)
+	release()
 	if err != nil {
 		return err
 	}

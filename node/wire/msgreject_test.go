@@ -51,7 +51,7 @@ func TestRejectLatest(t *testing.T) {
 	require.Equal(t, rejCode, msg.Code)
 	require.Equal(t, rejReason, msg.Reason)
 	require.Equal(t, "reject", msg.Command())
-	require.Equal(t, uint32(MaxMessagePayload), msg.MaxPayloadLength(pver))
+	require.Equal(t, uint32(MaxProtocolMessageLength), msg.MaxPayloadLength(pver))
 
 	// Test encode with latest protocol version.
 	var buf bytes.Buffer

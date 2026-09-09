@@ -7,6 +7,7 @@ package wire
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"reflect"
@@ -203,7 +204,7 @@ func TestReadMessageWireErrors(t *testing.T) {
 
 	// Wire encoded bytes for a message that exceeds max overall message
 	// length.
-	mpl := uint32(MaxMessagePayload)
+	mpl := uint32(MaxProtocolMessageLength)
 	exceedMaxPayloadBytes := makeHeader(prlnet, "getaddr", mpl+1, 0)
 
 	// Wire encoded bytes for a command which is invalid utf-8.
@@ -378,6 +379,68 @@ func TestReadMessageWireErrors(t *testing.T) {
 	}
 }
 
+func TestReadMessageTrailingBytes(t *testing.T) {
+	t.Parallel()
+
+	pver := ProtocolVersion
+	prlnet := MainNet
+
+	me := &NetAddress{
+		Timestamp: time.Time{},
+		IP:        net.ParseIP("127.0.0.1"),
+		Port:      8333,
+	}
+	you := &NetAddress{
+		Timestamp: time.Time{},
+		IP:        net.ParseIP("192.168.0.1"),
+		Port:      8333,
+	}
+	verMsg := NewMsgVersion(me, you, 1, 0)
+
+	var payloadBuf bytes.Buffer
+	verMsg.PrlEncode(&payloadBuf, pver, BaseEncoding)
+	cleanPayload := payloadBuf.Bytes()
+
+	garbage := []byte{0xde, 0xad, 0xbe, 0xef}
+	dirtyPayload := append(cleanPayload, garbage...)
+
+	checksum := chainhash.DoubleHashB(dirtyPayload)
+	hdr := makeHeader(prlnet, CmdVersion, uint32(len(dirtyPayload)), 0)
+	copy(hdr[20:], checksum[:4])
+	wireBytes := append(hdr, dirtyPayload...)
+
+	r := bytes.NewReader(wireBytes)
+	_, _, _, err := ReadMessageN(r, pver, prlnet)
+	if err == nil {
+		t.Fatal("expected error for message with trailing bytes")
+	}
+
+	var msgErr *MessageError
+	if !errors.As(err, &msgErr) {
+		t.Fatalf("expected MessageError, got: %T (%v)", err, err)
+	}
+}
+
+func TestReadV2MessageTrailingBytes(t *testing.T) {
+	payload := []byte{
+		v2Messages[CmdInv],
+		0x00,
+		0xaa,
+	}
+
+	_, _, err := ReadV2MessageN(
+		payload, ProtocolVersion, BaseEncoding,
+	)
+	if err == nil {
+		t.Fatal("expected error for v2 message with trailing bytes")
+	}
+
+	var msgErr *MessageError
+	if !errors.As(err, &msgErr) {
+		t.Fatalf("expected MessageError, got: %T (%v)", err, err)
+	}
+}
+
 // TestWriteMessageWireErrors performs negative tests against wire encoding from
 // concrete messages to confirm error paths work correctly.
 func TestWriteMessageWireErrors(t *testing.T) {
@@ -392,7 +455,7 @@ func TestWriteMessageWireErrors(t *testing.T) {
 	encodeErrMsg := &fakeMessage{forceEncodeErr: true}
 
 	// Fake message that has payload which exceeds max overall message size.
-	exceedOverallPayload := make([]byte, MaxMessagePayload+1)
+	exceedOverallPayload := make([]byte, MaxProtocolMessageLength+1)
 	exceedOverallPayloadErrMsg := &fakeMessage{payload: exceedOverallPayload}
 
 	// Fake message that has payload which exceeds max allowed per message.

@@ -283,3 +283,41 @@ func TestReadNetAddressV2(t *testing.T) {
 		}
 	}
 }
+
+func TestNetAddressV2FromBytesIPv4Mapped(t *testing.T) {
+	t.Parallel()
+
+	mapped := []byte{
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x01,
+	}
+	na := NetAddressV2FromBytes(time.Now(), SFNodeNetwork, mapped, 8333)
+	if na.Addr.Network() != string(ipv4) {
+		t.Fatalf("expected ipv4 network, got %q", na.Addr.Network())
+	}
+	if na.Addr.String() != "127.0.0.1" {
+		t.Fatalf("expected 127.0.0.1, got %q", na.Addr.String())
+	}
+}
+
+func TestReadNetAddressV2SkipsIPv4Mapped(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	_ = writeElement(&buf, uint32(0))
+	_ = WriteVarInt(&buf, 0, 0)
+	_ = writeElement(&buf, uint8(ipv6))
+	_ = WriteVarInt(&buf, 0, ipv6Size)
+	mapped := [16]byte{
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x01,
+	}
+	_ = writeElement(&buf, mapped)
+	_ = writeElement(&buf, uint16(8333))
+
+	na := &NetAddressV2{}
+	err := readNetAddressV2(bytes.NewReader(buf.Bytes()), 0, na)
+	if err != ErrSkippedNetworkID {
+		t.Fatalf("expected ErrSkippedNetworkID, got %v", err)
+	}
+}

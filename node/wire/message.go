@@ -23,8 +23,16 @@ const MessageHeaderSize = 24
 const CommandSize = 12
 
 // MaxMessagePayload is the maximum bytes a message can be regardless of other
-// individual limits imposed by messages themselves.
-const MaxMessagePayload = (1024 * 1024 * 32) // 32MB
+// individual limits imposed by messages themselves. This is used as a
+// serialization bound for all contexts (disk, RPC, network, etc.).
+const MaxMessagePayload = (1024 * 1024 * 32) // 32MiB
+
+// MaxProtocolMessageLength is the maximum length of an incoming/outgoing p2p
+// protocol message. This is separate from MaxMessagePayload which is used as a
+// general serialization bound. Pearl headers messages carry certificates, so
+// this must be at least MsgHeaders.MaxPayloadLength (about 6.5 MiB). Bitcoin
+// Core's equivalent is ~4MB.
+const MaxProtocolMessageLength = 8_000_000
 
 // Commands used in Pearl message headers which describe the type of message.
 const (
@@ -371,11 +379,11 @@ func WriteV2MessageN(w io.Writer, msg Message, pver uint32,
 	payload := bw.Bytes()
 	lenp := len(payload)
 
-	// Enforce maximum overall message payload.
-	if lenp > MaxMessagePayload {
+	// Enforce maximum protocol message payload.
+	if lenp > MaxProtocolMessageLength {
 		str := fmt.Sprintf("message payload is too large - encoded "+
 			"%d bytes, but maximum message payload is %d bytes",
-			lenp, MaxMessagePayload)
+			lenp, MaxProtocolMessageLength)
 		return totalBytes, messageError("WriteMessage", str)
 	}
 
@@ -426,11 +434,11 @@ func WriteMessageWithEncodingN(w io.Writer, msg Message, pver uint32,
 	payload := bw.Bytes()
 	lenp := len(payload)
 
-	// Enforce maximum overall message payload.
-	if lenp > MaxMessagePayload {
+	// Enforce maximum protocol message payload.
+	if lenp > MaxProtocolMessageLength {
 		str := fmt.Sprintf("message payload is too large - encoded "+
 			"%d bytes, but maximum message payload is %d bytes",
-			lenp, MaxMessagePayload)
+			lenp, MaxProtocolMessageLength)
 		return totalBytes, messageError("WriteMessage", str)
 	}
 
@@ -510,15 +518,31 @@ func ReadV2MessageN(plaintext []byte, pver uint32, enc MessageEncoding) (
 		return nil, nil, err
 	}
 
+	if len(plaintext) > MaxProtocolMessageLength {
+		str := fmt.Sprintf("message payload is too large - "+
+			"%d bytes, but max message payload is %d bytes",
+			len(plaintext), MaxProtocolMessageLength)
+		return nil, nil, messageError("ReadV2MessageN", str)
+	}
+
 	mpl := msg.MaxPayloadLength(pver)
 	if len(plaintext) > int(mpl) {
-		return nil, nil, fmt.Errorf("payload exceeds max length")
+		str := fmt.Sprintf("payload exceeds max length - "+
+			"%d bytes, but max payload size for messages of "+
+			"type [%v] is %v.", len(plaintext), msgCmd, mpl)
+		return nil, nil, messageError("ReadV2MessageN", str)
 	}
 
 	buf := bytes.NewBuffer(plaintext)
 	err = msg.PrlDecode(buf, pver, enc)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if buf.Len() > 0 {
+		str := fmt.Sprintf("message payload has %d extra bytes "+
+			"after decode", buf.Len())
+		return nil, nil, messageError("ReadV2MessageN", str)
 	}
 
 	return msg, plaintext, nil
@@ -552,11 +576,11 @@ func readMessageWithEncodingNInternal(r io.Reader, pver uint32,
 	hdr *messageHeader, prlnet PearlNet, enc MessageEncoding,
 	totalBytes int) (int, Message, []byte, error) {
 
-	// Enforce maximum message payload.
-	if hdr.length > MaxMessagePayload {
+	// Enforce maximum protocol message payload.
+	if hdr.length > MaxProtocolMessageLength {
 		str := fmt.Sprintf("message payload is too large - header "+
 			"indicates %d bytes, but max message payload is %d "+
-			"bytes.", hdr.length, MaxMessagePayload)
+			"bytes.", hdr.length, MaxProtocolMessageLength)
 		return totalBytes, nil, nil, messageError("ReadMessage", str)
 
 	}
@@ -620,6 +644,12 @@ func readMessageWithEncodingNInternal(r io.Reader, pver uint32,
 	err = msg.PrlDecode(pr, pver, enc)
 	if err != nil {
 		return totalBytes, nil, nil, err
+	}
+
+	if pr.Len() > 0 {
+		str := fmt.Sprintf("message payload has %d extra bytes "+
+			"after decode", pr.Len())
+		return totalBytes, nil, nil, messageError("ReadMessage", str)
 	}
 
 	return totalBytes, msg, payload, nil

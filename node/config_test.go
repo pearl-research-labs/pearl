@@ -13,6 +13,30 @@ var (
 	rpcpassRegexp = regexp.MustCompile("(?m)^rpcpass=.+$")
 )
 
+func TestValidateMaxPeers(t *testing.T) {
+	tests := []struct {
+		name     string
+		maxPeers int
+		wantErr  bool
+	}{
+		{name: "negative", maxPeers: -1, wantErr: true},
+		{name: "zero", wantErr: true},
+		{name: "positive", maxPeers: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateMaxPeers(test.maxPeers)
+			if test.wantErr && err == nil {
+				t.Fatal("expected error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestCreateDefaultConfigFile(t *testing.T) {
 	// find out where the sample config lives
 	_, path, _, ok := runtime.Caller(0)

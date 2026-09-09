@@ -91,7 +91,10 @@ func ParseSignature(sig []byte) (*Signature, error) {
 		return nil, signatureError(ecdsa_schnorr.ErrSigRTooBig, str)
 	}
 	var s btcec.ModNScalar
-	s.SetByteSlice(sig[32:64])
+	if overflow := s.SetByteSlice(sig[32:64]); overflow {
+		str := "invalid signature: s >= group order"
+		return nil, signatureError(ecdsa_schnorr.ErrSigSTooBig, str)
+	}
 
 	// Return the signature.
 	return NewSignature(&r, &s), nil
@@ -274,10 +277,9 @@ func schnorrSign(privKey, nonce *btcec.ModNScalar, pubKey *btcec.PublicKey, hash
 	// 14. If Verify(bytes(P), m, sig) fails, abort.
 	// 15. return sig.
 	//
-	// Note that the set of functional options passed in may modify the
-	// above algorithm. Namely if CustomNonce is used, then steps 6-8 are
-	// replaced with a process that generates the nonce using rfc6979. If
-	// FastSign is passed, then we skip set 14.
+	// CustomNonce keeps BIP-340 aux-rand nonce derivation; the default
+	// replaces steps 6-8 with RFC6979 so Sign stays deterministic unless
+	// the caller opts in.
 
 	// NOTE: Steps 1-9 are performed by the caller.
 
@@ -423,10 +425,9 @@ func Sign(privKey *btcec.PrivateKey, hash []byte,
 	// 14. If Verify(bytes(P), m, sig) fails, abort.
 	// 15. return sig.
 	//
-	// Note that the set of functional options passed in may modify the
-	// above algorithm. Namely if CustomNonce is used, then steps 6-8 are
-	// replaced with a process that generates the nonce using rfc6979. If
-	// FastSign is passed, then we skip set 14.
+	// CustomNonce keeps BIP-340 aux-rand nonce derivation; the default
+	// replaces steps 6-8 with RFC6979 so Sign stays deterministic unless
+	// the caller opts in.
 
 	// Step 1.
 	//

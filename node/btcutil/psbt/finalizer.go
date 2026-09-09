@@ -40,6 +40,9 @@ func isFinalizableWitnessInput(pInput *PInput) bool {
 	// For each of the script spend signatures we need a
 	// corresponding tap script leaf with the control block.
 	for _, sig := range pInput.TaprootScriptSpendSig {
+		if sig == nil {
+			return false
+		}
 		_, err := FindLeafScript(pInput, sig.LeafHash)
 		if err != nil {
 			return false
@@ -164,6 +167,13 @@ func finalizeTaprootInput(p *Packet, inIndex int) error {
 		pInput            = &p.Inputs[inIndex]
 	)
 
+	for idx, scriptSpendSig := range pInput.TaprootScriptSpendSig {
+		if scriptSpendSig == nil {
+			return fmt.Errorf("nil taproot script spend signature "+
+				"at index %d: %w", idx, ErrInvalidPsbtFormat)
+		}
+	}
+
 	// What spend path did we take?
 	switch {
 	// Key spend path.
@@ -195,27 +205,27 @@ func finalizeTaprootInput(p *Packet, inIndex int) error {
 		targetLeafHash := pInput.TaprootScriptSpendSig[0].LeafHash
 		leafScript, err := FindLeafScript(pInput, targetLeafHash)
 		if err != nil {
-			return fmt.Errorf("control block for script spend " +
-				"signature not found")
+			return fmt.Errorf("control block for script spend "+
+				"signature not found: %w", err)
 		}
 
-		// The witness stack will contain all signatures, followed by
-		// the script itself and then the control block.
+		// Make sure that all script spend signatures reference the same
+		// target leaf. Signing multiple possible execution paths at the
+		// same time is currently not supported by this library.
 		for idx, scriptSpendSig := range pInput.TaprootScriptSpendSig {
-			// Make sure that if there are indeed multiple
-			// signatures, they all reference the same leaf hash.
 			if !bytes.Equal(scriptSpendSig.LeafHash, targetLeafHash) {
 				return fmt.Errorf("script spend signature %d "+
 					"references different target leaf "+
 					"hash than first signature; only one "+
 					"script path is supported", idx)
 			}
+		}
 
-			sig := append([]byte{}, scriptSpendSig.Signature...)
-			if scriptSpendSig.SigHash != txscript.SigHashDefault {
-				sig = append(sig, byte(scriptSpendSig.SigHash))
-			}
-			witnessStack = append(witnessStack, sig)
+		witnessStack, err = taprootScriptSpendWitnessStack(
+			leafScript.Script, pInput.TaprootScriptSpendSig,
+		)
+		if err != nil {
+			return err
 		}
 
 		// Complete the witness stack with the executed script and the

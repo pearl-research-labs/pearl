@@ -6,7 +6,6 @@ package psbt
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 
@@ -143,17 +142,53 @@ func getKey(r io.Reader) (int, []byte, error) {
 	return int(keyType), keyData, nil
 }
 
-// readTxOut is a limited version of wire.ReadTxOut, because the latter is not
-// exported.
-func readTxOut(txout []byte) (*wire.TxOut, error) {
-	if len(txout) < 10 {
-		return nil, ErrInvalidPsbtFormat
+func assertFullyConsumed(r *bytes.Reader) error {
+	if r.Len() > 0 {
+		return ErrInvalidPsbtFormat
 	}
 
-	valueSer := binary.LittleEndian.Uint64(txout[:8])
-	scriptPubKey := txout[9:]
+	return nil
+}
 
-	return wire.NewTxOut(int64(valueSer), scriptPubKey), nil
+func readTxOut(txout []byte) (*wire.TxOut, error) {
+	txOut := &wire.TxOut{}
+	reader := bytes.NewReader(txout)
+
+	if err := wire.ReadTxOut(reader, 0, 0, txOut); err != nil {
+		return nil, err
+	}
+	if err := assertFullyConsumed(reader); err != nil {
+		return nil, err
+	}
+
+	// ReadTxOut may keep PkScript in a large script slab; compact it
+	// so a tiny witness script does not retain the slab.
+	script := make([]byte, len(txOut.PkScript))
+	copy(script, txOut.PkScript)
+	txOut.PkScript = script
+
+	return txOut, nil
+}
+
+func readTransaction(txBytes []byte, noWitness bool) (*wire.MsgTx, error) {
+	tx := wire.NewMsgTx(2)
+	reader := bytes.NewReader(txBytes)
+
+	var err error
+	if noWitness {
+		err = tx.DeserializeNoWitness(reader)
+	} else {
+		err = tx.Deserialize(reader)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err := assertFullyConsumed(reader); err != nil {
+		return nil, err
+	}
+
+	return tx, nil
 }
 
 // SumUtxoInputValues tries to extract the sum of all inputs specified in the
@@ -329,7 +364,15 @@ func NewFromSignedTx(tx *wire.MsgTx) (*Packet, [][]byte,
 func FindLeafScript(pInput *PInput,
 	targetLeafHash []byte) (*TaprootTapLeafScript, error) {
 
-	for _, leaf := range pInput.TaprootLeafScript {
+	if pInput == nil {
+		return nil, fmt.Errorf("nil PSBT input: %w", ErrInvalidPsbtFormat)
+	}
+
+	for idx, leaf := range pInput.TaprootLeafScript {
+		if leaf == nil {
+			return nil, fmt.Errorf("nil taproot leaf script at index "+
+				"%d: %w", idx, ErrInvalidPsbtFormat)
+		}
 		leafHash := txscript.TapLeaf{
 			LeafVersion: leaf.LeafVersion,
 			Script:      leaf.Script,

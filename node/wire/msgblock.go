@@ -310,10 +310,10 @@ func (msg *MsgBlock) Command() string {
 // MaxPayloadLength returns the maximum length the payload can be for the
 // receiver.  This is part of the Message interface implementation.
 func (msg *MsgBlock) MaxPayloadLength(pver uint32) uint32 {
-	// Block header at 80 bytes + Proof of Work + transaction count + max transactions
-	// which can vary up to the MaxBlockPayload (including the block header
-	// and transaction count).
-	return MaxBlockPayload
+	// Certificate + header + transactions. MaxBlockPayload covers the
+	// serialized txs at the 1M-vbyte consensus cap; the certificate is
+	// excluded from vsize and must be accounted for separately.
+	return MaxBlockPayload + CertificateMaxSize
 }
 
 // BlockHash computes the block identifier hash for this block.

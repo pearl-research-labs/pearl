@@ -11,13 +11,14 @@ import (
 
 // cloneTreapNode returns a shallow copy of the passed node.
 func cloneTreapNode(node *treapNode) *treapNode {
-	return &treapNode{
-		key:      node.key,
-		value:    node.value,
-		priority: node.priority,
-		left:     node.left,
-		right:    node.right,
-	}
+	n := treapNodePool.Get().(*treapNode)
+	n.key = node.key
+	n.value = node.value
+	n.priority = node.priority
+	n.left = node.left
+	n.right = node.right
+
+	return n
 }
 
 // Immutable represents a treap data structure which is used to hold ordered
@@ -104,8 +105,49 @@ func (t *Immutable) Get(key []byte) []byte {
 	return nil
 }
 
+// KVPair is a key/value pair to insert into an immutable treap.
+type KVPair struct {
+	Key   []byte
+	Value []byte
+}
+
 // Put inserts the passed key/value pair.
 func (t *Immutable) Put(key, value []byte) *Immutable {
+	return t.PutPairs(KVPair{Key: key, Value: value})
+}
+
+// PutPairs inserts the passed key/value pairs. Intermediate nodes from each
+// insert are recycled so a bulk commit does not pin a discarded snapshot per key.
+func (t *Immutable) PutPairs(kvPairs ...KVPair) *Immutable {
+	treap := t
+	var prevTreapNodes [staticDepth]*treapNode
+
+	for _, kvPair := range kvPairs {
+		newTreap, newTreapNodes := treap.put(kvPair.Key, kvPair.Value)
+
+		for _, node := range prevTreapNodes {
+			if node == nil {
+				break
+			}
+
+			// Recycle only nodes unreachable from the newest snapshot;
+			// shared ancestors are still live for concurrent readers.
+			got := newTreap.get(node.key)
+			if got == node {
+				continue
+			}
+
+			node.recycle()
+		}
+
+		treap = newTreap
+		prevTreapNodes = newTreapNodes
+	}
+
+	return treap
+}
+
+func (t *Immutable) put(key, value []byte) (*Immutable, [staticDepth]*treapNode) {
 	// Use an empty byte slice for the value when none was provided.  This
 	// ultimately allows key existence to be determined from the value since
 	// an empty byte slice is distinguishable from nil.
@@ -113,10 +155,16 @@ func (t *Immutable) Put(key, value []byte) *Immutable {
 		value = emptySlice
 	}
 
+	var (
+		recycle             [staticDepth]*treapNode
+		currentRecycleIndex int
+	)
+
 	// The node is the root of the tree if there isn't already one.
 	if t.root == nil {
 		root := newTreapNode(key, value, rand.Int())
-		return newImmutable(root, 1, nodeSize(root))
+		recycle[currentRecycleIndex] = root
+		return newImmutable(root, 1, nodeSize(root)), recycle
 	}
 
 	// Find the binary tree insertion point and construct a replaced list of
@@ -132,6 +180,10 @@ func (t *Immutable) Put(key, value []byte) *Immutable {
 	for node := t.root; node != nil; {
 		// Clone the node and link its parent to it if needed.
 		nodeCopy := cloneTreapNode(node)
+		if currentRecycleIndex < staticDepth {
+			recycle[currentRecycleIndex] = nodeCopy
+			currentRecycleIndex++
+		}
 		if oldParent := parents.At(0); oldParent != nil {
 			if oldParent.left == node {
 				oldParent.left = nodeCopy
@@ -161,11 +213,15 @@ func (t *Immutable) Put(key, value []byte) *Immutable {
 		newRoot := parents.At(parents.Len() - 1)
 		newTotalSize := t.totalSize - uint64(len(node.value)) +
 			uint64(len(value))
-		return newImmutable(newRoot, t.count, newTotalSize)
+		return newImmutable(newRoot, t.count, newTotalSize), recycle
 	}
 
 	// Link the new node into the binary tree in the correct position.
 	node := newTreapNode(key, value, rand.Int())
+	if currentRecycleIndex < staticDepth {
+		recycle[currentRecycleIndex] = node
+		currentRecycleIndex++
+	}
 	parent := parents.At(0)
 	if compareResult < 0 {
 		parent.left = node
@@ -205,7 +261,7 @@ func (t *Immutable) Put(key, value []byte) *Immutable {
 		}
 	}
 
-	return newImmutable(newRoot, t.count+1, t.totalSize+nodeSize(node))
+	return newImmutable(newRoot, t.count+1, t.totalSize+nodeSize(node)), recycle
 }
 
 // Delete removes the passed key from the treap and returns the resulting treap

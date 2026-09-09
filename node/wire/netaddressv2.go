@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
@@ -67,6 +68,14 @@ func isOnionCatTor(ip net.IP) bool {
 		Mask: net.CIDRMask(48, 128),
 	}
 	return onionCatNet.Contains(ip)
+}
+
+// ipv4MappedPrefix is the prefix for IPv4-mapped IPv6 addresses (::ffff:0:0/96)
+// as defined by RFC 4291.
+var ipv4MappedPrefix = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
+
+func isIPv4Mapped(addr []byte) bool {
+	return bytes.HasPrefix(addr, ipv4MappedPrefix)
 }
 
 // NetAddressV2 defines information about a peer on the network including the
@@ -166,6 +175,17 @@ func NetAddressV2FromBytes(timestamp time.Time, services ServiceFlag,
 			addr := &torv2Addr{}
 			addr.netID = torv2
 			copy(addr.addr[:], addrBytes[6:])
+			netAddr = addr
+			break
+		}
+
+		// IPv4-mapped IPv6 addresses (::ffff:0:0/96) should use the
+		// IPv4 networkID. Go's net.IP commonly stores IPv4 addresses
+		// in this 16-byte form, so extract the 4-byte IPv4 address.
+		if isIPv4Mapped(addrBytes) {
+			addr := &ipv4Addr{}
+			addr.netID = ipv4
+			copy(addr.addr[:], addrBytes[12:])
 			netAddr = addr
 			break
 		}
@@ -334,6 +354,10 @@ func readNetAddressV2(r io.Reader, pver uint32, na *NetAddressV2) error {
 		// BIP-155 says to ignore OnionCat addresses in addrv2
 		// messages.
 		if isOnionCatTor(addr.addr[:]) {
+			return ErrSkippedNetworkID
+		}
+
+		if isIPv4Mapped(addr.addr[:]) {
 			return ErrSkippedNetworkID
 		}
 	case torv2:

@@ -32,6 +32,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/connmgr"
 	"github.com/pearl-research-labs/pearl/node/database"
+	"github.com/pearl-research-labs/pearl/node/internal/inbound"
 	"github.com/pearl-research-labs/pearl/node/mempool"
 	"github.com/pearl-research-labs/pearl/node/mining"
 	"github.com/pearl-research-labs/pearl/node/mining/cpuminer"
@@ -60,6 +61,46 @@ const (
 	// number of retries such that there is a retry backoff.
 	connectionRetryInterval = time.Second * 5
 )
+
+func targetOutboundPeers(
+	maxPeers, permanentPeers int, automaticOutbound bool,
+) int {
+
+	if !automaticOutbound || permanentPeers >= maxPeers {
+		return 0
+	}
+
+	available := maxPeers - permanentPeers
+	if available < defaultTargetOutbound {
+		return available
+	}
+
+	return defaultTargetOutbound
+}
+
+func reservedOutboundPeers(
+	maxPeers, targetOutbound, permanentPeers int, automaticOutbound bool,
+) int {
+
+	reserved := permanentPeers
+	if automaticOutbound {
+		reserved += targetOutbound
+	}
+
+	if reserved > maxPeers {
+		return maxPeers
+	}
+
+	return reserved
+}
+
+func maxInboundPeers(maxPeers, reservedOutbound int) uint32 {
+	if maxPeers <= reservedOutbound {
+		return 0
+	}
+
+	return uint32(maxPeers - reservedOutbound)
+}
 
 var (
 	// userAgentName is the user agent name and is used to help identify
@@ -237,6 +278,7 @@ type server struct {
 	txMemPool            *mempool.TxPool
 	cpuMiner             *cpuminer.CPUMiner
 	modifyRebroadcastInv chan interface{}
+	inboundAdmission     *inbound.Admission
 	peerLifecycle        chan peerLifecycleEvent
 	banPeers             chan *serverPeer
 	query                chan interface{}
@@ -297,8 +339,20 @@ type serverPeer struct {
 	knownAddresses lru.Cache
 	banScore       connmgr.DynamicBanScore
 	quit           chan struct{}
-	// Closed when OnVerAck fires.
-	verAckCh chan struct{}
+
+	// Closed by verAckOnce when OnVerAck fires.
+	verAckCh   chan struct{}
+	verAckOnce sync.Once
+
+	releaseInboundHandshake     func()
+	releaseInboundHandshakeOnce sync.Once
+
+	// peerAdded is set by peerLifecycleHandler after a peerAdd event
+	// has been enqueued. handleDonePeerMsg gates sync-manager DonePeer
+	// and orphan eviction on this so those side effects only fire for
+	// peers that were actually registered.
+	peerAdded atomic.Bool
+
 	// The following chans are used to sync blockmanager and server.
 	txProcessed    chan struct{}
 	blockProcessed chan error
@@ -317,6 +371,14 @@ func newServerPeer(s *server, isPersistent bool) *serverPeer {
 		txProcessed:    make(chan struct{}, 1),
 		blockProcessed: make(chan error, 1),
 	}
+}
+
+func (sp *serverPeer) releaseHandshake() {
+	sp.releaseInboundHandshakeOnce.Do(func() {
+		if sp.releaseInboundHandshake != nil {
+			sp.releaseInboundHandshake()
+		}
+	})
 }
 
 // newestBlock returns the current best block hash and height using the format
@@ -533,13 +595,10 @@ func (sp *serverPeer) OnVersion(_ *peer.Peer, msg *wire.MsgVersion) *wire.MsgRej
 // It signals the peer's lifecycle handler that the handshake is
 // complete so it can register the peer with the server.
 func (sp *serverPeer) OnVerAck(_ *peer.Peer, _ *wire.MsgVerAck) {
-	select {
-	case <-sp.verAckCh:
-		peerLog.Errorf("OnVerAck called more than once "+
-			"for peer %v", sp)
-	default:
+	sp.verAckOnce.Do(func() {
+		sp.releaseHandshake()
 		close(sp.verAckCh)
-	}
+	})
 }
 
 // OnMemPool is invoked when a peer receives a mempool wire message.
@@ -1947,7 +2006,7 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 	// notification is serialized with NewPeer calls through the
 	// peerHandler goroutine, guaranteeing that the sync manager
 	// always sees NewPeer before DonePeer for a given peer.
-	if sp.VerAckReceived() {
+	if sp.peerAdded.Load() {
 		s.syncManager.DonePeer(sp.Peer)
 
 		numEvicted := s.txMemPool.RemoveOrphansByTag(mempool.Tag(sp.ID()))
@@ -2272,10 +2331,43 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 // connection is established.  It initializes a new inbound server peer
 // instance, associates it with the connection, and starts a goroutine to wait
 // for disconnection.
+func (s *server) acquireInboundPeerAdmission(
+	remoteAddr net.Addr,
+) (bool, func(), *inbound.V2Admission, error) {
+
+	whitelisted := isWhitelisted(remoteAddr)
+	if s.inboundAdmission == nil {
+		return whitelisted, nil, nil, nil
+	}
+
+	releaseHandshake, err := s.inboundAdmission.AcquireSource(
+		remoteAddr, false,
+	)
+	if err != nil {
+		return whitelisted, nil, nil, err
+	}
+
+	v2Admission := s.inboundAdmission.BindV2(remoteAddr, false)
+	return whitelisted, releaseHandshake, v2Admission, nil
+}
+
 func (s *server) inboundPeerConnected(conn net.Conn) {
+	remoteAddr := conn.RemoteAddr()
+	whitelisted, releaseHandshake, v2Admission, err :=
+		s.acquireInboundPeerAdmission(remoteAddr)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+
 	sp := newServerPeer(s, false)
-	sp.isWhitelisted = isWhitelisted(conn.RemoteAddr())
-	sp.Peer = peer.NewInboundPeer(newPeerConfig(sp))
+	sp.isWhitelisted = whitelisted
+	sp.releaseInboundHandshake = releaseHandshake
+
+	peerCfg := newPeerConfig(sp)
+	peerCfg.V2HandshakeAdmission = v2Admission
+
+	sp.Peer = peer.NewInboundPeer(peerCfg)
 	sp.AssociateConnection(conn)
 	go s.peerLifecycleHandler(sp)
 }
@@ -2327,10 +2419,12 @@ func (s *server) peerLifecycleHandler(sp *serverPeer) {
 		s.peerLifecycle <- peerLifecycleEvent{
 			action: peerAdd, sp: sp,
 		}
+		sp.peerAdded.Store(true)
 
-	case <-sp.Peer.Done():
+	case <-sp.Done():
 		// Disconnected before verack; no peerAdd needed.
 	}
+	sp.releaseHandshake()
 
 	// Wait for full disconnect (may already be done).
 	sp.WaitForDisconnect()
@@ -2881,8 +2975,12 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	}
 
 	s := server{
-		chainParams:          chainParams,
-		addrManager:          amgr,
+		chainParams:      chainParams,
+		addrManager:      amgr,
+		inboundAdmission: inbound.New(),
+		// Buffer sized for two events (add+done) per peer so a
+		// lifecycle handler cannot block on send while peerHandler
+		// is busy.
 		peerLifecycle:        make(chan peerLifecycleEvent, cfg.MaxPeers*2),
 		banPeers:             make(chan *serverPeer, cfg.MaxPeers),
 		query:                make(chan interface{}),
@@ -3110,13 +3208,30 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	}
 
 	// Create a connection manager.
-	targetOutbound := defaultTargetOutbound
-	if cfg.MaxPeers < targetOutbound {
-		targetOutbound = cfg.MaxPeers
+	permanentPeerCount := len(cfg.ConnectPeers)
+	if permanentPeerCount == 0 {
+		permanentPeerCount = len(cfg.AddPeers)
+	}
+	automaticOutbound := newAddressFunc != nil
+	targetOutbound := targetOutboundPeers(
+		cfg.MaxPeers, permanentPeerCount, automaticOutbound,
+	)
+	if targetOutbound == 0 {
+		newAddressFunc = nil
+	}
+	reservedOutbound := reservedOutboundPeers(
+		cfg.MaxPeers, targetOutbound, permanentPeerCount,
+		automaticOutbound,
+	)
+	maxInbound := maxInboundPeers(cfg.MaxPeers, reservedOutbound)
+	if maxInbound == 0 && len(listeners) > 0 {
+		srvrLog.Infof("Inbound connections disabled: maxpeers=%d, "+
+			"reserved-outbound=%d", cfg.MaxPeers, reservedOutbound)
 	}
 	cmgr, err := connmgr.New(&connmgr.Config{
 		Listeners:      listeners,
 		OnAccept:       s.inboundPeerConnected,
+		MaxInbound:     &maxInbound,
 		RetryDuration:  connectionRetryInterval,
 		TargetOutbound: uint32(targetOutbound),
 		Dial:           pearldDial,

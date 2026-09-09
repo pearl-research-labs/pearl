@@ -766,65 +766,61 @@ out:
 // handleSendPostMessage handles performing the passed HTTP request, reading the
 // result, unmarshalling it, and delivering the unmarshalled result to the
 // provided response channel.
-func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
-	var (
-		lastErr      error
-		backoff      time.Duration
-		httpResponse *http.Response
-	)
-
-	httpURL, err := c.config.httpURL()
-	if err != nil {
-		jReq.responseChan <- &Response{
-			err: fmt.Errorf("failed to parse address %v", err),
-		}
-		return
-	}
-
+func (c *Client) handleSendPostMessage(ctx context.Context, jReq *jsonRequest) {
 	tries := c.config.HTTPPostTries
 	if tries < 1 {
 		tries = 10
 	}
+	c.sendPostRequestAndRespond(ctx, jReq, tries)
+}
+
+func sendPostRequestWithRetry(ctx context.Context, jReq *jsonRequest,
+	tries int, httpClient *http.Client, config *ConnConfig,
+	batch bool) ([]byte, error) {
+
+	var (
+		lastErr      error
+		backoff      time.Duration
+		httpResponse *http.Response
+		err          error
+	)
+
+	httpURL, err := config.httpURL()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse address %v", err)
+	}
+
+retryloop:
 	for i := 0; i < tries; i++ {
 		var httpReq *http.Request
 
 		bodyReader := bytes.NewReader(jReq.marshalledJSON)
-		httpReq, err = http.NewRequest("POST", httpURL, bodyReader)
+		httpReq, err = http.NewRequestWithContext(
+			ctx, "POST", httpURL, bodyReader,
+		)
 		if err != nil {
-			jReq.responseChan <- &Response{result: nil, err: err}
-			return
+			return nil, err
 		}
 		httpReq.Close = true
 		httpReq.Header.Set("Content-Type", "application/json")
-		for key, value := range c.config.ExtraHeaders {
+		for key, value := range config.ExtraHeaders {
 			httpReq.Header.Set(key, value)
 		}
 
-		// Configure basic access authorization.  A distinct variable
-		// avoids shadowing the outer err: a := here would make the
-		// subsequent Do() assignment also write to a loop-scoped err,
-		// silently losing the transport error from the post-loop check.
-		user, pass, authErr := c.config.getAuth()
+		user, pass, authErr := config.getAuth()
 		if authErr != nil {
-			jReq.responseChan <- &Response{result: nil, err: authErr}
-			return
+			return nil, authErr
 		}
 		httpReq.SetBasicAuth(user, pass)
 
-		httpResponse, err = c.httpClient.Do(httpReq)
+		httpResponse, err = httpClient.Do(httpReq)
 
-		// Quit the retry loop on success or if we can't retry anymore.
 		if err == nil || i == tries-1 {
 			break
 		}
 
-		// Save the last error for the case where we backoff further,
-		// retry and get an invalid response but no error. If this
-		// happens the saved last error will be used to enrich the error
-		// message that we pass back to the caller.
 		lastErr = err
 
-		// Backoff sleep otherwise.
 		backoff = requestRetryInterval * time.Duration(i+1)
 		if backoff > time.Minute {
 			backoff = time.Minute
@@ -836,91 +832,88 @@ func (c *Client) handleSendPostMessage(jReq *jsonRequest) {
 		select {
 		case <-time.After(backoff):
 
-		case <-c.shutdown:
-			return
+		case <-ctx.Done():
+			err = ctx.Err()
+			break retryloop
 		}
 	}
 	if err != nil {
-		jReq.responseChan <- &Response{err: err}
-		return
+		return nil, err
 	}
 
-	// We still want to return an error if for any reason the response
-	// remains empty.
 	if httpResponse == nil {
-		jReq.responseChan <- &Response{
-			err: fmt.Errorf("invalid http POST response (nil), "+
-				"method: %s, id: %d, last error=%v",
-				jReq.method, jReq.id, lastErr),
-		}
-		return
+		return nil, fmt.Errorf("invalid http POST response (nil), "+
+			"method: %s, id: %d, last error=%v",
+			jReq.method, jReq.id, lastErr)
 	}
 
-	// Read the raw bytes and close the response.
 	respBytes, err := io.ReadAll(httpResponse.Body)
 	httpResponse.Body.Close()
 	if err != nil {
-		err = fmt.Errorf("error reading json reply: %v", err)
-		jReq.responseChan <- &Response{err: err}
-		return
+		return nil, fmt.Errorf("error reading json reply: %w", err)
 	}
 
-	// Try to unmarshal the response as a regular JSON-RPC response.
 	var resp rawResponse
 	var batchResponse json.RawMessage
-	if c.batch {
+	if batch {
 		err = json.Unmarshal(respBytes, &batchResponse)
 	} else {
 		err = json.Unmarshal(respBytes, &resp)
 	}
 	if err != nil {
-		// When the response itself isn't a valid JSON-RPC response
-		// return an error which includes the HTTP status code and raw
-		// response bytes.
-		err = fmt.Errorf("status code: %d, response: %q",
+		return nil, fmt.Errorf("status code: %d, response: %q",
 			httpResponse.StatusCode, string(respBytes))
-		jReq.responseChan <- &Response{err: err}
-		return
 	}
-	var res []byte
-	if c.batch {
-		// errors must be dealt with downstream since a whole request cannot
-		// "error out" other than through the status code error handled above
-		res, err = batchResponse, nil
-	} else {
-		res, err = resp.result()
+
+	if batch {
+		return batchResponse, nil
 	}
-	jReq.responseChan <- &Response{result: res, err: err}
+
+	return resp.result()
+}
+
+func (c *Client) sendPostRequestAndRespond(ctx context.Context,
+	jReq *jsonRequest, tries int) {
+
+	res, err := sendPostRequestWithRetry(
+		ctx, jReq, tries, c.httpClient, c.config, c.batch,
+	)
+
+	if errors.Is(err, context.Canceled) &&
+		errors.Is(context.Cause(ctx), ErrClientShutdown) {
+
+		err = ErrClientShutdown
+	}
+
+	jReq.responseChan <- &Response{
+		result: res,
+		err:    err,
+	}
 }
 
 // sendPostHandler handles all outgoing messages when the client is running
 // in HTTP POST mode.  It uses a buffered channel to serialize output messages
 // while allowing the sender to continue running asynchronously.  It must be run
 // as a goroutine.
-func (c *Client) sendPostHandler() {
+func (c *Client) sendPostHandler(ctx context.Context) {
 out:
 	for {
-		// Send any messages ready for send until the shutdown channel
-		// is closed.
 		select {
 		case jReq := <-c.sendPostChan:
-			c.handleSendPostMessage(jReq)
+			c.handleSendPostMessage(ctx, jReq)
 
-		case <-c.shutdown:
+		case <-ctx.Done():
 			break out
 		}
 	}
 
-	// Drain any wait channels before exiting so nothing is left waiting
-	// around to send.
+	err := context.Cause(ctx)
+
 cleanup:
 	for {
 		select {
 		case jReq := <-c.sendPostChan:
-			jReq.responseChan <- &Response{
-				result: nil,
-				err:    ErrClientShutdown,
-			}
+			jReq.responseChan <- &Response{result: nil, err: err}
 
 		default:
 			break cleanup
@@ -934,10 +927,15 @@ cleanup:
 // HTTP client associated with the client.  It is backed by a buffered channel,
 // so it will not block until the send channel is full.
 func (c *Client) sendPostRequest(jReq *jsonRequest) {
-	// Don't send the message if shutting down.
 	select {
 	case <-c.shutdown:
-		jReq.responseChan <- &Response{result: nil, err: ErrClientShutdown}
+		jReq.responseChan <- &Response{
+			result: nil,
+			err:    ErrClientShutdown,
+		}
+
+		return
+
 	default:
 	}
 
@@ -946,7 +944,10 @@ func (c *Client) sendPostRequest(jReq *jsonRequest) {
 		log.Tracef("Sent command [%s] with id %d", jReq.method, jReq.id)
 
 	case <-c.shutdown:
-		return
+		jReq.responseChan <- &Response{
+			result: nil,
+			err:    ErrClientShutdown,
+		}
 	}
 }
 
@@ -1184,8 +1185,13 @@ func (c *Client) start() {
 	// Start the I/O processing handlers depending on whether the client is
 	// in HTTP POST mode or the default websocket mode.
 	if c.config.HTTPPostMode {
+		ctx, cancel := context.WithCancelCause(context.Background())
 		c.wg.Add(1)
-		go c.sendPostHandler()
+		go c.sendPostHandler(ctx)
+		go func() {
+			<-c.shutdown
+			cancel(ErrClientShutdown)
+		}()
 	} else {
 		c.wg.Add(3)
 		go func() {
@@ -1596,8 +1602,9 @@ func NewBatch(config *ConnConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	client.batch = true //copy the client with changed batch setting
-	client.start()
+	// New() already started the HTTP handlers.
+	client.batch = true
+
 	return client, nil
 }
 
@@ -1742,6 +1749,25 @@ func (c *Client) sendAsync() (FutureGetBulkResult, error) {
 	return responseChan, nil
 }
 
+func (c *Client) failBatchRequests(err error) {
+	c.requestLock.Lock()
+	defer c.requestLock.Unlock()
+
+	c.batchLock.Lock()
+	defer c.batchLock.Unlock()
+
+	for e := c.batchList.Front(); e != nil; e = e.Next() {
+		req := e.Value.(*jsonRequest)
+
+		// Batch futures would otherwise wait forever after a failed Send.
+		req.responseChan <- &Response{err: err}
+	}
+
+	c.requestMap = make(map[uint64]*list.Element)
+	c.batchList = list.New()
+	c.requestList.Init()
+}
+
 // Marshall's bulk requests and sends to the server
 // creates a response channel to receive the response
 func (c *Client) Send() error {
@@ -1752,12 +1778,7 @@ func (c *Client) Send() error {
 
 	batchResp, err := future.Receive()
 	if err != nil {
-		// Clear batchlist in case of an error.
-
-		c.batchLock.Lock()
-		c.batchList = list.New()
-		c.batchLock.Unlock()
-
+		c.failBatchRequests(err)
 		return err
 	}
 

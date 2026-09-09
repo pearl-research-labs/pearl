@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // maxFailedAttempts is the maximum number of successive failed connection
@@ -139,8 +141,14 @@ type Config struct {
 	// connections in that case.
 	OnAccept func(net.Conn)
 
-	// TargetOutbound is the number of outbound network connections to
-	// maintain. Defaults to 8.
+	// MaxInbound limits accepted inbound connections that may be active
+	// at once. A nil value is unlimited; a pointer to zero disables
+	// inbound connections.
+	MaxInbound *uint32
+
+	// TargetOutbound is the number of automatic outbound network connections
+	// to maintain. Connections made through Connect are additional. Defaults
+	// to 8.
 	TargetOutbound uint32
 
 	// RetryDuration is the duration to wait before retrying connection
@@ -210,15 +218,59 @@ type handleFailed struct {
 // ConnManager provides a manager to handle network connections.
 type ConnManager struct {
 	// The following variables must only be used atomically.
-	connReqCount uint64
-	start        int32
-	stop         int32
+	connReqCount    uint64
+	inboundRejected uint64
+	start           int32
+	stop            int32
 
 	cfg            Config
 	wg             sync.WaitGroup
 	failedAttempts uint64
 	requests       chan interface{}
+	inboundSlots   chan struct{}
+	inboundLog     rate.Sometimes
 	quit           chan struct{}
+}
+
+type limitedInboundConn struct {
+	net.Conn
+
+	releaseOnce sync.Once
+	release     func()
+}
+
+func (c *limitedInboundConn) Close() error {
+	err := c.Conn.Close()
+	c.releaseOnce.Do(c.release)
+
+	return err
+}
+
+func (cm *ConnManager) limitInbound(conn net.Conn) (net.Conn, bool) {
+	if cm.inboundSlots == nil {
+		return conn, true
+	}
+
+	select {
+	case cm.inboundSlots <- struct{}{}:
+		return &limitedInboundConn{
+			Conn: conn,
+			release: func() {
+				<-cm.inboundSlots
+			},
+		}, true
+
+	default:
+		rejected := atomic.AddUint64(&cm.inboundRejected, 1)
+		cm.inboundLog.Do(func() {
+			log.Warnf("Inbound connection limit reached: "+
+				"rejected=%d remote=%s", rejected,
+				conn.RemoteAddr())
+		})
+
+		_ = conn.Close()
+		return nil, false
+	}
 }
 
 // handleFailedConn handles a connection failed due to a disconnect or any
@@ -559,6 +611,11 @@ func (cm *ConnManager) listenHandler(listener net.Listener) {
 			}
 			continue
 		}
+		conn, ok := cm.limitInbound(conn)
+		if !ok {
+			continue
+		}
+
 		go cm.cfg.OnAccept(conn)
 	}
 
@@ -586,7 +643,7 @@ func (cm *ConnManager) Start() {
 		}
 	}
 
-	for i := atomic.LoadUint64(&cm.connReqCount); i < uint64(cm.cfg.TargetOutbound); i++ {
+	for i := uint32(0); i < cm.cfg.TargetOutbound; i++ {
 		go cm.NewConnReq()
 	}
 }
@@ -629,9 +686,14 @@ func New(cfg *Config) (*ConnManager, error) {
 		cfg.TargetOutbound = defaultTargetOutbound
 	}
 	cm := ConnManager{
-		cfg:      *cfg, // Copy so caller can't mutate
-		requests: make(chan interface{}),
-		quit:     make(chan struct{}),
+		cfg:        *cfg, // Copy so caller can't mutate.
+		requests:   make(chan interface{}),
+		inboundLog: rate.Sometimes{First: 3, Interval: 30 * time.Second},
+		quit:       make(chan struct{}),
 	}
+	if cfg.MaxInbound != nil {
+		cm.inboundSlots = make(chan struct{}, int(*cfg.MaxInbound))
+	}
+
 	return &cm, nil
 }
