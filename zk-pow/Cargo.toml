@@ -34,7 +34,7 @@ sorted-vec = "0.8.10"
 itertools = "0.14.0"
 blake3 = "1.8"
 pearl-blake3 = { path = "../pearl-blake3", features = ["serde"] }
-pyo3 = { version = "0.24", optional = true }
+pyo3 = { version = "0.29", optional = true }
 
 [dev-dependencies]
 rand_chacha = "0.9"
