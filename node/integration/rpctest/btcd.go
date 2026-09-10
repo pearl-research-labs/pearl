@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -21,19 +22,16 @@ var (
 	// string until pearld is compiled. This should not be accessed directly;
 	// instead use the function pearldExecutablePath().
 	executablePath string
+
+	pearldBuildTags []string
 )
 
-// pearldExecutablePath returns a path to the pearld executable to be used by
-// rpctests. To ensure the code tests against the most up-to-date version of
-// pearld, this method compiles pearld the first time it is called. After that, the
-// generated binary is used for subsequent test harnesses. The executable file
-// is not cleaned up, but since it lives at a static path in a temp directory,
-// it is not a big deal.
+// pearldExecutablePath returns the path to the pearld test binary, building it
+// on first call and caching the result for subsequent harness instances.
 func pearldExecutablePath() (string, error) {
 	compileMtx.Lock()
 	defer compileMtx.Unlock()
 
-	// If pearld has already been compiled, just use that.
 	if len(executablePath) != 0 {
 		return executablePath, nil
 	}
@@ -43,20 +41,21 @@ func pearldExecutablePath() (string, error) {
 		return "", err
 	}
 
-	// Build pearld and output an executable in a static temp path.
 	outputPath := filepath.Join(testDir, "pearld")
 	if runtime.GOOS == "windows" {
 		outputPath += ".exe"
 	}
-	cmd := exec.Command(
-		"go", "build", "-o", outputPath, "github.com/pearl-research-labs/pearl/node",
-	)
+	args := []string{"build", "-o", outputPath}
+	if len(pearldBuildTags) > 0 {
+		args = append(args, "-tags", strings.Join(pearldBuildTags, ","))
+	}
+	args = append(args, "github.com/pearl-research-labs/pearl/node")
+	cmd := exec.Command("go", args...)
 	err = cmd.Run()
 	if err != nil {
 		return "", fmt.Errorf("Failed to build pearld: %v", err)
 	}
 
-	// Save executable path so future calls do not recompile.
 	executablePath = outputPath
 	return executablePath, nil
 }
