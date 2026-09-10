@@ -201,6 +201,7 @@ func (s *NeutrinoClient) SyncProgress() (*SyncProgress, error) {
 		HeaderHeight:       headerHeight,
 		FilterHeaderHeight: filterHeight,
 		BestPeerHeight:     s.CS.BestPeerHeight(),
+		Connections:        s.CS.ConnectedCount(),
 	}, nil
 }
 
