@@ -1,3 +1,5 @@
+//go:build zkpow
+
 // Copyright (c) 2025-2026 The Pearl Research Labs developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
@@ -33,8 +35,11 @@ func TestHeaderSanityCertificateAncestors(t *testing.T) {
 	prefix := forged.IncompleteHeaderBytes()
 	cert := &wire.CertificateV4{
 		PublicData:      prefix[:],
+		ProofData:       []byte{1},
 		AncestorHeaders: []wire.BlockHeader{forged},
 	}
+	header.ProofCommitment = cert.ProofCommitment()
+	cert.Hash = header.BlockHash()
 
 	for name, reorg := range map[string]bool{"extension": false, "reorg": true} {
 		t.Run(name, func(t *testing.T) {

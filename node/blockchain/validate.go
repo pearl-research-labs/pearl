@@ -395,10 +395,6 @@ func CheckBlockHeaderSanity(header *wire.BlockHeader, cert wire.BlockCertificate
 		return ruleError(ErrTimeTooNew, str)
 	}
 
-	if err := checkCertificateAncestors(header, cert, flags); err != nil {
-		return err
-	}
-
 	// Ensure the proof of work bits in the block header is in min/max range
 	// and the block hash is less than the target value described by the
 	// bits. This is the most expensive check (ZK proof verification), so

@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -94,6 +95,13 @@ func TestVerifyCertificateV4(t *testing.T) {
 	require.NoError(t, VerifyCertificate(header, cert), "the mined fp8 certificate should verify")
 }
 
+func TestVerifyCertificateV4_DisconnectedAncestor(t *testing.T) {
+	header, cert := loadFp8Fixture(t)
+	cert.AncestorHeaders = []wire.BlockHeader{{}}
+	require.ErrorContains(t, VerifyCertificate(header, cert),
+		"v4 ancestor header at depth 1 does not connect")
+}
+
 // TestVerifyCertificateV4_WireRoundTrip verifies the certificate again after a
 // full MsgCertificate encode/decode cycle, exercising the exact bytes a peer
 // would receive.
@@ -141,9 +149,11 @@ func TestVerifyCertificateV4_WrongHeader(t *testing.T) {
 	wrongHeader := copyBlockHeader(header)
 	wrongHeader.Timestamp = header.Timestamp.Add(time.Second)
 	wrongCert := copyCertificateV4(cert)
+	publicHeader := wrongHeader.IncompleteHeaderBytes()
+	copy(wrongCert.PublicData, publicHeader[:])
+	wrongHeader.ProofCommitment = wrongCert.ProofCommitment()
 	wrongCert.Hash = wrongHeader.BlockHash()
-	// The compact wire imposes the verifier's own expected public inputs, so a wrong
-	// header surfaces as the proof failing its Fiat-Shamir statement binding.
+	// The ancestry matches, but the unchanged proof must fail native statement binding.
 	require.ErrorContains(t, VerifyCertificate(wrongHeader, wrongCert), "does not verify against the expected statement")
 }
 
@@ -161,4 +171,75 @@ func TestVerifyCertificateV4_EmptyProof(t *testing.T) {
 	tampered := copyCertificateV4(cert)
 	tampered.ProofData = nil
 	require.ErrorContains(t, VerifyCertificate(header, tampered), "empty fp8 proof")
+}
+
+func ancestorPublicData(t *testing.T, header *wire.BlockHeader) []byte {
+	t.Helper()
+	var serialized bytes.Buffer
+	require.NoError(t, header.Serialize(&serialized))
+	return serialized.Bytes()[:wire.IncompleteBlockHeaderSize]
+}
+
+func TestCheckCertificateAncestors(t *testing.T) {
+	grandparent := *testBlockHeader()
+	parent := grandparent
+	parent.Version++
+	parent.PrevBlock = grandparent.BlockHash()
+	proposed := parent
+	proposed.Version++
+	proposed.PrevBlock = parent.BlockHash()
+	rogue := grandparent
+	rogue.Version++
+	proposedData := ancestorPublicData(t, &proposed)
+	parentData := ancestorPublicData(t, &parent)
+	grandparentData := ancestorPublicData(t, &grandparent)
+	rogueData := ancestorPublicData(t, &rogue)
+	wrongParent := parent
+	wrongParent.ProofCommitment[0] ^= 0xff
+	wrongGrandparent := grandparent
+	wrongGrandparent.ProofCommitment[0] ^= 0xff
+	other := proposed
+	other.ProofCommitment[0] ^= 0xff
+	reversedPrev := bytes.Clone(proposedData)
+	slices.Reverse(reversedPrev[4:36])
+	reversedMerkle := bytes.Clone(proposedData)
+	slices.Reverse(reversedMerkle[36:68])
+
+	for _, test := range []struct {
+		name     string
+		proposed wire.BlockHeader
+		cert     wire.CertificateV4
+		wantErr  bool
+	}{
+		{"depth 0", proposed, wire.CertificateV4{PublicData: proposedData}, false},
+		{"depth 1", proposed, wire.CertificateV4{PublicData: parentData, AncestorHeaders: []wire.BlockHeader{parent}}, false},
+		{"depth 2", proposed, wire.CertificateV4{PublicData: grandparentData, AncestorHeaders: []wire.BlockHeader{parent, grandparent}}, false},
+		{"depth 0 with ancestors", proposed, wire.CertificateV4{PublicData: proposedData, AncestorHeaders: []wire.BlockHeader{parent, grandparent}}, false},
+		{"outside window", proposed, wire.CertificateV4{PublicData: rogueData, AncestorHeaders: []wire.BlockHeader{parent, grandparent}}, true},
+		{"missing ancestor", proposed, wire.CertificateV4{PublicData: parentData}, true},
+		{"missing intermediate", proposed, wire.CertificateV4{PublicData: grandparentData, AncestorHeaders: []wire.BlockHeader{grandparent}}, true},
+		{"reversed order", proposed, wire.CertificateV4{PublicData: grandparentData, AncestorHeaders: []wire.BlockHeader{grandparent, parent}}, true},
+		{"wrong branch", proposed, wire.CertificateV4{PublicData: rogueData, AncestorHeaders: []wire.BlockHeader{rogue}}, true},
+		{"parent commitment", proposed, wire.CertificateV4{PublicData: parentData, AncestorHeaders: []wire.BlockHeader{wrongParent}}, true},
+		{"grandparent commitment", proposed, wire.CertificateV4{PublicData: grandparentData, AncestorHeaders: []wire.BlockHeader{parent, wrongGrandparent}}, true},
+		{"invalid after depth 0 match", proposed, wire.CertificateV4{PublicData: proposedData, AncestorHeaders: []wire.BlockHeader{rogue}}, true},
+		{"invalid after depth 1 match", proposed, wire.CertificateV4{PublicData: parentData, AncestorHeaders: []wire.BlockHeader{parent, rogue}}, true},
+		{"excessive depth", proposed, wire.CertificateV4{PublicData: proposedData, AncestorHeaders: []wire.BlockHeader{parent, grandparent, rogue}}, true},
+		{"reversed previous hash", proposed, wire.CertificateV4{PublicData: reversedPrev}, true},
+		{"reversed merkle root", proposed, wire.CertificateV4{PublicData: reversedMerkle}, true},
+		{"current commitment excluded", other, wire.CertificateV4{PublicData: proposedData}, false},
+		{"empty public data", proposed, wire.CertificateV4{}, true},
+		{"short public data", proposed, wire.CertificateV4{
+			PublicData: make([]byte, wire.IncompleteBlockHeaderSize-1),
+		}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := checkCertificateAncestors(&test.proposed, &test.cert)
+			if test.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

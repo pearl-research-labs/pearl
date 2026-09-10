@@ -17,6 +17,7 @@ package zkpow
 import "C"
 
 import (
+	"bytes"
 	"fmt"
 	"runtime"
 	"unsafe"
@@ -141,6 +142,9 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 		return fmt.Errorf("fp8 public data too large: %d bytes (max %d)",
 			len(publicData), C.PUBLICDATA_MAX_SIZE)
 	}
+	if err := checkCertificateAncestors(header, cert); err != nil {
+		return err
+	}
 
 	cBlockHeader := blockHeaderToC(header)
 
@@ -169,6 +173,39 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 	default:
 		return fmt.Errorf("unknown v4 verification result %d: %s", result, msg)
 	}
+}
+
+// checkCertificateAncestors authenticates the V4 proof's ancestor against the
+// proposed header and the certificate's hash-linked parent and grandparent.
+func checkCertificateAncestors(proposed *wire.BlockHeader, cert *wire.CertificateV4) error {
+	if len(cert.AncestorHeaders) > wire.MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("v4 certificate has %d ancestor headers, max %d",
+			len(cert.AncestorHeaders), wire.MaxCertificateV4AncestorHeaders)
+	}
+	publicData := cert.PublicDataBytes()
+	if len(publicData) < wire.IncompleteBlockHeaderSize {
+		return fmt.Errorf("v4 public data is %d bytes, want at least %d",
+			len(publicData), wire.IncompleteBlockHeaderSize)
+	}
+
+	ancestorHeader := publicData[:wire.IncompleteBlockHeaderSize]
+	proposedBytes := proposed.IncompleteHeaderBytes()
+	matched := bytes.Equal(ancestorHeader, proposedBytes[:])
+	prevHash := proposed.PrevBlock
+	// Authenticate every supplied header, including those after a match.
+	for i := range cert.AncestorHeaders {
+		header := &cert.AncestorHeaders[i]
+		if header.BlockHash() != prevHash {
+			return fmt.Errorf("v4 ancestor header at depth %d does not connect", i+1)
+		}
+		candidateBytes := header.IncompleteHeaderBytes()
+		matched = matched || bytes.Equal(ancestorHeader, candidateBytes[:])
+		prevHash = header.PrevBlock
+	}
+	if !matched {
+		return fmt.Errorf("v4 ancestor header is not the proposed header, its parent, or its grandparent")
+	}
+	return nil
 }
 
 // VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.
