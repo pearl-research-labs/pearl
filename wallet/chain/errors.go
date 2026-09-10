@@ -193,6 +193,11 @@ const (
 	// program hash mismatch).
 	ErrNonMandatoryScriptVerifyFlag
 
+	// ErrTxNotRelayed is returned by an SPV backend when no peer requested
+	// the transaction after it was announced, so no peer holds it. Callers
+	// may safely forget the transaction; nothing can confirm it.
+	ErrTxNotRelayed
+
 	// errSentinel is used to indicate the end of the error list. This
 	// should always be the last error code.
 	errSentinel
@@ -331,6 +336,9 @@ func (r RPCErr) Error() string {
 
 	case ErrNonMandatoryScriptVerifyFlag:
 		return "non mandatory script verify flag"
+
+	case ErrTxNotRelayed:
+		return "transaction not relayed to any peer"
 	}
 
 	return "unknown error"

@@ -947,8 +947,35 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	return foundBlock, nil
 }
 
+// newTransactionInv creates the inventory used to announce a transaction.
+// BIP-144 reserves the witness inventory types for getdata, where the
+// requesting peer picks the encoding; an inv must carry MSG_TX or peers
+// following the BIP ignore the announcement and never request the tx.
+func newTransactionInv(tx *wire.MsgTx) *wire.MsgInv {
+	txHash := tx.TxHash()
+	inv := wire.NewMsgInv()
+	_ = inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &txHash))
+
+	return inv
+}
+
+// notRelayedError reports that no peer requested the transaction. An inv
+// carries only the txid, so nothing that could confirm has left this node;
+// callers must not treat such a broadcast as a success.
+func notRelayedError(txHash chainhash.Hash, numPeers int) error {
+	reason := fmt.Sprintf("no connected peers to relay transaction %v",
+		txHash)
+	if numPeers > 0 {
+		reason = fmt.Sprintf("none of %d connected peers requested "+
+			"transaction %v", numPeers, txHash)
+	}
+
+	return &pushtx.BroadcastError{Code: pushtx.NotRelayed, Reason: reason}
+}
+
 // sendTransaction sends a transaction to all peers. It returns an error if any
-// peer rejects the transaction.
+// peer rejects the transaction, or a pushtx.NotRelayed error if no peer asked
+// for it.
 //
 // TODO: Better privacy by sending to only one random peer and watching
 // propagation, requires better peer selection support in query API.
@@ -956,21 +983,18 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 // TODO(wilmer): Move to pushtx package after introducing a query package. This
 // cannot be done at the moment due to circular dependencies.
 func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) error {
-	// Starting with the set of default options, we'll apply any specified
-	// functional options to the query so that we can check what inv type
-	// to use. Broadcast the inv to all peers, responding to any getdata
-	// messages for the transaction.
+	// The encoding option only selects how the transaction is serialized
+	// when a peer requests it via getdata.
 	qo := defaultQueryOptions()
 	qo.applyQueryOptions(options...)
-	invType := wire.InvTypeWitnessTx
-	if qo.encoding == wire.BaseEncoding {
-		invType = wire.InvTypeTx
+
+	txHash := tx.TxHash()
+	numPeers := len(s.Peers())
+	if numPeers == 0 {
+		return notRelayedError(txHash, numPeers)
 	}
 
-	// Create an inv.
-	txHash := tx.TxHash()
-	inv := wire.NewMsgInv()
-	_ = inv.AddInvVect(wire.NewInvVect(invType, &txHash))
+	inv := newTransactionInv(tx)
 
 	// We'll gather all the peers who replied to our query, along with
 	// the ones who rejected it and their reason for rejecting it. We'll use
@@ -1064,13 +1088,10 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 		)...,
 	)
 
-	// If none of our peers replied to our query, we'll avoid returning an
-	// error as the reliable broadcaster will take care of broadcasting this
-	// transaction upon every block connected/disconnected.
 	if len(replies) == 0 {
 		log.Debugf("No peers replied to inv message for transaction %v",
 			txHash)
-		return nil
+		return notRelayedError(txHash, numPeers)
 	}
 
 	// firstRejectWithCode returns the first reject error that we have for

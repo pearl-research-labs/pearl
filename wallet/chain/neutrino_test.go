@@ -8,12 +8,41 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // maxDur is the max duration a test has to execute successfully.
 var maxDur = 5 * time.Second
+
+// notRelayedChainService is a mockChainService whose broadcasts find no peer
+// willing to request the transaction.
+type notRelayedChainService struct {
+	*mockChainService
+}
+
+func (m *notRelayedChainService) SendTransaction(*wire.MsgTx) error {
+	return &pushtx.BroadcastError{
+		Code:   pushtx.NotRelayed,
+		Reason: "no connected peers to relay transaction",
+	}
+}
+
+// TestNeutrinoClientSendRawTransactionNotRelayed verifies that a broadcast no
+// peer requested surfaces as ErrTxNotRelayed with the backend's reason intact,
+// so the wallet can drop the record and the user can see why the send failed.
+func TestNeutrinoClientSendRawTransactionNotRelayed(t *testing.T) {
+	t.Parallel()
+
+	nc := newMockNeutrinoClient()
+	nc.CS = &notRelayedChainService{mockChainService: &mockChainService{}}
+
+	hash, err := nc.SendRawTransaction(wire.NewMsgTx(wire.TxVersion), false)
+	require.Nil(t, hash)
+	require.ErrorIs(t, err, ErrTxNotRelayed)
+	require.ErrorContains(t, err, "no connected peers")
+}
 
 // TestNeutrinoClientSequentialStartStop ensures that the client
 // can sequentially Start and Stop without errors or races.

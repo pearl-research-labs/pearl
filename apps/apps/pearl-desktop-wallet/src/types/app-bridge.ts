@@ -124,6 +124,9 @@ interface SyncProgress {
   filterHeaderHeight: number;
   blockHeight: number;
   bestPeerHeight: number;
+  // Undefined when the daemon predates the field; only an explicit 0 means
+  // a send cannot reach the network.
+  connections?: number;
   synced: boolean;
 }
 

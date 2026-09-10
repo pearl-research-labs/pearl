@@ -3214,7 +3214,7 @@ func (w *Wallet) resendUnminedTxs() {
 	}
 
 	for _, tx := range txs {
-		txHash, err := w.publishTransaction(tx)
+		txHash, err := w.publishTransaction(tx, republish)
 		if err != nil {
 			log.Debugf("Unable to rebroadcast transaction %v: %v",
 				tx.TxHash(), err)
@@ -3785,14 +3785,33 @@ func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx, label string) (*chai
 		return nil, err
 	}
 
-	return w.publishTransaction(tx)
+	return w.publishTransaction(tx, publishNew)
 }
+
+// publishMode tells publishTransaction what to do with the wallet's record of
+// a transaction that no peer requested.
+type publishMode uint8
+
+const (
+	// publishNew publishes a record written moments ago. No peer holds the
+	// transaction, so the record is removed again: keeping it would lock
+	// its inputs behind a spend that can never confirm.
+	publishNew publishMode = iota
+
+	// republish retries a stored record. It only exists because an earlier
+	// publish reached a peer, and a round with no takers is a transient
+	// peer condition, so the record is kept.
+	republish
+)
 
 // publishTransaction attempts to send an unconfirmed transaction to the
 // wallet's current backend. In the event that sending the transaction fails for
 // whatever reason, it will be removed from the wallet's unconfirmed transaction
-// store.
-func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
+// store, except for a transaction no peer requested, whose fate is decided by
+// mode.
+func (w *Wallet) publishTransaction(tx *wire.MsgTx,
+	mode publishMode) (*chainhash.Hash, error) {
+
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return nil, err
@@ -3809,19 +3828,27 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 		log.Infof("%v: tx already in mempool", txid)
 		return &txid, nil
 
+	case errors.Is(rpcErr, chain.ErrTxNotRelayed):
+		if mode == republish {
+			log.Infof("Keeping unrelayed transaction for the next "+
+				"rebroadcast: %v", rpcErr)
+			return nil, rpcErr
+		}
+
+		if err := w.removeUnminedTx(tx); err != nil {
+			log.Warnf("Unable to remove unrelayed transaction %v: %v",
+				txid, err)
+		} else {
+			log.Infof("Removed unrelayed transaction: %v", rpcErr)
+		}
+
+		return nil, rpcErr
+
 	case errors.Is(rpcErr, chain.ErrTxAlreadyKnown),
 		errors.Is(rpcErr, chain.ErrTxAlreadyConfirmed):
 
-		dbErr := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
-			txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
-			txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
-			if err != nil {
-				return err
-			}
-			return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
-		})
-		if dbErr != nil {
-			log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", tx.TxHash(), dbErr)
+		if err := w.removeUnminedTx(tx); err != nil {
+			log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", txid, err)
 		}
 
 		log.Infof("%v: tx already confirmed", txid)
@@ -3837,17 +3864,8 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 	// we'll remove it from the transaction store, as otherwise, we'll
 	// attempt to continually re-broadcast it, and the UTXO state of the
 	// wallet won't be accurate.
-	dbErr := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
-		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
-		txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
-		if err != nil {
-			return err
-		}
-		return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
-	})
-	if dbErr != nil {
-		log.Warnf("Unable to remove invalid transaction %v: %v",
-			tx.TxHash(), dbErr)
+	if err := w.removeUnminedTx(tx); err != nil {
+		log.Warnf("Unable to remove invalid transaction %v: %v", txid, err)
 	} else {
 		log.Infof("Removed invalid transaction: %v", tx.TxHash())
 
@@ -3869,6 +3887,19 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 	}
 
 	return nil, rpcErr
+}
+
+// removeUnminedTx forgets an unconfirmed transaction the backend will never
+// mine, so the inputs it spent become spendable again.
+func (w *Wallet) removeUnminedTx(tx *wire.MsgTx) error {
+	return walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
+		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
+		txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+		if err != nil {
+			return err
+		}
+		return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
+	})
 }
 
 // ChainParams returns the network parameters for the blockchain the wallet

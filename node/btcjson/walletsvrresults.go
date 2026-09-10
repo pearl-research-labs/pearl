@@ -349,6 +349,7 @@ type GetSyncProgressResult struct {
 	FilterHeaderHeight int32 `json:"filter_header_height"`
 	BlockHeight        int32 `json:"block_height"`
 	BestPeerHeight     int32 `json:"best_peer_height"`
+	Connections        int32 `json:"connections"`
 	Synced             bool  `json:"synced"`
 }
 

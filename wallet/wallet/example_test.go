@@ -34,6 +34,14 @@ func useFastScrypt() func() {
 
 // testWallet creates a test wallet and unlocks it.
 func testWallet(t *testing.T) (*Wallet, func()) {
+	return testWalletWithParams(t, &chaincfg.TestNetParams)
+}
+
+// testWalletWithParams creates a test wallet on the given network and unlocks
+// it.
+func testWalletWithParams(t *testing.T,
+	params *chaincfg.Params) (*Wallet, func()) {
+
 	t.Cleanup(useFastScrypt())
 	// Set up a wallet.
 	dir := t.TempDir()
@@ -47,7 +55,7 @@ func testWallet(t *testing.T) (*Wallet, func()) {
 	privPass := []byte("world")
 
 	loader := NewLoader(
-		&chaincfg.TestNetParams, dir, true, defaultDBTimeout, 250,
+		params, dir, true, defaultDBTimeout, 250,
 		WithWalletSyncRetryInterval(10*time.Millisecond),
 	)
 	w, err := loader.CreateNewWallet(pubPass, privPass, seed, time.Now())
