@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.96.1-alpine AS rust-toolchain
+FROM rust:1.98.0-alpine AS rust-toolchain
 
 # ===== Go + Rust + Task toolchain: rarely changes, fully cached =====
-FROM golang:1.26.6-alpine AS toolchain
+FROM golang:1.27.0-alpine AS toolchain
 
 RUN apk add --no-cache \
     curl \
