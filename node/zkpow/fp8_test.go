@@ -74,9 +74,10 @@ func loadFp8Fixture(t *testing.T) (*wire.BlockHeader, *wire.CertificateV4) {
 // copyCertificateV4 creates a deep copy of CertificateV4 for tampering tests.
 func copyCertificateV4(c *wire.CertificateV4) *wire.CertificateV4 {
 	return &wire.CertificateV4{
-		Hash:       c.Hash,
-		PublicData: append([]byte(nil), c.PublicData...),
-		ProofData:  append([]byte(nil), c.ProofData...),
+		Hash:            c.Hash,
+		PublicData:      append([]byte(nil), c.PublicData...),
+		ProofData:       append([]byte(nil), c.ProofData...),
+		AncestorHeaders: append([]wire.BlockHeader(nil), c.AncestorHeaders...),
 	}
 }
 

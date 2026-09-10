@@ -200,23 +200,6 @@ func (node *blockNode) Ancestor(height int32) *blockNode {
 	return n
 }
 
-// header reconstructs the wire header from the node's stored fields without
-// fetching the block from the database.
-func (node *blockNode) header() wire.BlockHeader {
-	var prevBlock chainhash.Hash
-	if node.parent != nil {
-		prevBlock = node.parent.hash
-	}
-	return wire.BlockHeader{
-		Version:         node.version,
-		PrevBlock:       prevBlock,
-		MerkleRoot:      node.merkleRoot,
-		Timestamp:       time.Unix(node.timestamp, 0),
-		Bits:            node.bits,
-		ProofCommitment: node.proofCommitment,
-	}
-}
-
 // Hash returns the blockNode's hash.
 //
 // NOTE: Part of the HeaderCtx interface.

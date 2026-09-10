@@ -17,17 +17,26 @@ import (
 // MAX_FP8_PROOF_SIZE in zk-pow/bindings/go/src/common.rs.
 const MaxFp8ProofSize = 131072
 
-// CertificateMaxSizeV4 is the maximum V4 certificate size, including the
-// version prefix: version(4) + hash(32) + public_len(4) + public + proof_len(4) + proof.
-const CertificateMaxSizeV4 = 4 + 32 + 4 + MaxFp8ProofSize + 4 + MaxFp8ProofSize
+// MaxCertificateV4AncestorHeaders bounds the parent/grandparent witness.
+const MaxCertificateV4AncestorHeaders = 2
 
-// CertificateV4 is a version-4 (FP8) block certificate. The wire
-// layout matches V2 (hash + length-prefixed public data + length-prefixed
-// proof) but both blobs are capped at MaxFp8ProofSize.
+// CertificateMaxSizeV4 is the maximum V4 certificate size, including the
+// version prefix, both blobs, one-byte ancestor count, and full ancestor headers.
+const CertificateMaxSizeV4 = 4 + 32 + 4 + MaxFp8ProofSize + 4 + MaxFp8ProofSize +
+	1 + MaxCertificateV4AncestorHeaders*MaxBlockHeaderPayload
+
+// CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is
+// hash + length-prefixed public data + length-prefixed proof + ancestor count
+// + full ancestor headers. Both blobs are capped at MaxFp8ProofSize.
 type CertificateV4 struct {
 	Hash       chainhash.Hash
 	PublicData []byte
 	ProofData  []byte
+
+	// AncestorHeaders supplies the parent, then grandparent, for ancestry
+	// verification. They are excluded from ProofCommitment and authenticated
+	// through the proposed header's PrevBlock hash.
+	AncestorHeaders []BlockHeader
 }
 
 func (c *CertificateV4) Version() CertificateVersion {
@@ -57,8 +66,14 @@ func (c *CertificateV4) ProofCommitment() chainhash.Hash {
 	return proofCommitment(c.Version(), c.PublicDataBytes())
 }
 
-// Serialize: BlockHash(32) + PublicDataLen(4) + PublicData + ProofLen(4) + ProofData
+// Serialize writes the certificate fields, followed by a canonical varint
+// ancestor count and the full headers in parent-to-grandparent order.
+// The count is mandatory, including zero for a depth-0 certificate.
 func (c *CertificateV4) Serialize(w io.Writer) error {
+	if len(c.AncestorHeaders) > MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
+			len(c.AncestorHeaders), MaxCertificateV4AncestorHeaders)
+	}
 	if _, err := w.Write(c.Hash[:]); err != nil {
 		return err
 	}
@@ -73,6 +88,14 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 	}
 	if _, err := w.Write(c.ProofData); err != nil {
 		return err
+	}
+	if err := WriteVarInt(w, 0, uint64(len(c.AncestorHeaders))); err != nil {
+		return err
+	}
+	for i := range c.AncestorHeaders {
+		if err := c.AncestorHeaders[i].Serialize(w); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -109,11 +132,29 @@ func (c *CertificateV4) Deserialize(r io.Reader) error {
 	if err != nil {
 		return err
 	}
+	count, err := ReadVarInt(r, 0)
+	if err != nil {
+		return err
+	}
+	if count > MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
+			count, MaxCertificateV4AncestorHeaders)
+	}
+	var ancestors []BlockHeader
+	for range count {
+		var header BlockHeader
+		if err := header.Deserialize(r); err != nil {
+			return err
+		}
+		ancestors = append(ancestors, header)
+	}
 	c.PublicData = publicData
 	c.ProofData = proofData
+	c.AncestorHeaders = ancestors
 	return nil
 }
 
 func (c *CertificateV4) SerializedSize() int {
-	return 32 + 4 + len(c.PublicData) + 4 + len(c.ProofData)
+	return 32 + 4 + len(c.PublicData) + 4 + len(c.ProofData) +
+		VarIntSerializeSize(uint64(len(c.AncestorHeaders))) + len(c.AncestorHeaders)*MaxBlockHeaderPayload
 }

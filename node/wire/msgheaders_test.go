@@ -43,7 +43,11 @@ var oneHeaderEncoded = []byte{
 func TestHeadersLargeV4RoundTrip(t *testing.T) {
 	msg := NewMsgHeaders()
 	header := *blockOne.BlockHeader()
-	cert := &CertificateV4{ProofData: bytes.Repeat([]byte{0x22}, MaxFp8ProofSize)}
+	cert := &CertificateV4{
+		PublicData:      bytes.Repeat([]byte{0x11}, MaxFp8ProofSize),
+		ProofData:       bytes.Repeat([]byte{0x22}, MaxFp8ProofSize),
+		AncestorHeaders: []BlockHeader{header, header},
+	}
 	for range MaxBlockHeadersPerMsg {
 		require.NoError(t, msg.AddBlockHeader(header, cert))
 	}

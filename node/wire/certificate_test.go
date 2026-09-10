@@ -228,8 +228,9 @@ func TestCertificateV3_MineVerifyRoundTrip(t *testing.T) {
 func TestCertificateV4_SerializeDeserialize(t *testing.T) {
 	header := testBlockHeader()
 	cert := &wire.CertificateV4{
-		PublicData: []byte{0x01, 0x02, 0x03, 0x04},
-		ProofData:  []byte{0xaa, 0xbb, 0xcc},
+		PublicData:      []byte{0x01, 0x02, 0x03, 0x04},
+		ProofData:       []byte{0xaa, 0xbb, 0xcc},
+		AncestorHeaders: []wire.BlockHeader{header},
 	}
 	header.ProofCommitment = cert.ProofCommitment()
 	cert.Hash = header.BlockHash()
@@ -242,6 +243,8 @@ func TestCertificateV4_SerializeDeserialize(t *testing.T) {
 	require.Equal(t, cert.Hash, decoded.Hash)
 	require.Equal(t, cert.PublicData, decoded.PublicData)
 	require.Equal(t, cert.ProofData, decoded.ProofData)
+	require.Equal(t, cert.AncestorHeaders, decoded.AncestorHeaders)
+	require.Equal(t, cert.SerializedSize(), buf.Len())
 	require.Equal(t, wire.CertificateVersionV4, decoded.Version())
 	require.False(t, decoded.IsMoE())
 	for size := range buf.Len() {
@@ -263,15 +266,19 @@ func TestCertificateV4_NilPublicDataRoundTrip(t *testing.T) {
 func TestMsgCertificate_V4_RoundTrip(t *testing.T) {
 	header := testBlockHeader()
 	cert := &wire.CertificateV4{
-		PublicData: bytes.Repeat([]byte{0x11}, wire.MaxFp8ProofSize),
-		ProofData:  bytes.Repeat([]byte{0x22}, wire.MaxFp8ProofSize),
+		PublicData:      bytes.Repeat([]byte{0x11}, wire.MaxFp8ProofSize),
+		ProofData:       bytes.Repeat([]byte{0x22}, wire.MaxFp8ProofSize),
+		AncestorHeaders: []wire.BlockHeader{header, header},
 	}
+	cert.AncestorHeaders[1].Version++
 	header.ProofCommitment = cert.ProofCommitment()
 	cert.Hash = header.BlockHash()
 
 	msg := &wire.MsgCertificate{Certificate: cert}
 	var buf bytes.Buffer
 	require.NoError(t, msg.PrlEncode(&buf, wire.ProtocolVersion))
+	require.Equal(t, wire.CertificateMaxSizeV4, buf.Len())
+	require.Equal(t, msg.SerializeSize(), buf.Len())
 
 	decoded := &wire.MsgCertificate{}
 	require.NoError(t, decoded.PrlDecode(bytes.NewReader(buf.Bytes()), wire.ProtocolVersion))
@@ -280,6 +287,44 @@ func TestMsgCertificate_V4_RoundTrip(t *testing.T) {
 	require.Equal(t, cert.Hash, got.Hash)
 	require.Equal(t, cert.PublicData, got.PublicData)
 	require.Equal(t, cert.ProofData, got.ProofData)
+	require.Equal(t, cert.AncestorHeaders, got.AncestorHeaders)
+}
+
+func TestCertificateV4_AncestorCount(t *testing.T) {
+	cert := &wire.CertificateV4{
+		AncestorHeaders: make([]wire.BlockHeader, wire.MaxCertificateV4AncestorHeaders+1),
+	}
+	var buf bytes.Buffer
+	require.ErrorContains(t, cert.Serialize(&buf), "too many v4 ancestor headers")
+	require.Zero(t, buf.Len())
+	cert.AncestorHeaders = nil
+	require.NoError(t, cert.Serialize(&buf))
+	prefix := buf.Bytes()[:buf.Len()-1] // Replace the zero ancestor count.
+	for _, test := range []struct {
+		name  string
+		count []byte
+		err   string
+	}{
+		{"oversized", []byte{3}, "too many v4 ancestor headers"},
+		{"noncanonical", []byte{0xfd, 0x02, 0x00}, "non-canonical"},
+		{"missing", nil, "EOF"},
+		{"truncated", []byte{0xfd, 0x02}, "unexpected EOF"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := append(bytes.Clone(prefix), test.count...)
+			err := (&wire.CertificateV4{}).Deserialize(bytes.NewReader(data))
+			require.ErrorContains(t, err, test.err)
+		})
+	}
+}
+
+func TestCertificateV4_AncestorHeadersNotCommitted(t *testing.T) {
+	cert := &wire.CertificateV4{PublicData: []byte{0x01}, ProofData: []byte{0x02}}
+	commitment := cert.ProofCommitment()
+	cert.AncestorHeaders = []wire.BlockHeader{testBlockHeader()}
+	require.Equal(t, commitment, cert.ProofCommitment())
+	cert.AncestorHeaders[0].ProofCommitment[0] ^= 0xff
+	require.Equal(t, commitment, cert.ProofCommitment())
 }
 
 func TestCertificateV4_RejectsOversizedBlobs(t *testing.T) {
