@@ -32,6 +32,7 @@
 //! not the required four-plane prequant shape.
 
 pub mod blake3_stark;
+pub mod circuit_utils;
 pub(crate) mod columns_view;
 #[cfg(test)]
 pub(crate) mod consistency;
