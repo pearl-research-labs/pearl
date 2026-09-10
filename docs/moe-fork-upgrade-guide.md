@@ -164,6 +164,7 @@ let zk_proof = match check_cert_version_eligible(required_cert_version, &proof)?
     CertificateVersion::ZkMoe => {
         zk_pow::api::prove::zk_prove_plain_proof(header, &proof, &mut v2_cache, true)?
     }
+    CertificateVersion::PlainPeel => todo()
 };
 ```
 

@@ -34,6 +34,9 @@ Version-first design enables polymorphic decoding:
 	CertificateV3: identical layout to CertificateV2; the version selects the
 	  salted noise-seed derivation.
 
+	CertificateV4: BlockHash(32) + PublicDataLen(4) + PublicData + ProofLen(4) + ProofData
+	  Same framing as V2/V3; both blobs are capped at MaxFp8ProofSize (FP8).
+
 KEY DESIGN: SYMMETRIC SERIALIZATION
 
 Certificate types implement perfectly mirrored Serialize/Deserialize methods:
@@ -43,8 +46,8 @@ Certificate types implement perfectly mirrored Serialize/Deserialize methods:
 
 # NETWORK RESTRICTIONS
 
-CertificateVersionV1, CertificateVersionV2 and CertificateVersionV3 are allowed.
-IsCertVersionAllowed(v) returns true for all three. blockchain.checkBlockSanity
+CertificateVersionV1 through CertificateVersionV4 are allowed.
+IsCertVersionAllowed(v) returns true for all four. blockchain.checkBlockSanity
 also validates via IsCertVersionAllowed.
 
 # GENESIS BLOCKS
@@ -54,7 +57,8 @@ Genesis blocks are never verified (hardcoded and trusted), only serialized.
 
 # IMPLEMENTATION NOTES
 
-- CertificateMaxSize: 65 KB
+- CertificateMaxSize: 65 KB (V1–V3)
+- CertificateMaxSizeV4: version + two MaxFp8ProofSize blobs
 - Integration: MsgHeader.BlockCertificate() and MsgBlock.BlockCertificate() accessors
 - Storage: Certificate-first serialization, stored with blocks (no separate indexing)
 */
@@ -82,7 +86,17 @@ const (
 	CertificateVersionV1   CertificateVersion = 1
 	CertificateVersionV2   CertificateVersion = 2
 	CertificateVersionV3   CertificateVersion = 3
+	CertificateVersionV4   CertificateVersion = 4
 )
+
+// MaxCertificateSize returns the encoded-size cap for certificate version v,
+// including the 4-byte version prefix.
+func MaxCertificateSize(v CertificateVersion) int {
+	if v == CertificateVersionV4 {
+		return CertificateMaxSizeV4
+	}
+	return CertificateMaxSize
+}
 
 // BlockCertificate is the interface that all certificate types must implement.
 // Certificate types are responsible for their own serialization of fields,
@@ -118,7 +132,7 @@ type BlockCertificate interface {
 // IsCertVersionAllowed reports whether certificate version v is permitted.
 func IsCertVersionAllowed(v CertificateVersion) bool {
 	switch v {
-	case CertificateVersionV1, CertificateVersionV2, CertificateVersionV3:
+	case CertificateVersionV1, CertificateVersionV2, CertificateVersionV3, CertificateVersionV4:
 		return true
 	default:
 		return false
@@ -138,9 +152,9 @@ func (m *MsgCertificate) PrlEncode(w io.Writer, pver uint32) error {
 		return binary.Write(w, binary.LittleEndian, uint32(CertificateVersionNull))
 	}
 
-	// Check size limit
-	if size := m.SerializeSize(); size > CertificateMaxSize {
-		return fmt.Errorf("certificate too large: %d bytes (max %d)", size, CertificateMaxSize)
+	maxSize := MaxCertificateSize(m.Certificate.Version())
+	if size := m.SerializeSize(); size > maxSize {
+		return fmt.Errorf("certificate too large: %d bytes (max %d)", size, maxSize)
 	}
 
 	// Write version first for polymorphic decoding
@@ -173,11 +187,14 @@ func (m *MsgCertificate) PrlDecode(r io.Reader, pver uint32) error {
 	case CertificateVersionV3:
 		m.Certificate = &CertificateV3{}
 
+	case CertificateVersionV4:
+		m.Certificate = &CertificateV4{}
+
 	default:
 		return fmt.Errorf("unsupported certificate version: %d", version)
 	}
 
-	lr := io.LimitReader(r, CertificateMaxSize)
+	lr := io.LimitReader(r, int64(MaxCertificateSize(CertificateVersion(version))))
 	return m.Certificate.Deserialize(lr)
 }
 

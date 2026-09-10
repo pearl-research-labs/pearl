@@ -1,12 +1,15 @@
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from miner_utils import get_logger
-from pearl_mining import PlainProof, check_cert_version_eligible
+from pearl_mining import PlainProof, PlainProofV4, check_cert_version_eligible
 
 from pearl_gateway.comm.dataclasses import BlockTemplate
 from pearl_gateway.pearl_client import PearlNodeClient
 from pearl_gateway.proof_generator import ProofGenerator
+
+if TYPE_CHECKING:
+    from pearl_gateway.proof_pool import ProofPool
 
 logger = get_logger(__name__)
 
@@ -14,23 +17,40 @@ logger = get_logger(__name__)
 class SubmissionService:
     """
     Handles block submissions from miners to the Pearl node.
-    Receives PlainProof from miners and generates complete blocks.
+    Receives PlainProof / PlainProofV4 from miners and generates complete blocks.
     """
 
-    def __init__(self, pearl_client: PearlNodeClient, debug_mode: bool = False):
+    def __init__(
+        self,
+        pearl_client: PearlNodeClient,
+        debug_mode: bool = False,
+        proof_pool: "ProofPool | None" = None,
+    ):
         self.pearl_client = pearl_client
         self.submission_lock = asyncio.Lock()  # Ensure serialized submissions
         self.submission_log = set()
         self.debug_mode = debug_mode
+        self.proof_pool = proof_pool
         self.submitted_blocks = 0
         self.accepted_blocks = 0
         self.rejected_blocks = 0
 
+    async def _build_block(self, plain_proof: PlainProof | PlainProofV4, template: BlockTemplate):
+        if self.proof_pool is not None:
+            public_data, proof_data = await self.proof_pool.prove(
+                int(template.required_cert_version),
+                template.header.serialize_without_proof_commitment(),
+                plain_proof.to_base64(),
+                self.debug_mode,
+            )
+            return ProofGenerator.build_block(public_data, proof_data, template)
+        return ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
+
     async def submit_plain_proof(
-        self, plain_proof: PlainProof, template: BlockTemplate
+        self, plain_proof: PlainProof | PlainProofV4, template: BlockTemplate
     ) -> dict[str, Any]:
         """
-        Submit a block built from PlainProof and the current template.
+        Submit a block built from a plain proof and the current template.
         Returns the result of the submission.
         """
         async with self.submission_lock:
@@ -50,7 +70,7 @@ class SubmissionService:
                     logger.warning(f"Rejecting proof: {e}")
                     return {"status": f"error: {e}"}
 
-                block = ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
+                block = await self._build_block(plain_proof, template)
 
                 # Submit to the Pearl node
                 self.submitted_blocks += 1

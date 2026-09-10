@@ -16,9 +16,11 @@ mod plain;
 mod verify;
 
 pub use common::{CZKProof, PUBLICDATA_MAX_SIZE, PUBLICDATA_SIZE};
-pub use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration};
+pub use zk_pow::v2::api::proof::{IncompleteBlockHeader, MiningConfiguration};
 
 pub use mine::mine;
 pub use verify::verify_zk_proof_v1;
 pub use verify::verify_zk_proof_v2;
 pub use verify::verify_zk_proof_v2_with_nbits;
+pub use verify::verify_zk_proof_v4;
+pub use verify::verify_zk_proof_v4_with_nbits;

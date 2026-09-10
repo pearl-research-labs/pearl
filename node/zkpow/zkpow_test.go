@@ -340,6 +340,35 @@ func BenchmarkMine(b *testing.B) {
 	}
 }
 
+// TestVerifyCertificateV4RejectsGarbage checks a structurally-bound but
+// meaningless proof pair is rejected by the FFI (there is no setup to install:
+// the trusted setups ship in the Rust library's embedded fp8 cache).
+func TestVerifyCertificateV4RejectsGarbage(t *testing.T) {
+	header := testBlockHeader()
+	cert := &wire.CertificateV4{
+		PublicData: []byte{0x01},
+		ProofData:  []byte{0x02},
+	}
+	header.ProofCommitment = cert.ProofCommitment()
+	cert.Hash = header.BlockHash()
+
+	err := VerifyCertificate(header, cert)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid public_data_len")
+}
+
+func TestVerifyCertificateV4HeaderMismatch(t *testing.T) {
+	header := testBlockHeader()
+	cert := &wire.CertificateV4{
+		Hash:       chainhash.Hash{0xff},
+		PublicData: []byte{0x01},
+		ProofData:  []byte{0x02},
+	}
+	err := VerifyCertificate(header, cert)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "block hash mismatch")
+}
+
 // BenchmarkVerifyProof benchmarks the ZK proof verification phase.
 // This measures the time to verify a ZK proof.
 func BenchmarkVerifyProof(b *testing.B) {

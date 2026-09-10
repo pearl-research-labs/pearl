@@ -166,9 +166,10 @@ func TestCheckBlockSanity(t *testing.T) {
 		Bits:       chainParams.PowLimitBits,
 	}
 
-	// Mine a valid certificate (only 1 block, so longer ZK proof time is
-	// acceptable), of the version regtest requires at height 1.
-	cert, err := zkpow.Mine(&header, chainParams.RequiredCertVersion(1))
+	// Mine a valid V3 certificate. CheckBlockSanity only allowlists the
+	// version and verifies the proof; it does not apply the height-gated
+	// V4 cutover. CPU mining cannot produce V4 yet.
+	cert, err := zkpow.Mine(&header, wire.CertificateVersionV3)
 	if err != nil {
 		t.Fatalf("Mine failed: %v", err)
 	}

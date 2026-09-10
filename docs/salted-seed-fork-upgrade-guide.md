@@ -99,9 +99,10 @@ If you built custom mining software, implement the new derivation:
    all experts stacked, but `n` does not include the expert count).
 
 Reference implementations: `zk-pow/src/api/seed.rs` (Rust, with pinned test
-vectors), `miner/miner-base/src/miner_base/commitment_hash.py` (Python,
-`bind_root_a`/`bind_root_b`), and the CUDA kernel behind
-`commitment_hash_from_merkle_roots(..., salted_dims=(m, n))` in `pearl-gemm`.
+vectors). The Python side of the historical V3 salted-seed derivation lived in
+the retired int8 miner (`miner/miner-base`), which the FP8 stack
+under `miner/` and `miner/pearl-gemm/` has replaced; the current Python
+transcript is `miner_base.transcript`.
 
 ## Questions
 

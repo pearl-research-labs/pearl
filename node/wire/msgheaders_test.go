@@ -40,6 +40,12 @@ var oneHeaderEncoded = []byte{
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 }
 
+func TestHeadersMaxPayloadLengthAccountsForV4(t *testing.T) {
+	want := uint32(MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSizeV4) * MaxBlockHeadersPerMsg))
+	require.Equal(t, want, NewMsgHeaders().MaxPayloadLength(ProtocolVersion))
+	require.Greater(t, want, uint32(MaxVarIntPayload+((MaxBlockHeaderPayload+CertificateMaxSize)*MaxBlockHeadersPerMsg)))
+}
+
 // TestHeaders tests the MsgHeaders API.
 func TestHeaders(t *testing.T) {
 	require := require.New(t)

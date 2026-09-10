@@ -1,5 +1,9 @@
 name: "Miner GPU CI"
 
+# FP8 kernels and the vLLM miner are SM100-only (B200); the EC2 runner
+# provisioned below must be a B200 instance (EC2_GPU_INSTANCE_TYPE /
+# EC2_GPU_AMI_ID repository variables).
+
 on:
   merge_group:
     types: [checks_requested]
@@ -18,6 +22,7 @@ concurrency:
 env:
   UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv-gpu-ci
   PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  PYTEST_UNIT_MARKER: ${{ github.event_name == 'merge_group' && 'not integration and not performance' || 'not integration and not performance and not slow' }}
 
 jobs:
   gate:
@@ -48,10 +53,11 @@ jobs:
           filters: |
             should_run:
               - 'miner/pearl-gemm/**'
-              - 'miner/pearl-gemm-build-utils/**'
+              - 'miner/miner-base/**'
               - 'miner/vllm-miner/**'
               - 'miner/conftest.py'
-              - 'miner/pytest.ini'
+              - 'py-pearl-mining/**'
+              - 'pearl-blake3/**'
               - '.github/workflows/miner_gpu_ci.yml'
               - 'pyproject.toml'
               - 'uv.lock'
@@ -82,10 +88,11 @@ jobs:
           security-group-id: ${{ vars.EC2_GPU_SECURITY_GROUP_ID }}
 
   gpu-ci:
-    name: GPU CI
+    name: GPU CI (B200)
     needs: [detect-changes, start-runner]
     if: always() && !cancelled() && needs.detect-changes.outputs.should_run == 'true'
-    runs-on: ${{ needs.start-runner.outputs.label || 'h100-gpu' }}
+    runs-on: ${{ needs.start-runner.outputs.label || 'b200-gpu' }}
+    timeout-minutes: 120
     container:
       image: public.ecr.aws/x5p2d7p8/pearl/ci-container:latest
       options: --gpus all --shm-size=16g --ipc=host
@@ -94,7 +101,6 @@ jobs:
     - name: Check out the repository
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       with:
-        submodules: recursive
         fetch-depth: 1
         persist-credentials: false
         ref: ${{ env.PR_HEAD_SHA }}
@@ -108,15 +114,44 @@ jobs:
     - name: Install uv
       uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
-    - name: Install vllm-miner
-      working-directory: miner/vllm-miner
-      run: uv sync --package vllm-miner --package pearl-gemm --package pearl-gemm-build-utils --no-editable --refresh
+    - name: Install pearl-gemm
+      run: uv sync --locked --package pearl-gemm --extra cuda
 
+    # Every xdist worker opens its own CUDA context on the single B200, so the
+    # worker count is capped instead of `-n auto`. loadfile keeps a file's tests
+    # on one worker, reusing its compile cache. A test stuck for 10 minutes
+    # dumps every thread's stack; the run is capped at 40 minutes.
+    - name: Run kernel tests
+      run: timeout 40m uv run --package pearl-gemm --extra cuda pytest -n 8 --dist loadfile -o faulthandler_timeout=600 -m "${{ github.event_name != 'merge_group' && 'not slow' || '' }}" miner/pearl-gemm/tests
+
+    - name: Install vLLM miner
+      run: uv sync --locked --package vllm-miner --no-editable --refresh
+
+    # Framework-free runtime tests run in parallel; the suites listed under
+    # --ignore size their buffer pools against total GPU memory and run serially
+    # below.
     - name: Run GPU tests
-      run: |
-        uv run pytest -n auto -v -m "not integration" --ignore=miner/vllm-miner/tests/test_vllm_execution.py \
-               miner/pearl-gemm/tests/ \
-               miner/vllm-miner/tests/
+      run: >-
+        uv run pytest -n 8 --dist loadfile -v -m "$PYTEST_UNIT_MARKER"
+        miner/vllm-miner
+        --ignore=miner/vllm-miner/tests/test_capture_gate.py
+        --ignore=miner/vllm-miner/tests/test_fp8_fallback.py
+        --ignore=miner/vllm-miner/tests/test_mining_config.py
+        --ignore=miner/vllm-miner/tests/test_no_mining_kill_switch.py
+        --ignore=miner/vllm-miner/tests/test_runtime_gpu.py
+        --ignore=miner/vllm-miner/tests/test_winner_callback.py
+        --ignore=miner/vllm-miner/tests/test_vllm_adapter.py
+
+    - name: Run GPU device tests (serial)
+      run: >-
+        uv run pytest -v
+        miner/vllm-miner/tests/test_capture_gate.py
+        miner/vllm-miner/tests/test_fp8_fallback.py
+        miner/vllm-miner/tests/test_mining_config.py
+        miner/vllm-miner/tests/test_no_mining_kill_switch.py
+        miner/vllm-miner/tests/test_runtime_gpu.py
+        miner/vllm-miner/tests/test_winner_callback.py
+        miner/vllm-miner/tests/test_vllm_adapter.py
 
   stop-runner:
     name: Stop EC2 GPU Runner

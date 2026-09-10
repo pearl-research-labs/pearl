@@ -51,6 +51,11 @@ func TestBlockTemplateResultRequiredCertVersion(t *testing.T) {
 			cert: &wire.CertificateV3{},
 			want: uint32(wire.CertificateVersionV3),
 		},
+		{
+			name: "v4 placeholder at/after the FP8 fork",
+			cert: &wire.CertificateV4{},
+			want: uint32(wire.CertificateVersionV4),
+		},
 	}
 
 	for _, tc := range testCases {

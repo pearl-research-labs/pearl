@@ -8,14 +8,15 @@
 
 use rand_chacha::rand_core::SeedableRng;
 
-use zk_pow::api::proof::{
-    IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, SeedDerivation, ZKProof,
-};
-use zk_pow::api::{prove, verify};
-use zk_pow::circuit::chip::blake3::program::{BLOCK_LEN, routing_blake_hotspot_rows};
-use zk_pow::circuit::circuit_utils::CircuitCache;
-use zk_pow::ffi::mine::try_mine_one_moe;
+use zk_pow::api::seed::SeedDerivation;
 use zk_pow::ffi::plain_proof::PlainProof;
+use zk_pow::v2::api::proof::{
+    IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, PublicProofParams, ZKProof,
+};
+use zk_pow::v2::api::{prove, verify};
+use zk_pow::v2::circuit::chip::blake3::program::{BLOCK_LEN, routing_blake_hotspot_rows};
+use zk_pow::v2::circuit::circuit_utils::CircuitCache;
+use zk_pow::v2::mine::try_mine_one_moe;
 
 struct MoETestParams {
     header: IncompleteBlockHeader,
@@ -29,7 +30,7 @@ struct MoETestParams {
 /// Dimensions kept small for CI speed; difficulty is permissive.
 fn moe_params() -> MoETestParams {
     let rank = 32u16;
-    let k = 1024;
+    let k = 2048;
     MoETestParams {
         header: IncompleteBlockHeader {
             version: 0,
@@ -80,20 +81,60 @@ fn prove_moe(p: &MoETestParams, moe_proof: &PlainProof) -> prove::ProveResult {
 }
 
 // =============================================================================
-// 1. Correct end-to-end MoE prove + verify
+// 1. Correct end-to-end MoE prove + verify, plus the two public-params tamper
+//    rejections (outer_indices shifted off the routing; hash_routing flipped,
+//    so commitment_hash diverges). Proving is the expensive step, so the two
+//    tamper checks reuse the proven proof instead of re-proving in isolation,
+//    but still mine two distinct proofs so both rejections run against
+//    different routing layouts.
 // =============================================================================
+
+/// Mine, prove, and deserialize a proof into (`public_data`, `proof_data`, `public_params`).
+fn proved_params(p: &MoETestParams, seed: u64) -> (Vec<u8>, Vec<u8>, PublicProofParams) {
+    let moe_proof = mine_moe_proof(p, seed);
+    let result = prove_moe(p, &moe_proof);
+    let (public_params, _) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
+    (result.public_data, result.proof_data, public_params)
+}
 
 #[test]
 fn test_moe_prove_verify() {
     let p = moe_params();
-    let moe_proof = mine_moe_proof(&p, 0xdeadbeef);
-    let result = prove_moe(&p, &moe_proof);
 
-    let (public_params, zk_proof) =
-        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
-
+    // Proof A: happy path + outer_indices tamper.
+    let (public_data, proof_data, public_params) = proved_params(&p, 0xdeadbeef);
     let mut cache = CircuitCache::default();
+    let (_, zk_proof) = ZKProof::deserialize(p.header, SeedDerivation::Legacy, &public_data, &proof_data).unwrap();
     verify::verify_block(&public_params, &zk_proof, &mut cache).expect("MoE proof must verify");
+
+    let mut wrong_outer = public_params.clone();
+    for idx in wrong_outer.moe.as_mut().unwrap().outer_indices.iter_mut() {
+        *idx += 1;
+    }
+    let tampered_public_data = wrong_outer.to_wire_bytes().unwrap();
+    let (tampered_params, zk_proof) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &tampered_public_data, &proof_data).unwrap();
+    let err = verify::verify_block(&tampered_params, &zk_proof, &mut cache).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Preprocessed digest mismatch") || msg.contains("Proof Invalid"),
+        "Expected preprocessed digest or proof mismatch, got: {msg}"
+    );
+
+    // Proof B: hash_routing flip on a different seed (distinct routing layout).
+    let (_, proof_data, public_params) = proved_params(&p, 0xcafebabe);
+    let mut tampered_routing = public_params.clone();
+    tampered_routing.moe.as_mut().unwrap().hash_routing[0] ^= 0xFF;
+    let tampered_data = tampered_routing.to_wire_bytes().unwrap();
+    let (tampered_params, zk_proof) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &tampered_data, &proof_data).unwrap();
+    let err = verify::verify_block(&tampered_params, &zk_proof, &mut cache).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Preprocessed digest mismatch") || msg.contains("Proof Invalid"),
+        "Expected preprocessed digest or proof mismatch, got: {msg}"
+    );
 }
 
 // =============================================================================
@@ -125,7 +166,8 @@ fn test_moe_routing_not_multiple_of_64_parse() {
     let p = moe_params_routing_not_multiple_of_64();
     let moe_proof = mine_moe_proof(&p, 0x51515151);
 
-    let (private, public) = moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
+    let (private, public) =
+        zk_pow::v2::api::plain_proof::parse_plain_proof(p.header, &moe_proof, SeedDerivation::Legacy).unwrap();
     public.sanity_check().unwrap();
     public.sanity_check_private_params(&private).unwrap();
 }
@@ -145,40 +187,7 @@ fn test_moe_routing_not_multiple_of_64_prove_verify() {
 }
 
 // =============================================================================
-// 2. Failure: public outer_indices do not match the routing
-//    The public params carry outer_indices that disagree with the values baked
-//    into the STARK proof via the outer-indices CTL.
-// =============================================================================
-
-#[test]
-fn test_moe_wrong_public_outer_indices_fails_verification() {
-    let p = moe_params();
-    let moe_proof = mine_moe_proof(&p, 0xcafebabe);
-    let result = prove_moe(&p, &moe_proof);
-
-    let (mut public_params, _) =
-        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
-
-    let moe = public_params.moe.as_mut().unwrap();
-    for idx in moe.outer_indices.iter_mut() {
-        *idx += 1;
-    }
-
-    let tampered_public_data = public_params.to_wire_bytes().unwrap();
-    let (tampered_params, zk_proof) =
-        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &tampered_public_data, &result.proof_data).unwrap();
-
-    let mut cache = CircuitCache::default();
-    let err = verify::verify_block(&tampered_params, &zk_proof, &mut cache).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Preprocessed digest mismatch") || msg.contains("Proof Invalid"),
-        "Expected preprocessed digest or proof mismatch, got: {msg}"
-    );
-}
-
-// =============================================================================
-// 3. Failure: corrupted routing Merkle root
+// 2. Failure: corrupted routing Merkle root
 //    parse_moe_proof recomputes hash_routing from the Merkle proof and compares
 //    it to the committed root — a corrupt root is caught immediately.
 // =============================================================================
@@ -194,11 +203,11 @@ fn test_moe_corrupted_routing_root_fails_parse() {
 
     moe_proof.moe = Some(moe);
 
-    moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
+    zk_pow::v2::api::plain_proof::parse_plain_proof(p.header, &moe_proof, SeedDerivation::Legacy).unwrap();
 }
 
 // =============================================================================
-// 4. Failure: routing entries don't match outer_indices
+// 3. Failure: routing entries don't match outer_indices
 //    Perturb a single a.row_index so the routing entry check fails, while
 //    keeping the indices sorted to avoid tripping the sort assertion earlier.
 // =============================================================================
@@ -213,11 +222,11 @@ fn test_moe_routing_outer_index_mismatch_fails_parse() {
     assert!(len >= 1, "Need at least 1 row index");
     moe_proof.a.row_indices[len - 1] += 1;
 
-    moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
+    zk_pow::v2::api::plain_proof::parse_plain_proof(p.header, &moe_proof, SeedDerivation::Legacy).unwrap();
 }
 
 // =============================================================================
-// 5. MoE parse roundtrip: verify all fields survive mine → parse correctly
+// 4. MoE parse roundtrip: verify all fields survive mine → parse correctly
 // =============================================================================
 
 #[test]
@@ -225,7 +234,8 @@ fn test_moe_roundtrip_parse_only() {
     let p = moe_params();
     let moe_proof = mine_moe_proof(&p, 0xdeadbeef);
 
-    let (private, public) = moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
+    let (private, public) =
+        zk_pow::v2::api::plain_proof::parse_plain_proof(p.header, &moe_proof, SeedDerivation::Legacy).unwrap();
 
     let moe = public.moe.as_ref().unwrap();
     assert_eq!(moe.outer_indices.len(), moe_proof.a.row_indices.len());
@@ -248,37 +258,7 @@ fn test_moe_roundtrip_parse_only() {
 }
 
 // =============================================================================
-// 6. Edge case: tampered hash_routing in public params after proving
-//    commitment_hash depends on hash_routing, so the verifier rejects.
-// =============================================================================
-
-#[test]
-fn test_moe_tampered_hash_routing_fails() {
-    let p = moe_params();
-    let moe_proof = mine_moe_proof(&p, 0xabcdef01);
-    let result = prove_moe(&p, &moe_proof);
-
-    let (mut public_params, _) =
-        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
-
-    let moe = public_params.moe.as_mut().unwrap();
-    moe.hash_routing[0] ^= 0xFF;
-
-    let tampered_data = public_params.to_wire_bytes().unwrap();
-    let (tampered_params, zk_proof) =
-        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &tampered_data, &result.proof_data).unwrap();
-
-    let mut cache = CircuitCache::default();
-    let err = verify::verify_block(&tampered_params, &zk_proof, &mut cache).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Preprocessed digest mismatch") || msg.contains("Proof Invalid"),
-        "Expected preprocessed digest or proof mismatch, got: {msg}"
-    );
-}
-
-// =============================================================================
-// 7. Edge case: wrong routing_start_offset
+// 5. Edge case: wrong routing_start_offset
 //    Shifting the offset means the routing entries are read from the wrong
 //    position, so the routing[expert][inner] != outer_indices check fails.
 // =============================================================================
@@ -297,11 +277,11 @@ fn test_moe_wrong_routing_start_offset_fails_parse() {
     moe.routing_end_offsets[moe.expert_idx as usize - 1] += 1;
     moe_proof.moe = Some(moe);
 
-    moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
+    zk_pow::v2::api::plain_proof::parse_plain_proof(p.header, &moe_proof, SeedDerivation::Legacy).unwrap();
 }
 
 // =============================================================================
-// 8. Unit tests for routing_blake_hotspot_rows and the dword-boundary logic
+// 6. Unit tests for routing_blake_hotspot_rows and the dword-boundary logic
 //    that maps (hotspot, idx_in_strip) back to (is_first, is_second, outer_index).
 //
 //    These are cheap, pure-logic tests that exercise the exact edge cases
@@ -492,7 +472,7 @@ fn test_sweep_offsets_1_through_32() {
 }
 
 // =============================================================================
-// 10. End-to-end MoE prove+verify with various expert counts and top_k values
+// 7. End-to-end MoE prove+verify with various expert counts and top_k values
 //     that produce different routing_start_offset alignments.
 //
 //     m and k are kept at 1024 so the miner has enough search space to find a
@@ -506,7 +486,7 @@ fn test_sweep_offsets_1_through_32() {
 
 fn moe_params_custom(e: usize, top_k: usize) -> MoETestParams {
     let rank = 32u16;
-    let k = 1024;
+    let k = 2048;
     MoETestParams {
         header: IncompleteBlockHeader {
             version: 0,
@@ -620,7 +600,7 @@ fn test_moe_prove_verify_e5_top_k3() {
 }
 
 // =============================================================================
-// 11. Failure: outer_index exceeds 26 bits → URANGE13 range check fails
+// 8. Failure: outer_index exceeds 26 bits → URANGE13 range check fails
 //     An outer index ≥ 2^26 cannot be decomposed into two 13-bit limbs that
 //     satisfy both the packing constraint and the URANGE13 lookup.  The STARK
 //     prover's debug constraint check catches this.
@@ -631,7 +611,8 @@ fn test_moe_prove_verify_e5_top_k3() {
 fn test_moe_outer_index_exceeding_26_bits_fails() {
     let p = moe_params();
     let moe_proof = mine_moe_proof(&p, 0xdeadbeef);
-    let (private_params, mut public_params) = moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
+    let (private_params, mut public_params) =
+        zk_pow::v2::api::plain_proof::parse_plain_proof(p.header, &moe_proof, SeedDerivation::Legacy).unwrap();
 
     // Set the last outer_index to 2^26, which exceeds the 26-bit range.
     // Each outer index is split into two 13-bit limbs that are range-checked
