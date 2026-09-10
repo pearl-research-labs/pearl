@@ -15,6 +15,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/require"
 )
 
 // TestBlock tests the API for Block.
@@ -205,11 +206,18 @@ func TestNewBlockFromBytes(t *testing.T) {
 		t.Errorf("MsgBlock: mismatched MsgBlock - got %v, want %v",
 			spew.Sdump(msgBlock), spew.Sdump(&Block100000))
 	}
+}
 
-	trailing := append(append([]byte{}, block100000Bytes...), 0x00)
-	if _, err := btcutil.NewBlockFromBytes(trailing); err == nil {
-		t.Fatal("NewBlockFromBytes: expected trailing-byte error")
-	}
+func TestNewBlockFromBytesRejectsTrailing(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, Block100000.Serialize(&buf))
+
+	_, err := btcutil.NewBlockFromBytes(buf.Bytes())
+	require.NoError(t, err)
+
+	trailing := append(append([]byte(nil), buf.Bytes()...), 0x00)
+	_, err = btcutil.NewBlockFromBytes(trailing)
+	require.ErrorContains(t, err, "trailing bytes")
 }
 
 // TestNewBlockFromBlockAndBytes tests creation of a Block from a MsgBlock and

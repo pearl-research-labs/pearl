@@ -7,7 +7,6 @@ package wire
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"reflect"
@@ -16,6 +15,8 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // makeHeader is a convenience function to make a message header in the form of
@@ -398,47 +399,34 @@ func TestReadMessageTrailingBytes(t *testing.T) {
 	verMsg := NewMsgVersion(me, you, 1, 0)
 
 	var payloadBuf bytes.Buffer
-	verMsg.PrlEncode(&payloadBuf, pver, BaseEncoding)
-	cleanPayload := payloadBuf.Bytes()
+	require.NoError(t, verMsg.PrlEncode(&payloadBuf, pver, BaseEncoding))
 
 	garbage := []byte{0xde, 0xad, 0xbe, 0xef}
-	dirtyPayload := append(cleanPayload, garbage...)
+	dirtyPayload := append(payloadBuf.Bytes(), garbage...)
 
 	checksum := chainhash.DoubleHashB(dirtyPayload)
 	hdr := makeHeader(prlnet, CmdVersion, uint32(len(dirtyPayload)), 0)
 	copy(hdr[20:], checksum[:4])
 	wireBytes := append(hdr, dirtyPayload...)
 
-	r := bytes.NewReader(wireBytes)
-	_, _, _, err := ReadMessageN(r, pver, prlnet)
-	if err == nil {
-		t.Fatal("expected error for message with trailing bytes")
-	}
+	_, _, _, err := ReadMessageN(bytes.NewReader(wireBytes), pver, prlnet)
 
 	var msgErr *MessageError
-	if !errors.As(err, &msgErr) {
-		t.Fatalf("expected MessageError, got: %T (%v)", err, err)
-	}
+	require.ErrorAs(t, err, &msgErr)
+	assert.Contains(t, msgErr.Description, "extra bytes")
 }
 
 func TestReadV2MessageTrailingBytes(t *testing.T) {
-	payload := []byte{
-		v2Messages[CmdInv],
-		0x00,
-		0xaa,
-	}
+	t.Parallel()
 
-	_, _, err := ReadV2MessageN(
-		payload, ProtocolVersion, BaseEncoding,
-	)
-	if err == nil {
-		t.Fatal("expected error for v2 message with trailing bytes")
-	}
+	// Empty inv (count 0) followed by one unconsumed byte.
+	payload := []byte{v2Messages[CmdInv], 0x00, 0xaa}
+
+	_, _, err := ReadV2MessageN(payload, ProtocolVersion, BaseEncoding)
 
 	var msgErr *MessageError
-	if !errors.As(err, &msgErr) {
-		t.Fatalf("expected MessageError, got: %T (%v)", err, err)
-	}
+	require.ErrorAs(t, err, &msgErr)
+	assert.Contains(t, msgErr.Description, "extra bytes")
 }
 
 // TestWriteMessageWireErrors performs negative tests against wire encoding from

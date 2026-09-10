@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
 )
@@ -52,11 +53,11 @@ func TestInboundSourcePrefix(t *testing.T) {
 		},
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := inboundSourcePrefix(test.addr)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := inboundSourcePrefix(tt.addr)
 			require.NoError(t, err)
-			require.Equal(t, test.want, got)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -72,18 +73,32 @@ func TestInboundSourcePrefixIgnoresPort(t *testing.T) {
 		IP: net.ParseIP("192.0.2.9"), Port: 65535,
 	})
 	require.NoError(t, err)
-	require.Equal(t, prefixA, prefixB)
+	assert.Equal(t, prefixA, prefixB)
 }
 
 func TestIsLoopback(t *testing.T) {
 	t.Parallel()
 
-	require.True(t, IsLoopback(&net.TCPAddr{
-		IP: net.ParseIP("127.0.0.2"), Port: 8333,
-	}))
-	require.True(t, IsLoopback(stringAddr("[::1]:8333")))
-	require.False(t, IsLoopback(stringAddr("192.0.2.1:8333")))
-	require.False(t, IsLoopback(stringAddr("attacker-controlled")))
+	tests := []struct {
+		name string
+		addr net.Addr
+		want bool
+	}{
+		{
+			name: "ipv4 loopback",
+			addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 8333},
+			want: true,
+		},
+		{"ipv6 loopback", stringAddr("[::1]:8333"), true},
+		{"public ipv4", stringAddr("192.0.2.1:8333"), false},
+		{"unparseable", stringAddr("attacker-controlled"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IsLoopback(tt.addr))
+		})
+	}
 }
 
 func TestInboundSourceAdmission(t *testing.T) {
@@ -123,7 +138,7 @@ func TestInboundSourceAdmission(t *testing.T) {
 
 	admission.mu.Lock()
 	defer admission.mu.Unlock()
-	require.Empty(t, admission.pendingBySource)
+	assert.Empty(t, admission.pendingBySource)
 }
 
 func TestV2HandshakeAdmission(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 	secp_ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	ecdsa_schnorr "github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
 	"github.com/pearl-research-labs/pearl/node/btcec"
+	"github.com/stretchr/testify/require"
 )
 
 type bip340Test struct {
@@ -296,32 +297,32 @@ func TestParseSignatureComponentRange(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		sig  string
-		err  error
+		name    string
+		sig     string
+		wantErr error
 	}{
 		{
-			name: "r == p",
-			sig:  "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d09",
-			err:  ecdsa_schnorr.ErrSigRTooBig,
+			name:    "r == p",
+			sig:     "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d09",
+			wantErr: ecdsa_schnorr.ErrSigRTooBig,
 		},
 		{
-			name: "s == n",
-			sig:  "4e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd41fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
-			err:  ecdsa_schnorr.ErrSigSTooBig,
+			// BIP340 test vector 13.
+			name:    "s == n",
+			sig:     "4e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd41fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+			wantErr: ecdsa_schnorr.ErrSigSTooBig,
 		},
 		{
-			name: "s > n",
-			sig:  "4e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd41fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364142",
-			err:  ecdsa_schnorr.ErrSigSTooBig,
+			name:    "s > n",
+			sig:     "4e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd41fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364142",
+			wantErr: ecdsa_schnorr.ErrSigSTooBig,
 		},
 	}
 
-	for _, test := range tests {
-		_, err := ParseSignature(decodeHex(test.sig))
-		if !errors.Is(err, test.err) {
-			t.Errorf("%s: mismatched err -- got %v, want %v",
-				test.name, err, test.err)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseSignature(decodeHex(tt.sig))
+			require.ErrorIs(t, err, tt.wantErr)
+		})
 	}
 }

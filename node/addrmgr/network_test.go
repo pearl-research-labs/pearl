@@ -11,6 +11,7 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/addrmgr"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestIPTypes ensures the various functions which determine the type of an IP
@@ -210,34 +211,44 @@ func TestGroupKey(t *testing.T) {
 func TestRFC7343AndZeroRoutable(t *testing.T) {
 	t.Parallel()
 
-	orchid := wire.NewNetAddressIPPort(
-		net.ParseIP("2001:20:abcd::1:1"), 8333, wire.SFNodeNetwork,
-	)
-	if !addrmgr.IsRFC7343(orchid) {
-		t.Fatal("expected ORCHIDv2 address to match RFC7343")
-	}
-	if addrmgr.IsRoutable(wire.NetAddressV2FromBytes(
-		time.Now(), wire.SFNodeNetwork, orchid.IP, 8333,
-	)) {
-		t.Fatal("expected ORCHIDv2 address to be unroutable")
+	tests := []struct {
+		name         string
+		ip           string
+		wantRFC7343  bool
+		wantZero     bool
+		wantRoutable bool
+	}{
+		{
+			name:        "orchidv2",
+			ip:          "2001:20:abcd::1:1",
+			wantRFC7343: true,
+		},
+		{
+			name:     "zero first group",
+			ip:       "0:9881:8181:8181:fe00:a:9e:9801",
+			wantZero: true,
+		},
+		{
+			name:         "rfc6145 translated ipv4",
+			ip:           "::ffff:0:0:1",
+			wantRoutable: true,
+		},
 	}
 
-	zero6 := wire.NewNetAddressIPPort(
-		net.ParseIP("0:9881:8181:8181:fe00:a:9e:9801"), 8333, wire.SFNodeNetwork,
-	)
-	if !addrmgr.IsZero(zero6) {
-		t.Fatal("expected 0000::/16 address to be IsZero")
-	}
-	if addrmgr.IsRoutable(wire.NetAddressV2FromBytes(
-		time.Now(), wire.SFNodeNetwork, zero6.IP, 8333,
-	)) {
-		t.Fatal("expected 0000::/16 address to be unroutable")
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	rfc6145 := wire.NewNetAddressIPPort(
-		net.ParseIP("::ffff:0:0:1"), 8333, wire.SFNodeNetwork,
-	)
-	if addrmgr.IsZero(rfc6145) {
-		t.Fatal("RFC6145 addresses must not be treated as zero")
+			na := wire.NewNetAddressIPPort(
+				net.ParseIP(tt.ip), 8333, wire.SFNodeNetwork,
+			)
+			naV2 := wire.NetAddressV2FromBytes(
+				time.Now(), wire.SFNodeNetwork, na.IP, 8333,
+			)
+
+			assert.Equal(t, tt.wantRFC7343, addrmgr.IsRFC7343(na))
+			assert.Equal(t, tt.wantZero, addrmgr.IsZero(na))
+			assert.Equal(t, tt.wantRoutable, addrmgr.IsRoutable(naV2))
+		})
 	}
 }

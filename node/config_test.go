@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"runtime"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -24,15 +26,14 @@ func TestValidateMaxPeers(t *testing.T) {
 		{name: "positive", maxPeers: 1},
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			err := validateMaxPeers(test.maxPeers)
-			if test.wantErr && err == nil {
-				t.Fatal("expected error")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMaxPeers(tt.maxPeers)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
 			}
-			if !test.wantErr && err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			require.NoError(t, err)
 		})
 	}
 }

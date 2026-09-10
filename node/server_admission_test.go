@@ -4,32 +4,84 @@
 
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 func TestTargetOutboundPeers(t *testing.T) {
 	t.Parallel()
 
-	if got := targetOutboundPeers(125, 0, true); got != defaultTargetOutbound {
-		t.Fatalf("automatic: got %d", got)
+	tests := []struct {
+		name           string
+		maxPeers       int
+		permanentPeers int
+		automatic      bool
+		want           int
+	}{
+		{"automatic", 125, 0, true, defaultTargetOutbound},
+		{"capped by maxpeers", 5, 0, true, 5},
+		{"connect-only", 125, 3, false, 0},
+		{"permanent consumes budget", 8, 8, true, 0},
 	}
-	if got := targetOutboundPeers(5, 0, true); got != 5 {
-		t.Fatalf("capped by maxpeers: got %d", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := targetOutboundPeers(
+				tt.maxPeers, tt.permanentPeers, tt.automatic,
+			)
+			assert.Equal(t, tt.want, got)
+		})
 	}
-	if got := targetOutboundPeers(125, 3, false); got != 0 {
-		t.Fatalf("connect-only: got %d", got)
+}
+
+func TestReservedOutboundPeers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		maxPeers       int
+		targetOutbound int
+		permanentPeers int
+		automatic      bool
+		want           int
+	}{
+		{"automatic only", 125, 8, 0, true, 8},
+		{"automatic plus permanent", 125, 8, 3, true, 11},
+		{"connect-only", 125, 0, 3, false, 3},
+		{"capped at maxpeers", 5, 5, 3, true, 5},
 	}
-	if got := targetOutboundPeers(8, 8, true); got != 0 {
-		t.Fatalf("permanent consumed budget: got %d", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := reservedOutboundPeers(
+				tt.maxPeers, tt.targetOutbound, tt.permanentPeers,
+				tt.automatic,
+			)
+			assert.Equal(t, tt.want, got)
+		})
 	}
 }
 
 func TestMaxInboundPeers(t *testing.T) {
 	t.Parallel()
 
-	if got := maxInboundPeers(125, 8); got != 117 {
-		t.Fatalf("got %d", got)
+	tests := []struct {
+		name             string
+		maxPeers         int
+		reservedOutbound int
+		want             uint32
+	}{
+		{"leftover", 125, 8, 117},
+		{"no leftover", 8, 8, 0},
+		{"reserved exceeds maxpeers", 5, 8, 0},
 	}
-	if got := maxInboundPeers(8, 8); got != 0 {
-		t.Fatalf("no inbound leftover: got %d", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := maxInboundPeers(tt.maxPeers, tt.reservedOutbound)
+			assert.Equal(t, tt.want, got)
+		})
 	}
 }

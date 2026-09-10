@@ -13,6 +13,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcutil/bloom"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/require"
 )
 
 // TestFilterLarge ensures a maximum sized filter can be created.
@@ -291,11 +292,9 @@ func TestFilterBloomMatch(t *testing.T) {
 		t.Errorf("TestFilterBloomMatch DecodeString failure: %v", err)
 		return
 	}
+	// The fixture carries trailing bytes, which NewTxFromBytes rejects.
 	var msgTx wire.MsgTx
-	if err := msgTx.Deserialize(bytes.NewReader(strBytes)); err != nil {
-		t.Errorf("TestFilterBloomMatch Deserialize failure: %v", err)
-		return
-	}
+	require.NoError(t, msgTx.Deserialize(bytes.NewReader(strBytes)))
 	tx := btcutil.NewTx(&msgTx)
 	spendingTxBytes := []byte{0x01, 0x00, 0x00, 0x00, 0x01, 0x6b, 0xff, 0x7f,
 		0xcd, 0x4f, 0x85, 0x65, 0xef, 0x40, 0x6d, 0xd5, 0xd6,
@@ -328,10 +327,7 @@ func TestFilterBloomMatch(t *testing.T) {
 		0x43, 0xf9, 0x88, 0xac, 0x00, 0x00, 0x00, 0x00, 0x00}
 
 	var spendingMsgTx wire.MsgTx
-	if err := spendingMsgTx.Deserialize(bytes.NewReader(spendingTxBytes)); err != nil {
-		t.Errorf("TestFilterBloomMatch Deserialize failure: %v", err)
-		return
-	}
+	require.NoError(t, spendingMsgTx.Deserialize(bytes.NewReader(spendingTxBytes)))
 	spendingTx := btcutil.NewTx(&spendingMsgTx)
 
 	f := bloom.NewFilter(10, 0, 0.000001, wire.BloomUpdateAll)

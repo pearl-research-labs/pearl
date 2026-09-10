@@ -10,6 +10,7 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,7 +26,7 @@ func TestTaprootMultiAFinalizerOrdersSignatures(t *testing.T) {
 		AddInt64(2).AddOp(txscript.OP_NUMEQUAL).Script()
 	require.NoError(t, err)
 
-	testCases := []struct {
+	tests := []struct {
 		name string
 		sigs []*TaprootScriptSpendSig
 	}{
@@ -45,16 +46,14 @@ func TestTaprootMultiAFinalizerOrdersSignatures(t *testing.T) {
 		},
 	}
 
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			packet := taprootMultiATestPacket(
-				t, script, testCase.sigs,
-			)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packet := taprootMultiATestPacket(t, script, tt.sigs)
 
 			require.NoError(t, MaybeFinalizeAll(packet))
 			finalTx, err := Extract(packet)
 			require.NoError(t, err)
-			require.Equal(t, wire.TxWitness{
+			assert.Equal(t, wire.TxWitness{
 				sigB,
 				sigA,
 				script,
@@ -86,7 +85,7 @@ func TestTaprootMultiAFinalizerAddsPlaceholders(t *testing.T) {
 	require.NoError(t, MaybeFinalizeAll(packet))
 	finalTx, err := Extract(packet)
 	require.NoError(t, err)
-	require.Equal(t, wire.TxWitness{
+	assert.Equal(t, wire.TxWitness{
 		sigC,
 		[]byte{},
 		sigA,
@@ -119,7 +118,7 @@ func TestTaprootMultiAFinalizerIgnoresExcessSignatures(t *testing.T) {
 	require.NoError(t, MaybeFinalizeAll(packet))
 	finalTx, err := Extract(packet)
 	require.NoError(t, err)
-	require.Equal(t, wire.TxWitness{
+	assert.Equal(t, wire.TxWitness{
 		[]byte{},
 		sigB,
 		sigA,

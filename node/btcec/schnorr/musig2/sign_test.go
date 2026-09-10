@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -395,5 +396,5 @@ func TestPartialSignatureDecodeShortRead(t *testing.T) {
 
 	var sig PartialSignature
 	err := sig.Decode(bytes.NewReader([]byte{0x01, 0x02}))
-	require.Error(t, err)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 }

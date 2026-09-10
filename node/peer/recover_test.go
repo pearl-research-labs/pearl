@@ -1,8 +1,14 @@
+// Copyright (c) 2025-2026 The Pearl Research Labs
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
 package peer
 
 import (
 	"sync/atomic"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRecoverFromPanic(t *testing.T) {
@@ -22,8 +28,10 @@ func TestRecoverFromPanic(t *testing.T) {
 
 	<-done
 
-	if atomic.LoadInt32(&p.disconnect) == 0 {
-		t.Fatal("expected disconnect flag to be set " +
-			"after panic recovery")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&p.disconnect))
+	select {
+	case <-p.quit:
+	default:
+		assert.Fail(t, "quit channel must be closed by Disconnect")
 	}
 }
