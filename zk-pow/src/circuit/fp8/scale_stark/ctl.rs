@@ -19,7 +19,9 @@ use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
-use super::super::ctl::{LutLookup, LutTable, Table};
+use super::super::ctl::Table;
+use super::super::luts::LutTable;
+use super::super::luts::ctl::LutLookup;
 use super::columns::{
     ALIGNED_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT, H_MULT_PUBLIC_INPUT, L2_SUM_LIMBS,
     SCALE_COL_MAP, W_MULT_PUBLIC_INPUT,
