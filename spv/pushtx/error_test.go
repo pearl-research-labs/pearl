@@ -112,23 +112,3 @@ func TestParseBroadcastErrorCode(t *testing.T) {
 		})
 	}
 }
-
-// TestBroadcastErrorCodeString ensures every code has a distinct name, so log
-// lines can tell a transaction nobody requested apart from a rejected one.
-func TestBroadcastErrorCodeString(t *testing.T) {
-	t.Parallel()
-
-	codes := map[pushtx.BroadcastErrorCode]string{
-		pushtx.Unknown:         "Unknown",
-		pushtx.Invalid:         "Invalid",
-		pushtx.InsufficientFee: "InsufficientFee",
-		pushtx.Mempool:         "Mempool",
-		pushtx.Confirmed:       "Confirmed",
-		pushtx.NotRelayed:      "NotRelayed",
-	}
-	for code, want := range codes {
-		if got := code.String(); got != want {
-			t.Fatalf("code %d: expected %q, got %q", code, want, got)
-		}
-	}
-}

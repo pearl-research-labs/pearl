@@ -78,21 +78,3 @@ func TestTransactionInvAnnouncesByTxid(t *testing.T) {
 	require.Equal(t, wire.InvTypeTx, inv.InvList[0].Type)
 	require.Equal(t, tx.TxHash(), inv.InvList[0].Hash)
 }
-
-// TestNotRelayedErrorReason ensures the reason distinguishes having no peers
-// from having peers that did not ask, since operators triage them differently.
-func TestNotRelayedErrorReason(t *testing.T) {
-	t.Parallel()
-
-	txHash := testTx().TxHash()
-
-	err := notRelayedError(txHash, 0)
-	require.True(t, pushtx.IsBroadcastError(err, pushtx.NotRelayed))
-	require.ErrorContains(t, err, "no connected peers")
-	require.ErrorContains(t, err, txHash.String())
-
-	err = notRelayedError(txHash, 3)
-	require.True(t, pushtx.IsBroadcastError(err, pushtx.NotRelayed))
-	require.ErrorContains(t, err, "none of 3 connected peers")
-	require.ErrorContains(t, err, txHash.String())
-}

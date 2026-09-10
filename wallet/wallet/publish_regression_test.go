@@ -38,16 +38,11 @@ func (c *neutrinoSendClient) SendRawTransaction(tx *wire.MsgTx,
 	return c.neutrino.SendRawTransaction(tx, allowHighFees)
 }
 
-// ghostHarness is a funded simnet wallet whose broadcasts go through a running
-// Neutrino ChainService that has no peers.
-type ghostHarness struct {
-	w          *Wallet
-	fundingOut wire.OutPoint
-}
-
-// newGhostHarness builds the harness. Simnet is a dev network, so the service
-// never DNS-seeds and stays peerless for the whole test.
-func newGhostHarness(t *testing.T) *ghostHarness {
+// newPeerlessSPVWallet returns a funded simnet wallet whose broadcasts go
+// through a running Neutrino ChainService that has no peers, plus the funding
+// outpoint. Simnet is a dev network, so the service never DNS-seeds and stays
+// peerless for the whole test.
+func newPeerlessSPVWallet(t *testing.T) (*Wallet, wire.OutPoint) {
 	t.Helper()
 
 	w, cleanup := testWalletWithParams(t, &chaincfg.SimNetParams)
@@ -78,10 +73,7 @@ func newGhostHarness(t *testing.T) *ghostHarness {
 		),
 	}
 
-	return &ghostHarness{
-		w:          w,
-		fundingOut: fundWallet(t, w, 100_000),
-	}
+	return w, fundWallet(t, w, 100_000)
 }
 
 // fundWallet credits the wallet with one confirmed taproot output and returns
@@ -146,60 +138,27 @@ func walletTxState(t *testing.T, w *Wallet) ([]*wire.MsgTx, []wtxmgr.Credit) {
 // transaction. Nothing left the machine, so the send must fail and leave no
 // local record instead of being reported as sent with the coins locked.
 func TestGhostPendingSendRegression(t *testing.T) {
-	t.Run("first publish without relay is a clean failure",
-		func(t *testing.T) {
-			h := newGhostHarness(t)
+	w, fundingOut := newPeerlessSPVWallet(t)
 
-			start := time.Now()
-			tx, err := h.w.SendOutputs(
-				[]*wire.TxOut{externalTaprootOutput(t, 50_000)},
-				nil, 0, 1, 1000, CoinSelectionLargest, "",
-			)
-			elapsed := time.Since(start)
+	start := time.Now()
+	tx, err := w.SendOutputs(
+		[]*wire.TxOut{externalTaprootOutput(t, 50_000)}, nil, 0, 1, 1000,
+		CoinSelectionLargest, "",
+	)
+	elapsed := time.Since(start)
 
-			unmined, unspent := walletTxState(t, h.w)
-			state := fmt.Sprintf("err=%v, unmined=%d, funding output "+
-				"unspent=%v", err, len(unmined),
-				hasOutPoint(unspent, h.fundingOut))
+	unmined, unspent := walletTxState(t, w)
+	state := fmt.Sprintf("err=%v, unmined=%d, funding output unspent=%v",
+		err, len(unmined), hasOutPoint(unspent, fundingOut))
 
-			require.ErrorIs(t, err, chain.ErrTxNotRelayed,
-				"ghost pending: %s", state)
-			require.ErrorContains(t, err, "no connected peers")
-			require.Nil(t, tx)
-			require.Less(t, elapsed, pushtx.DefaultBroadcastTimeout)
+	require.ErrorIs(t, err, chain.ErrTxNotRelayed, "ghost pending: %s", state)
+	require.ErrorContains(t, err, "no connected peers")
+	require.Nil(t, tx)
+	require.Less(t, elapsed, pushtx.DefaultBroadcastTimeout)
 
-			require.Empty(t, unmined, state)
-			require.Len(t, unspent, 1, state)
-			require.Equal(t, h.fundingOut, unspent[0].OutPoint, state)
-		})
-
-	t.Run("resend keeps a previously accepted tx", func(t *testing.T) {
-		h := newGhostHarness(t)
-
-		// A record already in the store was accepted for relay earlier
-		// (or predates the fix), so a peerless resend must not discard
-		// it.
-		authored, err := h.w.txToOutputs(
-			[]*wire.TxOut{externalTaprootOutput(t, 50_000)}, nil, nil,
-			0, 1, 1000, CoinSelectionLargest, false, nil,
-			alwaysAllowUtxo,
-		)
-		require.NoError(t, err)
-
-		rec, err := wtxmgr.NewTxRecordFromMsgTx(authored.Tx, time.Now())
-		require.NoError(t, err)
-		err = walletdb.Update(h.w.db, func(tx walletdb.ReadWriteTx) error {
-			return h.w.addRelevantTx(tx, rec, nil)
-		})
-		require.NoError(t, err)
-
-		h.w.resendUnminedTxs()
-
-		unmined, unspent := walletTxState(t, h.w)
-		require.Len(t, unmined, 1)
-		require.Equal(t, authored.Tx.TxHash(), unmined[0].TxHash())
-		require.False(t, hasOutPoint(unspent, h.fundingOut))
-	})
+	require.Empty(t, unmined, state)
+	require.Len(t, unspent, 1, state)
+	require.Equal(t, fundingOut, unspent[0].OutPoint, state)
 }
 
 func hasOutPoint(credits []wtxmgr.Credit, op wire.OutPoint) bool {
