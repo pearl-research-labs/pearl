@@ -142,11 +142,23 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 		return fmt.Errorf("fp8 public data too large: %d bytes (max %d)",
 			len(publicData), C.PUBLICDATA_MAX_SIZE)
 	}
-	if err := checkCertificateAncestors(header, cert); err != nil {
-		return err
+	if len(cert.AncestorHeaders) > wire.MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("v4 certificate has %d ancestor headers, max %d",
+			len(cert.AncestorHeaders), wire.MaxCertificateV4AncestorHeaders)
 	}
 
-	cBlockHeader := blockHeaderToC(header)
+	// Rust owns proof-specific header interpretation and ancestry verification.
+	var headers bytes.Buffer
+	headers.Grow((1 + len(cert.AncestorHeaders)) * wire.MaxBlockHeaderPayload)
+	if err := header.Serialize(&headers); err != nil {
+		return err
+	}
+	for i := range cert.AncestorHeaders {
+		if err := cert.AncestorHeaders[i].Serialize(&headers); err != nil {
+			return err
+		}
+	}
+	headerBytes := headers.Bytes()
 
 	var cZKProof C.CZKProof
 	cZKProof.public_data_len = C.uintptr_t(len(publicData))
@@ -160,7 +172,9 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 	cZKProof.proof_blob = (*C.uint8_t)(unsafe.Pointer(&proofData[0]))
 
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
-	result := C.verify_zk_proof_v4(&cBlockHeader, &cZKProof, &errorBuf[0])
+	result := C.verify_zk_proof_v4(
+		(*C.uint8_t)(unsafe.Pointer(&headerBytes[0])), C.uintptr_t(len(headerBytes)),
+		&cZKProof, &errorBuf[0])
 	msg := C.GoString(&errorBuf[0])
 
 	switch result {
@@ -173,39 +187,6 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 	default:
 		return fmt.Errorf("unknown v4 verification result %d: %s", result, msg)
 	}
-}
-
-// checkCertificateAncestors authenticates the V4 proof's ancestor against the
-// proposed header and the certificate's hash-linked parent and grandparent.
-func checkCertificateAncestors(proposed *wire.BlockHeader, cert *wire.CertificateV4) error {
-	if len(cert.AncestorHeaders) > wire.MaxCertificateV4AncestorHeaders {
-		return fmt.Errorf("v4 certificate has %d ancestor headers, max %d",
-			len(cert.AncestorHeaders), wire.MaxCertificateV4AncestorHeaders)
-	}
-	publicData := cert.PublicDataBytes()
-	if len(publicData) < wire.IncompleteBlockHeaderSize {
-		return fmt.Errorf("v4 public data is %d bytes, want at least %d",
-			len(publicData), wire.IncompleteBlockHeaderSize)
-	}
-
-	ancestorHeader := publicData[:wire.IncompleteBlockHeaderSize]
-	proposedBytes := proposed.IncompleteHeaderBytes()
-	matched := bytes.Equal(ancestorHeader, proposedBytes[:])
-	prevHash := proposed.PrevBlock
-	// Authenticate every supplied header, including those after a match.
-	for i := range cert.AncestorHeaders {
-		header := &cert.AncestorHeaders[i]
-		if header.BlockHash() != prevHash {
-			return fmt.Errorf("v4 ancestor header at depth %d does not connect", i+1)
-		}
-		candidateBytes := header.IncompleteHeaderBytes()
-		matched = matched || bytes.Equal(ancestorHeader, candidateBytes[:])
-		prevHash = header.PrevBlock
-	}
-	if !matched {
-		return fmt.Errorf("v4 ancestor header is not the proposed header, its parent, or its grandparent")
-	}
-	return nil
 }
 
 // VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.

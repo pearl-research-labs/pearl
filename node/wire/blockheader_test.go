@@ -88,11 +88,6 @@ func TestBlockHeaderWire(t *testing.T) {
 
 	t.Logf("Running %d tests", len(tests))
 	for i, test := range tests {
-		prefix := test.in.IncompleteHeaderBytes()
-		if !bytes.Equal(prefix[:], test.buf[:IncompleteBlockHeaderSize]) {
-			t.Errorf("IncompleteHeaderBytes #%d does not match the golden wire prefix", i)
-		}
-
 		// Encode to wire format.
 		var buf bytes.Buffer
 		err := writeBlockHeader(&buf, test.pver, test.in)

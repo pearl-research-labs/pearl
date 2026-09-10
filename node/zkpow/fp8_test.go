@@ -11,11 +11,9 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
-	"slices"
 	"testing"
 	"time"
 
-	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/require"
 )
@@ -23,10 +21,10 @@ import (
 // loadFp8Fixture loads the FP8 proof fixture generated from Rust's canonical
 // deterministic job and returns the block header it binds together with
 // its V4 certificate. Format: header(76) | u32le public_data_len | public_data
-// | proof_data, where the header is the Rust IncompleteBlockHeader
-// serialization (version, prev_block and merkle_root in display order,
-// timestamp, nbits, all little-endian). Regenerate on a machine with enough
-// memory for the wrapped proof:
+// | proof_data. The fixture header uses canonical wire bytes with the proof
+// commitment omitted. Its symmetric hashes cannot establish byte order; the
+// Rust ancestry tests cover full headers with asymmetric bytes. Regenerate on
+// a machine with enough memory for the wrapped proof:
 //
 //	task generate:fp8-fixture
 //
@@ -43,21 +41,6 @@ func loadFp8Fixture(t *testing.T) (*wire.BlockHeader, *wire.CertificateV4) {
 	require.NoError(t, err, "reading the fp8 fixture")
 	require.Greater(t, len(raw), 80, "fixture too short for header and length prefix")
 
-	// The fixture hashes are in display order; wire.BlockHeader holds internal
-	// (wire) order, the reverse (see blockHeaderToC).
-	var prevBlock, merkleRoot chainhash.Hash
-	for i := 0; i < chainhash.HashSize; i++ {
-		prevBlock[i] = raw[4+chainhash.HashSize-1-i]
-		merkleRoot[i] = raw[36+chainhash.HashSize-1-i]
-	}
-	header := &wire.BlockHeader{
-		Version:    int32(binary.LittleEndian.Uint32(raw[0:4])),
-		PrevBlock:  prevBlock,
-		MerkleRoot: merkleRoot,
-		Timestamp:  time.Unix(int64(binary.LittleEndian.Uint32(raw[68:72])), 0),
-		Bits:       binary.LittleEndian.Uint32(raw[72:76]),
-	}
-
 	publicLen := binary.LittleEndian.Uint32(raw[76:80])
 	require.LessOrEqual(t, int(publicLen), wire.MaxFp8ProofSize, "fixture public data too large")
 	require.Greater(t, len(raw)-80, int(publicLen), "fixture missing proof data")
@@ -67,7 +50,10 @@ func loadFp8Fixture(t *testing.T) (*wire.BlockHeader, *wire.CertificateV4) {
 		ProofData:  append([]byte(nil), raw[80+publicLen:]...),
 	}
 
-	header.ProofCommitment = cert.ProofCommitment()
+	commitment := cert.ProofCommitment()
+	headerBytes := append(bytes.Clone(raw[:76]), commitment[:]...)
+	header := &wire.BlockHeader{}
+	require.NoError(t, header.Deserialize(bytes.NewReader(headerBytes)))
 	cert.Hash = header.BlockHash()
 	return header, cert
 }
@@ -84,13 +70,6 @@ func copyCertificateV4(c *wire.CertificateV4) *wire.CertificateV4 {
 
 func TestVerifyCertificateV4(t *testing.T) {
 	header, cert := loadFp8Fixture(t)
-
-	// Repeated fixture hashes cannot detect byte-order reversals.
-	var serialized bytes.Buffer
-	require.NoError(t, header.Serialize(&serialized))
-	size := wire.MaxBlockHeaderPayload - chainhash.HashSize
-	require.Equal(t, serialized.Bytes()[:size], cert.PublicData[:size],
-		"fixture ancestor header must match the loaded header prefix")
 
 	require.NoError(t, VerifyCertificate(header, cert), "the mined fp8 certificate should verify")
 }
@@ -149,12 +128,8 @@ func TestVerifyCertificateV4_WrongHeader(t *testing.T) {
 	wrongHeader := copyBlockHeader(header)
 	wrongHeader.Timestamp = header.Timestamp.Add(time.Second)
 	wrongCert := copyCertificateV4(cert)
-	publicHeader := wrongHeader.IncompleteHeaderBytes()
-	copy(wrongCert.PublicData, publicHeader[:])
-	wrongHeader.ProofCommitment = wrongCert.ProofCommitment()
 	wrongCert.Hash = wrongHeader.BlockHash()
-	// The ancestry matches, but the unchanged proof must fail native statement binding.
-	require.ErrorContains(t, VerifyCertificate(wrongHeader, wrongCert), "does not verify against the expected statement")
+	require.ErrorContains(t, VerifyCertificate(wrongHeader, wrongCert), "ancestor header is not")
 }
 
 func TestVerifyCertificateV4_CommitmentMismatch(t *testing.T) {
@@ -171,75 +146,4 @@ func TestVerifyCertificateV4_EmptyProof(t *testing.T) {
 	tampered := copyCertificateV4(cert)
 	tampered.ProofData = nil
 	require.ErrorContains(t, VerifyCertificate(header, tampered), "empty fp8 proof")
-}
-
-func ancestorPublicData(t *testing.T, header *wire.BlockHeader) []byte {
-	t.Helper()
-	var serialized bytes.Buffer
-	require.NoError(t, header.Serialize(&serialized))
-	return serialized.Bytes()[:wire.IncompleteBlockHeaderSize]
-}
-
-func TestCheckCertificateAncestors(t *testing.T) {
-	grandparent := *testBlockHeader()
-	parent := grandparent
-	parent.Version++
-	parent.PrevBlock = grandparent.BlockHash()
-	proposed := parent
-	proposed.Version++
-	proposed.PrevBlock = parent.BlockHash()
-	rogue := grandparent
-	rogue.Version++
-	proposedData := ancestorPublicData(t, &proposed)
-	parentData := ancestorPublicData(t, &parent)
-	grandparentData := ancestorPublicData(t, &grandparent)
-	rogueData := ancestorPublicData(t, &rogue)
-	wrongParent := parent
-	wrongParent.ProofCommitment[0] ^= 0xff
-	wrongGrandparent := grandparent
-	wrongGrandparent.ProofCommitment[0] ^= 0xff
-	other := proposed
-	other.ProofCommitment[0] ^= 0xff
-	reversedPrev := bytes.Clone(proposedData)
-	slices.Reverse(reversedPrev[4:36])
-	reversedMerkle := bytes.Clone(proposedData)
-	slices.Reverse(reversedMerkle[36:68])
-
-	for _, test := range []struct {
-		name     string
-		proposed wire.BlockHeader
-		cert     wire.CertificateV4
-		wantErr  bool
-	}{
-		{"depth 0", proposed, wire.CertificateV4{PublicData: proposedData}, false},
-		{"depth 1", proposed, wire.CertificateV4{PublicData: parentData, AncestorHeaders: []wire.BlockHeader{parent}}, false},
-		{"depth 2", proposed, wire.CertificateV4{PublicData: grandparentData, AncestorHeaders: []wire.BlockHeader{parent, grandparent}}, false},
-		{"depth 0 with ancestors", proposed, wire.CertificateV4{PublicData: proposedData, AncestorHeaders: []wire.BlockHeader{parent, grandparent}}, false},
-		{"outside window", proposed, wire.CertificateV4{PublicData: rogueData, AncestorHeaders: []wire.BlockHeader{parent, grandparent}}, true},
-		{"missing ancestor", proposed, wire.CertificateV4{PublicData: parentData}, true},
-		{"missing intermediate", proposed, wire.CertificateV4{PublicData: grandparentData, AncestorHeaders: []wire.BlockHeader{grandparent}}, true},
-		{"reversed order", proposed, wire.CertificateV4{PublicData: grandparentData, AncestorHeaders: []wire.BlockHeader{grandparent, parent}}, true},
-		{"wrong branch", proposed, wire.CertificateV4{PublicData: rogueData, AncestorHeaders: []wire.BlockHeader{rogue}}, true},
-		{"parent commitment", proposed, wire.CertificateV4{PublicData: parentData, AncestorHeaders: []wire.BlockHeader{wrongParent}}, true},
-		{"grandparent commitment", proposed, wire.CertificateV4{PublicData: grandparentData, AncestorHeaders: []wire.BlockHeader{parent, wrongGrandparent}}, true},
-		{"invalid after depth 0 match", proposed, wire.CertificateV4{PublicData: proposedData, AncestorHeaders: []wire.BlockHeader{rogue}}, true},
-		{"invalid after depth 1 match", proposed, wire.CertificateV4{PublicData: parentData, AncestorHeaders: []wire.BlockHeader{parent, rogue}}, true},
-		{"excessive depth", proposed, wire.CertificateV4{PublicData: proposedData, AncestorHeaders: []wire.BlockHeader{parent, grandparent, rogue}}, true},
-		{"reversed previous hash", proposed, wire.CertificateV4{PublicData: reversedPrev}, true},
-		{"reversed merkle root", proposed, wire.CertificateV4{PublicData: reversedMerkle}, true},
-		{"current commitment excluded", other, wire.CertificateV4{PublicData: proposedData}, false},
-		{"empty public data", proposed, wire.CertificateV4{}, true},
-		{"short public data", proposed, wire.CertificateV4{
-			PublicData: make([]byte, wire.IncompleteBlockHeaderSize-1),
-		}, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			err := checkCertificateAncestors(&test.proposed, &test.cert)
-			if test.wantErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-		})
-	}
 }

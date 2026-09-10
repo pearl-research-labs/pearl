@@ -7,6 +7,8 @@
 package blockchain
 
 import (
+	"encoding/binary"
+	"os"
 	"testing"
 	"time"
 
@@ -17,22 +19,29 @@ import (
 )
 
 func TestCertificateAncestorVerificationPaths(t *testing.T) {
+	// Fixture framing is header(76), public length(4), public data, proof.
+	raw, err := os.ReadFile("../zkpow/testdata/fp8_zk_proof_b200.bin")
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(raw), 80)
+	publicLen := int(binary.LittleEndian.Uint32(raw[76:80]))
+	require.LessOrEqual(t, 80+publicLen, len(raw))
+
 	params := &chaincfg.RegressionNetParams
 	header := wire.BlockHeader{
 		Version: 1, Timestamp: time.Unix(100, 0), Bits: params.PowLimitBits,
 	}
 	header.PrevBlock[0] = 1
-	prefix := header.IncompleteHeaderBytes()
 	cert := &wire.CertificateV4{
-		PublicData:      prefix[:],
+		PublicData:      raw[80 : 80+publicLen],
 		ProofData:       []byte{1},
 		AncestorHeaders: []wire.BlockHeader{header},
 	}
 	header.ProofCommitment = cert.ProofCommitment()
 	cert.Hash = header.BlockHash()
 
-	// The certificate matches the current header, but its supplied ancestor
-	// does not connect. Both public validation paths must reject it before FFI.
+	// The certificate's hash and commitment match, but its supplied ancestor
+	// does not connect. Native ancestry validation must reject it before
+	// proof verification through both public validation paths.
 	t.Run("proof of work", func(t *testing.T) {
 		block := btcutil.NewBlock(&wire.MsgBlock{MsgHeader: wire.MsgHeader{
 			BlockHeader:    header,

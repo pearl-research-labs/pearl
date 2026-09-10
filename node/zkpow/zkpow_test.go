@@ -357,7 +357,7 @@ func TestVerifyCertificateV4RejectsGarbage(t *testing.T) {
 		publicLen int
 		wantErr   string
 	}{
-		{1, "v4 public data is 1 bytes, want at least 76"},
+		{1, "invalid public_data_len"},
 		{wire.MaxFp8ProofSize, "fp8 public data too large"}, // Reject before the C-buffer copy.
 	} {
 		t.Run(test.wantErr, func(t *testing.T) {
