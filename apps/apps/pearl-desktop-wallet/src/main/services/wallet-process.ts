@@ -137,6 +137,7 @@ class WalletProcess {
       const isImport = !!seed;
       let walletConfigFile: string | undefined;
 
+      fs.mkdirSync(this.config.dataDir, { recursive: true });
       walletConfigFile = path.join(this.config.dataDir, 'wallet-setup.json');
       const walletConfig = {
         seed,
