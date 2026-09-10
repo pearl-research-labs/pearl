@@ -314,7 +314,14 @@ class WalletProcess {
             const elapsed = Date.now() - startTime;
 
             try {
-              await this.walletService.getBalance('*', 0);
+              // Balance reads require a bbolt read transaction. During seed
+              // recovery the wallet intentionally holds a write transaction
+              // while scanning a batch, so using getbalance as a readiness
+              // probe can block until the RPC timeout and make a healthy
+              // recovering wallet look wedged. Sync progress is served from
+              // the in-memory chain/recovery state and remains responsive
+              // while those batches are being committed.
+              await this.walletService.getSyncProgress();
               if (!isResolved) {
                 isResolved = true;
                 this.isProcessRunning = true;
