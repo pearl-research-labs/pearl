@@ -3214,7 +3214,7 @@ func (w *Wallet) resendUnminedTxs() {
 	}
 
 	for _, tx := range txs {
-		txHash, err := w.publishTransaction(tx)
+		txHash, err := w.publishTransaction(tx, false)
 		if err != nil {
 			log.Debugf("Unable to rebroadcast transaction %v: %v",
 				tx.TxHash(), err)
@@ -3785,14 +3785,22 @@ func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx, label string) (*chai
 		return nil, err
 	}
 
-	return w.publishTransaction(tx)
+	return w.publishTransaction(tx, true)
 }
 
 // publishTransaction attempts to send an unconfirmed transaction to the
 // wallet's current backend. In the event that sending the transaction fails for
 // whatever reason, it will be removed from the wallet's unconfirmed transaction
 // store.
-func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
+//
+// dropIfUnrelayed decides the fate of a transaction that no peer requested.
+// A first publish must drop it: no peer holds the transaction, so keeping the
+// record would lock its inputs behind a spend that can never confirm. A resend
+// must keep it: the record only exists because an earlier publish did reach a
+// peer, and a round with no takers is a transient peer condition.
+func (w *Wallet) publishTransaction(tx *wire.MsgTx,
+	dropIfUnrelayed bool) (*chainhash.Hash, error) {
+
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return nil, err
@@ -3808,6 +3816,11 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 	case errors.Is(rpcErr, chain.ErrTxAlreadyInMempool):
 		log.Infof("%v: tx already in mempool", txid)
 		return &txid, nil
+
+	case errors.Is(rpcErr, chain.ErrTxNotRelayed) && !dropIfUnrelayed:
+		log.Infof("%v: not relayed, keeping for the next rebroadcast: %v",
+			txid, rpcErr)
+		return nil, rpcErr
 
 	case errors.Is(rpcErr, chain.ErrTxAlreadyKnown),
 		errors.Is(rpcErr, chain.ErrTxAlreadyConfirmed):

@@ -18,6 +18,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
+	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
 )
@@ -842,6 +843,13 @@ out:
 //
 // NOTE: we assume neutrino shares the same error strings as pearld.
 func (s *NeutrinoClient) MapRPCErr(rpcErr error) error {
+	// No peer saw the transaction, so this is not a peer verdict that the
+	// string maps below could express. Keep the reason: it tells the user
+	// whether there were no peers at all or none that asked.
+	if pushtx.IsBroadcastError(rpcErr, pushtx.NotRelayed) {
+		return fmt.Errorf("%w: %v", ErrTxNotRelayed, rpcErr)
+	}
+
 	// Iterate the map and find the matching error.
 	for pearldErr, matchedErr := range PearldErrMap {
 		// Match it against pearld's error.
