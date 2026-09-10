@@ -991,7 +991,7 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 	txHash := tx.TxHash()
 	numPeers := len(s.Peers())
 	if numPeers == 0 {
-		return notRelayedError(txHash, 0)
+		return notRelayedError(txHash, numPeers)
 	}
 
 	inv := newTransactionInv(tx)

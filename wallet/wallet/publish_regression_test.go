@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -41,7 +42,6 @@ func (c *neutrinoSendClient) SendRawTransaction(tx *wire.MsgTx,
 // Neutrino ChainService that has no peers.
 type ghostHarness struct {
 	w          *Wallet
-	cs         *neutrino.ChainService
 	fundingOut wire.OutPoint
 }
 
@@ -80,7 +80,6 @@ func newGhostHarness(t *testing.T) *ghostHarness {
 
 	return &ghostHarness{
 		w:          w,
-		cs:         cs,
 		fundingOut: fundWallet(t, w, 100_000),
 	}
 }
@@ -204,10 +203,7 @@ func TestGhostPendingSendRegression(t *testing.T) {
 }
 
 func hasOutPoint(credits []wtxmgr.Credit, op wire.OutPoint) bool {
-	for _, credit := range credits {
-		if credit.OutPoint == op {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(credits, func(credit wtxmgr.Credit) bool {
+		return credit.OutPoint == op
+	})
 }
