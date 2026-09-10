@@ -11,7 +11,6 @@ use plonky2::field::cosets::get_unique_coset_shifts;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use plonky2::field::types::{Field, Field64, PrimeField64};
-use plonky2::fri::{FriConfig, reduction_strategies::FriReductionStrategy};
 use plonky2::hash::hash_types::HashOut;
 use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData, VerifierCircuitData};
@@ -22,35 +21,16 @@ use super::wrapper::{D, F, OuterC};
 use crate::api::fp8::lut_caps::LutCap;
 use crate::api::fp8::public_params::{Device, PublicParams};
 use crate::ensure_eq;
+use crate::v2::circuit::circuit_utils::build_recursion_config as v2_build_recursion_config;
+pub use crate::v2::circuit::circuit_utils::num_query_rounds;
 
-// Preserve the recursion security target previously imported from the frozen v2 stack.
-const SECURITY_BITS: usize = 120;
-
-/// Calculate number of query rounds for FRI
-pub fn num_query_rounds(security_bits: usize, pow_bits: usize, rate_bits: usize) -> usize {
-    security_bits.saturating_sub(pow_bits).div_ceil(rate_bits)
-}
-
-/// Build a recursion circuit config with the given parameters
+/// Use v2's recursion config with additional routed wires in FP8's second stage.
 pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
-    debug_assert!(rate_bits >= 3);
-    CircuitConfig {
-        num_wires: 135,
-        num_routed_wires: if stage == 2 { 40 } else { 37 },
-        num_constants: 2,
-        use_base_arithmetic_gate: true,
-        security_bits: SECURITY_BITS,
-        num_challenges: 3,
-        zero_knowledge: is_zk,
-        max_quotient_degree_factor: 8,
-        fri_config: FriConfig {
-            rate_bits,
-            cap_height: 5,
-            proof_of_work_bits: pow_bits as u32,
-            reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
-            num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
-        },
+    let mut config = v2_build_recursion_config(rate_bits, pow_bits, stage, is_zk);
+    if stage == 2 {
+        config.num_routed_wires = 40;
     }
+    config
 }
 
 /// Trusted verifier setup: the universal wrapper's stage-2 verifier data
@@ -252,8 +232,6 @@ struct Fp8VerifierCacheEntryWire {
     verifier: Vec<u8>,
 }
 
-// Polynomial encoding is part of the existing FP8 verifier/cache wire format.
-
 fn bytes_for_max_value(max_val: usize) -> usize {
     if max_val == 0 {
         return 1;
@@ -373,6 +351,8 @@ fn deserialize_polynomials(
 
 #[cfg(test)]
 mod tests {
+    use plonky2::fri::FriConfig;
+
     use super::*;
     use crate::api::fp8::lut_caps::committed_lut_cap;
     use crate::api::fp8::zk::sample_dense_statement;
