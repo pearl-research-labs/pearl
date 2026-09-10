@@ -2,7 +2,7 @@ type Platform = 'windows' | 'mac' | 'linux';
 
 /** Detect current platform without needing Node types */
 function detectPlatform(): Platform {
-  const p = (globalThis as any)?.process?.platform as string | undefined;
+  const p = (globalThis as Record<string, unknown>)?.process?.platform as string | undefined;
   if (p === 'darwin') return 'mac';
   if (p === 'win32') return 'windows';
   return 'linux'; // default bucket for others
