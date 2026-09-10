@@ -2360,6 +2360,12 @@ func (w *Wallet) ListSinceBlock(start, end, syncHeight int32) ([]btcjson.ListTra
 // ListTransactions returns a slice of objects with details about a recorded
 // transaction.  This is intended to be used for listtransactions RPC
 // replies.
+//
+// Results are newest first. from and count are counted in transactions, but
+// the reply holds one entry per transaction category, and a spent output
+// contributes both a receive and a send entry, so len(result) is not count.
+// Callers paging through history must advance from by transactions rather
+// than by the number of entries they received.
 func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsResult, error) {
 	txList := []btcjson.ListTransactionsResult{}
 
@@ -2394,10 +2400,6 @@ func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsRe
 				jsonResults := listTransactions(tx, &details[i],
 					w.Manager, syncBlock.Height, w.chainParams)
 				txList = append(txList, jsonResults...)
-
-				if len(jsonResults) > 0 {
-					n++
-				}
 			}
 
 			return false, nil
