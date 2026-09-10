@@ -1,32 +1,23 @@
 # pearl-address-validation
 
-Validate Pearl Taproot (P2TR) addresses using bech32m encoding for mainnet, testnet, regtest, and simnet networks.
+Validate Pearl P2TR (witness v1) and P2MR (witness v2) addresses encoded with bech32m, across mainnet, testnet, and simnet.
 
 ```js
-validate('dup1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4');
+validate('prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k');
 ==> true
 
-getAddressInfo('dup1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4');
+getAddressInfo('prl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsypzqta');
 ==> {
-  bech32: true,
   network: 'mainnet',
-  address: 'dup1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4',
-  type: 'p2wpkh'
+  address: 'prl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsypzqta',
+  type: 'p2mr'
 }
 ```
 
 ## Installation
 
-Add `pearl-address-validation` to your Javascript project dependencies using Yarn:
-
 ```bash
-yarn add pearl-address-validation
-```
-
-Or NPM:
-
-```bash
-npm install pearl-address-validation --save
+pnpm add pearl-address-validation
 ```
 
 ## Usage
@@ -39,10 +30,10 @@ import { validate, getAddressInfo } from 'pearl-address-validation';
 
 ### Validating addresses
 
-`validate(address)` returns `true` for valid Pearl addresses or `false` for invalid Pearl addresses.
+`validate(address)` returns `true` for valid Pearl addresses or `false` otherwise.
 
 ```js
-validate('17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem')
+validate('prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k')
 ==> true
 
 validate('invalid')
@@ -51,115 +42,75 @@ validate('invalid')
 
 #### Network validation
 
-`validate(address, network)` allows you to validate whether an address is valid and belongs to `network`.
+`validate(address, network)` checks that an address is valid _and_ belongs to `network`.
 
 ```js
-validate('36bJ4iqZbNevh9b9kzaMEkXb28Gpqrv2bd', 'mainnet')
+validate('prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k', 'mainnet')
 ==> true
 
-validate('36bJ4iqZbNevh9b9kzaMEkXb28Gpqrv2bd', 'testnet')
+validate('prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k', 'testnet')
 ==> false
 
-validate('2N4RsPe5F2fKssy2HBf2fH2d7sHdaUjKk1c', 'testnet')
+validate('tprl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqts8nl36r', 'testnet')
 ==> true
 ```
 
 ### Address information
 
-`getAddressInfo(address)` parses the input address and returns information about its type and network.
-
-If the input address is invalid, an exception will be thrown.
+`getAddressInfo(address)` parses the input and returns its type and network. Throws if the address is invalid.
 
 ```js
-getAddressInfo('17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem')
+getAddressInfo('prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k')
 ==> {
-  address: '17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem',
-  type: 'p2pkh',
-  network: 'mainnet',
-  bech32: false
+  address: 'prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k',
+  type: 'p2tr',
+  network: 'mainnet'
 }
 ```
+
+### Address types
+
+- `p2tr` — Pay-to-Taproot (witness v1, BIP 341), 32-byte tweaked output key.
+- `p2mr` — Pay-to-Merkle-Root (witness v2, BIP 360), 32-byte script-tree merkle root.
+
+Both encode as bech32m with a 32-byte witness program. Witness versions other than 1 and 2 are rejected.
 
 ### Networks
 
-This library supports the following Pearl networks: `mainnet`, `testnet`, `regtest` and `signet`.
+Supported networks: `mainnet` (`prl`), `testnet` (`tprl`), `simnet` (`rprl`).
 
-> `signet` addresses will always be recognized as `testnet` addresses.
-
-> Non-bech32 `regtest` addresses will be recognized as `testnet` addresses.
-
-#### Casting testnet addresses to regtest or signet
-
-You can use the `options` parameter to cast `testnet` addresses to `regtest` or `signet`.
-
-```js
-// Default - No casting
-getAddressInfo('td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr');
-==> {
-  address: 'td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr',
-  type: 'p2wpkh',
-  network: 'testnet',
-  bech32: true
-}
-
-// Cast testnet to signet
-getAddressInfo('td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr', {
-  castTestnetTo: 'signet'
-})
-==> {
-  address: 'td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr',
-  type: 'p2wpkh',
-  network: 'signet',
-  bech32: true
-}
-
-// Validating and casting
-validate('td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr', 'signet', {
-  castTestnetTo: 'signet'
-})
-==> true
-```
-
-### TypeScript support
-
-If you're using TypeScript, the following types are provided with this library:
+### TypeScript
 
 ```ts
 enum Network {
   mainnet = 'mainnet',
   testnet = 'testnet',
-  regtest = 'regtest',
-  signet = 'signet',
+  simnet = 'simnet',
 }
 
 enum AddressType {
-  p2pkh = 'p2pkh',
-  p2sh = 'p2sh',
-  p2wpkh = 'p2wpkh',
-  p2wsh = 'p2wsh',
   p2tr = 'p2tr',
+  p2mr = 'p2mr',
 }
 
 type AddressInfo = {
-  bech32: boolean;
   network: Network;
   address: string;
   type: AddressType;
 };
 ```
 
-#### TypeScript usage
-
 ```ts
 import { validate, getAddressInfo, Network, AddressInfo } from 'pearl-address-validation';
 
-validate('36nGbqV7XCNf2xepCLAtRBaqzTcSjF4sv9', Network.mainnet);
+validate('prl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsypzqta', Network.mainnet);
 ==> true
 
-const addressInfo: AddressInfo = getAddressInfo('2Mz8rxD6FgfbhpWf9Mde9gy6w8ZKE8cnesp');
-addressInfo.network;
-
+const info: AddressInfo = getAddressInfo('tprl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqts0wx75g');
+info.network;
 ==> 'testnet'
+info.type;
+==> 'p2mr'
 ```
 
 ## License

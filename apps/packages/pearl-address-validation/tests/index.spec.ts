@@ -1,126 +1,139 @@
 import validate, { getAddressInfo, Network } from '../src/index';
 import { expect, describe, it } from 'vitest';
 
-describe('Taproot Address Validation', () => {
-  describe('Valid Taproot Addresses', () => {
-    it('validates Mainnet P2TR', () => {
-      const address = 'dup1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqnqzpxm';
+const MAINNET_P2TR = 'prl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsvum09k';
+const MAINNET_P2MR = 'prl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsypzqta';
+const TESTNET_P2TR = 'tprl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqts8nl36r';
+const TESTNET_P2MR = 'tprl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqts0wx75g';
+const SIMNET_P2TR = 'rprl1px8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsa2rflt';
+const SIMNET_P2MR = 'rprl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqts4h6x3q';
 
-      expect(validate(address)).toBe(true);
-      expect(getAddressInfo(address)).toEqual({ bech32: true, type: 'p2tr', network: 'mainnet', address });
+describe('Pearl Address Validation', () => {
+  describe('Valid P2TR (witness v1) addresses', () => {
+    it('validates Mainnet P2TR', () => {
+      expect(validate(MAINNET_P2TR)).toBe(true);
+      expect(getAddressInfo(MAINNET_P2TR)).toEqual({
+        type: 'p2tr',
+        network: 'mainnet',
+        address: MAINNET_P2TR,
+      });
     });
 
     it('validates Testnet P2TR', () => {
-      const address = 'td1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnql32xdy';
-
-      expect(validate(address)).toBe(true);
-      expect(getAddressInfo(address)).toEqual({ bech32: true, type: 'p2tr', network: 'testnet', address });
-    });
-
-    it('validates Regtest P2TR', () => {
-      const address = 'duprt1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqevu7ll';
-
-      expect(validate(address)).toBe(true);
-      expect(getAddressInfo(address)).toEqual({ bech32: true, type: 'p2tr', network: 'regtest', address });
+      expect(validate(TESTNET_P2TR)).toBe(true);
+      expect(getAddressInfo(TESTNET_P2TR)).toEqual({
+        type: 'p2tr',
+        network: 'testnet',
+        address: TESTNET_P2TR,
+      });
     });
 
     it('validates Simnet P2TR', () => {
-      const address = 'sd1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqcqqp5p';
-
-      expect(validate(address)).toBe(true);
-      expect(getAddressInfo(address)).toEqual({ bech32: true, type: 'p2tr', network: 'simnet', address });
+      expect(validate(SIMNET_P2TR)).toBe(true);
+      expect(getAddressInfo(SIMNET_P2TR)).toEqual({
+        type: 'p2tr',
+        network: 'simnet',
+        address: SIMNET_P2TR,
+      });
     });
   });
 
-  describe('Validation with Network Parameter', () => {
-    it('validates Mainnet P2TR with network parameter', () => {
-      const address = 'dup1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqnqzpxm';
-      expect(validate(address, Network.mainnet)).toBe(true);
+  describe('Valid P2MR (witness v2) addresses', () => {
+    it('validates Mainnet P2MR', () => {
+      expect(validate(MAINNET_P2MR)).toBe(true);
+      expect(getAddressInfo(MAINNET_P2MR)).toEqual({
+        type: 'p2mr',
+        network: 'mainnet',
+        address: MAINNET_P2MR,
+      });
     });
 
-    it('validates Testnet P2TR with network parameter', () => {
-      const address = 'td1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnql32xdy';
-      expect(validate(address, Network.testnet)).toBe(true);
+    it('validates Testnet P2MR', () => {
+      expect(validate(TESTNET_P2MR)).toBe(true);
+      expect(getAddressInfo(TESTNET_P2MR)).toEqual({
+        type: 'p2mr',
+        network: 'testnet',
+        address: TESTNET_P2MR,
+      });
     });
 
-    it('validates Regtest P2TR with network parameter', () => {
-      const address = 'duprt1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqevu7ll';
-      expect(validate(address, Network.regtest)).toBe(true);
-    });
-
-    it('validates Simnet P2TR with network parameter', () => {
-      const address = 'sd1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqcqqp5p';
-      expect(validate(address, Network.simnet)).toBe(true);
-    });
-
-    it('rejects mainnet address when validating against testnet', () => {
-      const address = 'dup1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqnqzpxm';
-      expect(validate(address, Network.testnet)).toBe(false);
+    it('validates Simnet P2MR', () => {
+      expect(validate(SIMNET_P2MR)).toBe(true);
+      expect(getAddressInfo(SIMNET_P2MR)).toEqual({
+        type: 'p2mr',
+        network: 'simnet',
+        address: SIMNET_P2MR,
+      });
     });
   });
 
-  describe('Invalid/Rejected Addresses', () => {
-    it('rejects Legacy SegWit v0 P2WPKH addresses', () => {
-      const addresses = [
-        'dup1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4', // mainnet
-        'td1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx', // testnet
-        'duprt1q6z64a43mjgkcq0ul2znwneq3spghrlau9slefp', // regtest
-        'sd1qw508d6qejxtdg4y5r3zarvary0c5xw7kwahwc4', // simnet
-      ];
-
-      addresses.forEach((address) => {
-        expect(validate(address)).toBe(false);
-      });
+  describe('Validation with network parameter', () => {
+    it('accepts an address whose network matches', () => {
+      expect(validate(MAINNET_P2TR, Network.mainnet)).toBe(true);
+      expect(validate(MAINNET_P2MR, Network.mainnet)).toBe(true);
+      expect(validate(TESTNET_P2MR, Network.testnet)).toBe(true);
+      expect(validate(SIMNET_P2MR, Network.simnet)).toBe(true);
     });
 
-    it('rejects Legacy SegWit v0 P2WSH addresses', () => {
-      const addresses = [
-        'dup1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3', // mainnet
-        'td1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7', // testnet
-        'duprt1q5n2k3frgpxces3dsw4qfpqk4kksv0cz96pldxdwxrrw0d5ud5hcqzzx7zt', // regtest
-      ];
+    it('rejects an address whose network does not match', () => {
+      expect(validate(MAINNET_P2TR, Network.testnet)).toBe(false);
+      expect(validate(MAINNET_P2MR, Network.simnet)).toBe(false);
+      expect(validate(TESTNET_P2TR, Network.mainnet)).toBe(false);
+    });
+  });
 
-      addresses.forEach((address) => {
-        expect(validate(address)).toBe(false);
-      });
+  describe('Invalid addresses', () => {
+    it('rejects witness v0 (legacy SegWit) addresses', () => {
+      // Bitcoin-style v0 P2WPKH/P2WSH addresses fail bech32m checksum verification.
+      expect(validate('prl1qw508d6qejxtdg4y5r3zarvary0c5xw7k6lzukf')).toBe(false);
+      expect(validate('tprl1qw508d6qejxtdg4y5r3zarvary0c5xw7knq72ye')).toBe(false);
     });
 
-    it('rejects invalid bech32 address', () => {
-      const address = 'dup1qw508d6qejxtdg4y5r3zrrvary0c5xw7kv8f3t4'; // invalid checksum
-      expect(validate(address)).toBe(false);
+    it('rejects witness versions other than v1 and v2', () => {
+      // Mainnet bech32m, witness v3, 32-byte program — well-formed but unsupported.
+      const v3 = 'prl1rx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsm2j9kr';
+      expect(validate(v3)).toBe(false);
     });
 
-    it('rejects bogus addresses', () => {
+    it('rejects v2 addresses with a non-32-byte witness program', () => {
+      // Mainnet bech32m, witness v2, 20-byte program.
+      const shortProgram = 'prl1zx8h7f4q0sra6ed4d9kasz5re6zj3u945rvmc5t';
+      expect(validate(shortProgram)).toBe(false);
+    });
+
+    it('rejects addresses with invalid checksum', () => {
+      // Last char tampered.
+      const bad = MAINNET_P2TR.slice(0, -1) + (MAINNET_P2TR.slice(-1) === 'k' ? 'l' : 'k');
+      expect(validate(bad)).toBe(false);
+    });
+
+    it('rejects addresses with unknown HRP', () => {
+      // Bitcoin mainnet P2TR address — valid bech32m but wrong network prefix.
+      expect(validate('bc1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq3xju0r')).toBe(false);
+    });
+
+    it('rejects bogus inputs', () => {
       expect(validate('x')).toBe(false);
       expect(validate('invalid')).toBe(false);
       expect(validate('')).toBe(false);
     });
+  });
 
-    it('rejects addresses with wrong witness version', () => {
-      // Address with witness version 2 (not v1/Taproot)
-      expect(validate('dup1z...someaddress')).toBe(false);
+  describe('Case sensitivity', () => {
+    it('accepts uppercase addresses', () => {
+      expect(validate(MAINNET_P2TR.toUpperCase())).toBe(true);
+      expect(validate(MAINNET_P2MR.toUpperCase())).toBe(true);
     });
   });
 
-  describe('Case Sensitivity', () => {
-    it('validates uppercase Taproot addresses', () => {
-      const address = 'DUP1PAARDR2NCZQ0RX5RQPFWNVPZM497ZVUX64Y0F7WJGCS7XUUUH2NNQNQZPXM';
-      expect(validate(address)).toBe(true);
-    });
-  });
-
-  describe('Error Messages', () => {
-    it('throws error for P2WPKH addresses', () => {
-      const address = 'dup1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4';
-
-      // The error message is caught and re-thrown as "Invalid address" by getAddressInfo
-      expect(() => getAddressInfo(address)).toThrow('Invalid address');
+  describe('Error behavior', () => {
+    it('throws "Invalid address" for unsupported witness versions', () => {
+      const v3 = 'prl1rx8h7f4q0sra6ed4d9kasz5re6zj3u945u0pk2t7yxyaf5a9geqtsm2j9kr';
+      expect(() => getAddressInfo(v3)).toThrow('Invalid address');
     });
 
-    it('throws descriptive error for invalid address', () => {
-      const address = 'invalid';
-
-      expect(() => getAddressInfo(address)).toThrow('Invalid address');
+    it('throws "Invalid address" for bogus input', () => {
+      expect(() => getAddressInfo('invalid')).toThrow('Invalid address');
     });
   });
 });
