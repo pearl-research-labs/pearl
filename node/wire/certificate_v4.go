@@ -12,8 +12,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
-// MaxFp8ProofSize is the maximum size of each published FP8 blob:
-// the encoded public statement and the stage-2 recursive proof. Must match
+// MaxFp8ProofSize limits each V4 public-data and proof blob. Must match
 // MAX_FP8_PROOF_SIZE in zk-pow/bindings/go/src/common.rs.
 const MaxFp8ProofSize = 131072
 
@@ -55,9 +54,7 @@ func (c *CertificateV4) ProofBytes() []byte {
 	return c.ProofData
 }
 
-// IsMoE is always false: fp8 public data is not the V2 length heuristic,
-// so MoE is not visible on this type. Empty template placeholders stay
-// valid under the dense-only fork.
+// IsMoE returns false because V4 is outside the legacy V2/V3 MoE classification.
 func (c *CertificateV4) IsMoE() bool {
 	return false
 }

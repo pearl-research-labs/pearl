@@ -36,11 +36,7 @@ const MinNoiseRank = C.MIN_NOISE_RANK
 
 // VerifyCertificate performs sanity checks followed by cryptographic proof verification.
 // It returns an error if the certificate is invalid or does not match the header.
-// V4 certificates (CertificateV4) carry an FP8 public_data / proof pair
-// and are checked with verify_zk_proof_v4; the trusted verifier setup resolves
-// inside the Rust library from its embedded fp8 cache, keyed by the statement's
-// device byte (the universal wrapper covers every envelope-legal geometry
-// and degree profile).
+// V4 certificates are verified with complete headers by the Rust verifier.
 // V3 certificates (CertificateV3) share the V2 layout but use the salted noise-seed derivation.
 // V2 certificates (CertificateV2) handle both MoE and non-MoE new proofs.
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
@@ -136,8 +132,7 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 	if len(publicData) == 0 || len(proofData) == 0 {
 		return fmt.Errorf("empty fp8 proof")
 	}
-	// The wire cap (MaxFp8ProofSize) is looser than the FFI statement buffer;
-	// no valid statement exceeds PUBLICDATA_MAX_SIZE, so reject before copying.
+	// Check the C buffer capacity before copying public data into it.
 	if len(publicData) > C.PUBLICDATA_MAX_SIZE {
 		return fmt.Errorf("fp8 public data too large: %d bytes (max %d)",
 			len(publicData), C.PUBLICDATA_MAX_SIZE)
