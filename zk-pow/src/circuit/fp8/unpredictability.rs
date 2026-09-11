@@ -208,9 +208,12 @@ pub fn lambda_witness(
     scaled_significand: u64,
     scaled_biased_exponent: u64,
     normalized_sigma_significand: u64,
-    sigma_biased_exponent: u64
+    sigma_biased_exponent: u64,
 ) -> LambdaWitness {
-    debug_assert!((1 << 15..1 << 16).contains(&normalized_sigma_significand), "sigma is never zero in-scheme");
+    debug_assert!(
+        (1 << 15..1 << 16).contains(&normalized_sigma_significand),
+        "sigma is never zero in-scheme"
+    );
     debug_assert!(scaled_significand == 0 || (1 << 15..1 << 16).contains(&scaled_significand));
     debug_assert_eq!(scaled_significand == 0, scaled_biased_exponent == 0);
     let x_dominates = scaled_biased_exponent >= sigma_biased_exponent && scaled_significand != 0;
@@ -287,7 +290,13 @@ pub fn lambda(alpha: u16, x: u16, l2f: u16) -> u64 {
     // sigma = sigma_product * 2^(alpha_e + l2f_e - 269), so e(sigma) sits 14 + sigma_wide
     // above that scale and enc(sigma) = e + 268 = alpha_e + l2f_e + sigma_wide + 13.
     let sigma_biased_exponent = alpha_e + l2f_e + sigma_wide + 13;
-    lambda_witness(scaled_significand, scaled_biased_exponent, normalized_sigma_significand, sigma_biased_exponent).lambda
+    lambda_witness(
+        scaled_significand,
+        scaled_biased_exponent,
+        normalized_sigma_significand,
+        sigma_biased_exponent,
+    )
+    .lambda
 }
 
 /// Returns floor(log2(M)) + 139 for a nonzero replay magnitude, or zero for M = 0.
@@ -387,7 +396,12 @@ mod tests {
             (33000, 436, 65535, 435),
         ];
         for (scaled_significand, scaled_biased_exponent, normalized_sigma_significand, sigma_biased_exponent) in cases {
-            let w = lambda_witness(scaled_significand, scaled_biased_exponent, normalized_sigma_significand, sigma_biased_exponent);
+            let w = lambda_witness(
+                scaled_significand,
+                scaled_biased_exponent,
+                normalized_sigma_significand,
+                sigma_biased_exponent,
+            );
             let gap = scaled_biased_exponent.abs_diff(sigma_biased_exponent);
             let (big, small) = if scaled_biased_exponent >= sigma_biased_exponent && scaled_significand != 0 {
                 (scaled_significand, normalized_sigma_significand)
@@ -404,7 +418,10 @@ mod tests {
             assert_eq!(w.half_quotient, (small * small) >> w.near_gap);
             assert_eq!(w.quotient, (small * small) >> (2 * w.near_gap));
             assert!(w.half_remainder < w.near_gap_pow && w.remainder < w.near_gap_pow);
-            assert_eq!(w.lambda, 128 * scaled_biased_exponent.max(sigma_biased_exponent) - 2624 + log2_fixed(v >> 17));
+            assert_eq!(
+                w.lambda,
+                128 * scaled_biased_exponent.max(sigma_biased_exponent) - 2624 + log2_fixed(v >> 17)
+            );
         }
     }
 
@@ -439,9 +456,12 @@ mod tests {
     fn the_sum_of_squares_matches_the_uncut_form_on_every_gap() {
         let mut live_quotients = 0u64;
         for gap in 0..=20 {
-            for (scaled_significand, normalized_sigma_significand) in [(1 << 15, 65535), (40000, 50000), (65535, 1 << 15), (33000, 60000)] {
+            for (scaled_significand, normalized_sigma_significand) in
+                [(1 << 15, 65535), (40000, 50000), (65535, 1 << 15), (33000, 60000)]
+            {
                 let w = lambda_witness(scaled_significand, 300, normalized_sigma_significand, 300 - gap);
-                let uncut = scaled_significand * scaled_significand + ((normalized_sigma_significand * normalized_sigma_significand) >> (2 * gap));
+                let uncut = scaled_significand * scaled_significand
+                    + ((normalized_sigma_significand * normalized_sigma_significand) >> (2 * gap));
                 assert_eq!(w.lambda, 128 * 300 - 2624 + log2_fixed(uncut >> 17), "gap {gap}");
                 live_quotients += u64::from(!w.gap_is_far && w.quotient != 0);
             }

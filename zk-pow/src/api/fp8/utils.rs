@@ -87,8 +87,7 @@ impl From<GFloat> for f32 {
             exponent -= 1;
         }
         let biased_exponent = u32::try_from(exponent).expect("GFloat exponent below f32 range");
-        let bits =
-            (components.sign as u32) << 31 | (biased_exponent & 0xFF) << 23 | (components.significand & 0x7FFFFF);
+        let bits = (components.sign as u32) << 31 | (biased_exponent & 0xFF) << 23 | (components.significand & 0x7FFFFF);
 
         let value = f32::from_bits(bits);
         check_not_nan_or_inf_f32(value).expect("GFloat must decode to a finite f32");
@@ -308,8 +307,7 @@ impl B200 {
 pub fn xor_fold_extract(c_tile: &[f32], lane_indices: &[Vec<usize>]) -> [u8; 4 * JACKPOT_ENTRIES] {
     assert_eq!(lane_indices.len(), JACKPOT_ENTRIES, "expected {JACKPOT_ENTRIES} lanes");
     let tile_elements: usize = lane_indices.iter().map(Vec::len).sum();
-    assert_eq!(c_tile.len(),
-        tile_elements, "tile shape does not match the committed layout");
+    assert_eq!(c_tile.len(), tile_elements, "tile shape does not match the committed layout");
     let mut lanes = [0u32; JACKPOT_ENTRIES];
     for (lane, cell_indices) in lanes.iter_mut().zip(lane_indices) {
         for &i in cell_indices {

@@ -1042,7 +1042,12 @@ impl SideWitness {
             // The summand's score witness (jackpot check 4). A dead group's phantom rows carry
             // the all-zero witness with the shift power pinned to 2^0; its lambda is 0.
             let score = if live {
-                lambda_witness(scaled_significand, scaled_biased_exponent, scales_w.normalized_sigma_significand, scales_w.sigma_biased_exponent)
+                lambda_witness(
+                    scaled_significand,
+                    scaled_biased_exponent,
+                    scales_w.normalized_sigma_significand,
+                    scales_w.sigma_biased_exponent,
+                )
             } else {
                 LambdaWitness {
                     x_dominates: false,
@@ -3100,5 +3105,4 @@ mod tests {
     fn circuit_constraints_match_native() {
         test_stark_circuit_constraints::<F, C, S, D>(S::new(test_program())).unwrap();
     }
-
 }

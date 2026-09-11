@@ -564,7 +564,14 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
             filter: Filter::default(),
         },
         // U3: decode RNERND — the outputs are the X fields.
-        rnernd_lookup(s.decode_significand_product, s.decode_cut_slot, s.x_mantissa, s.decode_width_adjust, s.x_is_zero, s.x_exp_is_zero),
+        rnernd_lookup(
+            s.decode_significand_product,
+            s.decode_cut_slot,
+            s.x_mantissa,
+            s.decode_width_adjust,
+            s.x_is_zero,
+            s.x_exp_is_zero,
+        ),
         // M2: beta-MUL cut depth — CLAMP22(535 - E*(BETA) - E*(NOISE)).
         LutLookup {
             table: LutTable::Clamp22,

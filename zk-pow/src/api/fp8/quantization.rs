@@ -175,7 +175,9 @@ impl Quant<u16, u8> for Fp8E4M3Quant {
             let row = &rows[i * k..(i + 1) * k];
             let l2 = bf16_max(norms[i].0, floor);
             let linf = bf16_max(norms[i].1, floor);
-            let (alpha, beta) = self.derive_row_scales(l2, linf, noise_rank).with_context(|| format!("row {i}"))?;
+            let (alpha, beta) = self
+                .derive_row_scales(l2, linf, noise_rank)
+                .with_context(|| format!("row {i}"))?;
             for j in 0..k {
                 // Round the noise term before the fused clean multiply-add.
                 let noised = bf16_fma(alpha, row[j], bf16_mul(beta, noise_bf16[i * k + j])?)?;

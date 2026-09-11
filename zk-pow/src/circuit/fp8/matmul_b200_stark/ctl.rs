@@ -211,7 +211,14 @@ pub fn matmul_b200_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
     let neg128 = -F::from_canonical_u64(128);
     for i in 0..GROUP_WIDTH {
         lookups.push(LutLookup::rc16_filtered(
-            Column::linear_combination_with_constant([(m.summand_score_a[i], one), (m.summand_score_b[i], one), (m.cell_magnitude_exponent, neg128)], offset),
+            Column::linear_combination_with_constant(
+                [
+                    (m.summand_score_a[i], one),
+                    (m.summand_score_b[i], one),
+                    (m.cell_magnitude_exponent, neg128),
+                ],
+                offset,
+            ),
             Filter::new(
                 vec![(
                     Column::single(m.cell_nonzero),

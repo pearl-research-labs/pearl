@@ -849,7 +849,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for MatmulB200Sta
     fn requires_ctls(&self) -> bool {
         true
     }
-
 }
 
 // Tests
@@ -1209,5 +1208,4 @@ mod tests {
     fn circuit_constraints_match_native() {
         test_stark_circuit_constraints::<F, C, S, D>(S::new(test_program())).unwrap();
     }
-
 }

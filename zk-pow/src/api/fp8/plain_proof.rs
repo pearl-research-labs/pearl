@@ -533,7 +533,6 @@ mod tests {
         digest.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-
     #[test]
     fn ho_single_chunk_equals_flat_keyed_digest() {
         // 3 offsets = 12 bytes pad to one 1024 chunk: the chunk-tree root IS

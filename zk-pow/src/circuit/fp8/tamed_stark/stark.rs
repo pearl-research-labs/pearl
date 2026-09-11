@@ -463,7 +463,11 @@ where
     let c = off_split(eval, s, lv.k_sigma_product_middle_limbs[0], lv.k_sigma_product_carries[0]);
     gate(eval, c);
     eval.constraint_bool(lv.k_sigma_product_carries[0]);
-    let e = [kl[0], lv.k_sigma_product_middle_limbs[0], eval.add(kh[1], lv.k_sigma_product_carries[0])];
+    let e = [
+        kl[0],
+        lv.k_sigma_product_middle_limbs[0],
+        eval.add(kh[1], lv.k_sigma_product_carries[0]),
+    ];
 
     // Y = W * PP schoolbook positions 0..=3 (position 4 is the carry itself: BOUND_TOP;
     // digit 5 is structurally zero — Y < 2^80). Per-position raw sums are < 2^33 + 2^17

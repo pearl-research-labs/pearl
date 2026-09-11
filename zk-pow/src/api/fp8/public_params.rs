@@ -252,8 +252,7 @@ impl JobParams {
     /// Inverse of [`Self::to_wire_bytes`]; does not include commitment digests or tile bases.
     pub(crate) fn from_wire_bytes(wire: &[u8]) -> Result<Self> {
         let mut remaining = wire;
-        let ancestor_header =
-            IncompleteBlockHeader::from_bytes(take(&mut remaining, IncompleteBlockHeader::SERIALIZED_SIZE)?)?;
+        let ancestor_header = IncompleteBlockHeader::from_bytes(take(&mut remaining, IncompleteBlockHeader::SERIALIZED_SIZE)?)?;
         let (common, b, experts) = parse_p_b(&mut remaining)?;
         let (a, moe_hash_ids) = parse_p_a(&mut remaining, experts)?;
         ensure!(remaining.is_empty(), "trailing bytes in fp8 job tuple");
@@ -544,8 +543,7 @@ impl PublicParams {
     pub(crate) fn from_bytes(public_data: &[u8]) -> Result<Self> {
         let mut remaining = public_data;
 
-        let ancestor_header =
-            IncompleteBlockHeader::from_bytes(take(&mut remaining, IncompleteBlockHeader::SERIALIZED_SIZE)?)?;
+        let ancestor_header = IncompleteBlockHeader::from_bytes(take(&mut remaining, IncompleteBlockHeader::SERIALIZED_SIZE)?)?;
 
         let (common, b, experts) = parse_p_b(&mut remaining)?;
         let hash_b: Hash256 = take(&mut remaining, 32)?.try_into().unwrap();
@@ -880,7 +878,10 @@ fn parse_p_a(remaining: &mut &[u8], experts: u16) -> Result<(OperandParams, Opti
     let hash_id = HashId::try_from(take(remaining, 1)?[0])?;
     let pattern = AxisPattern::from_bytes(take(remaining, AxisPattern::NUM_DIMS)?)?;
     let moe_hash_ids = if experts != 0 {
-        Some((HashId::try_from(take(remaining, 1)?[0])?, HashId::try_from(take(remaining, 1)?[0])?))
+        Some((
+            HashId::try_from(take(remaining, 1)?[0])?,
+            HashId::try_from(take(remaining, 1)?[0])?,
+        ))
     } else {
         None
     };

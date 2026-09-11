@@ -318,7 +318,10 @@ mod tests {
         let view: Blake3ColumnsView<u64> = arr.into();
         assert_eq!(view.row_flags_packed, 1);
         assert_eq!(view.uint8_data[0], BLAKE3_COL_MAP.uint8_data[0] as u64 * 3 + 1);
-        assert_eq!(view.round[2].b_bits[1][7], BLAKE3_COL_MAP.round[2].b_bits[1][7] as u64 * 3 + 1);
+        assert_eq!(
+            view.round[2].b_bits[1][7],
+            BLAKE3_COL_MAP.round[2].b_bits[1][7] as u64 * 3 + 1
+        );
         assert_eq!(view.cv_out_freq, (NUM_BLAKE3_COLUMNS as u64 - 1) * 3 + 1);
         let back: [u64; NUM_BLAKE3_COLUMNS] = view.into();
         assert_eq!(back, arr);
