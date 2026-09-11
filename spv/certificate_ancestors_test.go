@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestHeaderSanityCertificateAncestors(t *testing.T) {
+func TestCheckHeaderSanityRejectsDisconnectedV4Ancestor(t *testing.T) {
 	// Fixture framing is header(76), public length(4), public data, proof.
 	raw, err := os.ReadFile("../node/zkpow/testdata/fp8_zk_proof_b200.bin")
 	require.NoError(t, err)
@@ -57,7 +57,7 @@ func TestHeaderSanityCertificateAncestors(t *testing.T) {
 			var ruleErr blockchain.RuleError
 			require.ErrorAs(t, err, &ruleErr)
 			require.Equal(t, blockchain.ErrHighHash, ruleErr.ErrorCode)
-			require.Contains(t, ruleErr.Description, "ancestor")
+			require.Contains(t, ruleErr.Description, "v4 ancestor header at depth 1 does not connect")
 		})
 	}
 }

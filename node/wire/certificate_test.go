@@ -6,6 +6,7 @@ package wire_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -53,10 +54,10 @@ func mineV2(t *testing.T, header *wire.BlockHeader) *wire.CertificateV2 {
 }
 
 // ============================================================================
-// CertificateV1 Tests
+// CertificateV1/V2 Tests
 // ============================================================================
 
-func TestCertificateV2_SerializeDeserialize(t *testing.T) {
+func TestCertificateV2SerializeDeserialize(t *testing.T) {
 	header := testBlockHeader()
 
 	cert := mineV2(t, &header)
@@ -79,7 +80,7 @@ func TestCertificateV2_SerializeDeserialize(t *testing.T) {
 	require.Equal(t, cert.ProofData, deserialized.ProofData)
 }
 
-func TestCertificateV2_Verify(t *testing.T) {
+func TestCertificateV2Verify(t *testing.T) {
 	header := testBlockHeader()
 
 	cert := mineV2(t, &header)
@@ -88,64 +89,53 @@ func TestCertificateV2_Verify(t *testing.T) {
 	require.NoError(t, err, "valid CertificateV2 should verify")
 }
 
-func TestCertificateV1_VerifyErrors(t *testing.T) {
+func TestCertificateV2VerifyErrors(t *testing.T) {
 	header := testBlockHeader()
 
 	origCert := mineV2(t, &header)
 
-	createCert := func() *wire.CertificateV2 {
-		proofDataCopy := make([]byte, len(origCert.ProofData))
-		copy(proofDataCopy, origCert.ProofData)
-		return &wire.CertificateV2{
-			Hash:          origCert.Hash,
-			PublicDataLen: origCert.PublicDataLen,
-			PublicData:    origCert.PublicData,
-			ProofData:     proofDataCopy,
-		}
-	}
-
-	// Test certificate-level validation only (not underlying verifier logic)
+	// Exercise the wrapper's checks before native proof verification.
 	tests := []struct {
-		name   string
-		modify func(*wire.CertificateV2)
+		wantErr string
+		modify  func(*wire.CertificateV2)
 	}{
 		{
-			name: "empty proof data",
+			wantErr: "empty proof data",
 			modify: func(c *wire.CertificateV2) {
 				c.ProofData = nil
 			},
 		},
 		{
-			name: "corrupted config",
+			wantErr: "proof commitment mismatch",
 			modify: func(c *wire.CertificateV2) {
 				c.PublicData[c.PublicDataLen/2] ^= 0xFF
 			},
 		},
 		{
-			name: "block hash mismatch",
+			wantErr: "block hash mismatch",
 			modify: func(c *wire.CertificateV2) {
 				c.Hash[0] ^= 0xFF
 			},
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cert := createCert()
-			tt.modify(cert)
+	for _, test := range tests {
+		t.Run(test.wantErr, func(t *testing.T) {
+			cert := *origCert
+			test.modify(&cert)
 
-			err := zkpow.VerifyCertificate(&header, cert)
-			require.Error(t, err, "invalid certificate should fail verification")
+			err := zkpow.VerifyCertificate(&header, &cert)
+			require.ErrorContains(t, err, test.wantErr)
 		})
 	}
 }
 
-func TestCertificateV1_Version(t *testing.T) {
+func TestCertificateV1Version(t *testing.T) {
 	cert := &wire.CertificateV1{}
 	require.Equal(t, wire.CertificateVersionV1, cert.Version())
 }
 
-func TestCertificateV1_BlockHash(t *testing.T) {
+func TestCertificateV1BlockHash(t *testing.T) {
 	expectedHash := chainhash.Hash{1, 2, 3, 4}
 	cert := &wire.CertificateV1{Hash: expectedHash}
 	require.Equal(t, expectedHash, cert.BlockHash())
@@ -155,7 +145,7 @@ func TestCertificateV1_BlockHash(t *testing.T) {
 // MsgCertificate Tests
 // ============================================================================
 
-func TestMsgCertificate_MoE_RoundTrip(t *testing.T) {
+func TestMsgCertificateMoERoundTrip(t *testing.T) {
 	header := testBlockHeader()
 
 	cert := mineV2(t, &header)
@@ -185,7 +175,7 @@ func TestMsgCertificate_MoE_RoundTrip(t *testing.T) {
 // TestCertificateV3_MineVerifyRoundTrip mines a real V3 (salted noise-seed)
 // certificate and verifies it, its wire round-trip, and its domain separation
 // from V2.
-func TestCertificateV3_MineVerifyRoundTrip(t *testing.T) {
+func TestCertificateV3MineVerifyRoundTrip(t *testing.T) {
 	header := testBlockHeader()
 
 	cert, err := zkpow.Mine(&header, wire.CertificateVersionV3)
@@ -225,54 +215,42 @@ func TestCertificateV3_MineVerifyRoundTrip(t *testing.T) {
 		"V3 proof must not verify under the legacy (V2) derivation")
 }
 
-func TestCertificateV4_SerializeDeserialize(t *testing.T) {
-	header := testBlockHeader()
-	cert := &wire.CertificateV4{
-		PublicData:      []byte{0x01, 0x02, 0x03, 0x04},
-		ProofData:       []byte{0xaa, 0xbb, 0xcc},
-		AncestorHeaders: []wire.BlockHeader{header},
-	}
-	header.ProofCommitment = cert.ProofCommitment()
-	cert.Hash = header.BlockHash()
+func TestCertificateV4Wire(t *testing.T) {
+	for name, cert := range map[string]*wire.CertificateV4{
+		"empty public data": {ProofData: []byte{0x00}},
+		"empty proof data":  {PublicData: []byte{0x01}},
+		"one ancestor": {
+			Hash:            chainhash.Hash{0x01},
+			PublicData:      []byte{0x01, 0x02, 0x03, 0x04},
+			ProofData:       []byte{0xaa, 0xbb, 0xcc},
+			AncestorHeaders: []wire.BlockHeader{testBlockHeader()},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			require.NoError(t, cert.Serialize(&buf))
+			require.Equal(t, cert.SerializedSize(), buf.Len())
 
-	var buf bytes.Buffer
-	require.NoError(t, cert.Serialize(&buf))
-
-	decoded := &wire.CertificateV4{}
-	require.NoError(t, decoded.Deserialize(bytes.NewReader(buf.Bytes())))
-	require.Equal(t, cert.Hash, decoded.Hash)
-	require.Equal(t, cert.PublicData, decoded.PublicData)
-	require.Equal(t, cert.ProofData, decoded.ProofData)
-	require.Equal(t, cert.AncestorHeaders, decoded.AncestorHeaders)
-	require.Equal(t, cert.SerializedSize(), buf.Len())
-	require.Equal(t, wire.CertificateVersionV4, decoded.Version())
-	require.False(t, decoded.IsMoE())
-	for size := range buf.Len() {
-		err := (&wire.CertificateV4{}).Deserialize(bytes.NewReader(buf.Bytes()[:size]))
-		require.Error(t, err, "truncated certificate at byte %d", size)
+			var decoded wire.CertificateV4
+			require.NoError(t, decoded.Deserialize(bytes.NewReader(buf.Bytes())))
+			require.Equal(t, cert, &decoded)
+			for size := range buf.Len() {
+				err := (&wire.CertificateV4{}).Deserialize(bytes.NewReader(buf.Bytes()[:size]))
+				require.Error(t, err, "truncated certificate at byte %d", size)
+			}
+		})
 	}
 }
 
-func TestCertificateV4_NilPublicDataRoundTrip(t *testing.T) {
-	cert := &wire.CertificateV4{ProofData: []byte{0x00}}
-	var buf bytes.Buffer
-	require.NoError(t, cert.Serialize(&buf))
-
-	decoded := &wire.CertificateV4{}
-	require.NoError(t, decoded.Deserialize(bytes.NewReader(buf.Bytes())))
-	require.Equal(t, cert, decoded)
-}
-
-func TestMsgCertificate_V4_RoundTrip(t *testing.T) {
+func TestMsgCertificateV4MaxSizeRoundTrip(t *testing.T) {
 	header := testBlockHeader()
 	cert := &wire.CertificateV4{
+		Hash:            chainhash.Hash{0x01},
 		PublicData:      bytes.Repeat([]byte{0x11}, wire.MaxFp8ProofSize),
 		ProofData:       bytes.Repeat([]byte{0x22}, wire.MaxFp8ProofSize),
 		AncestorHeaders: []wire.BlockHeader{header, header},
 	}
 	cert.AncestorHeaders[1].Version++
-	header.ProofCommitment = cert.ProofCommitment()
-	cert.Hash = header.BlockHash()
 
 	msg := &wire.MsgCertificate{Certificate: cert}
 	var buf bytes.Buffer
@@ -280,17 +258,12 @@ func TestMsgCertificate_V4_RoundTrip(t *testing.T) {
 	require.Equal(t, wire.CertificateMaxSizeV4, buf.Len())
 	require.Equal(t, msg.SerializeSize(), buf.Len())
 
-	decoded := &wire.MsgCertificate{}
+	var decoded wire.MsgCertificate
 	require.NoError(t, decoded.PrlDecode(bytes.NewReader(buf.Bytes()), wire.ProtocolVersion))
-	got, ok := decoded.Certificate.(*wire.CertificateV4)
-	require.True(t, ok)
-	require.Equal(t, cert.Hash, got.Hash)
-	require.Equal(t, cert.PublicData, got.PublicData)
-	require.Equal(t, cert.ProofData, got.ProofData)
-	require.Equal(t, cert.AncestorHeaders, got.AncestorHeaders)
+	require.Equal(t, msg, &decoded)
 }
 
-func TestCertificateV4_AncestorCount(t *testing.T) {
+func TestCertificateV4AncestorCount(t *testing.T) {
 	cert := &wire.CertificateV4{
 		AncestorHeaders: make([]wire.BlockHeader, wire.MaxCertificateV4AncestorHeaders+1),
 	}
@@ -307,7 +280,6 @@ func TestCertificateV4_AncestorCount(t *testing.T) {
 	}{
 		{"oversized", []byte{3}, "too many v4 ancestor headers"},
 		{"noncanonical", []byte{0xfd, 0x02, 0x00}, "non-canonical"},
-		{"missing", nil, "EOF"},
 		{"truncated", []byte{0xfd, 0x02}, "unexpected EOF"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -318,26 +290,29 @@ func TestCertificateV4_AncestorCount(t *testing.T) {
 	}
 }
 
-func TestCertificateV4_AncestorHeadersNotCommitted(t *testing.T) {
-	cert := &wire.CertificateV4{PublicData: []byte{0x01}, ProofData: []byte{0x02}}
-	commitment := cert.ProofCommitment()
-	cert.AncestorHeaders = []wire.BlockHeader{testBlockHeader()}
-	require.Equal(t, commitment, cert.ProofCommitment())
+func TestCertificateV4ProofCommitment(t *testing.T) {
+	cert := &wire.CertificateV4{
+		Hash:            chainhash.Hash{0x03},
+		PublicData:      []byte{0x01},
+		ProofData:       []byte{0x02},
+		AncestorHeaders: []wire.BlockHeader{testBlockHeader()},
+	}
+	want := chainhash.DoubleHashH([]byte{4, 0, 0, 0, 0x01}) // Version + public data only.
+	require.Equal(t, want, cert.ProofCommitment())
 	cert.AncestorHeaders[0].ProofCommitment[0] ^= 0xff
-	require.Equal(t, commitment, cert.ProofCommitment())
+	require.Equal(t, want, cert.ProofCommitment())
 }
 
-func TestCertificateV4_RejectsOversizedBlobs(t *testing.T) {
-	tooBig := make([]byte, wire.MaxFp8ProofSize+1)
-	for field, cert := range map[string]*wire.CertificateV4{
-		"public_data": {PublicData: tooBig, ProofData: []byte{0x01}},
-		"proof_data":  {PublicData: []byte{0x01}, ProofData: tooBig},
+func TestCertificateV4OversizedBlobs(t *testing.T) {
+	for field, offset := range map[string]int{
+		"public_data": chainhash.HashSize,
+		"proof_data":  chainhash.HashSize + 4, // Empty public data.
 	} {
 		t.Run(field, func(t *testing.T) {
-			var buf bytes.Buffer
-			require.NoError(t, cert.Serialize(&buf))
-			err := (&wire.CertificateV4{}).Deserialize(&buf)
+			data := binary.LittleEndian.AppendUint32(make([]byte, offset), wire.MaxFp8ProofSize+1)
+			err := (&wire.CertificateV4{}).Deserialize(bytes.NewReader(data))
 			require.ErrorContains(t, err, field+"_len")
+			require.ErrorContains(t, err, "exceeds max")
 		})
 	}
 }

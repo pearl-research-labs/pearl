@@ -48,7 +48,8 @@ func TestHeadersLargeV4RoundTrip(t *testing.T) {
 		ProofData:       bytes.Repeat([]byte{0x22}, MaxFp8ProofSize),
 		AncestorHeaders: []BlockHeader{header, header},
 	}
-	for range MaxBlockHeadersPerMsg {
+	for i := range MaxBlockHeadersPerMsg {
+		header.Version = int32(i)
 		require.NoError(t, msg.AddBlockHeader(header, cert))
 	}
 

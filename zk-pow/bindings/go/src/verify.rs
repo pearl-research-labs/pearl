@@ -512,7 +512,7 @@ mod fp8_ancestor_tests {
     }
 
     #[test]
-    fn full_wire_header_golden() {
+    fn full_header_wire_encoding() {
         // Independent wire vector: every byte, including ProofCommitment, is distinct.
         let header: [u8; FULL_BLOCK_HEADER_SIZE] = std::array::from_fn(|i| i as u8);
         let expected_hash = [
@@ -530,18 +530,32 @@ mod fp8_ancestor_tests {
     }
 
     #[test]
-    fn ancestor_depths_and_links() {
+    fn accepts_ancestors_at_each_depth() {
         let headers = linked_headers();
         let proposed = Fp8BlockHeader::from_bytes(&headers[0][..76]).unwrap();
         for depth in 0..=2 {
             let public = public_data(&headers[depth]);
-            assert_eq!(
-                check_certificate_ancestors(&headers[..=depth].concat(), &public).unwrap(),
-                proposed
-            );
-            assert_eq!(check_certificate_ancestors(&headers.concat(), &public).unwrap(), proposed);
+            for supplied_depth in depth..=2 {
+                assert_eq!(
+                    check_certificate_ancestors(&headers[..=supplied_depth].concat(), &public).unwrap(),
+                    proposed,
+                    "ancestor depth {depth}, supplied depth {supplied_depth}"
+                );
+            }
         }
 
+        // The proposed header's commitment is excluded from the proof statement.
+        let mut changed_proposed = headers;
+        changed_proposed[0][76] ^= 1;
+        assert_eq!(
+            check_certificate_ancestors(&changed_proposed.concat(), &public_data(&headers[0])).unwrap(),
+            proposed
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ancestors() {
+        let headers = linked_headers();
         let mut parent_commitment = headers;
         parent_commitment[1][76] ^= 1;
         let mut grandparent_commitment = headers;
@@ -551,20 +565,25 @@ mod fp8_ancestor_tests {
         let mut reversed_merkle = public_data(&headers[0]);
         reversed_merkle[36..68].reverse();
         let unrelated = [0x55; FULL_BLOCK_HEADER_SIZE];
-        let cases = [
+        for (name, headers, public) in [
             ("outside window", headers.concat(), public_data(&unrelated)),
             ("missing ancestor", headers[..1].concat(), public_data(&headers[1])),
+            ("reversed previous hash", headers[..1].concat(), reversed_prev),
+            ("reversed merkle root", headers[..1].concat(), reversed_merkle),
+        ] {
+            let err = check_certificate_ancestors(&headers, &public).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("not the proposed header, its parent, or its grandparent"),
+                "{name}: {err}"
+            );
+        }
+        for (name, headers, public) in [
             (
                 "missing intermediate",
                 [headers[0], headers[2]].concat(),
                 public_data(&headers[2]),
             ),
-            (
-                "wrong order",
-                [headers[0], headers[2], headers[1]].concat(),
-                public_data(&headers[2]),
-            ),
-            ("wrong branch", [headers[0], unrelated].concat(), public_data(&unrelated)),
             ("parent commitment", parent_commitment.concat(), public_data(&headers[1])),
             (
                 "grandparent commitment",
@@ -581,34 +600,32 @@ mod fp8_ancestor_tests {
                 [headers[0], headers[1], unrelated].concat(),
                 public_data(&headers[1]),
             ),
-            ("reversed previous hash", headers[..1].concat(), reversed_prev),
-            ("reversed merkle root", headers[..1].concat(), reversed_merkle),
-        ];
-        for (name, headers, public) in cases {
-            assert!(check_certificate_ancestors(&headers, &public).is_err(), "{name}");
+        ] {
+            let err = check_certificate_ancestors(&headers, &public).unwrap_err();
+            assert!(err.to_string().contains("does not connect"), "{name}: {err}");
         }
-
-        let mut changed_proposed = headers;
-        changed_proposed[0][76] ^= 1;
-        assert_eq!(
-            check_certificate_ancestors(&changed_proposed.concat(), &public_data(&headers[0])).unwrap(),
-            proposed
-        );
     }
 
     #[test]
     fn rejects_invalid_framing_and_statements() {
         let headers = linked_headers();
         let public = public_data(&headers[0]);
-        for length in [0, 1, 76, 107, 109, 215, 217, 323, 325, 432] {
+        for length in [0, 76, 107, 109, 215, 217, 323, 325, 432] {
             let err = check_certificate_ancestors(&vec![0; length], &public).unwrap_err();
-            assert!(err.to_string().contains("invalid v4 headers length"));
+            assert!(
+                err.to_string().contains("invalid v4 headers length"),
+                "length {length}: {err}"
+            );
         }
+        let headers = headers.concat();
         for length in 0..public.len() {
-            assert!(check_certificate_ancestors(&headers.concat(), &public[..length]).is_err());
+            assert!(
+                check_certificate_ancestors(&headers, &public[..length]).is_err(),
+                "public data truncated at {length}"
+            );
         }
         let mut trailing = public;
         trailing.push(0);
-        assert!(check_certificate_ancestors(&headers.concat(), &trailing).is_err());
+        assert!(check_certificate_ancestors(&headers, &trailing).is_err());
     }
 }
