@@ -1,3 +1,22 @@
+//! Software replay of B200 FP8 accumulation and the lottery message fold.
+//!
+//! Matrix multiplication stores A as `m x k` and B as `n x k`, both row-major:
+//! output cell `(i, j)` is the dot product of row `i` of A and row `j` of B.
+//! Each accumulation group combines 32 exact FP8 products with the previous
+//! f32 sum. Terms align to the largest exponent in a window with 25 fractional
+//! bits; alignment and the final f32 conversion truncate toward zero.
+//!
+//! The lottery fold distributes the output cells among 16 lanes using
+//! [`lane_assignment`](crate::api::layout::lane_assignment). Each lane starts at
+//! zero and consumes its cells' raw f32 words in order:
+//!
+//! ```text
+//! lane = rotl32((lane * 0x9E3779B1 + word) mod 2^32, 13)
+//! ```
+//!
+//! The multiplier and 13-bit rotation are fixed by the protocol. The final
+//! lanes form the 64-byte little-endian message hashed by the jackpot check.
+
 use anyhow::{Result, ensure};
 
 use crate::api::fp8::dtype::{check_not_nan_or_inf_bf16, check_not_nan_or_inf_f32};
@@ -5,14 +24,10 @@ use crate::api::layout::JACKPOT_ENTRIES;
 
 const FP32_MIN_NONZERO_EXPONENT: i32 = -126;
 
-/// Products per hardware accumulation group: the MMA's group sum consumes the
-/// running accumulator plus this many fresh products (32 + 1 slots) before
-/// renormalizing.
+/// Fresh products per group; the running accumulator occupies one additional slot.
 pub const MMA_GROUP_PRODUCTS: usize = 32;
 
-/// Internal significand width of the B200 FP8 (`kind::f8f6f4`) accumulation
-/// window: 25 fractional bits below the anchor, result rounded to FP32
-/// towards zero (B200.md).
+/// Accumulation window: one bit at the largest stored exponent and 25 bits below it.
 const B200_FP8_WIDTH: u16 = 26;
 
 pub trait Dtype<F, T> {
@@ -21,10 +36,9 @@ pub trait Dtype<F, T> {
     fn add(&self, a: F, b: F) -> T;
 }
 
-/// Intermediate fixed-point view of an f32 used by the matmul emulation.
-/// `exponent` is a signed exponent so a "zero" term can carry a sentinel exponent
-/// (`zero_exp`, chosen well below any real exponent) without the alignment math
-/// underflowing. A `GFloat` is canonically zero iff `significand == 0`.
+/// Matmul intermediate: `(-1)^sign * significand * 2^(exponent - 23)`.
+/// The signed exponent permits a sentinel for zero terms, which are identified
+/// by `significand == 0`.
 pub struct GFloat {
     pub sign: bool,
     pub exponent: i32,
@@ -33,25 +47,20 @@ pub struct GFloat {
 
 impl From<f32> for GFloat {
     fn from(value: f32) -> Self {
-        // NaN and ±inf are banned throughout the FP8 module.
         check_not_nan_or_inf_f32(value).expect("GFloat input must be a finite f32");
-        let a_bits = value.to_bits();
-        let sign = (a_bits >> 31) & 1 == 1;
-        let exponent = ((a_bits >> 23) & 0xFF) as i32;
-        let significand = a_bits & 0x7FFFFF;
+        let bits = value.to_bits();
+        let sign = (bits >> 31) & 1 == 1;
+        let exponent = ((bits >> 23) & 0xFF) as i32;
+        let significand = bits & 0x7FFFFF;
 
         if exponent == 0 && significand == 0 {
-            // Exact zero.
             return GFloat {
                 sign,
                 exponent: -133,
                 significand: 0,
             };
         }
-        // Subnormals (exponent field 0) keep their denormalized significand —
-        // no implicit bit — at the scale of exponent field 1, the same
-        // `exponent = 1 - bias` rule the fp8/bf16 product decoders apply to
-        // subnormal operands.
+        // Subnormals use exponent `1 - bias` and have no implicit leading bit.
         let (exponent, significand) = if exponent != 0 {
             (exponent, 0x800000 | significand)
         } else {
@@ -67,38 +76,37 @@ impl From<f32> for GFloat {
 }
 
 impl From<GFloat> for f32 {
-    fn from(val: GFloat) -> f32 {
-        // A zero-significand `GFloat` decodes to a signed zero regardless of the
-        // (sentinel) exponent it carries.
-        if val.significand == 0 {
-            return f32::from_bits((val.sign as u32) << 31);
+    fn from(components: GFloat) -> f32 {
+        // A zero significand preserves its sign regardless of the sentinel exponent.
+        if components.significand == 0 {
+            return f32::from_bits((components.sign as u32) << 31);
         }
 
-        let mut exponent = val.exponent + 127;
-        if (val.significand & 0x800000) == 0 {
+        let mut exponent = components.exponent + 127;
+        if (components.significand & 0x800000) == 0 {
             exponent -= 1;
         }
-        let exp_bits = u32::try_from(exponent).expect("GFloat exponent below f32 range");
-        let value_u32 = (val.sign as u32) << 31 | (exp_bits & 0xFF) << 23 | (val.significand & 0x7FFFFF);
+        let biased_exponent = u32::try_from(exponent).expect("GFloat exponent below f32 range");
+        let bits =
+            (components.sign as u32) << 31 | (biased_exponent & 0xFF) << 23 | (components.significand & 0x7FFFFF);
 
-        let value = f32::from_bits(value_u32);
-        // NaN and ±inf are banned throughout the FP8 module.
+        let value = f32::from_bits(bits);
         check_not_nan_or_inf_f32(value).expect("GFloat must decode to a finite f32");
         value
     }
 }
 
-fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
+fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exponent: i32) -> GFloat {
     let sign_a = (a >> 7) & 1 == 1;
     let mut exp_a = (a >> 3) & 0x0F;
-    let sig_a = a & 0x07;
+    let fraction_a = a & 0x07;
 
     let sign_b = (b >> 7) & 1 == 1;
     let mut exp_b = (b >> 3) & 0x0F;
-    let sig_b = b & 0x07;
+    let fraction_b = b & 0x07;
 
-    let significand_a = if exp_a != 0 { sig_a | 0x08 } else { sig_a };
-    let significand_b = if exp_b != 0 { sig_b | 0x08 } else { sig_b };
+    let significand_a = if exp_a != 0 { fraction_a | 0x08 } else { fraction_a };
+    let significand_b = if exp_b != 0 { fraction_b | 0x08 } else { fraction_b };
     if exp_a == 0 {
         exp_a = 1;
     }
@@ -111,7 +119,7 @@ fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
     if result_significand == 0 {
         GFloat {
             sign: sign_a ^ sign_b,
-            exponent: zero_exp,
+            exponent: zero_exponent,
             significand: 0,
         }
     } else {
@@ -123,65 +131,59 @@ fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
     }
 }
 
-/// One hardware accumulation group at the given window width
-/// (`significand_width`; B200 FP8: 26). Aligns every
-/// non-zero term to the group's largest stored exponent, truncates each
-/// towards zero to the window's fractional bits, sums exactly, and
-/// renormalizes the result to `significand_width` bits.
-fn windowed_group_sum(values: &[GFloat], zero_exp: i32, significand_width: u16) -> GFloat {
-    let base_sig = 24;
-    let is_neg_shift = significand_width < base_sig;
-    let diff = significand_width.abs_diff(base_sig) as u32;
+/// Sum one group in a fixed-width accumulation window, then truncate to f32 precision.
+/// `significand_width` includes the bit at the alignment exponent; B200 uses 26.
+fn windowed_group_sum(values: &[GFloat], zero_exponent: i32, significand_width: u16) -> GFloat {
+    let fp32_significand_bits = 24;
+    let narrow_window = significand_width < fp32_significand_bits;
+    let precision_shift = significand_width.abs_diff(fp32_significand_bits) as u32;
     let significand_width = significand_width as i32;
-    // A zero result carries the SIGN computed from the accumulator, not a
-    // hardcoded positive zero: the reference simulator returns
-    // `Gfloat(sign, ZERO_EXP, 0)` with `sign = significand < 0`, so a
-    // negative accumulation that underflows to a zero significand must stay
-    // a `-0`. This matters bit-for-bit downstream — `xor_fold_extract`
-    // hashes `f32::to_bits()`, and `-0.0` (`0x80000000`) and `+0.0` differ.
+    // Preserve the sign when a nonzero sum underflows: `xor_fold_extract`
+    // uses raw f32 bits, which distinguish +0 and -0.
     let signed_zero = |sign: bool| GFloat {
         sign,
-        exponent: zero_exp,
+        exponent: zero_exponent,
         significand: 0,
     };
 
-    // Align every non-zero term to the largest exponent, then sum. Zero terms
-    // (significand == 0) contribute nothing and carry the `zero_exp` sentinel,
-    // so they neither set the alignment exponent nor add to the sum.
+    // Zero terms do not participate in choosing the alignment exponent.
     let Some(max_exponent) = values.iter().filter(|g| g.significand != 0).map(|g| g.exponent).max() else {
-        return signed_zero(false); // every term is zero => +0 (as in the reference)
+        return signed_zero(false); // every term is zero => +0
     };
-    let mut acc: i64 = 0;
-    for v in values {
-        if v.significand == 0 {
+    // Align and truncate each magnitude before adding the signed terms exactly.
+    let mut signed_sum: i64 = 0;
+    for term in values {
+        if term.significand == 0 {
             continue;
         }
-        let shift = max_exponent - v.exponent; // >= 0, since max_exponent is the max
+        let shift = max_exponent - term.exponent;
         if shift >= 32 {
             continue; // fully shifted out
         }
-        let shifted = if is_neg_shift {
-            v.significand >> diff
+        let shifted = if narrow_window {
+            term.significand >> precision_shift
         } else {
-            v.significand << diff
+            term.significand << precision_shift
         };
         let aligned = (shifted >> shift) as i64;
-        acc += if v.sign { -aligned } else { aligned };
+        signed_sum += if term.sign { -aligned } else { aligned };
     }
 
-    let sign = acc < 0;
-    let mut significand = acc.unsigned_abs() as u32;
+    let sign = signed_sum < 0;
+    let mut significand = signed_sum.unsigned_abs() as u32;
     if significand == 0 {
         return signed_zero(sign);
     }
 
-    let width = 32 - significand.leading_zeros() as i32;
-    let mut exponent = max_exponent + width - significand_width;
-    if width > significand_width {
-        significand >>= (width - significand_width) as u32;
+    // Renormalize the sum to the window width, discarding any low overflow bits.
+    let sum_bit_length = 32 - significand.leading_zeros() as i32;
+    let mut exponent = max_exponent + sum_bit_length - significand_width;
+    if sum_bit_length > significand_width {
+        significand >>= (sum_bit_length - significand_width) as u32;
     } else {
-        significand <<= (significand_width - width) as u32;
+        significand <<= (significand_width - sum_bit_length) as u32;
     }
+    // Shift subnormal results to f32's minimum exponent, -126.
     if exponent < FP32_MIN_NONZERO_EXPONENT {
         let shift = FP32_MIN_NONZERO_EXPONENT - exponent;
         if shift >= 32 {
@@ -191,14 +193,13 @@ fn windowed_group_sum(values: &[GFloat], zero_exp: i32, significand_width: u16) 
         };
         exponent = FP32_MIN_NONZERO_EXPONENT;
     }
-    significand = if is_neg_shift {
-        significand << diff
+    // Convert the window to f32's 24-bit significand, truncating any extra precision.
+    significand = if narrow_window {
+        significand << precision_shift
     } else {
-        significand >> diff
+        significand >> precision_shift
     };
     if significand == 0 {
-        // Underflowed to zero after the final (de)normalization shift: keep
-        // the computed sign so a negative sum that vanishes stays `-0`.
         return signed_zero(sign);
     }
     GFloat {
@@ -208,18 +209,15 @@ fn windowed_group_sum(values: &[GFloat], zero_exp: i32, significand_width: u16) 
     }
 }
 
-/// The FP8 matmul datapath: exact e4m3 products consumed in ascending
-/// chained accumulation groups of [`MMA_GROUP_PRODUCTS`] products plus the
-/// carry, each group collapsed by [`windowed_group_sum`] at the given
-/// window width. When `record_partials` is set, each cell's running FP32
-/// accumulator after every group collapse (`ceil(k / 32)` values, the last
-/// equal to the cell's final value) is returned alongside the output.
+/// Consume exact E4M3 products in groups of [`MMA_GROUP_PRODUCTS`] plus
+/// the carry, using [`windowed_group_sum`]. With `record_partials`, also
+/// return each cell's accumulator after every group, including a remainder.
 #[allow(clippy::too_many_arguments)]
 fn matmul_fp8_windowed(
     significand_width: u16,
     a: &[u8],
     b: &[u8],
-    acc: Option<&[f32]>,
+    carry_in: Option<&[f32]>,
     m: usize,
     n: usize,
     k: usize,
@@ -227,129 +225,105 @@ fn matmul_fp8_windowed(
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
     ensure!(a.len() == m * k);
     ensure!(b.len() == n * k);
-    if let Some(acc) = acc {
-        ensure!(acc.len() == m * n, "accumulator must have length m * n");
+    if let Some(carry_in) = carry_in {
+        ensure!(carry_in.len() == m * n, "accumulator must have length m * n");
     }
 
-    let zero_exp: i32 = -139;
-    // The hardware collapses the accumulator every MMA_GROUP_PRODUCTS
-    // products: each group_sum sees the carry plus 32 fresh products.
+    let zero_exponent: i32 = -139;
     let group_size = MMA_GROUP_PRODUCTS + 1;
 
-    let mut out: Vec<f32> = vec![0.0; m * n];
+    let mut output: Vec<f32> = vec![0.0; m * n];
     let mut partials: Vec<Vec<f32>> = Vec::with_capacity(if record_partials { m * n } else { 0 });
     for i in 0..m {
         let a_row = &a[i * k..(i + 1) * k];
         for j in 0..n {
             let b_col = &b[j * k..(j + 1) * k];
-            // Seed the cell's accumulator with the carry-in (0 when absent).
-            let initial = acc.map_or(0.0, |acc| acc[i * n + j]);
-            // NaN and ±inf are banned throughout the FP8 module.
+            let initial = carry_in.map_or(0.0, |carry_in| carry_in[i * n + j]);
             check_not_nan_or_inf_f32(initial)?;
             let mut cell_partials: Vec<f32> =
                 Vec::with_capacity(if record_partials { k.div_ceil(MMA_GROUP_PRODUCTS) } else { 0 });
-            let mut accumulator = vec![GFloat::from(initial)];
+            let mut group_terms = vec![GFloat::from(initial)];
             for (a_val, b_val) in a_row.iter().zip(b_col) {
-                accumulator.push(multiply_fp8_to_gfloat(*a_val, *b_val, zero_exp));
-                if accumulator.len() == group_size {
-                    let collapsed: f32 = windowed_group_sum(&accumulator, zero_exp, significand_width).into();
+                group_terms.push(multiply_fp8_to_gfloat(*a_val, *b_val, zero_exponent));
+                if group_terms.len() == group_size {
+                    let group_sum: f32 = windowed_group_sum(&group_terms, zero_exponent, significand_width).into();
                     if record_partials {
-                        cell_partials.push(collapsed);
+                        cell_partials.push(group_sum);
                     }
-                    accumulator = vec![GFloat::from(collapsed)];
+                    group_terms = vec![GFloat::from(group_sum)];
                 }
             }
-            // The final (possibly partial) group; when k is a multiple of the
-            // group size the accumulator holds a single already-collapsed
-            // value and this renormalization is the identity.
-            let final_value: f32 = windowed_group_sum(&accumulator, zero_exp, significand_width).into();
-            if record_partials && accumulator.len() > 1 {
+            // Finish a remainder group. When k is a multiple of MMA_GROUP_PRODUCTS,
+            // only the previous group result remains.
+            let final_value: f32 = windowed_group_sum(&group_terms, zero_exponent, significand_width).into();
+            if record_partials && group_terms.len() > 1 {
                 cell_partials.push(final_value);
             }
-            out[i * n + j] = final_value;
+            output[i * n + j] = final_value;
             if record_partials {
                 partials.push(cell_partials);
             }
         }
     }
 
-    Ok((out, partials))
+    Ok((output, partials))
 }
 
-/// f32 -> BF16 cast, round to nearest, ties to even: the COMPUTE-path operand
-/// conversion.
+/// Round an f32 result to nearest BF16, ties to even. Panics if the result is non-finite.
 pub fn fp32_to_bf16_rne(a: f32) -> u16 {
     let bits = a.to_bits();
 
     // Round to nearest, ties to even.
     let rounding_bias = 0x7fff + ((bits >> 16) & 1);
     let bf16 = ((bits + rounding_bias) >> 16) as u16;
-    // NaN and ±inf are banned throughout the FP8 module.
     check_not_nan_or_inf_bf16(bf16).expect("fp32_to_bf16 must produce a finite bf16");
     bf16
 }
 
-/// NVIDIA B200 (Blackwell) `tcgen05.mma` device, per the measured
-/// characteristics in `B200.md` (`B200_fp8_simulator`, `kind::f8f6f4` atoms):
-/// an FP32 carry plus 32 exact, un-normalized products per group, groups
-/// chained ascending with the (zero-padded) remainder last, the window
-/// anchored at the group's max stored exponent (carry included), per-term
-/// truncation towards zero; 25 fractional bits are kept below the anchor and
-/// the group result is rounded to full FP32 towards zero. Cross-checked
-/// bit-for-bit against the B200.md Python simulator
-/// (`b200_matmul_fp8_matches_python_reference_vectors`).
+/// NVIDIA B200 FP8 matmul emulation: a 25-fractional-bit accumulation window
+/// with truncation toward zero.
 pub struct B200 {}
 
 impl B200 {
-    /// The bit-exact FP8 MMA. `a` is `m × k` and `b` is `n × k` (both
-    /// row-major; `b` holds the operand transposed, so output cell `(i, j)` is
-    /// the dot product of row `i` of `a` with row `j` of `b`). `acc`, when
-    /// present, is the `m × n` carry-in accumulator: cell `(i, j)` is seeded
-    /// with `acc[i * n + j]` before the tile's products are summed, so
-    /// successive tiles accumulate on the hardware.
+    /// Multiply FP8 operands with B200 accumulation, optionally continuing an earlier sum.
+    ///
+    /// Inputs are row-major: `a` is `m x k`, `b` is `n x k`, and optional `acc`
+    /// is `m x n`. Row `j` of `b` holds the mathematical right operand's column `j`.
+    /// Each output cell starts from its corresponding `acc` value, or zero.
     pub fn matmul_fp8(&self, a: &[u8], b: &[u8], acc: Option<&[f32]>, m: usize, n: usize, k: usize) -> Result<Vec<f32>> {
         Ok(matmul_fp8_windowed(B200_FP8_WIDTH, a, b, acc, m, n, k, false)?.0)
     }
 
-    /// Like [`B200::matmul_fp8`] (no carry-in) but returns, for each output
-    /// cell, the running FP32 accumulator value after every accumulation group
-    /// — `ceil(k / MMA_GROUP_PRODUCTS)` values per cell, the last being the
-    /// cell's final value. These are the partial sums `c_v` the jackpot
-    /// policy's prefix-inclusive anchor consumes.
+    /// Like [`B200::matmul_fp8`] without carry-in, returning each cell's
+    /// running FP32 sum after every group (`ceil(k / MMA_GROUP_PRODUCTS)` values).
+    /// The jackpot policy includes these partials in its magnitude bound.
     pub fn matmul_fp8_partials(&self, a: &[u8], b: &[u8], m: usize, n: usize, k: usize) -> Result<Vec<Vec<f32>>> {
         Ok(matmul_fp8_windowed(B200_FP8_WIDTH, a, b, None, m, n, k, true)?.1)
     }
 }
 
-/// Reference lottery epilogue (`XorFoldExtractor` in the reference miner): fold
-/// each of the tile's 16 committed subtiles into one lane. The lane layout
-/// (which tile element feeds which lane, and in what order) is committed in
-/// advance via the config's grid patterns — `lane_indices[j]` lists lane `j`'s
-/// flat indices into the row-major tile in fold order (the committed
-/// [`lane_assignment`](crate::api::layout::lane_assignment), 8.8). Each lane
-/// folds its subtile's `matmul_dtype` (f32) words — reinterpreted as their
-/// same-width unsigned integers — as
-/// `lane = rotl32(lane * 0x9E3779B1 + word, 13)`, and the lanes serialize
-/// little-endian into 64 bytes: exactly one BLAKE3 block for the lottery hash
-/// `blake3(extracted, key=pow_key)`.
+/// Fold the tile's f32 words into a 64-byte jackpot message.
+/// `lane_indices`, from [`lane_assignment`](crate::api::layout::lane_assignment),
+/// specifies the cells and their order within each lane.
 pub fn xor_fold_extract(c_tile: &[f32], lane_indices: &[Vec<usize>]) -> [u8; 4 * JACKPOT_ENTRIES] {
     assert_eq!(lane_indices.len(), JACKPOT_ENTRIES, "expected {JACKPOT_ENTRIES} lanes");
-    let tile_elems: usize = lane_indices.iter().map(Vec::len).sum();
-    assert_eq!(c_tile.len(), tile_elems, "tile shape does not match the committed layout");
+    let tile_elements: usize = lane_indices.iter().map(Vec::len).sum();
+    assert_eq!(c_tile.len(),
+        tile_elements, "tile shape does not match the committed layout");
     let mut lanes = [0u32; JACKPOT_ENTRIES];
-    for (lane, idxs) in lanes.iter_mut().zip(lane_indices) {
-        for &i in idxs {
+    for (lane, cell_indices) in lanes.iter_mut().zip(lane_indices) {
+        for &i in cell_indices {
             *lane = lane
                 .wrapping_mul(0x9E3779B1)
                 .wrapping_add(c_tile[i].to_bits())
                 .rotate_left(13);
         }
     }
-    let mut out = [0u8; 4 * JACKPOT_ENTRIES];
+    let mut message = [0u8; 4 * JACKPOT_ENTRIES];
     for (i, lane) in lanes.iter().enumerate() {
-        out[i * 4..(i + 1) * 4].copy_from_slice(&lane.to_le_bytes());
+        message[i * 4..(i + 1) * 4].copy_from_slice(&lane.to_le_bytes());
     }
-    out
+    message
 }
 
 pub fn bf16_from_i8s(values: &[i8]) -> Result<Vec<u16>> {
@@ -373,11 +347,8 @@ pub fn bf16_from_i8s(values: &[i8]) -> Result<Vec<u16>> {
 mod tests {
     use super::*;
 
-    /// Cross-implementation test vector: the reference `XorFoldExtractor`
-    /// (each committed subtile's f32 words folded into its own rotl-mixed lane
-    /// per `lane_assignment`, lanes serialized LE) produces exactly these 64
-    /// bytes for this input. Layout: both axes use subtile [0, 1] on grid
-    /// [0, 2, 4, 6] — an 8x8 merged tile, 16 lanes of 4 words each.
+    /// An 8x8 tile uses 16 lanes of four words, with both axes selecting
+    /// subtile [0, 1] on grid [0, 2, 4, 6].
     #[test]
     #[allow(clippy::approx_constant)]
     fn xor_fold_extract_matches_python_reference_vector() {
@@ -387,7 +358,6 @@ mod tests {
             lane_assignment,
         };
 
-        // Fold [0, 1] under Blake [0, 2, 4, 6]: the old subtile/grid pair.
         let axis = AxisPattern::new(&[(2, Fold), (4, Blake)]).unwrap();
         let lanes = lane_assignment(&axis, &axis);
         assert_eq!(lanes[0], vec![0, 1, 8, 9], "lane 0 folds the top-left 2x2 subtile");
@@ -402,10 +372,7 @@ mod tests {
         assert_eq!(xor_fold_extract(&tile, &lanes).to_vec(), expected);
     }
 
-    // Regression tests for the `zero_exp` handling in the matmul emulation. The
-    // former sentinel scheme overflowed the group sum's exponent math (a `u16`
-    // subtraction) once the matmul was actually driven; these exercise that exact
-    // path and assert it stays finite, deterministic, and zero-preserving.
+    // Zero-product regression: sentinel exponents must not overflow alignment arithmetic.
 
     #[test]
     fn matmul_fp8_handles_zeros_without_panicking() {
@@ -426,10 +393,7 @@ mod tests {
         assert!(out3.iter().all(|x| x.is_finite()));
     }
 
-    /// The accumulator groups align to MMA_GROUP_PRODUCTS (32) products: one
-    /// matmul over the full contraction dim must equal chaining the carry-in
-    /// accumulator at every 32-column boundary — the hardware's group sum
-    /// collapses exactly there (32 products + the accumulator per group).
+    /// A full matmul must match carry-chained matmuls split at every 32-product boundary.
     #[test]
     fn matmul_group_boundaries_align_to_32_products() {
         let hw = B200 {};
@@ -455,11 +419,7 @@ mod tests {
         assert_eq!(full, acc.unwrap(), "fp8 grouping must collapse every 32 products");
     }
 
-    /// The partial sums are the running accumulator of the SAME bit-exact
-    /// datapath: per cell there is one partial per 32-product group, each
-    /// equal to the carry-in chained matmul over that prefix, and the last
-    /// partial equals the cell's final value. A trailing partial group (k not
-    /// a multiple of 32) contributes one more partial.
+    /// Each partial must match a carry-chained matmul over that prefix.
     #[test]
     fn matmul_fp8_partials_chain_the_group_accumulator() {
         let (m, n, k) = (2usize, 2usize, 96usize);
@@ -505,11 +465,7 @@ mod tests {
         assert_eq!(out, vec![0.0f32; 4], "an all-zero tile must produce exact zeros");
     }
 
-    /// A single non-zero term whose exponent is so low that the value underflows
-    /// to a zero significand keeps the accumulator's SIGN: a negative term must
-    /// decode to `-0.0`, not `+0.0`. This mirrors the reference simulator's
-    /// `Gfloat(sign, ZERO_EXP, 0)` and matters because `xor_fold_extract` hashes
-    /// the raw f32 bits, where `-0.0` (`0x80000000`) and `+0.0` differ.
+    /// An underflowing negative term must retain -0.0 for the raw-bit lottery fold.
     #[test]
     fn group_sum_zero_result_preserves_sign_on_underflow() {
         // exponent -252 (a product of two smallest normals) forces the
@@ -530,12 +486,7 @@ mod tests {
         assert_eq!(pos_out.to_bits(), 0x0000_0000, "positive underflow must yield +0.0");
     }
 
-    /// Subnormal f32s (legal since the module-wide subnormal ban was lifted)
-    /// must convert at their true scale: IEEE-754 exponent field 0 means
-    /// `2^(1 - bias)` with no implicit bit — the same rule the fp8/bf16
-    /// product decoders apply to subnormal operands (the reference
-    /// simulator's "subnormal exponent = 1 - bias"). An off-by-one here
-    /// halves every subnormal carry inside the accumulation window.
+    /// Subnormals have exponent `1 - bias` without an implicit bit; preserve their scale.
     #[test]
     fn gfloat_roundtrips_subnormal_f32_at_true_scale() {
         // 2^-127 (half the smallest normal): exponent -126, no implicit bit.
@@ -547,10 +498,7 @@ mod tests {
         }
     }
 
-    /// A subnormal FP32 carry-in renormalized through the FP8 accumulation
-    /// window (an all-zero group leaves the carry as the only live term):
-    /// the 26-bit window keeps subnormal carries like `2^-127` and `2^-140`
-    /// exactly.
+    /// A group of zero products must preserve representable subnormal carry-ins.
     #[test]
     fn subnormal_carry_renormalizes_through_the_fp8_window() {
         let (m, n, k) = (1usize, 1usize, 32usize);
@@ -563,10 +511,8 @@ mod tests {
         assert_eq!(out[0].to_bits(), 0x0000_0200, "2^-140 carry survives the 26-bit window");
     }
 
-    /// One cross-implementation test case for the B200 FP8 matmul: FP8 E4M3
-    /// operand bytes (`a` is m x k, `b` is n x k, row-major, b transposed),
-    /// an optional FP32 accumulator and the expected output, both as u32 bit
-    /// patterns (bit-exactness is the whole point).
+    /// B200 reference vector: row-major E4M3 inputs (`a: m x k`, `b: n x k`),
+    /// optional FP32 carry-in and expected FP32 output, stored as bit patterns.
     struct B200Vector {
         m: usize,
         n: usize,
@@ -577,8 +523,7 @@ mod tests {
         expected: &'static [u32],
     }
 
-    // Generated (one-off, seed 0xB200) by running the pure-Python
-    // `B200_fp8_simulator` from B200.md on the inputs below. Do not edit by hand.
+    // Expected bit patterns generated with a Python B200 simulator, seed 0xB200.
     const B200_FP8_VECTORS: &[B200Vector] = &[
         // single atom, no C
         B200Vector {
@@ -689,10 +634,8 @@ mod tests {
             c: None,
             expected: &[0xC80C9E2C, 0xC760B96E, 0x47B7B146, 0x481A5E3F, 0xC791C160, 0xC8553F0B],
         },
-        // window truncates each tiny product towards zero: C = 1024.0 anchors
-        // the window at 2^10 (bottom 2^-15), so every +-(2^-18) product
-        // truncates towards zero INDIVIDUALLY (floor would pull the negative
-        // ones to -2^-15) and C passes through exactly.
+        // C = 1024 anchors the window at 2^10. Each ±2^-18 product truncates
+        // individually toward zero; C passes through unchanged.
         B200Vector {
             m: 1,
             n: 1,
@@ -784,11 +727,8 @@ mod tests {
         },
     ];
 
-    /// Bit-exact cross-check of `B200::matmul_fp8` against the pure-Python
-    /// `B200_fp8_simulator` of B200.md (itself verified against B200 silicon
-    /// via the C++ extension). The vectors cover single/chained/remainder
-    /// atoms, FP32 accumulators, subnormal operands, per-summand window
-    /// truncation, accumulator passthrough, and exact cancellation.
+    /// Compare raw output bits against the stored vectors.
+    /// Covers full/remainder groups, carry-ins, subnormals, truncation and cancellation.
     #[test]
     fn b200_matmul_fp8_matches_python_reference_vectors() {
         let hw = B200 {};
@@ -796,7 +736,7 @@ mod tests {
             let c: Option<Vec<f32>> = v.c.map(|bits| bits.iter().map(|&b| f32::from_bits(b)).collect());
             let out = hw.matmul_fp8(v.a, v.b, c.as_deref(), v.m, v.n, v.k).unwrap();
             let got: Vec<u32> = out.iter().map(|x| x.to_bits()).collect();
-            assert_eq!(got, v.expected, "vector {idx} diverged from the B200.md simulator");
+            assert_eq!(got, v.expected, "vector {idx} differs from the expected output");
         }
     }
 

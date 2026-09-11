@@ -1,8 +1,11 @@
-//! Native keyed-minimal opening verification (`VerifyOpen_X`).
+//! Native Merkle opening verification (`VerifyOpen_X`).
 //!
-//! Compiles the Blake forest once, checks that each committed tree opens the
-//! unique minimal leaf/sibling set for the statement's indices under `keyA` /
-//! `keyB`, extracts [`PrequantOperand`] strips, and rejects NaN/±Inf.
+//! Authenticate the selected int8 values and BF16 scales against the operand
+//! commitments, then extract [`PrequantOperand`] rows. MoE jobs also authenticate
+//! the winner's routing entries and the complete offsets list.
+//!
+//! The compiled Blake3 program determines exactly which leaves and sibling
+//! hashes each opening must contain, and their order in the ZK trace.
 
 use anyhow::{Context, Result, ensure};
 use blake3::BLOCK_LEN;
@@ -17,32 +20,23 @@ use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLoc
 use crate::ensure_eq;
 use crate::ffi::plain_proof::MatrixMerkleProof;
 
-/// Opened strips and Blake3 auxiliary material from [`PublicParams::verify_openings`].
-///
-/// - *operands.a*: A's opened prequant `rows_pattern.tile_size()` rows, each of length `common_dim`.
-/// - *operands.b*: B^T's opened prequant `cols_pattern.tile_size()` columns, each of length `common_dim`.
-/// - *s_routing*: 64-byte strips of raw routing data (see below).
-/// - *external_msgs*: additional leaf data, consumed to generate the Blake3 trace.
-/// - *external_cvs*: Merkle siblings in a Merkle proof.
-///
-/// Routing strips differ from matrix rows: routing is a list of `u32` token indices rather
-/// than a matrix with a fixed row width. When laid out as bytes, the current
-/// expert's routing does not necessarily start at a 64-byte Blake3 block boundary. We work
-/// around this by "virtually" treating routing as a matrix of 64-byte rows. As a result, each
-/// strip is 64 bytes long but may also contain indices belonging to other experts that share
-/// the same Blake3 block. Under this view, routing membership proofs behave like matrix
-/// membership proofs in the program.
+/// Private inputs from [`PublicParams::verify_openings`].
 #[derive(Debug, Clone)]
 pub struct PrivateProofParams {
+    /// Selected A and B rows, each containing `common_dim` values.
     pub operands: Sides<PrequantOperand>,
-    pub s_routing: Vec<Vec<u8>>,      // strips of routing data
-    pub s_offsets: Vec<Vec<u8>>,      // the full offsets list as 64-byte strips
-    pub external_msgs: Vec<[u8; 64]>, // Additional leaf data, consumed to generate blake3 trace.
-    pub external_cvs: Vec<Hash256>,   // Merkle siblings in a merkle proof.
+    /// Opened 64-byte blocks of u32 token indices. A block may also contain
+    /// entries from experts adjacent to the winner.
+    pub s_routing: Vec<Vec<u8>>,
+    /// Complete, zero-padded offsets list in 64-byte blocks.
+    pub s_offsets: Vec<Vec<u8>>,
+    /// Additional leaf messages needed by the Blake3 trace.
+    pub external_msgs: Vec<[u8; 64]>,
+    /// Merkle sibling hashes needed by the Blake3 trace.
+    pub external_cvs: Vec<Hash256>,
 }
 
-/// Concatenated 64-byte strips (`s_routing`/`s_offsets`) as little-endian u32 words in
-/// stream order — the word view the Blake3 trace inputs take.
+/// Decode routing or offsets blocks into little-endian u32 words, preserving stream order.
 pub(crate) fn stream_words(strips: &[Vec<u8>]) -> Vec<u32> {
     strips
         .iter()
@@ -51,17 +45,13 @@ pub(crate) fn stream_words(strips: &[Vec<u8>]) -> Vec<u32> {
 }
 
 impl PublicParams {
-    /// Authenticate the committed operand trees (and the MoE routing tree and
-    /// offset list, if any) and extract the opened strips.
+    /// Verify operand and MoE commitments, then extract the private inputs.
+    /// Used by plaintext verification and ZK proving; the ZK verifier checks
+    /// these commitments through the recursive proof.
     ///
-    /// Shared by plaintext verification and ZK proving: both run this membership
-    /// check. The ZK verifier does not — it never sees private openings.
-    ///
-    /// Keys are derived via [`Self::commitment_keys`]: `keyA` from the
-    /// caller's proposed header, `keyB` from the statement's ancestor header.
-    /// The statement's `HR` and `HO` are claims from the witness; both are
-    /// checked here by Merkle reconstruction (`HR` from the minimal routing
-    /// opening, `HO` from the fully-opened offset list).
+    /// [`Self::commitment_keys`] derives A's key from the proposed header and
+    /// B's from the ancestor. MoE's `HR` is checked through routing openings;
+    /// `HO` is recomputed from the full offsets list.
     pub(crate) fn verify_openings(
         &self,
         proposed_header: &IncompleteBlockHeader,
@@ -106,11 +96,9 @@ impl PublicParams {
             DWORD_SIZE * BLOCK_SIZE / 2
         );
 
-        // The compiled program is the one opening schedule (the ZK circuit runs
-        // this exact program): every wire proof must open precisely what it
-        // asks for, and its aux locations drive the witness extraction below.
-        let (program, msg_locs, cv_locs) = BlakeProgram::compile(self);
-        let schedules = TreeSchedules::new(self, &cv_locs)?;
+        // Use the same opening schedule and auxiliary locations as the ZK trace.
+        let (program, message_locations, cv_locations) = BlakeProgram::compile(self);
+        let schedules = TreeSchedules::new(self, &cv_locations)?;
 
         check_minimal_opening(&a.proof, &schedules.values.a, keys.a, "int8 values A")?;
         check_minimal_opening(&a_scales.proof, &schedules.scales.a, keys.a, "BF16 scales A")?;
@@ -161,8 +149,8 @@ impl PublicParams {
             vec![]
         };
 
-        let external_msgs = extract_aux_msgs(&msg_locs, a, a_scales, bt, bt_scales, routing)?;
-        let external_cvs = compute_external_cvs(&cv_locs, &schedules, a, a_scales, bt, bt_scales, routing)?;
+        let external_msgs = extract_aux_msgs(&message_locations, a, a_scales, bt, bt_scales, routing)?;
+        let external_cvs = compute_external_cvs(&cv_locations, &schedules, a, a_scales, bt, bt_scales, routing)?;
         ensure_eq!(
             external_msgs.len(),
             program.num_auxiliary_msgs,
@@ -203,23 +191,19 @@ impl PublicParams {
     }
 }
 
-/// One committed tree's opening as scheduled by [`BlakeProgram::compile`]: the
-/// chunk leaves hashed from data and the sibling subtree ranges supplied as
-/// auxiliary CVs. This is the single source of truth the wire proofs are
-/// checked against; NaN/Inf rejection is separate.
+/// Leaves and sibling byte ranges required by [`BlakeProgram::compile`]
+/// for one committed tree.
 pub(crate) struct TreeSchedule {
     pub(crate) hash_id: HashId,
     pub(crate) padded_len: usize,
-    /// Scheduled leaf chunk indices — the unique-minimal leaf set.
+    /// Exactly the leaf chunks required by the compiled schedule.
     pub(crate) leaf_indices: Vec<usize>,
-    /// Aux-CV subtree byte ranges, sorted — the unique-minimal sibling set.
+    /// Byte ranges of the required unopened sibling subtrees, sorted by position.
     pub(crate) sibling_ranges: Vec<(usize, usize)>,
 }
 
 impl TreeSchedule {
-    /// The compiler partitions a tree's padded bytes into leaf chunks and
-    /// unopened sibling subtrees, so the leaf set is the chunk-complement of
-    /// the tree's aux-CV ranges.
+    /// Opened leaves are the complement of the unopened sibling subtree ranges.
     pub(crate) fn new(cv_locs: &[AuxiliaryCvLocation], source: ProofSource, tree_bytes: usize, hash_id: HashId) -> Self {
         let chunk_len = hash_id.chunk_len();
         let padded_len = hash_id.padded_len(tree_bytes);
@@ -251,8 +235,8 @@ impl TreeSchedule {
     }
 }
 
-/// The compiled opening schedule of every committed tree with a wire proof.
-/// (`O` is fully disclosed and directly hashed — no schedule.)
+/// Schedules for trees authenticated through Merkle openings.
+/// The offsets list is fully disclosed and hashed directly, so it needs no schedule.
 struct TreeSchedules {
     values: Sides<TreeSchedule>,
     scales: Sides<TreeSchedule>,
@@ -295,9 +279,8 @@ impl TreeSchedules {
     }
 }
 
-/// `VerifyOpen_X`: the wire proof must be exactly the opening the compiled
-/// program asks for — its leaf chunks, its sibling count — and reconstruct
-/// its claimed root under `key`.
+/// Require exactly the scheduled leaves and sibling count, then reconstruct
+/// the claimed root under `key` (`VerifyOpen_X`).
 fn check_minimal_opening(proof: &MerkleProof, schedule: &TreeSchedule, key: Hash256, label: &str) -> Result<()> {
     let chunk_len = schedule.hash_id.chunk_len();
     if let Some(leaf) = proof.leaf_data.first() {
@@ -346,9 +329,7 @@ fn check_minimal_opening(proof: &MerkleProof, schedule: &TreeSchedule, key: Hash
     Ok(())
 }
 
-/// Offsets commitment: `O` is fully disclosed, so no Merkle opening is needed —
-/// recompute the keyed chunk-tree root over the disclosed list and compare it
-/// against the statement's `HO` (which seed-A binds).
+/// Recompute the full offsets commitment and compare it with the statement's `HO`.
 fn check_full_offsets(params: &PublicParams, offsets: &[u32], key: Hash256) -> Result<()> {
     let (moe, moe_public) = params
         .moe()
@@ -380,17 +361,17 @@ fn extract_routing_strips(routing: &MerkleProof, params: &PublicParams) -> Resul
     let moe_public = params
         .moe_statement()
         .ok_or_else(|| anyhow::anyhow!("PublicParams has no MoE data; cannot extract routing strips"))?;
-    let inner = params.a_inner_indices();
+    let selected_routing_indices = params.a_inner_indices();
     ensure_eq!(
-        inner.len(),
+        selected_routing_indices.len(),
         params.a_rows_indices().len(),
         "inner A indices and outer row count must match"
     );
     moe_public
         .opened_routing_blocks()
         .iter()
-        .map(|&hotspot_idx| {
-            let block_start = hotspot_idx as usize * BLOCK_LEN;
+        .map(|&block_index| {
+            let block_start = block_index as usize * BLOCK_LEN;
             routing
                 .extract_bytes(block_start, BLOCK_LEN)
                 .with_context(|| format!("routing strip: extract 64 bytes at row_start={block_start}"))
@@ -399,14 +380,15 @@ fn extract_routing_strips(routing: &MerkleProof, params: &PublicParams) -> Resul
 }
 
 fn extract_aux_msgs(
-    locs: &[AuxiliaryMsgLocation],
+    locations: &[AuxiliaryMsgLocation],
     a: &MatrixMerkleProof,
     a_scales: &MatrixMerkleProof,
     bt: &MatrixMerkleProof,
     bt_scales: &MatrixMerkleProof,
     routing: Option<&MerkleProof>,
 ) -> Result<Vec<[u8; 64]>> {
-    locs.iter()
+    locations
+        .iter()
         .map(|loc| {
             let proof = match loc.source {
                 ProofSource::A => &a.proof,
@@ -422,12 +404,11 @@ fn extract_aux_msgs(
         .collect()
 }
 
-/// The compiled aux CVs, read off the proofs' sibling vectors. After
-/// [`check_minimal_opening`] every compiled range is a proof sibling, so a
-/// miss can only mean the two schedules drifted.
+/// Extract sibling hashes in compiled trace order. Requires
+/// [`check_minimal_opening`] to have validated the proof's schedule.
 #[allow(clippy::too_many_arguments)]
 fn compute_external_cvs(
-    locs: &[AuxiliaryCvLocation],
+    locations: &[AuxiliaryCvLocation],
     schedules: &TreeSchedules,
     a: &MatrixMerkleProof,
     a_scales: &MatrixMerkleProof,
@@ -445,7 +426,8 @@ fn compute_external_cvs(
         _ => None,
     };
 
-    locs.iter()
+    locations
+        .iter()
         .map(|loc| {
             let ranges = match loc.source {
                 ProofSource::A => &a_ranges,
@@ -549,7 +531,7 @@ mod tests {
         let cols_pattern = AxisPattern::new(&[(4, Blake), (16, Fold)]).unwrap();
         let a_rows: Vec<usize> = rows_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
         let b_rows: Vec<usize> = cols_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
-        // σ̂ and σ_Δ coincide in this fixture (the ancestor is the proposed header).
+        // The ancestor and proposed headers coincide in this fixture.
         let proposed = IncompleteBlockHeader::new_for_test(0x207FFFFF);
         let keys = commit_keys(Sides {
             a: key_a(&proposed),
@@ -700,11 +682,8 @@ mod tests {
         proof.parse_proof(&proposed).expect("mixed A/B hash_ids must parse");
     }
 
-    /// The compiled program and pearl-blake3 must encode one schedule: the
-    /// program's leaf set (chunk-complement of its aux-CV ranges) equals the
-    /// unique-minimal leaf set miners ship, and its aux-CV ranges equal the
-    /// wire proof's sibling ranges. `k = 2080` exercises blocks straddling row
-    /// boundaries (`k % 64 != 0`).
+    /// Compare compiled leaves and sibling ranges against pearl-blake3's
+    /// minimal opening. `k = 2080` exercises blocks crossing row boundaries.
     #[test]
     fn compiled_schedule_is_the_unique_minimal_opening() {
         for (a_hash, b_hash) in [
@@ -828,18 +807,15 @@ mod tests {
         proof.parse_proof(&proposed).expect("finite subnormal scales must parse");
     }
 
-    /// The B-side tree key follows the witness's own `job.ancestor_header`
-    /// (`σ_Δ`), not the proposed header: a proof whose ancestor differs from
-    /// `σ̂` keys B's trees with `H_"key-B"(σ_Δ)`.
+    /// B-side openings must use the key derived from the proof's `job.ancestor_header`.
     #[test]
     fn ancestor_header_keys_b_side() {
         let ancestor = IncompleteBlockHeader {
             prev_block: [7; 32],
             ..IncompleteBlockHeader::new_for_test(0x207FFFFF)
         };
-        // Key B's trees under the ancestor (A stays on the fixture's σ̂), then
-        // declare σ_Δ in the job: the proof parses only when the verifier's
-        // keyB — derived from the declared ancestor — matches the tree key.
+        // Key B's trees under the ancestor, then declare that ancestor in the job.
+        // The derived key must match the one used for the tree.
         let (proposed, mut proof) =
             build_dense_proof_with(2048, honest_scale, HashId::Blake3Chunk1024, HashId::Blake3Chunk1024, |keys| {
                 Sides {

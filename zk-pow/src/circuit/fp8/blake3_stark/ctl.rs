@@ -31,44 +31,22 @@ fn msg_pair_tables<F: Field>(filter_col: usize, key_stride: usize) -> Vec<TableW
         .collect()
 }
 
-/// Blake3's looking side of the **strip int8 bytes** channel: 4 byte-pair
-/// instances per values-message row, `(CTL_KEY_BASE + 2j, UINT8_DATA[2j] + 2^8*UINT8_DATA[2j+1])`
-/// for `j in 0..4` — two consecutive int8 elements per tuple (raw bytes; InputQuant's INT8DEC
-/// does the two's-complement decode). Filtered by `IS_INT8_MESSAGE`, set only on opened-strip
-/// values rows of either side — auxiliary blocks and parents don't cross; every strip element
-/// crosses exactly once. One channel serves both sides: the looked side holds InputQuant's A
-/// and B column groups as two slots, and `CTL_KEY_BASE` carries the `h*k` B-plane key offset, so
-/// the two sides' key spaces are disjoint.
-///
-/// The pair packing is sound because each byte is individually BYTES2-checked
-/// ([`blake3_lut_lookups`]).
-///
-/// Looked side: `input_quant_stark::ctl::ctl_int8_bytes_looked_input_quant` (slots A, B).
+/// Exports four int8 byte pairs per live message row, keyed by the first element.
+/// A/B keys are disjoint through the B offset h*k. Auxiliary and padding bytes do
+/// not cross. BYTES2 bounds each byte, making the pair packing unique.
 pub fn ctl_int8_bytes_looking_blake3<F: Field>() -> Vec<TableWithColumns<F>> {
     msg_pair_tables(BLAKE3_COL_MAP.is_int8_message, 2)
 }
 
-/// Blake3's looking side of the **block scales** channel: 4 instances per
-/// scales-message row, `(CTL_KEY_BASE + j, UINT8_DATA[2j] + 2^8*UINT8_DATA[2j+1])` for `j in 0..4`
-/// — one LE bf16 block-scale code per tuple, keyed by block index. Filtered by
-/// `IS_SCALE_MESSAGE` (opened-strip scales rows of either side; B keys carry the `h*k/8` offset
-/// in `CTL_KEY_BASE`); every block scale crosses exactly once.
-///
-/// Looked side: `input_quant_stark::ctl::ctl_block_scales_looked_input_quant` (slots A, B).
+/// Exports four little-endian BF16 scales per live scale-message row.
+/// Keys count blocks; B starts at h*k/8. Each opened scale crosses once.
 pub fn ctl_block_scales_looking_blake3<F: Field>() -> Vec<TableWithColumns<F>> {
     msg_pair_tables(BLAKE3_COL_MAP.is_scale_message, 1)
 }
 
-/// Blake3's looking side of the **lottery words** channel: 16
-/// instances `(word_pos, FOLD_OUT)` on the lottery message-load row — the 16 LE u32 words of
-/// the 64-byte lottery block, read from `BLAKE3_MSG` (row 0 of a compression holds the message
-/// itself). Filter `IS_BIND_JACKPOT_HASH * IS_NEW_BLAKE`, a degree-2 product of committed flags
-/// (`IS_BIND_JACKPOT_HASH` spans all 8 lottery rows precisely so this product fires exactly once).
-///
-/// Looked side: `xor_fold_stark::ctl::ctl_lottery_words_looked_xor_fold` (filter
-/// `IS_LANE_FINAL`). The FP8 V2 batch assembler pairs both sides, proving that the 16 jackpot
-/// message words are exactly XorFold's 16 lane outputs; the public `HASH_JACKPOT` then binds
-/// their keyed BLAKE3 digest.
+/// Binds the 16 lottery message words to XorFold's lane outputs on the load row.
+/// The filter requires both the lottery flag and compression start. The lottery
+/// flag spans all eight rows so it also enables the final hash binding.
 pub fn ctl_lottery_words_looking_blake3<F: Field>() -> Vec<TableWithColumns<F>> {
     let m = &BLAKE3_COL_MAP;
     (0..16)
@@ -85,36 +63,21 @@ pub fn ctl_lottery_words_looking_blake3<F: Field>() -> Vec<TableWithColumns<F>> 
         .collect()
 }
 
-/// Blake3Stark's per-row LUT instance inventory: BYTES2 x4 (every message
-/// byte pair), RC16 x8 (the four 13-bit outer-index limb bounds, each as an unshifted +
-/// shifted pair, **unfiltered** — every row), RC16 x4 (the MoE order-chain limbs, unfiltered).
-/// The CV-routing lookup is *not* a LUT instance — it is in-trace with both sides in this
-/// table and lives in `Blake3Stark::lookups` (already wired and proven).
+/// Byte ranges, routing-index limb bounds and MoE order-chain limb bounds.
+/// CV routing is an in-trace lookup defined by `Blake3Stark::lookups`.
 ///
-/// The limb bounds must be unfiltered, exactly the deployed chip's unfiltered `URANGE13`
-/// lookups: constraint 6 decodes the known packed word through the limbs *unconditionally*,
-/// and an unpinned slot (selector down — an unsampled neighbor, or any non-routing row) is
-/// sound only because its limbs are still range-checked and therefore forced to zero by the
-/// unique decomposition. Filtering by the selectors would let a malicious prover put
-/// arbitrary field elements in the dark slots' limbs and satisfy the packed equality with a
-/// wrap, breaking the pinned slot's binding. Off-routing rows all four limbs are zero, which
-/// is in-domain, so the unfiltered instances cost nothing.
-///
-/// Each 13-bit bound needs **both** RC16s. `RC16(8 * LIMB)` alone does not bound `LIMB` in
-/// Goldilocks: `p = 1 (mod 8)`, so every `v < 2^16` has aliases `LIMB = (v + k*p) / 8`
-/// (`k in 1..8`, huge canonical values) whose scaled key still lands in `[0, 2^16)` — with
-/// only the scaled check, `2^16 * LIMB_1` can contribute e.g. `2^23 * t (mod p)` to the
-/// packed word and shift a *pinned* slot's decoded index by `-2^23 * t` while an unpinned
-/// neighbor slot absorbs the difference. `RC16(LIMB)` first pins `LIMB < 2^16` (so `8 * LIMB`
-/// cannot wrap), and `RC16(8 * LIMB)` then gives the true 13-bit bound.
+/// Routing limbs need unfiltered `RC16(limb)` and `RC16(8*limb)`. The first prevents
+/// field wrap; the second narrows the value to 13 bits. A scaled check alone admits
+/// large field aliases. Disabling checks on unsampled slots would also let their
+/// limbs absorb changes to a sampled slot in the packed equality.
 pub fn blake3_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
     let m = &BLAKE3_COL_MAP;
     let eight = F::from_canonical_u64(8);
 
     let mut lookups = Vec::new();
-    // ---- BYTES2(UINT8_DATA[2j], UINT8_DATA[2j+1]) x4, every row (padding rows carry
-    // ---- zero bytes, which are in-domain). These byte ranges are also what make the byte-pair
-    // ---- CTL packings and the buffer-word packings (constraint 5) sound.
+    // BYTES2(UINT8_DATA[2j], UINT8_DATA[2j+1]) x4, every row (padding rows carry
+    // zero bytes, which are in-domain). These byte ranges are also what make the byte-pair
+    // CTL packings and the buffer-word packings (constraint 5) sound.
     for j in 0..4 {
         lookups.push(LutLookup {
             table: LutTable::Bytes2,
@@ -123,9 +86,7 @@ pub fn blake3_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
             filter: Filter::default(),
         });
     }
-    // ---- RC16(limb) + RC16(8 * limb) x4, unfiltered — the alias-free 13-bit bounds that make
-    // ---- the packed outer-index decomposition (constraint 6) unique on every row (module
-    // ---- docs above: neither check bounds the limb alone).
+    // Both checks are required on every routing-index limb, including unsampled slots.
     for limb in [
         m.outer_index_first[0],
         m.outer_index_first[1],
@@ -135,10 +96,10 @@ pub fn blake3_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
         lookups.push(LutLookup::rc16(Column::single(limb)));
         lookups.push(LutLookup::rc16(Column::linear_combination([(limb, eight)])));
     }
-    // ---- RC16 x4, unfiltered — the MoE order-chain limbs (constraint 7). The bounds force
-    // ---- each gated difference into [0, 2^32), so a wrapped negative (~2^64) can never
-    // ---- satisfy the chain equality. Rows with every gate off hold zeros, which are
-    // ---- in-domain.
+    // RC16 x4, unfiltered — the MoE order-chain limbs (constraint 7). The bounds force
+    // each gated difference into [0, 2^32), so a wrapped negative (~2^64) can never
+    // satisfy the chain equality. Rows with every gate off hold zeros, which are
+    // in-domain.
     for limbs in [m.chain_intra_limbs, m.chain_inter_limbs] {
         lookups.push(LutLookup::rc16(Column::single(limbs[0])));
         lookups.push(LutLookup::rc16(Column::single(limbs[1])));

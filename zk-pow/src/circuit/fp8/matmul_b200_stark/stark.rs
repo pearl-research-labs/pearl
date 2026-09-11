@@ -1,10 +1,20 @@
-//! Proves B200's 32-lane fp8 E4M3 matrix-multiplication accumulation.
+//! Proves B200's 32-lane FP8 E4M3 matrix-multiplication accumulation.
+//!
+//! For each output cell, `k/32` trace rows consume the dot product in groups of
+//! 32 products. Each row aligns its products with the incoming f32 accumulator,
+//! sums the resulting integers and truncates to the next f32 accumulator.
 //!
 //! # E4M3 decode and stored exponents
 //!
-//! Decode an operand as `+/-mag*2^(shift-9)`: for a normal code,
-//! `mag = 8 + mantissa` and `shift = exponent_field - 1`; for a subnormal,
-//! `mag = mantissa` and `shift = 0`. Thus an exact nonzero product is
+//! E4M3 has four exponent bits and three fraction bits. For a finite operand:
+//!
+//! ```text
+//! value = (-1)^sign * mag * 2^(shift - 9)
+//! mag   = 8 + mantissa,    shift = exponent_field - 1    for normals
+//! mag   = mantissa,        shift = 0                     for subnormals and zero
+//! ```
+//!
+//! Thus an exact nonzero product is:
 //!
 //! ```text
 //! product = +/-P*2^(L-18)
@@ -31,29 +41,61 @@
 //! dividing `P*2^(L-18)` by the window unit leaves `P*2^(19-REL)`. An attaining lane is
 //! therefore `< 225*2^19 < 2^27`; a relative shift of 27 or more discards it completely.
 //!
-//! The carry retains a full 24-bit f32 significand `C` and has biased exponent `CE`. In the
-//! same window it contributes
-//! `+/-floor(4*C / 2^(E-CE))`. The factor four converts the carry's 23 fractional bits to the
-//! window's 25. Because `4*C < 2^26`, shifts are capped at 26: every larger shift also yields
-//! zero.
+//! The carry retains a full 24-bit f32 significand `C` and has biased exponent `CE`.
+//! Its contribution in the same window is:
+//!
+//! ```text
+//! carry_term = +/-floor(4*C / 2^(E - CE))
+//! ```
+//!
+//! The factor four converts the carry's 23 fractional bits to the window's 25.
+//! Because `4*C < 2^26`, shifts are capped at 26: every larger shift also yields zero.
 //!
 //! The 32 lane terms and carry sum exactly as a signed integer, with magnitude `< 2^32`.
 //! B200 truncates this sum toward zero to a normalized 24-bit significand in
-//! `[2^23, 2^24)`. If its bit length is `W`, the next biased exponent is `E + W - 26`;
-//! 26 is the 25 window bits plus the leading-bit position. Adding `127 - 38 = 89` converts that
-//! exponent to the f32 field. A cell-final row exports the resulting exact f32 word; a zero sum
-//! exports positive zero.
+//! `[2^23, 2^24)`. For a nonzero sum of bit length `W`:
+//!
+//! ```text
+//! next_biased_exponent = E + W - 26
+//! f32_exponent_field  = next_biased_exponent + (127 - 38)
+//! ```
+//!
+//! The 26 accounts for the 25 window bits and the leading-bit position. A cell-final
+//! row exports the resulting exact f32 word; a zero sum exports positive zero.
+//!
+//! # Magnitude bounds and skip counts
+//!
+//! Let `M` be the maximum absolute product or partial accumulator value over a cell.
+//! MB13–MB14 enforce a cell-constant upper bound on its biased magnitude exponent:
+//!
+//! ```text
+//! cell_magnitude_exponent >= floor(log2(M)) + 139    for M > 0
+//! cell_magnitude_exponent = 0                      when a zero cell is claimed
+//! ```
+//!
+//! A zero claim requires every product and partial accumulator to be zero.
+//! The magnitude exponent uses bias 139, separately from the stored-exponent bias 38
+//! used for accumulation above. Tamed consumes this bound for jackpot check 3.
+//!
+//! For jackpot check 4, InputQuant supplies the two summand scores for each lane.
+//! MB15 allows a non-skip only when:
+//!
+//! ```text
+//! score_A + score_B >= 128*cell_magnitude_exponent + 45376
+//! ```
+//!
+//! MB16 accumulates the skip flags and exports the cell total to Tamed.
+//! [`super::super::unpredictability`] derives the score and threshold. A prover
+//! may overstate the magnitude bound or count extra skips; both make acceptance harder.
 //!
 //! # Padding
 //!
-//! Each cell is exactly its `k/32` live atom-steps; single-row phantom cells pad the full
-//! trace to a power of two and read no operands, emit no output.
+//! Single-row phantom cells pad the full trace to a power of two. They read no
+//! operands and emit no output. The verifier recomputes the cell boundaries and
+//! padding flags from public geometry.
 //!
-//! MB1-MB16 label the constraint groups. MB13 commits the cell's replay-magnitude binade
-//! E_CELL (jackpot check 3); MB14-MB16 commit the per-lane skip census over the summand
-//! scores received from InputQuant (jackpot check 4).
-//! A complete batch proof also includes the B200ALIGN, POW2GB, WIDTH32, and RC16 relations
-//! declared in `super::ctl`.
+//! MB1–MB16 label the constraint groups. A complete batch proof also includes the
+//! B200ALIGN, POW2GB, WIDTH32 and RC16 lookup relations declared in [`super::ctl`].
 
 use core::borrow::Borrow;
 use std::marker::PhantomData;
@@ -95,14 +137,12 @@ const OUT_WIDTH: u64 = 24;
 /// (`EXPB = GROUP_OUTPUT_BIASED_EXPONENT`), so `floor(log2 |partial|) = EXPB - 38` and its
 /// check-3 binade is `EXPB - 38 + 139 = EXPB + 101`. MB13's range check subtracts this offset.
 pub(crate) const PARTIAL_BINADE_OFFSET: u64 = BINADE_BIAS - 38;
-/// The shift on every jackpot check 3 binade (`E_CELL`, `LANE_BINADES`):
+/// The shift on every jackpot check 3 binade (`CELL_MAGNITUDE_EXPONENT`, `LANE_BINADES`):
 /// `E = floor(log2 |value|) + 139`, so all binades are nonnegative and comparable.
 /// 0 marks a zero value.
 pub(crate) const BINADE_BIAS: u64 = 139;
 
-// ==================================================================================================
 // Program and trace generation
-// ==================================================================================================
 
 /// The public geometry of one FP8 matmul: `out[r, c] = sum_t A[r, t] * B[t, c]` over fp8
 /// codes.
@@ -136,13 +176,7 @@ impl MatmulProgram {
         self.live_rows().next_power_of_two()
     }
 
-    /// The class (a) ("known") column values — the leading
-    /// [`NUM_MATMUL_B200_KNOWN_COLUMNS`](super::columns::NUM_MATMUL_B200_KNOWN_COLUMNS)
-    /// trace columns in their `columns.rs` order (`cell_id`, `is_cell_final`,
-    /// `operand_index_base_a`, `operand_index_base_b`, `is_padding`), pure functions of the
-    /// program geometry. Bit-exact with [`generate_b200_trace`]'s fill; the batch verifier
-    /// recomputes exactly this and checks the trace openings against it (`starky`'s
-    /// `BatchKnownColumns`).
+    /// Recomputes the leading schedule columns in trace order from public geometry.
     pub fn known_values<F: RichField>(&self) -> Vec<PolynomialValues<F>> {
         let (h, w, k) = (self.h, self.w, self.k);
         let live_rows_per_cell = k / GROUP_WIDTH;
@@ -298,13 +332,13 @@ pub fn generate_b200_trace<F: RichField>(
         for c in 0..w {
             let cell_id = r * w + c;
 
-            // ---- The k/32 live atom-steps (window-sum emulation columns). ----
+            // The k/32 live atom-steps (window-sum emulation columns).
             let mut carry = OutTriple::ZERO;
             let mut incoming_carry_is_zero = true;
-            // Jackpot check 3 (MB13): E_CELL = max of floor(log2 |x|) + 139 over the cell's
+            // Jackpot check 3 (MB13): CELL_MAGNITUDE_EXPONENT = max of floor(log2 |x|) + 139 over the cell's
             // products and partial sums (0 if all products are zero); filled in after the loop.
             let cell_start = rows.len();
-            let mut e_cell = 0u64;
+            let mut cell_magnitude_exponent = 0u64;
             for j in 0..live_rows_per_cell {
                 let is_final = j == live_rows_per_cell - 1;
                 let mut row = MatmulB200ColumnsView {
@@ -325,12 +359,12 @@ pub fn generate_b200_trace<F: RichField>(
                     row.operand_codes_a[i] = F::from_canonical_u8(operand_codes_a);
                     row.operand_codes_b[i] = F::from_canonical_u8(operand_codes_b);
                     row.product_biased_exponents[i] = F::from_canonical_u64(lanes[i].biased_exponent);
-                    row.lambda_a[i] = F::from_canonical_u64(a_lambdas[r * k + j * GROUP_WIDTH + i]);
-                    row.lambda_b[i] = F::from_canonical_u64(b_lambdas[c * k + j * GROUP_WIDTH + i]);
+                    row.summand_score_a[i] = F::from_canonical_u64(a_lambdas[r * k + j * GROUP_WIDTH + i]);
+                    row.summand_score_b[i] = F::from_canonical_u64(b_lambdas[c * k + j * GROUP_WIDTH + i]);
                     // MB13: the lane's binade, as served by B200ALIGN.
                     let lane_binade = lanes[i].biased_binade();
                     row.lane_binades[i] = F::from_canonical_u64(lane_binade);
-                    e_cell = e_cell.max(lane_binade);
+                    cell_magnitude_exponent = cell_magnitude_exponent.max(lane_binade);
                 }
 
                 // The window anchor: the max biased stored exponent over the nonzero summands
@@ -443,24 +477,23 @@ pub fn generate_b200_trace<F: RichField>(
                 // Check 3: partial sums enter the max too, at binade EXPB + 101
                 // (`PARTIAL_BINADE_OFFSET`); zero partials have none.
                 if out.sig24 != 0 {
-                    e_cell = e_cell.max(out.expb + PARTIAL_BINADE_OFFSET);
+                    cell_magnitude_exponent = cell_magnitude_exponent.max(out.expb + PARTIAL_BINADE_OFFSET);
                 }
                 incoming_carry_is_zero = total == 0;
                 carry = out;
                 rows.push(row.into());
             }
 
-            // ---- MB13-MB16 post-pass: fill the cell-constant E_CELL and the per-lane
-            // skip census (skip verdicts need the finished E_CELL). ----
+            // MB13-MB16: compute skip decisions after the complete cell's magnitude bound is known.
             let map = MATMUL_B200_COL_MAP;
             let mut cell_skips = 0u64;
             for (j, row) in rows[cell_start..].iter_mut().enumerate() {
-                row[map.e_cell] = F::from_canonical_u64(e_cell);
-                row[map.cell_nonzero] = F::from_bool(e_cell != 0);
+                row[map.cell_magnitude_exponent] = F::from_canonical_u64(cell_magnitude_exponent);
+                row[map.cell_nonzero] = F::from_bool(cell_magnitude_exponent != 0);
                 for i in 0..GROUP_WIDTH {
-                    let lambda_a = a_lambdas[r * k + j * GROUP_WIDTH + i];
-                    let lambda_b = b_lambdas[c * k + j * GROUP_WIDTH + i];
-                    let skipped = skip(lambda_a, lambda_b, e_cell);
+                    let summand_score_a = a_lambdas[r * k + j * GROUP_WIDTH + i];
+                    let summand_score_b = b_lambdas[c * k + j * GROUP_WIDTH + i];
+                    let skipped = skip(summand_score_a, summand_score_b, cell_magnitude_exponent);
                     row[map.skip_flag[i]] = F::from_bool(skipped);
                     cell_skips += u64::from(skipped);
                 }
@@ -469,7 +502,7 @@ pub fn generate_b200_trace<F: RichField>(
         }
     }
 
-    // ---- Trailing padding: one all-zero single-row phantom cell per padding row. ----
+    // Trailing padding: one all-zero single-row phantom cell per padding row.
     for t in 0..num_rows - program.live_rows() {
         rows.push(phantom_row::<F>(h * w + t).into());
     }
@@ -494,9 +527,7 @@ fn phantom_row<F: RichField>(cell_id: usize) -> MatmulB200ColumnsView<F> {
     }
 }
 
-// ==================================================================================================
 // Constraints, written once against the generic `Evaluator`
-// ==================================================================================================
 
 /// Evaluates every arithmetic constraint of MatmulB200Stark. Lookup-borne facts (LUT oracle)
 /// are *not* emitted here — see `super::ctl::matmul_b200_lut_lookups`. The constraint set
@@ -537,10 +568,10 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     );
 
     // The transition constraints below are *plain* (they also bind the last-row -> first-row
-    // wrap); the wrap instances are made inert by the last row being cell-final (a class (a)
+    // wrap); the wrap instances are made inert by the last row being cell-final (a verifier-known
     // fact, carried by the known-column binding — see MB4) and row 0's anchored zero carry.
 
-    // ---- MB1 — product lookups x32 (B200ALIGN; served by the LUT oracle). ----
+    // MB1 — product lookups x32 (B200ALIGN; served by the LUT oracle).
     // The tuple binds ALIGNED_LANE_TERMS / PRODUCT_BIASED_EXPONENT / OPERAND_CODES_A/B per
     // lane, and its key domain enforces GROUP_MAX_BIASED_EXPONENT >= PRODUCT_BIASED_EXPONENT_i.
     // Padding rows read no operands, so their lanes must be forced to zero products —
@@ -552,15 +583,13 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
         eval.constraint(c);
     }
 
-    // ---- MB3 — anchor attainment by vanishing product (the "<=" side of
-    // GROUP_MAX_BIASED_EXPONENT; the ">=" side is the LUT key domains). Chain links pin
-    // MAX_EXPONENT_ATTAINMENT_16 = prod_{i<32}(GROUP_MAX_BIASED_EXPONENT - PRODUCT_BIASED_EXPONENT_i)
-    // exactly (<= 2 new factors per link, degree <= 3); the closing constraint, anchored at
-    // the producing row, multiplies in the zero-gated carry factor and demands the product
-    // vanish. Zero lanes need no gate: attaining through the sentinel forces
-    // GROUP_MAX_BIASED_EXPONENT = 0,
-    // keyless for every nonzero summand — self-defeating except on all-zero rows, where 0 IS
-    // the honest anchor.
+    // MB3: prove the anchor E is attained. For lane exponents e_i and incoming-carry
+    // exponent e_c, the chain and closing constraint enforce
+    //   prod_{i=0..31}(E - e_i) * ((1 - z_c)*(E - e_c) + z_c) = 0,
+    // where z_c marks a zero carry, replacing its factor with 1.
+    // Lookup domains already prove E >= every participating exponent. The vanishing
+    // product forces equality with one of them; zero sentinels can attain only E = 0.
+    // Intermediate products keep each constraint's degree at most three.
     let factor = |eval: &mut E, view: &MatmulB200ColumnsView<V>, i: usize| {
         eval.sub(view.group_max_biased_exponent, view.product_biased_exponents[i])
     };
@@ -584,7 +613,7 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
         lv.max_exponent_attainment[NUM_ATT_LINKS - 1],
     );
     eval.constraint(link);
-    // Closing: the chain includes the zero-gated incoming-carry exponent factor.
+    // Close the next row's chain using this row's output as its incoming carry.
     let incoming_carry_is_live = eval.sub(one, nv.incoming_carry_is_zero);
     let incoming_carry_exponent_gap = eval.sub(nv.group_max_biased_exponent, lv.group_output_biased_exponent);
     let incoming_carry_factor = eval.mul(incoming_carry_is_live, incoming_carry_exponent_gap);
@@ -592,7 +621,7 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     let closing = eval.mul(nv.max_exponent_attainment[NUM_ATT_LINKS - 1], incoming_carry_factor);
     eval.constraint(closing);
 
-    // ---- MB4 — carry-zero flag by propagation. ----
+    // MB4 — carry-zero flag by propagation.
     let incoming_carry_next_diff = eval.sub(nv.incoming_carry_is_zero, z);
     let c = eval.mul(not_final, incoming_carry_next_diff);
     eval.constraint(c);
@@ -601,14 +630,14 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     eval.constraint(c);
     let first_anchor = eval.sub(lv.incoming_carry_is_zero, one);
     eval.constraint_first_row(first_anchor);
-    // IS_CELL_FINAL is class (a) (verifier-recomputed, checked against the trace openings —
+    // IS_CELL_FINAL is verifier-known (verifier-recomputed, checked against the trace openings —
     // `super::super::known_values`), so its schedule facts hold without in-AIR pins: it is
     // boolean, and the last row is cell-final — the wrap soundness of every plain transition
     // here.
 
     eval.constraint_bool(lv.is_padding);
 
-    // ---- MB5 — carry alignment (anchored at the producing row). ----
+    // MB5 — carry alignment (anchored at the producing row).
     // POW2GB(GROUP_MAX_BIASED_EXPONENT' - GROUP_OUTPUT_BIASED_EXPONENT;
     // INCOMING_CARRY_SHIFT_POWER') [filter 1 - INCOMING_CARRY_IS_ZERO'] is a LUT instance.
     // Its key domain enforces GROUP_MAX_BIASED_EXPONENT' >= GROUP_OUTPUT_BIASED_EXPONENT.
@@ -630,13 +659,12 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     let incoming_carry_remainder_sum = eval.add(incoming_carry_remainder_sum, one);
     let incoming_carry_remainder_identity = eval.sub(incoming_carry_remainder_sum, lv.incoming_carry_shift_power);
     eval.constraint(incoming_carry_remainder_identity);
-    // Local kill: zero carries contribute nothing (the limbs are RC16-nonnegative, so the
-    // weighted sum vanishes only when both do; also covers cell starts and the cyclic wrap).
+    // Zero carries contribute nothing, including at cell starts and across the cyclic wrap.
     let kill = eval.mul(lv.incoming_carry_is_zero, aligned_incoming_carry);
     eval.constraint(kill);
 
-    // ---- MB6 — signed sum (anchored at the producing row; row 0's instance rides the wrap,
-    // where ALIGNED_INCOMING_CARRY(0) = 0 makes the stale output sign inert). ----
+    // MB6: combine this row's signed output carry with the next row's lane terms.
+    // At the cyclic wrap, row 0's aligned carry is zero, so the last row's sign has no effect.
     let terms_sum = eval.sum(&nv.aligned_lane_terms);
     let carry_sign_factor = double_complement(eval, one, lv.group_output_sign);
     let signed_carry = eval.mul(carry_sign_factor, aligned_incoming_carry_next);
@@ -655,7 +683,7 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     let plus_zero = eval.mul(lv.group_sum_is_zero, lv.group_sum_sign);
     eval.constraint(plus_zero);
 
-    // ---- MB7 — width + truncation toward zero. WIDTH32 binds GROUP_SUM_WIDTH,
+    // MB7 — width + truncation toward zero. WIDTH32 binds GROUP_SUM_WIDTH,
     // TRUNCATION_POWER, and LIFTING_POWER. The Euclidean identity and normalized range pin the
     // exact bit width and truncation.
     let lifted = eval.mul(lv.group_sum_abs, lv.lifting_power);
@@ -670,7 +698,7 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     let c = eval.mul(one_minus_z, truncation_remainder_identity);
     eval.constraint(c);
 
-    // ---- MB10 — output mux (normal path / +0 path). ----
+    // MB10 — output mux (normal path / +0 path).
     let group_output_biased_exponent_raw = eval.add(lv.group_max_biased_exponent, lv.group_sum_width);
     let twenty_six = eval.i32(26);
     let group_output_biased_exponent_raw = eval.sub(group_output_biased_exponent_raw, twenty_six);
@@ -690,11 +718,10 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     let c = eval.mul(z, lv.group_output_sign);
     eval.constraint(c);
 
-    // ---- MB12 — f32 encode at cell-final. ----
-    // W := LO + 2^16*HI must equal GROUP_OUTPUT_SIGN*2^31
-    // + (GROUP_OUTPUT_BIASED_EXPONENT + 89)*2^23 + (GROUP_OUTPUT_SIGNIFICAND - 2^23)
-    // on the normal path and 0 on the zero path; folding the mux gives
-    // MB10 has already zeroed the group output on the zero path.
+    // MB12: for nonzero output fields (sign, expb, sig), the f32 word is
+    //   W = sign*2^31 + (expb + 89)*2^23 + (sig - 2^23).
+    // MB10 zeroes all three fields when z = 1, so both paths share the affine form
+    //   W = sign*2^31 + expb*2^23 + sig + 88*2^23*(1 - z).
     let w = eval.mad(lv.cell_result_f32_hi, limb_shift, lv.cell_result_f32_lo);
     let c2_31 = eval.u64(1 << 31);
     let sign_term = eval.mul(lv.group_output_sign, c2_31);
@@ -709,33 +736,27 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     let c = eval.mul(lv.is_cell_final, encode);
     eval.constraint(c);
 
-    // ---- MB13 — jackpot check 3: the cell's replay-magnitude binade
-    // Here, we only need to check that e_cell is constant within one cell computation. To check that it is an upper bound of the
-    // exponents of the products and the partial products, we use CTLs.
-    let e_cell_step = eval.sub(nv.e_cell, lv.e_cell);
-    let c = eval.mul(not_final, e_cell_step);
+    // MB13: keep the magnitude exponent bound constant within the cell.
+    // Range lookups in `ctl.rs` bound every product and partial-sum exponent by it.
+    let cell_exponent_step = eval.sub(nv.cell_magnitude_exponent, lv.cell_magnitude_exponent);
+    let c = eval.mul(not_final, cell_exponent_step);
     eval.constraint(c);
 
-    // ---- MB14 — the cell-nonzero flag (jackpot check 4). NZ is boolean and its complement
-    // pins E_CELL = 0. A false NZ = 0 claim on a nonzero cell cannot survive MB13: some lane
-    // binade is >= 121, and RC16(E_CELL - LANE_BINADES_i) rejects E_CELL = 0 there. ----
+    // MB14: a cleared flag forces a zero magnitude exponent. A nonzero cell has
+    // some lane binade >= 121, whose range check rejects a zero exponent claim.
     let nz = lv.cell_nonzero;
     eval.constraint_bool(nz);
     let not_nz = eval.sub(one, nz);
-    let c = eval.mul(not_nz, lv.e_cell);
+    let c = eval.mul(not_nz, lv.cell_magnitude_exponent);
     eval.constraint(c);
 
-    // ---- MB15 — per-lane skip flags (jackpot check 4). Boolean; pinned to 0 on padding rows
-    // and on zero cells (a zero cell never counts as skipped). On a nonzero cell, lane u is
-    // skipped exactly when
-    //   LAMBDA_A + LAMBDA_B < 128*E_CELL + 45376,
-    // the integer form of `(au^2 + si^2)*(bu^2 + sj^2)/2^21 < ulp(M)^2` on this device.
-    // Claiming non-skip costs the lane's RC16 (ctl.rs) on the key
-    //   LAMBDA_A + LAMBDA_B - 128*E_CELL - 45376,
-    // filter `CELL_NONZERO * (1 - SKIP_FLAG)`: a true skip makes the key negative, wrapping
-    // it far outside [0, 2^16) and forcing the flag to 1. Satisfiable traces keep honest
-    // non-skip keys below 2^16 (LAMBDA <= 54207, and E_CELL >= 121 on nonzero cells).
-    // Overstating the census is allowed and self-defeating. ----
+    // MB15: skip flags are boolean and zero on padding or claimed-zero cells.
+    // A claimed non-skip must pass RC16(lambda_A + lambda_B - 128*E - 45376),
+    // with E = cell_magnitude_exponent. A true skip gives a negative key and fails.
+    // Since lambda <= 54207 and nonzero cells have E >= 121, a nonnegative key is
+    // at most 2*54207 - 128*121 - 45376 = 47550 < 2^16.
+    // Overcounting is allowed and only makes the budget harder to satisfy.
+    // See `unpredictability` for the exact integer score rule.
     for i in 0..GROUP_WIDTH {
         eval.constraint_bool(lv.skip_flag[i]);
         let c = eval.mul(lv.is_padding, lv.skip_flag[i]);
@@ -744,11 +765,11 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
         eval.constraint(c);
     }
 
-    // ---- MB16 — the in-cell skip census. CELL_SKIPS anchors to the row's flag sum at each
-    // cell start and otherwise accumulates the next row's flags; the cell-final value rides
-    // the E-cell channel to TamedStark's budget gate. The cyclic wrap is inert: the last row
-    // is cell-final (class (a)), so the wrap instance is the next cell's anchor — row 0's
-    // explicit first-row anchor is redundant with it but keeps the recurrence local. ----
+    // MB16: count skip flags within each cell; Tamed checks the final count against the budget.
+    // On a cell-final row: CELL_SKIPS' = sum(SKIP_FLAG'). Otherwise:
+    // CELL_SKIPS' = CELL_SKIPS + sum(SKIP_FLAG').
+    // The verifier fixes the last row as cell-final, so the cyclic wrap also resets row 0.
+    // The explicit first-row constraint enforces the same reset locally.
     let flags_sum = eval.sum(&lv.skip_flag);
     let anchor = eval.sub(lv.cell_skips, flags_sum);
     eval.constraint_first_row(anchor);
@@ -768,9 +789,7 @@ fn double_complement<V: Copy, S: Copy, E: Evaluator<V, S>>(eval: &mut E, one: V,
     eval.sub(one, twice)
 }
 
-// ==================================================================================================
 // Stark impl
-// ==================================================================================================
 
 /// MatmulB200Stark — the AIR behind the batch's Matmul slot. A CTL party of the fp8 batch
 /// (`requires_ctls()`): the batch driver is the only supported proving path.
@@ -831,13 +850,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for MatmulB200Sta
         true
     }
 
-    // (No in-trace `lookups()`: the former MB14 per-cell histogram logup was removed with the
-    // jackpot policy.)
 }
 
-// ==================================================================================================
 // Tests
-// ==================================================================================================
 
 #[cfg(test)]
 mod tests {
@@ -946,7 +961,7 @@ mod tests {
 
     #[test]
     fn e_cell_is_the_binade_of_the_plaintext_replay_magnitude() {
-        // Check 3 (MB13): the committed E_CELL equals floor(log2 M_ij) + 139, with M_ij the
+        // Check 3 (MB13): the committed CELL_MAGNITUDE_EXPONENT equals floor(log2 M_ij) + 139, with M_ij the
         // replay magnitude exactly as `jackpot_policy` computes it (max |product| and
         // |partial sum| of the cell), and 0 for an all-zero cell — row 0 of A is zeroed to
         // hit that case on live cells. The trace must still satisfy every constraint; the
@@ -992,7 +1007,7 @@ mod tests {
                 };
                 assert_eq!(expected == 0, r == 0, "exactly row 0's cells are all-zero (cell {cell})");
                 let v: &MatmulB200ColumnsView<F> = rows[cell * program.rows_per_cell()].borrow();
-                assert_eq!(to_u64(v.e_cell), expected, "cell {cell}");
+                assert_eq!(to_u64(v.cell_magnitude_exponent), expected, "cell {cell}");
                 // Check 4 on the same trace: zero cells pin the nonzero flag and every skip flag.
                 assert_eq!(v.cell_nonzero, F::from_bool(expected != 0), "cell {cell}");
                 if expected == 0 {
@@ -1005,8 +1020,7 @@ mod tests {
         }
     }
 
-    /// A long-k geometry (k = 2048 gives 64 rows per cell, no head padding) paired with the
-    /// wide pool's ~36 distinct f32 exponents.
+    /// k = 2048 gives 64 accumulation rows per cell; use the wide-exponent operand pool.
     fn wide_program() -> MatmulProgram {
         MatmulProgram { h: 2, w: 2, k: 2048 }
     }
@@ -1028,10 +1042,7 @@ mod tests {
         assert_all_constraints(program, &rows, &pis);
     }
 
-    /// The bit-exactness oracle: the native `B200::matmul_fp8` (itself cross-checked against
-    /// B200.md's Python simulator) consumes K in ascending 32-groups with the chained carry —
-    /// exactly the row chain — so the trace's cell results must match it bit for bit on any
-    /// geometry, zeros included.
+    /// Compare every final cell word with native `B200::matmul_fp8`, including zero cells.
     #[test]
     fn trace_results_are_bit_exact_vs_native_b200() {
         let hw = B200 {};
@@ -1075,12 +1086,8 @@ mod tests {
         }
     }
 
-    /// No arithmetic constraint is vacuous: bumping any load-bearing witness cell of an
-    /// honest trace must violate some constraint somewhere. Columns whose integrity is the
-    /// committed oracle's job (`PRODUCT_BIASED_EXPONENT`, the operand codes,
-    /// `TRUNCATION_POWER`/`LIFTING_POWER`, and remainder bounds) are exercised by the
-    /// LutChecker in the consistency driver
-    /// instead — a tamper there shifts a lookup key/value, not an in-AIR identity.
+    /// Corrupt arithmetic witness cells and require constraint failure.
+    /// Lookup-bound values are checked separately by LutChecker in the consistency tests.
     #[test]
     fn tampered_cells_break_constraints() {
         let (program, rows, pis) = test_trace();
@@ -1142,7 +1149,7 @@ mod tests {
             ),
             ("GROUP_OUTPUT_SIGNIFICAND (MB10 mux)", live, m.group_output_significand),
             ("CELL_RESULT_F32_LO (MB12 encode)", final_row, m.cell_result_f32_lo),
-            ("E_CELL (MB13 cell constancy)", live, m.e_cell),
+            ("E_CELL (MB13 cell constancy)", live, m.cell_magnitude_exponent),
             ("CELL_SKIPS (MB16 census)", live, m.cell_skips),
         ];
         for (what, row, col) in bumps {
@@ -1170,7 +1177,7 @@ mod tests {
     #[test]
     fn padded_trace_matches_known_values() {
         // 15 cells of k/32 = 4 rows -> 60 live rows padded to 64 by 4 phantom cells; the
-        // class (a) columns (`MatmulProgram::known_values`) must be bit-exact with the
+        // verifier-known columns (`MatmulProgram::known_values`) must be bit-exact with the
         // trace fill, padding rows included.
         let program = MatmulProgram { h: 3, w: 5, k: 128 };
         let a = test_codes(program.h * program.k, 0x9E3779B97F4A7C15, 8);
@@ -1203,7 +1210,4 @@ mod tests {
         test_stark_circuit_constraints::<F, C, S, D>(S::new(test_program())).unwrap();
     }
 
-    // No standalone prove/verify smoke test: this table is a CTL party (`requires_ctls`); the
-    // end-to-end proving path is covered by the B200 driver test
-    // (`fp8::driver::tests::b200_batch_proof_roundtrips`).
 }

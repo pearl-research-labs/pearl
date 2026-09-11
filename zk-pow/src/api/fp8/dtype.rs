@@ -1,19 +1,13 @@
+//! FP8 E4M3, BF16 and f32 conversions used by operand construction and replay.
+//!
+//! FP8 and BF16 values are stored as raw `u8` and `u16` codes. Conversions to
+//! either format round to nearest, ties to even. E4M3 overflow saturates to
+//! +/-448; BF16 overflow returns an error. Arithmetic and decoders reject
+//! non-finite values.
+
 use super::utils::Dtype;
 use anyhow::Result;
 
-// Narrow-float `Dtype` implementations. `F` is the raw storage encoding
-// (u8/u16/u32 bit patterns) and `T` the wide accumulator type.
-//
-// Matmul hardware (e.g. NVIDIA tensor cores) decodes FP8/BF16 operands into
-// an IEEE-754 binary32 datapath and rounds each result to nearest-even, with
-// subnormal support and without FTZ (the CUDA default). Every FP8/BF16 value
-// converts to f32 losslessly, so decoding to f32 and using native f32
-// arithmetic reproduces the hardware result bit-for-bit.
-//
-// NaN and ±inf are banned throughout this module: decoders assert the input
-// is not a NaN or infinity encoding, and every op asserts its result is
-// finite (which also catches overflow to infinity from finite operands,
-// e.g. bf16 max * max).
 pub struct Fp8E4M3;
 pub struct Bf16;
 pub struct Fp32;
@@ -24,76 +18,74 @@ fn assert_finite(x: f32) -> f32 {
     x
 }
 
-/// Decodes an FP8 E4M3 value (OCP "E4M3FN": bias 7, no infinities,
+/// Decodes an FP8 E4M3 value (bias 7, no infinities,
 /// `S.1111.111` is the only NaN encoding) to f32. Exact.
 /// Panics on the NaN encoding.
 pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     assert!(bits & 0x7F != 0x7F, "FP8 E4M3 NaN encoding {bits:#04x} is not allowed");
     let sign = ((bits & 0x80) as u32) << 24;
-    let exp = ((bits >> 3) & 0x0F) as u32;
-    let man = (bits & 0x07) as u32;
-    let magnitude = match (exp, man) {
+    let biased_exponent = ((bits >> 3) & 0x0F) as u32;
+    let fraction_bits = (bits & 0x07) as u32;
+    let magnitude = match (biased_exponent, fraction_bits) {
         (0, 0) => 0,
         (0, _) => {
-            // Subnormal (man * 2^-9): renormalize into a normal f32.
-            let shift = 3 - (31 - man.leading_zeros());
-            ((121 - shift) << 23) | (((man << shift) & 0x07) << 20)
+            // Subnormal (`fraction_bits * 2^-9`): normalize into a normal f32.
+            let normalization_shift = 3 - (31 - fraction_bits.leading_zeros());
+            ((121 - normalization_shift) << 23) | (((fraction_bits << normalization_shift) & 0x07) << 20)
         }
-        _ => ((exp + 120) << 23) | (man << 20),
+        _ => ((biased_exponent + 120) << 23) | (fraction_bits << 20),
     };
     f32::from_bits(sign | magnitude)
 }
 
-/// Encodes a finite f32 as an FP8 E4M3 value (OCP "E4M3FN"), rounding to
-/// nearest with ties to even and saturating to ±448 (the max finite magnitude)
-/// on overflow. On values E4M3 can represent this is the exact inverse of
-/// `fp8_e4m3_to_f32`. Errors on NaN or infinity.
+/// Round a finite f32 to E4M3, nearest with ties to even, saturating at ±448.
+/// Returns an error for NaN or infinity.
 pub fn f32_to_fp8_e4m3(x: f32) -> Result<u8> {
     if !x.is_finite() {
         return Err(anyhow::anyhow!("non-finite value {x} unsupported"));
     }
     let sign: u8 = if x.is_sign_negative() { 0x80 } else { 0x00 };
-    let m = x.abs();
-    let bits = m.to_bits();
-    let e = (bits >> 23) as i32 - 127; // unbiased exponent of |x|
+    let abs_value = x.abs();
+    let bits = abs_value.to_bits();
+    let unbiased_exponent = (bits >> 23) as i32 - 127; // unbiased exponent of |x|
 
-    let magnitude: u8 = if e < -6 {
+    let magnitude: u8 = if unbiased_exponent < -6 {
         // Subnormal region: every E4M3 value below 2^-6 is a multiple of 2^-9,
         // so the encoding is |x| / 2^-9 rounded to nearest even. |x| * 512 is
         // exact, and a value rounding up to 8 lands on the smallest normal
         // (exp field 1) — the encoding is contiguous across that boundary.
-        (m * 512.0).round_ties_even() as u8
+        (abs_value * 512.0).round_ties_even() as u8
     } else {
-        // Normal region: exp field is e + 7 (>= 1). Keep the top 3 mantissa
-        // bits and round the low 20 discarded bits to nearest, ties to even.
-        let mut exp = (e + 7) as u32;
-        let fm = bits & 0x7F_FFFF;
-        let mut mant = fm >> 20;
-        let rem = fm & 0xF_FFFF;
-        if rem > 0x8_0000 || (rem == 0x8_0000 && mant & 1 == 1) {
-            mant += 1;
-            if mant == 8 {
-                mant = 0;
-                exp += 1;
+        // Normal values: retain three fraction bits and round the discarded bits, ties to even.
+        let mut biased_exponent = (unbiased_exponent + 7) as u32;
+        let fraction_bits = bits & 0x7F_FFFF;
+        let mut retained_fraction = fraction_bits >> 20;
+        let discarded_fraction = fraction_bits & 0xF_FFFF;
+        if discarded_fraction > 0x8_0000 || (discarded_fraction == 0x8_0000 && retained_fraction & 1 == 1) {
+            retained_fraction += 1;
+            if retained_fraction == 8 {
+                retained_fraction = 0;
+                biased_exponent += 1;
             }
         }
-        if exp > 15 || (exp == 15 && mant >= 7) {
+        if biased_exponent > 15 || (biased_exponent == 15 && retained_fraction >= 7) {
             0x7E // saturate to max finite (448); avoids the S.1111.111 NaN slot
         } else {
-            ((exp << 3) | mant) as u8
+            ((biased_exponent << 3) | retained_fraction) as u8
         }
     };
     Ok(sign | magnitude)
 }
 
+/// Round f32 to nearest BF16, ties to even. Reject non-finite inputs and BF16 overflow.
 pub fn f32_to_bf16(x: f32) -> Result<u16> {
     if !x.is_finite() {
         return Err(anyhow::anyhow!("non-finite value {x} unsupported"));
     }
     let bits = x.to_bits();
     // Round to nearest, ties to even.
-    let round_bit = (bits >> 16) & 1;
-    let bf16 = ((bits + 0x7FFF + round_bit) >> 16) as u16;
+    let retained_lsb = (bits >> 16) & 1;
+    let bf16 = ((bits + 0x7FFF + retained_lsb) >> 16) as u16;
     // Values above bf16 max round to the infinity encoding.
     if bf16 & 0x7FFF >= 0x7F80 {
         return Err(anyhow::anyhow!("value {x} overflows bf16"));
@@ -108,7 +100,7 @@ pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-/// Errors unless `x` is a finite BF16.
+/// Errors unless `bits` encodes a finite BF16 value.
 pub fn check_not_nan_or_inf_bf16(bits: u16) -> Result<()> {
     if bits & 0x7F80 == 0x7F80 {
         return Err(anyhow::anyhow!("bf16 value {bits:#06x} is not finite (NaN or infinity)"));
@@ -124,21 +116,15 @@ pub fn check_not_nan_or_inf_f32(x: f32) -> Result<()> {
     Ok(())
 }
 
-/// The raw 8-bit biased exponent field of an f32 (`0` for zero/subnormal, `0xFF`
-/// for NaN/infinity). Sign- and mantissa-agnostic, so it doubles as a cheap
-/// `log2`-scale proxy for a value's magnitude — the difference of two exponents
-/// is the base-2 log of their ratio, which is all the accumulation guard needs.
+/// Raw f32 exponent field: 0 for zero/subnormals, 0xFF for NaN/infinity.
+/// Ignores the sign and fraction.
 pub fn f32_biased_exponent(x: f32) -> u32 {
     (x.to_bits() >> 23) & 0xFF
 }
 
-/// Converts an FP8 E4M3 value to bf16. Always exact: bf16's 7 mantissa bits
-/// and 8 exponent bits subsume E4M3's 3 and 4, and E4M3's smallest subnormal
-/// (2^-9) is a normal bf16, so no value rounds or overflows. Panics on the
-/// E4M3 NaN encoding (via `fp8_e4m3_to_f32`).
+/// Convert E4M3 to BF16 exactly, including subnormals.
+/// Panics on E4M3 NaN (via `fp8_e4m3_to_f32`).
 pub fn fp8_to_bf16(bits: u8) -> u16 {
-    // f32 is a lossless intermediary and the value stays well within bf16's
-    // finite range, so f32_to_bf16 never rounds and never returns Err here.
     f32_to_bf16(fp8_e4m3_to_f32(bits)).expect("every E4M3 value is representable in bf16")
 }
 
@@ -166,10 +152,7 @@ impl Dtype<u16, f32> for Bf16 {
     }
 }
 
-// FP32 mul/add round to nearest-even like GPU FMUL/FADD. Note that fp32
-// matmul hardware fuses multiply-add (FFMA, no intermediate rounding), so a
-// dot product built from these separate ops matches FMUL+FADD codegen, not
-// FFMA.
+// Separate FP32 multiply and add round independently; they do not implement FMA.
 impl Dtype<u32, f32> for Fp32 {
     fn mul(&self, a: u32, b: u32) -> f32 {
         assert_finite(f32::from_bits(a) * f32::from_bits(b))
@@ -210,7 +193,7 @@ mod tests {
             let want = ref_decode(bits & 0x80 != 0, exp, man, 3, 7);
             assert_eq!(got.to_bits(), want.to_bits(), "{bits:#04x}");
         }
-        // Spec values: max normal 448, min subnormal 2^-9.
+        // Largest normal value: 448; smallest subnormal: 2^-9.
         assert_eq!(fp8_e4m3_to_f32(0x7E), 448.0);
         assert_eq!(fp8_e4m3_to_f32(0x01), 2f32.powi(-9));
     }
@@ -289,7 +272,7 @@ mod tests {
         assert_eq!(f32_biased_exponent(0.5), 126); // 2^-1
         assert_eq!(f32_biased_exponent(-4.0), 129); // sign-agnostic, 2^2
         assert_eq!(f32_biased_exponent(0.0), 0);
-        // The difference of exponents is the log2 of the magnitude ratio.
+        // For powers of two, exponent differences equal log2 of the magnitude ratio.
         assert_eq!(f32_biased_exponent(256.0) - f32_biased_exponent(1.0), 8);
     }
 
@@ -306,13 +289,9 @@ mod tests {
             if bits & 0x7F == 0x7F {
                 continue;
             }
-            // Round-tripping through bf16 must recover the exact E4M3 value,
-            // which proves the conversion loses no information.
             let bf16 = fp8_to_bf16(bits);
             assert_eq!(bf16_to_f32(bf16), fp8_e4m3_to_f32(bits), "{bits:#04x}");
         }
-        // Spot checks: zero, one, max normal 448, min subnormal 2^-9, and a
-        // negative value all map to the expected bf16 encodings.
         assert_eq!(fp8_to_bf16(0x00), 0x0000);
         assert_eq!(fp8_to_bf16(0x38), 0x3F80); // 1.0
         assert_eq!(fp8_to_bf16(0x7E), 0x43E0); // 448.0

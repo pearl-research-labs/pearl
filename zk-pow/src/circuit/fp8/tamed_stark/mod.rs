@@ -1,7 +1,6 @@
-//! TamedStark — jackpot check 3 (tamed products): one row per tile cell, importing the
-//! cell's replay-magnitude dominator (Matmul) and noise stds (Scale), proving a tamed
-//! certificate on every cell not counted untamed, and gating the untamed count against the
-//! `TAME_LIMIT` public input. See [`stark`] for the full mathematical description.
+//! Per-cell magnitude/noise comparisons and tile-wide untamed/skip budgets.
+//! Matmul supplies magnitude bounds and skip counts; Scale supplies noise scales.
+//! See [`stark`] for the certificates and their one-sided guarantees.
 
 pub mod columns;
 pub mod ctl;

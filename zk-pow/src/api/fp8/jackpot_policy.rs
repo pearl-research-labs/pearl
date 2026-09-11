@@ -1,47 +1,42 @@
-//! The tile-level jackpot policy.
+//! Jackpot admissibility checks over the opened tile, using B200 replay.
 //!
-//! The verifier replays the winning tile bit-exactly on the committed device's
-//! FP8 MMA semantics — that replay is the ground truth. On top of it, this
-//! policy certifies that producing the tile cost `~tile_elems * k` fresh
-//! multiply-adds. Design rules: (i) prefer checks that depend only on clean
-//! data + public constants ("x-only"), so a committed matrix passes or fails
-//! identically for every noise draw and grinding gains nothing; (ii) count
-//! density-type violations over the WHOLE lottery tile, so honest counts
-//! concentrate around their mean and never fail on tail fluctuations.
+//! The tile has h rows, w columns and reduction dimension k. For either operand X,
+//! `X_bar_iu = alpha_i * X_iu` is the scaled clean entry, and
+//! `sigma_i^X = DELTA * alpha_i * l2_i` uses the grid-rounded, floored RMS in
+//! [`BuiltRows`]. These products are exact; they are not BF16-rounded again.
+//! A' and B' below are the rebuilt, noised FP8 operands.
 //!
-//! Notation. Per-row noise scales, in quantized units:
-//! `sigma_i = delta * l2(A_bar_i) = DELTA * alpha_i * l2_i`. Scaled clean
-//! entries: `A_bar_iu = alpha_i * X_iu`, `B_bar_ju = alpha_j' * X_ju`.
+//! A tile passes only if all four checks pass. Counts cover the whole tile or
+//! operand strip, rather than requiring each row to meet the same fraction.
 //!
-//! The policy approves a single opened tile iff every check below passes. It
-//! runs after the verifier has rejected Infinity/NaN inputs on intermediate
-//! results.
-//!
-//! 1. **Entry liveness.** `|D_X| <= eps_idle * |I_X| * k` per side, where
-//!    `D_X = {(i,u): |X_bar_iu| >= tau_idle * sigma_i^X}` (dead entries).
+//! 1. **Entry liveness.** For each side X with n_X rows (`n_A = h`, `n_B = w`):
+//!    `D_X = {(i,u): |X_bar_iu| >= tau_idle * sigma_i^X}` and
+//!    `|D_X| <= eps_idle * n_X * k`.
 //! 2. **Noise floor.** `sigma_i^X >= sigma_min` for every row of both sides.
-//! 3. **Tamed products.** `|U| <= eps_tame * |I_A| * |I_B|`, where
-//!    `U = {(i,j): 2^(e_ij) > tau_tame * sqrt(k) * sigma_i^A * sigma_j^B}`,
-//!    `e_ij = floor(log2 M_ij)` is the binade of the replay magnitude and
-//!    `M_ij = max{max_u |A_tilde_iu * B_tilde_ju|, max_t |c_ij,t|}`.
-//! 4. **Unpredictable summands.** `|S| <= eps_pred * k * |I_A| * |I_B|`, where
-//!    `S` collects the summands `(i,j,u)` with `v_iju < ulp(M_ij)^2`, for
-//!    `v_iju = (A_bar_iu^2 + (sigma_i^A)^2)(B_bar_ju^2 + (sigma_j^B)^2) / 2^21`
-//!    and `ulp(x)^2 = 2^(2*(floor(log2 x) - W))`, `W = 25`. Decided exactly in
-//!    integers by taking log2 of the defining inequality, at fixed-point
-//!    resolution `1/64`: each summand half is scored once
-//!    (`unpredictability::lambda`) with a one-sided lower bound
-//!    `lambda_X ~= 64 * log2(X_bar_iu^2 + (sigma_i^X)^2)` -- never above
-//!    the true value, less than `1.1` steps below it -- and `(i,j,u)`
-//!    is skippable iff
-//!    `lambda_A + lambda_B < 64 * log2(2^21 * ulp(M_ij)^2)`.
+//! 3. **Tamed products.** With c_ij,t the B200 accumulator after group t, define
+//!    `M_ij = max(max_u |A'_iu * B'_ju|, max_t |c_ij,t|)` and
+//!    `e_ij = floor(log2 M_ij)` for nonzero cells. Then
+//!    `U = {(i,j): 2^e_ij > tau_tame * sqrt(k) * sigma_i^A * sigma_j^B}` must
+//!    satisfy `|U| <= eps_tame * h * w`. Zero cells are tamed.
+//! 4. **Unpredictable summands.** Let `S_X = X_bar_iu^2 + (sigma_i^X)^2`.
+//!    [`lambda`] gives an integer lower bound on `64*(log2(S_X) + 508)`.
+//!    For nonzero cells the implemented rule is
 //!
-//! The verdict is a BINARY gate (rejected / accepted): a `D`-dependent credit
-//! would incentivize shaping data toward incoherence.
+//!    ```text
+//!    E_ij = e_ij + 139
+//!    skip(i,j,u) iff lambda_A(i,u) + lambda_B(j,u) < 128*E_ij + 45376
+//!    sum_{i,j,u} skip(i,j,u) <= eps_pred * k * h * w
+//!    ```
 //!
-//! There is no policy-internal `k` cap: [`PublicParams`](crate::api::fp8::public_params::PublicParams)
-//! construction bounds `k <= 2^16` upstream; check 4's window `W = 25` is
-//! slack at any practical `k`.
+//!    Zero cells never skip. The rule approximates the real-valued test
+//!    `v_iju = S_A*S_B / 2^21 < ulp(M_ij)^2`, where
+//!    `ulp(M_ij)^2 = 2^(2*(e_ij - 25))`. Downward score rounding can add skips;
+//!    every ideal skip is counted, and a counted skip satisfies
+//!    `v_iju < ulp(M_ij)^2 * 2^(2.2/64)`. The integer rule defines acceptance;
+//!    [`unpredictability`](crate::circuit::fp8::unpredictability) derives its constants and error bound.
+//!
+//! Call after rejecting non-finite inputs. [`PublicParams`](crate::api::fp8::public_params::PublicParams)
+//! bounds `k <= 2^16`.
 
 use crate::api::fp8::dtype::{bf16_to_f32, fp8_e4m3_to_f32};
 use crate::api::fp8::quantization::{BuiltRows, DELTA};
@@ -51,8 +46,7 @@ use crate::circuit::fp8::unpredictability::{cell_exponent, lambda, skip};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-/// Consensus-tunable thresholds, with default values `tau_idle=8, eps_idle=1/64,
-/// sigma_min=1, tau_tame=256, eps_tame=1/64, eps_pred=1/16`.
+/// Jackpot thresholds; defaults are defined in [`Self::default`].
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct JackpotPolicy {
     /// Liveness threshold (check 1): entry `u` of row `i` is dead iff
@@ -94,9 +88,8 @@ pub struct OperandStrip {
     pub built: BuiltRows,
 }
 
-/// The lottery message: `xor_fold_extract(A' @ B'.T, lane_assignment(rows_pattern,
-/// cols_pattern))` — 64 bytes, one BLAKE3 block, the preimage hashed under
-/// `pow_key` to form `hash_jackpot`.
+/// 64-byte lottery message from `xor_fold_extract(A' @ B'.T, lanes)`,
+/// hashed under the jackpot key to produce `hash_jackpot`.
 pub type JackpotMessage = [u8; 4 * JACKPOT_ENTRIES];
 
 /// Per-row noise stds `sigma_i = DELTA * alpha_i * l2_i` (in quantized units),
@@ -110,9 +103,8 @@ fn sigmas(built: &BuiltRows) -> Vec<f64> {
         .collect()
 }
 
-/// A row's noise std factored exactly: `sigma = (-1)^negative * sig * 2^exp`,
-/// with `sig = 0` iff `sigma = 0` (`negative` is then false). `sig < 2^16`
-/// (product of two bf16 significands).
+/// Exact noise-scale representation: `sigma = (-1)^negative * sig * 2^exp`.
+/// `sig < 2^16`; zero has `sig = 0` and `negative = false`.
 #[derive(Copy, Clone)]
 struct SigmaPow {
     sig: u64,
@@ -120,9 +112,8 @@ struct SigmaPow {
     negative: bool,
 }
 
-/// Exact bf16 decode: `value = (-1)^negative * sig * 2^exp` with `sig = 0`
-/// iff the value is zero, as `(negative, sig, exp)`. `sig <= 255` (8-bit
-/// significand). Requires a finite encoding.
+/// Decode finite BF16 as `(negative, sig, exp)` with
+/// `value = (-1)^negative * sig * 2^exp` and `sig <= 255`.
 fn bf16_sig_exp(bits: u16) -> (bool, u64, i64) {
     debug_assert!(bits & 0x7FFF < 0x7F80, "finite bf16 expected");
     let exp_field = ((bits >> 7) & 0xFF) as i64;
@@ -148,9 +139,10 @@ fn f32_sig_exp(x: f32) -> (u64, i64) {
     }
 }
 
-/// Exact counterpart of [`sigmas`]: `sigma_i = DELTA * alpha_i * l2_i` with
-/// the bf16 significands multiplied as integers and `DELTA = 0.5` folded
-/// into the exponent.
+/// Exact counterpart of [`sigmas`]: multiply the BF16 significands and
+/// fold `DELTA = 0.5` into the exponent.
+/// Returns per-row sigmas as integer significands and binary exponents,
+/// for the exact integer comparison in `untamed_exact`.
 fn sigma_pows(built: &BuiltRows) -> Vec<SigmaPow> {
     built
         .alpha
@@ -169,57 +161,48 @@ fn sigma_pows(built: &BuiltRows) -> Vec<SigmaPow> {
         .collect()
 }
 
-/// Check 3's untamed predicate, decided exactly over
-/// the reals: `ufp(m) > tau_tame * sqrt(k) * sigma_i * sigma_j`, where
-/// `ufp(m) = 2^(e_m)`, `e_m = floor(log2 m)`, is the largest power of two not
-/// exceeding the replay magnitude, via comparing squares
+/// Check `2^floor(log2 m) > tau_tame * sqrt(k) * sigma_i * sigma_j`
+/// for finite nonnegative `m`, using integer arithmetic.
+///
+/// After handling zero and negative bounds, squaring and collecting powers of two gives
 ///
 /// ```text
-/// 2^(2*e_m)  >  tau_sq_k * (si.sig * sj.sig)^2 * 2^(2*(si.exp + sj.exp))
+/// e_m = floor(log2 m)
+/// g   = 2*e_m - 2*(si.exp + sj.exp)
+/// rhs = tau_sq_k * (si.sig * sj.sig)^2
+/// untamed iff 2^g > rhs iff g >= bitlen(rhs)    (rhs > 0)
 /// ```
 ///
-/// with `tau_sq_k = tau_tame^2 * k`. The left side is a pure power of two, so
-/// after moving every power of two left the comparison collapses to one
-/// bit-length test: `2^g > rhs <=> g >= bitlen(rhs)` for `rhs > 0`, with
-/// `rhs = tau_sq_k * pp^2 < 2^36 * 2^64 = 2^100` (fits u128). `m` must be
-/// finite and nonnegative (it is a max of magnitudes).
+/// Since `tau_sq_k <= 2^20 * 2^16` and each sigma significand is below `2^16`,
+/// `rhs < 2^36 * (2^32)^2 = 2^100`, so the comparison fits u128.
 ///
-/// Consuming `ufp(m)` instead of `m` keeps the verdict within a factor-2 band
-/// of the magnitude form: untamed implies `m >= ufp(m) > bound`, and
-/// `m > 2 * bound` implies untamed (`m < 2 * ufp(m)`).
+/// For a positive bound B, `2^e_m <= m < 2^(e_m+1)` gives
+/// `m > 2*B => untamed => m > B`. Equality `2^e_m = B` is tamed.
 fn untamed_exact(m: f32, tau_sq_k: u64, si: SigmaPow, sj: SigmaPow) -> bool {
     debug_assert!(m.is_finite() && m >= 0.0);
-    let (mm, em) = f32_sig_exp(m);
-    let pp = si.sig * sj.sig; // < 2^32
-    if tau_sq_k == 0 || pp == 0 {
-        return mm != 0; // bound = 0: untamed iff m > 0
+    let (m_significand, m_exponent) = f32_sig_exp(m);
+    let sigma_product = si.sig * sj.sig; // < 2^32
+    if tau_sq_k == 0 || sigma_product == 0 {
+        return m_significand != 0; // bound = 0: untamed iff m > 0
     }
     if si.negative != sj.negative {
         return true; // bound < 0 <= m
     }
-    if mm == 0 {
+    if m_significand == 0 {
         return false; // m = 0, bound > 0
     }
-    // Binade of m: e_m = floor(log2 m) = em + bitlen(mm) - 1 (subnormal-safe:
-    // f32_sig_exp keeps subnormal significands unnormalized, the bit length
-    // absorbs the difference).
-    let e_m = em + (64 - i64::from(mm.leading_zeros())) - 1;
-    let rhs = (tau_sq_k as u128) * (pp as u128) * (pp as u128);
+    // Bit length accounts for the unnormalized significand of subnormals.
+    let m_binade = m_exponent + (64 - i64::from(m_significand.leading_zeros())) - 1;
+    let rhs = (tau_sq_k as u128) * (sigma_product as u128) * (sigma_product as u128);
     // 2^g > rhs <=> g >= bitlen(rhs) (rhs > 0 here).
-    let g = 2 * e_m - 2 * (si.exp + sj.exp);
-    g >= i64::from(128 - rhs.leading_zeros())
+    let threshold_exponent = 2 * m_binade - 2 * (si.exp + sj.exp);
+    threshold_exponent >= i64::from(128 - rhs.leading_zeros())
 }
 
 impl JackpotPolicy {
-    /// Computes the tile's policy verdict: `Ok(None)` on rejection, or
-    /// `Ok(Some(message))` with the lottery message — the replayed first-stage
-    /// product folded over the committed 16-subtile lane layout, exactly one
-    /// BLAKE3 block. Only the folded message leaves the policy (to be hashed
-    /// under `pow_key`); the bit-exact `A' @ B'.T` never does.
-    ///
-    /// `a` / `b` are the tile's two sides; `rows_pattern` / `cols_pattern`
-    /// commit the tile's grid layout. The committed device's bit-exact FP8
-    /// datapath ([`B200`]) supplies the partial sums for check 4.
+    /// Return `Ok(None)` if a policy check rejects the tile; otherwise return
+    /// its 64-byte lottery message. `a`/`b` hold clean and rebuilt operands;
+    /// the patterns determine the fold lanes. [`B200`] supplies replay partials.
     pub fn evaluate(
         &self,
         a: &OperandStrip,
@@ -228,20 +211,18 @@ impl JackpotPolicy {
         rows_pattern: &AxisPattern,
         cols_pattern: &AxisPattern,
     ) -> Result<Option<JackpotMessage>> {
-        let Some(acc) = self.run_checks(a, b, k)? else {
+        let Some(replayed_tile) = self.run_checks(a, b, k)? else {
             return Ok(None);
         };
         let lanes = lane_assignment(rows_pattern, cols_pattern);
-        Ok(Some(xor_fold_extract(&acc, &lanes)))
+        Ok(Some(xor_fold_extract(&replayed_tile, &lanes)))
     }
 
-    /// Checks 1-4, returning the bit-exact replayed first-stage accumulator
+    /// Jackpot policy hecks 1-4, returning the bit-exact replayed first-stage accumulator
     /// `A' @ B'.T` (row-major, one value per tile cell) on success, `None` on
     /// rejection.
     fn run_checks(&self, a: &OperandStrip, b: &OperandStrip, k: usize) -> Result<Option<Vec<f32>>> {
-        // `k` and the operand dimensions are the verifier's own construction
-        // (open_and_noisy_quantize), so these are
-        // debug invariants, not runtime validation of untrusted input.
+        // The caller supplies clean and rebuilt operands with matching dimensions.
         debug_assert!(k > 0, "k must be positive");
         for (name, side) in [("A", a), ("B", b)] {
             debug_assert!(
@@ -269,8 +250,7 @@ impl JackpotPolicy {
             return Ok(None);
         }
 
-        // Checks 3 & 4 share the replay (products + partial sums); on success
-        // the replay's final per-cell accumulator is returned for the lottery fold.
+        // Checks 3 and 4: tamed products and unpredictable summands, sharing one pass over the tile.
         self.tamed_and_unpredictable_ok(a, b, k, sigma_a.len(), sigma_b.len())
     }
 
@@ -283,25 +263,21 @@ impl JackpotPolicy {
         let clean = &side.clean;
         let l2 = &side.built.l2;
         let k = clean.len() / l2.len();
-        let dead: usize = clean
+        let dead_entries: usize = clean
             .chunks(k)
             .zip(l2)
             .map(|(row, &l2)| {
-                let dead_bound = self.tau_idle * DELTA * bf16_to_f32(l2) as f64;
-                row.iter().filter(|&&x| bf16_to_f32(x).abs() as f64 >= dead_bound).count()
+                let dead_threshold = self.tau_idle * DELTA * bf16_to_f32(l2) as f64;
+                row.iter().filter(|&&x| bf16_to_f32(x).abs() as f64 >= dead_threshold).count()
             })
             .sum();
-        dead as f64 <= self.eps_idle * clean.len() as f64
+        dead_entries as f64 <= self.eps_idle * clean.len() as f64
     }
 
-    /// `tau_tame^2 * k`, the exact integer threshold constant consumed by
-    /// [`untamed_exact`]. (The AIR carries only `k` as its public input: the
-    /// default `tau_tame^2 = 2^16` is folded into the ZK XFPOW2 key's shift.)
-    /// Errors on policies whose `tau_tame^2` is not an integer in `[0, 2^20]`
-    /// or `k > 2^16` (the
-    /// [`PublicParams`](crate::api::fp8::public_params::PublicParams) bound):
-    /// the exact predicate's width guarantees hold only on that domain, and
-    /// such a configuration is a consensus misconfiguration, not a tile fault.
+    /// Integer threshold for [`untamed_exact`]. Require `tau_tame^2` in
+    /// `[0, 2^20]` and `k <= 2^16` ([`PublicParams`](crate::api::fp8::public_params::PublicParams))
+    /// so its u128 arithmetic fits. The AIR folds default `tau_tame^2 = 2^16`
+    /// into the XFPOW2 key's shift.
     fn tau_sq_k(&self, k: usize) -> Result<u64> {
         let tau_sq = self.tau_tame * self.tau_tame;
         ensure!(
@@ -324,66 +300,60 @@ impl JackpotPolicy {
         h: usize,
         w: usize,
     ) -> Result<Option<Vec<f32>>> {
-        // The k/32 partial sums each cell's bit-exact replay encounters.
         let partials = B200 {}.matmul_fp8_partials(&a.built.noised_part, &b.built.noised_part, h, w, k)?;
 
-        // Exact decodes of the noised FP8 codes (fp8 -> fp32 is exact).
-        let a_prime: Vec<f32> = a.built.noised_part.iter().map(|&c| fp8_e4m3_to_f32(c)).collect();
-        let b_prime: Vec<f32> = b.built.noised_part.iter().map(|&c| fp8_e4m3_to_f32(c)).collect();
+        let noised_a: Vec<f32> = a.built.noised_part.iter().map(|&c| fp8_e4m3_to_f32(c)).collect();
+        let noised_b: Vec<f32> = b.built.noised_part.iter().map(|&c| fp8_e4m3_to_f32(c)).collect();
 
-        // Check 4's per-element integer summand scores — the same lambda values the ZK
-        // InputQuant table commits and the Matmul lanes consume.
-        let lambda_of = |side: &OperandStrip| -> Vec<u64> {
+        // Scores match the `lambda` values used by the InputQuant and Matmul tables.
+        let summand_scores = |side: &OperandStrip| -> Vec<u64> {
             side.clean
                 .iter()
                 .enumerate()
                 .map(|(idx, &x)| lambda(side.built.alpha[idx / k], x, side.built.l2[idx / k]))
                 .collect()
         };
-        let a_lambda = lambda_of(a);
-        let b_lambda = lambda_of(b);
+        let scores_a = summand_scores(a);
+        let scores_b = summand_scores(b);
 
         let tau_sq_k = self.tau_sq_k(k)?;
         let sigma_pow_a = sigma_pows(&a.built);
         let sigma_pow_b = sigma_pows(&b.built);
-        let mut untamed: u64 = 0;
+        let mut untamed_cells: u64 = 0;
 
-        let mut skippable: u64 = 0;
+        let mut skippable_summands: u64 = 0;
 
         for i in 0..h {
             for j in 0..w {
-                // Replay magnitude M_ij = max{max_u |A'_iu * B'_ju|, max_t |c_ij,t|}
-                // — raw magnitudes, no snapping. Check 3 consumes only its
-                // binade floor(log2 M_ij), the exact quantity the ZK Matmul
-                // AIR commits per cell, so the two verdicts cannot diverge.
-                let mut m_ij = 0.0f32;
+                // Maximum absolute product or partial sum for this output cell.
+                let mut max_magnitude = 0.0f32;
                 for u in 0..k {
-                    m_ij = m_ij.max((a_prime[i * k + u] * b_prime[j * k + u]).abs());
+                    max_magnitude = max_magnitude.max((noised_a[i * k + u] * noised_b[j * k + u]).abs());
                 }
                 for &c in &partials[i * w + j] {
-                    m_ij = m_ij.max(c.abs());
+                    max_magnitude = max_magnitude.max(c.abs());
                 }
 
                 // Check 3: tamed products, decided exactly in integers.
-                if untamed_exact(m_ij, tau_sq_k, sigma_pow_a[i], sigma_pow_b[j]) {
-                    untamed += 1;
+                if untamed_exact(max_magnitude, tau_sq_k, sigma_pow_a[i], sigma_pow_b[j]) {
+                    untamed_cells += 1;
                 }
 
                 // Check 4: skippable summands.
-                let e_cell = cell_exponent(f64::from(m_ij));
+                let magnitude_exponent = cell_exponent(f64::from(max_magnitude));
                 for u in 0..k {
-                    if skip(a_lambda[i * k + u], b_lambda[j * k + u], e_cell) {
-                        skippable += 1;
+                    if skip(scores_a[i * k + u], scores_b[j * k + u], magnitude_exponent) {
+                        skippable_summands += 1;
                     }
                 }
             }
         }
 
         let tile_cells = (h * w) as f64;
-        if untamed as f64 > self.eps_tame * tile_cells {
+        if untamed_cells as f64 > self.eps_tame * tile_cells {
             return Ok(None);
         }
-        if skippable as f64 > self.eps_pred * k as f64 * tile_cells {
+        if skippable_summands as f64 > self.eps_pred * k as f64 * tile_cells {
             return Ok(None);
         }
 
@@ -458,11 +428,9 @@ mod tests {
     #[test]
     fn liveness_rejects_spike_dominated_rows() {
         let (k, r) = (16usize, 16usize);
-        // Both rows of A: one spike at 1.0, the rest exactly 0. Per row
-        // l2 = sqrt(1/16) = 0.25, so each spike is dead
-        // (1.0 >= tau_idle*DELTA*0.25 = 1.0) -- 2/32 of the A side, above
-        // eps_idle = 1/64. (A row can hold at most one dead entry: dead means
-        // x^2 >= k*l2^2 = sum x^2, so a second spike per row cannot work.)
+        // One unit spike per row gives RMS sqrt(1/16) = 0.25. The spike is dead
+        // at equality: 1 = tau_idle*DELTA*0.25 = 8*0.5*0.25.
+        // Two dead entries out of 32 exceed eps_idle = 1/64.
         let mut a_rows = vec![0u16; 2 * k];
         a_rows[0] = 0x3F80;
         a_rows[k] = 0x3F80;
@@ -480,13 +448,8 @@ mod tests {
 
     #[test]
     fn unpredictability_rejects_when_summands_are_predictable() {
-        // Check 4 rejects when v_iju < ulp(M_ij)^2 for too many summands. One
-        // spike per row concentrates the replay magnitude: M_ij ~ 421^2
-        // (e_cell = 17), so ulp(M_ij)^2 = 2^(2*(17 - 25)) = 2^-16. Shrinking
-        // the recorded l2 to 2^-32 collapses sigma = 0.5*alpha*2^-32 ~ 2^-24,
-        // and each of the k - 1 zero entries then scores only
-        // v_iju = (si*sj)^2 / 2^21 ~ 2^-118, far below 2^-16 -- nearly every
-        // summand is skippable, far above eps_pred.
+        // A spike creates a large replay magnitude. Lowering the recorded RMS
+        // makes the zero entries' scores small enough to be skippable.
         let (k, r) = (1024usize, 16usize);
         let mut rows = vec![0u16; 2 * k];
         rows[0] = 0x3F80; // 1.0
@@ -510,11 +473,7 @@ mod tests {
 
     #[test]
     fn tamed_products_rejects_coherent_tiles() {
-        // Two rows whose products M_ij are large relative to sigma_i*sigma_j
-        // drive the untamed count above eps_tame. Build honest rows then shrink
-        // the recorded l2 to the quantizer floor 2^-32: sigma = 0.5*alpha*2^-32
-        // is tiny, so the tamed bound tau_tame*sqrt(k)*si*sj falls far below
-        // the honest-scale products M_ij.
+        // Lower the recorded RMS so the replay products exceed the tamed bound.
         let (k, r) = (32usize, 16usize);
         let (a, mut a_built) = build(&honest_rows(2, k), k, r, 0);
         let (b, mut b_built) = build(&honest_rows(2, k), k, r, 1);
@@ -544,11 +503,8 @@ mod tests {
 
     #[test]
     fn untamed_exact_flags_whole_binades() {
-        // alpha = 2.0, l2 = 1.0 => sigma = DELTA * 2 * 1 = 1 exactly. With
-        // k = 1024, tau = 100 (a non-power-of-two threshold): bound =
-        // 100 * 32 * 1 * 1 = 3200. The predicate flags exactly the binades
-        // that start above the bound: untamed iff 2^e > 3200 iff e >= 12 iff
-        // m >= 2^12 = 4096.
+        // sigma = 1, k = 1024 and tau = 100 give bound 3200.
+        // The first untamed binade starts at 4096.
         let s = sigma_pow(0x4000, 0x3F80);
         let policy = JackpotPolicy {
             tau_tame: 100.0,
@@ -557,20 +513,15 @@ mod tests {
         let tau_sq_k = policy.tau_sq_k(1024).unwrap();
         assert!(!untamed_exact(f32::from_bits(4096f32.to_bits() - 1), tau_sq_k, s, s));
         assert!(untamed_exact(4096.0, tau_sq_k, s, s), "the binade boundary is untamed");
-        // m == bound is tamed (ufp(3200) = 2048 <= 3200) under the strict
-        // `>`; and any m > 2 * bound is flagged (m < 2 * ufp(m)): the
-        // factor-2 band.
+        // Test equality and the factor-two bound.
         assert!(!untamed_exact(3200.0, tau_sq_k, s, s));
         assert!(untamed_exact(6400.0, tau_sq_k, s, s));
     }
 
     #[test]
     fn untamed_exact_is_strict_at_power_of_two_ties() {
-        // The default tau = 256, k = 1024, sigma = 1: bound = 256 * 32 =
-        // 8192 = 2^13 is an exact power of two, so a whole binade starts
-        // exactly at the bound. The predicate stays strict there: [2^13, 2^14)
-        // has 2^13 > 8192 false (tamed — m == bound stays tamed under the
-        // strict `>`), while [2^14, 2^15) is untamed.
+        // sigma = 1, k = 1024 and tau = 256 give bound 8192 = 2^13.
+        // The strict comparison accepts [2^13, 2^14) and rejects [2^14, 2^15).
         let s = sigma_pow(0x4000, 0x3F80);
         let tau_sq_k = JackpotPolicy::default().tau_sq_k(1024).unwrap();
         assert!(
@@ -661,16 +612,11 @@ mod tests {
         assert!(checked > 10_000, "differential test degenerated: {checked} cases");
     }
 
-    /// The ufp predicate is a one-sided coarsening of the magnitude form
-    /// `m > bound`: every flagged cell is magnitude-untamed (`m >= ufp(m)`),
-    /// and every cell magnitude-untamed at threshold 2*tau is flagged
-    /// (`m < 2*ufp(m)`) — i.e. the flags sit between the tau and 2*tau
-    /// magnitude flags. Both references are decided exactly in integers, so
-    /// there are no ties to skip.
+    /// Binade-based flags lie between magnitude-based flags at thresholds
+    /// `tau` and `2*tau`. Both comparisons use exact integer arithmetic.
     #[test]
     fn ufp_flags_are_subset_of_magnitude_flags_within_factor_two_band() {
-        /// The magnitude predicate `m > tau * sqrt(k) * si * sj`, decided
-        /// exactly by comparing squares (the pre-binade `untamed_exact`).
+        /// Exact magnitude comparison `m > tau * sqrt(k) * si * sj`, using squares.
         fn magnitude_untamed(m: f32, tau_sq_k: u64, si: SigmaPow, sj: SigmaPow) -> bool {
             let (mm, em) = f32_sig_exp(m);
             let pp = si.sig * sj.sig;
@@ -700,7 +646,7 @@ mod tests {
 
         let policy = JackpotPolicy::default();
         let k = 1024usize;
-        let tau_sq_k = policy.tau_sq_k(k).unwrap(); // 2^14 * 1024 = 2^24
+        let tau_sq_k = policy.tau_sq_k(k).unwrap(); // 2^16 * 1024 = 2^26
         let double_tau_sq_k = tau_sq_k * 4; // (2*tau)^2 * k
         let mut state = 0x9E3779B97F4A7C15u64;
         let mut next = move || {

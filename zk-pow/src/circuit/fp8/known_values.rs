@@ -1,28 +1,19 @@
-//! Class (a) ("known") column assembly for the fp8 batch system.
+//! Verifier-known columns for the FP8 batch.
 //!
-//! Every fp8 STARK leads with a block of class (a) columns — values the verifier can
-//! recompute from the compiled programs and public data alone (schedules, indices, noise
-//! decode fields; see each `columns.rs`). Under the batch multi-STARK commitment these are
-//! **committed with the trace** like any online column (they are per-job data, so they cannot
-//! live in the setup-time preprocessed oracle the way the LUTs of `super::luts` do), and the
-//! verifier *re-derives* them: `starky::batch_prover::batch_prove` absorbs the
-//! [`BatchKnownColumns`] digest into the Fiat-Shamir transcript, and
-//! `starky::batch_verifier::batch_verify` recomputes each known column's openings at `zeta`
-//! and `g*zeta` from the values assembled here and checks them against the proof's claimed
-//! trace openings. A prover therefore cannot lie about any class (a) column without breaking
-//! the FRI binding of the trace commitment itself.
+//! Each main trace begins with columns derived from public geometry, schedules
+//! and noise seeds. They are committed with the trace; verification recomputes
+//! their openings at `zeta` and `g*zeta`. Here `zeta` is the Fiat–Shamir evaluation
+//! challenge and `g` is that table's trace-domain generator; multiplication by
+//! `g` selects the next-row opening.
 //!
-//! The digest slot is not a hash of those column values. It is the job's `statement_digest`
-//! (`PublicParams::digest`), bound at prove/verify — not at assembly. The columns are
-//! uniquely determined by that statement, so a collision-resistant hash of the statement is
-//! a valid Fiat-Shamir salt.
+//! This equality binds schedule flags and public noise to the statement even
+//! when the AIR has no separate equations for those columns. Static lookup-table
+//! columns are bound by the setup commitment.
 //!
-//! The per-table generators are `Blake3Program::known_values`,
-//! `InputQuantProgram::known_values`, `ScaleProgram::known_values`,
-//! `MatmulProgram::known_values`, `XorFoldProgram::known_values` and
-//! `TamedProgram::known_values` — each bit-exact with its `generate_trace` fill (asserted by
-//! `super::consistency`). [`fp8_known_columns`] packs their outputs into the
-//! [`BatchKnownColumns`] handed to both the batch prover and verifier.
+//! [`fp8_known_columns`] assembles each program's `known_values` in canonical
+//! table order. Its [`BatchKnownColumns`] digest is initially unset: proving
+//! and verification bind the statement digest before Fiat-Shamir. That digest
+//! hashes the public statement, not these column buffers.
 
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::hash::hash_types::{HashOut, RichField};
@@ -38,10 +29,9 @@ use super::tamed_stark::columns::NUM_TAMED_KNOWN_COLUMNS;
 use super::xor_fold_stark::columns::NUM_XOR_FOLD_KNOWN_COLUMNS;
 use crate::api::primitives::Hash256;
 
-/// Known-column count of every main table, in `super::ctl::Table` order. Each table's known
-/// block is its *leading* columns (indices `0..count`), by the `columns.rs` layouts. The LUT
-/// tables of the batch carry no known columns — their static halves are *preprocessed* (bound
-/// by the setup cap, `super::luts`), and their multiplicity columns are ordinary online data.
+/// Leading known-column count in `super::ctl::Table` order.
+/// LUTs have no known columns: their static values are preprocessed and their
+/// multiplicities belong to the proof.
 pub const KNOWN_COLUMNS_PER_TABLE: [usize; NUM_TABLES] = [
     NUM_BLAKE3_KNOWN_COLUMNS,
     NUM_INPUT_QUANT_KNOWN_COLUMNS,
@@ -53,25 +43,19 @@ pub const KNOWN_COLUMNS_PER_TABLE: [usize; NUM_TABLES] = [
 
 /// Reduce a 32-byte hash into four Goldilocks elements (little-endian integer mod `p^4`).
 pub(crate) fn hash256_to_hash_out<F: RichField>(hash: Hash256) -> HashOut<F> {
-    let p = U256::from(F::ORDER);
-    let mut v = U256::from_little_endian(&hash);
+    let field_order = U256::from(F::ORDER);
+    let mut remaining_hash = U256::from_little_endian(&hash);
     let mut elements = [F::ZERO; 4];
-    for e in elements.iter_mut() {
-        *e = F::from_canonical_u64((v % p).as_u64());
-        v /= p;
+    for element in elements.iter_mut() {
+        *element = F::from_canonical_u64((remaining_hash % field_order).as_u64());
+        remaining_hash /= field_order;
     }
     HashOut { elements }
 }
 
-/// Packs the six main tables' known-column values (in `Table` order, each from its
-/// program's `known_values`) into the [`BatchKnownColumns`] fed to
-/// `batch_prove`/`batch_verify`, covering all [`NUM_ALL_TABLES`] batch tables (the LUT
-/// entries empty): the leading-block column indices and the values the verifier reopens at
-/// `zeta`. The Fiat-Shamir digest slot is left empty; prove/verify bind `statement_digest`
-/// in place (`HashOut` is `Copy`) before absorbing the struct.
-///
-/// Panics if a table's column count differs from [`KNOWN_COLUMNS_PER_TABLE`] or a table's
-/// columns have mismatched or non-power-of-two heights — signs of a mis-ordered argument.
+/// Pack main-table values into [`BatchKnownColumns`], appending empty entries
+/// for LUTs. Proving and verification must set the statement digest before use.
+/// Panics on wrong column counts, unequal heights or non-power-of-two heights.
 pub fn fp8_known_columns<F: RichField>(values_per_table: [Vec<PolynomialValues<F>>; NUM_TABLES]) -> BatchKnownColumns<F> {
     for (t, values) in values_per_table.iter().enumerate() {
         assert_eq!(

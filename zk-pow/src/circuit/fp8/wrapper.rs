@@ -1,77 +1,51 @@
-//! The two-stage recursive wrapper for fp8 batch proofs — the fp8 analogue of the
-//! deployed v2 `pearl_circuit` architecture.
+//! Recursive verification and compact encoding for FP8 batch proofs.
 //!
-//! **Why wrap.** The batch multi-STARK proof of [`super::driver::Fp8System`] is large and
-//! is *not* zero-knowledge as a published object (its FRI oracles are unblinded; only the
-//! trace carries the AIR-level blinding cells). The wrapper encodes the whole batch
-//! verification inside a plonky2 circuit and publishes a constant-size recursive proof
-//! instead:
+//! # Stage 1: batch verification
 //!
-//! - **Stage 1** (Poseidon recursion, no ZK): the *universal* batch verifier
-//!   ([`verify_universal_batch_stark_proof_circuit`]) re-runs the full batch verification
-//!   in-circuit — every AIR's constraints, the lookups and CTL balances, the setup-time LUT
-//!   cap (baked into the circuit as a constant) and the batched FRI argument — for **any**
-//!   degree profile inside the consensus envelope
-//!   ([`fp8_universal_envelope`]): the per-table trace heights are circuit inputs, not
-//!   compile-time constants, so one compiled circuit covers every
-//!   envelope-legal job (the D1 redesign). Its public inputs are, in order:
+//! [`verify_universal_batch_stark_proof_circuit`] verifies the arithmetic constraints,
+//! cross-table lookups and batched FRI proof against a constant lookup-table cap.
+//! The trace degrees are circuit inputs bounded by [`fp8_universal_envelope`].
 //!
-//!   ```text
-//!   every table's STARK public inputs (batch order)
-//!   | per-table trace degree bits (NUM_ALL_TABLES)
-//!   | known-column digest (4)
-//!   | zeta (2)
-//!   | known-column evals at zeta      (2 per column, batch order)
-//!   | known-column evals at g_t*zeta  (2 per column, batch order)
-//!   ```
+//! The public inputs appear in this order:
 //!
-//!   The class (a) ("known") columns cannot be evaluated in-circuit (they are full-height
-//!   per-job columns), so — exactly like the deployed v2 layer 1 — the circuit *exposes*
-//!   the challenge point `zeta` (connected to the Fiat-Shamir challenge derived in-circuit)
-//!   and the claimed evaluations (connected to the proof's trace openings), and the native
-//!   gateway [`verify_wrapped_proof`] recomputes the evaluations at `zeta` from its own
-//!   statement-derived known values and pins every slot — including the degree slots, which
-//!   it pins to the statement's own profile. A prover can therefore not lie about any
-//!   class (a) column or any table height without either breaking the in-circuit FRI
-//!   binding or failing the gateway's public-input equality.
+//! ```text
+//! table public inputs
+//! table degree bits
+//! statement digest (4 field elements)
+//! zeta (2 field elements)
+//! known-column evaluations at zeta
+//! known-column evaluations at g_t*zeta
+//! ```
 //!
-//! - **Stage 2** (ZK wrap): a plonky2 circuit with `zero_knowledge: true` (blinding per
-//!   <https://eprint.iacr.org/2024/1037.pdf>, the same configuration as the deployed v2
-//!   layer 2) that verifies the stage-1 proof and forwards its public inputs unchanged.
-//!   Stage 1's verifier data is baked into stage 2 as circuit constants, so a stage-2 proof
-//!   attests to exactly this statement's stage-1 circuit. The published artifact is the
-//!   stage-2 proof only; the batch proof and the stage-1 proof never leave the prover.
+//! `zeta` is the inner proof's Fiat–Shamir evaluation challenge. For table `t`,
+//! `g_t` is the generator of its trace domain, so `g_t*zeta` opens the next row.
+//! The circuit binds the exposed evaluations to the trace openings.
 //!
-//! **Compact published encoding.** The published `proof_data` is the *compact* serialization
-//! of the stage-2 proof. The wire drops everything the verifier can rebuild from the statement
-//! and its trusted setup:
+//! [`verify_wrapped_proof`] reconstructs and checks the entire public-input vector.
+//! It evaluates the known columns from the statement at both points and supplies
+//! geometry inputs such as `K`, `WL2`, key offsets and multiplicities. Those inputs
+//! must come from the same statement; the circuit does not derive their mutual
+//! consistency. The proof supplies `zeta`, whose value is constrained by the inner verifier.
 //!
-//! - the **public-input vector** — every slot is a pure function of the statement except
-//!   the inner challenge point `zeta`, which travels as a 16-byte preamble;
-//! - the **constants/sigmas oracle data** — the openings at `zeta` and, per FRI query,
-//!   the tree-0 leaf evaluations and Merkle proofs. The verifier recomputes these
-//!   from the setup's trusted `constants_sigmas_polynomials`, so the prover supplies —
-//!   and can influence — none of them.
+//! # Stage 2: zero-knowledge wrapper
 //!
-//! Like the deployed v2 wrapper, stage 1 proves under [`PoseidonGoldilocksConfig`] (cheap
-//! recursion) and stage 2 under [`Blake3GoldilocksConfig`] (on-chain-friendly hashing).
+//! Stage 2 verifies stage 1 using constant verifier data and forwards its public
+//! inputs. It enables zero knowledge; only the stage-2 proof is published.
+//! Stage 1 uses [`PoseidonGoldilocksConfig`], and stage 2 uses [`Blake3GoldilocksConfig`].
 //!
-//! **Circuit identity.** The compiled circuits are consensus constants:
-//! the AIR identities are program-independent (geometry enters as public inputs and known
-//! columns — phases A/B3), and the known-column index layout, the CTL set, the LUT cap,
-//! the envelope and the FRI ladder are consensus constants. A
-//! [`Fp8WrapperCircuits`] is therefore reusable across *all* envelope-legal
-//! jobs, and any mismatch fails closed: a proof outside the envelope cannot satisfy the
-//! degree flags, and the gateway independently derives every pinned slot from its own
-//! statement. [`Fp8CircuitCache`] memoizes the compiled circuits
-//! ([`Fp8WrapperCircuits::with_cache`]).
+//! # Compact encoding and trusted setup
 //!
-//! **Geometry public inputs.** Scale's `K`/`WL2`, InputQuant's `2^WL2` and InputQuant's
-//! four CTL geometry slots (`h*k`, `h*k/8`, `w`, `h`) are inner-STARK public inputs
-//! re-exported as stage-1 public inputs — plain wires, with no in-circuit relations
-//! between them. Their well-formedness (`WL2 = 27 - ceil(log2 K)`, `2^WL2` its power,
-//! the CTL slots matching `h`, `w`, `k`) is the gateway's job: it pins every slot to
-//! its own recomputation from the statement, rejecting any other assignment.
+//! The wire format is `zeta (16 bytes) || outer proof`. It omits the public inputs
+//! and the constants/sigmas oracle data. Here sigmas are the proof system's
+//! permutation polynomials, distinct from the FP8 noise scales.
+//!
+//! Verification reconstructs the public inputs from the statement and the omitted
+//! oracle data from trusted polynomial coefficients. The reconstruction uses each
+//! Fiat–Shamir challenge at its normal transcript position; the prover does not
+//! choose those oracle values.
+//!
+//! [`Fp8CircuitCache`] reuses compiled circuits across job geometries, with one
+//! entry per lookup-table cap. Geometry and degrees remain verified public inputs.
 
 use anyhow::{Context, Result, anyhow, ensure};
 use hashbrown::HashMap;
@@ -108,16 +82,13 @@ use crate::circuit::fp8::circuit_utils::build_recursion_config;
 /// The wrapper's field, extension degree and per-stage hasher configurations.
 pub type F = GoldilocksField;
 pub const D: usize = 2;
-/// Stage-1 configuration: the batch proof's own config (its caps must be algebraic for the
-/// in-circuit Fiat-Shamir replay) and the cheap recursion hasher.
+/// Stage 1 uses algebraic hashing for recursive verification.
 pub type InnerC = PoseidonGoldilocksConfig;
-/// Stage-2 (published) configuration: Blake3 outer hashing, like the deployed v2 layer 2.
+/// Stage 2 uses Blake3 for the published proof.
 pub type OuterC = Blake3GoldilocksConfig;
 
-/// Sanctioned FRI parameters of the two wrapper stages — the same consensus combinations as
-/// the deployed v2 wrapper (`pearl_circuit::STAGE_1_PARAMS` / `STAGE_2_PARAMS`). Rate
-/// `2^-3` is the floor for both stages: the recursion gates carry degree-7 constraints
-/// (Poseidon), so the quotient needs an LDE blowup of at least `2^3`.
+/// FRI parameters for each recursive stage. Degree-seven Poseidon constraints
+/// require at least three rate bits for the quotient's LDE blowup.
 pub const STAGE_1_RATE_BITS: usize = 3;
 pub const STAGE_1_POW_BITS: usize = 18;
 pub const STAGE_2_RATE_BITS: usize = 7;
@@ -148,8 +119,7 @@ fn num_wrapper_public_inputs(system: &Fp8System<F, D>) -> usize {
     zeta_offset(system) + D + 2 * D * num_known
 }
 
-/// Splits the wrapper's flat public-input prefix back into per-table STARK public inputs
-/// (batch positions). Purely syntactic; [`verify_wrapped_proof`] is the judge of the values.
+/// Split the public-input prefix by table. [`verify_wrapped_proof`] checks its values.
 pub fn split_batch_public_inputs(system: &Fp8System<F, D>, flat: &[F]) -> Result<Vec<Vec<F>>> {
     ensure!(
         flat.len() == num_wrapper_public_inputs(system),
@@ -170,10 +140,7 @@ pub fn split_batch_public_inputs(system: &Fp8System<F, D>, flat: &[F]) -> Result
         .collect())
 }
 
-/// In-memory cache of compiled wrapper circuits, keyed by the baked
-/// LUT cap. Own one for the prover's lifetime and pass it to
-/// [`Fp8WrapperCircuits::with_cache`]: the first job compiles, every later job
-/// reuses — whatever its geometry or degree profile.
+/// Compiled circuits indexed by LUT cap; reused by [`Fp8WrapperCircuits::with_cache`].
 #[derive(Default)]
 pub struct Fp8CircuitCache {
     circuits: HashMap<Fp8CircuitKey, Fp8WrapperCircuits>,
@@ -190,14 +157,7 @@ impl Fp8CircuitCache {
     }
 }
 
-/// Everything that determines the compiled circuits: the baked LUT cap — a pure function of
-/// the committed tables and the consensus config.
-///
-/// Nothing else is key material (the D1 universal design): the degree profile and the
-/// geometry are runtime inputs — the profile rides the degree public inputs, the geometry
-/// rides the `K`/`WL2`/`2^WL2` public inputs and the known columns (whose evaluations the
-/// gateway pins natively) — and the AIR identities, the CTL set, the known-column index
-/// layout, the envelope and the FRI ladder are consensus constants.
+/// The LUT cap selects the circuits; geometry and degrees are verified inputs.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct Fp8CircuitKey {
     lut_cap: Vec<u64>,
@@ -233,9 +193,9 @@ pub struct Fp8WrapperCircuits {
 
 /// A virtual extension target registered (component-wise) as the next public inputs.
 fn add_ext_public_input(builder: &mut CircuitBuilder<F, D>) -> ExtensionTarget<D> {
-    let et = builder.add_virtual_extension_target();
-    builder.register_public_inputs(&et.0);
-    et
+    let target = builder.add_virtual_extension_target();
+    builder.register_public_inputs(&target.0);
+    target
 }
 
 impl Fp8WrapperCircuits {
@@ -255,14 +215,9 @@ impl Fp8WrapperCircuits {
         Ok(cache.circuits.get(&key).expect("just inserted"))
     }
 
-    /// Compiles both stages, baking `lut_cap` (the
-    /// consensus LUT commitment) into stage 1 as constants.
-    ///
-    /// The compiled circuits do not depend on `system`'s job: the AIRs are
-    /// program-independent, and every degree- or geometry-dependent quantity is a circuit
-    /// input (the second-geometry leg of `wrapped_api_roundtrip_and_tamper_rejection` pins
-    /// this). `system`'s profile must lie on the consensus ladder — its config then *is*
-    /// the consensus config the universal circuit's Fiat-Shamir replay absorbs.
+    /// Compile both stages with `lut_cap` fixed in stage 1.
+    /// `system` must use the supported degree schedule. Job geometry is supplied
+    /// through public inputs and known-column evaluations.
     pub fn build(
         system: &Fp8System<F, D>,
         lut_cap: &MerkleCap<F, <InnerC as GenericConfig<D>>::Hasher>,
@@ -279,16 +234,14 @@ impl Fp8WrapperCircuits {
         );
         let envelope = fp8_universal_envelope();
 
-        // ---- Stage 1: the universal batch verifier in-circuit. ----
+        // Stage 1: the universal batch verifier in-circuit.
         let config_1 = build_recursion_config(STAGE_1_RATE_BITS, STAGE_1_POW_BITS, 1, false);
         let mut builder = CircuitBuilder::<F, D>::new(config_1);
         let starks = system.batch_starks();
         let preprocessed = system.preprocessed_verifier_data::<InnerC>(lut_cap);
         let preprocessed_target = preprocessed.constant_target(&mut builder);
 
-        // The known-column surface: a digest slot and one claimed evaluation per column
-        // per point, created up front (registered as public inputs below, after the
-        // tables' own public inputs).
+        // Allocate known-column claims now; register them after the table public inputs.
         let known_digest_target = builder.add_virtual_hash();
         let evals_at_zeta: Vec<Vec<ExtensionTarget<D>>> = known
             .columns_per_table
@@ -318,9 +271,7 @@ impl Fp8WrapperCircuits {
             &HashMap::new(),
         )?;
 
-        // The public-input layout (see the module docs): table public inputs, the degree
-        // slots (the universal verifier's height inputs — the gateway pins them to the
-        // statement), the known-column digest, zeta, then the claimed evaluations.
+        // Register public inputs in the order consumed by `expected_wrapper_public_inputs`.
         for pis in &universal.proof_with_pis.public_inputs {
             builder.register_public_inputs(pis);
         }
@@ -342,16 +293,14 @@ impl Fp8WrapperCircuits {
             stage1.common.degree_bits(),
         );
 
-        // ---- Stage 2: the ZK wrap. ----
+        // Stage 2: the ZK wrap.
         let config_2 = build_recursion_config(STAGE_2_RATE_BITS, STAGE_2_POW_BITS, 2, true);
         debug_assert!(config_2.zero_knowledge);
         let mut builder = CircuitBuilder::<F, D>::new(config_2);
         let stage1_proof_target = builder.add_virtual_proof_with_pis(&stage1.common);
         // Forward stage 1's public inputs unchanged.
         builder.register_public_inputs(&stage1_proof_target.public_inputs);
-        // Stage 1's verifier data is a circuit constant: a stage-2 proof commits to exactly
-        // this statement's stage-1 circuit (no native digest pinning needed, unlike the
-        // deployed v2 layer 2 which exposes the layer-1 digest as public inputs).
+        // Stage 2 can verify only the stage-1 circuit compiled above.
         let stage1_verifier_target = builder.constant_verifier_data(&stage1.verifier_only);
         builder.verify_proof::<InnerC>(&stage1_proof_target, &stage1_verifier_target, &stage1.common);
         let stage2 = timed!(timing, "build the stage-2 (ZK) wrapper circuit", builder.build::<OuterC>());
@@ -367,14 +316,9 @@ impl Fp8WrapperCircuits {
         })
     }
 
-    /// Wraps one batch proof: proves stage 1 (the in-circuit batch verification), then
-    /// stage 2 (the ZK wrap). Returns the publishable stage-2 proof.
-    ///
-    /// `batch_proof` must be a proof of `system`'s statement; any mismatch fails closed
-    /// when the witness is set (an
-    /// off-envelope profile is rejected by the degree flags). `statement_digest` is the
-    /// Fiat-Shamir salt the inner batch proof absorbed (`PublicParams::digest` after `J`).
-    /// Cross-checked against the system's own bound digest, if any.
+    /// Prove both recursive stages and return the outer zero-knowledge proof.
+    /// `statement_digest` must match the batch proof's Fiat-Shamir binding,
+    /// including the generated jackpot digest.
     pub fn prove(
         &self,
         system: &Fp8System<F, D>,
@@ -383,20 +327,20 @@ impl Fp8WrapperCircuits {
         timing: &mut TimingTree,
     ) -> Result<ProofWithPublicInputs<F, OuterC, D>> {
         system.ensure_statement_digest_binding(statement_digest)?;
-        let mut pw = PartialWitness::new();
+        let mut witness = PartialWitness::new();
         set_universal_batch_stark_proof_with_pis_target(
-            &mut pw,
+            &mut witness,
             &self.universal_target,
             batch_proof,
             &self.envelope,
             system.config(),
         )?;
-        pw.set_hash_target(self.known_digest_target, hash256_to_hash_out(statement_digest))?;
-        let stage1_proof = timed!(timing, "prove the stage-1 wrapper", self.stage1.prove(pw))?;
+        witness.set_hash_target(self.known_digest_target, hash256_to_hash_out(statement_digest))?;
+        let stage1_proof = timed!(timing, "prove the stage-1 wrapper", self.stage1.prove(witness))?;
 
-        let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&self.stage1_proof_target, &stage1_proof)?;
-        timed!(timing, "prove the stage-2 (ZK) wrapper", self.stage2.prove(pw))
+        let mut witness = PartialWitness::new();
+        witness.set_proof_with_pis_target(&self.stage1_proof_target, &stage1_proof)?;
+        timed!(timing, "prove the stage-2 (ZK) wrapper", self.stage2.prove(witness))
     }
 
     /// The verifier's view: stage 2's verifier data (the only circuit a verifier needs).
@@ -410,20 +354,12 @@ impl Fp8WrapperCircuits {
     }
 }
 
-/// Verifies a wrapped (stage-2) proof against the statement:
+/// Verify the outer proof and its statement-derived public inputs.
 ///
-/// 1. pins *every* public-input slot — the per-table STARK public inputs to
-///    `expected_public_inputs` (at their batch positions), the degree slots to the
-///    statement's own profile (the heights the universal stage-1 circuit
-///    verified are inputs), the known-column digest to `statement_digest`, and the
-///    known-column evaluations to the verifier's *native recomputation* at the proof's
-///    `zeta` from the statement's known values (`zeta` itself is the one prover-supplied
-///    slot: the stage-1 circuit constrains it to equal the inner batch proof's Fiat-Shamir
-///    challenge);
-/// 2. verifies the plonky2 proof against `verifier_data` (which must be the ZK stage).
-///
-/// Together with the in-circuit batch verification this gives exactly the guarantees of
-/// [`Fp8System::verify`] on the underlying batch proof.
+/// Reconstruct the vector from `expected_public_inputs`, the degree profile,
+/// `statement_digest` and known-column evaluations. Zeta is supplied by the
+/// proof and constrained by the inner verifier. `verifier_data` must be the
+/// trusted zero-knowledge outer circuit.
 pub fn verify_wrapped_proof(
     system: &Fp8System<F, D>,
     verifier_data: &VerifierCircuitData<F, OuterC, D>,
@@ -443,8 +379,8 @@ pub fn verify_wrapped_proof(
         proof.public_inputs.len(),
         total
     );
-    let z = zeta_offset(system);
-    let zeta = QuadraticExtension([proof.public_inputs[z], proof.public_inputs[z + 1]]);
+    let zeta_start = zeta_offset(system);
+    let zeta = QuadraticExtension([proof.public_inputs[zeta_start], proof.public_inputs[zeta_start + 1]]);
     let expected = expected_wrapper_public_inputs(system, expected_public_inputs, statement_digest, zeta)?;
     ensure!(
         proof.public_inputs == expected,
@@ -473,8 +409,7 @@ pub fn expected_wrapper_public_inputs(
     expected.extend(system.degree_bits().iter().map(|&bits| F::from_canonical_usize(bits)));
     expected.extend(hash256_to_hash_out::<F>(statement_digest).elements);
     expected.extend(zeta.0);
-    // The class (a) recompute: evaluate the statement's own known columns at the proof's
-    // zeta and g_t * zeta — the same binding `batch_verify` performs natively.
+    // Recompute known columns at both points checked by native batch verification.
     let mut evals_at_zeta = Vec::new();
     let mut evals_at_g_zeta = Vec::new();
     for t in 0..NUM_ALL_TABLES {
@@ -488,7 +423,6 @@ pub fn expected_wrapper_public_inputs(
     }
     expected.extend(evals_at_zeta.iter().flat_map(|e| e.0));
     expected.extend(evals_at_g_zeta.iter().flat_map(|e| e.0));
-    // Layout invariant, fail closed: the assembled vector must fill the layout exactly.
     ensure!(
         expected.len() == total,
         "wrapped proof: internal public-input layout mismatch (built {}, layout says {})",
@@ -498,8 +432,7 @@ pub fn expected_wrapper_public_inputs(
     Ok(expected)
 }
 
-/// Byte length of the compact wire preamble: `zeta` as 2 canonical Goldilocks limbs
-/// (8 bytes each, little-endian) — the layout of the deployed v2 certificate's zeta field.
+/// Zeta preamble: two canonical Goldilocks elements, eight little-endian bytes each.
 pub const COMPACT_ZETA_PREAMBLE: usize = 16;
 
 /// Encodes a wrapped (stage-2) proof in the published compact form:
@@ -512,9 +445,9 @@ pub fn compact_proof_data(system: &Fp8System<F, D>, proof: &ProofWithPublicInput
         proof.public_inputs.len(),
         total
     );
-    let z = zeta_offset(system);
+    let zeta_start = zeta_offset(system);
     let mut data = Vec::new();
-    data.write_field_vec(&[proof.public_inputs[z], proof.public_inputs[z + 1]])
+    data.write_field_vec(&[proof.public_inputs[zeta_start], proof.public_inputs[zeta_start + 1]])
         .expect("writing to a byte vector cannot fail");
     debug_assert_eq!(data.len(), COMPACT_ZETA_PREAMBLE);
     let compact: CompactProofWithPublicInputs<F, OuterC, D> = proof.clone().into();
@@ -522,25 +455,11 @@ pub fn compact_proof_data(system: &Fp8System<F, D>, proof: &ProofWithPublicInput
     Ok(data)
 }
 
-/// Verifies a compact wrapped proof ([`compact_proof_data`]) against the statement.
-/// The compact counterpart of [`verify_wrapped_proof`], giving the same guarantees:
+/// Verify [`compact_proof_data`] using trusted setup polynomials.
 ///
-/// 1. reads `zeta` from the 16-byte preamble, rejecting non-canonical limb encodings
-///    (`read_field_vec`) — the only prover-supplied slot on the wire;
-/// 2. *imposes* the statement's own expected public-input vector
-///    ([`expected_wrapper_public_inputs`]): the proof is verified against the hash of the
-///    verifier-built vector, so a proof of any other statement fails the Fiat-Shamir
-///    public-input binding — the compact analogue of the full path's slot equality check
-///    (this is the deployed v2 verification pattern);
-/// 3. rejects non-canonical proof encodings by re-encoding: exactly one byte string is
-///    accepted per proof, the same malleability rule `Fp8Verifier::decode_proof` enforces
-///    for the full format;
-/// 4. runs [`CompactProofWithPublicInputs::verify`], which rebuilds the constants/sigmas
-///    openings and per-query tree-0 evaluations from `constants_sigmas_polynomials`
-///    (trusted setup, [`Fp8WrapperCircuits::constants_sigmas_polynomials`]) *after* each
-///    Fiat-Shamir challenge is drawn at its standard transcript position, then delegates
-///    to the standard plonky2 verifier with tree-0 Merkle authentication skipped — sound
-///    because those values are the verifier's own, never the prover's.
+/// The polynomial coefficients must come from the trusted outer setup
+/// ([`Fp8WrapperCircuits::constants_sigmas_polynomials`]). Public inputs are
+/// reconstructed from the statement and encoded zeta; non-canonical encodings are rejected.
 pub fn verify_compact_wrapped_proof(
     system: &Fp8System<F, D>,
     verifier_data: &VerifierCircuitData<F, OuterC, D>,
@@ -565,8 +484,7 @@ pub fn verify_compact_wrapped_proof(
     let zeta = QuadraticExtension([zeta_limbs[0], zeta_limbs[1]]);
 
     let expected = expected_wrapper_public_inputs(system, expected_public_inputs, statement_digest, zeta)?;
-    // Fail closed against the compiled circuit before hashing the imposed vector: the
-    // statement's layout and the circuit's registered public-input count must agree.
+    // Check the reconstructed vector length before hashing it for verification.
     ensure!(
         expected.len() == verifier_data.common.num_public_inputs,
         "compact wrapped proof: the statement's public-input layout ({}) does not match the circuit ({})",
@@ -579,15 +497,15 @@ pub fn verify_compact_wrapped_proof(
         compact.to_proof_bytes() == proof_bytes,
         "compact wrapped proof: non-canonical proof encoding"
     );
-    // With imposed public inputs, a proof for a different statement and a cryptographically
-    // invalid proof are the same failure (the Fiat-Shamir public-input binding breaks), so
-    // the message names both. This is the outermost context: FFI errors surface only this.
+    // Verification reconstructs omitted constants/sigmas data from the setup polynomials
+    // after drawing the corresponding Fiat-Shamir challenges.
     compact
         .verify(
             &verifier_data.verifier_only,
             &verifier_data.common,
             constants_sigmas_polynomials,
         )
+        // The FFI exposes this context for both statement mismatches and invalid proofs.
         .context(
             "compact fp8 proof does not verify against the expected statement (mismatched header/statement or an invalid proof)",
         )

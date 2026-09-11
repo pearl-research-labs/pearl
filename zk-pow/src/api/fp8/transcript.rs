@@ -1,44 +1,32 @@
-//! The FP8/v4 transcript: domain-separated BLAKE3, the key/seed derivations,
-//! and the immutable stage-output types the native verifier flows through.
+//! FP8/v4 domain-separated BLAKE3 keys, noise seeds and lottery [`Ticket`] values.
 //!
-//! # Whitepaper symbol map
+//! The caller supplies the proposed header. The proof carries the ancestor
+//! header in `JobParams.ancestor_header`; the caller must authenticate it
+//! within the proposed header's context window.
 //!
-//! | code name          | whitepaper symbol   | meaning                                                   |
-//! |--------------------|---------------------|-----------------------------------------------------------|
-//! | `proposed_header`  | `σ̂` (sigma-hat)    | the proposed block header (the caller's header argument)  |
-//! | `ancestor_header`  | `σ_Δ` (sigma-delta) | the proof-carried ancestor header selected by the miner  |
-//!
-//! The ancestor header is part of the proof (`JobParams.ancestor_header`) and is
-//! taken as granted by zk-pow: the **caller** authenticates it as a member of
-//! the context window preceding the proposed header (§5.3–§5.4).
-//!
-//! The per-side opening keys and the noise-seed chain are derived on
-//! [`PublicParams`] (see [`PublicParams::commitment_keys`] and
-//! [`PublicParams::noise_seeds`]), consuming the two headers and the committed
-//! roots.
+//! [`PublicParams::commitment_keys`] and [`PublicParams::noise_seeds`] derive
+//! the tree keys and noise seeds from the headers, parameters and commitments:
 //!
 //! ```text
 //! keyA := H_"key-A"(proposed_header)            (A-side tree key, routing/offset keys)
 //! keyB := H_"key-B"(ancestor_header)           (B-side tree key)
-//! noise seedB := H_"seed-B"(HB || keyB || pB)
-//! noise seedA := H_"seed-A"(HA || HR || HO || noise_seedB || keyA || pA)   (MoE)
-//! noise seedA := H_"seed-A"(HA || noise_seedB || keyA || pA)               (dense)
+//! noise_seedB := H_"seed-B"(HB || keyB || pB)
+//! noise_seedA := H_"seed-A"(HA || HR || HO || noise_seedB || keyA || pA)   (MoE)
+//! noise_seedA := H_"seed-A"(HA || noise_seedB || keyA || pA)               (dense)
 //! J := H_"jackpot"(z; noise_seedA)
 //! ```
 //!
-//! All messages are bare concatenations of the already-encoded fixed-width
-//! fields (no tags, no length prefixes), matching the rest of the FP8 codec.
-//!
-//! The [`Ticket`] type is the stage output the native
-//! verifier produces as it advances, one value per successful transition; each
-//! is complete at construction and no later stage mutates an earlier one.
+//! `HA`/`HB` are operand commitments; `HR`/`HO` commit to routing and offsets.
+//! `pA`/`pB` are the encoded parameter blocks. `z` is the 64-byte folded matmul
+//! result, and `J` is its jackpot digest. Concatenation adds no tags or length prefixes.
 //!
 //! # Domain separation
 //!
-//! Role labels are complete compile-time strings; `Some(parent)` derives the
-//! subkey in keyed mode, `None` uses unkeyed BLAKE3, and [`hash_labelled`]
-//! always hashes under that subkey. There is no fixed 32-byte protocol key:
-//! unkeyed BLAKE3 is a different mode from keyed BLAKE3 under any IV bytes.
+//! Each role label above has the prefix `pearl/v4/FP8/`. `H_label(message; parent)`
+//! first hashes the full label with BLAKE3 to obtain a subkey, then hashes the
+//! message with that subkey. The label hash is keyed by `parent` when supplied;
+//! otherwise it uses unkeyed BLAKE3. Unkeyed mode is distinct from keyed mode
+//! with a fixed key, including an all-zero key.
 
 use pearl_blake3::blake3_digest;
 
@@ -57,23 +45,15 @@ use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
 /// Every v4 role label starts with this prefix.
 const LABEL_PREFIX: &[u8] = b"pearl/v4/FP8/";
 
-/// `pearl/v4/FP8/key-A` — the A-side tree key label (also MoE routing/offset keys).
 const LABEL_KEY_A: &[u8] = b"pearl/v4/FP8/key-A";
-/// `pearl/v4/FP8/key-B` — the B-side tree key label.
 const LABEL_KEY_B: &[u8] = b"pearl/v4/FP8/key-B";
-/// `pearl/v4/FP8/seed-A` — the A-side noise-seed label.
 const LABEL_SEED_A: &[u8] = b"pearl/v4/FP8/seed-A";
-/// `pearl/v4/FP8/seed-B` — the B-side noise-seed label.
 const LABEL_SEED_B: &[u8] = b"pearl/v4/FP8/seed-B";
-/// `pearl/v4/FP8/zk-public` — the Fiat-Shamir statement-digest label.
 const LABEL_ZK_PUBLIC: &[u8] = b"pearl/v4/FP8/zk-public";
 
-/// `pearl/v4/FP8/noise-line` — the noise-line subkey label (see
-/// [`crate::api::fp8::noise`]).
+/// Line-key label used by [`crate::api::fp8::noise`].
 pub(crate) const LABEL_NOISE_LINE: &[u8] = b"pearl/v4/FP8/noise-line";
-/// `pearl/v4/FP8/jackpot` — the lottery ticket label (also the prover's
-/// jackpot-key subkey derivation, see
-/// [`crate::api::proof_utils::CompiledPublicParams`]).
+/// Lottery-key label used by [`jackpot_key`] and [`compute_jackpot_ticket`].
 pub(crate) const LABEL_JACKPOT: &[u8] = b"pearl/v4/FP8/jackpot";
 
 /// Derive a 32-byte role key from a complete v4 label and an optional parent.
@@ -82,25 +62,22 @@ pub(crate) fn subkey(label: &'static [u8], key: Option<&Hash256>) -> Hash256 {
     blake3_digest(label, key.copied())
 }
 
-/// Hash `message` under [`subkey`] of `label` and `key`.
+/// Hash `message` with a key derived from the role label and optional parent key.
 pub(crate) fn hash_labelled(message: &[u8], label: &'static [u8], key: Option<&Hash256>) -> Hash256 {
     blake3_digest(message, Some(subkey(label, key)))
 }
 
-/// `keyA = H_"key-A"(proposed_header)` — the A-side tree key (also the MoE
-/// routing/offset tree key).
+/// Derive A's tree key from the proposed header; also used for MoE routing and offsets.
 pub(crate) fn key_a(proposed_header: &IncompleteBlockHeader) -> Hash256 {
     hash_labelled(&proposed_header.to_bytes(), LABEL_KEY_A, None)
 }
 
-/// `keyB = H_"key-B"(ancestor_header)` — the B-side tree key.
+/// Derive B's tree key from the ancestor header.
 pub(crate) fn key_b(ancestor_header: &IncompleteBlockHeader) -> Hash256 {
     hash_labelled(&ancestor_header.to_bytes(), LABEL_KEY_B, None)
 }
 
-/// `jackpotKey = Subkey(noise_seedA, LABEL_JACKPOT)` — the lottery compression
-/// key (also the prover's jackpot-key subkey). The single source of truth for
-/// the jackpot key derivation.
+/// Derive the lottery hash key from A's noise seed.
 pub(crate) fn jackpot_key(seed_a: &Hash256) -> Hash256 {
     subkey(LABEL_JACKPOT, Some(seed_a))
 }
@@ -112,8 +89,7 @@ pub struct Ticket {
     pub jackpot: Hash256,
 }
 
-/// `H_"jackpot"(msg; seed_a)` — digest of the 64-byte extract under
-/// `Subkey(seed_a, "pearl/v4/FP8/jackpot")`.
+/// Hash the folded matmul message with A's derived lottery key and retain both in the ticket.
 pub fn compute_jackpot_ticket(seed_a: &Hash256, msg: &JackpotMessage) -> Ticket {
     Ticket {
         msg: *msg,
@@ -122,27 +98,26 @@ pub fn compute_jackpot_ticket(seed_a: &Hash256, msg: &JackpotMessage) -> Ticket 
 }
 
 impl PublicParams {
-    /// `H_"zk-public"(σ̂ || public_data)` — Fiat-Shamir salt bound as `statement_digest`.
-    /// `σ̂` is the caller's proposed header; `public_data` is [`PublicParams::to_bytes`].
+    /// Hash the proposed header followed by [`PublicParams::to_bytes`] under
+    /// the `zk-public` label to bind the statement into Fiat-Shamir.
     pub(crate) fn digest(&self, proposed_header: &IncompleteBlockHeader) -> Hash256 {
         let mut msg = proposed_header.to_bytes().to_vec();
         msg.extend_from_slice(&self.to_bytes());
         hash_labelled(&msg, LABEL_ZK_PUBLIC, None)
     }
 
-    /// `keyA = H_"key-A"(σ̂)` — the A-side tree key (and, in MoE, the routing and
-    /// offset tree key), keyed on the caller's proposed header.
+    /// The A-side tree key, derived from the caller's proposed header.
+    /// Also keys MoE routing and offsets.
     pub(crate) fn key_a(&self, proposed_header: &IncompleteBlockHeader) -> Hash256 {
         key_a(proposed_header)
     }
 
-    /// `keyB = H_"key-B"(σ_Δ)` — the B-side tree key, keyed on the statement's own
-    /// proof-carried ancestor header ([`Self::ancestor_header`]).
+    /// The B-side tree key, derived from [`Self::ancestor_header`].
     pub(crate) fn key_b(&self) -> Hash256 {
         key_b(self.ancestor_header())
     }
 
-    /// `Sides { a: keyA, b: keyB }` — the per-side opening keys.
+    /// Derive the keys used to verify A's and B's Merkle openings.
     pub(crate) fn commitment_keys(&self, proposed_header: &IncompleteBlockHeader) -> Sides<Hash256> {
         Sides {
             a: self.key_a(proposed_header),
@@ -150,20 +125,14 @@ impl PublicParams {
         }
     }
 
-    /// The lottery key used to compute jackpot ticket
+    /// Derive the lottery key used to compute the jackpot ticket.
     pub(crate) fn jackpot_key(&self, proposed_header: &IncompleteBlockHeader) -> Hash256 {
         jackpot_key(&self.noise_seeds(proposed_header).a)
     }
 
-    /// The derived per-side noise seeds, keyed by the opening keys.
-    ///
-    /// The roots are the operand commitment digests
-    /// ([`Self::commitment_digests`]). Native verification must call this only
-    /// after openings have checked those roots.
-    ///
-    /// MoE adds `H_R` and `H_O` after `H_A`:
-    /// `noise seedA = H_"seed-A"(H_A, H_R, H_O, noise seedB, keyA, pA)`;
-    /// dense omits them: `H_"seed-A"(H_A, noise seedB, keyA, pA)`.
+    /// Derive seeds from [`Self::commitment_digests`] using the chain above.
+    /// Native verification authenticates the claimed roots through the openings;
+    /// recursive verification binds them through the proof.
     pub(crate) fn noise_seeds(&self, proposed_header: &IncompleteBlockHeader) -> Sides<Hash256> {
         let keys = self.commitment_keys(proposed_header);
         let roots = self.commitment_digests();
@@ -293,9 +262,7 @@ mod tests {
 
     use crate::api::fp8::public_params::test_fixtures::{dense_params, moe_params};
 
-    /// The same statement with its proof-carried ancestor replaced — the
-    /// transcript-level view of the caller's hash-walk check (σ_Δ leads the
-    /// `public_data` blob, so the splice round-trips through the wire codec).
+    /// Replace the ancestor header at the start of `public_data`, then decode the statement.
     fn with_ancestor(params: &PublicParams, ancestor: IncompleteBlockHeader) -> PublicParams {
         let mut bytes = params.to_bytes();
         bytes[..IncompleteBlockHeader::SERIALIZED_SIZE].copy_from_slice(&ancestor.to_bytes());
@@ -313,8 +280,7 @@ mod tests {
         let other_header = IncompleteBlockHeader::new_for_test(0x1d00ffff);
         assert_ne!(params.digest(&header), params.digest(&other_header));
 
-        // A different ancestor header changes public_data (σ_Δ leads the blob),
-        // hence the statement digest.
+        // Changing the ancestor header changes `public_data` and its digest.
         let other_ancestor = with_ancestor(&params, other_header);
         assert_ne!(params.digest(&header), other_ancestor.digest(&header));
         assert_ne!(params.digest(&header), moe_params().digest(&header));

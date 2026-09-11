@@ -1,36 +1,25 @@
 //! Trace columns for eight-row BLAKE3 compressions.
 //!
-//! Each compression streams its 64-byte message at eight bytes per row, applies one of BLAKE3's
-//! seven rounds on each of the first seven rows, and finalizes the eight-word chaining value
-//! `cv_out` on the eighth. `blake3_msg_buffer` binds that byte stream to the sixteen-word
-//! `blake3_msg`; `cv_in`, a source-row pointer, `trace_row_index`, and `cv_out_freq` route
-//! chaining values between compressions.
-//!
-//! The first six columns are verifier-recomputed schedule values: packed row flags, the
-//! cross-table key base, int8/scale message selectors, the CV-source pointer or initialization
-//! tweak, and packed mixture-of-experts routing indices. Remaining columns unpack those flags,
-//! hold message/state data, route CVs, and bind the public hashes. [`BLAKE3_COL_MAP`] exposes
-//! the same `#[repr(C)]` order as flat column indices.
+//! Each compression streams eight bytes per row, runs seven rounds, and finalizes
+//! its chaining value on row 7. The message buffer binds the byte stream to the
+//! round messages; a lookup routes chaining values between compressions.
+//! Leading verifier-known columns fix the schedule, lookup keys and MoE word pins.
 
 use crate::circuit::fp8::columns_view::columns_view;
 
-/// One tracked BLAKE3 state (16 words `v[0..16]`), in the deployed chip's representation
-/// (`chip/blake3/blake3_air.rs`): words 0..4 and 8..12 packed as u32 field elements, words 4..8
-/// and 12..16 as 32 little-endian bits each — the bit halves are exactly the words the
-/// G-function XOR/rotate steps consume, so no extra decompositions are needed.
-///
-/// 4 + 128 + 4 + 128 = 264 columns per state.
+/// One BLAKE3 state: words 0..4 and 8..12 are packed u32 values; words 4..8 and
+/// 12..16 are bits for the G-function's XOR/rotate steps.
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct Blake3StateCols<T: Copy> {
     /// State words `v[0..4]`, packed u32.
-    pub row1: [T; 4],
+    pub a_words: [T; 4],
     /// State words `v[4..8]`, 32 LE bits each.
-    pub row2: [[T; 32]; 4],
+    pub b_bits: [[T; 32]; 4],
     /// State words `v[8..12]`, packed u32.
-    pub row3: [T; 4],
+    pub c_words: [T; 4],
     /// State words `v[12..16]`, 32 LE bits each.
-    pub row4: [[T; 32]; 4],
+    pub d_bits: [[T; 32]; 4],
 }
 
 /// Columns per tracked state.
@@ -43,14 +32,7 @@ pub const NUM_TRACKED_STATES: usize = 4;
 /// Number of message bytes ingested per row.
 pub const NUM_UINT8: usize = 8;
 
-/// Bit position of each committed unpack flag inside `ROW_FLAGS_PACKED` (constraint 2's weights):
-/// flag `j` carries weight `2^j`. The order is the field order below: `IS_USE_KEY_A(0),
-/// IS_USE_KEY_B(1), IS_USE_JACKPOT_KEY(2), IS_USE_IV(3), IS_BIND_HASH_A(4),
-/// IS_BIND_HASH_B(5), IS_BIND_ROUTING_HASH(6), IS_BIND_JACKPOT_HASH(7), IS_CV_IN(8),
-/// IS_NEW_BLAKE(9), IS_LAST_ROUND(10), the three IS_MSG_BITS at bits 11, 12, and 13,
-/// IS_FIRST_OUTER(14), IS_SECOND_OUTER(15), IS_BIND_OFFSETS_HASH(16), IS_WORD_PIN_FIRST(17),
-/// IS_WORD_PIN_SECOND(18), IS_CHAIN_INTRA(19), IS_CHAIN_INTER(20), IS_CHAIN_STRICT(21),
-/// IS_BOUND_FIRST(22), IS_BOUND_SECOND(23), and IS_CHAIN_DATA(24)`.
+/// Number of packed flags; [`unpack_flag_cols`] gives their bit order.
 pub const NUM_UNPACK_FLAGS: usize = 25;
 
 /// View of one Blake3Stark trace row: control unpacking, routing-index limbs, row counter,
@@ -60,16 +42,8 @@ pub const NUM_UNPACK_FLAGS: usize = 25;
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct Blake3ColumnsView<T: Copy> {
-    // ------------------------------------------------------------------------------------------
-    // Class (a): verifier-recomputable from the compiled `Blake3Program` (schedule, geometry).
-    // Committed *with the trace* like every main column, but the verifier recomputes them
-    // (`Blake3Program::known_values`) and checks the trace openings against its own values —
-    // the batch system's "known columns" (`starky::batch_verifier::BatchKnownColumns`,
-    // assembled by `super::super::known_values::fp8_known_columns`). The leading
-    // `NUM_BLAKE3_KNOWN_COLUMNS` indices are exactly this block.
-    // ------------------------------------------------------------------------------------------
-    /// Packed per-row program word: the 26 unpack flags below at weights `2^0..2^25`
-    /// (constraint 2 re-packs them to this).
+    // Verifier-known schedule columns; see `known_values`.
+    /// Packed schedule flags, with bit order given by [`unpack_flag_cols`].
     pub row_flags_packed: T,
     /// Flat element index (int8-plane rows) or block index (scales-plane rows) of the first item
     /// ingested on this row; base of the element/scale CTL keys (B-plane bases carry the
@@ -90,7 +64,7 @@ pub struct Blake3ColumnsView<T: Copy> {
     /// 0 elsewhere.
     pub cv_route_key_or_tweak: T,
     /// Packed MoE outer indices, `OUTER_INDEX_FIRST + 2^26 * OUTER_INDEX_SECOND` with each
-    /// index < 2^26. Selective pinning (the deployed chip's semantics): the word carries a
+    /// index < 2^26. Selective pinning: the word carries a
     /// nonzero index only in the *sampled* slots of routing rows
     /// ([`Blake3Program::routing_pins`](super::stark::Blake3Program)); unsampled neighbor
     /// slots and non-routing rows contribute zero, which the unconditional decomposition
@@ -104,10 +78,8 @@ pub struct Blake3ColumnsView<T: Copy> {
     /// As `word_pin_first` for the row's second ingested word.
     pub word_pin_second: T,
 
-    // ------------------------------------------------------------------------------------------
     // Main: committed unpack of ROW_FLAGS_PACKED (constraint 2). Individually usable in constraints
     // and lookup/CTL filters. Bit order = field order (see `NUM_UNPACK_FLAGS`).
-    // ------------------------------------------------------------------------------------------
     /// CV-source selector: keyed compression under `KEY_A` (the A-side/routing plane and its
     /// parents). Bit 0.
     pub is_use_key_a: T,
@@ -116,8 +88,7 @@ pub struct Blake3ColumnsView<T: Copy> {
     pub is_use_key_b: T,
     /// CV-source selector: `JACKPOT_KEY` (the lottery compression). Bit 2.
     pub is_use_jackpot_key: T,
-    /// CV-source selector: the BLAKE3 IV constants — the *unkeyed* compressions (the
-    /// commit-fold wrappers folding the plane roots into `HASH_A`/`HASH_B`). Bit 3.
+    /// CV-source selector: BLAKE3 IV for unkeyed compressions. Bit 3.
     pub is_use_iv: T,
     /// 1 on the A-side commit-fold wrapper's finalization row: binds `CV_OUT` to the `HASH_A`
     /// public limbs. Bit 4.
@@ -141,15 +112,13 @@ pub struct Blake3ColumnsView<T: Copy> {
     /// 1 on row 7 of every live compression: pins `BLAKE3_MSG_BUFFER = permute(BLAKE3_MSG)`
     /// (the message the compression actually consumed). Bit 10.
     pub is_last_round: T,
-    /// Message-source bits (bits 11..14), the **deployed chip's combinational encoding**
-    /// (`chip/blake3/logic.rs`): plane bytes = `100`, auxiliary/routing/lottery bytes = `011`,
-    /// CV window (`BLAKE3_MSG_BUFFER[8..16] = CV_IN`, parent child fetches) = `001`,
-    /// no load = `000`. The deployed jackpot mode `010` is outlawed by a constraint (the
-    /// lottery message arrives as auxiliary bytes + the XorFold CTL instead).
+    /// Message-source encoding: plane bytes `100`, auxiliary/routing/lottery bytes `011`,
+    /// CV window `001`, no load `000`. Mode `010` is forbidden; lottery words instead
+    /// arrive as auxiliary bytes bound by the XorFold channel.
     pub is_msg_bits: [T; 3],
     /// 1 on rows whose first ingested u32 word is pinned to `OUTER_INDEX_FIRST`: routing rows
-    /// where that slot holds a *sampled* entry (selective pinning, exactly the deployed
-    /// chip). Unsampled neighbor slots keep the selector down and their words free. Bit 14.
+    /// where that slot holds a sampled entry. Unsampled neighbor slots keep
+    /// the selector down and their words free. Bit 14.
     pub is_first_outer: T,
     /// As `is_first_outer` for the second ingested u32 word / `OUTER_INDEX_SECOND`. Bit 15.
     pub is_second_outer: T,
@@ -186,9 +155,7 @@ pub struct Blake3ColumnsView<T: Copy> {
     /// survives the Merkle-parent compressions interleaved between blocks. Bit 24.
     pub is_chain_data: T,
 
-    // ------------------------------------------------------------------------------------------
     // Main: witness data.
-    // ------------------------------------------------------------------------------------------
     /// First/second MoE outer index as 13-bit limb pairs (`value = limb0 + 2^13*limb1`),
     /// constrained against `MOE_OUTER_INDICES_PACKED` (constraint 6); each limb bounded
     /// < 2^13 by the **unfiltered** pair `RC16(limb)` + `RC16(8*limb)` (`super::ctl` — the
@@ -232,9 +199,9 @@ pub struct Blake3ColumnsView<T: Copy> {
     /// CV-routing lookup at key `CV_ROUTE_KEY_OR_TWEAK`); 0 off fetch rows.
     pub cv_in: [T; 8],
     /// The CV entering the compression: one-hot mux of `KEY_A` / `KEY_B` / `JACKPOT_KEY`
-    /// / `CV_IN` (constraint 3, the deployed mux plus the per-side key sources).
+    /// / `CV_IN` (constraint 3).
     pub blake3_cv: [T; 8],
-    /// The deployed round block: 4 tracked states of the G-function cascade (constraint 1);
+    /// Round states: 4 tracked states of the G-function cascade (constraint 1);
     /// `round[0]` is the row's input state (= the init state on `IS_NEW_BLAKE` rows).
     pub round: [Blake3StateCols<T>; NUM_TRACKED_STATES],
     /// The 8 output CV words: on finalization rows the compression output
@@ -246,10 +213,8 @@ pub struct Blake3ColumnsView<T: Copy> {
     pub cv_out_freq: T,
 }
 
-/// Total number of committed Blake3Stark columns.
 pub const NUM_BLAKE3_COLUMNS: usize = size_of::<Blake3ColumnsView<u8>>();
 
-// Committed-column count: 1164 (1156 main + 8 class (a)).
 const _: () = assert!(NUM_BLAKE3_COLUMNS == 1164);
 const _: () = assert!(BLAKE3_STATE_WIDTH == 264);
 
@@ -277,9 +242,7 @@ pub const NUM_BLAKE3_PUBLIC_INPUTS: usize = 64;
 
 columns_view!(Blake3ColumnsView, NUM_BLAKE3_COLUMNS, BLAKE3_COL_MAP);
 
-/// Number of leading class (a) ("known") columns: `ROW_FLAGS_PACKED..=WORD_PIN_SECOND`,
-/// recomputable from the program + public geometry alone (`Blake3Program::known_values`) and
-/// re-checked by the batch verifier against the trace openings.
+/// Number of leading verifier-known schedule columns.
 pub const NUM_BLAKE3_KNOWN_COLUMNS: usize = BLAKE3_COL_MAP.word_pin_second + 1;
 
 /// The 25 unpack-flag column indices in `ROW_FLAGS_PACKED` bit order (constraint 2's weights are
@@ -325,7 +288,6 @@ mod tests {
         for (i, &c) in as_array.iter().enumerate() {
             assert_eq!(c, i);
         }
-        // Class (a) columns come first (their indices will feed `preprocessed_indices`).
         assert_eq!(BLAKE3_COL_MAP.row_flags_packed, 0);
         assert_eq!(BLAKE3_COL_MAP.ctl_key_base, 1);
         assert_eq!(BLAKE3_COL_MAP.is_int8_message, 2);
@@ -334,7 +296,7 @@ mod tests {
         assert_eq!(BLAKE3_COL_MAP.moe_outer_indices_packed, 5);
         assert_eq!(BLAKE3_COL_MAP.word_pin_first, 6);
         assert_eq!(BLAKE3_COL_MAP.word_pin_second, 7);
-        // The unpack flags are consecutive after the class (a) block.
+        // The unpack flags are consecutive after the verifier-known block.
         let flags = unpack_flag_cols();
         for (j, &c) in flags.iter().enumerate() {
             assert_eq!(c, NUM_BLAKE3_KNOWN_COLUMNS + j, "unpack flag {j} not at its packing position");
@@ -342,7 +304,7 @@ mod tests {
         assert_eq!(BLAKE3_COL_MAP.cv_out_freq, NUM_BLAKE3_COLUMNS - 1);
         // The round block is 4 * 264 = 1056 contiguous columns.
         assert_eq!(
-            BLAKE3_COL_MAP.round[0].row1[0] + 4 * BLAKE3_STATE_WIDTH,
+            BLAKE3_COL_MAP.round[0].a_words[0] + 4 * BLAKE3_STATE_WIDTH,
             BLAKE3_COL_MAP.cv_out[0]
         );
     }
@@ -356,7 +318,7 @@ mod tests {
         let view: Blake3ColumnsView<u64> = arr.into();
         assert_eq!(view.row_flags_packed, 1);
         assert_eq!(view.uint8_data[0], BLAKE3_COL_MAP.uint8_data[0] as u64 * 3 + 1);
-        assert_eq!(view.round[2].row2[1][7], BLAKE3_COL_MAP.round[2].row2[1][7] as u64 * 3 + 1);
+        assert_eq!(view.round[2].b_bits[1][7], BLAKE3_COL_MAP.round[2].b_bits[1][7] as u64 * 3 + 1);
         assert_eq!(view.cv_out_freq, (NUM_BLAKE3_COLUMNS as u64 - 1) * 3 + 1);
         let back: [u64; NUM_BLAKE3_COLUMNS] = view.into();
         assert_eq!(back, arr);

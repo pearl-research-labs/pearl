@@ -1,101 +1,90 @@
-//! The canonical integer form of jackpot-policy check 4 (unpredictable summands) and its
-//! consensus budget — the shared rule enforced by the AIRs, `jackpot_policy.rs`, and the
-//! Python reference verifier.
+//! Integer summand scores and skip budgets shared by the FP8 AIRs and plaintext checks.
 //!
-//! # The check being implemented
+//! # Magnitudes and score
 //!
-//! Summand `(i, j, u)` is skippable iff `v_iju < ulp_Device(M_ij)^2`, where
+//! For each operand, the quantity to score is:
 //!
 //! ```text
-//! v_iju  = (au^2 + si^2) * (bu^2 + sj^2) / 2^21
-//! au     = alpha_i * x_iu      (exact: two bf16 values, 16-bit significand product)
-//! si     = DELTA * alpha_i * l2f_i = alpha_i * l2f_i / 2   (exact)
-//! ulp^2  = 2^(2*(e(M_ij) - W))                             (0 when M_ij = 0)
+//! S     = (alpha*x)^2 + sigma^2
+//! sigma = alpha*l2f/2
 //! ```
 //!
-//! and rejects the tile iff the skip count exceeds `eps_pred * k * h * w`. `e(x)` denotes
-//! `floor(log2 |x|)` and `W` is the B200 accumulation window ([`WINDOW_BITS`]). Summands
-//! with `au = si = 0` are outside the rule (never counted); in-scheme `si > 0` always.
-//!
-//! # The exact sum-of-squares rule (the consensus definition)
-//!
-//! Each summand magnitude `S = au^2 + si^2` is scored once, in base-2 logs at
-//! [`FRAC_BITS`]` = 6` fraction bits (unit `2^-6` octave). Every step is exact integer
-//! arithmetic — no floating point anywhere, so the rule is bit-stable across platforms.
-//!
-//! Write both squares over 16-bit normalized significands: `au = n_x * 2^(e_x - 15)` and
-//! `si = n_s * 2^(e_s - 15)` with `n_x, n_s in [2^15, 2^16)` (`n_x = 0` when `x = 0`).
-//! With `e_big = max(e_x, e_s)`, `g = 2*|e_x - e_s|`, and `(n_big, n_small)` the
-//! matching significand pair,
+//! Here `l2f` is the grid-rounded, floored row root mean square (RMS) used to derive
+//! the quantization scales. The products above are exact. Write the magnitudes as:
 //!
 //! ```text
-//! S = 2^(2*e_big - 30) * (n_big^2 + n_small^2 / 2^g).
+//! |alpha*x| = n_x * 2^(e_x - 15)
+//! sigma     = n_s * 2^(e_s - 15)
 //! ```
 //!
-//! The sum of squares, its top slice, and the lambda score are
+//! Nonzero significands lie in `[2^15, 2^16)`. For `x = 0`, `n_x = 0` and only
+//! sigma contributes. Order the pairs by exponent, so `e_big >= e_small`, and let
+//! `g = 2*(e_big - e_small)` be the exponent gap after squaring. Then:
 //!
 //! ```text
-//! V      = n_big^2 + floor(n_small^2 / 2^g)   if g <= 30, else n_big^2   (the far cut)
-//! kappa  = floor(V / 2^17)                    in [2^13, 2^16)
-//! lambda = 64*(2*e_big - 13 + SCORE_BIAS) + G(kappa),   G(kappa) = floor(64 * log2 kappa).
+//! S      = 2^(2*e_big - 30) * (n_big^2 + n_small^2 / 2^g)
+//! V      = n_big^2 + floor(n_small^2 / 2^g)
+//! kappa  = floor(V / 2^17)                          in [2^13, 2^16)
+//! lambda = 64*(2*e_big - 13 + SCORE_BIAS) + floor(64*log2(kappa))
 //! ```
 //!
-//! The `-13 = -(30 - 17)` is due to the initial left shift by 30 to compute `V`: we only
-//! shift back right by 17 to get `kappa`.
-//! The far cut is exact, not an approximation:
-//! `g` is even and `n_small^2 < 2^32 <= 2^g` there, so `V` equals the uncut sum on every
-//! gap; `x = 0` lands on it, scoring `si^2` alone. Every loss is a floor, so the error is
-//! one-sided:
+//! The correction `-13 = -30 + 17` converts kappa back to S's scale. For `g >= 32`,
+//! the smaller integer term is already zero because `n_small^2 < 2^32`.
+//!
+//! # Approximation error
+//!
+//! The two floors defining kappa are equivalent to flooring the exact scaled sum
+//! once. Since `kappa >= 2^13`, the loss in the logarithm is bounded. Including the
+//! final log floor, the total score loss is less than:
 //!
 //! ```text
-//! 64*(log2 S + SCORE_BIAS) - 1.1  <  lambda  <=  64*(log2 S + SCORE_BIAS)
+//! 1 + 64*log2(1 + 2^-13) < 1.1
 //! ```
 //!
-//! (the `kappa` truncation `< 2^-13` relative plus the final floor — under `1.1` units of
-//! `2^-6` octave in total, never above the true value).
-//!
-//! # The skip predicate
-//!
-//! With `E_CELL = e(M_ij) + 139` (`0` when `M_ij = 0`), substituting the scores into
-//! `v < ulp^2` and folding constants gives the consensus rule
+//! Consequently:
 //!
 //! ```text
-//! skip  <=>  E_CELL != 0  and  lambda_A + lambda_B < 128 * E_CELL + C
-//! C = 64*(21 + 2*SCORE_BIAS) - 128*(139 + W) = 45376 for B200,
+//! 64*(log2(S) + SCORE_BIAS) - 1.1 < lambda <= 64*(log2(S) + SCORE_BIAS)
 //! ```
 //!
-//! `21 = log2(2^21)` the denominator's log.
+//! # Skip threshold
 //!
-//! Both lambda floors err downward by less than `1.1` units, so the rule sits in a
-//! one-sided band around the ideal test: `v < ulp^2` always skips, and every rule skip has
-//! `v < ulp^2 * 2^(2.2/64)` — a 2.4% sliver above the ideal boundary. The rule itself, not
-//! the ideal test, is consensus.
+//! For a nonzero cell, let `M` be the maximum absolute product or partial accumulator
+//! value in its B200 replay. Its biased exponent is
+//! `E = cell_magnitude_exponent = floor(log2(M)) + 139`.
 //!
-//! # AIR wiring and soundness direction
-//!
-//! InputQuant commits the full score witness per element (normalized significands, the
-//! dominance bit, the gap, the far bit, both floor-division stages, `kappa`, and `lambda`);
-//! POW2D serves the two shift powers, LOG16 serves `G(kappa)`, and ScaleStark exports the
-//! sigma significand and encoding through the group tuple. Each Matmul lane commits a
-//! boolean skip flag; claiming *non-skip* costs one RC16 on the affine key
+//! The ideal real-valued test compares summand variance `v` with the square of the
+//! B200 accumulation-window spacing, denoted `ulp(M)` here:
 //!
 //! ```text
-//! LAMBDA_A + LAMBDA_B - 128*E_CELL - C,
+//! v      = S_A*S_B / 2^21
+//! ulp(M) = 2^(E - 139 - WINDOW_BITS)
+//! ideal skip iff v < ulp(M)^2
 //! ```
 //!
-//! filtered by `CELL_NONZERO * (1 - SKIP_FLAG)`; zero cells pin `SKIP_FLAG = 0` directly.
-//! A true skip's key is negative and wraps far outside `[0, 2^16)`, forcing the flag to 1.
-//! On satisfiable traces `lambda in [`[`LAMBDA_MIN_LIVE`]`, `[`LAMBDA_MAX`]`]` and nonzero
-//! cells have `E_CELL >= 121`, so honest non-skip keys stay below `2^16`. Claiming *skip*
-//! is free: a prover can only overstate the census (self-harm), never understate it.
-//! Inflating `M` is likewise monotone toward rejection.
+//! Expressing this threshold in the biased score units gives the implemented rule:
 //!
-//! # The budget
+//! ```text
+//! T = 64*(21 + 2*SCORE_BIAS) + 128*(E - 139 - WINDOW_BITS)
+//!   = 128*E + SKIP_THRESHOLD_OFFSET
+//! skip iff lambda_A + lambda_B < T
+//! ```
 //!
-//! The plaintext accepts iff `count as f64 <= eps_pred * k * (h*w)` — equivalently
-//! `count <= budget(k, h, w)` with [`budget`] the floor of that product (counts stay below
-//! `2^27 < 2^53`, so the integer comparison is exact). TamedStark exposes the budget as its
-//! `SKIP_LIMIT` public input and gates the imported per-cell census on its last row.
+//! Zero cells do not skip. Downward rounding gives the one-sided guarantee:
+//!
+//! ```text
+//! v < ulp(M)^2  =>  skip  =>  v < ulp(M)^2 * 2^(2.2/64)
+//! ```
+//!
+//! The integer rule defines acceptance, including the extra skips it may count
+//! near the ideal boundary.
+//!
+//! # Constraint ownership
+//!
+//! InputQuant proves the scores. For every claimed non-skip, Matmul range-checks
+//! the score sum minus the threshold. A prover may overcount skips, but cannot
+//! undercount them. A larger claimed magnitude also only increases the skip count.
+//! Tamed sums the cell counts and checks the public [`budget`].
 
 use crate::api::fp8::jackpot_policy::JackpotPolicy;
 
@@ -109,10 +98,8 @@ pub const FRAC_BITS: u32 = 6;
 /// smallest subnormal x). Live sums sit far higher: `S >= sigma^2 >= 2^-306`.
 pub const SCORE_BIAS: u64 = 508;
 
-/// Exponent gap at which the small addend is dropped from the sum of squares. Exact, not an
-/// approximation: the dropped term `floor(n_small^2 / 2^(2*gap))` is identically zero
-/// there, since `n_small^2 < 2^32 <= 2^(2*gap)` once the gap reaches 16. Keeps the
-/// per-stage shift key `|e_x - e_s|` inside POW2D's `[0, 19]` domain.
+/// Exponent gap where the smaller squared term becomes zero after alignment:
+/// `n_small^2 < 2^32 <= 2^(2*gap)`. Each division then needs at most a 15-bit shift.
 pub const FAR_GAP: u64 = 16;
 
 /// Smallest lambda on a live row: `x = 0` with `alpha` and `l2f` at their domain floors
@@ -131,12 +118,12 @@ pub const LAMBDA_MAX: u64 = 54_207;
 /// `kind::f8f6f4` significand minus 1.
 pub const WINDOW_BITS: u32 = 25;
 
-/// The skip threshold's additive constant: lane `(i, j, u)` skips iff `E_CELL != 0` and
-/// `lambda_A + lambda_B < 128 * E_CELL + SKIP_THRESHOLD_OFFSET`. This is the
+/// The skip threshold's additive constant: lane `(i, j, u)` skips iff `CELL_MAGNITUDE_EXPONENT != 0` and
+/// `lambda_A + lambda_B < 128 * CELL_MAGNITUDE_EXPONENT + SKIP_THRESHOLD_OFFSET`. This is the
 /// check's defining test `v < ulp^2` written in scores: `v = S_A * S_B / 2^21` and
-/// `ulp = 2^(e(M) - W)` with `e(M) = E_CELL - 139`, so the threshold is
-/// `64*(21 + 2*SCORE_BIAS) + 128*(E_CELL - 139 - W)` = 45376.
-// 21 = log2(2^21), the v denominator; 139 converts E_CELL back to e(M).
+/// `ulp = 2^(e(M) - W)` with `e(M) = CELL_MAGNITUDE_EXPONENT - 139`, so the threshold is
+/// `64*(21 + 2*SCORE_BIAS) + 128*(CELL_MAGNITUDE_EXPONENT - 139 - W)` = 45376.
+// 21 = log2(2^21), the v denominator; 139 converts CELL_MAGNITUDE_EXPONENT back to e(M).
 pub const SKIP_THRESHOLD_OFFSET: u64 = 64 * (21 + 2 * SCORE_BIAS) - 128 * (139 + WINDOW_BITS as u64);
 
 /// Bit length of a 16-bit significand product — the WIDTH16 LUT's first value column.
@@ -151,10 +138,8 @@ pub const fn sig_nonzero(sig_product: u64) -> u64 {
     (sig_product != 0) as u64
 }
 
-/// `ceil(2^(15 + i/64))` for `i in [0, 64)`: the exact integer decision bounds of the
-/// fractional part of [`log2_fixed`]. An integer `n in [2^15, 2^16)` satisfies
-/// `n >= LOG_BOUNDS[i]` iff `log2(n) >= 15 + i/64` (the bounds are never integers except
-/// at `i = 0`, with the nearest miss at distance 1.25e-2 — checked at 80-digit precision).
+/// `ceil(2^(15 + i/64))` for `i in [0, 64)`: integer thresholds used by [`log2_fixed`].
+/// For normalized n, crossing threshold i means `log2(n) >= 15 + i/64`.
 pub const LOG_BOUNDS: [u64; 64] = [
     32768, 33125, 33486, 33851, 34219, 34592, 34969, 35349, 35734, 36123, 36517, 36914, 37316, 37723, 38133, 38549, 38968, 39393,
     39822, 40255, 40694, 41137, 41585, 42038, 42495, 42958, 43426, 43899, 44377, 44860, 45348, 45842, 46341, 46846, 47356, 47872,
@@ -191,19 +176,19 @@ pub struct LambdaWitness {
     /// `2^near_gap` — the shared divisor of both floor stages.
     pub near_gap_pow: u64,
     /// The dominant addend's normalized significand, in `[2^15, 2^16)`.
-    pub norm_big: u64,
+    pub dominant_significand: u64,
     /// The other addend's normalized significand: `[2^15, 2^16)` or `0`.
-    pub norm_small: u64,
-    /// `floor(norm_small^2 / 2^near_gap)` — the first floor stage.
+    pub smaller_significand: u64,
+    /// `floor(smaller_significand^2 / 2^near_gap)` — the first floor stage.
     pub half_quotient: u64,
-    /// `norm_small^2 - half_quotient * near_gap_pow`, in `[0, near_gap_pow)`.
+    /// `smaller_significand^2 - half_quotient * near_gap_pow`, in `[0, near_gap_pow)`.
     pub half_remainder: u64,
-    /// `floor(norm_small^2 / 2^(2*near_gap))` — the second floor stage.
+    /// `floor(smaller_significand^2 / 2^(2*near_gap))` — the second floor stage.
     pub quotient: u64,
     /// `half_quotient - quotient * near_gap_pow`, in `[0, near_gap_pow)`.
     pub remainder: u64,
     /// `kappa = floor(V / 2^17)` for the sum of squares
-    /// `V = norm_big^2 + (1 - far) * quotient`; in `[2^13, 2^16)`.
+    /// `V = dominant_significand^2 + (1 - far) * quotient`; in `[2^13, 2^16)`.
     pub sum_of_squares_top: u64,
     /// `V - 2^17 * kappa`, in `[0, 2^17)`.
     pub sum_of_squares_rest: u64,
@@ -214,44 +199,49 @@ pub struct LambdaWitness {
     pub lambda: u64,
 }
 
-/// Evaluates the sum-of-squares rule on one summand. Inputs are the two addends' normalized
-/// significands and encodings: `|alpha*x| = x_norm * 2^(x_enc - 268 - 15)` (`x_norm` and
-/// `x_enc` both `0` when `x = 0`) and `sigma = sigma_norm * 2^(sigma_enc - 268 - 15)` with
-/// `x_norm, sigma_norm in [2^15, 2^16) ∪ {0}` and `enc(y) = floor(log2 y) + 268`
-/// (`268 = 2*134`, one bf16 exponent bias per factor).
-pub fn lambda_witness(x_norm: u64, x_enc: u64, sigma_norm: u64, sigma_enc: u64) -> LambdaWitness {
-    debug_assert!((1 << 15..1 << 16).contains(&sigma_norm), "sigma is never zero in-scheme");
-    debug_assert!(x_norm == 0 || (1 << 15..1 << 16).contains(&x_norm));
-    debug_assert_eq!(x_norm == 0, x_enc == 0);
-    let x_dominates = x_enc >= sigma_enc && x_norm != 0;
-    let exponent_gap = x_enc.abs_diff(sigma_enc);
+/// Builds a score witness from normalized significands and biased exponents.
+/// - `scaled_*` describes |alpha*x|; both fields are zero for x = 0.
+/// - The sigma significand is in [2^15, 2^16); sigma is positive.
+/// For either nonzero addend, value = significand * 2^(biased_exponent - 283),
+/// where 283 = exponent bias 268 + normalization shift 15.
+pub fn lambda_witness(
+    scaled_significand: u64,
+    scaled_biased_exponent: u64,
+    normalized_sigma_significand: u64,
+    sigma_biased_exponent: u64
+) -> LambdaWitness {
+    debug_assert!((1 << 15..1 << 16).contains(&normalized_sigma_significand), "sigma is never zero in-scheme");
+    debug_assert!(scaled_significand == 0 || (1 << 15..1 << 16).contains(&scaled_significand));
+    debug_assert_eq!(scaled_significand == 0, scaled_biased_exponent == 0);
+    let x_dominates = scaled_biased_exponent >= sigma_biased_exponent && scaled_significand != 0;
+    let exponent_gap = scaled_biased_exponent.abs_diff(sigma_biased_exponent);
     let gap_is_far = exponent_gap >= FAR_GAP;
     let near_gap = if gap_is_far { 0 } else { exponent_gap };
     let near_gap_pow = 1u64 << near_gap;
-    let (norm_big, norm_small) = if x_dominates {
-        (x_norm, sigma_norm)
+    let (dominant_significand, smaller_significand) = if x_dominates {
+        (scaled_significand, normalized_sigma_significand)
     } else {
-        (sigma_norm, x_norm)
+        (normalized_sigma_significand, scaled_significand)
     };
-    let small_squared = norm_small * norm_small;
+    let small_squared = smaller_significand * smaller_significand;
     let half_quotient = small_squared >> near_gap;
     let half_remainder = small_squared - (half_quotient << near_gap);
     let quotient = half_quotient >> near_gap;
     let remainder = half_quotient - (quotient << near_gap);
-    let sum_of_squares = norm_big * norm_big + if gap_is_far { 0 } else { quotient };
+    let sum_of_squares = dominant_significand * dominant_significand + if gap_is_far { 0 } else { quotient };
     let sum_of_squares_top = sum_of_squares >> 17;
     let sum_of_squares_rest = sum_of_squares & ((1 << 17) - 1);
     debug_assert!((1 << 13..1 << 16).contains(&sum_of_squares_top));
     let log_fraction = log2_fixed(sum_of_squares_top);
-    let lambda = 128 * x_enc.max(sigma_enc) - 2624 + log_fraction;
+    let lambda = 128 * scaled_biased_exponent.max(sigma_biased_exponent) - 2624 + log_fraction;
     LambdaWitness {
         x_dominates,
         exponent_gap,
         gap_is_far,
         near_gap,
         near_gap_pow,
-        norm_big,
-        norm_small,
+        dominant_significand,
+        smaller_significand,
         half_quotient,
         half_remainder,
         quotient,
@@ -283,7 +273,7 @@ pub fn lambda(alpha: u16, x: u16, l2f: u16) -> u64 {
     let (x_e, x_m) = bf16_e_star_m(x);
     let product = alpha_m * x_m;
     let width = sig_width(product);
-    let (x_norm, x_enc) = if x_m == 0 {
+    let (scaled_significand, scaled_biased_exponent) = if x_m == 0 {
         (0, 0)
     } else {
         // |alpha*x| = product * 2^(alpha_e + x_e - 268), so enc = e + 268 = alpha_e + x_e - 1 + width.
@@ -293,17 +283,16 @@ pub fn lambda(alpha: u16, x: u16, l2f: u16) -> u64 {
     assert!(l2f_m >= 128, "l2f must be normal (the 2^-32 norm floor)");
     let sigma_product = alpha_m * l2f_m;
     let sigma_wide = u64::from(sigma_product >= 1 << 15);
-    let sigma_norm = sigma_product << (1 - sigma_wide);
+    let normalized_sigma_significand = sigma_product << (1 - sigma_wide);
     // sigma = sigma_product * 2^(alpha_e + l2f_e - 269), so e(sigma) sits 14 + sigma_wide
     // above that scale and enc(sigma) = e + 268 = alpha_e + l2f_e + sigma_wide + 13.
-    let sigma_enc = alpha_e + l2f_e + sigma_wide + 13;
-    lambda_witness(x_norm, x_enc, sigma_norm, sigma_enc).lambda
+    let sigma_biased_exponent = alpha_e + l2f_e + sigma_wide + 13;
+    lambda_witness(scaled_significand, scaled_biased_exponent, normalized_sigma_significand, sigma_biased_exponent).lambda
 }
 
-/// The cell anchor `E_CELL = e(M) + 139` of a plaintext replay magnitude, `0` when
-/// `M = 0`. `M` is always an exact sum of bf16-product magnitudes, so it is f64-normal
-/// and its exponent is exact. A nonzero `M` is a multiple of the fp8 product grid
-/// `2^-9 * 2^-9 = 2^-18`, so `E_CELL >= -18 + 139 = 121 > 0`.
+/// Returns floor(log2(M)) + 139 for a nonzero replay magnitude, or zero for M = 0.
+/// A nonzero FP8 cell contains a product of at least 2^-18, so its maximum replay
+/// magnitude has biased exponent at least 121. The f64 exponent extraction is exact.
 pub fn cell_exponent(m: f64) -> u64 {
     if m == 0.0 {
         return 0;
@@ -313,13 +302,14 @@ pub fn cell_exponent(m: f64) -> u64 {
     (biased as i64 - 1023 + 139) as u64
 }
 
-/// The canonical skip predicate: skip iff the cell is nonzero, both summand halves exist,
-/// and `lambda_a + lambda_b < 128 * e_cell + SKIP_THRESHOLD_OFFSET` — exactly the
-/// sign whose opposite the AIR's per-lane non-skip range check proves. A zero lambda means
-/// the half is literally zero (`x = 0` and `sigma = 0`, outside the scheme): such summands
-/// are never counted.
-pub fn skip(lambda_a: u64, lambda_b: u64, e_cell: u64) -> bool {
-    e_cell != 0 && lambda_a != 0 && lambda_b != 0 && lambda_a + lambda_b < 128 * e_cell + SKIP_THRESHOLD_OFFSET
+/// Skips a nonzero cell's summand when the two scores sum to less than
+/// `128*cell_magnitude_exponent + SKIP_THRESHOLD_OFFSET`.
+/// Zero scores represent absent summand halves and are excluded.
+pub fn skip(summand_score_a: u64, summand_score_b: u64, cell_magnitude_exponent: u64) -> bool {
+    cell_magnitude_exponent != 0
+        && summand_score_a != 0
+        && summand_score_b != 0
+        && summand_score_a + summand_score_b < 128 * cell_magnitude_exponent + SKIP_THRESHOLD_OFFSET
 }
 
 /// The consensus skip budget: the largest count the plaintext comparison
@@ -396,13 +386,13 @@ mod tests {
             (50000, 150, 40000, 400),
             (33000, 436, 65535, 435),
         ];
-        for (x_norm, x_enc, sigma_norm, sigma_enc) in cases {
-            let w = lambda_witness(x_norm, x_enc, sigma_norm, sigma_enc);
-            let gap = x_enc.abs_diff(sigma_enc);
-            let (big, small) = if x_enc >= sigma_enc && x_norm != 0 {
-                (x_norm, sigma_norm)
+        for (scaled_significand, scaled_biased_exponent, normalized_sigma_significand, sigma_biased_exponent) in cases {
+            let w = lambda_witness(scaled_significand, scaled_biased_exponent, normalized_sigma_significand, sigma_biased_exponent);
+            let gap = scaled_biased_exponent.abs_diff(sigma_biased_exponent);
+            let (big, small) = if scaled_biased_exponent >= sigma_biased_exponent && scaled_significand != 0 {
+                (scaled_significand, normalized_sigma_significand)
             } else {
-                (sigma_norm, x_norm)
+                (normalized_sigma_significand, scaled_significand)
             };
             let v = if gap >= FAR_GAP {
                 big * big
@@ -414,7 +404,7 @@ mod tests {
             assert_eq!(w.half_quotient, (small * small) >> w.near_gap);
             assert_eq!(w.quotient, (small * small) >> (2 * w.near_gap));
             assert!(w.half_remainder < w.near_gap_pow && w.remainder < w.near_gap_pow);
-            assert_eq!(w.lambda, 128 * x_enc.max(sigma_enc) - 2624 + log2_fixed(v >> 17));
+            assert_eq!(w.lambda, 128 * scaled_biased_exponent.max(sigma_biased_exponent) - 2624 + log2_fixed(v >> 17));
         }
     }
 
@@ -449,9 +439,9 @@ mod tests {
     fn the_sum_of_squares_matches_the_uncut_form_on_every_gap() {
         let mut live_quotients = 0u64;
         for gap in 0..=20 {
-            for (x_norm, sigma_norm) in [(1 << 15, 65535), (40000, 50000), (65535, 1 << 15), (33000, 60000)] {
-                let w = lambda_witness(x_norm, 300, sigma_norm, 300 - gap);
-                let uncut = x_norm * x_norm + ((sigma_norm * sigma_norm) >> (2 * gap));
+            for (scaled_significand, normalized_sigma_significand) in [(1 << 15, 65535), (40000, 50000), (65535, 1 << 15), (33000, 60000)] {
+                let w = lambda_witness(scaled_significand, 300, normalized_sigma_significand, 300 - gap);
+                let uncut = scaled_significand * scaled_significand + ((normalized_sigma_significand * normalized_sigma_significand) >> (2 * gap));
                 assert_eq!(w.lambda, 128 * 300 - 2624 + log2_fixed(uncut >> 17), "gap {gap}");
                 live_quotients += u64::from(!w.gap_is_far && w.quotient != 0);
             }
@@ -469,7 +459,7 @@ mod tests {
             SKIP_THRESHOLD_OFFSET,
             64 * (21 + 2 * SCORE_BIAS) - 128 * (139 + u64::from(WINDOW_BITS))
         );
-        // Nonzero cells have E_CELL >= 121 (e(M) >= -18); the largest satisfiable
+        // Nonzero cells have CELL_MAGNITUDE_EXPONENT >= 121 (e(M) >= -18); the largest satisfiable
         // non-skip key must stay inside the RC16 range.
         const {
             assert!(2 * LAMBDA_MAX - 128 * 121 - SKIP_THRESHOLD_OFFSET < 1 << 16);
@@ -499,8 +489,8 @@ mod tests {
                 let sj = 0.5 * bf16_to_f32(ab) as f64 * bf16_to_f32(l2b) as f64;
                 let v = (au * au + si * si) * (bu * bu + sj * sj) / 2097152.0; // 2^21
                 for &m in &anchors {
-                    let e_cell = cell_exponent(m);
-                    let int_skip = skip(la, lb, e_cell);
+                    let cell_magnitude_exponent = cell_exponent(m);
+                    let int_skip = skip(la, lb, cell_magnitude_exponent);
                     let ulp_sq = if m == 0.0 {
                         0.0
                     } else {
@@ -532,7 +522,7 @@ mod tests {
     #[test]
     fn lambda_min_is_attained_at_the_domain_floor() {
         // alpha = 2^-120 (exp field 7), x = 0, l2f = 2^-32 (exp field 95): sigma alone,
-        // sigma_norm = 2^15, sigma_enc = 115, sum of squares 2^30, kappa 2^13.
+        // normalized_sigma_significand = 2^15, sigma_biased_exponent = 115, sum of squares 2^30, kappa 2^13.
         assert_eq!(lambda(7 << 7, 0, 95 << 7), LAMBDA_MIN_LIVE);
     }
 

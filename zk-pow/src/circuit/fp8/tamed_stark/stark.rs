@@ -1,58 +1,75 @@
-//! TamedStark: jackpot check 3 — the tamed-products count — and the check 4 budget gate.
+//! Per-cell tamed certificates and the tile's untamed and skip budgets.
 //!
-//! One row per tile cell `(i, j)`. The row imports the cell's replay-magnitude binade
-//! `E_CELL = floor(log2 M_ij) + 139` and its skip census `CELL_SKIPS` from Matmul (E_CELL is
-//! 0 only for an all-zero cell; M13/MB13 prove E_CELL bounds every product's and partial
-//! sum's binade) and the two exact noise stds `sigma = SIG * 2^(EXP - 2048)` from Scale,
-//! and decides the untamed predicate
+//! # Imported values and the tamed condition
 //!
-//! ```text
-//! UNTAMED(i,j)  <=>  2^(2*e_M) > tau_tame^2 * k * (sigma_A * sigma_B)^2
-//! ```
+//! Matmul supplies each cell's skip count and an upper bound on its replay-magnitude
+//! exponent. For nonzero magnitude `M`, the true exponent is `floor(log2(M))`.
+//! Write the claimed bound as `e_M = cell_magnitude_exponent - 139`; zero cells
+//! use the sentinel `cell_magnitude_exponent = 0`.
 //!
-//! exactly over the reals, mirroring the plaintext `jackpot_policy::untamed_exact`. The
-//! policy freezes `tau_tame = 128`, so `tau_tame^2 = 2^14` moves to the exponent side of
-//! the comparison (`FRAME_GAP_OFFSET`) and only `K = k <= 2^16` rides the proof as a public
-//! input. The AIR is one-sided: a committed `UNTAMED = 0` activates the *tamed certificate*
+//! Scale supplies the row and column noise scales in the form:
 //!
 //! ```text
-//! 2^A <= Y,   Y = K * PP^2,   PP = SIG_A * SIG_B,
+//! sigma_A = SIG_A * 2^(E_A - 2048)
+//! sigma_B = SIG_B * 2^(E_B - 2048)
+//! 0 <= SIG_A, SIG_B < 2^16
 //! ```
 //!
-//! with `2^A` the XFPOW2 saturating power of the doubled frame gap with the tau fold,
-//! `D = 2*(e_M - e_A - e_B - 7)` (`A = min(max(D, 0), 80)`; since `Y < 2^80`, saturation
-//! never changes the verdict). `UNTAMED = 1` rows prove nothing, so the count can only be
-//! *overstated* — and the J6 gate `RUNNING_UNTAMED <= TAME_LIMIT` on the last row makes
-//! overstating useless. An all-zero cell (`M = 0`) is tamed by definition and skips the
-//! certificate through `CELL_IS_ZERO` (J1 pins `CELL_IS_ZERO * E_CELL = 0`), since the
-//! certificate would demand `Y >= 2^A > 0`. Completeness: the imported `E_CELL` is the
-//! binade of the plaintext `M_ij`, so the certificate is satisfiable exactly on the
-//! plaintext-tamed nonzero cells.
+//! A nonzero cell claimed tamed must prove the squared policy condition:
 //!
-//! Constraint groups (lookups live in `super::ctl`):
+//! ```text
+//! 2^(2*e_M) <= tau_tame^2 * k * (sigma_A*sigma_B)^2
+//! ```
 //!
-//! - **J1 (verdict):** `UNTAMED` and `CELL_IS_ZERO` boolean and mutually exclusive (the gate
-//!   `1 - UNTAMED - CELL_IS_ZERO` stays boolean), `UNTAMED` pinned 0 on pads,
-//!   `CELL_IS_ZERO * E_CELL = 0`; `RUNNING_UNTAMED` anchored on the first row and
-//!   accumulated by transition.
-//! - **J2 (product):** `PP = SIG_A*SIG_B` split into an RC16'd limb pair (both factors are
-//!   import-bound below 2^16, so the split is exact over Z).
-//! - **J3 (bound build):** `W = K*PP` via the two partial products `K*PP_LO/HI` (each
-//!   < 2^32: two RC16'd limbs) and a digit-aligned add; then `Y = W*PP` by base-2^16
-//!   schoolbook positions with 17-bit carries. Every position equation is exact over Z
-//!   (all terms < 2^34 << p), so the digits are the unique base-2^16 representation.
-//! - **J4 (left side):** none in-AIR — `2^A`'s digits are the XFPOW2-bound one-hot limbs.
-//! - **J5 (comparison):** a digit-wise borrow chain over the six positions, RC16'd keys,
-//!   no borrow out of the top digit — `2^A <= Y` exactly.
-//! - **J7 (skip budget, jackpot check 4):** `CELL_SKIPS` pinned 0 on pads; `RUNNING_SKIPS`
-//!   anchored and accumulated like `RUNNING_UNTAMED`; on the last row
-//!   `SKIP_LIMIT - RUNNING_SKIPS` recomposes from its two RC16'd slack limbs, i.e. lies in
-//!   `[0, 2^32)`. The imported census can only overstate the true skippable count (Matmul's
-//!   M15/MB15), so an accepted proof implies the honest census is within budget.
+//! Equality is tamed. The circuit fixes `tau_tame = 256`, so `tau_tame^2 = 2^16`
+//! can be moved into the exponent on the left. With `E_M = cell_magnitude_exponent`:
 //!
-//! All J2-J5 equations are gated by `1 - UNTAMED - CELL_IS_ZERO`. Pad rows keep the gate
-//! active with all-zero imports and witnesses (`2^0` has zero limbs there — the XFPOW2
-//! lookup is filtered off, and `0 <= 0` digit-wise), so padding needs no extra machinery.
+//! ```text
+//! FRAME_GAP_OFFSET = 2*2048 - 139 - 16/2 = 3949
+//! D = 2*(E_M - E_A - E_B + FRAME_GAP_OFFSET)
+//! Y = k*(SIG_A*SIG_B)^2
+//!
+//! certificate: 2^D <= Y
+//! ```
+//!
+//! Since `k <= 2^16`, the integer bound is `Y < 2^16*(2^32)^2 = 2^80`.
+//! The native policy helper retains `tau_tame^2` in its integer right-hand side
+//! to support custom thresholds; its larger bound applies to that different expression.
+//!
+//! # Bounded integer certificate (J2–J5)
+//!
+//! XFPOW2 supplies `2^A`, where `A = min(max(D, 0), 80)`. Clamping the exponent
+//! preserves the comparison against the nonnegative integer `Y`:
+//!
+//! - If `D <= 0`, every positive `Y` passes both comparisons.
+//! - If `0 < D < 80`, the exponent is unchanged.
+//! - If `D >= 80`, every `Y < 2^80` fails both comparisons.
+//! - `Y = 0` fails for every exponent.
+//!
+//! The certificate splits `SIG_A*SIG_B` into 16-bit limbs and computes `Y` by
+//! schoolbook multiplication. A borrow chain then proves `2^A <= Y`.
+//! Range checks keep each multiplication-position sum below `2^34`, so the
+//! field equations also hold over the integers.
+//!
+//! # Flags and tile budgets (J1, J6–J7)
+//!
+//! J1 makes the untamed and zero-cell flags boolean and mutually exclusive.
+//! A zero-cell claim requires the imported magnitude exponent to be zero.
+//! Every other cell either supplies a tamed certificate or increments the untamed count.
+//!
+//! J6 and J7 accumulate the counts and enforce the public budgets on the last row:
+//!
+//! ```text
+//! untamed_total <= floor(eps_tame * h * w)
+//! skip_total   <= floor(eps_pred * k * h * w)
+//! ```
+//!
+//! A prover may overcount untamed cells or skips, but cannot undercount them.
+//! Larger claimed magnitude bounds only make acceptance harder.
+//!
+//! Padding imports no data and adds zero to both counts. Its certificate limbs
+//! are zero, and the power lookup is disabled. [`super::ctl`] declares the import
+//! channels, limb range checks and final budget checks.
 
 use core::borrow::{Borrow, BorrowMut};
 use core::marker::PhantomData;
@@ -82,21 +99,16 @@ use crate::circuit::utils::symbolic_evaluator::SymbolicEvaluator;
 const LIMB: u64 = 1 << 16;
 const MASK: u64 = LIMB - 1;
 
-/// `log2(tau_tame^2) = 14`: the policy's `tau_tame = 128` makes the tamed threshold's tau
-/// factor a power of two, folded into the exponent side of the comparison instead of the
-/// `Y` build (`TamedProgram::k` asserts the policy still matches).
+/// Fixed log2(tau_tame^2), absorbed into the comparison exponent.
+/// `TamedProgram::k` checks that the policy matches this constant.
 pub(crate) const TAU_TAME_SQ_LOG2: i64 = 16;
 
-/// The halved shift of the squared comparison, folding every bias and the tau fold into one
-/// constant:
-/// `D/2 = e_M - e_A - e_B - 7 = (E_CELL - 139) - (SA - 2048) - (SB - 2048) - 14/2
-///      = E_CELL - SA - SB + 3950`.
-/// The XFPOW2 key adds the table's zero point on top (`super::ctl`).
+/// Bias/tau adjustment for half the comparison exponent:
+/// `D/2 = cell_magnitude_exponent - sigma_a_exp - sigma_b_exp + FRAME_GAP_OFFSET`.
+/// The XFPOW2 lookup adds its own key zero point.
 pub(crate) const FRAME_GAP_OFFSET: i64 = 2 * 2048 - (BINADE_BIAS as i64) - TAU_TAME_SQ_LOG2 / 2;
 
-// ==================================================================================================
 // Program and trace generation
-// ==================================================================================================
 
 /// The public geometry of one tamed-products check: `h * w` cells over inner dimension `k`.
 /// The structural columns (cell id, the two sigma group keys, the last-row and pad flags) are
@@ -121,15 +133,12 @@ impl TamedProgram {
         (self.h * self.w).next_power_of_two()
     }
 
-    /// The inner dimension `k` — the `K` public input. The untamed threshold is
-    /// `tau_tame^2 * k * PP^2` with `tau_tame^2 = 128^2 = 2^14` folded into the XFPOW2
-    /// shift (`FRAME_GAP_OFFSET`), so only `k` rides the proof; the assert pins the frozen
-    /// policy the fold assumes (`2^16` bounds `k`, the width every J3 cap assumes).
+    /// Checks k <= 2^16 and the fixed tau assumption used by the limb bounds and exponent shift.
     fn k(&self) -> u64 {
         let policy = JackpotPolicy::default();
         assert!(
             policy.tau_tame * policy.tau_tame == (1u64 << TAU_TAME_SQ_LOG2) as f64,
-            "the circuit freezes tau_tame^2 = 2^14 (folded into the XFPOW2 shift)"
+            "tau_tame^2 must match the fixed XFPOW2 exponent offset"
         );
         assert!(self.k <= 1 << 16, "k must be at most 2^16");
         self.k as u64
@@ -164,16 +173,11 @@ impl TamedProgram {
         pis
     }
 
-    /// Generates the TamedStark trace and public inputs. `cells` is one
-    /// `(E_CELL, CELL_SKIPS)` tuple per cell in row-major cell order — the exact tuples
-    /// Matmul's E-cell channel exports (`E_CELL = floor(log2 M) + 139`, sentinel 0 for
-    /// all-zero cells; `CELL_SKIPS` the cell's skip census); `sigma_a` / `sigma_b` are the
-    /// per-tile-row/-column `(SIG, EXP)` frames of Scale's sigma channel, exponents biased
-    /// by 2048.
-    ///
-    /// Panics on a policy-rejected witness (untamed count above the allowance, or skip
-    /// census above the budget) — the J6/J7 gates have no satisfying row, so a prover has
-    /// no business tracing it.
+    /// Generates the trace and public inputs.
+    /// - `cells`: row-major `(magnitude_exponent, skip_count)` tuples from Matmul;
+    /// - `sigma_a`, `sigma_b`: row/column `(significand, exponent)` frames from Scale,
+    ///   with exponents biased by 2048.
+    /// Panics if the untamed or skip count exceeds its budget.
     pub fn generate_trace<F: RichField>(
         &self,
         cells: &[(u64, u64)],
@@ -190,7 +194,7 @@ impl TamedProgram {
         let mut rows: Vec<[F; NUM_TAMED_COLUMNS]> = Vec::with_capacity(num_rows);
         let mut running = 0u64;
         let mut running_skips = 0u64;
-        for (cell, &(e_cell, skips)) in cells.iter().enumerate() {
+        for (cell, &(cell_magnitude_exponent, skips)) in cells.iter().enumerate() {
             let (i, j) = (cell / w, cell % w);
             let (sa, sb) = (sigma_a[i], sigma_b[j]);
             running_skips += skips;
@@ -199,7 +203,7 @@ impl TamedProgram {
                 a_group_key: F::from_canonical_usize((i + 1) * self.k - 1),
                 b_group_key: F::from_canonical_usize(h * self.k + (j + 1) * self.k - 1),
                 is_last_row: F::from_bool(cell == num_rows - 1),
-                e_cell: F::from_canonical_u64(e_cell),
+                cell_magnitude_exponent: F::from_canonical_u64(cell_magnitude_exponent),
                 sigma_a_significand: F::from_canonical_u64(sa.0),
                 sigma_a_exp: F::from_canonical_u64(sa.1),
                 sigma_b_significand: F::from_canonical_u64(sb.0),
@@ -208,13 +212,13 @@ impl TamedProgram {
                 running_skips: F::from_canonical_u64(running_skips),
                 ..TamedColumnsView::default()
             };
-            if untamed(k, e_cell, sa, sb) {
+            if untamed(k, cell_magnitude_exponent, sa, sb) {
                 running += 1;
                 v.untamed = F::ONE;
-            } else if e_cell == 0 {
+            } else if cell_magnitude_exponent == 0 {
                 v.cell_is_zero = F::ONE; // M = 0: tamed by definition, certificate skipped.
             } else {
-                fill_certificate(&mut v, k, e_cell, sa, sb);
+                fill_certificate(&mut v, k, cell_magnitude_exponent, sa, sb);
             }
             v.running_untamed = F::from_canonical_u64(running);
             rows.push(v.into());
@@ -251,11 +255,7 @@ impl TamedProgram {
         (rows, self.public_inputs())
     }
 
-    /// The class (a) ("known") column values — the leading [`NUM_TAMED_KNOWN_COLUMNS`] trace
-    /// columns in their `columns.rs` order (`cell_id`, `a_group_key`, `b_group_key`,
-    /// `is_last_row`, `is_pad`), pure functions of the program geometry. Bit-exact with
-    /// [`Self::generate_trace`]'s fill; the batch verifier recomputes exactly this and checks
-    /// the trace openings against it (`starky`'s `BatchKnownColumns`).
+    /// Recomputes the leading schedule columns in trace order from public geometry.
     pub fn known_values<F: RichField>(&self) -> Vec<PolynomialValues<F>> {
         let num_rows = self.num_rows();
         let live = self.h * self.w;
@@ -278,24 +278,19 @@ impl TamedProgram {
     }
 }
 
-/// The untamed predicate on the exact imported values —
-/// `2^(2*e_M) > tau_tame^2 * k * (sigma_A*sigma_B)^2` over the reals — mirroring
-/// `jackpot_policy::untamed_exact` at the frozen `tau_tame^2 = 2^14`, which moves to the
-/// exponent side: `2^D > Y` with `D` the tau-folded doubled frame gap and `Y = k * PP^2`
-/// (`< 2^80`, u128-exact; the left side is a pure power of two, so the comparison is one
-/// bit-length test).
-fn untamed(k: u64, e_cell: u64, sa: Frame, sb: Frame) -> bool {
+/// Exact comparison `2^D > k*(SIG_A*SIG_B)^2`, with tau folded into D.
+/// The right side fits u128; a bit-length test compares it against the power of two.
+fn untamed(k: u64, cell_magnitude_exponent: u64, sa: Frame, sb: Frame) -> bool {
     let pp = sa.0 * sb.0;
     if k == 0 || pp == 0 {
-        return e_cell != 0; // bound = 0: untamed iff M > 0
+        return cell_magnitude_exponent != 0; // bound = 0: untamed iff M > 0
     }
-    if e_cell == 0 {
+    if cell_magnitude_exponent == 0 {
         return false; // M = 0, bound > 0
     }
     let y = u128::from(k) * u128::from(pp) * u128::from(pp);
-    // 2^D > Y at the tau-folded doubled frame gap (the biases and the 2^14 collapse to
-    // FRAME_GAP_OFFSET); 2^D > Y <=> D >= bitlen(Y) for Y > 0.
-    let d = 2 * (e_cell as i64 - sa.1 as i64 - sb.1 as i64 + FRAME_GAP_OFFSET);
+    // For Y > 0, `2^D > Y` iff D >= bit_length(Y).
+    let d = 2 * (cell_magnitude_exponent as i64 - sa.1 as i64 - sb.1 as i64 + FRAME_GAP_OFFSET);
     d >= i64::from(128 - y.leading_zeros())
 }
 
@@ -303,23 +298,23 @@ fn untamed(k: u64, e_cell: u64, sa: Frame, sb: Frame) -> bool {
 /// schoolbook digits of `Y = K * PP^2`, the one-hot limbs of `2^A`, and the borrow chain
 /// proving `2^A <= Y`. Panics if the cell is in fact untamed (the caller decides the
 /// verdict first).
-fn fill_certificate<F: RichField>(v: &mut TamedColumnsView<F>, k: u64, e_cell: u64, sa: Frame, sb: Frame) {
+fn fill_certificate<F: RichField>(v: &mut TamedColumnsView<F>, k: u64, cell_magnitude_exponent: u64, sa: Frame, sb: Frame) {
     let f = F::from_canonical_u64;
 
-    // ---- J2: the sigma product's limb split. ----
+    // J2: the sigma product's limb split.
     let pp = sa.0 * sb.0;
     let (pp_lo, pp_hi) = (pp & MASK, pp >> 16);
     v.sigma_product_limbs = [f(pp_lo), f(pp_hi)];
 
-    // ---- J3: W = K * PP (digits e), then Y = W * PP (digits y). ----
+    // J3: W = K * PP (digits e), then Y = W * PP (digits y).
     let limb2 = |x: u64| [x & MASK, x >> 16];
     let (kl, kh) = (limb2(k * pp_lo), limb2(k * pp_hi));
-    v.k_pp_lo_partial = kl.map(f);
-    v.k_pp_hi_partial = kh.map(f);
+    v.k_sigma_product_lo = kl.map(f);
+    v.k_sigma_product_hi = kh.map(f);
     let s = kl[1] + kh[0];
     let (w1, carry) = (s & MASK, s >> 16);
-    v.k_pp_mid_limbs[0] = f(w1);
-    v.k_pp_carries[0] = f(carry);
+    v.k_sigma_product_middle_limbs[0] = f(w1);
+    v.k_sigma_product_carries[0] = f(carry);
     let e = [kl[0], w1, kh[1] + carry];
 
     let mut y = [0u64; COMPARISON_DIGITS];
@@ -344,14 +339,14 @@ fn fill_certificate<F: RichField>(v: &mut TamedColumnsView<F>, k: u64, e_cell: u
     }
     v.bound_top = f(y[COMPARISON_DIGITS - 2]);
 
-    // ---- J4: the saturated one-hot power 2^A. ----
-    let d = 2 * (e_cell as i64 - sa.1 as i64 - sb.1 as i64 + FRAME_GAP_OFFSET);
+    // J4: the saturated one-hot power 2^A.
+    let d = 2 * (cell_magnitude_exponent as i64 - sa.1 as i64 - sb.1 as i64 + FRAME_GAP_OFFSET);
     let a = (d.max(0) as u64).min(XFPOW2_CAP);
     let mut a_limbs = [0u64; XFPOW2_LIMBS];
     a_limbs[(a / 16) as usize] = 1 << (a % 16);
-    v.shift_a_limbs = a_limbs.map(f);
+    v.comparison_power_limbs = a_limbs.map(f);
 
-    // ---- J5: the borrow chain of Y - 2^A over the six digits. ----
+    // J5: the borrow chain of Y - 2^A over the six digits.
     let mut borrow = 0u64;
     for pos in 0..COMPARISON_DIGITS - 1 {
         let need = a_limbs[pos] + borrow;
@@ -364,9 +359,7 @@ fn fill_certificate<F: RichField>(v: &mut TamedColumnsView<F>, k: u64, e_cell: u
     );
 }
 
-// ==================================================================================================
 // Constraints, written once against the generic `Evaluator`
-// ==================================================================================================
 
 /// Evaluates every arithmetic constraint of TamedStark. Lookup-borne facts (LUT oracle,
 /// import channels) are *not* emitted here — see the module docs and
@@ -401,15 +394,15 @@ where
         eval.sub(sum, split)
     };
 
-    // ---- J1 — the verdict bits and the running count. ----
+    // J1 — the verdict bits and the running count.
     eval.constraint_bool(lv.untamed);
     eval.constraint_bool(lv.cell_is_zero);
     // Mutual exclusion keeps the gate (and the XFPOW2 filter) boolean-valued.
     let both = eval.mul(lv.untamed, lv.cell_is_zero);
     eval.constraint(both);
-    // CELL_IS_ZERO * E_CELL = 0: only an all-zero cell (E_CELL = 0, by Matmul's M13) may
+    // CELL_IS_ZERO * CELL_MAGNITUDE_EXPONENT = 0: only an all-zero cell (CELL_MAGNITUDE_EXPONENT = 0, by Matmul's M13) may
     // set the flag.
-    let zero_pin = eval.mul(lv.cell_is_zero, lv.e_cell);
+    let zero_pin = eval.mul(lv.cell_is_zero, lv.cell_magnitude_exponent);
     eval.constraint(zero_pin);
     // Pads are tamed: the count is exactly the live untamed count when the J6 gate reads it.
     let pad_pin = eval.mul(lv.is_pad, lv.untamed);
@@ -420,7 +413,7 @@ where
     let step = eval.sub(step, nv.untamed);
     eval.constraint_transition(step);
 
-    // ---- J7 — the skip census and its budget gate (jackpot check 4). ----
+    // J7 — the skip census and its budget gate (jackpot check 4).
     // Pads import no skips (they are outside the E-cell channel, so the pin is load-bearing:
     // an unconstrained pad count could offset the census).
     let pad_skips = eval.mul(lv.is_pad, lv.cell_skips);
@@ -431,7 +424,7 @@ where
     let step = eval.sub(step, nv.cell_skips);
     eval.constraint_transition(step);
     // The budget gate: on the last row `SKIP_LIMIT - RUNNING_SKIPS` recomposes from the two
-    // RC16'd slack limbs, i.e. lies in [0, 2^32) — a census above the budget wraps to
+    // range-checked slack limbs, i.e. lies in [0, 2^32) — a census above the budget wraps to
     // p - x > 2^32 and has no such representation.
     let skip_limit = eval.scalar(vars.get_public_inputs()[SKIP_LIMIT_PUBLIC_INPUT]);
     let slack = eval.mad(lv.skip_gate_slack_hi, limb, lv.skip_gate_slack_lo);
@@ -439,18 +432,18 @@ where
     let c = eval.sub(diff, slack);
     eval.constraint_last_row(c);
 
-    // ---- J2 — PP = SIG_A*SIG_B, split into RC16'd limbs (exact: both factors are
-    // import-bound < 2^16, so the product is < 2^32 << p). ----
+    // J2 — PP = SIG_A*SIG_B, split into range-checked limbs (exact: both factors are
+    // import-bound < 2^16, so the product is < 2^32 << p).
     let pp = eval.mul(lv.sigma_a_significand, lv.sigma_b_significand);
     let c = off_split(eval, pp, lv.sigma_product_limbs[0], lv.sigma_product_limbs[1]);
     gate(eval, c);
 
-    // ---- J3 — Y = K * PP^2, via W = K*PP (K = k <= 2^16, the public input). ----
+    // J3 — Y = K * PP^2, via W = K*PP (K = k <= 2^16, the public input).
     // The two partial products K * PP_LO/HI as two-limb recompositions (< 2^32 by the limb
     // RCs, so the field equation is the integer equation).
     for (partial, pp_limb) in [
-        (&lv.k_pp_lo_partial, lv.sigma_product_limbs[0]),
-        (&lv.k_pp_hi_partial, lv.sigma_product_limbs[1]),
+        (&lv.k_sigma_product_lo, lv.sigma_product_limbs[0]),
+        (&lv.k_sigma_product_hi, lv.sigma_product_limbs[1]),
     ] {
         let mut c = eval.mul(k, pp_limb);
         for (pos, &l) in partial.iter().enumerate() {
@@ -464,13 +457,13 @@ where
     // W's digit-aligned add: W = KL + 2^16*KH, digits e_0 = KL[0], e_1 committed,
     // e_2 = KH[1] + carry (an expression: its width is forced by KH[1]'s RC16 and the
     // carry bit, so no committed limb is needed).
-    let kl = &lv.k_pp_lo_partial;
-    let kh = &lv.k_pp_hi_partial;
+    let kl = &lv.k_sigma_product_lo;
+    let kh = &lv.k_sigma_product_hi;
     let s = eval.add(kl[1], kh[0]);
-    let c = off_split(eval, s, lv.k_pp_mid_limbs[0], lv.k_pp_carries[0]);
+    let c = off_split(eval, s, lv.k_sigma_product_middle_limbs[0], lv.k_sigma_product_carries[0]);
     gate(eval, c);
-    eval.constraint_bool(lv.k_pp_carries[0]);
-    let e = [kl[0], lv.k_pp_mid_limbs[0], eval.add(kh[1], lv.k_pp_carries[0])];
+    eval.constraint_bool(lv.k_sigma_product_carries[0]);
+    let e = [kl[0], lv.k_sigma_product_middle_limbs[0], eval.add(kh[1], lv.k_sigma_product_carries[0])];
 
     // Y = W * PP schoolbook positions 0..=3 (position 4 is the carry itself: BOUND_TOP;
     // digit 5 is structurally zero — Y < 2^80). Per-position raw sums are < 2^33 + 2^17
@@ -501,18 +494,16 @@ where
         gate(eval, c);
     }
 
-    // ---- J4 — nothing in-AIR: the left side 2^A *is* the XFPOW2-bound one-hot limb vector
-    // (`SHIFT_A_LIMBS`), bound on live tamed nonzero rows by the lookup in `super::ctl`. ----
+    // J4 — nothing in-AIR: the left side 2^A *is* the XFPOW2-bound one-hot limb vector
+    // (`COMPARISON_POWER_LIMBS`), bound on live tamed nonzero rows by the lookup in `super::ctl`.
 
-    // ---- J5 — the comparison borrows (the RC16'd digit keys live in the LUT inventory). ----
+    // J5 — the comparison borrows (the range-checked digit keys live in the LUT inventory).
     for &b in &lv.comparison_borrows {
         eval.constraint_bool(b);
     }
 }
 
-// ==================================================================================================
 // Stark impl
-// ==================================================================================================
 
 /// TamedStark. A CTL party of the fp8 batch (`requires_ctls()`): its proofs carry the
 /// cross-table openings of the E-cell, sigma and LUT channels, so the batch driver is the
@@ -574,9 +565,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for TamedStark<F,
     }
 }
 
-// ==================================================================================================
 // Tests
-// ==================================================================================================
 
 #[cfg(test)]
 mod tests {
@@ -597,15 +586,9 @@ mod tests {
     type F = GoldilocksField;
     type S = TamedStark<F, D>;
 
-    /// A 10x10 tile over k = 64 (untamed allowance `floor(100 / 64) = 1`, skip budget
-    /// `floor(64 * 100 / 16) = 400`, and `K = k = 64`) with realistic frame magnitudes:
-    /// sigma significands are products of bf16 significand pairs (in `[2^14, 2^16)`, so
-    /// `Y = 64 * PP^2 >= 2^62`) at exponents near 2048 (`SA + SB in [4078, 4110]`); live
-    /// binades sit in the honest [121, 157] range, keeping
-    /// `D <= 2*(157 + 3950 - 4078) = 58 < 63 <= bitlen(Y)`: tamed. Cell 0 is untamed by
-    /// construction (`D >= 2*(400 + 3950 - 4110) = 480 > bitlen(Y)`); cell 3 is the
-    /// all-zero cell (zero skips — a zero cell never counts as skipped). The censuses sum
-    /// to 197, within the budget.
+    /// A 10x10 tile with k = 64: one untamed cell, one all-zero cell, and 197 skips.
+    /// Sigma frames and the remaining cell exponents keep all other cells tamed.
+    /// Padding must preserve both counts through the final budget checks.
     #[allow(clippy::type_complexity)]
     fn test_program_and_inputs() -> (TamedProgram, Vec<(u64, u64)>, Vec<Frame>, Vec<Frame>) {
         let program = TamedProgram { h: 10, w: 10, k: 64 };
@@ -739,12 +722,12 @@ mod tests {
     #[test]
     fn zero_claim_on_a_nonzero_cell_is_unsatisfiable() {
         // Cell 1 is a tamed nonzero cell; claiming CELL_IS_ZERO both violates the J1 zero pin
-        // (E_CELL != 0) and, were E_CELL also forged to 0, would desync the import channel.
+        // (CELL_MAGNITUDE_EXPONENT != 0) and, were CELL_MAGNITUDE_EXPONENT also forged to 0, would desync the import channel.
         let (_, mut rows, pis) = test_trace();
         {
             let v: &mut TamedColumnsView<F> = rows[1].borrow_mut();
             assert_eq!(v.untamed, F::ZERO, "test premise: cell 1 is tamed");
-            assert!(v.e_cell != F::ZERO, "test premise: cell 1 is nonzero");
+            assert!(v.cell_magnitude_exponent != F::ZERO, "test premise: cell 1 is nonzero");
             v.cell_is_zero = F::ONE;
         }
         assert!(check_constraints(&rows, &pis).is_err(), "the J1 zero pin must reject");
@@ -784,8 +767,8 @@ mod tests {
     #[test]
     fn untamed_predicate_matches_the_plaintext_shape() {
         // Boundary sweep: with K = k = 64 and sigma sigs 2^15 at exps 2048 (PP = 2^30,
-        // Y = 64 * 2^60 = 2^66, bitlen 67), D = 2*(e_cell - 147): untamed iff D >= 67 iff
-        // e_cell >= 181 (i.e. e_M >= 42 — the bound is tau_tame * sqrt(k) * sigma_A *
+        // Y = 64 * 2^60 = 2^66, bitlen 67), D = 2*(cell_magnitude_exponent - 147): untamed iff D >= 67 iff
+        // cell_magnitude_exponent >= 181 (i.e. e_M >= 42 — the bound is tau_tame * sqrt(k) * sigma_A *
         // sigma_B = 256 * 8 * 2^30 = 2^41, and the predicate flags exactly the binades
         // starting above it: ufp(M) = 2^e_M > 2^41).
         assert!(!untamed(64, 180, (1 << 15, 2048), (1 << 15, 2048)));
@@ -801,13 +784,13 @@ mod tests {
 
     #[test]
     fn certificate_is_tight_at_the_boundary() {
-        // At the last tamed binade (e_cell = 180 in the sweep above) the certificate must be
+        // At the last tamed binade (cell_magnitude_exponent = 180 in the sweep above) the certificate must be
         // satisfiable with A = D = 66 and Y = 2^66 — equality, zero borrows.
         let (sa, sb): (Frame, Frame) = ((1 << 15, 2048), (1 << 15, 2048));
         let mut v = TamedColumnsView::<F>::default();
         fill_certificate(&mut v, 64, 180, sa, sb);
         // A = 66: limb 4 holds 2^2; Y's digit 4 (BOUND_TOP) holds 2^2 too (Y = 2^66).
-        assert_eq!(v.shift_a_limbs[4], F::from_canonical_u64(4));
+        assert_eq!(v.comparison_power_limbs[4], F::from_canonical_u64(4));
         assert_eq!(v.bound_top, F::from_canonical_u64(4));
         assert!(
             v.comparison_borrows.iter().all(|&b| b == F::ZERO),
