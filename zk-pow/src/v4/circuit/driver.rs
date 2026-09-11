@@ -94,14 +94,9 @@ use crate::v2::api::proof_utils::u32_field_array_to_hash;
 use crate::v4::api::primitives::Hash256;
 use crate::v4::api::public_params::{Device, HashId};
 
-// ==================================================================================================
 // The consensus proof shape
-// ==================================================================================================
 
-/// Targeted (conjectured) security level in bits: `queries * rate_bits + proof_of_work_bits`.
-/// The 120-bit target of the recursive wrapper stages and of V1/V2
-/// (`v2::circuit::pearl_circuit::SECURITY_BITS`); `consensus_config_meets_the_security_target`
-/// asserts the parameters reach it.
+/// Targeted conjectured security in bits: `queries * rate_bits + proof_of_work_bits`.
 pub const STARK_SECURITY_BITS: usize = 120;
 /// Logup/CTL challenge repetitions (soundness `~(rows + instances)/|F|` per repetition; three
 /// repetitions push the batched-lookup error far below the FRI error).
@@ -183,20 +178,11 @@ pub fn fp8_universal_envelope(device: Device) -> UniversalVerifierEnvelope {
     }
 }
 
-/// The consensus [`StarkConfig`] for a job whose batch tables have the given heights
-/// (`degree_bits` per table, any order, duplicates allowed). Everything is a consensus
-/// constant, including the FRI reduction strategy: a [`FriReductionStrategy::Ladder`] whose
-/// boundaries are every *reachable* height ([`FP8_REACHABLE_DEGREE_BITS`]). A job's schedule
-/// is the ladder's suffix from its tallest table down to the `2^5` bottom, so any two jobs'
-/// schedules agree on their shared span, and — because the ladder serializes as the boundary
-/// list, not the suffix — the Fiat-Shamir transcript absorbs the *same* config for every
-/// envelope job: the universal-verifier prerequisite. Batch FRI injects each instance when
-/// the folded codeword reaches its LDE size and folds plainly through instance-free
-/// boundaries.
-///
-/// Sub-envelope profiles (unit-test geometries) add their own heights as extra boundaries;
-/// the config stays a pure function of the degree profile, and equals the consensus
-/// constant for every on-ladder profile (real jobs are ladder-gated at `Fp8Job::derive`).
+/// FRI configuration for the supplied table heights (any order, duplicates allowed).
+/// Production profiles use the fixed [`FP8_REACHABLE_DEGREE_BITS`] ladder. Jobs fold
+/// its suffix from their tallest table, but absorb the complete ladder into Fiat–Shamir,
+/// so one recursive verifier can cover them all.
+/// Test profiles outside the envelope add their heights as extra boundaries.
 pub fn fp8_stark_config(degree_bits: &[usize]) -> StarkConfig {
     let min = degree_bits.iter().copied().min().expect("at least one table");
     assert!(
@@ -219,9 +205,7 @@ pub fn fp8_stark_config(degree_bits: &[usize]) -> StarkConfig {
     )
 }
 
-// ==================================================================================================
 // The statement
-// ==================================================================================================
 
 /// The public data defining one fp8 statement: the five compiled programs and the
 /// class (a) recompute inputs. The caller derives all of it from the parsed job; **it must
@@ -235,7 +219,7 @@ pub struct Fp8PublicData {
     pub scale: ScaleProgram,
     pub xor_fold: XorFoldProgram,
     /// Raw byte lengths of the four opened strip planes (A/B values, A/B scales) — the
-    /// Blake3 class (a) schedule inputs. The MoE routing statement needs no length here:
+    /// Blake3 verifier-known schedule inputs. The MoE routing statement needs no length here:
     /// its public part is the pin schedule riding [`Blake3Program::routing_pins`], and the
     /// opened hotspot blocks themselves are witness data ([`Fp8Witness::routing_words`]).
     pub a_values_len: usize,
@@ -420,7 +404,7 @@ pub struct Fp8System<F: RichField + Extendable<D>, const D: usize> {
     degree_bits: [usize; NUM_ALL_TABLES],
     /// The consensus config for this job's degree profile.
     config: StarkConfig,
-    /// Class (a) columns in canonical table order. The digest slot is empty until
+    /// Verifier-known columns in canonical table order. The digest slot is empty until
     /// `bind_statement_digest` fills it.
     known: BatchKnownColumns<F>,
     /// All 21 CTL channels, table indices in canonical order.
@@ -552,11 +536,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         core::array::from_fn(|t| t)
     }
 
-    /// The setup-time commitment to the precommitted LUT columns,
-    /// placed at this job's batch positions. The underlying flat column list (and
-    /// hence the Merkle cap) is job-independent — the LUTs keep their
-    /// relative order under any geometry — so the cap is a consensus constant;
-    /// only the position bookkeeping varies per job.
+    /// Builds the fixed LUT setup commitment in canonical table order.
     pub fn preprocessed_data<C: GenericConfig<D, F = F>>(&self, timing: &mut TimingTree) -> BatchStarkPreprocessedData<F, C, D> {
         lut_preprocessed_data::<F, C, D>(NUM_ALL_TABLES, self.lut_positions(), &self.lut_tables, &self.config, timing)
     }
@@ -584,7 +564,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         &self.ctls
     }
 
-    /// The class (a) known columns in canonical table order (for the recursive wrapper:
+    /// The verifier-known columns in canonical table order (for the recursive wrapper:
     /// column indices shape the circuit; the values feed the native evaluation-at-zeta
     /// recompute). The digest slot is empty until `bind_statement_digest` fills it.
     pub(super) fn known(&self) -> &BatchKnownColumns<F> {
@@ -599,9 +579,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         self.known.digest = Some(statement_digest_to_hash_out(statement_digest));
     }
 
-    /// Cross-checks a caller-supplied `statement_digest` (the wrapper paths take it
-    /// as a parameter) against the one bound into this system, if any: they must
-    /// agree — a mismatch means system and digest came from different statements.
+    /// Checks a supplied digest against the system's bound digest, if present.
     pub fn ensure_statement_digest_binding(&self, statement_digest: Hash256) -> Result<()> {
         ensure!(
             self.known
@@ -660,7 +638,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             "witness plane lengths differ from the statement's"
         );
 
-        // ---- InputQuant: the opened strips + the statement's noise codes. ----
+        // InputQuant: the opened strips + the statement's noise codes.
         let as_int8 = |bytes: &[u8]| -> Vec<i8> { bytes.iter().map(|&b| b as i8).collect() };
         let le_codes = |bytes: &[u8]| -> Vec<u16> { bytes.chunks(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect() };
         let (a_int8, b_int8) = (as_int8(witness.a_values), as_int8(witness.b_values));
@@ -674,7 +652,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             &self.b_noise,
         );
 
-        // ---- Scale: one aggregate tuple per matrix row, exactly what InputQuant committed. ----
+        // Scale: one aggregate tuple per matrix row, exactly what InputQuant committed.
         let (h, w, k) = (
             self.input_quant.program.h,
             self.input_quant.program.w,
@@ -704,9 +682,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         };
         let (scale_rows, scale_pis) = self.scale.program.generate_trace::<F>(&tuples(false), &tuples(true));
 
-        // ---- Matmul: the noised fp8 codes and summand scores InputQuant committed (same
+        // Matmul: the noised fp8 codes and summand scores InputQuant committed (same
         // element order). Live rows only: past a side's
-        // `h*k`/`w*k` elements the InputQuant trace carries the dead phantom fill. ----
+        // `h*k`/`w*k` elements the InputQuant trace carries the dead phantom fill.
         let codes = |b_side: bool| -> Vec<u8> {
             let live = if b_side { w * k } else { h * k };
             iq_rows[..live]
@@ -723,7 +701,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
                 .iter()
                 .map(|r| {
                     let v: &InputQuantColumnsView<F> = r.borrow();
-                    (if b_side { v.lambda_b } else { v.lambda_a }).to_canonical_u64()
+                    (if b_side { v.summand_score_b } else { v.summand_score_a }).to_canonical_u64()
                 })
                 .collect()
         };
@@ -734,7 +712,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // ---- XorFold: fold Matmul's finished cell words into the lottery lanes. ----
         let (xf_rows, xf_pis) = self.xor_fold.program.generate_trace::<F>(&cell_words, &cell_skips);
 
-        // ---- Blake3: the strip bytes and the folded lottery words under the job schedule. ----
+        // Blake3: the strip bytes and the folded lottery words under the job schedule.
         let mut lottery_words = [0u32; 16];
         for r in &xf_rows {
             let v: &XorFoldColumnsView<F> = r.borrow();
@@ -769,7 +747,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // expectations in [`Self::verify`].
         let generated: [Vec<F>; NUM_TABLES] = [b3_pis.to_vec(), iq_pis.to_vec(), scale_pis.to_vec(), mat_pis, xf_pis.to_vec()];
 
-        // ---- Column-major traces, canonical order. ----
+        // Column-major traces, canonical order.
         let mut traces: Vec<Vec<PolynomialValues<F>>> = vec![
             column_major(&b3_rows),
             column_major(&iq_rows),
@@ -793,7 +771,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             traces.push(lut_trace::<F>(table, checker.multiplicities.table_columns(table)));
         }
 
-        // ---- The traces were assembled in canonical order, which is the batch order. ----
+        // The traces were assembled in canonical order, which is the batch order.
         let batch_traces: [Vec<PolynomialValues<F>>; NUM_ALL_TABLES] = traces.try_into().map_err(|_| anyhow!("table count"))?;
         for (t, trace) in batch_traces.iter().enumerate() {
             ensure!(
@@ -818,12 +796,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         )
     }
 
-    /// Verifies one job's proof against this statement, the caller's expected public inputs
-    /// (canonical `Table` order), the consensus LUT cap, and `statement_digest`
-    /// (bound into the known-column Fiat-Shamir slot): the degree profile and every public
-    /// input slot must equal the expectation, and the batch verifier then checks every
-    /// constraint, the class (a) openings against the statement's recomputed values, the
-    /// CTL balances and the batched FRI argument.
+    /// Verifies against the expected public inputs, degree profile, fixed LUT cap and
+    /// previously bound statement digest. The batch verifier checks all AIRs, known-column
+    /// openings, CTL balances and FRI.
     pub fn verify<C: GenericConfig<D, F = F>>(
         &self,
         proof: &BatchStarkProofWithPublicInputs<F, C, D>,
@@ -899,7 +874,8 @@ pub struct Fp8Witness<'a> {
     pub key_a: [u32; 8],
     pub key_b: [u32; 8],
     pub jackpot_key: [u32; 8],
-    /// Merkle leaf sizes from [`PublicParams`] (not stored on [`Blake3Program`]).
+    /// Merkle leaf sizes from [`PublicParams`](crate::api::fp8::public_params::PublicParams)
+    /// (not stored on [`Blake3Program`]).
     pub a_hash_id: HashId,
     pub b_hash_id: HashId,
     pub routing_hash_id: HashId,
@@ -1010,8 +986,7 @@ mod tests {
         }
     }
 
-    /// The consensus parameters meet [`FP8_V2_SECURITY_BITS`]: the batch prove/verify path
-    /// never calls [`StarkConfig::check_config`] at runtime, so enforce it here.
+    /// Check the configured FRI parameters against [`STARK_SECURITY_BITS`].
     #[test]
     fn consensus_config_meets_the_security_target() {
         fp8_stark_config(&FP8_REACHABLE_DEGREE_BITS)
@@ -1205,7 +1180,7 @@ mod tests {
 
     /// The full driver roundtrip on the consistency fixture: setup-time LUT precommitment,
     /// batch proof, verification — then the rejection surface: tampered public inputs, a
-    /// wrong consensus cap, a verifier whose class (a) recompute differs (different noise
+    /// wrong consensus cap, a verifier whose verifier-known recompute differs (different noise
     /// codes), a diverging `statement_digest`, and a tampered opening.
     #[test]
     fn batch_proof_roundtrips_and_rejects_tampering() {
@@ -1277,7 +1252,7 @@ mod tests {
         );
 
         // A verifier whose statement carries different noise codes recomputes different
-        // class (a) columns and must reject the proof (the known-column openings no longer
+        // verifier-known columns and must reject the proof (the known-column openings no longer
         // match the trace commitment). Same digest as the proof: failure is the openings,
         // not Fiat-Shamir.
         let mut data = public_data(&fx);

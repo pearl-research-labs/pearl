@@ -1,4 +1,4 @@
-//! The public parameters and their wire encoding.
+//! Public statements and their fixed-width wire encoding.
 //!
 //! [`PublicParams`] is the statement shared by the plaintext and ZK verifiers:
 //! the job tuple ([`JobParams`] — the per-operand parameter tuples plus the
@@ -9,8 +9,7 @@
 //! plus the caller's proposed header in [`crate::v4::api::transcript`], never
 //! stored here.
 //!
-//! [`Self::to_bytes`] / [`Self::from_bytes`] carry the statement as a
-//! fixed-width `public_data` blob:
+//! [`PublicParams::to_bytes`] / [`PublicParams::from_bytes`] use this layout:
 //!
 //! ```text
 //! public_data := σ_d(108) ‖ pB ‖ HB_values ‖ HB_scales ‖ pA ‖ HA_values ‖ HA_scales ‖ tA ‖ tB ‖ J ‖ [ MoE tail ]
@@ -32,9 +31,13 @@
 //! routing/offset lists (`O`, `R[w]`, `πR`) are witness data and never carried
 //! here.
 //!
-//! Dense `pA` is 11 bytes; MoE `pA` appends `hash_idR` and `hash_idO` (13
-//! bytes). `pB` is always 21 bytes (it carries the common `k`/`r`/`Quant`/
-//! `Device` once); dense jobs encode `e = 0`.
+//! `pB` is 21 bytes and carries the common parameters and expert count `e`.
+//! It precedes `pA` so the decoder knows whether the MoE suffix is present.
+//! Dense jobs encode `e = 0` and an 11-byte `pA`; MoE adds `hash_idR`/`hash_idO`
+//! to `pA` (13 bytes) and includes the tail.
+//!
+//! `I_A` contains `rows_pattern.tile_size()` little-endian u32 indices without
+//! a length prefix. Raw offsets and routing openings are private witness data.
 
 #![allow(dead_code)]
 
@@ -199,7 +202,6 @@ impl Device {
 impl TryFrom<u8> for Device {
     type Error = anyhow::Error;
 
-    /// Fails closed on an unrecognized (or retired) discriminant.
     fn try_from(value: u8) -> Result<Self> {
         match value {
             0 => Ok(Device::H100),
@@ -298,11 +300,8 @@ pub struct JobParams {
     pub ancestor_header: BlockHeader,
     /// The common tuple (`k`, `r`, `Quant`, `Device`) — rides `pB` on the wire.
     pub common: CommonParams,
-    /// The per-operand parameter tuples: `a` = A (`m`, `hash_idA`, `Prow`),
-    /// `b` = B (`n`, `hash_idB`, `Pcol`); `pB` = `common ‖ b ‖ e`.
-    ///
-    /// Declared `a`-first, but serialized `b`-first on the wire (the commitment
-    /// order — `pB` carries `e`, which discriminates `pA`'s MoE suffix).
+    /// Operand tuples: A (`m`, `hash_idA`, `Prow`) and B (`n`, `hash_idB`, `Pcol`).
+    /// Encoded B-first because `pB = common ‖ b ‖ e` determines `pA`'s MoE suffix.
     pub operands: Sides<OperandParams>,
     /// `Some` iff the job is MoE (then `b.num_rows` is the stacked height `η · e`).
     pub moe: Option<MoeParams>,
@@ -351,9 +350,8 @@ impl JobParams {
         })
     }
 
-    /// Every per-field check: common bounds, both operand tuples, MoE bounds.
-    /// Cross-field checks (layout, tile fit, `e | n`) live on
-    /// [`PublicParams::try_new`], which sees the full statement.
+    /// Check individual fields. [`PublicParams::try_new`] checks relationships
+    /// between them, including tile fit and `e | n`.
     fn check(&self) -> Result<()> {
         self.common.check()?;
         self.operands.b.check()?;
@@ -424,9 +422,8 @@ impl JobParams {
     }
 }
 
-/// The public MoE projection carried by the statement: the winner expert, the
-/// routing/offset scalars and roots, and the A-side index set the ZK verifier
-/// needs. Raw routing/offset lists are witness data and are *not* stored here.
+/// MoE public fields: winner, routing counts and roots, and selected A rows.
+/// The routing and offsets lists are private witness data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MoEStatement {
     /// Winner expert `w`.
@@ -492,11 +489,11 @@ impl MoEStatement {
                 self.o_last
             );
         }
-        let sw = self.o_w - self.o_w_prev;
+        let winner_row_count = self.o_w - self.o_w_prev;
         ensure!(
-            sw <= a.num_rows,
+            winner_row_count <= a.num_rows,
             "O_w - O_{{w-1}} must be <= m || s_w={} m={}",
-            sw,
+            winner_row_count,
             a.num_rows
         );
         // Routing byte spans stay <= 2^31 after pad-to-16 (2^29 is 16-divisible):
@@ -506,23 +503,22 @@ impl MoEStatement {
             "O_{{e-1}} must be <= 2^29 || O_{{e-1}}={}",
             self.o_last
         );
-        let a_hi = t_a
+        let last_selected_row = t_a
             .checked_add(a.pattern.tile_max())
             .ok_or_else(|| anyhow::anyhow!("tA + tile max overflows u32"))?;
         ensure!(
-            a_hi < sw,
+            last_selected_row < winner_row_count,
             "tA={} + tile max={} must be < |R[w]|={} (U_A subset of [0, s_w))",
             t_a,
             a.pattern.tile_max(),
-            sw
+            winner_row_count
         );
         Ok(())
     }
 
-    /// 64-byte BLAKE3 message blocks covering winner entries `[o_w_prev, o_w)`.
-    ///
-    /// `start = (o_w_prev * 4) / 64`, `end = ceil((o_w * 4) / 64)`. Empty if
-    /// `o_w <= o_w_prev`. Not Merkle [`HashId`] chunks.
+    /// Indices of the 64-byte BLAKE3 blocks covering the winner's routing entries.
+    /// Returns no blocks for an empty slice. These are message blocks, smaller than
+    /// the Merkle chunks selected by [`HashId`].
     pub(crate) fn opened_routing_blocks(&self) -> Vec<u32> {
         const BLOCK: usize = pearl_blake3::BLAKE3_MSG_LEN;
         let byte_start = self.o_w_prev as usize * std::mem::size_of::<u32>();
@@ -589,9 +585,7 @@ pub struct PublicParams {
     job: JobParams,
     /// The jackpot selection (tile bases, jackpot claim, committed plane roots).
     jackpot_statement: JackpotStatement,
-    /// MoE public projection (`w`, `O_{w-1}`, `O_w`, `O_{e-1}`, `HR`, `HO`, `I_A`);
-    /// `None` for dense. Holds only hashes/scalars/indices — the raw `O`/`R[w]`/
-    /// `πR` lists are witness data and are not carried here.
+    /// Public MoE fields; `None` for dense jobs.
     moe_statement: Option<MoEStatement>,
 }
 
@@ -633,8 +627,8 @@ impl PublicParams {
             job.moe.is_some() == moe_statement.is_some(),
             "moe and moe_statement must both be present or both absent"
         );
-        let b_row_bound = if let (Some(moe), Some(stmt)) = (job.moe, &moe_statement) {
-            stmt.check(moe, &job.operands.a, jackpot_statement.tile_bases.a)?;
+        let b_row_bound = if let (Some(moe), Some(moe_statement)) = (job.moe, &moe_statement) {
+            moe_statement.check(moe, &job.operands.a, jackpot_statement.tile_bases.a)?;
             ensure!(
                 job.operands.b.num_rows.is_multiple_of(u32::from(moe.experts)),
                 "n must be divisible by e || n={} e={}",
@@ -655,9 +649,8 @@ impl PublicParams {
         Ok(params)
     }
 
-    /// Re-runs the MoE statement consistency checks. [`Self::try_new`] already enforces
-    /// them; verifier entry points call this to fail closed on statements mutated after
-    /// construction rather than panic on a program invariant.
+    /// Repeat [`Self::try_new`]'s MoE checks before verification to catch
+    /// statements modified after construction.
     pub(crate) fn recheck_moe(&self) -> Result<()> {
         if let (Some(moe), Some(stmt)) = (self.moe(), self.moe_statement.as_ref()) {
             stmt.check(*moe, self.a(), self.jackpot_statement.tile_bases.a)?;
@@ -713,49 +706,40 @@ impl PublicParams {
 
     /// Builds the statement from its wire [`Self::to_bytes`] encoding.
     pub fn from_bytes(public_data: &[u8]) -> Result<Self> {
-        let mut s = public_data;
+        let mut remaining = public_data;
 
         // ---- the proof-carried ancestor header σ_d (108 bytes) ----
-        let ancestor_header = BlockHeader::from_bytes(take(&mut s, BlockHeader::SERIALIZED_SIZE)?)?;
+        let ancestor_header = BlockHeader::from_bytes(take(&mut remaining, BlockHeader::SERIALIZED_SIZE)?)?;
 
-        // ---- per-operand tuples (pB, HB | pA, HA) — pB first so its `e` discriminates pA's suffix ----
-        let (common, b, experts) = parse_p_b(&mut s)?;
-        // B-side aggregate commitment digest (one folded root).
-        let hash_b: Hash256 = take(&mut s, 32)?.try_into().unwrap();
+        let (common, b, experts) = parse_p_b(&mut remaining)?;
+        let hash_b: Hash256 = take(&mut remaining, 32)?.try_into().unwrap();
 
-        let (a, moe_hash_ids) = parse_p_a(&mut s, experts)?;
-        // A-side aggregate commitment digest (one folded root).
-        let hash_a: Hash256 = take(&mut s, 32)?.try_into().unwrap();
+        let (a, moe_hash_ids) = parse_p_a(&mut remaining, experts)?;
+        let hash_a: Hash256 = take(&mut remaining, 32)?.try_into().unwrap();
 
-        // ---- tile bases, jackpot claim ----
-        let t_a = u32::from_le_bytes(take(&mut s, 4)?.try_into().unwrap());
-        let t_b = u32::from_le_bytes(take(&mut s, 4)?.try_into().unwrap());
-        let hash_jackpot: Hash256 = take(&mut s, 32)?.try_into().unwrap();
+        let t_a = u32::from_le_bytes(take(&mut remaining, 4)?.try_into().unwrap());
+        let t_b = u32::from_le_bytes(take(&mut remaining, 4)?.try_into().unwrap());
+        let hash_jackpot: Hash256 = take(&mut remaining, 32)?.try_into().unwrap();
 
-        // ---- MoE tail (iff e != 0) ----
         let (moe, moe_statement) = if experts != 0 {
-            let w = u16::from_le_bytes(take(&mut s, 2)?.try_into().unwrap());
-            let o_w_m1 = u32::from_le_bytes(take(&mut s, 4)?.try_into().unwrap());
-            let o_w = u32::from_le_bytes(take(&mut s, 4)?.try_into().unwrap());
-            let o_e_m1 = u32::from_le_bytes(take(&mut s, 4)?.try_into().unwrap());
-            let hash_routing: Hash256 = take(&mut s, 32)?.try_into().unwrap();
-            let hash_offsets: Hash256 = take(&mut s, 32)?.try_into().unwrap();
-            // `I_A` carries no length prefix: its cardinality is the A-side
-            // pattern's tile size, which is proof-controlled (a canonical
-            // pattern admits tile sizes up to 2^24). Enforce the lottery
-            // envelope (bounding h to MAX_TILE_ROWS; `try_new` re-checks it
-            // for every construction path) and the remaining byte budget
-            // *before* reserving, so a small malformed blob cannot request a
-            // large allocation.
+            let w = u16::from_le_bytes(take(&mut remaining, 2)?.try_into().unwrap());
+            let winner_start = u32::from_le_bytes(take(&mut remaining, 4)?.try_into().unwrap());
+            let o_w = u32::from_le_bytes(take(&mut remaining, 4)?.try_into().unwrap());
+            let routing_count = u32::from_le_bytes(take(&mut remaining, 4)?.try_into().unwrap());
+            let hash_routing: Hash256 = take(&mut remaining, 32)?.try_into().unwrap();
+            let hash_offsets: Hash256 = take(&mut remaining, 32)?.try_into().unwrap();
+            // The pattern controls `I_A`'s length. Check the tile bounds and remaining
+            // bytes before allocating, so a small malformed blob cannot request a
+            // large buffer.
             check_lottery_layout(&a.pattern, &b.pattern)?;
             let i_a_len = a.pattern.tile_size() as usize;
             let i_a_bytes = i_a_len
                 .checked_mul(std::mem::size_of::<u32>())
                 .ok_or_else(|| anyhow::anyhow!("|I_A| * 4 overflows usize || |I_A|={i_a_len}"))?;
-            ensure!(s.len() >= i_a_bytes, "truncated fp8 public_data");
+            ensure!(remaining.len() >= i_a_bytes, "truncated fp8 public_data");
             let mut i_a = Vec::with_capacity(i_a_len);
             for _ in 0..i_a_len {
-                i_a.push(u32::from_le_bytes(take(&mut s, 4)?.try_into().unwrap()));
+                i_a.push(u32::from_le_bytes(take(&mut remaining, 4)?.try_into().unwrap()));
             }
             let (hash_id_r, hash_id_o) = moe_hash_ids.expect("MoE pA carries the routing/offset hash-ids");
             (
@@ -766,9 +750,9 @@ impl PublicParams {
                 }),
                 Some(MoEStatement {
                     w,
-                    o_w_prev: o_w_m1,
+                    o_w_prev: winner_start,
                     o_w,
-                    o_last: o_e_m1,
+                    o_last: routing_count,
                     hash_routing,
                     hash_offsets,
                     i_a,
@@ -777,7 +761,7 @@ impl PublicParams {
         } else {
             (None, None)
         };
-        ensure!(s.is_empty(), "trailing bytes in fp8 public_data");
+        ensure!(remaining.is_empty(), "trailing bytes in fp8 public_data");
 
         let params = Self::try_new(
             JobParams {
@@ -860,9 +844,8 @@ impl PublicParams {
         self.jackpot_statement.hash_jackpot
     }
 
-    /// Overwrites the claimed jackpot digest — the prover sets it from the proven
-    /// lottery digest just before shipping `public_data`; `parse_proof` leaves it
-    /// zeroed (the verifier re-pins `J` against the proof's claim).
+    /// Set the jackpot after proving. `parse_proof` initializes it to zero;
+    /// verification binds the statement's claim to the proven digest.
     pub(crate) fn set_hash_jackpot(&mut self, hash: Hash256) {
         self.jackpot_statement.hash_jackpot = hash;
     }
@@ -890,7 +873,6 @@ impl PublicParams {
         self.moe_statement.as_ref()
     }
 
-    /// Mutable access to the MoE projection (test-only tampering surface).
     #[cfg(test)]
     pub(crate) fn moe_statement_mut(&mut self) -> Option<&mut MoEStatement> {
         self.moe_statement.as_mut()
@@ -918,7 +900,7 @@ impl PublicParams {
         self.job.common.k
     }
 
-    /// Inner-hash rank `r` (the additive-noise rank).
+    /// Additive-noise rank `r`.
     pub(crate) fn rank(&self) -> u32 {
         self.job.common.r as u32
     }
@@ -981,7 +963,7 @@ impl PublicParams {
     /// offset by the winner's expert column block (`w · η`) in MoE.
     pub(crate) fn b_rows_indices(&self) -> Vec<u32> {
         let base = self.jackpot_statement.tile_bases.b;
-        let expert_col = self
+        let expert_row_offset = self
             .moe_statement
             .as_ref()
             .map_or(0, |stmt| self.expert_rows() * u32::from(stmt.w));
@@ -991,7 +973,7 @@ impl PublicParams {
             .pattern
             .tile_offsets()
             .into_iter()
-            .map(|i| expert_col + base + i)
+            .map(|i| expert_row_offset + base + i)
             .collect()
     }
 
@@ -1083,25 +1065,24 @@ fn check_opened_strips_bound(h: usize, w: usize, k: usize) -> Result<()> {
 }
 
 /// Consume the next `n` bytes of `s` and return them (or `Err` if short).
-fn take<'a>(s: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
-    ensure!(s.len() >= n, "truncated fp8 public_data");
-    let (head, tail) = s.split_at(n);
-    *s = tail;
+fn take<'a>(remaining: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    ensure!(remaining.len() >= n, "truncated fp8 public_data");
+    let (head, tail) = remaining.split_at(n);
+    *remaining = tail;
     Ok(head)
 }
 
-/// Parse `pB = (n, k, r, Quant, Device, hash_idB, Pcol, e)` — the shared
-/// B-side wire part ([`JobParams::encode_p_b`]). `pB` rides first so its `e`
-/// discriminates `pA`'s MoE suffix.
-fn parse_p_b(s: &mut &[u8]) -> Result<(CommonParams, OperandParams, u16)> {
-    let num_rows = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
-    let k = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
-    let r = u16::from_le_bytes(take(s, 2)?.try_into().unwrap());
-    let quant = Quant::try_from(take(s, 1)?[0])?;
-    let device = Device::try_from(take(s, 1)?[0])?;
-    let hash_id = HashId::try_from(take(s, 1)?[0])?;
-    let pattern = AxisPattern::from_bytes(take(s, AxisPattern::NUM_DIMS)?)?;
-    let experts = u16::from_le_bytes(take(s, 2)?.try_into().unwrap());
+/// Decode `pB = (n, k, r, Quant, Device, hash_idB, Pcol, e)`;
+/// inverse of [`JobParams::encode_p_b`].
+fn parse_p_b(remaining: &mut &[u8]) -> Result<(CommonParams, OperandParams, u16)> {
+    let num_rows = u32::from_le_bytes(take(remaining, 4)?.try_into().unwrap());
+    let k = u32::from_le_bytes(take(remaining, 4)?.try_into().unwrap());
+    let r = u16::from_le_bytes(take(remaining, 2)?.try_into().unwrap());
+    let quant = Quant::try_from(take(remaining, 1)?[0])?;
+    let device = Device::try_from(take(remaining, 1)?[0])?;
+    let hash_id = HashId::try_from(take(remaining, 1)?[0])?;
+    let pattern = AxisPattern::from_bytes(take(remaining, AxisPattern::NUM_DIMS)?)?;
+    let experts = u16::from_le_bytes(take(remaining, 2)?.try_into().unwrap());
     Ok((
         CommonParams { k, r, quant, device },
         OperandParams {
@@ -1113,15 +1094,14 @@ fn parse_p_b(s: &mut &[u8]) -> Result<(CommonParams, OperandParams, u16)> {
     ))
 }
 
-/// Parse `pA = (m, hash_idA, Prow[, hash_idR, hash_idO])` — the shared A-side
-/// wire part ([`JobParams::encode_p_a`]). MoE `pA` appends the routing/offset
-/// hash-ids; dense stops at `Prow`.
-fn parse_p_a(s: &mut &[u8], experts: u16) -> Result<(OperandParams, Option<(HashId, HashId)>)> {
-    let num_rows = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
-    let hash_id = HashId::try_from(take(s, 1)?[0])?;
-    let pattern = AxisPattern::from_bytes(take(s, AxisPattern::NUM_DIMS)?)?;
+/// Decode `pA = (m, hash_idA, Prow[, hash_idR, hash_idO])`;
+/// inverse of [`JobParams::encode_p_a`].
+fn parse_p_a(remaining: &mut &[u8], experts: u16) -> Result<(OperandParams, Option<(HashId, HashId)>)> {
+    let num_rows = u32::from_le_bytes(take(remaining, 4)?.try_into().unwrap());
+    let hash_id = HashId::try_from(take(remaining, 1)?[0])?;
+    let pattern = AxisPattern::from_bytes(take(remaining, AxisPattern::NUM_DIMS)?)?;
     let moe_hash_ids = if experts != 0 {
-        Some((HashId::try_from(take(s, 1)?[0])?, HashId::try_from(take(s, 1)?[0])?))
+        Some((HashId::try_from(take(remaining, 1)?[0])?, HashId::try_from(take(remaining, 1)?[0])?))
     } else {
         None
     };
@@ -1344,11 +1324,8 @@ mod tests {
         assert!(err.to_string().contains("truncated fp8 public_data"));
     }
 
-    /// Regression (allocation guard): an oversized-but-canonical rows pattern
-    /// used to size the `I_A` buffer before any validation, so a ~300-byte
-    /// blob with `tile_size() = 2^24` and a stream truncated before the first
-    /// `I_A` entry made the decoder reserve 64 MiB before `take()` failed.
-    /// The lottery envelope must reject it in `from_bytes` before reserving.
+    /// A short malformed blob must not cause a large allocation from its
+    /// claimed tile size. Reject the pattern before reserving `I_A`.
     #[test]
     fn from_bytes_rejects_oversized_pattern_before_i_a_alloc() {
         let huge = AxisPattern::new(&[(1 << 24, Fold)]).unwrap();

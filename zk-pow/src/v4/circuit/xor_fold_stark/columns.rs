@@ -1,7 +1,7 @@
 //! Columns for one XorFold step:
 //! `fold_out = rotl32(low32(fold_state_in * 0x9E3779B1 + cell_word), 13)`.
 //!
-//! Each live row folds one Matmul cell. The leading class-(a) columns `cell_id`, `lane_id`,
+//! Each live row folds one Matmul cell. The leading verifier-known columns `cell_id`, `lane_id`,
 //! `is_lane_final`, and `is_pad` bind the committed lane layout; the remaining columns hold
 //! the raw f32 cell word, that cell's policy-skip subtotal, the tile-wide running skip count,
 //! the terminal budget slack, the input state, the multiply-add's high limbs, and its low
@@ -18,16 +18,16 @@ use crate::v4::circuit::columns_view::columns_view;
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct XorFoldColumnsView<T: Copy> {
     /// The Matmul output cell this row folds, per the committed `lane_assignment`; key of the
-    /// cell-results CTL. Class (a), verifier-recomputed from the committed lane layout.
+    /// cell-results CTL. Verifier-known, verifier-recomputed from the committed lane layout.
     pub cell_id: T,
-    /// Which of the 16 lottery words this lane produces; key of the Blake3 channel. Class (a).
+    /// Which of the 16 lottery words this lane produces; key of the Blake3 channel. Verifier-known.
     pub lane_id: T,
-    /// 1 on each lane's last row: filter of the Blake3 channel, resets the fold chain. Class (a).
+    /// 1 on each lane's last row: filter of the Blake3 channel, resets the fold chain. Verifier-known.
     pub is_lane_final: T,
     /// 1 on the all-zero trailing padding rows (`h*w` live rows padded to a power of two);
-    /// excludes them from the cell-results channel. Class (a).
+    /// excludes them from the cell-results channel. Verifier-known.
     pub is_pad: T,
-    /// The cell's f32 word as two 16-bit limbs (RC16'd), CTL-received from Matmul.
+    /// The cell's f32 word as two 16-bit limbs (range-checked), CTL-received from Matmul.
     pub cell_result_f32_lo: T,
     pub cell_result_f32_hi: T,
     /// Number of this cell's `k` summands that Matmul classifies below the M/Z
@@ -59,7 +59,6 @@ pub struct XorFoldColumnsView<T: Copy> {
     pub rotation_input_bottom19_limb_1: T,
 }
 
-/// Total number of committed XorFoldStark columns.
 pub const NUM_XOR_FOLD_COLUMNS: usize = size_of::<XorFoldColumnsView<u8>>();
 
 // Committed-column count: 12 main + 4 class (a).
@@ -72,9 +71,7 @@ pub const NUM_XOR_FOLD_PUBLIC_INPUTS: usize = 1;
 
 columns_view!(XorFoldColumnsView, NUM_XOR_FOLD_COLUMNS, XOR_FOLD_COL_MAP);
 
-/// Number of leading class (a) ("known") columns: `CELL_ID`, `LANE_ID`, `IS_LANE_FINAL`,
-/// `IS_PAD` — pure functions of the committed lane layout (`XorFoldProgram::known_values`),
-/// re-checked by the batch verifier against the trace openings.
+/// Number of leading verifier-known schedule columns.
 pub const NUM_XOR_FOLD_KNOWN_COLUMNS: usize = XOR_FOLD_COL_MAP.is_pad + 1;
 
 #[cfg(test)]
@@ -89,7 +86,6 @@ mod tests {
         for (i, &c) in as_array.iter().enumerate() {
             assert_eq!(c, i);
         }
-        // Class (a) columns come first (their indices feed `preprocessed_indices`).
         assert_eq!(XOR_FOLD_COL_MAP.cell_id, 0);
         assert_eq!(XOR_FOLD_COL_MAP.lane_id, 1);
         assert_eq!(XOR_FOLD_COL_MAP.is_lane_final, 2);

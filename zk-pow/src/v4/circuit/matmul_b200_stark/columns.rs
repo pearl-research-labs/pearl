@@ -19,7 +19,7 @@ pub const GROUP_WIDTH: usize = 32;
 /// every link constraint stays degree <= 3 (the first takes three factors and the last one).
 pub const NUM_ATT_LINKS: usize = 16;
 
-/// View of one MatmulB200Stark trace row. The constraint labels (MB1..MB13) refer to
+/// View of one MatmulB200Stark trace row. The constraint labels (MB1..MB16) refer to
 /// `super::stark`'s constraint groups.
 ///
 /// Exponent conventions: `PRODUCT_BIASED_EXPONENT`, `GROUP_MAX_BIASED_EXPONENT`, and
@@ -47,9 +47,7 @@ pub struct MatmulB200ColumnsView<T: Copy> {
     /// the operand-code and cell-result channels, and their lanes are pinned to zero products.
     pub is_padding: T,
 
-    // ------------------------------------------------------------------------------------------
     // Window-sum emulation (main).
-    // ------------------------------------------------------------------------------------------
     /// The lane's fp8 A-operand code, received from InputQuant via the pair-packed CTL and
     /// individually pinned by the B200ALIGN tuple's `OPERAND_CODES_A` binding (MB1).
     pub operand_codes_a: [T; GROUP_WIDTH],
@@ -82,7 +80,7 @@ pub struct MatmulB200ColumnsView<T: Copy> {
     /// `floor(4*GROUP_OUTPUT_SIGNIFICAND_prev / 2^min(d, 26))`. The x4 lifts the 24-bit
     /// significand onto the window's 26-bit scale. Zero on zero-carry rows.
     pub aligned_incoming_carry_lo: T,
-    /// High 10-bit limb of the aligned carry (RC16'd as `HI * 2^6`).
+    /// High 10-bit limb of the aligned carry (range-checked as `HI * 2^6`).
     pub aligned_incoming_carry_hi: T,
     /// 16 + 10-bit limbs of the floor remainder
     /// `4*GROUP_OUTPUT_SIGNIFICAND_prev - ALIGNED_INCOMING_CARRY *
@@ -142,24 +140,27 @@ pub struct MatmulB200ColumnsView<T: Copy> {
     // E_GRID = floor(log2 M)+139. Range checks prove it bounds every product and partial.
     // ------------------------------------------------------------------------------------------
     /// MB13: the lane product's `floor(log2 |product|) + 139` (0 for a zero product), served
-    /// by the same B200ALIGN lookup as the term. `RC16(E_CELL - LANE_BINADES_i)` proves the
-    /// bound; nonzero binades are >= 121, so E_CELL = 0 implies an all-zero cell.
+    /// by the same B200ALIGN lookup as the term. `RC16(CELL_MAGNITUDE_EXPONENT - LANE_BINADES_i)` proves the
+    /// bound; nonzero binades are >= 121, so CELL_MAGNITUDE_EXPONENT = 0 implies an all-zero cell.
     pub lane_binades: [T; GROUP_WIDTH],
-    /// MB13: B200's E_GRID, retained under the `e_cell` field name until the Task 6 CTL
-    /// migration. Constant across the cell.
-    pub e_cell: T,
+    /// MB13: the cell magnitude exponent `CELL_MAGNITUDE_EXPONENT` (B200's E_GRID), constant
+    /// across the cell's rows, exported to the result channel on the cell-final row. The
+    /// partial sums' bound is `RC16(CELL_MAGNITUDE_EXPONENT - GROUP_OUTPUT_BIASED_EXPONENT - 101)`
+    /// (see `PARTIAL_BINADE_OFFSET`), filtered off on zero partials.
+    pub cell_magnitude_exponent: T,
 
     // ------------------------------------------------------------------------------------------
     // Consolidated policy census (MB14-MB16).
     // ------------------------------------------------------------------------------------------
-    /// MB14: 1 iff `E_CELL != 0` (boolean; `(1 - NZ) * E_CELL = 0`). A nonzero cell cannot
-    /// claim `NZ = 0`: its lane binades force `E_CELL >= 121`. Gates the MB15 certificates.
+    /// MB14: 1 iff `CELL_MAGNITUDE_EXPONENT != 0` (boolean; `(1 - NZ) * CELL_MAGNITUDE_EXPONENT = 0`).
+    /// A nonzero cell cannot claim `NZ = 0`: its lane binades force `CELL_MAGNITUDE_EXPONENT >= 121`.
+    /// Gates the MB15 certificates.
     pub cell_nonzero: T,
     /// MB15: the lane's A-operand summand score `lambda`, received from InputQuant on the
     /// widened operand-code channel (0 encodes "no finite summand").
-    pub lambda_a: [T; GROUP_WIDTH],
-    /// The lane's B-operand summand score (see `lambda_a`).
-    pub lambda_b: [T; GROUP_WIDTH],
+    pub summand_score_a: [T; GROUP_WIDTH],
+    /// The lane's B-operand summand score (see `summand_score_a`).
+    pub summand_score_b: [T; GROUP_WIDTH],
     /// MB15: the lane's skip verdict (boolean; 0 on padding rows and zero cells). One-sided:
     /// claiming *non-skip* costs the filtered RC16 certificate
     /// `LAMBDA_A + LAMBDA_B - 128*E_GRID - skip_threshold_offset in [0, 2^16)`
@@ -171,11 +172,8 @@ pub struct MatmulB200ColumnsView<T: Copy> {
     pub cell_skips: T,
 }
 
-/// Total number of committed MatmulB200Stark columns.
 pub const NUM_MATMUL_B200_COLUMNS: usize = size_of::<MatmulB200ColumnsView<u8>>();
 
-// Committed-column count: 256 per-lane (8 arrays of 32) + 40 fixed main + 5 class (a)
-// + 3 fixed jackpot (E_CELL, CELL_NONZERO, CELL_SKIPS).
 const _: () = assert!(NUM_MATMUL_B200_COLUMNS == 304);
 
 columns_view!(MatmulB200ColumnsView, NUM_MATMUL_B200_COLUMNS, MATMUL_B200_COL_MAP);
@@ -200,7 +198,6 @@ mod tests {
         for (i, &c) in as_array.iter().enumerate() {
             assert_eq!(c, i);
         }
-        // Class (a) columns come first (their indices feed `preprocessed_indices`).
         assert_eq!(MATMUL_B200_COL_MAP.cell_id, 0);
         assert_eq!(MATMUL_B200_COL_MAP.is_cell_final, 1);
         assert_eq!(MATMUL_B200_COL_MAP.operand_index_base_a, 2);

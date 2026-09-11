@@ -125,7 +125,7 @@ macro_rules! assert_constraints {
 /// the five generated main traces with their
 /// public inputs.
 pub(crate) struct Fp8Fixture {
-    // The statement: programs plus the class (a) recompute inputs and expected public inputs.
+    // The statement: programs plus the verifier-known recompute inputs and expected public inputs.
     pub blake3: Blake3Program,
     pub input_quant: InputQuantProgram,
     pub scale: ScaleProgram,
@@ -220,14 +220,9 @@ pub(crate) fn fixture_job_asym() -> (IncompleteBlockHeader, PlainProofV4) {
     )
 }
 
-/// The `k % 32` fixture job: `m = n = 32`, `k = 2080` (`= 32 * 65`, so `k % 64 = 32` — the
-/// envelope the wire layer admits since dword tiling replaced whole-block tiling). Committed
-/// rows are 2080 bytes (values) and 264 bytes (scales), so row boundaries inside a plane are
-/// never 64-byte aligned and the Blake3 schedule is dense with straddling blocks: cross-strip
-/// `MatrixLeaf`s across the contiguous opened band `{0..15}` on both the values and scales
-/// planes, and `SplitLeaf`s where a block runs into an unopened row or the plane's chunk
-/// padding. Downstream, `k/32 = 65` rows per Matmul cell and `k/8 = 260` whole quantizer
-/// blocks per InputQuant group.
+/// k = 2080 exercises values/scales rows crossing 64-byte BLAKE3 blocks.
+/// The schedule includes cross-strip and split leaves; Matmul uses 65 rows per cell
+/// and InputQuant uses 260 eight-element blocks per group.
 pub(crate) fn fixture_job_k32() -> (IncompleteBlockHeader, PlainProofV4) {
     let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
     fixture_job_with(32, 2080, dims, dims)
@@ -288,10 +283,9 @@ fn plane_byte(seed: usize, i: usize, j: usize) -> u8 {
     (x % 251) as u8
 }
 
-/// [`fixture_job_with`] with the given committed A rows' int8 values zeroed (scales stay
-/// normal, so those rows decode to `X = 0` everywhere): the all-zero-row envelope. The scheme
-/// floors both norms at `2^-32` (ledger N5), so alpha stays finite, beta strictly positive,
-/// and the row's noised elements are pure noise — the ticket must remain provable end to end.
+/// Zero selected A rows while retaining normal block scales.
+/// The 2^-32 norm floors must keep alpha finite and beta positive; those rows then
+/// quantize pure noise and remain provable.
 fn fixture_job_with_zero_a_rows(
     m: usize,
     k: usize,
@@ -320,7 +314,7 @@ fn fixture_job_with_planes(
     let n = m;
     let n_blocks = k / BLOCK_SIZE;
 
-    // ---- The committed matrices and the sampled strips: each axis' tile (fold (+) blake). ----
+    // The committed matrices and the sampled strips: each axis' tile (fold (+) blake).
     let rows_pattern = AxisPattern::new(row_dims).unwrap();
     let cols_pattern = AxisPattern::new(col_dims).unwrap();
     let tile = |p: &AxisPattern| -> Vec<usize> { p.tile_offsets().iter().map(|&o| o as usize).collect() };
@@ -377,7 +371,7 @@ fn fixture_job_with_planes(
 }
 
 /// The MoE fixture job: `m = 256` global tokens, `e = 4` experts
-/// with `top_k = 2` (512 flat routing entries — a two-chunk routing tree; the deployed
+/// with `top_k = 2` (512 flat routing entries — a two-chunk routing tree; the
 /// membership verifier requires more than one chunk, see `MerkleProof::compute_root`), the
 /// proof for `expert_idx = 1` whose region spans slots `128..256` — the sampled entries
 /// (inner = the rows tile `{0..3, 8..11, 16..19, 24..27}` -> slots `{128..131, 136..139,
@@ -503,25 +497,19 @@ fn fixture_job_moe_with(routing_flat: Vec<u32>) -> (IncompleteBlockHeader, Plain
     (header, proof)
 }
 
-/// Builds the shared end-to-end fixture: verifier-parsed
-/// job -> five mutually consistent traces (the Matmul trace,
-/// its bit-exact cell results feeding XorFold and, through the lottery words, Blake3).
-/// With `moe`, the job is [`fixture_job_moe`]: the Blake3 forest gains the routing tree,
-/// the pin schedule rides the program, and the opened hotspot words ride the witness.
+/// Builds all six main traces from a dense or MoE wire fixture.
 pub(crate) fn build_fixture(moe: bool) -> Fp8Fixture {
     let (header, proof) = if moe { fixture_job_moe() } else { fixture_job() };
     build_fixture_from_job(header, proof)
 }
 
-/// [`build_fixture`] on an explicit wire-level job: the geometry (`h`, `w`, `k`, `r`, the
-/// lane assignment) is read from the parse, so any reference-legal job — in particular the
-/// padded [`fixture_job_asym`] shapes — drives the same five traces.
+/// Builds all six main traces from an explicit parsed job, including padded geometries.
 pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: PlainProofV4) -> Fp8Fixture {
     let (private, public) = proof.parse_proof(&header).expect("fixture must parse");
     let (compiled, _, _) = public.compile(&header).expect("fixture must compile");
     let (h, w, k, r) = (compiled.h, compiled.w, compiled.k, compiled.r);
 
-    // ---- InputQuantStark: the opened strips + the job's noise codes. ----
+    // InputQuantStark: the opened strips + the job's noise codes.
     let iq_program = InputQuantProgram {
         h,
         w,
@@ -572,9 +560,9 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
     };
     let (scale_rows, scale_pis) = scale_program.generate_trace::<F>(&tuples(false), &tuples(true));
 
-    // ---- Matmul: the noised fp8 codes and summand scores InputQuant committed (same element
+    // Matmul: the noised fp8 codes and summand scores InputQuant committed (same element
     // order; live rows only — past `h*k`/`w*k` the InputQuant trace is the dead phantom
-    // fill). ----
+    // fill).
     let codes = |b_side: bool| -> Vec<u8> {
         let live = if b_side { w * k } else { h * k };
         iq_rows[..live]
@@ -591,7 +579,7 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
             .iter()
             .map(|r| {
                 let v: &InputQuantColumnsView<F> = r.borrow();
-                to_u64(if b_side { v.lambda_b } else { v.lambda_a })
+                to_u64(if b_side { v.summand_score_b } else { v.summand_score_a })
             })
             .collect()
     };
@@ -626,16 +614,16 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
         }
     };
 
-    // ---- XorFoldStark: fold Matmul's cell results into the 16 lottery lanes — the
-    // committed patterns' lane assignment, exactly what the API layer derives. ----
+    // XorFoldStark: fold Matmul's cell results into the 16 lottery lanes — the
+    // committed patterns' lane assignment, exactly what the API layer derives.
     let xf_program = XorFoldProgram {
         lanes: public.lane_assignment(),
         skip_limit: budget(k, h, w),
     };
     let (xf_rows, xf_pis) = xf_program.generate_trace::<F>(&cell_words, &cell_skips);
 
-    // ---- Blake3Stark: the deployed program over the strips, keyed by the real job key, with
-    // the lottery block = XorFold's folded words. ----
+    // Blake3Stark: the public program over the strips, keyed by the job key, with
+    // the lottery block = XorFold's folded words.
     let mut lottery_words = [0u32; 16];
     for r in &xf_rows {
         let v: &XorFoldColumnsView<F> = r.borrow();
@@ -720,13 +708,13 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
     }
 }
 
-/// The end-to-end consistency driver: every AIR satisfied on its own trace, class (a)
+/// The end-to-end consistency driver: every AIR satisfied on its own trace, verifier-known
 /// recompute bit-exact with the traces, every LUT instance served by the
 /// committed oracle, and all 21 CTL channels balanced over the full 20-table batch.
 fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     let (h, w, k) = (fx.input_quant.h, fx.input_quant.w, fx.input_quant.k);
 
-    // ---- Early diagnostics: the CTL surfaces have the expected row counts. ----
+    // Early diagnostics: the CTL surfaces have the expected row counts.
     let count = |get: fn(&Blake3ColumnsView<F>) -> F| {
         fx.b3_rows
             .iter()
@@ -836,7 +824,7 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     // Assemble every channel before the programs move into their starks below.
     let all_ctls = all_cross_table_lookups::<F>(fx.scale.device, &fx.scale);
 
-    // ---- Every AIR satisfied on its own trace (the LUT AIRs have no constraints). ----
+    // Every AIR satisfied on its own trace (the LUT AIRs have no constraints).
     let pis: [&[F]; NUM_TABLES] = core::array::from_fn(|t| fx.public_inputs[t].as_slice());
     assert_constraints!(Blake3Stark::<F, D>::new(fx.blake3), &fx.b3_rows, pis[0], "Blake3");
     assert_constraints!(
@@ -879,7 +867,7 @@ fn one_hopper_quantization_job_balances_every_ctl_channel() {
 
 /// The MoE fixture through the same driver: the routing tree joins the Blake3 forest (pins
 /// from the public routing statement, hotspot words from the witness), and every AIR,
-/// class (a) recompute, LUT instance and CTL channel must still close.
+/// verifier-known recompute, LUT instance and CTL channel must still close.
 #[test]
 fn one_moe_job_balances_every_ctl_channel() {
     check_job_balances_every_ctl_channel(build_fixture(true));
@@ -981,23 +969,14 @@ fn one_job_with_an_all_zero_opened_row_balances_every_ctl_channel() {
     check_job_balances_every_ctl_channel(build_fixture_from_job(header, proof));
 }
 
-/// The padded-geometry fixture ([`fixture_job_asym`]: `h = 16 != w = 20`) through the same
-/// driver: every liveness/padding flag path — InputQuant's dead
-/// A-region, Scale and XorFold pad rows, Matmul trailing phantom cells — must satisfy the
-/// constraints, match the class (a) recompute, stay in the LUT domains, and keep all 22
-/// channels balanced.
+/// Check asymmetric live prefixes, padding, known columns and channel balance.
 #[test]
 fn one_asymmetric_job_balances_every_ctl_channel() {
     let (header, proof) = fixture_job_asym();
     check_job_balances_every_ctl_channel(build_fixture_from_job(header, proof));
 }
 
-/// The `k % 32` fixture ([`fixture_job_k32`]: `k = 2080`, committed rows that never align to
-/// 64-byte Blake3 blocks) through the same driver: the schedule's
-/// straddling blocks — cross-strip `PlaneBytes` and `SplitLeaf`s of both orders — must
-/// satisfy the Blake3 constraints, match the class (a) recompute, and keep the values/scales
-/// CTL surface exact so all 22 channels still balance against InputQuant's demand at a
-/// non-power-of-two `k` (65 live rows per Matmul cell).
+/// Check k = 2080 split blocks, known columns and exact values/scales channel balance.
 #[test]
 fn one_k_mod_32_job_balances_every_ctl_channel() {
     let (header, proof) = fixture_job_k32();

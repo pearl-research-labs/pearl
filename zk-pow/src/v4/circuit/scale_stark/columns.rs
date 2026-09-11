@@ -1,25 +1,12 @@
-//! Fixed trace layout for one ScaleStark matrix row.
+//! Column layout for Scale's norms, scale chain and policy gates; see [`super::stark`].
 //!
-//! Columns follow the computation: the InputQuant aggregate; an exact integer check of the
-//! bf16 square-root claim; rounding that claim's code to the nearest multiple of four (ties
-//! upward); `linf`; the `2^-32` norm floors; the noised-bound FMA; alpha/beta derivation; the
-//! jackpot liveness gate (the per-side running dead totals compared against the
-//! `DEAD_LIMIT_A/B` public inputs on the last row); and the jackpot noise-floor gate (every
-//! row's `sigma = DELTA * alpha * l2f` held at or above `sigma_min`).
+//! The square-root certificate aligns squared rounding boundaries with InputQuant's
+//! framed sum using eight base-`2^16` limb positions. Range checks on these limbs
+//! make the comparisons hold over the integers.
 //!
-//! For the square-root check, `S` is InputQuant's framed sum,
-//! `Wl2 = 27 - ceil(log2(k))` is its precision shift, `E_MAX` is the doubled scale-frame
-//! exponent, and `(t, f)` are the claimed bf16 significand and effective exponent. The
-//! alignment exponent `G = 2*f + Wl2 - 4 - E_MAX` lies in `[-32, 47]` on every accepted
-//! honest row. Adding 32 makes it nonnegative; decomposition into 16-bit shifts then lets eight
-//! limb positions compare the squared quarter-ulp boundaries with `S` without field wrap. A
-//! live zero claim needs only the upper boundary, while a binade-bottom flag selects bf16's
-//! narrower lower boundary.
-//!
-//! [`ScaleColumnsView`] is `#[repr(C)]`; declaration order is committed column order.
-//! [`SCALE_COL_MAP`] exposes the same layout as indices for CTLs and LUTs. The FMA high-bit
-//! witness separately proves its RNERND significand key `< 2^17`; 17 is that lookup's key
-//! width, compared with bf16's eight-bit precision.
+//! A zero claim needs only the upper boundary. At a power of two above the minimum
+//! normal value, the lower boundary is one quarter of the current binade's spacing
+//! away. [`super::stark`] derives these boundaries and defines the constraint labels.
 
 use crate::v4::circuit::columns_view::columns_view;
 
@@ -65,13 +52,9 @@ pub struct MulBlock<T: Copy> {
     pub out_exp_is_zero: T,
 }
 
-/// The all-nonnegative FMA gadget `noised_bound = RNE_bf16(dr * l2f + linf_f)` (the W1-W12
-/// constraint pattern in its sign-free variant; constraint H1): every operand is sign-0 (`dr`
-/// normal public, `l2f`/`linf_f` floored norm magnitudes), so `OUT_SIGN` and the exact-zero
-/// inverse pair drop and the fold is a pure addition. Units: the exact product significand
-/// `M(dr)*M(l2f)` sits at `2^EP` with `EP = E*(dr) + E*(l2f) - 268`; the addend significand
-/// `M(linf_f)` at `2^EC` with `EC = E*(linf_f) - 134`; `d = |EP - EC|` is the alignment gap
-/// between the two units.
+/// Nonnegative FMA `RNE_bf16(dr*l2f + linf_f)` (H1, W1–W12).
+/// The product's LSB exponent is EP = E*(dr) + E*(l2f) - 268; the addend's is
+/// EC = E*(linf_f) - 134. Positive operands need neither a sign nor a zero-sign check.
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct FmaBlock<T: Copy> {
@@ -79,14 +62,14 @@ pub struct FmaBlock<T: Copy> {
     pub sig_product: T,
     /// W2: `GE = 1 <=> EP >= EC` — which operand's *unit* is coarser (not which is bigger).
     pub product_scale_ge_addend: T,
-    /// W2: two-sided order witness `GE*(EP - EC) + (1 - GE)*(EC - EP - 1)` (RC16'd).
+    /// W2: two-sided order witness `GE*(EP - EC) + (1 - GE)*(EC - EP - 1)` (range-checked to 16 bits).
     pub scale_gap_slack: T,
     /// W3: far-gap flag (`d >= THR`, `THR = 18 - 8*GE`): beyond the threshold the finer
     /// operand cannot affect more than the sticky bit, so the alignment gap is capped. (The
     /// pure-addition fold has no borrow case, hence a lower threshold than InputQuant's
     /// subtracting FMA.)
     pub is_far_gap: T,
-    /// W3: far-gap witness `d - THR` on far rows (RC16'd; 0 on near rows).
+    /// W3: far-gap witness `d - THR` on far rows (range-checked to 16 bits; 0 on near rows).
     pub far_gap_slack: T,
     /// W4: the gap actually used by the fold: `d` on near rows, `THR - 1` on far rows; POW2D key
     /// (shared domain [0, 19]; the honest Scale fill uses at most 17).
@@ -109,7 +92,7 @@ pub struct FmaBlock<T: Copy> {
     pub compression_quotient: T,
     /// W9: parity bit of `K` (bound two-sidedly by the `(K - K0)/2` RC16).
     pub compression_quotient_lsb: T,
-    /// W8: round-to-odd remainder `R = V - K*2^SHIFT` (RC16'd, and `< 2^SHIFT` by the
+    /// W8: round-to-odd remainder `R = V - K*2^SHIFT` (range-checked to 16 bits, and `< 2^SHIFT` by the
     /// `SHIFT_POW2 - 1 - R` RC16).
     pub compression_remainder: T,
     /// W9: inverse witness making `STICKY` two-sided:
@@ -149,14 +132,7 @@ pub struct FmaBlock<T: Copy> {
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct ScaleColumnsView<T: Copy> {
-    // ------------------------------------------------------------------------------------------
-    // Shared structural columns, class (a): verifier-recomputable from the program (geometry).
-    // Committed *with the trace* (per-job data cannot live in the setup-time preprocessed
-    // oracle), but the verifier recomputes them (`ScaleProgram::known_values`) and checks the
-    // trace openings against its own values (`starky`'s batch "known columns") — that binding
-    // carries every shape fact, so they appear in no constraint of their own (`stark.rs`
-    // group A).
-    // ------------------------------------------------------------------------------------------
+    // Verifier-known schedule columns; see `known_values`.
     /// The CTL key of this row's group tuple: `(g + 1)*k - 1` for A row `g`, `h*k + (c + 1)*k - 1`
     /// for B row `c` — InputQuantStark's `IS_GROUP_FINAL` element indices.
     pub group_key: T,
@@ -170,9 +146,7 @@ pub struct ScaleColumnsView<T: Copy> {
     /// group-tuple CTL.
     pub is_pad: T,
 
-    // ------------------------------------------------------------------------------------------
     // The received group tuple (main; every field CTL-bound to InputQuantStark).
-    // ------------------------------------------------------------------------------------------
     /// The exact block-integer L2 frame sum
     /// `S = sum_b floor(p_b * 2^Wl2 / 2^(FRAME_DOUBLED_SCALE_EXPONENT - 2*E*(scale_b))) <
     /// 2^62`, `p_b = M(scale_b)^2 * n_b`, `n_b` the block's int8 square sum
@@ -195,14 +169,7 @@ pub struct ScaleColumnsView<T: Copy> {
     /// threshold.
     pub dead_count: T,
 
-    // ------------------------------------------------------------------------------------------
-    // The jackpot liveness totals (group T): per-side prefix sums of DEAD_COUNT, gated on the
-    // last row against the DEAD_LIMIT public inputs (check 1 of the jackpot policy:
-    // `dead_total <= floor(eps_idle * side_elems)`). The T3 gate range-checks
-    // `slack - 2^16·HI` with a boolean high-bit witness per side, covering slacks up to
-    // 2^17 (at `eps_idle = 1/64` the honest slack `DEAD_LIMIT - RUNNING_DEAD` stays
-    // below 2^16 for every sanctioned geometry).
-    // ------------------------------------------------------------------------------------------
+    // Liveness totals (T): per-side dead counts, checked against public budgets on the last row.
     /// T2: prefix sum of `IS_A_ROW * DEAD_COUNT`; the last row holds the A side's dead total
     /// (frozen through pad rows), gated by the T3 RC16
     /// `DEAD_LIMIT_A - RUNNING_DEAD_A - 2^16·DEAD_SLACK_HI_A`.
@@ -242,11 +209,10 @@ pub struct ScaleColumnsView<T: Copy> {
     pub frame_sum_is_zero: T,
     /// Inverse witness of `S` on nonzero rows (`S * FRAME_SUM_INVERSE = 1 - FRAME_SUM_IS_ZERO`).
     pub frame_sum_inverse: T,
-    /// Q2b: zero-*claim* flag. Setting it forces the claim shape `t = 0` (mantissa 0,
-    /// exponent-field flag set) and drops the *lower* bracket arm: a zero claim on a live sum is
-    /// legal iff `sqrt(v_hat) <= 2^-7`, RNE's one-sided zero region (subnormal block scales can
-    /// put `v_hat` strictly below the former tie). One-sided force only: leaving it off on a
-    /// `t = 0` claim keeps the lower arm live with `B_LO^2 = 4`, a strict subset — sound.
+    /// Q2b: claim that the square root rounds to zero. Requires `t = 0` and disables
+    /// the lower boundary check. On a nonzero sum, this permits `sqrt(v_hat) <= 2^-7`.
+    /// Leaving the flag off for a zero claim is safe: it retains the stricter lower
+    /// boundary `B_LO^2 = 4` and cannot admit an invalid square root.
     pub sqrt_claim_is_zero: T,
     /// Q2b: the committed lower-arm gate
     /// `(1 - FRAME_SUM_IS_ZERO) * (1 - SQRT_CLAIM_IS_ZERO)` (committed to keep the Q8
@@ -254,9 +220,9 @@ pub struct ScaleColumnsView<T: Copy> {
     pub lower_bracket_is_active: T,
     /// Claim mantissa parity (`t` odd <=> both bracket inequalities strict — ties-to-even).
     pub sqrt_mantissa_parity: T,
-    /// `(SQRT_MANTISSA - SQRT_MANTISSA_PARITY) / 2`; rides the sqrt PAIR128 slot so the parity split
-    /// is exact over the integers and HALF is range-checked (an unranged HALF would make
-    /// PARITY forgeable).
+    /// `(SQRT_MANTISSA - SQRT_MANTISSA_PARITY) / 2`, range-checked by PAIR128.
+    /// The bound makes the parity split exact over the integers; without it, either
+    /// parity bit could satisfy the equation by field division.
     pub sqrt_mantissa_half: T,
 
     // Lower-midpoint correction at normal powers of two.
@@ -272,7 +238,7 @@ pub struct ScaleColumnsView<T: Copy> {
     /// `SQRT_EXP >= 2` flag (one-sided: `EXP_GE2 = 0` forces `EXP in {0, 1}`).
     pub sqrt_exponent_at_least_two: T,
 
-    /// Q1: 16-bit limbs of `S` (RC16'd; top limb capped `< 2^14` by `RC16(4 * limb_3)`).
+    /// Q1: 16-bit limbs of `S` (range-checked; top limb capped `< 2^14` by `RC16(4 * limb_3)`).
     pub frame_sum_limbs: [T; L2_SUM_LIMBS],
     /// Q7: 16-bit limbs of the squared lower rounding boundary `B_LO^2 < 2^20`,
     /// `B_LO = 4t - 2 + SQRT_IS_BINADE_BOTTOM` (quarter-ulp scale). The upper boundary's
@@ -297,9 +263,9 @@ pub struct ScaleColumnsView<T: Copy> {
     /// Multiplier `2^sum_shift_remainder`, fixed by the POW2D lookup.
     pub sum_shift_power: T,
 
-    /// Q6: low four 16-bit limbs of `S * 2^r2 < 2^77` (RC16'd); the top limb is the final carry.
+    /// Q6: low four 16-bit limbs of `S * 2^r2 < 2^77` (range-checked); the top limb is the final carry.
     pub shifted_sum_limbs: [T; L2_SUM_LIMBS],
-    /// Q6: per-limb carries of the `S * 2^r2` schoolbook product (RC16'd).
+    /// Q6: per-limb carries of the `S * 2^r2` schoolbook product (range-checked).
     pub shifted_sum_carries: [T; L2_SUM_LIMBS],
 
     /// Q7: stores the integer `L = k*B_LO^2*2^15` used for the lower comparison before alignment.
@@ -329,11 +295,9 @@ pub struct ScaleColumnsView<T: Copy> {
     /// bound, proving `T + sqrt_mantissa_parity <= upper_bound` by the same digit checks.
     pub upper_comparison_borrows: [T; UPPER_BORROW_BITS],
 
-    // ------------------------------------------------------------------------------------------
     // Grid snap `l2 = grid4(y)` (group G): round the sqrt code to a multiple of four, ties up.
     // SQRT_CODE + 2 = 4*GRID_SNAP_QUOTIENT + GRID_SNAP_REMAINDER,
     // GRID_SNAP_REMAINDER in [0, 4), and L2_CODE = 4*GRID_SNAP_QUOTIENT.
-    // ------------------------------------------------------------------------------------------
     /// G1: the snap quotient (bounded via the G3 decode: `4*GRID_SNAP_QUOTIENT < 2^15 + 2^7`).
     pub grid_snap_quotient: T,
     /// G1/G2: the snap remainder, in [0, 4) by two RC16s.
@@ -356,17 +320,12 @@ pub struct ScaleColumnsView<T: Copy> {
     /// N1: linf subnormal flag.
     pub linf_exp_is_zero: T,
 
-    // ------------------------------------------------------------------------------------------
-    // The scheme's norm floors (group H0): `l2f = max(l2, 2^-32)` and
-    // `linf_f = max(linf, 2^-32)` — the reference `Fp8QuantScheme.row_norms` floor, applied to
-    // BOTH norms BEFORE the scale chain (a zero row would otherwise divide by zero). Code
-    // order = value order on nonnegative bf16, so one order bit plus one RC16'd two-sided
-    // slack decide each max; the floored `(M, E*)` pairs are committed because the H1 FMA and
-    // H4 MUL/CLAMP22 consumers need them at degree <= 1 (the raw-field muxes are degree 2).
-    // ------------------------------------------------------------------------------------------
+    // H0: floor both norms at 2^-32. Code order matches value order for nonnegative
+    // BF16. The selected significand/exponent pairs are committed to keep downstream
+    // FMA and lookup expressions within the degree bound.
     /// H0: `l2_code >= 0x2F80` (the bf16 code of `2^-32`) order bit.
     pub l2_ge_floor: T,
-    /// H0: two-sided order slack for the l2 floor (RC16'd).
+    /// H0: two-sided order slack for the l2 floor (range-checked).
     pub l2_floor_order_slack: T,
     /// H0: the floored l2 significand `M(l2f)` (128 — the floor's own `M` — on floored rows).
     pub l2_floored_significand: T,
@@ -374,7 +333,7 @@ pub struct ScaleColumnsView<T: Copy> {
     pub l2_floored_exponent: T,
     /// H0: `linf_code >= 0x2F80` order bit.
     pub linf_ge_floor: T,
-    /// H0: two-sided order slack for the linf floor (RC16'd).
+    /// H0: two-sided order slack for the linf floor (range-checked).
     pub linf_floor_order_slack: T,
     /// H0: the floored linf significand `M(linf_f)`.
     pub linf_floored_significand: T,
@@ -397,16 +356,14 @@ pub struct ScaleColumnsView<T: Copy> {
     /// and rides the group-tuple channel to InputQuant's lambda encodings.
     pub sigma_sig_is_wide: T,
     /// S3 (jackpot check 4): the normalized sigma significand
-    /// `SIGMA_NORM = SIGMA_SIGNIFICAND * (2 - SIGMA_SIG_IS_WIDE) in [2^15, 2^16)`, so
-    /// `sigma = SIGMA_NORM * 2^(e(sigma) - 15)` exactly. Rides the group-tuple channel into
+    /// `normalized_sigma_significand = SIGMA_SIGNIFICAND * (2 - SIGMA_SIG_IS_WIDE) in [2^15, 2^16)`, so
+    /// `sigma = normalized_sigma_significand * 2^(e(sigma) - 15)` exactly. Rides the group-tuple channel into
     /// InputQuant's summand score; pad rows are excluded by the channel filter.
-    pub sigma_norm: T,
+    pub normalized_sigma_significand: T,
 
-    // ------------------------------------------------------------------------------------------
     // The scale chain (group H). No separate denominator floor exists (the reference floors
     // the norms, not the noised bound): `noised_bound >= linf_f >= 2^-32` by RNE monotonicity,
     // so DIV448 divides by the FMA output directly.
-    // ------------------------------------------------------------------------------------------
     /// H1: `noised_bound = RNE_bf16(dr * l2f + linf_f)` — the fused FMA gadget.
     pub noised_bound_fma: FmaBlock<T>,
 
@@ -417,7 +374,6 @@ pub struct ScaleColumnsView<T: Copy> {
     pub beta_scale_multiply: MulBlock<T>,
 }
 
-/// Total number of committed ScaleStark columns.
 pub const NUM_SCALE_COLUMNS: usize = size_of::<ScaleColumnsView<u8>>();
 
 // The committed-column count: 137 = 133 main + 4 class (a), of which the sqrt block is 65
@@ -461,9 +417,7 @@ pub const NUM_SCALE_PUBLIC_INPUTS: usize = 8;
 
 columns_view!(ScaleColumnsView, NUM_SCALE_COLUMNS, SCALE_COL_MAP);
 
-/// Number of leading class (a) ("known") columns: `GROUP_KEY`, `IS_LAST_ROW`, `IS_A_ROW`,
-/// `IS_PAD` — pure functions of the public geometry (`ScaleProgram::known_values`), re-checked
-/// by the batch verifier against the trace openings.
+/// Number of leading verifier-known schedule columns.
 pub const NUM_SCALE_KNOWN_COLUMNS: usize = SCALE_COL_MAP.is_pad + 1;
 
 #[cfg(test)]
@@ -478,7 +432,6 @@ mod tests {
         for (i, &c) in as_array.iter().enumerate() {
             assert_eq!(c, i);
         }
-        // Class (a) columns come first (their indices feed the future preprocessed oracle).
         assert_eq!(SCALE_COL_MAP.group_key, 0);
         assert_eq!(SCALE_COL_MAP.is_last_row, 1);
         assert_eq!(SCALE_COL_MAP.is_a_row, 2);

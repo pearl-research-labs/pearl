@@ -1,4 +1,4 @@
-//! Lookup descriptors for the ScaleStark computation.
+//! Scale's cross-table channels and lookup tables.
 //!
 //! The group cross-table lookup consumes each live InputQuant aggregate exactly once.
 //! Committed lookup tables then range-check the frame-sum and square-root-comparison limbs,
@@ -27,9 +27,7 @@ use super::columns::{
 };
 use super::stark::ScaleProgram;
 
-// ==================================================================================================
 // Channel: group tuples — InputQuant (looking) -> Scale (looked)
-// ==================================================================================================
 
 /// Scale's looked half of the group-tuple channel: the 13-component tuple
 /// `(GROUP_KEY, L2_FRAME_SUM, FRAME_DOUBLED_SCALE_EXPONENT, MAX_ABS, ALPHA_EXP,
@@ -82,7 +80,7 @@ pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWi
         ],
         F::from_canonical_u64(program.device.sigma_encoding_offset()),
     ));
-    columns.push(Column::single(m.sigma_norm));
+    columns.push(Column::single(m.normalized_sigma_significand));
     TableWithColumns::new(
         Table::Scale.into(),
         columns,
@@ -91,7 +89,6 @@ pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWi
 }
 
 // Committed LUT oracle instances
-// ==================================================================================================
 
 /// ScaleStark's per-row LUT instance inventory: RC16 x62, PAIR128 x3, EXPINFO x3, CLAMP22 x3,
 /// POW2D x3, RNERND x3, DIV448 x1 — 78 instances. Order: square root (Q), grid snap (G),
@@ -106,7 +103,7 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
     let half = F::TWO.inverse();
     let mut lookups: Vec<LutLookup<F>> = Vec::new();
 
-    // ---- Q1: frame-sum limbs + the canonicity cap (top limb < 2^14 => S < 2^62 < p). ----
+    // Q1: frame-sum limbs + the canonicity cap (top limb < 2^14 => S < 2^62 < p).
     for i in 0..L2_SUM_LIMBS {
         lookups.push(LutLookup::rc16(Column::single(m.frame_sum_limbs[i])));
     }
@@ -131,7 +128,7 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         filter: Filter::default(),
     });
 
-    // ---- Q7: midpoint-square limbs; MSQ = B_LO^2 < 2^20, so limb 1 < 2^4. ----
+    // Q7: midpoint-square limbs; MSQ = B_LO^2 < 2^20, so limb 1 < 2^4.
     lookups.push(LutLookup::rc16(Column::single(m.lower_boundary_squared_limbs[0])));
     lookups.push(LutLookup::rc16(Column::single(m.lower_boundary_squared_limbs[1])));
     lookups.push(LutLookup::rc16(Column::linear_combination([(
@@ -139,9 +136,9 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         F::from_canonical_u64(1 << 12),
     )])));
 
-    // ---- Q7: claim-side products B^2 * k * 2^15 < 2^53 — limbs 1..=3 committed (limb 0 is
+    // Q7: claim-side products B^2 * k * 2^15 < 2^53 — limbs 1..=3 committed (limb 0 is
     // provably zero: 32 | k), top limb < 2^5, capped at < 2^4 via the 2^12 scale (the honest
-    // bound is 2^52; the cap keeps the recomposition < 2^53 < p, alias-free). ----
+    // bound is 2^52; the cap keeps the recomposition < 2^53 < p, alias-free).
     for limbs in [&m.lower_boundary_product_limbs, &m.upper_boundary_product_limbs] {
         for i in 0..CLAIM_LIMBS {
             lookups.push(LutLookup::rc16(Column::single(limbs[i])));
@@ -167,8 +164,8 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         F::from_canonical_u64(15),
     )));
 
-    // ---- Q6: shifted-sum limbs and their carries (each per-limb product equation is < 2^32 on
-    // both sides given these ranges, hence exact over Z). ----
+    // Q6: shifted-sum limbs and their carries (each per-limb product equation is < 2^32 on
+    // both sides given these ranges, hence exact over Z).
     for i in 0..L2_SUM_LIMBS {
         lookups.push(LutLookup::rc16(Column::single(m.shifted_sum_limbs[i])));
     }
@@ -249,8 +246,8 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         F::from_canonical_u64(3),
     )));
 
-    // ---- G3: snapped-l2 decode — EXPINFO (also rejects a snap into the inf field: exponent
-    // 255 has no row) and the shared (L2_MANTISSA, LINF_MANTISSA) pair. ----
+    // G3: snapped-l2 decode — EXPINFO (also rejects a snap into the inf field: exponent
+    // 255 has no row) and the shared (L2_MANTISSA, LINF_MANTISSA) pair.
     lookups.push(LutLookup {
         table: LutTable::ExpInfo,
         keys: vec![Column::single(m.l2_exp)],
@@ -264,7 +261,7 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         filter: Filter::default(),
     });
 
-    // ---- N1: linf decode — EXPINFO (mantissa rides the G3 pair). ----
+    // N1: linf decode — EXPINFO (mantissa rides the G3 pair).
     lookups.push(LutLookup {
         table: LutTable::ExpInfo,
         keys: vec![Column::single(m.linf_exp)],
@@ -272,17 +269,17 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         filter: Filter::default(),
     });
 
-    // ---- H0: the two norm-floor MAXes' order slacks (l2 and linf vs 2^-32; the muxes are
-    // arithmetic constraints). ----
+    // H0: the two norm-floor MAXes' order slacks (l2 and linf vs 2^-32; the muxes are
+    // arithmetic constraints).
     lookups.push(LutLookup::rc16(Column::single(m.l2_floor_order_slack)));
     lookups.push(LutLookup::rc16(Column::single(m.linf_floor_order_slack)));
 
-    // ---- H1 (FMA), W2/W3: the order and far-gap slacks (0 on the inactive side, so
-    // unfiltered is complete). ----
+    // H1 (FMA), W2/W3: the order and far-gap slacks (0 on the inactive side, so
+    // unfiltered is complete).
     lookups.push(LutLookup::rc16(Column::single(m.noised_bound_fma.scale_gap_slack)));
     lookups.push(LutLookup::rc16(Column::single(m.noised_bound_fma.far_gap_slack)));
 
-    // ---- H1, W4/W8: the two POW2D powers (key domains are the range proofs). ----
+    // H1, W4/W8: the two POW2D powers (key domains are the range proofs).
     lookups.push(LutLookup {
         table: LutTable::Pow2D,
         keys: vec![Column::single(m.noised_bound_fma.exp_gap_capped)],
@@ -296,8 +293,8 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         filter: Filter::default(),
     });
 
-    // ---- H1, W8: wide split floor sandwich. K >= 2^16 here; the rounding-key bound proves
-    // K < 2^17. The remainder checks below prove R < 2^SHIFT. ----
+    // H1, W8: wide split floor sandwich. K >= 2^16 here; the rounding-key bound proves
+    // K < 2^17. The remainder checks below prove R < 2^SHIFT.
     lookups.push(LutLookup::rc16_filtered(
         Column::linear_combination_with_constant(
             [(m.noised_bound_fma.compression_quotient, one)],
@@ -314,7 +311,7 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         neg,
     )));
 
-    // ---- H1, W9: K's parity, two-sided: (K - K0)/2 in [0, 2^16). ----
+    // H1, W9: K's parity, two-sided: (K - K0)/2 in [0, 2^16).
     lookups.push(LutLookup::rc16(Column::linear_combination([
         (m.noised_bound_fma.compression_quotient, half),
         (m.noised_bound_fma.compression_quotient_lsb, -half),
@@ -327,7 +324,7 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         (m.noised_bound_fma.rounding_significand_key_high_bit, neg_limb_base),
     ])));
 
-    // ---- H1, W11: the cut depth and the shared RNE back-end. ----
+    // H1, W11: the cut depth and the shared RNE back-end.
     lookups.push(LutLookup {
         table: LutTable::Clamp22,
         keys: vec![Column::linear_combination_with_constant(
@@ -353,18 +350,15 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         filter: Filter::default(),
     });
 
-    // ---- H1, W12: the FMA exponent ban (out_exp <= 254 — makes the H2 code comparison and
-    // the downstream DIV448 key honest bf16 codes; 0 on zero/subnormal rows, so unfiltered). ----
+    // H1, W12: exclude exponent 255 before constructing the BF16 code used by DIV448.
     lookups.push(LutLookup::rc16(Column::linear_combination_with_constant(
         [(m.noised_bound_fma.out_exp, neg)],
         F::from_canonical_u64(254),
     )));
 
-    // ---- H3: alpha = RNE(448 / noised_bound) *is* the DIV448 row, keyed by the FMA output's
-    // affine code (no denominator floor — H0 floors the norms instead, and the key domain
-    // covers every constrained output; sentinel outputs carry exponent field 255, rejected by
-    // the validity RCs below), plus the alpha-mantissa 7-bit check (deviation: without it the
-    // value split is ambiguous). ----
+    // H3: DIV448 binds alpha to the rounded 448/noised_bound quotient.
+    // Exponent-255 sentinels fail the validity checks. The alpha-mantissa range check
+    // makes the output code's field decomposition unique.
     lookups.push(LutLookup {
         table: LutTable::Div448,
         keys: vec![Column::linear_combination([
@@ -392,8 +386,8 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         filter: Filter::default(),
     });
 
-    // ---- H4 (B1 = alpha * l2f, the FLOORED l2): CLAMP22 cut (key 535 - E*(alpha) - E*(l2f),
-    // affine in the committed floored exponent) + RNERND + the exponent ban. ----
+    // H4 (B1 = alpha * l2f, the FLOORED l2): CLAMP22 cut (key 535 - E*(alpha) - E*(l2f),
+    // affine in the committed floored exponent) + RNERND + the exponent ban.
     lookups.push(LutLookup {
         table: LutTable::Clamp22,
         keys: vec![Column::linear_combination_with_constant(
@@ -423,11 +417,8 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         F::from_canonical_u64(254),
     )));
 
-    // ---- H5 (B2 = B1 * dos): as H4, with the DOS effective exponent folded into the CLAMP22
-    // key as a program constant (the verifier-side constant-offset mechanism; DOS is
-    // structurally normal, so E*(dos) is its exponent field). `r` is the wire
-    // constant 16, so this offset is a consensus constant, not cache-key material.
-    // D1: derive it from the `DOS_EXP` public input once lookup keys can name PIs. ----
+    // H5: multiply beta_1 by dos. Its effective exponent is folded into the CLAMP22 key.
+    // The production noise rank is fixed, so this offset is independent of job geometry.
     let e_star_dos = u64::from(program.dos_code() >> 7);
     lookups.push(LutLookup {
         table: LutTable::Clamp22,
@@ -458,13 +449,9 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         F::from_canonical_u64(254),
     )));
 
-    // ---- T3: the jackpot liveness gates, one per side, on the last live row only (filter
-    // IS_LAST_ROW, a known column): RC16(DEAD_LIMIT - RUNNING_DEAD - 2^16·HI) with the
-    // boolean high-bit witness HI (constrained in `stark.rs`) proves
-    // `RUNNING_DEAD <= DEAD_LIMIT`. The honest slack is at most
-    // `DEAD_LIMIT = floor(side*k/64) < 2^16` (envelope `side*k < 2^22`), so the high
-    // bit plus one RC16 limb cover it; an over-limit total wraps the slack to `~p`, far
-    // outside RC16's window for either high-bit value. ----
+    // T3: on the last row, prove DEAD_LIMIT - RUNNING_DEAD = low16 + 2^16*high_bit.
+    // The high bit is boolean. Counts stay below 2^22 and limits below 2^16, so a
+    // negative slack wraps far outside the accepted range for either high-bit value.
     lookups.push(LutLookup::rc16_filtered(
         Column::public_input_minus_linear_combination(
             DEAD_LIMIT_A_PUBLIC_INPUT,

@@ -1,4 +1,4 @@
-//! ZK FP8: the multi-STARK proving system for prequant FP8 proof-of-work.
+//! FP8 proof-of-work: six main STARKs and committed lookup tables.
 //!
 //! Five main tables connected by cross-table lookups, all lookups (range checks included)
 //! targeting the precommitted consensus LUT oracle — fifteen more tables of the same batch,
@@ -25,10 +25,7 @@
 //! verifier-parsed job, twenty traces, every channel balanced. [`unpredictability`] is
 //! check 4's canonical integer mirror (the skip rule and consensus budget the AIRs enforce).
 //!
-//! **Scheme boundary.** This system proves exactly one scheme:
-//! prequant FP8 (`Quant::Fp8E4M3Prequant`) with int8 values, BF16 block scales, and FP8 E4M3
-//! matmul. The bridge from the shared job compiler rejects any program that is
-//! not the required four-plane prequant shape.
+//! Inputs use int8 values, BF16 block scales and FP8 E4M3 matmul.
 
 pub mod blake3_stark;
 pub mod chip;
