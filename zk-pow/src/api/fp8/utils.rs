@@ -238,6 +238,7 @@ fn matmul_fp8_windowed(
 
     let mut out: Vec<f32> = vec![0.0; m * n];
     let mut partials: Vec<Vec<f32>> = Vec::with_capacity(if record_partials { m * n } else { 0 });
+    let mut accumulator = Vec::with_capacity(group_size);
     for i in 0..m {
         let a_row = &a[i * k..(i + 1) * k];
         for j in 0..n {
@@ -248,7 +249,8 @@ fn matmul_fp8_windowed(
             check_not_nan_or_inf_f32(initial)?;
             let mut cell_partials: Vec<f32> =
                 Vec::with_capacity(if record_partials { k.div_ceil(MMA_GROUP_PRODUCTS) } else { 0 });
-            let mut accumulator = vec![GFloat::from(initial)];
+            accumulator.clear();
+            accumulator.push(GFloat::from(initial));
             for (a_val, b_val) in a_row.iter().zip(b_col) {
                 accumulator.push(multiply_fp8_to_gfloat(*a_val, *b_val, zero_exp));
                 if accumulator.len() == group_size {
@@ -256,7 +258,8 @@ fn matmul_fp8_windowed(
                     if record_partials {
                         cell_partials.push(collapsed);
                     }
-                    accumulator = vec![GFloat::from(collapsed)];
+                    accumulator.clear();
+                    accumulator.push(GFloat::from(collapsed));
                 }
             }
             // The final (possibly partial) group; when k is a multiple of the
