@@ -90,19 +90,37 @@ class ZKCertificate:
     header_hash: bytes
     proof: CertificateProof
     cert_version: CertificateVersion = field(default=CertificateVersion.ZK_DENSE)
+    ancestor_headers: list[PearlHeader] = field(default_factory=list)
 
     ZK_MAX_PROOF_DATA_SIZE: ClassVar[int] = _ZK_MAX_PROOF_DATA_SIZE
     FP8_MAX_PROOF_DATA_SIZE: ClassVar[int] = _FP8_MAX_PROOF_DATA_SIZE
+    MAX_ANCESTOR_HEADERS: ClassVar[int] = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.proof, CertificateProof):
             self.proof = CertificateProof(self.proof.public_data, self.proof.proof_data)
+        self._validate()
+
+    def _validate(self) -> None:
         max_proof = self._max_proof_data_size(self.cert_version)
         if len(self.proof.proof_data) > max_proof:
             raise ValueError(
                 f"Proof data is too large: {len(self.proof.proof_data)} bytes "
                 f"(max {max_proof} bytes)"
             )
+        if self.cert_version != CertificateVersion.PLAIN_FP8:
+            if self.ancestor_headers:
+                raise ValueError("Ancestor headers require a V4 certificate")
+            return
+        if len(self.header_hash) != 32:
+            raise ValueError("V4 header hash must be 32 bytes")
+        if len(self.proof.public_data) > _FP8_MAX_PROOF_DATA_SIZE:
+            raise ValueError("V4 public data exceeds max size")
+        if len(self.ancestor_headers) > self.MAX_ANCESTOR_HEADERS:
+            raise ValueError("V4 certificate permits at most two ancestor headers")
+        for header in self.ancestor_headers:
+            if len(header.serialize()) != PearlHeader.get_serialized_header_size():
+                raise ValueError("V4 ancestor header must include a full proof commitment")
 
     @staticmethod
     def _max_proof_data_size(cert_version: CertificateVersion) -> int:
@@ -114,9 +132,12 @@ class ZKCertificate:
         """Serialize to the wire format expected by the Go node.
 
         ZK_DENSE (v1): Version(4) | HeaderHash(32) | PublicData(164) | ProofDataLen(4) | ProofData
-        ZK_MOE / ZK_V3 / PLAIN_FP8: Version(4) | HeaderHash(32) | PublicDataLen(4) |
+        ZK_MOE / ZK_V3: Version(4) | HeaderHash(32) | PublicDataLen(4) |
             PublicData(N) | ProofDataLen(4) | ProofData
+        PLAIN_FP8 (v4): the same prefix, then AncestorCount(1) | AncestorHeaders(108 each).
+            The count is mandatory, including zero; parent precedes grandparent.
         """
+        self._validate()
         public_data = bytes(self.proof.public_data)
         proof = bytes(self.proof.proof_data)
 
@@ -132,16 +153,25 @@ class ZKCertificate:
                 dtype=_VARIABLE_PREAMBLE_DTYPE,
             )
             proof_data_len = struct.pack("<I", len(proof))
-            return preamble.tobytes() + public_data + proof_data_len + proof
+            encoded = preamble.tobytes() + public_data + proof_data_len + proof
+            if self.cert_version == CertificateVersion.PLAIN_FP8:
+                # Counts 0–2 have a single-byte canonical varint encoding.
+                encoded += bytes([len(self.ancestor_headers)])
+                encoded += b"".join(header.serialize() for header in self.ancestor_headers)
+            return encoded
         raise ValueError(f"ZKCertificate.serialize does not support {self.cert_version!r}")
 
     def get_serialized_size(self) -> int:
+        self._validate()
         pd_len = len(self.proof.public_data)
         proof_len = len(self.proof.proof_data)
         if self.cert_version == CertificateVersion.ZK_DENSE:
             return _DENSE_DTYPE.itemsize + proof_len
         if self.cert_version in _VARIABLE_LENGTH_VERSIONS:
-            return _VARIABLE_PREAMBLE_DTYPE.itemsize + pd_len + _PROOF_DATA_LEN_SIZE + proof_len
+            size = _VARIABLE_PREAMBLE_DTYPE.itemsize + pd_len + _PROOF_DATA_LEN_SIZE + proof_len
+            if self.cert_version == CertificateVersion.PLAIN_FP8:
+                size += 1 + len(self.ancestor_headers) * PearlHeader.get_serialized_header_size()
+            return size
         raise ValueError(
             f"ZKCertificate.get_serialized_size does not support {self.cert_version!r}"
         )
@@ -151,6 +181,7 @@ class ZKCertificate:
         """Deserialize from raw wire bytes (version-first dispatch)."""
         (raw_version,) = struct.unpack_from("<I", data, 0)
         cert_version = CertificateVersion(raw_version)
+        ancestor_headers = []
 
         if cert_version == CertificateVersion.ZK_DENSE:
             arr = np.frombuffer(data, dtype=_DENSE_DTYPE, count=1)[0]
@@ -164,11 +195,29 @@ class ZKCertificate:
             pd_len = int(arr["public_data_len"])
             pd_start = _VARIABLE_PREAMBLE_DTYPE.itemsize
             pd_end = pd_start + pd_len
-            public_data = data[pd_start:pd_end]
+            if cert_version == CertificateVersion.PLAIN_FP8 and pd_len > _FP8_MAX_PROOF_DATA_SIZE:
+                raise ValueError("V4 public data exceeds max size")
             (proof_data_len,) = struct.unpack_from("<I", data, pd_end)
-            proof_data = data[
-                pd_end + _PROOF_DATA_LEN_SIZE : pd_end + _PROOF_DATA_LEN_SIZE + proof_data_len
-            ]
+            public_data = data[pd_start:pd_end]
+            proof_start = pd_end + _PROOF_DATA_LEN_SIZE
+            proof_end = proof_start + proof_data_len
+            if cert_version == CertificateVersion.PLAIN_FP8:
+                if proof_data_len > _FP8_MAX_PROOF_DATA_SIZE:
+                    raise ValueError("V4 proof data exceeds max size")
+                if len(data) <= proof_end:
+                    raise ValueError("Truncated V4 proof data or missing ancestor count")
+                count = data[proof_end]
+                if count > cls.MAX_ANCESTOR_HEADERS:
+                    raise ValueError("V4 ancestor count must be between zero and two")
+                header_size = PearlHeader.get_serialized_header_size()
+                ancestors_start = proof_end + 1
+                if len(data) != ancestors_start + count * header_size:
+                    raise ValueError("Truncated V4 ancestor headers or trailing data")
+                ancestor_headers = [
+                    PearlHeader.deserialize(data[offset : offset + header_size])
+                    for offset in range(ancestors_start, len(data), header_size)
+                ]
+            proof_data = data[proof_start:proof_end]
         else:
             raise ValueError(f"Unsupported certificate version: {raw_version}")
 
@@ -176,6 +225,7 @@ class ZKCertificate:
             header_hash=header_hash,
             proof=CertificateProof(public_data, proof_data),
             cert_version=cert_version,
+            ancestor_headers=ancestor_headers,
         )
 
     @classmethod
@@ -184,6 +234,8 @@ class ZKCertificate:
         header: PearlHeader,
         proof: CertificateProof,
         cert_version: CertificateVersion = CertificateVersion.ZK_DENSE,
+        *,
+        ancestor_headers: list[PearlHeader] | None = None,
     ) -> "ZKCertificate":
         commitment = cls._get_proof_commitment(proof.public_data, cert_version=cert_version)
         if header.proof_commitment is None:
@@ -194,6 +246,7 @@ class ZKCertificate:
             header_hash=double_sha256(header.serialize()),
             proof=proof,
             cert_version=cert_version,
+            ancestor_headers=[] if ancestor_headers is None else ancestor_headers,
         )
 
     @staticmethod
