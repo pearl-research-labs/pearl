@@ -202,6 +202,7 @@ pub struct LambdaWitness {
 /// Builds a score witness from normalized significands and biased exponents.
 /// - `scaled_*` describes |alpha*x|; both fields are zero for x = 0.
 /// - The sigma significand is in [2^15, 2^16); sigma is positive.
+///
 /// For either nonzero addend, value = significand * 2^(biased_exponent - 283),
 /// where 283 = exponent bias 268 + normalization shift 15.
 pub fn lambda_witness(

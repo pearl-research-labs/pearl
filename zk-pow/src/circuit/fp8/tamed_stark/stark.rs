@@ -177,6 +177,7 @@ impl TamedProgram {
     /// - `cells`: row-major `(magnitude_exponent, skip_count)` tuples from Matmul;
     /// - `sigma_a`, `sigma_b`: row/column `(significand, exponent)` frames from Scale,
     ///   with exponents biased by 2048.
+    ///
     /// Panics if the untamed or skip count exceeds its budget.
     pub fn generate_trace<F: RichField>(
         &self,
