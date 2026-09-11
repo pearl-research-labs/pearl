@@ -65,7 +65,6 @@ use crate::circuit::fp8::wrapper::{
     Fp8CircuitCache, Fp8WrapperCircuits, OuterC, compact_proof_data, verify_compact_wrapped_proof, verify_wrapped_proof,
 };
 use crate::circuit::fp8::xor_fold_stark::stark::XorFoldProgram;
-use crate::ensure_eq;
 use crate::v2::api::proof_utils::hash_to_u32_field_array;
 
 /// The fp8 proof system's internal field, extension degree and hasher.
@@ -143,17 +142,6 @@ impl Fp8Prover {
         let proof_data = compact_proof_data(&job.system, &wrapped)?;
         Ok((statement.to_bytes(), proof_data))
     }
-}
-
-/// Trusted outer verifier data, LUT cap and constants/sigmas coefficients.
-/// [`verify_compact_wrapped_proof`] uses those coefficients to reconstruct
-/// omitted proof data. Obtain setup from [`Fp8Verifier::generate`] or trusted
-/// bytes via [`Fp8Verifier::from_bytes`].
-#[derive(Clone, Debug)]
-pub struct Fp8Verifier {
-    lut_cap: LutCap,
-    circuit: VerifierCircuitData<F, OuterC, D>,
-    constants_sigmas_polynomials: Vec<PolynomialCoeffs<F>>,
 }
 
 impl Fp8Verifier {
