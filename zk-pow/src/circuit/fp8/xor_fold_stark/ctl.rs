@@ -10,10 +10,7 @@ use starky::lookup::{Column, Filter};
 use super::super::ctl::{LutLookup, Table};
 use super::columns::XOR_FOLD_COL_MAP;
 
-/// XorFold's looking side of the **cell results** channel: `(CELL_ID,
-/// CELL_RESULT_F32_LO, CELL_RESULT_F32_HI)`, filter `1 - IS_PAD` — every live row folds
-/// exactly one finished cell; the power-of-two padding rows fold nothing.
-/// Matmul's looked side is `super::super::ctl::ctl_cell_results_looked_matmul`.
+/// Imports `(cell_id, f32_lo, f32_hi)` from Matmul on every live row; padding folds no cell.
 pub fn ctl_cell_results_looking_xor_fold<F: Field>() -> TableWithColumns<F> {
     let m = &XOR_FOLD_COL_MAP;
     TableWithColumns::new(
@@ -23,12 +20,7 @@ pub fn ctl_cell_results_looking_xor_fold<F: Field>() -> TableWithColumns<F> {
     )
 }
 
-/// XorFold's looked side of the **lottery words** channel: `(LANE_ID,
-/// FOLD_OUT)` with the affine `FOLD_OUT = (ROTATION_INPUT_BOTTOM19_LIMB_0
-/// + 2^16*ROTATION_INPUT_BOTTOM19_LIMB_1)*2^13 + ROTATION_INPUT_TOP13`, filter
-/// `IS_LANE_FINAL`. Blake3's looking side sends 16 tuples pairing each word position with the
-/// corresponding `BLAKE3_MSG` word on the lottery message-load row
-/// (`blake3_stark::ctl::ctl_lottery_words_looking_blake3`).
+/// Exports `(lane_id, fold_out)` on lane-final rows, binding Blake3's 16 lottery message words.
 pub fn ctl_lottery_words_looked_xor_fold<F: Field>() -> TableWithColumns<F> {
     let m = &XOR_FOLD_COL_MAP;
     TableWithColumns::new(
@@ -45,18 +37,8 @@ pub fn ctl_lottery_words_looked_xor_fold<F: Field>() -> TableWithColumns<F> {
     )
 }
 
-/// XorFoldStark's per-row LUT inventory: RC16 x10 — the four mul-add limbs,
-/// the rotation-split bounds and the canonicity cap `MULADD_HIGH_LIMB_1 + 1` that kills X1's
-/// `+p` limb alias.
-///
-/// Both sub-16-bit splits use the unshifted + shifted RC16 pair, because a scaled RC16 alone
-/// never bounds a Goldilocks column (`2^k` divides `v + j*p` for suitable `j`, producing huge
-/// canonical aliases whose scaled key is still `< 2^16`):
-/// - `ROTATION_INPUT_TOP13`: the unshifted check prevents wrap, then the `2^3`-scaled check
-///   gives the 13-bit bound.
-/// - `ROTATION_INPUT_BOTTOM19_LIMB_1`: the unshifted check plus the `2^13`-scaled check gives
-///   the 3-bit bound. Without the unshifted half, an alias can satisfy X2's split while moving
-///   `FOLD_OUT`, enabling free lottery grinding.
+/// Ten RC16 lookups per row bound the multiply-add limbs and rotation splits,
+/// and keep the recomposed multiply-add result below the field modulus.
 pub fn xor_fold_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
     let m = &XOR_FOLD_COL_MAP;
     vec![
@@ -65,16 +47,22 @@ pub fn xor_fold_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
         LutLookup::rc16(Column::single(m.muladd_high_limb_0)),
         LutLookup::rc16(Column::single(m.muladd_high_limb_1)),
         LutLookup::rc16(Column::single(m.rotation_input_bottom19_limb_0)),
+        // Bound to 16 bits before scaling by 2^3, then require the scaled value to fit too.
+        // Together these give a 13-bit bound. A scaled check alone can wrap modulo p,
+        // admitting a large field value that changes FOLD_OUT while satisfying X2.
         LutLookup::rc16(Column::single(m.rotation_input_top13)),
         LutLookup::rc16(Column::linear_combination([(
             m.rotation_input_top13,
             F::from_canonical_u64(1 << 3),
         )])),
+        // The same pair with scale 2^13 bounds the upper part of the 19-bit split to 3 bits.
         LutLookup::rc16(Column::single(m.rotation_input_bottom19_limb_1)),
         LutLookup::rc16(Column::linear_combination([(
             m.rotation_input_bottom19_limb_1,
             F::from_canonical_u64(1 << 13),
         )])),
+        // Cap the highest limb at 65534, keeping the 64-bit recomposition below p.
+        // Otherwise X1 could accept the intended integer plus the field modulus.
         LutLookup::rc16(Column::linear_combination_with_constant(
             [(m.muladd_high_limb_1, F::ONE)],
             F::ONE,

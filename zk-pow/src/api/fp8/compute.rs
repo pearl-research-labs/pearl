@@ -1,20 +1,12 @@
-//! Shared `compute_dtype` (BF16) element-wise primitives, mirroring the
-//! reference `ComputeOps` (`miner_base.compute_ops`).
-//!
-//! These ops feed the bit-exact operand-building path (per-row scale derivation
-//! and the noise lines, hence the lottery) but have NO accumulation order to pin
-//! — they are plain element-wise arithmetic, identical on any device. Each input
-//! decodes exactly to f32, the op runs in f32, and the result rounds back to
-//! BF16 with ties-to-even: the same semantics as the reference's torch BF16
-//! kernels.
+//! BF16 arithmetic for operand construction. Multiply and divide use f32
+//! intermediates; [`bf16_fma`] preserves a single rounding to BF16.
 
 use anyhow::Result;
 
 use super::dtype::{bf16_to_f32, f32_to_bf16};
 
-/// Element-wise BF16 op: decode both inputs exactly to f32, apply `op`, round
-/// the result back to BF16 (round-to-nearest-even). Errors on a non-finite
-/// result (overflow / NaN), matching the FP8 module's no-non-finite invariant.
+/// Apply `op` in f32 and round to BF16, ties to even.
+/// Returns an error if the result is non-finite or overflows BF16.
 fn bf16_op(a: u16, b: u16, op: impl Fn(f32, f32) -> f32) -> Result<u16> {
     f32_to_bf16(op(bf16_to_f32(a), bf16_to_f32(b)))
 }
@@ -27,59 +19,72 @@ pub fn bf16_div(a: u16, b: u16) -> Result<u16> {
     bf16_op(a, b, |x, y| x / y)
 }
 
-/// BF16 minimum (`torch.minimum`). The comparison is exact and the result is one
-/// of the inputs, so nothing rounds.
+/// BF16 minimum; returns one input without rounding.
 pub fn bf16_min(a: u16, b: u16) -> u16 {
     if bf16_to_f32(a) <= bf16_to_f32(b) { a } else { b }
 }
 
-/// BF16 maximum (`torch.maximum`). Exact, like [`bf16_min`].
+/// BF16 maximum; returns one input without rounding.
 pub fn bf16_max(a: u16, b: u16) -> u16 {
     if bf16_to_f32(a) >= bf16_to_f32(b) { a } else { b }
 }
 
-/// Clamp a BF16 value into `[-hi, hi]` (`hi >= 0`), composed of exact min/max
-/// comparisons — mirrors the reference's `clamp(x, -hi, hi)`.
+/// Clamp to `[-hi, hi]`, with `hi >= 0`.
 pub fn bf16_clamp_sym(x: u16, hi: u16) -> u16 {
     bf16_max(bf16_min(x, hi), hi ^ 0x8000)
 }
 
-/// Fused multiply-add `a*b + c` with a SINGLE rounding to BF16 — the hardware
-/// FMA contract (CUDA `__hfma` on `__nv_bfloat16`, PTX `fma.rn.bf16`), a bitwise
-/// port of the reference's `ComputeOps.fma`.
+/// `a*b + c` with one rounding to BF16.
 ///
-/// BF16 operands make `a*b` exact in f64 (two 8-bit significands need 16 <= 53
-/// bits). A TwoSum recovers the exact residual of `a*b + c`, from which the exact
-/// real sum is rounded to f32 with round-to-ODD; the final f32 -> BF16 RNE cast
-/// then rounds correctly (round-to-odd defuses the double rounding). Errors on a
-/// non-finite result.
+/// The BF16 significands have eight bits each, so their 16-bit product is exact
+/// in f64. TwoSum recovers the addition error, giving the real-valued identity
+/// `a*b + c = rounded_sum + sum_residual`.
+///
+/// Rounding first to f32 can lose which side of a BF16 midpoint the sum lies
+/// on. A sum just above a midpoint may round to that midpoint in f32; BF16
+/// then treats it as a tie and may incorrectly round down.
+///
+/// For an inexact finite f32 result, we force the last significand bit to 1
+/// ("round to odd"). If it is currently 0, move one f32 step toward the exact
+/// sum. The sign of
+/// `rounding_error = (rounded_sum - rounded_f32) + sum_residual`
+/// chooses the direction: positive means up, negative means down.
+/// BF16 midpoints have that bit 0, so inexact values cannot become false ties.
+/// Exact f32 results, including genuine BF16 midpoints, are left unchanged.
+///
+/// Returns an error on a non-finite result.
 pub fn bf16_fma(a: u16, b: u16, c: u16) -> Result<u16> {
     let a64 = bf16_to_f32(a) as f64;
     let b64 = bf16_to_f32(b) as f64;
     let c64 = bf16_to_f32(c) as f64;
-    let p = a64 * b64; // exact
-    let s = p + c64; // f64 RNE approximation of the exact sum x = a*b + c
-    let t = s - c64;
-    let r = (p - t) + (c64 - (s - t)); // TwoSum: x - s, exact
-    let s32 = s as f32; // brackets x: |s32 - x| < 0.51 ulp
-    let err = (s - s32 as f64) + r; // sign(x - s32); nonzero iff x != s32
-    // Round-to-odd fixup: if x is not representable and s32's significand is
-    // even, the bracketing odd neighbour is the next f32 toward x.
-    let fix = err != 0.0 && (s32.to_bits() & 1 == 0) && s32.is_finite();
-    let rounded = if fix {
-        if err > 0.0 { s32.next_up() } else { s32.next_down() }
+    // Two eight-bit BF16 significands have an exact 16-bit product in f64.
+    let exact_product = a64 * b64;
+    // TwoSum recovers the addition error: a*b + c = rounded_sum + sum_residual.
+    let rounded_sum = exact_product + c64;
+    let recovered_product = rounded_sum - c64;
+    let sum_residual = (exact_product - recovered_product) + (c64 - (rounded_sum - recovered_product));
+    let rounded_f32 = rounded_sum as f32;
+    // Include both rounding errors to locate the exact sum relative to its f32 approximation.
+    let rounding_error = (rounded_sum - rounded_f32 as f64) + sum_residual;
+    // An odd low bit cannot represent a BF16 midpoint; move toward the exact sum if needed.
+    let needs_odd_rounding = rounding_error != 0.0 && (rounded_f32.to_bits() & 1 == 0) && rounded_f32.is_finite();
+    let odd_rounded_f32 = if needs_odd_rounding {
+        if rounding_error > 0.0 {
+            rounded_f32.next_up()
+        } else {
+            rounded_f32.next_down()
+        }
     } else {
-        s32
+        rounded_f32
     };
-    f32_to_bf16(rounded)
+    f32_to_bf16(odd_rounded_f32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Cross-checked against the reference `ComputeOps.fma` (torch, f64 path):
-    /// each `(a, b, c)` BF16 triple maps to the listed result.
+    /// Expected BF16 results generated with PyTorch using f64 intermediates.
     #[test]
     fn bf16_fma_matches_reference_vectors() {
         // (a, b, c) -> expected, all as BF16 bit patterns.

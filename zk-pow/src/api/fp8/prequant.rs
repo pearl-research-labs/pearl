@@ -1,124 +1,106 @@
-//! The miner's prequantized input dtype — int8 values + per-block BF16 scales —
-//! mirroring `miner_base.prequant`.
+//! Prequantized inputs: int8 values and per-block BF16 scales.
 //!
-//! Each committed operand is TWO strips: an int8 values tensor `(n x k)` and a
-//! per-block BF16 scales tensor `(n x k/BLOCK_SIZE)`. A block of [`BLOCK_SIZE`]
-//! contiguous int8 values shares one scale and opens to BF16 as
-//! `int_value * scale`. The two strips are committed separately and combined
-//! (`blake3(commit(int8) || commit(scales))`, the reference's `commit_planes`);
-//! the plaintext FP8 verifier opens them here and feeds the result to the
-//! quantization scheme, exactly as the miner opens its inputs before mining.
+//! Each [`BLOCK_SIZE`]-value block shares one scale. For signed int8 value
+//! `q_ij` and its block's BF16 scale `s_ib`, the represented and opened values are:
 //!
-//! A strip ([`PrequantSlice`]) is a checked concatenation of equal-width rows.
-//! Hashing and wire code see the stored bytes; signed int8 interpretation
-//! happens only at the arithmetic boundary (`byte as i8`). One operand's two
-//! strips are bundled in [`PrequantOperand`].
+//! ```text
+//! b         = floor(j / BLOCK_SIZE)
+//! X_ij      = q_ij * s_ib
+//! opened_ij = RNE_bf16(X_ij)
+//! ```
+//!
+//! `RNE_bf16` rounds to the nearest BF16 value, with ties to even.
+//! [`exact_norms`] uses `X`, before this per-element rounding, to compute
+//! each row's `rms = sqrt(sum_j X_ij^2 / k)` and `abs_max = max_j |X_ij|`.
+//! Both statistics are rounded to BF16; the RMS is then coarsened by
+//! [`round_l2_to_grid`].
+//!
+//! [`PrequantSlice`] stores equal-width rows as bytes; arithmetic interprets
+//! value bytes as signed int8. [`PrequantOperand`] pairs the two planes.
+//! They are committed separately, then their roots are combined.
 
 use anyhow::{Result, ensure};
 
 use crate::api::fp8::dtype::{bf16_to_f32, f32_to_bf16};
 
-/// Block size of the whitelisted `int8 blk8 bf16s` format: one BF16 scale per
-/// [`BLOCK_SIZE`] contiguous int8 values (`DEFAULT_BLOCK_SIZE` in the reference).
+/// Int8 values per BF16 scale.
 pub const BLOCK_SIZE: usize = 8;
 
 /// Low explicit BF16 mantissa bits cleared from `l2` (see [`round_l2_to_grid`]).
 pub const L2_ROUNDED_BITS: u32 = 2;
 
-/// Round a non-negative BF16 to the nearest multiple of `2^L2_ROUNDED_BITS`
-/// ulps (ties up), clearing its low [`L2_ROUNDED_BITS`] mantissa bits.
-/// Non-negative IEEE-754 floats order the same as their bit patterns, so this is
-/// "add half a grid step to the u16 view, clear the low bits", any carry into
-/// the kept mantissa/exponent bits falling out of the plain integer addition.
-/// Vs. ceiling to the same grid it is equally robust to a 1-ulp host
-/// discrepancy but has half the mean bias (0.5 vs 1.5 ulp). Called wherever a
-/// row's exact `sumsq` is turned into `l2`, so a <=1-ulp f32 discrepancy in
-/// `sumsq` between miner and verifier can't change the result.
+/// Round nonnegative BF16 bits to a grid with the low [`L2_ROUNDED_BITS`]
+/// bits cleared. Ties round upward.
 pub fn round_l2_to_grid(l2: u16) -> u16 {
     let step: u16 = 1 << L2_ROUNDED_BITS;
     l2.wrapping_add(step >> 1) & !(step - 1)
 }
 
-/// Per-row `(l2, linf)` (BF16 bits) computed straight from the prequant planes,
-/// bypassing [`open_prequant`]'s per-element BF16 rounding — mirroring
-/// `PrequantMatrix.exact_norms` in the reference miner.
+/// Compute each row's `(rms, abs_max)` from the prequant values, before
+/// [`open_prequant`]'s per-element rounding. Return BF16 codes with a grid-rounded RMS.
 ///
-/// Per block: `scale^2 * sum(int_i^2)` and `scale * max(|int_i|)`.
-/// `sum(int_i^2)` over a `block_size`-wide int8 block is exact in f32
-/// (`<= 127^2 * 8` for the default block size), so each block's contribution to
-/// `sumsq` only picks up the single f32 rounding of the `scale^2` multiply.
-/// `l2 = rms(X) = sqrt(sumsq / k)`, grid-rounded ([`round_l2_to_grid`]) so the
-/// per-row f32 block-sum order can differ from the reference's by an ulp
-/// without changing the result.
+/// "Exact" refers to the input values; the f32 sum of squares can still round.
 pub fn exact_norms(int_values: &[i8], scales: &[u16], num_rows: usize, k: usize, block_size: usize) -> Result<Vec<(u16, u16)>> {
     ensure!(
         block_size > 0 && k > 0 && k.is_multiple_of(block_size),
         "k={k} must be a positive multiple of block_size={block_size}"
     );
-    let n_blocks = k / block_size;
+    let blocks_per_row = k / block_size;
     ensure!(int_values.len() == num_rows * k, "int_values must be num_rows x k");
     ensure!(
-        scales.len() == num_rows * n_blocks,
+        scales.len() == num_rows * blocks_per_row,
         "scales must be num_rows x (k / block_size)"
     );
     let mut norms = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
-        let mut sumsq = 0.0f32;
+        let mut sum_of_squares = 0.0f32;
         let mut linf = f32::NEG_INFINITY;
-        for b in 0..n_blocks {
-            let ints = &int_values[i * k + b * block_size..i * k + (b + 1) * block_size];
-            // Both block reductions are exact in f32: sum of int8 squares
-            // (<= 127^2 * block_size) and the int8 abs-max.
-            let block_sumsq: f32 = ints.iter().map(|&v| (v as f32) * (v as f32)).sum();
-            let block_amax = ints.iter().map(|&v| (v as i32).unsigned_abs()).max().expect("block_size > 0") as f32;
-            let scale = bf16_to_f32(scales[i * n_blocks + b]); // exact
-            sumsq += block_sumsq * (scale * scale);
-            linf = linf.max(block_amax * scale.abs()); // 15-bit product, exact in f32
+        for block_index in 0..blocks_per_row {
+            let ints = &int_values[i * k + block_index * block_size..i * k + (block_index + 1) * block_size];
+            // For eight-value blocks, the integer sum of squares is exact in f32.
+            let block_sum_of_squares: f32 = ints.iter().map(|&v| (v as f32) * (v as f32)).sum();
+            let block_abs_max = ints.iter().map(|&v| (v as i32).unsigned_abs()).max().expect("block_size > 0") as f32;
+            let scale = bf16_to_f32(scales[i * blocks_per_row + block_index]); // exact
+            sum_of_squares += block_sum_of_squares * (scale * scale);
+            linf = linf.max(block_abs_max * scale.abs()); // 15-bit product, exact in f32
         }
-        ensure!(sumsq.is_finite(), "row {i} sum of squares overflows f32");
-        let l2 = round_l2_to_grid(f32_to_bf16((sumsq / k as f32).sqrt())?);
+        ensure!(sum_of_squares.is_finite(), "row {i} sum of squares overflows f32");
+        let l2 = round_l2_to_grid(f32_to_bf16((sum_of_squares / k as f32).sqrt())?);
         norms.push((l2, f32_to_bf16(linf)?));
     }
     Ok(norms)
 }
 
-/// Open a stack of prequantized rows to BF16:
-/// `opened[i][j] = int8[i][j] * scale[i][j / block_size]`.
-///
-/// `int_values` is `(num_rows x k)` row-major int8; `scales` is
-/// `(num_rows x k/block_size)` row-major BF16 (`u16`). The `int8 * scale` product
-/// is exact in f32 (int8 has <= 7 magnitude bits, BF16 8), so the only rounding
-/// is the final RNE cast back to BF16 — mirroring `PrequantMatrix.open`.
+/// Decode prequant values to BF16, rounding each product once to nearest, ties to even.
+/// Both inputs are row-major: `num_rows x k` values and `num_rows x (k/block_size)` scales.
 pub fn open_prequant(int_values: &[i8], scales: &[u16], num_rows: usize, k: usize, block_size: usize) -> Result<Vec<u16>> {
     ensure!(
         block_size > 0 && k.is_multiple_of(block_size),
         "k={k} must be a multiple of block_size={block_size}"
     );
-    let n_blocks = k / block_size;
+    let blocks_per_row = k / block_size;
     ensure!(int_values.len() == num_rows * k, "int_values must be num_rows x k");
     ensure!(
-        scales.len() == num_rows * n_blocks,
+        scales.len() == num_rows * blocks_per_row,
         "scales must be num_rows x (k / block_size)"
     );
-    let mut out = Vec::with_capacity(num_rows * k);
+    let mut opened_rows = Vec::with_capacity(num_rows * k);
     for i in 0..num_rows {
         for j in 0..k {
             let value = int_values[i * k + j] as f32; // exact
-            let scale = bf16_to_f32(scales[i * n_blocks + j / block_size]); // exact
-            out.push(f32_to_bf16(value * scale)?); // product exact in f32, single RNE -> BF16
+            let scale = bf16_to_f32(scales[i * blocks_per_row + j / block_size]); // exact
+            // A finite int8-by-BF16 product is exact in f32, so this is the only rounding.
+            opened_rows.push(f32_to_bf16(value * scale)?);
         }
     }
-    Ok(out)
+    Ok(opened_rows)
 }
 
-/// A Merkle-committed slice of `row_bytes`-wide rows, stored as one contiguous
-/// byte buffer in row order. The row count is `bytes.len() / row_bytes` (see
-/// [`row_count`](Self::row_count)).
-///
-/// Represents one of [`PrequantOperand`]'s strips.
+/// Contiguous, equal-width rows from one [`PrequantOperand`] plane.
+/// [`row_count`](Self::row_count) is the byte length divided by the row width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrequantSlice {
-    row_bytes: usize, // bytes per row
+    row_bytes: usize,
     bytes: Vec<u8>,
 }
 
@@ -193,10 +175,10 @@ impl PrequantSlice {
     }
 }
 
-/// One FP8 operand's two committed strips (int8 values and per-block BF16 scales).
+/// One operand's committed int8 values and BF16 block scales.
 ///
-/// FP8 format: every consecutive 8 entries are encoded as 8 int8 values and 1 BF16 scale.
-/// Cross-strip row-count equality is checked by [`num_rows`](Self::num_rows).
+/// Each scale applies to eight consecutive values. [`num_rows`](Self::num_rows)
+/// checks that the values and scales contain the same number of rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrequantOperand {
     pub values: PrequantSlice,
@@ -219,8 +201,7 @@ impl PrequantOperand {
 mod tests {
     use super::*;
 
-    /// Cross-checked against the reference `PrequantMatrix.open` (torch),
-    /// generated by running `miner_base`.
+    /// Expected values generated with PyTorch.
     #[test]
     fn open_prequant_matches_reference_vectors() {
         // 2 rows x 16 cols, block_size 8 => 2 blocks/row.
@@ -247,9 +228,7 @@ mod tests {
         assert!(open_prequant(&[0i8; 7], &[0x3f80], 1, 8, 8).is_err()); // int_values too short
     }
 
-    /// Cross-checked against the reference `PrequantMatrix.exact_norms` (torch),
-    /// generated by running `miner_base`
-    /// on the same fixture as `open_prequant_matches_reference_vectors`.
+    /// Expected norms generated with PyTorch for the same fixture as `open_prequant_matches_reference_vectors`.
     #[test]
     fn exact_norms_matches_reference_vectors() {
         let int_values: [i8; 32] = [

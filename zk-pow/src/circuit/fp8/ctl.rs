@@ -1,33 +1,26 @@
-//! Cross-table lookups of the ZK FP8 V2 multi-STARK system.
+//! Cross-table channels and fixed table order for the FP8 batch.
 //!
-//! This module pins down (a) the table indices, (b) the shared [`LutTable`]/[`LutLookup`]
-//! descriptor types every AIR's LUT inventory uses, and (c) [`all_cross_table_lookups`], the
-//! assembly of every channel. Each AIR's halves live next to it — `blake3_stark::ctl`,
-//! `input_quant_stark::ctl`, `matmul_b200_stark::ctl`, `scale_stark::ctl` and
-//! `xor_fold_stark::ctl`.
+//! A cross-table lookup (CTL) equates multisets of tuples. The looking side
+//! requests tuples; the looked side supplies them. Filters determine which rows
+//! participate and how many times each tuple is counted. These directions need
+//! not match the direction in which witness generation passes data.
 //!
-//! The full channel set is eight main channels (below) plus one channel per committed LUT
-//! ([`super::luts::lut_cross_table_lookups`]): each LUT is its own AIR of the batch, its
-//! looking side collects every instance of the six main tables' inventories, and its looked
-//! side is the LUT's slots filtered by their per-proof multiplicity columns (folded tables are
-//! multi-slot looked sides). 24 [`CrossTableLookup`]s in total.
+//! The main channels bind the following data:
 //!
-//! The eight main channels are:
+//! | Producer | Consumer | Bound data |
+//! | --- | --- | --- |
+//! | Blake3 | InputQuant | Packed int8 pairs and BF16 block scales |
+//! | InputQuant | Matmul | FP8 operand pairs and summand scores |
+//! | InputQuant | Scale | Group norms and liveness counts |
+//! | Matmul | XorFold | Final f32 cell results |
+//! | XorFold | Blake3 | Folded lottery words |
+//! | Scale | Tamed | Row and column noise scales |
+//! | Matmul | Tamed | Cell magnitude bounds and skip counts |
 //!
-//! - two Blake3 -> InputQuant channels: packed int8 pairs and BF16 block-scale codes;
-//! - InputQuant -> Matmul: packed fp8 operand-code pairs, each element paired with its
-//!   summand score `lambda` (jackpot check 4);
-//! - InputQuant -> Scale: group key, L2 frame sum/exponent, max absolute value, and the
-//!   liveness dead bound/count;
-//! - Matmul -> XorFold: cell id and the two limbs of the final f32 result;
-//! - XorFold -> Blake3: lane id and final folded word;
-//! - Scale -> Tamed: per-row noise-sigma tuples (jackpot check 3), Scale's side weighted by
-//!   the `w`/`h` public-input multiplicities;
-//! - Matmul -> Tamed: per-cell replay-magnitude binades and skip censuses
-//!   `(CELL_ID, E_CELL, CELL_SKIPS)` (jackpot checks 3 + 4).
-//!
-//! The first three channels contain disjoint A/B key spaces, so each uses one CTL with two
-//! side-specific slots; so does the sigma channel (disjoint A/B group keys).
+//! Each committed lookup table (LUT) adds one channel. Its looked side carries
+//! per-proof multiplicities: the number of times consumers request each entry.
+//! A and B slots share channels but use disjoint keys, so one side cannot satisfy
+//! the other side's requests. [`Table`] fixes the batch indices used by all channels.
 
 use plonky2::field::types::Field;
 use starky::cross_table_lookup::{CrossTableLookup, TableIdx};
@@ -104,21 +97,10 @@ pub const fn lut_table_idx(i: usize) -> TableIdx {
     NUM_TABLES + i
 }
 
-/// All fp8 cross-table lookups: the eight main channels in the module-docs order (the
-/// InputQuant-looked channels carry the A and B slots of one channel each), then one channel
-/// per committed LUT in [`LUT_TABLES`] order. No half bakes a geometry constant
-/// (InputQuant's key offsets and multiplicities are public-input terms of its CTL
-/// expressions; the other tables' keys ride their class (a) schedule columns), so the CTL
-/// structure is a pure function of `scale.r` — and `r` is the wire constant 32, making the
-/// set a consensus constant. `scale` supplies the noise rank behind the H5 `E*(dos)` lookup
-/// offset.
-///
-/// Balance preconditions (each documented on its halves): every table's live rows fill its
-/// power-of-two height exactly — Blake3 is the exception (its padding rows are all-zero, every
-/// filter off), and InputQuant's per-side liveness filters exclude each side's dead rows
-/// (`h` and `w` are independent — v19). Validated end-to-end by `super::consistency` via
-/// `starky::cross_table_lookup::debug_utils::check_ctls` (which reads non-binary filter values
-/// as multiplicities, the prover/constraint semantics).
+/// Main channels in the order above, followed by LUT channels in [`LUT_TABLES`] order.
+/// Geometry enters through public inputs and verifier-known columns; it does not change
+/// the channel structure. `scale.r` supplies the noise-rank exponent for Scale's lookups.
+/// Each channel's filters exclude padding and inactive A/B rows.
 pub fn all_cross_table_lookups<F: Field>(scale: &ScaleProgram) -> Vec<CrossTableLookup<F>> {
     let mut ctls = vec![
         CrossTableLookup::new(ctl_int8_bytes_looking_blake3(), ctl_int8_bytes_looked_input_quant()),
@@ -150,95 +132,62 @@ pub fn all_cross_table_lookups<F: Field>(scale: &ScaleProgram) -> Vec<CrossTable
     ctls
 }
 
-// ==================================================================================================
 // Committed LUT oracle instances
-// ==================================================================================================
 
-/// The consensus lookup tables (every AIR lookup, range checks included,
-/// targets one of these; there are no in-trace tables). Each is
-/// generated once by exhaustively evaluating the canonical Rust function it mirrors,
-/// precommitted at setup time (`super::luts::lut_preprocessed_data`) and served as its own
-/// AIR of the batch (`super::luts::LutStark`) through one [`CrossTableLookup`] channel.
+/// Fixed lookup tables, committed at setup by [`super::luts::lut_preprocessed_data`].
+/// Each table has one AIR and one cross-table channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LutTable {
     /// 16-bit range check (the ramp itself is the key) — every `RC16` instance.
     Range16,
     /// Paired 8-bit range check; a lone byte checks `(d, 0)` — Blake message bytes.
     Bytes2,
-    /// Paired 7-bit range check (2^14 keys, padded into the 2^16 height group) — mantissa
-    /// fields, ScaleStark's sqrt parity/l2-linf pairs.
+    /// Paired 7-bit range check: all 2^14 pairs.
     Pair128,
-    /// Keyed bf16 code, value fp8 E4M3 code (one precommitted column; the binding pins the
-    /// committed code into `[0, 256)`): `f32_to_fp8_e4m3(bf16_to_f32(clamp_±448(x)))` exactly
-    /// (RNE, saturation, subnormal region, signed zero) — InputQuant Q1-Q3.
+    /// BF16 code -> FP8 E4M3 code after clamping to ±448 and round-to-nearest-even.
+    /// Includes subnormals and signed zero.
     Qcast,
-    /// Keyed int8 byte (raw two's complement, `[0, 255]`), tuple value
-    /// `(SIGN, EXP, MANTISSA, EXP_IS_ZERO)`: the exact bf16 decode fields of the int8 value
-    /// (byte 0 -> +0; byte 0x80 -> `(1, 134, 0, 0)`); the key domain doubles as the byte range
-    /// proof — InputQuant P1.
+    /// Raw int8 byte -> `(sign, exponent, mantissa, exponent_is_zero)` of its BF16 value.
+    /// The key domain also checks that the byte is in `[0, 255]`.
     Int8Dec,
-    /// Keyed denominator (noised-bound) bf16 code, value bf16 code `RNE_bf16(448 / denom)` —
-    /// the alpha definition; native error paths map to sentinel codes (exponent 255) rejected
-    /// by the alpha validity RCs — Scale H3.
+    /// BF16 denominator -> `RNE_bf16(448 / denominator)`. Invalid divisions produce
+    /// exponent-255 sentinels, rejected by Scale's alpha range checks.
     Div448,
-    /// Keyed exponent field `[0, 254]` (the inf/NaN field 255 has **no row**), value the
-    /// `EXP_IS_ZERO` flag: subnormal-flag derivation *and* the exponent range/finiteness proof
-    /// via the out-of-domain pattern — every decode carrying the flag.
+    /// Exponent in `[0, 254]` -> zero-exponent flag. No row for 255: membership
+    /// also excludes infinities and NaNs.
     ExpInfo,
-    /// Keyed `x + 400` for `x in [-400, 200]`, value `clamp(x, -7, 18) + 7`: the RNERND slot
-    /// (the signed subnormal fade cut, biased by +7) for MUL and FMA; the domain doubles as the
-    /// key's range proof.
+    /// Key `x + 400`, `x in [-400, 200]` -> `clamp(x, -7, 18) + 7`, the RneRnd slot.
     Clamp22,
-    /// Keyed `d in [0, 19]`, value `2^d`: the shared power-of-two table for every capped
-    /// shift — the FMA's gap (capped at 19, the largest key anywhere) and round-to-odd
-    /// shift, Scale's sqrt mod-16 shift, InputQuant's block split and summand-score
-    /// stages (keys at most 16). The domain doubles as each consumer's range proof.
+    /// Shift `d in [0, 19]` -> `2^d`. The domain bounds the shift as well as its power.
     Pow2D,
-    /// Keyed `V + 2^17*CUT_DEPTH` (26 slots, one per slot = signed fade cut + 7 with cuts in
-    /// `[-7, 18]`; `V in [0, 2^17)`), tuple value
-    /// `(OUT_MANTISSA, WIDTH_ADJUST, OUT_IS_ZERO, OUT_EXP_IS_ZERO)`: the shared bf16 RNE
-    /// back-end of every MUL and FMA — width detection, guard/round/sticky, ties-to-even,
-    /// mantissa-overflow renormalization, subnormal fade and the normal/subnormal
-    /// classification all in-table; cut 18 provably rounds every `V < 2^17` to zero and cut -7
-    /// covers every scale with only normal small-significand results.
+    /// Rounding key `V + 2^17*cut_slot` -> `(mantissa, width_adjust, is_zero, exp_is_zero)`.
+    /// `V < 2^17` prevents aliasing between slots; `cut_slot = cut + 7`, `cut in [-7, 18]`.
+    /// Implements BF16 ties-to-even, overflow renormalization and subnormal rounding.
+    /// Cut 18 rounds every allowed V to zero; cut -7 covers normal small significands.
     RneRnd,
-    /// The B200 product decode + window truncation (`matmul_b200_stark`), keyed
-    /// `OPERAND_CODES_A + 2^8*OPERAND_CODES_B + 2^16*REL` with `REL in [0, 71]` slot-folded; values
-    /// `(ALIGNED_LANE_TERMS, PRODUCT_BIASED_EXPONENT, OPERAND_CODES_A, OPERAND_CODES_B, BINADE)`:
-    /// `ALIGNED_LANE_TERMS = ±floor(P*2^19 / 2^REL)` (P = mag_a*mag_b <= 225, sign folded, < 2^27),
-    /// `PRODUCT_BIASED_EXPONENT = sh_a + sh_b + 26 in [26, 54]`
-    /// the biased stored-exponent sum (sentinel 0 for zero products, with zero lane terms in
-    /// every slot), `BINADE` the product's check-3 binade `floor(log2 |prod|) + 139` (0 for
-    /// zero products, same in every slot) — MB13's per-lane bound. Slots `REL >= 27` hold
-    /// zero lane terms; negative rel-shifts have no slot
-    /// (this proves `GROUP_MAX_BIASED_EXPONENT >= PRODUCT_BIASED_EXPONENT_i`) — MB1.
+    /// Key `code_a + 2^8*code_b + 2^16*shift`, `shift in [0, 71]`, binds both codes,
+    /// the aligned signed product, its biased exponent and its magnitude binade.
+    /// The aligned term is `±floor(P*2^19 / 2^shift)`, `P <= 225`; zero products
+    /// use exponent/binade sentinel 0. Shifts >= 27 yield zero terms.
+    /// Negative shifts have no slot, proving the anchor is at least the product exponent.
     B200Align,
-    /// Keyed `d in [0, 63]`, value `2^min(d, 26)` — Matmul's carry alignment (MB5): the
-    /// divisor for `floor(4*GROUP_OUTPUT_SIGNIFICAND / 2^d)`; the 26-cap makes the floor total
-    /// (`4*GROUP_OUTPUT_SIGNIFICAND < 2^26`), and missing negative keys prove
-    /// `GROUP_MAX_BIASED_EXPONENT >= GROUP_OUTPUT_BIASED_EXPONENT`.
+    /// Carry shift `d in [0, 63]` -> `2^min(d, 26)`.
+    /// Capping is exact for floor division because the dividend is below `2^26`.
+    /// No negative keys: the group anchor must be at least the carry exponent.
     Pow2Gb,
-    /// Keyed `GROUP_SUM_WIDTH in [1, 32]` (a shifted ramp: 32 live rows, no key 0), tuple value
-    /// `(TRUNCATION_POWER, LIFTING_POWER) = (2^max(W-24, 0), 2^max(24-W, 0))`: the
-    /// truncate-to-24-bits divisor/multiplier pair. Its key domain also proves
-    /// `GROUP_SUM_WIDTH <= 32`, hence `GROUP_SUM_ABS < 2^32` through MB7.
+    /// Width `W in [1, 32]` -> `(2^max(W-24, 0), 2^max(24-W, 0))`.
+    /// These powers truncate or lift to 24 bits. Together with MB7's remainder bounds,
+    /// the key domain proves the group sum is below `2^32`.
     Width32,
-    /// TamedStark's squared-comparison power (J4), keyed `t = d + 1024`, decoding `D = 2*d` —
-    /// the tau-folded doubled frame gap of the certificate `2^D <= Y` with
-    /// `Y = k*pp^2 < 2^80` (`tau_tame^2 = 2^16` rides the key's offset). Value:
-    /// `2^min(max(D,0),80)` as a base-2^16 limb vector (6 columns, exactly one limb
-    /// nonzero); the cap exceeds `Y`'s width, so the saturated comparison equals the
-    /// unsaturated one. The key domain doubles as the frame-gap window proof.
+    /// Key `d + 1024` -> six base-2^16 limbs of `2^min(max(2*d, 0), 80)`.
+    /// The key includes the fixed tau offset. Tamed compares this power against
+    /// `Y = k*(sigma_sig_a*sigma_sig_b)^2 < 2^80`, so saturation preserves the result.
     XfPow2,
-    /// Jackpot check 4's significand-product width, keyed `P in [0, 2^16)`, values
-    /// `(width(P), [P != 0])` — the bit length of a 16-bit product and its nonzero flag.
-    /// InputQuant binds it on the summand's significand product to build the lambda scores;
-    /// the nonzero flag pins the zero sentinel exactly, and the key domain doubles as the
-    /// product's range proof.
+    /// 16-bit significand product -> `(bit_width, is_nonzero)`. The key domain
+    /// bounds the product; the flag fixes the zero sentinel in the summand score.
     Width16,
-    /// Jackpot check 4's fixed-point log, keyed `n in [0, 2^16)`, value `floor(64 * log2 n)`
-    /// (0 at the key-0 sentinel). InputQuant binds it on the summand's sum of squares to
-    /// build the lambda scores.
+    /// `n in [0, 2^16)` -> `floor(64*log2(n))`, with zero sentinel at n = 0.
+    /// Used for the summand scores.
     Log16,
 }
 

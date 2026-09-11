@@ -19,7 +19,7 @@ pub const GROUP_WIDTH: usize = 32;
 /// every link constraint stays degree <= 3 (the first takes three factors and the last one).
 pub const NUM_ATT_LINKS: usize = 16;
 
-/// View of one MatmulB200Stark trace row. The constraint labels (MB1..MB13) refer to
+/// View of one MatmulB200Stark trace row. The constraint labels (MB1..MB16) refer to
 /// `super::stark`'s constraint groups.
 ///
 /// Exponent conventions: `PRODUCT_BIASED_EXPONENT`, `GROUP_MAX_BIASED_EXPONENT`, and
@@ -28,11 +28,7 @@ pub const NUM_ATT_LINKS: usize = 16;
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct MatmulB200ColumnsView<T: Copy> {
-    // ------------------------------------------------------------------------------------------
-    // Structural columns, class (a): verifier-recomputable from the program geometry
-    // (`MatmulProgram::known_values`); the batch verifier checks the trace openings against
-    // its own recomputed values.
-    // ------------------------------------------------------------------------------------------
+    // Verifier-known schedule columns; see `known_values`.
     /// Output cell index, constant across the cell's `k/32` rows; the XorFold channel key.
     pub cell_id: T,
     /// 1 on each cell's last row. Gates the f32 encode, the XorFold channel and the carry reset.
@@ -47,9 +43,7 @@ pub struct MatmulB200ColumnsView<T: Copy> {
     /// the operand-code and cell-result channels, and their lanes are pinned to zero products.
     pub is_padding: T,
 
-    // ------------------------------------------------------------------------------------------
     // Window-sum emulation (main).
-    // ------------------------------------------------------------------------------------------
     /// The lane's fp8 A-operand code, received from InputQuant via the pair-packed CTL and
     /// individually pinned by the B200ALIGN tuple's `OPERAND_CODES_A` binding (MB1).
     pub operand_codes_a: [T; GROUP_WIDTH],
@@ -82,7 +76,7 @@ pub struct MatmulB200ColumnsView<T: Copy> {
     /// `floor(4*GROUP_OUTPUT_SIGNIFICAND_prev / 2^min(d, 26))`. The x4 lifts the 24-bit
     /// significand onto the window's 26-bit scale. Zero on zero-carry rows.
     pub aligned_incoming_carry_lo: T,
-    /// High 10-bit limb of the aligned carry (RC16'd as `HI * 2^6`).
+    /// High 10-bit limb of the aligned carry (range-checked as `HI * 2^6`).
     pub aligned_incoming_carry_hi: T,
     /// 16 + 10-bit limbs of the floor remainder
     /// `4*GROUP_OUTPUT_SIGNIFICAND_prev - ALIGNED_INCOMING_CARRY *
@@ -137,55 +131,44 @@ pub struct MatmulB200ColumnsView<T: Copy> {
     /// High 16-bit limb of the cell result's f32 word.
     pub cell_result_f32_hi: T,
 
-    // ------------------------------------------------------------------------------------------
-    // Jackpot check 3 (MB13): the cell commits
-    // E_CELL = floor(log2 M) + 139 (M = its largest |product| or |partial sum|; 0 if all
-    // products are zero), and range checks prove E_CELL bounds every product's and partial
-    // sum's own binade.
-    // ------------------------------------------------------------------------------------------
+    // MB13: bound every product and partial-sum magnitude by one cell exponent.
+    // The witness generator chooses the exact maximum; constraints permit larger bounds.
     /// MB13: the lane product's `floor(log2 |product|) + 139` (0 for a zero product), served
-    /// by the same B200ALIGN lookup as the term. `RC16(E_CELL - LANE_BINADES_i)` proves the
-    /// bound; nonzero binades are >= 121, so E_CELL = 0 implies an all-zero cell.
+    /// by the same B200ALIGN lookup as the term. `RC16(CELL_MAGNITUDE_EXPONENT - LANE_BINADES_i)` proves the
+    /// bound; nonzero binades are >= 121, so CELL_MAGNITUDE_EXPONENT = 0 implies an all-zero cell.
     pub lane_binades: [T; GROUP_WIDTH],
-    /// MB13: E_CELL, constant across the cell's rows, exported to TamedStark on the cell-final
-    /// row. The partial sums' bound is `RC16(E_CELL - GROUP_OUTPUT_BIASED_EXPONENT - 101)`
+    /// MB13: CELL_MAGNITUDE_EXPONENT, constant across the cell's rows, exported to TamedStark on the cell-final
+    /// row. The partial sums' bound is `RC16(CELL_MAGNITUDE_EXPONENT - GROUP_OUTPUT_BIASED_EXPONENT - 101)`
     /// (see `PARTIAL_BINADE_OFFSET`), filtered off on zero partials.
-    pub e_cell: T,
+    pub cell_magnitude_exponent: T,
 
-    // ------------------------------------------------------------------------------------------
-    // Jackpot check 4 (MB14-MB16): the per-lane skip census.
-    // ------------------------------------------------------------------------------------------
-    /// MB14: 1 iff `E_CELL != 0` (boolean; `(1 - NZ) * E_CELL = 0`). A nonzero cell cannot
-    /// claim `NZ = 0`: its lane binades force `E_CELL >= 121`. Gates the MB15 certificates.
+    // Jackpot check 4 (MB14-MB16): per-lane skip decisions and their running count.
+    /// MB14: 0 claims a zero cell via `(1 - cell_nonzero) * cell_magnitude_exponent = 0`.
+    /// Nonzero cells must set this flag: their lane binades force `cell_magnitude_exponent >= 121`.
     pub cell_nonzero: T,
     /// MB15: the lane's A-operand summand score `lambda`, received from InputQuant on the
     /// widened operand-code channel (0 encodes "no finite summand").
-    pub lambda_a: [T; GROUP_WIDTH],
-    /// The lane's B-operand summand score (see `lambda_a`).
-    pub lambda_b: [T; GROUP_WIDTH],
-    /// MB15: the lane's skip verdict (boolean; 0 on padding rows and zero cells). One-sided:
-    /// claiming *non-skip* costs the filtered RC16 certificate
-    /// `LAMBDA_A + LAMBDA_B - 128*E_CELL - skip_threshold_offset in [0, 2^16)`
-    /// (filter `CELL_NONZERO * (1 - SKIP_FLAG)`), while claiming *skip* is free — the census
-    /// can only be overstated.
+    pub summand_score_a: [T; GROUP_WIDTH],
+    /// The lane's B-operand summand score (see `summand_score_a`).
+    pub summand_score_b: [T; GROUP_WIDTH],
+    /// MB15: mark this lane as skipped. Boolean; zero on padding rows and zero cells.
+    /// A nonzero cell's unskipped lane must prove:
+    /// `SUMMAND_SCORE_A + SUMMAND_SCORE_B - 128*CELL_MAGNITUDE_EXPONENT - skip_threshold_offset in [0, 2^16)`
+    /// The filter is `CELL_NONZERO * (1 - SKIP_FLAG)`. Marking extra lanes as skipped
+    /// is allowed and only makes the tile's skip budget harder to satisfy.
     pub skip_flag: [T; GROUP_WIDTH],
-    /// MB16: in-cell running count of `SKIP_FLAG`; the cell-final value rides the E-cell
-    /// channel to TamedStark's budget gate.
+    /// MB16: sum of skip flags through this row within the current cell.
+    /// The cell's final count is sent to Tamed for the tile-wide budget check.
     pub cell_skips: T,
 }
 
-/// Total number of committed MatmulB200Stark columns.
 pub const NUM_MATMUL_B200_COLUMNS: usize = size_of::<MatmulB200ColumnsView<u8>>();
 
-// Committed-column count: 256 per-lane (8 arrays of 32) + 40 fixed main + 5 class (a)
-// + 3 fixed jackpot (E_CELL, CELL_NONZERO, CELL_SKIPS).
 const _: () = assert!(NUM_MATMUL_B200_COLUMNS == 304);
 
 columns_view!(MatmulB200ColumnsView, NUM_MATMUL_B200_COLUMNS, MATMUL_B200_COL_MAP);
 
-/// Number of leading class (a) ("known") columns: `CELL_ID`, `IS_CELL_FINAL`,
-/// `OPERAND_INDEX_BASE_A/B`, and `IS_PADDING` — pure functions of the program geometry
-/// (`MatmulProgram::known_values`).
+/// Number of leading verifier-known schedule columns.
 pub const NUM_MATMUL_B200_KNOWN_COLUMNS: usize = MATMUL_B200_COL_MAP.is_padding + 1;
 
 /// Number of MatmulB200Stark public inputs — none: the AIR is program-independent.
@@ -203,7 +186,6 @@ mod tests {
         for (i, &c) in as_array.iter().enumerate() {
             assert_eq!(c, i);
         }
-        // Class (a) columns come first (their indices feed `preprocessed_indices`).
         assert_eq!(MATMUL_B200_COL_MAP.cell_id, 0);
         assert_eq!(MATMUL_B200_COL_MAP.is_cell_final, 1);
         assert_eq!(MATMUL_B200_COL_MAP.operand_index_base_a, 2);

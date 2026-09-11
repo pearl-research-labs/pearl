@@ -1,24 +1,12 @@
-//! Trace columns for TamedStark — jackpot check 3 (tamed products), one row per tile cell.
+//! One trace row per output cell, followed by padding to a power of two.
 //!
-//! A row imports its cell's replay-magnitude binade `E_CELL = floor(log2 M) + 139` (Matmul's
-//! E-cell channel; sentinel 0 for the all-zero cell) and its tile row's/column's exact noise
-//! stds `sigma = SIG * 2^(EXP - 2048)` (Scale's sigma channel), commits the cell's `UNTAMED`
-//! verdict bit, and — on tamed nonzero rows — proves the certificate
+//! Each live row imports its magnitude bound and skip count from Matmul, and its
+//! two noise scales from Scale. A nonzero cell claimed tamed supplies an integer
+//! certificate `2^D <= Y`, with `Y = k*(sig_A*sig_B)^2 < 2^80`.
 //!
-//! ```text
-//! 2^(2*e_M) <= tau_tame^2 * K * (sigma_A * sigma_B)^2
-//! <=>  2^A <= Y,   Y = K * PP^2 < 2^80,
-//! ```
-//!
-//! where `PP = SIGMA_A_SIGNIFICAND * SIGMA_B_SIGNIFICAND < 2^32`, `K = k <= 2^16` is the
-//! public input, and `2^A` is the XFPOW2 saturating power of the folded frame gap with
-//! `tau_tame^2 = 2^14` absorbed into the shift (`super::stark` J4). The untamed count runs
-//! monotonically and is gated against the `TAME_LIMIT` public input on the last row (J6);
-//! the skip census (jackpot check 4) accumulates the same way and is gated against the
-//! `SKIP_LIMIT` public input (J7).
-//!
-//! [`TamedColumnsView`] fixes committed column order; [`TAMED_COL_MAP`] exposes the same
-//! layout as flat indices for lookups and cross-table channels.
+//! [`super::stark`] derives `D`, including the fixed `tau_tame^2` factor moved
+//! into its exponent. Untamed-cell and skip counts accumulate across the tile;
+//! the final row checks both public budgets.
 
 use crate::circuit::fp8::columns_view::columns_view;
 use crate::circuit::fp8::luts::XFPOW2_LIMBS;
@@ -31,19 +19,15 @@ pub const K_PP_PARTIAL_LIMBS: usize = 2;
 /// `A <= 80` and `Y < 2^80`).
 pub const COMPARISON_DIGITS: usize = 6;
 
-/// View of one TamedStark trace row. The constraint labels (J1..J7) refer to
-/// `super::stark`'s constraint groups; the certificate columns (J2-J5) are all-zero on
-/// untamed and zero-cell rows (their constraints are gated by `1 - UNTAMED - CELL_IS_ZERO`)
-/// and on pad rows (whose all-zero imports satisfy the active gates vacuously).
+/// View of one TamedStark trace row. Labels J1–J7 refer to [`super::stark`].
+///
+/// Trace generation fills the certificate columns with zero on untamed, zero-cell
+/// and padding rows. Untamed and zero-cell flags disable certificate arithmetic
+/// and the power lookup. Unfiltered limb and subtraction checks accept this zero fill.
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct TamedColumnsView<T: Copy> {
-    // ------------------------------------------------------------------------------------------
-    // Shared structural columns, class (a): verifier-recomputable from the program (geometry).
-    // Committed *with the trace* but re-derived and checked by the batch verifier
-    // (`TamedProgram::known_values`, `starky`'s batch "known columns") — that binding carries
-    // every schedule fact, so they appear in no pinning constraint of their own.
-    // ------------------------------------------------------------------------------------------
+    // Verifier-known schedule columns; see `known_values`.
     /// Cell index `i*w + j` (row-major, Matmul's convention): the E-cell channel key. Pad rows
     /// carry `h*w + t`.
     pub cell_id: T,
@@ -59,12 +43,10 @@ pub struct TamedColumnsView<T: Copy> {
     /// `UNTAMED` pinned 0 (J1), certificate all-zero.
     pub is_pad: T,
 
-    // ------------------------------------------------------------------------------------------
     // CTL imports (each bound by its channel on live rows; free but harmless on pads).
-    // ------------------------------------------------------------------------------------------
-    /// The cell's replay-magnitude binade `E_CELL = floor(log2 M) + 139` (0 only for an
-    /// all-zero cell, enforced by Matmul's M13/MB13).
-    pub e_cell: T,
+    /// Upper bound on the cell's magnitude exponent, biased by +139, imported from Matmul.
+    /// Zero implies an all-zero cell; overstating the bound can only make acceptance harder.
+    pub cell_magnitude_exponent: T,
     /// The tile row's noise-std significand (< 2^16: a product of two bf16 significands,
     /// field-bound at the Scale side).
     pub sigma_a_significand: T,
@@ -74,48 +56,42 @@ pub struct TamedColumnsView<T: Copy> {
     pub sigma_b_significand: T,
     /// See [`Self::sigma_a_exp`].
     pub sigma_b_exp: T,
-    /// The cell's skip census — how many of its `k` summands Matmul's per-lane certificates
-    /// (M15/MB15) flagged as skippable; rides the E-cell channel. Pinned 0 on pads (J7);
-    /// Matmul's census can only be overstated, and the J7 gate rejects totals above
-    /// `SKIP_LIMIT`.
+    /// Number of this cell's summands marked as skipped, imported from Matmul.
+    /// MB15 allows overcounting but prevents undercounting. J7 requires zero on
+    /// padding and rejects a tile-wide total above `SKIP_LIMIT`.
     pub cell_skips: T,
 
-    // ------------------------------------------------------------------------------------------
-    // Verdicts and censuses (J1, J7).
-    // ------------------------------------------------------------------------------------------
-    /// The cell's untamed bit. 0 activates the tamed certificate below, so a prover can only
-    /// *overstate* the untamed count — and the J6 gate rejects counts above `TAME_LIMIT`.
+    // Verdicts and running counts (J1, J7).
+    /// Adds one to the untamed count and disables the tamed certificate when set.
+    /// A nonzero cell with this bit cleared must supply a certificate. The prover
+    /// may overcount untamed cells; J6 still requires the total to fit `TAME_LIMIT`.
     pub untamed: T,
     /// Running untamed count (prefix sum including this row).
     pub running_untamed: T,
-    /// Running skip census (prefix sum of `CELL_SKIPS` including this row), frozen through
-    /// pads; the last row's value faces the J7 budget gate.
+    /// Sum of `CELL_SKIPS` through this row, unchanged on padding.
+    /// J7 checks the final total against `SKIP_LIMIT`.
     pub running_skips: T,
-    /// 1 claims the all-zero cell (J1 pins `CELL_IS_ZERO * E_CELL = 0`): M = 0 is tamed by
-    /// definition, so the certificate is skipped — it would demand `Y >= 2^A > 0`, which a
-    /// zero cell need not prove. Mutually exclusive with `UNTAMED`.
+    /// Claims an all-zero cell, requiring `cell_magnitude_exponent = 0` (J1).
+    /// Zero cells are tamed by definition and bypass the integer certificate.
+    /// This flag is mutually exclusive with `untamed`.
     pub cell_is_zero: T,
 
-    // ------------------------------------------------------------------------------------------
     // J2: the sigma significand product, split into 16-bit limbs.
-    // ------------------------------------------------------------------------------------------
-    /// `PP = SIGMA_A_SIGNIFICAND * SIGMA_B_SIGNIFICAND` as two RC16'd limbs.
+    /// `PP = SIGMA_A_SIGNIFICAND * SIGMA_B_SIGNIFICAND` as two range-checked limbs.
     pub sigma_product_limbs: [T; 2],
 
-    // ------------------------------------------------------------------------------------------
     // J3: `Y = K * PP^2 < 2^80`, built as `W = K*PP` (3 digits) then `Y = W*PP` (5 digits)
     // by exact base-2^16 schoolbook arithmetic.
-    // ------------------------------------------------------------------------------------------
-    /// Limbs of `K * PP_LO` (< 2^32: two RC16'd limbs).
-    pub k_pp_lo_partial: [T; K_PP_PARTIAL_LIMBS],
+    /// Limbs of `K * PP_LO` (< 2^32: two range-checked limbs).
+    pub k_sigma_product_lo: [T; K_PP_PARTIAL_LIMBS],
     /// Limbs of `K * PP_HI` (< 2^32).
-    pub k_pp_hi_partial: [T; K_PP_PARTIAL_LIMBS],
-    /// `W`'s digit 1 (digit 0 is `K_PP_LO_PARTIAL[0]` verbatim; digit 2 is the
-    /// constraint-side expression `K_PP_HI_PARTIAL[1] + K_PP_CARRIES[0] <= 2^16`).
-    pub k_pp_mid_limbs: [T; 1],
+    pub k_sigma_product_hi: [T; K_PP_PARTIAL_LIMBS],
+    /// Middle digit of `W`. Its low digit reuses `K_SIGMA_PRODUCT_LO[0]`; its high
+    /// digit is reconstructed as `K_SIGMA_PRODUCT_HI[1] + K_SIGMA_PRODUCT_CARRIES[0] <= 2^16`.
+    pub k_sigma_product_middle_limbs: [T; 1],
     /// The carry bit of the digit-aligned add `W = K*PP_LO + 2^16 * K*PP_HI`.
-    pub k_pp_carries: [T; 1],
-    /// `Y`'s digits 0..=3 (RC16'd; digit 4 is [`Self::bound_top`], digit 5 is structurally
+    pub k_sigma_product_carries: [T; 1],
+    /// `Y`'s digits 0..=3 (range-checked; digit 4 is [`Self::bound_top`], digit 5 is structurally
     /// zero — `Y < 2^80`).
     pub bound_limbs: [T; 4],
     /// The `W*PP` position-0 carry (< 2^16).
@@ -124,46 +100,33 @@ pub struct TamedColumnsView<T: Copy> {
     pub bound_carries_lo: [T; 2],
     /// High bits of the position-1..=2 carries.
     pub bound_carries_bit: [T; 2],
-    /// `Y`'s digit 4 — the position-3 carry (RC16'd).
+    /// `Y`'s digit 4 — the position-3 carry (range-checked).
     pub bound_top: T,
 
-    // ------------------------------------------------------------------------------------------
-    // J4: the left side 2^A, straight from the XFPOW2 table. On live tamed nonzero rows the
-    // lookup binds the limbs at key E_CELL - SIGMA_A_EXP - SIGMA_B_EXP + 4974; elsewhere it
-    // is off and the limbs stay zero. The limbs are already 2^A's base-2^16 digits.
-    // ------------------------------------------------------------------------------------------
-    /// `2^A` as base-2^16 limbs (`A = min(max(D, 0), 80)`, `D` the doubled frame gap with
-    /// `tau_tame^2 = 2^14` folded in).
-    pub shift_a_limbs: [T; XFPOW2_LIMBS],
+    // J4: XFPOW2 supplies the left side of the comparison on tamed nonzero rows.
+    /// `2^min(max(D, 0), 80)` as base-2^16 limbs. The doubled frame gap D includes
+    /// `TAU_TAME_SQ_LOG2` through `FRAME_GAP_OFFSET`.
+    pub comparison_power_limbs: [T; XFPOW2_LIMBS],
 
-    // ------------------------------------------------------------------------------------------
-    // J5: the digit-wise borrow chain proving `2^A <= Y` (the RC16'd per-digit keys live in
+    // J5: the digit-wise borrow chain proving `2^A <= Y` (the range-checked per-digit keys live in
     // `super::ctl`; only the borrow bits are committed).
-    // ------------------------------------------------------------------------------------------
     /// Borrow bits of `Y - 2^A` at digit boundaries 1..=5; no borrow leaves digit 5.
     pub comparison_borrows: [T; COMPARISON_DIGITS - 1],
 
-    // ------------------------------------------------------------------------------------------
     // J7: the skip budget gate (`SKIP_LIMIT` can exceed one limb, so the gate difference is
-    // committed as a two-limb split; both limbs RC16'd, the recomposition constrained on the
+    // committed as a two-limb split; both limbs range-checked, the recomposition constrained on the
     // last row only).
-    // ------------------------------------------------------------------------------------------
     /// Low 16 bits of `SKIP_LIMIT - RUNNING_SKIPS` on the last row; 0 elsewhere.
     pub skip_gate_slack_lo: T,
     /// High 16 bits of the same difference (< 2^32 for every sanctioned geometry).
     pub skip_gate_slack_hi: T,
 }
 
-/// Total number of committed TamedStark columns.
 pub const NUM_TAMED_COLUMNS: usize = size_of::<TamedColumnsView<u8>>();
 
-// Committed-column count: 5 class (a) + 6 imports + 4 verdict/census + 2 sigma product +
-// 16 bound build + 6 shift limbs + 5 borrows + 2 gate slack limbs.
 const _: () = assert!(NUM_TAMED_COLUMNS == 46);
 
-/// TamedStark public-input index: the inner dimension `K = k`. The untamed threshold is
-/// `tau_tame^2 * k * (sigma_A*sigma_B)^2` with `tau_tame^2 = 2^14` folded into the XFPOW2
-/// shift (`super::stark::FRAME_GAP_OFFSET`), so only `k` rides the proof.
+/// Inner dimension k. The fixed tau factor is absorbed into `FRAME_GAP_OFFSET`.
 pub const TAME_K_PUBLIC_INPUT: usize = 0;
 /// TamedStark public-input index: the untamed-cell allowance `floor(eps_tame * h * w)`.
 pub const TAME_LIMIT_PUBLIC_INPUT: usize = 1;
@@ -175,9 +138,7 @@ pub const NUM_TAMED_PUBLIC_INPUTS: usize = 3;
 
 columns_view!(TamedColumnsView, NUM_TAMED_COLUMNS, TAMED_COL_MAP);
 
-/// Number of leading class (a) ("known") columns: `cell_id`, `a_group_key`, `b_group_key`,
-/// `is_last_row`, and `is_pad`. Pure functions of the public geometry, re-checked against the
-/// trace openings.
+/// Number of leading verifier-known schedule columns.
 pub const NUM_TAMED_KNOWN_COLUMNS: usize = TAMED_COL_MAP.is_pad + 1;
 
 #[cfg(test)]
@@ -190,7 +151,6 @@ mod tests {
         for (i, &c) in as_array.iter().enumerate() {
             assert_eq!(c, i);
         }
-        // Class (a) columns come first (their indices feed the known-column binding).
         assert_eq!(TAMED_COL_MAP.cell_id, 0);
         assert_eq!(TAMED_COL_MAP.a_group_key, 1);
         assert_eq!(TAMED_COL_MAP.b_group_key, 2);

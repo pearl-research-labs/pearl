@@ -1,29 +1,13 @@
-//! Deterministic low-rank noise factors for one matmul, mirroring the reference
-//! miner (`miner_base.noise`).
+//! Deterministic FP8 noise for the opened rows of A and columns of B.
 //!
-//! All factors are stacks of "lines" from one keyed-BLAKE3 rule
-//! ([`sample_line`]). A line is `r` XOF bytes -> sign x UNIFORM magnitude in
-//! `[1, 128]` (never zero, no modulo bias), L2-NORMALIZED to the constant norm
-//! `c := NOISE_TARGET_NORM` (independent of `r`), then rounded to FP8 E4M3.
-//! Normalization is exact integer math plus one BF16 division, hence
-//! byte-identical on any host: `norm_scaled = isqrt(sumsq * INT_SQRT_PREC^2)`
-//! (exact FLOOR integer sqrt, so `floor(||x||_2 * INT_SQRT_PREC)`), then
-//! `scale = bf16(NOISE_TARGET_NORM * INT_SQRT_PREC) / bf16(norm_scaled)` (the
-//! one BF16 rounding), `entry_i = fp8(bf16(x_i) * scale)`.
+//! Each operand's noise is a matrix product `E @ F` with inner dimension `rank`.
+//! A noise "line" is a vector of `rank` entries: one row of E or one column of F.
+//! Lines are sampled independently from public seeds and indices, so any required
+//! line can be regenerated without sampling the rest of the matrix.
 //!
-//! A CONSTANT norm makes an `E@F` entry (`<e_row, f_col>` of two lines) have a
-//! KNOWN peak (`~c^2`, Cauchy-Schwarz) and rms (`~c^2/sqrt(r)`), so the quant
-//! scheme derives its per-row scales from `X`'s norms alone, never measuring
-//! `E@F`. The exact procedure is chosen purely for cross-host bit-exactness;
-//! the draw need not be Gaussian, only deterministic and public.
-//!
-//! Each line is random-access: the per-side noise seed is
-//! subkeyed under `pearl/v4/FP8/noise-line`, and each line is addressed by a
-//! `(side, factor, line)` tuple zero-padded to one 64-byte BLAKE3 block. `E`
-//! lines use the selected global row/column index; `F` lines use `0..k` and
-//! never vary by expert. The `F` basis is stored `k x r` row-major (the
-//! transpose of the reference's `(r x k)` view), so line `i` is column `i` of
-//! `F` — exactly the operand layout `B200::matmul_fp8` expects for `E @ F`.
+//! Every line is scaled toward the same Euclidean norm, [`NOISE_TARGET_NORM`],
+//! then rounded to FP8 E4M3. The target is independent of `rank`; quantization
+//! uses it when choosing how much noise to add.
 
 use crate::api::fp8::compute::{bf16_div, bf16_mul};
 use crate::api::fp8::dtype::{bf16_to_f32, f32_to_bf16, f32_to_fp8_e4m3};
@@ -32,105 +16,113 @@ use crate::api::fp8::quantization::NOISE_TARGET_NORM;
 use crate::api::fp8::transcript::{LABEL_NOISE_LINE, subkey};
 use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
 
-/// Fixed-point factor carrying `log2(32) = 5` fractional norm bits through the
-/// exact integer `isqrt` (`_INT_SQRT_PREC` in the reference). It cancels in the
-/// scale division; it only preserves precision in the floored square root.
+/// Keep five fractional bits of the norm by computing `floor(32 * sqrt(sum(x_i^2)))`.
 const INT_SQRT_PREC: u64 = 32;
 
-/// Deterministic per-matmul noise factors, one side per operand: `a` holds
-/// `(e, f)` (A-side, `EA @ FA`), `b` holds `(e, f)` (B-side, `EB @ FB`).
+/// Stores one [`OperandNoise`] per matrix operand.
+/// `a` contains A's E and F factors; `b` contains B's E and F factors.
 pub type Noise = Sides<OperandNoise>;
 
-/// One operand's paired noise factors: `e` (the row/col-keyed E-lines) and `f`
-/// (the shared F basis), whose product `E @ F` is the injected noise.
+/// Factors for one operand's noise matrix `E @ F`.
+/// For `n` selected A rows or B columns, the product has shape `n x k`,
+/// where `k` is the matrix multiplication's reduction dimension.
 pub struct OperandNoise {
-    /// `(h x r)` or `(w x r)` E4M3 values, row-major.
+    /// E as `n x rank` FP8 E4M3 bytes, stored row-major in the requested index order.
     pub e: Vec<u8>,
-    /// `(k x r)` E4M3 values, row-major (the reference's `F` transposed).
+    /// F transposed: `k x rank` FP8 E4M3 bytes, stored row-major.
+    /// Each stored row is one column of F, matching B200's matrix-multiplication layout.
     pub f: Vec<u8>,
 }
 
-/// Which operand a noise line belongs to. The discriminants are the committed
-/// wire bytes.
+/// Identifies the operand whose noise is being sampled: matrix A or matrix B.
+///
+/// `sample_line` writes this choice as the first byte of its hash input:
+/// 0 for A, 1 for B.
 #[repr(u8)]
 pub(crate) enum Side {
     A = 0,
     B = 1,
 }
 
-/// Which factor a noise line contributes to: the row/col-keyed `E` lines or the
-/// shared `F` basis. The discriminants are the committed wire bytes.
+/// Selects a factor in the operand's low-rank noise product `E @ F`.
+/// Each operand has its own E and F matrices.
+///
+/// `sample_line` writes this choice as the second byte of its hash input:
+/// 0 for E, 1 for F.
 #[repr(u8)]
 pub(crate) enum NoiseFactor {
     E = 0,
     F = 1,
 }
 
-/// Draws one keyed, L2-normalized line of `rank` FP8 E4M3 entries.
+/// Sample one row of E or one column of F as `rank` FP8 E4M3 entries.
 ///
-/// Derives the line key as [`subkey`] of [`LABEL_NOISE_LINE`] under `seed`, then
-/// keyed-BLAKE3-XOF's the address `side | factor | line(u32 LE)` — zero-padded to
-/// a constant 64 bytes (one BLAKE3 block) — to `rank` output bytes and normalizes
-/// them (see [`normalize_line`]). The caller resolves its `side` and the matching
-/// `seed`.
+/// Pass A's noise seed with `Side::A`, or B's noise seed with `Side::B`.
+/// For E, `line` is the global A-row or B-column index. For F, it is a column index in `0..k`.
+///
+/// Derive a key by hashing [`LABEL_NOISE_LINE`] under `seed`. Keyed BLAKE3 then
+/// expands this 64-byte input into `rank` bytes:
+///
+/// ```text
+/// side (1 byte) | factor (1 byte) | line (4 bytes, little-endian) | 58 zero bytes
+/// ```
+///
+/// Decode and scale those bytes with [`normalize_line`] to obtain the noise samples.
 pub(crate) fn sample_line(seed: &Hash256, side: Side, factor: NoiseFactor, line: u32, rank: u16) -> Vec<u8> {
     let key = subkey(LABEL_NOISE_LINE, Some(seed));
-    let mut material = Vec::with_capacity(64);
-    material.push(side as u8);
-    material.push(factor as u8);
-    material.extend_from_slice(&line.to_le_bytes());
-    assert!(material.len() <= 64, "noise line material must fit one BLAKE3 block");
-    material.resize(64, 0);
+    let mut line_address = Vec::with_capacity(64);
+    line_address.push(side as u8);
+    line_address.push(factor as u8);
+    line_address.extend_from_slice(&line.to_le_bytes());
+    assert!(line_address.len() <= 64, "noise line material must fit one BLAKE3 block");
+    line_address.resize(64, 0);
 
     let mut bytes = vec![0u8; usize::from(rank)];
     let mut hasher = blake3::Hasher::new_keyed(&key);
-    hasher.update(&material);
+    hasher.update(&line_address);
     hasher.finalize_xof().fill(&mut bytes);
 
     normalize_line(&bytes)
 }
 
-/// Decodes `bytes` into a signed integer line and renormalizes it to L2 norm
-/// [`NOISE_TARGET_NORM`], cast to FP8 E4M3.
-///
-/// `norm_scaled = floor(||x||_2 * INT_SQRT_PREC)` (exact integer `isqrt`), then
-/// `scale = bf16(NOISE_TARGET_NORM * INT_SQRT_PREC) / bf16(norm_scaled)` (one
-/// BF16 rounding), then `entry_i = fp8(bf16(x_i) * scale)`.
+/// Convert random bytes to FP8 samples with Euclidean norm near [`NOISE_TARGET_NORM`].
 fn normalize_line(bytes: &[u8]) -> Vec<u8> {
-    // Each `x_i` in ±[1, 128]: bit 7 the sign, `(b & 0x7F) + 1` the magnitude.
-    // `x_i` is stored as i64 (only to carry the sign; the magnitude never
-    // exceeds 128) so `x_i^2 <= 2^14`, and with `r <= u16::MAX` the sum of
-    // squares stays within `u64` for the exact `.isqrt()` below.
-    let x: Vec<i64> = bytes
+    // The high bit is the sign; adding one to the low seven bits gives magnitudes 1..=128, excluding zero.
+    let signed_samples: Vec<i64> = bytes
         .iter()
         .map(|&b| {
-            let sign = 1 - 2 * ((b >> 7) as i64); // +1 (bit 7 = 0) or -1
-            let magnitude = ((b & 0x7F) as i64) + 1; // uniform in [1, 128], never 0
+            let sign = 1 - 2 * ((b >> 7) as i64);
+            let magnitude = ((b & 0x7F) as i64) + 1;
             sign * magnitude
         })
         .collect();
 
-    let sumsq: u64 = x.iter().map(|&xi| (xi * xi) as u64).sum();
-    let norm_scaled = (sumsq * (INT_SQRT_PREC * INT_SQRT_PREC)).isqrt();
+    // With fewer than 2^16 samples of magnitude at most 128, the scaled sum of squares stays below 2^40.
+    let sum_of_squares: u64 = signed_samples.iter().map(|&sample| (sample * sample) as u64).sum();
+    // Scaling by 32 preserves five fractional bits when the integer square root rounds down.
+    let scaled_norm = (sum_of_squares * (INT_SQRT_PREC * INT_SQRT_PREC)).isqrt();
 
-    let numer = f32_to_bf16((NOISE_TARGET_NORM * INT_SQRT_PREC as f64) as f32).expect("8192 is representable");
-    let denom = f32_to_bf16(norm_scaled as f32).expect("norm_scaled < 2^24 is representable");
-    let scale = bf16_div(numer, denom).expect("noise-line scale is finite");
+    // Apply the same factor to the target norm, then round both operands to BF16 before dividing.
+    let scale_numerator = f32_to_bf16((NOISE_TARGET_NORM * INT_SQRT_PREC as f64) as f32).expect("8192 is representable");
+    let scale_denominator = f32_to_bf16(scaled_norm as f32).expect("norm_scaled < 2^24 is representable");
+    let scale = bf16_div(scale_numerator, scale_denominator).expect("noise-line scale is finite");
 
-    x.iter()
-        .map(|&xi| {
-            let xb = f32_to_bf16(xi as f32).expect("|x_i| <= 128 is representable in bf16");
-            let entry = bf16_mul(xb, scale).expect("noise entry is finite");
+    // Preserve the BF16 rounding before the final FP8 rounding; both use nearest, ties to even.
+    signed_samples
+        .iter()
+        .map(|&sample| {
+            let sample_bf16 = f32_to_bf16(sample as f32).expect("|x_i| <= 128 is representable in bf16");
+            let entry = bf16_mul(sample_bf16, scale).expect("noise entry is finite");
             f32_to_fp8_e4m3(bf16_to_f32(entry)).expect("noise entry is finite")
         })
         .collect()
 }
 
-/// Draws the four noise factors for one matmul instance.
+/// Generate E for the requested A rows and B columns, and a full F basis for each operand.
 ///
-/// `a_rows`/`b_cols` are the selected global row/column indices; the `E` lines
-/// key off those indices, and the `F` basis is `0..k` for both sides.
-/// `rank` is the peel rank `r`.
+/// `a_rows` and `b_cols` are global matrix indices; E preserves their order.
+/// `k` is the reduction dimension and `rank` is the inner dimension of `E @ F`.
+/// For a fixed seed and side, F is independent of which rows or expert were selected.
 pub(crate) fn sample_noise(k: usize, rank: u16, seeds: Sides<Hash256>, a_rows: &[u32], b_cols: &[u32]) -> Noise {
     let e_a = a_rows
         .iter()
@@ -153,14 +145,11 @@ pub(crate) fn sample_noise(k: usize, rank: u16, seeds: Sides<Hash256>, a_rows: &
     }
 }
 
-/// Derives this job's deterministic FP8 noise factors directly from the public
-/// statement (`k`, `rank`, the per-side noise seeds and the selected global
-/// row/column indices), without touching the compiled Blake program.
+/// Rebuild the noise factors from the public statement and proposed header.
 ///
-/// The `E` lines key off the selected global row/column indices (in MoE they are
-/// the winner's `i_a` outer rows and the `expert_col + base + i` columns, so the
-/// global address itself gives per-expert pair-uniqueness); the `F` basis is
-/// `0..k` for both sides.
+/// The statement selects the A rows and B columns. For mixture-of-experts (MoE)
+/// jobs, these are the winning expert's global indices. The header and statement
+/// determine the seeds, so the prover and verifier can regenerate the same noise.
 pub fn compute_fp8_noise(params: &PublicParams, proposed_header: &IncompleteBlockHeader) -> Noise {
     let a_rows = params.a_rows_indices();
     let b_cols = params.b_rows_indices();

@@ -1,5 +1,4 @@
-//! Shared plumbing for the `#[repr(C)]` column-view structs: array conversions, borrows and the
-//! identity column map — identical for every fp8 STARK, so implemented once here.
+//! Array conversions and column indices for homogeneous `#[repr(C)]` trace views.
 
 use core::mem::{ManuallyDrop, transmute_copy};
 
@@ -15,9 +14,8 @@ pub(crate) unsafe fn transmute_no_compile_time_size_checks<T, U>(value: T) -> U 
     unsafe { transmute_copy(&value) }
 }
 
-/// Implements the standard plumbing for a `#[repr(C)]` columns view over `$n` fields of one
-/// `Copy` type: `From<[T; $n]>` both ways, `Borrow`/`BorrowMut` both ways, `Default`, and the
-/// identity column map `$map` (each field holds its own flat trace index).
+/// Implement array conversions, borrows and `Default` for `$n` fields of a
+/// single `Copy` type. `$map` gives each field's flat trace index.
 macro_rules! columns_view {
     ($view:ident, $n:ident, $map:ident) => {
         impl<T: Copy> From<[T; $n]> for $view<T> {

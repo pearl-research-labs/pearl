@@ -1,47 +1,43 @@
-//! The committed LUT oracle: one AIR per logical table.
+//! Committed lookup tables: one [`LutStark`] per [`LutTable`].
 //!
-//! Each of the sixteen [`LutTable`]s ([`LUT_TABLES`]) is its own table of
-//! the batch STARK — a [`LutStark`] at its natural committed height [`lut_height`] (the
-//! array orders the batch by descending height, so nothing pays for another table's
-//! padding). A LUT AIR has no constraints of its own; its columns split into two classes:
+//! # What a lookup proves
 //!
-//! - **Precommitted columns** (class (c)): the key column(s) — a plain ramp for tables whose
-//!   key domain fills the height, the enumerated key tuple for BYTES2/PAIR128, or a saturated
-//!   key `min(i, live - 1)` for the sub-height tables — followed by every stored value column
-//!   in slot order ([`lut_precommitted_values`]). Generated once system-wide and committed at
-//!   setup by [`lut_preprocessed_data`] into a `BatchStarkPreprocessedData` whose Merkle cap
-//!   is a consensus constant. Proofs never recommit these columns — the batch prover copies
-//!   the setup commitment and FRI opens it alongside the trace oracles, while constraints and
-//!   lookups keep addressing them through the table's ordinary column indices.
-//! - **Multiplicity columns** (per-proof): one trace column per slot, counting how often each
-//!   row is looked up — [`LutMultiplicities`], job-dependent, committed with the trace like
-//!   any online column.
+//! Each table contains setup columns (keys and values) and per-proof multiplicity
+//! columns. [`lut_preprocessed_data`] commits the setup columns once; the verifier
+//! pins that cap. The AIR needs no local constraints: the fixed commitment defines
+//! the allowed tuples, and cross-table lookups bind consumers to those tuples.
 //!
-//! The lookup argument is one [`CrossTableLookup`] per table ([`lut_cross_table_lookups`]):
-//! the looking side collects every instance of every AIR's inventory (`keys ++ values` over
-//! the consumer's own trace), the looked side is the table's slots — a multi-slot looked side
-//! for the folded tables — each slot's `(ramp + key offset, stored values...)` tuple filtered
-//! by its multiplicity column, whose value *is* the row's multiplicity in the channel (the
-//! logup numerator semantics).
+//! For example, RC16 admits exactly the integer keys in `[0, 2^16)`. A consumer
+//! querying `RC16(x)` therefore proves that `x` is a 16-bit unsigned integer.
 //!
-//! Values are produced by exhaustively evaluating the canonical Rust mirror each table binds —
-//! reusing the starks' own mirror functions wherever one exists, so the tables and the traces
-//! cannot drift apart. [`generate`] returns the stored value columns (`columns[j][row]`); a
-//! row's key is its index plus the slot's key offset (`2^17 * slot` for RNERND, `2^16 * rel`
-//! for B200ALIGN). `RANGE16` stores nothing: its ramp
-//! key column *is* the table, and `BYTES2`/`PAIR128` store the enumerated key tuple itself.
+//! # Packed keys and table layout
 //!
-//! Padding (sub-height tables only) is always a *repeated valid entry*, never an
-//! out-of-domain key: the saturated key column repeats the last live key and the value columns
-//! are padded alike, so a malicious nonzero multiplicity on a padding row only re-proves a
-//! fact the table already serves.
+//! [`lut_cross_table_lookups`] combines all consumers of each table into one channel.
+//! The looked side has one slot per folded key range, weighted by its multiplicity.
+//! Some tables encode multiple key components in one field element:
 //!
-//! RNERND's slot index is a *signed* subnormal fade cut biased by +7: slot `s` serves
-//! `cut = s - 7 in [-7, 18]`, i.e. `KEY_SCALE = -133 - cut`. The negative cuts (slots 0-6)
-//! distinguish normal from subnormal cancellation results with `V < 128`, which share a
-//! significand but not a scale; slot 0 also serves every `KEY_SCALE >= -126` (all normal)
-//! and slot 25 every `KEY_SCALE <= -151` (all zero), so 26 slots cover the full scale range
-//! bit-exactly.
+//! ```text
+//! RneRnd key    = V + 2^17*slot
+//! B200Align key = code_a + 2^8*code_b + 2^16*shift
+//! ```
+//!
+//! `V` is RneRnd's integer significand; `slot` selects its rounding cut.
+//! The component bounds are essential: without `V < 2^17`, an oversized
+//! significand could select a different cut slot with the same packed key.
+//!
+//! Tables use their own power-of-two heights. Padding repeats a valid entry, so
+//! nonzero padding multiplicities cannot admit an out-of-domain tuple.
+//!
+//! [`generate`] returns value columns as `columns[column][row]`. Where available,
+//! it uses the same reference functions as trace generation. Range-only tables
+//! store keys without value columns.
+//!
+//! # BF16 rounding cuts
+//!
+//! RneRnd implements round to nearest BF16, with ties to the even significand (RNE).
+//! RneRnd slots cover signed cuts `[-7, 18]`, biased by +7. Negative cuts distinguish
+//! normal from subnormal results with small significands. The endpoints cover all
+//! larger/smaller scales: cut -7 gives normal nonzero results, and cut 18 rounds to zero.
 
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
@@ -98,14 +94,10 @@ pub const fn slot_height(table: LutTable) -> usize {
     }
 }
 
-/// XFPOW2's saturating exponent cap (jackpot check 3, TamedStark): the table serves
-/// `2^A`, `A = min(max(D, 0), 80)`, `D = 2*(E_CELL - exp(A) - exp(B) + 3949)` — the doubled
-/// frame gap with `tau_tame^2 = 2^16` folded in. The compared bound `Y = k * PP^2` is below
-/// `2^80`, so the cap never changes the verdict of `2^A <= Y`.
+/// Cap for the comparison power. Tamed compares against an integer Y < 2^80,
+/// so clipping its power-of-two exponent to [0, 80] preserves the verdict.
 pub const XFPOW2_CAP: u64 = 80;
-/// XFPOW2's key zero point: `D = 2*(key - 1024)`. The 2^11 key domain covers every reachable
-/// gap: `E_CELL in [121, 172]` on keying rows and sigma exponents in `[1781, 2287]` keep the
-/// key inside `[521, 1584]`.
+/// Key zero point: `D = 2*(key - XFPOW2_ZERO_POINT)` for the doubled comparison gap.
 pub const XFPOW2_ZERO_POINT: u64 = 1024;
 /// XFPOW2's `2^A` value as base-2^16 limbs (`A <= 80`: 6 limbs, exactly one nonzero).
 pub const XFPOW2_LIMBS: usize = 6;
@@ -212,13 +204,8 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 columns[2].push(f(u64::from(oiz)));
                 columns[3].push(f(u64::from(oez)));
             }
-            // The whole per-lane fp8 product, pre-truncated to the B200 window (Matmul's
-            // mirror; slot = REL). `ALIGNED_LANE_TERMS = ±floor(P*2^19 / 2^REL)` toward zero with
-            // the sign folded; slots REL >= 27 hold 0 (P < 2^8). `PRODUCT_BIASED_EXPONENT`
-            // is the biased stored-exponent sum (sentinel 0 for zero products,
-            // slot-independent). `OPERAND_CODES_A/B` echo the key's operand bytes, pinning the
-            // looking side's code columns individually. `BINADE` is the product's check-3
-            // binade `floor(log2 |prod|) + 139` (0 for zero products, same in every slot).
+            // Decode the operand pair and align its signed product for this shift slot.
+            // Exponent, operand codes and magnitude binade are shared across all slots.
             LutTable::B200Align => {
                 let p = B200Product::new((key & 0xFF) as u8, (key >> 8) as u8);
                 let aligned = if p.is_zero {
@@ -256,9 +243,7 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
     columns
 }
 
-// ==================================================================================================
 // Per-table AIR layout
-// ==================================================================================================
 
 /// Committed height of the table's AIR: the slot key domain rounded up to a power of two.
 /// Full-height for most tables; EXPINFO (255 -> 256), CLAMP22 (601 -> 1024) and POW2D
@@ -450,17 +435,14 @@ pub fn lut_trace<F: Field>(table: LutTable, multiplicities: Vec<Vec<F>>) -> Vec<
     cols.into_iter().map(PolynomialValues::new).collect()
 }
 
-// ==================================================================================================
 // The per-table AIR and its CTL channel
-// ==================================================================================================
 
-/// One committed LUT's AIR: a pure lookup table of `WIDTH` columns — the precommitted block,
-/// then the per-slot multiplicity columns. It has **no constraints of its own**: the
-/// precommitted columns are bound by the consensus setup cap, and the multiplicity columns
-/// only by the table's CTL channel balance ([`lut_cross_table_lookups`]).
+/// AIR for one committed lookup table: fixed table values followed by per-slot use counts.
+/// It has no local arithmetic constraints. The consensus setup cap binds the fixed
+/// values; cross-table lookup balance constrains the counts (see [`lut_cross_table_lookups`]).
 ///
-/// `WIDTH` must equal [`lut_num_columns`]`(table)` (asserted by [`Self::new`]; the per-table
-/// aliases below pin it) — the `Stark` trait wants the column count as a compile-time constant.
+/// The `Stark` trait requires a compile-time width. [`Self::new`] checks that `WIDTH`
+/// matches [`lut_num_columns`] for the chosen table.
 #[derive(Clone, Copy, Debug)]
 pub struct LutStark<F, const D: usize, const WIDTH: usize> {
     pub table: LutTable,
@@ -544,16 +526,11 @@ pub fn ctl_looked_lut_slot<F: Field>(table_idx: TableIdx, table: LutTable, slot:
     )
 }
 
-/// The committed LUT channels: one [`CrossTableLookup`] per table of `tables`
-/// ([`LUT_TABLES`] — position `i` is batch table [`lut_table_idx`]`(i)`).
-/// `inventories` are the main tables' LUT instance inventories at their batch indices; each
-/// channel's looking side collects every instance of its table across all of them (tuple
-/// `keys ++ values` over the consumer's trace, the instance's filter), and its looked side is
-/// the table's slots — a multi-slot looked side for the folded tables, with looked-side helper
-/// columns handled by starky.
+/// Connect each committed LUT to all of its consumers in `inventories`.
 ///
-/// Every table must have at least one looking instance (a consumerless LUT signals a wiring
-/// bug); width consistency of every half is asserted by `CrossTableLookup::new`.
+/// Each channel matches the consumers' `keys ++ values` tuples to the table's slots.
+/// `tables` follows [`LUT_TABLES`] order: entry `i` has batch index [`lut_table_idx`]`(i)`.
+/// Panics if a table has no consumers or the tuple widths disagree.
 pub fn lut_cross_table_lookups<F: Field>(
     tables: &[LutTable; NUM_LUT_TABLES],
     inventories: &[(TableIdx, Vec<LutLookup<F>>)],
@@ -572,6 +549,7 @@ pub fn lut_cross_table_lookups<F: Field>(
                 })
                 .collect();
             assert!(!looking.is_empty(), "{table:?} has no looking instances");
+            // Folded tables serve several slots per row; starky supplies their lookup helpers.
             let looked = (0..num_slots(table))
                 .map(|slot| ctl_looked_lut_slot(lut_table_idx(i), table, slot))
                 .collect();
@@ -580,9 +558,7 @@ pub fn lut_cross_table_lookups<F: Field>(
         .collect()
 }
 
-// ==================================================================================================
 // Per-proof multiplicities and the served-lookup checker
-// ==================================================================================================
 
 /// The per-proof half of the committed oracle: for every table, one count column per slot —
 /// `counts[LUT_TABLES position][slot][row]`. Filled by
@@ -696,11 +672,8 @@ impl LutMultiplicities {
     }
 }
 
-/// Debug/test-side oracle checker: walks LUT instance inventories over honest traces, checks
-/// every instance is *served* by the committed tables (key resolves in-domain, bound values
-/// equal the stored columns), and accumulates the per-slot multiplicities — the committed-LUT
-/// analogue of `starky::cross_table_lookup::debug_utils::check_ctls`, with per-instance error
-/// reporting the multiset check cannot give.
+/// Checks every evaluated lookup tuple against the fixed table values and records
+/// its multiplicity. Used during proving and in tests for precise membership errors.
 pub struct LutChecker<F: PrimeField64> {
     pub multiplicities: LutMultiplicities,
     /// Generated stored columns, cached per (table, slot) across inventories.
@@ -781,15 +754,11 @@ impl<F: PrimeField64> LutChecker<F> {
     }
 }
 
-// ==================================================================================================
 // Setup-time precommitment
-// ==================================================================================================
 
-/// The `BatchStarkPreprocessedData::new` inputs for a batch of `num_tables` tables in which
-/// LUT `i` (of [`LUT_TABLES`]) is table `table_positions[i]`:
-/// `(values_per_table, columns_per_table)` — each LUT's precommitted columns at its position
-/// (empty elsewhere). Positions must be strictly increasing (LUT heights descend in
-/// [`LUT_TABLES`] order and the batch orders tables by descending height).
+/// Returns `(values_per_table, columns_per_table)` for setup preprocessing.
+/// LUT i occupies `table_positions[i]`; other tables have empty entries.
+/// Positions must increase in [`LUT_TABLES`] order so setup columns retain descending heights.
 pub fn lut_preprocessed_inputs<F: Field>(
     num_tables: usize,
     table_positions: [usize; NUM_LUT_TABLES],
@@ -810,11 +779,8 @@ pub fn lut_preprocessed_inputs<F: Field>(
     (values, columns)
 }
 
-/// Precommits every LUT column except the per-proof multiplicities:
-/// builds the setup-time `BatchStarkPreprocessedData` — LDEs, the batched
-/// Merkle tree, and the cap that becomes a consensus constant. The prover copies this data
-/// into every proof's preprocessed oracle; the verifier checks proofs against the cap;
-/// neither regenerates or recommits the tables per job.
+/// Builds the setup LDEs, Merkle tree and cap for all fixed LUT columns.
+/// Per-proof multiplicities are excluded; the verifier must pin the resulting cap.
 pub fn lut_preprocessed_data<F, C, const D: usize>(
     num_tables: usize,
     table_positions: [usize; NUM_LUT_TABLES],
@@ -1090,12 +1056,9 @@ mod tests {
 
     #[test]
     fn rnernd_matches_both_stark_mirrors_and_the_exact_encode_exhaustively() {
-        // ScaleStark's `(v, slot)` mirror is the table row function; the slot encodes the
-        // signed fade cut, so the pair determines the result everywhere — including the
-        // formerly gapped cancellation band (`v < 128` with `KEY_SCALE in [-133, -127]`).
-        // Each slot's rows are checked against InputQuant's scale-carrying mirror and the
-        // independent exact encoder at its implied scale; the clamped boundary slots are also
-        // swept over further scales they serve.
+        // Compare every rounding slot with both the scaled witness function and an
+        // independent exact BF16 encoder. Include subnormal cancellation and scales beyond
+        // the clamped endpoint slots.
         for slot in 0..num_slots(LutTable::RneRnd) {
             let cols = generate::<F>(LutTable::RneRnd, slot);
             // slot = clamp(-133 - lsb_scale, -7, 18) + 7, so the implied scale is -126 - slot.
@@ -1342,7 +1305,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "wrong AIR width")]
     fn stark_with_mismatched_width_is_rejected() {
-        // RNERND needs 116 columns; a 3-column instantiation must panic.
+        // Reject a width that does not match the table layout.
         let _ = LutStark::<F, 2, 3>::new(LutTable::RneRnd);
     }
 

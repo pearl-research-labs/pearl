@@ -1,7 +1,7 @@
-//! Certificate v4 miner witness. Parameter tuples match [`PublicParams`]; plane
-//! openings are Merkle proofs; MoE is [`MoeWitness`].
+//! Miner witness for an FP8 certificate: job parameters and Merkle openings
+//! of the selected values and scales. MoE jobs also carry a [`MoeWitness`].
 //!
-//! Constructing this type does not validate the statement. Call
+//! Constructing a [`PlainProofV4`] does not validate the statement. Call
 //! [`PlainProofV4::parse_proof`].
 
 use anyhow::{Context, Result, ensure};
@@ -19,13 +19,15 @@ use crate::api::proof_utils::operand_digest_fp10;
 use crate::circuit::utils::macros::ensure_eq;
 use crate::ffi::plain_proof::{MatrixMerkleProof, parse_axis};
 
-/// Winner expert, the fully disclosed offset list `O` with its claimed root
-/// `HO`, and the opening of `R[w]` from the routing tree (`HR` is its root).
+/// Winning expert, the complete offsets list, and an opening of the winner's routing entries.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MoeWitness", get_all))]
 pub struct MoeWitness {
+    /// Winning expert's index.
     pub w: u16,
+    /// Complete offsets list `O`, whose entries delimit each expert's routing slice.
     pub offsets: Vec<u32>,
+    /// Claimed root `HO` of the offsets list; recomputed during verification.
     pub offsets_root: Hash256,
     #[serde(
         serialize_with = "MerkleProof::serialize_variable_chunk",
@@ -34,8 +36,7 @@ pub struct MoeWitness {
     pub routing: MerkleProof,
 }
 
-/// Miner witness: the job tuple ([`JobParams`] — same fields as the statement,
-/// including the proof-carried ancestor header `σ_Δ`), plus openings.
+/// Job parameters, including the ancestor header, and openings of the selected inputs.
 ///
 /// Does not validate the statement. Verification and proving must go through
 /// [`Self::parse_proof`], which runs witness-only checks then
@@ -52,9 +53,8 @@ pub struct PlainProofV4 {
     pub moe_witness: Option<MoeWitness>,
 }
 
-/// The job tuple rides the wire through the one shared encoder
-/// ([`JobParams::to_wire_bytes`]) — the same `ancestor ‖ pB ‖ pA` layout the
-/// consensus `public_data` codec uses, not a struct-order serde of the fields.
+/// Use [`JobParams::to_wire_bytes`] for `ancestor ‖ pB ‖ pA`.
+/// `public_data` uses the same parts with commitment digests between them.
 mod job_wire {
     use super::JobParams;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -69,8 +69,7 @@ mod job_wire {
     }
 }
 
-/// V4 openings: [`MerkleProof::serialize_variable_chunk`] on each `proof`
-/// (`MatrixMerkleProof` default serde is cert v1–v3 `chunk_1024`).
+/// Use [`MerkleProof::serialize_variable_chunk`] for each opening to preserve its chunk size.
 mod variable_chunk_sides {
     use super::{MatrixMerkleProof, MerkleProof, Sides};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -87,8 +86,7 @@ mod variable_chunk_sides {
             proof: &'a MerkleProof,
             row_indices: &'a [usize],
         }
-        // The wire shape is `Sides<Matrix>`: the shared derive pins the
-        // `a`-then-`b` field order in both directions.
+        // Use the same `Sides<Matrix>` field order for encoding and decoding.
         Sides {
             a: Matrix {
                 proof: &sides.a.proof,
@@ -124,7 +122,7 @@ mod variable_chunk_sides {
 }
 
 impl PlainProofV4 {
-    /// Strict fixint bincode.
+    /// Serialize with fixed-width integer encoding.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         use bincode::Options;
         bincode::options()
@@ -133,7 +131,7 @@ impl PlainProofV4 {
             .context("serialize PlainProofV4")
     }
 
-    /// Inverse of [`Self::to_bytes`]. No compat ladder; rejects trailing bytes.
+    /// Inverse of [`Self::to_bytes`]; rejects trailing bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         use bincode::Options;
         bincode::options()
@@ -143,15 +141,11 @@ impl PlainProofV4 {
             .context("deserialize PlainProofV4")
     }
 
-    /// Authenticate openings and build the public statement.
+    /// Validate the witness and return its authenticated private inputs and public statement.
+    /// Deserialization alone does not perform these checks.
     ///
-    /// This is the security gate for a [`PlainProofV4`]: witness-only checks,
-    /// then [`PublicParams::try_new`], then keyed-minimal openings. A plaintext
-    /// verifier starts here. Do not treat a deserialized [`PlainProofV4`] as a validated statement.
-    ///
-    /// `proposed_header` (`σ̂`) is the caller's header; the statement's B-side
-    /// keying uses the witness's own `job.ancestor_header` (`σ_Δ`), which
-    /// zk-pow takes as granted — the caller authenticates it.
+    /// The caller supplies `proposed_header` and must authenticate the proof's
+    /// `job.ancestor_header`, which determines the B-side keys.
     pub fn parse_proof(&self, proposed_header: &IncompleteBlockHeader) -> Result<(PrivateProofParams, PublicParams)> {
         self.check_shape()?;
 
@@ -272,20 +266,20 @@ impl PlainProofV4 {
         let o_w = offsets[w as usize];
         let o_last = *offsets.last().expect("|O| = e >= 1");
 
-        let r_w = extract_u32_span(&witness.routing, o_w_prev, o_w)?;
+        let winner_routing = extract_u32_span(&witness.routing, o_w_prev, o_w)?;
         ensure!(
-            r_w.len() == (o_w - o_w_prev) as usize,
+            winner_routing.len() == (o_w - o_w_prev) as usize,
             "R[w] length must equal O_w - O_{{w-1}} || |R[w]|={} s_w={}",
-            r_w.len(),
+            winner_routing.len(),
             o_w - o_w_prev
         );
         ensure!(
-            r_w.iter().all(|&tok| tok < self.job.operands.a.num_rows),
+            winner_routing.iter().all(|&tok| tok < self.job.operands.a.num_rows),
             "R[w] must be a subset of [0, m) || m={}",
             self.job.operands.a.num_rows
         );
-        // `a_outer` is I_A; `r_w` is R[w]. Returned inners satisfy R[w][inner_i] == I_A[i].
-        let inner_a = find_subset_in_sorted_array(&r_w, &a_outer)?;
+        // Map each selected global A row to its position in the winner's routing list.
+        let inner_a = find_subset_in_sorted_array(&winner_routing, &a_outer)?;
 
         ensure!(
             self.job.operands.b.num_rows.is_multiple_of(u32::from(moe.experts)),
@@ -293,16 +287,16 @@ impl PlainProofV4 {
             self.job.operands.b.num_rows,
             moe.experts
         );
-        let eta = self.job.operands.b.num_rows / u32::from(moe.experts);
+        let rows_per_expert = self.job.operands.b.num_rows / u32::from(moe.experts);
         let weight_col_offset = u32::from(w)
-            .checked_mul(eta)
+            .checked_mul(rows_per_expert)
             .ok_or_else(|| anyhow::anyhow!("w * η overflows u32"))?;
         for &idx in &self.values.b.row_indices {
             let idx = idx as u32;
             ensure!(
-                idx >= weight_col_offset && idx < weight_col_offset + eta,
+                idx >= weight_col_offset && idx < weight_col_offset + rows_per_expert,
                 "B column index {idx} out of range for expert {w} (expected [{weight_col_offset}, {}))",
-                weight_col_offset + eta
+                weight_col_offset + rows_per_expert
             );
         }
         let inner_b: Vec<u32> = b_rows.iter().map(|&idx| idx - weight_col_offset).collect();
@@ -327,11 +321,9 @@ fn scale_row_bytes(k: usize) -> usize {
     2 * (k / BLOCK_SIZE)
 }
 
-/// `HO`: the keyed chunk-tree root of the cumulative-count list `O` under `keyA` — the
-/// same keyed chunked hash that commits `Rflat` to `HR`. The u32-LE encoding of `O` is
-/// zero-padded to the `hash_idO` chunk granularity first. A flat keyed BLAKE3 digest
-/// coincides only while the padded list fits one chunk; this chunk-tree form is the
-/// normative one (twin: `miner_base.commitment.hash_offsets`).
+/// Commit cumulative offsets `O` as little-endian u32s, zero-padded to
+/// `hash_id`'s chunk size and hashed under `keyA`. This is a chunk-tree root,
+/// which can differ from a flat keyed BLAKE3 digest for smaller chunk sizes.
 pub(crate) fn offsets_root(offsets: &[u32], hash_id: HashId, key: Hash256) -> Result<Hash256> {
     let bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
     Ok(MerkleTree::with_chunk_len(&hash_id.pad(&bytes), key, hash_id.chunk_len())?.root())
@@ -370,17 +362,17 @@ fn extract_u32_span(proof: &MerkleProof, start: u32, end: u32) -> Result<Vec<u32
 /// Checks `arr[i] < arr[i + 1]` for every adjacent pair, and each
 /// `subset[i]` appears in `arr`.
 /// Returns the indices in `arr` at which the `subset` entries appear, in `subset` order.
-fn find_subset_in_sorted_array(arr: &[u32], subset: &[u32]) -> Result<Vec<u32>> {
+fn find_subset_in_sorted_array(sorted_values: &[u32], subset: &[u32]) -> Result<Vec<u32>> {
     ensure!(
-        arr.windows(2).all(|w| w[0] < w[1]),
+        sorted_values.windows(2).all(|w| w[0] < w[1]),
         "winner routing slice R[w] must be strictly increasing"
     );
     subset
         .iter()
         .map(|&s| {
-            let i = arr.partition_point(|&a| a < s);
+            let i = sorted_values.partition_point(|&a| a < s);
             ensure!(
-                i < arr.len() && arr[i] == s,
+                i < sorted_values.len() && sorted_values[i] == s,
                 "outer index {s} missing from the winner routing slice"
             );
             u32::try_from(i).context("routing slice longer than u32::MAX")
@@ -541,12 +533,6 @@ mod tests {
         digest.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    // ---- HO (offsets_root) pins -------------------------------------------
-    // The hex constants are cross-implementation pins: the Python twin
-    // (`miner_base.commitment.hash_offsets`) computes the same digests for the
-    // same vectors, so the two `hash_offsets`/`offsets_root` implementations
-    // cannot drift apart silently.
-
     #[test]
     fn ho_single_chunk_equals_flat_keyed_digest() {
         // 3 offsets = 12 bytes pad to one 1024 chunk: the chunk-tree root IS
@@ -589,8 +575,6 @@ mod tests {
         assert_ne!(base, offsets_root(&offsets, HashId::Blake3Chunk128, KEY).unwrap());
     }
 
-    // ---- check_shape / moe_projection rejections --------------------------
-
     fn tiny_tree(data_len: usize, hash_id: HashId) -> MerkleProof {
         let data: Vec<u8> = (0..data_len).map(|i| (i as u8).wrapping_mul(31)).collect();
         MerkleTree::with_chunk_len(&hash_id.pad(&data), KEY, hash_id.chunk_len())
@@ -598,10 +582,8 @@ mod tests {
             .get_multileaf_proof(&[0])
     }
 
-    /// A witness that satisfies every non-MoE `check_shape` gate (tree sizes,
-    /// matching values/scales indices) so tests can probe the MoE gates alone.
-    /// Openings are not honestly mined; `parse_proof` would fail later at the
-    /// keyed-opening checks, which is fine for shape-level tests.
+    /// Valid non-MoE shapes let tests isolate the MoE shape checks.
+    /// The openings are dummy data and need not pass `parse_proof`.
     fn tiny_moe_proof(experts: u16, offsets: Vec<u32>) -> PlainProofV4 {
         let hash_id = HashId::Blake3Chunk1024;
         let (m, n, k) = (4usize, 4usize, 256usize);
@@ -666,8 +648,7 @@ mod tests {
 
     #[test]
     fn check_shape_rejects_zero_experts_without_panicking() {
-        // Regression: `experts = 0` used to reach `offsets.last().expect(..)` and panic
-        // instead of erroring.
+        // Reject before calling `offsets.last().expect(..)`.
         let err = tiny_moe_proof(0, vec![]).check_shape().unwrap_err();
         assert!(err.to_string().contains("at least one expert"), "{err}");
     }

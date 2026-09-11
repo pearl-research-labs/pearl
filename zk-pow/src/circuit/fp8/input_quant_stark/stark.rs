@@ -1,37 +1,29 @@
-//! AIR and trace generation for FP8 V2's input-quantization stage.
+//! Input quantization, row statistics and summand scores.
 //!
 //! # What is proved
 //!
-//! One trace row handles one A element and one B element. For each live side it proves:
+//! Each trace row handles one A element and one B element. A group of `k` trace rows
+//! represents one matrix row on each side; each block of eight elements shares a scale.
+//! For each live side, the table proves:
 //!
 //! 1. `X = RNE_bf16(int8 * block_scale)`;
-//! 2. the element's contribution to the row's canonical sum of squares and running `max |X|`;
-//! 3. `noise_term = RNE_bf16(beta * n)`, where `n` is public-seed-derived noise;
-//! 4. `NOISED = RNE_bf16(alpha * X + noise_term)`, rounded only once after the addition;
-//! 5. the fp8 E4M3 output code and the jackpot liveness flag `IS_DEAD = [ABS(X) >= DEAD_BOUND]`
-//!    with its in-group count (transported to ScaleStark with the group tuple);
-//! 6. the element's summand score `LAMBDA` (jackpot check 4): with `au = alpha*X` and `sigma`
-//!    the group noise standard deviation, written over 16-bit normalized significands
-//!    `|au| = X_NORM * 2^(X_ENC - 268 - 15)` and `sigma = SIGMA_NORM * 2^(SIGMA_ENC - 268 - 15)`,
-//!    the score is the fixed-point logarithm of `au^2 + sigma^2` at 64 steps per factor of 2:
+//! 2. the row's framed sum of squares and maximum decoded `|X|`;
+//! 3. `noise_term = RNE_bf16(beta * n)`, where `n` is noise derived from public seeds;
+//! 4. `noised = RNE_bf16(alpha*X + noise_term)`, with one rounding after the addition;
+//! 5. the FP8 E4M3 cast, the dead-entry flag and its running count;
+//! 6. the integer summand score used by jackpot check 4.
 //!
-//!    ```text
-//!    gap    = 2*|X_ENC - SIGMA_ENC|                 (doubled exponent gap)
-//!    V      = big^2 + floor(small^2 / 2^gap)        if gap <= 30, else big^2
-//!    LAMBDA = 128*max(X_ENC, SIGMA_ENC) - 2624 + floor(64 * log2(V / 2^17))
-//!    ```
+//! `RNE_bf16` means round to nearest BF16, with ties to even. At a midpoint, choose
+//! the representable value whose significand has an even least-significant bit.
 //!
-//!    where `(big, small)` orders the two normalized significands by exponent. `X = 0`
-//!    contributes only the sigma term; a dead group's phantom rows score `LAMBDA = 0`.
+//! Blake3 binds the committed int8 bytes and block-scale codes. Scale verifies the
+//! completed row statistics and the claims for `alpha`, `beta` and the noise scale
+//! `sigma`. Matmul consumes the FP8 codes and summand scores.
 //!
-//! Blake3Stark supplies the committed int8 bytes and block-scale codes. ScaleStark verifies the
-//! completed row statistics, the resulting `alpha`/`beta` values, and the group's sigma
-//! encoding and significand. MatmulB200Stark consumes the fp8 output codes and the lambda scores.
+//! # BF16 arithmetic
 //!
-//! # Bf16 arithmetic
-//!
-//! `RNE_bf16` means round-to-nearest, ties-to-even into finite bf16. Bf16 has exponent bias 127
-//! and seven fraction bits. Writing its fields as `(sign, exp, mantissa)`:
+//! BF16 has exponent bias 127 and seven fraction bits. For a finite value `V`, let
+//! `exp_is_zero` be 1 when its exponent field is zero, and 0 otherwise. Define:
 //!
 //! ```text
 //! M(V)  = 128*(1 - exp_is_zero) + mantissa
@@ -39,112 +31,120 @@
 //! V     = (-1)^sign * M(V) * 2^(E*(V) - 134)
 //! ```
 //!
-//! The constant `134 = 127 + 7`. Defining `E* = 1` when `exp = 0` makes the same formula work
-//! for normals, subnormals, and zero. Therefore an exact product has integer significand
-//! `M(a)*M(b)` and scale `2^(E*(a) + E*(b) - 268)`, with `268 = 2*134`.
-//! AIR equations live in the Goldilocks field `p = 2^64 - 2^32 + 1`; the integer bounds below
-//! keep each constrained value below `p`, so field wraparound cannot mimic another integer.
+//! Here `134 = 127 + 7`. Using `E* = 1` for exponent field zero makes the formula
+//! valid for subnormals and zero as well as normal values. An exact product has
+//! integer significand `M(a)*M(b)` and binary scale `2^(E*(a) + E*(b) - 268)`.
+//!
+//! The constraints are equations in the Goldilocks field, whose modulus is
+//! `p = 2^64 - 2^32 + 1`. The bounds beside each constraint keep the relevant
+//! integer differences within `(-p, p)`, so equality modulo `p` implies equality
+//! over the integers.
 //!
 //! # Framed row statistics
 //!
-//! **What.** This table computes the sum of squares from which ScaleStark later derives L2.
-//! A matrix row contains `k` raw int8 values. The sum uses those values and their block scales,
-//! before elementwise products are rounded into `X`. For each eight-element block `b`:
+//! L2 denotes the row's root mean square (RMS). Its sum of squares uses the raw
+//! int8 values and block scales, before per-element BF16 rounding. For block `b`:
 //!
 //! ```text
-//! n_b = sum_j int8_j^2
+//! n_b = sum_{j in block b} int8_j^2
 //! p_b = M(scale_b)^2 * n_b
 //! ```
 //!
-//! **Why a frame is needed.** The exact block values
-//! `p_b * 2^(2*E*(scale_b) - 268)` may be hundreds of binary positions apart, so they cannot
-//! be added directly in one Goldilocks field element. The table instead expresses every block
-//! relative to the largest live scale exponent
-//! `F = max_b 2*E*(scale_b)` (or zero when the row is all zero).
+//! The exact block contribution is `p_b * 2^(2*E*(scale_b) - 268)`. These exponents
+//! can be too far apart to add the contributions in one field element. Instead,
+//! all blocks use a common frame `F`: the maximum `2*E*(scale_b)` over blocks with
+//! `p_b != 0`, or zero if every block is zero.
 //!
-//! **How.** `Wl2` is the number of extra low bits retained before each block is shifted into
-//! that common frame:
+//! `Wl2` controls how many low bits are retained when a block is shifted into that frame:
 //!
 //! ```text
-//! Wl2    = 27 - ceil(log2(k))          // 11..16 for 2048 <= k <= 2^16
-//! sigma_b = F - 2*E*(scale_b)
-//! TERM_b  = 0                                      if p_b = 0
-//!           floor(p_b * 2^Wl2 / 2^sigma_b)         otherwise
-//! S       = sum_b TERM_b
+//! Wl2     = 27 - ceil(log2(k))
+//! shift_b = F - 2*E*(scale_b)                       for p_b != 0
+//! term_b  = floor(p_b * 2^Wl2 / 2^shift_b)          for p_b != 0; otherwise 0
+//! S       = sum_b term_b
+//! sum_sq  = S * 2^(F - 268 - Wl2)
 //! ```
 //!
-//! Here `ceil(log2(k))` is the smallest integer `c` such that `k <= 2^c`.
+//! Each floor discards less than one frame unit, `2^(F - 268 - Wl2)`. This defines
+//! the protocol's sum of squares; summing the rounded `X_j^2` would give a different
+//! quantity. Scale divides `sum_sq` by `k` and checks its rounded square root.
+//! The independent running maximum tracks decoded `|X|` for the infinity norm, `linf`.
 //!
-//! Thus `S * 2^(F - 268 - Wl2)` is the canonical framed sum, with less than one frame unit
-//! discarded per block. It is deliberately not `sum X_j^2`, which would include one bf16
-//! rounding per decoded element.
+//! For supported `2048 <= k <= 2^16`, `11 <= Wl2 <= 16`. Honest blocks satisfy
+//! `n_b <= 8*128^2 = 2^17` and `p_b < 2^33`; the gadget reserves the wider bound
+//! `p_b < 2^37`. With `k/8` blocks, the choice of 27 keeps `S < 2^61` and
+//! `p_b*2^Wl2 < 2^53`. These fit inside Scale's `2^62` sum bound and the division
+//! gadget's `2^54` dividend bound.
 //!
-//! The bounds explain the otherwise arbitrary-looking 27. Honest blocks satisfy
-//! `n_b <= 8*128^2 = 2^17` and `p_b < 2^33`; the gadget reserves four more bits by accepting
-//! the wider bound `p_b < 2^37`. With `k/8` blocks, the chosen `Wl2` keeps `S < 2^61`, one bit
-//! below ScaleStark's `2^62` cap. It also keeps every `p_b*2^Wl2 < 2^53`, one bit inside the
-//! division gadget's four-16-bit-limb `2^54` cap (six bits in the top limb).
+//! # Fused multiply-add (FMA)
 //!
-//! `max_abs` is independent of this L2 calculation: it tracks the largest decoded `|X|`.
-//! Group-final rows send `(S, F, max_abs, alpha/beta fields, dead bound/count)` to ScaleStark,
-//! which divides the represented sum by `k`, proves the square root, and verifies `alpha`,
-//! `beta`, and the liveness bound.
-//!
-//! # Single-rounding FMA
-//!
-//! **What.** The table proves the fused operation
-//! `NOISED = RNE_bf16(alpha*X + noise_term)`, where `alpha*X` remains exact until the final
-//! rounding and `noise_term = RNE_bf16(beta*n)` is the already-rounded addend.
-//!
-//! **Why.** Rounding `alpha*X` first and then adding would be a different operation, especially
-//! near cancellation. The AIR therefore reconstructs the exact signed integer sum and invokes
-//! the bf16 rounding lookup only once.
-//!
-//! **How.** Write the two operands as:
+//! The product `alpha*X` stays exact until the final BF16 rounding. The addend
+//! `noise_term` has already been rounded by the preceding multiplication. Write:
 //!
 //! ```text
-//! alpha*X   = (-1)^S_P * M_P * 2^EP,   M_P = M(alpha)*M(X) < 2^16
-//! noise_term = (-1)^S_C * M_C * 2^EC,  M_C = M(noise_term) < 2^8
-//! EP = E*(alpha) + E*(X) - 268
-//! EC = E*(noise_term) - 134
+//! alpha*X    = (-1)^S_P * M_P * 2^EP,    M_P = M(alpha)*M(X) < 2^16
+//! noise_term = (-1)^S_C * M_C * 2^EC,    M_C = M(noise_term) < 2^8
+//! EP         = E*(alpha) + E*(X) - 268
+//! EC         = E*(noise_term) - 134
 //! ```
 //!
-//! `S_P` and `S_C` are the respective sign bits. The AIR then:
+//! `S_P` and `S_C` are the sign bits. The gadget aligns the integer significands
+//! to a common binary scale, then adds or subtracts them. Rounding `alpha*X`
+//! before this addition would change the operation, especially near cancellation.
 //!
-//! 1. Compare `EP` and `EC`, then multiply the coarser operand's integer significand by
-//!    `2^|EP-EC|` so both operands use the finer common scale.
-//! 2. For very large gaps, cap the shift and adjust the common scale so the dominant operand
-//!    remains exact. This moves the smaller operand to a position where only its nonzeroness can
-//!    affect the final rounding. The threshold is 10 for an eight-bit smaller operand. It is 20
-//!    in the opposite direction because a subtracted 16-bit product can borrow across a binade
-//!    boundary and expose two additional positions.
-//! 3. Add or subtract the aligned integers exactly, producing a sign and magnitude `V`.
-//! 4. RNERND accepts a significand below `2^17`. If `V` is wider, keep its leading 17 bits and
-//!    round them to odd whenever discarded bits are nonzero. Since bf16 has eight precision
-//!    bits and `17 >= 8 + 2`, the later bf16 RNE result is unchanged.
-//! 5. RNERND performs the one final bf16 rounding at the reconstructed binary scale.
+//! Large exponent gaps are capped once the smaller operand can affect only rounding.
+//! The threshold is 10 when the product has the coarser binary unit, and 20 when
+//! the addend does. The latter covers subtraction across a binade boundary
+//! (a power of two). W3 derives these bounds; W10 adjusts the common scale to
+//! preserve the dominant operand.
 //!
-//! If `X = 0`, the product is zero and has no meaningful scale. The witness subtracts 400 from
-//! `EP`; 400 exceeds the largest legal operand-scale gap (386), so this selects the far path
-//! and preserves `noise_term` exactly. The zero flag itself is proved from `M(X) = 0`.
+//! RNERND is the lookup table that performs the final BF16 rounding. It accepts an
+//! integer significand below `2^17`. A wider aligned magnitude `T` is first
+//! compressed to 17 bits using round-to-odd:
 //!
-//! The RNERND slot is the *signed* subnormal fade cut `clamp(-133 - KEY_SCALE, -7, 18)` biased
-//! by +7 (see `luts.rs`). The signed extension makes the `(significand, slot)` pair determine
-//! the normal/subnormal classification for every reachable scale — including cancellation
-//! results with `V < 128` and `KEY_SCALE in [-133, -127]`, which are subnormal despite sharing
-//! a significand with normal small-scale results.
+//! ```text
+//! T   = q*2^c + r,    0 <= r < 2^c
+//! key = q + [r != 0]*(1 - (q mod 2))
+//! ```
 //!
-//! # Trace and constraint binding
+//! Here `c` is the compression shift, and brackets denote 0/1 indicators. An exact
+//! quotient is unchanged; an inexact quotient is made odd. The key's binary scale
+//! increases by `c`. Keeping 17 bits before rounding to BF16's eight precision bits
+//! preserves the final round-to-nearest, ties-to-even result.
 //!
-//! The height is `next_power_of_two(max(h, w)*k)`. Each side is live only on its own prefix;
-//! the rest uses a canonical phantom fill. The verifier recomputes the public noise, row
-//! schedule, indices, and liveness columns and checks their openings. These are called
-//! **known columns** below: their booleanness and boundary facts come from verifier equality,
-//! rather than duplicate AIR equations.
+//! The rounding slot is `clamp(-133 - key_scale, -7, 18) + 7`. Its signed cuts
+//! distinguish normal and subnormal results even after cancellation leaves a small
+//! significand. For `X = 0`, an artificial exponent drop of 400 selects the path
+//! that preserves the addend; 400 exceeds the maximum legal operand-scale gap of 386.
 //!
-//! [`super::ctl`] declares all range, decode, rounding, quantization, and cross-table lookups.
-//! Flags returned by a lookup are boolean by that table; free witness flags are constrained
-//! boolean in this AIR.
+//! # Summand scores
+//!
+//! For jackpot check 4, each element scores the quantity
+//! `S_X = (alpha*X)^2 + sigma^2`, where `sigma = alpha*l2f/2` and `l2f` is the
+//! grid-rounded, floored RMS. The products in `S_X` are exact.
+//!
+//! Group V normalizes both magnitudes to 16-bit significands. It aligns their
+//! squares, takes an integer logarithm and exports `summand_score` to Matmul.
+//! The score satisfies:
+//!
+//! ```text
+//! 64*(log2(S_X) + 508) - 1.1 < summand_score <= 64*(log2(S_X) + 508)
+//! ```
+//!
+//! [`super::super::unpredictability`] defines the integer rule and derives this
+//! error bound. A zero `X` contributes only the sigma term. Padding scores are zero
+//! and are excluded from the operand-code channel.
+//!
+//! # Trace binding
+//!
+//! The height is `next_power_of_two(max(h, w)*k)`. A is live on `[0, h*k)` and B
+//! on `[0, w*k)`; each side has a valid padding witness beyond its own prefix.
+//! The final trace row closes a group, including a truncated padding group.
+//!
+//! The verifier recomputes the noise and schedule columns and checks their openings.
+//! Their boolean and boundary properties follow from that equality. Lookup tables
+//! bind range, decode and rounding outputs; free witness flags are constrained
+//! boolean here. [`super::ctl`] declares the lookups and cross-table channels.
 
 use core::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
@@ -195,9 +195,7 @@ const WL2_BASE: u32 = 27;
 /// because `block_l2_product * 2^Wl2 < 2^54`.
 const FAR_SIGMA: u64 = 54;
 
-// ==================================================================================================
 // Program and trace generation
-// ==================================================================================================
 
 /// The public geometry of one FP8 input-quantization run.
 ///
@@ -390,18 +388,14 @@ impl InputQuantProgram {
     }
 }
 
-/// Adds about 256 bits of blinding entropy to the trace commitment by randomizing four
-/// otherwise-unused cells on row 0.
+/// Randomizes four unused row-0 cells to blind the trace commitment.
 ///
-/// **Why.** The recursive wrapper publishes `zeta`, a Fiat-Shamir challenge derived from the
-/// trace commitment. Without committed randomness, that public value could fingerprint a
-/// low-entropy witness. Four random field elements provide about 256 bits of entropy, giving
-/// statistical distance `2^-64` under the wrapper's blinding bound.
+/// The wrapper publishes the Fiat–Shamir challenge `zeta`, which is derived from
+/// the commitment. Without committed randomness, it could fingerprint a low-entropy
+/// witness. Four random field elements supply about 256 bits of entropy.
 ///
-/// **Why these cells are safe.** Row 0 is the first row of a block, not its final row, so it
-/// contributes no block-L2 term. The shift-power lookups are filtered off there, and every AIR
-/// expression that could read these values is multiplied by a zero selector. Randomizing them
-/// therefore changes the commitment but not the proved computation.
+/// Row 0 is not block-final. Every constraint or lookup reading these cells is
+/// disabled there, so the randomness leaves the computation unchanged.
 fn blind_trace<F: RichField>(rows: &mut [[F; NUM_INPUT_QUANT_COLUMNS]]) {
     let row: &mut InputQuantColumnsView<F> = rows[0].borrow_mut();
     row.block_l2_a.shift_remainder_power = F::rand();
@@ -429,9 +423,7 @@ fn field_i64<F: RichField>(v: i64) -> F {
     }
 }
 
-// --------------------------------------------------------------------------------------------------
 // bf16 field decode and the shared LUT mirrors (trace-generation side)
-// --------------------------------------------------------------------------------------------------
 
 /// A bf16 value's decode fields (trace-gen twin of [`Bf16FieldsView`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -535,14 +527,11 @@ impl RoundedBf16 {
     }
 }
 
-/// The final bf16 rounding step: the committed RNERND row at `(v, slot)` plus the consuming
-/// constraint's exponent reconstruction (U4/M4/W12), so witness generation is the table row by
-/// construction.
+/// Round `v * 2^lsb_scale` to BF16 using the RNERND table's reference calculation.
 ///
-/// `v` is an exact integer in units of `2^lsb_scale` and `slot` must be the CLAMP22 of that
-/// scale's signed fade cut, which [`rnernd_reference`] converts back to the rounding position.
-/// Subnormal outputs land on bf16's `2^-133` grid. It panics on overflow, matching the native
-/// non-finite error path.
+/// `v` must fit 17 bits. `slot` selects the rounding position for this scale,
+/// clamped so subnormal results land on BF16's `2^-133` grid.
+/// Panics on overflow, matching the native arithmetic's non-finite error.
 pub(crate) fn rnernd_scaled(v: u64, slot: u64, lsb_scale: i64) -> RoundedBf16 {
     debug_assert!(v < 1 << WIDE_WIDTH, "RNERND significands are pre-compressed to 17 bits");
     debug_assert_eq!(
@@ -551,6 +540,7 @@ pub(crate) fn rnernd_scaled(v: u64, slot: u64, lsb_scale: i64) -> RoundedBf16 {
         "slot must be the CLAMP22 of the LSB scale"
     );
     let (mantissa, width_adjust, is_zero, exp_is_zero) = rnernd_reference(v, slot);
+    // Reconstruct the exponent exactly as the consuming U4/M4/W12 constraints do.
     let exp = if exp_is_zero {
         0
     } else {
@@ -710,9 +700,7 @@ pub(crate) fn qcast(code: u16) -> u8 {
     f32_to_fp8_e4m3(bf16_to_f32(bf16_clamp_sym(code, BF16_CODE_448))).expect("clamped bf16 is finite")
 }
 
-// --------------------------------------------------------------------------------------------------
 // The protocol L2 (integer frame sum -> RNE sqrt -> grid snap) and the group scale witness
-// --------------------------------------------------------------------------------------------------
 
 /// The native `round_l2_to_grid` (private in `api::fp8::quantization`, mirrored here): round a
 /// nonnegative bf16 to the nearest multiple of 4 ulps, ties up, by code arithmetic.
@@ -737,39 +725,26 @@ struct GroupScales {
     dead_bound: u64,
     /// The group's noise-std encoding `enc(sigma) = e(sigma) + 268` for
     /// `sigma = DELTA * alpha * l2f` (positive on live groups; 0 on dead groups).
-    sigma_enc: u64,
-    /// The noise-std normalized significand: `sigma = sigma_norm * 2^(sigma_enc - 268 - 15)`
-    /// with `sigma_norm in [2^15, 2^16)` on live groups; 0 on dead groups.
-    sigma_norm: u64,
+    sigma_biased_exponent: u64,
+    /// The noise-std normalized significand: `sigma = normalized_sigma_significand * 2^(sigma_biased_exponent - 268 - 15)`
+    /// with `normalized_sigma_significand in [2^15, 2^16)` on live groups; 0 on dead groups.
+    normalized_sigma_significand: u64,
 }
 
-/// One row's group-B (block-integer L2) witness values — the per-row faces of the running
-/// block gadget.
+/// Witness for [`BlockL2Columns`]; fields use the same conventions as the trace.
 #[derive(Clone, Copy, Debug, Default)]
 struct BlockL2Witness {
-    /// Running sum of integer squares in the current eight-element block.
     block_int_squared_sum: u64,
-    /// Scale-significand square times `block_int_squared_sum`.
     block_l2_product: u64,
-    /// Doubled scale exponent candidate on live block-final rows.
     block_doubled_scale_exponent: u64,
-    /// Running maximum of the doubled scale exponent candidates.
     running_max_doubled_scale_exponent: u64,
-    /// Four limbs of `block_l2_product * 2^Wl2 < 2^54`.
     scaled_block_product_limbs: [u64; 4],
-    /// Power of the shift remainder; define `2^r = shift_remainder_power`.
     shift_remainder_power: u64,
-    /// Complement power `2^(16-r)`.
     shift_complement_power: u64,
-    /// One-hot selector for the limb containing the shift boundary.
     shift_limb_selector: [bool; 4],
-    /// Quotient of the selected limb by `2^r`.
     selected_limb_quotient: u64,
-    /// Remainder of the selected-limb split.
     selected_limb_remainder: u64,
-    /// Live block-final row with a shift of at least 54.
     is_far_shift: bool,
-    /// Running framed L2 sum; define its group-final value as `S`.
     running_l2_frame_sum: u64,
 }
 
@@ -790,14 +765,14 @@ struct ElementWitness {
     is_dead: bool,
     dead_count: u64,
     /// Bit length of the scaled significand product `M(alpha)*M(X)`.
-    x_width: u64,
+    scaled_product_width: u64,
     /// The scaled element's exponent encoding `enc(alpha*x)`, or 0 when `X = 0`.
-    x_enc: u64,
-    /// The scaled element's normalized significand `M(alpha)*M(X) * 2^(16 - x_width)`,
+    scaled_biased_exponent: u64,
+    /// The scaled element's normalized significand `M(alpha)*M(X) * 2^(16 - scaled_product_width)`,
     /// in `[2^15, 2^16)`, or 0 when `X = 0`.
-    x_norm: u64,
-    /// The normalizing power `2^(16 - x_width)`.
-    x_pow: u64,
+    scaled_significand: u64,
+    /// The normalizing power `2^(16 - scaled_product_width)`.
+    scaled_normalization_power: u64,
     /// The summand's score witness (jackpot check 4), ending in the lambda value.
     score: LambdaWitness,
 }
@@ -821,7 +796,7 @@ impl SideWitness {
         debug_assert!(live || int8.iter().all(|&v| v == 0), "dead groups take zero inputs");
         let wl2 = program.wl2();
 
-        // ---- Pass 1: decode X = RNE_bf16(int8 * scale) per element (groups P/U). ----
+        // Pass 1: decode X = RNE_bf16(int8 * scale) per element (groups P/U).
         let mut xs: Vec<(u8, Bf16Fields, Bf16Fields, MulWitness, bool)> = Vec::with_capacity(k);
         for j in 0..k {
             let byte = int8[j] as u8;
@@ -837,9 +812,9 @@ impl SideWitness {
             xs.push((byte, int_f, scale_f, dec, x_sign));
         }
 
-        // ---- Pass 2: compute the canonical prequant L2 frame, decoded max |X|, and row scales.
+        // Pass 2: compute the canonical prequant L2 frame, decoded max |X|, and row scales.
         // The L2 uses raw int8 squares times exact scale squares; it does not square the
-        // already-rounded decoded X values. ----
+        // already-rounded decoded X values.
         let n_blocks = k / BLOCK_SIZE;
         // First compute each block's integer square sum/product and its doubled scale exponent.
         let block_e2: Vec<u64> = (0..n_blocks)
@@ -976,8 +951,8 @@ impl SideWitness {
         // `M(alpha)*M(l2f) * 2^(E(alpha) + E(l2f) - 269)`, and the significand product spans
         // [2^14, 2^16) (both factors are normal), so with `wide = [product >= 2^15]`:
         // `enc(sigma) = e(sigma) + 268 = E(alpha) + E(l2f) + wide + 13` and
-        // `sigma_norm = product * 2^(1 - wide)` lands in [2^15, 2^16).
-        let (sigma_enc, sigma_norm) = if live {
+        // `normalized_sigma_significand = product * 2^(1 - wide)` lands in [2^15, 2^16).
+        let (sigma_biased_exponent, normalized_sigma_significand) = if live {
             let l2f = Bf16Fields::from_code(bf16_max(l2_code, NORM_FLOOR_CODE));
             let product = (128 + alpha.mantissa) * l2f.m();
             let wide = u64::from(product >= 1 << 15);
@@ -1001,11 +976,11 @@ impl SideWitness {
             alpha_code,
             beta_code,
             dead_bound,
-            sigma_enc,
-            sigma_norm,
+            sigma_biased_exponent,
+            normalized_sigma_significand,
         };
 
-        // ---- Pass 3: the noising path per element (groups M/W/Q/C). ----
+        // Pass 3: the noising path per element (groups M/W/Q/C).
         let mut elements = Vec::with_capacity(k);
         let (mut max_abs, mut dead_count) = (0u64, 0u64);
         for (j, &(byte, int_f, scale_f, dec, x_sign)) in xs.iter().enumerate() {
@@ -1047,11 +1022,11 @@ impl SideWitness {
             // The scaled element's exponent encoding and the summand encoding lambda
             // (jackpot check 4): `|alpha*x| = M(alpha)*M(X) * 2^(E(alpha) + E*(X) - 268)`, so a
             // nonzero X has `enc(alpha*x) = E(alpha) + E*(X) - 1 + bit_length(M(alpha)*M(X))`.
-            let x_width = u64::from(64 - m_p.leading_zeros());
-            let x_enc = if x.m() == 0 {
+            let scaled_product_width = u64::from(64 - m_p.leading_zeros());
+            let scaled_biased_exponent = if x.m() == 0 {
                 0
             } else {
-                let enc = (scales_w.alpha.exp as i64 + x.e_star() - 1) as u64 + x_width;
+                let enc = (scales_w.alpha.exp as i64 + x.e_star() - 1) as u64 + scaled_product_width;
                 debug_assert_eq!(
                     enc as i64 - 268,
                     {
@@ -1062,12 +1037,17 @@ impl SideWitness {
                 );
                 enc
             };
-            let x_pow = 1u64 << (16 - x_width);
-            let x_norm = m_p * x_pow;
+            let scaled_normalization_power = 1u64 << (16 - scaled_product_width);
+            let scaled_significand = m_p * scaled_normalization_power;
             // The summand's score witness (jackpot check 4). A dead group's phantom rows carry
             // the all-zero witness with the shift power pinned to 2^0; its lambda is 0.
             let score = if live {
-                lambda_witness(x_norm, x_enc, scales_w.sigma_norm, scales_w.sigma_enc)
+                lambda_witness(
+                    scaled_significand,
+                    scaled_biased_exponent,
+                    scales_w.normalized_sigma_significand,
+                    scales_w.sigma_biased_exponent,
+                )
             } else {
                 LambdaWitness {
                     x_dominates: false,
@@ -1075,8 +1055,8 @@ impl SideWitness {
                     gap_is_far: false,
                     near_gap: 0,
                     near_gap_pow: 1,
-                    norm_big: 0,
-                    norm_small: 0,
+                    dominant_significand: 0,
+                    smaller_significand: 0,
                     half_quotient: 0,
                     half_remainder: 0,
                     quotient: 0,
@@ -1102,10 +1082,10 @@ impl SideWitness {
                 code_noised,
                 is_dead,
                 dead_count,
-                x_width,
-                x_enc,
-                x_norm,
-                x_pow,
+                scaled_product_width,
+                scaled_biased_exponent,
+                scaled_significand,
+                scaled_normalization_power,
                 score,
             });
         }
@@ -1142,19 +1122,19 @@ impl SideWitness {
         row.dead_bound_a = F::from_canonical_u64(self.scales.dead_bound);
         row.is_dead_a = F::from_bool(e.is_dead);
         row.dead_count_a = F::from_canonical_u64(e.dead_count);
-        row.x_width_a = F::from_canonical_u64(e.x_width);
-        row.x_enc_a = F::from_canonical_u64(e.x_enc);
-        row.sigma_enc_a = F::from_canonical_u64(self.scales.sigma_enc);
-        row.sigma_norm_a = F::from_canonical_u64(self.scales.sigma_norm);
-        row.x_pow_a = F::from_canonical_u64(e.x_pow);
-        row.x_norm_a = F::from_canonical_u64(e.x_norm);
+        row.scaled_product_width_a = F::from_canonical_u64(e.scaled_product_width);
+        row.scaled_biased_exponent_a = F::from_canonical_u64(e.scaled_biased_exponent);
+        row.sigma_biased_exponent_a = F::from_canonical_u64(self.scales.sigma_biased_exponent);
+        row.normalized_sigma_significand_a = F::from_canonical_u64(self.scales.normalized_sigma_significand);
+        row.scaled_normalization_power_a = F::from_canonical_u64(e.scaled_normalization_power);
+        row.scaled_significand_a = F::from_canonical_u64(e.scaled_significand);
         row.x_dominates_a = F::from_bool(e.score.x_dominates);
         row.exponent_gap_a = F::from_canonical_u64(e.score.exponent_gap);
         row.gap_is_far_a = F::from_bool(e.score.gap_is_far);
         row.near_gap_a = F::from_canonical_u64(e.score.near_gap);
         row.near_gap_pow_a = F::from_canonical_u64(e.score.near_gap_pow);
-        row.norm_big_a = F::from_canonical_u64(e.score.norm_big);
-        row.norm_small_a = F::from_canonical_u64(e.score.norm_small);
+        row.dominant_significand_a = F::from_canonical_u64(e.score.dominant_significand);
+        row.smaller_significand_a = F::from_canonical_u64(e.score.smaller_significand);
         row.half_quotient_a = F::from_canonical_u64(e.score.half_quotient);
         row.half_remainder_a = F::from_canonical_u64(e.score.half_remainder);
         row.quotient_a = F::from_canonical_u64(e.score.quotient);
@@ -1163,7 +1143,7 @@ impl SideWitness {
         row.sum_of_squares_rest_lo_a = F::from_canonical_u64(e.score.sum_of_squares_rest & 0xFFFF);
         row.sum_of_squares_rest_hi_a = F::from_canonical_u64(e.score.sum_of_squares_rest >> 16);
         row.log_fraction_a = F::from_canonical_u64(e.score.log_fraction);
-        row.lambda_a = F::from_canonical_u64(e.score.lambda);
+        row.summand_score_a = F::from_canonical_u64(e.score.lambda);
     }
 
     fn fill_b<F: RichField>(&self, row: &mut InputQuantColumnsView<F>, j: usize) {
@@ -1192,19 +1172,19 @@ impl SideWitness {
         row.dead_bound_b = F::from_canonical_u64(self.scales.dead_bound);
         row.is_dead_b = F::from_bool(e.is_dead);
         row.dead_count_b = F::from_canonical_u64(e.dead_count);
-        row.x_width_b = F::from_canonical_u64(e.x_width);
-        row.x_enc_b = F::from_canonical_u64(e.x_enc);
-        row.sigma_enc_b = F::from_canonical_u64(self.scales.sigma_enc);
-        row.sigma_norm_b = F::from_canonical_u64(self.scales.sigma_norm);
-        row.x_pow_b = F::from_canonical_u64(e.x_pow);
-        row.x_norm_b = F::from_canonical_u64(e.x_norm);
+        row.scaled_product_width_b = F::from_canonical_u64(e.scaled_product_width);
+        row.scaled_biased_exponent_b = F::from_canonical_u64(e.scaled_biased_exponent);
+        row.sigma_biased_exponent_b = F::from_canonical_u64(self.scales.sigma_biased_exponent);
+        row.normalized_sigma_significand_b = F::from_canonical_u64(self.scales.normalized_sigma_significand);
+        row.scaled_normalization_power_b = F::from_canonical_u64(e.scaled_normalization_power);
+        row.scaled_significand_b = F::from_canonical_u64(e.scaled_significand);
         row.x_dominates_b = F::from_bool(e.score.x_dominates);
         row.exponent_gap_b = F::from_canonical_u64(e.score.exponent_gap);
         row.gap_is_far_b = F::from_bool(e.score.gap_is_far);
         row.near_gap_b = F::from_canonical_u64(e.score.near_gap);
         row.near_gap_pow_b = F::from_canonical_u64(e.score.near_gap_pow);
-        row.norm_big_b = F::from_canonical_u64(e.score.norm_big);
-        row.norm_small_b = F::from_canonical_u64(e.score.norm_small);
+        row.dominant_significand_b = F::from_canonical_u64(e.score.dominant_significand);
+        row.smaller_significand_b = F::from_canonical_u64(e.score.smaller_significand);
         row.half_quotient_b = F::from_canonical_u64(e.score.half_quotient);
         row.half_remainder_b = F::from_canonical_u64(e.score.half_remainder);
         row.quotient_b = F::from_canonical_u64(e.score.quotient);
@@ -1213,7 +1193,7 @@ impl SideWitness {
         row.sum_of_squares_rest_lo_b = F::from_canonical_u64(e.score.sum_of_squares_rest & 0xFFFF);
         row.sum_of_squares_rest_hi_b = F::from_canonical_u64(e.score.sum_of_squares_rest >> 16);
         row.log_fraction_b = F::from_canonical_u64(e.score.log_fraction);
-        row.lambda_b = F::from_canonical_u64(e.score.lambda);
+        row.summand_score_b = F::from_canonical_u64(e.score.lambda);
     }
 }
 
@@ -1306,9 +1286,7 @@ fn fill_fma<F: RichField>(dst: &mut FmaBlockView<F>, w: FmaWitness) {
     dst.out_exp_is_zero = F::from_bool(w.out.exp_is_zero);
 }
 
-// ==================================================================================================
 // Constraints, written once against the generic `Evaluator`
-// ==================================================================================================
 
 /// One side's column values, copied out of the row view so the A/B constraint logic is written
 /// once.
@@ -1337,19 +1315,19 @@ struct SideVals<V: Copy> {
     dead_bound: V,
     is_dead: V,
     dead_count: V,
-    x_width: V,
-    x_enc: V,
-    sigma_enc: V,
-    sigma_norm: V,
-    x_pow: V,
-    x_norm: V,
+    scaled_product_width: V,
+    scaled_biased_exponent: V,
+    sigma_biased_exponent: V,
+    normalized_sigma_significand: V,
+    scaled_normalization_power: V,
+    scaled_significand: V,
     x_dominates: V,
     exponent_gap: V,
     gap_is_far: V,
     near_gap: V,
     near_gap_pow: V,
-    norm_big: V,
-    norm_small: V,
+    dominant_significand: V,
+    smaller_significand: V,
     half_quotient: V,
     half_remainder: V,
     quotient: V,
@@ -1387,19 +1365,19 @@ fn side_a<V: Copy>(v: &InputQuantColumnsView<V>) -> SideVals<V> {
         dead_bound: v.dead_bound_a,
         is_dead: v.is_dead_a,
         dead_count: v.dead_count_a,
-        x_width: v.x_width_a,
-        x_enc: v.x_enc_a,
-        sigma_enc: v.sigma_enc_a,
-        sigma_norm: v.sigma_norm_a,
-        x_pow: v.x_pow_a,
-        x_norm: v.x_norm_a,
+        scaled_product_width: v.scaled_product_width_a,
+        scaled_biased_exponent: v.scaled_biased_exponent_a,
+        sigma_biased_exponent: v.sigma_biased_exponent_a,
+        normalized_sigma_significand: v.normalized_sigma_significand_a,
+        scaled_normalization_power: v.scaled_normalization_power_a,
+        scaled_significand: v.scaled_significand_a,
         x_dominates: v.x_dominates_a,
         exponent_gap: v.exponent_gap_a,
         gap_is_far: v.gap_is_far_a,
         near_gap: v.near_gap_a,
         near_gap_pow: v.near_gap_pow_a,
-        norm_big: v.norm_big_a,
-        norm_small: v.norm_small_a,
+        dominant_significand: v.dominant_significand_a,
+        smaller_significand: v.smaller_significand_a,
         half_quotient: v.half_quotient_a,
         half_remainder: v.half_remainder_a,
         quotient: v.quotient_a,
@@ -1408,7 +1386,7 @@ fn side_a<V: Copy>(v: &InputQuantColumnsView<V>) -> SideVals<V> {
         sum_of_squares_rest_lo: v.sum_of_squares_rest_lo_a,
         sum_of_squares_rest_hi: v.sum_of_squares_rest_hi_a,
         log_fraction: v.log_fraction_a,
-        lambda: v.lambda_a,
+        lambda: v.summand_score_a,
     }
 }
 
@@ -1438,19 +1416,19 @@ fn side_b<V: Copy>(v: &InputQuantColumnsView<V>) -> SideVals<V> {
         dead_bound: v.dead_bound_b,
         is_dead: v.is_dead_b,
         dead_count: v.dead_count_b,
-        x_width: v.x_width_b,
-        x_enc: v.x_enc_b,
-        sigma_enc: v.sigma_enc_b,
-        sigma_norm: v.sigma_norm_b,
-        x_pow: v.x_pow_b,
-        x_norm: v.x_norm_b,
+        scaled_product_width: v.scaled_product_width_b,
+        scaled_biased_exponent: v.scaled_biased_exponent_b,
+        sigma_biased_exponent: v.sigma_biased_exponent_b,
+        normalized_sigma_significand: v.normalized_sigma_significand_b,
+        scaled_normalization_power: v.scaled_normalization_power_b,
+        scaled_significand: v.scaled_significand_b,
         x_dominates: v.x_dominates_b,
         exponent_gap: v.exponent_gap_b,
         gap_is_far: v.gap_is_far_b,
         near_gap: v.near_gap_b,
         near_gap_pow: v.near_gap_pow_b,
-        norm_big: v.norm_big_b,
-        norm_small: v.norm_small_b,
+        dominant_significand: v.dominant_significand_b,
+        smaller_significand: v.smaller_significand_b,
         half_quotient: v.half_quotient_b,
         half_remainder: v.half_remainder_b,
         quotient: v.quotient_b,
@@ -1459,7 +1437,7 @@ fn side_b<V: Copy>(v: &InputQuantColumnsView<V>) -> SideVals<V> {
         sum_of_squares_rest_lo: v.sum_of_squares_rest_lo_b,
         sum_of_squares_rest_hi: v.sum_of_squares_rest_hi_b,
         log_fraction: v.log_fraction_b,
-        lambda: v.lambda_b,
+        lambda: v.summand_score_b,
     }
 }
 
@@ -1547,7 +1525,7 @@ where
     let c128 = eval.i32(128);
     let not_gf = eval.sub(one, gf);
 
-    // ---- Group P — bind the raw int8 value and its eight-element block scale. ----
+    // Group P — bind the raw int8 value and its eight-element block scale.
     // P1 is an INT8DEC lookup from the raw byte to its exact bf16 fields. The table also proves
     // its sign and exponent-zero outputs are bits.
     // P2 keeps every scale field unchanged inside an eight-row block. A next-row block start
@@ -1574,7 +1552,7 @@ where
     let c = eval.sub(lv.x_sign, xor);
     eval.constraint(c);
 
-    // ---- Group U — prove X = RNE_bf16(int8 * block_scale). ----
+    // Group U — prove X = RNE_bf16(int8 * block_scale).
     // U1 binds the exact, unrounded integer significand product M(int8)*M(scale).
     let m_int = m_expr(eval, lv.int_f.exp_is_zero, lv.int_f.mantissa);
     let m_scale = m_expr(eval, lv.scale.exp_is_zero, lv.scale.mantissa);
@@ -1605,7 +1583,7 @@ where
     eval.constraint(c);
     // U6 (RC16(254 - X_EXP)) is a LUT instance.
 
-    // ---- Group S — validate alpha/beta and keep all row-level values group-constant. ----
+    // Group S — validate alpha/beta and keep all row-level values group-constant.
     // S1-S3 are lookups that prove alpha is positive normal and beta is finite/nonnegative with
     // valid bf16 fields. S4 keeps alpha, beta, and the L2 frame exponent fixed across the group.
     for (f_next, f_local) in [
@@ -1621,7 +1599,7 @@ where
         eval.constraint(c);
     }
 
-    // ---- Group B — compute the canonical L2 sum from eight-element prequant blocks. ----
+    // Group B — compute the canonical L2 sum from eight-element prequant blocks.
     // A row is block-final exactly when the next row starts a block. This also handles the
     // cyclic last-row-to-first-row boundary.
     let ibf = next_block_start;
@@ -1746,7 +1724,7 @@ where
     let c = eval.sub(nv.blk.running_l2_frame_sum, expected);
     eval.constraint(c);
 
-    // ---- Group F — compute linf's source, the largest decoded |X| in the group. ----
+    // Group F — compute linf's source, the largest decoded |X| in the group.
     // For nonnegative finite bf16 codes, EXP*128 + MANTISSA is ordered by magnitude.
     let abs_next = eval.mad(nv.x_exp, c128, nv.x_mantissa);
     // F1 starts each group from its first element, including across the cyclic trace boundary.
@@ -1760,7 +1738,7 @@ where
     eval.constraint(c);
     // F3 range lookups prove the chosen value dominates both inputs and never decreases.
 
-    // ---- Group M — compute noise_term = RNE_bf16(beta*n). ----
+    // Group M — compute noise_term = RNE_bf16(beta*n).
     // M1 binds the exact significand product. The verifier supplies n's decoded fields, which
     // may represent a subnormal.
     let m_beta = m_expr(eval, lv.beta_exp_is_zero, lv.beta_mantissa);
@@ -1773,7 +1751,7 @@ where
     let e_star_noise = eval.add(lv.noise.exp, lv.noise.exp_is_zero);
     eval_mul_out(eval, &lv.mul_beta_n, e_star_beta, e_star_noise);
 
-    // ---- Group W — prove `NOISED = RNE_bf16(alpha*X + noise_term)` with one final rounding. ----
+    // Group W — prove `NOISED = RNE_bf16(alpha*X + noise_term)` with one final rounding.
     let f = &lv.fma;
     // W1: bind the exact product significand M(alpha)*M(X) (alpha is normal: M = 128 + mantissa).
     let m_x = m_expr(eval, lv.x_exp_is_zero, lv.x_mantissa);
@@ -1948,11 +1926,11 @@ where
     let c = eval.mul(f.out_is_zero, f.out_mantissa);
     eval.constraint(c);
 
-    // ---- Group Q — the lookup-backed fp8 cast: QCAST returns the E4M3 code (byte range
-    // included). ----
+    // Group Q — the lookup-backed fp8 cast: QCAST returns the E4M3 code (byte range
+    // included).
 
-    // ---- Group C — the jackpot liveness flag `IS_DEAD = [ABS(X) >= DEAD_BOUND]` and its
-    // in-group count (the group-final value rides ScaleStark's group-tuple CTL channel). ----
+    // Group C — the jackpot liveness flag `IS_DEAD = [ABS(X) >= DEAD_BOUND]` and its
+    // in-group count (the group-final value rides ScaleStark's group-tuple CTL channel).
     // C1: IS_DEAD is boolean and zero on phantom rows. The RC16 certificate pair in ctl.rs is
     // filtered by IS_DEAD resp. (1 - IS_DEAD)*LIVE, so on live rows exactly one certificate
     // fires and pins the flag; booleanness is what makes those filters sound.
@@ -1974,54 +1952,53 @@ where
     let c = eval.sub(nv.dead_count, expected);
     eval.constraint(c);
 
-    // ---- Group V — the element's summand score LAMBDA (jackpot check 4), exported to
-    // MatmulB200Stark's per-lane skip certificates by the operand-code channel. Encodings write
-    // `enc(v) = e(v) + 268` with `e(v) = floor(log2 v)`, and 0 encodes a zero value. Both
-    // addends are written over 16-bit normalized significands,
-    // `|alpha*X| = X_NORM * 2^(X_ENC - 268 - 15)` and `sigma = SIGMA_NORM * 2^(SIGMA_ENC - 268 - 15)`,
-    // and the score of `S = (alpha*X)^2 + sigma^2` is
+    // Group V: the summand score for S_X = (alpha*X)^2 + sigma^2.
+    // Use the following names for the committed biased exponents and significands:
     //
-    //   gap    = |X_ENC - SIGMA_ENC|
-    //   V      = big^2 + floor(floor(small^2 / 2^gap) / 2^gap)   if gap <= 15, else big^2
-    //   LAMBDA = 128*max(X_ENC, SIGMA_ENC) - 2624 + floor(64 * log2(floor(V / 2^17)))
+    //   E_x = scaled_biased_exponent       n_x = scaled_significand
+    //   E_s = sigma_biased_exponent        n_s = normalized_sigma_significand
+    //   |alpha*X| = n_x * 2^(E_x - 268 - 15)
+    //   sigma     = n_s * 2^(E_s - 268 - 15)
     //
-    // with (big, small) the two significands ordered by exponent. Every step is exact
-    // integer arithmetic. ----
-    // V1: bind ENC(alpha*X) from the product width. The WIDTH16 lookup (ctl.rs) returns
-    // X_WIDTH = bit_length(M(alpha)*M(X)) and pins the product-nonzero flag to 1 - X_IS_ZERO.
-    // For nonzero X, `|alpha*X| = M(alpha)*M(X) * 2^(ALPHA_EXP + E*(X) - 268)`, so
-    // `enc(alpha*X) = ALPHA_EXP + E*(X) - 1 + X_WIDTH`; a zero X encodes to 0 (X_WIDTH = 0).
+    // Nonzero significands lie in [2^15, 2^16). Zero X uses E_x = n_x = 0.
+    // `unpredictability` derives the score's error bound; V1–V11 enforce its integer rule.
+    //
+    // V1: let w = bit_length(M(alpha)*M(X)), supplied by WIDTH16. For nonzero X:
+    //
+    //   E_x = ALPHA_EXP + E*(X) - 1 + w.
+    //
+    // WIDTH16 also binds the product-nonzero flag. Zero X has w = 0 and uses sentinel E_x = 0.
     let not_xz = eval.sub(one, lv.x_is_zero);
     let enc_base = eval.add(lv.alpha_exp, e_star_x);
     let enc_base = eval.sub(enc_base, one);
     let enc_gated = eval.mul(not_xz, enc_base);
-    let x_enc_target = eval.add(enc_gated, lv.x_width);
-    let c = eval.sub(lv.x_enc, x_enc_target);
+    let x_enc_target = eval.add(enc_gated, lv.scaled_product_width);
+    let c = eval.sub(lv.scaled_biased_exponent, x_enc_target);
     eval.constraint(c);
-    // V2 and V3: SIGMA_ENC and SIGMA_NORM are group-constant; a live group's group-final
-    // values are bound to ScaleStark's exact sigma encoding and significand by the
-    // group-tuple channel. (Dead groups' scores never leave the table: the operand-code
-    // channel is liveness-filtered.)
-    let sig_diff = eval.sub(nv.sigma_enc, lv.sigma_enc);
+    // V2/V3: keep sigma's exponent and normalized significand group-constant.
+    // The group-final tuple binds them to Scale. Padding scores are filtered from exports.
+    let sig_diff = eval.sub(nv.sigma_biased_exponent, lv.sigma_biased_exponent);
     let c = eval.mul(not_gf, sig_diff);
     eval.constraint(c);
-    let sig_norm_diff = eval.sub(nv.sigma_norm, lv.sigma_norm);
+    let sig_norm_diff = eval.sub(nv.normalized_sigma_significand, lv.normalized_sigma_significand);
     let c = eval.mul(not_gf, sig_norm_diff);
     eval.constraint(c);
-    // V4: X_NORM = M(alpha)*M(X) * 2^(16 - X_WIDTH) — in [2^15, 2^16) for nonzero X, else 0.
-    // The POW2D lookup at the affine key 16 - X_WIDTH (ctl.rs) pins X_POW = 2^(16 - X_WIDTH).
-    let norm_target = eval.mul(lv.fma_sig_product, lv.x_pow);
-    let c = eval.sub(lv.x_norm, norm_target);
+    // V4: normalize M(alpha)*M(X) to 16 bits using the POW2D shift 16 - product width.
+    // The normalized significand is in [2^15, 2^16) for nonzero X, otherwise zero.
+    let norm_target = eval.mul(lv.fma_sig_product, lv.scaled_normalization_power);
+    let c = eval.sub(lv.scaled_significand, norm_target);
     eval.constraint(c);
-    // V5: X_DOMINATES picks the larger addend. The gap identity plus RC16(EXPONENT_GAP)
-    // (ctl.rs) force the bit whenever the encodings differ: the wrong bit makes the gap
-    // negative, wrapping its range-check key. A zero X has X_ENC = 0 < SIGMA_ENC, so its bit
-    // is forced to 0 and the gap equals SIGMA_ENC (far). On a tie either bit gives the same
-    // score, so the freedom is inert.
+    // V5: X_DOMINATES selects the addend with the larger exponent:
+    //
+    //   exponent_gap = (2*X_DOMINATES - 1)*(E_x - E_s) = |E_x - E_s|.
+    //
+    // RC16(exponent_gap) forces the choice when E_x != E_s: the wrong bit gives a
+    // negative range-check key. On live rows, zero X has E_x = 0 < E_s, so sigma
+    // dominates and the gap is far. At equal exponents, either ordering gives the same score.
     eval.constraint_bool(lv.x_dominates);
     let two_b = eval.add(lv.x_dominates, lv.x_dominates);
     let sign = eval.sub(two_b, one);
-    let enc_diff = eval.sub(lv.x_enc, lv.sigma_enc);
+    let enc_diff = eval.sub(lv.scaled_biased_exponent, lv.sigma_biased_exponent);
     let gap_target = eval.mul(sign, enc_diff);
     let c = eval.sub(lv.exponent_gap, gap_target);
     eval.constraint(c);
@@ -2035,38 +2012,43 @@ where
     let near_target = eval.mul(not_far, lv.exponent_gap);
     let c = eval.sub(lv.near_gap, near_target);
     eval.constraint(c);
-    // V8: order the two normalized significands by exponent.
-    //   NORM_BIG   = X_DOMINATES * X_NORM + (1 - X_DOMINATES) * SIGMA_NORM
-    //   NORM_SMALL = X_DOMINATES * SIGMA_NORM + (1 - X_DOMINATES) * X_NORM
-    let big_target = eval.mux(lv.x_dominates, lv.sigma_norm, lv.x_norm);
-    let c = eval.sub(lv.norm_big, big_target);
+    // V8: order normalized significands by exponent.
+    let big_target = eval.mux(lv.x_dominates, lv.normalized_sigma_significand, lv.scaled_significand);
+    let c = eval.sub(lv.dominant_significand, big_target);
     eval.constraint(c);
-    let small_target = eval.mux(lv.x_dominates, lv.x_norm, lv.sigma_norm);
-    let c = eval.sub(lv.norm_small, small_target);
+    let small_target = eval.mux(lv.x_dominates, lv.scaled_significand, lv.normalized_sigma_significand);
+    let c = eval.sub(lv.smaller_significand, small_target);
     eval.constraint(c);
-    // V9: the two exact floor stages, dividing NORM_SMALL^2 by 2^NEAR_GAP twice:
-    //   NORM_SMALL^2  = HALF_QUOTIENT * NEAR_GAP_POW + HALF_REMAINDER
+    // V9: the two exact floor stages, dividing SMALLER_SIGNIFICAND^2 by 2^NEAR_GAP twice:
+    //
+    //   SMALLER_SIGNIFICAND^2  = HALF_QUOTIENT * NEAR_GAP_POW + HALF_REMAINDER
     //   HALF_QUOTIENT = QUOTIENT * NEAR_GAP_POW + REMAINDER
+    //
     // Each remainder is pinned into [0, NEAR_GAP_POW) by its RC16 pair (ctl.rs), making both
-    // quotients exact floors. No identity can wrap the field: V10 keeps QUOTIENT's signed
-    // value inside (-2^32, 2^33 + 2^17), so HALF_QUOTIENT stays inside (-2^47, 2^49), each
-    // product inside (-2^62, 2^63 + 2^48), and both identities equate values whose
-    // difference lies inside (-p, p) — integer equality follows.
-    let small_sq = eval.mul(lv.norm_small, lv.norm_small);
+    // quotients exact floors.
+    //
+    // No identity can wrap the field. V10 keeps QUOTIENT's signed value inside
+    // (-2^32, 2^33 + 2^17). This bounds HALF_QUOTIENT to (-2^47, 2^49) and each
+    // product to (-2^62, 2^63 + 2^48). The difference between the two sides of either
+    // identity lies in (-p, p), so equality in the field implies integer equality.
+    let small_sq = eval.mul(lv.smaller_significand, lv.smaller_significand);
     let stage1 = eval.mad(lv.half_quotient, lv.near_gap_pow, lv.half_remainder);
     let c = eval.sub(small_sq, stage1);
     eval.constraint(c);
     let stage2 = eval.mad(lv.quotient, lv.near_gap_pow, lv.remainder);
     let c = eval.sub(lv.half_quotient, stage2);
     eval.constraint(c);
-    // V10: split the sum of squares V into its top 16 bits and the 17-bit rest:
-    //   V = NORM_BIG^2 + (1 - GAP_IS_FAR) * QUOTIENT
-    //   V = SUM_OF_SQUARES_TOP * 2^17 + SUM_OF_SQUARES_REST_LO + 2^16 * SUM_OF_SQUARES_REST_HI
-    // The rest is below 2^17 (one RC16 plus one boolean bit), so the split is the exact
-    // division of V by 2^17. The LOG16 lookup at SUM_OF_SQUARES_TOP (ctl.rs) bounds the top
-    // below 2^16 and serves LOG_FRACTION = floor(64 * log2 SUM_OF_SQUARES_TOP).
+    // V10: split the aligned sum of squares into its top slice and low 17 bits:
+    //
+    //   V = dominant_significand^2 + (1 - gap_is_far)*quotient
+    //     = 2^17*sum_of_squares_top + rest
+    //   rest = sum_of_squares_rest_lo + 2^16*sum_of_squares_rest_hi.
+    //
+    // RC16 and a boolean high bit force 0 <= rest < 2^17, so the top slice is
+    // floor(V / 2^17). LOG16 bounds that slice and returns
+    // log_fraction = floor(64*log2(sum_of_squares_top)).
     eval.constraint_bool(lv.sum_of_squares_rest_hi);
-    let big_sq = eval.mul(lv.norm_big, lv.norm_big);
+    let big_sq = eval.mul(lv.dominant_significand, lv.dominant_significand);
     let kept_quotient = eval.mul(not_far, lv.quotient);
     let sum_of_squares = eval.add(big_sq, kept_quotient);
     let c2_17 = eval.u64(1 << 17);
@@ -2077,19 +2059,15 @@ where
     let split = eval.add(top_term, rest);
     let c = eval.sub(sum_of_squares, split);
     eval.constraint(c);
-    // V11: the summand score, gated by row liveness (phantom rows score 0):
-    //   LAMBDA = LIVE * (128*ENC_BIG - 2624 + LOG_FRACTION)
-    // where ENC_BIG = X_DOMINATES*X_ENC + (1 - X_DOMINATES)*SIGMA_ENC = max(X_ENC, SIGMA_ENC)
-    // (V5 orders the dominance bit by the encodings; a tie makes both mux branches equal).
-    // The score is 64*(log2 S + 508) rounded down, for S = (alpha*x)^2 + sigma^2:
-    //   S ~= V * 2^(2*(ENC_BIG - 268) - 30)   (each addend is norm * 2^(enc - 268 - 15))
-    //   LOG_FRACTION ~= 64*(log2 V - 17)      (SUM_OF_SQUARES_TOP = V >> 17)
-    //   -2624 = 64*(508 - 13) - 128*268       (-13 = -(30 - 17): V is built 30 bits up but
-    //                                          read back only 17 bits down; -128*268 strips
-    //                                          the two encoding biases from 128*ENC_BIG)
-    // Each ~= is a floor, so LAMBDA is never above 64*(log2 S + 508) and sits less than
-    // 1.1 steps of 1/64 below it.
-    let enc_big = eval.mux(lv.x_dominates, lv.sigma_enc, lv.x_enc);
+    // V11: convert the aligned logarithm back to the score of S_X:
+    //
+    //   score = LIVE * (128*max(E_x, E_s) - 2624 + log_fraction)
+    //   -2624 = 64*(508 - 13) - 128*268.
+    //
+    // Squaring the normalized significands introduces 30 fractional bits; taking
+    // V's top slice removes 17, leaving the correction -13. The other terms add
+    // the score bias 508 and remove the exponent bias 268 twice. Padding scores are zero.
+    let enc_big = eval.mux(lv.x_dominates, lv.sigma_biased_exponent, lv.scaled_biased_exponent);
     let enc_term = eval.mul(c128, enc_big);
     let c2624 = eval.i32(2624);
     let biased = eval.sub(enc_term, c2624);
@@ -2116,13 +2094,13 @@ pub(crate) fn eval_input_quant_constraints<V, S, E>(
     let nv: &InputQuantColumnsView<V> = nv.borrow();
     let wl2_pow = eval.scalar(vars.get_public_inputs()[WL2_POW_PUBLIC_INPUT]);
 
-    // ---- Verifier-known columns need no duplicate AIR equations. The verifier recomputes the
+    // Verifier-known columns need no duplicate AIR equations. The verifier recomputes the
     // noise fields, indices, liveness, and row/block/group flags and checks their openings.
     // This proves the boundary facts used below: the final row closes a block and group,
     // even/odd rows alternate from row 0, and each block start has
-    // ELEMENT_INDEX = 8*BLOCK_INDEX. ----
+    // ELEMENT_INDEX = 8*BLOCK_INDEX.
 
-    // ---- Both sides (groups P/U/V/S/B/F/M/W/Q/C). ----
+    // Both sides (groups P/U/V/S/B/F/M/W/Q/C).
     let lva = side_a(lv);
     let nva = side_a(nv);
     eval_side(eval, &lva, &nva, lv.is_group_final, nv.is_block_start, wl2_pow);
@@ -2131,14 +2109,13 @@ pub(crate) fn eval_input_quant_constraints<V, S, E>(
     eval_side(eval, &lvb, &nvb, lv.is_group_final, nv.is_block_start, wl2_pow);
 }
 
-// ==================================================================================================
 // Stark impl
-// ==================================================================================================
 
-/// InputQuantStark. A CTL party of the fp8 batch (`requires_ctls()`): its proofs carry the
-/// cross-table openings of the channels declared in `super::ctl`, so the batch driver is the
-/// only supported proving path. There are no in-trace lookups (`lookups()` stays empty): every
-/// lookup instance targets the committed LUT oracle.
+/// Input-quantization AIR. The batch driver is the supported proving path.
+///
+/// The arithmetic constraints require the cross-table channels and committed
+/// lookup tables declared in [`super::ctl`]. A standalone proof of this table
+/// would not establish those relations.
 #[derive(Clone, Debug)]
 pub struct InputQuantStark<F: RichField + Extendable<D>, const D: usize> {
     pub program: InputQuantProgram,
@@ -2197,9 +2174,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for InputQuantSta
     }
 }
 
-// ==================================================================================================
 // Tests
-// ==================================================================================================
 
 #[cfg(test)]
 mod tests {
@@ -2376,11 +2351,8 @@ mod tests {
 
     #[test]
     fn padded_asymmetric_trace_satisfies_constraints_and_lut_domains() {
-        // The padded geometry in one program: h != w (dead A rows [288, 512), dead B rows
-        // [480, 512)) and a truncated tail group (k = 96 is not a power of two: 512 = 5*96 +
-        // 32, and the 32-row tail still closes with IS_GROUP_FINAL on the last row). The
-        // phantom fill must satisfy every constraint—including cyclic wraps through the dead
-        // tail—keep active lookup keys in range, and match the verifier-known columns.
+        // Unequal live prefixes and k = 96 exercise both-side padding and a truncated
+        // tail group. The final row must close that group for cyclic constraints.
         let program = InputQuantProgram {
             h: 3,
             w: 5,
@@ -2440,9 +2412,7 @@ mod tests {
 
     #[test]
     fn trace_is_bit_exact_vs_native_pipeline() {
-        // X vs open_prequant, then the noised codes and the liveness flags vs the native
-        // functions, given the trace's alpha/beta. The decode follows the canonical
-        // `open_prequant` semantics (the plain verifier has not wired prequant openings yet).
+        // Compare decoded X, noised codes and liveness flags against their native functions.
         let (program, rows, _) = test_trace();
         let inp = test_inputs(&program);
         let (h, k) = (program.h, program.k);
@@ -2516,11 +2486,8 @@ mod tests {
 
     #[test]
     fn group_scales_match_native_derivation() {
-        // The honest alpha/beta witness must be exactly the native scheme: floor the group's
-        // (l2, linf) at 2^-32 (`bf16_max`, the reference `row_norms`), then derive_row_scales —
-        // the same flow as `noisy_quantize`. l2 is the exact-integer path (module docs,
-        // native-semantics notes); on this test data it coincides with the native
-        // f32-summation row_norms, asserted here.
+        // Compare scales derived from norms floored at 2^-32. For this fixture, native
+        // f32 summation and the integer L2 calculation give the same norms.
         let (program, rows, _) = test_trace();
         let inp = test_inputs(&program);
         let (h, k) = (program.h, program.k);
@@ -2565,13 +2532,9 @@ mod tests {
 
     #[test]
     fn all_zero_group_is_provable_with_reference_scales() {
-        // An all-zero opened row is protocol-legal: the scheme floors both norms at 2^-32, so
-        // alpha is finite and beta strictly positive (real noise IS injected — the reference
-        // semantics). Regression: witness generation used to divide 448 by an unfloored zero
-        // noised-bound and panic. Group 0 of the A side is forced all-zero (ints AND noise on
-        // that side stay as generated — only the ints are zeroed, so X = 0 while the noise
-        // codes still exercise the beta*n path); every constraint and LUT lookup must hold,
-        // and the committed scales must equal the native derivation on the floored norms.
+        // An all-zero row must still produce finite alpha and positive beta after the
+        // 2^-32 norm floor. Zero the first A row's int8 values while retaining its noise;
+        // check constraints, lookups and the native scale derivation.
         let program = test_program();
         let mut inp = test_inputs(&program);
         let k = program.k;
@@ -2719,9 +2682,8 @@ mod tests {
         check(0x0401, 0x3F81, 0x8402); // V = 1 at EP = -133: exact subnormal result 2^-133
         check(0x1481, 0x3F81, 0x9482); // V = 1 at EP = -100: a normal result despite V < 128
         check(0x3F81, 0x3F81, 0xBF81); // V = 129 (mantissa-borrow pattern)
-        // The formerly gapped cancellation band: V < 128 with KEY_SCALE in [-132, -127], the
-        // signed-cut slots 1-6. Each subnormal below was misclassified as normal by the old
-        // nonnegative-cut table; the two normal cases pin the in-band normal/subnormal split.
+        // Cancellation with V < 128 at scales [-132, -127] exercises signed cut slots 1–6
+        // and their normal/subnormal boundary.
         check(0x0481, 0x3F81, 0x8482); // V = 1 at EP = -132: subnormal 0x0002
         check(0x0501, 0x3F81, 0x8502); // V = 1 at EP = -131: subnormal 0x0004
         check(0x0581, 0x3F81, 0x8582); // V = 1 at EP = -130: subnormal 0x0008
@@ -2750,9 +2712,7 @@ mod tests {
 
     #[test]
     fn lut_instance_inventory_holds_on_honest_trace() {
-        // Evaluates every declared LUT instance (key/value/filter algebra) over the honest trace
-        // and checks it against the table semantics (mirror functions). This ties the ctl
-        // descriptors to the trace the way the oracle wiring will.
+        // Check all evaluated lookup tuples against their table semantics.
         let (_, rows, _) = test_trace();
         let n = rows.len();
         let polys = trace_rows_to_poly_values(rows.clone());
@@ -2940,7 +2900,7 @@ mod tests {
         assert_ne!(known[bs_col].values[9], t[9][bs_col], "IS_BLOCK_START must diverge at row 9");
         assert_ne!(known[blk_col].values[9], t[9][blk_col], "block_index must diverge at row 9");
 
-        // ---- Group B (block-integer L2) tampers, one per constraint family. ----
+        // Group B (block-integer L2) tampers, one per constraint family.
         let n = rows.len();
         let is_block_final = |r: usize| rows[(r + 1) % n][m.is_block_start] == F::ONE;
 
@@ -3023,11 +2983,11 @@ mod tests {
         t[gi][m.block_l2_b.running_l2_frame_sum] += F::ONE;
         assert!(!constraints_vanish(&stark, &t, &pis), "B16 B-side tamper undetected");
 
-        // ---- Group V (check 4 score witness) tampers, one per constraint family. ----
+        // Group V (check 4 score witness) tampers, one per constraint family.
 
-        // V3: SIGMA_NORM must be group-constant.
+        // V3: NORMALIZED_SIGMA_SIGNIFICAND must be group-constant.
         let mut t = rows.clone();
-        t[2][m.sigma_norm_a] += F::ONE;
+        t[2][m.normalized_sigma_significand_a] += F::ONE;
         assert!(!constraints_vanish(&stark, &t, &pis), "V3 tamper undetected");
 
         // V5: flipping the dominance bit negates the gap identity on a split-encoding row.
@@ -3048,7 +3008,7 @@ mod tests {
 
         // V8: a corrupted dominant significand breaks the ordering mux.
         let mut t = rows.clone();
-        t[vr][m.norm_big_a] += F::ONE;
+        t[vr][m.dominant_significand_a] += F::ONE;
         assert!(!constraints_vanish(&stark, &t, &pis), "V8 tamper undetected");
 
         // V9: a corrupted second-stage quotient breaks the Euclidean split.
@@ -3063,7 +3023,7 @@ mod tests {
 
         // V11: a forged score no longer matches its committed sum of squares.
         let mut t = rows.clone();
-        t[vr][m.lambda_a] += F::ONE;
+        t[vr][m.summand_score_a] += F::ONE;
         assert!(!constraints_vanish(&stark, &t, &pis), "V11 tamper undetected");
     }
 
@@ -3145,8 +3105,4 @@ mod tests {
     fn circuit_constraints_match_native() {
         test_stark_circuit_constraints::<F, C, S, D>(S::new(test_program())).unwrap();
     }
-
-    // No standalone prove/verify smoke test: this table is a CTL party (`requires_ctls`), so a
-    // proof without the cross-table argument is not a supported object. The end-to-end proving
-    // path is covered by `fp8::driver::tests::batch_proof_roundtrips_and_rejects_tampering`.
 }

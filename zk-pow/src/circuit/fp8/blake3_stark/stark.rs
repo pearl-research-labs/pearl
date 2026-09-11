@@ -1,37 +1,46 @@
-//! Proves every BLAKE3 compression used by FP8 V2 and binds the resulting public hashes.
+//! Proves every BLAKE3 compression used by FP8 and binds the resulting public hashes.
 //!
 //! # Compression rows
 //!
 //! One BLAKE3 compression consumes a 64-byte message (sixteen little-endian `u32` words), an
 //! eight-word chaining value (CV), a counter, block length, and flags. It occupies eight trace
-//! rows: seven rows apply BLAKE3's seven permutation rounds, and the eighth applies the
-//! feed-forward finalization and exposes the eight-word output CV. [`Blake3Program`] is the
-//! public instruction schedule selecting each compression's CV source, message source,
-//! counter/flag tweak, and optional public-output slot.
+//! rows: seven apply BLAKE3's permutation rounds; the eighth applies feed-forward
+//! finalization and exposes the eight-word output CV.
+//!
+//! [`Blake3Program`] is the public instruction schedule. For each compression it
+//! selects the CV source, message source, counter/flag tweak and optional public-output slot.
 //!
 //! # Protocol hash graph
 //!
 //! Leaf and parent compressions build four keyed Merkle roots: int8 values and bf16 block-scale
 //! codes for each of matrices A and B. A separate keyed tree binds mixture-of-experts (MoE)
-//! routing data when present. Eight parallel lookups route an internal CV by packing each
+//! routing data when present.
+//!
+//! Eight parallel lookups route an internal CV by packing each
 //! `(source trace row, CV word value)` pair injectively; `cv_route_key_or_tweak` carries the
 //! source-row pointer on fetch rows or the instruction's public tweak on initialization rows.
 //!
-//! Two keyed wrapper compressions ([`append_commit_fold`]) fold the four roots into the
-//! per-side commitment digests `blake3(values_root || scales_root, key=keyA/keyB)`, bound to the
-//! `HASH_A`/`HASH_B` public inputs — the roots themselves stay internal CVs.
+//! Two keyed wrapper compressions ([`append_commit_fold`]) bind the four roots
+//! to the public per-side commitment digests:
+//!
+//! ```text
+//! HASH_A = blake3(A_values_root || A_scales_root, key=keyA)
+//! HASH_B = blake3(B_values_root || B_scales_root, key=keyB)
+//! ```
+//!
+//! Here `||` denotes byte concatenation. The individual roots remain internal CVs.
 //!
 //! After Matmul and XorFold, one final keyed compression hashes the folded lottery words under
 //! `POW_KEY`; its output is the public jackpot hash. `HASH_A`, `HASH_B`, the optional
 //! routing/offsets hashes, and the jackpot hash are public inputs.
+//!
+//! # Trace binding
 //!
 //! The verifier recomputes the schedule columns and checks their openings. Cross-table lookups
 //! bind live int8/scale message blocks to InputQuantStark and lottery words to XorFoldStark;
 //! byte and MoE-limb lookups range-check packed message data. Thus neither padding
 //! compressions nor an alternative private instruction schedule can contribute to a public
 //! binding.
-
-// TODO: this file contains many asserts, that should be prevented in advance
 
 use core::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
@@ -79,8 +88,7 @@ pub const ROWS_PER_COMPRESSION: usize = 8;
 /// this keeps the packing injective for every value accepted by the constraints.
 const CV_ROUTING_KEY_FACTOR: u64 = 1 << 34;
 
-/// `apply BLAKE3_MSG_PERMUTATION`: `new[i] = old[BLAKE3_MSG_PERMUTATION[i]]` (the deployed
-/// chip's `blake3_permute_msg`, generic so the constraint side can permute column handles).
+/// Permutes message words in place; generic so the AIR can also permute column handles.
 fn blake3_permute<T: Copy>(msg: &mut [T; 16]) {
     let old = *msg;
     for i in 0..16 {
@@ -88,9 +96,7 @@ fn blake3_permute<T: Copy>(msg: &mut [T; 16]) {
     }
 }
 
-// ==================================================================================================
-// Program: the compiled instruction schedule (deployed `BlakeInstruction` model)
-// ==================================================================================================
+// Public compression schedule
 
 /// The six committed byte planes a compression's message bytes can come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,9 +131,7 @@ impl PlaneId {
     }
 }
 
-/// A chaining value referenced by a parent compression: an earlier instruction's output, or a
-/// witness **auxiliary CV** — the root of an unopened subtree, the deployed sparse-opening
-/// mechanism (`CvType::Instruction` / `CvType::Auxiliary`).
+/// A parent's child CV: an earlier instruction's output or the witness root of an unopened subtree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CvRef {
     /// `CV_OUT` of instruction `i` (must precede the referencing instruction).
@@ -152,25 +156,20 @@ pub enum CvSource {
     Chain(usize),
 }
 
-/// Where one compression's 64 message bytes come from (deployed `MessageType`).
+/// Message source for one 64-byte compression block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageSource {
-    /// 64 committed plane bytes at `offset` in the **chunk-padded** plane (deployed
-    /// `MatrixLeaf`), ingested 8 bytes per row through `UINT8_DATA`. `ctl_base` is the
-    /// element / scale-block CTL key of the block's first byte (ignored on the routing plane);
-    /// rows whose bytes lie past the raw plane length are chunk padding — CTL filters off.
-    /// The 64 bytes may span two adjacent opened strips: adjacent committed rows sit
-    /// back-to-back in the plane stream, so the offsets (and CTL keys) stay contiguous.
+    /// 64 bytes starting at `offset` in the chunk-padded plane, ingested eight per row.
+    /// `ctl_base` is the first element/scale-block lookup key. Bytes beyond the raw plane
+    /// length are hashed as padding but excluded from CTLs. A block may span adjacent
+    /// opened strips, which are contiguous in the plane stream.
     PlaneBytes { plane: PlaneId, offset: usize, ctl_base: u64 },
-    /// 64 witness bytes, `aux_msgs[idx]` (deployed `AuxiliaryLeaf`): an unopened block that is
-    /// hashed but exports nothing.
+    /// `aux_msgs[idx]`: an unopened 64-byte block, hashed without exporting lookup tuples.
     AuxBytes { idx: usize },
-    /// A block straddling an opening boundary (deployed `SplitLeaf`): only dwords
-    /// `skip..skip + take` carry opened plane bytes — `offset` / `ctl_base` are the stream
-    /// byte offset and CTL key of dword `skip` — while the remaining dwords carry the
-    /// unopened-neighbor bytes from `aux_msgs[aux_idx]` (the full 64-byte block), hashed but
-    /// exporting nothing. Arises when a committed row is not a multiple of 64 bytes (int8
-    /// rows at `k % 64 != 0`, scales rows at `k % 256 != 0`); never on the routing plane.
+    /// A block crossing an opening boundary. Dwords `skip..skip+take` are opened plane
+    /// bytes; `offset` and `ctl_base` refer to the first opened dword. Other bytes come
+    /// from `aux_msgs[aux_idx]` and are hashed without exporting tuples.
+    /// Used when values/scales rows end inside a 64-byte block.
     PlaneBytesSplit {
         plane: PlaneId,
         offset: usize,
@@ -198,8 +197,7 @@ pub enum PublicBinding {
     HashJackpot,
 }
 
-/// One compiled compression = 8 trace rows (the deployed `BlakeInstruction` shape: CV source,
-/// message source, tweak, binding).
+/// One eight-row compression: CV source, message source, tweak and optional public binding.
 #[derive(Clone, Copy, Debug)]
 pub struct Blake3Instruction {
     pub cv: CvSource,
@@ -214,9 +212,7 @@ pub struct Blake3Instruction {
 }
 
 impl Blake3Instruction {
-    /// The lottery compression: one keyed block under `JACKPOT_KEY` (chunk start + end + root),
-    /// message = XorFold's 16 folded words, output bound to `HASH_JACKPOT`. Scheduled here —
-    /// the deployed pipeline runs the jackpot outside `BlakeProgram`.
+    /// Keyed compression of XorFold's 16 words under JACKPOT_KEY, bound to HASH_JACKPOT.
     pub fn lottery() -> Self {
         Self {
             cv: CvSource::JackpotKey,
@@ -228,8 +224,7 @@ impl Blake3Instruction {
         }
     }
 
-    /// The packed tweak riding `CV_ROUTE_KEY_OR_TWEAK` on row 1, in the deployed init-state bit
-    /// window layout: `counter(48 bits) | flags(8) | block_len(7)`.
+    /// Initialization tweak packed as `counter(48 bits) | flags(8) | block_len(7)`, stored on row 1.
     fn tweak_packed(&self) -> u64 {
         assert!(self.counter < 1 << 48 && self.flags < 1 << 8 && self.block_len < 1 << 7);
         self.counter + ((self.flags as u64) << 48) + ((self.block_len as u64) << 56)
@@ -256,11 +251,8 @@ impl Blake3Instruction {
     }
 }
 
-/// Appends one side's commitment-fold wrapper — a single keyed compression mirroring
-/// `proof_utils.rs::operand_digest_fp10`: `blake3(values_root || scales_root, key=key)`,
-/// whose output binds to the side's public hash. `values_root`/`scales_root` are the
-/// instruction indices of the side's tree-root compressions (both roots arrive through the
-/// CV window fetches); `key` is the side's opening-key CV source (`KeyA`/`KeyB`).
+/// Appends `blake3(values_root || scales_root, key=key)`, bound to the side's public digest.
+/// Both roots are earlier instruction indices fetched through CV routing; key is KeyA or KeyB.
 pub fn append_commit_fold(
     instrs: &mut Vec<Blake3Instruction>,
     values_root: usize,
@@ -288,7 +280,7 @@ pub fn append_commit_fold(
 /// The compiled schedule of one job's hash forest: the full per-plane commitment trees (with
 /// auxiliary material at the opening boundary), the routing tree, and the lottery — one
 /// instruction per compression, children before parents. Produced by the fp8 program
-/// compiler; everything here is class (a) (verifier-recomputable from public job geometry).
+/// compiler; everything here is verifier-known (verifier-recomputable from public job geometry).
 #[derive(Clone, Debug, Default)]
 pub struct Blake3Program {
     pub instructions: Vec<Blake3Instruction>,
@@ -296,18 +288,13 @@ pub struct Blake3Program {
     pub num_aux_msgs: usize,
     /// Number of auxiliary sibling CVs the schedule references (witness bound).
     pub num_aux_cvs: usize,
-    /// The MoE sampled-entry pins, `(stream word index, public outer index)` with the stream
-    /// word index counting u32 words of the concatenated opened hotspot blocks
-    /// (`16 * strip + word_in_block`), strictly ascending, each value < 2^26. Exactly the
-    /// deployed chip's selective outer-index schedule (`pearl_preprocess.rs::
-    /// compute_outer_index_packed`): `IS_FIRST_OUTER`/`IS_SECOND_OUTER` fire only where a
-    /// routing row ingests a pinned word, `MOE_OUTER_INDICES_PACKED` carries only pinned
-    /// values (zero in unpinned slots), and every *other* word of the opened blocks stays
-    /// prover witness, bound solely by the hash chain to `HASH_ROUTING`. Class (a) — derived
-    /// from the public MoE data ([`MoEStatement::routing_pins`]); empty for dense jobs.
+    /// Sampled MoE entries `(stream_word_index, public_outer_index)`, sorted by stream
+    /// position. Each public value is below 2^26. Selectors bind only sampled words;
+    /// unsampled neighbors remain witness bytes bound by the hash and order chains.
+    /// Empty for dense jobs.
     pub routing_pins: Vec<(usize, u32)>,
     /// The MoE scalar statement driving the offsets pins and the order chains; `None` for
-    /// dense jobs. Class (a) — public statement data.
+    /// dense jobs. Verifier-known — public statement data.
     pub moe: Option<MoeSchedule>,
 }
 
@@ -399,39 +386,20 @@ impl MoeSchedule {
 impl Blake3Program {
     // TODO: Consolidate `chip_program::BlakeProgram` and this STARK-specific
     // `Blake3Program` into one canonical program representation.
-    /// Translates the deployed program compiler's output (`chip/blake3/program.rs`, compiled
-    /// by the verifier from public data only) into the in-table schedule, appending the
-    /// lottery compression (the deployed pipeline schedules the jackpot outside
-    /// `BlakeProgram`). The mapping is one-to-one:
-    /// - `is_cv_key` -> [`CvSource::KeyA`]/[`CvSource::KeyB`] by the `KeySource` side, and
-    ///   `KeySource::Jackpot` -> [`CvSource::JackpotKey`]; otherwise [`CvSource::Chain`] of the
-    ///   *previous* instruction (the deployed evaluator chains `cvs.last()`);
-    /// - `MatrixLeaf` -> [`MessageSource::PlaneBytes`]: the strip-list index and in-row offset
-    ///   give the offset into the concatenated opened strips (the [`Blake3TraceInputs`] plane
-    ///   streams) and the CTL key base — flat element index on values planes, block index on
-    ///   scales planes, B bases past A's key range (`+ h*k` / `+ h*k/BLOCK_SIZE`). Scales
-    ///   strips sit at list indices `h..2h` / `w..2w` (the deployed prequant convention).
-    ///   A block spanning two adjacent opened strips stays one contiguous stream range;
-    /// - `SplitLeaf` -> [`MessageSource::PlaneBytesSplit`]: the opened dword window maps as
-    ///   `MatrixLeaf`, the unopened remainder rides the auxiliary message;
-    /// - `RoutingLeaf { hotspot_idx }` -> `PlaneBytes` on the routing plane at
-    ///   `64 * hotspot_idx` (the routing stream is the concatenated opened hotspot blocks);
-    /// - `OffsetsLeaf { block_idx }` -> `PlaneBytes` on the offsets plane at `64 * block_idx`
-    ///   (the offsets tree is fully opened: the stream is the whole padded list);
-    /// - `AuxiliaryLeaf { idx }` -> [`MessageSource::AuxBytes`]; `Parent` -> `Parent` with
-    ///   `CvType::Instruction/Auxiliary -> CvRef` verbatim (same witness indexing as
-    ///   `PrivateProofParams::external_msgs/external_cvs`);
-    /// - the routing/offsets root flags -> `HashRouting` / `HashOffsets`; the four plane
-    ///   roots stay unbound internal CVs — [`append_commit_fold`] wires them into the
-    ///   `HASH_A`/`HASH_B` wrappers appended before the lottery.
+    /// Translates the public `BlakeProgram` into this AIR's schedule, then appends
+    /// per-side commitment folds and the lottery compression.
     ///
-    /// `routing_pins` is the MoE sampled-entry schedule (`MoEStatement::routing_pins`) and
-    /// `moe` the scalar statement driving the offsets pins and order chains (both empty/`None`
-    /// for a dense job); `Self::validate` cross-checks them against the instructions.
+    /// - Keyed CVs select KeyA/KeyB/JackpotKey; chained CVs use the preceding instruction.
+    /// - Matrix leaves become byte ranges in the concatenated opened strips. CTL keys
+    ///   count values or scale blocks; B keys start after A's range.
+    /// - Split leaves retain their opened dword window and auxiliary remainder.
+    /// - Routing/offsets leaves use 64-byte blocks in their respective streams.
+    /// - Parent/auxiliary CV indices retain the input witness indexing.
+    /// - Routing/offsets roots bind directly; values/scales roots feed the commitment folds.
     ///
-    /// Panics unless `program` is a **prequant four-plane** program (each of the A/B
-    /// values/scales roots produced exactly once). FP8 proves only the
-    /// prequant four-plane statement shape.
+    /// `routing_pins` and `moe` supply the public sampled entries, offsets and order checks.
+    /// Validation checks them against the schedule. Dense jobs use empty pins and no MoE data.
+    /// Panics unless each A/B values/scales root is produced exactly once.
     pub fn from_blake_program(
         program: &chip_program::BlakeProgram,
         k: usize,
@@ -442,7 +410,7 @@ impl Blake3Program {
         // fold wrappers reference.
         let mut plane_roots = [const { Vec::new() }; 4];
         for (i, instr) in program.instructions.iter().enumerate() {
-            // Bridge deployed chip field names to fp8 plane names.
+            // Map compiler root roles to FP8 planes.
             let root_slot = match instr.out {
                 chip_program::HashOut::A => 0,
                 chip_program::HashOut::AScales => 1,
@@ -619,14 +587,9 @@ impl Blake3Program {
         self.num_live_rows().next_power_of_two()
     }
 
-    /// Schedule sanity: back-references only, witness indices in bounds, at most one
-    /// instruction per public binding, and the MoE pin schedule consistent with the routing
-    /// instructions — pins strictly ascending with values < 2^26 (the two-limb packing cap),
-    /// and every pin inside a *scheduled* routing block. The last check is the load-bearing
-    /// one: a pin whose block is never hashed in-table would silently drop that sampled
-    /// entry from the statement. (The converse — a scheduled routing block without pins —
-    /// is legitimate: such a block's words are simply free witness under the hash chain,
-    /// like the chunk-padding blocks of a dense fixture tree.)
+    /// Check instruction references, public bindings and MoE routing against the schedule.
+    /// Panics on forward references, invalid witness indices, repeated bindings,
+    /// or routing samples that cannot be authenticated by the scheduled blocks.
     fn validate(&self) {
         let mut seen_binds = Vec::new();
         let mut routing_blocks = Vec::new();
@@ -706,7 +669,10 @@ impl Blake3Program {
             "routing pins must be strictly ascending by stream position"
         );
         for &(pos, value) in &self.routing_pins {
+            // Two-limb packing requires every sampled routing value to fit 26 bits.
             assert!(value < 1 << 26, "routing pin value {value} does not fit 26 bits");
+            // Every public sample must occur in a block the trace actually hashes.
+            // Blocks without samples are valid: their remaining words are private witness.
             assert!(
                 routing_blocks.iter().any(|&(_, b)| b == pos / 16),
                 "routing pin at stream word {pos} lies outside every scheduled routing block"
@@ -804,7 +770,7 @@ impl Blake3Program {
             );
         }
 
-        // ---- Plane byte streams, chunk-padded (the padding bytes are hashed). ----
+        // Plane byte streams, chunk-padded (the padding bytes are hashed).
         let routing_bytes: Vec<u8> = inputs.routing_words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let offsets_bytes: Vec<u8> = inputs.offsets_words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let raw_lens: [usize; NUM_PLANES] = [
@@ -830,7 +796,7 @@ impl Blake3Program {
             hash_id(PlaneId::Offsets).pad(&offsets_bytes),
         ];
 
-        // ---- Phase A: evaluate every compression natively (messages, CV chain, outputs). ----
+        // Evaluate messages and CV chains natively before filling rows.
         let aux_cv_words = |idx: usize| -> [u32; 8] {
             core::array::from_fn(|i| u32::from_le_bytes(inputs.aux_cvs[idx][4 * i..4 * i + 4].try_into().unwrap()))
         };
@@ -887,7 +853,7 @@ impl Blake3Program {
             cvs_out.push(core::array::from_fn(|i| state[i] ^ state[8 + i]));
         }
 
-        // ---- Phase B: fill the rows. ----
+        // Fill trace rows from those compression results.
         let num_live = self.num_live_rows();
         let num_rows = self.num_rows();
         let mut rows: Vec<[F; NUM_BLAKE3_COLUMNS]> = vec![[F::ZERO; NUM_BLAKE3_COLUMNS]; num_rows];
@@ -1123,7 +1089,7 @@ impl Blake3Program {
             }
             debug_assert_eq!(msg_j, m);
 
-            // Round states (rows 0..6) and per-row CV_OUT, the deployed fill.
+            // Round states (rows 0..6) and per-row CV_OUT.
             let mut state = init_state(&cvs_in[c], instr);
             let mut msg_j = m;
             for j in 0..ROWS_PER_COMPRESSION - 1 {
@@ -1153,23 +1119,23 @@ impl Blake3Program {
             }
         }
 
-        // ---- Padding rows: IS_NEW_BLAKE with the zero CV / zero tweak / zero message. ----
+        // Padding rows: IS_NEW_BLAKE with the zero CV / zero tweak / zero message.
         for (r, row) in rows.iter_mut().enumerate().take(num_rows).skip(num_live) {
             let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
             row.is_new_blake = F::ONE;
             row.trace_row_index = F::from_canonical_usize(r); // Constraint 8 spans padding too.
             for i in 0..4 {
-                row.round[0].row3[i] = F::from_canonical_u32(BLAKE3_IV[i]);
+                row.round[0].c_words[i] = F::from_canonical_u32(BLAKE3_IV[i]);
                 // The finalize expression on padding rows: [IV[0..4] ^ 0, 0 ^ 0].
                 row.cv_out[i] = F::from_canonical_u32(BLAKE3_IV[i]);
             }
         }
 
-        // ---- Sliding message buffer: a 16-word window over the concatenated message stream
-        // ---- (2 words appended per live row; padding rows append nothing and shift zeros
-        // ---- in). This makes the unconditional shift-by-2 (constraint 5a) hold everywhere,
-        // ---- and the CV-window pins (5b) are consistent automatically because the fetched
-        // ---- CVs are message words. Matches the deployed generator's row layout.
+        // Sliding message buffer: a 16-word window over the concatenated message stream
+        // (2 words appended per live row; padding rows append nothing and shift zeros
+        // in). This makes the unconditional shift-by-2 (constraint 5a) hold everywhere,
+        // and the CV-window pins (5b) are consistent automatically because the fetched
+        // CVs are message words.
         let mut buffer = [0u32; 16];
         for r in 0..num_rows {
             buffer = shift_buffer(&buffer);
@@ -1188,7 +1154,7 @@ impl Blake3Program {
         }
         // Wrap fixup: the unconditional shift also binds the last -> first row pair, so rows
         // 0..6 must carry the shifted-out residue of the last row's buffer in their prefixes
-        // (the residue never reaches any message; the deployed generator does the same).
+        // (the residue never reaches a compression's message).
         let mut fwd = buffer;
         for off in 1..=(ROWS_PER_COMPRESSION - 1) {
             fwd = shift_buffer(&fwd);
@@ -1198,8 +1164,8 @@ impl Blake3Program {
             }
         }
 
-        // ---- Write the deferred slice bound into the row after IS_BOUND_SECOND: its inter
-        // ---- limbs are idle, since that row's word pair starts past the slice.
+        // Write the deferred slice bound into the row after IS_BOUND_SECOND: its inter
+        // limbs are idle, since that row's word pair starts past the slice.
         if let Some((r, limbs)) = bound_write {
             let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
             assert_eq!(
@@ -1210,10 +1176,10 @@ impl Blake3Program {
             row.chain_inter_limbs = limbs;
         }
 
-        // ---- Fill `chain_carry`: each row holds the last routing/offsets word before it.
-        // ---- Data rows overwrite it with their second word, all other rows copy it. The
-        // ---- first pass computes the end-of-trace value: the constraint is cyclic, so
-        // ---- row 0 checks against the last row.
+        // Fill `chain_carry`: each row holds the last routing/offsets word before it.
+        // Data rows overwrite it with their second word, all other rows copy it. The
+        // first pass computes the end-of-trace value: the constraint is cyclic, so
+        // row 0 checks against the last row.
         let carry_after = |row: &Blake3ColumnsView<F>, prev: F| -> F {
             if row.is_chain_data == F::ONE {
                 F::from_canonical_u64((0..4).map(|i| row.uint8_data[4 + i].to_canonical_u64() << (8 * i)).sum())
@@ -1231,9 +1197,9 @@ impl Blake3Program {
             carry = carry_after(row, carry);
         }
 
-        // ---- Postprocess rows whose next row starts a compression (real finalization rows,
-        // ---- padding rows, and the cyclic wrap): fill STATE1..3 so the unconditional
-        // ---- add2/add3 constraints hold and STATE1 carries the finalize bit decompositions.
+        // Postprocess rows whose next row starts a compression (real finalization rows,
+        // padding rows, and the cyclic wrap): fill STATE1..3 so the unconditional
+        // add2/add3 constraints hold and STATE1 carries the finalize bit decompositions.
         for r in 0..num_rows {
             let next = (r + 1) % num_rows;
             {
@@ -1245,31 +1211,31 @@ impl Blake3Program {
             let (nr1, nr3, nr4) = {
                 let next_row: &Blake3ColumnsView<F> = rows[next].borrow();
                 (
-                    read_words(&next_row.round[0].row1),
-                    read_words(&next_row.round[0].row3),
-                    read_bits(&next_row.round[0].row4),
+                    read_words(&next_row.round[0].a_words),
+                    read_words(&next_row.round[0].c_words),
+                    read_bits(&next_row.round[0].d_bits),
                 )
             };
             let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
             let msg: [u32; 16] = core::array::from_fn(|i| row.blake3_msg[i].to_canonical_u64() as u32);
-            let r1 = read_words(&row.round[0].row1);
-            let r2 = read_bits(&row.round[0].row2);
-            let r3 = read_words(&row.round[0].row3);
+            let r1 = read_words(&row.round[0].a_words);
+            let r2 = read_bits(&row.round[0].b_bits);
+            let r3 = read_words(&row.round[0].c_words);
 
-            // STATE1: row2/row4 repurposed as the finalize decompositions of row1/row3.
+            // STATE1: b_bits/d_bits repurposed as the finalize decompositions of a_words/c_words.
             let s1r1: [u32; 4] = core::array::from_fn(|i| r1[i].wrapping_add(r2[i]).wrapping_add(msg[2 * i]));
             let s1r3: [u32; 4] = core::array::from_fn(|i| r3[i].wrapping_add(r3[i]));
-            write_words(&mut row.round[1].row1, &s1r1);
-            write_bits(&mut row.round[1].row2, &r1);
-            write_words(&mut row.round[1].row3, &s1r3);
-            write_bits(&mut row.round[1].row4, &r3);
+            write_words(&mut row.round[1].a_words, &s1r1);
+            write_bits(&mut row.round[1].b_bits, &r1);
+            write_words(&mut row.round[1].c_words, &s1r3);
+            write_bits(&mut row.round[1].d_bits, &r3);
 
             // STATE2: bit halves zero; word halves from the unconditional adds.
             let s2r1: [u32; 4] = core::array::from_fn(|i| s1r1[i].wrapping_add(r1[i]).wrapping_add(msg[2 * i + 1]));
-            write_words(&mut row.round[2].row1, &s2r1);
-            write_bits(&mut row.round[2].row2, &[0; 4]);
-            write_words(&mut row.round[2].row3, &s1r3);
-            write_bits(&mut row.round[2].row4, &[0; 4]);
+            write_words(&mut row.round[2].a_words, &s2r1);
+            write_bits(&mut row.round[2].b_bits, &[0; 4]);
+            write_words(&mut row.round[2].c_words, &s1r3);
+            write_bits(&mut row.round[2].d_bits, &[0; 4]);
 
             // STATE3: solved backwards from the next row's input state (diagonal adds).
             let s3r1: [u32; 4] = core::array::from_fn(|i| s2r1[i].wrapping_add(msg[8 + 2 * i]));
@@ -1280,20 +1246,20 @@ impl Blake3Program {
                 s3r4[d] = s3r3[c].wrapping_sub(s1r3[c]);
                 s3r2[b] = nr1[i].wrapping_sub(s3r1[i]).wrapping_sub(msg[8 + 2 * i + 1]);
             }
-            write_words(&mut row.round[3].row1, &s3r1);
-            write_bits(&mut row.round[3].row2, &s3r2);
-            write_words(&mut row.round[3].row3, &s3r3);
-            write_bits(&mut row.round[3].row4, &s3r4);
+            write_words(&mut row.round[3].a_words, &s3r1);
+            write_bits(&mut row.round[3].b_bits, &s3r2);
+            write_words(&mut row.round[3].c_words, &s3r3);
+            write_bits(&mut row.round[3].d_bits, &s3r4);
         }
 
-        // ---- CV-routing multiplicities and the ROW_FLAGS_PACKED packing. ----
+        // CV-routing multiplicities and the ROW_FLAGS_PACKED packing.
         for (r, row) in rows.iter_mut().enumerate() {
             let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
             row.cv_out_freq = F::from_canonical_u64(freq[r]);
             row.row_flags_packed = pack_control(row);
         }
 
-        // ---- Public inputs. ----
+        // Public inputs.
         let bound_cv = |bind: PublicBinding| -> [u32; 8] {
             instrs
                 .iter()
@@ -1319,19 +1285,16 @@ impl Blake3Program {
         (rows, pis)
     }
 
-    /// The class (a) ("known") column values — the leading
-    /// [`NUM_BLAKE3_KNOWN_COLUMNS`](super::columns::NUM_BLAKE3_KNOWN_COLUMNS) trace columns in
-    /// their `columns.rs` order — recomputed from the compiled program and the public
-    /// byte-stream geometry alone (no witness bytes). Bit-exact with
-    /// [`Self::generate_trace`]'s fill (asserted by the stark's tests and by
-    /// `super::super::consistency`): the batch verifier recomputes exactly this and checks the
-    /// trace-commitment openings against it (`starky`'s `BatchKnownColumns`), so the schedule
-    /// wiring is consensus data even though the columns are committed with the trace.
+    /// Recomputes the leading schedule columns in trace order from public geometry.
+    ///
+    /// The batch verifier checks their trace openings against these values. This
+    /// binds the compression schedule, CV-source selectors and public word pins
+    /// without trusting the prover's choice of flags. No witness bytes are read.
     pub fn known_values<F: RichField>(&self, inputs: &Blake3KnownInputs) -> Vec<PolynomialValues<F>> {
         self.validate();
         let num_live = self.num_live_rows();
         let num_rows = self.num_rows();
-        // The routing/offsets planes have no liveness length: their rows' class (a) data
+        // The routing/offsets planes have no liveness length: their rows' verifier-known data
         // (selectors, pins, chain gates) is driven by the MoE schedule, never by a byte count.
         let raw_lens: [usize; NUM_PLANES] = [
             inputs.a_values_len,
@@ -1407,7 +1370,7 @@ impl Blake3Program {
                                 ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j / 2) as u64);
                             }
                             PlaneId::Routing => {
-                                // Selective pinning, exactly the deployed chip: a selector
+                                // A selector
                                 // fires only where this row ingests a sampled entry, and the
                                 // packed word carries only the pinned public values.
                                 let base = offset / 4 + 2 * j;
@@ -1594,8 +1557,7 @@ pub struct Blake3KnownInputs {
     pub b_scales_len: usize,
 }
 
-/// `IS_MSG_BITS` encodings (deployed `encode_is_msg_bits`): committed plane bytes, auxiliary /
-/// routing / lottery bytes, the parent CV window. `010` (deployed jackpot) is outlawed.
+/// Message modes for plane bytes, auxiliary bytes and CV windows; mode 010 is forbidden.
 const MODE_BYTES: [bool; 3] = [true, false, false];
 const MODE_AUX: [bool; 3] = [false, true, true];
 const MODE_CV: [bool; 3] = [false, false, true];
@@ -1606,11 +1568,8 @@ fn set_msg_mode<F: RichField>(row: &mut Blake3ColumnsView<F>, mode: [bool; 3]) {
     }
 }
 
-/// The deployed chip's selective outer-index fill on one routing row: each of the two
-/// ingested u32 slots is pinned (`Some(outer)`) only where the schedule sampled it — the
-/// selector fires and the 13-bit limbs carry the public value — and stays dark otherwise
-/// (selector off, limbs zero; the word is free witness under the hash chain). The packed
-/// class (a) word carries only pinned values, matching `known_values` bit for bit.
+/// Fills each sampled routing slot's selector and 13-bit limbs.
+/// Unsampled slots have zero selectors/limbs; their message words remain witness data.
 fn set_outer<F: RichField>(row: &mut Blake3ColumnsView<F>, w0: Option<u64>, w1: Option<u64>) {
     if let Some(w0) = w0 {
         assert!(w0 < 1 << 26, "outer-index words must fit 26 bits");
@@ -1749,10 +1708,10 @@ fn native_compress_state(cv: &[u32; 8], m: &[u32; 16], counter: u64, block_len: 
 }
 
 fn write_state<F: RichField>(dst: &mut Blake3StateCols<F>, state: &[u32; 16]) {
-    write_words(&mut dst.row1, &core::array::from_fn(|i| state[i]));
-    write_bits(&mut dst.row2, &core::array::from_fn(|i| state[4 + i]));
-    write_words(&mut dst.row3, &core::array::from_fn(|i| state[8 + i]));
-    write_bits(&mut dst.row4, &core::array::from_fn(|i| state[12 + i]));
+    write_words(&mut dst.a_words, &core::array::from_fn(|i| state[i]));
+    write_bits(&mut dst.b_bits, &core::array::from_fn(|i| state[4 + i]));
+    write_words(&mut dst.c_words, &core::array::from_fn(|i| state[8 + i]));
+    write_bits(&mut dst.d_bits, &core::array::from_fn(|i| state[12 + i]));
 }
 
 fn write_words<F: RichField>(dst: &mut [F; 4], words: &[u32; 4]) {
@@ -1777,9 +1736,7 @@ fn read_bits<F: RichField>(src: &[[F; 32]; 4]) -> [u32; 4] {
     core::array::from_fn(|i| (0..32).fold(0u32, |acc, b| acc | (((src[i][b] == F::ONE) as u32) << b)))
 }
 
-// ==================================================================================================
 // Constraints, written once against the generic `Evaluator`
-// ==================================================================================================
 
 /// Evaluates every arithmetic constraint of Blake3Stark. The CV-routing lookup is
 /// declared in [`Blake3Stark::lookups`] and evaluated by the framework; the BYTES2/RC16
@@ -1812,7 +1769,7 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
     let two = eval.i32(2);
     let c256 = eval.i32(256);
 
-    // ---- 2. Unpack/repack: every flag boolean, weighted sum = ROW_FLAGS_PACKED. ----
+    // 2. Unpack/repack: every flag boolean, weighted sum = ROW_FLAGS_PACKED.
     let flags = [
         lv.is_use_key_a,
         lv.is_use_key_b,
@@ -1846,15 +1803,11 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
     }
     let repacked = eval.polyval(&flags, two);
     eval.constraint_eq(repacked, lv.row_flags_packed);
-    // With every flag boolean, the unpack is the unique binary decomposition of ROW_FLAGS_PACKED —
-    // and ROW_FLAGS_PACKED is class (a), re-derived by the batch verifier and checked against the
-    // trace openings. The flags are therefore the *program's* bits, which carries two facts the
-    // deployed chip reads off its preprocessed schedule and this AIR needs but does not state:
-    // the five CV-source selectors are one-hot-or-zero (a two-hot row would open the mux to CV
-    // forgeries), and row 0 starts a compression (the plain, cyclically wrapping
-    // buffer/message/round constraints rely on it).
+    // Boolean unpacking uniquely recovers the verifier-known schedule flags.
+    // That schedule makes CV-source selectors one-hot-or-zero and starts row 0 at a
+    // compression boundary, as required by the mux and cyclic constraints.
 
-    // ---- 3. CV-source one-hot mux (the deployed mux + the per-side key sources + IV). ----
+    // 3. Select the CV source.
     for i in 0..8 {
         let iv = eval.u64(u64::from(BLAKE3_IV[i]));
         let mut acc = eval.mul(lv.is_use_key_a, key_a[i]);
@@ -1865,7 +1818,7 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
         eval.constraint_eq(lv.blake3_cv[i], acc);
     }
 
-    // ---- 4. Public bindings: the side digests, routing/offsets hashes, the lottery output. ----
+    // 4. Public bindings: the side digests, routing/offsets hashes, the lottery output.
     for (flag, target) in [
         (lv.is_bind_hash_a, hash_a),
         (lv.is_bind_hash_b, hash_b),
@@ -1887,16 +1840,12 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
         eval.constraint(c);
     }
 
-    // ---- 5. Message ingestion (deployed modes; `decode_is_msg_bits` is the deployed
-    // ---- decoder). ----
-    // The unconditional shift-by-2 (plain, incl. the wrap — the generator's wrap fixup keeps
-    // the wrapped instance honest; it never reaches a message).
+    // 5. Shift the message buffer by two words, including across the cyclic wrap.
     for i in 0..14 {
         eval.constraint_eq(nv.blake3_msg_buffer[i], lv.blake3_msg_buffer[i + 2]);
     }
     let (is_msg_jackpot, is_msg_uint8_data, is_msg_cv) = decode_is_msg_bits(eval, one, lv.is_msg_bits);
-    // The deployed jackpot whole-buffer mode (010) is outlawed: the lottery message arrives as
-    // auxiliary bytes and is pinned by the XorFold CTL against BLAKE3_MSG on the load row.
+    // Mode 010 is forbidden: lottery bytes are loaded normally and bound by the XorFold CTL.
     eval.constraint(is_msg_jackpot);
     // Byte-ingestion rows (plane or auxiliary bytes) load the packed byte pairs into the tail.
     let word0 = eval.polyval(&lv.uint8_data[0..4], c256);
@@ -1918,7 +1867,7 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
         eval.constraint_eq_if(lv.is_last_round, permuted[i], lv.blake3_msg_buffer[i]);
     }
 
-    // ---- 1. Round block (the deployed chip's constraint set, re-expressed on this layout). --
+    // 1. Compression rounds and finalization.
     let states = [&lv.round[0], &lv.round[1], &lv.round[2], &lv.round[3], &nv.round[0]];
     verify_round(eval, &states, &lv.blake3_msg, next_same_blake);
     let blake3_output = finalize_blake(eval, states[0], states[1], nv.is_new_blake);
@@ -1928,17 +1877,16 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
     // The packed tweak rides the *next* row's CV_ROUTE_KEY_OR_TWEAK (row 1 of the compression).
     verify_init_state(eval, states[0], lv.is_new_blake, &lv.blake3_cv, nv.cv_route_key_or_tweak);
 
-    // ---- 6. MoE outer indices (deployed packing layout, deployed selective pinning). ----
-    // `MOE_OUTER_INDICES_PACKED`, `IS_FIRST_OUTER` and `IS_SECOND_OUTER` are known columns:
-    // the verifier recomputes them from the public pin schedule, so on a routing row the
-    // packed word carries exactly the pinned outer indices (zero in unpinned slots) and a
-    // selector is up iff its slot is pinned. The unconditional packed equality plus the
-    // *unfiltered* 13-bit limb bounds (`super::ctl::blake3_lut_lookups`) give a
-    // unique decomposition — sum of four 13-bit limbs with weights 1, 2^13, 2^26, 2^39 stays
-    // below 2^52, no field wrap — so a pinned slot's limbs are forced to the public value and
-    // the gated word pin transfers it onto the ingested message word. An unpinned slot's
-    // limbs are forced to zero and its ingested word stays free witness (neighbor entries,
-    // bound only by the hash chain to `HASH_ROUTING`) — the deployed chip's exact semantics.
+    // 6. Bind sampled routing words to the public indices. In order, let l_0..l_3
+    // be the two limbs of outer_index_first followed by those of outer_index_second:
+    //
+    //   packed = l_0 + 2^13*l_1 + 2^26*l_2 + 2^39*l_3, with 0 <= l_i < 2^13.
+    //
+    // Thus packed < 2^52, below the field modulus, and its base-2^13 decomposition is unique.
+    //
+    // Limb bounds must apply even to unsampled slots: otherwise an unchecked limb
+    // could offset a change in a sampled one while preserving packed. Unsampled slots
+    // have zero limbs; their message words remain bound by the routing hash and order checks.
     let limb_base = eval.u64(1 << 13);
     let outer_first = eval.polyval(&lv.outer_index_first, limb_base);
     let outer_second = eval.polyval(&lv.outer_index_second, limb_base);
@@ -1948,7 +1896,7 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
     eval.constraint_eq_if(lv.is_first_outer, word0, outer_first);
     eval.constraint_eq_if(lv.is_second_outer, word1, outer_second);
 
-    // ---- 7. MoE offsets/routing order machinery.
+    // 7. MoE offsets/routing order machinery.
     // We need to check:
     // 1. `O_i` <= `O_{i+1}` for all i,
     // 2. `R[w][i]` < `R[w][i+1]` for all i (the winner slice is strictly increasing),
@@ -1997,15 +1945,15 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
     let carry_next = eval.mad(lv.is_chain_data, carry_step, lv.chain_carry);
     eval.constraint_eq(nv.chain_carry, carry_next);
 
-    // ---- 8. Row counter: transition (the cyclic wrap cannot apply to a strict increment),
-    // ---- first-row anchor 0. ----
+    // 8. Row counter: transition (the cyclic wrap cannot apply to a strict increment),
+    // first-row anchor 0.
     let incremented = eval.add(lv.trace_row_index, one);
     let diff = eval.sub(nv.trace_row_index, incremented);
     eval.constraint_transition(diff);
     eval.constraint_first_row(lv.trace_row_index);
 }
 
-/// One half quarter-round of the G-function cascade (the deployed chip's `half_g`):
+/// One half quarter-round:
 /// `ea = a + packed(b) + m` (mod 2^32, unconditional), `ea = d ^ (ed <<< rot1)` (gated),
 /// `ec = c + packed(ed)` (mod 2^32, unconditional), `ec = b ^ (eb <<< rot2)` (gated);
 /// the produced bit columns `eb`/`ed` are boolean-checked unconditionally.
@@ -2049,73 +1997,71 @@ where
     for i in 0..4 {
         half_g(
             eval,
-            states[0].row1[i],
-            &states[0].row2[i],
-            states[0].row3[i],
-            &states[0].row4[i],
+            states[0].a_words[i],
+            &states[0].b_bits[i],
+            states[0].c_words[i],
+            &states[0].d_bits[i],
             msg[2 * i],
             false,
-            states[1].row1[i],
-            &states[1].row2[i],
-            states[1].row3[i],
-            &states[1].row4[i],
+            states[1].a_words[i],
+            &states[1].b_bits[i],
+            states[1].c_words[i],
+            &states[1].d_bits[i],
             is_activated,
         );
     }
     for i in 0..4 {
         half_g(
             eval,
-            states[1].row1[i],
-            &states[1].row2[i],
-            states[1].row3[i],
-            &states[1].row4[i],
+            states[1].a_words[i],
+            &states[1].b_bits[i],
+            states[1].c_words[i],
+            &states[1].d_bits[i],
             msg[2 * i + 1],
             true,
-            states[2].row1[i],
-            &states[2].row2[i],
-            states[2].row3[i],
-            &states[2].row4[i],
+            states[2].a_words[i],
+            &states[2].b_bits[i],
+            states[2].c_words[i],
+            &states[2].d_bits[i],
             is_activated,
         );
     }
     for i in 0..4 {
         half_g(
             eval,
-            states[2].row1[i],
-            &states[2].row2[(i + 1) % 4],
-            states[2].row3[(i + 2) % 4],
-            &states[2].row4[(i + 3) % 4],
+            states[2].a_words[i],
+            &states[2].b_bits[(i + 1) % 4],
+            states[2].c_words[(i + 2) % 4],
+            &states[2].d_bits[(i + 3) % 4],
             msg[8 + 2 * i],
             false,
-            states[3].row1[i],
-            &states[3].row2[(i + 1) % 4],
-            states[3].row3[(i + 2) % 4],
-            &states[3].row4[(i + 3) % 4],
+            states[3].a_words[i],
+            &states[3].b_bits[(i + 1) % 4],
+            states[3].c_words[(i + 2) % 4],
+            &states[3].d_bits[(i + 3) % 4],
             is_activated,
         );
     }
     for i in 0..4 {
         half_g(
             eval,
-            states[3].row1[i],
-            &states[3].row2[(i + 1) % 4],
-            states[3].row3[(i + 2) % 4],
-            &states[3].row4[(i + 3) % 4],
+            states[3].a_words[i],
+            &states[3].b_bits[(i + 1) % 4],
+            states[3].c_words[(i + 2) % 4],
+            &states[3].d_bits[(i + 3) % 4],
             msg[8 + 2 * i + 1],
             true,
-            states[4].row1[i],
-            &states[4].row2[(i + 1) % 4],
-            states[4].row3[(i + 2) % 4],
-            &states[4].row4[(i + 3) % 4],
+            states[4].a_words[i],
+            &states[4].b_bits[(i + 1) % 4],
+            states[4].c_words[(i + 2) % 4],
+            &states[4].d_bits[(i + 3) % 4],
             is_activated,
         );
     }
 }
 
-/// The finalization identity (deployed `finalize_blake`): on `is_activated` rows STATE1's bit
-/// halves are repurposed as decompositions of STATE0's packed halves, and the returned output
-/// expression is `v[i] ^ v[8+i]` — a bona-fide u32 because it is packed from boolean-checked
-/// bits.
+/// On active rows, state1's bits decompose state0's packed words.
+/// Returns `v[i] ^ v[8+i]`; boolean-checked bits keep each output in u32 range.
 fn finalize_blake<V, S, E>(eval: &mut E, state0: &Blake3StateCols<V>, state1: &Blake3StateCols<V>, is_activated: V) -> [V; 8]
 where
     V: Copy,
@@ -2124,23 +2070,22 @@ where
 {
     let two = eval.i32(2);
     for i in 0..4 {
-        let row2_packed = eval.polyval(&state1.row2[i], two);
-        eval.constraint_eq_if(is_activated, state0.row1[i], row2_packed);
-        let row4_packed = eval.polyval(&state1.row4[i], two);
-        eval.constraint_eq_if(is_activated, state0.row3[i], row4_packed);
+        let row2_packed = eval.polyval(&state1.b_bits[i], two);
+        eval.constraint_eq_if(is_activated, state0.a_words[i], row2_packed);
+        let row4_packed = eval.polyval(&state1.d_bits[i], two);
+        eval.constraint_eq_if(is_activated, state0.c_words[i], row4_packed);
     }
     core::array::from_fn(|i| {
         if i < 4 {
-            xor_32(eval, &state1.row2[i], &state1.row4[i])
+            xor_32(eval, &state1.b_bits[i], &state1.d_bits[i])
         } else {
-            xor_32(eval, &state0.row2[i - 4], &state0.row4[i - 4])
+            xor_32(eval, &state0.b_bits[i - 4], &state0.d_bits[i - 4])
         }
     })
 }
 
-/// The init-state check on `IS_NEW_BLAKE` rows (deployed `verify_init_state`): words 0..8 equal
-/// the muxed CV, words 8..12 the BLAKE3 IV, and the row4 bit block packs to the tweak
-/// (`counter(48) | flags(8) | block_len(7)` window, remaining bits zero).
+/// On compression starts, bind words 0..8 to the selected CV, 8..12 to the IV,
+/// and the final bit block to the packed counter/flags/block-length tweak.
 fn verify_init_state<V, S, E>(eval: &mut E, init_state: &Blake3StateCols<V>, is_new_blake: V, cv: &[V; 8], blake3_tweak: V)
 where
     V: Copy,
@@ -2149,25 +2094,25 @@ where
 {
     let two = eval.i32(2);
     for i in 0..4 {
-        eval.constraint_eq_if(is_new_blake, init_state.row1[i], cv[i]);
+        eval.constraint_eq_if(is_new_blake, init_state.a_words[i], cv[i]);
         let iv = eval.u64(BLAKE3_IV[i] as u64);
-        eval.constraint_eq_if(is_new_blake, init_state.row3[i], iv);
-        let row2_packed = eval.polyval(&init_state.row2[i], two);
+        eval.constraint_eq_if(is_new_blake, init_state.c_words[i], iv);
+        let row2_packed = eval.polyval(&init_state.b_bits[i], two);
         eval.constraint_eq_if(is_new_blake, row2_packed, cv[i + 4]);
     }
-    let active_bits: Vec<V> = init_state.row4[0]
+    let active_bits: Vec<V> = init_state.d_bits[0]
         .iter()
-        .chain(&init_state.row4[1][0..16])
-        .chain(&init_state.row4[3][0..8])
-        .chain(&init_state.row4[2][0..7])
+        .chain(&init_state.d_bits[1][0..16])
+        .chain(&init_state.d_bits[3][0..8])
+        .chain(&init_state.d_bits[2][0..7])
         .copied()
         .collect();
     let packed = eval.polyval(&active_bits, two);
     eval.constraint_eq_if(is_new_blake, packed, blake3_tweak);
-    let zero_bits: Vec<V> = init_state.row4[1][16..]
+    let zero_bits: Vec<V> = init_state.d_bits[1][16..]
         .iter()
-        .chain(&init_state.row4[2][7..])
-        .chain(&init_state.row4[3][8..])
+        .chain(&init_state.d_bits[2][7..])
+        .chain(&init_state.d_bits[3][8..])
         .copied()
         .collect();
     for bit in zero_bits {
@@ -2246,13 +2191,9 @@ where
     eval.polyval(&xor_bits, two)
 }
 
-// ==================================================================================================
 // Stark impl
-// ==================================================================================================
 
-/// Blake3Stark. A CTL party of the fp8 batch (`requires_ctls()`): its proofs carry the
-/// cross-table openings of the channels declared in `super::ctl`, so the batch driver is the
-/// only supported proving path — there is no standalone uni-STARK proof object.
+/// BLAKE3 AIR, proved through the batch driver with the channels in `super::ctl`.
 #[derive(Clone, Debug)]
 pub struct Blake3Stark<F: RichField + Extendable<D>, const D: usize> {
     pub program: Blake3Program,
@@ -2333,9 +2274,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for Blake3Stark<F
     }
 }
 
-// ==================================================================================================
 // Tests
-// ==================================================================================================
 
 #[cfg(test)]
 mod tests {
@@ -2566,7 +2505,7 @@ mod tests {
         field_words_to_bytes(&w)
     }
 
-    /// All plane trees single-chunk; 89 compressions -> 712 live rows -> 1024.
+    /// Single-chunk plane trees.
     fn small_geometry() -> (usize, usize, usize, usize) {
         (2, 2, 64, 2)
     }
@@ -2668,13 +2607,9 @@ mod tests {
         (i as u32 + 1) * 8
     }
 
-    /// The deployed selective-pinning semantics on a mixed schedule: pins on a strict
-    /// subset of the routing words — a second-slot-only row, a fully pinned row, and a pin
-    /// in the second block — with every other word (including all chunk-padding blocks) a
-    /// free witness neighbor. Selectors, limbs and the packed word must follow the pins
-    /// exactly, the neighbor words must be unconstrained (one is deliberately >= 2^26), the
-    /// constraints must accept, and `known_values` must reproduce the known columns bit for
-    /// bit — the class (a) recompute the batch verifier pins.
+    /// Test sampled routing slots alongside unsampled neighbors, including one above
+    /// 2^26. Selectors and limbs must match the public pins; neighbor words remain
+    /// subject to hash/order checks. Recomputed schedule columns must match the trace.
     #[test]
     fn selective_pinning_matches_deployed_semantics() {
         let (h, w, k, routing_blocks) = small_geometry();
@@ -2762,7 +2697,7 @@ mod tests {
     }
 
     /// A forged limb on a pinned slot breaks the unconditional packed decomposition
-    /// (constraint 6): `MOE_OUTER_INDICES_PACKED` is class (a), so the limbs cannot move.
+    /// (constraint 6): `MOE_OUTER_INDICES_PACKED` is verifier-known, so the limbs cannot move.
     #[test]
     fn tampered_pinned_limb_breaks_packed_decomposition() {
         let (h, w, k, routing_blocks) = small_geometry();
@@ -2917,10 +2852,8 @@ mod tests {
         );
     }
 
-    /// Clearing a pin's selector (with `ROW_FLAGS_PACKED` repacked so the unpack stays
-    /// self-consistent) leaves the AIR satisfied — the selectors are **class (a) known
-    /// columns**, so the divergence is caught by the batch verifier's known-column check,
-    /// exactly like the deployed chip's preprocessed columns.
+    /// Clearing a selector and consistently repacking its flags can satisfy the AIR.
+    /// The verifier-known schedule check must reject the changed flags.
     #[test]
     fn cleared_outer_selector_is_caught_by_the_known_column_recompute() {
         let (h, w, k, routing_blocks) = small_geometry();
@@ -2943,7 +2876,7 @@ mod tests {
         let (mut rows, pis) = program.generate_trace::<F>(&data.inputs());
         {
             // Freeing the word also requires zeroing the pinned limbs (the packed word is
-            // class (a) too and must keep decomposing); zero limbs match packed = 0 only if
+            // verifier-known too and must keep decomposing); zero limbs match packed = 0 only if
             // the packed column is also moved — which the known-column check pins. Here we
             // only clear the selector and zero the limbs+packed consistently.
             let row: &mut Blake3ColumnsView<F> = rows[routing_row0].borrow_mut();
@@ -2957,7 +2890,7 @@ mod tests {
             !constraints_violated(&S::new(program.clone()), &rows, &pis),
             "the AIR alone accepts a self-consistent selector clear"
         );
-        // ... but the class (a) recompute does not: ROW_FLAGS_PACKED and the packed word both
+        // ... but the verifier-known recompute does not: ROW_FLAGS_PACKED and the packed word both
         // diverge from the verifier's own values on that row.
         let known = program.known_values::<F>(&data.inputs().known_inputs());
         let row: &Blake3ColumnsView<F> = rows[routing_row0].borrow();
@@ -3004,11 +2937,8 @@ mod tests {
         program.validate();
     }
 
-    /// The sparse-opening membership mechanism (deployed auxiliary CVs): a 4-chunk "full
-    /// matrix" values tree of which only chunks 0/1 (the sampled strip) are hashed in-table;
-    /// the unopened right subtree enters as one auxiliary sibling CV. The root folds through
-    /// the A-side commit wrappers, so `HASH_A` must equal the native fold of the *full*
-    /// matrix's Merkle root — membership of the strip.
+    /// A four-chunk values tree with only chunks 0/1 opened. An auxiliary CV supplies
+    /// the unopened right subtree; the commitment fold must bind the full matrix root.
     fn sparse_opening_setup() -> (Blake3Program, TestData, Vec<u8>) {
         let full: Vec<u8> = (0..4 * BLAKE3_CHUNK_LEN)
             .map(|i| ((i as u64).wrapping_mul(0xA24BAED4963EE407) >> 7) as u8)
@@ -3113,7 +3043,7 @@ mod tests {
         let stark = S::new(program);
         // A state word mid-compression (row 2 of compression 0, STATE1's packed half).
         let row: &mut Blake3ColumnsView<F> = rows[2].borrow_mut();
-        row.round[1].row1[0] += F::ONE;
+        row.round[1].a_words[0] += F::ONE;
         assert!(
             constraints_violated(&stark, &rows, &pis),
             "corrupt state word must break add3"
@@ -3167,11 +3097,11 @@ mod tests {
         let (h, w, k, r) = small_geometry();
         let (program, _, mut rows, pis) = generate(h, w, k, r);
         let stark = S::new(program);
-        // Flip one bit of a rotated/xored state word (STATE1's row2 bits feed the first
+        // Flip one bit of a rotated/xored state word (STATE1's b_bits bits feed the first
         // half-round's xor recomposition and the next add3).
         {
             let row: &mut Blake3ColumnsView<F> = rows[1].borrow_mut();
-            let bit = &mut row.round[1].row2[0][5];
+            let bit = &mut row.round[1].b_bits[0][5];
             *bit = F::ONE - *bit;
         }
         assert!(
@@ -3228,21 +3158,9 @@ mod tests {
         test_stark_circuit_constraints::<F, C, S, D>(S::new(compile_forest(h, w, k, r))).unwrap();
     }
 
-    // No standalone prove/verify smoke tests: this table is a CTL party (`requires_ctls`), so
-    // a proof without the cross-table argument is not a supported object — the proof shape
-    // promises CTL openings the single-table prover has no data for. The end-to-end proving
-    // path (this table included, sparse openings and all) is covered by
-    // `fp8::driver::tests::batch_proof_roundtrips_and_rejects_tampering` and
-    // `api::fp8::zk::tests::api_roundtrip_and_tamper_rejection`; the sparse-opening geometry
-    // keeps constraint-level coverage above (`sparse_opening_root_proves_membership_in_full_tree`,
-    // `tampered_aux_cv_breaks_root_binding`).
-
-    /// End-to-end against the deployed pipeline: build a prequantized proof, run the real
-    /// verifier (`PlainProof::parse_proof`), compile the real `BlakeProgram` from public data,
-    /// translate it with [`Blake3Program::from_blake_program`], and generate the trace from the
-    /// verifier's own witness (opened strips + auxiliary blocks/sibling CVs). The bound root
-    /// public inputs must equal the four committed Merkle roots (the full `m`-row trees, of
-    /// which only `h`/`w` strips are opened) and every constraint must hold.
+    /// Parse a prequant proof, adapt its public hash schedule and generate a trace from
+    /// its extracted witness. Check constraints and side digests against the full matrix
+    /// commitments, including unopened blocks and auxiliary subtrees.
     #[test]
     fn adapter_consumes_deployed_blake_program() {
         use crate::api::fp8::plain_proof::PlainProofV4;
@@ -3373,17 +3291,10 @@ mod tests {
         assert!(!constraints_violated(&S::new(program), &rows, &pis));
     }
 
-    /// The `k % 32` envelope end-to-end at the Blake3 layer, over the REAL wire pipeline.
-    /// With `k = 2080` (`k % 64 = 32`, and `k ≥ 2048`) the int8 rows are 2080 bytes and the
-    /// scales rows 520, so committed rows no longer tile into whole 64-byte blocks and the
-    /// deployed compiler must emit straddling blocks — cross-strip `MatrixLeaf`s where both
-    /// neighbor rows are opened, `SplitLeaf`s where only one side is (the other side being an
-    /// unopened row, or the plane's chunk padding). `parse_proof` reruns `evaluate_blake`
-    /// against the committed Merkle roots, so the chip-level split evaluation is exercised
-    /// before the trace is built. Checks: the trace binds the committed roots, the CTL
-    /// surface still covers exactly the opened elements/scales once each, `known_values`
-    /// reproduces the known columns bit for bit, and every constraint holds. Returns the
-    /// straddle-kind counts of the compiled schedule so callers can pin their geometry's mix.
+    /// Exercise k = 2080: values/scales rows cross 64-byte block boundaries.
+    /// The compiler emits cross-strip leaves when both sides are opened and split leaves
+    /// when one side is unopened or padding. Check digest binding, exact CTL key coverage,
+    /// known columns and constraints. Return split-kind counts for each fixture's assertions.
     fn k_mod_32_adapter_fixture(
         m: usize,
         n: usize,
@@ -3551,7 +3462,7 @@ mod tests {
         assert!(value_keys.iter().enumerate().all(|(i, &b)| b == 8 * i as u64));
         assert!(scale_keys.iter().enumerate().all(|(i, &b)| b == 4 * i as u64));
 
-        // The class (a) recompute is bit-exact with the trace, split rows included.
+        // The verifier-known recompute is bit-exact with the trace, split rows included.
         let known = program.known_values::<F>(&data.inputs().known_inputs());
         assert_eq!(known.len(), NUM_BLAKE3_KNOWN_COLUMNS);
         for (c, column) in known.iter().enumerate() {
@@ -3608,9 +3519,7 @@ mod tests {
         assert!(unopened_first > 0);
     }
 
-    /// The scheme boundary: an Int7 job's `BlakeProgram` — with no scales sections — must be
-    /// rejected by the adapter. Int7 is being disabled protocol-wide; nothing Int7-shaped
-    /// may acquire an fp8 schedule.
+    /// Reject an Int7 schedule, which lacks the four values/scales planes FP8 requires.
     #[test]
     #[should_panic(expected = "not a prequant four-plane program")]
     fn adapter_rejects_legacy_int7_programs() {

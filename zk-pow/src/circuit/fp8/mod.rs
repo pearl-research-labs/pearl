@@ -1,35 +1,25 @@
-//! ZK FP8: the multi-STARK proving system for prequant FP8 proof-of-work.
+//! FP8 proof-of-work: six main STARKs and committed lookup tables.
 //!
-//! Six main tables connected by cross-table lookups, all lookups (range checks included)
-//! targeting the precommitted consensus LUT oracle — sixteen more tables of the same batch,
-//! one AIR per logical LUT. Each table's `stark.rs` module docs carry its full mathematical
-//! description:
+//! Each STARK proves an execution trace using an algebraic intermediate
+//! representation (AIR): polynomial constraints on its rows. Cross-table
+//! lookups (CTLs) bind values shared by different traces. Fixed lookup tables
+//! (LUTs) supply range checks and small arithmetic operations.
 //!
-//! 1. Blake3Stark — commitment/lottery hashing: [`blake3_stark`].
-//! 2. InputQuantStark — strip decode + fp8 quantization: [`input_quant_stark`].
-//! 3. ScaleStark — per-row norm/scale chain: [`scale_stark`].
-//! 4. MatmulB200Stark — B200 tcgen05 window-accumulation emulation: [`matmul_b200_stark`].
-//! 5. XorFoldStark — lottery extractor folds: [`xor_fold_stark`].
-//! 6. TamedStark — jackpot checks 3+4 policy censuses: [`tamed_stark`].
-//! 7. The sixteen `LutStark`s: [`luts`], batch tables 6..22.
+//! - [`blake3_stark`]: operand commitments, routing and jackpot hashes.
+//! - [`input_quant_stark`]: prequant decoding, noise addition and FP8 conversion.
+//! - [`scale_stark`]: row norms, quantization scales and noise-floor checks.
+//! - [`matmul_b200_stark`]: B200 accumulation and per-cell magnitude/skip counts.
+//! - [`xor_fold_stark`]: fold matmul results into the lottery message.
+//! - [`tamed_stark`]: tile-wide tamed-product and skip budgets.
 //!
-//! [`ctl`] carries the table indices, the shared CTL/LUT descriptor types and the channel
-//! assembly (eight main channels + one per LUT); the main tables
-//! keep their halves and LUT inventories in their own `ctl` submodules. [`luts`] generates
-//! the committed LUT tables, their per-AIR layout, their CTL channels and the setup-time
-//! precommitment; [`known_values`] assembles the per-table class (a) columns the batch
-//! verifier recomputes. [`driver`] is the batch prover/verifier: it sorts the twenty-two
-//! tables by height, renumbers the CTLs, and runs `starky`'s batched multi-STARK argument
-//! over one FRI instance. [`wrapper`] is the two-stage recursive wrapper (the batch verifier
-//! encoded in a plonky2 circuit, then a zero-knowledge wrap) producing the constant-size
-//! published proof. `consistency` (test-only) builds the shared end-to-end fixture: one
-//! verifier-parsed job, twenty-two traces, every channel balanced. [`unpredictability`] is
-//! check 4's canonical integer mirror (the skip rule and consensus budget the AIRs enforce).
+//! [`ctl`] connects the tables; [`luts`] supplies preprocessed lookup data.
+//! [`known_values`] assembles columns recomputed from the public statement.
+//! [`driver`] proves the batch in canonical table order, grouping the LUT
+//! commitments. [`wrapper`] recursively verifies it and adds zero knowledge.
+//! [`unpredictability`] defines the integer summand scores and skip rule.
+//! The test-only `consistency` module checks the complete trace pipeline.
 //!
-//! **Scheme boundary.** This system proves exactly one scheme:
-//! prequant FP8 (`Quant::Fp8E4M3Prequant`) with int8 values, BF16 block scales, and FP8 E4M3
-//! matmul. The bridge from the shared job compiler rejects any program that is
-//! not the required four-plane prequant shape.
+//! Inputs use int8 values, BF16 block scales and FP8 E4M3 matmul.
 
 pub mod blake3_stark;
 pub mod circuit_utils;
