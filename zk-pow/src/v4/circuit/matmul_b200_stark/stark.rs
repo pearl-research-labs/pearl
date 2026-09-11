@@ -856,7 +856,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for MatmulStarkB2
     fn requires_ctls(&self) -> bool {
         true
     }
-
 }
 
 // Tests

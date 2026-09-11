@@ -1101,7 +1101,10 @@ fn parse_p_a(remaining: &mut &[u8], experts: u16) -> Result<(OperandParams, Opti
     let hash_id = HashId::try_from(take(remaining, 1)?[0])?;
     let pattern = AxisPattern::from_bytes(take(remaining, AxisPattern::NUM_DIMS)?)?;
     let moe_hash_ids = if experts != 0 {
-        Some((HashId::try_from(take(remaining, 1)?[0])?, HashId::try_from(take(remaining, 1)?[0])?))
+        Some((
+            HashId::try_from(take(remaining, 1)?[0])?,
+            HashId::try_from(take(remaining, 1)?[0])?,
+        ))
     } else {
         None
     };
