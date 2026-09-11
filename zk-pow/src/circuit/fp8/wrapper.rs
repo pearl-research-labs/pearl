@@ -103,9 +103,7 @@ use super::ctl::{NUM_ALL_TABLES, NUM_TABLES};
 use super::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8System, fp8_universal_envelope};
 use super::known_values::hash256_to_hash_out;
 use crate::api::primitives::Hash256;
-// `build_recursion_config` lives in the frozen v2 clone since the mainline circuit
-// module no longer carries the legacy recursion stack.
-use crate::v2::circuit::circuit_utils::build_recursion_config;
+use crate::circuit::fp8::circuit_utils::build_recursion_config;
 
 /// The wrapper's field, extension degree and per-stage hasher configurations.
 pub type F = GoldilocksField;

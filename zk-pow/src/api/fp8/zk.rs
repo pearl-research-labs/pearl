@@ -80,20 +80,12 @@
 //! hold a full [`ProofWithPublicInputs`].
 
 use anyhow::{Context, Result, anyhow, ensure};
-use bincode::Options;
-use hashbrown::HashMap;
-use plonky2::field::cosets::get_unique_coset_shifts;
 use plonky2::field::goldilocks_field::GoldilocksField;
-use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use plonky2::field::types::{Field, Field64, PrimeField64};
-use plonky2::hash::hash_types::HashOut;
-use plonky2::hash::merkle_tree::MerkleCap;
-use plonky2::plonk::circuit_data::{CommonCircuitData, VerifierCircuitData};
+use plonky2::field::types::Field;
+use plonky2::plonk::circuit_data::VerifierCircuitData;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
-use plonky2::util::serialization::{Buffer, DefaultGateSerializer, Read, Remaining};
 use plonky2::util::timing::TimingTree;
-use serde::{Deserialize, Serialize};
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::BatchStarkPreprocessedData;
 
@@ -114,6 +106,7 @@ use crate::circuit::fp8::blake3_stark::columns::{
     PI_KEY_B,
 };
 use crate::circuit::fp8::blake3_stark::stark::{Blake3Program, MoeSchedule};
+pub use crate::circuit::fp8::circuit_utils::{Fp8Verifier, Fp8VerifierCache};
 use crate::circuit::fp8::ctl::NUM_TABLES;
 use crate::circuit::fp8::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8PublicData, Fp8System, Fp8Witness};
 use crate::circuit::fp8::input_quant_stark::stark::InputQuantProgram;
@@ -124,7 +117,6 @@ use crate::circuit::fp8::wrapper::{
     Fp8CircuitCache, Fp8WrapperCircuits, OuterC, compact_proof_data, verify_compact_wrapped_proof, verify_wrapped_proof,
 };
 use crate::circuit::fp8::xor_fold_stark::stark::XorFoldProgram;
-use crate::ensure_eq;
 // The u32-limb hash packing helpers live in the frozen v2 clone since the mainline
 // API no longer carries the legacy STARK plumbing.
 use crate::v2::api::proof_utils::hash_to_u32_field_array;
@@ -216,20 +208,6 @@ impl Fp8Prover {
     }
 }
 
-/// Trusted verifier setup: the universal wrapper's stage-2 verifier data
-/// plus the committed LUT cap, plus the stage-2 constants/sigmas polynomial
-/// coefficients the compact proof encoding omits
-/// ([`verify_compact_wrapped_proof`] recomputes the omitted oracle data from
-/// them — same trust class as the verifier data itself, exactly the deployed
-/// v2 `VerifierCircuitWithPolynomials` bundle). Covers every envelope-legal
-/// job; obtain one from [`Fp8Verifier::generate`] or [`Fp8Verifier::from_bytes`].
-#[derive(Clone, Debug)]
-pub struct Fp8Verifier {
-    lut_cap: LutCap,
-    circuit: VerifierCircuitData<F, OuterC, D>,
-    constants_sigmas_polynomials: Vec<PolynomialCoeffs<F>>,
-}
-
 impl Fp8Verifier {
     /// Generates the trusted setup: compiles the two-stage universal wrapper
     /// circuits against the committed LUT cap
@@ -313,163 +291,14 @@ impl Fp8Verifier {
         )?;
         job.native_epilogue(nbits)
     }
-
-    /// Serializes trusted verifier setup for distribution to independent
-    /// verifier processes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let circuit = self
-            .circuit
-            .to_bytes(&DefaultGateSerializer)
-            .map_err(|error| anyhow::anyhow!("serializing the recursive fp8 verifier circuit: {error:?}"))?;
-        let wire = Fp8VerifierWire {
-            lut_cap: self
-                .lut_cap
-                .0
-                .iter()
-                .map(|hash| hash.elements.map(|element| element.to_canonical_u64()))
-                .collect(),
-            circuit,
-            constants_sigmas_polynomials: serialize_polynomials(&self.constants_sigmas_polynomials, &self.circuit.common),
-        };
-        fp8_wire_options().serialize(&wire).context("serializing fp8 verifier setup")
-    }
-
-    /// Loads verifier setup previously produced by [`Fp8Verifier::to_bytes`].
-    /// The bytes are consensus/trusted-setup data, not proof-controlled input.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let wire: Fp8VerifierWire = fp8_wire_options()
-            .deserialize(bytes)
-            .context("deserializing fp8 verifier setup")?;
-        ensure!(!wire.lut_cap.is_empty(), "fp8 verifier LUT cap cannot be empty");
-        ensure!(
-            wire.lut_cap.iter().flatten().all(|&element| element < F::ORDER),
-            "fp8 verifier LUT cap contains a non-canonical field element"
-        );
-        let lut_cap = MerkleCap(
-            wire.lut_cap
-                .into_iter()
-                .map(|elements| HashOut {
-                    elements: elements.map(F::from_canonical_u64),
-                })
-                .collect(),
-        );
-        let circuit = VerifierCircuitData::from_bytes(wire.circuit, &DefaultGateSerializer)
-            .map_err(|error| anyhow::anyhow!("deserializing the recursive fp8 verifier circuit: {error}"))?;
-        ensure!(
-            circuit.common.config.zero_knowledge,
-            "the fp8 verifier setup must contain the ZK wrapper stage"
-        );
-        // The codec pins the polynomial count and degree to `circuit.common` (and rejects
-        // trailing bytes), so a shape mismatch with the circuit fails closed here.
-        let constants_sigmas_polynomials = deserialize_polynomials(&wire.constants_sigmas_polynomials, &circuit.common)
-            .context("deserializing the fp8 verifier constants/sigmas polynomials")?;
-        Ok(Self {
-            lut_cap,
-            circuit,
-            constants_sigmas_polynomials,
-        })
-    }
-}
-
-/// A read-only store of verifier setups keyed by the statement's device byte. The
-/// stage-1 wrapper is the *universal* batch verifier: one compiled circuit covers
-/// every envelope-legal degree profile and geometry, so the whole cache holds a single
-/// setup. Deployments preload
-/// [`embedded_cache::CACHE_DATA`](crate::api::fp8::embedded_cache::CACHE_DATA), built
-/// offline by `build_cache` ([`Fp8Verifier::generate`] + [`Fp8VerifierCache::insert`]).
-///
-/// Verification never compiles circuits: a setup missing from the cache rejects the
-/// proof. An on-demand fallback would let anyone force the expensive setup
-/// build through the verify path (denial of service); a stale or incomplete cache is a
-/// deployment error instead, surfaced by the returned message.
-#[derive(Default)]
-pub struct Fp8VerifierCache {
-    verifiers: HashMap<Fp8VerifierKey, Fp8Verifier>,
-}
-
-/// Everything that selects one trusted setup: the statement's device byte.
-///
-/// Nothing else is key material (the D1 universal design): the degree profile rides the
-/// wrapper's degree public inputs and the geometry rides the `K`/`WL2`/`2^WL2` public
-/// inputs and the known columns, all pinned natively by the gateway; the AIR identities,
-/// the CTL set and the FRI ladder are consensus constants.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct Fp8VerifierKey {
-    hardware: u8,
-}
-
-impl Fp8VerifierKey {
-    fn new(hardware: Device) -> Self {
-        Self {
-            hardware: hardware as u8,
-        }
-    }
 }
 
 impl Fp8VerifierCache {
-    /// Loads a cache previously produced by [`Fp8VerifierCache::to_bytes`] (consensus /
-    /// trusted-setup data, not proof-controlled input). An empty blob — the embedded
-    /// default when no cache has been built — loads as an empty cache.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.is_empty() {
-            return Ok(Self::default());
-        }
-        let wire: Fp8VerifierCacheWire = fp8_wire_options()
-            .deserialize(bytes)
-            .context("deserializing the fp8 verifier cache")?;
-        let mut verifiers = HashMap::new();
-        for entry in wire.entries {
-            let key = Fp8VerifierKey {
-                hardware: entry.hardware,
-            };
-            ensure!(
-                verifiers.insert(key, Fp8Verifier::from_bytes(&entry.verifier)?).is_none(),
-                "duplicate fp8 verifier cache entry"
-            );
-        }
-        Ok(Self { verifiers })
-    }
-
-    /// Serializes the cache (canonical entry order, so equal caches share bytes).
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut entries = self
-            .verifiers
-            .iter()
-            .map(|(key, verifier)| {
-                Ok(Fp8VerifierCacheEntryWire {
-                    hardware: key.hardware,
-                    verifier: verifier.to_bytes()?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.hardware);
-        fp8_wire_options()
-            .serialize(&Fp8VerifierCacheWire { entries })
-            .context("serializing the fp8 verifier cache")
-    }
-
-    /// Number of cached setups.
-    pub fn len(&self) -> usize {
-        self.verifiers.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.verifiers.is_empty()
-    }
-
-    /// Registers a pre-built verifier setup under `params`' device byte
-    /// (build tooling: assembles an embeddable cache without regenerating setups
-    /// already compiled elsewhere). Replaces any previous setup of the same device.
-    pub fn insert(&mut self, params: &PublicParams, verifier: Fp8Verifier) {
-        self.verifiers.insert(Fp8VerifierKey::new(params.common().device), verifier);
-    }
-
     /// The trusted setup for `job`'s device, from the cache alone. A missing
     /// setup is an error: this cache never compiles circuits (see the type docs).
     fn verifier_for_job(&self, job: &Fp8Job) -> Result<&Fp8Verifier> {
         let device = job.params.common().device;
-        self.verifiers
-            .get(&Fp8VerifierKey::new(device))
+        self.get(device)
             .ok_or_else(|| anyhow!("no cached fp8 verifier setup for {device:?}; regenerate fp8_cache.bin with build_cache"))
     }
 
@@ -505,10 +334,6 @@ impl Fp8VerifierCache {
         let nbits = nbits_override.unwrap_or(proposed_header.nbits);
         verifier.verify_derived(&job, proof_data, nbits)
     }
-}
-
-fn fp8_wire_options() -> impl Options {
-    bincode::options().with_fixint_encoding().reject_trailing_bytes()
 }
 
 /// The canonical dense statement of the launch geometry — `m = n = 32`, `k = 2048`,
@@ -559,155 +384,6 @@ pub fn sample_dense_statement() -> Result<PublicParams> {
 /// [`PublicParams`] codec.
 pub(crate) fn decode_statement(public_data: &[u8]) -> Result<PublicParams> {
     PublicParams::from_bytes(public_data)
-}
-
-/// Serialized verifier-circuit bytes plus the LUT cap they were compiled against, plus
-/// the circuit's constants/sigmas polynomials.
-#[derive(Serialize, Deserialize)]
-struct Fp8VerifierWire {
-    lut_cap: Vec<[u64; 4]>,
-    circuit: Vec<u8>,
-    constants_sigmas_polynomials: Vec<u8>,
-}
-
-// ============================================================================
-// Constants/sigmas polynomial codec
-//
-// The encoding must stay byte-identical — it is the
-// wire format of `Fp8VerifierWire::constants_sigmas_polynomials` and of the
-// embedded `fp8_cache.bin`.
-// ============================================================================
-
-fn bytes_for_max_value(max_val: usize) -> usize {
-    if max_val == 0 {
-        return 1;
-    }
-    let bits = usize::BITS - max_val.leading_zeros();
-    bits.div_ceil(8) as usize
-}
-
-fn write_tight_le(buf: &mut Vec<u8>, val: usize, num_bytes: usize) {
-    assert!(val < (1 << (num_bytes * 8)), "value overflows tight encoding");
-    buf.extend_from_slice(&val.to_le_bytes()[..num_bytes]);
-}
-
-/// Precomputed coset geometry used by both the polynomial serializer and deserializer.
-struct CosetLayout {
-    bytes_per_index: usize,
-    k_is: Vec<GoldilocksField>,
-    subgroup: Vec<GoldilocksField>,
-}
-
-impl CosetLayout {
-    fn new(common_data: &CommonCircuitData<GoldilocksField, 2>) -> Self {
-        let num_routed_wires = common_data.config.num_routed_wires;
-        let degree = common_data.degree();
-        Self {
-            bytes_per_index: bytes_for_max_value(num_routed_wires * degree - 1),
-            k_is: get_unique_coset_shifts(degree, num_routed_wires),
-            subgroup: GoldilocksField::two_adic_subgroup(common_data.degree_bits()),
-        }
-    }
-}
-
-/// Serialize constants_sigmas polynomials in compact form.
-/// Constants are stored as u64 evaluations; sigmas as tightly packed permutation indices.
-fn serialize_polynomials(
-    polys: &[PolynomialCoeffs<GoldilocksField>],
-    common_data: &CommonCircuitData<GoldilocksField, 2>,
-) -> Vec<u8> {
-    let num_constants = common_data.num_constants;
-    let num_routed_wires = common_data.config.num_routed_wires;
-    let degree = common_data.degree();
-    let layout = CosetLayout::new(common_data);
-
-    // Build reverse lookup: field element -> flat index
-    let mut reverse_map: HashMap<GoldilocksField, usize> = HashMap::with_capacity(num_routed_wires * degree);
-    for col in 0..num_routed_wires {
-        for row in 0..degree {
-            let val = layout.k_is[col] * layout.subgroup[row];
-            reverse_map.insert(val, col * degree + row);
-        }
-    }
-
-    let mut buf = Vec::new();
-
-    // Constants: FFT to get evaluations, store as u64
-    for poly in &polys[..num_constants] {
-        let evals = poly.clone().fft();
-        for &v in &evals.values {
-            buf.extend_from_slice(&v.to_canonical_u64().to_le_bytes());
-        }
-    }
-
-    // Sigmas: FFT to get evaluations, map to tight indices
-    for poly in &polys[num_constants..num_constants + num_routed_wires] {
-        let evals = poly.clone().fft();
-        for &v in &evals.values {
-            let idx = reverse_map[&v];
-            write_tight_le(&mut buf, idx, layout.bytes_per_index);
-        }
-    }
-
-    buf
-}
-
-/// Deserialize constants_sigmas polynomials from compact form.
-/// Reconstructs field elements from indices and runs iFFT to get coefficients.
-fn deserialize_polynomials(
-    data: &[u8],
-    common_data: &CommonCircuitData<GoldilocksField, 2>,
-) -> Result<Vec<PolynomialCoeffs<GoldilocksField>>> {
-    let num_constants = common_data.num_constants;
-    let num_routed_wires = common_data.config.num_routed_wires;
-    let degree = common_data.degree();
-    let layout = CosetLayout::new(common_data);
-
-    let mut reader = Buffer::new(data);
-    let mut polys = Vec::with_capacity(num_constants + num_routed_wires);
-
-    for _ in 0..num_constants {
-        let mut values = Vec::with_capacity(degree);
-        for _ in 0..degree {
-            values.push(
-                reader
-                    .read_field::<GoldilocksField>()
-                    .map_err(|_| anyhow::anyhow!("invalid field element in polynomial data"))?,
-            );
-        }
-        polys.push(PolynomialValues::new(values).ifft());
-    }
-
-    for _ in 0..num_routed_wires {
-        let mut values = Vec::with_capacity(degree);
-        for _ in 0..degree {
-            let idx = reader
-                .read_uint_le(layout.bytes_per_index)
-                .map_err(|_| anyhow::anyhow!("unexpected end of polynomial data"))?;
-            ensure!(idx / degree < layout.k_is.len(), "sigma permutation index out of bounds");
-            values.push(layout.k_is[idx / degree] * layout.subgroup[idx % degree]);
-        }
-        polys.push(PolynomialValues::new(values).ifft());
-    }
-
-    ensure_eq!(reader.remaining(), 0, "unexpected trailing bytes in polynomial data");
-
-    Ok(polys)
-}
-
-/// Wire form of [`Fp8VerifierCache`]: the setups with their device-byte keys, in
-/// canonical order. The blob is embedded in the binary that reads it (`fp8_cache.bin`),
-/// so there is no cross-version exchange to tag: a stale file fails deserialization or
-/// rejects proofs, both closed.
-#[derive(Serialize, Deserialize)]
-struct Fp8VerifierCacheWire {
-    entries: Vec<Fp8VerifierCacheEntryWire>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Fp8VerifierCacheEntryWire {
-    hardware: u8,
-    verifier: Vec<u8>,
 }
 
 /// The verifier's cached data: the setup-time Merkle cap of the committed LUT tables. The
@@ -1166,6 +842,7 @@ mod tests {
     use plonky2::field::types::Field;
 
     use super::*;
+    use crate::circuit::fp8::circuit_utils::Fp8VerifierKey;
     use crate::circuit::fp8::consistency::{fixture_job, fixture_job_asym, fixture_job_k32, fixture_job_medium, fixture_job_moe};
     use crate::circuit::fp8::ctl::Table;
     use crate::circuit::fp8::input_quant_stark::columns::{
@@ -1337,6 +1014,15 @@ mod tests {
             Fp8VerifierKey::new(job_k32.params.common().device),
             "different geometry: one universal setup"
         );
+    }
+
+    #[test]
+    fn missing_verifier_cache_rejects_before_proof_decoding() {
+        let statement = sample_dense_statement().unwrap();
+        let error = Fp8VerifierCache::default()
+            .verify_block(&IncompleteBlockHeader::zero(), &statement.to_bytes(), &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("no cached fp8 verifier setup"), "{error:#}");
     }
 
     /// Regenerates the wrapped proof consumed by the Go V4 certificate tests.
