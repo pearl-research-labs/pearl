@@ -17,7 +17,9 @@ use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
-use super::super::ctl::{LutLookup, LutTable, Table};
+use super::super::ctl::Table;
+use super::super::luts::LutTable;
+use super::super::luts::ctl::LutLookup;
 use super::columns::{COMPARISON_DIGITS, TAME_LIMIT_PUBLIC_INPUT, TAMED_COL_MAP};
 use super::stark::FRAME_GAP_OFFSET;
 use crate::circuit::fp8::luts::XFPOW2_ZERO_POINT;

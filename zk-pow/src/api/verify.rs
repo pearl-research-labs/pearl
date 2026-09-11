@@ -4,10 +4,8 @@ use crate::api::{
     fp8::{
         jackpot_policy::{JackpotPolicy, OperandStrip},
         noise::{OperandNoise, compute_fp8_noise},
-        openings::PrivateProofParams,
         plain_proof::PlainProofV4,
         prequant::{BLOCK_SIZE, PrequantOperand, exact_norms, open_prequant},
-        public_params::PublicParams,
         quantization::{Fp8E4M3Quant, Quant},
         transcript::compute_jackpot_ticket,
     },
@@ -53,21 +51,20 @@ fn open_and_noisy_quantize(
     Ok(OperandStrip { clean: codes, built })
 }
 
-// Assumption: the caller guarantees the opened operands already match the committed
-// `rows_pattern`/`cols_pattern`, so no re-check here.
-fn verify_plain_proof_fp8(
-    private_params: &PrivateProofParams,
-    public_params: &PublicParams,
+pub fn verify_plain_proof_with_policy(
     proposed_header: &IncompleteBlockHeader,
-    nbits: u32,
+    plain_proof: &PlainProofV4,
+    nbits_override: Option<u32>,
     jackpot_policy: JackpotPolicy,
 ) -> Result<()> {
+    let (private_params, public_params) = plain_proof.parse_proof(proposed_header)?;
+    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
     let quantization = Fp8E4M3Quant;
     let k = public_params.common_dim() as usize;
 
     // Open each operand's committed strips, inject the deterministic noise,
     // and quantize: A' = Q(alpha_a·A + beta_a·E1@F1), likewise for B'.
-    let noise = compute_fp8_noise(public_params, proposed_header);
+    let noise = compute_fp8_noise(&public_params, proposed_header);
     let tile_a = open_and_noisy_quantize(&private_params.operands.a, k, &noise.a, &quantization)?;
     let tile_b = open_and_noisy_quantize(&private_params.operands.b, k, &noise.b, &quantization)?;
 
@@ -80,18 +77,6 @@ fn verify_plain_proof_fp8(
 
     // The plain difficulty condition on the proven ticket digest.
     check_jackpot_difficulty(&ticket.jackpot, nbits, public_params.h(), public_params.w(), k as u32)
-}
-
-pub fn verify_plain_proof_with_policy(
-    proposed_header: &IncompleteBlockHeader,
-    plain_proof: &PlainProofV4,
-    nbits_override: Option<u32>,
-    jackpot_policy: JackpotPolicy,
-) -> Result<()> {
-    let (private_params, public_params) = plain_proof.parse_proof(proposed_header)?;
-
-    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-    verify_plain_proof_fp8(&private_params, &public_params, proposed_header, nbits, jackpot_policy)
 }
 
 /// Verifies a v4 (FP8) plain proof, supplying the consensus-default

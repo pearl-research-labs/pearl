@@ -13,10 +13,9 @@
 //! 6. TamedStark — jackpot checks 3+4 policy censuses: [`tamed_stark`].
 //! 7. The sixteen `LutStark`s: [`luts`], batch tables 6..22.
 //!
-//! [`ctl`] carries the table indices, the shared CTL/LUT descriptor types and the channel
-//! assembly (eight main channels + one per LUT); the main tables
-//! keep their halves and LUT inventories in their own `ctl` submodules. [`luts`] generates
-//! the committed LUT tables, their per-AIR layout, their CTL channels and the setup-time
+//! [`ctl`] carries the table indices and assembles every channel (eight main channels +
+//! one per LUT). Each table keeps its halves in its own `ctl` submodule. [`luts`] owns
+//! the LUT descriptors, column layouts, AIRs, witness multiplicities, and setup-time
 //! precommitment; [`known_values`] assembles the per-table class (a) columns the batch
 //! verifier recomputes. [`driver`] is the batch prover/verifier: it sorts the twenty-two
 //! tables by height, renumbers the CTLs, and runs `starky`'s batched multi-STARK argument

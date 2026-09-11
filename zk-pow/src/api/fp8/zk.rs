@@ -773,11 +773,6 @@ pub fn verify_fp8_block(
 ) -> Result<()> {
     let mut job = Fp8Job::derive(public_params, proposed_header)?;
     let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-    verify_block_with_job(&mut job, proof, verifier_data, nbits)
-}
-
-/// The [`verify_fp8_block`] core on an already-derived statement.
-fn verify_block_with_job(job: &mut Fp8Job, proof: &Fp8Proof, verifier_data: &Fp8VerifierData, nbits: u32) -> Result<()> {
     let expected = job.expected_public_inputs();
     let digest = job.params.digest(&job.proposed_header);
     job.system.bind_statement_digest(digest);
@@ -808,18 +803,6 @@ pub fn verify_fp8_block_wrapped(
 ) -> Result<()> {
     let job = Fp8Job::derive(public_params, proposed_header)?;
     let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-    verify_wrapped_with_job(&job, proof, circuit, nbits)
-}
-
-/// The [`verify_fp8_block_wrapped`] core on an already-derived statement (shared with
-/// [`Fp8Verifier`] / [`Fp8VerifierCache`], which derive the job once for both the setup
-/// lookup and the verification).
-fn verify_wrapped_with_job(
-    job: &Fp8Job,
-    proof: &ProofWithPublicInputs<F, OuterC, D>,
-    circuit: &VerifierCircuitData<F, OuterC, D>,
-    nbits: u32,
-) -> Result<()> {
     let expected = job.expected_public_inputs();
     verify_wrapped_proof(
         &job.system,
