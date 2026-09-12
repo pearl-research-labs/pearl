@@ -351,8 +351,7 @@ func CheckProofOfWork(block *btcutil.Block, powLimit *big.Int) error {
 // ensure it is sane before continuing with processing.  These checks are
 // context free.
 //
-// The flags do not modify the behavior of this function directly, however they
-// are needed to pass along to checkProofOfWork.
+// BFNoPoWCheck skips proof verification and certificate ancestor checks.
 func CheckBlockHeaderSanity(header *wire.BlockHeader, cert wire.BlockCertificate, powLimit *big.Int,
 	timeSource MedianTimeSource, maxTimeOffsetMinutes int64, flags BehaviorFlags) error {
 
@@ -760,24 +759,6 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 	if err := CheckCertificateRules(
 		header, cert, blockHeight, b.chainParams, flags,
 	); err != nil {
-		return err
-	}
-
-	// Authenticate the v4 proof-carried ancestor header σ_Δ against this
-	// block's chain context (consensus-critical, run regardless of
-	// BFFastAdd; BFNoPoWCheck remains the only bypass, covering templates
-	// and the networks NetBehaviorFlags exempts).
-	parent := prevNode.header()
-	var grandparent *wire.BlockHeader
-	if prevNode.parent != nil {
-		gp := prevNode.parent.header()
-		grandparent = &gp
-	}
-	ctx := CertificateHeaderContext{
-		Parent:      &parent,
-		Grandparent: grandparent,
-	}
-	if err := CheckCertificateContext(header, ctx, cert, flags); err != nil {
 		return err
 	}
 

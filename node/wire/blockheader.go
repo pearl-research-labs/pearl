@@ -89,28 +89,6 @@ func (h *BlockHeader) Serialize(w io.Writer) error {
 	return writeBlockHeader(w, 0, h)
 }
 
-// IncompleteBlockHeaderSize is the size in bytes of the block-header prefix
-// serialized by IncompleteHeaderBytes: Version(4) + PrevBlock(32) +
-// MerkleRoot(32) + Timestamp(4) + Bits(4).  It matches the proof-carried
-// ancestor header sigma_delta committed in v4 certificate public data and
-// IncompleteBlockHeader::SERIALIZED_SIZE in the zk-pow Rust crate.
-const IncompleteBlockHeaderSize = MaxBlockHeaderPayload - chainhash.HashSize
-
-// IncompleteHeaderBytes returns the header prefix serialized by
-// writeBlockHeaderBuf without its final field: ProofCommitment is the only
-// omitted BlockHeader field.  The result is the canonical sigma_delta
-// encoding, byte-for-byte equal to a full Serialize() truncated to
-// IncompleteBlockHeaderSize bytes.
-func (h *BlockHeader) IncompleteHeaderBytes() [IncompleteBlockHeaderSize]byte {
-	var serialized [IncompleteBlockHeaderSize]byte
-	littleEndian.PutUint32(serialized[0:4], uint32(h.Version))
-	copy(serialized[4:36], h.PrevBlock[:])
-	copy(serialized[36:68], h.MerkleRoot[:])
-	littleEndian.PutUint32(serialized[68:72], uint32(h.Timestamp.Unix()))
-	littleEndian.PutUint32(serialized[72:76], h.Bits)
-	return serialized
-}
-
 // NewBlockHeader returns a new BlockHeader using the provided version, previous
 // block hash, merkle root hash, and difficulty bits with defaults for the
 // remaining fields.

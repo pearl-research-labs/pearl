@@ -12,22 +12,30 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
-// MaxFp8ProofSize is the maximum size of each published FP8 blob:
-// the encoded public statement and the stage-2 recursive proof. Must match
+// MaxFp8ProofSize limits each V4 public-data and proof blob. Must match
 // MAX_FP8_PROOF_SIZE in zk-pow/bindings/go/src/common.rs.
 const MaxFp8ProofSize = 131072
 
-// CertificateMaxSizeV4 is the maximum V4 certificate size, including the
-// version prefix: version(4) + hash(32) + public_len(4) + public + proof_len(4) + proof.
-const CertificateMaxSizeV4 = 4 + 32 + 4 + MaxFp8ProofSize + 4 + MaxFp8ProofSize
+// MaxCertificateV4AncestorHeaders bounds the parent/grandparent witness.
+const MaxCertificateV4AncestorHeaders = 2
 
-// CertificateV4 is a version-4 (FP8) block certificate. The wire
-// layout matches V2 (hash + length-prefixed public data + length-prefixed
-// proof) but both blobs are capped at MaxFp8ProofSize.
+// CertificateMaxSizeV4 is the maximum V4 certificate size, including the
+// version prefix, both blobs, one-byte ancestor count, and full ancestor headers.
+const CertificateMaxSizeV4 = 4 + 32 + 4 + MaxFp8ProofSize + 4 + MaxFp8ProofSize +
+	1 + MaxCertificateV4AncestorHeaders*MaxBlockHeaderPayload
+
+// CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is
+// hash + length-prefixed public data + length-prefixed proof + ancestor count
+// + full ancestor headers. Both blobs are capped at MaxFp8ProofSize.
 type CertificateV4 struct {
 	Hash       chainhash.Hash
 	PublicData []byte
 	ProofData  []byte
+
+	// AncestorHeaders supplies the parent, then grandparent, for ancestry
+	// verification. They are excluded from ProofCommitment and authenticated
+	// through the proposed header's PrevBlock hash.
+	AncestorHeaders []BlockHeader
 }
 
 func (c *CertificateV4) Version() CertificateVersion {
@@ -46,9 +54,7 @@ func (c *CertificateV4) ProofBytes() []byte {
 	return c.ProofData
 }
 
-// IsMoE is always false: fp8 public data is not the V2 length heuristic,
-// so MoE is not visible on this type. Empty template placeholders stay
-// valid under the dense-only fork.
+// IsMoE returns false because V4 is outside the legacy V2/V3 MoE classification.
 func (c *CertificateV4) IsMoE() bool {
 	return false
 }
@@ -57,8 +63,14 @@ func (c *CertificateV4) ProofCommitment() chainhash.Hash {
 	return proofCommitment(c.Version(), c.PublicDataBytes())
 }
 
-// Serialize: BlockHash(32) + PublicDataLen(4) + PublicData + ProofLen(4) + ProofData
+// Serialize writes the certificate fields, followed by a canonical varint
+// ancestor count and the full headers in parent-to-grandparent order.
+// The count is mandatory, including zero for a depth-0 certificate.
 func (c *CertificateV4) Serialize(w io.Writer) error {
+	if len(c.AncestorHeaders) > MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
+			len(c.AncestorHeaders), MaxCertificateV4AncestorHeaders)
+	}
 	if _, err := w.Write(c.Hash[:]); err != nil {
 		return err
 	}
@@ -74,19 +86,26 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 	if _, err := w.Write(c.ProofData); err != nil {
 		return err
 	}
+	if err := WriteVarInt(w, 0, uint64(len(c.AncestorHeaders))); err != nil {
+		return err
+	}
+	for i := range c.AncestorHeaders {
+		if err := c.AncestorHeaders[i].Serialize(w); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// readBlob reads one length-prefixed (4-byte LE) blob, enforcing the V4
-// per-blob size cap. A zero length decodes as nil. `tooLarge` is the
-// violation message for this blob, matching each blob's legacy wording.
-func readBlob(r io.Reader, tooLarge func(length uint32) error) ([]byte, error) {
+// readFp8Blob reads one length-prefixed (4-byte LE) blob, enforcing the V4
+// per-blob size cap. A zero length decodes as nil.
+func readFp8Blob(r io.Reader, fieldName string) ([]byte, error) {
 	var length uint32
 	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return nil, err
 	}
 	if length > MaxFp8ProofSize {
-		return nil, tooLarge(length)
+		return nil, fmt.Errorf("fp8 %s_len %d exceeds max %d", fieldName, length, MaxFp8ProofSize)
 	}
 	if length == 0 {
 		return nil, nil
@@ -102,23 +121,37 @@ func (c *CertificateV4) Deserialize(r io.Reader) error {
 	if _, err := io.ReadFull(r, c.Hash[:]); err != nil {
 		return err
 	}
-	publicData, err := readBlob(r, func(n uint32) error {
-		return fmt.Errorf("fp8 public_data_len %d exceeds max %d", n, MaxFp8ProofSize)
-	})
+	publicData, err := readFp8Blob(r, "public_data")
 	if err != nil {
 		return err
 	}
-	proofData, err := readBlob(r, func(n uint32) error {
-		return fmt.Errorf("fp8 proof data too large: %d bytes (max %d)", n, MaxFp8ProofSize)
-	})
+	proofData, err := readFp8Blob(r, "proof_data")
 	if err != nil {
 		return err
+	}
+	count, err := ReadVarInt(r, 0)
+	if err != nil {
+		return err
+	}
+	if count > MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
+			count, MaxCertificateV4AncestorHeaders)
+	}
+	var ancestors []BlockHeader
+	for range count {
+		var header BlockHeader
+		if err := header.Deserialize(r); err != nil {
+			return err
+		}
+		ancestors = append(ancestors, header)
 	}
 	c.PublicData = publicData
 	c.ProofData = proofData
+	c.AncestorHeaders = ancestors
 	return nil
 }
 
 func (c *CertificateV4) SerializedSize() int {
-	return 32 + 4 + len(c.PublicData) + 4 + len(c.ProofData)
+	return 32 + 4 + len(c.PublicData) + 4 + len(c.ProofData) +
+		VarIntSerializeSize(uint64(len(c.AncestorHeaders))) + len(c.AncestorHeaders)*MaxBlockHeaderPayload
 }

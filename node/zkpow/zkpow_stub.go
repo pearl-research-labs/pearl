@@ -21,7 +21,7 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
 }
 
-func VerifyZKProofFFIV2(
+func VerifyZKProofFFI(
 	header *wire.BlockHeader,
 	cert wire.BlockCertificate,
 	nbitsOverride *uint32,
@@ -30,14 +30,6 @@ func VerifyZKProofFFIV2(
 }
 
 func CheckRankPenalty(bits uint32, publicData []byte) error {
-	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
-}
-
-func verifyZKProofFFIV4(
-	header *wire.BlockHeader,
-	cert *wire.CertificateV4,
-	nbitsOverride *uint32,
-) error {
 	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
 }
 

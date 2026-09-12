@@ -574,7 +574,7 @@ impl PublicParams {
     }
 
     /// Builds the statement from its wire [`Self::to_bytes`] encoding.
-    pub(crate) fn from_bytes(public_data: &[u8]) -> Result<Self> {
+    pub fn from_bytes(public_data: &[u8]) -> Result<Self> {
         let mut s = public_data;
 
         // ---- the proof-carried ancestor header σ_Δ (76 bytes) ----

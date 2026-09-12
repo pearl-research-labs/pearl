@@ -62,39 +62,11 @@ func mineCertificate(t *testing.T) (*wire.BlockHeader, *wire.CertificateV2) {
 	return header, requireV2(t, cert)
 }
 
-// copyBlockHeader creates a copy of BlockHeader for tampering tests
-func copyBlockHeader(h *wire.BlockHeader) *wire.BlockHeader {
-	return &wire.BlockHeader{
-		Version:         h.Version,
-		PrevBlock:       h.PrevBlock,
-		MerkleRoot:      h.MerkleRoot,
-		Timestamp:       h.Timestamp,
-		Bits:            h.Bits,
-		ProofCommitment: h.ProofCommitment,
-	}
-}
-
-// copyCertificateV1 creates a deep copy of CertificateV1 for tampering tests
-func copyCertificateV1(c *wire.CertificateV1) *wire.CertificateV1 {
-	cp := &wire.CertificateV1{
-		Hash:       c.Hash,
-		PublicData: c.PublicData,
-		ProofData:  make([]byte, len(c.ProofData)),
-	}
-	copy(cp.ProofData, c.ProofData)
-	return cp
-}
-
 // copyCertificateV2 creates a deep copy of CertificateV2 for tampering tests
 func copyCertificateV2(c *wire.CertificateV2) *wire.CertificateV2 {
-	cp := &wire.CertificateV2{
-		Hash:          c.Hash,
-		PublicDataLen: c.PublicDataLen,
-		PublicData:    c.PublicData,
-		ProofData:     make([]byte, len(c.ProofData)),
-	}
-	copy(cp.ProofData, c.ProofData)
-	return cp
+	cp := *c
+	cp.ProofData = bytes.Clone(c.ProofData)
+	return &cp
 }
 
 // TestMineAndVerifyProof tests the full mining and verification flow
@@ -119,7 +91,8 @@ func TestMineAndVerifyProof(t *testing.T) {
 		"the mined certificate should satisfy the rank penalty rule")
 }
 
-// TestTamperedParams tests that tampering any header or certificate field causes rejection.
+// TestTamperedParams checks header/hash and public-data/commitment bindings,
+// then rejects tampered proof data through native verification.
 // PublicData layout: config(0..52) | hash_a(52..84) | hash_b(84..116) | hash_jackpot(116..148) |
 // m,n,t_rows,t_cols(148..164)
 func TestTamperedParams(t *testing.T) {
@@ -136,24 +109,22 @@ func TestTamperedParams(t *testing.T) {
 		{"Timestamp", func(h *wire.BlockHeader) { h.Timestamp = h.Timestamp.Add(time.Second) }},
 	}
 	for _, tc := range headerTampers {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			tamperedHeader := copyBlockHeader(header)
-			tc.tamper(tamperedHeader)
-			err := VerifyCertificate(tamperedHeader, cert)
+			tamperedHeader := *header
+			tc.tamper(&tamperedHeader)
+			err := VerifyCertificate(&tamperedHeader, cert)
 			require.Error(t, err, "proof should be rejected when %s is tampered", tc.name)
 			t.Logf("%s tampered: %v", tc.name, err)
 		})
 	}
 
-	// Every byte of PublicData must individually cause rejection when flipped.
+	// Every byte of PublicData is authenticated by the commitment.
 	for i := 0; i < int(cert.PublicDataLen); i++ {
-		i := i
 		t.Run(fmt.Sprintf("PublicData[%d]", i), func(t *testing.T) {
 			tamperedCert := copyCertificateV2(cert)
 			tamperedCert.PublicData[i] ^= 0xFF
 			err := VerifyCertificate(header, tamperedCert)
-			require.Error(t, err, "proof should be rejected when PublicData[%d] is tampered", i)
+			require.ErrorContains(t, err, "proof commitment mismatch")
 			t.Logf("PublicData[%d] tampered: %v", i, err)
 		})
 	}
@@ -182,31 +153,29 @@ func TestTamperedProof(t *testing.T) {
 	t.Logf("Tampered proof metadata result: %v", err)
 }
 
-// TestVerifyProof_InvalidInput tests edge cases for invalid inputs
-func TestVerifyProof_InvalidInput(t *testing.T) {
-	header := testBlockHeader()
-
-	// Generate a random 70400-byte proof (the native size of a valid V1 certificate)
-	randomProof := make([]byte, 70400)
-	for i := range randomProof {
-		randomProof[i] = byte(i % 256)
+func TestVerifyCertificateV1InvalidProof(t *testing.T) {
+	// Use the native size of a V1 proof so rejection exercises its contents.
+	invalidProof := make([]byte, 70400)
+	for i := range invalidProof {
+		invalidProof[i] = byte(i % 256)
 	}
 
 	testCases := []struct {
-		name   string
-		header *wire.BlockHeader
-		cert   *wire.CertificateV1
+		name    string
+		proof   []byte
+		wantErr string
 	}{
-		{"EmptyProofData", header, &wire.CertificateV1{ProofData: nil}},
-		{"ZeroLengthProofData", header, &wire.CertificateV1{ProofData: []byte{}}},
-		{"Random70400ByteProof", header, &wire.CertificateV1{ProofData: randomProof}},
+		{"empty", nil, "empty proof data"},
+		{"invalid encoding", invalidProof, "v1 proof rejected"},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := VerifyCertificate(tc.header, tc.cert)
-			require.Error(t, err)
-			t.Logf("%s: %v", tc.name, err)
+			header := testBlockHeader()
+			cert := &wire.CertificateV1{ProofData: tc.proof}
+			header.ProofCommitment = cert.ProofCommitment()
+			cert.Hash = header.BlockHash()
+			require.ErrorContains(t, VerifyCertificate(header, cert), tc.wantErr)
 		})
 	}
 }
@@ -280,17 +249,17 @@ func TestMoESerializeDeserializeVerify(t *testing.T) {
 	require.NoError(t, err, "deserialized MoE cert should verify")
 }
 
-// TestMoETamperedParams tests that tampering any byte of MoE PublicData causes rejection.
+// TestMoETamperedParams checks the MoE public-data commitment and rejects
+// tampered proof data through native verification.
 func TestMoETamperedParams(t *testing.T) {
 	header, cert := mineMoECertificate(t)
 
 	for i := 0; i < int(cert.PublicDataLen); i++ {
-		i := i
 		t.Run(fmt.Sprintf("PublicData[%d]", i), func(t *testing.T) {
 			tamperedCert := copyCertificateV2(cert)
 			tamperedCert.PublicData[i] ^= 0xFF
 			err := VerifyCertificate(header, tamperedCert)
-			require.Error(t, err, "MoE proof should be rejected when PublicData[%d] is tampered", i)
+			require.ErrorContains(t, err, "proof commitment mismatch")
 		})
 	}
 
@@ -340,21 +309,25 @@ func BenchmarkMine(b *testing.B) {
 	}
 }
 
-// TestVerifyCertificateV4RejectsGarbage checks a structurally-bound but
-// meaningless proof pair is rejected by the FFI (there is no setup to install:
-// the trusted setups ship in the Rust library's embedded fp8 cache).
-func TestVerifyCertificateV4RejectsGarbage(t *testing.T) {
-	header := testBlockHeader()
-	cert := &wire.CertificateV4{
-		PublicData: []byte{0x01},
-		ProofData:  []byte{0x02},
+func TestVerifyCertificateV4PublicDataSize(t *testing.T) {
+	for _, test := range []struct {
+		publicLen int
+		wantErr   string
+	}{
+		{1, "invalid public_data_len"},
+		{wire.MaxFp8ProofSize, "fp8 public data too large"}, // Reject before the C-buffer copy.
+	} {
+		t.Run(test.wantErr, func(t *testing.T) {
+			header := testBlockHeader()
+			cert := &wire.CertificateV4{
+				PublicData: make([]byte, test.publicLen),
+				ProofData:  []byte{0x02},
+			}
+			header.ProofCommitment = cert.ProofCommitment()
+			cert.Hash = header.BlockHash()
+			require.ErrorContains(t, VerifyCertificate(header, cert), test.wantErr)
+		})
 	}
-	header.ProofCommitment = cert.ProofCommitment()
-	cert.Hash = header.BlockHash()
-
-	err := VerifyCertificate(header, cert)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid public_data_len")
 }
 
 func TestVerifyCertificateV4HeaderMismatch(t *testing.T) {
@@ -364,9 +337,7 @@ func TestVerifyCertificateV4HeaderMismatch(t *testing.T) {
 		PublicData: []byte{0x01},
 		ProofData:  []byte{0x02},
 	}
-	err := VerifyCertificate(header, cert)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "block hash mismatch")
+	require.ErrorContains(t, VerifyCertificate(header, cert), "block hash mismatch")
 }
 
 // BenchmarkVerifyProof benchmarks the ZK proof verification phase.

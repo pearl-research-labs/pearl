@@ -40,10 +40,26 @@ var oneHeaderEncoded = []byte{
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 }
 
-func TestHeadersMaxPayloadLengthAccountsForV4(t *testing.T) {
-	want := uint32(MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSizeV4) * MaxBlockHeadersPerMsg))
-	require.Equal(t, want, NewMsgHeaders().MaxPayloadLength(ProtocolVersion))
-	require.Greater(t, want, uint32(MaxVarIntPayload+((MaxBlockHeaderPayload+CertificateMaxSize)*MaxBlockHeadersPerMsg)))
+func TestHeadersLargeV4RoundTrip(t *testing.T) {
+	msg := NewMsgHeaders()
+	header := *blockOne.BlockHeader()
+	cert := &CertificateV4{
+		PublicData:      bytes.Repeat([]byte{0x11}, MaxFp8ProofSize),
+		ProofData:       bytes.Repeat([]byte{0x22}, MaxFp8ProofSize),
+		AncestorHeaders: []BlockHeader{header, header},
+	}
+	for i := range MaxBlockHeadersPerMsg {
+		header.Version = int32(i)
+		require.NoError(t, msg.AddBlockHeader(header, cert))
+	}
+
+	var buf bytes.Buffer
+	// A full batch of maximum-size V4 proofs exceeds the old HEADERS cap.
+	_, err := WriteV2MessageN(&buf, msg, ProtocolVersion, BaseEncoding)
+	require.NoError(t, err)
+	decoded, _, err := ReadV2MessageN(buf.Bytes(), ProtocolVersion, BaseEncoding)
+	require.NoError(t, err)
+	require.Equal(t, msg, decoded)
 }
 
 // TestHeaders tests the MsgHeaders API.

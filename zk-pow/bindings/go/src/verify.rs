@@ -6,8 +6,12 @@
 use std::os::raw::c_char;
 use std::slice;
 
+use anyhow::{ensure, Result};
+use sha2::{Digest, Sha256};
+
 use crate::common::{MAX_FP8_PROOF_SIZE, MAX_ZK_PROOF_SIZE};
 use zk_pow::api::fp8::public_params::PublicParams;
+use zk_pow::api::primitives::IncompleteBlockHeader as Fp8BlockHeader;
 use zk_pow::api::seed::SeedDerivation;
 use zk_pow::v2::api::proof::{IncompleteBlockHeader, PublicProofParams, ZKProof};
 use zk_pow::v2::api::sanity_checks;
@@ -241,35 +245,60 @@ pub unsafe extern "C" fn check_rank_penalty(
 // FP8 ZK Proof Verification FFI
 // ============================================================================
 
-/// The FFI block-header type is the frozen v2 clone; the fp8 (v4) API binds
-/// the mainline type. The two structs are field-identical.
-fn header_to_v4(header: &IncompleteBlockHeader) -> zk_pow::api::primitives::IncompleteBlockHeader {
-    zk_pow::api::primitives::IncompleteBlockHeader {
-        version: header.version,
-        prev_block: header.prev_block,
-        merkle_root: header.merkle_root,
-        timestamp: header.timestamp,
-        nbits: header.nbits,
+const FULL_BLOCK_HEADER_SIZE: usize = 108;
+
+/// Authenticate all supplied full headers, then locate the proof-carried ancestor.
+/// Hash raw wire bytes, including ProofCommitment; parsed hash fields use display order.
+fn check_certificate_ancestors(headers: &[u8], public_data: &[u8]) -> Result<Fp8BlockHeader> {
+    ensure!(
+        matches!(headers.len(), 108 | 216 | 324),
+        "invalid v4 headers length {}",
+        headers.len()
+    );
+    let statement = PublicParams::from_bytes(public_data)?;
+    let mut headers = headers.chunks_exact(FULL_BLOCK_HEADER_SIZE);
+    let proposed_bytes = headers.next().unwrap();
+    let proposed = Fp8BlockHeader::from_bytes(&proposed_bytes[..Fp8BlockHeader::SERIALIZED_SIZE])?;
+    let mut matched = statement.ancestor_header() == &proposed;
+    let mut prev_hash = &proposed_bytes[4..36];
+    for (i, header) in headers.enumerate() {
+        let hash = Sha256::digest(Sha256::digest(header));
+        ensure!(
+            hash[..] == prev_hash[..],
+            "v4 ancestor header at depth {} does not connect",
+            i + 1
+        );
+        let ancestor = Fp8BlockHeader::from_bytes(&header[..Fp8BlockHeader::SERIALIZED_SIZE])?;
+        matched |= statement.ancestor_header() == &ancestor;
+        prev_hash = &header[4..36];
     }
+    ensure!(
+        matched,
+        "v4 ancestor header is not the proposed header, its parent, or its grandparent"
+    );
+    Ok(proposed)
 }
 
-/// Shared implementation for fp8 proof verification — the same shape as
-/// [`verify_zk_proof_inner`]: pointer and size validation, then a single call into the
-/// fp8 API, which deserializes both blobs (header binding included) and runs the full
-/// verification.
+/// Shared implementation for fp8 proof verification: validate pointers and sizes,
+/// authenticate the certificate's ancestor, then run the cached proof verifier.
 ///
 /// # Safety
 /// Same contract as [`verify_zk_proof_v4`].
 unsafe fn verify_zk_proof_v4_inner(
-    block_header: *const IncompleteBlockHeader,
+    headers: *const u8,
+    headers_len: usize,
     zk_proof: *const CZKProof,
     nbits_override: Option<u32>,
     error_msg_out: *mut c_char,
 ) -> i32 {
     let result = catch_panic(|| {
-        if block_header.is_null() || zk_proof.is_null() {
+        if headers.is_null() || zk_proof.is_null() {
             set_error_msg(error_msg_out, "Null pointer");
             return 2;
+        }
+        if !matches!(headers_len, 108 | 216 | 324) {
+            set_error_msg(error_msg_out, &format!("invalid v4 headers length {}", headers_len));
+            return 1;
         }
 
         let zk_proof_ref = &*zk_proof;
@@ -292,6 +321,14 @@ unsafe fn verify_zk_proof_v4_inner(
 
         let proof_data = slice::from_raw_parts(zk_proof_ref.proof_blob, zk_proof_ref.proof_blob_len);
         let public_data = &zk_proof_ref.public_data[..zk_proof_ref.public_data_len];
+        let headers = slice::from_raw_parts(headers, headers_len);
+        let header = match check_certificate_ancestors(headers, public_data) {
+            Ok(header) => header,
+            Err(error) => {
+                set_error_msg(error_msg_out, &error.to_string());
+                return 1;
+            }
+        };
 
         // The statement's trusted setup comes from the global read-only cache: the
         // embedded `fp8_cache.bin` preloads the universal (D1) wrapper circuits,
@@ -299,13 +336,6 @@ unsafe fn verify_zk_proof_v4_inner(
         // missing from a stale cache rejects the proof — setups are never compiled
         // on demand, so no proof can force that cost.
         let cache = fp8_cache();
-        let header = header_to_v4(&*block_header);
-        // The statement carries its own `ancestor_header` (σ_Δ) inside
-        // `public_data`'s 76-byte prefix, so the single `block_header`
-        // argument (σ̂) is all the binding the FFI needs. Authenticating
-        // σ_Δ against the caller's blockchain context (hash-walking the
-        // `prev_block` chain) is the caller's responsibility — see
-        // `verify_zk_proof_v4`'s docs.
         let verdict = match nbits_override {
             None => cache.verify_block(&header, public_data, proof_data),
             Some(nbits) => cache.verify_share(&header, public_data, proof_data, nbits),
@@ -332,14 +362,13 @@ unsafe fn verify_zk_proof_v4_inner(
 }
 
 /// Verify an FP8 ZK block proof: the published `public_data` / `proof_data` pair carried
-/// by `zk_proof` against the caller's expected block header (`block_header` = σ̂).
+/// by `zk_proof` against the caller's expected block header.
 ///
-/// **Caller responsibility — `ancestor_header` (σ_Δ) authentication.** The statement
-/// carries its own 76-byte `ancestor_header` (σ_Δ) in the `public_data` prefix; the
-/// proof's B side is keyed by it, but the proof does *not* establish that this header
-/// is the caller's real ancestor. The caller must hash-walk `prev_block` links from
-/// the proposed header's parent and confirm the proof-carried σ_Δ appears in that
-/// window before accepting the block.
+/// `headers` contains canonical 108-byte wire headers in proposed, parent, grandparent
+/// order. The proposed header is required; zero to two ancestors may follow, so
+/// `headers_len` must be 108, 216, or 324. Every supplied link is authenticated by
+/// SHA256d of the full header, including its proof commitment. The statement's
+/// ancestor must match the incomplete projection of one of these headers.
 ///
 /// The trusted verifier setup is not an argument: setups live in a global read-only
 /// cache preloaded from the embedded `fp8_cache.bin`, resolved by the statement's
@@ -353,17 +382,18 @@ unsafe fn verify_zk_proof_v4_inner(
 /// - 2: System error (null pointers or internal panic)
 ///
 /// # Safety
-/// - `block_header` must be a valid pointer
+/// - `headers` must point to `headers_len` readable bytes
 /// - `zk_proof` must be a valid pointer; `zk_proof.proof_blob` must be a valid pointer to
 ///   `proof_blob_len` bytes
 /// - `error_msg_out` must be null or a valid pointer to a caller-allocated buffer of `ERROR_MSG_MAX_SIZE` bytes
 #[no_mangle]
 pub unsafe extern "C" fn verify_zk_proof_v4(
-    block_header: *const IncompleteBlockHeader,
+    headers: *const u8,
+    headers_len: usize,
     zk_proof: *const CZKProof,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    verify_zk_proof_v4_inner(block_header, zk_proof, None, error_msg_out)
+    verify_zk_proof_v4_inner(headers, headers_len, zk_proof, None, error_msg_out)
 }
 
 /// Verify an FP8 ZK share proof: identical to [`verify_zk_proof_v4`] except the
@@ -377,12 +407,13 @@ pub unsafe extern "C" fn verify_zk_proof_v4(
 /// Same as [`verify_zk_proof_v4`].
 #[no_mangle]
 pub unsafe extern "C" fn verify_zk_proof_v4_with_nbits(
-    block_header: *const IncompleteBlockHeader,
+    headers: *const u8,
+    headers_len: usize,
     zk_proof: *const CZKProof,
     nbits_override: u32,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    verify_zk_proof_v4_inner(block_header, zk_proof, Some(nbits_override), error_msg_out)
+    verify_zk_proof_v4_inner(headers, headers_len, zk_proof, Some(nbits_override), error_msg_out)
 }
 
 /// Verify a V1 (version 1, master-format) ZK proof.
@@ -455,5 +486,146 @@ pub unsafe extern "C" fn verify_zk_proof_v1(
             set_error_msg(error_msg_out, &format!("Internal panic: {}", panic_msg));
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod fp8_ancestor_tests {
+    use super::*;
+
+    fn linked_headers() -> [[u8; FULL_BLOCK_HEADER_SIZE]; 3] {
+        let grandparent = std::array::from_fn(|i| i as u8);
+        let mut parent = std::array::from_fn(|i| (i as u8).wrapping_add(113));
+        parent[4..36].copy_from_slice(&Sha256::digest(Sha256::digest(grandparent)));
+        let mut proposed = std::array::from_fn(|i| (i as u8).wrapping_add(211));
+        proposed[4..36].copy_from_slice(&Sha256::digest(Sha256::digest(parent)));
+        [proposed, parent, grandparent]
+    }
+
+    // Reuse only the unchanged fixture's canonical statement, replacing its ancestor.
+    fn public_data(ancestor: &[u8; FULL_BLOCK_HEADER_SIZE]) -> Vec<u8> {
+        let fixture = include_bytes!("../../../../node/zkpow/testdata/fp8_zk_proof_b200.bin");
+        let length = u32::from_le_bytes(fixture[76..80].try_into().unwrap()) as usize;
+        let mut data = fixture[80..80 + length].to_vec();
+        data[..76].copy_from_slice(&ancestor[..76]);
+        data
+    }
+
+    #[test]
+    fn full_header_wire_encoding() {
+        // Independent wire vector: every byte, including ProofCommitment, is distinct.
+        let header: [u8; FULL_BLOCK_HEADER_SIZE] = std::array::from_fn(|i| i as u8);
+        let expected_hash = [
+            0x35, 0x54, 0xa2, 0x7c, 0xb6, 0x00, 0x80, 0x65, 0xba, 0x72, 0xf6, 0xa9, 0x1f, 0x25, 0xc4, 0xb2, 0x06, 0xa6, 0x82,
+            0x95, 0xc0, 0x71, 0xfb, 0x50, 0x71, 0xed, 0xa6, 0x95, 0x68, 0x4b, 0xac, 0xf1,
+        ];
+        assert_eq!(Sha256::digest(Sha256::digest(header))[..], expected_hash);
+        let parsed = Fp8BlockHeader::from_bytes(&header[..76]).unwrap();
+        assert_eq!(parsed.version, 0x03020100);
+        assert_eq!(parsed.prev_block, std::array::from_fn(|i| (35 - i) as u8));
+        assert_eq!(parsed.merkle_root, std::array::from_fn(|i| (67 - i) as u8));
+        assert_eq!(parsed.timestamp, 0x47464544);
+        assert_eq!(parsed.nbits, 0x4b4a4948);
+        assert_eq!(parsed.to_bytes(), header[..76]);
+    }
+
+    #[test]
+    fn accepts_ancestors_at_each_depth() {
+        let headers = linked_headers();
+        let proposed = Fp8BlockHeader::from_bytes(&headers[0][..76]).unwrap();
+        for depth in 0..=2 {
+            let public = public_data(&headers[depth]);
+            for supplied_depth in depth..=2 {
+                assert_eq!(
+                    check_certificate_ancestors(&headers[..=supplied_depth].concat(), &public).unwrap(),
+                    proposed,
+                    "ancestor depth {depth}, supplied depth {supplied_depth}"
+                );
+            }
+        }
+
+        // The proposed header's commitment is excluded from the proof statement.
+        let mut changed_proposed = headers;
+        changed_proposed[0][76] ^= 1;
+        assert_eq!(
+            check_certificate_ancestors(&changed_proposed.concat(), &public_data(&headers[0])).unwrap(),
+            proposed
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ancestors() {
+        let headers = linked_headers();
+        let mut parent_commitment = headers;
+        parent_commitment[1][76] ^= 1;
+        let mut grandparent_commitment = headers;
+        grandparent_commitment[2][76] ^= 1;
+        let mut reversed_prev = public_data(&headers[0]);
+        reversed_prev[4..36].reverse();
+        let mut reversed_merkle = public_data(&headers[0]);
+        reversed_merkle[36..68].reverse();
+        let unrelated = [0x55; FULL_BLOCK_HEADER_SIZE];
+        for (name, headers, public) in [
+            ("outside window", headers.concat(), public_data(&unrelated)),
+            ("missing ancestor", headers[..1].concat(), public_data(&headers[1])),
+            ("reversed previous hash", headers[..1].concat(), reversed_prev),
+            ("reversed merkle root", headers[..1].concat(), reversed_merkle),
+        ] {
+            let err = check_certificate_ancestors(&headers, &public).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("not the proposed header, its parent, or its grandparent"),
+                "{name}: {err}"
+            );
+        }
+        for (name, headers, public) in [
+            (
+                "missing intermediate",
+                [headers[0], headers[2]].concat(),
+                public_data(&headers[2]),
+            ),
+            ("parent commitment", parent_commitment.concat(), public_data(&headers[1])),
+            (
+                "grandparent commitment",
+                grandparent_commitment.concat(),
+                public_data(&headers[2]),
+            ),
+            (
+                "invalid after depth 0 match",
+                [headers[0], unrelated].concat(),
+                public_data(&headers[0]),
+            ),
+            (
+                "invalid after depth 1 match",
+                [headers[0], headers[1], unrelated].concat(),
+                public_data(&headers[1]),
+            ),
+        ] {
+            let err = check_certificate_ancestors(&headers, &public).unwrap_err();
+            assert!(err.to_string().contains("does not connect"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_framing_and_statements() {
+        let headers = linked_headers();
+        let public = public_data(&headers[0]);
+        for length in [0, 76, 107, 109, 215, 217, 323, 325, 432] {
+            let err = check_certificate_ancestors(&vec![0; length], &public).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid v4 headers length"),
+                "length {length}: {err}"
+            );
+        }
+        let headers = headers.concat();
+        for length in 0..public.len() {
+            assert!(
+                check_certificate_ancestors(&headers, &public[..length]).is_err(),
+                "public data truncated at {length}"
+            );
+        }
+        let mut trailing = public;
+        trailing.push(0);
+        assert!(check_certificate_ancestors(&headers, &trailing).is_err());
     }
 }
