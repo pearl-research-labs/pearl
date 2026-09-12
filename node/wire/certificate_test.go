@@ -172,7 +172,7 @@ func TestMsgCertificateMoERoundTrip(t *testing.T) {
 // CertificateV3 Tests
 // ============================================================================
 
-// TestCertificateV3_MineVerifyRoundTrip mines a real V3 (salted noise-seed)
+// TestCertificateV3MineVerifyRoundTrip mines a real V3 (salted noise-seed)
 // certificate and verifies it, its wire round-trip, and its domain separation
 // from V2.
 func TestCertificateV3MineVerifyRoundTrip(t *testing.T) {

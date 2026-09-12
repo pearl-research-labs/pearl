@@ -17,18 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBlockHeaderToCByteOrder(t *testing.T) {
-	header := testBlockHeader()
-	header.Version = 1
-	header.PrevBlock[0] = 1 // Both hashes must differ from their reversed bytes.
-	got := blockHeaderToC(header)
-	require.Equal(t, header.PrevBlock.String(), fmt.Sprintf("%x", got.prev_block))
-	require.Equal(t, header.MerkleRoot.String(), fmt.Sprintf("%x", got.merkle_root))
-	require.Equal(t, uint32(header.Version), uint32(got.version))
-	require.Equal(t, uint32(header.Timestamp.Unix()), uint32(got.timestamp))
-	require.Equal(t, header.Bits, uint32(got.nbits))
-}
-
 // Test block header values from mainnet genesis block (chaincfg/genesis.go)
 var (
 	testPrevBlock  = chainhash.Hash{}

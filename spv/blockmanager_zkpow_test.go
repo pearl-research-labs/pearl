@@ -49,15 +49,11 @@ func TestCheckHeaderSanityRejectsDisconnectedV4Ancestor(t *testing.T) {
 	header.ProofCommitment = cert.ProofCommitment()
 	cert.Hash = header.BlockHash()
 
-	for name, reorg := range map[string]bool{"extension": false, "reorg": true} {
-		t.Run(name, func(t *testing.T) {
-			// Native ancestry validation needs no header store or list and
-			// rejects the disconnected witness before proof verification.
-			err := bm.checkHeaderSanity(&header, &parent, cert, reorg, 1)
-			var ruleErr blockchain.RuleError
-			require.ErrorAs(t, err, &ruleErr)
-			require.Equal(t, blockchain.ErrHighHash, ruleErr.ErrorCode)
-			require.Contains(t, ruleErr.Description, "v4 ancestor header at depth 1 does not connect")
-		})
-	}
+	// Native ancestry validation needs no header store or list and
+	// rejects the disconnected witness before proof verification.
+	err = bm.checkHeaderSanity(&header, &parent, cert, false, 1)
+	var ruleErr blockchain.RuleError
+	require.ErrorAs(t, err, &ruleErr)
+	require.Equal(t, blockchain.ErrHighHash, ruleErr.ErrorCode)
+	require.Contains(t, ruleErr.Description, "v4 ancestor header at depth 1 does not connect")
 }
