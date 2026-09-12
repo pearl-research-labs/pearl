@@ -21,7 +21,7 @@ packaged into a `PlainProof` (V1–V3) or `PlainProofV4` (FP8) using this librar
 types (Merkle trees, matrix proofs, block header, mining configuration, etc.)
 and submitted to the gateway.
 
-The module also exposes a legacy Int7 `mine()` function that performs the full search loop
+The module also exposes a `mine()` function that performs the full search loop
 on the CPU. This is a naive implementation included for completeness and testing — it is not suitable for production use.
 
 ### Sanity-checking a PlainProof

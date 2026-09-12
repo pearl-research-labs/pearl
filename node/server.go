@@ -2599,9 +2599,7 @@ func (s *server) Start() {
 
 	// Start the CPU miner if generation is enabled.
 	if cfg.Generate {
-		if err := s.cpuMiner.Start(); err != nil {
-			srvrLog.Errorf("Unable to start CPU miner: %v", err)
-		}
+		s.cpuMiner.Start()
 	}
 }
 
@@ -2969,12 +2967,6 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	})
 	if err != nil {
 		return nil, err
-	}
-	if cfg.Generate {
-		if err := blockchain.CheckCPUMiningSupported(chainParams,
-			s.chain.BestSnapshot().Height+1); err != nil {
-			return nil, fmt.Errorf("--generate: %w", err)
-		}
 	}
 
 	// Search for a FeeEstimator state in the database. If none can be found
