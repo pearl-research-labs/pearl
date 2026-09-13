@@ -311,10 +311,6 @@ impl BlakeProgram {
         let m = params.m() as usize;
         let total_b_cols = params.n() as usize;
 
-        // The fp8 statement is always prequant (int8 values + BF16 scales), so the
-        // scales sections below always run.
-        let is_prequant = true;
-
         // Committed row stride and exposed strip prefix of the values trees:
         // prequant commits 1 byte per int8 element and exposes full rows.
         let (row_bytes, strip_bytes) = (params.common_dim() as usize, params.common_dim() as usize);
@@ -380,39 +376,37 @@ impl BlakeProgram {
         );
         instructions[idx].out = HashOut::B;
 
-        if is_prequant {
-            // The scales trees: one BF16 scale (2 bytes) per BLOCK_SIZE int8
-            // values, full rows exposed. Their strips follow the values strips
-            // in each side's strip list (indices h.. / w..).
-            let scale_row_bytes = 2 * (params.common_dim() as usize / BLOCK_SIZE);
-            let idx = section(
-                scale_row_bytes,
-                scale_row_bytes,
-                m,
-                &params.a_rows_indices(),
-                ProofSource::AScales,
-                params.h() as usize,
-                params.a().hash_id,
-                &mut instructions,
-                &mut msgs,
-                &mut cvs,
-            );
-            instructions[idx].out = HashOut::AScales;
+        // The scales trees: one BF16 scale (2 bytes) per BLOCK_SIZE int8
+        // values, full rows exposed. Their strips follow the values strips
+        // in each side's strip list (indices h.. / w..).
+        let scale_row_bytes = 2 * (params.common_dim() as usize / BLOCK_SIZE);
+        let idx = section(
+            scale_row_bytes,
+            scale_row_bytes,
+            m,
+            &params.a_rows_indices(),
+            ProofSource::AScales,
+            params.h() as usize,
+            params.a().hash_id,
+            &mut instructions,
+            &mut msgs,
+            &mut cvs,
+        );
+        instructions[idx].out = HashOut::AScales;
 
-            let idx = section(
-                scale_row_bytes,
-                scale_row_bytes,
-                total_b_cols,
-                &params.b_rows_indices(),
-                ProofSource::BScales,
-                params.w() as usize,
-                params.b().hash_id,
-                &mut instructions,
-                &mut msgs,
-                &mut cvs,
-            );
-            instructions[idx].out = HashOut::BScales;
-        }
+        let idx = section(
+            scale_row_bytes,
+            scale_row_bytes,
+            total_b_cols,
+            &params.b_rows_indices(),
+            ProofSource::BScales,
+            params.w() as usize,
+            params.b().hash_id,
+            &mut instructions,
+            &mut msgs,
+            &mut cvs,
+        );
+        instructions[idx].out = HashOut::BScales;
 
         let mut num_routing_strips = 0usize;
         let mut num_offsets_strips = 0usize;
@@ -470,12 +464,12 @@ impl BlakeProgram {
         // A prequant program must expose exactly one scales root per side.
         debug_assert_eq!(
             instructions.iter().filter(|i| i.out == HashOut::AScales).count(),
-            is_prequant as usize,
+            1,
             "prequant <=> exactly one A scales root"
         );
         debug_assert_eq!(
             instructions.iter().filter(|i| i.out == HashOut::BScales).count(),
-            is_prequant as usize,
+            1,
             "prequant <=> exactly one B scales root"
         );
 
@@ -645,7 +639,6 @@ fn recursive_compilation(
         let mut is_first_in_chunk = true;
         let mut msg_start = start;
         while msg_start < end {
-            let mut is_auxiliary_msg = true;
             let block_len = (end - msg_start).min(BLAKE3_MSG_LEN);
             let is_last_in_chunk = msg_start + block_len == end;
             let flags = B3F_KEYED_HASH
@@ -680,10 +673,10 @@ fn recursive_compilation(
                     })
             });
             let num_strip_dwords = mat_dwords.iter().filter(|d| d.is_some()).count();
-            if num_strip_dwords > 0 {
+            let msg = if num_strip_dwords > 0 {
                 // Slices are chunk-padded, so a block that intersects strips is always full.
                 assert_eq!(block_len, BLAKE3_MSG_LEN, "strip-intersecting blocks are whole");
-                let msg = if is_routing || is_offsets {
+                if is_routing || is_offsets {
                     // Each routing/offsets strip is exactly one whole blake3 block: never straddling.
                     let d0 = mat_dwords[0].expect("routing/offsets blocks are wholly opened");
                     assert_eq!(d0.idx_in_strip, 0);
@@ -712,28 +705,20 @@ fn recursive_compilation(
                         mat_dwords,
                         aux_idx: out_msgs.len() - 1,
                     }
-                };
-                instructions.push(BlakeInstruction {
-                    key_source: if is_first_in_chunk { key_source } else { KeySource::Prev },
-                    tweak,
-                    msg,
-                    out: HashOut::None,
-                });
-                is_auxiliary_msg = false;
-            }
-
-            if is_auxiliary_msg {
+                }
+            } else {
                 out_msgs.push(AuxiliaryMsgLocation {
                     global_start: msg_start,
                     source,
                 });
-                instructions.push(BlakeInstruction {
-                    key_source: if is_first_in_chunk { key_source } else { KeySource::Prev },
-                    tweak,
-                    msg: MessageType::AuxiliaryLeaf { idx: out_msgs.len() - 1 },
-                    out: HashOut::None,
-                });
-            }
+                MessageType::AuxiliaryLeaf { idx: out_msgs.len() - 1 }
+            };
+            instructions.push(BlakeInstruction {
+                key_source: if is_first_in_chunk { key_source } else { KeySource::Prev },
+                tweak,
+                msg,
+                out: HashOut::None,
+            });
             is_first_in_chunk = false;
             msg_start += block_len;
         }

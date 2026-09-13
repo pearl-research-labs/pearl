@@ -7,7 +7,8 @@ use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
-use super::super::ctl::{LutLookup, Table};
+use super::super::ctl::Table;
+use super::super::luts::ctl::LutLookup;
 use super::columns::XOR_FOLD_COL_MAP;
 
 /// XorFold's looking side of the **cell results** channel: `(CELL_ID,

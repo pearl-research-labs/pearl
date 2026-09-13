@@ -125,7 +125,11 @@ pub struct PrequantSlice {
 impl PrequantSlice {
     /// Concatenate `rows` after checking that every row has `expected_row_bytes`.
     pub fn try_from_rows(rows: Vec<Vec<u8>>, expected_row_bytes: usize) -> Result<Self> {
-        let total = Self::total_bytes(rows.len(), expected_row_bytes)?;
+        ensure!(expected_row_bytes > 0, "committed row width must be positive");
+        let total = rows
+            .len()
+            .checked_mul(expected_row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("committed-row length overflow"))?;
         let mut bytes = Vec::with_capacity(total);
         for (i, row) in rows.iter().enumerate() {
             ensure!(
@@ -160,13 +164,6 @@ impl PrequantSlice {
             bytes.len()
         );
         Ok(Self { row_bytes, bytes })
-    }
-
-    fn total_bytes(row_count: usize, row_bytes: usize) -> Result<usize> {
-        ensure!(row_bytes > 0, "committed row width must be positive");
-        row_count
-            .checked_mul(row_bytes)
-            .ok_or_else(|| anyhow::anyhow!("committed-row length overflow"))
     }
 
     pub fn row_bytes(&self) -> usize {

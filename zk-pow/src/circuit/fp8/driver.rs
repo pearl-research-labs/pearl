@@ -76,30 +76,22 @@ use starky::config::StarkConfig;
 use starky::cross_table_lookup::CrossTableLookup;
 
 use super::blake3_stark::columns::{NUM_BLAKE3_PUBLIC_INPUTS, PI_HASH_JACKPOT};
-use super::blake3_stark::ctl::blake3_lut_lookups;
 use super::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, Blake3Stark, Blake3TraceInputs};
-use super::ctl::{LUT_TABLES, LutTable, NUM_ALL_TABLES, NUM_LUT_TABLES, NUM_TABLES, Table, all_cross_table_lookups};
+use super::ctl::{LUT_TABLES, NUM_ALL_TABLES, NUM_LUT_TABLES, NUM_TABLES, Table, all_cross_table_lookups, lut_inventories};
 use super::input_quant_stark::columns::{InputQuantColumnsView, NUM_INPUT_QUANT_PUBLIC_INPUTS};
-use super::input_quant_stark::ctl::input_quant_lut_lookups;
 use super::input_quant_stark::stark::{InputQuantProgram, InputQuantStark};
 use super::known_values::{fp8_known_columns, hash256_to_hash_out};
-use super::luts::{
-    B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Int8DecStark, Log16Stark, LutChecker, Pair128Stark,
-    Pow2DStark, Pow2GbStark, QcastStark, Range16Stark, RneRndStark, Width16Stark, Width32Stark, XfPow2Stark, lut_height,
-    lut_preprocessed_data, lut_trace, num_precommitted_columns,
-};
+use super::luts::stark::boxed_lut_stark;
+use super::luts::{LutChecker, lut_height, lut_preprocessed_data, lut_trace, num_precommitted_columns};
 use super::matmul_b200_stark::MatmulB200ColumnsView;
 use super::matmul_b200_stark::columns::NUM_MATMUL_PUBLIC_INPUTS;
-use super::matmul_b200_stark::ctl::matmul_b200_lut_lookups;
 use super::matmul_b200_stark::stark::{MatmulB200Stark, MatmulProgram, generate_b200_trace};
 use super::scale_stark::columns::{NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView};
-use super::scale_stark::ctl::{SIGMA_EXP_OFFSET, scale_lut_lookups};
+use super::scale_stark::ctl::SIGMA_EXP_OFFSET;
 use super::scale_stark::stark::{ScaleProgram, ScaleRowTuple, ScaleStark};
 use super::tamed_stark::columns::NUM_TAMED_PUBLIC_INPUTS;
-use super::tamed_stark::ctl::tamed_lut_lookups;
 use super::tamed_stark::stark::{TamedProgram, TamedStark};
 use super::xor_fold_stark::columns::{NUM_XOR_FOLD_PUBLIC_INPUTS, XorFoldColumnsView};
-use super::xor_fold_stark::ctl::xor_fold_lut_lookups;
 use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
 use crate::api::fp8::public_params::HashId;
 use crate::api::primitives::Hash256;
@@ -260,48 +252,6 @@ pub struct Fp8PublicData {
     pub b_noise: Vec<u16>,
 }
 
-/// The sixteen LUT AIRs at their exact widths, in [`LUT_TABLES`] order (boxed: each table
-/// instantiates its own width).
-struct LutStarks<F: RichField + Extendable<D>, const D: usize> {
-    starks: Vec<Box<dyn BatchStark<F, D>>>,
-}
-
-/// One LUT AIR at its table's exact width (the width is a compile-time constant per table,
-/// so the dispatch is a static match).
-fn boxed_lut_stark<F: RichField + Extendable<D>, const D: usize>(table: LutTable) -> Box<dyn BatchStark<F, D>> {
-    match table {
-        LutTable::RneRnd => Box::new(RneRndStark::<F, D>::new(table)),
-        LutTable::Range16 => Box::new(Range16Stark::<F, D>::new(table)),
-        LutTable::Bytes2 => Box::new(Bytes2Stark::<F, D>::new(table)),
-        LutTable::Qcast => Box::new(QcastStark::<F, D>::new(table)),
-        LutTable::Div448 => Box::new(Div448Stark::<F, D>::new(table)),
-        LutTable::Pair128 => Box::new(Pair128Stark::<F, D>::new(table)),
-        LutTable::Clamp22 => Box::new(Clamp22Stark::<F, D>::new(table)),
-        LutTable::Int8Dec => Box::new(Int8DecStark::<F, D>::new(table)),
-        LutTable::ExpInfo => Box::new(ExpInfoStark::<F, D>::new(table)),
-        LutTable::Pow2D => Box::new(Pow2DStark::<F, D>::new(table)),
-        LutTable::B200Align => Box::new(B200AlignStark::<F, D>::new(table)),
-        LutTable::Pow2Gb => Box::new(Pow2GbStark::<F, D>::new(table)),
-        LutTable::Width32 => Box::new(Width32Stark::<F, D>::new(table)),
-        LutTable::XfPow2 => Box::new(XfPow2Stark::<F, D>::new(table)),
-        LutTable::Width16 => Box::new(Width16Stark::<F, D>::new(table)),
-        LutTable::Log16 => Box::new(Log16Stark::<F, D>::new(table)),
-    }
-}
-
-impl<F: RichField + Extendable<D>, const D: usize> LutStarks<F, D> {
-    fn new() -> Self {
-        Self {
-            starks: LUT_TABLES.iter().map(|&t| boxed_lut_stark::<F, D>(t)).collect(),
-        }
-    }
-
-    /// The AIRs as batch tables, in [`LUT_TABLES`] order.
-    fn as_dyn(&self) -> [&dyn BatchStark<F, D>; NUM_LUT_TABLES] {
-        core::array::from_fn(|i| self.starks[i].as_ref())
-    }
-}
-
 /// Generates the Matmul trace from the noised fp8 codes and their summand scores: the
 /// column-major polynomials, the public inputs, the finished cells' f32 words (XorFold's
 /// inputs), and the per-cell `(E_CELL, CELL_SKIPS)` tuples (Tamed's inputs — exactly the
@@ -337,7 +287,9 @@ pub struct Fp8System<F: RichField + Extendable<D>, const D: usize> {
     matmul: MatmulB200Stark<F, D>,
     xor_fold: XorFoldStark<F, D>,
     tamed: TamedStark<F, D>,
-    luts: LutStarks<F, D>,
+    /// The sixteen LUT AIRs at their exact widths, in [`LUT_TABLES`] order (boxed: each table
+    /// instantiates its own width).
+    luts: [Box<dyn BatchStark<F, D>>; NUM_LUT_TABLES],
     /// Class (a) recompute inputs kept for trace generation and witness validation.
     plane_lens: [usize; 4],
     a_noise: Vec<u16>,
@@ -420,7 +372,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             matmul: MatmulB200Stark::new(matmul),
             xor_fold: XorFoldStark::new(xor_fold),
             tamed: TamedStark::new(tamed),
-            luts: LutStarks::new(),
+            luts: LUT_TABLES.map(boxed_lut_stark::<F, D>),
             plane_lens: [a_values_len, a_scales_len, b_values_len, b_scales_len],
             a_noise,
             b_noise,
@@ -534,7 +486,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
 
     /// The batch tables, canonical order.
     pub(super) fn batch_starks(&self) -> [&dyn BatchStark<F, D>; NUM_ALL_TABLES] {
-        let mut tables: Vec<&dyn BatchStark<F, D>> = vec![
+        let main_tables: [&dyn BatchStark<F, D>; NUM_TABLES] = [
             &self.blake3,
             &self.input_quant,
             &self.scale,
@@ -542,8 +494,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             &self.xor_fold,
             &self.tamed,
         ];
-        tables.extend(self.luts.as_dyn());
-        core::array::from_fn(|t| tables[t])
+        core::array::from_fn(|t| {
+            if t < NUM_TABLES {
+                main_tables[t]
+            } else {
+                self.luts[t - NUM_TABLES].as_ref()
+            }
+        })
     }
 
     /// The main tables' public inputs, padded with the LUT tables' empty vectors to the
@@ -728,17 +685,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // with per-instance errors — the prover fails fast instead of emitting an
         // unbalanceable proof. ----
         let mut checker = LutChecker::<F>::new();
-        let inventories = [
-            (blake3_lut_lookups::<F>(), "Blake3"),
-            (input_quant_lut_lookups::<F>(), "InputQuant"),
-            (scale_lut_lookups::<F>(&self.scale.program), "Scale"),
-            (matmul_b200_lut_lookups::<F>(), "Matmul"),
-            (xor_fold_lut_lookups::<F>(), "XorFold"),
-            (tamed_lut_lookups::<F>(), "Tamed"),
-        ];
-        for (t, (lookups, name)) in inventories.iter().enumerate() {
+        for (table, lookups) in lut_inventories::<F>(&self.scale.program) {
+            let t = usize::from(table);
             checker
-                .check_trace(lookups, &traces[t], &generated[t], name)
+                .check_trace(&lookups, &traces[t], &generated[t], &format!("{table:?}"))
                 .map_err(|e| anyhow!(e))?;
         }
         for table in LUT_TABLES {

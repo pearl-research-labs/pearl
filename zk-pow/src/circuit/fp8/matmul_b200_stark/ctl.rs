@@ -10,7 +10,9 @@ use starky::lookup::{Column, Filter};
 
 use super::columns::{GROUP_WIDTH, MATMUL_B200_COL_MAP};
 use super::stark::PARTIAL_BINADE_OFFSET;
-use crate::circuit::fp8::ctl::{LutLookup, LutTable, Table};
+use crate::circuit::fp8::ctl::Table;
+use crate::circuit::fp8::luts::LutTable;
+use crate::circuit::fp8::luts::ctl::LutLookup;
 use crate::circuit::fp8::unpredictability::SKIP_THRESHOLD_OFFSET;
 
 /// Matmul's looking side of the operand-code channel: 16 pair-packed instances per side
