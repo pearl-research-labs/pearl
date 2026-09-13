@@ -2,10 +2,11 @@
 
 use std::os::raw::c_char;
 
-use zk_pow::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, SeedDerivation};
-use zk_pow::api::prove;
-use zk_pow::ffi::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
+use zk_pow::api::seed::SeedDerivation;
 use zk_pow::ffi::plain_proof::{CertificateVersion, PlainProof};
+use zk_pow::v2::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern};
+use zk_pow::v2::api::prove;
+use zk_pow::v2::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
 
 use crate::common::{catch_panic, copy_prove_result, set_error_msg, zk_prove, CZKProof, MIN_NOISE_RANK};
 

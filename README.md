@@ -1,7 +1,6 @@
 # Pearl
 
 [![Blockchain / Build and Test](https://github.com/pearl-research-labs/pearl/actions/workflows/blockchain_ci.yml/badge.svg)](https://github.com/pearl-research-labs/pearl/actions/workflows/blockchain_ci.yml)
-[![Integration Tests CI](https://github.com/pearl-research-labs/pearl/actions/workflows/integration_tests_ci.yml/badge.svg)](https://github.com/pearl-research-labs/pearl/actions/workflows/integration_tests_ci.yml)
 [![Miner CI](https://github.com/pearl-research-labs/pearl/actions/workflows/miner_ci.yml/badge.svg)](https://github.com/pearl-research-labs/pearl/actions/workflows/miner_ci.yml)
 [![Miner GPU CI](https://github.com/pearl-research-labs/pearl/actions/workflows/miner_gpu_ci.yml/badge.svg)](https://github.com/pearl-research-labs/pearl/actions/workflows/miner_gpu_ci.yml)
 [![Desktop Wallet CI/CD](https://github.com/pearl-research-labs/pearl/actions/workflows/pearl-desktop-wallet.yml/badge.svg)](https://github.com/pearl-research-labs/pearl/actions/workflows/pearl-desktop-wallet.yml)
@@ -28,7 +27,7 @@ system, vLLM miner, and supporting tools.
 | [`zk-pow/`](zk-pow/) | ZK proof-of-work circuit and verifier (Rust, Plonky2/STARKy) |
 | [`pearl-blake3/`](pearl-blake3/) | Blake3 hashing utilities (Rust) |
 | [`plonky2/`](plonky2/) | Plonky2 SNARK proving system (Rust, vendored) |
-| [`miner/`](miner/) | vLLM miner — GPU mining infrastructure (Python/CUDA, uv workspace) |
+| [`miner/`](miner/) | FP8 mining stack — pearl-gateway, miner-base, the vLLM miner and the `pearl-gemm` CuTe DSL kernels (Python/CUDA, uv workspace; SM100/B200) |
 | [`py-pearl-mining/`](py-pearl-mining/) | Python bindings for Pearl mining (Rust/PyO3) |
 | [`apps/`](apps/) | Frontend applications (website, desktop wallet — pnpm/Turborepo) |
 | [`tools/`](tools/) | Go development tool dependencies |
@@ -134,8 +133,10 @@ options.
 
 ### 3. Start the vLLM miner
 
-The vLLM miner has two components: **pearl-gateway** (bridge to the node) and
-**vllm-miner** (GPU mining via vLLM).
+The vLLM miner has two components: **pearl-gateway** (bridge to the node,
+`miner/pearl-gateway`) and **vllm-miner** (GPU mining via vLLM; requires an
+SM100/B200 GPU). See [`miner/README.md`](miner/README.md) and
+[`miner/vllm-miner/README.md`](miner/vllm-miner/README.md).
 
 ```bash
 export PEARLD_RPC_URL="http://localhost:44107"
@@ -157,11 +158,10 @@ docker run --rm -it --gpus all --network host \
   -e PEARLD_RPC_URL=http://localhost:44107 \
   -e PEARLD_RPC_USER=rpcuser \
   -e PEARLD_RPC_PASSWORD=rpcpass \
+  -e PEARLD_MINING_ADDRESS=<your-taproot-address> \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --shm-size 8g \
-  vllm_miner:latest \
-  pearl-ai/Llama-3.3-70B-Instruct-pearl \
-  --host 0.0.0.0 --port 8000
+  vllm_miner:latest
 ```
 
 ## Testing
@@ -169,8 +169,8 @@ docker run --rm -it --gpus all --network host \
 ```bash
 task test               # run all tests (Go + Python)
 task test:go            # Go tests with race detector
-task test:python        # full Python test suite
-task test:python:basic  # Python tests (excludes integration/perf/slow)
+task test:python        # full Python miner test suite (needs an SM100 GPU)
+task test:python:basic  # CPU-safe Python tests (excludes integration/perf/slow/GPU)
 ```
 
 ## Formatting and Linting

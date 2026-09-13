@@ -7,9 +7,9 @@
 use std::os::raw::c_char;
 use std::slice;
 
-use zk_pow::api::proof::IncompleteBlockHeader;
-use zk_pow::api::verify;
-use zk_pow::ffi::plain_proof::{check_cert_version_eligible, PlainProof};
+use zk_pow::ffi::plain_proof::PlainProof;
+use zk_pow::v2::api::proof::IncompleteBlockHeader;
+use zk_pow::v2::api::verify;
 
 use crate::common::{catch_panic, copy_prove_result, set_error_msg, zk_prove, CZKProof};
 
@@ -45,7 +45,7 @@ pub unsafe extern "C" fn verify_plain_proof_ffi(
             Ok(p) => p,
             Err(e) => return (1, format!("deserialize: {e}")),
         };
-        let version = match check_cert_version_eligible(cert_version, &pp) {
+        let version = match pp.check_cert_version_eligible(cert_version) {
             Ok(v) => v,
             Err(e) => return (1, format!("rejected: {e}")),
         };
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn prove_plain_proof_ffi(
         }
     };
 
-    let version = match check_cert_version_eligible(cert_version, &pp) {
+    let version = match pp.check_cert_version_eligible(cert_version) {
         Ok(v) => v,
         Err(e) => {
             set_error_msg(error_msg_out, &format!("cert version: {e}"));
@@ -141,15 +141,16 @@ mod tests {
 
     use bincode::Options;
     use rand_chacha::rand_core::SeedableRng;
-    use zk_pow::api::proof::{MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, SeedDerivation};
-    use zk_pow::ffi::mine::try_mine_one_moe;
+    use zk_pow::api::seed::SeedDerivation;
+    use zk_pow::v2::api::proof::{MMAType, MiningConfiguration, MoEConfig, PeriodicPattern};
+    use zk_pow::v2::mine::try_mine_one_moe;
 
     use crate::common::{ERROR_MSG_MAX_SIZE, MAX_ZK_PROOF_SIZE, PUBLICDATA_MAX_SIZE};
     use crate::verify::verify_zk_proof_v2;
 
     /// CI-fast MoE parameters with permissive difficulty, mirroring zk-pow's moe_test baseline.
     fn test_params() -> (IncompleteBlockHeader, MiningConfiguration, usize, usize, usize) {
-        let k = 1024usize;
+        let k = 2048usize;
         let header = IncompleteBlockHeader {
             version: 0,
             prev_block: [0; 32],

@@ -66,20 +66,29 @@ impl<F: Field> Filter<F> {
         }
     }
 
-    /// Given the column values for the current and next rows, evaluates the filter.
-    pub(crate) fn eval_filter<FE, P, const D: usize>(&self, v: &[P], next_v: &[P]) -> P
+    /// Given the column values for the current and next rows and the table's public inputs,
+    /// evaluates the filter.
+    pub(crate) fn eval_filter<FE, P, const D: usize>(
+        &self,
+        v: &[P],
+        next_v: &[P],
+        public_inputs: &[FE],
+    ) -> P
     where
         FE: FieldExtension<D, BaseField = F>,
         P: PackedField<Scalar = FE>,
     {
         self.products
             .iter()
-            .map(|(col1, col2)| col1.eval_with_next(v, next_v) * col2.eval_with_next(v, next_v))
+            .map(|(col1, col2)| {
+                col1.eval_with_next(v, next_v, public_inputs)
+                    * col2.eval_with_next(v, next_v, public_inputs)
+            })
             .sum::<P>()
             + self
                 .constants
                 .iter()
-                .map(|col| col.eval_with_next(v, next_v))
+                .map(|col| col.eval_with_next(v, next_v, public_inputs))
                 .sum::<P>()
     }
 
@@ -90,6 +99,7 @@ impl<F: Field> Filter<F> {
         builder: &mut CircuitBuilder<F, D>,
         v: &[ExtensionTarget<D>],
         next_v: &[ExtensionTarget<D>],
+        public_inputs: &[ExtensionTarget<D>],
     ) -> ExtensionTarget<D>
     where
         F: RichField + Extendable<D>,
@@ -98,8 +108,8 @@ impl<F: Field> Filter<F> {
             .products
             .iter()
             .map(|(col1, col2)| {
-                let col1_eval = col1.eval_with_next_circuit(builder, v, next_v);
-                let col2_eval = col2.eval_with_next_circuit(builder, v, next_v);
+                let col1_eval = col1.eval_with_next_circuit(builder, v, next_v, public_inputs);
+                let col2_eval = col2.eval_with_next_circuit(builder, v, next_v, public_inputs);
                 builder.mul_extension(col1_eval, col2_eval)
             })
             .collect::<Vec<_>>();
@@ -107,7 +117,7 @@ impl<F: Field> Filter<F> {
         let consts = self
             .constants
             .iter()
-            .map(|col| col.eval_with_next_circuit(builder, v, next_v))
+            .map(|col| col.eval_with_next_circuit(builder, v, next_v, public_inputs))
             .collect::<Vec<_>>();
 
         let prods = builder.add_many_extension(prods);
@@ -116,28 +126,35 @@ impl<F: Field> Filter<F> {
     }
 
     /// Evaluate on a row of a table given in column-major form.
-    pub fn eval_table(&self, table: &[PolynomialValues<F>], row: usize) -> F {
+    pub fn eval_table(&self, table: &[PolynomialValues<F>], row: usize, public_inputs: &[F]) -> F {
         self.products
             .iter()
-            .map(|(col1, col2)| col1.eval_table(table, row) * col2.eval_table(table, row))
+            .map(|(col1, col2)| {
+                col1.eval_table(table, row, public_inputs)
+                    * col2.eval_table(table, row, public_inputs)
+            })
             .sum::<F>()
             + self
                 .constants
                 .iter()
-                .map(|col| col.eval_table(table, row))
+                .map(|col| col.eval_table(table, row, public_inputs))
                 .sum()
     }
 
-    /// Evaluates the filter on all rows.
+    /// Evaluates the filter on all rows, with the public inputs.
     /// Optimized for batch evaluation
-    pub fn eval_all_rows(&self, table: &[PolynomialValues<F>]) -> Vec<F> {
+    pub fn eval_all_rows_with_inputs(
+        &self,
+        table: &[PolynomialValues<F>],
+        public_inputs: &[F],
+    ) -> Vec<F> {
         let num_rows = table[0].len();
         let mut result = vec![F::ZERO; num_rows];
 
         // Accumulate product terms (degree-2): col1 * col2
         for (col1, col2) in &self.products {
-            let col1_vals = col1.eval_all_rows(table);
-            let col2_vals = col2.eval_all_rows(table);
+            let col1_vals = col1.eval_all_rows_with_inputs(table, public_inputs);
+            let col2_vals = col2.eval_all_rows_with_inputs(table, public_inputs);
             result
                 .iter_mut()
                 .zip(col1_vals.iter())
@@ -147,7 +164,7 @@ impl<F: Field> Filter<F> {
 
         // Accumulate linear terms
         for col in &self.constants {
-            let col_vals = col.eval_all_rows(table);
+            let col_vals = col.eval_all_rows_with_inputs(table, public_inputs);
             result
                 .iter_mut()
                 .zip(col_vals.iter())
@@ -155,6 +172,12 @@ impl<F: Field> Filter<F> {
         }
 
         result
+    }
+
+    /// Evaluates the filter on all rows.
+    /// Optimized for batch evaluation
+    pub fn eval_all_rows(&self, table: &[PolynomialValues<F>]) -> Vec<F> {
+        self.eval_all_rows_with_inputs(table, &[])
     }
 
     /// All STARK columns contributing to this filter.
@@ -172,15 +195,50 @@ impl<F: Field> Filter<F> {
     }
 }
 
-/// Represent two linear combination of columns, corresponding to the current and next row values.
-/// Each linear combination is represented as:
-/// - a vector of `(usize, F)` corresponding to the column number and the associated multiplicand
-/// - the constant of the linear combination.
-#[derive(Clone, Debug)]
+/// A virtual column: a linear expression evaluated on a trace row. Writing `v`/`v'` for the
+/// current/next row values and `PI` for the table's public inputs, a `Column` represents
+///
+/// `Σ f_i·v[c_i] + Σ g_j·v'[c_j] + Σ PI[s]·v[c] + Σ PI[s] + constant`
+///
+/// with the four sums given by `linear_combination`, `next_row_linear_combination`,
+/// `public_input_scaled` and `public_input_offsets`. Public inputs are per-proof scalars, so
+/// the public-input terms leave the expression's degree in the trace unchanged (the scaled
+/// terms are degree 1, the offsets degree 0); they let one fixed expression — hence one
+/// compiled verifier circuit — cover every instance geometry.
+///
+/// The `public_inputs` slice passed to any evaluation method must cover every slot the
+/// expression references (out-of-range slots panic); expressions without public-input terms
+/// never read the slice, so `&[]` is fine for them.
+#[derive(Clone)]
 pub struct Column<F: Field> {
     linear_combination: Vec<(usize, F)>,
     next_row_linear_combination: Vec<(usize, F)>,
+    /// Terms `PI[s]·v[c]` (current row), one per `(c, s)` pair.
+    public_input_scaled: Vec<(usize, usize)>,
+    /// Terms `PI[s]`, one per slot `s`, added to the constant.
+    public_input_offsets: Vec<usize>,
     constant: F,
+}
+
+impl<F: Field> Debug for Column<F> {
+    /// Prints the public-input fields only when non-empty: expressions without such terms
+    /// keep their pre-public-input `derive(Debug)` output, which downstream fingerprint
+    /// tests hash to pin frozen protocol versions.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut s = f.debug_struct("Column");
+        s.field("linear_combination", &self.linear_combination)
+            .field(
+                "next_row_linear_combination",
+                &self.next_row_linear_combination,
+            );
+        if !self.public_input_scaled.is_empty() {
+            s.field("public_input_scaled", &self.public_input_scaled);
+        }
+        if !self.public_input_offsets.is_empty() {
+            s.field("public_input_offsets", &self.public_input_offsets);
+        }
+        s.field("constant", &self.constant).finish()
+    }
 }
 
 impl<F: Field> Column<F> {
@@ -189,7 +247,71 @@ impl<F: Field> Column<F> {
         Self {
             linear_combination: vec![(c, F::ONE)],
             next_row_linear_combination: vec![],
+            public_input_scaled: vec![],
+            public_input_offsets: vec![],
             constant: F::ZERO,
+        }
+    }
+
+    /// The single column `c` offset by a public input: `v[c] + PI[s]`.
+    pub fn single_plus_public_input(c: usize, s: usize) -> Self {
+        Self {
+            public_input_offsets: vec![s],
+            ..Self::single(c)
+        }
+    }
+
+    /// A public input minus a single column: `PI[s] - v[c]`.
+    pub fn public_input_minus_single(s: usize, c: usize) -> Self {
+        Self {
+            linear_combination: vec![(c, -F::ONE)],
+            public_input_offsets: vec![s],
+            ..Self::zero()
+        }
+    }
+
+    /// `PI[s] - sum coeff·v[c]` over the given `(column, coeff)` terms.
+    pub fn public_input_minus_linear_combination<I: IntoIterator<Item = (usize, F)>>(
+        s: usize,
+        iter: I,
+    ) -> Self {
+        Self {
+            linear_combination: iter.into_iter().map(|(c, coeff)| (c, -coeff)).collect(),
+            public_input_offsets: vec![s],
+            ..Self::zero()
+        }
+    }
+
+    /// The single column `c` scaled by a public input: `PI[s]·v[c]`.
+    pub fn single_times_public_input(c: usize, s: usize) -> Self {
+        Self {
+            public_input_scaled: vec![(c, s)],
+            ..Self::zero()
+        }
+    }
+
+    /// A public input alone: `PI[s]`.
+    pub fn public_input(s: usize) -> Self {
+        Self {
+            public_input_offsets: vec![s],
+            ..Self::zero()
+        }
+    }
+
+    /// A public-input-scaled column plus a plain column: `PI[s]·v[c_scaled] + v[c]`.
+    pub fn single_times_public_input_plus_single(c_scaled: usize, s: usize, c: usize) -> Self {
+        Self {
+            public_input_scaled: vec![(c_scaled, s)],
+            ..Self::single(c)
+        }
+    }
+
+    /// A public-input-scaled column plus a public-input offset: `PI[s]·v[c] + PI[s_off]`.
+    pub fn single_times_public_input_plus_public_input(c: usize, s: usize, s_off: usize) -> Self {
+        Self {
+            public_input_scaled: vec![(c, s)],
+            public_input_offsets: vec![s_off],
+            ..Self::zero()
         }
     }
 
@@ -203,9 +325,8 @@ impl<F: Field> Column<F> {
     /// Returns the representation of a single column in the next row.
     pub fn single_next_row(c: usize) -> Self {
         Self {
-            linear_combination: vec![],
             next_row_linear_combination: vec![(c, F::ONE)],
-            constant: F::ZERO,
+            ..Self::zero()
         }
     }
 
@@ -221,6 +342,8 @@ impl<F: Field> Column<F> {
         Self {
             linear_combination: vec![],
             next_row_linear_combination: vec![],
+            public_input_scaled: vec![],
+            public_input_offsets: vec![],
             constant,
         }
     }
@@ -254,8 +377,7 @@ impl<F: Field> Column<F> {
 
         Self {
             linear_combination: v,
-            next_row_linear_combination: vec![],
-            constant,
+            ..Self::constant(constant)
         }
     }
 
@@ -289,7 +411,7 @@ impl<F: Field> Column<F> {
         Self {
             linear_combination: v,
             next_row_linear_combination: next_row_v,
-            constant,
+            ..Self::constant(constant)
         }
     }
 
@@ -336,6 +458,8 @@ impl<F: Field> Column<F> {
     pub fn get_single_column_idx(&self) -> Option<usize> {
         if self.linear_combination.len() == 1
             && self.next_row_linear_combination.is_empty()
+            && self.public_input_scaled.is_empty()
+            && self.public_input_offsets.is_empty()
             && self.constant.is_zero()
             && self.linear_combination[0].1.is_one()
         {
@@ -351,11 +475,13 @@ impl<F: Field> Column<F> {
             .iter()
             .chain(&self.next_row_linear_combination)
             .map(|&(c, _)| c)
+            .chain(self.public_input_scaled.iter().map(|&(c, _)| c))
             .collect()
     }
 
-    /// Given the column values for the current row, returns the evaluation of the linear combination.
-    pub(crate) fn eval<FE, P, const D: usize>(&self, v: &[P]) -> P
+    /// Given the column values for the current row and the table's public inputs, returns the
+    /// evaluation of the expression (next-row terms are ignored).
+    pub(crate) fn eval<FE, P, const D: usize>(&self, v: &[P], public_inputs: &[FE]) -> P
     where
         FE: FieldExtension<D, BaseField = F>,
         P: PackedField<Scalar = FE>,
@@ -364,11 +490,27 @@ impl<F: Field> Column<F> {
             .iter()
             .map(|&(c, f)| v[c] * FE::from_basefield(f))
             .sum::<P>()
+            + self
+                .public_input_scaled
+                .iter()
+                .map(|&(c, s)| v[c] * public_inputs[s])
+                .sum::<P>()
+            + self
+                .public_input_offsets
+                .iter()
+                .map(|&s| public_inputs[s])
+                .sum::<FE>()
             + FE::from_basefield(self.constant)
     }
 
-    /// Given the column values for the current and next rows, evaluates the current and next linear combinations and returns their sum.
-    pub(crate) fn eval_with_next<FE, P, const D: usize>(&self, v: &[P], next_v: &[P]) -> P
+    /// Given the column values for the current and next rows and the table's public inputs,
+    /// evaluates the full expression.
+    pub(crate) fn eval_with_next<FE, P, const D: usize>(
+        &self,
+        v: &[P],
+        next_v: &[P],
+        public_inputs: &[FE],
+    ) -> P
     where
         FE: FieldExtension<D, BaseField = F>,
         P: PackedField<Scalar = FE>,
@@ -382,11 +524,21 @@ impl<F: Field> Column<F> {
                 .iter()
                 .map(|&(c, f)| next_v[c] * FE::from_basefield(f))
                 .sum::<P>()
+            + self
+                .public_input_scaled
+                .iter()
+                .map(|&(c, s)| v[c] * public_inputs[s])
+                .sum::<P>()
+            + self
+                .public_input_offsets
+                .iter()
+                .map(|&s| public_inputs[s])
+                .sum::<FE>()
             + FE::from_basefield(self.constant)
     }
 
     /// Evaluate on a row of a table given in column-major form.
-    pub fn eval_table(&self, table: &[PolynomialValues<F>], row: usize) -> F {
+    pub fn eval_table(&self, table: &[PolynomialValues<F>], row: usize, public_inputs: &[F]) -> F {
         self.linear_combination
             .iter()
             .map(|&(c, f)| table[c].values[row] * f)
@@ -396,18 +548,44 @@ impl<F: Field> Column<F> {
                 .iter()
                 .map(|&(c, f)| table[c].values[(row + 1) % table[c].values.len()] * f)
                 .sum::<F>()
+            + self
+                .public_input_scaled
+                .iter()
+                .map(|&(c, s)| table[c].values[row] * public_inputs[s])
+                .sum::<F>()
+            + self
+                .public_input_offsets
+                .iter()
+                .map(|&s| public_inputs[s])
+                .sum::<F>()
             + self.constant
     }
 
-    /// Evaluates the column on all rows.
+    /// Evaluates the column on all rows, with the public inputs.
     /// Optimized for batch evaluation.
-    pub fn eval_all_rows(&self, table: &[PolynomialValues<F>]) -> Vec<F> {
+    pub fn eval_all_rows_with_inputs(
+        &self,
+        table: &[PolynomialValues<F>],
+        public_inputs: &[F],
+    ) -> Vec<F> {
         let num_rows = table[0].len();
 
-        let mut result = vec![self.constant; num_rows];
+        // Row-independent part: the constant plus the public-input offsets.
+        let constant = self
+            .public_input_offsets
+            .iter()
+            .map(|&s| public_inputs[s])
+            .sum::<F>()
+            + self.constant;
+        let mut result = vec![constant; num_rows];
 
-        // Accumulate current-row linear combination terms
-        for &(col_idx, factor) in &self.linear_combination {
+        // Accumulate current-row linear combination terms, with the public-input-scaled
+        // terms folded in as additional `(column, factor)` pairs.
+        let scaled = self
+            .public_input_scaled
+            .iter()
+            .map(|&(c, s)| (c, public_inputs[s]));
+        for (col_idx, factor) in self.linear_combination.iter().copied().chain(scaled) {
             let col_values = &table[col_idx].values;
             result
                 .iter_mut()
@@ -426,11 +604,42 @@ impl<F: Field> Column<F> {
         result
     }
 
+    /// Evaluates the column on all rows.
+    /// Optimized for batch evaluation.
+    pub fn eval_all_rows(&self, table: &[PolynomialValues<F>]) -> Vec<F> {
+        self.eval_all_rows_with_inputs(table, &[])
+    }
+
+    /// Adds this expression's public-input terms to `acc`:
+    /// `Σ PI[s]·v[c]` (scaled terms) and `Σ PI[s]` (offsets).
+    fn add_public_input_terms_circuit<const D: usize>(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        v: &[ExtensionTarget<D>],
+        public_inputs: &[ExtensionTarget<D>],
+        mut acc: ExtensionTarget<D>,
+    ) -> ExtensionTarget<D>
+    where
+        F: RichField + Extendable<D>,
+    {
+        for &(c, s) in &self.public_input_scaled {
+            let term = builder.mul_extension(public_inputs[s], v[c]);
+            acc = builder.add_extension(acc, term);
+        }
+        if !self.public_input_offsets.is_empty() {
+            let offset = builder
+                .add_many_extension(self.public_input_offsets.iter().map(|&s| public_inputs[s]));
+            acc = builder.add_extension(acc, offset);
+        }
+        acc
+    }
+
     /// Circuit version of `eval`: Given a row's targets, returns their linear combination.
     pub(crate) fn eval_circuit<const D: usize>(
         &self,
         builder: &mut CircuitBuilder<F, D>,
         v: &[ExtensionTarget<D>],
+        public_inputs: &[ExtensionTarget<D>],
     ) -> ExtensionTarget<D>
     where
         F: RichField + Extendable<D>,
@@ -446,7 +655,8 @@ impl<F: Field> Column<F> {
             })
             .collect::<Vec<_>>();
         let constant = builder.constant_extension(F::Extension::from_basefield(self.constant));
-        builder.inner_product_extension(F::ONE, constant, pairs)
+        let acc = builder.inner_product_extension(F::ONE, constant, pairs);
+        self.add_public_input_terms_circuit(builder, v, public_inputs, acc)
     }
 
     /// Circuit version of `eval_with_next`:
@@ -456,6 +666,7 @@ impl<F: Field> Column<F> {
         builder: &mut CircuitBuilder<F, D>,
         v: &[ExtensionTarget<D>],
         next_v: &[ExtensionTarget<D>],
+        public_inputs: &[ExtensionTarget<D>],
     ) -> ExtensionTarget<D>
     where
         F: RichField + Extendable<D>,
@@ -478,7 +689,8 @@ impl<F: Field> Column<F> {
         });
         pairs.extend(next_row_pairs);
         let constant = builder.constant_extension(F::Extension::from_basefield(self.constant));
-        builder.inner_product_extension(F::ONE, constant, pairs)
+        let acc = builder.inner_product_extension(F::ONE, constant, pairs);
+        self.add_public_input_terms_circuit(builder, v, public_inputs, acc)
     }
 }
 
@@ -691,6 +903,7 @@ pub fn get_grand_product_challenge_set_target<
 pub(crate) fn lookup_helper_columns<F: Field>(
     lookup: &Lookup<F>,
     trace_poly_values: &[PolynomialValues<F>],
+    public_inputs: &[F],
     challenge: F,
     constraint_degree: usize,
 ) -> Vec<PolynomialValues<F>> {
@@ -730,6 +943,7 @@ pub(crate) fn lookup_helper_columns<F: Field>(
         trace_poly_values,
         trace_poly_values[0].len(),
         &columns_filters,
+        public_inputs,
         grand_challenge,
         constraint_degree,
     );
@@ -737,7 +951,9 @@ pub(crate) fn lookup_helper_columns<F: Field>(
     // Add `1/(table+challenge)` to the helper columns.
     // This is 1/phi_0(x) = 1/(x + t(x)) from the paper.
     // Here, we don't include m(x) in the numerator, instead multiplying it with this column later.
-    let mut table = lookup.table_column.eval_all_rows(trace_poly_values);
+    let mut table = lookup
+        .table_column
+        .eval_all_rows_with_inputs(trace_poly_values, public_inputs);
     for x in table.iter_mut() {
         *x = challenge + *x;
     }
@@ -747,7 +963,9 @@ pub(crate) fn lookup_helper_columns<F: Field>(
     // This enforces the check from the paper, that the sum of the h_k(x) polynomials is 0 over H.
     // In the paper, that sum includes m(x)/(x + t(x)) = frequencies(x)/g(x), because that was bundled
     // into the h_k(x) polynomials.
-    let frequencies = &lookup.frequencies_column.eval_all_rows(trace_poly_values);
+    let frequencies = &lookup
+        .frequencies_column
+        .eval_all_rows_with_inputs(trace_poly_values, public_inputs);
     let mut z = Vec::with_capacity(frequencies.len());
     z.push(F::ZERO);
     for i in 0..frequencies.len() - 1 {
@@ -802,6 +1020,7 @@ pub(crate) fn eval_helper_columns<F, FE, P, const D: usize, const D2: usize>(
     columns: &[Vec<P>],
     local_values: &[P],
     next_values: &[P],
+    public_inputs: &[FE],
     helper_columns: &[P],
     constraint_degree: usize,
     challenges: &GrandProductChallenge<F>,
@@ -817,7 +1036,7 @@ pub(crate) fn eval_helper_columns<F, FE, P, const D: usize, const D2: usize>(
     constrain_helper_columns(
         columns.len(),
         |i| challenges.combine(&columns[i]),
-        |i| filter[i].eval_filter(local_values, next_values),
+        |i| filter[i].eval_filter(local_values, next_values, public_inputs),
         helper_columns,
         constraint_degree,
         consumer,
@@ -832,6 +1051,7 @@ pub(crate) fn eval_helper_columns_circuit<F: RichField + Extendable<D>, const D:
     columns: &[Vec<ExtensionTarget<D>>],
     local_values: &[ExtensionTarget<D>],
     next_values: &[ExtensionTarget<D>],
+    public_inputs: &[ExtensionTarget<D>],
     helper_columns: &[ExtensionTarget<D>],
     constraint_degree: usize,
     challenges: &GrandProductChallenge<Target>,
@@ -848,8 +1068,18 @@ pub(crate) fn eval_helper_columns_circuit<F: RichField + Extendable<D>, const D:
                     let combin0 = challenges.combine_circuit(builder, &chunk[0]);
                     let combin1 = challenges.combine_circuit(builder, &chunk[1]);
 
-                    let f0 = fs[0].eval_filter_circuit(builder, local_values, next_values);
-                    let f1 = fs[1].eval_filter_circuit(builder, local_values, next_values);
+                    let f0 = fs[0].eval_filter_circuit(
+                        builder,
+                        local_values,
+                        next_values,
+                        public_inputs,
+                    );
+                    let f1 = fs[1].eval_filter_circuit(
+                        builder,
+                        local_values,
+                        next_values,
+                        public_inputs,
+                    );
 
                     let constr = builder.mul_sub_extension(combin0, h, f0);
                     let constr = builder.mul_extension(constr, combin1);
@@ -860,7 +1090,12 @@ pub(crate) fn eval_helper_columns_circuit<F: RichField + Extendable<D>, const D:
                 }
                 1 => {
                     let combin = challenges.combine_circuit(builder, &chunk[0]);
-                    let f0 = fs[0].eval_filter_circuit(builder, local_values, next_values);
+                    let f0 = fs[0].eval_filter_circuit(
+                        builder,
+                        local_values,
+                        next_values,
+                        public_inputs,
+                    );
                     let constr = builder.mul_sub_extension(combin, h, f0);
                     consumer.constraint(builder, constr);
                 }
@@ -877,6 +1112,7 @@ pub(crate) fn get_helper_cols<F: Field>(
     trace: &[PolynomialValues<F>],
     degree: usize,
     columns_filters: &[ColumnFilter<F>],
+    public_inputs: &[F],
     challenge: GrandProductChallenge<F>,
     constraint_degree: usize,
 ) -> Vec<PolynomialValues<F>> {
@@ -892,13 +1128,15 @@ pub(crate) fn get_helper_cols<F: Field>(
                 .map(|(col, filter)| {
                     // Optimization: for single-element columns, combine([x]) = x + gamma (no beta multiplication)
                     let mut combined = if col.len() == 1 {
-                        let mut col_values = col[0].eval_all_rows(trace);
+                        let mut col_values = col[0].eval_all_rows_with_inputs(trace, public_inputs);
                         col_values.iter_mut().for_each(|v| *v += challenge.gamma);
                         col_values
                     } else {
                         // Multi-element columns: precompute all rows, combine via iterator
-                        let col_all_rows: Vec<Vec<F>> =
-                            col.iter().map(|c| c.eval_all_rows(trace)).collect();
+                        let col_all_rows: Vec<Vec<F>> = col
+                            .iter()
+                            .map(|c| c.eval_all_rows_with_inputs(trace, public_inputs))
+                            .collect();
                         (0..degree)
                             .map(|d| {
                                 challenge
@@ -908,7 +1146,7 @@ pub(crate) fn get_helper_cols<F: Field>(
                     };
 
                     combined = F::batch_multiplicative_inverse(&combined);
-                    let filter_col = filter.eval_all_rows(trace);
+                    let filter_col = filter.eval_all_rows_with_inputs(trace, public_inputs);
                     batch_multiply_inplace(&mut combined, &filter_col);
                     combined
                 })
@@ -924,8 +1162,11 @@ pub(crate) fn get_helper_cols<F: Field>(
     helper_columns
 }
 
+/// Evaluations of the lookup helper columns at a point (or batch of points),
+/// together with the lookup challenges, as needed to check the lookup
+/// argument constraints.
 #[derive(Debug)]
-pub(crate) struct LookupCheckVars<F, FE, P, const D2: usize>
+pub struct LookupCheckVars<F, FE, P, const D2: usize>
 where
     F: Field,
     FE: FieldExtension<D2, BaseField = F>,
@@ -934,6 +1175,23 @@ where
     pub(crate) local_values: Vec<P>,
     pub(crate) next_values: Vec<P>,
     pub(crate) challenges: Vec<F>,
+}
+
+impl<F, FE, P, const D2: usize> LookupCheckVars<F, FE, P, D2>
+where
+    F: Field,
+    FE: FieldExtension<D2, BaseField = F>,
+    P: PackedField<Scalar = FE>,
+{
+    /// Bundles the local and next helper column evaluations with the lookup
+    /// challenges.
+    pub fn new(local_values: Vec<P>, next_values: Vec<P>, challenges: Vec<F>) -> Self {
+        Self {
+            local_values,
+            next_values,
+            challenges,
+        }
+    }
 }
 
 /// Constraints for the logUp lookup argument.
@@ -951,6 +1209,7 @@ pub(crate) fn eval_packed_lookups_generic<F, FE, P, S, const D: usize, const D2:
 {
     let local_values = vars.get_local_values();
     let next_values = vars.get_next_values();
+    let public_inputs = vars.get_public_inputs();
     let degree = stark.constraint_degree();
     let mut start = 0;
     for lookup in lookups {
@@ -960,10 +1219,10 @@ pub(crate) fn eval_packed_lookups_generic<F, FE, P, S, const D: usize, const D2:
         let lookup_columns: Vec<P> = lookup
             .columns
             .iter()
-            .map(|col| col.eval_with_next(local_values, next_values))
+            .map(|col| col.eval_with_next(local_values, next_values, public_inputs))
             .collect();
-        let table_eval = lookup.table_column.eval(local_values);
-        let freq_eval = lookup.frequencies_column.eval(local_values);
+        let table_eval = lookup.table_column.eval(local_values, public_inputs);
+        let freq_eval = lookup.frequencies_column.eval(local_values, public_inputs);
 
         for &challenge in &lookup_vars.challenges {
             let gamma = FE::from_basefield(challenge);
@@ -975,7 +1234,13 @@ pub(crate) fn eval_packed_lookups_generic<F, FE, P, S, const D: usize, const D2:
                 constrain_helper_columns(
                     lookup_columns.len(),
                     |i| lookup_columns[i] + gamma,
-                    |i| lookup.filter_columns[i].eval_filter(local_values, next_values),
+                    |i| {
+                        lookup.filter_columns[i].eval_filter(
+                            local_values,
+                            next_values,
+                            public_inputs,
+                        )
+                    },
                     helper_columns,
                     degree,
                     yield_constr,
@@ -1022,13 +1287,16 @@ pub(crate) fn eval_ext_lookups_circuit<
 
     let local_values = vars.get_local_values();
     let next_values = vars.get_next_values();
+    let public_inputs = vars.get_public_inputs();
     let mut start = 0;
     for lookup in lookups {
         let num_helper_columns = lookup.num_helper_columns(degree);
         let col_values = lookup
             .columns
             .iter()
-            .map(|col| vec![col.eval_with_next_circuit(builder, local_values, next_values)])
+            .map(|col| {
+                vec![col.eval_with_next_circuit(builder, local_values, next_values, public_inputs)]
+            })
             .collect::<Vec<_>>();
 
         for &challenge in &lookup_vars.challenges {
@@ -1043,6 +1311,7 @@ pub(crate) fn eval_ext_lookups_circuit<
                 &col_values,
                 local_values,
                 next_values,
+                public_inputs,
                 &lookup_vars.local_values[start..start + num_helper_columns - 1],
                 degree,
                 &grand_challenge,
@@ -1052,17 +1321,20 @@ pub(crate) fn eval_ext_lookups_circuit<
 
             let z = lookup_vars.local_values[start + num_helper_columns - 1];
             let next_z = lookup_vars.next_values[start + num_helper_columns - 1];
-            let table_column = lookup
-                .table_column
-                .eval_circuit(builder, vars.get_local_values());
+            let table_column =
+                lookup
+                    .table_column
+                    .eval_circuit(builder, vars.get_local_values(), public_inputs);
             let table_with_challenge = builder.add_extension(table_column, challenge);
             let mut y = builder.add_many_extension(
                 &lookup_vars.local_values[start..start + num_helper_columns - 1],
             );
 
-            let frequencies_column = lookup
-                .frequencies_column
-                .eval_circuit(builder, vars.get_local_values());
+            let frequencies_column = lookup.frequencies_column.eval_circuit(
+                builder,
+                vars.get_local_values(),
+                public_inputs,
+            );
             y = builder.mul_extension(y, table_with_challenge);
             y = builder.sub_extension(y, frequencies_column);
 

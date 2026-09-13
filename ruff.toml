@@ -50,12 +50,9 @@ exclude = [
     "dist",
     "node_modules",
     "venv",
-    "**/third_party/cutlass/**",
 ]
 
 [format]
-exclude = ["**/third_party/cutlass/**"]
-
 # Use double quotes for strings
 quote-style = "double"
 
