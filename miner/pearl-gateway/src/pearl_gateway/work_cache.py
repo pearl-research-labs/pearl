@@ -1,11 +1,38 @@
 import asyncio
 import time
+from typing import NamedTuple
 
 from miner_utils import get_logger
 
 from pearl_gateway.comm.dataclasses import BlockTemplate, MiningJob, MiningPausedError
 
 logger = get_logger(__name__)
+
+
+class _TemplateIdentity(NamedTuple):
+    height: int
+    version: int
+    previous_block_hash: bytes
+    merkle_root: bytes
+    target_bits: int
+    required_cert_version: int
+
+
+def _template_identity(template: BlockTemplate) -> _TemplateIdentity:
+    """Fields that make cached miner work materially different.
+
+    Timestamp is omitted because the node refreshes it without regenerating a
+    block template, and updating on every tick would reject in-flight proofs.
+    """
+    header = template.header
+    return _TemplateIdentity(
+        height=template.height,
+        version=header.version,
+        previous_block_hash=header.previous_block_hash,
+        merkle_root=header.merkle_root,
+        target_bits=header.target_bits,
+        required_cert_version=int(template.required_cert_version),
+    )
 
 
 class WorkCache:
@@ -25,11 +52,11 @@ class WorkCache:
         Returns True if template was updated, False if unchanged.
         """
         async with self.lock:
-            is_new = (
-                self.current_template is None
-                or template.header.previous_block_hash
-                != self.current_template.header.previous_block_hash
-            )
+            current_template = self.current_template
+            if current_template is None:
+                is_new = True
+            else:
+                is_new = _template_identity(template) != _template_identity(current_template)
 
             if is_new:
                 logger.info(f"Updating block template to height {template.height}")
