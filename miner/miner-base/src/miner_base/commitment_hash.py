@@ -5,6 +5,27 @@ from pearl_mining import MiningConfiguration
 
 from .matrix_merkle_tree import MatrixMerkleTree
 
+# Domain-separation salts for the V3 (salted noise-seed) certificate derivation:
+SEED_SALT_A = blake3(b"pearl/cert-v3/noise-seed/A").digest()
+SEED_SALT_B = blake3(b"pearl/cert-v3/noise-seed/B").digest()
+
+# root(32) || dim u32 LE(4) || zero padding(28) = one 64-byte BLAKE3 block.
+_BIND_PAD = b"\x00" * 28
+
+
+def _bind_root(merkle_root: bytes, dim: int, salt: bytes) -> bytes:
+    return blake3(merkle_root + dim.to_bytes(4, "little") + _BIND_PAD, key=salt).digest()
+
+
+def bind_root_a(a_merkle_root: bytes, m: int) -> bytes:
+    """V3 salting of A's Merkle root; commits the row count ``m``."""
+    return _bind_root(a_merkle_root, m, SEED_SALT_A)
+
+
+def bind_root_b(b_merkle_root: bytes, n: int) -> bytes:
+    """V3 salting of B's Merkle root; commits the column count ``n``."""
+    return _bind_root(b_merkle_root, n, SEED_SALT_B)
+
 
 class CommitmentHasher:
     """
@@ -22,6 +43,8 @@ class CommitmentHasher:
         B: torch.Tensor,
         incomplete_header_bytes: bytes,
         mining_config: MiningConfiguration,
+        *,
+        salted_dims: tuple[int, int] | None,
     ) -> CommitmentHash:
         key = cls.get_key(incomplete_header_bytes, mining_config)
         merkle_tree_A = MatrixMerkleTree(A, key)
@@ -29,7 +52,9 @@ class CommitmentHasher:
         # We hash B.T because we would like to expose a column strip of B
         merkle_tree_B = MatrixMerkleTree(B.T, key)
 
-        return cls.commitment_hash_from_merkle_roots(merkle_tree_A.root, merkle_tree_B.root, key)
+        return cls.commitment_hash_from_merkle_roots(
+            merkle_tree_A.root, merkle_tree_B.root, key, salted_dims=salted_dims
+        )
 
     @staticmethod
     def get_commitment_B_key(key: bytes, B_merkle_root: bytes) -> bytes:
@@ -60,7 +85,16 @@ class CommitmentHasher:
         *,
         routing_root: bytes | None = None,
         offsets_root: bytes | None = None,
+        salted_dims: tuple[int, int] | None,
     ) -> CommitmentHash:
+        # salted_dims has no default so callers must choose a derivation explicitly:
+        # (m, n) for V3 salted seeds, None for the legacy (V1/V2) chain.
+        # V3 (salted) derivation: salt each root before the MoE routing fold.
+        if salted_dims is not None:
+            m, n = salted_dims
+            A_merkle_root = bind_root_a(A_merkle_root, m)
+            B_merkle_root = bind_root_b(B_merkle_root, n)
+
         moe_args = (routing_root, offsets_root)
         if any(arg is not None for arg in moe_args):
             if any(arg is None for arg in moe_args):

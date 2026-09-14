@@ -58,6 +58,25 @@ log.info(`Platform: ${process.platform}`);
 log.info(`Log file location: ${log.transports.file.getFile().path}`);
 log.info('====================================');
 
+// Enforce a single running instance. Each instance generates its own RPC
+// credentials, so a duplicate launch spawns a wallet process that cannot bind
+// the RPC port and every call to the surviving listener fails with 401.
+if (!app.requestSingleInstanceLock()) {
+  log.info('Pearl Wallet is already running; exiting this duplicate instance.');
+  app.exit(0);
+} else {
+  app.on('second-instance', () => {
+    const existingWindow = BrowserWindow.getAllWindows()[0];
+    if (existingWindow) {
+      if (existingWindow.isMinimized()) {
+        existingWindow.restore();
+      }
+      existingWindow.show();
+      existingWindow.focus();
+    }
+  });
+}
+
 let managerService: ManagerService | null = null;
 let updateService: UpdateService | null = null;
 

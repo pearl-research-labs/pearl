@@ -230,6 +230,11 @@ const (
 	// ErrTimewarpAttack indicates a timewarp attack i.e.
 	// when block's timestamp is too early on diff adjustment block.
 	ErrTimewarpAttack
+
+	// ErrRankPenalty indicates the block certificate violates the rank-penalty
+	// rule: its noise rank is below the minimum, or its jackpot does not meet
+	// the difficulty bound scaled for that rank.
+	ErrRankPenalty
 )
 
 // Map of ErrorCode values back to their constant names for pretty printing.
@@ -278,6 +283,7 @@ var errorCodeStrings = map[ErrorCode]string{
 	ErrPreviousBlockUnknown:      "ErrPreviousBlockUnknown",
 	ErrInvalidAncestorBlock:      "ErrInvalidAncestorBlock",
 	ErrPrevBlockNotBest:          "ErrPrevBlockNotBest",
+	ErrRankPenalty:               "ErrRankPenalty",
 }
 
 // String returns the ErrorCode as a human-readable name.

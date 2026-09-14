@@ -35,6 +35,21 @@ func (c *CertificateV1) BlockHash() chainhash.Hash {
 	return c.Hash
 }
 
+// PublicDataBytes returns the public data bytes for V1 certificates.
+func (c *CertificateV1) PublicDataBytes() []byte {
+	return c.PublicData[:]
+}
+
+// ProofBytes returns the raw ZK proof bytes.
+func (c *CertificateV1) ProofBytes() []byte {
+	return c.ProofData
+}
+
+// IsMoE reports whether the certificate carries a MoE proof (always false for V1).
+func (c *CertificateV1) IsMoE() bool {
+	return false
+}
+
 // ProofCommitment computes SHA256d(CertificateVersion_LE(4) || PublicData(164)).
 func (c *CertificateV1) ProofCommitment() chainhash.Hash {
 	var buf [4 + PublicDataSizeV1]byte

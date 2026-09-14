@@ -2205,6 +2205,37 @@ func deleteBlockHash(ns walletdb.ReadWriteBucket, height int32) error {
 	return nil
 }
 
+// deleteBlockHashesFrom deletes every block hash entry within the syncBucket
+// recorded at or above the given height. The bucket's other keys are all
+// longer than the four byte height keys, so they are left untouched.
+func deleteBlockHashesFrom(ns walletdb.ReadWriteBucket, height int32) error {
+	var heights []int32
+	err := ns.NestedReadWriteBucket(syncBucketName).ForEach(func(k, _ []byte) error {
+		if len(k) != 4 {
+			return nil
+		}
+		if h := int32(binary.BigEndian.Uint32(k)); h >= height {
+			heights = append(heights, h)
+		}
+
+		return nil
+	})
+	if err != nil {
+		errStr := fmt.Sprintf("failed to read hashes at or above height %v", height)
+		return managerError(ErrDatabase, errStr, err)
+	}
+
+	// Delete outside of the iteration, as removing keys through a cursor
+	// mid-walk is not safe.
+	for _, h := range heights {
+		if err := deleteBlockHash(ns, h); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // updateSyncedTo updates the value behind the syncedToName key to the given
 // block.
 func updateSyncedTo(ns walletdb.ReadWriteBucket, bs *BlockStamp) error {

@@ -36,6 +36,10 @@ Wallet clients can use one of two RPC servers:
      (`--experimentalrpclisten`). The gRPC server is documented
      [here](./rpc/documentation/README.md).
 
+For day-to-day use from a terminal, [oystercli](cmd/oystercli/) provides an
+interactive menu-driven client over the JSON-RPC server, including guided
+wallet creation and troubleshooting tools.
+
 ## Requirements
 
 - [Go](https://golang.org) 1.26 or newer
@@ -49,7 +53,7 @@ From the repository root:
 task build:blockchain
 ```
 
-This builds Oyster (along with pearld and prlctl) into `bin/`.
+This builds Oyster (along with pearld, prlctl, and oystercli) into `bin/`.
 
 ## Getting Started
 

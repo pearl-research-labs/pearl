@@ -181,9 +181,7 @@ func (s *Store) unminedTxDetails(ns walletdb.ReadBucket, txHash *chainhash.Hash,
 // TxLabel looks up a transaction label for the txHash provided. If the store
 // has no labels in it, or the specific txHash does not have a label, an empty
 // string and no error are returned.
-func (s *Store) TxLabel(ns walletdb.ReadBucket, txHash chainhash.Hash) (string,
-	error) {
-
+func (s *Store) TxLabel(ns walletdb.ReadBucket, txHash chainhash.Hash) (string, error) {
 	label, err := FetchTxLabel(ns, txHash)
 	switch err {
 	// If there are no saved labels yet (the bucket has not been created) or
@@ -232,9 +230,7 @@ func (s *Store) TxDetails(ns walletdb.ReadBucket, txHash *chainhash.Hash) (*TxDe
 //
 // Not finding a transaction with this hash from this block is not an error.  In
 // this case, a nil TxDetails is returned.
-func (s *Store) UniqueTxDetails(ns walletdb.ReadBucket, txHash *chainhash.Hash,
-	block *Block) (*TxDetails, error) {
-
+func (s *Store) UniqueTxDetails(ns walletdb.ReadBucket, txHash *chainhash.Hash, block *Block) (*TxDetails, error) {
 	if block == nil {
 		v := existsRawUnmined(ns, txHash[:])
 		if v == nil {
@@ -259,8 +255,7 @@ func (s *Store) rangeUnminedTransactions(ns walletdb.ReadBucket, f func([]TxDeta
 	var details []TxDetails
 	err := ns.NestedReadBucket(bucketUnmined).ForEach(func(k, v []byte) error {
 		if len(k) < 32 {
-			str := fmt.Sprintf("%s: short key (expected %d "+
-				"bytes, read %d)", bucketUnmined, 32, len(k))
+			str := fmt.Sprintf("%s: short key (expected %d bytes, read %d)", bucketUnmined, 32, len(k))
 			return storeError(ErrData, str, nil)
 		}
 
@@ -334,8 +329,7 @@ func (s *Store) rangeBlockTransactions(ns walletdb.ReadBucket, begin, end int32,
 			k := keyTxRecord(&txHash, &block.Block)
 			v := existsRawTxRecord(ns, k)
 			if v == nil {
-				str := fmt.Sprintf("missing transaction %v for "+
-					"block %v", txHash, block.Height)
+				str := fmt.Sprintf("missing transaction %v for block %v", txHash, block.Height)
 				return false, storeError(ErrData, str, nil)
 			}
 
@@ -370,9 +364,7 @@ func (s *Store) rangeBlockTransactions(ns walletdb.ReadBucket, begin, end int32,
 // All calls to f are guaranteed to be passed a slice with more than zero
 // elements.  The slice may be reused for multiple blocks, so it is not safe to
 // use it after the loop iteration it was acquired.
-func (s *Store) RangeTransactions(ns walletdb.ReadBucket, begin, end int32,
-	f func([]TxDetails) (bool, error)) error {
-
+func (s *Store) RangeTransactions(ns walletdb.ReadBucket, begin, end int32, f func([]TxDetails) (bool, error)) error {
 	var addedUnmined bool
 	if begin < 0 {
 		brk, err := s.rangeUnminedTransactions(ns, f)
@@ -455,4 +447,19 @@ func (s *Store) PreviousPkScripts(ns walletdb.ReadBucket, rec *TxRecord, block *
 	}
 
 	return pkScripts, nil
+}
+
+// Blocks returns every block the store has recorded transactions for, ordered
+// by ascending height.
+func (s *Store) Blocks(ns walletdb.ReadBucket) ([]Block, error) {
+	var blocks []Block
+	it := makeReadBlockIterator(ns, 0)
+	for it.next() {
+		blocks = append(blocks, it.elem.Block)
+	}
+	if it.err != nil {
+		return nil, it.err
+	}
+
+	return blocks, nil
 }

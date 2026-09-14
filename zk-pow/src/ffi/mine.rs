@@ -4,7 +4,7 @@ use anyhow::Result;
 use primitive_types::U256;
 use rand::Rng;
 
-use crate::api::proof::{IncompleteBlockHeader, MiningConfiguration, PeriodicPattern};
+use crate::api::proof::{IncompleteBlockHeader, MiningConfiguration, PeriodicPattern, SeedDerivation};
 use crate::api::proof_utils::{compute_hash_activations, compute_jackpot_hash};
 use crate::api::sanity_checks::extract_difficulty_bound;
 use crate::circuit::pearl_noise::compute_noise_for_indices;
@@ -25,6 +25,7 @@ pub fn try_mine_one<R: Rng>(
     config: MiningConfiguration,
     signal_range: Option<(i8, i8)>,
     wrong_jackpot_hash: bool,
+    seed_derivation: SeedDerivation,
 ) -> Result<Option<PlainProof>> {
     let rank = config.rank as usize;
     let (signal_min, signal_max) = signal_range.unwrap_or((SIGNAL_MIN, SIGNAL_MAX));
@@ -45,7 +46,15 @@ pub fn try_mine_one<R: Rng>(
 
     let a_row_major = pearl_blake3::pad_to_chunk_boundary(&flatten_matrix(&a_matrix));
     let b_col_major = pearl_blake3::pad_to_chunk_boundary(&flatten_matrix(&b_transposed));
-    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major);
+    let (b_noise_seed, a_noise_seed, _) = compute_commitment_hash_with_offsets(
+        &job_key,
+        &a_row_major,
+        &b_col_major,
+        None,
+        seed_derivation,
+        m as u32,
+        n as u32,
+    );
 
     // Compute noise using shared implementation from pearl_noise
     let a_all_rows: Vec<usize> = (0..m).collect();
@@ -128,10 +137,21 @@ pub fn try_mine_one_moe<R: Rng>(
     config: MiningConfiguration,
     signal_range: Option<(i8, i8)>,
     wrong_jackpot_hash: bool,
+    seed_derivation: SeedDerivation,
 ) -> Result<Option<PlainProof>> {
     // If we are in the non-moe case, mine via the original function.
     if config.moe.is_none() {
-        return try_mine_one(rng, m, n, k, header, config, signal_range, wrong_jackpot_hash);
+        return try_mine_one(
+            rng,
+            m,
+            n,
+            k,
+            header,
+            config,
+            signal_range,
+            wrong_jackpot_hash,
+            seed_derivation,
+        );
     }
 
     let moe_cfg = config.moe.unwrap();
@@ -182,8 +202,15 @@ pub fn try_mine_one_moe<R: Rng>(
         }
     }
 
-    let (b_noise_seed, a_noise_seed, routing_end_offsets) =
-        compute_commitment_hash_with_offsets(&job_key, &a_row_major, &b_col_major, Some(&routing[..]));
+    let (b_noise_seed, a_noise_seed, routing_end_offsets) = compute_commitment_hash_with_offsets(
+        &job_key,
+        &a_row_major,
+        &b_col_major,
+        Some(&routing[..]),
+        seed_derivation,
+        m as u32,
+        n as u32,
+    );
 
     // Compute noise using shared implementation from pearl_noise
     let a_all_rows: Vec<usize> = (0..m).collect();
@@ -298,17 +325,29 @@ pub fn mine(
     config: MiningConfiguration,
     signal_range: Option<(i8, i8)>,
     wrong_jackpot_hash: bool,
+    seed_derivation: SeedDerivation,
 ) -> Result<PlainProof> {
     let mut rng = rand::rng();
 
     loop {
-        let proof = try_mine_one(&mut rng, m, n, k, header, config, signal_range, wrong_jackpot_hash)?;
+        let proof = try_mine_one(
+            &mut rng,
+            m,
+            n,
+            k,
+            header,
+            config,
+            signal_range,
+            wrong_jackpot_hash,
+            seed_derivation,
+        )?;
         if let Some(proof) = proof {
             return Ok(proof);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn mine_moe(
     m: usize,
     n: usize,
@@ -317,11 +356,22 @@ pub fn mine_moe(
     config: MiningConfiguration,
     signal_range: Option<(i8, i8)>,
     wrong_jackpot_hash: bool,
+    seed_derivation: SeedDerivation,
 ) -> Result<PlainProof> {
     let mut rng = rand::rng();
 
     loop {
-        let proof = try_mine_one_moe(&mut rng, m, n, k, header, config, signal_range, wrong_jackpot_hash)?;
+        let proof = try_mine_one_moe(
+            &mut rng,
+            m,
+            n,
+            k,
+            header,
+            config,
+            signal_range,
+            wrong_jackpot_hash,
+            seed_derivation,
+        )?;
         if let Some(proof) = proof {
             return Ok(proof);
         }
@@ -385,21 +435,22 @@ fn compute_job_key(header: &IncompleteBlockHeader, config: &MiningConfiguration)
     blake3_digest(&data, None)
 }
 
-fn compute_commitment_hash(job_key: &[u8; 32], a_row_major: &[u8], b_col_major: &[u8]) -> ([u8; 32], [u8; 32]) {
-    let (b_seed, a_seed, _) = compute_commitment_hash_with_offsets(job_key, a_row_major, b_col_major, None);
-
-    (b_seed, a_seed)
-}
-
 type MoECaseOutputs = ([u8; 32], [u8; 32], Vec<u32>);
+/// Miner-side noise-seed derivation; must match `PublicProofParams::commitment_hash`
+/// (MoE: A is salted before the routing fold, `n` is the per-expert dimension).
+#[allow(clippy::too_many_arguments)]
 fn compute_commitment_hash_with_offsets(
     job_key: &[u8; 32],
     a_row_major: &[u8],
     b_col_major: &[u8],
     opt_routing: Option<&[Vec<u32>]>,
+    seed_derivation: SeedDerivation,
+    m: u32,
+    n: u32,
 ) -> MoECaseOutputs {
-    let hash_a = blake3_digest(a_row_major, Some(*job_key));
-    let hash_b = blake3_digest(b_col_major, Some(*job_key));
+    let raw_hash_a = blake3_digest(a_row_major, Some(*job_key));
+    let raw_hash_b = blake3_digest(b_col_major, Some(*job_key));
+    let (hash_a, hash_b) = seed_derivation.bind_roots(&raw_hash_a, &raw_hash_b, m, n);
 
     let (hash_activations, routing_offsets) = match opt_routing {
         Some(r) => {
@@ -546,14 +597,22 @@ mod tests {
         let b_col_major = pearl_blake3::pad_to_chunk_boundary(&[2u8; 100]);
 
         // Miner side.
-        let (b_mine, a_mine, offsets) =
-            compute_commitment_hash_with_offsets(&job_key, &a_row_major, &b_col_major, Some(&routing));
+        let (b_mine, a_mine, offsets) = compute_commitment_hash_with_offsets(
+            &job_key,
+            &a_row_major,
+            &b_col_major,
+            Some(&routing),
+            SeedDerivation::Legacy,
+            0,
+            0,
+        );
 
         // Verifier side: take `hash_routing` from the actual routing Merkle proof root
         // (what the wire carries), then recompute the seeds via the canonical path.
         let hash_routing = build_routing_proof(&routing, &job_key, 1, &[0]).proof.root;
         let params = PublicProofParams {
             block_header: IncompleteBlockHeader::new_for_test(0x207FFFFF),
+            seed_derivation: SeedDerivation::Legacy,
             mining_config: MiningConfiguration {
                 common_dim: 1024,
                 rank: 32,
@@ -602,7 +661,7 @@ mod tests {
             cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105]).unwrap(),
             moe: Some(MoEConfig { e: e as u16, top_k: 1 }),
         };
-        let proof = mine_moe(m, n, k as usize, header, config, None, false).unwrap();
-        verify_plain_proof(&header, &proof, None).unwrap();
+        let proof = mine_moe(m, n, k as usize, header, config, None, false, SeedDerivation::Legacy).unwrap();
+        verify_plain_proof(&header, &proof, None, SeedDerivation::Legacy).unwrap();
     }
 }

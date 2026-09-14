@@ -1,0 +1,15 @@
+# BuildKit per-Dockerfile ignore: trims the monorepo build context for this
+# image only, without affecting other images built from the repo root.
+# Only go.mod/go.sum and Go sources matter to this build (no go:embed in the
+# repo); excluding test data and non-Go subprojects avoids spurious rebuilds.
+.git
+**/.DS_Store
+**/*.md
+**/*_test.go
+**/testdata/
+node/txscript/data/
+apps/
+docs/
+plonky2/
+py-pearl-mining/
+uv.lock

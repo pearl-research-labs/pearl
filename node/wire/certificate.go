@@ -31,6 +31,9 @@ Version-first design enables polymorphic decoding:
 	  PublicData: committed public fields (variable-length, up to PublicDataMaxSizeV2)
 	  ProofData: Plonky2 proof bytes
 
+	CertificateV3: identical layout to CertificateV2; the version selects the
+	  salted noise-seed derivation.
+
 KEY DESIGN: SYMMETRIC SERIALIZATION
 
 Certificate types implement perfectly mirrored Serialize/Deserialize methods:
@@ -40,8 +43,9 @@ Certificate types implement perfectly mirrored Serialize/Deserialize methods:
 
 # NETWORK RESTRICTIONS
 
-CertificateVersionV1 and CertificateVersionV2 are allowed. IsCertVersionAllowed(v)
-returns true for both. blockchain.checkBlockSanity also validates via IsCertVersionAllowed.
+CertificateVersionV1, CertificateVersionV2 and CertificateVersionV3 are allowed.
+IsCertVersionAllowed(v) returns true for all three. blockchain.checkBlockSanity
+also validates via IsCertVersionAllowed.
 
 # GENESIS BLOCKS
 
@@ -77,6 +81,7 @@ const (
 	CertificateVersionNull CertificateVersion = 0
 	CertificateVersionV1   CertificateVersion = 1
 	CertificateVersionV2   CertificateVersion = 2
+	CertificateVersionV3   CertificateVersion = 3
 )
 
 // BlockCertificate is the interface that all certificate types must implement.
@@ -91,6 +96,15 @@ type BlockCertificate interface {
 	// SHA256d(CertificateVersion_LE(4) || PublicData)
 	ProofCommitment() chainhash.Hash
 
+	// PublicDataBytes returns the meaningful public data bytes.
+	PublicDataBytes() []byte
+
+	// ProofBytes returns the raw ZK proof bytes.
+	ProofBytes() []byte
+
+	// IsMoE reports whether the certificate carries a MoE proof.
+	IsMoE() bool
+
 	// Serialize writes certificate fields (excludes version - handled by MsgCertificate).
 	Serialize(w io.Writer) error
 
@@ -103,7 +117,12 @@ type BlockCertificate interface {
 
 // IsCertVersionAllowed reports whether certificate version v is permitted.
 func IsCertVersionAllowed(v CertificateVersion) bool {
-	return v == CertificateVersionV1 || v == CertificateVersionV2
+	switch v {
+	case CertificateVersionV1, CertificateVersionV2, CertificateVersionV3:
+		return true
+	default:
+		return false
+	}
 }
 
 // MsgCertificate wraps a BlockCertificate and handles polymorphic
@@ -150,6 +169,9 @@ func (m *MsgCertificate) PrlDecode(r io.Reader, pver uint32) error {
 
 	case CertificateVersionV2:
 		m.Certificate = &CertificateV2{}
+
+	case CertificateVersionV3:
+		m.Certificate = &CertificateV3{}
 
 	default:
 		return fmt.Errorf("unsupported certificate version: %d", version)

@@ -156,6 +156,11 @@ __device__ __constant__ constexpr CompressParams
         .counter = 0,
         .block_len = MSG_BLOCK_SIZE,
         .flags = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT};
+// Unkeyed compression for a single 64-byte message block.
+__device__ __constant__ constexpr CompressParams COMPRESS_PARAMS_SINGLE_BLOCK =
+    {.counter = 0,
+     .block_len = MSG_BLOCK_SIZE,
+     .flags = CHUNK_START | CHUNK_END | ROOT};
 
 CUTLASS_DEVICE
 u32 add32(u32 x, u32 y) {

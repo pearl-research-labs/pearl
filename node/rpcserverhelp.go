@@ -255,6 +255,7 @@ var helpDescsEnUS = map[string]string{
 	"getblockverboseresult-previousblockhash": "The hash of the previous block",
 	"getblockverboseresult-nextblockhash":     "The hash of the next block (only if there is one)",
 	"getblockverboseresult-strippedsize":      "The size of the block without witness data",
+	"getblockverboseresult-proofcommitment":   "The proof commitment of the block",
 
 	// GetBlockCountCmd help.
 	"getblockcount--synopsis": "Returns the number of blocks in the longest block chain.",
@@ -286,6 +287,7 @@ var helpDescsEnUS = map[string]string{
 	"getblockheaderverboseresult-proofofwork":       "The proof-of-work of the block",
 	"getblockheaderverboseresult-previousblockhash": "The hash of the previous block",
 	"getblockheaderverboseresult-nextblockhash":     "The hash of the next block (only if there is one)",
+	"getblockheaderverboseresult-proofcommitment":   "The proof commitment of the block",
 
 	// TemplateRequest help.
 	"templaterequest-mode":         "This is 'template', 'proposal', or omitted",
@@ -333,7 +335,7 @@ var helpDescsEnUS = map[string]string{
 	"getblocktemplateresult-capabilities":               "List of server capabilities including 'proposal' to indicate support for block proposals",
 	"getblocktemplateresult-reject-reason":              "Reason the proposal was invalid as-is (only applies to proposal responses)",
 	"getblocktemplateresult-default_witness_commitment": "The witness commitment itself. Will be populated if the block has witness data",
-	"getblocktemplateresult-requiredcertversion":        "Certificate version a block built on this template must carry under the MoE hardfork cutover (1 before the activation height, 2 at and after)",
+	"getblocktemplateresult-requiredcertversion":        "Certificate version a block built on this template must carry at its height under the hardfork cutovers (1 before the MoE fork, 2 at and after it, 3 at and after the salted-seed fork)",
 
 	// GetBlockTemplateCmd help.
 	"getblocktemplate--synopsis": "Returns a JSON object with information necessary to construct a block to mine or accepts a proposal to validate.\n" +
@@ -595,7 +597,7 @@ var helpDescsEnUS = map[string]string{
 	"searchrawtransactions--condition0": "verbose=0",
 	"searchrawtransactions--condition1": "verbose=1",
 	"searchrawtransactions-skip":        "The number of leading transactions to leave out of the final response",
-	"searchrawtransactions-count":       "The maximum number of transactions to return",
+	"searchrawtransactions-count":       "The maximum number of transactions to return (must not exceed 10000)",
 	"searchrawtransactions-vinextra":    "Specify that extra data from previous output will be returned in vin",
 	"searchrawtransactions-reverse":     "Specifies that the transactions should be returned in reverse chronological order",
 	"searchrawtransactions-filteraddrs": "Address list.  Only inputs or outputs with matching address will be returned",

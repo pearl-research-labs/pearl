@@ -2,6 +2,7 @@ from contextlib import AbstractContextManager
 from types import TracebackType
 
 from miner_utils import get_logger
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gateway.comm.json_rpc_client import JSONRPCClient
 from pearl_gateway.config import MinerRpcConfig
@@ -67,4 +68,4 @@ class DummyMiningClient(MiningClient):
         self.client = DummyRPCClient()
 
     def get_mining_info(self) -> MiningJob:
-        return MiningJob(b"\xde\xad\xba\xbe" * 8, 1)
+        return MiningJob(b"\xde\xad\xba\xbe" * 8, 1, cert_version=CertificateVersion.ZK_MOE)

@@ -69,6 +69,57 @@ func (m *Manager) SetSyncedTo(ns walletdb.ReadWriteBucket, bs *BlockStamp) error
 	return nil
 }
 
+// Rollback rewinds the manager to the given block, discarding the hashes it
+// recorded above it along with the branch they belonged to. A birthday block
+// that is no longer part of that chain is moved back to the same block, so the
+// next sync locates a new one.
+//
+// Unlike SetSyncedTo, the preceding block's hash is not required to be known.
+// A rollback may legitimately target a height whose ancestors the manager has
+// already pruned, which is not the discontinuity that check guards against.
+func (m *Manager) Rollback(ns walletdb.ReadWriteBucket, bs *BlockStamp) error {
+	m.syncStateMtx.Lock()
+	defer m.syncStateMtx.Unlock()
+
+	if err := deleteBlockHashesFrom(ns, bs.Height+1); err != nil {
+		return err
+	}
+	if err := addBlockHash(ns, bs.Height, bs.Hash); err != nil {
+		return err
+	}
+	if err := updateSyncedTo(ns, bs); err != nil {
+		return err
+	}
+
+	if err := m.rollbackBirthday(ns, bs); err != nil {
+		return err
+	}
+
+	// Assigned last so that a failure above, which rolls back the caller's
+	// transaction, cannot leave this ahead of what the database holds.
+	m.syncState.syncedTo = *bs
+
+	return nil
+}
+
+// rollbackBirthday moves a birthday block that is no longer part of the chain
+// back to the given block, so that the next sync locates a new one.
+func (m *Manager) rollbackBirthday(ns walletdb.ReadWriteBucket, bs *BlockStamp) error {
+	birthday, err := FetchBirthdayBlock(ns)
+	if IsError(err, ErrBirthdayBlockNotSet) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if bs.Height > birthday.Height || bs.Hash == birthday.Hash {
+		return nil
+	}
+
+	return m.SetBirthdayBlock(ns, *bs, true)
+}
+
 // SyncedTo returns details about the block height and hash that the address
 // manager is synced through at the very least.  The intention is that callers
 // can use this information for intelligently initiating rescans to sync back to

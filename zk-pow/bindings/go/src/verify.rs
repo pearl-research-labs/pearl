@@ -7,7 +7,8 @@ use std::os::raw::c_char;
 use std::slice;
 
 use crate::common::MAX_ZK_PROOF_SIZE;
-use zk_pow::api::proof::{IncompleteBlockHeader, PublicProofParams, ZKProof};
+use zk_pow::api::proof::{IncompleteBlockHeader, PublicProofParams, SeedDerivation, ZKProof};
+use zk_pow::api::sanity_checks;
 use zk_pow::api::verify;
 
 use crate::common::{acquire_cache, catch_panic, set_error_msg, CZKProof};
@@ -26,6 +27,7 @@ unsafe fn verify_zk_proof_inner(
     block_header: *const IncompleteBlockHeader,
     zk_proof: *const CZKProof,
     nbits_override: Option<u32>,
+    seed_derivation: SeedDerivation,
     error_msg_out: *mut c_char,
 ) -> i32 {
     // Wrap in catch_unwind to prevent panics from crossing FFI boundary
@@ -57,7 +59,7 @@ unsafe fn verify_zk_proof_inner(
 
         let plonky2_proof = slice::from_raw_parts(zk_proof_ref.proof_blob, zk_proof_ref.proof_blob_len);
         let public_data = &zk_proof_ref.public_data[..zk_proof_ref.public_data_len];
-        let (params, zk_proof) = match ZKProof::deserialize(*block_header, public_data, plonky2_proof) {
+        let (params, zk_proof) = match ZKProof::deserialize(*block_header, seed_derivation, public_data, plonky2_proof) {
             Ok(r) => r,
             Err(e) => {
                 set_error_msg(error_msg_out, &format!("{}", e));
@@ -116,7 +118,7 @@ pub unsafe extern "C" fn verify_zk_proof_v2(
     zk_proof: *const CZKProof,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    verify_zk_proof_inner(block_header, zk_proof, None, error_msg_out)
+    verify_zk_proof_inner(block_header, zk_proof, None, SeedDerivation::Legacy, error_msg_out)
 }
 
 /// Verify a ZK proof against public parameters, overriding the difficulty with the given nbits.
@@ -140,7 +142,97 @@ pub unsafe extern "C" fn verify_zk_proof_v2_with_nbits(
     nbits_override: u32,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    verify_zk_proof_inner(block_header, zk_proof, Some(nbits_override), error_msg_out)
+    verify_zk_proof_inner(
+        block_header,
+        zk_proof,
+        Some(nbits_override),
+        SeedDerivation::Legacy,
+        error_msg_out,
+    )
+}
+
+/// `verify_zk_proof_v2` with the salted (V3) noise-seed derivation.
+#[no_mangle]
+pub unsafe extern "C" fn verify_zk_proof_v3(
+    block_header: *const IncompleteBlockHeader,
+    zk_proof: *const CZKProof,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    verify_zk_proof_inner(block_header, zk_proof, None, SeedDerivation::Salted, error_msg_out)
+}
+
+/// `verify_zk_proof_v3` with the difficulty from `nbits_override`.
+#[no_mangle]
+pub unsafe extern "C" fn verify_zk_proof_v3_with_nbits(
+    block_header: *const IncompleteBlockHeader,
+    zk_proof: *const CZKProof,
+    nbits_override: u32,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    verify_zk_proof_inner(
+        block_header,
+        zk_proof,
+        Some(nbits_override),
+        SeedDerivation::Salted,
+        error_msg_out,
+    )
+}
+
+/// Check wire `public_data` against the rank-penalty rule.
+///
+/// # Returns
+/// - 0: rule satisfied
+/// - 1: rule violated (the block must be rejected)
+/// - 2: System error (could not run the check)
+///
+/// # Safety
+/// - `public_data` must be a valid pointer to `public_data_len` bytes
+/// - `error_msg_out` must be null or a valid pointer to a caller-allocated buffer of `ERROR_MSG_MAX_SIZE` bytes
+#[no_mangle]
+pub unsafe extern "C" fn check_rank_penalty(
+    nbits: u32,
+    public_data: *const u8,
+    public_data_len: usize,
+    error_msg_out: *mut c_char,
+) -> i32 {
+    let result = catch_panic(|| {
+        if public_data.is_null() {
+            set_error_msg(error_msg_out, "Null pointer");
+            return 2;
+        }
+        if !PublicProofParams::is_valid_wire_size(public_data_len) {
+            set_error_msg(error_msg_out, &format!("invalid public_data_len {}", public_data_len));
+            return 1;
+        }
+
+        let public_data = slice::from_raw_parts(public_data, public_data_len);
+        let (mining_config, hash_jackpot) = match PublicProofParams::mining_config_and_jackpot_from_wire_bytes(public_data) {
+            Ok(fields) => fields,
+            Err(e) => {
+                set_error_msg(error_msg_out, &format!("{}", e));
+                return 1;
+            }
+        };
+
+        match sanity_checks::check_rank_penalty(&mining_config, &hash_jackpot, nbits) {
+            Ok(()) => {
+                set_error_msg(error_msg_out, "Rank penalty rule satisfied");
+                0
+            }
+            Err(e) => {
+                set_error_msg(error_msg_out, &format!("{}", e));
+                1
+            }
+        }
+    });
+
+    match result {
+        Ok(code) => code,
+        Err(panic_msg) => {
+            set_error_msg(error_msg_out, &format!("Internal panic: {}", panic_msg));
+            2
+        }
+    }
 }
 
 /// Verify a V1 (version 1, master-format) ZK proof.

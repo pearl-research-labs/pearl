@@ -1038,6 +1038,14 @@ func readScriptBuf(r io.Reader, pver uint32, buf, s []byte,
 		return nil, messageError("readScript", str)
 	}
 
+	if count > uint64(len(s)) {
+		// s is a suffix of the original script buffer; each entry is read into
+		// the front of s, so len(s) reflects the remaining capacity.
+		str := fmt.Sprintf("%s size exceeds remaining script buffer "+
+			"[count %d, remaining %d]", fieldName, count, len(s))
+		return nil, messageError("readScript", str)
+	}
+
 	_, err = io.ReadFull(r, s[:count])
 	if err != nil {
 		return nil, err

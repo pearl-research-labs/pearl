@@ -6,6 +6,7 @@
 #include <torch/python.h>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 // Include only the host function declaration
 #include "blake3/blake3_constants.hpp"
@@ -23,6 +24,15 @@ constexpr size_t DEFAULT_LEAVES_PER_MT_BLOCK = 512;  // compute_blake_mt_kernel
 // merkle_tree_roots_kernel builds a TMA descriptor over `data`;
 // cuTensorMapEncodeTiled requires the global address to be 16-byte aligned.
 constexpr uintptr_t TMA_GLOBAL_ALIGNMENT_BYTES = 16;
+
+// V3 salting writes the matrix dimension into the hashed block as a u32.
+constexpr int64_t MAX_SALTED_DIM = std::numeric_limits<uint32_t>::max();
+
+uint32_t to_salted_dim(int64_t dim, const char* name) {
+  TORCH_CHECK(dim > 0 && dim <= MAX_SALTED_DIM, name, " must be in [1, ",
+              MAX_SALTED_DIM, "], got ", dim);
+  return static_cast<uint32_t>(dim);
+}
 
 size_t get_required_scratchpad_bytes(
     size_t matrix_bytes, size_t threads_per_block = DEFAULT_THREADS_PER_BLOCK) {
@@ -111,17 +121,15 @@ void run_tensor_hash(
               roots.data_ptr<uint8_t>(), *dprops, stream);
 }
 
-// Computes both A and B commitment hashes from their merkle roots
-// Should be the same as commitment_hash_from_merkle_roots from Commitment_hash.py
-//
-// routing_root and offsets_hash are optional. When both are provided the MoE
-// routing commitment is folded into A's seed (see the kernel); they must be
-// supplied together or not at all (the dense case passes neither).
+// Computes both commitment hashes from their Merkle roots.
+// Optional routing inputs and V3 dimensions must each be supplied as a pair.
 void run_commitment_hash_from_merkle_roots(
     at::Tensor& A_merkle_root, at::Tensor& B_merkle_root, at::Tensor& key,
     at::Tensor& A_commitment_hash, at::Tensor& B_commitment_hash,
     std::optional<at::Tensor> routing_root = std::nullopt,
-    std::optional<at::Tensor> offsets_hash = std::nullopt) {
+    std::optional<at::Tensor> offsets_hash = std::nullopt,
+    std::optional<int64_t> salted_dim_a = std::nullopt,
+    std::optional<int64_t> salted_dim_b = std::nullopt) {
   CHECK_DEVICE(A_merkle_root);
   CHECK_DEVICE(B_merkle_root);
   CHECK_DEVICE(key);
@@ -182,6 +190,17 @@ void run_commitment_hash_from_merkle_roots(
     offsets_hash_ptr = offsets_hash_tensor.data_ptr<uint8_t>();
   }
 
+  TORCH_CHECK(salted_dim_a.has_value() == salted_dim_b.has_value(),
+              "salted_dim_a and salted_dim_b must be provided together");
+
+  const bool apply_salt = salted_dim_a.has_value();
+  uint32_t salted_dim_a_u32 = 0;
+  uint32_t salted_dim_b_u32 = 0;
+  if (apply_salt) {
+    salted_dim_a_u32 = to_salted_dim(salted_dim_a.value(), "salted_dim_a");
+    salted_dim_b_u32 = to_salted_dim(salted_dim_b.value(), "salted_dim_b");
+  }
+
   auto stream = at::cuda::getCurrentCUDAStream();
   auto dprops = at::cuda::getCurrentDeviceProperties();
 
@@ -189,7 +208,7 @@ void run_commitment_hash_from_merkle_roots(
       A_merkle_root.data_ptr<uint8_t>(), B_merkle_root.data_ptr<uint8_t>(),
       key.data_ptr<uint8_t>(), A_commitment_hash.data_ptr<uint8_t>(),
       B_commitment_hash.data_ptr<uint8_t>(), routing_root_ptr, offsets_hash_ptr,
-      *dprops, stream);
+      apply_salt, salted_dim_a_u32, salted_dim_b_u32, *dprops, stream);
 }
 
 #undef CHECK_DEVICE

@@ -105,8 +105,11 @@ def test_expert_mining_mask_keeps_global_nk_thresholds(
     monkeypatch.setenv(_EXPERT_LOCAL_MIN_M_ENV, "1024")
     layout = _FakeRoutingLayout([2048, 2048])
 
-    assert PearlMoEExperts._expert_mining_mask(layout, n=1023, k=1024) == [False, False]
-    assert PearlMoEExperts._expert_mining_mask(layout, n=1024, k=1023) == [False, False]
+    gate = pearl_config.matrix_multiplication_config["use_simplified_gemm"]
+    min_n, min_k = int(gate["min_n"]), int(gate["min_k"])
+    assert PearlMoEExperts._expert_mining_mask(layout, n=min_n - 1, k=min_k) == [False, False]
+    assert PearlMoEExperts._expert_mining_mask(layout, n=min_n, k=min_k - 1) == [False, False]
+    assert PearlMoEExperts._expert_mining_mask(layout, n=min_n, k=min_k) == [True, True]
 
 
 def test_all_cold_apply_uses_grouped_vanilla_without_preparing_noising(
@@ -190,3 +193,63 @@ def test_all_cold_apply_uses_grouped_vanilla_without_preparing_noising(
     grouped_gemm.assert_called_once()
     apply_per_expert.assert_not_called()
     prepare_noising.assert_not_called()
+
+
+@pytest.mark.parametrize("salted", [False, True])
+@pytest.mark.parametrize("reuse_layout", [False, True])
+def test_noising_keeps_protocol_salt_with_reused_routing(
+    monkeypatch: pytest.MonkeyPatch, salted: bool, reuse_layout: bool
+) -> None:
+    import vllm_miner.moe_gemm_operators as operators
+
+    layout = operators.MoERoutingLayout.from_kernel_outputs(
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([1, 2], dtype=torch.int32),
+        num_experts=2,
+        top_k=1,
+    )
+    build_layout = Mock(return_value=layout)
+    commitment = Mock()
+    job = SimpleNamespace(
+        cert_version=SimpleNamespace(uses_salted_seeds=salted),
+        incomplete_header_bytes=b"header",
+        adjust_target=lambda **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        operators, "get_async_manager", lambda: SimpleNamespace(get_mining_job=lambda: job)
+    )
+    monkeypatch.setattr(
+        operators,
+        "GPUMatmulConfigFactory",
+        SimpleNamespace(create=lambda **kwargs: SimpleNamespace(mining_config=None)),
+    )
+    monkeypatch.setattr(
+        operators, "CommitmentHasher", SimpleNamespace(get_key=lambda *args: bytes(32))
+    )
+    monkeypatch.setattr(
+        operators, "make_pow_target_tensor", lambda target: torch.zeros(8, dtype=torch.uint32)
+    )
+    monkeypatch.setattr(operators, "_hash_2d", lambda *args: torch.zeros(32, dtype=torch.uint8))
+    monkeypatch.setattr(operators, "build_moe_routing_layout", build_layout)
+    monkeypatch.setattr(operators, "commitment_hash_from_merkle_roots", commitment)
+    monkeypatch.setattr(
+        operators, "generate_noise_factors", lambda *args: tuple(torch.empty(1) for _ in range(8))
+    )
+
+    context = operators.prepare_moe_noising(
+        torch.zeros((2, 4), dtype=torch.int8),
+        torch.ones((2, 1)),
+        torch.tensor([[0], [1]], dtype=torch.int32),
+        torch.zeros((6, 4), dtype=torch.int8),
+        num_experts=2,
+        routing_layout=layout if reuse_layout else None,
+    )
+    assert context.routing_layout is layout
+    assert context.routing_data is layout.token_indices
+    commitment.assert_called_once()
+    assert commitment.call_args.kwargs["salted_dims"] == ((2, 3) if salted else None)
+    if reuse_layout:
+        build_layout.assert_not_called()
+    else:
+        build_layout.assert_called_once()

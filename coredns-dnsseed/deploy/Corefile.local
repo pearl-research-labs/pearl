@@ -3,8 +3,8 @@
         network regtest
         bootstrap_peers 127.0.0.1:18444
         crawl_interval 2m
-        record_ttl 30
     }
     log
     health :8180
+    ready :8181
 }

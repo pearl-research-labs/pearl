@@ -99,7 +99,7 @@ class TestTensorHash:
         cuda_result_A = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
         cuda_result_B = torch.empty(blake3.digest_size, dtype=torch.uint8, device="cuda")
         commitment_hash_from_merkle_roots(
-            A_merkle_root, B_merkle_root, key, cuda_result_A, cuda_result_B
+            A_merkle_root, B_merkle_root, key, cuda_result_A, cuda_result_B, salted_dims=None
         )
         torch.cuda.synchronize()
 
@@ -142,6 +142,7 @@ class TestTensorHash:
             cuda_result_B,
             routing_root=routing_root,
             offsets_hash=offsets_hash,
+            salted_dims=None,
         )
         torch.cuda.synchronize()
 
@@ -151,6 +152,7 @@ class TestTensorHash:
             key.cpu().numpy().tobytes(),
             routing_root=routing_root.cpu().numpy().tobytes(),
             offsets_root=offsets_root,
+            salted_dims=None,
         )
 
         assert cuda_result_A.cpu().numpy().tobytes() == reference.noise_seed_A, (

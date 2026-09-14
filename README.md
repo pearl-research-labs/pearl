@@ -19,7 +19,7 @@ system, vLLM miner, and supporting tools.
 | Directory | Description |
 |-----------|-------------|
 | [`node/`](node/) | **pearld** — reference implementation of the Pearl Protocol (full node) |
-| [`wallet/`](wallet/) | **Oyster** — HD wallet daemon with JSON-RPC and gRPC interfaces |
+| [`wallet/`](wallet/) | **Oyster** — HD wallet daemon with JSON-RPC and gRPC interfaces, plus [**oystercli**](wallet/cmd/oystercli/), an interactive terminal client for it |
 | [`spv/`](spv/) | **Pearl light client** — privacy-preserving SPV client using compact block filters |
 | [`dnsseeder/`](dnsseeder/) | DNS seeder for the Pearl network |
 | [`coredns-dnsseed/`](coredns-dnsseed/) | CoreDNS plugin — production DNS seeder |
@@ -32,6 +32,35 @@ system, vLLM miner, and supporting tools.
 | [`py-pearl-mining/`](py-pearl-mining/) | Python bindings for Pearl mining (Rust/PyO3) |
 | [`apps/`](apps/) | Frontend applications (website, desktop wallet — pnpm/Turborepo) |
 | [`tools/`](tools/) | Go development tool dependencies |
+
+## Install (prebuilt binaries)
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.sh | sh
+```
+
+Windows:
+
+```powershell
+irm https://raw.githubusercontent.com/pearl-research-labs/pearl/master/install.ps1 | iex
+```
+
+Installs `pearld`, `prlctl`, `oyster`, and `oystercli` with localhost-only mainnet defaults and
+shared RPC credentials (oyster uses SPV by default). Binaries go to
+`${XDG_BIN_HOME:-$HOME/.local/bin}` on macOS/Linux, or `%LOCALAPPDATA%\Pearl\bin`
+on Windows.
+
+| Tool | Linux | macOS | Windows |
+|------|-------|-------|---------|
+| pearld | `~/.pearld/pearld.conf` | `~/Library/Application Support/Pearld/pearld.conf` | `%LOCALAPPDATA%\Pearld\pearld.conf` |
+| oyster | `~/.oyster/oyster.conf` | `~/Library/Application Support/Oyster/oyster.conf` | `%LOCALAPPDATA%\Oyster\oyster.conf` |
+| prlctl | `~/.prlctl/prlctl.conf` | `~/Library/Application Support/Prlctl/prlctl.conf` | `%LOCALAPPDATA%\Prlctl\prlctl.conf` |
+
+Pin a version or install directory with `--version` / `--bin-dir` (or `-Version` /
+`-BinDir` on Windows). See [node/docs/installation.md](node/docs/installation.md)
+for upgrade, removal, and other details. To build from source, see **Building** below.
 
 ## Prerequisites
 
@@ -46,7 +75,7 @@ system, vLLM miner, and supporting tools.
 
 ```bash
 task build              # build everything (blockchain + vLLM miner)
-task build:blockchain   # pearld, prlctl, oyster → bin/
+task build:blockchain   # pearld, prlctl, oyster, oystercli → bin/
 task build:miner        # install vLLM miner Python packages
 task build:pearld       # pearld only
 ```
@@ -56,6 +85,17 @@ task build:pearld       # pearld only
 The setup flow: **build** > **create wallet** > **start node** > **start vLLM miner**.
 
 ### 1. Create a wallet and get a mining address
+
+The interactive way — [`oystercli`](wallet/cmd/oystercli/) configures oyster
+automatically and walks you through wallet creation, starting the daemon, and
+generating an address (Receive menu). With the release installer it is already
+on your PATH (`oystercli`); from a source build:
+
+```bash
+cd bin && ./oystercli
+```
+
+Or manually:
 
 ```bash
 ./bin/oyster -u rpcuser -P rpcpass --create

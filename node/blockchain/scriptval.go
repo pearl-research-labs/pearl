@@ -6,7 +6,6 @@ package blockchain
 
 import (
 	"fmt"
-	"math"
 	"runtime"
 	"time"
 
@@ -33,7 +32,6 @@ type txValidator struct {
 	utxoView     *UtxoViewpoint
 	flags        txscript.ScriptFlags
 	sigCache     *txscript.SigCache
-	hashCache    *txscript.HashCache
 }
 
 // sendResult sends the result of a script pair validation on the internal
@@ -51,7 +49,6 @@ func (v *txValidator) sendResult(result error) {
 // and returns the result of the validation on the internal result channel. It
 // must be run as a goroutine.
 func (v *txValidator) validateHandler() {
-out:
 	for {
 		select {
 		case txVI := <-v.validateChan:
@@ -66,7 +63,8 @@ out:
 					txVI.txInIndex)
 				err := ruleError(ErrMissingTxOut, str)
 				v.sendResult(err)
-				break out
+
+				return
 			}
 
 			// Create a new script engine for the script pair.
@@ -89,7 +87,7 @@ out:
 					sigScript, pkScript)
 				err := ruleError(ErrScriptMalformed, str)
 				v.sendResult(err)
-				break out
+				return
 			}
 
 			// Execute the script pair.
@@ -103,14 +101,14 @@ out:
 					sigScript, pkScript)
 				err := ruleError(ErrScriptValidation, str)
 				v.sendResult(err)
-				break out
+				return
 			}
 
 			// Validation succeeded.
 			v.sendResult(nil)
 
 		case <-v.quitChan:
-			break out
+			return
 		}
 	}
 }
@@ -176,14 +174,13 @@ func (v *txValidator) Validate(items []*txValidateItem) error {
 // newTxValidator returns a new instance of txValidator to be used for
 // validating transaction scripts asynchronously.
 func newTxValidator(utxoView *UtxoViewpoint, flags txscript.ScriptFlags,
-	sigCache *txscript.SigCache, hashCache *txscript.HashCache) *txValidator {
+	sigCache *txscript.SigCache) *txValidator {
 	return &txValidator{
 		validateChan: make(chan *txValidateItem),
 		quitChan:     make(chan struct{}),
 		resultChan:   make(chan error),
 		utxoView:     utxoView,
 		sigCache:     sigCache,
-		hashCache:    hashCache,
 		flags:        flags,
 	}
 }
@@ -194,31 +191,20 @@ func ValidateTransactionScripts(tx *btcutil.Tx, utxoView *UtxoViewpoint,
 	flags txscript.ScriptFlags, sigCache *txscript.SigCache,
 	hashCache *txscript.HashCache) error {
 
-	// If the hashcache doesn't yet have the sighash midstate for this
-	// transaction, then we'll compute them now so we can re-use them
-	// amongst all worker validation goroutines.
-	if tx.MsgTx().HasWitness() &&
-		!hashCache.ContainsHashes(tx.Hash()) {
-		hashCache.AddSigHashes(tx.MsgTx(), utxoView)
+	// The coinbase spends nothing, so there are no scripts to validate.
+	if IsCoinBase(tx) {
+		return nil
 	}
 
 	// Re-use the same pre-computed sighash midstate across all validation
 	// goroutines so the sighashes are only computed once.
-	var cachedHashes *txscript.TxSigHashes
-	if tx.MsgTx().HasWitness() {
-		cachedHashes, _ = hashCache.GetSigHashes(tx.Hash())
-	}
+	cachedHashes := hashCache.LoadOrComputeSigHashes(tx.MsgTx(), utxoView)
 
 	// Collect all of the transaction inputs and required information for
 	// validation.
 	txIns := tx.MsgTx().TxIn
 	txValItems := make([]*txValidateItem, 0, len(txIns))
 	for txInIdx, txIn := range txIns {
-		// Skip coinbases.
-		if txIn.PreviousOutPoint.Index == math.MaxUint32 {
-			continue
-		}
-
 		txVI := &txValidateItem{
 			txInIndex: txInIdx,
 			txIn:      txIn,
@@ -229,7 +215,7 @@ func ValidateTransactionScripts(tx *btcutil.Tx, utxoView *UtxoViewpoint,
 	}
 
 	// Validate all of the inputs.
-	validator := newTxValidator(utxoView, flags, sigCache, hashCache)
+	validator := newTxValidator(utxoView, flags, sigCache)
 	return validator.Validate(txValItems)
 }
 
@@ -247,33 +233,17 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 	}
 	txValItems := make([]*txValidateItem, 0, numInputs)
 	for _, tx := range block.Transactions() {
-		hash := tx.Hash()
-
-		// Pre-compute sighash midstates for witness transactions so
-		// they can be re-used across validation goroutines.
-		if tx.HasWitness() && hashCache != nil &&
-			!hashCache.ContainsHashes(hash) {
-
-			hashCache.AddSigHashes(tx.MsgTx(), utxoView)
+		// The coinbase spends nothing, so there are no scripts to
+		// validate and no sighash midstates are needed.
+		if IsCoinBase(tx) {
+			continue
 		}
 
-		var cachedHashes *txscript.TxSigHashes
-		if tx.HasWitness() {
-			if hashCache != nil {
-				cachedHashes, _ = hashCache.GetSigHashes(hash)
-			} else {
-				cachedHashes = txscript.NewTxSigHashes(
-					tx.MsgTx(), utxoView,
-				)
-			}
-		}
+		// Pre-compute sighash midstates so they can be re-used
+		// across validation goroutines.
+		cachedHashes := hashCache.LoadOrComputeSigHashes(tx.MsgTx(), utxoView)
 
 		for txInIdx, txIn := range tx.MsgTx().TxIn {
-			// Skip coinbases.
-			if txIn.PreviousOutPoint.Index == math.MaxUint32 {
-				continue
-			}
-
 			txVI := &txValidateItem{
 				txInIndex: txInIdx,
 				txIn:      txIn,
@@ -285,7 +255,7 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 	}
 
 	// Validate all of the inputs.
-	validator := newTxValidator(utxoView, scriptFlags, sigCache, hashCache)
+	validator := newTxValidator(utxoView, scriptFlags, sigCache)
 	start := time.Now()
 	if err := validator.Validate(txValItems); err != nil {
 		return err
@@ -294,15 +264,10 @@ func checkBlockScripts(block *btcutil.Block, utxoView *UtxoViewpoint,
 
 	log.Tracef("block %v took %v to verify", block.Hash(), elapsed)
 
-	// If the HashCache is present, once we have validated the block, we no
-	// longer need the cached hashes for these transactions, so we purge
-	// them from the cache.
-	if hashCache != nil {
-		for _, tx := range block.Transactions() {
-			if tx.MsgTx().HasWitness() {
-				hashCache.PurgeSigHashes(tx.Hash())
-			}
-		}
+	// Once we have validated the block, we no longer need the cached
+	// hashes for these transactions, so we purge them from the cache.
+	for _, tx := range block.Transactions() {
+		hashCache.PurgeSigHashes(tx.Hash())
 	}
 
 	return nil

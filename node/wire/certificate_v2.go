@@ -16,6 +16,11 @@ import (
 // Must match PublicProofParams::MAX_WIRE_SIZE in zk-pow/src/api/proof_utils.rs.
 const PublicDataMaxSizeV2 = 4807
 
+// PublicDataSizeDenseV2 is the exact PublicData size of a dense (non-MoE) V2
+// proof. Must match PublicProofParams::WIRE_SIZE in zk-pow/src/api/proof_utils.rs;
+// MoE proofs are strictly longer.
+const PublicDataSizeDenseV2 = 164
+
 // CertificateV2 is a version-2 (V2) block certificate. It supports MoE (Mixture-of-Experts)
 // proofs as well as standard non-MoE proofs. PublicData is variable-length; PublicDataLen
 // tracks how many bytes are meaningful.
@@ -32,15 +37,42 @@ func (c *CertificateV2) Version() CertificateVersion {
 	return CertificateVersionV2
 }
 
+// IsMoE reports whether the certificate carries a MoE proof. MoE proofs are
+// strictly larger than a dense proof (PublicDataSizeDenseV2); using ">" rather
+// than "!=" keeps the zero-length placeholder proof used in block templates
+// valid under the dense-only fork.
+func (c *CertificateV2) IsMoE() bool {
+	return c.PublicDataLen > PublicDataSizeDenseV2
+}
+
 func (c *CertificateV2) BlockHash() chainhash.Hash {
 	return c.Hash
 }
 
+// PublicDataBytes returns the meaningful prefix of PublicData. Every producer
+// bounds PublicDataLen against the array (Deserialize here, Mine and MineMoE in
+// the zkpow package), so a larger value is a corrupt struct and left for the
+// bounds check to catch.
+func (c *CertificateV2) PublicDataBytes() []byte {
+	return c.PublicData[:c.PublicDataLen]
+}
+
+// ProofBytes returns the raw ZK proof bytes.
+func (c *CertificateV2) ProofBytes() []byte {
+	return c.ProofData
+}
+
 // ProofCommitment computes SHA256d(CertificateVersion_LE(4) || PublicData[:PublicDataLen]).
 func (c *CertificateV2) ProofCommitment() chainhash.Hash {
-	buf := make([]byte, 4+c.PublicDataLen)
-	binary.LittleEndian.PutUint32(buf[:4], uint32(c.Version()))
-	copy(buf[4:], c.PublicData[:c.PublicDataLen])
+	return proofCommitment(c.Version(), c.PublicDataBytes())
+}
+
+// proofCommitment computes SHA256d(CertificateVersion_LE(4) || publicData).
+// V3 overrides ProofCommitment to hash version 3 (domain separation from V2).
+func proofCommitment(version CertificateVersion, publicData []byte) chainhash.Hash {
+	buf := make([]byte, 4+len(publicData))
+	binary.LittleEndian.PutUint32(buf[:4], uint32(version))
+	copy(buf[4:], publicData)
 	return chainhash.DoubleHashH(buf)
 }
 
@@ -53,7 +85,7 @@ func (c *CertificateV2) Serialize(w io.Writer) error {
 	if err := binary.Write(w, binary.LittleEndian, c.PublicDataLen); err != nil {
 		return err
 	}
-	if _, err := w.Write(c.PublicData[:c.PublicDataLen]); err != nil {
+	if _, err := w.Write(c.PublicDataBytes()); err != nil {
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, uint32(len(c.ProofData))); err != nil {

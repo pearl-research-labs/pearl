@@ -83,7 +83,7 @@ jobs:
     needs: [detect-changes, start-runner]
     if: always() && !cancelled() && needs.detect-changes.outputs.should_run == 'true'
     runs-on: ${{ needs.start-runner.outputs.label || 'h100-gpu' }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     container:
       image: public.ecr.aws/x5p2d7p8/pearl/ci-container:latest
       options: --gpus all --shm-size=16g --ipc=host

@@ -284,9 +284,9 @@ dependencies = [
 
 [[package]]
 name = "constant_time_eq"
-version = "0.4.3"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dab3fe76c1571ecd5cfe878b61bce3fedf4adbde5d8a8653b2a7956ffd14628"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-foundation-sys"
@@ -2052,6 +2052,7 @@ name = "zk-pow-go"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "blake3",
  "cbindgen",
  "env_logger 0.10.2",
@@ -2060,6 +2061,7 @@ dependencies = [
  "log",
  "primitive-types 0.12.2",
  "rand 0.8.6",
+ "rand_chacha 0.9.0",
  "tikv-jemallocator",
  "zk-pow",
 ]

@@ -1,0 +1,130 @@
+name: Blockchain / Build & Publish
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sha:
+    runs-on: ubuntu-latest
+    outputs:
+      sha_short: ${{ steps.sha.outputs.sha_short }}
+    steps:
+      - name: Compute short SHA
+        id: sha
+        run: echo "sha_short=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: sha
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact_name: pearl-linux-amd64
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            artifact_name: pearl-linux-arm64
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            artifact_name: pearl-darwin-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            artifact_name: pearl-darwin-arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            artifact_name: pearl-windows-amd64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      SHA_SHORT: ${{ needs.sha.outputs.sha_short }}
+      # Bake the commit into the binary so `pearld --version` reports it (as
+      # build metadata). UserAgent() excludes Build, so this never leaks to p2p.
+      GOFLAGS: -ldflags=-X=github.com/pearl-research-labs/pearl/version.Build=${{ needs.sha.outputs.sha_short }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Add Rust GNU target (Windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Build with Task
+        shell: bash
+        run: |
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            export CARGO_BUILD_TARGET=x86_64-pc-windows-gnu
+          fi
+          task build:blockchain
+
+      - name: Package binaries (Unix)
+        if: matrix.goos != 'windows'
+        run: |
+          mkdir -p dist
+          cp bin/pearld bin/prlctl bin/oyster bin/oystercli dist/
+          tar -czvf ${{ matrix.artifact_name }}-${{ env.SHA_SHORT }}.tar.gz -C dist .
+
+      - name: Package binaries (Windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp bin/pearld dist/pearld.exe
+          cp bin/prlctl dist/prlctl.exe
+          cp bin/oyster dist/oyster.exe
+          cp bin/oystercli dist/oystercli.exe
+          cd dist && 7z a ../${{ matrix.artifact_name }}-${{ env.SHA_SHORT }}.zip *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}-${{ env.SHA_SHORT }}.*
+          retention-days: 30
+
+  docker:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    with:
+      output: image
+      context: .
+      file: ./node/Dockerfile
+      platforms: linux/amd64,linux/arm64
+      push: true
+      cache: true
+      cache-mode: max
+      sbom: true
+      set-meta-labels: true
+      set-meta-annotations: true
+      meta-images: ghcr.io/${{ github.repository }}/pearld
+      meta-tags: |
+        type=sha
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}

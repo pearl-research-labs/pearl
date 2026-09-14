@@ -26,8 +26,8 @@ interface WalletProcessConfig {
   dataDir: string;
   rpcUser: string;
   rpcPassword: string;
-  peerAddress: string;
-  peerPort: number;
+  peerAddress?: string;
+  peerPort?: number;
 }
 
 class WalletProcess {
@@ -86,7 +86,6 @@ class WalletProcess {
     const networkConfig = getCurrentNetworkConfig();
     const args = [
       '--usespv',
-      `--addpeer=${this.config.peerAddress}:${this.config.peerPort}`,
       `--appdata=${this.config.dataDir}`,
       `--username=${this.config.rpcUser}`,
       `--password=${this.config.rpcPassword}`,
@@ -94,9 +93,16 @@ class WalletProcess {
       '--noservertls',
     ];
 
+    // Only pass --addpeer when the user has configured a custom peer.
+    // Otherwise the daemon falls back to its built-in DNS seeding
+    // (seeder1/2/3.pearlresearch.ai — see node/chaincfg/params.go).
+    if (this.config.peerAddress && this.config.peerPort) {
+      args.push(`--addpeer=${this.config.peerAddress}:${this.config.peerPort}`);
+    }
+
     // Add network flag if not mainnet
     if (networkConfig.walletFlag) {
-      args.splice(2, 0, networkConfig.walletFlag);
+      args.splice(1, 0, networkConfig.walletFlag);
     }
 
     return args;
@@ -420,12 +426,16 @@ class WalletProcess {
       });
 
       lsofProcess.on('close', code => {
-        if (code === 0 && output.includes('pearlwall')) {
+        // The shipped daemon binary is named `oyster-<platform>-<arch>`, which
+        // lsof reports (truncated) as `oyster-...` in its COMMAND column. The
+        // previous match string ('pearlwall') never appears, so a wedged prior
+        // daemon holding the RPC port was never reaped. Match on 'oyster'.
+        if (code === 0 && output.includes('oyster')) {
           const lines = output.split('\n');
           const pids: string[] = [];
 
           for (const line of lines) {
-            if (line.includes('pearlwall')) {
+            if (line.includes('oyster')) {
               const parts = line.split(/\s+/);
               if (parts.length > 1) {
                 pids.push(parts[1]);

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use plonky2_field::goldilocks_field::GoldilocksField;
 
-use crate::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams};
+use crate::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams, SeedDerivation};
 use crate::api::proof::{PrivateProofParams, ZKProof};
 use crate::api::proof_utils::u32_field_array_to_hash;
 use crate::circuit::circuit_utils::CircuitCache;
@@ -22,9 +22,10 @@ pub fn zk_prove_plain_proof(
     proof: &PlainProof,
     cache: &mut CircuitCache,
     sanity_check: bool,
+    seed_derivation: SeedDerivation,
 ) -> Result<ProveResult> {
     // Convert PlainProof to proof parameters
-    let (private, public) = proof.parse_proof(block_header)?;
+    let (private, public) = proof.parse_proof(block_header, seed_derivation)?;
     if sanity_check {
         public.sanity_check_private_params(&private)?;
     }
@@ -102,7 +103,8 @@ pub fn warmup_prove(mining_configuration: MiningConfiguration, cache: &mut Circu
 
     let m = mining_configuration.rows_pattern.max() + 1;
     let n = mining_configuration.cols_pattern.max() + 1;
-    let mut public_params = PublicProofParams::new_dummy(block_header, mining_configuration, m, n, 0, 0);
+    // Seed values don't affect circuit shape, so warming up under Legacy covers both derivations.
+    let mut public_params = PublicProofParams::new_dummy(block_header, SeedDerivation::Legacy, mining_configuration, m, n, 0, 0);
     let private_params = public_params.fill_dummy_merkle_proof(private_params)?;
 
     let _ = prove_block(&mut public_params, private_params, cache)?;
