@@ -140,6 +140,10 @@ type Client struct {
 	// POST mode.
 	httpClient *http.Client
 
+	// httpURL is the request URL used for every HTTP POST. Host and
+	// DisableTLS are immutable after New, so it is computed once.
+	httpURL string
+
 	// backendVersion is the version of the backend the client is currently
 	// connected to. This should be retrieved through GetVersion.
 	backendVersionMu sync.Mutex
@@ -776,7 +780,7 @@ func (c *Client) handleSendPostMessage(ctx context.Context, jReq *jsonRequest) {
 
 func sendPostRequestWithRetry(ctx context.Context, jReq *jsonRequest,
 	tries int, httpClient *http.Client, config *ConnConfig,
-	batch bool) ([]byte, error) {
+	httpURL string, batch bool) ([]byte, error) {
 
 	var (
 		lastErr      error
@@ -784,11 +788,6 @@ func sendPostRequestWithRetry(ctx context.Context, jReq *jsonRequest,
 		httpResponse *http.Response
 		err          error
 	)
-
-	httpURL, err := config.httpURL()
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse address %v", err)
-	}
 
 retryloop:
 	for i := 0; i < tries; i++ {
@@ -807,11 +806,13 @@ retryloop:
 			httpReq.Header.Set(key, value)
 		}
 
-		user, pass, authErr := config.getAuth()
-		if authErr != nil {
-			return nil, authErr
+		if !config.DisableAuth {
+			user, pass, authErr := config.getAuth()
+			if authErr != nil {
+				return nil, authErr
+			}
+			httpReq.SetBasicAuth(user, pass)
 		}
-		httpReq.SetBasicAuth(user, pass)
 
 		httpResponse, err = httpClient.Do(httpReq)
 
@@ -876,7 +877,7 @@ func (c *Client) sendPostRequestAndRespond(ctx context.Context,
 	jReq *jsonRequest, tries int) {
 
 	res, err := sendPostRequestWithRetry(
-		ctx, jReq, tries, c.httpClient, c.config, c.batch,
+		ctx, jReq, tries, c.httpClient, c.config, c.httpURL, c.batch,
 	)
 
 	if errors.Is(err, context.Canceled) &&
@@ -1307,6 +1308,12 @@ type ConnConfig struct {
 	// EnableBCInfoHacks is an option provided to enable compatibility hacks
 	// when connecting to blockchain.info RPC server
 	EnableBCInfoHacks bool
+
+	// DisableAuth instructs the client to skip generating a Basic
+	// Authorization header for RPC requests. Caller-provided Authorization
+	// values in ExtraHeaders are still sent. Providers that authenticate
+	// through the URL reject requests carrying a second Authorization header.
+	DisableAuth bool
 }
 
 // getAuth returns the username and passphrase that will actually be used for
@@ -1412,7 +1419,7 @@ func newHTTPClient(config *ConnConfig) (*http.Client, error) {
 }
 
 // httpURL returns the URL to use for HTTP POST requests.
-func (config *ConnConfig) httpURL() (string, error) {
+func (config *ConnConfig) httpURL() string {
 	protocol := "http"
 	if !config.DisableTLS {
 		protocol = "https"
@@ -1424,10 +1431,10 @@ func (config *ConnConfig) httpURL() (string, error) {
 		strings.HasPrefix(config.Host, "unixpacket://") {
 		// Using a placeholder URL because a non-empty URL is required.
 		// The Unix domain socket is specified in the DialContext.
-		return protocol + "://unix", nil
+		return protocol + "://unix"
 	}
 
-	return protocol + "://" + config.Host, nil
+	return protocol + "://" + config.Host
 }
 
 // dial opens a websocket connection using the passed connection configuration
@@ -1463,16 +1470,16 @@ func dial(config *ConnConfig) (*websocket.Conn, error) {
 		dialer.NetDial = proxy.Dial
 	}
 
-	// The RPC server requires basic authorization, so create a custom
-	// request header with the Authorization header set.
-	user, pass, err := config.getAuth()
-	if err != nil {
-		return nil, err
-	}
-	login := user + ":" + pass
-	auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
 	requestHeader := make(http.Header)
-	requestHeader.Add("Authorization", auth)
+	if !config.DisableAuth {
+		user, pass, err := config.getAuth()
+		if err != nil {
+			return nil, err
+		}
+		login := user + ":" + pass
+		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(login))
+		requestHeader.Add("Authorization", auth)
+	}
 	for key, value := range config.ExtraHeaders {
 		requestHeader.Add(key, value)
 	}
@@ -1515,6 +1522,7 @@ func New(config *ConnConfig, ntfnHandlers *NotificationHandlers) (*Client, error
 	// when running in HTTP POST mode.
 	var wsConn *websocket.Conn
 	var httpClient *http.Client
+	var httpURL string
 	connEstablished := make(chan struct{})
 	var start bool
 	if config.HTTPPostMode {
@@ -1526,6 +1534,7 @@ func New(config *ConnConfig, ntfnHandlers *NotificationHandlers) (*Client, error
 		if err != nil {
 			return nil, err
 		}
+		httpURL = config.httpURL()
 	} else {
 		if !config.DisableConnectOnNew {
 			var err error
@@ -1541,6 +1550,7 @@ func New(config *ConnConfig, ntfnHandlers *NotificationHandlers) (*Client, error
 		config:          config,
 		wsConn:          wsConn,
 		httpClient:      httpClient,
+		httpURL:         httpURL,
 		requestMap:      make(map[uint64]*list.Element),
 		requestList:     list.New(),
 		batch:           false,
