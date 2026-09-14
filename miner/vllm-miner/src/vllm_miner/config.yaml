@@ -8,5 +8,5 @@ matrix_multiplication:
   # Use noisy GEMM when N and K dimensions are larger than these thresholds, if not use vanilla GEMM
   use_simplified_gemm:
     min_m: 1024
-    min_n: 1024
+    min_n: 256
     min_k: 1024

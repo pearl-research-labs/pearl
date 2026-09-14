@@ -23,7 +23,18 @@ func moeSimNetParams() chaincfg.Params {
 	params := chaincfg.SimNetParams
 	params.ReduceMinDifficulty = false
 	params.MoEForkHeight = moeForkTestHeight
+	// Exercise the V1/V2 cutover in isolation; disable the later V3 fork.
+	params.SaltedSeedForkHeight = 0
 	return params
+}
+
+// checkCertVersion exercises the certificate version and dense-only rules
+// alone. Only the rank-penalty rule reads the header and the flags, so params
+// must leave that fork disabled.
+func checkCertVersion(cert wire.BlockCertificate, height int32,
+	params *chaincfg.Params) error {
+
+	return CheckCertificateRules(&wire.BlockHeader{}, cert, height, params, BFNone)
 }
 
 // newBlockForcedCert builds (but does not process) the next block on top of
@@ -189,9 +200,9 @@ func TestMoEForkBlockTemplateVersion(t *testing.T) {
 		ErrDisallowedCertVersion)
 }
 
-// TestCheckCertificateVersion exercises the policy helper directly, including
-// the disabled-fork case and the nil-certificate guard.
-func TestCheckCertificateVersion(t *testing.T) {
+// TestCheckCertificateRulesVersion exercises the version cutover directly,
+// including the disabled-fork case and the nil-certificate guard.
+func TestCheckCertificateRulesVersion(t *testing.T) {
 	enabled := &chaincfg.Params{MoEForkHeight: moeForkTestHeight}
 	disabled := &chaincfg.Params{MoEForkHeight: 0}
 
@@ -199,19 +210,81 @@ func TestCheckCertificateVersion(t *testing.T) {
 	moe := &wire.CertificateV2{}
 
 	// Disabled fork: V1 always valid, V2 never valid.
-	require.NoError(t, CheckCertificateVersion(zk, 1_000_000, disabled))
-	requireRuleError(t, CheckCertificateVersion(moe, 1_000_000, disabled),
+	require.NoError(t, checkCertVersion(zk, 1_000_000, disabled))
+	requireRuleError(t, checkCertVersion(moe, 1_000_000, disabled),
 		ErrDisallowedCertVersion)
 
 	// Enabled fork: strict cutover at the activation height.
-	require.NoError(t, CheckCertificateVersion(zk, moeForkTestHeight-1, enabled))
-	require.NoError(t, CheckCertificateVersion(moe, moeForkTestHeight, enabled))
-	requireRuleError(t, CheckCertificateVersion(moe, moeForkTestHeight-1, enabled),
+	require.NoError(t, checkCertVersion(zk, moeForkTestHeight-1, enabled))
+	require.NoError(t, checkCertVersion(moe, moeForkTestHeight, enabled))
+	requireRuleError(t, checkCertVersion(moe, moeForkTestHeight-1, enabled),
 		ErrDisallowedCertVersion)
-	requireRuleError(t, CheckCertificateVersion(zk, moeForkTestHeight, enabled),
+	requireRuleError(t, checkCertVersion(zk, moeForkTestHeight, enabled),
 		ErrDisallowedCertVersion)
 
 	// Missing certificate.
-	requireRuleError(t, CheckCertificateVersion(nil, 1, enabled),
+	requireRuleError(t, checkCertVersion(nil, 1, enabled),
 		ErrCertificateMissing)
+}
+
+// TestCheckCertificateRulesDenseOnlyFork exercises the dense-only fork: at
+// and after DenseOnlyForkHeight a V2 certificate must carry a dense (non-MoE)
+// proof. MoE-ness is detected by the public data length (dense proofs are
+// exactly wire.PublicDataSizeDenseV2 bytes, MoE proofs are longer).
+func TestCheckCertificateRulesDenseOnlyFork(t *testing.T) {
+	const denseOnlyTestHeight = moeForkTestHeight + 2
+	params := &chaincfg.Params{
+		MoEForkHeight:       moeForkTestHeight,
+		DenseOnlyForkHeight: denseOnlyTestHeight,
+	}
+
+	dense := &wire.CertificateV2{PublicDataLen: wire.PublicDataSizeDenseV2}
+	moe := &wire.CertificateV2{PublicDataLen: wire.PublicDataSizeDenseV2 + 1}
+
+	// Before the dense-only fork both proof kinds are accepted.
+	require.NoError(t, checkCertVersion(dense, denseOnlyTestHeight-1, params))
+	require.NoError(t, checkCertVersion(moe, denseOnlyTestHeight-1, params))
+
+	// At and after the fork only dense proofs are accepted.
+	require.NoError(t, checkCertVersion(dense, denseOnlyTestHeight, params))
+	requireRuleError(t, checkCertVersion(moe, denseOnlyTestHeight, params),
+		ErrDisallowedCertVersion)
+
+	// The zero-length placeholder proof used by block templates is not MoE
+	// and must stay valid at and after the fork. Regression guard for the
+	// template-generation failure caused by detecting MoE-ness with "!=".
+	placeholder := &wire.CertificateV2{}
+	require.NoError(t, checkCertVersion(placeholder, denseOnlyTestHeight, params))
+}
+
+// TestDenseOnlyForkAcceptsTemplatesAndBlocks builds a SimNet chain across the
+// dense-only activation height. SolveBlock emits V2 certificates with a
+// zero-length (placeholder) proof on SimNet; both freshly built templates and
+// processed blocks must be accepted under the dense-only rule, since a
+// placeholder is not a MoE proof. This reproduces the "failed to create new
+// block template" failure observed once the fork activated.
+func TestDenseOnlyForkAcceptsTemplatesAndBlocks(t *testing.T) {
+	params := moeSimNetParams()
+	params.DenseOnlyForkHeight = moeForkTestHeight + 2
+	chain, teardown, err := chainSetup("dense_only_template", &params)
+	require.NoError(t, err)
+	defer teardown()
+
+	tip := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	tip.SetHeight(0)
+
+	// Extend past the dense-only fork height; every block must be accepted
+	// (its placeholder V2 certificate is non-MoE).
+	for h := int32(1); h <= params.DenseOnlyForkHeight+1; h++ {
+		block, _, err := addBlock(chain, tip, nil)
+		require.NoErrorf(t, err,
+			"block at height %d must be accepted after the dense-only fork", h)
+		tip = block
+	}
+
+	// A fresh template on top of a post-fork tip must also be accepted.
+	template, _, err := newBlock(chain, tip, nil)
+	require.NoError(t, err)
+	require.NoError(t, chain.CheckConnectBlockTemplate(template),
+		"post-fork block template must be accepted")
 }

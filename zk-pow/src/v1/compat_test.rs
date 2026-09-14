@@ -145,12 +145,24 @@ mod test {
         };
         let main_header = crate::api::proof::IncompleteBlockHeader::new_for_test(0x1D2FFFFF);
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xdeadbeef);
-        let plain_proof = crate::ffi::mine::try_mine_one(&mut rng, m, n, k, main_header, main_config, None, false)
-            .unwrap()
-            .unwrap();
+        let plain_proof = crate::ffi::mine::try_mine_one(
+            &mut rng,
+            m,
+            n,
+            k,
+            main_header,
+            main_config,
+            None,
+            false,
+            crate::api::proof::SeedDerivation::Legacy,
+        )
+        .unwrap()
+        .unwrap();
 
         // Parse with main module to get public/private params for hashing
-        let (private_params, public_params) = plain_proof.parse_proof(main_header).unwrap();
+        let (private_params, public_params) = plain_proof
+            .parse_proof(main_header, crate::api::proof::SeedDerivation::Legacy)
+            .unwrap();
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(&public_params.block_header.to_bytes());

@@ -110,16 +110,17 @@ var subsystemLoggers = map[string]btclog.Logger{
 }
 
 // initLogRotator initializes the logging rotater to write logs to logFile and
-// create roll files in the same directory.  It must be called before the
-// package-global log rotater variables are used.
-func initLogRotator(logFile string) {
+// create roll files in the same directory.  The log file is rotated once it
+// exceeds thresholdKB kilobytes.  It must be called before the package-global
+// log rotater variables are used.
+func initLogRotator(logFile string, thresholdKB int64) {
 	logDir, _ := filepath.Split(logFile)
 	err := os.MkdirAll(logDir, 0700)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create log directory: %v\n", err)
 		os.Exit(1)
 	}
-	r, err := rotator.New(logFile, 10*1024, false, 3)
+	r, err := rotator.New(logFile, thresholdKB, false, 3)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create file rotator: %v\n", err)
 		os.Exit(1)

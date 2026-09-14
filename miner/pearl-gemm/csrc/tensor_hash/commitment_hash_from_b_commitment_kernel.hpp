@@ -32,10 +32,8 @@ class CommitmentHashFromBCommitmentKernel {
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
-    return {args.ptr_A_merkle_root,
-            args.ptr_B_commitment_hash,
-            args.ptr_A_commitment_hash,
-            args.ptr_routing_root,
+    return {args.ptr_A_merkle_root, args.ptr_B_commitment_hash,
+            args.ptr_A_commitment_hash, args.ptr_routing_root,
             args.ptr_offsets_hash};
   }
 

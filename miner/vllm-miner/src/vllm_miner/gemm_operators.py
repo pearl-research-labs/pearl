@@ -134,57 +134,73 @@ def pearl_gemm_noisy(
         tensor_hash_scratchpad,
     )
 
-    def _prepare_b_state(
-        B: torch.Tensor = B,
-        key_tensor: torch.Tensor = key_tensor,
-        tensor_hash_scratchpad: torch.Tensor = tensor_hash_scratchpad,
-        n: int = n,
-        k: int = k,
-        r: int = r,
-        device: torch.device = a.device,
-    ) -> PreparedBMiningState:
-        return prepare_b_mining_state(
-            B,
-            key_tensor,
-            tensor_hash_scratchpad,
-            n,
-            k,
-            r,
-            device,
-        )
-
-    prepared_b_state = get_or_prepare_b_mining_state(
-        B,
-        hash_key,
-        r,
-        config.settings.prepared_b_cache_bytes,
-        _prepare_b_state,
-    )
-
     commitment_hash_A_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
-    commitment_hash_from_b_commitment(
-        A_tensor_hash,
-        prepared_b_state.commitment_b,
-        commitment_hash_A_tensor,
-    )
-    commitment_hash_B_tensor = prepared_b_state.commitment_b
+    # V3 salts both roots; the cached-commitment helper only supports unsalted jobs.
+    if mining_job.cert_version.uses_salted_seeds:
+        B_tensor_hash = torch.empty(32, device="cuda", dtype=torch.uint8)
+        tensor_hash(B, key_tensor, B_tensor_hash, tensor_hash_scratchpad)
+        commitment_hash_B_tensor = torch.empty(32, device="cuda", dtype=torch.uint8)
+        commitment_hash_from_merkle_roots(
+            A_tensor_hash,
+            B_tensor_hash,
+            key_tensor,
+            commitment_hash_A_tensor,
+            commitment_hash_B_tensor,
+            salted_dims=(m, n),
+        )
+        (
+            EAL,
+            EAR_R_major,
+            EBL_R_major,
+            EAR_K_major,
+            EBL_K_major,
+            EBR,
+            EAL_fp16,
+            EBR_fp16,
+        ) = generate_noise_factors(
+            m, n, k, r, commitment_hash_A_tensor, commitment_hash_B_tensor, a.device
+        )
+    else:
 
-    (
-        EAL,
-        EAR_R_major,
-        EAR_K_major,
-        EAL_fp16,
-    ) = generate_a_noise_factors(
-        m,
-        k,
-        r,
-        commitment_hash_A_tensor,
-        a.device,
-    )
-    EBL_R_major = prepared_b_state.ebl_r_major
-    EBL_K_major = prepared_b_state.ebl_k_major
-    EBR = prepared_b_state.ebr
-    EBR_fp16 = prepared_b_state.ebr_fp16
+        def _prepare_b_state(
+            B: torch.Tensor = B,
+            key_tensor: torch.Tensor = key_tensor,
+            tensor_hash_scratchpad: torch.Tensor = tensor_hash_scratchpad,
+            n: int = n,
+            k: int = k,
+            r: int = r,
+            device: torch.device = a.device,
+        ) -> PreparedBMiningState:
+            return prepare_b_mining_state(
+                B,
+                key_tensor,
+                tensor_hash_scratchpad,
+                n,
+                k,
+                r,
+                device,
+            )
+
+        prepared_b_state = get_or_prepare_b_mining_state(
+            B,
+            hash_key,
+            r,
+            config.settings.prepared_b_cache_bytes,
+            _prepare_b_state,
+        )
+        commitment_hash_from_b_commitment(
+            A_tensor_hash,
+            prepared_b_state.commitment_b,
+            commitment_hash_A_tensor,
+        )
+        commitment_hash_B_tensor = prepared_b_state.commitment_b
+        EAL, EAR_R_major, EAR_K_major, EAL_fp16 = generate_a_noise_factors(
+            m, k, r, commitment_hash_A_tensor, a.device
+        )
+        EBL_R_major = prepared_b_state.ebl_r_major
+        EBL_K_major = prepared_b_state.ebl_k_major
+        EBR = prepared_b_state.ebr
+        EBR_fp16 = prepared_b_state.ebr_fp16
 
     # Always compute B noising (depends on A through EAR)
     BpEB = torch.empty((n, k), dtype=torch.int8, device=a.device)

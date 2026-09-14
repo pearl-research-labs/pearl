@@ -1,4 +1,5 @@
 use anyhow::{Result, bail, ensure};
+use core::ops::Range;
 use plonky2::field::extension::quadratic::QuadraticExtension;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::HashOut;
@@ -8,7 +9,7 @@ use primitive_types::U256;
 
 use crate::api::proof::{
     Hash256, IncompleteBlockHeader, MINING_CONFIG_RESERVED_SIZE, MMAType, MiningConfiguration, MoEConfig, MoEParams,
-    PeriodicPattern, PrivateProofParams, PublicProofParams, ZKProof,
+    PeriodicPattern, PrivateProofParams, PublicProofParams, SeedDerivation, ZKProof,
 };
 use crate::api::sanity_checks::public_params_sanity_check;
 use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLocation, BlakeProgram};
@@ -16,6 +17,14 @@ use crate::circuit::pearl_circuit::PearlCircuitParams;
 use crate::ensure_eq;
 
 use pearl_blake3::blake3_digest;
+
+fn ensure_roundtrip(original: &[u8], reserialized: &[u8], label: &str) -> Result<()> {
+    ensure!(
+        reserialized == original,
+        "{label} round-trip mismatch: deserialized form does not re-serialize to the original bytes"
+    );
+    Ok(())
+}
 
 /// Computes `hash_activations = H(hash_a || hash_router)` where
 /// `hash_router = H(hash_routing_data || hash_offsets)` and
@@ -125,7 +134,9 @@ impl PeriodicPattern {
             min_stride = stride * length;
         }
 
-        Ok(Self { shape })
+        let result = Self { shape };
+        ensure_roundtrip(data, &result.to_bytes(), "PeriodicPattern")?;
+        Ok(result)
     }
 
     /// Serialize to exactly 2 * PeriodicPattern::NUM_DIMS bytes (6 bytes).
@@ -345,12 +356,16 @@ impl PublicProofParams {
     ///
     /// In the MoE setting `hash_a` is replaced by `hash_activations = blake3(hash_a || hash_router)`,
     /// so the routing affects A's noise seed without an extra chained hash.
+    ///
+    /// Under [`SeedDerivation::Salted`] the raw roots are salted first (MoE:
+    /// A is salted *before* the routing fold); the chain itself is unchanged.
     pub fn commitment_hash(&self, job_key: Hash256) -> (Hash256, Hash256) {
+        let (hash_a, hash_b) = self.seed_derivation.bind_roots(&self.hash_a, &self.hash_b, self.m, self.n);
         let hash_activations = match &self.moe {
-            Some(moe) => compute_hash_activations(&self.hash_a, &moe.hash_routing, &moe.routing_offsets, &job_key),
-            None => self.hash_a,
+            Some(moe) => compute_hash_activations(&hash_a, &moe.hash_routing, &moe.routing_offsets, &job_key),
+            None => hash_a,
         };
-        let b_noise_seed = blake3_digest(&[&job_key[..], &self.hash_b[..]].concat(), None);
+        let b_noise_seed = blake3_digest(&[&job_key[..], &hash_b[..]].concat(), None);
         let a_noise_seed = blake3_digest(&[&b_noise_seed[..], &hash_activations[..]].concat(), None);
 
         (b_noise_seed, a_noise_seed)
@@ -464,15 +479,18 @@ impl MiningConfiguration {
         let e = u16::from_le_bytes(trailer[0..2].try_into().unwrap());
         let top_k = u16::from_le_bytes(trailer[2..4].try_into().unwrap());
         ensure!(trailer[4..].iter().all(|&b| b == 0), "Reserved trailer bytes must be zero");
+        ensure!(e != 0 || top_k == 0, "top_k must be 0 when e == 0 (non-MoE)");
         let moe = if e == 0 { None } else { Some(MoEConfig { e, top_k }) };
-        Ok(Self {
+        let result = Self {
             common_dim,
             rank,
             mma_type,
             rows_pattern,
             cols_pattern,
             moe,
-        })
+        };
+        ensure_roundtrip(data, &result.to_bytes(), "MiningConfiguration")?;
+        Ok(result)
     }
 
     pub fn dot_product_length(&self) -> usize {
@@ -524,13 +542,15 @@ impl IncompleteBlockHeader {
         let timestamp = u32::from_le_bytes(data[68..72].try_into().unwrap());
         let nbits = u32::from_le_bytes(data[72..76].try_into().unwrap());
 
-        Ok(Self {
+        let result = Self {
             version,
             prev_block,
             merkle_root,
             timestamp,
             nbits,
-        })
+        };
+        ensure_roundtrip(data, &result.to_bytes(), "IncompleteBlockHeader")?;
+        Ok(result)
     }
 }
 
@@ -693,6 +713,7 @@ impl PublicProofParams {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         block_header: IncompleteBlockHeader,
+        seed_derivation: SeedDerivation,
         mining_config: MiningConfiguration,
         hash_a: Hash256,
         hash_b: Hash256,
@@ -704,6 +725,7 @@ impl PublicProofParams {
     ) -> Self {
         Self {
             block_header,
+            seed_derivation,
             mining_config,
             hash_a,
             hash_b,
@@ -720,6 +742,7 @@ impl PublicProofParams {
     #[allow(clippy::too_many_arguments)]
     pub fn new_dummy(
         block_header: IncompleteBlockHeader,
+        seed_derivation: SeedDerivation,
         mining_configuration: MiningConfiguration,
         m: u32,
         n: u32,
@@ -728,6 +751,7 @@ impl PublicProofParams {
     ) -> Self {
         Self::new(
             block_header,
+            seed_derivation,
             mining_configuration,
             [1; 32], // dummy hash_a
             [2; 32], // dummy hash_b
@@ -743,6 +767,7 @@ impl PublicProofParams {
     pub fn new_for_tests(m: u32, n: u32, k: u32) -> Self {
         Self::new_dummy(
             IncompleteBlockHeader::new_for_test(0x207FFFFF),
+            SeedDerivation::Legacy,
             MiningConfiguration {
                 common_dim: k,
                 rank: 128,
@@ -776,6 +801,7 @@ mod tests {
                 timestamp: 0,
                 nbits: 0,
             },
+            SeedDerivation::Legacy,
             MiningConfiguration {
                 common_dim: 4096 - 64,
                 rank: 128,
@@ -1042,7 +1068,7 @@ mod tests {
         assert_eq!(bytes.len(), PublicProofParams::WIRE_SIZE);
 
         let proof_blob = [0u8; ZKProof::PROOFDATA_PREAMBLE];
-        let (parsed, _) = ZKProof::deserialize(params.block_header, &bytes, &proof_blob).unwrap();
+        let (parsed, _) = ZKProof::deserialize(params.block_header, SeedDerivation::Legacy, &bytes, &proof_blob).unwrap();
         assert!(parsed.moe.is_none());
         assert_eq!(parsed.hash_a, params.hash_a);
         assert_eq!(parsed.hash_b, params.hash_b);
@@ -1071,7 +1097,7 @@ mod tests {
         assert!(bytes.len() > PublicProofParams::WIRE_SIZE);
 
         let proof_blob = [0u8; ZKProof::PROOFDATA_PREAMBLE];
-        let (parsed, _) = ZKProof::deserialize(params.block_header, &bytes, &proof_blob).unwrap();
+        let (parsed, _) = ZKProof::deserialize(params.block_header, SeedDerivation::Legacy, &bytes, &proof_blob).unwrap();
         let moe_config = parsed.mining_config.moe.as_ref().unwrap();
         assert_eq!(moe_config.e, 4);
         assert_eq!(moe_config.top_k, 4);
@@ -1079,6 +1105,36 @@ mod tests {
         assert_eq!(moe.routing_offsets, routing_offsets);
         assert_eq!(moe.hash_routing, [0x11u8; 32]);
         assert_eq!(moe.outer_indices, vec![3u32, 7, 42]);
+    }
+
+    #[test]
+    fn mining_config_and_jackpot_parse_from_moe_wire_bytes() {
+        // The rank-penalty FFI parses only the shared prefix (config + jackpot)
+        // and accepts any MoE-sized blob, since the MoE tail is irrelevant to
+        // the rule. Pin that the dense and MoE layouts agree on the prefix the
+        // rule reads (common_dim, rank, and the jackpot hash), even though the
+        // mining-config trailer (e, top_k) differs.
+        let mut dense = PublicProofParams::new_for_tests(64, 64, 256);
+        dense.hash_jackpot = [0xcdu8; 32];
+        let dense_bytes = dense.to_wire_bytes().unwrap();
+
+        let mut moe = dense.clone();
+        moe.mining_config.moe = Some(MoEConfig { e: 4, top_k: 4 });
+        moe.moe = Some(MoEParams {
+            routing_offsets: vec![64u32, 128, 192, 256],
+            expert_idx: 1,
+            hash_routing: [0x11u8; 32],
+            outer_indices: vec![3u32, 7, 42],
+        });
+        let moe_bytes = moe.to_wire_bytes().unwrap();
+        assert!(moe_bytes.len() > PublicProofParams::WIRE_SIZE);
+
+        let (dense_cfg, dense_jp) = PublicProofParams::mining_config_and_jackpot_from_wire_bytes(&dense_bytes).unwrap();
+        let (moe_cfg, moe_jp) = PublicProofParams::mining_config_and_jackpot_from_wire_bytes(&moe_bytes).unwrap();
+        assert_eq!(dense_cfg.common_dim, moe_cfg.common_dim);
+        assert_eq!(dense_cfg.rank, moe_cfg.rank);
+        assert_eq!(dense_jp, moe_jp);
+        assert_eq!(dense_jp, [0xcdu8; 32]);
     }
 }
 
@@ -1108,6 +1164,47 @@ impl PublicProofParams {
         len == Self::WIRE_SIZE || (Self::MIN_MOE_WIRE_SIZE..=Self::MAX_WIRE_SIZE).contains(&len)
     }
 
+    /// Byte range of the serialized [`MiningConfiguration`] within wire `public_data`.
+    pub const MINING_CONFIG_RANGE: Range<usize> = 0..MiningConfiguration::SERIALIZED_SIZE;
+
+    /// Length of each `Hash256` field in the wire layout.
+    pub const HASH_LEN: usize = 32;
+
+    /// Byte range of `hash_a` within wire `public_data`.
+    pub const HASH_A_RANGE: Range<usize> =
+        MiningConfiguration::SERIALIZED_SIZE..MiningConfiguration::SERIALIZED_SIZE + Self::HASH_LEN;
+
+    /// Byte range of `hash_b` within wire `public_data`.
+    pub const HASH_B_RANGE: Range<usize> = {
+        let start = MiningConfiguration::SERIALIZED_SIZE + Self::HASH_LEN;
+        start..start + Self::HASH_LEN
+    };
+
+    /// Byte range of `hash_jackpot` within wire `public_data`.
+    ///
+    /// Follows the serialized [`MiningConfiguration`] and the two preceding hashes
+    /// (`hash_a`, `hash_b`), each [`Self::HASH_LEN`] bytes.
+    pub const HASH_JACKPOT_RANGE: Range<usize> = {
+        let start = MiningConfiguration::SERIALIZED_SIZE + 2 * Self::HASH_LEN;
+        start..start + Self::HASH_LEN
+    };
+
+    /// Parses just the mining configuration and jackpot hash from wire `public_data`.
+    ///
+    /// Both live in the core prefix that dense and MoE proofs share, so this needs
+    /// neither the MoE tail nor a block header — unlike [`Self::from_wire_bytes`],
+    /// which reconstructs the full parameters.
+    pub fn mining_config_and_jackpot_from_wire_bytes(public_data: &[u8]) -> Result<(MiningConfiguration, Hash256)> {
+        ensure!(
+            public_data.len() >= Self::WIRE_SIZE,
+            "public_data too short: need at least {} bytes",
+            Self::WIRE_SIZE
+        );
+        let mining_config = MiningConfiguration::from_bytes(&public_data[Self::MINING_CONFIG_RANGE])?;
+        let hash_jackpot: Hash256 = public_data[Self::HASH_JACKPOT_RANGE].try_into().unwrap();
+        Ok((mining_config, hash_jackpot))
+    }
+
     /// Deserialize from the wire `public_data` bytes produced by [`Self::to_wire_bytes`].
     ///
     /// `public_data` layout (non-MoE): [`Self::WIRE_SIZE`] bytes — core prefix only.
@@ -1116,17 +1213,21 @@ impl PublicProofParams {
     /// `hash_routing(32)` | `outer_count(u8)` | `outer_indices(u32 LE each)`.
     /// `e` and `top_k` come from `mining_config.moe` (committed in the job_key).
     /// Each routing offset is a `u32` bounded by `m * top_k < 2^32`, serialized as 4 LE bytes.
-    pub fn from_wire_bytes(block_header: IncompleteBlockHeader, public_data: &[u8]) -> Result<Self> {
+    pub fn from_wire_bytes(
+        block_header: IncompleteBlockHeader,
+        seed_derivation: SeedDerivation,
+        public_data: &[u8],
+    ) -> Result<Self> {
         ensure!(
             public_data.len() >= Self::WIRE_SIZE,
             "public_data too short: need at least {} bytes",
             Self::WIRE_SIZE
         );
 
-        let mining_config = MiningConfiguration::from_bytes(&public_data[0..52])?;
-        let hash_a: [u8; 32] = public_data[52..84].try_into().unwrap();
-        let hash_b: [u8; 32] = public_data[84..116].try_into().unwrap();
-        let hash_jackpot: [u8; 32] = public_data[116..148].try_into().unwrap();
+        let mining_config = MiningConfiguration::from_bytes(&public_data[Self::MINING_CONFIG_RANGE])?;
+        let hash_a: [u8; 32] = public_data[Self::HASH_A_RANGE].try_into().unwrap();
+        let hash_b: [u8; 32] = public_data[Self::HASH_B_RANGE].try_into().unwrap();
+        let hash_jackpot: [u8; 32] = public_data[Self::HASH_JACKPOT_RANGE].try_into().unwrap();
         let m = u32::from_le_bytes(public_data[148..152].try_into().unwrap());
         let n = u32::from_le_bytes(public_data[152..156].try_into().unwrap());
         let t_rows = u32::from_le_bytes(public_data[156..160].try_into().unwrap());
@@ -1187,8 +1288,10 @@ impl PublicProofParams {
             );
             let outer_indices_bytes = &moe_data[offset..];
             let outer_indices: Vec<u32> = outer_indices_bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             Some(MoEParams {
                 routing_offsets,
@@ -1209,8 +1312,9 @@ impl PublicProofParams {
         ensure!(t_rows < m, "t_rows={t_rows} must be < m={m}");
         ensure!(t_cols < n, "t_cols={t_cols} must be < n={n}");
 
-        Ok(Self {
+        let result = Self {
             block_header,
+            seed_derivation,
             mining_config,
             hash_a,
             hash_b,
@@ -1220,16 +1324,19 @@ impl PublicProofParams {
             t_rows,
             t_cols,
             moe,
-        })
+        };
+        // ensure that from_wire_bytes(public_data).to_wire_bytes() is injective
+        ensure_roundtrip(public_data, &result.to_wire_bytes()?, "PublicProofParams")?;
+        Ok(result)
     }
 
     /// Serialize to the wire `public_data` format (164 bytes non-MoE; longer when `moe` is set).
     pub fn to_wire_bytes(&self) -> Result<Vec<u8>> {
         let mut public_data = vec![0u8; Self::WIRE_SIZE];
-        public_data[0..52].copy_from_slice(&self.mining_config.to_bytes());
-        public_data[52..84].copy_from_slice(&self.hash_a);
-        public_data[84..116].copy_from_slice(&self.hash_b);
-        public_data[116..148].copy_from_slice(&self.hash_jackpot);
+        public_data[Self::MINING_CONFIG_RANGE].copy_from_slice(&self.mining_config.to_bytes());
+        public_data[Self::HASH_A_RANGE].copy_from_slice(&self.hash_a);
+        public_data[Self::HASH_B_RANGE].copy_from_slice(&self.hash_b);
+        public_data[Self::HASH_JACKPOT_RANGE].copy_from_slice(&self.hash_jackpot);
         public_data[148..152].copy_from_slice(&self.m.to_le_bytes());
         public_data[152..156].copy_from_slice(&self.n.to_le_bytes());
         public_data[156..160].copy_from_slice(&self.t_rows.to_le_bytes());
@@ -1368,10 +1475,11 @@ impl ZKProof {
     /// `proof_data` layout: `pow_bits(3) | rate_bits(3) | zeta(16) | plonky2_proof`
     pub fn deserialize(
         block_header: IncompleteBlockHeader,
+        seed_derivation: SeedDerivation,
         public_data: &[u8],
         proof_data: &[u8],
     ) -> Result<(PublicProofParams, Self)> {
-        let params = PublicProofParams::from_wire_bytes(block_header, public_data)?;
+        let params = PublicProofParams::from_wire_bytes(block_header, seed_derivation, public_data)?;
         let zk_proof = Self::from_bytes(proof_data)?;
         Ok((params, zk_proof))
     }

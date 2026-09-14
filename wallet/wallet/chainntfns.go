@@ -45,8 +45,7 @@ func (w *Wallet) handleChainNotifications() {
 		// if it doesn't match the original hash returned by
 		// the notification, to roll back and restart the
 		// rescan.
-		log.Infof("Catching up block hashes to height %d, this"+
-			" might take a while", height)
+		log.Infof("Catching up block hashes to height %d, this might take a while", height)
 		err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
@@ -75,8 +74,7 @@ func (w *Wallet) handleChainNotifications() {
 			return nil
 		})
 		if err != nil {
-			log.Errorf("Failed to update address manager "+
-				"sync state for height %d: %v", height, err)
+			log.Errorf("Failed to update address manager sync state for height %d: %v", height, err)
 		}
 
 		log.Info("Done catching up block hashes")
@@ -103,9 +101,7 @@ func (w *Wallet) handleChainNotifications() {
 						return ErrWalletShuttingDown
 					}
 
-					log.Errorf("Unable to synchronize "+
-						"wallet to chain, trying "+
-						"again in %s: %v",
+					log.Errorf("Unable to synchronize wallet to chain, trying again in %s: %v",
 						w.syncRetryInterval, err)
 
 					continue
@@ -145,15 +141,13 @@ func (w *Wallet) handleChainNotifications() {
 					err, waddrmgr.ErrBirthdayBlockNotSet,
 				) {
 
-					log.Errorf("Unable to sanity check "+
-						"wallet birthday block: %v",
+					log.Errorf("Unable to sanity check wallet birthday block: %v",
 						err)
 				}
 
 				err = waitForSync(birthdayBlock)
 				if err != nil {
-					log.Infof("Stopped waiting for wallet "+
-						"sync due to error: %v", err)
+					log.Infof("Stopped waiting for wallet sync due to error: %v", err)
 
 					return
 				}
@@ -220,15 +214,12 @@ func (w *Wallet) handleChainNotifications() {
 					waddrmgr.IsError(err, waddrmgr.ErrBlockNotFound) &&
 					!w.ChainSynced() {
 
-					log.Debugf("Received block connected "+
-						"notification for height %v "+
-						"while rescanning",
+					log.Debugf("Received block connected notification for height %v while rescanning",
 						n.(chain.BlockConnected).Height)
 					continue
 				}
 
-				log.Errorf("Unable to process chain backend "+
-					"%v notification: %v", notificationName,
+				log.Errorf("Unable to process chain backend %v notification: %v", notificationName,
 					err)
 			}
 		case <-w.quit:
@@ -268,17 +259,22 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
 
 	if !w.ChainSynced() {
+		log.Warnf("Ignoring disconnected block %v at height %d: wallet is not chain synced", b.Hash, b.Height)
+
 		return nil
 	}
 
 	// Disconnect the removed block and all blocks after it if we know about
 	// the disconnected block. Otherwise, the block is in the future.
-	if b.Height <= w.Manager.SyncedTo().Height {
+	syncedTo := w.Manager.SyncedTo()
+	if b.Height <= syncedTo.Height {
 		hash, err := w.Manager.BlockHash(addrmgrNs, b.Height)
 		if err != nil {
 			return err
 		}
 		if bytes.Equal(hash[:], b.Hash[:]) {
+			log.Infof("Rolling the wallet back to height %d after block %v was disconnected", b.Height-1, b.Hash)
+
 			bs := waddrmgr.BlockStamp{
 				Height: b.Height - 1,
 			}
@@ -304,7 +300,12 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 			if err != nil {
 				return err
 			}
+		} else {
+			log.Warnf("Ignoring disconnected block %v at height %d: wallet recorded %v there", b.Hash, b.Height, hash)
 		}
+	} else {
+		log.Warnf("Ignoring disconnected block %v at height %d: wallet tip is at height %d",
+			b.Hash, b.Height, syncedTo.Height)
 	}
 
 	// Notify interested clients of the disconnected block.
@@ -313,9 +314,7 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 	return nil
 }
 
-func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord,
-	block *wtxmgr.BlockMeta) error {
-
+func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord, block *wtxmgr.BlockMeta) error {
 	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
 	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
 
@@ -374,8 +373,7 @@ func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord,
 				return err
 			}
 			if !waddrmgr.IsDefaultScope(scopedManager.Scope()) {
-				log.Debugf("Skipping non-default scope "+
-					"address %v", addr)
+				log.Debugf("Skipping non-default scope address %v", addr)
 
 				continue
 			}
@@ -504,9 +502,7 @@ func (s *walletBirthdayStore) SetBirthdayBlock(block waddrmgr.BlockStamp) error 
 // block to ensure we do not miss any relevant events throughout rescans.
 // waddrmgr.ErrBirthdayBlockNotSet is returned if the birthday block has not
 // been set yet.
-func birthdaySanityCheck(chainConn chainConn,
-	birthdayStore birthdayStore) (*waddrmgr.BlockStamp, error) {
-
+func birthdaySanityCheck(chainConn chainConn, birthdayStore birthdayStore) (*waddrmgr.BlockStamp, error) {
 	// We'll start by fetching our wallet's birthday timestamp and block.
 	birthdayTimestamp := birthdayStore.Birthday()
 	birthdayBlock, birthdayBlockVerified, err := birthdayStore.BirthdayBlock()
@@ -518,8 +514,7 @@ func birthdaySanityCheck(chainConn chainConn,
 	// exit our sanity check to prevent potentially fetching a better
 	// candidate.
 	if birthdayBlockVerified {
-		log.Debugf("Birthday block has already been verified: "+
-			"height=%d, hash=%v", birthdayBlock.Height,
+		log.Debugf("Birthday block has already been verified: height=%d, hash=%v", birthdayBlock.Height,
 			birthdayBlock.Hash)
 
 		return &birthdayBlock, nil

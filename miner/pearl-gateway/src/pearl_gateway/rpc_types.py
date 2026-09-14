@@ -43,9 +43,5 @@ class GetBlockTemplateResponse(BaseModel):
     coinbaseaux: CoinbaseAux
     coinbasevalue: int = Field(ge=0)
     default_witness_commitment: str | None = None
-    # Optional for backward compatibility
-    requiredcertversion: int = Field(
-        default=int(CertificateVersion.ZK_DENSE),
-        ge=int(CertificateVersion.ZK_DENSE),
-        le=int(CertificateVersion.ZK_MOE),
-    )
+    # Absent from nodes that predate the field; those only ever require V1.
+    requiredcertversion: CertificateVersion = CertificateVersion.ZK_DENSE

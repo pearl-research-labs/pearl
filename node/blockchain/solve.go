@@ -12,24 +12,30 @@ import (
 	"github.com/pearl-research-labs/pearl/node/zkpow"
 )
 
-// SolveBlock mines a block certificate for the given header at the given height.
-// It produces a V2 certificate when the MoE fork is active; otherwise V1.
+// SolveBlock mines a block certificate for the given header at the given height,
+// producing the certificate version consensus requires at that height.
 //
 // On SimNet it returns a lightweight dummy certificate of the required version
 // (no actual mining). For real mining it modifies header.ProofCommitment to
 // match the mined certificate.
 func SolveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32) (wire.BlockCertificate, error) {
-	moeActive := params.IsMoEForkActive(height)
+	version := params.RequiredCertVersion(height)
 
 	if params.Net == wire.SimNet {
-		if moeActive {
+		switch version {
+		case wire.CertificateVersionV3:
+			cert := &wire.CertificateV3{}
+			cert.ProofData = []byte{0x00}
+			return cert, nil
+		case wire.CertificateVersionV2:
 			return &wire.CertificateV2{ProofData: []byte{0x00}}, nil
+		default:
+			return &wire.CertificateV1{ProofData: []byte{0x00}}, nil
 		}
-		return &wire.CertificateV1{ProofData: []byte{0x00}}, nil
 	}
 
-	if moeActive {
-		return zkpow.Mine(header)
+	if version == wire.CertificateVersionV1 {
+		return nil, fmt.Errorf("V1 mining not supported in this build; use a pre-fork binary")
 	}
-	return nil, fmt.Errorf("V1 mining not supported in this build; use a pre-fork binary")
+	return zkpow.Mine(header, version)
 }

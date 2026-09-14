@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::proof::{
     IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, MoEParams, PeriodicPattern, PrivateProofParams,
-    PublicProofParams,
+    PublicProofParams, SeedDerivation,
 };
 use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLocation, ProofSource, routing_blake_hotspot_rows};
 use crate::circuit::utils::macros::ensure_eq;
@@ -162,6 +162,19 @@ pub enum CertificateVersion {
     ZkDense = 1,
     /// V2: MoE and dense proofs.
     ZkMoe = 2,
+    /// V3: same wire layout as V2, salted noise-seed derivation.
+    ZkV3 = 3,
+}
+
+impl CertificateVersion {
+    /// The noise-seed derivation this certificate version mandates. This is the
+    /// single version→derivation mapping; the `api` layer only sees [`SeedDerivation`].
+    pub fn seed_derivation(self) -> SeedDerivation {
+        match self {
+            Self::ZkDense | Self::ZkMoe => SeedDerivation::Legacy,
+            Self::ZkV3 => SeedDerivation::Salted,
+        }
+    }
 }
 
 impl TryFrom<u32> for CertificateVersion {
@@ -171,6 +184,7 @@ impl TryFrom<u32> for CertificateVersion {
         match version {
             v if v == Self::ZkDense as u32 => Ok(Self::ZkDense),
             v if v == Self::ZkMoe as u32 => Ok(Self::ZkMoe),
+            v if v == Self::ZkV3 as u32 => Ok(Self::ZkV3),
             v => bail!("unknown certificate version: {v}"),
         }
     }
@@ -399,11 +413,78 @@ impl PlainProof {
         if let Some(moe) = &self.moe { self.n * moe.e } else { self.n }
     }
 
+    /// Leaf count the Merkle tree of a row-major byte buffer whose length is the
+    /// product of `dims` must declare. Errors if the product overflows `usize`.
+    fn expected_merkle_leaves(dims: &[usize]) -> Result<usize> {
+        let bytes = dims
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| anyhow::anyhow!("declared dimensions {dims:?} overflow usize"))?;
+        Ok(pearl_blake3::padded_chunk_len(bytes) / BLAKE3_CHUNK_LEN)
+    }
+
+    /// Rejects a proof whose committed Merkle trees don't have the leaf count
+    /// implied by the declared dimensions.
+    ///
+    /// The V3 noise seed is salted with the declared `m`/`n`, making them
+    /// consensus-critical: without pinning each tree's `total_leaves` to those
+    /// dimensions a miner could open one committed tree under several dimension
+    /// interpretations. The A/B trees are row-major `m*k` / `total_b_cols*k`
+    /// int8 bytes; the MoE routing tree is `m*top_k` little-endian `u32`s.
+    fn check_declared_tree_sizes(&self) -> Result<()> {
+        let a_expected = Self::expected_merkle_leaves(&[self.m, self.k])?;
+        ensure_eq!(
+            self.a.proof.total_leaves,
+            a_expected,
+            "A Merkle tree declares {} leaves but m={} k={} imply {}",
+            self.a.proof.total_leaves,
+            self.m,
+            self.k,
+            a_expected
+        );
+
+        let b_expected = Self::expected_merkle_leaves(&[self.total_b_cols(), self.k])?;
+        ensure_eq!(
+            self.bt.proof.total_leaves,
+            b_expected,
+            "B^T Merkle tree declares {} leaves but n={} k={} (total columns {}) imply {}",
+            self.bt.proof.total_leaves,
+            self.n,
+            self.k,
+            self.total_b_cols(),
+            b_expected
+        );
+
+        if let Some(moe) = &self.moe {
+            let routing_expected = Self::expected_merkle_leaves(&[self.m, moe.top_k, std::mem::size_of::<u32>()])?;
+            ensure_eq!(
+                moe.routing_proof.total_leaves,
+                routing_expected,
+                "routing Merkle tree declares {} leaves but m={} top_k={} imply {}",
+                moe.routing_proof.total_leaves,
+                self.m,
+                moe.top_k,
+                routing_expected
+            );
+        }
+        Ok(())
+    }
+
     /// Derives the inner A/B index lists used to build the periodic patterns,
     /// plus the public `MoEParams` (when this is an MoE proof).
     fn moe_inner_indices(&self) -> Result<(Vec<u32>, Vec<u32>, Option<MoEParams>)> {
-        let a_indices: Vec<u32> = self.a.row_indices.iter().map(|&x| x as u32).collect();
-        let bt_indices: Vec<u32> = self.bt.row_indices.iter().map(|&x| x as u32).collect();
+        let a_indices: Vec<u32> = self
+            .a
+            .row_indices
+            .iter()
+            .map(|&x| x.try_into().context("A row index exceeds u32"))
+            .collect::<Result<_>>()?;
+        let bt_indices: Vec<u32> = self
+            .bt
+            .row_indices
+            .iter()
+            .map(|&x| x.try_into().context("B row index exceeds u32"))
+            .collect::<Result<_>>()?;
 
         let Some(moe) = &self.moe else {
             return Ok((a_indices, bt_indices, None));
@@ -434,8 +515,21 @@ impl PlainProof {
 
         ensure!(moe.routing_end_offsets.len() == moe.e);
 
-        let inner_a: Vec<u32> = moe.inner_a_rows.iter().map(|&x| x as u32).collect();
-        let inner_b: Vec<u32> = bt_indices.iter().map(|&idx| idx - weight_col_offset as u32).collect();
+        let inner_a: Vec<u32> = moe
+            .inner_a_rows
+            .iter()
+            .map(|&x| x.try_into().context("MoE inner A row index exceeds u32"))
+            .collect::<Result<_>>()?;
+        let weight_col_offset_u32: u32 = weight_col_offset
+            .try_into()
+            .context("expert weight column offset exceeds u32")?;
+        let inner_b: Vec<u32> = bt_indices
+            .iter()
+            .map(|&idx| {
+                idx.checked_sub(weight_col_offset_u32)
+                    .context("B row index below expert offset")
+            })
+            .collect::<Result<_>>()?;
 
         ensure!(
             moe.e <= PublicProofParams::MAX_NUM_EXPERTS,
@@ -453,11 +547,31 @@ impl PlainProof {
     }
 
     /// Converts plain proof to Rust proof types, checks a,bt merkle roots match provided hashes.
-    pub fn parse_proof(&self, header: IncompleteBlockHeader) -> Result<(PrivateProofParams, PublicProofParams)> {
-        let (m, n, k) = (self.m, self.n, self.k);
+    pub fn parse_proof(
+        &self,
+        header: IncompleteBlockHeader,
+        seed_derivation: SeedDerivation,
+    ) -> Result<(PrivateProofParams, PublicProofParams)> {
+        // Leaf-count binds usize; public dims are u32/u16 — wrap would unbind them.
+        let m: u32 = self.m.try_into().context("m exceeds u32")?;
+        let n: u32 = self.n.try_into().context("n exceeds u32")?;
+        let k: u32 = self.k.try_into().context("k exceeds u32")?;
+        let noise_rank: u16 = self.noise_rank.try_into().context("noise_rank exceeds u16")?;
+
+        let moe_config = match &self.moe {
+            Some(mp) => Some(MoEConfig {
+                e: mp.e.try_into().context("e exceeds u16")?,
+                top_k: mp.top_k.try_into().context("top_k exceeds u16")?,
+            }),
+            None => None,
+        };
+
+        // Pin the committed trees to the declared dimensions before those
+        // dimensions flow into the (salted) noise-seed derivation.
+        self.check_declared_tree_sizes()?;
 
         for &tok in &self.a.row_indices {
-            ensure!(tok < m, "routing entry {} out of range for t={}", tok, m);
+            ensure!(tok < m as usize, "routing entry {} out of range for t={}", tok, m);
         }
 
         let (inner_a_indices, inner_b_indices, moe_params) = self.moe_inner_indices()?;
@@ -466,22 +580,20 @@ impl PlainProof {
 
         let public = PublicProofParams {
             block_header: header,
+            seed_derivation,
             mining_config: MiningConfiguration {
-                common_dim: k as u32,
-                rank: self.noise_rank as u16,
+                common_dim: k,
+                rank: noise_rank,
                 mma_type: MMAType::Int7xInt7ToInt32,
                 rows_pattern,
                 cols_pattern,
-                moe: self.moe.as_ref().map(|m| MoEConfig {
-                    e: m.e as u16,
-                    top_k: m.top_k as u16,
-                }),
+                moe: moe_config,
             },
             hash_a: self.a.proof.root,
             hash_b: self.bt.proof.root,
             hash_jackpot: [0xFFu8; 32], // Consumed only by ZK verifier
-            m: m as u32,
-            n: n as u32,
+            m,
+            n,
             t_rows,
             t_cols,
             moe: moe_params,
@@ -502,6 +614,7 @@ impl PlainProof {
             vec![]
         };
 
+        let k = k as usize;
         let private = PrivateProofParams {
             s_a: extract_strips(&self.a.row_indices, k, strip_len, &self.a.proof)?,
             s_b: extract_strips(&self.bt.row_indices, k, strip_len, &self.bt.proof)?,
@@ -647,8 +760,25 @@ mod tests {
     }
 
     #[test]
+    fn both_proof_kinds_eligible_under_v3() {
+        for proof in [dense_proof(), moe_proof()] {
+            assert_eq!(
+                check_cert_version_eligible(CertificateVersion::ZkV3 as u32, &proof).unwrap(),
+                CertificateVersion::ZkV3
+            );
+        }
+    }
+
+    #[test]
+    fn seed_derivation_mapping() {
+        assert_eq!(CertificateVersion::ZkDense.seed_derivation(), SeedDerivation::Legacy);
+        assert_eq!(CertificateVersion::ZkMoe.seed_derivation(), SeedDerivation::Legacy);
+        assert_eq!(CertificateVersion::ZkV3.seed_derivation(), SeedDerivation::Salted);
+    }
+
+    #[test]
     fn unknown_cert_versions_rejected() {
-        for version in [0u32, 3, u32::MAX] {
+        for version in [0u32, 4, u32::MAX] {
             assert!(check_cert_version_eligible(version, &dense_proof()).is_err());
         }
     }
@@ -683,5 +813,36 @@ mod tests {
         let mut bytes = bincode::serialize(&dense_proof()).unwrap();
         bytes.extend_from_slice(&[0x01, 0x02]);
         assert!(PlainProof::deserialize_compat(&bytes).is_err());
+    }
+
+    #[test]
+    fn declared_tree_sizes_must_match_padded_leaf_counts() {
+        // m*k = 200*16 = 3200 bytes -> ceil(3200/1024) = 4 leaves for A;
+        // n*k = 4*16 = 64 bytes -> 1 leaf for B^T.
+        let mut proof = PlainProof { m: 200, ..dense_proof() };
+        proof.a.proof.total_leaves = 4;
+        proof.bt.proof.total_leaves = 1;
+        proof.check_declared_tree_sizes().unwrap();
+
+        // Off-by-one in either tree is rejected.
+        proof.a.proof.total_leaves = 3;
+        assert!(proof.check_declared_tree_sizes().is_err());
+        proof.a.proof.total_leaves = 4;
+        proof.bt.proof.total_leaves = 2;
+        assert!(proof.check_declared_tree_sizes().is_err());
+    }
+
+    #[test]
+    fn declared_tree_sizes_check_routing_tree_for_moe() {
+        // m*k = 8*16 = 128 -> 1 leaf; total_b_cols*k = (4*4)*16 = 256 -> 1 leaf;
+        // routing m*top_k*4 = 8*2*4 = 64 -> 1 leaf.
+        let mut proof = moe_proof();
+        proof.a.proof.total_leaves = 1;
+        proof.bt.proof.total_leaves = 1;
+        proof.moe.as_mut().unwrap().routing_proof.total_leaves = 1;
+        proof.check_declared_tree_sizes().unwrap();
+
+        proof.moe.as_mut().unwrap().routing_proof.total_leaves = 3;
+        assert!(proof.check_declared_tree_sizes().is_err());
     }
 }

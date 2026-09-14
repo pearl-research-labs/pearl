@@ -10,21 +10,6 @@ from .blockchain_utils import double_sha256
 from .pearl_header import PearlHeader
 
 
-def _validate_mining_config_trailer(public_data: bytes | bytearray) -> None:
-    """Reject non-canonical MiningConfiguration trailers.
-
-    The trailer starts at byte 20 of public_data:  e(2 LE) | top_k(2 LE) | padding(28).
-    If e == 0 (non-MoE), top_k must also be 0; otherwise the unused bytes become
-    a free nonce that changes ProofCommitment without affecting the ZK proof.
-    """
-    if len(public_data) < 24:
-        raise ValueError(f"public_data too short for mining config: {len(public_data)} bytes")
-    e = int.from_bytes(public_data[20:22], "little")
-    top_k = int.from_bytes(public_data[22:24], "little")
-    if e == 0 and top_k != 0:
-        raise ValueError(f"invalid mining config: e=0 but top_k={top_k} (must be 0 for non-MoE)")
-
-
 class CertificateVersion(IntEnum):
     """Block certificate version (the wire format a block's certificate uses).
 
@@ -36,6 +21,11 @@ class CertificateVersion(IntEnum):
 
     ZK_DENSE = 1  # V1: dense (non-MoE) proofs only.
     ZK_MOE = 2  # V2: MoE and dense proofs.
+    ZK_V3 = 3  # V3: V2 layout with the salted noise-seed derivation.
+
+    @property
+    def uses_salted_seeds(self) -> bool:
+        return self >= CertificateVersion.ZK_V3
 
 
 _DENSE_DTYPE = np.dtype(
@@ -80,6 +70,7 @@ class ZKCertificate:
 
         ZK_DENSE (v1): Version(4) | HeaderHash(32) | PublicData(164) | ProofDataLen(4) | ProofData
         ZK_MOE   (v2): Version(4) | HeaderHash(32) | PublicDataLen(4) | PublicData(N) | ProofDataLen(4) | ProofData
+        ZK_V3 (v3): same layout as v2 (only the noise-seed derivation differs).
         """
         public_data = bytes(self.proof.public_data)
         proof = bytes(self.proof.proof_data)
@@ -118,7 +109,7 @@ class ZKCertificate:
             public_data = bytes(arr["public_data"])
             proof_data_len = int(arr["proof_data_len"])
             proof_data = data[_DENSE_DTYPE.itemsize : _DENSE_DTYPE.itemsize + proof_data_len]
-        elif cert_version == CertificateVersion.ZK_MOE:
+        elif cert_version in (CertificateVersion.ZK_MOE, CertificateVersion.ZK_V3):
             arr = np.frombuffer(data, dtype=_MOE_PREAMBLE_DTYPE, count=1)[0]
             header_hash = bytes(arr["header_hash"])
             pd_len = int(arr["public_data_len"])
@@ -132,7 +123,6 @@ class ZKCertificate:
         else:
             raise ValueError(f"Unsupported certificate version: {raw_version}")
 
-        _validate_mining_config_trailer(public_data)
         return cls(
             header_hash=header_hash,
             proof=ZKProof(public_data, proof_data),
@@ -146,7 +136,6 @@ class ZKCertificate:
         proof: ZKProof,
         cert_version: CertificateVersion = CertificateVersion.ZK_DENSE,
     ) -> "ZKCertificate":
-        _validate_mining_config_trailer(proof.public_data)
         commitment = cls._get_proof_commitment(proof.public_data, cert_version=cert_version)
         if header.proof_commitment is None:
             header.proof_commitment = commitment

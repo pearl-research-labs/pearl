@@ -54,6 +54,7 @@ def generate_plain_proof(
     rank: int = DEFAULT_RANK,
     signal_range: tuple[int, int] | None = None,
     wrong_jackpot_hash: bool = False,
+    cert_version: int = pearl_mining.CERT_VERSION_ZK_V3,
 ) -> pearl_mining.PlainProof:
     """Generate a PlainProof using mine()."""
     mining_config = create_default_mining_config(k, rank=rank)
@@ -65,6 +66,7 @@ def generate_plain_proof(
         mining_config,
         signal_range=signal_range,
         wrong_jackpot_hash=wrong_jackpot_hash,
+        cert_version=cert_version,
     )
 
 
@@ -78,8 +80,9 @@ def generate_moe_plain_proof(
     rank: int = DEFAULT_RANK,
     signal_range: tuple[int, int] | None = None,
     wrong_jackpot_hash: bool = False,
+    cert_version: int = pearl_mining.CERT_VERSION_ZK_V3,
 ) -> pearl_mining.PlainProof:
-    """Generate a PlainProof using mine_moe()."""
+    """Generate an MoE PlainProof with the current V3 derivation."""
     mining_config = create_default_mining_config(k, rank=rank, e=e, top_k=top_k)
     return pearl_mining.mine_moe(
         m,
@@ -89,6 +92,7 @@ def generate_moe_plain_proof(
         mining_config,
         signal_range=signal_range,
         wrong_jackpot_hash=wrong_jackpot_hash,
+        cert_version=cert_version,
     )
 
 
@@ -98,9 +102,9 @@ def prove_and_verify(
     *,
     expect_valid: bool = True,
 ) -> tuple[pearl_mining.ZKProof, bool, str]:
-    """Generate a ZK proof and verify it. Asserts the expected outcome."""
-    proof = pearl_mining.generate_proof_v2(block_header, plain_proof)
-    is_valid, message = pearl_mining.verify_proof_v2(block_header, proof)
+    """Generate a V3 ZK proof and verify it. Asserts the expected outcome."""
+    proof = pearl_mining.generate_proof_v3(block_header, plain_proof)
+    is_valid, message = pearl_mining.verify_proof_v3(block_header, proof)
     if expect_valid:
         assert is_valid, f"Verification unexpectedly failed: {message}"
     else:
@@ -114,9 +118,9 @@ def moe_prove_and_verify(
     *,
     expect_valid: bool = True,
 ) -> tuple[pearl_mining.ZKProof, bool, str]:
-    """Generate a ZK proof from an MoE mining solution and verify it."""
-    proof = pearl_mining.generate_proof_v2(block_header, moe_proof)
-    is_valid, message = pearl_mining.verify_proof_v2(block_header, proof)
+    """Generate a V3 ZK proof from an MoE mining solution and verify it."""
+    proof = pearl_mining.generate_proof_v3(block_header, moe_proof)
+    is_valid, message = pearl_mining.verify_proof_v3(block_header, proof)
     if expect_valid:
         assert is_valid, f"MoE verification unexpectedly failed: {message}"
     else:
@@ -159,14 +163,14 @@ class TestDifferentDimensions:
 
 
 class TestVerifyPlainProof:
-    """Tests for verify_plain_proof_v2(), which checks the mining solution without ZK proving."""
+    """Test V3 plain-proof verification without ZK proving."""
 
     def test_valid_plain_proof(self):
         m, n, k = 256, 128, DEFAULT_K
         block_header = create_test_block_header()
         plain_proof = generate_plain_proof(m, n, k, block_header)
 
-        is_valid, message = pearl_mining.verify_plain_proof_v2(block_header, plain_proof)
+        is_valid, message = pearl_mining.verify_plain_proof_v3(block_header, plain_proof)
         assert is_valid, f"verify_plain_proof failed on valid proof: {message}"
 
     def test_wrong_range_plain_proof(self):
@@ -181,7 +185,7 @@ class TestVerifyPlainProof:
             signal_range=OUT_OF_RANGE_SIGNAL_RANGE,
         )
 
-        is_valid, message = pearl_mining.verify_plain_proof_v2(block_header, plain_proof)
+        is_valid, message = pearl_mining.verify_plain_proof_v3(block_header, plain_proof)
         assert not is_valid, "verify_plain_proof accepted out-of-range matrices -- soundness issue!"
 
 
@@ -248,7 +252,7 @@ class TestMoEMineProveVerify:
             block_header,
         )
 
-        is_valid, msg = pearl_mining.verify_plain_proof_v2(block_header, moe_proof)
+        is_valid, msg = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
         assert is_valid, f"MoE plain proof verification failed: {msg}"
 
         moe_prove_and_verify(block_header, moe_proof)
@@ -258,14 +262,14 @@ class TestMoEMineProveVerify:
         block_header = create_test_block_header()
         moe_proof = generate_moe_plain_proof(m, n, k, e, top_k, block_header, rank=rank)
 
-        is_valid, msg = pearl_mining.verify_plain_proof_v2(block_header, moe_proof)
+        is_valid, msg = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
         assert is_valid, f"MoE plain proof verification failed: {msg}"
 
         moe_prove_and_verify(block_header, moe_proof)
 
 
 class TestMoEVerifyPlainProof:
-    """Tests for verify_plain_proof_v2() in the MoE context, which checks the MoE mining solution without ZK proving."""
+    """Test V3 plain-proof verification for MoE solutions."""
 
     def test_valid_moe_plain_proof(self):
         block_header = create_test_block_header()
@@ -278,7 +282,7 @@ class TestMoEVerifyPlainProof:
             block_header,
         )
 
-        is_valid, msg = pearl_mining.verify_plain_proof_v2(block_header, moe_proof)
+        is_valid, msg = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
         assert is_valid, f"verify_plain_proof failed on valid proof: {msg}"
 
     def test_wrong_range_moe_plain_proof(self):
@@ -294,7 +298,7 @@ class TestMoEVerifyPlainProof:
             signal_range=OUT_OF_RANGE_SIGNAL_RANGE,
         )
 
-        is_valid, msg = pearl_mining.verify_plain_proof_v2(block_header, moe_proof)
+        is_valid, msg = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
         assert not is_valid, "verify_plain_proof accepted out-of-range matrices -- soundness issue!"
 
 
@@ -349,8 +353,8 @@ class TestMoESerialization:
         encoded = moe_proof.to_base64()
         restored = pearl_mining.PlainProof.from_base64(encoded)
 
-        is_valid_original, _ = pearl_mining.verify_plain_proof_v2(block_header, moe_proof)
-        is_valid_restored, _ = pearl_mining.verify_plain_proof_v2(block_header, restored)
+        is_valid_original, _ = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
+        is_valid_restored, _ = pearl_mining.verify_plain_proof_v3(block_header, restored)
         assert is_valid_original and is_valid_restored, "Round-trip serialization broke the proof"
 
 
@@ -364,6 +368,13 @@ BINCODE_OPTION_NONE_TAG = 0x00
 HARD_NBITS = 0x10FFFFFF
 
 VALID_CERT_VERSIONS = [
+    pearl_mining.CERT_VERSION_ZK_DENSE,
+    pearl_mining.CERT_VERSION_ZK_MOE,
+    pearl_mining.CERT_VERSION_ZK_V3,
+]
+
+# Versions using the legacy (unsalted) noise-seed derivation.
+LEGACY_CERT_VERSIONS = [
     pearl_mining.CERT_VERSION_ZK_DENSE,
     pearl_mining.CERT_VERSION_ZK_MOE,
 ]
@@ -415,7 +426,10 @@ class TestLegacyV1Deserialization:
     def test_accepts_legacy_v1_blob(self):
         m, n, k = 256, 128, DEFAULT_K
         block_header = create_test_block_header()
-        plain_proof = generate_plain_proof(m, n, k, block_header)
+        # Old V1 miners used the legacy derivation.
+        plain_proof = generate_plain_proof(
+            m, n, k, block_header, cert_version=pearl_mining.CERT_VERSION_ZK_DENSE
+        )
 
         raw = base64.b64decode(plain_proof.to_base64())
         assert raw[-1] == BINCODE_OPTION_NONE_TAG
@@ -454,7 +468,7 @@ class TestCertVersionEligibility:
 
     def test_unknown_versions_rejected(self):
         dense = make_dummy_plain_proof(moe=False)
-        for version in (0, 3):
+        for version in (0, 4):
             with pytest.raises(ValueError, match="unknown certificate version"):
                 pearl_mining.check_cert_version_eligible(version, dense)
 
@@ -462,11 +476,15 @@ class TestCertVersionEligibility:
 class TestCertVersionDispatchers:
     """The *_for_cert_version entry points pick the circuit from the block's version."""
 
-    @pytest.mark.parametrize("cert_version", VALID_CERT_VERSIONS)
+    @pytest.mark.parametrize("cert_version", LEGACY_CERT_VERSIONS)
     def test_dense_proof_round_trip_under_both_versions(self, cert_version):
         m, n, k = 256, 128, DEFAULT_K
         block_header = create_test_block_header()
-        plain_proof = generate_plain_proof(m, n, k, block_header)
+        # Both legacy versions share a derivation, so the same dense proof must
+        # verify under either dispatcher.
+        plain_proof = generate_plain_proof(
+            m, n, k, block_header, cert_version=pearl_mining.CERT_VERSION_ZK_DENSE
+        )
 
         is_valid, msg = pearl_mining.verify_plain_proof_for_cert_version(
             cert_version, block_header, plain_proof
@@ -490,13 +508,53 @@ class TestCertVersionDispatchers:
             )
 
 
+class TestSaltedCertVersion:
+    """V3 (salted noise-seed) mining, verification, and cross-derivation rejection."""
+
+    def test_salted_round_trip(self):
+        m, n, k = 256, 128, DEFAULT_K
+        block_header = create_test_block_header()
+        plain_proof = generate_plain_proof(m, n, k, block_header)
+
+        is_valid, msg = pearl_mining.verify_plain_proof_for_cert_version(
+            pearl_mining.CERT_VERSION_ZK_V3, block_header, plain_proof
+        )
+        assert is_valid, f"salted plain proof verification failed: {msg}"
+
+        proof = pearl_mining.generate_proof_for_cert_version(
+            pearl_mining.CERT_VERSION_ZK_V3, block_header, plain_proof
+        )
+        is_valid, msg = pearl_mining.verify_proof_for_cert_version(
+            pearl_mining.CERT_VERSION_ZK_V3, block_header, proof
+        )
+        assert is_valid, f"salted ZK verification failed: {msg}"
+
+    def test_cross_derivation_rejected(self):
+        """A proof mined under one derivation must fail under the other."""
+        m, n, k = 256, 128, DEFAULT_K
+        block_header = create_test_block_header()
+
+        legacy_proof = generate_plain_proof(
+            m, n, k, block_header, cert_version=pearl_mining.CERT_VERSION_ZK_MOE
+        )
+        is_valid, _ = pearl_mining.verify_plain_proof_v3(block_header, legacy_proof)
+        assert not is_valid, "legacy-derived proof accepted under the salted derivation"
+
+        salted_proof = generate_plain_proof(m, n, k, block_header)
+        is_valid, _ = pearl_mining.verify_plain_proof_v2(block_header, salted_proof)
+        assert not is_valid, "salted-derived proof accepted under the legacy derivation"
+
+
 class TestV1NbitsOverride:
-    """verify_plain_proof_v1() supports pool share-difficulty overrides like v2."""
+    """verify_plain_proof_v1() supports pool share-difficulty overrides."""
 
     def test_share_difficulty_override(self):
         m, n, k = 256, 128, DEFAULT_K
         block_header = create_test_block_header()
-        plain_proof = generate_plain_proof(m, n, k, block_header)
+        # V1 verification uses the legacy derivation.
+        plain_proof = generate_plain_proof(
+            m, n, k, block_header, cert_version=pearl_mining.CERT_VERSION_ZK_DENSE
+        )
 
         is_valid, msg = pearl_mining.verify_plain_proof_v1(
             block_header, plain_proof, nbits_override=DEFAULT_NBITS

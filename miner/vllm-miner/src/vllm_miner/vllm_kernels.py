@@ -25,7 +25,7 @@ from vllm.platforms import current_platform
 from .config import config
 from .gemm_operators import pearl_gemm_noisy, pearl_gemm_vanilla
 from .mining_state import get_async_manager
-from .quantization_operators import quant_7bit, quant_8bit
+from .quantization_operators import NO_HADAMARD_BLOCK_SIZE, quant_7bit, quant_8bit
 
 _LOGGER = get_logger("vllm.pearl_miner")
 
@@ -143,6 +143,13 @@ class PearlKernel(Int8ScaledMMLinearKernel):
             if scale is not None and not isinstance(scale, torch.nn.Parameter):
                 layer.smooth_quant_scale = torch.nn.Parameter(scale.data, requires_grad=False)
 
+        hadamard_block_size_param = getattr(layer, "hadamard_block_size", None)
+        layer._hadamard_block_size = (
+            int(hadamard_block_size_param.item())
+            if hadamard_block_size_param is not None
+            else NO_HADAMARD_BLOCK_SIZE
+        )
+
     @override
     def apply_weights(
         self,
@@ -169,9 +176,13 @@ class PearlKernel(Int8ScaledMMLinearKernel):
             smooth_scale = layer.smooth_quant_scale
 
         if self.mining_enabled:
-            return self._apply_weights_mining(layer, x, w_q, w_s, smooth_scale, bias)
+            return self._apply_weights_mining(
+                layer, x, w_q, w_s, smooth_scale, layer._hadamard_block_size, bias
+            )
         else:
-            return self._apply_weights_non_mining(layer, x, w_q, w_s, smooth_scale, bias)
+            return self._apply_weights_non_mining(
+                layer, x, w_q, w_s, smooth_scale, layer._hadamard_block_size, bias
+            )
 
     def _apply_weights_mining(
         self,
@@ -180,6 +191,7 @@ class PearlKernel(Int8ScaledMMLinearKernel):
         w_q: torch.Tensor,
         w_s: torch.Tensor,
         smooth_scale: torch.Tensor | None,
+        hadamard_block_size: int,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """
@@ -187,8 +199,7 @@ class PearlKernel(Int8ScaledMMLinearKernel):
 
         Uses noisy GEMM for large matrices (proof-of-work), vanilla GEMM for small ones.
         """
-        # INT7 quantization with optional smooth scale
-        x_q, x_s, _ = quant_7bit(x, smooth_scale=smooth_scale)
+        x_q, x_s, _ = quant_7bit(x, smooth_scale=smooth_scale, block_size=hadamard_block_size)
 
         m, k, n = x_q.shape[0], x_q.shape[1], w_q.shape[0]
 
@@ -219,13 +230,13 @@ class PearlKernel(Int8ScaledMMLinearKernel):
         w_q: torch.Tensor,
         w_s: torch.Tensor,
         smooth_scale: torch.Tensor | None,
+        hadamard_block_size: int,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """
         Apply weights in non-mining mode: int8 quantization + vanilla GEMM only.
         """
-        # INT8 quantization with optional smooth scale
-        x_q, x_s, _ = quant_8bit(x, smooth_scale=smooth_scale)
+        x_q, x_s, _ = quant_8bit(x, smooth_scale=smooth_scale, block_size=hadamard_block_size)
 
         return pearl_gemm_vanilla(
             x_q.contiguous(),

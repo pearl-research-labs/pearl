@@ -281,8 +281,9 @@ void tensor_hash(
 void commitment_hash_from_merkle_roots(
     const uint8_t* A_merkle_root, const uint8_t* B_merkle_root,
     const uint8_t* key, uint8_t* A_commitment_hash, uint8_t* B_commitment_hash,
-    const uint8_t* routing_root, const uint8_t* offsets_hash,
-    cudaDeviceProp& deviceProp, cudaStream_t stream) {
+    const uint8_t* routing_root, const uint8_t* offsets_hash, bool apply_salt,
+    uint32_t salted_dim_a, uint32_t salted_dim_b, cudaDeviceProp& deviceProp,
+    cudaStream_t stream) {
 
   using CommitmentHashFromMerkleRootsKernel =
       pearl::CommitmentHashFromMerkleRootsKernel;
@@ -294,7 +295,10 @@ void commitment_hash_from_merkle_roots(
       static_cast<uint8_t*>(A_commitment_hash),
       static_cast<uint8_t*>(B_commitment_hash),
       static_cast<const uint8_t*>(routing_root),
-      static_cast<const uint8_t*>(offsets_hash)};
+      static_cast<const uint8_t*>(offsets_hash),
+      apply_salt,
+      salted_dim_a,
+      salted_dim_b};
 
   typename CommitmentHashFromMerkleRootsKernel::Params kernel_params =
       CommitmentHashFromMerkleRootsKernel::to_underlying_arguments(args);
@@ -316,10 +320,13 @@ void commitment_hash_from_merkle_roots(
   kernel<<<grid, block, commitment_hash_smem_size, stream>>>(kernel_params);
 }
 
-void commitment_hash_from_b_commitment(
-    const uint8_t* A_merkle_root, const uint8_t* B_commitment_hash,
-    uint8_t* A_commitment_hash, const uint8_t* routing_root,
-    const uint8_t* offsets_hash, cudaDeviceProp& deviceProp, cudaStream_t stream) {
+void commitment_hash_from_b_commitment(const uint8_t* A_merkle_root,
+                                       const uint8_t* B_commitment_hash,
+                                       uint8_t* A_commitment_hash,
+                                       const uint8_t* routing_root,
+                                       const uint8_t* offsets_hash,
+                                       cudaDeviceProp& deviceProp,
+                                       cudaStream_t stream) {
 
   using CommitmentHashFromBCommitmentKernel =
       pearl::CommitmentHashFromBCommitmentKernel;
@@ -345,5 +352,6 @@ void commitment_hash_from_b_commitment(
                                    commitment_hash_smem_size));
   }
 
-  kernel<<<dim3(1), dim3(1), commitment_hash_smem_size, stream>>>(kernel_params);
+  kernel<<<dim3(1), dim3(1), commitment_hash_smem_size, stream>>>(
+      kernel_params);
 }

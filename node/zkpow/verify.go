@@ -21,9 +21,13 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
+
+// MinNoiseRank is the minimum accepted by the rank-penalty rule, taken from the
+// Rust implementation of the rule, which asserts at compile time that the value it
+// exports matches the one it enforces.
+const MinNoiseRank = C.MIN_NOISE_RANK
 
 // ================================================================================
 // CERTIFICATE VERIFICATION
@@ -31,10 +35,13 @@ import (
 
 // VerifyCertificate performs sanity checks followed by cryptographic proof verification.
 // It returns an error if the certificate is invalid or does not match the header.
+// V3 certificates (CertificateV3) share the V2 layout but use the salted noise-seed derivation.
 // V2 certificates (CertificateV2) handle both MoE and non-MoE new proofs.
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
 	switch c := cert.(type) {
+	case *wire.CertificateV3:
+		return verifyCertificateV3(header, c)
 	case *wire.CertificateV2:
 		return verifyCertificateV2(header, c)
 	case *wire.CertificateV1:
@@ -92,50 +99,42 @@ func verifyCertificateV1(header *wire.BlockHeader, c *wire.CertificateV1) error 
 }
 
 // ================================================================================
-// V2 CERTIFICATE VERIFICATION
+// V2/V3 CERTIFICATE VERIFICATION
 // ================================================================================
 
 func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error {
-	// Guard against directly-constructed structs that bypassed Deserialize.
-	if c.PublicDataLen > wire.PublicDataMaxSizeV2 {
-		return fmt.Errorf("invalid public_data_len %d (max %d)", c.PublicDataLen, wire.PublicDataMaxSizeV2)
-	}
-	publicData := c.PublicData[:c.PublicDataLen]
-	if len(publicData) < 24 {
-		return fmt.Errorf("public_data too short for mining config: %d bytes", len(publicData))
-	}
-	// MiningConfiguration trailer: e is at bytes 20-21 (u16 LE), top_k at bytes 22-23 (u16 LE).
-	// If e == 0 (non-MoE), top_k must also be 0.
-	e := uint16(publicData[20]) | uint16(publicData[21])<<8
-	topK := uint16(publicData[22]) | uint16(publicData[23])<<8
-	if e == 0 && topK != 0 {
-		return fmt.Errorf("invalid mining config: e=0 but top_k=%d (must be 0 for non-MoE)", topK)
-	}
-	return VerifyZKProofFFI(header, c.Hash, c.ProofCommitment(), publicData, c.ProofData, nil)
+	return VerifyZKProofFFI(header, c, nil)
 }
 
+func verifyCertificateV3(header *wire.BlockHeader, c *wire.CertificateV3) error {
+	return VerifyZKProofFFI(header, c, nil)
+}
+
+// VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.
 func VerifyZKProofFFI(
 	header *wire.BlockHeader,
-	certHash chainhash.Hash,
-	proofCommitment chainhash.Hash,
-	publicData []byte,
-	proofData []byte,
+	cert wire.BlockCertificate,
 	nbitsOverride *uint32,
 ) error {
+	certHash := cert.BlockHash()
 	blockHash := header.BlockHash()
 	if !certHash.IsEqual(&blockHash) {
 		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
 			certHash, blockHash)
 	}
 
+	proofCommitment := cert.ProofCommitment()
 	if header.ProofCommitment != proofCommitment {
 		return fmt.Errorf("proof commitment mismatch: header has %s, certificate has %s",
 			header.ProofCommitment, proofCommitment)
 	}
 
+	publicData := cert.PublicDataBytes()
 	if len(publicData) == 0 { // avoid publicData[0] index below
 		return fmt.Errorf("empty public data")
 	}
+
+	proofData := cert.ProofBytes()
 	if len(proofData) == 0 { // avoid proofData[0] index below
 		return fmt.Errorf("empty proof data")
 	}
@@ -158,10 +157,21 @@ func VerifyZKProofFFI(
 	// Call Rust FFI
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
 	var result C.int32_t
-	if nbitsOverride != nil {
-		result = C.verify_zk_proof_v2_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
-	} else {
-		result = C.verify_zk_proof_v2(&cBlockHeader, &cZKProof, &errorBuf[0])
+	switch cert.Version() {
+	case wire.CertificateVersionV2:
+		if nbitsOverride != nil {
+			result = C.verify_zk_proof_v2_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
+		} else {
+			result = C.verify_zk_proof_v2(&cBlockHeader, &cZKProof, &errorBuf[0])
+		}
+	case wire.CertificateVersionV3:
+		if nbitsOverride != nil {
+			result = C.verify_zk_proof_v3_with_nbits(&cBlockHeader, &cZKProof, C.uint32_t(*nbitsOverride), &errorBuf[0])
+		} else {
+			result = C.verify_zk_proof_v3(&cBlockHeader, &cZKProof, &errorBuf[0])
+		}
+	default:
+		return fmt.Errorf("unsupported certificate version %d for FFI verification", cert.Version())
 	}
 	msg := C.GoString(&errorBuf[0])
 
@@ -174,6 +184,35 @@ func VerifyZKProofFFI(
 		return fmt.Errorf("verification system error: %s", msg)
 	default:
 		return fmt.Errorf("unknown verification result %d: %s", result, msg)
+	}
+}
+
+// CheckRankPenalty checks public data against the rank-penalty rule, measuring the
+// jackpot against bits: a block header's Bits for consensus, or a share target for
+// pool accounting. Callers decide whether the height-gated rule is active.
+func CheckRankPenalty(bits uint32, publicData []byte) error {
+	if len(publicData) == 0 { // avoid publicData[0] index below
+		return fmt.Errorf("empty public data")
+	}
+
+	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
+	result := C.check_rank_penalty(
+		C.uint32_t(bits),
+		(*C.uint8_t)(unsafe.Pointer(&publicData[0])),
+		C.uintptr_t(len(publicData)),
+		&errorBuf[0],
+	)
+	msg := C.GoString(&errorBuf[0])
+
+	switch result {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("rank penalty rule violated: %s", msg)
+	case 2:
+		return fmt.Errorf("rank penalty check system error: %s", msg)
+	default:
+		return fmt.Errorf("unknown rank penalty check result %d: %s", result, msg)
 	}
 }
 

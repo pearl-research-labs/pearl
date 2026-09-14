@@ -86,9 +86,9 @@ func TestSigCacheAddEvictEntry(t *testing.T) {
 	}
 
 	// The sigcache should now have sigCacheSize entries within it.
-	if uint(len(sigCache.validSigs)) != sigCacheSize {
+	if uint(sigCache.validSigs.len()) != sigCacheSize {
 		t.Fatalf("sigcache should now have %v entries, instead it has %v",
-			sigCacheSize, len(sigCache.validSigs))
+			sigCacheSize, sigCache.validSigs.len())
 	}
 
 	// Add a new entry, this should cause eviction of a randomly chosen
@@ -100,9 +100,9 @@ func TestSigCacheAddEvictEntry(t *testing.T) {
 	sigCache.Add(*msgNew, sigNew.Serialize(), keyNew.SerializeCompressed())
 
 	// The sigcache should still have sigCache entries.
-	if uint(len(sigCache.validSigs)) != sigCacheSize {
+	if uint(sigCache.validSigs.len()) != sigCacheSize {
 		t.Fatalf("sigcache should now have %v entries, instead it has %v",
-			sigCacheSize, len(sigCache.validSigs))
+			sigCacheSize, sigCache.validSigs.len())
 	}
 
 	// The entry added above should be found within the sigcache.
@@ -137,8 +137,8 @@ func TestSigCacheAddMaxEntriesZeroOrNegative(t *testing.T) {
 	}
 
 	// There shouldn't be any entries in the sigCache.
-	if len(sigCache.validSigs) != 0 {
+	if sigCache.validSigs.len() != 0 {
 		t.Errorf("%v items found in sigcache, no items should have"+
-			"been added", len(sigCache.validSigs))
+			"been added", sigCache.validSigs.len())
 	}
 }

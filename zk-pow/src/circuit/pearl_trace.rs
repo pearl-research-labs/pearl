@@ -163,7 +163,7 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Fill JOB_KEY (PUBLIC)
-    for chunk in compiled_params.job_key.chunks_exact(BYTES_PER_GOLDILOCKS) {
+    for chunk in compiled_params.job_key.as_chunks::<BYTES_PER_GOLDILOCKS>().0 {
         public_inputs_builder.dump_u64(u64_pack_le(chunk, 8));
     }
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::JOB_KEY_END);
@@ -171,7 +171,7 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
     // Fill COMMITMENT_HASH (PUBLIC)
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::COMMITMENT_HASH);
     let (_, commitment_hash) = compiled_params.commitment_hash;
-    for chunk in commitment_hash.chunks_exact(BYTES_PER_GOLDILOCKS) {
+    for chunk in commitment_hash.as_chunks::<BYTES_PER_GOLDILOCKS>().0 {
         public_inputs_builder.dump_u64(u64_pack_le(chunk, 8));
     }
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::COMMITMENT_HASH_END);
@@ -179,7 +179,7 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Fill HASH_A (PUBLIC)
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_A);
-    for chunk in public_params.hash_a.chunks_exact(BYTES_PER_GOLDILOCKS) {
+    for chunk in public_params.hash_a.as_chunks::<BYTES_PER_GOLDILOCKS>().0 {
         public_inputs_builder.dump_u64(u64_pack_le(chunk, 8));
     }
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_A_END);
@@ -187,7 +187,7 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////
     // Fill HASH_B (PUBLIC)
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_B);
-    for chunk in public_params.hash_b.chunks_exact(BYTES_PER_GOLDILOCKS) {
+    for chunk in public_params.hash_b.as_chunks::<BYTES_PER_GOLDILOCKS>().0 {
         public_inputs_builder.dump_u64(u64_pack_le(chunk, 8));
     }
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_B_END);
@@ -196,7 +196,7 @@ pub fn generate_trace<F: RichField + Extendable<D>, const D: usize>(
     // Fill HASH_ROUTING (PUBLIC). Zero-filled for non-MoE proofs.
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_ROUTING);
     let hash_routing = public_params.moe.as_ref().map(|moe| moe.hash_routing).unwrap_or_default();
-    for chunk in hash_routing.chunks_exact(BYTES_PER_GOLDILOCKS) {
+    for chunk in hash_routing.as_chunks::<BYTES_PER_GOLDILOCKS>().0 {
         public_inputs_builder.dump_u64(u64_pack_le(chunk, 8));
     }
     debug_assert_eq!(public_inputs_builder.offset, pearl_public::HASH_ROUTING_END);

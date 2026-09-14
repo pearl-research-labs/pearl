@@ -10,6 +10,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	_ "crypto/sha512" // Needed for RegisterHash in init
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -18,11 +19,12 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 )
 
 // NewTLSCertPair returns a new PEM-encoded x.509 certificate pair
-// based on a 521-bit ECDSA private key.  The machine's local interface
+// based on a P-256 ECDSA private key.  The machine's local interface
 // addresses and all variants of IPv4 and IPv6 localhost are included as
 // valid IP addresses.
 func NewTLSCertPair(organization string, validUntil time.Time, extraHosts []string) (cert, key []byte, err error) {
@@ -31,7 +33,7 @@ func NewTLSCertPair(organization string, validUntil time.Time, extraHosts []stri
 		return nil, nil, errors.New("validUntil would create an already-expired certificate")
 	}
 
-	priv, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -129,16 +131,65 @@ func NewTLSCertPair(organization string, validUntil time.Time, extraHosts []stri
 		return nil, nil, fmt.Errorf("failed to encode certificate: %v", err)
 	}
 
-	keybytes, err := x509.MarshalECPrivateKey(priv)
+	keybytes, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to marshal private key: %v", err)
 	}
 
 	keyBuf := &bytes.Buffer{}
-	err = pem.Encode(keyBuf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keybytes})
+	err = pem.Encode(keyBuf, &pem.Block{Type: "PRIVATE KEY", Bytes: keybytes})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to encode private key: %v", err)
 	}
 
 	return certBuf.Bytes(), keyBuf.Bytes(), nil
+}
+
+// WriteTLSCertPair generates a self-signed certificate/key pair via
+// NewTLSCertPair, creates the parent directories of certFile and keyFile, and
+// writes the PEM-encoded certificate (0644, public) and -- when writeKey is
+// true -- the private key (0600).  On a key-write failure the certificate file
+// is removed so a half-written pair is not left behind.  The parsed keypair is
+// returned regardless of whether the key was persisted.
+func WriteTLSCertPair(certFile, keyFile, org string, validUntil time.Time, extraHosts []string, writeKey bool) (tls.Certificate, error) {
+	cert, key, err := NewTLSCertPair(org, validUntil, extraHosts)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	keyPair, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(certFile), 0700); err != nil {
+		return tls.Certificate{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(keyFile), 0700); err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// The certificate is public, so 0644 is appropriate; the private key
+	// must stay owner-only.
+	if err := os.WriteFile(certFile, cert, 0644); err != nil {
+		return tls.Certificate{}, err
+	}
+	if writeKey {
+		// os.WriteFile keeps an existing file's mode, so remove any stale
+		// key first to guarantee the new one is created owner-only (0600).
+		if err := os.Remove(keyFile); err != nil && !os.IsNotExist(err) {
+			// Don't leave the freshly written cert without a matching
+			// key.
+			_ = os.Remove(certFile)
+			return tls.Certificate{}, err
+		}
+		if err := os.WriteFile(keyFile, key, 0600); err != nil {
+			// Best-effort cleanup so a cert without its key is not
+			// left behind.
+			_ = os.Remove(certFile)
+			return tls.Certificate{}, err
+		}
+	}
+
+	return keyPair, nil
 }

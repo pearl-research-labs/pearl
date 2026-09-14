@@ -8,7 +8,9 @@
 
 use rand_chacha::rand_core::SeedableRng;
 
-use zk_pow::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, ZKProof};
+use zk_pow::api::proof::{
+    IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, SeedDerivation, ZKProof,
+};
 use zk_pow::api::{prove, verify};
 use zk_pow::circuit::chip::blake3::program::{BLOCK_LEN, routing_blake_hotspot_rows};
 use zk_pow::circuit::circuit_utils::CircuitCache;
@@ -53,7 +55,18 @@ fn moe_params() -> MoETestParams {
 fn mine_moe_proof(p: &MoETestParams, seed: u64) -> PlainProof {
     let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
     loop {
-        let proof = try_mine_one_moe(&mut rng, p.m, p.n, p.k, p.header, p.config, None, false).unwrap();
+        let proof = try_mine_one_moe(
+            &mut rng,
+            p.m,
+            p.n,
+            p.k,
+            p.header,
+            p.config,
+            None,
+            false,
+            SeedDerivation::Legacy,
+        )
+        .unwrap();
         if let Some(proof) = proof {
             return proof;
         }
@@ -63,7 +76,7 @@ fn mine_moe_proof(p: &MoETestParams, seed: u64) -> PlainProof {
 /// Prove an MoE proof end-to-end and return the serialized result.
 fn prove_moe(p: &MoETestParams, moe_proof: &PlainProof) -> prove::ProveResult {
     let mut cache = CircuitCache::default();
-    prove::zk_prove_plain_proof(p.header, moe_proof, &mut cache, true).expect("MoE proving failed")
+    prove::zk_prove_plain_proof(p.header, moe_proof, &mut cache, true, SeedDerivation::Legacy).expect("MoE proving failed")
 }
 
 // =============================================================================
@@ -76,7 +89,8 @@ fn test_moe_prove_verify() {
     let moe_proof = mine_moe_proof(&p, 0xdeadbeef);
     let result = prove_moe(&p, &moe_proof);
 
-    let (public_params, zk_proof) = ZKProof::deserialize(p.header, &result.public_data, &result.proof_data).unwrap();
+    let (public_params, zk_proof) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
 
     let mut cache = CircuitCache::default();
     verify::verify_block(&public_params, &zk_proof, &mut cache).expect("MoE proof must verify");
@@ -111,7 +125,7 @@ fn test_moe_routing_not_multiple_of_64_parse() {
     let p = moe_params_routing_not_multiple_of_64();
     let moe_proof = mine_moe_proof(&p, 0x51515151);
 
-    let (private, public) = moe_proof.parse_proof(p.header).unwrap();
+    let (private, public) = moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
     public.sanity_check().unwrap();
     public.sanity_check_private_params(&private).unwrap();
 }
@@ -124,7 +138,8 @@ fn test_moe_routing_not_multiple_of_64_prove_verify() {
     let moe_proof = mine_moe_proof(&p, 0x51515151);
     let result = prove_moe(&p, &moe_proof);
 
-    let (public_params, zk_proof) = ZKProof::deserialize(p.header, &result.public_data, &result.proof_data).unwrap();
+    let (public_params, zk_proof) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
     let mut cache = CircuitCache::default();
     verify::verify_block(&public_params, &zk_proof, &mut cache).expect("non-64-aligned routing must verify");
 }
@@ -141,7 +156,8 @@ fn test_moe_wrong_public_outer_indices_fails_verification() {
     let moe_proof = mine_moe_proof(&p, 0xcafebabe);
     let result = prove_moe(&p, &moe_proof);
 
-    let (mut public_params, _) = ZKProof::deserialize(p.header, &result.public_data, &result.proof_data).unwrap();
+    let (mut public_params, _) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
 
     let moe = public_params.moe.as_mut().unwrap();
     for idx in moe.outer_indices.iter_mut() {
@@ -149,7 +165,8 @@ fn test_moe_wrong_public_outer_indices_fails_verification() {
     }
 
     let tampered_public_data = public_params.to_wire_bytes().unwrap();
-    let (tampered_params, zk_proof) = ZKProof::deserialize(p.header, &tampered_public_data, &result.proof_data).unwrap();
+    let (tampered_params, zk_proof) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &tampered_public_data, &result.proof_data).unwrap();
 
     let mut cache = CircuitCache::default();
     let err = verify::verify_block(&tampered_params, &zk_proof, &mut cache).unwrap_err();
@@ -177,7 +194,7 @@ fn test_moe_corrupted_routing_root_fails_parse() {
 
     moe_proof.moe = Some(moe);
 
-    moe_proof.parse_proof(p.header).unwrap();
+    moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
 }
 
 // =============================================================================
@@ -196,7 +213,7 @@ fn test_moe_routing_outer_index_mismatch_fails_parse() {
     assert!(len >= 1, "Need at least 1 row index");
     moe_proof.a.row_indices[len - 1] += 1;
 
-    moe_proof.parse_proof(p.header).unwrap();
+    moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
 }
 
 // =============================================================================
@@ -208,7 +225,7 @@ fn test_moe_roundtrip_parse_only() {
     let p = moe_params();
     let moe_proof = mine_moe_proof(&p, 0xdeadbeef);
 
-    let (private, public) = moe_proof.parse_proof(p.header).unwrap();
+    let (private, public) = moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
 
     let moe = public.moe.as_ref().unwrap();
     assert_eq!(moe.outer_indices.len(), moe_proof.a.row_indices.len());
@@ -241,13 +258,15 @@ fn test_moe_tampered_hash_routing_fails() {
     let moe_proof = mine_moe_proof(&p, 0xabcdef01);
     let result = prove_moe(&p, &moe_proof);
 
-    let (mut public_params, _) = ZKProof::deserialize(p.header, &result.public_data, &result.proof_data).unwrap();
+    let (mut public_params, _) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
 
     let moe = public_params.moe.as_mut().unwrap();
     moe.hash_routing[0] ^= 0xFF;
 
     let tampered_data = public_params.to_wire_bytes().unwrap();
-    let (tampered_params, zk_proof) = ZKProof::deserialize(p.header, &tampered_data, &result.proof_data).unwrap();
+    let (tampered_params, zk_proof) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &tampered_data, &result.proof_data).unwrap();
 
     let mut cache = CircuitCache::default();
     let err = verify::verify_block(&tampered_params, &zk_proof, &mut cache).unwrap_err();
@@ -278,7 +297,7 @@ fn test_moe_wrong_routing_start_offset_fails_parse() {
     moe.routing_end_offsets[moe.expert_idx as usize - 1] += 1;
     moe_proof.moe = Some(moe);
 
-    moe_proof.parse_proof(p.header).unwrap();
+    moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
 }
 
 // =============================================================================
@@ -526,7 +545,8 @@ fn run_moe_prove_verify(p: &MoETestParams, seed: u64) {
         offset % 16
     );
 
-    let (public_params, zk_proof) = ZKProof::deserialize(p.header, &result.public_data, &result.proof_data).unwrap();
+    let (public_params, zk_proof) =
+        ZKProof::deserialize(p.header, SeedDerivation::Legacy, &result.public_data, &result.proof_data).unwrap();
     let mut cache = CircuitCache::default();
     verify::verify_block(&public_params, &zk_proof, &mut cache).expect("MoE proof must verify");
 }
@@ -611,7 +631,7 @@ fn test_moe_prove_verify_e5_top_k3() {
 fn test_moe_outer_index_exceeding_26_bits_fails() {
     let p = moe_params();
     let moe_proof = mine_moe_proof(&p, 0xdeadbeef);
-    let (private_params, mut public_params) = moe_proof.parse_proof(p.header).unwrap();
+    let (private_params, mut public_params) = moe_proof.parse_proof(p.header, SeedDerivation::Legacy).unwrap();
 
     // Set the last outer_index to 2^26, which exceeds the 26-bit range.
     // Each outer index is split into two 13-bit limbs that are range-checked

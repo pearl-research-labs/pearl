@@ -1,15 +1,19 @@
 package dnsseed
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/coredns/caddy"
+	"github.com/pearl-research-labs/pearl/node/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseConfig(t *testing.T) {
+func TestParse(t *testing.T) {
+	minProtoAboveFloor := strconv.Itoa(peer.MinAcceptableProtocolVersion + 1)
+
 	tests := []struct {
 		name      string
 		config    string
@@ -17,8 +21,7 @@ func TestParseConfig(t *testing.T) {
 		network   string
 		interval  time.Duration
 		bootstrap []string
-		ttl       uint32
-		maxAns    uint32
+		minProto  uint32
 	}{
 		{
 			name:   "bare dnsseed",
@@ -36,13 +39,22 @@ func TestParseConfig(t *testing.T) {
 			valid:  false,
 		},
 		{
-			name:     "mainnet defaults",
-			config:   `dnsseed { network mainnet }`,
-			valid:    true,
-			network:  "mainnet",
-			interval: defaultUpdateInterval,
-			ttl:      defaultTTL,
-			maxAns:   defaultMaxAnswers,
+			name:   "missing bootstrap_peers rejected",
+			config: `dnsseed { network mainnet }`,
+			valid:  false,
+		},
+		{
+			name:   "missing network rejected",
+			config: "dnsseed {\n  bootstrap_peers 127.0.0.1:44108\n}",
+			valid:  false,
+		},
+		{
+			name:      "minimal valid config",
+			config:    "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n}",
+			valid:     true,
+			network:   "mainnet",
+			interval:  defaultUpdateInterval,
+			bootstrap: []string{"127.0.0.1:44108"},
 		},
 		{
 			name:   "bootstrap_peers without values",
@@ -50,8 +62,33 @@ func TestParseConfig(t *testing.T) {
 			valid:  false,
 		},
 		{
+			name:   "bootstrap peer without port rejected",
+			config: "dnsseed {\n  network testnet\n  bootstrap_peers node.example.com\n}",
+			valid:  false,
+		},
+		{
+			name:   "bootstrap peer with empty host rejected",
+			config: "dnsseed {\n  network testnet\n  bootstrap_peers :44110\n}",
+			valid:  false,
+		},
+		{
+			name:   "bootstrap peer with invalid port rejected",
+			config: "dnsseed {\n  network testnet\n  bootstrap_peers node.example.com:http\n}",
+			valid:  false,
+		},
+		{
+			name:   "bootstrap peer with zero port rejected",
+			config: "dnsseed {\n  network testnet\n  bootstrap_peers node.example.com:0\n}",
+			valid:  false,
+		},
+		{
 			name:   "crawl_interval without value",
 			config: "dnsseed {\n  network testnet\n  crawl_interval\n  bootstrap_peers 127.0.0.1:44110\n}",
+			valid:  false,
+		},
+		{
+			name:   "negative crawl_interval rejected",
+			config: "dnsseed {\n  network testnet\n  crawl_interval -1s\n  bootstrap_peers 127.0.0.1:44110\n}",
 			valid:  false,
 		},
 		{
@@ -61,8 +98,6 @@ func TestParseConfig(t *testing.T) {
 			network:   "testnet",
 			interval:  15 * time.Second,
 			bootstrap: []string{"127.0.0.1:44110"},
-			ttl:       defaultTTL,
-			maxAns:    defaultMaxAnswers,
 		},
 		{
 			name:   "unknown option rejected",
@@ -71,36 +106,62 @@ func TestParseConfig(t *testing.T) {
 		},
 		{
 			name:      "mainnet full config",
-			config:    "dnsseed {\n  network mainnet\n  crawl_interval 30m\n  bootstrap_peers 127.0.0.1:44108 127.0.0.2:44108\n  record_ttl 300\n  max_answers 10\n}",
+			config:    "dnsseed {\n  network mainnet\n  crawl_interval 30m\n  bootstrap_peers 127.0.0.1:44108 127.0.0.2:44108\n}",
 			valid:     true,
 			network:   "mainnet",
 			interval:  30 * time.Minute,
 			bootstrap: []string{"127.0.0.1:44108", "127.0.0.2:44108"},
-			ttl:       300,
-			maxAns:    10,
 		},
 		{
-			name:     "regtest network accepted",
-			config:   `dnsseed { network regtest }`,
-			valid:    true,
-			network:  "regtest",
-			interval: defaultUpdateInterval,
-			ttl:      defaultTTL,
-			maxAns:   defaultMaxAnswers,
+			name:      "regtest network accepted",
+			config:    "dnsseed {\n  network regtest\n  bootstrap_peers 127.0.0.1:18444\n}",
+			valid:     true,
+			network:   "regtest",
+			interval:  defaultUpdateInterval,
+			bootstrap: []string{"127.0.0.1:18444"},
 		},
 		{
-			name:   "invalid network rejected",
-			config: `dnsseed { network fakenet }`,
+			name:   "removed max_answers directive rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  max_answers 10\n}",
 			valid:  false,
 		},
 		{
-			name:   "bad ttl rejected",
-			config: "dnsseed {\n  network mainnet\n  record_ttl -1\n}",
+			name:   "removed record_ttl directive rejected",
+			config: "dnsseed {\n  network mainnet\n  record_ttl 300\n}",
 			valid:  false,
 		},
 		{
-			name:   "bad max_answers rejected",
-			config: "dnsseed {\n  network mainnet\n  max_answers 999\n}",
+			name:   "removed min_client_version directive rejected",
+			config: "dnsseed {\n  network mainnet\n  min_client_version 1.2.0\n}",
+			valid:  false,
+		},
+		{
+			name:      "min_protocol_version above library floor accepted",
+			config:    "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version " + minProtoAboveFloor + "\n}",
+			valid:     true,
+			network:   "mainnet",
+			interval:  defaultUpdateInterval,
+			bootstrap: []string{"127.0.0.1:44108"},
+			minProto:  peer.MinAcceptableProtocolVersion + 1,
+		},
+		{
+			name:   "min_protocol_version without value rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version\n}",
+			valid:  false,
+		},
+		{
+			name:   "non-numeric min_protocol_version rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version two\n}",
+			valid:  false,
+		},
+		{
+			name:   "min_protocol_version below library floor rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version 0\n}",
+			valid:  false,
+		},
+		{
+			name:   "min_protocol_version above wire range rejected",
+			config: "dnsseed {\n  network mainnet\n  bootstrap_peers 127.0.0.1:44108\n  min_protocol_version 2147483648\n}",
 			valid:  false,
 		},
 	}
@@ -108,7 +169,7 @@ func TestParseConfig(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := caddy.NewTestController("dns", tt.config)
-			opts, err := parseConfig(c)
+			opts, err := parse(c)
 
 			if !tt.valid {
 				require.Error(t, err)
@@ -118,12 +179,11 @@ func TestParseConfig(t *testing.T) {
 
 			assert.Equal(t, tt.network, opts.networkName)
 			assert.Equal(t, tt.interval, opts.updateInterval)
-			assert.Equal(t, tt.ttl, opts.recordTTL)
-			assert.Equal(t, tt.maxAns, opts.maxAnswers)
-
-			for i, s := range tt.bootstrap {
-				assert.Equal(t, s, opts.bootstrapPeers[i])
+			assert.Equal(t, tt.bootstrap, opts.bootstrapPeers)
+			if tt.minProto == 0 {
+				tt.minProto = peer.MinAcceptableProtocolVersion
 			}
+			assert.Equal(t, tt.minProto, opts.minProtocolVersion)
 		})
 	}
 }

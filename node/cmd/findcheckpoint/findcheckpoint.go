@@ -13,6 +13,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
+	"github.com/pearl-research-labs/pearl/node/txscript"
 )
 
 const blockDbNamePrefix = "blocks"
@@ -154,6 +155,8 @@ func main() {
 		DB:          db,
 		ChainParams: activeNetParams,
 		TimeSource:  blockchain.NewMedianTime(),
+		SigCache:    txscript.NewSigCache(0),
+		HashCache:   txscript.NewHashCache(0),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize chain: %v\n", err)

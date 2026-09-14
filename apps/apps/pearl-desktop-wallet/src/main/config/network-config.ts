@@ -3,8 +3,6 @@
  * All network-specific settings should be consumed from here
  */
 
-import { MAINNET_DEFAULT_PEER_ADDRESSES, TESTNET_DEFAULT_PEER_ADDRESSES } from "./consts";
-
 export type Network = 'mainnet' | 'testnet';
 
 export interface NetworkConfig {
@@ -14,14 +12,7 @@ export interface NetworkConfig {
     walletFlag: string;
     dataSubdir: string;
     addressPrefix: string;
-    defaultPeerAddress: string;
-    defaultPeerPort: number;
 }
-
-const nodeIndex = Math.floor(Math.random() * 3);
-
-const mainnetDefaultPeerAddress = MAINNET_DEFAULT_PEER_ADDRESSES[nodeIndex];
-const testnetDefaultPeerAddress = TESTNET_DEFAULT_PEER_ADDRESSES[nodeIndex];
 
 const NETWORK_CONFIGS: Record<Network, NetworkConfig> = {
     mainnet: {
@@ -31,8 +22,6 @@ const NETWORK_CONFIGS: Record<Network, NetworkConfig> = {
         walletFlag: '',  // No flag for mainnet (default)
         dataSubdir: 'mainnet',
         addressPrefix: 'prl1',
-        defaultPeerAddress: mainnetDefaultPeerAddress,
-        defaultPeerPort: 44108,
     },
     testnet: {
         name: 'testnet',
@@ -41,8 +30,6 @@ const NETWORK_CONFIGS: Record<Network, NetworkConfig> = {
         walletFlag: '--testnet2',
         dataSubdir: 'testnet2',
         addressPrefix: 'tprl1',
-        defaultPeerAddress: testnetDefaultPeerAddress,
-        defaultPeerPort: 44112,
     },
 };
 

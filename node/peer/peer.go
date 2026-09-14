@@ -37,8 +37,10 @@ const (
 	DefaultTrickleInterval = 10 * time.Second
 
 	// MinAcceptableProtocolVersion is the lowest protocol version that a
-	// connected peer may support.
-	MinAcceptableProtocolVersion = wire.ProtocolVersion
+	// connected peer may support. Raise it only after a protocol upgrade
+	// activates; raising it together with wire.ProtocolVersion would
+	// disconnect not-yet-upgraded peers that still share our chain.
+	MinAcceptableProtocolVersion = 2
 
 	// outputBufferSize is the number of elements the output channels use.
 	outputBufferSize = 50
@@ -880,8 +882,7 @@ func (p *Peer) PushAddrV2Msg(addrs []*wire.NetAddressV2) (
 	// Randomize the addresses sent if there are more than the maximum.
 	if count > wire.MaxV2AddrPerMsg {
 		rand.Shuffle(count, func(i, j int) {
-			m.AddrList[i] = m.AddrList[j]
-			m.AddrList[j] = m.AddrList[i]
+			m.AddrList[i], m.AddrList[j] = m.AddrList[j], m.AddrList[i]
 		})
 
 		// Truncate it to the maximum size.

@@ -31,7 +31,6 @@ from .pearl_gemm_interface import (
     noise_B,
     noise_gen,
     noisy_gemm,
-    quantize,
     tensor_hash,
 )
 
@@ -56,6 +55,5 @@ __all__ = [
     "noise_gen",
     "noisy_gemm",
     "pearl_gemm_interface",
-    "quantize",
     "tensor_hash",
 ]

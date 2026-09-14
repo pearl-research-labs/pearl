@@ -135,6 +135,89 @@ func TestMoEForkDisabled(t *testing.T) {
 	}
 }
 
+// TestSaltedSeedForkActivation verifies the strict cutover at the salted
+// noise-seed hardfork activation height: V2 before the fork (with the MoE fork
+// active), V3 at and after it.
+func TestSaltedSeedForkActivation(t *testing.T) {
+	const forkHeight = int32(200)
+	p := Params{MoEForkHeight: 100, SaltedSeedForkHeight: forkHeight}
+
+	tests := []struct {
+		name        string
+		height      int32
+		wantActive  bool
+		wantVersion wire.CertificateVersion
+	}{
+		{"just before fork", forkHeight - 1, false, wire.CertificateVersionV2},
+		{"at fork height", forkHeight, true, wire.CertificateVersionV3},
+		{"after fork height", forkHeight + 1, true, wire.CertificateVersionV3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, p.IsSaltedSeedForkActive(tt.height))
+			require.Equal(t, tt.wantVersion, p.RequiredCertVersion(tt.height))
+		})
+	}
+}
+
+// TestSaltedSeedForkDisabled verifies that a zero SaltedSeedForkHeight disables
+// the fork at every height (the version follows the MoE fork schedule).
+func TestSaltedSeedForkDisabled(t *testing.T) {
+	p := Params{MoEForkHeight: 1, SaltedSeedForkHeight: 0}
+	for _, height := range []int32{1, 100, 1_000_000} {
+		require.False(t, p.IsSaltedSeedForkActive(height))
+		require.Equal(t, wire.CertificateVersionV2, p.RequiredCertVersion(height))
+	}
+}
+
+// TestRankPenaltyForkActivation verifies the activation boundary of the
+// rank-penalty softfork, including the disabled case.
+func TestRankPenaltyForkActivation(t *testing.T) {
+	const forkHeight = int32(100)
+	enabled := Params{RankPenaltyForkHeight: forkHeight}
+
+	tests := []struct {
+		name       string
+		height     int32
+		wantActive bool
+	}{
+		{"genesis", 0, false},
+		{"just before fork", forkHeight - 1, false},
+		{"at fork height", forkHeight, true},
+		{"after fork height", forkHeight + 1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, enabled.IsRankPenaltyForkActive(tt.height))
+		})
+	}
+
+	disabled := Params{RankPenaltyForkHeight: 0}
+	for _, height := range []int32{0, 1, 100, 1_000_000} {
+		require.False(t, disabled.IsRankPenaltyForkActive(height))
+	}
+}
+
+// TestShippedNetworksRankPenaltyOrdering asserts the invariant the rule relies
+// on: only V2 certificates carry a noise rank, so the rank-penalty softfork must
+// never activate before the V2 cutover. blockchain.New rejects params that
+// violate this.
+func TestShippedNetworksRankPenaltyOrdering(t *testing.T) {
+	for name, params := range map[string]*Params{
+		"mainnet":  &MainNetParams,
+		"testnet":  &TestNetParams,
+		"testnet2": &TestNet2Params,
+		"regtest":  &RegressionNetParams,
+		"simnet":   &SimNetParams,
+	} {
+		if params.RankPenaltyForkHeight == 0 {
+			continue
+		}
+		require.GreaterOrEqualf(t, params.RankPenaltyForkHeight, params.MoEForkHeight,
+			"%s must not activate the rank-penalty fork before the MoE fork", name)
+	}
+}
+
 // TestShippedNetworksMoEForkHeights pins the MoE hardfork activation heights
 // for the shipped networks so they cannot change accidentally.
 func TestShippedNetworksMoEForkHeights(t *testing.T) {
@@ -143,7 +226,7 @@ func TestShippedNetworksMoEForkHeights(t *testing.T) {
 		want   int32
 	}{
 		"mainnet":  {&MainNetParams, 71935},
-		"testnet":  {&TestNetParams, 38405},
+		"testnet":  {&TestNetParams, 1},
 		"testnet2": {&TestNet2Params, 54869},
 	}
 	for name, tt := range heights {

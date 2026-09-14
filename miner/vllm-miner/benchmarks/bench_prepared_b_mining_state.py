@@ -13,6 +13,7 @@ import time
 
 import torch
 from miner_base.settings import MinerSettings
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from vllm_miner.config import config
 from vllm_miner.gemm_operators import pearl_gemm_noisy, pearl_gemm_vanilla
@@ -46,6 +47,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--cache-bytes", type=int, default=1 << 30)
+    parser.add_argument(
+        "--cert-version",
+        type=int,
+        choices=[1, 2, 3],
+        default=3,
+        help="Certificate protocol; V3 uses uncached salted preparation. Cache gains apply only to V1/V2.",
+    )
     parser.add_argument(
         "--modes",
         type=str,
@@ -89,9 +97,11 @@ def _make_inputs(m: int, args: argparse.Namespace) -> tuple[torch.Tensor, ...]:
     return a, b, scale_a, scale_b
 
 
-def _set_job(sequence: int) -> None:
+def _set_job(sequence: int, cert_version: int) -> None:
     header = sequence.to_bytes(8, byteorder="little", signed=False) * 4
-    get_async_manager()._mining_job = MiningJob(header, 1)
+    get_async_manager()._mining_job = MiningJob(
+        header, 1, cert_version=CertificateVersion(cert_version)
+    )
 
 
 def _one_noisy_call(
@@ -135,7 +145,7 @@ def _measure(  # noqa: C901
         config.settings.prepared_b_cache_bytes = args.cache_bytes
 
     if mode == "warm":
-        _set_job(0)
+        _set_job(0, args.cert_version)
         _one_call(mode, a, b, scale_a, scale_b)
         torch.cuda.synchronize()
         reset_prepared_b_cache_stats()
@@ -152,12 +162,12 @@ def _measure(  # noqa: C901
         if mode == "vanilla":
             pass
         elif mode == "warm":
-            _set_job(0)
+            _set_job(0, args.cert_version)
         elif mode == "job_transition":
-            _set_job(sequence)
+            _set_job(sequence, args.cert_version)
             sequence += 1
         else:
-            _set_job(idx)
+            _set_job(idx, args.cert_version)
         _one_call(mode, a, b, scale_a, scale_b)
     torch.cuda.synchronize()
 
@@ -167,9 +177,9 @@ def _measure(  # noqa: C901
         if mode == "cold":
             clear_prepared_b_cache(reset_stats=False)
         if mode == "warm":
-            _set_job(0)
+            _set_job(0, args.cert_version)
         elif mode == "job_transition":
-            _set_job(sequence)
+            _set_job(sequence, args.cert_version)
             sequence += 1
         start.record()
         wall_start = time.perf_counter()
@@ -202,6 +212,10 @@ def _measure(  # noqa: C901
         "oversize": stats.oversize,
         "disabled": stats.disabled,
         "cache_budget_bytes": args.cache_bytes,
+        "cert_version": args.cert_version,
+        "prepared_b_cache_eligible": int(
+            not CertificateVersion(args.cert_version).uses_salted_seeds
+        ),
     }
 
 
@@ -209,7 +223,7 @@ def _print_rows(rows: list[dict[str, float | int | str]]) -> None:
     print(
         "mode,m,n,k,avg_gpu_ms,median_gpu_ms,avg_wall_ms,median_wall_ms,"
         "cache_entries,cache_bytes,b_state_bytes,avoided_b_state_bytes,"
-        "hits,misses,evictions,oversize,disabled,cache_budget_bytes",
+        "hits,misses,evictions,oversize,disabled,cache_budget_bytes,cert_version,prepared_b_cache_eligible",
         flush=True,
     )
     for row in rows:
@@ -220,7 +234,7 @@ def _print_rows(rows: list[dict[str, float | int | str]]) -> None:
             f"{row['cache_entries']},{row['cache_bytes']},{row['b_state_bytes']},"
             f"{row['avoided_b_state_bytes']},{row['hits']},{row['misses']},"
             f"{row['evictions']},{row['oversize']},{row['disabled']},"
-            f"{row['cache_budget_bytes']}",
+            f"{row['cache_budget_bytes']},{row['cert_version']},{row['prepared_b_cache_eligible']}",
             flush=True,
         )
 

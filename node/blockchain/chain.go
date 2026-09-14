@@ -2172,8 +2172,8 @@ type Config struct {
 	// transactions are already being validated prior to their inclusion in
 	// a block such as what is usually done via a transaction memory pool.
 	//
-	// This field can be nil if the caller is not interested in using a
-	// signature cache.
+	// This field is required. Callers that do not want caching should pass
+	// a zero-size no-op cache via txscript.NewSigCache(0).
 	SigCache *txscript.SigCache
 
 	// IndexManager defines an index manager to use when initializing the
@@ -2189,8 +2189,8 @@ type Config struct {
 	// mid-state eliminates the O(N^2) validation complexity due to the
 	// SigHashAll flag.
 	//
-	// This field can be nil if the caller is not interested in using a
-	// signature cache.
+	// This field is required. Callers that do not want caching should pass
+	// a zero-size no-op cache via txscript.NewHashCache(0).
 	HashCache *txscript.HashCache
 
 	// Prune specifies the target database usage (in bytes) the database
@@ -2211,9 +2211,35 @@ func New(config *Config) (*BlockChain, error) {
 	if config.TimeSource == nil {
 		return nil, AssertError("blockchain.New timesource is nil")
 	}
+	if config.SigCache == nil {
+		return nil, AssertError("blockchain.New sigcache is nil")
+	}
+	if config.HashCache == nil {
+		return nil, AssertError("blockchain.New hashcache is nil")
+	}
+
 	// 0 means the fork is not scheduled.
 	if config.ChainParams.MoEForkHeight < 0 {
 		return nil, AssertError("blockchain.New MoEForkHeight must be >= 0")
+	}
+	if config.ChainParams.RankPenaltyForkHeight < 0 {
+		return nil, AssertError("blockchain.New RankPenaltyForkHeight must be >= 0")
+	}
+	// Only V2 certificates carry a noise rank, so the rank-penalty rule cannot
+	// start before the V2 cutover.
+	if config.ChainParams.RankPenaltyForkHeight != 0 &&
+		config.ChainParams.RankPenaltyForkHeight < config.ChainParams.MoEForkHeight {
+		return nil, AssertError("blockchain.New RankPenaltyForkHeight must not " +
+			"precede MoEForkHeight")
+	}
+	if config.ChainParams.SaltedSeedForkHeight < 0 {
+		return nil, AssertError("blockchain.New SaltedSeedForkHeight must be >= 0")
+	}
+	// V3 supersedes V2, so the salted-seed cutover cannot precede the V2 cutover.
+	if config.ChainParams.SaltedSeedForkHeight != 0 &&
+		config.ChainParams.SaltedSeedForkHeight < config.ChainParams.MoEForkHeight {
+		return nil, AssertError("blockchain.New SaltedSeedForkHeight must not " +
+			"precede MoEForkHeight")
 	}
 
 	// Generate a checkpoint by height map from the provided checkpoints

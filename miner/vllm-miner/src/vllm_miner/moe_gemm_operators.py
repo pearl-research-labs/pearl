@@ -150,6 +150,14 @@ def prepare_moe_noising(
     A_hash = _hash_2d(A_q.contiguous().view(torch.uint8), key_tensor, device)
     B_hash = _hash_2d(B_stacked.contiguous().view(torch.uint8), key_tensor, device)
 
+    # V3 (salted) mining: the kernel salts the raw roots before the routing
+    # fold. The proof's ``n`` is the per-expert intermediate dimension.
+    salted_dims = (
+        (num_tokens, num_stacked_weight_rows // num_experts)
+        if mining_job.cert_version.uses_salted_seeds
+        else None
+    )
+
     num_routed_slots = num_tokens * top_k
     routing_data = torch.empty(num_routed_slots, dtype=torch.int32, device=device)
     slot_indices = torch.empty(num_routed_slots, dtype=torch.int32, device=device)
@@ -183,6 +191,7 @@ def prepare_moe_noising(
         commitment_hash_B,
         routing_root=routing_hash,
         offsets_hash=offsets_hash,
+        salted_dims=salted_dims,
     )
 
     (

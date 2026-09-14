@@ -12,6 +12,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 mod common;
 mod mine;
+mod plain;
 mod verify;
 
 pub use common::{CZKProof, PUBLICDATA_MAX_SIZE, PUBLICDATA_SIZE};

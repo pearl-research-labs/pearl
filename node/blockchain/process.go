@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
+	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
 // BehaviorFlags is a bitmask defining tweaks to the normal behavior when
@@ -32,6 +34,16 @@ const (
 	// BFNone is a convenience value to specifically indicate no flags.
 	BFNone BehaviorFlags = 0
 )
+
+// NetBehaviorFlags returns the behavior flags the network parameters imply.
+// SimNet mines the placeholder certificates emitted by SolveBlock, so it can
+// neither verify proof of work nor enforce any rule that reads a proof.
+func NetBehaviorFlags(params *chaincfg.Params) BehaviorFlags {
+	if params.Net == wire.SimNet {
+		return BFNoPoWCheck
+	}
+	return BFNone
+}
 
 // blockExists determines whether a block with the given hash exists either in
 // the main chain or any side chains.
