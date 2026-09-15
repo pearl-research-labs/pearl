@@ -349,6 +349,7 @@ type gbtWorkState struct {
 	prevHash             *chainhash.Hash
 	minTimestamp         time.Time
 	template             *mining.BlockTemplate
+	ancestorHeaders      []string
 	notifyMap            map[chainhash.Hash]map[int64]chan struct{}
 	timeSource           blockchain.MedianTimeSource
 	maxTimeOffsetMinutes int64
@@ -1580,9 +1581,28 @@ func (state *gbtWorkState) updateBlockTemplate(s *rpcServer, useCoinbaseValue bo
 		best := s.cfg.Chain.BestSnapshot()
 		minTimestamp := mining.MinBlockTimestamp(best)
 
+		// V4 certificates carry the ancestor headers the proof may key on.
+		var ancestorHeaders []string
+		if cert := msgBlock.BlockCertificate(); cert != nil && cert.Version() >= wire.CertificateVersionV4 {
+			hash := *latestHash
+			for range wire.MaxCertificateV4AncestorHeaders {
+				ancestor, err := s.cfg.Chain.HeaderByHash(&hash)
+				if err != nil {
+					break
+				}
+				var buf bytes.Buffer
+				if err := ancestor.Serialize(&buf); err != nil {
+					return err
+				}
+				ancestorHeaders = append(ancestorHeaders, hex.EncodeToString(buf.Bytes()))
+				hash = ancestor.PrevBlock
+			}
+		}
+
 		// Update work state to ensure another block template isn't
 		// generated until needed.
 		state.template = template
+		state.ancestorHeaders = ancestorHeaders
 		state.lastGenerated = time.Now()
 		state.lastTxUpdate = lastTxUpdate
 		state.prevHash = latestHash
@@ -1750,6 +1770,7 @@ func (state *gbtWorkState) blockTemplateResult(useCoinbaseValue bool, submitOld 
 	if cert := msgBlock.BlockCertificate(); cert != nil {
 		reply.RequiredCertVersion = uint32(cert.Version())
 	}
+	reply.AncestorHeaders = state.ancestorHeaders
 	// SegWit is always active; include the witness commitment in the GBT result.
 	if template.WitnessCommitment != nil {
 		reply.DefaultWitnessCommitment = hex.EncodeToString(template.WitnessCommitment)
