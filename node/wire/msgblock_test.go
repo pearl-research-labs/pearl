@@ -34,9 +34,7 @@ func TestBlock(t *testing.T) {
 			cmd, wantCmd)
 	}
 
-	// Ensure max payload is expected value for latest protocol version.
-	// Updated to 4M to match MaxBlockVsize (1M) × WitnessScaleFactor (4)
-	wantPayload := uint32(1000 * 4000)
+	wantPayload := uint32(MaxBlockPayload + CertificateMaxSize)
 	maxPayload := msg.MaxPayloadLength(pver)
 	if maxPayload != wantPayload {
 		t.Errorf("MaxPayloadLength: wrong max payload length for "+

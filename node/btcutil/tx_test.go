@@ -13,6 +13,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/stretchr/testify/require"
 )
 
 // TestTx tests the API for Tx.
@@ -133,4 +134,16 @@ func TestTxWitnessHash(t *testing.T) {
 				"got %v, want %v", txWithoutWitness.WitnessHash(), txWithoutWitness.Hash())
 		}
 	}
+}
+
+func TestNewTxFromBytesRejectsTrailing(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, Block100000.Transactions[0].Serialize(&buf))
+
+	_, err := btcutil.NewTxFromBytes(buf.Bytes())
+	require.NoError(t, err)
+
+	trailing := append(append([]byte(nil), buf.Bytes()...), 0x00)
+	_, err = btcutil.NewTxFromBytes(trailing)
+	require.ErrorContains(t, err, "trailing bytes")
 }

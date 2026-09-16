@@ -5,6 +5,9 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestNetAddressV2FromBytes tests that NetAddressV2FromBytes works as
@@ -282,4 +285,37 @@ func TestReadNetAddressV2(t *testing.T) {
 				na.Addr.Network())
 		}
 	}
+}
+
+// ipv4MappedLoopback is ::ffff:127.0.0.1 in its 16-byte form.
+var ipv4MappedLoopback = [16]byte{
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x01,
+}
+
+func TestNetAddressV2FromBytesIPv4Mapped(t *testing.T) {
+	t.Parallel()
+
+	na := NetAddressV2FromBytes(
+		time.Now(), SFNodeNetwork, ipv4MappedLoopback[:], 8333,
+	)
+
+	assert.Equal(t, string(ipv4), na.Addr.Network())
+	assert.Equal(t, "127.0.0.1", na.Addr.String())
+}
+
+func TestReadNetAddressV2SkipsIPv4Mapped(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, writeElement(&buf, uint32(0)))
+	require.NoError(t, WriteVarInt(&buf, 0, 0))
+	require.NoError(t, writeElement(&buf, uint8(ipv6)))
+	require.NoError(t, WriteVarInt(&buf, 0, ipv6Size))
+	require.NoError(t, writeElement(&buf, ipv4MappedLoopback))
+	require.NoError(t, writeElement(&buf, uint16(8333)))
+
+	na := &NetAddressV2{}
+	err := readNetAddressV2(bytes.NewReader(buf.Bytes()), 0, na)
+	require.ErrorIs(t, err, ErrSkippedNetworkID)
 }

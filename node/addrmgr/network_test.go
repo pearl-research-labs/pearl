@@ -11,6 +11,7 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/addrmgr"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestIPTypes ensures the various functions which determine the type of an IP
@@ -76,7 +77,7 @@ func TestIPTypes(t *testing.T) {
 		newIPTest("64:ff9b::1", false, false, false, false, false, false,
 			false, false, false, false, true, false, false, false, true, true),
 		newIPTest("::ffff:abcd:ef12:1", false, false, false, false, false, false,
-			false, false, false, false, false, false, false, false, true, true),
+			false, false, false, false, false, false, false, false, true, false),
 		newIPTest("::1", false, false, false, false, false, false, false, false,
 			false, false, false, false, false, true, true, false),
 		newIPTest("198.18.0.1", false, true, false, false, false, false, false,
@@ -204,5 +205,34 @@ func TestGroupKey(t *testing.T) {
 				"- got '%s', want '%s'", i, test.name,
 				key, test.expected)
 		}
+	}
+}
+
+func TestRFC7343AndZeroRoutable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		ip           string
+		wantRFC7343  bool
+		wantZero     bool
+		wantRoutable bool
+	}{
+		{name: "orchidv2", ip: "2001:20:abcd::1:1", wantRFC7343: true},
+		{name: "zero first group", ip: "0:9881:8181:8181:fe00:a:9e:9801", wantZero: true},
+		{name: "rfc6145 translated ipv4", ip: "::ffff:0:0:1", wantRoutable: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			na := wire.NewNetAddressIPPort(net.ParseIP(tt.ip), 8333, wire.SFNodeNetwork)
+			naV2 := wire.NetAddressV2FromBytes(time.Now(), wire.SFNodeNetwork, na.IP, 8333)
+
+			assert.Equal(t, tt.wantRFC7343, addrmgr.IsRFC7343(na))
+			assert.Equal(t, tt.wantZero, addrmgr.IsZero(na))
+			assert.Equal(t, tt.wantRoutable, addrmgr.IsRoutable(naV2))
+		})
 	}
 }

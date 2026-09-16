@@ -75,6 +75,10 @@ func Extract(p *Packet) (*wire.MsgTx, error) {
 				}
 				tin.Witness[j] = wit
 			}
+
+			if err := assertFullyConsumed(witnessReader); err != nil {
+				return nil, err
+			}
 		}
 	}
 
