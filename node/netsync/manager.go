@@ -1291,12 +1291,13 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		}
 	}
 
-	// Low-quality + current peers route block announcements through a
-	// single cert-less getheaders probe anchored on the last announced
-	// block; handleHeadersMsg converts a valid response into getdata.
-	// Skip the probe when we already have the anchor (the peer has
-	// nothing new for us in this batch).
-	if lastBlock >= 0 && sm.current() && !isPeerHighQuality(state) {
+	// Low-quality peers route block announcements through a single
+	// cert-less getheaders probe anchored on the last announced block;
+	// handleHeadersMsg converts a valid response into getdata. The gate
+	// also covers the no-sync-peer window, where non-sync-peer invs are
+	// otherwise acted on. Skip the probe when we already have the anchor
+	// (the peer has nothing new for us in this batch).
+	if lastBlock >= 0 && (sm.current() || sm.syncPeer == nil) && !isPeerHighQuality(state) {
 		if have, _ := sm.haveInventory(invVects[lastBlock]); !have {
 			locator, _ := sm.chain.LatestBlockLocator()
 			_ = peer.PushGetHeadersMsg(
@@ -1328,11 +1329,11 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			continue
 		}
 
-		// Block invs from low-quality + current peers are handled by
-		// the probe dispatched above. Skip the per-inv block path
+		// Block invs from gated low-quality peers are handled by the
+		// probe dispatched above. Skip the per-inv block path
 		// (including IsKnownOrphan retry and long-side-chain stall
 		// detection) so untrusted peers can't drive our state machine.
-		if iv.Type == wire.InvTypeBlock && sm.current() &&
+		if iv.Type == wire.InvTypeBlock && (sm.current() || sm.syncPeer == nil) &&
 			!isPeerHighQuality(state) {
 			continue
 		}
