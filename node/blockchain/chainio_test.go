@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
@@ -34,6 +35,59 @@ func TestErrNotInMainChain(t *testing.T) {
 	err = errors.New("something else")
 	if isNotInMainChainErr(err) {
 		t.Fatalf("isNotInMainChainErr detected incorrect type")
+	}
+}
+
+// Own-DB leftover trailer must not fail decode; Bytes() must not leak it.
+func TestDBBlockFromBytes(t *testing.T) {
+	t.Parallel()
+
+	params := &chaincfg.MainNetParams
+	var serialized bytes.Buffer
+	if err := params.GenesisBlock.Serialize(&serialized); err != nil {
+		t.Fatalf("failed to serialize genesis block: %v", err)
+	}
+	cleanBytes := serialized.Bytes()
+	wantHash := params.GenesisBlock.BlockHash()
+
+	block, err := DBBlockFromBytes(cleanBytes, wantHash)
+	if err != nil {
+		t.Fatalf("failed to parse exact block: %v", err)
+	}
+	gotBytes, err := block.Bytes()
+	if err != nil {
+		t.Fatalf("failed to serialize parsed block: %v", err)
+	}
+	if !bytes.Equal(gotBytes, cleanBytes) {
+		t.Fatal("exact serialization was not preserved")
+	}
+	if *block.Hash() != wantHash {
+		t.Fatalf("unexpected block hash - got %v, want %v",
+			block.Hash(), wantHash)
+	}
+
+	block, err = DBBlockFromBytes(
+		append(append([]byte(nil), cleanBytes...), 0x00, 0xff), wantHash,
+	)
+	if err != nil {
+		t.Fatalf("failed to parse block with trailing bytes: %v", err)
+	}
+	gotBytes, err = block.Bytes()
+	if err != nil {
+		t.Fatalf("failed to serialize parsed block: %v", err)
+	}
+	if !bytes.Equal(gotBytes, cleanBytes) {
+		t.Fatal("cached serialization includes trailing bytes")
+	}
+
+	_, err = DBBlockFromBytes(cleanBytes[:len(cleanBytes)-1], wantHash)
+	if err == nil {
+		t.Fatal("expected truncated block to fail to parse")
+	}
+
+	_, err = DBBlockFromBytes(nil, wantHash)
+	if err == nil {
+		t.Fatal("expected empty input to fail to parse")
 	}
 }
 
