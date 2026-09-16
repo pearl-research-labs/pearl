@@ -1231,8 +1231,6 @@ func (p *Peer) maybeAddDeadline(pendingResponses map[string]time.Time, msgCmd st
 // track of expected responses and assigning them deadlines while accounting for
 // the time spent in callbacks.  It must be run as a goroutine.
 func (p *Peer) stallHandler() {
-	defer p.recoverFromPanic()
-
 	// These variables are used to adjust the deadline times forward by the
 	// time it takes callbacks to execute.  This is done because new
 	// messages aren't read until the previous one is finished processing
@@ -1630,7 +1628,6 @@ out:
 // handlers will not block on us sending a message.  That data is then passed on
 // to outHandler to be actually written.
 func (p *Peer) queueHandler() {
-	defer p.recoverFromPanic()
 	defer close(p.queueQuit)
 
 	pendingMsgs := list.New()
@@ -1790,7 +1787,6 @@ func (p *Peer) shouldLogWriteError(err error) bool {
 // goroutine.  It uses a buffered channel to serialize output messages while
 // allowing the sender to continue running asynchronously.
 func (p *Peer) outHandler() {
-	defer p.recoverFromPanic()
 	defer close(p.outQuit)
 
 out:
@@ -1860,8 +1856,6 @@ cleanup:
 
 // pingHandler periodically pings the peer.  It must be run as a goroutine.
 func (p *Peer) pingHandler() {
-	defer p.recoverFromPanic()
-
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
 
@@ -1942,6 +1936,10 @@ func (p *Peer) Connected() bool {
 		atomic.LoadInt32(&p.disconnect) == 0
 }
 
+// recoverFromPanic is deferred only in inHandler, the one handler that runs
+// untrusted input and whose exit path is entirely deferred. The plumbing
+// handlers must crash instead: a panic there is a broken invariant, and
+// recovering would skip their drain loops and leave waiters hung.
 func (p *Peer) recoverFromPanic() {
 	if r := recover(); r != nil {
 		log.Errorf("Recovered panic in peer %s: %v\n%s", p, r, debug.Stack())
@@ -2301,7 +2299,14 @@ func (p *Peer) start() error {
 
 	negotiateErr := make(chan error, 1)
 	go func() {
-		defer p.recoverFromPanic()
+		// A panic has to surface through negotiateErr; otherwise the
+		// select below waits out negotiateTimeout with the slot held.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("Recovered panic negotiating with peer %s: %v\n%s", p, r, debug.Stack())
+				negotiateErr <- fmt.Errorf("panic during protocol negotiation: %v", r)
+			}
+		}()
 
 		if p.inbound {
 			negotiateErr <- p.negotiateInboundProtocol()
