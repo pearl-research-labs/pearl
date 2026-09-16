@@ -2749,12 +2749,17 @@ func handleGetRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan str
 			return nil, rpcNoTxInfoError(txHash)
 		}
 
-		// Load the raw transaction bytes from the database.
+		// Load the raw transaction bytes from the database. Region bytes
+		// are only valid inside the transaction, so copy before the view
+		// ends.
 		var txBytes []byte
 		err = s.cfg.DB.View(func(dbTx database.Tx) error {
-			var err error
-			txBytes, err = dbTx.FetchBlockRegion(blockRegion)
-			return err
+			regionBytes, err := dbTx.FetchBlockRegion(blockRegion)
+			if err != nil {
+				return err
+			}
+			txBytes = slices.Clone(regionBytes)
+			return nil
 		})
 		if err != nil {
 			return nil, rpcNoTxInfoError(txHash)
@@ -3059,12 +3064,17 @@ func fetchInputTxos(s *rpcServer, tx *wire.MsgTx) (map[wire.OutPoint]wire.TxOut,
 			return nil, rpcNoTxInfoError(&origin.Hash)
 		}
 
-		// Load the raw transaction bytes from the database.
+		// Load the raw transaction bytes from the database. Region bytes
+		// are only valid inside the transaction, so copy before the view
+		// ends.
 		var txBytes []byte
 		err = s.cfg.DB.View(func(dbTx database.Tx) error {
-			var err error
-			txBytes, err = dbTx.FetchBlockRegion(blockRegion)
-			return err
+			regionBytes, err := dbTx.FetchBlockRegion(blockRegion)
+			if err != nil {
+				return err
+			}
+			txBytes = slices.Clone(regionBytes)
+			return nil
 		})
 		if err != nil {
 			return nil, rpcNoTxInfoError(&origin.Hash)
@@ -3368,10 +3378,11 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 			// is left serialized here since the caller might have
 			// requested non-verbose output and hence there would be
 			// no point in deserializing it just to reserialize it
-			// later.
+			// later. Region bytes are only valid inside the
+			// transaction, so copy them before the view ends.
 			for i, serializedTx := range serializedTxns {
 				addressTxns = append(addressTxns, retrievedTx{
-					txBytes: serializedTx,
+					txBytes: slices.Clone(serializedTx),
 					blkHash: regions[i].Hash,
 				})
 			}

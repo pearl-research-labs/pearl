@@ -1715,29 +1715,21 @@ func (s *server) pushTxMsg(sp *serverPeer, hash *chainhash.Hash,
 func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash,
 	doneChan chan<- struct{}, encoding wire.MessageEncoding) error {
 
-	// Fetch the raw block bytes from the database.
-	var blockBytes []byte
+	// Fetch and deserialize the block inside the transaction: FetchBlock
+	// bytes are only valid until the view ends, and the decoded block
+	// owns its memory, so this avoids copying block-sized buffers on the
+	// serve path.
+	var msgBlock wire.MsgBlock
 	err := sp.server.db.View(func(dbTx database.Tx) error {
-		var err error
-		blockBytes, err = dbTx.FetchBlock(hash)
-		return err
+		blockBytes, err := dbTx.FetchBlock(hash)
+		if err != nil {
+			return err
+		}
+		return msgBlock.Deserialize(bytes.NewReader(blockBytes))
 	})
 	if err != nil {
-		peerLog.Tracef("Unable to fetch requested block hash %v: %v",
+		peerLog.Tracef("Unable to load requested block hash %v: %v",
 			hash, err)
-
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-		return err
-	}
-
-	// Deserialize the block.
-	var msgBlock wire.MsgBlock
-	err = msgBlock.Deserialize(bytes.NewReader(blockBytes))
-	if err != nil {
-		peerLog.Tracef("Unable to deserialize requested block hash "+
-			"%v: %v", hash, err)
 
 		if doneChan != nil {
 			doneChan <- struct{}{}

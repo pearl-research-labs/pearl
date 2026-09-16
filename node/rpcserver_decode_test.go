@@ -106,8 +106,9 @@ func TestHandleSubmitBlockRejectsTrailingBytes(t *testing.T) {
 	assert.Nil(t, result)
 }
 
-// invalidatingBlockDB clears fetched block bytes as soon as its managed view ends, modelling zero-copy backends
-// whose buffers die with the transaction.
+// invalidatingBlockDB poisons fetched block bytes as soon as its managed view ends, modelling zero-copy backends
+// whose buffers are reused after the transaction. 0xff rather than zero: an all-zero buffer still decodes as an
+// empty block, so a late decode would pass unnoticed.
 type invalidatingBlockDB struct {
 	database.DB
 	blockBytes []byte
@@ -115,7 +116,9 @@ type invalidatingBlockDB struct {
 
 func (d *invalidatingBlockDB) View(fn func(database.Tx) error) error {
 	err := fn(&invalidatingBlockTx{blockBytes: d.blockBytes})
-	clear(d.blockBytes)
+	for i := range d.blockBytes {
+		d.blockBytes[i] = 0xff
+	}
 
 	return err
 }

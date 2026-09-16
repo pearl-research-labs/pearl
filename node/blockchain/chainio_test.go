@@ -11,9 +11,12 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestErrNotInMainChain ensures the functions related to errNotInMainChain work
@@ -35,59 +38,6 @@ func TestErrNotInMainChain(t *testing.T) {
 	err = errors.New("something else")
 	if isNotInMainChainErr(err) {
 		t.Fatalf("isNotInMainChainErr detected incorrect type")
-	}
-}
-
-// Own-DB leftover trailer must not fail decode; Bytes() must not leak it.
-func TestDBBlockFromBytes(t *testing.T) {
-	t.Parallel()
-
-	params := &chaincfg.MainNetParams
-	var serialized bytes.Buffer
-	if err := params.GenesisBlock.Serialize(&serialized); err != nil {
-		t.Fatalf("failed to serialize genesis block: %v", err)
-	}
-	cleanBytes := serialized.Bytes()
-	wantHash := params.GenesisBlock.BlockHash()
-
-	block, err := DBBlockFromBytes(cleanBytes, wantHash)
-	if err != nil {
-		t.Fatalf("failed to parse exact block: %v", err)
-	}
-	gotBytes, err := block.Bytes()
-	if err != nil {
-		t.Fatalf("failed to serialize parsed block: %v", err)
-	}
-	if !bytes.Equal(gotBytes, cleanBytes) {
-		t.Fatal("exact serialization was not preserved")
-	}
-	if *block.Hash() != wantHash {
-		t.Fatalf("unexpected block hash - got %v, want %v",
-			block.Hash(), wantHash)
-	}
-
-	block, err = DBBlockFromBytes(
-		append(append([]byte(nil), cleanBytes...), 0x00, 0xff), wantHash,
-	)
-	if err != nil {
-		t.Fatalf("failed to parse block with trailing bytes: %v", err)
-	}
-	gotBytes, err = block.Bytes()
-	if err != nil {
-		t.Fatalf("failed to serialize parsed block: %v", err)
-	}
-	if !bytes.Equal(gotBytes, cleanBytes) {
-		t.Fatal("cached serialization includes trailing bytes")
-	}
-
-	_, err = DBBlockFromBytes(cleanBytes[:len(cleanBytes)-1], wantHash)
-	if err == nil {
-		t.Fatal("expected truncated block to fail to parse")
-	}
-
-	_, err = DBBlockFromBytes(nil, wantHash)
-	if err == nil {
-		t.Fatal("expected empty input to fail to parse")
 	}
 }
 
@@ -772,4 +722,49 @@ func TestBestChainStateDeserializeErrors(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestDBBlockFromBytes pins the lenient own-database decoder: trailing bytes are dropped, not rejected, while
+// truncated data still fails and the strict constructor used for untrusted input keeps rejecting the same bytes.
+func TestDBBlockFromBytes(t *testing.T) {
+	t.Parallel()
+
+	params := &chaincfg.MainNetParams
+	var buf bytes.Buffer
+	require.NoError(t, params.GenesisBlock.Serialize(&buf))
+	exact := buf.Bytes()
+	withTrailing := append(append([]byte{}, exact...), 0xde, 0xad, 0xbe, 0xef)
+
+	tests := []struct {
+		name      string
+		in        []byte
+		wantBytes []byte
+		wantErr   bool
+	}{
+		{name: "exact bytes", in: exact, wantBytes: exact},
+		{name: "trailing bytes are dropped", in: withTrailing, wantBytes: exact},
+		{name: "truncated", in: exact[:len(exact)/2], wantErr: true},
+		{name: "empty", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			block, err := DBBlockFromBytes(tt.in, *params.GenesisHash)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			assert.Equal(t, params.GenesisHash, block.Hash())
+			got, err := block.Bytes()
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantBytes, got)
+		})
+	}
+
+	_, err := btcutil.NewBlockFromBytes(withTrailing)
+	require.Error(t, err, "the strict constructor must keep rejecting what the lenient one accepts")
 }

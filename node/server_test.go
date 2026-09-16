@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/internal/inbound"
 	"github.com/pearl-research-labs/pearl/node/peer"
+	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -80,6 +82,20 @@ func TestOnVerAckDoubleCall(t *testing.T) {
 	require.NotPanics(t, func() { sp.OnVerAck(nil, nil) })
 	requireClosed(t, sp.verAckCh, "verAckCh must stay closed")
 	assert.Equal(t, uint32(1), releases.Load(), "the source-prefix slot must be released exactly once")
+}
+
+// TestPushBlockMsgDecodesInsideView pins that the block is decoded before the view ends: FetchBlock bytes die with
+// the database transaction.
+func TestPushBlockMsgDecodesInsideView(t *testing.T) {
+	t.Parallel()
+
+	var serializedBlock bytes.Buffer
+	require.NoError(t, chaincfg.SimNetParams.GenesisBlock.Serialize(&serializedBlock))
+
+	s, sp := newTestServerPeer(t)
+	s.db = &invalidatingBlockDB{blockBytes: serializedBlock.Bytes()}
+
+	require.NoError(t, s.pushBlockMsg(sp, chaincfg.SimNetParams.GenesisHash, nil, wire.WitnessEncoding))
 }
 
 func TestHandshakeReleaseOnDisconnect(t *testing.T) {

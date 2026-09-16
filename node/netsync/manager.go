@@ -1257,11 +1257,13 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 	}
 
 	// Attempt to find the final block in the inventory list.  There may
-	// not be one.
+	// not be one. Witness-typed invs count too: the gate below keys off
+	// this index, and a peer must not bypass it by picking the other
+	// block type.
 	lastBlock := -1
 	invVects := imsg.inv.InvList
 	for i := len(invVects) - 1; i >= 0; i-- {
-		if invVects[i].Type == wire.InvTypeBlock {
+		if typ := invVects[i].Type; typ == wire.InvTypeBlock || typ == wire.InvTypeWitnessBlock {
 			lastBlock = i
 			break
 		}
@@ -1333,8 +1335,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		// probe dispatched above. Skip the per-inv block path
 		// (including IsKnownOrphan retry and long-side-chain stall
 		// detection) so untrusted peers can't drive our state machine.
-		if iv.Type == wire.InvTypeBlock && (sm.current() || sm.syncPeer == nil) &&
-			!isPeerHighQuality(state) {
+		if (iv.Type == wire.InvTypeBlock || iv.Type == wire.InvTypeWitnessBlock) &&
+			(sm.current() || sm.syncPeer == nil) && !isPeerHighQuality(state) {
 			continue
 		}
 

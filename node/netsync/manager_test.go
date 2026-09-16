@@ -170,11 +170,13 @@ func TestInvGateWithoutSyncPeer(t *testing.T) {
 	tests := []struct {
 		name           string
 		inbound        bool
+		witnessInv     bool
 		withSyncPeer   bool
 		wantGetHeaders bool
 		wantGetData    bool
 	}{
 		{name: "low-quality peer is probed", inbound: true, wantGetHeaders: true},
+		{name: "low-quality peer is probed for witness invs", inbound: true, witnessInv: true, wantGetHeaders: true},
 		{name: "high-quality peer is served directly", wantGetData: true},
 		{name: "non-sync peer is dropped once a sync peer exists", inbound: true, withSyncPeer: true},
 	}
@@ -195,8 +197,12 @@ func TestInvGateWithoutSyncPeer(t *testing.T) {
 			}
 
 			announced := chainhash.Hash{0x01}
+			invType := wire.InvTypeBlock
+			if tt.witnessInv {
+				invType = wire.InvTypeWitnessBlock
+			}
 			inv := wire.NewMsgInv()
-			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &announced)))
+			require.NoError(t, inv.AddInvVect(wire.NewInvVect(invType, &announced)))
 			sm.handleInvMsg(&invMsg{inv: inv, peer: p})
 
 			if tt.wantGetHeaders {
