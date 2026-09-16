@@ -247,7 +247,10 @@ __global__ void __launch_bounds__(
       }
 
       if constexpr (!SkipDenoising) {
+        // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
         warpgroup_wait<0>();
+#endif
         collective_epilogue.denoise(tCrD_fp32, shared_storage, AxEB_pipeline,
                                     EAxBpEB_pipeline, AxEB_pipe_read,
                                     EAxBpEB_pipe_read, consumer_tix);
