@@ -127,7 +127,7 @@ jobs:
             bin_ext: ""
             electron_build_cmd: pnpm -F @pearl/pearl-desktop-wallet run build:linux
           - name: macOS Intel
-            os: macos-15
+            os: macos-13
             goos: darwin
             goarch: amd64
             electron_arch: x64
