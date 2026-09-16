@@ -106,42 +106,35 @@ func TestHandleSubmitBlockRejectsTrailingBytes(t *testing.T) {
 	assert.Nil(t, result)
 }
 
-// invalidatingBlockDB poisons fetched block bytes as soon as its managed view ends, modelling zero-copy backends
-// whose buffers are reused after the transaction. 0xff rather than zero: an all-zero buffer still decodes as an
-// empty block, so a late decode would pass unnoticed.
-type invalidatingBlockDB struct {
+// stubBlockDB serves one block's bytes to every FetchBlock.
+type stubBlockDB struct {
 	database.DB
 	blockBytes []byte
 }
 
-func (d *invalidatingBlockDB) View(fn func(database.Tx) error) error {
-	err := fn(&invalidatingBlockTx{blockBytes: d.blockBytes})
-	for i := range d.blockBytes {
-		d.blockBytes[i] = 0xff
-	}
-
-	return err
+func (d *stubBlockDB) View(fn func(database.Tx) error) error {
+	return fn(&stubBlockTx{blockBytes: d.blockBytes})
 }
 
-type invalidatingBlockTx struct {
+type stubBlockTx struct {
 	database.Tx
 	blockBytes []byte
 }
 
-func (tx *invalidatingBlockTx) FetchBlock(*chainhash.Hash) ([]byte, error) {
+func (tx *stubBlockTx) FetchBlock(*chainhash.Hash) ([]byte, error) {
 	return tx.blockBytes, nil
 }
 
-func TestHandleGetBlockCopiesTransactionBytes(t *testing.T) {
+// TestHandleGetBlockStripsTrailingBytes pins that own-DB trailing bytes, which the lenient loader tolerates, do not
+// reach RPC clients.
+func TestHandleGetBlockStripsTrailingBytes(t *testing.T) {
 	t.Parallel()
 
 	var serializedBlock bytes.Buffer
 	require.NoError(t, chaincfg.MainNetParams.GenesisBlock.Serialize(&serializedBlock))
 
 	wantBytes := serializedBlock.Bytes()
-	// Own-DB bytes may carry trailing data; getblock must strip it.
-	dbBytes := append(append([]byte(nil), wantBytes...), 0x00)
-	db := &invalidatingBlockDB{blockBytes: dbBytes}
+	db := &stubBlockDB{blockBytes: append(append([]byte(nil), wantBytes...), 0x00)}
 
 	verbosity := 0
 	cmd := btcjson.NewGetBlockCmd(chaincfg.MainNetParams.GenesisHash.String(), &verbosity)

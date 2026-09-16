@@ -19,7 +19,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1057,14 +1056,9 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 	}
 	var blkBytes []byte
 	err = s.cfg.DB.View(func(dbTx database.Tx) error {
-		dbBlockBytes, err := dbTx.FetchBlock(hash)
-		if err != nil {
-			return err
-		}
-
-		// FetchBlock bytes are only valid for the lifetime of the transaction.
-		blkBytes = slices.Clone(dbBlockBytes)
-		return nil
+		var err error
+		blkBytes, err = dbTx.FetchBlock(hash)
+		return err
 	})
 	if err != nil {
 		return nil, &btcjson.RPCError{
@@ -2749,17 +2743,12 @@ func handleGetRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan str
 			return nil, rpcNoTxInfoError(txHash)
 		}
 
-		// Load the raw transaction bytes from the database. Region bytes
-		// are only valid inside the transaction, so copy before the view
-		// ends.
+		// Load the raw transaction bytes from the database.
 		var txBytes []byte
 		err = s.cfg.DB.View(func(dbTx database.Tx) error {
-			regionBytes, err := dbTx.FetchBlockRegion(blockRegion)
-			if err != nil {
-				return err
-			}
-			txBytes = slices.Clone(regionBytes)
-			return nil
+			var err error
+			txBytes, err = dbTx.FetchBlockRegion(blockRegion)
+			return err
 		})
 		if err != nil {
 			return nil, rpcNoTxInfoError(txHash)
@@ -3064,17 +3053,12 @@ func fetchInputTxos(s *rpcServer, tx *wire.MsgTx) (map[wire.OutPoint]wire.TxOut,
 			return nil, rpcNoTxInfoError(&origin.Hash)
 		}
 
-		// Load the raw transaction bytes from the database. Region bytes
-		// are only valid inside the transaction, so copy before the view
-		// ends.
+		// Load the raw transaction bytes from the database.
 		var txBytes []byte
 		err = s.cfg.DB.View(func(dbTx database.Tx) error {
-			regionBytes, err := dbTx.FetchBlockRegion(blockRegion)
-			if err != nil {
-				return err
-			}
-			txBytes = slices.Clone(regionBytes)
-			return nil
+			var err error
+			txBytes, err = dbTx.FetchBlockRegion(blockRegion)
+			return err
 		})
 		if err != nil {
 			return nil, rpcNoTxInfoError(&origin.Hash)
@@ -3378,11 +3362,10 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 			// is left serialized here since the caller might have
 			// requested non-verbose output and hence there would be
 			// no point in deserializing it just to reserialize it
-			// later. Region bytes are only valid inside the
-			// transaction, so copy them before the view ends.
+			// later.
 			for i, serializedTx := range serializedTxns {
 				addressTxns = append(addressTxns, retrievedTx{
-					txBytes: slices.Clone(serializedTx),
+					txBytes: serializedTx,
 					blkHash: regions[i].Hash,
 				})
 			}
