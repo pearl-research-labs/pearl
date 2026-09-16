@@ -1704,20 +1704,24 @@ func (c *Client) BackendVersion() (BackendVersion, error) {
 	return c.backendVersion, nil
 }
 
-func (c *Client) sendAsync() (FutureGetBulkResult, error) {
+// sendAsync posts every queued batch request and returns the ids it submitted alongside the response future; a
+// failed Send must fail exactly those, since requests queued by a concurrent batch share batchList.
+func (c *Client) sendAsync() (FutureGetBulkResult, []uint64, error) {
 	c.batchLock.Lock()
 	defer c.batchLock.Unlock()
 
 	// If batchList is empty, there's nothing to send.
 	if c.batchList.Len() == 0 {
-		return nil, ErrEmptyBatch
+		return nil, nil, ErrEmptyBatch
 	}
 
 	// convert the array of marshalled json requests to a single request we can send
 	responseChan := make(chan *Response, 1)
 	marshalledRequest := []byte("[")
+	ids := make([]uint64, 0, c.batchList.Len())
 	for iter := c.batchList.Front(); iter != nil; iter = iter.Next() {
 		request := iter.Value.(*jsonRequest)
+		ids = append(ids, request.id)
 		marshalledRequest = append(marshalledRequest, request.marshalledJSON...)
 		marshalledRequest = append(marshalledRequest, []byte(",")...)
 	}
@@ -1734,39 +1738,31 @@ func (c *Client) sendAsync() (FutureGetBulkResult, error) {
 		responseChan:   responseChan,
 	}
 	c.sendPostRequest(&request)
-	return responseChan, nil
+	return responseChan, ids, nil
 }
 
-func (c *Client) failBatchRequests(err error) {
-	c.requestLock.Lock()
-	defer c.requestLock.Unlock()
-
-	c.batchLock.Lock()
-	defer c.batchLock.Unlock()
-
-	for e := c.batchList.Front(); e != nil; e = e.Next() {
-		req := e.Value.(*jsonRequest)
-
-		// Batch futures would otherwise wait forever after a failed Send.
-		req.responseChan <- &Response{err: err}
+// failBatchRequests resolves the futures of the given submitted requests with err. Batch futures would otherwise
+// wait forever after a failed Send. Requests are claimed through removeRequest so a request already answered by
+// another batch's response is skipped rather than written twice.
+func (c *Client) failBatchRequests(ids []uint64, err error) {
+	for _, id := range ids {
+		if req := c.removeRequest(id); req != nil {
+			req.responseChan <- &Response{err: err}
+		}
 	}
-
-	c.requestMap = make(map[uint64]*list.Element)
-	c.batchList = list.New()
-	c.requestList.Init()
 }
 
 // Marshall's bulk requests and sends to the server
 // creates a response channel to receive the response
 func (c *Client) Send() error {
-	future, err := c.sendAsync()
+	future, ids, err := c.sendAsync()
 	if err != nil {
 		return err
 	}
 
 	batchResp, err := future.Receive()
 	if err != nil {
-		c.failBatchRequests(err)
+		c.failBatchRequests(ids, err)
 		return err
 	}
 

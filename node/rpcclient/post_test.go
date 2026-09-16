@@ -6,6 +6,7 @@ package rpcclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -417,6 +418,83 @@ func TestBatchSendErrorResolvesQueuedFutures(t *testing.T) {
 
 	assertFutureErr(f1)
 	assertFutureErr(f2)
+}
+
+// TestBatchSendFailureSparesConcurrentBatch pins that a failed Send resolves only the requests it submitted. A
+// request queued for a second batch while the first is in flight shares batchList; failing it with the first
+// batch's error would also orphan its real result, leaving the second Send to report success for a lost request.
+func TestBatchSendFailureSparesConcurrentBatch(t *testing.T) {
+	t.Parallel()
+
+	client := newBatchTestClient(t)
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var posts int32
+	client.httpClient.Transport = postRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if atomic.AddInt32(&posts, 1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			return okJSONResponse("not-json"), nil
+		}
+
+		var reqs []struct {
+			ID uint64 `json:"id"`
+		}
+		require.NoError(t, json.NewDecoder(req.Body).Decode(&reqs))
+		answers := make([]string, len(reqs))
+		for i, r := range reqs {
+			answers[i] = fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":42,"error":null}`, r.ID)
+		}
+
+		return okJSONResponse("[" + strings.Join(answers, ",") + "]"), nil
+	})
+
+	client.GetBlockCountAsync()
+	firstSend := make(chan error, 1)
+	go func() { firstSend <- client.Send() }()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "first batch never reached the transport")
+	}
+
+	second := client.GetBlockCountAsync()
+	secondSend := make(chan error, 1)
+	go func() { secondSend <- client.Send() }()
+
+	// The batch client serializes POSTs, so the second batch is queued behind the first until it is released.
+	time.Sleep(50 * time.Millisecond)
+	close(releaseFirst)
+
+	select {
+	case err := <-firstSend:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "first Send did not return")
+	}
+	select {
+	case err := <-secondSend:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "second Send did not return")
+	}
+
+	result := make(chan error, 1)
+	var count int64
+	go func() {
+		var err error
+		count, err = second.Receive()
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		require.NoError(t, err, "the second batch's future must not carry the first batch's failure")
+		assert.Equal(t, int64(42), count)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "second batch's future never resolved")
+	}
 }
 
 // TestNewBatchSerializesPostSends holds one POST open and checks that no second handler goroutine starts a
