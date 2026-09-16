@@ -14,9 +14,10 @@ import (
 )
 
 type mockChainClient struct {
-	getBestBlockHeight int32
-	getBlockHashFunc   func() (*chainhash.Hash, error)
-	getBlockHeader     *wire.BlockHeader
+	getBestBlockHeight     int32
+	getBlockHashFunc       func() (*chainhash.Hash, error)
+	getBlockHeader         *wire.BlockHeader
+	sendRawTransactionFunc func(*wire.MsgTx) (*chainhash.Hash, error)
 }
 
 var _ chain.Interface = (*mockChainClient)(nil)
@@ -67,8 +68,12 @@ func (m *mockChainClient) BlockStamp() (*waddrmgr.BlockStamp, error) {
 	}, nil
 }
 
-func (m *mockChainClient) SendRawTransaction(*wire.MsgTx, bool) (
+func (m *mockChainClient) SendRawTransaction(tx *wire.MsgTx, _ bool) (
 	*chainhash.Hash, error) {
+
+	if m.sendRawTransactionFunc != nil {
+		return m.sendRawTransactionFunc(tx)
+	}
 	return nil, nil
 }
 

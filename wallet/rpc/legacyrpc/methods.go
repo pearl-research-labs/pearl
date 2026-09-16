@@ -379,6 +379,7 @@ func getSyncProgress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		FilterHeaderHeight: sp.FilterHeaderHeight,
 		BlockHeight:        w.Manager.SyncedTo().Height,
 		BestPeerHeight:     sp.BestPeerHeight,
+		Connections:        sp.Connections,
 		Synced:             w.ChainSynced(),
 	}, nil
 }

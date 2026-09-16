@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -276,4 +277,91 @@ func TestRebroadcast(t *testing.T) {
 		t.Fatalf("unexpected rebroadcast of tx %s", tx.TxHash())
 	case <-time.Tick(100 * time.Millisecond):
 	}
+}
+
+// TestBroadcastNotRelayed ensures a transaction that no peer requested on its
+// first broadcast is reported to the caller and never enters the rebroadcast
+// set, while a transaction already in the set survives a rebroadcast round in
+// which no peer requested it.
+func TestBroadcastNotRelayed(t *testing.T) {
+	t.Parallel()
+
+	broadcastChan := make(chan *wire.MsgTx, 10)
+	ntfnChan := make(chan blockntfns.BlockNtfn)
+
+	var noTakers atomic.Bool
+	cfg := &Config{
+		Broadcast: func(tx *wire.MsgTx) error {
+			broadcastChan <- tx
+			if noTakers.Load() {
+				return &BroadcastError{
+					Code:   NotRelayed,
+					Reason: "no connected peers",
+				}
+			}
+			return nil
+		},
+		SubscribeBlocks: func() (*blockntfns.Subscription, error) {
+			return &blockntfns.Subscription{
+				Notifications: ntfnChan,
+				Cancel:        func() {},
+			}, nil
+		},
+		RebroadcastInterval: DefaultRebroadcastInterval,
+	}
+
+	broadcaster := NewBroadcaster(cfg)
+	if err := broadcaster.Start(); err != nil {
+		t.Fatalf("unable to start broadcaster: %v", err)
+	}
+	defer broadcaster.Stop()
+
+	expectBroadcast := func(want *wire.MsgTx) {
+		t.Helper()
+
+		select {
+		case got := <-broadcastChan:
+			if got.TxHash() != want.TxHash() {
+				t.Fatalf("expected broadcast of %v, got %v",
+					want.TxHash(), got.TxHash())
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("no broadcast of %v", want.TxHash())
+		}
+	}
+	expectNoBroadcast := func() {
+		t.Helper()
+
+		select {
+		case tx := <-broadcastChan:
+			t.Fatalf("unexpected broadcast of %v", tx.TxHash())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// A transaction a peer requested enters the set.
+	relayed := createTx(t, 1)
+	if err := broadcaster.Broadcast(relayed); err != nil {
+		t.Fatalf("unable to broadcast: %v", err)
+	}
+	expectBroadcast(relayed)
+
+	// A transaction nobody requested is reported and not retained.
+	noTakers.Store(true)
+	ghost := createTx(t, 1)
+	err := broadcaster.Broadcast(ghost)
+	if !IsBroadcastError(err, NotRelayed) {
+		t.Fatalf("expected NotRelayed error, got %v", err)
+	}
+	expectBroadcast(ghost)
+
+	// Only the relayed transaction is retried, and a round with no
+	// takers keeps it in the set for the next block.
+	ntfnChan <- blockntfns.NewBlockConnected(wire.BlockHeader{}, 100)
+	expectBroadcast(relayed)
+	expectNoBroadcast()
+
+	ntfnChan <- blockntfns.NewBlockConnected(wire.BlockHeader{}, 101)
+	expectBroadcast(relayed)
+	expectNoBroadcast()
 }

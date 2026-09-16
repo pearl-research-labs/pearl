@@ -282,6 +282,15 @@ func (b *Broadcaster) rebroadcast(txs map[chainhash.Hash]*wire.MsgTx,
 
 			continue
 
+		// A transaction only enters this set once a peer requested it,
+		// so a round with no takers is a transient peer condition, not
+		// a reason to give up on it.
+		case IsBroadcastError(err, NotRelayed):
+			log.Debugf("Re-broadcast of txid=%v: %v", tx.TxHash(),
+				err)
+
+			continue
+
 		case err != nil:
 			log.Errorf("Unable to rebroadcast transaction %v: %v",
 				tx.TxHash(), err)

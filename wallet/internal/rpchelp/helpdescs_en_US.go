@@ -426,6 +426,7 @@ var helpDescsEnUS = map[string]string{
 	"getsyncprogressresult-filter_header_height": "The height of the best filter header synced so far",
 	"getsyncprogressresult-block_height":         "The height of the best full block the wallet has processed",
 	"getsyncprogressresult-best_peer_height":     "The best block height reported by connected peers",
+	"getsyncprogressresult-connections":          "The number of currently connected peers; a broadcast needs at least one",
 	"getsyncprogressresult-synced":               "Whether the wallet considers the chain fully synced",
 	"getsyncprogress--result0":                   "",
 }

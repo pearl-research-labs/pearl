@@ -16,6 +16,31 @@ import { getErrorMessage } from '@/lib/utils';
 
 type FeeLevel = 'fast' | 'medium' | 'slow';
 const MEMPOOL_MIN_FEE_PER_VBYTE = 0.00001;
+const PEER_POLL_INTERVAL_MS = 5000;
+
+const NO_PEERS_MESSAGE =
+  'Not connected to any network peers. Nothing was sent and your funds are untouched. ' +
+  'Wait for the wallet to reconnect and try again.';
+const NOT_RELAYED_MESSAGE =
+  'No network peer accepted the transaction. Nothing was sent and your funds are untouched. ' +
+  'Check your connection and try again.';
+
+// The daemon reports this when it announced the transaction but no peer asked
+// for it, so nothing left this machine.
+function isNotRelayedError(message: string): boolean {
+  return message.includes('not relayed') || message.includes('no connected peers');
+}
+
+// Reads the peer count directly from the daemon. Undefined means unknown,
+// which must not block a send; only an explicit 0 does.
+async function fetchConnections(): Promise<number | undefined> {
+  try {
+    const progress = await window.appBridge.sync.getSyncProgress();
+    return progress.connections;
+  } catch {
+    return undefined;
+  }
+}
 
 export default function SendTransaction() {
   const navigate = useNavigate();
@@ -24,6 +49,8 @@ export default function SendTransaction() {
   const [success, setSuccess] = useState<string | null>(null);
   const [txid, setTxid] = useState<string | null>(null);
   const [isMaxSelected, setIsMaxSelected] = useState(false);
+  const [connections, setConnections] = useState<number | undefined>(undefined);
+  const hasNoPeers = connections === 0;
 
   // Fee-related state
   const [feeLevel, setFeeLevel] = useState<FeeLevel>('fast');
@@ -46,6 +73,16 @@ export default function SendTransaction() {
     onSubmit: async ({ value }: { value: { amount: string; address: string } }) => {
       setError(null);
       setSuccess(null);
+
+      // A fresh reading rather than the polled one: the peer set can change
+      // between polls, and a peerless send is the failure this guards.
+      const currentConnections = await fetchConnections();
+      setConnections(currentConnections);
+      if (currentConnections === 0) {
+        setError(NO_PEERS_MESSAGE);
+        return;
+      }
+
       try {
         const feeRate = estimatedFees[feeLevel];
 
@@ -56,7 +93,7 @@ export default function SendTransaction() {
         );
         setTxid(txId);
         syncWalletData();
-        setSuccess('Transaction sent successfully!');
+        setSuccess('Transaction broadcast to the network!');
         form.reset();
       } catch (err) {
         const errorMessage = getErrorMessage(err, 'Failed to send transaction');
@@ -71,6 +108,8 @@ export default function SendTransaction() {
           setTimeout(() => {
             navigate('/unlock');
           }, 3000);
+        } else if (isNotRelayedError(errorMessage)) {
+          setError(NOT_RELAYED_MESSAGE);
         } else if (errorMessage.includes('mempool min fee not met')) {
           setError('Seems like the transaction fee is too low. This often means that the transaction is too large. Try setting up smaller transactions.')
         } else {
@@ -111,6 +150,24 @@ export default function SendTransaction() {
 
   useEffect(() => {
     fetchEstimatedFees();
+  }, []);
+
+  // The global sync poller stops once the chain is synced, which is exactly
+  // when sends happen, so this page tracks the peer count itself.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      const current = await fetchConnections();
+      if (!cancelled) {
+        setConnections(current);
+      }
+    };
+    poll();
+    const interval = setInterval(poll, PEER_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
   // Update amount when fee changes if MAX was selected
@@ -232,6 +289,8 @@ export default function SendTransaction() {
 
               {error && <ErrorAlert message={error} />}
 
+              {!error && hasNoPeers && <ErrorAlert message={NO_PEERS_MESSAGE} />}
+
               {success && txid && (
                 <SuccessBanner message={success} txid={txid} formatTxid={formatTxid} />
               )}
@@ -256,7 +315,9 @@ export default function SendTransaction() {
                     <SendButton
                       onClick={() => form.handleSubmit()}
                       isLoading={isSubmitting}
-                      disabled={isSubmitting || !amount || !address || !!error || !isValid}
+                      disabled={
+                        isSubmitting || !amount || !address || !!error || !isValid || hasNoPeers
+                      }
                     />
                   </>
                 )}

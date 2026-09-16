@@ -32,6 +32,10 @@ type SyncProgress struct {
 	HeaderHeight       int32
 	FilterHeaderHeight int32
 	BestPeerHeight     int32
+
+	// Connections is the number of connected peers. A broadcast needs at
+	// least one, so front-ends gate sending on it.
+	Connections int32
 }
 
 // Interface allows more than one backing blockchain source, such as a
