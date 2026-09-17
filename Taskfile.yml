@@ -6,14 +6,15 @@ env:
 
 tasks:
   build:zk-cache:
-    desc: Generate verifier circuit caches (main + v1, one-time)
+    desc: Generate verifier circuit caches (main + v1 + fp8, one-time)
     run: once
     dir: zk-pow
     status:
-      - test -s src/circuit/v2_cache.bin
+      - test -s src/v2/circuit/v2_cache.bin
       - test -s src/v1/v1_cache.bin
+      - test -s src/api/fp8/fp8_cache.bin
     cmds:
-      - cargo run --release --no-default-features --bin build_cache src/circuit/v2_cache.bin src/v1/v1_cache.bin
+      - cargo run --release --no-default-features --bin build_cache src/api/fp8/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
 
   build:zk-gobind:
     desc: Build the Rust ZK verification library for Go FFI
@@ -22,6 +23,12 @@ tasks:
     dir: zk-pow/bindings/go
     cmds:
       - cargo build --release
+
+  generate:fp8-fixture:
+    desc: Regenerate the committed wrapped-proof fixture for Go tests (needs a machine with enough memory to prove)
+    dir: zk-pow
+    cmds:
+      - cargo test --release --jobs 12 --lib api::fp8::zk::tests::regenerate_go_fixture -- --ignored --exact --nocapture
 
   build:libxmss:
     desc: Build the XMSS static library for Go FFI
@@ -85,7 +92,7 @@ tasks:
     cmds:
       - rm -rf bin
       - rm -f xmss/libxmss.a
-      - rm -f zk-pow/src/circuit/v2_cache.bin zk-pow/src/v1/v1_cache.bin
+      - rm -f zk-pow/src/v1/v1_cache.bin
       - rm -rf pearl-blake3/target py-pearl-mining/target zk-pow/target zk-pow/bindings/go/target
       - find . -name coverage.txt -type f -delete
 
@@ -107,14 +114,15 @@ tasks:
       - go tool -modfile tools/go.mod gotestsum --format {{.GOTESTSUM_FORMAT}} {{if .GOTESTSUM_JUNITFILE}}--junitfile {{.GOTESTSUM_JUNITFILE}}{{end}} -- -race -tags=rpctest,xmss,zkpow -test.timeout=45m ./...
 
   test:python:basic:
-    desc: Run Python tests (excludes integration, performance, and slow)
+    desc: Run CPU-safe Python miner tests (excludes integration, performance, slow, and GPU-only suites)
     cmds:
-      - uv run pytest -m "not integration and not performance and not slow" miner/
+      - uv run pytest -m "not integration and not performance and not slow" miner/miner-base miner/pearl-gateway
 
   test:python:
-    desc: Run full Python test suite
+    desc: Run the full Python miner test suite (needs an SM100 GPU for vllm-miner and pearl_gemm)
     cmds:
       - uv run pytest miner/
+      - uv run --package pearl-gemm --extra cuda pytest miner/pearl-gemm/tests
 
   fmt:rust:
     desc: Format Rust code

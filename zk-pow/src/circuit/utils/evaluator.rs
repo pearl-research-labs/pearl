@@ -12,6 +12,9 @@
 /// and support basic arithmetic operations.
 /// `S`: The scalar type, used for public inputs. For native evaluation, this is a field extension.
 /// For circuit evaluation, this is the same as `V`.
+// The fp8 AIRs exercise only a subset of this interface; the full API is kept
+// mirrored with the frozen clones' copies (`crate::v2::circuit::utils::evaluator`).
+#[allow(dead_code)]
 pub(crate) trait Evaluator<V, S>
 where
     V: Copy, // Value type, in which we perform arithmetic operations

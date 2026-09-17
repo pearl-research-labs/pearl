@@ -13,11 +13,11 @@ import (
 )
 
 // PublicDataMaxSizeV2 is the maximum PublicData size for V2 certificates.
-// Must match PublicProofParams::MAX_WIRE_SIZE in zk-pow/src/api/proof_utils.rs.
+// Must match PublicProofParams::MAX_WIRE_SIZE in zk-pow/src/v2/api/proof_utils.rs.
 const PublicDataMaxSizeV2 = 4807
 
 // PublicDataSizeDenseV2 is the exact PublicData size of a dense (non-MoE) V2
-// proof. Must match PublicProofParams::WIRE_SIZE in zk-pow/src/api/proof_utils.rs;
+// proof. Must match PublicProofParams::WIRE_SIZE in zk-pow/src/v2/api/proof_utils.rs;
 // MoE proofs are strictly longer.
 const PublicDataSizeDenseV2 = 164
 

@@ -28,6 +28,7 @@ anyhow = "1.0.98"
 hashbrown = { version = "0.14.3", default-features = false, features = ["ahash", "serde"] }
 layout-macro = { path = "src/circuit/layout_macro" }
 rand = "0.9.2"
+rand_chacha = "0.9"
 serde_with = "3.14.0"
 lazy_static = "1.4"
 sorted-vec = "0.8.10"
@@ -36,8 +37,6 @@ blake3 = "1.8"
 pearl-blake3 = { path = "../pearl-blake3", features = ["serde"] }
 pyo3 = { version = "0.24", optional = true }
 
-[dev-dependencies]
-rand_chacha = "0.9"
 
 [profile.devr]
 inherits = "release"

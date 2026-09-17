@@ -6,10 +6,13 @@ use std::slice;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams, SeedDerivation};
-use zk_pow::api::prove;
-use zk_pow::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
+use zk_pow::api::fp8::public_params::PublicParams;
+use zk_pow::api::fp8::zk::Fp8VerifierCache;
+use zk_pow::api::seed::SeedDerivation;
 use zk_pow::ffi::plain_proof::PlainProof;
+use zk_pow::v2::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams};
+use zk_pow::v2::api::prove;
+use zk_pow::v2::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
 
 /// Size of reserved field in MiningConfiguration (exported to C header).
 pub const MINING_CONFIG_RESERVED_SIZE: usize = 32;
@@ -24,13 +27,18 @@ pub const ERROR_MSG_MAX_SIZE: usize = 128;
 /// Maximum size of a serialized ZK proof blob (excluding IncompleteBlockHeader and MiningConfiguration, including everything else).
 pub const MAX_ZK_PROOF_SIZE: usize = 60000;
 
+/// Maximum size of each published FP8 ZK blob: the encoded public statement and the
+/// constant-size stage-2 recursive proof. Proof-controlled input larger than this is
+/// rejected before deserialization.
+pub const MAX_FP8_PROOF_SIZE: usize = 131072;
+
 /// Smallest noise rank the rank-penalty rule accepts (exported to C header).
 pub const MIN_NOISE_RANK: u16 = 128;
 
 // Compile-time assertions to ensure constants stay in sync
 const _: () = assert!(MINING_CONFIG_RESERVED_SIZE == MiningConfiguration::RESERVED_SIZE);
 const _: () = assert!(MINING_CONFIG_SERIALIZED_SIZE == MiningConfiguration::SERIALIZED_SIZE);
-const _: () = assert!(MIN_NOISE_RANK as usize == zk_pow::api::sanity_checks::PENALTY_BASE_RANK);
+const _: () = assert!(MIN_NOISE_RANK as usize == zk_pow::v2::api::sanity_checks::PENALTY_BASE_RANK);
 
 type CircuitCache = <PearlRecursion as RecursionCircuit>::CircuitCache;
 type V1CircuitCache = zk_pow::v1::circuit::circuit_utils::CircuitCache;
@@ -39,7 +47,7 @@ lazy_static::lazy_static! {
     /// Global circuit cache shared across Go FFI functions (verify and prove).
     /// Protected by a Mutex for thread-safe access from multiple Go goroutines.
     pub static ref CIRCUIT_CACHE: Mutex<CircuitCache> = {
-        use zk_pow::circuit::embedded_cache;
+        use zk_pow::v2::circuit::embedded_cache;
         Mutex::new(CircuitCache::from_bytes(embedded_cache::CACHE_DATA)
             .expect("V2 circuit cache is missing or corrupt; cannot verify proofs"))
     };
@@ -49,6 +57,16 @@ lazy_static::lazy_static! {
         use zk_pow::v1::embedded_cache;
         Mutex::new(V1CircuitCache::from_bytes(embedded_cache::CACHE_DATA)
             .expect("V1 circuit cache is missing or corrupt; cannot verify V1 proofs"))
+    };
+
+    /// FP8 verifier cache: the trusted setup (LUT cap + universal wrapper circuits),
+    /// keyed by device byte and preloaded from the embedded `fp8_cache.bin`. Read-only —
+    /// a device missing from the cache rejects the proof rather than compiling its setup
+    /// on demand, so no proof can force an expensive circuit build (denial of service).
+    pub static ref FP8_VERIFIER_CACHE: Fp8VerifierCache = {
+        use zk_pow::api::fp8::embedded_cache;
+        Fp8VerifierCache::from_bytes(embedded_cache::CACHE_DATA)
+            .expect("fp8 verifier cache is missing or corrupt; cannot verify fp8 proofs")
     };
 }
 
@@ -61,6 +79,11 @@ pub(crate) fn acquire_cache() -> std::sync::MutexGuard<'static, CircuitCache> {
 /// Acquires the V1 circuit cache for version-1 proof verification.
 pub(crate) fn acquire_v1_cache() -> std::sync::MutexGuard<'static, V1CircuitCache> {
     V1_CIRCUIT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The fp8 verifier cache: read-only, so no lock — concurrent verifications share it.
+pub(crate) fn fp8_cache() -> &'static Fp8VerifierCache {
+    &FP8_VERIFIER_CACHE
 }
 
 /// Catches panics from a closure and returns Ok(result) or Err(panic_message).
@@ -84,9 +107,20 @@ where
 pub const PUBLICDATA_SIZE: usize = 164;
 const _: () = assert!(PUBLICDATA_SIZE == PublicProofParams::WIRE_SIZE);
 
-/// Maximum `public_data` buffer length, sized for largest MoE proofs (exported to C header).
+/// Maximum `public_data` buffer length over all schemes. Equal to the v2 MoE
+/// maximum (`PublicProofParams::MAX_WIRE_SIZE`); the v4/fp8 maximum
+/// (`PublicParams::MAX_WIRE_SIZE`) must fit inside it. `CZKProof.public_data` is
+/// shared by the v2 and fp8 paths, so it must fit both. Exported to C and
+/// mirrored as the FFI statement buffer; the Go node's `wire.PublicDataMaxSizeV2`
+/// caps v2 certificates separately.
+///
+/// Kept literal so cbindgen can emit a `#define`. The compile-time assertions
+/// below guard the value against drift.
 pub const PUBLICDATA_MAX_SIZE: usize = 4807;
-const _: () = assert!(PUBLICDATA_MAX_SIZE == PublicProofParams::MAX_WIRE_SIZE);
+const _: () = {
+    assert!(PUBLICDATA_MAX_SIZE >= PublicParams::MAX_WIRE_SIZE);
+    assert!(PUBLICDATA_MAX_SIZE == PublicProofParams::MAX_WIRE_SIZE);
+};
 
 /// Go-owned ZK proof structure. Buffer is sized for the largest MoE proof;
 /// `public_data_len` indicates how many bytes are actually used.

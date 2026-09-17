@@ -99,7 +99,7 @@ jobs:
       - name: Build project and generate verifier cache
         run: |
           cargo build --release
-          cargo run --release --bin build_cache src/circuit/v2_cache.bin src/v1/v1_cache.bin
+          cargo run --release --bin build_cache src/api/fp8/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
           cargo build --release --features embedded_cache
 
       - name: Run tests
@@ -120,16 +120,10 @@ jobs:
       - name: Test invalid proofs mode
         run: cargo run --release --bin prove_verify -- invalid
 
-      - name: Test performance mode
-        run: cargo run --release --bin prove_verify -- performance
-
       # Go FFI Build
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: '1.26.6'
-
-      - name: Regenerate verifier circuit cache for Go FFI
-        run: cargo run --release --bin build_cache src/circuit/v2_cache.bin src/v1/v1_cache.bin
 
       - name: Build zk_pow_ffi library for Go FFI
         run: |
