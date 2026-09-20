@@ -20,6 +20,21 @@ func NewCreateNewAccountCmd(account string) *CreateNewAccountCmd {
 	}
 }
 
+// DeriveMultisigKeyCmd defines the derivemultisigkey JSON-RPC command.
+type DeriveMultisigKeyCmd struct {
+	VaultAccount int
+	KeyIndex     int
+}
+
+// NewDeriveMultisigKeyCmd returns a new instance which can be used to issue a
+// derivemultisigkey JSON-RPC command.
+func NewDeriveMultisigKeyCmd(vaultAccount, keyIndex int) *DeriveMultisigKeyCmd {
+	return &DeriveMultisigKeyCmd{
+		VaultAccount: vaultAccount,
+		KeyIndex:     keyIndex,
+	}
+}
+
 // DumpWalletCmd defines the dumpwallet JSON-RPC command.
 type DumpWalletCmd struct {
 	Filename string
@@ -98,6 +113,7 @@ func init() {
 	flags := UFWalletOnly
 
 	MustRegisterCmd("createnewaccount", (*CreateNewAccountCmd)(nil), flags)
+	MustRegisterCmd("derivemultisigkey", (*DeriveMultisigKeyCmd)(nil), flags)
 	MustRegisterCmd("dumpwallet", (*DumpWalletCmd)(nil), flags)
 	MustRegisterCmd("importaddress", (*ImportAddressCmd)(nil), flags)
 	MustRegisterCmd("importpubkey", (*ImportPubKeyCmd)(nil), flags)

@@ -8,6 +8,7 @@ import WalletSetupStep from './WalletSetupStep';
 import SeedDisplay from './SeedDisplay';
 import SeedVerification from './SeedVerification';
 import { useWalletStore } from '../../store/walletStore';
+import { setActiveWalletName, setSessionWalletSeed } from '../../services/wallet-seed';
 
 type CreateWalletStep = 'wallet-setup' | 'seed-display' | 'seed-verification' | 'complete';
 
@@ -26,6 +27,8 @@ export default function CreateWallet() {
         password: password,
       });
 
+      setSessionWalletSeed(walletName, result.seed);
+      setActiveWalletName(walletName);
       setGeneratedSeed(result.seed);
       setStep('seed-display');
     } catch (error) {

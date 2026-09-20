@@ -2,6 +2,7 @@ import { RpcClient, RpcConfig } from '../rpc-client.ts';
 import { formatAndSortTransactions } from './transaction-formatter.ts';
 import { WalletRpcMethods } from './wallet-rpc-methods.ts';
 import { WalletApi } from '../../../types/app-bridge.ts';
+import { BlockbookClient } from '../../clients/blockbook-client.ts';
 
 class WalletService extends WalletRpcMethods implements WalletApi {
   constructor(config: RpcConfig) {
@@ -34,6 +35,10 @@ class WalletService extends WalletRpcMethods implements WalletApi {
     );
     const transactions = filteredTransactions.slice(from, from + count);
     return transactions;
+  }
+
+  async getTransactionInfo(txid: string) {
+    return await BlockbookClient.getTransactionInfo(txid);
   }
 }
 

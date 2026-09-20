@@ -31,7 +31,13 @@ interface WindowApi {
 interface WalletApi {
   getNewAddress: () => Promise<string>;
 
-  unlockWallet: (passphrase: string, timeout?: number) => Promise<void>;
+  unlockWallet: (passphrase: string, timeout?: number) => Promise<{ seed?: string }>;
+
+  deriveMultisigKey: (vaultAccount: number, keyIndex: number) => Promise<{
+    pubkeyHex: string;
+    privKeyHex: string;
+    originPath: string;
+  }>;
 
   lockWallet: () => Promise<void>;
 
@@ -47,9 +53,43 @@ interface WalletApi {
 
   getBalance: (account?: string, minconf?: number) => Promise<number>;
 
+  getVaultBalance: (address: string) => Promise<{ grains: string; degraded: boolean }>;
+
+  getVaultUtxos: (address: string) => Promise<{
+    utxos: Array<{
+      txid: string;
+      vout: number;
+      valueGrains: string;
+      scriptHex: string;
+    }>;
+    degraded: boolean;
+    droppedNoScript: number;
+  }>;
+
+  broadcastPearlTx: (rawHex: string) => Promise<string>;
+
+  getTransactionInfo: (txid: string) => Promise<{
+    txid: string;
+    confirmations: number;
+    blockhash: string;
+    time: number;
+  } | null>;
+
   validateAddress: (address: string) => Promise<{ isValid: boolean }>;
 
   estimateFee: (numBlocks: number) => Promise<number>;
+
+  getMultisigState: () => Promise<{
+    vaults: unknown[];
+    pendingTxs: unknown[];
+    sentTxs: unknown[];
+  }>;
+
+  saveMultisigState: (state: {
+    vaults: unknown[];
+    pendingTxs: unknown[];
+    sentTxs: unknown[];
+  }) => Promise<void>;
 }
 
 interface ManagerApi {

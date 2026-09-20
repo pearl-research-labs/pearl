@@ -7,6 +7,11 @@ import { NetworkSelector } from '../components/NetworkSelector';
 import { SettingsButton } from '../components/SettingsButton';
 import { UpgradeCta } from '../components/UpgradeCta';
 import { Button } from '@pearl/ui';
+import {
+  clearSessionWalletSeed,
+  setActiveWalletName,
+  setSessionWalletSeed,
+} from '../services/wallet-seed';
 
 export default function WalletUnlock() {
   const navigate = useNavigate();
@@ -35,6 +40,9 @@ export default function WalletUnlock() {
 
           setSelectedWallet(defaultWallet);
           setWalletName(defaultWallet);
+          if (defaultWallet) {
+            setActiveWalletName(defaultWallet);
+          }
         }
       } catch (error) {
         console.error('[WalletUnlock] Error fetching wallet data:', error);
@@ -47,6 +55,8 @@ export default function WalletUnlock() {
   const handleWalletSelect = async (walletName: string) => {
     setSelectedWallet(walletName);
     setWalletName(walletName);
+    clearSessionWalletSeed();
+    setActiveWalletName(walletName);
     setIsDropdownOpen(false);
     setError(null);
   };
@@ -55,9 +65,11 @@ export default function WalletUnlock() {
     try {
       if (attempt === 1) {
         clearWalletData();
+        clearSessionWalletSeed();
         setIsWaitingForService(true);
         try {
           await window.appBridge.manager.selectWallet(walletName);
+          setActiveWalletName(walletName);
         } catch (error) {
           throw new Error(getErrorMessage(error));
         }
@@ -65,7 +77,10 @@ export default function WalletUnlock() {
       }
 
       try {
-        await window.appBridge.wallet.unlockWallet(password, 3600);
+        const result = await window.appBridge.wallet.unlockWallet(password, 3600);
+        if (result.seed) {
+          setSessionWalletSeed(walletName, result.seed);
+        }
 
         setIsUnlocking(false);
         setIsWaitingForService(false);
