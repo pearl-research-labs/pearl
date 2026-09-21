@@ -14,7 +14,7 @@ export function UpgradeCta() {
     <button
       type="button"
       onClick={() => void openReleasePage()}
-      className="mx-auto flex items-center gap-2 rounded-full border border-green-300 bg-green-50 px-4 py-1.5 text-sm font-medium text-green-800 transition-colors hover:bg-green-100 focus:outline-none focus:ring-2 focus:ring-green-500/40"
+      className="mx-auto flex items-center gap-2 rounded-full border border-green-300 dark:border-green-800 bg-green-50 dark:bg-green-950/40 px-4 py-1.5 text-sm font-medium text-green-800 dark:text-green-200 transition-colors hover:bg-green-100 dark:hover:bg-green-900/60 focus:outline-none focus:ring-2 focus:ring-green-500/40"
       title={
         status.latestVersion
           ? `Pearl Wallet ${status.latestVersion} is available`

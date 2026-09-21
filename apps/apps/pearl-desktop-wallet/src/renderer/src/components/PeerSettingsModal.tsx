@@ -97,20 +97,20 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-            <div className="w-full max-w-md rounded-lg border border-gray-300 bg-white p-6 shadow-xl">
+            <div className="w-full max-w-md rounded-lg border border-gray-300 dark:border-border bg-white dark:bg-card p-6 shadow-xl">
                 {/* Header */}
                 <div className="mb-4 flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                        <h2 className="text-xl font-bold text-gray-900">Peer Settings</h2>
+                        <h2 className="text-xl font-bold text-gray-900 dark:text-foreground">Peer Settings</h2>
                         {network && (
-                            <span className={`rounded-full px-2 py-0.5 text-xs font-semibold capitalize ${network === 'mainnet' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
+                            <span className={`rounded-full px-2 py-0.5 text-xs font-semibold capitalize ${network === 'mainnet' ? 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300' : 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300'}`}>
                                 {network}
                             </span>
                         )}
                     </div>
                     <button
                         onClick={onClose}
-                        className="rounded-full p-1 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700"
+                        className="rounded-full p-1 text-gray-500 dark:text-muted-foreground transition-colors hover:bg-gray-100 dark:hover:bg-muted hover:text-gray-700 dark:hover:text-foreground"
                     >
                         <X className="h-5 w-5" />
                     </button>
@@ -119,12 +119,12 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
                 {/* Form */}
                 <div className="space-y-4">
                     {/* Default Peer Discovery */}
-                    <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+                    <div className="rounded-lg border border-gray-200 dark:border-border bg-gray-50 dark:bg-muted/40 p-3">
                         <div className="mb-1 flex items-center gap-2">
-                            <Globe className="h-4 w-4 text-green-600" />
-                            <span className="text-sm font-semibold text-gray-700">Default Peer Discovery</span>
+                            <Globe className="h-4 w-4 text-green-600 dark:text-green-400" />
+                            <span className="text-sm font-semibold text-gray-700 dark:text-foreground/90">Default Peer Discovery</span>
                         </div>
-                        <p className="text-xs text-gray-500">
+                        <p className="text-xs text-gray-500 dark:text-muted-foreground">
                             By default, the wallet automatically discovers peers via Pearl DNS seeders.
                         </p>
                     </div>
@@ -132,10 +132,10 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
                     {/* Custom Peer (optional) */}
                     <div>
                         <div className="mb-2 flex items-center gap-2">
-                            <Server className="h-4 w-4 text-gray-500" />
-                            <label className="text-sm font-medium text-gray-700">Custom Peer (optional)</label>
+                            <Server className="h-4 w-4 text-gray-500 dark:text-muted-foreground" />
+                            <label className="text-sm font-medium text-gray-700 dark:text-foreground/90">Custom Peer (optional)</label>
                         </div>
-                        <p className="mb-2 text-xs text-gray-500">
+                        <p className="mb-2 text-xs text-gray-500 dark:text-muted-foreground">
                             Add a specific peer (IP address or hostname) to connect to at startup. Leave empty to use automatic discovery.
                         </p>
                         <div className="space-y-2">
@@ -144,21 +144,21 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
                                 value={peerAddress}
                                 onChange={(e) => setPeerAddress(e.target.value)}
                                 placeholder="e.g. 192.168.1.1 or my-node.example.com"
-                                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-gray-900 focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500/20"
+                                className="w-full rounded-lg border border-gray-300 dark:border-border dark:bg-card px-3 py-2 text-gray-900 dark:text-foreground focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500/20"
                             />
                             <input
                                 type="number"
                                 value={peerPort}
                                 onChange={(e) => setPeerPort(e.target.value)}
                                 placeholder="Port (e.g. 44108)"
-                                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-gray-900 focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500/20"
+                                className="w-full rounded-lg border border-gray-300 dark:border-border dark:bg-card px-3 py-2 text-gray-900 dark:text-foreground focus:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500/20"
                             />
                         </div>
                     </div>
 
                     {isCustom && (
-                        <div className="rounded-lg bg-blue-50 p-3">
-                            <p className="text-sm text-blue-700">
+                        <div className="rounded-lg bg-blue-50 dark:bg-blue-950/40 p-3">
+                            <p className="text-sm text-blue-700 dark:text-blue-300">
                                 A custom peer is currently configured. The wallet will connect to it in addition to DNS-discovered peers.
                             </p>
                         </div>
@@ -186,7 +186,7 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
                         </Button>
                     </div>
 
-                    <p className="text-xs text-gray-500">
+                    <p className="text-xs text-gray-500 dark:text-muted-foreground">
                         Note: You'll need to restart the wallet after changing peer settings.
                     </p>
                 </div>

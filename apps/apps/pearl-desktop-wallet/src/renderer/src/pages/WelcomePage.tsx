@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import { NetworkSelector } from '../components/NetworkSelector';
 import { SettingsButton } from '../components/SettingsButton';
+import { ThemeToggle } from '../components/ThemeToggle';
 import { Logo, LogoSmall } from '@pearl/ui';
 
 const features = [
@@ -70,13 +71,13 @@ export default function WelcomePage() {
 
   if (isCheckingWallet) {
     return (
-      <div className="flex h-full w-full flex-col items-center justify-center bg-transparent text-gray-900">
+      <div className="flex h-full w-full flex-col items-center justify-center bg-transparent text-gray-900 dark:text-foreground">
         <div className="bg-brand-green mb-6 rounded-2xl p-4">
           <Logo className="h-10 w-10 text-white" />
         </div>
         <h1 className="mb-4 text-2xl font-bold">Pearl Wallet</h1>
         <div className="border-brand-green mb-4 h-8 w-8 animate-spin rounded-full border-2 border-t-transparent" />
-        <p className="text-gray-600">
+        <p className="text-gray-600 dark:text-muted-foreground">
           {existingWalletName ? 'Starting wallet service...' : 'Checking for existing wallet...'}
         </p>
         {existingWalletName && (
@@ -87,18 +88,19 @@ export default function WelcomePage() {
   }
 
   return (
-    <div className="relative flex h-full w-full flex-col items-center justify-center bg-transparent p-8 text-center text-gray-900">
+    <div className="relative flex h-full w-full flex-col items-center justify-center bg-transparent p-8 text-center text-gray-900 dark:text-foreground">
       {/* Network Selector & Settings - Top Right */}
       <div className="absolute right-8 top-8 flex items-center gap-3">
         <NetworkSelector />
         <SettingsButton />
+        <ThemeToggle />
       </div>
 
       <div className="bg-brand-green mb-4 rounded-2xl p-4">
         <LogoSmall className="h-12 w-auto" />
       </div>
       <h1 className="text-4xl font-bold">Pearl Wallet</h1>
-      <p className="mt-1 text-gray-600">The official Pearl (PRL) Open Source Desktop Wallet</p>
+      <p className="mt-1 text-gray-600 dark:text-muted-foreground">The official Pearl (PRL) Open Source Desktop Wallet</p>
 
       <div className="my-10 w-full max-w-xs space-y-6 text-left">
         {features.map(feature => (
@@ -108,7 +110,7 @@ export default function WelcomePage() {
             </div>
             <div>
               <h3 className="font-semibold">{feature.title}</h3>
-              <p className="text-sm text-gray-600">{feature.description}</p>
+              <p className="text-sm text-gray-600 dark:text-muted-foreground">{feature.description}</p>
             </div>
           </div>
         ))}
@@ -126,7 +128,7 @@ export default function WelcomePage() {
           asChild
           variant="outline"
           size="lg"
-          className="w-full hover:bg-gray-100 hover:text-gray-900"
+          className="w-full hover:bg-gray-100 dark:hover:bg-muted hover:text-gray-900 dark:hover:text-foreground"
         >
           <Link to="/import-account">Restore Wallet From A Recovery Phrase</Link>
         </Button>

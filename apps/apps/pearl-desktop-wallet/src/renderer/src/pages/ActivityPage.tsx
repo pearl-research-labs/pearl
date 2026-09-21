@@ -70,21 +70,21 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
   return (
     <div className="flex h-screen w-full flex-col bg-transparent">
       {/* Header */}
-      <div className="flex flex-shrink-0 items-center gap-4 border-b border-gray-200 bg-white/80 p-6 shadow-sm backdrop-blur-sm">
-        <button onClick={onBack} className="rounded-lg p-2 transition-colors hover:bg-gray-100">
-          <ArrowLeft className="h-5 w-5 text-gray-700" />
+      <div className="flex flex-shrink-0 items-center gap-4 border-b border-gray-200 dark:border-border bg-white/80 dark:bg-card/80 p-6 shadow-sm backdrop-blur-sm">
+        <button onClick={onBack} className="rounded-lg p-2 transition-colors hover:bg-gray-100 dark:hover:bg-muted">
+          <ArrowLeft className="h-5 w-5 text-gray-700 dark:text-foreground/90" />
         </button>
-        <h1 className="text-2xl font-semibold text-gray-900">Activity</h1>
+        <h1 className="text-2xl font-semibold text-gray-900 dark:text-foreground">Activity</h1>
       </div>
 
       {/* Content - Scrollable */}
       <div className="flex-1 overflow-y-auto p-6">
         {loading && activities.length === 0 ? (
-          <div className="py-12 text-center text-gray-500">
+          <div className="py-12 text-center text-gray-500 dark:text-muted-foreground">
             <p>Loading activities...</p>
           </div>
         ) : activities.length === 0 ? (
-          <div className="py-12 text-center text-gray-500">
+          <div className="py-12 text-center text-gray-500 dark:text-muted-foreground">
             <p>No activity found</p>
           </div>
         ) : (
@@ -93,11 +93,11 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
             {activities.map((activity: Transaction, index) => (
               <div
                 key={`${activity.type}_${activity.txid}_${index}`}
-                className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm transition-all hover:shadow-md"
+                className="rounded-lg border border-gray-200 dark:border-border bg-white dark:bg-card p-4 shadow-sm transition-all hover:shadow-md"
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-4">
-                    <div className="flex h-12 w-12 items-center justify-center rounded-full bg-gray-100">
+                    <div className="flex h-12 w-12 items-center justify-center rounded-full bg-gray-100 dark:bg-muted">
                       {activity.type === 'received' ? (
                         <ArrowDownLeft className="text-brand-green h-6 w-6" />
                       ) : (
@@ -105,25 +105,25 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                       )}
                     </div>
                     <div>
-                      <div className="text-lg font-medium text-gray-900">
+                      <div className="text-lg font-medium text-gray-900 dark:text-foreground">
                         {activity.type === 'received' ? 'Received' : 'Sent'}
                       </div>
-                      <div className="text-sm text-gray-600">
+                      <div className="text-sm text-gray-600 dark:text-muted-foreground">
                         {formatTimeAgo(activity.time)} • {formatFullDate(activity.time)}
                       </div>
                       <div className="mt-1 flex items-center gap-2">
-                        <span className="text-xs text-gray-500">
+                        <span className="text-xs text-gray-500 dark:text-muted-foreground">
                           Tx ID: {truncateTxId(activity.txid)}
                         </span>
                         <button
                           onClick={() => handleCopyTxId(activity.txid)}
-                          className="rounded p-1 transition-colors hover:bg-gray-100"
+                          className="rounded p-1 transition-colors hover:bg-gray-100 dark:hover:bg-muted"
                           title="Copy transaction ID"
                         >
                           {copiedTxId === activity.txid ? (
                             <Check className="text-brand-green h-3 w-3" />
                           ) : (
-                            <Copy className="h-3 w-3 text-gray-400" />
+                            <Copy className="h-3 w-3 text-gray-400 dark:text-muted-foreground/70" />
                           )}
                         </button>
                       </div>
@@ -131,17 +131,17 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                   </div>
                   <div className="text-right">
                     <div
-                      className={`text-lg font-bold ${activity.type === 'received' ? 'text-green-700' : 'text-red-500'
+                      className={`text-lg font-bold ${activity.type === 'received' ? 'text-green-700 dark:text-green-300' : 'text-red-500'
                         }`}
                     >
                       {activity.type === 'received' ? '+' : '-'}
                       {activity.amount} PRL
                     </div>
-                    <div className="text-sm text-gray-600">
+                    <div className="text-sm text-gray-600 dark:text-muted-foreground">
                       {activity.confirmations} confirmations
                     </div>
                     {activity.fee > 0 && (
-                      <div className="text-xs text-gray-500">
+                      <div className="text-xs text-gray-500 dark:text-muted-foreground">
                         Fee: {activity.fee.toFixed(8)} PRL
                       </div>
                     )}
@@ -151,11 +151,11 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
             ))}
 
             {loading && activities.length > 0 && (
-              <div className="py-2 text-center text-sm text-gray-500">Loading more...</div>
+              <div className="py-2 text-center text-sm text-gray-500 dark:text-muted-foreground">Loading more...</div>
             )}
 
             {!hasMore && activities.length > 0 && (
-              <div className="py-2 text-center text-xs text-gray-400">No more activity</div>
+              <div className="py-2 text-center text-xs text-gray-400 dark:text-muted-foreground/70">No more activity</div>
             )}
 
             {hasMore ? (
@@ -171,7 +171,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
             ) : null}
 
             {/* Total count indicator */}
-            <div className="mt-6 border-t border-gray-200 py-4 text-center text-sm text-gray-500">
+            <div className="mt-6 border-t border-gray-200 dark:border-border py-4 text-center text-sm text-gray-500 dark:text-muted-foreground">
               {activities.length} transactions loaded
             </div>
           </div>

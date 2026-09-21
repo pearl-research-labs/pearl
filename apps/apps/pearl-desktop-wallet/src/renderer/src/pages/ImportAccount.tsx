@@ -147,17 +147,17 @@ export default function ImportAccount() {
               <KeyRound className="h-10 w-10" />
             </div>
 
-            <h2 className="mb-2 text-center text-xl font-bold text-gray-900 sm:text-2xl">
+            <h2 className="mb-2 text-center text-xl font-bold text-gray-900 dark:text-foreground sm:text-2xl">
               Enter Your recovery phrase
             </h2>
-            <p className="mb-6 text-center text-sm text-gray-600 sm:mb-8 sm:text-base">
+            <p className="mb-6 text-center text-sm text-gray-600 dark:text-muted-foreground sm:mb-8 sm:text-base">
               Enter your 12- or 24-word BIP39 mnemonic (15/18/21 also supported), or a hex seed,
               to restore your wallet
             </p>
 
             <div className="w-full space-y-4">
               <div>
-                <Label htmlFor="walletName" className="text-gray-900">
+                <Label htmlFor="walletName" className="text-gray-900 dark:text-foreground">
                   Wallet Name
                 </Label>
                 <div className="relative">
@@ -166,7 +166,7 @@ export default function ImportAccount() {
                     placeholder="My Pearl Wallet"
                     value={walletName}
                     onChange={e => setWalletName(e.target.value)}
-                    className={`focus:border-brand-green focus:ring-brand-green/20 mt-2 border-gray-300 bg-white text-gray-900 placeholder-gray-400 shadow-sm focus:ring-2 ${walletNameError
+                    className={`focus:border-brand-green focus:ring-brand-green/20 mt-2 border-gray-300 dark:border-border bg-white dark:bg-card text-gray-900 dark:text-foreground placeholder-gray-400 dark:placeholder-muted-foreground/70 shadow-sm focus:ring-2 ${walletNameError
                       ? 'border-red-500 focus:border-red-500 focus:ring-red-500/20'
                       : ''
                       }`}
@@ -188,7 +188,7 @@ export default function ImportAccount() {
               </div>
 
               <div>
-                <Label htmlFor="seed" className="text-gray-900">
+                <Label htmlFor="seed" className="text-gray-900 dark:text-foreground">
                   Recovery Phrase (12 or 24 words) or Hex Seed
                 </Label>
                 <textarea
@@ -196,7 +196,7 @@ export default function ImportAccount() {
                   placeholder="Enter your recovery phrase here..."
                   value={seed}
                   onChange={e => setSeed(e.target.value)}
-                  className="focus:border-brand-green focus:ring-brand-green/20 mt-2 h-32 w-full resize-none rounded-lg border border-gray-300 bg-white p-3 text-gray-900 placeholder-gray-400 shadow-sm focus:outline-none focus:ring-2"
+                  className="focus:border-brand-green focus:ring-brand-green/20 mt-2 h-32 w-full resize-none rounded-lg border border-gray-300 dark:border-border bg-white dark:bg-card p-3 text-gray-900 dark:text-foreground placeholder-gray-400 dark:placeholder-muted-foreground/70 shadow-sm focus:outline-none focus:ring-2"
                   rows={4}
                 />
               </div>
@@ -231,13 +231,13 @@ export default function ImportAccount() {
             <h2 className="mb-2 text-center text-xl font-bold sm:text-2xl">
               Set Wallet Passphrase
             </h2>
-            <p className="mb-6 text-center text-sm text-gray-600 sm:mb-8 sm:text-base">
+            <p className="mb-6 text-center text-sm text-gray-600 dark:text-muted-foreground sm:mb-8 sm:text-base">
               Create a secure passphrase to encrypt and protect your wallet
             </p>
 
             <div className="w-full space-y-4">
               <div>
-                <Label htmlFor="passphrase" className="text-gray-900">
+                <Label htmlFor="passphrase" className="text-gray-900 dark:text-foreground">
                   Wallet Passphrase
                 </Label>
                 <div className="relative">
@@ -247,12 +247,12 @@ export default function ImportAccount() {
                     placeholder="Enter a secure passphrase..."
                     value={passphrase}
                     onChange={e => setPassphrase(e.target.value)}
-                    className="focus:border-brand-green focus:ring-brand-green/20 mt-2 border-gray-300 bg-white pr-12 text-gray-900 placeholder-gray-400 shadow-sm focus:ring-2"
+                    className="focus:border-brand-green focus:ring-brand-green/20 mt-2 border-gray-300 dark:border-border bg-white dark:bg-card pr-12 text-gray-900 dark:text-foreground placeholder-gray-400 dark:placeholder-muted-foreground/70 shadow-sm focus:ring-2"
                   />
                   <button
                     type="button"
                     onClick={() => setShowPassphrase(!showPassphrase)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 transition-colors hover:text-gray-700"
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 dark:text-muted-foreground transition-colors hover:text-gray-700 dark:hover:text-foreground"
                   >
                     {showPassphrase ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
                   </button>
@@ -265,7 +265,7 @@ export default function ImportAccount() {
               </div>
 
               <div>
-                <Label htmlFor="confirmPassphrase" className="text-gray-900">
+                <Label htmlFor="confirmPassphrase" className="text-gray-900 dark:text-foreground">
                   Confirm Passphrase
                 </Label>
                 <div className="relative">
@@ -275,12 +275,12 @@ export default function ImportAccount() {
                     placeholder="Confirm your passphrase..."
                     value={confirmPassphrase}
                     onChange={e => setConfirmPassphrase(e.target.value)}
-                    className="focus:border-brand-green focus:ring-brand-green/20 mt-2 border-gray-300 bg-white pr-12 text-gray-900 placeholder-gray-400 shadow-sm focus:ring-2"
+                    className="focus:border-brand-green focus:ring-brand-green/20 mt-2 border-gray-300 dark:border-border bg-white dark:bg-card pr-12 text-gray-900 dark:text-foreground placeholder-gray-400 dark:placeholder-muted-foreground/70 shadow-sm focus:ring-2"
                   />
                   <button
                     type="button"
                     onClick={() => setShowConfirmPassphrase(!showConfirmPassphrase)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 transition-colors hover:text-gray-700"
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 dark:text-muted-foreground transition-colors hover:text-gray-700 dark:hover:text-foreground"
                   >
                     {showConfirmPassphrase ? (
                       <EyeOff className="h-5 w-5" />
@@ -297,7 +297,7 @@ export default function ImportAccount() {
                 <Button
                   onClick={() => setStep('seed-input')}
                   variant="outline"
-                  className="flex-1 border-gray-300 bg-white text-gray-700 shadow-sm hover:border-gray-400 hover:bg-gray-50 hover:text-gray-900"
+                  className="flex-1 border-gray-300 dark:border-border bg-white dark:bg-card text-gray-700 dark:text-foreground/90 shadow-sm hover:border-gray-400 dark:hover:border-muted-foreground/60 hover:bg-gray-50 dark:hover:bg-muted/60 hover:text-gray-900 dark:hover:text-foreground"
                 >
                   Back
                 </Button>
@@ -318,8 +318,8 @@ export default function ImportAccount() {
               </div>
             </div>
 
-            <div className="mt-6 rounded-lg border border-amber-300 bg-amber-50 p-4 shadow-sm">
-              <p className="text-center text-sm text-amber-800">
+            <div className="mt-6 rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 p-4 shadow-sm">
+              <p className="text-center text-sm text-amber-800 dark:text-amber-200">
                 <strong>Important:</strong> Remember this passphrase! You'll need it to unlock your
                 wallet and make transactions.
               </p>
@@ -336,14 +336,14 @@ export default function ImportAccount() {
   };
 
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-transparent text-gray-900">
+    <div className="flex h-full w-full flex-col overflow-hidden bg-transparent text-gray-900 dark:text-foreground">
       {/* Header */}
       <div className="flex flex-shrink-0 items-center gap-4 px-4 py-4 sm:px-8 sm:py-6">
         <Button
           variant="ghost"
           size="sm"
           asChild
-          className="text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+          className="text-gray-700 dark:text-foreground/90 hover:bg-gray-100 dark:hover:bg-muted hover:text-gray-900 dark:hover:text-foreground"
         >
           <Link to="/">
             <ArrowLeft className="h-4 w-4" />

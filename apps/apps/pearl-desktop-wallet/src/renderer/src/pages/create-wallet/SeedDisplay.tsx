@@ -35,16 +35,16 @@ export default function SeedDisplay({ seed, onConfirm }: SeedDisplayProps) {
         <Key className="h-8 w-8 text-white sm:h-10 sm:w-10" />
       </div>
 
-      <h2 className="mb-2 text-center text-xl font-bold text-gray-900 sm:text-2xl">
+      <h2 className="mb-2 text-center text-xl font-bold text-gray-900 dark:text-foreground sm:text-2xl">
         Your Wallet Seed
       </h2>
-      <p className="mb-4 text-center text-sm text-gray-600 sm:mb-6 sm:text-base">
+      <p className="mb-4 text-center text-sm text-gray-600 dark:text-muted-foreground sm:mb-6 sm:text-base">
         This is your wallet's seed phrase. Keep it safe and secure!
       </p>
 
-      <Card className="mb-4 w-full border-gray-300 bg-white shadow-sm sm:mb-6">
+      <Card className="mb-4 w-full border-gray-300 dark:border-border bg-white dark:bg-card shadow-sm sm:mb-6">
         <CardContent className="p-4 sm:p-6">
-          <div className="mb-4 rounded-lg border border-gray-200 bg-gray-50 p-4">
+          <div className="mb-4 rounded-lg border border-gray-200 dark:border-border bg-gray-50 dark:bg-muted/40 p-4">
             <p className="text-brand-green break-words font-mono text-sm leading-relaxed">{seed}</p>
           </div>
 
@@ -53,7 +53,7 @@ export default function SeedDisplay({ seed, onConfirm }: SeedDisplayProps) {
             variant="outline"
             className={`w-full transition-all duration-200 ${isCopied
               ? 'border-brand-green bg-brand-light-green/10 '
-              : 'border-gray-300 bg-gray-100'
+              : 'border-gray-300 dark:border-border bg-gray-100 dark:bg-muted'
               }`}
           >
             {isCopied ? (
@@ -71,12 +71,12 @@ export default function SeedDisplay({ seed, onConfirm }: SeedDisplayProps) {
         </CardContent>
       </Card>
 
-      <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 shadow-sm sm:mb-6 sm:p-4">
+      <div className="mb-4 rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 p-3 shadow-sm sm:mb-6 sm:p-4">
         <div className="flex items-start gap-3">
-          <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-600" />
+          <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-600 dark:text-amber-400" />
           <div className="text-sm">
-            <p className="mb-1 font-medium text-amber-900">Important:</p>
-            <p className="text-amber-700">
+            <p className="mb-1 font-medium text-amber-900 dark:text-amber-100">Important:</p>
+            <p className="text-amber-700 dark:text-amber-300">
               Store this seed securely. Anyone with access to it can control your wallet and funds.
             </p>
           </div>

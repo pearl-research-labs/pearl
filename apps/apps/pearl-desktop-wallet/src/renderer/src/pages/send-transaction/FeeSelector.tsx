@@ -16,15 +16,15 @@ export default function FeeSelector({
 }: FeeSelectorProps) {
   return (
     <div className="space-y-3">
-      <label className="text-sm text-gray-600">Transaction Fee</label>
-      <div className="rounded-lg border border-gray-300 bg-white p-4 shadow-sm">
+      <label className="text-sm text-gray-600 dark:text-muted-foreground">Transaction Fee</label>
+      <div className="rounded-lg border border-gray-300 dark:border-border bg-white dark:bg-card p-4 shadow-sm">
         <div className="mb-4 grid grid-cols-3 gap-2">
           <button
             type="button"
             onClick={() => onSelect('fast')}
             className={`rounded-lg border p-3 transition-all ${feeLevel === 'fast'
               ? 'border-green-500 bg-green-500/10'
-              : 'border-gray-300 bg-gray-50 hover:border-gray-400'
+              : 'border-gray-300 dark:border-border bg-gray-50 dark:bg-muted/40 hover:border-gray-400 dark:hover:border-muted-foreground/60'
               }`}
           >
             <div className="flex flex-col items-center gap-1">
@@ -45,7 +45,7 @@ export default function FeeSelector({
             onClick={() => onSelect('medium')}
             className={`rounded-lg border p-3 transition-all ${feeLevel === 'medium'
               ? 'border-blue-500 bg-blue-500/10'
-              : 'border-gray-300 bg-gray-50 hover:border-gray-400'
+              : 'border-gray-300 dark:border-border bg-gray-50 dark:bg-muted/40 hover:border-gray-400 dark:hover:border-muted-foreground/60'
               }`}
           >
             <div className="flex flex-col items-center gap-1">
@@ -66,7 +66,7 @@ export default function FeeSelector({
             onClick={() => onSelect('slow')}
             className={`rounded-lg border p-3 transition-all ${feeLevel === 'slow'
               ? 'border-orange-500 bg-orange-500/10'
-              : 'border-gray-300 bg-gray-50 hover:border-gray-400'
+              : 'border-gray-300 dark:border-border bg-gray-50 dark:bg-muted/40 hover:border-gray-400 dark:hover:border-muted-foreground/60'
               }`}
           >
             <div className="flex flex-col items-center gap-1">
@@ -84,10 +84,10 @@ export default function FeeSelector({
         </div>
 
         <div className="flex items-center justify-between text-sm">
-          <span className="text-gray-600">Transaction Fee / kb:</span>
-          <span className="font-medium text-gray-900">
+          <span className="text-gray-600 dark:text-muted-foreground">Transaction Fee / kb:</span>
+          <span className="font-medium text-gray-900 dark:text-foreground">
             {isLoadingFees ? (
-              <div className="border-t-brand-green h-4 w-4 animate-spin rounded-full border-2 border-gray-300" />
+              <div className="border-t-brand-green h-4 w-4 animate-spin rounded-full border-2 border-gray-300 dark:border-border" />
             ) : (
               `${formatPearlAmount(currentFee)} PRL`
             )}
