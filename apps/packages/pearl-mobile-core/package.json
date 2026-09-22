@@ -1,0 +1,27 @@
+{
+  "name": "@pearl/pearl-mobile-core",
+  "version": "0.1.0",
+  "description": "Pearl 链移动钱包核心密码学库：BIP39/32/86、Taproot 签名、交易构建",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.8.0",
+    "@noble/hashes": "^1.7.1",
+    "@scure/base": "^1.2.4",
+    "@scure/bip32": "^1.6.2",
+    "@scure/bip39": "^1.5.4"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
