@@ -23,7 +23,6 @@ export interface StoredAddress {
 export interface PersistedState {
   network: NetworkName;
   addresses: StoredAddress[];
-  nextIndex: number;
 }
 
 export async function loadNetwork(): Promise<NetworkName | null> {

@@ -8,19 +8,18 @@ import {
   Utxo,
   ApiTxItem,
   deriveTaprootKey,
-  encodeAddress,
   addressToScriptPubKey,
   isValidAddress,
   selectCoins,
   buildAndSign,
   discoverAddresses,
+  discoverRotatedAddresses,
   changeEntry,
   entryFor,
   mergeHistories,
   hexToBytes,
   grainsToPrl,
   prlToGrains,
-  GRAINS_PER_PRL,
   FALLBACK_FEE_RATE,
 } from '@pearl/pearl-mobile-core';
 import type {ApiClient} from './api';
@@ -36,6 +35,8 @@ export interface WalletSnapshot {
   addresses: StoredAddress[];
   /** 当前对外展示的收款地址（最新未使用） */
   receiveAddress: string;
+  /** 已使用的最大收款 index（无已用地址时为 -1），供收款页轮换 */
+  usedMaxIndex: number;
   /** 找零地址 */
   changeAddress: StoredAddress;
   /** 链高度 */
@@ -60,40 +61,46 @@ export async function discoverWalletAddresses(
   network: NetworkName,
   api: ApiClient,
   onProgress?: (index: number) => void
-): Promise<{addresses: StoredAddress[]; nextIndex: number}> {
+): Promise<StoredAddress[]> {
   const result = await discoverAddresses(mnemonic, network, api, {onProgress});
-  const addresses: StoredAddress[] = result.entries.map(e => ({
+  return result.entries.map(e => ({
     index: e.index,
     chain: e.chain,
     address: e.address,
     scriptHex: e.scriptHex,
     used: e.used,
   }));
-  return {addresses, nextIndex: result.nextIndex};
 }
 
-/** 拉取当前快照：各地址余额 + UTXO 聚合 + 链状态 + 费率 */
+/** 拉取当前快照：各地址余额聚合 + 链状态 + 费率（轮换持久化地址发现） */
 export async function refreshSnapshot(
   mnemonic: string,
   network: NetworkName,
   api: ApiClient,
-  addresses: StoredAddress[],
-  nextIndex: number
+  addresses: StoredAddress[]
 ): Promise<WalletSnapshot> {
-  // 收款展示地址：与导入流程（gap-limit 扫描结果）一致，至少从 index 1 起，
-  // 避免与旋转地址的递增规则冲突
-  const receiveIndex = Math.max(1, nextIndex);
-  const receiveEntry = entryFor(mnemonic, network, receiveIndex, 0, false);
-  const all = [...addresses];
-  if (!all.some(a => a.address === receiveEntry.address)) {
-    all.push({...receiveEntry});
-  }
   const change = changeEntry(mnemonic, network);
 
-  const [status, fee, perAddressUtxos, perAddressBalance] = await Promise.all([
+  // 已用最大 index 之外，再保证额外 3 个未使用地址被监视，
+  // 与收款页轮换规则一致，恢复/日常刷新都不会漏掉曾展示的地址
+  const usedMax = addresses.filter(a => a.used).reduce((m, a) => Math.max(m, a.index), -1);
+  const rotated = await discoverRotatedAddresses(mnemonic, network, api, usedMax);
+
+  const all = [...addresses];
+  for (const r of rotated) {
+    if (!all.some(a => a.address === r.address)) all.push(r);
+  }
+
+  // 收款展示地址：最大已使用 index + 1；新钱包（无已用地址）用 index 0
+  const receiveIndex = usedMax >= 0 ? usedMax + 1 : 0;
+  const receiveEntry =
+    all.find(a => a.index === receiveIndex && a.chain === 0) ??
+    entryFor(mnemonic, network, receiveIndex, 0, false);
+
+  // 余额聚合（找零地址一并计入）
+  const [status, fee, perAddressBalance] = await Promise.all([
     api.status().catch(() => ({blockHeight: 0, network, serverTime: 0})),
     api.feeEstimate().catch(() => ({feeRate: FALLBACK_FEE_RATE})),
-    Promise.all(all.map(a => api.utxos(a.address).catch(() => ({utxos: []})))),
     Promise.all(
       [...all, change].map(a =>
         api.balance(a.address).catch(() => ({confirmed: '0', unconfirmed: '0'}))
@@ -114,6 +121,7 @@ export async function refreshSnapshot(
     unconfirmed,
     addresses: all,
     receiveAddress: receiveEntry.address,
+    usedMaxIndex: usedMax,
     changeAddress: {
       index: change.index,
       chain: change.chain,

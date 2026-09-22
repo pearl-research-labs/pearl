@@ -110,6 +110,37 @@ export async function discoverAddresses(
   return {entries, nextIndex: Math.max(nextIndex, entries.length > 0 ? nextIndex : 1)};
 }
 
+/**
+ * 轮换持久化探测（恢复语义 B 的增量补充）。
+ *
+ * 收款页规则：每次「换新地址」都把新地址持久化，因此恢复端只需
+ * 从最大已使用 index 之后继续探测，直到出现 additionalRotation 个
+ * 连续未使用地址，就能恰好找回用户曾经展示过的全部地址——
+ * 与浏览器的 gap-limit 无关，不会漏掉轮换出去的资金。
+ */
+export async function discoverRotatedAddresses(
+  mnemonic: string,
+  network: NetworkName,
+  querier: Querier,
+  usedMax: number,
+  additionalRotation = 3,
+  maxIndex = 200,
+  onProgress?: (index: number) => void,
+): Promise<AddressEntry[]> {
+  const entries: AddressEntry[] = [];
+  let unusedStreak = 0;
+  let i = usedMax + 1;
+  while (unusedStreak < additionalRotation && i < maxIndex) {
+    onProgress?.(i);
+    const probe = entryFor(mnemonic, network, i, 0, false);
+    const count = await querier.historyCount(probe.address);
+    entries.push({...probe, used: count > 0});
+    unusedStreak = count > 0 ? 0 : unusedStreak + 1;
+    i++;
+  }
+  return entries;
+}
+
 /** 合并多个地址的历史：按 txid 去重（净流入求和）、时间倒序 */
 export function mergeHistories(perAddress: ApiTxItem[][]): ApiTxItem[] {
   const byTxid = new Map<string, ApiTxItem>();

@@ -75,7 +75,8 @@ func parseFlags() *config {
 func (c *config) params() *chaincfg.Params {
 	switch c.network {
 	case "testnet2", "testnet":
-		return &chaincfg.TestNetParams
+		// Pearl 当前活跃测试链为 testnet2（TestNetParams 为早期版本）
+		return &chaincfg.TestNet2Params
 	case "regtest", "regnet":
 		return &chaincfg.RegressionNetParams
 	default:
@@ -506,8 +507,9 @@ func (s *server) handleFeeEstimate(w http.ResponseWriter, r *http.Request) {
 	result, err := s.client.EstimateSmartFee(6, &estimateModeConservative)
 	feeRate := 2.0 // 兜底：2 Grain/vbyte
 	if err == nil && result != nil && result.FeeRate != nil && *result.FeeRate > 0 {
-		// PRL/kB → Grain/vbyte：/1e5
-		feeRate = *result.FeeRate / 100_000
+		// estimatesmartfee 返回 PRL/kB；换算 Grain/vbyte：
+		// PRL/kB × 1e8 (Grain/PRL) ÷ 1000 (vbyte/kB) = ×1e5
+		feeRate = *result.FeeRate * 100_000
 		if feeRate < 1 {
 			feeRate = 1
 		}

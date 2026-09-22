@@ -19,6 +19,7 @@ type Props = NativeStackScreenProps<RootStackParamList, 'Receive'>;
 export default function ReceiveScreen({route}: Props) {
   const [address, setAddress] = useState(route.params.address);
   const [rotating, setRotating] = useState(false);
+  const [rotateCount, setRotateCount] = useState(0);
 
   const copy = async () => {
     await Clipboard.setStringAsync(address);
@@ -27,34 +28,32 @@ export default function ReceiveScreen({route}: Props) {
 
   const share = () => Share.share({message: address}).catch(() => {});
 
-  /** 轮换一个新收款地址（旧地址依然有效） */
+  /** 轮换一个新收款地址（旧地址依然有效；每次轮换都持久化，恢复时可找回） */
   const rotate = async () => {
     setRotating(true);
     try {
       const mnemonic = await requireMnemonic();
       const network = (await loadNetwork()) ?? 'mainnet';
       const persisted = await loadAddresses(network);
-      // 已展示地址的 index 也可能超过 nextIndex（新钱包展示地址 1）
-      const shownIndex = persisted?.addresses.find(a => a.address === address)?.index;
-      // 新钱包展示地址 1 可能尚未持久化（shownIndex 为 undefined），保底按 1 算
-      const base = Math.max(persisted?.nextIndex ?? 0, shownIndex ?? 1);
-      const freshIndex = base + 1;
+      // 展示地址 = usedMax + 1 + 已轮换次数；下一个 = 再 +1
+      const freshIndex = route.params.usedMaxIndex + rotateCount + 2;
       const fresh = entryFor(mnemonic, network, freshIndex, 0, false);
+      const stored = {
+        index: fresh.index,
+        chain: fresh.chain as 0 | 1,
+        address: fresh.address,
+        scriptHex: fresh.scriptHex,
+        used: false,
+      };
+      const existing = persisted?.addresses ?? [];
       await saveAddresses({
         network,
-        addresses: [
-          ...(persisted?.addresses ?? []),
-          {
-            index: fresh.index,
-            chain: fresh.chain,
-            address: fresh.address,
-            scriptHex: fresh.scriptHex,
-            used: false,
-          },
-        ],
-        nextIndex: freshIndex,
+        addresses: existing.some(a => a.address === fresh.address)
+          ? existing
+          : [...existing, stored],
       });
       setAddress(fresh.address);
+      setRotateCount(c => c + 1);
     } catch (e) {
       Alert.alert('操作失败', e instanceof Error ? e.message : '未知错误');
     } finally {

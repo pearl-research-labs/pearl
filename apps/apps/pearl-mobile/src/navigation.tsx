@@ -20,7 +20,7 @@ export type RootStackParamList = {
   CreateWallet: undefined;
   ImportWallet: undefined;
   Main: undefined;
-  Receive: {address: string};
+  Receive: {address: string; usedMaxIndex: number};
   Send: {feeRate: number; balanceGrains: string; toAddress?: string};
   Scan: {returnFeeRate: number; returnBalanceGrains: string};
   TxDetail: {txJson: string};

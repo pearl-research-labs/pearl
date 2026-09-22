@@ -36,24 +36,12 @@ export default function HomeScreen({navigation}: Props) {
       const network = (await loadNetwork()) ?? 'mainnet';
       const api = await getApiClient(network);
 
-      let persisted = await loadAddresses(network);
-      if (!persisted) {
-        // 新建钱包：尚无地址记录，直接以 index 0 起步
-        persisted = {network, addresses: [], nextIndex: 0};
-      }
-      const snap = await refreshSnapshot(
-        mnemonic,
-        network,
-        api,
-        persisted.addresses,
-        persisted.nextIndex
-      );
+      const persisted = await loadAddresses(network);
+      // 轮换持久化地址发现：从最大已用 index 之后继续探测，
+      // 兼顾日常刷新与恢复导入（发现到的地址会持久化）
+      const snap = await refreshSnapshot(mnemonic, network, api, persisted?.addresses ?? []);
       setSnapshot(snap);
-      await saveAddresses({
-        network,
-        addresses: snap.addresses,
-        nextIndex: persisted.nextIndex,
-      });
+      await saveAddresses({network, addresses: snap.addresses});
 
       const txs = await loadHistory(api, snap.addresses, snap.changeAddress);
       setHistory(txs);
@@ -109,7 +97,11 @@ export default function HomeScreen({navigation}: Props) {
                 <TouchableOpacity
                   style={styles.actionButton}
                   onPress={() =>
-                    snapshot && navigation.navigate('Receive', {address: snapshot.receiveAddress})
+                    snapshot &&
+                    navigation.navigate('Receive', {
+                      address: snapshot.receiveAddress,
+                      usedMaxIndex: snapshot.usedMaxIndex,
+                    })
                   }
                 >
                   <Text style={styles.actionText}>收款</Text>

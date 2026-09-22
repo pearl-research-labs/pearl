@@ -8,7 +8,7 @@ import type {NativeStackScreenProps} from '@react-navigation/native-stack';
 import {isValidMnemonic} from '@pearl/pearl-mobile-core';
 import {Button, Card, Field} from '../components/common';
 import {colors} from '../theme';
-import {saveMnemonic, setSessionMnemonic} from '../wallet/secure';
+import {saveMnemonic, deleteMnemonic, setSessionMnemonic} from '../wallet/secure';
 import {getApiClient} from '../wallet/api';
 import {discoverWalletAddresses} from '../wallet/engine';
 import {loadNetwork, saveAddresses, saveNetwork} from '../wallet/storage';
@@ -38,15 +38,22 @@ export default function ImportWalletScreen({navigation}: Props) {
       await saveNetwork(network);
       const api = await getApiClient(network);
 
-      // gap-limit 扫描，恢复历史地址
-      const {addresses, nextIndex} = await discoverWalletAddresses(mnemonic, network, api, i =>
+      // gap-limit 扫描，恢复历史地址（轮换未使用地址由首页快照按需补齐）
+      const addresses = await discoverWalletAddresses(mnemonic, network, api, i =>
         setProgress(`正在扫描地址 #${i + 1}…`)
       );
-      await saveAddresses({network, addresses, nextIndex});
+      await saveAddresses({network, addresses});
 
       navigation.reset({index: 0, routes: [{name: 'Main'}]});
     } catch (e) {
-      Alert.alert('导入失败', e instanceof Error ? e.message : '未知错误');
+      // 导入中途失败（如网络错误导致扫描中断）时回滚：
+      // 删除已写入的助记词，避免留下「有钱包、无地址簿」的残缺状态
+      await deleteMnemonic().catch(() => {});
+      setSessionMnemonic(null);
+      Alert.alert(
+        '导入失败',
+        (e instanceof Error ? e.message : '未知错误') + '\n\n已回滚，可重试导入。'
+      );
     } finally {
       setScanning(false);
       setProgress('');

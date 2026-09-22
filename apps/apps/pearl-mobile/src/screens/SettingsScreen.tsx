@@ -52,13 +52,13 @@ export default function SettingsScreen({navigation}: Props) {
               await saveNetwork(target);
               setNetwork(target);
               const api = await getApiClient(target);
-              const {addresses, nextIndex} = await discoverWalletAddresses(
+              const addresses = await discoverWalletAddresses(
                 mnemonic,
                 target,
                 api,
                 i => setProgress(`扫描地址 #${i + 1}…`)
               );
-              await saveAddresses({network: target, addresses, nextIndex});
+              await saveAddresses({network: target, addresses});
               setProgress('完成，回首页下拉刷新即可');
             } catch (e) {
               Alert.alert('切换失败', e instanceof Error ? e.message : '未知错误');

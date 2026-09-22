@@ -51,7 +51,13 @@ export default function SendScreen({navigation, route}: Props) {
     if (text) setAddress(text.trim());
   };
 
-  const setMax = () => setAmount(grainsToPrl(BigInt(balanceGrains)));
+  const setMax = () => {
+    // 全部转出：预留费率兜底（Grain），若不足 1 Grain 则提示无法转出
+    const balance = BigInt(balanceGrains);
+    const reserve = BigInt(Math.max(1, feeRate)) * 1000n;
+    const maxSendable = balance - reserve;
+    setAmount(maxSendable > 0n ? grainsToPrl(maxSendable) : '0');
+  };
 
   const review = async () => {
     if (!address || addressError || !amount || amountError) return;
