@@ -45,3 +45,14 @@ This repository uses a 3-tier CI system to safely support open-source contributi
   `:vX.Y.Z` + `:latest`, and renaming the tested binaries to their version names
   for the GitHub Release.
 - **`pearl-desktop-wallet.yml`** release job — Wallet release (protected by `release` environment)
+
+## Mobile Wallet Builds
+
+- **`pearl-mobile.yml`** — iOS wallet builds via **EAS Build** (signing hosted by
+  Expo; requires `EXPO_TOKEN` secret). Runs the shared-core golden-vector tests
+  first, then triggers an EAS build. Gated to the official repo
+  (`github.repository == 'pearl-research-labs/pearl'`) so forks cannot consume
+  EAS quota or access the token. Triggers: `workflow_dispatch` (choose
+  `preview`/`production` IPA or `development` simulator; `submit=true` also
+  uploads production builds to TestFlight) and `push` to `master` on mobile
+  wallet paths (builds the `preview` internal-distribution profile).

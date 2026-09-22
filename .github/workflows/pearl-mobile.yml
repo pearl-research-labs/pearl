@@ -1,0 +1,153 @@
+name: Pearl Mobile Wallet (iOS)
+
+# 自签名 IPA 构建（不使用 EAS 托管签名）：
+#   - 在 macOS runner 上用 expo prebuild 生成原生工程，xcodebuild 产出
+#     **未签名** IPA（Payload/*.app 打包），作为 artifact 上传
+#   - 下载后用 Sideloadly / AltStore / 爱思助手 等工具，用自己的 Apple ID
+#     （含免费账号）重签名安装到真机
+#   - 无需 Expo/EAS 账号、无需 Apple 付费开发者账号、仓库不落任何证书
+#
+# 触发：
+#   - workflow_dispatch：手动构建 IPA（自签/分发）
+#   - push 到 master 的移动端路径：自动构建（可随时改为仅手动）
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'apps/apps/pearl-mobile/**'
+      - 'apps/packages/pearl-mobile-core/**'
+      - 'apps/package.json'
+      - 'apps/pnpm-lock.yaml'
+      - '.github/workflows/pearl-mobile.yml'
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  PNPM_VERSION: '8.15.6'
+  APP_DIR: 'apps/apps/pearl-mobile'
+  CORE_DIR: 'apps/packages/pearl-mobile-core'
+
+jobs:
+  # 核心密码学库黄金向量测试（对照 node 权威实现），失败则不构建
+  core-test:
+    name: Core crypto tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0 # v6.0.7
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install workspace dependencies
+        working-directory: apps
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck core
+        working-directory: ${{ env.CORE_DIR }}
+        run: pnpm typecheck
+
+      - name: Run golden-vector tests
+        working-directory: ${{ env.CORE_DIR }}
+        run: pnpm test
+
+  build-ipa:
+    name: Build unsigned IPA
+    needs: core-test
+    runs-on: macos-15
+    # 仅官方仓库可构建（防止 fork 触发付费/耗时的 macOS 构建）
+    if: github.repository == 'pearl-research-labs/pearl' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@739bfe42ca9233c5e6aca07c1a25a9d34aca49b0 # v6.0.7
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install workspace dependencies
+        working-directory: apps
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # JS 打包冒烟验证（纯 Metro，不依赖 Xcode）
+      - name: Bundle check (iOS JS bundle)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          npx expo export --platform ios --output-dir /tmp/pearl-export-check
+          rm -rf /tmp/pearl-export-check
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer || true
+          xcodebuild -version
+
+      - name: Generate native iOS project
+        working-directory: ${{ env.APP_DIR }}
+        run: npx expo prebuild --platform ios --clean --non-interactive
+
+      - name: Install CocoaPods
+        working-directory: ${{ env.APP_DIR }}/ios
+        run: pod install --repo-update
+
+      - name: Resolve scheme
+        id: scheme
+        working-directory: ${{ env.APP_DIR }}/ios
+        run: |
+          SCHEME=$(xcodebuild -list -workspace *.xcworkspace -json \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['workspace']['schemes'][0])")
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Using scheme: $SCHEME"
+
+      - name: Archive (unsigned)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          xcodebuild \
+            -workspace ios/*.xcworkspace \
+            -scheme "${{ steps.scheme.outputs.scheme }}" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Pearl.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: Package unsigned IPA
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          APP_PATH=$(ls -d build/Pearl.xcarchive/Products/Applications/*.app)
+          echo "App bundle: $APP_PATH"
+          mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/
+          (cd build/ipa && zip -qr "../Pearl-Mobile-unsigned.ipa" Payload)
+          ls -lh build/Pearl-Mobile-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pearl-mobile-ios-unsigned
+          path: ${{ env.APP_DIR }}/build/Pearl-Mobile-unsigned.ipa
+          retention-days: 30
