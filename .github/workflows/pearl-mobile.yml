@@ -141,7 +141,12 @@ jobs:
       - name: Package unsigned IPA
         working-directory: ${{ env.APP_DIR }}
         run: |
-          APP_PATH=$(ls -d build/Pearl.xcarchive/Products/Applications/*.app)
+          APP_PATH=$(find build/Pearl.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::archive 中未找到 .app，xcarchive 内容："
+            find build/Pearl.xcarchive -maxdepth 3 | head -50
+            exit 1
+          fi
           echo "App bundle: $APP_PATH"
           mkdir -p build/ipa/Payload
           cp -R "$APP_PATH" build/ipa/Payload/
