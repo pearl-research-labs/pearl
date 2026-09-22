@@ -110,7 +110,7 @@ jobs:
 
       - name: Install CocoaPods
         working-directory: ${{ env.APP_DIR }}/ios
-        run: pod install --repo-update
+        run: pod install # 使用 CDN 源（runner 无本地 spec 仓库，--repo-update 会全量拉取 specs 非常慢）
 
       - name: Resolve scheme
         id: scheme
