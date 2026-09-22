@@ -69,8 +69,8 @@ jobs:
     name: Build unsigned IPA
     needs: core-test
     runs-on: macos-15
-    # 仅官方仓库可构建（防止 fork 触发付费/耗时的 macOS 构建）
-    if: github.repository == 'pearl-research-labs/pearl' || github.event_name == 'workflow_dispatch'
+    # 本工作流不使用任何 secrets（自签名方案），任意仓库的 push/手动触发
+    # 都只会消耗该仓库自己的 runner 额度，因此无需仓库名门槛
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
