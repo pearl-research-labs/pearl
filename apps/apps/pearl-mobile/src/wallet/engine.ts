@@ -83,15 +83,26 @@ export async function refreshSnapshot(
 
   // 已用最大 index 之外，再保证额外 3 个未使用地址被监视，
   // 与收款页轮换规则一致，恢复/日常刷新都不会漏掉曾展示的地址
-  const usedMax = addresses.filter(a => a.used).reduce((m, a) => Math.max(m, a.index), -1);
-  const rotated = await discoverRotatedAddresses(mnemonic, network, api, usedMax);
+  const persistedMax = addresses.filter(a => a.used).reduce((m, a) => Math.max(m, a.index), -1);
+  const rotated = await discoverRotatedAddresses(mnemonic, network, api, persistedMax);
 
   const all = [...addresses];
   for (const r of rotated) {
-    if (!all.some(a => a.address === r.address)) all.push(r);
+    const existing = all.findIndex(a => a.address === r.address);
+    if (existing >= 0) {
+      // 探测到链上历史必须回写 used 标志，
+      // 否则 usedMax 永不前进、收款地址永远停在同一 index
+      if (r.used && !all[existing].used) {
+        all[existing] = {...all[existing], used: true};
+      }
+    } else {
+      all.push(r);
+    }
   }
 
   // 收款展示地址：最大已使用 index + 1；新钱包（无已用地址）用 index 0
+  // （在回写之后重新计算，才能反映本次探测结果）
+  const usedMax = all.filter(a => a.used).reduce((m, a) => Math.max(m, a.index), -1);
   const receiveIndex = usedMax >= 0 ? usedMax + 1 : 0;
   const receiveEntry =
     all.find(a => a.index === receiveIndex && a.chain === 0) ??
