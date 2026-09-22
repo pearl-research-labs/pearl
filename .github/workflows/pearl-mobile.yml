@@ -119,8 +119,20 @@ jobs:
         id: scheme
         working-directory: ${{ env.APP_DIR }}/ios
         run: |
-          SCHEME=$(xcodebuild -list -workspace *.xcworkspace -json \
-            | python3 -c "import json,sys; print(json.load(sys.stdin)['workspace']['schemes'][0])")
+          # 工作区 scheme 列表里混有 Pods 的 scheme（如 EXConstants），
+          # 必须选与 .xcworkspace 同名的 App scheme
+          WS=$(basename "$(ls -d *.xcworkspace | head -1)" .xcworkspace)
+          SCHEMES=$(xcodebuild -list -workspace "${WS}.xcworkspace" -json \
+            | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin)['workspace']['schemes']))")
+          echo "Available schemes:"; echo "$SCHEMES"
+          SCHEME=""
+          while IFS= read -r s; do
+            if [ "$s" = "$WS" ]; then SCHEME="$s"; break; fi
+          done <<< "$SCHEMES"
+          if [ -z "$SCHEME" ]; then
+            SCHEME=$(echo "$SCHEMES" | grep -viE 'pods|EX' | head -1)
+          fi
+          if [ -z "$SCHEME" ]; then echo "::error::未找到 App scheme"; exit 1; fi
           echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
           echo "Using scheme: $SCHEME"
 
