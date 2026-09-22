@@ -18,6 +18,16 @@ Electron, React, and TypeScript.
 
 **Location:** [apps/pearl-desktop-wallet](./apps/pearl-desktop-wallet)
 
+### 📱 Pearl Mobile Wallet (`@pearl/pearl-mobile`)
+
+A self-custody iOS/Android wallet built with React Native (Expo). Keys are derived and
+transactions are signed on-device (BIP39/32/86 + Taproot); chain data comes from the
+`pearl-api` service (`node/cmd/pearl-api`). Cryptography lives in the shared package
+[`@pearl/pearl-mobile-core`](./packages/pearl-mobile-core) with golden vectors generated
+from the node implementation.
+
+**Location:** [apps/pearl-mobile](./apps/pearl-mobile)
+
 ## 🚀 Prerequisites
 
 Before getting started, ensure you have the following installed:

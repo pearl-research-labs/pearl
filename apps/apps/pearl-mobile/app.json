@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "Pearl 钱包",
+    "slug": "pearl-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "pearlmobile",
+    "userInterfaceStyle": "automatic",
+    "backgroundColor": "#0B1020",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B1020"
+    },
+    "ios": {
+      "bundleIdentifier": "ai.pearlresearch.pearlmobile",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "扫描二维码以读取收款地址",
+        "NSFaceIDUsageDescription": "使用面容 ID 解锁钱包与确认转账"
+      }
+    },
+    "android": {
+      "package": "ai.pearlresearch.pearlmobile",
+      "edgeToEdgeEnabled": true,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B1020"
+      },
+      "permissions": ["CAMERA"]
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "扫描二维码以读取收款地址"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
