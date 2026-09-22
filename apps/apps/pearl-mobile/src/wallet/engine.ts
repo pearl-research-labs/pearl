@@ -252,4 +252,4 @@ export function formatGrains(grains: bigint): string {
   return `${grainsToPrl(grains)} PRL`;
 }
 
-export {GRAINS_PER_PRL, grainsToPrl, prlToGrains};
+export {grainsToPrl, prlToGrains};
