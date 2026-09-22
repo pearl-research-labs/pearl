@@ -40,36 +40,39 @@ pnpm android                        # 本机编译 Android
 
 首次使用前生成图标：`pnpm assets`（需 Python + Pillow）。
 
-## 构建与发布（EAS）
+## 构建与发布
+
+### GitHub Actions 自签名 IPA（默认，推荐）
+
+工作流 `.github/workflows/pearl-mobile.yml`：macOS runner 上执行
+`expo prebuild → pod install → xcodebuild archive`（关闭签名），
+把 `Payload/*.app` 打成**未签名 IPA** 并作为 artifact 上传（保留 30 天）。
+
+- 手动触发：Actions → "Pearl Mobile Wallet (iOS)" → Run workflow；
+- 自动触发：push 到 `master` 且涉及移动端路径；
+- 每次构建前先跑 `@pearl/pearl-mobile-core` 黄金向量测试与 iOS bundle 冒烟验证。
+
+下载 IPA 后自行重签名安装到真机（任选其一）：
+
+| 工具 | 说明 |
+| --- | --- |
+| Sideloadly | Windows/macOS，免费 Apple ID 即可签名（7 天有效期需续签） |
+| AltStore / SideStore | 通过电脑端服务器为手机侧载应用 |
+| 爱思助手 | Windows，一键 IPA 签名安装 |
+
+免费 Apple ID 签名的应用 7 天后过期（数据保留，重新签名安装即可）；
+付费开发者账号签名则一年有效。此方式**不需要** Expo/EAS 账号与仓库 secrets。
+
+### EAS Build（可选）
+
+如需 TestFlight/商店分发，可改用 EAS 托管构建：
 
 ```bash
 npm i -g eas-cli
-eas login
-eas build --platform ios --profile production     # TestFlight/App Store
-eas build --platform android --profile production
+eas login && eas init          # 链接项目（写入 eas.json 的 projectId）
+eas build --platform ios --profile production
+eas submit --platform ios      # 上传 TestFlight（需 Apple 付费账号）
 ```
-
-iOS 发布需要 Apple Developer 账号；`app.json` 中的 `bundleIdentifier`、
-相机/FaceID 权限说明均已配置。
-
-### GitHub Actions（推荐）
-
-仓库内置工作流 `.github/workflows/pearl-mobile.yml`：
-
-- **手动触发**：Actions → "Pearl Mobile Wallet (iOS)" → Run workflow，
-  可选 `preview`（内测 IPA）/ `production`（正式 IPA）/ `development`（模拟器包），
-  `submit=true` 时 production 构建完成后自动上传 TestFlight；
-- **自动触发**：push 到 `master` 且涉及移动端路径时，自动构建 `preview` 内测包；
-- 每次构建前先跑 `@pearl/pearl-mobile-core` 黄金向量测试与 iOS JS bundle 冒烟验证，
-  失败即终止，不会产出包。
-
-需要在仓库 Settings → Secrets and variables → Actions 配置：
-
-| Secret | 用途 |
-| --- | --- |
-| `EXPO_TOKEN` | Expo 账户 token（`npx expo login` 后在 https://expo.dev/settings/access-tokens 创建），EAS 构建与签名托管 |
-
-签名证书由 EAS 托管（首次 `eas build` 按提示创建），仓库内不落任何证书私钥。
 
 ## 数据服务部署
 

@@ -48,11 +48,11 @@ This repository uses a 3-tier CI system to safely support open-source contributi
 
 ## Mobile Wallet Builds
 
-- **`pearl-mobile.yml`** — iOS wallet builds via **EAS Build** (signing hosted by
-  Expo; requires `EXPO_TOKEN` secret). Runs the shared-core golden-vector tests
-  first, then triggers an EAS build. Gated to the official repo
-  (`github.repository == 'pearl-research-labs/pearl'`) so forks cannot consume
-  EAS quota or access the token. Triggers: `workflow_dispatch` (choose
-  `preview`/`production` IPA or `development` simulator; `submit=true` also
-  uploads production builds to TestFlight) and `push` to `master` on mobile
-  wallet paths (builds the `preview` internal-distribution profile).
+- **`pearl-mobile.yml`** — iOS wallet builds producing an **unsigned IPA**
+  for self-signing (Sideloadly / AltStore / iTools). Runs the shared-core
+  golden-vector tests first, then on `macos-15` does `expo prebuild` +
+  `pod install` + `xcodebuild archive` with signing disabled and packages
+  `Payload/*.app` as an IPA artifact. No signing assets are stored in the
+  repo and no EAS/Expo token is required. Triggers: `workflow_dispatch`
+  and `push` to `master` on mobile wallet paths (the `push` trigger is
+  gated to the official repo so forks cannot burn paid macOS minutes).
