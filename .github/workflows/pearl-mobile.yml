@@ -101,7 +101,10 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer || true
+          # RN 0.81 要求 Xcode >= 16.1；自动选择镜像中最新版本（兼容后续镜像更新）
+          XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version
 
       - name: Generate native iOS project
