@@ -28,7 +28,7 @@ const MaxMessagePayload = (1024 * 1024 * 32) // 32MiB
 
 // MaxProtocolMessageLength is the maximum length of an incoming/outgoing p2p protocol message. This is separate
 // from MaxMessagePayload which is used as a general serialization bound. Pearl headers messages carry
-// certificates, so this must be at least MsgHeaders.MaxPayloadLength (about 6.5 MiB). Bitcoin Core's equivalent
+// certificates, so this must be at least MsgHeaders.MaxPayloadLength (about 7.9 MB). Bitcoin Core's equivalent
 // is ~4MB.
 const MaxProtocolMessageLength = 8_000_000
 
