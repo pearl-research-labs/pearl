@@ -12,13 +12,13 @@ from miner_base.block_submission import commit_planes_for_leaf
 from miner_base.commitment import BlockHeader
 from miner_base.commitment_hash import noise_seed_b
 from miner_base.hardware import hardware_for
-from miner_base.noise import OperandNoiser, Side
+from miner_base.noise import Noiser
 from miner_base.prequant import PrequantMatrix
 from miner_base.quantization import Fp8QuantScheme
 from miner_base.scheme import PearlScheme
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
-from pearl_gemm import b_peel_for_a
+from pearl_gemm import pack_noise_factor
 from vllm_miner import settings as settings_module
 from vllm_miner.job_prep import prepare_layer
 from vllm_miner.mining_config import (
@@ -216,35 +216,26 @@ def test_prepare_layer_matches_reference_commitment_chain(layer_state):
     assert bytes(buffers.seed_b_dev.cpu().numpy()) == expected_seed_b
     assert bytes(buffers.threshold_dev.cpu().numpy()) == threshold_bytes_for(job, k, n)
 
-    # Uploaded operands equal the canonical CPU reference build. F_A is keyed
-    # by seedB (Side.A addresses), so the B-side check uses that basis: the
-    # job-invariant parts from the buffers, the mid half of the peel through
-    # the same ``b_peel_for_a`` the pipeline runs.
+    # Uploaded operands equal the canonical CPU reference build. Both F bases
+    # are keyed by seedB, so the whole B side -- the complete peel included --
+    # is a job constant the reference draws from seedB alone.
     hardware = hardware_for(config.device)
     scheme = PearlScheme(hardware, Fp8QuantScheme(), k, RANK)
-    seed_a_probe = b"\x00" * 32
-    noise_a = OperandNoiser(seed_a_probe, Side.A, RANK, k, hardware.compute, f_seed=expected_seed_b)
-    noise_b = OperandNoiser(expected_seed_b, Side.B, RANK, k, hardware.compute)
-    stacked = scheme.build_b_rows(
-        weight_pq.open(), noise_a, noise_b, list(range(n)), weight_pq.exact_norms()
-    )
+    noise = Noiser(expected_seed_b, RANK, k, hardware.compute)
+    stacked = scheme.build_b_rows(weight_pq.open(), noise, list(range(n)), weight_pq.exact_norms())
     assert torch.equal(buffers.b_prime.cpu(), stacked.quant_part)
-    assert torch.equal(buffers.f2.cpu(), noise_b.F())
+    assert torch.equal(buffers.f1.cpu(), noise.F_A())
+    assert torch.equal(buffers.f2.cpu(), noise.F_B())
+    assert torch.equal(buffers.f1_hl.cpu(), pack_noise_factor(noise.F_A()))
+    assert torch.equal(ctx.f1_hl, buffers.f1_hl)
     b_peel = buffers.b_peel.cpu()
-    # The element-wise second half (the job-invariant -(beta_b (.) E_B)) is
-    # bit-exact; the first half is the per-launch reference-only peel matmul,
-    # which the buffers leave zero (noisy_quant_b runs against F_A = 0).
+    # The element-wise second half (-(beta_b (.) E_B)) is bit-exact; the mid
+    # half is the reference-only peel matmul, which the fused kernel's
+    # epilogue reassociates, so it is held to tolerance.
     assert torch.equal(b_peel[:, RANK:], stacked.peel_part[:, RANK:])
-    assert not b_peel[:, :RANK].any()
-    f1_lines = noise_a.F().t().contiguous().cuda()  # (k, R) noise_lines layout
-    full = b_peel_for_a(
-        buffers.b_prime, buffers.e2, buffers.f2, buffers.beta_b, buffers.b_peel, f1_lines
-    ).cpu()
-    assert torch.equal(full[:, RANK:], stacked.peel_part[:, RANK:])
-    # CPU and GPU reduction order may differ on the matmul half.
     mid_reference = stacked.peel_part[:, :RANK].float()
     mid_relative_error = (
-        (full[:, :RANK].float() - mid_reference).norm() / mid_reference.norm().clamp_min(1e-30)
+        (b_peel[:, :RANK].float() - mid_reference).norm() / mid_reference.norm().clamp_min(1e-30)
     ).item()
     assert mid_relative_error < 1e-2, mid_relative_error
     assert torch.equal(
@@ -287,10 +278,10 @@ def test_prepare_dispatches_gpu_b_chain_without_reference_builder(layer_state, m
     torch.cuda.synchronize()
 
     assert ctx is not None
-    # v4: F_A is per launch (drawn under each A's seedA), so B preparation
-    # draws only F_B here.
+    # Both F bases are keyed by seedB, so B preparation draws F_A and F_B.
     assert calls == [
         "tensor_hash_plus_stats_b",
+        "noise_lines",
         "noise_lines",
         "noisy_quant_b",
     ]

@@ -9,15 +9,15 @@ and runs four GPU stages, all launch-only (no D2H sync, CUDA-graph capturable):
     2. commit   -- one keyed BLAKE3 Merkle root per blob + fused per-block
                    stats partials + on-GPU finalize of A's keys (seedA,
                    noise-line key, jackpot key)
-    3. noise    -- F_A from B's noise-line key (``noise_lines``, Side.A), then
-                   combine partials -> alpha/beta, E_A in-kernel, and
+    3. noise    -- combine partials -> alpha/beta, E_A in-kernel, and
                    A' = Q(alpha (.) A + beta (.) E_A@F_A) + peel columns
     4. gemm     -- fused FP8 UMMA + in-register lottery + BF16 peel + unscale
-                   (B's peel mid half is formed from the job-constant F_A)
 
 Only stage 1 reads the BF16 activation: stages 2 and 3 both consume the two
 committed blobs, so the noise stage is protocol-canonical by construction
-rather than by assuming A is a block-scaled fixpoint.
+rather than by assuming A is a block-scaled fixpoint. Both F bases are keyed
+by seedB, so ``F_A`` is drawn once at construction (``noise_lines`` under
+B's noise-line key) and B's peel is the preprocessed job constant.
 
 The persistent hit signal and the ``C''`` buffer are owned by the pipeline.
 """
@@ -142,9 +142,11 @@ class MinerPipeline:
         self.e1 = torch.zeros(m, R, dtype=torch.float8_e4m3fn, device=device)
         self.a_prime = torch.zeros(m, ctx.k, dtype=torch.float8_e4m3fn, device=device)
         self.a_peel = torch.zeros(m, 2 * R, dtype=torch.bfloat16, device=device)
-        self.f1_lines = torch.zeros(ctx.k, R, dtype=torch.float8_e4m3fn, device=device)
         self.f2 = ctx.f2.contiguous()
-        self.b_peel = torch.zeros_like(ctx.b_peel)
+        # F_A: the job-constant Side.A draw under B's noise-line key; at
+        # R == PACKED_NOISE_K its int8 view is noisy_quant's packed operand.
+        self.f1_lines = torch.zeros(ctx.k, R, dtype=torch.float8_e4m3fn, device=device)
+        noise_lines(self.noise_key_b, LABEL_F1, self.f1_lines)
 
         self.inv_alpha_b = torch.reciprocal(ctx.alpha_b.reshape(-1).float()).contiguous()
         self.c = torch.zeros(m, ctx.n, dtype=torch.bfloat16, device=device)
@@ -197,13 +199,12 @@ class MinerPipeline:
         return self.a_keys[64:96]
 
     def stage_prepare(self) -> None:
-        noise_lines(self.noise_key_b, LABEL_F1, self.f1_lines)
         noisy_quant(
             self.codes,
             self.scales,
             self.noise_key_a,
             self.stats,
-            self.f1_lines.view(torch.int8),  # == pack_noise_factor(F_A) at R == PACKED_NOISE_K
+            self.f1_lines.view(torch.int8),
             self.f2,
             self.alpha_a,
             self.beta_a,
@@ -225,12 +226,11 @@ class MinerPipeline:
                     "(hit_signal.reset_hit()) before capturing the pipeline"
                 )
             self.hit_signal.reset_hit()
-        self.ctx.b_peel_for(self.f1_lines, out=self.b_peel)
         mixed_gemm(
             self.a_prime,
             self.ctx.b_prime,
             self.a_peel,
-            self.b_peel,
+            self.ctx.b_peel,
             self.alpha_a,
             self.inv_alpha_b,
             self.pow_key,

@@ -12,6 +12,11 @@ jackpot key, so a miner never builds the CPU Merkle tree just to learn a seed
     noise-line keyX  = Subkey("noise-line", seedX)      (the line generator's key)
     jackpot key      = Subkey("jackpot",    seedA)      (the winning test's key)
 
+Noise-line keyA draws ``E_A``; noise-line keyB draws ``E_B`` and *both* F
+bases (``F_A`` at the ``A | F`` address, ``F_B`` at ``B | F``), so every
+job-constant B-side operand -- including B's complete peel -- is fixed once
+seedB is known (``miner_base.noise``).
+
 ``HX`` is exactly ``commit_planes(planes, keyX, hash_id).digest``; the seeds
 are ``miner_base.transcript.noise_seeds``. The tensor-hash finalize
 kernel computes the A-side chain on the device from the same inputs

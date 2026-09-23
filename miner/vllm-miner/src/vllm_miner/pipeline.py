@@ -446,13 +446,12 @@ def _launch_stages(
     """Launch every stage (no D2H sync); returns ``(codes, scales, a_keys, c)``.
 
     ``a_keys`` is the finalize's 96-byte ``seedA || noise-line keyA || jackpot
-    key`` (``miner_base.commitment_hash.AKeys``).
+    key`` (``miner_base.commitment_hash.AKeys``). Every B-side operand, ``F_A``
+    and the complete B peel included, is a job constant read from ``ctx``.
     """
     from pearl_gemm import (
-        LABEL_F1,
         R,
         mixed_gemm,
-        noise_lines,
         noisy_quant,
         pre_quant,
         pre_quant_output_shapes,
@@ -498,12 +497,6 @@ def _launch_stages(
     noise_key_a = a_keys[32:64]
     pow_key = a_keys[64:96]
 
-    # F_A is keyed by seedB (Side.A addresses), so the lines are a job
-    # constant. Drawn here so noisy_quant still sees a packed (k, R) blob;
-    # at R == PACKED_NOISE_K that view-as-int8 is pack_noise_factor.
-    f1_lines = torch.empty(k, R, dtype=torch.float8_e4m3fn, device=device)
-    noise_lines(ctx.noise_key_b_dev, LABEL_F1, f1_lines)
-
     alpha_a = torch.empty(m, dtype=torch.bfloat16, device=device)
     beta_a = torch.empty_like(alpha_a)
     e1 = torch.empty(m, R, dtype=torch.float8_e4m3fn, device=device)
@@ -514,7 +507,7 @@ def _launch_stages(
         scales,
         noise_key_a,
         stats,
-        f1_lines.view(torch.int8),
+        ctx.f1_hl,
         ctx.f2,
         alpha_a,
         beta_a,
@@ -525,13 +518,11 @@ def _launch_stages(
     )
 
     c = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-    b_peel = torch.empty(n, 2 * R, dtype=torch.bfloat16, device=device)
-    _b_peel_for_launch(ctx, f1_lines, b_peel)
     mixed_gemm(
         a_prime,
         ctx.b_prime,
         a_peel,
-        b_peel,
+        ctx.b_peel,
         alpha_a,
         ctx.inv_alpha_b,
         pow_key,
@@ -546,17 +537,6 @@ def _launch_stages(
         record_hits=record_hits,
     )
     return codes, scales, a_keys, c
-
-
-def _b_peel_for_launch(ctx: BOperands, f1_lines: torch.Tensor, out: torch.Tensor) -> None:
-    """B's peel for this job's ``F_A`` (``pearl_gemm.b_peel_for_a``) into the
-    launch-owned ``out``. ``F_A`` is keyed by seedB, so the mid half is the
-    same ``(n, k) x (k, R)`` product every launch of the job. Like every
-    other per-launch buffer here, ``out`` and the helper's FP32 intermediates
-    come from the caching allocator; ``memory._launch_bytes`` budgets them."""
-    from pearl_gemm import b_peel_for_a
-
-    b_peel_for_a(ctx.b_prime, ctx.e2, ctx.f2, ctx.beta_b, ctx.b_peel, f1_lines, out=out)
 
 
 def _record_stream_event() -> torch.cuda.Event:

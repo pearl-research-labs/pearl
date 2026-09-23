@@ -21,7 +21,6 @@ from .noisy_quant import (
 )
 from .noisy_quant_b import (
     NoisyQuantBConfig,
-    b_peel_for_a,
     noisy_quant_b,
 )
 from .pow import (
@@ -63,7 +62,6 @@ __all__ = [
     "NoisyQuantConfig",
     "PreQuantConfig",
     "TensorHashConfig",
-    "b_peel_for_a",
     "get_tensor_hash_plus_stats_config",
     "mixed_gemm",
     "validate_mixed_gemm_config",

@@ -1,7 +1,7 @@
 """Deterministic low-rank noise: the v4 random-access ``SampleLine`` map.
 
 Twin of ``zk-pow/src/api/fp8/noise.rs``. All factors
-are stacks of "lines" from one keyed-BLAKE3 rule (:meth:`OperandNoiser._lines`).
+are stacks of "lines" from one keyed-BLAKE3 rule (:meth:`_OperandNoiser._lines`).
 A line is ``r`` XOF bytes -> sign x UNIFORM magnitude in ``[1, 128]`` (never
 zero, no modulo bias), L2-NORMALIZED to the constant norm
 ``c := NOISE_TARGET_NORM`` (independent of ``r``), then rounded to FP8 e4m3.
@@ -36,6 +36,9 @@ subkeyed under ``pearl/v4/FP8/noise-line``, and each line is addressed by a
 (``F_A`` uses ``Side.A`` addresses so it is a distinct draw from ``F_B``);
 ``E_B`` is keyed by ``noise seedB``. The address omits ``k`` and ``r``: the
 seed already binds them (through ``pA`` / ``pB``).
+
+:class:`Noiser` is the one public way to draw factors: it applies that seed
+rule itself, so a caller never chooses which seed keys which factor.
 """
 
 from __future__ import annotations
@@ -68,27 +71,27 @@ class _Factor(enum.IntEnum):
     F = 1
 
 
-class OperandNoiser:
-    """One side's noise factors (``E_X``, ``F_X``).
+class _OperandNoiser:
+    """One side's noise factors (``E_X``, ``F_X``), each under its own key.
 
-    ``E`` lines use ``noise_seed``. ``F`` lines use ``f_seed`` when given
-    (``F_A`` is keyed by seedB: construct the A-side noiser with
-    ``f_seed=seed_b``), otherwise the same seed as ``E``.
+    Private: :class:`Noiser` is the only constructor, and it is what binds the
+    protocol's seeds to the two keys. ``e_seed`` may be ``None`` while the
+    side's E seed is unknown (the A side before seedA exists); ``F`` is still
+    drawable then, ``E`` is not.
     """
 
     def __init__(
         self,
-        noise_seed: bytes,
         side: Side,
         rank: int,
         common_dim: int,
         compute: ComputeOps,
         *,
-        f_seed: bytes | None = None,
+        e_seed: bytes | None,
+        f_seed: bytes,
     ):
-        self.seed = noise_seed
-        self._key = subkey(LABEL_NOISE_LINE, noise_seed)
-        self._f_key = subkey(LABEL_NOISE_LINE, f_seed if f_seed is not None else noise_seed)
+        self._key = subkey(LABEL_NOISE_LINE, e_seed) if e_seed is not None else None
+        self._f_key = subkey(LABEL_NOISE_LINE, f_seed)
         self.side = side
         self.r = rank
         self.k = common_dim
@@ -112,6 +115,8 @@ class OperandNoiser:
         BLAKE3 block). No ``k``/``r`` in the address -- the seed binds them."""
         material = (bytes([self.side, factor]) + encode_u32_le(line)).ljust(64, b"\x00")
         key = self._f_key if factor is _Factor.F else self._key
+        if key is None:
+            raise ValueError(f"E_{self.side.name} needs the side's E seed (seedA for Side.A)")
         assert len(key) == 32 and len(material) == 64
         return blake3(material, key=key).digest(length=self.r)
 
@@ -134,6 +139,60 @@ class OperandNoiser:
             self.compute.const(norm_scaled),
         )
         return (x.to(torch.bfloat16) * scale.unsqueeze(1)).to(DType.FACTOR.value)
+
+
+class Noiser:
+    """One job's four noise factors under the protocol's seed rule.
+
+    ``F_A``, ``E_B`` and ``F_B`` are keyed by ``seed_b`` and exist from it
+    alone: the B side and its complete peel are job constants, fixed before
+    any A is known. ``E_A`` is the only seedA-keyed factor; construct with
+    ``seed_a`` (or take :meth:`with_seed_a`) before reading it.
+
+    This is the only public way to draw factors, so no caller picks which seed
+    keys which factor.
+    """
+
+    def __init__(
+        self,
+        seed_b: bytes,
+        rank: int,
+        common_dim: int,
+        compute: ComputeOps,
+        *,
+        seed_a: bytes | None = None,
+    ):
+        self.seed_a = seed_a
+        self.seed_b = seed_b
+        self.r = rank
+        self.k = common_dim
+        self.compute = compute
+        self._a = _OperandNoiser(Side.A, rank, common_dim, compute, e_seed=seed_a, f_seed=seed_b)
+        self._b = _OperandNoiser(Side.B, rank, common_dim, compute, e_seed=seed_b, f_seed=seed_b)
+
+    def with_seed_a(self, seed_a: bytes) -> Noiser:
+        """The same job once ``seed_a`` is known. The seedB-keyed bases are
+        shared, so a memoized ``F_A`` / ``F_B`` is not redrawn."""
+        other = Noiser(self.seed_b, self.r, self.k, self.compute, seed_a=seed_a)
+        other._a._basis = self._a._basis
+        other._b = self._b
+        return other
+
+    def E_A(self, row_indices: list[int]) -> torch.Tensor:
+        """``(len(row_indices) x r)`` FP8, keyed by seedA: one line per GLOBAL A row."""
+        return self._a.E(row_indices)
+
+    def F_A(self) -> torch.Tensor:
+        """``(r x k)`` FP8, keyed by seedB at ``Side.A`` addresses; memoized."""
+        return self._a.F()
+
+    def E_B(self, row_indices: list[int]) -> torch.Tensor:
+        """``(len(row_indices) x r)`` FP8, keyed by seedB: one line per GLOBAL B row."""
+        return self._b.E(row_indices)
+
+    def F_B(self) -> torch.Tensor:
+        """``(r x k)`` FP8, keyed by seedB at ``Side.B`` addresses; memoized."""
+        return self._b.F()
 
 
 Factor = _Factor

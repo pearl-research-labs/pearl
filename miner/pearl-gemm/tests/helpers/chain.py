@@ -2,7 +2,7 @@
 
 The A side of the chain, from the two committed blobs to the three A keys
 (``seedA || noise-line key A || jackpot key``) the prep and GEMM kernels
-consume, plus the reference ``OperandNoiser`` for either side. Protocol
+consume, plus the reference ``Noiser`` over the fixed seedB. Protocol
 composition over a real block header is owned by the production miner;
 these helpers only keep the fixture boilerplate of the per-kernel tests
 in one place.
@@ -15,7 +15,7 @@ from blake3 import blake3
 from miner_base.commitment import Device
 from miner_base.commitment_hash import AKeys, noise_line_key
 from miner_base.hardware import hardware_for
-from miner_base.noise import OperandNoiser, Side
+from miner_base.noise import Noiser
 
 from pearl_gemm import (
     TensorHashConfig,
@@ -49,7 +49,7 @@ class CommittedA:
     root_scales: torch.Tensor
     commit_stats: torch.Tensor
     a_keys_dev: torch.Tensor  # (96,) u8 on device
-    seed_b: bytes = SEED_B
+    seed_b: bytes = SEED_B  # keys both F bases (F_A at the Side.A address)
 
     @property
     def a_keys(self) -> AKeys:
@@ -67,18 +67,15 @@ class CommittedA:
     def pow_key_dev(self) -> torch.Tensor:
         return self.a_keys_dev[64:96]
 
-    def noise_a(self, k: int, compute=None) -> OperandNoiser:
-        noiser = OperandNoiser(
-            self.seed_a,
-            Side.A,
+    def noise(self, k: int, compute=None) -> Noiser:
+        """The reference factors for this A under the fixture's seedB."""
+        return Noiser(
+            self.seed_b,
             R,
             k,
             compute or hardware_for(Device.BLACKWELL).compute,
-            f_seed=self.seed_b,
+            seed_a=self.seed_a,
         )
-        assert noiser._key == noise_line_key(self.seed_a)
-        assert noiser._f_key == noise_line_key(self.seed_b)
-        return noiser
 
 
 def commit_a(
@@ -121,8 +118,9 @@ def commit_a(
     return committed
 
 
-def noise_b(seed_b: bytes = SEED_B, k: int = 512, compute=None) -> OperandNoiser:
-    return OperandNoiser(seed_b, Side.B, R, k, compute or hardware_for(Device.BLACKWELL).compute)
+def noise(seed_b: bytes = SEED_B, k: int = 512, compute=None) -> Noiser:
+    """The B side's reference factors (no seedA: ``E_A`` is not drawable)."""
+    return Noiser(seed_b, R, k, compute or hardware_for(Device.BLACKWELL).compute)
 
 
 def noise_key_b_dev(seed_b: bytes = SEED_B, device="cuda") -> torch.Tensor:
