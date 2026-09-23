@@ -14,7 +14,7 @@ from pearl_mining import MIN_MOE_PUBLICDATA_SIZE, PUBLICDATA_SIZE
 HEADER_HASH = bytes(range(32))
 PROOF_DATA = bytes([0x5A] * 128)
 ANCESTOR_BYTES = (bytes(range(108)), bytes(range(108, 216)))
-FP8_MAX_BLOB_SIZE = 131072
+ZK_MAX_BLOB_SIZE = 60000
 
 
 def _public_data(cert_version: CertificateVersion) -> bytes:
@@ -116,7 +116,7 @@ def test_v4_rejects_trailing_bytes():
 @pytest.mark.parametrize("field", ["public_data", "proof_data"])
 def test_v4_blob_size_limits(field):
     parts = {"public_data": b"public", "proof_data": PROOF_DATA}
-    parts[field] = bytes(FP8_MAX_BLOB_SIZE)
+    parts[field] = bytes(ZK_MAX_BLOB_SIZE)
     proof = CertificateProof(**parts)
     certificate = ZKCertificate(HEADER_HASH, proof, CertificateVersion.PLAIN_FP8)
     assert ZKCertificate.deserialize(certificate.serialize()).proof == proof
@@ -181,6 +181,17 @@ def test_v4_block_framing(count):
         public_data, PROOF_DATA, bytes([count]) + b"".join(raw_headers), expected_hash
     )
     assert block.serialize() == expected_certificate + expected_header + b"\x02coinbasetransaction"
+
+
+@pytest.mark.parametrize("cert_version", list(CertificateVersion))
+def test_all_versions_reject_oversized_proofs(cert_version):
+    proof = CertificateProof(
+        _public_data(cert_version),
+        bytes(ZKCertificate.ZK_MAX_PROOF_DATA_SIZE + 1),
+    )
+
+    with pytest.raises(ValueError, match="Proof data is too large"):
+        ZKCertificate(HEADER_HASH, proof, cert_version)
 
 
 @pytest.mark.parametrize(

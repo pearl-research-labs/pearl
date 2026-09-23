@@ -27,11 +27,6 @@ pub const ERROR_MSG_MAX_SIZE: usize = 128;
 /// Maximum size of a serialized ZK proof blob (excluding IncompleteBlockHeader and MiningConfiguration, including everything else).
 pub const MAX_ZK_PROOF_SIZE: usize = 60000;
 
-/// Maximum size of each published FP8 ZK blob: the encoded public statement and the
-/// constant-size stage-2 recursive proof. Proof-controlled input larger than this is
-/// rejected before deserialization.
-pub const MAX_FP8_PROOF_SIZE: usize = 131072;
-
 /// Smallest noise rank the rank-penalty rule accepts (exported to C header).
 pub const MIN_NOISE_RANK: u16 = 128;
 

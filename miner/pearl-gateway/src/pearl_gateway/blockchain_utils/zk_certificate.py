@@ -58,9 +58,8 @@ _VARIABLE_PREAMBLE_DTYPE = np.dtype(
 _CERT_VERSION_SIZE = 4  # u32 LE
 _PROOF_DATA_LEN_SIZE = 4  # u32 LE
 
-# Go ``wire.MaxZKProofSize`` / ``MaxFp8ProofSize``.
+# Go ``wire.MaxZKProofSize``.
 _ZK_MAX_PROOF_DATA_SIZE = 60000
-_FP8_MAX_PROOF_DATA_SIZE = 131072
 
 _VARIABLE_LENGTH_VERSIONS = {
     CertificateVersion.ZK_MOE,
@@ -93,7 +92,6 @@ class ZKCertificate:
     ancestor_headers: list[PearlHeader] = field(default_factory=list)
 
     ZK_MAX_PROOF_DATA_SIZE: ClassVar[int] = _ZK_MAX_PROOF_DATA_SIZE
-    FP8_MAX_PROOF_DATA_SIZE: ClassVar[int] = _FP8_MAX_PROOF_DATA_SIZE
     MAX_ANCESTOR_HEADERS: ClassVar[int] = 2
 
     def __post_init__(self) -> None:
@@ -102,11 +100,10 @@ class ZKCertificate:
         self._validate()
 
     def _validate(self) -> None:
-        max_proof = self._max_proof_data_size(self.cert_version)
-        if len(self.proof.proof_data) > max_proof:
+        if len(self.proof.proof_data) > _ZK_MAX_PROOF_DATA_SIZE:
             raise ValueError(
                 f"Proof data is too large: {len(self.proof.proof_data)} bytes "
-                f"(max {max_proof} bytes)"
+                f"(max {_ZK_MAX_PROOF_DATA_SIZE} bytes)"
             )
         if self.cert_version != CertificateVersion.PLAIN_FP8:
             if self.ancestor_headers:
@@ -114,19 +111,13 @@ class ZKCertificate:
             return
         if len(self.header_hash) != 32:
             raise ValueError("V4 header hash must be 32 bytes")
-        if len(self.proof.public_data) > _FP8_MAX_PROOF_DATA_SIZE:
+        if len(self.proof.public_data) > _ZK_MAX_PROOF_DATA_SIZE:
             raise ValueError("V4 public data exceeds max size")
         if len(self.ancestor_headers) > self.MAX_ANCESTOR_HEADERS:
             raise ValueError("V4 certificate permits at most two ancestor headers")
         for header in self.ancestor_headers:
             if len(header.serialize()) != PearlHeader.get_serialized_header_size():
                 raise ValueError("V4 ancestor header must include a full proof commitment")
-
-    @staticmethod
-    def _max_proof_data_size(cert_version: CertificateVersion) -> int:
-        if cert_version == CertificateVersion.PLAIN_FP8:
-            return _FP8_MAX_PROOF_DATA_SIZE
-        return _ZK_MAX_PROOF_DATA_SIZE
 
     def serialize(self) -> bytes:
         """Serialize to the wire format expected by the Go node.
@@ -195,14 +186,14 @@ class ZKCertificate:
             pd_len = int(arr["public_data_len"])
             pd_start = _VARIABLE_PREAMBLE_DTYPE.itemsize
             pd_end = pd_start + pd_len
-            if cert_version == CertificateVersion.PLAIN_FP8 and pd_len > _FP8_MAX_PROOF_DATA_SIZE:
+            if cert_version == CertificateVersion.PLAIN_FP8 and pd_len > _ZK_MAX_PROOF_DATA_SIZE:
                 raise ValueError("V4 public data exceeds max size")
             (proof_data_len,) = struct.unpack_from("<I", data, pd_end)
             public_data = data[pd_start:pd_end]
             proof_start = pd_end + _PROOF_DATA_LEN_SIZE
             proof_end = proof_start + proof_data_len
             if cert_version == CertificateVersion.PLAIN_FP8:
-                if proof_data_len > _FP8_MAX_PROOF_DATA_SIZE:
+                if proof_data_len > _ZK_MAX_PROOF_DATA_SIZE:
                     raise ValueError("V4 proof data exceeds max size")
                 if len(data) <= proof_end:
                     raise ValueError("Truncated V4 proof data or missing ancestor count")

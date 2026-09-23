@@ -74,12 +74,12 @@ func TestBlockCapHasRoomForEveryCertificateVersion(t *testing.T) {
 	}
 }
 
-// TestFp8ProofSizeMatchesRust asserts that the Go and Rust copies of the FP8
-// blob limit agree. Go bounds what the node accepts off the wire; Rust bounds
-// what the verifier will process. If they drift, the node accepts certificates
-// its own verifier refuses, or rejects ones that would have verified. The
-// relationship is currently asserted only in a comment.
-func TestFp8ProofSizeMatchesRust(t *testing.T) {
+// TestZKProofSizeMatchesRust asserts that the Go and Rust copies of the
+// proof-blob limit agree. Go bounds what the node accepts off the wire; Rust
+// bounds what the verifier will process. If they drift, the node accepts
+// certificates its own verifier refuses, or rejects ones that would have
+// verified. The relationship is currently asserted only in a comment.
+func TestZKProofSizeMatchesRust(t *testing.T) {
 	const rustPath = "../../zk-pow/bindings/go/src/common.rs"
 
 	source, err := os.ReadFile(rustPath)
@@ -88,21 +88,21 @@ func TestFp8ProofSizeMatchesRust(t *testing.T) {
 	}
 
 	matches := regexp.MustCompile(
-		`MAX_FP8_PROOF_SIZE\s*:\s*usize\s*=\s*(\d+)`,
+		`MAX_ZK_PROOF_SIZE\s*:\s*usize\s*=\s*(\d+)`,
 	).FindSubmatch(source)
 	if matches == nil {
-		t.Fatalf("MAX_FP8_PROOF_SIZE not found in %s; if it moved, update this "+
+		t.Fatalf("MAX_ZK_PROOF_SIZE not found in %s; if it moved, update this "+
 			"test rather than deleting it", rustPath)
 	}
 
 	rustValue, err := strconv.Atoi(string(matches[1]))
 	if err != nil {
-		t.Fatalf("parsing MAX_FP8_PROOF_SIZE from %s: %v", rustPath, err)
+		t.Fatalf("parsing MAX_ZK_PROOF_SIZE from %s: %v", rustPath, err)
 	}
 
-	if rustValue != MaxFp8ProofSize {
-		t.Errorf("MaxFp8ProofSize is %d in Go but MAX_FP8_PROOF_SIZE is %d in "+
+	if rustValue != MaxZKProofSize {
+		t.Errorf("MaxZKProofSize is %d in Go but MAX_ZK_PROOF_SIZE is %d in "+
 			"%s; the node and the verifier disagree on what they accept",
-			MaxFp8ProofSize, rustValue, rustPath)
+			MaxZKProofSize, rustValue, rustPath)
 	}
 }
