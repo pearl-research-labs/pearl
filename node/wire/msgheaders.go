@@ -12,15 +12,8 @@ import (
 // MaxBlockHeadersPerMsg is the maximum number of block headers that can be in
 // a single headers message.
 // https://en.bitcoin.it/wiki/Protocol_documentation#getheaders
-// 2000 is too many for our Block Header size. A full batch of maximum-size V4
-// certificates must fit MaxProtocolMessageLength (MsgHeaders.MaxPayloadLength
-// is ~7.9 MB at 30), so we limit it to 30.
-//
-// TODO FIXME: 30 is a stopgap that keeps HEADERS under the 8 MB protocol
-// limit while every header may carry a 262 KB V4 certificate. Revisit once the
-// V4 certificate bound is settled (a smaller MaxFp8ProofSize, or relaying
-// certificates outside HEADERS) so header sync can go back to larger batches.
-const MaxBlockHeadersPerMsg = 30
+// 2000 is too many for our Block Header size, so we limit it to 100.
+const MaxBlockHeadersPerMsg = 100
 
 type MsgHeader struct {
 	MsgCertificate MsgCertificate
@@ -159,8 +152,7 @@ func (msg *MsgHeaders) Command() string {
 // MaxPayloadLength returns the maximum length the payload can be for the
 // receiver.  This is part of the Message interface implementation.
 func (msg *MsgHeaders) MaxPayloadLength(pver uint32) uint32 {
-	// HEADERS can carry V4 certs; the V1–V3 65k cap would reject a full valid batch.
-	return MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSizeV4) * MaxBlockHeadersPerMsg)
+	return MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSize) * MaxBlockHeadersPerMsg)
 }
 
 // NewMsgHeaders returns a new headers message that conforms to the

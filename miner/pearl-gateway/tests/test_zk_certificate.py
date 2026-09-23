@@ -183,6 +183,17 @@ def test_v4_block_framing(count):
     assert block.serialize() == expected_certificate + expected_header + b"\x02coinbasetransaction"
 
 
+@pytest.mark.parametrize("cert_version", list(CertificateVersion))
+def test_all_versions_reject_oversized_proofs(cert_version):
+    proof = CertificateProof(
+        _public_data(cert_version),
+        bytes(ZKCertificate.ZK_MAX_PROOF_DATA_SIZE + 1),
+    )
+
+    with pytest.raises(ValueError, match="Proof data is too large"):
+        ZKCertificate(HEADER_HASH, proof, cert_version)
+
+
 @pytest.mark.parametrize(
     ("cert_version", "expected"),
     [

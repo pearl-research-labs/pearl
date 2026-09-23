@@ -9,7 +9,7 @@ use std::slice;
 use anyhow::{ensure, Result};
 use sha2::{Digest, Sha256};
 
-use crate::common::{MAX_FP8_PROOF_SIZE, MAX_ZK_PROOF_SIZE};
+use crate::common::MAX_ZK_PROOF_SIZE;
 use zk_pow::api::fp8::public_params::PublicParams;
 use zk_pow::api::primitives::IncompleteBlockHeader as Fp8BlockHeader;
 use zk_pow::api::seed::SeedDerivation;
@@ -307,7 +307,7 @@ unsafe fn verify_zk_proof_v4_inner(
             set_error_msg(error_msg_out, "Null or empty proof blob");
             return 1;
         }
-        if zk_proof_ref.proof_blob_len > MAX_FP8_PROOF_SIZE {
+        if zk_proof_ref.proof_blob_len > MAX_ZK_PROOF_SIZE {
             set_error_msg(error_msg_out, "FP8 proof too large");
             return 1;
         }

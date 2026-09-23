@@ -242,25 +242,40 @@ func TestCertificateV4Wire(t *testing.T) {
 	}
 }
 
-func TestMsgCertificateV4MaxSizeRoundTrip(t *testing.T) {
+// maxSizeCertificateV4 is a V4 certificate of exactly CertificateMaxSize
+// bytes: two ancestor headers, a MaxZKProofSize proof, and public data
+// filling the rest.
+func maxSizeCertificateV4() *wire.CertificateV4 {
 	header := testBlockHeader()
+	// version + hash + two length prefixes + ancestor count + two ancestors.
+	fixed := 4 + chainhash.HashSize + 4 + 4 + 1 + 2*wire.MaxBlockHeaderPayload
 	cert := &wire.CertificateV4{
 		Hash:            chainhash.Hash{0x01},
-		PublicData:      bytes.Repeat([]byte{0x11}, wire.MaxFp8ProofSize),
-		ProofData:       bytes.Repeat([]byte{0x22}, wire.MaxFp8ProofSize),
+		PublicData:      bytes.Repeat([]byte{0x11}, wire.CertificateMaxSize-fixed-wire.MaxZKProofSize),
+		ProofData:       bytes.Repeat([]byte{0x22}, wire.MaxZKProofSize),
 		AncestorHeaders: []wire.BlockHeader{header, header},
 	}
 	cert.AncestorHeaders[1].Version++
+	return cert
+}
 
-	msg := &wire.MsgCertificate{Certificate: cert}
+func TestMsgCertificateV4MaxSizeRoundTrip(t *testing.T) {
+	msg := &wire.MsgCertificate{Certificate: maxSizeCertificateV4()}
 	var buf bytes.Buffer
 	require.NoError(t, msg.PrlEncode(&buf, wire.ProtocolVersion))
-	require.Equal(t, wire.CertificateMaxSizeV4, buf.Len())
+	require.Equal(t, wire.CertificateMaxSize, buf.Len())
 	require.Equal(t, msg.SerializeSize(), buf.Len())
 
 	var decoded wire.MsgCertificate
 	require.NoError(t, decoded.PrlDecode(bytes.NewReader(buf.Bytes()), wire.ProtocolVersion))
 	require.Equal(t, msg, &decoded)
+
+	// One byte over the common cap is rejected even though each blob fits.
+	cert := maxSizeCertificateV4()
+	cert.PublicData = append(cert.PublicData, 0x11)
+	require.ErrorContains(t,
+		(&wire.MsgCertificate{Certificate: cert}).PrlEncode(&bytes.Buffer{}, wire.ProtocolVersion),
+		"certificate too large")
 }
 
 func TestCertificateV4AncestorCount(t *testing.T) {
@@ -309,11 +324,22 @@ func TestCertificateV4OversizedBlobs(t *testing.T) {
 		"proof_data":  chainhash.HashSize + 4, // Empty public data.
 	} {
 		t.Run(field, func(t *testing.T) {
-			data := binary.LittleEndian.AppendUint32(make([]byte, offset), wire.MaxFp8ProofSize+1)
+			data := binary.LittleEndian.AppendUint32(make([]byte, offset), wire.MaxZKProofSize+1)
 			err := (&wire.CertificateV4{}).Deserialize(bytes.NewReader(data))
 			require.ErrorContains(t, err, field+"_len")
 			require.ErrorContains(t, err, "exceeds max")
 		})
+	}
+}
+
+func TestMaxCertificateSize(t *testing.T) {
+	for _, version := range []wire.CertificateVersion{
+		wire.CertificateVersionV1,
+		wire.CertificateVersionV2,
+		wire.CertificateVersionV3,
+		wire.CertificateVersionV4,
+	} {
+		require.Equal(t, wire.CertificateMaxSize, wire.MaxCertificateSize(version))
 	}
 }
 

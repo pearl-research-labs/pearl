@@ -12,21 +12,14 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
-// MaxFp8ProofSize limits each V4 public-data and proof blob. Must match
-// MAX_FP8_PROOF_SIZE in zk-pow/bindings/go/src/common.rs.
-const MaxFp8ProofSize = 131072
-
 // MaxCertificateV4AncestorHeaders bounds the parent/grandparent witness.
 const MaxCertificateV4AncestorHeaders = 2
 
-// CertificateMaxSizeV4 is the maximum V4 certificate size, including the
-// version prefix, both blobs, one-byte ancestor count, and full ancestor headers.
-const CertificateMaxSizeV4 = 4 + 32 + 4 + MaxFp8ProofSize + 4 + MaxFp8ProofSize +
-	1 + MaxCertificateV4AncestorHeaders*MaxBlockHeaderPayload
-
 // CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is
 // hash + length-prefixed public data + length-prefixed proof + ancestor count
-// + full ancestor headers. Both blobs are capped at MaxFp8ProofSize.
+// + full ancestor headers. It uses the common certificate and proof-size
+// bounds: each blob is capped at MaxZKProofSize and the whole certificate at
+// CertificateMaxSize.
 type CertificateV4 struct {
 	Hash       chainhash.Hash
 	PublicData []byte
@@ -97,15 +90,15 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 	return nil
 }
 
-// readFp8Blob reads one length-prefixed (4-byte LE) blob, enforcing the V4
-// per-blob size cap. A zero length decodes as nil.
+// readFp8Blob reads one length-prefixed (4-byte LE) blob, enforcing the common
+// blob-size cap. A zero length decodes as nil.
 func readFp8Blob(r io.Reader, fieldName string) ([]byte, error) {
 	var length uint32
 	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return nil, err
 	}
-	if length > MaxFp8ProofSize {
-		return nil, fmt.Errorf("fp8 %s_len %d exceeds max %d", fieldName, length, MaxFp8ProofSize)
+	if length > MaxZKProofSize {
+		return nil, fmt.Errorf("fp8 %s_len %d exceeds max %d", fieldName, length, MaxZKProofSize)
 	}
 	if length == 0 {
 		return nil, nil

@@ -315,7 +315,7 @@ func TestVerifyCertificateV4PublicDataSize(t *testing.T) {
 		wantErr   string
 	}{
 		{1, "invalid public_data_len"},
-		{wire.MaxFp8ProofSize, "fp8 public data too large"}, // Reject before the C-buffer copy.
+		{wire.MaxZKProofSize, "fp8 public data too large"}, // Reject before the C-buffer copy.
 	} {
 		t.Run(test.wantErr, func(t *testing.T) {
 			header := testBlockHeader()
