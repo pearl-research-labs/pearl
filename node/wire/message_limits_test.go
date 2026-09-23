@@ -5,14 +5,11 @@
 package wire
 
 import (
+	"os"
+	"regexp"
+	"strconv"
 	"testing"
 )
-
-// maxCertificateVersion is the newest certificate version this build can put on
-// the wire. Bump it when a version is added: the assertions below then verify
-// that every size limit which has to accommodate a certificate was widened to
-// match.
-const maxCertificateVersion = CertificateVersionV4
 
 // allMessageCommands is every command makeEmptyMessage understands. Add new
 // commands here so they are covered by TestMessageCapsFitProtocolLimit.
@@ -25,11 +22,18 @@ var allMessageCommands = []string{
 	CmdWTxIdRelay,
 }
 
+// allCertificateVersions is every certificate version this build can place on
+// the wire. Add new versions here so the size assertions cover them.
+var allCertificateVersions = []CertificateVersion{
+	CertificateVersionV1, CertificateVersionV2, CertificateVersionV3,
+	CertificateVersionV4,
+}
+
 // TestMessageCapsFitProtocolLimit asserts that no message type declares a
 // per-type payload cap larger than the protocol-wide message limit. A type that
 // does is unreadable at its own declared maximum: the read path rejects the
-// message on MaxProtocolMessageLength before the per-type cap is ever consulted,
-// so legitimate traffic at that size can never be exchanged.
+// message on MaxProtocolMessageLength before the per-type cap is consulted, so
+// legitimate traffic at that size can never be exchanged.
 func TestMessageCapsFitProtocolLimit(t *testing.T) {
 	for _, command := range allMessageCommands {
 		t.Run(command, func(t *testing.T) {
@@ -48,43 +52,57 @@ func TestMessageCapsFitProtocolLimit(t *testing.T) {
 	}
 }
 
-// TestCertificateBearingCapsFitCertificate asserts the opposite bound for the
-// two message types that carry certificates: their caps must be large enough
-// for the biggest certificate this build can emit. Certificates are excluded
-// from block vsize, so the room for them has to be added on top of the
-// consensus payload caps rather than assumed to be inside them.
-func TestCertificateBearingCapsFitCertificate(t *testing.T) {
-	certSize := MaxCertificateSize(maxCertificateVersion)
+// TestBlockCapHasRoomForEveryCertificateVersion asserts that the BLOCK message
+// cap leaves room for a certificate of any version on top of the consensus
+// transaction payload. Certificates are excluded from block vsize, so that room
+// has to be budgeted explicitly rather than assumed to be inside
+// MaxBlockPayload. A version whose certificate does not fit makes
+// consensus-valid blocks unrelayable.
+func TestBlockCapHasRoomForEveryCertificateVersion(t *testing.T) {
+	declared := int((&MsgBlock{}).MaxPayloadLength(ProtocolVersion))
+	room := declared - MaxBlockPayload
 
-	tests := []struct {
-		name   string
-		msg    Message
-		needed int
-		what   string
-	}{
-		{
-			name:   "headers",
-			msg:    NewMsgHeaders(),
-			needed: MaxVarIntPayload + (MaxBlockHeaderPayload+certSize)*MaxBlockHeadersPerMsg,
-			what:   "a full batch of MaxBlockHeadersPerMsg certificate-bearing headers",
-		},
-		{
-			name:   "block",
-			msg:    &MsgBlock{},
-			needed: MaxBlockPayload + certSize,
-			what:   "a maximum-vsize block plus its certificate",
-		},
+	for _, version := range allCertificateVersions {
+		needed := MaxCertificateSize(version)
+		if room < needed {
+			t.Errorf("BLOCK declares a %d-byte cap, leaving %d bytes above the "+
+				"%d-byte transaction payload, but a version-%d certificate can "+
+				"be %d bytes; a maximum-size block carrying one would be "+
+				"rejected on receipt", declared, room, MaxBlockPayload, version,
+				needed)
+		}
+	}
+}
+
+// TestFp8ProofSizeMatchesRust asserts that the Go and Rust copies of the FP8
+// blob limit agree. Go bounds what the node accepts off the wire; Rust bounds
+// what the verifier will process. If they drift, the node accepts certificates
+// its own verifier refuses, or rejects ones that would have verified. The
+// relationship is currently asserted only in a comment.
+func TestFp8ProofSizeMatchesRust(t *testing.T) {
+	const rustPath = "../../zk-pow/bindings/go/src/common.rs"
+
+	source, err := os.ReadFile(rustPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", rustPath, err)
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			declared := int(test.msg.MaxPayloadLength(ProtocolVersion))
-			if declared < test.needed {
-				t.Errorf("%s declares a %d-byte payload cap, but %s needs %d "+
-					"bytes at the %d-byte version-%d certificate size; honest "+
-					"traffic would be rejected on receipt", test.name, declared,
-					test.what, test.needed, certSize, maxCertificateVersion)
-			}
-		})
+	matches := regexp.MustCompile(
+		`MAX_FP8_PROOF_SIZE\s*:\s*usize\s*=\s*(\d+)`,
+	).FindSubmatch(source)
+	if matches == nil {
+		t.Fatalf("MAX_FP8_PROOF_SIZE not found in %s; if it moved, update this "+
+			"test rather than deleting it", rustPath)
+	}
+
+	rustValue, err := strconv.Atoi(string(matches[1]))
+	if err != nil {
+		t.Fatalf("parsing MAX_FP8_PROOF_SIZE from %s: %v", rustPath, err)
+	}
+
+	if rustValue != MaxFp8ProofSize {
+		t.Errorf("MaxFp8ProofSize is %d in Go but MAX_FP8_PROOF_SIZE is %d in "+
+			"%s; the node and the verifier disagree on what they accept",
+			MaxFp8ProofSize, rustValue, rustPath)
 	}
 }
