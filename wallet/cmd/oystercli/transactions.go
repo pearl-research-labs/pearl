@@ -135,15 +135,16 @@ func showTransactionDetail(c *client, txid string) error {
 	// was never announced by this wallet; forgetting it would drop the
 	// credit (and any spend chained off it) while the payment can still
 	// confirm on chain.
-	if tx.Confirmations > 0 || !isWalletSend(tx) {
+	if tx.Confirmations > 0 || !spendsWalletCoins(tx) {
 		return nil
 	}
 	return pendingTxActions(c, tx.TxID)
 }
 
-// isWalletSend reports whether this wallet originated the transaction, as
-// opposed to merely receiving an output from it.
-func isWalletSend(tx *btcjson.GetTransactionResult) bool {
+// spendsWalletCoins reports whether the transaction spends wallet-owned
+// outputs (a send-category debit). A send detail does not mean this daemon
+// created or broadcast the transaction.
+func spendsWalletCoins(tx *btcjson.GetTransactionResult) bool {
 	for _, det := range tx.Details {
 		if det.Category == "send" {
 			return true
