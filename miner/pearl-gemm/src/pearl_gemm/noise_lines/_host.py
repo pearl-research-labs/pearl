@@ -17,8 +17,8 @@ from ..noisy_quant._quantization_ops import (
 from ..protocol_constants import R
 from ._kernel import _NoiseLines
 
-# The four v4 noise-line address prefixes ``side | factor`` (``OperandNoiser``'s
-# draws): E1/F1 are A's row lines and shared basis, E2/F2 are B's.
+# The four v4 noise-line address prefixes ``side | factor`` (the reference
+# ``Noiser``'s draws): E1/F1 are A's row lines and shared basis, E2/F2 are B's.
 LABEL_E1 = _L_E1
 LABEL_E2 = _L_E2
 LABEL_F1 = _L_F1
@@ -41,16 +41,17 @@ def noise_lines(
     ``label || u32(index)`` zero-padded where ``label`` is the ``side |
     factor`` address prefix, digest length R, sign/magnitude decode, exact
     isqrt L2 normalization to 256, e4m3 rounding
-    (``miner_base.noise.OperandNoiser._lines``).
+    (``miner_base.noise::_OperandNoiser._lines``).
 
-    For the F basis: draw ``k`` lines under ``LABEL_F1`` (A's key) /
-    ``LABEL_F2`` (B's key) and materialize any factor passed raw to a prep
+    For the F basis: draw ``k`` lines under ``LABEL_F1`` / ``LABEL_F2``
+    with B's noise-line key (both F bases are keyed by seedB; ``LABEL_F1``
+    is the ``Side.A`` address) and materialize any factor passed raw to a prep
     kernel with ``factor = out.t().contiguous()``. ``pack_noise_factor``
     accepts the transpose directly and returns a contiguous packed blob; at
     ``R == PACKED_NOISE_K`` the ``(k, R)`` draw viewed as int8 already *is*
     the blob. On the B side, pass raw F1 to the peel side and
     ``pack_noise_factor(F2)`` to the noise-dot side, exactly the reference
-    ``OperandNoiser.F`` assembly per side.
+    ``Noiser.F_A`` / ``Noiser.F_B`` assembly.
     """
     if not isinstance(label, bytes):
         raise TypeError("label must be bytes")

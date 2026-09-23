@@ -28,7 +28,7 @@ from pearl_gemm import (
     validate_noisy_quant_config,
 )
 from pearl_gemm.protocol_constants import R
-from tests.helpers.chain import commit_a, noise_b
+from tests.helpers.chain import commit_a, noise
 
 
 def _mism(got: torch.Tensor, ref: torch.Tensor) -> int:
@@ -86,9 +86,9 @@ def _assert_chain_matches_reference(a: torch.Tensor, config_fields=None) -> None
     aq_ref = PrequantMatrix.encode(a.cpu())
     opened = aq_ref.open()
 
-    # Factors from the commitment chain (reference OperandNoiser per side).
-    noise_a, noise_bb = committed.noise_a(k, hw.compute), noise_b(k=k, compute=hw.compute)
-    e1, f1, f2 = noise_a.E(list(range(m))), noise_a.F(), noise_bb.F()
+    # Factors from the commitment chain (the reference Noiser).
+    noiser = committed.noise(k, hw.compute)
+    e1, f1, f2 = noiser.E_A(list(range(m))), noiser.F_A(), noiser.F_B()
 
     # Step 3 on GPU.
     config = NoisyQuantConfig(**(config_fields or {}))
@@ -119,7 +119,7 @@ def _assert_chain_matches_reference(a: torch.Tensor, config_fields=None) -> None
     # it comes back from the quant step that derives it.
     row_norms = aq_ref.exact_norms()
     ref_stacked = PearlScheme(hw, Fp8QuantScheme(), k, R).build_a_rows(
-        opened, noise_a, noise_bb, list(range(m)), row_norms
+        opened, noiser, list(range(m)), row_norms
     )
     _, _, ref_beta, _ = Fp8QuantScheme().noisy_quantize(opened, e1, f1, hw, row_norms)
 
@@ -192,7 +192,8 @@ def test_consistency():
     torch.manual_seed(11)
     a = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 1.5
     codes, scales, committed = _commit(a)
-    f1, f2 = committed.noise_a(k).F(), noise_b(k=k).F()
+    noiser = noise(k=k)
+    f1, f2 = noiser.F_A(), noiser.F_B()
 
     config = NoisyQuantConfig()
 

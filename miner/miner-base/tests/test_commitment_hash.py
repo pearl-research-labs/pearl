@@ -24,7 +24,7 @@ from miner_base.commitment_hash import (
 )
 from miner_base.hardware import hardware_for
 from miner_base.mining_config import default_mining_config
-from miner_base.noise import OperandNoiser, Side
+from miner_base.noise import Noiser
 
 
 @pytest.fixture
@@ -71,11 +71,47 @@ def test_subkeys_are_the_reference_noise_and_jackpot_keys(chain):
         comm_a.digest, comm_b.digest, key_a, key_b, config.p_a(m), config.p_b(n)
     )
     compute = hardware_for(config.device).compute
-    assert OperandNoiser(seed_a, Side.A, 32, 1024, compute)._key == noise_line_key(seed_a)
-    assert OperandNoiser(seed_b, Side.B, 32, 1024, compute)._key == noise_line_key(seed_b)
+    noise = Noiser(seed_b, 32, 1024, compute, seed_a=seed_a)
+    # E_A under seedA's noise-line key; F_A, E_B and F_B under seedB's.
+    assert noise._a._key == noise_line_key(seed_a)
+    assert noise._a._f_key == noise._b._key == noise._b._f_key == noise_line_key(seed_b)
+    # Same seedB, different Side addresses: F_A and F_B are distinct draws.
+    assert not _same_bits(noise.F_A(), noise.F_B())
     extracted = secrets.token_bytes(64)
     assert jackpot_key(seed_a) == subkey(LABEL_JACKPOT, seed_a)
     assert blake3(extracted, key=jackpot_key(seed_a)).digest() == jackpot_digest(extracted, seed_a)
+
+
+def _same_bits(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Bitwise FP8 equality (``torch.equal`` has no CPU FP8 kernel)."""
+    return torch.equal(lhs.contiguous().view(torch.uint8), rhs.contiguous().view(torch.uint8))
+
+
+def test_only_e_a_moves_with_seed_a(chain):
+    """Draw the factors for (A, B), then for (A', B): F_A, E_B and F_B are
+    unchanged, only E_A moves. Conversely a new seedB under the same seedA
+    moves those three and leaves E_A alone."""
+    config, m, n, key_a, key_b, comm_a, comm_b = chain
+    seed_a, seed_b = noise_seeds(
+        comm_a.digest, comm_b.digest, key_a, key_b, config.p_a(m), config.p_b(n)
+    )
+    compute = hardware_for(config.device).compute
+    rows, cols = list(range(m)), list(range(n))
+    job = Noiser(seed_b, 32, 1024, compute)  # B side: exists before any A
+    with pytest.raises(ValueError, match="E_A"):
+        job.E_A(rows)
+    with_a = job.with_seed_a(seed_a)
+    with_a_prime = job.with_seed_a(secrets.token_bytes(32))
+    for lhs, rhs in ((job, with_a), (with_a, with_a_prime)):
+        assert _same_bits(lhs.F_A(), rhs.F_A())
+        assert _same_bits(lhs.E_B(cols), rhs.E_B(cols))
+        assert _same_bits(lhs.F_B(), rhs.F_B())
+    assert not _same_bits(with_a.E_A(rows), with_a_prime.E_A(rows))
+    other_b = Noiser(secrets.token_bytes(32), 32, 1024, compute, seed_a=seed_a)
+    assert _same_bits(with_a.E_A(rows), other_b.E_A(rows))
+    assert not _same_bits(with_a.F_A(), other_b.F_A())
+    assert not _same_bits(with_a.E_B(cols), other_b.E_B(cols))
+    assert not _same_bits(with_a.F_B(), other_b.F_B())
 
 
 def test_p_a_binds_shape_leaf_and_pattern(chain):

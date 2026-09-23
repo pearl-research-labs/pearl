@@ -6,7 +6,8 @@ with the reference chain driven through the new-scheme API (planes -> commit
 over the codes and scales planes with fused stats, exact norms off the
 committed int8 blocks + scales, ``build_b_rows`` over the opened rows). The
 kernel is keyed by B's noise-line key (``Subkey("noise-line", seedB)``); F_A
-(per-A in v4) enters only as the raw peel factor, drawn here from a probe seed.
+enters as the raw peel factor and is keyed by the same seedB (Side.A
+address), so no seedA is involved on the B side.
 
 The mid tolerance is looser than the A side's ``A'@F2^T`` gate because the
 reference computes that half through its tolerance-path matmul with bf16
@@ -20,7 +21,7 @@ from blake3 import blake3
 from miner_base.commitment import Device
 from miner_base.commitment_hash import noise_line_key
 from miner_base.hardware import hardware_for
-from miner_base.noise import OperandNoiser, Side
+from miner_base.noise import Noiser
 from miner_base.prequant import PrequantMatrix
 from miner_base.quantization import Fp8QuantScheme
 from miner_base.scheme import PearlScheme
@@ -37,8 +38,6 @@ from pearl_gemm import (
 )
 from pearl_gemm.protocol_constants import R
 from tests.helpers.chain import KEY_A, SEED_B, device_bytes
-
-_SEED_A_PROBE = blake3(b"seed-a-probe").digest()
 
 # The reassociated mid half vs the reference's tolerance-path mid (see module
 # docstring); the bit-exact halves use _mism. Near-degenerate inputs (e.g. a
@@ -112,13 +111,9 @@ def _committed_planes(b: torch.Tensor):
     return codes, scales, commit_stats
 
 
-def _noisers(seed_b: bytes, k: int, hw=None):
-    """The reference per-side noisers: B's from ``seed_b``, A's from the probe seed."""
-    compute = (hw or hardware_for(Device.BLACKWELL)).compute
-    return (
-        OperandNoiser(_SEED_A_PROBE, Side.A, R, k, compute),
-        OperandNoiser(seed_b, Side.B, R, k, compute),
-    )
+def _noiser(seed_b: bytes, k: int, hw=None) -> Noiser:
+    """The reference factors of the B side: all keyed by ``seed_b``, no seedA."""
+    return Noiser(seed_b, R, k, (hw or hardware_for(Device.BLACKWELL)).compute)
 
 
 def _launch_b(codes, scales, commit_stats, seed_b, f1, f2, config):
@@ -155,9 +150,9 @@ def _assert_b_chain_matches_reference(b: torch.Tensor, config_fields=None) -> No
 
     codes, scales, commit_stats = _committed_planes(b)
 
-    # Factors from the commitment chain (reference noisers per side).
-    noise_a, noise_b = _noisers(SEED_B, k, hw)
-    e2, f1, f2 = noise_b.E(list(range(n))), noise_a.F(), noise_b.F()
+    # Factors from the commitment chain (the reference Noiser).
+    noiser = _noiser(SEED_B, k, hw)
+    e2, f1, f2 = noiser.E_B(list(range(n))), noiser.F_A(), noiser.F_B()
 
     config = NoisyQuantBConfig(**(config_fields or {}))
     got = _launch_b(codes, scales, commit_stats, SEED_B, f1, f2, config)
@@ -169,7 +164,7 @@ def _assert_b_chain_matches_reference(b: torch.Tensor, config_fields=None) -> No
     opened = bq_ref.open()
     row_norms = bq_ref.exact_norms()
     ref_stacked = PearlScheme(hw, Fp8QuantScheme(), k, R).build_b_rows(
-        opened, noise_a, noise_b, list(range(n)), row_norms
+        opened, noiser, list(range(n)), row_norms
     )
     _, _, ref_beta, _ = Fp8QuantScheme().noisy_quantize(opened, e2, f2, hw, row_norms)
 
@@ -246,13 +241,13 @@ def test_other_seed_b_rekeys_the_draw():
     hw = hardware_for(Device.BLACKWELL)
     codes, scales, commit_stats = _committed_planes(b)
 
-    noise_a, noise_b = _noisers(seed_b, k, hw)
-    e2, f1, f2 = noise_b.E(list(range(n))), noise_a.F(), noise_b.F()
+    noiser = _noiser(seed_b, k, hw)
+    e2, f1, f2 = noiser.E_B(list(range(n))), noiser.F_A(), noiser.F_B()
     got = _launch_b(codes, scales, commit_stats, seed_b, f1, f2, NoisyQuantBConfig())
 
     bq_ref = PrequantMatrix.encode(b.cpu())
     ref_stacked = PearlScheme(hw, Fp8QuantScheme(), k, R).build_b_rows(
-        bq_ref.open(), noise_a, noise_b, list(range(n)), bq_ref.exact_norms()
+        bq_ref.open(), noiser, list(range(n)), bq_ref.exact_norms()
     )
     assert _mism(got["e2"], e2) == 0
     assert _mism(got["b_prime"], ref_stacked.quant_part) == 0
@@ -269,8 +264,8 @@ def test_consistency():
     torch.manual_seed(11)
     b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 1.5
     codes, scales, commit_stats = _committed_planes(b)
-    noise_a, noise_b = _noisers(SEED_B, k)
-    f1, f2 = noise_a.F(), noise_b.F()
+    noiser = _noiser(SEED_B, k)
+    f1, f2 = noiser.F_A(), noiser.F_B()
     config = NoisyQuantBConfig()
 
     first = _launch_b(codes, scales, commit_stats, SEED_B, f1, f2, config)
@@ -289,13 +284,13 @@ def test_mixed_gemm_parity_gpu_vs_reference_prep():
     b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 1.5
     hw = hardware_for(Device.BLACKWELL)
     codes, scales, commit_stats = _committed_planes(b)
-    noise_a, noise_b = _noisers(SEED_B, k, hw)
-    f1, f2 = noise_a.F(), noise_b.F()
+    noiser = _noiser(SEED_B, k, hw)
+    f1, f2 = noiser.F_A(), noiser.F_B()
     got = _launch_b(codes, scales, commit_stats, SEED_B, f1, f2, NoisyQuantBConfig())
 
     bq_ref = PrequantMatrix.encode(b.cpu())
     ref_stacked = PearlScheme(hw, Fp8QuantScheme(), k, R).build_b_rows(
-        bq_ref.open(), noise_a, noise_b, list(range(n)), bq_ref.exact_norms()
+        bq_ref.open(), noiser, list(range(n)), bq_ref.exact_norms()
     )
 
     # A fixed synthetic A side; only the B operands differ between runs.

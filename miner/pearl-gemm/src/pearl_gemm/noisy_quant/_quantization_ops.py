@@ -34,7 +34,7 @@ _ROW_W, _ROW_SH = _ROW_OFF // 4, (_ROW_OFF % 4) * 8
 
 
 def _noise_base_words(label: bytes) -> tuple[int, ...]:
-    """The 16 message words of ``OperandNoiser._line_digest`` with the line index zeroed."""
+    """The 16 message words of ``_OperandNoiser._line_digest`` with the line index zeroed."""
     if len(label) != _LABEL_LEN:
         raise ValueError(f"noise line address must be {_LABEL_LEN} bytes, got {len(label)}")
     material = (label + struct.pack("<I", 0)).ljust(64, b"\x00")

@@ -8,12 +8,10 @@ device kernel is ``noisy_quant``'s, launched on mirrored operands.
 
 from ._host import (
     NoisyQuantBConfig,
-    b_peel_for_a,
     noisy_quant_b,
 )
 
 __all__ = [
     "NoisyQuantBConfig",
-    "b_peel_for_a",
     "noisy_quant_b",
 ]

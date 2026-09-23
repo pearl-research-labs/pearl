@@ -38,17 +38,17 @@ class LayerBuffers:
     """
 
     b_prime: torch.Tensor  # (n, k) float8_e4m3fn
-    # Columns [R, 2R) hold -(beta_b (.) E_B), the per-job half of B's peel. The
-    # mid half [0, R) depends on the per-nonce F_A and is recomputed per launch
-    # (pipeline._b_peel_for_launch); the kernel writes a zero placeholder here.
+    # The complete job-constant peel: both F bases are keyed by seedB, so
+    # noisy_quant_b emits the mid half [0, R) and -(beta_b (.) E_B) in [R, 2R).
     b_peel: torch.Tensor  # (n, 2R) bfloat16
     alpha_b: torch.Tensor  # (n,) bfloat16
     beta_b: torch.Tensor  # (n,) bfloat16
     inv_alpha_b: torch.Tensor  # (n,) float32
     e2: torch.Tensor  # (n, R) float8_e4m3fn  E_B rows
-    f1: torch.Tensor  # (R, k) float8_e4m3fn  all-zero F_A stand-in for noisy_quant_b's peel side
-    f2: torch.Tensor  # (R, k) float8_e4m3fn  F_B
-    f2_hl: torch.Tensor  # (k, PACKED_NOISE_K) int8 packed F_B
+    f1: torch.Tensor  # (R, k) float8_e4m3fn  F_A (noisy_quant_b's raw peel factor)
+    f1_hl: torch.Tensor  # (k, PACKED_NOISE_K) int8 packed F_A (noisy_quant's noise operand)
+    f2: torch.Tensor  # (R, k) float8_e4m3fn  F_B (noisy_quant's raw peel factor)
+    f2_hl: torch.Tensor  # (k, PACKED_NOISE_K) int8 packed F_B (noisy_quant_b's noise operand)
     noise_lines: torch.Tensor  # (k, R) float8_e4m3fn scratch
     root_codes: torch.Tensor  # (32,) uint8
     root_scales: torch.Tensor  # (32,) uint8
@@ -60,7 +60,7 @@ class LayerBuffers:
     key_a_dev: torch.Tensor  # (32,) uint8 keyA (the header's A-side opening key)
     key_b_dev: torch.Tensor  # (32,) uint8 keyB (B's Merkle key)
     seed_b_dev: torch.Tensor  # (32,) uint8 noise seedB (finalize input, hit-record stamp)
-    noise_key_b_dev: torch.Tensor  # (32,) uint8 Subkey("noise-line", seedB): E_B/F_B draw key
+    noise_key_b_dev: torch.Tensor  # (32,) uint8 Subkey("noise-line", seedB): E_B/F_A/F_B draw key
     threshold_dev: torch.Tensor  # (32,) uint8 little-endian lottery threshold
 
 
@@ -120,6 +120,7 @@ class JobContext:
     key_a_dev: torch.Tensor
     seed_b_dev: torch.Tensor
     threshold_dev: torch.Tensor
+    f1_hl: torch.Tensor
     f2: torch.Tensor
     e2: torch.Tensor
     beta_b: torch.Tensor
@@ -231,6 +232,7 @@ def buffer_field_specs(
         "inv_alpha_b": ((n,), torch.float32),
         "e2": ((n, RANK), torch.float8_e4m3fn),
         "f1": ((RANK, k), torch.float8_e4m3fn),
+        "f1_hl": ((k, PACKED_NOISE_K), torch.int8),
         "f2": ((RANK, k), torch.float8_e4m3fn),
         "f2_hl": ((k, PACKED_NOISE_K), torch.int8),
         "noise_lines": ((k, RANK), torch.float8_e4m3fn),

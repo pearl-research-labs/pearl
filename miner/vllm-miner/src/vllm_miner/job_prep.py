@@ -49,14 +49,15 @@ def _prepare_b_on_gpu(
 
     Returns B's noise seed. The v4 B chain: ``HB = blake3(roots, key=keyB)``,
     ``seedB = H_"seed-B"(HB || keyB || pB)``, and every B-side line (``E_B``
-    in-kernel, ``F_B`` here) is drawn under ``Subkey("noise-line", seedB)``.
-    ``F_A`` depends on each launch's A commitment, so B's peel mid half cannot
-    be prepared per job: ``noisy_quant_b`` runs against an all-zero ``F_A``
-    stand-in (``buffers.f1``, giving a zero mid half) and the pipeline rebuilds
-    that half per launch. The root readback (``.cpu()``) synchronizes the
-    stream, which is what makes ``seedB`` available to derive the noise key.
+    in-kernel, ``F_B`` here) plus ``F_A`` (``Side.A`` addresses under the same
+    key) is drawn under ``Subkey("noise-line", seedB)``. Nothing on the B side
+    depends on A, so ``noisy_quant_b`` runs against the real ``F_A`` and emits
+    the complete peel; the launches read ``f1_hl``, ``b_peel`` and friends
+    unchanged. The root readback (``.cpu()``) synchronizes the stream, which
+    is what makes ``seedB`` available to derive the noise key.
     """
     from pearl_gemm import (
+        LABEL_F1,
         LABEL_F2,
         noise_lines,
         noisy_quant_b,
@@ -83,10 +84,15 @@ def _prepare_b_on_gpu(
 
     buffers.seed_b_dev.copy_(_as_bytes_tensor(seed_b))
     buffers.noise_key_b_dev.copy_(_as_bytes_tensor(noise_line_key(seed_b)))
-    noise_lines(buffers.noise_key_b_dev, LABEL_F2, buffers.noise_lines)
-    buffers.f2.copy_(buffers.noise_lines.t())
-    buffers.f2_hl.copy_(pack_noise_factor(buffers.f2))
-    buffers.f1.zero_()
+    # Each factor is the materialized transpose of its (k, R) line draw; the
+    # packed form is the sibling kernel's noise-UMMA operand.
+    for label, factor, packed in (
+        (LABEL_F1, buffers.f1, buffers.f1_hl),
+        (LABEL_F2, buffers.f2, buffers.f2_hl),
+    ):
+        noise_lines(buffers.noise_key_b_dev, label, buffers.noise_lines)
+        factor.copy_(buffers.noise_lines.t())
+        packed.copy_(pack_noise_factor(factor))
 
     noisy_quant_b(
         state.weight,
@@ -160,6 +166,7 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
         key_a_dev=buffers.key_a_dev,
         seed_b_dev=buffers.seed_b_dev,
         threshold_dev=buffers.threshold_dev,
+        f1_hl=buffers.f1_hl,
         f2=buffers.f2,
         e2=buffers.e2,
         beta_b=buffers.beta_b,

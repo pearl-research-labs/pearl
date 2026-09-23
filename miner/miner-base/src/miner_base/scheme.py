@@ -1,8 +1,8 @@
 """The with-peel scheme: stacked rows + the single fused tile kernel.
 
-Recall the algebra (each side X draws its own factors
-``E_X``, ``F_X`` from its noise seed; the injected rank-r noise is
-``N_X = E_X @ F_X``):
+Recall the algebra (``E_X`` from that side's noise seed; both ``F_A``
+and ``F_B`` from ``noise seedB``, distinguished by the ``Side`` address;
+the injected rank-r noise is ``N_X = E_X @ F_X``):
 
     A' = Q(A + EA @ FA)                                  # m x k, FP8
     B' = Q(B + EB @ FB)                                  # n x k, FP8
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import torch
 
 from .hardware import DType, Hardware
-from .noise import OperandNoiser
+from .noise import Noiser
 from .prequant import RowNorms
 from .quantization import Fp8QuantScheme
 
@@ -50,19 +50,18 @@ class PearlScheme:
     def build_a_rows(
         self,
         rows: torch.Tensor,
-        noise_a: OperandNoiser,
-        noise_b: OperandNoiser,
+        noise: Noiser,
         row_indices: list[int],
         row_norms: RowNorms,
     ) -> StackedRows:
         """``row_indices`` are the GLOBAL noise-line addresses of ``rows`` (for a
         gathered MoE activation: the pre-routing token indices, giving
-        noise-once across experts)."""
+        noise-once across experts). ``noise`` must carry seedA (``E_A``)."""
         assert rows.shape[1] == self.k, "A rows must have width k"
         assert len(row_indices) == rows.shape[0], "one row index per A row"
-        e_a = noise_a.E(row_indices)  # (m x r) FP8
-        f_a = noise_a.F()  # (r x k) FP8
-        f_b = noise_b.F()  # (r x k) FP8
+        e_a = noise.E_A(row_indices)  # (m x r) FP8
+        f_a = noise.F_A()  # (r x k) FP8
+        f_b = noise.F_B()  # (r x k) FP8
 
         a_prime, alpha_a, beta_a, l2_a = self.quant.noisy_quantize(
             rows, e_a, f_a, self.hw, row_norms
@@ -83,18 +82,18 @@ class PearlScheme:
     def build_b_rows(
         self,
         rows: torch.Tensor,
-        noise_a: OperandNoiser,
-        noise_b: OperandNoiser,
+        noise: Noiser,
         row_indices: list[int],
         row_norms: RowNorms,
     ) -> StackedRows:
         """``row_indices`` are the GLOBAL noise-line addresses of ``rows`` (for
-        the stacked MoE weight: ``w * n_e + j``, giving per-expert lines)."""
+        the stacked MoE weight: ``w * n_e + j``, giving per-expert lines).
+        Reads only seedB-keyed factors, so ``noise`` needs no seedA."""
         assert rows.shape[1] == self.k, "B rows must have width k"
         assert len(row_indices) == rows.shape[0], "one row index per B row"
-        e_b = noise_b.E(row_indices)  # (n x r) FP8
-        f_a = noise_a.F()  # (r x k) FP8
-        f_b = noise_b.F()  # (r x k) FP8
+        e_b = noise.E_B(row_indices)  # (n x r) FP8
+        f_a = noise.F_A()  # (r x k) FP8
+        f_b = noise.F_B()  # (r x k) FP8
 
         b_prime, alpha_b, beta_b, l2_b = self.quant.noisy_quantize(
             rows, e_b, f_b, self.hw, row_norms

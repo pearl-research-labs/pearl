@@ -52,7 +52,7 @@ def test_pre_quant_rejects_misaligned_assumed_buffer():
 
 
 def _fake_noise_lines(k: int) -> torch.Tensor:
-    """Noise-line-like e4m3 values (+-[0.5, ~200], the OperandNoiser's range)."""
+    """Noise-line-like e4m3 values (+-[0.5, ~200], the reference ``Noiser``'s range)."""
     magnitudes = torch.rand(R, k, device="cuda") * 200 + 0.5
     signs = torch.randint(0, 2, (R, k), device="cuda") * 2 - 1
     return (magnitudes * signs).to(torch.float8_e4m3fn)

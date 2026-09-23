@@ -7,18 +7,19 @@ path:
 
 * ``keyA``/``keyB`` (from the header), ``HB``, ``noise seedB`` (from ``HB``,
   ``keyB`` and the committed ``pB``),
-* B's noise factors ``E_B`` (n x r), ``F_B`` (r x k) -- both drawn from
-  ``seedB``,
+* the noise factors keyed by ``seedB``: ``E_B`` (n x r), ``F_B`` (r x k) and
+  ``F_A`` (r x k; the ``Side.A`` address under the same key),
 * the noised quantized operand ``B'`` (n x k, FP8) with its per-row scales,
-* the ``-(beta_B (.) E_B)`` half of the peel.
+* the complete peel ``[ (beta_B (.) E_B@F_B - B') @ F_A^T | -(beta_B (.) E_B) ]``.
 
-v4 draws ``F_A`` from ``noise seedA``, which depends on A's commitment, so the
-mid half of B's peel ``(beta_B (.) E_B@F_B - B') @ F_A^T`` is per-A: see
-:meth:`MinerContext.b_peel_for` (the kernel-side product).
+Nothing on the B side depends on A: ``E_A`` is the only factor keyed by
+``noise seedA``, and ``build_b_rows`` never reads it, so the reference
+``Noiser`` here is built from ``seedB`` alone.
 
-Fidelity: operand construction uses the protocol ``Fp8QuantScheme`` ops --
-plain device-agnostic torch -- executed on GPU tensors via a small adapter
-that moves the ``OperandNoiser``'s CPU-generated factor lines onto the device.
+Fidelity: the operand construction runs the *reference miner code itself*
+(``PearlScheme.build_b_rows`` / ``Fp8QuantScheme``) -- the reference ops are plain
+device-agnostic torch, so we execute them on GPU tensors via a small adapter
+that moves the ``Noiser``'s CPU-generated factor lines onto the device.
 """
 
 from dataclasses import dataclass
@@ -33,15 +34,14 @@ from miner_base.commitment import (
     commitment_keys,
 )
 from miner_base.commitment_hash import noise_line_key, noise_seed_b
-from miner_base.compute_ops import DType
 from miner_base.hardware import Hardware, hardware_for
 from miner_base.mining_config import default_mining_config, tall_tile_mining_config
-from miner_base.noise import OperandNoiser, Side
+from miner_base.noise import Noiser
 from miner_base.policy import effective_work
 from miner_base.prequant import RowNorms, round_l2_to_grid
 from miner_base.quantization import Fp8QuantScheme
+from miner_base.scheme import PearlScheme, StackedRows
 
-from pearl_gemm import b_peel_for_a
 from pearl_gemm.protocol_constants import R
 
 # Grid/subtile lottery layout: each subtile is exactly one thread's
@@ -96,17 +96,23 @@ def default_header(nbits: int = 0x1D3FFFFF, timestamp: int = 1_700_000_000) -> B
 
 
 class _DeviceNoiser:
-    """Adapter: reference ``OperandNoiser`` whose factor tensors land on ``device``."""
+    """Adapter: reference ``Noiser`` whose factor tensors land on ``device``."""
 
-    def __init__(self, noiser: OperandNoiser, device: torch.device):
+    def __init__(self, noiser: Noiser, device: torch.device):
         self._noiser = noiser
         self._device = device
 
-    def E(self, line_indices):
-        return self._noiser.E(line_indices).to(self._device)
+    def E_A(self, row_indices):
+        return self._noiser.E_A(row_indices).to(self._device)
 
-    def F(self):
-        return self._noiser.F().to(self._device)
+    def F_A(self):
+        return self._noiser.F_A().to(self._device)
+
+    def E_B(self, row_indices):
+        return self._noiser.E_B(row_indices).to(self._device)
+
+    def F_B(self):
+        return self._noiser.F_B().to(self._device)
 
 
 @dataclass
@@ -122,12 +128,13 @@ class MinerContext:
 
     key_a: bytes  # keyA: A's opening key (header-derived)
     key_b: bytes  # keyB: B's opening key (header-derived)
-    seed_b: bytes  # noise seedB (B's F basis / E lines; the B-side stamp)
+    seed_b: bytes  # noise seedB (both F bases / B's E lines; the B-side stamp)
 
     e2: torch.Tensor  # (n x r) FP8, on GPU: E_B
+    f1: torch.Tensor  # (r x k) FP8, on GPU: F_A (keyed by seedB, Side.A address)
     f2: torch.Tensor  # (r x k) FP8, on GPU: F_B
     b_prime: torch.Tensor  # (n x k) FP8, on GPU
-    b_peel: torch.Tensor  # (n x 2r) BF16, on GPU: [ 0 | -(beta_B (.) E_B) ] (mid is per-A)
+    b_peel: torch.Tensor  # (n x 2r) BF16, on GPU: the complete job-constant peel
     alpha_b: torch.Tensor  # (n x 1) BF16, on GPU
     beta_b: torch.Tensor  # (n x 1) BF16, on GPU
     l2_b: torch.Tensor  # (n x 1) BF16, on GPU: floored row rms the scales came from
@@ -138,18 +145,13 @@ class MinerContext:
     def noise_key_b(self) -> bytes:
         return noise_line_key(self.seed_b)
 
-    def noise_b(self) -> OperandNoiser:
-        return OperandNoiser(self.seed_b, Side.B, self.r, self.k, self.hardware.compute)
+    def noise(self, seed_a: bytes | None = None) -> Noiser:
+        """The job's reference noise factors; ``seed_a`` unlocks ``E_A``."""
+        return Noiser(self.seed_b, self.r, self.k, self.hardware.compute, seed_a=seed_a)
 
-    def noise_a(self, seed_a: bytes) -> OperandNoiser:
-        return OperandNoiser(seed_a, Side.A, self.r, self.k, self.hardware.compute)
-
-    def b_peel_for(self, f1_lines: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-        """The complete ``(n x 2r)`` peel for one A's ``(k x r)`` ``F_A`` draw
-        (``noise_lines`` layout), through the kernel-side ``b_peel_for_a``."""
-        return b_peel_for_a(
-            self.b_prime, self.e2, self.f2, self.beta_b, self.b_peel, f1_lines, out=out
-        )
+    def reference_b_rows(self, b: torch.Tensor) -> StackedRows:
+        """``build_b_rows`` (the reference ops, on ``b``'s device)."""
+        return _reference_b_rows(b, self.seed_b, self.r, self.hardware)
 
     def threshold_for(self) -> int:
         """Lottery threshold ``min(target * work, 2^256-1)`` for the merged tile."""
@@ -160,6 +162,14 @@ class MinerContext:
 
     def threshold_bytes(self) -> bytes:
         return self.threshold_for().to_bytes(32, "little")
+
+
+def _reference_b_rows(b: torch.Tensor, seed_b: bytes, r: int, hardware: Hardware) -> StackedRows:
+    """``build_b_rows`` over ``b`` on its own device, from ``seedB`` alone."""
+    n, k = b.shape
+    scheme = PearlScheme(hardware, Fp8QuantScheme(), k, r)
+    noise = _DeviceNoiser(Noiser(seed_b, r, k, hardware.compute), b.device)
+    return scheme.build_b_rows(b, noise, list(range(n)), _row_norms(b))
 
 
 def preprocess(
@@ -185,20 +195,18 @@ def preprocess(
     seed_b = noise_seed_b(digest_b, key_b, config.p_b(n))
 
     hardware = hardware_for(config.device)
-    quant = Fp8QuantScheme()
-    noise_b = _DeviceNoiser(OperandNoiser(seed_b, Side.B, r, k, hardware.compute), device)
+    noise = _DeviceNoiser(Noiser(seed_b, r, k, hardware.compute), device)
+    f_a = noise.F_A()
 
     B_dev = B.to(device)
     # B is a raw BF16 research operand, so its norms reduce over the rows
-    # themselves (no int8 blocks to take them off). This is build_b_rows'
-    # A-independent prefix: quantize, then the exact -(beta (.) E_B) half.
-    e_b = noise_b.E(list(range(n)))
-    f_b = noise_b.F()
-    b_prime, alpha_b, beta_b, l2_b = quant.noisy_quantize(
-        B_dev, e_b, f_b, hardware, _row_norms(B_dev)
-    )
-    b_peel = torch.zeros(n, 2 * r, dtype=torch.bfloat16, device=device)
-    b_peel[:, r:] = -hardware.compute.mul(beta_b, hardware.cast_to_peel(e_b, DType.FACTOR))
+    # themselves (no int8 blocks to take them off). The whole B side is
+    # job-constant, so build_b_rows runs to completion here; beta_b is not
+    # carried on the built rows and comes back from the quant step.
+    e_b = noise.E_B(list(range(n)))
+    f_b = noise.F_B()
+    stacked = _reference_b_rows(B_dev, seed_b, r, hardware)
+    _, _, beta_b, _ = Fp8QuantScheme().noisy_quantize(B_dev, e_b, f_b, hardware, _row_norms(B_dev))
 
     return MinerContext(
         config=config,
@@ -211,11 +219,12 @@ def preprocess(
         key_b=key_b,
         seed_b=seed_b,
         e2=e_b.contiguous(),
+        f1=f_a.contiguous(),
         f2=f_b.contiguous(),
-        b_prime=b_prime.contiguous(),
-        b_peel=b_peel,
-        alpha_b=alpha_b.contiguous(),
+        b_prime=stacked.quant_part.contiguous(),
+        b_peel=stacked.peel_part.contiguous(),
+        alpha_b=stacked.alpha.contiguous(),
         beta_b=beta_b.contiguous(),
-        l2_b=l2_b.contiguous(),
+        l2_b=stacked.l2.contiguous(),
         target=bits_to_target(header.nbits),
     )
