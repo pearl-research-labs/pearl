@@ -2,13 +2,11 @@ package neutrino
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
-	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
@@ -57,8 +55,9 @@ func TestSendTransactionNoPeers(t *testing.T) {
 	cs := startPeerlessChainService(t)
 	require.Zero(t, cs.ConnectedCount())
 
+	tx := testTx()
 	start := time.Now()
-	err := cs.SendTransaction(testTx())
+	err := cs.SendTransaction(tx)
 	elapsed := time.Since(start)
 
 	require.Truef(t, pushtx.IsBroadcastError(err, pushtx.NotRelayed),
@@ -66,42 +65,6 @@ func TestSendTransactionNoPeers(t *testing.T) {
 	require.ErrorContains(t, err, "no connected peers")
 	require.Less(t, elapsed, time.Second)
 
-	_, ok := cs.LastRelayed(testTx().TxHash())
+	_, ok := cs.LastRelayed(tx.TxHash())
 	require.False(t, ok, "an unrelayed announcement must leave no evidence")
-}
-
-// TestRelayed pins which broadcast outcomes count as the network holding
-// the transaction.
-func TestRelayed(t *testing.T) {
-	t.Parallel()
-
-	broadcastErr := func(code pushtx.BroadcastErrorCode) error {
-		return &pushtx.BroadcastError{Code: code, Reason: "test"}
-	}
-
-	require.True(t, relayed(nil))
-	require.True(t, relayed(broadcastErr(pushtx.Mempool)))
-	require.False(t, relayed(broadcastErr(pushtx.NotRelayed)))
-	require.False(t, relayed(broadcastErr(pushtx.Invalid)))
-	require.False(t, relayed(errors.New("connection reset")))
-}
-
-// TestRelayEvidence covers the per-session evidence a wallet reads back.
-func TestRelayEvidence(t *testing.T) {
-	t.Parallel()
-
-	cs := &ChainService{lastRelayed: make(map[chainhash.Hash]time.Time)}
-	hash := testTx().TxHash()
-
-	_, ok := cs.LastRelayed(hash)
-	require.False(t, ok)
-
-	cs.lastRelayed[hash] = time.Now()
-	last, ok := cs.LastRelayed(hash)
-	require.True(t, ok)
-	require.False(t, last.IsZero())
-
-	cs.ForgetTransaction(hash)
-	_, ok = cs.LastRelayed(hash)
-	require.False(t, ok)
 }

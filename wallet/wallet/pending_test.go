@@ -1,11 +1,11 @@
 package wallet
 
 import (
-	"bytes"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
@@ -17,8 +17,7 @@ import (
 )
 
 // trackingChainClient is a mock backend that also keeps relay evidence, the
-// way the SPV backend does. Existing tests keep using the plain mock so they
-// exercise the "backend offers no evidence" path.
+// way the SPV backend does.
 type trackingChainClient struct {
 	mockChainClient
 
@@ -145,7 +144,6 @@ func TestRemoveTransaction(t *testing.T) {
 	t.Run("works without relay tracking", func(t *testing.T) {
 		w, cleanup := testWallet(t)
 		t.Cleanup(cleanup)
-		w.chainClient = &mockChainClient{}
 		fundingOut := fundWallet(t, w, 100_000)
 		tx := sendTo(t, w, 50_000, 1)
 
@@ -283,44 +281,24 @@ func TestRelayStatusInListings(t *testing.T) {
 		w, client, fundingOut, parent, _ := pendingChain(t)
 		client.ForgetTransaction(parent.TxHash())
 
-		results, err := w.ListAllTransactions()
-		require.NoError(t, err)
-
-		byTxid := make(map[string][]*bool)
-		lastRelay := make(map[string]int64)
-		for i := range results {
-			r := &results[i]
-			byTxid[r.TxID] = append(byTxid[r.TxID], r.Relayed)
-			lastRelay[r.TxID] = r.LastRelayTime
+		for _, r := range entriesFor(t, w, fundingOut.Hash) {
+			require.Nil(t, r.Relayed, "confirmed txs carry no relay status")
 		}
-
-		for _, relayed := range byTxid[fundingOut.Hash.String()] {
-			require.Nil(t, relayed, "confirmed txs carry no relay status")
+		for _, r := range entriesFor(t, w, parent.TxHash()) {
+			require.NotNil(t, r.Relayed)
+			require.False(t, *r.Relayed)
+			require.Zero(t, r.LastRelayTime)
 		}
-		for _, relayed := range byTxid[parent.TxHash().String()] {
-			require.NotNil(t, relayed)
-			require.False(t, *relayed)
-		}
-		require.Zero(t, lastRelay[parent.TxHash().String()])
 	})
 
 	t.Run("relayed transaction carries the time", func(t *testing.T) {
 		w, _, _, _, child := pendingChain(t)
 
-		results, err := w.ListAllTransactions()
-		require.NoError(t, err)
-
-		var seen bool
-		for _, r := range results {
-			if r.TxID != child.TxHash().String() {
-				continue
-			}
-			seen = true
+		for _, r := range entriesFor(t, w, child.TxHash()) {
 			require.NotNil(t, r.Relayed)
 			require.True(t, *r.Relayed)
 			require.NotZero(t, r.LastRelayTime)
 		}
-		require.True(t, seen)
 	})
 
 	t.Run("incoming receive has no relay status", func(t *testing.T) {
@@ -330,39 +308,44 @@ func TestRelayStatusInListings(t *testing.T) {
 
 		hash := addUnminedIncoming(t, w, 40_000)
 
-		results, err := w.ListAllTransactions()
-		require.NoError(t, err)
-
-		var seen bool
-		for _, r := range results {
-			if r.TxID != hash.String() {
-				continue
-			}
-			seen = true
+		for _, r := range entriesFor(t, w, hash) {
 			require.Equal(t, "receive", r.Category)
 			require.Nil(t, r.Relayed, "incoming txs carry no relay status")
 			require.Zero(t, r.LastRelayTime)
 		}
-		require.True(t, seen)
 	})
 
 	t.Run("non-tracking backend omits the fields", func(t *testing.T) {
 		w, cleanup := testWallet(t)
 		t.Cleanup(cleanup)
-		w.chainClient = &mockChainClient{}
 		fundWallet(t, w, 100_000)
 		tx := sendTo(t, w, 50_000, 1)
 
-		results, err := w.ListAllTransactions()
-		require.NoError(t, err)
-		for _, r := range results {
+		for _, r := range entriesFor(t, w, tx.TxHash()) {
 			require.Nil(t, r.Relayed)
 			require.Zero(t, r.LastRelayTime)
 		}
-
-		_, _, ok := w.RelayStatus(tx.TxHash())
-		require.False(t, ok)
 	})
+}
+
+// entriesFor returns the listing entries of txHash, failing if there are none.
+func entriesFor(t *testing.T, w *Wallet,
+	txHash chainhash.Hash) []btcjson.ListTransactionsResult {
+
+	t.Helper()
+
+	results, err := w.ListAllTransactions()
+	require.NoError(t, err)
+
+	var entries []btcjson.ListTransactionsResult
+	for _, r := range results {
+		if r.TxID == txHash.String() {
+			entries = append(entries, r)
+		}
+	}
+	require.NotEmpty(t, entries)
+
+	return entries
 }
 
 // addUnminedIncoming credits the wallet with an unconfirmed receive it did
@@ -382,9 +365,7 @@ func addUnminedIncoming(t *testing.T, w *Wallet, value int64) chainhash.Hash {
 		TxOut: []*wire.TxOut{wire.NewTxOut(value, pkScript)},
 	}
 
-	var buf bytes.Buffer
-	require.NoError(t, incoming.Serialize(&buf))
-	rec, err := wtxmgr.NewTxRecord(buf.Bytes(), time.Now())
+	rec, err := wtxmgr.NewTxRecordFromMsgTx(incoming, time.Now())
 	require.NoError(t, err)
 
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {

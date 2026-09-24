@@ -3,7 +3,7 @@ package wallet
 import (
 	"errors"
 	"fmt"
-	"time"
+	"slices"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
@@ -16,22 +16,24 @@ import (
 // pending transaction is asked of one that is already mined.
 var ErrTxConfirmed = errors.New("transaction is already confirmed")
 
-// RelayStatus reports the chain backend's evidence on whether the network
-// took the pending transaction txHash: relayed is true if a peer requested it
-// after an announcement made in this daemon session, and last is when. It
-// therefore reads false for "not announced since start", not for "the
-// network lacks it". ok is false when the backend keeps no such evidence, as
-// a full node's own mempool answers the question and nothing should be shown.
-func (w *Wallet) RelayStatus(txHash chainhash.Hash) (relayed bool,
-	last time.Time, ok bool) {
-
+// RelayFields returns the relayed and lastrelaytime listing fields for
+// details. Only an unconfirmed send gets them, and only from a backend that
+// keeps relay evidence: this daemon never announced an incoming payment, so
+// relayed=false there would read as "stuck" rather than "received, unmined".
+func (w *Wallet) RelayFields(details *wtxmgr.TxDetails) (*bool, int64) {
+	if details.Block.Height != -1 || len(details.Debits) == 0 {
+		return nil, 0
+	}
 	tracker, ok := w.ChainClient().(chain.BroadcastTracker)
 	if !ok {
-		return false, time.Time{}, false
+		return nil, 0
 	}
 
-	last, relayed = tracker.LastRelayed(txHash)
-	return relayed, last, true
+	last, relayed := tracker.LastRelayed(details.Hash)
+	if !relayed {
+		return &relayed, 0
+	}
+	return &relayed, last.Unix()
 }
 
 // pendingTxDetails loads txHash and rejects anything that is not a pending
@@ -158,35 +160,23 @@ func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) (
 // unminedAncestry returns the transaction txHash preceded by every
 // transaction in unmined that it spends from, directly or through other
 // unmined transactions. unmined must be in dependency order, as
-// TxStore.UnminedTxs guarantees, so filtering it preserves that order.
+// TxStore.UnminedTxs guarantees: walked backwards, every child comes before
+// its parents.
 func unminedAncestry(txHash chainhash.Hash,
 	unmined []*wire.MsgTx) []*wire.MsgTx {
 
-	byHash := make(map[chainhash.Hash]*wire.MsgTx, len(unmined))
-	for _, tx := range unmined {
-		byHash[tx.TxHash()] = tx
-	}
-
 	wanted := map[chainhash.Hash]bool{txHash: true}
-	for queue := []chainhash.Hash{txHash}; len(queue) > 0; queue = queue[1:] {
-		tx := byHash[queue[0]]
-		if tx == nil {
+	var ancestry []*wire.MsgTx
+	for _, tx := range slices.Backward(unmined) {
+		if !wanted[tx.TxHash()] {
 			continue
 		}
+		ancestry = append(ancestry, tx)
 		for _, txIn := range tx.TxIn {
-			parent := txIn.PreviousOutPoint.Hash
-			if _, pending := byHash[parent]; pending && !wanted[parent] {
-				wanted[parent] = true
-				queue = append(queue, parent)
-			}
+			wanted[txIn.PreviousOutPoint.Hash] = true
 		}
 	}
+	slices.Reverse(ancestry)
 
-	var ancestry []*wire.MsgTx
-	for _, tx := range unmined {
-		if wanted[tx.TxHash()] {
-			ancestry = append(ancestry, tx)
-		}
-	}
 	return ancestry
 }

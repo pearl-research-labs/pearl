@@ -386,7 +386,6 @@ func getSyncProgress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	}, nil
 }
 
-// decodeTxHash parses a txid parameter.
 func decodeTxHash(txID string) (*chainhash.Hash, error) {
 	txHash, err := chainhash.NewHashFromStr(txID)
 	if err != nil {
@@ -398,9 +397,14 @@ func decodeTxHash(txID string) (*chainhash.Hash, error) {
 	return txHash, nil
 }
 
+// internalError reports a broadcast failure. Clients recognize a not-relayed
+// verdict by its message, so sends and rebroadcasts must report it the same
+// way.
+func internalError(err error) *btcjson.RPCError {
+	return &btcjson.RPCError{Code: btcjson.ErrRPCInternal.Code, Message: err.Error()}
+}
+
 // pendingTxError maps the wallet's pending-transaction errors to RPC errors.
-// Anything else, including a not-relayed verdict, becomes an internal error
-// carrying the reason, the same as sendmany reports it.
 func pendingTxError(err error) error {
 	switch {
 	case errors.Is(err, wallet.ErrNoTx):
@@ -408,10 +412,7 @@ func pendingTxError(err error) error {
 	case errors.Is(err, wallet.ErrTxConfirmed):
 		return InvalidParameterError{err}
 	default:
-		return &btcjson.RPCError{
-			Code:    btcjson.ErrRPCInternal.Code,
-			Message: err.Error(),
-		}
+		return internalError(err)
 	}
 }
 
@@ -823,15 +824,8 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		ret.BlockHash = details.Block.Hash.String()
 		ret.BlockTime = details.Block.Time.Unix()
 		ret.Confirmations = int64(confirms(details.Block.Height, syncBlock.Height))
-	} else if len(details.Debits) != 0 {
-		// Incoming 0-conf was never announced by this wallet.
-		if relayed, last, ok := w.RelayStatus(*txHash); ok {
-			ret.Relayed = &relayed
-			if relayed {
-				ret.LastRelayTime = last.Unix()
-			}
-		}
 	}
+	ret.Relayed, ret.LastRelayTime = w.RelayFields(details)
 
 	var (
 		debitTotal  btcutil.Amount
@@ -1398,10 +1392,7 @@ func sendPairs(w *wallet.Wallet, amounts map[string]btcutil.Amount,
 			return "", err
 		}
 
-		return "", &btcjson.RPCError{
-			Code:    btcjson.ErrRPCInternal.Code,
-			Message: err.Error(),
-		}
+		return "", internalError(err)
 	}
 
 	txHashStr := tx.TxHash().String()

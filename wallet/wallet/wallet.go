@@ -2214,33 +2214,23 @@ func (w *Wallet) listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails,
 		blockHashStr  string
 		blockTime     int64
 		confirmations int64
-		relayed       *bool
-		lastRelayTime int64
 	)
-	// Relay evidence is only meaningful for a send this wallet announced.
-	// An incoming 0-conf was never published from this daemon, so
-	// Relayed=false would read as "stuck" rather than "received, unmined".
-	send := len(details.Debits) != 0
 	if details.Block.Height != -1 {
 		blockHashStr = details.Block.Hash.String()
 		blockTime = details.Block.Time.Unix()
 		confirmations = int64(
 			calcConf(details.Block.Height, syncHeight),
 		)
-	} else if send {
-		if isRelayed, last, ok := w.RelayStatus(details.Hash); ok {
-			relayed = &isRelayed
-			if isRelayed {
-				lastRelayTime = last.Unix()
-			}
-		}
 	}
+	relayed, lastRelayTime := w.RelayFields(details)
 
 	results := []btcjson.ListTransactionsResult{}
 	txHashStr := details.Hash.String()
 	received := details.Received.Unix()
 	generated := blockchain.IsCoinBaseTx(&details.MsgTx)
 	recvCat := RecvCategory(details, syncHeight, net).String()
+
+	send := len(details.Debits) != 0
 
 	// Fee can only be determined if every input is a debit.
 	var feeF64 float64
@@ -3910,8 +3900,8 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 	return nil, rpcErr
 }
 
-// removeUnminedTx forgets an unconfirmed transaction the backend will never
-// mine, so the inputs it spent become spendable again.
+// removeUnminedTx also drops every unmined transaction spending from tx, since
+// RemoveUnminedTx recurses.
 func (w *Wallet) removeUnminedTx(tx *wire.MsgTx) error {
 	return walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
 		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
@@ -3941,16 +3931,7 @@ func (w *Wallet) Database() walletdb.DB {
 // transaction. This remove propagates recursively down the chain of descendent
 // transactions.
 func (w *Wallet) RemoveDescendants(tx *wire.MsgTx) error {
-	txRecord, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
-	if err != nil {
-		return err
-	}
-
-	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		wtxmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-		return w.TxStore.RemoveUnminedTx(wtxmgrNs, txRecord)
-	})
+	return w.removeUnminedTx(tx)
 }
 
 // BirthdayBlock returns the birthday block of the wallet.

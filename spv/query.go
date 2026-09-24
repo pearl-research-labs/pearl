@@ -959,19 +959,6 @@ func newTransactionInv(tx *wire.MsgTx) *wire.MsgInv {
 	return inv
 }
 
-// notRelayedError is safe to treat as "nothing was sent": an inv carries only
-// the txid, so no peer received anything that could confirm.
-func notRelayedError(txHash chainhash.Hash, numPeers int) error {
-	reason := fmt.Sprintf("no connected peers to relay transaction %v",
-		txHash)
-	if numPeers > 0 {
-		reason = fmt.Sprintf("none of %d connected peers requested "+
-			"transaction %v", numPeers, txHash)
-	}
-
-	return &pushtx.BroadcastError{Code: pushtx.NotRelayed, Reason: reason}
-}
-
 // sendTransaction sends a transaction to all peers. It returns an error if any
 // peer rejects the transaction, or a pushtx.NotRelayed error if no peer asked
 // for it.
@@ -988,11 +975,6 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 	// any getdata messages for the transaction.
 	qo := defaultQueryOptions()
 	qo.applyQueryOptions(options...)
-
-	numPeers := len(s.Peers())
-	if numPeers == 0 {
-		return notRelayedError(tx.TxHash(), numPeers)
-	}
 
 	// Announce the transaction by txid. A peer can request its preferred
 	// serialization in getdata, which we answer using qo.encoding below.
@@ -1091,10 +1073,19 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 		)...,
 	)
 
+	// Nothing re-announces the transaction later, so a silent network must
+	// surface as NotRelayed rather than as success.
 	if len(replies) == 0 {
 		log.Debugf("No peers replied to inv message for transaction %v",
 			txHash)
-		return notRelayedError(txHash, numPeers)
+
+		reason := fmt.Sprintf("no connected peers to relay transaction %v",
+			txHash)
+		if n := s.ConnectedCount(); n > 0 {
+			reason = fmt.Sprintf("none of %d connected peers requested "+
+				"transaction %v", n, txHash)
+		}
+		return &pushtx.BroadcastError{Code: pushtx.NotRelayed, Reason: reason}
 	}
 
 	// firstRejectWithCode returns the first reject error that we have for

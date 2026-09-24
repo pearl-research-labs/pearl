@@ -1520,7 +1520,9 @@ func disconnectPeer(peerList map[int32]*ServerPeer,
 func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 	// TODO(roasbeef): pipe through querying interface
 	err := s.sendTransaction(tx)
-	if !relayed(err) {
+	// A Mempool reject means a peer already holds the transaction, which is
+	// as good as a request; any other error is evidence of nothing.
+	if err != nil && !pushtx.IsBroadcastError(err, pushtx.Mempool) {
 		return err
 	}
 
@@ -1529,14 +1531,6 @@ func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 	s.relayMu.Unlock()
 
 	return nil
-}
-
-// relayed reports whether a broadcast result means the network holds the
-// transaction: either a peer requested it, or peers rejected it as already
-// in their mempool. Every other outcome, including NotRelayed, is evidence
-// of nothing.
-func relayed(err error) bool {
-	return err == nil || pushtx.IsBroadcastError(err, pushtx.Mempool)
 }
 
 // LastRelayed reports when a peer last requested txHash after an announcement
