@@ -153,7 +153,7 @@ To run the full stack with Docker:
 ```bash
 docker buildx build -t vllm_miner . -f miner/vllm-miner/Dockerfile
 
-docker run --rm -it --gpus all --network host \
+docker run --rm -it --gpus all 
   -e PEARLD_RPC_URL=http://localhost:44107 \
   -e PEARLD_RPC_USER=rpcuser \
   -e PEARLD_RPC_PASSWORD=rpcpass \
