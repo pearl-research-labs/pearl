@@ -155,6 +155,12 @@ type GetTransactionResult struct {
 	TimeReceived    int64                         `json:"timereceived"`
 	Details         []GetTransactionDetailsResult `json:"details"`
 	Hex             string                        `json:"hex"`
+
+	// Relayed and LastRelayTime are present only for an unconfirmed send on a backend that keeps relay evidence (SPV).
+	// Incoming 0-conf payments omit them. Relayed false means no peer requested the transaction after an announcement
+	// made in the current daemon session, not that the network lacks it.
+	Relayed       *bool `json:"relayed,omitempty"`
+	LastRelayTime int64 `json:"lastrelaytime,omitempty"`
 }
 
 type ScanningOrFalse struct {
@@ -255,6 +261,10 @@ type ListTransactionsResult struct {
 	WalletConflicts   []string `json:"walletconflicts"`
 	Comment           string   `json:"comment,omitempty"`
 	OtherAccount      string   `json:"otheraccount,omitempty"`
+
+	// Relayed and LastRelayTime follow the same rules as on GetTransactionResult.
+	Relayed       *bool `json:"relayed,omitempty"`
+	LastRelayTime int64 `json:"lastrelaytime,omitempty"`
 }
 
 // ListReceivedByAccountResult models the data from the listreceivedbyaccount
@@ -349,7 +359,20 @@ type GetSyncProgressResult struct {
 	FilterHeaderHeight int32 `json:"filter_header_height"`
 	BlockHeight        int32 `json:"block_height"`
 	BestPeerHeight     int32 `json:"best_peer_height"`
+	Connections        int32 `json:"connections"`
 	Synced             bool  `json:"synced"`
+}
+
+// RemoveTransactionResult models the data from the removetransaction command.
+type RemoveTransactionResult struct {
+	// Removed lists the requested transaction first, then every pending transaction that spent from it.
+	Removed []string `json:"removed"`
+}
+
+// RebroadcastTransactionResult models the data from the rebroadcasttransaction command.
+type RebroadcastTransactionResult struct {
+	// Announced lists the hashes a peer requested, pending ancestors first and the requested transaction last.
+	Announced []string `json:"announced"`
 }
 
 // BalanceDetailsResult models the details data from the `getbalances` command.

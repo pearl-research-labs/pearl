@@ -76,6 +76,42 @@ func fmtConfs(confs int64) string {
 	return fmt.Sprintf("%d conf", confs)
 }
 
+// fmtPeerCount renders the SPV peer count, flagging zero because nothing can be sent without a peer.
+func fmtPeerCount(peers int32) string {
+	if peers == 0 {
+		return "0 (cannot send: no peers)"
+	}
+	return fmt.Sprintf("%d", peers)
+}
+
+// fmtAgo renders how long ago a unix timestamp was, coarsely.
+func fmtAgo(unix int64, now time.Time) string {
+	d := now.Sub(time.Unix(unix, 0))
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
+// relayLabel describes the network's take on a pending transaction from the relay fields of a listing entry. The daemon
+// omits them on a full-node backend, and for confirmed transactions, where there is nothing to say.
+func relayLabel(relayed *bool, lastRelayTime int64, now time.Time) string {
+	switch {
+	case relayed == nil:
+		return ""
+	case *relayed:
+		return "relayed " + fmtAgo(lastRelayTime, now)
+	default:
+		return "not announced since start"
+	}
+}
+
 // syncPercent formats sync progress as a percentage of the best known peer
 // height, falling back to raw heights when peers haven't reported yet. The
 // value is truncated (not rounded) to one decimal so it never displays

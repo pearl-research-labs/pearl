@@ -41,6 +41,12 @@ interface WalletApi {
 
   sendFromDefaultAccount: (toAddress: string, amount: number, feeRate: number) => Promise<string>;
 
+  // Never call without the user's explicit confirmation: a peer may already
+  // hold the transaction, so spending its freed inputs is a double spend.
+  removeTransaction: (txid: string) => Promise<string[]>;
+
+  rebroadcastTransaction: (txid: string) => Promise<string[]>;
+
   listAllTransactions: () => Promise<Transaction[]>;
 
   listTransactions: (count?: number, from?: number) => Promise<Transaction[]>;

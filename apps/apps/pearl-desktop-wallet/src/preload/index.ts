@@ -31,6 +31,8 @@ const walletIpc: Ipc<WalletApi> = {
     ipcRenderer.invoke('wallet-change-password', currentPassword, newPassword),
   sendFromDefaultAccount: (toAddress: string, amount: number, feeRate: number) =>
     ipcRenderer.invoke('wallet-send-from-default-account', toAddress, amount, feeRate),
+  removeTransaction: txid => ipcRenderer.invoke('wallet-remove-transaction', txid),
+  rebroadcastTransaction: txid => ipcRenderer.invoke('wallet-rebroadcast-transaction', txid),
   listAllTransactions: () => ipcRenderer.invoke('wallet-list-all-transactions'),
   listTransactions: (count, from) => ipcRenderer.invoke('wallet-list-transactions', count, from),
   getBalance: (account, minconf) => ipcRenderer.invoke('wallet-get-balance', account, minconf),

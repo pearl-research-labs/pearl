@@ -23,10 +23,12 @@ type NeutrinoChainService interface {
 	BlockHeaderTipHeight() (int32, error)
 	FilterHeaderTipHeight() (int32, error)
 	BestPeerHeight() int32
+	ConnectedCount() int32
 	GetBlockHash(int64) (*chainhash.Hash, error)
 	GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader, error)
 	IsCurrent() bool
 	SendTransaction(*wire.MsgTx) error
+	BroadcastTracker
 	GetCFilter(chainhash.Hash, wire.FilterType,
 		...neutrino.QueryOption) (*gcs.Filter, error)
 	GetUtxo(...neutrino.RescanOption) (*neutrino.SpendReport, error)

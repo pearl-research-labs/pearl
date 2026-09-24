@@ -66,6 +66,9 @@ var (
 	// BanDuration is the duration of a ban.
 	BanDuration = time.Hour * 24
 
+	// DefaultBroadcastTimeout is the default timeout used when broadcasting transactions to network peers.
+	DefaultBroadcastTimeout = 5 * time.Second
+
 	// TargetOutbound is the number of outbound peers to target.
 	TargetOutbound = 8
 
@@ -656,7 +659,6 @@ type ChainService struct { // nolint:maligned
 	timeSource           blockchain.MedianTimeSource
 	services             wire.ServiceFlag
 	utxoScanner          *UtxoScanner
-	broadcaster          *pushtx.Broadcaster
 	banStore             banman.Store
 	workManager          query.WorkManager
 	filterBatchWriter    *chanutils.BatchWriter[*filterdb.FilterData]
@@ -675,6 +677,12 @@ type ChainService struct { // nolint:maligned
 	dialer       func(net.Addr) (net.Conn, error)
 
 	broadcastTimeout time.Duration
+
+	// lastRelayed records when a peer last took each transaction this process announced. An SPV node cannot see
+	// mempools, so this is the only evidence it has that the network holds a pending transaction; it lives for the
+	// session only and is dropped once the transaction confirms or the wallet removes it.
+	relayMu     sync.Mutex
+	lastRelayed map[chainhash.Hash]time.Time
 }
 
 // NewChainService returns a new chain service configured to connect to the
@@ -683,7 +691,7 @@ type ChainService struct { // nolint:maligned
 func NewChainService(cfg Config) (*ChainService, error) {
 	// Use the default broadcast timeout if one isn't provided.
 	if cfg.BroadcastTimeout == 0 {
-		cfg.BroadcastTimeout = pushtx.DefaultBroadcastTimeout
+		cfg.BroadcastTimeout = DefaultBroadcastTimeout
 	}
 
 	// First, we'll sort out the methods that we'll use to established
@@ -734,6 +742,7 @@ func NewChainService(cfg Config) (*ChainService, error) {
 		dialer:            dialer,
 		persistToDisk:     cfg.PersistToDisk,
 		broadcastTimeout:  cfg.BroadcastTimeout,
+		lastRelayed:       make(map[chainhash.Hash]time.Time),
 	}
 
 	s.services |= wire.SFNodeP2PV2
@@ -929,16 +938,6 @@ func NewChainService(cfg Config) (*ChainService, error) {
 
 			return matches, err
 		},
-	})
-
-	s.broadcaster = pushtx.NewBroadcaster(&pushtx.Config{
-		Broadcast: func(tx *wire.MsgTx) error {
-			return s.sendTransaction(tx)
-		},
-		SubscribeBlocks: func() (*blockntfns.Subscription, error) {
-			return s.blockSubscriptionMgr.NewSubscription(0)
-		},
-		RebroadcastInterval: pushtx.DefaultRebroadcastInterval,
 	})
 
 	s.banStore, err = banman.NewStore(cfg.Database)
@@ -1511,14 +1510,39 @@ func disconnectPeer(peerList map[int32]*ServerPeer,
 	return false
 }
 
-// SendTransaction broadcasts the transaction to all currently active peers so
-// it can be propagated to other nodes and eventually mined. An error won't be
-// returned if the transaction already exists within the mempool. Any
-// transaction broadcast through this method will be rebroadcast upon every
-// change of the tip of the chain.
+// SendTransaction announces the transaction to all currently active peers exactly once. An error won't be returned if
+// the transaction already exists within the mempool. Nothing re-announces it later; callers that want another attempt
+// call SendTransaction again.
 func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 	// TODO(roasbeef): pipe through querying interface
-	return s.broadcaster.Broadcast(tx)
+	err := s.sendTransaction(tx)
+	// A Mempool reject means a peer already holds the transaction, which is
+	// as good as a request; any other error is evidence of nothing.
+	if err != nil && !pushtx.IsBroadcastError(err, pushtx.Mempool) {
+		return err
+	}
+
+	s.relayMu.Lock()
+	s.lastRelayed[tx.TxHash()] = time.Now()
+	s.relayMu.Unlock()
+
+	return nil
+}
+
+// LastRelayed reports when a peer last requested txHash after an announcement made by this process, if any.
+func (s *ChainService) LastRelayed(txHash chainhash.Hash) (time.Time, bool) {
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+
+	t, ok := s.lastRelayed[txHash]
+	return t, ok
+}
+
+// ForgetTransaction drops the relay evidence kept for txHash.
+func (s *ChainService) ForgetTransaction(txHash chainhash.Hash) {
+	s.relayMu.Lock()
+	delete(s.lastRelayed, txHash)
+	s.relayMu.Unlock()
 }
 
 // NewPeerConfig returns the configuration for the given ServerPeer.
@@ -1660,11 +1684,6 @@ func (s *ChainService) Start(ctx context.Context) error {
 		return fmt.Errorf("unable to start utxo scanner: %v", err)
 	}
 
-	if err := s.broadcaster.Start(); err != nil {
-		return fmt.Errorf("unable to start transaction broadcaster: %v",
-			err)
-	}
-
 	if s.persistToDisk {
 		s.filterBatchWriter.Start()
 	}
@@ -1689,7 +1708,6 @@ func (s *ChainService) Stop() error {
 
 	var returnErr error
 	s.connManager.Stop()
-	s.broadcaster.Stop()
 	if err := s.utxoScanner.Stop(); err != nil {
 		log.Errorf("error stopping utxo scanner: %v", err)
 		returnErr = err

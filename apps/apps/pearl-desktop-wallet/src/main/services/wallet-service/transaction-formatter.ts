@@ -12,6 +12,8 @@ export type RawTransaction = {
   blockhash?: string;
   trusted?: boolean;
   generated?: boolean;
+  relayed?: boolean;
+  lastrelaytime?: number;
 };
 
 export function formatTransaction(tx: RawTransaction): Transaction {
@@ -29,6 +31,8 @@ export function formatTransaction(tx: RawTransaction): Transaction {
     blockhash: tx.blockhash || '',
     trusted: tx.trusted || false,
     generated: tx.generated || false,
+    relayed: tx.relayed,
+    lastRelayTime: tx.lastrelaytime ? tx.lastrelaytime * 1000 : undefined,
   };
 }
 

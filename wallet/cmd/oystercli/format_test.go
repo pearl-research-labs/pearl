@@ -6,6 +6,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/stretchr/testify/assert"
@@ -85,6 +86,40 @@ func TestSortedKeys(t *testing.T) {
 		"imported": 4,
 	}
 	assert.Equal(t, []string{"default", "alpha", "imported", "zebra"}, sortedKeys(m))
+}
+
+func TestRelayLabel(t *testing.T) {
+	now := time.Unix(10_000, 0)
+	yes, no := true, false
+
+	tests := []struct {
+		name          string
+		relayed       *bool
+		lastRelayTime int64
+		want          string
+	}{
+		{"no evidence offered", nil, 0, ""},
+		{"relayed", &yes, 10_000 - 5*60, "relayed 5m ago"},
+		{"not announced", &no, 0, "not announced since start"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, relayLabel(tt.relayed, tt.lastRelayTime, now))
+		})
+	}
+}
+
+func TestFmtAgo(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	assert.Equal(t, "just now", fmtAgo(1_000_000-30, now))
+	assert.Equal(t, "3m ago", fmtAgo(1_000_000-3*60, now))
+	assert.Equal(t, "2h ago", fmtAgo(1_000_000-2*3600, now))
+	assert.Equal(t, "3d ago", fmtAgo(1_000_000-3*86400, now))
+}
+
+func TestFmtPeerCount(t *testing.T) {
+	assert.Equal(t, "0 (cannot send: no peers)", fmtPeerCount(0))
+	assert.Equal(t, "8", fmtPeerCount(8))
 }
 
 func TestSyncPercent(t *testing.T) {

@@ -106,20 +106,20 @@ Before a PR is submitted, the proposer should ensure that the file passes the
 set of linting scripts run by `make lint`. These include `gofmt`. In addition
 to `gofmt` we've opted to enforce the following style guidelines.
 
-### 80 character line length
+### 120 character line length
 
-ALL columns (on a best effort basis) should be wrapped to 80 line columns.
-Editors should be set to treat a **tab as 8 spaces**.
+ALL columns (on a best effort basis) should be wrapped to 120 line columns.
+Editors should be set to treat a **tab as 4 spaces**.
 
 **WRONG**
 ```go
-myKey := "0214cd678a565041d00e6cf8d62ef8add33b4af4786fb2beb87b366a2e151fcee7"
+myKey := "040214cd678a565041d00e6cf8d62ef8add33b4af4786fb2beb87b366a2e151fcee70214cd678a565041d00e6cf8d62ef8add33b4af4786fb2beb87b366a2e151fcee7"
 ```
 
 **RIGHT**
 ```go
-myKey := "0214cd678a565041d00e6cf8d62ef8add33b4af4786fb2beb87b366a2e1" +
-	"51fcee7"
+myKey := "040214cd678a565041d00e6cf8d62ef8add33b4af4786fb2beb87b366a2e151fcee70214cd678a565041d00e6cf8d62ef8add33b4af" +
+	"4786fb2beb87b366a2e151fcee7"
 ```
 
 ### Wrapping long function calls
@@ -145,7 +145,7 @@ value, err := bar(
 
 **Note that the above guidelines don't apply to log or error messages.** For
 log and error messages, committers should attempt to minimize the number of
-lines utilized, while still adhering to the 80-character column limit. For
+lines utilized, while still adhering to the 120-character column limit. For
 example:
 
 **WRONG**
@@ -221,14 +221,14 @@ log.InfoS(ctx, "Channel open performed",
         btclog.Fmt("amount", "%.8f", 0.00154))
 ```
 
-3) **Line wrapping**: Structured log lines are an exception to the 80-character
+3) **Line wrapping**: Structured log lines are an exception to the 120-character
 line wrapping rule. This is so that the key-value pairs can be easily read and
 reasoned about. If it is the case that there is only a single key-value pair
-and the entire log line is still less than 80 characters, it is acceptable to
+and the entire log line is still less than 120 characters, it is acceptable to
 have the key-value pair on the same line as the log message. However, if there
 are multiple key-value pairs, it is suggested to use the one line per key-value
 pair format. Due to this suggestion, it is acceptable for any single key-value
-pair line to exceed 80 characters for the sake of readability.
+pair line to exceed 120 characters for the sake of readability.
 
 **WRONG**
 ```go
@@ -270,7 +270,7 @@ log.InfoS(ctx, "Bytes received",
 ### Wrapping long function definitions
 
 If one is forced to wrap lines of function arguments that exceed the 
-80-character limit, then indentation must be kept on the following lines. Also,
+120-character limit, then indentation must be kept on the following lines. Also,
 lines should not end with an open parenthesis if the function definition isn't
 finished yet.
 
@@ -322,8 +322,8 @@ func foo(a, b, c,
 To make it easier to follow the rules outlined above, we recommend setting up
 your editor with at least the following two settings:
 
-1. Set your tabulator width (also called "tab size") to **8 spaces**.
-2. Set a ruler or visual guide at 80 character.
+1. Set your tabulator width (also called "tab size") to **4 spaces**.
+2. Set a ruler or visual guide at 120 characters.
 
 Note that the two above settings are automatically applied in editors that
 support the `EditorConfig` scheme (for example GoLand, GitHub, GitLab,
@@ -333,4 +333,4 @@ into the code base as well.
 Other editors (for example Atom, Notepad++, Vim, Emacs and so on) might install
 a plugin to understand the rules in the `.editorconfig` file.
 
-In Vim, you might want to use `set colorcolumn=80`.
+In Vim, you might want to use `set colorcolumn=120`.

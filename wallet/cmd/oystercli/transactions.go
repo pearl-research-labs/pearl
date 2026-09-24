@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"charm.land/huh/v2"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
@@ -88,7 +89,8 @@ func transactionsScreen(c *client) error {
 	}
 }
 
-// showTransactionDetail prints the full record for one transaction.
+// showTransactionDetail prints the full record for one transaction and, for
+// a pending one, offers the explicit relay actions.
 func showTransactionDetail(c *client, txid string) error {
 	tx, err := c.transaction(txid)
 	if err != nil {
@@ -112,6 +114,9 @@ func showTransactionDetail(c *client, txid string) error {
 			[2]string{"Block time", fmtUnixTime(tx.BlockTime)},
 		)
 	}
+	if relay := relayLabel(tx.Relayed, tx.LastRelayTime, time.Now()); relay != "" {
+		rows = append(rows, [2]string{"Relay", relay})
+	}
 	for _, det := range tx.Details {
 		target := det.Address
 		if target == "" {
@@ -125,6 +130,117 @@ func showTransactionDetail(c *client, txid string) error {
 
 	printTitle("Transaction detail")
 	printBox(kvLines(rows))
+
+	// Rebroadcast and remove recover a stuck send. An incoming 0-conf was never announced by this wallet; forgetting it
+	// would drop the credit (and any spend chained off it) while the payment can still confirm on chain.
+	if tx.Confirmations > 0 || !spendsWalletCoins(tx) {
+		return nil
+	}
+	return pendingTxActions(c, tx.TxID)
+}
+
+// spendsWalletCoins reports whether the transaction spends wallet-owned outputs (a send-category debit). A send detail
+// does not mean this daemon created or broadcast the transaction.
+func spendsWalletCoins(tx *btcjson.GetTransactionResult) bool {
+	for _, det := range tx.Details {
+		if det.Category == "send" {
+			return true
+		}
+	}
+	return false
+}
+
+// pendingTxActions lets the user re-announce or remove a pending transaction. Under SPV the daemon announces a
+// transaction exactly once, so anything further is the user's explicit call.
+func pendingTxActions(c *client, txid string) error {
+	const (
+		opBack        = "back"
+		opRebroadcast = "rebroadcast"
+		opRemove      = "remove"
+	)
+	choice := opBack
+	submitted, err := runForm(newForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Pending transaction").
+			Description("Under SPV the daemon announces a transaction once when sent and never again on its own.").
+			Options(
+				huh.NewOption("Back", opBack),
+				huh.NewOption("Rebroadcast to the network", opRebroadcast),
+				huh.NewOption("Remove from the wallet (frees its inputs)", opRemove),
+			).
+			Value(&choice),
+	)))
+	if err != nil || !submitted {
+		return err
+	}
+
+	switch choice {
+	case opRebroadcast:
+		return rebroadcastPendingTx(c, txid)
+	case opRemove:
+		return removePendingTx(c, txid)
+	}
+	return nil
+}
+
+func rebroadcastPendingTx(c *client, txid string) error {
+	var announced []string
+	err := withSpinner("Announcing to peers...", func() error {
+		var callErr error
+		announced, callErr = c.rebroadcastTransaction(txid)
+		return callErr
+	})
+	switch {
+	case isNotRelayedError(err):
+		printWarn("No peer requested it: either every connected peer already has it, or none will take it.")
+		printWarn(rawErrorDetail(err))
+		return nil
+	case err != nil:
+		return err
+	}
+
+	if len(announced) > 1 {
+		printSuccess(fmt.Sprintf("A peer requested the transaction and %d pending ancestor(s).", len(announced)-1))
+	} else {
+		printSuccess("A peer requested the transaction.")
+	}
+	return nil
+}
+
+func removePendingTx(c *client, txid string) error {
+	confirmed := false
+	ok, err := runForm(newForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Remove this pending transaction from the wallet?").
+			Description("Its inputs become spendable again, and any pending transaction spending from it is\n" +
+				"removed too. The network is not consulted: if a peer already holds this transaction\n" +
+				"it may still confirm, and spending the freed inputs again is a double-spend attempt.").
+			Affirmative("Remove it").
+			Negative("Cancel").
+			Value(&confirmed),
+	)))
+	if err != nil {
+		return err
+	}
+	if !ok || !confirmed {
+		printWarn("Kept the transaction.")
+		return nil
+	}
+
+	var removed []string
+	err = withSpinner("Removing...", func() error {
+		var callErr error
+		removed, callErr = c.removeTransaction(txid)
+		return callErr
+	})
+	if err != nil {
+		return err
+	}
+
+	printSuccess(fmt.Sprintf("Removed %d transaction(s):", len(removed)))
+	for _, hash := range removed {
+		fmt.Println("  " + hash)
+	}
 	return nil
 }
 

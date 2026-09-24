@@ -32,6 +32,7 @@ type SyncProgress struct {
 	HeaderHeight       int32
 	FilterHeaderHeight int32
 	BestPeerHeight     int32
+	Connections        int32
 }
 
 // Interface allows more than one backing blockchain source, such as a
@@ -57,6 +58,17 @@ type Interface interface {
 	SyncProgress() (*SyncProgress, error)
 	TestMempoolAccept([]*wire.MsgTx, float64) ([]*btcjson.TestMempoolAcceptResult, error)
 	MapRPCErr(err error) error
+}
+
+// BroadcastTracker is implemented by backends that cannot observe a mempool and therefore keep their own evidence of
+// whether the network took a transaction. It stays off Interface: a full node answers this question by holding the
+// transaction in its mempool, so callers type-assert and treat an absent tracker as "no such evidence exists".
+type BroadcastTracker interface {
+	// LastRelayed reports when a peer last requested txHash after an announcement made by this process, if any.
+	LastRelayed(txHash chainhash.Hash) (time.Time, bool)
+
+	// ForgetTransaction drops the relay evidence for txHash.
+	ForgetTransaction(txHash chainhash.Hash)
 }
 
 // Notification types.  These are defined here and processed from from reading

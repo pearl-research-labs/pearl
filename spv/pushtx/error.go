@@ -30,6 +30,10 @@ const (
 	// Confirmed is the code used when a transaction has been deemed as
 	// confirmed in the chain by a peer.
 	Confirmed
+
+	// NotRelayed is the code used when no peer requested the transaction after it was announced. Only the txid went
+	// out, so the announcement delivered nothing; peers that already held the transaction stay silent too.
+	NotRelayed
 )
 
 func (c BroadcastErrorCode) String() string {
@@ -42,6 +46,8 @@ func (c BroadcastErrorCode) String() string {
 		return "Mempool"
 	case Confirmed:
 		return "Confirmed"
+	case NotRelayed:
+		return "NotRelayed"
 	default:
 		return "Unknown"
 	}

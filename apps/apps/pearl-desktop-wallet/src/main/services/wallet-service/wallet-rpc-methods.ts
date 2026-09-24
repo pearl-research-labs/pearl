@@ -76,6 +76,14 @@ class WalletRpcMethods {
     return this.rpc.call<string>('sendmany', ['default', outputs, feeRate, minconf]);
   }
 
+  removeTransaction(txid: string) {
+    return this.rpc.call<{ removed: string[] }>('removetransaction', [txid]).then(r => r.removed);
+  }
+
+  rebroadcastTransaction(txid: string) {
+    return this.rpc.call<{ announced: string[] }>('rebroadcasttransaction', [txid]).then(r => r.announced);
+  }
+
   async validateAddress(address: string) {
     const validationResult = await this.rpc.call<{ isvalid: boolean }>('validateaddress', [address]);
     return { isValid: validationResult.isvalid };

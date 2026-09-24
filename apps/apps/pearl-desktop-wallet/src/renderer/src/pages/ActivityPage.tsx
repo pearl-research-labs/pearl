@@ -1,29 +1,23 @@
-import { ArrowLeft, ArrowUpRight, ArrowDownLeft, Copy, Check } from 'lucide-react';
+import { ArrowLeft, ArrowUpRight, ArrowDownLeft, Copy, Check, Loader2 } from 'lucide-react';
 import { Transaction } from '../../../types/transaction';
 import { usePagination } from '../hooks/usePagination';
+import { useWalletStore } from '../store/walletStore';
 import { Button } from '@/components/ui/button';
+import { formatTimeAgo, getErrorMessage } from '@/lib/utils';
+import { isNotRelayedError, pendingStatusLabel } from '@/lib/pending-tx';
 import { useState } from 'react';
 
 interface ActivityPageProps {
   onBack: () => void;
 }
 
-const formatTimeAgo = (timestamp: number): string => {
-  const now = Date.now();
-  const diff = now - timestamp;
+const REBROADCAST_NOT_RELAYED_MESSAGE =
+  'No peer requested it: either every connected peer already has it, or none will take it.';
 
-  const minutes = Math.floor(diff / (1000 * 60));
-  const hours = Math.floor(diff / (1000 * 60 * 60));
-  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  } else if (hours < 24) {
-    return `${hours}h ago`;
-  } else {
-    return `${days}d ago`;
-  }
-};
+const REMOVE_WARNING =
+  'Its inputs become spendable again, and any pending transaction spending from it is removed too. ' +
+  'The network is not consulted: if a peer already holds this transaction it may still confirm, ' +
+  'and spending the freed inputs again is a double-spend attempt.';
 
 const formatFullDate = (timestamp: number): string => {
   const date = new Date(timestamp);
@@ -40,12 +34,76 @@ const truncateTxId = (txid: string): string => {
   return `${txid.slice(0, 8)}...${txid.slice(-8)}`;
 };
 
+type PendingAction = 'rebroadcast' | 'remove';
+
+interface PendingNotice {
+  txid: string;
+  tone: 'success' | 'warning';
+  message: string;
+}
+
 export default function ActivityPage({ onBack }: ActivityPageProps) {
-  const { activities, loading, hasMore, loadMore } = usePagination({
+  const { activities, loading, hasMore, loadMore, reload } = usePagination({
     pageSize: 10,
   });
+  const { syncWalletData } = useWalletStore();
   const [copiedTxId, setCopiedTxId] = useState<string | null>(null);
   const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
+  const [busy, setBusy] = useState<{ txid: string; action: PendingAction } | null>(null);
+  const [notice, setNotice] = useState<PendingNotice | null>(null);
+
+  // run resolves to the success notice, or null for none. Errors go to a dialog because the reload below can drop their
+  // row, e.g. when a conflicting spend confirmed in the meantime.
+  const runPendingAction = async (txid: string, action: PendingAction, run: () => Promise<string | null>) => {
+    setBusy({ txid, action });
+    setNotice(null);
+    try {
+      const message = await run();
+      if (message) setNotice({ txid, tone: 'success', message });
+    } catch (err) {
+      const message = getErrorMessage(err);
+      if (action === 'rebroadcast' && isNotRelayedError(message)) {
+        setNotice({ txid, tone: 'warning', message: REBROADCAST_NOT_RELAYED_MESSAGE });
+      } else {
+        void window.appBridge.window.showMessageBox({
+          type: 'error',
+          title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
+          message,
+          buttons: ['OK'],
+        });
+      }
+    } finally {
+      setBusy(null);
+      await Promise.all([reload(), syncWalletData()]);
+    }
+  };
+
+  const handleRebroadcast = (txid: string) =>
+    runPendingAction(txid, 'rebroadcast', async () => {
+      const announced = await window.appBridge.wallet.rebroadcastTransaction(txid);
+      const ancestors = announced.length - 1;
+      return ancestors > 0
+        ? `A peer requested the transaction and ${ancestors} pending ancestor${ancestors === 1 ? '' : 's'}.`
+        : 'A peer requested the transaction.';
+    });
+
+  const handleRemove = async (txid: string) => {
+    const { response } = await window.appBridge.window.showMessageBox({
+      type: 'warning',
+      title: 'Remove pending transaction',
+      message: 'Remove this pending transaction from the wallet?',
+      detail: REMOVE_WARNING,
+      buttons: ['Cancel', 'Remove'],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (response !== 1) return;
+
+    await runPendingAction(txid, 'remove', async () => {
+      await window.appBridge.wallet.removeTransaction(txid);
+      return null;
+    });
+  };
 
   const handleCopyTxId = async (txid: string) => {
     try {
@@ -138,7 +196,9 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                       {activity.amount} PRL
                     </div>
                     <div className="text-sm text-gray-600">
-                      {activity.confirmations} confirmations
+                      {activity.confirmations === 0
+                        ? pendingStatusLabel(activity)
+                        : `${activity.confirmations} confirmations`}
                     </div>
                     {activity.fee > 0 && (
                       <div className="text-xs text-gray-500">
@@ -147,6 +207,44 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                     )}
                   </div>
                 </div>
+                {activity.confirmations === 0 && activity.type === 'sent' && (
+                  <div className="mt-3 flex items-center justify-end gap-2 border-t border-gray-100 pt-3">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy !== null}
+                      onClick={() => handleRebroadcast(activity.txid)}
+                    >
+                      {busy?.txid === activity.txid && busy.action === 'rebroadcast' ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        'Rebroadcast'
+                      )}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy !== null}
+                      className="text-red-600 hover:text-red-700"
+                      onClick={() => handleRemove(activity.txid)}
+                    >
+                      {busy?.txid === activity.txid && busy.action === 'remove' ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        'Remove'
+                      )}
+                    </Button>
+                  </div>
+                )}
+                {notice?.txid === activity.txid && (
+                  <div
+                    className={`mt-2 rounded-md px-3 py-2 text-xs ${
+                      notice.tone === 'success' ? 'bg-green-50 text-green-800' : 'bg-amber-50 text-amber-800'
+                    }`}
+                  >
+                    {notice.message}
+                  </div>
+                )}
               </div>
             ))}
 

@@ -135,6 +135,8 @@ var helpDescsEnUS = map[string]string{
 	"gettransactionresult-timereceived":    "The earliest Unix time this transaction was known to exist",
 	"gettransactionresult-details":         "Additional details for each recorded wallet credit and debit",
 	"gettransactionresult-hex":             "The transaction encoded as a hexadecimal string",
+	"gettransactionresult-relayed":         "Only for an unconfirmed send under SPV (incoming payments never carry it): whether a peer requested the transaction after an announcement made since the daemon started. false means it has not been announced this session, not that the network lacks it",
+	"gettransactionresult-lastrelaytime":   "Only when relayed is true: the Unix time a peer last requested the transaction",
 
 	// GetTransactionDetailsResult help.
 	"gettransactiondetailsresult-account":           "DEPRECATED -- Unset",
@@ -232,6 +234,8 @@ var helpDescsEnUS = map[string]string{
 	"listtransactionsresult-trusted":            "Unset",
 	"listtransactionsresult-bip125-replaceable": "Unset",
 	"listtransactionsresult-abandoned":          "Unset",
+	"listtransactionsresult-relayed":            "Only for an unconfirmed send under SPV (incoming payments never carry it): whether a peer requested the transaction after an announcement made since the daemon started. false means it has not been announced this session, not that the network lacks it",
+	"listtransactionsresult-lastrelaytime":      "Only when relayed is true: the Unix time a peer last requested the transaction",
 
 	// ListTransactionsCmd help.
 	"listtransactions--synopsis":        "Returns a JSON array of objects containing verbose details for wallet transactions.",
@@ -426,6 +430,21 @@ var helpDescsEnUS = map[string]string{
 	"getsyncprogressresult-filter_header_height": "The height of the best filter header synced so far",
 	"getsyncprogressresult-block_height":         "The height of the best full block the wallet has processed",
 	"getsyncprogressresult-best_peer_height":     "The best block height reported by connected peers",
+	"getsyncprogressresult-connections":          "The number of currently connected peers; a broadcast needs at least one",
 	"getsyncprogressresult-synced":               "Whether the wallet considers the chain fully synced",
 	"getsyncprogress--result0":                   "",
+
+	// RemoveTransactionCmd help.
+	"removetransaction--synopsis": "Forgets an unconfirmed transaction, and every unconfirmed transaction spending from it, so the inputs they used become spendable again.\n" +
+		"The network is not consulted: a peer that already holds the transaction may still mine it, and spending the freed inputs again is then a double-spend attempt. Only remove a transaction you are sure never left this machine or that you intend to replace.",
+	"removetransaction-txid":          "Hash of the unconfirmed transaction to remove",
+	"removetransactionresult-removed": "Hashes of the removed transactions, the requested one first",
+	"removetransaction--result0":      "",
+
+	// RebroadcastTransactionCmd help.
+	"rebroadcasttransaction--synopsis": "Announces an unconfirmed transaction to the network again, preceded by any of its unconfirmed ancestors in dependency order.\n" +
+		"Under SPV a transaction is announced exactly once when sent and never again automatically; this is the explicit way to try again. Fails with the daemon's not-relayed error when no peer requests it, which is ambiguous by construction: peers that already hold the transaction stay silent. A rejection is reported and the transaction kept; removetransaction drops it.",
+	"rebroadcasttransaction-txid":            "Hash of the unconfirmed transaction to announce",
+	"rebroadcasttransactionresult-announced": "Hashes a peer requested, unconfirmed ancestors first and the requested transaction last",
+	"rebroadcasttransaction--result0":        "",
 }

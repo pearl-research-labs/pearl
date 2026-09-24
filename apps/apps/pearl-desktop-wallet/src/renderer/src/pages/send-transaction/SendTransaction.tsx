@@ -13,14 +13,24 @@ import TransactionPreview from './TransactionPreview';
 import SendButton from './SendButton';
 import { formatTxid } from '@/lib/crypto';
 import { getErrorMessage } from '@/lib/utils';
+import { isNotRelayedError } from '@/lib/pending-tx';
 
 type FeeLevel = 'fast' | 'medium' | 'slow';
 const MEMPOOL_MIN_FEE_PER_VBYTE = 0.00001;
+
+// The daemon reports this both with no peers connected and when none of
+// them asked for the transaction; either way nothing left this machine.
+const NOT_RELAYED_MESSAGE =
+  'No network peer accepted the transaction. Nothing was sent and your funds are untouched. ' +
+  'Check your connection and try again.';
 
 export default function SendTransaction() {
   const navigate = useNavigate();
   const { walletName, availableBalance, validateAddress, syncWalletData } = useWalletStore();
   const [error, setError] = useState<string | null>(null);
+  // A not-relayed failure is fixed by retrying once peers are back, so it
+  // must not disable Send; submitting clears the error first.
+  const errorBlocksSend = error !== null && error !== NOT_RELAYED_MESSAGE;
   const [success, setSuccess] = useState<string | null>(null);
   const [txid, setTxid] = useState<string | null>(null);
   const [isMaxSelected, setIsMaxSelected] = useState(false);
@@ -56,7 +66,7 @@ export default function SendTransaction() {
         );
         setTxid(txId);
         syncWalletData();
-        setSuccess('Transaction sent successfully!');
+        setSuccess('Transaction broadcast to the network!');
         form.reset();
       } catch (err) {
         const errorMessage = getErrorMessage(err, 'Failed to send transaction');
@@ -71,6 +81,8 @@ export default function SendTransaction() {
           setTimeout(() => {
             navigate('/unlock');
           }, 3000);
+        } else if (isNotRelayedError(errorMessage)) {
+          setError(NOT_RELAYED_MESSAGE);
         } else if (errorMessage.includes('mempool min fee not met')) {
           setError('Seems like the transaction fee is too low. This often means that the transaction is too large. Try setting up smaller transactions.')
         } else {
@@ -256,7 +268,7 @@ export default function SendTransaction() {
                     <SendButton
                       onClick={() => form.handleSubmit()}
                       isLoading={isSubmitting}
-                      disabled={isSubmitting || !amount || !address || !!error || !isValid}
+                      disabled={isSubmitting || !amount || !address || errorBlocksSend || !isValid}
                     />
                   </>
                 )}

@@ -10,6 +10,7 @@ interface UsePaginationResult {
   loading: boolean;
   hasMore: boolean;
   loadMore: () => Promise<void>;
+  reload: () => Promise<void>;
 }
 
 export function usePagination(options: UsePaginationOptions = {}): UsePaginationResult {
@@ -44,10 +45,26 @@ export function usePagination(options: UsePaginationOptions = {}): UsePagination
     }
   }, [loading, hasMore, count, offset]);
 
+  // Refetch everything loaded so far in one request so the list keeps its length and the user's scroll position.
+  const reload = useCallback(async () => {
+    setLoading(true);
+    try {
+      const loaded = Math.max(offset, count);
+      const txs = await window.appBridge.wallet.listTransactions(loaded, 0);
+      setActivities(txs);
+      setOffset(loaded);
+      setHasMore(txs.length >= loaded);
+    } catch (err) {
+      console.error('Failed to reload activities:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, [count, offset]);
+
   useEffect(() => {
     loadMore();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { activities, loading, hasMore, loadMore };
+  return { activities, loading, hasMore, loadMore, reload };
 }
