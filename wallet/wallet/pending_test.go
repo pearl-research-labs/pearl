@@ -214,6 +214,24 @@ func TestRebroadcastTransaction(t *testing.T) {
 		require.False(t, hasOutPoint(unspent, fundingOut))
 	})
 
+	t.Run("already known or confirmed keeps the record", func(t *testing.T) {
+		for _, sendErr := range []error{
+			chain.ErrTxAlreadyKnown,
+			chain.ErrTxAlreadyConfirmed,
+		} {
+			w, client, fundingOut, _, child := pendingChain(t)
+			client.sendRawTransactionFunc = sendResult(sendErr)
+
+			announced, err := w.RebroadcastTransaction(child.TxHash())
+			require.ErrorIs(t, err, sendErr)
+			require.Empty(t, announced, "the parent failed first")
+
+			unmined, unspent := walletTxState(t, w)
+			require.Len(t, unmined, 2)
+			require.False(t, hasOutPoint(unspent, fundingOut))
+		}
+	})
+
 	t.Run("refuses a confirmed transaction", func(t *testing.T) {
 		w, _, fundingOut, _, _ := pendingChain(t)
 

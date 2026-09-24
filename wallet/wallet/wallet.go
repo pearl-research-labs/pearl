@@ -3865,6 +3865,15 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 	case errors.Is(rpcErr, chain.ErrTxAlreadyKnown),
 		errors.Is(rpcErr, chain.ErrTxAlreadyConfirmed):
 
+		// Under SPV a peer that already holds the transaction answers
+		// with this reject. That is not proof the spend is settled, so
+		// an explicit rebroadcast reports it and keeps the record.
+		// RemoveTransaction is what drops the spend.
+		if mode == rebroadcast {
+			log.Infof("%v: broadcast failed because of: %v", txid, rpcErr)
+			return nil, rpcErr
+		}
+
 		if err := w.removeUnminedTx(tx); err != nil {
 			log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", txid, err)
 		}
