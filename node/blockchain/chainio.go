@@ -1410,24 +1410,29 @@ func dbFetchBlockVsize(dbTx database.Tx, blockHash chainhash.Hash) (int64, error
 	return vsize, nil
 }
 
-// dbFetchCertificate retrieves a certificate for a block from the database.
-// It fetches the full block and extracts the certificate from it.
+// dbFetchCertificate retrieves a certificate for a block from the database
+// without fetching the full block.
+// does not verify the certificate against the block's checksum.
 func dbFetchCertificate(dbTx database.Tx, blockHash chainhash.Hash) (wire.BlockCertificate, error) {
-	// Fetch the block data from database
-	blockBytes, err := dbTx.FetchBlock(&blockHash)
+	blockSize, err := dbTx.FetchBlockSize(&blockHash)
 	if err != nil {
 		return nil, err
 	}
 
-	// Deserialize the block to extract certificate
-	var block wire.MsgBlock
-	err = block.Deserialize(bytes.NewReader(blockBytes))
+	certBytes, err := dbTx.FetchBlockRegion(&database.BlockRegion{
+		Hash: &blockHash,
+		Len:  min(blockSize, wire.CertificateMaxSize),
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize block: %w", err)
+		return nil, err
 	}
 
-	// Return the certificate from the block header
-	return block.BlockCertificate(), nil
+	var cert wire.MsgCertificate
+	if err := cert.PrlDecode(bytes.NewReader(certBytes), 0); err != nil {
+		return nil, err
+	}
+
+	return cert.Certificate, nil
 }
 
 // dbStoreBlock stores the provided block in the database. The block header is
