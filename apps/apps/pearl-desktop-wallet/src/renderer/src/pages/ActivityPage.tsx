@@ -8,7 +8,6 @@ import {
   isNotRelayedError,
   pendingStatusLabel,
   REBROADCAST_NOT_RELAYED_MESSAGE,
-  REBROADCAST_REJECTED_DETAIL,
   REMOVE_WARNING,
 } from '@/lib/pending-tx';
 import { useState } from 'react';
@@ -50,10 +49,9 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
   const [busy, setBusy] = useState<{ txid: string; action: PendingAction } | null>(null);
   const [notice, setNotice] = useState<PendingNotice | null>(null);
 
-  // run resolves to the success notice, or null for none. A rejected
-  // rebroadcast deletes its record, so errors go to a dialog rather than the
-  // row. reload() is only the current page, so a send that is still in the
-  // wallet can fall out of that window; membership is the full listing.
+  // run resolves to the success notice, or null for none. Errors go to a
+  // dialog because the reload below can drop their row, e.g. when a
+  // conflicting spend confirmed in the meantime.
   const runPendingAction = async (
     txid: string,
     action: PendingAction,
@@ -61,7 +59,6 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
   ) => {
     setBusy({ txid, action });
     setNotice(null);
-    let failure: string | null = null;
     try {
       const message = await run();
       if (message) setNotice({ txid, tone: 'success', message });
@@ -70,33 +67,17 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
       if (action === 'rebroadcast' && isNotRelayedError(message)) {
         setNotice({ txid, tone: 'warning', message: REBROADCAST_NOT_RELAYED_MESSAGE });
       } else {
-        failure = message;
+        void window.appBridge.window.showMessageBox({
+          type: 'error',
+          title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
+          message,
+          buttons: ['OK'],
+        });
       }
+    } finally {
+      setBusy(null);
+      await Promise.all([reload(), syncWalletData()]);
     }
-    setBusy(null);
-
-    const recorded =
-      failure !== null && action === 'rebroadcast'
-        ? window.appBridge.wallet.listAllTransactions().then(
-            txs => txs.some(tx => tx.txid === txid),
-            err => {
-              console.error('Failed to check whether the transaction remains:', err);
-              return null;
-            }
-          )
-        : Promise.resolve<boolean | null>(null);
-
-    const [, stillPresent] = await Promise.all([reload(), recorded, syncWalletData()]);
-    if (failure === null) return;
-
-    const dropped = stillPresent === false;
-    void window.appBridge.window.showMessageBox({
-      type: 'error',
-      title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
-      message: failure,
-      detail: dropped ? REBROADCAST_REJECTED_DETAIL : undefined,
-      buttons: ['OK'],
-    });
   };
 
   const handleRebroadcast = (txid: string) =>
