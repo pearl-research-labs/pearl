@@ -28,6 +28,9 @@ export default function SendTransaction() {
   const navigate = useNavigate();
   const { walletName, availableBalance, validateAddress, syncWalletData } = useWalletStore();
   const [error, setError] = useState<string | null>(null);
+  // A not-relayed failure is fixed by retrying once peers are back, so it
+  // must not disable Send; submitting clears the error first.
+  const errorBlocksSend = error !== null && error !== NOT_RELAYED_MESSAGE;
   const [success, setSuccess] = useState<string | null>(null);
   const [txid, setTxid] = useState<string | null>(null);
   const [isMaxSelected, setIsMaxSelected] = useState(false);
@@ -265,7 +268,7 @@ export default function SendTransaction() {
                     <SendButton
                       onClick={() => form.handleSubmit()}
                       isLoading={isSubmitting}
-                      disabled={isSubmitting || !amount || !address || !!error || !isValid}
+                      disabled={isSubmitting || !amount || !address || errorBlocksSend || !isValid}
                     />
                   </>
                 )}
