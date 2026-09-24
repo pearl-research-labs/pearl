@@ -95,7 +95,12 @@ class NoisingKernelB {
   static constexpr int kNumMmaWarpgroups = 1;
   static constexpr int kNumMmaThreads =
       kNumMmaWarpgroups * kNumThreadsPerWarpGroup;
-  using AtomLayoutMma = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
+  // Blackwell port: SM80 mma.sync 16x8x32 int8 atom tiled as 4 warps per
+  // warpgroup (matching Hopper's CLayout_64xN per-thread fragment ownership
+  // exactly — same row groups per warp, same value packing). See
+  // kernel_traits.hpp for the bit-identicality argument.
+  static constexpr int kWarpsPerWarpGroupMma = 4;
+  using AtomLayoutMma = Layout<Shape<Int<kWarpsPerWarpGroupMma * kNumMmaWarpgroups>, _1, _1>>;
 
   /*
   Tiled WGMMA for EAR * BpEB, int8 * int8 -> int32, size (bN, R, bK) for one k_block.
@@ -108,9 +113,9 @@ class NoisingKernelB {
   layout is handled by swizzles in the SMEM layouts.
   */
   using TiledMmaNRK = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NRK>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Underscore, cute::Int<R>, cute::Underscore>{}));
 
   /*
   Tiled WGMMA for B + EBR * EBL, size (bN, bK, R) for one k_block iteration.
@@ -120,9 +125,9 @@ class NoisingKernelB {
   The operands are both sourced from SMEM, but accumulator is in RMEM.
   */
   using TiledMmaNKR = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NKR>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Underscore, cute::Int<kBlockK>, cute::Underscore>{}));
 
   /*
   Smem layouts for the smem tensors, used primarily for TMA and WGMMA. Sizes are
@@ -251,9 +256,9 @@ class NoisingKernelB {
   // accumulator.
   using TileShape_NKR_half = Shape<Int<kBlockN>, Int<kBlockK / 2>, Int<R>>;
   using TiledMmaNKR_half = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_NKR_half>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Underscore, cute::Int<kBlockK / 2>, cute::Underscore>{}));
   using S2RCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
   using R2SCopyAtomB = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
 
@@ -559,6 +564,18 @@ class NoisingKernelB {
     Tensor tCrBpEB = thr_mma.make_fragment_A(tCsBpEB);  // (MMA,MMA_N,MMA_K,P)
     Tensor tCrEAR = thr_mma.make_fragment_B(tCsEAR);    // (MMA,MMA_N,MMA_K,P)
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    using S2RCopyAtom_NB1 = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+    auto s2r_tiled_copy_BpEB1 = make_tiled_copy_A(S2RCopyAtom_NB1{}, tiled_mma);
+    auto s2r_tiled_copy_EAR1 = make_tiled_copy_B(S2RCopyAtom_NB1{}, tiled_mma);
+    auto s2r_thr_copy_BpEB1 = s2r_tiled_copy_BpEB1.get_thread_slice(tid);
+    auto s2r_thr_copy_EAR1 = s2r_tiled_copy_EAR1.get_thread_slice(tid);
+    Tensor tCsBpEB_s2r1 = s2r_thr_copy_BpEB1.partition_S(sBpEB);
+    Tensor tCsEAR_s2r1 = s2r_thr_copy_EAR1.partition_S(sEAR);
+    Tensor tCrBpEB_view1 = s2r_thr_copy_BpEB1.retile_D(tCrBpEB);
+    Tensor tCrEAR_view1 = s2r_thr_copy_EAR1.retile_D(tCrEAR);
+#endif
+
     StorePipelineState smem_pipe_read_BpEB;
     LoadPipelineState smem_pipe_read_EAR;
 
@@ -567,16 +584,36 @@ class NoisingKernelB {
       pipeline_BpEB.consumer_wait(smem_pipe_read_BpEB);
       pipeline_EAR.consumer_wait(smem_pipe_read_EAR);
       cutlass::arch::fence_view_async_shared();
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrEARxBpEB);
       warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      cute::copy(s2r_tiled_copy_BpEB1,
+                 tCsBpEB_s2r1(_, _, _, smem_pipe_read_BpEB.index()),
+                 tCrBpEB_view1(_, _, _, smem_pipe_read_BpEB.index()));
+      cute::copy(s2r_tiled_copy_EAR1,
+                 tCsEAR_s2r1(_, _, _, smem_pipe_read_EAR.index()),
+                 tCrEAR_view1(_, _, _, smem_pipe_read_EAR.index()));
+#endif
       // WGMMA with dispatch mode (V,M,K) x (V,N,K) => (V,M,N)
       gemm(tiled_mma, tCrBpEB(_, _, _, smem_pipe_read_BpEB.index()),
            tCrEAR(_, _, _, smem_pipe_read_EAR.index()), tCrEARxBpEB);
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
+#endif
       // Wait for all MMAs across warp group to complete
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_wait<0>();
+#endif
 
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrEARxBpEB);
+#endif
 
       cutlass::arch::fence_view_async_shared();
       pipeline_BpEB.consumer_release(smem_pipe_read_BpEB);
@@ -627,14 +664,32 @@ class NoisingKernelB {
     // (1, REST_N, REST_R) -- tensor of WGMMA descriptors, 1 per atom
     Tensor tCrEBR = thr_mma.make_fragment_A(tCsEBR);
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    using S2RCopyAtom_NB2 = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+    auto s2r_tiled_copy_EBR2 = make_tiled_copy_A(S2RCopyAtom_NB2{}, tiled_mma);
+    auto s2r_thr_copy_EBR2 = s2r_tiled_copy_EBR2.get_thread_slice(tid);
+    Tensor tCsEBR_s2r2 = s2r_thr_copy_EBR2.partition_S(sEBR);
+    Tensor tCrEBR_view2 = s2r_thr_copy_EBR2.retile_D(tCrEBR);
+#endif
+
     // (ATOM, REST_K, REST_R)
     Tensor tCsEBL = thr_mma.partition_B(sEBL);
     // (1, REST_K, REST_R) -- tensor of WGMMA descriptors, 1 per atom
     Tensor tCrEBL = thr_mma.make_fragment_B(tCsEBL);
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    auto s2r_tiled_copy_EBL2 = make_tiled_copy_B(S2RCopyAtom_NB2{}, tiled_mma);
+    auto s2r_thr_copy_EBL2 = s2r_tiled_copy_EBL2.get_thread_slice(tid);
+    Tensor tCsEBL_s2r2 = s2r_thr_copy_EBL2.partition_S(sEBL);
+    Tensor tCrEBL_view2 = s2r_thr_copy_EBL2.retile_D(tCrEBL);
+#endif
+
     // Wait for EBR load. It does not change with K, so only once
     uint64_t* EBR_mbar = &shared_storage.EBR_mbar;
     ProducerBarType::wait(EBR_mbar, 0);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    cute::copy(s2r_tiled_copy_EBR2, tCsEBR_s2r2, tCrEBR_view2);
+#endif
 
     // S2R copy for B to add to the accumulator
     TiledMmaNKR_half tiled_mma_half;
@@ -668,13 +723,24 @@ class NoisingKernelB {
       clear(tCrBpEB);  // We store every iter so we need to clear
       // WGMMA: B + EBR * EBL
       pipeline_EBL.consumer_wait(smem_pipe_read_EBL);
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrBpEB);
       warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      cute::copy(s2r_tiled_copy_EBL2,
+                 tCsEBL_s2r2(_, _, _, smem_pipe_read_EBL.index()),
+                 tCrEBL_view2(_, _, _, smem_pipe_read_EBL.index()));
+#endif
       gemm(tiled_mma, tCrEBR, tCrEBL(_, _, _, smem_pipe_read_EBL.index()),
            tCrBpEB);
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
       warpgroup_wait<0>();
       warpgroup_fence_operand(tCrBpEB);
+#endif
 
       pipeline_EBL.consumer_release(smem_pipe_read_EBL);
       ++smem_pipe_read_EBL;

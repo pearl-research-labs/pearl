@@ -86,7 +86,11 @@ CORES_PER_JOB = 1
 FALLBACK_MAX_JOBS = 4
 KB_PER_GB = 1024 * 1024
 NVCC_THREAD_COUNT = "4"
-COMPUTE_CAPABILITY = "arch=compute_90a,code=sm_90a"
+# Default to Hopper (sm_90a). Set PEARL_GEMM_ARCH to override, e.g.:
+#   PEARL_GEMM_ARCH=sm_120a  (consumer Blackwell)
+#   PEARL_GEMM_ARCH=sm_121a  (GB10 Grace Blackwell)
+_TARGET_ARCH = os.environ.get("PEARL_GEMM_ARCH", "sm_90a")
+COMPUTE_CAPABILITY = f"arch=compute_{_TARGET_ARCH[3:]},code={_TARGET_ARCH}"
 
 
 def linux_total_ram_kb() -> int:
@@ -425,11 +429,20 @@ if not SKIP_CUDA_BUILD:
         cutlass_dir / "tools" / "util" / "include",
     ]
     if sys.platform.startswith("linux"):
-        cuda_cccl_include_dir = (
-            Path(CUDA_HOME) / "targets" / f"{platform.machine()}-linux" / "include" / "cccl"
-        )
-        if cuda_cccl_include_dir.exists():
-            include_dirs.append(cuda_cccl_include_dir)
+        # CUDA 12 layout: <cuda>/targets/<arch>-linux/include/cccl
+        # CUDA 13 aarch64 (Grace) layout: <cuda>/include/cccl  (path was simplified upstream)
+        candidate_cccl_dirs = [
+            Path(CUDA_HOME) / "targets" / f"{platform.machine()}-linux" / "include" / "cccl",
+            Path(CUDA_HOME) / "include" / "cccl",
+        ]
+        for cuda_cccl_include_dir in candidate_cccl_dirs:
+            if cuda_cccl_include_dir.exists():
+                include_dirs.append(cuda_cccl_include_dir)
+                # PyTorch CUDAExtension include_dirs doesn't reliably propagate to the host
+                # C++ compiler for .cpp translation units. Pass it explicitly via -I so files
+                # like pearl_gemm_api.cpp can resolve <cuda/std/utility> et al used by CUTLASS.
+                gcc_flags.append(f"-I{cuda_cccl_include_dir}")
+                break
 
     # Get PyTorch library path for rpath
     torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
