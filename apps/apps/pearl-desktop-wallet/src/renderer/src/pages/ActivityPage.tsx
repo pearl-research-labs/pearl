@@ -52,8 +52,8 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
 
   // run resolves to the success notice, or null for none. A rejected
   // rebroadcast deletes its record, so errors go to a dialog rather than the
-  // row, and only the reloaded listing tells a rejection from a failure that
-  // kept the record.
+  // row. reload() is only the current page, so a send that is still in the
+  // wallet can fall out of that window; membership is the full listing.
   const runPendingAction = async (
     txid: string,
     action: PendingAction,
@@ -75,11 +75,21 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
     }
     setBusy(null);
 
-    const [rows] = await Promise.all([reload(), syncWalletData()]);
+    const recorded =
+      failure !== null && action === 'rebroadcast'
+        ? window.appBridge.wallet.listAllTransactions().then(
+            txs => txs.some(tx => tx.txid === txid),
+            err => {
+              console.error('Failed to check whether the transaction remains:', err);
+              return null;
+            }
+          )
+        : Promise.resolve<boolean | null>(null);
+
+    const [, stillPresent] = await Promise.all([reload(), recorded, syncWalletData()]);
     if (failure === null) return;
 
-    const dropped =
-      action === 'rebroadcast' && rows !== null && !rows.some(tx => tx.txid === txid);
+    const dropped = stillPresent === false;
     void window.appBridge.window.showMessageBox({
       type: 'error',
       title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
