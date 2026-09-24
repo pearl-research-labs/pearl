@@ -3815,6 +3815,11 @@ const (
 	// publish reached a peer, and a round with no takers is a transient
 	// peer condition, so the record is kept.
 	republish
+
+	// rebroadcast is republish on the user's request, and also keeps the
+	// record through a rejection: under SPV one peer can reject what others
+	// still hold, so dropping the spend is left to RemoveTransaction.
+	rebroadcast
 )
 
 // publishTransaction attempts to send an unconfirmed transaction to the
@@ -3842,7 +3847,7 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 		return &txid, nil
 
 	case errors.Is(rpcErr, chain.ErrTxNotRelayed):
-		if mode == republish {
+		if mode != publishNew {
 			log.Infof("Keeping unrelayed transaction for the next "+
 				"rebroadcast: %v", rpcErr)
 			return nil, rpcErr
@@ -3872,6 +3877,9 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 
 	// Log the causing error, even if we know how to handle it.
 	log.Infof("%v: broadcast failed because of: %v", txid, rpcErr)
+	if mode == rebroadcast {
+		return nil, rpcErr
+	}
 
 	// If the transaction was rejected for whatever other reason, then
 	// we'll remove it from the transaction store, as otherwise, we'll

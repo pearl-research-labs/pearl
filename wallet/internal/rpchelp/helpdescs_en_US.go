@@ -443,7 +443,7 @@ var helpDescsEnUS = map[string]string{
 
 	// RebroadcastTransactionCmd help.
 	"rebroadcasttransaction--synopsis": "Announces an unconfirmed transaction to the network again, preceded by any of its unconfirmed ancestors in dependency order.\n" +
-		"Under SPV a transaction is announced exactly once when sent and never again automatically; this is the explicit way to try again. Fails with the daemon's not-relayed error when no peer requests it, which is ambiguous by construction: peers that already hold the transaction stay silent.",
+		"Under SPV a transaction is announced exactly once when sent and never again automatically; this is the explicit way to try again. Fails with the daemon's not-relayed error when no peer requests it, which is ambiguous by construction: peers that already hold the transaction stay silent. A rejection is reported and the transaction kept; removetransaction drops it.",
 	"rebroadcasttransaction-txid":            "Hash of the unconfirmed transaction to announce",
 	"rebroadcasttransactionresult-announced": "Hashes a peer requested, unconfirmed ancestors first and the requested transaction last",
 	"rebroadcasttransaction--result0":        "",

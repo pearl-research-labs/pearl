@@ -202,7 +202,7 @@ func TestRebroadcastTransaction(t *testing.T) {
 		require.False(t, hasOutPoint(unspent, fundingOut))
 	})
 
-	t.Run("rejection removes the record", func(t *testing.T) {
+	t.Run("rejection keeps the record", func(t *testing.T) {
 		w, client, fundingOut, _, child := pendingChain(t)
 		client.sendRawTransactionFunc = sendResult(chain.ErrMissingInputs)
 
@@ -210,8 +210,8 @@ func TestRebroadcastTransaction(t *testing.T) {
 		require.ErrorIs(t, err, chain.ErrMissingInputs)
 
 		unmined, unspent := walletTxState(t, w)
-		require.Empty(t, unmined, "removing the parent takes the child")
-		require.True(t, hasOutPoint(unspent, fundingOut))
+		require.Len(t, unmined, 2)
+		require.False(t, hasOutPoint(unspent, fundingOut))
 	})
 
 	t.Run("refuses a confirmed transaction", func(t *testing.T) {

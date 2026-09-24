@@ -114,8 +114,8 @@ func (w *Wallet) RemoveTransaction(txHash chainhash.Hash) ([]chainhash.Hash,
 // dependency order. Without a wallet-side retry loop a child whose parent no
 // peer holds would otherwise stay an orphan forever.
 //
-// It stops at the first failure. A chain.ErrTxNotRelayed keeps the record; a
-// rejection removes it, as any resend does.
+// It stops at the first failure and keeps every record, rejected or not;
+// dropping one is the user's call via RemoveTransaction.
 func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) (
 	[]chainhash.Hash, error) {
 
@@ -141,7 +141,7 @@ func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) (
 
 	announced := make([]chainhash.Hash, 0, len(toAnnounce))
 	for _, tx := range toAnnounce {
-		hash, err := w.publishTransaction(tx, republish)
+		hash, err := w.publishTransaction(tx, rebroadcast)
 		if err != nil {
 			return nil, err
 		}
