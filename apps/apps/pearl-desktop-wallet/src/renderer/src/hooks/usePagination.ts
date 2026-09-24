@@ -10,7 +10,7 @@ interface UsePaginationResult {
   loading: boolean;
   hasMore: boolean;
   loadMore: () => Promise<void>;
-  reload: () => Promise<void>;
+  reload: () => Promise<Transaction[] | null>;
 }
 
 export function usePagination(options: UsePaginationOptions = {}): UsePaginationResult {
@@ -56,8 +56,10 @@ export function usePagination(options: UsePaginationOptions = {}): UsePagination
       setActivities(txs);
       setOffset(loaded);
       setHasMore(txs.length >= loaded);
+      return txs;
     } catch (err) {
       console.error('Failed to reload activities:', err);
+      return null;
     } finally {
       setLoading(false);
     }

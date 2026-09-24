@@ -7,7 +7,6 @@ import { formatTimeAgo, getErrorMessage } from '@/lib/utils';
 import {
   isNotRelayedError,
   pendingStatusLabel,
-  rebroadcastKeptRecord,
   REBROADCAST_NOT_RELAYED_MESSAGE,
   REBROADCAST_REJECTED_DETAIL,
   REMOVE_WARNING,
@@ -51,9 +50,10 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
   const [busy, setBusy] = useState<{ txid: string; action: PendingAction } | null>(null);
   const [notice, setNotice] = useState<PendingNotice | null>(null);
 
-  // run resolves to the success notice, or null for none. The listing is
-  // refetched whatever happens, and a rejected rebroadcast deletes its
-  // record, so errors go to a dialog: an inline notice could have no row.
+  // run resolves to the success notice, or null for none. A rejected
+  // rebroadcast deletes its record, so errors go to a dialog rather than the
+  // row, and only the reloaded listing tells a rejection from a failure that
+  // kept the record.
   const runPendingAction = async (
     txid: string,
     action: PendingAction,
@@ -61,6 +61,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
   ) => {
     setBusy({ txid, action });
     setNotice(null);
+    let failure: string | null = null;
     try {
       const message = await run();
       if (message) setNotice({ txid, tone: 'success', message });
@@ -69,21 +70,23 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
       if (action === 'rebroadcast' && isNotRelayedError(message)) {
         setNotice({ txid, tone: 'warning', message: REBROADCAST_NOT_RELAYED_MESSAGE });
       } else {
-        void window.appBridge.window.showMessageBox({
-          type: 'error',
-          title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
-          message,
-          detail:
-            action === 'rebroadcast' && !rebroadcastKeptRecord(message)
-              ? REBROADCAST_REJECTED_DETAIL
-              : undefined,
-          buttons: ['OK'],
-        });
+        failure = message;
       }
-    } finally {
-      setBusy(null);
-      await Promise.all([reload(), syncWalletData()]);
     }
+    setBusy(null);
+
+    const [rows] = await Promise.all([reload(), syncWalletData()]);
+    if (failure === null) return;
+
+    const dropped =
+      action === 'rebroadcast' && rows !== null && !rows.some(tx => tx.txid === txid);
+    void window.appBridge.window.showMessageBox({
+      type: 'error',
+      title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
+      message: failure,
+      detail: dropped ? REBROADCAST_REJECTED_DETAIL : undefined,
+      buttons: ['OK'],
+    });
   };
 
   const handleRebroadcast = (txid: string) =>
