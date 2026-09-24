@@ -7,6 +7,7 @@ import { formatTimeAgo, getErrorMessage } from '@/lib/utils';
 import {
   isNotRelayedError,
   pendingStatusLabel,
+  rebroadcastKeptRecord,
   REBROADCAST_NOT_RELAYED_MESSAGE,
   REBROADCAST_REJECTED_DETAIL,
   REMOVE_WARNING,
@@ -72,7 +73,10 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
           type: 'error',
           title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
           message,
-          detail: action === 'rebroadcast' ? REBROADCAST_REJECTED_DETAIL : undefined,
+          detail:
+            action === 'rebroadcast' && !rebroadcastKeptRecord(message)
+              ? REBROADCAST_REJECTED_DETAIL
+              : undefined,
           buttons: ['OK'],
         });
       }
