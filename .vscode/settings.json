@@ -1,3 +1,4 @@
 {
-    "go.buildTags": "rpctest,xmss,zkpow"
+    "go.buildTags": "rpctest,xmss,zkpow",
+    "editor.rulers": [120]
 }
