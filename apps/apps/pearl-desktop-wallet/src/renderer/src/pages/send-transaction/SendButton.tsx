@@ -12,7 +12,7 @@ export default function SendButton({ disabled, isLoading, onClick }: SendButtonP
     <Button
       onClick={onClick}
       disabled={disabled}
-      className="flex h-12 w-full items-center justify-center gap-2 rounded-xl py-3 font-semibold disabled:bg-gray-300 disabled:text-gray-500"
+      className="flex h-12 w-full items-center justify-center gap-2 rounded-xl py-3 font-semibold disabled:bg-gray-300 dark:disabled:bg-muted disabled:text-gray-500 dark:disabled:text-muted-foreground"
     >
       {isLoading ? (
         <>

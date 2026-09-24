@@ -73,14 +73,14 @@ export default function ChangePassword() {
   return (
     <div className="flex h-full w-full flex-col bg-transparent">
       {/* Header */}
-      <div className="flex flex-shrink-0 items-center gap-4 border-b border-gray-200 bg-white/80 p-6 shadow-sm backdrop-blur-sm">
+      <div className="flex flex-shrink-0 items-center gap-4 border-b border-gray-200 dark:border-border bg-white/80 dark:bg-card/80 p-6 shadow-sm backdrop-blur-sm">
         <button
           onClick={() => navigate('/wallet')}
-          className="rounded-lg p-2 transition-colors hover:bg-gray-100"
+          className="rounded-lg p-2 transition-colors hover:bg-gray-100 dark:hover:bg-muted"
         >
-          <ArrowLeft className="h-5 w-5 text-gray-700" />
+          <ArrowLeft className="h-5 w-5 text-gray-700 dark:text-foreground/90" />
         </button>
-        <h1 className="text-xl font-semibold text-gray-900">Change Password</h1>
+        <h1 className="text-xl font-semibold text-gray-900 dark:text-foreground">Change Password</h1>
       </div>
 
       {/* Content */}
@@ -91,28 +91,28 @@ export default function ChangePassword() {
             <div className="mb-6 inline-flex h-16 w-16 items-center justify-center rounded-full bg-amber-600">
               <Key className="h-8 w-8 text-white" />
             </div>
-            <h2 className="mb-2 text-2xl font-bold text-gray-900">Change Wallet Password</h2>
-            <p className="text-gray-600">Update the password for wallet "{walletName}"</p>
+            <h2 className="mb-2 text-2xl font-bold text-gray-900 dark:text-foreground">Change Wallet Password</h2>
+            <p className="text-gray-600 dark:text-muted-foreground">Update the password for wallet "{walletName}"</p>
           </div>
 
           {/* Change Password Form */}
           <form onSubmit={handleChangePassword} className="w-full space-y-6">
             {/* Current Password */}
             <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">Current Password</label>
+              <label className="text-sm font-medium text-gray-700 dark:text-foreground/90">Current Password</label>
               <div className="relative">
                 <input
                   type={showCurrentPassword ? 'text' : 'password'}
                   value={currentPassword}
                   onChange={e => setCurrentPassword(e.target.value)}
                   placeholder="Enter your current password"
-                  className="focus:border-brand-green focus:ring-brand-green/20 w-full rounded-lg border border-gray-300 bg-white px-4 py-3 pr-12 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2"
+                  className="focus:border-brand-green focus:ring-brand-green/20 w-full rounded-lg border border-gray-300 dark:border-border bg-white dark:bg-card px-4 py-3 pr-12 text-gray-900 dark:text-foreground placeholder-gray-400 dark:placeholder-muted-foreground/70 focus:outline-none focus:ring-2"
                   disabled={isChanging}
                 />
                 <button
                   type="button"
                   onClick={() => setShowCurrentPassword(!showCurrentPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 transition-colors hover:text-gray-700"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 dark:text-muted-foreground transition-colors hover:text-gray-700 dark:hover:text-foreground"
                   disabled={isChanging}
                 >
                   {showCurrentPassword ? (
@@ -126,20 +126,20 @@ export default function ChangePassword() {
 
             {/* New Password */}
             <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">New Password</label>
+              <label className="text-sm font-medium text-gray-700 dark:text-foreground/90">New Password</label>
               <div className="relative">
                 <input
                   type={showNewPassword ? 'text' : 'password'}
                   value={newPassword}
                   onChange={e => setNewPassword(e.target.value)}
                   placeholder="Enter a new secure password"
-                  className="focus:border-brand-green focus:ring-brand-green/20 w-full rounded-lg border border-gray-300 bg-white px-4 py-3 pr-12 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2"
+                  className="focus:border-brand-green focus:ring-brand-green/20 w-full rounded-lg border border-gray-300 dark:border-border bg-white dark:bg-card px-4 py-3 pr-12 text-gray-900 dark:text-foreground placeholder-gray-400 dark:placeholder-muted-foreground/70 focus:outline-none focus:ring-2"
                   disabled={isChanging}
                 />
                 <button
                   type="button"
                   onClick={() => setShowNewPassword(!showNewPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 transition-colors hover:text-gray-700"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 dark:text-muted-foreground transition-colors hover:text-gray-700 dark:hover:text-foreground"
                   disabled={isChanging}
                 >
                   {showNewPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
@@ -154,20 +154,20 @@ export default function ChangePassword() {
 
             {/* Confirm New Password */}
             <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">Confirm New Password</label>
+              <label className="text-sm font-medium text-gray-700 dark:text-foreground/90">Confirm New Password</label>
               <div className="relative">
                 <input
                   type={showConfirmPassword ? 'text' : 'password'}
                   value={confirmPassword}
                   onChange={e => setConfirmPassword(e.target.value)}
                   placeholder="Confirm your new password"
-                  className="focus:border-brand-green focus:ring-brand-green/20 w-full rounded-lg border border-gray-300 bg-white px-4 py-3 pr-12 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2"
+                  className="focus:border-brand-green focus:ring-brand-green/20 w-full rounded-lg border border-gray-300 dark:border-border bg-white dark:bg-card px-4 py-3 pr-12 text-gray-900 dark:text-foreground placeholder-gray-400 dark:placeholder-muted-foreground/70 focus:outline-none focus:ring-2"
                   disabled={isChanging}
                 />
                 <button
                   type="button"
                   onClick={() => setShowConfirmPassword(!showConfirmPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 transition-colors hover:text-gray-700"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-500 dark:text-muted-foreground transition-colors hover:text-gray-700 dark:hover:text-foreground"
                   disabled={isChanging}
                 >
                   {showConfirmPassword ? (
@@ -181,17 +181,17 @@ export default function ChangePassword() {
 
             {/* Error Message */}
             {error && (
-              <div className="flex items-center gap-3 rounded-lg border border-red-200 bg-red-50 p-4">
-                <AlertCircle className="h-5 w-5 flex-shrink-0 text-red-600" />
-                <span className="text-red-700">{error}</span>
+              <div className="flex items-center gap-3 rounded-lg border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 p-4">
+                <AlertCircle className="h-5 w-5 flex-shrink-0 text-red-600 dark:text-red-400" />
+                <span className="text-red-700 dark:text-red-300">{error}</span>
               </div>
             )}
 
             {/* Success Message */}
             {success && (
-              <div className="flex items-center gap-3 rounded-lg border border-green-200 bg-green-50 p-4">
-                <CheckCircle2 className="h-5 w-5 flex-shrink-0 text-green-600" />
-                <span className="text-green-700">{success}</span>
+              <div className="flex items-center gap-3 rounded-lg border border-green-200 dark:border-green-900 bg-green-50 dark:bg-green-950/40 p-4">
+                <CheckCircle2 className="h-5 w-5 flex-shrink-0 text-green-600 dark:text-green-400" />
+                <span className="text-green-700 dark:text-green-300">{success}</span>
               </div>
             )}
 
@@ -204,7 +204,7 @@ export default function ChangePassword() {
                 !newPassword.trim() ||
                 !confirmPassword.trim()
               }
-              className="flex w-full items-center justify-center gap-2 rounded-xl bg-amber-500 py-4 font-semibold text-white transition-colors hover:bg-amber-600 disabled:bg-gray-300 disabled:text-gray-500"
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-amber-500 py-4 font-semibold text-white transition-colors hover:bg-amber-600 disabled:bg-gray-300 dark:disabled:bg-muted disabled:text-gray-500 dark:disabled:text-muted-foreground"
             >
               {isChanging ? (
                 <>
@@ -221,10 +221,10 @@ export default function ChangePassword() {
           </form>
 
           {/* Security Notice */}
-          <div className="mt-6 rounded-lg border bg-amber-50 p-4">
+          <div className="mt-6 rounded-lg border bg-amber-50 dark:bg-amber-950/40 p-4">
             <div className="text-sm">
-              <p className="mb-2 font-medium text-amber-800">Security Notice:</p>
-              <ul className="space-y-1 text-amber-700">
+              <p className="mb-2 font-medium text-amber-800 dark:text-amber-200">Security Notice:</p>
+              <ul className="space-y-1 text-amber-700 dark:text-amber-300">
                 <li>• Make sure to remember your new password</li>
                 <li>• This will update the password for all wallet operations</li>
               </ul>

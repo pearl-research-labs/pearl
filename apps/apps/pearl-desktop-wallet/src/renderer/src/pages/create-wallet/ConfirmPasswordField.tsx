@@ -18,7 +18,7 @@ export default function ConfirmPasswordField({
 }: ConfirmPasswordFieldProps) {
   return (
     <div className="space-y-2">
-      <Label htmlFor="confirmPassword" className="text-gray-900">
+      <Label htmlFor="confirmPassword" className="text-gray-900 dark:text-foreground">
         Confirm Password
       </Label>
       <div className="relative">
@@ -26,14 +26,14 @@ export default function ConfirmPasswordField({
           type={showConfirmPassword ? 'text' : 'password'}
           onChange={e => onChange(e.target.value)}
           placeholder="Confirm your password"
-          className="focus:border-brand-green focus:ring-brand-green/20 border-gray-300 bg-white pr-10 text-gray-900 shadow-sm focus:ring-2"
+          className="focus:border-brand-green focus:ring-brand-green/20 border-gray-300 dark:border-border bg-white dark:bg-card pr-10 text-gray-900 dark:text-foreground shadow-sm focus:ring-2"
           disabled={disabled}
         />
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          className="absolute right-1 top-1 h-8 w-8 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+          className="absolute right-1 top-1 h-8 w-8 text-gray-500 dark:text-muted-foreground hover:bg-gray-100 dark:hover:bg-muted hover:text-gray-700 dark:hover:text-foreground"
           onClick={() => setShowConfirmPassword(!showConfirmPassword)}
         >
           {showConfirmPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}

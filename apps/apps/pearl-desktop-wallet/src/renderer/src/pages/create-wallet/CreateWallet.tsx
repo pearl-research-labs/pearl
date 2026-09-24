@@ -69,7 +69,7 @@ export default function CreateWallet() {
   };
 
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-transparent text-gray-900">
+    <div className="flex h-full w-full flex-col overflow-hidden bg-transparent text-gray-900 dark:text-foreground">
       {/* Header - Fixed */}
       <Header
         title="Create Wallet"

@@ -56,7 +56,7 @@ export function NetworkSelector() {
 
     return (
         <div className="flex items-center gap-3">
-            <span className="text-sm text-gray-600">Network:</span>
+            <span className="text-sm text-gray-600 dark:text-muted-foreground">Network:</span>
             <Select
                 value={networkInfo.currentNetwork}
                 onValueChange={handleNetworkChange}

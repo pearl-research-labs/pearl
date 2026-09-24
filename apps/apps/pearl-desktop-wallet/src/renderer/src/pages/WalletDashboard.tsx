@@ -3,6 +3,7 @@ import { Copy, CheckCircle2, ArrowUpRight, ArrowDownLeft, Lock, Key, Loader2 } f
 import { useNavigate } from 'react-router-dom';
 import { useWalletStore } from '../store/walletStore';
 import { formatPearlAmount } from '../lib/crypto';
+import { ThemeToggle } from '../components/ThemeToggle';
 import {
   Tooltip,
   TooltipContent,
@@ -80,7 +81,11 @@ export default function WalletDashboard() {
   };
 
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-transparent">
+    <div className="relative flex h-full w-full flex-col overflow-hidden bg-transparent">
+      {/* Theme - Top Right, as on the welcome and unlock screens */}
+      <div className="absolute right-8 top-8 z-10">
+        <ThemeToggle />
+      </div>
       {/* Main Content Area */}
       <div className="flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-8">
         <div className="w-full max-w-md flex-shrink-0 space-y-6 sm:space-y-8">
@@ -89,18 +94,18 @@ export default function WalletDashboard() {
 
           {/* Wallet Name */}
           <div className="text-center">
-            <h1 className="text-2xl font-medium text-gray-900">{walletName}</h1>
+            <h1 className="text-2xl font-medium text-gray-900 dark:text-foreground">{walletName}</h1>
           </div>
 
           {/* Address Display - only show if wallet name is default */}
           {walletAddress && walletName === 'Pearl Wallet' && (
-            <div className="flex items-center justify-center gap-3 text-gray-600">
+            <div className="flex items-center justify-center gap-3 text-gray-600 dark:text-muted-foreground">
               <span className="font-mono text-base" title={`Full address: ${walletAddress}`}>
                 {walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}
               </span>
               <button
                 onClick={() => copyToClipboard(walletAddress)}
-                className="p-1.5 transition-colors hover:text-gray-900"
+                className="p-1.5 transition-colors hover:text-gray-900 dark:hover:text-foreground"
               >
                 {copiedAddress === walletAddress ? (
                   <CheckCircle2 className="text-brand-green h-4 w-4" />
@@ -113,13 +118,13 @@ export default function WalletDashboard() {
 
           {/* Balance Section */}
           <div className="space-y-2 text-center">
-            <div className="text-base text-gray-600">Total Balance</div>
+            <div className="text-base text-gray-600 dark:text-muted-foreground">Total Balance</div>
             {typeof balance === 'number' ? (
-              <div className="text-4xl font-bold text-gray-900 sm:text-5xl text-nowrap">
+              <div className="text-4xl font-bold text-gray-900 dark:text-foreground sm:text-5xl text-nowrap">
                 {formatPearlAmount(balance)} PRL
               </div>
             ) : (
-              <Loader2 className="mx-auto h-6 w-6 animate-spin text-gray-900 sm:h-8 sm:w-8" />
+              <Loader2 className="mx-auto h-6 w-6 animate-spin text-gray-900 dark:text-foreground sm:h-8 sm:w-8" />
             )}
 
             {!isBlockchainSynced && bestPeerHeight > 0 && (
@@ -143,7 +148,7 @@ export default function WalletDashboard() {
                       : 'Starts after headers finish downloading'
                   }
                 />
-                <p className="text-xs text-amber-600">
+                <p className="text-xs text-amber-600 dark:text-amber-400">
                   Balance may not reflect all transactions until sync is complete
                 </p>
               </div>
@@ -167,7 +172,7 @@ export default function WalletDashboard() {
                 <div className="grid w-full grid-cols-2 gap-3 sm:gap-4">
                   <ActionTile
                     onClick={() => navigate('/send')}
-                    icon={<ArrowUpRight className="h-4 w-4 text-white sm:h-5 sm:w-5" />}
+                    icon={<ArrowUpRight className="h-4 w-4 text-white dark:text-background sm:h-5 sm:w-5" />}
                     label="Send"
                     disabled={actionsBlocked}
                     disabledTooltip={blockedTooltip}
@@ -175,7 +180,7 @@ export default function WalletDashboard() {
 
                   <ActionTile
                     onClick={() => navigate('/receive')}
-                    icon={<ArrowDownLeft className="h-4 w-4 text-white sm:h-5 sm:w-5" />}
+                    icon={<ArrowDownLeft className="h-4 w-4 text-white dark:text-background sm:h-5 sm:w-5" />}
                     label="Receive"
                     disabled={actionsBlocked}
                     disabledTooltip={blockedTooltip}
@@ -183,7 +188,7 @@ export default function WalletDashboard() {
 
                   <ActionTile
                     onClick={() => navigate('/change-password')}
-                    icon={<Key className="h-4 w-4 text-white sm:h-5 sm:w-5" />}
+                    icon={<Key className="h-4 w-4 text-white dark:text-background sm:h-5 sm:w-5" />}
                     label="Password"
                     disabled={actionsBlocked}
                     disabledTooltip={blockedTooltip}
@@ -191,7 +196,7 @@ export default function WalletDashboard() {
 
                   <ActionTile
                     onClick={handleLockWallet}
-                    icon={<Lock className="h-4 w-4 text-white sm:h-5 sm:w-5" />}
+                    icon={<Lock className="h-4 w-4 text-white dark:text-background sm:h-5 sm:w-5" />}
                     label="Lock"
                   />
                 </div>
@@ -202,7 +207,7 @@ export default function WalletDashboard() {
           {/* Activity Section */}
           <div className="w-full">
             <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-lg font-medium text-gray-900">Activity</h3>
+              <h3 className="text-lg font-medium text-gray-900 dark:text-foreground">Activity</h3>
               <button
                 onClick={() => navigate('/activity')}
                 className="text-brand-green hover:text-brand-green/80 text-sm transition-colors"
@@ -214,32 +219,32 @@ export default function WalletDashboard() {
             {/* Real Activity Data */}
             <div className="space-y-3">
               {activitiesPreview.length === 0 ? (
-                <div className="rounded-lg border border-gray-200 bg-white py-8 text-center shadow-sm">
-                  <p className="text-sm text-gray-500">No recent activity</p>
+                <div className="rounded-lg border border-gray-200 dark:border-border bg-white dark:bg-card py-8 text-center shadow-sm">
+                  <p className="text-sm text-gray-500 dark:text-muted-foreground">No recent activity</p>
                 </div>
               ) : (
                 activitiesPreview.map(activity => (
                   <div
                     key={`${activity.type}_${activity.txid}_${activity.amount}`}
-                    className="flex items-center justify-between rounded-lg border border-gray-200 bg-white p-4 shadow-sm transition-shadow hover:shadow-md"
+                    className="flex items-center justify-between rounded-lg border border-gray-200 dark:border-border bg-white dark:bg-card p-4 shadow-sm transition-shadow hover:shadow-md"
                   >
                     <div className="flex items-center gap-3">
-                      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gray-100">
+                      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gray-100 dark:bg-muted">
                         {activity.type === 'received' ? (
-                          <ArrowDownLeft className="text-green-700 h-4 w-4" />
+                          <ArrowDownLeft className="text-green-700 dark:text-green-300 h-4 w-4" />
                         ) : (
                           <ArrowUpRight className="h-4 w-4 text-red-500" />
                         )}
                       </div>
                       <div>
-                        <div className="text-sm font-medium text-gray-900">
+                        <div className="text-sm font-medium text-gray-900 dark:text-foreground">
                           {activity.type === 'received' ? 'Received' : 'Sent'}
                         </div>
-                        <div className="text-xs text-gray-500">{formatTimeAgo(activity.time)}</div>
+                        <div className="text-xs text-gray-500 dark:text-muted-foreground">{formatTimeAgo(activity.time)}</div>
                       </div>
                     </div>
                     <div
-                      className={`text-sm font-medium ${activity.type === 'received' ? 'text-green-700' : 'text-red-500'
+                      className={`text-sm font-medium ${activity.type === 'received' ? 'text-green-700 dark:text-green-300' : 'text-red-500'
                         }`}
                     >
                       {activity.type === 'received' ? '+' : '-'}
@@ -271,9 +276,9 @@ function ActionTile({ onClick, icon, label, disabled = false, disabledTooltip }:
   const baseClasses =
     'flex w-full flex-col items-center gap-2 rounded-lg border p-4 shadow-sm transition-all sm:gap-3 sm:p-5';
   const enabledClasses =
-    'cursor-pointer border-gray-200 bg-white hover:border-gray-300 hover:shadow-md';
-  const disabledClasses = 'cursor-not-allowed border-gray-200 bg-gray-100 opacity-60';
-  const iconBg = disabled ? 'bg-gray-400' : 'bg-black';
+    'cursor-pointer border-gray-200 dark:border-border bg-white dark:bg-card hover:border-gray-300 dark:hover:border-muted-foreground/40 hover:shadow-md';
+  const disabledClasses = 'cursor-not-allowed border-gray-200 dark:border-border bg-gray-100 dark:bg-muted opacity-60';
+  const iconBg = disabled ? 'bg-gray-400 dark:bg-muted-foreground/40' : 'bg-black dark:bg-foreground';
 
   const button = (
     <button
@@ -285,7 +290,7 @@ function ActionTile({ onClick, icon, label, disabled = false, disabledTooltip }:
       <div className={`flex h-8 w-8 items-center justify-center rounded-full ${iconBg} sm:h-10 sm:w-10`}>
         {icon}
       </div>
-      <span className="text-sm font-medium text-gray-900 sm:text-base">{label}</span>
+      <span className="text-sm font-medium text-gray-900 dark:text-foreground sm:text-base">{label}</span>
     </button>
   );
 
@@ -326,25 +331,25 @@ function SyncStage({ label, current, total, active, done, note }: SyncStageProps
   // separately from the full-block recovery we're actually waiting on.
   const pending = !active && !done;
   const pct = done ? 100 : pending ? 0 : total > 0 ? Math.min(100, (current / total) * 100) : 0;
-  const barColor = done ? 'bg-green-500' : active ? 'bg-amber-500' : 'bg-gray-300';
-  const labelColor = active ? 'font-medium text-amber-700' : done ? 'text-green-700' : 'text-gray-500';
+  const barColor = done ? 'bg-green-500' : active ? 'bg-amber-500' : 'bg-gray-300 dark:bg-muted';
+  const labelColor = active ? 'font-medium text-amber-700 dark:text-amber-300' : done ? 'text-green-700 dark:text-green-300' : 'text-gray-500 dark:text-muted-foreground';
   const displayCurrent = pending ? '—' : current.toLocaleString();
   const displayTotal = total > 0 ? total.toLocaleString() : '—';
   return (
     <div className="space-y-1">
       <div className="flex items-center justify-between text-xs">
         <span className={labelColor}>{label}</span>
-        <span className="tabular-nums text-gray-500">
+        <span className="tabular-nums text-gray-500 dark:text-muted-foreground">
           {displayCurrent} / {displayTotal}
         </span>
       </div>
-      <div className="mx-auto h-1.5 w-full overflow-hidden rounded-full bg-gray-200">
+      <div className="mx-auto h-1.5 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-muted">
         <div
           className={`h-full rounded-full ${barColor} transition-all duration-500`}
           style={{ width: `${pct}%` }}
         />
       </div>
-      {note && <p className="text-left text-[11px] text-gray-500">{note}</p>}
+      {note && <p className="text-left text-[11px] text-gray-500 dark:text-muted-foreground">{note}</p>}
     </div>
   );
 }

@@ -18,7 +18,7 @@ function AppContent() {
   const navigate = useNavigate();
 
   return (
-    <div className="relative flex h-screen w-full flex-col overflow-hidden bg-gradient-to-br from-gray-50 to-gray-100 font-sans text-gray-900 antialiased">
+    <div className="relative flex h-screen w-full flex-col overflow-hidden bg-gradient-to-br from-gray-50 dark:from-background to-gray-100 dark:to-card font-sans text-gray-900 dark:text-foreground antialiased">
       <MajorUpgradeBanner />
       <div className={`min-h-0 flex-1`}>
         <Routes>

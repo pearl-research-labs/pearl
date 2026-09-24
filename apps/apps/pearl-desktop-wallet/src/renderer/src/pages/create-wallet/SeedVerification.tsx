@@ -69,24 +69,24 @@ export default function SeedVerification({ seed, onSuccess, onBack }: SeedVerifi
 
   return (
     <div className="mx-auto flex w-full max-w-md flex-col items-center">
-      <div className="mb-4 rounded-2xl bg-gray-800 p-3 sm:mb-6 sm:p-4">
+      <div className="mb-4 rounded-2xl bg-gray-800 dark:bg-muted p-3 sm:mb-6 sm:p-4">
         <Shield className="h-8 w-8 text-white sm:h-10 sm:w-10" />
       </div>
 
-      <h2 className="mb-2 text-center text-xl font-bold text-gray-900 sm:text-2xl">
+      <h2 className="mb-2 text-center text-xl font-bold text-gray-900 dark:text-foreground sm:text-2xl">
         Verify Your Seed Phrase
       </h2>
-      <p className="mb-6 text-center text-sm text-gray-600 sm:text-base">
+      <p className="mb-6 text-center text-sm text-gray-600 dark:text-muted-foreground sm:text-base">
         Select the correct word for each position to confirm you've saved your seed phrase.
       </p>
 
-      <Card className="mb-4 w-full border-gray-300 bg-white shadow-sm sm:mb-6">
+      <Card className="mb-4 w-full border-gray-300 dark:border-border bg-white dark:bg-card shadow-sm sm:mb-6">
         <CardContent className="space-y-6 p-4 sm:p-6">
           {QUIZ_POSITIONS.map((pos, qIdx) => (
             <div key={pos}>
-              <label className="mb-3 block text-sm font-medium text-gray-900">
+              <label className="mb-3 block text-sm font-medium text-gray-900 dark:text-foreground">
                 What is word{' '}
-                <span className="font-bold text-gray-900">#{pos + 1}</span> of your seed phrase?
+                <span className="font-bold text-gray-900 dark:text-foreground">#{pos + 1}</span> of your seed phrase?
               </label>
               <div className="grid grid-cols-2 gap-2">
                 {options[qIdx].map(word => (
@@ -95,8 +95,8 @@ export default function SeedVerification({ seed, onSuccess, onBack }: SeedVerifi
                     onClick={() => handleSelect(qIdx, word)}
                     className={`rounded-lg border-2 p-3 font-mono text-sm font-medium transition-all ${
                       selected[qIdx] === word
-                        ? 'border-gray-900 bg-white text-gray-900 shadow-md'
-                        : 'border-gray-300 bg-white text-gray-700 hover:border-gray-400 hover:bg-gray-50'
+                        ? 'border-gray-900 dark:border-foreground bg-white dark:bg-card text-gray-900 dark:text-foreground shadow-md'
+                        : 'border-gray-300 dark:border-border bg-white dark:bg-card text-gray-700 dark:text-foreground/90 hover:border-gray-400 dark:hover:border-muted-foreground/60 hover:bg-gray-50 dark:hover:bg-muted/60'
                     }`}
                   >
                     {word}
@@ -109,14 +109,14 @@ export default function SeedVerification({ seed, onSuccess, onBack }: SeedVerifi
       </Card>
 
       {showError && (
-        <div className="mb-4 w-full rounded-lg border border-red-300 bg-red-50 p-3 shadow-sm sm:mb-6 sm:p-4">
+        <div className="mb-4 w-full rounded-lg border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/40 p-3 shadow-sm sm:mb-6 sm:p-4">
           <div className="flex items-start gap-3">
-            <XCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-600" />
+            <XCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-600 dark:text-red-400" />
             <div className="text-sm">
-              <p className="mb-1 font-medium text-red-900">
+              <p className="mb-1 font-medium text-red-900 dark:text-red-100">
                 {!allAnswered ? 'Please answer all questions' : 'Incorrect words'}
               </p>
-              <p className="text-red-700">
+              <p className="text-red-700 dark:text-red-300">
                 {!allAnswered
                   ? 'You need to select a word for each question to continue.'
                   : 'The words you selected do not match your seed phrase. Please go back and review it carefully.'}
@@ -126,12 +126,12 @@ export default function SeedVerification({ seed, onSuccess, onBack }: SeedVerifi
         </div>
       )}
 
-      <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 shadow-sm sm:mb-6 sm:p-4">
+      <div className="mb-4 rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 p-3 shadow-sm sm:mb-6 sm:p-4">
         <div className="flex items-start gap-3">
-          <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-600" />
+          <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-600 dark:text-amber-400" />
           <div className="text-sm">
-            <p className="mb-1 font-medium text-amber-900">Why this matters:</p>
-            <p className="text-amber-700">
+            <p className="mb-1 font-medium text-amber-900 dark:text-amber-100">Why this matters:</p>
+            <p className="text-amber-700 dark:text-amber-300">
               Your seed phrase is the ONLY way to recover your wallet if you lose access. We need to
               make sure you've saved it properly before continuing.
             </p>
@@ -143,7 +143,7 @@ export default function SeedVerification({ seed, onSuccess, onBack }: SeedVerifi
         <Button
           onClick={onBack}
           variant="outline"
-          className="h-12 flex-1 border-gray-300 text-base shadow-sm"
+          className="h-12 flex-1 border-gray-300 dark:border-border text-base shadow-sm"
         >
           Back to Seed
         </Button>

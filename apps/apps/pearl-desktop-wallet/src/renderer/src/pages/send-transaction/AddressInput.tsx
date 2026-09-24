@@ -17,7 +17,7 @@ export default function AddressInput({ address, onChange, error, onBlur }: Addre
         onChange={e => onChange(e.target.value)}
         onBlur={onBlur}
         placeholder="Insert a recpipient address"
-        className="focus:border-brand-green focus:ring-brand-green/20 w-full rounded-lg border border-gray-300 bg-white px-4 py-3 font-mono text-sm text-gray-900 placeholder-gray-400 shadow-sm focus:outline-none focus:ring-2"
+        className="focus:border-brand-green focus:ring-brand-green/20 w-full rounded-lg border border-gray-300 dark:border-border bg-white dark:bg-card px-4 py-3 font-mono text-sm text-gray-900 dark:text-foreground placeholder-gray-400 dark:placeholder-muted-foreground/70 shadow-sm focus:outline-none focus:ring-2"
       />
       {error && (
         <div className="mt-1 flex items-center gap-1 rounded border border-red-700/30 px-2 py-1 text-xs text-red-400">

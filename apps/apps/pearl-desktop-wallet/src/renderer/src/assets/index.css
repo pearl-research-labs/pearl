@@ -23,6 +23,8 @@
   /* Add dark mode overrides for pearl-desktop-wallet */
   .dark {
     /* Dark mode using the dark greys from the design system */
+    /* Native controls (inputs, scrollbars, selects) render dark too */
+    color-scheme: dark;
     --background: 180 9% 14%;
     /* Grey Dark 3 #202525 */
     --foreground: 90 11% 95%;
@@ -41,8 +43,8 @@
     --secondary-foreground: 90 11% 95%;
     --muted: 180 6% 25%;
     /* Dark Grey 1 */
-    --muted-foreground: 120 5% 91%;
-    /* Light Grey 2 */
+    --muted-foreground: 120 4% 68%;
+    /* Between Light Grey 2 and Dark Grey 1, so secondary text reads as secondary */
     --accent: 185 51% 71%;
     /* Summer Sky */
     --accent-foreground: 0 0% 0%;
