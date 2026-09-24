@@ -40,7 +40,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pearl-research-labs/pearl/apps/packages/pearl-address-validation"
+    "url": "https://github.com/pearl-research-labs/pearl/tree/master/apps/packages/pearl-address-validation"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.17.3",
