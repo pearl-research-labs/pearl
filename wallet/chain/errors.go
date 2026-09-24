@@ -194,8 +194,9 @@ const (
 	ErrNonMandatoryScriptVerifyFlag
 
 	// ErrTxNotRelayed is returned by an SPV backend when no peer requested
-	// the transaction after it was announced, so no peer holds it. Callers
-	// may safely forget the transaction; nothing can confirm it.
+	// the transaction after it was announced. Peers that already hold it
+	// stay silent too, so only a transaction announced for the first time
+	// can safely be forgotten on this error.
 	ErrTxNotRelayed
 
 	// errSentinel is used to indicate the end of the error list. This

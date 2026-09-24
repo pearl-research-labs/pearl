@@ -189,13 +189,35 @@ func TestRebroadcastTransaction(t *testing.T) {
 		require.Equal(t, []chainhash.Hash{parent.TxHash()}, announced)
 	})
 
-	t.Run("not relayed keeps the record", func(t *testing.T) {
-		w, client, fundingOut, _, child := pendingChain(t)
-		client.sendRawTransactionFunc = sendResult(notRelayed)
+	t.Run("a silent parent does not stop the child", func(t *testing.T) {
+		w, client, _, parent, child := pendingChain(t)
+		client.sendRawTransactionFunc = func(tx *wire.MsgTx) (
+			*chainhash.Hash, error) {
+
+			if tx.TxHash() == parent.TxHash() {
+				return nil, notRelayed
+			}
+			return sendResult(nil)(tx)
+		}
 
 		announced, err := w.RebroadcastTransaction(child.TxHash())
+		require.NoError(t, err)
+		require.Equal(t, []chainhash.Hash{child.TxHash()}, announced)
+	})
+
+	t.Run("not relayed keeps the record", func(t *testing.T) {
+		w, client, fundingOut, _, child := pendingChain(t)
+		var sends int
+		client.sendRawTransactionFunc = func(*wire.MsgTx) (
+			*chainhash.Hash, error) {
+
+			sends++
+			return nil, notRelayed
+		}
+
+		_, err := w.RebroadcastTransaction(child.TxHash())
 		require.ErrorIs(t, err, chain.ErrTxNotRelayed)
-		require.Empty(t, announced, "the parent failed first")
+		require.Equal(t, 2, sends)
 
 		unmined, unspent := walletTxState(t, w)
 		require.Len(t, unmined, 2)
@@ -204,27 +226,36 @@ func TestRebroadcastTransaction(t *testing.T) {
 
 	t.Run("rejection keeps the record", func(t *testing.T) {
 		w, client, fundingOut, _, child := pendingChain(t)
-		client.sendRawTransactionFunc = sendResult(chain.ErrMissingInputs)
+		var sends int
+		client.sendRawTransactionFunc = func(*wire.MsgTx) (
+			*chainhash.Hash, error) {
+
+			sends++
+			return nil, chain.ErrMissingInputs
+		}
 
 		_, err := w.RebroadcastTransaction(child.TxHash())
 		require.ErrorIs(t, err, chain.ErrMissingInputs)
+		require.Equal(t, 1, sends, "a rejected ancestor stops the rebroadcast")
 
 		unmined, unspent := walletTxState(t, w)
 		require.Len(t, unmined, 2)
 		require.False(t, hasOutPoint(unspent, fundingOut))
 	})
 
-	t.Run("already known or confirmed keeps the record", func(t *testing.T) {
+	t.Run("already known or confirmed keeps the records", func(t *testing.T) {
 		for _, sendErr := range []error{
 			chain.ErrTxAlreadyKnown,
 			chain.ErrTxAlreadyConfirmed,
 		} {
-			w, client, fundingOut, _, child := pendingChain(t)
+			w, client, fundingOut, parent, child := pendingChain(t)
 			client.sendRawTransactionFunc = sendResult(sendErr)
 
 			announced, err := w.RebroadcastTransaction(child.TxHash())
-			require.ErrorIs(t, err, sendErr)
-			require.Empty(t, announced, "the parent failed first")
+			require.NoError(t, err)
+			require.Equal(t,
+				[]chainhash.Hash{parent.TxHash(), child.TxHash()}, announced,
+			)
 
 			unmined, unspent := walletTxState(t, w)
 			require.Len(t, unmined, 2)

@@ -3801,8 +3801,8 @@ func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx, label string) (*chai
 	return w.publishTransaction(tx, publishNew)
 }
 
-// publishMode tells publishTransaction what to do with the wallet's record of
-// a transaction that no peer requested.
+// publishMode decides which publish outcomes keep the wallet's record of the
+// transaction.
 type publishMode uint8
 
 const (
@@ -3811,22 +3811,20 @@ const (
 	// its inputs behind a spend that can never confirm.
 	publishNew publishMode = iota
 
-	// republish retries a stored record. It only exists because an earlier
-	// publish reached a peer, and a round with no takers is a transient
-	// peer condition, so the record is kept.
+	// republish is the automatic resend after a rescan, to full-node
+	// backends only. A rejection there is the wallet's own node's verdict,
+	// so the record is removed rather than resent forever.
 	republish
 
-	// rebroadcast is republish on the user's request, and also keeps the
-	// record through a rejection: under SPV one peer can reject what others
-	// still hold, so dropping the spend is left to RemoveTransaction.
+	// rebroadcast is the user's explicit retry, which keeps the record
+	// whatever the outcome: under SPV one peer can reject what others still
+	// hold, so dropping the spend is left to RemoveTransaction.
 	rebroadcast
 )
 
 // publishTransaction attempts to send an unconfirmed transaction to the
-// wallet's current backend. In the event that sending the transaction fails for
-// whatever reason, it will be removed from the wallet's unconfirmed transaction
-// store, except for a transaction no peer requested, whose fate is decided by
-// mode.
+// wallet's current backend. If that fails, the transaction is removed from
+// the wallet's unconfirmed transaction store unless mode keeps it.
 func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 	mode publishMode) (*chainhash.Hash, error) {
 
@@ -3865,17 +3863,10 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 	case errors.Is(rpcErr, chain.ErrTxAlreadyKnown),
 		errors.Is(rpcErr, chain.ErrTxAlreadyConfirmed):
 
-		// Under SPV a peer that already holds the transaction answers
-		// with this reject. That is not proof the spend is settled, so
-		// an explicit rebroadcast reports it and keeps the record.
-		// RemoveTransaction is what drops the spend.
-		if mode == rebroadcast {
-			log.Infof("%v: broadcast failed because of: %v", txid, rpcErr)
-			return nil, rpcErr
-		}
-
-		if err := w.removeUnminedTx(tx); err != nil {
-			log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", txid, err)
+		if mode != rebroadcast {
+			if err := w.removeUnminedTx(tx); err != nil {
+				log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", txid, err)
+			}
 		}
 
 		log.Infof("%v: tx already confirmed", txid)

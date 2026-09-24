@@ -111,11 +111,12 @@ func (w *Wallet) RemoveTransaction(txHash chainhash.Hash) ([]chainhash.Hash,
 
 // RebroadcastTransaction announces the pending transaction txHash to the
 // network again, preceded by any of its ancestors that are still pending, in
-// dependency order. Without a wallet-side retry loop a child whose parent no
-// peer holds would otherwise stay an orphan forever.
+// dependency order. Nothing re-announces a parent on its own, so a child
+// whose parent no peer holds would otherwise stay an orphan.
 //
-// It stops at the first failure and keeps every record, rejected or not;
-// dropping one is the user's call via RemoveTransaction.
+// An ancestor that no peer requests does not stop it, since peers that
+// already hold the ancestor stay silent; any other failure does. Every record
+// is kept either way: dropping one is the user's call via RemoveTransaction.
 func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) (
 	[]chainhash.Hash, error) {
 
@@ -140,9 +141,12 @@ func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) (
 	}
 
 	announced := make([]chainhash.Hash, 0, len(toAnnounce))
-	for _, tx := range toAnnounce {
+	for i, tx := range toAnnounce {
 		hash, err := w.publishTransaction(tx, rebroadcast)
-		if err != nil {
+		switch {
+		case errors.Is(err, chain.ErrTxNotRelayed) && i < len(toAnnounce)-1:
+			continue
+		case err != nil:
 			return nil, err
 		}
 		announced = append(announced, *hash)

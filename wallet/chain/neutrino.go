@@ -861,9 +861,8 @@ out:
 //
 // NOTE: we assume neutrino shares the same error strings as pearld.
 func (s *NeutrinoClient) MapRPCErr(rpcErr error) error {
-	// No peer saw the transaction, so this is not a peer verdict that the
-	// string maps below could express. Keep the reason: it tells the user
-	// whether there were no peers at all or none that asked.
+	// NotRelayed is no peer verdict the string maps below could express.
+	// Keep the reason: it tells the user whether any peer was connected.
 	if pushtx.IsBroadcastError(rpcErr, pushtx.NotRelayed) {
 		return fmt.Errorf("%w: %v", ErrTxNotRelayed, rpcErr)
 	}
