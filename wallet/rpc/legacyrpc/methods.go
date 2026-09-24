@@ -824,8 +824,13 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		ret.BlockHash = details.Block.Hash.String()
 		ret.BlockTime = details.Block.Time.Unix()
 		ret.Confirmations = int64(confirms(details.Block.Height, syncBlock.Height))
+	} else if tracker, ok := w.ChainClient().(chain.BroadcastTracker); ok && len(details.Debits) != 0 {
+		last, relayed := tracker.LastRelayed(details.Hash)
+		ret.Relayed = &relayed
+		if relayed {
+			ret.LastRelayTime = last.Unix()
+		}
 	}
-	ret.Relayed, ret.LastRelayTime = w.RelayFields(details)
 
 	var (
 		debitTotal  btcutil.Amount

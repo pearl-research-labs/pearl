@@ -2214,6 +2214,8 @@ func (w *Wallet) listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails,
 		blockHashStr  string
 		blockTime     int64
 		confirmations int64
+		relayed       *bool
+		lastRelayTime int64
 	)
 	if details.Block.Height != -1 {
 		blockHashStr = details.Block.Hash.String()
@@ -2221,8 +2223,13 @@ func (w *Wallet) listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails,
 		confirmations = int64(
 			calcConf(details.Block.Height, syncHeight),
 		)
+	} else if tracker, ok := w.ChainClient().(chain.BroadcastTracker); ok && len(details.Debits) != 0 {
+		last, isRelayed := tracker.LastRelayed(details.Hash)
+		relayed = &isRelayed
+		if isRelayed {
+			lastRelayTime = last.Unix()
+		}
 	}
-	relayed, lastRelayTime := w.RelayFields(details)
 
 	results := []btcjson.ListTransactionsResult{}
 	txHashStr := details.Hash.String()
@@ -3217,7 +3224,7 @@ func (w *Wallet) resendUnminedTxs() {
 	}
 
 	for _, tx := range txs {
-		txHash, err := w.publishTransaction(tx, republish)
+		txHash, err := w.publishTransaction(tx)
 		if err != nil {
 			log.Debugf("Unable to rebroadcast transaction %v: %v",
 				tx.TxHash(), err)
@@ -3788,36 +3795,14 @@ func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx, label string) (*chai
 		return nil, err
 	}
 
-	return w.publishTransaction(tx, publishNew)
+	return w.publishTransaction(tx)
 }
 
-// publishMode decides which publish outcomes keep the wallet's record of the
-// transaction.
-type publishMode uint8
-
-const (
-	// publishNew publishes a record written moments ago. No peer holds the
-	// transaction, so the record is removed again: keeping it would lock
-	// its inputs behind a spend that can never confirm.
-	publishNew publishMode = iota
-
-	// republish is the automatic resend after a rescan, to full-node
-	// backends only. A rejection there is the wallet's own node's verdict,
-	// so the record is removed rather than resent forever.
-	republish
-
-	// rebroadcast is the user's explicit retry, which keeps the record
-	// whatever the outcome: under SPV one peer can reject what others still
-	// hold, so dropping the spend is left to RemoveTransaction.
-	rebroadcast
-)
-
 // publishTransaction attempts to send an unconfirmed transaction to the
-// wallet's current backend. If that fails, the transaction is removed from
-// the wallet's unconfirmed transaction store unless mode keeps it.
-func (w *Wallet) publishTransaction(tx *wire.MsgTx,
-	mode publishMode) (*chainhash.Hash, error) {
-
+// wallet's current backend. In the event that sending the transaction fails for
+// whatever reason, it will be removed from the wallet's unconfirmed transaction
+// store.
+func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return nil, err
@@ -3834,29 +3819,19 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 		log.Infof("%v: tx already in mempool", txid)
 		return &txid, nil
 
-	case errors.Is(rpcErr, chain.ErrTxNotRelayed):
-		if mode != publishNew {
-			log.Infof("Keeping unrelayed transaction for the next "+
-				"rebroadcast: %v", rpcErr)
-			return nil, rpcErr
-		}
-
-		if err := w.removeUnminedTx(tx); err != nil {
-			log.Warnf("Unable to remove unrelayed transaction %v: %v",
-				txid, err)
-		} else {
-			log.Infof("Removed unrelayed transaction: %v", rpcErr)
-		}
-
-		return nil, rpcErr
-
 	case errors.Is(rpcErr, chain.ErrTxAlreadyKnown),
 		errors.Is(rpcErr, chain.ErrTxAlreadyConfirmed):
 
-		if mode != rebroadcast {
-			if err := w.removeUnminedTx(tx); err != nil {
-				log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", txid, err)
+		dbErr := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
+			txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
+			txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+			if err != nil {
+				return err
 			}
+			return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
+		})
+		if dbErr != nil {
+			log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", tx.TxHash(), dbErr)
 		}
 
 		log.Infof("%v: tx already confirmed", txid)
@@ -3867,16 +3842,22 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 
 	// Log the causing error, even if we know how to handle it.
 	log.Infof("%v: broadcast failed because of: %v", txid, rpcErr)
-	if mode == rebroadcast {
-		return nil, rpcErr
-	}
 
 	// If the transaction was rejected for whatever other reason, then
 	// we'll remove it from the transaction store, as otherwise, we'll
 	// attempt to continually re-broadcast it, and the UTXO state of the
 	// wallet won't be accurate.
-	if err := w.removeUnminedTx(tx); err != nil {
-		log.Warnf("Unable to remove invalid transaction %v: %v", txid, err)
+	dbErr := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
+		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
+		txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+		if err != nil {
+			return err
+		}
+		return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
+	})
+	if dbErr != nil {
+		log.Warnf("Unable to remove invalid transaction %v: %v",
+			tx.TxHash(), dbErr)
 	} else {
 		log.Infof("Removed invalid transaction: %v", tx.TxHash())
 
@@ -3900,19 +3881,6 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx,
 	return nil, rpcErr
 }
 
-// removeUnminedTx also drops every unmined transaction spending from tx, since
-// RemoveUnminedTx recurses.
-func (w *Wallet) removeUnminedTx(tx *wire.MsgTx) error {
-	return walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
-		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
-		txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
-		if err != nil {
-			return err
-		}
-		return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
-	})
-}
-
 // ChainParams returns the network parameters for the blockchain the wallet
 // belongs to.
 func (w *Wallet) ChainParams() *chaincfg.Params {
@@ -3931,7 +3899,16 @@ func (w *Wallet) Database() walletdb.DB {
 // transaction. This remove propagates recursively down the chain of descendent
 // transactions.
 func (w *Wallet) RemoveDescendants(tx *wire.MsgTx) error {
-	return w.removeUnminedTx(tx)
+	txRecord, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+	if err != nil {
+		return err
+	}
+
+	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		wtxmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+
+		return w.TxStore.RemoveUnminedTx(wtxmgrNs, txRecord)
+	})
 }
 
 // BirthdayBlock returns the birthday block of the wallet.

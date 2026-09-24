@@ -16,26 +16,6 @@ import (
 // pending transaction is asked of one that is already mined.
 var ErrTxConfirmed = errors.New("transaction is already confirmed")
 
-// RelayFields returns the relayed and lastrelaytime listing fields for
-// details. Only an unconfirmed send gets them, and only from a backend that
-// keeps relay evidence: this daemon never announced an incoming payment, so
-// relayed=false there would read as "stuck" rather than "received, unmined".
-func (w *Wallet) RelayFields(details *wtxmgr.TxDetails) (*bool, int64) {
-	if details.Block.Height != -1 || len(details.Debits) == 0 {
-		return nil, 0
-	}
-	tracker, ok := w.ChainClient().(chain.BroadcastTracker)
-	if !ok {
-		return nil, 0
-	}
-
-	last, relayed := tracker.LastRelayed(details.Hash)
-	if !relayed {
-		return &relayed, 0
-	}
-	return &relayed, last.Unix()
-}
-
 // pendingTxDetails loads txHash and rejects anything that is not a pending
 // transaction of this wallet.
 func (w *Wallet) pendingTxDetails(ns walletdb.ReadBucket,
@@ -111,19 +91,21 @@ func (w *Wallet) RemoveTransaction(txHash chainhash.Hash) ([]chainhash.Hash,
 	return removed, nil
 }
 
-// RebroadcastTransaction announces the pending transaction txHash to the
-// network again, preceded by any of its ancestors that are still pending, in
-// dependency order. Nothing re-announces a parent on its own, so a child
-// whose parent no peer holds would otherwise stay an orphan.
+// RebroadcastTransaction announces the pending transaction txHash to the network again, preceded by any of its ancestors
+// that are still pending, in dependency order. Nothing re-announces a parent on its own, so a child whose parent no peer
+// holds would otherwise stay an orphan.
 //
-// An ancestor that no peer requests does not stop it, since peers that
-// already hold the ancestor stay silent; any other failure does. Every record
-// is kept either way: dropping one is the user's call via RemoveTransaction.
-func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) (
-	[]chainhash.Hash, error) {
+// An ancestor that no peer requests does not stop it, since peers that already hold the ancestor stay silent; any other
+// failure does. It sends through the backend directly because publishTransaction drops the record of a failed send:
+// under SPV one peer can reject what others still hold, so dropping a spend is the user's call via RemoveTransaction.
+func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) ([]chainhash.Hash, error) {
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
 
 	var toAnnounce []*wire.MsgTx
-	err := walletdb.View(w.db, func(dbTx walletdb.ReadTx) error {
+	err = walletdb.View(w.db, func(dbTx walletdb.ReadTx) error {
 		txmgrNs := dbTx.ReadBucket(wtxmgrNamespaceKey)
 
 		if _, err := w.pendingTxDetails(txmgrNs, txHash); err != nil {
@@ -144,14 +126,16 @@ func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) (
 
 	announced := make([]chainhash.Hash, 0, len(toAnnounce))
 	for i, tx := range toAnnounce {
-		hash, err := w.publishTransaction(tx, rebroadcast)
+		_, err := chainClient.SendRawTransaction(tx, false)
 		switch {
-		case errors.Is(err, chain.ErrTxNotRelayed) && i < len(toAnnounce)-1:
-			continue
-		case err != nil:
+		case err == nil, errors.Is(err, chain.ErrTxAlreadyInMempool), errors.Is(err, chain.ErrTxAlreadyKnown),
+			errors.Is(err, chain.ErrTxAlreadyConfirmed):
+
+			announced = append(announced, tx.TxHash())
+
+		case !errors.Is(err, chain.ErrTxNotRelayed) || i == len(toAnnounce)-1:
 			return nil, err
 		}
-		announced = append(announced, *hash)
 	}
 
 	return announced, nil

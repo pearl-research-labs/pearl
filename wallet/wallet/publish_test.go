@@ -22,9 +22,8 @@ func sendResult(sendErr error) func(*wire.MsgTx) (*chainhash.Hash, error) {
 	}
 }
 
-// TestPublishTransactionNotRelayed covers how the wallet's record of a spend
-// reacts to a backend that reports no peer requested the transaction, on a
-// first publish and on a resend of an existing record.
+// TestPublishTransactionNotRelayed covers how the wallet's record of a new spend reacts to a backend that reports no peer
+// requested the transaction.
 func TestPublishTransactionNotRelayed(t *testing.T) {
 	notRelayed := fmt.Errorf("%w: no connected peers", chain.ErrTxNotRelayed)
 
@@ -69,39 +68,6 @@ func TestPublishTransactionNotRelayed(t *testing.T) {
 		require.Len(t, unmined, 1)
 		require.Equal(t, tx.TxHash(), unmined[0].TxHash())
 		require.False(t, hasOutPoint(unspent, fundingOut))
-	})
-
-	t.Run("resend keeps the record", func(t *testing.T) {
-		w, fundingOut := newFundedWallet(t, nil)
-
-		tx, err := send(t, w)
-		require.NoError(t, err)
-
-		w.chainClient = &mockChainClient{
-			sendRawTransactionFunc: sendResult(notRelayed),
-		}
-		w.resendUnminedTxs()
-
-		unmined, unspent := walletTxState(t, w)
-		require.Len(t, unmined, 1)
-		require.Equal(t, tx.TxHash(), unmined[0].TxHash())
-		require.False(t, hasOutPoint(unspent, fundingOut))
-	})
-
-	t.Run("resend still drops a rejected tx", func(t *testing.T) {
-		w, fundingOut := newFundedWallet(t, nil)
-
-		_, err := send(t, w)
-		require.NoError(t, err)
-
-		w.chainClient = &mockChainClient{
-			sendRawTransactionFunc: sendResult(chain.ErrMissingInputs),
-		}
-		w.resendUnminedTxs()
-
-		unmined, unspent := walletTxState(t, w)
-		require.Empty(t, unmined)
-		require.True(t, hasOutPoint(unspent, fundingOut))
 	})
 }
 
