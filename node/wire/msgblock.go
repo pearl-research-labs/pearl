@@ -311,7 +311,8 @@ func (msg *MsgBlock) Command() string {
 // receiver.  This is part of the Message interface implementation.
 func (msg *MsgBlock) MaxPayloadLength(pver uint32) uint32 {
 	// Certificate + header + transactions. MaxBlockPayload covers the serialized txs at the 1M-vbyte consensus
-	// cap; the certificate is excluded from vsize and must be accounted for separately.
+	// cap; the certificate is excluded from vsize and must be accounted for separately. Every certificate
+	// version is capped at CertificateMaxSize, so this ensures any valid block can be relayed.
 	return MaxBlockPayload + CertificateMaxSize
 }
 

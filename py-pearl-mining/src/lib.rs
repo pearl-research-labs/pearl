@@ -14,24 +14,44 @@ use std::sync::Mutex;
 use blake3::CHUNK_LEN;
 use pearl_blake3::{pad_to_chunk_boundary, MerkleProof, MerkleTree};
 use primitive_types::U256;
-use zk_pow::api::proof::{
-    IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern,
-    PublicProofParams, SeedDerivation, ZKProof,
+use zk_pow::api::fp8::plain_proof::{MoeWitness, PlainProofV4};
+use zk_pow::api::fp8::public_params::{
+    CommonParams, Device, HashId, MoeParams, OperandParams, Quant,
 };
-use zk_pow::api::sanity_checks;
-use zk_pow::api::{prove, verify};
-use zk_pow::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
-use zk_pow::ffi::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
-use zk_pow::ffi::plain_proof::{
-    check_cert_version_eligible as core_check_cert_version_eligible, CertificateVersion,
-    MatrixMerkleProof, MoEProofParams, PlainProof,
-};
+use zk_pow::api::layout::{AxisPattern, DimType};
+use zk_pow::api::primitives::IncompleteBlockHeader;
+use zk_pow::api::seed::SeedDerivation;
+use zk_pow::api::verify as fp8_verify;
+use zk_pow::ffi::plain_proof::{CertificateVersion, MatrixMerkleProof, MoEProofParams, PlainProof};
+use zk_pow::ffi::pybind::{PyFp8Prover, PyFp8Verifier};
+use zk_pow::v2::api::sanity_checks;
 
 use zk_pow::v1::api::proof as v1_proof;
 use zk_pow::v1::api::{prove as v1_prove, verify as v1_verify};
 
+use zk_pow::v2::api::proof as v2_proof;
+use zk_pow::v2::api::proof::{
+    MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, PublicProofParams, ZKProof,
+};
+use zk_pow::v2::api::{prove, verify};
+use zk_pow::v2::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
+use zk_pow::v2::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
+
 fn py_err(msg: &str, e: impl std::fmt::Display) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}: {}", msg, e))
+}
+
+/// The Python-facing `IncompleteBlockHeader` is the mainline (v3) type; the
+/// v1/v2 clones each carry an identical struct that we convert into at the
+/// dispatch boundary.
+fn header_to_v2(h: &IncompleteBlockHeader) -> v2_proof::IncompleteBlockHeader {
+    v2_proof::IncompleteBlockHeader {
+        version: h.version,
+        prev_block: h.prev_block,
+        merkle_root: h.merkle_root,
+        timestamp: h.timestamp,
+        nbits: h.nbits,
+    }
 }
 
 // ============================================================================
@@ -87,7 +107,7 @@ fn generate_proof_impl(
 ) -> PyResult<PyProof> {
     let mut cache = acquire_cache()?;
     let result = prove::zk_prove_plain_proof(
-        block_header,
+        header_to_v2(&block_header),
         &plain_proof,
         &mut cache,
         true,
@@ -133,7 +153,7 @@ fn verify_proof_impl(
     }
 
     let (params, zk_proof) = ZKProof::deserialize(
-        block_header,
+        header_to_v2(&block_header),
         seed_derivation,
         &proof.public_data,
         &proof.proof_data,
@@ -188,7 +208,12 @@ fn verify_plain_proof_impl(
     nbits_override: Option<u32>,
     seed_derivation: SeedDerivation,
 ) -> PyResult<(bool, String)> {
-    match verify::verify_plain_proof(&block_header, &plain_proof, nbits_override, seed_derivation) {
+    match verify::verify_plain_proof(
+        &header_to_v2(&block_header),
+        &plain_proof,
+        nbits_override,
+        seed_derivation,
+    ) {
         Ok(()) => Ok((true, "Mining solution verified successfully".into())),
         Err(e) => Ok((false, e.to_string())),
     }
@@ -209,7 +234,7 @@ fn verify_plain_proof_v2(
     )
 }
 
-/// V3 (salted noise-seed) plain-proof verification.
+/// V3 (salted noise-seed) Int7 plain-proof verification.
 #[pyfunction]
 #[pyo3(signature = (block_header, plain_proof, nbits_override=None))]
 fn verify_plain_proof_v3(
@@ -223,6 +248,24 @@ fn verify_plain_proof_v3(
         nbits_override,
         SeedDerivation::Salted,
     )
+}
+
+/// Cert v4 (PlainFP8) plain verification against the mainline FP8 verifier.
+///
+/// The proof carries its own `ancestor_header` (σ_Δ) in the job; `block_header`
+/// (σ̂) is only used for the A side and the default difficulty. Authenticating
+/// σ_Δ is the caller's responsibility (hash-walk the `prev_block` chain).
+#[pyfunction]
+#[pyo3(signature = (block_header, plain_proof, nbits_override=None))]
+fn verify_plain_proof_v4(
+    block_header: IncompleteBlockHeader,
+    plain_proof: PlainProofV4,
+    nbits_override: Option<u32>,
+) -> PyResult<(bool, String)> {
+    match fp8_verify::verify_plain_proof(&block_header, &plain_proof, nbits_override) {
+        Ok(()) => Ok((true, "Mining solution verified successfully".into())),
+        Err(e) => Ok((false, e.to_string())),
+    }
 }
 
 #[pyfunction]
@@ -275,7 +318,7 @@ fn mine(
         m,
         n,
         k,
-        block_header,
+        header_to_v2(&block_header),
         mining_config,
         signal_range,
         wrong_jackpot_hash,
@@ -303,7 +346,7 @@ fn mine_moe(
         m,
         n,
         k,
-        block_header,
+        header_to_v2(&block_header),
         mining_config,
         signal_range,
         wrong_jackpot_hash,
@@ -434,11 +477,32 @@ fn value_err(e: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
 
+/// Cert v4 (PlainFP8) blocks certify the plain proof itself; no ZK circuit
+/// is wired for v4 proofs yet, so the ZK entry points fail closed.
+fn not_implemented_fp8() -> PyErr {
+    pyo3::exceptions::PyNotImplementedError::new_err(
+        "cert v4 (PlainFP8) has no ZK proof yet; use verify_plain_proof_for_cert_version",
+    )
+}
+
 #[pyfunction]
 #[pyo3(name = "check_cert_version_eligible")]
-fn py_check_cert_version_eligible(cert_version: u32, plain_proof: PlainProof) -> PyResult<()> {
-    core_check_cert_version_eligible(cert_version, &plain_proof).map_err(value_err)?;
-    Ok(())
+fn py_check_cert_version_eligible(
+    cert_version: u32,
+    plain_proof: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    match CertificateVersion::try_from(cert_version).map_err(value_err)? {
+        CertificateVersion::ZkDense | CertificateVersion::ZkMoe | CertificateVersion::ZkV3 => {
+            extract_int7(plain_proof)?
+                .check_cert_version_eligible(cert_version)
+                .map_err(value_err)?;
+            Ok(())
+        }
+        CertificateVersion::PlainFp8 => {
+            extract_v4(plain_proof)?;
+            Ok(())
+        }
+    }
 }
 
 #[pyfunction]
@@ -447,10 +511,14 @@ fn generate_proof_for_cert_version(
     block_header: IncompleteBlockHeader,
     plain_proof: PlainProof,
 ) -> PyResult<PyProof> {
-    match core_check_cert_version_eligible(cert_version, &plain_proof).map_err(value_err)? {
+    match plain_proof
+        .check_cert_version_eligible(cert_version)
+        .map_err(value_err)?
+    {
         CertificateVersion::ZkDense => generate_proof_v1(block_header, plain_proof),
         CertificateVersion::ZkMoe => generate_proof_v2(block_header, plain_proof),
         CertificateVersion::ZkV3 => generate_proof_v3(block_header, plain_proof),
+        CertificateVersion::PlainFp8 => Err(not_implemented_fp8()),
     }
 }
 
@@ -465,6 +533,7 @@ fn verify_proof_for_cert_version(
         CertificateVersion::ZkDense => verify_proof_v1(block_header, proof),
         CertificateVersion::ZkMoe => verify_proof_v2(block_header, proof),
         CertificateVersion::ZkV3 => verify_proof_v3(block_header, proof),
+        CertificateVersion::PlainFp8 => Err(not_implemented_fp8()),
     }
 }
 
@@ -473,20 +542,48 @@ fn verify_proof_for_cert_version(
 fn verify_plain_proof_for_cert_version(
     cert_version: u32,
     block_header: IncompleteBlockHeader,
-    plain_proof: PlainProof,
+    plain_proof: &Bound<'_, PyAny>,
     nbits_override: Option<u32>,
 ) -> PyResult<(bool, String)> {
-    match core_check_cert_version_eligible(cert_version, &plain_proof).map_err(value_err)? {
+    match CertificateVersion::try_from(cert_version).map_err(value_err)? {
         CertificateVersion::ZkDense => {
-            verify_plain_proof_v1(block_header, plain_proof, nbits_override)
+            let proof = extract_int7(plain_proof)?;
+            proof
+                .check_cert_version_eligible(cert_version)
+                .map_err(value_err)?;
+            verify_plain_proof_v1(block_header, proof, nbits_override)
         }
         CertificateVersion::ZkMoe => {
-            verify_plain_proof_v2(block_header, plain_proof, nbits_override)
+            let proof = extract_int7(plain_proof)?;
+            proof
+                .check_cert_version_eligible(cert_version)
+                .map_err(value_err)?;
+            verify_plain_proof_v2(block_header, proof, nbits_override)
         }
         CertificateVersion::ZkV3 => {
-            verify_plain_proof_v3(block_header, plain_proof, nbits_override)
+            let proof = extract_int7(plain_proof)?;
+            proof
+                .check_cert_version_eligible(cert_version)
+                .map_err(value_err)?;
+            verify_plain_proof_v3(block_header, proof, nbits_override)
+        }
+        CertificateVersion::PlainFp8 => {
+            let proof = extract_v4(plain_proof)?;
+            verify_plain_proof_v4(block_header, proof, nbits_override)
         }
     }
+}
+
+fn extract_int7(plain_proof: &Bound<'_, PyAny>) -> PyResult<PlainProof> {
+    plain_proof.extract().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("certificate versions 1/2/3 require PlainProof")
+    })
+}
+
+fn extract_v4(plain_proof: &Bound<'_, PyAny>) -> PyResult<PlainProofV4> {
+    plain_proof.extract().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("certificate version 4 requires PlainProofV4")
+    })
 }
 
 // ============================================================================
@@ -519,7 +616,7 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add("PUBLICDATA_MAX_SIZE", PublicProofParams::MAX_WIRE_SIZE)?;
     m.add(
         "PENALTY_BASE_RANK",
-        zk_pow::api::sanity_checks::PENALTY_BASE_RANK,
+        zk_pow::v2::api::sanity_checks::PENALTY_BASE_RANK,
     )?;
     m.add_class::<MerkleTree>()?;
     m.add_class::<MerkleProof>()?;
@@ -530,6 +627,16 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<MMAType>()?;
     m.add_class::<MatrixMerkleProof>()?;
     m.add_class::<PlainProof>()?;
+    m.add_class::<PlainProofV4>()?;
+    m.add_class::<MoeWitness>()?;
+    m.add_class::<CommonParams>()?;
+    m.add_class::<OperandParams>()?;
+    m.add_class::<MoeParams>()?;
+    m.add_class::<HashId>()?;
+    m.add_class::<Quant>()?;
+    m.add_class::<DimType>()?;
+    m.add_class::<AxisPattern>()?;
+    m.add_class::<Device>()?;
     m.add_class::<MoEProofParams>()?;
     m.add_class::<PyProof>()?;
     m.add_function(wrap_pyfunction!(mine, m)?)?;
@@ -546,6 +653,9 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_proof_v3, m)?)?;
     m.add_function(wrap_pyfunction!(verify_proof_v3, m)?)?;
     m.add_function(wrap_pyfunction!(verify_plain_proof_v3, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_plain_proof_v4, m)?)?;
+    m.add_class::<PyFp8Prover>()?;
+    m.add_class::<PyFp8Verifier>()?;
     // V1 functions (legacy circuit; dense proofs only)
     m.add(
         "V1_PUBLICDATA_SIZE",
@@ -560,6 +670,10 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add("CERT_VERSION_ZK_DENSE", CertificateVersion::ZkDense as u32)?;
     m.add("CERT_VERSION_ZK_MOE", CertificateVersion::ZkMoe as u32)?;
     m.add("CERT_VERSION_ZK_V3", CertificateVersion::ZkV3 as u32)?;
+    m.add(
+        "CERT_VERSION_PLAIN_FP8",
+        CertificateVersion::PlainFp8 as u32,
+    )?;
     m.add_function(wrap_pyfunction!(py_check_cert_version_eligible, m)?)?;
     m.add_function(wrap_pyfunction!(generate_proof_for_cert_version, m)?)?;
     m.add_function(wrap_pyfunction!(verify_proof_for_cert_version, m)?)?;

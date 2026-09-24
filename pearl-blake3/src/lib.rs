@@ -19,4 +19,19 @@ pub use hasher::{
     blake3_digest, Blake3Hasher, B3F_CHUNK_END, B3F_CHUNK_START, B3F_KEYED_HASH, B3F_PARENT,
     B3F_ROOT,
 };
-pub use merkle::{pad_to_chunk_boundary, padded_chunk_len, MerkleProof, MerkleTree};
+pub use merkle::{
+    is_allowed_chunk_len, pad_to_chunk_boundary, padded_chunk_len, MerkleProof, MerkleTree,
+    ALLOWED_CHUNK_LENS,
+};
+
+#[cfg(feature = "extension-module")]
+#[pyo3::pymodule]
+fn pearl_blake3(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+    use pyo3::types::PyModuleMethods;
+
+    module.add("BLAKE3_CHUNK_LEN", BLAKE3_CHUNK_LEN)?;
+    module.add("ALLOWED_CHUNK_LENS", ALLOWED_CHUNK_LENS)?;
+    module.add_class::<MerkleTree>()?;
+    module.add_class::<MerkleProof>()?;
+    Ok(())
+}

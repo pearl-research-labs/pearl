@@ -10,6 +10,7 @@ import torch
 from pearl_gateway.blockchain_utils.pearl_block import PearlBlock
 from pearl_gateway.blockchain_utils.zk_certificate import (
     PUBLICDATA_SIZE,
+    CertificateProof,
     CertificateVersion,
     ZKCertificate,
 )
@@ -21,7 +22,7 @@ from pearl_gateway.comm.dataclasses import (
     OpenedBlockInfo,
 )
 from pearl_gateway.config import MinerRpcConfig, PearlConfig
-from pearl_mining import MatrixMerkleProof, MerkleProof, PlainProof, ZKProof, penalized_target_bound
+from pearl_mining import MatrixMerkleProof, MerkleProof, PlainProof, penalized_target_bound
 
 
 @pytest.fixture(scope="session")
@@ -260,7 +261,7 @@ def sample_pearl_block(sample_block_template):
     header = copy.copy(sample_block_template.header)
     zk_certificate = ZKCertificate.from_pearl_header(
         header,
-        ZKProof(bytes(PUBLICDATA_SIZE), bytes(10000)),  # dummy proof
+        CertificateProof(bytes(PUBLICDATA_SIZE), bytes(10000)),  # dummy proof
     )
     return PearlBlock(
         header,
@@ -396,14 +397,6 @@ def make_random_test_matrices():
 
 
 @pytest.fixture
-def default_matmul_config():
-    """Create a default MatmulConfig for testing."""
-    from miner_base.gpu_matmul_config import GPUMatmulConfigFactory
-
-    return GPUMatmulConfigFactory.create(k=128, noise_rank=128)
-
-
-@pytest.fixture
 def real_gateway(mining_address):
     """
     Start a real PearlGateway using config.yaml settings.
@@ -451,3 +444,41 @@ def real_gateway(mining_address):
     stop_event.set()
     thread.join(timeout=10.0)
     loop.close()
+
+
+# ---------------------------------------------------------------------------
+# GPU mining subsystem fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def miner_settings():
+    """Default MinerSettings for GPU miner tests.
+
+    Override this fixture in a closer conftest.py to change defaults
+    (e.g. ``no_mining=True`` or ``no_gateway=False``).
+    """
+    from miner_base.settings import MinerSettings
+
+    return MinerSettings(no_gateway=True, no_mining=False)
+
+
+@pytest.fixture
+def gpu_async_manager(miner_settings):
+    """Initialize and tear down the GPU mining subsystem.
+
+    Not ``autouse`` — per-miner conftest files wrap this as an autouse
+    fixture named ``async_manager`` so existing tests keep working.
+
+    Imports are deferred so this conftest can be loaded by venvs that
+    don't have ``vllm-miner`` installed.
+    """
+    from vllm_miner.config import config as vllm_miner_config
+    from vllm_miner.mining_state import delete_state, get_async_manager, init_async_manager
+
+    init_async_manager(miner_settings)
+    am = get_async_manager()
+    am._conf = miner_settings
+    vllm_miner_config.settings = miner_settings
+    yield am
+    delete_state()

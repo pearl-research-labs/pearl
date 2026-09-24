@@ -15,7 +15,7 @@ import (
 
 // These tests cover when the rank-penalty rule is applied. The rule itself (the
 // rank floor and the rank-scaled jackpot bound) lives in Rust and is tested in
-// zk-pow/src/api/sanity_checks.rs and node/zkpow/rank_penalty_test.go, since it
+// zk-pow/src/v2/api/sanity_checks.rs and node/zkpow/rank_penalty_test.go, since it
 // needs the proof verification backend.
 
 const rankPenaltyTestHeight = int32(10)

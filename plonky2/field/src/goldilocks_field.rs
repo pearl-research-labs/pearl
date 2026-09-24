@@ -101,9 +101,11 @@ impl Sample for GoldilocksField {
         rng.fill_bytes(&mut bytes);
 
         bytes
-            .chunks_exact(GoldilocksField::BITS / 8)
+            .as_chunks::<{ GoldilocksField::BITS / 8 }>()
+            .0
+            .iter()
             .map(|chunk| {
-                let value = u64::from_le_bytes(chunk.try_into().unwrap());
+                let value = u64::from_le_bytes(*chunk);
                 if value < Self::ORDER {
                     Self::from_canonical_u64(value)
                 } else {

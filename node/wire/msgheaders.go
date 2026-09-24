@@ -152,7 +152,6 @@ func (msg *MsgHeaders) Command() string {
 // MaxPayloadLength returns the maximum length the payload can be for the
 // receiver.  This is part of the Message interface implementation.
 func (msg *MsgHeaders) MaxPayloadLength(pver uint32) uint32 {
-	// Num headers (varInt) + max allowed headers (header length + certificate).
 	return MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSize) * MaxBlockHeadersPerMsg)
 }
 

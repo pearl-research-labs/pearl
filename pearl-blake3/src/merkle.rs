@@ -11,19 +11,36 @@ use rayon::prelude::*;
 
 use crate::hasher::{Blake3Hasher, Digest};
 
-/// Round `raw_len` up to the next multiple of `CHUNK_LEN` (1024).
+/// Leaf sizes this crate will build or accept in a proof.
+pub const ALLOWED_CHUNK_LENS: [usize; 4] = [128, 256, 512, 1024];
+
+pub fn is_allowed_chunk_len(n: usize) -> bool {
+    ALLOWED_CHUNK_LENS.contains(&n)
+}
+
+/// Round `raw_len` up to the next multiple of the native BLAKE3 chunk (1024).
 pub fn padded_chunk_len(raw_len: usize) -> usize {
     raw_len.div_ceil(CHUNK_LEN) * CHUNK_LEN
 }
 
-/// Zero-pad `data` so its length is a multiple of `CHUNK_LEN` (1024).
+/// Zero-pad `data` so its length is a multiple of the native BLAKE3 chunk (1024).
 ///
 /// Matrix data must be padded to a BLAKE3 chunk boundary before building a
-/// Merkle tree.  Uses [`padded_chunk_len`] for the target size.
+/// Merkle tree.
 pub fn pad_to_chunk_boundary(data: &[u8]) -> Vec<u8> {
     let mut padded = data.to_vec();
     padded.resize(padded_chunk_len(data.len()), 0);
     padded
+}
+
+fn hash_leaves(hasher: &Blake3Hasher, data: &[u8], chunk_len: usize) -> Vec<Digest> {
+    if chunk_len == CHUNK_LEN {
+        return hasher.hash_chunks(data);
+    }
+    data.par_chunks(chunk_len)
+        .enumerate()
+        .map(|(i, chunk)| hasher.chunk_cv(chunk, i as u64))
+        .collect()
 }
 
 // ============================================================================
@@ -36,49 +53,46 @@ pub struct MerkleTree {
     key: Digest,
     layers: Vec<Vec<Digest>>,
     data: Vec<u8>,
+    chunk_len: usize,
 }
 
 impl MerkleTree {
-    /// Build a Merkle tree from `data` using keyed BLAKE3.
+    /// Build a Merkle tree from `data` using keyed BLAKE3 and 1024-byte leaves.
     pub fn new(data: &[u8], key: Digest) -> Self {
+        Self::with_chunk_len(data, key, CHUNK_LEN).expect("1024 is in ALLOWED_CHUNK_LENS")
+    }
+
+    /// Build a Merkle tree whose leaf size is `chunk_len` (must be in [`ALLOWED_CHUNK_LENS`]).
+    pub fn with_chunk_len(data: &[u8], key: Digest, chunk_len: usize) -> Result<Self> {
+        ensure!(
+            is_allowed_chunk_len(chunk_len),
+            "chunk_len {chunk_len} is not in {ALLOWED_CHUNK_LENS:?}"
+        );
         let hasher = Blake3Hasher::with_key(key);
-        if data.is_empty() {
-            return Self {
-                key,
-                layers: vec![vec![]],
-                data: vec![],
-            };
-        }
-
-        // Single chunk or less: hash directly
-        if data.len() <= CHUNK_LEN {
-            let root = hasher.hash(data);
-            return Self {
-                key,
-                layers: vec![vec![root]],
-                data: data.to_vec(),
-            };
-        }
-
-        let chunk_cvs = hasher.hash_chunks(data);
-        let mut layers: Vec<Vec<Digest>> = vec![chunk_cvs];
-
-        while layers.last().unwrap().len() > 2 {
-            let prev = layers.last().unwrap();
-            layers.push(hasher.combine_layer(prev));
-        }
-
-        let last = layers.last().unwrap();
-        if last.len() == 2 {
-            let root = hasher.root_cv(&last[0], &last[1]);
-            layers.push(vec![root]);
-        }
-
-        Self {
+        let layers = if data.is_empty() {
+            vec![vec![]]
+        } else if data.len() <= chunk_len {
+            // One leaf: the root is the ROOT-finalized keyed hash, not a chunk CV.
+            vec![vec![hasher.hash(data)]]
+        } else {
+            let mut layers = vec![hash_leaves(&hasher, data, chunk_len)];
+            while layers.last().unwrap().len() > 2 {
+                let prev = layers.last().unwrap();
+                layers.push(hasher.combine_layer(prev));
+            }
+            let last = layers.last().unwrap();
+            if last.len() == 2 {
+                let root = hasher.root_cv(&last[0], &last[1]);
+                layers.push(vec![root]);
+            }
+            layers
+        };
+        Ok(Self {
             key,
             layers,
             data: data.to_vec(),
-        }
+            chunk_len,
+        })
     }
 
     /// The BLAKE3 key this tree was built with.
@@ -112,12 +126,13 @@ impl MerkleTree {
 
         // Collect leaf data
         let sorted_indices: Vec<usize> = unique.iter().copied().collect();
-        let leaf_data: Vec<[u8; CHUNK_LEN]> = sorted_indices
+        let chunk_len = self.chunk_len;
+        let leaf_data: Vec<Vec<u8>> = sorted_indices
             .iter()
             .map(|&i| {
-                let start = i * CHUNK_LEN;
-                let end = (start + CHUNK_LEN).min(self.data.len());
-                let mut chunk = [0u8; CHUNK_LEN];
+                let start = i * chunk_len;
+                let end = (start + chunk_len).min(self.data.len());
+                let mut chunk = vec![0u8; chunk_len];
                 chunk[..end - start].copy_from_slice(&self.data[start..end]);
                 chunk
             })
@@ -157,20 +172,26 @@ impl MerkleTree {
     }
 
     /// Compute which leaf indices are needed to prove the given matrix rows.
+    /// `chunk_len` must be in [`ALLOWED_CHUNK_LENS`].
     pub fn compute_leaf_indices_from_rows(
         row_indices: &[usize],
         shape: (usize, usize),
-    ) -> Vec<usize> {
+        chunk_len: usize,
+    ) -> Result<Vec<usize>> {
+        ensure!(
+            is_allowed_chunk_len(chunk_len),
+            "chunk_len {chunk_len} is not in {ALLOWED_CHUNK_LENS:?}"
+        );
         let cols = shape.1;
         let mut indices = BTreeSet::new();
         for &row in row_indices {
-            let first = (row * cols) / CHUNK_LEN;
-            let last = ((row + 1) * cols - 1) / CHUNK_LEN;
+            let first = (row * cols) / chunk_len;
+            let last = ((row + 1) * cols - 1) / chunk_len;
             for i in first..=last {
                 indices.insert(i);
             }
         }
-        indices.into_iter().collect()
+        Ok(indices.into_iter().collect())
     }
 }
 
@@ -178,17 +199,22 @@ impl MerkleTree {
 // MerkleProof
 // ============================================================================
 
-/// Generic multi-leaf Merkle proof, domain-agnostic.
+/// Multi-leaf keyed-BLAKE3 Merkle proof.
+///
+/// Leaves are full chunks of one length in [`ALLOWED_CHUNK_LENS`]. A short last
+/// chunk in the tree is zero-padded into `leaf_data`; proofs never store a
+/// truncated leaf. Enforced by [`Self::sanity_check`], V4 deserialize, and the
+/// Python constructor. A Rust struct literal does not check, but
+/// [`Self::compute_root`] (and thus [`Self::verify`]) re-runs
+/// [`Self::sanity_check`] and fails closed on malformed proofs.
+///
+/// No default serde: [`Self::serialize_chunk_1024`] is cert v1–v3;
+/// [`Self::serialize_variable_chunk`] is cert v4.
 #[derive(Clone)]
 #[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MerkleProof"))]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(crate = "serde")
-)]
 pub struct MerkleProof {
-    #[cfg_attr(feature = "serde", serde(with = "serde_chunk_vec"))]
-    pub leaf_data: Vec<[u8; CHUNK_LEN]>,
+    /// Full chunks of one allowed length; never a truncated last leaf.
+    pub leaf_data: Vec<Vec<u8>>,
     pub leaf_indices: Vec<usize>,
     pub total_leaves: usize,
     pub root: Digest,
@@ -208,7 +234,9 @@ impl std::fmt::Debug for MerkleProof {
 }
 
 impl MerkleProof {
-    /// Validate proof structure.
+    /// Validate proof structure: matching leaf/index counts, sorted unique
+    /// indices, every index below `total_leaves`, and equal-length leaves of
+    /// an allowed size.
     pub fn sanity_check(&self) -> Result<()> {
         ensure!(
             !self.leaf_indices.is_empty(),
@@ -222,7 +250,40 @@ impl MerkleProof {
             self.leaf_indices.windows(2).all(|w| w[0] < w[1]),
             "leaf_indices must be sorted and unique"
         );
+        let max_index = *self.leaf_indices.last().unwrap();
+        ensure!(
+            max_index < self.total_leaves,
+            "leaf index {max_index} out of range for a tree of {} leaves",
+            self.total_leaves
+        );
+        Self::check_equal_allowed_leaves(&self.leaf_data).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())
+    }
+
+    /// Equal-length leaves in an [`ALLOWED_CHUNK_LENS`] size. Empty `leaf_data` is allowed.
+    pub(crate) fn check_equal_allowed_leaves(leaf_data: &[Vec<u8>]) -> Result<(), String> {
+        let Some(first) = leaf_data.first() else {
+            return Ok(());
+        };
+        if !is_allowed_chunk_len(first.len()) {
+            return Err(format!(
+                "leaf data length {} is not in {ALLOWED_CHUNK_LENS:?}",
+                first.len(),
+            ));
+        }
+        if leaf_data.iter().any(|leaf| leaf.len() != first.len()) {
+            return Err("all leaves in a proof must have the same length".into());
+        }
+        Ok(())
+    }
+
+    /// Leaf size in bytes, inferred from the opened leaves (1024 if none).
+    pub fn chunk_len(&self) -> usize {
+        self.leaf_data
+            .first()
+            .map(|leaf| leaf.len())
+            .filter(|&n| is_allowed_chunk_len(n))
+            .unwrap_or(CHUNK_LEN)
     }
 
     /// Compute leaf hashes (chunk CVs) from the raw leaf data.
@@ -236,26 +297,38 @@ impl MerkleProof {
     }
 
     /// Reconstruct the Merkle root from leaf hashes and proof siblings.
-    /// Returns `None` if the proof has incorrect shape.
+    ///
+    /// Returns `None` if the proof is malformed: anything [`Self::sanity_check`]
+    /// rejects (mismatched leaf/index counts, unsorted or duplicate indices, an
+    /// index `>= total_leaves`, bad leaf lengths), or a sibling list that does
+    /// not exactly cover the reconstruction. The shape checks are
+    /// security-critical, not just hygiene: an out-of-range or duplicate index
+    /// would let the reconstruction rebuild the root from the supplied siblings
+    /// without ever consuming the corresponding leaf data, so [`Self::verify`]
+    /// would accept leaf bytes the root does not commit to.
     pub fn compute_root(&self, key: Digest) -> Option<Digest> {
-        if self.leaf_indices.is_empty() {
+        if self.sanity_check().is_err() {
             return None;
         }
 
         let hasher = Blake3Hasher::with_key(key);
+
+        if self.total_leaves == 1 {
+            // A single-chunk tree's root is the ROOT-finalized keyed hash of
+            // the chunk itself (see `MerkleTree::new`), not its non-root
+            // chunk CV.
+            return if self.leaf_indices == [0] && self.siblings.is_empty() {
+                Some(hasher.hash(&self.leaf_data[0]))
+            } else {
+                None
+            };
+        }
+
         let leaf_hashes = self.leaf_hashes(key);
 
         let mut current: BTreeMap<usize, Digest> =
             self.leaf_indices.iter().copied().zip(leaf_hashes).collect();
         let mut level_len = self.total_leaves;
-
-        if level_len == 1 {
-            return if self.siblings.is_empty() {
-                Some(current[&0])
-            } else {
-                None
-            };
-        }
 
         let mut sib_iter = self.siblings.iter();
 
@@ -320,8 +393,9 @@ impl MerkleProof {
         let mut copied = 0;
 
         for (&leaf_idx, data) in self.leaf_indices.iter().zip(&self.leaf_data) {
-            let leaf_start = leaf_idx * CHUNK_LEN;
-            let leaf_end = leaf_start + CHUNK_LEN;
+            let chunk_len = data.len();
+            let leaf_start = leaf_idx * chunk_len;
+            let leaf_end = leaf_start + chunk_len;
             if leaf_start < global_end && global_start < leaf_end {
                 let copy_start = global_start.max(leaf_start);
                 let copy_end = global_end.min(leaf_end);
@@ -343,9 +417,10 @@ impl MerkleProof {
 
         let mut current: BTreeSet<usize> = self.leaf_indices.iter().copied().collect();
 
+        let chunk_len = self.chunk_len();
         let mut result = Vec::new();
         let mut proof_idx = 0;
-        let mut level_size = total_size.div_ceil(CHUNK_LEN);
+        let mut level_size = total_size.div_ceil(chunk_len);
         let mut level = 0;
 
         while level_size > 1 && !current.is_empty() && proof_idx < self.siblings.len() {
@@ -359,7 +434,7 @@ impl MerkleProof {
                 };
 
                 if need_sib && proof_idx < self.siblings.len() {
-                    let chunk = CHUNK_LEN << level;
+                    let chunk = chunk_len << level;
                     result.push((
                         sib * chunk,
                         ((sib + 1) * chunk).min(total_size),
@@ -387,9 +462,10 @@ impl MerkleProof {
         if let Some(&(_, _, h)) = ranges.iter().find(|(s, e, _)| *s == start && *e == end) {
             return Ok(h);
         }
-        if end - start == CHUNK_LEN {
+        let chunk_len = self.chunk_len();
+        if end - start == chunk_len {
             let data = self.extract_bytes(start, end - start)?;
-            return Ok(Blake3Hasher::with_key(key).chunk_cv(&data, (start / CHUNK_LEN) as u64));
+            return Ok(Blake3Hasher::with_key(key).chunk_cv(&data, (start / chunk_len) as u64));
         }
         let mid = start + (end - start).next_power_of_two() / 2;
         let hasher = Blake3Hasher::with_key(key);
@@ -400,32 +476,89 @@ impl MerkleProof {
 }
 
 // ============================================================================
-// Serde helpers for fixed-size arrays
+// Serde: chunk_1024 (cert v1–v3 PlainProof) vs variable_chunk (cert v4 PlainProofV4)
 // ============================================================================
 
 #[cfg(feature = "serde")]
-mod serde_chunk_vec {
-    use blake3::CHUNK_LEN;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        data: &[[u8; CHUNK_LEN]],
+impl MerkleProof {
+    /// Certificate v1–v3 `PlainProof` encoding: length-prefixed leaves, each 1024 bytes.
+    pub fn serialize_chunk_1024<S: serde::Serializer>(
+        &self,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        let vecs: Vec<&[u8]> = data.iter().map(|a| a.as_slice()).collect();
-        vecs.serialize(serializer)
+        Self::check_chunk_1024(&self.leaf_data).map_err(serde::ser::Error::custom)?;
+        self.serialize_fields(serializer)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
+    /// Certificate v1–v3 `PlainProof` encoding.
+    pub fn deserialize_chunk_1024<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Vec<[u8; CHUNK_LEN]>, D::Error> {
-        let vecs: Vec<Vec<u8>> = Vec::deserialize(deserializer)?;
-        vecs.into_iter()
-            .map(|v| {
-                v.try_into()
-                    .map_err(|_| serde::de::Error::custom("leaf data must be CHUNK_LEN bytes"))
-            })
-            .collect()
+    ) -> Result<Self, D::Error> {
+        Self::deserialize_fields(deserializer, Self::check_chunk_1024)
+    }
+
+    /// Certificate v4 `PlainProofV4` encoding: length-prefixed leaves, equal length in
+    /// [`ALLOWED_CHUNK_LENS`].
+    pub fn serialize_variable_chunk<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Self::check_equal_allowed_leaves(&self.leaf_data).map_err(serde::ser::Error::custom)?;
+        self.serialize_fields(serializer)
+    }
+
+    /// Certificate v4 `PlainProofV4` encoding. Rejects proofs that fail [`Self::sanity_check`].
+    pub fn deserialize_variable_chunk<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let proof = Self::deserialize_fields(deserializer, Self::check_equal_allowed_leaves)?;
+        proof.sanity_check().map_err(serde::de::Error::custom)?;
+        Ok(proof)
+    }
+
+    fn serialize_fields<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("MerkleProof", 5)?;
+        s.serialize_field("leaf_data", &self.leaf_data)?;
+        s.serialize_field("leaf_indices", &self.leaf_indices)?;
+        s.serialize_field("total_leaves", &self.total_leaves)?;
+        s.serialize_field("root", &self.root)?;
+        s.serialize_field("siblings", &self.siblings)?;
+        s.end()
+    }
+
+    fn deserialize_fields<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+        check: fn(&[Vec<u8>]) -> Result<(), String>,
+    ) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            leaf_data: Vec<Vec<u8>>,
+            leaf_indices: Vec<usize>,
+            total_leaves: usize,
+            root: Digest,
+            siblings: Vec<Digest>,
+        }
+        use serde::Deserialize;
+        let fields = Fields::deserialize(deserializer)?;
+        check(&fields.leaf_data).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            leaf_data: fields.leaf_data,
+            leaf_indices: fields.leaf_indices,
+            total_leaves: fields.total_leaves,
+            root: fields.root,
+            siblings: fields.siblings,
+        })
+    }
+
+    fn check_chunk_1024(leaf_data: &[Vec<u8>]) -> Result<(), String> {
+        if leaf_data.iter().any(|leaf| leaf.len() != CHUNK_LEN) {
+            Err(format!(
+                "chunk_1024 MerkleProof leaves must be {CHUNK_LEN} bytes"
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -511,6 +644,25 @@ mod tests {
                 "Single leaf proof failed for index {idx}"
             );
         }
+    }
+
+    #[test]
+    fn test_single_chunk_tree_proof_roundtrip() {
+        // A tree with exactly one chunk: the root is the ROOT-finalized hash
+        // of the chunk, and a proof opening it must verify (regression:
+        // compute_root used to return the non-root chunk CV).
+        let key = test_key();
+        let data = test_data(CHUNK_LEN);
+        let tree = MerkleTree::new(&data, key);
+        let proof = tree.get_multileaf_proof(&[0]);
+        assert_eq!(proof.total_leaves, 1);
+        assert_eq!(proof.compute_root(key), Some(tree.root()));
+        assert!(proof.verify(key));
+
+        // Tampered chunk bytes fail closed.
+        let mut tampered = proof;
+        tampered.leaf_data[0][0] ^= 1;
+        assert!(!tampered.verify(key));
     }
 
     #[test]
@@ -607,7 +759,7 @@ mod tests {
         let tree = MerkleTree::new(&data, key);
 
         let mut proof = tree.get_multileaf_proof(&[2, 3]);
-        proof.leaf_data[0] = [0xFFu8; CHUNK_LEN];
+        proof.leaf_data[0] = vec![0xFFu8; CHUNK_LEN];
         assert!(!proof.verify(key));
     }
 
@@ -642,6 +794,64 @@ mod tests {
         let mut proof = tree.get_multileaf_proof(&[0, 2, 5]);
         proof.siblings.push([0xBB; OUT_LEN]);
         assert!(!proof.verify(key));
+    }
+
+    #[test]
+    fn test_reject_out_of_range_leaf_indices() {
+        // Regression (security): with an index >= total_leaves, the final
+        // combine used to take both children from the sibling list, so the
+        // root was reconstructed without ever hashing the supplied leaf data
+        // and verify() accepted leaf bytes the root does not commit to.
+        let key = test_key();
+        let data = test_data(2 * CHUNK_LEN);
+        let tree = MerkleTree::new(&data, key);
+
+        let forged = MerkleProof {
+            leaf_data: vec![vec![0xEE; CHUNK_LEN]], // arbitrary, never hashed pre-fix
+            leaf_indices: vec![2],                  // out of range: tree has 2 leaves
+            total_leaves: 2,
+            root: tree.root(),
+            siblings: tree.leaf_hashes().to_vec(), // real CVs fill positions 0 and 1
+        };
+        assert!(forged.sanity_check().is_err());
+        assert_eq!(forged.compute_root(key), None);
+        assert!(!forged.verify(key));
+
+        // Same forgery one level deeper: the out-of-range leaf survives one
+        // merge round and is then silently dropped at the final combine.
+        let data = test_data(4 * CHUNK_LEN);
+        let tree = MerkleTree::new(&data, key);
+        let forged = MerkleProof {
+            leaf_data: vec![vec![0xEE; CHUNK_LEN]],
+            leaf_indices: vec![4], // out of range: tree has 4 leaves
+            total_leaves: 4,
+            root: tree.root(),
+            siblings: tree.layers[1].clone(), // both level-1 CVs
+        };
+        assert!(forged.sanity_check().is_err());
+        assert_eq!(forged.compute_root(key), None);
+        assert!(!forged.verify(key));
+    }
+
+    #[test]
+    fn test_compute_root_rejects_malformed_shape() {
+        let key = test_key();
+        let data = test_data(4 * CHUNK_LEN);
+        let tree = MerkleTree::new(&data, key);
+
+        // More indices than leaf data: the index/hash zip would silently drop
+        // the extra index instead of failing.
+        let mut mismatched = tree.get_multileaf_proof(&[0]);
+        mismatched.leaf_indices = vec![0, 1];
+        assert_eq!(mismatched.compute_root(key), None);
+        assert!(!mismatched.verify(key));
+
+        // Duplicate index: the BTreeMap would silently keep only one of the
+        // two leaves' hashes, leaving the other leaf unverified.
+        let mut duplicated = tree.get_multileaf_proof(&[0, 1]);
+        duplicated.leaf_indices = vec![1, 1];
+        assert_eq!(duplicated.compute_root(key), None);
+        assert!(!duplicated.verify(key));
     }
 
     // ---- Randomized round-trips ----
@@ -679,15 +889,18 @@ mod tests {
     #[test]
     fn test_leaf_indices_from_rows() {
         // 4 rows of 1024 bytes each = 4 leaves, 1:1 mapping
-        let indices = MerkleTree::compute_leaf_indices_from_rows(&[0, 2], (4, CHUNK_LEN));
+        let indices =
+            MerkleTree::compute_leaf_indices_from_rows(&[0, 2], (4, CHUNK_LEN), CHUNK_LEN).unwrap();
         assert_eq!(indices, vec![0, 2]);
 
         // 4 rows of 512 bytes each = 2 leaves (2 rows per leaf)
-        let indices = MerkleTree::compute_leaf_indices_from_rows(&[0, 2], (4, 512));
+        let indices =
+            MerkleTree::compute_leaf_indices_from_rows(&[0, 2], (4, 512), CHUNK_LEN).unwrap();
         assert_eq!(indices, vec![0, 1]);
 
         // Row spans two leaves
-        let indices = MerkleTree::compute_leaf_indices_from_rows(&[0], (2, 1500));
+        let indices =
+            MerkleTree::compute_leaf_indices_from_rows(&[0], (2, 1500), CHUNK_LEN).unwrap();
         assert_eq!(indices, vec![0, 1]);
     }
 
@@ -758,7 +971,7 @@ mod tests {
     #[test]
     fn test_sanity_check() {
         let proof = MerkleProof {
-            leaf_data: vec![[0u8; CHUNK_LEN], [1u8; CHUNK_LEN]],
+            leaf_data: vec![vec![0u8; CHUNK_LEN], vec![1u8; CHUNK_LEN]],
             leaf_indices: vec![0, 2],
             total_leaves: 4,
             root: [0u8; OUT_LEN],
@@ -776,13 +989,22 @@ mod tests {
         assert!(bad.sanity_check().is_err());
 
         let unsorted = MerkleProof {
-            leaf_data: vec![[0u8; CHUNK_LEN], [1u8; CHUNK_LEN]],
+            leaf_data: vec![vec![0u8; CHUNK_LEN], vec![1u8; CHUNK_LEN]],
             leaf_indices: vec![2, 0],
             total_leaves: 4,
             root: [0u8; OUT_LEN],
             siblings: vec![],
         };
         assert!(unsorted.sanity_check().is_err());
+
+        let out_of_range = MerkleProof {
+            leaf_data: vec![vec![0u8; CHUNK_LEN]],
+            leaf_indices: vec![4],
+            total_leaves: 4,
+            root: [0u8; OUT_LEN],
+            siblings: vec![],
+        };
+        assert!(out_of_range.sanity_check().is_err());
     }
 
     #[test]
@@ -830,5 +1052,32 @@ mod tests {
         );
         assert_eq!(tree_padded.num_leaves(), 2);
         assert_eq!(tree_raw.num_leaves(), 2);
+    }
+
+    #[test]
+    fn allowed_chunk_lens() {
+        assert_eq!(ALLOWED_CHUNK_LENS, [128, 256, 512, CHUNK_LEN]);
+        assert!(is_allowed_chunk_len(128));
+        assert!(is_allowed_chunk_len(CHUNK_LEN));
+        assert!(!is_allowed_chunk_len(64));
+        assert!(MerkleTree::with_chunk_len(&[0u8; 64], test_key(), 64).is_err());
+        assert!(MerkleTree::compute_leaf_indices_from_rows(&[0], (1, 64), 64).is_err());
+    }
+
+    #[test]
+    fn test_variable_chunk_len_round_trip() {
+        let key = test_key();
+        for chunk_len in ALLOWED_CHUNK_LENS {
+            let raw_len = chunk_len * 3 + 17;
+            let mut data = test_data(raw_len);
+            data.resize(raw_len.div_ceil(chunk_len) * chunk_len, 0);
+            let tree = MerkleTree::with_chunk_len(&data, key, chunk_len).unwrap();
+            assert_eq!(tree.num_leaves(), data.len() / chunk_len);
+
+            let proof = tree.get_multileaf_proof(&[0, tree.num_leaves() - 1]);
+            assert_eq!(proof.chunk_len(), chunk_len);
+            assert!(proof.verify(key));
+            assert_eq!(proof.leaf_data[0].len(), chunk_len);
+        }
     }
 }

@@ -4,40 +4,45 @@ version = "0.1.0"
 description = "Pearl monorepo workspace"
 requires-python = "==3.12.*"
 
+# No PEP 658 sidecar, so declare metadata statically; keep in sync with miner/vllm-miner.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-cubin"
+version = "0.6.16.post3"
+requires-dist = []
+
+# PyTorch cu130 index — PyPI default torch 2.13 wheels are also CUDA 13, but
+# routing through this index pins torch/torchaudio/torchvision to the explicit
+# +cu130 local-version wheels for clarity and consistency.
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
-# vLLM 0.20.2+cu130 allows transformers 5.x (see wheel requires-dist); default resolution
-# stayed on 4.57.x. Gemma 4 checkpoints need transformers>=5.5 with model_type gemma4.
-[tool.uv]
-override-dependencies = [
-  "transformers>=5.5.1,<6",
-  "cuda-bindings>=13.0,<13.1",
-  "cuda-python>=13.0,<13.1",
-]
+# vLLM's Linux flashinfer cubin is distributed from the official project
+# index rather than PyPI.
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
+explicit = true
 
-# Workspace sources - these apply globally to all members
+# Workspace sources. Route torch/torchaudio/torchvision through the cu130
+# index so all three resolve to the +cu130 local-version wheels and stay
+# aligned with the CUDA 13 toolchain.
 [tool.uv.sources]
-miner-utils = {workspace = true}
-miner-base = {workspace = true}
-pearl-gateway = {workspace = true}
+flashinfer-cubin = { index = "flashinfer" }
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+pearl-blake3 = {path = "pearl-blake3"}
 py-pearl-mining = {workspace = true}
+miner-utils = {workspace = true}
+pearl-gateway = {workspace = true}
+miner-base = {workspace = true}
 vllm-miner = {workspace = true}
-pearl-gemm-build-utils = {workspace = true}
 pearl-gemm = {workspace = true}
-# use torch compiled against nvidia runtime
-torch = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchvision = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchaudio = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
 
+# pytest config for every test tree except miner/pearl-gemm/, which ships
+# its own pytest.ini (pytest picks the nearest one).
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
@@ -59,11 +64,10 @@ addopts = "-v --import-mode=importlib"
 
 [tool.uv.workspace]
 members = [
-  "miner/miner-utils",
-  "miner/miner-base",
-  "miner/pearl-gateway",
   "py-pearl-mining",
+  "miner/miner-utils",
+  "miner/pearl-gateway",
+  "miner/miner-base",
   "miner/vllm-miner",
-  "miner/pearl-gemm-build-utils",
-  "miner/pearl-gemm"
+  "miner/pearl-gemm",
 ]

@@ -14,9 +14,10 @@ use plonky2::fri::structure::{
 };
 use plonky2::hash::hash_types::{MerkleCapTarget, RichField};
 use plonky2::hash::merkle_tree::MerkleCap;
+use plonky2::iop::challenger::{Challenger, RecursiveChallenger};
 use plonky2::iop::ext_target::ExtensionTarget;
 use plonky2::iop::target::Target;
-use plonky2::plonk::config::{GenericConfig, Hasher};
+use plonky2::plonk::config::{AlgebraicHasher, GenericConfig, Hasher};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
@@ -305,6 +306,26 @@ impl<F: RichField + Extendable<D>, const D: usize> StarkOpeningSet<F, D> {
 
         FriOpenings { batches }
     }
+
+    /// Binds this opening set into the Fiat-Shamir transcript, in canonical
+    /// field order. Batch mode observes each table's openings this way so the
+    /// stream does not depend on the tables' degree profile.
+    pub fn observe<H: Hasher<F>>(&self, challenger: &mut Challenger<F, H>) {
+        challenger.observe_extension_elements(&self.local_values);
+        challenger.observe_extension_elements(&self.next_values);
+        if let Some(aux) = &self.auxiliary_polys {
+            challenger.observe_extension_elements(aux);
+        }
+        if let Some(aux_next) = &self.auxiliary_polys_next {
+            challenger.observe_extension_elements(aux_next);
+        }
+        if let Some(ctl_zs_first) = &self.ctl_zs_first {
+            challenger.observe_elements(ctl_zs_first);
+        }
+        if let Some(quotient) = &self.quotient_polys {
+            challenger.observe_extension_elements(quotient);
+        }
+    }
 }
 
 /// Circuit version of [`StarkOpeningSet`].
@@ -391,7 +412,9 @@ impl<const D: usize> StarkOpeningSetTarget<D> {
     }
 
     /// Circuit version of `to_fri_openings`for [`FriOpeningsTarget`].
-    pub(crate) fn to_fri_openings(&self) -> FriOpeningsTarget<D> {
+    /// `zero` is a `Target` with value 0, used to convert the base field
+    /// `ctl_zs_first` openings into `ExtensionTarget`s.
+    pub(crate) fn to_fri_openings(&self, zero: Target) -> FriOpeningsTarget<D> {
         let zeta_batch = FriOpeningBatchTarget {
             values: self
                 .local_values
@@ -410,9 +433,45 @@ impl<const D: usize> StarkOpeningSetTarget<D> {
                 .collect_vec(),
         };
 
-        let batches = vec![zeta_batch, zeta_next_batch];
+        let mut batches = vec![zeta_batch, zeta_next_batch];
 
-        assert!(self.ctl_zs_first.is_none());
+        if let Some(ctl_zs_first) = self.ctl_zs_first.as_ref() {
+            debug_assert!(!ctl_zs_first.is_empty());
+            debug_assert!(self.auxiliary_polys.is_some());
+            debug_assert!(self.auxiliary_polys_next.is_some());
+
+            let ctl_first_batch = FriOpeningBatchTarget {
+                values: ctl_zs_first
+                    .iter()
+                    .copied()
+                    .map(|t| t.to_ext_target(zero))
+                    .collect(),
+            };
+
+            batches.push(ctl_first_batch);
+        }
         FriOpeningsTarget { batches }
+    }
+
+    /// Circuit version of [`StarkOpeningSet::observe`].
+    pub fn observe<F, H>(&self, challenger: &mut RecursiveChallenger<F, H, D>)
+    where
+        F: RichField + Extendable<D>,
+        H: AlgebraicHasher<F>,
+    {
+        challenger.observe_extension_elements(&self.local_values);
+        challenger.observe_extension_elements(&self.next_values);
+        if let Some(aux) = &self.auxiliary_polys {
+            challenger.observe_extension_elements(aux);
+        }
+        if let Some(aux_next) = &self.auxiliary_polys_next {
+            challenger.observe_extension_elements(aux_next);
+        }
+        if let Some(ctl_zs_first) = &self.ctl_zs_first {
+            challenger.observe_elements(ctl_zs_first);
+        }
+        if let Some(quotient) = &self.quotient_polys {
+            challenger.observe_extension_elements(quotient);
+        }
     }
 }

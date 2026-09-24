@@ -17,6 +17,7 @@ package zkpow
 import "C"
 
 import (
+	"bytes"
 	"fmt"
 	"runtime"
 	"unsafe"
@@ -35,11 +36,14 @@ const MinNoiseRank = C.MIN_NOISE_RANK
 
 // VerifyCertificate performs sanity checks followed by cryptographic proof verification.
 // It returns an error if the certificate is invalid or does not match the header.
+// V4 certificates are verified with complete headers by the Rust verifier.
 // V3 certificates (CertificateV3) share the V2 layout but use the salted noise-seed derivation.
 // V2 certificates (CertificateV2) handle both MoE and non-MoE new proofs.
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
 	switch c := cert.(type) {
+	case *wire.CertificateV4:
+		return verifyCertificateV4(header, c)
 	case *wire.CertificateV3:
 		return verifyCertificateV3(header, c)
 	case *wire.CertificateV2:
@@ -108,6 +112,76 @@ func verifyCertificateV2(header *wire.BlockHeader, c *wire.CertificateV2) error 
 
 func verifyCertificateV3(header *wire.BlockHeader, c *wire.CertificateV3) error {
 	return VerifyZKProofFFI(header, c, nil)
+}
+
+func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) error {
+	certHash := cert.BlockHash()
+	blockHash := header.BlockHash()
+	if !certHash.IsEqual(&blockHash) {
+		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
+			certHash, blockHash)
+	}
+	proofCommitment := cert.ProofCommitment()
+	if header.ProofCommitment != proofCommitment {
+		return fmt.Errorf("proof commitment mismatch: header has %s, certificate has %s",
+			header.ProofCommitment, proofCommitment)
+	}
+
+	publicData := cert.PublicDataBytes()
+	proofData := cert.ProofBytes()
+	if len(publicData) == 0 || len(proofData) == 0 {
+		return fmt.Errorf("empty fp8 proof")
+	}
+	// Check the C buffer capacity before copying public data into it.
+	if len(publicData) > C.PUBLICDATA_MAX_SIZE {
+		return fmt.Errorf("fp8 public data too large: %d bytes (max %d)",
+			len(publicData), C.PUBLICDATA_MAX_SIZE)
+	}
+	if len(cert.AncestorHeaders) > wire.MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("v4 certificate has %d ancestor headers, max %d",
+			len(cert.AncestorHeaders), wire.MaxCertificateV4AncestorHeaders)
+	}
+
+	// Rust owns proof-specific header interpretation and ancestry verification.
+	var headers bytes.Buffer
+	headers.Grow((1 + len(cert.AncestorHeaders)) * wire.MaxBlockHeaderPayload)
+	if err := header.Serialize(&headers); err != nil {
+		return err
+	}
+	for i := range cert.AncestorHeaders {
+		if err := cert.AncestorHeaders[i].Serialize(&headers); err != nil {
+			return err
+		}
+	}
+	headerBytes := headers.Bytes()
+
+	var cZKProof C.CZKProof
+	cZKProof.public_data_len = C.uintptr_t(len(publicData))
+	C.memcpy(unsafe.Pointer(&cZKProof.public_data[0]), unsafe.Pointer(&publicData[0]), C.size_t(len(publicData)))
+
+	var pinner runtime.Pinner
+	pinner.Pin(&proofData[0])
+	defer pinner.Unpin()
+
+	cZKProof.proof_blob_len = C.uintptr_t(len(proofData))
+	cZKProof.proof_blob = (*C.uint8_t)(unsafe.Pointer(&proofData[0]))
+
+	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
+	result := C.verify_zk_proof_v4(
+		(*C.uint8_t)(unsafe.Pointer(&headerBytes[0])), C.uintptr_t(len(headerBytes)),
+		&cZKProof, &errorBuf[0])
+	msg := C.GoString(&errorBuf[0])
+
+	switch result {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("v4 proof rejected: %s", msg)
+	case 2:
+		return fmt.Errorf("v4 verification system error: %s", msg)
+	default:
+		return fmt.Errorf("unknown v4 verification result %d: %s", result, msg)
+	}
 }
 
 // VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.
