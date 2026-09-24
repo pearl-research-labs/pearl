@@ -22,30 +22,37 @@ const (
 
 // transactionsScreen pages through the wallet history; selecting an entry
 // shows its full detail.
+//
+// listtransactions pages in transactions but answers in entries: a spent
+// output contributes both a receive and a send row, so a page of 15
+// transactions can be twice that many rows. Paging therefore counts
+// transactions, and asks for one beyond the page to learn whether older
+// history exists without a second round trip.
 func transactionsScreen(c *client) error {
 	offset := 0
 	for {
-		var page []btcjson.ListTransactionsResult
+		var entries []btcjson.ListTransactionsResult
 		err := withSpinner("Loading transactions...", func() error {
 			var listErr error
-			page, listErr = c.listTransactions(txPageSize, offset)
+			entries, listErr = c.listTransactions(txPageSize+1, offset)
 			return listErr
 		})
 		if err != nil {
 			return err
 		}
 
+		page, shown, hasOlder := txPage(entries, txPageSize)
 		if len(page) == 0 && offset == 0 {
 			printWarn("No transactions in this wallet yet.")
 			return nil
 		}
 
+		// The wallet answers newest first, which is the order to show.
 		opts := make([]huh.Option[string], 0, len(page)+3)
-		// listtransactions returns oldest first within the page.
-		for i := len(page) - 1; i >= 0; i-- {
-			opts = append(opts, huh.NewOption(txRow(page[i]), page[i].TxID))
+		for _, entry := range page {
+			opts = append(opts, huh.NewOption(txRow(entry), entry.TxID))
 		}
-		if len(page) == txPageSize {
+		if hasOlder {
 			opts = append(opts, huh.NewOption(th.subtle.Render("→ Older transactions"), txNavNext))
 		}
 		if offset > 0 {
@@ -58,7 +65,7 @@ func transactionsScreen(c *client) error {
 		selected := opts[0].Value
 		form := newForm(huh.NewGroup(
 			huh.NewSelect[string]().
-				Title(fmt.Sprintf("Transactions (%d-%d)", offset+1, offset+len(page))).
+				Title(fmt.Sprintf("Transactions %d-%d", offset+1, offset+shown)).
 				Description("Type / to filter, enter for details.").
 				Options(opts...).
 				Height(txPageSize + 5).
@@ -74,18 +81,35 @@ func transactionsScreen(c *client) error {
 
 		switch selected {
 		case txNavNext:
-			offset += txPageSize
+			offset += shown
 		case txNavPrev:
-			offset -= txPageSize
-			if offset < 0 {
-				offset = 0
-			}
+			offset = max(offset-txPageSize, 0)
 		default:
 			if err := showTransactionDetail(c, selected); err != nil {
 				printError(err)
 			}
 		}
 	}
+}
+
+// txPage trims entries to at most size transactions, reporting how many
+// transactions were kept and whether the reply ran past the page. All entries
+// for one transaction arrive together, so a change of txid starts a new one.
+func txPage(entries []btcjson.ListTransactionsResult, size int) (
+	page []btcjson.ListTransactionsResult, shown int, hasMore bool) {
+
+	var current string
+	for i, entry := range entries {
+		if entry.TxID == current {
+			continue
+		}
+		if shown == size {
+			return entries[:i], shown, true
+		}
+		shown++
+		current = entry.TxID
+	}
+	return entries, shown, false
 }
 
 // showTransactionDetail prints the full record for one transaction.
