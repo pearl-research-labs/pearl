@@ -39,7 +39,7 @@ for arg in "$@"; do
             echo "  --rpc-user=USER        RPC username (required)"
             echo "  --rpc-pass=PASS        RPC password (required)"
             echo "  --proxy-port=PORT      Local port for the proxy (default: 44111)"
-            echo "  --rate-limit=N         Expected rate limit events/min (default: 60)"
+            echo "  --rate-limit=N         Expected rate limit events/min (default: 100)"
             exit 0
             ;;
         *) echo "Unknown argument: $arg"; exit 1 ;;
