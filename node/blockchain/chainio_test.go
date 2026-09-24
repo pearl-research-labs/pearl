@@ -7,6 +7,7 @@ package blockchain
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/big"
 	"path/filepath"
 	"reflect"
@@ -46,20 +47,10 @@ func TestErrNotInMainChain(t *testing.T) {
 func setupTestDB(tb testing.TB, name string) database.DB {
 	tb.Helper()
 
-	if !isSupportedDbType(testDbType) {
-		tb.Fatalf("unsupported db type %v", testDbType)
-	}
-
-	dbPath := filepath.Join(tb.TempDir(), name)
-	db, err := database.Create(testDbType, dbPath, blockDataNet)
-	if err != nil {
-		tb.Fatalf("error creating db: %v", err)
-	}
-	tb.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			tb.Fatalf("error closing db: %v", err)
-		}
-	})
+	require.True(tb, isSupportedDbType(testDbType), "unsupported db type %v", testDbType)
+	db, err := database.Create(testDbType, filepath.Join(tb.TempDir(), name), blockDataNet)
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, db.Close()) })
 
 	return db
 }
@@ -67,9 +58,19 @@ func setupTestDB(tb testing.TB, name string) database.DB {
 func TestDbFetchCertificate(t *testing.T) {
 	db := setupTestDB(t, "certfetch")
 
+	maxCert := &wire.CertificateV2{
+		PublicDataLen: wire.PublicDataMaxSizeV2,
+		ProofData:     bytes.Repeat([]byte{0x0a}, wire.MaxZKProofSize),
+	}
+
+	padTx := wire.NewMsgTx(1)
+	padTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, nil))
+	padTx.AddTxOut(wire.NewTxOut(0, make([]byte, 1000)))
+
 	tests := []struct {
 		name string
 		cert wire.BlockCertificate
+		txs  []*wire.MsgTx
 	}{
 		{
 			name: "null",
@@ -96,45 +97,56 @@ func TestDbFetchCertificate(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "v2 max size",
+			cert: maxCert,
+		},
+		{
+			name: "v2 max size, block greater than CertificateMaxSize",
+			cert: maxCert,
+			txs:  []*wire.MsgTx{padTx},
+		},
 	}
 
 	for i, test := range tests {
-		header := wire.BlockHeader{
-			Version:   int32(i + 1),
-			Timestamp: time.Unix(int64(i+1), 0),
-		}
 		block := btcutil.NewBlock(&wire.MsgBlock{
 			MsgHeader: wire.MsgHeader{
-				BlockHeader: header,
+				BlockHeader: wire.BlockHeader{
+					Version:   int32(i + 1),
+					Timestamp: time.Unix(int64(i+1), 0),
+				},
 				MsgCertificate: wire.MsgCertificate{
 					Certificate: test.cert,
 				},
 			},
+			Transactions: test.txs,
 		})
-		blockHash := *block.Hash()
 
-		err := db.Update(func(dbTx database.Tx) error {
-			return dbTx.StoreBlock(block)
-		})
-		if err != nil {
-			t.Fatalf("StoreBlock (%s): unexpected error: %v", test.name, err)
+		blockHash := *block.Hash()
+		if test.txs != nil {
+			require.Greater(t, block.MsgBlock().SerializeSize(), wire.CertificateMaxSize, test.name)
 		}
 
-		err = db.View(func(dbTx database.Tx) error {
+		// used to asses test inside a db view (Update, View, etc)
+		check := func(dbTx database.Tx) error {
 			gotCert, err := dbFetchCertificate(dbTx, blockHash)
 			if err != nil {
 				return err
 			}
 			if !reflect.DeepEqual(gotCert, test.cert) {
-				t.Fatalf("dbFetchCertificate (%s): got %#v, want %#v",
-					test.name, gotCert, test.cert)
+				return fmt.Errorf("got %#v, want %#v", gotCert, test.cert)
 			}
 			return nil
-		})
-		if err != nil {
-			t.Fatalf("dbFetchCertificate (%s): unexpected error: %v",
-				test.name, err)
 		}
+
+		err := db.Update(func(dbTx database.Tx) error {
+			if err := dbTx.StoreBlock(block); err != nil {
+				return err
+			}
+			return check(dbTx)
+		})
+		require.NoError(t, err, "%s: pending block", test.name)
+		require.NoError(t, db.View(check), "%s: stored block", test.name)
 	}
 }
 

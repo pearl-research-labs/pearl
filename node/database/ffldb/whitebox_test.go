@@ -445,7 +445,7 @@ func testBlockFileErrors(tc *testContext) bool {
 	testName = "readBlock invalid file number"
 	invalidLoc := blockLocation{
 		blockFileNum: ^uint32(0),
-		blockLen:     80,
+		recordLen:    80,
 	}
 	_, err = store.readBlock(block0Hash, invalidLoc)
 	if !checkDbError(tc.t, testName, err, database.ErrDriverSpecific) {

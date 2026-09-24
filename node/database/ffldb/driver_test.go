@@ -6,6 +6,7 @@ package ffldb_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/database/ffldb"
+	"github.com/stretchr/testify/require"
 )
 
 // dbType is the database type name for this driver.
@@ -251,6 +253,81 @@ func TestPersistence(t *testing.T) {
 		t.Errorf("View: unexpected error: %v", err)
 		return
 	}
+}
+
+// TestBlockSizeAndRegionBounds ensures FetchBlockSize reports the serialized block length and that
+// regions are bounded by it, for both pending and stored blocks.
+func TestBlockSizeAndRegionBounds(t *testing.T) {
+	t.Parallel()
+
+	db, err := database.Create(dbType, filepath.Join(t.TempDir(), "ffldb-blocksizetest"), blockDataNet)
+	require.NoError(t, err)
+	defer db.Close()
+
+	block := btcutil.NewBlock(chaincfg.MainNetParams.GenesisBlock)
+	blockHash := block.Hash()
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+	blockLen := uint32(len(blockBytes))
+
+	wantCode := func(name string, err error, code database.ErrorCode) error {
+		var dbErr database.Error
+		if !errors.As(err, &dbErr) || dbErr.ErrorCode != code {
+			return fmt.Errorf("%s: got %v, want %v", name, err, code)
+		}
+
+		return nil
+	}
+
+	// performs the actual inspection of FetchBlockSize.
+	check := func(tx database.Tx) error {
+		gotLen, err := tx.FetchBlockSize(blockHash)
+		if err != nil {
+			return fmt.Errorf("FetchBlockSize: %w", err)
+		}
+		if gotLen != blockLen {
+			return fmt.Errorf("FetchBlockSize: got %d, want %d", gotLen, blockLen)
+		}
+
+		whole := database.BlockRegion{Hash: blockHash, Len: blockLen}
+		got, err := tx.FetchBlockRegion(&whole)
+		if err != nil {
+			return fmt.Errorf("FetchBlockRegion whole block: %w", err)
+		}
+		if !bytes.Equal(got, blockBytes) {
+			return errors.New("FetchBlockRegion whole block: bytes mismatch")
+		}
+
+		// A region a byte past the block reaches into the on-disk framing.
+		past := database.BlockRegion{Hash: blockHash, Offset: 1, Len: blockLen}
+		_, err = tx.FetchBlockRegion(&past)
+		if err := wantCode("FetchBlockRegion past end", err, database.ErrBlockRegionInvalid); err != nil {
+			return err
+		}
+		_, err = tx.FetchBlockRegions([]database.BlockRegion{past})
+		if err := wantCode("FetchBlockRegions past end", err, database.ErrBlockRegionInvalid); err != nil {
+			return err
+		}
+
+		_, err = tx.FetchBlockSize(&chainhash.Hash{})
+		return wantCode("FetchBlockSize missing", err, database.ErrBlockNotFound)
+	}
+
+	err = db.Update(func(tx database.Tx) error {
+		if err := tx.StoreBlock(block); err != nil {
+			return err
+		}
+		return check(tx)
+	})
+	require.NoError(t, err, "pending block")
+	require.NoError(t, db.View(check), "stored block")
+
+	tx, err := db.Begin(false)
+	require.NoError(t, err)
+	require.NoError(t, tx.Rollback())
+	_, err = tx.FetchBlockSize(blockHash)
+	require.NoError(t, wantCode("FetchBlockSize closed tx", err, database.ErrTxClosed))
+
 }
 
 // TestPrune tests that the older .fdb files are deleted with a call to prune.
