@@ -70,8 +70,7 @@ type NeutrinoClient struct {
 	clientMtx sync.Mutex
 }
 
-// A compile-time check to ensure that RPCClient satisfies the chain.Interface
-// interface.
+// A compile-time check to ensure that RPCClient satisfies the chain.Interface interface.
 var (
 	_ Interface        = (*NeutrinoClient)(nil)
 	_ BroadcastTracker = (*NeutrinoClient)(nil)

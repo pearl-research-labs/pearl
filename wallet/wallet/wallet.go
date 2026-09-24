@@ -2200,8 +2200,7 @@ func RecvCategory(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Par
 	return CreditReceive
 }
 
-// listTransactions creates a object that may be marshalled to a response result
-// for a listtransactions RPC.
+// listTransactions creates a object that may be marshalled to a response result for a listtransactions RPC.
 //
 // TODO: This should be moved to the legacyrpc package.
 func (w *Wallet) listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails,
@@ -2220,9 +2219,7 @@ func (w *Wallet) listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails,
 	if details.Block.Height != -1 {
 		blockHashStr = details.Block.Hash.String()
 		blockTime = details.Block.Time.Unix()
-		confirmations = int64(
-			calcConf(details.Block.Height, syncHeight),
-		)
+		confirmations = int64(calcConf(details.Block.Height, syncHeight))
 	} else if tracker, ok := w.ChainClient().(chain.BroadcastTracker); ok && len(details.Debits) != 0 {
 		last, isRelayed := tracker.LastRelayed(details.Hash)
 		relayed = &isRelayed
@@ -2250,16 +2247,14 @@ func (w *Wallet) listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails,
 		for _, output := range details.MsgTx.TxOut {
 			outputTotal += btcutil.Amount(output.Value)
 		}
-		// Note: The actual fee is debitTotal - outputTotal.  However,
-		// this RPC reports negative numbers for fees, so the inverse
-		// is calculated.
+		// Note: The actual fee is debitTotal - outputTotal. However, this RPC reports negative numbers for fees, so the
+		// inverse is calculated.
 		feeF64 = (outputTotal - debitTotal).ToPRL()
 	}
 
 outputs:
 	for i, output := range details.MsgTx.TxOut {
-		// Determine if this output is a credit, and if so, determine
-		// its spentness.
+		// Determine if this output is a credit, and if so, determine its spentness.
 		var isCredit bool
 		var spentCredit bool
 		for _, cred := range details.Credits {
@@ -2315,15 +2310,12 @@ outputs:
 			LastRelayTime:   lastRelayTime,
 		}
 
-		// Add a received/generated/immature result if this is a credit.
-		// If the output was spent, create a second result under the
-		// send category with the inverse of the output amount.  It is
-		// therefore possible that a single output may be included in
-		// the results set zero, one, or two times.
+		// Add a received/generated/immature result if this is a credit. If the output was spent, create a second result
+		// under the send category with the inverse of the output amount. It is therefore possible that a single output
+		// may be included in the results set zero, one, or two times.
 		//
-		// Since credits are not saved for outputs that are not
-		// controlled by this wallet, all non-credits from transactions
-		// with debits are grouped under the send category.
+		// Since credits are not saved for outputs that are not controlled by this wallet, all non-credits from
+		// transactions with debits are grouped under the send category.
 
 		if send || spentCredit {
 			result.Category = "send"
@@ -2354,9 +2346,7 @@ func (w *Wallet) ListSinceBlock(start, end, syncHeight int32) ([]btcjson.ListTra
 			for _, detail := range details {
 				detail := detail
 
-				jsonResults := w.listTransactions(
-					tx, &detail, syncHeight,
-				)
+				jsonResults := w.listTransactions(tx, &detail, syncHeight)
 				txList = append(txList, jsonResults...)
 			}
 			return false, nil
@@ -2401,8 +2391,7 @@ func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsRe
 					return true, nil
 				}
 
-				jsonResults := w.listTransactions(tx, &details[i],
-					syncBlock.Height)
+				jsonResults := w.listTransactions(tx, &details[i], syncBlock.Height)
 				txList = append(txList, jsonResults...)
 
 				if len(jsonResults) > 0 {
@@ -2453,8 +2442,7 @@ func (w *Wallet) ListAddressTransactions(pkHashes map[string]struct{}) ([]btcjso
 						continue
 					}
 
-					jsonResults := w.listTransactions(tx, detail,
-						syncBlock.Height)
+					jsonResults := w.listTransactions(tx, detail, syncBlock.Height)
 					txList = append(txList, jsonResults...)
 					continue loopDetails
 				}
@@ -2485,8 +2473,7 @@ func (w *Wallet) ListAllTransactions() ([]btcjson.ListTransactionsResult, error)
 			// unsorted, but it will process mined transactions in the
 			// reverse order they were marked mined.
 			for i := len(details) - 1; i >= 0; i-- {
-				jsonResults := w.listTransactions(tx, &details[i],
-					syncBlock.Height)
+				jsonResults := w.listTransactions(tx, &details[i], syncBlock.Height)
 				txList = append(txList, jsonResults...)
 			}
 			return false, nil

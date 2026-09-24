@@ -66,8 +66,7 @@ var (
 	// BanDuration is the duration of a ban.
 	BanDuration = time.Hour * 24
 
-	// DefaultBroadcastTimeout is the default timeout used when broadcasting
-	// transactions to network peers.
+	// DefaultBroadcastTimeout is the default timeout used when broadcasting transactions to network peers.
 	DefaultBroadcastTimeout = 5 * time.Second
 
 	// TargetOutbound is the number of outbound peers to target.
@@ -679,11 +678,9 @@ type ChainService struct { // nolint:maligned
 
 	broadcastTimeout time.Duration
 
-	// lastRelayed records when a peer last took each transaction this
-	// process announced. An SPV node cannot see mempools, so this is the
-	// only evidence it has that the network holds a pending transaction;
-	// it lives for the session only and is dropped once the transaction
-	// confirms or the wallet removes it.
+	// lastRelayed records when a peer last took each transaction this process announced. An SPV node cannot see
+	// mempools, so this is the only evidence it has that the network holds a pending transaction; it lives for the
+	// session only and is dropped once the transaction confirms or the wallet removes it.
 	relayMu     sync.Mutex
 	lastRelayed map[chainhash.Hash]time.Time
 }
@@ -1513,10 +1510,9 @@ func disconnectPeer(peerList map[int32]*ServerPeer,
 	return false
 }
 
-// SendTransaction announces the transaction to all currently active peers
-// exactly once. An error won't be returned if the transaction already exists
-// within the mempool. Nothing re-announces it later; callers that want another
-// attempt call SendTransaction again.
+// SendTransaction announces the transaction to all currently active peers exactly once. An error won't be returned if
+// the transaction already exists within the mempool. Nothing re-announces it later; callers that want another attempt
+// call SendTransaction again.
 func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 	// TODO(roasbeef): pipe through querying interface
 	err := s.sendTransaction(tx)
@@ -1533,8 +1529,7 @@ func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 	return nil
 }
 
-// LastRelayed reports when a peer last requested txHash after an announcement
-// made by this process, if any.
+// LastRelayed reports when a peer last requested txHash after an announcement made by this process, if any.
 func (s *ChainService) LastRelayed(txHash chainhash.Hash) (time.Time, bool) {
 	s.relayMu.Lock()
 	defer s.relayMu.Unlock()

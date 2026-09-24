@@ -156,11 +156,9 @@ type GetTransactionResult struct {
 	Details         []GetTransactionDetailsResult `json:"details"`
 	Hex             string                        `json:"hex"`
 
-	// Relayed and LastRelayTime are present only for an unconfirmed send
-	// on a backend that keeps relay evidence (SPV). Incoming 0-conf
-	// payments omit them. Relayed false means no peer requested the
-	// transaction after an announcement made in the current daemon
-	// session, not that the network lacks it.
+	// Relayed and LastRelayTime are present only for an unconfirmed send on a backend that keeps relay evidence (SPV).
+	// Incoming 0-conf payments omit them. Relayed false means no peer requested the transaction after an announcement
+	// made in the current daemon session, not that the network lacks it.
 	Relayed       *bool `json:"relayed,omitempty"`
 	LastRelayTime int64 `json:"lastrelaytime,omitempty"`
 }
@@ -264,8 +262,7 @@ type ListTransactionsResult struct {
 	Comment           string   `json:"comment,omitempty"`
 	OtherAccount      string   `json:"otheraccount,omitempty"`
 
-	// Relayed and LastRelayTime follow the same rules as on
-	// GetTransactionResult.
+	// Relayed and LastRelayTime follow the same rules as on GetTransactionResult.
 	Relayed       *bool `json:"relayed,omitempty"`
 	LastRelayTime int64 `json:"lastrelaytime,omitempty"`
 }
@@ -368,16 +365,13 @@ type GetSyncProgressResult struct {
 
 // RemoveTransactionResult models the data from the removetransaction command.
 type RemoveTransactionResult struct {
-	// Removed lists the requested transaction first, then every pending
-	// transaction that spent from it.
+	// Removed lists the requested transaction first, then every pending transaction that spent from it.
 	Removed []string `json:"removed"`
 }
 
-// RebroadcastTransactionResult models the data from the
-// rebroadcasttransaction command.
+// RebroadcastTransactionResult models the data from the rebroadcasttransaction command.
 type RebroadcastTransactionResult struct {
-	// Announced lists the hashes a peer requested, pending ancestors
-	// first and the requested transaction last.
+	// Announced lists the hashes a peer requested, pending ancestors first and the requested transaction last.
 	Announced []string `json:"announced"`
 }
 

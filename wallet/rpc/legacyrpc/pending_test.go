@@ -11,8 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestPendingTxError pins the RPC codes clients branch on for the
-// pending-transaction commands.
+// TestPendingTxError pins the RPC codes clients branch on for the pending-transaction commands.
 func TestPendingTxError(t *testing.T) {
 	notRelayed := fmt.Errorf("%w: no peer requested", chain.ErrTxNotRelayed)
 

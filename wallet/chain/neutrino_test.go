@@ -16,8 +16,7 @@ import (
 // maxDur is the max duration a test has to execute successfully.
 var maxDur = 5 * time.Second
 
-// notRelayedChainService is a mockChainService whose broadcasts find no peer
-// willing to request the transaction.
+// notRelayedChainService is a mockChainService whose broadcasts find no peer willing to request the transaction.
 type notRelayedChainService struct {
 	*mockChainService
 }

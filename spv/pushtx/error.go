@@ -31,10 +31,8 @@ const (
 	// confirmed in the chain by a peer.
 	Confirmed
 
-	// NotRelayed is the code used when no peer requested the transaction
-	// after it was announced. Only the txid went out, so the announcement
-	// delivered nothing; peers that already held the transaction stay silent
-	// too.
+	// NotRelayed is the code used when no peer requested the transaction after it was announced. Only the txid went
+	// out, so the announcement delivered nothing; peers that already held the transaction stay silent too.
 	NotRelayed
 )
 

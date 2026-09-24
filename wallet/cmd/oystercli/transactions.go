@@ -131,19 +131,16 @@ func showTransactionDetail(c *client, txid string) error {
 	printTitle("Transaction detail")
 	printBox(kvLines(rows))
 
-	// Rebroadcast and remove recover a stuck send. An incoming 0-conf
-	// was never announced by this wallet; forgetting it would drop the
-	// credit (and any spend chained off it) while the payment can still
-	// confirm on chain.
+	// Rebroadcast and remove recover a stuck send. An incoming 0-conf was never announced by this wallet; forgetting it
+	// would drop the credit (and any spend chained off it) while the payment can still confirm on chain.
 	if tx.Confirmations > 0 || !spendsWalletCoins(tx) {
 		return nil
 	}
 	return pendingTxActions(c, tx.TxID)
 }
 
-// spendsWalletCoins reports whether the transaction spends wallet-owned
-// outputs (a send-category debit). A send detail does not mean this daemon
-// created or broadcast the transaction.
+// spendsWalletCoins reports whether the transaction spends wallet-owned outputs (a send-category debit). A send detail
+// does not mean this daemon created or broadcast the transaction.
 func spendsWalletCoins(tx *btcjson.GetTransactionResult) bool {
 	for _, det := range tx.Details {
 		if det.Category == "send" {
@@ -153,9 +150,8 @@ func spendsWalletCoins(tx *btcjson.GetTransactionResult) bool {
 	return false
 }
 
-// pendingTxActions lets the user re-announce or remove a pending transaction.
-// Under SPV the daemon announces a transaction exactly once, so anything
-// further is the user's explicit call.
+// pendingTxActions lets the user re-announce or remove a pending transaction. Under SPV the daemon announces a
+// transaction exactly once, so anything further is the user's explicit call.
 func pendingTxActions(c *client, txid string) error {
 	const (
 		opBack        = "back"
@@ -216,7 +212,9 @@ func removePendingTx(c *client, txid string) error {
 	ok, err := runForm(newForm(huh.NewGroup(
 		huh.NewConfirm().
 			Title("Remove this pending transaction from the wallet?").
-			Description("Its inputs become spendable again, and any pending transaction spending from it is\nremoved too. The network is not consulted: if a peer already holds this transaction\nit may still confirm, and spending the freed inputs again is a double-spend attempt.").
+			Description("Its inputs become spendable again, and any pending transaction spending from it is\n" +
+				"removed too. The network is not consulted: if a peer already holds this transaction\n" +
+				"it may still confirm, and spending the freed inputs again is a double-spend attempt.").
 			Affirmative("Remove it").
 			Negative("Cancel").
 			Value(&confirmed),

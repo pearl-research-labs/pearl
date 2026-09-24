@@ -37,11 +37,8 @@ func testWallet(t *testing.T) (*Wallet, func()) {
 	return testWalletWithParams(t, &chaincfg.TestNetParams)
 }
 
-// testWalletWithParams creates a test wallet on the given network and unlocks
-// it.
-func testWalletWithParams(t *testing.T,
-	params *chaincfg.Params) (*Wallet, func()) {
-
+// testWalletWithParams creates a test wallet on the given network and unlocks it.
+func testWalletWithParams(t *testing.T, params *chaincfg.Params) (*Wallet, func()) {
 	t.Cleanup(useFastScrypt())
 	// Set up a wallet.
 	dir := t.TempDir()

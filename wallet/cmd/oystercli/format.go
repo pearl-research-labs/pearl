@@ -76,8 +76,7 @@ func fmtConfs(confs int64) string {
 	return fmt.Sprintf("%d conf", confs)
 }
 
-// fmtPeerCount renders the SPV peer count, flagging zero because nothing can
-// be sent without a peer.
+// fmtPeerCount renders the SPV peer count, flagging zero because nothing can be sent without a peer.
 func fmtPeerCount(peers int32) string {
 	if peers == 0 {
 		return "0 (cannot send: no peers)"
@@ -100,9 +99,8 @@ func fmtAgo(unix int64, now time.Time) string {
 	}
 }
 
-// relayLabel describes the network's take on a pending transaction from the
-// relay fields of a listing entry. The daemon omits them on a full-node
-// backend, and for confirmed transactions, where there is nothing to say.
+// relayLabel describes the network's take on a pending transaction from the relay fields of a listing entry. The daemon
+// omits them on a full-node backend, and for confirmed transactions, where there is nothing to say.
 func relayLabel(relayed *bool, lastRelayTime int64, now time.Time) string {
 	switch {
 	case relayed == nil:

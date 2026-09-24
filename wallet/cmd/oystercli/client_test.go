@@ -33,8 +33,7 @@ func TestIsRPCErrorCode(t *testing.T) {
 }
 
 func TestIsNotRelayedError(t *testing.T) {
-	// The daemon reports this verdict as a generic internal error, so the
-	// message is the only handle the CLI has.
+	// The daemon reports this verdict as a generic internal error, so the message is the only handle the CLI has.
 	notRelayed := &btcjson.RPCError{
 		Code:    btcjson.ErrRPCInternal.Code,
 		Message: "transaction not relayed to any peer: no peer requested it",

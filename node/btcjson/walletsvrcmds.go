@@ -1111,14 +1111,12 @@ type RemoveTransactionCmd struct {
 	TxID string
 }
 
-// NewRemoveTransactionCmd returns a new instance which can be used to issue a
-// removetransaction JSON-RPC command.
+// NewRemoveTransactionCmd returns a new instance which can be used to issue a removetransaction JSON-RPC command.
 func NewRemoveTransactionCmd(txID string) *RemoveTransactionCmd {
 	return &RemoveTransactionCmd{TxID: txID}
 }
 
-// RebroadcastTransactionCmd defines the rebroadcasttransaction JSON-RPC
-// command.
+// RebroadcastTransactionCmd defines the rebroadcasttransaction JSON-RPC command.
 type RebroadcastTransactionCmd struct {
 	TxID string
 }

@@ -22,14 +22,12 @@ func sendResult(sendErr error) func(*wire.MsgTx) (*chainhash.Hash, error) {
 	}
 }
 
-// TestPublishTransactionNotRelayed covers how the wallet's record of a new spend reacts to a backend that reports no peer
-// requested the transaction.
+// TestPublishTransactionNotRelayed covers how the wallet's record of a new spend reacts to a backend that reports no
+// peer requested the transaction.
 func TestPublishTransactionNotRelayed(t *testing.T) {
 	notRelayed := fmt.Errorf("%w: no connected peers", chain.ErrTxNotRelayed)
 
-	newFundedWallet := func(t *testing.T, sendErr error) (*Wallet,
-		wire.OutPoint) {
-
+	newFundedWallet := func(t *testing.T, sendErr error) (*Wallet, wire.OutPoint) {
 		w, cleanup := testWallet(t)
 		t.Cleanup(cleanup)
 		w.chainClient = &mockChainClient{
@@ -40,10 +38,7 @@ func TestPublishTransactionNotRelayed(t *testing.T) {
 	}
 
 	send := func(t *testing.T, w *Wallet) (*wire.MsgTx, error) {
-		return w.SendOutputs(
-			[]*wire.TxOut{externalTaprootOutput(t, 50_000)}, nil, 0, 1,
-			1000, CoinSelectionLargest, "",
-		)
+		return w.SendOutputs([]*wire.TxOut{externalTaprootOutput(t, 50_000)}, nil, 0, 1, 1000, CoinSelectionLargest, "")
 	}
 
 	t.Run("first publish drops the record", func(t *testing.T) {
@@ -71,8 +66,7 @@ func TestPublishTransactionNotRelayed(t *testing.T) {
 	})
 }
 
-// TestResendAfterRescanBackendGate checks that the post-rescan resend reaches
-// a full-node backend and never an SPV one.
+// TestResendAfterRescanBackendGate checks that the post-rescan resend reaches a full-node backend and never an SPV one.
 func TestResendAfterRescanBackendGate(t *testing.T) {
 	tests := []struct {
 		backEnd     string
@@ -95,9 +89,7 @@ func TestResendAfterRescanBackendGate(t *testing.T) {
 			var resends int
 			w.chainClient = &mockChainClient{
 				backEnd: tc.backEnd,
-				sendRawTransactionFunc: func(tx *wire.MsgTx) (
-					*chainhash.Hash, error) {
-
+				sendRawTransactionFunc: func(tx *wire.MsgTx) (*chainhash.Hash, error) {
 					resends++
 					return sendResult(nil)(tx)
 				},

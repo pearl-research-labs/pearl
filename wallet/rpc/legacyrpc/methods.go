@@ -397,9 +397,8 @@ func decodeTxHash(txID string) (*chainhash.Hash, error) {
 	return txHash, nil
 }
 
-// internalError reports a broadcast failure. Clients recognize a not-relayed
-// verdict by its message, so sends and rebroadcasts must report it the same
-// way.
+// internalError reports a broadcast failure. Clients recognize a not-relayed verdict by its message, so sends and
+// rebroadcasts must report it the same way.
 func internalError(err error) *btcjson.RPCError {
 	return &btcjson.RPCError{Code: btcjson.ErrRPCInternal.Code, Message: err.Error()}
 }
@@ -416,9 +415,8 @@ func pendingTxError(err error) error {
 	}
 }
 
-// removeTransaction handles a removetransaction request by forgetting a
-// pending transaction and its pending dependents so their inputs can be spent
-// again.
+// removeTransaction handles a removetransaction request by forgetting a pending transaction and its pending dependents
+// so their inputs can be spent again.
 func removeTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.RemoveTransactionCmd)
 
@@ -432,20 +430,16 @@ func removeTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) 
 		return nil, pendingTxError(err)
 	}
 
-	log.Infof("Removed pending transaction %v and %d dependents", txHash,
-		len(removed)-1)
+	log.Infof("Removed pending transaction %v and %d dependents", txHash, len(removed)-1)
 
 	return &btcjson.RemoveTransactionResult{
 		Removed: hashStrings(removed),
 	}, nil
 }
 
-// rebroadcastTransaction handles a rebroadcasttransaction request by
-// announcing a pending transaction, and its pending ancestors, to the network
-// again.
-func rebroadcastTransaction(icmd interface{}, w *wallet.Wallet) (interface{},
-	error) {
-
+// rebroadcastTransaction handles a rebroadcasttransaction request by announcing a pending transaction, and its pending
+// ancestors, to the network again.
+func rebroadcastTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.RebroadcastTransactionCmd)
 
 	txHash, err := decodeTxHash(cmd.TxID)
@@ -458,8 +452,7 @@ func rebroadcastTransaction(icmd interface{}, w *wallet.Wallet) (interface{},
 		return nil, pendingTxError(err)
 	}
 
-	log.Infof("Rebroadcast pending transaction %v (%d announced)", txHash,
-		len(announced))
+	log.Infof("Rebroadcast pending transaction %v (%d announced)", txHash, len(announced))
 
 	return &btcjson.RebroadcastTransactionResult{
 		Announced: hashStrings(announced),
@@ -780,8 +773,7 @@ func getReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, erro
 	return total.ToPRL(), nil
 }
 
-// getTransaction handles a gettransaction request by returning details about
-// a single transaction saved by wallet.
+// getTransaction handles a gettransaction request by returning details about a single transaction saved by wallet.
 func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.GetTransactionCmd)
 

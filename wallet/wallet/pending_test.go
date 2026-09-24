@@ -16,8 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// trackingChainClient is a mock backend that also keeps relay evidence, the
-// way the SPV backend does.
+// trackingChainClient is a mock backend that also keeps relay evidence, the way the SPV backend does.
 type trackingChainClient struct {
 	mockChainClient
 
@@ -39,9 +38,7 @@ func newTrackingChainClient() *trackingChainClient {
 	return c
 }
 
-func (c *trackingChainClient) LastRelayed(txHash chainhash.Hash) (time.Time,
-	bool) {
-
+func (c *trackingChainClient) LastRelayed(txHash chainhash.Hash) (time.Time, bool) {
 	t, ok := c.relayed[txHash]
 	return t, ok
 }
@@ -56,8 +53,7 @@ func sendTo(t *testing.T, w *Wallet, value int64, minconf int32) *wire.MsgTx {
 	t.Helper()
 
 	tx, err := w.SendOutputs(
-		[]*wire.TxOut{externalTaprootOutput(t, value)}, nil, 0, minconf,
-		1000, CoinSelectionLargest, "",
+		[]*wire.TxOut{externalTaprootOutput(t, value)}, nil, 0, minconf, 1000, CoinSelectionLargest, "",
 	)
 	require.NoError(t, err)
 	return tx
@@ -65,9 +61,7 @@ func sendTo(t *testing.T, w *Wallet, value int64, minconf int32) *wire.MsgTx {
 
 // pendingChain funds a wallet on a tracking backend and creates a parent
 // spend plus a child that spends the parent's change.
-func pendingChain(t *testing.T) (*Wallet, *trackingChainClient,
-	wire.OutPoint, *wire.MsgTx, *wire.MsgTx) {
-
+func pendingChain(t *testing.T) (*Wallet, *trackingChainClient, wire.OutPoint, *wire.MsgTx, *wire.MsgTx) {
 	t.Helper()
 
 	w, cleanup := testWallet(t)
@@ -78,8 +72,7 @@ func pendingChain(t *testing.T) (*Wallet, *trackingChainClient,
 
 	parent := sendTo(t, w, 50_000, 1)
 	child := sendTo(t, w, 20_000, 0)
-	require.Equal(t, parent.TxHash(), child.TxIn[0].PreviousOutPoint.Hash,
-		"child must spend the parent's change")
+	require.Equal(t, parent.TxHash(), child.TxIn[0].PreviousOutPoint.Hash, "child must spend the parent's change")
 
 	unmined, _ := walletTxState(t, w)
 	require.Len(t, unmined, 2)
@@ -93,9 +86,7 @@ func TestRemoveTransaction(t *testing.T) {
 
 		removed, err := w.RemoveTransaction(parent.TxHash())
 		require.NoError(t, err)
-		require.Equal(t,
-			[]chainhash.Hash{parent.TxHash(), child.TxHash()}, removed,
-		)
+		require.Equal(t, []chainhash.Hash{parent.TxHash(), child.TxHash()}, removed)
 
 		unmined, unspent := walletTxState(t, w)
 		require.Empty(t, unmined)
@@ -163,9 +154,7 @@ func TestRebroadcastTransaction(t *testing.T) {
 		w, client, _, parent, child := pendingChain(t)
 
 		var order []chainhash.Hash
-		client.sendRawTransactionFunc = func(tx *wire.MsgTx) (
-			*chainhash.Hash, error) {
-
+		client.sendRawTransactionFunc = func(tx *wire.MsgTx) (*chainhash.Hash, error) {
 			hash := tx.TxHash()
 			order = append(order, hash)
 			return &hash, nil
@@ -173,9 +162,7 @@ func TestRebroadcastTransaction(t *testing.T) {
 
 		announced, err := w.RebroadcastTransaction(child.TxHash())
 		require.NoError(t, err)
-		require.Equal(t,
-			[]chainhash.Hash{parent.TxHash(), child.TxHash()}, announced,
-		)
+		require.Equal(t, []chainhash.Hash{parent.TxHash(), child.TxHash()}, announced)
 		require.Equal(t, announced, order)
 	})
 
@@ -189,9 +176,7 @@ func TestRebroadcastTransaction(t *testing.T) {
 
 	t.Run("a silent parent does not stop the child", func(t *testing.T) {
 		w, client, _, parent, child := pendingChain(t)
-		client.sendRawTransactionFunc = func(tx *wire.MsgTx) (
-			*chainhash.Hash, error) {
-
+		client.sendRawTransactionFunc = func(tx *wire.MsgTx) (*chainhash.Hash, error) {
 			if tx.TxHash() == parent.TxHash() {
 				return nil, notRelayed
 			}
@@ -206,9 +191,7 @@ func TestRebroadcastTransaction(t *testing.T) {
 	t.Run("not relayed keeps the record", func(t *testing.T) {
 		w, client, fundingOut, _, child := pendingChain(t)
 		var sends int
-		client.sendRawTransactionFunc = func(*wire.MsgTx) (
-			*chainhash.Hash, error) {
-
+		client.sendRawTransactionFunc = func(*wire.MsgTx) (*chainhash.Hash, error) {
 			sends++
 			return nil, notRelayed
 		}
@@ -225,9 +208,7 @@ func TestRebroadcastTransaction(t *testing.T) {
 	t.Run("rejection keeps the record", func(t *testing.T) {
 		w, client, fundingOut, _, child := pendingChain(t)
 		var sends int
-		client.sendRawTransactionFunc = func(*wire.MsgTx) (
-			*chainhash.Hash, error) {
-
+		client.sendRawTransactionFunc = func(*wire.MsgTx) (*chainhash.Hash, error) {
 			sends++
 			return nil, chain.ErrMissingInputs
 		}
@@ -251,9 +232,7 @@ func TestRebroadcastTransaction(t *testing.T) {
 
 			announced, err := w.RebroadcastTransaction(child.TxHash())
 			require.NoError(t, err)
-			require.Equal(t,
-				[]chainhash.Hash{parent.TxHash(), child.TxHash()}, announced,
-			)
+			require.Equal(t, []chainhash.Hash{parent.TxHash(), child.TxHash()}, announced)
 
 			unmined, unspent := walletTxState(t, w)
 			require.Len(t, unmined, 2)
@@ -329,9 +308,7 @@ func TestRelayStatusInListings(t *testing.T) {
 }
 
 // entriesFor returns the listing entries of txHash, failing if there are none.
-func entriesFor(t *testing.T, w *Wallet,
-	txHash chainhash.Hash) []btcjson.ListTransactionsResult {
-
+func entriesFor(t *testing.T, w *Wallet, txHash chainhash.Hash) []btcjson.ListTransactionsResult {
 	t.Helper()
 
 	results, err := w.ListAllTransactions()

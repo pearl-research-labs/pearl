@@ -21,9 +21,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// neutrinoSendClient routes only SendRawTransaction through a real Neutrino
-// client. The other backend calls stay mocked so that NotifyReceived never
-// starts a rescan, which would wait on peers this harness does not have.
+// neutrinoSendClient routes only SendRawTransaction through a real Neutrino client. The other backend calls stay mocked
+// so that NotifyReceived never starts a rescan, which would wait on peers this harness does not have.
 type neutrinoSendClient struct {
 	*mockChainClient
 	neutrino *chain.NeutrinoClient
@@ -31,16 +30,13 @@ type neutrinoSendClient struct {
 
 var _ chain.Interface = (*neutrinoSendClient)(nil)
 
-func (c *neutrinoSendClient) SendRawTransaction(tx *wire.MsgTx,
-	allowHighFees bool) (*chainhash.Hash, error) {
-
+func (c *neutrinoSendClient) SendRawTransaction(tx *wire.MsgTx, allowHighFees bool) (*chainhash.Hash, error) {
 	return c.neutrino.SendRawTransaction(tx, allowHighFees)
 }
 
-// newPeerlessSPVWallet returns a funded simnet wallet whose broadcasts go
-// through a running Neutrino ChainService that has no peers, plus the funding
-// outpoint. Simnet is a dev network, so the service never DNS-seeds and stays
-// peerless for the whole test.
+// newPeerlessSPVWallet returns a funded simnet wallet whose broadcasts go through a running Neutrino ChainService that
+// has no peers, plus the funding outpoint. Simnet is a dev network, so the service never DNS-seeds and stays peerless
+// for the whole test.
 func newPeerlessSPVWallet(t *testing.T) (*Wallet, wire.OutPoint) {
 	t.Helper()
 
@@ -48,10 +44,7 @@ func newPeerlessSPVWallet(t *testing.T) (*Wallet, wire.OutPoint) {
 	t.Cleanup(cleanup)
 
 	dir := t.TempDir()
-	db, err := walletdb.Create(
-		"bdb", filepath.Join(dir, "neutrino.db"), true,
-		defaultDBTimeout, false,
-	)
+	db, err := walletdb.Create("bdb", filepath.Join(dir, "neutrino.db"), true, defaultDBTimeout, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
@@ -67,16 +60,13 @@ func newPeerlessSPVWallet(t *testing.T) (*Wallet, wire.OutPoint) {
 
 	w.chainClient = &neutrinoSendClient{
 		mockChainClient: &mockChainClient{},
-		neutrino: chain.NewNeutrinoClient(
-			&chaincfg.SimNetParams, cs,
-		),
+		neutrino:        chain.NewNeutrinoClient(&chaincfg.SimNetParams, cs),
 	}
 
 	return w, fundWallet(t, w, 100_000)
 }
 
-// fundWallet credits the wallet with one confirmed taproot output and returns
-// its outpoint.
+// fundWallet credits the wallet with one confirmed taproot output and returns its outpoint.
 func fundWallet(t *testing.T, w *Wallet, value int64) wire.OutPoint {
 	t.Helper()
 
@@ -100,16 +90,13 @@ func externalTaprootOutput(t *testing.T, value int64) *wire.TxOut {
 
 	privKey, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
-	pkScript, err := txscript.PayToTaprootScript(
-		txscript.ComputeTaprootKeyNoScript(privKey.PubKey()),
-	)
+	pkScript, err := txscript.PayToTaprootScript(txscript.ComputeTaprootKeyNoScript(privKey.PubKey()))
 	require.NoError(t, err)
 
 	return wire.NewTxOut(value, pkScript)
 }
 
-// walletTxState reads the unmined transactions and unspent outputs straight
-// from the transaction store.
+// walletTxState reads the unmined transactions and unspent outputs straight from the transaction store.
 func walletTxState(t *testing.T, w *Wallet) ([]*wire.MsgTx, []wtxmgr.Credit) {
 	t.Helper()
 
@@ -132,18 +119,14 @@ func walletTxState(t *testing.T, w *Wallet) ([]*wire.MsgTx, []wtxmgr.Credit) {
 	return unmined, unspent
 }
 
-// TestGhostPendingSendRegression covers the Desktop "ghost pending" send: a
-// spend published while the SPV backend has no peer that requests the
-// transaction. Nothing left the machine, so the send must fail and leave no
-// local record instead of being reported as sent with the coins locked.
+// TestGhostPendingSendRegression covers the Desktop "ghost pending" send: a spend published while the SPV backend has
+// no peer that requests the transaction. Nothing left the machine, so the send must fail and leave no local record
+// instead of being reported as sent with the coins locked.
 func TestGhostPendingSendRegression(t *testing.T) {
 	w, fundingOut := newPeerlessSPVWallet(t)
 
 	start := time.Now()
-	tx, err := w.SendOutputs(
-		[]*wire.TxOut{externalTaprootOutput(t, 50_000)}, nil, 0, 1, 1000,
-		CoinSelectionLargest, "",
-	)
+	tx, err := w.SendOutputs([]*wire.TxOut{externalTaprootOutput(t, 50_000)}, nil, 0, 1, 1000, CoinSelectionLargest, "")
 	elapsed := time.Since(start)
 
 	unmined, unspent := walletTxState(t, w)

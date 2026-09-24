@@ -76,9 +76,8 @@ func traced[T any](c *client, method string, fn func() (T, error)) (T, error) {
 	return v, err
 }
 
-// rawCall invokes an RPC method with positional params and decodes the result
-// into out (skipped when out is nil). It exists for the oyster extension
-// methods that have no typed rpcclient binding.
+// rawCall invokes an RPC method with positional params and decodes the result into out (skipped when out is nil). It
+// exists for the oyster extension methods that have no typed rpcclient binding.
 func (c *client) rawCall(method string, out interface{}, params ...interface{}) error {
 	rawParams := make([]json.RawMessage, 0, len(params))
 	for _, p := range params {
@@ -278,9 +277,8 @@ func (c *client) rebroadcastTransaction(txid string) ([]string, error) {
 	return res.Announced, nil
 }
 
-// isNotRelayedError reports whether err is the daemon's verdict that no peer
-// requested a transaction it announced. The daemon wraps it as an internal
-// RPC error, so only the message identifies it.
+// isNotRelayedError reports whether err is the daemon's verdict that no peer requested a transaction it announced. The
+// daemon wraps it as an internal RPC error, so only the message identifies it.
 func isNotRelayedError(err error) bool {
 	var rpcErr *btcjson.RPCError
 	return errors.As(err, &rpcErr) && strings.Contains(rpcErr.Message, "not relayed")

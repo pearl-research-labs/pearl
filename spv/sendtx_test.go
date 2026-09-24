@@ -14,17 +14,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// startPeerlessChainService runs a ChainService on simnet with no peers.
-// Simnet is a dev network, so nothing DNS-seeds and the service stays
-// peerless for the whole test.
+// startPeerlessChainService runs a ChainService on simnet with no peers. Simnet is a dev network, so nothing DNS-seeds
+// and the service stays peerless for the whole test.
 func startPeerlessChainService(t *testing.T) *ChainService {
 	t.Helper()
 
 	dir := t.TempDir()
-	db, err := walletdb.Create(
-		"bdb", filepath.Join(dir, "neutrino.db"), true, 10*time.Second,
-		false,
-	)
+	db, err := walletdb.Create("bdb", filepath.Join(dir, "neutrino.db"), true, 10*time.Second, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
@@ -48,9 +44,8 @@ func testTx() *wire.MsgTx {
 	return tx
 }
 
-// TestSendTransactionNoPeers pins the broadcast contract when no peer can be
-// asked for the transaction: the caller must learn that nothing was relayed
-// instead of being told the broadcast succeeded.
+// TestSendTransactionNoPeers pins the broadcast contract when no peer can be asked for the transaction: the caller must
+// learn that nothing was relayed instead of being told the broadcast succeeded.
 func TestSendTransactionNoPeers(t *testing.T) {
 	cs := startPeerlessChainService(t)
 	require.Zero(t, cs.ConnectedCount())

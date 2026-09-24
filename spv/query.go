@@ -1073,17 +1073,14 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 		)...,
 	)
 
-	// Nothing re-announces the transaction later, so a silent network must
-	// surface as NotRelayed rather than as success.
+	// Nothing re-announces the transaction later, so a silent network must surface as NotRelayed, not as success.
 	if len(replies) == 0 {
 		log.Debugf("No peers replied to inv message for transaction %v",
 			txHash)
 
-		reason := fmt.Sprintf("no connected peers to relay transaction %v",
-			txHash)
+		reason := fmt.Sprintf("no connected peers to relay transaction %v", txHash)
 		if n := s.ConnectedCount(); n > 0 {
-			reason = fmt.Sprintf("none of %d connected peers requested "+
-				"transaction %v", n, txHash)
+			reason = fmt.Sprintf("none of %d connected peers requested transaction %v", n, txHash)
 		}
 		return &pushtx.BroadcastError{Code: pushtx.NotRelayed, Reason: reason}
 	}

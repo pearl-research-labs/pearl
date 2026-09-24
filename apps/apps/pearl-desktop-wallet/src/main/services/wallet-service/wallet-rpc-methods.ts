@@ -77,15 +77,11 @@ class WalletRpcMethods {
   }
 
   removeTransaction(txid: string) {
-    return this.rpc
-      .call<{ removed: string[] }>('removetransaction', [txid])
-      .then(r => r.removed);
+    return this.rpc.call<{ removed: string[] }>('removetransaction', [txid]).then(r => r.removed);
   }
 
   rebroadcastTransaction(txid: string) {
-    return this.rpc
-      .call<{ announced: string[] }>('rebroadcasttransaction', [txid])
-      .then(r => r.announced);
+    return this.rpc.call<{ announced: string[] }>('rebroadcasttransaction', [txid]).then(r => r.announced);
   }
 
   async validateAddress(address: string) {

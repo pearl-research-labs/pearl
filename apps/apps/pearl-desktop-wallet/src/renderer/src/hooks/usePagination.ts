@@ -45,8 +45,7 @@ export function usePagination(options: UsePaginationOptions = {}): UsePagination
     }
   }, [loading, hasMore, count, offset]);
 
-  // Refetch everything loaded so far in one request so the list keeps its
-  // length and the user's scroll position.
+  // Refetch everything loaded so far in one request so the list keeps its length and the user's scroll position.
   const reload = useCallback(async () => {
     setLoading(true);
     try {

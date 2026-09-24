@@ -52,14 +52,9 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
   const [busy, setBusy] = useState<{ txid: string; action: PendingAction } | null>(null);
   const [notice, setNotice] = useState<PendingNotice | null>(null);
 
-  // run resolves to the success notice, or null for none. Errors go to a
-  // dialog because the reload below can drop their row, e.g. when a
-  // conflicting spend confirmed in the meantime.
-  const runPendingAction = async (
-    txid: string,
-    action: PendingAction,
-    run: () => Promise<string | null>
-  ) => {
+  // run resolves to the success notice, or null for none. Errors go to a dialog because the reload below can drop their
+  // row, e.g. when a conflicting spend confirmed in the meantime.
+  const runPendingAction = async (txid: string, action: PendingAction, run: () => Promise<string | null>) => {
     setBusy({ txid, action });
     setNotice(null);
     try {
@@ -244,9 +239,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                 {notice?.txid === activity.txid && (
                   <div
                     className={`mt-2 rounded-md px-3 py-2 text-xs ${
-                      notice.tone === 'success'
-                        ? 'bg-green-50 text-green-800'
-                        : 'bg-amber-50 text-amber-800'
+                      notice.tone === 'success' ? 'bg-green-50 text-green-800' : 'bg-amber-50 text-amber-800'
                     }`}
                   >
                     {notice.message}
