@@ -11,6 +11,9 @@ export function isNotRelayedError(message: string): boolean {
 export const REBROADCAST_NOT_RELAYED_MESSAGE =
   'No peer requested it: either every connected peer already has it, or none will take it.';
 
+export const REBROADCAST_REJECTED_DETAIL =
+  'A transaction the network rejects is removed from the wallet, and its funds become spendable again.';
+
 export const REMOVE_WARNING =
   'Its inputs become spendable again, and any pending transaction spending from it is removed too. ' +
   'The network is not consulted: if a peer already holds this transaction it may still confirm, ' +

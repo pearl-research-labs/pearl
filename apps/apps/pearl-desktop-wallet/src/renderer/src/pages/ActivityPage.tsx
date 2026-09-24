@@ -8,6 +8,7 @@ import {
   isNotRelayedError,
   pendingStatusLabel,
   REBROADCAST_NOT_RELAYED_MESSAGE,
+  REBROADCAST_REJECTED_DETAIL,
   REMOVE_WARNING,
 } from '@/lib/pending-tx';
 import { useState } from 'react';
@@ -35,7 +36,7 @@ type PendingAction = 'rebroadcast' | 'remove';
 
 interface PendingNotice {
   txid: string;
-  tone: 'success' | 'warning' | 'error';
+  tone: 'success' | 'warning';
   message: string;
 }
 
@@ -49,8 +50,9 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
   const [busy, setBusy] = useState<{ txid: string; action: PendingAction } | null>(null);
   const [notice, setNotice] = useState<PendingNotice | null>(null);
 
-  // run resolves to the success notice, or null for none. Whatever happens,
-  // the listing is refetched: a rejection on rebroadcast removes the record.
+  // run resolves to the success notice, or null for none. The listing is
+  // refetched whatever happens, and a rejected rebroadcast deletes its
+  // record, so errors go to a dialog: an inline notice could have no row.
   const runPendingAction = async (
     txid: string,
     action: PendingAction,
@@ -63,12 +65,17 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
       if (message) setNotice({ txid, tone: 'success', message });
     } catch (err) {
       const message = getErrorMessage(err);
-      const notRelayed = action === 'rebroadcast' && isNotRelayedError(message);
-      setNotice({
-        txid,
-        tone: notRelayed ? 'warning' : 'error',
-        message: notRelayed ? REBROADCAST_NOT_RELAYED_MESSAGE : message,
-      });
+      if (action === 'rebroadcast' && isNotRelayedError(message)) {
+        setNotice({ txid, tone: 'warning', message: REBROADCAST_NOT_RELAYED_MESSAGE });
+      } else {
+        void window.appBridge.window.showMessageBox({
+          type: 'error',
+          title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
+          message,
+          detail: action === 'rebroadcast' ? REBROADCAST_REJECTED_DETAIL : undefined,
+          buttons: ['OK'],
+        });
+      }
     } finally {
       setBusy(null);
       await Promise.all([reload(), syncWalletData()]);
@@ -238,9 +245,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                     className={`mt-2 rounded-md px-3 py-2 text-xs ${
                       notice.tone === 'success'
                         ? 'bg-green-50 text-green-800'
-                        : notice.tone === 'warning'
-                          ? 'bg-amber-50 text-amber-800'
-                          : 'bg-red-50 text-red-800'
+                        : 'bg-amber-50 text-amber-800'
                     }`}
                   >
                     {notice.message}
