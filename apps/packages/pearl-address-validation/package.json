@@ -1,7 +1,7 @@
 {
   "name": "@pearl/pearl-address-validation",
   "version": "3.0.0",
-  "description": "Validate Pearl Taproot (P2TR) addresses using bech32m encoding for mainnet, testnet, regtest, and simnet networks.",
+  "description": "Validate Pearl P2TR (witness v1) and P2MR (witness v2) addresses using bech32m encoding for mainnet, testnet, and simnet networks.",
   "main": "dist/index.js",
   "files": [
     "dist"
@@ -25,12 +25,13 @@
     "validation",
     "mainnet",
     "testnet",
-    "regtest",
     "simnet",
     "bech32m",
     "taproot",
     "p2tr",
-    "witness-v1"
+    "witness-v1",
+    "p2mr",
+    "witness-v2"
   ],
   "author": {
     "name": "Liad Madmon",
@@ -45,14 +46,11 @@
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.17.3",
     "@changesets/cli": "^2.27.12",
-    "@types/sha.js": "^2.4.0",
     "prettier": "^3.5.1",
     "typescript": "^5.7.3",
     "vitest": "^3.2.6"
   },
   "dependencies": {
-    "base58-js": "^3.0.2",
-    "bech32": "^2.0.0",
-    "sha256-uint8array": "^0.10.3"
+    "bech32": "^2.0.0"
   }
 }
