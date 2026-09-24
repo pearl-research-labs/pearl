@@ -166,7 +166,7 @@ func pendingTxActions(c *client, txid string) error {
 	submitted, err := runForm(newForm(huh.NewGroup(
 		huh.NewSelect[string]().
 			Title("Pending transaction").
-			Description("The daemon announces a transaction once when sent and never again on its own.").
+			Description("Under SPV the daemon announces a transaction once when sent and never again on its own.").
 			Options(
 				huh.NewOption("Back", opBack),
 				huh.NewOption("Rebroadcast to the network", opRebroadcast),

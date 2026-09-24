@@ -45,9 +45,8 @@ export function usePagination(options: UsePaginationOptions = {}): UsePagination
     }
   }, [loading, hasMore, count, offset]);
 
-  // Refetches the pages loaded so far in one request, so a change made by
-  // the user (rebroadcast, remove) shows up without losing their scroll
-  // position.
+  // Refetch everything loaded so far in one request so the list keeps its
+  // length and the user's scroll position.
   const reload = useCallback(async () => {
     setLoading(true);
     try {

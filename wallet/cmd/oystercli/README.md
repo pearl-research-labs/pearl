@@ -30,9 +30,9 @@ for its exact location — point them at the built `oyster`, or pass
   relay fee (0.00001 PRL/kB).
 - **Receive** — fresh or current addresses, rendered with a scannable QR code.
 - **Transactions** — paged history browser with filtering and full detail view.
-  Under SPV a pending entry shows whether the network took it ("pending,
-  relayed 5m ago") or not ("pending, not announced since start"), and its
-  detail view offers **Rebroadcast** and **Remove** (see below).
+  A pending send's detail view offers **Rebroadcast** and **Remove** (see
+  below); under SPV the entry also shows whether the network took it
+  ("pending, relayed 5m ago") or not ("pending, not announced since start").
 - **Accounts** — list, create, rename, and inspect addresses.
 - **Coins** — UTXO listing plus lock/unlock coin control.
 - **Security** — lock/unlock, passphrase change, WIF import/export (guarded),
@@ -147,7 +147,7 @@ shows is the evidence it has for the current session:
 The status and the two actions below apply to sends this wallet made. An
 incoming payment that is still unconfirmed shows plain `unconfirmed`: the
 daemon never announced it, so there is no relay evidence to report and no
-send to rebroadcast or abandon.
+send to rebroadcast or remove.
 
 From a pending send's detail view:
 

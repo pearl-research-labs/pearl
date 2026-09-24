@@ -4,17 +4,20 @@ import { usePagination } from '../hooks/usePagination';
 import { useWalletStore } from '../store/walletStore';
 import { Button } from '@/components/ui/button';
 import { formatTimeAgo, getErrorMessage } from '@/lib/utils';
-import {
-  isNotRelayedError,
-  pendingStatusLabel,
-  REBROADCAST_NOT_RELAYED_MESSAGE,
-  REMOVE_WARNING,
-} from '@/lib/pending-tx';
+import { isNotRelayedError, pendingStatusLabel } from '@/lib/pending-tx';
 import { useState } from 'react';
 
 interface ActivityPageProps {
   onBack: () => void;
 }
+
+const REBROADCAST_NOT_RELAYED_MESSAGE =
+  'No peer requested it: either every connected peer already has it, or none will take it.';
+
+const REMOVE_WARNING =
+  'Its inputs become spendable again, and any pending transaction spending from it is removed too. ' +
+  'The network is not consulted: if a peer already holds this transaction it may still confirm, ' +
+  'and spending the freed inputs again is a double-spend attempt.';
 
 const formatFullDate = (timestamp: number): string => {
   const date = new Date(timestamp);

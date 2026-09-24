@@ -5,8 +5,8 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-export function formatTimeAgo(timestampMs: number, nowMs = Date.now()): string {
-  const minutes = Math.floor((nowMs - timestampMs) / 60_000);
+export function formatTimeAgo(timestampMs: number): string {
+  const minutes = Math.floor((Date.now() - timestampMs) / 60_000);
   if (minutes < 1) return 'just now';
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
