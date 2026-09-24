@@ -947,7 +947,10 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	return foundBlock, nil
 }
 
-// BIP-144: the inv is MSG_TX by txid; witness encoding is selected in getdata.
+// newTransactionInv creates the inventory used to announce a transaction.
+// BIP-144 reserves witness inventory types for getdata, where the requesting
+// peer selects the transaction encoding. The preceding inv therefore always
+// identifies the transaction by its txid using MSG_TX.
 func newTransactionInv(tx *wire.MsgTx) *wire.MsgInv {
 	txHash := tx.TxHash()
 	inv := wire.NewMsgInv()
@@ -956,8 +959,8 @@ func newTransactionInv(tx *wire.MsgTx) *wire.MsgInv {
 	return inv
 }
 
-// NotRelayed: nothing confirmable left this node; the inv carried only
-// a txid.
+// notRelayedError is safe to treat as "nothing was sent": an inv carries only
+// the txid, so no peer received anything that could confirm.
 func notRelayedError(txHash chainhash.Hash, numPeers int) error {
 	reason := fmt.Sprintf("no connected peers to relay transaction %v",
 		txHash)
@@ -979,6 +982,10 @@ func notRelayedError(txHash chainhash.Hash, numPeers int) error {
 // TODO(wilmer): Move to pushtx package after introducing a query package. This
 // cannot be done at the moment due to circular dependencies.
 func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) error {
+	// Starting with the set of default options, we'll apply any specified
+	// functional options to the query so we know which encoding to serve
+	// the transaction with. We broadcast an inv to all peers and respond to
+	// any getdata messages for the transaction.
 	qo := defaultQueryOptions()
 	qo.applyQueryOptions(options...)
 
@@ -987,6 +994,8 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 		return notRelayedError(tx.TxHash(), numPeers)
 	}
 
+	// Announce the transaction by txid. A peer can request its preferred
+	// serialization in getdata, which we answer using qo.encoding below.
 	txHash := tx.TxHash()
 	inv := newTransactionInv(tx)
 
