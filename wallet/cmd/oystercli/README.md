@@ -155,7 +155,7 @@ From a pending send's detail view:
   `rebroadcasttransaction`. Success means a peer requested it. "No peer
   requested it" is ambiguous by construction: peers that already hold the
   transaction stay silent, so it also happens when every connected peer has
-  it.
+  it. A rejection is shown and the transaction stays pending; Remove drops it.
 - **Remove** — forgets it, and every pending transaction spending from it,
   via `removetransaction`, so their inputs become spendable again. The
   network is not consulted: a peer that already holds the transaction may
