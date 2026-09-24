@@ -482,8 +482,12 @@ impl Fp8Job {
                 .map(fp32_to_bf16_rne)
                 .collect())
         };
-        let a_noise = noise_codes(&noise.a.e, &noise.a.f, h).context("A-side noise codes")?;
-        let b_noise = noise_codes(&noise.b.e, &noise.b.f, w).context("B-side noise codes")?;
+        let (a_noise, b_noise) = plonky2_maybe_rayon::join(
+            || noise_codes(&noise.a.e, &noise.a.f, h),
+            || noise_codes(&noise.b.e, &noise.b.f, w),
+        );
+        let a_noise = a_noise.context("A-side noise codes")?;
+        let b_noise = b_noise.context("B-side noise codes")?;
 
         // ---- The five programs. ----
         // The MoE sampled-entry pins (empty for a dense job): the deployed compiler already
