@@ -8,7 +8,7 @@ export interface TransactionDetail {
   blockhash: string;
   blockindex: number;
   blocktime: number;
-  details: any[];
+  details: unknown[];
   hex: string;
   walletconflicts: string[];
 }

@@ -5,7 +5,7 @@ class WalletRpcMethods {
   constructor(private readonly rpc: RpcClient) { }
 
   getInfo() {
-    return this.rpc.call<any>('getinfo', []);
+    return this.rpc.call<unknown>('getinfo', []);
   }
 
   getSyncProgress(): Promise<SyncProgress> {
@@ -51,12 +51,12 @@ class WalletRpcMethods {
   }
 
   listAllTransactions() {
-    return this.rpc.call<any>('listalltransactions', []);
+    return this.rpc.call<unknown>('listalltransactions', []);
   }
 
   listTransactions(count: number = 10, from: number = 0) {
     // Passing account gives an error: Transactions are not yet grouped by account
-    return this.rpc.call<any>('listtransactions', [undefined, count, from]);
+    return this.rpc.call<unknown>('listtransactions', [undefined, count, from]);
   }
 
   unlockWallet(passphrase: string, timeout: number = 3600) {

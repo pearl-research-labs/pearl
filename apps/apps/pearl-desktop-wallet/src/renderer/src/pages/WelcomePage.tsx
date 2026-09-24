@@ -1,5 +1,5 @@
 import { Button } from '@/components/ui/button';
-import { ShieldCheck, ArrowRightLeft, BarChart3, Atom } from 'lucide-react';
+import { ShieldCheck, ArrowRightLeft, BarChart3 } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import { NetworkSelector } from '../components/NetworkSelector';
@@ -39,6 +39,7 @@ export default function WelcomePage() {
     } else {
       checkForExistingWallet();
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally run once on mount
   }, []);
 
   const checkForExistingWallet = async () => {

@@ -30,7 +30,7 @@ const formatFullDate = (timestamp: number): string => {
   return date.toLocaleString();
 };
 
-const truncateAddress = (address: string): string => {
+const _truncateAddress = (address: string): string => {
   if (address.length <= 12) return address;
   return `${address.slice(0, 6)}...${address.slice(-6)}`;
 };
@@ -45,7 +45,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
     pageSize: 10,
   });
   const [copiedTxId, setCopiedTxId] = useState<string | null>(null);
-  const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
+  const [_copiedAddress, setCopiedAddress] = useState<string | null>(null);
 
   const handleCopyTxId = async (txid: string) => {
     try {
@@ -57,7 +57,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
     }
   };
 
-  const handleCopyAddress = async (address: string) => {
+  const _handleCopyAddress = async (address: string) => {
     try {
       await navigator.clipboard.writeText(address);
       setCopiedAddress(address);

@@ -45,6 +45,7 @@ function SyncWallet() {
         syncIntervalRef.current = null;
       }
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- syncWalletData and updateSyncProgress are stable store functions
   }, [isUnlocked]);
 
   useEffect(() => {
@@ -62,6 +63,7 @@ function SyncWallet() {
         updateSyncProgress();
       }, 5000);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- syncWalletData and updateSyncProgress are stable store functions
   }, [isBlockchainSynced, isUnlocked]);
 
   return null;

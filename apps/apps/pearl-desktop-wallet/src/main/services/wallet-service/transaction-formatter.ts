@@ -32,7 +32,7 @@ export function formatTransaction(tx: RawTransaction): Transaction {
   };
 }
 
-export function formatAndSortTransactions(transactions: any[]): Transaction[] {
-  const formatted = transactions.map((tx: any) => formatTransaction(tx));
+export function formatAndSortTransactions(transactions: unknown[]): Transaction[] {
+  const formatted = transactions.map((tx: unknown) => formatTransaction(tx));
   return formatted.sort((a: Transaction, b: Transaction) => b.time - a.time);
 }
