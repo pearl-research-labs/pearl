@@ -14,7 +14,7 @@ zk-pow = { path = "../zk-pow", features = ["pyo3"] }
 blake3 = "1.8"
 primitive-types = "0.12.1"
 rayon = "1.10"
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py312"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py312"] }
 lazy_static = "1.5"
 env_logger = "0.10.0"
 
