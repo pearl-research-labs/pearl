@@ -26,7 +26,7 @@
 //! (`F_A` uses `Side::A` addresses so it is a distinct draw from `F_B`); `E_B`
 //! is keyed by `noise seedB`. The `F` basis is stored `k x r` row-major (the
 //! transpose of the reference's `(r x k)` view), so line `i` is column `i` of
-//! `F` — exactly the operand layout `B200::matmul_fp8` expects for `E @ F`.
+//! `F` — exactly the operand layout both device atoms expect for `E @ F`.
 
 use crate::api::fp8::compute::{bf16_div, bf16_mul};
 use crate::api::fp8::dtype::{bf16_to_f32, f32_to_bf16, f32_to_fp8_e4m3};
@@ -51,6 +51,17 @@ pub struct OperandNoise {
     pub e: Vec<u8>,
     /// `(k x r)` E4M3 values, row-major (the reference's `F` transposed).
     pub f: Vec<u8>,
+}
+
+/// Fixed seed-address line bytes, shared with the device-quantization vectors in
+/// [`crate::api::fp8::quantization::tests`].
+#[cfg(test)]
+pub(crate) fn decode_hex_for_test(raw: &str) -> Vec<u8> {
+    assert!(raw.len().is_multiple_of(2), "hex string must have even length");
+    (0..raw.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&raw[i..i + 2], 16).expect("hex must decode"))
+        .collect()
 }
 
 /// Which operand a noise line belongs to. The discriminants are the committed
@@ -179,6 +190,8 @@ mod tests {
     use crate::api::fp8::dtype::fp8_e4m3_to_f32;
     use crate::api::primitives::Sides;
 
+    use super::decode_hex_for_test as decode_hex;
+
     fn fixed_seeds() -> Sides<Hash256> {
         Sides {
             a: [0x22u8; 32],
@@ -259,8 +272,47 @@ mod tests {
         // Seed addressing: EA from seedA; both F bases from seedB alone.
         assert_eq!(n0.a.f, n_a.a.f, "FA is independent of seedA");
         assert_ne!(n0.a.e, n_a.a.e, "EA still draws from seedA");
+        assert_eq!(n0.b.e, n_a.b.e, "EB is independent of seedA");
         assert_ne!(n0.a.f, n_b.a.f, "FA draws from seedB");
         assert_eq!(n0.b.f, n_a.b.f, "FB is independent of seedA");
         assert_ne!(n0.b.f, n_b.b.f, "FB draws from seedB");
+    }
+
+    #[test]
+    fn sample_line_pins_fixed_seed_address_bytes() {
+        let seed_a: Hash256 = [0x22u8; 32];
+        let seed_b: Hash256 = [0x11u8; 32];
+        for (seed, side, factor, line, expected_hex) in [
+            (
+                &seed_a,
+                Side::A,
+                NoiseFactor::E,
+                7u32,
+                "be3adfead867e55be469dd50e9e85c50dfdc64e2dfe4eae2e8d6596a6746dd65",
+            ),
+            (
+                &seed_b,
+                Side::A,
+                NoiseFactor::F,
+                0u32,
+                "c65268603369d96362e16a5f6ae6615fe6db43eae463e2d3eae55ae3bb5f54e3",
+            ),
+            (
+                &seed_b,
+                Side::B,
+                NoiseFactor::E,
+                7u32,
+                "e6dce3e05ce4684ae1dee56555596ae3605de9e6e968e961dce1c2e8d75ee559",
+            ),
+            (
+                &seed_b,
+                Side::B,
+                NoiseFactor::F,
+                0u32,
+                "59de69d9696352dee8cee7d4e6da66615be9df69dd66dfe0d7e44f685fe96553",
+            ),
+        ] {
+            assert_eq!(sample_line(seed, side, factor, line, 32), decode_hex(expected_hex));
+        }
     }
 }

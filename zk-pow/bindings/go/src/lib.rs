@@ -23,4 +23,3 @@ pub use verify::verify_zk_proof_v1;
 pub use verify::verify_zk_proof_v2;
 pub use verify::verify_zk_proof_v2_with_nbits;
 pub use verify::verify_zk_proof_v4;
-pub use verify::verify_zk_proof_v4_with_nbits;

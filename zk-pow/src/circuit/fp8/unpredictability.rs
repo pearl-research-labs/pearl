@@ -1,21 +1,28 @@
-//! The canonical integer form of jackpot-policy check 4 (unpredictable summands) and its
-//! consensus budget — the shared rule enforced by the AIRs, `jackpot_policy.rs`, and the
-//! Python reference verifier.
+//! Integer rule for the unpredictable-summands check and its tile-wide skip budget.
 //!
-//! # The check being implemented
-//!
-//! Summand `(i, j, u)` is skippable iff `v_iju < ulp_Device(M_ij)^2`, where
+//! For cell `(i, j)` and product index `u`, the real-valued test is `v_iju < T_iju`:
 //!
 //! ```text
-//! v_iju  = (au^2 + si^2) * (bu^2 + sj^2) / 2^21
-//! au     = alpha_i * x_iu      (exact: two bf16 values, 16-bit significand product)
-//! si     = DELTA * alpha_i * l2f_i = alpha_i * l2f_i / 2   (exact)
-//! ulp^2  = 2^(2*(e(M_ij) - W))                             (0 when M_ij = 0)
+//! au = alpha_A[i] * X_A[i,u]              bu = alpha_B[j] * X_B[j,u]
+//! si = delta(device) * alpha_A[i] * l2f_A[i]
+//! sj = delta(device) * alpha_B[j] * l2f_B[j]
+//! v_iju = (au^2 + si^2) * (bu^2 + sj^2) / 2^21
+//! T_iju = max(ulp_Device(Z_ij,s), 32 * ulp_23(M_ij))^2 / 32
 //! ```
 //!
-//! and rejects the tile iff the skip count exceeds `eps_pred * k * h * w`. `e(x)` denotes
-//! `floor(log2 |x|)` and `W` is the B200 accumulation window ([`WINDOW_BITS`]). Summands
-//! with `au = si = 0` are outside the rule (never counted); in-scheme `si > 0` always.
+//! `X_A` and `X_B` are clean BF16 entries, `alpha` is the row scale, and `l2f` is
+//! the floored row norm. Thus `au`/`bu` are scaled clean entries and `si`/`sj` are
+//! row noise standard deviations, all in quantized units. The variance estimate
+//! for each FP8 quantization error is `2^-10.5 * (entry^2 + sigma^2)`; their product
+//! gives the `2^-21` factor in `v`. `M` is the cell's replay magnitude and `Z` is
+//! the magnitude of the window containing `u`; B200 sets `Z = M`.
+//!
+//! Write `q = max(e(Z_ij,s) - W, e(M_ij) - 18)`, where `e(x)` is
+//! `floor(log2 |x|)` for nonzero `x`. A zero M or Z contribution has zero ULP; only a
+//! jointly-zero threshold disables skipping. `W` is 13 on H100 and 25 on B200.
+//! Skippability is decided using a fixed-point lower bound on `log2(v)`
+//! and the integer comparison below.
+//! The tile passes iff this count is at most `floor(k*h*w/20)`.
 //!
 //! # The exact sum-of-squares rule (the consensus definition)
 //!
@@ -56,20 +63,21 @@
 //!
 //! # The skip predicate
 //!
-//! With `E_CELL = e(M_ij) + 139` (`0` when `M_ij = 0`), substituting the scores into
-//! `v < ulp^2` and folding constants gives the consensus rule
+//! With `E_GRID = q + 157` (`0` only when both M and Z are zero), substituting the scores
+//! into the threshold and folding constants gives the consensus rule
 //!
 //! ```text
-//! skip  <=>  E_CELL != 0  and  lambda_A + lambda_B < 128 * E_CELL + C
-//! C = 64*(21 + 2*SCORE_BIAS) - 128*(139 + W) = 45376 for B200,
+//! skip  <=>  E_GRID != 0  and  lambda_A + lambda_B < 128 * E_GRID + C
+//! C = 64*(16 + 2*SCORE_BIAS) - 128*157 = 45952.
 //! ```
 //!
-//! `21 = log2(2^21)` the denominator's log.
+//! Here `16 = 21 - 5`: `v` has a `2^21` denominator while the threshold divides by
+//! `32 = 2^5`.
 //!
-//! Both lambda floors err downward by less than `1.1` units, so the rule sits in a
-//! one-sided band around the ideal test: `v < ulp^2` always skips, and every rule skip has
-//! `v < ulp^2 * 2^(2.2/64)` — a 2.4% sliver above the ideal boundary. The rule itself, not
-//! the ideal test, is consensus.
+//! The fixed-point rule relates to the ideal real-valued comparison as
+//! follows: `v < T` implies a skip, and a skip implies `v < T * 2^(2.2/64)` for
+//! `T > 0`. These bounds follow from each lambda's downward error of less than
+//! `1.1` units. The fixed-point rule defines the consensus count.
 //!
 //! # AIR wiring and soundness direction
 //!
@@ -80,24 +88,19 @@
 //! boolean skip flag; claiming *non-skip* costs one RC16 on the affine key
 //!
 //! ```text
-//! LAMBDA_A + LAMBDA_B - 128*E_CELL - C,
+//! LAMBDA_A + LAMBDA_B - 128*E_GRID - C,
 //! ```
 //!
-//! filtered by `CELL_NONZERO * (1 - SKIP_FLAG)`; zero cells pin `SKIP_FLAG = 0` directly.
+//! filtered by `GRID_NONZERO * (1 - SKIP_FLAG)`; jointly-zero grids pin `SKIP_FLAG = 0`.
 //! A true skip's key is negative and wraps far outside `[0, 2^16)`, forcing the flag to 1.
-//! On satisfiable traces `lambda in [`[`LAMBDA_MIN_LIVE`]`, `[`LAMBDA_MAX`]`]` and nonzero
-//! cells have `E_CELL >= 121`, so honest non-skip keys stay below `2^16`. Claiming *skip*
-//! is free: a prover can only overstate the census (self-harm), never understate it.
-//! Inflating `M` is likewise monotone toward rejection.
+//! Claiming *skip* is free: a prover can only overstate the census, never understate it.
+//! Inflating M, Z, or E_GRID is likewise monotone toward rejection.
 //!
 //! # The budget
 //!
-//! The plaintext accepts iff `count as f64 <= eps_pred * k * (h*w)` — equivalently
-//! `count <= budget(k, h, w)` with [`budget`] the floor of that product (counts stay below
-//! `2^27 < 2^53`, so the integer comparison is exact). TamedStark exposes the budget as its
-//! `SKIP_LIMIT` public input and gates the imported per-cell census on its last row.
+//! The plaintext accepts iff `count <= floor(k*h*w/20)`, computed directly in integers.
 
-use crate::api::fp8::jackpot_policy::JackpotPolicy;
+use crate::api::fp8::public_params::Device;
 
 /// Fixed-point fraction bits of the log domain: all scores are integers in units of
 /// `2^-FRAC_BITS = 1/64` octave.
@@ -127,17 +130,15 @@ pub const LAMBDA_MIN_LIVE: u64 = 12_928;
 /// `lambda <= 64*(log2 S + 508) < 64*(339 + 508) = 54208`. Honest tiles sit far lower.
 pub const LAMBDA_MAX: u64 = 54_207;
 
-/// The B200 accumulation window `W`: the 26-bit
-/// `kind::f8f6f4` significand minus 1.
-pub const WINDOW_BITS: u32 = 25;
+/// Precision of the shared M branch: `ulp_23(M) * 32 = 2^(e(M)-18)`.
+pub const M_WINDOW_BITS: i64 = 18;
 
-/// The skip threshold's additive constant: lane `(i, j, u)` skips iff `E_CELL != 0` and
-/// `lambda_A + lambda_B < 128 * E_CELL + SKIP_THRESHOLD_OFFSET`. This is the
-/// check's defining test `v < ulp^2` written in scores: `v = S_A * S_B / 2^21` and
-/// `ulp = 2^(e(M) - W)` with `e(M) = E_CELL - 139`, so the threshold is
-/// `64*(21 + 2*SCORE_BIAS) + 128*(E_CELL - 139 - W)` = 45376.
-// 21 = log2(2^21), the v denominator; 139 converts E_CELL back to e(M).
-pub const SKIP_THRESHOLD_OFFSET: u64 = 64 * (21 + 2 * SCORE_BIAS) - 128 * (139 + WINDOW_BITS as u64);
+/// Bias of the nonnegative grid encoding `E_GRID = q + GRID_EXPONENT_BIAS`.
+pub const GRID_EXPONENT_BIAS: i64 = 157;
+
+/// The skip threshold's additive constant:
+/// `lambda_A + lambda_B < 128 * E_GRID + SKIP_THRESHOLD_OFFSET`.
+pub const SKIP_THRESHOLD_OFFSET: u64 = 64 * (16 + 2 * SCORE_BIAS) - 128 * (GRID_EXPONENT_BIAS as u64);
 
 /// Bit length of a 16-bit significand product — the WIDTH16 LUT's first value column.
 pub const fn sig_width(sig_product: u64) -> u64 {
@@ -274,10 +275,10 @@ fn bf16_e_star_m(code: u16) -> (u64, u64) {
 }
 
 /// The element's lambda: the score of `S = (alpha*x)^2 + sigma^2` with
-/// `sigma = alpha * l2f / 2` — the exact integer the InputQuant AIR commits and the
+/// `sigma = delta(device) * alpha * l2f` — the exact integer the InputQuant AIR commits and the
 /// operand channel carries to the Matmul lanes. `alpha` and `l2f` must be positive-normal
 /// (in-scheme `l2f >= 2^-32`); both products below are exact.
-pub fn lambda(alpha: u16, x: u16, l2f: u16) -> u64 {
+pub fn lambda(device: Device, alpha: u16, x: u16, l2f: u16) -> u64 {
     let (alpha_e, alpha_m) = bf16_e_star_m(alpha);
     assert!(alpha_m >= 128, "alpha must be normal");
     let (x_e, x_m) = bf16_e_star_m(x);
@@ -294,39 +295,61 @@ pub fn lambda(alpha: u16, x: u16, l2f: u16) -> u64 {
     let sigma_product = alpha_m * l2f_m;
     let sigma_wide = u64::from(sigma_product >= 1 << 15);
     let sigma_norm = sigma_product << (1 - sigma_wide);
-    // sigma = sigma_product * 2^(alpha_e + l2f_e - 269), so e(sigma) sits 14 + sigma_wide
-    // above that scale and enc(sigma) = e + 268 = alpha_e + l2f_e + sigma_wide + 13.
-    let sigma_enc = alpha_e + l2f_e + sigma_wide + 13;
+    // The device power-of-two delta changes only the exponent; the significand is shared.
+    let sigma_enc = alpha_e + l2f_e + sigma_wide + device.sigma_encoding_offset();
     lambda_witness(x_norm, x_enc, sigma_norm, sigma_enc).lambda
 }
 
-/// The cell anchor `E_CELL = e(M) + 139` of a plaintext replay magnitude, `0` when
-/// `M = 0`. `M` is always an exact sum of bf16-product magnitudes, so it is f64-normal
-/// and its exponent is exact. A nonzero `M` is a multiple of the fp8 product grid
-/// `2^-9 * 2^-9 = 2^-18`, so `E_CELL >= -18 + 139 = 121 > 0`.
-pub fn cell_exponent(m: f64) -> u64 {
+/// `floor(log2(m))` for a nonnegative protocol magnitude, or `None` at zero.
+pub fn magnitude_exponent(m: f64) -> Option<i64> {
+    assert!(m.is_finite() && m >= 0.0, "policy magnitudes must be finite and nonnegative");
     if m == 0.0 {
-        return 0;
+        return None;
     }
     let biased = (m.to_bits() >> 52) & 0x7FF;
     assert!((1..2047).contains(&biased), "a nonzero replay magnitude is f64-normal");
-    (biased as i64 - 1023 + 139) as u64
+    Some(biased as i64 - 1023)
 }
 
-/// The canonical skip predicate: skip iff the cell is nonzero, both summand halves exist,
-/// and `lambda_a + lambda_b < 128 * e_cell + SKIP_THRESHOLD_OFFSET` — exactly the
-/// sign whose opposite the AIR's per-lane non-skip range check proves. A zero lambda means
-/// the half is literally zero (`x = 0` and `sigma = 0`, outside the scheme): such summands
-/// are never counted.
-pub fn skip(lambda_a: u64, lambda_b: u64, e_cell: u64) -> bool {
-    e_cell != 0 && lambda_a != 0 && lambda_b != 0 && lambda_a + lambda_b < 128 * e_cell + SKIP_THRESHOLD_OFFSET
+/// The cell magnitude's AIR encoding `e(M) + 139`, or zero when `M = 0`.
+pub fn cell_exponent(m: f64) -> u64 {
+    magnitude_exponent(m).map_or(0, |e| (e + 139) as u64)
 }
 
-/// The consensus skip budget: the largest count the plaintext comparison
-/// `count as f64 <= eps_pred * k * (h*w)` admits.
+/// `E_GRID = max(e(Z)-W, e(M)-18) + 157`, with zero contributions omitted.
+/// Returns zero only when both magnitudes are zero.
+pub fn grid_exponent(device: Device, z: f64, m: f64) -> u64 {
+    grid_exponent_from_binades(
+        device,
+        magnitude_exponent(z).map(|e| e as i32),
+        magnitude_exponent(m).map(|e| e as i32),
+    )
+}
+
+/// Integer-only counterpart of [`grid_exponent`] for exact replay binades.
+pub fn grid_exponent_from_binades(device: Device, z: Option<i32>, m: Option<i32>) -> u64 {
+    let encode = |q: i64| {
+        let encoded = q + GRID_EXPONENT_BIAS;
+        assert!(encoded > 0, "nonzero protocol grids must have a positive encoding");
+        encoded as u64
+    };
+    let z_q = z.map(|e| i64::from(e) - i64::from(device.fp8_window_bits()));
+    let m_q = m.map(|e| i64::from(e) - M_WINDOW_BITS);
+    match (z_q, m_q) {
+        (None, None) => 0,
+        (Some(q), None) | (None, Some(q)) => encode(q),
+        (Some(z_q), Some(m_q)) => encode(z_q.max(m_q)),
+    }
+}
+
+/// The canonical strict skip predicate. `e_grid == 0` is the jointly-zero threshold.
+pub fn skip(lambda_a: u64, lambda_b: u64, e_grid: u64) -> bool {
+    e_grid != 0 && lambda_a + lambda_b < 128 * e_grid + SKIP_THRESHOLD_OFFSET
+}
+
+/// The exact consensus skip budget `floor(k*h*w/20)`.
 pub fn budget(k: usize, h: usize, w: usize) -> u64 {
-    let bound = JackpotPolicy::default().eps_pred * k as f64 * (h * w) as f64;
-    bound.floor() as u64
+    (k as u64) * (h as u64) * (w as u64) / 20
 }
 
 #[cfg(test)]
@@ -426,7 +449,7 @@ mod tests {
         for (i, &alpha) in alpha_samples().iter().enumerate() {
             for (j, &x) in bf16_samples().iter().enumerate() {
                 let l2f = l2f_samples()[(i * 7 + j) % 30];
-                let lam = lambda(alpha, x, l2f);
+                let lam = lambda(Device::B200, alpha, x, l2f);
                 max_lambda = max_lambda.max(lam);
                 let au = bf16_to_f32(alpha) as f64 * bf16_to_f32(x) as f64;
                 let sigma = 0.5 * bf16_to_f32(alpha) as f64 * bf16_to_f32(l2f) as f64;
@@ -464,20 +487,19 @@ mod tests {
 
     #[test]
     fn offset_matches_the_folded_constant_and_the_certificate_fits_rc16() {
-        assert_eq!(SKIP_THRESHOLD_OFFSET, 45_376);
+        assert_eq!(SKIP_THRESHOLD_OFFSET, 45_952);
         assert_eq!(
             SKIP_THRESHOLD_OFFSET,
-            64 * (21 + 2 * SCORE_BIAS) - 128 * (139 + u64::from(WINDOW_BITS))
+            64 * (16 + 2 * SCORE_BIAS) - 128 * GRID_EXPONENT_BIAS as u64
         );
-        // Nonzero cells have E_CELL >= 121 (e(M) >= -18); the largest satisfiable
-        // non-skip key must stay inside the RC16 range.
+        // The lowest possible encoded grid is still high enough that every
+        // satisfiable non-skip key fits the RC16 range.
         const {
-            assert!(2 * LAMBDA_MAX - 128 * 121 - SKIP_THRESHOLD_OFFSET < 1 << 16);
+            assert!(2 * LAMBDA_MAX - 128 * 114 - SKIP_THRESHOLD_OFFSET < 1 << 16);
         }
     }
 
-    /// The one-sided sandwich against the ideal f64 test: `v < ulp^2` always skips, and an
-    /// integer-rule skip implies `v < ulp^2 * 2^(2.2/64)`.
+    /// Bounds the integer skip rule's error against the real-valued threshold.
     #[test]
     fn skip_is_sandwiched_around_the_ideal_rule() {
         let alphas = alpha_samples();
@@ -491,26 +513,31 @@ mod tests {
                 let xb = codes[(j * 13 + 5) % codes.len()];
                 let l2a = l2fs[(j * 17 + 1) % l2fs.len()];
                 let l2b = l2fs[(j * 29 + 11) % l2fs.len()];
-                let la = lambda(aa, xa, l2a);
-                let lb = lambda(ab, xb, l2b);
+                let la = lambda(Device::B200, aa, xa, l2a);
+                let lb = lambda(Device::B200, ab, xb, l2b);
                 let au = bf16_to_f32(aa) as f64 * bf16_to_f32(xa) as f64;
                 let bu = bf16_to_f32(ab) as f64 * bf16_to_f32(xb) as f64;
                 let si = 0.5 * bf16_to_f32(aa) as f64 * bf16_to_f32(l2a) as f64;
                 let sj = 0.5 * bf16_to_f32(ab) as f64 * bf16_to_f32(l2b) as f64;
                 let v = (au * au + si * si) * (bu * bu + sj * sj) / 2097152.0; // 2^21
                 for &m in &anchors {
-                    let e_cell = cell_exponent(m);
-                    let int_skip = skip(la, lb, e_cell);
-                    let ulp_sq = if m == 0.0 {
+                    let e_grid = grid_exponent(Device::B200, m, m);
+                    let int_skip = skip(la, lb, e_grid);
+                    let threshold = if m == 0.0 {
                         0.0
                     } else {
-                        2f64.powi(2 * (m.log2().floor() as i32 - WINDOW_BITS as i32))
+                        let e = m.log2().floor() as i32;
+                        let q = (e - Device::B200.fp8_window_bits() as i32).max(e - M_WINDOW_BITS as i32);
+                        2f64.powi(2 * q - 5)
                     };
-                    if v < ulp_sq {
+                    if v < threshold {
                         assert!(int_skip, "an ideal skip must be an integer skip");
                     }
                     if int_skip {
-                        assert!(v < ulp_sq * 2f64.powf(2.2 / 64.0), "integer skip must hug the ideal boundary");
+                        assert!(
+                            v < threshold * 2f64.powf(2.2 / 64.0),
+                            "integer skip must hug the ideal boundary"
+                        );
                         skips += 1;
                     } else {
                         nonskips += 1;
@@ -522,31 +549,52 @@ mod tests {
     }
 
     #[test]
-    fn zero_cells_and_zero_summands_never_skip() {
+    fn only_a_jointly_zero_grid_disables_skipping() {
         assert!(!skip(0, 0, 0));
         assert!(!skip(LAMBDA_MIN_LIVE, LAMBDA_MIN_LIVE, 0));
-        assert!(!skip(0, LAMBDA_MIN_LIVE, 300), "a zero summand half is outside the rule");
-        assert!(!skip(LAMBDA_MIN_LIVE, 0, 300));
+        assert!(skip(0, LAMBDA_MIN_LIVE, 300));
+        assert!(skip(LAMBDA_MIN_LIVE, 0, 300));
+        assert_eq!(grid_exponent(Device::H100, 0.0, 0.0), 0);
+        assert_ne!(grid_exponent(Device::H100, 1.0, 0.0), 0);
+        assert_ne!(grid_exponent(Device::H100, 0.0, 1.0), 0);
+    }
+
+    #[test]
+    fn grid_exponent_applies_device_z_and_shared_m_branches() {
+        assert_eq!(grid_exponent(Device::H100, 128.0, 256.0), 151);
+        assert_eq!(grid_exponent(Device::B200, 256.0, 256.0), 147);
+        // On H100, a large window-local c can dominate the cell-wide M branch.
+        assert_eq!(grid_exponent(Device::H100, 1024.0, 256.0), 154);
+    }
+
+    #[test]
+    fn removed_check_3_has_no_independent_rejection_gate() {
+        // This represents a large replay magnitude against arbitrarily tiny sigma,
+        // which the removed tamed-products predicate rejected. The consolidated
+        // policy depends only on E_GRID and lambda: high-score summands do not skip.
+        let e_grid = grid_exponent(Device::B200, 256.0, 256.0);
+        assert!(!skip(LAMBDA_MAX, LAMBDA_MAX, e_grid));
+        assert_eq!(budget(1024, 1, 1), 51);
     }
 
     #[test]
     fn lambda_min_is_attained_at_the_domain_floor() {
         // alpha = 2^-120 (exp field 7), x = 0, l2f = 2^-32 (exp field 95): sigma alone,
         // sigma_norm = 2^15, sigma_enc = 115, sum of squares 2^30, kappa 2^13.
-        assert_eq!(lambda(7 << 7, 0, 95 << 7), LAMBDA_MIN_LIVE);
+        assert_eq!(lambda(Device::B200, 7 << 7, 0, 95 << 7), LAMBDA_MIN_LIVE);
+        assert_eq!(lambda(Device::H100, 7 << 7, 0, 95 << 7), LAMBDA_MIN_LIVE + 128);
     }
 
     #[test]
     fn budget_matches_the_plaintext_comparison() {
         for (k, h, w) in [(1024, 4, 64), (2048, 16, 16), (32, 5, 7), (65536, 32, 64), (100, 2, 10)] {
             let t = budget(k, h, w);
-            let bound = JackpotPolicy::default().eps_pred * k as f64 * (h * w) as f64;
-            assert!(t as f64 <= bound, "budget itself must pass");
-            assert!((t + 1) as f64 > bound, "budget + 1 must fail");
+            let summands = (k as u64) * (h as u64) * (w as u64);
+            assert_eq!(t, summands / 20);
+            assert!(20 * t <= summands, "budget itself must pass");
+            assert!(20 * (t + 1) > summands, "budget + 1 must fail");
         }
-        // eps_pred = 1/16 is dyadic, so the f64 product is exact and the budget
-        // is exactly floor(k*h*w / 16): no f64-vs-rational divergence exists.
-        assert_eq!(budget(20, 1, 1), 1); // 20/16 = 1.25
-        assert_eq!(budget(2048, 4, 16), 2048 * 64 / 16);
+        assert_eq!(budget(20, 1, 1), 1);
+        assert_eq!(budget(2048, 4, 16), 2048 * 64 / 20);
     }
 }

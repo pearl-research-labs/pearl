@@ -256,12 +256,12 @@ fn check_certificate_ancestors(headers: &[u8], public_data: &[u8]) -> Result<Fp8
         headers.len()
     );
     let statement = PublicParams::from_bytes(public_data)?;
-    let mut headers = headers.chunks_exact(FULL_BLOCK_HEADER_SIZE);
-    let proposed_bytes = headers.next().unwrap();
+    let (headers, _) = headers.as_chunks::<FULL_BLOCK_HEADER_SIZE>();
+    let (proposed_bytes, ancestors) = headers.split_first().unwrap();
     let proposed = Fp8BlockHeader::from_bytes(&proposed_bytes[..Fp8BlockHeader::SERIALIZED_SIZE])?;
     let mut matched = statement.ancestor_header() == &proposed;
     let mut prev_hash = &proposed_bytes[4..36];
-    for (i, header) in headers.enumerate() {
+    for (i, header) in ancestors.iter().enumerate() {
         let hash = Sha256::digest(Sha256::digest(header));
         ensure!(
             hash[..] == prev_hash[..],
@@ -280,7 +280,8 @@ fn check_certificate_ancestors(headers: &[u8], public_data: &[u8]) -> Result<Fp8
 }
 
 /// Shared implementation for fp8 proof verification: validate pointers and sizes,
-/// authenticate the certificate's ancestor, then run the cached proof verifier.
+/// authenticate the certificate's ancestor, then run the cached proof verifier
+/// against the single explicit `verification_nbits` target.
 ///
 /// # Safety
 /// Same contract as [`verify_zk_proof_v4`].
@@ -288,7 +289,7 @@ unsafe fn verify_zk_proof_v4_inner(
     headers: *const u8,
     headers_len: usize,
     zk_proof: *const CZKProof,
-    nbits_override: Option<u32>,
+    verification_nbits: u32,
     error_msg_out: *mut c_char,
 ) -> i32 {
     let result = catch_panic(|| {
@@ -336,10 +337,7 @@ unsafe fn verify_zk_proof_v4_inner(
         // missing from a stale cache rejects the proof — setups are never compiled
         // on demand, so no proof can force that cost.
         let cache = fp8_cache();
-        let verdict = match nbits_override {
-            None => cache.verify_block(&header, public_data, proof_data),
-            Some(nbits) => cache.verify_share(&header, public_data, proof_data, nbits),
-        };
+        let verdict = cache.verify_share(&header, public_data, proof_data, verification_nbits);
         match verdict {
             Ok(()) => {
                 set_error_msg(error_msg_out, "Proof verified successfully");
@@ -361,8 +359,13 @@ unsafe fn verify_zk_proof_v4_inner(
     }
 }
 
-/// Verify an FP8 ZK block proof: the published `public_data` / `proof_data` pair carried
-/// by `zk_proof` against the caller's expected block header.
+/// Verify an FP8 ZK proof: the published `public_data` / `proof_data` pair carried
+/// by `zk_proof` against the caller's expected block header and the single explicit
+/// difficulty target `verification_nbits`.
+///
+/// Consensus passes the header's own `nbits`; pool shares pass the share target —
+/// both through this one function, so header-bound and share-target verification
+/// can never diverge into separate C paths.
 ///
 /// `headers` contains canonical 108-byte wire headers in proposed, parent, grandparent
 /// order. The proposed header is required; zero to two ancestors may follow, so
@@ -391,29 +394,10 @@ pub unsafe extern "C" fn verify_zk_proof_v4(
     headers: *const u8,
     headers_len: usize,
     zk_proof: *const CZKProof,
+    verification_nbits: u32,
     error_msg_out: *mut c_char,
 ) -> i32 {
-    verify_zk_proof_v4_inner(headers, headers_len, zk_proof, None, error_msg_out)
-}
-
-/// Verify an FP8 ZK share proof: identical to [`verify_zk_proof_v4`] except the
-/// difficulty target is derived from `nbits_override` (e.g. a pool share target) instead of
-/// the block header's own nbits field.
-///
-/// # Returns
-/// Same as [`verify_zk_proof_v4`].
-///
-/// # Safety
-/// Same as [`verify_zk_proof_v4`].
-#[no_mangle]
-pub unsafe extern "C" fn verify_zk_proof_v4_with_nbits(
-    headers: *const u8,
-    headers_len: usize,
-    zk_proof: *const CZKProof,
-    nbits_override: u32,
-    error_msg_out: *mut c_char,
-) -> i32 {
-    verify_zk_proof_v4_inner(headers, headers_len, zk_proof, Some(nbits_override), error_msg_out)
+    verify_zk_proof_v4_inner(headers, headers_len, zk_proof, verification_nbits, error_msg_out)
 }
 
 /// Verify a V1 (version 1, master-format) ZK proof.

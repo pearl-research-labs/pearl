@@ -325,13 +325,13 @@ pub struct InputQuantColumnsView<T: Copy> {
     /// fp8 E4M3 code of the quantized noised A value, pinned (byte range included) by the
     /// tuple-valued QCAST lookup on the FMA output code (Q1); the value Matmul consumes.
     pub code_noised_a: T,
-    /// The liveness threshold in bf16-code space: `code(l2f) + 256`, the code of the plaintext
-    /// dead bound `tau_idle * DELTA * l2f = 4 * l2f`, where `l2f = max(l2, NORM_FLOOR)` is the
-    /// group's floored L2 norm. Group-constant (C2); the group-final value rides the Scale
+    /// The device liveness threshold in bf16-code space: `code(l2f) + 256` on Blackwell and
+    /// `code(l2f) + 384` on Hopper, representing `tau_idle * delta(device) * l2f`. Group-
+    /// constant (C2); the group-final value rides the Scale
     /// tuple, where T1 binds it to the floored-sqrt claim. When `E*(l2f) >= 253` the bound
     /// exceeds every finite abs code and all entries are alive, matching the plaintext.
     pub dead_bound_a: T,
-    /// Jackpot liveness flag: 1 iff `ABS(X_A) >= DEAD_BOUND_A`, i.e. `|X| >= 4*l2f`
+    /// Jackpot liveness flag: 1 iff `ABS(X_A) >= DEAD_BOUND_A`
     /// (bf16 code order equals value order on nonnegative finite codes). Boolean, zero on
     /// phantom rows (C1); certified by the dead/alive RC16 pair (ctl.rs).
     pub is_dead_a: T,
@@ -412,7 +412,7 @@ pub struct InputQuantColumnsView<T: Copy> {
     /// V11 (jackpot check 4): the element's summand score
     /// `LAMBDA = 128*max(X_ENC, SIGMA_ENC) - 2624 + LOG_FRACTION`
     /// `~= 64*(log2((alpha*x)^2 + sigma^2) + 508)`, never above, within 1.1 steps below
-    /// (0 on phantom rows); rides the operand-code channel to MatmulB200Stark's per-lane skip
+    /// (0 on phantom rows); rides the operand-code channel to Matmul's per-lane skip
     /// certificates.
     pub lambda_a: T,
 
@@ -520,7 +520,7 @@ pub const NUM_INPUT_QUANT_COLUMNS: usize = size_of::<InputQuantColumnsView<u8>>(
 const _: () = assert!(NUM_INPUT_QUANT_COLUMNS == 229);
 
 /// `2^Wl2`, the job's block-L2 precision scale
-/// (`Wl2 = 27 - ceil(log2 k)`, in `[11, 16]` over the envelope `2048 <= k <= 2^16`).
+/// (`Wl2 = 27 - ceil(log2 k)`, in `[11, 17]` over the envelope `1024 <= k <= 2^16`).
 pub const WL2_POW_PUBLIC_INPUT: usize = 0;
 /// `h*k`: the B slots' element-key offset. The B key spaces stay disjoint from A's
 /// (`ELEM_IDX` in `[0, h*k)`) as `ELEM_IDX + h*k`.

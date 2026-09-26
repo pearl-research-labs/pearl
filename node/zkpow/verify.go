@@ -169,7 +169,7 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
 	result := C.verify_zk_proof_v4(
 		(*C.uint8_t)(unsafe.Pointer(&headerBytes[0])), C.uintptr_t(len(headerBytes)),
-		&cZKProof, &errorBuf[0])
+		&cZKProof, C.uint32_t(header.Bits), &errorBuf[0])
 	msg := C.GoString(&errorBuf[0])
 
 	switch result {

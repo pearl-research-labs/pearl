@@ -19,18 +19,17 @@ use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsume
 use starky::evaluation_frame::StarkFrame;
 use starky::stark::Stark;
 
-use super::super::ctl::{LUT_TABLES, NUM_LUT_TABLES};
+use super::super::ctl::NUM_LUT_TABLES;
 use super::super::input_quant_stark::stark::qcast;
 use super::super::matmul_b200_stark::stark::B200Product;
+use super::super::matmul_stark::stark::Fp8Product;
 use super::super::scale_stark::stark::{CODE_448, rnernd_reference};
 use super::super::unpredictability::{log2_fixed, sig_nonzero, sig_width};
 use super::LutTable;
-use super::columns::{
-    XFPOW2_CAP, XFPOW2_LIMBS, XFPOW2_ZERO_POINT, lut_height, lut_num_columns, num_precommitted_columns, num_slots, slot_height,
-};
+use super::columns::{lut_height, lut_num_columns, num_precommitted_columns, num_slots, rnernd_stored_values, slot_height};
 use crate::api::fp8::compute::bf16_div;
 
-/// Generates one table (or one slot of a folded table): the stored value columns, in the order
+/// Generates one slot's semantic values before fixed-column factoring, in the order
 /// the consumers' `LutLookup::values` bind them.
 pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
     assert!(slot < num_slots(table), "slot {slot} out of range for {table:?}");
@@ -40,10 +39,14 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
         LutTable::Range16 => vec![],
         _ => {
             let arity = match table {
-                LutTable::Bytes2 | LutTable::Pair128 | LutTable::Width32 | LutTable::Width16 => 2,
+                LutTable::Bytes2
+                | LutTable::Pair128
+                | LutTable::WidthNorm
+                | LutTable::Width32
+                | LutTable::Width16
+                | LutTable::Pow2G => 2,
                 LutTable::Int8Dec | LutTable::RneRnd => 4,
-                LutTable::B200Align => 5,
-                LutTable::XfPow2 => XFPOW2_LIMBS,
+                LutTable::ProdAlign15 | LutTable::B200Align => 5,
                 _ => 1,
             };
             vec![Vec::with_capacity(height); arity]
@@ -113,6 +116,18 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
             // The RNERND slot for fade argument `x = key - 400`: `clamp(x, -7, 18) + 7`.
             LutTable::Clamp22 => columns[0].push(f((key as i64 - 400 + 7).clamp(0, 25) as u64)),
             LutTable::Pow2D => columns[0].push(f(1 << key)),
+            LutTable::Pow2G => {
+                let width = (key + 1).min(49);
+                let (power, flag) = match slot {
+                    0 => (1 << key.min(14), 0),
+                    1 => (if key <= 25 { 1 << key } else { 1 }, 2 + u64::from(key > 25)),
+                    2 => (1, 3),
+                    3 => (1 << width.abs_diff(24), 4 + u64::from(width <= 24)),
+                    _ => unreachable!(),
+                };
+                columns[0].push(f(power));
+                columns[1].push(f(flag));
+            }
             // Matmul's carry alignment: the 26-cap floors a far accumulator to zero
             // (`4*GROUP_OUTPUT_SIGNIFICAND < 2^26`), exactly as the window drops it.
             LutTable::Pow2Gb => columns[0].push(f(1 << key.min(26))),
@@ -131,6 +146,20 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 columns[1].push(f(wa));
                 columns[2].push(f(u64::from(oiz)));
                 columns[3].push(f(u64::from(oez)));
+            }
+            LutTable::ProdAlign15 => {
+                let p = Fp8Product::new((key & 0xFF) as u8, (key >> 8) as u8);
+                let aligned = if p.is_zero {
+                    F::ZERO
+                } else {
+                    let mag = f((p.sig << 7) >> slot);
+                    if p.sign { -mag } else { mag }
+                };
+                columns[0].push(aligned);
+                columns[1].push(f(p.fp22_exp));
+                columns[2].push(f(key & 0xFF));
+                columns[3].push(f(key >> 8));
+                columns[4].push(f(p.biased_binade()));
             }
             // The whole per-lane fp8 product, pre-truncated to the B200 window (Matmul's
             // mirror; slot = REL). `ALIGNED_LANE_TERMS = ±floor(P*2^19 / 2^REL)` toward zero with
@@ -153,15 +182,21 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 columns[3].push(f(key >> 8));
                 columns[4].push(f(p.biased_binade()));
             }
-            // TamedStark's squared-comparison power: key `t` decodes `D = 2*(t - 1024)`, the
-            // value is `2^min(max(D,0), 80)` as base-2^16 limbs (exactly one limb nonzero —
-            // a power of two).
-            LutTable::XfPow2 => {
-                let d = 2 * (key as i64 - XFPOW2_ZERO_POINT as i64);
-                let a = (d.max(0) as u64).min(XFPOW2_CAP);
-                for u in 0..XFPOW2_LIMBS as u64 {
-                    columns[u as usize].push(if a / 16 == u { f(1 << (a % 16)) } else { F::ZERO });
-                }
+            LutTable::WidthNorm => {
+                let abs = ((slot as u64) << 16) | key;
+                let (width, sig14) = if abs == 0 {
+                    (0, 0)
+                } else {
+                    let width = 64 - abs.leading_zeros() as u64;
+                    let sig14 = if width >= 14 {
+                        abs >> (width - 14)
+                    } else {
+                        abs << (14 - width)
+                    };
+                    (width, sig14)
+                };
+                columns[0].push(f(width));
+                columns[1].push(f(sig14));
             }
             // Jackpot check 4's significand-product width: the bit length of the 16-bit key
             // and its nonzero flag (key 0 holds the (0, 0) sentinel).
@@ -208,28 +243,51 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
             cols.push((0..height).map(F::from_canonical_usize).collect());
             match table {
                 LutTable::Range16 => {} // the ramp is the whole table
-                LutTable::Qcast | LutTable::Div448 | LutTable::XfPow2 | LutTable::Width16 | LutTable::Log16 => {
-                    cols.extend(generate::<F>(table, 0))
-                }
-                // Folded: the per-slot aligned column in slot-major order, then the
-                // slot-independent columns (product decode facts — computed from the key
-                // alone; asserted in tests).
-                LutTable::B200Align => {
-                    let mut slot0 = generate::<F>(table, 0);
-                    let shared = slot0.split_off(1);
-                    cols.extend(slot0);
-                    for slot in 1..num_slots(table) {
-                        let mut columns = generate::<F>(table, slot);
-                        columns.truncate(1);
-                        cols.extend(columns);
+                LutTable::Qcast | LutTable::Div448 | LutTable::Width16 | LutTable::Log16 => cols.extend(generate::<F>(table, 0)),
+                // Eight signed truncations span every alignment shift; decode fields are shared.
+                LutTable::ProdAlign15 | LutTable::B200Align => {
+                    let shift = if table == LutTable::ProdAlign15 { 7 } else { 19 };
+                    let mut base = generate::<F>(table, shift);
+                    cols.push(base.remove(0));
+                    for j in 1..8 {
+                        cols.push(generate::<F>(table, shift + j).remove(0));
                     }
-                    cols.extend(shared);
+                    let mut shared = base.into_iter();
+                    cols.push(shared.next().unwrap()); // Product exponent.
+                    cols.push(shared.next().unwrap()); // Operand A; B is derived from the key.
+                    shared.next();
+                    cols.push(shared.next().unwrap()); // Product binade.
                 }
-                // Folded: all four value columns per slot.
+                LutTable::WidthNorm => {
+                    cols.extend(generate::<F>(table, 0));
+                    for shift in 3..=6 {
+                        cols.push((0..height).map(|x| F::from_canonical_usize(x >> shift)).collect());
+                    }
+                }
                 LutTable::RneRnd => {
+                    let stored = rnernd_stored_values();
                     for slot in 0..num_slots(table) {
-                        cols.extend(generate::<F>(table, slot));
+                        for (value, column) in generate::<F>(table, slot).into_iter().enumerate() {
+                            if stored.contains(&(slot, value)) {
+                                cols.push(column);
+                            }
+                        }
                     }
+                }
+                LutTable::Pow2G => {
+                    cols.push((0..height).map(|r| F::from_canonical_usize(r.min(25))).collect());
+                    cols.push((0..height).map(|r| F::from_canonical_usize((r + 1).min(49))).collect());
+                    cols.push(generate::<F>(table, 0).remove(0));
+                    let mut gap = generate::<F>(table, 1);
+                    for flag in &mut gap[1] {
+                        *flag -= F::TWO;
+                    }
+                    cols.extend(gap);
+                    let mut normalization = generate::<F>(table, 3);
+                    for flag in &mut normalization[1] {
+                        *flag -= F::from_canonical_u64(4);
+                    }
+                    cols.extend(normalization);
                 }
                 _ => unreachable!("handled above"),
             }
@@ -313,8 +371,7 @@ impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize> Stark<F, 
     }
 }
 
-/// The AIRs at their exact widths (the batch instantiates sixteen of these, in [`LUT_TABLES`]
-/// order).
+/// The AIRs at their exact widths (the batch instantiates the selected device's fifteen).
 pub type RneRndStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::RneRnd) }>;
 pub type Range16Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Range16) }>;
 pub type Bytes2Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Bytes2) }>;
@@ -325,10 +382,12 @@ pub type Clamp22Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutT
 pub type Int8DecStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Int8Dec) }>;
 pub type ExpInfoStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::ExpInfo) }>;
 pub type Pow2DStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Pow2D) }>;
+pub type Pow2GStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Pow2G) }>;
+pub type ProdAlign15Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::ProdAlign15) }>;
+pub type WidthNormStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::WidthNorm) }>;
 pub type B200AlignStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::B200Align) }>;
 pub type Pow2GbStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Pow2Gb) }>;
 pub type Width32Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Width32) }>;
-pub type XfPow2Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::XfPow2) }>;
 pub type Width16Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Width16) }>;
 pub type Log16Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Log16) }>;
 
@@ -346,23 +405,26 @@ pub(crate) fn boxed_lut_stark<F: RichField + Extendable<D>, const D: usize>(tabl
         LutTable::Int8Dec => Box::new(Int8DecStark::<F, D>::new(table)),
         LutTable::ExpInfo => Box::new(ExpInfoStark::<F, D>::new(table)),
         LutTable::Pow2D => Box::new(Pow2DStark::<F, D>::new(table)),
+        LutTable::Pow2G => Box::new(Pow2GStark::<F, D>::new(table)),
+        LutTable::ProdAlign15 => Box::new(ProdAlign15Stark::<F, D>::new(table)),
+        LutTable::WidthNorm => Box::new(WidthNormStark::<F, D>::new(table)),
         LutTable::B200Align => Box::new(B200AlignStark::<F, D>::new(table)),
         LutTable::Pow2Gb => Box::new(Pow2GbStark::<F, D>::new(table)),
         LutTable::Width32 => Box::new(Width32Stark::<F, D>::new(table)),
-        LutTable::XfPow2 => Box::new(XfPow2Stark::<F, D>::new(table)),
         LutTable::Width16 => Box::new(Width16Stark::<F, D>::new(table)),
         LutTable::Log16 => Box::new(Log16Stark::<F, D>::new(table)),
     }
 }
 
 /// The `BatchStarkPreprocessedData::new` inputs for a batch of `num_tables` tables in which
-/// LUT `i` (of [`LUT_TABLES`]) is table `table_positions[i]`:
+/// Committed LUT `i` is table `table_positions[i]`:
 /// `(values_per_table, columns_per_table)` — each LUT's precommitted columns at its position
 /// (empty elsewhere). Positions must be strictly increasing (LUT heights descend in
-/// [`LUT_TABLES`] order and the batch orders tables by descending height).
+/// device-specific committed order and the batch orders tables by descending height).
 pub fn lut_preprocessed_inputs<F: Field>(
     num_tables: usize,
     table_positions: [usize; NUM_LUT_TABLES],
+    tables: &[LutTable; NUM_LUT_TABLES],
 ) -> (Vec<Vec<PolynomialValues<F>>>, Vec<Vec<usize>>) {
     assert!(
         table_positions.windows(2).all(|w| w[0] < w[1]) && table_positions[NUM_LUT_TABLES - 1] < num_tables,
@@ -370,7 +432,7 @@ pub fn lut_preprocessed_inputs<F: Field>(
     );
     let mut values = vec![Vec::new(); num_tables];
     let mut columns = vec![Vec::new(); num_tables];
-    for (i, &table) in LUT_TABLES.iter().enumerate() {
+    for (i, &table) in tables.iter().enumerate() {
         values[table_positions[i]] = lut_precommitted_values::<F>(table)
             .into_iter()
             .map(PolynomialValues::new)
@@ -388,6 +450,7 @@ pub fn lut_preprocessed_inputs<F: Field>(
 pub fn lut_preprocessed_data<F, C, const D: usize>(
     num_tables: usize,
     table_positions: [usize; NUM_LUT_TABLES],
+    tables: &[LutTable; NUM_LUT_TABLES],
     config: &StarkConfig,
     timing: &mut TimingTree,
 ) -> BatchStarkPreprocessedData<F, C, D>
@@ -395,6 +458,6 @@ where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
 {
-    let (values, columns) = lut_preprocessed_inputs::<F>(num_tables, table_positions);
+    let (values, columns) = lut_preprocessed_inputs::<F>(num_tables, table_positions, tables);
     BatchStarkPreprocessedData::new(values, columns, config, timing)
 }

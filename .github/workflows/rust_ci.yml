@@ -103,7 +103,9 @@ jobs:
           cargo build --release --features embedded_cache
 
       - name: Run tests
-        run: cargo test --release --features embedded_cache
+        # FP8 wrapper-proof tests retain large compiled setups; parallel test
+        # processes can exceed the GitHub runner's memory.
+        run: cargo test --release --features embedded_cache -- --test-threads=1
 
       - name: Test binaries
         run: cargo test --bins --release --features embedded_cache

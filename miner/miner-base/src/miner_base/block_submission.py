@@ -231,6 +231,7 @@ def _checked_commitment(
 
 
 _NATIVE_DEVICE = {
+    Device.HOPPER: pearl_mining.Device.H100,
     Device.BLACKWELL: pearl_mining.Device.B200,
 }
 _NATIVE_HASH_ID = {

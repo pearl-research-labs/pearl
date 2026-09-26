@@ -10,16 +10,13 @@ use hashbrown::HashMap;
 use plonky2::field::cosets::get_unique_coset_shifts;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use plonky2::field::types::{Field, Field64, PrimeField64};
-use plonky2::hash::hash_types::HashOut;
-use plonky2::hash::merkle_tree::MerkleCap;
+use plonky2::field::types::{Field, PrimeField64};
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData, VerifierCircuitData};
 use plonky2::util::serialization::{Buffer, DefaultGateSerializer, Read, Remaining};
 use serde::{Deserialize, Serialize};
 
 use super::wrapper::{D, F, OuterC};
-use crate::api::fp8::lut_caps::LutCap;
-use crate::api::fp8::public_params::{Device, PublicParams};
+use crate::api::fp8::public_params::Device;
 use crate::ensure_eq;
 use crate::v2::circuit::circuit_utils::build_recursion_config as v2_build_recursion_config;
 pub use crate::v2::circuit::circuit_utils::num_query_rounds;
@@ -33,16 +30,14 @@ pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, i
     config
 }
 
-/// Trusted verifier setup: the universal wrapper's stage-2 verifier data
-/// plus the committed LUT cap, plus the stage-2 constants/sigmas polynomial
-/// coefficients the compact proof encoding omits
+/// Trusted verifier setup: the universal wrapper's stage-2 verifier data plus the
+/// stage-2 constants/sigmas polynomial coefficients the compact proof encoding omits
 /// ([`super::wrapper::verify_compact_wrapped_proof`] recomputes the omitted oracle data from
 /// them — same trust class as the verifier data itself, exactly the deployed
 /// v2 `VerifierCircuitWithPolynomials` bundle). Covers every envelope-legal
 /// job; obtain one from [`Fp8Verifier::generate`] or [`Fp8Verifier::from_bytes`].
 #[derive(Clone, Debug)]
 pub struct Fp8Verifier {
-    pub(crate) lut_cap: LutCap,
     pub(crate) circuit: VerifierCircuitData<F, OuterC, D>,
     pub(crate) constants_sigmas_polynomials: Vec<PolynomialCoeffs<F>>,
 }
@@ -56,37 +51,20 @@ impl Fp8Verifier {
             .to_bytes(&DefaultGateSerializer)
             .map_err(|error| anyhow::anyhow!("serializing the recursive fp8 verifier circuit: {error:?}"))?;
         let wire = Fp8VerifierWire {
-            lut_cap: self
-                .lut_cap
-                .0
-                .iter()
-                .map(|hash| hash.elements.map(|element| element.to_canonical_u64()))
-                .collect(),
             circuit,
             constants_sigmas_polynomials: serialize_polynomials(&self.constants_sigmas_polynomials, &self.circuit.common),
         };
-        fp8_wire_options().serialize(&wire).context("serializing fp8 verifier setup")
+        verifier_setup_codec_options()
+            .serialize(&wire)
+            .context("serializing fp8 verifier setup")
     }
 
     /// Loads verifier setup previously produced by [`Fp8Verifier::to_bytes`].
     /// The bytes are consensus/trusted-setup data, not proof-controlled input.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let wire: Fp8VerifierWire = fp8_wire_options()
+        let wire: Fp8VerifierWire = verifier_setup_codec_options()
             .deserialize(bytes)
             .context("deserializing fp8 verifier setup")?;
-        ensure!(!wire.lut_cap.is_empty(), "fp8 verifier LUT cap cannot be empty");
-        ensure!(
-            wire.lut_cap.iter().flatten().all(|&element| element < F::ORDER),
-            "fp8 verifier LUT cap contains a non-canonical field element"
-        );
-        let lut_cap = MerkleCap(
-            wire.lut_cap
-                .into_iter()
-                .map(|elements| HashOut {
-                    elements: elements.map(F::from_canonical_u64),
-                })
-                .collect(),
-        );
         let circuit = VerifierCircuitData::from_bytes(wire.circuit, &DefaultGateSerializer)
             .map_err(|error| anyhow::anyhow!("deserializing the recursive fp8 verifier circuit: {error}"))?;
         ensure!(
@@ -98,7 +76,6 @@ impl Fp8Verifier {
         let constants_sigmas_polynomials = deserialize_polynomials(&wire.constants_sigmas_polynomials, &circuit.common)
             .context("deserializing the fp8 verifier constants/sigmas polynomials")?;
         Ok(Self {
-            lut_cap,
             circuit,
             constants_sigmas_polynomials,
         })
@@ -106,9 +83,9 @@ impl Fp8Verifier {
 }
 
 /// A read-only store of verifier setups keyed by the statement's device byte. The
-/// stage-1 wrapper is the *universal* batch verifier: one compiled circuit covers
-/// every envelope-legal degree profile and geometry, so the whole cache holds a single
-/// setup. Deployments preload
+/// stage-1 wrapper is universal within one device family: one compiled circuit covers
+/// every envelope-legal degree profile and geometry for that device, while Hopper and
+/// Blackwell occupy distinct cache entries. Deployments preload
 /// [`embedded_cache::CACHE_DATA`](crate::api::fp8::embedded_cache::CACHE_DATA), built
 /// offline by `build_cache` ([`Fp8Verifier::generate`] + [`Fp8VerifierCache::insert`]).
 ///
@@ -121,24 +98,13 @@ pub struct Fp8VerifierCache {
     verifiers: HashMap<Fp8VerifierKey, Fp8Verifier>,
 }
 
-/// Everything that selects one trusted setup: the statement's device byte.
+/// Everything that selects one trusted setup: the statement's device.
 ///
 /// Nothing else is key material (the D1 universal design): the degree profile rides the
 /// wrapper's degree public inputs and the geometry rides the `K`/`WL2`/`2^WL2` public
 /// inputs and the known columns, all pinned natively by the gateway; the AIR identities,
 /// the CTL set and the FRI ladder are consensus constants.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(crate) struct Fp8VerifierKey {
-    hardware: u8,
-}
-
-impl Fp8VerifierKey {
-    pub(crate) fn new(hardware: Device) -> Self {
-        Self {
-            hardware: hardware as u8,
-        }
-    }
-}
+type Fp8VerifierKey = Device;
 
 impl Fp8VerifierCache {
     /// Loads a cache previously produced by [`Fp8VerifierCache::to_bytes`] (consensus /
@@ -148,16 +114,15 @@ impl Fp8VerifierCache {
         if bytes.is_empty() {
             return Ok(Self::default());
         }
-        let wire: Fp8VerifierCacheWire = fp8_wire_options()
+        let entries: Vec<(u8, Vec<u8>)> = verifier_setup_codec_options()
             .deserialize(bytes)
             .context("deserializing the fp8 verifier cache")?;
         let mut verifiers = HashMap::new();
-        for entry in wire.entries {
-            let key = Fp8VerifierKey {
-                hardware: entry.hardware,
-            };
+        for (hardware, serialized_verifier) in entries {
+            let key = Device::try_from(hardware).context("invalid device in fp8 verifier cache")?;
+            let verifier = Fp8Verifier::from_bytes(&serialized_verifier)?;
             ensure!(
-                verifiers.insert(key, Fp8Verifier::from_bytes(&entry.verifier)?).is_none(),
+                verifiers.insert(key, verifier).is_none(),
                 "duplicate fp8 verifier cache entry"
             );
         }
@@ -169,16 +134,11 @@ impl Fp8VerifierCache {
         let mut entries = self
             .verifiers
             .iter()
-            .map(|(key, verifier)| {
-                Ok(Fp8VerifierCacheEntryWire {
-                    hardware: key.hardware,
-                    verifier: verifier.to_bytes()?,
-                })
-            })
+            .map(|(key, verifier)| Ok((*key as u8, verifier.to_bytes()?)))
             .collect::<Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.hardware);
-        fp8_wire_options()
-            .serialize(&Fp8VerifierCacheWire { entries })
+        entries.sort_by_key(|(hardware, _)| *hardware);
+        verifier_setup_codec_options()
+            .serialize(&entries)
             .context("serializing the fp8 verifier cache")
     }
 
@@ -191,45 +151,38 @@ impl Fp8VerifierCache {
         self.verifiers.is_empty()
     }
 
-    /// Registers a pre-built verifier setup under `params`' device byte
+    /// Whether the cache contains a setup for `device`.
+    pub fn contains_device(&self, device: Device) -> bool {
+        self.verifiers.contains_key(&device)
+    }
+
+    /// Production completeness: exactly one setup for every committed device.
+    pub fn contains_all_devices(&self) -> bool {
+        self.len() == Device::ALL.len() && Device::ALL.into_iter().all(|device| self.contains_device(device))
+    }
+
+    /// Registers a pre-built verifier setup under `device`
     /// (build tooling: assembles an embeddable cache without regenerating setups
     /// already compiled elsewhere). Replaces any previous setup of the same device.
-    pub fn insert(&mut self, params: &PublicParams, verifier: Fp8Verifier) {
-        self.verifiers.insert(Fp8VerifierKey::new(params.common().device), verifier);
+    pub fn insert(&mut self, device: Device, verifier: Fp8Verifier) {
+        self.verifiers.insert(device, verifier);
     }
 
     /// Looks up a pre-built setup; never compiles circuits on a cache miss.
     pub(crate) fn get(&self, hardware: Device) -> Option<&Fp8Verifier> {
-        self.verifiers.get(&Fp8VerifierKey::new(hardware))
+        self.verifiers.get(&hardware)
     }
 }
 
-fn fp8_wire_options() -> impl Options {
+fn verifier_setup_codec_options() -> impl Options {
     bincode::options().with_fixint_encoding().reject_trailing_bytes()
 }
 
-/// Serialized verifier-circuit bytes plus the LUT cap they were compiled against, plus
-/// the circuit's constants/sigmas polynomials.
+/// Serialized verifier-circuit bytes plus the circuit's constants/sigmas polynomials.
 #[derive(Serialize, Deserialize)]
 struct Fp8VerifierWire {
-    lut_cap: Vec<[u64; 4]>,
     circuit: Vec<u8>,
     constants_sigmas_polynomials: Vec<u8>,
-}
-
-/// Wire form of [`Fp8VerifierCache`]: the setups with their device-byte keys, in
-/// canonical order. The blob is embedded in the binary that reads it (`fp8_cache.bin`),
-/// so there is no cross-version exchange to tag: a stale file fails deserialization or
-/// rejects proofs, both closed.
-#[derive(Serialize, Deserialize)]
-struct Fp8VerifierCacheWire {
-    entries: Vec<Fp8VerifierCacheEntryWire>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Fp8VerifierCacheEntryWire {
-    hardware: u8,
-    verifier: Vec<u8>,
 }
 
 fn bytes_for_max_value(max_val: usize) -> usize {
@@ -351,11 +304,10 @@ fn deserialize_polynomials(
 
 #[cfg(test)]
 mod tests {
+    use plonky2::field::types::Field64;
     use plonky2::fri::FriConfig;
 
     use super::*;
-    use crate::api::fp8::lut_caps::committed_lut_cap;
-    use crate::api::fp8::zk::sample_dense_statement;
 
     // A small real circuit exercises setup serialization and compact verification without
     // the full FP8 prover's memory requirements. The reduced FRI parameters are test-only.
@@ -400,29 +352,27 @@ mod tests {
 
         let (data, x) = cache_test_circuit();
         let verifier = Fp8Verifier {
-            lut_cap: committed_lut_cap(),
             circuit: data.verifier_data(),
             constants_sigmas_polynomials: data.prover_only.constants_sigmas_commitment.polynomials.clone(),
         };
-        // Fingerprints captured with the original codecs in api::fp8::zk, before extraction.
+        // Pin the canonical verifier and cache encodings.
         let verifier_bytes = verifier.to_bytes()?;
         let mut cache = Fp8VerifierCache::default();
-        let statement = sample_dense_statement()?;
-        cache.insert(&statement, verifier);
+        cache.insert(Device::B200, verifier);
         let cache_bytes = cache.to_bytes()?;
         assert_eq!(
             blake3::hash(&verifier_bytes).to_hex().as_str(),
-            "59e35386018bcd923128056fdaf3c0453f39a362eab1bec8bed08f24a4adbea3"
+            "b10810a6550f57a7ede20d07df8c6acb03901611b6f7065017d77e730d1281bc"
         );
         assert_eq!(
             blake3::hash(&cache_bytes).to_hex().as_str(),
-            "c8cb12508c528741112265987ff9d0942fa1b3340efaea633f917610dbf22674"
+            "e6e1429f4d0a1c9f1ca1661539aeb769628d46d56109e9d016c92ad0d4d1d2c6"
         );
 
         let loaded = Fp8VerifierCache::from_bytes(&cache_bytes)?;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.to_bytes()?, cache_bytes);
-        let loaded_verifier = &loaded.verifiers[&Fp8VerifierKey::new(Device::B200)];
+        let loaded_verifier = &loaded.verifiers[&Device::B200];
         assert_eq!(loaded_verifier.to_bytes()?, verifier_bytes);
 
         let mut witness = PartialWitness::new();
@@ -450,40 +400,33 @@ mod tests {
 
         let (data, _) = cache_test_circuit();
         let verifier = Fp8Verifier {
-            lut_cap: committed_lut_cap(),
             circuit: data.verifier_data(),
             constants_sigmas_polynomials: data.prover_only.constants_sigmas_commitment.polynomials.clone(),
         };
         let verifier_bytes = verifier.to_bytes()?;
-        let statement = sample_dense_statement()?;
         let mut cache = Fp8VerifierCache::default();
-        cache.insert(&statement, verifier.clone());
-        cache.insert(&statement, verifier.clone());
+        cache.insert(Device::B200, verifier.clone());
+        cache.insert(Device::B200, verifier.clone());
         assert_eq!(cache.len(), 1, "insertion replaces the existing device setup");
 
-        // Loading preserves arbitrary device-byte keys, as the previous codec did.
         // Ordering is canonical regardless of map insertion order.
+        let h100_verifier = verifier.clone();
         let mut reverse_cache = Fp8VerifierCache::default();
-        for hardware in [254, 253] {
-            reverse_cache.verifiers.insert(Fp8VerifierKey { hardware }, verifier.clone());
+        for (device, setup) in [(Device::B200, verifier.clone()), (Device::H100, h100_verifier.clone())] {
+            reverse_cache.verifiers.insert(device, setup);
         }
         let mut forward_cache = Fp8VerifierCache::default();
-        for hardware in [253, 254] {
-            forward_cache.verifiers.insert(Fp8VerifierKey { hardware }, verifier.clone());
+        for (device, setup) in [(Device::H100, h100_verifier), (Device::B200, verifier.clone())] {
+            forward_cache.verifiers.insert(device, setup);
         }
         assert_eq!(forward_cache.to_bytes()?, reverse_cache.to_bytes()?);
         let bytes = reverse_cache.to_bytes()?;
         assert_eq!(Fp8VerifierCache::from_bytes(&bytes)?.to_bytes()?, bytes);
 
-        let duplicate = fp8_wire_options().serialize(&Fp8VerifierCacheWire {
-            entries: (0..2)
-                .map(|_| Fp8VerifierCacheEntryWire {
-                    hardware: Device::B200 as u8,
-                    verifier: verifier_bytes.clone(),
-                })
-                .collect(),
-        })?;
+        let duplicate = verifier_setup_codec_options().serialize(&vec![(Device::B200 as u8, verifier_bytes.clone()); 2])?;
         assert!(Fp8VerifierCache::from_bytes(&duplicate).is_err());
+        let unknown = verifier_setup_codec_options().serialize(&vec![(254, verifier_bytes.clone())])?;
+        assert!(Fp8VerifierCache::from_bytes(&unknown).is_err());
         let mut trailing_cache = cache.to_bytes()?;
         trailing_cache.push(0);
         assert!(Fp8VerifierCache::from_bytes(&trailing_cache).is_err());
@@ -491,17 +434,11 @@ mod tests {
         trailing_verifier.push(0);
         assert!(Fp8Verifier::from_bytes(&trailing_verifier).is_err());
 
-        let mut wire: Fp8VerifierWire = fp8_wire_options().deserialize(&verifier_bytes)?;
-        wire.lut_cap.clear();
-        assert!(Fp8Verifier::from_bytes(&fp8_wire_options().serialize(&wire)?).is_err());
-        let mut wire: Fp8VerifierWire = fp8_wire_options().deserialize(&verifier_bytes)?;
-        wire.lut_cap[0][0] = F::ORDER;
-        assert!(Fp8Verifier::from_bytes(&fp8_wire_options().serialize(&wire)?).is_err());
-        let mut wire: Fp8VerifierWire = fp8_wire_options().deserialize(&verifier_bytes)?;
+        let mut wire: Fp8VerifierWire = verifier_setup_codec_options().deserialize(&verifier_bytes)?;
         let mut non_zk = data.verifier_data();
         non_zk.common.config.zero_knowledge = false;
         wire.circuit = non_zk.to_bytes(&DefaultGateSerializer).unwrap();
-        assert!(Fp8Verifier::from_bytes(&fp8_wire_options().serialize(&wire)?).is_err());
+        assert!(Fp8Verifier::from_bytes(&verifier_setup_codec_options().serialize(&wire)?).is_err());
         Ok(())
     }
 

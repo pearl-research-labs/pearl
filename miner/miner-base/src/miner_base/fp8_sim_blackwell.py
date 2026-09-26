@@ -144,18 +144,6 @@ def matmul_fp8_sim_blackwell(
     return _matmul_fp8_sim_blackwell(a, b, chunk_elems, partials=False)
 
 
-def matmul_fp8_sim_blackwell_partials(
-    a: torch.Tensor, b: torch.Tensor, chunk_elems: int = 1 << 18
-) -> torch.Tensor:
-    """Like :func:`matmul_fp8_sim_blackwell` but returns every cell's running
-    FP32 accumulator after each of the ``ceil(K / 32)`` atoms (shape
-    ``(M, N, ceil(K/32))``), the last slice equal to the final matmul. These
-    are the partial sums ``c_v`` the jackpot policy's prefix-inclusive
-    anchor (check 3, ``jackpot_policy.rs``) consumes.
-    """
-    return _matmul_fp8_sim_blackwell(a, b, chunk_elems, partials=True)
-
-
 def _matmul_fp8_sim_blackwell(
     a: torch.Tensor, b: torch.Tensor, chunk_elems: int, partials: bool
 ) -> torch.Tensor:

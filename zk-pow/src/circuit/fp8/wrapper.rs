@@ -23,6 +23,7 @@
 //!   | zeta (2)
 //!   | known-column evals at zeta      (2 per column, batch order)
 //!   | known-column evals at g_t*zeta  (2 per column, batch order)
+//!   | compiled device (1)
 //!   ```
 //!
 //!   The class (a) ("known") columns cannot be evaluated in-circuit (they are full-height
@@ -59,12 +60,14 @@
 //! **Circuit identity.** The compiled circuits are consensus constants:
 //! the AIR identities are program-independent (geometry enters as public inputs and known
 //! columns — phases A/B3), and the known-column index layout, the CTL set, the LUT cap,
-//! the envelope and the FRI ladder are consensus constants. A
+//! the envelope and the FRI ladder are consensus constants. The compiled device is also
+//! a pinned public input, so a cached H100 circuit cannot verify a B200 statement or
+//! vice versa. A
 //! [`Fp8WrapperCircuits`] is therefore reusable across *all* envelope-legal
-//! jobs, and any mismatch fails closed: a proof outside the envelope cannot satisfy the
-//! degree flags, and the gateway independently derives every pinned slot from its own
-//! statement. [`Fp8CircuitCache`] memoizes the compiled circuits
-//! ([`Fp8WrapperCircuits::with_cache`]).
+//! jobs for one device and LUT commitment. [`Fp8Prover`](crate::api::fp8::zk::Fp8Prover)
+//! owns and reuses each compiled circuit set. Any mismatch fails closed: a proof outside
+//! the envelope cannot satisfy the degree flags, and the gateway independently derives
+//! every pinned slot from its own statement.
 //!
 //! **Geometry public inputs.** Scale's `K`/`WL2`, InputQuant's `2^WL2` and InputQuant's
 //! four CTL geometry slots (`h*k`, `h*k/8`, `w`, `h`) are inner-STARK public inputs
@@ -79,7 +82,7 @@ use plonky2::field::extension::FieldExtension;
 use plonky2::field::extension::quadratic::QuadraticExtension;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use plonky2::field::types::{Field, PrimeField64};
+use plonky2::field::types::Field;
 use plonky2::hash::hash_types::{HashOutTarget, NUM_HASH_OUT_ELTS};
 use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -100,8 +103,7 @@ use starky::batch_universal::{
 use starky::verifier::eval_columns_at_zeta_and_next;
 
 use super::ctl::{NUM_ALL_TABLES, NUM_TABLES};
-use super::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8System, fp8_universal_envelope};
-use super::known_values::hash256_to_hash_out;
+use super::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8System, fp8_universal_envelope, statement_digest_to_hash_out};
 use crate::api::primitives::Hash256;
 use crate::circuit::fp8::circuit_utils::build_recursion_config;
 
@@ -145,7 +147,7 @@ pub fn zeta_offset(system: &Fp8System<F, D>) -> usize {
 /// Total public-input count of a wrapper proof for this batch shape.
 fn num_wrapper_public_inputs(system: &Fp8System<F, D>) -> usize {
     let num_known: usize = system.known().columns_per_table.iter().map(Vec::len).sum();
-    zeta_offset(system) + D + 2 * D * num_known
+    zeta_offset(system) + D + 2 * D * num_known + 1
 }
 
 /// Splits the wrapper's flat public-input prefix back into per-table STARK public inputs
@@ -170,64 +172,18 @@ pub fn split_batch_public_inputs(system: &Fp8System<F, D>, flat: &[F]) -> Result
         .collect())
 }
 
-/// In-memory cache of compiled wrapper circuits, keyed by the baked
-/// LUT cap. Own one for the prover's lifetime and pass it to
-/// [`Fp8WrapperCircuits::with_cache`]: the first job compiles, every later job
-/// reuses — whatever its geometry or degree profile.
-#[derive(Default)]
-pub struct Fp8CircuitCache {
-    circuits: HashMap<Fp8CircuitKey, Fp8WrapperCircuits>,
-}
-
-impl Fp8CircuitCache {
-    /// Number of compiled circuit sets (one per LUT cap seen).
-    pub fn len(&self) -> usize {
-        self.circuits.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.circuits.is_empty()
-    }
-}
-
-/// Everything that determines the compiled circuits: the baked LUT cap — a pure function of
-/// the committed tables and the consensus config.
-///
-/// Nothing else is key material (the D1 universal design): the degree profile and the
-/// geometry are runtime inputs — the profile rides the degree public inputs, the geometry
-/// rides the `K`/`WL2`/`2^WL2` public inputs and the known columns (whose evaluations the
-/// gateway pins natively) — and the AIR identities, the CTL set, the known-column index
-/// layout, the envelope and the FRI ladder are consensus constants.
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct Fp8CircuitKey {
-    lut_cap: Vec<u64>,
-}
-
-impl Fp8CircuitKey {
-    fn new(lut_cap: &MerkleCap<F, <InnerC as GenericConfig<D>>::Hasher>) -> Self {
-        Self {
-            lut_cap: lut_cap
-                .0
-                .iter()
-                .flat_map(|h| h.elements)
-                .map(|e| e.to_canonical_u64())
-                .collect(),
-        }
-    }
-}
-
 /// The two compiled wrapper circuits, plus the witness targets the
 /// prover fills. Build once ([`Fp8WrapperCircuits::build`]), reuse across every
-/// envelope-legal job.
-pub struct Fp8WrapperCircuits {
+/// envelope-legal job for the same device and LUT commitment.
+pub(crate) struct Fp8WrapperCircuits {
     /// Stage 1: the universal in-circuit batch verifier (Poseidon recursion, no ZK).
-    pub stage1: CircuitData<F, InnerC, D>,
+    stage1: CircuitData<F, InnerC, D>,
     universal_target: UniversalBatchStarkVerifierTarget<D>,
     known_digest_target: HashOutTarget,
     /// The consensus envelope the stage-1 circuit was built on (needed to pad witnesses).
     envelope: UniversalVerifierEnvelope,
     /// Stage 2: the ZK wrap publishing stage 1's public inputs.
-    pub stage2: CircuitData<F, OuterC, D>,
+    stage2: CircuitData<F, OuterC, D>,
     stage1_proof_target: ProofWithPublicInputsTarget<D>,
 }
 
@@ -239,31 +195,21 @@ fn add_ext_public_input(builder: &mut CircuitBuilder<F, D>) -> ExtensionTarget<D
 }
 
 impl Fp8WrapperCircuits {
-    /// [`Self::build`] behind `cache`: compiles both stages the first time,
-    /// reuses the cached circuits for every later job.
-    pub fn with_cache<'c>(
-        system: &Fp8System<F, D>,
-        lut_cap: &MerkleCap<F, <InnerC as GenericConfig<D>>::Hasher>,
-        cache: &'c mut Fp8CircuitCache,
-        timing: &mut TimingTree,
-    ) -> Result<&'c Self> {
-        let key = Fp8CircuitKey::new(lut_cap);
-        if !cache.circuits.contains_key(&key) {
-            let circuits = Self::build(system, lut_cap, timing)?;
-            cache.circuits.insert(key.clone(), circuits);
-        }
-        Ok(cache.circuits.get(&key).expect("just inserted"))
-    }
-
     /// Compiles both stages, baking `lut_cap` (the
     /// consensus LUT commitment) into stage 1 as constants.
+    ///
+    /// The cap is baked rather than passed as a public input because it is a
+    /// consensus constant — identical for every envelope-legal job — so there is
+    /// nothing for the prover to choose. A public input would additionally need an
+    /// in-circuit equality constraint against the verifier's recomputed cap on every
+    /// proof, for no expressiveness gain.
     ///
     /// The compiled circuits do not depend on `system`'s job: the AIRs are
     /// program-independent, and every degree- or geometry-dependent quantity is a circuit
     /// input (the second-geometry leg of `wrapped_api_roundtrip_and_tamper_rejection` pins
     /// this). `system`'s profile must lie on the consensus ladder — its config then *is*
     /// the consensus config the universal circuit's Fiat-Shamir replay absorbs.
-    pub fn build(
+    pub(crate) fn build(
         system: &Fp8System<F, D>,
         lut_cap: &MerkleCap<F, <InnerC as GenericConfig<D>>::Hasher>,
         timing: &mut TimingTree,
@@ -277,7 +223,7 @@ impl Fp8WrapperCircuits {
             "universal wrapper: the degree profile {:?} must lie on the consensus ladder",
             system.degree_bits()
         );
-        let envelope = fp8_universal_envelope();
+        let envelope = fp8_universal_envelope(system.device());
 
         // ---- Stage 1: the universal batch verifier in-circuit. ----
         let config_1 = build_recursion_config(STAGE_1_RATE_BITS, STAGE_1_POW_BITS, 1, false);
@@ -334,6 +280,11 @@ impl Fp8WrapperCircuits {
                 builder.register_public_inputs(&eval.0);
             }
         }
+        // The circuit's LUT cap and AIR family are compile-time constants. Publishing the
+        // device constant makes that compiled choice observable and lets native verification
+        // pin it to the statement, rather than trusting a detached cache annotation.
+        let compiled_device = builder.constant(F::from_canonical_u64(system.device() as u64));
+        builder.register_public_input(compiled_device);
 
         let stage1_gates = builder.num_gates();
         let stage1 = timed!(timing, "build the stage-1 wrapper circuit", builder.build::<InnerC>());
@@ -375,7 +326,7 @@ impl Fp8WrapperCircuits {
     /// off-envelope profile is rejected by the degree flags). `statement_digest` is the
     /// Fiat-Shamir salt the inner batch proof absorbed (`PublicParams::digest` after `J`).
     /// Cross-checked against the system's own bound digest, if any.
-    pub fn prove(
+    pub(crate) fn prove(
         &self,
         system: &Fp8System<F, D>,
         batch_proof: &BatchStarkProofWithPublicInputs<F, InnerC, D>,
@@ -391,7 +342,7 @@ impl Fp8WrapperCircuits {
             &self.envelope,
             system.config(),
         )?;
-        pw.set_hash_target(self.known_digest_target, hash256_to_hash_out(statement_digest))?;
+        pw.set_hash_target(self.known_digest_target, statement_digest_to_hash_out(statement_digest))?;
         let stage1_proof = timed!(timing, "prove the stage-1 wrapper", self.stage1.prove(pw))?;
 
         let mut pw = PartialWitness::new();
@@ -400,12 +351,12 @@ impl Fp8WrapperCircuits {
     }
 
     /// The verifier's view: stage 2's verifier data (the only circuit a verifier needs).
-    pub fn verifier_data(&self) -> VerifierCircuitData<F, OuterC, D> {
+    pub(crate) fn verifier_data(&self) -> VerifierCircuitData<F, OuterC, D> {
         self.stage2.verifier_data()
     }
 
     /// Stage 2's constants/sigmas polynomial coefficients.
-    pub fn constants_sigmas_polynomials(&self) -> Vec<PolynomialCoeffs<F>> {
+    pub(crate) fn constants_sigmas_polynomials(&self) -> Vec<PolynomialCoeffs<F>> {
         self.stage2.prover_only.constants_sigmas_commitment.polynomials.clone()
     }
 }
@@ -471,7 +422,7 @@ pub fn expected_wrapper_public_inputs(
         expected.extend(pis);
     }
     expected.extend(system.degree_bits().iter().map(|&bits| F::from_canonical_usize(bits)));
-    expected.extend(hash256_to_hash_out::<F>(statement_digest).elements);
+    expected.extend(statement_digest_to_hash_out::<F>(statement_digest).elements);
     expected.extend(zeta.0);
     // The class (a) recompute: evaluate the statement's own known columns at the proof's
     // zeta and g_t * zeta — the same binding `batch_verify` performs natively.
@@ -488,6 +439,7 @@ pub fn expected_wrapper_public_inputs(
     }
     expected.extend(evals_at_zeta.iter().flat_map(|e| e.0));
     expected.extend(evals_at_g_zeta.iter().flat_map(|e| e.0));
+    expected.push(F::from_canonical_u64(system.device() as u64));
     // Layout invariant, fail closed: the assembled vector must fill the layout exactly.
     ensure!(
         expected.len() == total,

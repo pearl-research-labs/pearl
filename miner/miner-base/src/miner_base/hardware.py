@@ -15,8 +15,8 @@
   (`Hardware.matmul_peel`, `Hardware.cast_to_peel`).
 
 :class:`ReferenceHardware` implements both kernel tiers in plain ``torch`` so
-the miner runs end-to-end on CPU; :class:`Blackwell` pins SM100 FP8 MMA
-arithmetic via a bit-exact CPU emulation.
+the miner runs end-to-end on CPU; :class:`Hopper` and :class:`Blackwell` provide
+bit-exact CPU emulations of their devices' FP8 arithmetic.
 
 Design note (propagate-or-fail): the device-specific tier's correct-or-NaN
 contract (`Hardware.matmul` / `Hardware.cast` below) propagates invalid
@@ -30,11 +30,34 @@ which NaN is only the sharpest instance.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from .compute_ops import ComputeOps, DType
 
-__all__ = ["DType", "Hardware", "ReferenceHardware", "Blackwell", "hardware_for"]
+__all__ = [
+    "DType",
+    "Fp8Replay",
+    "Hardware",
+    "ReferenceHardware",
+    "Hopper",
+    "Blackwell",
+    "hardware_for",
+]
+
+
+@dataclass
+class Fp8Replay:
+    """Accumulators after each rank-32 atom, stored as FP32 tensors.
+
+    On Hopper, ``totals`` records ``RNE_FP32(C + c)``, where ``C`` is the
+    total before the current window and ``c`` is its local accumulator.
+    """
+
+    totals: torch.Tensor  # (rows_a, rows_b, ceil(k/32))
+    window_partials: torch.Tensor | None  # local c before promotion; same shape, or None
+    window_groups: int | None  # atoms per promotion window, or None without promotion
 
 
 def _assert_quant_operands(op: str, a: torch.Tensor, b: torch.Tensor) -> None:
@@ -90,19 +113,15 @@ class Hardware:
         """
         raise NotImplementedError
 
-    def matmul_fp8_partials(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Like ``matmul`` (FP8 @ FP8, no carry-in) but returns, for each output
-        cell, the running FP32 accumulator after every accumulation group --
-        shape ``(a.shape[0], b.shape[0], ceil(k / 32))``, the last slice equal
-        to the final matmul. These are the partial sums ``c_v`` the jackpot
-        policy's prefix-inclusive anchor (``policy.py`` check 3) consumes.
-        """
+    def matmul_fp8_replay(self, a: torch.Tensor, b: torch.Tensor) -> Fp8Replay:
+        """Replay matrix multiplication while recording intermediate accumulators."""
         raise NotImplementedError
 
-    # `W` in the jackpot policy's convention (``jackpot_policy.rs``): a summand
-    # more than `W` bits below the accumulation window's anchor is dropped.
-    # 25 on Blackwell (tcgen05.mma's 25 fractional bits below the anchor).
+    # Fractional bits below the atom's alignment exponent (`W` in ``jackpot_policy.rs``):
+    # 13 on Hopper (WGMMA), 25 on Blackwell (tcgen05.mma).
     fp8_window_bits: int
+    # Row noise standard deviation / scaled row norm: 1.0 on Hopper, 0.5 on Blackwell.
+    noise_fraction: float
 
     # ============ Reference-only (deviable) surface =====================
     # Used ONLY to build C'' = A'' @ B''.T (the approximated product). The
@@ -123,18 +142,18 @@ class Hardware:
 class ReferenceHardware(Hardware):
     """Plain-``torch`` reference so the miner runs end-to-end on CPU.
 
-    ``matmul`` is a CPU STUB. The protocol's matmul is the device's real
-    FP8 @ FP8 MMA opcode (SM100 ``tcgen05.mma`` kind ``f8f6f4``); for its
-    exact arithmetic see :class:`Blackwell` below.
+    ``matmul`` is a CPU STUB. The protocol uses Hopper's FP8 WGMMA or
+    Blackwell's ``tcgen05.mma`` kind ``f8f6f4``, with device-specific accumulation.
     The BF16-upcast torch matmul below does NOT reproduce that bit-for-bit;
     verification against a real device needs the device-accurate ``matmul``
-    swapped in (:class:`Blackwell` below).
+    swapped in (:class:`Hopper` or :class:`Blackwell` below).
     All lottery-critical computation (``Fp8QuantScheme`` / ``PearlScheme``) composes
     only these primitives, so swapping in a device's bit-exact ``matmul`` / ``cast``
     yields that device's exact results.
     """
 
     name = "reference"
+    noise_fraction = 0.5
 
     # -- device-specific surface --
 
@@ -198,6 +217,37 @@ class ReferenceHardware(Hardware):
         return x.to(DType.PEEL.value)
 
 
+class Hopper(ReferenceHardware):
+    """NVIDIA Hopper FP8 WGMMA arithmetic, emulated by :mod:`.fp8_sim_hopper`.
+
+    Each atom accumulates 32 products at 13 fractional bits below its alignment
+    exponent. Each window starts at zero and chains up to four atoms; its result
+    is added to the FP32 total with round-to-nearest-even. The last window may
+    contain fewer than 128 products.
+    """
+
+    name = "Hopper"
+    fp8_window_bits = 13
+    noise_fraction = 1.0
+
+    def matmul(self, a, b):
+        _assert_matmul_operands(a, b)
+        from .fp8_sim_hopper import matmul_fp8_sim_hopper
+
+        return matmul_fp8_sim_hopper(a, b).to(DType.MATMUL.value)
+
+    def matmul_fp8_replay(self, a, b):
+        _assert_matmul_operands(a, b)
+        from .fp8_sim_hopper import PROMOTE_GROUPS, matmul_fp8_sim_hopper_replay
+
+        _, totals, windows = matmul_fp8_sim_hopper_replay(a, b)
+        return Fp8Replay(
+            totals=totals,
+            window_partials=windows,
+            window_groups=PROMOTE_GROUPS,
+        )
+
+
 class Blackwell(ReferenceHardware):
     """NVIDIA Blackwell: ``matmul`` is the tcgen05.mma (kind::f8f6f4) FP8 atom arithmetic.
 
@@ -215,6 +265,7 @@ class Blackwell(ReferenceHardware):
 
     name = "Blackwell"
     fp8_window_bits = 25
+    noise_fraction = 0.5
 
     def matmul(self, a, b):
         _assert_matmul_operands(a, b)
@@ -222,22 +273,14 @@ class Blackwell(ReferenceHardware):
 
         return matmul_fp8_sim_blackwell(a, b).to(DType.MATMUL.value)
 
-    def matmul_fp8_partials(self, a, b):
-        _assert_quant_operands("matmul_fp8_partials", a, b)
-        from .fp8_sim_blackwell import matmul_fp8_sim_blackwell_partials
-
-        return matmul_fp8_sim_blackwell_partials(a, b)
-
 
 def hardware_for(device: object) -> Hardware:
-    """Resolve a committed device to its bit-exact CPU emulation.
-
-    Blackwell (SM100) is the only device this miner mines on or verifies
-    against; every other committed device is rejected.
-    """
+    """Resolve Hopper or Blackwell to its bit-exact CPU emulation; reject other devices."""
     from .params import Device
 
     match device:
+        case Device.HOPPER:
+            return Hopper()
         case Device.BLACKWELL:
             return Blackwell()
         case _:

@@ -8,4 +8,4 @@ pub mod ctl;
 pub mod stark;
 
 pub use columns::{MATMUL_B200_COL_MAP, MatmulB200ColumnsView, NUM_MATMUL_B200_COLUMNS, NUM_MATMUL_B200_KNOWN_COLUMNS};
-pub use stark::{MatmulB200Stark, MatmulProgram};
+pub use stark::MatmulStarkB200;

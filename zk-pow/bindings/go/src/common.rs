@@ -60,8 +60,13 @@ lazy_static::lazy_static! {
     /// on demand, so no proof can force an expensive circuit build (denial of service).
     pub static ref FP8_VERIFIER_CACHE: Fp8VerifierCache = {
         use zk_pow::api::fp8::embedded_cache;
-        Fp8VerifierCache::from_bytes(embedded_cache::CACHE_DATA)
-            .expect("fp8 verifier cache is missing or corrupt; cannot verify fp8 proofs")
+        let cache = Fp8VerifierCache::from_bytes(embedded_cache::CACHE_DATA)
+            .expect("fp8 verifier cache is missing or corrupt; cannot verify fp8 proofs");
+        assert!(
+            cache.contains_all_devices(),
+            "fp8 verifier cache must contain exactly the H100 and B200 setups"
+        );
+        cache
     };
 }
 

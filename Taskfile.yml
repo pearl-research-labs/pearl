@@ -92,7 +92,7 @@ tasks:
     cmds:
       - rm -rf bin
       - rm -f xmss/libxmss.a
-      - rm -f zk-pow/src/v1/v1_cache.bin
+      - rm -f zk-pow/src/api/fp8/fp8_cache.bin zk-pow/src/v2/circuit/v2_cache.bin zk-pow/src/v1/v1_cache.bin
       - rm -rf pearl-blake3/target py-pearl-mining/target zk-pow/target zk-pow/bindings/go/target
       - find . -name coverage.txt -type f -delete
 

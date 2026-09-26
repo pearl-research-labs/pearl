@@ -24,13 +24,7 @@ _LOGGER = get_logger(__name__)
 # Rust ``MMAType::Bf16ToFp8Fp32``; the Python binding only names the Int7 variant.
 _MMA_BF16_TO_FP8_FP32 = 1
 
-# The committed job shape one ``Fp8Prover`` setup is specific to (see
-# ``_fp8_shape_key``): ``(k, r, quant, device)`` then each operand's
-# ``(rows, hash_id, pattern bytes)``, A before B.
-Fp8ShapeKey = tuple[int, int, object, object, int, object, bytes, int, object, bytes]
-
 _fp8_prover: Fp8Prover | None = None
-_fp8_prover_key: Fp8ShapeKey | None = None
 
 
 def worker_init() -> None:
@@ -54,10 +48,10 @@ def _run_warmup() -> None:
     try:
         mining_config = pearl_mining.MiningConfiguration.from_bytes(raw)
     except Exception:
-        _LOGGER.info("FP8 (cert-v4 pB) warmup deferred to first Fp8Prover.setup for this shape")
+        _LOGGER.info("FP8 (cert-v4 pB) warmup deferred to the first FP8 proof")
         return
     if int.from_bytes(raw[6:8], "little") == _MMA_BF16_TO_FP8_FP32:
-        _LOGGER.info("FP8 warmup deferred to first Fp8Prover.setup for this shape")
+        _LOGGER.info("FP8 warmup deferred to the first FP8 proof")
         return
 
     _LOGGER.info(
@@ -72,35 +66,15 @@ def ready_probe() -> bool:
     return True
 
 
-def _fp8_shape_key(plain_proof: PlainProofV4) -> Fp8ShapeKey:
-    """The committed job shape a prover setup is specific to: ``CommonParams``
-    plus both operands' ``(rows, hash_id, pattern)``."""
-    common, a, b = plain_proof.common, plain_proof.a, plain_proof.b
-    return (
-        int(common.k),
-        int(common.r),
-        common.quant,
-        common.device,
-        int(a.num_rows),
-        a.hash_id,
-        bytes(a.pattern.to_bytes()),
-        int(b.num_rows),
-        b.hash_id,
-        bytes(b.pattern.to_bytes()),
-    )
-
-
 def _prove_fp8(
     header: IncompleteBlockHeader,
     plain_proof: PlainProofV4,
     debug: bool,
 ) -> tuple[bytes, bytes]:
-    global _fp8_prover, _fp8_prover_key
-    key = _fp8_shape_key(plain_proof)
-    if _fp8_prover is None or _fp8_prover_key != key:
-        _LOGGER.info(f"Building Fp8Prover for shape {key}")
-        _fp8_prover = Fp8Prover.setup(header, plain_proof)
-        _fp8_prover_key = key
+    global _fp8_prover
+    if _fp8_prover is None:
+        _LOGGER.info(f"Building Fp8Prover for initial device {plain_proof.common.device}")
+        _fp8_prover = Fp8Prover.setup(plain_proof.common.device)
     public_data, proof_data = _fp8_prover.prove(header, plain_proof)
     public_bytes, proof_bytes = bytes(public_data), bytes(proof_data)
     if debug:

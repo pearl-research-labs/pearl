@@ -22,7 +22,6 @@ from .prequant import RowNorms
 
 # The quant grid ceiling: largest finite magnitude of the QUANT dtype (448.0 for e4m3).
 QUANT_MAX = float(torch.finfo(DType.QUANT.value).max)
-DELTA = 0.5  # noise-to-signal ratio (in L2) of the injected E@F noise
 
 
 class Fp8QuantScheme:
@@ -51,8 +50,8 @@ class Fp8QuantScheme:
         see there). Returns ``(a_prime, alpha, beta, l2)``: the quantized
         noised operand (FP8), the per-row scales (n x 1, BF16) used to build
         it, and the floored ``l2`` those scales were derived from --
-        ``sigma_i = DELTA * alpha_i * l2_i`` is the jackpot policy's per-row
-        noise std (``policy.py``).
+        ``sigma_i = delta * alpha_i * l2_i`` (``delta = hw.noise_fraction``)
+        is the jackpot policy's per-row noise std (``policy.py``).
         """
         assert e.dtype == DType.FACTOR.value and f.dtype == DType.FACTOR.value
         X = rows.to(torch.bfloat16)
@@ -61,8 +60,8 @@ class Fp8QuantScheme:
         # Per-row scale derivation: pick alpha, beta so the quantized
         # alpha (.) X + beta (.) E@F satisfies, per row:
         #   (1) |alpha*X + beta*E@F| <= QUANT_MAX  -- no loss to saturation;
-        #   (2) rms(beta*E@F) = DELTA * rms(alpha*X)  -- noise-to-signal (L2)
-        #       is DELTA.
+        #   (2) rms(beta*E@F) = delta * rms(alpha*X)  -- noise-to-signal (L2)
+        #       is delta, the committed device's noise fraction.
         # We have X's norms (l2 := rms(X), linf) but never measure E@F; its
         # construction bounds it instead: each e_row / f_col is a uniform draw
         # renormalized to L2 norm NOISE_TARGET_NORM (noise.py), so with
@@ -73,17 +72,18 @@ class Fp8QuantScheme:
         #                             on the bound; the clamp below covers it)
         #   rms(entry) ~ c/sqrt(r) -- IN EXPECTATION (random ~unit directions:
         #                             E[<u,v>^2] = 1/r), so (2) is approximate.
-        # (2) => beta = alpha * DELTA*l2 / (c/sqrt(r)) = alpha*l2*delta_over_std;
+        # (2) => beta = alpha * delta*l2 / (c/sqrt(r)) = alpha*l2*delta_over_std;
         # into (1) at the peaks (alpha*linf + beta*c = QUANT_MAX):
-        #   alpha = QUANT_MAX / (linf + DELTA*sqrt(r) * l2).
+        #   alpha = QUANT_MAX / (linf + delta*sqrt(r) * l2).
         #
-        # Universal constants -- fixed by (QUANT_MAX, DELTA, r), not the data;
-        # a real implementation precomputes them once.
+        # Universal constants (the paper's d_r, e_r) -- fixed by (QUANT_MAX,
+        # delta, r), not the data; a real implementation precomputes them once.
         r = e.shape[1]
+        delta = hw.noise_fraction
         quant_max = hw.compute.const(QUANT_MAX)
-        delta_r = hw.compute.const(DELTA * math.sqrt(r))
+        delta_r = hw.compute.const(delta * math.sqrt(r))
         delta_over_std = hw.compute.const(
-            DELTA * math.sqrt(r) / (NOISE_TARGET_NORM * NOISE_TARGET_NORM)
+            delta * math.sqrt(r) / (NOISE_TARGET_NORM * NOISE_TARGET_NORM)
         )
 
         noised_bound = hw.compute.fma(delta_r, l2, linf)

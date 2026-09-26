@@ -1,6 +1,7 @@
 use anyhow::{Result, ensure};
 
 use crate::api::fp8::dtype::{check_not_nan_or_inf_bf16, check_not_nan_or_inf_f32};
+use crate::api::fp8::public_params::Device;
 use crate::api::layout::JACKPOT_ENTRIES;
 
 const FP32_MIN_NONZERO_EXPONENT: i32 = -126;
@@ -14,6 +15,9 @@ pub const MMA_GROUP_PRODUCTS: usize = 32;
 /// window: 25 fractional bits below the anchor, result rounded to FP32
 /// towards zero (B200.md).
 const B200_FP8_WIDTH: u16 = 26;
+/// Hopper WGMMA keeps 13 fractional bits below the atom anchor.
+const H100_FP8_WIDTH: u16 = 14;
+const H100_WINDOW_PRODUCTS: usize = 128;
 
 pub trait Dtype<F, T> {
     fn mul(&self, a: F, b: F) -> T;
@@ -21,10 +25,22 @@ pub trait Dtype<F, T> {
     fn add(&self, a: F, b: F) -> T;
 }
 
+impl Device {
+    /// `a` is `m × k` and `b` is `n × k`, both row-major (`b` stores the
+    /// transposed logical operand). `acc`, when present, is the `m × n` carry-in.
+    pub(crate) fn matmul_fp8(self, a: &[u8], b: &[u8], acc: Option<&[f32]>, m: usize, n: usize, k: usize) -> Result<Vec<f32>> {
+        match self {
+            Self::H100 => H100 {}.matmul_fp8(a, b, acc, m, n, k),
+            Self::B200 => B200 {}.matmul_fp8(a, b, acc, m, n, k),
+        }
+    }
+}
+
 /// Intermediate fixed-point view of an f32 used by the matmul emulation.
 /// `exponent` is a signed exponent so a "zero" term can carry a sentinel exponent
 /// (`zero_exp`, chosen well below any real exponent) without the alignment math
 /// underflowing. A `GFloat` is canonically zero iff `significand == 0`.
+#[derive(Clone, Copy)]
 pub struct GFloat {
     pub sign: bool,
     pub exponent: i32,
@@ -307,7 +323,7 @@ impl B200 {
     /// present, is the `m × n` carry-in accumulator: cell `(i, j)` is seeded
     /// with `acc[i * n + j]` before the tile's products are summed, so
     /// successive tiles accumulate on the hardware.
-    pub fn matmul_fp8(&self, a: &[u8], b: &[u8], acc: Option<&[f32]>, m: usize, n: usize, k: usize) -> Result<Vec<f32>> {
+    pub(crate) fn matmul_fp8(&self, a: &[u8], b: &[u8], acc: Option<&[f32]>, m: usize, n: usize, k: usize) -> Result<Vec<f32>> {
         Ok(matmul_fp8_windowed(B200_FP8_WIDTH, a, b, acc, m, n, k, false)?.0)
     }
 
@@ -316,8 +332,206 @@ impl B200 {
     /// — `ceil(k / MMA_GROUP_PRODUCTS)` values per cell, the last being the
     /// cell's final value. These are the partial sums `c_v` the jackpot
     /// policy's prefix-inclusive anchor consumes.
-    pub fn matmul_fp8_partials(&self, a: &[u8], b: &[u8], m: usize, n: usize, k: usize) -> Result<Vec<Vec<f32>>> {
+    pub(crate) fn matmul_fp8_partials(&self, a: &[u8], b: &[u8], m: usize, n: usize, k: usize) -> Result<Vec<Vec<f32>>> {
         Ok(matmul_fp8_windowed(B200_FP8_WIDTH, a, b, None, m, n, k, true)?.1)
+    }
+}
+
+/// NVIDIA H100's rank-32 noise atom and reset-and-promote matrix replay.
+pub struct H100 {}
+
+/// Exact binades consumed by the consolidated H100 jackpot policy for one cell.
+#[derive(Clone, Debug, PartialEq)]
+pub struct H100PolicyExponents {
+    /// One `e(Z)` per at-most-128-term window; `None` means zero.
+    pub z_windows: Vec<Option<i32>>,
+    /// Cell-wide `e(M)`, including every exact unrounded `C + c`.
+    pub m_cell: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+enum H100ReplayMode {
+    Output,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Partials,
+    Policy,
+}
+
+struct H100Replay {
+    output: Vec<f32>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    partials: Vec<Vec<f32>>,
+    policy: Vec<H100PolicyExponents>,
+}
+
+fn finite_f32_binade(value: f32) -> Option<i32> {
+    check_not_nan_or_inf_f32(value).expect("policy replay values must be finite");
+    let bits = value.to_bits() & 0x7FFF_FFFF;
+    if bits == 0 {
+        return None;
+    }
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    if exp == 0 {
+        Some((bits & 0x7F_FFFF).ilog2() as i32 - 149)
+    } else {
+        Some(exp - 127)
+    }
+}
+
+/// Exact binade of the real sum of two finite f32 values, before FP32 rounding.
+fn exact_f32_sum_binade(a: f32, b: f32) -> Option<i32> {
+    let parts = |value: f32| {
+        check_not_nan_or_inf_f32(value).expect("policy replay values must be finite");
+        let bits = value.to_bits();
+        let negative = bits >> 31 != 0;
+        let exp_field = ((bits >> 23) & 0xFF) as i32;
+        let fraction = bits & 0x7F_FFFF;
+        let (significand, exponent) = if exp_field == 0 {
+            (fraction, -149)
+        } else {
+            ((1 << 23) | fraction, exp_field - 150)
+        };
+        let signed = if negative {
+            -(significand as i128)
+        } else {
+            significand as i128
+        };
+        (signed, exponent)
+    };
+
+    let (a_sig, a_exp) = parts(a);
+    let (b_sig, b_exp) = parts(b);
+    if a_sig == 0 {
+        return finite_f32_binade(b);
+    }
+    if b_sig == 0 {
+        return finite_f32_binade(a);
+    }
+    let exponent = a_exp.min(b_exp);
+    let a_shift = (a_exp - exponent) as u32;
+    let b_shift = (b_exp - exponent) as u32;
+    assert!(
+        a_shift < 104 && b_shift < 104,
+        "protocol replay exponent gap exceeds the i128 exact-sum frame"
+    );
+    let sum = (a_sig << a_shift) + (b_sig << b_shift);
+    (sum != 0).then(|| exponent + sum.unsigned_abs().ilog2() as i32)
+}
+
+impl H100 {
+    /// Full Hopper replay. Every ascending 128-product window starts a fresh
+    /// local WGMMA accumulator at +0, chains one to four rank-32 atoms, then
+    /// adds its local result to the prior global total with one FP32 RNE add.
+    pub(crate) fn matmul_fp8(&self, a: &[u8], b: &[u8], acc: Option<&[f32]>, m: usize, n: usize, k: usize) -> Result<Vec<f32>> {
+        ensure!(acc.is_none(), "H100 replay does not accept a carry-in");
+        Ok(self.matmul_fp8_replay(a, b, m, n, k, H100ReplayMode::Output)?.output)
+    }
+
+    /// One globalized partial per rank-32 atom. Within a window, partial `u`
+    /// is `RNE_f32(C_before + z_u)`; each window's final partial is its
+    /// promoted total and the last partial is the cell result.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn matmul_fp8_partials(&self, a: &[u8], b: &[u8], m: usize, n: usize, k: usize) -> Result<Vec<Vec<f32>>> {
+        Ok(self.matmul_fp8_replay(a, b, m, n, k, H100ReplayMode::Partials)?.partials)
+    }
+}
+
+impl H100 {
+    /// Full replay plus the exact M/Z binades used by the jackpot census.
+    pub fn matmul_fp8_policy_replay(
+        &self,
+        a: &[u8],
+        b: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(Vec<f32>, Vec<H100PolicyExponents>)> {
+        let replay = self.matmul_fp8_replay(a, b, m, n, k, H100ReplayMode::Policy)?;
+        Ok((replay.output, replay.policy))
+    }
+
+    fn matmul_fp8_replay(&self, a: &[u8], b: &[u8], m: usize, n: usize, k: usize, mode: H100ReplayMode) -> Result<H100Replay> {
+        ensure!(
+            k > 0 && k.is_multiple_of(MMA_GROUP_PRODUCTS),
+            "H100 replay requires positive k divisible by 32"
+        );
+        ensure!(a.len() == m * k);
+        ensure!(b.len() == n * k);
+
+        let record_partials = matches!(mode, H100ReplayMode::Partials);
+        let record_policy = matches!(mode, H100ReplayMode::Policy);
+        let zero_exp = -139;
+        let events_per_cell = k / MMA_GROUP_PRODUCTS;
+        let mut out = vec![0.0f32; m * n];
+        let mut partials = Vec::with_capacity(if record_partials { m * n } else { 0 });
+        let mut policy = Vec::with_capacity(if record_policy { m * n } else { 0 });
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            for j in 0..n {
+                let b_row = &b[j * k..(j + 1) * k];
+                let mut total = 0.0f32;
+                let mut events = Vec::with_capacity(if record_partials { events_per_cell } else { 0 });
+                let mut m_cell = None;
+                let mut z_windows = Vec::with_capacity(if record_policy { k.div_ceil(H100_WINDOW_PRODUCTS) } else { 0 });
+                for window_start in (0..k).step_by(H100_WINDOW_PRODUCTS) {
+                    let window_end = (window_start + H100_WINDOW_PRODUCTS).min(k);
+                    let mut local = 0.0f32;
+                    let mut z_window = None;
+                    for atom_start in (window_start..window_end).step_by(MMA_GROUP_PRODUCTS) {
+                        let mut values = Vec::with_capacity(MMA_GROUP_PRODUCTS + 1);
+                        values.push(GFloat::from(local));
+                        for (&a, &b) in a_row[atom_start..atom_start + MMA_GROUP_PRODUCTS]
+                            .iter()
+                            .zip(&b_row[atom_start..atom_start + MMA_GROUP_PRODUCTS])
+                        {
+                            let product = multiply_fp8_to_gfloat(a, b, zero_exp);
+                            if record_policy {
+                                // Products are unnormalized: |p| = significand * 2^(exponent - 23).
+                                let exponent = (product.significand != 0)
+                                    .then(|| product.exponent + product.significand.ilog2() as i32 - 23);
+                                z_window = z_window.max(exponent);
+                                m_cell = m_cell.max(exponent);
+                            }
+                            values.push(product);
+                        }
+                        local = windowed_group_sum(&values, zero_exp, H100_FP8_WIDTH).into();
+                        if record_policy {
+                            z_window = z_window.max(finite_f32_binade(local));
+                            m_cell = m_cell.max(exact_f32_sum_binade(total, local));
+                        }
+                        if record_partials {
+                            let mut projected = total + local;
+                            ensure!(projected.is_finite(), "H100 replay partial overflowed FP32");
+                            if projected == 0.0 {
+                                projected = 0.0;
+                            }
+                            events.push(projected);
+                        }
+                    }
+                    if record_policy {
+                        z_windows.push(z_window);
+                    }
+                    total += local;
+                    ensure!(total.is_finite(), "H100 replay promotion overflowed FP32");
+                    if total == 0.0 {
+                        total = 0.0;
+                    }
+                }
+                out[i * n + j] = total;
+                if record_partials {
+                    debug_assert_eq!(events.len(), events_per_cell);
+                    partials.push(events);
+                }
+                if record_policy {
+                    policy.push(H100PolicyExponents { z_windows, m_cell });
+                }
+            }
+        }
+        Ok(H100Replay {
+            output: out,
+            partials,
+            policy,
+        })
     }
 }
 
@@ -372,6 +586,96 @@ pub fn bf16_from_i8s(values: &[i8]) -> Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h100_replay_resets_every_four_atoms_and_promotes_in_fp32() {
+        let k = 1024;
+        let mut a = vec![0u8; k];
+        a[..128].fill(0x78); // 256
+        a[128..256].fill(0x38); // 1
+        let b = vec![0x38u8; k]; // 1
+
+        let replay = H100 {}.matmul_fp8(&a, &b, None, 1, 1, k).unwrap();
+        assert_eq!(replay, vec![32_896.0]);
+        let old_continuous = matmul_fp8_windowed(H100_FP8_WIDTH, &a, &b, None, 1, 1, k, false).unwrap().0;
+        assert_eq!(old_continuous, vec![32_768.0]);
+
+        let events = H100 {}.matmul_fp8_partials(&a, &b, 1, 1, k).unwrap();
+        assert_eq!(events[0].len(), 32);
+        assert_eq!(events[0].last(), Some(&32_896.0));
+    }
+
+    #[test]
+    fn h100_replay_handles_partial_windows_and_canonicalizes_zero() {
+        for (k, live_atoms, expected) in [(1056, 1, 32.0), (1088, 2, 64.0), (1120, 3, 96.0), (1152, 4, 128.0)] {
+            let mut a = vec![0u8; k];
+            a[1024..].fill(0x38);
+            let b = vec![0x38u8; k];
+            let replay = H100 {}.matmul_fp8(&a, &b, None, 1, 1, k).unwrap();
+            assert_eq!(replay, vec![expected]);
+            let events = H100 {}.matmul_fp8_partials(&a, &b, 1, 1, k).unwrap();
+            assert_eq!(events[0].len(), k / 32);
+            assert_eq!(events[0][events[0].len() - live_atoms - 1], 0.0);
+            assert_eq!(events[0].last(), Some(&expected));
+        }
+
+        let k = 1024;
+        let mut a = vec![0u8; k];
+        a[0] = 0x78;
+        a[1] = 0xF8;
+        let b = vec![0x38u8; k];
+        let replay = H100 {}.matmul_fp8(&a, &b, None, 1, 1, k).unwrap();
+        assert_eq!(replay[0].to_bits(), 0);
+    }
+
+    #[test]
+    fn h100_policy_replay_tracks_window_z_and_cell_m() {
+        let k = 256;
+        let a = vec![0x38u8; k];
+        let b = vec![0x38u8; k];
+        let (out, policy) = H100 {}.matmul_fp8_policy_replay(&a, &b, 1, 1, k).unwrap();
+        assert_eq!(out, vec![256.0]);
+        assert_eq!(policy.len(), 1);
+        assert_eq!(policy[0].z_windows, vec![Some(7), Some(7)]);
+        assert_eq!(policy[0].m_cell, Some(8));
+    }
+
+    #[test]
+    fn h100_policy_replay_tracks_exact_products_when_atoms_cancel() {
+        use crate::api::fp8::dtype::fp8_e4m3_to_f32;
+
+        let mut a = [0u8; MMA_GROUP_PRODUCTS];
+        let mut b = [0u8; MMA_GROUP_PRODUCTS];
+        for a_code in 0..=u8::MAX {
+            if a_code & 0x7F == 0x7F {
+                continue;
+            }
+            for b_code in 0..=u8::MAX {
+                if b_code & 0x7F == 0x7F {
+                    continue;
+                }
+                a[0] = a_code;
+                a[1] = a_code;
+                b[0] = b_code;
+                b[1] = b_code ^ 0x80;
+                // Opposite products cancel, so only their magnitudes determine M and Z.
+                // Every finite FP8 product is exactly representable in FP32.
+                let product = fp8_e4m3_to_f32(a_code) * fp8_e4m3_to_f32(b_code);
+                let expected = finite_f32_binade(product);
+                let (out, policy) = H100 {}.matmul_fp8_policy_replay(&a, &b, 1, 1, MMA_GROUP_PRODUCTS).unwrap();
+                assert_eq!(out[0].to_bits(), 0, "a={a_code:#04x}, b={b_code:#04x}");
+                assert_eq!(policy[0].m_cell, expected, "M: a={a_code:#04x}, b={b_code:#04x}");
+                assert_eq!(policy[0].z_windows, vec![expected], "Z: a={a_code:#04x}, b={b_code:#04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_sum_binade_handles_far_subtraction_below_power_of_two() {
+        let tiny = f32::from_bits((127 - 30) << 23);
+        assert_eq!(1.0f32 - tiny, 1.0);
+        assert_eq!(exact_f32_sum_binade(1.0, -tiny), Some(-1));
+    }
 
     /// Cross-implementation test vector: the reference `XorFoldExtractor`
     /// (each committed subtile's f32 words folded into its own rotl-mixed lane

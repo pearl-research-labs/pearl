@@ -194,9 +194,9 @@ pub struct ScaleColumnsView<T: Copy> {
     pub beta_exp_is_zero: T,
     /// The group's dead-entry count `|{u : ABS(X_u) >= DEAD_BOUND}|`, CTL-transported from
     /// InputQuant; T2 accumulates it into the per-side running totals. The bound itself is
-    /// not a column: the looked tuple carries the affine expression
-    /// `128*L2_FLOORED_EXPONENT + L2_FLOORED_SIGNIFICAND + 128 = code(l2f) + 256` (T1) — the
-    /// bf16 code of the plaintext dead bound `tau_idle * DELTA * l2f = 4 * l2f` — so
+    /// not a column: the looked tuple carries the device-specific affine BF16 code of
+    /// `tau_idle * delta(device) * l2f` (`code(l2f) + 256` on Blackwell,
+    /// `code(l2f) + 384` on Hopper), so
     /// InputQuant's per-element `IS_DEAD` certificates run against the true floored-L2
     /// threshold.
     pub dead_count: T,
@@ -221,34 +221,6 @@ pub struct ScaleColumnsView<T: Copy> {
     pub dead_slack_hi_a: T,
     /// T3 witness for the B side (see `dead_slack_hi_a`).
     pub dead_slack_hi_b: T,
-
-    // ------------------------------------------------------------------------------------------
-    // The jackpot noise floor (group F). Check 2 of the jackpot policy: every row's noise
-    // scale `sigma = DELTA * alpha * l2f` must satisfy `sigma >= sigma_min`, where `alpha` is
-    // the row's quantization scale and `l2f` its floored L2 norm. `ScaleProgram::new` freezes
-    // `sigma_min = 2 * DELTA`, so the condition is exactly
-    //
-    //     alpha * l2f >= 2.
-    //
-    // Both factors are positive normal bfloat16 numbers: with 7-bit mantissa field `m` and
-    // exponent field `e`, each equals `(2^7 + m) * 2^(e - 134)`. Define
-    //
-    //     P = (2^7 + m_alpha) * (2^7 + m_l2f)   (= ALPHA_L2_MULTIPLY.SIG_PRODUCT, in [2^14, 2^16))
-    //     E = e_alpha + e_l2f                   (= ALPHA_EXP + L2_FLOORED_EXPONENT, at most 508).
-    //
-    // Then `alpha * l2f = P * 2^(E - 268)`, so the condition reads `P >= 2^(269 - E)`, and
-    // with `2^14 <= P < 2^16` it splits by exponent sum:
-    //
-    //     alpha * l2f >= 2   <=>   E >= 255,  or  (E = 254 and P >= 2^15);
-    //
-    // rows with `E <= 253` are below the floor for every `P`.
-    // ------------------------------------------------------------------------------------------
-    /// The branch of the equivalence above that this row passes through. 1 claims `E >= 255`,
-    /// proved by a 16-bit range check of `E - 255`. 0 claims `E = 254`, forced by the
-    /// constraint `(1 - bit) * (E - 254) = 0`, and `P >= 2^15`, proved by a 16-bit range
-    /// check of `P - 2^15`. A row with `alpha * l2f < 2` satisfies neither branch, so no
-    /// valid assignment of this bit exists.
-    pub sigma_exp_clears_floor: T,
 
     // ------------------------------------------------------------------------------------------
     // The sqrt claim `y = RNE_bf16(sqrt(mean_j X_j^2))` (group Q; `stark.rs` derives the frame
@@ -408,21 +380,22 @@ pub struct ScaleColumnsView<T: Copy> {
     /// S1 (jackpot check 3): the row's noise-std significand
     /// `M(alpha) * M(l2f) = (128 + ALPHA_MANTISSA) * L2_FLOORED_SIGNIFICAND in [2^14, 2^16)` —
     /// the exact `sigma = DELTA * alpha * l2f` factors as
-    /// `SIGMA_SIGNIFICAND * 2^(ALPHA_EXP + L2_FLOORED_EXPONENT - 269)` (the -269 folds both
-    /// bf16 units and DELTA = 2^-1). Committed so the sigma CTL tuple stays degree 1; the
+    /// `SIGMA_SIGNIFICAND * 2^(ALPHA_EXP + L2_FLOORED_EXPONENT - 268 + log2(delta))`.
+    /// Committed so the sigma CTL tuple stays degree 1; the
     /// factors' PAIR128/EXPINFO bounds already cap the product below 2^16.
     pub sigma_significand: T,
     /// S2 (jackpot check 4): 1 iff `SIGMA_SIGNIFICAND >= 2^15` — the width bit of the sigma
     /// significand, which spans exactly two binades. Boolean (S2), two-sided by a filtered
     /// RC16 per branch (`SIGMA_SIGNIFICAND - 2^15` under the bit, `2^15 - 1 - SIGMA_SIGNIFICAND`
     /// under its complement). With it the sigma encoding
-    /// `e(sigma) + 268 = ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_SIG_IS_WIDE + 13` is affine,
+    /// `e(sigma) + 268 = ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_SIG_IS_WIDE + offset(device)`
+    /// is affine,
     /// and rides the group-tuple channel to InputQuant's lambda encodings.
     pub sigma_sig_is_wide: T,
     /// S3 (jackpot check 4): the normalized sigma significand
     /// `SIGMA_NORM = SIGMA_SIGNIFICAND * (2 - SIGMA_SIG_IS_WIDE) in [2^15, 2^16)`, so
     /// `sigma = SIGMA_NORM * 2^(e(sigma) - 15)` exactly. Rides the group-tuple channel into
-    /// InputQuant's summand score; 0 on pad rows.
+    /// InputQuant's summand score; pad rows are excluded by the channel filter.
     pub sigma_norm: T,
 
     // ------------------------------------------------------------------------------------------
@@ -442,9 +415,9 @@ pub struct ScaleColumnsView<T: Copy> {
 /// Total number of committed ScaleStark columns.
 pub const NUM_SCALE_COLUMNS: usize = size_of::<ScaleColumnsView<u8>>();
 
-// The committed-column count: 145 = 141 main + 4 class (a), of which the sqrt block is 67
+// The committed-column count: 144 = 140 main + 4 class (a), of which the sqrt block is 67
 // (the module docs derive its layout).
-const _: () = assert!(NUM_SCALE_COLUMNS == 145);
+const _: () = assert!(NUM_SCALE_COLUMNS == 144);
 
 // Public inputs (consumed by groups H and Q). `dr`/`dos` are the public scale constants
 // `bf16(DELTA*sqrt(r))` and `bf16(DELTA*sqrt(r)/NOISE_TARGET_NORM^2)` split into bf16 fields
@@ -452,7 +425,7 @@ const _: () = assert!(NUM_SCALE_COLUMNS == 145);
 // lifted to public inputs so the AIR identity is program-independent (one compiled circuit
 // per shape, not per program). The verifier pins every slot to its own statement-derived
 // value (`Fp8Job::expected_public_inputs`), whose `k` passed the wire sanity checks
-// (`k % 32 == 0`, `2048 <= k <= 2^16`) — the envelope the Q5/Q7 soundness bounds assume.
+// (`k % 32 == 0`, `1024 <= k <= 2^16`) — the envelope the Q5/Q7 soundness bounds assume.
 /// `dr` exponent field.
 pub const DR_EXP_PUBLIC_INPUT: usize = 0;
 /// `dr` mantissa field.
@@ -463,10 +436,10 @@ pub const DOS_EXP_PUBLIC_INPUT: usize = 2;
 pub const DOS_MANTISSA_PUBLIC_INPUT: usize = 3;
 /// The row length `k` (Q7's claim-side products are `B^2 * k * 2^15`). Sanctioned envelope:
 /// `k % 32 == 0` (limb 0 of the claim-side products provably vanishes: `2^20 | B^2*k*2^15`)
-/// and `2048 <= k <= 2^16` (the `< 2^53` claim-product cap in `ctl.rs` assumes `k <= 2^16`).
+/// and `1024 <= k <= 2^16` (the `< 2^53` claim-product cap in `ctl.rs` assumes `k <= 2^16`).
 pub const K_PUBLIC_INPUT: usize = 4;
 /// `Wl2 = 27 - ceil(log2 k)` — the block-L2 frame width (Q5's alignment window). In
-/// `[11, 16]` over the sanctioned `k` range. The native verifier pins this slot and
+/// `[11, 17]` over the sanctioned `k` range. The native verifier pins this slot and
 /// InputQuantStark's `2^Wl2` from the same `k` (plaintext power); the wrapper just
 /// exposes both wires.
 pub const WL2_PUBLIC_INPUT: usize = 5;
@@ -478,14 +451,8 @@ pub const WL2_PUBLIC_INPUT: usize = 5;
 pub const DEAD_LIMIT_A_PUBLIC_INPUT: usize = 6;
 /// The B side's dead-entry allowance `floor(eps_idle * w*k)` (see `DEAD_LIMIT_A_PUBLIC_INPUT`).
 pub const DEAD_LIMIT_B_PUBLIC_INPUT: usize = 7;
-/// The tile width `w` — the sigma channel's A-row multiplicity (each A row's sigma serves the
-/// `w` cells of its tile row; jackpot check 3). A looked-side CTL filter term, not read by
-/// any AIR constraint.
-pub const W_MULT_PUBLIC_INPUT: usize = 8;
-/// The tile height `h` — the sigma channel's B-row multiplicity.
-pub const H_MULT_PUBLIC_INPUT: usize = 9;
 /// Number of ScaleStark public inputs.
-pub const NUM_SCALE_PUBLIC_INPUTS: usize = 10;
+pub const NUM_SCALE_PUBLIC_INPUTS: usize = 8;
 
 columns_view!(ScaleColumnsView, NUM_SCALE_COLUMNS, SCALE_COL_MAP);
 

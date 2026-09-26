@@ -225,6 +225,7 @@ mod fp8 {
     use pyo3::types::PyBytes;
 
     use crate::api::fp8::plain_proof::PlainProofV4;
+    use crate::api::fp8::public_params::Device;
     use crate::api::fp8::zk::{Fp8Prover, Fp8Verifier, decode_statement};
     use crate::api::primitives::IncompleteBlockHeader;
 
@@ -236,8 +237,8 @@ mod fp8 {
         pyo3::exceptions::PyRuntimeError::new_err(format!("{context}: {error}"))
     }
 
-    /// Shape-specific fp8 prover setup (LUT precommitment + compiled
-    /// recursive-wrapper circuits). Create via [`PyFp8Prover::setup`].
+    /// Reusable fp8 prover setup (LUT precommitments + compiled recursive
+    /// wrapper circuits). Create via [`PyFp8Prover::setup`].
     #[pyclass(name = "Fp8Prover")]
     pub struct PyFp8Prover {
         inner: Fp8Prover,
@@ -245,12 +246,11 @@ mod fp8 {
 
     #[pymethods]
     impl PyFp8Prover {
-        /// Builds prover data for the job shape of `plain_proof` (an FP8
-        /// witness). The `ancestor_header` carried inside the proof's job
-        /// keys the B side; `block_header` (σ̂) keys the A side.
+        /// Precompiles one device's prover setup. Another device is initialized
+        /// lazily if a later proof requires it.
         #[staticmethod]
-        fn setup(block_header: IncompleteBlockHeader, plain_proof: PlainProofV4) -> PyResult<PyFp8Prover> {
-            let prover = Fp8Prover::setup(&block_header, &plain_proof).map_err(|e| runtime_err("fp8 setup failed", e))?;
+        fn setup(device: Device) -> PyResult<PyFp8Prover> {
+            let prover = Fp8Prover::setup(device).map_err(|e| runtime_err("fp8 setup failed", e))?;
             Ok(Self { inner: prover })
         }
 

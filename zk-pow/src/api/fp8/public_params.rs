@@ -137,12 +137,58 @@ impl TryFrom<u8> for Quant {
 }
 
 /// Mining device whose matmul datapath an FP8 proof reproduces; committed in
-/// `pB`'s device byte. B200 = 1 is the only supported device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `pB`'s device byte.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 #[cfg_attr(feature = "pyo3", pyo3::pyclass(eq, eq_int))]
 pub enum Device {
+    H100 = 0,
     B200 = 1,
+}
+
+impl Device {
+    pub const ALL: [Self; 2] = [Self::H100, Self::B200];
+
+    /// Base-two logarithm of the protocol noise-to-signal ratio used by
+    /// quantization, jackpot-policy thresholds, and their matching AIR
+    /// encodings.
+    pub const fn lg2_delta(self) -> i32 {
+        match self {
+            Self::H100 => 0,
+            Self::B200 => -1,
+        }
+    }
+
+    /// Protocol noise-to-signal ratio `2^lg2_delta`, shared by plaintext
+    /// quantization, policy replay, and the ZK witness.
+    pub const fn delta(self) -> f64 {
+        f64::from_bits(((self.lg2_delta() + 1023) as u64) << 52)
+    }
+
+    /// Number of fractional bits retained below this device's FP8
+    /// accumulation-window anchor. The unpredictability policy and AIR use it
+    /// to decide which summands hardware can drop.
+    pub const fn fp8_window_bits(self) -> u32 {
+        match self {
+            Self::H100 => 13,
+            Self::B200 => 25,
+        }
+    }
+
+    /// BF16-code increment for the liveness bound: adding it to the floored-L2 code
+    /// multiplies the bound by `tau_idle * delta` (an exact power of two, so the
+    /// bound stays value-ordered in code space) — `+256` (`x4`) on B200,
+    /// `+384` (`x8`) on H100.
+    pub const fn liveness_code_shift(self) -> u64 {
+        ((3 + self.lg2_delta()) * 128) as u64
+    }
+
+    /// Additive term in `enc(delta * alpha * l2) = E(alpha) + E(l2f) + wide + offset`:
+    /// folds the `2^-268` BF16-unit product bias and `-log2(delta)` — `13` on B200
+    /// (`delta = 2^-1`), `14` on H100 (`delta = 1`).
+    pub const fn sigma_encoding_offset(self) -> u64 {
+        (14 + self.lg2_delta()) as u64
+    }
 }
 
 impl TryFrom<u8> for Device {
@@ -151,6 +197,7 @@ impl TryFrom<u8> for Device {
     /// Fails closed on an unrecognized (or retired) discriminant.
     fn try_from(value: u8) -> Result<Self> {
         match value {
+            0 => Ok(Device::H100),
             1 => Ok(Device::B200),
             other => bail!("unsupported Device discriminant: {other}"),
         }
@@ -167,14 +214,14 @@ pub struct CommonParams {
 }
 
 impl CommonParams {
-    /// `r == 32`, `k ∈ [2048, 2^16]`, `32 | k`.
+    /// `r == 32`, `k ∈ [1024, 2^16]`, `32 | k`.
     fn check(&self) -> Result<()> {
         let k = self.k as usize;
         let r = self.r as usize;
         ensure!(r == 32, "Rank must be exactly 32 || r={r}");
         ensure!(k.is_multiple_of(32), "k must be divisible by 32 || k={k}");
-        ensure!(k >= 2048, "k must be >= 2048 || k={k}");
-        ensure!(k <= (1 << 16), "k must be <= 2^16 || k={k}");
+        ensure!(k >= PublicParams::MIN_K, "k must be >= {} || k={k}", PublicParams::MIN_K);
+        ensure!(k <= PublicParams::MAX_K, "k must be <= {} || k={k}", PublicParams::MAX_K);
         Ok(())
     }
 }
@@ -514,6 +561,10 @@ pub struct PublicParams {
 }
 
 impl PublicParams {
+    /// Inclusive consensus bounds for the common matmul dimension (`k ∈ [1024, 2^16]`).
+    pub const MIN_K: usize = 1 << 10;
+    pub const MAX_K: usize = 1 << 16;
+
     /// Byte length of a dense (non-MoE) statement:
     /// σ_Δ (76) + pB (21) + HB (32) + pA (11) + HA (32) + tile bases (8) + J (32).
     pub const WIRE_SIZE: usize = 212;
@@ -757,6 +808,12 @@ impl PublicParams {
     #[cfg(test)]
     pub(crate) fn moe_statement_mut(&mut self) -> Option<&mut MoEStatement> {
         self.moe_statement.as_mut()
+    }
+
+    /// Replaces the committed device for proof-transfer rejection tests.
+    #[cfg(test)]
+    pub(crate) fn set_device_for_test(&mut self, device: Device) {
+        self.job.common.device = device;
     }
 
     pub(crate) fn value_row_bytes(&self) -> usize {
@@ -1251,7 +1308,7 @@ mod tests {
         assert!(build((u32::MAX as usize).saturating_add(1), 1024, &prow, None).is_err());
         assert!(build(256, 1024, &[0x00, 0x03, 0x03, 0x03, 0x03, 0x03], None).is_err());
         assert!(Quant::try_from(1u8).is_err());
-        assert!(Device::try_from(0u8).is_err());
+        assert_eq!(Device::try_from(0u8).unwrap(), Device::H100);
         assert!(Device::try_from(2u8).is_err());
         assert_eq!(Device::try_from(1u8).unwrap(), Device::B200);
         assert!(HashId::try_from(4u8).is_err());
@@ -1297,27 +1354,34 @@ mod tests {
 
     #[test]
     fn wire_roundtrip_and_truncation_reject() {
-        for params in [dense_params(), moe_params()] {
-            let bytes = params.to_bytes();
-            let parsed = PublicParams::from_bytes(&bytes).unwrap();
-            assert_eq!(parsed.to_bytes(), bytes, "decode must be canonical");
+        for device in [Device::H100, Device::B200] {
+            let mut dense = dense_params();
+            dense.job.common.device = device;
+            let mut moe = moe_params();
+            moe.job.common.device = device;
+            for params in [dense, moe] {
+                let bytes = params.to_bytes();
+                let parsed = PublicParams::from_bytes(&bytes).unwrap();
+                assert_eq!(parsed.common().device, device);
+                assert_eq!(parsed.to_bytes(), bytes, "decode must be canonical");
 
-            // Regression: truncating inside the MoE i_a tail used to panic in
-            // `from_bytes` (unwrap on a short slice); every strict prefix must
-            // now return an error instead.
-            for len in 0..bytes.len() {
+                // Regression: truncating inside the MoE i_a tail used to panic in
+                // `from_bytes` (unwrap on a short slice); every strict prefix must
+                // now return an error instead.
+                for len in 0..bytes.len() {
+                    assert!(
+                        PublicParams::from_bytes(&bytes[..len]).is_err(),
+                        "strict prefix of {len} bytes must be rejected"
+                    );
+                }
+
+                let mut trailing = bytes.clone();
+                trailing.push(0);
                 assert!(
-                    PublicParams::from_bytes(&bytes[..len]).is_err(),
-                    "strict prefix of {len} bytes must be rejected"
+                    PublicParams::from_bytes(&trailing).is_err(),
+                    "trailing bytes must be rejected"
                 );
             }
-
-            let mut trailing = bytes.clone();
-            trailing.push(0);
-            assert!(
-                PublicParams::from_bytes(&trailing).is_err(),
-                "trailing bytes must be rejected"
-            );
         }
     }
 
@@ -1365,6 +1429,7 @@ mod tests {
 
     #[test]
     fn envelope_launch_geometry_passes() {
+        with_kr(32, PublicParams::MIN_K as u32).unwrap();
         with_kr(32, 2048).unwrap();
     }
 
@@ -1381,9 +1446,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_k_1024_is_rejected() {
-        let err = with_kr(32, 1024).unwrap_err();
-        assert!(err.to_string().contains("k must be >= 2048"));
+    fn k_below_minimum_is_rejected() {
+        let err = with_kr(32, (PublicParams::MIN_K - 32) as u32).unwrap_err();
+        assert!(err.to_string().contains(&format!("k must be >= {}", PublicParams::MIN_K)));
     }
 
     #[test]
@@ -1472,7 +1537,7 @@ mod tests {
             JobParams {
                 ancestor_header: p.job.ancestor_header,
                 common: CommonParams {
-                    k: 1 << 16,
+                    k: PublicParams::MAX_K as u32,
                     r: 32,
                     quant: p.job.common.quant,
                     device: p.job.common.device,

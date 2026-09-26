@@ -4,15 +4,15 @@
 //! [`ctl`] declares their CTL halves, and [`witness`] checks lookups and counts multiplicities.
 //! Complete channels are assembled in [`super::ctl`].
 //!
-//! Each of the sixteen [`LutTable`]s ([`LUT_TABLES`](super::ctl::LUT_TABLES)) is its own table of
+//! Each device family's fifteen [`LutTable`]s is its own table of
 //! the batch STARK — a [`LutStark`] at its natural committed height [`lut_height`] (the
 //! array orders the batch by descending height, so nothing pays for another table's
 //! padding). A LUT AIR has no constraints of its own; its columns split into two classes:
 //!
 //! - **Precommitted columns** (class (c)): the key column(s) — a plain ramp for tables whose
 //!   key domain fills the height, the enumerated key tuple for BYTES2/PAIR128, or a saturated
-//!   key `min(i, live - 1)` for the sub-height tables — followed by every stored value column
-//!   in slot order ([`lut_precommitted_values`]). Generated once system-wide and committed at
+//!   key `min(i, live - 1)` for sub-height tables — and independent value columns
+//!   ([`lut_precommitted_values`]). Slot expressions derive constant and affine outputs. Generated once system-wide and committed at
 //!   setup by [`lut_preprocessed_data`] into a `BatchStarkPreprocessedData` whose Merkle cap
 //!   is a consensus constant. Proofs never recommit these columns — the batch prover copies
 //!   the setup commitment and FRI opens it alongside the trace oracles, while constraints and
@@ -24,15 +24,16 @@
 //! The lookup argument is one [`starky::cross_table_lookup::CrossTableLookup`] per table ([`lut_cross_table_lookups`]):
 //! the looking side collects every instance of every AIR's inventory (`keys ++ values` over
 //! the consumer's own trace), the looked side is the table's slots — a multi-slot looked side
-//! for the folded tables — each slot's `(ramp + key offset, stored values...)` tuple filtered
+//! for the folded tables — each slot's key and value expressions form a tuple filtered
 //! by its multiplicity column, whose value *is* the row's multiplicity in the channel (the
 //! logup numerator semantics).
 //!
 //! Values are produced by exhaustively evaluating the canonical Rust mirror each table binds —
 //! reusing the starks' own mirror functions wherever one exists, so the tables and the traces
-//! cannot drift apart. [`generate`] returns the stored value columns (`columns[j][row]`); a
-//! row's key is its index plus the slot's key offset (`2^17 * slot` for RNERND, `2^16 * rel`
-//! for B200ALIGN). `RANGE16` stores nothing: its ramp
+//! cannot drift apart. [`generate`] returns the semantic value columns before factoring;
+//! exhaustive tests compare them with the committed slot expressions. Folded keys usually
+//! add a slot offset (`2^17 * slot` for RNERND, `2^16 * rel` for B200ALIGN).
+//! `RANGE16` stores nothing: its ramp
 //! key column *is* the table, and `BYTES2`/`PAIR128` store the enumerated key tuple itself.
 //!
 //! Padding (sub-height tables only) is always a *repeated valid entry*, never an
@@ -54,14 +55,13 @@ pub mod witness;
 
 pub use super::ctl::lut_cross_table_lookups;
 pub use columns::{
-    LutSlotLayout, XFPOW2_CAP, XFPOW2_LIMBS, XFPOW2_ZERO_POINT, lut_height, lut_num_columns, lut_slot_layout,
-    num_precommitted_columns, num_slots, slot_height,
+    LutSlotLayout, lut_height, lut_num_columns, lut_slot_layout, num_precommitted_columns, num_slots, slot_height,
 };
 pub use ctl::ctl_looked_lut_slot;
 pub use stark::{
     B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Int8DecStark, Log16Stark, LutStark, Pair128Stark,
-    Pow2DStark, Pow2GbStark, QcastStark, Range16Stark, RneRndStark, Width16Stark, Width32Stark, XfPow2Stark, generate,
-    lut_precommitted_values, lut_preprocessed_data, lut_preprocessed_inputs, lut_trace,
+    Pow2DStark, Pow2GStark, Pow2GbStark, ProdAlign15Stark, QcastStark, Range16Stark, RneRndStark, Width16Stark, Width32Stark,
+    WidthNormStark, generate, lut_precommitted_values, lut_preprocessed_data, lut_preprocessed_inputs, lut_trace,
 };
 pub use witness::{LutChecker, LutMultiplicities};
 
@@ -113,6 +113,15 @@ pub enum LutTable {
     /// classification all in-table; cut 18 provably rounds every `V < 2^17` to zero and cut -7
     /// covers every scale with only normal small-significand results.
     RneRnd,
+    /// H100 carry alignment and FP32 promotion: `(key, power, tagged_flag)`.
+    /// Carry gaps use keys 0..=63 and flag 0; promotion gaps use 128..=217 and
+    /// flag `2 + is_far`; widths use 257..=305 and flag `4 + is_low`.
+    Pow2G,
+    /// H100 product decode and 15-bit-frame alignment, folded over shifts `[0, 58]`.
+    ProdAlign15,
+    /// H100 group-sum width and normalized 14-bit significand, folded over the key's high
+    /// four bits.
+    WidthNorm,
     /// The B200 product decode + window truncation (`matmul_b200_stark`), keyed
     /// `OPERAND_CODES_A + 2^8*OPERAND_CODES_B + 2^16*REL` with `REL in [0, 71]` slot-folded; values
     /// `(ALIGNED_LANE_TERMS, PRODUCT_BIASED_EXPONENT, OPERAND_CODES_A, OPERAND_CODES_B, BINADE)`:
@@ -134,13 +143,6 @@ pub enum LutTable {
     /// truncate-to-24-bits divisor/multiplier pair. Its key domain also proves
     /// `GROUP_SUM_WIDTH <= 32`, hence `GROUP_SUM_ABS < 2^32` through MB7.
     Width32,
-    /// TamedStark's squared-comparison power (J4), keyed `t = d + 1024`, decoding `D = 2*d` —
-    /// the tau-folded doubled frame gap of the certificate `2^D <= Y` with
-    /// `Y = k*pp^2 < 2^80` (`tau_tame^2 = 2^16` rides the key's offset). Value:
-    /// `2^min(max(D,0),80)` as a base-2^16 limb vector (6 columns, exactly one limb
-    /// nonzero); the cap exceeds `Y`'s width, so the saturated comparison equals the
-    /// unsaturated one. The key domain doubles as the frame-gap window proof.
-    XfPow2,
     /// Jackpot check 4's significand-product width, keyed `P in [0, 2^16)`, values
     /// `(width(P), [P != 0])` — the bit length of a 16-bit product and its nonzero flag.
     /// InputQuant binds it on the summand's significand product to build the lambda scores;

@@ -26,7 +26,8 @@
 //!
 //! Blake3Stark supplies the committed int8 bytes and block-scale codes. ScaleStark verifies the
 //! completed row statistics, the resulting `alpha`/`beta` values, and the group's sigma
-//! encoding and significand. MatmulB200Stark consumes the fp8 output codes and the lambda scores.
+//! encoding and significand. The selected device-specific Matmul table consumes the fp8 output
+//! codes and the lambda scores.
 //!
 //! # Bf16 arithmetic
 //!
@@ -66,7 +67,7 @@
 //! that common frame:
 //!
 //! ```text
-//! Wl2    = 27 - ceil(log2(k))          // 11..16 for 2048 <= k <= 2^16
+//! Wl2    = 27 - ceil(log2(k))          // 11..17 for 1024 <= k <= 2^16
 //! sigma_b = F - 2*E*(scale_b)
 //! TERM_b  = 0                                      if p_b = 0
 //!           floor(p_b * 2^Wl2 / 2^sigma_b)         otherwise
@@ -82,8 +83,8 @@
 //! The bounds explain the otherwise arbitrary-looking 27. Honest blocks satisfy
 //! `n_b <= 8*128^2 = 2^17` and `p_b < 2^33`; the gadget reserves four more bits by accepting
 //! the wider bound `p_b < 2^37`. With `k/8` blocks, the chosen `Wl2` keeps `S < 2^61`, one bit
-//! below ScaleStark's `2^62` cap. It also keeps every `p_b*2^Wl2 < 2^53`, one bit inside the
-//! division gadget's four-16-bit-limb `2^54` cap (six bits in the top limb).
+//! below ScaleStark's `2^62` cap. It also keeps every `p_b*2^Wl2 < 2^54`, inside the
+//! division gadget's four-16-bit-limb cap (six bits in the top limb).
 //!
 //! `max_abs` is independent of this L2 calculation: it tracks the largest decoded `|X|`.
 //! Group-final rows send `(S, F, max_abs, alpha/beta fields, dead bound/count)` to ScaleStark,
@@ -165,8 +166,9 @@ use super::columns::{
 };
 use crate::api::fp8::compute::{bf16_clamp_sym, bf16_fma, bf16_max, bf16_mul};
 use crate::api::fp8::dtype::{bf16_to_f32, f32_to_fp8_e4m3};
-use crate::api::fp8::prequant::BLOCK_SIZE;
-use crate::api::fp8::quantization::{DELTA, Fp8E4M3Quant, Quant};
+use crate::api::fp8::prequant::{BLOCK_SIZE, l2_frame_width};
+use crate::api::fp8::public_params::Device;
+use crate::api::fp8::quantization::Fp8E4M3Quant;
 use crate::circuit::fp8::scale_stark::stark::{CUT_BIAS, NORM_FLOOR_CODE, SLOT_MAX, rne_sqrt_hat, rnernd_reference};
 use crate::circuit::fp8::unpredictability::{LambdaWitness, lambda_witness};
 use crate::circuit::utils::evaluator::Evaluator;
@@ -187,10 +189,6 @@ const ZERO_PRODUCT_SCALE_DROP: i64 = 400;
 const WIDE_WIDTH: u64 = 17;
 /// bf16 code of 448 (the fp8 E4M3 clamp bound; `fp8_to_bf16(0x7E)`).
 const BF16_CODE_448: u16 = 0x43E0;
-/// Base of the protocol formula `Wl2 = 27 - ceil(log2 k)`. Under the reserved
-/// `p_b < 2^37` bound, this keeps the framed sum below `2^61` and each shifted block product
-/// below `2^53`. Changing 27 would change the per-block floors and therefore protocol output.
-const WL2_BASE: u32 = 27;
 /// Far-shift threshold: a block with `sigma >= 54` floors to `TERM = 0` exactly,
 /// because `block_l2_product * 2^Wl2 < 2^54`.
 const FAR_SIGMA: u64 = 54;
@@ -218,6 +216,8 @@ pub struct InputQuantProgram {
     /// Noise rank `r`, needed to derive the honest alpha/beta witness
     /// (`derive_row_scales` on the `2^-32`-floored norms, as `noisy_quantize`).
     pub r: usize,
+    /// Committed arithmetic profile.
+    pub device: Device,
 }
 
 impl InputQuantProgram {
@@ -232,10 +232,10 @@ impl InputQuantProgram {
         self.live_rows().next_power_of_two()
     }
 
-    /// `Wl2 = 27 - ceil(log2 k)`: the job's block-L2 frame width (in `[11, 16]` over the
-    /// envelope `2048 <= k <= 2^16`).
+    /// `Wl2 = 27 - ceil(log2 k)`: the job's block-L2 frame width ([`l2_frame_width`].
+    /// In `[11, 17]` over the envelope `1024 <= k <= 2^16`.
     pub fn wl2(&self) -> u32 {
-        WL2_BASE - ceil_log2(self.k)
+        l2_frame_width(self.k).expect("sanctioned k")
     }
 
     /// Generates the InputQuantStark trace and public inputs.
@@ -410,11 +410,6 @@ fn blind_trace<F: RichField>(rows: &mut [[F; NUM_INPUT_QUANT_COLUMNS]]) {
     row.block_l2_b.shift_complement_power = F::rand();
 }
 
-/// `ceil(log2 n)` for `n >= 1`.
-fn ceil_log2(n: usize) -> u32 {
-    n.next_power_of_two().trailing_zeros()
-}
-
 /// `bit_length(x)` for `x > 0` (0 for 0): the position of the leading 1.
 fn bit_len(x: u64) -> u64 {
     (64 - x.leading_zeros()) as u64
@@ -504,7 +499,7 @@ fn clamp_slot(x: i64) -> u64 {
 /// `sigma >= 54` far branch is exactly zero; the `sigma >= 64` branch here also avoids an
 /// invalid native shift.
 pub(crate) fn block_l2_term(p: u64, sigma: u64, wl2: u32) -> u64 {
-    let x = p << wl2; // p < 2^37 envelope, Wl2 <= 16: < 2^53
+    let x = p << wl2; // p < 2^37 envelope, Wl2 <= 17: < 2^54
     if sigma >= 64 { 0 } else { x >> sigma }
 }
 
@@ -731,12 +726,10 @@ struct GroupScales {
     beta: Bf16Fields,
     alpha_code: u16,
     beta_code: u16,
-    /// The liveness threshold `code(l2f) + 256`: the bf16 code of the plaintext dead bound
-    /// `tau_idle * DELTA * l2f = 4 * l2f` (`l2f` is positive normal, so +256 raises its
-    /// exponent field by exactly 2).
+    /// The BF16 code of the device threshold `tau_idle * delta(device) * l2f`.
     dead_bound: u64,
     /// The group's noise-std encoding `enc(sigma) = e(sigma) + 268` for
-    /// `sigma = DELTA * alpha * l2f` (positive on live groups; 0 on dead groups).
+    /// `sigma = delta(device) * alpha * l2f` (positive on live groups; 0 on dead groups).
     sigma_enc: u64,
     /// The noise-std normalized significand: `sigma = sigma_norm * 2^(sigma_enc - 268 - 15)`
     /// with `sigma_norm in [2^15, 2^16)` on live groups; 0 on dead groups.
@@ -945,7 +938,7 @@ impl SideWitness {
             // FLOORED norms, exactly as `noisy_quantize` computes them — total even on all-zero
             // rows. The raw codes stay in the committed columns and the group-tuple CTL;
             // ScaleStark floors them in-circuit (group H0) before its chain.
-            Fp8E4M3Quant
+            Fp8E4M3Quant::new(program.device)
                 .derive_row_scales(
                     bf16_max(l2_code, NORM_FLOOR_CODE),
                     bf16_max(linf_code, NORM_FLOOR_CODE),
@@ -966,26 +959,29 @@ impl SideWitness {
             "alpha must be positive normal (S1)"
         );
         assert!(!beta.sign, "beta is nonnegative");
-        // The liveness bound in bf16-code space. A code past the largest finite abs code
+        // The liveness bound in bf16-code space (`liveness_code_shift` multiplies the
+        // floored-L2 code by `tau_idle * delta`, device-dependent). A code past the
+        // largest finite abs code
         // (possible when `E*(l2f) >= 253`) marks every entry alive, matching the plaintext:
         // every finite `|X|` is below `4*l2f` there. Dead groups take the floored-zero bound;
         // their flags vanish anyway (X = 0) and C1 pins them to zero.
-        let dead_bound = u64::from(bf16_max(l2_code, NORM_FLOOR_CODE)) + 256;
+        let dead_bound = u64::from(bf16_max(l2_code, NORM_FLOOR_CODE)) + program.device.liveness_code_shift();
         // The group's noise-std encoding and normalized significand (jackpot check 4). With
-        // `l2f` the floored L2 norm, `sigma = DELTA * alpha * l2f` is the exact product
-        // `M(alpha)*M(l2f) * 2^(E(alpha) + E(l2f) - 269)`, and the significand product spans
+        // `l2f` the floored L2 norm, `sigma = delta(device) * alpha * l2f` is exact, and the
+        // significand product spans
         // [2^14, 2^16) (both factors are normal), so with `wide = [product >= 2^15]`:
-        // `enc(sigma) = e(sigma) + 268 = E(alpha) + E(l2f) + wide + 13` and
-        // `sigma_norm = product * 2^(1 - wide)` lands in [2^15, 2^16).
+        // `enc(sigma) = e(sigma) + 268 = E(alpha) + E(l2f) + wide + offset(device)` and
+        // `sigma_norm = product * 2^(1 - wide)` lands in [2^15, 2^16), where
+        // `offset(device)` is `sigma_encoding_offset` (13 on B200, 14 on H100).
         let (sigma_enc, sigma_norm) = if live {
             let l2f = Bf16Fields::from_code(bf16_max(l2_code, NORM_FLOOR_CODE));
             let product = (128 + alpha.mantissa) * l2f.m();
             let wide = u64::from(product >= 1 << 15);
-            let enc = alpha.exp + l2f.exp + wide + 13;
+            let enc = alpha.exp + l2f.exp + wide + program.device.sigma_encoding_offset();
             debug_assert_eq!(
                 enc as i64 - 268,
                 {
-                    let sigma = DELTA * f64::from(bf16_to_f32(alpha_code)) * f64::from(bf16_to_f32(l2f.code()));
+                    let sigma = program.device.delta() * f64::from(bf16_to_f32(alpha_code)) * f64::from(bf16_to_f32(l2f.code()));
                     ((sigma.to_bits() >> 52) & 0x7FF) as i64 - 1023
                 },
                 "sigma encoding diverged from the exact exponent"
@@ -1039,7 +1035,7 @@ impl SideWitness {
             debug_assert_eq!(
                 is_dead,
                 f64::from(bf16_to_f32(x.code()).abs())
-                    >= 8.0 * DELTA * f64::from(bf16_to_f32(bf16_max(l2_code, NORM_FLOOR_CODE))),
+                    >= 8.0 * program.device.delta() * f64::from(bf16_to_f32(bf16_max(l2_code, NORM_FLOOR_CODE))),
                 "liveness flag diverged from the plaintext dead predicate"
             );
             dead_count += u64::from(is_dead);
@@ -1975,7 +1971,7 @@ where
     eval.constraint(c);
 
     // ---- Group V — the element's summand score LAMBDA (jackpot check 4), exported to
-    // MatmulB200Stark's per-lane skip certificates by the operand-code channel. Encodings write
+    // Matmul's per-lane skip certificates by the operand-code channel. Encodings write
     // `enc(v) = e(v) + 268` with `e(v) = floor(log2 v)`, and 0 encodes a zero value. Both
     // addends are written over 16-bit normalized significands,
     // `|alpha*X| = X_NORM * 2^(X_ENC - 268 - 15)` and `sigma = SIGMA_NORM * 2^(SIGMA_ENC - 268 - 15)`,
@@ -2213,6 +2209,7 @@ mod tests {
     use super::super::ctl::input_quant_lut_lookups;
     use super::*;
     use crate::api::fp8::prequant::open_prequant;
+    use crate::api::fp8::public_params::PublicParams;
     use crate::circuit::fp8::ctl::{LutLookup, LutTable};
     use crate::circuit::fp8::unpredictability::log2_fixed;
 
@@ -2229,6 +2226,7 @@ mod tests {
             k: 64,
             block_size: BLOCK_SIZE,
             r: 16,
+            device: Device::B200,
         }
     }
 
@@ -2372,6 +2370,31 @@ mod tests {
                 assert_eq!(acc, F::ZERO, "constraints do not vanish on row {i}");
             }
         }
+
+        // The lower protocol boundary reaches Wl2 = 17, one bit wider than the old
+        // envelope. Exercise it in this existing honest-trace test.
+        for device in [Device::H100, Device::B200] {
+            let program = InputQuantProgram {
+                h: 1,
+                w: 1,
+                k: PublicParams::MIN_K,
+                block_size: BLOCK_SIZE,
+                r: 32,
+                device,
+            };
+            assert_eq!(program.wl2(), 17);
+            let inp = test_inputs(&program);
+            let (rows, pis) = program.generate_trace::<F>(
+                &inp.a_int8,
+                &inp.a_scales,
+                &inp.a_noise,
+                &inp.b_int8,
+                &inp.b_scales,
+                &inp.b_noise,
+            );
+            assert_eq!(pis[WL2_POW_PUBLIC_INPUT].to_canonical_u64(), 1 << 17);
+            assert!(constraints_vanish(&S::new(program), &rows, &pis));
+        }
     }
 
     #[test]
@@ -2387,6 +2410,7 @@ mod tests {
             k: 96,
             block_size: BLOCK_SIZE,
             r: 16,
+            device: Device::B200,
         };
         let inp = test_inputs(&program);
         let (rows, pis) = program.generate_trace::<F>(
@@ -2453,14 +2477,17 @@ mod tests {
         // that).
         let l2f = |opened: &[u16], g: usize| {
             bf16_max(
-                Fp8E4M3Quant.row_norms(&opened[g * k..(g + 1) * k]).unwrap().0,
+                Fp8E4M3Quant::new(program.device)
+                    .row_norms(&opened[g * k..(g + 1) * k])
+                    .unwrap()
+                    .0,
                 NORM_FLOOR_CODE,
             )
         };
         // The plaintext dead bound and predicate, exactly as `JackpotPolicy::liveness_ok`
         // (`tau_idle = 8`, `dead iff |X| >= tau_idle * DELTA * l2f`, all in f64).
         let native_dead = |opened: &[u16], g: usize, x_code: u16| {
-            f64::from(bf16_to_f32(x_code).abs()) >= 8.0 * DELTA * f64::from(bf16_to_f32(l2f(opened, g)))
+            f64::from(bf16_to_f32(x_code).abs()) >= 8.0 * program.device.delta() * f64::from(bf16_to_f32(l2f(opened, g)))
         };
 
         for (r, row) in rows.iter().enumerate() {
@@ -2481,12 +2508,12 @@ mod tests {
                     to_u64(v.code_noised_b)
                 } as u8;
                 assert_eq!(got_noised, expected_noised, "row {r}: noised fp8 code differs from native");
-                // Liveness: the committed bound is code(l2f) + 256 and the flag matches the
-                // plaintext f64 predicate.
+                // Liveness: the committed bound uses the device code shift and the flag
+                // matches the plaintext f64 predicate.
                 assert_eq!(
                     to_u64(side.dead_bound),
-                    u64::from(l2f(opened, g)) + 256,
-                    "row {r}: dead bound differs from code(l2f) + 256"
+                    u64::from(l2f(opened, g)) + program.device.liveness_code_shift(),
+                    "row {r}: dead bound differs from the device liveness threshold"
                 );
                 assert_eq!(
                     to_u64(side.is_dead),
@@ -2545,8 +2572,9 @@ mod tests {
                     INPUT_QUANT_COL_MAP.dead_bound_b,
                 ),
             ] {
-                let (l2, linf) = Fp8E4M3Quant.row_norms(&opened[g * k..(g + 1) * k]).unwrap();
-                let (alpha, beta) = Fp8E4M3Quant
+                let quant = Fp8E4M3Quant::new(program.device);
+                let (l2, linf) = quant.row_norms(&opened[g * k..(g + 1) * k]).unwrap();
+                let (alpha, beta) = quant
                     .derive_row_scales(bf16_max(l2, NORM_FLOOR_CODE), bf16_max(linf, NORM_FLOOR_CODE), program.r)
                     .unwrap();
                 let row = &rows[g * k];
@@ -2556,7 +2584,7 @@ mod tests {
                 assert_eq!(got_beta, beta, "group {g}: beta differs from the native derivation");
                 assert_eq!(
                     to_u64(row[bound_col]),
-                    u64::from(bf16_max(l2, NORM_FLOOR_CODE)) + 256,
+                    u64::from(bf16_max(l2, NORM_FLOOR_CODE)) + program.device.liveness_code_shift(),
                     "group {g}: dead bound differs from the native floored L2"
                 );
             }
@@ -2587,7 +2615,7 @@ mod tests {
 
         let v: &InputQuantColumnsView<F> = rows[k - 1].borrow();
         assert_eq!(v.max_abs_a, F::ZERO, "test premise: the A group decodes to all zeros");
-        let (alpha, beta) = Fp8E4M3Quant
+        let (alpha, beta) = Fp8E4M3Quant::new(program.device)
             .derive_row_scales(NORM_FLOOR_CODE, NORM_FLOOR_CODE, program.r)
             .expect("native scales on the floor");
         let got = |exp: F, man: F| (to_u64(exp) << 7 | to_u64(man)) as u16;

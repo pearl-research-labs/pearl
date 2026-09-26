@@ -30,14 +30,35 @@
 //!
 //! X3 starts each public-layout lane at state zero, carries `fold_out` into the next live row,
 //! and resets at `is_lane_final`. Live rows receive
-//! `(cell_id, cell_result_f32_lo, cell_result_f32_hi)` from MatmulB200Stark. Each lane-final row
+//! `(cell_id, cell_result_f32_lo, cell_result_f32_hi, cell_skips)` from the selected
+//! device-specific Matmul table. Each lane-final row
 //! sends `(lane_id, fold_out)` to Blake3Stark as one jackpot message word.
 //!
 //! The verifier recomputes `cell_id`, `lane_id`, `is_lane_final`, and `is_pad` from the public
-//! lane assignment and checks their openings. Padding rows set `is_pad = 1`, zero all data
-//! columns, and participate in neither cross-table lookup.
+//! lane assignment and checks their openings. Padding rows set `is_pad = 1`, contribute no
+//! cell subtotal, carry the final running skip count, and participate in neither cross-table
+//! lookup.
+//!
+//! # Global unpredictability census
+//!
+//! For each output cell, Matmul classifies all `k` summands against the device's M/Z
+//! unpredictability threshold and exports their subtotal as `cell_skips` through the
+//! cell-results CTL. X4 computes the inclusive sum of those subtotals in XorFold trace order.
+//! Because the lane assignment contains every output cell exactly once, the last row's
+//! `running_skips` is the tile-wide count.
+//!
+//! The sole public input is the verifier-derived allowance `skip_limit = floor(k*h*w/20)`.
+//! On the final trace row, X4 enforces
+//!
+//! ```text
+//! skip_limit - running_skips = skip_gate_slack_lo + 2^16*skip_gate_slack_hi.
+//! ```
+//!
+//! RC16 lookups bound both slack limbs, turning that field equality into the integer
+//! inequality `running_skips <= skip_limit`. Padding rows keep the final running count
+//! unchanged so the same terminal gate works whether or not `h*w` is a power of two.
 
-use core::borrow::Borrow;
+use core::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
 
 use plonky2::field::extension::{Extendable, FieldExtension};
@@ -50,7 +71,7 @@ use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsume
 use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
-use super::columns::{NUM_XOR_FOLD_COLUMNS, NUM_XOR_FOLD_PUBLIC_INPUTS, XorFoldColumnsView};
+use super::columns::{NUM_XOR_FOLD_COLUMNS, NUM_XOR_FOLD_PUBLIC_INPUTS, SKIP_LIMIT_PUBLIC_INPUT, XorFoldColumnsView};
 use crate::api::layout::JACKPOT_ENTRIES as XOR_FOLD_LANES;
 use crate::circuit::utils::evaluator::Evaluator;
 use crate::circuit::utils::native_evaluator::NativeEvaluator;
@@ -64,6 +85,8 @@ const GOLDEN: u64 = 0x9E3779B1;
 #[derive(Clone, Debug)]
 pub struct XorFoldProgram {
     pub lanes: Vec<Vec<usize>>,
+    /// Exact consolidated-policy allowance `floor(k*h*w/20)`.
+    pub skip_limit: u64,
 }
 
 impl XorFoldProgram {
@@ -78,13 +101,15 @@ impl XorFoldProgram {
         self.live_rows().next_power_of_two()
     }
 
-    /// `cell_words[c]` = cell `c`'s f32 bit pattern (what Matmul's `IS_CELL_FINAL` rows expose
-    /// as `CELL_RESULT_F32_LO/HI`).
+    /// `cell_words[c]` is cell `c`'s f32 bit pattern and `cell_skips[c]` is its certified
+    /// summand-skip subtotal. Matmul exposes both on its `IS_CELL_FINAL` row.
     pub fn generate_trace<F: RichField>(
         &self,
         cell_words: &[u32],
+        cell_skips: &[u64],
     ) -> (Vec<[F; NUM_XOR_FOLD_COLUMNS]>, [F; NUM_XOR_FOLD_PUBLIC_INPUTS]) {
         assert_eq!(self.lanes.len(), XOR_FOLD_LANES, "the lottery block has 16 lanes");
+        assert_eq!(cell_skips.len(), cell_words.len(), "one skip count per folded cell");
         // Each cell folded exactly once; no lane empty (an empty lane has no IS_LANE_FINAL row
         // and the Blake3 lottery channel cannot balance).
         let mut seen = vec![false; cell_words.len()];
@@ -96,12 +121,14 @@ impl XorFoldProgram {
         }
         assert!(seen.iter().all(|&s| s), "not every cell is folded");
 
-        let mut rows = Vec::with_capacity(self.num_rows());
+        let mut rows: Vec<[F; NUM_XOR_FOLD_COLUMNS]> = Vec::with_capacity(self.num_rows());
+        let mut running_skips = 0u64;
         for (j, lane) in self.lanes.iter().enumerate() {
             let mut state = 0u32;
             for (step, &cell) in lane.iter().enumerate() {
                 // The leading four columns are class (a) — keep in sync with known_values.
                 let w = cell_words[cell];
+                running_skips += cell_skips[cell];
                 let t = state as u64 * GOLDEN + w as u64; // < 2^63.5: exact in the field too
                 let (lo, hi) = (t as u32, (t >> 32) as u32);
                 debug_assert!(hi >> 16 <= 0x9E38, "honest top limb under the 0xFFFE cap");
@@ -112,6 +139,10 @@ impl XorFoldProgram {
                     is_pad: F::ZERO,
                     cell_result_f32_lo: F::from_canonical_u32(w & 0xFFFF),
                     cell_result_f32_hi: F::from_canonical_u32(w >> 16),
+                    cell_skips: F::from_canonical_u64(cell_skips[cell]),
+                    running_skips: F::from_canonical_u64(running_skips),
+                    skip_gate_slack_lo: F::ZERO,
+                    skip_gate_slack_hi: F::ZERO,
                     fold_state_in: F::from_canonical_u32(state),
                     muladd_low_limb_0: F::from_canonical_u32(lo & 0xFFFF),
                     muladd_low_limb_1: F::from_canonical_u32(lo >> 16),
@@ -125,14 +156,24 @@ impl XorFoldProgram {
                 state = lo.rotate_left(13);
             }
         }
-        // Pad to the next power of two with all-zero IS_PAD rows: X1-X3 hold on zeros (the
-        // last live row is lane-final, so the pad chain starts and stays at state 0).
+        // Pad to the next power of two: mixer and cell-subtotal columns are zero, while
+        // RUNNING_SKIPS carries the final count to the last-row budget gate. X1-X3 hold on
+        // zeros (the last live row is lane-final, so the pad chain starts and stays at state 0).
+        assert!(
+            running_skips <= self.skip_limit,
+            "policy-rejected witness: skippable summands exceed the census budget"
+        );
         let pad_row = XorFoldColumnsView::<F> {
             is_pad: F::ONE,
+            running_skips: F::from_canonical_u64(running_skips),
             ..XorFoldColumnsView::default()
         };
         rows.resize(self.num_rows(), pad_row.into());
-        (rows, [])
+        let slack = self.skip_limit - running_skips;
+        let last: &mut XorFoldColumnsView<F> = rows.last_mut().expect("at least one row").borrow_mut();
+        last.skip_gate_slack_lo = F::from_canonical_u64(slack & 0xFFFF);
+        last.skip_gate_slack_hi = F::from_canonical_u64(slack >> 16);
+        (rows, [F::from_canonical_u64(self.skip_limit)])
     }
 
     /// The class (a) ("known") column values — the leading
@@ -165,8 +206,8 @@ impl XorFoldProgram {
     }
 }
 
-/// Evaluates the X1-X3 constraint groups (module docs). The 10 RC16 facts (limbs, split
-/// bounds, the `MULADD_HIGH_LIMB_1` canonicity cap) live in
+/// Evaluates the X1-X4 constraint groups (module docs). The 12 RC16 facts (limbs, split
+/// bounds, the `MULADD_HIGH_LIMB_1` canonicity cap, and budget-slack limbs) live in
 /// `super::ctl::xor_fold_lut_lookups`.
 pub(crate) fn eval_xor_fold_constraints<V, S, E>(
     vars: &StarkFrame<V, S, NUM_XOR_FOLD_COLUMNS, NUM_XOR_FOLD_PUBLIC_INPUTS>,
@@ -224,6 +265,25 @@ pub(crate) fn eval_xor_fold_constraints<V, S, E>(
     let chain_diff = eval.sub(nv.fold_state_in, fold_out);
     let chain = eval.mul(not_final, chain_diff);
     eval.constraint(chain);
+
+    // X4 — tile-wide unpredictability census. The cell-results CTL binds CELL_SKIPS on every
+    // live row to Matmul's per-cell subtotal. IS_PAD rows contribute zero, and the recurrence
+    // carries the inclusive sum to the final row.
+    let pad_skips = eval.mul(lv.is_pad, lv.cell_skips);
+    eval.constraint(pad_skips);
+    let first_running = eval.sub(lv.running_skips, lv.cell_skips);
+    eval.constraint_first_row(first_running);
+    let running_step = eval.sub(nv.running_skips, lv.running_skips);
+    let running_step = eval.sub(running_step, nv.cell_skips);
+    eval.constraint_transition(running_step);
+
+    // The verifier derives SKIP_LIMIT = floor(k*h*w/20). RC16 bounds both slack limbs, so
+    // this final-row field equality proves the corresponding integer inequality.
+    let skip_limit = eval.scalar(vars.get_public_inputs()[SKIP_LIMIT_PUBLIC_INPUT]);
+    let slack = eval.mad(lv.skip_gate_slack_hi, two16, lv.skip_gate_slack_lo);
+    let budget = eval.sub(skip_limit, lv.running_skips);
+    let budget = eval.sub(budget, slack);
+    eval.constraint_last_row(budget);
 }
 
 /// XorFoldStark. A CTL party of the fp8 batch (`requires_ctls()`): its proofs carry the
@@ -306,8 +366,8 @@ mod tests {
     use super::*;
     use crate::api::fp8::utils::xor_fold_extract;
     use crate::api::layout::{AxisPattern, DimType, lane_assignment};
+    use crate::circuit::fp8::matmul_b200_stark::MatmulStarkB200;
     use crate::circuit::fp8::matmul_b200_stark::columns::MATMUL_B200_COL_MAP;
-    use crate::circuit::fp8::matmul_b200_stark::stark::{MatmulProgram, generate_b200_trace};
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -327,21 +387,31 @@ mod tests {
         (tile, lane_assignment(&axis, &axis))
     }
 
-    fn test_trace() -> (XorFoldProgram, Vec<[F; NUM_XOR_FOLD_COLUMNS]>, [F; 0]) {
+    fn test_trace() -> (
+        XorFoldProgram,
+        Vec<[F; NUM_XOR_FOLD_COLUMNS]>,
+        [F; NUM_XOR_FOLD_PUBLIC_INPUTS],
+    ) {
         let (tile, lanes) = test_layout();
-        let program = XorFoldProgram { lanes };
+        let skips = vec![1u64; tile.len()];
+        let program = XorFoldProgram {
+            lanes,
+            skip_limit: skips.iter().sum(),
+        };
         let words: Vec<u32> = tile.iter().map(|x| x.to_bits()).collect();
-        let (rows, pis) = program.generate_trace::<F>(&words);
+        let (rows, pis) = program.generate_trace::<F>(&words, &skips);
         (program, rows, pis)
     }
 
-    fn constraints_violated(stark: &S, rows: &[[F; NUM_XOR_FOLD_COLUMNS]], pis: &[F; 0]) -> bool {
+    fn constraints_violated(stark: &S, rows: &[[F; NUM_XOR_FOLD_COLUMNS]], pis: &[F; NUM_XOR_FOLD_PUBLIC_INPUTS]) -> bool {
         let n = rows.len();
         (0..n).any(|i| {
             let frame = StarkFrame::from_values(&rows[i], &rows[(i + 1) % n], pis);
             let mut consumer = ConstraintConsumer::new(
                 vec![F::from_canonical_u64(2), F::from_canonical_u64(0x876543210)],
-                F::ONE,
+                // `constraint_transition` is active on every row except the last. Plain
+                // constraints remain cyclic and still inspect the last -> first frame.
+                F::from_bool(i != n - 1),
                 F::from_bool(i == 0),
                 F::from_bool(i == n - 1),
             );
@@ -350,10 +420,21 @@ mod tests {
         })
     }
 
+    fn lut_keys_are_in_domain(rows: &[[F; NUM_XOR_FOLD_COLUMNS]]) -> bool {
+        let polys = trace_rows_to_poly_values(rows.to_vec());
+        xor_fold_lut_lookups::<F>()
+            .iter()
+            .all(|lookup| (0..rows.len()).all(|r| lookup.keys[0].eval_table(&polys, r, &[]).to_canonical_u64() < 1 << 16))
+    }
+
     #[test]
     fn honest_trace_satisfies_all_constraints() {
-        // Includes the last -> first wrap, which the AIR uses as row 0's reset instance.
+        // Plain X3 constraints inspect the last -> first wrap as row 0's reset instance; X4's
+        // running-sum transition correctly stops at the last row.
         let (program, rows, pis) = test_trace();
+        let last: &XorFoldColumnsView<F> = rows.last().unwrap().borrow();
+        assert_eq!(last.skip_gate_slack_lo, F::ZERO);
+        assert_eq!(last.skip_gate_slack_hi, F::ZERO);
         assert!(!constraints_violated(&S::new(program), &rows, &pis));
     }
 
@@ -364,9 +445,10 @@ mod tests {
         // anchor and the padded last-row anchor.
         let program = XorFoldProgram {
             lanes: (0..16).map(|j| vec![3 * j, 3 * j + 1, 3 * j + 2]).collect(),
+            skip_limit: 48,
         };
         let words: Vec<u32> = (0..48u32).map(|i| f32::to_bits(i as f32 - 20.5)).collect();
-        let (rows, pis) = program.generate_trace::<F>(&words);
+        let (rows, pis) = program.generate_trace::<F>(&words, &vec![1; words.len()]);
         assert_eq!(rows.len(), 64, "48 live rows pad to 64");
         let known = program.known_values::<F>();
         assert!(known.iter().all(|c| c.len() == 64));
@@ -376,7 +458,70 @@ mod tests {
                 assert_eq!(col.values[r], row[c], "known column {c} row {r}");
             }
         }
+        for row in &rows[48..] {
+            let v: &XorFoldColumnsView<F> = row.borrow();
+            assert_eq!(v.cell_skips, F::ZERO, "padding must not add skips");
+            assert_eq!(
+                v.running_skips,
+                F::from_canonical_u64(48),
+                "padding must carry the final total"
+            );
+        }
         assert!(!constraints_violated(&S::new(program), &rows, &pis));
+    }
+
+    #[test]
+    fn census_gate_accepts_two_limb_slack() {
+        let (tile, lanes) = test_layout();
+        let skips = vec![1u64; tile.len()];
+        let total: u64 = skips.iter().sum();
+        let slack = (1 << 16) + 2;
+        let program = XorFoldProgram {
+            lanes,
+            skip_limit: total + slack,
+        };
+        let words: Vec<u32> = tile.iter().map(|x| x.to_bits()).collect();
+        let (rows, pis) = program.generate_trace::<F>(&words, &skips);
+        let last: &XorFoldColumnsView<F> = rows.last().unwrap().borrow();
+        assert_eq!(last.running_skips, F::from_canonical_u64(total));
+        assert_eq!(last.skip_gate_slack_lo, F::from_canonical_u64(2));
+        assert_eq!(last.skip_gate_slack_hi, F::ONE);
+        assert!(!constraints_violated(&S::new(program), &rows, &pis));
+        assert!(lut_keys_are_in_domain(&rows));
+    }
+
+    #[test]
+    fn census_gate_rejects_bad_limit_running_sum_and_slack() {
+        let (program, rows, pis) = test_trace();
+        let stark = S::new(program);
+
+        let mut too_small = pis;
+        too_small[SKIP_LIMIT_PUBLIC_INPUT] -= F::ONE;
+        assert!(constraints_violated(&stark, &rows, &too_small), "lowered public limit passed");
+
+        let mut bad_running = rows.clone();
+        bad_running[1][XOR_FOLD_COL_MAP.running_skips] += F::ONE;
+        assert!(
+            constraints_violated(&stark, &bad_running, &pis),
+            "tampered running sum passed"
+        );
+
+        let mut bad_slack = rows.clone();
+        bad_slack.last_mut().unwrap()[XOR_FOLD_COL_MAP.skip_gate_slack_lo] += F::ONE;
+        assert!(constraints_violated(&stark, &bad_slack, &pis), "tampered budget slack passed");
+
+        // A field element of -1 can satisfy the final equality for the lowered limit, but it
+        // is not a 16-bit nonnegative integer and the RC16 lookup rejects it.
+        let mut wrapped_slack = rows.clone();
+        wrapped_slack.last_mut().unwrap()[XOR_FOLD_COL_MAP.skip_gate_slack_lo] = -F::ONE;
+        assert!(
+            !constraints_violated(&stark, &wrapped_slack, &too_small),
+            "the polynomial equality alone should admit the wrapped slack"
+        );
+        assert!(
+            !lut_keys_are_in_domain(&wrapped_slack),
+            "RC16 must reject a field-wrapped negative slack"
+        );
     }
 
     #[test]
@@ -407,7 +552,7 @@ mod tests {
         // The cell-results channel end to end: Matmul's looked tuples (CELL_ID, LO, HI on
         // IS_CELL_FINAL rows) must equal XorFold's looking tuples (every row) as multisets when
         // XorFold folds exactly Matmul's outputs.
-        let matmul = MatmulProgram { h: 4, w: 4, k: 128 };
+        let matmul = MatmulStarkB200::<F, D>::new(4, 4, 128);
         // Same code recipe as the Matmul tests: pool codes with a zero sprinkled in.
         const POOL: [u8; 8] = [0x38, 0x40, 0xB9, 0x3A, 0xC1, 0x3B, 0xBA, 0x42];
         let codes = |len: usize, salt: u64, zero_every: usize| -> Vec<u8> {
@@ -424,11 +569,11 @@ mod tests {
         let a = codes(matmul.h * matmul.k, 0x9E3779B97F4A7C15, 8);
         let b = codes(matmul.w * matmul.k, 0xC2B2AE3D27D4EB4F, 11);
         let lambdas = vec![300u64; matmul.h * matmul.k];
-        let (matmul_rows, _) = generate_b200_trace::<F>(&matmul, &a, &b, &lambdas, &lambdas);
+        let (matmul_rows, _) = matmul.generate_trace(&a, &b, &lambdas, &lambdas);
 
         // The looked filter is IS_CELL_FINAL * (1 - IS_PADDING): the phantom padding cells'
         // finals emit no word.
-        let mut looked: Vec<(u64, u64, u64)> = matmul_rows
+        let mut looked: Vec<(u64, u64, u64, u64)> = matmul_rows
             .iter()
             .filter(|row| row[MATMUL_B200_COL_MAP.is_cell_final] == F::ONE && row[MATMUL_B200_COL_MAP.is_padding] == F::ZERO)
             .map(|row| {
@@ -436,22 +581,26 @@ mod tests {
                     to_u64(row[MATMUL_B200_COL_MAP.cell_id]),
                     to_u64(row[MATMUL_B200_COL_MAP.cell_result_f32_lo]),
                     to_u64(row[MATMUL_B200_COL_MAP.cell_result_f32_hi]),
+                    to_u64(row[MATMUL_B200_COL_MAP.cell_skips]),
                 )
             })
             .collect();
 
         // Fold those 16 cells, one per lane (16 = h*w keeps every lane nonempty).
         let mut words = vec![0u32; 16];
-        for &(cell, lo, hi) in &looked {
+        let mut skips = vec![0u64; 16];
+        for &(cell, lo, hi, cell_skips) in &looked {
             words[cell as usize] = (lo | (hi << 16)) as u32;
+            skips[cell as usize] = cell_skips;
         }
         let program = XorFoldProgram {
             lanes: (0..16).map(|j| vec![j]).collect(),
+            skip_limit: skips.iter().sum(),
         };
-        let (rows, pis) = program.generate_trace::<F>(&words);
+        let (rows, pis) = program.generate_trace::<F>(&words, &skips);
         assert!(!constraints_violated(&S::new(program), &rows, &pis));
 
-        let mut looking: Vec<(u64, u64, u64)> = rows
+        let mut looking: Vec<(u64, u64, u64, u64)> = rows
             .iter()
             .filter(|row| {
                 let v: &XorFoldColumnsView<F> = (*row).borrow();
@@ -459,7 +608,12 @@ mod tests {
             })
             .map(|row| {
                 let v: &XorFoldColumnsView<F> = row.borrow();
-                (to_u64(v.cell_id), to_u64(v.cell_result_f32_lo), to_u64(v.cell_result_f32_hi))
+                (
+                    to_u64(v.cell_id),
+                    to_u64(v.cell_result_f32_lo),
+                    to_u64(v.cell_result_f32_hi),
+                    to_u64(v.cell_skips),
+                )
             })
             .collect();
         looked.sort_unstable();
@@ -470,13 +624,7 @@ mod tests {
     #[test]
     fn lut_inventory_holds_on_honest_trace_and_catches_the_alias() {
         let (_, rows, _) = test_trace();
-        let polys = trace_rows_to_poly_values(rows.clone());
-        let in_domain = |polys: &[plonky2::field::polynomial::PolynomialValues<F>]| {
-            xor_fold_lut_lookups::<F>()
-                .iter()
-                .all(|l| (0..rows.len()).all(|r| l.keys[0].eval_table(polys, r, &[]).to_canonical_u64() < 1 << 16))
-        };
-        assert!(in_domain(&polys), "honest trace has an out-of-range RC16 key");
+        assert!(lut_keys_are_in_domain(&rows), "honest trace has an out-of-range RC16 key");
 
         // The `+p` limb alias: at a lane start (state 0, t = W < 2^32) rewrite the limbs as
         // t + p = (t + 1) + 0xFFFFFFFF*2^32 and re-split consistently. X1/X2 still vanish in the
@@ -521,7 +669,7 @@ mod tests {
             "the alias must satisfy X1-X3 — it is the RC16 cap's job"
         );
         assert!(
-            !in_domain(&trace_rows_to_poly_values(forged)),
+            !lut_keys_are_in_domain(&forged),
             "the RC16(MULADD_HIGH_LIMB_1 + 1) cap must catch the +p alias"
         );
     }

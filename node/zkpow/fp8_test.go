@@ -34,9 +34,13 @@ import (
 //	    src/api/fp8/fp8_cache.bin
 //	task build:zk-gobind && go clean -cache
 func loadFP8Fixture(t *testing.T) (*wire.BlockHeader, *wire.CertificateV4) {
+	return loadFP8FixtureForDevice(t, "b200")
+}
+
+func loadFP8FixtureForDevice(t *testing.T, device string) (*wire.BlockHeader, *wire.CertificateV4) {
 	t.Helper()
 
-	raw, err := os.ReadFile("testdata/fp8_zk_proof_b200.bin")
+	raw, err := os.ReadFile("testdata/fp8_zk_proof_" + device + ".bin")
 	require.NoError(t, err, "reading the fp8 fixture")
 	require.Greater(t, len(raw), 80, "fixture too short for header and length prefix")
 
@@ -58,9 +62,13 @@ func loadFP8Fixture(t *testing.T) (*wire.BlockHeader, *wire.CertificateV4) {
 }
 
 func TestVerifyCertificateV4(t *testing.T) {
-	header, cert := loadFP8Fixture(t)
+	for _, device := range []string{"h100", "b200"} {
+		t.Run(device, func(t *testing.T) {
+			header, cert := loadFP8FixtureForDevice(t, device)
 
-	require.NoError(t, VerifyCertificate(header, cert), "the mined fp8 certificate should verify")
+			require.NoError(t, VerifyCertificate(header, cert), "the mined fp8 certificate should verify")
+		})
+	}
 }
 
 func TestVerifyCertificateV4DisconnectedAncestor(t *testing.T) {
