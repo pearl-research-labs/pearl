@@ -834,8 +834,6 @@ mod tests {
 
     mod proof_pipeline_tests;
 
-    mod profiling;
-
     #[test]
     fn compile_jackpot_key_is_labelled_subkey_for_dense_and_moe() {
         use crate::api::fp8::transcript::{LABEL_JACKPOT, subkey};
