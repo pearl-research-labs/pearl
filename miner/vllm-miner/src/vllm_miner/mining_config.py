@@ -11,7 +11,6 @@ from miner_base.mining_config import (
     default_mining_config,
     tall_tile_mining_config,
 )
-from miner_base.policy import effective_work
 from miner_base.prequant import DEFAULT_BLOCK_SIZE
 from pearl_gateway.comm.dataclasses import MiningJob
 
@@ -68,7 +67,7 @@ class LotteryTileSpec:
 
 
 # Committed lottery tiles. Difficulty is area-normalized, not tile-invariant:
-# each message's win chance scales with ``effective_work`` (== rows*cols*(k - k%r)), so
+# each message's win chance scales with its tile's work (``rows*cols*k``), so
 # the 4x64 tile (256-element area) halves the per-message threshold while
 # doubling the message count -- total win rate and credited work (m*n*k) are
 # identical across tiles. The tiles differ in:
@@ -198,8 +197,13 @@ def commitment_keys_for(job: MiningJob) -> tuple[bytes, bytes]:
     return commitment_keys(bytes(job.incomplete_header_bytes))
 
 
+def _tile_work(tile: LotteryTileSpec, k: int) -> int:
+    """``rows * cols * k``: one lottery message's work, the difficulty scale."""
+    return tile.rows * tile.cols * k
+
+
 def lottery_threshold(target: int, k: int, n: int | None = None) -> int:
-    """``min(target * effective_work(tile), 2^256-1)`` for the committed tile.
+    """``min(target * rows*cols*k, 2^256-1)`` for the committed tile.
 
     Area-aware: each message's win chance scales with the committed tile's
     ``rows*cols*k``, so the 256-element 4x64 tile halves the per-message
@@ -211,7 +215,7 @@ def lottery_threshold(target: int, k: int, n: int | None = None) -> int:
     back-compat 4x128 commitment.
     """
     tile = (select_tile(n, k) if n is not None else DEFAULT_TILE) or DEFAULT_TILE
-    return min(target * effective_work(tile.rows, tile.cols, k, RANK), _MAX_256)
+    return min(target * _tile_work(tile, k), _MAX_256)
 
 
 def lottery_hashes_per_matmul(m: int, n: int, tile: LotteryTileSpec = DEFAULT_TILE) -> int:
@@ -240,9 +244,7 @@ def effective_work_per_matmul(m: int, n: int, k: int) -> int:
     """Difficulty-normalized credited work for one launch.
 
     Raw ``lottery_hashes_per_matmul`` counts messages ((m/rows)*(n/cols)); each
-    message's win chance is ``target * effective_work(k) / 2^256`` with
-    ``effective_work = rows*cols*(k - k % r)`` (v4 floors ``k`` to the rank
-    multiple; ``k % 512 == 0`` here so it is ``rows*cols*k``). Weighting
+    message's win chance is ``target * rows*cols*k / 2^256``. Weighting
     messages by that work collapses to ``m*n*k`` (tiling-invariant) and is
     what actually predicts wins (``E[wins] = target * m*n*k / 2^256``). Use this for a difficulty-normalized
     hashrate; the raw message count is not comparable across shapes/k.
@@ -266,7 +268,7 @@ def effective_work_per_matmul(m: int, n: int, k: int) -> int:
         raise ValueError(
             f"({n}, {k}) is not mineable by any committed tile; refusing to credit work"
         )
-    return lottery_hashes_per_matmul(m, n, tile) * effective_work(tile.rows, tile.cols, k, RANK)
+    return lottery_hashes_per_matmul(m, n, tile) * _tile_work(tile, k)
 
 
 def threshold_bytes_for(job: MiningJob, k: int, n: int | None = None) -> bytes:

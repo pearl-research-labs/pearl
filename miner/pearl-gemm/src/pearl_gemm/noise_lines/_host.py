@@ -17,8 +17,8 @@ from ..noisy_quant._quantization_ops import (
 from ..protocol_constants import R
 from ._kernel import _NoiseLines
 
-# The four v4 noise-line address prefixes ``side | factor`` (zk-pow
-# ``noise.rs``): E1/F1 are A's row lines and shared basis, E2/F2 are B's.
+# The four v4 noise-line address prefixes ``side | factor``: E1/F1 are A's
+# row lines and shared basis (``E_A``, ``F_A``), E2/F2 are B's (``E_B``, ``F_B``).
 LABEL_E1 = _L_E1
 LABEL_E2 = _L_E2
 LABEL_F1 = _L_F1
@@ -40,8 +40,7 @@ def noise_lines(
     ``Subkey("noise-line", noise seedX)``), single 64-byte block message
     ``label || u32(index)`` zero-padded where ``label`` is the ``side |
     factor`` address prefix, digest length R, sign/magnitude decode, exact
-    isqrt L2 normalization to 256, e4m3 rounding
-    (zk-pow ``noise.rs::sample_line``).
+    isqrt L2 normalization to 256, e4m3 rounding.
 
     For the F basis: draw ``k`` lines under ``LABEL_F1`` / ``LABEL_F2``
     with B's noise-line key (both F bases are keyed by seedB; ``LABEL_F1``

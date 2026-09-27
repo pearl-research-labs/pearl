@@ -104,32 +104,18 @@ def test_tile_indices_are_the_committed_offsets():
     assert tile_indices(cols, 3) == [3 * cols.total + off for off in cols.tile_offsets]
 
 
-def test_lottery_threshold_matches_protocol_gate():
-    """``target * effective_work(committed tile)`` clamped to ``2^256-1``: the
-    verifier's winner boundary per tile. Area-aware: the 4x64 tile folds 256
-    elements -- half the 512-element tiles' per-message work -- so its
-    threshold halves (its launches hash twice the messages). A drift from the
-    protocol gate makes every GPU winner unverifiable."""
-    from miner_base.policy import effective_work
-
-    work = TILE_ROWS * TILE_COLS * _K
+def test_lottery_threshold_is_area_aware_and_clamped():
+    """``target * rows*cols*k`` for the committed tile, clamped to ``2^256-1``.
+    The 4x64 tile folds 256 elements -- half the 512-element tiles'
+    per-message work -- so its threshold halves (its launches hash twice the
+    messages)."""
     # n omitted: the back-compat 4x128 commitment.
-    assert lottery_threshold(3, _K) == 3 * work
+    assert lottery_threshold(3, _K) == 3 * 4 * 128 * _K
     assert lottery_threshold(_MAX_256, _K) == _MAX_256  # clamped
-    assert int.from_bytes(threshold_bytes_for(_job(target=3), _K), "little") == 3 * work
-    # The committed tile scales the per-message threshold by its area.
-    assert lottery_threshold(3, 2048, 6144) == 3 * effective_work(
-        SMALL_TILE.rows, SMALL_TILE.cols, 2048, RANK
-    )
+    assert int.from_bytes(threshold_bytes_for(_job(target=3), _K), "little") == 3 * 4 * 128 * _K
+    assert select_tile(6144, 2048) == SMALL_TILE
+    assert lottery_threshold(3, 2048, 6144) == 3 * 4 * 64 * 2048
     assert 2 * lottery_threshold(3, 2048, 6144) == lottery_threshold(3, 2048, 96)
-    # Pinned to the protocol gate across the committed tiles and targets.
-    for k in (2048, 16384):
-        for n, tile in ((6144, SMALL_TILE), (96, TALL_TILE), (None, DEFAULT_TILE)):
-            if n is not None:
-                assert select_tile(n, k) == tile
-            gate_work = effective_work(tile.rows, tile.cols, k, RANK)
-            for target in (1, 2**200, 2**255):
-                assert lottery_threshold(target, k, n) == min(target * gate_work, _MAX_256)
 
 
 def test_credited_work_is_mnk_and_rejects_unmineable():

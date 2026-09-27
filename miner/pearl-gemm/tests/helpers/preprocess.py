@@ -31,7 +31,6 @@ from miner_base.commitment import (
 )
 from miner_base.commitment_hash import noise_line_key, noise_seed_b, operand_digest
 from miner_base.mining_config import default_mining_config, tall_tile_mining_config
-from miner_base.policy import effective_work
 
 from pearl_gemm import (
     LABEL_F1,
@@ -120,8 +119,7 @@ class MinerContext:
         """Lottery threshold ``min(target * work, 2^256-1)`` for the merged tile."""
         rows = self.config.rows_pattern.tile_size
         cols = self.config.cols_pattern.tile_size
-        work = effective_work(rows, cols, self.k, self.config.rank)
-        return min(self.target * work, _MAX_256)
+        return min(self.target * rows * cols * self.k, _MAX_256)
 
     def threshold_bytes(self) -> bytes:
         return self.threshold_for().to_bytes(32, "little")
@@ -131,30 +129,23 @@ def _device_bytes(data: bytes, device: torch.device) -> torch.Tensor:
     return torch.frombuffer(bytearray(data), dtype=torch.uint8).to(device)
 
 
-def preprocess(
-    B: torch.Tensor,
-    header: BlockHeader | None = None,
-    config: MiningConfiguration | None = None,
-) -> MinerContext:
-    """Preprocess the B side. ``B``: (n x k) BF16, on GPU (or CPU; moved as needed)."""
-    assert B.dim() == 2 and B.dtype == torch.bfloat16
+def _pre_quant_b(B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``B``'s int8 codes and BF16 block-scales planes."""
     n, k = B.shape
-    if header is None:
-        header = default_header()
-    if config is None:
-        config = default_config(k)
-    assert config.common_dim == k
-    assert config.rank == R, "the kernels are specialized for the protocol rank"
-    device = B.device if B.is_cuda else torch.device("cuda")
-    B_dev = B.to(device)
-
-    key_a, key_b = commitment_keys(bytes(header.to_bytes()))
-
     codes_shape, scales_shape = pre_quant_output_shapes(n, k)
-    codes = torch.zeros(codes_shape, dtype=torch.int8, device=device)
-    scales = torch.zeros(scales_shape, dtype=torch.bfloat16, device=device)
-    pre_quant(B_dev, codes, scales)
+    codes = torch.zeros(codes_shape, dtype=torch.int8, device=B.device)
+    scales = torch.zeros(scales_shape, dtype=torch.bfloat16, device=B.device)
+    pre_quant(B, codes, scales)
+    return codes, scales
 
+
+def _commit_b(
+    codes: torch.Tensor, scales: torch.Tensor, key_b: bytes, p_b: bytes
+) -> tuple[bytes, torch.Tensor]:
+    """Commit ``B``'s planes; returns ``noise seedB`` and the row stats the
+    commit pass accumulates for ``noisy_quant_b``."""
+    n, k = codes.shape
+    device = codes.device
     hash_config = TensorHashConfig()
     root_codes = torch.zeros(32, dtype=torch.uint8, device=device)
     root_scales = torch.zeros(32, dtype=torch.uint8, device=device)
@@ -175,15 +166,30 @@ def preprocess(
     hash_b = operand_digest(
         [bytes(root_codes.cpu().numpy()), bytes(root_scales.cpu().numpy())], key_b
     )
-    seed_b = noise_seed_b(hash_b, key_b, config.p_b(n))
-    noise_key_b = _device_bytes(noise_line_key(seed_b), device)
+    return noise_seed_b(hash_b, key_b, p_b), commit_stats
 
-    lines = torch.zeros(k, R, dtype=torch.float8_e4m3fn, device=device)
+
+def _f_bases(noise_key_b: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(F_A, F_B)``, each ``(R x k)`` e4m3, drawn under seedB's noise-line key."""
+    lines = torch.zeros(k, R, dtype=torch.float8_e4m3fn, device=noise_key_b.device)
     noise_lines(noise_key_b, LABEL_F1, lines)
     f_a = lines.t().contiguous()
     noise_lines(noise_key_b, LABEL_F2, lines)
-    f_b = lines.t().contiguous()
+    return f_a, lines.t().contiguous()
 
+
+def _noisy_quant_b(
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    noise_key_b: torch.Tensor,
+    commit_stats: torch.Tensor,
+    f_a: torch.Tensor,
+    f_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(B', peel, alpha_B)``: the noised FP8 operand, its complete peel and
+    its per-row scales."""
+    n, k = codes.shape
+    device = codes.device
     alpha_b = torch.zeros(n, dtype=torch.bfloat16, device=device)
     beta_b = torch.zeros_like(alpha_b)
     e_b = torch.zeros(n, R, dtype=torch.float8_e4m3fn, device=device)
@@ -204,6 +210,31 @@ def preprocess(
         torch.zeros(R, R, dtype=torch.float32, device=device),
         config=NoisyQuantBConfig(),
     )
+    return b_prime, b_peel, alpha_b
+
+
+def preprocess(
+    B: torch.Tensor,
+    header: BlockHeader | None = None,
+    config: MiningConfiguration | None = None,
+) -> MinerContext:
+    """Preprocess the B side. ``B``: (n x k) BF16, on GPU (or CPU; moved as needed)."""
+    assert B.dim() == 2 and B.dtype == torch.bfloat16
+    n, k = B.shape
+    if header is None:
+        header = default_header()
+    if config is None:
+        config = default_config(k)
+    assert config.common_dim == k
+    assert config.rank == R, "the kernels are specialized for the protocol rank"
+    device = B.device if B.is_cuda else torch.device("cuda")
+
+    key_a, key_b = commitment_keys(bytes(header.to_bytes()))
+    codes, scales = _pre_quant_b(B.to(device))
+    seed_b, commit_stats = _commit_b(codes, scales, key_b, config.p_b(n))
+    noise_key_b = _device_bytes(noise_line_key(seed_b), device)
+    f_a, f_b = _f_bases(noise_key_b, k)
+    b_prime, b_peel, alpha_b = _noisy_quant_b(codes, scales, noise_key_b, commit_stats, f_a, f_b)
     torch.cuda.synchronize()
 
     return MinerContext(

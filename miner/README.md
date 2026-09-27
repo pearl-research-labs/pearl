@@ -19,8 +19,7 @@ directory names use hyphens; Python import packages use underscores.
 
 `miner-base` holds the host-side protocol surface the GPU miners share
 (commitments, keys, prequantized planes, proof construction and submission);
-the FP8 noise and quantization math runs in the `pearl-gemm` kernels and is
-specified by the verifier in `zk-pow`.
+the FP8 noise and quantization math runs in the `pearl-gemm` kernels.
 
 ## Distributed dense mining
 
