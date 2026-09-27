@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
-	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/stretchr/testify/assert"
@@ -28,38 +27,43 @@ func (m *verdictChainService) SendTransaction(*wire.MsgTx) error {
 	return m.verdict
 }
 
-func sendWithVerdict(verdict *pushtx.BroadcastError) (*chainhash.Hash, error) {
-	nc := newMockNeutrinoClient()
-	nc.CS = &verdictChainService{mockChainService: &mockChainService{}, verdict: verdict}
-
-	return nc.SendRawTransaction(wire.NewMsgTx(wire.TxVersion), false)
-}
-
-// TestNeutrinoClientSendRawTransactionNotRelayed verifies that a broadcast no
-// peer requested surfaces as ErrTxNotRelayed with the backend's reason intact,
-// so the wallet can drop the record and the user can see why the send failed.
-func TestNeutrinoClientSendRawTransactionNotRelayed(t *testing.T) {
+// TestNeutrinoClientSendRawTransactionVerdicts pins how the peer verdicts the wallet branches on reach it. The mempool
+// case uses bitcoind's reject wording, which no string map knows, so only its code can identify it.
+func TestNeutrinoClientSendRawTransactionVerdicts(t *testing.T) {
 	t.Parallel()
 
-	hash, err := sendWithVerdict(&pushtx.BroadcastError{
-		Code:   pushtx.NotRelayed,
-		Reason: "no connected peers to relay transaction",
-	})
-	require.Nil(t, hash)
-	require.ErrorIs(t, err, ErrTxNotRelayed)
-	require.ErrorContains(t, err, "no connected peers")
-}
+	tests := []struct {
+		name    string
+		verdict *pushtx.BroadcastError
+		wantErr error
+		wantMsg string
+	}{
+		{
+			name:    "not relayed keeps the reason",
+			verdict: &pushtx.BroadcastError{Code: pushtx.NotRelayed, Reason: "no connected peers to relay transaction"},
+			wantErr: ErrTxNotRelayed,
+			wantMsg: "no connected peers",
+		},
+		{
+			name:    "already in mempool",
+			verdict: &pushtx.BroadcastError{Code: pushtx.Mempool, Reason: "rejected by peer: txn-already-in-mempool"},
+			wantErr: ErrTxAlreadyInMempool,
+			wantMsg: "already in mempool",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-// TestNeutrinoClientSendRawTransactionAlreadyHeld uses bitcoind's reject wording, which no string map knows, to pin
-// that a peer already holding the transaction reaches the wallet as ErrTxAlreadyInMempool.
-func TestNeutrinoClientSendRawTransactionAlreadyHeld(t *testing.T) {
-	t.Parallel()
+			nc := newMockNeutrinoClient()
+			nc.CS = &verdictChainService{mockChainService: &mockChainService{}, verdict: tt.verdict}
 
-	_, err := sendWithVerdict(&pushtx.BroadcastError{
-		Code:   pushtx.Mempool,
-		Reason: "rejected by 127.0.0.1:18555: txn-already-in-mempool",
-	})
-	require.ErrorIs(t, err, ErrTxAlreadyInMempool)
+			hash, err := nc.SendRawTransaction(wire.NewMsgTx(wire.TxVersion), false)
+			assert.Nil(t, hash)
+			assert.ErrorIs(t, err, tt.wantErr)
+			assert.ErrorContains(t, err, tt.wantMsg)
+		})
+	}
 }
 
 // TestNeutrinoClientSequentialStartStop ensures that the client

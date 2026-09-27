@@ -11,52 +11,28 @@ import (
 	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	_ "github.com/pearl-research-labs/pearl/wallet/walletdb/bdb"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// startPeerlessChainService runs a ChainService on simnet with no peers. Simnet is a dev network, so nothing DNS-seeds
-// and the service stays peerless for the whole test.
-func startPeerlessChainService(t *testing.T) *ChainService {
-	t.Helper()
-
+// TestSendTransactionNoPeers pins the broadcast contract when no peer can be asked for the transaction: the caller must
+// learn at once that nothing was relayed instead of being told the broadcast succeeded.
+func TestSendTransactionNoPeers(t *testing.T) {
+	// Simnet is a dev network, so nothing DNS-seeds and the service stays peerless.
 	dir := t.TempDir()
 	db, err := walletdb.Create("bdb", filepath.Join(dir, "neutrino.db"), true, 10*time.Second, false)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
 
-	cs, err := NewChainService(Config{
-		DataDir:     dir,
-		Database:    db,
-		ChainParams: chaincfg.SimNetParams,
-	})
+	cs, err := NewChainService(Config{DataDir: dir, Database: db, ChainParams: chaincfg.SimNetParams})
 	require.NoError(t, err)
 	require.NoError(t, cs.Start(context.Background()))
-	t.Cleanup(func() { require.NoError(t, cs.Stop()) })
+	t.Cleanup(func() { assert.NoError(t, cs.Stop()) })
 
-	return cs
-}
-
-func testTx() *wire.MsgTx {
-	tx := wire.NewMsgTx(wire.TxVersion)
-	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Index: 0}})
-	tx.AddTxOut(&wire.TxOut{Value: 1000, PkScript: []byte{0x51}})
-
-	return tx
-}
-
-// TestSendTransactionNoPeers pins the broadcast contract when no peer can be asked for the transaction: the caller must
-// learn that nothing was relayed instead of being told the broadcast succeeded.
-func TestSendTransactionNoPeers(t *testing.T) {
-	cs := startPeerlessChainService(t)
-	require.Zero(t, cs.ConnectedCount())
-
-	tx := testTx()
 	start := time.Now()
-	err := cs.SendTransaction(tx)
-	elapsed := time.Since(start)
+	err = cs.SendTransaction(wire.NewMsgTx(wire.TxVersion))
 
-	require.Truef(t, pushtx.IsBroadcastError(err, pushtx.NotRelayed),
-		"SendTransaction with zero peers returned err=%v", err)
-	require.ErrorContains(t, err, "no connected peers")
-	require.Less(t, elapsed, time.Second)
+	assert.Less(t, time.Since(start), time.Second)
+	assert.Truef(t, pushtx.IsBroadcastError(err, pushtx.NotRelayed), "got %v", err)
+	assert.ErrorContains(t, err, "no connected peers")
 }

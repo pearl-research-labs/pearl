@@ -8,7 +8,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/wallet/chain"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
-	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestPendingTxError pins the RPC codes clients branch on for the pending-transaction commands.
@@ -47,11 +47,11 @@ func TestPendingTxError(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			rpcErr := jsonError(pendingTxError(tc.err))
-			require.Equal(t, tc.wantCode, rpcErr.Code)
-			require.Equal(t, tc.wantMsg, rpcErr.Message)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rpcErr := jsonError(pendingTxError(tt.err))
+			assert.Equal(t, tt.wantCode, rpcErr.Code)
+			assert.Equal(t, tt.wantMsg, rpcErr.Message)
 		})
 	}
 }
