@@ -11,7 +11,6 @@ import enum
 import struct
 from dataclasses import dataclass
 
-from .hardware import Blackwell, Hardware, Hopper
 from .layout import (
     LANES,
     MAX_SUBTILE_ELEMS,
@@ -56,9 +55,6 @@ class Device(enum.IntEnum):
 
     HOPPER = 0
     BLACKWELL = 1
-
-    def hardware(self) -> Hardware:
-        return Hopper() if self is Device.HOPPER else Blackwell()
 
 
 @dataclass(frozen=True)

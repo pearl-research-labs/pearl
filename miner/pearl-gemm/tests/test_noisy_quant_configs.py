@@ -26,7 +26,7 @@ def _open_blobs(codes, scales):
 
 
 def _fake_noise_lines(k: int) -> torch.Tensor:
-    """Noise-line-like e4m3 values (+-[0.5, ~200], the Noiser's range)."""
+    """Noise-line-like e4m3 values (+-[0.5, ~200], the noise lines' range)."""
     magnitudes = torch.rand(R, k, device="cuda") * 200 + 0.5
     signs = torch.randint(0, 2, (R, k), device="cuda") * 2 - 1
     return (magnitudes * signs).to(torch.float8_e4m3fn)

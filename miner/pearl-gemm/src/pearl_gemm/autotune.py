@@ -482,7 +482,7 @@ def tune_noisy_quant(m: int, k: int) -> list[dict]:
     # plausible commit partials (values do not affect kernel timing)
     stats = torch.rand(2 * (m * k // 512), device="cuda") * 512 + 1
     # Noise-line-like values (+-[0.5, ~200]): pack_noise_factor asserts the
-    # Noiser value grid, which plain randn codes do not satisfy.
+    # noise-line value grid, which plain randn codes do not satisfy.
     f1 = (
         (torch.rand(R, k, device="cuda") * 200 + 0.5)
         * (torch.randint(0, 2, (R, k), device="cuda") * 2 - 1)

@@ -1,15 +1,15 @@
 """Protocol constants shared by the kernels.
 
-Mirrored from ``miner_base`` (``noise.py`` / ``quantization.py`` /
-``prequant.py``) so the kernel package has no runtime dependency on miner-base;
-``tests/test_protocol_constants.py`` asserts the two stay in sync.
+Mirrored from the verifier (``zk-pow/src/api/fp8/noise.rs`` /
+``quantization.rs``) and ``miner_base.prequant``;
+``tests/test_protocol_constants.py`` pins them.
 """
 
-# noise.py
+# noise.rs
 NOISE_TARGET_NORM = 256  # constant approximate L2 norm every noise line is renormalized to
 _INT_SQRT_PREC = 32  # fixed-point factor carrying log2(32)=5 fractional norm bits through isqrt
 
-# quantization.py
+# quantization.rs
 QUANT_MAX = 448.0  # largest finite e4m3 magnitude (the quant grid ceiling)
 DELTA = 0.5  # noise-to-signal ratio (in L2) of the injected E@F noise
 L2_ROUNDED_BITS = 2  # low explicit BF16 mantissa bits cleared from l2

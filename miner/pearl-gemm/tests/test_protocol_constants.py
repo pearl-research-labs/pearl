@@ -1,22 +1,15 @@
-"""The kernel package's constants must stay in sync with the reference."""
+"""The kernel package's constants must stay in sync with miner-base's prequant.
 
-import miner_base.noise as ref_noise
+The noise and quantization constants feed every bit-exact operand, so the
+pinned digests in ``test_noise_lines`` / ``test_noisy_quant*`` gate them.
+"""
+
 import miner_base.prequant as ref_prequant
-import miner_base.quantization as ref_quant
-from miner_base.hardware import Blackwell
 
 from pearl_gemm import protocol_constants
 
 
-def test_noise_constants():
-    assert protocol_constants.NOISE_TARGET_NORM == ref_noise.NOISE_TARGET_NORM
-    assert protocol_constants._INT_SQRT_PREC == ref_noise._INT_SQRT_PREC
-
-
 def test_quantization_constants():
-    assert protocol_constants.QUANT_MAX == ref_quant.QUANT_MAX
-    # The SM100 kernel's noise fraction is Blackwell's device-dependent delta.
-    assert Blackwell().noise_fraction == protocol_constants.DELTA
     assert protocol_constants.L2_ROUNDED_BITS == ref_prequant.L2_ROUNDED_BITS
 
 

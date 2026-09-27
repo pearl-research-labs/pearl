@@ -29,7 +29,7 @@ cuda = ["torch==2.13.0"]
 [dependency-groups]
 dev = [
     # miner-base protocol modules drive kernel tests that need
-    # commitments, noise, and the hardware compute contract.
+    # commitments, keys, and prequantized planes.
     "miner-base",
     # Merkle-tree oracle used by tensor-hash tests.
     "py-pearl-mining>=0.2.0",

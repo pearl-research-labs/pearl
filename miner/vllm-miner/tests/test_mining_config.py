@@ -104,14 +104,13 @@ def test_tile_indices_are_the_committed_offsets():
     assert tile_indices(cols, 3) == [3 * cols.total + off for off in cols.tile_offsets]
 
 
-def test_lottery_threshold_matches_reference_gate():
-    """``target * effective_work(committed tile)`` clamped to ``2^256-1`` and
-    exactly the reference winner boundary per tile. Area-aware: the 4x64 tile
-    folds 256 elements -- half the 512-element tiles' per-message work -- so
-    its threshold halves (its launches hash twice the messages). A drift from
-    the reference gate makes every GPU winner unverifiable."""
-    from miner_base.commitment import jackpot_digest
-    from miner_base.policy import effective_work, is_winning
+def test_lottery_threshold_matches_protocol_gate():
+    """``target * effective_work(committed tile)`` clamped to ``2^256-1``: the
+    verifier's winner boundary per tile. Area-aware: the 4x64 tile folds 256
+    elements -- half the 512-element tiles' per-message work -- so its
+    threshold halves (its launches hash twice the messages). A drift from the
+    protocol gate makes every GPU winner unverifiable."""
+    from miner_base.policy import effective_work
 
     work = TILE_ROWS * TILE_COLS * _K
     # n omitted: the back-compat 4x128 commitment.
@@ -123,20 +122,14 @@ def test_lottery_threshold_matches_reference_gate():
         SMALL_TILE.rows, SMALL_TILE.cols, 2048, RANK
     )
     assert 2 * lottery_threshold(3, 2048, 6144) == lottery_threshold(3, 2048, 96)
-    # Pinned to the reference gate across the committed tiles and targets.
-    seed_a = bytes(range(32))
+    # Pinned to the protocol gate across the committed tiles and targets.
     for k in (2048, 16384):
         for n, tile in ((6144, SMALL_TILE), (96, TALL_TILE), (None, DEFAULT_TILE)):
             if n is not None:
                 assert select_tile(n, k) == tile
             gate_work = effective_work(tile.rows, tile.cols, k, RANK)
             for target in (1, 2**200, 2**255):
-                threshold = lottery_threshold(target, k, n)
-                for msg in (b"", b"win", bytes([255]) * 32):
-                    h = int.from_bytes(jackpot_digest(msg, seed_a), "little")
-                    assert (is_winning(msg, seed_a, target, gate_work) is not None) == (
-                        h <= threshold
-                    )
+                assert lottery_threshold(target, k, n) == min(target * gate_work, _MAX_256)
 
 
 def test_credited_work_is_mnk_and_rejects_unmineable():

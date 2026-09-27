@@ -4,18 +4,17 @@ parity, launch accounting, winner round-trip, and staleness.
 Intentionally no hardware skip guards: this suite runs only on the B200 job.
 """
 
+import hashlib
+import json
 import threading
+from pathlib import Path
 
 import pytest
 import torch
 from miner_base.block_submission import commit_planes_for_leaf
 from miner_base.commitment import BlockHeader
 from miner_base.commitment_hash import noise_seed_b
-from miner_base.hardware import hardware_for
-from miner_base.noise import Noiser
 from miner_base.prequant import PrequantMatrix
-from miner_base.quantization import Fp8QuantScheme
-from miner_base.scheme import PearlScheme
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gemm import pack_noise_factor
@@ -125,6 +124,24 @@ def _cpu_pq(state) -> PrequantMatrix:
     return PrequantMatrix(state.weight_cpu, state.weight_scale_cpu)
 
 
+# SHA-256 digests of the protocol's job-constant B operands for the
+# ``layer_state`` weights, recorded from the CPU reference implementation
+# that mirrored the verifier (``zk-pow/src/api/fp8``) bit for bit. Each shape
+# also stores ``peel_tol``, the mid peel half's bound against its fp64-exact
+# product.
+_B_DIGESTS = json.loads(
+    (Path(__file__).parent / "fixtures" / "b_preparation_digests.json").read_text()
+)
+
+
+def _digest(t: torch.Tensor) -> str:
+    """SHA-256 of ``t``'s values: FP8 as raw bytes, other floats as float32
+    with ``-0.0`` folded into ``+0.0``."""
+    t = t.detach().cpu().contiguous()
+    data = t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t.float() + 0.0
+    return hashlib.sha256(data.numpy().tobytes()).hexdigest()
+
+
 # --------------------------------------------------------------------------- #
 # state / load-time encoding
 # --------------------------------------------------------------------------- #
@@ -183,9 +200,9 @@ def test_fp8_fallback_matches_opened_planes(layer_state):
 
 
 @pytest.mark.parametrize("layer_state", _MINED_SHAPE_PARAMS, ids=_MINED_SHAPE_IDS, indirect=True)
-def test_prepare_layer_matches_reference_commitment_chain(layer_state):
-    """Load-time commitment + B preparation parity against the CPU reference,
-    for both the low-k shape and the high-k o_proj shape (k=16384) the 4x128 tile
+def test_prepare_layer_matches_pinned_commitment_chain(layer_state):
+    """Load-time commitment + B preparation parity against the protocol's
+    operands, for both the low-k shape and the high-k o_proj shape (k=16384) the 4x128 tile
     could not prove. Both commit the preferred 4x64 tile, which is bound into
     ``pB`` and so into noise seedB -- so the expected seed must pass the layer's
     ``n``."""
@@ -216,32 +233,32 @@ def test_prepare_layer_matches_reference_commitment_chain(layer_state):
     assert bytes(buffers.seed_b_dev.cpu().numpy()) == expected_seed_b
     assert bytes(buffers.threshold_dev.cpu().numpy()) == threshold_bytes_for(job, k, n)
 
-    # Uploaded operands equal the canonical CPU reference build. Both F bases
-    # are keyed by seedB, so the whole B side -- the complete peel included --
-    # is a job constant the reference draws from seedB alone.
-    hardware = hardware_for(config.device)
-    scheme = PearlScheme(hardware, Fp8QuantScheme(), k, RANK)
-    noise = Noiser(expected_seed_b, RANK, k, hardware.compute)
-    stacked = scheme.build_b_rows(weight_pq.open(), noise, list(range(n)), weight_pq.exact_norms())
-    assert torch.equal(buffers.b_prime.cpu(), stacked.quant_part)
-    assert torch.equal(buffers.f1.cpu(), noise.F_A())
-    assert torch.equal(buffers.f2.cpu(), noise.F_B())
-    assert torch.equal(buffers.f1_hl.cpu(), pack_noise_factor(noise.F_A()))
+    # Uploaded operands equal the protocol's B side. Both F bases are keyed by
+    # seedB, so the whole B side -- the complete peel included -- is a job
+    # constant fixed by seedB alone.
+    expected = _B_DIGESTS[f"{n}x{k}"]
+    assert _digest(buffers.f1) == expected["f1"], "F_A"
+    assert _digest(buffers.f2) == expected["f2"], "F_B"
+    assert _digest(buffers.e2) == expected["e2"], "E_B"
+    assert _digest(buffers.alpha_b) == expected["alpha_b"], "alpha_b"
+    assert _digest(buffers.beta_b) == expected["beta_b"], "beta_b"
+    assert _digest(buffers.b_prime) == expected["b_prime"], "B'"
+    assert torch.equal(buffers.f1_hl.cpu(), pack_noise_factor(buffers.f1.cpu()))
     assert torch.equal(ctx.f1_hl, buffers.f1_hl)
     b_peel = buffers.b_peel.cpu()
     # The element-wise second half (-(beta_b (.) E_B)) is bit-exact; the mid
-    # half is the reference-only peel matmul, which the fused kernel's
-    # epilogue reassociates, so it is held to tolerance.
-    assert torch.equal(b_peel[:, RANK:], stacked.peel_part[:, RANK:])
-    mid_reference = stacked.peel_part[:, :RANK].float()
+    # half is the peel matmul, which the fused kernel's epilogue reassociates,
+    # so it is held to tolerance against the fp64-exact product of the
+    # (pinned) operands.
+    assert _digest(b_peel[:, RANK:]) == expected["peel_beta_e"], "-(beta_b (.) E_B)"
+    f1_64, f2_64 = buffers.f1.cpu().double(), buffers.f2.cpu().double()
+    beta_64 = buffers.beta_b.cpu().double().reshape(-1, 1)
+    diff_64 = beta_64 * (buffers.e2.cpu().double() @ f2_64) - buffers.b_prime.cpu().double()
+    mid_64 = diff_64 @ f1_64.t()
     mid_relative_error = (
-        (b_peel[:, :RANK].float() - mid_reference).norm() / mid_reference.norm().clamp_min(1e-30)
+        (b_peel[:, :RANK].double() - mid_64).norm() / mid_64.norm().clamp_min(1e-30)
     ).item()
-    assert mid_relative_error < 1e-2, mid_relative_error
-    assert torch.equal(
-        buffers.alpha_b.cpu().reshape(-1),
-        stacked.alpha.reshape(-1),
-    )
+    assert mid_relative_error < expected["peel_tol"], mid_relative_error
     prebuilt = ctx.b_proof.prebuilt_commitment()
     assert prebuilt.key == key_b
     assert prebuilt.commitment.digest == comm_b.digest
@@ -249,8 +266,8 @@ def test_prepare_layer_matches_reference_commitment_chain(layer_state):
     assert layer_state.job_ctx is ctx
 
 
-def test_prepare_dispatches_gpu_b_chain_without_reference_builder(layer_state, monkeypatch):
-    """Production B preparation must never fall back to PearlScheme.build_b_rows."""
+def test_prepare_dispatches_gpu_b_chain(layer_state, monkeypatch):
+    """Production B preparation runs the GPU chain, in order."""
     import pearl_gemm
 
     calls: list[str] = []
@@ -268,11 +285,6 @@ def test_prepare_dispatches_gpu_b_chain_without_reference_builder(layer_state, m
             kernel_name,
             observed(kernel_name, getattr(pearl_gemm, kernel_name)),
         )
-    monkeypatch.setattr(
-        PearlScheme,
-        "build_b_rows",
-        lambda *_args, **_kwargs: pytest.fail("B rebuild used the CPU reference builder"),
-    )
 
     ctx = prepare_layer(layer_state, _job())
     torch.cuda.synchronize()
@@ -287,11 +299,10 @@ def test_prepare_dispatches_gpu_b_chain_without_reference_builder(layer_state, m
     ]
 
 
-def test_prepare_fails_closed_instead_of_using_reference_b_fallback(layer_state, monkeypatch):
+def test_prepare_fails_closed_on_gpu_b_failure(layer_state, monkeypatch):
     """A failed GPU B stage must leave the layer unpublished and propagate."""
     import pearl_gemm
 
-    reference_called = False
     noise_launches = 0
 
     def fail_after_partial_gpu_chain(*args, **kwargs):
@@ -299,19 +310,12 @@ def test_prepare_fails_closed_instead_of_using_reference_b_fallback(layer_state,
         noise_launches += 1
         raise RuntimeError("synthetic GPU B-preparation failure")
 
-    def reject_reference_fallback(*_args, **_kwargs):
-        nonlocal reference_called
-        reference_called = True
-        pytest.fail("GPU B-preparation failure fell back to CPU build_b_rows")
-
     monkeypatch.setattr(pearl_gemm, "noise_lines", fail_after_partial_gpu_chain)
-    monkeypatch.setattr(PearlScheme, "build_b_rows", reject_reference_fallback)
 
     with pytest.raises(RuntimeError, match="synthetic GPU B-preparation failure"):
         prepare_layer(layer_state, _job())
 
     assert noise_launches == 1
-    assert not reference_called
     assert layer_state.job_ctx is None
 
 

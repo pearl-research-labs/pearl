@@ -2,23 +2,23 @@
 
 The A side of the chain, from the two committed blobs to the three A keys
 (``seedA || noise-line key A || jackpot key``) the prep and GEMM kernels
-consume, plus the reference ``Noiser`` over the fixed seedB. Protocol
-composition over a real block header is owned by the production miner;
-these helpers only keep the fixture boilerplate of the per-kernel tests
-in one place.
+consume, plus the job-constant F bases drawn on device under the fixed seedB.
+Protocol composition over a real block header is owned by the production
+miner; these helpers only keep the fixture boilerplate of the per-kernel
+tests in one place.
 """
 
 from dataclasses import dataclass
 
 import torch
 from blake3 import blake3
-from miner_base.commitment import Device
 from miner_base.commitment_hash import AKeys, noise_line_key
-from miner_base.hardware import hardware_for
-from miner_base.noise import Noiser
 
 from pearl_gemm import (
+    LABEL_F1,
+    LABEL_F2,
     TensorHashConfig,
+    noise_lines,
     tensor_hash_plus_stats,
     tensor_hash_workspace_bytes,
 )
@@ -67,16 +67,6 @@ class CommittedA:
     def pow_key_dev(self) -> torch.Tensor:
         return self.a_keys_dev[64:96]
 
-    def noise(self, k: int, compute=None) -> Noiser:
-        """The reference factors for this A under the fixture's seedB."""
-        return Noiser(
-            self.seed_b,
-            R,
-            k,
-            compute or hardware_for(Device.BLACKWELL).compute,
-            seed_a=self.seed_a,
-        )
-
 
 def commit_a(
     codes: torch.Tensor,
@@ -118,9 +108,17 @@ def commit_a(
     return committed
 
 
-def noise(seed_b: bytes = SEED_B, k: int = 512, compute=None) -> Noiser:
-    """The B side's reference factors (no seedA: ``E_A`` is not drawable)."""
-    return Noiser(seed_b, R, k, compute or hardware_for(Device.BLACKWELL).compute)
+def f_bases(k: int, seed_b: bytes = SEED_B, device="cuda") -> tuple[torch.Tensor, torch.Tensor]:
+    """``(F_A, F_B)``, each ``(R x k)`` e4m3: the ``k``-line draws under seedB's
+    noise-line key at the ``Side.A`` / ``Side.B`` F addresses, transposed."""
+    key = device_bytes(noise_line_key(seed_b), device)
+    lines = torch.zeros(k, R, dtype=torch.float8_e4m3fn, device=device)
+    bases = []
+    for label in (LABEL_F1, LABEL_F2):
+        noise_lines(key, label, lines)
+        bases.append(lines.t().contiguous())
+    torch.cuda.synchronize()
+    return bases[0], bases[1]
 
 
 def noise_key_b_dev(seed_b: bytes = SEED_B, device="cuda") -> torch.Tensor:

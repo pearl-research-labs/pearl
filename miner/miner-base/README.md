@@ -1,15 +1,15 @@
 # miner-base
 
-Framework- and kernel-independent infrastructure every Pearl miner shares,
-plus the stable FP8 plain-peel protocol surface.
+Framework- and kernel-independent infrastructure every Pearl GPU miner shares,
+plus the host-side FP8 plain-peel protocol surface. `miner_base` does not
+mine or emulate a GPU: the noise, quantization, and lottery math runs in the
+`pearl-gemm` kernels, and the verifier in `zk-pow` specifies it.
 
 `miner_base` owns:
 
-- commitments, extractor layout, prequantized planes, deterministic noise,
-  FP8 quantization, lottery policy, scheme types, and the hardware contract
-  (`miner_base.commitment`, `layout`, `noise`, `quantization`, `scheme`,
-  `hardware`, …). :func:`miner_base.hardware.hardware_for` resolves Blackwell
-  (SM100) only.
+- commitments and keys, extractor layout, prequantized planes, protocol
+  parameters, and the lottery work normalization (`miner_base.commitment`,
+  `commitment_hash`, `transcript`, `layout`, `prequant`, `params`, `policy`).
 - `async_loop_manager`: gateway job polling, credited-hash accounting, bounded
   proof handoff. CUDA event/stream ownership belongs to
   the `vllm_miner` package in `vllm-miner`.

@@ -119,7 +119,7 @@ def noisy_quant_b(
 
     # The fused kernel emits the peel in its A-side layout; the epilogue
     # reduces G = F2 @ F1^T into the gram workspace and rewrites the peel in
-    # place into build_b_rows' order (see _kernel.py).
+    # place into the B-side layout (see _kernel.py).
     capability = torch.cuda.get_device_capability(device)
     stream = get_stream(device.index or 0)
     gram_args = (
