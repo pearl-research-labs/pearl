@@ -3,8 +3,7 @@ import { Transaction } from '../../../types/transaction';
 import { usePagination } from '../hooks/usePagination';
 import { useWalletStore } from '../store/walletStore';
 import { Button } from '@/components/ui/button';
-import { getErrorMessage } from '@/lib/utils';
-import { isNotRelayedError } from '@/lib/pending-tx';
+import { getErrorMessage, isNotRelayedError } from '@/lib/utils';
 import { useState } from 'react';
 
 interface ActivityPageProps {

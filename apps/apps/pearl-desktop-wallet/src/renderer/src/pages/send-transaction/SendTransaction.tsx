@@ -12,8 +12,7 @@ import SuccessBanner from './SuccessBanner';
 import TransactionPreview from './TransactionPreview';
 import SendButton from './SendButton';
 import { formatTxid } from '@/lib/crypto';
-import { getErrorMessage } from '@/lib/utils';
-import { isNotRelayedError } from '@/lib/pending-tx';
+import { getErrorMessage, isNotRelayedError } from '@/lib/utils';
 
 type FeeLevel = 'fast' | 'medium' | 'slow';
 const MEMPOOL_MIN_FEE_PER_VBYTE = 0.00001;
