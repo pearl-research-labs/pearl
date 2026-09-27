@@ -3,6 +3,7 @@ package v2transport
 import (
 	"bytes"
 	"encoding/hex"
+	"io"
 	"strings"
 	"testing"
 
@@ -547,4 +548,58 @@ func TestDeriveV2CiphersReleasesLease(t *testing.T) {
 		require.NoError(t, p.deriveV2Ciphers(ellswiftTheirs, true, PearlNet(1)))
 		assert.Zero(t, admission.acquired)
 	})
+}
+
+// TestCompleteHandshakeGarbageLengthBounds pins that the garbage terminator is found after up to MaxGarbageLen
+// bytes of garbage and that longer garbage is rejected. The receiver used to stop one check short and reject
+// MaxGarbageLen, failing roughly one in 2048 peer handshakes since both sides pick a length in [0, MaxGarbageLen].
+func TestCompleteHandshakeGarbageLengthBounds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		garbageLen int
+		wantErr    error
+	}{
+		{name: "no garbage"},
+		{name: "maximum garbage", garbageLen: MaxGarbageLen},
+		{name: "garbage over the maximum", garbageLen: MaxGarbageLen + 1, wantErr: errGarbageTermNotRecv},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var err error
+			initiator, responder := NewPeer(), NewPeer()
+			initiator.privkeyOurs, initiator.ellswiftOurs, err = ellswift.EllswiftCreate()
+			require.NoError(t, err)
+			responder.privkeyOurs, responder.ellswiftOurs, err = ellswift.EllswiftCreate()
+			require.NoError(t, err)
+
+			// Script the responder's side of the stream by hand: RespondV2Handshake refuses oversized garbage.
+			stream := bytes.NewBuffer(nil)
+			responder.UseReadWriter(stream)
+			garbage := make([]byte, tt.garbageLen)
+			_, err = responder.Send(append(responder.ellswiftOurs[:], garbage...))
+			require.NoError(t, err)
+			require.NoError(t, responder.deriveV2Ciphers(initiator.ellswiftOurs, false, mainNet))
+			_, err = responder.Send(responder.sendGarbageTerm[:])
+			require.NoError(t, err)
+			_, _, err = responder.V2EncPacket(transportVersion, garbage, false)
+			require.NoError(t, err)
+
+			initiator.UseReadWriter(struct {
+				io.Reader
+				io.Writer
+			}{stream, io.Discard})
+
+			err = initiator.CompleteHandshake(true, nil, mainNet)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
