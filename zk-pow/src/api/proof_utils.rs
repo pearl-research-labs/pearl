@@ -7,14 +7,6 @@ use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLoc
 
 use pearl_blake3::blake3_digest;
 
-fn ensure_roundtrip(original: &[u8], reserialized: &[u8], label: &str) -> Result<()> {
-    ensure!(
-        reserialized == original,
-        "{label} round-trip mismatch: deserialized form does not re-serialize to the original bytes"
-    );
-    Ok(())
-}
-
 /// Convert Bitcoin's compact nbits format to an absolute difficulty target as U256
 ///
 /// Bitcoin's nbits is a compact representation where:
@@ -115,7 +107,10 @@ impl IncompleteBlockHeader {
             timestamp,
             nbits,
         };
-        ensure_roundtrip(data, &result.to_bytes(), "IncompleteBlockHeader")?;
+        ensure!(
+            result.to_bytes() == data,
+            "IncompleteBlockHeader round-trip mismatch: deserialized form does not re-serialize to the original bytes"
+        );
         Ok(result)
     }
 }

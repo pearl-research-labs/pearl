@@ -40,10 +40,34 @@ var oneHeaderEncoded = []byte{
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 }
 
-func TestHeadersMaxPayloadLengthAccountsForV4(t *testing.T) {
-	want := uint32(MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSizeV4) * MaxBlockHeadersPerMsg))
+func TestHeadersMaxPayloadLength(t *testing.T) {
+	want := uint32(MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSize) * MaxBlockHeadersPerMsg))
 	require.Equal(t, want, NewMsgHeaders().MaxPayloadLength(ProtocolVersion))
-	require.Greater(t, want, uint32(MaxVarIntPayload+((MaxBlockHeaderPayload+CertificateMaxSize)*MaxBlockHeadersPerMsg)))
+}
+
+func TestHeadersLargeV4RoundTrip(t *testing.T) {
+	msg := NewMsgHeaders()
+	header := *blockOne.BlockHeader()
+	// version + hash + two length prefixes + ancestor count + two ancestors.
+	fixed := 4 + 32 + 4 + 4 + 1 + 2*MaxBlockHeaderPayload
+	cert := &CertificateV4{
+		PublicData:      bytes.Repeat([]byte{0x11}, CertificateMaxSize-fixed-MaxZKProofSize),
+		ProofData:       bytes.Repeat([]byte{0x22}, MaxZKProofSize),
+		AncestorHeaders: []BlockHeader{header, header},
+	}
+	require.Equal(t, CertificateMaxSize, (&MsgCertificate{Certificate: cert}).SerializeSize())
+	for i := range MaxBlockHeadersPerMsg {
+		header.Version = int32(i)
+		require.NoError(t, msg.AddBlockHeader(header, cert))
+	}
+
+	// A full batch of maximum-size V4 certificates fits the protocol limit.
+	var buf bytes.Buffer
+	_, err := WriteV2MessageN(&buf, msg, ProtocolVersion, BaseEncoding)
+	require.NoError(t, err)
+	decoded, _, err := ReadV2MessageN(buf.Bytes(), ProtocolVersion, BaseEncoding)
+	require.NoError(t, err)
+	require.Equal(t, msg, decoded)
 }
 
 // TestHeaders tests the MsgHeaders API.

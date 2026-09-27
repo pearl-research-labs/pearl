@@ -259,11 +259,12 @@ type Tx interface {
 	//   - ErrTxClosed if the transaction has already been closed
 	//   - ErrCorruption if the database has somehow become corrupted
 	//
-	// NOTE: The data returned by this function is only valid during a
-	// database transaction.  Attempting to access it after a transaction
-	// has ended results in undefined behavior.  This constraint prevents
-	// additional data copies and allows support for memory-mapped database
-	// implementations.
+	// The returned bytes belong to the caller and stay valid after the
+	// transaction ends: callers decode, relay, and serve them outside the
+	// view without copying, so an implementation backed by reused or
+	// mapped memory must copy at its own boundary. A block stored earlier
+	// in the same writable transaction is returned as the bytes that were
+	// passed to StoreBlock.
 	FetchBlock(hash *chainhash.Hash) ([]byte, error)
 
 	// FetchBlocks returns the raw serialized bytes for the blocks
@@ -277,11 +278,8 @@ type Tx interface {
 	//   - ErrTxClosed if the transaction has already been closed
 	//   - ErrCorruption if the database has somehow become corrupted
 	//
-	// NOTE: The data returned by this function is only valid during a
-	// database transaction.  Attempting to access it after a transaction
-	// has ended results in undefined behavior.  This constraint prevents
-	// additional data copies and allows support for memory-mapped database
-	// implementations.
+	// The returned bytes belong to the caller and stay valid after the
+	// transaction ends, under the same terms as FetchBlock.
 	FetchBlocks(hashes []chainhash.Hash) ([][]byte, error)
 
 	// FetchBlockRegion returns the raw serialized bytes for the given
@@ -304,11 +302,10 @@ type Tx interface {
 	//   - ErrTxClosed if the transaction has already been closed
 	//   - ErrCorruption if the database has somehow become corrupted
 	//
-	// NOTE: The data returned by this function is only valid during a
-	// database transaction.  Attempting to access it after a transaction
-	// has ended results in undefined behavior.  This constraint prevents
-	// additional data copies and allows support for memory-mapped database
-	// implementations.
+	// The returned bytes belong to the caller and stay valid after the
+	// transaction ends, under the same terms as FetchBlock; a region of a
+	// block stored earlier in the same writable transaction aliases the
+	// bytes that were passed to StoreBlock.
 	FetchBlockRegion(region *BlockRegion) ([]byte, error)
 
 	// FetchBlockRegions returns the raw serialized bytes for the given
@@ -332,11 +329,8 @@ type Tx interface {
 	//   - ErrTxClosed if the transaction has already been closed
 	//   - ErrCorruption if the database has somehow become corrupted
 	//
-	// NOTE: The data returned by this function is only valid during a
-	// database transaction.  Attempting to access it after a transaction
-	// has ended results in undefined behavior.  This constraint prevents
-	// additional data copies and allows support for memory-mapped database
-	// implementations.
+	// The returned bytes belong to the caller and stay valid after the
+	// transaction ends, under the same terms as FetchBlockRegion.
 	FetchBlockRegions(regions []BlockRegion) ([][]byte, error)
 
 	// PruneBlocks deletes the block files until it reaches the target size

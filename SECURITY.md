@@ -63,6 +63,15 @@ wallet components:
 - **Oyster** - wallet daemon (`wallet/`)
 - **SPV** - light client (`spv/`)
 
+The rewards mentioned above apply only to production code on the default
+branch (`master`) or the latest supported release. Reports against feature
+branches, work-in-progress, experimental PRs, or other unmerged code are
+**not bounty-eligible**, even if the component would otherwise be in bounty
+scope. Nevertheless, such findings may still be reported privately via
+[Reporting a Vulnerability](#reporting-a-vulnerability), or as regular
+[GitHub issues](https://github.com/pearl-research-labs/pearl/issues) for
+non-security bugs.
+
 Reports against other components in the repo (`miner/`, `py-pearl-mining/`,
 `dnsseeder/`, `apps/`) are **not bounty-eligible** and should be filed as
 regular [GitHub issues](https://github.com/pearl-research-labs/pearl/issues).

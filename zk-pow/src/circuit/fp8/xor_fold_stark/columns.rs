@@ -3,7 +3,9 @@
 //!
 //! Each live row folds one Matmul cell. The leading class-(a) columns `cell_id`, `lane_id`,
 //! `is_lane_final`, and `is_pad` bind the committed lane layout; the remaining columns hold
-//! the raw f32 cell word, input state, exact 64-bit multiply-add limbs, and rotation split.
+//! the raw f32 cell word, that cell's policy-skip subtotal, the tile-wide running skip count,
+//! the terminal budget slack, the input state, exact 64-bit multiply-add limbs, and rotation
+//! split.
 //! `0x9E3779B1` and rotation distance 13 are fixed protocol mixing constants.
 
 use crate::circuit::fp8::columns_view::columns_view;
@@ -28,6 +30,17 @@ pub struct XorFoldColumnsView<T: Copy> {
     /// The cell's f32 word as two 16-bit limbs (RC16'd), CTL-received from Matmul.
     pub cell_result_f32_lo: T,
     pub cell_result_f32_hi: T,
+    /// Number of this cell's `k` summands that Matmul classifies below the M/Z
+    /// unpredictability threshold; CTL-received from Matmul with the cell result.
+    pub cell_skips: T,
+    /// Inclusive sum of `CELL_SKIPS` from the first live row through this row. Padding rows
+    /// carry the final total unchanged.
+    pub running_skips: T,
+    /// Base-`2^16` limbs of `SKIP_LIMIT - RUNNING_SKIPS` on the final trace row. RC16 bounds
+    /// both limbs, so the final-row equality proves that the tile-wide skip total does not
+    /// exceed the verifier-derived public limit. Honest traces write zero on other rows.
+    pub skip_gate_slack_lo: T,
+    pub skip_gate_slack_hi: T,
     /// The lane's running fold state entering this row (0 at lane start).
     pub fold_state_in: T,
     /// 16-bit limbs of the 64-bit multiply-add `FOLD_STATE_IN*0x9E3779B1 + W`, where
@@ -52,11 +65,13 @@ pub struct XorFoldColumnsView<T: Copy> {
 /// Total number of committed XorFoldStark columns.
 pub const NUM_XOR_FOLD_COLUMNS: usize = size_of::<XorFoldColumnsView<u8>>();
 
-// Committed-column count: 10 main + 4 class (a).
-const _: () = assert!(NUM_XOR_FOLD_COLUMNS == 14);
+// Committed-column count: 14 main + 4 class (a).
+const _: () = assert!(NUM_XOR_FOLD_COLUMNS == 18);
 
-/// XorFoldStark has no public inputs.
-pub const NUM_XOR_FOLD_PUBLIC_INPUTS: usize = 0;
+/// Exact tile-wide skip allowance `floor(k*h*w/20)`, derived by the verifier from the public
+/// job dimensions rather than chosen by the prover.
+pub const SKIP_LIMIT_PUBLIC_INPUT: usize = 0;
+pub const NUM_XOR_FOLD_PUBLIC_INPUTS: usize = 1;
 
 columns_view!(XorFoldColumnsView, NUM_XOR_FOLD_COLUMNS, XOR_FOLD_COL_MAP);
 

@@ -31,6 +31,9 @@ from pearl_mining import (
     IncompleteBlockHeader,
     verify_plain_proof_for_cert_version,
 )
+from pearl_mining import (
+    Device as NativeDevice,
+)
 
 _M = 256
 _N = 256
@@ -125,6 +128,13 @@ def test_plain_peel_proof_verifies_and_binds_header(tile):
     other_header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS, timestamp=header.timestamp + 1)
     accepted, _ = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, other_header, proof)
     assert not accepted
+
+
+def test_plain_peel_proof_maps_hopper_to_native_h100():
+    config = default_mining_config(k=_K, rank=32, device=Device.HOPPER)
+    proof = create_proof(_opening(config=config), make_plain_peel_header())
+
+    assert proof.common.device == NativeDevice.H100
 
 
 def test_tall_tile_keeps_high_k_proof_under_the_verifier_cap():

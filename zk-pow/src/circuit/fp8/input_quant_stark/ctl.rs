@@ -2,7 +2,7 @@
 //!
 //! A cross-table lookup (CTL) proves multiset equality between this trace and another STARK.
 //! This file defines InputQuant's half of four channels: committed int8 bytes and block scales
-//! from Blake3Stark, fp8 operand codes to MatmulB200Stark, and completed row-group tuples to
+//! from Blake3Stark, fp8 operand codes to the device-specific Matmul table, and completed row-group tuples to
 //! ScaleStark. Their counterpart halves are assembled by
 //! `super::super::ctl::all_cross_table_lookups`.
 //!
@@ -15,7 +15,9 @@ use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
-use super::super::ctl::{LutLookup, LutTable, Table};
+use super::super::ctl::Table;
+use super::super::luts::LutTable;
+use super::super::luts::ctl::LutLookup;
 use super::columns::{
     B_BLOCK_KEY_OFFSET_PUBLIC_INPUT, B_KEY_OFFSET_PUBLIC_INPUT, BlockL2Columns, INPUT_QUANT_COL_MAP, OPERAND_MULT_A_PUBLIC_INPUT,
     OPERAND_MULT_B_PUBLIC_INPUT,
@@ -116,7 +118,7 @@ pub fn ctl_block_scales_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F
     .to_vec()
 }
 
-/// InputQuant's side of the fp8 operand-code channel to MatmulB200Stark. Each tuple contains an
+/// InputQuant's side of the fp8 operand-code channel to Matmul. Each tuple contains an
 /// element key (A: `ELEM_IDX`, B: `ELEM_IDX + h*k` — disjoint key spaces), two consecutive
 /// noised fp8 codes packed into one field element, and the same two elements' summand
 /// scores `LAMBDA` (jackpot check 4) as separate slots.

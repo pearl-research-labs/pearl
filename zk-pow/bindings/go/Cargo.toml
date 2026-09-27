@@ -16,6 +16,7 @@ anyhow = "1.0"
 itertools = "0.14"
 log = "0.4"
 rand = "0.8"
+sha2 = "0.10"
 primitive-types = "0.12"
 env_logger = "0.10.0"
 

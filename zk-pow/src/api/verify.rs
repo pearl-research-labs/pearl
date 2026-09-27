@@ -4,11 +4,9 @@ use crate::api::{
     fp8::{
         jackpot_policy::{JackpotPolicy, OperandStrip},
         noise::{OperandNoise, compute_fp8_noise},
-        openings::PrivateProofParams,
         plain_proof::PlainProofV4,
         prequant::{BLOCK_SIZE, PrequantOperand, exact_norms, open_prequant},
-        public_params::PublicParams,
-        quantization::{Fp8E4M3Quant, Quant},
+        quantization::Fp8E4M3Quant,
         transcript::compute_jackpot_ticket,
     },
     primitives::IncompleteBlockHeader,
@@ -25,7 +23,7 @@ fn open_and_noisy_quantize(
     operand: &PrequantOperand,
     k: usize,
     noise: &OperandNoise,
-    quantization: &impl Quant<u16, u8>,
+    quantization: &Fp8E4M3Quant,
 ) -> Result<OperandStrip> {
     ensure!(
         operand.values.row_bytes() == k,
@@ -53,25 +51,32 @@ fn open_and_noisy_quantize(
     Ok(OperandStrip { clean: codes, built })
 }
 
-// Assumption: the caller guarantees the opened operands already match the committed
-// `rows_pattern`/`cols_pattern`, so no re-check here.
-fn verify_plain_proof_fp8(
-    private_params: &PrivateProofParams,
-    public_params: &PublicParams,
+/// Verifies a v4 FP8 plain proof under the whitepaper-fixed jackpot policy for
+/// the statement's committed device.
+pub fn verify_plain_proof(
     proposed_header: &IncompleteBlockHeader,
-    nbits: u32,
-    jackpot_policy: JackpotPolicy,
+    plain_proof: &PlainProofV4,
+    nbits_override: Option<u32>,
 ) -> Result<()> {
-    let quantization = Fp8E4M3Quant;
+    let (private_params, public_params) = plain_proof.parse_proof(proposed_header)?;
+    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
+    let device = public_params.common().device;
+    let quantization = Fp8E4M3Quant::new(device);
     let k = public_params.common_dim() as usize;
 
     // Open each operand's committed strips, inject the deterministic noise,
     // and quantize: A' = Q(alpha_a·A + beta_a·E1@F1), likewise for B'.
-    let noise = compute_fp8_noise(public_params, proposed_header);
+    let noise = compute_fp8_noise(&public_params, proposed_header);
     let tile_a = open_and_noisy_quantize(&private_params.operands.a, k, &noise.a, &quantization)?;
     let tile_b = open_and_noisy_quantize(&private_params.operands.b, k, &noise.b, &quantization)?;
 
-    let Some(message) = jackpot_policy.evaluate(&tile_a, &tile_b, k, &public_params.a().pattern, &public_params.b().pattern)?
+    let Some(message) = JackpotPolicy::for_device(device).evaluate(
+        &tile_a,
+        &tile_b,
+        k,
+        &public_params.a().pattern,
+        &public_params.b().pattern,
+    )?
     else {
         bail!("The jackpot is not admissible");
     };
@@ -82,35 +87,13 @@ fn verify_plain_proof_fp8(
     check_jackpot_difficulty(&ticket.jackpot, nbits, public_params.h(), public_params.w(), k as u32)
 }
 
-pub fn verify_plain_proof_with_policy(
-    proposed_header: &IncompleteBlockHeader,
-    plain_proof: &PlainProofV4,
-    nbits_override: Option<u32>,
-    jackpot_policy: JackpotPolicy,
-) -> Result<()> {
-    let (private_params, public_params) = plain_proof.parse_proof(proposed_header)?;
-
-    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-    verify_plain_proof_fp8(&private_params, &public_params, proposed_header, nbits, jackpot_policy)
-}
-
-/// Verifies a v4 (FP8) plain proof, supplying the consensus-default
-/// [`JackpotPolicy`].
-pub fn verify_plain_proof(
-    proposed_header: &IncompleteBlockHeader,
-    plain_proof: &PlainProofV4,
-    nbits_override: Option<u32>,
-) -> Result<()> {
-    verify_plain_proof_with_policy(proposed_header, plain_proof, nbits_override, JackpotPolicy::default())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::circuit::fp8::consistency::{fixture_job, fixture_job_untamed};
 
     /// The full plain-proof acceptance path: wire parse (Merkle openings),
-    /// deterministic noise replay, noisy quantization, the four jackpot checks, and the
+    /// deterministic noise replay, noisy quantization, the jackpot policy, and the
     /// winning condition (the fixture header's easy nbits saturates the difficulty bound).
     #[test]
     fn plain_verifier_accepts_the_honest_fixture() {
@@ -118,25 +101,13 @@ mod tests {
         verify_plain_proof(&header, &plain, None).unwrap_or_else(|e| panic!("the honest fixture must verify: {e:#}"));
     }
 
-    /// A tile committing the same value plane on both sides replays coherent diagonal
-    /// cells that blow the tamed-products allowance (jackpot check 3): the plain
-    /// verifier rejects it, and lifting `eps_tame` alone accepts it — pinning the
-    /// rejection to check 3. The ZK pipeline refuses to even trace the same job
-    /// (`crate::circuit::fp8::consistency` tests).
+    /// This historical coherent fixture also exceeds the new consolidated census, so
+    /// removing Check 3 must not accidentally turn it into an accepted proof.
     #[test]
-    fn plain_verifier_rejects_an_untamed_tile() {
+    fn plain_verifier_rejects_coherent_fixture_under_new_census() {
         let (header, plain) = fixture_job_untamed();
-        let err = verify_plain_proof(&header, &plain, None).expect_err("the untamed tile must be rejected");
-        assert!(
-            format!("{err:#}").contains("not admissible"),
-            "the rejection must be the policy's, got: {err:#}"
-        );
-        let lifted = JackpotPolicy {
-            eps_tame: 1.0,
-            ..JackpotPolicy::default()
-        };
-        verify_plain_proof_with_policy(&header, &plain, None, lifted)
-            .unwrap_or_else(|e| panic!("only the tamed allowance may reject this tile: {e:#}"));
+        let err = verify_plain_proof(&header, &plain, None).expect_err("the consolidated census must reject");
+        assert!(format!("{err:#}").contains("not admissible"));
     }
 
     /// The v4 witness codec round-trips the dense consistency fixture: the

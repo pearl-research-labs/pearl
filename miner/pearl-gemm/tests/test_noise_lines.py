@@ -1,27 +1,27 @@
-"""``noise_lines`` vs the reference ``OperandNoiser``: bit-exact keyed line draws.
+"""``noise_lines``: bit-exact keyed line draws against pinned digests.
 
-Every ``side | factor`` address and several counts, gated with byte equality:
-the kernel shares the fused prep kernels' line generator, so this also pins
-the E_A/E_B device draw in isolation.
+Every ``side | factor`` address and several counts, gated on the digest of the
+protocol's draw (``helpers/digests.py``): the kernel shares the fused prep
+kernels' line generator, so this also pins the E_A/E_B device draw in
+isolation. Only ``E_A`` is keyed by seedA; the other three factors are keyed
+by seedB.
 """
 
 import pytest
 import torch
 from blake3 import blake3
-from miner_base.commitment import Device
 from miner_base.commitment_hash import noise_line_key
-from miner_base.hardware import hardware_for
-from miner_base.noise import Factor, OperandNoiser, Side
 
 from pearl_gemm import LABEL_E1, LABEL_E2, LABEL_F1, LABEL_F2, noise_lines
 from pearl_gemm.protocol_constants import R
+from tests.helpers.digests import digest, reference_digests
 
-# label -> (side, factor) of the reference draw it addresses.
+# label -> (device label, side, factor): the wire ``side(1) | factor(1)`` address.
 _LABELS = {
-    "e1": (LABEL_E1, Side.A, Factor.E),
-    "e2": (LABEL_E2, Side.B, Factor.E),
-    "f1": (LABEL_F1, Side.A, Factor.F),
-    "f2": (LABEL_F2, Side.B, Factor.F),
+    "e1": (LABEL_E1, 0, 0),
+    "e2": (LABEL_E2, 1, 0),
+    "f1": (LABEL_F1, 0, 1),
+    "f2": (LABEL_F2, 1, 1),
 }
 
 
@@ -37,7 +37,23 @@ def _device_lines(key: bytes, label: bytes, count: int) -> torch.Tensor:
     return out.cpu()
 
 
-def test_labels_are_the_reference_addresses():
+def _device_factors(seed_a: bytes, seed_b: bytes, rows: int, k: int) -> dict[str, torch.Tensor]:
+    """The four factors as the kernel chain draws them: ``E_A`` under seedA's
+    noise-line key, ``F_A``/``E_B``/``F_B`` under seedB's (each ``(lines x r)``)."""
+    key_a, key_b = noise_line_key(seed_a), noise_line_key(seed_b)
+    return {
+        "E_A": _device_lines(key_a, LABEL_E1, rows),
+        "F_A": _device_lines(key_b, LABEL_F1, k),
+        "E_B": _device_lines(key_b, LABEL_E2, rows),
+        "F_B": _device_lines(key_b, LABEL_F2, k),
+    }
+
+
+def _same_bits(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    return torch.equal(lhs.view(torch.uint8), rhs.view(torch.uint8))
+
+
+def test_labels_are_the_protocol_addresses():
     """The device address prefixes are the wire ``side(1) | factor(1)`` bytes."""
     for label, side, factor in _LABELS.values():
         assert label == bytes((side, factor))
@@ -45,49 +61,37 @@ def test_labels_are_the_reference_addresses():
 
 @pytest.mark.parametrize("label_name", sorted(_LABELS))
 @pytest.mark.parametrize("count", [16, 128, 1000])
-def test_lines_match_reference_noiser(label_name, count):
-    """Raw draws equal ``OperandNoiser._lines`` under the side's noise-line key
-    byte-for-byte.
+def test_lines_match_pinned_digests(label_name, count):
+    """Raw draws under the factor's noise-line key match the protocol's lines
+    byte-for-byte (E lines row by row; F as the transposed ``k``-line basis).
 
     1000 exercises the tail CTA's bounds guard (not a multiple of the block).
     """
     seed_a, seed_b = _seeds()
-    label, side, factor = _LABELS[label_name]
-    seed = seed_a if side is Side.A else seed_b
-    noiser = OperandNoiser(seed, side, R, count, hardware_for(Device.BLACKWELL).compute)
-    assert noiser._key == noise_line_key(seed)
-    ref = noiser._lines(factor, range(count))
-    got = _device_lines(noiser._key, label, count)
-    assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+    label = _LABELS[label_name][0]
+    line_key = noise_line_key(seed_a if label_name == "e1" else seed_b)
+    device_lines = _device_lines(line_key, label, count)
+    expected = reference_digests()["noise_lines"]["lines"][str(count)][label_name]
+    assert digest(device_lines) == expected
 
 
-def test_f_basis_assembly_matches_reference():
-    """Transposed draws equal ``OperandNoiser.F`` per side (the memoized basis)."""
+def test_only_e_a_moves_with_seed_a():
+    """Draw all four factors for (A, B), then for (A', B): both match the
+    pinned draws, F_A, E_B and F_B are unchanged, and only E_A moves."""
     seed_a, seed_b = _seeds()
-    k = 1536
-    noise_a = OperandNoiser(seed_a, Side.A, R, k, hardware_for(Device.BLACKWELL).compute)
-    noise_b = OperandNoiser(seed_b, Side.B, R, k, hardware_for(Device.BLACKWELL).compute)
-    f_a = _device_lines(noise_line_key(seed_a), LABEL_F1, k).t().contiguous()
-    f_b = _device_lines(noise_line_key(seed_b), LABEL_F2, k).t().contiguous()
-    assert torch.equal(f_a.view(torch.uint8), noise_a.F().view(torch.uint8))
-    assert torch.equal(f_b.view(torch.uint8), noise_b.F().view(torch.uint8))
-    # The sides are keyed apart: the same seed under B's address is a different draw.
-    assert not torch.equal(
-        _device_lines(noise_line_key(seed_a), LABEL_F2, k).view(torch.uint8),
-        f_a.t().contiguous().view(torch.uint8),
-    )
-
-
-def test_e_draws_match_reference_noiser():
-    """E_A/E_B row draws equal the public ``OperandNoiser.E`` under their keys."""
-    seed_a, seed_b = _seeds()
-    n = 96
-    noise_a = OperandNoiser(seed_a, Side.A, R, 512, hardware_for(Device.BLACKWELL).compute)
-    noise_b = OperandNoiser(seed_b, Side.B, R, 512, hardware_for(Device.BLACKWELL).compute)
-    e_a = _device_lines(noise_line_key(seed_a), LABEL_E1, n)
-    e_b = _device_lines(noise_line_key(seed_b), LABEL_E2, n)
-    assert torch.equal(e_a.view(torch.uint8), noise_a.E(list(range(n))).view(torch.uint8))
-    assert torch.equal(e_b.view(torch.uint8), noise_b.E(list(range(n))).view(torch.uint8))
+    seed_a_prime = blake3(b"noise-lines-seed-a-prime").digest()
+    rows, k = 96, 1536
+    expected = reference_digests()["noise_lines"]["factors_96x1536"]
+    device = _device_factors(seed_a, seed_b, rows, k)
+    device_prime = _device_factors(seed_a_prime, seed_b, rows, k)
+    assert digest(device["E_A"]) == expected["E_A"]
+    assert digest(device_prime["E_A"]) == expected["E_A_prime"]
+    for name in ("F_A", "E_B", "F_B"):
+        assert digest(device[name]) == expected[name], name
+        assert _same_bits(device[name], device_prime[name]), name
+    assert not _same_bits(device["E_A"], device_prime["E_A"])
+    # Same seedB, different Side addresses: F_A and F_B are distinct draws.
+    assert not _same_bits(device["F_A"], device["F_B"])
 
 
 def test_rejects_malformed_requests():

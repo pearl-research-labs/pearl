@@ -16,9 +16,8 @@
 //!
 //! The trailing paths are optional: with fewer arguments only the leading
 //! caches are written (fp8, then v2, then v1), and a path of `-` skips that
-//! cache. Regenerating the fp8 cache also rewrites the committed
-//! LUT caps file (`lut_caps.bin`, next to the cache) — the cached circuits
-//! bake the cap, so the two files move together.
+//! cache. The FP8 cache derivation bakes each device's freshly derived LUT cap
+//! into its wrapper circuit; no separate LUT-cap artifact is written.
 
 use anyhow::{Context, Result, ensure};
 
@@ -45,10 +44,7 @@ fn main() -> Result<()> {
     let v1_path = skippable(args.next());
 
     if let Some(fp8_path) = fp8_path {
-        let caps_path = std::path::Path::new(&fp8_path).with_file_name("lut_caps.bin");
-        let (caps_bytes, cache_bytes) = build_fp8_caches()?;
-        std::fs::write(&caps_path, &caps_bytes).with_context(|| format!("writing {}", caps_path.display()))?;
-        println!("wrote {} ({} bytes)", caps_path.display(), caps_bytes.len());
+        let cache_bytes = build_fp8_cache()?;
         std::fs::write(&fp8_path, &cache_bytes).with_context(|| format!("writing {fp8_path}"))?;
         println!("wrote {fp8_path} ({} bytes)", cache_bytes.len());
     }
@@ -85,27 +81,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Builds the committed fp8 artifacts in one consistent pass: the LUT cap,
-/// derived fresh from the tables ([`zk_pow::api::fp8::lut_caps`] — not from
-/// the possibly stale embedded file), and the verifier cache — one *universal*
-/// setup (the degree profile and geometry are public inputs, so a single
-/// entry covers every envelope-legal job), compiled from the canonical statement
-/// ([`zk_pow::api::fp8::zk::sample_dense_statement`]) against that same cap.
-fn build_fp8_caches() -> Result<(Vec<u8>, Vec<u8>)> {
-    use zk_pow::api::fp8::lut_caps::{cap_from_file_bytes, derive_lut_caps_bytes};
-    use zk_pow::api::fp8::zk::{Fp8Verifier, Fp8VerifierCache, sample_dense_statement};
-
-    let caps_bytes = derive_lut_caps_bytes()?;
-    println!("derived the LUT cap");
+/// Builds the sole FP8 setup artifact: one *universal* verifier per device. Each
+/// setup derives its cap fresh from the LUT tables before baking it into the wrapper
+/// circuit; the degree profile and geometry remain public inputs.
+fn build_fp8_cache() -> Result<Vec<u8>> {
+    use zk_pow::api::fp8::public_params::Device;
+    use zk_pow::api::fp8::zk::{Fp8Verifier, Fp8VerifierCache, sample_dense_statement_for_device};
 
     let mut cache = Fp8VerifierCache::default();
-    let params = sample_dense_statement()?;
-    let lut_cap = cap_from_file_bytes(&caps_bytes);
-    let mut timing = plonky2::util::timing::TimingTree::default();
-    let verifier = Fp8Verifier::generate_with_lut_cap(&params, params.ancestor_header(), lut_cap, &mut timing)?;
-    cache.insert(&params, verifier);
-    println!("compiled the fp8 verifier setup");
+    for device in [Device::H100, Device::B200] {
+        let params = sample_dense_statement_for_device(device)?;
+        let mut timing = plonky2::util::timing::TimingTree::default();
+        let verifier = Fp8Verifier::generate(&params, params.ancestor_header(), &mut timing)?;
+        cache.insert(device, verifier);
+        println!("compiled the {device:?} fp8 verifier setup");
+    }
 
-    ensure!(!cache.is_empty(), "fp8 verifier cache came out empty");
-    Ok((caps_bytes, cache.to_bytes()?))
+    ensure!(
+        cache.contains_all_devices(),
+        "fp8 verifier cache must contain exactly the H100 and B200 setups"
+    );
+    cache.to_bytes()
 }

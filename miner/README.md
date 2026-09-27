@@ -17,7 +17,9 @@ directory names use hyphens; Python import packages use underscores.
 - **`pearl-gateway`** is the node-to-miner bridge the miner submits proofs
   through; **`miner-utils`** holds the shared logging helpers.
 
-The FP8 protocol math lives in `miner-base` (commitments, noise, quantization, scheme, hardware).
+`miner-base` holds the host-side protocol surface the GPU miners share
+(commitments, keys, prequantized planes, proof construction and submission);
+the FP8 noise and quantization math runs in the `pearl-gemm` kernels.
 
 ## Distributed dense mining
 

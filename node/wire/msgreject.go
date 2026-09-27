@@ -159,7 +159,7 @@ func (msg *MsgReject) MaxPayloadLength(pver uint32) uint32 {
 	// Unfortunately the wire protocol does not enforce a sane
 	// limit on the length of the reason, so the max payload is the
 	// overall maximum message payload.
-	return MaxMessagePayload
+	return MaxProtocolMessageLength
 }
 
 // NewMsgReject returns a new reject message that conforms to the

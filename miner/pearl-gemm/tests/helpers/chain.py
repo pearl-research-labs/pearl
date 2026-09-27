@@ -2,23 +2,23 @@
 
 The A side of the chain, from the two committed blobs to the three A keys
 (``seedA || noise-line key A || jackpot key``) the prep and GEMM kernels
-consume, plus the reference ``OperandNoiser`` for either side. Protocol
-composition over a real block header is owned by the production miner;
-these helpers only keep the fixture boilerplate of the per-kernel tests
-in one place.
+consume, plus the job-constant F bases drawn on device under the fixed seedB.
+Protocol composition over a real block header is owned by the production
+miner; these helpers only keep the fixture boilerplate of the per-kernel
+tests in one place.
 """
 
 from dataclasses import dataclass
 
 import torch
 from blake3 import blake3
-from miner_base.commitment import Device
 from miner_base.commitment_hash import AKeys, noise_line_key
-from miner_base.hardware import hardware_for
-from miner_base.noise import OperandNoiser, Side
 
 from pearl_gemm import (
+    LABEL_F1,
+    LABEL_F2,
     TensorHashConfig,
+    noise_lines,
     tensor_hash_plus_stats,
     tensor_hash_workspace_bytes,
 )
@@ -49,6 +49,7 @@ class CommittedA:
     root_scales: torch.Tensor
     commit_stats: torch.Tensor
     a_keys_dev: torch.Tensor  # (96,) u8 on device
+    seed_b: bytes = SEED_B  # keys both F bases (F_A at the Side.A address)
 
     @property
     def a_keys(self) -> AKeys:
@@ -65,13 +66,6 @@ class CommittedA:
     @property
     def pow_key_dev(self) -> torch.Tensor:
         return self.a_keys_dev[64:96]
-
-    def noise_a(self, k: int, compute=None) -> OperandNoiser:
-        noiser = OperandNoiser(
-            self.seed_a, Side.A, R, k, compute or hardware_for(Device.BLACKWELL).compute
-        )
-        assert noiser._key == noise_line_key(self.seed_a)
-        return noiser
 
 
 def commit_a(
@@ -92,6 +86,7 @@ def commit_a(
         root_scales=torch.zeros(32, dtype=torch.uint8, device=device),
         commit_stats=torch.zeros(2 * (m * k // 512), dtype=torch.float32, device=device),
         a_keys_dev=torch.zeros(96, dtype=torch.uint8, device=device),
+        seed_b=seed_b,
     )
     roots = torch.zeros(
         tensor_hash_workspace_bytes(m, k, hash_config), dtype=torch.uint8, device=device
@@ -113,8 +108,17 @@ def commit_a(
     return committed
 
 
-def noise_b(seed_b: bytes = SEED_B, k: int = 512, compute=None) -> OperandNoiser:
-    return OperandNoiser(seed_b, Side.B, R, k, compute or hardware_for(Device.BLACKWELL).compute)
+def f_bases(k: int, seed_b: bytes = SEED_B, device="cuda") -> tuple[torch.Tensor, torch.Tensor]:
+    """``(F_A, F_B)``, each ``(R x k)`` e4m3: the ``k``-line draws under seedB's
+    noise-line key at the ``Side.A`` / ``Side.B`` F addresses, transposed."""
+    key = device_bytes(noise_line_key(seed_b), device)
+    lines = torch.zeros(k, R, dtype=torch.float8_e4m3fn, device=device)
+    bases = []
+    for label in (LABEL_F1, LABEL_F2):
+        noise_lines(key, label, lines)
+        bases.append(lines.t().contiguous())
+    torch.cuda.synchronize()
+    return bases[0], bases[1]
 
 
 def noise_key_b_dev(seed_b: bytes = SEED_B, device="cuda") -> torch.Tensor:

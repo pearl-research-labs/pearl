@@ -1,24 +1,28 @@
 //! Connects each XorFold step's `cell_word` input and `fold_out` output.
 //!
-//! Live rows receive `(cell_id, cell_result_f32_lo, cell_result_f32_hi)` from Matmul.
-//! Lane-final rows send `(lane_id, fold_out)` to Blake3; RC16 lookups bound arithmetic limbs.
+//! Live rows receive `(cell_id, cell_result_f32_lo, cell_result_f32_hi, cell_skips)` from
+//! Matmul, binding each folded result to its certified unpredictability-census subtotal.
+//! Lane-final rows send `(lane_id, fold_out)` to Blake3. RC16 lookups bound both the mixer
+//! arithmetic and the two limbs of the final nonnegative skip-budget slack.
 
 use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
-use super::super::ctl::{LutLookup, Table};
+use super::super::ctl::Table;
+use super::super::luts::ctl::LutLookup;
 use super::columns::XOR_FOLD_COL_MAP;
 
 /// XorFold's looking side of the **cell results** channel: `(CELL_ID,
-/// CELL_RESULT_F32_LO, CELL_RESULT_F32_HI)`, filter `1 - IS_PAD` — every live row folds
-/// exactly one finished cell; the power-of-two padding rows fold nothing.
+/// CELL_RESULT_F32_LO, CELL_RESULT_F32_HI, CELL_SKIPS)`, filter `1 - IS_PAD` — every live
+/// row folds one finished cell and imports the number of that cell's summands below the
+/// Matmul table's M/Z unpredictability threshold.
 /// Matmul's looked side is `super::super::ctl::ctl_cell_results_looked_matmul`.
 pub fn ctl_cell_results_looking_xor_fold<F: Field>() -> TableWithColumns<F> {
     let m = &XOR_FOLD_COL_MAP;
     TableWithColumns::new(
         Table::XorFold.into(),
-        Column::singles([m.cell_id, m.cell_result_f32_lo, m.cell_result_f32_hi]).collect(),
+        Column::singles([m.cell_id, m.cell_result_f32_lo, m.cell_result_f32_hi, m.cell_skips]).collect(),
         Filter::from_column(Column::linear_combination_with_constant([(m.is_pad, -F::ONE)], F::ONE)),
     )
 }
@@ -45,9 +49,11 @@ pub fn ctl_lottery_words_looked_xor_fold<F: Field>() -> TableWithColumns<F> {
     )
 }
 
-/// XorFoldStark's per-row LUT inventory: RC16 x10 — the four mul-add limbs,
+/// XorFoldStark's per-row LUT inventory: RC16 x12 — the four mul-add limbs,
 /// the rotation-split bounds and the canonicity cap `MULADD_HIGH_LIMB_1 + 1` that kills X1's
-/// `+p` limb alias.
+/// `+p` limb alias, plus the two skip-budget slack limbs. The slack lookups apply on every row;
+/// only the final row enters the budget equality, and honest traces set both limbs to zero
+/// elsewhere.
 ///
 /// Both sub-16-bit splits use the unshifted + shifted RC16 pair, because a scaled RC16 alone
 /// never bounds a Goldilocks column (`2^k` divides `v + j*p` for suitable `j`, producing huge
@@ -79,6 +85,8 @@ pub fn xor_fold_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
             [(m.muladd_high_limb_1, F::ONE)],
             F::ONE,
         )),
+        LutLookup::rc16(Column::single(m.skip_gate_slack_lo)),
+        LutLookup::rc16(Column::single(m.skip_gate_slack_hi)),
     ]
 }
 
@@ -99,9 +107,9 @@ mod tests {
 
     #[test]
     fn xor_fold_lut_inventory_matches_documented_counts() {
-        // Documented inventory: 10 RC16 instances, nothing else.
+        // Documented inventory: 12 RC16 instances, nothing else.
         let lookups = xor_fold_lut_lookups::<F>();
-        assert_eq!(lookups.len(), 10);
+        assert_eq!(lookups.len(), 12);
         assert!(lookups.iter().all(|l| l.table == LutTable::Range16));
     }
 }

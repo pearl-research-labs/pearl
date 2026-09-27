@@ -20,16 +20,14 @@ keep vLLM's unquantized BF16 path. All mined launches share one persistent
 copies and re-arms it before validating a candidate, so the first-wins latch is
 reusable across launches.
 
-Lottery candidates are validated against the reference `is_winning`, opened
-from the retained FP10 planes into certificate-v3 `PlainProof` objects, and
-canonically verified. Jackpot-policy-inadmissible candidates are filtered;
+Lottery candidates are opened from the retained FP10 planes into
+certificate-v3 `PlainProof` objects and canonically verified. Jackpot-policy-inadmissible candidates are filtered;
 admissible proofs are submitted to `pearl-gateway`. The gateway and Go node still do
 not support the certificate-v3 block wire format, so production node acceptance
 remains unavailable; integration uses the real miner RPC plus the consensus
 PlainPeel verifier. B-side per-job preparation runs the SM100 GPU chain
 (`tensor_hash_plus_stats_b -> noise_lines -> noisy_quant_b`) off the serving
-path. The CPU `build_b_rows` path is retained only as an independent oracle for
-rare winner validation; it never prepares production launch operands.
+path; there is no CPU fallback.
 
 Capability gates:
 

@@ -8,6 +8,8 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/btcec"
 	"github.com/pearl-research-labs/pearl/node/btcec/ellswift"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func setHex(hexString string) *btcec.FieldVal {
@@ -495,4 +497,54 @@ func TestPacketEncodingVectors(t *testing.T) {
 			}
 		}
 	}
+}
+
+type recordingAdmission struct {
+	acquired, released int
+}
+
+func (a *recordingAdmission) Acquire() (func(), error) {
+	a.acquired++
+	return func() { a.released++ }, nil
+}
+
+// TestDeriveV2CiphersReleasesLease pins that the responder lease is returned on success and when the derivation
+// panics; the peer goroutine recovers panics, so a leaked lease would never come back.
+func TestDeriveV2CiphersReleasesLease(t *testing.T) {
+	t.Parallel()
+
+	_, ellswiftTheirs, err := ellswift.EllswiftCreate()
+	require.NoError(t, err)
+
+	newResponder := func(t *testing.T) (*Peer, *recordingAdmission) {
+		t.Helper()
+
+		admission := &recordingAdmission{}
+		p := NewPeerWithOptions(WithResponderHandshakeAdmission(admission))
+		var err error
+		p.privkeyOurs, p.ellswiftOurs, err = ellswift.EllswiftCreate()
+		require.NoError(t, err)
+		return p, admission
+	}
+
+	t.Run("released on success", func(t *testing.T) {
+		p, admission := newResponder(t)
+		require.NoError(t, p.deriveV2Ciphers(ellswiftTheirs, false, PearlNet(1)))
+		assert.Equal(t, 1, admission.acquired)
+		assert.Equal(t, 1, admission.released)
+	})
+
+	t.Run("released when the derivation panics", func(t *testing.T) {
+		p, admission := newResponder(t)
+		p.privkeyOurs = nil
+		require.Panics(t, func() { _ = p.deriveV2Ciphers(ellswiftTheirs, false, PearlNet(1)) })
+		assert.Equal(t, 1, admission.acquired)
+		assert.Equal(t, 1, admission.released)
+	})
+
+	t.Run("initiator takes no lease", func(t *testing.T) {
+		p, admission := newResponder(t)
+		require.NoError(t, p.deriveV2Ciphers(ellswiftTheirs, true, PearlNet(1)))
+		assert.Zero(t, admission.acquired)
+	})
 }

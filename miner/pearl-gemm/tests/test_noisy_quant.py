@@ -1,23 +1,17 @@
-"""``noisy_quant`` vs the reference chain, over the two block-scaled A blobs.
+"""``noisy_quant`` against pinned digests, over the two block-scaled A blobs.
 
-A-side gates: E_A / alpha / beta / A' codes / peel_e bit-exact, A'@F_B.T
-peel to tolerance -- with the reference chain driven through the new-scheme
-API (``pre_quant`` -> commit over the codes and scales blobs -> the A keys,
-exact norms off the committed int8 blocks + scales, ``noisy_quantize`` over
-the opened rows).
+A-side gates: E_A / alpha / beta / A' codes / peel_e bit-exact against the
+protocol's operands for host-drawn inputs (``helpers/digests.py``), and the
+A'@F_B.T peel half against its fp64-exact product -- with the chain driven
+through the new-scheme API (``pre_quant`` -> commit over the codes and scales
+blobs -> the A keys -> ``noisy_quant`` against the device F bases).
 
 The kernel reads the committed codes and scales blobs and opens them in
-registers, while the reference is driven by ``PrequantMatrix.open()``: the
-bit-exact gates therefore also pin the in-kernel decode.
+registers, so the bit-exact gates also pin the in-kernel decode.
 """
 
 import pytest
 import torch
-from miner_base.commitment import Device
-from miner_base.hardware import hardware_for
-from miner_base.prequant import PrequantMatrix
-from miner_base.quantization import Fp8QuantScheme
-from miner_base.scheme import PearlScheme
 
 from pearl_gemm import (
     NoisyQuantConfig,
@@ -28,14 +22,8 @@ from pearl_gemm import (
     validate_noisy_quant_config,
 )
 from pearl_gemm.protocol_constants import R
-from tests.helpers.chain import commit_a, noise_b
-
-
-def _mism(got: torch.Tensor, ref: torch.Tensor) -> int:
-    def bits(t):
-        return t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t
-
-    return (bits(got.cpu()) != bits(ref)).sum().item()
+from tests.helpers.chain import commit_a, f_bases
+from tests.helpers.digests import digest, fixture_input, reference_digests
 
 
 def _rel(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -62,6 +50,10 @@ def _shape_id(shape):
     return "x".join(map(str, shape))
 
 
+def _case_id(m, k, seed):
+    return f"{m}x{k}-seed{seed}"
+
+
 def _commit(a: torch.Tensor):
     """pre_quant -> commit on GPU; returns the blobs and the committed A."""
     m, k = a.shape
@@ -72,23 +64,15 @@ def _commit(a: torch.Tensor):
     return codes, scales, commit_a(codes, scales)
 
 
-def _assert_chain_matches_reference(a: torch.Tensor, config_fields=None) -> None:
+def _assert_chain_matches_pinned(a: torch.Tensor, case: str, config_fields=None) -> None:
     """Run pre_quant -> commit -> noisy_quant on ``a`` and gate every A-side
-    output against the reference chain."""
+    output against the pinned ``case``."""
     m, k = a.shape
-    hw = hardware_for(Device.BLACKWELL)
 
     # Steps 1 + 2: block-scale quantization into the two blobs, commit both
     # blobs + fuse the stats, finalize the A keys (GPU).
     codes, scales, committed = _commit(a)
-
-    # Downstream ops consume the opened (dequantized) block-scaled rows.
-    aq_ref = PrequantMatrix.encode(a.cpu())
-    opened = aq_ref.open()
-
-    # Factors from the commitment chain (reference OperandNoiser per side).
-    noise_a, noise_bb = committed.noise_a(k, hw.compute), noise_b(k=k, compute=hw.compute)
-    e1, f1, f2 = noise_a.E(list(range(m))), noise_a.F(), noise_bb.F()
+    f1, f2 = f_bases(k)
 
     # Step 3 on GPU.
     config = NoisyQuantConfig(**(config_fields or {}))
@@ -102,8 +86,8 @@ def _assert_chain_matches_reference(a: torch.Tensor, config_fields=None) -> None
         scales,
         committed.noise_key_a_dev,
         committed.commit_stats,
-        pack_noise_factor(f1).cuda(),
-        f2.cuda().contiguous(),
+        pack_noise_factor(f1),
+        f2,
         alpha,
         beta,
         e1_out,
@@ -113,40 +97,28 @@ def _assert_chain_matches_reference(a: torch.Tensor, config_fields=None) -> None
     )
     torch.cuda.synchronize()
 
-    # Step 3 in the reference: rows are the opened blobs and the norms come
-    # off the committed int8 blocks + scales (exact_norms), matching the
-    # GPU's factored commit stats. beta is not carried on the built rows, so
-    # it comes back from the quant step that derives it.
-    row_norms = aq_ref.exact_norms()
-    ref_stacked = PearlScheme(hw, Fp8QuantScheme(), k, R).build_a_rows(
-        opened, noise_a, noise_bb, list(range(m)), row_norms
-    )
-    _, _, ref_beta, _ = Fp8QuantScheme().noisy_quantize(opened, e1, f1, hw, row_norms)
-
-    assert _mism(e1_out, e1) == 0, "E_A codes"
-    assert _mism(alpha, ref_stacked.alpha.flatten()) == 0, "alpha"
-    assert _mism(beta, ref_beta.flatten()) == 0, "beta"
-    assert _mism(a_prime, ref_stacked.quant_part) == 0, "A' codes"
-    assert _mism(a_peel[:, :R], ref_stacked.peel_part[:, :R]) == 0, "peel_e"
-    # The A'F_B half is the scheme's tolerance surface: both implementations
-    # approximate the fp64-exact A'@F_B.T (single fixed-order fp32 chains
-    # drift more at long k), so the gate is self-calibrating against the
-    # reference's own error, like the B-side mid gate.
-    af2_64 = ref_stacked.quant_part.float().double() @ f2.float().double().t()
+    expected = reference_digests()["noisy_quant"][case]
+    assert digest(e1_out) == expected["e1"], "E_A codes"
+    assert digest(alpha) == expected["alpha"], "alpha"
+    assert digest(beta) == expected["beta"], "beta"
+    assert digest(a_prime) == expected["a_prime"], "A' codes"
+    assert digest(a_peel[:, :R]) == expected["peel_e"], "peel_e"
+    # The A'F_B half is the scheme's tolerance surface: it approximates the
+    # fp64-exact A'@F_B.T of the (pinned) A' codes (single fixed-order fp32
+    # chains drift more at long k), within twice the reference's own error.
+    af2_64 = a_prime.cpu().float().double() @ f2.cpu().float().double().t()
     gpu_rel = _rel(a_peel[:, R:], af2_64)
-    ref_rel = _rel(ref_stacked.peel_part[:, R:], af2_64)
-    assert gpu_rel < max(2 * ref_rel, 1e-4), f"A'@F_B.T rel {gpu_rel} vs ref {ref_rel}"
+    assert gpu_rel < expected["peel_tol"], f"A'@F_B.T rel {gpu_rel}"
 
 
 @pytest.mark.parametrize("m,k", _SHAPES, ids=[_shape_id(s) for s in _SHAPES])
 @pytest.mark.parametrize("seed", [0, 1])
-def test_noisy_quant_matches_reference(m, k, seed):
-    torch.manual_seed(seed)
-    _assert_chain_matches_reference(torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 1.5)
+def test_noisy_quant_matches_pinned(m, k, seed):
+    _assert_chain_matches_pinned(fixture_input(m, k, seed).cuda(), _case_id(m, k, seed))
 
 
-# The pinned SM100 config families (consumer-E1 rows=64, both bk tiles)
-# against the reference at a multi-row-block shape.
+# The pinned SM100 config families (consumer-E1 rows=64, both bk tiles) at a
+# multi-row-block shape: the config never changes the bits.
 @pytest.mark.parametrize(
     "config_fields",
     [
@@ -164,10 +136,9 @@ def test_noisy_quant_matches_reference(m, k, seed):
         },
     ],
 )
-def test_pinned_config_families_match_reference(config_fields):
-    torch.manual_seed(0)
-    a = torch.randn(512, 4096, dtype=torch.bfloat16, device="cuda") * 1.5
-    _assert_chain_matches_reference(a, config_fields)
+def test_pinned_config_families_match_pinned(config_fields):
+    a = fixture_input(512, 4096, 0).cuda()
+    _assert_chain_matches_pinned(a, _case_id(512, 4096, 0), config_fields)
 
 
 # 2^56 (not bf16-max): bf16-max overflows fp32 norm accum to NaN beta.
@@ -181,9 +152,9 @@ _EDGE_FILLS = {
 
 
 @pytest.mark.parametrize("fill", sorted(_EDGE_FILLS))
-def test_edge_fill_activations_match_reference(fill):
+def test_edge_fill_activations_match_pinned(fill):
     a = torch.full((64, 512), _EDGE_FILLS[fill], dtype=torch.bfloat16, device="cuda")
-    _assert_chain_matches_reference(a)
+    _assert_chain_matches_pinned(a, fill)
 
 
 def test_consistency():
@@ -192,7 +163,7 @@ def test_consistency():
     torch.manual_seed(11)
     a = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 1.5
     codes, scales, committed = _commit(a)
-    f1, f2 = committed.noise_a(k).F(), noise_b(k=k).F()
+    f1, f2 = f_bases(k)
 
     config = NoisyQuantConfig()
 
@@ -207,8 +178,8 @@ def test_consistency():
             scales,
             committed.noise_key_a_dev,
             committed.commit_stats,
-            pack_noise_factor(f1).cuda(),
-            f2.cuda().contiguous(),
+            pack_noise_factor(f1),
+            f2,
             alpha,
             beta,
             e1_out,

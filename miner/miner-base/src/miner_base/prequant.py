@@ -26,8 +26,8 @@ def _qmax(bits: int) -> int:
 
 @dataclass(frozen=True)
 class RowNorms:
-    """Per-row ``(l2, linf)``, BF16 ``(n x 1)`` each, feeding
-    `~.quantization.Fp8QuantScheme.row_norms`. ``l2`` is
+    """Per-row ``(l2, linf)``, BF16 ``(n x 1)`` each, feeding the per-row
+    scale derivation (``alpha``, ``beta``). ``l2`` is
     ``rms(X) = sqrt(sumsq / k)``, grid-rounded (:func:`round_l2_to_grid`);
     both are computed by the caller straight from an operand's
     pre-BF16-rounding values, right where its ``sumsq`` is produced (see

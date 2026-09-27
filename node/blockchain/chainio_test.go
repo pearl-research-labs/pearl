@@ -11,8 +11,12 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestErrNotInMainChain ensures the functions related to errNotInMainChain work
@@ -718,4 +722,49 @@ func TestBestChainStateDeserializeErrors(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestDBBlockFromBytes pins the lenient own-database decoder: trailing bytes are dropped, not rejected, while
+// truncated data still fails and the strict constructor used for untrusted input keeps rejecting the same bytes.
+func TestDBBlockFromBytes(t *testing.T) {
+	t.Parallel()
+
+	params := &chaincfg.MainNetParams
+	var buf bytes.Buffer
+	require.NoError(t, params.GenesisBlock.Serialize(&buf))
+	exact := buf.Bytes()
+	withTrailing := append(append([]byte{}, exact...), 0xde, 0xad, 0xbe, 0xef)
+
+	tests := []struct {
+		name      string
+		in        []byte
+		wantBytes []byte
+		wantErr   bool
+	}{
+		{name: "exact bytes", in: exact, wantBytes: exact},
+		{name: "trailing bytes are dropped", in: withTrailing, wantBytes: exact},
+		{name: "truncated", in: exact[:len(exact)/2], wantErr: true},
+		{name: "empty", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			block, err := DBBlockFromBytes(tt.in, *params.GenesisHash)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			assert.Equal(t, params.GenesisHash, block.Hash())
+			got, err := block.Bytes()
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantBytes, got)
+		})
+	}
+
+	_, err := btcutil.NewBlockFromBytes(withTrailing)
+	require.Error(t, err, "the strict constructor must keep rejecting what the lenient one accepts")
 }

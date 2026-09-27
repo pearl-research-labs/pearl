@@ -10,23 +10,22 @@
 //! The trusted verifier setup is generated on the verifier side from the published
 //! statement alone ([`Fp8Verifier::generate`]) and round-trips through bytes.
 //!
-//! **Verifier setup resolution.** A verifier needs one [`Fp8Verifier`]: the stage-1
+//! **Verifier setup resolution.** A verifier needs one [`Fp8Verifier`] per device: the stage-1
 //! wrapper is the *universal* batch verifier (D1) — the degree profile and geometry are
 //! public inputs, not circuit shape — so a single setup covers every envelope-legal job.
 //! [`Fp8VerifierCache`] holds it keyed by the statement's device byte, preloaded
 //! from [`embedded_cache::CACHE_DATA`](crate::api::fp8::embedded_cache::CACHE_DATA)
-//! (built offline by `build_cache` against the committed caps file
-//! [`crate::api::fp8::lut_caps`] — the verifier side never builds a LUT oracle).
+//! (built offline by `build_cache`; each device's LUT cap is derived and baked into
+//! its cached circuit, so the verifier side never builds a LUT oracle).
 //! Verification is lookup-only: a setup missing from the cache rejects the proof
 //! rather than compiling it on demand, so no input can force an expensive
 //! circuit build through the verify path.
 //!
-//! **Cached data.** [`Fp8ProverData`] is the prover's cache: the LUT cap (the committed
-//! consensus value of [`crate::api::fp8::lut_caps`]) plus
-//! the full LUT precommitment oracle (LDEs + batched Merkle tree — prover-only). Both are
-//! job-independent: the batch order, the LUT positions and the consensus
-//! config are canonical constants. [`Fp8VerifierData`] is the verifier's cached view of
-//! the cap and an argument of [`verify_fp8_block`], exactly the "cached commitment" shape.
+//! **Cached data.** [`Fp8Prover`] owns one setup per device: the full LUT precommitment
+//! oracle (LDEs + batched Merkle tree — prover-only) and the compiled wrapper circuits.
+//! Each setup is job-independent: the batch order, LUT positions and consensus config are
+//! canonical constants. The first requested device is compiled by [`Fp8Prover::setup`];
+//! another device is compiled lazily on its first proof.
 //!
 //! **The statement and its public inputs.** [`Fp8Job::derive`] rebuilds the full
 //! statement from public data alone: the five programs (the Blake3 schedule from the shared
@@ -61,12 +60,11 @@
 //! *publishes* is the two-stage recursive wrap of [`crate::circuit::fp8::wrapper`]: the
 //! batch verification encoded in a plonky2 circuit (stage 1), re-wrapped with
 //! `zero_knowledge: true` (stage 2) — mirroring the deployed v2 `pearl_circuit`
-//! architecture, including its circuit-cache pattern: [`zk_prove_plain_proof_fp8_wrapped`]
-//! takes a [`Fp8CircuitCache`] and compiles the universal wrapper circuits on the first
-//! job, reusing them afterwards. [`verify_fp8_block_wrapped`] verifies the
-//! published proof: the same statement derivation and native epilogues as the unwrapped
-//! path, with the batch-level checks replaced by the wrapper's public-input pinning (every
-//! slot recomputed from the statement, the class (a) columns natively re-evaluated at the
+//! architecture. [`Fp8Prover`] compiles each device's universal wrapper circuits once and
+//! reuses them afterwards. Wrapped verification applies the same statement derivation and
+//! native epilogues as the unwrapped path, with the batch-level checks replaced by the
+//! wrapper's public-input pinning (every slot recomputed from the statement, the class (a)
+//! columns natively re-evaluated at the
 //! proof's `zeta`) plus one plonky2 verification against the consensus stage-2 verifier
 //! data.
 //!
@@ -80,16 +78,15 @@
 //! hold a full [`ProofWithPublicInputs`].
 
 use anyhow::{Context, Result, anyhow, ensure};
+use hashbrown::HashMap;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
-use plonky2::plonk::circuit_data::VerifierCircuitData;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
 use plonky2::util::timing::TimingTree;
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::BatchStarkPreprocessedData;
 
-use crate::api::fp8::lut_caps::{LutCap, committed_lut_cap};
 use crate::api::fp8::noise::compute_fp8_noise;
 use crate::api::fp8::openings::stream_words;
 use crate::api::fp8::plain_proof::PlainProofV4;
@@ -97,7 +94,7 @@ use crate::api::fp8::prequant::BLOCK_SIZE;
 use crate::api::fp8::public_params::{
     CommonParams, Device, HashId, JackpotStatement, JobParams, MoEStatement, OperandParams, PublicParams, Quant,
 };
-use crate::api::fp8::utils::{B200, fp32_to_bf16_rne};
+use crate::api::fp8::utils::fp32_to_bf16_rne;
 use crate::api::layout::{AxisPattern, DimType, lane_assignment};
 use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
 use crate::api::proof_utils::check_jackpot_difficulty;
@@ -110,12 +107,11 @@ pub use crate::circuit::fp8::circuit_utils::{Fp8Verifier, Fp8VerifierCache};
 use crate::circuit::fp8::ctl::NUM_TABLES;
 use crate::circuit::fp8::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8PublicData, Fp8System, Fp8Witness};
 use crate::circuit::fp8::input_quant_stark::stark::InputQuantProgram;
-use crate::circuit::fp8::matmul_b200_stark::stark::MatmulProgram;
 use crate::circuit::fp8::scale_stark::stark::ScaleProgram;
-use crate::circuit::fp8::tamed_stark::stark::TamedProgram;
-use crate::circuit::fp8::wrapper::{
-    Fp8CircuitCache, Fp8WrapperCircuits, OuterC, compact_proof_data, verify_compact_wrapped_proof, verify_wrapped_proof,
-};
+use crate::circuit::fp8::unpredictability::budget;
+#[cfg(test)]
+use crate::circuit::fp8::wrapper::verify_wrapped_proof;
+use crate::circuit::fp8::wrapper::{Fp8WrapperCircuits, OuterC, compact_proof_data, verify_compact_wrapped_proof};
 use crate::circuit::fp8::xor_fold_stark::stark::XorFoldProgram;
 // The u32-limb hash packing helpers live in the frozen v2 clone since the mainline
 // API no longer carries the legacy STARK plumbing.
@@ -151,35 +147,69 @@ impl MoEStatement {
     }
 }
 
-/// Per-family prover setup and recursive-circuit cache.
+/// Reusable prover setup for one device.
+struct Fp8ProverSetup {
+    device: Device,
+    preprocessed: BatchStarkPreprocessedData<F, C, D>,
+    circuits: Fp8WrapperCircuits,
+}
+
+impl Fp8ProverSetup {
+    fn build(device: Device, timing: &mut TimingTree) -> Result<Self> {
+        let params = sample_dense_statement_for_device(device)?;
+        let job = Fp8Job::derive(&params, params.ancestor_header())?;
+        let preprocessed = job.system.preprocessed_data::<C>(timing);
+        let circuits = Fp8WrapperCircuits::build(&job.system, &preprocessed.cap(), timing)?;
+        Ok(Self {
+            device,
+            preprocessed,
+            circuits,
+        })
+    }
+}
+
+/// Per-family prover. Strictly prover-side: it retains one setup per device and
+/// reuses it across every supported geometry.
 ///
-/// Strictly prover-side. Verifiers use their own trusted setup — compiled offline
-/// by `build_cache` ([`Fp8Verifier::generate`]) and shipped in [`Fp8VerifierCache`];
-/// both sides derive the same circuits deterministically from public data, so
-/// nothing needs to be handed over.
+/// Verifiers use their own trusted setup — compiled offline by `build_cache`
+/// ([`Fp8Verifier::generate`]) and shipped in [`Fp8VerifierCache`].
 pub struct Fp8Prover {
-    data: Fp8ProverData,
-    circuits: Fp8CircuitCache,
+    setups: HashMap<Device, Fp8ProverSetup>,
 }
 
 impl Fp8Prover {
-    /// Builds the prover's per-family data (the LUT precommitment and the
-    /// compiled universal wrapper circuits).
-    pub fn setup(proposed_header: &IncompleteBlockHeader, input: &PlainProofV4) -> Result<Self> {
+    /// Builds and retains the first device's LUT precommitment and universal
+    /// wrapper circuits. Other devices are built lazily by [`Self::prove`].
+    pub fn setup(device: Device) -> Result<Self> {
         let mut timing = TimingTree::default();
-        Self::setup_with_timing(proposed_header, input, &mut timing)
+        Self::setup_with_timing(device, &mut timing)
     }
 
-    fn setup_with_timing(proposed_header: &IncompleteBlockHeader, input: &PlainProofV4, timing: &mut TimingTree) -> Result<Self> {
-        let (_, params) = input
-            .parse_proof(proposed_header)
-            .context("parsing the fp8 input during setup")?;
-        let data = Fp8ProverData::generate(&params, proposed_header, timing)?;
-        let job = Fp8Job::derive(&params, proposed_header)?;
-        let mut circuits = Fp8CircuitCache::default();
-        // Pay the wrapper-circuit compilation cost up front so `prove` runs hot.
-        Fp8WrapperCircuits::with_cache(&job.system, &data.lut_cap, &mut circuits, timing)?;
-        Ok(Self { data, circuits })
+    fn setup_with_timing(device: Device, timing: &mut TimingTree) -> Result<Self> {
+        // Pay the LUT-preprocessing and wrapper-circuit compilation costs up front so
+        // `prove` does not pay them.
+        // TODO: Add `Fp8Prover::warmup_prove(&mut self, input: &PlainProofV4)` if
+        // shape-specific first-proof warm-up is needed. It can prove once against
+        // `IncompleteBlockHeader::zero()` and discard the result.
+        let setup = Fp8ProverSetup::build(device, timing)?;
+        Ok(Self {
+            setups: HashMap::from([(device, setup)]),
+        })
+    }
+
+    fn setup_for_device(&mut self, device: Device, timing: &mut TimingTree) -> Result<&mut Fp8ProverSetup> {
+        if !self.setups.contains_key(&device) {
+            self.setups.insert(device, Fp8ProverSetup::build(device, timing)?);
+        }
+        Ok(self.setups.get_mut(&device).expect("the device setup was just inserted"))
+    }
+
+    /// Builds and retains this device's LUT precommitment and universal wrapper
+    /// circuits now, so a later [`Self::prove`] does not pay that setup cost.
+    /// Calling this again for an already-cached device is a no-op.
+    pub fn setup_device(&mut self, device: Device) -> Result<()> {
+        let mut timing = TimingTree::default();
+        self.setup_for_device(device, &mut timing).map(|_| ())
     }
 
     /// Proves one block and returns the published artifact as the same
@@ -199,10 +229,8 @@ impl Fp8Prover {
         input: &PlainProofV4,
         timing: &mut TimingTree,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let (statement, wrapped) =
-            zk_prove_plain_proof_fp8_wrapped(proposed_header, input, &self.data, &mut self.circuits, timing)?;
-        // Re-derive the job for its batch layout (the zeta slot position); cheap next to proving.
-        let job = Fp8Job::derive(&statement, proposed_header)?;
+        let setup = self.setup_for_device(input.job.common.device, timing)?;
+        let (statement, job, wrapped) = prove_wrapped_statement(setup, proposed_header, input, timing)?;
         let proof_data = compact_proof_data(&job.system, &wrapped)?;
         Ok((statement.to_bytes(), proof_data))
     }
@@ -210,35 +238,20 @@ impl Fp8Prover {
 
 impl Fp8Verifier {
     /// Generates the trusted setup: compiles the two-stage universal wrapper
-    /// circuits against the committed LUT cap
-    /// ([`crate::api::fp8::lut_caps`] — read from the committed caps file, so no
-    /// LUT oracle is ever built). Expensive — run once, offline
+    /// circuits against a freshly derived LUT cap. Expensive — run once, offline
     /// (`build_cache`); verification only ever reads the result from [`Fp8VerifierCache`].
     pub fn generate(params: &PublicParams, proposed_header: &IncompleteBlockHeader, timing: &mut TimingTree) -> Result<Self> {
         let job = Fp8Job::derive(params, proposed_header)?;
-        Self::build_for_job(&job, committed_lut_cap(), timing)
+        Self::build_for_job(&job, timing)
     }
 
-    /// Build tooling: [`Fp8Verifier::generate`] against an explicit LUT cap instead
-    /// of the committed caps file. `build_cache` uses this to regenerate the caps
-    /// file and the embeddable cache in one pass — the running binary still embeds
-    /// the previous file, so the freshly derived caps must be passed in.
-    pub fn generate_with_lut_cap(
-        params: &PublicParams,
-        proposed_header: &IncompleteBlockHeader,
-        lut_cap: LutCap,
-        timing: &mut TimingTree,
-    ) -> Result<Self> {
-        let job = Fp8Job::derive(params, proposed_header)?;
-        Self::build_for_job(&job, lut_cap, timing)
-    }
-
-    /// The shared constructor core: compile the universal wrapper circuits
-    /// against the given cap, keeping the cap alongside the circuit.
-    fn build_for_job(job: &Fp8Job, lut_cap: LutCap, timing: &mut TimingTree) -> Result<Self> {
-        let circuits = Fp8WrapperCircuits::build(&job.system, &lut_cap, timing)?;
+    /// The shared constructor core: derive the one device's preprocessing cap and compile
+    /// the universal wrapper against it. The cap is baked into the circuit and discarded;
+    /// `fp8_cache.bin` is the sole persisted setup artifact.
+    fn build_for_job(job: &Fp8Job, timing: &mut TimingTree) -> Result<Self> {
+        let preprocessed = job.system.preprocessed_data::<C>(timing);
+        let circuits = Fp8WrapperCircuits::build(&job.system, &preprocessed.cap(), timing)?;
         Ok(Self {
-            lut_cap,
             circuit: circuits.verifier_data(),
             constants_sigmas_polynomials: circuits.constants_sigmas_polynomials(),
         })
@@ -336,7 +349,7 @@ impl Fp8VerifierCache {
     }
 }
 
-/// The canonical dense statement of the launch geometry — `m = n = 32`, `k = 2048`,
+/// The canonical minimum-envelope dense statement — `m = n = 32`, `k = 1024`,
 /// rank 32, per-axis pattern `[(4, Fold), (4, Blake)]`:
 /// the statement `build_cache` compiles the universal setup from (any
 /// envelope-legal statement yields the same circuits) and the
@@ -345,15 +358,22 @@ impl Fp8VerifierCache {
 /// statement with a zeroed `ancestor_header` (so the statement binds the zero
 /// header on both sides).
 pub fn sample_dense_statement() -> Result<PublicParams> {
+    sample_dense_statement_for_device(Device::B200)
+}
+
+/// [`sample_dense_statement`] with an explicit committed device, used to derive
+/// each device's job-independent prover setup, LUT commitment and universal
+/// verifier setup.
+pub fn sample_dense_statement_for_device(device: Device) -> Result<PublicParams> {
     let pattern = AxisPattern::new(&[(4, DimType::Fold), (4, DimType::Blake)])?;
     let params = PublicParams::try_new(
         JobParams {
             ancestor_header: IncompleteBlockHeader::zero(),
             common: CommonParams {
-                k: 2048,
+                k: PublicParams::MIN_K as u32,
                 r: 32,
                 quant: Quant::Fp8E4M3Prequant,
-                device: Device::B200,
+                device,
             },
             operands: Sides {
                 a: OperandParams {
@@ -386,63 +406,22 @@ pub(crate) fn decode_statement(public_data: &[u8]) -> Result<PublicParams> {
     PublicParams::from_bytes(public_data)
 }
 
-/// The verifier's cached data: the setup-time Merkle cap of the committed LUT tables. The
-/// cap is a network constant — a pure function of the LUT contents and
-/// the consensus STARK config, independent of job geometry. A cap mismatch fails
-/// closed (the proof cannot open a different cap).
-#[derive(Clone, Debug)]
-pub struct Fp8VerifierData {
-    pub lut_cap: LutCap,
-}
-
-/// The prover's cached data: the consensus LUT cap plus the full LUT precommitment
-/// (polynomials, LDEs, batched Merkle tree). Job-independent —
-/// the batch order, the LUT positions and the consensus config are canonical constants —
-/// so any job reuses it.
-pub struct Fp8ProverData {
-    pub lut_cap: LutCap,
-    pub preprocessed: BatchStarkPreprocessedData<F, C, D>,
-}
-
-impl Fp8ProverData {
-    /// Generates the prover's cached data (any job reuses it): derives the
-    /// statement once to fix the batch layout, then commits to the LUT tables.
-    pub fn generate(params: &PublicParams, proposed_header: &IncompleteBlockHeader, timing: &mut TimingTree) -> Result<Self> {
-        let job = Fp8Job::derive(params, proposed_header)?;
-        let preprocessed = job.system.preprocessed_data::<C>(timing);
-        let lut_cap = preprocessed.cap();
-        Ok(Self { lut_cap, preprocessed })
-    }
-
-    /// The verifier's view of this cached data.
-    pub fn verifier_data(&self) -> Fp8VerifierData {
-        Fp8VerifierData {
-            lut_cap: self.lut_cap.clone(),
-        }
-    }
-}
-
-impl Fp8VerifierData {
-    /// Builds the verifier's cached data from the consensus cap.
-    pub fn new(lut_cap: LutCap) -> Self {
-        Self { lut_cap }
-    }
-}
-
-/// One fp8 batch proof (the twenty-two-table batched STARK argument with every table's
+/// One fp8 batch proof (the twenty-table batched STARK argument with every table's
 /// public inputs), plus its wire encoding.
 #[derive(Clone, Debug)]
-pub struct Fp8Proof(pub BatchStarkProofWithPublicInputs<F, C, D>);
+#[cfg(test)]
+struct Fp8Proof(BatchStarkProofWithPublicInputs<F, C, D>);
 
+#[cfg(test)]
 impl Fp8Proof {
     /// Serializes the proof (and all its public inputs) for the wire.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(&self.0).context("serializing an fp8 proof")
     }
 
     /// Deserializes a wire proof. Structural validity only — [`verify_fp8_block`] is the
     /// judge of everything else.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Ok(Self(bincode::deserialize(bytes).context("deserializing an fp8 proof")?))
     }
 }
@@ -475,12 +454,10 @@ impl Fp8Job {
         // ---- Class (a) noise codes: bf16((E @ F)[elem]) on the bit-exact hardware MMA,
         // exactly the intermediate `noisy_quantize` computes. ----
         let noise = compute_fp8_noise(params, proposed_header);
+        let device = params.common().device;
         let noise_codes = |e: &[u8], f: &[u8], rows: usize| -> Result<Vec<u16>> {
-            Ok(B200 {}
-                .matmul_fp8(e, f, None, rows, k, r)?
-                .into_iter()
-                .map(fp32_to_bf16_rne)
-                .collect())
+            let values = device.matmul_fp8(e, f, None, rows, k, r)?;
+            Ok(values.into_iter().map(fp32_to_bf16_rne).collect())
         };
         let (a_noise, b_noise) = plonky2_maybe_rayon::join(
             || noise_codes(&noise.a.e, &noise.a.f, h),
@@ -513,18 +490,18 @@ impl Fp8Job {
             k,
             block_size: BLOCK_SIZE,
             r,
+            device: params.common().device,
         };
-        let scale = ScaleProgram::new(h, w, k, r);
-        let matmul = MatmulProgram { h, w, k };
+        let scale = ScaleProgram::new_for_device(h, w, k, r, params.common().device);
         let xor_fold = XorFoldProgram {
             lanes: lane_assignment(&params.a().pattern, &params.b().pattern),
+            skip_limit: budget(k, h, w),
         };
 
         let system = Fp8System::new(Fp8PublicData {
             blake3,
             input_quant: input_quant.clone(),
             scale: scale.clone(),
-            matmul,
             xor_fold,
             a_values_len: h * k,
             a_scales_len: h * (k / BLOCK_SIZE) * 2,
@@ -582,7 +559,7 @@ impl Fp8Job {
     fn scale(&self) -> ScaleProgram {
         let p = &self.params;
         let u = |v: u32| usize::try_from(v).expect("geometry fits usize");
-        ScaleProgram::new(u(p.h()), u(p.w()), u(p.common_dim()), u(p.rank()))
+        ScaleProgram::new_for_device(u(p.h()), u(p.w()), u(p.common_dim()), u(p.rank()), p.common().device)
     }
 
     /// The InputQuant program (expected-public-input assembly and CTL geometry).
@@ -595,6 +572,7 @@ impl Fp8Job {
             k: u(p.common_dim()),
             block_size: BLOCK_SIZE,
             r: u(p.rank()),
+            device: p.common().device,
         }
     }
 
@@ -624,16 +602,8 @@ impl Fp8Job {
         // expressions read.
         let iq = self.input_quant();
         let input_quant = iq.public_inputs::<F>().to_vec();
-        // Tamed: the untamed threshold and allowance and the skip budget, pure functions of
-        // the geometry.
-        let tamed = TamedProgram {
-            h: iq.h,
-            w: iq.w,
-            k: iq.k,
-        }
-        .public_inputs::<F>()
-        .to_vec();
-        [blake3, input_quant, scale, vec![], vec![], tamed]
+        let xor_fold = vec![F::from_canonical_u64(budget(iq.k, iq.h, iq.w))];
+        [blake3, input_quant, scale, vec![], xor_fold]
     }
 
     /// The native epilogue shared by the batch and wrapped verification paths, run after
@@ -658,39 +628,20 @@ impl Fp8Job {
 /// batch statement, and returns the public params — with `hash_jackpot` set from the proven
 /// lottery digest, like the v1 `prove_block` — alongside the proof.
 ///
-/// `prover_data` must have been generated for this job's geometry
-/// ([`Fp8ProverData::generate`]).
-pub fn zk_prove_plain_proof_fp8(
+/// `setup` must match the statement's device.
+///
+/// Test-only thin wrapper over the same [`prove_batch_statement`] core production proves
+/// through: the unwrapped proof is observable here for negative testing, while production
+/// publishes only the wrapped compact form.
+#[cfg(test)]
+fn zk_prove_plain_proof_fp8(
     proposed_header: &IncompleteBlockHeader,
     plain_proof: &PlainProofV4,
-    prover_data: &Fp8ProverData,
+    setup: &Fp8ProverSetup,
     timing: &mut TimingTree,
 ) -> Result<(PublicParams, Fp8Proof)> {
-    let (public, _, proof) = prove_batch_statement(proposed_header, plain_proof, prover_data, timing)?;
+    let (public, _, proof) = prove_batch_statement(proposed_header, plain_proof, setup, timing)?;
     Ok((public, Fp8Proof(proof)))
-}
-
-/// [`zk_prove_plain_proof_fp8`], then the two-stage recursive wrap: the returned proof
-/// is the constant-size stage-2 zero-knowledge plonky2 proof — the batch proof and the
-/// stage-1 proof never leave the prover.
-///
-/// `prover_data` must come from [`Fp8ProverData::generate`]. `cache` collects the
-/// compiled wrapper circuits: the first job compiles them, every later job reuses
-/// them whatever its geometry.
-pub fn zk_prove_plain_proof_fp8_wrapped(
-    proposed_header: &IncompleteBlockHeader,
-    plain_proof: &PlainProofV4,
-    prover_data: &Fp8ProverData,
-    cache: &mut Fp8CircuitCache,
-    timing: &mut TimingTree,
-) -> Result<(PublicParams, ProofWithPublicInputs<F, OuterC, D>)> {
-    let (public, job, batch_proof) = prove_batch_statement(proposed_header, plain_proof, prover_data, timing)?;
-    let circuits = Fp8WrapperCircuits::with_cache(&job.system, &prover_data.lut_cap, cache, timing)?;
-    // Digest the live `public`, not the stale `job.params`: the Fiat-Shamir callback in
-    // `prove_batch_statement` set the jackpot on `public`, so it (not the pre-jackpot
-    // copy the job derived from) is what the batch proof baked into its known columns.
-    let wrapped = circuits.prove(&job.system, &batch_proof, public.digest(proposed_header), timing)?;
-    Ok((public, wrapped))
 }
 
 /// The shared proving core: parse the plain proof, derive the statement, prove the batch.
@@ -699,22 +650,25 @@ pub fn zk_prove_plain_proof_fp8_wrapped(
 fn prove_batch_statement(
     proposed_header: &IncompleteBlockHeader,
     plain_proof: &PlainProofV4,
-    prover_data: &Fp8ProverData,
+    setup: &Fp8ProverSetup,
     timing: &mut TimingTree,
 ) -> Result<(PublicParams, Fp8Job, BatchStarkProofWithPublicInputs<F, C, D>)> {
     let (private, mut public) = plain_proof.parse_proof(proposed_header)?;
     let mut job = Fp8Job::derive(&public, proposed_header)?;
+    ensure!(
+        setup.device == public.common().device,
+        "the FP8 prover setup is for {:?}, but the statement commits {:?}",
+        setup.device,
+        public.common().device
+    );
 
     // The cached precommitment must match this job's batch layout and the consensus cap.
-    let expected_prep = job.system.preprocessed_verifier_data::<C>(&prover_data.lut_cap);
+    let lut_cap = setup.preprocessed.cap();
+    let expected_prep = job.system.preprocessed_verifier_data::<C>(&lut_cap);
     ensure!(
-        prover_data.preprocessed.columns_per_table == expected_prep.columns_per_table,
+        setup.preprocessed.columns_per_table == expected_prep.columns_per_table,
         "the cached LUT precommitment does not match this job's batch layout; \
          regenerate the prover data"
-    );
-    ensure!(
-        prover_data.preprocessed.cap() == prover_data.lut_cap,
-        "the cached LUT precommitment disagrees with the consensus cap"
     );
 
     // The opened routing hotspot blocks and the full offsets list (MoE; empty for dense
@@ -748,11 +702,30 @@ fn prove_batch_statement(
             public.set_hash_jackpot(jackpot);
             public.digest(proposed_header)
         },
-        &prover_data.preprocessed,
+        &setup.preprocessed,
         timing,
     )?;
 
     Ok((public, job, proof))
+}
+
+/// The shared batch-prove-and-wrap core: parse the plain proof, prove the batch
+/// statement, and wrap it in the two-stage recursive circuit. Both
+/// [`Fp8Prover::prove`] and the wrapped round-trip tests prove through here so the
+/// sequence cannot drift between production and test paths.
+fn prove_wrapped_statement(
+    setup: &Fp8ProverSetup,
+    proposed_header: &IncompleteBlockHeader,
+    input: &PlainProofV4,
+    timing: &mut TimingTree,
+) -> Result<(PublicParams, Fp8Job, ProofWithPublicInputs<F, OuterC, D>)> {
+    let (statement, job, batch_proof) = prove_batch_statement(proposed_header, input, setup, timing)?;
+    // Digest the live `statement`, not `job.params`: proving sets the jackpot on the
+    // returned statement after the job was derived.
+    let wrapped = setup
+        .circuits
+        .prove(&job.system, &batch_proof, statement.digest(proposed_header), timing)?;
+    Ok((statement, job, wrapped))
 }
 
 /// Verifies one fp8 block proof end to end:
@@ -768,24 +741,26 @@ fn prove_batch_statement(
 ///    (or `nbits_override`, e.g. a pool share target).
 ///
 /// `Ok(())` accepts, `Err` rejects.
-pub fn verify_fp8_block(
+#[cfg(test)]
+fn verify_fp8_block(
     public_params: &PublicParams,
     proposed_header: &IncompleteBlockHeader,
     proof: &Fp8Proof,
-    verifier_data: &Fp8VerifierData,
+    setup: &Fp8ProverSetup,
     nbits_override: Option<u32>,
 ) -> Result<()> {
     let mut job = Fp8Job::derive(public_params, proposed_header)?;
+    ensure!(
+        setup.device == public_params.common().device,
+        "the FP8 prover setup is for {:?}, but the statement commits {:?}",
+        setup.device,
+        public_params.common().device
+    );
     let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-    verify_block_with_job(&mut job, proof, verifier_data, nbits)
-}
-
-/// The [`verify_fp8_block`] core on an already-derived statement.
-fn verify_block_with_job(job: &mut Fp8Job, proof: &Fp8Proof, verifier_data: &Fp8VerifierData, nbits: u32) -> Result<()> {
     let expected = job.expected_public_inputs();
     let digest = job.params.digest(&job.proposed_header);
     job.system.bind_statement_digest(digest);
-    job.system.verify::<C>(&proof.0, &expected, &verifier_data.lut_cap)?;
+    job.system.verify::<C>(&proof.0, &expected, &setup.preprocessed.cap())?;
     job.native_epilogue(nbits)
 }
 
@@ -803,31 +778,20 @@ fn verify_block_with_job(job: &mut Fp8Job, proof: &Fp8Proof, verifier_data: &Fp8
 ///    pins the whole baked statement shape (batch layout, AIR constraint set, CTLs, the LUT
 ///    family cap),
 /// 4. runs the native epilogue (the plain difficulty condition).
-pub fn verify_fp8_block_wrapped(
+#[cfg(test)]
+fn verify_fp8_block_wrapped(
     public_params: &PublicParams,
     proposed_header: &IncompleteBlockHeader,
     proof: &ProofWithPublicInputs<F, OuterC, D>,
-    circuit: &VerifierCircuitData<F, OuterC, D>,
+    verifier: &Fp8Verifier,
     nbits_override: Option<u32>,
 ) -> Result<()> {
     let job = Fp8Job::derive(public_params, proposed_header)?;
     let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-    verify_wrapped_with_job(&job, proof, circuit, nbits)
-}
-
-/// The [`verify_fp8_block_wrapped`] core on an already-derived statement (shared with
-/// [`Fp8Verifier`] / [`Fp8VerifierCache`], which derive the job once for both the setup
-/// lookup and the verification).
-fn verify_wrapped_with_job(
-    job: &Fp8Job,
-    proof: &ProofWithPublicInputs<F, OuterC, D>,
-    circuit: &VerifierCircuitData<F, OuterC, D>,
-    nbits: u32,
-) -> Result<()> {
     let expected = job.expected_public_inputs();
     verify_wrapped_proof(
         &job.system,
-        circuit,
+        &verifier.circuit,
         proof,
         &expected,
         job.params.digest(&job.proposed_header),
@@ -846,16 +810,12 @@ mod tests {
     use plonky2::field::types::Field;
 
     use super::*;
-    use crate::circuit::fp8::circuit_utils::Fp8VerifierKey;
-    use crate::circuit::fp8::consistency::{fixture_job, fixture_job_asym, fixture_job_k32, fixture_job_medium, fixture_job_moe};
-    use crate::circuit::fp8::ctl::Table;
-    use crate::circuit::fp8::input_quant_stark::columns::{
-        B_KEY_OFFSET_PUBLIC_INPUT, OPERAND_MULT_A_PUBLIC_INPUT, WL2_POW_PUBLIC_INPUT,
-    };
-    use crate::circuit::fp8::scale_stark::columns::{K_PUBLIC_INPUT, WL2_PUBLIC_INPUT};
+    use crate::circuit::fp8::consistency::{fixture_job, fixture_job_k32, fixture_job_moe};
 
     // The fixtures use an easy `nbits` that saturates the difficulty bound, so the plain
     // winning condition `hash_jackpot <= bound` is deterministic on pseudo-random data.
+
+    mod proof_pipeline_tests;
 
     #[test]
     fn compile_jackpot_key_is_labelled_subkey_for_dense_and_moe() {
@@ -869,90 +829,13 @@ mod tests {
         }
     }
 
-    /// The full wire-level round trip: parse the plain proof, prove the batch statement,
-    /// serialize, verify against independently derived expectations, and reject tampering
-    /// with the block's claims, the proof's public inputs, and the openings.
     #[test]
-    fn api_roundtrip_and_tamper_rejection() {
-        let (header, plain) = fixture_job();
-        let mut timing = TimingTree::default();
-
-        let (_, params) = plain.parse_proof(&header).expect("fixture job must parse");
-        assert_eq!(params.common().device, Device::B200, "the wire byte must parse back");
-        let prover_data = Fp8ProverData::generate(&params, &header, &mut timing).expect("prover setup");
-
-        let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &prover_data, &mut timing).expect("proving must succeed");
-        assert_ne!(public.hash_jackpot(), [0u8; 32], "prove must ship the proven lottery digest");
-
-        // Wire round trip.
-        let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
-
-        let verifier_data = prover_data.verifier_data();
-        verify_fp8_block(&public, &header, &proof, &verifier_data, None).expect("honest proof must verify");
-
-        // Tamper 1: a different shipped lottery digest is a public-input mismatch.
-        let mut bad_public = public.clone();
-        bad_public.set_hash_jackpot({
-            let mut h = bad_public.hash_jackpot();
-            h[0] ^= 1;
-            h
-        });
-        assert!(verify_fp8_block(&bad_public, &header, &proof, &verifier_data, None).is_err());
-
-        // Tamper 2: bump the Scale geometry slot (`K`) — every public input is pinned to the
-        // verifier's own statement-derived expectation, so a shifted slot must be rejected.
-        let job = Fp8Job::derive(&public, &header).unwrap();
-        let mut tampered = proof.clone();
-        tampered.0.public_inputs[job.system.main_table_positions()[Table::Scale as usize]][K_PUBLIC_INPUT] += F::ONE;
-        assert!(verify_fp8_block(&public, &header, &tampered, &verifier_data, None).is_err());
-
-        // Tamper 3: any opening perturbation breaks the batched FRI argument.
-        let mut tampered = proof.clone();
-        tampered.0.proof.openings[0].local_values[0] += F::ONE.into();
-        assert!(verify_fp8_block(&public, &header, &tampered, &verifier_data, None).is_err());
-    }
-
-    /// The padded-geometry wire-level round trip ([`fixture_job_asym`]: `h = 16 != w = 20`,
-    /// `k = 2048` — a reference-legal job the pre-padding AIRs could not prove, since
-    /// `h + w = 36` and `h*w = 320` are not powers of two). Exercises `derive` without the
-    /// old envelope checks and every AIR's
-    /// padding path (InputQuant per-side liveness, Scale and XorFold pad rows, Matmul
-    /// phantom cells) through parse -> derive -> prove -> verify.
-    #[test]
-    fn asymmetric_api_roundtrip() {
-        let (header, plain) = fixture_job_asym();
-        let mut timing = TimingTree::default();
-
-        let (_, params) = plain.parse_proof(&header).expect("asymmetric fixture job must parse");
-        assert_ne!(params.h(), params.w(), "the fixture must be asymmetric");
-        let prover_data = Fp8ProverData::generate(&params, &header, &mut timing).expect("prover setup");
-
-        let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &prover_data, &mut timing).expect("proving must succeed");
-        let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
-
-        let verifier_data = prover_data.verifier_data();
-        verify_fp8_block(&public, &header, &proof, &verifier_data, None).expect("honest proof must verify");
-    }
-
-    /// The `k % 32` wire-level round trip ([`fixture_job_k32`]: `k = 2080`, committed rows
-    /// that never tile into whole 64-byte Blake3 blocks — a job the wire layer rejected
-    /// while it required block-aligned rows). Exercises the straddling-block schedule
-    /// (cross-strip messages and `SplitLeaf`s of both orders) and the non-power-of-two
-    /// row-mean scale derivation through parse -> derive -> prove -> verify.
-    #[test]
-    fn k_mod_32_api_roundtrip() {
-        let (header, plain) = fixture_job_k32();
-        let mut timing = TimingTree::default();
-
-        let (_, params) = plain.parse_proof(&header).expect("k % 32 fixture job must parse");
-        assert_eq!(params.common_dim() % 64, 32, "the fixture must exercise the k % 32 envelope");
-        let prover_data = Fp8ProverData::generate(&params, &header, &mut timing).expect("prover setup");
-
-        let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &prover_data, &mut timing).expect("proving must succeed");
-        let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
-
-        let verifier_data = prover_data.verifier_data();
-        verify_fp8_block(&public, &header, &proof, &verifier_data, None).expect("honest proof must verify");
+    fn published_statement_rejects_an_unknown_device_byte() {
+        let mut bytes = sample_dense_statement().unwrap().to_bytes();
+        const DEVICE_OFFSET: usize = IncompleteBlockHeader::SERIALIZED_SIZE + 4 + 4 + 2 + 1;
+        bytes[DEVICE_OFFSET] = 2;
+        let error = decode_statement(&bytes).expect_err("unknown device byte must reject");
+        assert!(error.to_string().contains("Device discriminant"), "{error}");
     }
 
     /// The compact wire's one prover-supplied slot: the expected-PI builder embeds a legal
@@ -1000,24 +883,27 @@ mod tests {
     fn verifier_key_is_universal_across_geometries() {
         let (header, plain) = fixture_job();
         let (_, params) = plain.parse_proof(&header).expect("fixture job must parse");
-        let job = Fp8Job::derive(&params, &header).expect("fixture job must derive");
-        let key = Fp8VerifierKey::new(job.params.common().device);
+        let key = params.common().device;
 
         // A different geometry (k = 2080 vs 2048, hence a different degree profile too)
         // resolves to the same universal setup.
         let (header_k32, plain_k32) = fixture_job_k32();
         let (_, params_k32) = plain_k32.parse_proof(&header_k32).expect("k32 fixture must parse");
-        let job_k32 = Fp8Job::derive(&params_k32, &header_k32).expect("k32 fixture must derive");
         assert_ne!(
-            job.system.geometry(),
-            job_k32.system.geometry(),
+            [params.h(), params.w(), params.common_dim()],
+            [params_k32.h(), params_k32.w(), params_k32.common_dim()],
             "the fixtures must differ in geometry for this test to bite"
         );
-        assert_eq!(
-            key,
-            Fp8VerifierKey::new(job_k32.params.common().device),
-            "different geometry: one universal setup"
+        assert_eq!(key, params_k32.common().device, "different geometry: one universal setup");
+
+        let params_min = sample_dense_statement().expect("minimum-envelope statement");
+        let job_min =
+            Fp8Job::derive(&params_min, &IncompleteBlockHeader::zero()).expect("minimum-envelope statement must derive");
+        assert!(
+            job_min.system.degree_bits().contains(&13),
+            "the minimum-envelope Matmul table must exercise the new 2^13 rung"
         );
+        assert_eq!(key, job_min.params.common().device, "minimum geometry: one universal setup");
     }
 
     #[test]
@@ -1029,308 +915,26 @@ mod tests {
         assert!(error.to_string().contains("no cached fp8 verifier setup"), "{error:#}");
     }
 
-    /// Regenerates the wrapped proof consumed by the Go V4 certificate tests.
+    #[test]
+    fn committed_device_selects_the_matmul_air_and_lut_inventory() {
+        use crate::circuit::fp8::luts::LutTable;
+        use crate::circuit::fp8::matmul_b200_stark::columns::NUM_MATMUL_B200_COLUMNS;
+        use crate::circuit::fp8::matmul_h100::columns::NUM_MATMUL_COLUMNS;
+
+        let h100 = sample_dense_statement_for_device(Device::H100).unwrap();
+        let b200 = sample_dense_statement_for_device(Device::B200).unwrap();
+        let h100 = Fp8Job::derive(&h100, &IncompleteBlockHeader::zero()).unwrap();
+        let b200 = Fp8Job::derive(&b200, &IncompleteBlockHeader::zero()).unwrap();
+        assert_eq!(h100.system.matmul_num_columns(), NUM_MATMUL_COLUMNS);
+        assert_eq!(b200.system.matmul_num_columns(), NUM_MATMUL_B200_COLUMNS);
+        assert!(h100.system.committed_lut_tables().contains(&LutTable::ProdAlign15));
+        assert!(b200.system.committed_lut_tables().contains(&LutTable::B200Align));
+    }
+
     #[test]
     #[ignore = "fixture generator: expensive wrapped proof; run with task generate:fp8-fixture"]
     fn regenerate_go_fixture() {
-        let (header, plain) = fixture_job();
-        let mut prover = Fp8Prover::setup(&header, &plain).expect("fp8 setup");
-        let (public_data, proof_data) = prover.prove(&header, &plain).expect("wrapped proving must succeed");
-
-        let public_data_len = u32::try_from(public_data.len()).expect("public data length must fit u32");
-        let mut fixture = Vec::with_capacity(IncompleteBlockHeader::SERIALIZED_SIZE + 4 + public_data.len() + proof_data.len());
-        fixture.extend_from_slice(&header.to_bytes());
-        fixture.extend_from_slice(&public_data_len.to_le_bytes());
-        fixture.extend_from_slice(&public_data);
-        fixture.extend_from_slice(&proof_data);
-
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../node/zkpow/testdata/fp8_zk_proof_b200.bin");
-        std::fs::write(&path, fixture).expect("write Go fp8 fixture");
-        println!("Go fixture written to {}", path.display());
-    }
-
-    /// The wrapped (published) round trip: prove the batch statement, wrap it in the
-    /// two-stage universal recursive circuit (compiled into the cache), serialize, verify
-    /// (public-input pinning + one plonky2 verification + the native epilogues); then the
-    /// universal payoff — a second geometry of the same family through the same circuits
-    /// and setup — and the wrapped rejection surface: a tampered block claim, a tampered
-    /// claim slot, a tampered degree slot, a shifted zeta and a forged known-column
-    /// evaluation must all fail closed.
-    #[test]
-    #[ignore = "exceeds the safe memory budget of an 8 GiB CI runner; run explicitly on a larger machine"]
-    fn wrapped_api_roundtrip_and_tamper_rejection() {
-        use crate::circuit::fp8::wrapper::{COMPACT_ZETA_PREAMBLE, degree_bits_offset, table_pis_offset, zeta_offset};
-
-        // Surface the wrapper's gate/size logs under `RUST_LOG=info`.
-        let _ = env_logger::builder().format_timestamp(None).try_init();
-
-        let mut timing = TimingTree::default();
-        let (header, plain) = fixture_job();
-        let mut prover = Fp8Prover::setup_with_timing(&header, &plain, &mut timing).expect("fp8 setup");
-        // Prove through the typed wrapped API (so the tamper section below can mutate
-        // slots of the full proof) and compact it with the same encoder
-        // [`Fp8Prover::prove`] publishes through.
-        let (public, wrapped) =
-            zk_prove_plain_proof_fp8_wrapped(&header, &plain, &prover.data, &mut prover.circuits, &mut timing)
-                .expect("wrapped proving must succeed");
-        let job = Fp8Job::derive(&public, &header).unwrap();
-        let public_data = public.to_bytes();
-        let proof_data = compact_proof_data(&job.system, &wrapped).expect("compact encode");
-
-        // The verifier side generates its own trusted setup from the published statement
-        // alone — nothing crosses over from the prover.
-        let statement = decode_statement(&public_data).expect("public data must decode");
-        let verifier = Fp8Verifier::generate(&statement, &header, &mut timing).expect("verifier-side setup");
-        assert!(
-            verifier.circuit.common.config.zero_knowledge,
-            "the published stage must carry plonky2's ZK blinding"
-        );
-
-        // Independent-process wire round trip of the trusted setup; the published
-        // artifact is already the `(public_data, proof_data)` byte pair.
-        let verifier_bytes = verifier.to_bytes().expect("serialize verifier setup");
-        let verifier = Fp8Verifier::from_bytes(&verifier_bytes).expect("deserialize verifier setup");
-
-        verifier
-            .verify_block(&header, &public_data, &proof_data)
-            .expect("honest wrapped proof must verify");
-
-        // The cache surface: register the setup, round-trip the cache bytes, and verify
-        // through the cache (the embedded-`CACHE_DATA` path).
-        let mut cache = Fp8VerifierCache::default();
-        cache.insert(&statement, verifier.clone());
-        let cache_bytes = cache.to_bytes().expect("serialize cache");
-        let cache = Fp8VerifierCache::from_bytes(&cache_bytes).expect("deserialize cache");
-        assert_eq!(cache.len(), 1);
-        cache
-            .verify_block(&header, &public_data, &proof_data)
-            .expect("the cached setup must verify the honest proof");
-        assert!(
-            Fp8VerifierCache::from_bytes(&[])
-                .expect("an empty blob is a valid cache")
-                .is_empty(),
-            "the no-embedded-cache default must load as an empty cache"
-        );
-
-        // A setup missing from the cache fails closed: verification never compiles
-        // circuits, so no proof can force the expensive setup build (DoS hardening).
-        let err = Fp8VerifierCache::default()
-            .verify_block(&header, &public_data, &proof_data)
-            .expect_err("an uncached setup must reject, not compile");
-        assert!(
-            err.to_string().contains("no cached fp8 verifier setup"),
-            "unexpected error: {err:#}"
-        );
-
-        // The universal (D1) payoff: a different geometry *and* degree profile
-        // (`k = 2080`: non-power-of-two blocks, 65-row Matmul cells)
-        // proves through the same prover without recompiling — the circuit cache still
-        // holds exactly the one entry — and verifies against the same setup.
-        let (header_k32, plain_k32) = fixture_job_k32();
-        let (public_k32, proof_k32) = prover
-            .prove_with_timing(&header_k32, &plain_k32, &mut timing)
-            .expect("the prover must prove a different geometry");
-        assert_eq!(prover.circuits.len(), 1, "one universal circuit set");
-        verifier
-            .verify_block(&header_k32, &public_k32, &proof_k32)
-            .expect("one universal setup must verify every geometry");
-        cache
-            .verify_block(&header_k32, &public_k32, &proof_k32)
-            .expect("the cached setup must verify the second geometry");
-        assert_eq!(cache.len(), 1, "no per-shape setups: the one entry serves both");
-
-        // Re-encoding the decoded statement reproduces the published bytes.
-        assert_eq!(statement.to_bytes(), public_data);
-
-        // Tamper 1: a different shipped lottery digest is a public-input mismatch.
-        let mut tampered = statement.clone();
-        tampered.set_hash_jackpot({
-            let mut h = tampered.hash_jackpot();
-            h[0] ^= 1;
-            h
-        });
-        let bad_public = tampered.to_bytes();
-        assert!(verifier.verify_block(&header, &bad_public, &proof_data).is_err());
-
-        // Tampering with the recursive proof's public inputs: the Scale geometry slots
-        // (`K`, `WL2`), InputQuant's `2^WL2` and two of its CTL geometry slots (the B key
-        // offset `h*k` and the A operand multiplicity `w`), a degree slot (the universal
-        // circuit's height input, pinned to the statement's profile), a shifted zeta
-        // (moves the native class (a) recompute), and a forged known-column evaluation
-        // (the first slot after zeta).
-        let scale_pis = table_pis_offset(&job.system, job.system.main_table_positions()[Table::Scale as usize]);
-        let iq_pis = table_pis_offset(&job.system, job.system.main_table_positions()[Table::InputQuant as usize]);
-        for slot in [
-            scale_pis + K_PUBLIC_INPUT,
-            scale_pis + WL2_PUBLIC_INPUT,
-            iq_pis + WL2_POW_PUBLIC_INPUT,
-            iq_pis + B_KEY_OFFSET_PUBLIC_INPUT,
-            iq_pis + OPERAND_MULT_A_PUBLIC_INPUT,
-            degree_bits_offset(&job.system) + Table::InputQuant as usize,
-            zeta_offset(&job.system),
-            zeta_offset(&job.system) + D,
-        ] {
-            let mut tampered = wrapped.clone();
-            tampered.public_inputs[slot] += F::ONE;
-            assert!(
-                verify_fp8_block_wrapped(&public, &header, &tampered, &verifier.circuit, None).is_err(),
-                "tampered public input slot {slot} must be rejected"
-            );
-        }
-
-        // The compact wire carries no public-input vector so changing a public input
-        // should not change the encoding.
-        let mut mutated = wrapped.clone();
-        mutated.public_inputs[scale_pis + K_PUBLIC_INPUT] += F::ONE;
-        assert_eq!(
-            compact_proof_data(&job.system, &mutated).expect("compact encode"),
-            proof_data,
-            "imposed slots must not ride the compact wire"
-        );
-        // But zeta does ride the wire (the 16-byte preamble) and a shifted value is
-        // rejected.
-        for limb in 0..D {
-            let mut tampered = wrapped.clone();
-            tampered.public_inputs[zeta_offset(&job.system) + limb] += F::ONE;
-            let bytes = compact_proof_data(&job.system, &tampered).expect("compact encode");
-            assert!(
-                verifier.verify_block(&header, &public_data, &bytes).is_err(),
-                "a preamble zeta shifted in limb {limb} must be rejected"
-            );
-        }
-
-        // Compact-wire malleability surface: a corrupted proof byte, a non-canonical
-        // zeta limb (>= the field order) and a truncated body must all be rejected.
-        let mut corrupt = proof_data.clone();
-        let mid = COMPACT_ZETA_PREAMBLE + (proof_data.len() - COMPACT_ZETA_PREAMBLE) / 2;
-        corrupt[mid] ^= 1;
-        assert!(verifier.verify_block(&header, &public_data, &corrupt).is_err());
-
-        let mut noncanonical = proof_data.clone();
-        noncanonical[..8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(verifier.verify_block(&header, &public_data, &noncanonical).is_err());
-
-        assert!(
-            verifier
-                .verify_block(&header, &public_data, &proof_data[..COMPACT_ZETA_PREAMBLE])
-                .is_err(),
-            "a bare preamble with no proof body must be rejected"
-        );
-
-        // Verification is tied to the caller's expected block, not merely the
-        // header embedded in the published statement.
-        let mut other_header = header;
-        other_header.timestamp ^= 1;
-        assert!(verifier.verify_block(&other_header, &public_data, &proof_data).is_err());
-
-        // Trailing bytes are rejected in both encodings.
-        let mut trailing = public_data.clone();
-        trailing.push(0);
-        assert!(verifier.verify_block(&header, &trailing, &proof_data).is_err());
-
-        let mut trailing = proof_data.clone();
-        trailing.push(0);
-        assert!(verifier.verify_block(&header, &public_data, &trailing).is_err());
-
-        let mut trailing = verifier_bytes;
-        trailing.push(0);
-        assert!(Fp8Verifier::from_bytes(&trailing).is_err());
-    }
-
-    /// A mid-size job through the full published pipeline — batch proof plus both recursion
-    /// stages — at a geometry comparable to the existing recursion test jobs
-    /// (`h = w = 16`, `k = 4096`: InputQuant at 2^16 rows, Blake3 and Matmul at 2^15),
-    /// large enough that per-proof overheads stop dominating the measurement.
-    #[test]
-    #[ignore = "exceeds the safe memory budget of an 8 GiB CI runner; run explicitly on a larger machine"]
-    fn medium_wrapped_roundtrip() {
-        let (header, plain) = fixture_job_medium();
-        let mut timing = TimingTree::default();
-
-        let (_, params) = plain.parse_proof(&header).expect("medium fixture job must parse");
-        let prover_data = Fp8ProverData::generate(&params, &header, &mut timing).expect("prover setup");
-        let mut cache = Fp8CircuitCache::default();
-
-        let (public, proof) = zk_prove_plain_proof_fp8_wrapped(&header, &plain, &prover_data, &mut cache, &mut timing)
-            .expect("medium wrapped proving must succeed");
-
-        let job = Fp8Job::derive(&public, &header).unwrap();
-        let circuit = Fp8WrapperCircuits::with_cache(&job.system, &prover_data.lut_cap, &mut cache, &mut timing)
-            .expect("cache hit")
-            .verifier_data();
-        verify_fp8_block_wrapped(&public, &header, &proof, &circuit, None).expect("honest medium wrapped proof must verify");
-    }
-
-    /// The MoE wire-level round trip: parse the MoE plain proof (routing membership +
-    /// sampled-entry checks), derive the MoE statement (routing pins, jackpot subkey,
-    /// `HASH_ROUTING` binding), prove, verify — then the MoE-specific rejection surface:
-    /// a different sampled outer index, a forged routing commitment, and a different
-    /// expert index must all fail closed.
-    #[test]
-    fn moe_api_roundtrip_and_tamper_rejection() {
-        let (header, plain) = fixture_job_moe();
-        let mut timing = TimingTree::default();
-
-        let (_, params) = plain.parse_proof(&header).expect("MoE fixture job must parse");
-        let moe = params.moe_statement().expect("the fixture is MoE").clone();
-
-        // The statement's MoE key material, bit-exact vs the labelled jackpot subkey.
-        let job = Fp8Job::derive(&params, &header).expect("MoE jobs must derive");
-        let a_noise_seed = params.noise_seeds(&header).a;
-        assert_eq!(
-            job.jackpot_key(),
-            crate::api::fp8::transcript::subkey(crate::api::fp8::transcript::LABEL_JACKPOT, Some(&a_noise_seed)),
-            "the MoE lottery key must be Subkey(noise_seedA, jackpot)"
-        );
-        assert_ne!(
-            job.jackpot_key(),
-            a_noise_seed,
-            "lottery key is the jackpot subkey, not the raw A seed"
-        );
-        assert_eq!(job.hash_routing(), Some(moe.hash_routing));
-
-        let prover_data = Fp8ProverData::generate(&params, &header, &mut timing).expect("prover setup");
-        let (public, proof) =
-            zk_prove_plain_proof_fp8(&header, &plain, &prover_data, &mut timing).expect("MoE proving must succeed");
-        let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
-
-        let verifier_data = prover_data.verifier_data();
-        verify_fp8_block(&public, &header, &proof, &verifier_data, None).expect("honest MoE proof must verify");
-
-        // The proof ships the routing tree root at HASH_ROUTING, bound to the public
-        // commitment (the same root the plain proof's Merkle membership verified).
-        let blake3_pis = &proof.0.public_inputs[job.system.main_table_positions()[0]];
-        assert_eq!(
-            &blake3_pis[PI_HASH_ROUTING..PI_HASH_ROUTING + 8],
-            &hash_to_u32_field_array(&moe.hash_routing),
-            "the proven routing root must be the job's routing commitment"
-        );
-
-        // Tamper 1: a different sampled outer index is a different pin schedule — the
-        // verifier's class (a) recompute (known columns) diverges from the committed trace.
-        let mut bad_outer = public.clone();
-        bad_outer.moe_statement_mut().unwrap().i_a[0] += 1;
-        assert!(
-            verify_fp8_block(&bad_outer, &header, &proof, &verifier_data, None).is_err(),
-            "a forged sampled outer index must be rejected"
-        );
-
-        // Tamper 2: a forged routing commitment moves the expected HASH_ROUTING.
-        let mut bad_routing = public.clone();
-        bad_routing.moe_statement_mut().unwrap().hash_routing[0] ^= 1;
-        assert!(
-            verify_fp8_block(&bad_routing, &header, &proof, &verifier_data, None).is_err(),
-            "a forged routing commitment must be rejected"
-        );
-
-        // Tamper 3: a different expert index is a different statement (pin schedule, POW
-        // key, hotspot schedule) — the proof must not transfer.
-        let mut bad_expert = public.clone();
-        bad_expert.moe_statement_mut().unwrap().w = 0;
-        assert!(
-            verify_fp8_block(&bad_expert, &header, &proof, &verifier_data, None).is_err(),
-            "a proof must not verify under a different expert's statement"
-        );
+        proof_pipeline_tests::regenerate_go_fixture();
     }
 
     /// The size constants must match the actual encoding: a dense statement encodes to exactly

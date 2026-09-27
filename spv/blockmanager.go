@@ -2450,26 +2450,8 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 		prevHash := prevNode.Header.BlockHash()
 		if prevHash.IsEqual(&blockHeader.PrevBlock) {
 			prevNodeHeight := prevNode.Height
-			prevNodeHeader := prevNode.Header
-
-			// Resolve the grandparent for the v4 ancestor
-			// window, falling back to the header store if the
-			// in-memory list trimmed it away.
-			grandparentNodeHeader, err := b.grandparentHeader(
-				prevNode.Prev(), &prevNodeHeader,
-			)
-			if err != nil {
-				log.Errorf("Unable to resolve header context: %v", err)
-				return
-			}
-
-			ctx := blockchain.CertificateHeaderContext{
-				Parent:      &prevNodeHeader,
-				Grandparent: grandparentNodeHeader,
-			}
-
-			err = b.checkHeaderSanity(
-				blockHeader, ctx, cert, false, prevNodeHeight,
+			err := b.checkHeaderSanity(
+				blockHeader, &prevNode.Header, cert, false, prevNodeHeight,
 			)
 			if err != nil {
 				log.Warnf("Header doesn't pass sanity check: "+
@@ -2579,25 +2561,15 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 				Height: int32(backHeight),
 			})
 
-			reorgGrandparent, err := b.grandparentHeader(nil, backHead)
-			if err != nil {
-				log.Errorf("Unable to resolve reorg header context: %v", err)
-				return
-			}
-			reorgContext := blockchain.CertificateHeaderContext{
-				Parent:      backHead,
-				Grandparent: reorgGrandparent,
-			}
 			totalWork := big.NewInt(0)
 			for j, reorgMsgHeader := range msg.Headers[i:] {
 				reorgHeader := &reorgMsgHeader.BlockHeader
-				prevNodeHeight := backHeight + uint32(j)
-
+				parent := b.reorgList.Back()
 				reorgCert := msg.Headers[i+j].BlockCertificate()
 
 				err = b.checkHeaderSanity(
-					reorgHeader, reorgContext, reorgCert, true,
-					int32(prevNodeHeight),
+					reorgHeader, &parent.Header, reorgCert, true,
+					parent.Height,
 				)
 				if err != nil {
 					log.Warnf("Header doesn't pass sanity"+
@@ -2612,7 +2584,6 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 					Header: *reorgHeader,
 					Height: int32(backHeight+1) + int32(j),
 				})
-				reorgContext.Advance(reorgHeader)
 			}
 			log.Tracef("Sane reorg attempted. Total work from "+
 				"reorg chain: %v", totalWork)
@@ -2835,12 +2806,9 @@ func areHeadersConnected(headers []*wire.BlockHeader) bool {
 // checkHeaderSanity performs contextual and context-less checks on the passed
 // wire.BlockHeader and wire.BlockCertificate. This function calls blockchain.CheckBlockHeaderContext for
 // the contextual check and blockchain.CheckBlockHeaderSanity for context-less
-// checks. headers contains the parent and grandparent of blockHeader on its
-// own chain (nil near genesis); a v4 proof's ancestor header σ_Δ is
-// authenticated against that window via blockchain.CheckCertificateContext.
+// checks. parent is the previous header on blockHeader's chain.
 func (b *blockManager) checkHeaderSanity(
-	blockHeader *wire.BlockHeader,
-	headers blockchain.CertificateHeaderContext,
+	blockHeader, parent *wire.BlockHeader,
 	cert wire.BlockCertificate, reorgAttempt bool,
 	prevNodeHeight int32,
 ) error {
@@ -2852,7 +2820,7 @@ func (b *blockManager) checkHeaderSanity(
 	}
 
 	parentHeaderCtx := newLightHeaderCtx(
-		prevNodeHeight, headers.Parent, b.cfg.BlockHeaders, hList,
+		prevNodeHeight, parent, b.cfg.BlockHeaders, hList,
 	)
 
 	// Create a lightChainCtx as well.
@@ -2875,39 +2843,10 @@ func (b *blockManager) checkHeaderSanity(
 		return err
 	}
 
-	if err := blockchain.CheckCertificateContext(
-		blockHeader, headers, cert, flags,
-	); err != nil {
-		return err
-	}
-
 	return blockchain.CheckBlockHeaderSanity(
 		blockHeader, cert, b.cfg.ChainParams.PowLimit, b.cfg.TimeSource,
 		b.cfg.ChainParams.MaxTimeOffsetMinutes, flags,
 	)
-}
-
-// grandparentHeader resolves the header before parent from memory or storage.
-func (b *blockManager) grandparentHeader(prevNode *headerlist.Node,
-	parent *wire.BlockHeader) (*wire.BlockHeader, error) {
-
-	if parent == nil {
-		return nil, nil
-	}
-
-	if prevNode != nil {
-		return &prevNode.Header, nil
-	}
-	if parent.PrevBlock == zeroHash {
-		return nil, nil
-	}
-
-	header, _, err := b.cfg.BlockHeaders.FetchHeader(&parent.PrevBlock)
-	if err != nil {
-		return nil, fmt.Errorf("unable to fetch grandparent header %s: %w",
-			&parent.PrevBlock, err)
-	}
-	return header, nil
 }
 
 // onBlockConnected queues a block notification that extends the current chain.

@@ -92,6 +92,14 @@ func minUint32(a, b uint32) uint32 {
 	return b
 }
 
+func validateMaxPeers(maxPeers int) error {
+	if maxPeers <= 0 {
+		return fmt.Errorf("maxpeers must be greater than zero: %d", maxPeers)
+	}
+
+	return nil
+}
+
 // config defines the configuration options for pearld.
 //
 // See loadConfig for details on the configuration load process.
@@ -125,7 +133,7 @@ type config struct {
 	LogSize                  uint32        `long:"logsize" description:"Maximum size in KB of the log file before it is rotated (default: 10240, ~10MB)"`
 	MaxMempool               uint64        `long:"maxmempool" description:"Maximum mempool size in MB (default: 300)"`
 	MaxOrphanTxs             int           `long:"maxorphantx" description:"Max number of orphan transactions to keep in memory"`
-	MaxPeers                 int           `long:"maxpeers" description:"Max number of inbound and outbound peers"`
+	MaxPeers                 int           `long:"maxpeers" description:"Max number of inbound and outbound peers. Must be greater than zero"`
 	MiningAddrs              []string      `long:"miningaddr" description:"Add the specified payment address to the list of addresses to use for generated blocks -- At least one address is required if the generate option is set"`
 	MinRelayTxFee            float64       `long:"minrelaytxfee" description:"The minimum transaction fee in PRL/kB to be considered a non-zero fee."`
 	DisableBanning           bool          `long:"nobanning" description:"Disable banning of misbehaving peers"`
@@ -604,6 +612,13 @@ func loadConfig() (*config, []string, error) {
 		str := "%s: The testnet, testnet2, regtest, signet and simnet " +
 			"params can't be used together -- choose one"
 		err := fmt.Errorf(str, funcName)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
+	if err := validateMaxPeers(cfg.MaxPeers); err != nil {
+		err := fmt.Errorf("%s: %w", funcName, err)
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err

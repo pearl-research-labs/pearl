@@ -17,13 +17,16 @@
 //! `E@F`. The exact procedure is chosen purely for cross-host bit-exactness;
 //! the draw need not be Gaussian, only deterministic and public.
 //!
-//! Each line is random-access: the per-side noise seed is
-//! subkeyed under `pearl/v4/FP8/noise-line`, and each line is addressed by a
-//! `(side, factor, line)` tuple zero-padded to one 64-byte BLAKE3 block. `E`
-//! lines use the selected global row/column index; `F` lines use `0..k` and
-//! never vary by expert. The `F` basis is stored `k x r` row-major (the
+//! Each line is random-access: the noise-line key is `Subkey("noise-line",
+//! seed)`, and each line is addressed by a `(side, factor, line)` tuple
+//! zero-padded to one 64-byte BLAKE3 block. `E` lines use the selected global
+//! row/column index; `F` lines use `0..k` and never vary by expert.
+//!
+//! `E_A` is keyed by `noise seedA`. Both F bases are keyed by `noise seedB`
+//! (`F_A` uses `Side::A` addresses so it is a distinct draw from `F_B`); `E_B`
+//! is keyed by `noise seedB`. The `F` basis is stored `k x r` row-major (the
 //! transpose of the reference's `(r x k)` view), so line `i` is column `i` of
-//! `F` — exactly the operand layout `B200::matmul_fp8` expects for `E @ F`.
+//! `F` — exactly the operand layout both device atoms expect for `E @ F`.
 
 use crate::api::fp8::compute::{bf16_div, bf16_mul};
 use crate::api::fp8::dtype::{bf16_to_f32, f32_to_bf16, f32_to_fp8_e4m3};
@@ -48,6 +51,17 @@ pub struct OperandNoise {
     pub e: Vec<u8>,
     /// `(k x r)` E4M3 values, row-major (the reference's `F` transposed).
     pub f: Vec<u8>,
+}
+
+/// Fixed seed-address line bytes, shared with the device-quantization vectors in
+/// [`crate::api::fp8::quantization::tests`].
+#[cfg(test)]
+pub(crate) fn decode_hex_for_test(raw: &str) -> Vec<u8> {
+    assert!(raw.len().is_multiple_of(2), "hex string must have even length");
+    (0..raw.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&raw[i..i + 2], 16).expect("hex must decode"))
+        .collect()
 }
 
 /// Which operand a noise line belongs to. The discriminants are the committed
@@ -130,7 +144,7 @@ fn normalize_line(bytes: &[u8]) -> Vec<u8> {
 ///
 /// `a_rows`/`b_cols` are the selected global row/column indices; the `E` lines
 /// key off those indices, and the `F` basis is `0..k` for both sides.
-/// `rank` is the peel rank `r`.
+/// `rank` is the peel rank `r`. Both F bases are keyed by `seeds.b`.
 pub(crate) fn sample_noise(k: usize, rank: u16, seeds: Sides<Hash256>, a_rows: &[u32], b_cols: &[u32]) -> Noise {
     let e_a = a_rows
         .iter()
@@ -141,7 +155,7 @@ pub(crate) fn sample_noise(k: usize, rank: u16, seeds: Sides<Hash256>, a_rows: &
         .flat_map(|&col| sample_line(&seeds.b, Side::B, NoiseFactor::E, col, rank))
         .collect();
     let f_a = (0..k as u32)
-        .flat_map(|i| sample_line(&seeds.a, Side::A, NoiseFactor::F, i, rank))
+        .flat_map(|i| sample_line(&seeds.b, Side::A, NoiseFactor::F, i, rank))
         .collect();
     let f_b = (0..k as u32)
         .flat_map(|i| sample_line(&seeds.b, Side::B, NoiseFactor::F, i, rank))
@@ -159,8 +173,8 @@ pub(crate) fn sample_noise(k: usize, rank: u16, seeds: Sides<Hash256>, a_rows: &
 ///
 /// The `E` lines key off the selected global row/column indices (in MoE they are
 /// the winner's `i_a` outer rows and the `expert_col + base + i` columns, so the
-/// global address itself gives per-expert pair-uniqueness); the `F` basis is
-/// `0..k` for both sides.
+/// global address itself gives per-expert pair-uniqueness); both `F` bases are
+/// `0..k` lines keyed by seedB.
 pub fn compute_fp8_noise(params: &PublicParams, proposed_header: &IncompleteBlockHeader) -> Noise {
     let a_rows = params.a_rows_indices();
     let b_cols = params.b_rows_indices();
@@ -175,6 +189,8 @@ mod tests {
     use super::*;
     use crate::api::fp8::dtype::fp8_e4m3_to_f32;
     use crate::api::primitives::Sides;
+
+    use super::decode_hex_for_test as decode_hex;
 
     fn fixed_seeds() -> Sides<Hash256> {
         Sides {
@@ -223,28 +239,80 @@ mod tests {
         assert!(noise.a.e.iter().all(|&c| fp8_e4m3_to_f32(c) != 0.0), "noise never draws zero");
     }
 
+    // the E lines track the selected global rows/columns,
+    // the shared F bases never do, and the seeds feed E_X (seedX)
+    // and both F bases (seedB).
     #[test]
-    fn global_addresses_disambiguate_e_lines() {
-        let seeds = Sides {
-            a: [6u8; 32],
-            b: [5u8; 32],
-        };
-        let a = sample_noise(64, 32, seeds, &[0], &[0]);
-        let b = sample_noise(64, 32, seeds, &[0], &[256]);
-        assert_ne!(a.b.e, b.b.e, "distinct global B-columns must draw distinct E-lines");
-        assert_eq!(a.a.e, b.a.e, "the A E-line depends only on its row");
-        assert_eq!(a.a.f, b.a.f, "the F basis never varies across instances");
-    }
-
-    #[test]
-    fn f_basis_is_side_deterministic_and_expert_independent() {
-        let seeds = Sides {
+    fn noise_lines_are_keyed_by_address_side_and_seed() {
+        let base = Sides {
             a: [9u8; 32],
             b: [7u8; 32],
         };
-        let a = sample_noise(64, 32, seeds, &[], &[]);
-        let b = sample_noise(64, 32, seeds, &[], &[]);
-        assert_eq!(a.a.f, b.a.f, "FA draws solely from the A seed");
-        assert_eq!(a.b.f, b.b.f, "FB draws solely from the B seed");
+        let a_changed = Sides {
+            a: [8u8; 32],
+            b: [7u8; 32],
+        };
+        let b_changed = Sides {
+            a: [9u8; 32],
+            b: [6u8; 32],
+        };
+        let n0 = sample_noise(64, 32, base, &[0], &[0]);
+        let n_a = sample_noise(64, 32, a_changed, &[0], &[0]);
+        let n_b = sample_noise(64, 32, b_changed, &[0], &[0]);
+
+        // Global addressing: only the E lines key on the selected indices.
+        let n_cols = sample_noise(64, 32, base, &[0], &[256]);
+        assert_ne!(n0.b.e, n_cols.b.e, "distinct global B-columns must draw distinct E-lines");
+        assert_eq!(n0.a.e, n_cols.a.e, "the A E-line depends only on its row");
+        assert_eq!(n0.a.f, n_cols.a.f, "the F basis never varies across instances");
+
+        // Side addressing: FA and FB share seedB but never a Side address.
+        assert_ne!(n0.a.f, n0.b.f, "FA and FB are distinct Side addresses under seedB");
+
+        // Seed addressing: EA from seedA; both F bases from seedB alone.
+        assert_eq!(n0.a.f, n_a.a.f, "FA is independent of seedA");
+        assert_ne!(n0.a.e, n_a.a.e, "EA still draws from seedA");
+        assert_eq!(n0.b.e, n_a.b.e, "EB is independent of seedA");
+        assert_ne!(n0.a.f, n_b.a.f, "FA draws from seedB");
+        assert_eq!(n0.b.f, n_a.b.f, "FB is independent of seedA");
+        assert_ne!(n0.b.f, n_b.b.f, "FB draws from seedB");
+    }
+
+    #[test]
+    fn sample_line_pins_fixed_seed_address_bytes() {
+        let seed_a: Hash256 = [0x22u8; 32];
+        let seed_b: Hash256 = [0x11u8; 32];
+        for (seed, side, factor, line, expected_hex) in [
+            (
+                &seed_a,
+                Side::A,
+                NoiseFactor::E,
+                7u32,
+                "be3adfead867e55be469dd50e9e85c50dfdc64e2dfe4eae2e8d6596a6746dd65",
+            ),
+            (
+                &seed_b,
+                Side::A,
+                NoiseFactor::F,
+                0u32,
+                "c65268603369d96362e16a5f6ae6615fe6db43eae463e2d3eae55ae3bb5f54e3",
+            ),
+            (
+                &seed_b,
+                Side::B,
+                NoiseFactor::E,
+                7u32,
+                "e6dce3e05ce4684ae1dee56555596ae3605de9e6e968e961dce1c2e8d75ee559",
+            ),
+            (
+                &seed_b,
+                Side::B,
+                NoiseFactor::F,
+                0u32,
+                "59de69d9696352dee8cee7d4e6da66615be9df69dd66dfe0d7e44f685fe96553",
+            ),
+        ] {
+            assert_eq!(sample_line(seed, side, factor, line, 32), decode_hex(expected_hex));
+        }
     }
 }

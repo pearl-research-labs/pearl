@@ -6,6 +6,7 @@ package treap
 
 import (
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,12 @@ var (
 	emptySlice = make([]byte, 0)
 )
 
+var treapNodePool = sync.Pool{
+	New: func() any {
+		return &treapNode{}
+	},
+}
+
 // treapNode represents a node in the treap.
 type treapNode struct {
 	key      []byte
@@ -40,6 +47,15 @@ type treapNode struct {
 	priority int
 	left     *treapNode
 	right    *treapNode
+}
+
+func (n *treapNode) recycle() {
+	n.key = nil
+	n.value = nil
+	n.priority = 0
+	n.left = nil
+	n.right = nil
+	treapNodePool.Put(n)
 }
 
 // nodeSize returns the number of bytes the specified node occupies including
@@ -51,7 +67,14 @@ func nodeSize(node *treapNode) uint64 {
 // newTreapNode returns a new node from the given key, value, and priority.  The
 // node is not initially linked to any others.
 func newTreapNode(key, value []byte, priority int) *treapNode {
-	return &treapNode{key: key, value: value, priority: priority}
+	n := treapNodePool.Get().(*treapNode)
+	n.key = key
+	n.value = value
+	n.priority = priority
+	n.left = nil
+	n.right = nil
+
+	return n
 }
 
 // parentStack represents a stack of parent treap nodes that are used during

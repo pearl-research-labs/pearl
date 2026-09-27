@@ -6,6 +6,8 @@ package rpctest
 
 import (
 	"fmt"
+	"math/rand/v2"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -43,17 +45,22 @@ func pearldExecutablePath() (string, error) {
 		return "", err
 	}
 
-	// Build pearld and output an executable in a static temp path.
 	outputPath := filepath.Join(testDir, "pearld")
 	if runtime.GOOS == "windows" {
 		outputPath += ".exe"
 	}
-	cmd := exec.Command(
-		"go", "build", "-o", outputPath, "github.com/pearl-research-labs/pearl/node",
-	)
+
+	// Concurrent `go test` processes share testDir. Building straight into the shared path lets two `go build`
+	// invocations interleave and leave a truncated binary, so build privately and publish with an atomic rename.
+	buildPath := fmt.Sprintf("%s.%d.tmp", outputPath, rand.Uint32())
+	cmd := exec.Command("go", "build", "-o", buildPath, "github.com/pearl-research-labs/pearl/node")
 	err = cmd.Run()
 	if err != nil {
 		return "", fmt.Errorf("Failed to build pearld: %v", err)
+	}
+	if err := os.Rename(buildPath, outputPath); err != nil {
+		_ = os.Remove(buildPath)
+		return "", fmt.Errorf("Failed to publish pearld binary: %v", err)
 	}
 
 	// Save executable path so future calls do not recompile.

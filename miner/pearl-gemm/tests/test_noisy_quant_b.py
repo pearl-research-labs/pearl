@@ -1,29 +1,23 @@
-"""``noisy_quant_b`` vs the reference chain, over the two committed weight planes.
+"""``noisy_quant_b`` against pinned digests, over the two committed weight planes.
 
 B-side gates: E_B / alpha_b / beta_b / B' codes / the ``-(beta (.) E_B)`` peel
-half bit-exact, the ``(beta (.) E_B@F_B - B') @ F_A^T`` mid half to tolerance --
-with the reference chain driven through the new-scheme API (planes -> commit
-over the codes and scales planes with fused stats, exact norms off the
-committed int8 blocks + scales, ``build_b_rows`` over the opened rows). The
-kernel is keyed by B's noise-line key (``Subkey("noise-line", seedB)``); F_A
-(per-A in v4) enters only as the raw peel factor, drawn here from a probe seed.
+half bit-exact against the protocol's operands for host-drawn inputs
+(``helpers/digests.py``), the ``(beta (.) E_B@F_B - B') @ F_A^T`` mid half
+against its fp64-exact product -- with the chain driven through the
+new-scheme API (planes -> commit over the codes and scales planes with fused
+stats -> ``noisy_quant_b`` against the device F bases). The kernel is keyed
+by B's noise-line key (``Subkey("noise-line", seedB)``); F_A enters as the raw
+peel factor and is keyed by the same seedB (Side.A address), so no seedA is
+involved on the B side.
 
 The mid tolerance is looser than the A side's ``A'@F2^T`` gate because the
-reference computes that half through its tolerance-path matmul with bf16
-roundings of ``E2@F2`` and ``diff`` that the kernel's reassociated epilogue
-does not replicate (both sit within ~3e-3 of the fp64-exact mid).
+kernel's reassociated epilogue sits ~3e-3 from the fp64-exact mid.
 """
 
 import pytest
 import torch
 from blake3 import blake3
-from miner_base.commitment import Device
 from miner_base.commitment_hash import noise_line_key
-from miner_base.hardware import hardware_for
-from miner_base.noise import OperandNoiser, Side
-from miner_base.prequant import PrequantMatrix
-from miner_base.quantization import Fp8QuantScheme
-from miner_base.scheme import PearlScheme
 
 from pearl_gemm import (
     NoisyQuantBConfig,
@@ -36,25 +30,8 @@ from pearl_gemm import (
     tensor_hash_workspace_bytes,
 )
 from pearl_gemm.protocol_constants import R
-from tests.helpers.chain import KEY_A, SEED_B, device_bytes
-
-_SEED_A_PROBE = blake3(b"seed-a-probe").digest()
-
-# The reassociated mid half vs the reference's tolerance-path mid (see module
-# docstring); the bit-exact halves use _mism. Near-degenerate inputs (e.g. a
-# zero operand, where the mid is pure quantization residue after the noise
-# terms cancel) make the mid's own norm a meaningless denominator, so the gate
-# is self-calibrating: the GPU mid must sit no further from the fp64-exact mid
-# than twice the reference's own tolerance-path deviation, with an absolute
-# floor for the well-conditioned case.
-_MID_REL_TOL = 1e-2
-
-
-def _mism(got: torch.Tensor, ref: torch.Tensor) -> int:
-    def bits(t):
-        return t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t
-
-    return (bits(got.cpu()) != bits(ref)).sum().item()
+from tests.helpers.chain import KEY_A, SEED_B, device_bytes, f_bases
+from tests.helpers.digests import digest, fixture_input, reference_digests
 
 
 def _rel(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -79,6 +56,10 @@ _SHAPES = [
 
 def _shape_id(shape):
     return "x".join(map(str, shape))
+
+
+def _case_id(n, k, seed):
+    return f"{n}x{k}-seed{seed}"
 
 
 def _committed_planes(b: torch.Tensor):
@@ -112,15 +93,6 @@ def _committed_planes(b: torch.Tensor):
     return codes, scales, commit_stats
 
 
-def _noisers(seed_b: bytes, k: int, hw=None):
-    """The reference per-side noisers: B's from ``seed_b``, A's from the probe seed."""
-    compute = (hw or hardware_for(Device.BLACKWELL)).compute
-    return (
-        OperandNoiser(_SEED_A_PROBE, Side.A, R, k, compute),
-        OperandNoiser(seed_b, Side.B, R, k, compute),
-    )
-
-
 def _launch_b(codes, scales, commit_stats, seed_b, f1, f2, config):
     """GPU ``noisy_quant_b`` (keyed by ``seed_b``'s noise-line key) over fresh
     caller-owned outputs; returns them."""
@@ -137,8 +109,8 @@ def _launch_b(codes, scales, commit_stats, seed_b, f1, f2, config):
         scales,
         device_bytes(noise_line_key(seed_b)),
         commit_stats,
-        pack_noise_factor(f2).cuda(),
-        f1.cuda().contiguous(),
+        pack_noise_factor(f2),
+        f1,
         *outputs.values(),
         torch.zeros(R, R, dtype=torch.float32, device="cuda"),
         config=config,
@@ -147,57 +119,44 @@ def _launch_b(codes, scales, commit_stats, seed_b, f1, f2, config):
     return outputs
 
 
-def _assert_b_chain_matches_reference(b: torch.Tensor, config_fields=None) -> None:
+def _assert_b_chain_matches_pinned(
+    b: torch.Tensor, case: str, config_fields=None, seed_b: bytes = SEED_B
+):
     """Run planes -> commit_b -> noisy_quant_b on ``b`` and gate every B-side
-    output against the reference chain."""
-    n, k = b.shape
-    hw = hardware_for(Device.BLACKWELL)
-
+    output against the pinned ``case``; returns the outputs and F bases."""
+    k = b.shape[1]
     codes, scales, commit_stats = _committed_planes(b)
-
-    # Factors from the commitment chain (reference noisers per side).
-    noise_a, noise_b = _noisers(SEED_B, k, hw)
-    e2, f1, f2 = noise_b.E(list(range(n))), noise_a.F(), noise_b.F()
-
+    f1, f2 = f_bases(k, seed_b)
     config = NoisyQuantBConfig(**(config_fields or {}))
-    got = _launch_b(codes, scales, commit_stats, SEED_B, f1, f2, config)
+    got = _launch_b(codes, scales, commit_stats, seed_b, f1, f2, config)
 
-    # The reference: rows are the opened planes and the norms come off the
-    # committed int8 blocks + scales (exact_norms), matching the GPU's
-    # factored commit stats. beta is not carried on the built rows.
-    bq_ref = PrequantMatrix.encode(b.cpu())
-    opened = bq_ref.open()
-    row_norms = bq_ref.exact_norms()
-    ref_stacked = PearlScheme(hw, Fp8QuantScheme(), k, R).build_b_rows(
-        opened, noise_a, noise_b, list(range(n)), row_norms
-    )
-    _, _, ref_beta, _ = Fp8QuantScheme().noisy_quantize(opened, e2, f2, hw, row_norms)
+    expected = reference_digests()["noisy_quant_b"][case]
+    assert digest(got["e2"]) == expected["e2"], "E_B codes"
+    assert digest(got["alpha_b"]) == expected["alpha_b"], "alpha_b"
+    assert digest(got["beta_b"]) == expected["beta_b"], "beta_b"
+    assert digest(got["b_prime"]) == expected["b_prime"], "B' codes"
+    assert digest(got["b_peel"][:, R:]) == expected["peel_beta_e"], "-(beta (.) E_B)"
 
-    assert _mism(got["e2"], e2) == 0, "E_B codes"
-    assert _mism(got["alpha_b"], ref_stacked.alpha.flatten()) == 0, "alpha_b"
-    assert _mism(got["beta_b"], ref_beta.flatten()) == 0, "beta_b"
-    assert _mism(got["b_prime"], ref_stacked.quant_part) == 0, "B' codes"
-    assert _mism(got["b_peel"][:, R:], ref_stacked.peel_part[:, R:]) == 0, "-(beta (.) E_B)"
-
-    # The pinned noise dot is exact integer arithmetic, so the fp64 chain is
-    # the exact mid; both implementations approximate it (see _MID_REL_TOL).
-    e2f2_64 = e2.double() @ f2.double()
-    diff_64 = ref_beta.double() * e2f2_64 - ref_stacked.quant_part.double()
-    mid_64 = diff_64 @ f1.double().t()
+    # The pinned noise dot is exact integer arithmetic, so the fp64 chain over
+    # the (pinned) operands is the exact mid. Near-degenerate inputs (e.g. a
+    # zero operand, where the mid is pure quantization residue after the noise
+    # terms cancel) carry a wider pinned tolerance.
+    e2f2_64 = got["e2"].cpu().double() @ f2.cpu().double()
+    diff_64 = got["beta_b"].cpu().double()[:, None] * e2f2_64 - got["b_prime"].cpu().double()
+    mid_64 = diff_64 @ f1.cpu().double().t()
     gpu_err = _rel(got["b_peel"][:, :R].double(), mid_64)
-    ref_err = _rel(ref_stacked.peel_part[:, :R].double(), mid_64)
-    assert gpu_err < max(2 * ref_err, _MID_REL_TOL), f"mid err {gpu_err} vs ref err {ref_err}"
+    assert gpu_err < expected["peel_tol"], f"mid err {gpu_err}"
+    return got, f1, f2, (codes, scales, commit_stats)
 
 
 @pytest.mark.parametrize("n,k", _SHAPES, ids=[_shape_id(s) for s in _SHAPES])
 @pytest.mark.parametrize("seed", [0, 1])
-def test_noisy_quant_b_matches_reference(n, k, seed):
-    torch.manual_seed(seed)
-    _assert_b_chain_matches_reference(torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 1.5)
+def test_noisy_quant_b_matches_pinned(n, k, seed):
+    _assert_b_chain_matches_pinned(fixture_input(n, k, seed).cuda(), _case_id(n, k, seed))
 
 
-# The pinned SM100 config families (consumer-E rows=64, both bk tiles)
-# against the reference at a multi-row-block shape, on the B operands.
+# The pinned SM100 config families (consumer-E rows=64, both bk tiles) at a
+# multi-row-block shape, on the B operands: the config never changes the bits.
 @pytest.mark.parametrize(
     "config_fields",
     [
@@ -215,10 +174,9 @@ def test_noisy_quant_b_matches_reference(n, k, seed):
         },
     ],
 )
-def test_pinned_config_families_match_reference(config_fields):
-    torch.manual_seed(0)
-    b = torch.randn(512, 4096, dtype=torch.bfloat16, device="cuda") * 1.5
-    _assert_b_chain_matches_reference(b, config_fields)
+def test_pinned_config_families_match_pinned(config_fields):
+    b = fixture_input(512, 4096, 0).cuda()
+    _assert_b_chain_matches_pinned(b, _case_id(512, 4096, 0), config_fields)
 
 
 # 2^56 (not bf16-max): bf16-max overflows fp32 norm accum to NaN beta.
@@ -232,35 +190,20 @@ _EDGE_FILLS = {
 
 
 @pytest.mark.parametrize("fill", sorted(_EDGE_FILLS))
-def test_edge_fill_weights_match_reference(fill):
+def test_edge_fill_weights_match_pinned(fill):
     b = torch.full((64, 512), _EDGE_FILLS[fill], dtype=torch.bfloat16, device="cuda")
-    _assert_b_chain_matches_reference(b)
+    _assert_b_chain_matches_pinned(b, fill)
 
 
 def test_other_seed_b_rekeys_the_draw():
     """Another job's ``seedB`` re-keys E_B (and F_B) and stays bit-exact."""
-    n, k = 64, 512
-    torch.manual_seed(2)
-    b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 1.5
+    b = fixture_input(64, 512, 2).cuda()
     seed_b = blake3(b"seed-b-other").digest()
-    hw = hardware_for(Device.BLACKWELL)
-    codes, scales, commit_stats = _committed_planes(b)
-
-    noise_a, noise_b = _noisers(seed_b, k, hw)
-    e2, f1, f2 = noise_b.E(list(range(n))), noise_a.F(), noise_b.F()
-    got = _launch_b(codes, scales, commit_stats, seed_b, f1, f2, NoisyQuantBConfig())
-
-    bq_ref = PrequantMatrix.encode(b.cpu())
-    ref_stacked = PearlScheme(hw, Fp8QuantScheme(), k, R).build_b_rows(
-        bq_ref.open(), noise_a, noise_b, list(range(n)), bq_ref.exact_norms()
-    )
-    assert _mism(got["e2"], e2) == 0
-    assert _mism(got["b_prime"], ref_stacked.quant_part) == 0
-    assert _mism(got["b_peel"][:, R:], ref_stacked.peel_part[:, R:]) == 0
+    got, f1, f2, planes = _assert_b_chain_matches_pinned(b, "other_seed_b", seed_b=seed_b)
 
     # And the fixture seed over the same planes draws different noise.
-    base = _launch_b(codes, scales, commit_stats, SEED_B, f1, f2, NoisyQuantBConfig())
-    assert _mism(base["e2"], e2) != 0
+    base = _launch_b(*planes, SEED_B, f1, f2, NoisyQuantBConfig())
+    assert not torch.equal(base["e2"].view(torch.uint8), got["e2"].view(torch.uint8))
 
 
 def test_consistency():
@@ -269,74 +212,10 @@ def test_consistency():
     torch.manual_seed(11)
     b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 1.5
     codes, scales, commit_stats = _committed_planes(b)
-    noise_a, noise_b = _noisers(SEED_B, k)
-    f1, f2 = noise_a.F(), noise_b.F()
+    f1, f2 = f_bases(k)
     config = NoisyQuantBConfig()
 
     first = _launch_b(codes, scales, commit_stats, SEED_B, f1, f2, config)
     second = _launch_b(codes, scales, commit_stats, SEED_B, f1, f2, config)
     for name in first:
         assert torch.equal(first[name].view(torch.uint8), second[name].view(torch.uint8)), name
-
-
-def test_mixed_gemm_parity_gpu_vs_reference_prep():
-    """``mixed_gemm`` fed GPU-prepped B vs reference-prepped B: bit-identical
-    lottery accumulator, C'' within the existing end-to-end tolerance."""
-    from pearl_gemm import HitSignal, HitSignalConfig, MixedGemmConfig, mixed_gemm
-
-    m, n, k = 256, 256, 512
-    torch.manual_seed(4)
-    b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 1.5
-    hw = hardware_for(Device.BLACKWELL)
-    codes, scales, commit_stats = _committed_planes(b)
-    noise_a, noise_b = _noisers(SEED_B, k, hw)
-    f1, f2 = noise_a.F(), noise_b.F()
-    got = _launch_b(codes, scales, commit_stats, SEED_B, f1, f2, NoisyQuantBConfig())
-
-    bq_ref = PrequantMatrix.encode(b.cpu())
-    ref_stacked = PearlScheme(hw, Fp8QuantScheme(), k, R).build_b_rows(
-        bq_ref.open(), noise_a, noise_b, list(range(n)), bq_ref.exact_norms()
-    )
-
-    # A fixed synthetic A side; only the B operands differ between runs.
-    a_prime = (torch.randn(m, k, device="cuda") * 0.1).to(torch.float8_e4m3fn)
-    a_peel = torch.randn(m, 2 * R, dtype=torch.bfloat16, device="cuda") * 0.1
-    alpha_a = torch.rand(m, dtype=torch.bfloat16, device="cuda") + 0.5
-    pow_key = torch.randint(0, 256, (32,), dtype=torch.uint8, device="cuda")
-    threshold = torch.zeros(32, dtype=torch.uint8, device="cuda")  # never-win
-    config = MixedGemmConfig(cluster_m=1, cluster_n=1)
-    # Synthetic A side: the committed planes only feed the (never-taken)
-    # hit-snapshot path, so zeros of the right shapes suffice.
-    a_codes = torch.zeros(m, k, dtype=torch.int8, device="cuda")
-    a_scales = torch.zeros(m, k // 8, dtype=torch.bfloat16, device="cuda")
-    commitment_hash_b = torch.zeros(32, dtype=torch.uint8, device="cuda")
-    hit_signal = HitSignal(HitSignalConfig(max_m=m, max_k=k))
-
-    def run(b_prime, b_peel, alpha_b):
-        out = torch.zeros(m, n, dtype=torch.bfloat16, device="cuda")
-        mixed_gemm(
-            a_prime,
-            b_prime.contiguous(),
-            a_peel,
-            b_peel.contiguous(),
-            alpha_a,
-            torch.reciprocal(alpha_b.flatten().float()).contiguous(),
-            pow_key,
-            threshold,
-            out,
-            hit_signal,
-            a_codes,
-            a_scales,
-            commitment_hash_b,
-            config=config,
-        )
-        torch.cuda.synchronize()
-        return out
-
-    out_gpu = run(got["b_prime"], got["b_peel"], got["alpha_b"])
-    out_ref = run(
-        ref_stacked.quant_part.cuda(), ref_stacked.peel_part.cuda(), ref_stacked.alpha.cuda()
-    )
-
-    assert _rel(out_gpu, out_ref) < 5e-3
-    assert torch.isfinite(out_gpu).all()

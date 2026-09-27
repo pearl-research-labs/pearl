@@ -35,7 +35,9 @@ Version-first design enables polymorphic decoding:
 	  salted noise-seed derivation.
 
 	CertificateV4: BlockHash(32) + PublicDataLen(4) + PublicData + ProofLen(4) + ProofData
-	  Same framing as V2/V3; both blobs are capped at MaxFp8ProofSize (FP8).
+	  + AncestorCount(varint) + AncestorHeaders(108 bytes each).
+	  Same size bounds as V2/V3. At most two full ancestor headers follow,
+	  ordered parent then grandparent, outside ProofCommitment.
 
 KEY DESIGN: SYMMETRIC SERIALIZATION
 
@@ -57,8 +59,7 @@ Genesis blocks are never verified (hardcoded and trusted), only serialized.
 
 # IMPLEMENTATION NOTES
 
-- CertificateMaxSize: 65 KB (V1–V3)
-- CertificateMaxSizeV4: version + two MaxFp8ProofSize blobs
+- CertificateMaxSize: 65 KB for every certificate version
 - Integration: MsgHeader.BlockCertificate() and MsgBlock.BlockCertificate() accessors
 - Storage: Certificate-first serialization, stored with blocks (no separate indexing)
 */
@@ -89,12 +90,9 @@ const (
 	CertificateVersionV4   CertificateVersion = 4
 )
 
-// MaxCertificateSize returns the encoded-size cap for certificate version v,
-// including the 4-byte version prefix.
-func MaxCertificateSize(v CertificateVersion) int {
-	if v == CertificateVersionV4 {
-		return CertificateMaxSizeV4
-	}
+// MaxCertificateSize returns the encoded-size cap for every certificate
+// version, including the 4-byte version prefix.
+func MaxCertificateSize(CertificateVersion) int {
 	return CertificateMaxSize
 }
 

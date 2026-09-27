@@ -8,31 +8,32 @@
 //! values it rebuilds are bit-identical to the miner's. The `(l2, linf)` norms
 //! feeding the derivation are computed by the CALLER straight from an
 //! operand's exact pre-BF16-rounding values (`exact_norms` for prequant
-//! operands, [`Quant::row_norms`] for raw-BF16 ones) and passed into
-//! [`Quant::noisy_quantize`] — mirroring the reference's `RowNorms` flow.
+//! operands, [`Fp8E4M3Quant::row_norms`] for raw-BF16 ones) and passed into
+//! [`Fp8E4M3Quant::noisy_quantize`] — mirroring the reference's `RowNorms` flow.
 //!
 //! All scale arithmetic is element-wise `compute_dtype` (BF16) via
 //! [`compute`](crate::api::fp8::compute): every input decodes exactly to f32,
 //! the op runs in f32, and the result rounds back to BF16 with ties-to-even —
 //! the same semantics as the reference's torch BF16 kernels, which have no
 //! accumulation order to pin. The one exception is the `E @ F` noise product,
-//! which runs on the bit-exact FP8 MMA (`B200::matmul_fp8`).
+//! which runs on the committed device's bit-exact rank-32 FP8 atom.
 
-use anyhow::{Context, Result, ensure};
-use itertools::Itertools;
+#[cfg(test)]
+use anyhow::ensure;
+use anyhow::{Context, Result};
 
 use crate::api::fp8::{
     compute::{bf16_clamp_sym, bf16_div, bf16_fma, bf16_max, bf16_mul},
-    dtype::{bf16_to_f32, f32_to_bf16, f32_to_fp8_e4m3, fp8_e4m3_to_f32},
+    dtype::{bf16_to_f32, f32_to_bf16, f32_to_fp8_e4m3},
     noise::OperandNoise,
-    prequant::round_l2_to_grid,
-    utils::{B200, fp32_to_bf16_rne},
+    public_params::Device,
+    utils::fp32_to_bf16_rne,
 };
+#[cfg(test)]
+use crate::api::fp8::{dtype::fp8_e4m3_to_f32, prequant::round_l2_to_grid};
 
 /// Largest finite FP8 E4M3 magnitude (the quant grid ceiling).
 pub const MAX_E4M3: f32 = 448.0;
-/// Noise-to-signal ratio (in L2) of the injected `E @ F` noise.
-pub const DELTA: f64 = 0.5;
 /// Constant L2 norm every noise line is renormalized to (`NOISE_TARGET_NORM` in
 /// the reference); an `E @ F` entry is Cauchy-Schwarz-bounded by its square.
 pub const NOISE_TARGET_NORM: f64 = 256.0;
@@ -52,71 +53,42 @@ pub struct BuiltRows {
     /// Per-row `beta` (BF16): scale on the `E @ F` noise.
     pub beta: Vec<u16>,
     /// Per-row `l2` (BF16): the floored, grid-rounded rms the scales derive
-    /// from. The jackpot policy's noise scale is `sigma_i = DELTA * alpha_i *
+    /// from. The jackpot policy's noise scale is `sigma_i = device.delta() * alpha_i *
     /// l2_i` (the std of the noise actually added to row `i`, in quantized
     /// units).
     pub l2: Vec<u16>,
 }
 
-/// A per-row fused noising + quantization scheme. Each
-/// [`Quant`](crate::api::fp8::public_params::Quant) variant maps to one
-/// implementation of this trait; only the 1-byte discriminant is serialized
-/// into `pB` — never any scales, which the verifier recomputes from the
-/// opened rows. `F` is the row storage encoding (BF16 as `u16`), `T` the
-/// quantized code encoding (E4M3 as `u8`).
-pub trait Quant<F, T> {
-    /// Per-row `(l2, linf)` norms of a RAW-BF16 row (the fallback for operands
-    /// with no prequant structure to compute exact norms from; mirrors the
-    /// reference's `_row_norms` raw branch). Prequant operands use
-    /// `exact_norms` (in [`prequant`](crate::api::fp8::prequant)) instead.
-    fn row_norms(&self, row: &[F]) -> Result<(F, F)>;
-
-    /// Per-row scales `(alpha, beta)` from the norms and the noise rank.
-    /// Expects `l2`/`linf` already floored at [`NORM_FLOOR`] (the scheme's
-    /// `row_norms` floor in the reference), as `noisy_quantize` does.
-    fn derive_row_scales(&self, l2: F, linf: F, r: usize) -> Result<(F, F)>;
-
-    /// Fused `Q(alpha (.) X + beta (.) (E @ F))` over a stack of rows.
-    ///
-    /// `rows` is `(num_rows x k)` row-major; `noise` carries the paired factors
-    /// `(e, f)` — `e` is `(num_rows x r)` and `f` is `(k x r)` (as stored, `f`
-    /// row `j` holding column `j` of the reference's `F`). `norms` holds each
-    /// row's `(l2, linf)`, computed by the caller from the operand's exact
-    /// values (see [`Quant::row_norms`]).
-    fn noisy_quantize(&self, rows: &[F], noise: &OperandNoise, norms: &[(F, F)]) -> Result<BuiltRows>;
-
-    /// `Q(alpha * x)` WITHOUT noise.
-    fn quantize_clean(&self, alpha: F, x: F) -> Result<T>;
-
-    /// The set of actual (unencoded) differences between grid values, excluding 0. Returned
-    /// as exact f32 so the differences are the real values, not re-quantized.
-    fn difference_grid(&self) -> Vec<f32>;
-}
-
-/// The scale constant `DELTA * sqrt(r)` as BF16 (`delta_r` in the reference):
-/// the coefficient of `l2` in the noised-value bound.
+/// FP8 E4M3 per-row fused quantization for one committed hardware device.
 ///
-/// The reference computes it in f64 (a Python float) and torch rounds
-/// f64 -> BF16 in one step; here the f64 result goes through f32 first. The
-/// double rounding is provably harmless for every rank up to 4096 (see
-/// `scale_constants_double_rounding_is_exact`), so the two paths agree bit-for-bit.
-fn delta_r_bf16(r: usize) -> Result<u16> {
-    f32_to_bf16((DELTA * (r as f64).sqrt()) as f32)
+/// The device is supplied once at construction; scale derivation and the
+/// `E @ F` atom cannot accidentally use different arithmetic profiles.
+#[derive(Clone, Copy, Debug)]
+pub struct Fp8E4M3Quant {
+    device: Device,
 }
 
-/// The scale constant `DELTA * sqrt(r) / NOISE_TARGET_NORM^2` as BF16
-/// (`delta_over_std` in the reference): the target noise-to-signal ratio times
-/// the rms/peak ratio `sqrt(r)`, over the squared noise-line norm. Same
-/// double-rounding guarantee as [`delta_r_bf16`].
-fn delta_over_std_bf16(r: usize) -> Result<u16> {
-    f32_to_bf16((DELTA * (r as f64).sqrt() / (NOISE_TARGET_NORM * NOISE_TARGET_NORM)) as f32)
-}
+impl Fp8E4M3Quant {
+    pub const fn new(device: Device) -> Self {
+        Self { device }
+    }
 
-/// FP8 E4M3 per-row fused quantization — the [`Quant`] implementation
-/// corresponding to [`Quant::Fp8E4M3Prequant`].
-pub struct Fp8E4M3Quant;
+    /// The scale constant `DELTA * sqrt(r)` as BF16 (`delta_r` in the
+    /// reference): the coefficient of `l2` in the noised-value bound.
+    ///
+    /// The reference computes it in f64 (a Python float) and torch rounds
+    /// f64 -> BF16 in one step; here the f64 result goes through f32 first.
+    /// The double rounding is provably harmless for every sanctioned rank.
+    pub(crate) fn delta_r_bf16(&self, r: usize) -> Result<u16> {
+        f32_to_bf16((self.device.delta() * (r as f64).sqrt()) as f32)
+    }
 
-impl Quant<u16, u8> for Fp8E4M3Quant {
+    /// `DELTA * sqrt(r) / NOISE_TARGET_NORM^2` as BF16
+    /// (`delta_over_std` in the reference).
+    pub(crate) fn delta_over_std_bf16(&self, r: usize) -> Result<u16> {
+        f32_to_bf16((self.device.delta() * (r as f64).sqrt() / (NOISE_TARGET_NORM * NOISE_TARGET_NORM)) as f32)
+    }
+
     /// Per-row `(l2, linf)`: `rms(X) = sqrt(mean_j X_j^2)` and `||X||_inf`.
     ///
     /// `l2` is summed in f32 and then cast down to a BF16 variant with its low
@@ -127,7 +99,8 @@ impl Quant<u16, u8> for Fp8E4M3Quant {
     ///
     /// A zero row yields `(0, 0)`; `noisy_quantize`'s [`NORM_FLOOR`] guards
     /// the division instead of an epsilon bump on `linf`.
-    fn row_norms(&self, row: &[u16]) -> Result<(u16, u16)> {
+    #[cfg(test)]
+    pub(crate) fn row_norms(&self, row: &[u16]) -> Result<(u16, u16)> {
         let k = row.len();
         ensure!(k > 0, "row must be non-empty");
         let sumsq: f32 = row
@@ -159,10 +132,10 @@ impl Quant<u16, u8> for Fp8E4M3Quant {
     /// [`NORM_FLOOR`] the caller applied to `l2`/`linf` keeps `alpha` finite on
     /// a (near-)zero row (a huge scale on a ~zero row is harmless —
     /// reconstruction divides it back out) and `beta` strictly positive.
-    fn derive_row_scales(&self, l2: u16, linf: u16, r: usize) -> Result<(u16, u16)> {
+    pub(crate) fn derive_row_scales(&self, l2: u16, linf: u16, r: usize) -> Result<(u16, u16)> {
         let max_e4m3 = f32_to_bf16(MAX_E4M3)?; // exact
-        let delta_r = delta_r_bf16(r)?;
-        let delta_over_std = delta_over_std_bf16(r)?;
+        let delta_r = self.delta_r_bf16(r)?;
+        let delta_over_std = self.delta_over_std_bf16(r)?;
 
         let noised_bound = bf16_fma(delta_r, l2, linf).context("noised bound")?;
         let alpha = bf16_div(max_e4m3, noised_bound).context("alpha scale")?;
@@ -174,7 +147,7 @@ impl Quant<u16, u8> for Fp8E4M3Quant {
     /// MATMUL -> COMPUTE (f32 -> BF16, RNE); the noised value is a single-rounding
     /// FMA `alpha*X + beta*(E@F)`, clamped to `±MAX_E4M3` before the BF16 -> E4M3
     /// cast.
-    fn noisy_quantize(&self, rows: &[u16], noise: &OperandNoise, norms: &[(u16, u16)]) -> Result<BuiltRows> {
+    pub(crate) fn noisy_quantize(&self, rows: &[u16], noise: &OperandNoise, norms: &[(u16, u16)]) -> Result<BuiltRows> {
         let e = &noise.e;
         let f = &noise.f;
         let num_rows = norms.len();
@@ -187,7 +160,7 @@ impl Quant<u16, u8> for Fp8E4M3Quant {
         let r = e.len() / num_rows;
         debug_assert!(f.len() == k * r, "f must be k x r");
 
-        let noise = B200 {}.matmul_fp8(e, f, None, num_rows, k, r)?;
+        let noise = self.device.matmul_fp8(e, f, None, num_rows, k, r)?;
         let noise: Vec<u16> = noise.into_iter().map(fp32_to_bf16_rne).collect();
 
         let max_e4m3 = f32_to_bf16(MAX_E4M3)?;
@@ -221,40 +194,12 @@ impl Quant<u16, u8> for Fp8E4M3Quant {
             l2: l2s,
         })
     }
-
-    fn quantize_clean(&self, alpha: u16, x: u16) -> Result<u8> {
-        let max_e4m3 = f32_to_bf16(MAX_E4M3)?;
-        let scaled = bf16_clamp_sym(bf16_mul(alpha, x)?, max_e4m3);
-        f32_to_fp8_e4m3(bf16_to_f32(scaled))
-    }
-
-    /// The set of all actual differences between E4M3 grid values: for every
-    /// ordered pair `(v1, v2)` of E4M3 grid values, the real value `v1 - v2`
-    /// (iterating ordered pairs yields both `v1 - v2` and `v2 - v1`). Returned as
-    /// exact, unencoded f32, deduplicated and sorted so the result is deterministic.
-    fn difference_grid(&self) -> Vec<f32> {
-        // E4M3 grid values: every code except the two NaN encodings (`S.1111.111`).
-        let values: Vec<f32> = (0u16..=0xFF)
-            .map(|c| c as u8)
-            .filter(|&c| c & 0x7F != 0x7F)
-            .map(fp8_e4m3_to_f32)
-            .collect();
-        let mut grid: Vec<f32> = values
-            .iter()
-            .cartesian_product(&values)
-            .filter_map(|(&v1, &v2)| if v1 != v2 { Some(v1 - v2) } else { None })
-            .collect();
-        // Differences are all finite, so `total_cmp` is a total order; dedup then
-        // merges numerically-equal entries (including ±0.0).
-        grid.sort_by(f32::total_cmp);
-        grid.dedup();
-        grid
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::fp8::noise::decode_hex_for_test as decode_hex_bytes;
 
     /// Reference single-rounding f64 -> bf16 (RNE), used to prove the production
     /// f64 -> f32 -> bf16 path never double-rounds for any sanctioned rank.
@@ -277,17 +222,20 @@ mod tests {
 
     #[test]
     fn scale_constants_double_rounding_is_exact() {
-        for r in 1..=4096usize {
-            assert_eq!(
-                delta_r_bf16(r).unwrap(),
-                f64_to_bf16_single(DELTA * (r as f64).sqrt()),
-                "delta_r double rounding diverges at r={r}"
-            );
-            assert_eq!(
-                delta_over_std_bf16(r).unwrap(),
-                f64_to_bf16_single(DELTA * (r as f64).sqrt() / (NOISE_TARGET_NORM * NOISE_TARGET_NORM)),
-                "delta_over_std double rounding diverges at r={r}"
-            );
+        for device in [Device::H100, Device::B200] {
+            let quant = Fp8E4M3Quant::new(device);
+            for r in 1..=4096usize {
+                assert_eq!(
+                    quant.delta_r_bf16(r).unwrap(),
+                    f64_to_bf16_single(device.delta() * (r as f64).sqrt()),
+                    "delta_r double rounding diverges for {device:?} at r={r}"
+                );
+                assert_eq!(
+                    quant.delta_over_std_bf16(r).unwrap(),
+                    f64_to_bf16_single(device.delta() * (r as f64).sqrt() / (NOISE_TARGET_NORM * NOISE_TARGET_NORM)),
+                    "delta_over_std double rounding diverges for {device:?} at r={r}"
+                );
+            }
         }
     }
 
@@ -304,10 +252,14 @@ mod tests {
             (1024, 0x4180, 0x3980),
             (4096, 0x4200, 0x3a00),
         ];
+        let b200 = Fp8E4M3Quant::new(Device::B200);
         for &(r, dr, dos) in cases {
-            assert_eq!(delta_r_bf16(r).unwrap(), dr, "delta_r r={r}");
-            assert_eq!(delta_over_std_bf16(r).unwrap(), dos, "delta_over_std r={r}");
+            assert_eq!(b200.delta_r_bf16(r).unwrap(), dr, "delta_r r={r}");
+            assert_eq!(b200.delta_over_std_bf16(r).unwrap(), dos, "delta_over_std r={r}");
         }
+        let h100 = Fp8E4M3Quant::new(Device::H100);
+        assert_eq!(h100.delta_r_bf16(32).unwrap(), 0x40B5);
+        assert_eq!(h100.delta_over_std_bf16(32).unwrap(), 0x38B5);
     }
 
     /// Cross-checked against the reference `Fp8QuantScheme.row_norms`, generated by
@@ -322,9 +274,10 @@ mod tests {
             (&[0.0; 4], 0x0000, 0x0000),
             (&[0.5, 0.25, -0.75, 1.5, -2.0, 0.125, 3.0, -1.0], 0x3fbc, 0x4040),
         ];
+        let quant = Fp8E4M3Quant::new(Device::B200);
         for &(vals, l2, linf) in cases {
             let row: Vec<u16> = vals.iter().map(|&v| bf(v)).collect();
-            assert_eq!(Fp8E4M3Quant.row_norms(&row).unwrap(), (l2, linf), "row {vals:?}");
+            assert_eq!(quant.row_norms(&row).unwrap(), (l2, linf), "row {vals:?}");
         }
     }
 
@@ -339,9 +292,10 @@ mod tests {
             (0x2f80, 0x2f80, 16, 0x5315, 0x3b95), // zero row, floored to 2^-32 on both norms
             (0x3f00, 0x4040, 64, 0x42b3, 0x3b33),
         ];
+        let quant = Fp8E4M3Quant::new(Device::B200);
         for &(l2, linf, r, alpha, beta) in cases {
             assert_eq!(
-                Fp8E4M3Quant.derive_row_scales(l2, linf, r).unwrap(),
+                quant.derive_row_scales(l2, linf, r).unwrap(),
                 (alpha, beta),
                 "l2={l2:#06x} linf={linf:#06x} r={r}"
             );
@@ -353,10 +307,11 @@ mod tests {
         // A zero row's raw norms are (0, 0); noisy_quantize floors both at
         // NORM_FLOOR = 2^-32 before the derivation, so alpha stays finite and
         // beta strictly positive (the row still receives real noise).
+        let quant = Fp8E4M3Quant::new(Device::B200);
         let zeros = vec![0u16; 64];
-        assert_eq!(Fp8E4M3Quant.row_norms(&zeros).unwrap(), (0, 0));
+        assert_eq!(quant.row_norms(&zeros).unwrap(), (0, 0));
         let floor = f32_to_bf16(NORM_FLOOR).unwrap();
-        let (alpha, beta) = Fp8E4M3Quant.derive_row_scales(floor, floor, 16).unwrap();
+        let (alpha, beta) = quant.derive_row_scales(floor, floor, 16).unwrap();
         assert!(bf16_to_f32(alpha).is_finite() && bf16_to_f32(alpha) > 0.0);
         assert!(bf16_to_f32(beta) > 0.0, "floored l2 keeps the noise scale positive");
     }
@@ -370,9 +325,10 @@ mod tests {
         let e: Vec<u8> = (0..num_rows * r).map(|i| if i % 3 == 0 { 0xB0 } else { 0x30 }).collect();
         let f: Vec<u8> = (0..k * r).map(|i| if i % 5 == 0 { 0xB0 } else { 0x30 }).collect();
         let noise = OperandNoise { e, f };
-        let norms: Vec<(u16, u16)> = rows.chunks(k).map(|row| Fp8E4M3Quant.row_norms(row).unwrap()).collect();
+        let quant = Fp8E4M3Quant::new(Device::B200);
+        let norms: Vec<(u16, u16)> = rows.chunks(k).map(|row| quant.row_norms(row).unwrap()).collect();
 
-        let built = Fp8E4M3Quant.noisy_quantize(&rows, &noise, &norms).unwrap();
+        let built = quant.noisy_quantize(&rows, &noise, &norms).unwrap();
         assert_eq!(built.noised_part.len(), num_rows * k);
         assert_eq!(built.alpha.len(), num_rows);
         assert_eq!(built.l2.len(), num_rows);
@@ -381,10 +337,41 @@ mod tests {
             assert!(fp8_e4m3_to_f32(c).abs() <= MAX_E4M3);
         }
         // Deterministic.
-        let again = Fp8E4M3Quant.noisy_quantize(&rows, &noise, &norms).unwrap();
+        let again = quant.noisy_quantize(&rows, &noise, &norms).unwrap();
         assert_eq!(built.noised_part, again.noised_part);
         assert_eq!(built.alpha, again.alpha);
         assert_eq!(built.beta, again.beta);
         assert_eq!(built.l2, again.l2);
+    }
+
+    /// Device-divergence vectors: the `e`/`f` inputs are the fixed seed-address
+    /// lines pinned by `noise::tests::sample_line_pins_fixed_seed_address_bytes`.
+    #[test]
+    fn device_quantization_pins_noise_alpha_beta_and_code() {
+        let e = decode_hex_bytes("be3adfead867e55be469dd50e9e85c50dfdc64e2dfe4eae2e8d6596a6746dd65");
+        let f = decode_hex_bytes("c65268603369d96362e16a5f6ae6615fe6db43eae463e2d3eae55ae3bb5f54e3");
+        let clean = vec![16256u16];
+        let norms = vec![(16256u16, 16384u16)];
+        for (device, expected_noise_bits, expected_alpha, expected_beta, expected_code) in [
+            (Device::H100, 1161306112u32, 17002u16, 15269u16, 105u8),
+            (Device::B200, 1161306624u32, 17082u16, 15236u16, 109u8),
+        ] {
+            let quant = Fp8E4M3Quant::new(device);
+            let noise_bits = device.matmul_fp8(&e, &f, None, 1, 1, 32).unwrap()[0].to_bits();
+            assert_eq!(noise_bits, expected_noise_bits, "{device:?} noise");
+            let built = quant
+                .noisy_quantize(
+                    &clean,
+                    &OperandNoise {
+                        e: e.clone(),
+                        f: f.clone(),
+                    },
+                    &norms,
+                )
+                .unwrap();
+            assert_eq!(built.alpha[0], expected_alpha, "{device:?} alpha");
+            assert_eq!(built.beta[0], expected_beta, "{device:?} beta");
+            assert_eq!(built.noised_part[0], expected_code, "{device:?} code");
+        }
     }
 }

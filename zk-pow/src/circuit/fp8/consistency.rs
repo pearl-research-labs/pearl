@@ -1,17 +1,17 @@
-//! One job, twenty-two traces, every CTL channel balanced.
+//! One job, twenty traces, every CTL channel balanced.
 //!
 //! [`build_fixture`] assembles the same fixture the real verifier parses and generates every
 //! main table's trace from that one witness — InputQuant consumes the opened strips, Scale
 //! consumes InputQuant's group tuples, Matmul
-//! consumes InputQuant's noised fp8 codes, XorFold consumes Matmul's cell results, Tamed
-//! consumes Matmul's E-cell binades and Scale's sigma frames, Blake3 consumes the strips'
+//! consumes InputQuant's noised fp8 codes, XorFold consumes Matmul's cell results and
+//! consolidated census counts, and Blake3 consumes the strips'
 //! bytes and XorFold's folded lottery words under the deployed `BlakeProgram` schedule. It is
 //! shared by two drivers:
 //!
 //! - this module's channel-balance test, which checks every AIR's constraints on its own
 //!   trace, every program's `known_values` (class (a) recompute) against its trace's leading
 //!   columns, every committed-LUT instance against the committed tables
-//!   ([`LutChecker`]), and the balance of all 24 CTL channels over the full 22-table batch
+//!   ([`LutChecker`]), and the balance of all 21 CTL channels over the full 20-table batch
 //!   via starky's `check_ctls`;
 //! - the batch driver's end-to-end proof test (`super::driver`), which proves the same job
 //!   with `starky::batch_prover::batch_prove` and verifies it back.
@@ -29,23 +29,23 @@ use starky::stark::Stark;
 
 use super::blake3_stark::columns::{Blake3ColumnsView, NUM_BLAKE3_COLUMNS};
 use super::blake3_stark::ctl::blake3_lut_lookups;
-use super::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, Blake3Stark, Blake3TraceInputs, MoeSchedule};
-use super::ctl::{LUT_TABLES, LutTable, NUM_TABLES, all_cross_table_lookups};
+use super::blake3_stark::stark::{Blake3Program, Blake3Stark, Blake3TraceInputs, MoeSchedule};
+use super::ctl::{LutTable, NUM_TABLES, Table, all_cross_table_lookups, lut_tables};
+use super::driver::{Fp8PublicData, Fp8System};
 use super::input_quant_stark::columns::{InputQuantColumnsView, NUM_INPUT_QUANT_COLUMNS};
 use super::input_quant_stark::ctl::input_quant_lut_lookups;
 use super::input_quant_stark::stark::{InputQuantProgram, InputQuantStark};
-use super::known_values::{KNOWN_COLUMNS_PER_TABLE, fp8_known_columns};
 use super::luts::{LutChecker, lut_trace};
-use super::matmul_b200_stark::MatmulB200ColumnsView;
 use super::matmul_b200_stark::columns::NUM_MATMUL_B200_COLUMNS;
 use super::matmul_b200_stark::ctl::matmul_b200_lut_lookups;
-use super::matmul_b200_stark::stark::{MatmulB200Stark, MatmulProgram, generate_b200_trace};
-use super::scale_stark::columns::{NUM_SCALE_COLUMNS, ScaleColumnsView};
-use super::scale_stark::ctl::{SIGMA_EXP_OFFSET, scale_lut_lookups};
+use super::matmul_b200_stark::{MatmulB200ColumnsView, MatmulStarkB200};
+use super::matmul_h100::columns::NUM_MATMUL_COLUMNS;
+use super::matmul_h100::ctl::matmul_lut_lookups;
+use super::matmul_h100::{MatmulColumnsView, MatmulStarkH100};
+use super::scale_stark::columns::NUM_SCALE_COLUMNS;
+use super::scale_stark::ctl::scale_lut_lookups;
 use super::scale_stark::stark::{ScaleProgram, ScaleRowTuple, ScaleStark};
-use super::tamed_stark::columns::NUM_TAMED_COLUMNS;
-use super::tamed_stark::ctl::tamed_lut_lookups;
-use super::tamed_stark::stark::{TamedProgram, TamedStark};
+use super::unpredictability::budget;
 use super::xor_fold_stark::columns::{NUM_XOR_FOLD_COLUMNS, XorFoldColumnsView};
 use super::xor_fold_stark::ctl::xor_fold_lut_lookups;
 use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
@@ -62,6 +62,27 @@ use crate::ffi::plain_proof::MatrixMerkleProof;
 
 type F = GoldilocksField;
 const D: usize = 2;
+
+enum MatmulRows {
+    H100(Vec<[F; NUM_MATMUL_COLUMNS]>),
+    B200(Vec<[F; NUM_MATMUL_B200_COLUMNS]>),
+}
+
+impl MatmulRows {
+    fn columns(&self) -> Vec<PolynomialValues<F>> {
+        match self {
+            Self::H100(rows) => columns(rows),
+            Self::B200(rows) => columns(rows),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::H100(rows) => rows.len(),
+            Self::B200(rows) => rows.len(),
+        }
+    }
+}
 
 fn to_u64(x: F) -> u64 {
     x.to_canonical_u64()
@@ -99,15 +120,14 @@ macro_rules! assert_constraints {
 }
 
 /// One fully assembled fp8 job: the compiled programs and public recompute inputs
-/// (the statement; Tamed's program is the shared geometry itself), the private strip planes
-/// and Blake3 auxiliary data (the witness), and the six generated main traces with their
+/// (the statement), the private strip planes and Blake3 auxiliary data (the witness), and
+/// the five generated main traces with their
 /// public inputs.
 pub(crate) struct Fp8Fixture {
     // The statement: programs plus the class (a) recompute inputs and expected public inputs.
     pub blake3: Blake3Program,
     pub input_quant: InputQuantProgram,
     pub scale: ScaleProgram,
-    pub matmul: MatmulProgram,
     pub xor_fold: XorFoldProgram,
     pub a_noise: Vec<u16>,
     pub b_noise: Vec<u16>,
@@ -134,9 +154,8 @@ pub(crate) struct Fp8Fixture {
     pub b3_rows: Vec<[F; NUM_BLAKE3_COLUMNS]>,
     pub iq_rows: Vec<[F; NUM_INPUT_QUANT_COLUMNS]>,
     pub scale_rows: Vec<[F; NUM_SCALE_COLUMNS]>,
-    pub mat_rows: Vec<[F; NUM_MATMUL_B200_COLUMNS]>,
+    mat_rows: MatmulRows,
     pub xf_rows: Vec<[F; NUM_XOR_FOLD_COLUMNS]>,
-    pub tamed_rows: Vec<[F; NUM_TAMED_COLUMNS]>,
 }
 
 /// The fixture job as the wire would carry it: the block header and the fp8 `PlainProof`
@@ -153,6 +172,13 @@ pub(crate) struct Fp8Fixture {
 pub(crate) fn fixture_job() -> (IncompleteBlockHeader, PlainProofV4) {
     let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
     fixture_job_with(32, 2048, dims, dims)
+}
+
+/// The minimum common-dimension envelope fixture (`k = 1024`) with the same
+/// 16x16 dense tile as [`fixture_job`].
+pub(crate) fn fixture_job_min_k() -> (IncompleteBlockHeader, PlainProofV4) {
+    let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
+    fixture_job_with(32, 1024, dims, dims)
 }
 
 /// The v4 opening keys for a fixture header: `keyA = H_"key-A"(σ̂)`,
@@ -219,14 +245,9 @@ pub(crate) fn fixture_job_medium() -> (IncompleteBlockHeader, PlainProofV4) {
 
 /// A policy-rejected wire job ([`fixture_job`]'s geometry): both sides commit the *same*
 /// value plane, so each diagonal tile cell replays a coherent `<v, v>` accumulation — all
-/// squares, no cancellation — whose magnitude blows the tamed-products allowance (jackpot
-/// check 3, 16 untamed of 256 cells > the `eps_tame = 1/64` allowance of 4). Checks 1, 2
-/// and 4 all pass: lifting `eps_tame` alone accepts the tile.
-///
-/// `k = 8192` is forced by `tau_tame = 256`: a diagonal cell's ratio `M / (sigma_i*sigma_j)`
-/// is Cauchy-Schwarz-capped at `~5k` (`4k` clean + `~k` noise), so untamed needs
-/// `4k > tau_tame * sqrt(k)`, i.e. `sqrt(k) > 64`. This `k` keeps the same `~1.4x`
-/// clean-cap headroom over the bound that `k = 2048` gave at `tau_tame = 128`.
+/// squares, no cancellation — whose M/Z grids make too many summands skippable under the
+/// consolidated census. `k = 8192` gives the fixture enough coherent mass to exceed the
+/// exact `floor(k*h*w/20)` allowance.
 pub(crate) fn fixture_job_untamed() -> (IncompleteBlockHeader, PlainProofV4) {
     let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
     let (m, k) = (32, 8192);
@@ -251,8 +272,7 @@ fn fixture_job_with(
 
 /// One committed int8-plane byte: a splitmix64-style mix of `(seed, i, j)`, so committed rows
 /// are mutually incoherent like honest workloads. (Overlapping ramps would make `A @ B^T`
-/// cells coherent and fail the jackpot policy's tamed-products allowance, which
-/// `TamedProgram::generate_trace` enforces.)
+/// cells coherent and fail the consolidated jackpot census.)
 fn plane_byte(seed: usize, i: usize, j: usize) -> u8 {
     let mut x = ((seed as u64) << 48) ^ ((i as u64) << 24) ^ j as u64;
     x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -502,6 +522,7 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
         k,
         block_size: BLOCK_SIZE,
         r,
+        device: public.common().device,
     };
     let a_int8: Vec<i8> = private.operands.a.values.as_bytes().iter().map(|&b| b as i8).collect();
     let b_int8: Vec<i8> = private.operands.b.values.as_bytes().iter().map(|&b| b as i8).collect();
@@ -520,7 +541,7 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
     let (iq_rows, iq_pis) = iq_program.generate_trace::<F>(&a_int8, &a_scale_codes, &a_noise, &b_int8, &b_scale_codes, &b_noise);
 
     // ---- ScaleStark: one tuple per matrix row, exactly what InputQuant committed. ----
-    let scale_program = ScaleProgram::new(h, w, k, r);
+    let scale_program = ScaleProgram::new_for_device(h, w, k, r, public.common().device);
     let tuples = |b_side: bool| -> Vec<ScaleRowTuple> {
         (0..if b_side { w } else { h })
             .map(|g| {
@@ -568,41 +589,44 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
             })
             .collect()
     };
-    let matmul_program = MatmulProgram { h, w, k };
     let mut cell_words = vec![0u32; h * w];
-    let mut cell_tuples = vec![(0u64, 0u64); h * w];
-    let (mat_rows, mat_pis) =
-        generate_b200_trace::<F>(&matmul_program, &codes(false), &codes(true), &lambdas(false), &lambdas(true));
-    for r in &mat_rows {
-        let v: &MatmulB200ColumnsView<F> = r.borrow();
-        // Live finals only: trailing phantom cells' finals carry no cell.
-        if v.is_cell_final == F::ONE && v.is_padding == F::ZERO {
-            cell_words[to_u64(v.cell_id) as usize] = (to_u64(v.cell_result_f32_lo) | (to_u64(v.cell_result_f32_hi) << 16)) as u32;
-            cell_tuples[to_u64(v.cell_id) as usize] = (to_u64(v.e_cell), to_u64(v.cell_skips));
+    let mut cell_skips = vec![0u64; h * w];
+    let (mat_rows, mat_pis) = match public.common().device {
+        Device::H100 => {
+            let stark = MatmulStarkH100::<F, D>::new(h, w, k);
+            let (rows, pis) = stark.generate_trace(&codes(false), &codes(true), &lambdas(false), &lambdas(true));
+            for r in &rows {
+                let v: &MatmulColumnsView<F> = r.borrow();
+                if v.is_cell_final == F::ONE && v.is_padding == F::ZERO {
+                    cell_words[to_u64(v.cell_id) as usize] =
+                        (to_u64(v.cell_result_f32_lo) | (to_u64(v.cell_result_f32_hi) << 16)) as u32;
+                    cell_skips[to_u64(v.cell_id) as usize] = to_u64(v.cell_skips);
+                }
+            }
+            (MatmulRows::H100(rows), pis.to_vec())
         }
-    }
-
-    // ---- Tamed: Matmul's per-cell binade-and-census tuples against Scale's per-row sigma
-    // frames, reassembled exactly as the channels export them. ----
-    let sigma_frames = |rows: core::ops::Range<usize>| -> Vec<(u64, u64)> {
-        rows.map(|g| {
-            let v: &ScaleColumnsView<F> = scale_rows[g].borrow();
-            (
-                to_u64(v.sigma_significand),
-                to_u64(v.alpha_exp) + to_u64(v.l2_floored_exponent) + SIGMA_EXP_OFFSET,
-            )
-        })
-        .collect()
+        Device::B200 => {
+            let stark = MatmulStarkB200::<F, D>::new(h, w, k);
+            let (rows, pis) = stark.generate_trace(&codes(false), &codes(true), &lambdas(false), &lambdas(true));
+            for r in &rows {
+                let v: &MatmulB200ColumnsView<F> = r.borrow();
+                if v.is_cell_final == F::ONE && v.is_padding == F::ZERO {
+                    cell_words[to_u64(v.cell_id) as usize] =
+                        (to_u64(v.cell_result_f32_lo) | (to_u64(v.cell_result_f32_hi) << 16)) as u32;
+                    cell_skips[to_u64(v.cell_id) as usize] = to_u64(v.cell_skips);
+                }
+            }
+            (MatmulRows::B200(rows), pis.to_vec())
+        }
     };
-    let tamed_program = TamedProgram { h, w, k };
-    let (tamed_rows, tamed_pis) = tamed_program.generate_trace::<F>(&cell_tuples, &sigma_frames(0..h), &sigma_frames(h..h + w));
 
     // ---- XorFoldStark: fold Matmul's cell results into the 16 lottery lanes — the
     // committed patterns' lane assignment, exactly what the API layer derives. ----
     let xf_program = XorFoldProgram {
         lanes: public.lane_assignment(),
+        skip_limit: budget(k, h, w),
     };
-    let (xf_rows, xf_pis) = xf_program.generate_trace::<F>(&cell_words);
+    let (xf_rows, xf_pis) = xf_program.generate_trace::<F>(&cell_words, &cell_skips);
 
     // ---- Blake3Stark: the deployed program over the strips, keyed by the real job key, with
     // the lottery block = XorFold's folded words. ----
@@ -663,18 +687,10 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
         blake3: blake_program,
         input_quant: iq_program,
         scale: scale_program,
-        matmul: matmul_program,
         xor_fold: xf_program,
         a_noise,
         b_noise,
-        public_inputs: [
-            b3_pis.to_vec(),
-            iq_pis.to_vec(),
-            scale_pis.to_vec(),
-            mat_pis.to_vec(),
-            xf_pis.to_vec(),
-            tamed_pis.to_vec(),
-        ],
+        public_inputs: [b3_pis.to_vec(), iq_pis.to_vec(), scale_pis.to_vec(), mat_pis, xf_pis.to_vec()],
         a_values,
         a_scales,
         b_values,
@@ -695,13 +711,12 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
         scale_rows,
         mat_rows,
         xf_rows,
-        tamed_rows,
     }
 }
 
 /// The end-to-end consistency driver: every AIR satisfied on its own trace, class (a)
 /// recompute bit-exact with the traces, every LUT instance served by the
-/// committed oracle, and all 24 CTL channels balanced over the full 22-table batch.
+/// committed oracle, and all 21 CTL channels balanced over the full 20-table batch.
 fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     let (h, w, k) = (fx.input_quant.h, fx.input_quant.w, fx.input_quant.k);
 
@@ -718,57 +733,55 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     assert_eq!(count(|v| v.is_int8_message), (h + w) * k / 8);
     assert_eq!(count(|v| v.is_scale_message), (h + w) * k / 32);
 
-    // ---- Column-major views (Table order: Blake3, InputQuant, Scale, Matmul, XorFold,
-    // Tamed; the sixteen LUT traces are appended below once their multiplicities are
-    // known). ----
+    // ---- Column-major views (Table order: Blake3, InputQuant, Scale, Matmul, XorFold;
+    // the LUT traces are appended below once their multiplicities are known). ----
     let mut traces = vec![
         columns(&fx.b3_rows),
         columns(&fx.iq_rows),
         columns(&fx.scale_rows),
-        columns(&fx.mat_rows),
+        fx.mat_rows.columns(),
         columns(&fx.xf_rows),
-        columns(&fx.tamed_rows),
     ];
 
     // ---- Class (a) ("known") columns: every program's `known_values` — recomputed from the
     // program and public data alone — must equal its trace's leading columns bit for bit.
     // This is exactly what the batch verifier recomputes and checks the trace-commitment
     // openings against (`BatchKnownColumns`), so any divergence here is a soundness hole. ----
-    let tamed_program = TamedProgram { h, w, k };
-    let known = [
-        fx.blake3.known_values::<F>(&Blake3KnownInputs {
-            a_values_len: fx.a_values.len(),
-            a_scales_len: fx.a_scales.len(),
-            b_values_len: fx.b_values.len(),
-            b_scales_len: fx.b_scales.len(),
-        }),
-        fx.input_quant.known_values::<F>(&fx.a_noise, &fx.b_noise),
-        fx.scale.known_values::<F>(),
-        fx.matmul.known_values::<F>(),
-        fx.xor_fold.known_values::<F>(),
-        tamed_program.known_values::<F>(),
-    ];
-    for (t, known_cols) in known.iter().enumerate() {
-        assert_eq!(known_cols.len(), KNOWN_COLUMNS_PER_TABLE[t]);
+    let batch_known = Fp8System::<F, D>::derive_known_columns(&Fp8PublicData {
+        blake3: fx.blake3.clone(),
+        input_quant: fx.input_quant.clone(),
+        scale: fx.scale.clone(),
+        xor_fold: fx.xor_fold.clone(),
+        a_values_len: fx.a_values.len(),
+        a_scales_len: fx.a_scales.len(),
+        b_values_len: fx.b_values.len(),
+        b_scales_len: fx.b_scales.len(),
+        a_noise: fx.a_noise.clone(),
+        b_noise: fx.b_noise.clone(),
+    });
+    for table in Table::ALL {
+        let t = table as usize;
+        let known_cols = &batch_known.values_per_table[t];
+        assert_eq!(known_cols.len(), table.known_column_count(fx.scale.device));
         for (ci, col) in known_cols.iter().enumerate() {
             assert_eq!(&traces[t][ci], col, "table {t}: known column {ci} diverges from the trace");
         }
     }
-    let batch_known = fp8_known_columns::<F>(known);
     assert!(
         batch_known.digest.is_none(),
         "the Fiat-Shamir digest is unbound until prove/verify"
     );
     assert_eq!(
-        batch_known.columns_per_table[0],
-        (0..KNOWN_COLUMNS_PER_TABLE[0]).collect::<Vec<_>>()
+        batch_known.columns_per_table[Table::Blake3 as usize],
+        (0..Table::Blake3.known_column_count(fx.scale.device)).collect::<Vec<_>>()
     );
 
     // ---- The committed LUT oracle serves every instance of every AIR's inventory: each key
     // resolves to an in-domain (slot, row) of the generated tables and the bound values equal
     // the precommitted columns there ([`LutChecker`], precise per-instance errors — the CTL
     // balance check below would only report an unbalanced multiset). ----
-    let mut checker = LutChecker::<F>::new();
+    let tables = lut_tables(fx.scale.device);
+    let mut checker = LutChecker::<F>::new(&tables);
     checker
         .check_trace(&blake3_lut_lookups::<F>(), &traces[0], &fx.public_inputs[0], "Blake3")
         .unwrap();
@@ -783,14 +796,15 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     checker
         .check_trace(&scale_lut_lookups::<F>(&fx.scale), &traces[2], &fx.public_inputs[2], "Scale")
         .unwrap();
+    let matmul_lookups = match fx.scale.device {
+        Device::H100 => matmul_lut_lookups::<F>(),
+        Device::B200 => matmul_b200_lut_lookups::<F>(),
+    };
     checker
-        .check_trace(&matmul_b200_lut_lookups::<F>(), &traces[3], &fx.public_inputs[3], "Matmul")
+        .check_trace(&matmul_lookups, &traces[3], &fx.public_inputs[3], "Matmul")
         .unwrap();
     checker
         .check_trace(&xor_fold_lut_lookups::<F>(), &traces[4], &fx.public_inputs[4], "XorFold")
-        .unwrap();
-    checker
-        .check_trace(&tamed_lut_lookups::<F>(), &traces[5], &fx.public_inputs[5], "Tamed")
         .unwrap();
     // Unfiltered inventories give exact totals: RNERND x6 per InputQuant row and x3 per Scale
     // row; the Matmul backend table (B200ALIGN) x32 per Matmul row (one per
@@ -800,17 +814,21 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
         mults.table_total(LutTable::RneRnd),
         (6 * fx.iq_rows.len() + 3 * fx.scale_rows.len()) as u64
     );
-    assert_eq!(mults.table_total(LutTable::B200Align), (32 * fx.mat_rows.len()) as u64);
+    let matmul_table = match fx.scale.device {
+        Device::H100 => LutTable::ProdAlign15,
+        Device::B200 => LutTable::B200Align,
+    };
+    assert_eq!(mults.table_total(matmul_table), (32 * fx.mat_rows.len()) as u64);
 
-    // ---- The sixteen LUT AIRs' traces (batch tables 6..=21, [`LUT_TABLES`] order):
+    // ---- The LUT AIR traces (device-specific committed order):
     // each is its precommitted block plus the accumulated multiplicity columns — the
     // per-proof online half of the committed LUT oracle. ----
-    for table in LUT_TABLES {
+    for table in tables {
         traces.push(lut_trace::<F>(table, mults.table_columns(table)));
     }
 
-    // All 22 channels, assembled before the programs move into their starks below.
-    let all_ctls = all_cross_table_lookups::<F>(&fx.scale);
+    // Assemble every channel before the programs move into their starks below.
+    let all_ctls = all_cross_table_lookups::<F>(fx.scale.device, &fx.scale);
 
     // ---- Every AIR satisfied on its own trace (the LUT AIRs have no constraints). ----
     let pis: [&[F]; NUM_TABLES] = core::array::from_fn(|t| fx.public_inputs[t].as_slice());
@@ -822,16 +840,18 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
         "InputQuant"
     );
     assert_constraints!(ScaleStark::<F, D>::new(fx.scale), &fx.scale_rows, pis[2], "Scale");
-    assert_constraints!(MatmulB200Stark::<F, D>::new(fx.matmul), &fx.mat_rows, pis[3], "Matmul");
+    match &fx.mat_rows {
+        MatmulRows::H100(rows) => assert_constraints!(MatmulStarkH100::<F, D>::new(h, w, k), rows, pis[3], "Matmul"),
+        MatmulRows::B200(rows) => {
+            assert_constraints!(MatmulStarkB200::<F, D>::new(h, w, k), rows, pis[3], "Matmul")
+        }
+    }
     assert_constraints!(XorFoldStark::<F, D>::new(fx.xor_fold), &fx.xf_rows, pis[4], "XorFold");
-    assert_constraints!(TamedStark::<F, D>::new(tamed_program), &fx.tamed_rows, pis[5], "Tamed");
 
-    // ---- Every CTL channel balances over the full 22-table batch: the eight main channels
+    // ---- Every CTL channel balances over the full batch: the six main channels
     // and one per committed LUT. `check_ctls` reads non-binary filter values as
-    // multiplicities — the operand channels' `w/h * IS_EVEN_ROW` looked sides, the sigma
-    // channel's `W_MULT`/`H_MULT` looked side, and the LUT channels' multiplicity columns.
-    // The main tables' public inputs feed InputQuant's CTL geometry terms and Scale's sigma
-    // multiplicities; the LUT tables have none. ----
+    // multiplicities — notably the operand channels' `w/h * IS_EVEN_ROW` looked sides and
+    // the LUT channels' multiplicity columns. The LUT tables have no public inputs. ----
     let mut all_pis: Vec<Vec<F>> = fx.public_inputs.to_vec();
     all_pis.resize(traces.len(), vec![]);
     check_ctls(&traces, &all_pis, &all_ctls, &Default::default());
@@ -840,6 +860,15 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
 #[test]
 fn one_job_balances_every_ctl_channel() {
     check_job_balances_every_ctl_channel(build_fixture(false));
+}
+
+/// Exercise Hopper's device-specific InputQuant, Scale, and Matmul traces across
+/// the actual CTL channels.
+#[test]
+fn one_hopper_quantization_job_balances_every_ctl_channel() {
+    let (header, mut proof) = fixture_job();
+    proof.job.common.device = Device::H100;
+    check_job_balances_every_ctl_channel(build_fixture_from_job(header, proof));
 }
 
 /// The MoE fixture through the same driver: the routing tree joins the Blake3 forest (pins
@@ -936,7 +965,7 @@ fn moe_tampered_offsets_root_fails_parse_and_verify() {
 /// protocol-legal all-zero-row envelope (ledger N5). The scheme floors both norms at `2^-32`,
 /// alpha stays finite, beta strictly positive, and that row's noised elements are pure noise;
 /// every AIR (InputQuant's floored witness, ScaleStark's in-circuit H0 floors, Matmul on the
-/// noise-only codes), the class (a) recompute, the LUT domains and all 24 CTL channels must
+/// noise-only codes), the class (a) recompute, the LUT domains and all 21 CTL channels must
 /// still close. Regression: the InputQuant witness used to derive alpha from the unfloored
 /// zero norms and panic.
 #[test]
@@ -969,7 +998,7 @@ fn one_k_mod_32_job_balances_every_ctl_channel() {
     check_job_balances_every_ctl_channel(build_fixture_from_job(header, proof));
 }
 
-/// Below the envelope: `k = 2064` sits in `[2048, 2^16]` but `k % 32 = 16`, so
+/// Below the envelope: `k = 2064` sits in `[1024, 2^16]` but `k % 32 = 16`, so
 /// `PublicParams::try_new` must reject at parse time.
 #[test]
 fn wire_layer_rejects_k_not_multiple_of_32() {
@@ -982,13 +1011,11 @@ fn wire_layer_rejects_k_not_multiple_of_32() {
     );
 }
 
-/// The ZK pipeline refuses to trace a policy-rejected job: TamedStark's trace generation
-/// panics on the untamed fixture (its J6 gate has no satisfying row), so no proof of the
-/// job can exist. The plain verifier rejects the same job with "not admissible"
-/// (`crate::api::verify` tests).
+/// The ZK pipeline refuses to trace a job whose consolidated skip census exceeds the exact
+/// global budget. The plain verifier rejects the same fixture.
 #[test]
-#[should_panic(expected = "untamed cells exceed the eps_tame allowance")]
-fn an_untamed_job_has_no_zk_trace() {
+#[should_panic(expected = "skippable summands exceed the census budget")]
+fn a_census_rejected_job_has_no_zk_trace() {
     let (header, proof) = fixture_job_untamed();
     let _ = build_fixture_from_job(header, proof);
 }

@@ -14,9 +14,10 @@
 //! happens only at the arithmetic boundary (`byte as i8`). One operand's two
 //! strips are bundled in [`PrequantOperand`].
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
-use crate::api::fp8::dtype::{bf16_to_f32, f32_to_bf16};
+use crate::api::fp8::dtype::{bf16_to_f32, check_not_nan_or_inf_bf16, f32_to_bf16};
+use crate::circuit::fp8::scale_stark::stark::rne_sqrt_hat;
 
 /// Block size of the whitelisted `int8 blk8 bf16s` format: one BF16 scale per
 /// [`BLOCK_SIZE`] contiguous int8 values (`DEFAULT_BLOCK_SIZE` in the reference).
@@ -30,26 +31,35 @@ pub const L2_ROUNDED_BITS: u32 = 2;
 /// Non-negative IEEE-754 floats order the same as their bit patterns, so this is
 /// "add half a grid step to the u16 view, clear the low bits", any carry into
 /// the kept mantissa/exponent bits falling out of the plain integer addition.
-/// Vs. ceiling to the same grid it is equally robust to a 1-ulp host
-/// discrepancy but has half the mean bias (0.5 vs 1.5 ulp). Called wherever a
-/// row's exact `sumsq` is turned into `l2`, so a <=1-ulp f32 discrepancy in
-/// `sumsq` between miner and verifier can't change the result.
+/// Vs. ceiling to the same grid it has half the mean bias (0.5 vs 1.5 ulp).
+/// Applied to the exactly rounded square root in [`exact_norms`] (ScaleStark group G).
 pub fn round_l2_to_grid(l2: u16) -> u16 {
     let step: u16 = 1 << L2_ROUNDED_BITS;
     l2.wrapping_add(step >> 1) & !(step - 1)
 }
 
+/// `Wl2 = 27 - ceil(log2 k)`: the precision shift of the block-integer L2 frame sum
+/// (ScaleStark's `WL2_PUBLIC_INPUT`, InputQuantStark's `2^Wl2`); `[11, 17]` over the
+/// envelope `1024 <= k <= 2^16`. With `p_b < 2^37` it keeps every shifted block product
+/// below `2^54` and the frame sum below `2^61`. Changing 27 changes the per-block floors
+/// and therefore protocol output.
+pub fn l2_frame_width(k: usize) -> Result<u32> {
+    let ceil_log2_k = k.next_power_of_two().trailing_zeros();
+    ensure!(ceil_log2_k <= 27, "k={k} exceeds the L2 frame width");
+    Ok(27 - ceil_log2_k)
+}
+
 /// Per-row `(l2, linf)` (BF16 bits) computed straight from the prequant planes,
-/// bypassing [`open_prequant`]'s per-element BF16 rounding — mirroring
-/// `PrequantMatrix.exact_norms` in the reference miner.
+/// bypassing [`open_prequant`]'s per-element BF16 rounding. Bit-identical to the
+/// ZK certificate (InputQuantStark group B + ScaleStark groups Q and G).
 ///
-/// Per block: `scale^2 * sum(int_i^2)` and `scale * max(|int_i|)`.
-/// `sum(int_i^2)` over a `block_size`-wide int8 block is exact in f32
-/// (`<= 127^2 * 8` for the default block size), so each block's contribution to
-/// `sumsq` only picks up the single f32 rounding of the `scale^2` multiply.
-/// `l2 = rms(X) = sqrt(sumsq / k)`, grid-rounded ([`round_l2_to_grid`]) so the
-/// per-row f32 block-sum order can differ from the reference's by an ulp
-/// without changing the result.
+/// `l2` is `grid4(RNE_bf16(sqrt(v)))` ([`round_l2_to_grid`]) of the canonical
+/// mean square `v = S * 2^(E_MAX - 268 - Wl2) / k`, where per block
+/// `p_b = M(scale_b)^2 * sum(int_i^2)`, `E_MAX = max 2*E*(scale_b)` over blocks
+/// with `p_b != 0`, and `S = sum floor(p_b * 2^Wl2 / 2^(E_MAX - 2*E*(scale_b)))`
+/// over the same blocks — exact integers, one rounding in the square root.
+///
+/// `linf` is `RNE_bf16(max(|int_i| * |scale|))`, exact in f32 before the cast.
 pub fn exact_norms(int_values: &[i8], scales: &[u16], num_rows: usize, k: usize, block_size: usize) -> Result<Vec<(u16, u16)>> {
     ensure!(
         block_size > 0 && k > 0 && k.is_multiple_of(block_size),
@@ -61,25 +71,58 @@ pub fn exact_norms(int_values: &[i8], scales: &[u16], num_rows: usize, k: usize,
         scales.len() == num_rows * n_blocks,
         "scales must be num_rows x (k / block_size)"
     );
-    let mut norms = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
-        let mut sumsq = 0.0f32;
-        let mut linf = f32::NEG_INFINITY;
-        for b in 0..n_blocks {
-            let ints = &int_values[i * k + b * block_size..i * k + (b + 1) * block_size];
-            // Both block reductions are exact in f32: sum of int8 squares
-            // (<= 127^2 * block_size) and the int8 abs-max.
-            let block_sumsq: f32 = ints.iter().map(|&v| (v as f32) * (v as f32)).sum();
-            let block_amax = ints.iter().map(|&v| (v as i32).unsigned_abs()).max().expect("block_size > 0") as f32;
-            let scale = bf16_to_f32(scales[i * n_blocks + b]); // exact
-            sumsq += block_sumsq * (scale * scale);
-            linf = linf.max(block_amax * scale.abs()); // 15-bit product, exact in f32
+    let wl2 = l2_frame_width(k)?;
+    int_values
+        .chunks_exact(k)
+        .zip(scales.chunks_exact(n_blocks))
+        .enumerate()
+        .map(|(i, (ints, scales))| row_norms(ints, scales, block_size, wl2).with_context(|| format!("row {i}")))
+        .collect()
+}
+
+/// One row of [`exact_norms`]. Two passes over the row: the frame exponent must be known
+/// before any block term can be floored.
+fn row_norms(ints: &[i8], scales: &[u16], block_size: usize, wl2: u32) -> Result<(u16, u16)> {
+    // `|scale| = M * 2^(E* - 134)`; returns `(M, 2*E*)`.
+    let decode = |code: u16| {
+        let exp_field = (code & 0x7FFF) >> 7;
+        let m = u64::from(code & 0x7F) + if exp_field == 0 { 0 } else { 128 };
+        (m, 2 * u32::from(exp_field.max(1)))
+    };
+    let blocks = || ints.chunks_exact(block_size).zip(scales);
+
+    // A block is live (`p_b != 0`) iff it has a nonzero int and a nonzero scale.
+    let mut e_max = 0;
+    let mut linf = 0.0f32;
+    for (b, (block, &code)) in blocks().enumerate() {
+        check_not_nan_or_inf_bf16(code).with_context(|| format!("block {b} scale"))?;
+        let amax = block.iter().map(|v| v.unsigned_abs()).max().expect("block_size > 0");
+        let (m, doubled_exp) = decode(code);
+        if amax != 0 && m != 0 {
+            e_max = e_max.max(doubled_exp);
         }
-        ensure!(sumsq.is_finite(), "row {i} sum of squares overflows f32");
-        let l2 = round_l2_to_grid(f32_to_bf16((sumsq / k as f32).sqrt())?);
-        norms.push((l2, f32_to_bf16(linf)?));
+        linf = linf.max(f32::from(amax) * bf16_to_f32(code & 0x7FFF)); // exact in f32
     }
-    Ok(norms)
+    let linf = f32_to_bf16(linf)?;
+
+    // Dead blocks contribute 0 whatever their (saturated) shift; p_b < 2^33 and Wl2 <= 27
+    // keep every shifted product below 2^60 and S below 2^62.
+    let s: u64 = blocks()
+        .map(|(block, &code)| {
+            let (m, doubled_exp) = decode(code);
+            let p = m * m * block.iter().map(|&v| u64::from(v.unsigned_abs()).pow(2)).sum::<u64>();
+            (p << wl2).checked_shr(e_max.saturating_sub(doubled_exp)).unwrap_or(0)
+        })
+        .sum();
+    let l2 = if s == 0 {
+        0
+    } else {
+        // The finite linf above bounds sqrt(v) below bf16 overflow, which `rne_sqrt_hat` asserts.
+        let claim = rne_sqrt_hat(s, i64::from(e_max), i64::from(wl2), ints.len() as u64);
+        round_l2_to_grid(((claim.exp << 7) + claim.mantissa) as u16)
+    };
+    ensure!(l2 < 0x7F80, "l2 snaps into the bf16 infinity code");
+    Ok((l2, linf))
 }
 
 /// Open a stack of prequantized rows to BF16:
@@ -100,6 +143,9 @@ pub fn open_prequant(int_values: &[i8], scales: &[u16], num_rows: usize, k: usiz
         scales.len() == num_rows * n_blocks,
         "scales must be num_rows x (k / block_size)"
     );
+    for (i, &scale) in scales.iter().enumerate() {
+        check_not_nan_or_inf_bf16(scale).with_context(|| format!("scale {i}"))?;
+    }
     let mut out = Vec::with_capacity(num_rows * k);
     for i in 0..num_rows {
         for j in 0..k {
@@ -125,7 +171,11 @@ pub struct PrequantSlice {
 impl PrequantSlice {
     /// Concatenate `rows` after checking that every row has `expected_row_bytes`.
     pub fn try_from_rows(rows: Vec<Vec<u8>>, expected_row_bytes: usize) -> Result<Self> {
-        let total = Self::total_bytes(rows.len(), expected_row_bytes)?;
+        ensure!(expected_row_bytes > 0, "committed row width must be positive");
+        let total = rows
+            .len()
+            .checked_mul(expected_row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("committed-row length overflow"))?;
         let mut bytes = Vec::with_capacity(total);
         for (i, row) in rows.iter().enumerate() {
             ensure!(
@@ -160,13 +210,6 @@ impl PrequantSlice {
             bytes.len()
         );
         Ok(Self { row_bytes, bytes })
-    }
-
-    fn total_bytes(row_count: usize, row_bytes: usize) -> Result<usize> {
-        ensure!(row_bytes > 0, "committed row width must be positive");
-        row_count
-            .checked_mul(row_bytes)
-            .ok_or_else(|| anyhow::anyhow!("committed-row length overflow"))
     }
 
     pub fn row_bytes(&self) -> usize {
@@ -245,6 +288,7 @@ mod tests {
         assert!(open_prequant(&[1, 2, 3], &[0x3f80], 1, 3, 8).is_err()); // k not multiple of block
         assert!(open_prequant(&[0i8; 8], &[0x3f80, 0x3f80], 1, 8, 8).is_err()); // scales too long
         assert!(open_prequant(&[0i8; 7], &[0x3f80], 1, 8, 8).is_err()); // int_values too short
+        assert!(open_prequant(&[1i8; 8], &[0x7F80], 1, 8, 8).is_err()); // non-finite scale
     }
 
     /// Cross-checked against the reference `PrequantMatrix.exact_norms` (torch),
@@ -259,6 +303,49 @@ mod tests {
         let scales: [u16; 4] = [0x3ca0, 0x4020, 0x3f00, 0x3d00];
         let norms = exact_norms(&int_values, &scales, 2, 16, BLOCK_SIZE).unwrap();
         assert_eq!(norms, vec![(0x42bc, 0x437a), (0x3fa0, 0x4000)]);
+    }
+
+    /// A pseudo-random prequant row: full-range int8 values, scales in `[2^-7, 2)`.
+    fn seeded_row(seed: u64, k: usize) -> (Vec<i8>, Vec<u16>) {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let ints = (0..k).map(|_| next() as i8).collect();
+        let scales = (0..k / BLOCK_SIZE).map(|_| 0x3C00 + (next() % 0x400) as u16).collect();
+        (ints, scales)
+    }
+
+    /// L2 norm computation fixtures
+    #[test]
+    fn exact_norms_l2_matches_the_zk_certificate() {
+        // (seed, k, l2); the f32 formula gave 0x4228 on both rows.
+        for (seed, k, l2) in [(877_130, 1024, 0x4224), (110_113, 2048, 0x422c)] {
+            let (ints, scales) = seeded_row(seed, k);
+            assert_eq!(exact_norms(&ints, &scales, 1, k, BLOCK_SIZE).unwrap()[0].0, l2, "seed {seed}");
+        }
+        // Every element 2^60: the f32 sum of squares overflowed and rejected the row.
+        let k = 1024;
+        let norms = exact_norms(&vec![1; k], &vec![(127 + 60) << 7; k / BLOCK_SIZE], 1, k, BLOCK_SIZE).unwrap();
+        assert_eq!(norms[0].0, 0x5d80);
+    }
+
+    #[test]
+    fn exact_norms_rejects_non_finite_scales() {
+        let err = exact_norms(&[1i8; 8], &[0x7F80], 1, 8, 8).unwrap_err();
+        assert!(format!("{err:#}").contains("not finite"), "{err:#}");
+    }
+
+    #[test]
+    fn l2_frame_width_pins_the_protocol_formula() {
+        assert_eq!(l2_frame_width(1024).unwrap(), 17);
+        assert_eq!(l2_frame_width(2080).unwrap(), 15); // ceil(log2 2080) = 12
+        assert_eq!(l2_frame_width(1 << 16).unwrap(), 11);
+        assert_eq!(l2_frame_width(1 << 27).unwrap(), 0);
+        assert!(l2_frame_width((1 << 27) + 1).is_err());
     }
 
     #[test]

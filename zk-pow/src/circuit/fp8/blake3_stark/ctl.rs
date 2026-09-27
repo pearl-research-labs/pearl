@@ -8,7 +8,9 @@ use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
-use super::super::ctl::{LutLookup, LutTable, Table};
+use super::super::ctl::Table;
+use super::super::luts::LutTable;
+use super::super::luts::ctl::LutLookup;
 use super::columns::BLAKE3_COL_MAP;
 
 /// The shared shape of both message channels: 4 byte-pair instances per message row,

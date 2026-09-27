@@ -2,7 +2,6 @@ pub mod compute;
 pub mod dtype;
 pub mod embedded_cache;
 pub mod jackpot_policy;
-pub mod lut_caps;
 pub mod noise;
 pub(crate) mod openings;
 pub mod plain_proof;

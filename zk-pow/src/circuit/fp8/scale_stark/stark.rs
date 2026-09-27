@@ -29,7 +29,7 @@
 //!
 //! Thus the canonical real row mean-square is
 //! `v = S * 2^(E_MAX - 268 - Wl2) / k`, where `268 = 2*134`. The envelope
-//! `2048 <= k <= 2^16` gives `11 <= Wl2 <= 16`. InputQuant's format envelope proves
+//! `1024 <= k <= 2^16` gives `11 <= Wl2 <= 17`. InputQuant's format envelope proves
 //! `S < 2^61`; this table enforces the slightly wider `S < 2^62`, still below the Goldilocks
 //! modulus `p = 2^64 - 2^32 + 1`.
 //!
@@ -37,8 +37,8 @@
 //!
 //! `RNE_bf16` means one round to finite bf16 using round-to-nearest, ties-to-even.
 //!
-//! Let `delta = 0.5`, noise rank `r`, and `N = 256`, the protocol's target norm for each noise
-//! line. The verifier derives the public bf16 constants
+//! Let `delta` be the committed device ratio (`1` on Hopper, `1/2` on Blackwell), noise rank
+//! `r`, and `N = 256`. The verifier derives the public bf16 constants
 //! `dr = RNE_bf16(delta*sqrt(r))` and
 //! `dos = RNE_bf16(delta*sqrt(r)/N^2)`. Each row proves:
 //!
@@ -61,10 +61,10 @@
 //! # Jackpot liveness gate (check 1)
 //!
 //! Each row also carries the group's `DEAD_COUNT` (CTL-bound to InputQuant, which proves the
-//! per-element `|X| >= 4*l2f` certificates against the group's `DEAD_BOUND`). T1 is the CTL
+//! per-element device-threshold certificates against the group's `DEAD_BOUND`). T1 is the CTL
 //! binding itself: the looked tuple's bound component is the affine expression
-//! `code(l2f) + 256` over the floored-L2 fields — the bf16 code of the plaintext threshold
-//! `tau_idle * DELTA * l2f = 4*l2f` — so the bound needs no Scale column. T2 accumulates the
+//! device-specific BF16 code of `tau_idle * delta * l2f`, so the bound needs no Scale column.
+//! T2 accumulates the
 //! counts into per-side running totals (frozen through padding), and on the last row the T3
 //! RC16 gates each total against its `DEAD_LIMIT` public input
 //! `floor(eps_idle * side_entries)` — the integer form of the plaintext
@@ -75,15 +75,13 @@
 //! # Jackpot noise-floor gate (check 2)
 //!
 //! Every opened row must carry noise of scale at least `sigma_min` in quantized units:
-//! `sigma = DELTA * alpha * l2f >= sigma_min`, with `sigma_min = 2*DELTA` frozen in
-//! [`ScaleProgram::new`], i.e. exactly `alpha * l2f >= 2`. The gate needs no new decode: H4's
-//! exact pre-rounding significand product `SIG = M(alpha)*M(l2f) in [2^14, 2^16)` and the
-//! exponent sum `E_SUM = ALPHA_EXP + L2_FLOORED_EXPONENT` give
-//! `alpha * l2f = SIG * 2^(E_SUM - 268)` exactly, so the comparison is the integer disjunction
-//! `E_SUM >= 255`, or `E_SUM = 254` and `SIG >= 2^15` — a committed branch bit plus two
-//! filtered RC16s (group F). This is bit-for-bit the plaintext policy comparison: the native
-//! check computes `DELTA * alpha * l2f` in f64, where the product of two 8-bit significands
-//! is exact.
+//! `sigma = delta * alpha * l2f >= sigma_min`, with the whitepaper-fixed `sigma_min = 1`.
+//! S2 normalizes H4's exact pre-rounding significand product, giving the affine encoding
+//! `SIGMA_ENC = E(alpha) + E(l2f) + SIGMA_SIG_IS_WIDE + offset(device) = e(sigma) + 268`.
+//! Therefore one unfiltered RC16 lookup of `SIGMA_ENC - 268` proves `sigma >= 1`; its maximum
+//! is only 255 on the pinned exponent domain, while a negative value wraps far outside the
+//! table range. This is bit-for-bit the plaintext policy comparison: the native check computes
+//! `delta * alpha * l2f` in f64, where the product of two 8-bit significands is exact.
 //!
 //! # Exact square-root check
 //!
@@ -129,14 +127,15 @@ use starky::stark::Stark;
 
 use super::columns::{
     ALIGNED_LIMBS, BORROW_BITS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT, DOS_EXP_PUBLIC_INPUT,
-    DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT, FmaBlock, H_MULT_PUBLIC_INPUT, K_PUBLIC_INPUT,
-    L2_SUM_LIMBS, MulBlock, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView, W_MULT_PUBLIC_INPUT, WL2_PUBLIC_INPUT,
+    DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT, FmaBlock, K_PUBLIC_INPUT, L2_SUM_LIMBS, MulBlock,
+    NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView, WL2_PUBLIC_INPUT,
 };
 use crate::api::fp8::compute::{bf16_div, bf16_fma, bf16_max, bf16_mul};
 use crate::api::fp8::dtype::f32_to_bf16;
 use crate::api::fp8::jackpot_policy::JackpotPolicy;
-use crate::api::fp8::prequant::BLOCK_SIZE;
-use crate::api::fp8::quantization::{DELTA, Fp8E4M3Quant, MAX_E4M3, NOISE_TARGET_NORM, NORM_FLOOR, Quant};
+use crate::api::fp8::prequant::{BLOCK_SIZE, l2_frame_width};
+use crate::api::fp8::public_params::{Device, PublicParams};
+use crate::api::fp8::quantization::{Fp8E4M3Quant, MAX_E4M3, NORM_FLOOR};
 
 // ==================================================================================================
 // Frame constants (bf16 field conventions)
@@ -208,7 +207,7 @@ impl ScaleRowTuple {
     /// the jackpot dead-entry count against the row's own floored L2.
     ///
     /// Panics on non-finite scales and on decoded elements overflowing bf16.
-    pub fn from_prequant_row(int8: &[i8], scales: &[u16], wl2: u32) -> Self {
+    pub fn from_prequant_row_for_device(int8: &[i8], scales: &[u16], wl2: u32, device: Device) -> Self {
         assert!(int8.len().is_multiple_of(BLOCK_SIZE), "row length is a multiple of 8");
         assert_eq!(scales.len(), int8.len() / BLOCK_SIZE, "one scale per block");
 
@@ -268,7 +267,7 @@ impl ScaleRowTuple {
             rne_sqrt_hat(s, frame_doubled_scale_exponent as i64, i64::from(wl2), int8.len() as u64)
         };
         let snapped = ((claim.exp << 7) + claim.mantissa + 2) & !3;
-        let dead_bound = snapped.max(u64::from(NORM_FLOOR_CODE)) + 256;
+        let dead_bound = snapped.max(u64::from(NORM_FLOOR_CODE)) + device.liveness_code_shift();
         let dead_count = abs_codes.iter().filter(|&&abs| u64::from(abs) >= dead_bound).count() as u32;
 
         Self {
@@ -290,19 +289,25 @@ pub struct ScaleProgram {
     /// B-side rows.
     pub w: usize,
     /// Row length. Protocol preconditions: `k % 32 == 0`,
-    /// `2048 <= k <= 2^16` — they keep `Wl2 in [11, 16]`, inside the sqrt shift window's
-    /// honest-completeness proof.
+    /// `PublicParams::MIN_K <= k <= PublicParams::MAX_K` — they keep `Wl2 in [11, 17]`,
+    /// inside the sqrt shift window's honest-completeness proof.
     pub k: usize,
     /// Noise rank (the `r` of `dr = bf16(DELTA * sqrt(r))`).
     pub r: usize,
+    /// Committed arithmetic profile.
+    pub device: Device,
 }
 
 impl ScaleProgram {
     /// Builds the program, asserting the geometry preconditions the AIR's soundness bounds
-    /// assume (the wire layer is expected to enforce the same envelope with errors).
-    pub fn new(h: usize, w: usize, k: usize, r: usize) -> Self {
+    /// assume. Production reaches this constructor only after `PublicParams` validates the
+    /// same envelope with errors; these assertions also protect direct internal callers.
+    pub fn new_for_device(h: usize, w: usize, k: usize, r: usize, device: Device) -> Self {
         assert!(h >= 1 && w >= 1, "empty geometry");
-        assert!(k.is_multiple_of(32) && (2048..=1 << 16).contains(&k), "unsanctioned k");
+        assert!(
+            k.is_multiple_of(32) && (PublicParams::MIN_K..=PublicParams::MAX_K).contains(&k),
+            "unsanctioned k"
+        );
         assert!(r >= 1, "noise rank must be positive");
         assert_eq!(
             f32_to_bf16(MAX_E4M3).expect("448 is finite"),
@@ -314,21 +319,17 @@ impl ScaleProgram {
             NORM_FLOOR_CODE,
             "NORM_FLOOR_CODE is the bf16 code of the scheme's norm floor"
         );
-        // The F gate compares alpha * l2f against sigma_min / DELTA = 2, a binade pivot the
-        // AIR bakes into its constants (E_SUM 255/254, SIG 2^15) — structural, like the
-        // tau_idle freeze in `dead_limit`.
-        assert!(
-            JackpotPolicy::default().sigma_min == 2.0 * DELTA,
-            "the circuit freezes sigma_min = 2*DELTA (the F-gate binade pivot)"
+        assert_eq!(
+            JackpotPolicy::for_device(device).sigma_min,
+            1.0,
+            "the circuit freezes the whitepaper sigma_min = 1"
         );
-        Self { h, w, k, r }
+        Self { h, w, k, r, device }
     }
 
-    /// `Wl2 = 27 - ceil(log2 k)` — the block-L2 frame width; `in [11, 16]` for sanctioned `k`.
-    /// Must match InputQuantStark's `WL2_BASE`: the CTL-transported `S` is scaled by `2^Wl2`,
-    /// and changing the schedule would change canonical L2 values rather than merely rescale S.
+    /// `Wl2` — the block-L2 frame width ([`l2_frame_width`]); `in [11, 17]` for sanctioned `k`.
     pub fn wl2(&self) -> u32 {
-        27 - self.k.next_power_of_two().trailing_zeros()
+        l2_frame_width(self.k).expect("sanctioned k")
     }
 
     /// Live rows: one per matrix row, A rows then B rows.
@@ -345,13 +346,15 @@ impl ScaleProgram {
     /// `dr = bf16(DELTA * sqrt(r))` — mirrors the private `quantization::delta_r_bf16`
     /// bit for bit (kept in sync by the derive_row_scales differential test).
     pub fn dr_code(&self) -> u16 {
-        f32_to_bf16((DELTA * (self.r as f64).sqrt()) as f32).expect("dr is finite")
+        Fp8E4M3Quant::new(self.device).delta_r_bf16(self.r).expect("dr is finite")
     }
 
     /// `dos = bf16(DELTA * sqrt(r) / NOISE_TARGET_NORM^2)` — mirrors the private
     /// `quantization::delta_over_std_bf16`.
     pub fn dos_code(&self) -> u16 {
-        f32_to_bf16((DELTA * (self.r as f64).sqrt() / (NOISE_TARGET_NORM * NOISE_TARGET_NORM)) as f32).expect("dos is finite")
+        Fp8E4M3Quant::new(self.device)
+            .delta_over_std_bf16(self.r)
+            .expect("dos is finite")
     }
 
     /// A side's dead-entry allowance `floor(eps_idle * entries)`, in f64 exactly like the
@@ -361,8 +364,13 @@ impl ScaleProgram {
     /// boolean-high-bit capacity of `2^17`.
     fn dead_limit(&self, entries: usize) -> u64 {
         let policy = JackpotPolicy::default();
-        // The +256 code shift T1/InputQuant bake in *is* tau_idle * DELTA = 4 = 2^2.
-        assert!(policy.tau_idle * DELTA == 4.0, "the circuit freezes tau_idle * DELTA = 4");
+        // The device-specific code shift T1/InputQuant bake in is exactly
+        // `tau_idle * delta`, an integral power of two.
+        debug_assert_eq!(
+            policy.tau_idle * self.device.delta(),
+            2f64.powi(self.device.lg2_delta() + 3),
+            "tau_idle * delta must remain an exact power of two"
+        );
         let limit = (policy.eps_idle * entries as f64).floor() as u64;
         assert!(limit < 1 << 17, "DEAD_LIMIT exceeds the high-bit RC16 gate");
         limit
@@ -386,8 +394,6 @@ impl ScaleProgram {
         pis[WL2_PUBLIC_INPUT] = F::from_canonical_u64(u64::from(self.wl2()));
         pis[DEAD_LIMIT_A_PUBLIC_INPUT] = F::from_canonical_u64(self.dead_limit(self.h * self.k));
         pis[DEAD_LIMIT_B_PUBLIC_INPUT] = F::from_canonical_u64(self.dead_limit(self.w * self.k));
-        pis[W_MULT_PUBLIC_INPUT] = F::from_canonical_u64(self.w as u64);
-        pis[H_MULT_PUBLIC_INPUT] = F::from_canonical_u64(self.h as u64);
         pis
     }
 
@@ -656,7 +662,7 @@ impl ScaleProgram {
         // The whole chain in one shot: alpha/beta must equal the native `derive_row_scales`
         // on the floored norms — the exact `noisy_quantize` flow (floor, FMA, DIV, MUL, MUL) —
         // on EVERY row, all-zero rows included.
-        let native = Fp8E4M3Quant
+        let native = Fp8E4M3Quant::new(self.device)
             .derive_row_scales(l2f.code(), linf_f.code(), self.r)
             .expect("native derive_row_scales");
         assert_eq!(
@@ -665,14 +671,14 @@ impl ScaleProgram {
             "H: the scale chain diverged from the native derive_row_scales"
         );
 
-        // ---- The jackpot noise floor (group F): sigma = DELTA*alpha*l2f >= sigma_min, i.e.
-        // alpha*l2f = SIG*2^(E_SUM - 268) >= 2 with SIG = M(alpha)*M(l2f) in [2^14, 2^16):
-        // pass iff E_SUM >= 255 (the committed branch bit), or E_SUM = 254 and SIG >= 2^15. ----
+        // ---- The jackpot noise floor (group F): sigma = DELTA*alpha*l2f >= sigma_min = 1.
+        // S2 makes its exact exponent encoding affine; the matching RC16 gate checks that the
+        // encoding is at least 268, i.e. e(sigma) >= 0. ----
         let e_sum = alpha.e_star() + l2f.e_star();
-        v.sigma_exp_clears_floor = F::from_bool(e_sum >= 255);
+        let sigma_enc = e_sum + i64::from(sigma_sig_is_wide) + self.device.sigma_encoding_offset() as i64;
         if expect_valid {
             assert!(
-                e_sum >= 255 || (e_sum == 254 && b1.sig_product >= 1 << 15),
+                sigma_enc >= PROD_UNIT,
                 "policy-rejected witness: row noise scale below the sigma floor (jackpot check 2)"
             );
         }
@@ -1353,7 +1359,7 @@ where
     // The geometry parameters, as public inputs (degree 0 in the constraint polynomials —
     // swapping the former baked constants for these scalars changes no constraint degree).
     // The verifier pins both to statement-derived values inside the envelope
-    // (`k % 32 == 0`, `2048 <= k <= 2^16`, hence `Wl2 in [11, 16]`) — the range every
+    // (`k % 32 == 0`, `1024 <= k <= 2^16`, hence `Wl2 in [11, 17]`) — the range every
     // soundness bound below assumes.
     let k_pi = eval.scalar(pis[K_PUBLIC_INPUT]);
     let wl2_pi = eval.scalar(pis[WL2_PUBLIC_INPUT]);
@@ -1805,8 +1811,8 @@ where
     eval.constraint_bool(lv.sigma_sig_is_wide);
 
     // ==== S3 — jackpot check 4: SIGMA_NORM = SIGMA_SIGNIFICAND * (2 - SIGMA_SIG_IS_WIDE),
-    // the significand normalized into [2^15, 2^16) (0 on pad rows, where S1 pins the
-    // significand to the zero product). ====
+    // the significand normalized into [2^15, 2^16). Pad rows carry the same valid scale
+    // chain but are excluded from the group-tuple CTL. ====
     let two = eval.i32(2);
     let doubling = eval.sub(two, lv.sigma_sig_is_wide);
     let norm_expected = eval.mul(lv.sigma_significand, doubling);
@@ -1829,11 +1835,9 @@ where
 
     // T1 — the group-tuple CTL binds InputQuant's committed DEAD_BOUND to the floored-L2
     // threshold with no column and no constraint here: the looked tuple's bound component is
-    // the affine expression 128*L2_FLOORED_EXPONENT + L2_FLOORED_SIGNIFICAND + 128
-    // = code(l2f) + 256 (l2f is always normal, so its code is 128*E* + M - 128, and +256
-    // raises the exponent field by 2 — the bf16 code of the plaintext dead bound
-    // tau_idle * DELTA * l2f = 4*l2f; `ctl::ctl_looked_scale_group_tuple`). InputQuant's C
-    // group proves the per-element |X| >= 4*l2f certificates against that bound and counts
+    // the device-specific affine BF16 code of `tau_idle * delta * l2f`
+    // (`ctl::ctl_looked_scale_group_tuple`). InputQuant's C
+    // group proves the per-element liveness certificates against that bound and counts
     // them into DEAD_COUNT, CTL-bound to this row.
 
     // T2 — the per-side running totals. Row 0 is an A row (`h >= 1`, pinned by the
@@ -1869,31 +1873,9 @@ where
     eval.constraint_bool(lv.dead_slack_hi_a);
     eval.constraint_bool(lv.dead_slack_hi_b);
 
-    // ==== F — the jackpot noise floor (check 2): every row's noise scale
-    // sigma = DELTA * alpha * l2f is at or above sigma_min, i.e. alpha * l2f >= 2
-    // (sigma_min = 2*DELTA, frozen in ScaleProgram::new). H4's exact pre-rounding product
-    // gives alpha * l2f = SIG * 2^(E_SUM - 268) with SIG = ALPHA_L2_MULTIPLY.SIG_PRODUCT
-    // in [2^14, 2^16) (M1 over the pinned significands) and
-    // E_SUM = ALPHA_EXP + L2_FLOORED_EXPONENT in [2, 508] (both effective exponents pinned
-    // to [1, 254]), so the pass region is exactly
-    //
-    //     E_SUM >= 255,  or  E_SUM = 254 and SIG >= 2^15.
-    //
-    // F1/F2 constrain the committed branch bit; the two branch inequalities are the filtered
-    // RC16s F3a/F3b (`ctl::scale_lut_lookups`), wrap-safe over the pinned domains. The gate
-    // runs on every row, pad rows included: the pad chain (l2f = 2^-32,
-    // alpha = RNE(448/((dr+1)*2^-32))) satisfies E_SUM >= 255 for every sane noise rank, so
-    // the honest fill sets the bit and no liveness filter is needed.
-    // F1 — the branch bit is boolean.
-    eval.constraint_bool(lv.sigma_exp_clears_floor);
-    // F2 — a cleared bit pins the boundary binade E_SUM = 254 (rows with E_SUM <= 253
-    // satisfy neither this nor F3a, and can commit no passing bit).
-    let e_sum = eval.add(lv.alpha_exp, lv.l2_floored_exponent);
-    let not_clears = eval.sub(one, lv.sigma_exp_clears_floor);
-    let c254 = eval.i32(254);
-    let e_sum_boundary = eval.sub(e_sum, c254);
-    let c = eval.mul(not_clears, e_sum_boundary);
-    eval.constraint(c);
+    // ==== F — the jackpot noise floor (check 2) is the unfiltered RC16 lookup
+    // `SIGMA_ENC - 268`, where S2 makes `SIGMA_ENC = e(sigma) + 268` affine. No additional
+    // witness column or arithmetic constraint is needed. ====
 }
 
 // ==================================================================================================
@@ -1986,7 +1968,7 @@ mod tests {
     /// 4 + 4 = 8 rows (power of two, no padding), k = 4096 (power of two: single-element and
     /// constant rows have *exact* f32 norms); `Wl2 = 27 - 12 = 15`.
     fn test_program() -> ScaleProgram {
-        ScaleProgram::new(4, 4, 4096, 4)
+        ScaleProgram::new_for_device(4, 4, 4096, 4, Device::B200)
     }
 
     /// A deterministic nonnegative finite bf16 code with exponent field in `[lo_exp, hi_exp]`
@@ -2023,7 +2005,7 @@ mod tests {
         let k = program.k;
         let n_blocks = k / BLOCK_SIZE;
         let wl2 = program.wl2();
-        let mk = |ints: &[i8], scales: &[u16]| ScaleRowTuple::from_prequant_row(ints, scales, wl2);
+        let mk = |ints: &[i8], scales: &[u16]| ScaleRowTuple::from_prequant_row_for_device(ints, scales, wl2, program.device);
         let (gi, gs) = gen_prequant_row(k, 0x9E3779B97F4A7C15, 110, 140);
         let mut single_ints = vec![0i8; k];
         single_ints[7] = 1;
@@ -2197,6 +2179,18 @@ mod tests {
     fn honest_trace_satisfies_all_constraints() {
         let (program, rows, pis) = test_trace();
         check_constraints(&program, &rows, &pis).unwrap();
+
+        // The lower protocol boundary reaches Wl2 = 17, one bit wider than the old
+        // envelope. Exercise both constraints and lookups in this existing honest test.
+        for (device, dr, dos) in [(Device::H100, 0x40B5, 0x38B5), (Device::B200, 0x4035, 0x3835)] {
+            let program = ScaleProgram::new_for_device(4, 4, PublicParams::MIN_K, 32, device);
+            assert_eq!(program.wl2(), 17);
+            assert_eq!(program.dr_code(), dr);
+            assert_eq!(program.dos_code(), dos);
+            let (a, b) = test_tuples(&program);
+            let (rows, pis) = program.generate_trace::<F>(&a, &b);
+            check_all(&program, &rows, &pis).unwrap();
+        }
     }
 
     #[test]
@@ -2209,7 +2203,7 @@ mod tests {
     fn padded_trace_satisfies_constraints_and_lut_lookups() {
         // Non-power-of-two geometry: 3 + 4 = 7 live rows pad to 8 (the last row is the pad
         // row).
-        let program = ScaleProgram::new(3, 4, 4096, 4);
+        let program = ScaleProgram::new_for_device(3, 4, 4096, 4, Device::B200);
         assert_eq!(program.num_rows(), 8);
         let (a8, b) = test_tuples(&test_program());
         let a: Vec<ScaleRowTuple> = a8[..3].to_vec();
@@ -2240,7 +2234,7 @@ mod tests {
             let linf_code = to_u64(v.max_abs) as u16;
             let l2f = bf16_max(l2_code, NORM_FLOOR_CODE);
             let linf_f = bf16_max(linf_code, NORM_FLOOR_CODE);
-            let (alpha, beta) = Fp8E4M3Quant
+            let (alpha, beta) = Fp8E4M3Quant::new(program.device)
                 .derive_row_scales(l2f, linf_f, program.r)
                 .expect("native chain on the floored norms");
             // The committed floored fields are the floored codes' (M, E*).
@@ -2268,7 +2262,7 @@ mod tests {
         assert_eq!(v.frame_sum_is_zero, F::ONE, "test premise: row 1 is the all-zero row");
         assert_eq!(v.max_abs, F::ZERO, "test premise: zero linf");
         assert_eq!((v.l2_ge_floor, v.linf_ge_floor), (F::ZERO, F::ZERO), "both norms floored");
-        let (alpha, beta) = Fp8E4M3Quant
+        let (alpha, beta) = Fp8E4M3Quant::new(program.device)
             .derive_row_scales(NORM_FLOOR_CODE, NORM_FLOOR_CODE, program.r)
             .expect("native scales on the floor");
         assert_eq!((to_u64(v.alpha_exp) << 7 | to_u64(v.alpha_mantissa)) as u16, alpha);
@@ -2306,8 +2300,8 @@ mod tests {
             (vec![1i8; k], vec![60 << 7; n_blocks], vec![60 << 7; k]),
         ];
         for (ri, (ints, scales, decoded)) in rows.iter().enumerate() {
-            let (l2_native, linf_native) = Fp8E4M3Quant.row_norms(decoded).expect("native norms");
-            let tuple = ScaleRowTuple::from_prequant_row(ints, scales, program.wl2());
+            let (l2_native, linf_native) = Fp8E4M3Quant::new(program.device).row_norms(decoded).expect("native norms");
+            let tuple = ScaleRowTuple::from_prequant_row_for_device(ints, scales, program.wl2(), Device::B200);
             let claim = if tuple.l2_frame_sum == 0 {
                 SqrtClaim {
                     exp: 0,
@@ -2343,7 +2337,7 @@ mod tests {
         scales[0] = 130 << 7;
         ints[8] = -3;
         scales[1] = (128 << 7) | 64;
-        let tuple = ScaleRowTuple::from_prequant_row(&ints, &scales, wl2);
+        let tuple = ScaleRowTuple::from_prequant_row_for_device(&ints, &scales, wl2, Device::B200);
         assert_eq!(tuple.frame_doubled_scale_exponent, 260);
         // Decoded elements: 8 (code 130<<7), 16 (code 131<<7), -9 (|code| (130<<7)|16).
         assert_eq!(tuple.max_abs, (131 << 7) as u32);
@@ -2392,7 +2386,14 @@ mod tests {
             x ^= x << 17;
             x
         };
-        for k in [2048u64, 2080, 4096, 32768, 1 << 16] {
+        for k in [
+            PublicParams::MIN_K as u64,
+            2048,
+            2080,
+            4096,
+            32768,
+            PublicParams::MAX_K as u64,
+        ] {
             let clk = 64 - (k - 1).leading_zeros() as i64;
             let wl2 = 27 - clk;
             for _ in 0..2000 {
@@ -3063,7 +3064,7 @@ mod tests {
         ints[0] = 1;
         let mut scales = vec![0x3F80u16; program.k / BLOCK_SIZE];
         scales[0] = scale_code;
-        let tuple = ScaleRowTuple::from_prequant_row(&ints, &scales, program.wl2());
+        let tuple = ScaleRowTuple::from_prequant_row_for_device(&ints, &scales, program.wl2(), Device::B200);
         let claim = rne_sqrt_hat(
             tuple.l2_frame_sum,
             i64::from(tuple.frame_doubled_scale_exponent),
@@ -3098,10 +3099,10 @@ mod tests {
         );
     }
 
-    /// A full honest trace whose row 2 sits exactly in the gate's boundary binade
-    /// (`E_SUM = 254`, `SIG >= 2^15` — the branch-bit-cleared pass path F2 + F3b).
+    /// A full honest B200 trace whose row 2 sits exactly at the sigma floor:
+    /// `E_SUM = 254`, `SIG >= 2^15`, hence `SIGMA_ENC = 254 + 1 + 13 = 268`.
     fn boundary_binade_trace() -> (ScaleProgram, Vec<[F; NUM_SCALE_COLUMNS]>, [F; NUM_SCALE_PUBLIC_INPUTS]) {
-        let program = ScaleProgram::new(4, 4, 1 << 14, 4);
+        let program = ScaleProgram::new_for_device(4, 4, 1 << 14, 4, Device::B200);
         let (mut a, b) = test_tuples(&program);
         a[2] = find_boundary_spike(&program, true);
         let (rows, pis) = program.generate_trace::<F>(&a, &b);
@@ -3114,9 +3115,12 @@ mod tests {
         {
             let v: &ScaleColumnsView<F> = rows[2].borrow();
             assert_eq!(
-                v.sigma_exp_clears_floor,
-                F::ZERO,
-                "test premise: row 2 decides on the significand"
+                to_u64(v.alpha_exp)
+                    + to_u64(v.l2_floored_exponent)
+                    + to_u64(v.sigma_sig_is_wide)
+                    + program.device.sigma_encoding_offset(),
+                PROD_UNIT as u64,
+                "test premise: row 2 sits exactly at sigma = 1"
             );
         }
         check_all(&program, &rows, &pis).unwrap();
@@ -3124,12 +3128,17 @@ mod tests {
 
     /// A 2-row k = 2^16 trace whose A row violates the noise floor with `E_SUM = 254` and
     /// `SIG < 2^15`, built with `expect_valid = false` (the honest builder panics on it) and
-    /// honest running totals — every constraint holds, so ONLY the F3b RC16 can reject.
+    /// honest running totals — every arithmetic constraint holds, so only the sigma-floor
+    /// RC16 can reject.
     fn below_floor_trace() -> (ScaleProgram, Vec<[F; NUM_SCALE_COLUMNS]>, [F; NUM_SCALE_PUBLIC_INPUTS]) {
-        let program = ScaleProgram::new(1, 1, 1 << 16, 4);
+        let program = ScaleProgram::new_for_device(1, 1, PublicParams::MAX_K, 4, Device::B200);
         let spike = find_boundary_spike(&program, false);
-        let ones =
-            ScaleRowTuple::from_prequant_row(&vec![1i8; program.k], &vec![0x3F80u16; program.k / BLOCK_SIZE], program.wl2());
+        let ones = ScaleRowTuple::from_prequant_row_for_device(
+            &vec![1i8; program.k],
+            &vec![0x3F80u16; program.k / BLOCK_SIZE],
+            program.wl2(),
+            Device::B200,
+        );
         let mut rows = vec![[F::ZERO; NUM_SCALE_COLUMNS]; 2];
         for (i, (tuple, is_a)) in [(&spike, true), (&ones, false)].into_iter().enumerate() {
             let claim = rne_sqrt_hat(
@@ -3154,103 +3163,83 @@ mod tests {
         {
             let v: &ScaleColumnsView<F> = rows[0].borrow();
             assert_eq!(
-                v.sigma_exp_clears_floor,
-                F::ZERO,
-                "test premise: the spike row sits in the boundary binade"
+                to_u64(v.alpha_exp)
+                    + to_u64(v.l2_floored_exponent)
+                    + to_u64(v.sigma_sig_is_wide)
+                    + program.device.sigma_encoding_offset(),
+                PROD_UNIT as u64 - 1,
+                "test premise: the spike row sits immediately below sigma = 1"
             );
         }
-        check_constraints(&program, &rows, &pis).expect("F2 stays satisfied on E_SUM = 254 — only the gate rejects");
+        check_constraints(&program, &rows, &pis).expect("the sigma floor is lookup-only");
         assert!(
             check_lut_lookups(&program, &rows, &pis).is_err(),
-            "the F3b RC16 must reject a below-floor significand product"
+            "the sigma-floor RC16 must reject a below-floor encoding"
         );
     }
 
     #[test]
     #[should_panic(expected = "below the sigma floor")]
     fn generate_trace_rejects_sigma_floor_violations() {
-        let program = ScaleProgram::new(1, 1, 1 << 16, 4);
+        let program = ScaleProgram::new_for_device(1, 1, PublicParams::MAX_K, 4, Device::B200);
         let spike = find_boundary_spike(&program, false);
-        let ones =
-            ScaleRowTuple::from_prequant_row(&vec![1i8; program.k], &vec![0x3F80u16; program.k / BLOCK_SIZE], program.wl2());
+        let ones = ScaleRowTuple::from_prequant_row_for_device(
+            &vec![1i8; program.k],
+            &vec![0x3F80u16; program.k / BLOCK_SIZE],
+            program.wl2(),
+            Device::B200,
+        );
         let _ = program.generate_trace::<F>(&[spike], &[ones]);
     }
 
     #[test]
-    fn tamper_sigma_floor_bit_is_rejected() {
-        // Clearing the bit on an exponent-margin row: F2 demands E_SUM = 254 but the row's
-        // sum is >= 255 (every live row at k = 4096 clears the floor on exponents alone).
-        let (program, rows, pis) = test_trace();
-        let mut tampered = rows.clone();
-        {
-            let v: &mut ScaleColumnsView<F> = tampered[0].borrow_mut();
-            assert_eq!(v.sigma_exp_clears_floor, F::ONE, "test premise: row 0 clears on exponents");
-            v.sigma_exp_clears_floor = F::ZERO;
-        }
-        assert!(
-            check_all(&program, &tampered, &pis).is_err(),
-            "clearing the branch bit off the boundary binade must be rejected"
-        );
-
-        // Setting the bit on a boundary-binade row (E_SUM = 254): F1/F2 hold, so only the
-        // F3a RC16 is left to reject — its key E_SUM - 255 = -1 wraps out of range.
-        let (program, rows, pis) = boundary_binade_trace();
-        let mut tampered = rows.clone();
-        {
-            let v: &mut ScaleColumnsView<F> = tampered[2].borrow_mut();
-            v.sigma_exp_clears_floor = F::ONE;
-        }
-        check_constraints(&program, &tampered, &pis).expect("a forged set bit satisfies F1/F2");
-        assert!(
-            check_lut_lookups(&program, &tampered, &pis).is_err(),
-            "the F3a RC16 must reject a forged exponent-margin claim"
-        );
-    }
-
-    #[test]
     fn sigma_floor_gate_matches_native_policy_comparison() {
-        // The gate's integer disjunction vs the plaintext jackpot comparison
-        // `DELTA * alpha * l2f >= sigma_min` in f64 (exact: 16-bit significand products,
-        // exponents far from f64's limits) — exhaustive over all mantissa pairs in the pivot
-        // binades E_SUM in {253, 254, 255, 256}, fuzzed across the full pinned domain.
-        let policy = JackpotPolicy::default();
+        // The gate's affine encoding vs the plaintext jackpot comparison
+        // `delta * alpha * l2f >= sigma_min` in f64 (exact: 16-bit significand products,
+        // exponents far from f64's limits) — exhaustive around both devices' pivots and
+        // fuzzed across the full pinned domain.
         let value = |m: u64, e_star: i64| m as f64 * ((e_star - 134) as f64).exp2();
-        let check = |alpha_exp: i64, alpha_mantissa: u64, l2f_e_star: i64, l2f_m: u64| {
-            let alpha_m = 128 + alpha_mantissa;
-            let e_sum = alpha_exp + l2f_e_star;
-            let sig = alpha_m * l2f_m;
-            let gate = e_sum >= 255 || (e_sum == 254 && sig >= 1 << 15);
-            let sigma = DELTA * value(alpha_m, alpha_exp) * value(l2f_m, l2f_e_star);
-            assert_eq!(
-                gate,
-                sigma >= policy.sigma_min,
-                "gate vs plaintext at alpha = ({alpha_exp}, {alpha_mantissa}), l2f = ({l2f_e_star}, {l2f_m})"
-            );
-        };
-        for e_sum in 253..=256i64 {
-            for l2f_e_star in [95i64, 200] {
-                for alpha_mantissa in 0..128u64 {
-                    for l2f_mantissa in 0..128u64 {
-                        check(e_sum - l2f_e_star, alpha_mantissa, l2f_e_star, 128 + l2f_mantissa);
+        for device in [Device::H100, Device::B200] {
+            let policy = JackpotPolicy::for_device(device);
+            let check = |alpha_exp: i64, alpha_mantissa: u64, l2f_e_star: i64, l2f_m: u64| {
+                let alpha_m = 128 + alpha_mantissa;
+                let e_sum = alpha_exp + l2f_e_star;
+                let sig = alpha_m * l2f_m;
+                let wide = i64::from(sig >= 1 << 15);
+                let gate = e_sum + wide + device.sigma_encoding_offset() as i64 >= PROD_UNIT;
+                let sigma = device.delta() * value(alpha_m, alpha_exp) * value(l2f_m, l2f_e_star);
+                assert_eq!(
+                    gate,
+                    sigma >= policy.sigma_min,
+                    "{device:?} gate vs plaintext at alpha = ({alpha_exp}, {alpha_mantissa}), \
+                     l2f = ({l2f_e_star}, {l2f_m})"
+                );
+            };
+            for e_sum in 252..=256i64 {
+                for l2f_e_star in [95i64, 200] {
+                    for alpha_mantissa in 0..128u64 {
+                        for l2f_mantissa in 0..128u64 {
+                            check(e_sum - l2f_e_star, alpha_mantissa, l2f_e_star, 128 + l2f_mantissa);
+                        }
                     }
                 }
             }
-        }
-        let mut x: u64 = 0x243F6A8885A308D3;
-        let mut step = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
-        for _ in 0..200_000 {
-            let r = step();
-            // alpha structurally normal: exp in [1, 254]; l2f >= 2^-32: E* in [95, 254].
-            let alpha_exp = 1 + (r & 0xFF) as i64 % 254;
-            let alpha_mantissa = (r >> 8) & 0x7F;
-            let l2f_e_star = 95 + ((r >> 15) & 0xFF) as i64 % 160;
-            let l2f_mantissa = (r >> 23) & 0x7F;
-            check(alpha_exp, alpha_mantissa, l2f_e_star, 128 + l2f_mantissa);
+            let mut x: u64 = 0x243F6A8885A308D3;
+            let mut step = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            for _ in 0..100_000 {
+                let r = step();
+                // alpha structurally normal: exp in [1, 254]; l2f >= 2^-32: E* in [95, 254].
+                let alpha_exp = 1 + (r & 0xFF) as i64 % 254;
+                let alpha_mantissa = (r >> 8) & 0x7F;
+                let l2f_e_star = 95 + ((r >> 15) & 0xFF) as i64 % 160;
+                let l2f_mantissa = (r >> 23) & 0x7F;
+                check(alpha_exp, alpha_mantissa, l2f_e_star, 128 + l2f_mantissa);
+            }
         }
     }
 

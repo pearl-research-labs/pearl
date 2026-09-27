@@ -6,12 +6,37 @@ import (
 	"regexp"
 	"runtime"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 var (
 	rpcuserRegexp = regexp.MustCompile("(?m)^rpcuser=.+$")
 	rpcpassRegexp = regexp.MustCompile("(?m)^rpcpass=.+$")
 )
+
+func TestValidateMaxPeers(t *testing.T) {
+	tests := []struct {
+		name     string
+		maxPeers int
+		wantErr  bool
+	}{
+		{name: "negative", maxPeers: -1, wantErr: true},
+		{name: "zero", wantErr: true},
+		{name: "positive", maxPeers: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMaxPeers(tt.maxPeers)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
 
 func TestCreateDefaultConfigFile(t *testing.T) {
 	// find out where the sample config lives

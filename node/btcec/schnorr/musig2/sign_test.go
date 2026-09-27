@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -388,4 +389,12 @@ func TestMusig2SignCombine(t *testing.T) {
 			)
 		})
 	}
+}
+
+func TestPartialSignatureDecodeShortRead(t *testing.T) {
+	t.Parallel()
+
+	var sig PartialSignature
+	err := sig.Decode(bytes.NewReader([]byte{0x01, 0x02}))
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 }

@@ -17,9 +17,9 @@ maturin develop --release  # optimized build
 
 Mining searches for a matrix solution that satisfies the proof-of-work target.
 Production miners run this search on GPUs; the resulting solution is then
-packaged into a `PlainProof` using the types from this library (Merkle trees,
-matrix proofs, block header, mining configuration, etc.) and submitted to the
-gateway.
+packaged into a `PlainProof` (V1–V3) or `PlainProofV4` (FP8) using this library's
+types (Merkle trees, matrix proofs, block header, mining configuration, etc.)
+and submitted to the gateway.
 
 The module also exposes a `mine()` function that performs the full search loop
 on the CPU. This is a naive implementation included for completeness and testing — it is not suitable for production use.
@@ -36,14 +36,14 @@ is_valid, message = verify_plain_proof_for_cert_version(cert_version, header, pl
 ```
 
 `cert_version` is the `requiredcertversion` field from the node's
-`getblocktemplate` response: `1` (V1/dense certificate) before the MoE fork,
-`2` (V2/MoE certificate) at and after it.
+`getblocktemplate` response: `1` (dense), `2` (dense/MoE), `3` (salted seeds),
+or `4` (FP8), according to the active forks.
 
 ## ZK Proof Generation and Verification
 
-The gateway converts a `PlainProof` into a ZK proof before submitting a block
-to the node. Use the `*_for_cert_version` dispatchers. They select the correct
-prover automatically around the MoE fork. The explicitly versioned functions
+For V1–V3, the gateway converts a `PlainProof` into a ZK proof before submitting
+a block to the node. The following `*_for_cert_version` dispatchers select the
+corresponding prover and verifier. The explicitly versioned functions
 (`generate_proof_v1` / `generate_proof_v2`, etc.) are also available.
 
 ### Generating a ZK proof
@@ -69,11 +69,22 @@ is_valid, message = verify_proof_for_cert_version(cert_version, header, zk_proof
 
 Returns `(True, "Verified")` on success, or `(False, reason)` on failure.
 
+For V4, use `Fp8Prover.setup(header, plain_proof_v4)` followed by
+`prover.prove(header, plain_proof_v4)` to obtain `(public_data, proof_data)`.
+`Fp8Verifier.generate(public_data)` creates the corresponding verifier;
+`verifier.verify_block(header, public_data, proof_data)` raises on rejection.
+The node separately authenticates the carried ancestor headers during block validation.
+
 ## Wire Format
 
-After converting a `PlainProof` into a `ZKProof`, a `ZKCertificate` is assembled
-from the proof's `public_data` and `proof_data` fields. The full block is then serialized as:
+A `ZKCertificate` is assembled from the published `public_data` and `proof_data`.
+The full block is then serialized as:
 
 ```
 ZKCertificate.serialize() | PearlHeader.serialize() | TX_COUNT (varint) | TRANSACTIONS
 ```
+
+V4 certificates append a CompactSize ancestor count (0–2) after the proof bytes,
+then that many full 108-byte headers in parent, grandparent order. These headers
+are excluded from the proof commitment. The current miner uses the proposed
+header as its proof's ancestor (depth zero), so it writes a zero count.

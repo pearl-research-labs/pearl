@@ -1,7 +1,6 @@
 //! Lookup descriptors for the ScaleStark computation.
 //!
-//! The group cross-table lookup consumes each live InputQuant aggregate exactly once; the
-//! sigma channel exports each live row's exact noise std to TamedStark (jackpot check 3).
+//! The group cross-table lookup consumes each live InputQuant aggregate exactly once.
 //! Committed lookup tables then range-check the frame-sum and square-root-comparison limbs,
 //! decode bf16 fields, floor both norms at `2^-32` (the scheme's `row_norms` floor), evaluate
 //! the noised-bound FMA and two multiplies, divide the largest finite E4M3 magnitude (448) by
@@ -9,20 +8,21 @@
 //! public inputs on the last row (jackpot check 1), and hold every row's noise scale
 //! `sigma = DELTA * alpha * l2f` at or above the sigma floor (jackpot check 2).
 //!
-//! The inventory is RC16 x63, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, and
+//! The inventory is RC16 x62, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, and
 //! DIV448 x1. The additional RC16 and PAIR128 instances make the integer borrow comparisons,
 //! FMA key bound, sqrt parity split, and alpha field split sound. The verifier derives the
-//! normal bf16 constants `dr = RNE_bf16(0.5*sqrt(noise_rank))` and
-//! `dos = RNE_bf16(0.5*sqrt(noise_rank)/256^2)`.
+//! normal bf16 constants `dr = RNE_bf16(delta*sqrt(noise_rank))` and
+//! `dos = RNE_bf16(delta*sqrt(noise_rank)/256^2)`.
 
 use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
-use super::super::ctl::{LutLookup, LutTable, Table};
+use super::super::ctl::Table;
+use super::super::luts::LutTable;
+use super::super::luts::ctl::LutLookup;
 use super::columns::{
-    ALIGNED_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT, H_MULT_PUBLIC_INPUT, L2_SUM_LIMBS,
-    SCALE_COL_MAP, W_MULT_PUBLIC_INPUT,
+    ALIGNED_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT, L2_SUM_LIMBS, SCALE_COL_MAP,
 };
 use super::stark::ScaleProgram;
 
@@ -39,9 +39,8 @@ use super::stark::ScaleProgram;
 ///
 /// Two components are not Scale columns but affine expressions the channel itself binds:
 ///
-/// - `DEAD_BOUND = 128*L2_FLOORED_EXPONENT + L2_FLOORED_SIGNIFICAND + 128 = code(l2f) + 256`
-///   (T1) — InputQuant's committed dead bound equals the floored-L2 threshold;
-/// - `SIGMA_ENC = ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_SIG_IS_WIDE + 13 = e(sigma) + 268`
+/// - `DEAD_BOUND` is the device-specific BF16 code of `tau_idle * delta * l2f`;
+/// - `SIGMA_ENC = ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_SIG_IS_WIDE + offset(device) = e(sigma) + 268`
 ///   (S2, jackpot check 4) — the row's exact sigma encoding
 ///   (`sigma = SIGMA_SIGNIFICAND * 2^(ALPHA_EXP + L2_FLOORED_EXPONENT - 269)` with
 ///   `SIGMA_SIGNIFICAND in [2^14, 2^16)`, so `e(sigma)` adds `14 + SIGMA_SIG_IS_WIDE` to the
@@ -51,7 +50,7 @@ use super::stark::ScaleProgram;
 /// InputQuant's looking half is `input_quant_stark::ctl::ctl_group_tuples_looking_input_quant`
 /// (2 instances on live `IS_GROUP_FINAL` rows, A and B planes with the `+ h*k` key offset, the
 /// same 13-component order).
-pub fn ctl_looked_scale_group_tuple<F: Field>() -> TableWithColumns<F> {
+pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWithColumns<F> {
     let m = &SCALE_COL_MAP;
     let mut columns: Vec<Column<F>> = Column::singles([
         m.group_key,
@@ -70,7 +69,7 @@ pub fn ctl_looked_scale_group_tuple<F: Field>() -> TableWithColumns<F> {
             (m.l2_floored_exponent, F::from_canonical_u64(128)),
             (m.l2_floored_significand, F::ONE),
         ],
-        F::from_canonical_u64(128),
+        F::from_canonical_u64(program.device.liveness_code_shift() - 128),
     ));
     columns.push(Column::single(m.dead_count));
     columns.push(Column::linear_combination_with_constant(
@@ -79,7 +78,7 @@ pub fn ctl_looked_scale_group_tuple<F: Field>() -> TableWithColumns<F> {
             (m.l2_floored_exponent, F::ONE),
             (m.sigma_sig_is_wide, F::ONE),
         ],
-        F::from_canonical_u64(13),
+        F::from_canonical_u64(program.device.sigma_encoding_offset()),
     ));
     columns.push(Column::single(m.sigma_norm));
     TableWithColumns::new(
@@ -89,56 +88,11 @@ pub fn ctl_looked_scale_group_tuple<F: Field>() -> TableWithColumns<F> {
     )
 }
 
-// ==================================================================================================
-// Channel: sigma frames — Tamed (looking) -> Scale (looked)
-// ==================================================================================================
-
-/// `SIGMA_EXP = ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_EXP_OFFSET`: folds the two bf16 units
-/// (`M * 2^(E - 134)` each, both factors structurally normal), `DELTA = 2^-1`, and the +2048
-/// sigma frame bias TamedStark decodes (`2048 - 2*134 - 1 = 1779`).
-pub const SIGMA_EXP_OFFSET: u64 = 1779;
-
-/// Scale's looked half of the sigma channel (jackpot check 3): `(GROUP_KEY, SIGMA_SIGNIFICAND,
-/// SIGMA_EXP)` per live row, where `SIGMA_EXP = ALPHA_EXP + L2_FLOORED_EXPONENT +`
-/// [`SIGMA_EXP_OFFSET`] is the row's exact noise std as
-/// `sigma = SIGMA_SIGNIFICAND * 2^(SIGMA_EXP - 2048)`.
-///
-/// TamedStark's looking half reads each A row's tuple once per cell of that tile row and each
-/// B row's once per cell of that tile column, so the looked multiplicity is the *tile width*
-/// on A rows and the *tile height* on B rows: the filter is the non-binary
-/// `IS_A_ROW * PI[W_MULT] + (1 - IS_A_ROW - IS_PAD) * PI[H_MULT]`, which the CTL sum treats
-/// as a per-row use count. The verifier pins both PIs to the statement geometry.
-pub fn ctl_sigma_looked_scale<F: Field>() -> TableWithColumns<F> {
-    let m = &SCALE_COL_MAP;
-    TableWithColumns::new(
-        Table::Scale.into(),
-        vec![
-            Column::single(m.group_key),
-            Column::single(m.sigma_significand),
-            Column::linear_combination_with_constant(
-                [(m.alpha_exp, F::ONE), (m.l2_floored_exponent, F::ONE)],
-                F::from_canonical_u64(SIGMA_EXP_OFFSET),
-            ),
-        ],
-        Filter::new(
-            vec![
-                (Column::single(m.is_a_row), Column::public_input(W_MULT_PUBLIC_INPUT)),
-                (
-                    Column::linear_combination_with_constant([(m.is_a_row, -F::ONE), (m.is_pad, -F::ONE)], F::ONE),
-                    Column::public_input(H_MULT_PUBLIC_INPUT),
-                ),
-            ],
-            vec![],
-        ),
-    )
-}
-
-// ==================================================================================================
 // Committed LUT oracle instances
 // ==================================================================================================
 
-/// ScaleStark's per-row LUT instance inventory: RC16 x63, PAIR128 x3, EXPINFO x3, CLAMP22 x3,
-/// POW2D x3, RNERND x3, DIV448 x1 — 79 instances. Order: square root (Q), grid snap (G),
+/// ScaleStark's per-row LUT instance inventory: RC16 x62, PAIR128 x3, EXPINFO x3, CLAMP22 x3,
+/// POW2D x3, RNERND x3, DIV448 x1 — 78 instances. Order: square root (Q), grid snap (G),
 /// `linf` (N), the scale chain (H: norm floors, FMA, alpha, beta steps B1/B2), the liveness
 /// gates (T3), the noise-floor gate (F3), then the sigma width bit (S2).
 pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> {
@@ -530,30 +484,18 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         Filter::from_column(Column::single(m.is_last_row)),
     ));
 
-    // ---- F3: the jackpot noise-floor gate (check 2), every row:
-    // sigma = DELTA*alpha*l2f >= sigma_min <=> alpha*l2f >= 2 <=> E_SUM >= 255, or
-    // E_SUM = 254 and SIG >= 2^15, with E_SUM = ALPHA_EXP + L2_FLOORED_EXPONENT and
-    // SIG = ALPHA_L2_MULTIPLY.SIG_PRODUCT (see `columns.rs` for details). Wrap-safety: E_SUM <= 508 and SIG <= 255^2 < 2^16 on the pinned domains, so
-    // each key is in range exactly on its branch's pass region and wraps far outside
-    // [0, 2^16) below it. ----
-    lookups.push(LutLookup::rc16_filtered(
-        Column::linear_combination_with_constant(
-            [(m.alpha_exp, one), (m.l2_floored_exponent, one)],
-            -F::from_canonical_u64(255),
-        ),
-        Filter::from_column(Column::single(m.sigma_exp_clears_floor)),
-    ));
-    lookups.push(LutLookup::rc16_filtered(
-        Column::linear_combination_with_constant([(m.alpha_l2_multiply.sig_product, one)], -F::from_canonical_u64(1 << 15)),
-        Filter::from_column(Column::linear_combination_with_constant(
-            [(m.sigma_exp_clears_floor, neg)],
-            F::ONE,
-        )),
-    ));
+    // ---- F: the jackpot noise-floor gate (check 2), every row:
+    // SIGMA_ENC = E_SUM + SIGMA_SIG_IS_WIDE + offset(device) = e(sigma) + 268, so
+    // sigma >= sigma_min = 1 iff SIGMA_ENC - 268 is nonnegative. Its maximum is 255 on
+    // the pinned exponent domain; a negative key wraps far outside RC16's range. ----
+    lookups.push(LutLookup::rc16(Column::linear_combination_with_constant(
+        [(m.alpha_exp, one), (m.l2_floored_exponent, one), (m.sigma_sig_is_wide, one)],
+        F::from_canonical_u64(program.device.sigma_encoding_offset()) - F::from_canonical_u64(268),
+    )));
 
     // ---- S2: the sigma significand's width bit (jackpot check 4), two-sided:
     // SIGMA_SIGNIFICAND - 2^15 under the bit, 2^15 - 1 - SIGMA_SIGNIFICAND under its
-    // complement. S1 pins the significand to the F3 product (< 2^16), so each branch's key
+    // complement. S1 pins the significand to H4's product (< 2^16), so each branch's key
     // wraps far outside [0, 2^16) exactly when the bit is wrong; pad rows (significand 0,
     // bit 0) pass the complement branch. ----
     lookups.push(LutLookup::rc16_filtered(
@@ -573,17 +515,18 @@ mod tests {
     use plonky2::field::goldilocks_field::GoldilocksField;
 
     use super::*;
+    use crate::api::fp8::public_params::Device;
 
     type F = GoldilocksField;
 
     fn test_program() -> ScaleProgram {
-        ScaleProgram::new(4, 4, 2048, 4)
+        ScaleProgram::new_for_device(4, 4, 2048, 4, Device::B200)
     }
 
     #[test]
     fn scale_ctl_looked_half_is_well_formed() {
         // 12 tuple components, filter 1 - IS_PAD (padding rows consume no tuple).
-        let looked = ctl_looked_scale_group_tuple::<F>();
+        let looked = ctl_looked_scale_group_tuple::<F>(&test_program());
         // TableWithColumns exposes no accessors; construction itself checks the column algebra.
         let _ = looked;
     }
@@ -593,14 +536,14 @@ mod tests {
         let lookups = scale_lut_lookups::<F>(&test_program());
         let count = |t: LutTable| lookups.iter().filter(|l| l.table == t).count();
         // Inventory documented by `scale_lut_lookups`:
-        // RC16 x63, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, DIV448 x1.
-        assert_eq!(count(LutTable::Range16), 63);
+        // RC16 x62, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, DIV448 x1.
+        assert_eq!(count(LutTable::Range16), 62);
         assert_eq!(count(LutTable::Pair128), 3);
         assert_eq!(count(LutTable::ExpInfo), 3);
         assert_eq!(count(LutTable::Clamp22), 3);
         assert_eq!(count(LutTable::Pow2D), 3);
         assert_eq!(count(LutTable::RneRnd), 3);
         assert_eq!(count(LutTable::Div448), 1);
-        assert_eq!(lookups.len(), 79);
+        assert_eq!(lookups.len(), 78);
     }
 }

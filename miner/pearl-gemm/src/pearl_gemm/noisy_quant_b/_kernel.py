@@ -2,7 +2,7 @@
 
 The fused prep kernel emits the peel in its A-side layout,
 ``[ beta (.) E2 || B' @ F1^T ]``. The B-side layout is
-``[ (beta (.) E2@F2 - B') @ F1^T || -(beta (.) E2) ]`` (`build_b_rows`), whose
+``[ (beta (.) E2@F2 - B') @ F1^T || -(beta (.) E2) ]``, whose
 mid half splits algebraically as
 
     (beta (.) E2@F2 - B') @ F1^T = (beta (.) E2) @ (F2 @ F1^T) - B' @ F1^T

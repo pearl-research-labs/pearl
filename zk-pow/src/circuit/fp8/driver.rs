@@ -1,18 +1,18 @@
-//! The fp8 batch driver: one proof for the whole 22-table system.
+//! The fp8 batch driver: one proof for the whole 20-table system.
 //!
-//! [`Fp8System`] is the *statement* of one job: the six compiled programs (Tamed is derived
-//! from the shared geometry) and the public recompute inputs of the class (a) columns (plane
+//! [`Fp8System`] is the *statement* of one job: the five compiled programs and the public
+//! recompute inputs of the class (a) columns (plane
 //! byte lengths, routing words, the noise codes). Both the prover and the verifier build it
 //! from public data alone, and it derives everything batching needs:
 //!
-//! - the **batch order**: canonical table order (`Table` 0..5, then
-//!   [`LUT_TABLES`]) — profile-independent, so Fiat-Shamir observes every
+//! - the **batch order**: canonical table order (`Table` 0..4, then the
+//!   device's LUT inventory) — profile-independent within each device, so Fiat-Shamir observes every
 //!   trace/auxiliary/quotient cap in the same order for every job (a
 //!   universal-verifier prerequisite), and CTL table indices need no renumbering.
-//!   The six main tables commit solo (one tree per table per role); the sixteen
+//!   The five main tables commit solo (one tree per table per role); the fifteen
 //!   fixed-height LUT tables are *grouped* ([`FP8_GROUPED_TABLES`]): each role commits
-//!   all of them in one shared multi-height tree, so a proof carries `6 + 1` caps per
-//!   role instead of `22`. Batched FRI still folds by height internally
+//!   all of them in one shared multi-height tree, so a proof carries `5 + 1` caps per
+//!   role instead of `20`. Batched FRI still folds by height internally
 //!   (`starky::batch_stark` sorts the *distinct* heights for its instances; the setup
 //!   tree's flat column order stays job-independent). The verifier derives the heights
 //!   from its own class (a) recompute — never from the proof — so a prover cannot
@@ -29,12 +29,12 @@
 //!   `lut_preprocessed_data`; [`Fp8System::verify`] takes only the consensus cap and pins
 //!   the per-table preprocessed column indices itself).
 //!
-//! [`Fp8System::prove`] regenerates the six main traces from the private strips, chaining
+//! [`Fp8System::prove`] regenerates the five main traces from the private strips, chaining
 //! each table's inputs from its producer exactly like the consistency driver (InputQuant from
-//! the strips, Scale from InputQuant's group tuples, Matmul from the noised codes, XorFold
-//! from the cell results, Tamed from Matmul's E-cell binades and Scale's sigma frames, Blake3 from the strip bytes and the folded lottery words),
+//! the strips, Scale from InputQuant's group tuples, device-specific Matmul from the noised
+//! codes, XorFold from the cell results and census counts, Blake3 from the strip bytes and the folded lottery words),
 //! accumulates the committed-LUT multiplicities ([`LutChecker`] — which also re-checks that
-//! every instance is served by the committed tables), assembles the sixteen LUT traces,
+//! every instance is served by the committed tables), assembles the fifteen LUT traces,
 //! observes the generated lottery digest through its `derive_statement_digest` callback
 //! (the Fiat-Shamir salt may depend on `J`), binds the returned `statement_digest`, and
 //! hands the batch to `starky::batch_prover::batch_prove`. The main tables' public
@@ -62,11 +62,12 @@ use plonky2::field::extension::Extendable;
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::fri::FriConfig;
 use plonky2::fri::reduction_strategies::FriReductionStrategy;
-use plonky2::hash::hash_types::RichField;
+use plonky2::hash::hash_types::{HashOut, RichField};
 use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::plonk::config::GenericConfig;
 use plonky2::util::log2_strict;
 use plonky2::util::timing::TimingTree;
+use primitive_types::U256;
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::{BatchStarkPreprocessedData, BatchStarkPreprocessedVerifierData, batch_prove};
 use starky::batch_stark::BatchStark;
@@ -76,32 +77,20 @@ use starky::config::StarkConfig;
 use starky::cross_table_lookup::CrossTableLookup;
 
 use super::blake3_stark::columns::{NUM_BLAKE3_PUBLIC_INPUTS, PI_HASH_JACKPOT};
-use super::blake3_stark::ctl::blake3_lut_lookups;
 use super::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, Blake3Stark, Blake3TraceInputs};
-use super::ctl::{LUT_TABLES, LutTable, NUM_ALL_TABLES, NUM_LUT_TABLES, NUM_TABLES, Table, all_cross_table_lookups};
+use super::ctl::{NUM_ALL_TABLES, NUM_LUT_TABLES, NUM_TABLES, Table, all_cross_table_lookups, lut_inventories, lut_tables};
 use super::input_quant_stark::columns::{InputQuantColumnsView, NUM_INPUT_QUANT_PUBLIC_INPUTS};
-use super::input_quant_stark::ctl::input_quant_lut_lookups;
 use super::input_quant_stark::stark::{InputQuantProgram, InputQuantStark};
-use super::known_values::{fp8_known_columns, hash256_to_hash_out};
-use super::luts::{
-    B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Int8DecStark, Log16Stark, LutChecker, Pair128Stark,
-    Pow2DStark, Pow2GbStark, QcastStark, Range16Stark, RneRndStark, Width16Stark, Width32Stark, XfPow2Stark, lut_height,
-    lut_preprocessed_data, lut_trace, num_precommitted_columns,
-};
-use super::matmul_b200_stark::MatmulB200ColumnsView;
+use super::luts::stark::boxed_lut_stark;
+use super::luts::{LutChecker, lut_height, lut_preprocessed_data, lut_trace, num_precommitted_columns};
 use super::matmul_b200_stark::columns::NUM_MATMUL_PUBLIC_INPUTS;
-use super::matmul_b200_stark::ctl::matmul_b200_lut_lookups;
-use super::matmul_b200_stark::stark::{MatmulB200Stark, MatmulProgram, generate_b200_trace};
-use super::scale_stark::columns::{NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView};
-use super::scale_stark::ctl::{SIGMA_EXP_OFFSET, scale_lut_lookups};
+use super::matmul_b200_stark::{MatmulB200ColumnsView, MatmulStarkB200};
+use super::matmul_h100::{MatmulColumnsView, MatmulStarkH100};
+use super::scale_stark::columns::NUM_SCALE_PUBLIC_INPUTS;
 use super::scale_stark::stark::{ScaleProgram, ScaleRowTuple, ScaleStark};
-use super::tamed_stark::columns::NUM_TAMED_PUBLIC_INPUTS;
-use super::tamed_stark::ctl::tamed_lut_lookups;
-use super::tamed_stark::stark::{TamedProgram, TamedStark};
 use super::xor_fold_stark::columns::{NUM_XOR_FOLD_PUBLIC_INPUTS, XorFoldColumnsView};
-use super::xor_fold_stark::ctl::xor_fold_lut_lookups;
 use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
-use crate::api::fp8::public_params::HashId;
+use crate::api::fp8::public_params::{Device, HashId};
 use crate::api::primitives::Hash256;
 use crate::v2::api::proof_utils::u32_field_array_to_hash;
 
@@ -129,41 +118,40 @@ pub const STARK_QUERY_ROUNDS: usize = (STARK_SECURITY_BITS - STARK_POW_BITS as u
 /// Every trace height (degree bits) reachable by some table of some envelope-legal job,
 /// descending — the consensus FRI ladder's fold boundaries. The wire envelope
 /// (`api::layout` lottery-tile bounds) is
-/// `k ∈ [2^11, 2^16]` with `32 | k`, `h ≥ 4`, `w ≥ 16`, `h·w ∈ [256, 2048]`,
+/// `k ∈ [2^10, 2^16]` with `32 | k`, `h ≥ 4`, `w ≥ 16`, `h·w ∈ [256, 2048]`,
 /// `(h + w)·k ≤ 2^22`; heights are `next_pow2` of each table's row formula:
 ///
 /// | table      | rows             | bits    |
 /// |------------|------------------|---------|
-/// | InputQuant | `max(h,w)·k`     | 15..=22 |
-/// | Matmul     | `h·w·(k/32)`     | 14..=22 |
-/// | Blake3     | `8·compressions` | 14..=21 |
+/// | InputQuant | `max(h,w)·k`     | 14..=22 |
+/// | Matmul     | `h·w·(k/32)`     | 13..=22 |
+/// | Blake3     | `8·compressions` | 13..=21 |
 /// | XorFold    | `h·w`            |  8..=11 |
-/// | Tamed      | `h·w`            |  8..=11 |
 /// | Scale      | `h + w`          |  5..=10 |
 /// | LUTs       | [`lut_height`]   | {17, 16, 14, 11, 10, 8, 6, 5} |
 ///
 /// Blake3 bounds: opened bytes are `1.25·(h+w)·k ∈ [5·2^14, 5·2^20]` (values `k` plus
-/// scales `k/4` bytes per strip), so leaf compressions alone are `≥ 1280 > 2^10`
-/// (rows `> 2^13`), while leaves (`16·chunks ≤ 16·((5/4096)·2^22 + 4(h+w)) < 2^17`) +
+/// scales `k/4` bytes per strip), so leaf compressions alone are `≥ 640 > 2^9`
+/// (rows `> 2^12`), while leaves (`16·chunks ≤ 16·((5/4096)·2^22 + 4(h+w)) < 2^17`) +
 /// strip membership paths (`≤ 2·chunks + 30·2(h+w)`) + MoE hotspot rows stay `< 2^18`
-/// (rows `≤ 2^21`). The union is `[5, 22] \ {12, 13}`: no table lands on `2^12` or
-/// `2^13` (Scale and XorFold/Tamed top out at `2^10`/`2^11`, the tallest sub-2^14 LUT
-/// is the `2^11` XFPOW2, Matmul rows are `≥ 256·2^11/32 = 2^14`, InputQuant `≥ 2^15`,
-/// Blake3 `> 2^13`). Coverage and minimality are asserted by
+/// (rows `≤ 2^21`). The union is `[5, 22] \ {12}`: no table lands on `2^12`
+/// (Scale and XorFold top out at `2^10`/`2^11`, and Matmul, InputQuant, and Blake3 all start
+/// at `2^13`).
+/// Coverage and minimality are asserted by
 /// `ladder_covers_the_envelope`; real jobs are gated onto the ladder at
 /// `Fp8Job::derive`.
-pub const FP8_REACHABLE_DEGREE_BITS: [usize; 16] = [22, 21, 20, 19, 18, 17, 16, 15, 14, 11, 10, 9, 8, 7, 6, 5];
+pub const FP8_REACHABLE_DEGREE_BITS: [usize; 17] = [22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 11, 10, 9, 8, 7, 6, 5];
 
 /// Per-main-table inclusive degree-bits ranges `[lo, hi]` over the wire envelope, in
 /// canonical `Table` order — the rows of [`FP8_REACHABLE_DEGREE_BITS`]'s table. Exactness
 /// (each bound is attained by some envelope-legal job) is asserted by
 /// `ladder_covers_the_envelope`; Blake3's bounds are proven, not swept (see above).
-pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(14, 21), (15, 22), (5, 10), (14, 22), (8, 11), (8, 11)];
+pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(13, 21), (14, 22), (5, 10), (13, 22), (8, 11)];
 
 /// Batch indices of the *grouped* tables — the LUTs
 /// (`NUM_TABLES..NUM_ALL_TABLES`). Their heights are consensus constants, so each role
 /// (trace / auxiliary / quotient) commits all of them in one shared multi-height Merkle
-/// tree: the proof carries `3` LUT caps instead of `3 * NUM_LUT_TABLES = 42`, and the
+/// tree: the proof carries `3` LUT caps instead of `3 * NUM_LUT_TABLES = 45`, and the
 /// recursive verifier walks 3 shared trees per query instead of 42 solo ones.
 pub const FP8_GROUPED_TABLES: [usize; NUM_LUT_TABLES] = {
     let mut tables = [0; NUM_LUT_TABLES];
@@ -181,9 +169,9 @@ pub const FP8_GROUPED_TABLES: [usize; NUM_LUT_TABLES] = {
 /// [`FP8_REACHABLE_DEGREE_BITS`]. One stage-1 wrapper circuit built on this envelope
 /// verifies every envelope-legal job (the job's degree profile becomes a
 /// public input).
-pub fn fp8_universal_envelope() -> UniversalVerifierEnvelope {
+pub fn fp8_universal_envelope(device: Device) -> UniversalVerifierEnvelope {
     let mut degree_ranges: Vec<(usize, usize)> = FP8_MAIN_TABLE_DEGREE_RANGES.to_vec();
-    degree_ranges.extend(LUT_TABLES.iter().map(|&table| {
+    degree_ranges.extend(lut_tables(device).iter().map(|&table| {
         let bits = log2_strict(lut_height(table));
         (bits, bits)
     }));
@@ -234,7 +222,7 @@ pub fn fp8_stark_config(degree_bits: &[usize]) -> StarkConfig {
 // The statement
 // ==================================================================================================
 
-/// The public data defining one fp8 statement: the six compiled programs and the
+/// The public data defining one fp8 statement: the five compiled programs and the
 /// class (a) recompute inputs. The caller derives all of it from the parsed job; **it must
 /// reject any job with `mma_type != Bf16ToFp8Fp32` before building a statement**. The
 /// main tables' public inputs are not part of the statement object: the prover generates
@@ -244,7 +232,6 @@ pub struct Fp8PublicData {
     pub blake3: Blake3Program,
     pub input_quant: InputQuantProgram,
     pub scale: ScaleProgram,
-    pub matmul: MatmulProgram,
     pub xor_fold: XorFoldProgram,
     /// Raw byte lengths of the four opened strip planes (A/B values, A/B scales) — the
     /// Blake3 class (a) schedule inputs. The MoE routing statement needs no length here:
@@ -260,73 +247,155 @@ pub struct Fp8PublicData {
     pub b_noise: Vec<u16>,
 }
 
-/// The sixteen LUT AIRs at their exact widths, in [`LUT_TABLES`] order (boxed: each table
-/// instantiates its own width).
-struct LutStarks<F: RichField + Extendable<D>, const D: usize> {
-    starks: Vec<Box<dyn BatchStark<F, D>>>,
+/// Verifier-recomputable leading columns for the five main tables. This is only an
+/// intermediate representation: [`Fp8System::derive_known_columns`] is the sole place
+/// that converts it to the positional layout the batch verifier requires.
+struct MainTableKnownValues<F: RichField> {
+    blake3: Vec<PolynomialValues<F>>,
+    input_quant: Vec<PolynomialValues<F>>,
+    scale: Vec<PolynomialValues<F>>,
+    matmul: Vec<PolynomialValues<F>>,
+    xor_fold: Vec<PolynomialValues<F>>,
 }
 
-/// One LUT AIR at its table's exact width (the width is a compile-time constant per table,
-/// so the dispatch is a static match).
-fn boxed_lut_stark<F: RichField + Extendable<D>, const D: usize>(table: LutTable) -> Box<dyn BatchStark<F, D>> {
-    match table {
-        LutTable::RneRnd => Box::new(RneRndStark::<F, D>::new(table)),
-        LutTable::Range16 => Box::new(Range16Stark::<F, D>::new(table)),
-        LutTable::Bytes2 => Box::new(Bytes2Stark::<F, D>::new(table)),
-        LutTable::Qcast => Box::new(QcastStark::<F, D>::new(table)),
-        LutTable::Div448 => Box::new(Div448Stark::<F, D>::new(table)),
-        LutTable::Pair128 => Box::new(Pair128Stark::<F, D>::new(table)),
-        LutTable::Clamp22 => Box::new(Clamp22Stark::<F, D>::new(table)),
-        LutTable::Int8Dec => Box::new(Int8DecStark::<F, D>::new(table)),
-        LutTable::ExpInfo => Box::new(ExpInfoStark::<F, D>::new(table)),
-        LutTable::Pow2D => Box::new(Pow2DStark::<F, D>::new(table)),
-        LutTable::B200Align => Box::new(B200AlignStark::<F, D>::new(table)),
-        LutTable::Pow2Gb => Box::new(Pow2GbStark::<F, D>::new(table)),
-        LutTable::Width32 => Box::new(Width32Stark::<F, D>::new(table)),
-        LutTable::XfPow2 => Box::new(XfPow2Stark::<F, D>::new(table)),
-        LutTable::Width16 => Box::new(Width16Stark::<F, D>::new(table)),
-        LutTable::Log16 => Box::new(Log16Stark::<F, D>::new(table)),
+impl<F: RichField> MainTableKnownValues<F> {
+    fn into_batch_known_columns(self, device: Device) -> BatchKnownColumns<F> {
+        let values_per_table = vec![self.blake3, self.input_quant, self.scale, self.matmul, self.xor_fold];
+        for table in Table::ALL {
+            let columns = &values_per_table[table as usize];
+            assert_eq!(
+                columns.len(),
+                table.known_column_count(device),
+                "{table:?}: wrong known-column count"
+            );
+            assert!(!columns.is_empty(), "{table:?}: no known columns");
+            for column in columns {
+                assert_eq!(column.len(), columns[0].len(), "{table:?}: ragged known columns");
+            }
+            assert!(
+                columns[0].len().is_power_of_two(),
+                "{table:?}: known columns do not have power-of-two height"
+            );
+        }
+
+        let mut columns_per_table = Table::ALL
+            .into_iter()
+            .map(|table| (0..table.known_column_count(device)).collect())
+            .collect::<Vec<Vec<usize>>>();
+        columns_per_table.resize(NUM_ALL_TABLES, Vec::new());
+        let mut values_per_table = values_per_table;
+        values_per_table.resize(NUM_ALL_TABLES, Vec::new());
+        BatchKnownColumns {
+            digest: None,
+            columns_per_table,
+            values_per_table,
+        }
     }
 }
 
-impl<F: RichField + Extendable<D>, const D: usize> LutStarks<F, D> {
-    fn new() -> Self {
-        Self {
-            starks: LUT_TABLES.iter().map(|&t| boxed_lut_stark::<F, D>(t)).collect(),
+/// Reduces a statement digest into four Goldilocks elements (little-endian integer mod `p^4`).
+pub(super) fn statement_digest_to_hash_out<F: RichField>(digest: Hash256) -> HashOut<F> {
+    let p = U256::from(F::ORDER);
+    let mut value = U256::from_little_endian(&digest);
+    let mut elements = [F::ZERO; 4];
+    for element in &mut elements {
+        *element = F::from_canonical_u64((value % p).as_u64());
+        value /= p;
+    }
+    HashOut { elements }
+}
+
+/// The device-specific Matmul AIR of one FP8 statement. It owns the geometry the AIR
+/// constrains; callers do not maintain a second dimension-only program alongside it.
+enum MatmulBackend<F: RichField + Extendable<D>, const D: usize> {
+    H100(MatmulStarkH100<F, D>),
+    B200(MatmulStarkB200<F, D>),
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
+    fn new(device: Device, h: usize, w: usize, k: usize) -> Self {
+        match device {
+            Device::H100 => Self::H100(MatmulStarkH100::new(h, w, k)),
+            Device::B200 => Self::B200(MatmulStarkB200::new(h, w, k)),
         }
     }
 
-    /// The AIRs as batch tables, in [`LUT_TABLES`] order.
-    fn as_dyn(&self) -> [&dyn BatchStark<F, D>; NUM_LUT_TABLES] {
-        core::array::from_fn(|i| self.starks[i].as_ref())
-    }
-}
-
-/// Generates the Matmul trace from the noised fp8 codes and their summand scores: the
-/// column-major polynomials, the public inputs, the finished cells' f32 words (XorFold's
-/// inputs), and the per-cell `(E_CELL, CELL_SKIPS)` tuples (Tamed's inputs — exactly the
-/// E-cell channel tuples).
-#[allow(clippy::type_complexity)]
-fn matmul_trace<F: RichField>(
-    program: &MatmulProgram,
-    a_codes: &[u8],
-    b_codes: &[u8],
-    a_lambdas: &[u64],
-    b_lambdas: &[u64],
-) -> (Vec<PolynomialValues<F>>, Vec<F>, Vec<u32>, Vec<(u64, u64)>) {
-    let cells = program.h * program.w;
-    let (mut cell_words, mut cell_tuples) = (vec![0u32; cells], vec![(0u64, 0u64); cells]);
-    let (rows, pis) = generate_b200_trace::<F>(program, a_codes, b_codes, a_lambdas, b_lambdas);
-    for r in &rows {
-        let v: &MatmulB200ColumnsView<F> = r.borrow();
-        // Live finals only: the trailing phantom cells' finals carry no cell.
-        if v.is_cell_final == F::ONE && v.is_padding == F::ZERO {
-            let cell = v.cell_id.to_canonical_u64() as usize;
-            cell_words[cell] = (v.cell_result_f32_lo.to_canonical_u64() | (v.cell_result_f32_hi.to_canonical_u64() << 16)) as u32;
-            cell_tuples[cell] = (v.e_cell.to_canonical_u64(), v.cell_skips.to_canonical_u64());
+    /// Recomputes Matmul's class-(a) columns from public geometry.
+    ///
+    /// This runs when either a prover or a native verifier derives an [`Fp8System`];
+    /// wrapper compilation consumes those same values through the system. It does not
+    /// generate a private trace.
+    fn known_values(&self) -> Vec<PolynomialValues<F>> {
+        match self {
+            Self::H100(stark) => stark.known_values(),
+            Self::B200(stark) => stark.known_values(),
         }
     }
-    (column_major(&rows), pis.to_vec(), cell_words, cell_tuples)
+
+    /// Generates the Matmul trace from InputQuant-bound operand data.
+    ///
+    /// This runs only on the prover's per-proof path. Native verification never
+    /// regenerates the private trace; it checks its openings against the public
+    /// class-(a) columns above. Wrapper compilation only uses [`Self::as_stark`].
+    ///
+    /// `a_codes` and `b_codes` are the post-noise FP8 E4M3 codes produced by InputQuant
+    /// and CTL-bound into Matmul. A is row-major (`h * k`); B is transposed/column-major
+    /// (`w * k`). `a_lambdas` and `b_lambdas` are InputQuant's deterministic integer
+    /// unpredictability scores, CTL-bound with the corresponding codes and used by
+    /// Matmul's skip/census logic.
+    #[allow(clippy::type_complexity)]
+    fn generate_trace(
+        &self,
+        a_codes: &[u8],
+        b_codes: &[u8],
+        a_lambdas: &[u64],
+        b_lambdas: &[u64],
+    ) -> (Vec<PolynomialValues<F>>, Vec<F>, Vec<u32>, Vec<u64>) {
+        match self {
+            Self::H100(stark) => {
+                let (rows, pis) = stark.generate_trace(a_codes, b_codes, a_lambdas, b_lambdas);
+                let (mut cell_words, mut cell_skips) = (vec![0u32; stark.h * stark.w], vec![0u64; stark.h * stark.w]);
+                for row in &rows {
+                    let value: &MatmulColumnsView<F> = row.borrow();
+                    if value.is_cell_final == F::ONE && value.is_padding == F::ZERO {
+                        let cell = value.cell_id.to_canonical_u64() as usize;
+                        cell_words[cell] = (value.cell_result_f32_lo.to_canonical_u64()
+                            | (value.cell_result_f32_hi.to_canonical_u64() << 16))
+                            as u32;
+                        cell_skips[cell] = value.cell_skips.to_canonical_u64();
+                    }
+                }
+                (column_major(&rows), pis.to_vec(), cell_words, cell_skips)
+            }
+            Self::B200(stark) => {
+                let (rows, pis) = stark.generate_trace(a_codes, b_codes, a_lambdas, b_lambdas);
+                let (mut cell_words, mut cell_skips) = (vec![0u32; stark.h * stark.w], vec![0u64; stark.h * stark.w]);
+                for row in &rows {
+                    let value: &MatmulB200ColumnsView<F> = row.borrow();
+                    if value.is_cell_final == F::ONE && value.is_padding == F::ZERO {
+                        let cell = value.cell_id.to_canonical_u64() as usize;
+                        cell_words[cell] = (value.cell_result_f32_lo.to_canonical_u64()
+                            | (value.cell_result_f32_hi.to_canonical_u64() << 16))
+                            as u32;
+                        cell_skips[cell] = value.cell_skips.to_canonical_u64();
+                    }
+                }
+                (column_major(&rows), pis.to_vec(), cell_words, cell_skips)
+            }
+        }
+    }
+
+    /// Borrows the selected AIR at the heterogeneous batch boundary.
+    ///
+    /// The returned trait object is read by native batch proving and verification, and
+    /// while compiling the recursive wrapper. It neither constructs a trace nor selects
+    /// an AIR from proof-controlled data.
+    fn as_stark(&self) -> &dyn BatchStark<F, D> {
+        match self {
+            Self::H100(stark) => stark,
+            Self::B200(stark) => stark,
+        }
+    }
 }
 
 /// One job's fully derived proving/verifying context. See the module docs.
@@ -334,16 +403,18 @@ pub struct Fp8System<F: RichField + Extendable<D>, const D: usize> {
     blake3: Blake3Stark<F, D>,
     input_quant: InputQuantStark<F, D>,
     scale: ScaleStark<F, D>,
-    matmul: MatmulB200Stark<F, D>,
+    matmul: MatmulBackend<F, D>,
     xor_fold: XorFoldStark<F, D>,
-    tamed: TamedStark<F, D>,
-    luts: LutStarks<F, D>,
+    lut_tables: [super::luts::LutTable; NUM_LUT_TABLES],
+    /// The device's LUT AIRs at their exact widths, in committed order (boxed: each table
+    /// instantiates its own width).
+    luts: [Box<dyn BatchStark<F, D>>; NUM_LUT_TABLES],
     /// Class (a) recompute inputs kept for trace generation and witness validation.
     plane_lens: [usize; 4],
     a_noise: Vec<u16>,
     b_noise: Vec<u16>,
-    /// Per-table trace degree bits in the canonical batch order (`Table` 0..5, then
-    /// [`LUT_TABLES`]) — not height-sorted; batched FRI sorts the distinct
+    /// Per-table trace degree bits in the canonical batch order (`Table` 0..4, then
+    /// the device's committed LUT inventory) — not height-sorted; batched FRI sorts the distinct
     /// heights internally.
     degree_bits: [usize; NUM_ALL_TABLES],
     /// The consensus config for this job's degree profile.
@@ -351,20 +422,44 @@ pub struct Fp8System<F: RichField + Extendable<D>, const D: usize> {
     /// Class (a) columns in canonical table order. The digest slot is empty until
     /// `bind_statement_digest` fills it.
     known: BatchKnownColumns<F>,
-    /// All 24 CTL channels, table indices in canonical order.
+    /// All 21 CTL channels, table indices in canonical order.
     ctls: Vec<CrossTableLookup<F>>,
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
+    /// Derives the five main tables' verifier-known columns from a statement. This is
+    /// the only cross-table owner of their canonical batch order and metadata.
+    pub(super) fn derive_known_columns(data: &Fp8PublicData) -> BatchKnownColumns<F> {
+        debug_assert_eq!(
+            data.input_quant.device, data.scale.device,
+            "InputQuant and Scale must use the same committed device"
+        );
+        let device = data.scale.device;
+        let matmul = MatmulBackend::<F, D>::new(device, data.input_quant.h, data.input_quant.w, data.input_quant.k);
+        MainTableKnownValues {
+            blake3: data.blake3.known_values::<F>(&Blake3KnownInputs {
+                a_values_len: data.a_values_len,
+                a_scales_len: data.a_scales_len,
+                b_values_len: data.b_values_len,
+                b_scales_len: data.b_scales_len,
+            }),
+            input_quant: data.input_quant.known_values::<F>(&data.a_noise, &data.b_noise),
+            scale: data.scale.known_values::<F>(),
+            matmul: matmul.known_values(),
+            xor_fold: data.xor_fold.known_values::<F>(),
+        }
+        .into_batch_known_columns(device)
+    }
+
     /// Derives the full batching context from the statement: class (a) values (which fix
     /// every main table's height), the consensus config, the CTL set and the known-column
     /// data — all in the canonical table order.
     pub fn new(data: Fp8PublicData) -> Self {
+        let known = Self::derive_known_columns(&data);
         let Fp8PublicData {
             blake3,
             input_quant,
             scale,
-            matmul,
             xor_fold,
             a_values_len,
             a_scales_len,
@@ -373,33 +468,20 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             a_noise,
             b_noise,
         } = data;
-        // Tamed's program is the shared geometry itself.
-        let tamed = TamedProgram {
-            h: matmul.h,
-            w: matmul.w,
-            k: matmul.k,
-        };
-
+        debug_assert_eq!(
+            input_quant.device, scale.device,
+            "InputQuant and Scale must use the same committed device"
+        );
+        let device = scale.device;
+        let (h, w, k) = (input_quant.h, input_quant.w, input_quant.k);
+        let lut_tables = lut_tables(device);
         // Class (a) recompute — also the (only) source of the main tables' heights: the
         // verifier must never take the batch layout from the proof.
-        let known_values = [
-            blake3.known_values::<F>(&Blake3KnownInputs {
-                a_values_len,
-                a_scales_len,
-                b_values_len,
-                b_scales_len,
-            }),
-            input_quant.known_values::<F>(&a_noise, &b_noise),
-            scale.known_values::<F>(),
-            matmul.known_values::<F>(),
-            xor_fold.known_values::<F>(),
-            tamed.known_values::<F>(),
-        ];
         let mut heights = [0usize; NUM_ALL_TABLES];
-        for (t, columns) in known_values.iter().enumerate() {
-            heights[t] = columns[0].len();
+        for table in Table::ALL {
+            heights[table as usize] = known.values_per_table[table as usize][0].len();
         }
-        for (i, &table) in LUT_TABLES.iter().enumerate() {
+        for (i, &table) in lut_tables.iter().enumerate() {
             heights[NUM_TABLES + i] = lut_height(table);
         }
 
@@ -409,18 +491,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         let degree_bits: [usize; NUM_ALL_TABLES] = core::array::from_fn(|t| log2_strict(heights[t]));
         let config = fp8_stark_config(&degree_bits);
 
-        let known = fp8_known_columns::<F>(known_values);
-        // All 24 channels, in the same canonical index space.
-        let ctls = all_cross_table_lookups::<F>(&scale);
+        // Every channel in the same canonical index space.
+        let ctls = all_cross_table_lookups::<F>(device, &scale);
 
         Self {
             blake3: Blake3Stark::new(blake3),
             input_quant: InputQuantStark::new(input_quant),
             scale: ScaleStark::new(scale),
-            matmul: MatmulB200Stark::new(matmul),
+            matmul: MatmulBackend::new(device, h, w, k),
             xor_fold: XorFoldStark::new(xor_fold),
-            tamed: TamedStark::new(tamed),
-            luts: LutStarks::new(),
+            luts: lut_tables.map(boxed_lut_stark::<F, D>),
+            lut_tables,
             plane_lens: [a_values_len, a_scales_len, b_values_len, b_scales_len],
             a_noise,
             b_noise,
@@ -436,36 +517,34 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         &self.config
     }
 
-    /// Per-table trace degree bits in the canonical batch order (`Table` 0..5, then
-    /// [`LUT_TABLES`]) — the expected `proof.degree_bits`, and the
+    /// Per-table trace degree bits in the canonical batch order (`Table` 0..4, then
+    /// the device's committed LUT inventory) — the expected `proof.degree_bits`, and the
     /// shape identity of any compiled-circuit cache key: per-table assignments, not the
     /// height multiset, so two statements sharing a multiset cannot collide.
     pub fn degree_bits(&self) -> &[usize; NUM_ALL_TABLES] {
         &self.degree_bits
     }
 
-    /// The job's geometry `[h, w, k]`.
-    ///
-    /// *Not* circuit-cache key material since v20/D1 (hence test-only): the CTL structure
-    /// no longer bakes geometry (the `h*k` B-plane key offsets and `h`/`w` operand
-    /// multiplicities are public-input terms of the CTL expressions), the AIRs take
-    /// `k` / `WL2` / `2^WL2` as public inputs, and the universal wrapper takes the degree
-    /// profile as public inputs — so one compiled circuit covers the envelope. `r` and
-    /// `block_size` are protocol constants (`r = 32`, block size 8); Scale's H5 CLAMP22
-    /// offset `535 - E*(dos)` is a consensus constant (a function of that fixed `r` only).
-    #[cfg(test)]
-    pub fn geometry(&self) -> [usize; 3] {
-        let p = &self.input_quant.program;
-        [p.h, p.w, p.k]
+    pub(crate) fn device(&self) -> Device {
+        self.scale.program.device
     }
 
-    /// The batch positions of the sixteen LUT tables, in [`LUT_TABLES`]
+    #[cfg(test)]
+    pub fn matmul_num_columns(&self) -> usize {
+        self.matmul.as_stark().num_columns()
+    }
+
+    /// The batch positions of the fifteen device-specific LUT tables
     /// order. The batch order is canonical, so LUT `i` sits at `NUM_TABLES + i`.
     pub fn lut_positions(&self) -> [usize; NUM_LUT_TABLES] {
         core::array::from_fn(|i| NUM_TABLES + i)
     }
 
-    /// The batch positions of the six main tables, in canonical `Table` order — where a
+    pub fn committed_lut_tables(&self) -> &[super::luts::LutTable; NUM_LUT_TABLES] {
+        &self.lut_tables
+    }
+
+    /// The batch positions of the five main tables, in canonical `Table` order — where a
     /// caller finds each table's public inputs inside `proof.public_inputs`. The batch
     /// order is canonical, so table `t` sits at `t`.
     pub fn main_table_positions(&self) -> [usize; NUM_TABLES] {
@@ -478,7 +557,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// relative order under any geometry — so the cap is a consensus constant;
     /// only the position bookkeeping varies per job.
     pub fn preprocessed_data<C: GenericConfig<D, F = F>>(&self, timing: &mut TimingTree) -> BatchStarkPreprocessedData<F, C, D> {
-        lut_preprocessed_data::<F, C, D>(NUM_ALL_TABLES, self.lut_positions(), &self.config, timing)
+        lut_preprocessed_data::<F, C, D>(NUM_ALL_TABLES, self.lut_positions(), &self.lut_tables, &self.config, timing)
     }
 
     /// The verifier's view of the LUT precommitment: the consensus `cap` plus the
@@ -489,7 +568,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         cap: &MerkleCap<F, C::Hasher>,
     ) -> BatchStarkPreprocessedVerifierData<F, C, D> {
         let mut columns_per_table = vec![Vec::new(); NUM_ALL_TABLES];
-        for (i, &table) in LUT_TABLES.iter().enumerate() {
+        for (i, &table) in self.lut_tables.iter().enumerate() {
             columns_per_table[NUM_TABLES + i] = (0..num_precommitted_columns(table)).collect();
         }
         BatchStarkPreprocessedVerifierData {
@@ -516,7 +595,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// against) before the verification: `verify` fails closed on an unbound slot.
     /// [`Self::prove`] performs the bind itself.
     pub fn bind_statement_digest(&mut self, statement_digest: Hash256) {
-        self.known.digest = Some(hash256_to_hash_out(statement_digest));
+        self.known.digest = Some(statement_digest_to_hash_out(statement_digest));
     }
 
     /// Cross-checks a caller-supplied `statement_digest` (the wrapper paths take it
@@ -526,7 +605,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         ensure!(
             self.known
                 .digest
-                .is_none_or(|bound| bound == hash256_to_hash_out(statement_digest)),
+                .is_none_or(|bound| bound == statement_digest_to_hash_out(statement_digest)),
             "the statement_digest disagrees with the one bound into the system's known columns"
         );
         Ok(())
@@ -534,16 +613,20 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
 
     /// The batch tables, canonical order.
     pub(super) fn batch_starks(&self) -> [&dyn BatchStark<F, D>; NUM_ALL_TABLES] {
-        let mut tables: Vec<&dyn BatchStark<F, D>> = vec![
+        let main_tables: [&dyn BatchStark<F, D>; NUM_TABLES] = [
             &self.blake3,
             &self.input_quant,
             &self.scale,
-            &self.matmul,
+            self.matmul.as_stark(),
             &self.xor_fold,
-            &self.tamed,
         ];
-        tables.extend(self.luts.as_dyn());
-        core::array::from_fn(|t| tables[t])
+        core::array::from_fn(|t| {
+            if t < NUM_TABLES {
+                main_tables[t]
+            } else {
+                self.luts[t - NUM_TABLES].as_ref()
+            }
+        })
     }
 
     /// The main tables' public inputs, padded with the LUT tables' empty vectors to the
@@ -552,9 +635,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         core::array::from_fn(|t| if t < NUM_TABLES { main_pis[t].clone() } else { Vec::new() })
     }
 
-    /// Proves one job: regenerates the six main traces from the witness (chaining each
+    /// Proves one job: regenerates the five main traces from the witness (chaining each
     /// table's inputs from its producer), accumulates the committed-LUT multiplicities,
-    /// assembles the sixteen LUT traces and runs the batch prover. `preprocessed` is the
+    /// assembles the LUT traces and runs the batch prover. `preprocessed` is the
     /// setup-time LUT commitment for this job's layout ([`Self::preprocessed_data`]).
     ///
     /// `derive_statement_digest` receives the lottery digest `J` (the 32-byte
@@ -643,33 +726,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
                 })
                 .collect()
         };
-        let (mat_trace, mat_pis, cell_words, cell_tuples) = matmul_trace(
-            &self.matmul.program,
-            &codes(false),
-            &codes(true),
-            &lambdas(false),
-            &lambdas(true),
-        );
+        let (mat_trace, mat_pis, cell_words, cell_skips) =
+            self.matmul
+                .generate_trace(&codes(false), &codes(true), &lambdas(false), &lambdas(true));
 
         // ---- XorFold: fold Matmul's finished cell words into the lottery lanes. ----
-        let (xf_rows, xf_pis) = self.xor_fold.program.generate_trace::<F>(&cell_words);
-
-        // ---- Tamed: Matmul's per-cell binade-and-census tuples against Scale's per-row
-        // sigma frames, reassembled exactly as the channels export them. ----
-        let sigma_frames = |rows: core::ops::Range<usize>| -> Vec<(u64, u64)> {
-            rows.map(|g| {
-                let v: &ScaleColumnsView<F> = scale_rows[g].borrow();
-                (
-                    v.sigma_significand.to_canonical_u64(),
-                    v.alpha_exp.to_canonical_u64() + v.l2_floored_exponent.to_canonical_u64() + SIGMA_EXP_OFFSET,
-                )
-            })
-            .collect()
-        };
-        let (tamed_rows, tamed_pis) =
-            self.tamed
-                .program
-                .generate_trace::<F>(&cell_tuples, &sigma_frames(0..h), &sigma_frames(h..h + w));
+        let (xf_rows, xf_pis) = self.xor_fold.program.generate_trace::<F>(&cell_words, &cell_skips);
 
         // ---- Blake3: the strip bytes and the folded lottery words under the job schedule. ----
         let mut lottery_words = [0u32; 16];
@@ -704,14 +766,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // The proof ships the public inputs the witness generates (keys, roots, the geometry
         // and dead-limit slots, the lottery digest); the verifier pins every slot to its own
         // expectations in [`Self::verify`].
-        let generated: [Vec<F>; NUM_TABLES] = [
-            b3_pis.to_vec(),
-            iq_pis.to_vec(),
-            scale_pis.to_vec(),
-            mat_pis,
-            xf_pis.to_vec(),
-            tamed_pis.to_vec(),
-        ];
+        let generated: [Vec<F>; NUM_TABLES] = [b3_pis.to_vec(), iq_pis.to_vec(), scale_pis.to_vec(), mat_pis, xf_pis.to_vec()];
 
         // ---- Column-major traces, canonical order. ----
         let mut traces: Vec<Vec<PolynomialValues<F>>> = vec![
@@ -720,28 +775,20 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             column_major(&scale_rows),
             mat_trace,
             column_major(&xf_rows),
-            column_major(&tamed_rows),
         ];
 
         // ---- Committed-LUT multiplicities: walk every AIR's inventory over its trace. The
         // checker also re-validates that every instance is served by the committed tables,
         // with per-instance errors — the prover fails fast instead of emitting an
         // unbalanceable proof. ----
-        let mut checker = LutChecker::<F>::new();
-        let inventories = [
-            (blake3_lut_lookups::<F>(), "Blake3"),
-            (input_quant_lut_lookups::<F>(), "InputQuant"),
-            (scale_lut_lookups::<F>(&self.scale.program), "Scale"),
-            (matmul_b200_lut_lookups::<F>(), "Matmul"),
-            (xor_fold_lut_lookups::<F>(), "XorFold"),
-            (tamed_lut_lookups::<F>(), "Tamed"),
-        ];
-        for (t, (lookups, name)) in inventories.iter().enumerate() {
+        let mut checker = LutChecker::<F>::new(&self.lut_tables);
+        for (table, lookups) in lut_inventories::<F>(self.device(), &self.scale.program) {
+            let t = usize::from(table);
             checker
-                .check_trace(lookups, &traces[t], &generated[t], name)
+                .check_trace(&lookups, &traces[t], &generated[t], &format!("{table:?}"))
                 .map_err(|e| anyhow!(e))?;
         }
-        for table in LUT_TABLES {
+        for table in self.lut_tables {
             traces.push(lut_trace::<F>(table, checker.multiplicities.table_columns(table)));
         }
 
@@ -788,7 +835,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             NUM_SCALE_PUBLIC_INPUTS,
             NUM_MATMUL_PUBLIC_INPUTS,
             NUM_XOR_FOLD_PUBLIC_INPUTS,
-            NUM_TAMED_PUBLIC_INPUTS,
         ]
         .into_iter()
         .enumerate()
@@ -872,9 +918,9 @@ mod tests {
     use plonky2::field::types::Field;
     use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
-    use super::super::consistency::{Fp8Fixture, build_fixture};
-    use super::super::known_values::hash256_to_hash_out;
+    use super::super::consistency::{Fp8Fixture, build_fixture, build_fixture_from_job, fixture_job};
     use super::*;
+    use crate::api::fp8::public_params::PublicParams;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -941,7 +987,7 @@ mod tests {
         // schedule is exactly the suffix of a deeper one's from its own tallest table
         // (on-ladder maxima only: an off-ladder max adds its own boundary and diverges).
         let deep = schedule_boundaries(&[22, 5]);
-        for max in [21, 20, 19, 18, 17, 16, 15, 14] {
+        for max in [21, 20, 19, 18, 17, 16, 15, 14, 13] {
             let shallow = schedule_boundaries(&[max, 5]);
             let offset = deep.iter().position(|&b| b == max).unwrap();
             assert_eq!(
@@ -985,29 +1031,29 @@ mod tests {
         // Per-main-table reach, canonical `Table` order (Blake3's bounded 14..=21 is
         // documented on the constant, not swept).
         let mut per_table: [BTreeSet<usize>; NUM_TABLES] = Default::default();
-        per_table[Table::Blake3 as usize].extend(14..=21);
+        per_table[Table::Blake3 as usize].extend(13..=21);
         // Envelope (`api::layout` tile bounds): h >= 4
         // (MIN_TILE_ROWS), w >= 16 (MIN_TILE_COLS), h*w <= 2048 (MAX_TILE_ELEMS),
         // h*w >= 16*16 (JACKPOT_ENTRIES lanes of >= MIN_SUBTILE_ELEMS), and the
-        // opened-strips bound (h + w)*k <= 2^22 with k in [2048, 2^16], 32 | k.
+        // opened-strips bound (h + w)*k <= 2^22 with k in
+        // [PublicParams::MIN_K, PublicParams::MAX_K], 32 | k.
         let bits = |rows: usize| rows.next_power_of_two().trailing_zeros() as usize;
         for h in 4..=128 {
             for w in 16..=(2048 / h) {
                 if h * w < 256 {
                     continue;
                 }
-                let k_max = ((1 << 22) / (h + w) / 32 * 32).min(1 << 16);
-                if k_max < 2048 {
+                let k_max = ((1 << 22) / (h + w) / 32 * 32).min(PublicParams::MAX_K);
+                if k_max < PublicParams::MIN_K {
                     continue;
                 }
                 per_table[Table::Scale as usize].insert(bits(h + w));
                 per_table[Table::XorFold as usize].insert(bits(h * w));
-                per_table[Table::Tamed as usize].insert(bits(h * w));
                 // InputQuant `max(h,w)*k` and Matmul `h*w*(k/32)` are monotone in k, and
-                // consecutive k steps (+32 on k >= 2048) never double a value, so
+                // consecutive k steps (+32 on k >= PublicParams::MIN_K) never double a value, so
                 // sweeping k hits exactly the bit range between the two endpoints.
-                per_table[Table::InputQuant as usize].extend(bits(h.max(w) * 2048)..=bits(h.max(w) * k_max));
-                per_table[Table::Matmul as usize].extend(bits(h * w * (2048 / 32))..=bits(h * w * (k_max / 32)));
+                per_table[Table::InputQuant as usize].extend(bits(h.max(w) * PublicParams::MIN_K)..=bits(h.max(w) * k_max));
+                per_table[Table::Matmul as usize].extend(bits(h * w * (PublicParams::MIN_K / 32))..=bits(h * w * (k_max / 32)));
             }
         }
 
@@ -1022,27 +1068,28 @@ mod tests {
         }
 
         let mut reachable: BTreeSet<usize> = per_table.into_iter().flatten().collect();
-        reachable.extend(LUT_TABLES.into_iter().map(|t| bits(lut_height(t))));
+        for device in [Device::H100, Device::B200] {
+            reachable.extend(lut_tables(device).into_iter().map(|t| bits(lut_height(t))));
+        }
 
-        assert!(
-            !reachable.contains(&12) && !reachable.contains(&13),
-            "2^12 and 2^13 must stay unreachable (the ladder's gap)"
-        );
+        assert!(!reachable.contains(&12), "2^12 must stay unreachable (the ladder's gap)");
         let ladder: BTreeSet<usize> = FP8_REACHABLE_DEGREE_BITS.into_iter().collect();
         assert_eq!(reachable, ladder, "the consensus ladder must equal the envelope's reach");
 
         // The universal envelope is well-formed: bounds on the ladder,
         // fixed LUT slots, and the ladder headed by the tallest reachable table.
-        let envelope = fp8_universal_envelope();
-        assert_eq!(envelope.ladder, FP8_REACHABLE_DEGREE_BITS.to_vec());
-        assert_eq!(envelope.degree_ranges.len(), NUM_ALL_TABLES);
-        for (t, &(lo, hi)) in envelope.degree_ranges.iter().enumerate() {
-            assert!(lo <= hi, "table {t}");
-            assert!(
-                ladder.contains(&lo) && ladder.contains(&hi),
-                "table {t}: bounds on the ladder"
-            );
-            assert!(t < NUM_TABLES || lo == hi, "LUT slot {t} must be fixed");
+        for device in [Device::H100, Device::B200] {
+            let envelope = fp8_universal_envelope(device);
+            assert_eq!(envelope.ladder, FP8_REACHABLE_DEGREE_BITS.to_vec());
+            assert_eq!(envelope.degree_ranges.len(), NUM_ALL_TABLES);
+            for (t, &(lo, hi)) in envelope.degree_ranges.iter().enumerate() {
+                assert!(lo <= hi, "table {t}");
+                assert!(
+                    ladder.contains(&lo) && ladder.contains(&hi),
+                    "table {t}: bounds on the ladder"
+                );
+                assert!(t < NUM_TABLES || lo == hi, "LUT slot {t} must be fixed");
+            }
         }
     }
 
@@ -1051,7 +1098,6 @@ mod tests {
             blake3: fx.blake3.clone(),
             input_quant: fx.input_quant.clone(),
             scale: fx.scale.clone(),
-            matmul: fx.matmul.clone(),
             xor_fold: fx.xor_fold.clone(),
             a_values_len: fx.a_values.len(),
             a_scales_len: fx.a_scales.len(),
@@ -1098,7 +1144,7 @@ mod tests {
 
         assert_eq!(system.main_table_positions(), core::array::from_fn(|t| t));
         assert_eq!(system.lut_positions(), core::array::from_fn(|i| NUM_TABLES + i));
-        for (i, &table) in LUT_TABLES.iter().enumerate() {
+        for (i, &table) in system.committed_lut_tables().iter().enumerate() {
             assert_eq!(
                 system.degree_bits()[NUM_TABLES + i],
                 log2_strict(lut_height(table)),
@@ -1122,9 +1168,38 @@ mod tests {
         system.bind_statement_digest(STATEMENT_DIGEST);
         assert_eq!(
             system.known().digest,
-            Some(hash256_to_hash_out(STATEMENT_DIGEST)),
+            Some(statement_digest_to_hash_out(STATEMENT_DIGEST)),
             "BatchKnownColumns.digest must be the statement_digest quartet"
         );
+    }
+
+    #[test]
+    fn compact_hopper_batch_area_matches_the_lookup_inventory() {
+        let fx = build_fixture(false);
+        let mut data = public_data(&fx);
+        data.input_quant.device = Device::H100;
+        data.scale.device = Device::H100;
+        let system = Fp8System::<F, D>::new(data);
+        let starks = system.batch_starks();
+        let matmul = Table::Matmul as usize;
+        let config = system.config();
+        assert_eq!(config.num_challenges, 3);
+        assert_eq!(config.fri_config.rate_bits, 1);
+        assert_eq!(starks[matmul].constraint_degree(), 3);
+        let (helpers, zs, _) = CrossTableLookup::num_ctl_helpers_zs_all(system.ctls(), matmul, config.num_challenges, 3);
+        assert_eq!((starks[matmul].num_columns(), helpers, zs), (331, 276, 18));
+        assert_eq!(starks[matmul].num_columns() + helpers + zs + 6, 631);
+        let pow2g = NUM_TABLES
+            + system
+                .committed_lut_tables()
+                .iter()
+                .position(|&t| t == super::super::luts::LutTable::Pow2G)
+                .unwrap();
+        let (helpers, zs, _) = CrossTableLookup::num_ctl_helpers_zs_all(system.ctls(), pow2g, config.num_challenges, 3);
+        assert_eq!((starks[pow2g].num_columns(), helpers, zs), (12, 6, 3));
+        assert_eq!(starks[pow2g].num_columns() + helpers + zs + 6, 27);
+        assert_eq!(system.ctls().len(), 21);
+        assert_eq!(starks.len(), 20);
     }
 
     /// The full driver roundtrip on the consistency fixture: setup-time LUT precommitment,
@@ -1133,7 +1208,14 @@ mod tests {
     /// codes), a diverging `statement_digest`, and a tampered opening.
     #[test]
     fn batch_proof_roundtrips_and_rejects_tampering() {
-        let fx = build_fixture(false);
+        for device in [Device::H100, Device::B200] {
+            let (header, mut plain) = fixture_job();
+            plain.job.common.device = device;
+            check_batch_roundtrip(build_fixture_from_job(header, plain));
+        }
+    }
+
+    fn check_batch_roundtrip(fx: Fp8Fixture) {
         let mut system = build_system(&fx);
 
         let mut timing = TimingTree::default();

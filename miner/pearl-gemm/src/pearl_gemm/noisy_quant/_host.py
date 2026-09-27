@@ -311,8 +311,9 @@ def noisy_quant(
     dequantized BF16 copy. ``c_a`` is A's 32-byte noise-line key
     (``Subkey("noise-line", noise seedA)``; the finalize kernel's ``a_keys``
     words ``[8, 16)``), under which the E1 rows are drawn in-kernel.
-    ``f1_hl`` is A's own basis ``F_A`` (drawn under the same key, so it is
-    per-nonce like ``c_a``) and ``f2`` is B's ``F_B``.
+    ``f1_hl`` is the packed basis ``F_A`` and ``f2`` is B's ``F_B``; both are
+    drawn under B's noise-line key (``LABEL_F1`` / ``LABEL_F2``), so they are
+    job constants, unlike the per-nonce ``c_a``.
     """
     _launch_prep(
         codes,

@@ -14,13 +14,13 @@ from ..tensor_hash_plus_stats._blake3_ops import (
 
 MAX_E4M3 = QUANT_MAX  # 448.0, the e4m3 quant-grid ceiling
 _NORM_FLOOR = 2.0**-32  # row_norms' (near-)zero-row floor on l2 and linf
-# Noise-line normalization constants (Noiser._lines): the target norm times the
+# Noise-line normalization constants: the target norm times the
 # fixed-point isqrt factor, and the squared factor applied under the isqrt.
 _LINE_NORM_NUM = float(NOISE_TARGET_NORM * _INT_SQRT_PREC)  # 8192, exact bf16
 _LINE_SQRT_SQ = _INT_SQRT_PREC * _INT_SQRT_PREC  # 1024
 
-# The v4 noise-line address prefix ``side(1) | factor(1)`` (``miner_base.noise``:
-# ``Side.A = 0, Side.B = 1``; ``Factor.E = 0, Factor.F = 1``). The
+# The v4 noise-line address prefix ``side(1) | factor(1)`` (side A = 0, B = 1;
+# factor E = 0, F = 1). The
 # full 64-byte block message is ``side | factor | u32 LE line`` zero-padded;
 # ``k`` and ``r`` are bound by the side's noise seed, not the address. E1/F1
 # are A's row lines and shared basis, E2/F2 are B's.
@@ -34,7 +34,7 @@ _ROW_W, _ROW_SH = _ROW_OFF // 4, (_ROW_OFF % 4) * 8
 
 
 def _noise_base_words(label: bytes) -> tuple[int, ...]:
-    """The 16 message words of ``OperandNoiser._line_digest`` with the line index zeroed."""
+    """The 16 message words of a noise-line draw with the line index zeroed."""
     if len(label) != _LABEL_LEN:
         raise ValueError(f"noise line address must be {_LABEL_LEN} bytes, got {len(label)}")
     material = (label + struct.pack("<I", 0)).ljust(64, b"\x00")
@@ -57,9 +57,7 @@ def _mul_bf16x2(a, b):
 def _fma_bf16x2(a, b, c):
     """Two reference BF16 fmas: a*b + c per lane with a SINGLE RTNE rounding.
 
-    Exactly ``ComputeOps.fma``'s hardware-FMA contract (the product is exact,
-    only the sum rounds once) -- the reference's fp64 TwoSum + round-to-odd
-    emulation is defined to match this native instruction.
+    The product is exact; only the sum rounds once.
     """
     return _asm_u32(
         "fma.rn.bf16x2 $0, $1, $2, $3;",

@@ -15,6 +15,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/blockchain/indexers"
 	"github.com/pearl-research-labs/pearl/node/connmgr"
 	"github.com/pearl-research-labs/pearl/node/database"
+	"github.com/pearl-research-labs/pearl/node/internal/inbound"
 	"github.com/pearl-research-labs/pearl/node/mempool"
 	"github.com/pearl-research-labs/pearl/node/mining"
 	"github.com/pearl-research-labs/pearl/node/mining/cpuminer"
@@ -71,6 +72,7 @@ var (
 	syncLog = backendLog.Logger("SYNC")
 	txmpLog = backendLog.Logger("TXMP")
 	v2trLog = backendLog.Logger(v2transport.Subsystem)
+	inbdLog = backendLog.Logger("INBD")
 )
 
 // Initialize package-global logger variables.
@@ -87,6 +89,7 @@ func init() {
 	netsync.UseLogger(syncLog)
 	mempool.UseLogger(txmpLog)
 	v2transport.UseLogger(v2trLog)
+	inbound.UseLogger(inbdLog)
 }
 
 // subsystemLoggers maps each subsystem identifier to its associated logger.
@@ -107,6 +110,7 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"SYNC":                syncLog,
 	"TXMP":                txmpLog,
 	v2transport.Subsystem: v2trLog,
+	"INBD":                inbdLog,
 }
 
 // initLogRotator initializes the logging rotater to write logs to logFile and

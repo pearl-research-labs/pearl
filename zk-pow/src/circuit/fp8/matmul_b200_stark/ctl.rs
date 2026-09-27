@@ -10,7 +10,9 @@ use starky::lookup::{Column, Filter};
 
 use super::columns::{GROUP_WIDTH, MATMUL_B200_COL_MAP};
 use super::stark::PARTIAL_BINADE_OFFSET;
-use crate::circuit::fp8::ctl::{LutLookup, LutTable, Table};
+use crate::circuit::fp8::ctl::Table;
+use crate::circuit::fp8::luts::LutTable;
+use crate::circuit::fp8::luts::ctl::LutLookup;
 use crate::circuit::fp8::unpredictability::SKIP_THRESHOLD_OFFSET;
 
 /// Matmul's looking side of the operand-code channel: 16 pair-packed instances per side
@@ -58,14 +60,14 @@ pub fn ctl_operand_codes_looking_matmul_b200<F: Field>() -> Vec<TableWithColumns
 }
 
 /// Matmul's looked side of the cell-result channel: `(CELL_ID, CELL_RESULT_F32_LO,
-/// CELL_RESULT_F32_HI)`, filter `IS_CELL_FINAL * (1 - IS_PADDING)` — phantom padding cells
-/// emit no word. XorFold receives each finished real cell's f32 word (as two RC16'd limbs)
-/// exactly once, keyed by the cell it folds.
+/// CELL_RESULT_F32_HI, CELL_SKIPS)`, filter `IS_CELL_FINAL * (1 - IS_PADDING)` — phantom
+/// padding cells emit no tuple. XorFold receives each finished real cell and its policy
+/// census exactly once.
 pub fn ctl_cell_results_looked_matmul_b200<F: Field>() -> TableWithColumns<F> {
     let m = &MATMUL_B200_COL_MAP;
     TableWithColumns::new(
         Table::Matmul.into(),
-        Column::singles([m.cell_id, m.cell_result_f32_lo, m.cell_result_f32_hi]).collect(),
+        Column::singles([m.cell_id, m.cell_result_f32_lo, m.cell_result_f32_hi, m.cell_skips]).collect(),
         Filter::new(
             vec![(
                 Column::single(m.is_cell_final),
@@ -76,27 +78,9 @@ pub fn ctl_cell_results_looked_matmul_b200<F: Field>() -> TableWithColumns<F> {
     )
 }
 
-/// Matmul's looked side of the E-cell channel (jackpot checks 3 + 4):
-/// `(CELL_ID, E_CELL, CELL_SKIPS)` on the cell-final row of every live cell, with
-/// `E_CELL = floor(log2 M) + 139` and `CELL_SKIPS` the cell's skip census (MB16).
-pub fn ctl_e_cell_looked_matmul_b200<F: Field>() -> TableWithColumns<F> {
-    let m = &MATMUL_B200_COL_MAP;
-    TableWithColumns::new(
-        Table::Matmul.into(),
-        Column::singles([m.cell_id, m.e_cell, m.cell_skips]).collect(),
-        Filter::new(
-            vec![(
-                Column::single(m.is_cell_final),
-                Column::linear_combination_with_constant([(m.is_padding, -F::ONE)], F::ONE),
-            )],
-            vec![],
-        ),
-    )
-}
-
-/// MatmulB200Stark's per-row LUT instance inventory: RC16 x78 (13 window-sum + 33 check 3:
-/// `E_CELL - LANE_BINADES_i >= 0` on the 32 lanes and the filtered partial-sum bound + 32
-/// check 4: the per-lane non-skip certificates), B200ALIGN x32, POW2GB x1 (filtered),
+/// MatmulB200Stark's per-row LUT instance inventory: RC16 x78 (13 window-sum + 33
+/// consolidated-census magnitude bounds: `E_GRID - LANE_BINADES_i >= 0` on the 32 lanes
+/// and the filtered partial-sum bound + 32 per-lane non-skip certificates), B200ALIGN x32, POW2GB x1 (filtered),
 /// WIDTH32 x1 (filtered) — 112 instances.
 /// Each becomes a CTL into the matching committed `LutStark` (`lut_cross_table_lookups`).
 /// The inventory is program-independent.
@@ -229,8 +213,8 @@ pub fn matmul_b200_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
         ])));
     }
 
-    // ---- MB15: the per-lane non-skip certificates (jackpot check 4) — the affine key
-    // LAMBDA_A_i + LAMBDA_B_i - 128*E_CELL - 45376 under the filter
+    // ---- MB15: the per-lane non-skip certificates — the affine key
+    // LAMBDA_A_i + LAMBDA_B_i - 128*E_GRID - 45952 under the filter
     // CELL_NONZERO * (1 - SKIP_FLAG_i). A true skip's key is negative and wraps far outside
     // [0, 2^16), forcing SKIP_FLAG_i = 1; zero cells and padding pin the flag to 0 and the
     // filter is off, so they pay no certificate. ----

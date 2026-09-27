@@ -75,15 +75,10 @@ mod variable_chunk_sides {
     use super::{MatrixMerkleProof, MerkleProof, Sides};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    /// `serialize_with` is called with `&T`; here `T = &MerkleProof`.
-    fn serialize_variable_ref<S: Serializer>(proof: &&MerkleProof, serializer: S) -> Result<S::Ok, S::Error> {
-        proof.serialize_variable_chunk(serializer)
-    }
-
     pub fn serialize<S: Serializer>(sides: &Sides<MatrixMerkleProof>, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Matrix<'a> {
-            #[serde(serialize_with = "serialize_variable_ref")]
+            #[serde(serialize_with = "MerkleProof::serialize_variable_chunk")]
             proof: &'a MerkleProof,
             row_indices: &'a [usize],
         }

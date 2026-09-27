@@ -16,6 +16,7 @@ import (
 	secp_ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	ecdsa_schnorr "github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
 	"github.com/pearl-research-labs/pearl/node/btcec"
+	"github.com/stretchr/testify/require"
 )
 
 type bip340Test struct {
@@ -289,5 +290,39 @@ func TestSchnorrSignNoMutate(t *testing.T) {
 
 	if err := quick.Check(f, nil); err != nil {
 		t.Fatalf("private key modified: %v", err)
+	}
+}
+
+func TestParseSignatureComponentRange(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		sig     string
+		wantErr error
+	}{
+		{
+			name:    "r == p",
+			sig:     "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d09",
+			wantErr: ecdsa_schnorr.ErrSigRTooBig,
+		},
+		{
+			// BIP340 test vector 13.
+			name:    "s == n",
+			sig:     "4e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd41fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+			wantErr: ecdsa_schnorr.ErrSigSTooBig,
+		},
+		{
+			name:    "s > n",
+			sig:     "4e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd41fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364142",
+			wantErr: ecdsa_schnorr.ErrSigSTooBig,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseSignature(decodeHex(tt.sig))
+			require.ErrorIs(t, err, tt.wantErr)
+		})
 	}
 }

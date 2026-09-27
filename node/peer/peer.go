@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -289,6 +290,9 @@ type Config struct {
 	// scenarios where the stall behavior isn't important to the system
 	// under test.
 	DisableStallHandler bool
+
+	// V2HandshakeAdmission optionally leases CPU for inbound v2 keygen and ECDH. Unused for outbound peers.
+	V2HandshakeAdmission v2transport.HandshakeAdmission
 }
 
 // minUint32 is a helper function to return the minimum of two uint32s.
@@ -442,7 +446,9 @@ type Peer struct {
 	connected     int32
 	disconnect    int32
 
-	conn net.Conn
+	// connMtx serializes connection association with disconnection.
+	connMtx sync.Mutex
+	conn    net.Conn
 
 	// These fields are set at creation time and never modified, so they are
 	// safe to read from concurrently without a mutex.
@@ -1380,6 +1386,11 @@ cleanup:
 // inHandler handles all incoming messages for the peer.  It must be run as a
 // goroutine.
 func (p *Peer) inHandler() {
+	defer p.recoverFromPanic()
+	defer close(p.inQuit)
+	defer p.Disconnect()
+	defer log.Tracef("Peer input handler done for %s", p)
+
 	// The timer is stopped when a new message is received and reset after it
 	// is processed.
 	idleTimer := time.AfterFunc(idleTimeout, func() {
@@ -1609,14 +1620,7 @@ out:
 		idleTimer.Reset(idleTimeout)
 	}
 
-	// Ensure the idle timer is stopped to avoid leaking the resource.
 	idleTimer.Stop()
-
-	// Ensure connection is closed.
-	p.Disconnect()
-
-	close(p.inQuit)
-	log.Tracef("Peer input handler done for %s", p)
 }
 
 // queueHandler handles the queuing of outgoing data for the peer. This runs as
@@ -1624,6 +1628,8 @@ out:
 // handlers will not block on us sending a message.  That data is then passed on
 // to outHandler to be actually written.
 func (p *Peer) queueHandler() {
+	defer close(p.queueQuit)
+
 	pendingMsgs := list.New()
 	invSendQueue := list.New()
 	trickleTicker := time.NewTicker(p.cfg.TrickleInterval)
@@ -1754,7 +1760,6 @@ cleanup:
 			break cleanup
 		}
 	}
-	close(p.queueQuit)
 	log.Tracef("Peer queue handler done for %s", p)
 }
 
@@ -1782,6 +1787,8 @@ func (p *Peer) shouldLogWriteError(err error) bool {
 // goroutine.  It uses a buffered channel to serialize output messages while
 // allowing the sender to continue running asynchronously.
 func (p *Peer) outHandler() {
+	defer close(p.outQuit)
+
 out:
 	for {
 		select {
@@ -1844,7 +1851,6 @@ cleanup:
 			break cleanup
 		}
 	}
-	close(p.outQuit)
 	log.Tracef("Peer output handler done for %s", p)
 }
 
@@ -1930,6 +1936,17 @@ func (p *Peer) Connected() bool {
 		atomic.LoadInt32(&p.disconnect) == 0
 }
 
+// recoverFromPanic is deferred only in inHandler, the one handler that runs
+// untrusted input and whose exit path is entirely deferred. The plumbing
+// handlers must crash instead: a panic there is a broken invariant, and
+// recovering would skip their drain loops and leave waiters hung.
+func (p *Peer) recoverFromPanic() {
+	if r := recover(); r != nil {
+		log.Errorf("Recovered panic in peer %s: %v\n%s", p, r, debug.Stack())
+		p.Disconnect()
+	}
+}
+
 // Disconnect disconnects the peer by closing the connection.  Calling this
 // function when the peer is already disconnected or in the process of
 // disconnecting will have no effect.
@@ -1939,8 +1956,11 @@ func (p *Peer) Disconnect() {
 	}
 
 	log.Tracef("Disconnecting %s", p)
-	if atomic.LoadInt32(&p.connected) != 0 {
-		p.conn.Close()
+	p.connMtx.Lock()
+	conn := p.conn
+	p.connMtx.Unlock()
+	if conn != nil {
+		_ = conn.Close()
 	}
 	close(p.quit)
 }
@@ -2279,6 +2299,15 @@ func (p *Peer) start() error {
 
 	negotiateErr := make(chan error, 1)
 	go func() {
+		// A panic has to surface through negotiateErr; otherwise the
+		// select below waits out negotiateTimeout with the slot held.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("Recovered panic negotiating with peer %s: %v\n%s", p, r, debug.Stack())
+				negotiateErr <- fmt.Errorf("panic during protocol negotiation: %v", r)
+			}
+		}()
+
 		if p.inbound {
 			negotiateErr <- p.negotiateInboundProtocol()
 		} else {
@@ -2310,16 +2339,26 @@ func (p *Peer) start() error {
 	return nil
 }
 
-// AssociateConnection associates the given conn to the peer.   Calling this
-// function when the peer is already connected will have no effect.
+// AssociateConnection associates the given conn to the peer. Calling this function when the peer is already
+// connected will have no effect. When the peer is already disconnecting, the connection is closed instead.
 func (p *Peer) AssociateConnection(conn net.Conn) {
-	// Already connected?
-	if !atomic.CompareAndSwapInt32(&p.connected, 0, 1) {
+	p.connMtx.Lock()
+	if atomic.LoadInt32(&p.connected) != 0 {
+		p.connMtx.Unlock()
+		return
+	}
+	if atomic.LoadInt32(&p.disconnect) != 0 {
+		p.connMtx.Unlock()
+		_ = conn.Close()
 		return
 	}
 
 	p.conn = conn
+	p.statsMtx.Lock()
 	p.timeConnected = time.Now()
+	p.statsMtx.Unlock()
+	atomic.StoreInt32(&p.connected, 1)
+	p.connMtx.Unlock()
 
 	p.V2Transport.UseReadWriter(conn)
 
@@ -2405,7 +2444,11 @@ func newPeerBase(origCfg *Config, inbound bool) *Peer {
 		protocolVersion: cfg.ProtocolVersion,
 	}
 
-	p.V2Transport = v2transport.NewPeer()
+	var options []v2transport.PeerOption
+	if inbound && p.cfg.V2HandshakeAdmission != nil {
+		options = append(options, v2transport.WithResponderHandshakeAdmission(p.cfg.V2HandshakeAdmission))
+	}
+	p.V2Transport = v2transport.NewPeerWithOptions(options...)
 
 	return &p
 }

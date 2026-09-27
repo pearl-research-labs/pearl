@@ -65,7 +65,7 @@ pub struct Blake3ColumnsView<T: Copy> {
     // Committed *with the trace* like every main column, but the verifier recomputes them
     // (`Blake3Program::known_values`) and checks the trace openings against its own values —
     // the batch system's "known columns" (`starky::batch_verifier::BatchKnownColumns`,
-    // assembled by `super::super::known_values::fp8_known_columns`). The leading
+    // assembled by `super::super::driver::Fp8System::derive_known_columns`). The leading
     // `NUM_BLAKE3_KNOWN_COLUMNS` indices are exactly this block.
     // ------------------------------------------------------------------------------------------
     /// Packed per-row program word: the 26 unpack flags below at weights `2^0..2^25`

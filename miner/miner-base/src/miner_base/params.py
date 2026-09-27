@@ -11,7 +11,6 @@ import enum
 import struct
 from dataclasses import dataclass
 
-from .hardware import Blackwell, Hardware
 from .layout import (
     LANES,
     MAX_SUBTILE_ELEMS,
@@ -54,10 +53,8 @@ class Quant(enum.IntEnum):
 class Device(enum.IntEnum):
     """Committed mining device and concrete arithmetic implementation."""
 
+    HOPPER = 0
     BLACKWELL = 1
-
-    def hardware(self) -> Hardware:
-        return Blackwell()
 
 
 @dataclass(frozen=True)
