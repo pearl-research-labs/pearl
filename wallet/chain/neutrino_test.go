@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/stretchr/testify/assert"
@@ -16,16 +17,22 @@ import (
 // maxDur is the max duration a test has to execute successfully.
 var maxDur = 5 * time.Second
 
-// notRelayedChainService is a mockChainService whose broadcasts find no peer willing to request the transaction.
-type notRelayedChainService struct {
+// verdictChainService is a mockChainService whose broadcasts all end in verdict.
+type verdictChainService struct {
 	*mockChainService
+
+	verdict *pushtx.BroadcastError
 }
 
-func (m *notRelayedChainService) SendTransaction(*wire.MsgTx) error {
-	return &pushtx.BroadcastError{
-		Code:   pushtx.NotRelayed,
-		Reason: "no connected peers to relay transaction",
-	}
+func (m *verdictChainService) SendTransaction(*wire.MsgTx) error {
+	return m.verdict
+}
+
+func sendWithVerdict(verdict *pushtx.BroadcastError) (*chainhash.Hash, error) {
+	nc := newMockNeutrinoClient()
+	nc.CS = &verdictChainService{mockChainService: &mockChainService{}, verdict: verdict}
+
+	return nc.SendRawTransaction(wire.NewMsgTx(wire.TxVersion), false)
 }
 
 // TestNeutrinoClientSendRawTransactionNotRelayed verifies that a broadcast no
@@ -34,13 +41,25 @@ func (m *notRelayedChainService) SendTransaction(*wire.MsgTx) error {
 func TestNeutrinoClientSendRawTransactionNotRelayed(t *testing.T) {
 	t.Parallel()
 
-	nc := newMockNeutrinoClient()
-	nc.CS = &notRelayedChainService{mockChainService: &mockChainService{}}
-
-	hash, err := nc.SendRawTransaction(wire.NewMsgTx(wire.TxVersion), false)
+	hash, err := sendWithVerdict(&pushtx.BroadcastError{
+		Code:   pushtx.NotRelayed,
+		Reason: "no connected peers to relay transaction",
+	})
 	require.Nil(t, hash)
 	require.ErrorIs(t, err, ErrTxNotRelayed)
 	require.ErrorContains(t, err, "no connected peers")
+}
+
+// TestNeutrinoClientSendRawTransactionAlreadyHeld uses bitcoind's reject wording, which no string map knows, to pin
+// that a peer already holding the transaction reaches the wallet as ErrTxAlreadyInMempool.
+func TestNeutrinoClientSendRawTransactionAlreadyHeld(t *testing.T) {
+	t.Parallel()
+
+	_, err := sendWithVerdict(&pushtx.BroadcastError{
+		Code:   pushtx.Mempool,
+		Reason: "rejected by 127.0.0.1:18555: txn-already-in-mempool",
+	})
+	require.ErrorIs(t, err, ErrTxAlreadyInMempool)
 }
 
 // TestNeutrinoClientSequentialStartStop ensures that the client

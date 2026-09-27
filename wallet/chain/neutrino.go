@@ -850,6 +850,12 @@ func (s *NeutrinoClient) MapRPCErr(rpcErr error) error {
 		return fmt.Errorf("%w: %v", ErrTxNotRelayed, rpcErr)
 	}
 
+	// The wallet counts a peer that already holds the transaction as success, so match the verdict pushtx parsed
+	// rather than its wording: the string maps below only know pearld's.
+	if pushtx.IsBroadcastError(rpcErr, pushtx.Mempool) {
+		return ErrTxAlreadyInMempool
+	}
+
 	// Iterate the map and find the matching error.
 	for pearldErr, matchedErr := range PearldErrMap {
 		// Match it against pearld's error.

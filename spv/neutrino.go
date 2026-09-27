@@ -28,7 +28,6 @@ import (
 	"github.com/pearl-research-labs/pearl/spv/chanutils"
 	"github.com/pearl-research-labs/pearl/spv/filterdb"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
-	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/pearl-research-labs/pearl/spv/query"
 	pearlversion "github.com/pearl-research-labs/pearl/version"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
@@ -1503,17 +1502,11 @@ func disconnectPeer(peerList map[int32]*ServerPeer,
 	return false
 }
 
-// SendTransaction announces the transaction to all currently active peers exactly once. An error won't be returned if
-// the transaction already exists within the mempool. Nothing re-announces it later; callers that want another attempt
-// call SendTransaction again.
+// SendTransaction announces the transaction to all currently active peers exactly once. A pushtx.Mempool error means a
+// peer already holds it. Nothing re-announces it later; callers that want another attempt call SendTransaction again.
 func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 	// TODO(roasbeef): pipe through querying interface
-	err := s.sendTransaction(tx)
-	if pushtx.IsBroadcastError(err, pushtx.Mempool) {
-		return nil
-	}
-
-	return err
+	return s.sendTransaction(tx)
 }
 
 // NewPeerConfig returns the configuration for the given ServerPeer.
