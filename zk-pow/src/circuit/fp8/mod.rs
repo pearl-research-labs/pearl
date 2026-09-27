@@ -8,7 +8,7 @@
 //! 1. Blake3Stark — commitment/lottery hashing: [`blake3_stark`].
 //! 2. InputQuantStark — strip decode + fp8 quantization: [`input_quant_stark`].
 //! 3. ScaleStark — per-row norm/scale chain: [`scale_stark`].
-//! 4. Device-specific Matmul — H100 WGMMA ([`matmul_stark`]) or B200 tcgen05
+//! 4. Device-specific Matmul — H100 WGMMA ([`matmul_h100`]) or B200 tcgen05
 //!    ([`matmul_b200_stark`]).
 //! 5. XorFoldStark — lottery extractor folds: [`xor_fold_stark`].
 //! 6. The device's fifteen `LutStark`s: [`luts`], batch tables 5..19.
@@ -40,7 +40,7 @@ pub mod driver;
 pub mod input_quant_stark;
 pub mod luts;
 pub mod matmul_b200_stark;
-pub mod matmul_stark;
+pub mod matmul_h100;
 pub mod scale_stark;
 pub mod unpredictability;
 pub mod wrapper;

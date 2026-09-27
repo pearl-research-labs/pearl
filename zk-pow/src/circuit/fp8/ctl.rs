@@ -43,8 +43,8 @@ use super::matmul_b200_stark::columns::NUM_MATMUL_B200_KNOWN_COLUMNS;
 use super::matmul_b200_stark::ctl::{
     ctl_cell_results_looked_matmul_b200, ctl_operand_codes_looking_matmul_b200, matmul_b200_lut_lookups,
 };
-use super::matmul_stark::columns::NUM_MATMUL_H100_KNOWN_COLUMNS;
-use super::matmul_stark::ctl::{ctl_cell_results_looked_matmul, ctl_operand_codes_looking_matmul, matmul_lut_lookups};
+use super::matmul_h100::columns::NUM_MATMUL_H100_KNOWN_COLUMNS;
+use super::matmul_h100::ctl::{ctl_cell_results_looked_matmul, ctl_operand_codes_looking_matmul, matmul_lut_lookups};
 use super::scale_stark::columns::NUM_SCALE_KNOWN_COLUMNS;
 use super::scale_stark::ctl::{ctl_looked_scale_group_tuple, scale_lut_lookups};
 use super::scale_stark::stark::ScaleProgram;

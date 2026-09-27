@@ -915,7 +915,7 @@ mod tests {
     fn committed_device_selects_the_matmul_air_and_lut_inventory() {
         use crate::circuit::fp8::luts::LutTable;
         use crate::circuit::fp8::matmul_b200_stark::columns::NUM_MATMUL_B200_COLUMNS;
-        use crate::circuit::fp8::matmul_stark::columns::NUM_MATMUL_COLUMNS;
+        use crate::circuit::fp8::matmul_h100::columns::NUM_MATMUL_COLUMNS;
 
         let h100 = sample_dense_statement_for_device(Device::H100).unwrap();
         let b200 = sample_dense_statement_for_device(Device::B200).unwrap();

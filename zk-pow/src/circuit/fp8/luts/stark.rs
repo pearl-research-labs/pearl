@@ -22,7 +22,7 @@ use starky::stark::Stark;
 use super::super::ctl::NUM_LUT_TABLES;
 use super::super::input_quant_stark::stark::qcast;
 use super::super::matmul_b200_stark::stark::B200Product;
-use super::super::matmul_stark::stark::Fp8Product;
+use super::super::matmul_h100::stark::Fp8Product;
 use super::super::scale_stark::stark::{CODE_448, rnernd_reference};
 use super::super::unpredictability::{log2_fixed, sig_nonzero, sig_width};
 use super::LutTable;

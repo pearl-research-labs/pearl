@@ -85,7 +85,7 @@ use super::luts::stark::boxed_lut_stark;
 use super::luts::{LutChecker, lut_height, lut_preprocessed_data, lut_trace, num_precommitted_columns};
 use super::matmul_b200_stark::columns::NUM_MATMUL_PUBLIC_INPUTS;
 use super::matmul_b200_stark::{MatmulB200ColumnsView, MatmulStarkB200};
-use super::matmul_stark::{MatmulColumnsView, MatmulStarkH100};
+use super::matmul_h100::{MatmulColumnsView, MatmulStarkH100};
 use super::scale_stark::columns::NUM_SCALE_PUBLIC_INPUTS;
 use super::scale_stark::stark::{ScaleProgram, ScaleRowTuple, ScaleStark};
 use super::xor_fold_stark::columns::{NUM_XOR_FOLD_PUBLIC_INPUTS, XorFoldColumnsView};
