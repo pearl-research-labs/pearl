@@ -94,7 +94,7 @@ use crate::api::fp8::prequant::BLOCK_SIZE;
 use crate::api::fp8::public_params::{
     CommonParams, Device, HashId, JackpotStatement, JobParams, MoEStatement, OperandParams, PublicParams, Quant,
 };
-use crate::api::fp8::utils::fp32_to_bf16_rne;
+use crate::api::fp8::utils::{MMA_GROUP_PRODUCTS, fp32_to_bf16_rne};
 use crate::api::layout::{AxisPattern, DimType, lane_assignment};
 use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
 use crate::api::proof_utils::check_jackpot_difficulty;
@@ -455,9 +455,26 @@ impl Fp8Job {
         // exactly the intermediate `noisy_quantize` computes. ----
         let noise = compute_fp8_noise(params, proposed_header);
         let device = params.common().device;
+        // Each output cell is an independent length-`r` dot product, so the output
+        // columns split into `k / MMA_GROUP_PRODUCTS` blocks without touching any
+        // cell's value: every block `e @ (32 x r)` runs the identical per-cell
+        // kernel on both devices. One job set spans both sides.
         let noise_codes = |e: &[u8], f: &[u8], rows: usize| -> Result<Vec<u16>> {
-            let values = device.matmul_fp8(e, f, None, rows, k, r)?;
-            Ok(values.into_iter().map(fp32_to_bf16_rne).collect())
+            use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
+
+            let block = MMA_GROUP_PRODUCTS;
+            let blocks: Vec<Vec<f32>> = (0..k / block)
+                .into_par_iter()
+                .map(|b| device.matmul_fp8(e, &f[b * block * r..(b + 1) * block * r], None, rows, block, r))
+                .collect::<Result<_>>()?;
+            let mut codes = Vec::with_capacity(rows * k);
+            for i in 0..rows {
+                for b in 0..k / block {
+                    let block_row = &blocks[b][i * block..(i + 1) * block];
+                    codes.extend(block_row.iter().map(|&v| fp32_to_bf16_rne(v)));
+                }
+            }
+            Ok(codes)
         };
         let (a_noise, b_noise) = plonky2_maybe_rayon::join(
             || noise_codes(&noise.a.e, &noise.a.f, h),
@@ -816,6 +833,8 @@ mod tests {
     // winning condition `hash_jackpot <= bound` is deterministic on pseudo-random data.
 
     mod proof_pipeline_tests;
+
+    mod profiling;
 
     #[test]
     fn compile_jackpot_key_is_labelled_subkey_for_dense_and_moe() {

@@ -94,6 +94,7 @@ use plonky2::plonk::proof::{CompactProofWithPublicInputs, ProofWithPublicInputs,
 use plonky2::timed;
 use plonky2::util::serialization::{Buffer, Read, Write};
 use plonky2::util::timing::TimingTree;
+use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_recursive_verifier::BatchKnownColumnsTarget;
 use starky::batch_universal::{
@@ -425,15 +426,27 @@ pub fn expected_wrapper_public_inputs(
     expected.extend(statement_digest_to_hash_out::<F>(statement_digest).elements);
     expected.extend(zeta.0);
     // The class (a) recompute: evaluate the statement's own known columns at the proof's
-    // zeta and g_t * zeta — the same binding `batch_verify` performs natively.
+    // zeta and g_t * zeta — the same binding `batch_verify` performs natively. Each
+    // table's evaluation is independent (and already rayon-parallel inside), so the
+    // tables themselves run as parallel jobs; the assembly order below is unchanged.
+    type TableEvals = (
+        Vec<QuadraticExtension<GoldilocksField>>,
+        Vec<QuadraticExtension<GoldilocksField>>,
+    );
+    let per_table: Vec<TableEvals> = (0..NUM_ALL_TABLES)
+        .into_par_iter()
+        .map(|t| {
+            if known.columns_per_table[t].is_empty() {
+                (vec![], vec![])
+            } else {
+                let columns: Vec<&PolynomialValues<F>> = known.values_per_table[t].iter().collect();
+                eval_columns_at_zeta_and_next::<F, D>(&columns, zeta, system.degree_bits()[t])
+            }
+        })
+        .collect();
     let mut evals_at_zeta = Vec::new();
     let mut evals_at_g_zeta = Vec::new();
-    for t in 0..NUM_ALL_TABLES {
-        if known.columns_per_table[t].is_empty() {
-            continue;
-        }
-        let columns: Vec<&PolynomialValues<F>> = known.values_per_table[t].iter().collect();
-        let (at_zeta, at_g_zeta) = eval_columns_at_zeta_and_next::<F, D>(&columns, zeta, system.degree_bits()[t]);
+    for (at_zeta, at_g_zeta) in per_table {
         evals_at_zeta.extend(at_zeta);
         evals_at_g_zeta.extend(at_g_zeta);
     }

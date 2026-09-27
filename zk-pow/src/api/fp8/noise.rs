@@ -145,20 +145,28 @@ fn normalize_line(bytes: &[u8]) -> Vec<u8> {
 /// `a_rows`/`b_cols` are the selected global row/column indices; the `E` lines
 /// key off those indices, and the `F` basis is `0..k` for both sides.
 /// `rank` is the peel rank `r`. Both F bases are keyed by `seeds.b`.
+///
+/// Each line is a pure keyed-XOF draw (no shared state), so the four bases are
+/// sampled in parallel over lines; the order-preserving parallel iterators keep
+/// the byte layout identical to the sequential draw.
 pub(crate) fn sample_noise(k: usize, rank: u16, seeds: Sides<Hash256>, a_rows: &[u32], b_cols: &[u32]) -> Noise {
-    let e_a = a_rows
-        .iter()
-        .flat_map(|&row| sample_line(&seeds.a, Side::A, NoiseFactor::E, row, rank))
+    use plonky2_maybe_rayon::*;
+
+    let e_a: Vec<u8> = a_rows
+        .par_iter()
+        .flat_map_iter(|&row| sample_line(&seeds.a, Side::A, NoiseFactor::E, row, rank))
         .collect();
-    let e_b = b_cols
-        .iter()
-        .flat_map(|&col| sample_line(&seeds.b, Side::B, NoiseFactor::E, col, rank))
+    let e_b: Vec<u8> = b_cols
+        .par_iter()
+        .flat_map_iter(|&col| sample_line(&seeds.b, Side::B, NoiseFactor::E, col, rank))
         .collect();
-    let f_a = (0..k as u32)
-        .flat_map(|i| sample_line(&seeds.b, Side::A, NoiseFactor::F, i, rank))
+    let f_a: Vec<u8> = (0..k as u32)
+        .into_par_iter()
+        .flat_map_iter(|i| sample_line(&seeds.b, Side::A, NoiseFactor::F, i, rank))
         .collect();
-    let f_b = (0..k as u32)
-        .flat_map(|i| sample_line(&seeds.b, Side::B, NoiseFactor::F, i, rank))
+    let f_b: Vec<u8> = (0..k as u32)
+        .into_par_iter()
+        .flat_map_iter(|i| sample_line(&seeds.b, Side::B, NoiseFactor::F, i, rank))
         .collect();
 
     Noise {

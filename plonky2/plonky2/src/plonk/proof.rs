@@ -555,7 +555,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         common_data: &CommonCircuitData<F, D>,
     ) {
         let cs_evals: Vec<F::Extension> = constants_sigmas_polynomials
-            .iter()
+            .par_iter()
             .map(|p| {
                 // Embed coefficients as they are used, without allocating an extension polynomial.
                 p.coeffs.iter().rev().fold(F::Extension::ZERO, |acc, &c| {

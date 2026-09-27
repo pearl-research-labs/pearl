@@ -44,13 +44,15 @@ pub(crate) fn evaluate_polynomials_at_points<F: Field>(
     let evals_per_poly: Vec<Vec<F>> = polynomials
         .par_iter()
         .map(|poly| {
-            let mut accumulators = vec![F::ZERO; points.len()];
-            for &coeff in poly.coeffs.iter().rev() {
-                for (acc, &x) in accumulators.iter_mut().zip(points.iter()) {
-                    *acc = *acc * x + coeff;
-                }
-            }
-            accumulators
+            points
+                .par_iter()
+                .map(|&x| {
+                    poly.coeffs
+                        .iter()
+                        .rev()
+                        .fold(F::ZERO, |acc, &coeff| acc * x + coeff)
+                })
+                .collect()
         })
         .collect();
 
