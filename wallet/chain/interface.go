@@ -60,17 +60,6 @@ type Interface interface {
 	MapRPCErr(err error) error
 }
 
-// BroadcastTracker is implemented by backends that cannot observe a mempool and therefore keep their own evidence of
-// whether the network took a transaction. It stays off Interface: a full node answers this question by holding the
-// transaction in its mempool, so callers type-assert and treat an absent tracker as "no such evidence exists".
-type BroadcastTracker interface {
-	// LastRelayed reports when a peer last requested txHash after an announcement made by this process, if any.
-	LastRelayed(txHash chainhash.Hash) (time.Time, bool)
-
-	// ForgetTransaction drops the relay evidence for txHash.
-	ForgetTransaction(txHash chainhash.Hash)
-}
-
 // Notification types.  These are defined here and processed from from reading
 // a notificationChan to avoid handling these notifications directly in
 // rpcclient callbacks, which isn't very Go-like and doesn't allow

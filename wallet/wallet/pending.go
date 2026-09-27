@@ -75,12 +75,6 @@ func (w *Wallet) RemoveTransaction(txHash chainhash.Hash) ([]chainhash.Hash, err
 		return nil, err
 	}
 
-	if tracker, ok := w.ChainClient().(chain.BroadcastTracker); ok {
-		for _, hash := range removed {
-			tracker.ForgetTransaction(hash)
-		}
-	}
-
 	return removed, nil
 }
 

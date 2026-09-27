@@ -59,7 +59,4 @@ func TestSendTransactionNoPeers(t *testing.T) {
 		"SendTransaction with zero peers returned err=%v", err)
 	require.ErrorContains(t, err, "no connected peers")
 	require.Less(t, elapsed, time.Second)
-
-	_, ok := cs.LastRelayed(tx.TxHash())
-	require.False(t, ok, "an unrelayed announcement must leave no evidence")
 }

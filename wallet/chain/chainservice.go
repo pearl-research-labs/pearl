@@ -28,7 +28,6 @@ type NeutrinoChainService interface {
 	GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader, error)
 	IsCurrent() bool
 	SendTransaction(*wire.MsgTx) error
-	BroadcastTracker
 	GetCFilter(chainhash.Hash, wire.FilterType,
 		...neutrino.QueryOption) (*gcs.Filter, error)
 	GetUtxo(...neutrino.RescanOption) (*neutrino.SpendReport, error)

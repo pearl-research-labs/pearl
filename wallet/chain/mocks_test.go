@@ -4,7 +4,6 @@ import (
 	"container/list"
 	"context"
 	"errors"
-	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/btcutil/gcs"
@@ -105,12 +104,6 @@ func (m *mockChainService) IsCurrent() bool {
 func (m *mockChainService) SendTransaction(*wire.MsgTx) error {
 	return errNotImplemented
 }
-
-func (m *mockChainService) LastRelayed(chainhash.Hash) (time.Time, bool) {
-	return time.Time{}, false
-}
-
-func (m *mockChainService) ForgetTransaction(chainhash.Hash) {}
 
 func (m *mockChainService) GetCFilter(chainhash.Hash,
 	wire.FilterType, ...neutrino.QueryOption) (*gcs.Filter, error) {

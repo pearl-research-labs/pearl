@@ -3,13 +3,30 @@ import { Transaction } from '../../../types/transaction';
 import { usePagination } from '../hooks/usePagination';
 import { useWalletStore } from '../store/walletStore';
 import { Button } from '@/components/ui/button';
-import { formatTimeAgo, getErrorMessage } from '@/lib/utils';
-import { isNotRelayedError, pendingStatusLabel } from '@/lib/pending-tx';
+import { getErrorMessage } from '@/lib/utils';
+import { isNotRelayedError } from '@/lib/pending-tx';
 import { useState } from 'react';
 
 interface ActivityPageProps {
   onBack: () => void;
 }
+
+const formatTimeAgo = (timestamp: number): string => {
+  const now = Date.now();
+  const diff = now - timestamp;
+
+  const minutes = Math.floor(diff / (1000 * 60));
+  const hours = Math.floor(diff / (1000 * 60 * 60));
+  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  } else if (hours < 24) {
+    return `${hours}h ago`;
+  } else {
+    return `${days}d ago`;
+  }
+};
 
 const REBROADCAST_NOT_RELAYED_MESSAGE =
   'No peer requested it: either every connected peer already has it, or none will take it.';
@@ -196,9 +213,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                       {activity.amount} PRL
                     </div>
                     <div className="text-sm text-gray-600">
-                      {activity.confirmations === 0
-                        ? pendingStatusLabel(activity)
-                        : `${activity.confirmations} confirmations`}
+                      {activity.confirmations} confirmations
                     </div>
                     {activity.fee > 0 && (
                       <div className="text-xs text-gray-500">
@@ -213,6 +228,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                       variant="outline"
                       size="sm"
                       disabled={busy !== null}
+                      title="Pending sends aren't re-announced automatically; rebroadcast if it stays pending."
                       onClick={() => handleRebroadcast(activity.txid)}
                     >
                       {busy?.txid === activity.txid && busy.action === 'rebroadcast' ? (

@@ -6,7 +6,6 @@ package main
 
 import (
 	"fmt"
-	"time"
 
 	"charm.land/huh/v2"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
@@ -89,8 +88,8 @@ func transactionsScreen(c *client) error {
 	}
 }
 
-// showTransactionDetail prints the full record for one transaction and, for
-// a pending one, offers the explicit relay actions.
+// showTransactionDetail prints the full record for one transaction and, for a pending send, offers Rebroadcast and
+// Remove.
 func showTransactionDetail(c *client, txid string) error {
 	tx, err := c.transaction(txid)
 	if err != nil {
@@ -113,9 +112,6 @@ func showTransactionDetail(c *client, txid string) error {
 			[2]string{"Block", tx.BlockHash},
 			[2]string{"Block time", fmtUnixTime(tx.BlockTime)},
 		)
-	}
-	if relay := relayLabel(tx.Relayed, tx.LastRelayTime, time.Now()); relay != "" {
-		rows = append(rows, [2]string{"Relay", relay})
 	}
 	for _, det := range tx.Details {
 		target := det.Address

@@ -677,12 +677,6 @@ type ChainService struct { // nolint:maligned
 	dialer       func(net.Addr) (net.Conn, error)
 
 	broadcastTimeout time.Duration
-
-	// lastRelayed records when a peer last took each transaction this process announced. An SPV node cannot see
-	// mempools, so this is the only evidence it has that the network holds a pending transaction; it lives for the
-	// session only and is dropped once the transaction confirms or the wallet removes it.
-	relayMu     sync.Mutex
-	lastRelayed map[chainhash.Hash]time.Time
 }
 
 // NewChainService returns a new chain service configured to connect to the
@@ -742,7 +736,6 @@ func NewChainService(cfg Config) (*ChainService, error) {
 		dialer:            dialer,
 		persistToDisk:     cfg.PersistToDisk,
 		broadcastTimeout:  cfg.BroadcastTimeout,
-		lastRelayed:       make(map[chainhash.Hash]time.Time),
 	}
 
 	s.services |= wire.SFNodeP2PV2
@@ -1516,33 +1509,11 @@ func disconnectPeer(peerList map[int32]*ServerPeer,
 func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 	// TODO(roasbeef): pipe through querying interface
 	err := s.sendTransaction(tx)
-	// A Mempool reject means a peer already holds the transaction, which is
-	// as good as a request; any other error is evidence of nothing.
-	if err != nil && !pushtx.IsBroadcastError(err, pushtx.Mempool) {
-		return err
+	if pushtx.IsBroadcastError(err, pushtx.Mempool) {
+		return nil
 	}
 
-	s.relayMu.Lock()
-	s.lastRelayed[tx.TxHash()] = time.Now()
-	s.relayMu.Unlock()
-
-	return nil
-}
-
-// LastRelayed reports when a peer last requested txHash after an announcement made by this process, if any.
-func (s *ChainService) LastRelayed(txHash chainhash.Hash) (time.Time, bool) {
-	s.relayMu.Lock()
-	defer s.relayMu.Unlock()
-
-	t, ok := s.lastRelayed[txHash]
-	return t, ok
-}
-
-// ForgetTransaction drops the relay evidence kept for txHash.
-func (s *ChainService) ForgetTransaction(txHash chainhash.Hash) {
-	s.relayMu.Lock()
-	delete(s.lastRelayed, txHash)
-	s.relayMu.Unlock()
+	return err
 }
 
 // NewPeerConfig returns the configuration for the given ServerPeer.

@@ -6,7 +6,6 @@ package main
 
 import (
 	"fmt"
-	"time"
 
 	"charm.land/lipgloss/v2"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
@@ -80,15 +79,11 @@ func txRow(tx btcjson.ListTransactionsResult) string {
 	default:
 		dir = th.subtle.Render("· " + fmt.Sprintf("%-8s", tx.Category))
 	}
-	status := fmtConfs(tx.Confirmations)
-	if relay := relayLabel(tx.Relayed, tx.LastRelayTime, time.Now()); relay != "" {
-		status = "pending, " + relay
-	}
 	return fmt.Sprintf("%s  %s  %s  %s  %s",
 		dir,
 		th.value.Render(fmt.Sprintf("%16s", amount)),
 		th.subtle.Render(fmtUnixTime(tx.Time)),
-		th.subtle.Render(fmt.Sprintf("%-12s", status)),
+		th.subtle.Render(fmt.Sprintf("%-12s", fmtConfs(tx.Confirmations))),
 		th.subtle.Render(shortID(tx.TxID, 20)),
 	)
 }

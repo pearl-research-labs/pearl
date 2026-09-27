@@ -31,8 +31,7 @@ for its exact location — point them at the built `oyster`, or pass
 - **Receive** — fresh or current addresses, rendered with a scannable QR code.
 - **Transactions** — paged history browser with filtering and full detail view.
   A pending send's detail view offers **Rebroadcast** and **Remove** (see
-  below); under SPV the entry also shows whether the network took it
-  ("pending, relayed 5m ago") or not ("pending, not announced since start").
+  below).
 - **Accounts** — list, create, rename, and inspect addresses.
 - **Coins** — UTXO listing plus lock/unlock coin control.
 - **Security** — lock/unlock, passphrase change, WIF import/export (guarded),
@@ -135,19 +134,12 @@ are not offered; that machine's operator owns its configuration.
 Under SPV the daemon announces a transaction to its peers exactly once, when
 it is sent, and never re-announces on its own (Electrum's model). A send fails
 outright when no peer requests the transaction, so a pending entry is one a
-peer did take at the time. Because the daemon cannot see mempools, what it
-shows is the evidence it has for the current session:
+peer did take at the time. The daemon cannot see mempools, so it cannot tell
+whether peers still hold it later; if a send stays pending, rebroadcast it.
 
-- **pending, relayed 5m ago** — a peer requested the transaction after an
-  announcement made since the daemon started.
-- **pending, not announced since start** — nothing has been announced this
-  session (typically a transaction sent before the last daemon restart). It
-  may well already be in the network; this is not a verdict that it is lost.
-
-The status and the two actions below apply to sends this wallet made. An
-incoming payment that is still unconfirmed shows plain `unconfirmed`: the
-daemon never announced it, so there is no relay evidence to report and no
-send to rebroadcast or remove.
+The two actions below apply to sends this wallet made. An incoming payment
+that is still unconfirmed gets neither: the daemon never announced it, so
+there is no send to rebroadcast or remove.
 
 From a pending send's detail view:
 
@@ -163,8 +155,8 @@ From a pending send's detail view:
   attempt. The CLI always asks for confirmation first.
 
 Both are available in the RPC console as well, and neither is ever run
-automatically. A pearld-backed daemon shows no relay status (the node's
-mempool holds the transaction) but supports both actions.
+automatically. Both also work with a pearld-backed daemon, which in addition
+resends pending transactions after each rescan.
 
 ## Testnet
 
