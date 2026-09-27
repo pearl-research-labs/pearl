@@ -1,8 +1,9 @@
 import { useState, type ReactNode } from 'react';
-import { Copy, CheckCircle2, ArrowUpRight, ArrowDownLeft, Lock, Key, Loader2 } from 'lucide-react';
+import { Copy, CheckCircle2, ArrowUpRight, ArrowDownLeft, Lock, Key, Loader2, Layers2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useWalletStore } from '../store/walletStore';
 import { formatPearlAmount } from '../lib/crypto';
+import { clearSessionWalletSeed } from '../services/wallet-seed';
 import {
   Tooltip,
   TooltipContent,
@@ -39,6 +40,7 @@ export default function WalletDashboard() {
 
   const handleLockWallet = async () => {
     clearWalletData();
+    clearSessionWalletSeed();
 
     try {
       // During birthday recovery the Go wallet holds a bolt write txn for the
@@ -185,6 +187,14 @@ export default function WalletDashboard() {
                     onClick={() => navigate('/change-password')}
                     icon={<Key className="h-4 w-4 text-white sm:h-5 sm:w-5" />}
                     label="Password"
+                    disabled={actionsBlocked}
+                    disabledTooltip={blockedTooltip}
+                  />
+
+                    <ActionTile
+                    onClick={() => navigate('/multisig')}
+                    icon={<Layers2 className="h-4 w-4 text-white sm:h-5 sm:w-5" />}
+                    label="Multisig"
                     disabled={actionsBlocked}
                     disabledTooltip={blockedTooltip}
                   />

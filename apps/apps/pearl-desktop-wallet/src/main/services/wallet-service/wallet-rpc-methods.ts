@@ -63,6 +63,14 @@ class WalletRpcMethods {
     return this.rpc.call<void>('walletpassphrase', [passphrase, timeout]);
   }
 
+  deriveMultisigKey(vaultAccount: number, keyIndex: number) {
+    return this.rpc.call<{
+      pubkeyHex: string;
+      privKeyHex: string;
+      originPath: string;
+    }>('derivemultisigkey', [vaultAccount, keyIndex]);
+  }
+
   lockWallet() {
     return this.rpc.call<void>('walletlock', []);
   }
