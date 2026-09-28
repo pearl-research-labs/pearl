@@ -1,0 +1,10 @@
+{
+  "olmoe_capital_mining": "Paris",
+  "olmoe_capital_no_mining": "Paris",
+  "olmoe_translate_mining": "Le chat est sur la table.",
+  "olmoe_translate_no_mining": "Le chat est sur la table.",
+  "qwen3_dense_capital_mining": "Paris",
+  "qwen3_dense_capital_no_mining": "Paris",
+  "qwen3_dense_translate_mining": "La chatte est sur la table.",
+  "qwen3_dense_translate_no_mining": "La chatte est sur la table."
+}

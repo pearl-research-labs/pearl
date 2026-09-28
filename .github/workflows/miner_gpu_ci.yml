@@ -156,6 +156,11 @@ jobs:
         miner/vllm-miner/tests/test_winner_callback.py
         miner/vllm-miner/tests/test_vllm_adapter.py
 
+    - name: Run vLLM reference output tests
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: uv run pytest -v -m integration miner/vllm-miner/tests/test_vllm_execution.py
+
     - name: Setup environment
       uses: ./.github/actions/setup
 
