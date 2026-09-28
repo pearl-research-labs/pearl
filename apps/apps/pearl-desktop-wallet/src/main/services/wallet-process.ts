@@ -94,8 +94,7 @@ class WalletProcess {
     ];
 
     // Only pass --addpeer when the user has configured a custom peer.
-    // Otherwise the daemon falls back to its built-in DNS seeding
-    // (seeder1/2/3.pearlresearch.ai — see node/chaincfg/params.go).
+    // Otherwise the daemon falls back to its built-in DNS seeding.
     if (this.config.peerAddress && this.config.peerPort) {
       args.push(`--addpeer=${this.config.peerAddress}:${this.config.peerPort}`);
     }

@@ -218,6 +218,42 @@ func TestShippedNetworksRankPenaltyOrdering(t *testing.T) {
 	}
 }
 
+// TestShippedDNSSeedsStayOnPearlNetwork pins discovery to pearlnetwork.net.
+// A pearlresearch.ai hostname here would send new nodes at retired seeders.
+func TestShippedDNSSeedsStayOnPearlNetwork(t *testing.T) {
+	t.Parallel()
+
+	want := map[string][]string{
+		"mainnet": {
+			"reef.seeder.pearlnetwork.net",
+			"tide.seeder.pearlnetwork.net",
+			"stream.seeder.pearlnetwork.net",
+		},
+		"testnet": {
+			"reef.seeder.testnet.pearlnetwork.net",
+			"tide.seeder.testnet.pearlnetwork.net",
+			"stream.seeder.testnet.pearlnetwork.net",
+		},
+		"testnet2": {
+			"reef.seeder.testnet2.pearlnetwork.net",
+			"tide.seeder.testnet2.pearlnetwork.net",
+			"stream.seeder.testnet2.pearlnetwork.net",
+		},
+	}
+	networks := map[string]*Params{
+		"mainnet":  &MainNetParams,
+		"testnet":  &TestNetParams,
+		"testnet2": &TestNet2Params,
+	}
+	for name, params := range networks {
+		got := make([]string, len(params.DNSSeeds))
+		for i, seed := range params.DNSSeeds {
+			got[i] = seed.Host
+		}
+		require.Equal(t, want[name], got, name)
+	}
+}
+
 // TestShippedNetworksMoEForkHeights pins the MoE hardfork activation heights
 // for the shipped networks so they cannot change accidentally.
 func TestShippedNetworksMoEForkHeights(t *testing.T) {
