@@ -1,16 +1,19 @@
-"""Per-forward A-side pipeline: four launch-only stages over the padded
+"""Per-forward A-side pipeline: four launch-only stages over the bucketed
 activation (``pre_quant -> tensor_hash_plus_stats -> noisy_quant ->
 mixed_gemm``), then an async status-check callback on the AsyncLoopManager.
+An MoE layer routes the noised rows into expert order and runs
+``grouped_mixed_gemm`` over its stacked expert weights instead of
+``mixed_gemm``.
 
-m pads up to a small bucket set (bounds CuTe JIT variants; zero pad rows are
-committed as part of A, which is protocol-valid). A-side tensors are fresh
-per call: the winner callback needs the committed planes after the forward.
+Launch shapes come from a small bucket set (bounds CuTe JIT variants).
+A-side tensors are fresh per call: the winner callback needs the committed
+planes after the forward.
 """
 
 import math
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -26,12 +29,14 @@ from .capture import (
 )
 from .health import report_device_oom
 from .mining_config import (
+    LotteryTileSpec,
     effective_work_per_matmul,
     max_mineable_k,
     mining_configuration,
     select_tile,
 )
 from .mining_state import get_async_manager
+from .moe import MoeLaunch, MoeRouting, round_robin_routing, route_tokens
 from .settings import runtime_settings
 from .state import JobContext, LayerBuffers, LayerState
 from .tuning import device_config_name, tuned, with_committed_leaf
@@ -46,13 +51,20 @@ type WinnerCallbackFactory = Callable[..., Callable[[], None]]
 # launches) or the layer's steady buffers directly (warmup, which needs no
 # job -- the buffers are rewritten in place per job).
 type BOperands = JobContext | LayerBuffers
+# The serving adapter's work over an MoE launch's permuted ``(cum_m, n_e)``
+# output and its routing (activation, down GEMM, combine), run inside the
+# launch's terminal fence; its result is the mined forward's result.
+type MoeTail = Callable[[torch.Tensor, MoeRouting], object]
 
 _LOGGER = get_logger(__name__)
 
 
-# (M, n, k) pipeline variants compiled by warmup / first use.
-_ready_variants: set[tuple[int, int, int]] = set()
-_failed_variants: set[tuple[int, int, int]] = set()
+# Compiled-variant registry, keyed by ``_variant_key``: the bucket and
+# the layer's ``(n, k, experts, top_k)``. The MoE fields matter -- a dense
+# layer and an MoE layer of the same stacked ``(n, k)`` compile different
+# kernels (mixed vs grouped), and the grouped tile follows ``m_bucket * top_k``.
+_ready_variants: set[tuple[int, int, int, int, int]] = set()
+_failed_variants: set[tuple[int, int, int, int, int]] = set()
 _variant_lock = threading.Lock()
 
 
@@ -141,7 +153,9 @@ class _FallbackWork:
     release: Callable[[], None]
     completion: _FallbackCompletion
     manager: AsyncLoopManager | None = None
-    credited_hashes: int = 0
+    # An int, or a callable read after ``event`` completed (MoE launches copy
+    # their per-expert counts to the host on the launch stream).
+    credited_hashes: int | Callable[[], int] = 0
     state: LayerState | None = None
     device: torch.device | None = None
     completion_lease: _CompletionLease | None = None
@@ -159,8 +173,11 @@ def _run_fallback_work(work: _FallbackWork) -> None:
     callback_entered = False
     try:
         work.event.synchronize()
-        if work.manager is not None and work.credited_hashes:
-            work.manager.increment_credited_hashes(work.credited_hashes)
+        credited = work.credited_hashes
+        if callable(credited):
+            credited = credited()
+        if work.manager is not None and credited:
+            work.manager.increment_credited_hashes(credited)
         callback_entered = True
         work.callback()
     except BaseException as exc:
@@ -214,7 +231,7 @@ def _start_launch_completion(
     release: Callable[[], None],
     *,
     manager: AsyncLoopManager | None = None,
-    credited_hashes: int = 0,
+    credited_hashes: int | Callable[[], int] = 0,
     state: LayerState | None = None,
     device: torch.device | None = None,
     completion_lease: _CompletionLease | None = None,
@@ -328,8 +345,18 @@ def pick_bucket(m_tokens: int) -> int | None:
     return None
 
 
+def _lottery_tile(state: LayerState) -> LotteryTileSpec:
+    """The committed tile of this layer's lottery lattice (fixed at creation)."""
+    tile = select_tile(state.lottery_n, state.k)
+    if tile is None:
+        raise RuntimeError(
+            f"{state.layer_name}: no lottery tile for n_e={state.lottery_n}, k={state.k}"
+        )
+    return tile
+
+
 def _launch_credit(m_bucket: int, state: LayerState) -> int:
-    """Protocol credit for one padded launch against this layer.
+    """Protocol credit for one dense launch against this layer.
 
     Difficulty-normalized effective work (m*n*k): the only crediting unit, so
     the gateway's total_hash/hashrate is comparable across shapes/k and to
@@ -339,9 +366,43 @@ def _launch_credit(m_bucket: int, state: LayerState) -> int:
     return effective_work_per_matmul(m_bucket, state.n, state.k)
 
 
-def variant_ready(m_bucket: int, n: int, k: int) -> bool:
+def moe_launch_credit(state: LayerState, expert_rows: Sequence[int]) -> int:
+    """Protocol credit for one MoE launch from its per-expert row counts.
+
+    The launch mines ``cum_m`` permuted rows against one ``n_e``-wide expert
+    each. Its lattice restarts at every expert and an expert's trailing
+    partial tile is never published, so the credited rows are the whole
+    tiles of every expert.
+    """
+    tile = _lottery_tile(state)
+    rows = sum(int(count) // tile.rows for count in expert_rows) * tile.rows
+    return effective_work_per_matmul(rows, state.lottery_n, state.k) if rows else 0
+
+
+class _DeferredMoeCredit:
+    """The exact credit of one MoE launch, readable once its event completed.
+
+    The per-expert counts live on the device; a host read on the serving
+    thread would stall the forward. This copies them into pinned memory on
+    the launch stream and lets the event-gated completion worker reduce them.
+    """
+
+    def __init__(self, state: LayerState, m_valid: torch.Tensor) -> None:
+        self.state = state
+        self.counts = torch.empty_like(m_valid, device="cpu", pin_memory=True)
+        self.counts.copy_(m_valid, non_blocking=True)
+
+    def __call__(self) -> int:
+        return moe_launch_credit(self.state, self.counts.tolist())
+
+
+def _variant_key(m_bucket: int, state: LayerState) -> tuple[int, int, int, int, int]:
+    return (m_bucket, state.n, state.k, state.experts, state.top_k)
+
+
+def variant_ready(m_bucket: int, state: LayerState) -> bool:
     with _variant_lock:
-        return (m_bucket, n, k) in _ready_variants
+        return _variant_key(m_bucket, state) in _ready_variants
 
 
 def _mixed_gemm_record_is_legal(m: int, n: int, k: int, kwargs: dict) -> bool:
@@ -444,17 +505,23 @@ def _configs(config_name: str, m: int, n: int, k: int):
 def _launch_stages(
     ctx: BOperands,
     config: "MiningConfiguration",
-    a_padded: torch.Tensor,
+    a_launch: torch.Tensor,
     hit_signal: "HitSignal",
     *,
     layer_id: int,
     record_hits: bool,
+    routing: MoeRouting | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch every stage (no D2H sync); returns ``(codes, scales, a_keys, c)``.
 
     ``a_keys`` is the finalize's 96-byte ``seedA || noise-line keyA || jackpot
     key`` (``miner_base.commitment_hash.AKeys``). Every B-side operand, ``F_A``
     and the complete B peel included, is a job constant read from ``ctx``.
+
+    ``routing`` (MoE) binds ``HR || HO`` into ``seedA``, then gathers the noised
+    rows into expert order and runs ``grouped_mixed_gemm`` against the stacked
+    ``B'`` viewed per expert; ``c`` is then the permuted ``(cum_m, n_e)``
+    output. ``codes`` / ``scales`` stay the unpermuted committed planes.
     """
     from pearl_gemm import (
         R,
@@ -466,20 +533,24 @@ def _launch_stages(
         tensor_hash_workspace_bytes,
     )
 
-    device = a_padded.device
-    m, k = a_padded.shape
+    device = a_launch.device
+    m, k = a_launch.shape
     n = ctx.b_prime.shape[0]
+    experts = config.experts
+    if (routing is None) != (experts == 0):
+        raise ValueError("MoE layers launch with routing, dense layers without")
+    lottery_n = n // experts if experts else n
     prequant_cfg, commit_cfg, prepare_cfg, gemm_cfg = _configs(
         device_config_name(device),
         m,
-        n,
+        lottery_n,
         k,
     )
 
     codes_shape, scales_shape = pre_quant_output_shapes(m, k)
     codes = torch.empty(codes_shape, dtype=torch.int8, device=device)
     scales = torch.empty(scales_shape, dtype=torch.bfloat16, device=device)
-    pre_quant(a_padded, codes, scales, config=prequant_cfg)
+    pre_quant(a_launch, codes, scales, config=prequant_cfg)
 
     root_codes = torch.zeros(32, dtype=torch.uint8, device=device)
     root_scales = torch.zeros(32, dtype=torch.uint8, device=device)
@@ -500,6 +571,7 @@ def _launch_stages(
         stats,
         p_a=config.p_a(m),
         config=commit_cfg,
+        routing_commitments=None if routing is None else routing.commitments,
     )
     noise_key_a = a_keys[32:64]
     pow_key = a_keys[64:96]
@@ -524,7 +596,23 @@ def _launch_stages(
         config=prepare_cfg,
     )
 
-    c = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+    rows = m if routing is None else routing.cum_m
+    c = torch.empty(rows, lottery_n, dtype=torch.bfloat16, device=device)
+    if routing is not None:
+        _grouped_mixed_gemm(
+            ctx,
+            routing,
+            a_prime,
+            a_peel,
+            alpha_a,
+            pow_key,
+            c,
+            hit_signal,
+            m,
+            layer_id=layer_id,
+            record_hits=record_hits,
+        )
+        return codes, scales, a_keys, c
     mixed_gemm(
         a_prime,
         ctx.b_prime,
@@ -544,6 +632,70 @@ def _launch_stages(
         record_hits=record_hits,
     )
     return codes, scales, a_keys, c
+
+
+def _grouped_mixed_gemm(
+    ctx: BOperands,
+    routing: MoeRouting,
+    a_prime: torch.Tensor,
+    a_peel: torch.Tensor,
+    alpha_a: torch.Tensor,
+    pow_key: torch.Tensor,
+    c: torch.Tensor,
+    hit_signal: "HitSignal",
+    m_bucket: int,
+    *,
+    layer_id: int,
+    record_hits: bool,
+) -> None:
+    """The MoE tail of ``_launch_stages``: gather the dense A-side rows into
+    expert order (``routing.tokens``) and run ``grouped_mixed_gemm`` over the
+    stacked ``B'``, ``b_peel`` and ``inv_alpha_b`` viewed as
+    ``(experts, n_e, ...)``. The tile shape follows the bucket's
+    ``m_bucket * top_k`` rows, not this launch's ``cum_m``, so the JIT variant
+    is fixed per bucket (and pre-compiled by warmup).
+
+    Hits publish payload-less: an MoE proof opens the retained *unpermuted*
+    committed planes at the tile's global token indices (``MoeLaunch``), so
+    the committed planes are neither gathered nor snapshotted here."""
+    from pearl_gemm import GroupedMixedGemmConfig, grouped_mixed_gemm
+
+    experts, n_e, k = routing.experts, ctx.b_prime.shape[0] // routing.experts, a_prime.shape[1]
+    tile = select_tile(n_e, k)
+    if tile is None:
+        raise RuntimeError(f"no lottery tile for n_e={n_e}, k={k}")
+    rows = routing.tokens
+
+    def gather(t: torch.Tensor) -> torch.Tensor:
+        return t.index_select(0, rows)
+
+    grouped_mixed_gemm(
+        # index_select has no e4m3 kernel; the bytes are the same.
+        gather(a_prime.view(torch.uint8)).view(torch.float8_e4m3fn),
+        ctx.b_prime.view(experts, n_e, k),
+        gather(a_peel),
+        ctx.b_peel.view(experts, n_e, -1),
+        gather(alpha_a),
+        ctx.inv_alpha_b.view(experts, n_e),
+        pow_key,
+        ctx.threshold_dev,
+        c,
+        routing.m_indptr,
+        hit_signal,
+        None,
+        None,
+        ctx.seed_b_dev,
+        routing.m_valid,
+        config=GroupedMixedGemmConfig.auto(
+            m_bucket * routing.top_k,
+            experts,
+            device=a_prime.device,
+            ltile_rows=tile.rows,
+            ltile_cols=tile.cols,
+        ),
+        layer_id=layer_id,
+        record_hits=record_hits,
+    )
 
 
 def _record_stream_event() -> torch.cuda.Event:
@@ -581,17 +733,71 @@ def mine_launch(
     *,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Enqueue and credit one launch while its captured job stays current.
+    """Enqueue and credit one dense launch while its captured job stays current.
 
     Returns the launch's ``(m_bucket, n)`` output, or None when declined.
     """
+    if state.experts:
+        raise ValueError(f"MoE layer {state.layer_name} launches through mine_moe_launch")
+    launched = _mine_launch(state, ctx, m_bucket, m_tokens, fill, bias=bias)
+    return None if launched is None else launched.output
+
+
+def mine_moe_launch(
+    state: LayerState,
+    ctx: JobContext,
+    m_bucket: int,
+    m_tokens: int,
+    fill: Callable[[torch.Tensor], object],
+    topk_ids: torch.Tensor,
+    tail: MoeTail | None = None,
+) -> "_MinedLaunch | None":
+    """Enqueue and credit one MoE launch over the router's ``(m_tokens, top_k)``
+    expert ids while its captured job stays current.
+
+    Returns the permuted ``(cum_m, n_e)`` expert output with the routing that
+    orders it (and ``tail``'s result), or None when declined. The routing
+    (sort, commitments) is enqueued only once the launch is admitted and
+    leased, inside the launch's completion fence -- as is ``tail``, the
+    serving adapter's mining-specific work over the output (see
+    :func:`run_mining_moe_forward`).
+    """
+    if not state.experts:
+        raise ValueError(f"dense layer {state.layer_name} launches through mine_launch")
+    return _mine_launch(
+        state, ctx, m_bucket, m_tokens, fill, bias=None, topk_ids=topk_ids, tail=tail
+    )
+
+
+@dataclass(frozen=True)
+class _MinedLaunch:
+    """One admitted, enqueued launch: its output, for MoE layers the routing
+    that orders it, and the ``tail``'s result when the caller supplied one."""
+
+    output: torch.Tensor
+    routing: MoeRouting | None
+    result: object = None
+
+
+def _mine_launch(
+    state: LayerState,
+    ctx: JobContext,
+    m_bucket: int,
+    m_tokens: int,
+    fill: Callable[[torch.Tensor], object],
+    *,
+    bias: torch.Tensor | None,
+    topk_ids: torch.Tensor | None = None,
+    tail: MoeTail | None = None,
+) -> _MinedLaunch | None:
+    """Admission and launch shared by both public entry points (None: declined)."""
     if mining_launches_suspended():
         return None
     manager = get_async_manager()
     with manager.mining_launch_admission(ctx.job) as decision:
         if not decision.launch:
             return None
-        launched, output = _mine_admitted_launch(
+        return _mine_admitted_launch(
             manager,
             decision,
             state,
@@ -600,8 +806,22 @@ def mine_launch(
             m_tokens,
             fill,
             bias=bias,
+            topk_ids=topk_ids,
+            tail=tail,
         )
-        return output if launched else None
+
+
+def _routing_for_launch(
+    state: LayerState, ctx: JobContext, topk_ids: torch.Tensor | None
+) -> MoeRouting | None:
+    """Enqueue the routing of one admitted launch (None for dense layers)."""
+    if not state.experts:
+        if topk_ids is not None:
+            raise ValueError(f"dense layer {state.layer_name} takes no topk_ids")
+        return None
+    if topk_ids is None:
+        raise ValueError(f"MoE layer {state.layer_name} launches with the router's topk_ids")
+    return route_tokens(topk_ids, state.experts, ctx.key_a_dev)
 
 
 def _acquire_launch_leases(
@@ -626,6 +846,60 @@ def _acquire_launch_leases(
     return completion_lease, decision.retain_winner, winner_callback_factory
 
 
+def _pow_key_host_buffer() -> torch.Tensor:
+    """Pinned target for the launch's jackpot key (``a_keys[64:96]``).
+
+    Allocated before the publisher is enqueued so the retained launch's only
+    post-publication host allocation cannot fail; the copy itself rides the
+    launch stream and is complete once the launch's event is."""
+    return torch.empty(32, dtype=torch.uint8, pin_memory=True)
+
+
+@dataclass
+class _OwnedRecordDiscard:
+    """Consume, and drop, the record a launch may have published when its
+    winner continuation could not be installed.
+
+    A retained launch enables publication the moment its kernel is enqueued;
+    if the host work between that and ``_start_launch_completion`` fails (an
+    MoE serving tail included), no consumer owns its record. Every winner
+    check leaves a record under a foreign key in place by design, so an
+    unowned record would keep the device-wide latch closed for every later
+    winner. This event-gated continuation takes only the failed launch's own
+    record (``take_owned_hit`` under its ``pow_key``) and releases the winner
+    lease it inherits; another launch's live record is left for its owner.
+    """
+
+    signal: "HitSignal"
+    # The launch's device-side keys, complete once the gating event is; the
+    # pinned copy is preferred when it was enqueued before the failure.
+    a_keys: torch.Tensor
+    pow_key_host: torch.Tensor | None
+    leases: WinnerCheckLeases
+
+    def __call__(self) -> None:
+        try:
+            if self.pow_key_host is not None:
+                owner = bytes(self.pow_key_host.tolist())
+            else:
+                owner = bytes(self.a_keys[64:96].cpu().tolist())
+            if self.signal.take_owned_hit(owner) is not None:
+                _LOGGER.warning("dropped the hit record of a launch whose continuation failed")
+        except Exception as exc:
+            from pearl_gemm import HitSignalPoisonedError
+
+            if isinstance(exc, HitSignalPoisonedError):
+                from .winners import disable_mining_after_poisoning
+
+                disable_mining_after_poisoning(self.signal)
+            else:
+                _LOGGER.opt(exception=True).warning(
+                    "failed launch's hit record could not be inspected"
+                )
+        finally:
+            self.leases.release()
+
+
 def _winner_continuation(
     *,
     retained: bool,
@@ -633,17 +907,26 @@ def _winner_continuation(
     hit_signal: "HitSignal",
     event: torch.cuda.Event,
     manager: AsyncLoopManager,
+    pow_key_host: torch.Tensor | None,
+    moe: MoeLaunch | None,
 ) -> tuple[Callable[[], None], Callable[[], None]]:
     if not retained:
         return _noop, _noop
-    assert callback_factory is not None
+    assert callback_factory is not None and pow_key_host is not None
     callback: Callable[[], None] = callback_factory(
         signal=hit_signal,
         event=event,
         leases=WINNER_LEASES,
         manager=manager,
+        pow_key_host=pow_key_host,
+        moe=moe,
     )
     return callback, WINNER_LEASES.release
+
+
+def _check_bias(bias: torch.Tensor | None, state: LayerState) -> None:
+    if bias is not None and state.experts:
+        raise ValueError("an MoE launch returns the permuted expert output; add bias per expert")
 
 
 def _mine_admitted_launch(
@@ -656,52 +939,91 @@ def _mine_admitted_launch(
     fill: Callable[[torch.Tensor], object],
     *,
     bias: torch.Tensor | None = None,
-) -> tuple[bool, torch.Tensor | None]:
+    topk_ids: torch.Tensor | None = None,
+    tail: MoeTail | None = None,
+) -> _MinedLaunch | None:
     """Own completion/accounting and winner retention for one enqueue.
 
-    Returns ``(launched, output)``.
+    Returns the launch, or None when no lease was free. ``tail`` (MoE
+    serving) runs over the permuted output and its routing inside the
+    launch's terminal fence: its result is the launch's ``result``, and its
+    failure is the launch's failure (no credit, cleanup fenced like every
+    other escape).
+
+    Ordering. The publisher is enabled the moment ``_launch_stages`` returns
+    a retained launch, so every host operation that can fail is either
+    performed before it (the pinned key and credit buffers) or, on failure
+    after it, compensated by an event-gated owner-selective discard of this
+    launch's own record (``_OwnedRecordDiscard``) so the shared latch never
+    stays closed behind a record nobody owns.
     """
     # Every credited launch, retained or not, needs the lifecycle completion
     # worker. Start it before any GPU allocation so thread exhaustion fails
     # without leaving unowned kernels.
     _ensure_fallback_runner_started()
+    _check_bias(bias, state)
     leases = _acquire_launch_leases(decision)
     if leases is None:
-        return False, None
+        return None
     completion_lease, leased, winner_callback_factory = leases
+    device = state.weight.device
 
     signal_event: torch.cuda.Event | None = None
     work_may_be_enqueued = False
     completion_published = False
+    # Set once a retained launch's publisher is enqueued: ``(hit_signal,
+    # a_keys, pinned key copy or None until it is enqueued)``.
+    published: tuple[HitSignal, torch.Tensor, torch.Tensor | None] | None = None
     try:
-        a_padded = torch.empty(
+        pow_key_host = _pow_key_host_buffer() if leased else None
+        a_launch = torch.empty(
             m_bucket,
             state.k,
             dtype=torch.bfloat16,
-            device=state.weight.device,
+            device=device,
         )
-        # ``fill`` may partially enqueue before raising. From this point onward
-        # every escape must publish an exact completion or fence this stream.
+        # The routing and ``fill`` may partially enqueue before raising. From
+        # this point onward every escape must publish an exact completion or
+        # fence this stream.
         work_may_be_enqueued = True
-        # Live serving rows are written exactly once; only protocol padding
-        # needs explicit zeroes. Idle fill initializes its full synthetic input.
-        fill(a_padded[:m_tokens])
+        routing = _routing_for_launch(state, ctx, topk_ids)
+        # An MoE launch's credit depends on the per-expert counts; their
+        # pinned host copy rides the launch stream ahead of the completion
+        # event (allocated here, before the publisher is enabled).
+        moe_credit = None if routing is None else _DeferredMoeCredit(state, routing.m_valid)
+        # Live serving rows are written exactly once.
+        fill(a_launch[:m_tokens])
         if m_tokens < m_bucket:
-            a_padded[m_tokens:].zero_()
-        hit_signal = _hit_signal_for(state.weight.device)
-        _, _, _, c = _launch_stages(
+            a_launch[m_tokens:].zero_()
+        hit_signal = _hit_signal_for(device)
+        codes, scales, a_keys, c = _launch_stages(
             ctx,
             ctx.config,
-            a_padded,
+            a_launch,
             hit_signal,
             layer_id=state.layer_id,
             record_hits=leased,
+            routing=routing,
         )
+        if pow_key_host is not None:
+            published = (hit_signal, a_keys, None)
+            # The winner check binds the record to this launch through its
+            # jackpot key; the host copy rides the launch stream ahead of the
+            # completion event.
+            pow_key_host.copy_(a_keys[64:96], non_blocking=True)
+            published = (hit_signal, a_keys, pow_key_host)
         if bias is not None:
             # Keep this serving operation inside the launch's exact terminal
             # fence. In-place addition avoids a second m*n allocation and makes
             # completion-lease memory accounting cover the whole mined path.
             c[:m_tokens].add_(bias)
+        # The adapter's mining-specific tail (activation, down GEMM, combine)
+        # belongs to this launch: it completes before the terminal event
+        # below, so drain/capture quiescence covers it.
+        result = _run_launch_tail(tail, c, routing)
+        credit: int | Callable[[], int] = (
+            _launch_credit(m_bucket, state) if moe_credit is None else moe_credit
+        )
 
         signal_event = _record_stream_event()
         _register_launch_event(signal_event)
@@ -711,6 +1033,8 @@ def _mine_admitted_launch(
             hit_signal=hit_signal,
             event=signal_event,
             manager=manager,
+            pow_key_host=pow_key_host,
+            moe=None if routing is None else MoeLaunch(routing, codes, scales),
         )
         # The worker proves event success before crediting. Its host token also
         # keeps capture/drain closed through rare winner D2H/reset/proof work.
@@ -719,32 +1043,84 @@ def _mine_admitted_launch(
             callback,
             release,
             manager=manager,
-            credited_hashes=_launch_credit(m_bucket, state),
+            credited_hashes=credit,
             state=state,
-            device=state.weight.device,
+            device=device,
             completion_lease=completion_lease,
         )
         completion_lease = None  # event-gated worker now owns this launch slot
-        if leased:
-            leased = False  # the event-gated callback now owns the winner lease
+        leased = False  # the event-gated callback now owns the winner lease, if any
         completion_published = True
-        return True, c
+        return _MinedLaunch(c, routing, result)
     finally:
-        if leased:
-            WINNER_LEASES.release()
         try:
-            if work_may_be_enqueued and not completion_published:
-                # A partial/failed launch may still have queued work. Prefer
-                # another exact event; if event creation/record also fails,
-                # synchronize only this launch stream before returning.
-                try:
-                    cleanup_event = _record_stream_event()
-                    _register_launch_event(cleanup_event)
-                except BaseException:
-                    _synchronize_launch_stream(state.weight.device)
+            if (
+                work_may_be_enqueued
+                and not completion_published
+                and _fence_abandoned_launch(state, published, completion_lease)
+            ):
+                leased = False  # both leases now belong to the discard
+                completion_lease = None
         finally:
+            if leased:
+                WINNER_LEASES.release()
             if completion_lease is not None:
                 completion_lease.release()
+
+
+def _run_launch_tail(
+    tail: MoeTail | None, output: torch.Tensor, routing: MoeRouting | None
+) -> object:
+    """Run the serving adapter's tail over an MoE launch's output, if given."""
+    if tail is None:
+        return None
+    if routing is None:
+        raise ValueError("a launch tail needs an MoE launch")
+    return tail(output, routing)
+
+
+def _fence_abandoned_launch(
+    state: LayerState,
+    published: tuple["HitSignal", torch.Tensor, torch.Tensor | None] | None,
+    completion_lease: _CompletionLease | None,
+) -> bool:
+    """Fence a launch that raised after it may have enqueued work.
+
+    Prefer another exact event; if event creation/record also fails,
+    synchronize only this launch stream before returning. When a retained
+    launch's publisher ran (``published``: signal, device keys, pinned key
+    copy if enqueued) no consumer owns its record, so both leases are handed
+    to an owner-selective discard gated on the same fence, or the discard
+    runs in place on an already synchronized stream. Returns whether the
+    leases were taken over. The failed launch is not credited.
+    """
+    device = state.weight.device
+    cleanup_event: torch.cuda.Event | None = None
+    try:
+        cleanup_event = _record_stream_event()
+        _register_launch_event(cleanup_event)
+    except BaseException:
+        cleanup_event = None
+        _synchronize_launch_stream(device)
+    if published is None:
+        return False
+    signal, a_keys, key_copy = published
+    discard = _OwnedRecordDiscard(signal, a_keys, key_copy, WINNER_LEASES)
+    if cleanup_event is None:
+        # The discard never raises and releases the winner lease itself.
+        discard()
+        if completion_lease is not None:
+            completion_lease.release()
+        return True
+    _start_launch_completion(
+        cleanup_event,
+        discard,
+        WINNER_LEASES.release,
+        state=state,
+        device=device,
+        completion_lease=completion_lease,
+    )
+    return True
 
 
 def run_mining_forward(
@@ -772,6 +1148,44 @@ def run_mining_forward(
     return None if c is None else c[:m_tokens]
 
 
+def run_mining_moe_forward(
+    state: LayerState,
+    ctx: JobContext,
+    x2d: torch.Tensor,
+    topk_ids: torch.Tensor,
+    m_bucket: int,
+    tail: MoeTail | None = None,
+) -> object | None:
+    """Mine one MoE forward: the first grouped GEMM of every routed
+    ``(token, expert)`` pair.
+
+    The launch produces the ``(cum_m, n_e)`` output in the canonical
+    expert-major, token-ascending row order together with the routing that
+    defines it (``routing.slots`` maps rows back to the router's ``(token,
+    slot)``). With ``tail`` -- the serving adapter's activation, down GEMM
+    and combine over that pair -- the tail runs inside the admitted launch,
+    before its terminal event, and its result is returned: drain/capture
+    quiescence then covers the whole mined forward, and a tail failure is
+    the launch's failure (fenced cleanup, no credit; an OOM opens the
+    device cooldown like any launch OOM). Without ``tail`` the raw
+    ``(output, routing)`` pair is returned (test and diagnostic use; a
+    serving adapter must pass its tail). None when the launch was declined.
+    """
+    if x2d.dtype != torch.bfloat16:
+        raise RuntimeError(f"pearl::apply_moe requires BF16 input, got {x2d.dtype}")
+    m_tokens = x2d.shape[0]
+    launched = mine_moe_launch(
+        state, ctx, m_bucket, m_tokens, lambda a: a[:m_tokens].copy_(x2d), topk_ids, tail=tail
+    )
+    if launched is None:
+        return None
+    if launched.routing is None:
+        raise RuntimeError("an admitted MoE serving launch emits its routing")
+    if tail is None:
+        return launched.output, launched.routing
+    return launched.result
+
+
 def warmup_layer_variants(
     state: LayerState,
     cancelled: Callable[[], bool] | None = None,
@@ -784,16 +1198,21 @@ def warmup_layer_variants(
     """
     assert state.buffers is not None
     device = state.weight.device
-    config = mining_configuration(state.k, state.n)
+    config = mining_configuration(state.k, state.n, state.experts)
     for m_bucket in runtime_settings().m_buckets:
         if (cancelled is not None and cancelled()) or not mining_producer_admission_open():
             return False
-        variant = (m_bucket, state.n, state.k)
+        variant = _variant_key(m_bucket, state)
         with _variant_lock:
             if variant in _ready_variants or variant in _failed_variants:
                 continue
         try:
             dummy = torch.zeros(m_bucket, state.k, dtype=torch.bfloat16, device=device)
+            routing = None
+            if state.experts:
+                routing = round_robin_routing(
+                    m_bucket, state.experts, state.top_k, state.buffers.key_a_dev
+                )
             # The variant must be warm before the shape is advertised as
             # ready: the first mined serving forward would otherwise pay a
             # synchronous JIT that stalls serving (and a compile failure would
@@ -805,6 +1224,7 @@ def warmup_layer_variants(
                 _hit_signal_for(device),
                 layer_id=state.layer_id,
                 record_hits=False,
+                routing=routing,
             )
             _record_stream_event().synchronize()
             if (cancelled is not None and cancelled()) or not mining_producer_admission_open():
@@ -829,6 +1249,4 @@ def warmup_layer_variants(
         _LOGGER.info(
             f"pipeline variant ready: m={m_bucket}, n={state.n}, k={state.k} ({state.layer_name})"
         )
-    return all(
-        variant_ready(m_bucket, state.n, state.k) for m_bucket in runtime_settings().m_buckets
-    )
+    return all(variant_ready(m_bucket, state) for m_bucket in runtime_settings().m_buckets)

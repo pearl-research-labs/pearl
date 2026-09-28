@@ -43,7 +43,7 @@ class _Signal:
         self.hit = hit
         self.resets = 0
 
-    def take_owned_hit(self):
+    def take_owned_hit(self, owner=None):
         hit = self.hit
         if hit is None:
             return None
@@ -82,8 +82,8 @@ def test_winner_callback_rearms_before_slow_validation(monkeypatch):
             return self
 
     class Signal(_Signal):
-        def take_owned_hit(self):
-            hit = super().take_owned_hit()
+        def take_owned_hit(self, owner=None):
+            hit = super().take_owned_hit(owner)
             order.append("reset")
             return hit
 
@@ -196,6 +196,7 @@ def test_validated_persistent_hit_builds_canonical_opening(
         layer_name="test.layer",
         layer_id=7,
         n=b.int_values.shape[0],
+        lottery_n=b.int_values.shape[0],
         k=k,
         weight_cpu=b.int_values,
         weight_scale_cpu=b.scales,
@@ -327,7 +328,7 @@ def test_hit_stamped_with_a_stale_b_seed_is_dropped(monkeypatch):
     config = mining_configuration(2048, 256)
     ctx = SimpleNamespace(job=job, config=config, seed_b=b"\x01" * 32)
     state = SimpleNamespace(
-        layer_name="test.layer", n=256, k=2048, lock=threading.Lock(), job_ctx=ctx
+        layer_name="test.layer", n=256, lottery_n=256, k=2048, lock=threading.Lock(), job_ctx=ctx
     )
     hit = SimpleNamespace(
         layer_id=3,
@@ -343,6 +344,178 @@ def test_hit_stamped_with_a_stale_b_seed_is_dropped(monkeypatch):
     assert (
         winners._matching_context(hit, state, SimpleNamespace(get_mining_job=lambda: job)) is None
     )
+
+
+def test_winner_callback_consumes_only_its_launch_record():
+    """The callback passes its launch's pinned ``pow_key`` to the signal, so a
+    record another launch published is left for that launch's check."""
+    owners = []
+
+    class Signal(_Signal):
+        def take_owned_hit(self, owner=None):
+            owners.append(owner)
+            return None
+
+    key = bytes(range(32))
+    leases = _Leases()
+    WinnerCheckCallback(
+        signal=Signal(),
+        event=object(),
+        leases=leases,
+        manager=SimpleNamespace(),
+        pow_key_host=torch.tensor(list(key), dtype=torch.uint8),
+    )()
+    assert owners == [key] and leases.releases == 1
+    with pytest.raises(ValueError, match="pow_key"):
+        WinnerCheckCallback(
+            signal=Signal(), event=object(), leases=leases, manager=SimpleNamespace(), moe=object()
+        )
+
+
+def _moe_winner_fixture(group_id: int):
+    """A retained MoE launch's host view: 4 experts of ``n_e = 256`` stacked
+    rows, round-robin top-2 routing of 64 tokens, and an always-win job."""
+    from miner_base.block_submission import PrebuiltCommitment
+    from miner_base.commitment import BlockHeader
+    from vllm_miner.moe import MoeLaunch, MoeRouting
+
+    k, experts, n_e, top_k, m = 2048, 4, 256, 2, 64
+    config = mining_configuration(k, experts * n_e, experts)
+    header = BlockHeader(
+        version=1,
+        prev_block=b"\x11" * 32,
+        merkle_root=b"\x22" * 32,
+        timestamp=1_700_000_000,
+        nbits=0x207FFFFF,
+    )
+    job = MiningJob(
+        incomplete_header_bytes=bytes(header.to_bytes()),
+        target=(1 << 256) - 1,
+        cert_version=CertificateVersion.PLAIN_FP8,
+    )
+    torch.manual_seed(3)
+    a = PrequantMatrix.encode(torch.randn(m, k, dtype=torch.bfloat16))
+    b = PrequantMatrix.encode(torch.randn(experts * n_e, k, dtype=torch.bfloat16))
+    key_a, key_b = commitment_keys_for(job)
+    comm_b = commit_planes_for_leaf(b.planes(), key_b, config.chunk_size)
+    seed_b = noise_seed_b(comm_b.digest, key_b, config.p_b(experts * n_e))
+    per_expert = [
+        [t for t in range(m) if any((t + slot) % experts == e for slot in range(top_k))]
+        for e in range(experts)
+    ]
+    counts = [len(rows) for rows in per_expert]
+    m_indptr = torch.tensor([0, *torch.tensor(counts).cumsum(0).tolist()], dtype=torch.int32)
+    routing = MoeRouting(
+        experts=experts,
+        top_k=top_k,
+        tokens=torch.tensor([t for rows in per_expert for t in rows], dtype=torch.int32),
+        m_indptr=m_indptr,
+        m_valid=m_indptr.diff(),
+        slots=torch.zeros(m * top_k, dtype=torch.int64),
+        commitments=torch.zeros(64, dtype=torch.uint8),
+    )
+    ctx = SimpleNamespace(
+        config=config,
+        key_a=key_a,
+        key_b=key_b,
+        seed_b=seed_b,
+        target=job.target,
+        job=job,
+        b_proof=SimpleNamespace(prebuilt_commitment=lambda: PrebuiltCommitment(comm_b, key_b)),
+    )
+    state = SimpleNamespace(
+        layer_name="test.experts",
+        layer_id=9,
+        n=experts * n_e,
+        lottery_n=n_e,
+        experts=experts,
+        k=k,
+        weight_cpu=b.int_values,
+        weight_scale_cpu=b.scales,
+        lock=threading.Lock(),
+        job_ctx=ctx,
+    )
+    hit = SimpleNamespace(
+        valid=True,
+        layer_id=state.layer_id,
+        m=counts[min(group_id, experts - 1)],
+        n=n_e,
+        k=k,
+        ltile_rows=config.rows_pattern.tile_size,
+        ltile_cols=config.cols_pattern.tile_size,
+        tile_row=2,
+        tile_column=1,
+        group_id=group_id,
+        commitment_hash_A=b"\x07" * 32,
+        commitment_hash_B=seed_b,
+        target=threshold_bytes_for(job, k, n_e),
+        codes=None,
+        scales=None,
+    )
+    moe = MoeLaunch(routing, a.int_values, a.scales)
+    return job, state, hit, moe, per_expert
+
+
+def test_moe_hit_opens_the_routed_tokens_and_expert_rows(monkeypatch):
+    """A payload-less MoE record resolves through the launch's retained
+    routing: its expert-local tile becomes the expert's routed tokens and its
+    stacked weight rows, and the opening carries a routing witness the cert-v4
+    verifier accepts."""
+    from miner_base.block_submission import create_proof
+    from pearl_mining import (
+        CERT_VERSION_PLAIN_FP8,
+        IncompleteBlockHeader,
+        verify_plain_proof_for_cert_version,
+    )
+
+    w = 2
+    job, state, hit, moe, per_expert = _moe_winner_fixture(w)
+    submitted = []
+
+    class Manager:
+        @staticmethod
+        def get_mining_job():
+            return job
+
+        @staticmethod
+        def handle_submit_block(opening, _job, *, timeout):
+            submitted.append(opening)
+            return True
+
+    monkeypatch.setattr(winners, "lookup_state_by_layer_id", lambda _layer_id: state)
+    callback = WinnerCheckCallback(
+        signal=_Signal(hit),
+        event=object(),
+        leases=_Leases(),
+        manager=Manager(),
+        pow_key_host=torch.zeros(32, dtype=torch.uint8),
+        moe=moe,
+    )
+    callback._handle_hit(hit)
+
+    (opening,) = submitted
+    config = state.job_ctx.config
+    inner = tile_indices(config.rows_pattern, hit.tile_row)
+    assert opening.moe is not None and opening.moe.expert_index == w
+    assert opening.moe.inner_a_rows == tuple(inner)
+    assert opening.a_row_indices == tuple(per_expert[w][i] for i in inner)
+    assert opening.b_column_indices == tuple(
+        w * state.lottery_n + c for c in tile_indices(config.cols_pattern, hit.tile_column)
+    )
+    assert opening.a_codes is moe.codes and opening.b_codes is state.weight_cpu
+    header = IncompleteBlockHeader.from_bytes(job.incomplete_header_bytes)
+    proof = create_proof(opening, header)
+    assert proof.moe is not None and proof.moe_witness.w == w
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
+    assert accepted, message
+
+
+def test_moe_hit_outside_the_expert_range_is_dropped():
+    job, state, hit, moe, _ = _moe_winner_fixture(4)
+    manager = SimpleNamespace(get_mining_job=lambda: job)
+    assert winners._matching_context(hit, state, manager, moe=moe) is None
+    # A dense check never opens a payload-less record.
+    assert winners._matching_context(hit, state, manager) is None
 
 
 def test_launch_asks_submission_gate_about_its_captured_job(monkeypatch):
@@ -411,6 +584,8 @@ def test_launch_asks_submission_gate_about_its_captured_job(monkeypatch):
         layer_id=5,
         k=2048,
         n=128,
+        experts=0,
+        top_k=0,
         weight=SimpleNamespace(device="cuda:0"),
     )
     ctx = SimpleNamespace(
@@ -430,7 +605,7 @@ def test_launch_asks_submission_gate_about_its_captured_job(monkeypatch):
     assert result is output
     assert order == [("bias", bias), "event"]
     assert checked_jobs == [legacy_job]
-    assert launch_args == [{"layer_id": 5, "record_hits": False}]
+    assert launch_args == [{"layer_id": 5, "record_hits": False, "routing": None}]
     assert manager.credited == effective_work_per_matmul(256, 128, 2048)
 
 
@@ -467,6 +642,8 @@ def test_serving_activation_writes_live_prefix_and_zeros_only_tail(monkeypatch):
         layer_id=5,
         k=8,
         n=128,
+        experts=0,
+        top_k=0,
         weight=SimpleNamespace(device=torch.device("cpu")),
     )
     ctx = SimpleNamespace(config=object())
@@ -530,6 +707,8 @@ def test_partial_fill_failure_registers_cleanup_before_releasing_slot(monkeypatc
         layer_id=5,
         k=8,
         n=128,
+        experts=0,
+        top_k=0,
         weight=SimpleNamespace(device=torch.device("cpu")),
     )
     ctx = SimpleNamespace(config=object())
@@ -575,6 +754,8 @@ def test_unretained_launches_decline_before_allocation_when_completions_are_full
         layer_id=5,
         k=8,
         n=128,
+        experts=0,
+        top_k=0,
         weight=SimpleNamespace(device=torch.device("cpu")),
     )
     ctx = SimpleNamespace(config=object())
@@ -606,10 +787,10 @@ def test_unretained_launches_decline_before_allocation_when_completions_are_full
     monkeypatch.setattr(pipeline, "_start_launch_completion", hold_completion)
 
     def launch():
-        launched, _ = pipeline._mine_admitted_launch(
+        launched = pipeline._mine_admitted_launch(
             manager, decision, state, ctx, 8, 8, lambda _a: None
         )
-        return launched
+        return launched is not None
 
     assert launch()
     assert launch()
@@ -640,7 +821,9 @@ def test_launch_declines_a_job_replaced_before_launch_admission(monkeypatch):
     monkeypatch.setattr(pipeline, "get_async_manager", lambda: manager)
     allocate = Mock(side_effect=AssertionError("stale launch allocated GPU work"))
     monkeypatch.setattr(pipeline.torch, "empty", allocate)
-    state = SimpleNamespace(k=2048, n=128, weight=SimpleNamespace(device="cuda:0"))
+    state = SimpleNamespace(
+        k=2048, n=128, experts=0, top_k=0, weight=SimpleNamespace(device="cuda:0")
+    )
     ctx = SimpleNamespace(job=stale_job, threshold_dev=object())
 
     assert pipeline.mine_launch(state, ctx, 256, 8, lambda _activation: None) is None
@@ -679,7 +862,9 @@ def test_fallback_runner_failure_happens_before_retained_gpu_launch(monkeypatch)
     monkeypatch.setattr(pipeline.threading, "Thread", BrokenThread)
     allocate = Mock(side_effect=AssertionError("GPU work started before fallback setup"))
     monkeypatch.setattr(pipeline.torch, "empty", allocate)
-    state = SimpleNamespace(k=2048, n=128, weight=SimpleNamespace(device="cuda:0"))
+    state = SimpleNamespace(
+        k=2048, n=128, experts=0, top_k=0, weight=SimpleNamespace(device="cuda:0")
+    )
     ctx = SimpleNamespace(job=job, threshold_dev=object())
 
     with pytest.raises(RuntimeError, match="thread exhaustion"):
@@ -871,7 +1056,9 @@ def test_winner_retention_uses_its_own_configured_capacity(monkeypatch):
     )
     allocate = Mock(side_effect=AssertionError("unretained launch allocated GPU work"))
     monkeypatch.setattr(pipeline.torch, "empty", allocate)
-    state = SimpleNamespace(k=2048, n=128, weight=SimpleNamespace(device="cuda:0"))
+    state = SimpleNamespace(
+        k=2048, n=128, experts=0, top_k=0, weight=SimpleNamespace(device="cuda:0")
+    )
     ctx = SimpleNamespace(job=job, threshold_dev=object())
 
     assert pipeline.mine_launch(state, ctx, 256, 8, lambda _activation: None) is None

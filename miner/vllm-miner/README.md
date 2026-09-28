@@ -38,12 +38,14 @@ Capability gates:
   `k > 30720`) keep their original BF16 path there. TP, DP, and EP workers
   independently commit and mine each eligible process-local dense shard;
   there is no cross-rank weight reconstruction or proof aggregation.
-- Dense linear layers only; a mined local shard needs `k % 512 == 0`,
+- Dense linear layers: a mined local shard needs `k % 512 == 0`,
   `n % 128 == 0`, and `n, k % 16 == 0` (FP8 fallback alignment). Layers that
   cannot mine on this device/shape keep their original BF16 path.
-- MoE expert weights are not mined yet. MLA `.kv_b_proj` parameters also stay
-  on their source scheme because the model reads those weights directly instead
-  of exclusively through the linear quantization method.
+- MoE expert layers (BF16 routed experts, see
+  [MoE expert mining](#moe-expert-mining)) mine their first grouped GEMM on
+  SM100 and SM120. MLA `.kv_b_proj` parameters stay on their source scheme
+  because the model reads those weights directly instead of exclusively
+  through the linear quantization method.
 - The worker subtracts a bounded post-profile allowance for the persistent hit
   signal and one reusable A-side workspace for each runtime CUDA stream that can
   retain an allocator population. The allowance counts one workspace per
@@ -61,9 +63,44 @@ FP8 / NVFP4 / MXFP4. The plugin claims such a checkpoint through
 `override_quantization_method` and delegates loading to the matching vLLM quant
 method, so the model keeps its compact footprint. Only mineable dense linears
 are then decoded back to BF16 through the delegate's own kernels and encoded to
-FP10; every other layer — MoE experts, KV cache, embeddings, MLA `.kv_b_proj`,
-`PEARL_IGNORED_LAYERS` matches, and unsupported local shards — keeps the
-checkpoint's source scheme.
+FP10; every other layer — quantized MoE experts, KV cache, embeddings, MLA
+`.kv_b_proj`, `PEARL_IGNORED_LAYERS` matches, and unsupported local shards —
+keeps the checkpoint's source scheme.
+
+### MoE expert mining
+
+A BF16 routed-expert layer (vLLM `RoutedExperts`) is served by
+`PearlMoEMethod`, which mines the layer's first grouped GEMM, the fused
+gate/up projection `w13`. Its stacked `(E, 2I, H)` weight is committed as one
+`(E * 2I, H)` B operand whose expert count is bound into `pB`. A mined forward
+commits, seeds and noises the activation once at its token addresses, exactly
+like a dense layer; the router's expert ids are then sorted into the canonical
+routing table (each expert's tokens ascending), whose keyed roots `HR || HO`
+are bound into `noise seedA`. The noised rows are gathered into expert order
+and `pearl_gemm.grouped_mixed_gemm` runs every expert's `x_e @ w13_e^T` with
+the lottery on an expert-local lattice. The activation, the `w2` grouped GEMM
+and the router-weighted combine stay plain PyTorch. A winning tile is opened
+from the full committed activation at its routed tokens, plus the routing
+witness (`R[w]`'s opening and the offsets), into a cert-v4 MoE proof.
+
+Gates (a layer outside them keeps the engine's own unmined MoE path):
+
+- SM100 or SM120 with `pearl_gemm.supports_grouped_mixed_gemm`; SM120 runs the
+  grouped kernel's static tile schedule.
+- Per-expert `n_e = 2I` must be a multiple of the 128-column MoE lottery
+  lattice (no lottery tile straddles two experts) and `(n_e, H)` must be a
+  mineable dense shape (`H % 512 == 0`, `2048 <= H`).
+- BF16 checkpoint experts with an act-and-mul activation; no SwiGLU gate
+  parameters, expert biases, shared experts, LoRA, expert parallelism, or
+  router weights applied on the input. Quantized expert checkpoints keep
+  their source scheme.
+- `PearlMoEMethod` forces vLLM's Triton MoE backend for the layer (the
+  FlashInfer backends re-lay the expert weights out); ignored but otherwise
+  mineable expert layers also take it, unmined.
+- Mining is eager only: the routing is data dependent, so CUDA-graph captures
+  and declined forwards (small batches, no job, oversize buckets) serve the
+  inherited Triton path. A mined forward is credited with the whole lottery
+  tiles of every expert.
 
 This upcast is **lossy in the sense that it cannot recover what the checkpoint
 already discarded**: mining and serving then run over already-quantized
@@ -149,8 +186,8 @@ Notes / constraints:
 - CUDA graphs work with vLLM's default `cudagraph_mode`; captured graphs
   always replay the FP8 fallback, so mining runs on eager prefills.
 - TP/DP/EP workers own independent runtime, accounting, winner, and drain
-  state. Fused expert GEMMs remain native; only dense `LinearBase` shards
-  route through Pearl.
+  state. Dense `LinearBase` shards route through Pearl, as do BF16 routed
+  experts without expert parallelism; other fused expert GEMMs remain native.
 
 ## Runtime configuration
 
@@ -163,7 +200,7 @@ Unsupported devices or layer shapes stay on the serving fallback.
 |---|---:|---|---|---|
 | `PEARL_IGNORED_LAYERS` | empty | comma-separated exact prefixes or `re:` regular expressions | registration | Excludes matching framework layer prefixes from mining. |
 | `PEARL_MIN_MINING_TOKENS` | `1024` | integer `>= 4` | request-time/busy | Sends smaller serving forwards through the FP8 fallback. |
-| `PEARL_M_BUCKETS` | `2048,8192` | non-empty comma-separated positive multiples of 64 | request-time | Bounds compiled kernel variants. Request-time mining pads to the smallest fitting bucket and falls back above the largest. |
+| `PEARL_M_BUCKETS` | `2048,8192` | non-empty comma-separated positive multiples of 64 | request-time | Bounds compiled kernel variants. Request-time mining uses the smallest fitting bucket and falls back above the largest. |
 | `PEARL_WARMUP_COMPILE` | `true` | boolean | startup/job preparation | Compiles every configured pipeline variant off the serving path before mining engages. |
 | `PEARL_WINNER_CHECK_INFLIGHT_LIMIT` | `8` | integer `>= 1` | all mining launches | Caps retained launches awaiting event-gated inspection of the persistent hit signal. At the cap, mining is declined and serving falls back. |
 | `PEARL_COMPLETION_INFLIGHT_LIMIT` | `8` | integer `1..256` | all mining launches | Caps all event-gated credited launches, including no-gateway launches that retain no winner. At the cap, mining is declined before GPU allocation. Also sizes the mining memory kept off the KV cache (peak reservation scales ~linearly with it); raise only when profiling shows spare memory. |

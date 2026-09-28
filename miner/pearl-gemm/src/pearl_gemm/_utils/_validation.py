@@ -32,6 +32,30 @@ def require_tensor(
         raise ValueError(f"{name} must be {alignment}-byte aligned")
 
 
+def _byte_span(tensor: torch.Tensor) -> tuple[int, int]:
+    start = tensor.data_ptr()
+    return start, start + tensor.numel() * tensor.element_size()
+
+
+def require_disjoint_writes(
+    writes: Sequence[tuple[str, torch.Tensor | None]],
+    reads: Sequence[tuple[str, torch.Tensor | None]],
+) -> None:
+    """Reject a written buffer whose bytes overlap any other operand.
+
+    Read/read aliasing is harmless and allowed; a write overlapping a read
+    (or another write) lets one tile overwrite bytes another tile still
+    reads. Spans are compared by ``data_ptr``, so no device read is needed.
+    """
+    write_spans = [(name, _byte_span(t)) for name, t in writes if t is not None]
+    read_spans = [(name, _byte_span(t)) for name, t in reads if t is not None]
+    for i, (name_w, (start_w, end_w)) in enumerate(write_spans):
+        others = write_spans[i + 1 :] + read_spans
+        for name_o, (start_o, end_o) in others:
+            if start_w < end_o and start_o < end_w:
+                raise ValueError(f"{name_w} is written and must not overlap {name_o} in memory")
+
+
 def require_buffer(
     name: str,
     tensor: torch.Tensor,

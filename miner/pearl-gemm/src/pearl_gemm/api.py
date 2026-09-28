@@ -1,5 +1,15 @@
 """Caller-owned functional API for the new-scheme operations."""
 
+from .grouped_fp8_gemm import (
+    GroupedFp8GemmConfig,
+    grouped_fp8_gemm,
+    grouped_fp8_gemm_scale_shapes,
+)
+from .grouped_mixed_gemm import (
+    GroupedMixedGemmConfig,
+    grouped_mixed_gemm,
+    supports_grouped_mixed_gemm,
+)
 from .mixed_gemm import (
     MixedGemmConfig,
     default_mixed_gemm_config,
@@ -50,6 +60,8 @@ from .tensor_hash_plus_stats import (
 )
 
 __all__ = [
+    "GroupedFp8GemmConfig",
+    "GroupedMixedGemmConfig",
     "Hit",
     "HitRecordLayout",
     "HitSignal",
@@ -67,6 +79,10 @@ __all__ = [
     "TensorHashConfig",
     "get_tensor_hash_plus_stats_config",
     "default_mixed_gemm_config",
+    "grouped_fp8_gemm",
+    "grouped_fp8_gemm_scale_shapes",
+    "grouped_mixed_gemm",
+    "supports_grouped_mixed_gemm",
     "mixed_gemm",
     "supports_lottery_family",
     "validate_mixed_gemm_config",

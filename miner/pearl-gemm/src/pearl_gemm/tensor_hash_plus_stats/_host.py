@@ -13,7 +13,13 @@ from .._utils._stream import get_stream
 from .._utils._validation import require_buffer, require_tensor
 from ..pre_quant import pre_quant_output_shapes
 from . import _blake3
-from ._finalize_kernel import A_KEYS_BYTES, _finalize_launch, p_a_words
+from ._finalize_kernel import (
+    A_KEYS_BYTES,
+    P_A_MOE_BYTES,
+    ROUTING_COMMITMENTS_BYTES,
+    _finalize_launch,
+    p_a_words,
+)
 from ._merkle_host import (
     _validate_hash_tunables,
     get_required_scratchpad_bytes,
@@ -414,6 +420,7 @@ def tensor_hash_plus_stats(
     *,
     p_a: bytes,
     config: TensorHashConfig | None = None,
+    routing_commitments: torch.Tensor | None = None,
 ) -> None:
     """Commit the block-scaled activation blobs and reduce its commit stats.
 
@@ -431,6 +438,11 @@ def tensor_hash_plus_stats(
     encoding (``MiningConfiguration.p_a(m)``; a compile-time constant, so a
     different lottery layout or leaf recompiles the finalize). ``a_keys`` is
     the 96-byte output (``miner_base.commitment_hash.AKeys``).
+
+    MoE launches pass the 13-byte MoE ``pA`` together with
+    ``routing_commitments``, the 64-byte ``HR || HO`` device digests of the
+    routing table; the finalize then derives ``seedA = H_"seed-A"(HA || HR ||
+    HO || seedB || keyA || pA)``. Supplying only one of the two is an error.
 
     ``stats`` receives the fp32 ``(sumsq, absmax)`` pair per 512-element
     block, reduced over the *dequantized* codes and scales -- the partials
@@ -454,7 +466,19 @@ def tensor_hash_plus_stats(
         "a_keys", a_keys, dtype=torch.uint8, shape=(A_KEYS_BYTES,), device=device, alignment=4
     )
     words = p_a_words(p_a)
-    # One complete alias check across all nine operands: the finalize writes
+    moe = len(p_a) == P_A_MOE_BYTES
+    if moe != (routing_commitments is not None):
+        raise ValueError("the MoE pA encoding and routing_commitments must be passed together")
+    if routing_commitments is not None:
+        require_tensor(
+            "routing_commitments",
+            routing_commitments,
+            dtype=torch.uint8,
+            shape=(ROUTING_COMMITMENTS_BYTES,),
+            device=device,
+            alignment=4,
+        )
+    # One complete alias check across all operands: the finalize writes
     # a_keys, so aliasing even a read-only input (key, a plane) would corrupt
     # the caller's material for later commitments.
     _validate_committed_planes(
@@ -466,11 +490,15 @@ def tensor_hash_plus_stats(
         roots,
         stats,
         config,
-        extra_disjoint=(("seed_b", seed_b), ("a_keys", a_keys)),
+        extra_disjoint=(
+            ("seed_b", seed_b),
+            ("a_keys", a_keys),
+            ("routing_commitments", routing_commitments),
+        ),
     )
 
     _launch_pair(codes, scales, key, root_codes, root_scales, roots, stats, config)
-    finalize = _compile_finalize(torch.cuda.get_device_capability(device), words)
+    finalize = _compile_finalize(torch.cuda.get_device_capability(device), words, len(p_a))
     # Explicit, like every other launch in the package. Resolved from the FFI
     # environment instead, this one stops tracking the caller's stream once
     # the GPU is contended, and publishes keys read from unwritten roots.
@@ -479,22 +507,30 @@ def tensor_hash_plus_stats(
         root_scales.view(torch.uint32),
         key.view(torch.uint32),
         seed_b.view(torch.uint32),
+        None if routing_commitments is None else routing_commitments.view(torch.uint32),
         a_keys.view(torch.uint32),
         get_stream(device.index or 0),
     )
 
 
 @single_flight_compile
-def _compile_finalize(capability: tuple, p_a: tuple):
+def _compile_finalize(capability: tuple, p_a: tuple, p_a_bytes: int):
     digests = [
         make_fake_tensor(cutlass.Uint32, (8,), leading_dim=0, divisibility=1) for _ in range(4)
     ]
+    routing = (
+        make_fake_tensor(cutlass.Uint32, (16,), leading_dim=0, divisibility=1)
+        if p_a_bytes == P_A_MOE_BYTES
+        else None
+    )
     out = make_fake_tensor(cutlass.Uint32, (A_KEYS_BYTES // 4,), leading_dim=0, divisibility=1)
     return cute.compile(
         _finalize_launch,
         *digests,
+        routing,
         out,
         make_fake_stream(),
         p_a=p_a,
+        p_a_bytes=p_a_bytes,
         options="--enable-tvm-ffi",
     )

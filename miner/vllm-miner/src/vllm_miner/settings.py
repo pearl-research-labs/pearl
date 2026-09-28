@@ -17,7 +17,7 @@ class RuntimeSettings(BaseSettings):
     ignored_layers: Annotated[tuple[str, ...], NoDecode] = ()
     # Forwards below this token count (decode) take the FP8 fallback GEMM.
     min_mining_tokens: int = Field(default=1024, ge=4)
-    # Ascending activation-row buckets; m pads to the smallest fit (bounds JIT variants).
+    # Ascending activation-row buckets; a forward uses the smallest fit (bounds JIT variants).
     m_buckets: Annotated[tuple[int, ...], NoDecode] = (2048, 8192)
     # Compile pipeline variants off the serving path before mining engages.
     warmup_compile: bool = True
@@ -64,7 +64,7 @@ class RuntimeSettings(BaseSettings):
             raise ValueError("m_buckets must not be empty")
         # 64 keeps every committed lottery tile's row alignment (m % 16) and is
         # the smallest bucket the 64-row decode kernel tile fills. Sub-256
-        # buckets let small decode batches pad less; on 4-row commitments those
+        # buckets fit small decode batches more tightly; on 4-row commitments those
         # buckets use the 64-row tile unless an exact autotune record exists.
         if any(b <= 0 or b % 64 for b in buckets):
             raise ValueError(f"m_buckets must be positive multiples of 64, got {buckets}")

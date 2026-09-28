@@ -1,7 +1,7 @@
 """Mining-job adapter: per-layer-shape committed configuration, thresholds, and
 credited-work formulas for the SM100 schema lottery."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 
 from miner_base.commitment import Device, MiningConfiguration, commitment_keys
@@ -25,6 +25,9 @@ PACKED_NOISE_K = 32
 # pearl_gemm.protocol_constants.BLOCK_SCALE_GROUP is this value; take it from the protocol
 # rather than restating it, so the FP10 scale grouping has one definition.
 SCALE_BLOCK = DEFAULT_BLOCK_SIZE
+# pearl_gemm.grouped_mixed_gemm's lottery lattice width: an expert's ``n_e``
+# must be a multiple of it so no lottery tile straddles two experts.
+MOE_LOTTERY_N = 128
 
 _MAX_256 = (1 << 256) - 1
 
@@ -153,37 +156,51 @@ def _tall_tile_configuration(k: int) -> MiningConfiguration:
     )
 
 
-def mining_configuration(k: int, n: int | None = None) -> MiningConfiguration:
+def mining_configuration(k: int, n: int | None = None, experts: int = 0) -> MiningConfiguration:
     """The committed mining configuration for one layer's ``(n, k)`` shape.
 
     ``n`` selects the committed tile via :func:`select_tile` (the 4x64 tile is
     preferred; see there). It is optional: omitting it commits the 4x128 tile
     for back-compat, but the runtime commit path (``job_prep``) always passes
-    ``n`` so every layer commits the tile it actually mines.
+    ``n`` so every layer commits the tile it actually mines. ``experts`` (MoE)
+    is the expert count of a stacked ``(experts * n_e, k)`` weight; the tile
+    is then selected on the per-expert ``n_e``, the lottery lattice being
+    expert-local.
 
     Both Merkle trees commit BLAKE3's native 1024-byte leaf
     (``HashId.BLAKE3_CHUNK_1024``). Autotune records may carry a faster hasher
     leaf, but the leaf is committed through each operand's ``HashId``, so GPU
     launches overlay this protocol leaf (see ``with_committed_leaf``).
     """
-    return _cached_mining_configuration(k, n)
+    return _cached_mining_configuration(k, n, experts)
+
+
+def expert_n(n: int, experts: int) -> int:
+    """Per-expert output rows ``n_e`` of a stacked MoE weight (``n`` itself when dense)."""
+    if experts and n % experts:
+        raise ValueError(f"stacked n={n} is not a multiple of {experts} experts")
+    return n // experts if experts else n
 
 
 @cache
-def _cached_mining_configuration(k: int, n: int | None) -> MiningConfiguration:
-    tile = (select_tile(n, k) if n is not None else DEFAULT_TILE) or DEFAULT_TILE
+def _cached_mining_configuration(k: int, n: int | None, experts: int) -> MiningConfiguration:
+    n_e = None if n is None else expert_n(n, experts)
+    tile = (select_tile(n_e, k) if n_e is not None else DEFAULT_TILE) or DEFAULT_TILE
     if tile == TALL_TILE:
-        return _tall_tile_configuration(k)
+        return replace(_tall_tile_configuration(k), experts=experts)
     # The 4x128 layout has exactly one definition -- the miner-base builder the
     # CPU plain-peel miner commits too. Duplicating it here would let the two
     # drift, silently changing GPU job keys.
-    return default_mining_config(
-        k,
-        RANK,
-        ltile_cols=tile.cols,
-        ltile_rows=tile.rows,
-        chunk_size=COMMITMENT_CHUNK_SIZE,
-        a_chunk_size=COMMITMENT_CHUNK_SIZE,
+    return replace(
+        default_mining_config(
+            k,
+            RANK,
+            ltile_cols=tile.cols,
+            ltile_rows=tile.rows,
+            chunk_size=COMMITMENT_CHUNK_SIZE,
+            a_chunk_size=COMMITMENT_CHUNK_SIZE,
+        ),
+        experts=experts,
     )
 
 
@@ -219,7 +236,7 @@ def lottery_threshold(target: int, k: int, n: int | None = None) -> int:
 
 
 def lottery_hashes_per_matmul(m: int, n: int, tile: LotteryTileSpec = DEFAULT_TILE) -> int:
-    """Protocol-credited, in-bounds lottery messages for one padded launch.
+    """Protocol-credited, in-bounds lottery messages for one launch.
 
     ``tile`` must be the tile the launch actually committed (see
     :func:`select_tile`); the tall tile divides ``n`` by 32, not 128, so

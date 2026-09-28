@@ -3,8 +3,9 @@
 Public surface over caller-owned buffers: the A-side runtime pipeline
 (``pre_quant``, ``tensor_hash_plus_stats``, ``noisy_quant``, ``mixed_gemm``),
 the B-side per-job preparation (``tensor_hash_plus_stats_b``,
-``noise_lines``, ``noisy_quant_b``), and the persistent per-process PoW hit
-signal (``HitSignal``).
+``noise_lines``, ``noisy_quant_b``), the MoE grouped GEMMs
+(``grouped_fp8_gemm``, ``grouped_mixed_gemm``), and the persistent
+per-process PoW hit signal (``HitSignal``).
 """
 
 from .api import (
@@ -12,6 +13,8 @@ from .api import (
     LABEL_E2,
     LABEL_F1,
     LABEL_F2,
+    GroupedFp8GemmConfig,
+    GroupedMixedGemmConfig,
     Hit,
     HitRecordLayout,
     HitSignal,
@@ -26,6 +29,9 @@ from .api import (
     default_mixed_gemm_config,
     default_noisy_quant_config,
     get_tensor_hash_plus_stats_config,
+    grouped_fp8_gemm,
+    grouped_fp8_gemm_scale_shapes,
+    grouped_mixed_gemm,
     mixed_gemm,
     noise_lines,
     noisy_quant,
@@ -33,6 +39,7 @@ from .api import (
     pack_noise_factor,
     pre_quant,
     pre_quant_output_shapes,
+    supports_grouped_mixed_gemm,
     supports_lottery_family,
     tensor_hash,
     tensor_hash_plus_stats,
@@ -56,6 +63,8 @@ from .protocol_constants import (
 __all__ = [
     "BLOCK_SCALE_GROUP",
     "DELTA",
+    "GroupedFp8GemmConfig",
+    "GroupedMixedGemmConfig",
     "Hit",
     "HitRecordLayout",
     "HitSignal",
@@ -79,6 +88,9 @@ __all__ = [
     "default_mixed_gemm_config",
     "default_noisy_quant_config",
     "get_tensor_hash_plus_stats_config",
+    "grouped_fp8_gemm",
+    "grouped_fp8_gemm_scale_shapes",
+    "grouped_mixed_gemm",
     "mixed_gemm",
     "noise_lines",
     "noisy_quant",
@@ -86,6 +98,7 @@ __all__ = [
     "pack_noise_factor",
     "pre_quant",
     "pre_quant_output_shapes",
+    "supports_grouped_mixed_gemm",
     "supports_lottery_family",
     "tensor_hash",
     "tensor_hash_plus_stats",

@@ -15,6 +15,12 @@ header). The output is the 96-byte ``a_keys = seedA || noise-line keyA ||
 jackpot key`` (``miner_base.commitment_hash.AKeys``): word ``[8, 16)`` keys
 ``noisy_quant``'s E1 draw and the ``F_A`` ``noise_lines`` draw, word ``[16,
 24)`` is ``mixed_gemm``'s ``pow_key``.
+
+MoE (``miner_base.transcript.noise_seeds`` with routing commitments) splices
+the two 32-byte routing roots right after ``HA`` and appends ``hash_idR ||
+hash_idO`` to ``pA``:
+
+    noise seedA = blake3(HA || HR || HO || seedB || keyA || pA, key=Subkey("seed-A"))  (173 B: 3 blocks)
 """
 
 import struct
@@ -34,10 +40,15 @@ LABEL_NOISE_LINE = b"pearl/v4/FP8/noise-line"
 LABEL_JACKPOT = b"pearl/v4/FP8/jackpot"
 
 P_A_BYTES = 11  # u32(m) | u8(hash_id) | pattern(6): the dense pA
-_P_A_WORDS = (P_A_BYTES + 3) // 4
-_SEED_A_MSG_BYTES = 32 * 3 + P_A_BYTES  # HA || seedB || keyA || pA
-_SEED_A_BLOCK1_BYTES = _SEED_A_MSG_BYTES - 64
+P_A_MOE_BYTES = P_A_BYTES + 2  # ... | u8(hash_idR) | u8(hash_idO): the MoE pA
+_P_A_WORDS = (P_A_MOE_BYTES + 3) // 4  # both encodings fit four words
+ROUTING_COMMITMENTS_BYTES = 64  # HR || HO
 A_KEYS_BYTES = 96
+
+
+def _last_block_bytes(p_a_bytes: int) -> int:
+    """Bytes of seedA's closing block ``keyA || pA``."""
+    return 32 + p_a_bytes
 
 
 def _words(data: bytes) -> tuple[int, ...]:
@@ -52,9 +63,16 @@ _JACKPOT_LABEL = _words(LABEL_JACKPOT)
 
 
 def p_a_words(p_a: bytes) -> tuple[int, ...]:
-    """``pA`` as the constexpr words the finalize splices into seedA's second block."""
-    if not isinstance(p_a, bytes) or len(p_a) != P_A_BYTES:
-        raise ValueError(f"p_a must be the {P_A_BYTES}-byte dense pA encoding")
+    """``pA`` as the constexpr words the finalize splices into seedA's last block.
+
+    Accepts the 11-byte dense encoding or the 13-byte MoE encoding; the word
+    tuple is padded to four words either way, and ``len(p_a)`` (which also
+    selects the routing-commitment message layout) is passed separately.
+    """
+    if not isinstance(p_a, bytes) or len(p_a) not in (P_A_BYTES, P_A_MOE_BYTES):
+        raise ValueError(
+            f"p_a must be the {P_A_BYTES}-byte dense or {P_A_MOE_BYTES}-byte MoE pA encoding"
+        )
     return struct.unpack(f"<{_P_A_WORDS}I", p_a.ljust(4 * _P_A_WORDS, b"\x00"))
 
 
@@ -68,8 +86,10 @@ def _finalize_kernel(
     gRootScales: cute.Tensor,  # (8,) u32: merkle root of the scales plane
     gKeyA: cute.Tensor,  # (8,) u32: keyA (the header's A-side opening key)
     gSeedB: cute.Tensor,  # (8,) u32: noise seedB
+    gRouting: cute.Tensor | None,  # (16,) u32: HR || HO (MoE only)
     gOut: cute.Tensor,  # (24,) u32: seedA || noise-line keyA || jackpot key
     p_a: tuple,
+    p_a_bytes: cutlass.Constexpr[int],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     if tidx == 0:
@@ -77,13 +97,21 @@ def _finalize_kernel(
         roots = [gRootCodes[i] for i in range(8)] + [gRootScales[i] for i in range(8)]
         hash_a = compress(key_a, roots, 64, SINGLE_BLOCK_KEYED_FLAGS)
 
-        # seedA: a two-block single chunk under the "seed-A" subkey. Block 0
-        # (HA || seedB) opens the chunk, block 1 (keyA || pA, 43 bytes) closes
-        # it as the root.
-        block0 = list(hash_a) + [gSeedB[i] for i in range(8)]
-        cv = compress(_const(_SEED_A_KEY), block0, 64, CHUNK_START | KEYED_HASH)
-        block1 = key_a + _const(p_a) + _const([0] * (8 - _P_A_WORDS))
-        seed_a = compress(cv, block1, _SEED_A_BLOCK1_BYTES, CHUNK_END | ROOT | KEYED_HASH)
+        # seedA: one chunk under the "seed-A" subkey. Dense: block 0 (HA ||
+        # seedB) opens the chunk and block 1 (keyA || pA, 43 bytes) closes it
+        # as the root. MoE: block 0 (HA || HR) opens, block 1 (HO || seedB) is
+        # the middle block, block 2 (keyA || pA, 45 bytes) closes.
+        seed_b = [gSeedB[i] for i in range(8)]
+        if cutlass.const_expr(gRouting is not None):
+            block0 = list(hash_a) + [gRouting[i] for i in range(8)]
+            cv = compress(_const(_SEED_A_KEY), block0, 64, CHUNK_START | KEYED_HASH)
+            block1 = [gRouting[8 + i] for i in range(8)] + seed_b
+            cv = compress(cv, block1, 64, KEYED_HASH)
+        else:
+            block0 = list(hash_a) + seed_b
+            cv = compress(_const(_SEED_A_KEY), block0, 64, CHUNK_START | KEYED_HASH)
+        last = key_a + _const(p_a) + _const([0] * (8 - _P_A_WORDS))
+        seed_a = compress(cv, last, _last_block_bytes(p_a_bytes), CHUNK_END | ROOT | KEYED_HASH)
 
         noise_key = compress(
             seed_a, _const(_NOISE_LINE_LABEL), len(LABEL_NOISE_LINE), SINGLE_BLOCK_KEYED_FLAGS
@@ -103,11 +131,13 @@ def _finalize_launch(
     gRootScales: cute.Tensor,
     gKeyA: cute.Tensor,
     gSeedB: cute.Tensor,
+    gRouting: cute.Tensor | None,
     gOut: cute.Tensor,
     stream: cuda_drv.CUstream,
     p_a: cutlass.Constexpr,
+    p_a_bytes: cutlass.Constexpr,
 ):
-    _finalize_kernel(gRootCodes, gRootScales, gKeyA, gSeedB, gOut, p_a).launch(
+    _finalize_kernel(gRootCodes, gRootScales, gKeyA, gSeedB, gRouting, gOut, p_a, p_a_bytes).launch(
         grid=(1, 1, 1),
         block=(32, 1, 1),
         stream=stream,

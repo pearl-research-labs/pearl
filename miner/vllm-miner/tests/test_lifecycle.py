@@ -118,3 +118,21 @@ def test_pointer_change_fails_closed(owner):
 
     assert ("resume", 17) not in events
     lifecycle.reset_for_tests()
+
+
+def test_state_pointers_skip_the_missing_moe_fallback_operands(monkeypatch):
+    """MoE states carry no dense FP8 fallback; only their real tensors are pinned."""
+    from types import SimpleNamespace
+
+    import torch
+
+    weight, scale = torch.zeros(4, 8), torch.zeros(4, 1)
+    state = SimpleNamespace(
+        layer_id=3, weight=weight, weight_scale=scale, w_fp8=None, w_fp8_scale=None, buffers=None
+    )
+    monkeypatch.setattr(lifecycle_module, "all_states", lambda: [state])
+
+    assert lifecycle_module._state_pointers() == {
+        (3, "weight"): weight.data_ptr(),
+        (3, "weight_scale"): scale.data_ptr(),
+    }

@@ -20,7 +20,16 @@ from miner_utils import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob
 
 from .fp8_fallback import build_fp8_fallback
-from .mining_config import PACKED_NOISE_K, RANK, SCALE_BLOCK, is_mineable_shape, select_tile
+from .mining_config import (
+    MOE_LOTTERY_N,
+    PACKED_NOISE_K,
+    RANK,
+    SCALE_BLOCK,
+    expert_n,
+    is_mineable_shape,
+    select_tile,
+)
+from .moe import validate_moe_dims
 from .tuning import device_config_name, tuned, with_committed_leaf
 
 _LOGGER = get_logger(__name__)
@@ -146,14 +155,26 @@ class LayerState:
     k: int
     mineable: bool
     buffers: LayerBuffers | None
-    w_fp8: torch.Tensor  # (n, k) float8_e4m3fn fallback operand
-    w_fp8_scale: torch.Tensor  # (1, n) float32
+    # Dense unmined-forward operands: (n, k) float8_e4m3fn and its (1, n)
+    # float32 row scales. None for MoE layers, whose framework adapter serves
+    # its own unmined path from the retained BF16 weight.
+    w_fp8: torch.Tensor | None
+    w_fp8_scale: torch.Tensor | None
     # The job the steady buffers currently hold, or None before the first
     # preparation / after unpublication. Read and replaced under ``lock``.
     job_ctx: JobContext | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     mining_error_logged: bool = False
     disabled_reason: str | None = None
+    # MoE: ``weight`` stacks ``experts`` expert matrices of ``n // experts``
+    # rows each and every token routes to ``top_k`` of them (0 for dense).
+    experts: int = 0
+    top_k: int = 0
+
+    @property
+    def lottery_n(self) -> int:
+        """Columns the lottery lattice spans: ``n`` dense, ``n_e`` per expert for MoE."""
+        return expert_n(self.n, self.experts)
 
     def disable_mining(self, reason: str) -> None:
         """Permanently isolate one deterministic layer failure from serving.
@@ -186,6 +207,17 @@ def _kernels_available() -> bool:
         _LOGGER.opt(exception=True).warning("pearl_gemm import failed; layer will not mine")
         return False
     return True
+
+
+def _grouped_kernel_available(device: torch.device) -> bool:
+    """Whether ``device`` has the MoE grouped GEMM. An unavailable package or
+    an unknown architecture is a refusal, the same fail-closed outcome as
+    ``_kernels_available``."""
+    if not _kernels_available():
+        return False
+    from pearl_gemm import supports_grouped_mixed_gemm
+
+    return supports_grouped_mixed_gemm(device)
 
 
 @lru_cache(maxsize=256)
@@ -285,16 +317,23 @@ def _lottery_family_available(n: int, k: int, device: torch.device) -> bool:
     return tile is not None and supports_lottery_family(tile.rows, device)
 
 
-def can_mine_layer(n: int, k: int, device: torch.device) -> bool:
+def can_mine_layer(n: int, k: int, device: torch.device, experts: int = 0) -> bool:
     """Whether this device/shape runs the mined pipeline. Layers that cannot
     mine must stay on their original unquantized path: encoding them would
-    trade serving quality for zero protocol value."""
+    trade serving quality for zero protocol value. ``experts`` is the MoE
+    expert count of a stacked ``(experts * n_e, k)`` weight; the grouped
+    mining kernel needs ``n_e`` on its 128-column lottery lattice and exists
+    only on SM100 and SM120, so other families leave expert layers
+    unquantized."""
+    if experts and (n % (experts * MOE_LOTTERY_N) or not _grouped_kernel_available(device)):
+        return False
+    n_e = expert_n(n, experts)
     return (
         supports_layer_shape(n, k)
-        and is_mineable_shape(n, k)
+        and is_mineable_shape(n_e, k)
         and _mines_on(device)
         and _kernels_available()
-        and _lottery_family_available(n, k, device)
+        and _lottery_family_available(n_e, k, device)
     )
 
 
@@ -304,8 +343,8 @@ class _StaticLayerEncoding:
     weight_scale: torch.Tensor
     weight_cpu: torch.Tensor
     weight_scale_cpu: torch.Tensor
-    w_fp8: torch.Tensor
-    w_fp8_scale: torch.Tensor
+    w_fp8: torch.Tensor | None
+    w_fp8_scale: torch.Tensor | None
 
 
 def _validate_bf16_weight(bf16_weight: torch.Tensor) -> tuple[int, int]:
@@ -320,11 +359,17 @@ def _validate_bf16_weight(bf16_weight: torch.Tensor) -> tuple[int, int]:
     return n, k
 
 
-def _encode_static_weight(bf16_weight: torch.Tensor) -> _StaticLayerEncoding:
+def _encode_static_weight(
+    bf16_weight: torch.Tensor, *, dense_fallback: bool = True
+) -> _StaticLayerEncoding:
+    """Encode the committed FP10 planes, plus the FP8 operands of the dense
+    unmined forward when ``dense_fallback`` (MoE layers never run it)."""
     pq = PrequantMatrix.encode(bf16_weight)
     weight = pq.int_values.contiguous()
     weight_scale = pq.scales.contiguous()
-    w_fp8, w_fp8_scale = build_fp8_fallback(weight, weight_scale)
+    w_fp8 = w_fp8_scale = None
+    if dense_fallback:
+        w_fp8, w_fp8_scale = build_fp8_fallback(weight, weight_scale)
     return _StaticLayerEncoding(
         weight=weight,
         weight_scale=weight_scale,
@@ -335,15 +380,28 @@ def _encode_static_weight(bf16_weight: torch.Tensor) -> _StaticLayerEncoding:
     )
 
 
-def create_layer_state(layer_name: str, bf16_weight: torch.Tensor) -> LayerState:
-    """Encode a loaded BF16 weight and build one graph-stable layer state."""
+def create_layer_state(
+    layer_name: str, bf16_weight: torch.Tensor, *, experts: int = 0, top_k: int = 0
+) -> LayerState:
+    """Encode a loaded BF16 weight and build one graph-stable layer state.
+
+    An MoE layer passes its stacked ``(experts * n_e, k)`` gate/up weight with
+    ``experts`` and the router's ``top_k``; it is committed as one B. It gets
+    no dense FP8 fallback operands (``w_fp8`` is None).
+    """
     n, k = _validate_bf16_weight(bf16_weight)
-    encoded = _encode_static_weight(bf16_weight)
+    if type(experts) is not int or type(top_k) is not int:
+        raise ValueError(f"experts and top_k must be ints, got {experts!r}, {top_k!r}")
+    if experts or top_k:
+        validate_moe_dims(experts, top_k)
+    encoded = _encode_static_weight(bf16_weight, dense_fallback=not experts)
     # Callers gate on can_mine_layer, so reaching here without it is a bug.
-    mineable = can_mine_layer(n, k, encoded.weight.device)
+    mineable = can_mine_layer(n, k, encoded.weight.device, experts)
     if not mineable:
         raise RuntimeError(f"layer {layer_name} (n={n}, k={k}) is not mineable on this device")
     return LayerState(
+        experts=experts,
+        top_k=top_k,
         layer_name=layer_name,
         layer_id=next(_NEXT_LAYER_ID),
         weight=encoded.weight,
@@ -375,12 +433,13 @@ def refresh_layer_state(state: LayerState, bf16_weight: torch.Tensor) -> None:
     with state.lock:
         if state.job_ctx is not None:
             raise RuntimeError(f"cannot refresh active mining layer {state.layer_name}")
-    encoded = _encode_static_weight(bf16_weight)
+    encoded = _encode_static_weight(bf16_weight, dense_fallback=state.w_fp8 is not None)
     with torch.no_grad():
         state.weight.copy_(encoded.weight)
         state.weight_scale.copy_(encoded.weight_scale)
-        state.w_fp8.copy_(encoded.w_fp8)
-        state.w_fp8_scale.copy_(encoded.w_fp8_scale)
+        if state.w_fp8 is not None and state.w_fp8_scale is not None:
+            state.w_fp8.copy_(encoded.w_fp8)
+            state.w_fp8_scale.copy_(encoded.w_fp8_scale)
     with state.lock:
         if state.job_ctx is not None:
             raise RuntimeError(f"mining layer {state.layer_name} became active during reload")

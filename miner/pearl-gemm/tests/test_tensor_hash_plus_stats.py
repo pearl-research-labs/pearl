@@ -35,7 +35,15 @@ import torch
 from blake3 import blake3
 from miner_base.commitment import HashId, commit_planes
 from miner_base.commitment_hash import a_keys as ref_a_keys
+from miner_base.params import MoeParams, encode_p_a
 from miner_base.prequant import PrequantMatrix
+from miner_base.transcript import (
+    LABEL_JACKPOT,
+    LABEL_NOISE_LINE,
+    LABEL_SEED_A,
+    hash_labelled,
+    subkey,
+)
 
 from pearl_gemm import (
     TensorHashConfig,
@@ -56,6 +64,7 @@ from pearl_gemm.tensor_hash_plus_stats._merkle_host import (
     tensor_hash_smem_bytes,
 )
 from tests.helpers.chain import p_a_for
+from tests.helpers.preprocess import default_config
 from tests.helpers.smem import skip_unless_tensor_hash_fits, tensor_hash_config_fits
 
 _KEY = bytes(range(32))
@@ -577,6 +586,56 @@ def test_activation_finalize_uses_current_stream():
     stream.synchronize()
 
     _assert_commitment(buffers, codes, scales, jk, c_b)
+
+
+def _moe_p_a(m: int, k: int) -> bytes:
+    """The 13-byte MoE ``pA``: the dense encoding plus ``hash_idR || hash_idO``."""
+    moe = MoeParams(experts=8, hash_id_r=_LEAF, hash_id_o=_LEAF)
+    return encode_p_a(default_config(k).a_params(m), moe)
+
+
+def test_moe_routing_commitments_bind_into_seed_a():
+    """MoE: ``seedA = H_"seed-A"(HA || HR || HO || seedB || keyA || pA)`` with
+    the 13-byte MoE ``pA``; the noise-line and jackpot keys follow from it,
+    and HR / HO each change every key."""
+    m, k = 32, 512
+    key_a, seed_b = blake3(b"moe-job").digest(), blake3(b"moe-cb").digest()
+    codes, scales = _blobs_gpu(_make_input(m, k, seed=3))
+    hash_r, hash_o = blake3(b"routing").digest(), blake3(b"offsets").digest()
+    p_a = _moe_p_a(m, k)
+    assert len(p_a) == len(p_a_for(m, k)) + 2
+    comm = commit_planes([codes.cpu(), scales.cpu()], key_a, _LEAF)
+
+    seen = set()
+    for hr, ho in ((hash_r, hash_o), (bytes(32), hash_o), (hash_r, bytes(32))):
+        buffers = _buffers(m, k, key_a, seed_b)
+        buffers["p_a"] = p_a
+        routing = torch.frombuffer(bytearray(hr + ho), dtype=torch.uint8).cuda()
+        tensor_hash_plus_stats(codes, scales, **buffers, routing_commitments=routing)
+        torch.cuda.synchronize()
+        seed_a = hash_labelled(comm.digest + hr + ho + seed_b + key_a + p_a, LABEL_SEED_A)
+        expected = seed_a + subkey(LABEL_NOISE_LINE, seed_a) + subkey(LABEL_JACKPOT, seed_a)
+        got = bytes(buffers["a_keys"].cpu().numpy())
+        assert got == expected
+        seen.add(got)
+    assert len(seen) == 3
+
+
+def test_moe_pa_and_routing_commitments_come_together():
+    m, k = 32, 512
+    codes, scales = _blobs_gpu(_make_input(m, k, seed=3))
+    routing = torch.zeros(64, dtype=torch.uint8, device="cuda")
+    buffers = _buffers(m, k, _KEY, blake3(b"cb").digest())
+    with pytest.raises(ValueError, match="passed together"):
+        tensor_hash_plus_stats(codes, scales, **buffers, routing_commitments=routing)
+    buffers["p_a"] = _moe_p_a(m, k)
+    with pytest.raises(ValueError, match="passed together"):
+        tensor_hash_plus_stats(codes, scales, **buffers)
+    with pytest.raises(ValueError, match="routing_commitments must have shape"):
+        tensor_hash_plus_stats(codes, scales, **buffers, routing_commitments=routing[:32])
+    buffers["p_a"] = bytes(12)
+    with pytest.raises(ValueError, match="13-byte MoE pA"):
+        tensor_hash_plus_stats(codes, scales, **buffers, routing_commitments=routing)
 
 
 def test_rejects_short_keys():

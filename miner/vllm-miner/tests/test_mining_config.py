@@ -274,8 +274,8 @@ def test_tile_layout_matches_reference_and_kernel():
 def test_m_buckets_parse_and_validate(monkeypatch):
     monkeypatch.setenv("PEARL_M_BUCKETS", "8192,2048")
     assert RuntimeSettings().m_buckets == (2048, 8192)
-    # 64-multiples below 256 are legal: decode pads to them and mines under
-    # the 64-row kernel tile instead of padding up to 256.
+    # 64-multiples below 256 are legal: decode batches use them and mine under
+    # the 64-row kernel tile instead of a 256-row bucket.
     monkeypatch.setenv("PEARL_M_BUCKETS", "64,2048")
     assert RuntimeSettings().m_buckets == (64, 2048)
     for invalid in ("1000", "0", "-256", "32"):

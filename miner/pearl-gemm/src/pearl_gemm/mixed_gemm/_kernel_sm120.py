@@ -21,10 +21,18 @@ Every mma warp owns one 16-row slab spanning the whole ``tile_n``
 lottery words: rows ``T >> 2`` and ``(T >> 2) + 8`` of its slab at the
 mod-8 column pair ``2 * (T & 3)``. That is the 4-row lottery family only;
 the 16-row family's whole-row words are split across four lanes.
+
+``grouped_mixed_gemm``'s subclass compiles the MoE variant of the same
+kernel: each work tile belongs to one expert, whose operands are per-expert
+views (ragged A / D rows, offset A_peel rows and B / B_peel columns) and
+whose lottery restarts at the expert's first row. It overrides the per-tile
+hooks (``_tile_group`` and the helpers that take its ``group``), each the
+identity on a dense tile, so the dense trace is unchanged.
 """
 
 import enum
 from functools import partial
+from typing import NamedTuple
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -38,6 +46,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum, SmemPartition, blockscaled_layout
 from quack import sm80_utils
+from quack.cute_dsl_utils import mlir_namedtuple
 from quack.epilogue.ops import EpiSmemBytes
 from quack.gemm_base import NamedBarrierGemm
 from quack.gemm_sm120 import GemmSm120, _sf_group_vmk
@@ -86,11 +95,38 @@ class _NamedBarrier(enum.IntEnum):
     ALPHA_READY = 13
 
 
+@mlir_namedtuple
+class _Grouping(NamedTuple):
+    """Grouped-launch operands: ``m_indptr`` / ``m_valid`` (see
+    ``grouped_mixed_gemm``) and the problem extents -- permuted rows
+    ``cum_m``, per-expert columns ``n`` and ``k`` -- which a grouped launch
+    compiles symbolically, so the kernel takes them as arguments."""
+
+    m_indptr: cute.Tensor
+    m_valid: cute.Tensor
+    cum_m: Int32
+    n: Int32
+    k: Int32
+
+
+class _TileGroup(NamedTuple):
+    """One work tile's expert: its index, its block of the permuted rows
+    ``[row0, row0 + rows)`` and its real (publishable) row count."""
+
+    index: Int32
+    row0: Int32
+    rows: Int32
+    valid_rows: Int32
+
+
 class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
     """Quack's SM120 GEMM with lottery, peel, and unscale fused in."""
 
     # GemmSm120._setup_attributes inspects the epilogue-op tuple; this kernel has none.
     _epi_ops = ()
+    # The grouped (MoE) subclass flips both; see the module docstring.
+    grouped = False
+    scheduler_cls = TileScheduler
 
     def __init__(
         self,
@@ -334,6 +370,7 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
         layer_id: Int32,
         record_hits: Int32,
         tile_coord_mnkl,
+        group: _TileGroup | None,
         warp_group_idx: cutlass.Constexpr,
         lane: Int32,
     ):
@@ -365,9 +402,7 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
                 + thread_row
             )
             tile_column = tile_coord_mnkl[1] * self.column_tiles + column_tile
-            in_bounds = Boolean(tile_row * LTILE_ROWS < self.problem_m) & Boolean(
-                tile_column * self.ltile_cols < self.problem_n
-            )
+            in_bounds, hit_group = self._lottery_tile_bounds(tile_row, tile_column, group)
             words = [sExt[warp_group_idx, message, column].to(Uint32) for column in range(LANES)]
             digest = compress(
                 list(chaining_value),
@@ -392,6 +427,7 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
                 layer_id,
                 record_hits,
                 local_hit,
+                hit_group,
             )
         cute.arch.barrier_arrive(
             barrier_id=int(_NamedBarrier.LOTTERY_BUFFER_FREE_WG0) + warp_group_idx,
@@ -399,21 +435,11 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
         )
 
     @cute.jit
-    def _stage_alpha_slices(
-        self,
-        mAlA: cute.Tensor,
-        mAlB: cute.Tensor,
-        sAlA: cute.Tensor,
-        sAlB: cute.Tensor,
-        tile_coord_mnkl,
-        tidx: Int32,
-    ):
-        """Stage this tile's row and column scales with asynchronous copies."""
+    def _stage_alpha_slices(self, slices, tile_coord_mnkl, tidx: Int32):
+        """Stage this tile's scale slices, each ``(global_scale, shared_scale,
+        coordinate_mode, tile_extent)``, with asynchronous copies."""
         alpha_threads = self.num_mma_warps * cute.arch.WARP_SIZE
-        for global_scale, shared_scale, coordinate_mode, tile_extent in (
-            (mAlA, sAlA, 0, self.tile_m),
-            (mAlB, sAlB, 1, self.tile_n),
-        ):
+        for global_scale, shared_scale, coordinate_mode, tile_extent in slices:
             thread_copy = copy_utils.tiled_copy_1d(
                 global_scale.element_type,
                 alpha_threads,
@@ -450,13 +476,40 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
         cute.arch.cp_async_commit_group()
 
     @cute.jit
-    def _row_inverse_scales(self, sAlA: cute.Tensor, warp_idx: Int32, lane: Int32):
-        """Wait for the staged scales and load this lane's two row reciprocals."""
+    def _stage_tile_alphas(
+        self,
+        mAlA: cute.Tensor,
+        mAlB: cute.Tensor,
+        sAlA: cute.Tensor,
+        sAlB: cute.Tensor,
+        group: _TileGroup | None,
+        tile_coord_mnkl,
+        warp_idx: Int32,
+        lane: Int32,
+        tidx: Int32,
+    ):
+        """Stage this tile's row and column scales while the mainloop runs.
+        Returns the register copy of this lane's row scales, which a dense
+        tile does not need (``_row_inverse_scales`` reads ``sAlA``)."""
+        self._stage_alpha_slices(
+            ((mAlA, sAlA, 0, self.tile_m), (mAlB, sAlB, 1, self.tile_n)), tile_coord_mnkl, tidx
+        )
+        return None
+
+    @cute.jit
+    def _wait_alpha_slices(self):
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier(
             barrier_id=int(_NamedBarrier.ALPHA_READY),
             number_of_threads=self.num_mma_warps * cute.arch.WARP_SIZE,
         )
+
+    @cute.jit
+    def _row_inverse_scales(
+        self, sAlA: cute.Tensor, row_alpha: cute.Tensor | None, warp_idx: Int32, lane: Int32
+    ):
+        """Wait for the staged scales and load this lane's two row reciprocals."""
+        self._wait_alpha_slices()
         row_inverse = cute.make_rmem_tensor(2, Float32)
         for row_half in cutlass.range_constexpr(2):
             row = WARP_ROWS * warp_idx + (lane >> 2) + 8 * row_half
@@ -576,6 +629,22 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
         ab_read_state.advance()
         return ab_read_state
 
+    def _tile_scheduler_params(self, grouping: _Grouping | None):
+        """The dense launch's persistent tile schedule; the grouped subclass
+        schedules over experts instead."""
+        tile_sched_args = TileSchedulerArguments(
+            problem_shape_ntile_mnl=(
+                cute.ceil_div(self.problem_m, self.tile_m),
+                cute.ceil_div(self.problem_n, self.tile_n),
+                1,
+            ),
+            raster_order=RasterOrderOption.Heuristic,
+            group_size=Int32(_RASTER_GROUP_SIZE),
+            cluster_shape_mnk=self.cluster_shape_mnk,
+            persistence_mode=PersistenceMode.STATIC,
+        )
+        return TileScheduler.to_underlying_arguments(tile_sched_args)
+
     @cute.jit
     def __call__(
         self,
@@ -599,23 +668,35 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
         record_hits: Int32,  # runtime gate: hash always, publish only when nonzero
         max_active_clusters: Int32,
         stream: cuda_driver.CUstream,
+        grouping: _Grouping | None = None,
     ):
+        """Trace-time setup and launch. ``grouping`` (the grouped variant
+        only) makes ``mAq`` the permuted ``(cum_m, k)`` rows, ``mBq`` the
+        stacked ``(E * n, k)`` experts and every other operand likewise."""
+        assert (grouping is not None) == self.grouped
         payload_tensors = (mCodesSrc, mScalesSrc, mCodesDst, mScalesDst)
         assert all((t is not None) == self.snapshot_payload for t in payload_tensors), (
             "payload tensor presence must match the compiled snapshot variant"
         )
         # Static problem shape and payload byte counts, baked into the hit
-        # record writes (shapes are compile-time for a given launch).
+        # record writes (shapes are compile-time for a given launch). A
+        # grouped launch's m is the permuted row total and n is per expert.
         self.problem_m = cute.size(mAq, mode=[0])
         self.problem_n = cute.size(mBq, mode=[0])
         self.problem_k = cute.size(mAq, mode=[1])
-        self.codes_payload_bytes = self.problem_m * self.problem_k
-        self.scales_payload_bytes = self.problem_m * (self.problem_k // 8) * 2
-        if const_expr(self.snapshot_payload):
-            assert cute.size(mCodesSrc) * 4 == self.codes_payload_bytes
-            assert cute.size(mScalesSrc) * 4 == self.scales_payload_bytes
-            assert cute.size(mCodesDst) == cute.size(mCodesSrc)
-            assert cute.size(mScalesDst) == cute.size(mScalesSrc)
+        if const_expr(grouping is not None):
+            self.problem_m, self.problem_n, self.problem_k = grouping.cum_m, grouping.n, grouping.k
+        # Grouped launches are compiled over symbolic shapes (the host checks
+        # the planes) and size the snapshot per hit, the winning expert's rows
+        # against the signal's capacity.
+        if const_expr(grouping is None):
+            self.codes_payload_bytes = self.problem_m * self.problem_k
+            self.scales_payload_bytes = self.problem_m * (self.problem_k // 8) * 2
+            if const_expr(self.snapshot_payload):
+                assert cute.size(mCodesSrc) * 4 == self.codes_payload_bytes
+                assert cute.size(mScalesSrc) * 4 == self.scales_payload_bytes
+                assert cute.size(mCodesDst) == cute.size(mCodesSrc)
+                assert cute.size(mScalesDst) == cute.size(mScalesSrc)
         self.a_dtype = mAq.element_type
         self.b_dtype = mBq.element_type
         self.d_dtype = mD.element_type
@@ -642,14 +723,17 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
         tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = self.make_tma_load_atoms_and_tensors(
-            mAq, mBq, a_smem_layout, b_smem_layout, varlen_k=False
+            self._launch_row_operand(mAq), mBq, a_smem_layout, b_smem_layout, varlen_k=False
         )
         self.num_tma_load_bytes = cute.size_in_bytes(
             self.a_dtype, a_smem_layout
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
         tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
-            mD, self.epi_smem_layout_staged, self.epi_tile, op_type="store"
+            self._launch_row_operand(mD, store=True),
+            self.epi_smem_layout_staged,
+            self.epi_tile,
+            op_type="store",
         )
         bf16 = cutlass.BFloat16
         # Peel operands ride the main AB TMA ring: one extra ring slot per
@@ -693,19 +777,8 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
             "peel MMA must share the mainloop accumulator fragment"
         )
 
-        tile_sched_args = TileSchedulerArguments(
-            problem_shape_ntile_mnl=(
-                cute.ceil_div(self.problem_m, self.tile_m),
-                cute.ceil_div(self.problem_n, self.tile_n),
-                1,
-            ),
-            raster_order=RasterOrderOption.Heuristic,
-            group_size=Int32(_RASTER_GROUP_SIZE),
-            cluster_shape_mnk=self.cluster_shape_mnk,
-            persistence_mode=PersistenceMode.STATIC,
-        )
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
-        grid = TileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+        tile_sched_params = self._tile_scheduler_params(grouping)
+        grid = self.scheduler_cls.get_grid_shape(tile_sched_params, max_active_clusters)
 
         sext_size = self.mma_warp_groups * self.msgs_wg * _SEXT_PAD
 
@@ -763,6 +836,7 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
             pa_smem_layout_staged,
             pb_smem_layout_staged,
             tile_sched_params,
+            grouping,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -770,6 +844,81 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
             stream=stream,
             min_blocks_per_mp=1,
         )
+
+    # -- per-tile hooks: the identity on a dense tile; the grouped subclass
+    # resolves each work tile to its expert's views --
+
+    def _launch_row_operand(self, tensor: cute.Tensor, *, store: bool = False):
+        """The launch-wide TMA view of a row operand (A', D)."""
+        return tensor
+
+    @cute.jit
+    def _tile_group(self, grouping: _Grouping | None, tile_coord_mnkl) -> _TileGroup | None:
+        """The work tile's group (``None``: dense)."""
+        return None
+
+    def _row_operand(self, tensor: cute.Tensor, group: _TileGroup | None, *, store: bool = False):
+        """The tile's view of a row operand (A', D)."""
+        return tensor
+
+    def _column_operand(self, tensor: cute.Tensor, group: _TileGroup | None):
+        """The tile's view of a stacked column operand (B', B_peel)."""
+        return tensor
+
+    @cute.jit
+    def _tile_peel_partitions(
+        self,
+        hoisted,
+        tma_atom_pa: cute.CopyAtom,
+        mPa: cute.Tensor,
+        sPa: cute.Tensor,
+        tma_atom_pb: cute.CopyAtom,
+        mPb: cute.Tensor,
+        sPb: cute.Tensor,
+        group: _TileGroup | None,
+    ):
+        """The tile's peel TMA partitions: a dense tile reuses the ``hoisted``
+        launch-wide ones."""
+        return hoisted
+
+    @cute.jit
+    def _lottery_tile_bounds(self, tile_row: Int32, tile_column: Int32, group: _TileGroup | None):
+        """Whether lottery tile ``(tile_row, tile_column)`` may publish, and
+        its ``_HitGroup`` (``None``: dense)."""
+        in_bounds = Boolean(tile_row * LTILE_ROWS < self.problem_m) & Boolean(
+            tile_column * self.ltile_cols < self.problem_n
+        )
+        return in_bounds, None
+
+    @cute.jit
+    def _peel_tma_partitions(
+        self,
+        tma_atom_pa: cute.CopyAtom,
+        mPa: cute.Tensor,
+        sPa: cute.Tensor,
+        tma_atom_pb: cute.CopyAtom,
+        mPb: cute.Tensor,
+        sPb: cute.Tensor,
+    ):
+        """TMA partitions of the peel operands, indexed by M / N tile."""
+        cta_layout = cute.make_layout(1)
+        gPa_all = cute.local_tile(mPa, (self.tile_m, R2), (None, 0))
+        tPsPa, tPgPa = cpasync.tma_partition(
+            tma_atom_pa,
+            0,
+            cta_layout,
+            cute.group_modes(sPa, 0, 2),
+            cute.group_modes(gPa_all, 0, 2),
+        )
+        gPb_all = cute.local_tile(mPb, (self.tile_n, R2), (None, 0))
+        tPsPb, tPgPb = cpasync.tma_partition(
+            tma_atom_pb,
+            0,
+            cta_layout,
+            cute.group_modes(sPb, 0, 2),
+            cute.group_modes(gPb_all, 0, 2),
+        )
+        return tPsPa, tPgPa, tPsPb, tPgPb
 
     # noqa C901: a warp-specialized persistent kernel. Its branches are
     # compile-time role dispatch that must stay in one traced body.
@@ -808,7 +957,11 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
         pa_smem_layout: cute.ComposedLayout,
         pb_smem_layout: cute.ComposedLayout,
         tile_sched_params,
+        grouping: _Grouping | None,
     ):
+        if const_expr(grouping is not None):
+            # The device-side extents: the launch's values are host SSA.
+            self.problem_m, self.problem_n, self.problem_k = grouping.cum_m, grouping.n, grouping.k
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # Prefetch TMA descriptors
@@ -854,7 +1007,7 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
         )
 
         TileSchedulerCreate = partial(
-            TileScheduler.create, tile_sched_params, sched_data, sched_pipeline
+            self.scheduler_cls.create, tile_sched_params, sched_data, sched_pipeline
         )
         k_tile_cnt = cute.ceil_div(cute.size(mAq, mode=[1]), self.cta_tile_shape_mnk[2])
 
@@ -865,23 +1018,11 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
             cute.arch.setmaxregister_decrease(self.num_regs_load)
             if warp_idx == self.ab_load_warp_id:
                 # -------- TMA load warp (also the scheduler warp) --------
-                cta_layout = cute.make_layout(1)
-                gPa_all = cute.local_tile(mPa, (self.tile_m, R2), (None, 0))
-                tPsPa, tPgPa = cpasync.tma_partition(
-                    tma_atom_pa,
-                    0,
-                    cta_layout,
-                    cute.group_modes(sPa, 0, 2),
-                    cute.group_modes(gPa_all, 0, 2),
-                )
-                gPb_all = cute.local_tile(mPb, (self.tile_n, R2), (None, 0))
-                tPsPb, tPgPb = cpasync.tma_partition(
-                    tma_atom_pb,
-                    0,
-                    cta_layout,
-                    cute.group_modes(sPb, 0, 2),
-                    cute.group_modes(gPb_all, 0, 2),
-                )
+                tPsPa, tPgPa, tPsPb, tPgPb = (None,) * 4
+                if const_expr(not self.grouped):
+                    tPsPa, tPgPa, tPsPb, tPgPb = self._peel_tma_partitions(
+                        tma_atom_pa, mPa, sPa, tma_atom_pb, mPb, sPb
+                    )
 
                 tile_scheduler = TileSchedulerCreate(is_scheduler_warp=True)
                 work_tile = tile_scheduler.initial_work_tile_info()
@@ -890,8 +1031,9 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
                 )
                 while work_tile.is_valid_tile:
                     tile_coord_mnkl = work_tile.tile_idx
+                    group = self._tile_group(grouping, tile_coord_mnkl)
                     gA_mk = cute.local_tile(
-                        mAq,
+                        self._row_operand(mAq, group),
                         cute.select(self.cta_tile_shape_mnk, [0, 2]),
                         (tile_coord_mnkl[0], None),
                     )
@@ -899,7 +1041,7 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
                         tma_atom_a, src_tensor=gA_mk, dst_tensor=sA
                     )
                     gB_nk = cute.local_tile(
-                        mBq,
+                        self._column_operand(mBq, group),
                         cute.select(self.cta_tile_shape_mnk, [1, 2]),
                         (tile_coord_mnkl[1], None),
                     )
@@ -908,6 +1050,16 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
                     )
                     ab_producer_state = self.load_tma(
                         ab_pipeline, ab_producer_state, [copy_A, copy_B], k_tile_cnt
+                    )
+                    tile_sPa, tile_gPa, tile_sPb, tile_gPb = self._tile_peel_partitions(
+                        (tPsPa, tPgPa, tPsPb, tPgPb),
+                        tma_atom_pa,
+                        mPa,
+                        sPa,
+                        tma_atom_pb,
+                        mPb,
+                        sPb,
+                        group,
                     )
                     # A_peel + B_peel take the (k_tile_cnt+1)-th ring slot
                     # of this tile. extra_tx_count rebases the expect-tx
@@ -919,14 +1071,14 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
                     peel_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
                     cute.copy(
                         tma_atom_pa,
-                        tPgPa[(None, tile_coord_mnkl[0])],
-                        tPsPa[(None, ab_producer_state.index)],
+                        tile_gPa[(None, tile_coord_mnkl[0])],
+                        tile_sPa[(None, ab_producer_state.index)],
                         tma_bar_ptr=peel_bar,
                     )
                     cute.copy(
                         tma_atom_pb,
-                        tPgPb[(None, tile_coord_mnkl[1])],
-                        tPsPb[(None, ab_producer_state.index)],
+                        tile_gPb[(None, tile_coord_mnkl[1])],
+                        tile_sPb[(None, ab_producer_state.index)],
                         tma_bar_ptr=peel_bar,
                     )
                     ab_pipeline.producer_commit(ab_producer_state)
@@ -966,6 +1118,7 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
                             layer_id,
                             record_hits,
                             work_tile.tile_idx,
+                            self._tile_group(grouping, work_tile.tile_idx),
                             warp_group_idx,
                             lane,
                         )
@@ -1024,8 +1177,11 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
+                group = self._tile_group(grouping, tile_coord_mnkl)
                 # Stage this tile's alpha slices while the mainloop runs.
-                self._stage_alpha_slices(mAlA, mAlB, sAlA, sAlB, tile_coord_mnkl, tidx)
+                row_alpha = self._stage_tile_alphas(
+                    mAlA, mAlB, sAlA, sAlB, group, tile_coord_mnkl, warp_idx, lane, tidx
+                )
                 acc.fill(0.0)
                 ab_read_state = self.mma(
                     ab_pipeline,
@@ -1046,10 +1202,10 @@ class _FusedGemmSm120(_HitPublishMixin, GemmSm120):
                 self._stage_lottery_messages(acc, sExt, warp_group_idx, warp_in_wg, lane)
 
                 ab_read_state = peel(ab_pipeline, ab_read_state)
-                row_inverse = self._row_inverse_scales(sAlA, warp_idx, lane)
+                row_inverse = self._row_inverse_scales(sAlA, row_alpha, warp_idx, lane)
                 copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                     tma_atom_d,
-                    mD,
+                    self._row_operand(mD, group, store=True),
                     self.cta_tile_shape_mnk[:2],
                     self.epi_tile,
                     sD,

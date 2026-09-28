@@ -119,6 +119,21 @@ def test_gpu_side_digest_combine_matches_the_cpu_tree():
     assert noise_seed_a(operand_digest(roots_a, key_a), seed_b, key_a, config.p_a(64)) == seed_a
 
 
+def test_moe_seed_a_binds_the_routing_commitments():
+    """The MoE twin of ``seedA`` inserts ``HR || HO`` after ``HA``, exactly as
+    the transcript's ``noise_seeds`` does; anything but 0 or 64 bytes is refused."""
+    hash_a, hash_b, key_a, key_b = (bytes([i]) * 32 for i in range(1, 5))
+    p_a, p_b = b"pA", b"pB"
+    hr, ho = b"\x05" * 32, b"\x06" * 32
+    seed_a, seed_b = noise_seeds(
+        hash_a, hash_b, key_a, key_b, p_a, p_b, hash_routing=hr, hash_offsets=ho
+    )
+    assert noise_seed_a(hash_a, seed_b, key_a, p_a, hr + ho) == seed_a
+    assert noise_seed_a(hash_a, seed_b, key_a, p_a) != seed_a
+    with pytest.raises(ValueError, match="64-byte"):
+        noise_seed_a(hash_a, seed_b, key_a, p_a, hr)
+
+
 def test_prebuilt_commitment_is_checked_against_the_job_and_planes():
     """The handoff skips ``commit_planes``, so its cheap checks are all that
     stands between a mismatched commitment and an invalid proof (or an

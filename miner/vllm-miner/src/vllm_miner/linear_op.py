@@ -7,6 +7,9 @@ layer cannot or must not mine right now it runs the job-independent FP8 fallback
 GEMM -- the only path a captured graph ever replays.
 """
 
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
 import torch
 from miner_utils import get_logger
 
@@ -19,7 +22,10 @@ from .config import config as gpu_config
 from .fp8_fallback import fp8_fallback_gemm
 from .health import mining_attempt
 from .settings import runtime_settings
-from .state import LayerState, lookup_state
+from .state import JobContext, LayerState, lookup_state
+
+if TYPE_CHECKING:
+    from .moe import MoeRouting
 
 _LOGGER = get_logger(__name__)
 
@@ -40,7 +46,7 @@ def _eager_mining_blocked(state: LayerState, m_tokens: int) -> bool:
 
 
 def _eager_bucket(state: LayerState, m_tokens: int) -> int | None:
-    """The padded bucket for one eager forward, or None when it cannot mine."""
+    """The bucket for one eager forward, or None when it cannot mine."""
     from .pipeline import pick_bucket, variant_ready
 
     settings = runtime_settings()
@@ -51,7 +57,7 @@ def _eager_bucket(state: LayerState, m_tokens: int) -> int | None:
             f"({settings.m_buckets[-1]}); such forwards serve without mining.",
         )
         return None
-    if settings.warmup_compile and not variant_ready(bucket, state.n, state.k):
+    if settings.warmup_compile and not variant_ready(bucket, state):
         return None
     return bucket
 
@@ -65,7 +71,60 @@ def _try_mine(
         # callbacks) is illegal inside a CUDA-graph capture; captured graphs
         # always record the job-independent FP8 fallback.
         return None
-    m_tokens = x2d.shape[0]
+    from .pipeline import run_mining_forward
+
+    return _mine_eager(
+        state,
+        x2d.shape[0],
+        lambda ctx, bucket: run_mining_forward(state, ctx, x2d.contiguous(), bias, bucket),
+    )
+
+
+def try_mine_moe[T](
+    state: LayerState,
+    x2d: torch.Tensor,
+    topk_ids: torch.Tensor,
+    tail: "Callable[[torch.Tensor, MoeRouting], T]",
+) -> T | None:
+    """Mine one MoE layer's first grouped GEMM when it can mine right now.
+
+    ``tail`` receives the permuted ``(cum_m, n_e)`` output and the routing
+    that orders it and finishes the layer (activation, down GEMM, combine);
+    it runs inside the admitted launch, before the launch's terminal event
+    (``pipeline.run_mining_moe_forward``), so lifecycle drain and capture
+    quiescence cover the whole mined forward. Returns the tail's result, or
+    None -- the caller then serves its own unmined path (a tail OOM opens the
+    device cooldown, any other tail failure disables the layer, exactly as
+    for the launch itself). The routing is data dependent, so MoE layers
+    never mine inside a CUDA graph capture.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    from .moe import topk_ids_shape_error
+    from .pipeline import run_mining_moe_forward
+
+    # A malformed router table declines this call only; it is not a layer
+    # failure (``_mine_eager`` disables the layer on any other exception).
+    problem = topk_ids_shape_error(topk_ids, x2d.shape[0], state.top_k)
+    if problem is None and topk_ids.device != x2d.device:
+        problem = f"topk_ids on {topk_ids.device} but activations on {x2d.device}"
+    if problem is not None:
+        _LOGGER.warning(f"{state.layer_name}: {problem}; serving this forward unmined")
+        return None
+
+    return _mine_eager(
+        state,
+        x2d.shape[0],
+        lambda ctx, bucket: run_mining_moe_forward(
+            state, ctx, x2d.contiguous(), topk_ids, bucket, tail=tail
+        ),
+    )
+
+
+def _mine_eager[T](
+    state: LayerState, m_tokens: int, launch: Callable[[JobContext, int], T | None]
+) -> T | None:
+    """Admit and run one eager launch against the layer's live context."""
     if _eager_mining_blocked(state, m_tokens):
         return None
     bucket = _eager_bucket(state, m_tokens)
@@ -73,7 +132,6 @@ def _try_mine(
         return None
 
     from .job_prep import current_context, current_job
-    from .pipeline import run_mining_forward
 
     try:
         # The producer slot is what CUDA-graph capture waits on; taking it and
@@ -88,7 +146,7 @@ def _try_mine(
                 ctx = current_context(state, current_job())
                 if ctx is None:
                     return None
-                out = run_mining_forward(state, ctx, x2d.contiguous(), bias, bucket)
+                out = launch(ctx, bucket)
                 attempt.mark_success(out is not None)
                 return out
     except torch.cuda.OutOfMemoryError:
@@ -129,6 +187,8 @@ def _apply_linear_impl(
 
     out = _try_mine(state, x2d, bias)
     if out is None:
+        if state.w_fp8 is None or state.w_fp8_scale is None:
+            raise ValueError(f"pearl::apply_linear does not serve MoE layer {state.layer_name}")
         out = fp8_fallback_gemm(
             x2d,
             state.w_fp8,

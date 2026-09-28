@@ -8,7 +8,7 @@ jackpot key, so a miner never builds the CPU Merkle tree just to learn a seed
 
     HX               = blake3(root(values_X) || root(scales_X), key=keyX)
     noise seedB      = H_"seed-B"(HB || keyB || pB)
-    noise seedA      = H_"seed-A"(HA || seedB || keyA || pA)
+    noise seedA      = H_"seed-A"(HA || [HR || HO ||] seedB || keyA || pA)
     noise-line keyX  = Subkey("noise-line", seedX)      (the line generator's key)
     jackpot key      = Subkey("jackpot",    seedA)      (the winning test's key)
 
@@ -49,9 +49,16 @@ def noise_seed_b(hash_b: bytes, key_b: bytes, p_b: bytes) -> bytes:
     return hash_labelled(hash_b + key_b + p_b, LABEL_SEED_B)
 
 
-def noise_seed_a(hash_a: bytes, seed_b: bytes, key_a: bytes, p_a: bytes) -> bytes:
-    """``noise seedA = H_"seed-A"(HA || seedB || keyA || pA)`` (dense: no routing)."""
-    return hash_labelled(hash_a + seed_b + key_a + p_a, LABEL_SEED_A)
+def noise_seed_a(
+    hash_a: bytes, seed_b: bytes, key_a: bytes, p_a: bytes, routing_commitments: bytes = b""
+) -> bytes:
+    """``noise seedA = H_"seed-A"(HA || [HR || HO ||] seedB || keyA || pA)``.
+
+    ``routing_commitments`` is empty for dense mining and the 64-byte
+    ``HR || HO`` for MoE (``miner_base.transcript.noise_seeds``)."""
+    if len(routing_commitments) not in (0, 64):
+        raise ValueError("routing_commitments must be empty or the 64-byte HR || HO")
+    return hash_labelled(hash_a + routing_commitments + seed_b + key_a + p_a, LABEL_SEED_A)
 
 
 def noise_line_key(seed: bytes) -> bytes:
@@ -81,7 +88,9 @@ class AKeys(NamedTuple):
         return self.seed_a + self.noise_line_key + self.jackpot_key
 
 
-def a_keys(hash_a: bytes, seed_b: bytes, key_a: bytes, p_a: bytes) -> AKeys:
+def a_keys(
+    hash_a: bytes, seed_b: bytes, key_a: bytes, p_a: bytes, routing_commitments: bytes = b""
+) -> AKeys:
     """The A-side chain from ``HA`` down: ``(seedA, noise-line keyA, jackpot key)``."""
-    seed_a = noise_seed_a(hash_a, seed_b, key_a, p_a)
+    seed_a = noise_seed_a(hash_a, seed_b, key_a, p_a, routing_commitments)
     return AKeys(seed_a, noise_line_key(seed_a), jackpot_key(seed_a))

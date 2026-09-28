@@ -43,7 +43,8 @@ def _state_pointers() -> dict[tuple[int, str], int]:
     for state in all_states():
         for name in ("weight", "weight_scale", "w_fp8", "w_fp8_scale"):
             tensor = getattr(state, name)
-            pointers[(state.layer_id, name)] = tensor.data_ptr()
+            if tensor is not None:  # MoE states carry no dense FP8 fallback
+                pointers[(state.layer_id, name)] = tensor.data_ptr()
         buffers = state.buffers
         if buffers is not None:
             for descriptor in fields(LayerBuffers):

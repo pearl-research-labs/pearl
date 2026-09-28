@@ -18,6 +18,7 @@ homed around Quack's ``GemmSm100`` warp specialization:
 """
 
 from functools import partial
+from typing import NamedTuple
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -25,7 +26,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import quack.copy_utils as copy_utils
-from cutlass import Boolean, Float32, Int32, Uint32, const_expr
+from cutlass import Boolean, Float32, Int32, Int64, Uint32, const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum, SmemPartition
@@ -163,14 +164,24 @@ def _fold_register_groups(
     return groups, words_per_class
 
 
+class _HitGroup(NamedTuple):
+    """The expert of a grouped (MoE) hit: the record's ``M`` is its block's
+    ``rows``, ``GROUP_ID`` its ``index``, and its payload the plane rows
+    ``[row0, row0 + rows)``."""
+
+    index: Int32
+    row0: Int32
+    rows: Int32
+
+
 class _HitPublishMixin:
     """Arch-independent lottery digest compare and hit-record publishing.
 
     Shared by the fused GEMMs of every architecture: only the message ->
     (tile_row, tile_column) decode differs per kernel, so callers decode
     lane-locally and hand the coordinates in. Requires the host attributes
-    ``problem_m/n/k``, ``ltile_rows/ltile_cols``, ``snapshot_payload``, and
-    the payload byte counts.
+    ``problem_m/n/k`` (``problem_n/k`` for grouped hits), ``ltile_rows/ltile_cols``,
+    ``snapshot_payload``, and (dense hits) the payload byte counts.
     """
 
     @cute.jit
@@ -216,6 +227,79 @@ class _HitPublishMixin:
                 dst_vec[tail] = src_vec[tail]
 
     @cute.jit
+    def _hit_warp_copy_rows(
+        self,
+        dst: cute.Tensor,
+        src: cute.Tensor,
+        src_off_u32: Int64,
+        num_u32: Int32,
+        lane: Int32,
+    ):
+        """``_hit_warp_copy`` of one group's rows of a plane.
+
+        The rows start at u32 offset ``src_off_u32`` (64-bit: a group deep
+        into a large plane lies past 2^31 bytes) and span ``num_u32`` words
+        (32-bit: bounded by the destination's capacity), both whole 16-byte
+        vectors (k is a multiple of 64).
+        """
+        src_vec = cute.recast_tensor(src, cutlass.Uint128)
+        dst_vec = cute.recast_tensor(dst, cutlass.Uint128)
+        vec_off = src_off_u32 // 4
+        num_vecs = num_u32 // 4
+        stride = cute.arch.WARP_SIZE * _HIT_COPY_UNROLL
+        full_iters = num_vecs // stride
+        staged = cute.make_rmem_tensor(_HIT_COPY_UNROLL, cutlass.Uint128)
+        for it in cutlass.range(full_iters):
+            base = it * stride + lane
+            for u in cutlass.range_constexpr(_HIT_COPY_UNROLL):
+                staged[u] = src_vec[vec_off + Int64(base + u * cute.arch.WARP_SIZE)]
+            for u in cutlass.range_constexpr(_HIT_COPY_UNROLL):
+                dst_vec[base + u * cute.arch.WARP_SIZE] = staged[u]
+        for tail in cutlass.range(full_iters * stride + lane, num_vecs, cute.arch.WARP_SIZE):
+            dst_vec[tail] = src_vec[vec_off + Int64(tail)]
+
+    @cute.jit
+    def _snapshot_group_payload(
+        self,
+        group: _HitGroup,
+        k: Int32,
+        mCodesSrc: cute.Tensor,
+        mScalesSrc: cute.Tensor,
+        mCodesDst: cute.Tensor,
+        mScalesDst: cute.Tensor,
+        lane: Int32,
+    ):
+        """Copy the group's rows of both planes when they fit the signal.
+
+        Returns the ``(codes, scales)`` byte counts, zero when skipped (the
+        winning group is not known at launch, so capacity is decided here).
+        64-bit throughout: a group's byte offset into a large plane and a hot
+        group's byte count can exceed 2^31, and the signal admits byte counts
+        up to 2^32 - 1, which a signed 32-bit narrowing would turn negative.
+        Only the word counts are narrowed, after the capacity check bounds
+        them below 2^30.
+        """
+        k64 = Int64(k)
+        row0 = Int64(group.row0)
+        codes_bytes64 = Int64(group.rows) * k64
+        scales_bytes64 = Int64(group.rows) * (k64 // 4)  # (k / 8) bf16 per row
+        codes_bytes = Int64(0)
+        scales_bytes = Int64(0)
+        fits = Boolean(codes_bytes64 <= Int64(cute.size(mCodesDst)) * 4) & Boolean(
+            scales_bytes64 <= Int64(cute.size(mScalesDst)) * 4
+        )
+        if fits:
+            codes_bytes = codes_bytes64
+            scales_bytes = scales_bytes64
+            self._hit_warp_copy_rows(
+                mCodesDst, mCodesSrc, (row0 * k64) // 4, Int32(codes_bytes64 // 4), lane
+            )
+            self._hit_warp_copy_rows(
+                mScalesDst, mScalesSrc, (row0 * (k64 // 4)) // 4, Int32(scales_bytes64 // 4), lane
+            )
+        return codes_bytes, scales_bytes
+
+    @cute.jit
     def _publish_hit(
         self,
         tile_row: Int32,
@@ -233,6 +317,7 @@ class _HitPublishMixin:
         layer_id: Int32,
         record_hits: Int32,
         local_hit: Boolean,
+        group: _HitGroup | None = None,
     ):
         """Publish one hit into the persistent signal (whole warp calls this).
 
@@ -244,7 +329,9 @@ class _HitPublishMixin:
         win the ballot and mask a publishable hit in the same warp.
 
         ``tile_row``/``tile_column``/``in_bounds`` are the caller's lane-local
-        decode; the leader's values are the published ones.
+        decode; the leader's values are the published ones. ``group`` (warp
+        uniform) publishes with group semantics: ``M`` is the group's rows,
+        ``GROUP_ID`` its index and the payload its rows of the planes.
         """
         lane = cute.arch.lane_idx()
         # The ballot is deliberately unconditional: even when publication is
@@ -268,33 +355,52 @@ class _HitPublishMixin:
                     claimed = Int32(1)
             claimed = cute.arch.shuffle_sync(claimed, leader)
             if claimed != 0:
-                if const_expr(self.snapshot_payload):
-                    self._hit_warp_copy(mCodesDst, mCodesSrc, lane)
-                    self._hit_warp_copy(mScalesDst, mScalesSrc, lane)
+                if const_expr(group is None):
+                    record_m = Uint32(self.problem_m)
+                    group_id = Uint32(0)  # dense hits have no group; a MoE hit may have left one
+                    codes_bytes = Uint32(self.codes_payload_bytes if self.snapshot_payload else 0)
+                    scales_bytes = Uint32(self.scales_payload_bytes if self.snapshot_payload else 0)
+                    if const_expr(self.snapshot_payload):
+                        self._hit_warp_copy(mCodesDst, mCodesSrc, lane)
+                        self._hit_warp_copy(mScalesDst, mScalesSrc, lane)
+                else:
+                    record_m = group.rows.to(Uint32)
+                    group_id = group.index.to(Uint32)
+                    codes_bytes = Uint32(0)
+                    scales_bytes = Uint32(0)
+                    if const_expr(self.snapshot_payload):
+                        codes64, scales64 = self._snapshot_group_payload(
+                            group,
+                            self.problem_k,
+                            mCodesSrc,
+                            mScalesSrc,
+                            mCodesDst,
+                            mScalesDst,
+                            lane,
+                        )
+                        codes_bytes = codes64.to(Uint32)
+                        scales_bytes = scales64.to(Uint32)
                 # Every lane fences its own payload stores to system scope,
                 # then the warp syncs, so the leader's publication below
                 # cannot pass them.
                 cute.arch.fence_acq_rel_sys()
                 cute.arch.sync_warp()
                 if lane == leader:
-                    mRecord[HitRecordLayout.M] = Uint32(self.problem_m)
+                    mRecord[HitRecordLayout.M] = record_m
                     mRecord[HitRecordLayout.N] = Uint32(self.problem_n)
                     mRecord[HitRecordLayout.K] = Uint32(self.problem_k)
                     mRecord[HitRecordLayout.TILE_ROW] = Uint32(tile_row)
                     mRecord[HitRecordLayout.TILE_COLUMN] = Uint32(tile_column)
                     mRecord[HitRecordLayout.LTILE_ROWS] = Uint32(self.ltile_rows)
                     mRecord[HitRecordLayout.LTILE_COLS] = Uint32(self.ltile_cols)
-                    mRecord[HitRecordLayout.CODES_PAYLOAD_BYTES] = Uint32(
-                        self.codes_payload_bytes if self.snapshot_payload else 0
-                    )
-                    mRecord[HitRecordLayout.SCALES_PAYLOAD_BYTES] = Uint32(
-                        self.scales_payload_bytes if self.snapshot_payload else 0
-                    )
+                    mRecord[HitRecordLayout.CODES_PAYLOAD_BYTES] = codes_bytes
+                    mRecord[HitRecordLayout.SCALES_PAYLOAD_BYTES] = scales_bytes
                     mRecord[HitRecordLayout.LAYER_ID] = layer_id.to(Uint32)
                     for i in cutlass.range_constexpr(8):
                         mRecord[HitRecordLayout.TARGET + i] = threshold_words[i]
                         mRecord[HitRecordLayout.HASH_A + i] = pow_key_words[i]
                         mRecord[HitRecordLayout.HASH_B + i] = mHashB[i]
+                    mRecord[HitRecordLayout.GROUP_ID] = group_id
                     mRecord[HitRecordLayout.MAGIC] = Uint32(HIT_RECORD_MAGIC_WORDS[0])
                     mRecord[HitRecordLayout.MAGIC + 1] = Uint32(HIT_RECORD_MAGIC_WORDS[1])
                     cute.arch.fence_acq_rel_sys()

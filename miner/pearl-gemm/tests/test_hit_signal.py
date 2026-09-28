@@ -26,7 +26,7 @@ from pearl_gemm import (
     mixed_gemm,
 )
 from pearl_gemm._utils._arch import arch_of
-from pearl_gemm.pow import HIT_PAYLOAD_K_ALIGN, HIT_RECORD_MAGIC_WORDS
+from pearl_gemm.pow import HIT_PAYLOAD_K_ALIGN, HIT_RECORD_MAGIC_WORDS, RECORD_WORDS
 from pearl_gemm.protocol_constants import BLOCK_SCALE_GROUP, R
 
 # The family's library default tile as a single CTA (no cluster multicast).
@@ -54,6 +54,7 @@ def _forge_hit(
     n=FORGE_N,
     k=FORGE_K,
     with_payload=True,
+    group_id=0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Simulate a kernel publish with plain host stores: payloads, record
     fields, magic, then the status doorbell LAST."""
@@ -74,6 +75,7 @@ def _forge_hit(
     record[HitRecordLayout.CODES_PAYLOAD_BYTES] = m * k if with_payload else 0
     record[HitRecordLayout.SCALES_PAYLOAD_BYTES] = m * (k // 8) * 2 if with_payload else 0
     record[HitRecordLayout.LAYER_ID] = FORGE_LAYER_ID
+    record[HitRecordLayout.GROUP_ID] = group_id
     for word in range(8):
         record[HitRecordLayout.TARGET + word] = word + 1
         record[HitRecordLayout.HASH_A + word] = word + 100
@@ -121,7 +123,30 @@ def test_offsets_are_sane():
     assert layout.TARGET + 8 <= layout.HASH_A
     assert layout.HASH_A + 8 <= layout.HASH_B
     assert layout.HASH_B + 8 <= layout.MAGIC
-    assert layout.MAGIC + 2 <= layout.RECORD_WORDS
+    assert layout.MAGIC + 2 <= layout.GROUP_ID < layout.RECORD_WORDS
+
+
+def test_group_id_parses_and_defaults_to_dense():
+    """GROUP_ID names a grouped (MoE) hit's expert; dense hits carry 0 and the
+    positional ``Hit`` constructor keeps its historical order."""
+    assert Hit(True).group_id == 0
+    signal = _make_signal()
+    _forge_hit(signal, group_id=5)
+    hit = signal.read_hit()
+    assert hit is not None and hit.valid and hit.group_id == 5
+    assert hit.owned_copy().group_id == 5
+    signal.reset_hit()
+
+
+def test_record_device_view_aliases_the_pinned_record():
+    """TVM-FFI launches pass a CUDA view of the pinned record: same bytes, no copy."""
+    signal = _make_signal()
+    view = signal.record_device_view
+    assert view.is_cuda and view.dtype == torch.uint32 and view.shape == (RECORD_WORDS,)
+    assert view.data_ptr() == signal.record.data_ptr()
+    signal.record[HitRecordLayout.LAYER_ID] = 1234
+    assert int(view[HitRecordLayout.LAYER_ID].item()) == 1234
+    signal.record[HitRecordLayout.LAYER_ID] = 0
 
 
 def test_allocation_idle_at_init():
@@ -242,6 +267,91 @@ def test_two_consumers_cannot_take_the_same_record():
     assert not signal.doorbell()
 
 
+_FORGED_HASH_A = b"".join((word + 100).to_bytes(4, "little") for word in range(8))
+
+
+def test_take_owned_hit_leaves_another_launchs_record_in_place():
+    """A consumer that names its launch (its ``pow_key``) takes only the
+    record that launch published; a foreign record stays for its owner."""
+    signal = _make_signal()
+    codes, _ = _forge_hit(signal)
+
+    assert signal.take_owned_hit(bytes(32)) is None
+    assert signal.doorbell()  # untouched: not re-armed, payload intact
+
+    owned = signal.take_owned_hit(_FORGED_HASH_A)
+    assert owned is not None and owned.valid
+    assert owned.commitment_hash_A == _FORGED_HASH_A
+    assert torch.equal(owned.codes, codes)
+    assert not signal.doorbell()
+
+
+def test_foreign_record_is_rejected_before_any_payload_copy(monkeypatch):
+    """Ownership is decided from the header: a consumer that does not own the
+    record performs no payload D2H / staging clone. The owner copies once;
+    payload-less records never reach the fetch; a key-less consumer takes
+    any record."""
+    signal = _make_signal()
+    fetches: list[int] = []
+    fetch = signal._fetch_payload_locked
+
+    def counting_fetch(header):
+        fetches.append(header.m)
+        return fetch(header)
+
+    monkeypatch.setattr(signal, "_fetch_payload_locked", counting_fetch)
+    codes, _ = _forge_hit(signal)
+    for _ in range(3):
+        assert signal.take_owned_hit(bytes(32)) is None
+    assert fetches == [] and signal.doorbell()
+
+    owned = signal.take_owned_hit(_FORGED_HASH_A)
+    assert owned is not None and owned.valid and torch.equal(owned.codes, codes)
+    assert fetches == [FORGE_M] and not signal.doorbell()
+
+    _forge_hit(signal, with_payload=False)
+    owned = signal.take_owned_hit(_FORGED_HASH_A)
+    assert owned is not None and owned.valid and owned.codes is None
+    assert fetches == [FORGE_M]  # payload-less records never reach the fetch
+    assert not signal.doorbell()
+
+    _forge_hit(signal, with_payload=False)
+    owned = signal.take_owned_hit()
+    assert owned is not None and owned.valid and owned.codes is None
+    assert not signal.doorbell()
+
+
+def test_malformed_records_are_consumed_by_any_consumer():
+    """A torn/forged record has no owner: whoever sees it drops it and
+    re-arms, so a bad publish can never close the latch for good."""
+    signal = _make_signal()
+    _forge_hit(signal)
+    signal.record[HitRecordLayout.MAGIC] = 0
+
+    owned = signal.take_owned_hit(bytes(32))
+    assert owned is not None and not owned.valid
+    assert not signal.doorbell()
+
+
+def test_discard_hit_drops_any_owners_record_and_rearms():
+    """The no-live-job drop path consumes a record regardless of owner and
+    re-arms the latch."""
+    signal = _make_signal()
+    assert signal.discard_hit() is False
+    _forge_hit(signal, with_payload=False)
+    assert signal.take_owned_hit(bytes(32)) is None  # a foreign consumer leaves it
+    assert signal.discard_hit() is True
+    assert not signal.doorbell()
+    _forge_hit(signal)  # the latch is open: the next record publishes
+    assert signal.take_owned_hit() is not None
+
+
+def test_owner_key_must_be_a_pow_key():
+    signal = _make_signal()
+    with pytest.raises(ValueError, match="32-byte"):
+        signal.take_owned_hit(b"short")
+
+
 def test_reset_does_not_reopen_an_unpublished_producer_claim():
     signal = _make_signal()
     signal.lock.fill_(1)
@@ -265,10 +375,10 @@ def test_take_owned_hit_rearms_after_snapshot_failure(monkeypatch):
     signal = _make_signal()
     _forge_hit(signal)
 
-    def fail_read():
+    def fail_fetch(header):
         raise RuntimeError("synthetic D2H failure")
 
-    monkeypatch.setattr(signal, "_read_published_hit_locked", fail_read)
+    monkeypatch.setattr(signal, "_fetch_payload_locked", fail_fetch)
     with pytest.raises(RuntimeError, match="D2H failure"):
         signal.take_owned_hit()
 
@@ -299,8 +409,8 @@ def test_snapshot_and_reset_failure_preserve_both_causes(monkeypatch):
     _forge_hit(signal)
     monkeypatch.setattr(
         signal,
-        "_read_published_hit_locked",
-        lambda: (_ for _ in ()).throw(ValueError("snapshot failed")),
+        "_fetch_payload_locked",
+        lambda header: (_ for _ in ()).throw(ValueError("snapshot failed")),
     )
     monkeypatch.setattr(
         signal,
@@ -461,8 +571,22 @@ def test_kernel_publish_snapshot_matches_source():
     assert hit.target == b"\xff" * 32
     assert hit.commitment_hash_A == bytes(buffers["pow_key"].cpu().tolist())
     assert hit.commitment_hash_B == bytes(buffers["commitment_hash_b"].cpu().tolist())
+    assert hit.group_id == 0
     assert torch.equal(hit.codes, buffers["a_codes"].cpu())
     assert torch.equal(hit.scales.view(torch.uint16), buffers["a_scales"].cpu().view(torch.uint16))
+    signal.reset_hit()
+
+
+def test_dense_publish_clears_a_stale_group_id():
+    """A dense hit writes GROUP_ID = 0, so a record word left by an earlier
+    grouped hit never tags a dense one."""
+    buffers = _gemm_buffers()
+    signal = buffers["hit_signal"]
+    signal.record[HitRecordLayout.GROUP_ID] = 9
+    mixed_gemm(**buffers)
+    torch.cuda.synchronize()
+    hit = signal.read_hit()
+    assert hit is not None and hit.valid and hit.group_id == 0
     signal.reset_hit()
 
 

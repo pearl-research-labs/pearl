@@ -1,6 +1,7 @@
 """The mining hit signal: one persistent per-process record the ``mixed_gemm``
-kernel publishes PoW hits into, consumed by a host thread in the same process
-(device producer: ``mixed_gemm/_kernel.py``; host consumer: this module).
+and ``grouped_mixed_gemm`` kernels publish PoW hits into, consumed by a host
+thread in the same process (device producer: ``mixed_gemm/_kernel.py``; host
+consumer: this module).
 
 The public contract: FIRST hit wins -- the producer claims the persistent
 latch it never releases, so a pending record is immutable until the consumer
@@ -15,6 +16,7 @@ protocol are documented inline below.
 
 import ctypes
 import threading
+import types
 from dataclasses import dataclass, replace
 
 import torch
@@ -89,6 +91,11 @@ class HitRecordLayout:
     HASH_A = 20  # 8 words: the launch's pow_key (v4: the jackpot key from seedA)
     HASH_B = 28  # 8 words: the launch's B-side stamp (v4: noise seedB)
     MAGIC = 36  # 2 words, written before the status flip
+    # MoE (grouped) hits: the expert whose rows the tile belongs to. M and
+    # TILE_ROW are then expert-local (the group's block row count and the
+    # tile index within it) and the payload is the group's rows. Dense
+    # kernels write 0.
+    GROUP_ID = 38
     RECORD_WORDS = 64
 
 
@@ -126,6 +133,10 @@ class Hit:
     commitment_hash_B: bytes = b""
     codes: torch.Tensor | None = None  # (m, k) int8
     scales: torch.Tensor | None = None  # (m, k // BLOCK_SCALE_GROUP) bf16
+    # Appended so the positional API above is unchanged. MoE hits
+    # (``grouped_mixed_gemm``): the expert; ``m``, ``tile_row`` and the
+    # payload planes are then that expert's rows. Dense hits carry 0.
+    group_id: int = 0
 
     def owned_copy(self) -> "Hit":
         """Copy staging-backed payload planes before the signal is re-armed."""
@@ -229,6 +240,35 @@ class HitSignal:
         # The pinned allocation lives as long as self.record, so the raw
         # status address the doorbell polls stays valid.
         self._status_addr = self.record.data_ptr() + 4 * HitRecordLayout.STATUS
+        # Built eagerly so a platform whose alias would copy (no UVA mapping)
+        # fails at construction rather than at the first hit.
+        self.record_device_view = self._alias_record_on_device()
+
+    def _alias_record_on_device(self) -> torch.Tensor:
+        """The pinned record as a CUDA tensor (same bytes, no copy).
+
+        The record is host-mapped pinned memory, which the device addresses
+        through the identical UVA pointer. Launch paths whose argument
+        marshalling insists on CUDA tensors (TVM-FFI) pass this alias; the
+        host keeps polling ``record`` itself. The carrier keeps a reference
+        to ``record`` (torch retains it for the alias's lifetime), so an
+        exported alias never outlives the pinned allocation.
+        """
+        carrier = types.SimpleNamespace(
+            __cuda_array_interface__={
+                "shape": (RECORD_WORDS,),
+                "typestr": "<u4",
+                "data": (self.record.data_ptr(), False),
+                "strides": None,
+                "version": 3,
+            },
+            _owner=self.record,
+        )
+        with torch.cuda.device(self.device):
+            view = torch.as_tensor(carrier, device=self.device)
+        if view.data_ptr() != self.record.data_ptr():
+            raise RuntimeError("CUDA alias of the pinned hit record copied instead of aliasing")
+        return view
 
     @property
     def codes_payload_capacity_bytes(self) -> int:
@@ -259,6 +299,18 @@ class HitSignal:
 
     def _read_published_hit_locked(self) -> Hit:
         """Parse/fetch a record after this consumer observed publication."""
+        header, has_payload = self._parse_record_locked()
+        if header.valid and has_payload:
+            return self._fetch_payload_locked(header)
+        return header
+
+    def _parse_record_locked(self) -> tuple[Hit, bool]:
+        """Parse and bounds-check the published header; no device traffic.
+
+        Returns the payload-less ``Hit`` (``codes`` / ``scales`` still
+        ``None``) and whether the record declares a payload; see
+        :meth:`_fetch_payload_locked`.
+        """
         layout = HitRecordLayout
         words = self.record.tolist()
         # Bounds-check everything the consumer will index with: a torn/forged
@@ -293,29 +345,14 @@ class HitSignal:
             )
         )
         if not valid:
-            return Hit(valid=False)
-
-        codes = scales = None
-        if has_payload:
-            scales_elems = m * (k // BLOCK_SCALE_GROUP)
-            codes = self._codes_staging.narrow(0, 0, m * k).view(m, k)
-            scales = self._scales_staging.narrow(0, 0, scales_elems).view(m, k // BLOCK_SCALE_GROUP)
-            # Both D2H fetches are enqueued on the dedicated stream and share
-            # ONE synchronize.
-            with torch.cuda.stream(self._consumer_stream):
-                codes.copy_(self.codes_payload.narrow(0, 0, m * k).view(m, k), non_blocking=True)
-                scales.copy_(
-                    self.scales_payload.narrow(0, 0, scales_elems).view(m, k // BLOCK_SCALE_GROUP),
-                    non_blocking=True,
-                )
-            self._consumer_stream.synchronize()
+            return Hit(valid=False), False
 
         record_bytes = self.record.view(torch.uint8)
 
         def _field(word_offset: int) -> bytes:
             return bytes(record_bytes[4 * word_offset : 4 * (word_offset + 8)].tolist())
 
-        return Hit(
+        header = Hit(
             valid=True,
             m=m,
             n=n,
@@ -328,9 +365,27 @@ class HitSignal:
             target=_field(layout.TARGET),
             commitment_hash_A=_field(layout.HASH_A),
             commitment_hash_B=_field(layout.HASH_B),
-            codes=codes,
-            scales=scales,
+            group_id=words[layout.GROUP_ID],
         )
+        return header, has_payload
+
+    def _fetch_payload_locked(self, header: Hit) -> Hit:
+        """D2H-fetch the payload planes a parsed header declares into the
+        staging buffers (one consumer-stream synchronize) and attach them."""
+        m, k = header.m, header.k
+        scales_elems = m * (k // BLOCK_SCALE_GROUP)
+        codes = self._codes_staging.narrow(0, 0, m * k).view(m, k)
+        scales = self._scales_staging.narrow(0, 0, scales_elems).view(m, k // BLOCK_SCALE_GROUP)
+        # Both D2H fetches are enqueued on the dedicated stream and share
+        # ONE synchronize.
+        with torch.cuda.stream(self._consumer_stream):
+            codes.copy_(self.codes_payload.narrow(0, 0, m * k).view(m, k), non_blocking=True)
+            scales.copy_(
+                self.scales_payload.narrow(0, 0, scales_elems).view(m, k // BLOCK_SCALE_GROUP),
+                non_blocking=True,
+            )
+        self._consumer_stream.synchronize()
+        return replace(header, codes=codes, scales=scales)
 
     def _reset_hit_locked(self) -> None:
         with torch.cuda.stream(self._consumer_stream):
@@ -364,25 +419,61 @@ class HitSignal:
                 "persistent hit signal reset failed; mining must stop on this device"
             ) from cause
 
-    def take_owned_hit(self) -> Hit | None:
+    def take_owned_hit(self, owner: bytes | None = None) -> Hit | None:
         """Atomically read, own, and re-arm one published record.
 
         The consumer mutex spans doorbell acquisition, payload D2H, cloning,
         and the synchronized reset kernel. A second host consumer therefore
         cannot reset a newer producer claim using a stale doorbell observation.
         Malformed records are returned as ``Hit(valid=False)`` and consumed.
+
+        Ownership. Many launches may share one signal, and a consumer that
+        owns launch-specific context (an MoE routing witness, the launch's
+        committed planes for a payload-less record) must not attach it to
+        another launch's record. ``owner`` is the consumer's launch
+        ``pow_key`` (the record's ``HASH_A`` word run, 32 bytes): a record
+        published under a different key is left in place, unconsumed, for its
+        own consumer, and ``None`` is returned. Without ``owner`` every
+        record is taken. Malformed records have no owner and are consumed by
+        whoever sees them first. Ownership is decided from the parsed header
+        alone: a foreign record costs this consumer no payload D2H, staging
+        synchronize or clone.
         """
+        if owner is not None and len(owner) != 32:
+            raise ValueError(f"owner must be the 32-byte launch pow_key, got {len(owner)} bytes")
         with self._consumer_mu:
             self._raise_if_poisoned()
             if not self.doorbell():
                 return None
             try:
-                owned = self._read_published_hit_locked().owned_copy()
+                header, has_payload = self._parse_record_locked()
+                if header.valid and owner is not None and header.commitment_hash_A != owner:
+                    return None
+                owned = header
+                if header.valid and has_payload:
+                    owned = self._fetch_payload_locked(header).owned_copy()
             except BaseException as read_error:
                 self._reset_or_poison_locked(read_error)
                 raise
             self._reset_or_poison_locked()
             return owned
+
+    def discard_hit(self) -> bool:
+        """Consume and re-arm whatever record is published, regardless of
+        owner, without reading its payload (``True`` when there was one).
+
+        For consumers that cannot open any record -- no live mining job on
+        the device -- and would otherwise leave a launch-owned record
+        (:meth:`take_owned_hit`) waiting for a consumer that will drop it
+        anyway. Not for ordinary consumers: it takes a record its owner may
+        still want.
+        """
+        with self._consumer_mu:
+            self._raise_if_poisoned()
+            if not self.doorbell():
+                return False
+            self._reset_or_poison_locked()
+            return True
 
     def reset_hit(self) -> None:
         """Consume the pending hit and re-arm the signal.

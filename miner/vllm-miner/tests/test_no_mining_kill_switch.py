@@ -380,6 +380,8 @@ def test_pipeline_warmup_reports_completion_or_stops(
         buffers=object(),
         n=_N,
         k=_K,
+        experts=0,
+        top_k=0,
         layer_name="test.mined.layer",
         layer_id=1,
     )

@@ -6,6 +6,7 @@ import torch
 from miner_base.async_loop_manager import AsyncLoopManager
 from miner_base.block_submission import (
     PROTOCOL_COMMITMENT_LEAF,
+    MoEBlockInfo,
     OpenedBlockInfo,
     PrebuiltCommitment,
     commit_planes_for_leaf,
@@ -149,6 +150,209 @@ def test_tall_tile_keeps_high_k_proof_under_the_verifier_cap():
     cap = 1 << 22
     assert (16 + 32) * k * 2 <= cap
     assert (4 + 128) * k * 2 > cap
+
+
+def _round_robin_routing(experts: int, top_k: int) -> list[list[int]]:
+    """Token ``t`` reaches experts ``t % E`` and ``(t + 1) % E``, ...."""
+    return [
+        sorted(t for t in range(_M) for slot in range(top_k) if (t + slot) % experts == e)
+        for e in range(experts)
+    ]
+
+
+def _cumulative(per_expert: list[list[int]]) -> list[int]:
+    return [sum(len(rows) for rows in per_expert[: e + 1]) for e in range(len(per_expert))]
+
+
+# Expert 1's routing slice ends 200 bytes into the second 1024-byte routing
+# leaf, so its opening straddles a leaf boundary.
+_RAGGED_ROUTING = [
+    list(range(0, 100)),
+    list(range(50, 256)),
+    list(range(0, 200)),
+    list(range(100, 106)),
+]
+
+
+@pytest.mark.parametrize(
+    ("per_expert", "w", "tile"),
+    [(_round_robin_routing(4, 2), 2, 3), (_RAGGED_ROUTING, 1, 3)],
+    ids=["round-robin", "ragged-straddle"],
+)
+def test_moe_plain_peel_proof_verifies(per_expert, w, tile):
+    """An MoE opening -- the full activation and the stacked expert weights,
+    a tile of one expert's routed tokens against that expert's stacked rows,
+    plus the routing witness -- is accepted by the cert-v4 verifier."""
+    experts, n_e = len(per_expert), _N
+    config = replace(default_mining_config(k=_K, rank=32, ltile_cols=128), experts=experts)
+    a = PrequantMatrix.encode(torch.zeros(_M, _K, dtype=torch.bfloat16))
+    b = PrequantMatrix.encode(torch.zeros(experts * n_e, _K, dtype=torch.bfloat16))
+    routing = tuple(t for rows in per_expert for t in rows)
+    offsets = _cumulative(per_expert)
+    moe = MoEBlockInfo(
+        expert_index=w,
+        inner_a_rows=tuple(_tile_indices(config.rows_pattern, tile)),
+        routing=routing,
+        offsets=tuple(offsets),
+    )
+    expert_rows = moe.expert_rows()
+    opening = OpenedBlockInfo(
+        a_row_indices=tuple(expert_rows[i] for i in moe.inner_a_rows),
+        b_column_indices=tuple(w * n_e + c for c in _tile_indices(config.cols_pattern, 0)),
+        a_codes=a.int_values,
+        a_scales=a.scales,
+        b_codes=b.int_values,
+        b_scales=b.scales,
+        mining_config=config,
+        moe=moe,
+    )
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+    proof = create_proof(opening, header)
+
+    assert proof.moe is not None and proof.moe.experts == experts
+    assert proof.moe_witness is not None and proof.moe_witness.w == w
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
+    assert accepted, message
+
+    # The proof binds the routing: the same tile under other tokens is rejected.
+    wrong_rows = replace(opening, a_row_indices=tuple(expert_rows[i] for i in range(4)))
+    with pytest.raises(ValueError, match="routed tokens"):
+        create_proof(wrong_rows, header)
+    # A dense opening cannot carry a witness, nor an MoE configuration omit it.
+    with pytest.raises(ValueError, match="needs both"):
+        create_proof(replace(opening, moe=None), header)
+    with pytest.raises(ValueError, match="needs both"):
+        create_proof(replace(opening, mining_config=replace(config, experts=0)), header)
+
+
+def test_moe_opening_rejects_non_canonical_witnesses():
+    """The witness must be a canonical partition of exact integers: a slice
+    that still selects the right rows is not enough."""
+    experts = 4
+    per_expert = _round_robin_routing(experts, 2)
+    config = replace(default_mining_config(k=_K, rank=32, ltile_cols=128), experts=experts)
+    a = PrequantMatrix.encode(torch.zeros(_M, _K, dtype=torch.bfloat16))
+    b = PrequantMatrix.encode(torch.zeros(experts * _N, _K, dtype=torch.bfloat16))
+    routing = tuple(t for rows in per_expert for t in rows)
+    offsets = _cumulative(per_expert)
+    w = 2
+    moe = MoEBlockInfo(
+        expert_index=w,
+        inner_a_rows=tuple(_tile_indices(config.rows_pattern, 3)),
+        routing=routing,
+        offsets=tuple(offsets),
+    )
+    expert_rows = moe.expert_rows()
+    opening = OpenedBlockInfo(
+        a_row_indices=tuple(expert_rows[i] for i in moe.inner_a_rows),
+        b_column_indices=tuple(w * _N + c for c in _tile_indices(config.cols_pattern, 0)),
+        a_codes=a.int_values,
+        a_scales=a.scales,
+        b_codes=b.int_values,
+        b_scales=b.scales,
+        mining_config=config,
+        moe=moe,
+    )
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+
+    shifted = list(offsets)
+    shifted[-1] -= 1  # no longer ends at len(routing)
+    for bad_offsets in (tuple(shifted), tuple(reversed(offsets)), tuple(float(o) for o in offsets)):
+        with pytest.raises((ValueError, TypeError)):
+            create_proof(replace(opening, moe=replace(moe, offsets=bad_offsets)), header)
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(replace(opening, moe=replace(moe, expert_index=True)), header)
+    float_rows = tuple(float(r) for r in opening.a_row_indices)  # == the ints, but not ints
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(replace(opening, a_row_indices=float_rows), header)
+    bool_inner = (False, *moe.inner_a_rows[1:])  # == 0, but not an int
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(replace(opening, moe=replace(moe, inner_a_rows=bool_inner)), header)
+    float_cols = tuple(float(c) for c in opening.b_column_indices)
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(replace(opening, b_column_indices=float_cols), header)
+    # Expert 0's first column tile starts at 0, 1: bools there survive the
+    # expert-base subtraction as ints, so the given values must be checked.
+    moe0 = replace(moe, expert_index=0, inner_a_rows=tuple(_tile_indices(config.rows_pattern, 0)))
+    rows0 = moe0.expert_rows()
+    cols0 = tuple(_tile_indices(config.cols_pattern, 0))
+    opening0 = replace(
+        opening,
+        moe=moe0,
+        a_row_indices=tuple(rows0[i] for i in moe0.inner_a_rows),
+        b_column_indices=cols0,
+    )
+    assert cols0[:2] == (0, 1)
+    create_proof(opening0, header)  # the int form is a valid opening
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(replace(opening0, b_column_indices=(False, True, *cols0[2:])), header)
+    # Columns outside the winning expert's stacked rows are not its tile.
+    with pytest.raises(ValueError, match="b_column_indices"):
+        create_proof(replace(opening, b_column_indices=cols0), header)
+
+    # Canonical routing lists every expert's tokens strictly ascending: a
+    # swapped pair or a duplicate anywhere in the table (even in another
+    # expert's segment) is a witness the verifier cannot reproduce.
+    swapped = list(routing)
+    swapped[0], swapped[1] = swapped[1], swapped[0]
+    duplicated = list(routing)
+    duplicated[offsets[0]] = duplicated[offsets[0] + 1]
+    for bad_routing in (tuple(swapped), tuple(duplicated)):
+        with pytest.raises(ValueError, match="strictly increasing"):
+            create_proof(replace(opening, moe=replace(moe, routing=bad_routing)), header)
+
+
+def test_owned_copy_snapshots_the_moe_witness():
+    """A list-backed witness mutated after the asynchronous handoff must not
+    change the queued proof's routing commitment."""
+    experts = 4
+    config = replace(default_mining_config(k=_K, rank=32, ltile_cols=128), experts=experts)
+    a = PrequantMatrix.encode(torch.zeros(_M, _K, dtype=torch.bfloat16))
+    b = PrequantMatrix.encode(torch.zeros(experts * _N, _K, dtype=torch.bfloat16))
+    per_expert = _round_robin_routing(experts, 2)
+    routing = [t for rows in per_expert for t in rows]
+    offsets = _cumulative(per_expert)
+    inner = list(_tile_indices(config.rows_pattern, 1))
+    moe = MoEBlockInfo(expert_index=1, inner_a_rows=inner, routing=routing, offsets=offsets)
+    expert_rows = moe.expert_rows()
+    opening = OpenedBlockInfo(
+        a_row_indices=[expert_rows[i] for i in inner],
+        b_column_indices=[_N + c for c in _tile_indices(config.cols_pattern, 0)],
+        a_codes=a.int_values,
+        a_scales=a.scales,
+        b_codes=b.int_values,
+        b_scales=b.scales,
+        mining_config=config,
+        moe=moe,
+    )
+    owned = opening.owned_copy()
+    assert owned.moe is not None and owned.moe is not moe
+    assert all(
+        type(seq) is tuple for seq in (owned.moe.routing, owned.moe.offsets, owned.moe.inner_a_rows)
+    )
+
+    routing[0], routing[1] = routing[1], routing[0]
+    offsets[-1] -= 1
+    inner[0] += 1
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+    proof = create_proof(owned, header)
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
+    assert accepted, message
+
+
+def test_moe_configuration_binds_experts_into_pa_and_pb():
+    """``pB`` carries the expert count and ``pA`` the routing/offset leaves;
+    a dense configuration encodes neither."""
+    dense = default_mining_config(k=_K, rank=32, ltile_cols=128)
+    moe = replace(dense, experts=8)
+    assert dense.moe_params() is None
+    params = moe.moe_params()
+    assert params is not None and params.experts == 8
+    assert params.hash_id_r is params.hash_id_o is moe.a_hash_id
+    assert moe.p_a(_M) == dense.p_a(_M) + bytes((moe.a_hash_id, moe.a_hash_id))
+    assert moe.p_b(_N)[:-2] == dense.p_b(_N)[:-2]
+    assert moe.p_b(_N)[-2:] == (8).to_bytes(2, "little")
+    assert dense.p_b(_N)[-2:] == bytes(2)
 
 
 @pytest.mark.parametrize(

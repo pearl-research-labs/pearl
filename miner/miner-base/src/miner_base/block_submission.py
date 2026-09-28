@@ -31,8 +31,11 @@ from .commitment import (
     OperandParams,
     PlanarCommitment,
     commit_planes,
+    commit_routing,
     commitment_keys,
     hash_id_for_leaf,
+    hash_offsets,
+    routing_leaf_indices,
 )
 from .layout import AxisPattern
 from .mining_config import COMMITMENT_CHUNK_SIZE
@@ -68,8 +71,44 @@ class PrebuiltCommitment:
 
 
 @dataclass(frozen=True)
+class MoEBlockInfo:
+    """The routing witness of one MoE winning tile.
+
+    ``routing`` is the canonical flat table ``R[0] || ... || R[E-1]`` (each
+    expert's token indices ascending) and ``offsets`` its cumulative end
+    offsets ``O``. The tile's rows are ``R[expert_index][inner_a_rows]``, and
+    the opening's ``a_row_indices`` must be exactly those global tokens.
+    """
+
+    expert_index: int
+    inner_a_rows: tuple[int, ...]
+    routing: tuple[int, ...]
+    offsets: tuple[int, ...]
+
+    def expert_rows(self) -> tuple[int, ...]:
+        start = self.offsets[self.expert_index - 1] if self.expert_index else 0
+        return tuple(self.routing[start : self.offsets[self.expert_index]])
+
+    def owned_copy(self) -> "MoEBlockInfo":
+        """Snapshot every sequence: a list-backed witness handed off
+        asynchronously must not change under the queued proof."""
+        return MoEBlockInfo(
+            expert_index=self.expert_index,
+            inner_a_rows=tuple(self.inner_a_rows),
+            routing=tuple(self.routing),
+            offsets=tuple(self.offsets),
+        )
+
+
+@dataclass(frozen=True)
 class OpenedBlockInfo:
-    """CPU-resident committed planes and indices for one winning tile."""
+    """CPU-resident committed planes and indices for one winning tile.
+
+    For an MoE layer (``mining_config.experts``) the planes are the full
+    activation ``A`` and the stacked expert weights, ``a_row_indices`` are the
+    global token indices of the tile and ``b_column_indices`` the global
+    stacked weight rows; ``moe`` carries the routing witness.
+    """
 
     a_row_indices: tuple[int, ...] | list[int]
     b_column_indices: tuple[int, ...] | list[int]
@@ -80,6 +119,7 @@ class OpenedBlockInfo:
     mining_config: MiningConfiguration
     b_commitment: PrebuiltCommitment | None = None
     a_commitment: PrebuiltCommitment | None = None
+    moe: MoEBlockInfo | None = None
 
     def owned_copy(self) -> "OpenedBlockInfo":
         """Validate and snapshot mutable inputs for an asynchronous handoff."""
@@ -87,6 +127,7 @@ class OpenedBlockInfo:
         prebuilt_a = self.a_commitment
         prebuilt_b = self.b_commitment
         return OpenedBlockInfo(
+            moe=None if self.moe is None else self.moe.owned_copy(),
             a_row_indices=tuple(self.a_row_indices),
             b_column_indices=tuple(self.b_column_indices),
             # A prebuilt tree was built from these exact owned hit planes. Keep
@@ -185,11 +226,71 @@ def _validate_opening(opened_block_info: OpenedBlockInfo) -> tuple[int, int, int
     config = opened_block_info.mining_config
     if k != config.common_dim:
         raise ValueError(f"opening k={k} does not match mining configuration k={config.common_dim}")
-    _validate_indices("a_row_indices", opened_block_info.a_row_indices, m, config.rows_pattern)
+    moe = opened_block_info.moe
+    if (moe is None) != (config.experts == 0):
+        raise ValueError("an MoE opening needs both mining_config.experts and moe")
+    if moe is None:
+        _validate_indices("a_row_indices", opened_block_info.a_row_indices, m, config.rows_pattern)
+        _validate_indices(
+            "b_column_indices", opened_block_info.b_column_indices, n, config.cols_pattern
+        )
+        return m, n, k
+
+    # MoE: the lottery lattice is expert-local. Rows are a tile of the expert's
+    # routing list, columns a tile of the expert's stacked weight rows. The
+    # column indices are checked here as given: the expert-local values handed
+    # to ``_validate_indices`` below are computed (``index - base``), so a bool
+    # would already have become an int there.
+    witness = (
+        moe.expert_index,
+        *moe.offsets,
+        *moe.routing,
+        *moe.inner_a_rows,
+        *opened_block_info.a_row_indices,
+        *opened_block_info.b_column_indices,
+    )
+    if any(type(v) is not int for v in witness):
+        raise TypeError("MoE witness fields must be integers")
+    if n % config.experts or not 0 <= moe.expert_index < config.experts:
+        raise ValueError(f"expert {moe.expert_index} / stacked n={n} do not fit {config.experts}")
+    n_e = n // config.experts
+    _validate_routing_witness(moe, config.experts, m)
+    expert_rows = moe.expert_rows()
+    _validate_indices("inner_a_rows", moe.inner_a_rows, len(expert_rows), config.rows_pattern)
+    if tuple(opened_block_info.a_row_indices) != tuple(expert_rows[i] for i in moe.inner_a_rows):
+        raise ValueError("a_row_indices are not the routed tokens of inner_a_rows")
+    base = moe.expert_index * n_e
     _validate_indices(
-        "b_column_indices", opened_block_info.b_column_indices, n, config.cols_pattern
+        "b_column_indices",
+        tuple(index - base for index in opened_block_info.b_column_indices),
+        n_e,
+        config.cols_pattern,
     )
     return m, n, k
+
+
+def _validate_routing_witness(moe: MoEBlockInfo, experts: int, m: int) -> None:
+    """``(routing, offsets)`` is the canonical routing table.
+
+    The witness is committed and Merkle-indexed as exact integers (checked by
+    the caller). ``offsets`` is the cumulative partition of the flat table:
+    one end offset per expert, non-decreasing, the last being its length;
+    every token index lies in the activation; and each expert's segment is
+    strictly ascending, the only form the verifier reproduces the routing
+    root from.
+    """
+    if (
+        len(moe.offsets) != experts
+        or any(moe.offsets[i] > moe.offsets[i + 1] for i in range(experts - 1))
+        or (moe.offsets and (moe.offsets[0] < 0 or moe.offsets[-1] != len(moe.routing)))
+        or any(index < 0 or index >= m for index in moe.routing)
+    ):
+        raise ValueError("MoE routing witness does not describe this opening")
+    bounds = (0, *moe.offsets)
+    for expert in range(experts):
+        segment = moe.routing[bounds[expert] : bounds[expert + 1]]
+        if any(a >= b for a, b in zip(segment, segment[1:], strict=False)):
+            raise ValueError(f"MoE routing witness R[{expert}] is not strictly increasing")
 
 
 def _checked_commitment(
@@ -242,17 +343,44 @@ _NATIVE_HASH_ID = {
 }
 
 
-def _native_matrix_proof(opening: MatrixMerkleProof) -> pearl_mining.MatrixMerkleProof:
-    """The reference opening (a ``pearl_blake3`` proof) as the verifier's own type."""
-    proof = opening.proof
-    native = pearl_mining.MerkleProof(
+def _native_merkle_proof(proof) -> pearl_mining.MerkleProof:
+    """A ``pearl_blake3`` multi-leaf proof as the verifier's own type."""
+    return pearl_mining.MerkleProof(
         [bytes(leaf) for leaf in proof.leaf_data],
         list(proof.leaf_indices),
         bytes(proof.root),
         [bytes(sibling) for sibling in proof.siblings],
         proof.total_leaves,
     )
-    return pearl_mining.MatrixMerkleProof(native, list(opening.row_indices))
+
+
+def _native_matrix_proof(opening: MatrixMerkleProof) -> pearl_mining.MatrixMerkleProof:
+    """The reference opening (a ``pearl_blake3`` proof) as the verifier's own type."""
+    return pearl_mining.MatrixMerkleProof(
+        _native_merkle_proof(opening.proof), list(opening.row_indices)
+    )
+
+
+def _native_moe(
+    moe: MoEBlockInfo, config: MiningConfiguration, key_a: bytes
+) -> tuple[pearl_mining.MoeParams, pearl_mining.MoeWitness]:
+    """The MoE public fields and witness: ``HR``'s opening of ``R[w]`` and ``O``."""
+    params = config.moe_params()
+    assert params is not None
+    routing, offsets, w = list(moe.routing), list(moe.offsets), moe.expert_index
+    routing_tree = commit_routing(routing, key_a, params.hash_id_r)
+    start = offsets[w - 1] if w else 0
+    leaf_indices = routing_leaf_indices(start, offsets[w], params.hash_id_r)
+    witness = pearl_mining.MoeWitness(
+        w,
+        offsets,
+        hash_offsets(offsets, key_a, params.hash_id_o),
+        _native_merkle_proof(routing_tree.get_multileaf_proof(leaf_indices)),
+    )
+    native_params = pearl_mining.MoeParams(
+        params.experts, _NATIVE_HASH_ID[params.hash_id_r], _NATIVE_HASH_ID[params.hash_id_o]
+    )
+    return native_params, witness
 
 
 def _native_operand(params: OperandParams) -> pearl_mining.OperandParams:
@@ -291,6 +419,9 @@ def create_proof(
         )
     a_values, a_scales = comm_a.open(list(opened_block_info.a_row_indices))
     bt_values, bt_scales = comm_b.open(list(opened_block_info.b_column_indices))
+    moe = moe_witness = None
+    if opened_block_info.moe is not None:
+        moe, moe_witness = _native_moe(opened_block_info.moe, config, key_a)
 
     common = config.common_params()
     return PlainProofV4(
@@ -307,6 +438,8 @@ def create_proof(
         values_b=_native_matrix_proof(bt_values),
         scales_a=_native_matrix_proof(a_scales),
         scales_b=_native_matrix_proof(bt_scales),
+        moe=moe,
+        moe_witness=moe_witness,
     )
 
 
@@ -343,6 +476,7 @@ def submit_opened_block(
 
 
 __all__ = [
+    "MoEBlockInfo",
     "OpenedBlockInfo",
     "PrebuiltCommitment",
     "PlainProofClient",

@@ -28,6 +28,7 @@ from .params import (
     CommonParams,
     Device,
     HashId,
+    MoeParams,
     OperandParams,
     Quant,
     encode_p_a,
@@ -64,6 +65,7 @@ __all__ = [
     "MatrixCommitment",
     "MatrixMerkleProof",
     "MiningConfiguration",
+    "MoeParams",
     "OperandParams",
     "PROTOCOL_RANK",
     "PlanarCommitment",
@@ -71,14 +73,17 @@ __all__ = [
     "bits_to_target",
     "commit_matrix",
     "commit_planes",
+    "commit_routing",
     "commitment_keys",
     "encode_p_a",
     "encode_p_b",
     "encode_u32_le",
     "hash_id_for_leaf",
     "hash_labelled",
+    "hash_offsets",
     "jackpot_digest",
     "noise_seeds",
+    "routing_leaf_indices",
     "subkey",
 ]
 
@@ -200,6 +205,16 @@ def hash_offsets(
     return bytes(tree.root)
 
 
+def routing_leaf_indices(start: int, end: int, hash_id: HashId) -> list[int]:
+    """The routing-tree leaves that open ``Rflat[start:end]`` (one expert's
+    ``R[w]``): every ``hash_id`` chunk overlapping its u32 bytes, the minimal
+    opening the verifier compiles for the routing tree."""
+    if not 0 <= start < end:
+        raise ValueError(f"routing slice [{start}, {end}) must be non-empty")
+    chunk = hash_id.chunk_len
+    return list(range(4 * start // chunk, -(-4 * end // chunk)))
+
+
 # The verifier's whitelisted keyed-BLAKE3 Merkle leaf sizes.
 _HASH_ID_FOR_LEAF = {hash_id.chunk_len: hash_id for hash_id in HashId}
 
@@ -229,6 +244,11 @@ class MiningConfiguration:
     committed tree: ``chunk_size`` for the weight (B) planes and
     ``a_chunk_size`` (defaulting to it) for the activation (A) planes. Both
     leaves are protocol-visible through the operands' ``HashId``.
+
+    ``experts`` is 0 for a dense linear. An MoE layer commits its stacked
+    expert weights as one ``(experts * n_e, k)`` B and carries the expert count
+    into ``pB``, plus the routing-table leaves (``hash_idR`` / ``hash_idO``,
+    both the activation leaf) into ``pA``.
     """
 
     device: Device
@@ -238,6 +258,7 @@ class MiningConfiguration:
     cols_pattern: AxisPattern
     chunk_size: int = HashId.BLAKE3_CHUNK_1024.chunk_len
     a_chunk_size: int | None = None
+    experts: int = 0
 
     def __post_init__(self) -> None:
         if self.a_chunk_size is None:
@@ -267,10 +288,16 @@ class MiningConfiguration:
         """The B operand's committed ``(n, hash_idB, Pcol)``."""
         return OperandParams(n, self.b_hash_id, self.cols_pattern)
 
+    def moe_params(self) -> MoeParams | None:
+        """The MoE public fields (``None`` for a dense layer)."""
+        if not self.experts:
+            return None
+        return MoeParams(self.experts, self.a_hash_id, self.a_hash_id)
+
     def p_a(self, m: int) -> bytes:
         """The encoded ``pA`` bound into ``noise seedA``."""
-        return encode_p_a(self.a_params(m))
+        return encode_p_a(self.a_params(m), self.moe_params())
 
     def p_b(self, n: int) -> bytes:
         """The encoded ``pB`` bound into ``noise seedB``."""
-        return encode_p_b(self.common_params(), self.b_params(n))
+        return encode_p_b(self.common_params(), self.b_params(n), experts=self.experts)

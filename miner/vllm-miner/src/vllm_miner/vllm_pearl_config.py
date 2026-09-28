@@ -10,22 +10,35 @@ Selected with ``--quantization pearl``. Two source shapes are supported:
   ``compressed-tensors`` FP8 / NVFP4 / MXFP4) are delegated to the matching
   vLLM quant method: mineable dense linears are decoded back to BF16
   (:mod:`vllm_miner.upcast`) then encoded to FP10, while every
-  non-mined layer -- MoE experts, KV cache, embeddings, ignored/non-mineable
-  linears -- keeps its compact source scheme so a quantized model still fits.
-  Upcasting is lossy: it mines over already-quantized weights.
+  non-mined layer -- quantized MoE experts, KV cache, embeddings,
+  ignored/non-mineable linears -- keeps its compact source scheme so a
+  quantized model still fits. Upcasting is lossy: it mines over
+  already-quantized weights.
 
   ``--quantization pearl`` takes over such checkpoints via
   ``override_quantization_method`` (vLLM would otherwise refuse the mismatch).
 
-Each CUDA worker mines the dense 2-D shard loaded in that process. Layers matched
-by ``PEARL_IGNORED_LAYERS`` and non-linear layers keep the source/unquantized
-path.
+Each CUDA worker mines the dense 2-D shard loaded in that process. BF16 routed
+experts mine their stacked gate/up weight through :class:`PearlMoEMethod`.
+Ignored dense linears keep the source/unquantized path. Ignored but otherwise
+mineable routed experts still take :class:`PearlMoEMethod` (Triton, unmined)
+so every expert layer of a MoE checkpoint runs on one backend.
 """
 
 from typing import Any, override
 
 import torch
 from miner_utils import get_logger
+from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.activation import (
+    ApplyMoEActivationConfig,
+    apply_moe_activation,
+    apply_moe_activation_supported,
+)
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -38,6 +51,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 
+from .moe import MoeRouting, combine_routed_rows
 from .settings import is_layer_ignored, runtime_settings
 from .state import (
     LayerState,
@@ -461,6 +475,163 @@ class PearlLinearMethod(UnquantizedLinearMethod):
         return super().apply(layer, x, bias)
 
 
+def moe_config_unsupported_reason(moe: FusedMoEConfig) -> str | None:
+    """Why this deployment's MoE configuration cannot mine, or None.
+
+    Decided from the model-owned ``FusedMoEConfig`` alone, before any method
+    is constructed: a declined layer keeps the engine's own MoE method and
+    backend (``PearlMoEMethod`` forces the Triton backend, which does not
+    serve every topology the FlashInfer backends do).
+    """
+    if not moe.is_act_and_mul or not apply_moe_activation_supported(moe.activation):
+        return f"activation {moe.activation.value}"
+    if moe.swiglu_limit is not None or moe.swiglu_alpha is not None or moe.swiglu_beta is not None:
+        return "swiglu gate parameters"
+    if moe.has_bias:
+        return "expert biases"
+    if moe.use_ep:
+        return "expert parallelism"
+    if moe.is_lora_enabled:
+        return "LoRA experts"
+    return None
+
+
+class PearlMoEMethod(UnquantizedFusedMoEMethod):
+    """Mines the first grouped GEMM (``w13``) of a BF16 MoE layer.
+
+    Scope. A layer mines when it is BF16 with an act-and-mul activation, has no
+    SwiGLU gate parameters, no expert biases, no shared experts, no LoRA and no
+    expert parallelism (``expert_map is None``). Quantized expert checkpoints
+    stay on their source scheme. ``PearlConfig`` builds this method only for
+    configurations :func:`moe_config_unsupported_reason` admits; anything it
+    can only see on the loaded layer logs the reason once and serves the
+    inherited Triton path unmined (see ``_unsupported_reason``).
+
+    The stacked ``(E, 2I, H)`` gate/up weight is encoded to FP10 planes as one
+    ``(E * 2I, H)`` mining weight. A mined forward commits the activation once
+    at its token addresses, routes the noised rows to their experts
+    (:mod:`vllm_miner.moe`) and serves the mined ``x_e @ w13_e^T`` as each
+    expert's gate/up output; the activation, the ``w2`` grouped GEMM and the
+    router-weighted combine stay plain PyTorch. The BF16 ``w13`` remains on
+    the layer for the inherited Triton path, which serves whenever a launch
+    is declined (CUDA-graph capture, oversize batch, no job, ...).
+    """
+
+    def __init__(self, moe: FusedMoEConfig, prefix: str):
+        # The FlashInfer backends re-lay w13/w2 out in kernel-private formats.
+        # The plain Triton kernel keeps the checkpoint (E, 2I, H) layout the
+        # mining weight is encoded from and the mined tail reads w2 in. This
+        # overrides the engine's choice for the whole layer, mined or not.
+        if moe.moe_backend not in ("auto", "triton"):
+            _LOGGER.info(f"{prefix}: forcing moe_backend=triton (was {moe.moe_backend})")
+        moe.moe_backend = "triton"
+        super().__init__(moe)
+        self.prefix = prefix
+        self._state: LayerState | None = None
+
+    def _unsupported_reason(self, layer: torch.nn.Module) -> str | None:
+        reason = moe_config_unsupported_reason(self.moe)
+        if reason is not None:
+            return reason
+        if layer.expert_map is not None:
+            return "expert parallelism"
+        if layer.apply_router_weight_on_input:
+            return "router weights applied on the input"
+        return None
+
+    @override
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if is_layer_ignored(self.prefix, runtime_settings().ignored_layers):
+            return
+        w13 = layer.w13_weight.data
+        experts, n_e, k = w13.shape
+        weight = w13.reshape(experts * n_e, k)
+        if self._state is not None:
+            refresh_layer_state(self._state, weight)
+            return
+        reason = self._unsupported_reason(layer)
+        if reason is None and not can_mine_layer(experts * n_e, k, w13.device, experts):
+            reason = f"shape (experts={experts}, n_e={n_e}, k={k})"
+        if reason is not None:
+            _LOGGER.info(f"MoE layer {self.prefix} not mineable here ({reason}); serving unmined")
+            return
+        try:
+            state = create_layer_state(
+                self.prefix, weight, experts=experts, top_k=self.moe.experts_per_token
+            )
+            register_state(state)
+        except torch.cuda.OutOfMemoryError:
+            _LOGGER.warning(
+                f"Pearl state allocation ran out of memory for {self.prefix}; "
+                "serving this MoE layer unmined.",
+            )
+            return
+        self._state = state
+        if state.mineable:
+            from .cuda_graph_submission_gate import suspend_submissions_until_capture_complete
+
+            suspend_submissions_until_capture_complete()
+
+    @override
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: Any,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self._state is not None and shared_experts is None:
+            if x.dtype != torch.bfloat16:
+                raise TypeError(f"Pearl mined MoE requires bfloat16 activations, got {x.dtype}")
+            from .linear_op import try_mine_moe
+
+            # The tail runs inside the admitted launch, before its terminal
+            # event, so the runtime's drain/capture quiescence covers the
+            # whole mined forward and a tail OOM is handled like a launch OOM
+            # (device cooldown, this forward served unmined). Nothing of the
+            # mined path outlives the call: the fallback below never competes
+            # with a dead gate/up output for memory.
+            def tail(gate_up: torch.Tensor, routing: MoeRouting) -> torch.Tensor:
+                return self._mined_tail(layer, topk_weights, gate_up, routing)
+
+            out = try_mine_moe(self._state, x, topk_ids, tail)
+            if out is not None:
+                return out
+        return super().apply(layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input)
+
+    def _mined_tail(
+        self,
+        layer: torch.nn.Module,
+        topk_weights: torch.Tensor,
+        gate_up: torch.Tensor,
+        routing: MoeRouting,
+    ) -> torch.Tensor:
+        """Activation, ``w2`` grouped GEMM and router-weighted combine over the
+        mined ``(cum_m, 2I)`` gate/up output in expert-permuted row order."""
+        hidden = torch.empty(
+            gate_up.shape[0], gate_up.shape[1] // 2, dtype=gate_up.dtype, device=gate_up.device
+        )
+        # The activation reads its parameters (SITU betas, SwiGLU clamp) from
+        # the configs, exactly as the inherited expert path forwards them.
+        apply_moe_activation(
+            self.moe.activation,
+            hidden,
+            gate_up,
+            activation_config=ApplyMoEActivationConfig.from_configs(
+                self.moe, self.moe_quant_config
+            ),
+        )
+        # torch._grouped_mm is private API (pinned torch==2.13.0); it is the
+        # only BF16 grouped GEMM torch ships for Blackwell. Re-check on any bump.
+        down = torch._grouped_mm(hidden, layer.w2_weight.transpose(1, 2), offs=routing.m_indptr[1:])
+        # Deterministic (no atomics) scatter + slot reduction; every slot is
+        # routed because EP, which drops off-rank rows, is refused above.
+        return combine_routed_rows(down, topk_weights, routing)
+
+
 class PearlConfig(QuantizationConfig):
     """Engine-selected config over BF16 or compressed-tensors checkpoints.
 
@@ -571,6 +742,26 @@ class PearlConfig(QuantizationConfig):
         if self.source_config is not None:
             self.source_config.maybe_update_config(model_name, hf_config, revision)
 
+    @staticmethod
+    def _non_linear_method(
+        layer: torch.nn.Module, prefix: str, source_method: QuantizeMethodBase | None
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, RoutedExperts) and source_method is None:
+            # Decline unsupported topologies here, not inside PearlMoEMethod:
+            # its constructor forces Triton, which does not serve every
+            # topology (EP over FlashInfer NVL). None leaves the layer on the
+            # engine's own unquantized method with its original backend.
+            # Ignored-but-mineable experts still take PearlMoEMethod so they
+            # stay on Triton (unmined) like the mined expert layers.
+            reason = moe_config_unsupported_reason(layer.moe_config)
+            if reason is None and getattr(layer, "apply_router_weight_on_input", False):
+                reason = "router weights applied on the input"
+            if reason is not None:
+                _LOGGER.info(f"MoE layer {prefix} not mineable here ({reason}); serving unmined")
+                return None
+            return PearlMoEMethod(layer.moe_config, prefix)
+        return source_method
+
     @override
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
         source_method: QuantizeMethodBase | None = None
@@ -580,10 +771,11 @@ class PearlConfig(QuantizationConfig):
             self.source_config.packed_modules_mapping = self.packed_modules_mapping
             source_method = self.source_config.get_quant_method(layer, prefix)
 
-        # Non-linear layers (MoE experts, KV cache, embeddings): serve via the
-        # source scheme so they keep the checkpoint's compact format. No mining.
+        # BF16 routed experts mine their first grouped GEMM. Every other
+        # non-linear layer (quantized experts, KV cache, embeddings) serves via
+        # the source scheme so it keeps the checkpoint's compact format.
         if not isinstance(layer, LinearBase):
-            return source_method
+            return self._non_linear_method(layer, prefix, source_method)
 
         # MLA reads kv_b_proj weights directly (not via ``apply``): leave them on
         # the source scheme (or BF16) rather than encoding to FP10 planes.
