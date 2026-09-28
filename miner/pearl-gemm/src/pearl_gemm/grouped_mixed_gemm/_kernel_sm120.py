@@ -129,12 +129,12 @@ class _GroupedFusedGemmSm120(_FusedGemmSm120):
         sPb: cute.Tensor,
         group: _TileGroup,
     ):
-        """``A_peel`` from the expert's first row is a plain offset, not a
-        ragged view: rows past the block only reach output rows the ragged
-        store clips (the peel follows the fold)."""
+        """``A_peel`` from the expert's first row uses the same ragged view as
+        ``A'``: the last expert's partial CTA tile must stay inside the
+        gathered peel allocation (``cum_m`` rows)."""
         return self._peel_tma_partitions(
             tma_atom_pa,
-            cute.domain_offset((group.row0, 0), mPa),
+            copy_utils.offset_ragged_tensor(mPa, group.row0, group.rows, ragged_dim=0),
             sPa,
             tma_atom_pb,
             self._column_operand(mPb, group),

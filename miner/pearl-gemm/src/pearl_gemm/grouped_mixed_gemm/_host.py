@@ -122,6 +122,7 @@ class GroupedMixedGemmConfig:
         cum_m: int,
         num_groups: int,
         *,
+        n: int | None = None,
         arch: Arch | None = None,
         device: torch.device | int | None = None,
         **knobs,
@@ -134,6 +135,10 @@ class GroupedMixedGemmConfig:
         ``WIDE_TILE_MIN_TOKENS_PER_GROUP`` tokens per expert on average, the
         1-SM 128x128 tile below. SM120: the 128x128 tile. Explicit tile knobs
         win.
+
+        ``n`` (the expert width) clamps the auto-selected ``tile_n`` so the
+        CTA tile never exceeds the expert: pass the per-expert ``n_e``, not
+        the stacked ``num_groups * n_e``.
         """
         if arch is None:
             arch = arch_of(device)
@@ -141,7 +146,10 @@ class GroupedMixedGemmConfig:
             return cls(**knobs)
         wide = cum_m >= WIDE_TILE_MIN_TOKENS_PER_GROUP * num_groups
         knobs.setdefault("mma_sm", 2 if wide else 1)
-        knobs.setdefault("tile_n", 256 if wide else 128)
+        default_tile_n = 256 if wide else 128
+        if n is not None and default_tile_n > n:
+            default_tile_n = 128
+        knobs.setdefault("tile_n", default_tile_n)
         return cls(**knobs)
 
 
@@ -368,7 +376,7 @@ def grouped_mixed_gemm(
     arch = require_arch("grouped_mixed_gemm", device, *_SUPPORTED_ARCHS)
     capability = torch.cuda.get_device_capability(device)
     if config is None:
-        config = GroupedMixedGemmConfig.auto(cum_m, num_groups, arch=arch)
+        config = GroupedMixedGemmConfig.auto(cum_m, num_groups, n=n, arch=arch)
     if arch is Arch.SM120 and (
         config.mma_sm != 1 or config.scheduler != "static" or group_order is not None
     ):

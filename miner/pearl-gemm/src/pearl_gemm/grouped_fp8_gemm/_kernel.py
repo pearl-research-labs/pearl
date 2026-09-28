@@ -753,11 +753,13 @@ class GroupedGemmSm100(_HitPublishMixin):
         # publication exclude those columns.
         tma_atom_pa, tma_tensor_pa, tma_atom_pb, tma_tensor_pb = (None,) * 4
         if self.mining:
-            pa3 = cute.make_tensor(
-                a_peel.iterator,
-                cute.make_layout(
-                    (a_peel.shape[0], a_peel.shape[1], 1), stride=(a_peel.stride[0], 1, 0)
-                ),
+            # A_peel uses the same ragged row view as A: the last group's
+            # partial CTA tile must stay inside the gathered peel allocation.
+            pa3 = self._ragged_rows_view(
+                cute.make_tensor(
+                    a_peel.iterator,
+                    cute.make_layout(a_peel.shape, stride=(a_peel.stride[0], 1)),
+                )
             )
             pb3 = cute.make_tensor(
                 b_peel.iterator,
@@ -1756,22 +1758,23 @@ class GroupedGemmSm100(_HitPublishMixin):
                     # This tile's BF16 peel operands: the MMA tile's rows of
                     # A_peel (this CTA's half of them for the 2-CTA pair) and
                     # rows [group * n + tile_n * cta_n, +cta_n) of B_peel,
-                    # addressed through the global descriptors by coordinate
-                    # offset. They are issued once the A/B ring has wrapped:
-                    # by then the MMA warp has consumed this tile's first
-                    # k-tile, hence finished the previous tile's peel and
-                    # freed the single peel stage, so the acquire never
-                    # stalls the A/B loads, and the load has the rest of the
-                    # mainloop to land. With the peel accumulated in place the
-                    # MMA warp consumes the previous tile's peel operands
-                    # ``num_ab_stage`` k-tiles into this tile, so the load
-                    # moves one ring depth later to keep the acquire free.
-                    row_a = m_off + mma_tile_coord_mnl[0] * self.mma_tiler[0]
+                    # addressed through the ragged A_peel descriptor and the
+                    # global B_peel descriptor by coordinate offset. They are
+                    # issued once the A/B ring has wrapped: by then the MMA
+                    # warp has consumed this tile's first k-tile, hence
+                    # finished the previous tile's peel and freed the single
+                    # peel stage, so the acquire never stalls the A/B loads,
+                    # and the load has the rest of the mainloop to land. With
+                    # the peel accumulated in place the MMA warp consumes the
+                    # previous tile's peel operands ``num_ab_stage`` k-tiles
+                    # into this tile, so the load moves one ring depth later
+                    # to keep the acquire free.
+                    mPa_g = self._ragged_group(mPa_mkl, m_off, m_cnt)
                     row_b = cur_group_idx * n + tile_info[1] * self.cta_tile_shape_mnk[1]
                     gPa = cute.local_tile(
-                        cute.domain_offset((row_a, 0, 0), mPa_mkl),
+                        mPa_g,
                         (self.mma_tiler[0], R2),
-                        (0, None, None),
+                        (mma_tile_coord_mnl[0], None),
                     )
                     gPb = cute.local_tile(
                         cute.domain_offset((row_b, 0, 0), mPb_nkl),

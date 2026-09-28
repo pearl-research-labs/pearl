@@ -689,6 +689,7 @@ def _grouped_mixed_gemm(
         config=GroupedMixedGemmConfig.auto(
             m_bucket * routing.top_k,
             experts,
+            n=n_e,
             device=a_prime.device,
             ltile_rows=tile.rows,
             ltile_cols=tile.cols,
