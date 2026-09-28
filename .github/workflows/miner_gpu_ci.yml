@@ -55,7 +55,10 @@ jobs:
               - 'miner/pearl-gemm/**'
               - 'miner/miner-base/**'
               - 'miner/vllm-miner/**'
+              - 'miner/pearl-gateway/**'
               - 'miner/conftest.py'
+              - 'zk-pow/**'
+              - 'node/zkpow/**'
               - 'py-pearl-mining/**'
               - 'pearl-blake3/**'
               - '.github/workflows/miner_gpu_ci.yml'
@@ -152,6 +155,15 @@ jobs:
         miner/vllm-miner/tests/test_runtime_gpu.py
         miner/vllm-miner/tests/test_winner_callback.py
         miner/vllm-miner/tests/test_vllm_adapter.py
+
+    - name: Setup environment
+      uses: ./.github/actions/setup
+
+    - name: Build pearld
+      run: task build:pearld
+
+    - name: Run end-to-end regtest mining test
+      run: uv run pytest -v -s -m integration miner/vllm-miner/tests/test_e2e_regtest.py
 
   stop-runner:
     name: Stop EC2 GPU Runner
