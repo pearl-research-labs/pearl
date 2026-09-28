@@ -20,14 +20,10 @@ const (
 	txNavPrev = "__prev"
 )
 
-// transactionsScreen pages through the wallet history; selecting an entry
-// shows its full detail.
+// transactionsScreen pages through the wallet history; selecting an entry shows its full detail.
 //
-// listtransactions pages in transactions but answers in entries: a spent
-// output contributes both a receive and a send row, so a page of 15
-// transactions can be twice that many rows. Paging therefore counts
-// transactions, and asks for one beyond the page to learn whether older
-// history exists without a second round trip.
+// listtransactions pages in transactions but answers in entries (a spent output lists both a receive and a send), so
+// paging counts transactions, asking for one past the page to learn whether older history exists.
 func transactionsScreen(c *client) error {
 	offset := 0
 	for {
@@ -92,11 +88,10 @@ func transactionsScreen(c *client) error {
 	}
 }
 
-// txPage trims entries to at most size transactions, reporting how many
-// transactions were kept and whether the reply ran past the page. All entries
-// for one transaction arrive together, so a change of txid starts a new one.
-func txPage(entries []btcjson.ListTransactionsResult, size int) (
-	page []btcjson.ListTransactionsResult, shown int, hasMore bool) {
+// txPage trims entries to at most size transactions, reporting how many transactions were kept and whether the reply
+// ran past the page. All entries for one transaction arrive together, so a change of txid starts a new one.
+func txPage(entries []btcjson.ListTransactionsResult, size int) (page []btcjson.ListTransactionsResult, shown int,
+	hasMore bool) {
 
 	var current string
 	for i, entry := range entries {
