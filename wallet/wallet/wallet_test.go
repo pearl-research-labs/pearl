@@ -10,12 +10,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -660,4 +663,53 @@ func TestEndRecovery(t *testing.T) {
 	if !strings.EqualFold(err.Error(), "recovery: forced shutdown") {
 		t.Fatal("wrong error")
 	}
+}
+
+// Callers page listtransactions by the transactions they were shown, so the entries per transaction (two for a spent
+// receive, none for a transfer to the wallet's own change) must not shift what from and count select.
+func TestListTransactionsPaging(t *testing.T) {
+	w, cleanup := testWallet(t)
+	t.Cleanup(cleanup)
+
+	var receives []string
+	for i := range 3 {
+		receives = append(receives, fundWallet(t, w, 100_000+int64(i)).Hash.String())
+	}
+	sends := []string{sendTo(t, w, 30_000, 1).TxHash().String(), sendTo(t, w, 30_000, 1).TxHash().String()}
+
+	changeAddr, err := w.NewChangeAddress(0, waddrmgr.KeyScopeBIP0086, false)
+	require.NoError(t, err)
+	pkScript, err := txscript.PayToAddrScript(changeAddr)
+	require.NoError(t, err)
+	_, err = w.SendOutputs([]*wire.TxOut{wire.NewTxOut(20_000, pkScript)}, nil, 0, 1, 1000, CoinSelectionLargest, "")
+	require.NoError(t, err)
+
+	all, err := w.ListTransactions(0, 100)
+	require.NoError(t, err)
+	txids := listedTxids(all)
+	require.Len(t, txids, 5)
+	assert.ElementsMatch(t, sends, txids[:2], "unmined first")
+	assert.Equal(t, []string{receives[2], receives[1], receives[0]}, txids[2:], "then mined, newest first")
+	assert.Len(t, all, 8, "each spent receive lists a receive and a send")
+
+	for size := 1; size <= len(txids); size++ {
+		var paged []string
+		for from := 0; from < len(txids); from += size {
+			page, err := w.ListTransactions(from, size)
+			require.NoError(t, err)
+			paged = append(paged, listedTxids(page)...)
+		}
+		assert.Equal(t, txids, paged, "pages of %d", size)
+	}
+}
+
+// listedTxids dedupes against the previous txid only, since a transaction's entries arrive together.
+func listedTxids(entries []btcjson.ListTransactionsResult) []string {
+	var txids []string
+	for _, entry := range entries {
+		if len(txids) == 0 || txids[len(txids)-1] != entry.TxID {
+			txids = append(txids, entry.TxID)
+		}
+	}
+	return txids
 }
