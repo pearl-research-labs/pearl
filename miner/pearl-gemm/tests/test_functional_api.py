@@ -1,5 +1,7 @@
 """Regression tests for caller-owned launch buffers and compile-cache reuse."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -7,9 +9,9 @@ from pearl_gemm import (
     LABEL_F1,
     HitSignal,
     HitSignalConfig,
-    MixedGemmConfig,
     NoisyQuantBConfig,
-    NoisyQuantConfig,
+    default_mixed_gemm_config,
+    default_noisy_quant_config,
     mixed_gemm,
     noise_lines,
     noisy_quant,
@@ -18,7 +20,11 @@ from pearl_gemm import (
     pre_quant,
     pre_quant_output_shapes,
 )
+from pearl_gemm._utils._arch import arch_of
 from pearl_gemm.protocol_constants import R
+
+# The family's library default tile as a single CTA (no cluster multicast).
+_GEMM_CONFIG = replace(default_mixed_gemm_config(arch_of()), cluster_m=1, cluster_n=1)
 
 
 def _pre_quant_buffers(m=32, k=512):
@@ -59,7 +65,7 @@ def _fake_noise_lines(k: int) -> torch.Tensor:
 
 
 def _noisy_buffers(m=32, k=512):
-    config = NoisyQuantConfig()
+    config = default_noisy_quant_config(arch_of())
     codes_shape, scales_shape = pre_quant_output_shapes(m, k)
     codes = torch.zeros(codes_shape, dtype=torch.int8, device="cuda")
     scales = torch.zeros(scales_shape, dtype=torch.bfloat16, device="cuda")
@@ -196,7 +202,7 @@ def _mixed_buffers(m=256, n=128, k=512):
         "a_codes": torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda"),
         "a_scales": torch.rand(m, k // 8, dtype=torch.bfloat16, device="cuda"),
         "commitment_hash_b": torch.zeros(32, dtype=torch.uint8, device="cuda"),
-        "config": MixedGemmConfig(cluster_m=1, cluster_n=1),
+        "config": _GEMM_CONFIG,
     }
 
 

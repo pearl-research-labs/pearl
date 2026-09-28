@@ -1,7 +1,8 @@
 # vLLM - PearlMiner
 
 A vLLM plugin that mines the Pearl FP8/FP10 scheme inside serving forwards on
-SM100 (B200) GPUs, over BF16 or quantized HuggingFace checkpoints.
+Blackwell GPUs -- SM100 (B200) and SM120 (RTX PRO 6000, GeForce RTX 50) -- over
+BF16 or quantized HuggingFace checkpoints.
 
 ## How it works
 
@@ -25,16 +26,18 @@ certificate-v3 `PlainProof` objects and canonically verified. Jackpot-policy-ina
 admissible proofs are submitted to `pearl-gateway`. The gateway and Go node still do
 not support the certificate-v3 block wire format, so production node acceptance
 remains unavailable; integration uses the real miner RPC plus the consensus
-PlainPeel verifier. B-side per-job preparation runs the SM100 GPU chain
+PlainPeel verifier. B-side per-job preparation runs the GPU chain
 (`tensor_hash_plus_stats_b -> noise_lines -> noisy_quant_b`) off the serving
 path; there is no CPU fallback.
 
 Capability gates:
 
-- SM100 (B200) only: the `pearl` quantization method refuses to load on any
-  other GPU. TP, DP, and EP workers independently commit and mine
-  each eligible process-local dense shard; there is no cross-rank weight
-  reconstruction or proof aggregation.
+- Blackwell only (SM100 and SM120): the `pearl` quantization method refuses
+  to load on any other GPU. SM120 has no kernel for the tall 16x32 lottery
+  tile, so layers that commit to it (`n` not a multiple of 64, or
+  `k > 30720`) keep their original BF16 path there. TP, DP, and EP workers
+  independently commit and mine each eligible process-local dense shard;
+  there is no cross-rank weight reconstruction or proof aggregation.
 - Dense linear layers only; a mined local shard needs `k % 512 == 0`,
   `n % 128 == 0`, and `n, k % 16 == 0` (FP8 fallback alignment). Layers that
   cannot mine on this device/shape keep their original BF16 path.
@@ -153,7 +156,7 @@ Notes / constraints:
 
 `RuntimeSettings` reads case-insensitive `PEARL_*` environment variables once
 per worker process. These controls configure the launch runtime; the current
-schema-mining kernels require SM100/B200 and supported layer shapes.
+schema-mining kernels require SM100 or SM120 and supported layer shapes.
 Unsupported devices or layer shapes stay on the serving fallback.
 
 | Variable | Default | Valid values | Applies to | Effect |
@@ -198,8 +201,8 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct --quantization pearl
 ## Running Tests
 
 The suite runs on the B200 GPU CI job. Device-heavy files such as
-`tests/test_vllm_adapter.py` and `tests/test_runtime_gpu.py` need an
-SM100 GPU and carry no hardware skip guards.
+`tests/test_vllm_adapter.py` and `tests/test_runtime_gpu.py` need a
+Blackwell GPU (SM100 or SM120); SM120 skips the 16x32 lottery cases.
 
 ```bash
 pytest miner/vllm-miner/tests

@@ -28,6 +28,7 @@ from pearl_gemm.tensor_hash_plus_stats._merkle_host import (
     _effective_chunks_per_thread,
     _validate_stats_compatible,
     supported_chunk_sizes,
+    tensor_hash_smem_fits,
 )
 from pearl_gemm.tensor_hash_plus_stats._merkle_tree_roots_kernel import (
     SUPPORTED_CHUNKS_PER_THREAD,
@@ -360,9 +361,26 @@ def test_tensor_hash_space_matches_stats_path_legal_grid():
     # The kernel's stats gate: sub-block leaves plus whole multiples of one.
     assert set(_stats_chunk_sizes()) == set(range(64, 512, 64)) | set(range(512, 4096 + 1, 512))
     space = tensor_hash_plus_stats_space()
+    # The TMA legs are the full grid minus what the local architecture's smem
+    # cannot hold (every knob value survives on SM100; SM120's 99 KB drops the
+    # 512-byte loads), plus the sync legs at every thread count.
+    fitting = [
+        (threads, stages, load)
+        for threads in SUPPORTED_THREADS_PER_BLOCK
+        for stages in SUPPORTED_NUM_STAGES
+        for load in SUPPORTED_THREAD_LOAD_SIZES
+        if tensor_hash_smem_fits(threads, stages, load, stats_chunk=_blake3.CHUNK_SIZE)
+    ]
+    assert fitting, "no TMA geometry fits this architecture"
+    tma_legs = {
+        (cfg["threads_per_block"], cfg["num_stages"], cfg["thread_load_size"])
+        for cfg in space
+        if not cfg["sync_loads"]
+    }
+    assert tma_legs == set(fitting)
     assert {cfg["threads_per_block"] for cfg in space} == set(SUPPORTED_THREADS_PER_BLOCK)
-    assert {cfg["num_stages"] for cfg in space} == set(SUPPORTED_NUM_STAGES)
-    assert {cfg["thread_load_size"] for cfg in space} == set(SUPPORTED_THREAD_LOAD_SIZES)
+    assert {cfg["num_stages"] for cfg in space} == {stages for _, stages, _ in fitting}
+    assert {cfg["thread_load_size"] for cfg in space} == {load for *_, load in fitting} | {128}
     assert {cfg["leaves_per_mt_block"] for cfg in space} == set(SUPPORTED_LEAVES_PER_MT_BLOCK)
     assert {cfg["mad_rot"] for cfg in space} == {False, True}
     assert {cfg["sync_loads"] for cfg in space} == {False, True}
@@ -437,7 +455,7 @@ def test_get_tensor_hash_config_prefers_exact_then_nearest_legal():
                 "runtime": 2.0,
                 "threads_per_block": 256,
                 "num_stages": 3,
-                "thread_load_size": 128,
+                "thread_load_size": 64,  # a ring both Blackwell families can hold
                 "chunk_size": 1024,
             },
         ]

@@ -3,7 +3,7 @@ the published job context, and the weight-keyed registry the torch op uses."""
 
 import itertools
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any
 
@@ -20,7 +20,7 @@ from miner_utils import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob
 
 from .fp8_fallback import build_fp8_fallback
-from .mining_config import PACKED_NOISE_K, RANK, SCALE_BLOCK, is_mineable_shape
+from .mining_config import PACKED_NOISE_K, RANK, SCALE_BLOCK, is_mineable_shape, select_tile
 from .tuning import device_config_name, tuned, with_committed_leaf
 
 _LOGGER = get_logger(__name__)
@@ -171,8 +171,12 @@ class LayerState:
             _LOGGER.error(f"mining disabled for {self.layer_name}: {reason}")
 
 
-def _is_sm100(device: torch.device) -> bool:
-    return torch.cuda.get_device_capability(device)[0] == 10
+def _mines_on(device: torch.device) -> bool:
+    """Whether ``device`` belongs to a family the pearl_gemm kernels run on
+    (SM100 datacenter Blackwell, SM120 workstation/consumer Blackwell)."""
+    from pearl_gemm.protocol_constants import SM100_CC_MAJOR, SM120_CC_MAJOR
+
+    return torch.cuda.get_device_capability(device)[0] in (SM100_CC_MAJOR, SM120_CC_MAJOR)
 
 
 def _kernels_available() -> bool:
@@ -187,8 +191,8 @@ def _kernels_available() -> bool:
 @lru_cache(maxsize=256)
 def _b_configs(config_name: str, n: int, k: int):
     from pearl_gemm import (
-        NoisyQuantBConfig,
         TensorHashConfig,
+        default_noisy_quant_config,
         tensor_hash_plus_stats_record_is_legal,
         validate_noisy_quant_config,
     )
@@ -205,7 +209,9 @@ def _b_configs(config_name: str, n: int, k: int):
             PROTOCOL_COMMITMENT_LEAF,
         )
     )
-    prepare = NoisyQuantBConfig(**tuned(config_name, "noisy_quant", m=n, k=k))
+    # Records overlay the device family's library default, so a catalog miss
+    # never launches another family's topology.
+    prepare = replace(default_noisy_quant_config(), **tuned(config_name, "noisy_quant", m=n, k=k))
     validate_noisy_quant_config(n, k, prepare)
     return commit, prepare
 
@@ -269,6 +275,16 @@ def supports_layer_shape(n: int, k: int) -> bool:
     return k % SCALE_BLOCK == 0 and n % 16 == 0 and k % 16 == 0
 
 
+def _lottery_family_available(n: int, k: int, device: torch.device) -> bool:
+    """Whether ``device`` ships a kernel for the tile ``(n, k)`` commits to
+    (SM120 has no tall 16x32 kernel, so 32-but-not-64-aligned ``n`` and
+    k > 30720 layers stay unquantized there)."""
+    from pearl_gemm import supports_lottery_family
+
+    tile = select_tile(n, k)
+    return tile is not None and supports_lottery_family(tile.rows, device)
+
+
 def can_mine_layer(n: int, k: int, device: torch.device) -> bool:
     """Whether this device/shape runs the mined pipeline. Layers that cannot
     mine must stay on their original unquantized path: encoding them would
@@ -276,8 +292,9 @@ def can_mine_layer(n: int, k: int, device: torch.device) -> bool:
     return (
         supports_layer_shape(n, k)
         and is_mineable_shape(n, k)
-        and _is_sm100(device)
+        and _mines_on(device)
         and _kernels_available()
+        and _lottery_family_available(n, k, device)
     )
 
 

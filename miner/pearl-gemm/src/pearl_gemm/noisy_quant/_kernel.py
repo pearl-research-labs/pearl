@@ -22,6 +22,11 @@ Blackwell (SM100) implementation: the ``E1 @ F1`` noise dot and the
 The consumer C-fragment ownership (``tiled_mma_n``/``tiled_mma_u16``) is
 layout scaffolding only -- those tiled MMAs issue no MMA instructions; the
 only MMA atom the kernel executes is ``tcgen05.MmaF8F6F4Op``.
+
+The SM120 (``mma.sync``) variant, ``_kernel_sm120._NoisyQuantSm120``,
+subclasses this class: the producer and output warps, the A decode and the
+quantize chain below are architecture-neutral and shared; only the
+MMA-bound phases differ.
 """
 
 import enum
@@ -30,7 +35,6 @@ from typing import NamedTuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float32
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -40,6 +44,7 @@ from cutlass.utils.blackwell_helpers import tile_to_mma_shape
 from cutlass.utils.tmem_allocator import compute_tmem_cols_from_layout
 from quack.cute_dsl_utils import mlir_namedtuple
 
+from .._utils._arch import Arch
 from ..protocol_constants import BLOCK_SCALE_GROUP, PACKED_NOISE_K, PEEL_COLS, R
 from ._quantization_ops import (
     _bf16x2_to_e4m3x2,
@@ -57,7 +62,7 @@ from ._quantization_ops import (
 WG_THREADS = 128
 HALF_TILE_ROWS = 16  # A is staged and consumed in 16-row half-tiles
 _OUT_STAGES = 2  # staged A' output tiles feeding the TMA store warp
-_SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
+_SMEM_CAPACITY_BYTES = Arch.SM100.smem_capacity_bytes
 
 
 class NoiseLoadMode(enum.StrEnum):
@@ -172,6 +177,10 @@ class _NoisyQuant:
         self.mma_warp = self.consumer_warps + 2
         # Consumer-side E1 overlaps the BLAKE3 prologue with the stats combine.
         self.consumer_e1 = self.rows == 64
+        # E1_READY participants: the consumers, the E1 generator (the output
+        # warp, unless the consumers own E1) and the MMA warp, whose TMEM
+        # pointer publication rides the same barrier.
+        self.e1_ready_threads = self.consumer_threads + (32 if self.consumer_e1 else 64)
 
     # -- device helpers -----------------------------------------------------
 
@@ -460,14 +469,17 @@ class _NoisyQuant:
                     cute.make_layout(R),
                 ),
             )
-            cute.autovec_copy(
-                e1_padded,
-                sE1B[((local_row, None), 0, 0, 0)],
-            )
+            cute.autovec_copy(e1_padded, self._e1_operand_row(sE1B, local_row))
             cute.autovec_copy(
                 e1_codes,
                 cute.local_tile(mE1, (R,), (global_row,)),
             )
+
+    @cute.jit
+    def _e1_operand_row(self, sE1B, local_row):
+        """One row's K-padded codes in the noise MMA's E1 operand image (the
+        UMMA canonical K-major B tile here)."""
+        return sE1B[((local_row, None), 0, 0, 0)]
 
     @cute.jit
     def _produce_factor_tile(
@@ -616,7 +628,7 @@ class _NoisyQuant:
                     a_write_state.advance()
 
     @cute.jit
-    def _run_producer_warp_sm100(
+    def _run_producer_warp(
         self,
         tma_aq,
         tma_as,
@@ -636,7 +648,10 @@ class _NoisyQuant:
         first_row_half,
         tile_count,
     ):
-        """Produce factor stages and A half-tiles."""
+        """Produce factor stages and A half-tiles.
+
+        Architecture-neutral: the TMA producer is the same on every family.
+        """
         self._produce_factors_and_a(
             tma_aq,
             tma_as,
@@ -658,7 +673,7 @@ class _NoisyQuant:
         )
 
     @cute.jit
-    def _run_output_warp_sm100(
+    def _run_output_warp(
         self,
         tma_q,
         tQsQ,
@@ -672,14 +687,18 @@ class _NoisyQuant:
         row_block,
         tile_count,
     ):
-        """Generate E1 (unless the consumers own it), then drain A'."""
+        """Generate E1 (unless the consumers own it), then drain A'.
+
+        Architecture-neutral: the E1 operand image differs per family only
+        through ``_e1_operand_row``.
+        """
         if cutlass.const_expr(not self.consumer_e1):
             for row_sweep in cutlass.range_constexpr((self.rows + 31) // 32):
                 self._generate_e1_rows(mE1, mKey, sE1, sE1B, 32 * row_sweep, lane, row_block)
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.barrier_arrive(
                 barrier_id=_NamedBarrier.E1_READY,
-                number_of_threads=self.consumer_threads + 64,
+                number_of_threads=self.e1_ready_threads,
             )
         read_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.out_stages
@@ -788,7 +807,7 @@ class _NoisyQuant:
 
         cute.arch.barrier(
             barrier_id=_NamedBarrier.E1_READY,
-            number_of_threads=self.consumer_threads + (32 if self.consumer_e1 else 64),
+            number_of_threads=self.e1_ready_threads,
         )
         acc_ptr = tmem.retrieve_ptr(Float32)
         tCtNoiseBase = cute.make_tensor(acc_ptr, tCtNoise_fake.layout)
@@ -994,7 +1013,7 @@ class _NoisyQuant:
 
         cute.arch.barrier(
             barrier_id=_NamedBarrier.E1_READY,
-            number_of_threads=self.consumer_threads + (32 if self.consumer_e1 else 64),
+            number_of_threads=self.e1_ready_threads,
         )
         acc_ptr = tmem.retrieve_ptr(Float32)
         tCtNoiseBase = cute.make_tensor(acc_ptr, tCtNoise_fake.layout)
@@ -1798,7 +1817,7 @@ class _NoisyQuant:
         pipeline_init_wait(cluster_shape_mn=(1, 1))
 
         if warp_idx == self.producer_warp:
-            self._run_producer_warp_sm100(
+            self._run_producer_warp(
                 tma_aq,
                 tma_as,
                 tma_f1,
@@ -1818,7 +1837,7 @@ class _NoisyQuant:
                 tile_count,
             )
         elif warp_idx == self.output_warp:
-            self._run_output_warp_sm100(
+            self._run_output_warp(
                 tma_q,
                 tQsQ,
                 tQgQ,

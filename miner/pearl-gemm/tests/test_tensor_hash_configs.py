@@ -23,7 +23,8 @@ from pearl_gemm.tensor_hash_plus_stats._merkle_host import SUPPORTED_THREAD_LOAD
 from tests.helpers.chain import p_a_for
 
 _DEFAULT_CONFIG = TensorHashConfig()
-_REPRESENTATIVE_CONFIG = TensorHashConfig(threads_per_block=256, num_stages=3, thread_load_size=256)
+# A non-default tuning point whose staging ring fits both Blackwell families.
+_REPRESENTATIVE_CONFIG = TensorHashConfig(threads_per_block=256, num_stages=3, thread_load_size=64)
 
 
 def _protocol_leaf(config: TensorHashConfig) -> TensorHashConfig:

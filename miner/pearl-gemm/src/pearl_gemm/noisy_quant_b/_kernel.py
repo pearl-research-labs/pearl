@@ -30,6 +30,7 @@ from ..protocol_constants import PACKED_NOISE_K, R
 
 _CTA_THREADS = R * R
 _ROWS_PER_CTA = _CTA_THREADS
+_TREE_HALF = _CTA_THREADS // 2  # the gram reduction tree's first-level pairing distance
 
 
 class _GramFactor:
@@ -60,8 +61,11 @@ class _GramFactor:
         bidx, _, _ = cute.arch.block_idx()
 
         smem = cutlass.utils.SmemAllocator()
+        # Staging for half the CTA's partials: the first level of the
+        # reduction tree runs through registers (below), which keeps the
+        # footprint under SM120's ~99 KB as well as SM100's.
         sPart = smem.allocate_tensor(
-            Float32, cute.make_layout((_CTA_THREADS, R), stride=(R, 1)), byte_alignment=16
+            Float32, cute.make_layout((_TREE_HALF, R), stride=(R, 1)), byte_alignment=16
         )
 
         # One CTA per F1 row r1 = bidx. Threads stride j, so a warp's F1
@@ -95,20 +99,36 @@ class _GramFactor:
             )
             for r2 in cutlass.range_constexpr(R):
                 accs[r2] += f2_row[r2].to(Float32) * f1_val
-        for r2 in cutlass.range_constexpr(R):
-            sPart[tidx, r2] = accs[r2]
+        self._reduce_partials(sPart, accs, tidx)
+        if tidx < R:
+            mGram[tidx, r1] = sPart[0, tidx]
+
+    @cute.jit
+    def _reduce_partials(self, sPart, accs, tidx):
+        """Sum the CTA's per-thread partials into ``sPart[0, :]``.
+
+        Fixed binary-tree order keeps repeat launches bit-identical. The
+        first level pairs thread t with t + _TREE_HALF through registers
+        (same operands, same order as the in-smem levels): the upper half
+        publishes, the lower half adds and then stages its sums. Slot t is
+        read and rewritten by thread t alone, so no barrier sits between.
+        """
+        if tidx >= _TREE_HALF:
+            for r2 in cutlass.range_constexpr(R):
+                sPart[tidx - _TREE_HALF, r2] = accs[r2]
+        cute.arch.barrier()
+        if tidx < _TREE_HALF:
+            for r2 in cutlass.range_constexpr(R):
+                sPart[tidx, r2] = accs[r2] + sPart[tidx, r2]
         cute.arch.barrier()
 
-        # Fixed binary-tree order keeps repeat launches bit-identical.
-        offset = _CTA_THREADS // 2
+        offset = _TREE_HALF // 2
         while offset >= 1:
             if tidx < offset:
                 for r2 in cutlass.range_constexpr(R):
                     sPart[tidx, r2] = sPart[tidx, r2] + sPart[tidx + offset, r2]
             cute.arch.barrier()
             offset //= 2
-        if tidx < R:
-            mGram[tidx, r1] = sPart[0, tidx]
 
 
 class _PeelFixup:

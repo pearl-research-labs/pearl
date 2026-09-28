@@ -10,6 +10,7 @@ CUDA-graph replays with in-place threshold updates (no recapture).
 
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 import torch
@@ -21,10 +22,15 @@ from pearl_gemm import (
     HitSignalConfig,
     HitSignalPoisonedError,
     MixedGemmConfig,
+    default_mixed_gemm_config,
     mixed_gemm,
 )
+from pearl_gemm._utils._arch import arch_of
 from pearl_gemm.pow import HIT_PAYLOAD_K_ALIGN, HIT_RECORD_MAGIC_WORDS
 from pearl_gemm.protocol_constants import BLOCK_SCALE_GROUP, R
+
+# The family's library default tile as a single CTA (no cluster multicast).
+_DEFAULT_CONFIG = replace(default_mixed_gemm_config(arch_of()), cluster_m=1, cluster_n=1)
 
 STATUS_IDLE = 0
 STATUS_PUBLISHED = 1
@@ -404,7 +410,7 @@ def _gemm_buffers(
         "a_codes": torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda"),
         "a_scales": torch.rand(m, k // 8, dtype=torch.bfloat16, device="cuda"),
         "commitment_hash_b": torch.randint(0, 256, (32,), dtype=torch.uint8, device="cuda"),
-        "config": config if config is not None else MixedGemmConfig(cluster_m=1, cluster_n=1),
+        "config": config if config is not None else _DEFAULT_CONFIG,
         "layer_id": KERNEL_LAYER_ID,
     }
 
@@ -564,7 +570,7 @@ def test_partial_n_publishes_in_bounds_tile():
     tile inside the problem, not an OOB lane that won the ballot.
     """
     m, n, k = 8, 64, 512
-    config = MixedGemmConfig(tile_n=256, ltile_cols=64, cluster_m=1, cluster_n=1)
+    config = replace(_DEFAULT_CONFIG, tile_n=256, ltile_cols=64)
     signal = _make_signal(max_m=m, max_k=k)
     buffers = _gemm_buffers(m=m, n=n, k=k, signal=signal, config=config)
     mixed_gemm(**buffers)

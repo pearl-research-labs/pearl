@@ -8,25 +8,36 @@ is what makes wide-``k`` layers such as GLM-5.2 ``o_proj`` (k=16384)
 verifiable.
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 from miner_base.layout import lane_assignment
 
-from pearl_gemm import HitSignal, HitSignalConfig, MixedGemmConfig, mixed_gemm
+from pearl_gemm import (
+    HitSignal,
+    HitSignalConfig,
+    MixedGemmConfig,
+    default_mixed_gemm_config,
+    mixed_gemm,
+    supports_lottery_family,
+)
 from pearl_gemm.protocol_constants import R
 from tests.helpers.preprocess import tall_tile_config
 
 _OUTPUT_RTOL = 5e-3
 
+_DEFAULT_CONFIG = default_mixed_gemm_config()
+
 # Committed tile variants. The 16x32 variant exists for GLM-5.2 o_proj
 # (256x6144x16384): its k exceeds the 4x128 tile's 4 MiB verifier limit.
 _VARIANTS = {
     "4x128": {
-        "config": MixedGemmConfig(),
+        "config": _DEFAULT_CONFIG,
         "lottery_shapes": [(256, 128, 512), (512, 256, 1024)],
     },
     "16x32": {
-        "config": MixedGemmConfig(ltile_rows=16, ltile_cols=32),
+        "config": replace(_DEFAULT_CONFIG, ltile_rows=16, ltile_cols=32),
         "lottery_shapes": [(256, 128, 512), (512, 256, 1024)],
     },
     # The 64-row CTA tile (decode m=64 shapes): 16dp TMEM loads split every
@@ -40,13 +51,24 @@ _VARIANTS = {
 }
 
 
+def _variant_marks(vid: str) -> list:
+    """Skip a variant whose lottery family this device ships no kernel for."""
+    ltile_rows = _VARIANTS[vid]["config"].ltile_rows
+    if supports_lottery_family(ltile_rows):
+        return []
+    return [pytest.mark.skip(reason=f"no {ltile_rows}-row lottery kernel on this device")]
+
+
 def _cases(kind: str):
     """Expand ``(variant, m, n, k)`` params for one shape list across tiles."""
     return [
-        pytest.param(vid, m, n, k, id=f"{vid}-{m}x{n}x{k}")
+        pytest.param(vid, m, n, k, id=f"{vid}-{m}x{n}x{k}", marks=_variant_marks(vid))
         for vid, variant in _VARIANTS.items()
         for (m, n, k) in variant[kind]
     ]
+
+
+_VARIANT_PARAMS = [pytest.param(vid, id=vid, marks=_variant_marks(vid)) for vid in _VARIANTS]
 
 
 def _rel(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -85,8 +107,8 @@ def _run(
     config: MixedGemmConfig | None = None,
     record_hits: bool = True,
 ):
-    """Launch mixed_gemm."""
-    config = MixedGemmConfig() if config is None else config
+    """Launch mixed_gemm (the device family's default config when omitted)."""
+    config = _DEFAULT_CONFIG if config is None else config
     m, k = inputs["a_prime"].shape
     n = inputs["b_prime"].shape[0]
     out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
@@ -155,7 +177,7 @@ def test_consistency(variant, m, n, k):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("variant", list(_VARIANTS), ids=list(_VARIANTS))
+@pytest.mark.parametrize("variant", _VARIANT_PARAMS)
 def test_consistency_many_iterations(variant):
     config = _VARIANTS[variant]["config"]
     m, n, k = _VARIANTS[variant]["lottery_shapes"][0]

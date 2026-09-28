@@ -7,6 +7,7 @@ fused device kernel, and ``_host.py`` the functional caller-owned launch.
 from ._host import (
     NoiseLoadMode,
     NoisyQuantConfig,
+    default_noisy_quant_config,
     noisy_quant,
     pack_noise_factor,
     validate_noisy_quant_config,
@@ -15,6 +16,7 @@ from ._host import (
 __all__ = [
     "NoiseLoadMode",
     "NoisyQuantConfig",
+    "default_noisy_quant_config",
     "noisy_quant",
     "pack_noise_factor",
     "validate_noisy_quant_config",

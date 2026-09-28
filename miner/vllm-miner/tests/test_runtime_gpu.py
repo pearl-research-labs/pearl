@@ -1,4 +1,4 @@
-"""Mined-linear runtime on SM100: load-time encoding, per-job B preparation
+"""Mined-linear runtime on Blackwell: load-time encoding, per-job B preparation
 parity, launch accounting, winner round-trip, and staleness.
 
 Intentionally no hardware skip guards: this suite runs only on the B200 job.
@@ -17,7 +17,7 @@ from miner_base.commitment_hash import noise_seed_b
 from miner_base.prequant import PrequantMatrix
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
-from pearl_gemm import pack_noise_factor
+from pearl_gemm import pack_noise_factor, supports_lottery_family
 from vllm_miner import settings as settings_module
 from vllm_miner.job_prep import prepare_layer
 from vllm_miner.mining_config import (
@@ -543,6 +543,9 @@ def test_decode_bucket_routes_to_the_64_row_tile_and_wins(layer_state, async_man
     assert (hit.ltile_rows, hit.ltile_cols) == (4, 64)
 
 
+@pytest.mark.skipif(
+    not supports_lottery_family(16), reason="no 16x32 lottery kernel on this device"
+)
 @pytest.mark.parametrize(
     "layer_state", [("test.mined.tall", 96, 2048)], ids=["tall_16x32"], indirect=True
 )

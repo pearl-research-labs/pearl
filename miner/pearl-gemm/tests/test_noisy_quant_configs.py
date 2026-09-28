@@ -1,4 +1,11 @@
-"""Correctness parity across noisy-quant tuning configurations."""
+"""Correctness parity across noisy-quant tuning configurations.
+
+The reference is the family's library default (``default_noisy_quant_config``);
+the per-family matrices below cover every compile key that fits the family's
+shared memory.
+"""
+
+from dataclasses import replace
 
 import pytest
 import torch
@@ -6,13 +13,57 @@ import torch
 from pearl_gemm import (
     NoiseLoadMode,
     NoisyQuantConfig,
+    default_noisy_quant_config,
     noisy_quant,
     pack_noise_factor,
     pre_quant,
     pre_quant_output_shapes,
+    validate_noisy_quant_config,
 )
+from pearl_gemm._utils._arch import Arch, arch_of
 from pearl_gemm.autotune import NOISY_QUANT_SPACE
 from pearl_gemm.protocol_constants import R
+
+_ARCH = arch_of()
+_DEFAULT = default_noisy_quant_config(_ARCH)
+# Every (bk, load mode) compile key, at a factor pipeline depth the family's
+# shared memory admits: SM120 holds bk=256 stages only two deep.
+_BK_MODE_MATRIX = {
+    Arch.SM100: [
+        {"noise_bk": bk, "noise_load_mode": mode} for bk in (128, 256) for mode in NoiseLoadMode
+    ],
+    Arch.SM120: [{"noise_bk": 128, "noise_load_mode": mode} for mode in NoiseLoadMode]
+    + [{"noise_bk": 256, "noise_stages": 2, "noise_load_mode": mode} for mode in NoiseLoadMode],
+}[_ARCH]
+# The rows=64 path matrix: SM120's shared memory holds rows=64 at bk=128, and
+# at bk=256 only behind the half-tile ring.
+_ROWS64_MATRIX = {
+    Arch.SM100: [(bk, mode) for bk in (128, 256) for mode in NoiseLoadMode],
+    Arch.SM120: [(128, mode) for mode in NoiseLoadMode] + [(256, NoiseLoadMode.RING)],
+}[_ARCH]
+
+
+def _fits(config_fields: dict) -> bool:
+    try:
+        validate_noisy_quant_config(64, 512, NoisyQuantConfig(**config_fields), _ARCH)
+    except ValueError as error:
+        if "shared memory" not in str(error):
+            raise
+        return False
+    return True
+
+
+# The tuned space is the SM100 sweep; points beyond the family's shared
+# memory are rejected by the host and skipped here.
+_SPACE_PARAMS = [
+    pytest.param(
+        fields,
+        marks=()
+        if _fits(fields)
+        else pytest.mark.skip(reason=f"exceeds {_ARCH.name}'s shared-memory budget"),
+    )
+    for fields in NOISY_QUANT_SPACE
+]
 
 
 def _open_blobs(codes, scales):
@@ -100,24 +151,23 @@ def _assert_same(got, reference):
     )
 
 
-@pytest.mark.parametrize("mode", list(NoiseLoadMode))
-@pytest.mark.parametrize("bk", [128, 256])
-def test_block_k_and_load_modes_match(inputs, bk, mode):
+@pytest.mark.parametrize("fields", _BK_MODE_MATRIX)
+def test_block_k_and_load_modes_match(inputs, fields):
     """Fast smoke over every ``noise_bk`` x ``NoiseLoadMode`` compile key on
     one shape: load-mode coverage alone would leave the bk-dependent staging
     paths uncompiled on the PR gate."""
-    reference = _run(inputs, NoisyQuantConfig())
-    got = _run(inputs, NoisyQuantConfig(noise_bk=bk, noise_load_mode=mode))
+    reference = _run(inputs, _DEFAULT)
+    got = _run(inputs, replace(_DEFAULT, **fields))
     _assert_same(got, reference)
 
 
-@pytest.mark.parametrize("mode", list(NoiseLoadMode))
-@pytest.mark.parametrize("bk", [128, 256])
+@pytest.mark.parametrize("bk,mode", _ROWS64_MATRIX)
 def test_rows64_path_matrix_matches(inputs, bk, mode):
-    reference = _run(inputs, NoisyQuantConfig())
+    reference = _run(inputs, _DEFAULT)
     got = _run(
         inputs,
-        NoisyQuantConfig(
+        replace(
+            _DEFAULT,
             noise_rows=64,
             noise_bk=bk,
             noise_stages=2,
@@ -128,9 +178,9 @@ def test_rows64_path_matrix_matches(inputs, bk, mode):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("config_fields", NOISY_QUANT_SPACE)
+@pytest.mark.parametrize("config_fields", _SPACE_PARAMS)
 def test_autotune_space_matches_default(inputs, config_fields):
-    reference = _run(inputs, NoisyQuantConfig())
+    reference = _run(inputs, _DEFAULT)
     got = _run(inputs, NoisyQuantConfig(**config_fields))
     _assert_same(got, reference)
 
@@ -138,8 +188,8 @@ def test_autotune_space_matches_default(inputs, config_fields):
 @pytest.mark.slow
 @pytest.mark.parametrize("rows", [16, 32, 64])
 def test_row_block_sizes_match(inputs, rows):
-    reference = _run(inputs, NoisyQuantConfig())
-    got = _run(inputs, NoisyQuantConfig(noise_rows=rows))
+    reference = _run(inputs, _DEFAULT)
+    got = _run(inputs, replace(_DEFAULT, noise_rows=rows))
     _assert_same(got, reference)
 
 
@@ -147,7 +197,7 @@ _CONSISTENCY_ITERS = 10_000
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("config_fields", NOISY_QUANT_SPACE)
+@pytest.mark.parametrize("config_fields", _SPACE_PARAMS)
 def test_consistency_across_tuning_space(inputs, config_fields):
     """Relaunches under every tuned config are bit-identical (q8 noise-A
     consistency). Unlike cross-config parity, this holds for every output

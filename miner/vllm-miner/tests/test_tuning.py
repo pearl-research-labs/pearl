@@ -5,7 +5,14 @@ from collections import Counter
 import pytest
 import vllm_miner.pipeline as pipeline
 import vllm_miner.state as state
+from pearl_gemm import supports_lottery_family
 from pearl_gemm.autotune import get_tuned
+
+# ``_configs`` validates against the local device family; the tall 16x32
+# lottery has a kernel on SM100 only.
+tall_tile_kernel = pytest.mark.skipif(
+    not supports_lottery_family(16), reason="no 16x32 lottery kernel on this device"
+)
 
 
 def test_mixed_gemm_selection_skips_illegal_nearest_and_preserves_tile_n(monkeypatch):
@@ -145,8 +152,9 @@ def test_gemm_resolution_orders_exact_then_heuristic_then_nearest(monkeypatch):
 
     # 16x32 lottery: the heuristic declines and the nearest record is used.
     assert pipeline.select_tile(96, 2048).rows == 16
-    *_, tall = pipeline._configs("synthetic", 64, 96, 2048)
-    assert (tall.tile_m, tall.ltile_rows) == (128, 16)
+    if supports_lottery_family(16):
+        *_, tall = pipeline._configs("synthetic", 64, 96, 2048)
+        assert (tall.tile_m, tall.ltile_rows) == (128, 16)
 
 
 def test_exact_mixed_gemm_record_wins_over_small_m_route(monkeypatch):
@@ -154,10 +162,11 @@ def test_exact_mixed_gemm_record_wins_over_small_m_route(monkeypatch):
 
     def resolve(_name, kernel, *, legal=None, require_legal=False, exact=False, **shape):
         if kernel == "mixed_gemm" and exact:
+            # A single-CTA 128-row tile, legal on every Blackwell family.
             return {
-                "tile_m": 256,
+                "tile_m": 128,
                 "tile_n": 64,
-                "cluster_m": 2,
+                "cluster_m": 1,
                 "cluster_n": 1,
             }
         if kernel == "mixed_gemm":
@@ -168,11 +177,12 @@ def test_exact_mixed_gemm_record_wins_over_small_m_route(monkeypatch):
     pipeline._configs.cache_clear()
 
     *_, gemm = pipeline._configs("synthetic", 256, 256, 2048)
-    assert (gemm.tile_m, gemm.tile_n) == (256, 64)
-    assert (gemm.cluster_m, gemm.cluster_n) == (2, 1)
+    assert (gemm.tile_m, gemm.tile_n) == (128, 64)
+    assert (gemm.cluster_m, gemm.cluster_n) == (1, 1)
     assert (gemm.ltile_rows, gemm.ltile_cols) == (4, 64)
 
 
+@tall_tile_kernel
 def test_small_m_keeps_records_for_the_tall_tile(monkeypatch):
     """A 16x32-committed layer (n % 32 but not 64-aligned) cannot run the
     64-row tile: small m still resolves through the saved records."""

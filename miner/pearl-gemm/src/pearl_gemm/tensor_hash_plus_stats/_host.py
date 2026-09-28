@@ -1,12 +1,13 @@
 """Functional keyed tensor hash over the block-scaled activation blobs."""
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import cutlass
 import cutlass.cute as cute
 import torch
 
+from .._utils._arch import Arch, arch_of
 from .._utils._compile import make_fake_stream, make_fake_tensor, single_flight_compile
 from .._utils._stream import get_stream
 from .._utils._validation import require_buffer, require_tensor
@@ -67,7 +68,7 @@ _DEFAULT_CONFIG = TensorHashConfig()
 _REQUIRE_PROTOCOL_LEAF = False
 
 
-def tensor_hash_plus_stats_record_is_legal(kwargs: dict) -> bool:
+def tensor_hash_plus_stats_record_is_legal(kwargs: dict, arch: Arch | None = None) -> bool:
     """True when ``kwargs`` construct a config a commitment record may carry.
 
     Any stats-legal ``chunk_size`` is allowed: miners overlay the protocol
@@ -76,7 +77,8 @@ def tensor_hash_plus_stats_record_is_legal(kwargs: dict) -> bool:
 
     It also requires the estimated CTA shared memory to fit
     (``tensor_hash_smem_fits`` -- the same estimator that generates the tune
-    space), so a hand-edited or stale record cannot carry a config the
+    space) on ``arch`` (the current device's family when omitted), so a
+    hand-edited, stale, or foreign-device record cannot carry a config the
     device cannot launch.
     """
     try:
@@ -89,6 +91,7 @@ def tensor_hash_plus_stats_record_is_legal(kwargs: dict) -> bool:
         config.thread_load_size,
         config.chunk_size,
         sync_loads=config.sync_loads,
+        arch=arch,
     )
 
 
@@ -103,11 +106,13 @@ def get_tensor_hash_plus_stats_config(
     Exact JSON record if one exists, else the nearest legal neighbour in
     log2 ``(m, k)`` space (``autotune.get_tuned``). ``records=None`` reads
     the file of ``device`` (current CUDA device when omitted) and LRU-caches
-    the result; pass a dict to bypass both. The raw ``tensor_hash`` keeps
-    its own library default and never reads these records.
+    the result; pass a dict to bypass both. Either way record legality is
+    checked against ``device``'s architecture family. The raw
+    ``tensor_hash`` keeps its own library default and never reads these
+    records.
     """
     if records is not None:
-        return _config_from_records(m, k, records)
+        return _config_from_records(m, k, records, arch=arch_of(device))
     # Resolve unindexed handles (None, plain "cuda") to a concrete index
     # before caching, so the entry cannot go stale when the current device
     # changes between calls.
@@ -125,17 +130,21 @@ def _device_config(m: int, k: int, device_index: int) -> TensorHashConfig:
     # ``or {}``: a device without a config file fails closed to the library
     # defaults instead of falling through to the current device's file
     # inside ``get_tuned`` (wrong records on a mixed-GPU host).
-    return _config_from_records(m, k, load_config(device=device_index) or {})
+    return _config_from_records(
+        m, k, load_config(device=device_index) or {}, arch=arch_of(device_index)
+    )
 
 
-def _config_from_records(m: int, k: int, records: dict | None) -> TensorHashConfig:
+def _config_from_records(
+    m: int, k: int, records: dict | None, arch: Arch | None = None
+) -> TensorHashConfig:
     from ..autotune import get_tuned
 
     return TensorHashConfig(
         **get_tuned(
             "tensor_hash_plus_stats",
             records,
-            legal=tensor_hash_plus_stats_record_is_legal,
+            legal=partial(tensor_hash_plus_stats_record_is_legal, arch=arch),
             m=m,
             k=k,
         )

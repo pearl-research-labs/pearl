@@ -16,7 +16,6 @@ from .._utils._compile import get_or_compile
 from .._utils._stream import get_stream
 from .._utils._validation import require_tensor
 from ..noisy_quant._host import (
-    _DEFAULT_CONFIG,
     NoisyQuantConfig,
     _launch_prep,
 )
@@ -62,7 +61,7 @@ def noisy_quant_b(
     b_peel: torch.Tensor,
     gram: torch.Tensor,
     *,
-    config: NoisyQuantBConfig = _DEFAULT_CONFIG,
+    config: NoisyQuantBConfig | None = None,
 ) -> None:
     """Launch B-side noising into caller-owned outputs.
 

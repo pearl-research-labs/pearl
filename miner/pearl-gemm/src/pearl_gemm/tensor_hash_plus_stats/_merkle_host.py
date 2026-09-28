@@ -39,6 +39,7 @@ import torch
 from cutlass import Int32, Int64
 from cutlass.cute.nvgpu import cpasync
 
+from .._utils._arch import Arch, arch_of, require_arch
 from .._utils._compile import make_fake_stream, make_fake_tensor, single_flight_compile
 from .._utils._stream import get_stream
 from . import _blake3
@@ -85,22 +86,30 @@ def get_required_scratchpad_bytes(
     return required_blocks * _blake3.CHAINING_VALUE_SIZE
 
 
-# CTA shared-memory budget the tune space and record legality test against:
-# headroom under the SM100 opt-in maximum for what the estimate below does
-# not model (barriers, TMA descriptors, alignment padding).
-_MAX_TENSOR_HASH_SMEM = 220 * 1024
+# The kernels are TMA + mbarrier pipelines with plain-ALU BLAKE3 and run on
+# both Blackwell families; only the shared-memory budget differs between them.
+_SUPPORTED_ARCHS = (Arch.SM100, Arch.SM120)
+
+# Headroom under an architecture's opt-in shared-memory maximum for what
+# ``tensor_hash_smem_fits`` does not model (barriers, TMA descriptors,
+# alignment padding).
+_SMEM_HEADROOM_BYTES = 7 * 1024
 
 
-def tensor_hash_smem_fits(
+def tensor_hash_smem_capacity(arch: Arch) -> int:
+    """CTA shared-memory budget the tune space and record legality test against."""
+    return arch.smem_capacity_bytes - _SMEM_HEADROOM_BYTES
+
+
+def tensor_hash_smem_bytes(
     threads_per_block: int,
     num_stages: int,
     thread_load_size: int,
     stats_chunk: int | None = None,
     *,
     sync_loads: bool = False,
-) -> bool:
-    """Estimated CTA smem fit, shared by tune-space generation and persisted
-    record legality so the two can never disagree on "launchable".
+) -> int:
+    """Estimated CTA shared memory of a stage-1 launch.
 
     The TMA staging ring (dual-pipeline at 512 threads; absent on the sync
     path) plus the leaves buffer, plus -- when ``stats_chunk`` is a sub-block
@@ -120,7 +129,25 @@ def tensor_hash_smem_fits(
         4 * _stats_smem_floats(threads_per_block, stats_chunk, 1, True) if stats_chunk else 0
     )
     leaves_bytes = threads_per_block * _blake3.CHAINING_VALUE_SIZE
-    return ring_bytes + leaves_bytes + stats_bytes <= _MAX_TENSOR_HASH_SMEM
+    return ring_bytes + leaves_bytes + stats_bytes
+
+
+def tensor_hash_smem_fits(
+    threads_per_block: int,
+    num_stages: int,
+    thread_load_size: int,
+    stats_chunk: int | None = None,
+    *,
+    sync_loads: bool = False,
+    arch: Arch | None = None,
+) -> bool:
+    """Estimated CTA smem fit, shared by tune-space generation and persisted
+    record legality so the two can never disagree on "launchable". The budget
+    is ``arch``'s (the current CUDA device's family when omitted)."""
+    estimate = tensor_hash_smem_bytes(
+        threads_per_block, num_stages, thread_load_size, stats_chunk, sync_loads=sync_loads
+    )
+    return estimate <= tensor_hash_smem_capacity(arch_of() if arch is None else arch)
 
 
 def _stage1_geometry(threads_per_block, num_stages, thread_load_size, chunk_size):
@@ -855,6 +882,7 @@ def tensor_hash_launch(
     # Ahead of the coarsening gate below, which reads the payload length and
     # divides by the tunables before the buffer validation would reach them.
     _require_tensors(("data", data))
+    require_arch("tensor_hash", data.device, *_SUPPORTED_ARCHS)
     _validate_hash_tunables(
         threads_per_block,
         num_stages,
@@ -981,6 +1009,7 @@ def tensor_hash_pair_launch(
     # Ahead of the workspace split below, which reads both blob lengths and
     # divides by the tunables before the per-blob validation would reach them.
     _require_tensors(("codes", codes), ("scales", scales))
+    require_arch("tensor_hash_plus_stats", codes.device, *_SUPPORTED_ARCHS)
     _validate_hash_tunables(
         threads_per_block,
         num_stages,

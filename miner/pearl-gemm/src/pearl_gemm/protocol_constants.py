@@ -20,5 +20,7 @@ FP8_MMA_K = 32
 PACKED_NOISE_K = FP8_MMA_K * ((R + FP8_MMA_K - 1) // FP8_MMA_K)
 PEEL_COLS = 2 * R
 
-# the only architecture the kernels are implemented for (SM100 / Blackwell)
-SM100_CC_MAJOR = 10
+# compute-capability majors of the architecture families the kernels target;
+# ``_utils/_arch.py`` is the gate and each host declares the families it runs on
+SM100_CC_MAJOR = 10  # datacenter Blackwell (B200/B300): tcgen05 UMMA + TMEM
+SM120_CC_MAJOR = 12  # workstation/consumer Blackwell (RTX PRO 6000, RTX 50): mma.sync tensor cores

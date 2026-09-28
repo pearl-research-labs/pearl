@@ -6,11 +6,16 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from .._utils._arch import Arch, require_arch
 from .._utils._compile import get_or_compile
 from .._utils._stream import get_stream
 from .._utils._validation import require_tensor
 from ..protocol_constants import BLOCK_SCALE_GROUP
 from ._kernel import CHUNK_ELEMS, _pre_quant_launch
+
+# Warp-local (no MMA, no shared memory, sm_80+ packed-bf16 PTX only), so one
+# source serves both Blackwell families.
+_SUPPORTED_ARCHS = (Arch.SM100, Arch.SM120)
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,7 @@ def pre_quant(
     codes_shape, scales_shape = pre_quant_output_shapes(m, k)
     device = a.device
     require_tensor("a", a, dtype=torch.bfloat16, shape=(m, k), alignment=16)
+    require_arch("pre_quant", device, *_SUPPORTED_ARCHS)
     require_tensor(
         "codes",
         codes,

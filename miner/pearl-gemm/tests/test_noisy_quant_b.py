@@ -20,6 +20,7 @@ from blake3 import blake3
 from miner_base.commitment_hash import noise_line_key
 
 from pearl_gemm import (
+    NoiseLoadMode,
     NoisyQuantBConfig,
     TensorHashConfig,
     noisy_quant_b,
@@ -29,6 +30,7 @@ from pearl_gemm import (
     tensor_hash_plus_stats_b,
     tensor_hash_workspace_bytes,
 )
+from pearl_gemm._utils._arch import Arch, arch_of
 from pearl_gemm.protocol_constants import R
 from tests.helpers.chain import KEY_A, SEED_B, device_bytes, f_bases
 from tests.helpers.digests import digest, fixture_input, reference_digests
@@ -155,8 +157,9 @@ def test_noisy_quant_b_matches_pinned(n, k, seed):
     _assert_b_chain_matches_pinned(fixture_input(n, k, seed).cuda(), _case_id(n, k, seed))
 
 
-# The pinned SM100 config families (consumer-E rows=64, both bk tiles) at a
-# multi-row-block shape, on the B operands: the config never changes the bits.
+# The pinned config families (consumer-E rows=64, both bk tiles) at a
+# multi-row-block shape, on the B operands: the config never changes the bits. SM120's
+# shared memory holds the bk=256 family only behind the half-tile ring.
 @pytest.mark.parametrize(
     "config_fields",
     [
@@ -165,6 +168,14 @@ def test_noisy_quant_b_matches_pinned(n, k, seed):
             "noise_bk": 256,
             "noise_stages": 2,
             "noise_out_stages": 3,
+        }
+        if arch_of() is Arch.SM100
+        else {
+            "noise_rows": 64,
+            "noise_bk": 256,
+            "noise_stages": 2,
+            "noise_out_stages": 2,
+            "noise_load_mode": NoiseLoadMode.RING,
         },
         {
             "noise_rows": 64,

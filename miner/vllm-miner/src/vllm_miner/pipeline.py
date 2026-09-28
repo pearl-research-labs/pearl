@@ -11,7 +11,7 @@ import math
 import queue
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -346,7 +346,7 @@ def variant_ready(m_bucket: int, n: int, k: int) -> bool:
 
 def _mixed_gemm_record_is_legal(m: int, n: int, k: int, kwargs: dict) -> bool:
     """Whether one saved record preserves protocol geometry and can launch."""
-    from pearl_gemm import MixedGemmConfig, validate_mixed_gemm_config
+    from pearl_gemm import default_mixed_gemm_config, validate_mixed_gemm_config
 
     tile = select_tile(n, k)
     if tile is None:
@@ -356,7 +356,10 @@ def _mixed_gemm_record_is_legal(m: int, n: int, k: int, kwargs: dict) -> bool:
     if kwargs.get("ltile_rows", tile.rows) != tile.rows:
         return False
     try:
-        config = MixedGemmConfig(**{**kwargs, "ltile_cols": tile.cols, "ltile_rows": tile.rows})
+        config = replace(
+            default_mixed_gemm_config(),
+            **{**kwargs, "ltile_cols": tile.cols, "ltile_rows": tile.rows},
+        )
         validate_mixed_gemm_config(m, n, k, config)
     except (TypeError, ValueError):
         return False
@@ -367,10 +370,10 @@ def _mixed_gemm_record_is_legal(m: int, n: int, k: int, kwargs: dict) -> bool:
 def _configs(config_name: str, m: int, n: int, k: int):
     """Resolve and validate one device/shape pipeline configuration."""
     from pearl_gemm import (
-        MixedGemmConfig,
-        NoisyQuantConfig,
         PreQuantConfig,
         TensorHashConfig,
+        default_mixed_gemm_config,
+        default_noisy_quant_config,
         tensor_hash_plus_stats_record_is_legal,
         validate_mixed_gemm_config,
         validate_noisy_quant_config,
@@ -397,7 +400,8 @@ def _configs(config_name: str, m: int, n: int, k: int):
             committed_leaf,
         )
     )
-    prepare = NoisyQuantConfig(**tuned(config_name, "noisy_quant", m=m, k=k))
+    # Records overlay the device family's library defaults (see _b_configs).
+    prepare = replace(default_noisy_quant_config(), **tuned(config_name, "noisy_quant", m=m, k=k))
     validate_noisy_quant_config(m, k, prepare)
 
     def gemm_legal(kwargs: dict) -> bool:
@@ -427,7 +431,10 @@ def _configs(config_name: str, m: int, n: int, k: int):
             n=n,
             k=k,
         )
-    gemm = MixedGemmConfig(**{**gemm_kwargs, "ltile_cols": tile.cols, "ltile_rows": tile.rows})
+    gemm = replace(
+        default_mixed_gemm_config(),
+        **{**gemm_kwargs, "ltile_cols": tile.cols, "ltile_rows": tile.rows},
+    )
     # Saved records are filtered first, but this public validator remains the
     # final safety boundary for both tuned and default configurations.
     validate_mixed_gemm_config(m, n, k, gemm)

@@ -68,6 +68,11 @@ def _fma_bf16x2(a, b, c):
     )
 
 
+def _e4m3x2_to_f16x2(v):
+    """Packed exact widening of two e4m3 codes to f16x2 (register-direct peel operands)."""
+    return _asm_u32("cvt.rn.f16x2.e4m3x2 $0, $1;", "=r,h", cutlass.Uint16(v))
+
+
 def _f32x2_to_bf16x2(hi, lo):
     """Pack {hi, lo} fp32 into a bf16x2 register (two RTNE roundings)."""
     return _asm_u32(

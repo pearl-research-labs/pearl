@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from pearl_gemm import (
+    NoiseLoadMode,
     NoisyQuantConfig,
     noisy_quant,
     pack_noise_factor,
@@ -21,6 +22,7 @@ from pearl_gemm import (
     pre_quant_output_shapes,
     validate_noisy_quant_config,
 )
+from pearl_gemm._utils._arch import Arch, arch_of
 from pearl_gemm.protocol_constants import R
 from tests.helpers.chain import commit_a, f_bases
 from tests.helpers.digests import digest, fixture_input, reference_digests
@@ -117,8 +119,9 @@ def test_noisy_quant_matches_pinned(m, k, seed):
     _assert_chain_matches_pinned(fixture_input(m, k, seed).cuda(), _case_id(m, k, seed))
 
 
-# The pinned SM100 config families (consumer-E1 rows=64, both bk tiles) at a
-# multi-row-block shape: the config never changes the bits.
+# The pinned config families (consumer-E1 rows=64, both bk tiles) at a
+# multi-row-block shape: the config never changes the bits. SM120's
+# shared memory holds the bk=256 family only behind the half-tile ring.
 @pytest.mark.parametrize(
     "config_fields",
     [
@@ -127,6 +130,14 @@ def test_noisy_quant_matches_pinned(m, k, seed):
             "noise_bk": 256,
             "noise_stages": 2,
             "noise_out_stages": 3,
+        }
+        if arch_of() is Arch.SM100
+        else {
+            "noise_rows": 64,
+            "noise_bk": 256,
+            "noise_stages": 2,
+            "noise_out_stages": 2,
+            "noise_load_mode": NoiseLoadMode.RING,
         },
         {
             "noise_rows": 64,

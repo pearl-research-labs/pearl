@@ -2,7 +2,9 @@
 
 from .mixed_gemm import (
     MixedGemmConfig,
+    default_mixed_gemm_config,
     mixed_gemm,
+    supports_lottery_family,
     validate_mixed_gemm_config,
 )
 from .noise_lines import (
@@ -15,6 +17,7 @@ from .noise_lines import (
 from .noisy_quant import (
     NoiseLoadMode,
     NoisyQuantConfig,
+    default_noisy_quant_config,
     noisy_quant,
     pack_noise_factor,
     validate_noisy_quant_config,
@@ -63,9 +66,12 @@ __all__ = [
     "PreQuantConfig",
     "TensorHashConfig",
     "get_tensor_hash_plus_stats_config",
+    "default_mixed_gemm_config",
     "mixed_gemm",
+    "supports_lottery_family",
     "validate_mixed_gemm_config",
     "noise_lines",
+    "default_noisy_quant_config",
     "noisy_quant",
     "noisy_quant_b",
     "validate_noisy_quant_config",

@@ -48,10 +48,15 @@ from pearl_gemm import (
 )
 from pearl_gemm.tensor_hash_plus_stats import _blake3, _host, _merkle_host
 from pearl_gemm.tensor_hash_plus_stats._merkle_host import (
+    SUPPORTED_NUM_STAGES,
+    SUPPORTED_THREAD_LOAD_SIZES,
+    SUPPORTED_THREADS_PER_BLOCK,
     tensor_hash_launch,
     tensor_hash_pair_launch,
+    tensor_hash_smem_bytes,
 )
 from tests.helpers.chain import p_a_for
+from tests.helpers.smem import skip_unless_tensor_hash_fits, tensor_hash_config_fits
 
 _KEY = bytes(range(32))
 _LEAF = HashId.BLAKE3_CHUNK_1024
@@ -60,11 +65,15 @@ _LEAF = HashId.BLAKE3_CHUNK_1024
 # k whose scales rows straddle 1024-byte hash chunks, and 4096x8192 (32 MiB of
 # codes) spans multiple MT blocks so the reduce_roots stage runs too.
 _SHAPES = [(32, 512), (256, 2048), (128, 4096), (512, 1536), (4096, 8192)]
+# Geometries beyond the local architecture's shared-memory budget are skipped
+# (``skip_unless_tensor_hash_fits``); the 512-thread dual pipeline at load 64
+# fits both Blackwell families.
 _HASH_CONFIGS = [
     (128, 2, 64, 1),
     (128, 2, 128, 1),
     (256, 3, 128, 1),
     (512, 2, 128, 257),
+    (512, 2, 64, 257),
     (128, 2, 512, 1),
 ]
 _CHUNK_SIZES = (64, 128, 256, 512, 1024, 2048, 4096)
@@ -343,6 +352,7 @@ def test_geometry_digest(threads_per_block, num_stages, thread_load_size, m):
         leaves_per_mt_block=256,
         thread_load_size=thread_load_size,
     )
+    skip_unless_tensor_hash_fits(config)
     a = _exact_stats_input(m, k)
     codes, scales = _blobs_gpu(a)
     buffers = _buffers(m, k, jk, c_b, config)
@@ -649,13 +659,14 @@ def test_chunk_sync_digest_matrix(chunk_size, sync_loads):
 @pytest.mark.slow
 @pytest.mark.parametrize(
     "threads_per_block,num_stages,thread_load_size",
-    [(256, 3, 128), (512, 2, 128)],
+    [(256, 3, 128), (512, 2, 128), (512, 2, 64)],
     ids=lambda value: str(value),
 )
 @pytest.mark.parametrize("chunk_size", _CHUNK_SIZES)
 def test_chunk_size_across_geometries(chunk_size, threads_per_block, num_stages, thread_load_size):
     """Non-default CTA geometries (including the dual-pipeline 512) keep the
-    digest at every chunk size, on both load paths."""
+    digest at every chunk size, on both load paths. A TMA ring the local
+    family's smem cannot hold skips its leg; the sync leg always runs."""
     length = 2 * threads_per_block * chunk_size + 999
     data = _data_bytes(length)
     expected = _reference_root(data, chunk_size)
@@ -667,6 +678,8 @@ def test_chunk_size_across_geometries(chunk_size, threads_per_block, num_stages,
             thread_load_size=min(thread_load_size, chunk_size),
             sync_loads=sync_loads,
         )
+        if not tensor_hash_config_fits(config):
+            continue
         assert _gpu_root(data, config) == expected, f"sync_loads={sync_loads}"
 
 
@@ -1043,8 +1056,9 @@ def test_single_flight_compile_runs_the_factory_once():
 def _run_cold_compile_race():
     faulthandler.enable()
     faulthandler.dump_traceback_later(60)
+    # Non-default geometries that fit both Blackwell families' smem budgets.
     config = TensorHashConfig(
-        threads_per_block=256, num_stages=4, thread_load_size=128, leaves_per_mt_block=512
+        threads_per_block=256, num_stages=4, thread_load_size=64, leaves_per_mt_block=512
     )
     data = _data_bytes(200_000)
     expected = _blake3_1024(data)
@@ -1070,7 +1084,7 @@ def _run_cold_compile_race():
     assert results == [expected, expected]
 
     next_data = _data_bytes(4096)
-    next_config = TensorHashConfig(threads_per_block=512, num_stages=3)
+    next_config = TensorHashConfig(threads_per_block=512, num_stages=2, thread_load_size=64)
     assert _gpu_root(next_data, next_config) == _blake3_1024(next_data)
     faulthandler.cancel_dump_traceback_later()
 
@@ -1089,14 +1103,30 @@ def test_cold_compile_race_shares_one_module():
             process.join(timeout=10)
 
 
+def _estimated_smem_bytes(config: TensorHashConfig) -> int:
+    return tensor_hash_smem_bytes(
+        config.threads_per_block, config.num_stages, config.thread_load_size
+    )
+
+
 def test_smem_estimator_brackets_the_launch_boundary():
     """The largest-footprint config the shared estimator admits must launch,
     and the smallest it rejects must fail, so tune-space generation and
-    record legality track the device cap from both sides."""
-    admitted = TensorHashConfig(threads_per_block=512, num_stages=3, thread_load_size=128)
-    rejected = TensorHashConfig(threads_per_block=512, num_stages=4, thread_load_size=128)
-    assert _merkle_host.tensor_hash_smem_fits(512, 3, 128)
-    assert not _merkle_host.tensor_hash_smem_fits(512, 4, 128)
+    record legality track the device cap from both sides (on this device's
+    architecture: 512x3x128 / 512x4x128 on SM100, 512x2x64 / 128x3x256 on SM120)."""
+    grid = [
+        TensorHashConfig(threads_per_block=threads, num_stages=stages, thread_load_size=load)
+        for threads in SUPPORTED_THREADS_PER_BLOCK
+        for stages in SUPPORTED_NUM_STAGES
+        for load in SUPPORTED_THREAD_LOAD_SIZES
+        if _blake3.CHUNK_SIZE % load == 0
+    ]
+    admitted = max(filter(tensor_hash_config_fits, grid), key=_estimated_smem_bytes)
+    rejected = min(
+        (config for config in grid if not tensor_hash_config_fits(config)),
+        key=_estimated_smem_bytes,
+    )
+    assert _estimated_smem_bytes(admitted) < _estimated_smem_bytes(rejected)
     data = _data_bytes(4096)
     assert _gpu_root(data, admitted) == _blake3_1024(data)
     with pytest.raises(Exception):  # noqa: B017 -- the DSL's smem-cap error type is its own
@@ -1236,7 +1266,8 @@ def test_fused_tail_many_sequential_streams():
 def test_fused_tail_dual_pipeline():
     """The dual-pipeline fused tail matches the BLAKE3 reference."""
     data = _data_bytes(2 * 512 * 1024)
-    assert _gpu_root(data, TensorHashConfig(threads_per_block=512)) == _blake3_1024(data)
+    config = TensorHashConfig(threads_per_block=512, thread_load_size=64)  # fits both families
+    assert _gpu_root(data, config) == _blake3_1024(data)
 
 
 def test_concurrent_ragged_fold():
@@ -1287,7 +1318,9 @@ def test_coarsening_matrix(chunks_per_thread, chunk_size, sync_loads):
 def test_coarsening_across_geometries():
     """256- and dual-pipeline 512-thread CTAs keep the coarsened digest."""
     for threads_per_block in (256, 512):
-        config = TensorHashConfig(threads_per_block=threads_per_block, chunks_per_thread=4)
+        config = TensorHashConfig(
+            threads_per_block=threads_per_block, thread_load_size=64, chunks_per_thread=4
+        )
         data = _data_bytes(1024 * 4 * (2 * threads_per_block + 3))
         assert _gpu_root(data, config) == _blake3_1024(data), f"tpb={threads_per_block}"
 

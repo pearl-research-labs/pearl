@@ -22,7 +22,7 @@ B's noise-line key) and B's peel is the preprocessed job constant.
 The persistent hit signal and the ``C''`` buffer are owned by the pipeline.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -30,10 +30,10 @@ from pearl_gemm import (
     LABEL_F1,
     HitSignal,
     HitSignalConfig,
-    MixedGemmConfig,
-    NoisyQuantConfig,
     PreQuantConfig,
     TensorHashConfig,
+    default_mixed_gemm_config,
+    default_noisy_quant_config,
     mixed_gemm,
     noise_lines,
     noisy_quant,
@@ -43,6 +43,7 @@ from pearl_gemm import (
     tensor_hash_plus_stats_record_is_legal,
     tensor_hash_workspace_bytes,
 )
+from pearl_gemm._utils._arch import arch_of
 from pearl_gemm.autotune import get_tuned
 from pearl_gemm.protocol_constants import R
 
@@ -114,8 +115,12 @@ class MinerPipeline:
 
         self.prequant_config = PreQuantConfig(**prequant_tune)
         self.commit_config = TensorHashConfig(**commit_tune)
-        self.prepare_config = NoisyQuantConfig(**prepare_tune)
-        self.gemm_config = MixedGemmConfig(**gemm_tune)
+        # Records overlay the family default: an empty record (no file for
+        # this device) must not fall back to another family's tile or
+        # shared-memory footprint.
+        arch = arch_of(self.device)
+        self.prepare_config = replace(default_noisy_quant_config(arch), **prepare_tune)
+        self.gemm_config = replace(default_mixed_gemm_config(arch), **gemm_tune)
 
         self.key_a = torch.frombuffer(bytearray(ctx.key_a), dtype=torch.uint8).to(device)
         self.seed_b = torch.frombuffer(bytearray(ctx.seed_b), dtype=torch.uint8).to(device)

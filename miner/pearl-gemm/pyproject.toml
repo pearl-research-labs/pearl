@@ -19,7 +19,9 @@ dependencies = [
     # The mixed_gemm substrate. The SM100 pieces (gemm_sm100,
     # PipelineUmmaAsync, CLC tile scheduler) shipped in 0.6.1, but 0.6.4 is
     # the first release with the epilogue package (quack.epilogue.ops /
-    # .frontend) this kernel imports — and it is vLLM 0.28.0's exact pin.
+    # .frontend) this kernel imports and with GemmSm120.mma_n_warp_run, which
+    # the SM120 fused kernel's peel MMA reads — and it is vLLM 0.28.0's exact
+    # pin.
     "quack-kernels>=0.6.4",
 ]
 

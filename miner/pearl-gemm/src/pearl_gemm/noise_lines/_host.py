@@ -4,6 +4,7 @@ import torch
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
+from .._utils._arch import Arch, require_arch
 from .._utils._compile import get_or_compile
 from .._utils._stream import get_stream
 from .._utils._validation import require_tensor
@@ -23,6 +24,9 @@ LABEL_E1 = _L_E1
 LABEL_E2 = _L_E2
 LABEL_F1 = _L_F1
 LABEL_F2 = _L_F2
+
+# Thread-local keyed BLAKE3 and e4m3 conversion only: one source for both families.
+_SUPPORTED_ARCHS = (Arch.SM100, Arch.SM120)
 
 _compile_cache: dict[tuple, object] = {}
 
@@ -56,6 +60,7 @@ def noise_lines(
     msg_base = _noise_base_words(label)
     device = key.device
     require_tensor("key", key, dtype=torch.uint8, shape=(32,), device=device, alignment=4)
+    require_arch("noise_lines", device, *_SUPPORTED_ARCHS)
     if out.ndim != 2:
         raise ValueError("out must be 2D")
     count = out.shape[0]

@@ -5,20 +5,32 @@ host FP8-upcast peel algebra. Repeat launches under a given config must
 be bit-identical. Invalid configs are rejected on the host.
 """
 
+from dataclasses import asdict, replace
+
 import pytest
 import torch
 
-from pearl_gemm import HitSignal, HitSignalConfig, MixedGemmConfig, mixed_gemm
+from pearl_gemm import (
+    HitSignal,
+    HitSignalConfig,
+    MixedGemmConfig,
+    default_mixed_gemm_config,
+    mixed_gemm,
+    validate_mixed_gemm_config,
+)
+from pearl_gemm._utils._arch import Arch, arch_of
 from pearl_gemm.autotune import MIXED_GEMM_SPACE
 from pearl_gemm.protocol_constants import R
 
-# Library / production default (MixedGemmConfig()).
-_DEFAULT_CONFIG = {"tile_m": 256, "tile_n": 128, "cluster_m": 2, "cluster_n": 1}
+_ARCH = arch_of()
+
+# The family's library default (``default_mixed_gemm_config``).
+_DEFAULT_CONFIG = asdict(default_mixed_gemm_config(_ARCH))
 
 # Per-model / non-default smoke points on the PR gate: single-CTA fallback,
-# explicit tile_k, and every committed lottery width. Full MIXED_GEMM_SPACE
-# stays @slow.
-_PER_MODEL_CONFIGS = [
+# explicit tile_k, and every committed lottery width. SM100 adds clustered
+# and 2-CTA points; SM120 has neither. Full MIXED_GEMM_SPACE stays @slow.
+_SM100_PER_MODEL_CONFIGS = [
     {"tile_m": 256, "tile_n": 128, "cluster_m": 1, "cluster_n": 1},
     {"tile_m": 256, "tile_n": 128, "cluster_m": 2, "cluster_n": 1, "tile_k": 128},
     {
@@ -73,7 +85,43 @@ _PER_MODEL_CONFIGS = [
     },
 ]
 
+_SM120_PER_MODEL_CONFIGS = [
+    {"tile_m": 128, "tile_n": 128, "cluster_m": 1, "cluster_n": 1, "tile_k": 128},
+    {"tile_m": 128, "tile_n": 192, "cluster_m": 1, "cluster_n": 1, "ltile_cols": 64},
+    {"tile_m": 128, "tile_n": 64, "cluster_m": 1, "cluster_n": 1, "ltile_cols": 64},
+    {"tile_m": 128, "tile_n": 192, "cluster_m": 1, "cluster_n": 1, "ltile_cols": 192},
+    {"tile_m": 128, "tile_n": 256, "cluster_m": 1, "cluster_n": 1, "ltile_cols": 256},
+    {"tile_m": 64, "tile_n": 64, "cluster_m": 1, "cluster_n": 1, "ltile_cols": 64},
+    {"tile_m": 64, "tile_n": 128, "cluster_m": 1, "cluster_n": 1},
+]
+
+_PER_MODEL_CONFIGS = {
+    Arch.SM100: _SM100_PER_MODEL_CONFIGS,
+    Arch.SM120: _SM120_PER_MODEL_CONFIGS,
+}[_ARCH]
+
 _SMOKE_CONFIGS = [_DEFAULT_CONFIG, *_PER_MODEL_CONFIGS]
+
+
+def _is_legal(config_fields: dict) -> bool:
+    try:
+        validate_mixed_gemm_config(1536, 768, 512, MixedGemmConfig(**config_fields))
+    except ValueError:
+        return False
+    return True
+
+
+# The tuned shortlist is SM100's; points the local family cannot run (clusters,
+# 256-row tiles on SM120) are skipped.
+_GATE_SPACE = [
+    pytest.param(
+        fields,
+        marks=()
+        if _is_legal(fields)
+        else pytest.mark.skip(reason=f"not a {_ARCH.name} tile shape"),
+    )
+    for fields in MIXED_GEMM_SPACE
+]
 
 _CONSISTENCY_ITERS = 10_000
 
@@ -138,14 +186,14 @@ def test_representative_configs(inputs, config_fields):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("config_fields", MIXED_GEMM_SPACE)
+@pytest.mark.parametrize("config_fields", _GATE_SPACE)
 def test_autotune_space_matches_host_peel_algebra(inputs, config_fields):
     out = _run(inputs, config_fields)
     _assert_correct(inputs, out)
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("config_fields", MIXED_GEMM_SPACE)
+@pytest.mark.parametrize("config_fields", _GATE_SPACE)
 def test_consistency_across_tuning_space(inputs, config_fields):
     """Relaunches under every tuned config are bit-identical (mixed GEMM consistency)."""
     out_first = _run(inputs, config_fields)
@@ -184,31 +232,69 @@ def test_consistency_across_tuning_space(inputs, config_fields):
         (512, 256, 512, {"cluster_m": True}, "cluster_m must be an int"),
         (512, 256, 512, {"tile_k": 64.0}, "tile_k must be an int"),
         (512, 256, 512, {"cluster_m": 0}, "cluster"),
-        (512, 256, 512, {"cluster_m": 3}, "powers of 2"),
+        # SM100 rejects the non-power-of-2 cluster; SM120 rejects any cluster.
+        (512, 256, 512, {"cluster_m": 3}, "powers of 2|no thread-block clusters"),
         (512, 256, 513, {}, "divisible by 64"),
         (513, 256, 512, {}, "lottery tiles"),
         (512, 130, 512, {}, "lottery tiles"),
     ],
 )
 def test_invalid_configurations_are_rejected(m, n, k, config, match):
-    from pearl_gemm import validate_mixed_gemm_config
-
+    """One field at a time on top of the family default, so the rejection names
+    the field under test rather than another family's tile."""
     with pytest.raises(ValueError, match=match):
-        validate_mixed_gemm_config(m, n, k, MixedGemmConfig(**config))
+        validate_mixed_gemm_config(m, n, k, replace(default_mixed_gemm_config(_ARCH), **config))
 
 
 def test_tall_tile_config_and_legacy_positional_configs_validate():
     """``MixedGemmConfig`` is public API: ``ltile_rows`` is appended after
-    ``ltile_cols`` so existing positional constructions keep their meaning."""
-    from pearl_gemm import validate_mixed_gemm_config
-
+    ``ltile_cols`` so existing positional constructions keep their meaning.
+    Validation is per family: SM100 runs the legacy 2-CTA default and the tall
+    tile, SM120 (no clusters, no whole-row fold) rejects both."""
     legacy = MixedGemmConfig(256, 128, None, 2, 1, 128)
     assert (legacy.ltile_cols, legacy.ltile_rows) == (128, 4)
-    validate_mixed_gemm_config(256, 6144, 12288, legacy)
+    tall = MixedGemmConfig(ltile_rows=16, ltile_cols=32)
+    sm100 = (10, 0)
+    validate_mixed_gemm_config(256, 6144, 12288, legacy, device_capability=sm100)
     # The tall tile is what makes k=16384 (GLM o_proj) verifiable.
-    validate_mixed_gemm_config(256, 6144, 16384, MixedGemmConfig(ltile_rows=16, ltile_cols=32))
+    validate_mixed_gemm_config(256, 6144, 16384, tall, device_capability=sm100)
     # Gemma-3 31B q/k/v and o_proj use k=5376: 64-aligned, not 512-aligned.
-    validate_mixed_gemm_config(256, 128, 5376, MixedGemmConfig())
+    validate_mixed_gemm_config(256, 128, 5376, MixedGemmConfig(), device_capability=sm100)
+    sm120 = (12, 0)
+    sm120_default = default_mixed_gemm_config(Arch.SM120)
+    with pytest.raises(ValueError, match="SM120 tile_m"):
+        validate_mixed_gemm_config(256, 6144, 12288, legacy, device_capability=sm120)
+    with pytest.raises(ValueError, match="4-row lottery family"):
+        validate_mixed_gemm_config(
+            256,
+            6144,
+            16384,
+            replace(sm120_default, ltile_rows=16, ltile_cols=32),
+            device_capability=sm120,
+        )
+    validate_mixed_gemm_config(256, 128, 5376, sm120_default, device_capability=sm120)
+
+
+def test_supports_lottery_family_agrees_with_the_validator():
+    """The runtime's load-time admission predicate must match what the
+    validator later accepts for each family, so a layer is never encoded for
+    a lottery whose kernel the device lacks."""
+    from pearl_gemm import supports_lottery_family
+
+    for capability, arch in (((10, 0), Arch.SM100), ((12, 0), Arch.SM120)):
+        base = default_mixed_gemm_config(arch)
+        for rows, cols in ((4, 64), (16, 32)):
+            config = replace(base, ltile_rows=rows, ltile_cols=cols)
+            try:
+                validate_mixed_gemm_config(256, 6144, 12288, config, device_capability=capability)
+            except ValueError:
+                assert not supports_lottery_family(rows, capability)
+            else:
+                assert supports_lottery_family(rows, capability)
+    assert supports_lottery_family(4)
+    assert supports_lottery_family(16) is (_ARCH is Arch.SM100)
+    assert supports_lottery_family(4.0, (12, 0)) is False
+    assert supports_lottery_family(True, (10, 0)) is False
 
 
 @pytest.mark.parametrize("tag_name", ["layer_id"])

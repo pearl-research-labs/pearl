@@ -8,9 +8,13 @@ import torch
 from cutlass import Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
+from .._utils._arch import Arch, require_arch
 from .._utils._compile import get_or_compile
 from .._utils._stream import get_stream
 from ._hit_signal import HitRecordLayout
+
+# Plain sys/gpu-scope atomics and fences: one source for both families.
+_SUPPORTED_ARCHS = (Arch.SM100, Arch.SM120)
 
 _reset_cache: dict[tuple, object] = {}
 
@@ -64,6 +68,7 @@ def prepare_hit_reset(
     device: torch.device,
 ) -> Callable[[], None]:
     """Compile once and bind one signal's stable record/latch pointers."""
+    require_arch("HitSignal", device, *_SUPPORTED_ARCHS)
     index = device.index or 0
     args = (
         from_dlpack(record, assumed_align=16),
