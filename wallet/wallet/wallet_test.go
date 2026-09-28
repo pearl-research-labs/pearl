@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -665,8 +666,9 @@ func TestEndRecovery(t *testing.T) {
 	}
 }
 
-// Callers page listtransactions by the transactions they were shown, so the entries per transaction (two for a spent
-// receive, none for a transfer to the wallet's own change) must not shift what from and count select.
+// TestListTransactionsPaging pins from and count to listed transactions: callers page by the transactions they were
+// shown, so the entries per transaction (two for a spent receive, none for a transfer to the wallet's own change) must
+// not shift what they select.
 func TestListTransactionsPaging(t *testing.T) {
 	w, cleanup := testWallet(t)
 	t.Cleanup(cleanup)
@@ -703,13 +705,11 @@ func TestListTransactionsPaging(t *testing.T) {
 	}
 }
 
-// listedTxids dedupes against the previous txid only, since a transaction's entries arrive together.
+// listedTxids compacts consecutive repeats only, since a transaction's entries arrive together.
 func listedTxids(entries []btcjson.ListTransactionsResult) []string {
 	var txids []string
 	for _, entry := range entries {
-		if len(txids) == 0 || txids[len(txids)-1] != entry.TxID {
-			txids = append(txids, entry.TxID)
-		}
+		txids = append(txids, entry.TxID)
 	}
-	return txids
+	return slices.Compact(txids)
 }

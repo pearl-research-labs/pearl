@@ -2368,11 +2368,8 @@ func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsRe
 
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
+		syncHeight := w.Manager.SyncedTo().Height
 
-		// Get current block.  The block height used for calculating the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
-
-		// Need to skip the first from transactions, and after those, only include the next count transactions.
 		skipped := 0
 		n := 0
 
@@ -2380,7 +2377,7 @@ func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsRe
 			// Iterate over transactions at this height in reverse order. This does nothing for unmined transactions,
 			// which are unsorted, but it will process mined transactions in the reverse order they were marked mined.
 			for i := len(details) - 1; i >= 0; i-- {
-				jsonResults := listTransactions(tx, &details[i], w.Manager, syncBlock.Height, w.chainParams)
+				jsonResults := listTransactions(tx, &details[i], w.Manager, syncHeight, w.chainParams)
 				// A transfer to the wallet's own change lists nothing and must not count, or pages would drift from
 				// what callers were shown.
 				if len(jsonResults) == 0 {

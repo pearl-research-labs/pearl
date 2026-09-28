@@ -17,12 +17,11 @@ func TestTxPage(t *testing.T) {
 		txids     []string
 		wantPage  []string
 		wantShown int
-		wantMore  bool
 	}{
-		{"empty", nil, nil, 0, false},
-		{"short page", []string{"a", "a"}, []string{"a", "a"}, 1, false},
-		{"exactly a page", []string{"a", "b", "b"}, []string{"a", "b", "b"}, 2, false},
-		{"past the page", []string{"a", "a", "b", "b", "c"}, []string{"a", "a", "b", "b"}, 2, true},
+		{"empty", nil, nil, 0},
+		{"short page", []string{"a", "a"}, []string{"a", "a"}, 1},
+		{"exactly a page", []string{"a", "b", "b"}, []string{"a", "b", "b"}, 2},
+		{"past the page", []string{"a", "a", "b", "b", "c"}, []string{"a", "a", "b", "b"}, 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -31,15 +30,14 @@ func TestTxPage(t *testing.T) {
 				entries[i].TxID = txid
 			}
 
-			page, shown, more := txPage(entries, 2)
+			page, gotShown := txPage(entries, 2)
 
 			var gotPage []string
 			for _, entry := range page {
 				gotPage = append(gotPage, entry.TxID)
 			}
 			assert.Equal(t, tt.wantPage, gotPage)
-			assert.Equal(t, tt.wantShown, shown)
-			assert.Equal(t, tt.wantMore, more)
+			assert.Equal(t, tt.wantShown, gotShown)
 		})
 	}
 }

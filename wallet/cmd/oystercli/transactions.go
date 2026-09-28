@@ -37,13 +37,13 @@ func transactionsScreen(c *client) error {
 			return err
 		}
 
-		page, shown, hasOlder := txPage(entries, txPageSize)
+		page, shown := txPage(entries, txPageSize)
+		hasOlder := len(page) < len(entries)
 		if len(page) == 0 && offset == 0 {
 			printWarn("No transactions in this wallet yet.")
 			return nil
 		}
 
-		// The wallet answers newest first, which is the order to show.
 		opts := make([]huh.Option[string], 0, len(page)+3)
 		for _, entry := range page {
 			opts = append(opts, huh.NewOption(txRow(entry), entry.TxID))
@@ -88,23 +88,19 @@ func transactionsScreen(c *client) error {
 	}
 }
 
-// txPage trims entries to at most size transactions, reporting how many transactions were kept and whether the reply
-// ran past the page. All entries for one transaction arrive together, so a change of txid starts a new one.
-func txPage(entries []btcjson.ListTransactionsResult, size int) (page []btcjson.ListTransactionsResult, shown int,
-	hasMore bool) {
-
-	var current string
+// txPage trims entries to at most size transactions, reporting how many it kept. All entries for one transaction
+// arrive together, so a change of txid starts a new one.
+func txPage(entries []btcjson.ListTransactionsResult, size int) (page []btcjson.ListTransactionsResult, shown int) {
 	for i, entry := range entries {
-		if entry.TxID == current {
+		if i > 0 && entry.TxID == entries[i-1].TxID {
 			continue
 		}
 		if shown == size {
-			return entries[:i], shown, true
+			return entries[:i], shown
 		}
 		shown++
-		current = entry.TxID
 	}
-	return entries, shown, false
+	return entries, shown
 }
 
 // showTransactionDetail prints the full record for one transaction and, for a pending send, offers Rebroadcast and
