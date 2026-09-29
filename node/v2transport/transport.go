@@ -606,7 +606,7 @@ func (p *Peer) processGarbageTerminator(recvGarbage []byte) error {
 
 	log.Tracef("Processing %d bytes preceding garbage terminator", recvGarbageLen-16)
 
-	// Process any potential packet data sent before the terminator.
+	// V2ReceivePacket authenticates the first packet with this garbage as AAD.
 	_, err := p.V2ReceivePacket(recvGarbage[:recvGarbageLen-16])
 	if err != nil {
 		log.Errorf("Error processing packet data before garbage "+
