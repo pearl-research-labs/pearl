@@ -1,8 +1,10 @@
 """Architecture families (one per compute-capability major) and the launch gate.
 
-SM100: datacenter Blackwell (tcgen05, TMEM, clusters). SM120: workstation and
-consumer Blackwell (warp-level ``mma.sync``, ~99 KB smem, no TMEM/clusters).
-Each host declares the families it runs on through ``require_arch``.
+SM90: Hopper (WGMMA into register accumulators, promoted FP8 accumulation,
+clusters). SM100: datacenter Blackwell (tcgen05, TMEM, clusters). SM120:
+workstation and consumer Blackwell (warp-level ``mma.sync``, ~99 KB smem, no
+TMEM/clusters). Each host declares the families it runs on through
+``require_arch``.
 """
 
 from enum import Enum
@@ -10,12 +12,13 @@ from enum import Enum
 import cutlass.utils
 import torch
 
-from ..protocol_constants import SM100_CC_MAJOR, SM120_CC_MAJOR
+from ..protocol_constants import SM90_CC_MAJOR, SM100_CC_MAJOR, SM120_CC_MAJOR
 
 
 class Arch(Enum):
     """One compute-capability major, named after its lead SM target."""
 
+    SM90 = SM90_CC_MAJOR
     SM100 = SM100_CC_MAJOR
     SM120 = SM120_CC_MAJOR
 

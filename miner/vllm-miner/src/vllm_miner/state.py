@@ -13,8 +13,9 @@ from miner_base.block_submission import (
     PrebuiltCommitment,
     commit_planes_for_leaf,
 )
-from miner_base.commitment import MiningConfiguration, PlanarCommitment
+from miner_base.commitment import Device, MiningConfiguration, PlanarCommitment
 from miner_base.commitment_hash import noise_seed_b
+from miner_base.devices import local_device
 from miner_base.prequant import PrequantMatrix
 from miner_utils import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob
@@ -176,6 +177,11 @@ class LayerState:
         """Columns the lottery lattice spans: ``n`` dense, ``n_e`` per expert for MoE."""
         return expert_n(self.n, self.experts)
 
+    @property
+    def committed_device(self) -> Device:
+        """The committed mining ``Device`` of the GPU this layer mines on."""
+        return local_device(self.weight.device)
+
     def disable_mining(self, reason: str) -> None:
         """Permanently isolate one deterministic layer failure from serving.
 
@@ -194,10 +200,15 @@ class LayerState:
 
 def _mines_on(device: torch.device) -> bool:
     """Whether ``device`` belongs to a family the pearl_gemm kernels run on
-    (SM100 datacenter Blackwell, SM120 workstation/consumer Blackwell)."""
-    from pearl_gemm.protocol_constants import SM100_CC_MAJOR, SM120_CC_MAJOR
+    (SM90 Hopper, SM100 datacenter Blackwell, SM120 workstation/consumer
+    Blackwell)."""
+    from pearl_gemm.protocol_constants import SM90_CC_MAJOR, SM100_CC_MAJOR, SM120_CC_MAJOR
 
-    return torch.cuda.get_device_capability(device)[0] in (SM100_CC_MAJOR, SM120_CC_MAJOR)
+    return torch.cuda.get_device_capability(device)[0] in (
+        SM90_CC_MAJOR,
+        SM100_CC_MAJOR,
+        SM120_CC_MAJOR,
+    )
 
 
 def _kernels_available() -> bool:
@@ -313,7 +324,7 @@ def _lottery_family_available(n: int, k: int, device: torch.device) -> bool:
     k > 30720 layers stay unquantized there)."""
     from pearl_gemm import supports_lottery_family
 
-    tile = select_tile(n, k)
+    tile = select_tile(n, k, device=local_device(device))
     return tile is not None and supports_lottery_family(tile.rows, device)
 
 
@@ -323,16 +334,18 @@ def can_mine_layer(n: int, k: int, device: torch.device, experts: int = 0) -> bo
     trade serving quality for zero protocol value. ``experts`` is the MoE
     expert count of a stacked ``(experts * n_e, k)`` weight; the grouped
     mining kernel needs ``n_e`` on its 128-column lottery lattice and exists
-    only on SM100 and SM120, so other families leave expert layers
+    only on SM90, SM100 and SM120, so other families leave expert layers
     unquantized."""
+    # Architecture first: the committed-tile set is per device, and resolving
+    # it raises on a family without a committed device.
+    if not _mines_on(device) or not _kernels_available():
+        return False
     if experts and (n % (experts * MOE_LOTTERY_N) or not _grouped_kernel_available(device)):
         return False
     n_e = expert_n(n, experts)
     return (
         supports_layer_shape(n, k)
-        and is_mineable_shape(n_e, k)
-        and _mines_on(device)
-        and _kernels_available()
+        and is_mineable_shape(n_e, k, device=local_device(device))
         and _lottery_family_available(n_e, k, device)
     )
 

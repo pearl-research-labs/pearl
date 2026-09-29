@@ -1,12 +1,13 @@
-"""SM120 MoE mining grouped GEMM: the fused SM120 kernel scheduled over experts.
+"""SM90 / SM120 MoE mining grouped GEMM: the fused kernels scheduled over experts.
 
-``_GroupedFusedGemmSm120`` is ``mixed_gemm``'s ``_FusedGemmSm120`` compiled in
-its grouped mode (see that module's docstring): the same warp roles, fold,
-hash, peel and unscale, with every work tile resolved to one expert by
-``_GroupedTileScheduler`` and the expert-local lottery of
-``grouped_mixed_gemm``. It overrides the dense kernel's per-tile hooks with
-the expert's operand views, scales and lottery bounds. The launch signature
-is ``GroupedGemmSm100.mine``'s, so both families share the host.
+``_GroupedFusedGemmSm90`` / ``_GroupedFusedGemmSm120`` are ``mixed_gemm``'s
+``_FusedGemmSm90`` / ``_FusedGemmSm120`` compiled in their grouped mode: the
+same warp roles, fold, hash, peel and unscale, with every work tile resolved
+to one expert by ``_GroupedTileScheduler`` and the expert-local lottery of
+``grouped_mixed_gemm``. ``_GroupedFusedGemm`` overrides the dense kernels'
+per-tile hooks with the expert's operand views and lottery bounds; each
+family adds its fragment's row scales. The launch signature is ``GroupedGemmSm100.mine``'s, so every family shares
+the host.
 """
 
 import cuda.bindings.driver as cuda_driver
@@ -21,15 +22,15 @@ from quack.tile_scheduler import (
     VarlenMTileSchedulerArguments,
 )
 
-from ..mixed_gemm._kernel import _HitGroup
-from ..mixed_gemm._kernel_sm120 import (
+from ..mixed_gemm._kernel_register_acc import (
     _RASTER_GROUP_SIZE,
     LTILE_ROWS,
-    WARP_ROWS,
-    _FusedGemmSm120,
     _Grouping,
     _TileGroup,
 )
+from ..mixed_gemm._kernel_sm90 import _FusedGemmSm90
+from ..mixed_gemm._kernel_sm120 import WARP_ROWS, _FusedGemmSm120
+from ..mixed_gemm._lottery import _HitGroup
 
 
 @cute.jit
@@ -64,8 +65,9 @@ class _GroupedTileScheduler(VarlenMTileScheduler):
         return m_blocks
 
 
-class _GroupedFusedGemmSm120(_FusedGemmSm120):
-    """The SM120 fused mining GEMM over MoE experts (``grouped_mixed_gemm``)."""
+class _GroupedFusedGemm:
+    """The per-tile hooks shared by the SM90 and SM120 fused mining GEMMs over
+    MoE experts (``grouped_mixed_gemm``)."""
 
     grouped = True
     scheduler_cls = _GroupedTileScheduler
@@ -129,58 +131,17 @@ class _GroupedFusedGemmSm120(_FusedGemmSm120):
         sPb: cute.Tensor,
         group: _TileGroup,
     ):
-        """``A_peel`` from the expert's first row uses the same ragged view as
-        ``A'``: the last expert's partial CTA tile must stay inside the
-        gathered peel allocation (``cum_m`` rows)."""
+        """``A_peel`` from the expert's first row is a plain offset, not a
+        ragged view: rows past the block only reach output rows the ragged
+        store clips (the peel follows the fold)."""
         return self._peel_tma_partitions(
             tma_atom_pa,
-            copy_utils.offset_ragged_tensor(mPa, group.row0, group.rows, ragged_dim=0),
+            cute.domain_offset((group.row0, 0), mPa),
             sPa,
             tma_atom_pb,
             self._column_operand(mPb, group),
             sPb,
         )
-
-    @cute.jit
-    def _stage_tile_alphas(
-        self,
-        mAlA: cute.Tensor,
-        mAlB: cute.Tensor,
-        sAlA: cute.Tensor,
-        sAlB: cute.Tensor,
-        group: _TileGroup,
-        tile_coord_mnkl,
-        warp_idx: Int32,
-        lane: Int32,
-        tidx: Int32,
-    ):
-        """Stage the expert's column scales; its row scales start at an
-        arbitrary, possibly odd, row that ``cp.async`` cannot address, so each
-        lane loads its two into registers. Rows past the expert's block
-        (never stored) read 1."""
-        row_alpha = cute.make_rmem_tensor(2, Float32)
-        for row_half in cutlass.range_constexpr(2):
-            row = (
-                tile_coord_mnkl[0] * self.tile_m + WARP_ROWS * warp_idx + (lane >> 2) + 8 * row_half
-            )
-            row_alpha[row_half] = Float32(1.0)
-            if row < group.rows:
-                row_alpha[row_half] = mAlA[group.row0 + row].to(Float32)
-        expert_alpha_b = cute.make_tensor(
-            mAlB.iterator + group.index * self.problem_n, cute.make_layout(self.problem_n)
-        )
-        self._stage_alpha_slices(((expert_alpha_b, sAlB, 1, self.tile_n),), tile_coord_mnkl, tidx)
-        return row_alpha
-
-    @cute.jit
-    def _row_inverse_scales(
-        self, sAlA: cute.Tensor, row_alpha: cute.Tensor, warp_idx: Int32, lane: Int32
-    ):
-        self._wait_alpha_slices()
-        row_inverse = cute.make_rmem_tensor(2, Float32)
-        for row_half in cutlass.range_constexpr(2):
-            row_inverse[row_half] = cute.arch.rcp_approx(row_alpha[row_half])
-        return row_inverse
 
     @cute.jit
     def _lottery_tile_bounds(self, tile_row: Int32, tile_column: Int32, group: _TileGroup):
@@ -223,7 +184,7 @@ class _GroupedFusedGemmSm120(_FusedGemmSm120):
         """Launch over ``grouped_mixed_gemm``'s operands (see
         ``GroupedGemmSm100.mine`` for each argument)."""
         assert sched_counter is None and group_order is None, (
-            "SM120 runs the static schedule in expert order"
+            "the fused grouped kernels run the static schedule in expert order"
         )
         self.__call__(
             a,
@@ -254,3 +215,100 @@ class _GroupedFusedGemmSm120(_FusedGemmSm120):
                 Int32(cute.size(a, mode=[1])),
             ),
         )
+
+
+class _GroupedFusedGemmSm120(_GroupedFusedGemm, _FusedGemmSm120):
+    """The SM120 fused mining GEMM over MoE experts."""
+
+    @cute.jit
+    def _stage_tile_alphas(
+        self,
+        mAlA: cute.Tensor,
+        mAlB: cute.Tensor,
+        sAlA: cute.Tensor,
+        sAlB: cute.Tensor,
+        group: _TileGroup,
+        tile_coord_mnkl,
+        warp_idx: Int32,
+        lane: Int32,
+        tidx: Int32,
+    ):
+        """Stage the expert's column scales; its row scales start at an
+        arbitrary, possibly odd, row that ``cp.async`` cannot address, so each
+        lane loads its two into registers. Rows past the expert's block
+        (never stored) read 1."""
+        row_alpha = cute.make_rmem_tensor(2, Float32)
+        for row_half in cutlass.range_constexpr(2):
+            row = (
+                tile_coord_mnkl[0] * self.tile_m + WARP_ROWS * warp_idx + (lane >> 2) + 8 * row_half
+            )
+            row_alpha[row_half] = Float32(1.0)
+            if row < group.rows:
+                row_alpha[row_half] = mAlA[group.row0 + row].to(Float32)
+        expert_alpha_b = cute.make_tensor(
+            mAlB.iterator + group.index * self.problem_n, cute.make_layout(self.problem_n)
+        )
+        self._stage_alpha_slices(((expert_alpha_b, sAlB, 1, self.tile_n),), tile_coord_mnkl, tidx)
+        return row_alpha
+
+    @cute.jit
+    def _row_inverse_scales(
+        self, sAlA: cute.Tensor, row_alpha: cute.Tensor, warp_idx: Int32, lane: Int32
+    ):
+        self._wait_alpha_slices()
+        row_inverse = cute.make_rmem_tensor(2, Float32)
+        for row_half in cutlass.range_constexpr(2):
+            row_inverse[row_half] = cute.arch.rcp_approx(row_alpha[row_half])
+        return row_inverse
+
+
+class _GroupedFusedGemmSm90(_GroupedFusedGemm, _FusedGemmSm90):
+    """The SM90 fused mining GEMM over MoE experts."""
+
+    @cute.jit
+    def _stage_tile_alphas(
+        self,
+        mAlA: cute.Tensor,
+        mAlB: cute.Tensor,
+        sAlA: cute.Tensor,
+        sAlB: cute.Tensor,
+        group: _TileGroup,
+        tile_coord_mnkl,
+        warp_idx: Int32,
+        lane: Int32,
+        tidx: Int32,
+    ):
+        """Stage the expert's column scales; its row scales start at an
+        arbitrary, possibly odd, row that ``cp.async`` cannot address, so each
+        thread loads its fragment rows' into registers. Rows past the expert's
+        block (never stored) read 1."""
+        warp_group_idx, warp_in_wg = warp_idx // 4, warp_idx % 4
+        row_alpha = cute.make_rmem_tensor((self.mma_m_per_wg, 2), Float32)
+        for mma_row in cutlass.range_constexpr(self.mma_m_per_wg):
+            for row_half in cutlass.range_constexpr(2):
+                row = tile_coord_mnkl[0] * self.tile_m + self._fragment_row(
+                    mma_row, row_half, warp_group_idx, warp_in_wg, lane
+                )
+                row_alpha[mma_row, row_half] = Float32(1.0)
+                if row < group.rows:
+                    row_alpha[mma_row, row_half] = mAlA[group.row0 + row].to(Float32)
+        expert_alpha_b = cute.make_tensor(
+            mAlB.iterator + group.index * self.problem_n, cute.make_layout(self.problem_n)
+        )
+        self._stage_alpha_slices(((expert_alpha_b, sAlB, 1, self.tile_n),), tile_coord_mnkl, tidx)
+        return row_alpha
+
+    @cute.jit
+    def _row_inverse_scales(
+        self,
+        sAlA: cute.Tensor,
+        row_alpha: cute.Tensor,
+        warp_group_idx: Int32,
+        warp_in_wg: Int32,
+        lane: Int32,
+    ):
+        row_inverse = cute.make_rmem_tensor((self.mma_m_per_wg, 2), Float32)
+        for mma_row in cutlass.range_constexpr(self.mma_m_per_wg):
+            for row_half in cutlass.range_constexpr(2):
+                row_inverse[mma_row, row_half] = cute.arch.rcp_approx(row_alpha[mma_row, row_half])
+        return row_inverse

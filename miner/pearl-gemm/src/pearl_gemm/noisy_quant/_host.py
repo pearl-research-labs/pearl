@@ -13,24 +13,31 @@ from .._utils._stream import get_stream
 from .._utils._validation import require_tensor
 from ..protocol_constants import (
     BLOCK_SCALE_GROUP,
-    DELTA,
     NOISE_TARGET_NORM,
     PACKED_NOISE_K,
     PEEL_COLS,
     R,
+    delta_for_capability,
 )
-from ._kernel import (
+from ._kernel import _NoisyQuantSm100
+from ._kernel_common import (
+    _NOISE_SKEW_ELEMS,
     _OUT_STAGES,
+    _PEEL_PARTIAL_WARPS,
+    _PEEL_VALUES_PER_THREAD,
+    HALF_TILE_ROWS,
     NoiseLoadMode,
     _NoisyQuant,
 )
+from ._kernel_sm90 import _NoisyQuantSm90
 from ._kernel_sm120 import _NoisyQuantSm120
 from ._quantization_ops import _L_E1, _noise_base_words
 
 # One fused kernel per architecture family; the host path, the tuning knobs
 # and every output are shared.
 _KERNELS: dict[Arch, type[_NoisyQuant]] = {
-    Arch.SM100: _NoisyQuant,
+    Arch.SM90: _NoisyQuantSm90,
+    Arch.SM100: _NoisyQuantSm100,
     Arch.SM120: _NoisyQuantSm120,
 }
 _SUPPORTED_ARCHS = tuple(_KERNELS)
@@ -63,6 +70,7 @@ class NoisyQuantConfig:
 # ~99 KB CTA takes a shallower factor pipeline than SM100's 227 KB; the
 # merged A pipe keeps its footprint k-independent.
 _DEFAULT_CONFIGS: dict[Arch, NoisyQuantConfig] = {
+    Arch.SM90: NoisyQuantConfig(),
     Arch.SM100: NoisyQuantConfig(),
     Arch.SM120: NoisyQuantConfig(noise_stages=3),
 }
@@ -77,29 +85,31 @@ _compile_cache: dict[tuple, object] = {}
 
 
 # Shared-memory geometry mirrored from the kernels' SharedStorage (shared terms):
-_A_HALF_TILE_ROWS = 16  # A is staged in 16-row half-tiles
 _F1_BYTES_PER_COLUMN = PACKED_NOISE_K  # e4m3 codes zero-padded to the atom's K
 _F2_BYTES_PER_COLUMN = R
 _F32_BYTES = 4
-_NOISE_SKEW_ELEMS = 16  # sNoise's per-row f32 skew (bank spread)
 _MBARRIER_BYTES = 8
-_WARP_LANES = 32
+# The register-direct peel's cross-warp partials (SM90, SM120): the
+# publishing warps' 16 x R f32 accumulators.
+_PEEL_PARTIALS_BYTES = _PEEL_PARTIAL_WARPS * 32 * _PEEL_VALUES_PER_THREAD * _F32_BYTES
 
 
 @dataclass(frozen=True)
 class _SmemGeometry:
-    """The SharedStorage terms that differ between the two kernel families."""
+    """The SharedStorage terms that differ between the kernel families."""
 
     # A' stage rows (None: the tile's own rows). The SM100 peel UMMA consumes
-    # whole 64-row operand tiles; SM120 stages only what the TMA store needs.
+    # whole 64-row operand tiles; SM90 and SM120 stage only what the TMA
+    # store needs.
     aprime_stage_rows: int | None
-    # The SM100 TMEM drain's skewed f32 (rows, bk) staging tile; SM120
-    # quantizes straight from the accumulator registers.
+    # The skewed f32 (rows, bk) noise staging tile (SM100's TMEM drain,
+    # SM90's WGMMA accumulator transpose); SM120 quantizes straight from the
+    # accumulator registers.
     noise_staging: bool
     # E1 operand image rows (None: the tile's own rows): a 64-row UMMA tile
-    # on SM100, the (rows, K) ldmatrix tile on SM120.
+    # on SM100, the (rows, K) WGMMA / ldmatrix tile on SM90 / SM120.
     e1_operand_rows: int | None
-    # SM120's cross-warp peel partials: the publishing warps' 16 x R f32.
+    # The register-direct peel's cross-warp partials (0 on SM100).
     peel_partials_bytes: int
     # Extra mbarriers: SM100's peel pipe (per output stage) plus its
     # two-stage acc pipe (4) and peel_done (2).
@@ -110,6 +120,17 @@ class _SmemGeometry:
 
 
 _SMEM_GEOMETRY: dict[Arch, _SmemGeometry] = {
+    # SM120's regions plus the sNoise staging tile. sNoise, sAq, sAs, sF1,
+    # sF2, sAp are 1 KiB-aligned.
+    Arch.SM90: _SmemGeometry(
+        aprime_stage_rows=None,
+        noise_staging=True,
+        e1_operand_rows=None,
+        peel_partials_bytes=_PEEL_PARTIALS_BYTES,
+        extra_mbarriers_per_out_stage=0,
+        extra_mbarriers=0,
+        aligned_regions=6,
+    ),
     # sNoise, sE1B, sAq, sAs, sF1, sF2, sAp are 1 KiB-aligned.
     Arch.SM100: _SmemGeometry(
         aprime_stage_rows=64,
@@ -125,7 +146,7 @@ _SMEM_GEOMETRY: dict[Arch, _SmemGeometry] = {
         aprime_stage_rows=None,
         noise_staging=False,
         e1_operand_rows=None,
-        peel_partials_bytes=3 * _WARP_LANES * (_A_HALF_TILE_ROWS * R // _WARP_LANES) * _F32_BYTES,
+        peel_partials_bytes=_PEEL_PARTIALS_BYTES,
         extra_mbarriers_per_out_stage=0,
         extra_mbarriers=0,
         aligned_regions=5,
@@ -136,15 +157,15 @@ _SMEM_GEOMETRY: dict[Arch, _SmemGeometry] = {
 def _smem_bytes(k: int, config: NoisyQuantConfig, arch: Arch) -> int:
     """Upper-bound the family's kernel SharedStorage for one configuration.
 
-    Mirrors the ``SharedStorage`` of ``_kernel.py`` (SM100) or
-    ``_kernel_sm120.py`` term by term, with alignment counted at its worst
+    Mirrors the ``SharedStorage`` of ``_kernel.py`` (SM100), ``_kernel_sm90.py``
+    or ``_kernel_sm120.py`` term by term, with alignment counted at its worst
     case so the estimate only over-reserves. The kernel's compile-time size
     assert remains the hard gate.
     """
     geometry = _SMEM_GEOMETRY[arch]
     rows, bk = config.noise_rows, config.noise_bk
     stages, out_stages = config.noise_stages, config.noise_out_stages
-    row_halves = rows // _A_HALF_TILE_ROWS
+    row_halves = rows // HALF_TILE_ROWS
     if config.noise_load_mode == NoiseLoadMode.RESIDENT:
         a_stage_count = row_halves * k // bk
     elif config.noise_load_mode == NoiseLoadMode.RING:
@@ -170,7 +191,7 @@ def _smem_bytes(k: int, config: NoisyQuantConfig, arch: Arch) -> int:
         _F32_BYTES * rows * (bk + _NOISE_SKEW_ELEMS) if geometry.noise_staging else 0
     )
     return (
-        _A_HALF_TILE_ROWS * a_bytes_per_row * a_stage_count
+        HALF_TILE_ROWS * a_bytes_per_row * a_stage_count
         + (_F1_BYTES_PER_COLUMN + _F2_BYTES_PER_COLUMN) * bk * stages
         + aprime_rows * bk * out_stages
         + noise_staging_bytes
@@ -207,7 +228,8 @@ def validate_noisy_quant_config(
     """Reject tuning points the kernel cannot express or fit in shared memory.
 
     The shared-memory fit is per architecture family (SM120 has ~99 KB per
-    CTA against SM100's 227 KB); ``arch`` defaults to the current device's.
+    CTA against SM90's / SM100's ~227 KB); ``arch`` defaults to the current
+    device's.
     """
     _validate_noisy_quant_tunables(config)
     if m <= 0:
@@ -229,9 +251,9 @@ def pack_noise_factor(f1: torch.Tensor) -> torch.Tensor:
     ``f1``: the (R, k) e4m3 factor from the commitment chain (same
     orientation as ``f2``). The blob is the transposed e4m3 codes
     themselves, zero-padded to the FP8 atom's K (``PACKED_NOISE_K``), and
-    is TMA-staged directly as the noise MMA's F1 operand on both families
-    (the tcgen05 UMMA's A operand on SM100, the ``mma.sync`` B operand on
-    SM120 -- the same K-major byte image). The zero padding is
+    is TMA-staged directly as the noise MMA's F1 operand on every family
+    (the tcgen05 UMMA's and the WGMMA's A operand on SM100 and SM90, the
+    ``mma.sync`` B operand on SM120 -- the same K-major byte image). The zero padding is
     the reference's own atom-K zero-pad, so pad products are exact zeros.
     When ``R`` already equals the atom K there is no pad, and the blob is
     ``noise_lines``' ``(k, R)`` output viewed as int8 -- callers on the timed
@@ -251,15 +273,19 @@ def pack_noise_factor(f1: torch.Tensor) -> torch.Tensor:
     return torch.cat([codes, pad], dim=1).contiguous()
 
 
-def _scale_constants() -> tuple[float, float]:
-    """BF16-valued ``DELTA * sqrt(R)`` pair matching the reference ``const`` path.
+def _scale_constants(device_capability: tuple[int, int]) -> tuple[float, float]:
+    """BF16-valued ``delta * sqrt(R)`` and ``delta * sqrt(R) / NOISE_TARGET_NORM**2`` constants.
 
-    R=16 made both values powers of two; that is not a protocol requirement.
+    ``delta`` is the committed device's noise fraction
+    (``protocol_constants.delta_for_capability``), so each architecture
+    derives its own alpha/beta from the same row norms, bit-exact against its
+    reference.
     """
-    delta_r = float(torch.tensor(DELTA * math.sqrt(R), dtype=torch.bfloat16))
+    delta = delta_for_capability(device_capability)
+    delta_r = float(torch.tensor(delta * math.sqrt(R), dtype=torch.bfloat16))
     delta_over_std = float(
         torch.tensor(
-            DELTA * math.sqrt(R) / (NOISE_TARGET_NORM * NOISE_TARGET_NORM),
+            delta * math.sqrt(R) / (NOISE_TARGET_NORM * NOISE_TARGET_NORM),
             dtype=torch.bfloat16,
         )
     )
@@ -361,7 +387,7 @@ def _launch_prep(
                 config.noise_stages,
                 out_stages=config.noise_out_stages,
                 msg_base=msg_base,
-                consts=_scale_constants(),
+                consts=_scale_constants(device_capability),
                 load_mode=config.noise_load_mode,
                 rows=config.noise_rows,
             ),

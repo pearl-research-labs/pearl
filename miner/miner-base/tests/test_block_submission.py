@@ -69,6 +69,9 @@ def _tall_config(k: int, rank: int = 32) -> MiningConfiguration:
 
 _TILE_CONFIGS = {
     "4x128": lambda: default_mining_config(k=_K, rank=32, ltile_cols=128),
+    "4x128-hopper": lambda: default_mining_config(
+        k=_K, rank=32, ltile_cols=128, device=Device.HOPPER
+    ),
     "16x32": lambda: _tall_config(k=16384),
 }
 

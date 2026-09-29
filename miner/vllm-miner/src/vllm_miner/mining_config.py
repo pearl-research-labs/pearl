@@ -1,5 +1,5 @@
 """Mining-job adapter: per-layer-shape committed configuration, thresholds, and
-credited-work formulas for the SM100 schema lottery."""
+credited-work formulas for the FP8 schema lottery (Hopper and Blackwell)."""
 
 from dataclasses import dataclass, replace
 from functools import cache
@@ -92,6 +92,22 @@ SMALL_TILE = LotteryTileSpec(4, 64)
 _TILES: tuple[LotteryTileSpec, ...] = (SMALL_TILE, TALL_TILE, DEFAULT_TILE)
 
 
+def _committed_tiles(device: Device) -> tuple[LotteryTileSpec, ...]:
+    """The committed tiles ``device``'s ``mixed_gemm`` can mine, in
+    selection-preference order.
+
+    SM90's WGMMA fragments split accumulator rows across four lanes, so the
+    Hopper kernel implements only the 4-row family: the tall 16x32 tile is
+    Blackwell-only, and tall-tile-only shapes (k in (30720, 43520], or
+    32-but-not-64-aligned ``n``) are unmineable on Hopper.
+    """
+    if device is Device.HOPPER:
+        return (SMALL_TILE, DEFAULT_TILE)
+    if device is Device.BLACKWELL:
+        return (SMALL_TILE, TALL_TILE, DEFAULT_TILE)
+    raise ValueError(f"no committed lottery tiles for {device!r}")
+
+
 def max_verifiable_k(tile_cols: int = TILE_COLS, tile_rows: int = TILE_ROWS) -> int:
     """Largest ``k`` whose peel proof fits the verifier's worker input for a
     committed ``tile_rows x tile_cols`` lottery tile."""
@@ -110,7 +126,7 @@ def max_mineable_k() -> int:
     return max(_tile_max_k(tile) for tile in _TILES)
 
 
-def select_tile(n: int, k: int) -> LotteryTileSpec | None:
+def select_tile(n: int, k: int, *, device: Device) -> LotteryTileSpec | None:
     """The committed lottery tile for one layer's ``(n, k)`` shape, or ``None``
     if no committed tile can mine it.
 
@@ -118,6 +134,9 @@ def select_tile(n: int, k: int) -> LotteryTileSpec | None:
     64-row kernel tile the runtime routes small-m (decode) launches to its
     smallest tile_n -- then the tall 16x32 for shapes 4x64 cannot take, and
     4x128 last (see the tile-commitment comment above ``_TILES``).
+
+    ``device`` is the committed device; it selects the architecture's
+    committed-tile set (Hopper has no 16x32 family).
 
     Anything counting messages or thresholds must use the tile this returns
     rather than assuming a geometry (see :func:`lottery_hashes_per_matmul`
@@ -137,26 +156,28 @@ def select_tile(n: int, k: int) -> LotteryTileSpec | None:
         return None
     if k % _K_ALIGNMENT or not (_VERIFIER_MIN_K <= k <= _VERIFIER_MAX_K):
         return None
-    for tile in (SMALL_TILE, TALL_TILE, DEFAULT_TILE):
+    for tile in _committed_tiles(device):
         if n % tile.cols == 0 and k <= _tile_max_k(tile):
             return tile
     return None
 
 
-def _tall_tile_configuration(k: int) -> MiningConfiguration:
+def _tall_tile_configuration(k: int, device: Device) -> MiningConfiguration:
     """The committed 16x32 layout: a 16x1 grid of 1x32 subtiles -- one lane per
     tile row, each lane folding its row's 32 contiguous cols ascending (the
     kernel's thread-local single-row fold, ltile_rows=16 / ltile_cols=32)."""
     return tall_tile_mining_config(
         k,
         RANK,
-        Device.BLACKWELL,
+        device,
         chunk_size=COMMITMENT_CHUNK_SIZE,
         a_chunk_size=COMMITMENT_CHUNK_SIZE,
     )
 
 
-def mining_configuration(k: int, n: int | None = None, experts: int = 0) -> MiningConfiguration:
+def mining_configuration(
+    k: int, n: int | None = None, experts: int = 0, *, device: Device
+) -> MiningConfiguration:
     """The committed mining configuration for one layer's ``(n, k)`` shape.
 
     ``n`` selects the committed tile via :func:`select_tile` (the 4x64 tile is
@@ -165,14 +186,15 @@ def mining_configuration(k: int, n: int | None = None, experts: int = 0) -> Mini
     ``n`` so every layer commits the tile it actually mines. ``experts`` (MoE)
     is the expert count of a stacked ``(experts * n_e, k)`` weight; the tile
     is then selected on the per-expert ``n_e``, the lottery lattice being
-    expert-local.
+    expert-local. ``device`` is the committed device of the GPU the layer
+    mines on (``miner_base.devices.local_device``).
 
     Both Merkle trees commit BLAKE3's native 1024-byte leaf
     (``HashId.BLAKE3_CHUNK_1024``). Autotune records may carry a faster hasher
     leaf, but the leaf is committed through each operand's ``HashId``, so GPU
     launches overlay this protocol leaf (see ``with_committed_leaf``).
     """
-    return _cached_mining_configuration(k, n, experts)
+    return _cached_mining_configuration(k, n, experts, device)
 
 
 def expert_n(n: int, experts: int) -> int:
@@ -183,11 +205,13 @@ def expert_n(n: int, experts: int) -> int:
 
 
 @cache
-def _cached_mining_configuration(k: int, n: int | None, experts: int) -> MiningConfiguration:
+def _cached_mining_configuration(
+    k: int, n: int | None, experts: int, device: Device
+) -> MiningConfiguration:
     n_e = None if n is None else expert_n(n, experts)
-    tile = (select_tile(n_e, k) if n_e is not None else DEFAULT_TILE) or DEFAULT_TILE
+    tile = (select_tile(n_e, k, device=device) if n_e is not None else DEFAULT_TILE) or DEFAULT_TILE
     if tile == TALL_TILE:
-        return replace(_tall_tile_configuration(k), experts=experts)
+        return replace(_tall_tile_configuration(k, device), experts=experts)
     # The 4x128 layout has exactly one definition -- the miner-base builder the
     # CPU plain-peel miner commits too. Duplicating it here would let the two
     # drift, silently changing GPU job keys.
@@ -197,6 +221,7 @@ def _cached_mining_configuration(k: int, n: int | None, experts: int) -> MiningC
             RANK,
             ltile_cols=tile.cols,
             ltile_rows=tile.rows,
+            device=device,
             chunk_size=COMMITMENT_CHUNK_SIZE,
             a_chunk_size=COMMITMENT_CHUNK_SIZE,
         ),
@@ -219,7 +244,7 @@ def _tile_work(tile: LotteryTileSpec, k: int) -> int:
     return tile.rows * tile.cols * k
 
 
-def lottery_threshold(target: int, k: int, n: int | None = None) -> int:
+def lottery_threshold(target: int, k: int, n: int | None = None, *, device: Device) -> int:
     """``min(target * rows*cols*k, 2^256-1)`` for the committed tile.
 
     Area-aware: each message's win chance scales with the committed tile's
@@ -229,9 +254,10 @@ def lottery_threshold(target: int, k: int, n: int | None = None) -> int:
     exactly like :func:`mining_configuration` -- pass the launch's actual
     matrix dimension everywhere, or a 4x64/16x32-committed layer gets a
     threshold its verifier rejects. Omitting ``n`` matches only the
-    back-compat 4x128 commitment.
+    back-compat 4x128 commitment. ``device`` is the committed device (it
+    selects the tile set, see :func:`select_tile`).
     """
-    tile = (select_tile(n, k) if n is not None else DEFAULT_TILE) or DEFAULT_TILE
+    tile = (select_tile(n, k, device=device) if n is not None else DEFAULT_TILE) or DEFAULT_TILE
     return min(target * _tile_work(tile, k), _MAX_256)
 
 
@@ -257,8 +283,8 @@ def lottery_hashes_per_matmul(m: int, n: int, tile: LotteryTileSpec = DEFAULT_TI
     return (m // tile.rows) * (n // tile.cols)
 
 
-def effective_work_per_matmul(m: int, n: int, k: int) -> int:
-    """Difficulty-normalized credited work for one launch.
+def effective_work_per_matmul(m: int, n: int, k: int, *, device: Device) -> int:
+    """Difficulty-normalized credited work for one launch on the committed ``device``.
 
     Raw ``lottery_hashes_per_matmul`` counts messages ((m/rows)*(n/cols)); each
     message's win chance is ``target * rows*cols*k / 2^256``. Weighting
@@ -280,7 +306,7 @@ def effective_work_per_matmul(m: int, n: int, k: int) -> int:
         raise TypeError(f"lottery common dimension k must be an int, got {k!r}")
     if k <= 0:
         raise ValueError(f"lottery common dimension must be positive, got k={k}")
-    tile = select_tile(n, k)
+    tile = select_tile(n, k, device=device)
     if tile is None:
         raise ValueError(
             f"({n}, {k}) is not mineable by any committed tile; refusing to credit work"
@@ -288,12 +314,12 @@ def effective_work_per_matmul(m: int, n: int, k: int) -> int:
     return lottery_hashes_per_matmul(m, n, tile) * _tile_work(tile, k)
 
 
-def threshold_bytes_for(job: MiningJob, k: int, n: int | None = None) -> bytes:
+def threshold_bytes_for(job: MiningJob, k: int, n: int | None = None, *, device: Device) -> bytes:
     """32-byte little-endian lottery threshold consumed by ``mixed_gemm``.
 
     ``n`` selects the committed tile (see :func:`lottery_threshold`); pass the
     layer's actual dimension everywhere, like :func:`mining_configuration`."""
-    return lottery_threshold(job.target, k, n).to_bytes(32, "little")
+    return lottery_threshold(job.target, k, n, device=device).to_bytes(32, "little")
 
 
 def tile_indices(pattern: AxisPattern, tile_index: int) -> list[int]:
@@ -303,10 +329,13 @@ def tile_indices(pattern: AxisPattern, tile_index: int) -> list[int]:
     return [base + off for off in pattern.tile_offsets]
 
 
-def is_mineable_shape(n: int, k: int) -> bool:
+def is_mineable_shape(n: int, k: int, *, device: Device) -> bool:
     """Admissibility for both the kernels and the verifier: some committed tile
     accepts ``(n, k)`` -- ``k % 512`` inside that tile's legal ``k`` domain, and
     whole lottery tiles in ``n``. High-``k`` layers up to 30720 (e.g. o_proj,
     k=16384) are admitted via the preferred 4x64 tile; the tall 16x32 extends
-    the domain to k=43520 and to 32-but-not-64-aligned ``n``."""
-    return select_tile(n, k) is not None
+    the domain to k=43520 and to 32-but-not-64-aligned ``n`` on Blackwell.
+
+    ``device`` selects the architecture's committed-tile set.
+    """
+    return select_tile(n, k, device=device) is not None

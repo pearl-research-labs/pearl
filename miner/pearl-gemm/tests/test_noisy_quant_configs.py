@@ -29,6 +29,9 @@ _DEFAULT = default_noisy_quant_config(_ARCH)
 # Every (bk, load mode) compile key, at a factor pipeline depth the family's
 # shared memory admits: SM120 holds bk=256 stages only two deep.
 _BK_MODE_MATRIX = {
+    Arch.SM90: [
+        {"noise_bk": bk, "noise_load_mode": mode} for bk in (128, 256) for mode in NoiseLoadMode
+    ],
     Arch.SM100: [
         {"noise_bk": bk, "noise_load_mode": mode} for bk in (128, 256) for mode in NoiseLoadMode
     ],
@@ -38,6 +41,7 @@ _BK_MODE_MATRIX = {
 # The rows=64 path matrix: SM120's shared memory holds rows=64 at bk=128, and
 # at bk=256 only behind the half-tile ring.
 _ROWS64_MATRIX = {
+    Arch.SM90: [(bk, mode) for bk in (128, 256) for mode in NoiseLoadMode],
     Arch.SM100: [(bk, mode) for bk in (128, 256) for mode in NoiseLoadMode],
     Arch.SM120: [(128, mode) for mode in NoiseLoadMode] + [(256, NoiseLoadMode.RING)],
 }[_ARCH]

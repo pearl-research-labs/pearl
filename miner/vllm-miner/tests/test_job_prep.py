@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from miner_base.commitment import Device
 from miner_base.commitment_hash import noise_seed_b
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
@@ -42,8 +43,10 @@ from vllm_miner.state import (
 
 _N, _K = 128, 2048
 # Past the 4x64 tile's verifier limit (30720), so this shape commits the tall
-# 16x32 tile instead of the preferred 4x64.
+# 16x32 tile instead of the preferred 4x64. Blackwell only: Hopper commits no
+# tall tile, so this k is unmineable there.
 _TALL_K = 43520
+_DEVICES = pytest.mark.parametrize("device", list(Device), ids=lambda d: d.name.lower())
 _HEADER = bytes(range(80))
 _OTHER_HEADER = bytes(range(1, 81))
 _LAYER_IDS = itertools.count(1)
@@ -130,6 +133,18 @@ def host_only_runtime(monkeypatch):
 
 
 @pytest.fixture
+def device() -> Device:
+    """The stub layers' committed device (their planes live on the host).
+    Tests whose outcome depends on it parametrize it."""
+    return Device.BLACKWELL
+
+
+@pytest.fixture(autouse=True)
+def _host_layers_commit_the_device(monkeypatch, device):
+    monkeypatch.setattr(LayerState, "committed_device", property(lambda _state: device))
+
+
+@pytest.fixture
 def preps(monkeypatch) -> list[tuple[LayerState, bytes]]:
     """Stub the GPU B chain and record ``(layer, keyB)`` per full preparation.
 
@@ -162,25 +177,28 @@ def _threshold_words(state: LayerState) -> bytes:
     return bytes(state.buffers.threshold_dev.numpy())
 
 
-def test_first_job_runs_the_b_chain_and_publishes_in_place(layer, preps):
+@_DEVICES
+def test_first_job_runs_the_b_chain_and_publishes_in_place(layer, preps, device):
     job = _job()
     ctx = current_context(layer, job)
 
     assert ctx is not None and layer.job_ctx is ctx
     assert [key for _, key in preps] == [layer_job_keys(job)[1]]
     assert ctx.job is job and ctx.target == job.target
-    assert ctx.config == mining_configuration(_K, _N)
+    assert ctx.config == mining_configuration(_K, _N, device=device)
+    assert ctx.config.device is device
     assert ctx.seed_b == noise_seed_b(b"\x00" * 32, ctx.key_b, ctx.config.p_b(_N))
     assert ctx.b_proof.commit_leaf == layer.buffers.commit_config.chunk_size
     # Every device operand is the steady buffer itself: launches read the
     # same addresses forever.
     for name in _ALIASED_OPERANDS:
         assert getattr(ctx, name) is getattr(layer.buffers, name), name
-    assert _threshold_words(layer) == threshold_bytes_for(job, _K, _N)
+    assert _threshold_words(layer) == threshold_bytes_for(job, _K, _N, device=device)
     assert bytes(layer.buffers.seed_b_dev.numpy()) == ctx.seed_b
 
 
-def test_same_header_target_change_rewrites_only_the_threshold(layer, preps):
+@_DEVICES
+def test_same_header_target_change_rewrites_only_the_threshold(layer, preps, device):
     """The 32 bytes that changed must not cost a full-model B prep.
 
     Only the lottery threshold depends on the target: keyA/keyB come from the
@@ -201,16 +219,17 @@ def test_same_header_target_change_rewrites_only_the_threshold(layer, preps):
     assert published.b_proof is first.b_proof
     for name in _ALIASED_OPERANDS:
         assert getattr(published, name) is getattr(first, name), name
-    assert _threshold_words(layer) == threshold_bytes_for(second_job, _K, _N)
+    assert published.config.device is device
+    assert _threshold_words(layer) == threshold_bytes_for(second_job, _K, _N, device=device)
 
 
-def test_tall_shape_target_change_reuses_the_b_side(preps):
+def test_tall_shape_target_change_reuses_the_b_side(preps, device):
     """A wide-k layer commits the tall 16x32 tile, whose ``pB`` enters seedB.
     The fast path must compare the keys exactly as the full path derived them
     (n included) or a target-only change would re-prepare precisely the layers
     the tall tile made mineable."""
     state = _layer_state(_TALL_K)
-    config = mining_configuration(_TALL_K, state.n)
+    config = mining_configuration(_TALL_K, state.n, device=device)
     assert (config.rows_pattern.tile_size, config.cols_pattern.tile_size) == (16, 32)
 
     first = prepare_layer(state, _job(target=100))
@@ -218,17 +237,21 @@ def test_tall_shape_target_change_reuses_the_b_side(preps):
 
     assert len(preps) == 1, "a target-only change re-prepared the tall B side"
     assert published.seed_b == first.seed_b
-    assert _threshold_words(state) == threshold_bytes_for(_job(target=200), _TALL_K, _N)
+    assert _threshold_words(state) == threshold_bytes_for(
+        _job(target=200), _TALL_K, _N, device=device
+    )
 
 
-def test_header_change_reruns_the_b_chain(layer, preps):
+def test_header_change_reruns_the_b_chain(layer, preps, device):
     first = current_context(layer, _job())
     published = current_context(layer, _job(header=_OTHER_HEADER))
 
     assert len(preps) == 2
     assert (published.key_a, published.key_b) != (first.key_a, first.key_b)
     assert published.seed_b != first.seed_b
-    assert _threshold_words(layer) == threshold_bytes_for(_job(header=_OTHER_HEADER), _K, _N)
+    assert _threshold_words(layer) == threshold_bytes_for(
+        _job(header=_OTHER_HEADER), _K, _N, device=device
+    )
 
 
 def test_unchanged_job_is_a_noop(layer, preps):

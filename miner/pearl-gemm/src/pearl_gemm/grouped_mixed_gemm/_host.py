@@ -6,7 +6,7 @@ publish, the BF16 peel and the per-row / per-column unscale. Operands are the
 protocol's MoE inputs with A rows permuted so each expert's tokens are
 contiguous and in ascending token order, so a lottery tile's rows are the
 expert's routed tokens ``4r .. 4r + 3``. SM100 runs ``GroupedGemmSm100``,
-SM120 the grouped mode of the fused SM120 kernel.
+SM90 / SM120 the grouped mode of their fused kernel.
 """
 
 from dataclasses import dataclass
@@ -36,7 +36,8 @@ from ..grouped_fp8_gemm._kernel import (
     SCHEDULERS,
     GroupedGemmSm100,
 )
-from ..mixed_gemm._kernel import (
+from ..mixed_gemm._kernel_register_acc import LTILE_ROWS
+from ..mixed_gemm._lottery import (
     DEFAULT_LTILE_COLS,
     DEFAULT_LTILE_ROWS,
     R2,
@@ -45,9 +46,9 @@ from ..mixed_gemm._kernel import (
 )
 from ..pow import HIT_PAYLOAD_K_ALIGN, HitSignal
 from ..protocol_constants import BLOCK_SCALE_GROUP
-from ._kernel_sm120 import _GroupedFusedGemmSm120
+from ._kernel import _GroupedFusedGemmSm90, _GroupedFusedGemmSm120
 
-_SUPPORTED_ARCHS = (Arch.SM100, Arch.SM120)
+_SUPPORTED_ARCHS = (Arch.SM90, Arch.SM100, Arch.SM120)
 
 
 def supports_grouped_mixed_gemm(
@@ -55,7 +56,7 @@ def supports_grouped_mixed_gemm(
 ) -> bool:
     """Whether ``device`` (the current one when omitted; a ``(major, minor)``
     capability is also accepted) has the MoE mining grouped GEMM: SM100
-    (``GroupedGemmSm100``) and SM120 (the grouped fused SM120 kernel).
+    (``GroupedGemmSm100``) and SM90 / SM120 (their grouped fused kernel).
     Unknown majors return false, so expert layers stay on their unquantized
     path."""
     try:
@@ -76,7 +77,9 @@ class GroupedMixedGemmConfig:
     SM100: ``mma_sm`` / ``tile_n`` select the UMMA shape and the per-CTA tile
     width exactly as ``GroupedFp8GemmConfig`` does (128 x ``tile_n`` per CTA,
     the 2-CTA pair covering 256 rows); SM120 has no CTA pairs (``mma_sm=1``)
-    and runs the static schedule only.
+    and runs the static schedule only. SM90 runs the static schedule with
+    ``tile_n=128``; ``mma_sm=2`` selects the 256-row tile, one CTA with two
+    consumer warpgroups.
     The lottery observables are the same for every tile shape: the lottery
     lattice is expert-local and in ``ltile_rows x ltile_cols`` units, and hit
     records report lottery-tile coordinates.
@@ -133,8 +136,9 @@ class GroupedMixedGemmConfig:
         SM100: the rule of ``GroupedFp8GemmConfig.auto`` (the mining kernel
         is always full-K): the 2-CTA 256-wide tile from
         ``WIDE_TILE_MIN_TOKENS_PER_GROUP`` tokens per expert on average, the
-        1-SM 128x128 tile below. SM120: the 128x128 tile. Explicit tile knobs
-        win.
+        1-SM 128x128 tile below. SM90: the same rule picks the 256- or
+        128-row tile, always 128 wide. SM120: the 128x128 tile. Explicit tile
+        knobs win.
 
         ``n`` (the expert width) clamps the auto-selected ``tile_n`` so the
         CTA tile never exceeds the expert: pass the per-expert ``n_e``, not
@@ -146,7 +150,7 @@ class GroupedMixedGemmConfig:
             return cls(**knobs)
         wide = cum_m >= WIDE_TILE_MIN_TOKENS_PER_GROUP * num_groups
         knobs.setdefault("mma_sm", 2 if wide else 1)
-        default_tile_n = 256 if wide else 128
+        default_tile_n = 256 if wide and arch is Arch.SM100 else 128
         if n is not None and default_tile_n > n:
             default_tile_n = 128
         knobs.setdefault("tile_n", default_tile_n)
@@ -174,8 +178,11 @@ def _compile_variant(
         "ltile_rows": ltile_rows,
         "ltile_cols": ltile_cols,
     }
-    if arch_of(capability) is Arch.SM120:
+    arch = arch_of(capability)
+    if arch is Arch.SM120:
         kernel = _GroupedFusedGemmSm120(CTA_TILE_M, tile_n, **variant_flags)
+    elif arch is Arch.SM90:
+        kernel = _GroupedFusedGemmSm90(CTA_TILE_M * mma_sm, tile_n, **variant_flags)
     else:
         kernel = GroupedGemmSm100(
             scale_major_k=False,
@@ -305,6 +312,28 @@ def _validate_hit_signal(hit_signal: HitSignal, device: torch.device) -> None:
     hit_signal.require_usable()
 
 
+def _require_fused_kernel_config(
+    arch: Arch, config: GroupedMixedGemmConfig, group_order: torch.Tensor | None
+) -> None:
+    """SM90 / SM120 run the static schedule in expert order with one CTA per
+    tile and the register accumulator's 4-row lottery tiles; SM90 tiles are
+    128 wide."""
+    if arch is Arch.SM100:
+        return
+    if (
+        config.scheduler != "static"
+        or group_order is not None
+        or config.ltile_rows != LTILE_ROWS
+        or (arch is Arch.SM120 and config.mma_sm != 1)
+        or (arch is Arch.SM90 and config.tile_n != 128)
+    ):
+        raise ValueError(
+            f"{arch.name} runs the static schedule in expert order: scheduler must be "
+            f"'static', group_order None and ltile_rows {LTILE_ROWS}"
+            + (", mma_sm 1 (no CTA pairs)" if arch is Arch.SM120 else ", tile_n 128")
+        )
+
+
 def grouped_mixed_gemm(
     a_prime: torch.Tensor,
     b_prime: torch.Tensor,
@@ -369,7 +398,9 @@ def grouped_mixed_gemm(
     from the average tokens per expert (``GroupedMixedGemmConfig.auto``).
     SM120 has no CTA pairs and runs the static schedule in expert order:
     ``mma_sm`` must be 1, ``scheduler`` ``"static"`` and ``group_order``
-    ``None`` there.
+    ``None`` there. SM90 runs the same static schedule with ``tile_n=128``,
+    and ``mma_sm=2`` selects its 256-row single-CTA tile. Both take only the
+    4-row lottery family.
     """
     cum_m, num_groups, n, k = _problem_dims(a_prime, b_prime)
     device = a_prime.device
@@ -377,13 +408,7 @@ def grouped_mixed_gemm(
     capability = torch.cuda.get_device_capability(device)
     if config is None:
         config = GroupedMixedGemmConfig.auto(cum_m, num_groups, n=n, arch=arch)
-    if arch is Arch.SM120 and (
-        config.mma_sm != 1 or config.scheduler != "static" or group_order is not None
-    ):
-        raise ValueError(
-            "SM120 has no CTA pairs and runs the static schedule in expert order: "
-            "mma_sm must be 1, scheduler 'static' and group_order None"
-        )
+    _require_fused_kernel_config(arch, config, group_order)
     # ``_problem_dims`` only checks divisibility; the mining launch has no
     # empty-problem policy, so every extent must be positive.
     if num_groups <= 0 or n <= 0 or k <= 0:
@@ -474,7 +499,8 @@ def grouped_mixed_gemm(
         if snapshot_payload
         else (None, None, None, None)
     )
-    max_active_clusters = get_max_active_clusters(config.mma_sm)
+    # An SM90 256-row tile is one CTA, not a CTA pair.
+    max_active_clusters = get_max_active_clusters(1 if arch is Arch.SM90 else config.mma_sm)
     compiled = _compile_variant(
         capability,
         snapshot_payload,

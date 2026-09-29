@@ -1,8 +1,8 @@
 # vLLM - PearlMiner
 
 A vLLM plugin that mines the Pearl FP8/FP10 scheme inside serving forwards on
-Blackwell GPUs -- SM100 (B200) and SM120 (RTX PRO 6000, GeForce RTX 50) -- over
-BF16 or quantized HuggingFace checkpoints.
+Hopper GPUs -- SM90 (H100) -- and Blackwell GPUs -- SM100 (B200) and SM120
+(RTX PRO 6000, GeForce RTX 50) -- over BF16 or quantized HuggingFace checkpoints.
 
 ## How it works
 
@@ -32,18 +32,21 @@ path; there is no CPU fallback.
 
 Capability gates:
 
-- Blackwell only (SM100 and SM120): the `pearl` quantization method refuses
-  to load on any other GPU. SM120 has no kernel for the tall 16x32 lottery
-  tile, so layers that commit to it (`n` not a multiple of 64, or
-  `k > 30720`) keep their original BF16 path there. TP, DP, and EP workers
-  independently commit and mine each eligible process-local dense shard;
-  there is no cross-rank weight reconstruction or proof aggregation.
+- SM90, SM100 and SM120 only: the `pearl` quantization method refuses to load
+  on any other GPU. Each worker commits its GPU's device into every job
+  (`Device.HOPPER` on SM90, `Device.BLACKWELL` on SM100 and SM120). Hopper
+  commits only the 4-row lottery tiles (4x64, 4x128) and SM120 has no kernel
+  for the tall 16x32 tile, so on both, layers only that tile can mine (`n` not
+  a multiple of 64, or `k > 30720`) keep their original BF16 path. TP, DP,
+  and EP workers independently commit and mine each eligible process-local
+  dense shard; there is no cross-rank weight reconstruction or proof
+  aggregation.
 - Dense linear layers: a mined local shard needs `k % 512 == 0`,
   `n % 128 == 0`, and `n, k % 16 == 0` (FP8 fallback alignment). Layers that
   cannot mine on this device/shape keep their original BF16 path.
 - MoE expert layers (BF16 routed experts, see
   [MoE expert mining](#moe-expert-mining)) mine their first grouped GEMM on
-  SM100 and SM120. MLA `.kv_b_proj` parameters stay on their source scheme
+  SM90, SM100 and SM120. MLA `.kv_b_proj` parameters stay on their source scheme
   because the model reads those weights directly instead of exclusively
   through the linear quantization method.
 - The worker subtracts a bounded post-profile allowance for the persistent hit
@@ -85,7 +88,7 @@ witness (`R[w]`'s opening and the offsets), into a cert-v4 MoE proof.
 
 Gates (a layer outside them keeps the engine's own unmined MoE path):
 
-- SM100 or SM120 with `pearl_gemm.supports_grouped_mixed_gemm`; SM120 runs the
+- SM90, SM100 or SM120 with `pearl_gemm.supports_grouped_mixed_gemm`; SM120 runs the
   grouped kernel's static tile schedule.
 - Per-expert `n_e = 2I` must be a multiple of the 128-column MoE lottery
   lattice (no lottery tile straddles two experts) and `(n_e, H)` must be a
@@ -193,7 +196,7 @@ Notes / constraints:
 
 `RuntimeSettings` reads case-insensitive `PEARL_*` environment variables once
 per worker process. These controls configure the launch runtime; the current
-schema-mining kernels require SM100 or SM120 and supported layer shapes.
+schema-mining kernels require SM90, SM100 or SM120 and supported layer shapes.
 Unsupported devices or layer shapes stay on the serving fallback.
 
 | Variable | Default | Valid values | Applies to | Effect |
@@ -238,8 +241,8 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct --quantization pearl
 ## Running Tests
 
 The suite runs on the B200 GPU CI job. Device-heavy files such as
-`tests/test_vllm_adapter.py` and `tests/test_runtime_gpu.py` need a
-Blackwell GPU (SM100 or SM120); SM120 skips the 16x32 lottery cases.
+`tests/test_vllm_adapter.py` and `tests/test_runtime_gpu.py` need an
+SM90, SM100 or SM120 GPU; SM90 and SM120 skip the 16x32 lottery cases.
 
 ```bash
 pytest miner/vllm-miner/tests

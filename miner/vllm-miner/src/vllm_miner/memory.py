@@ -75,6 +75,7 @@ def _moe_tail_bytes(m: int, n: int, k: int, experts: int, top_k: int) -> int:
 
 
 def _launch_bytes(m: int, n: int, k: int, device, experts: int = 0, top_k: int = 0) -> int:
+    from miner_base.devices import local_device
     from pearl_gemm import (
         R,
         pre_quant_output_shapes,
@@ -88,7 +89,9 @@ def _launch_bytes(m: int, n: int, k: int, device, experts: int = 0, top_k: int =
     # The pipeline resolves its configuration against the lottery width: the
     # stacked ``n`` dense, one expert's ``n_e`` for MoE (pipeline._launch_stages).
     lottery_n = expert_n(n, experts)
-    _, commit, _, _ = _configs(device_config_name(device), m, lottery_n, k)
+    _, commit, _, _ = _configs(
+        device_config_name(device), m, lottery_n, k, device=local_device(device)
+    )
     codes_shape, scales_shape = pre_quant_output_shapes(m, k)
 
     # MoE layers gather the A side into expert order over ``m * top_k`` rows

@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from miner_base.async_loop_manager import AsyncLoopManager, MiningLaunchDecision
+from miner_base.commitment import Device
+from miner_base.devices import local_device
 from miner_utils import get_logger
 
 from .capture import (
@@ -347,7 +349,7 @@ def pick_bucket(m_tokens: int) -> int | None:
 
 def _lottery_tile(state: LayerState) -> LotteryTileSpec:
     """The committed tile of this layer's lottery lattice (fixed at creation)."""
-    tile = select_tile(state.lottery_n, state.k)
+    tile = select_tile(state.lottery_n, state.k, device=state.committed_device)
     if tile is None:
         raise RuntimeError(
             f"{state.layer_name}: no lottery tile for n_e={state.lottery_n}, k={state.k}"
@@ -363,7 +365,7 @@ def _launch_credit(m_bucket: int, state: LayerState) -> int:
     network difficulty. effective_work_per_matmul derives the committed tile
     from (n, k), so a tall-tile (16x32) layer is credited against that tile.
     """
-    return effective_work_per_matmul(m_bucket, state.n, state.k)
+    return effective_work_per_matmul(m_bucket, state.n, state.k, device=state.committed_device)
 
 
 def moe_launch_credit(state: LayerState, expert_rows: Sequence[int]) -> int:
@@ -376,7 +378,9 @@ def moe_launch_credit(state: LayerState, expert_rows: Sequence[int]) -> int:
     """
     tile = _lottery_tile(state)
     rows = sum(int(count) // tile.rows for count in expert_rows) * tile.rows
-    return effective_work_per_matmul(rows, state.lottery_n, state.k) if rows else 0
+    if not rows:
+        return 0
+    return effective_work_per_matmul(rows, state.lottery_n, state.k, device=state.committed_device)
 
 
 class _DeferredMoeCredit:
@@ -405,11 +409,11 @@ def variant_ready(m_bucket: int, state: LayerState) -> bool:
         return _variant_key(m_bucket, state) in _ready_variants
 
 
-def _mixed_gemm_record_is_legal(m: int, n: int, k: int, kwargs: dict) -> bool:
+def _mixed_gemm_record_is_legal(m: int, n: int, k: int, kwargs: dict, *, device: Device) -> bool:
     """Whether one saved record preserves protocol geometry and can launch."""
     from pearl_gemm import default_mixed_gemm_config, validate_mixed_gemm_config
 
-    tile = select_tile(n, k)
+    tile = select_tile(n, k, device=device)
     if tile is None:
         return False
     if kwargs.get("ltile_cols", tile.cols) != tile.cols:
@@ -428,8 +432,12 @@ def _mixed_gemm_record_is_legal(m: int, n: int, k: int, kwargs: dict) -> bool:
 
 
 @lru_cache(maxsize=256)
-def _configs(config_name: str, m: int, n: int, k: int):
-    """Resolve and validate one device/shape pipeline configuration."""
+def _configs(config_name: str, m: int, n: int, k: int, *, device: Device | None = None):
+    """Resolve and validate one device/shape pipeline configuration.
+
+    ``device`` is the committed device the lottery tile is selected for (the
+    current CUDA device's when omitted); the kernel configs are validated
+    against the current device's family."""
     from pearl_gemm import (
         PreQuantConfig,
         TensorHashConfig,
@@ -441,14 +449,16 @@ def _configs(config_name: str, m: int, n: int, k: int):
     )
     from pearl_gemm.autotune import route_small_m_mixed_gemm
 
-    tile = select_tile(n, k)
+    if device is None:
+        device = local_device()
+    tile = select_tile(n, k, device=device)
     if tile is None:
         raise ValueError(f"({n}, {k}) is not mineable by any committed lottery tile")
 
     prequant = PreQuantConfig(**tuned(config_name, "pre_quant", m=m, k=k))
     # Overlay the cert-v4 1024-byte leaf on autotune knobs. Every m bucket
     # of the layer must build the same A tree; the verifier can only open 1024.
-    committed_leaf = mining_configuration(k, n).a_chunk_size
+    committed_leaf = mining_configuration(k, n, device=device).a_chunk_size
     commit = TensorHashConfig(
         **with_committed_leaf(
             tuned(
@@ -466,7 +476,7 @@ def _configs(config_name: str, m: int, n: int, k: int):
     validate_noisy_quant_config(m, k, prepare)
 
     def gemm_legal(kwargs: dict) -> bool:
-        return _mixed_gemm_record_is_legal(m, n, k, kwargs)
+        return _mixed_gemm_record_is_legal(m, n, k, kwargs, device=device)
 
     # Exact autotune records win: they were measured on this (m, n, k). The
     # 64-row decode heuristic only fills the gap when no exact record exists
@@ -545,6 +555,7 @@ def _launch_stages(
         m,
         lottery_n,
         k,
+        device=config.device,
     )
 
     codes_shape, scales_shape = pre_quant_output_shapes(m, k)
@@ -609,6 +620,7 @@ def _launch_stages(
             c,
             hit_signal,
             m,
+            committed_device=config.device,
             layer_id=layer_id,
             record_hits=record_hits,
         )
@@ -645,6 +657,7 @@ def _grouped_mixed_gemm(
     hit_signal: "HitSignal",
     m_bucket: int,
     *,
+    committed_device: Device,
     layer_id: int,
     record_hits: bool,
 ) -> None:
@@ -661,7 +674,7 @@ def _grouped_mixed_gemm(
     from pearl_gemm import GroupedMixedGemmConfig, grouped_mixed_gemm
 
     experts, n_e, k = routing.experts, ctx.b_prime.shape[0] // routing.experts, a_prime.shape[1]
-    tile = select_tile(n_e, k)
+    tile = select_tile(n_e, k, device=committed_device)
     if tile is None:
         raise RuntimeError(f"no lottery tile for n_e={n_e}, k={k}")
     rows = routing.tokens
@@ -1199,7 +1212,7 @@ def warmup_layer_variants(
     """
     assert state.buffers is not None
     device = state.weight.device
-    config = mining_configuration(state.k, state.n, state.experts)
+    config = mining_configuration(state.k, state.n, state.experts, device=state.committed_device)
     for m_bucket in runtime_settings().m_buckets:
         if (cancelled is not None and cancelled()) or not mining_producer_admission_open():
             return False

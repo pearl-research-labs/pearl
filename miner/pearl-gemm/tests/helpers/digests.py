@@ -8,6 +8,12 @@ host so they reproduce exactly; any drift in a kernel's bits changes its
 digest. Each case also stores ``peel_tol``, the relative-error bound for the
 peel's matmul half (twice the reference's own deviation from the fp64-exact
 product, with an absolute floor).
+
+The noisy-quantized operands are the Blackwell device's (SM100 and SM120 run
+the same arithmetic and commit the same ``delta``). Hopper commits a
+different ``delta`` and noise-dot arithmetic and has no pinned digests here,
+so ``blackwell_digests`` skips those gates on SM90. The noise lines are
+device-independent.
 """
 
 import hashlib
@@ -15,7 +21,10 @@ import json
 from functools import cache
 from pathlib import Path
 
+import pytest
 import torch
+
+from pearl_gemm._utils._arch import Arch, arch_of
 
 _FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "reference_digests.json"
 
@@ -23,6 +32,13 @@ _FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "reference_digests
 @cache
 def reference_digests() -> dict:
     return json.loads(_FIXTURE.read_text())
+
+
+def blackwell_digests(section: str) -> dict:
+    """``section``'s pinned digests of the Blackwell device's operands; skips on SM90."""
+    if arch_of() is Arch.SM90:
+        pytest.skip(f"no pinned Hopper (SM90) {section} digests")
+    return reference_digests()[section]
 
 
 def digest(t: torch.Tensor) -> str:

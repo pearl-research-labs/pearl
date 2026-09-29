@@ -25,8 +25,8 @@ LABEL_E2 = _L_E2
 LABEL_F1 = _L_F1
 LABEL_F2 = _L_F2
 
-# Thread-local keyed BLAKE3 and e4m3 conversion only: one source for both families.
-_SUPPORTED_ARCHS = (Arch.SM100, Arch.SM120)
+# Thread-local keyed BLAKE3 and e4m3 conversion only: one source for every family.
+_SUPPORTED_ARCHS = (Arch.SM90, Arch.SM100, Arch.SM120)
 
 _compile_cache: dict[tuple, object] = {}
 

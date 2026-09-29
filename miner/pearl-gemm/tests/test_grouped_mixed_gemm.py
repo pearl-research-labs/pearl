@@ -34,10 +34,14 @@ _EASY_THRESHOLD = (1 << 256) - 1  # every publishable tile wins
 _FOLD_MUL = 0x9E3779B1
 
 # CTA tile shapes every test runs under, per family. SM100: the 1-SM 128x128
-# tile and the 2-CTA 128x256-per-CTA tile (256x256 per pair). SM120: the
-# 128x128 and 128x256 tiles. Every lottery observable must be identical
-# across them.
+# tile and the 2-CTA 128x256-per-CTA tile (256x256 per pair). SM90: the
+# 128x128 and 256x128 tiles. SM120: the 128x128 and 128x256 tiles. Every
+# lottery observable must be identical across them.
 _FAMILY_TILE_SHAPES = {
+    Arch.SM90: {
+        "m128": {"mma_sm": 1, "tile_n": 128},
+        "m256": {"mma_sm": 2, "tile_n": 128},
+    },
     Arch.SM100: {
         "sm1_n128": {"mma_sm": 1, "tile_n": 128},
         "sm2_n256": {"mma_sm": 2, "tile_n": 256},
@@ -48,10 +52,13 @@ _FAMILY_TILE_SHAPES = {
     },
 }
 _TILE_SHAPES = _FAMILY_TILE_SHAPES[arch_of()]
-_ON_SM120 = arch_of() is Arch.SM120
-_SM120_STATIC_ONLY = "SM120 runs the static schedule in expert order (no dynamic / group_order)"
-# SM120 runs only the static schedule, in expert order.
-_SCHEDULERS = ["static"] if _ON_SM120 else ["static", "dynamic"]
+# The fused SM90 / SM120 kernels run only the static schedule, in expert order.
+_FUSED = arch_of() in (Arch.SM90, Arch.SM120)
+_FUSED_STATIC_ONLY = (
+    "the fused SM90 / SM120 kernels run the static schedule in expert order "
+    "(no dynamic / group_order)"
+)
+_SCHEDULERS = ["static"] if _FUSED else ["static", "dynamic"]
 
 
 @pytest.fixture(autouse=True, params=list(_TILE_SHAPES), ids=list(_TILE_SHAPES))
@@ -323,7 +330,7 @@ def test_first_winner_matches_expert_local_lottery(case, scheduler):
     assert _winner(hit_signal) is None
 
 
-@pytest.mark.skipif(_ON_SM120, reason=_SM120_STATIC_ONLY)
+@pytest.mark.skipif(_FUSED, reason=_FUSED_STATIC_ONLY)
 def test_dynamic_schedule_matches_static_on_every_lottery_observable():
     """More tiles than SMs with skewed experts: the dynamic schedule (and the
     LPT visiting order) reproduce the static output and the single winner bit
@@ -690,7 +697,8 @@ def test_is_cuda_graph_capturable(scheduler):
 
 def test_auto_config_selects_the_tile_by_average_tokens_per_group():
     """SM100 widens to the 2-CTA 256-wide tile from ``WIDE_TILE_MIN_TOKENS_PER_GROUP``
-    tokens per expert; SM120 always takes the 128x128 tile."""
+    tokens per expert; SM90 widens to the 256x128 tile by the same rule; SM120
+    always takes the 128x128 tile."""
     e = 32
     auto = GroupedMixedGemmConfig.auto
     below, at = WIDE_TILE_MIN_TOKENS_PER_GROUP * e - 1, WIDE_TILE_MIN_TOKENS_PER_GROUP * e
@@ -701,6 +709,8 @@ def test_auto_config_selects_the_tile_by_average_tokens_per_group():
     )
     # Explicit tile knobs override the rule instead of clashing with it.
     assert auto(at, e, arch=Arch.SM100, mma_sm=1, tile_n=128) == GroupedMixedGemmConfig()
+    assert auto(below, e, arch=Arch.SM90) == GroupedMixedGemmConfig()
+    assert auto(at, e, arch=Arch.SM90) == GroupedMixedGemmConfig(mma_sm=2)
     assert auto(at, e, arch=Arch.SM120) == GroupedMixedGemmConfig()
     with pytest.raises(ValueError, match="tile_n"):
         GroupedMixedGemmConfig(tile_n=192)
@@ -771,17 +781,23 @@ def test_missing_output_operand_raises():
         )
 
 
-def test_sm120_rejects_the_cta_pair_and_other_schedules():
-    if not _ON_SM120:
+def test_fused_kernels_reject_unsupported_tiles_and_schedules():
+    if not _FUSED:
         pytest.skip("SM100 runs the 2-CTA pair and every schedule")
     inputs = _make_inputs([4, 4], 128, 512, seed=67)
     order = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
+    # A knob the tile-shape fixture does not override.
+    unsupported_tile = (
+        GroupedMixedGemmConfig(mma_sm=2)
+        if arch_of() is Arch.SM120
+        else GroupedMixedGemmConfig(ltile_rows=16, ltile_cols=32)
+    )
     for config, group_order in (
-        (GroupedMixedGemmConfig(mma_sm=2), None),
+        (unsupported_tile, None),
         (GroupedMixedGemmConfig(scheduler="dynamic"), None),
         (None, order),
     ):
-        with pytest.raises(ValueError, match="no CTA pairs"):
+        with pytest.raises(ValueError, match="static schedule in expert order"):
             _run(inputs, config=config, group_order=group_order)
 
 
@@ -795,7 +811,7 @@ def test_malformed_indptr_and_group_order_stay_in_bounds():
     )
     order = torch.tensor([7, -1, 2, 2], dtype=torch.int32, device="cuda")
     launches = [(None, None)]
-    if not _ON_SM120:
+    if not _FUSED:
         launches += [(None, order), (GroupedMixedGemmConfig(scheduler="dynamic"), order)]
     for config, group_order in launches:
         _run(inputs, config=config, group_order=group_order)

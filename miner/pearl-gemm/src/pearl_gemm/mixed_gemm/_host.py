@@ -13,20 +13,25 @@ from .._utils._compile import get_or_compile
 from .._utils._stream import get_stream
 from .._utils._validation import require_tensor
 from ..pow import HIT_PAYLOAD_K_ALIGN, HitSignal
-from ..protocol_constants import BLOCK_SCALE_GROUP
-from ._kernel import (
-    _EPI_THREADS,
+from ..protocol_constants import BLOCK_SCALE_GROUP, SM90_PROMOTE_K
+from ._kernel import _EPI_THREADS, _FusedGemmSm100, cta_tile_m
+from ._kernel_sm90 import (
+    _MAX_ACC_REGS,
+    SM90_TILE_NS,
+    WGMMA_M,
+    _accumulator_registers,
+    _FusedGemmSm90,
+)
+from ._kernel_sm120 import _FusedGemmSm120
+from ._lottery import (
     DEFAULT_LTILE_COLS,
     DEFAULT_LTILE_ROWS,
     R2,
     SUPPORTED_LTILE_COLS,
     SUPPORTED_LTILE_ROWS,
-    _FusedGemmSm100,
-    cta_tile_m,
 )
-from ._kernel_sm120 import _FusedGemmSm120
 
-_SUPPORTED_ARCHS = (Arch.SM100, Arch.SM120)
+_SUPPORTED_ARCHS = (Arch.SM90, Arch.SM100, Arch.SM120)
 
 
 @dataclass(frozen=True)
@@ -44,10 +49,13 @@ class MixedGemmConfig:
     ltile_rows: int = DEFAULT_LTILE_ROWS
 
 
-# Per-family library defaults: the SM100 2-CTA pair tile and the SM120
-# single-CTA 128-row tile (SM120 has no clusters and its accumulator lives in
-# eight mma warps). Frozen, so one instance per family is safe to share.
+# Per-family library defaults: the SM100 2-CTA pair tile, the same 256x128
+# tile on a 1x1 cluster on SM90 (whole-tile CTAs cannot assume the 2x1
+# cluster's even CTA-row count), and the SM120 single-CTA 128-row tile (SM120
+# has no clusters and its accumulator lives in eight mma warps). Frozen, so
+# one instance per family is safe to share.
 _DEFAULT_CONFIGS: dict[Arch, MixedGemmConfig] = {
+    Arch.SM90: MixedGemmConfig(tile_m=256, tile_n=128, cluster_m=1, cluster_n=1),
     Arch.SM100: MixedGemmConfig(),
     Arch.SM120: MixedGemmConfig(tile_m=128, tile_n=128, cluster_m=1, cluster_n=1),
 }
@@ -62,6 +70,7 @@ def default_mixed_gemm_config(arch: Arch | None = None) -> MixedGemmConfig:
 # mma.sync fragments split every accumulator row across four lanes, so it cannot
 # fold the tall 16-row tile (see ``_validate_tile_shape_sm120``).
 _LOTTERY_ROWS: dict[Arch, frozenset[int]] = {
+    Arch.SM90: frozenset({4}),
     Arch.SM100: frozenset({4, 16}),
     Arch.SM120: frozenset({4}),
 }
@@ -97,10 +106,51 @@ def _validate_tile_shape(config: MixedGemmConfig, arch: Arch) -> None:
         raise ValueError(
             f"tile_k must be an int, got {config.tile_k!r} ({type(config.tile_k).__name__})"
         )
-    if arch is Arch.SM120:
+    if arch is Arch.SM90:
+        _validate_tile_shape_sm90(config)
+    elif arch is Arch.SM120:
         _validate_tile_shape_sm120(config)
     else:
         _validate_tile_shape_sm100(config)
+
+
+def _sm90_atom_m(config: MixedGemmConfig) -> int:
+    """Quack GemmSm90's atom_layout M (consumer warpgroups) for the tile shapes
+    this host admits."""
+    return 1 if config.tile_m == WGMMA_M else 2
+
+
+def sm90_accumulator_registers(config: MixedGemmConfig) -> int:
+    """Per-thread fp32 accumulator registers of the promoted mainloop."""
+    return _accumulator_registers(config.tile_m, config.tile_n, _sm90_atom_m(config))
+
+
+def _validate_tile_shape_sm90(config: MixedGemmConfig) -> None:
+    """SM90 tile shape limits (WGMMA warpgroup layouts, register budget)."""
+    if config.ltile_rows != 4:
+        # WGMMA fragments split accumulator rows across four lanes at mod-8
+        # column-pair granularity, so no thread can fold a 16-row-family
+        # word thread-locally.
+        raise ValueError("the SM90 lottery implements only the 4-row lottery family")
+    if config.tile_m not in (64, 128, 256):
+        # 192 needs three consumer warpgroups (192x128) or an N-split atom
+        # layout (192x192); _FusedGemmSm90 asserts against both.
+        raise ValueError("SM90 tile_m must be 64, 128, or 256")
+    if config.tile_n not in SM90_TILE_NS:
+        raise ValueError(f"SM90 tile_n must be one of {SM90_TILE_NS}")
+    acc_regs = sm90_accumulator_registers(config)
+    if acc_regs > _MAX_ACC_REGS:
+        raise ValueError(
+            f"SM90 tile {config.tile_m}x{config.tile_n} needs {acc_regs} accumulator "
+            f"registers per thread (FP32 total + 64-row promotion window); at most "
+            f"{_MAX_ACC_REGS} fit beside the consumer's other state"
+        )
+    if config.tile_k is not None and config.tile_k != SM90_PROMOTE_K:
+        # One k-tile is one promotion window of the Hopper device model
+        # (4 x 32 terms, then C <- RNE(C + c); the verifier's H100 replay).
+        raise ValueError(f"SM90 tile_k must be None or {SM90_PROMOTE_K} (the FP8 promotion window)")
+    if config.cluster_m & (config.cluster_m - 1) or config.cluster_n & (config.cluster_n - 1):
+        raise ValueError("SM90 cluster dimensions must be powers of 2")
 
 
 def _validate_tile_shape_sm120(config: MixedGemmConfig) -> None:
@@ -187,10 +237,12 @@ def validate_mixed_gemm_config(
     n: int,
     k: int,
     config: MixedGemmConfig,
-    device_capability: tuple[int, int] | None = None,
+    *,
+    arch: Arch | None = None,
 ) -> None:
-    """Validate a config for the given (default: current) device's kernel family."""
-    arch = arch_of(device_capability)
+    """Validate a config for ``arch``'s kernel family (the current device's
+    when omitted)."""
+    arch = arch_of() if arch is None else arch
     if arch not in _SUPPORTED_ARCHS:
         raise ValueError(f"mixed_gemm has no kernel for {arch.name}")
     if m <= 0 or n <= 0 or k <= 0:
@@ -210,7 +262,7 @@ def validate_mixed_gemm_config(
         )
     # On SM100, tile_m=256 selects the 2-CTA UMMA pair when cluster_m is even
     # (128-row CTAs either way) and tile_m=64 runs the 64-row 1-CTA kernel. On
-    # SM120 every CTA owns the whole tile_m.
+    # SM90 and SM120 every CTA owns the whole tile_m.
     cta_m = cta_tile_m(config.tile_m) if arch is Arch.SM100 else config.tile_m
     m_tiles = -(-m // cta_m)
     n_tiles = -(-n // config.tile_n)
@@ -235,6 +287,8 @@ def _fused_kernel(arch: Arch, config: MixedGemmConfig, *, snapshot_payload: bool
         return _FusedGemmSm100(
             cluster_m=config.cluster_m, cluster_n=config.cluster_n, **tile_kwargs
         )
+    if arch is Arch.SM90:
+        return _FusedGemmSm90(cluster_m=config.cluster_m, cluster_n=config.cluster_n, **tile_kwargs)
     # Validated to cluster 1x1: the SM120 kernel has no cluster mode.
     return _FusedGemmSm120(**tile_kwargs)
 
@@ -362,7 +416,7 @@ def mixed_gemm(
     device_capability = torch.cuda.get_device_capability(device)
     if config is None:
         config = default_mixed_gemm_config(arch)
-    validate_mixed_gemm_config(m, n, k, config, device_capability)
+    validate_mixed_gemm_config(m, n, k, config, arch=arch)
     _validate_output_operands(
         {
             "out": out,

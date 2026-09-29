@@ -141,7 +141,8 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
     started = time.monotonic()
 
     key_a, key_b = layer_job_keys(job)
-    threshold = _as_bytes_tensor(threshold_bytes_for(job, state.k, state.lottery_n))
+    device = state.committed_device
+    threshold = _as_bytes_tensor(threshold_bytes_for(job, state.k, state.lottery_n, device=device))
     with state.lock:
         current = state.job_ctx
     if current is not None and (current.key_a, current.key_b) == (key_a, key_b):
@@ -152,7 +153,7 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
         _LOGGER.debug(f"{state.layer_name}: target-only refresh (target={job.target})")
         return ctx
 
-    config = mining_configuration(state.k, state.n, state.experts)
+    config = mining_configuration(state.k, state.n, state.experts, device=device)
     p_b = config.p_b(state.n)
     seed_b = _prepare_b_on_gpu(state, key_a, key_b, p_b, buffers)
     buffers.threshold_dev.copy_(threshold)

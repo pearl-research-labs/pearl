@@ -87,8 +87,8 @@ def get_required_scratchpad_bytes(
 
 
 # The kernels are TMA + mbarrier pipelines with plain-ALU BLAKE3 and run on
-# both Blackwell families; only the shared-memory budget differs between them.
-_SUPPORTED_ARCHS = (Arch.SM100, Arch.SM120)
+# every family; only the shared-memory budget differs between them.
+_SUPPORTED_ARCHS = (Arch.SM90, Arch.SM100, Arch.SM120)
 
 # Headroom under an architecture's opt-in shared-memory maximum for what
 # ``tensor_hash_smem_fits`` does not model (barriers, TMA descriptors,

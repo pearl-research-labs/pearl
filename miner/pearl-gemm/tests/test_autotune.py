@@ -6,12 +6,15 @@ from dataclasses import fields
 import pytest
 
 from pearl_gemm import TensorHashConfig, get_tensor_hash_plus_stats_config
+from pearl_gemm._utils._arch import Arch, arch_of
 from pearl_gemm.autotune import (
     SMALL_M_LIMIT,
     TUNERS,
     _stats_chunk_sizes,
     _sweep,
     autotune,
+    committed_lottery,
+    config_path,
     get_tuned,
     merge_records,
     mixed_gemm_space,
@@ -35,30 +38,81 @@ from pearl_gemm.tensor_hash_plus_stats._merkle_tree_roots_kernel import (
 )
 
 
+def test_committed_lottery_skips_tall_tile_on_sm90():
+    # n=96 is 32-aligned but not 64-aligned: Blackwell's 16x32 family, which
+    # Hopper has no kernel for. The helper still returns 4x128.
+    assert committed_lottery(96, 1024, Arch.SM90) == (4, 128)
+    assert committed_lottery(96, 1024, Arch.SM100) == (16, 32)
+    assert committed_lottery(96, 1024) == committed_lottery(96, 1024, arch_of())
+
+
+def test_mixed_gemm_sweep_space_uses_the_target_arch_lottery():
+    """A cross-architecture sweep walks the target's committed lottery, not the host's."""
+    assert all(
+        cfg.get("ltile_rows") == 16 for cfg in mixed_gemm_sweep_space(4096, 96, 1024, Arch.SM100)
+    )
+    hopper = mixed_gemm_sweep_space(4096, 96, 1024, Arch.SM90)
+    assert hopper and all("ltile_rows" not in cfg for cfg in hopper)
+
+
 def test_mixed_gemm_space_filters_tile_n_by_lottery_width():
-    wide = mixed_gemm_space(4, 128)
+    wide = mixed_gemm_space(4, 128, Arch.SM100)
     assert {cfg["tile_n"] for cfg in wide} == {128, 256}
     assert all("ltile_cols" not in cfg for cfg in wide)
 
-    narrow = mixed_gemm_space(4, 64)
+    narrow = mixed_gemm_space(4, 64, Arch.SM100)
     assert {cfg["tile_n"] for cfg in narrow} == {64, 128, 192, 256}
     assert all(cfg["ltile_cols"] == 64 for cfg in narrow)
     assert all(cfg["tile_n"] % 64 == 0 for cfg in narrow)
 
-    tall = mixed_gemm_space(16, 32)
+    tall = mixed_gemm_space(16, 32, Arch.SM100)
     assert {cfg["tile_n"] for cfg in tall} == {32, 64, 96, 128, 160, 192, 224, 256}
     assert all(cfg["ltile_cols"] == 32 and cfg["ltile_rows"] == 16 for cfg in tall)
     assert all(cfg["tile_n"] % 32 == 0 for cfg in tall)
 
 
+def test_sm90_mixed_gemm_space_is_the_register_legal_lattice():
+    """SM90's promoted mainloop caps tile_n at 192, drops the corner over the
+    accumulator budget (256x192), and has no 16-row fold to sweep."""
+    from pearl_gemm import MixedGemmConfig
+    from pearl_gemm.mixed_gemm._host import sm90_accumulator_registers
+    from pearl_gemm.mixed_gemm._kernel_sm90 import _MAX_ACC_REGS
+
+    wide = mixed_gemm_space(4, 128, Arch.SM90)
+    assert {cfg["tile_n"] for cfg in wide} == {128}
+    assert {cfg["tile_m"] for cfg in wide} == {64, 128, 256}
+    assert all("ltile_cols" not in cfg for cfg in wide)
+
+    narrow = mixed_gemm_space(4, 64, Arch.SM90)
+    assert {cfg["tile_n"] for cfg in narrow} == {128, 192}
+    assert all(cfg["ltile_cols"] == 64 for cfg in narrow)
+    assert (256, 192) not in {(cfg["tile_m"], cfg["tile_n"]) for cfg in narrow}
+    assert all(
+        sm90_accumulator_registers(MixedGemmConfig(**cfg)) <= _MAX_ACC_REGS for cfg in narrow
+    )
+
+    assert mixed_gemm_space(16, 32, Arch.SM90) == []
+
+
 def test_small_m_sweep_includes_routed_64_row_tile():
-    routed = route_small_m_mixed_gemm(64, 576, 6144, ltile_rows=4, ltile_cols=64)
+    routed = route_small_m_mixed_gemm(64, 576, 6144, ltile_rows=4, ltile_cols=64, arch=Arch.SM100)
     assert routed is not None
-    space = mixed_gemm_sweep_space(64, 576, 6144)
+    space = mixed_gemm_sweep_space(64, 576, 6144, Arch.SM100)
     assert dict(routed) in space
-    assert all(cfg.get("tile_m") != 64 for cfg in mixed_gemm_space(4, 64))
+    assert all(cfg.get("tile_m") != 64 for cfg in mixed_gemm_space(4, 64, Arch.SM100))
     # Prefill m is outside the route, so the 64-row tile stays out.
-    assert all(cfg.get("tile_m") != 64 for cfg in mixed_gemm_sweep_space(4096, 576, 6144))
+    assert all(
+        cfg.get("tile_m") != 64 for cfg in mixed_gemm_sweep_space(4096, 576, 6144, Arch.SM100)
+    )
+    # The SM90 lattice carries the 64-row tiles itself, so the routed tile is
+    # already a lattice point (records omit default fields: compare configs).
+    from pearl_gemm import MixedGemmConfig
+
+    hopper = route_small_m_mixed_gemm(64, 576, 6144, ltile_rows=4, ltile_cols=64, arch=Arch.SM90)
+    assert MixedGemmConfig(**hopper) in {
+        MixedGemmConfig(**cfg) for cfg in mixed_gemm_space(4, 64, Arch.SM90)
+    }
+    assert dict(hopper) in mixed_gemm_sweep_space(64, 576, 6144, Arch.SM90)
 
 
 def test_autotune_kernels_subset_skips_other_tuners(monkeypatch, tmp_path):
@@ -99,7 +153,8 @@ def test_autotune_kernels_subset_skips_other_tuners(monkeypatch, tmp_path):
 def test_route_small_m_mixed_gemm_routes_to_the_64_row_tile():
     """Small-m routing: (64, 64) for the 64-wide lottery, (64, ltile_cols)
     otherwise, and None whenever the committed geometry or shape cannot run it."""
-    routed = route_small_m_mixed_gemm(64, 2752, 6144, ltile_rows=4, ltile_cols=64)
+    sm100 = Arch.SM100
+    routed = route_small_m_mixed_gemm(64, 2752, 6144, ltile_rows=4, ltile_cols=64, arch=sm100)
     assert routed == {
         "tile_m": 64,
         "tile_n": 64,
@@ -109,25 +164,91 @@ def test_route_small_m_mixed_gemm_routes_to_the_64_row_tile():
         "ltile_cols": 64,
     }
     # 128-wide committed lottery: the narrowest tile_n it divides.
-    wide = route_small_m_mixed_gemm(128, 4096, 4096, ltile_rows=4, ltile_cols=128)
+    wide = route_small_m_mixed_gemm(128, 4096, 4096, ltile_rows=4, ltile_cols=128, arch=sm100)
     assert (wide["tile_m"], wide["tile_n"], wide["ltile_cols"]) == (64, 128, 128)
     # The limit is inclusive; above it the saved records stay in charge.
-    at_limit = route_small_m_mixed_gemm(SMALL_M_LIMIT, 2752, 6144, ltile_rows=4, ltile_cols=64)
+    at_limit = route_small_m_mixed_gemm(
+        SMALL_M_LIMIT[sm100], 2752, 6144, ltile_rows=4, ltile_cols=64, arch=sm100
+    )
     assert (at_limit["tile_m"], at_limit["tile_n"]) == (64, 64)
     assert (
-        route_small_m_mixed_gemm(SMALL_M_LIMIT + 64, 2752, 6144, ltile_rows=4, ltile_cols=64)
+        route_small_m_mixed_gemm(
+            SMALL_M_LIMIT[sm100] + 64, 2752, 6144, ltile_rows=4, ltile_cols=64, arch=sm100
+        )
         is None
     )
     # The 16-row lottery family cannot run a 64-row kernel tile.
-    assert route_small_m_mixed_gemm(64, 2752, 6144, ltile_rows=16, ltile_cols=32) is None
+    assert (
+        route_small_m_mixed_gemm(64, 2752, 6144, ltile_rows=16, ltile_cols=32, arch=sm100) is None
+    )
     # Shapes the routed config cannot launch fall back to the records.
-    assert route_small_m_mixed_gemm(64, 100, 6144, ltile_rows=4, ltile_cols=64) is None
-    assert route_small_m_mixed_gemm(64, 2752, 1000, ltile_rows=4, ltile_cols=64) is None
+    assert route_small_m_mixed_gemm(64, 100, 6144, ltile_rows=4, ltile_cols=64, arch=sm100) is None
+    assert route_small_m_mixed_gemm(64, 2752, 1000, ltile_rows=4, ltile_cols=64, arch=sm100) is None
     # Hot-path LRU: repeated resolution returns the cached object, which is
     # therefore shared and immutable (a mutation would poison the cache).
-    assert route_small_m_mixed_gemm(64, 2752, 6144, ltile_rows=4, ltile_cols=64) is routed
+    assert (
+        route_small_m_mixed_gemm(64, 2752, 6144, ltile_rows=4, ltile_cols=64, arch=sm100) is routed
+    )
     with pytest.raises(TypeError):
         routed["tile_m"] = 128
+
+
+def test_route_small_m_is_keyed_by_arch():
+    """SM90 routes to the 64-row tile at tile_n at least 128 (WGMMA's narrowest
+    legal width) and only up to its lower small-m limit; the families must not
+    share an LRU entry."""
+    hopper = route_small_m_mixed_gemm(64, 2752, 6144, ltile_rows=4, ltile_cols=64, arch=Arch.SM90)
+    blackwell = route_small_m_mixed_gemm(
+        64, 2752, 6144, ltile_rows=4, ltile_cols=64, arch=Arch.SM100
+    )
+    assert (hopper["tile_m"], hopper["tile_n"]) == (64, 128)
+    assert (blackwell["tile_m"], blackwell["tile_n"]) == (64, 64)
+    wide = route_small_m_mixed_gemm(
+        SMALL_M_LIMIT[Arch.SM90], 4096, 4096, ltile_rows=4, ltile_cols=128, arch=Arch.SM90
+    )
+    assert (wide["tile_m"], wide["tile_n"], wide["ltile_cols"]) == (64, 128, 128)
+    assert SMALL_M_LIMIT[Arch.SM90] < SMALL_M_LIMIT[Arch.SM100]
+    assert (
+        route_small_m_mixed_gemm(
+            SMALL_M_LIMIT[Arch.SM90] + 64, 4096, 4096, ltile_rows=4, ltile_cols=128, arch=Arch.SM90
+        )
+        is None
+    )
+    # Omitting ``arch`` resolves the current device's family.
+    assert route_small_m_mixed_gemm(
+        64, 2752, 6144, ltile_rows=4, ltile_cols=64
+    ) is route_small_m_mixed_gemm(64, 2752, 6144, ltile_rows=4, ltile_cols=64, arch=arch_of())
+
+
+def test_config_path_aliases_h200_to_the_h100_records():
+    h100 = config_path("nvidia_h100_80gb_hbm3")
+    assert h100.exists()
+    assert config_path("nvidia_h200") == h100
+    assert config_path("nvidia_h200_nvl") == h100
+    missing = config_path("nvidia_unknown_gpu")
+    assert not missing.exists()
+
+
+def test_h100_records_are_legal_on_sm90():
+    """The shipped H100 records validate on the family they were swept on."""
+    from pearl_gemm import (
+        MixedGemmConfig,
+        NoisyQuantConfig,
+        validate_mixed_gemm_config,
+        validate_noisy_quant_config,
+    )
+    from pearl_gemm.autotune import load_config
+
+    records = load_config("nvidia_h100_80gb_hbm3")
+    assert records["mixed_gemm"] and records["noisy_quant"]
+    for record in records["mixed_gemm"]:
+        shape = record["shape"]
+        config = MixedGemmConfig(**get_tuned("mixed_gemm", {"mixed_gemm": [record]}, **shape))
+        validate_mixed_gemm_config(shape["m"], shape["n"], shape["k"], config, arch=Arch.SM90)
+    for record in records["noisy_quant"]:
+        shape = record["shape"]
+        config = NoisyQuantConfig(**get_tuned("noisy_quant", {"noisy_quant": [record]}, **shape))
+        validate_noisy_quant_config(shape["m"], shape["k"], config, Arch.SM90)
 
 
 def test_get_tuned_prefers_exact_then_nearest_shape():

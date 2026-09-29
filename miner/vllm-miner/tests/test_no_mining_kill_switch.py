@@ -21,6 +21,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import vllm_miner.capture as gcs
+from miner_base.commitment import Device
 from miner_base.settings import MinerSettings
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
@@ -382,6 +383,7 @@ def test_pipeline_warmup_reports_completion_or_stops(
         k=_K,
         experts=0,
         top_k=0,
+        committed_device=Device.BLACKWELL,
         layer_name="test.mined.layer",
         layer_id=1,
     )

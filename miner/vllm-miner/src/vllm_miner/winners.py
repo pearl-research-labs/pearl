@@ -75,7 +75,9 @@ def _matching_context(
     if hit.commitment_hash_B != ctx.seed_b:
         _LOGGER.info(f"dropping stale B seed for {state.layer_name}")
         return None
-    if hit.target != threshold_bytes_for(ctx.job, state.k, state.lottery_n):
+    if hit.target != threshold_bytes_for(
+        ctx.job, state.k, state.lottery_n, device=ctx.config.device
+    ):
         _LOGGER.info(f"dropping stale target for {state.layer_name}")
         return None
     if moe is None and (hit.codes is None or hit.scales is None):

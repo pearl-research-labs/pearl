@@ -33,7 +33,7 @@ from pearl_gemm import (
 from pearl_gemm._utils._arch import Arch, arch_of
 from pearl_gemm.protocol_constants import R
 from tests.helpers.chain import KEY_A, SEED_B, device_bytes, f_bases
-from tests.helpers.digests import digest, fixture_input, reference_digests
+from tests.helpers.digests import blackwell_digests, digest, fixture_input
 
 
 def _rel(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -132,7 +132,7 @@ def _assert_b_chain_matches_pinned(
     config = NoisyQuantBConfig(**(config_fields or {}))
     got = _launch_b(codes, scales, commit_stats, seed_b, f1, f2, config)
 
-    expected = reference_digests()["noisy_quant_b"][case]
+    expected = blackwell_digests("noisy_quant_b")[case]
     assert digest(got["e2"]) == expected["e2"], "E_B codes"
     assert digest(got["alpha_b"]) == expected["alpha_b"], "alpha_b"
     assert digest(got["beta_b"]) == expected["beta_b"], "beta_b"

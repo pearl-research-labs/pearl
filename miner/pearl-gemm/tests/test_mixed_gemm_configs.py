@@ -85,6 +85,18 @@ _SM100_PER_MODEL_CONFIGS = [
     },
 ]
 
+# SM90 has tile_n >= 128 and only the 4-row family.
+_SM90_PER_MODEL_CONFIGS = [
+    {"tile_m": 256, "tile_n": 128, "cluster_m": 2, "cluster_n": 1, "tile_k": 128},
+    {"tile_m": 128, "tile_n": 128, "cluster_m": 1, "cluster_n": 1},
+    {"tile_m": 128, "tile_n": 192, "cluster_m": 2, "cluster_n": 1, "ltile_cols": 64},
+    {"tile_m": 256, "tile_n": 128, "cluster_m": 2, "cluster_n": 2, "ltile_cols": 64},
+    {"tile_m": 128, "tile_n": 192, "cluster_m": 1, "cluster_n": 1, "ltile_cols": 192},
+    {"tile_m": 64, "tile_n": 128, "cluster_m": 1, "cluster_n": 1, "ltile_cols": 64},
+    {"tile_m": 64, "tile_n": 128, "cluster_m": 1, "cluster_n": 1},
+    {"tile_m": 64, "tile_n": 128, "cluster_m": 2, "cluster_n": 1},
+]
+
 _SM120_PER_MODEL_CONFIGS = [
     {"tile_m": 128, "tile_n": 128, "cluster_m": 1, "cluster_n": 1, "tile_k": 128},
     {"tile_m": 128, "tile_n": 192, "cluster_m": 1, "cluster_n": 1, "ltile_cols": 64},
@@ -96,6 +108,7 @@ _SM120_PER_MODEL_CONFIGS = [
 ]
 
 _PER_MODEL_CONFIGS = {
+    Arch.SM90: _SM90_PER_MODEL_CONFIGS,
     Arch.SM100: _SM100_PER_MODEL_CONFIGS,
     Arch.SM120: _SM120_PER_MODEL_CONFIGS,
 }[_ARCH]
@@ -202,6 +215,13 @@ def test_consistency_across_tuning_space(inputs, config_fields):
         assert torch.equal(out, out_first)
 
 
+# Host-only validation, so every family's rejections run on any machine.
+_FAMILIES = pytest.mark.parametrize(
+    "arch", [Arch.SM90, Arch.SM100, Arch.SM120], ids=lambda arch: arch.name.lower()
+)
+
+
+@_FAMILIES
 @pytest.mark.parametrize(
     "m,n,k,config,match",
     [
@@ -232,47 +252,77 @@ def test_consistency_across_tuning_space(inputs, config_fields):
         (512, 256, 512, {"cluster_m": True}, "cluster_m must be an int"),
         (512, 256, 512, {"tile_k": 64.0}, "tile_k must be an int"),
         (512, 256, 512, {"cluster_m": 0}, "cluster"),
-        # SM100 rejects the non-power-of-2 cluster; SM120 rejects any cluster.
+        # SM90/SM100 reject the non-power-of-2 cluster; SM120 rejects any cluster.
         (512, 256, 512, {"cluster_m": 3}, "powers of 2|no thread-block clusters"),
         (512, 256, 513, {}, "divisible by 64"),
         (513, 256, 512, {}, "lottery tiles"),
         (512, 130, 512, {}, "lottery tiles"),
     ],
 )
-def test_invalid_configurations_are_rejected(m, n, k, config, match):
+def test_invalid_configurations_are_rejected(arch, m, n, k, config, match):
     """One field at a time on top of the family default, so the rejection names
     the field under test rather than another family's tile."""
     with pytest.raises(ValueError, match=match):
-        validate_mixed_gemm_config(m, n, k, replace(default_mixed_gemm_config(_ARCH), **config))
+        validate_mixed_gemm_config(
+            m, n, k, replace(default_mixed_gemm_config(arch), **config), arch=arch
+        )
+
+
+@pytest.mark.parametrize(
+    "m,n,k,config,match",
+    [
+        # Over the promoted mainloop's accumulator register budget.
+        (512, 384, 512, {"tile_m": 256, "tile_n": 192, "ltile_cols": 64}, "accumulator"),
+        # One k-tile is one promotion window of the verifier's H100 arithmetic.
+        (512, 256, 512, {"tile_k": 160}, "promotion window"),
+        (512, 256, 512, {"tile_k": 256}, "promotion window"),
+        # WGMMA's fused epilogue and register budget admit tile_n 128 and 192.
+        (512, 256, 512, {"tile_n": 256}, "SM90 tile_n"),
+        (512, 256, 512, {"tile_n": 64, "ltile_cols": 64}, "SM90 tile_n"),
+    ],
+)
+def test_invalid_sm90_configurations_are_rejected(m, n, k, config, match):
+    """The promoted SM90 mainloop's own limits, on top of the Hopper default."""
+    with pytest.raises(ValueError, match=match):
+        validate_mixed_gemm_config(
+            m, n, k, replace(default_mixed_gemm_config(Arch.SM90), **config), arch=Arch.SM90
+        )
 
 
 def test_tall_tile_config_and_legacy_positional_configs_validate():
     """``MixedGemmConfig`` is public API: ``ltile_rows`` is appended after
     ``ltile_cols`` so existing positional constructions keep their meaning.
     Validation is per family: SM100 runs the legacy 2-CTA default and the tall
-    tile, SM120 (no clusters, no whole-row fold) rejects both."""
+    tile, SM120 (no clusters, no whole-row fold) rejects both, and SM90 runs
+    the legacy default but not the tall tile."""
     legacy = MixedGemmConfig(256, 128, None, 2, 1, 128)
     assert (legacy.ltile_cols, legacy.ltile_rows) == (128, 4)
     tall = MixedGemmConfig(ltile_rows=16, ltile_cols=32)
-    sm100 = (10, 0)
-    validate_mixed_gemm_config(256, 6144, 12288, legacy, device_capability=sm100)
+    validate_mixed_gemm_config(256, 6144, 12288, legacy, arch=Arch.SM100)
     # The tall tile is what makes k=16384 (GLM o_proj) verifiable.
-    validate_mixed_gemm_config(256, 6144, 16384, tall, device_capability=sm100)
+    validate_mixed_gemm_config(256, 6144, 16384, tall, arch=Arch.SM100)
     # Gemma-3 31B q/k/v and o_proj use k=5376: 64-aligned, not 512-aligned.
-    validate_mixed_gemm_config(256, 128, 5376, MixedGemmConfig(), device_capability=sm100)
-    sm120 = (12, 0)
+    validate_mixed_gemm_config(256, 128, 5376, MixedGemmConfig(), arch=Arch.SM100)
     sm120_default = default_mixed_gemm_config(Arch.SM120)
     with pytest.raises(ValueError, match="SM120 tile_m"):
-        validate_mixed_gemm_config(256, 6144, 12288, legacy, device_capability=sm120)
+        validate_mixed_gemm_config(256, 6144, 12288, legacy, arch=Arch.SM120)
     with pytest.raises(ValueError, match="4-row lottery family"):
         validate_mixed_gemm_config(
             256,
             6144,
             16384,
             replace(sm120_default, ltile_rows=16, ltile_cols=32),
-            device_capability=sm120,
+            arch=Arch.SM120,
         )
-    validate_mixed_gemm_config(256, 128, 5376, sm120_default, device_capability=sm120)
+    validate_mixed_gemm_config(256, 128, 5376, sm120_default, arch=Arch.SM120)
+    sm90_default = default_mixed_gemm_config(Arch.SM90)
+    # Whole-tile SM90 CTAs: the legacy 2x1 cluster needs an even CTA-row count.
+    validate_mixed_gemm_config(512, 6144, 12288, legacy, arch=Arch.SM90)
+    with pytest.raises(ValueError, match="4-row lottery family"):
+        validate_mixed_gemm_config(256, 6144, 16384, tall, arch=Arch.SM90)
+    validate_mixed_gemm_config(256, 128, 5376, sm90_default, arch=Arch.SM90)
+    # The promotion window is the only legal explicit tile_k on SM90.
+    validate_mixed_gemm_config(512, 256, 512, replace(sm90_default, tile_k=128), arch=Arch.SM90)
 
 
 def test_supports_lottery_family_agrees_with_the_validator():
@@ -281,12 +331,12 @@ def test_supports_lottery_family_agrees_with_the_validator():
     a lottery whose kernel the device lacks."""
     from pearl_gemm import supports_lottery_family
 
-    for capability, arch in (((10, 0), Arch.SM100), ((12, 0), Arch.SM120)):
+    for capability, arch in (((9, 0), Arch.SM90), ((10, 0), Arch.SM100), ((12, 0), Arch.SM120)):
         base = default_mixed_gemm_config(arch)
         for rows, cols in ((4, 64), (16, 32)):
             config = replace(base, ltile_rows=rows, ltile_cols=cols)
             try:
-                validate_mixed_gemm_config(256, 6144, 12288, config, device_capability=capability)
+                validate_mixed_gemm_config(256, 6144, 12288, config, arch=arch)
             except ValueError:
                 assert not supports_lottery_family(rows, capability)
             else:

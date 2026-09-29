@@ -34,6 +34,7 @@ from types import MappingProxyType
 
 import torch
 
+from ._utils._arch import Arch, arch_of
 from .protocol_constants import R
 from .tensor_hash_plus_stats import _blake3, _host
 from .tensor_hash_plus_stats._merkle_host import (
@@ -247,32 +248,56 @@ _LOTTERY_MIN_K = 1024
 
 _MIXED_GEMM_TILE_M = (128, 256)
 _MIXED_GEMM_CLUSTERS = ((1, 1), (2, 1), (2, 2))
+# SM90 runs 64/128/256-row tiles on the cooperative warpgroup schedule, so its
+# 64-row tile is a prefill candidate too. Its lattice is filtered by the
+# host's SM90 tile-shape validation, which drops the tile_n values outside
+# ``SM90_TILE_NS`` and the corner over the promoted mainloop's accumulator
+# register budget (256x192).
+_SM90_MIXED_GEMM_TILE_M = (64, 128, 256)
 _MIXED_GEMM_TILE_N_ALIGN = 32
 _MIXED_GEMM_TILE_N_MAX = 256
 
 
-def committed_lottery(n: int, k: int) -> tuple[int, int]:
-    """Return the committed ``(ltile_rows, ltile_cols)`` for ``(n, k)``."""
+def committed_lottery(n: int, k: int, arch: Arch | None = None) -> tuple[int, int]:
+    """Return the committed ``(ltile_rows, ltile_cols)`` for ``(n, k)`` on ``arch``
+    (the current device's family when omitted; without a GPU, no family skip).
+
+    Hopper has no 16x32 family, so SM90 skips it and falls through to 4x128.
+    """
+    if arch is None:
+        skip_tall = (
+            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == Arch.SM90.value
+        )
+    else:
+        skip_tall = arch is Arch.SM90
     if n % 64 == 0 and _LOTTERY_MIN_K <= k <= _LOTTERY_4X64_MAX_K:
         return 4, 64
-    if n % 32 == 0 and _LOTTERY_MIN_K <= k <= _LOTTERY_16X32_MAX_K:
+    if not skip_tall and n % 32 == 0 and _LOTTERY_MIN_K <= k <= _LOTTERY_16X32_MAX_K:
         return 16, 32
     return 4, 128
 
 
-def mixed_gemm_space(ltile_rows: int = 4, ltile_cols: int = 128) -> list[dict]:
-    """Tile/cluster lattice legal for a committed lottery width.
+def mixed_gemm_space(
+    ltile_rows: int = 4, ltile_cols: int = 128, arch: Arch | None = None
+) -> list[dict]:
+    """Tile/cluster lattice legal for a committed lottery width on ``arch``
+    (the current device's family when omitted).
 
     ``tile_n`` steps by ``ltile_cols`` across the host-legal range (multiples
     of 32 in ``[32, 256]``), so a 16x32 job can pick an exact-width 96-column
     CTA rather than a padded 64/128 neighbour. Non-default lottery fields are
     stored on the record so ``get_tuned``'s legal filter can keep 64-wide and
-    128-wide jobs from inheriting each other.
+    128-wide jobs from inheriting each other. On SM90 the candidates its
+    tile-shape validation rejects are dropped here.
     """
+    from .mixed_gemm._host import MixedGemmConfig, _validate_tile_shape
+
+    arch = arch_of() if arch is None else arch
+    tile_ms = _SM90_MIXED_GEMM_TILE_M if arch is Arch.SM90 else _MIXED_GEMM_TILE_M
     space = []
     tile_ns = range(ltile_cols, _MIXED_GEMM_TILE_N_MAX + 1, ltile_cols)
     for tile_m, tile_n, (cluster_m, cluster_n) in itertools.product(
-        _MIXED_GEMM_TILE_M, tile_ns, _MIXED_GEMM_CLUSTERS
+        tile_ms, tile_ns, _MIXED_GEMM_CLUSTERS
     ):
         if tile_n % _MIXED_GEMM_TILE_N_ALIGN:
             continue
@@ -286,6 +311,11 @@ def mixed_gemm_space(ltile_rows: int = 4, ltile_cols: int = 128) -> list[dict]:
             cfg["ltile_cols"] = ltile_cols
         if ltile_rows != 4:
             cfg["ltile_rows"] = ltile_rows
+        if arch is Arch.SM90:
+            try:
+                _validate_tile_shape(MixedGemmConfig(**cfg), arch)
+            except ValueError:
+                continue
         space.append(cfg)
     return space
 
@@ -591,9 +621,26 @@ def device_config_name(device: "torch.device | int | None" = None) -> str:
     return torch.cuda.get_device_name(device).lower().replace(" ", "_").replace("-", "_")
 
 
+# H200 (including H200 NVL) has no tuned records of its own and runs the SM90
+# H100 records.
+_CONFIG_FAMILY_ALIASES = (("h200", "nvidia_h100_80gb_hbm3"),)
+
+
 def config_path(name: str | None = None, device: "torch.device | int | None" = None) -> Path:
+    """Return the autotune JSON path for ``name`` or ``device``.
+
+    An exact ``<stem>.json`` wins. If that file is missing, a family alias
+    (``_CONFIG_FAMILY_ALIASES``) is used when its records exist.
+    """
     name = name or device_config_name(device)
-    return Path(resources.files("pearl_gemm") / "autotune_configs" / f"{name}.json")
+    base = Path(resources.files("pearl_gemm") / "autotune_configs")
+    path = base / f"{name}.json"
+    if path.exists():
+        return path
+    for needle, alias in _CONFIG_FAMILY_ALIASES:
+        if needle in name.lower() and (base / f"{alias}.json").exists():
+            return base / f"{alias}.json"
+    return path
 
 
 def _shape_key(shape: dict) -> tuple:
@@ -806,50 +853,61 @@ def get_tuned(
     return kwargs(min(candidates, key=dist))
 
 
-# For m <= SMALL_M_LIMIT with a 4-row lottery, route to the 64-row kernel
-# tile: tile_n = max(64, ltile_cols), cluster 1x1. Callers that have an
-# exact autotune record should prefer that record (see pipeline._configs).
-SMALL_M_LIMIT = 256
+# Per family: the largest m routed to the 64-row kernel tile, and that tile's
+# narrowest tile_n (SM90: the narrowest ``SM90_TILE_NS``). On H100 the 64x128
+# cooperative tile matched or beat every larger tile up to m = 128. Callers
+# that have an exact autotune record should prefer that record (see
+# pipeline._configs).
+SMALL_M_LIMIT: dict[Arch, int] = {Arch.SM90: 128, Arch.SM100: 256, Arch.SM120: 256}
+_SMALL_M_MIN_TILE_N: dict[Arch, int] = {Arch.SM90: 128, Arch.SM100: 64, Arch.SM120: 64}
 _SMALL_TILE_M = 64
 
 
-@lru_cache(maxsize=256)
 def route_small_m_mixed_gemm(
-    m: int, n: int, k: int, *, ltile_rows: int, ltile_cols: int
+    m: int, n: int, k: int, *, ltile_rows: int, ltile_cols: int, arch: Arch | None = None
 ) -> Mapping | None:
     """Heuristic ``MixedGemmConfig`` kwargs for a small-m (decode) launch.
 
-    For ``m <= SMALL_M_LIMIT`` and a 4-row lottery, route to the 64-row
-    kernel tile: tile (64, 64) when the committed lottery width is 64, and
-    (64, ltile_cols) otherwise (the narrowest tile_n the committed width
-    divides). Returns ``None`` -- keep the saved records -- when the
-    committed geometry cannot run a 64-row tile (the 16-row lottery family
-    splits every accumulator row between two TMEM-load threads) or when the
-    routed config cannot launch the shape. Cached: config resolution sits
-    on the launch hot path, so the returned mapping is shared across callers
-    and read-only (an immutable proxy: mutating it would poison every later
-    resolution of the shape).
+    For ``m <= SMALL_M_LIMIT[arch]`` and a 4-row lottery, route to the 64-row
+    kernel tile at cluster 1x1 and the narrowest tile_n the committed width
+    divides, at least ``_SMALL_M_MIN_TILE_N[arch]``: (64, 64) for a 64-wide
+    lottery on Blackwell, (64, 128) on SM90. Returns ``None`` -- keep the
+    saved records -- when the committed geometry cannot run a 64-row tile (the
+    16-row lottery family splits every accumulator row between threads on
+    every family) or when the routed config cannot launch the shape on
+    ``arch`` (the current device's family when omitted). Cached: config
+    resolution sits on the launch hot path, so the returned mapping is shared
+    across callers and read-only (an immutable proxy: mutating it would
+    poison every later resolution of the shape).
     """
-    if m > SMALL_M_LIMIT or ltile_rows != 4:
+    arch = arch_of() if arch is None else arch
+    return _route_small_m_mixed_gemm(m, n, k, ltile_rows, ltile_cols, arch)
+
+
+@lru_cache(maxsize=256)
+def _route_small_m_mixed_gemm(
+    m: int, n: int, k: int, ltile_rows: int, ltile_cols: int, arch: Arch
+) -> Mapping | None:
+    if m > SMALL_M_LIMIT[arch] or ltile_rows != 4:
         return None
     from .mixed_gemm import MixedGemmConfig, validate_mixed_gemm_config
 
     kwargs = {
         "tile_m": _SMALL_TILE_M,
-        "tile_n": max(_SMALL_TILE_M, ltile_cols),
+        "tile_n": max(_SMALL_M_MIN_TILE_N[arch], ltile_cols),
         "cluster_m": 1,
         "cluster_n": 1,
         "ltile_rows": ltile_rows,
         "ltile_cols": ltile_cols,
     }
     try:
-        validate_mixed_gemm_config(m, n, k, MixedGemmConfig(**kwargs))
+        validate_mixed_gemm_config(m, n, k, MixedGemmConfig(**kwargs), arch=arch)
     except (TypeError, ValueError):
         return None
     return MappingProxyType(kwargs)
 
 
-def mixed_gemm_sweep_space(m: int, n: int, k: int) -> list[dict]:
+def mixed_gemm_sweep_space(m: int, n: int, k: int, arch: Arch | None = None) -> list[dict]:
     """Committed lottery lattice plus the routed 64-row decode tile when it applies.
 
     Exact autotune records outrank the small-m heuristic at lookup, so a
@@ -857,9 +915,12 @@ def mixed_gemm_sweep_space(m: int, n: int, k: int) -> list[dict]:
     128/256-row winner the heuristic was meant to beat. Include it so a
     replacement has to win the comparison.
     """
-    ltile_rows, ltile_cols = committed_lottery(n, k)
-    space = mixed_gemm_space(ltile_rows, ltile_cols)
-    routed = route_small_m_mixed_gemm(m, n, k, ltile_rows=ltile_rows, ltile_cols=ltile_cols)
+    arch = arch_of() if arch is None else arch
+    ltile_rows, ltile_cols = committed_lottery(n, k, arch)
+    space = mixed_gemm_space(ltile_rows, ltile_cols, arch)
+    routed = route_small_m_mixed_gemm(
+        m, n, k, ltile_rows=ltile_rows, ltile_cols=ltile_cols, arch=arch
+    )
     if routed is None:
         return space
     routed_cfg = dict(routed)

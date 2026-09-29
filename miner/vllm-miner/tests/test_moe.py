@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from miner_base.commitment import Device
 from vllm_miner.mining_config import (
     MOE_LOTTERY_N,
     effective_work_per_matmul,
@@ -48,11 +49,13 @@ def test_topk_ids_shape_error_names_the_problem():
     assert "tensor" in topk_ids_shape_error([[0, 1]] * 16, 16, 2)
 
 
-def test_moe_configuration_commits_the_expert_local_tile():
+@pytest.mark.parametrize("device", list(Device), ids=lambda d: d.name.lower())
+def test_moe_configuration_commits_the_expert_local_tile(device):
     """The tile is selected on ``n_e``, and the expert count reaches ``pB``."""
     experts, n_e, k = 8, 3 * MOE_LOTTERY_N, 2048
-    config = mining_configuration(k, experts * n_e, experts)
-    dense_e = mining_configuration(k, n_e)
+    config = mining_configuration(k, experts * n_e, experts, device=device)
+    dense_e = mining_configuration(k, n_e, device=device)
+    assert config.device is device
     assert config.experts == experts and dense_e.experts == 0
     assert config.rows_pattern == dense_e.rows_pattern
     assert config.cols_pattern == dense_e.cols_pattern
@@ -62,5 +65,7 @@ def test_moe_configuration_commits_the_expert_local_tile():
     with pytest.raises(ValueError, match="multiple"):
         expert_n(experts * n_e + 1, experts)
     # Credit over whole expert-local tiles is the dense formula at n_e.
-    tile = select_tile(n_e, k)
-    assert effective_work_per_matmul(4 * tile.rows, n_e, k) == 4 * tile.rows * n_e * k
+    tile = select_tile(n_e, k, device=device)
+    assert effective_work_per_matmul(4 * tile.rows, n_e, k, device=device) == (
+        4 * tile.rows * n_e * k
+    )

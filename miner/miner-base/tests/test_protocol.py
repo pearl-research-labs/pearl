@@ -13,6 +13,7 @@ from miner_base.commitment import (
     noise_seeds,
 )
 from miner_base.commitment_hash import noise_seed_a, noise_seed_b, operand_digest
+from miner_base.devices import device_for_capability, local_device
 from miner_base.mining_config import COMMITMENT_CHUNK_SIZE, activation_leaf, default_mining_config
 from miner_base.prequant import DEFAULT_BLOCK_SIZE, PrequantMatrix
 
@@ -69,6 +70,39 @@ def test_split_leaf_changes_only_the_activation_side():
 
     with pytest.raises(ValueError, match="no committed Merkle leaf"):
         default_mining_config(2048, rank=32, device=Device.BLACKWELL, a_chunk_size=96)
+
+
+@pytest.mark.parametrize(
+    ("capability", "device"),
+    [((9, 0), Device.HOPPER), ((10, 3), Device.BLACKWELL), ((12, 0), Device.BLACKWELL)],
+)
+def test_capability_resolves_to_the_committed_device(capability, device):
+    assert device_for_capability(*capability) is device
+
+
+@pytest.mark.parametrize("capability", [(8, 9), (11, 0), (13, 0)])
+def test_capability_without_a_committed_device_fails_closed(capability):
+    with pytest.raises(ValueError, match=f"sm{capability[0]}{capability[1]}"):
+        device_for_capability(*capability)
+
+
+def test_local_device_reads_the_cuda_capability(monkeypatch):
+    queried = []
+
+    def capability(device=None):
+        queried.append(device)
+        return (9, 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    assert local_device() is Device.HOPPER
+    assert local_device(1) is Device.HOPPER
+    assert queried == [None, 1]
+
+
+def test_hopper_commits_its_device_into_p_b():
+    hopper = default_mining_config(2048, rank=32, device=Device.HOPPER)
+    assert hopper.p_b(256)[_P_B_DEVICE_OFFSET] == Device.HOPPER.value
+    assert hopper.p_b(256) != _config(2048).p_b(256)
 
 
 def test_matrix_commitment_is_keyed_and_records_its_geometry():

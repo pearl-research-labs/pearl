@@ -22,6 +22,7 @@ from pearl_gemm import (
     mixed_gemm,
     supports_lottery_family,
 )
+from pearl_gemm._utils._arch import Arch, arch_of
 from pearl_gemm.protocol_constants import R
 from tests.helpers.preprocess import tall_tile_config
 
@@ -40,15 +41,33 @@ _VARIANTS = {
         "config": replace(_DEFAULT_CONFIG, ltile_rows=16, ltile_cols=32),
         "lottery_shapes": [(256, 128, 512), (512, 256, 1024)],
     },
+}
+if arch_of() is Arch.SM90:
+    # SM90: tile_n is at least 128. The 4x64 committed width on the default
+    # 256-row tile, the two-warpgroup 128-row tile, and the single-warpgroup
+    # 64-row tile (the small-m route); k=576 ends in a partial promotion
+    # window. (64, 128, 512) is a decode-like problem.
+    _VARIANTS["4x64"] = {
+        "config": replace(_DEFAULT_CONFIG, ltile_cols=64),
+        "lottery_shapes": [(256, 128, 512), (512, 256, 1024), (256, 128, 576)],
+    }
+    _VARIANTS["4x128-tile128"] = {
+        "config": MixedGemmConfig(tile_m=128, tile_n=128, cluster_m=1, cluster_n=1),
+        "lottery_shapes": [(256, 128, 512), (512, 256, 1024)],
+    }
+    _VARIANTS["4x64-tile64"] = {
+        "config": MixedGemmConfig(tile_m=64, tile_n=128, cluster_m=1, cluster_n=1, ltile_cols=64),
+        "lottery_shapes": [(256, 128, 512), (64, 128, 512)],
+    }
+else:
     # The 64-row CTA tile (decode m=64 shapes): 16dp TMEM loads split every
     # accumulator row between two threads and the 16 messages per CTA
     # exercise the sub-warp hashing gate. (64, 192, 512) is a decode-like
     # single-CTA-row problem.
-    "4x64-tile64": {
+    _VARIANTS["4x64-tile64"] = {
         "config": MixedGemmConfig(tile_m=64, tile_n=64, cluster_m=1, cluster_n=1, ltile_cols=64),
         "lottery_shapes": [(256, 128, 512), (64, 192, 512)],
-    },
-}
+    }
 
 
 def _variant_marks(vid: str) -> list:

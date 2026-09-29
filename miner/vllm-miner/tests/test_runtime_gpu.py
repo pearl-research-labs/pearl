@@ -212,17 +212,21 @@ def test_prepare_layer_matches_pinned_commitment_chain(layer_state):
 
     key_a, key_b = commitment_keys_for(job)
     weight_pq = _cpu_pq(layer_state)
-    config = mining_configuration(k, n)
+    device = layer_state.committed_device
+    config = mining_configuration(k, n, device=device)
     comm_b = commit_planes_for_leaf(weight_pq.planes(), key_b, config.chunk_size)
     # The committed tile (4x64) is bound into pB, hence into seedB.
     expected_seed_b = noise_seed_b(comm_b.digest, key_b, config.p_b(n))
     assert (ctx.key_a, ctx.key_b) == (key_a, key_b)
     assert ctx.seed_b == expected_seed_b
-    assert expected_seed_b != noise_seed_b(comm_b.digest, key_b, mining_configuration(k).p_b(n))
+    assert expected_seed_b != noise_seed_b(
+        comm_b.digest, key_b, mining_configuration(k, device=device).p_b(n)
+    )
 
     # Every mineable shape here commits the preferred 4x64 tile.
     assert (config.rows_pattern.tile_size, config.cols_pattern.tile_size) == (4, 64)
     assert config.common_dim == k
+    assert config.device is device
     # Cert-v4 can only open the native 1024-byte leaf.
     assert config.chunk_size == 1024
     assert config.a_chunk_size == 1024
@@ -231,7 +235,9 @@ def test_prepare_layer_matches_pinned_commitment_chain(layer_state):
     assert bytes(buffers.key_a_dev.cpu().numpy()) == key_a
     assert bytes(buffers.key_b_dev.cpu().numpy()) == key_b
     assert bytes(buffers.seed_b_dev.cpu().numpy()) == expected_seed_b
-    assert bytes(buffers.threshold_dev.cpu().numpy()) == threshold_bytes_for(job, k, n)
+    assert bytes(buffers.threshold_dev.cpu().numpy()) == threshold_bytes_for(
+        job, k, n, device=device
+    )
 
     # Uploaded operands equal the protocol's B side. Both F bases are keyed by
     # seedB, so the whole B side -- the complete peel included -- is a job
@@ -325,7 +331,7 @@ def test_prepare_republishes_on_new_job(layer_state):
     assert (second.key_a, second.key_b) == (first.key_a, first.key_b)  # same header, same keys
     assert second.seed_b == first.seed_b
     assert bytes(layer_state.buffers.threshold_dev.cpu().numpy()) == threshold_bytes_for(
-        _job(target=7), _K, _N
+        _job(target=7), _K, _N, device=layer_state.committed_device
     )
     assert layer_state.job_ctx is second
 
@@ -346,7 +352,9 @@ def test_mine_launch_credits_protocol_hashes(layer_state, async_manager, monkeyp
     assert async_manager.wait_until_drained(timeout=30)
     assert c.shape == (_M_BUCKET, _N)
     credited = async_manager._inner_hash_counter - before
-    assert credited == effective_work_per_matmul(_M_BUCKET, _N, _K)
+    assert credited == effective_work_per_matmul(
+        _M_BUCKET, _N, _K, device=layer_state.committed_device
+    )
 
 
 def test_failed_completion_record_fences_real_launch_before_fallback(
@@ -618,7 +626,7 @@ def test_legacy_certificate_job_credits_hashrate_without_submission(
     assert async_manager.wait_until_drained(timeout=30)
 
     assert async_manager._inner_hash_counter - hashes_before == effective_work_per_matmul(
-        _M_BUCKET, _N, _K
+        _M_BUCKET, _N, _K, device=layer_state.committed_device
     )
     assert WINNER_LEASES.held() == leases_before
     assert fallback_winner_checks_idle()
@@ -740,7 +748,7 @@ def test_launch_reprepares_a_stale_context_for_the_live_job(
     assert layer_state.job_ctx is not stale
     assert layer_state.job_ctx.job == live
     assert bytes(layer_state.buffers.threshold_dev.cpu().numpy()) == threshold_bytes_for(
-        live, _K, _N
+        live, _K, _N, device=layer_state.committed_device
     )
     assert async_manager.wait_until_drained(timeout=30)
 
@@ -798,7 +806,7 @@ def _moe_topk_ids(m_tokens: int) -> torch.Tensor:
 
 def test_moe_layers_mine_only_where_the_grouped_kernel_exists(monkeypatch):
     """An expert layer with a lottery tile the dense kernels accept mines only
-    where ``grouped_mixed_gemm`` exists (SM100, SM120), and only when its
+    where ``grouped_mixed_gemm`` exists (SM90, SM100, SM120), and only when its
     ``n_e`` sits on the 128-column MoE lottery lattice."""
     from pearl_gemm import supports_grouped_mixed_gemm
     from vllm_miner.mining_config import MOE_LOTTERY_N
@@ -812,7 +820,7 @@ def test_moe_layers_mine_only_where_the_grouped_kernel_exists(monkeypatch):
     assert can_mine_layer(experts * 64, k, device)
     assert not can_mine_layer(experts * 64, k, device, experts)
 
-    for major in (10, 12):
+    for major in (9, 10, 12):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=None, m=major: (m, 0))
         assert can_mine_layer(experts * n_e, k, device, experts)
 
@@ -833,7 +841,9 @@ def test_moe_layer_state_commits_the_stacked_weight_without_dense_fallback(moe_l
     ctx = prepare_layer(state, _job())
     assert ctx.config.experts == _EXPERTS
     assert ctx.config.p_b(state.n)[-2:] == _EXPERTS.to_bytes(2, "little")
-    assert bytes(state.buffers.threshold_dev.cpu().numpy()) == threshold_bytes_for(_job(), _K, _N_E)
+    assert bytes(state.buffers.threshold_dev.cpu().numpy()) == threshold_bytes_for(
+        _job(), _K, _N_E, device=state.committed_device
+    )
 
 
 def test_moe_warmup_compiles_the_grouped_variant(moe_layer_state):
@@ -894,10 +904,12 @@ def test_moe_mined_forward_approximates_each_experts_gemm(
     credited = async_manager._inner_hash_counter - before
     # Exact: the whole 4-row tiles of every expert, read from the device
     # counts once the launch's event completed.
-    tile_rows = select_tile(_N_E, _K).rows
+    tile_rows = select_tile(_N_E, _K, device=state.committed_device).rows
     whole_rows = sum(count // tile_rows * tile_rows for count in routing.m_valid.tolist())
     assert 0 < whole_rows <= routing.cum_m
-    assert credited == effective_work_per_matmul(whole_rows, _N_E, _K)
+    assert credited == effective_work_per_matmul(
+        whole_rows, _N_E, _K, device=state.committed_device
+    )
 
 
 def test_moe_routing_commitments_match_the_host_tree(moe_layer_state):
@@ -932,7 +944,8 @@ def test_moe_routing_commitments_match_the_host_tree(moe_layer_state):
 def test_moe_launch_credit_counts_whole_expert_tiles(moe_layer_state, counts, whole_rows):
     from vllm_miner.pipeline import moe_launch_credit
 
-    expected = effective_work_per_matmul(whole_rows, _N_E, _K) if whole_rows else 0
+    device = moe_layer_state.committed_device
+    expected = effective_work_per_matmul(whole_rows, _N_E, _K, device=device) if whole_rows else 0
     assert moe_launch_credit(moe_layer_state, counts) == expected
     assert moe_launch_credit(moe_layer_state, torch.tensor(counts, dtype=torch.int32)) == expected
 

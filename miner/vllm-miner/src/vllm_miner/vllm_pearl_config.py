@@ -705,7 +705,7 @@ class PearlConfig(QuantizationConfig):
     @override
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100  # SM100 and SM120 (Blackwell): the mining kernels and the FP8 fallback GEMM
+        return 90  # SM90, SM100 and SM120: the mining kernels and the FP8 fallback GEMM
 
     @override
     @staticmethod

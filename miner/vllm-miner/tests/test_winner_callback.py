@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 from miner_base.block_submission import commit_planes_for_leaf
+from miner_base.commitment import Device
 from miner_base.commitment_hash import a_keys, noise_seed_b
 from miner_base.mining_config import activation_leaf
 from miner_base.prequant import PrequantMatrix
@@ -22,6 +23,9 @@ from vllm_miner.mining_config import (
     tile_indices,
 )
 from vllm_miner.winners import WinnerCheckCallback
+
+# Host-only: every configuration commits one explicit device.
+_DEVICE = Device.BLACKWELL
 
 
 @pytest.fixture(autouse=True)
@@ -168,7 +172,7 @@ def test_validated_persistent_hit_builds_canonical_opening(
     # Non-saturating: 4x64 vs 4x128 thresholds stay distinct, so omitting n
     # from mining_configuration / the pB in seedB would fail this test.
     target = 1 << 128
-    config = mining_configuration(k, n)
+    config = mining_configuration(k, n, device=_DEVICE)
     job = MiningJob(
         incomplete_header_bytes=bytes(range(76)),
         target=target,
@@ -177,7 +181,9 @@ def test_validated_persistent_hit_builds_canonical_opening(
     a = PrequantMatrix.encode(torch.zeros(8, k, dtype=torch.bfloat16))
     b = PrequantMatrix.encode(torch.zeros(n, k, dtype=torch.bfloat16))
     key_a, key_b = commitment_keys_for(job)
-    assert lottery_threshold(target, k, n) != lottery_threshold(target, k)
+    assert lottery_threshold(target, k, n, device=_DEVICE) != lottery_threshold(
+        target, k, device=_DEVICE
+    )
     comm_a = commit_planes_for_leaf(a.planes(), key_a, activation_leaf(config))
     comm_b = commit_planes_for_leaf(b.planes(), key_b, config.chunk_size)
     seed_b = noise_seed_b(comm_b.digest, key_b, config.p_b(n))
@@ -215,7 +221,7 @@ def test_validated_persistent_hit_builds_canonical_opening(
         tile_column=0,
         commitment_hash_A=keys.jackpot_key,
         commitment_hash_B=seed_b,
-        target=threshold_bytes_for(job, k, state.n),
+        target=threshold_bytes_for(job, k, state.n, device=_DEVICE),
         codes=a.int_values,
         scales=a.scales,
     )
@@ -325,7 +331,7 @@ def test_hit_stamped_with_a_stale_b_seed_is_dropped(monkeypatch):
     produced before the layer was re-prepared for the live job carries the
     old seed and must not validate against the new context."""
     job = Mock(spec=MiningJob)
-    config = mining_configuration(2048, 256)
+    config = mining_configuration(2048, 256, device=_DEVICE)
     ctx = SimpleNamespace(job=job, config=config, seed_b=b"\x01" * 32)
     state = SimpleNamespace(
         layer_name="test.layer", n=256, lottery_n=256, k=2048, lock=threading.Lock(), job_ctx=ctx
@@ -380,7 +386,7 @@ def _moe_winner_fixture(group_id: int):
     from vllm_miner.moe import MoeLaunch, MoeRouting
 
     k, experts, n_e, top_k, m = 2048, 4, 256, 2, 64
-    config = mining_configuration(k, experts * n_e, experts)
+    config = mining_configuration(k, experts * n_e, experts, device=_DEVICE)
     header = BlockHeader(
         version=1,
         prev_block=b"\x11" * 32,
@@ -448,7 +454,7 @@ def _moe_winner_fixture(group_id: int):
         group_id=group_id,
         commitment_hash_A=b"\x07" * 32,
         commitment_hash_B=seed_b,
-        target=threshold_bytes_for(job, k, n_e),
+        target=threshold_bytes_for(job, k, n_e, device=_DEVICE),
         codes=None,
         scales=None,
     )
@@ -586,6 +592,7 @@ def test_launch_asks_submission_gate_about_its_captured_job(monkeypatch):
         n=128,
         experts=0,
         top_k=0,
+        committed_device=_DEVICE,
         weight=SimpleNamespace(device="cuda:0"),
     )
     ctx = SimpleNamespace(
@@ -606,7 +613,7 @@ def test_launch_asks_submission_gate_about_its_captured_job(monkeypatch):
     assert order == [("bias", bias), "event"]
     assert checked_jobs == [legacy_job]
     assert launch_args == [{"layer_id": 5, "record_hits": False, "routing": None}]
-    assert manager.credited == effective_work_per_matmul(256, 128, 2048)
+    assert manager.credited == effective_work_per_matmul(256, 128, 2048, device=_DEVICE)
 
 
 def test_completion_registration_failure_synchronizes_exact_event(monkeypatch):
@@ -644,6 +651,7 @@ def test_serving_activation_writes_live_prefix_and_zeros_only_tail(monkeypatch):
         n=128,
         experts=0,
         top_k=0,
+        committed_device=_DEVICE,
         weight=SimpleNamespace(device=torch.device("cpu")),
     )
     ctx = SimpleNamespace(config=object())
@@ -709,6 +717,7 @@ def test_partial_fill_failure_registers_cleanup_before_releasing_slot(monkeypatc
         n=128,
         experts=0,
         top_k=0,
+        committed_device=_DEVICE,
         weight=SimpleNamespace(device=torch.device("cpu")),
     )
     ctx = SimpleNamespace(config=object())
@@ -756,6 +765,7 @@ def test_unretained_launches_decline_before_allocation_when_completions_are_full
         n=128,
         experts=0,
         top_k=0,
+        committed_device=_DEVICE,
         weight=SimpleNamespace(device=torch.device("cpu")),
     )
     ctx = SimpleNamespace(config=object())

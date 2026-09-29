@@ -25,7 +25,7 @@ from pearl_gemm import (
 from pearl_gemm._utils._arch import Arch, arch_of
 from pearl_gemm.protocol_constants import R
 from tests.helpers.chain import commit_a, f_bases
-from tests.helpers.digests import digest, fixture_input, reference_digests
+from tests.helpers.digests import blackwell_digests, digest, fixture_input
 
 
 def _rel(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -99,7 +99,7 @@ def _assert_chain_matches_pinned(a: torch.Tensor, case: str, config_fields=None)
     )
     torch.cuda.synchronize()
 
-    expected = reference_digests()["noisy_quant"][case]
+    expected = blackwell_digests("noisy_quant")[case]
     assert digest(e1_out) == expected["e1"], "E_A codes"
     assert digest(alpha) == expected["alpha"], "alpha"
     assert digest(beta) == expected["beta"], "beta"

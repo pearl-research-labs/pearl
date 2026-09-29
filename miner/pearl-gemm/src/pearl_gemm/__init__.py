@@ -52,7 +52,6 @@ from .api import (
 )
 from .protocol_constants import (
     BLOCK_SCALE_GROUP,
-    DELTA,
     NOISE_TARGET_NORM,
     PACKED_NOISE_K,
     PEEL_COLS,
@@ -62,7 +61,6 @@ from .protocol_constants import (
 
 __all__ = [
     "BLOCK_SCALE_GROUP",
-    "DELTA",
     "GroupedFp8GemmConfig",
     "GroupedMixedGemmConfig",
     "Hit",
