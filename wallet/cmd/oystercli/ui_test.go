@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/key"
+	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -54,4 +55,46 @@ func TestWithSpinnerAccessibleMode(t *testing.T) {
 		return sentinel
 	})
 	require.ErrorIs(t, err, sentinel)
+}
+
+func TestFriendlyError(t *testing.T) {
+	rpcErr := func(code btcjson.RPCErrorCode, msg string) error {
+		return &btcjson.RPCError{Code: code, Message: msg}
+	}
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			"locked wallet",
+			rpcErr(btcjson.ErrRPCWalletUnlockNeeded, "locked"),
+			"The wallet is locked. Unlock it first (Security menu).",
+		},
+		{"wrong passphrase", rpcErr(btcjson.ErrRPCWalletPassphraseIncorrect, "bad"), "Incorrect passphrase."},
+		{
+			"no funds",
+			rpcErr(btcjson.ErrRPCWalletInsufficientFunds, "short"),
+			"Insufficient funds for this transaction.",
+		},
+		{
+			"fee below the relay minimum",
+			rpcErr(btcjson.ErrRPCInternal.Code, "mempool min fee not met: 250 < 1000"),
+			"The fee is too low for the network to accept this transaction. This often means the transaction is " +
+				"large: send a smaller amount, or set a higher fee rate.",
+		},
+		{"other daemon errors pass through", rpcErr(btcjson.ErrRPCInternal.Code, "db closed"), "db closed"},
+		{
+			"daemon down",
+			errors.New("dial tcp: connection refused"),
+			"Cannot reach oyster: connection refused. Is the daemon running?",
+		},
+		{"bad credentials", errors.New("status code: 401"), "Authentication failed: check the RPC username/password."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, friendlyError(tt.err))
+		})
+	}
 }

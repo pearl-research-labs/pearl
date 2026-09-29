@@ -131,13 +131,28 @@ func sendScreen(c *client) error {
 	}
 
 	var txid *chainhash.Hash
-	err = withAutoUnlock(c, func() error {
-		return withSpinner("Signing and broadcasting...", func() error {
-			var sendErr error
-			txid, sendErr = c.send(fromAccount, address, amount, feeRate, 1)
-			return sendErr
+	for {
+		err = withAutoUnlock(c, func() error {
+			return withSpinner("Signing and broadcasting...", func() error {
+				var sendErr error
+				txid, sendErr = c.send(fromAccount, address, amount, feeRate, 1)
+				return sendErr
+			})
 		})
-	})
+		if !isNotRelayedError(err) {
+			break
+		}
+
+		printWarn(sendNotRelayedMessage)
+		retry, askErr := confirmSendRetry()
+		if askErr != nil {
+			return askErr
+		}
+		if !retry {
+			printWarn("Send cancelled. Nothing was broadcast.")
+			return nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -149,6 +164,24 @@ func sendScreen(c *client) error {
 		{"To", address},
 	}))
 	return nil
+}
+
+// sendNotRelayedMessage explains a send that no peer requested. It never left
+// this machine, so the funds are untouched and trying again is safe.
+const sendNotRelayedMessage = "No network peer accepted the transaction. Nothing was sent and your funds are " +
+	"untouched. Check your connection and try again."
+
+func confirmSendRetry() (bool, error) {
+	retry := true
+	ok, err := runForm(newForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Try again?").
+			Description("Sends the same amount to the same address at the same fee rate.").
+			Affirmative("Retry").
+			Negative("Cancel").
+			Value(&retry),
+	)))
+	return ok && retry, err
 }
 
 // validateRecipient checks the address decodes and belongs to the active

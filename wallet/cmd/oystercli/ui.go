@@ -171,6 +171,10 @@ func friendlyError(err error) string {
 		case btcjson.ErrRPCInvalidAddressOrKey:
 			return "Invalid address or key."
 		}
+		if strings.Contains(rpcErr.Message, "mempool min fee not met") {
+			return "The fee is too low for the network to accept this transaction. This often means the " +
+				"transaction is large: send a smaller amount, or set a higher fee rate."
+		}
 		return rpcErr.Message
 	}
 	msg := err.Error()

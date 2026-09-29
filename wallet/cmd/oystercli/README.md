@@ -27,7 +27,8 @@ for its exact location — point them at the built `oyster`, or pass
 - **Overview** — per-account balances, pending funds, recent activity.
 - **Send** — guided flow with address/amount validation, a review step, and
   automatic unlock prompting; the fee rate defaults to the network's minimum
-  relay fee (0.00001 PRL/kB).
+  relay fee (0.00001 PRL/kB). When no peer accepts the transaction it says
+  nothing was sent and offers to retry the same send.
 - **Receive** — fresh or current addresses, rendered with a scannable QR code.
 - **Transactions** — paged history browser, newest first, with page filtering
   and a full detail view. Pages are sized to the terminal, so the **Older** and
