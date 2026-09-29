@@ -58,9 +58,8 @@ func overviewScreen(c *client) error {
 	}
 
 	lipgloss.Println(th.title.Render("Recent activity"))
-	// listtransactions returns oldest first; show newest at the top.
-	for i := len(recent) - 1; i >= 0; i-- {
-		lipgloss.Println("  " + txRow(recent[i]))
+	for _, entry := range recent {
+		lipgloss.Println("  " + txRow(entry))
 	}
 	return nil
 }

@@ -56,6 +56,7 @@ func nodeStatusScreen(c *client) error {
 			rows = append(rows,
 				[2]string{"Wallet height", fmt.Sprintf("%d", si.height)},
 				[2]string{"Best peer height", fmt.Sprintf("%d", si.peerHeight)},
+				[2]string{"Peer connections", fmtPeerCount(si.peers)},
 			)
 		}
 	} else {

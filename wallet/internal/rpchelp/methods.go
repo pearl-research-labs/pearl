@@ -71,6 +71,8 @@ var Methods = []struct {
 	{"walletislocked", returnsBool},
 	{"chainsynced", returnsBool},
 	{"getsyncprogress", []interface{}{(*btcjson.GetSyncProgressResult)(nil)}},
+	{"removetransaction", []interface{}{(*btcjson.RemoveTransactionResult)(nil)}},
+	{"rebroadcasttransaction", []interface{}{(*btcjson.RebroadcastTransactionResult)(nil)}},
 }
 
 // HelpDescs contains the locale-specific help strings along with the locale.

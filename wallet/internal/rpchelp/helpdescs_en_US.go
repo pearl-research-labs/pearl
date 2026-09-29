@@ -236,8 +236,8 @@ var helpDescsEnUS = map[string]string{
 	// ListTransactionsCmd help.
 	"listtransactions--synopsis":        "Returns a JSON array of objects containing verbose details for wallet transactions.",
 	"listtransactions-account":          "DEPRECATED -- Unused (must be unset or \"*\")",
-	"listtransactions-count":            "Maximum number of transactions to create results from",
-	"listtransactions-from":             "Number of transactions to skip before results are created",
+	"listtransactions-count":            "Maximum number of transactions to list, newest first; one transaction can produce several results",
+	"listtransactions-from":             "Number of transactions to skip, counting from the newest",
 	"listtransactions-includewatchonly": "Unused",
 
 	// ListUnspentCmd help.
@@ -426,6 +426,21 @@ var helpDescsEnUS = map[string]string{
 	"getsyncprogressresult-filter_header_height": "The height of the best filter header synced so far",
 	"getsyncprogressresult-block_height":         "The height of the best full block the wallet has processed",
 	"getsyncprogressresult-best_peer_height":     "The best block height reported by connected peers",
+	"getsyncprogressresult-connections":          "The number of currently connected peers; a broadcast needs at least one",
 	"getsyncprogressresult-synced":               "Whether the wallet considers the chain fully synced",
 	"getsyncprogress--result0":                   "",
+
+	// RemoveTransactionCmd help.
+	"removetransaction--synopsis": "Forgets an unconfirmed transaction, and every unconfirmed transaction spending from it, so the inputs they used become spendable again.\n" +
+		"The network is not consulted: a peer that already holds the transaction may still mine it, and spending the freed inputs again is then a double-spend attempt. Only remove a transaction you are sure never left this machine or that you intend to replace.",
+	"removetransaction-txid":          "Hash of the unconfirmed transaction to remove",
+	"removetransactionresult-removed": "Hashes of the removed transactions, the requested one first",
+	"removetransaction--result0":      "",
+
+	// RebroadcastTransactionCmd help.
+	"rebroadcasttransaction--synopsis": "Announces an unconfirmed transaction to the network again, preceded by any of its unconfirmed ancestors in dependency order.\n" +
+		"Under SPV a transaction is announced exactly once when sent and never again automatically; this is the explicit way to try again. Fails with the daemon's not-relayed error when no peer requests it, which is ambiguous by construction: peers that already hold the transaction stay silent. A rejection is reported and the transaction kept; removetransaction drops it.",
+	"rebroadcasttransaction-txid":            "Hash of the unconfirmed transaction to announce",
+	"rebroadcasttransactionresult-announced": "Hashes a peer requested, unconfirmed ancestors first and the requested transaction last",
+	"rebroadcasttransaction--result0":        "",
 }

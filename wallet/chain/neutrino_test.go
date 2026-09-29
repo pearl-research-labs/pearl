@@ -8,12 +8,63 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // maxDur is the max duration a test has to execute successfully.
 var maxDur = 5 * time.Second
+
+// verdictChainService is a mockChainService whose broadcasts all end in verdict.
+type verdictChainService struct {
+	*mockChainService
+
+	verdict *pushtx.BroadcastError
+}
+
+func (m *verdictChainService) SendTransaction(*wire.MsgTx) error {
+	return m.verdict
+}
+
+// TestNeutrinoClientSendRawTransactionVerdicts pins how the peer verdicts the wallet branches on reach it. The mempool
+// case uses bitcoind's reject wording, which no string map knows, so only its code can identify it.
+func TestNeutrinoClientSendRawTransactionVerdicts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		verdict *pushtx.BroadcastError
+		wantErr error
+		wantMsg string
+	}{
+		{
+			name:    "not relayed keeps the reason",
+			verdict: &pushtx.BroadcastError{Code: pushtx.NotRelayed, Reason: "no connected peers to relay transaction"},
+			wantErr: ErrTxNotRelayed,
+			wantMsg: "no connected peers",
+		},
+		{
+			name:    "already in mempool",
+			verdict: &pushtx.BroadcastError{Code: pushtx.Mempool, Reason: "rejected by peer: txn-already-in-mempool"},
+			wantErr: ErrTxAlreadyInMempool,
+			wantMsg: "already in mempool",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			nc := newMockNeutrinoClient()
+			nc.CS = &verdictChainService{mockChainService: &mockChainService{}, verdict: tt.verdict}
+
+			hash, err := nc.SendRawTransaction(wire.NewMsgTx(wire.TxVersion), false)
+			assert.Nil(t, hash)
+			assert.ErrorIs(t, err, tt.wantErr)
+			assert.ErrorContains(t, err, tt.wantMsg)
+		})
+	}
+}
 
 // TestNeutrinoClientSequentialStartStop ensures that the client
 // can sequentially Start and Stop without errors or races.

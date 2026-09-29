@@ -18,6 +18,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
+	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
 )
@@ -200,6 +201,7 @@ func (s *NeutrinoClient) SyncProgress() (*SyncProgress, error) {
 		HeaderHeight:       headerHeight,
 		FilterHeaderHeight: filterHeight,
 		BestPeerHeight:     s.CS.BestPeerHeight(),
+		Connections:        s.CS.ConnectedCount(),
 	}, nil
 }
 
@@ -842,6 +844,18 @@ out:
 //
 // NOTE: we assume neutrino shares the same error strings as pearld.
 func (s *NeutrinoClient) MapRPCErr(rpcErr error) error {
+	// NotRelayed is no peer verdict the string maps below could express.
+	// Keep the reason: it tells the user whether any peer was connected.
+	if pushtx.IsBroadcastError(rpcErr, pushtx.NotRelayed) {
+		return fmt.Errorf("%w: %v", ErrTxNotRelayed, rpcErr)
+	}
+
+	// The wallet counts a peer that already holds the transaction as success, so match the verdict pushtx parsed
+	// rather than its wording: the string maps below only know pearld's.
+	if pushtx.IsBroadcastError(rpcErr, pushtx.Mempool) {
+		return ErrTxAlreadyInMempool
+	}
+
 	// Iterate the map and find the matching error.
 	for pearldErr, matchedErr := range PearldErrMap {
 		// Match it against pearld's error.

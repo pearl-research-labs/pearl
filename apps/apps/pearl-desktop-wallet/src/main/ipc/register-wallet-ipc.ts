@@ -14,11 +14,20 @@ function registerWalletIpc(ms: ManagerService) {
   ipcMain.handle('wallet-send-from-default-account', (_event, toAddress: string, amount: number, feeRate: number) =>
     ms.ensureWalletService().sendFromDefaultAccount(toAddress, amount, feeRate)
   );
+  ipcMain.handle('wallet-remove-transaction', (_event, txid: string) =>
+    ms.ensureWalletService().removeTransaction(txid)
+  );
+  ipcMain.handle('wallet-rebroadcast-transaction', (_event, txid: string) =>
+    ms.ensureWalletService().rebroadcastTransaction(txid)
+  );
   ipcMain.handle('wallet-list-all-transactions', _event =>
     ms.ensureWalletService().listAllTransactions()
   );
   ipcMain.handle('wallet-list-transactions', (_event, count: number = 10, from: number = 0) =>
     ms.ensureWalletService().listTransactions(count, from)
+  );
+  ipcMain.handle('wallet-list-recent-transactions', (_event, count: number) =>
+    ms.ensureWalletService().listRecentTransactions(count)
   );
   ipcMain.handle('wallet-get-balance', (_event, account: string, minconf: number = 1) =>
     ms.ensureWalletService().getBalance(account, minconf)

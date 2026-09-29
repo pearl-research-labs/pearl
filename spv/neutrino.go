@@ -28,7 +28,6 @@ import (
 	"github.com/pearl-research-labs/pearl/spv/chanutils"
 	"github.com/pearl-research-labs/pearl/spv/filterdb"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
-	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/pearl-research-labs/pearl/spv/query"
 	pearlversion "github.com/pearl-research-labs/pearl/version"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
@@ -65,6 +64,9 @@ var (
 
 	// BanDuration is the duration of a ban.
 	BanDuration = time.Hour * 24
+
+	// DefaultBroadcastTimeout is the default timeout used when broadcasting transactions to network peers.
+	DefaultBroadcastTimeout = 5 * time.Second
 
 	// TargetOutbound is the number of outbound peers to target.
 	TargetOutbound = 8
@@ -656,7 +658,6 @@ type ChainService struct { // nolint:maligned
 	timeSource           blockchain.MedianTimeSource
 	services             wire.ServiceFlag
 	utxoScanner          *UtxoScanner
-	broadcaster          *pushtx.Broadcaster
 	banStore             banman.Store
 	workManager          query.WorkManager
 	filterBatchWriter    *chanutils.BatchWriter[*filterdb.FilterData]
@@ -683,7 +684,7 @@ type ChainService struct { // nolint:maligned
 func NewChainService(cfg Config) (*ChainService, error) {
 	// Use the default broadcast timeout if one isn't provided.
 	if cfg.BroadcastTimeout == 0 {
-		cfg.BroadcastTimeout = pushtx.DefaultBroadcastTimeout
+		cfg.BroadcastTimeout = DefaultBroadcastTimeout
 	}
 
 	// First, we'll sort out the methods that we'll use to established
@@ -929,16 +930,6 @@ func NewChainService(cfg Config) (*ChainService, error) {
 
 			return matches, err
 		},
-	})
-
-	s.broadcaster = pushtx.NewBroadcaster(&pushtx.Config{
-		Broadcast: func(tx *wire.MsgTx) error {
-			return s.sendTransaction(tx)
-		},
-		SubscribeBlocks: func() (*blockntfns.Subscription, error) {
-			return s.blockSubscriptionMgr.NewSubscription(0)
-		},
-		RebroadcastInterval: pushtx.DefaultRebroadcastInterval,
 	})
 
 	s.banStore, err = banman.NewStore(cfg.Database)
@@ -1511,14 +1502,11 @@ func disconnectPeer(peerList map[int32]*ServerPeer,
 	return false
 }
 
-// SendTransaction broadcasts the transaction to all currently active peers so
-// it can be propagated to other nodes and eventually mined. An error won't be
-// returned if the transaction already exists within the mempool. Any
-// transaction broadcast through this method will be rebroadcast upon every
-// change of the tip of the chain.
+// SendTransaction announces the transaction to all currently active peers exactly once. A pushtx.Mempool error means a
+// peer already holds it. Nothing re-announces it later; callers that want another attempt call SendTransaction again.
 func (s *ChainService) SendTransaction(tx *wire.MsgTx) error {
 	// TODO(roasbeef): pipe through querying interface
-	return s.broadcaster.Broadcast(tx)
+	return s.sendTransaction(tx)
 }
 
 // NewPeerConfig returns the configuration for the given ServerPeer.
@@ -1660,11 +1648,6 @@ func (s *ChainService) Start(ctx context.Context) error {
 		return fmt.Errorf("unable to start utxo scanner: %v", err)
 	}
 
-	if err := s.broadcaster.Start(); err != nil {
-		return fmt.Errorf("unable to start transaction broadcaster: %v",
-			err)
-	}
-
 	if s.persistToDisk {
 		s.filterBatchWriter.Start()
 	}
@@ -1689,7 +1672,6 @@ func (s *ChainService) Stop() error {
 
 	var returnErr error
 	s.connManager.Stop()
-	s.broadcaster.Stop()
 	if err := s.utxoScanner.Stop(); err != nil {
 		log.Errorf("error stopping utxo scanner: %v", err)
 		returnErr = err

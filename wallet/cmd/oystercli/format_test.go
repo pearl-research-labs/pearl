@@ -87,6 +87,11 @@ func TestSortedKeys(t *testing.T) {
 	assert.Equal(t, []string{"default", "alpha", "imported", "zebra"}, sortedKeys(m))
 }
 
+func TestFmtPeerCount(t *testing.T) {
+	assert.Equal(t, "0 (cannot send: no peers)", fmtPeerCount(0))
+	assert.Equal(t, "8", fmtPeerCount(8))
+}
+
 func TestSyncPercent(t *testing.T) {
 	assert.Equal(t, "50.0% (50/100)", syncPercent(&syncInfo{height: 50, peerHeight: 100}))
 	// Nearly-but-not-fully synced must not round up to 100.0%.

@@ -76,6 +76,14 @@ func fmtConfs(confs int64) string {
 	return fmt.Sprintf("%d conf", confs)
 }
 
+// fmtPeerCount renders the SPV peer count, flagging zero because nothing can be sent without a peer.
+func fmtPeerCount(peers int32) string {
+	if peers == 0 {
+		return "0 (cannot send: no peers)"
+	}
+	return fmt.Sprintf("%d", peers)
+}
+
 // syncPercent formats sync progress as a percentage of the best known peer
 // height, falling back to raw heights when peers haven't reported yet. The
 // value is truncated (not rounded) to one decimal so it never displays
