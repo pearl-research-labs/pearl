@@ -22,8 +22,8 @@ const (
 
 // transactionsScreen pages through the wallet history; selecting an entry shows its full detail.
 //
-// listtransactions pages in transactions but answers in entries (a spent output lists both a receive and a send), so
-// paging counts transactions, asking for one past the page to learn whether older history exists.
+// listtransactions pages in transactions but answers in entries (a payment to several addresses lists one send for
+// each), so paging counts transactions, asking for one past the page to learn whether older history exists.
 func transactionsScreen(c *client) error {
 	offset := 0
 	for {

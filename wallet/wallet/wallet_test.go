@@ -722,7 +722,7 @@ func TestListTransactions(t *testing.T) {
 		assert.Equal(t, []string{"send"}, categories[oneOutput.TxHash().String()])
 		assert.NotContains(t, categories, consolidation.TxHash().String())
 		for _, txid := range receives {
-			assert.Equal(t, []string{"send", "receive"}, categories[txid], "spent receive %s", txid)
+			assert.Equal(t, []string{"receive"}, categories[txid], "spent receive %s", txid)
 		}
 	})
 

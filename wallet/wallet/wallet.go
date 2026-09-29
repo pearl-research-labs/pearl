@@ -2255,10 +2255,7 @@ func listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *wa
 
 outputs:
 	for i, output := range details.MsgTx.TxOut {
-		// Determine if this output is a credit, and if so, determine
-		// its spentness.
 		var isCredit bool
-		var spentCredit bool
 		for _, cred := range details.Credits {
 			if cred.Index == uint32(i) {
 				if !ListsCredit(details, cred) {
@@ -2266,7 +2263,6 @@ outputs:
 				}
 
 				isCredit = true
-				spentCredit = cred.Spent
 				break
 			}
 		}
@@ -2309,17 +2305,10 @@ outputs:
 			TimeReceived:    received,
 		}
 
-		// Add a received/generated/immature result if this is a credit.
-		// If the output was spent, create a second result under the
-		// send category with the inverse of the output amount.  It is
-		// therefore possible that a single output may be included in
-		// the results set zero, one, or two times.
-		//
-		// Since credits are not saved for outputs that are not
-		// controlled by this wallet, all non-credits from transactions
-		// with debits are grouped under the send category.
-
-		if send || spentCredit {
+		// A spend is listed on the spending transaction only; listing a spent credit as a send here too would count
+		// the outflow twice. Credits are not saved for outputs this wallet does not control, so every listed output
+		// of a transaction it funded is a send.
+		if send {
 			result.Category = "send"
 			result.Amount = -amountF64
 			result.Fee = &feeF64
@@ -2366,8 +2355,8 @@ func (w *Wallet) ListSinceBlock(start, end, syncHeight int32) ([]btcjson.ListTra
 // for listtransactions RPC replies.
 //
 // Results are newest first. from and count are counted in transactions that list at least one entry, and one
-// transaction can list several (a spent output lists both a receive and a send), so callers paging through history
-// must advance from by transactions, not entries.
+// transaction can list several (a payment to several addresses lists one send for each), so callers paging through
+// history must advance from by transactions, not entries.
 func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsResult, error) {
 	txList := []btcjson.ListTransactionsResult{}
 
