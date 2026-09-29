@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"iter"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -2206,13 +2208,13 @@ func IsChange(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
 	return cred.Change && len(details.Debits) > 0
 }
 
-// listTransactions returns the listtransactions entries for one wallet transaction, in output order. Every output
+// transactionEntries returns the listtransactions entries for one wallet transaction, in output order. Every output
 // the wallet paid out lists a send and every output paid to the wallet lists a receive, so a payment from the wallet
 // to its own address lists both. Change lists nothing, and neither does spending a received output: the spend is
 // listed once, on the transaction that makes it.
 //
 // TODO: This should be moved to the legacyrpc package.
-func listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *waddrmgr.Manager, syncHeight int32,
+func transactionEntries(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *waddrmgr.Manager, syncHeight int32,
 	net *chaincfg.Params) []btcjson.ListTransactionsResult {
 
 	addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
@@ -2306,30 +2308,20 @@ func addressAccount(addrMgr *waddrmgr.Manager, ns walletdb.ReadBucket, addr btcu
 	return name
 }
 
-// ListSinceBlock returns a slice of objects with details about transactions
-// since the given block. If the block is -1 then all transactions are included.
-// This is intended to be used for listsinceblock RPC replies.
+// ListSinceBlock returns a slice of objects with details about transactions since the given block. If the block is
+// -1 then all transactions are included. This is intended to be used for listsinceblock RPC replies.
 func (w *Wallet) ListSinceBlock(start, end, syncHeight int32) ([]btcjson.ListTransactionsResult, error) {
-	txList := []btcjson.ListTransactionsResult{}
+	entries := []btcjson.ListTransactionsResult{}
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
-			for _, detail := range details {
-				detail := detail
-
-				jsonResults := listTransactions(
-					tx, &detail, w.Manager, syncHeight,
-					w.chainParams,
-				)
-				txList = append(txList, jsonResults...)
+		return w.TxStore.RangeTransactions(txmgrNs, start, end, func(details []wtxmgr.TxDetails) (bool, error) {
+			for i := range details {
+				entries = append(entries, transactionEntries(tx, &details[i], w.Manager, syncHeight, w.chainParams)...)
 			}
 			return false, nil
-		}
-
-		return w.TxStore.RangeTransactions(txmgrNs, start, end, rangeFn)
+		})
 	})
-	return txList, err
+	return entries, err
 }
 
 // ListTransactions returns a slice of objects with details about a recorded transaction.  This is intended to be used
@@ -2339,124 +2331,105 @@ func (w *Wallet) ListSinceBlock(start, end, syncHeight int32) ([]btcjson.ListTra
 // transaction can list several (a payment to several addresses lists one send for each), so callers paging through
 // history must advance from by transactions, not entries.
 func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsResult, error) {
-	txList := []btcjson.ListTransactionsResult{}
+	entries := []btcjson.ListTransactionsResult{}
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		syncHeight := w.Manager.SyncedTo().Height
+		skipped, listed := 0, 0
+		for details, err := range w.newestFirst(tx.ReadBucket(wtxmgrNamespaceKey)) {
+			if err != nil {
+				return err
+			}
+			if listed >= count {
+				break
+			}
+			txEntries := transactionEntries(tx, details, w.Manager, syncHeight, w.chainParams)
+			// A transfer to the wallet's own change lists nothing and must not count, or pages would drift from what
+			// callers were shown.
+			if len(txEntries) == 0 {
+				continue
+			}
+			if skipped < from {
+				skipped++
+				continue
+			}
+			listed++
+			entries = append(entries, txEntries...)
+		}
+		return nil
+	})
+	return entries, err
+}
 
+// ListAddressTransactions returns a slice of objects with details about recorded transactions that pay any address in
+// a set of script addresses, oldest first. This is intended to be used for listaddresstransactions RPC replies.
+func (w *Wallet) ListAddressTransactions(scriptAddrs map[string]struct{}) ([]btcjson.ListTransactionsResult, error) {
+	entries := []btcjson.ListTransactionsResult{}
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
 		syncHeight := w.Manager.SyncedTo().Height
-
-		skipped := 0
-		n := 0
-
-		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
-			// Iterate over transactions at this height in reverse order. This does nothing for unmined transactions,
-			// which are unsorted, but it will process mined transactions in the reverse order they were marked mined.
-			for i := len(details) - 1; i >= 0; i-- {
-				jsonResults := listTransactions(tx, &details[i], w.Manager, syncHeight, w.chainParams)
-				// A transfer to the wallet's own change lists nothing and must not count, or pages would drift from
-				// what callers were shown.
-				if len(jsonResults) == 0 {
+		return w.TxStore.RangeTransactions(txmgrNs, 0, -1, func(details []wtxmgr.TxDetails) (bool, error) {
+			for i := range details {
+				if !w.paysAnyOf(&details[i], scriptAddrs) {
 					continue
 				}
-				if from > skipped {
-					skipped++
-					continue
-				}
+				entries = append(entries, transactionEntries(tx, &details[i], w.Manager, syncHeight, w.chainParams)...)
+			}
+			return false, nil
+		})
+	})
+	return entries, err
+}
 
-				n++
-				if n > count {
+// paysAnyOf reports whether one of the transaction's credits pays a Taproot address in scriptAddrs.
+func (w *Wallet) paysAnyOf(details *wtxmgr.TxDetails, scriptAddrs map[string]struct{}) bool {
+	return slices.ContainsFunc(details.Credits, func(cred wtxmgr.CreditRecord) bool {
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(details.MsgTx.TxOut[cred.Index].PkScript, w.chainParams)
+		if err != nil || len(addrs) != 1 {
+			return false
+		}
+		taproot, ok := addrs[0].(*btcutil.AddressTaproot)
+		if !ok {
+			log.Warnf("Skipping non-Taproot address in ListAddressTransactions: %v", addrs[0])
+			return false
+		}
+		_, ok = scriptAddrs[string(taproot.ScriptAddress())]
+		return ok
+	})
+}
+
+// ListAllTransactions returns the listtransactions entries of every wallet transaction, newest first. This is
+// intended to be used for listalltransactions RPC replies.
+func (w *Wallet) ListAllTransactions() ([]btcjson.ListTransactionsResult, error) {
+	entries := []btcjson.ListTransactionsResult{}
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		syncHeight := w.Manager.SyncedTo().Height
+		for details, err := range w.newestFirst(tx.ReadBucket(wtxmgrNamespaceKey)) {
+			if err != nil {
+				return err
+			}
+			entries = append(entries, transactionEntries(tx, details, w.Manager, syncHeight, w.chainParams)...)
+		}
+		return nil
+	})
+	return entries, err
+}
+
+// newestFirst yields the wallet's transactions newest first: unmined ones in no particular order, then mined ones
+// from the tip down, the last one recorded in each block first.
+func (w *Wallet) newestFirst(txmgrNs walletdb.ReadBucket) iter.Seq2[*wtxmgr.TxDetails, error] {
+	return func(yield func(*wtxmgr.TxDetails, error) bool) {
+		err := w.TxStore.RangeTransactions(txmgrNs, -1, 0, func(details []wtxmgr.TxDetails) (bool, error) {
+			for i := range slices.Backward(details) {
+				if !yield(&details[i], nil) {
 					return true, nil
 				}
-
-				txList = append(txList, jsonResults...)
-			}
-
-			return false, nil
-		}
-
-		// Return newer results first by starting at mempool height and working down to the genesis block.
-		return w.TxStore.RangeTransactions(txmgrNs, -1, 0, rangeFn)
-	})
-	return txList, err
-}
-
-// ListAddressTransactions returns a slice of objects with details about
-// recorded transactions to or from any address belonging to a set.  This is
-// intended to be used for listaddresstransactions RPC replies.
-func (w *Wallet) ListAddressTransactions(pkHashes map[string]struct{}) ([]btcjson.ListTransactionsResult, error) {
-	txList := []btcjson.ListTransactionsResult{}
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
-		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
-		loopDetails:
-			for i := range details {
-				detail := &details[i]
-
-				for _, cred := range detail.Credits {
-					pkScript := detail.MsgTx.TxOut[cred.Index].PkScript
-					_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-						pkScript, w.chainParams)
-					if err != nil || len(addrs) != 1 {
-						continue
-					}
-					apkh, ok := addrs[0].(*btcutil.AddressTaproot)
-					if !ok {
-						log.Warnf("Skipping non-Taproot address in ListAddressTransactions: %v", addrs[0])
-						continue
-					}
-					_, ok = pkHashes[string(apkh.ScriptAddress())]
-					if !ok {
-						continue
-					}
-
-					jsonResults := listTransactions(tx, detail,
-						w.Manager, syncBlock.Height, w.chainParams)
-					txList = append(txList, jsonResults...)
-					continue loopDetails
-				}
 			}
 			return false, nil
+		})
+		if err != nil {
+			yield(nil, err)
 		}
-
-		return w.TxStore.RangeTransactions(txmgrNs, 0, -1, rangeFn)
-	})
-	return txList, err
-}
-
-// ListAllTransactions returns a slice of objects with details about a recorded
-// transaction.  This is intended to be used for listalltransactions RPC
-// replies.
-func (w *Wallet) ListAllTransactions() ([]btcjson.ListTransactionsResult, error) {
-	txList := []btcjson.ListTransactionsResult{}
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
-
-		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
-			// Iterate over transactions at this height in reverse order.
-			// This does nothing for unmined transactions, which are
-			// unsorted, but it will process mined transactions in the
-			// reverse order they were marked mined.
-			for i := len(details) - 1; i >= 0; i-- {
-				jsonResults := listTransactions(tx, &details[i], w.Manager,
-					syncBlock.Height, w.chainParams)
-				txList = append(txList, jsonResults...)
-			}
-			return false, nil
-		}
-
-		// Return newer results first by starting at mempool height and
-		// working down to the genesis block.
-		return w.TxStore.RangeTransactions(txmgrNs, -1, 0, rangeFn)
-	})
-	return txList, err
+	}
 }
 
 // BlockIdentifier identifies a block by either a height or a hash.
