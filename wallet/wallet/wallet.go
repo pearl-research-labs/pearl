@@ -2200,46 +2200,37 @@ func RecvCategory(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Par
 	return CreditReceive
 }
 
-// ListsCredit reports whether a wallet credit appears in transaction listings. Change is only change when the wallet
-// funded the transaction, so a payment received on a change address is listed as a receive.
-func ListsCredit(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
-	return !cred.Change || len(details.Debits) == 0
+// IsChange reports whether a wallet credit is change: an output the wallet pays back to itself in a transaction it
+// funded. A payment received on one of the wallet's change addresses is therefore not change.
+func IsChange(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
+	return cred.Change && len(details.Debits) > 0
 }
 
-// listTransactions builds the listtransactions entries for one transaction.
+// listTransactions returns the listtransactions entries for one wallet transaction, in output order. Every output
+// the wallet paid out lists a send and every output paid to the wallet lists a receive, so a payment from the wallet
+// to its own address lists both. Change lists nothing, and neither does spending a received output: the spend is
+// listed once, on the transaction that makes it.
 //
 // TODO: This should be moved to the legacyrpc package.
 func listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *waddrmgr.Manager, syncHeight int32,
 	net *chaincfg.Params) []btcjson.ListTransactionsResult {
 
 	addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-	send := len(details.Debits) != 0
-	recvCat := RecvCategory(details, syncHeight, net).String()
+	funded := len(details.Debits) > 0
+	fee := listingFee(details)
+	receiveCategory := RecvCategory(details, syncHeight, net).String()
 
-	// The fee is known only when every input is a debit. listtransactions reports it as a negative amount.
-	var fee float64
-	if len(details.Debits) == len(details.MsgTx.TxIn) {
-		var debitTotal, outputTotal btcutil.Amount
-		for _, deb := range details.Debits {
-			debitTotal += deb.Amount
-		}
-		for _, output := range details.MsgTx.TxOut {
-			outputTotal += btcutil.Amount(output.Value)
-		}
-		fee = (outputTotal - debitTotal).ToPRL()
-	}
-
-	template := btcjson.ListTransactionsResult{
-		Generated:       blockchain.IsCoinBaseTx(&details.MsgTx),
+	base := btcjson.ListTransactionsResult{
 		TxID:            details.Hash.String(),
-		WalletConflicts: []string{},
+		Generated:       blockchain.IsCoinBaseTx(&details.MsgTx),
 		Time:            details.Received.Unix(),
 		TimeReceived:    details.Received.Unix(),
+		WalletConflicts: []string{},
 	}
 	if details.Block.Height != -1 {
-		template.BlockHash = details.Block.Hash.String()
-		template.BlockTime = details.Block.Time.Unix()
-		template.Confirmations = int64(calcConf(details.Block.Height, syncHeight))
+		base.BlockHash = details.Block.Hash.String()
+		base.BlockTime = details.Block.Time.Unix()
+		base.Confirmations = int64(calcConf(details.Block.Height, syncHeight))
 	}
 
 	credits := make(map[uint32]wtxmgr.CreditRecord, len(details.Credits))
@@ -2247,17 +2238,17 @@ func listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *wa
 		credits[cred.Index] = cred
 	}
 
-	var results []btcjson.ListTransactionsResult
+	var entries []btcjson.ListTransactionsResult
 	for i, output := range details.MsgTx.TxOut {
-		cred, isCredit := credits[uint32(i)]
-		if isCredit && !ListsCredit(details, cred) {
-			continue
-		}
-		if !isCredit && !send {
+		cred, toWallet := credits[uint32(i)]
+		change := toWallet && IsChange(details, cred)
+		paidOut := funded && !change
+		received := toWallet && !change
+		if !paidOut && !received {
 			continue
 		}
 
-		entry := template
+		entry := base
 		entry.Vout = uint32(i)
 		_, addrs, _, _ := txscript.ExtractPkScriptAddrs(output.PkScript, net)
 		if len(addrs) == 1 {
@@ -2265,26 +2256,40 @@ func listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *wa
 		}
 		amount := btcutil.Amount(output.Value).ToPRL()
 
-		// A spend is listed on the spending transaction only; listing a spent credit as a send here too would count
-		// the outflow twice. Credits are not saved for outputs this wallet does not control, so every listed output
-		// of a transaction it funded is a send.
-		if send {
-			sent := entry
-			sent.Category = "send"
-			sent.Amount = -amount
-			sent.Fee = &fee
-			results = append(results, sent)
+		if paidOut {
+			send := entry
+			send.Category = "send"
+			send.Amount = -amount
+			send.Fee = &fee
+			entries = append(entries, send)
 		}
-		if isCredit {
-			entry.Category = recvCat
-			entry.Amount = amount
+		if received {
+			receive := entry
+			receive.Category = receiveCategory
+			receive.Amount = amount
 			if len(addrs) == 1 {
-				entry.Account = addressAccount(addrMgr, addrmgrNs, addrs[0])
+				receive.Account = addressAccount(addrMgr, addrmgrNs, addrs[0])
 			}
-			results = append(results, entry)
+			entries = append(entries, receive)
 		}
 	}
-	return results
+	return entries
+}
+
+// listingFee returns the fee as listtransactions reports it, negated. It is 0 unless every input is the wallet's,
+// since the wallet knows only the values of its own inputs.
+func listingFee(details *wtxmgr.TxDetails) float64 {
+	if len(details.Debits) != len(details.MsgTx.TxIn) {
+		return 0
+	}
+	var in, out btcutil.Amount
+	for _, debit := range details.Debits {
+		in += debit.Amount
+	}
+	for _, output := range details.MsgTx.TxOut {
+		out += btcutil.Amount(output.Value)
+	}
+	return (out - in).ToPRL()
 }
 
 // addressAccount names the account that owns addr. A listing shows an empty account rather than failing when the

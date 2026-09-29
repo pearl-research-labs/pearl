@@ -828,7 +828,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		debitTotal += deb.Amount
 	}
 	for _, cred := range details.Credits {
-		if wallet.ListsCredit(details, cred) {
+		if !wallet.IsChange(details, cred) {
 			creditTotal += cred.Amount
 		}
 	}
@@ -870,7 +870,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 
 	credCat := wallet.RecvCategory(details, syncBlock.Height, w.ChainParams()).String()
 	for _, cred := range details.Credits {
-		if !wallet.ListsCredit(details, cred) {
+		if wallet.IsChange(details, cred) {
 			continue
 		}
 
