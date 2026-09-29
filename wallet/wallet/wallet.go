@@ -2206,123 +2206,99 @@ func ListsCredit(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
 	return !cred.Change || len(details.Debits) == 0
 }
 
-// listTransactions creates a object that may be marshalled to a response result
-// for a listtransactions RPC.
+// listTransactions builds the listtransactions entries for one transaction.
 //
 // TODO: This should be moved to the legacyrpc package.
-func listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *waddrmgr.Manager,
-	syncHeight int32, net *chaincfg.Params) []btcjson.ListTransactionsResult {
+func listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *waddrmgr.Manager, syncHeight int32,
+	net *chaincfg.Params) []btcjson.ListTransactionsResult {
 
 	addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-	var (
-		blockHashStr  string
-		blockTime     int64
-		confirmations int64
-	)
-	if details.Block.Height != -1 {
-		blockHashStr = details.Block.Hash.String()
-		blockTime = details.Block.Time.Unix()
-		confirmations = int64(
-			calcConf(details.Block.Height, syncHeight),
-		)
-	}
-
-	results := []btcjson.ListTransactionsResult{}
-	txHashStr := details.Hash.String()
-	received := details.Received.Unix()
-	generated := blockchain.IsCoinBaseTx(&details.MsgTx)
+	send := len(details.Debits) != 0
 	recvCat := RecvCategory(details, syncHeight, net).String()
 
-	send := len(details.Debits) != 0
-
-	// Fee can only be determined if every input is a debit.
-	var feeF64 float64
+	// The fee is known only when every input is a debit. listtransactions reports it as a negative amount.
+	var fee float64
 	if len(details.Debits) == len(details.MsgTx.TxIn) {
-		var debitTotal btcutil.Amount
+		var debitTotal, outputTotal btcutil.Amount
 		for _, deb := range details.Debits {
 			debitTotal += deb.Amount
 		}
-		var outputTotal btcutil.Amount
 		for _, output := range details.MsgTx.TxOut {
 			outputTotal += btcutil.Amount(output.Value)
 		}
-		// Note: The actual fee is debitTotal - outputTotal.  However,
-		// this RPC reports negative numbers for fees, so the inverse
-		// is calculated.
-		feeF64 = (outputTotal - debitTotal).ToPRL()
+		fee = (outputTotal - debitTotal).ToPRL()
 	}
 
-outputs:
-	for i, output := range details.MsgTx.TxOut {
-		var isCredit bool
-		for _, cred := range details.Credits {
-			if cred.Index == uint32(i) {
-				if !ListsCredit(details, cred) {
-					continue outputs
-				}
+	template := btcjson.ListTransactionsResult{
+		Generated:       blockchain.IsCoinBaseTx(&details.MsgTx),
+		TxID:            details.Hash.String(),
+		WalletConflicts: []string{},
+		Time:            details.Received.Unix(),
+		TimeReceived:    details.Received.Unix(),
+	}
+	if details.Block.Height != -1 {
+		template.BlockHash = details.Block.Hash.String()
+		template.BlockTime = details.Block.Time.Unix()
+		template.Confirmations = int64(calcConf(details.Block.Height, syncHeight))
+	}
 
-				isCredit = true
-				break
-			}
+	credits := make(map[uint32]wtxmgr.CreditRecord, len(details.Credits))
+	for _, cred := range details.Credits {
+		credits[cred.Index] = cred
+	}
+
+	var results []btcjson.ListTransactionsResult
+	for i, output := range details.MsgTx.TxOut {
+		cred, isCredit := credits[uint32(i)]
+		if isCredit && !ListsCredit(details, cred) {
+			continue
+		}
+		if !isCredit && !send {
+			continue
 		}
 
-		var address string
-		var accountName string
+		entry := template
+		entry.Vout = uint32(i)
 		_, addrs, _, _ := txscript.ExtractPkScriptAddrs(output.PkScript, net)
 		if len(addrs) == 1 {
-			addr := addrs[0]
-			address = addr.EncodeAddress()
-			mgr, account, err := addrMgr.AddrAccount(addrmgrNs, addrs[0])
-			if err == nil {
-				accountName, err = mgr.AccountName(addrmgrNs, account)
-				if err != nil {
-					accountName = ""
-				}
-			}
+			entry.Address = addrs[0].EncodeAddress()
 		}
-
-		amountF64 := btcutil.Amount(output.Value).ToPRL()
-		result := btcjson.ListTransactionsResult{
-			// Fields left zeroed:
-			//   InvolvesWatchOnly
-			//   BlockIndex
-			//
-			// Fields set below:
-			//   Account (only for non-"send" categories)
-			//   Category
-			//   Amount
-			//   Fee
-			Address:         address,
-			Vout:            uint32(i),
-			Confirmations:   confirmations,
-			Generated:       generated,
-			BlockHash:       blockHashStr,
-			BlockTime:       blockTime,
-			TxID:            txHashStr,
-			WalletConflicts: []string{},
-			Time:            received,
-			TimeReceived:    received,
-		}
+		amount := btcutil.Amount(output.Value).ToPRL()
 
 		// A spend is listed on the spending transaction only; listing a spent credit as a send here too would count
 		// the outflow twice. Credits are not saved for outputs this wallet does not control, so every listed output
 		// of a transaction it funded is a send.
 		if send {
-			result.Category = "send"
-			result.Amount = -amountF64
-			result.Fee = &feeF64
-			results = append(results, result)
+			sent := entry
+			sent.Category = "send"
+			sent.Amount = -amount
+			sent.Fee = &fee
+			results = append(results, sent)
 		}
 		if isCredit {
-			result.Account = accountName
-			result.Category = recvCat
-			result.Amount = amountF64
-			result.Fee = nil
-			results = append(results, result)
+			entry.Category = recvCat
+			entry.Amount = amount
+			if len(addrs) == 1 {
+				entry.Account = addressAccount(addrMgr, addrmgrNs, addrs[0])
+			}
+			results = append(results, entry)
 		}
 	}
 	return results
+}
+
+// addressAccount names the account that owns addr. A listing shows an empty account rather than failing when the
+// wallet cannot name it.
+func addressAccount(addrMgr *waddrmgr.Manager, ns walletdb.ReadBucket, addr btcutil.Address) string {
+	mgr, account, err := addrMgr.AddrAccount(ns, addr)
+	if err != nil {
+		return ""
+	}
+	name, err := mgr.AccountName(ns, account)
+	if err != nil {
+		return ""
+	}
+	return name
 }
 
 // ListSinceBlock returns a slice of objects with details about transactions
