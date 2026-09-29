@@ -35,6 +35,7 @@ const walletIpc: Ipc<WalletApi> = {
   rebroadcastTransaction: txid => ipcRenderer.invoke('wallet-rebroadcast-transaction', txid),
   listAllTransactions: () => ipcRenderer.invoke('wallet-list-all-transactions'),
   listTransactions: (count, from) => ipcRenderer.invoke('wallet-list-transactions', count, from),
+  listRecentTransactions: count => ipcRenderer.invoke('wallet-list-recent-transactions', count),
   getBalance: (account, minconf) => ipcRenderer.invoke('wallet-get-balance', account, minconf),
   validateAddress: address => ipcRenderer.invoke('wallet-validate-address', address),
   estimateFee: numBlocks => ipcRenderer.invoke('wallet-estimate-fee', numBlocks),

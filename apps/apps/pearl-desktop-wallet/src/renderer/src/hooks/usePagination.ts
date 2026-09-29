@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Transaction } from '../../../types/transaction';
 
+// A transaction can list several rows (a payment to several addresses), so match rows already shown by row, not txid.
+const rowKey = (tx: Transaction) => `${tx.type}_${tx.txid}_${tx.address}_${tx.amount}`;
+
 interface UsePaginationOptions {
   pageSize?: number;
 }
@@ -29,9 +32,9 @@ export function usePagination(options: UsePaginationOptions = {}): UsePagination
     try {
       const txs = await window.appBridge.wallet.listTransactions(count, offset);
       setActivities(prev => {
-        const existingTxids = new Set(prev.map(tx => tx.txid));
-        const newTxs = txs.filter(tx => !existingTxids.has(tx.txid));
-        return [...prev, ...newTxs];
+        const existingRows = new Set(prev.map(rowKey));
+        const newRows = txs.filter(tx => !existingRows.has(rowKey(tx)));
+        return [...prev, ...newRows];
       });
       setOffset(offset + count);
       if (txs.length < count) {
