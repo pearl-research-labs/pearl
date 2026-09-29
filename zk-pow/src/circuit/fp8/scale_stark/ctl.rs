@@ -270,6 +270,9 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         filter: Filter::default(),
     });
 
+    // ---- G1: the snap quotient, RC16'd so the snap equations are integer equations. ----
+    lookups.push(LutLookup::rc16(Column::single(m.grid_snap_quotient)));
+
     // ---- H0: the two norm-floor MAXes' order slacks (l2 and linf vs 2^-32; the muxes are
     // arithmetic constraints). ----
     lookups.push(LutLookup::rc16(Column::single(m.l2_floor_order_slack)));
@@ -536,14 +539,14 @@ mod tests {
         let lookups = scale_lut_lookups::<F>(&test_program());
         let count = |t: LutTable| lookups.iter().filter(|l| l.table == t).count();
         // Inventory documented by `scale_lut_lookups`:
-        // RC16 x62, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, DIV448 x1.
-        assert_eq!(count(LutTable::Range16), 62);
+        // RC16 x63, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, DIV448 x1.
+        assert_eq!(count(LutTable::Range16), 63);
         assert_eq!(count(LutTable::Pair128), 3);
         assert_eq!(count(LutTable::ExpInfo), 3);
         assert_eq!(count(LutTable::Clamp22), 3);
         assert_eq!(count(LutTable::Pow2D), 3);
         assert_eq!(count(LutTable::RneRnd), 3);
         assert_eq!(count(LutTable::Div448), 1);
-        assert_eq!(lookups.len(), 78);
+        assert_eq!(lookups.len(), 79);
     }
 }
