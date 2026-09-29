@@ -820,7 +820,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 
 	var (
 		debitTotal  btcutil.Amount
-		creditTotal btcutil.Amount // Excludes change
+		creditTotal btcutil.Amount
 		fee         btcutil.Amount
 		feeF64      float64
 	)
@@ -828,7 +828,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		debitTotal += deb.Amount
 	}
 	for _, cred := range details.Credits {
-		if !cred.Change {
+		if wallet.ListsCredit(details, cred) {
 			creditTotal += cred.Amount
 		}
 	}
@@ -870,8 +870,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 
 	credCat := wallet.RecvCategory(details, syncBlock.Height, w.ChainParams()).String()
 	for _, cred := range details.Credits {
-		// Change is ignored.
-		if cred.Change {
+		if !wallet.ListsCredit(details, cred) {
 			continue
 		}
 

@@ -2200,6 +2200,12 @@ func RecvCategory(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Par
 	return CreditReceive
 }
 
+// ListsCredit reports whether a wallet credit appears in transaction listings. Change is only change when the wallet
+// funded the transaction, so a payment received on a change address is listed as a receive.
+func ListsCredit(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
+	return !cred.Change || len(details.Debits) == 0
+}
+
 // listTransactions creates a object that may be marshalled to a response result
 // for a listtransactions RPC.
 //
@@ -2255,8 +2261,7 @@ outputs:
 		var spentCredit bool
 		for _, cred := range details.Credits {
 			if cred.Index == uint32(i) {
-				// Change outputs are ignored.
-				if cred.Change {
+				if !ListsCredit(details, cred) {
 					continue outputs
 				}
 
