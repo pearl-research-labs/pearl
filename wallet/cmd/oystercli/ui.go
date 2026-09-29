@@ -59,6 +59,10 @@ const (
 	maxPageRows      = 40
 )
 
+// fallbackWidth is assumed when the terminal width cannot be read; wide enough
+// that rows keep every column.
+const fallbackWidth = 100
+
 // listPageSize returns how many list rows fit the terminal, reserving chrome
 // lines for the surrounding title, description, help line, and any sibling
 // fields in the same group.
@@ -68,6 +72,26 @@ func listPageSize(chrome int) int {
 		return fallbackPageRows
 	}
 	return min(max(height-chrome, minPageRows), maxPageRows)
+}
+
+// terminalWidth returns the terminal's column count. A list row longer than
+// this wraps, so every list row must be sized against it.
+func terminalWidth() int {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width <= 0 {
+		return fallbackWidth
+	}
+	return width
+}
+
+// rowMargin is left empty at the end of every list row: some terminals wrap a
+// row that writes the last column.
+const rowMargin = 1
+
+// availableRowWidth returns the columns a row may use after gutter columns of
+// surrounding chrome.
+func availableRowWidth(gutter int) int {
+	return terminalWidth() - gutter - rowMargin
 }
 
 // spinnerDelay is how long an operation may run before a spinner appears.

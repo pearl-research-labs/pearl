@@ -6,6 +6,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/stretchr/testify/assert"
@@ -100,4 +101,14 @@ func TestSyncPercent(t *testing.T) {
 	assert.Equal(t, "100.0% (100/100)", syncPercent(&syncInfo{height: 100, peerHeight: 100}))
 	assert.Equal(t, "100.0% (120/100)", syncPercent(&syncInfo{height: 120, peerHeight: 100}))
 	assert.Equal(t, "height 42", syncPercent(&syncInfo{height: 42}))
+}
+
+func TestFmtUnixTime(t *testing.T) {
+	// Rendered in local time, so expected values are built the same way.
+	when := time.Date(2026, time.September, 29, 23, 24, 0, 0, time.Local)
+
+	assert.Equal(t, "2026-09-29 23:24", fmtUnixTime(when.Unix()))
+	assert.Equal(t, "09-29 23:24", fmtUnixTimeShort(when.Unix()))
+	assert.Equal(t, "-", fmtUnixTime(0))
+	assert.Equal(t, "-", fmtUnixTimeShort(0))
 }

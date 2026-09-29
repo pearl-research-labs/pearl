@@ -68,6 +68,14 @@ func fmtUnixTime(unix int64) string {
 	return time.Unix(unix, 0).Format("2006-01-02 15:04")
 }
 
+// fmtUnixTimeShort is fmtUnixTime without the year, for rows too narrow to fit it.
+func fmtUnixTimeShort(unix int64) string {
+	if unix == 0 {
+		return "-"
+	}
+	return time.Unix(unix, 0).Format("01-02 15:04")
+}
+
 // fmtConfs renders a confirmation count, flagging unconfirmed transactions.
 func fmtConfs(confs int64) string {
 	if confs <= 0 {

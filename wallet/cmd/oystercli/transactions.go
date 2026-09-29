@@ -5,12 +5,15 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 
 	"charm.land/huh/v2"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 )
 
+// txPageSize is the most transactions one page lists.
 const txPageSize = 15
 
 // Sentinel values for the non-transaction rows of the browser.
@@ -20,51 +23,68 @@ const (
 	txNavPrev = "__prev"
 )
 
+// txNavRows is how many navigation rows (Older, Newer, Back) can follow the list.
+const txNavRows = 3
+
+// txChrome is how many terminal lines the browser needs besides list rows: the field's title and description, the
+// blank line and help footer huh adds below it, and a spare line, since a frame as tall as the window scrolls it.
+const txChrome = 6
+
+// txListGutter is the columns a list row loses to huh's border and cursor.
+const txListGutter = 4
+
 // transactionsScreen pages through the wallet history; selecting an entry shows its full detail.
 //
-// listtransactions pages in transactions but answers in entries (a payment to several addresses lists one send for
-// each), so paging counts transactions, asking for one past the page to learn whether older history exists.
+// Each page is sized to the terminal so that its Older/Newer rows stay on screen: a field taller than the window cannot
+// be drawn, and a row wider than it wraps.
 func transactionsScreen(c *client) error {
-	offset := 0
+	var (
+		pager    txPager
+		selected string
+	)
 	for {
-		var entries []btcjson.ListTransactionsResult
+		viewportRows := listPageSize(txChrome)
+		maxRows := max(viewportRows-txNavRows, 1)
+		maxTxs := min(txPageSize, maxRows)
+
+		var view txPageView
 		err := withSpinner("Loading transactions...", func() error {
-			var listErr error
-			entries, listErr = c.listTransactions(txPageSize+1, offset)
-			return listErr
+			var loadErr error
+			view, loadErr = loadTxPage(c, pager.offset, maxTxs, maxRows)
+			return loadErr
 		})
 		if err != nil {
 			return err
 		}
-
-		page, shown := txPage(entries, txPageSize)
-		hasOlder := len(page) < len(entries)
-		if len(page) == 0 && offset == 0 {
+		if view.shown == 0 && pager.offset == 0 {
 			printWarn("No transactions in this wallet yet.")
 			return nil
 		}
 
-		opts := make([]huh.Option[string], 0, len(page)+3)
-		for _, entry := range page {
-			opts = append(opts, huh.NewOption(txRow(entry), entry.TxID))
+		layout := newTxLayout(view.entries, availableRowWidth(txListGutter))
+		opts := make([]huh.Option[string], 0, len(view.entries)+txNavRows)
+		for _, entry := range view.entries {
+			opts = append(opts, huh.NewOption(txRow(entry, layout), entry.TxID))
 		}
-		if hasOlder {
+		if view.older {
 			opts = append(opts, huh.NewOption(th.subtle.Render("→ Older transactions"), txNavNext))
 		}
-		if offset > 0 {
+		if pager.offset > 0 {
 			opts = append(opts, huh.NewOption(th.subtle.Render("← Newer transactions"), txNavPrev))
 		}
 		opts = append(opts, huh.NewOption(th.subtle.Render("Back"), txNavBack))
 
-		// Default to the first row (the newest transaction), not Back:
-		// huh starts the cursor on the option matching the bound value.
-		selected := opts[0].Value
+		// huh starts the cursor on the option matching the bound value, which keeps it on the row just inspected and
+		// otherwise on the first row (the newest transaction), not Back.
+		if selected == "" {
+			selected = opts[0].Value
+		}
 		form := newForm(huh.NewGroup(
 			huh.NewSelect[string]().
-				Title(fmt.Sprintf("Transactions %d-%d", offset+1, offset+shown)).
-				Description("Type / to filter, enter for details.").
+				Title(txTitle(pager.offset, view.shown)).
+				Description("Enter: details · /: filter this page · Older/Newer: change page").
 				Options(opts...).
-				Height(txPageSize + 5).
+				Height(min(len(opts), viewportRows) + 2).
 				Value(&selected),
 		))
 		submitted, err := runForm(form)
@@ -77,9 +97,11 @@ func transactionsScreen(c *client) error {
 
 		switch selected {
 		case txNavNext:
-			offset += shown
+			pager.older(view.shown)
+			selected = ""
 		case txNavPrev:
-			offset = max(offset-txPageSize, 0)
+			pager.newer()
+			selected = ""
 		default:
 			if err := showTransactionDetail(c, selected); err != nil {
 				printError(err)
@@ -88,19 +110,107 @@ func transactionsScreen(c *client) error {
 	}
 }
 
-// txPage trims entries to at most size transactions, reporting how many it kept. All entries for one transaction
-// arrive together, so a change of txid starts a new one.
-func txPage(entries []btcjson.ListTransactionsResult, size int) (page []btcjson.ListTransactionsResult, shown int) {
+func txTitle(offset, shown int) string {
+	if shown == 0 {
+		return "Transactions"
+	}
+	return fmt.Sprintf("Transactions %d-%d", offset+1, offset+shown)
+}
+
+// txPager tracks the listtransactions offset of the page on screen. Pages hold as many transactions as the terminal
+// fits, so their sizes differ and Newer can only return to the page the user came from by remembering it.
+type txPager struct {
+	offset int
+	prev   []int
+}
+
+// older moves past a page of shown transactions.
+func (p *txPager) older(shown int) {
+	p.prev = append(p.prev, p.offset)
+	p.offset += shown
+}
+
+func (p *txPager) newer() {
+	last := len(p.prev) - 1
+	if last < 0 {
+		return
+	}
+	p.offset = p.prev[last]
+	p.prev = p.prev[:last]
+}
+
+// txGroup is the entries one transaction lists.
+type txGroup []btcjson.ListTransactionsResult
+
+// groupTransactions splits a listtransactions reply into transactions. All entries of one transaction arrive together,
+// so a change of txid starts a new one.
+func groupTransactions(entries []btcjson.ListTransactionsResult) []txGroup {
+	var groups []txGroup
 	for i, entry := range entries {
 		if i > 0 && entry.TxID == entries[i-1].TxID {
+			groups[len(groups)-1] = append(groups[len(groups)-1], entry)
 			continue
 		}
-		if shown == size {
-			return entries[:i], shown
-		}
-		shown++
+		groups = append(groups, txGroup{entry})
 	}
-	return entries, shown
+	return groups
+}
+
+// newestFirst orders one page as the Desktop Wallet does. The daemon lists unmined transactions in txid order, so they
+// are put newest first; mined ones already arrive newest first. Only a whole page may be reordered: the daemon's order
+// fixes which transactions a page holds, and sorting across pages would repeat some and skip others.
+func newestFirst(groups []txGroup) []txGroup {
+	unmined := 0
+	for unmined < len(groups) && groups[unmined][0].Confirmations <= 0 {
+		unmined++
+	}
+	slices.SortStableFunc(groups[:unmined], func(a, b txGroup) int {
+		return cmp.Compare(b[0].Time, a[0].Time)
+	})
+	return groups
+}
+
+// txPageView is one screen of the history.
+type txPageView struct {
+	entries []btcjson.ListTransactionsResult
+	shown   int  // transactions in entries
+	older   bool // history continues past this page
+}
+
+// loadTxPage reads the page at offset. listtransactions counts and pages in transactions but answers in entries (a
+// payment to several addresses lists one send for each), so it asks for one transaction past the page to learn whether
+// older history exists.
+func loadTxPage(c *client, offset, maxTxs, maxRows int) (txPageView, error) {
+	entries, err := c.listTransactions(maxTxs+1, offset)
+	if err != nil {
+		return txPageView{}, err
+	}
+	return planTxPage(entries, maxTxs, maxRows), nil
+}
+
+// planTxPage picks what one screen shows from a reply that may hold a transaction more than maxTxs: whole transactions
+// only, and no more rows than maxRows, so the navigation rows that follow stay on screen. The first transaction is
+// always kept, even when its own entries exceed maxRows.
+func planTxPage(entries []btcjson.ListTransactionsResult, maxTxs, maxRows int) txPageView {
+	groups := groupTransactions(entries)
+
+	var (
+		view txPageView
+		rows int
+	)
+	for _, group := range groups {
+		if view.shown == maxTxs || (view.shown > 0 && rows+len(group) > maxRows) {
+			break
+		}
+		rows += len(group)
+		view.shown++
+	}
+	view.older = view.shown < len(groups)
+
+	for _, group := range newestFirst(groups[:view.shown]) {
+		view.entries = append(view.entries, group...)
+	}
+	return view
 }
 
 // showTransactionDetail prints the full record for one transaction and, for a pending send, offers Rebroadcast and

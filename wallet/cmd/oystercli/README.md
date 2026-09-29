@@ -29,7 +29,9 @@ for its exact location — point them at the built `oyster`, or pass
   automatic unlock prompting; the fee rate defaults to the network's minimum
   relay fee (0.00001 PRL/kB).
 - **Receive** — fresh or current addresses, rendered with a scannable QR code.
-- **Transactions** — paged history browser with filtering and full detail view.
+- **Transactions** — paged history browser, newest first, with page filtering
+  and a full detail view. Pages are sized to the terminal, so the **Older** and
+  **Newer** rows always sit right under the list; `/` filters the current page.
   A pending send's detail view offers **Rebroadcast** and **Remove** (see
   below).
 - **Accounts** — list, create, rename, and inspect addresses.
