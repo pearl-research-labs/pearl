@@ -36,14 +36,18 @@ class WalletService extends WalletRpcMethods implements WalletApi {
     return allTransactions.filter(isShown).slice(from, from + count);
   }
 
-  // The dashboard polls this, so it reads history newest first a page at a time rather than listing all of it. The
-  // filter can hide whole pages (a miner's immature coinbases), so keep paging until enough rows are shown.
+  // The dashboard polls this, so it reads history newest first a page at a time rather than listing all of it.
+  // Unmined transactions come first in no time order and the filter can hide whole pages (a miner's immature
+  // coinbases), so read on until count shown rows are mined; every row after those is older.
   async listRecentTransactions(count: number) {
     const shown: Transaction[] = [];
-    for (let from = 0; shown.length < count; from += RECENT_PAGE_SIZE) {
+    let shownMined = 0;
+    for (let from = 0; shownMined < count; from += RECENT_PAGE_SIZE) {
       const page = await super.listTransactions(RECENT_PAGE_SIZE, from);
       if (page.length === 0) break;
-      shown.push(...page.map(formatTransaction).filter(isShown));
+      const rows: Transaction[] = page.map(formatTransaction).filter(isShown);
+      shown.push(...rows);
+      shownMined += rows.filter(tx => tx.blockhash).length;
     }
     return sortNewestFirst(shown).slice(0, count);
   }
