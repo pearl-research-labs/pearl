@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/pearl-research-labs/pearl/node/blockchain"
 	"github.com/pearl-research-labs/pearl/node/btcec"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
@@ -2178,32 +2177,6 @@ func (c CreditCategory) String() string {
 	default:
 		return "unknown"
 	}
-}
-
-// RecvCategory returns the category of received credit outputs from a
-// transaction record.  The passed block chain height is used to distinguish
-// immature from mature coinbase outputs.
-//
-// TODO: This is intended for use by the RPC server and should be moved out of
-// this package at a later time.
-func RecvCategory(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params) CreditCategory {
-	if blockchain.IsCoinBaseTx(&details.MsgTx) {
-		if hasMinConfs(
-			int32(net.CoinbaseMaturity), details.Block.Height,
-			syncHeight,
-		) {
-
-			return CreditGenerate
-		}
-		return CreditImmature
-	}
-	return CreditReceive
-}
-
-// IsChange reports whether a wallet credit is change: an output the wallet pays back to itself in a transaction it
-// funded. A payment received on one of the wallet's change addresses is therefore not change.
-func IsChange(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
-	return cred.Change && len(details.Debits) > 0
 }
 
 // BlockIdentifier identifies a block by either a height or a hash.

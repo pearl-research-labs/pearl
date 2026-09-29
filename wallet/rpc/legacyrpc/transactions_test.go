@@ -1,6 +1,8 @@
 package legacyrpc
 
 import (
+	"bytes"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -88,6 +91,93 @@ func TestListEntries(t *testing.T) {
 	assert.Equal(t, []btcjson.ListTransactionsResult{}, listEntries(nil), "an empty listing encodes as [], not null")
 }
 
+func TestTransactionResult(t *testing.T) {
+	var spend wire.MsgTx
+	spend.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: 0}, nil, nil))
+	spend.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: 1}, nil, nil))
+	spend.AddTxOut(wire.NewTxOut(50_000, nil))
+	spend.AddTxOut(wire.NewTxOut(49_000, nil))
+	spendDetails := testTxDetails(chainhash.Hash{4}, spend, testBlock)
+	spendDetails.Debits = []wtxmgr.DebitRecord{{Amount: 60_000, Index: 0}, {Amount: 40_000, Index: 1}}
+	selfPayment := wallet.Tx{
+		TxDetails:     spendDetails,
+		Confirmations: 3,
+		Fee:           1_000,
+		Outputs: []wallet.TxOutput{
+			{Index: 0, Amount: 50_000, Sent: true, Received: true, Address: "own", Account: "default"},
+		},
+	}
+	consolidation := selfPayment
+	consolidation.Outputs = nil
+
+	var receive wire.MsgTx
+	receive.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: 0}, nil, nil))
+	receive.AddTxOut(wire.NewTxOut(70_000, nil))
+	pending := wallet.Tx{
+		TxDetails: testTxDetails(chainhash.Hash{5}, receive, testUnmined),
+		Outputs:   []wallet.TxOutput{{Index: 0, Amount: 70_000, Received: true, Address: "own", Account: "default"}},
+	}
+
+	fee := 0.00001
+	send := btcjson.GetTransactionDetailsResult{Category: "send", Amount: -0.001, Fee: &fee}
+	tests := []struct {
+		name string
+		tx   wallet.Tx
+		want btcjson.GetTransactionResult
+	}{
+		{
+			name: "payment to the wallet's own address",
+			tx:   selfPayment,
+			want: btcjson.GetTransactionResult{
+				Amount:        0.0005,
+				Fee:           fee,
+				Confirmations: 3,
+				BlockHash:     testBlock.Hash.String(),
+				BlockTime:     testBlock.Time.Unix(),
+				Details: []btcjson.GetTransactionDetailsResult{
+					send,
+					{Account: "default", Address: "own", Category: "receive", Amount: 0.0005},
+				},
+			},
+		},
+		{
+			name: "transfer to the wallet's own change",
+			tx:   consolidation,
+			want: btcjson.GetTransactionResult{
+				Fee:           fee,
+				Confirmations: 3,
+				BlockHash:     testBlock.Hash.String(),
+				BlockTime:     testBlock.Time.Unix(),
+				Details:       []btcjson.GetTransactionDetailsResult{send},
+			},
+		},
+		{
+			name: "pending receive",
+			tx:   pending,
+			want: btcjson.GetTransactionResult{
+				Amount: 0.0007,
+				Details: []btcjson.GetTransactionDetailsResult{
+					{Account: "default", Address: "own", Category: "receive", Amount: 0.0007},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			txid := test.tx.Hash.String()
+			test.want.TxID = txid
+			test.want.Hex = txHex(t, &test.tx.MsgTx)
+			test.want.Time = testReceived.Unix()
+			test.want.TimeReceived = testReceived.Unix()
+			test.want.WalletConflicts = []string{}
+
+			got, err := transactionResult(txid, &test.tx)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
 func testTxDetails(hash chainhash.Hash, msgTx wire.MsgTx, block wtxmgr.BlockMeta) wtxmgr.TxDetails {
 	return wtxmgr.TxDetails{
 		TxRecord: wtxmgr.TxRecord{MsgTx: msgTx, Hash: hash, Received: testReceived},
@@ -99,4 +189,12 @@ func coinbaseTx() wire.MsgTx {
 	var tx wire.MsgTx
 	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: wire.MaxPrevOutIndex}, nil, nil))
 	return tx
+}
+
+func txHex(t *testing.T, tx *wire.MsgTx) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	require.NoError(t, tx.Serialize(&buf))
+	return hex.EncodeToString(buf.Bytes())
 }

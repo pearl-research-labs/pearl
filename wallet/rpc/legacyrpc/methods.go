@@ -782,127 +782,14 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		return nil, err
 	}
 
-	details, err := wallet.UnstableAPI(w).TxDetails(txHash)
-	if err != nil {
-		return nil, err
-	}
-	if details == nil {
+	tx, err := w.Transaction(txHash)
+	if errors.Is(err, wallet.ErrNoTx) {
 		return nil, &ErrNoTransactionInfo
 	}
-
-	syncBlock := w.Manager.SyncedTo()
-
-	// TODO: The serialized transaction is already in the DB, so
-	// reserializing can be avoided here.
-	var txBuf bytes.Buffer
-	txBuf.Grow(details.MsgTx.SerializeSize())
-	err = details.MsgTx.Serialize(&txBuf)
 	if err != nil {
 		return nil, err
 	}
-
-	// TODO: Add a "generated" field to this result type.  "generated":true
-	// is only added if the transaction is a coinbase.
-	ret := btcjson.GetTransactionResult{
-		TxID:            cmd.Txid,
-		Hex:             hex.EncodeToString(txBuf.Bytes()),
-		Time:            details.Received.Unix(),
-		TimeReceived:    details.Received.Unix(),
-		WalletConflicts: []string{}, // Not saved
-		//Generated:     blockchain.IsCoinBaseTx(&details.MsgTx),
-	}
-
-	if details.Block.Height != -1 {
-		ret.BlockHash = details.Block.Hash.String()
-		ret.BlockTime = details.Block.Time.Unix()
-		ret.Confirmations = int64(confirms(details.Block.Height, syncBlock.Height))
-	}
-
-	var (
-		debitTotal  btcutil.Amount
-		creditTotal btcutil.Amount
-		fee         btcutil.Amount
-		feeF64      float64
-	)
-	for _, deb := range details.Debits {
-		debitTotal += deb.Amount
-	}
-	for _, cred := range details.Credits {
-		if !wallet.IsChange(details, cred) {
-			creditTotal += cred.Amount
-		}
-	}
-	// Fee can only be determined if every input is a debit.
-	if len(details.Debits) == len(details.MsgTx.TxIn) {
-		var outputTotal btcutil.Amount
-		for _, output := range details.MsgTx.TxOut {
-			outputTotal += btcutil.Amount(output.Value)
-		}
-		fee = debitTotal - outputTotal
-		feeF64 = fee.ToPRL()
-	}
-
-	if len(details.Debits) == 0 {
-		// Credits must be set later, but since we know the full length
-		// of the details slice, allocate it with the correct cap.
-		ret.Details = make([]btcjson.GetTransactionDetailsResult, 0, len(details.Credits))
-	} else {
-		ret.Details = make([]btcjson.GetTransactionDetailsResult, 1, len(details.Credits)+1)
-
-		ret.Details[0] = btcjson.GetTransactionDetailsResult{
-			// Fields left zeroed:
-			//   InvolvesWatchOnly
-			//   Account
-			//   Address
-			//   Vout
-			//
-			// TODO(jrick): Address and Vout should always be set,
-			// but we're doing the wrong thing here by not matching
-			// core.  Instead, gettransaction should only be adding
-			// details for transaction outputs, just like
-			// listtransactions (but using the short result format).
-			Category: "send",
-			Amount:   (-debitTotal).ToPRL(), // negative since it is a send
-			Fee:      &feeF64,
-		}
-		ret.Fee = feeF64
-	}
-
-	credCat := wallet.RecvCategory(details, syncBlock.Height, w.ChainParams()).String()
-	for _, cred := range details.Credits {
-		if wallet.IsChange(details, cred) {
-			continue
-		}
-
-		var address string
-		var accountName string
-		_, addrs, _, err := txscript.ExtractPkScriptAddrs(details.MsgTx.TxOut[cred.Index].PkScript, w.ChainParams())
-		if err == nil && len(addrs) == 1 {
-			addr := addrs[0]
-			address = addr.EncodeAddress()
-			account, err := w.AccountOfAddress(addr)
-			if err == nil {
-				name, err := w.AccountName(waddrmgr.KeyScopeBIP0086, account)
-				if err == nil {
-					accountName = name
-				}
-			}
-		}
-
-		ret.Details = append(ret.Details, btcjson.GetTransactionDetailsResult{
-			// Fields left zeroed:
-			//   InvolvesWatchOnly
-			//   Fee
-			Account:  accountName,
-			Address:  address,
-			Category: credCat,
-			Amount:   cred.Amount.ToPRL(),
-			Vout:     cred.Index,
-		})
-	}
-
-	ret.Amount = creditTotal.ToPRL()
-	return ret, nil
+	return transactionResult(cmd.Txid, tx)
 }
 
 // These generators create the following global variables in this package:

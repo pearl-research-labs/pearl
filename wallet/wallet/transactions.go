@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/pearl-research-labs/pearl/node/blockchain"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
@@ -168,7 +169,7 @@ func classify(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params)
 		TxDetails:       *details,
 		Confirmations:   calcConf(details.Block.Height, syncHeight),
 		Fee:             txFee(details),
-		ReceiveCategory: RecvCategory(details, syncHeight, net),
+		ReceiveCategory: receiveCategory(details, syncHeight, net),
 	}
 
 	credits := make(map[uint32]wtxmgr.CreditRecord, len(details.Credits))
@@ -178,7 +179,7 @@ func classify(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params)
 	funded := len(details.Debits) > 0
 	for i, output := range details.MsgTx.TxOut {
 		cred, toWallet := credits[uint32(i)]
-		change := toWallet && IsChange(details, cred)
+		change := toWallet && isChange(details, cred)
 		out := TxOutput{
 			Index:    uint32(i),
 			Amount:   btcutil.Amount(output.Value),
@@ -190,6 +191,24 @@ func classify(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params)
 		}
 	}
 	return tx
+}
+
+// isChange reports whether a wallet credit is change: an output the wallet pays back to itself in a transaction it
+// funded. A payment received on one of the wallet's change addresses is therefore not change.
+func isChange(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
+	return cred.Change && len(details.Debits) > 0
+}
+
+// receiveCategory returns the category of the outputs details pays to the wallet. Coinbase outputs stay immature until
+// the chain lets them be spent.
+func receiveCategory(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params) CreditCategory {
+	if !blockchain.IsCoinBaseTx(&details.MsgTx) {
+		return CreditReceive
+	}
+	if hasMinConfs(int32(net.CoinbaseMaturity), details.Block.Height, syncHeight) {
+		return CreditGenerate
+	}
+	return CreditImmature
 }
 
 // txFee returns the transaction's fee, or zero unless every input is the wallet's, since the wallet knows only its own
