@@ -26,6 +26,9 @@ function registerWalletIpc(ms: ManagerService) {
   ipcMain.handle('wallet-list-transactions', (_event, count: number = 10, from: number = 0) =>
     ms.ensureWalletService().listTransactions(count, from)
   );
+  ipcMain.handle('wallet-list-recent-transactions', (_event, count: number) =>
+    ms.ensureWalletService().listRecentTransactions(count)
+  );
   ipcMain.handle('wallet-get-balance', (_event, account: string, minconf: number = 1) =>
     ms.ensureWalletService().getBalance(account, minconf)
   );

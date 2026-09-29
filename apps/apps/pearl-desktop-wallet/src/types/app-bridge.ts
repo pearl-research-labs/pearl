@@ -51,6 +51,8 @@ interface WalletApi {
 
   listTransactions: (count?: number, from?: number) => Promise<Transaction[]>;
 
+  listRecentTransactions: (count: number) => Promise<Transaction[]>;
+
   getBalance: (account?: string, minconf?: number) => Promise<number>;
 
   validateAddress: (address: string) => Promise<{ isValid: boolean }>;

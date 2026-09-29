@@ -32,7 +32,10 @@ export function formatTransaction(tx: RawTransaction): Transaction {
   };
 }
 
+export function sortNewestFirst(transactions: Transaction[]): Transaction[] {
+  return transactions.sort((a: Transaction, b: Transaction) => b.time - a.time);
+}
+
 export function formatAndSortTransactions(transactions: any[]): Transaction[] {
-  const formatted = transactions.map((tx: any) => formatTransaction(tx));
-  return formatted.sort((a: Transaction, b: Transaction) => b.time - a.time);
+  return sortNewestFirst(transactions.map((tx: any) => formatTransaction(tx)));
 }
