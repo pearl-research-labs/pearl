@@ -21,11 +21,12 @@ import (
 // and the help footer.
 const coinsChrome = 10
 
-// slowListThreshold is where rendering starts to lag. huh redraws every option
-// on every keystroke, about 15us each per BenchmarkCoinListFrame, so this sits
-// near a 30ms frame. Past it the list is warned about rather than truncated:
-// hiding outputs would defeat the point of the screen.
-const slowListThreshold = 2000
+// coinListLimit bounds the rows handed to huh, which is not virtualized: one
+// key press redraws every option about nine times at roughly 15ms per 1000
+// options each, so tens of thousands of outputs cost seconds per key press. A
+// larger wallet is searched first and lists what matches, since cutting the
+// list off would hide the output being looked for.
+const coinListLimit = 500
 
 // coinMeta is the part of an output's description that never changes.
 // listunspent omits locked outputs entirely and listlockunspent returns bare
@@ -52,36 +53,57 @@ type coinRow struct {
 	locked bool
 }
 
-// coinsScreen is a scrolling browser over every output the wallet holds.
+// coinsScreen is a scrolling browser over the outputs the wallet holds.
 // Locking excludes an output from coin selection until it is unlocked or the
 // daemon restarts.
 //
-// The whole list goes into one scrolling field rather than being split across
-// pages so that the filter searches every output and a single submit can lock
-// and unlock anywhere in the wallet. Submitting applies and redraws; esc
-// leaves.
+// Up to coinListLimit outputs go into one scrolling field, so the filter
+// searches every output and a single submit can lock and unlock anywhere in
+// the wallet. A larger wallet is searched first (see askCoinQuery) and the
+// field lists what matches; lock changes then apply to the listed outputs
+// only. Submitting applies and redraws; esc leaves, or goes back to the search.
 func coinsScreen(c *client) error {
 	rows, err := loadCoins(c)
 	if err != nil {
 		return err
 	}
 
+	// ask is false right after an apply, which redraws the same search so the
+	// changed rows show in place.
+	query, ask := "", true
 	for {
 		if len(rows) == 0 {
 			printWarn("No unspent outputs.")
 			return nil
 		}
 
+		shown := rows
+		searching := len(rows) > coinListLimit
+		if searching {
+			if ask {
+				var ok bool
+				if query, ok, err = askCoinQuery(query, len(rows)); err != nil || !ok {
+					return err
+				}
+			}
+			ask = true
+			if shown = searchCoins(rows, query); len(shown) == 0 {
+				printWarn(fmt.Sprintf("No outputs match %q.", query))
+				continue
+			}
+		}
+		matched := len(shown)
+		shown = shown[:min(matched, coinListLimit)]
+
 		printTitle("Coins")
 		lipgloss.Println("  " + coinsSummary(rows))
-		if len(rows) > slowListThreshold {
-			printWarn(fmt.Sprintf("%d outputs is enough to make scrolling "+
-				"sluggish; press / to filter.", len(rows)))
+		if len(shown) < len(rows) {
+			printWarn(coinsShownNote(len(shown), matched, len(rows), query))
 		}
 
-		opts := make([]huh.Option[string], 0, len(rows))
-		picked := make([]string, 0, len(rows))
-		for _, row := range rows {
+		opts := make([]huh.Option[string], 0, len(shown))
+		picked := make([]string, 0, len(shown))
+		for _, row := range shown {
 			opts = append(opts, huh.NewOption(coinRowLabel(row), row.key))
 			if row.locked {
 				picked = append(picked, row.key)
@@ -105,10 +127,14 @@ func coinsScreen(c *client) error {
 			return err
 		}
 		if !submitted {
+			if searching {
+				continue
+			}
 			return nil
 		}
 
-		locked, unlocked, applyErr := applyLockChanges(c, rows, picked)
+		ask = false
+		locked, unlocked, applyErr := applyLockChanges(c, shown, picked)
 		switch {
 		case applyErr != nil:
 			printError(applyErr)
@@ -125,6 +151,70 @@ func coinsScreen(c *client) error {
 				return err
 			}
 		}
+	}
+}
+
+// askCoinQuery asks what to look for among a wallet too large to list whole.
+// An empty answer lists the largest outputs. It reports false when the user
+// backs out.
+func askCoinQuery(previous string, total int) (string, bool, error) {
+	query := previous
+	ok, err := runForm(newForm(huh.NewGroup(
+		huh.NewInput().
+			Title(fmt.Sprintf("Search %d outputs", total)).
+			Description(fmt.Sprintf("Address, txid, amount or \"locked\"; empty lists the largest %d.", coinListLimit)).
+			Value(&query),
+	)))
+	return strings.TrimSpace(query), ok, err
+}
+
+// searchCoins returns the rows matching every word of query, in the order the
+// rows are already in. Matching is case-insensitive over the whole outpoint,
+// address, amount and lock state, not just the shortened text a row shows.
+func searchCoins(rows []coinRow, query string) []coinRow {
+	words := strings.Fields(strings.ToLower(query))
+	if len(words) == 0 {
+		return rows
+	}
+
+	var found []coinRow
+	for _, row := range rows {
+		if containsAll(coinSearchText(row), words) {
+			found = append(found, row)
+		}
+	}
+	return found
+}
+
+func containsAll(text string, words []string) bool {
+	for _, word := range words {
+		if !strings.Contains(text, word) {
+			return false
+		}
+	}
+	return true
+}
+
+func coinSearchText(row coinRow) string {
+	parts := []string{row.key, row.meta.address}
+	if row.known {
+		parts = append(parts, fmtPRLFloat(row.meta.amount))
+	}
+	if row.locked {
+		parts = append(parts, "locked")
+	}
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+// coinsShownNote says why the list holds fewer outputs than the wallet does.
+func coinsShownNote(shown, matched, total int, query string) string {
+	switch {
+	case query == "":
+		return fmt.Sprintf("Showing the largest %d of %d outputs.", shown, total)
+	case shown < matched:
+		return fmt.Sprintf("Showing %d of the %d outputs matching %q (%d in the wallet).", shown, matched, query, total)
+	default:
+		return fmt.Sprintf("%d of %d outputs match %q.", shown, total, query)
 	}
 }
 

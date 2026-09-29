@@ -36,7 +36,9 @@ for its exact location — point them at the built `oyster`, or pass
   A pending send's detail view offers **Rebroadcast** and **Remove** (see
   below).
 - **Accounts** — list, create, rename, and inspect addresses.
-- **Coins** — UTXO listing plus lock/unlock coin control.
+- **Coins** — UTXO listing plus lock/unlock coin control. A wallet with more
+  than 500 outputs is searched first (address, txid, amount, or `locked`) and
+  lists what matches, since the list redraws every row on each key press.
 - **Security** — lock/unlock, passphrase change, WIF import/export (guarded),
   message signing and verification.
 - **Node & sync** — oyster and pearld state at a glance, including the SPV
