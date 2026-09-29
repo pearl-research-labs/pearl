@@ -276,8 +276,7 @@ func TestTransactions(t *testing.T) {
 	})
 
 	t.Run("match", func(t *testing.T) {
-		pays := w.PaysAnyOf(map[string]struct{}{string(changeAddr.ScriptAddress()): {}})
-		txs, err := w.Transactions(TxQuery{Match: pays, Limit: NoLimit})
+		txs, err := w.Transactions(TxQuery{Match: w.PaysAnyOf(changeAddr), Limit: NoLimit})
 		require.NoError(t, err)
 		assert.Equal(t, []string{changePayment}, txHashes(txs), "the consolidation pays it too but shows nothing")
 

@@ -120,18 +120,21 @@ func (w *Wallet) Transaction(hash *chainhash.Hash) (*Tx, error) {
 	return &txs[0], nil
 }
 
-// PaysAnyOf returns a TxQuery match for transactions with a credit paying a Taproot address whose script address is
-// in scriptAddrs.
-func (w *Wallet) PaysAnyOf(scriptAddrs map[string]struct{}) func(*Tx) bool {
+// PaysAnyOf returns a TxQuery match for transactions with a credit paying one of addrs. Only Taproot credits match.
+func (w *Wallet) PaysAnyOf(addrs ...btcutil.Address) func(*Tx) bool {
+	scriptAddrs := make(map[string]struct{}, len(addrs))
+	for _, addr := range addrs {
+		scriptAddrs[string(addr.ScriptAddress())] = struct{}{}
+	}
 	return func(tx *Tx) bool {
 		return slices.ContainsFunc(tx.Credits, func(cred wtxmgr.CreditRecord) bool {
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(tx.MsgTx.TxOut[cred.Index].PkScript, w.chainParams)
-			if err != nil || len(addrs) != 1 {
+			_, paid, _, _ := txscript.ExtractPkScriptAddrs(tx.MsgTx.TxOut[cred.Index].PkScript, w.chainParams)
+			if len(paid) != 1 {
 				return false
 			}
-			taproot, ok := addrs[0].(*btcutil.AddressTaproot)
+			taproot, ok := paid[0].(*btcutil.AddressTaproot)
 			if !ok {
-				log.Warnf("Skipping non-Taproot address when matching transactions by address: %v", addrs[0])
+				log.Warnf("Skipping non-Taproot address when matching transactions by address: %v", paid[0])
 				return false
 			}
 			_, ok = scriptAddrs[string(taproot.ScriptAddress())]
@@ -140,7 +143,6 @@ func (w *Wallet) PaysAnyOf(scriptAddrs map[string]struct{}) func(*Tx) bool {
 	}
 }
 
-// scan yields the wallet's transactions in q's height range and order.
 func (w *Wallet) scan(txmgrNs walletdb.ReadBucket, q TxQuery) iter.Seq2[*wtxmgr.TxDetails, error] {
 	begin, end, walk := q.SinceHeight, int32(-1), slices.All[[]wtxmgr.TxDetails]
 	if q.NewestFirst {
@@ -161,9 +163,7 @@ func (w *Wallet) scan(txmgrNs walletdb.ReadBucket, q TxQuery) iter.Seq2[*wtxmgr.
 	}
 }
 
-// classify works out what a listing shows for details: a send for every output the wallet paid out and a receive for
-// every output paid to the wallet. Change shows nothing, and neither does spending a received output: the spend shows
-// once, on the transaction that makes it.
+// classify leaves a spent receive showing only its receive: the spend shows once, on the transaction that makes it.
 func classify(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params) Tx {
 	tx := Tx{
 		TxDetails:       *details,
@@ -179,7 +179,9 @@ func classify(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params)
 	funded := len(details.Debits) > 0
 	for i, output := range details.MsgTx.TxOut {
 		cred, toWallet := credits[uint32(i)]
-		change := toWallet && isChange(details, cred)
+		// Change is what the wallet pays back to itself in a transaction it funded; a payment received on one of its
+		// change addresses is a receive.
+		change := toWallet && funded && cred.Change
 		out := TxOutput{
 			Index:    uint32(i),
 			Amount:   btcutil.Amount(output.Value),
@@ -193,14 +195,7 @@ func classify(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params)
 	return tx
 }
 
-// isChange reports whether a wallet credit is change: an output the wallet pays back to itself in a transaction it
-// funded. A payment received on one of the wallet's change addresses is therefore not change.
-func isChange(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
-	return cred.Change && len(details.Debits) > 0
-}
-
-// receiveCategory returns the category of the outputs details pays to the wallet. Coinbase outputs stay immature until
-// the chain lets them be spent.
+// receiveCategory keeps coinbase outputs immature until the chain lets them be spent.
 func receiveCategory(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Params) CreditCategory {
 	if !blockchain.IsCoinBaseTx(&details.MsgTx) {
 		return CreditReceive
@@ -211,8 +206,6 @@ func receiveCategory(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.
 	return CreditImmature
 }
 
-// txFee returns the transaction's fee, or zero unless every input is the wallet's, since the wallet knows only its own
-// inputs' values.
 func txFee(details *wtxmgr.TxDetails) btcutil.Amount {
 	if len(details.Debits) != len(details.MsgTx.TxIn) {
 		return 0
@@ -227,9 +220,10 @@ func txFee(details *wtxmgr.TxDetails) btcutil.Amount {
 	return fee
 }
 
-// resolveOutputs fills in the addresses and accounts of the outputs txs show. It runs on returned transactions only,
-// since the account lookups read the address manager.
+// resolveOutputs runs on returned transactions only, since its account lookups read the address manager.
 func (w *Wallet) resolveOutputs(addrmgrNs walletdb.ReadBucket, txs []Tx) {
+	// A miner's coinbases pay one address over and over, so each address's account is looked up once.
+	accounts := make(map[string]string)
 	for i := range txs {
 		tx := &txs[i]
 		for j := range tx.Outputs {
@@ -239,9 +233,15 @@ func (w *Wallet) resolveOutputs(addrmgrNs walletdb.ReadBucket, txs []Tx) {
 				continue
 			}
 			out.Address = addrs[0].EncodeAddress()
-			if out.Received {
-				out.Account = addressAccount(w.Manager, addrmgrNs, addrs[0])
+			if !out.Received {
+				continue
 			}
+			account, ok := accounts[out.Address]
+			if !ok {
+				account = addressAccount(w.Manager, addrmgrNs, addrs[0])
+				accounts[out.Address] = account
+			}
+			out.Account = account
 		}
 	}
 }

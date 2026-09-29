@@ -1158,16 +1158,16 @@ func listAddressTransactions(icmd interface{}, w *wallet.Wallet) (interface{}, e
 	}
 
 	// Decode addresses.
-	scriptAddrs := make(map[string]struct{})
+	addrs := make([]btcutil.Address, 0, len(cmd.Addresses))
 	for _, addrStr := range cmd.Addresses {
 		addr, err := decodeAddress(addrStr, w.ChainParams())
 		if err != nil {
 			return nil, err
 		}
-		scriptAddrs[string(addr.ScriptAddress())] = struct{}{}
+		addrs = append(addrs, addr)
 	}
 
-	txs, err := w.Transactions(wallet.TxQuery{Match: w.PaysAnyOf(scriptAddrs), Limit: wallet.NoLimit})
+	txs, err := w.Transactions(wallet.TxQuery{Match: w.PaysAnyOf(addrs...), Limit: wallet.NoLimit})
 	if err != nil {
 		return nil, err
 	}

@@ -10,10 +10,8 @@ import (
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 )
 
-// listEntries renders txs as listtransactions entries: for every output a transaction shows, a send when the wallet
-// paid it out and a receive when it pays the wallet.
 func listEntries(txs []wallet.Tx) []btcjson.ListTransactionsResult {
-	entries := []btcjson.ListTransactionsResult{}
+	entries := make([]btcjson.ListTransactionsResult, 0, len(txs))
 	for i := range txs {
 		tx := &txs[i]
 		base := btcjson.ListTransactionsResult{
@@ -53,8 +51,8 @@ func listEntries(txs []wallet.Tx) []btcjson.ListTransactionsResult {
 	return entries
 }
 
-// transactionResult renders tx as a gettransaction result. Unlike listtransactions, its details show the whole debit
-// as one send, without an address or output index.
+// transactionResult keeps gettransaction's legacy details, one send for the whole debit without an address or output
+// index, because clients already parse that shape.
 func transactionResult(txid string, tx *wallet.Tx) (btcjson.GetTransactionResult, error) {
 	var txBuf bytes.Buffer
 	txBuf.Grow(tx.MsgTx.SerializeSize())
