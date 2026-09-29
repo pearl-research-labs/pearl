@@ -10,6 +10,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/txscript"
+	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
 )
@@ -224,4 +225,18 @@ func (w *Wallet) resolveOutputs(addrmgrNs walletdb.ReadBucket, txs []Tx) {
 			}
 		}
 	}
+}
+
+// addressAccount names the account that owns addr. A listing shows an empty account rather than failing when the
+// wallet cannot name it.
+func addressAccount(addrMgr *waddrmgr.Manager, ns walletdb.ReadBucket, addr btcutil.Address) string {
+	mgr, account, err := addrMgr.AddrAccount(ns, addr)
+	if err != nil {
+		return ""
+	}
+	name, err := mgr.AccountName(ns, account)
+	if err != nil {
+		return ""
+	}
+	return name
 }

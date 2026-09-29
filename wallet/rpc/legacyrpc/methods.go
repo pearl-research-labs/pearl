@@ -1211,7 +1211,7 @@ func listSinceBlock(icmd interface{}, w *wallet.Wallet, chainClient *chain.RPCCl
 		start = int32(block.Height) + 1
 	}
 
-	txInfoList, err := w.ListSinceBlock(start, -1, syncBlock.Height)
+	txs, err := w.Transactions(wallet.TxQuery{SinceHeight: start, Limit: wallet.NoLimit})
 	if err != nil {
 		return nil, err
 	}
@@ -1223,7 +1223,7 @@ func listSinceBlock(icmd interface{}, w *wallet.Wallet, chainClient *chain.RPCCl
 	}
 
 	res := btcjson.ListSinceBlockResult{
-		Transactions: txInfoList,
+		Transactions: listEntries(txs),
 		LastBlock:    blockHash.String(),
 	}
 	return res, nil
@@ -1248,7 +1248,11 @@ func listTransactions(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		}
 	}
 
-	return w.ListTransactions(*cmd.From, *cmd.Count)
+	txs, err := w.Transactions(wallet.TxQuery{NewestFirst: true, Offset: *cmd.From, Limit: *cmd.Count})
+	if err != nil {
+		return nil, err
+	}
+	return listEntries(txs), nil
 }
 
 // listAddressTransactions handles a listaddresstransactions request by
@@ -1267,16 +1271,20 @@ func listAddressTransactions(icmd interface{}, w *wallet.Wallet) (interface{}, e
 	}
 
 	// Decode addresses.
-	hash160Map := make(map[string]struct{})
+	scriptAddrs := make(map[string]struct{})
 	for _, addrStr := range cmd.Addresses {
 		addr, err := decodeAddress(addrStr, w.ChainParams())
 		if err != nil {
 			return nil, err
 		}
-		hash160Map[string(addr.ScriptAddress())] = struct{}{}
+		scriptAddrs[string(addr.ScriptAddress())] = struct{}{}
 	}
 
-	return w.ListAddressTransactions(hash160Map)
+	txs, err := w.Transactions(wallet.TxQuery{Match: w.PaysAnyOf(scriptAddrs), Limit: wallet.NoLimit})
+	if err != nil {
+		return nil, err
+	}
+	return listEntries(txs), nil
 }
 
 // listAllTransactions handles a listalltransactions request by returning
@@ -1293,7 +1301,11 @@ func listAllTransactions(icmd interface{}, w *wallet.Wallet) (interface{}, error
 		}
 	}
 
-	return w.ListAllTransactions()
+	txs, err := w.Transactions(wallet.TxQuery{NewestFirst: true, Limit: wallet.NoLimit})
+	if err != nil {
+		return nil, err
+	}
+	return listEntries(txs), nil
 }
 
 // listUnspent handles the listunspent command.
