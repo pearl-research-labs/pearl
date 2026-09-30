@@ -33,12 +33,12 @@ function openNoFollow(file: string, flags: number): number {
   return fs.openSync(file, flags | (fs.constants.O_NOFOLLOW || 0));
 }
 
-function pathExists(file: string): boolean {
+function isMissing(file: string): boolean {
   try {
     fs.lstatSync(file);
-    return true;
-  } catch {
     return false;
+  } catch (error) {
+    return isErrno(error, 'ENOENT');
   }
 }
 
@@ -74,10 +74,10 @@ export function writeSetupFile(dataDir: string, contents: string): string {
       }
     }
   } catch (error) {
-    if (pathExists(file)) {
-      activeSetupFiles.add(file);
-    } else {
+    if (isMissing(file)) {
       activeSetupFiles.delete(file);
+    } else {
+      activeSetupFiles.add(file);
     }
     throw error;
   }
@@ -93,8 +93,11 @@ export function removeSetupFile(file: string): void {
   let stat: fs.Stats;
   try {
     stat = fs.lstatSync(file);
-  } catch {
-    activeSetupFiles.delete(file);
+  } catch (error) {
+    // Quit retries tracked paths. ENOENT has nothing left to retry.
+    if (isErrno(error, 'ENOENT')) {
+      activeSetupFiles.delete(file);
+    }
     return;
   }
 
