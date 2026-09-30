@@ -7,6 +7,7 @@ import { createMainWindow } from './services/window-service/create-window';
 import { registerWindowIpc } from './ipc/register-window-ipc';
 import { registerManagerIpc } from './ipc/register-manager-ipc';
 import { ManagerService } from './services/manager-service';
+import { removeActiveSetupFiles } from './services/setup-file';
 import { registerSyncIpc } from './ipc/register-sync-ipc';
 import { SyncService } from './services/sync-service';
 import { UpdateService } from './services/update-service/update-service';
@@ -147,3 +148,6 @@ app.on('before-quit', async event => {
   }
   app.quit(); // resume quit; handler runs again but won't prevent
 });
+
+app.on('will-quit', removeActiveSetupFiles);
+process.on('exit', removeActiveSetupFiles);

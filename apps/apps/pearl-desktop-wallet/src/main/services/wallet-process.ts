@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { WalletService } from './wallet-service/wallet-service';
 import { getCurrentNetworkConfig } from '../config/network-config';
+import { removeSetupFile, writeSetupFile } from './setup-file';
 
 const binaryNameMap: Record<string, Record<string, string>> = {
   win32: {
@@ -134,16 +135,13 @@ class WalletProcess {
       }
 
       const isImport = !!seed;
-      let walletConfigFile: string | undefined;
-
-      walletConfigFile = path.join(this.config.dataDir, 'wallet-setup.json');
       const walletConfig = {
         seed,
         privatepassphrase: passphrase,
         bday: isImport ? '1724644369' : undefined,
       };
 
-      fs.writeFileSync(walletConfigFile, JSON.stringify(walletConfig, null, 2));
+      const walletConfigFile = writeSetupFile(this.config.dataDir, JSON.stringify(walletConfig, null, 2));
 
       return new Promise<
         { success: true; message: string; seed?: string } | { success: false; error: string }
@@ -182,11 +180,7 @@ class WalletProcess {
           });
 
           const cleanup = () => {
-            if (walletConfigFile && fs.existsSync(walletConfigFile)) {
-              try {
-                fs.unlinkSync(walletConfigFile);
-              } catch { }
-            }
+            removeSetupFile(walletConfigFile);
           };
 
           childProcess.on('close', code => {
@@ -248,6 +242,7 @@ class WalletProcess {
             }
           }, 30000);
         } catch (error) {
+          removeSetupFile(walletConfigFile);
           const errorMessage = error instanceof Error ? error.message : 'Unknown error';
           resolve({ success: false, error: errorMessage });
         }
