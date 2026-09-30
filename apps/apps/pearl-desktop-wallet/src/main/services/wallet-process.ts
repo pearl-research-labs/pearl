@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { WalletService } from './wallet-service/wallet-service';
 import { getCurrentNetworkConfig } from '../config/network-config';
-import { removeSetupFile, untrackSetupFile, writeSetupFile } from './setup-file';
+import { removeSetupFile, setupFileGeneration, untrackSetupFile, writeSetupFile } from './setup-file';
 
 const binaryNameMap: Record<string, Record<string, string>> = {
   win32: {
@@ -144,6 +144,7 @@ class WalletProcess {
       };
 
       const walletConfigFile = writeSetupFile(this.config.dataDir, JSON.stringify(walletConfig, null, 2));
+      const setupGeneration = setupFileGeneration(walletConfigFile);
 
       return new Promise<
         { success: true; message: string; seed?: string } | { success: false; error: string }
@@ -184,7 +185,8 @@ class WalletProcess {
           });
 
           const cleanup = () => {
-            removeSetupFile(walletConfigFile);
+            // Ignore a close that arrives after a retry has rewritten this path.
+            removeSetupFile(walletConfigFile, setupGeneration);
           };
 
           childProcess.on('close', code => {

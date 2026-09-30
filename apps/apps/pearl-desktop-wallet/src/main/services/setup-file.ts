@@ -7,6 +7,20 @@ const DATA_DIR_MODE = 0o700;
 const SETUP_FILE_MODE = 0o600;
 
 const activeSetupFiles = new Set<string>();
+// Bumped on every rewrite of a path. A setup child's close handler captures
+// the generation it wrote and must not wipe a later rewrite of the same path.
+const setupFileGenerations = new Map<string, number>();
+// Paths a live setup child may still have open. Unlink can fail for these
+// (Windows); zeroing them publishes zeros to that reader.
+const openSetupFiles = new Set<string>();
+
+export function setupFileGeneration(file: string): number {
+  return setupFileGenerations.get(file) ?? 0;
+}
+
+function advanceSetupFileGeneration(file: string): void {
+  setupFileGenerations.set(file, setupFileGeneration(file) + 1);
+}
 
 export function setupFilePath(dataDir: string): string {
   return path.join(dataDir, SETUP_FILE_NAME);
@@ -44,8 +58,24 @@ function isMissing(file: string): boolean {
 
 export function writeSetupFile(dataDir: string, contents: string): string {
   const file = setupFilePath(dataDir);
+  // Publish the new generation before replacing bytes. stopSetupChild can
+  // return while the previous child's close handler is still armed; once this
+  // generation is current that handler must not zero the file we write here.
+  advanceSetupFileGeneration(file);
   activeSetupFiles.add(file);
-  removeSetupFile(file);
+  const stillOpen = openSetupFiles.delete(file);
+  if (stillOpen) {
+    // Child is still alive. Do not zero. Unlink detaches the name on POSIX
+    // without altering the inode the child is reading. If unlink fails, the
+    // exclusive-create fallback below overwrites a regular file in place.
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // ignore
+    }
+  } else {
+    removeSetupFile(file);
+  }
   try {
     try {
       fs.writeFileSync(file, contents, { mode: SETUP_FILE_MODE, flag: 'wx' });
@@ -78,6 +108,9 @@ export function writeSetupFile(dataDir: string, contents: string): string {
       activeSetupFiles.delete(file);
     } else {
       activeSetupFiles.add(file);
+      if (stillOpen) {
+        openSetupFiles.add(file);
+      }
     }
     throw error;
   }
@@ -87,9 +120,17 @@ export function writeSetupFile(dataDir: string, contents: string): string {
 
 export function untrackSetupFile(file: string): void {
   activeSetupFiles.delete(file);
+  // Give-up left the setup child alive. The next rewrite must not zero a
+  // file that child may still be reading.
+  openSetupFiles.add(file);
 }
 
-export function removeSetupFile(file: string): void {
+export function removeSetupFile(file: string, generation?: number): void {
+  if (generation !== undefined && setupFileGenerations.get(file) !== generation) {
+    return;
+  }
+  openSetupFiles.delete(file);
+
   let stat: fs.Stats;
   try {
     stat = fs.lstatSync(file);
