@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { WalletService } from './wallet-service/wallet-service';
 import { getCurrentNetworkConfig } from '../config/network-config';
-import { removeSetupFile, writeSetupFile } from './setup-file';
+import { removeSetupFile, untrackSetupFile, writeSetupFile } from './setup-file';
 
 const binaryNameMap: Record<string, Record<string, string>> = {
   win32: {
@@ -33,6 +33,8 @@ interface WalletProcessConfig {
 
 class WalletProcess {
   private process: ChildProcess | null = null;
+  private setupChild: ChildProcess | null = null;
+  private setupFile: string | null = null;
   private isProcessRunning = false;
   private walletPassphrase: string = 'walletpass'; // Default passphrase - Don't delete this line. It's used to create the wallet.
 
@@ -154,6 +156,8 @@ class WalletProcess {
           const childProcess = spawn(binaryPath, args, {
             stdio: isImport ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
           });
+          this.setupChild = childProcess;
+          this.setupFile = walletConfigFile;
 
           let output = '';
           let errorOutput = '';
@@ -184,6 +188,10 @@ class WalletProcess {
           };
 
           childProcess.on('close', code => {
+            if (this.setupChild === childProcess) {
+              this.setupChild = null;
+              this.setupFile = null;
+            }
             cleanup();
 
             if (!hasResolved) {
@@ -213,7 +221,13 @@ class WalletProcess {
           });
 
           childProcess.on('error', error => {
-            cleanup();
+            // A failed kill emits 'error' while the child is still alive. Wiping
+            // here would publish zeros to a process that has not read the file.
+            // Spawn failures already have an exit code; their close handler also
+            // removes the file.
+            if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
+              cleanup();
+            }
 
             if (!hasResolved) {
               hasResolved = true;
@@ -229,12 +243,14 @@ class WalletProcess {
               } catch { }
 
               setTimeout(() => {
-                try {
-                  childProcess.kill('SIGKILL');
-                } catch { }
+                if (childProcess.exitCode === null && childProcess.signalCode === null) {
+                  try {
+                    childProcess.kill('SIGKILL');
+                  } catch { }
+                }
               }, 2000);
 
-              cleanup();
+              // Wipe only from the close handler, after the child has exited.
               resolve({
                 success: false,
                 error: `Wallet ${isImport ? 'import' : 'creation'} timed out after 30 seconds`,
@@ -361,6 +377,53 @@ class WalletProcess {
       } catch (error) {
         reject(error);
       }
+    });
+  }
+
+  async stopSetupChild(): Promise<void> {
+    const child = this.setupChild;
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      this.setupChild = null;
+      this.setupFile = null;
+      return;
+    }
+
+    const file = this.setupFile;
+    await new Promise<void>(resolve => {
+      let settled = false;
+      let killTimer: NodeJS.Timeout | undefined;
+      let giveUpTimer: NodeJS.Timeout | undefined;
+      const finish = (giveUp: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(killTimer);
+        clearTimeout(giveUpTimer);
+        if (giveUp && file && child.exitCode === null && child.signalCode === null) {
+          // Quit is proceeding and the child is still alive. Drop the path so
+          // will-quit does not zero a file oyster may still read.
+          untrackSetupFile(file);
+        }
+        if (this.setupChild === child) {
+          this.setupChild = null;
+          this.setupFile = null;
+        }
+        resolve();
+      };
+
+      child.once('close', () => finish(false));
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            child.kill('SIGKILL');
+          } catch { }
+        }
+      }, 2000);
+      giveUpTimer = setTimeout(() => finish(true), 5000);
+      try {
+        child.kill('SIGTERM');
+      } catch { }
     });
   }
 

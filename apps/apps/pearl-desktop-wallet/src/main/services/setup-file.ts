@@ -24,29 +24,86 @@ export function ensureDataDir(dir: string): void {
   }
 }
 
+function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === code;
+}
+
+function openNoFollow(file: string, flags: number): number {
+  // O_NOFOLLOW is 0 on Windows; callers lstat first so a symlink is never opened there.
+  return fs.openSync(file, flags | (fs.constants.O_NOFOLLOW || 0));
+}
+
+function pathExists(file: string): boolean {
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function writeSetupFile(dataDir: string, contents: string): string {
   const file = setupFilePath(dataDir);
+  activeSetupFiles.add(file);
   removeSetupFile(file);
-  fs.writeFileSync(file, contents, { mode: SETUP_FILE_MODE, flag: 'wx' });
+  try {
+    try {
+      fs.writeFileSync(file, contents, { mode: SETUP_FILE_MODE, flag: 'wx' });
+    } catch (error) {
+      if (!isErrno(error, 'EEXIST')) {
+        throw error;
+      }
+      // Unlink can fail while another handle still has the file open (Windows).
+      // Replace a regular file in place. Never write through a symlink: wx
+      // already refused, and O_NOFOLLOW keeps the fallback from following one.
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw error;
+      }
+      const fd = openNoFollow(file, fs.constants.O_WRONLY | fs.constants.O_TRUNC);
+      try {
+        fs.writeFileSync(fd, contents);
+        try {
+          fs.fchmodSync(fd, SETUP_FILE_MODE);
+        } catch {
+          // ignore
+        }
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+  } catch (error) {
+    if (pathExists(file)) {
+      activeSetupFiles.add(file);
+    } else {
+      activeSetupFiles.delete(file);
+    }
+    throw error;
+  }
   activeSetupFiles.add(file);
   return file;
 }
 
-export function removeSetupFile(file: string): void {
+export function untrackSetupFile(file: string): void {
   activeSetupFiles.delete(file);
+}
 
-  let size: number;
+export function removeSetupFile(file: string): void {
+  let stat: fs.Stats;
   try {
-    size = fs.statSync(file).size;
+    stat = fs.lstatSync(file);
   } catch {
+    activeSetupFiles.delete(file);
     return;
   }
 
-  if (size > 0) {
+  // stat/open follow symlinks. Unlink the link itself and leave its target alone.
+  if (!stat.isSymbolicLink() && stat.isFile() && stat.size > 0) {
     try {
-      const fd = fs.openSync(file, 'r+');
+      const fd = openNoFollow(file, fs.constants.O_RDWR);
       try {
-        fs.writeSync(fd, Buffer.alloc(size), 0, size, 0);
+        fs.writeSync(fd, Buffer.alloc(stat.size), 0, stat.size, 0);
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
@@ -58,8 +115,9 @@ export function removeSetupFile(file: string): void {
 
   try {
     fs.unlinkSync(file);
+    activeSetupFiles.delete(file);
   } catch {
-    // ignore
+    // Leave the path tracked so quit cleanup can retry a locked leftover.
   }
 }
 
