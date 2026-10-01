@@ -157,7 +157,7 @@ struct Fp8ProverSetup {
 impl Fp8ProverSetup {
     fn build(device: Device, timing: &mut TimingTree) -> Result<Self> {
         let params = sample_dense_statement_for_device(device)?;
-        let job = Fp8Job::derive(&params, &params.ancestor_header().incomplete)?;
+        let job = Fp8Job::derive(&params, &IncompleteBlockHeader::zero())?;
         let preprocessed = job.system.preprocessed_data::<C>(timing);
         let circuits = Fp8WrapperCircuits::build(&job.system, &preprocessed.cap(), timing)?;
         Ok(Self {
@@ -242,13 +242,6 @@ impl Fp8Verifier {
     /// (`build_cache`); verification only ever reads the result from [`Fp8VerifierCache`].
     pub fn generate(params: &PublicParams, proposed_header: &IncompleteBlockHeader, timing: &mut TimingTree) -> Result<Self> {
         let job = Fp8Job::derive(params, proposed_header)?;
-        Self::build_for_job(&job, timing)
-    }
-
-    /// The shared constructor core: derive the one device's preprocessing cap and compile
-    /// the universal wrapper against it. The cap is baked into the circuit and discarded;
-    /// `fp8_cache.bin` is the sole persisted setup artifact.
-    fn build_for_job(job: &Fp8Job, timing: &mut TimingTree) -> Result<Self> {
         let preprocessed = job.system.preprocessed_data::<C>(timing);
         let circuits = Fp8WrapperCircuits::build(&job.system, &preprocessed.cap(), timing)?;
         Ok(Self {
@@ -365,8 +358,7 @@ impl Fp8VerifierCache {
 /// envelope-legal statement yields the same circuits) and the
 /// committed-LUT-cap tests pin. Its consumers only need an envelope-legal
 /// statement, so hashes, header words and tile bases stay zero. Returns the
-/// statement with a zeroed `ancestor_header` (so the statement binds the zero
-/// header on both sides).
+/// statement with a zeroed `ancestor_header` for setup derivation.
 pub fn sample_dense_statement() -> Result<PublicParams> {
     sample_dense_statement_for_device(Device::B200)
 }

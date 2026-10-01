@@ -326,11 +326,8 @@ mod fp8 {
         #[staticmethod]
         fn generate(public_data: &[u8]) -> PyResult<Self> {
             let statement = decode_statement(public_data).map_err(value_err)?;
-            // The setup is job-independent, so the statement's own `ancestor_header`
-            // anchors the job derivation (the committed cache is built from the
-            // canonical `sample_dense_statement` dummy of the same shape).
-            let anchor = statement.ancestor_header().incomplete;
-            Fp8Verifier::generate(&statement, &anchor, &mut TimingTree::default())
+            // The setup is job-independent; a zero header suffices for derivation.
+            Fp8Verifier::generate(&statement, &IncompleteBlockHeader::zero(), &mut TimingTree::default())
                 .map(|verifier| Self { inner: verifier })
                 .map_err(|e| runtime_err("fp8 verifier setup generation failed", e))
         }

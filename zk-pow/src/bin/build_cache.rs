@@ -87,12 +87,13 @@ fn main() -> Result<()> {
 fn build_fp8_cache() -> Result<Vec<u8>> {
     use zk_pow::api::fp8::public_params::Device;
     use zk_pow::api::fp8::zk::{Fp8Verifier, Fp8VerifierCache, sample_dense_statement_for_device};
+    use zk_pow::api::primitives::IncompleteBlockHeader;
 
     let mut cache = Fp8VerifierCache::default();
-    for device in [Device::H100, Device::B200] {
+    for device in Device::ALL {
         let params = sample_dense_statement_for_device(device)?;
         let mut timing = plonky2::util::timing::TimingTree::default();
-        let verifier = Fp8Verifier::generate(&params, &params.ancestor_header().incomplete, &mut timing)?;
+        let verifier = Fp8Verifier::generate(&params, &IncompleteBlockHeader::zero(), &mut timing)?;
         cache.insert(device, verifier);
         println!("compiled the {device:?} fp8 verifier setup");
     }

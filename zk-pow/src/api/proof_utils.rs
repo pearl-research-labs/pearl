@@ -50,18 +50,9 @@ impl IncompleteBlockHeader {
     /// 4 (version) + 32 (prev_block) + 32 (merkle_root) + 4 (timestamp) + 4 (nbits) = 76
     pub const SERIALIZED_SIZE: usize = 76;
 
-    /// The all-zero (except for a valid difficulty `nbits`) ancestor header used to
-    /// anchor canonical, job-independent derivations such as the LUT setup caps.
-    /// The header never reaches family-only preprocessed data, so both this and
-    /// [`PublicParams::dense_params`] anchors share it.
-    pub(crate) fn zero() -> IncompleteBlockHeader {
-        Self {
-            version: 0,
-            prev_block: [0; 32],
-            merkle_root: [0; 32],
-            timestamp: 0,
-            nbits: 0,
-        }
+    /// All-zero placeholder for job-independent setup derivation.
+    pub fn zero() -> IncompleteBlockHeader {
+        Self::default()
     }
 
     #[cfg(test)]
@@ -123,10 +114,7 @@ impl BlockHeader {
     /// The all-zero header anchoring job-independent derivations (see
     /// [`IncompleteBlockHeader::zero`]).
     pub(crate) fn zero() -> BlockHeader {
-        Self {
-            incomplete: IncompleteBlockHeader::zero(),
-            proof_commitment: [0; 32],
-        }
+        Self::default()
     }
 
     #[cfg(test)]
