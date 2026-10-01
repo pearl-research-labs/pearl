@@ -41,6 +41,7 @@ COPY miner/vllm-miner/pyproject.toml ./miner/vllm-miner/
 COPY miner/miner-utils/pyproject.toml ./miner/miner-utils/
 COPY miner/miner-base/pyproject.toml ./miner/miner-base/
 COPY miner/pearl-gateway/pyproject.toml ./miner/pearl-gateway/
+COPY pearl-blake3/ ./pearl-blake3/
 
 # Sync remote packages ONLY (mainly download torch and vLLM)
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -56,7 +57,6 @@ COPY miner/miner-utils/ ./miner/miner-utils/
 COPY miner/miner-base/ ./miner/miner-base/
 COPY miner/pearl-gateway/ ./miner/pearl-gateway/
 COPY miner/vllm-miner/src ./miner/vllm-miner/src
-COPY pearl-blake3/ ./pearl-blake3/
 COPY py-pearl-mining/ ./py-pearl-mining/
 COPY zk-pow/ ./zk-pow/
 COPY plonky2/ ./plonky2/

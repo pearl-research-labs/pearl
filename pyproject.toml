@@ -57,7 +57,7 @@ markers = [
     "moe: marks Mixture-of-Experts (MoE) mining tests",
 ]
 python_files = ["test_*.py", "*_test.py"]
-norecursedirs = [".git", ".venv", "venv", ".github", ".pytest_cache", ".mypy_cache", ".ruff_cache", "build", "dist", "third_party"]
+norecursedirs = [".git", ".venv", "venv", ".github", ".pytest_cache", ".mypy_cache", ".ruff_cache", "build", "dist", "third_party", "pearl-gemm"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --import-mode=importlib"
