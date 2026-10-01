@@ -176,7 +176,7 @@ impl<F: PrimeField64> LutChecker<F> {
                     .iter()
                     .map(|c| c.eval_table(trace, row, public_inputs).to_canonical_u64())
                     .collect();
-                let (slot, table_row) = LutMultiplicities::resolve(lookup.table, &keys).map_err(&err)?;
+                let (slot, table_row) = LutMultiplicities::resolve(lookup.table, &keys).map_err(err)?;
                 let outputs = self
                     .cache
                     .entry((lookup.table, slot))

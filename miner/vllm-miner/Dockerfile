@@ -57,6 +57,7 @@ COPY miner/miner-utils/ ./miner/miner-utils/
 COPY miner/miner-base/ ./miner/miner-base/
 COPY miner/pearl-gateway/ ./miner/pearl-gateway/
 COPY miner/vllm-miner/src ./miner/vllm-miner/src
+COPY miner/vllm-miner/README.md ./miner/vllm-miner/
 COPY py-pearl-mining/ ./py-pearl-mining/
 COPY zk-pow/ ./zk-pow/
 COPY plonky2/ ./plonky2/
