@@ -79,7 +79,7 @@ def _prove_fp8(
     public_bytes, proof_bytes = bytes(public_data), bytes(proof_data)
     if debug:
         verifier = Fp8Verifier.generate(public_bytes)
-        verifier.verify_block(header, public_bytes, proof_bytes)
+        verifier.verify_block(header, plain_proof.ancestor_chain, public_bytes, proof_bytes)
     return public_bytes, proof_bytes
 
 

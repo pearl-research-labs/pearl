@@ -14,7 +14,7 @@ use crate::api::fp8::prequant::BLOCK_SIZE;
 use crate::api::fp8::public_params::{CommonParams, MoeParams, OperandParams};
 use crate::api::fp8::public_params::{HashId, JackpotStatement, JobParams, MoEStatement, PublicParams};
 use crate::api::fp8::transcript::{key_a, key_b};
-use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
+use crate::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader, Sides};
 use crate::api::proof_utils::operand_digest_fp10;
 use crate::circuit::utils::macros::ensure_eq;
 use crate::ffi::plain_proof::{MatrixMerkleProof, parse_axis};
@@ -35,7 +35,8 @@ pub struct MoeWitness {
 }
 
 /// Miner witness: the job tuple ([`JobParams`] — same fields as the statement,
-/// including the proof-carried ancestor header `σ_Δ`), plus openings.
+/// including the proof-carried ancestor header `σ_d`), the intermediate headers
+/// linking `σ_d` to the proposed header, plus openings.
 ///
 /// Does not validate the statement. Verification and proving must go through
 /// [`Self::parse_proof`], which runs witness-only checks then
@@ -45,6 +46,11 @@ pub struct MoeWitness {
 pub struct PlainProofV4 {
     #[serde(with = "job_wire")]
     pub job: JobParams,
+    /// The headers `σ_1..σ_{d-1}` strictly between the proposed header and
+    /// `σ_d`, parent first (empty when `σ_d` is the parent); see
+    /// [`JobParams::check_ancestry`].
+    #[serde(with = "chain_wire")]
+    pub ancestor_chain: Vec<BlockHeader>,
     #[serde(with = "variable_chunk_sides")]
     pub values: Sides<MatrixMerkleProof>,
     #[serde(with = "variable_chunk_sides")]
@@ -66,6 +72,25 @@ mod job_wire {
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<JobParams, D::Error> {
         let wire = Vec::<u8>::deserialize(deserializer)?;
         JobParams::from_wire_bytes(&wire).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The ancestor chain rides the wire as one byte string of concatenated
+/// 108-byte wire headers, the same buffer shape the Go FFI takes.
+mod chain_wire {
+    use super::BlockHeader;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(chain: &[BlockHeader], serializer: S) -> Result<S::Ok, S::Error> {
+        chain
+            .iter()
+            .flat_map(BlockHeader::to_bytes)
+            .collect::<Vec<u8>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<BlockHeader>, D::Error> {
+        BlockHeader::chain_from_bytes(&Vec::<u8>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -145,9 +170,10 @@ impl PlainProofV4 {
     /// verifier starts here. Do not treat a deserialized [`PlainProofV4`] as a validated statement.
     ///
     /// `proposed_header` (`σ̂`) is the caller's header; the statement's B-side
-    /// keying uses the witness's own `job.ancestor_header` (`σ_Δ`), which
-    /// zk-pow takes as granted — the caller authenticates it.
+    /// keying uses the witness's own `job.ancestor_header` (`σ_d`), which is
+    /// first authenticated against `σ̂` through [`Self::ancestor_chain`].
     pub fn parse_proof(&self, proposed_header: &IncompleteBlockHeader) -> Result<(PrivateProofParams, PublicParams)> {
+        self.job.check_ancestry(proposed_header, &self.ancestor_chain)?;
         self.check_shape()?;
 
         let (inner_a, inner_b, moe_statement) = self.moe_projection()?;
@@ -401,10 +427,10 @@ impl MoeWitness {
 #[pyo3::pymethods]
 impl PlainProofV4 {
     #[new]
-    #[pyo3(signature = (ancestor_header, common, a, b, values_a, values_b, scales_a, scales_b, moe=None, moe_witness=None))]
+    #[pyo3(signature = (ancestor_header, common, a, b, values_a, values_b, scales_a, scales_b, moe=None, moe_witness=None, ancestor_chain=None))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
-        ancestor_header: IncompleteBlockHeader,
+        ancestor_header: BlockHeader,
         common: CommonParams,
         a: OperandParams,
         b: OperandParams,
@@ -414,6 +440,7 @@ impl PlainProofV4 {
         scales_b: MatrixMerkleProof,
         moe: Option<MoeParams>,
         moe_witness: Option<MoeWitness>,
+        ancestor_chain: Option<Vec<BlockHeader>>,
     ) -> Self {
         Self {
             job: JobParams {
@@ -422,6 +449,7 @@ impl PlainProofV4 {
                 operands: Sides { a, b },
                 moe,
             },
+            ancestor_chain: ancestor_chain.unwrap_or_default(),
             values: Sides {
                 a: values_a,
                 b: values_b,
@@ -435,8 +463,13 @@ impl PlainProofV4 {
     }
 
     #[getter]
-    fn ancestor_header(&self) -> IncompleteBlockHeader {
+    fn ancestor_header(&self) -> BlockHeader {
         self.job.ancestor_header
+    }
+
+    #[getter]
+    fn ancestor_chain(&self) -> Vec<BlockHeader> {
+        self.ancestor_chain.clone()
     }
 
     #[getter]
@@ -518,10 +551,11 @@ impl PlainProofV4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::fp8::public_params::test_fixtures::ancestry;
     use crate::api::fp8::public_params::{CommonParams, Device, MoeParams, OperandParams, Quant};
     use crate::api::layout::AxisPattern;
     use crate::api::layout::DimType::Blake;
-    use crate::api::primitives::{Hash256, IncompleteBlockHeader};
+    use crate::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader};
     use pearl_blake3::{MerkleTree, blake3_digest};
 
     const KEY: Hash256 = [
@@ -608,7 +642,7 @@ mod tests {
         let routing_entries = offsets.last().copied().unwrap_or(0).max(1) as usize;
         PlainProofV4 {
             job: JobParams {
-                ancestor_header: IncompleteBlockHeader::new_for_test(0x207FFFFF),
+                ancestor_header: ancestry(1).2,
                 common: CommonParams {
                     k: k as u32,
                     r: 32,
@@ -633,6 +667,7 @@ mod tests {
                     hash_id_o: hash_id,
                 }),
             },
+            ancestor_chain: vec![],
             values: Sides {
                 a: matrix(m * k),
                 b: matrix(n * k),
@@ -706,11 +741,44 @@ mod tests {
 
     #[test]
     fn parse_proof_rejects_winner_out_of_range() {
-        let header = IncompleteBlockHeader::new_for_test(0x207FFFFF);
+        let (header, _, _) = ancestry(1);
         let mut proof = tiny_moe_proof(2, vec![2, 4]);
         proof.moe_witness.as_mut().unwrap().w = 2;
         let err = proof.parse_proof(&header).unwrap_err();
         assert!(err.to_string().contains("winner expert out of range"), "{err}");
+    }
+
+    #[test]
+    fn parse_proof_authenticates_the_ancestor_first() {
+        // σ̂ does not descend from the witness's σ_d: rejected before any other gate.
+        let mut proof = tiny_moe_proof(2, vec![2, 4]);
+        proof.moe_witness.as_mut().unwrap().w = 2;
+        let err = proof
+            .parse_proof(&IncompleteBlockHeader::new_for_test(0x207FFFFF))
+            .unwrap_err();
+        assert!(err.to_string().contains("depth 1 does not connect"), "{err}");
+    }
+
+    #[test]
+    fn ancestor_chain_survives_the_wire_roundtrip() {
+        let (_, chain, ancestor) = ancestry(4);
+        let mut proof = tiny_moe_proof(2, vec![2, 4]);
+        proof.job.ancestor_header = ancestor;
+        proof.ancestor_chain = chain.clone();
+        let mut bytes = proof.to_bytes().unwrap();
+        let parsed = PlainProofV4::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.ancestor_chain, chain);
+        assert_eq!(parsed.job.ancestor_header, ancestor);
+
+        // The chain is a whole number of headers: a truncated one fails to decode.
+        // Fixint bincode: the job's u64 length prefix and bytes, then the chain's prefix.
+        let chain_len_at = 8 + proof.job.to_wire_bytes().len();
+        let wire_len = u64::from_le_bytes(bytes[chain_len_at..chain_len_at + 8].try_into().unwrap());
+        assert_eq!(wire_len as usize, 3 * BlockHeader::SERIALIZED_SIZE);
+        bytes[chain_len_at..chain_len_at + 8].copy_from_slice(&(wire_len - 1).to_le_bytes());
+        bytes.remove(chain_len_at + 8);
+        let err = PlainProofV4::from_bytes(&bytes).unwrap_err();
+        assert!(format!("{err:#}").contains("not a multiple of 108"), "{err:#}");
     }
 
     #[test]

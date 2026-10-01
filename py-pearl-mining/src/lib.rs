@@ -19,7 +19,7 @@ use zk_pow::api::fp8::public_params::{
     CommonParams, Device, HashId, MoeParams, OperandParams, Quant,
 };
 use zk_pow::api::layout::{AxisPattern, DimType};
-use zk_pow::api::primitives::IncompleteBlockHeader;
+use zk_pow::api::primitives::{BlockHeader, IncompleteBlockHeader};
 use zk_pow::api::seed::SeedDerivation;
 use zk_pow::api::verify as fp8_verify;
 use zk_pow::ffi::plain_proof::{CertificateVersion, MatrixMerkleProof, MoEProofParams, PlainProof};
@@ -252,9 +252,9 @@ fn verify_plain_proof_v3(
 
 /// Cert v4 (PlainFP8) plain verification against the mainline FP8 verifier.
 ///
-/// The proof carries its own `ancestor_header` (σ_Δ) in the job; `block_header`
-/// (σ̂) is only used for the A side and the default difficulty. Authenticating
-/// σ_Δ is the caller's responsibility (hash-walk the `prev_block` chain).
+/// The proof carries its own `ancestor_header` (σ_d) in the job and the headers
+/// linking it to `block_header` (σ̂) in `ancestor_chain`; the verifier
+/// authenticates σ_d by hash-walking that chain from σ̂'s `prev_block`.
 #[pyfunction]
 #[pyo3(signature = (block_header, plain_proof, nbits_override=None))]
 fn verify_plain_proof_v4(
@@ -622,6 +622,7 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<MerkleProof>()?;
     m.add_class::<PeriodicPattern>()?;
     m.add_class::<IncompleteBlockHeader>()?;
+    m.add_class::<BlockHeader>()?;
     m.add_class::<MiningConfiguration>()?;
     m.add_class::<MoEConfig>()?;
     m.add_class::<MMAType>()?;

@@ -3,6 +3,7 @@ Tests for the pearl_mining Python API (PyO3 bindings).
 """
 
 import base64
+import hashlib
 
 import pearl_mining
 import pytest
@@ -424,18 +425,23 @@ def make_dummy_plain_proof(*, moe: bool) -> pearl_mining.PlainProof:
     )
 
 
-def make_dummy_plain_proof_v4() -> pearl_mining.PlainProofV4:
+def make_dummy_plain_proof_v4(
+    ancestor_chain: list[pearl_mining.BlockHeader] | None = None,
+) -> pearl_mining.PlainProofV4:
     """Lightweight (non-verifiable) PlainProofV4 for eligibility checks only."""
     matrix_proof = pearl_mining.MatrixMerkleProof(proof=_dummy_merkle_proof(), row_indices=[0])
     pattern = pearl_mining.AxisPattern(
         [(4, pearl_mining.DimType.Fold), (4, pearl_mining.DimType.Blake)]
     )
-    header = pearl_mining.IncompleteBlockHeader(
-        version=0,
-        prev_block=b"\x00" * 32,
-        merkle_root=b"\x00" * 32,
-        timestamp=0,
-        nbits=DEFAULT_NBITS,
+    header = pearl_mining.BlockHeader(
+        pearl_mining.IncompleteBlockHeader(
+            version=0,
+            prev_block=b"\x00" * 32,
+            merkle_root=b"\x00" * 32,
+            timestamp=0,
+            nbits=DEFAULT_NBITS,
+        ),
+        b"\x00" * 32,
     )
     common = pearl_mining.CommonParams(
         2048,
@@ -454,7 +460,39 @@ def make_dummy_plain_proof_v4() -> pearl_mining.PlainProofV4:
         values_b=matrix_proof,
         scales_a=matrix_proof,
         scales_b=matrix_proof,
+        ancestor_chain=ancestor_chain,
     )
+
+
+class TestBlockHeader:
+    """The complete 108-byte header that keys B and links the ancestor chain."""
+
+    def test_wire_round_trip_and_hash(self):
+        raw = bytes(range(108))
+        header = pearl_mining.BlockHeader.from_bytes(raw)
+        assert pearl_mining.BlockHeader.SERIALIZED_SIZE == 108
+        assert bytes(header.to_bytes()) == raw
+        assert bytes(header.incomplete.to_bytes()) == raw[:76]
+        assert bytes(header.proof_commitment) == raw[76:]
+        # SHA256d of the wire bytes, reversed into prev_block's display order.
+        expected = hashlib.sha256(hashlib.sha256(raw).digest()).digest()[::-1]
+        assert bytes(header.block_hash()) == expected
+
+    def test_rejects_partial_headers(self):
+        with pytest.raises(ValueError):
+            pearl_mining.BlockHeader.from_bytes(bytes(76))
+        with pytest.raises(ValueError, match="32 bytes"):
+            pearl_mining.BlockHeader(create_test_block_header(), b"\x00" * 31)
+
+    def test_plain_proof_v4_carries_the_ancestor_chain(self):
+        assert make_dummy_plain_proof_v4().ancestor_chain == []
+        chain = [pearl_mining.BlockHeader.from_bytes(bytes([i]) * 108) for i in (1, 2)]
+        proof = make_dummy_plain_proof_v4(ancestor_chain=chain)
+        restored = pearl_mining.PlainProofV4.from_base64(proof.to_base64())
+        assert [bytes(h.to_bytes()) for h in restored.ancestor_chain] == [
+            bytes(h.to_bytes()) for h in chain
+        ]
+        assert bytes(restored.ancestor_header.to_bytes()) == bytes(proof.ancestor_header.to_bytes())
 
 
 class TestLegacyV1Deserialization:

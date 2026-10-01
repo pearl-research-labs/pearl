@@ -43,7 +43,7 @@ class SubmissionService:
                 plain_proof.to_base64(),
                 self.debug_mode,
             )
-            return ProofGenerator.build_block(public_data, proof_data, template)
+            return ProofGenerator.build_block(public_data, proof_data, template, plain_proof)
         return ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
 
     async def submit_plain_proof(

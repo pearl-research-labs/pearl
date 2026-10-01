@@ -1,8 +1,8 @@
 """Per-job B-side preparation: in place, synchronous, on the caller's stream.
 
-v4 keys B under the ancestor header (the miner proposes at depth 0, so that is
-the proposed header itself): ``B'``, its peel, ``E_B``/``F_B`` and noise
-``seedB`` change with every job. :func:`prepare_layer` runs the GPU B chain
+v4 keys B under the ancestor header, which the miner always takes to be the
+parent: ``B'``, its peel, ``E_B``/``F_B`` and noise ``seedB`` change whenever
+the parent does. :func:`prepare_layer` runs the GPU B chain
 (``tensor_hash_plus_stats_b -> seedB -> noise_lines -> noisy_quant_b``) into
 the layer's steady :class:`~vllm_miner.state.LayerBuffers` on the
 current CUDA stream and publishes a :class:`~vllm_miner.state.JobContext`
@@ -114,8 +114,9 @@ def _prepare_b_on_gpu(
 
 
 def layer_job_keys(job: MiningJob) -> tuple[bytes, bytes]:
-    """``(keyA, keyB)`` under ``job``. v4 keys depend on the header alone; the
-    layer's committed tile enters through ``pB`` in ``seedB`` instead."""
+    """``(keyA, keyB)`` under ``job``. v4 keys depend on the header and its
+    parent alone; the layer's committed tile enters through ``pB`` in ``seedB``
+    instead."""
     return commitment_keys_for(job)
 
 

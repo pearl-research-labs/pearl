@@ -52,7 +52,8 @@ fn open_and_noisy_quantize(
 }
 
 /// Verifies a v4 FP8 plain proof under the whitepaper-fixed jackpot policy for
-/// the statement's committed device.
+/// the statement's committed device. The proof's `σ_d` is authenticated against
+/// `proposed_header` through its own [`PlainProofV4::ancestor_chain`].
 pub fn verify_plain_proof(
     proposed_header: &IncompleteBlockHeader,
     plain_proof: &PlainProofV4,
@@ -101,6 +102,16 @@ mod tests {
         verify_plain_proof(&header, &plain, None).unwrap_or_else(|e| panic!("the honest fixture must verify: {e:#}"));
     }
 
+    /// The fixture's σ_d is the grandparent: without the parent in its chain the
+    /// plain verifier cannot reach it.
+    #[test]
+    fn plain_verifier_rejects_a_chain_that_misses_sigma_d() {
+        let (header, mut plain) = fixture_job();
+        plain.ancestor_chain.clear();
+        let err = verify_plain_proof(&header, &plain, None).expect_err("an empty chain must reject");
+        assert!(format!("{err:#}").contains("depth 1 does not connect"), "{err:#}");
+    }
+
     /// This historical coherent fixture also exceeds the new consolidated census, so
     /// removing Check 3 must not accidentally turn it into an accepted proof.
     #[test]
@@ -119,6 +130,7 @@ mod tests {
         let bytes = plain.to_bytes().expect("serialize");
         let restored = PlainProofV4::from_bytes(&bytes).expect("deserialize");
         assert_eq!(restored.job, plain.job);
+        assert_eq!(restored.ancestor_chain, plain.ancestor_chain);
         assert_eq!(restored.values.a.row_indices, plain.values.a.row_indices);
         assert_eq!(restored.values.a.proof.root, plain.values.a.proof.root);
         assert_eq!(restored.values.b.row_indices, plain.values.b.row_indices);

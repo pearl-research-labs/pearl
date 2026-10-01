@@ -1,5 +1,5 @@
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import torch
@@ -51,6 +51,9 @@ class BlockTemplate:
     coinbase_tx: Transaction
     # Certificate version this block must carry under the crossover cutover.
     required_cert_version: CertificateVersion
+    # Full 108-byte wire headers of the most recent ancestors, parent first:
+    # the V4 state window from which a proof picks the ancestor that keys B.
+    ancestor_headers: list[bytes] = field(default_factory=list)
 
     @classmethod
     def from_get_block_template(
@@ -79,6 +82,10 @@ class BlockTemplate:
         if int(data.target, 16) != bits_translation:
             raise ValueError(f"target and bits must match: {data.target} != {bits_translation}")
 
+        ancestor_headers = [bytes.fromhex(header) for header in data.ancestorheaders]
+        if any(len(h) != PearlHeader.get_serialized_header_size() for h in ancestor_headers):
+            raise ValueError("ancestor headers must be full 108-byte wire headers")
+
         return cls(
             header=PearlHeader(
                 incomplete_header=IncompleteBlockHeader(
@@ -93,6 +100,7 @@ class BlockTemplate:
             raw_transactions=raw_transactions,
             coinbase_tx=coinbase_tx,
             required_cert_version=CertificateVersion(data.requiredcertversion),
+            ancestor_headers=ancestor_headers,
         )
 
     def get_raw_transactions(self) -> list[bytes]:
@@ -181,6 +189,9 @@ class MiningJob:
     target: int
     # Certificate version required for this block.
     cert_version: CertificateVersion
+    # Full 108-byte wire headers of the most recent ancestors, parent first
+    # (see BlockTemplate.ancestor_headers). Empty unless cert_version is V4.
+    ancestor_headers: list[bytes] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
@@ -188,6 +199,7 @@ class MiningJob:
             "incomplete_header_bytes": b64_encode(self.incomplete_header_bytes),
             "target": self.target,
             "cert_version": int(self.cert_version),
+            "ancestor_headers": [b64_encode(header) for header in self.ancestor_headers],
         }
 
     @classmethod
@@ -198,6 +210,7 @@ class MiningJob:
             incomplete_header_bytes=b64_decode(data["incomplete_header_bytes"]),
             target=data["target"],
             cert_version=CertificateVersion(data["cert_version"]),
+            ancestor_headers=[b64_decode(header) for header in data.get("ancestor_headers", [])],
         )
 
     @classmethod
@@ -207,7 +220,15 @@ class MiningJob:
             incomplete_header_bytes=template.header.serialize_without_proof_commitment(),
             target=template.target,
             cert_version=template.required_cert_version,
+            ancestor_headers=list(template.ancestor_headers),
         )
+
+    @property
+    def parent_header(self) -> bytes:
+        """The parent's full 108-byte header: the ancestor miners key B by."""
+        if not self.ancestor_headers:
+            raise ValueError("mining job carries no ancestor headers to key B by")
+        return self.ancestor_headers[0]
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:
         """Calculate the rank-penalized PoW target for the mining job."""

@@ -9,6 +9,7 @@ import json
 import threading
 from pathlib import Path
 
+import pearl_mining
 import pytest
 import torch
 from miner_base.block_submission import commit_planes_for_leaf
@@ -57,10 +58,23 @@ _MINED_SHAPE_PARAMS = list(_MINED_SHAPES.values())
 _MINED_SHAPE_IDS = list(_MINED_SHAPES)
 
 
+# The parent every test job extends; miners key B by its complete header.
+_PARENT = pearl_mining.BlockHeader.from_bytes(
+    BlockHeader(
+        version=1,
+        prev_block=b"\x10" * 32,
+        merkle_root=b"\x33" * 32,
+        timestamp=1_699_999_000,
+        nbits=0x1D3FFFFF,
+    ).to_bytes()
+    + b"\x44" * 32
+)
+
+
 def _header() -> BlockHeader:
     return BlockHeader(
         version=1,
-        prev_block=b"\x11" * 32,
+        prev_block=bytes(_PARENT.block_hash()),
         merkle_root=b"\x22" * 32,
         timestamp=1_700_000_000,
         nbits=0x1D3FFFFF,
@@ -76,6 +90,7 @@ def _job(
         incomplete_header_bytes=bytes(_header().to_bytes()),
         target=target,
         cert_version=cert_version,
+        ancestor_headers=[bytes(_PARENT.to_bytes())],
     )
 
 
@@ -787,7 +802,7 @@ def _always_win_job() -> MiningJob:
     resulting jackpot, so its proofs verify and submit."""
     header = BlockHeader(
         version=1,
-        prev_block=b"\x11" * 32,
+        prev_block=bytes(_PARENT.block_hash()),
         merkle_root=b"\x22" * 32,
         timestamp=1_700_000_000,
         nbits=0x207FFFFF,
@@ -796,6 +811,7 @@ def _always_win_job() -> MiningJob:
         incomplete_header_bytes=bytes(header.to_bytes()),
         target=_MAX_256,
         cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[bytes(_PARENT.to_bytes())],
     )
 
 
@@ -1213,7 +1229,7 @@ def test_winner_check_consumes_only_its_own_launch_record(
         assert tuple(opening.moe.routing) == tuple(winner_routing.tokens.tolist())
         assert tuple(opening.moe.offsets) == tuple(winner_routing.m_indptr[1:].tolist())
     accepted, message = verify_plain_proof_for_cert_version(
-        CERT_VERSION_PLAIN_FP8, header, create_proof(opening, header)
+        CERT_VERSION_PLAIN_FP8, header, create_proof(opening, header, job.parent_header)
     )
     assert accepted, message
 
@@ -1387,4 +1403,4 @@ def test_moe_real_winner_yields_a_verifiable_moe_proof(moe_layer_state, async_ma
     accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
     assert accepted, message
     # Reconstructing the same host opening produces identical proof bytes.
-    assert create_proof(opening, header).to_base64() == proof.to_base64()
+    assert create_proof(opening, header, job.parent_header).to_base64() == proof.to_base64()

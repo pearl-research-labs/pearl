@@ -49,6 +49,8 @@ _TALL_K = 65536
 _DEVICES = pytest.mark.parametrize("device", list(Device), ids=lambda d: d.name.lower())
 _HEADER = bytes(range(80))
 _OTHER_HEADER = bytes(range(1, 81))
+_PARENT = bytes(range(108))
+_OTHER_PARENT = bytes(range(1, 109))
 _LAYER_IDS = itertools.count(1)
 
 _ALIASED_OPERANDS = (
@@ -66,11 +68,12 @@ _ALIASED_OPERANDS = (
 )
 
 
-def _job(target: int = 100, header: bytes = _HEADER) -> MiningJob:
+def _job(target: int = 100, header: bytes = _HEADER, parent: bytes = _PARENT) -> MiningJob:
     return MiningJob(
         incomplete_header_bytes=header,
         target=target,
         cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[parent],
     )
 
 
@@ -244,7 +247,8 @@ def test_tall_shape_target_change_reuses_the_b_side(preps, device):
 
 def test_header_change_reruns_the_b_chain(layer, preps, device):
     first = current_context(layer, _job())
-    published = current_context(layer, _job(header=_OTHER_HEADER))
+    # A new block template extends a new parent, which keys B.
+    published = current_context(layer, _job(header=_OTHER_HEADER, parent=_OTHER_PARENT))
 
     assert len(preps) == 2
     assert (published.key_a, published.key_b) != (first.key_a, first.key_b)

@@ -92,7 +92,7 @@ class ZKCertificate:
     ancestor_headers: list[PearlHeader] = field(default_factory=list)
 
     ZK_MAX_PROOF_DATA_SIZE: ClassVar[int] = _ZK_MAX_PROOF_DATA_SIZE
-    MAX_ANCESTOR_HEADERS: ClassVar[int] = 2
+    MAX_ANCESTOR_HEADERS: ClassVar[int] = 3
 
     def __post_init__(self) -> None:
         if not isinstance(self.proof, CertificateProof):
@@ -114,7 +114,7 @@ class ZKCertificate:
         if len(self.proof.public_data) > _ZK_MAX_PROOF_DATA_SIZE:
             raise ValueError("V4 public data exceeds max size")
         if len(self.ancestor_headers) > self.MAX_ANCESTOR_HEADERS:
-            raise ValueError("V4 certificate permits at most two ancestor headers")
+            raise ValueError("V4 certificate permits at most three ancestor headers")
         for header in self.ancestor_headers:
             if len(header.serialize()) != PearlHeader.get_serialized_header_size():
                 raise ValueError("V4 ancestor header must include a full proof commitment")
@@ -146,7 +146,7 @@ class ZKCertificate:
             proof_data_len = struct.pack("<I", len(proof))
             encoded = preamble.tobytes() + public_data + proof_data_len + proof
             if self.cert_version == CertificateVersion.PLAIN_FP8:
-                # Counts 0–2 have a single-byte canonical varint encoding.
+                # Counts 0–3 have a single-byte canonical varint encoding.
                 encoded += bytes([len(self.ancestor_headers)])
                 encoded += b"".join(header.serialize() for header in self.ancestor_headers)
             return encoded
@@ -199,7 +199,7 @@ class ZKCertificate:
                     raise ValueError("Truncated V4 proof data or missing ancestor count")
                 count = data[proof_end]
                 if count > cls.MAX_ANCESTOR_HEADERS:
-                    raise ValueError("V4 ancestor count must be between zero and two")
+                    raise ValueError("V4 ancestor count must be between zero and three")
                 header_size = PearlHeader.get_serialized_header_size()
                 ancestors_start = proof_end + 1
                 if len(data) != ancestors_start + count * header_size:

@@ -36,8 +36,8 @@ Version-first design enables polymorphic decoding:
 
 	CertificateV4: BlockHash(32) + PublicDataLen(4) + PublicData + ProofLen(4) + ProofData
 	  + AncestorCount(varint) + AncestorHeaders(108 bytes each).
-	  Same size bounds as V2/V3. At most two full ancestor headers follow,
-	  ordered parent then grandparent, outside ProofCommitment.
+	  Same size bounds as V2/V3. At most three full ancestor headers follow,
+	  ordered parent first, outside ProofCommitment.
 
 KEY DESIGN: SYMMETRIC SERIALIZATION
 

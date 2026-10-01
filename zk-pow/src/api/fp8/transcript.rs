@@ -6,11 +6,12 @@
 //! | code name          | whitepaper symbol   | meaning                                                   |
 //! |--------------------|---------------------|-----------------------------------------------------------|
 //! | `proposed_header`  | `σ̂` (sigma-hat)    | the proposed block header (the caller's header argument)  |
-//! | `ancestor_header`  | `σ_Δ` (sigma-delta) | the proof-carried ancestor header selected by the miner  |
+//! | `ancestor_header`  | `σ_d` (sigma-d)     | the proof-carried ancestor header selected by the miner  |
 //!
-//! The ancestor header is part of the proof (`JobParams.ancestor_header`) and is
-//! taken as granted by zk-pow: the **caller** authenticates it as a member of
-//! the context window preceding the proposed header (§5.3–§5.4).
+//! The ancestor header is part of the proof (`JobParams.ancestor_header`) as a
+//! complete 108-byte header; verifiers authenticate it as one of the window
+//! headers `σ_1..σ_D` preceding the proposed header
+//! ([`crate::api::fp8::public_params::JobParams::check_ancestry`]).
 //!
 //! The per-side opening keys and the noise-seed chain are derived on
 //! [`PublicParams`] (see [`PublicParams::commitment_keys`] and
@@ -44,7 +45,7 @@ use pearl_blake3::blake3_digest;
 
 use crate::api::fp8::jackpot_policy::JackpotMessage;
 use crate::api::fp8::public_params::PublicParams;
-use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
+use crate::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader, Sides};
 
 // Test vectors in the `tests` module below were generated independently with
 // the Python `blake3` package:
@@ -93,8 +94,9 @@ pub(crate) fn key_a(proposed_header: &IncompleteBlockHeader) -> Hash256 {
     hash_labelled(&proposed_header.to_bytes(), LABEL_KEY_A, None)
 }
 
-/// `keyB = H_"key-B"(ancestor_header)` — the B-side tree key.
-pub(crate) fn key_b(ancestor_header: &IncompleteBlockHeader) -> Hash256 {
+/// `keyB = H_"key-B"(ancestor_header)` — the B-side tree key, over the complete
+/// 108-byte ancestor header.
+pub(crate) fn key_b(ancestor_header: &BlockHeader) -> Hash256 {
     hash_labelled(&ancestor_header.to_bytes(), LABEL_KEY_B, None)
 }
 
@@ -136,7 +138,7 @@ impl PublicParams {
         key_a(proposed_header)
     }
 
-    /// `keyB = H_"key-B"(σ_Δ)` — the B-side tree key, keyed on the statement's own
+    /// `keyB = H_"key-B"(σ_d)` — the B-side tree key, keyed on the statement's own
     /// proof-carried ancestor header ([`Self::ancestor_header`]).
     pub(crate) fn key_b(&self) -> Hash256 {
         key_b(self.ancestor_header())
@@ -294,11 +296,11 @@ mod tests {
     use crate::api::fp8::public_params::test_fixtures::{dense_params, moe_params};
 
     /// The same statement with its proof-carried ancestor replaced — the
-    /// transcript-level view of the caller's hash-walk check (σ_Δ leads the
+    /// transcript-level view of the caller's hash-walk check (σ_d leads the
     /// `public_data` blob, so the splice round-trips through the wire codec).
-    fn with_ancestor(params: &PublicParams, ancestor: IncompleteBlockHeader) -> PublicParams {
+    fn with_ancestor(params: &PublicParams, ancestor: BlockHeader) -> PublicParams {
         let mut bytes = params.to_bytes();
-        bytes[..IncompleteBlockHeader::SERIALIZED_SIZE].copy_from_slice(&ancestor.to_bytes());
+        bytes[..BlockHeader::SERIALIZED_SIZE].copy_from_slice(&ancestor.to_bytes());
         PublicParams::from_bytes(&bytes).expect("ancestor splice must round-trip")
     }
 
@@ -313,9 +315,9 @@ mod tests {
         let other_header = IncompleteBlockHeader::new_for_test(0x1d00ffff);
         assert_ne!(params.digest(&header), params.digest(&other_header));
 
-        // A different ancestor header changes public_data (σ_Δ leads the blob),
+        // A different ancestor header changes public_data (σ_d leads the blob),
         // hence the statement digest.
-        let other_ancestor = with_ancestor(&params, other_header);
+        let other_ancestor = with_ancestor(&params, BlockHeader::new_for_test(0x1d00ffff));
         assert_ne!(params.digest(&header), other_ancestor.digest(&header));
         assert_ne!(params.digest(&header), moe_params().digest(&header));
     }
@@ -323,9 +325,12 @@ mod tests {
     #[test]
     fn commitment_keys_bind_both_headers() {
         let proposed = IncompleteBlockHeader::new_for_test(0x207FFFFF);
-        let ancestor = IncompleteBlockHeader {
-            prev_block: [9; 32],
-            ..proposed
+        let ancestor = BlockHeader {
+            incomplete: IncompleteBlockHeader {
+                prev_block: [9; 32],
+                ..proposed
+            },
+            proof_commitment: [7; 32],
         };
         let params = with_ancestor(&dense_params(), ancestor);
 
@@ -340,6 +345,14 @@ mod tests {
         let keys2 = params.commitment_keys(&other_proposed);
         assert_ne!(keys.a, keys2.a);
         assert_eq!(keys.b, keys2.b);
+
+        // keyB binds the ancestor's proof commitment too (all 108 bytes).
+        let recommitted = BlockHeader {
+            proof_commitment: [8; 32],
+            ..ancestor
+        };
+        let keys3 = with_ancestor(&dense_params(), recommitted).commitment_keys(&proposed);
+        assert_ne!(keys.b, keys3.b);
     }
 
     #[test]

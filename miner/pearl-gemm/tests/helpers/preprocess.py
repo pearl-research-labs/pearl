@@ -80,6 +80,10 @@ def tall_tile_config(k: int, r: int = R, device: Device = Device.BLACKWELL) -> M
     return tall_tile_mining_config(k, r, device)
 
 
+# The complete 108-byte parent header that keys B (kernel tests never verify a proof).
+DEFAULT_PARENT_HEADER = b"\x33" * 108
+
+
 def default_header(nbits: int = 0x1D3FFFFF, timestamp: int = 1_700_000_000) -> BlockHeader:
     return BlockHeader(
         version=1,
@@ -100,7 +104,7 @@ class MinerContext:
     n: int
 
     key_a: bytes  # keyA: A's opening key (header-derived)
-    key_b: bytes  # keyB: B's opening key (header-derived)
+    key_b: bytes  # keyB: B's opening key (parent-header-derived)
     seed_b: bytes  # noise seedB (both F bases / B's E lines; the B-side stamp)
 
     f1: torch.Tensor  # (r x k) FP8, on GPU: F_A (keyed by seedB, Side.A address)
@@ -229,7 +233,7 @@ def preprocess(
     assert config.rank == R, "the kernels are specialized for the protocol rank"
     device = B.device if B.is_cuda else torch.device("cuda")
 
-    key_a, key_b = commitment_keys(bytes(header.to_bytes()))
+    key_a, key_b = commitment_keys(bytes(header.to_bytes()), DEFAULT_PARENT_HEADER)
     codes, scales = _pre_quant_b(B.to(device))
     seed_b, commit_stats = _commit_b(codes, scales, key_b, config.p_b(n))
     noise_key_b = _device_bytes(noise_line_key(seed_b), device)

@@ -137,10 +137,6 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 		return fmt.Errorf("fp8 public data too large: %d bytes (max %d)",
 			len(publicData), C.PUBLICDATA_MAX_SIZE)
 	}
-	if len(cert.AncestorHeaders) > wire.MaxCertificateV4AncestorHeaders {
-		return fmt.Errorf("v4 certificate has %d ancestor headers, max %d",
-			len(cert.AncestorHeaders), wire.MaxCertificateV4AncestorHeaders)
-	}
 
 	// Rust owns proof-specific header interpretation and ancestry verification.
 	var headers bytes.Buffer

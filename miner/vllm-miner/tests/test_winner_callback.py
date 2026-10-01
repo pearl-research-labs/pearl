@@ -177,6 +177,7 @@ def test_validated_persistent_hit_builds_canonical_opening(
         incomplete_header_bytes=bytes(range(76)),
         target=target,
         cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[bytes(range(108))],
     )
     a = PrequantMatrix.encode(torch.zeros(8, k, dtype=torch.bfloat16))
     b = PrequantMatrix.encode(torch.zeros(n, k, dtype=torch.bfloat16))
@@ -251,6 +252,7 @@ def test_validated_persistent_hit_builds_canonical_opening(
                 incomplete_header_bytes=bytes(range(1, 77)),
                 target=target,
                 cert_version=CertificateVersion.PLAIN_FP8,
+                ancestor_headers=[bytes(range(1, 109))],
             )
         return result
 
@@ -383,13 +385,15 @@ def _moe_winner_fixture(group_id: int):
     rows, round-robin top-2 routing of 64 tokens, and an always-win job."""
     from miner_base.block_submission import PrebuiltCommitment
     from miner_base.commitment import BlockHeader
+    from pearl_mining import BlockHeader as CompleteBlockHeader
     from vllm_miner.moe import MoeLaunch, MoeRouting
 
     k, experts, n_e, top_k, m = 2048, 4, 256, 2, 64
     config = mining_configuration(k, experts * n_e, experts, device=_DEVICE)
+    parent = CompleteBlockHeader.from_bytes(bytes(range(108)))
     header = BlockHeader(
         version=1,
-        prev_block=b"\x11" * 32,
+        prev_block=bytes(parent.block_hash()),
         merkle_root=b"\x22" * 32,
         timestamp=1_700_000_000,
         nbits=0x207FFFFF,
@@ -398,6 +402,7 @@ def _moe_winner_fixture(group_id: int):
         incomplete_header_bytes=bytes(header.to_bytes()),
         target=(1 << 256) - 1,
         cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[bytes(parent.to_bytes())],
     )
     torch.manual_seed(3)
     a = PrequantMatrix.encode(torch.randn(m, k, dtype=torch.bfloat16))
@@ -510,7 +515,7 @@ def test_moe_hit_opens_the_routed_tokens_and_expert_rows(monkeypatch):
     )
     assert opening.a_codes is moe.codes and opening.b_codes is state.weight_cpu
     header = IncompleteBlockHeader.from_bytes(job.incomplete_header_bytes)
-    proof = create_proof(opening, header)
+    proof = create_proof(opening, header, job.parent_header)
     assert proof.moe is not None and proof.moe_witness.w == w
     accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
     assert accepted, message

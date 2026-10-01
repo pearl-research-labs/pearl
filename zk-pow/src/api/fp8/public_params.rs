@@ -13,12 +13,12 @@
 //! fixed-width `public_data` blob:
 //!
 //! ```text
-//! public_data := σ_Δ(76) ‖ pB ‖ HB_values ‖ HB_scales ‖ pA ‖ HA_values ‖ HA_scales ‖ tA ‖ tB ‖ J ‖ [ MoE tail ]
+//! public_data := σ_d(108) ‖ pB ‖ HB_values ‖ HB_scales ‖ pA ‖ HA_values ‖ HA_scales ‖ tA ‖ tB ‖ J ‖ [ MoE tail ]
 //! MoE tail    := w ‖ O_{w-1} ‖ O_w ‖ O_{e-1} ‖ HR ‖ HO ‖ I_A
 //! ```
 //!
-//! `σ_Δ` (the 76-byte [`IncompleteBlockHeader`] projection of the
-//! proof-carried ancestor header) leads the blob; the depth itself is not
+//! `σ_d` (the complete 108-byte [`BlockHeader`] of the proof-carried
+//! ancestor, proof commitment included) leads the blob; the depth itself is not
 //! transmitted. `tA`/`tB` (4 bytes each) and `J` (32 bytes) are consumed
 //! verbatim.
 //! `pB`/`pA` are the per-operand tuples below, each followed by its two plane
@@ -43,7 +43,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::fp8::prequant::BLOCK_SIZE;
 use crate::api::layout::{AxisPattern, MAX_TILE_ROWS, check_lottery_layout, lane_assignment};
-use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
+use crate::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader, Sides};
+
+/// State-window depth `D`: `σ_d` must be one of the `D` most recent ancestors
+/// `σ_1..σ_D` of the proposed header, never the proposed header itself.
+pub const STATE_WINDOW_DEPTH: usize = 4;
+
 /// Whitelisted keyed-BLAKE3 Merkle chunk size. Encoded as one byte (`0..=3`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -275,22 +280,22 @@ impl MoeParams {
 /// the protocol's commitment order (the B-side keys and seeds derive first).
 ///
 /// # Whitepaper symbol map
-/// - `ancestor_header` = `σ_Δ` — the selected ancestor block header (the same
-///   76-byte incomplete projection as the proposed header), carried by the
-///   proof and taken as granted by zk-pow; the **caller** authenticates it as a
-///   member of the context window preceding the proposed header (§5.3–§5.4).
+/// - `ancestor_header` = `σ_d` — the selected ancestor block header, complete
+///   (108 bytes, proof commitment included), carried by the proof. Verifiers
+///   authenticate it as one of the window headers `σ_1..σ_D` preceding the
+///   proposed header with [`Self::check_ancestry`].
 /// - The proposed header `σ̂` is *not* part of the job: it is the caller's
-///   header argument (`proposed_header`).
+///   header argument (`proposed_header`), which omits the proof commitment.
 ///
 /// Both wire codecs share the part encoders ([`Self::encode_p_b`] /
 /// [`Self::encode_p_a`]): the consensus `public_data` interleaves the
 /// statement's plane roots between `pB` and `pA`, while the `PlainProofV4`
 /// bincode carries the job contiguously via [`Self::to_wire_bytes`]
-/// (`ancestor_header(76) || pB || pA`).
+/// (`ancestor_header(108) || pB || pA`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobParams {
-    /// The proof-carried ancestor header `σ_Δ` (76-byte incomplete projection).
-    pub ancestor_header: IncompleteBlockHeader,
+    /// The proof-carried ancestor header `σ_d` (complete 108-byte header).
+    pub ancestor_header: BlockHeader,
     /// The common tuple (`k`, `r`, `Quant`, `Device`) — rides `pB` on the wire.
     pub common: CommonParams,
     /// The per-operand parameter tuples: `a` = A (`m`, `hash_idA`, `Prow`),
@@ -309,25 +314,27 @@ impl JobParams {
     /// Wire length of dense `pA = (m, hash_idA, Prow)` (MoE appends two hash-ids).
     const P_A_LEN: usize = 4 + 1 + AxisPattern::NUM_DIMS;
 
-    /// The single wire encoding of the job tuple: `ancestor_header(76) || pB || pA`.
+    /// The single wire encoding of the job tuple: `ancestor_header(108) || pB || pA`.
+    /// [`MoeParams`] rides inside the parts: `pB` ends with `e` (`0` when dense) and an
+    /// MoE `pA` appends `hash_idR || hash_idO`.
     ///
     /// The consensus `public_data` codec interleaves the statement's plane
     /// roots between the same parts ([`PublicParams::to_bytes`]); the
     /// `PlainProofV4` bincode carries the job contiguously via
     /// [`Self::from_wire_bytes`].
     pub(crate) fn to_wire_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(IncompleteBlockHeader::SERIALIZED_SIZE + Self::P_B_LEN + Self::P_A_LEN);
+        let mut out = Vec::with_capacity(BlockHeader::SERIALIZED_SIZE + Self::P_B_LEN + Self::P_A_LEN);
         out.extend_from_slice(&self.ancestor_header.to_bytes());
         out.extend_from_slice(&self.encode_p_b());
         out.extend_from_slice(&self.encode_p_a());
         out
     }
 
-    /// Inverse of [`Self::to_wire_bytes`]: parses `ancestor_header(76) || pB || pA`
+    /// Inverse of [`Self::to_wire_bytes`]: parses `ancestor_header(108) || pB || pA`
     /// (no statement material — the plane roots and tile bases ride separately).
     pub(crate) fn from_wire_bytes(wire: &[u8]) -> Result<Self> {
         let mut s = wire;
-        let ancestor_header = IncompleteBlockHeader::from_bytes(take(&mut s, IncompleteBlockHeader::SERIALIZED_SIZE)?)?;
+        let ancestor_header = BlockHeader::from_bytes(take(&mut s, BlockHeader::SERIALIZED_SIZE)?)?;
         let (common, b, experts) = parse_p_b(&mut s)?;
         let (a, moe_hash_ids) = parse_p_a(&mut s, experts)?;
         ensure!(s.is_empty(), "trailing bytes in fp8 job tuple");
@@ -358,6 +365,27 @@ impl JobParams {
                 MoeParams::MAX_NUM_EXPERTS,
                 moe.experts
             );
+        }
+        Ok(())
+    }
+
+    /// Authenticates `σ_d` as the depth-`d ≤ D` ancestor of `proposed_header` (`σ̂`):
+    /// `chain` is exactly `σ_1..σ_{d-1}`, parent first, and each link is the SHA256d
+    /// of the complete parent header.
+    pub fn check_ancestry(&self, proposed_header: &IncompleteBlockHeader, chain: &[BlockHeader]) -> Result<()> {
+        ensure!(
+            chain.len() < STATE_WINDOW_DEPTH,
+            "v4 ancestor chain holds {} headers, at most {} fit the state window",
+            chain.len(),
+            STATE_WINDOW_DEPTH - 1
+        );
+        let mut child = proposed_header;
+        for (depth, parent) in (1..).zip(chain.iter().chain([&self.ancestor_header])) {
+            ensure!(
+                child.prev_block == parent.block_hash(),
+                "v4 ancestor header at depth {depth} does not connect"
+            );
+            child = &parent.incomplete;
         }
         Ok(())
     }
@@ -566,8 +594,8 @@ impl PublicParams {
     pub const MAX_K: usize = 1 << 16;
 
     /// Byte length of a dense (non-MoE) statement:
-    /// σ_Δ (76) + pB (21) + HB (32) + pA (11) + HA (32) + tile bases (8) + J (32).
-    pub const WIRE_SIZE: usize = 212;
+    /// σ_d (108) + pB (21) + HB (32) + pA (11) + HA (32) + tile bases (8) + J (32).
+    pub const WIRE_SIZE: usize = 244;
 
     /// Largest statement byte length: the dense core plus the largest supported MoE tail.
     pub const MAX_WIRE_SIZE: usize = Self::WIRE_SIZE + 2 + 2 + 3 * 4 + 2 * 32 + 4 * MAX_TILE_ROWS;
@@ -628,8 +656,8 @@ impl PublicParams {
     pub fn from_bytes(public_data: &[u8]) -> Result<Self> {
         let mut s = public_data;
 
-        // ---- the proof-carried ancestor header σ_Δ (76 bytes) ----
-        let ancestor_header = IncompleteBlockHeader::from_bytes(take(&mut s, IncompleteBlockHeader::SERIALIZED_SIZE)?)?;
+        // ---- the proof-carried ancestor header σ_d (108 bytes) ----
+        let ancestor_header = BlockHeader::from_bytes(take(&mut s, BlockHeader::SERIALIZED_SIZE)?)?;
 
         // ---- per-operand tuples (pB, HB | pA, HA) — pB first so its `e` discriminates pA's suffix ----
         let (common, b, experts) = parse_p_b(&mut s)?;
@@ -744,9 +772,8 @@ impl PublicParams {
         &self.job
     }
 
-    /// The proof-carried ancestor header `σ_Δ` — taken as granted by zk-pow;
-    /// the caller authenticates it (see the module docs and [`JobParams`]).
-    pub fn ancestor_header(&self) -> &IncompleteBlockHeader {
+    /// The proof-carried ancestor header `σ_d`, authenticated by [`JobParams::check_ancestry`].
+    pub fn ancestor_header(&self) -> &BlockHeader {
         &self.job.ancestor_header
     }
 
@@ -1057,6 +1084,33 @@ pub(crate) mod test_fixtures {
         }
     }
 
+    /// A linked header chain of the given depth: `(σ̂, σ_1..σ_{depth-1}, σ_depth)`,
+    /// each `prev_block` the hash of its parent, `σ̂` being
+    /// [`IncompleteBlockHeader::new_for_test`] with only its `prev_block` relinked.
+    pub(crate) fn ancestry(depth: usize) -> (IncompleteBlockHeader, Vec<BlockHeader>, BlockHeader) {
+        assert!(depth >= 1, "σ_d is at least the parent");
+        let ancestor = BlockHeader::new_for_test(0x207FFFFF);
+        // Built oldest first: each header is its predecessor's child.
+        let mut lineage = vec![ancestor];
+        for _ in 1..depth {
+            let parent = lineage.last().unwrap();
+            lineage.push(BlockHeader {
+                incomplete: IncompleteBlockHeader {
+                    prev_block: parent.block_hash(),
+                    timestamp: parent.incomplete.timestamp + 1,
+                    ..parent.incomplete
+                },
+                ..*parent
+            });
+        }
+        let proposed = IncompleteBlockHeader {
+            prev_block: lineage.last().unwrap().block_hash(),
+            ..IncompleteBlockHeader::new_for_test(0x207FFFFF)
+        };
+        let chain = lineage[1..].iter().rev().copied().collect();
+        (proposed, chain, ancestor)
+    }
+
     pub(crate) fn empty_moe_statement(i_a: Vec<u32>) -> MoEStatement {
         MoEStatement {
             w: 1,
@@ -1072,7 +1126,7 @@ pub(crate) mod test_fixtures {
     pub(crate) fn dense_params() -> PublicParams {
         PublicParams::try_new(
             JobParams {
-                ancestor_header: IncompleteBlockHeader::zero(),
+                ancestor_header: BlockHeader::zero(),
                 common: CommonParams {
                     k: 2048,
                     r: 32,
@@ -1134,7 +1188,7 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::*;
     use crate::api::fp8::public_params::test_fixtures::{
-        cols, dense_params, empty_jackpot, empty_moe_statement, moe_params, rows, stacked_b,
+        ancestry, cols, dense_params, empty_jackpot, empty_moe_statement, moe_params, rows, stacked_b,
     };
     use crate::api::layout::DimType::{Blake, Fold};
 
@@ -1238,7 +1292,7 @@ mod tests {
             };
             PublicParams::try_new(
                 JobParams {
-                    ancestor_header: IncompleteBlockHeader::zero(),
+                    ancestor_header: BlockHeader::zero(),
                     common: CommonParams {
                         k: u32::try_from(k)?,
                         r: 32,
@@ -1711,5 +1765,79 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("n must be divisible by e"));
+    }
+
+    // ---- check_ancestry: σ_d authenticated by the SHA256d walk from σ̂ ----
+
+    fn job_with_ancestor(ancestor_header: BlockHeader) -> JobParams {
+        JobParams {
+            ancestor_header,
+            ..dense_params().job.clone()
+        }
+    }
+
+    fn ancestry_err(proposed: &IncompleteBlockHeader, chain: &[BlockHeader], ancestor: BlockHeader) -> String {
+        job_with_ancestor(ancestor)
+            .check_ancestry(proposed, chain)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn check_ancestry_accepts_every_window_depth() {
+        for depth in 1..=STATE_WINDOW_DEPTH {
+            let (proposed, chain, ancestor) = ancestry(depth);
+            assert_eq!(chain.len(), depth - 1);
+            job_with_ancestor(ancestor).check_ancestry(&proposed, &chain).unwrap();
+        }
+    }
+
+    #[test]
+    fn check_ancestry_rejects_depth_beyond_the_window() {
+        let (proposed, chain, ancestor) = ancestry(STATE_WINDOW_DEPTH + 1);
+        let err = ancestry_err(&proposed, &chain, ancestor);
+        assert!(err.contains("at most 3 fit the state window"), "{err}");
+    }
+
+    #[test]
+    fn check_ancestry_rejects_a_broken_link() {
+        let (proposed, chain, ancestor) = ancestry(3);
+        for (i, depth) in [(0, 1), (1, 2)] {
+            let mut broken = chain.clone();
+            broken[i].incomplete.merkle_root[0] ^= 1;
+            let err = ancestry_err(&proposed, &broken, ancestor);
+            assert!(err.contains(&format!("depth {depth} does not connect")), "{err}");
+        }
+    }
+
+    #[test]
+    fn check_ancestry_rejects_extra_headers() {
+        let (proposed, mut chain, ancestor) = ancestry(2);
+        // σ_d repeated at the end of the chain: the walk overshoots it.
+        chain.push(ancestor);
+        let err = ancestry_err(&proposed, &chain, ancestor);
+        assert!(err.contains("depth 3 does not connect"), "{err}");
+    }
+
+    #[test]
+    fn check_ancestry_rejects_a_wrong_sigma_d() {
+        let (proposed, chain, ancestor) = ancestry(2);
+        // The proof commitment is part of the authenticated header.
+        let recommitted = BlockHeader {
+            proof_commitment: [0xee; 32],
+            ..ancestor
+        };
+        let err = ancestry_err(&proposed, &chain, recommitted);
+        assert!(err.contains("depth 2 does not connect"), "{err}");
+        // σ̂ itself is never in the window.
+        let err = ancestry_err(
+            &proposed,
+            &[],
+            BlockHeader {
+                incomplete: proposed,
+                proof_commitment: [0; 32],
+            },
+        );
+        assert!(err.contains("depth 1 does not connect"), "{err}");
     }
 }

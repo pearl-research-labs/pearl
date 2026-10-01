@@ -7,19 +7,29 @@ from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gateway.comm.json_rpc_client import JSONRPCClient
 from pearl_gateway.config import MinerRpcConfig
-from pearl_mining import IncompleteBlockHeader, PlainProof, PlainProofV4
+from pearl_mining import BlockHeader, IncompleteBlockHeader, PlainProof, PlainProofV4
 
 _LOGGER = get_logger(__name__)
 
 # The dummy (no-gateway) job: plain-peel miners parse the header with
 # IncompleteBlockHeader.from_bytes on every first matmul, so it must be a
-# valid serialized 76-byte header. Hard difficulty so offline runs
-# (MINER_NO_GATEWAY=1 benchmarks) do not constantly "win".
+# valid serialized 76-byte header, and key B by a parent it links to. Hard
+# difficulty so offline runs (MINER_NO_GATEWAY=1 benchmarks) do not constantly "win".
 _DUMMY_NBITS = 0x1D00FFFF
-_DUMMY_HEADER_BYTES = bytes(
+_DUMMY_PARENT = BlockHeader(
     IncompleteBlockHeader(
         version=1,
         prev_block=b"\xde\xad\xba\xbe" * 8,
+        merkle_root=b"\x00" * 32,
+        timestamp=0,
+        nbits=_DUMMY_NBITS,
+    ),
+    bytes(32),
+)
+_DUMMY_HEADER_BYTES = bytes(
+    IncompleteBlockHeader(
+        version=1,
+        prev_block=bytes(_DUMMY_PARENT.block_hash()),
         merkle_root=b"\x00" * 32,
         timestamp=0,
         nbits=_DUMMY_NBITS,
@@ -87,5 +97,8 @@ class DummyMiningClient(MiningClient):
 
     def get_mining_info(self) -> MiningJob:
         return MiningJob(
-            _DUMMY_HEADER_BYTES, bits_to_target(_DUMMY_NBITS), CertificateVersion.PLAIN_FP8
+            _DUMMY_HEADER_BYTES,
+            bits_to_target(_DUMMY_NBITS),
+            CertificateVersion.PLAIN_FP8,
+            [bytes(_DUMMY_PARENT.to_bytes())],
         )

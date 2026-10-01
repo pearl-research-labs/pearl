@@ -3,9 +3,10 @@
 GPU and framework adapters extract the committed planes for a winning tile;
 this module validates that opening, builds and verifies the consensus
 ``PlainProofV4``, and submits admissible candidates through the miner RPC
-client. The proof opens A's trees under ``keyA`` and B's under ``keyB``, both
-derived from the proposed header (the miner proposes at depth 0, so the
-ancestor header that keyed B is the proposed header itself).
+client. The proof opens A's trees under ``keyA``, derived from the proposed
+header, and B's under ``keyB``, derived from the parent's complete header (the
+miner always keys B at state-window depth 1, so the proof carries no
+intermediate ancestor headers).
 """
 
 from dataclasses import dataclass, replace
@@ -392,17 +393,19 @@ def _native_operand(params: OperandParams) -> pearl_mining.OperandParams:
 
 
 def create_proof(
-    opened_block_info: OpenedBlockInfo, header: BlockHeader | IncompleteBlockHeader
+    opened_block_info: OpenedBlockInfo,
+    header: BlockHeader | IncompleteBlockHeader,
+    parent_header: bytes,
 ) -> PlainProofV4:
     """Build a certificate-v4 FP8 ``PlainProofV4`` from a validated winning opening.
 
-    ``header`` is the proposed (incomplete) block header; it keys both sides'
-    trees since the miner proposes at ancestor depth 0.
+    ``header`` is the proposed (incomplete) block header, which keys A's trees;
+    ``parent_header`` is the parent's complete 108-byte header, which keys B's.
     """
     m, n, k = _validate_opening(opened_block_info)
     config = opened_block_info.mining_config
     header_bytes = bytes(header.to_bytes())
-    key_a, key_b = commitment_keys(header_bytes)
+    key_a, key_b = commitment_keys(header_bytes, parent_header)
     a_planes = (opened_block_info.a_codes, opened_block_info.a_scales)
     if opened_block_info.a_commitment is None:
         comm_a = commit_planes(list(a_planes), key_a, config.a_hash_id)
@@ -425,7 +428,7 @@ def create_proof(
 
     common = config.common_params()
     return PlainProofV4(
-        ancestor_header=IncompleteBlockHeader.from_bytes(header_bytes),
+        ancestor_header=pearl_mining.BlockHeader.from_bytes(parent_header),
         common=pearl_mining.CommonParams(
             common.k,
             common.r,
@@ -462,7 +465,7 @@ def submit_opened_block(
         )
 
     header = IncompleteBlockHeader.from_bytes(mining_job.incomplete_header_bytes)
-    plain_proof = create_proof(opened_block_info, header)
+    plain_proof = create_proof(opened_block_info, header, mining_job.parent_header)
     is_valid, message = verify_plain_proof_for_cert_version(
         mining_job.cert_version, header, plain_proof
     )

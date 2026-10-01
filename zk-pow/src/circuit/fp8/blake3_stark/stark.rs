@@ -3248,7 +3248,7 @@ mod tests {
         use crate::api::fp8::plain_proof::PlainProofV4;
         use crate::api::fp8::public_params::{CommonParams, Device, HashId, JobParams, OperandParams, Quant};
         use crate::api::layout::{AxisPattern, DimType};
-        use crate::api::primitives::{IncompleteBlockHeader, Sides};
+        use crate::api::primitives::Sides;
         use crate::ffi::plain_proof::MatrixMerkleProof;
         // k = 2048, 4×64 tile, 16 Blake lanes. m > h and n > w so every
         // plane tree still mixes opened blocks, auxiliary blocks (unopened rows sharing an
@@ -3259,8 +3259,8 @@ mod tests {
         let cols_pattern = AxisPattern::new(&[(4, DimType::Blake), (16, DimType::Fold)]).unwrap();
         let a_rows: Vec<usize> = rows_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
         let b_rows: Vec<usize> = cols_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
-        let header = IncompleteBlockHeader::new_for_test(0x207FFFFF);
-        let (key_a, key_b) = crate::circuit::fp8::consistency::fixture_tree_keys(&header);
+        let (header, ancestor_chain, ancestor_header) = crate::circuit::fp8::consistency::fixture_headers();
+        let (key_a, key_b) = crate::circuit::fp8::consistency::fixture_tree_keys(&header, &ancestor_header);
         let key_a_words = core::array::from_fn(|i| u32::from_le_bytes(key_a[4 * i..4 * i + 4].try_into().unwrap()));
         let key_b_words = core::array::from_fn(|i| u32::from_le_bytes(key_b[4 * i..4 * i + 4].try_into().unwrap()));
 
@@ -3295,8 +3295,7 @@ mod tests {
         };
         let proof = PlainProofV4 {
             job: JobParams {
-                // σ̂ and σ_Δ coincide in this fixture (the ancestor is the proposed header).
-                ancestor_header: header,
+                ancestor_header,
                 common: CommonParams {
                     k: k as u32,
                     r: 32,
@@ -3317,6 +3316,7 @@ mod tests {
                 },
                 moe: None,
             },
+            ancestor_chain,
             values: Sides {
                 a: keyed_proof(&value_tree(m, 0), &a_rows, key_a),
                 b: keyed_proof(&value_tree(n, 7), &b_rows, key_b),
@@ -3395,7 +3395,7 @@ mod tests {
     ) -> (usize, usize, usize) {
         use crate::api::fp8::plain_proof::PlainProofV4;
         use crate::api::fp8::public_params::{CommonParams, Device, HashId, JobParams, OperandParams, Quant};
-        use crate::api::primitives::{IncompleteBlockHeader, Sides};
+        use crate::api::primitives::Sides;
         use crate::ffi::plain_proof::MatrixMerkleProof;
 
         assert_eq!(k % 32, 0);
@@ -3403,8 +3403,8 @@ mod tests {
         let n_blocks = k / BLOCK_SIZE;
         let rows_pattern = AxisPattern::new(a_dims).unwrap();
         let cols_pattern = AxisPattern::new(b_dims).unwrap();
-        let header = IncompleteBlockHeader::new_for_test(0x207FFFFF);
-        let (key_a, key_b) = crate::circuit::fp8::consistency::fixture_tree_keys(&header);
+        let (header, ancestor_chain, ancestor_header) = crate::circuit::fp8::consistency::fixture_headers();
+        let (key_a, key_b) = crate::circuit::fp8::consistency::fixture_tree_keys(&header, &ancestor_header);
         let key_a_words = core::array::from_fn(|i| u32::from_le_bytes(key_a[4 * i..4 * i + 4].try_into().unwrap()));
         let key_b_words = core::array::from_fn(|i| u32::from_le_bytes(key_b[4 * i..4 * i + 4].try_into().unwrap()));
 
@@ -3438,8 +3438,7 @@ mod tests {
         };
         let proof = PlainProofV4 {
             job: JobParams {
-                // σ̂ and σ_Δ coincide in this fixture (the ancestor is the proposed header).
-                ancestor_header: header,
+                ancestor_header,
                 common: CommonParams {
                     k: k as u32,
                     r: 32,
@@ -3460,6 +3459,7 @@ mod tests {
                 },
                 moe: None,
             },
+            ancestor_chain,
             values: Sides {
                 a: keyed_proof(&value_tree(m, 0), a_rows, key_a),
                 b: keyed_proof(&value_tree(n, 7), b_rows, key_b),

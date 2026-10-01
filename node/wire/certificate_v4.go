@@ -12,8 +12,10 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
-// MaxCertificateV4AncestorHeaders bounds the parent/grandparent witness.
-const MaxCertificateV4AncestorHeaders = 2
+// MaxCertificateV4AncestorHeaders bounds the ancestor chain: the proof's
+// ancestor header lies at depth at most four (the state window), so at most
+// three intermediate headers separate it from the proposed header.
+const MaxCertificateV4AncestorHeaders = 3
 
 // CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is
 // hash + length-prefixed public data + length-prefixed proof + ancestor count
@@ -25,9 +27,11 @@ type CertificateV4 struct {
 	PublicData []byte
 	ProofData  []byte
 
-	// AncestorHeaders supplies the parent, then grandparent, for ancestry
-	// verification. They are excluded from ProofCommitment and authenticated
-	// through the proposed header's PrevBlock hash.
+	// AncestorHeaders supplies the headers strictly between the proposed
+	// header and the proof's ancestor header (carried in PublicData), parent
+	// first: empty when that ancestor is the parent. They are excluded from
+	// ProofCommitment and authenticated through the proposed header's
+	// PrevBlock hash.
 	AncestorHeaders []BlockHeader
 }
 
@@ -58,7 +62,7 @@ func (c *CertificateV4) ProofCommitment() chainhash.Hash {
 
 // Serialize writes the certificate fields, followed by a canonical varint
 // ancestor count and the full headers in parent-to-grandparent order.
-// The count is mandatory, including zero for a depth-0 certificate.
+// The count is mandatory, including zero for a depth-1 (parent) ancestor.
 func (c *CertificateV4) Serialize(w io.Writer) error {
 	if len(c.AncestorHeaders) > MaxCertificateV4AncestorHeaders {
 		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",

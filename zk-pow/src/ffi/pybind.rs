@@ -2,12 +2,12 @@
 //!
 //! Int7 types: `PeriodicPattern` / `MiningConfiguration` / `MoEConfig` / `MMAType`.
 //! FP8 witnesses cross as [`crate::api::fp8::plain_proof::PlainProofV4`].
-//! `IncompleteBlockHeader` is shared. The node-side cache
+//! `IncompleteBlockHeader` and the complete `BlockHeader` are shared. The node-side cache
 //! ([`crate::api::fp8::zk::Fp8VerifierCache`]) is not bound: Python is the
 //! prover/miner surface; the Go node uses its own embedded cache.
 
 #[cfg(feature = "pyo3")]
-use crate::api::primitives::IncompleteBlockHeader;
+use crate::api::primitives::{BlockHeader, IncompleteBlockHeader};
 #[cfg(feature = "pyo3")]
 use crate::v2::api::proof::{MMAType, MiningConfiguration, MoEConfig, PeriodicPattern};
 
@@ -130,6 +130,46 @@ impl IncompleteBlockHeader {
 
 #[cfg(feature = "pyo3")]
 #[pyo3::pymethods]
+impl BlockHeader {
+    /// Size of a serialized (wire) BlockHeader in bytes.
+    #[classattr]
+    #[pyo3(name = "SERIALIZED_SIZE")]
+    fn py_serialized_size() -> usize {
+        Self::SERIALIZED_SIZE
+    }
+
+    #[new]
+    fn py_new(incomplete: IncompleteBlockHeader, proof_commitment: Vec<u8>) -> pyo3::PyResult<Self> {
+        let proof_commitment = proof_commitment
+            .try_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("proof_commitment must be 32 bytes"))?;
+        Ok(Self {
+            incomplete,
+            proof_commitment,
+        })
+    }
+
+    /// Format: IncompleteBlockHeader wire bytes(76) | proof_commitment(32, as stored)
+    #[pyo3(name = "to_bytes")]
+    fn py_to_bytes(&self) -> Vec<u8> {
+        BlockHeader::to_bytes(self).to_vec()
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_bytes")]
+    fn py_from_bytes(data: Vec<u8>) -> pyo3::PyResult<Self> {
+        BlockHeader::from_bytes(&data).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// SHA256d of the wire header, in `prev_block` (display) byte order.
+    #[pyo3(name = "block_hash")]
+    fn py_block_hash(&self) -> Vec<u8> {
+        BlockHeader::block_hash(self).to_vec()
+    }
+}
+
+#[cfg(feature = "pyo3")]
+#[pyo3::pymethods]
 impl MoEConfig {
     #[new]
     fn py_new(e: u16, top_k: u16) -> Self {
@@ -227,7 +267,7 @@ mod fp8 {
     use crate::api::fp8::plain_proof::PlainProofV4;
     use crate::api::fp8::public_params::Device;
     use crate::api::fp8::zk::{Fp8Prover, Fp8Verifier, decode_statement};
-    use crate::api::primitives::IncompleteBlockHeader;
+    use crate::api::primitives::{BlockHeader, IncompleteBlockHeader};
 
     fn value_err(error: impl core::fmt::Display) -> PyErr {
         pyo3::exceptions::PyValueError::new_err(error.to_string())
@@ -289,16 +329,24 @@ mod fp8 {
             // The setup is job-independent, so the statement's own `ancestor_header`
             // anchors the job derivation (the committed cache is built from the
             // canonical `sample_dense_statement` dummy of the same shape).
-            Fp8Verifier::generate(&statement, statement.ancestor_header(), &mut TimingTree::default())
+            let anchor = statement.ancestor_header().incomplete;
+            Fp8Verifier::generate(&statement, &anchor, &mut TimingTree::default())
                 .map(|verifier| Self { inner: verifier })
                 .map_err(|e| runtime_err("fp8 verifier setup generation failed", e))
         }
 
         /// Verifies a published `(public_data, proof_data)` pair against the
-        /// expected block header. Raises on rejection.
-        fn verify_block(&self, block_header: IncompleteBlockHeader, public_data: &[u8], proof_data: &[u8]) -> PyResult<()> {
+        /// expected block header; `ancestor_chain` holds the headers strictly
+        /// between it and the statement's `σ_d`, parent first. Raises on rejection.
+        fn verify_block(
+            &self,
+            block_header: IncompleteBlockHeader,
+            ancestor_chain: Vec<BlockHeader>,
+            public_data: &[u8],
+            proof_data: &[u8],
+        ) -> PyResult<()> {
             self.inner
-                .verify_block(&block_header, public_data, proof_data)
+                .verify_block(&block_header, &ancestor_chain, public_data, proof_data)
                 .map_err(|e| runtime_err("fp8 verification rejected the proof", e))
         }
 
@@ -306,12 +354,13 @@ mod fp8 {
         fn verify_share(
             &self,
             block_header: IncompleteBlockHeader,
+            ancestor_chain: Vec<BlockHeader>,
             public_data: &[u8],
             proof_data: &[u8],
             share_nbits: u32,
         ) -> PyResult<()> {
             self.inner
-                .verify_share(&block_header, public_data, proof_data, share_nbits)
+                .verify_share(&block_header, &ancestor_chain, public_data, proof_data, share_nbits)
                 .map_err(|e| runtime_err("fp8 verification rejected the share", e))
         }
 

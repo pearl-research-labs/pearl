@@ -502,6 +502,7 @@ class AsyncLoopManager:
                 incomplete_header_bytes=bytes(mining_job.incomplete_header_bytes),
                 target=mining_job.target,
                 cert_version=mining_job.cert_version,
+                ancestor_headers=[bytes(header) for header in mining_job.ancestor_headers],
             )
         except BaseException:
             self._release_pending_submission_ownership()

@@ -34,6 +34,7 @@ lazy_static = "1.4"
 sorted-vec = "0.8.10"
 itertools = "0.14.0"
 blake3 = "1.8"
+sha2 = "0.10"
 pearl-blake3 = { path = "../pearl-blake3", features = ["serde"] }
 pyo3 = { version = "0.24", optional = true }
 

@@ -72,8 +72,11 @@ Returns `(True, "Verified")` on success, or `(False, reason)` on failure.
 For V4, use `Fp8Prover.setup(header, plain_proof_v4)` followed by
 `prover.prove(header, plain_proof_v4)` to obtain `(public_data, proof_data)`.
 `Fp8Verifier.generate(public_data)` creates the corresponding verifier;
-`verifier.verify_block(header, public_data, proof_data)` raises on rejection.
-The node separately authenticates the carried ancestor headers during block validation.
+`verifier.verify_block(header, ancestor_chain, public_data, proof_data)` raises on
+rejection. `ancestor_chain` is the list of `BlockHeader`s strictly between `header`
+and the proof's ancestor `σ_d` (parent first; empty when `σ_d` is the parent), and
+the verifier authenticates `σ_d` by hash-walking it. A `PlainProofV4` carries the
+same chain in its `ancestor_chain` field.
 
 ## Wire Format
 
@@ -84,7 +87,8 @@ The full block is then serialized as:
 ZKCertificate.serialize() | PearlHeader.serialize() | TX_COUNT (varint) | TRANSACTIONS
 ```
 
-V4 certificates append a CompactSize ancestor count (0–2) after the proof bytes,
-then that many full 108-byte headers in parent, grandparent order. These headers
-are excluded from the proof commitment. The current miner uses the proposed
-header as its proof's ancestor (depth zero), so it writes a zero count.
+V4 certificates append a CompactSize ancestor count (0–3) after the proof bytes,
+then that many full 108-byte headers in parent, grandparent order: the proof's
+`ancestor_chain`. These headers are excluded from the proof commitment. The
+current miner uses the parent as its proof's ancestor (depth one), so it writes
+a zero count.

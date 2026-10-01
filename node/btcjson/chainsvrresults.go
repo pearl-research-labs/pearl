@@ -305,6 +305,12 @@ type GetBlockTemplateResult struct {
 	// (see chaincfg.Params.RequiredCertVersion). It is the single source of
 	// truth for miners selecting which proof/certificate to produce.
 	RequiredCertVersion uint32 `json:"requiredcertversion"`
+
+	// AncestorHeaders holds hex-encoded 108-byte wire headers of the most
+	// recent ancestors (up to four), parent first. A V4 proof keys its
+	// ancestor header by one of them and its certificate carries the
+	// headers in between. Only present for V4 templates.
+	AncestorHeaders []string `json:"ancestorheaders,omitempty"`
 }
 
 // GetMempoolEntryResult models the data returned from the getmempoolentry's

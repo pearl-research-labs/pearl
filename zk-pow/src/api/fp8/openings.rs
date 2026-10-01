@@ -501,6 +501,7 @@ fn reject_nonfinite_prequant(operand: &PrequantOperand, k: usize) -> Result<()> 
 mod tests {
     use super::*;
     use crate::api::fp8::plain_proof::PlainProofV4;
+    use crate::api::fp8::public_params::test_fixtures::ancestry;
     use crate::api::fp8::public_params::{
         CommonParams, Device, HashId, JackpotStatement, JobParams, OperandParams, PublicParams, Quant,
     };
@@ -549,11 +550,11 @@ mod tests {
         let cols_pattern = AxisPattern::new(&[(4, Blake), (16, Fold)]).unwrap();
         let a_rows: Vec<usize> = rows_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
         let b_rows: Vec<usize> = cols_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
-        // σ̂ and σ_Δ coincide in this fixture (the ancestor is the proposed header).
-        let proposed = IncompleteBlockHeader::new_for_test(0x207FFFFF);
+        // σ_d is the parent of σ̂ in this fixture.
+        let (proposed, ancestor_chain, ancestor_header) = ancestry(1);
         let keys = commit_keys(Sides {
             a: key_a(&proposed),
-            b: key_b(&proposed),
+            b: key_b(&ancestor_header),
         });
 
         let value_tree = |rows: usize, seed: usize| -> Vec<Vec<u8>> {
@@ -569,7 +570,7 @@ mod tests {
 
         let proof = PlainProofV4 {
             job: JobParams {
-                ancestor_header: proposed,
+                ancestor_header,
                 common: CommonParams {
                     k: k as u32,
                     r: 32,
@@ -590,6 +591,7 @@ mod tests {
                 },
                 moe: None,
             },
+            ancestor_chain,
             values: Sides {
                 a: matrix_proof_keyed(&value_tree(m, 0), &a_rows, keys.a, a_hash),
                 b: matrix_proof_keyed(&value_tree(n, 7), &b_rows, keys.b, b_hash),
@@ -829,25 +831,22 @@ mod tests {
     }
 
     /// The B-side tree key follows the witness's own `job.ancestor_header`
-    /// (`σ_Δ`), not the proposed header: a proof whose ancestor differs from
-    /// `σ̂` keys B's trees with `H_"key-B"(σ_Δ)`.
+    /// (`σ_d`), not the proposed header: a proof whose `σ_d` is the
+    /// grandparent keys B's trees with `H_"key-B"(σ_d)`.
     #[test]
     fn ancestor_header_keys_b_side() {
-        let ancestor = IncompleteBlockHeader {
-            prev_block: [7; 32],
-            ..IncompleteBlockHeader::new_for_test(0x207FFFFF)
-        };
-        // Key B's trees under the ancestor (A stays on the fixture's σ̂), then
-        // declare σ_Δ in the job: the proof parses only when the verifier's
-        // keyB — derived from the declared ancestor — matches the tree key.
-        let (proposed, mut proof) =
-            build_dense_proof_with(2048, honest_scale, HashId::Blake3Chunk1024, HashId::Blake3Chunk1024, |keys| {
-                Sides {
-                    b: key_b(&ancestor),
-                    ..keys
-                }
-            });
+        let (proposed, chain, ancestor) = ancestry(2);
+        // Key the trees under the depth-2 headers, then declare σ_d and its chain
+        // in the job: the proof parses only when the verifier's keyB — derived
+        // from the declared ancestor — matches the tree key.
+        let (_, mut proof) = build_dense_proof_with(2048, honest_scale, HashId::Blake3Chunk1024, HashId::Blake3Chunk1024, |_| {
+            Sides {
+                a: key_a(&proposed),
+                b: key_b(&ancestor),
+            }
+        });
         proof.job.ancestor_header = ancestor;
+        proof.ancestor_chain = chain;
         let (_, public) = proof.parse_proof(&proposed).expect("ancestor-keyed proof must parse");
         assert_eq!(public.ancestor_header(), &ancestor);
     }

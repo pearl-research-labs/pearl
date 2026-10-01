@@ -106,6 +106,8 @@ fn hopper_api_roundtrips_minimum_k_and_partial_window() {
     }
 }
 
+/// Writes `σ̂(76) ‖ u32le public_data_len ‖ public_data ‖ u8 chain_len ‖ chain(108 each,
+/// parent first) ‖ proof_data` per device; σ_d itself rides inside `public_data`.
 pub(super) fn regenerate_go_fixture() {
     let mut prover = Fp8Prover::setup(Device::H100).expect("fp8 setup");
     let mut fixtures = Vec::new();
@@ -118,10 +120,15 @@ pub(super) fn regenerate_go_fixture() {
         let (public_data, proof_data) = prover.prove(&header, &plain).expect("wrapped proving must succeed");
 
         let public_data_len = u32::try_from(public_data.len()).expect("public data length must fit u32");
-        let mut fixture = Vec::with_capacity(IncompleteBlockHeader::SERIALIZED_SIZE + 4 + public_data.len() + proof_data.len());
+        let chain_len = u8::try_from(plain.ancestor_chain.len()).expect("the chain fits the state window");
+        let mut fixture = Vec::new();
         fixture.extend_from_slice(&header.to_bytes());
         fixture.extend_from_slice(&public_data_len.to_le_bytes());
         fixture.extend_from_slice(&public_data);
+        fixture.push(chain_len);
+        for ancestor in &plain.ancestor_chain {
+            fixture.extend_from_slice(&ancestor.to_bytes());
+        }
         fixture.extend_from_slice(&proof_data);
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../node/zkpow/testdata/fp8_zk_proof_{suffix}.bin"));
@@ -152,8 +159,9 @@ fn wrapped_devices_roundtrip_through_embedded_cache() {
         let (public_data, proof_data) = prover.prove(&header, &plain).expect("wrapped proving must succeed");
         let statement = decode_statement(&public_data).expect("published statement must decode");
         assert_eq!(statement.common().device, device);
+        let chain = &plain.ancestor_chain;
         cache
-            .verify_block(&header, &public_data, &proof_data)
+            .verify_block(&header, chain, &public_data, &proof_data)
             .expect("embedded device setup must verify the wrapped proof");
 
         let mut relabeled = statement.clone();
@@ -162,7 +170,9 @@ fn wrapped_devices_roundtrip_through_embedded_cache() {
             Device::B200 => Device::H100,
         });
         assert!(
-            cache.verify_block(&header, &relabeled.to_bytes(), &proof_data).is_err(),
+            cache
+                .verify_block(&header, chain, &relabeled.to_bytes(), &proof_data)
+                .is_err(),
             "a proof must not verify through the other device's setup"
         );
     }
@@ -203,8 +213,9 @@ fn check_wrapped_api_roundtrip_and_tamper_rejection(device: Device) {
     let verifier_bytes = verifier.to_bytes().expect("serialize verifier setup");
     let verifier = Fp8Verifier::from_bytes(&verifier_bytes).expect("deserialize verifier setup");
 
+    let chain = &plain.ancestor_chain;
     verifier
-        .verify_block(&header, &public_data, &proof_data)
+        .verify_block(&header, chain, &public_data, &proof_data)
         .expect("honest wrapped proof must verify");
 
     let mut cache = Fp8VerifierCache::default();
@@ -213,7 +224,7 @@ fn check_wrapped_api_roundtrip_and_tamper_rejection(device: Device) {
     let cache = Fp8VerifierCache::from_bytes(&cache_bytes).expect("deserialize cache");
     assert_eq!(cache.len(), 1);
     cache
-        .verify_block(&header, &public_data, &proof_data)
+        .verify_block(&header, chain, &public_data, &proof_data)
         .expect("the cached setup must verify the honest proof");
     assert!(
         Fp8VerifierCache::from_bytes(&[])
@@ -223,7 +234,7 @@ fn check_wrapped_api_roundtrip_and_tamper_rejection(device: Device) {
     );
 
     let err = Fp8VerifierCache::default()
-        .verify_block(&header, &public_data, &proof_data)
+        .verify_block(&header, chain, &public_data, &proof_data)
         .expect_err("an uncached setup must reject, not compile");
     assert!(
         err.to_string().contains("no cached fp8 verifier setup"),
@@ -237,10 +248,10 @@ fn check_wrapped_api_roundtrip_and_tamper_rejection(device: Device) {
         .expect("the prover must prove a different geometry");
     assert_eq!(prover.setups.len(), 1, "one universal setup");
     verifier
-        .verify_block(&header_k32, &public_k32, &proof_k32)
+        .verify_block(&header_k32, &plain_k32.ancestor_chain, &public_k32, &proof_k32)
         .expect("one universal setup must verify every geometry");
     cache
-        .verify_block(&header_k32, &public_k32, &proof_k32)
+        .verify_block(&header_k32, &plain_k32.ancestor_chain, &public_k32, &proof_k32)
         .expect("the cached setup must verify the second geometry");
     assert_eq!(cache.len(), 1, "no per-shape setups: the one entry serves both");
 
@@ -253,7 +264,7 @@ fn check_wrapped_api_roundtrip_and_tamper_rejection(device: Device) {
         h
     });
     let bad_public = tampered.to_bytes();
-    assert!(verifier.verify_block(&header, &bad_public, &proof_data).is_err());
+    assert!(verifier.verify_block(&header, chain, &bad_public, &proof_data).is_err());
 
     let scale_pis = table_pis_offset(&job.system, job.system.main_table_positions()[Table::Scale as usize]);
     let iq_pis = table_pis_offset(&job.system, job.system.main_table_positions()[Table::InputQuant as usize]);
@@ -288,7 +299,7 @@ fn check_wrapped_api_roundtrip_and_tamper_rejection(device: Device) {
         tampered.public_inputs[zeta_offset(&job.system) + limb] += F::ONE;
         let bytes = compact_proof_data(&job.system, &tampered).expect("compact encode");
         assert!(
-            verifier.verify_block(&header, &public_data, &bytes).is_err(),
+            verifier.verify_block(&header, chain, &public_data, &bytes).is_err(),
             "a preamble zeta shifted in limb {limb} must be rejected"
         );
     }
@@ -296,30 +307,37 @@ fn check_wrapped_api_roundtrip_and_tamper_rejection(device: Device) {
     let mut corrupt = proof_data.clone();
     let mid = COMPACT_ZETA_PREAMBLE + (proof_data.len() - COMPACT_ZETA_PREAMBLE) / 2;
     corrupt[mid] ^= 1;
-    assert!(verifier.verify_block(&header, &public_data, &corrupt).is_err());
+    assert!(verifier.verify_block(&header, chain, &public_data, &corrupt).is_err());
 
     let mut noncanonical = proof_data.clone();
     noncanonical[..8].copy_from_slice(&u64::MAX.to_le_bytes());
-    assert!(verifier.verify_block(&header, &public_data, &noncanonical).is_err());
+    assert!(verifier.verify_block(&header, chain, &public_data, &noncanonical).is_err());
 
     assert!(
         verifier
-            .verify_block(&header, &public_data, &proof_data[..COMPACT_ZETA_PREAMBLE])
+            .verify_block(&header, chain, &public_data, &proof_data[..COMPACT_ZETA_PREAMBLE])
             .is_err(),
         "a bare preamble with no proof body must be rejected"
     );
 
     let mut other_header = header;
     other_header.timestamp ^= 1;
-    assert!(verifier.verify_block(&other_header, &public_data, &proof_data).is_err());
+    assert!(
+        verifier
+            .verify_block(&other_header, chain, &public_data, &proof_data)
+            .is_err()
+    );
+
+    // σ_d is reached only through the carried intermediates.
+    assert!(verifier.verify_block(&header, &[], &public_data, &proof_data).is_err());
 
     let mut trailing = public_data.clone();
     trailing.push(0);
-    assert!(verifier.verify_block(&header, &trailing, &proof_data).is_err());
+    assert!(verifier.verify_block(&header, chain, &trailing, &proof_data).is_err());
 
     let mut trailing = proof_data.clone();
     trailing.push(0);
-    assert!(verifier.verify_block(&header, &public_data, &trailing).is_err());
+    assert!(verifier.verify_block(&header, chain, &public_data, &trailing).is_err());
 
     let mut trailing = verifier_bytes;
     trailing.push(0);

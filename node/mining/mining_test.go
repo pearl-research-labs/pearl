@@ -152,4 +152,9 @@ func TestNewBlockTemplateForkRulesActive(t *testing.T) {
 	require.Equal(t, wire.CertificateVersionV4,
 		template.Block.BlockCertificate().Version(),
 		"regtest requires V4 certificates from genesis")
+
+	// At height 1 the V4 state window holds the genesis block alone.
+	require.Len(t, template.AncestorHeaders, 1)
+	require.Equal(t, *params.GenesisHash, template.AncestorHeaders[0].BlockHash())
+	require.Equal(t, template.Block.BlockHeader().PrevBlock, template.AncestorHeaders[0].BlockHash())
 }

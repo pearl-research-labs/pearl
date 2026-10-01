@@ -1,8 +1,9 @@
 use anyhow::{Result, ensure};
 use primitive_types::U256;
+use sha2::{Digest, Sha256};
 
 use crate::api::fp8::public_params::PublicParams;
-use crate::api::primitives::{Hash256, IncompleteBlockHeader};
+use crate::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader};
 use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLocation, BlakeProgram};
 
 use pearl_blake3::blake3_digest;
@@ -112,6 +113,72 @@ impl IncompleteBlockHeader {
             "IncompleteBlockHeader round-trip mismatch: deserialized form does not re-serialize to the original bytes"
         );
         Ok(result)
+    }
+}
+
+impl BlockHeader {
+    /// [`IncompleteBlockHeader::SERIALIZED_SIZE`] + 32 (proof commitment) = 108.
+    pub const SERIALIZED_SIZE: usize = IncompleteBlockHeader::SERIALIZED_SIZE + 32;
+
+    /// The all-zero header anchoring job-independent derivations (see
+    /// [`IncompleteBlockHeader::zero`]).
+    pub(crate) fn zero() -> BlockHeader {
+        Self {
+            incomplete: IncompleteBlockHeader::zero(),
+            proof_commitment: [0; 32],
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(nbits: u32) -> BlockHeader {
+        Self {
+            incomplete: IncompleteBlockHeader::new_for_test(nbits),
+            proof_commitment: [3; 32],
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut bytes = [0u8; Self::SERIALIZED_SIZE];
+        bytes[..IncompleteBlockHeader::SERIALIZED_SIZE].copy_from_slice(&self.incomplete.to_bytes());
+        bytes[IncompleteBlockHeader::SERIALIZED_SIZE..].copy_from_slice(&self.proof_commitment);
+        bytes
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        ensure!(
+            data.len() == Self::SERIALIZED_SIZE,
+            "Expected {} bytes, got {}",
+            Self::SERIALIZED_SIZE,
+            data.len()
+        );
+        let (incomplete, proof_commitment) = data.split_at(IncompleteBlockHeader::SERIALIZED_SIZE);
+        Ok(Self {
+            incomplete: IncompleteBlockHeader::from_bytes(incomplete)?,
+            proof_commitment: proof_commitment.try_into().unwrap(),
+        })
+    }
+
+    /// Parses concatenated wire headers, the wire form of an ancestor chain.
+    pub fn chain_from_bytes(data: &[u8]) -> Result<Vec<Self>> {
+        ensure!(
+            data.len().is_multiple_of(Self::SERIALIZED_SIZE),
+            "header chain length {} is not a multiple of {}",
+            data.len(),
+            Self::SERIALIZED_SIZE
+        );
+        data.as_chunks::<{ Self::SERIALIZED_SIZE }>()
+            .0
+            .iter()
+            .map(|header| Self::from_bytes(header))
+            .collect()
+    }
+
+    /// The block hash: SHA256d of the full wire header, in the display byte order of
+    /// [`IncompleteBlockHeader::prev_block`], so a child links to it by equality.
+    pub fn block_hash(&self) -> Hash256 {
+        let mut hash: Hash256 = Sha256::digest(Sha256::digest(self.to_bytes())).into();
+        hash.reverse();
+        hash
     }
 }
 

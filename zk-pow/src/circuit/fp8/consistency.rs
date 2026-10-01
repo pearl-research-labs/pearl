@@ -52,10 +52,11 @@ use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
 use crate::api::fp8::openings::stream_words;
 use crate::api::fp8::plain_proof::{MoeWitness, PlainProofV4};
 use crate::api::fp8::prequant::BLOCK_SIZE;
+use crate::api::fp8::public_params::test_fixtures::ancestry;
 use crate::api::fp8::public_params::{CommonParams, Device, HashId, JobParams, MoeParams, OperandParams, Quant};
 use crate::api::fp8::transcript::{key_a, key_b};
 use crate::api::layout::{AxisPattern, DimType};
-use crate::api::primitives::IncompleteBlockHeader;
+use crate::api::primitives::{BlockHeader, IncompleteBlockHeader};
 #[cfg(test)]
 use crate::api::verify::verify_plain_proof;
 use crate::ffi::plain_proof::MatrixMerkleProof;
@@ -181,10 +182,15 @@ pub(crate) fn fixture_job_min_k() -> (IncompleteBlockHeader, PlainProofV4) {
     fixture_job_with(32, 1024, dims, dims)
 }
 
-/// The v4 opening keys for a fixture header: `keyA = H_"key-A"(σ̂)`,
-/// `keyB = H_"key-B"(σ_Δ)`, where the fixture's σ_Δ is σ̂ itself.
-pub(crate) fn fixture_tree_keys(header: &IncompleteBlockHeader) -> ([u8; 32], [u8; 32]) {
-    (key_a(header), key_b(header))
+/// The fixture's linked headers: every fixture proves at depth 2,
+/// `(σ̂, [σ_1], σ_d = σ_2)`, so each carries a real one-header ancestor chain.
+pub(crate) fn fixture_headers() -> (IncompleteBlockHeader, Vec<BlockHeader>, BlockHeader) {
+    ancestry(2)
+}
+
+/// The v4 opening keys for a fixture: `keyA = H_"key-A"(σ̂)`, `keyB = H_"key-B"(σ_d)`.
+pub(crate) fn fixture_tree_keys(proposed: &IncompleteBlockHeader, ancestor: &BlockHeader) -> ([u8; 32], [u8; 32]) {
+    (key_a(proposed), key_b(ancestor))
 }
 
 fn keyed_plane_proof(rows_bytes: &[Vec<u8>], row_indices: &[usize], key: [u8; 32], hash_id: HashId) -> MatrixMerkleProof {
@@ -319,8 +325,8 @@ fn fixture_job_with_planes(
     let cols_pattern = AxisPattern::new(col_dims).unwrap();
     let tile = |p: &AxisPattern| -> Vec<usize> { p.tile_offsets().iter().map(|&o| o as usize).collect() };
     let (a_rows, b_rows) = (tile(&rows_pattern), tile(&cols_pattern));
-    let header = IncompleteBlockHeader::new_for_test(0x207FFFFF);
-    let (key_a, key_b) = fixture_tree_keys(&header);
+    let (header, ancestor_chain, ancestor_header) = fixture_headers();
+    let (key_a, key_b) = fixture_tree_keys(&header, &ancestor_header);
 
     let scale_tree = |seed: usize| -> Vec<Vec<u8>> {
         (0..m)
@@ -335,8 +341,7 @@ fn fixture_job_with_planes(
     let b_hash_id = HashId::Blake3Chunk128;
     let proof = PlainProofV4 {
         job: JobParams {
-            // σ̂ and σ_Δ coincide in this fixture (the ancestor is the proposed header).
-            ancestor_header: header,
+            ancestor_header,
             common: CommonParams {
                 k: k as u32,
                 r: 32,
@@ -357,6 +362,7 @@ fn fixture_job_with_planes(
             },
             moe: None,
         },
+        ancestor_chain,
         values: crate::api::primitives::Sides {
             a: keyed_plane_proof(&a_values, &a_rows, key_a, a_hash_id),
             b: keyed_plane_proof(&b_values, &b_rows, key_b, b_hash_id),
@@ -407,8 +413,8 @@ fn fixture_job_moe_with(routing_flat: Vec<u32>) -> (IncompleteBlockHeader, Plain
     let inner_a_rows: Vec<usize> = rows_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
     let outer_rows: Vec<usize> = inner_a_rows.iter().map(|&i| routing_flat[128 + i] as usize).collect();
 
-    let header = IncompleteBlockHeader::new_for_test(0x207FFFFF);
-    let (key_a, key_b) = fixture_tree_keys(&header);
+    let (header, ancestor_chain, ancestor_header) = fixture_headers();
+    let (key_a, key_b) = fixture_tree_keys(&header, &ancestor_header);
 
     let value_tree = |rows: usize, seed: usize| -> Vec<Vec<u8>> {
         (0..rows).map(|i| (0..k).map(|j| plane_byte(seed, i, j)).collect()).collect()
@@ -453,8 +459,7 @@ fn fixture_job_moe_with(routing_flat: Vec<u32>) -> (IncompleteBlockHeader, Plain
     let hash_id = HashId::Blake3Chunk1024;
     let proof = PlainProofV4 {
         job: JobParams {
-            // σ̂ and σ_Δ coincide in this fixture (the ancestor is the proposed header).
-            ancestor_header: header,
+            ancestor_header,
             common: CommonParams {
                 k: k as u32,
                 r: 32,
@@ -479,6 +484,7 @@ fn fixture_job_moe_with(routing_flat: Vec<u32>) -> (IncompleteBlockHeader, Plain
                 hash_id_o: hash_id,
             }),
         },
+        ancestor_chain,
         values: crate::api::primitives::Sides {
             a: keyed_plane_proof(&value_tree(m, 0), &outer_rows, key_a, hash_id),
             b: keyed_plane_proof(&value_tree(n_e * e, 7), &bt_rows, key_b, hash_id),

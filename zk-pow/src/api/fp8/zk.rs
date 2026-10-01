@@ -96,7 +96,7 @@ use crate::api::fp8::public_params::{
 };
 use crate::api::fp8::utils::{MMA_GROUP_PRODUCTS, fp32_to_bf16_rne};
 use crate::api::layout::{AxisPattern, DimType, lane_assignment};
-use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
+use crate::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader, Sides};
 use crate::api::proof_utils::check_jackpot_difficulty;
 use crate::circuit::fp8::blake3_stark::columns::{
     NUM_BLAKE3_PUBLIC_INPUTS, PI_HASH_A, PI_HASH_B, PI_HASH_JACKPOT, PI_HASH_OFFSETS, PI_HASH_ROUTING, PI_JACKPOT_KEY, PI_KEY_A,
@@ -157,7 +157,7 @@ struct Fp8ProverSetup {
 impl Fp8ProverSetup {
     fn build(device: Device, timing: &mut TimingTree) -> Result<Self> {
         let params = sample_dense_statement_for_device(device)?;
-        let job = Fp8Job::derive(&params, params.ancestor_header())?;
+        let job = Fp8Job::derive(&params, &params.ancestor_header().incomplete)?;
         let preprocessed = job.system.preprocessed_data::<C>(timing);
         let circuits = Fp8WrapperCircuits::build(&job.system, &preprocessed.cap(), timing)?;
         Ok(Self {
@@ -259,29 +259,40 @@ impl Fp8Verifier {
 
     /// Verifies a published `(public_data, proof_data)` pair against the
     /// caller's expected block header: `Ok(())` accepts, `Err` rejects.
-    pub fn verify_block(&self, proposed_header: &IncompleteBlockHeader, public_data: &[u8], proof_data: &[u8]) -> Result<()> {
-        self.verify_with_nbits(proposed_header, public_data, proof_data, None)
+    /// `ancestor_chain` links the statement's `σ_d` to `proposed_header`
+    /// ([`JobParams::check_ancestry`]).
+    pub fn verify_block(
+        &self,
+        proposed_header: &IncompleteBlockHeader,
+        ancestor_chain: &[BlockHeader],
+        public_data: &[u8],
+        proof_data: &[u8],
+    ) -> Result<()> {
+        self.verify_with_nbits(proposed_header, ancestor_chain, public_data, proof_data, None)
     }
 
     /// Verifies a pool share under an explicit share target.
     pub fn verify_share(
         &self,
         proposed_header: &IncompleteBlockHeader,
+        ancestor_chain: &[BlockHeader],
         public_data: &[u8],
         proof_data: &[u8],
         share_nbits: u32,
     ) -> Result<()> {
-        self.verify_with_nbits(proposed_header, public_data, proof_data, Some(share_nbits))
+        self.verify_with_nbits(proposed_header, ancestor_chain, public_data, proof_data, Some(share_nbits))
     }
 
     fn verify_with_nbits(
         &self,
         proposed_header: &IncompleteBlockHeader,
+        ancestor_chain: &[BlockHeader],
         public_data: &[u8],
         proof_data: &[u8],
         nbits_override: Option<u32>,
     ) -> Result<()> {
         let statement = decode_statement(public_data)?;
+        statement.job().check_ancestry(proposed_header, ancestor_chain)?;
         let job = Fp8Job::derive(&statement, proposed_header)?;
         let nbits = nbits_override.unwrap_or(proposed_header.nbits);
         self.verify_derived(&job, proof_data, nbits)
@@ -319,29 +330,40 @@ impl Fp8VerifierCache {
     /// expected block header, resolving the setup by the statement's device byte
     /// from the cache alone — a missing setup rejects the proof (never compiles; see
     /// the type docs). A proof of a different shape than its statement fails closed.
-    pub fn verify_block(&self, proposed_header: &IncompleteBlockHeader, public_data: &[u8], proof_data: &[u8]) -> Result<()> {
-        self.verify_with_nbits(proposed_header, public_data, proof_data, None)
+    /// `ancestor_chain` links the statement's `σ_d` to `proposed_header`
+    /// ([`JobParams::check_ancestry`]).
+    pub fn verify_block(
+        &self,
+        proposed_header: &IncompleteBlockHeader,
+        ancestor_chain: &[BlockHeader],
+        public_data: &[u8],
+        proof_data: &[u8],
+    ) -> Result<()> {
+        self.verify_with_nbits(proposed_header, ancestor_chain, public_data, proof_data, None)
     }
 
     /// Verifies a pool share under an explicit share target.
     pub fn verify_share(
         &self,
         proposed_header: &IncompleteBlockHeader,
+        ancestor_chain: &[BlockHeader],
         public_data: &[u8],
         proof_data: &[u8],
         share_nbits: u32,
     ) -> Result<()> {
-        self.verify_with_nbits(proposed_header, public_data, proof_data, Some(share_nbits))
+        self.verify_with_nbits(proposed_header, ancestor_chain, public_data, proof_data, Some(share_nbits))
     }
 
     fn verify_with_nbits(
         &self,
         proposed_header: &IncompleteBlockHeader,
+        ancestor_chain: &[BlockHeader],
         public_data: &[u8],
         proof_data: &[u8],
         nbits_override: Option<u32>,
     ) -> Result<()> {
         let statement = decode_statement(public_data)?;
+        statement.job().check_ancestry(proposed_header, ancestor_chain)?;
         let job = Fp8Job::derive(&statement, proposed_header)?;
         let verifier = self.verifier_for_job(&job)?;
         let nbits = nbits_override.unwrap_or(proposed_header.nbits);
@@ -368,7 +390,7 @@ pub fn sample_dense_statement_for_device(device: Device) -> Result<PublicParams>
     let pattern = AxisPattern::new(&[(4, DimType::Fold), (4, DimType::Blake)])?;
     let params = PublicParams::try_new(
         JobParams {
-            ancestor_header: IncompleteBlockHeader::zero(),
+            ancestor_header: BlockHeader::zero(),
             common: CommonParams {
                 k: PublicParams::MIN_K as u32,
                 r: 32,
@@ -438,7 +460,7 @@ pub struct Fp8Job {
     /// verified against: everything downstream (expected public inputs,
     /// statement digests, the native epilogue) reads from this pair.
     params: PublicParams,
-    /// `σ̂`: the caller's expected block header (`params.ancestor_header()` is `σ_Δ`).
+    /// `σ̂`: the caller's expected block header (`params.ancestor_header()` is `σ_d`).
     proposed_header: IncompleteBlockHeader,
     pub system: Fp8System<F, D>,
 }
@@ -550,7 +572,7 @@ impl Fp8Job {
         self.params.key_a(&self.proposed_header)
     }
 
-    /// `KEY_B` (`H_"key-B"(σ_Δ)`): the B-side plane's tree key.
+    /// `KEY_B` (`H_"key-B"(σ_d)`): the B-side plane's tree key.
     fn key_b(&self) -> Hash256 {
         self.params.key_b()
     }
@@ -849,7 +871,7 @@ mod tests {
     #[test]
     fn published_statement_rejects_an_unknown_device_byte() {
         let mut bytes = sample_dense_statement().unwrap().to_bytes();
-        const DEVICE_OFFSET: usize = IncompleteBlockHeader::SERIALIZED_SIZE + 4 + 4 + 2 + 1;
+        const DEVICE_OFFSET: usize = BlockHeader::SERIALIZED_SIZE + 4 + 4 + 2 + 1;
         bytes[DEVICE_OFFSET] = 2;
         let error = decode_statement(&bytes).expect_err("unknown device byte must reject");
         assert!(error.to_string().contains("Device discriminant"), "{error}");
@@ -926,10 +948,23 @@ mod tests {
     #[test]
     fn missing_verifier_cache_rejects_before_proof_decoding() {
         let statement = sample_dense_statement().unwrap();
+        let proposed = IncompleteBlockHeader {
+            prev_block: statement.ancestor_header().block_hash(),
+            ..IncompleteBlockHeader::zero()
+        };
         let error = Fp8VerifierCache::default()
-            .verify_block(&IncompleteBlockHeader::zero(), &statement.to_bytes(), &[])
+            .verify_block(&proposed, &[], &statement.to_bytes(), &[])
             .unwrap_err();
         assert!(error.to_string().contains("no cached fp8 verifier setup"), "{error:#}");
+    }
+
+    #[test]
+    fn verifier_cache_authenticates_the_ancestor_before_the_setup_lookup() {
+        let statement = sample_dense_statement().unwrap();
+        let error = Fp8VerifierCache::default()
+            .verify_block(&IncompleteBlockHeader::zero(), &[], &statement.to_bytes(), &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("depth 1 does not connect"), "{error:#}");
     }
 
     #[test]

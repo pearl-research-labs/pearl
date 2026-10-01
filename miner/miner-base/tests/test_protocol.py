@@ -134,11 +134,20 @@ def test_planar_commitment_combines_the_plane_digests():
     assert planar.digest == operand_digest([part.digest for part in planar.parts], key)
 
 
+def test_key_b_hashes_the_complete_ancestor_header():
+    """``keyB`` covers the ancestor's proof commitment, so a 76-byte header is refused."""
+    sigma_hat = b"\x11" * 76
+    with pytest.raises(ValueError, match="108-byte"):
+        commitment_keys(sigma_hat, sigma_hat)
+    _, key_b = commitment_keys(sigma_hat, b"\x22" * 108)
+    assert commitment_keys(sigma_hat, b"\x22" * 76 + b"\x33" * 32)[1] != key_b
+
+
 def test_gpu_side_digest_combine_matches_the_cpu_tree():
     """The GPU B path derives ``HB`` (and ``seedB``) from the device plane roots
     alone; that combine must equal the CPU ``commit_planes`` digest."""
     config = _config(1024)
-    key_a, key_b = commitment_keys(b"\x11" * 76)
+    key_a, key_b = commitment_keys(b"\x11" * 76, b"\x22" * 108)
     operand = PrequantMatrix.encode(torch.arange(64 * 1024, dtype=torch.bfloat16).reshape(64, 1024))
     planar_b = commit_planes(operand.planes(), key_b, config.b_hash_id)
     planar_a = commit_planes(operand.planes(), key_a, config.a_hash_id)

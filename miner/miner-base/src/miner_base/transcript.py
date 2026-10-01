@@ -6,7 +6,7 @@ Twin of ``zk-pow/src/api/fp8/transcript.rs``
     H_l(x; q)     = BLAKE3(x; key=Subkey(q, l))
 
     keyA          = H_"key-A"(sigma_hat)      # A-side tree key (and routing/offset keys)
-    keyB          = H_"key-B"(sigma_d)        # B-side tree key
+    keyB          = H_"key-B"(sigma_d)        # B-side tree key; sigma_d is a full 108-byte header
     noise seedB   = H_"seed-B"(HB || keyB || pB)
     noise seedA   = H_"seed-A"(HA || noise seedB || keyA || pA)
 
@@ -76,16 +76,17 @@ def hash_labelled(message: bytes, label: bytes, key: bytes | None = None) -> byt
     return blake3(message, key=subkey(label, key)).digest()
 
 
-def commitment_keys(sigma_hat: bytes, sigma_d: bytes | None = None) -> tuple[bytes, bytes]:
+def commitment_keys(sigma_hat: bytes, sigma_d: bytes) -> tuple[bytes, bytes]:
     """``(keyA, keyB)`` -- the per-side opening keys from the header window.
 
     ``keyA = H_"key-A"(sigma_hat)`` keys A's trees (and, in MoE, the routing and
     offset hashes); ``keyB = H_"key-B"(sigma_d)`` keys B's trees, where
-    ``sigma_d`` is the depth-``d`` ancestor header. The miner proposes at depth
-    0, where ``sigma_d == sigma_hat`` (the default here).
+    ``sigma_d`` is the complete 108-byte header of the depth-``d`` ancestor,
+    ``1 <= d <= 4``. ``sigma_hat`` is the 76-byte proposed header, which has no
+    proof commitment yet.
     """
-    if sigma_d is None:
-        sigma_d = sigma_hat
+    if len(sigma_d) != 108:
+        raise ValueError(f"sigma_d must be a complete 108-byte header, got {len(sigma_d)} bytes")
     return (
         hash_labelled(sigma_hat, LABEL_KEY_A),
         hash_labelled(sigma_d, LABEL_KEY_B),

@@ -92,7 +92,7 @@ fn build_fp8_cache() -> Result<Vec<u8>> {
     for device in [Device::H100, Device::B200] {
         let params = sample_dense_statement_for_device(device)?;
         let mut timing = plonky2::util::timing::TimingTree::default();
-        let verifier = Fp8Verifier::generate(&params, params.ancestor_header(), &mut timing)?;
+        let verifier = Fp8Verifier::generate(&params, &params.ancestor_header().incomplete, &mut timing)?;
         cache.insert(device, verifier);
         println!("compiled the {device:?} fp8 verifier setup");
     }

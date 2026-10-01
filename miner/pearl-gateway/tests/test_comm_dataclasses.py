@@ -21,7 +21,7 @@ class TestMiningJob:
         result = job.to_dict()
         expected_header_bytes = sample_block_template.header.serialize_without_proof_commitment()
 
-        expected_keys = {"incomplete_header_bytes", "target", "cert_version"}
+        expected_keys = {"incomplete_header_bytes", "target", "cert_version", "ancestor_headers"}
         assert set(result.keys()) == expected_keys
 
         assert b64_decode(result["incomplete_header_bytes"]) == expected_header_bytes
@@ -71,6 +71,33 @@ class TestMiningJob:
         )
         assert job.target == sample_block_template.target
         assert job.cert_version == sample_block_template.required_cert_version
+
+    def test_mining_job_carries_the_template_ancestors(
+        self, sample_block_template_data, mining_address
+    ):
+        """The node's state-window headers reach the miner unchanged, parent first."""
+        from pearl_gateway.rpc_types import GetBlockTemplateResponse
+
+        ancestors = [bytes([i]) * 108 for i in range(1, 5)]
+        data = {
+            **sample_block_template_data,
+            "requiredcertversion": int(CertificateVersion.PLAIN_FP8),
+            "ancestorheaders": [header.hex() for header in ancestors],
+        }
+        template = BlockTemplate.from_get_block_template(
+            GetBlockTemplateResponse.model_validate(data), mining_address=mining_address
+        )
+        assert template.ancestor_headers == ancestors
+
+        job = MiningJob.from_dict(MiningJob.from_template(template).to_dict())
+        assert job.ancestor_headers == ancestors
+        assert job.parent_header == ancestors[0]
+
+        data["ancestorheaders"] = [bytes(76).hex()]
+        with pytest.raises(ValueError, match="108-byte"):
+            BlockTemplate.from_get_block_template(
+                GetBlockTemplateResponse.model_validate(data), mining_address=mining_address
+            )
 
 
 class TestAdjustTarget:

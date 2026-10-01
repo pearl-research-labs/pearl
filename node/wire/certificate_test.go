@@ -225,6 +225,12 @@ func TestCertificateV4Wire(t *testing.T) {
 			ProofData:       []byte{0xaa, 0xbb, 0xcc},
 			AncestorHeaders: []wire.BlockHeader{testBlockHeader()},
 		},
+		"max ancestors": {
+			Hash:            chainhash.Hash{0x02},
+			PublicData:      []byte{0x01},
+			ProofData:       []byte{0xaa},
+			AncestorHeaders: []wire.BlockHeader{testBlockHeader(), testBlockHeader(), testBlockHeader()},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var buf bytes.Buffer
@@ -293,7 +299,7 @@ func TestCertificateV4AncestorCount(t *testing.T) {
 		count []byte
 		err   string
 	}{
-		{"oversized", []byte{3}, "too many v4 ancestor headers"},
+		{"oversized", []byte{4}, "too many v4 ancestor headers"},
 		{"noncanonical", []byte{0xfd, 0x02, 0x00}, "non-canonical"},
 		{"truncated", []byte{0xfd, 0x02}, "unexpected EOF"},
 	} {

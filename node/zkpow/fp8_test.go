@@ -20,10 +20,10 @@ import (
 // loadFP8Fixture loads the FP8 proof fixture generated from Rust's canonical
 // deterministic job and returns the block header it binds together with
 // its V4 certificate. Format: header(76) | u32le public_data_len | public_data
-// | proof_data. The fixture header uses canonical wire bytes with the proof
-// commitment omitted. Its symmetric hashes cannot establish byte order; the
-// Rust ancestry tests cover full headers with asymmetric bytes. Regenerate on
-// a machine with enough memory for the wrapped proof:
+// | u8 chain_len | chain(108 each) | proof_data. The fixture header uses
+// canonical wire bytes with the proof commitment omitted. The proof's ancestor
+// header (inside public_data) is the grandparent, so the chain carries the
+// parent. Regenerate on a machine with enough memory for the wrapped proof:
 //
 //	task generate:fp8-fixture
 //
@@ -48,9 +48,18 @@ func loadFP8FixtureForDevice(t *testing.T, device string) (*wire.BlockHeader, *w
 	require.LessOrEqual(t, int(publicLen), wire.MaxZKProofSize, "fixture public data too large")
 	require.Greater(t, len(raw)-80, int(publicLen), "fixture missing proof data")
 
+	rest := bytes.NewReader(raw[80+publicLen:])
+	chainLen, err := rest.ReadByte()
+	require.NoError(t, err)
+	ancestors := make([]wire.BlockHeader, chainLen)
+	for i := range ancestors {
+		require.NoError(t, ancestors[i].Deserialize(rest), "fixture ancestor %d", i)
+	}
+
 	cert := &wire.CertificateV4{
-		PublicData: raw[80 : 80+publicLen],
-		ProofData:  raw[80+publicLen:],
+		PublicData:      raw[80 : 80+publicLen],
+		ProofData:       raw[len(raw)-rest.Len():],
+		AncestorHeaders: ancestors,
 	}
 
 	commitment := cert.ProofCommitment()
@@ -65,6 +74,7 @@ func TestVerifyCertificateV4(t *testing.T) {
 	for _, device := range []string{"h100", "b200"} {
 		t.Run(device, func(t *testing.T) {
 			header, cert := loadFP8FixtureForDevice(t, device)
+			require.Len(t, cert.AncestorHeaders, 1, "the fixture proves at depth 2")
 
 			require.NoError(t, VerifyCertificate(header, cert), "the mined fp8 certificate should verify")
 		})
@@ -76,6 +86,14 @@ func TestVerifyCertificateV4DisconnectedAncestor(t *testing.T) {
 	cert.AncestorHeaders = []wire.BlockHeader{{}}
 	require.ErrorContains(t, VerifyCertificate(header, cert),
 		"v4 ancestor header at depth 1 does not connect")
+}
+
+// TestVerifyCertificateV4TooManyAncestors relies on the Rust verifier's state
+// window bound, shared by every verification entry point.
+func TestVerifyCertificateV4TooManyAncestors(t *testing.T) {
+	header, cert := loadFP8Fixture(t)
+	cert.AncestorHeaders = make([]wire.BlockHeader, wire.MaxCertificateV4AncestorHeaders+1)
+	require.ErrorContains(t, VerifyCertificate(header, cert), "at most 3 fit the state window")
 }
 
 // TestVerifyCertificateV4WireRoundTrip verifies the certificate after a
@@ -112,12 +130,14 @@ func TestVerifyCertificateV4TamperedPublicData(t *testing.T) {
 	require.ErrorContains(t, VerifyCertificate(header, cert), "v4 proof rejected")
 }
 
-func TestVerifyCertificateV4AncestorMismatch(t *testing.T) {
+// TestVerifyCertificateV4ProposedHeaderMismatch changes a proposed-header field
+// that leaves the ancestor chain intact: the statement no longer binds the header.
+func TestVerifyCertificateV4ProposedHeaderMismatch(t *testing.T) {
 	header, cert := loadFP8Fixture(t)
 
 	header.Timestamp = header.Timestamp.Add(time.Second)
 	cert.Hash = header.BlockHash()
-	require.ErrorContains(t, VerifyCertificate(header, cert), "ancestor header is not")
+	require.ErrorContains(t, VerifyCertificate(header, cert), "v4 proof rejected")
 }
 
 func TestVerifyCertificateV4CommitmentMismatch(t *testing.T) {

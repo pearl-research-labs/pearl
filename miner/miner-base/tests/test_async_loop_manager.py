@@ -38,6 +38,7 @@ def mock_mining_job():
     mock_job.incomplete_header_bytes = b"test_bytes"
     mock_job.target = "test_target"
     mock_job.cert_version = CertificateVersion.PLAIN_FP8
+    mock_job.ancestor_headers = [b"parent_header"]
     return mock_job
 
 
@@ -633,9 +634,11 @@ class TestAsyncLoopManagerStartStop:
         first_entered = threading.Event()
         release_first = threading.Event()
         submitted: list[object] = []
+        submitted_jobs: list[MiningJob] = []
 
-        def submit(opening, _job) -> bool:
+        def submit(opening, job) -> bool:
             submitted.append(opening)
+            submitted_jobs.append(job)
             if len(submitted) == 1:
                 first_entered.set()
                 assert release_first.wait(timeout=5)
@@ -671,6 +674,10 @@ class TestAsyncLoopManagerStartStop:
             assert not flush.is_alive()
             assert result == [True]
             assert len(submitted) == 2
+            # The owned job snapshot keeps the headers the proof keys B by.
+            assert all(
+                job.ancestor_headers == mock_mining_job.ancestor_headers for job in submitted_jobs
+            )
             assert manager._pending_submission_count() == 0
         finally:
             release_first.set()

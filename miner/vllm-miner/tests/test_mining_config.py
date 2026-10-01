@@ -58,6 +58,7 @@ def _job(target: int = 1 << 200) -> MiningJob:
         incomplete_header_bytes=bytes(header.to_bytes()),
         target=target,
         cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[b"\x33" * 108],
     )
 
 
@@ -99,11 +100,12 @@ def test_scale_block_matches_reference_and_kernels():
 
 
 def test_commitment_keys_match_reference_derivation():
-    """v4 keys both Merkle trees by the header alone; the layer shape and tile
-    enter later through ``pA``/``pB`` (see ``test_commitment_binds_n_and_k``)."""
+    """v4 keys A by the header and B by its parent's complete header; the layer
+    shape and tile enter later through ``pA``/``pB`` (see
+    ``test_commitment_binds_n_and_k``)."""
     job = _job()
     key_a, key_b = commitment_keys_for(job)
-    assert (key_a, key_b) == commitment_keys(bytes(job.incomplete_header_bytes))
+    assert (key_a, key_b) == commitment_keys(bytes(job.incomplete_header_bytes), b"\x33" * 108)
     assert key_a != key_b
     assert commitment_keys_for(_job(target=5)) == (key_a, key_b)  # target is not in the header
 
