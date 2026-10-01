@@ -141,7 +141,7 @@ func securityScreen(c *client) error {
 }
 
 func changePassphraseFlow(c *client) error {
-	var oldPass, newPass, confirm string
+	var oldPass, newPass, repeated string
 	ok, err := runForm(newForm(huh.NewGroup(
 		huh.NewInput().
 			Title("Current passphrase").
@@ -162,7 +162,7 @@ func changePassphraseFlow(c *client) error {
 				}
 				return nil
 			}).
-			Value(&confirm),
+			Value(&repeated),
 	)))
 	if err != nil || !ok {
 		return err

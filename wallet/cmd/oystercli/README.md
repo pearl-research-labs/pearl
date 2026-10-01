@@ -33,8 +33,9 @@ for its exact location — point them at the built `oyster`, or pass
 - **Transactions** — paged history browser, newest first, with page filtering
   and a full detail view. Pages are sized to the terminal, so the **Older** and
   **Newer** rows always sit right under the list; `/` filters the current page.
-  A pending send's detail view offers **Rebroadcast** and **Remove** (see
-  below).
+  A transaction with more entries than a page has rows lists what fits and ends
+  with a row that opens its detail view. A pending send's detail view offers
+  **Rebroadcast** and **Remove** (see below).
 - **Accounts** — list, create, rename, and inspect addresses.
 - **Coins** — UTXO listing plus lock/unlock coin control. A wallet with more
   than 500 outputs is searched first (address, txid, amount, or `locked`) and

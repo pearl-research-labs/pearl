@@ -57,15 +57,27 @@ var th = ui{
 // background) whose option foreground is near-white — invisible on light
 // terminals. Both defects are fixed upstream in charmbracelet/huh#776;
 // once released, this collapses to a plain ThemeCharm.
+//
+// huh asks for the styles once per option on every render, so both palettes
+// are built up front and shared. That relies on huh never writing to the
+// styles it is given, which holds for v2.0.3.
 func oysterTheme() huh.Theme {
+	dark, light := oysterStyles(true), oysterStyles(false)
 	return huh.ThemeFunc(func(isDark bool) *huh.Styles {
-		t := huh.ThemeCharm(isDark)
-		t.Focused.Option = t.Focused.Option.UnsetForeground()
-		t.Focused.UnselectedOption = t.Focused.UnselectedOption.UnsetForeground()
-		t.Blurred.Option = t.Blurred.Option.UnsetForeground()
-		t.Blurred.UnselectedOption = t.Blurred.UnselectedOption.UnsetForeground()
-		return t
+		if isDark {
+			return dark
+		}
+		return light
 	})
+}
+
+func oysterStyles(isDark bool) *huh.Styles {
+	t := huh.ThemeCharm(isDark)
+	t.Focused.Option = t.Focused.Option.UnsetForeground()
+	t.Focused.UnselectedOption = t.Focused.UnselectedOption.UnsetForeground()
+	t.Blurred.Option = t.Blurred.Option.UnsetForeground()
+	t.Blurred.UnselectedOption = t.Blurred.UnselectedOption.UnsetForeground()
+	return t
 }
 
 // oysterKeyMap extends huh's defaults so Esc aborts any form (the default

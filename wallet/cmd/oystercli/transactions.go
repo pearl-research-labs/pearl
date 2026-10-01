@@ -13,7 +13,6 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 )
 
-// txPageSize is the most transactions one page lists.
 const txPageSize = 15
 
 // Sentinel values for the non-transaction rows of the browser.
@@ -21,13 +20,14 @@ const (
 	txNavBack = "__back"
 	txNavNext = "__next"
 	txNavPrev = "__prev"
+	txNavMore = "__more"
 )
 
 // txNavRows is how many navigation rows (Older, Newer, Back) can follow the list.
 const txNavRows = 3
 
 // txChrome is how many terminal lines the browser needs besides list rows: the field's title and description, the
-// blank line and help footer huh adds below it, and a spare line, since a frame as tall as the window scrolls it.
+// blank line and help footer huh adds below it, and two spare lines, since a frame as tall as the window scrolls it.
 const txChrome = 6
 
 // txListGutter is the columns a list row loses to huh's border and cursor.
@@ -66,7 +66,11 @@ func transactionsScreen(c *client) error {
 		for _, entry := range view.entries {
 			opts = append(opts, huh.NewOption(txRow(entry, layout), entry.TxID))
 		}
-		if view.older {
+		if view.hiddenEntries > 0 {
+			more := fmt.Sprintf("… %d more in this transaction", view.hiddenEntries)
+			opts = append(opts, huh.NewOption(th.subtle.Render(more), txNavMore))
+		}
+		if view.hasOlder {
 			opts = append(opts, huh.NewOption(th.subtle.Render("→ Older transactions"), txNavNext))
 		}
 		if pager.offset > 0 {
@@ -84,7 +88,7 @@ func transactionsScreen(c *client) error {
 				Title(txTitle(pager.offset, view.shown)).
 				Description("Enter: details · /: filter this page · Older/Newer: change page").
 				Options(opts...).
-				Height(min(len(opts), viewportRows) + 2).
+				Height(min(len(opts), viewportRows) + fieldHeaderRows).
 				Value(&selected),
 		))
 		submitted, err := runForm(form)
@@ -103,7 +107,11 @@ func transactionsScreen(c *client) error {
 			pager.newer()
 			selected = ""
 		default:
-			if err := showTransactionDetail(c, selected); err != nil {
+			txid := selected
+			if selected == txNavMore {
+				txid = view.entries[0].TxID
+			}
+			if err := showTransactionDetail(c, txid); err != nil {
 				printError(err)
 			}
 		}
@@ -124,7 +132,6 @@ type txPager struct {
 	prev   []int
 }
 
-// older moves past a page of shown transactions.
 func (p *txPager) older(shown int) {
 	p.prev = append(p.prev, p.offset)
 	p.offset += shown
@@ -139,11 +146,10 @@ func (p *txPager) newer() {
 	p.prev = p.prev[:last]
 }
 
-// txGroup is the entries one transaction lists.
 type txGroup []btcjson.ListTransactionsResult
 
-// groupTransactions splits a listtransactions reply into transactions. All entries of one transaction arrive together,
-// so a change of txid starts a new one.
+// groupTransactions relies on all entries of one transaction arriving together, so a change of txid starts a new
+// group.
 func groupTransactions(entries []btcjson.ListTransactionsResult) []txGroup {
 	var groups []txGroup
 	for i, entry := range entries {
@@ -156,9 +162,9 @@ func groupTransactions(entries []btcjson.ListTransactionsResult) []txGroup {
 	return groups
 }
 
-// newestFirst orders one page as the Desktop Wallet does. The daemon lists unmined transactions in txid order, so they
-// are put newest first; mined ones already arrive newest first. Only a whole page may be reordered: the daemon's order
-// fixes which transactions a page holds, and sorting across pages would repeat some and skip others.
+// newestFirst puts a page's unmined transactions newest first, as the Desktop Wallet lists them. The daemon returns
+// them in txid order and mined ones already newest first. Only a whole page may be reordered: the daemon's order fixes
+// which transactions a page holds, and sorting across pages would repeat some and skip others.
 func newestFirst(groups []txGroup) []txGroup {
 	unmined := 0
 	for unmined < len(groups) && groups[unmined][0].Confirmations <= 0 {
@@ -170,16 +176,15 @@ func newestFirst(groups []txGroup) []txGroup {
 	return groups
 }
 
-// txPageView is one screen of the history.
 type txPageView struct {
-	entries []btcjson.ListTransactionsResult
-	shown   int  // transactions in entries
-	older   bool // history continues past this page
+	entries       []btcjson.ListTransactionsResult
+	shown         int  // transactions in entries
+	hasOlder      bool // history continues past this page
+	hiddenEntries int  // entries of a lone oversized transaction left to its detail view
 }
 
-// loadTxPage reads the page at offset. listtransactions counts and pages in transactions but answers in entries (a
-// payment to several addresses lists one send for each), so it asks for one transaction past the page to learn whether
-// older history exists.
+// listtransactions counts and pages in transactions but answers in entries (a payment to several addresses lists one
+// send for each), so loadTxPage asks for one transaction past the page to learn whether older history exists.
 func loadTxPage(c *client, offset, maxTxs, maxRows int) (txPageView, error) {
 	entries, err := c.listTransactions(maxTxs+1, offset)
 	if err != nil {
@@ -189,8 +194,8 @@ func loadTxPage(c *client, offset, maxTxs, maxRows int) (txPageView, error) {
 }
 
 // planTxPage picks what one screen shows from a reply that may hold a transaction more than maxTxs: whole transactions
-// only, and no more rows than maxRows, so the navigation rows that follow stay on screen. The first transaction is
-// always kept, even when its own entries exceed maxRows.
+// only, and no more rows than maxRows, so the navigation rows that follow stay on screen. A first transaction taller
+// than maxRows is cut to leave a row that opens its detail view, since listed whole it would push those rows off.
 func planTxPage(entries []btcjson.ListTransactionsResult, maxTxs, maxRows int) txPageView {
 	groups := groupTransactions(entries)
 
@@ -205,10 +210,13 @@ func planTxPage(entries []btcjson.ListTransactionsResult, maxTxs, maxRows int) t
 		rows += len(group)
 		view.shown++
 	}
-	view.older = view.shown < len(groups)
+	view.hasOlder = view.shown < len(groups)
 
-	for _, group := range newestFirst(groups[:view.shown]) {
-		view.entries = append(view.entries, group...)
+	view.entries = slices.Concat(newestFirst(groups[:view.shown])...)
+	if len(view.entries) > maxRows {
+		listed := max(maxRows-1, 1)
+		view.hiddenEntries = len(view.entries) - listed
+		view.entries = view.entries[:listed]
 	}
 	return view
 }
@@ -329,21 +337,15 @@ func rebroadcastPendingTx(c *client, txid string) error {
 }
 
 func removePendingTx(c *client, txid string) error {
-	confirmed := false
-	ok, err := runForm(newForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Remove this pending transaction from the wallet?").
-			Description("Its inputs become spendable again, and any pending transaction spending from it is\n" +
-				"removed too. The network is not consulted: if a peer already holds this transaction\n" +
-				"it may still confirm, and spending the freed inputs again is a double-spend attempt.").
-			Affirmative("Remove it").
-			Negative("Cancel").
-			Value(&confirmed),
-	)))
+	confirmed, err := confirm("Remove this pending transaction from the wallet?",
+		"Its inputs become spendable again, and any pending transaction spending from it is\n"+
+			"removed too. The network is not consulted: if a peer already holds this transaction\n"+
+			"it may still confirm, and spending the freed inputs again is a double-spend attempt.",
+		"Remove it", "Cancel", false)
 	if err != nil {
 		return err
 	}
-	if !ok || !confirmed {
+	if !confirmed {
 		printWarn("Kept the transaction.")
 		return nil
 	}

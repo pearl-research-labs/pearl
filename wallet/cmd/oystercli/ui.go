@@ -49,6 +49,25 @@ func runForm(f *huh.Form) (bool, error) {
 	return false, err
 }
 
+// confirm asks a yes/no question with the answer preselected, so Enter picks it.
+// It reports false when the user declines or backs out with Esc.
+func confirm(title, description, yes, no string, preselected bool) (bool, error) {
+	answer := preselected
+	ok, err := runForm(confirmForm(&answer, title, description, yes, no))
+	return ok && answer, err
+}
+
+func confirmForm(answer *bool, title, description, yes, no string) *huh.Form {
+	return newForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title(title).
+			Description(description).
+			Affirmative(yes).
+			Negative(no).
+			Value(answer),
+	))
+}
+
 // Row bounds for list screens. huh renders inline rather than in an alternate
 // screen, so a field taller than the window cannot be drawn at all: the
 // terminal scrolls and the cursor ends up out of view. Every list screen must
@@ -59,9 +78,9 @@ const (
 	maxPageRows      = 40
 )
 
-// fallbackWidth is assumed when the terminal width cannot be read; wide enough
-// that rows keep every column.
-const fallbackWidth = 100
+// fieldHeaderRows is the title and description lines that a huh list field's
+// Height counts besides its options.
+const fieldHeaderRows = 2
 
 // listPageSize returns how many list rows fit the terminal, reserving chrome
 // lines for the surrounding title, description, help line, and any sibling
@@ -74,24 +93,28 @@ func listPageSize(chrome int) int {
 	return min(max(height-chrome, minPageRows), maxPageRows)
 }
 
-// terminalWidth returns the terminal's column count. A list row longer than
-// this wraps, so every list row must be sized against it.
-func terminalWidth() int {
-	width, _, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || width <= 0 {
-		return fallbackWidth
-	}
-	return width
-}
+// fallbackWidth is assumed when the terminal width cannot be read; wide enough
+// that rows keep every column.
+const fallbackWidth = 100
 
 // rowMargin is left empty at the end of every list row: some terminals wrap a
 // row that writes the last column.
 const rowMargin = 1
 
-// availableRowWidth returns the columns a row may use after gutter columns of
-// surrounding chrome.
+// rowWidth returns the columns a row may use on a terminal columns wide, after
+// gutter columns of surrounding chrome. A longer row wraps, so every list row
+// must be sized against it.
+func rowWidth(columns, gutter int) int {
+	return columns - gutter - rowMargin
+}
+
+// availableRowWidth is rowWidth for the current terminal.
 func availableRowWidth(gutter int) int {
-	return terminalWidth() - gutter - rowMargin
+	columns, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || columns <= 0 {
+		columns = fallbackWidth
+	}
+	return rowWidth(columns, gutter)
 }
 
 // spinnerDelay is how long an operation may run before a spinner appears.

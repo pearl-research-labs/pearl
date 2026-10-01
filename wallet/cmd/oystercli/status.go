@@ -111,20 +111,17 @@ func nodeActions(c *client) error {
 		return err
 	}
 
-	confirmed := false
-	ok, err := runForm(newForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Stop the oyster daemon?").
-			Description("It goes offline for every client (prlctl, the desktop wallet, this CLI),\nkeys are unloaded from memory, and oystercli will exit. Restart later by\nrunning oystercli again and choosing \"Start oyster now\".").
-			Affirmative("Stop it").
-			Negative("Cancel").
-			Value(&confirmed),
-	)))
-	if err != nil || !ok || !confirmed {
-		if err == nil {
-			printWarn("Left the daemon running.")
-		}
+	confirmed, err := confirm("Stop the oyster daemon?",
+		"It goes offline for every client (prlctl, the desktop wallet, this CLI),\n"+
+			"keys are unloaded from memory, and oystercli will exit. Restart later by\n"+
+			"running oystercli again and choosing \"Start oyster now\".",
+		"Stop it", "Cancel", false)
+	if err != nil {
 		return err
+	}
+	if !confirmed {
+		printWarn("Left the daemon running.")
+		return nil
 	}
 
 	if err := c.stopDaemon(); err != nil {
