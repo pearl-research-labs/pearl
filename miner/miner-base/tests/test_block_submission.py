@@ -187,8 +187,9 @@ def _historical_plain_proof(depth: int):
         )
     parent = lineage[-1]
     header = make_plain_peel_header(ALWAYS_WIN_NBITS, parent.incomplete.timestamp + 1, parent)
-    proof = create_proof(_opening(), header, PARENT_BYTES)
-    return header, _with_ancestry(proof, PARENT, list(reversed(lineage[1:])))
+    return header, create_proof(
+        _opening(), header, PARENT_BYTES, [bytes(h.to_bytes()) for h in reversed(lineage[1:])]
+    )
 
 
 def _with_ancestry(proof, ancestor, chain):
@@ -544,9 +545,12 @@ def test_opening_validation_rejects_non_integer_indices():
 
 
 def test_owned_copy_detaches_mutable_plane_storage():
-    opening = _opening()
+    ancestor = bytearray(PARENT_BYTES)
+    opening = replace(_opening(), b_ancestor_header=ancestor)
     owned = opening.owned_copy()
 
+    ancestor[0] ^= 1
+    assert owned.b_ancestor_header == PARENT_BYTES
     opening.a_codes.fill_(7)
     opening.a_scales.fill_(3)
     opening.b_codes.fill_(5)
@@ -656,6 +660,28 @@ def test_submission_requires_the_parent_header():
 
     with pytest.raises(ValueError, match="no ancestor headers"):
         submit_opened_block(_opening(), replace(_plain_job(), ancestor_headers=[]), client)
+    client.submit_plain_proof.assert_not_called()
+
+
+@pytest.mark.parametrize("depth", range(1, 5))
+def test_submission_resolves_the_selected_b_ancestor(depth):
+    header, expected = _historical_plain_proof(depth)
+    job = MiningJob(
+        bytes(header.to_bytes()),
+        (1 << 256) - 1,
+        CertificateVersion.PLAIN_FP8,
+        [bytes(h.to_bytes()) for h in expected.ancestor_chain] + [PARENT_BYTES],
+    )
+    opening = replace(_opening(), b_ancestor_header=PARENT_BYTES)
+    client = Mock()
+    proof = submit_opened_block(opening, job, client)
+    assert bytes(proof.to_bytes()) == bytes(expected.to_bytes())
+    client.submit_plain_proof.assert_called_once_with(proof, job)
+    client.reset_mock()
+    with pytest.raises(ValueError, match="outside.*state window"):
+        submit_opened_block(
+            opening, replace(job, ancestor_headers=job.ancestor_headers[:-1]), client
+        )
     client.submit_plain_proof.assert_not_called()
 
 

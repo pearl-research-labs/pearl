@@ -1,9 +1,7 @@
 import struct
 from dataclasses import replace
 from hashlib import sha256
-from unittest.mock import Mock
 
-import pearl_mining
 import pytest
 from pearl_gateway.blockchain_utils.pearl_block import PearlBlock
 from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
@@ -191,13 +189,13 @@ def test_v4_block_framing(count):
     assert block.serialize() == expected_certificate + expected_header + b"\x02coinbasetransaction"
 
 
-def test_build_block_certifies_the_proof_ancestor_chain(sample_block_template):
-    chain = [pearl_mining.BlockHeader.from_bytes(raw) for raw in ANCESTOR_BYTES[1:]]
-    plain_proof = Mock(spec=pearl_mining.PlainProofV4, ancestor_chain=chain)
+def test_build_block_certifies_the_supplied_ancestor_chain(sample_block_template):
     template = replace(sample_block_template, required_cert_version=CertificateVersion.PLAIN_FP8)
-    block = ProofGenerator.build_block(b"public", PROOF_DATA, template, plain_proof)
+    block = ProofGenerator.build_block(b"public", PROOF_DATA, template, ANCESTOR_BYTES[1:])
     restored = ZKCertificate.deserialize(block.zk_certificate.serialize())
     assert [header.serialize() for header in restored.ancestor_headers] == list(ANCESTOR_BYTES[1:])
+    block = ProofGenerator.build_block(b"public", PROOF_DATA, template)
+    assert block.zk_certificate.ancestor_headers == []
 
 
 @pytest.mark.parametrize("cert_version", list(CertificateVersion))

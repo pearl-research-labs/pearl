@@ -21,6 +21,9 @@ from pearl_gateway.rpc_types import (
 )
 from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
 
+# Matches zk-pow's STATE_WINDOW_DEPTH: the proposed header is excluded.
+STATE_WINDOW_DEPTH = 4
+
 
 def get_bytes(data: str | bytes) -> bytes:
     if isinstance(data, str):
@@ -225,10 +228,21 @@ class MiningJob:
 
     @property
     def parent_header(self) -> bytes:
-        """The parent's full 108-byte header: the ancestor miners key B by."""
+        """The parent's full 108-byte header, used to prepare a fresh B side."""
         if not self.ancestor_headers:
             raise ValueError("mining job carries no ancestor headers to key B by")
         return self.ancestor_headers[0]
+
+    def keeps_ancestor(self, ancestor: bytes) -> bool:
+        """Whether B's complete ancestor header remains in this job's state window."""
+        return ancestor in self.ancestor_headers[:STATE_WINDOW_DEPTH]
+
+    def ancestor_chain_to(self, ancestor: bytes) -> list[bytes]:
+        """Intermediate full headers, parent first, excluding the selected ancestor."""
+        window = self.ancestor_headers[:STATE_WINDOW_DEPTH]
+        if ancestor not in window:
+            raise ValueError("ancestor header is outside this job's state window")
+        return window[: window.index(ancestor)]
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:
         """Calculate the rank-penalized PoW target for the mining job."""

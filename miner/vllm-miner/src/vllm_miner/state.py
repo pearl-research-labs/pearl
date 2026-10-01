@@ -76,7 +76,7 @@ class LayerBuffers:
 
 @dataclass
 class BProofContext:
-    """Lazily build and retain the B opening tree for one job's ``keyB``.
+    """Retain B's opening tree while its complete ancestor stays in the state window.
 
     ``commit_leaf`` is the Merkle leaf the GPU commit ran at (the resolved
     commit config's ``chunk_size``); the CPU rebuild must open the same
@@ -87,6 +87,7 @@ class BProofContext:
     """
 
     key_b: bytes
+    ancestor_header: bytes
     seed_b: bytes
     p_b: bytes
     codes: torch.Tensor

@@ -229,15 +229,18 @@ def _cached_mining_configuration(
     )
 
 
-def commitment_keys_for(job: MiningJob) -> tuple[bytes, bytes]:
+def commitment_keys_for(
+    job: MiningJob, ancestor_header: bytes | None = None
+) -> tuple[bytes, bytes]:
     """``(keyA, keyB)``: the job's per-side Merkle opening keys.
 
     v4 keys A's trees by the proposed header (``H_"key-A"(header)``) and B's by
-    the parent's complete header (``H_"key-B"(parent)``, state-window depth 1),
-    so every layer of a job shares one pair; the layer shape and committed tile
-    enter the chain later, through ``pA``/``pB`` in the noise seeds
+    a complete ancestor header (``H_"key-B"(ancestor)``; None selects the parent).
+    The layer shape and committed tile enter the chain through ``pA``/``pB`` in the noise seeds
     (``miner_base.commitment_hash``)."""
-    return commitment_keys(bytes(job.incomplete_header_bytes), bytes(job.parent_header))
+    if ancestor_header is None:
+        ancestor_header = job.parent_header
+    return commitment_keys(bytes(job.incomplete_header_bytes), bytes(ancestor_header))
 
 
 def _tile_work(tile: LotteryTileSpec, k: int) -> int:

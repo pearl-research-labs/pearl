@@ -1,8 +1,8 @@
 """Per-job B-side preparation: in place, synchronous, on the caller's stream.
 
-v4 keys B under the ancestor header, which the miner always takes to be the
-parent: ``B'``, its peel, ``E_B``/``F_B`` and noise ``seedB`` change whenever
-the parent does. :func:`prepare_layer` runs the GPU B chain
+v4 keys B under a complete ancestor header, choosing the parent for a fresh
+B side and retaining it while that ancestor stays in the four-header state
+window. :func:`prepare_layer` runs the GPU B chain
 (``tensor_hash_plus_stats_b -> seedB -> noise_lines -> noisy_quant_b``) into
 the layer's steady :class:`~vllm_miner.state.LayerBuffers` on the
 current CUDA stream and publishes a :class:`~vllm_miner.state.JobContext`
@@ -14,9 +14,9 @@ prepares in place otherwise. Preparation and mined launches are all
 enqueued by the serving worker thread on its stream, so stream order alone
 guarantees a launch never reads torn operands -- no background thread,
 reader quiesce, or scratch publication is involved. The cost is that the
-first launch of each layer after a parent change pays that layer's B
-preparation inline. Other job changes reuse B and refresh key A and the
-threshold as needed.
+first launch after the ancestor expires or a reorg removes it pays that
+layer's B preparation inline. Other job changes reuse B and refresh key A
+and the threshold as needed.
 """
 
 import time
@@ -124,21 +124,21 @@ def _publish(state: LayerState, ctx: JobContext) -> bool:
 def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
     """Rewrite this layer's B operands for ``job`` and publish the new context.
 
-    Runs on the caller's current stream. When the parent is unchanged, reuse
-    B and refresh key A and the lottery threshold. Returns None only when the
-    layer was disabled meanwhile; failures propagate so the caller can isolate it.
+    Runs on the caller's current stream. While B's ancestor stays in the state
+    window, reuse B and refresh key A and the lottery threshold. Returns None
+    only when the layer was disabled meanwhile; failures propagate so the caller can isolate it.
     """
     assert state.buffers is not None
     buffers = state.buffers
     torch.cuda.set_device(state.weight.device)
     started = time.monotonic()
 
-    key_a, key_b = commitment_keys_for(job)
     device = state.committed_device
     threshold = _as_bytes_tensor(threshold_bytes_for(job, state.k, state.lottery_n, device=device))
     with state.lock:
         current = state.job_ctx
-    if current is not None and current.key_b == key_b:
+    if current is not None and job.keeps_ancestor(current.b_proof.ancestor_header):
+        key_a, _ = commitment_keys_for(job, current.b_proof.ancestor_header)
         if current.key_a != key_a:
             buffers.key_a_dev.copy_(_as_bytes_tensor(key_a))
         buffers.threshold_dev.copy_(threshold)
@@ -148,6 +148,7 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
         _LOGGER.debug(f"{state.layer_name}: reused B (target={job.target})")
         return ctx
 
+    key_a, key_b = commitment_keys_for(job)
     config = mining_configuration(state.k, state.n, state.experts, device=device)
     p_b = config.p_b(state.n)
     seed_b = _prepare_b_on_gpu(state, key_a, key_b, p_b, buffers)
@@ -172,6 +173,7 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
         inv_alpha_b=buffers.inv_alpha_b,
         b_proof=BProofContext(
             key_b=key_b,
+            ancestor_header=bytes(job.parent_header),
             seed_b=seed_b,
             p_b=p_b,
             codes=state.weight_cpu,

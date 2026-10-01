@@ -99,6 +99,17 @@ class TestMiningJob:
                 GetBlockTemplateResponse.model_validate(data), mining_address=mining_address
             )
 
+    def test_ancestor_selection_is_limited_to_the_four_header_window(self):
+        headers = [bytes([i]) * 108 for i in range(1, 6)]
+        job = MiningJob(b"", 1, CertificateVersion.PLAIN_FP8, headers)
+        for depth in range(1, 5):
+            assert job.keeps_ancestor(headers[depth - 1])
+            assert job.ancestor_chain_to(headers[depth - 1]) == headers[: depth - 1]
+        for ancestor in (headers[4], bytes(108)):
+            assert not job.keeps_ancestor(ancestor)
+            with pytest.raises(ValueError, match="outside.*state window"):
+                job.ancestor_chain_to(ancestor)
+
 
 class TestAdjustTarget:
     """The rank penalty applied when turning a block target into a mining target."""

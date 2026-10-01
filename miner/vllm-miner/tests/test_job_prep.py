@@ -1,15 +1,15 @@
 """Per-job B preparation of a mined layer (``vllm_miner.job_prep``).
 
-What a job change costs must depend on *what* changed: a target-only change
-rewrites the 32-byte threshold in place and reuses every B-side artifact, a
-parent change reruns the GPU B chain, and an unchanged job does nothing.
-Changing only the proposed header refreshes key A and reuses B.
+Target and proposed-header changes refresh the threshold and key A, retaining
+B while its ancestor remains in the four-header window. Expiry or a reorg
+reruns B preparation; an unchanged job does nothing.
 
 Host logic only. The expensive GPU B-preparation collaborator is stubbed and
 counted.
 """
 
 import itertools
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -199,6 +199,7 @@ def test_first_job_runs_the_b_chain_and_publishes_in_place(layer, preps, device)
     assert ctx.config.device is device
     assert ctx.seed_b == noise_seed_b(b"\x00" * 32, ctx.key_b, ctx.config.p_b(_N))
     assert ctx.b_proof.commit_leaf == layer.buffers.commit_config.chunk_size
+    assert ctx.b_proof.ancestor_header == job.parent_header
     # Every device operand is the steady buffer itself: launches read the
     # same addresses forever.
     for name in _ALIASED_OPERANDS:
@@ -249,9 +250,35 @@ def test_tall_shape_target_change_reuses_the_b_side(preps, device):
     )
 
 
-def test_parent_change_reruns_the_b_chain(layer, preps, device):
+@_DEVICES
+def test_ancestor_window_reuses_b_until_it_expires(layer, preps, device):
     first = current_context(layer, _job())
-    # A new block template extends a new parent, which keys B.
+    ancestors = [_PARENT]
+    for depth in range(2, 6):
+        ancestors.insert(0, bytes([depth]) * 108)
+        job = replace(
+            _job(target=100 + depth, header=bytes([depth]) * 76),
+            ancestor_headers=ancestors[:4],
+        )
+        published = current_context(layer, job)
+        assert published.job is job
+        assert bytes(layer.buffers.key_a_dev.numpy()) == published.key_a
+        assert _threshold_words(layer) == threshold_bytes_for(job, _K, _N, device=device)
+        if depth <= 4:
+            assert len(preps) == 1
+            assert published.b_proof is first.b_proof
+            assert published.seed_b == first.seed_b
+            assert (published.key_a, published.key_b) == commitment_keys_for(job, _PARENT)
+        else:
+            assert len(preps) == 2
+            assert published.b_proof.ancestor_header == job.parent_header
+            assert published.seed_b != first.seed_b
+            assert (published.key_a, published.key_b) == commitment_keys_for(job)
+
+
+def test_reorg_away_from_the_ancestor_reruns_the_b_chain(layer, preps, device):
+    first = current_context(layer, _job())
+    # The replacement branch's window excludes the ancestor that keyed B.
     published = current_context(layer, _job(header=_OTHER_HEADER, parent=_OTHER_PARENT))
 
     assert len(preps) == 2

@@ -11,6 +11,7 @@ from miner_base.block_submission import (
     PrebuiltCommitment,
     commit_planes_for_leaf,
 )
+from miner_base.commitment_hash import a_keys
 from miner_base.mining_config import activation_leaf
 from miner_utils import get_logger
 
@@ -47,9 +48,9 @@ def _matching_context(
     """Return the live context described by a persistent record, if any.
 
     The seedB and target words below were stamped by the kernel from the
-    device buffers at launch time, so they pin the hit to the job the layer
-    was prepared for when it launched. A dense record must carry its payload
-    (the tile's committed A rows); an MoE record is payload-less by design
+    device buffers at launch time. They select B and the target; the jackpot
+    key check in ``_handle_hit`` also binds the proposed header. A dense record
+    must carry its payload (the tile's committed A rows); an MoE record is payload-less by design
     and is opened from the launch's retained planes (``moe``).
     """
     with state.lock:
@@ -157,11 +158,13 @@ class WinnerCheckCallback:
         scales_cpu = hit.scales
         m = hit.m
         moe_info = None
+        routing_commitments = b""
         if self.moe is not None:
             # The record's ``m`` and ``tile_row`` are the winning expert's; the
             # committed A is the launch's full activation, and the
             # tile's rows are that expert's tokens at the expert-local rows.
             routing = self.moe.routing
+            routing_commitments = bytes(routing.commitments.cpu())
             moe_info = MoEBlockInfo(
                 expert_index=hit.group_id,
                 inner_a_rows=tuple(a_rows),
@@ -173,19 +176,24 @@ class WinnerCheckCallback:
             b_rows = [hit.group_id * state.lottery_n + r for r in b_rows]
             codes_cpu, scales_cpu = self.moe.codes.cpu(), self.moe.scales.cpu()
             m = codes_cpu.shape[0]
-        pow_key = hit.commitment_hash_A  # the launch's jackpot key
-        expert = "" if moe_info is None else f" expert={moe_info.expert_index}"
-        _LOGGER.info(
-            f"block candidate! layer={state.layer_name} "
-            f"tile=({hit.tile_row}, {hit.tile_column}){expert} "
-            f"m={m} n={state.n} k={state.k} jackpot_key={pow_key.hex()[:16]}..."
-        )
-
         # The hit's GPU commit ran at the committed ACTIVATION leaf (forced on
         # every launchable A-side TensorHashConfig); rebuild the same tree for
         # the opening.
         comm_a = commit_planes_for_leaf(
             [codes_cpu, scales_cpu], ctx.key_a, activation_leaf(ctx.config)
+        )
+        expected_key = a_keys(
+            comm_a.digest, ctx.seed_b, ctx.key_a, config.p_a(m), routing_commitments
+        ).jackpot_key
+        # B's seed and the target can outlive the header that produced a hit.
+        if expected_key != hit.commitment_hash_A:
+            _LOGGER.info(f"dropping winner keyed by another header on {state.layer_name}")
+            return
+        expert = "" if moe_info is None else f" expert={moe_info.expert_index}"
+        _LOGGER.info(
+            f"block candidate! layer={state.layer_name} "
+            f"tile=({hit.tile_row}, {hit.tile_column}){expert} "
+            f"m={m} n={state.n} k={state.k} jackpot_key={expected_key.hex()[:16]}..."
         )
 
         opening = OpenedBlockInfo(
@@ -199,6 +207,7 @@ class WinnerCheckCallback:
             b_commitment=ctx.b_proof.prebuilt_commitment(),
             a_commitment=PrebuiltCommitment(comm_a, ctx.key_a),
             moe=moe_info,
+            b_ancestor_header=ctx.b_proof.ancestor_header,
         )
         submitted = ctx.job == self.manager.get_mining_job() and self.manager.handle_submit_block(
             opening,

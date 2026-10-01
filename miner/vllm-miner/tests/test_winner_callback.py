@@ -1,13 +1,14 @@
 import sys
 import threading
 from contextlib import nullcontext
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
 from miner_base.block_submission import commit_planes_for_leaf
-from miner_base.commitment import Device
+from miner_base.commitment import Device, commit_routing, hash_offsets
 from miner_base.commitment_hash import a_keys, noise_seed_b
 from miner_base.mining_config import activation_leaf
 from miner_base.prequant import PrequantMatrix
@@ -163,9 +164,11 @@ def test_hit_signal_poison_disables_device_and_releases_lease(monkeypatch):
 
 
 @pytest.mark.parametrize("job_replaced_during_handoff", [False, True])
+@pytest.mark.parametrize("previous_header", [False, True])
 def test_validated_persistent_hit_builds_canonical_opening(
     monkeypatch,
     job_replaced_during_handoff,
+    previous_header,
 ):
     k = 2048
     n = 256
@@ -189,6 +192,12 @@ def test_validated_persistent_hit_builds_canonical_opening(
     comm_b = commit_planes_for_leaf(b.planes(), key_b, config.chunk_size)
     seed_b = noise_seed_b(comm_b.digest, key_b, config.p_b(n))
     keys = a_keys(comm_a.digest, seed_b, key_a, config.p_a(a.int_values.shape[0]))
+    if previous_header:
+        old_job = replace(job, incomplete_header_bytes=bytes(range(1, 77)))
+        old_a, old_b = commitment_keys_for(old_job)
+        assert old_a != key_a and old_b == key_b
+        old_comm = commit_planes_for_leaf(a.planes(), old_a, activation_leaf(config))
+        keys = a_keys(old_comm.digest, seed_b, old_a, config.p_a(a.int_values.shape[0]))
     prebuilt = object()
     ctx = SimpleNamespace(
         config=config,
@@ -197,7 +206,9 @@ def test_validated_persistent_hit_builds_canonical_opening(
         seed_b=seed_b,
         target=job.target,
         job=job,
-        b_proof=SimpleNamespace(prebuilt_commitment=lambda: prebuilt),
+        b_proof=SimpleNamespace(
+            prebuilt_commitment=lambda: prebuilt, ancestor_header=job.parent_header
+        ),
     )
     state = SimpleNamespace(
         layer_name="test.layer",
@@ -266,7 +277,7 @@ def test_validated_persistent_hit_builds_canonical_opening(
 
     callback._handle_hit(hit)
 
-    if job_replaced_during_handoff:
+    if job_replaced_during_handoff or previous_header:
         assert submitted == []
         return
 
@@ -281,6 +292,7 @@ def test_validated_persistent_hit_builds_canonical_opening(
     assert opening.b_codes is b.int_values
     assert opening.b_scales is b.scales
     assert opening.b_commitment is prebuilt
+    assert opening.b_ancestor_header == job.parent_header
     assert opening.a_commitment is not None
     assert opening.a_commitment.key == key_a
     assert opening.a_commitment.commitment.digest == comm_a.digest
@@ -425,6 +437,20 @@ def _moe_winner_fixture(group_id: int):
         slots=torch.zeros(m * top_k, dtype=torch.int64),
         commitments=torch.zeros(64, dtype=torch.uint8),
     )
+    params = config.moe_params()
+    routing.commitments.copy_(
+        torch.tensor(
+            list(
+                bytes(commit_routing(routing.tokens.tolist(), key_a, params.hash_id_r).root)
+                + hash_offsets(m_indptr[1:].tolist(), key_a, params.hash_id_o)
+            ),
+            dtype=torch.uint8,
+        )
+    )
+    comm_a = commit_planes_for_leaf(a.planes(), key_a, activation_leaf(config))
+    jackpot_key = a_keys(
+        comm_a.digest, seed_b, key_a, config.p_a(m), bytes(routing.commitments)
+    ).jackpot_key
     ctx = SimpleNamespace(
         config=config,
         key_a=key_a,
@@ -432,7 +458,10 @@ def _moe_winner_fixture(group_id: int):
         seed_b=seed_b,
         target=job.target,
         job=job,
-        b_proof=SimpleNamespace(prebuilt_commitment=lambda: PrebuiltCommitment(comm_b, key_b)),
+        b_proof=SimpleNamespace(
+            prebuilt_commitment=lambda: PrebuiltCommitment(comm_b, key_b),
+            ancestor_header=job.parent_header,
+        ),
     )
     state = SimpleNamespace(
         layer_name="test.experts",
@@ -457,7 +486,7 @@ def _moe_winner_fixture(group_id: int):
         tile_row=2,
         tile_column=1,
         group_id=group_id,
-        commitment_hash_A=b"\x07" * 32,
+        commitment_hash_A=jackpot_key,
         commitment_hash_B=seed_b,
         target=threshold_bytes_for(job, k, n_e, device=_DEVICE),
         codes=None,
@@ -467,7 +496,8 @@ def _moe_winner_fixture(group_id: int):
     return job, state, hit, moe, per_expert
 
 
-def test_moe_hit_opens_the_routed_tokens_and_expert_rows(monkeypatch):
+@pytest.mark.parametrize("previous_header", [False, True])
+def test_moe_hit_opens_the_routed_tokens_and_expert_rows(monkeypatch, previous_header):
     """A payload-less MoE record resolves through the launch's retained
     routing: its expert-local tile becomes the expert's routed tokens and its
     stacked weight rows, and the opening carries a routing witness the cert-v4
@@ -481,6 +511,13 @@ def test_moe_hit_opens_the_routed_tokens_and_expert_rows(monkeypatch):
 
     w = 2
     job, state, hit, moe, per_expert = _moe_winner_fixture(w)
+    if previous_header:
+        header = IncompleteBlockHeader.from_bytes(job.incomplete_header_bytes)
+        header.timestamp += 1
+        job = replace(job, incomplete_header_bytes=bytes(header.to_bytes()))
+        state.job_ctx.job = job
+        state.job_ctx.key_a, key_b = commitment_keys_for(job)
+        assert key_b == state.job_ctx.key_b
     submitted = []
 
     class Manager:
@@ -504,6 +541,9 @@ def test_moe_hit_opens_the_routed_tokens_and_expert_rows(monkeypatch):
     )
     callback._handle_hit(hit)
 
+    if previous_header:
+        assert submitted == []
+        return
     (opening,) = submitted
     config = state.job_ctx.config
     inner = tile_indices(config.rows_pattern, hit.tile_row)

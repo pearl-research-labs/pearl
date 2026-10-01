@@ -1,7 +1,7 @@
 from copy import copy
 
 from miner_utils import get_logger
-from pearl_mining import PlainProof, PlainProofV4
+from pearl_mining import PlainProofV4
 
 from pearl_gateway.blockchain_utils.pearl_block import PearlBlock
 from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
@@ -27,25 +27,25 @@ class ProofGenerator:
         public_data: bytes,
         proof_data: bytes,
         template: BlockTemplate,
-        plain_proof: PlainProof | PlainProofV4,
+        ancestor_headers: tuple[bytes, ...] = (),
     ) -> PearlBlock:
-        """Build a complete block from the worker's proof bytes and the template."""
+        """Assemble a block with the proof's intermediate 108-byte headers, parent first.
+
+        ``ancestor_headers`` excludes the selected ancestor and proposed header;
+        it is empty when B is keyed by the parent.
+        """
         _LOGGER.debug("Building block from ZK proof")
 
         # The certificate version is dictated by the block height via the template.
         cert_version = template.required_cert_version
         zk_proof = CertificateProof(public_data, proof_data)
-        # A V4 certificate carries the headers linking its proof's ancestor to the block.
-        ancestor_headers = []
-        if isinstance(plain_proof, PlainProofV4):
-            ancestor_headers = [
-                PearlHeader.deserialize(bytes(h.to_bytes())) for h in plain_proof.ancestor_chain
-            ]
-
         # We need to copy because ZKCertificate assigns the proof_commitment to the header
         header = copy(template.header)
         zk_certificate = ZKCertificate.from_pearl_header(
-            header, zk_proof, cert_version=cert_version, ancestor_headers=ancestor_headers
+            header,
+            zk_proof,
+            cert_version=cert_version,
+            ancestor_headers=[PearlHeader.deserialize(h) for h in ancestor_headers],
         )
         block = PearlBlock(
             header=header,
@@ -58,10 +58,13 @@ class ProofGenerator:
     @classmethod
     def generate_block(cls, plain_proof, template: BlockTemplate, debug_mode: bool = False):
         """Prove in-process and assemble the block (test / no-pool path)."""
+        ancestor_headers = ()
+        if isinstance(plain_proof, PlainProofV4):
+            ancestor_headers = tuple(bytes(h.to_bytes()) for h in plain_proof.ancestor_chain)
         public_data, proof_data = prove(
             int(template.required_cert_version),
             template.header.serialize_without_proof_commitment(),
             plain_proof.to_base64(),
             debug_mode,
         )
-        return cls.build_block(public_data, proof_data, template, plain_proof)
+        return cls.build_block(public_data, proof_data, template, ancestor_headers)

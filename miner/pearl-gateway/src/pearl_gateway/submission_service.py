@@ -37,13 +37,16 @@ class SubmissionService:
 
     async def _build_block(self, plain_proof: PlainProof | PlainProofV4, template: BlockTemplate):
         if self.proof_pool is not None:
+            ancestor_headers = ()
+            if isinstance(plain_proof, PlainProofV4):
+                ancestor_headers = tuple(bytes(h.to_bytes()) for h in plain_proof.ancestor_chain)
             public_data, proof_data = await self.proof_pool.prove(
                 int(template.required_cert_version),
                 template.header.serialize_without_proof_commitment(),
                 plain_proof.to_base64(),
                 self.debug_mode,
             )
-            return ProofGenerator.build_block(public_data, proof_data, template, plain_proof)
+            return ProofGenerator.build_block(public_data, proof_data, template, ancestor_headers)
         return ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
 
     async def submit_plain_proof(
