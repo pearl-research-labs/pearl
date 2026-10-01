@@ -79,7 +79,10 @@ mod job_wire {
 /// 108-byte wire headers, the same buffer shape the Go FFI takes.
 mod chain_wire {
     use super::BlockHeader;
+    use crate::api::fp8::public_params::STATE_WINDOW_DEPTH;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    const MAX_BYTES: usize = (STATE_WINDOW_DEPTH - 1) * BlockHeader::SERIALIZED_SIZE;
 
     pub fn serialize<S: Serializer>(chain: &[BlockHeader], serializer: S) -> Result<S::Ok, S::Error> {
         chain
@@ -90,7 +93,12 @@ mod chain_wire {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<BlockHeader>, D::Error> {
-        BlockHeader::chain_from_bytes(&Vec::<u8>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+        // Borrow the wire bytes so the size check precedes header decoding/allocation.
+        let bytes = <&[u8]>::deserialize(deserializer)?;
+        if bytes.len() > MAX_BYTES {
+            return Err(serde::de::Error::custom("ancestor chain exceeds the state window"));
+        }
+        BlockHeader::chain_from_bytes(bytes).map_err(serde::de::Error::custom)
     }
 }
 
@@ -775,6 +783,13 @@ mod tests {
         let chain_len_at = 8 + proof.job.to_wire_bytes().len();
         let wire_len = u64::from_le_bytes(bytes[chain_len_at..chain_len_at + 8].try_into().unwrap());
         assert_eq!(wire_len as usize, 3 * BlockHeader::SERIALIZED_SIZE);
+        // Oversized chains reject before parsing even a partial header.
+        for length in [325u64, 432] {
+            let mut oversized = bytes.clone();
+            oversized[chain_len_at..chain_len_at + 8].copy_from_slice(&length.to_le_bytes());
+            let err = PlainProofV4::from_bytes(&oversized).unwrap_err();
+            assert!(format!("{err:#}").contains("exceeds the state window"), "{err:#}");
+        }
         bytes[chain_len_at..chain_len_at + 8].copy_from_slice(&(wire_len - 1).to_le_bytes());
         bytes.remove(chain_len_at + 8);
         let err = PlainProofV4::from_bytes(&bytes).unwrap_err();

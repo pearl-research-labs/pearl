@@ -9,7 +9,7 @@ use std::slice;
 use anyhow::{ensure, Result};
 
 use crate::common::MAX_ZK_PROOF_SIZE;
-use zk_pow::api::fp8::public_params::PublicParams;
+use zk_pow::api::fp8::public_params::{PublicParams, STATE_WINDOW_DEPTH};
 use zk_pow::api::primitives::BlockHeader;
 use zk_pow::api::primitives::IncompleteBlockHeader as Fp8BlockHeader;
 use zk_pow::api::seed::SeedDerivation;
@@ -249,19 +249,43 @@ pub unsafe extern "C" fn check_rank_penalty(
 /// incomplete projection and the ancestor chain, which the verifier authenticates
 /// ([`zk_pow::api::fp8::public_params::JobParams::check_ancestry`]).
 fn split_v4_headers(headers: &[u8]) -> Result<(Fp8BlockHeader, Vec<BlockHeader>)> {
-    let mut headers = BlockHeader::chain_from_bytes(headers)?;
-    ensure!(!headers.is_empty(), "missing the proposed v4 header");
-    let proposed = headers.remove(0).incomplete;
-    Ok((proposed, headers))
+    ensure!(
+        valid_v4_headers_len(headers.len()),
+        "invalid v4 headers length {}",
+        headers.len()
+    );
+    let (proposed, chain) = headers.split_at(BlockHeader::SERIALIZED_SIZE);
+    Ok((
+        Fp8BlockHeader::from_bytes(&proposed[..Fp8BlockHeader::SERIALIZED_SIZE])?,
+        BlockHeader::chain_from_bytes(chain)?,
+    ))
 }
 
-/// Shared implementation for fp8 proof verification: validate pointers and sizes,
-/// then run the cached proof verifier (which authenticates the certificate's
-/// ancestor chain) against the single explicit `verification_nbits` target.
+fn valid_v4_headers_len(len: usize) -> bool {
+    (BlockHeader::SERIALIZED_SIZE..=STATE_WINDOW_DEPTH * BlockHeader::SERIALIZED_SIZE).contains(&len)
+        && len.is_multiple_of(BlockHeader::SERIALIZED_SIZE)
+}
+
+/// Verify FP8 `public_data` / `proof_data` against the expected proposed header.
+/// Pass its `nbits` for consensus or the explicit share target for pool shares.
+///
+/// `headers` is `σ̂ ‖ σ_1 ‖ … ‖ σ_{d-1}` in canonical 108-byte wire headers,
+/// parent first; `headers_len` must be 108·d for d = 1..=4. The statement carries
+/// the complete `σ_d`. Every link authenticates the full parent's SHA256d,
+/// including its proof commitment; the proposed header's proof commitment is ignored.
+/// Setups come from the device-indexed, read-only embedded cache; uncached devices
+/// reject, and verification never compiles a setup on demand.
+///
+/// # Returns
+/// 0 = accepted, 1 = rejected (malformed, oversized, wrong header or invalid proof),
+/// 2 = system error (null pointers or internal panic).
 ///
 /// # Safety
-/// Same contract as [`verify_zk_proof_v4`].
-unsafe fn verify_zk_proof_v4_inner(
+/// - `headers` must point to `headers_len` readable bytes
+/// - `zk_proof` must be valid; its `proof_blob` must point to `proof_blob_len` readable bytes
+/// - `error_msg_out` must be null or point to a caller-allocated buffer of `ERROR_MSG_MAX_SIZE` bytes
+#[no_mangle]
+pub unsafe extern "C" fn verify_zk_proof_v4(
     headers: *const u8,
     headers_len: usize,
     zk_proof: *const CZKProof,
@@ -272,6 +296,10 @@ unsafe fn verify_zk_proof_v4_inner(
         if headers.is_null() || zk_proof.is_null() {
             set_error_msg(error_msg_out, "Null pointer");
             return 2;
+        }
+        if !valid_v4_headers_len(headers_len) {
+            set_error_msg(error_msg_out, &format!("invalid v4 headers length {}", headers_len));
+            return 1;
         }
 
         let zk_proof_ref = &*zk_proof;
@@ -303,11 +331,6 @@ unsafe fn verify_zk_proof_v4_inner(
             }
         };
 
-        // The statement's trusted setup comes from the global read-only cache: the
-        // embedded `fp8_cache.bin` preloads the universal (D1) wrapper circuits,
-        // which cover every envelope-legal geometry and degree profile. A device
-        // missing from a stale cache rejects the proof — setups are never compiled
-        // on demand, so no proof can force that cost.
         let cache = fp8_cache();
         let verdict = cache.verify_share(&header, &ancestor_chain, public_data, proof_data, verification_nbits);
         match verdict {
@@ -329,48 +352,6 @@ unsafe fn verify_zk_proof_v4_inner(
             2
         }
     }
-}
-
-/// Verify an FP8 ZK proof: the published `public_data` / `proof_data` pair carried
-/// by `zk_proof` against the caller's expected block header and the single explicit
-/// difficulty target `verification_nbits`.
-///
-/// Consensus passes the header's own `nbits`; pool shares pass the share target —
-/// both through this one function, so header-bound and share-target verification
-/// can never diverge into separate C paths.
-///
-/// `headers` contains canonical 108-byte wire headers: the proposed header `σ̂`, then
-/// the ancestor chain `σ_1..σ_{d-1}` strictly between it and the statement's
-/// complete ancestor header `σ_d` (parent first), so `headers_len` is 108·d for
-/// `d = 1..=4`. Each link — ending at `σ_d` — must be the SHA256d of the full parent
-/// header, including its proof commitment; extra headers are rejected. The proposed
-/// header's own proof commitment is ignored.
-///
-/// The trusted verifier setup is not an argument: setups live in a global read-only
-/// cache preloaded from the embedded `fp8_cache.bin`, resolved by the statement's
-/// device byte. A device outside the cache rejects the proof (code 1) — setups are
-/// never compiled on demand, so no proof can force an expensive circuit build. The
-/// verdict is binary: the jackpot policy accepts or rejects, nothing else is reported.
-///
-/// # Returns
-/// - 0: Proof verified and accepted
-/// - 1: Proof rejected (malformed, oversized, wrong header, or verification failure)
-/// - 2: System error (null pointers or internal panic)
-///
-/// # Safety
-/// - `headers` must point to `headers_len` readable bytes
-/// - `zk_proof` must be a valid pointer; `zk_proof.proof_blob` must be a valid pointer to
-///   `proof_blob_len` bytes
-/// - `error_msg_out` must be null or a valid pointer to a caller-allocated buffer of `ERROR_MSG_MAX_SIZE` bytes
-#[no_mangle]
-pub unsafe extern "C" fn verify_zk_proof_v4(
-    headers: *const u8,
-    headers_len: usize,
-    zk_proof: *const CZKProof,
-    verification_nbits: u32,
-    error_msg_out: *mut c_char,
-) -> i32 {
-    verify_zk_proof_v4_inner(headers, headers_len, zk_proof, verification_nbits, error_msg_out)
 }
 
 /// Verify a V1 (version 1, master-format) ZK proof.
@@ -476,16 +457,33 @@ mod fp8_ancestor_tests {
 
     #[test]
     fn splits_the_proposed_header_from_its_chain() {
-        let headers: Vec<u8> = (0..3 * BlockHeader::SERIALIZED_SIZE).map(|i| i as u8).collect();
-        let (proposed, chain) = split_v4_headers(&headers).unwrap();
-        // The proposed header's own proof commitment is not part of the statement.
-        assert_eq!(proposed.to_bytes(), headers[..Fp8BlockHeader::SERIALIZED_SIZE]);
-        assert_eq!(
-            chain.iter().flat_map(BlockHeader::to_bytes).collect::<Vec<_>>(),
-            headers[BlockHeader::SERIALIZED_SIZE..]
-        );
-        for length in [0, 76, 107, 109, 215, 217] {
+        use crate::common::{ERROR_MSG_MAX_SIZE, PUBLICDATA_MAX_SIZE};
+        use std::ffi::CStr;
+
+        let headers: Vec<u8> = (0..5 * BlockHeader::SERIALIZED_SIZE).map(|i| i as u8).collect();
+        for depth in 1..=STATE_WINDOW_DEPTH {
+            let bytes = &headers[..depth * BlockHeader::SERIALIZED_SIZE];
+            let (proposed, chain) = split_v4_headers(bytes).unwrap();
+            // The proposed header's own proof commitment is not part of the statement.
+            assert_eq!(proposed.to_bytes(), bytes[..Fp8BlockHeader::SERIALIZED_SIZE]);
+            assert_eq!(
+                chain.iter().flat_map(BlockHeader::to_bytes).collect::<Vec<_>>(),
+                bytes[BlockHeader::SERIALIZED_SIZE..]
+            );
+        }
+        let proof = CZKProof {
+            public_data_len: 0,
+            public_data: [0; PUBLICDATA_MAX_SIZE],
+            proof_blob_len: 0,
+            proof_blob: std::ptr::null_mut(),
+        };
+        for length in [0, 76, 107, 109, 215, 217, 433, 540] {
             assert!(split_v4_headers(&headers[..length]).is_err(), "length {length}");
+            let mut err = [0 as c_char; ERROR_MSG_MAX_SIZE];
+            let code = unsafe { verify_zk_proof_v4(headers.as_ptr(), length, &proof, 0x207fffff, err.as_mut_ptr()) };
+            assert_eq!(code, 1);
+            let message = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
+            assert!(message.contains("invalid v4 headers length"), "{message}");
         }
     }
 }

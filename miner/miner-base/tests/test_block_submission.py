@@ -1,4 +1,9 @@
+import ctypes
+import subprocess
+import sys
 from dataclasses import replace
+from functools import partial
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -31,6 +36,7 @@ from pearl_mining import (
     CERT_VERSION_PLAIN_FP8,
     BlockHeader,
     IncompleteBlockHeader,
+    PlainProofV4,
     verify_plain_proof_for_cert_version,
 )
 from pearl_mining import (
@@ -59,12 +65,12 @@ PARENT_BYTES = bytes(PARENT.to_bytes())
 
 
 def make_plain_peel_header(
-    nbits: int = DEFAULT_NBITS, timestamp: int = 1_700_000_000
+    nbits: int = DEFAULT_NBITS, timestamp: int = 1_700_000_000, parent: BlockHeader = PARENT
 ) -> IncompleteBlockHeader:
-    """A static block-template header extending ``PARENT``."""
+    """A block-template header extending ``parent``."""
     return IncompleteBlockHeader(
         version=1,
-        prev_block=bytes(PARENT.block_hash()),
+        prev_block=bytes(parent.block_hash()),
         merkle_root=b"\x22" * 32,
         timestamp=timestamp,
         nbits=nbits,
@@ -167,6 +173,119 @@ def test_plain_peel_proof_maps_hopper_to_native_h100():
     proof = create_proof(_opening(config=config), make_plain_peel_header(), PARENT_BYTES)
 
     assert proof.common.device == NativeDevice.H100
+
+
+def _historical_plain_proof(depth: int):
+    lineage = [PARENT]
+    for _ in range(1, depth):
+        parent = lineage[-1]
+        lineage.append(
+            BlockHeader(
+                make_plain_peel_header(ALWAYS_WIN_NBITS, parent.incomplete.timestamp + 1, parent),
+                b"\x44" * 32,
+            )
+        )
+    parent = lineage[-1]
+    header = make_plain_peel_header(ALWAYS_WIN_NBITS, parent.incomplete.timestamp + 1, parent)
+    proof = create_proof(_opening(), header, PARENT_BYTES)
+    return header, _with_ancestry(proof, PARENT, list(reversed(lineage[1:])))
+
+
+def _with_ancestry(proof, ancestor, chain):
+    return PlainProofV4(
+        ancestor_header=ancestor,
+        common=proof.common,
+        a=proof.a,
+        b=proof.b,
+        values_a=proof.values_a,
+        values_b=proof.values_b,
+        scales_a=proof.scales_a,
+        scales_b=proof.scales_b,
+        ancestor_chain=chain,
+    )
+
+
+@pytest.fixture(scope="module", params=["python", "c"])
+def plain_v4_verifier(request, tmp_path_factory):
+    if request.param == "python":
+        return partial(verify_plain_proof_for_cert_version, CERT_VERSION_PLAIN_FP8)
+    # Link the existing Go static library so both interfaces use the same proof cases.
+    static = (
+        Path(__file__).resolve().parents[3] / "zk-pow/bindings/go/target/release/libzk_pow_ffi.a"
+    )
+    if sys.platform != "linux" or not static.exists():
+        pytest.skip("C verifier tests require Linux and task build:zk-gobind")
+    shared = tmp_path_factory.mktemp("plain-ffi") / "verify.so"
+    subprocess.run(
+        ["cc", "-shared", "-Wl,-u,verify_plain_proof_v4_ffi", str(static)]
+        + ["-ldl", "-lpthread", "-lm", "-o", str(shared)],
+        check=True,
+    )
+    verify = ctypes.CDLL(str(shared)).verify_plain_proof_v4_ffi
+    verify.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+    ]
+
+    def verify_proof(header, proof):
+        error = ctypes.create_string_buffer(128)
+        wire = bytes(proof.to_bytes())
+        code = verify(bytes(header.to_bytes()), wire, len(wire), 0, error)
+        assert code != 2, error.value
+        return code == 0, error.value.decode()
+
+    return verify_proof
+
+
+@pytest.mark.parametrize("depth", range(1, 5))
+def test_plain_fp8_accepts_all_ancestor_depths(depth, plain_v4_verifier):
+    header, proof = _historical_plain_proof(depth)
+    restored = PlainProofV4.from_bytes(proof.to_bytes())
+    accepted, message = plain_v4_verifier(header, restored)
+    assert accepted, message
+
+
+@pytest.fixture(scope="module")
+def historical_plain_proof():
+    return _historical_plain_proof(4)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "too_deep",
+        "proposed_as_ancestor",
+        "intermediate_commitment",
+        "ancestor_commitment",
+    ],
+)
+def test_plain_fp8_rejects_invalid_ancestry(historical_plain_proof, mutation, plain_v4_verifier):
+    header, proof = historical_plain_proof
+    ancestor, chain = proof.ancestor_header, proof.ancestor_chain
+    if mutation == "missing":
+        chain = []
+    elif mutation == "too_deep":
+        chain.append(ancestor)
+    elif mutation == "proposed_as_ancestor":
+        ancestor, chain = BlockHeader(header, bytes(32)), []
+    else:
+        wire = bytearray(
+            (chain[0] if mutation == "intermediate_commitment" else ancestor).to_bytes()
+        )
+        wire[76] ^= 1
+        tampered = BlockHeader.from_bytes(wire)
+        if mutation == "intermediate_commitment":
+            chain[0] = tampered
+        else:
+            ancestor = tampered
+    invalid = _with_ancestry(proof, ancestor, chain)
+    accepted, message = plain_v4_verifier(header, invalid)
+    assert not accepted
+    assert "does not connect" in message or "state window" in message
 
 
 def test_tall_tile_keeps_high_k_proof_under_the_verifier_cap():

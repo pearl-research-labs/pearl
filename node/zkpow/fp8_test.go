@@ -88,12 +88,12 @@ func TestVerifyCertificateV4DisconnectedAncestor(t *testing.T) {
 		"v4 ancestor header at depth 1 does not connect")
 }
 
-// TestVerifyCertificateV4TooManyAncestors relies on the Rust verifier's state
-// window bound, shared by every verification entry point.
+// TestVerifyCertificateV4TooManyAncestors exercises the FFI length bound,
+// which rejects oversized chains before decoding them.
 func TestVerifyCertificateV4TooManyAncestors(t *testing.T) {
 	header, cert := loadFP8Fixture(t)
 	cert.AncestorHeaders = make([]wire.BlockHeader, wire.MaxCertificateV4AncestorHeaders+1)
-	require.ErrorContains(t, VerifyCertificate(header, cert), "at most 3 fit the state window")
+	require.ErrorContains(t, VerifyCertificate(header, cert), "invalid v4 headers length")
 }
 
 // TestVerifyCertificateV4WireRoundTrip verifies the certificate after a

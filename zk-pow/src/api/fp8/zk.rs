@@ -268,7 +268,13 @@ impl Fp8Verifier {
         public_data: &[u8],
         proof_data: &[u8],
     ) -> Result<()> {
-        self.verify_with_nbits(proposed_header, ancestor_chain, public_data, proof_data, None)
+        self.verify_share(
+            proposed_header,
+            ancestor_chain,
+            public_data,
+            proof_data,
+            proposed_header.nbits,
+        )
     }
 
     /// Verifies a pool share under an explicit share target.
@@ -280,22 +286,10 @@ impl Fp8Verifier {
         proof_data: &[u8],
         share_nbits: u32,
     ) -> Result<()> {
-        self.verify_with_nbits(proposed_header, ancestor_chain, public_data, proof_data, Some(share_nbits))
-    }
-
-    fn verify_with_nbits(
-        &self,
-        proposed_header: &IncompleteBlockHeader,
-        ancestor_chain: &[BlockHeader],
-        public_data: &[u8],
-        proof_data: &[u8],
-        nbits_override: Option<u32>,
-    ) -> Result<()> {
         let statement = decode_statement(public_data)?;
         statement.job().check_ancestry(proposed_header, ancestor_chain)?;
         let job = Fp8Job::derive(&statement, proposed_header)?;
-        let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-        self.verify_derived(&job, proof_data, nbits)
+        self.verify_derived(&job, proof_data, share_nbits)
     }
 
     /// The verification core on an already-derived statement (shared with
@@ -339,7 +333,13 @@ impl Fp8VerifierCache {
         public_data: &[u8],
         proof_data: &[u8],
     ) -> Result<()> {
-        self.verify_with_nbits(proposed_header, ancestor_chain, public_data, proof_data, None)
+        self.verify_share(
+            proposed_header,
+            ancestor_chain,
+            public_data,
+            proof_data,
+            proposed_header.nbits,
+        )
     }
 
     /// Verifies a pool share under an explicit share target.
@@ -351,23 +351,11 @@ impl Fp8VerifierCache {
         proof_data: &[u8],
         share_nbits: u32,
     ) -> Result<()> {
-        self.verify_with_nbits(proposed_header, ancestor_chain, public_data, proof_data, Some(share_nbits))
-    }
-
-    fn verify_with_nbits(
-        &self,
-        proposed_header: &IncompleteBlockHeader,
-        ancestor_chain: &[BlockHeader],
-        public_data: &[u8],
-        proof_data: &[u8],
-        nbits_override: Option<u32>,
-    ) -> Result<()> {
         let statement = decode_statement(public_data)?;
         statement.job().check_ancestry(proposed_header, ancestor_chain)?;
         let job = Fp8Job::derive(&statement, proposed_header)?;
         let verifier = self.verifier_for_job(&job)?;
-        let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-        verifier.verify_derived(&job, proof_data, nbits)
+        verifier.verify_derived(&job, proof_data, share_nbits)
     }
 }
 

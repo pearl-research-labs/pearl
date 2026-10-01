@@ -14,9 +14,9 @@ prepares in place otherwise. Preparation and mined launches are all
 enqueued by the serving worker thread on its stream, so stream order alone
 guarantees a launch never reads torn operands -- no background thread,
 reader quiesce, or scratch publication is involved. The cost is that the
-first launch of each layer after a job change pays that layer's B
-preparation inline (a target-only change skips the chain and rewrites just
-the 32-byte threshold).
+first launch of each layer after a parent change pays that layer's B
+preparation inline. Other job changes reuse B and refresh key A and the
+threshold as needed.
 """
 
 import time
@@ -113,13 +113,6 @@ def _prepare_b_on_gpu(
     return seed_b
 
 
-def layer_job_keys(job: MiningJob) -> tuple[bytes, bytes]:
-    """``(keyA, keyB)`` under ``job``. v4 keys depend on the header and its
-    parent alone; the layer's committed tile enters through ``pB`` in ``seedB``
-    instead."""
-    return commitment_keys_for(job)
-
-
 def _publish(state: LayerState, ctx: JobContext) -> bool:
     with state.lock:
         if not state.mineable:
@@ -131,27 +124,28 @@ def _publish(state: LayerState, ctx: JobContext) -> bool:
 def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
     """Rewrite this layer's B operands for ``job`` and publish the new context.
 
-    Runs on the caller's current stream. A job that only changed the lottery
-    target (same header, hence the same keys, ``seedB`` and every B operand)
-    rewrites just the 32-byte threshold. Returns None only when the layer was
-    disabled meanwhile; failures propagate so the caller can isolate the layer.
+    Runs on the caller's current stream. When the parent is unchanged, reuse
+    B and refresh key A and the lottery threshold. Returns None only when the
+    layer was disabled meanwhile; failures propagate so the caller can isolate it.
     """
     assert state.buffers is not None
     buffers = state.buffers
     torch.cuda.set_device(state.weight.device)
     started = time.monotonic()
 
-    key_a, key_b = layer_job_keys(job)
+    key_a, key_b = commitment_keys_for(job)
     device = state.committed_device
     threshold = _as_bytes_tensor(threshold_bytes_for(job, state.k, state.lottery_n, device=device))
     with state.lock:
         current = state.job_ctx
-    if current is not None and (current.key_a, current.key_b) == (key_a, key_b):
+    if current is not None and current.key_b == key_b:
+        if current.key_a != key_a:
+            buffers.key_a_dev.copy_(_as_bytes_tensor(key_a))
         buffers.threshold_dev.copy_(threshold)
-        ctx = replace(current, job=job, target=job.target)
+        ctx = replace(current, job=job, key_a=key_a, target=job.target)
         if not _publish(state, ctx):
             return None
-        _LOGGER.debug(f"{state.layer_name}: target-only refresh (target={job.target})")
+        _LOGGER.debug(f"{state.layer_name}: reused B (target={job.target})")
         return ctx
 
     config = mining_configuration(state.k, state.n, state.experts, device=device)

@@ -2,7 +2,8 @@
 
 What a job change costs must depend on *what* changed: a target-only change
 rewrites the 32-byte threshold in place and reuses every B-side artifact, a
-header change reruns the GPU B chain, and an unchanged job does nothing.
+parent change reruns the GPU B chain, and an unchanged job does nothing.
+Changing only the proposed header refreshes key A and reuses B.
 
 Host logic only. The expensive GPU B-preparation collaborator is stubbed and
 counted.
@@ -22,7 +23,6 @@ from vllm_miner import settings as settings_module
 from vllm_miner.job_prep import (
     current_context,
     current_job,
-    layer_job_keys,
     prepare_layer,
     prepare_mining,
     unpublish_contexts,
@@ -30,6 +30,7 @@ from vllm_miner.job_prep import (
 from vllm_miner.mining_config import (
     PACKED_NOISE_K,
     RANK,
+    commitment_keys_for,
     mining_configuration,
     threshold_bytes_for,
 )
@@ -125,6 +126,12 @@ def _layer_state(k: int = _K) -> LayerState:
 
 
 @pytest.fixture(autouse=True)
+def async_manager():
+    """Preparation decisions use host buffers without starting the serving runtime."""
+    yield
+
+
+@pytest.fixture(autouse=True)
 def host_only_runtime(monkeypatch):
     """No CUDA device to pin; kernel warmup is not part of the preparation decision."""
     monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
@@ -186,7 +193,7 @@ def test_first_job_runs_the_b_chain_and_publishes_in_place(layer, preps, device)
     ctx = current_context(layer, job)
 
     assert ctx is not None and layer.job_ctx is ctx
-    assert [key for _, key in preps] == [layer_job_keys(job)[1]]
+    assert [key for _, key in preps] == [commitment_keys_for(job)[1]]
     assert ctx.job is job and ctx.target == job.target
     assert ctx.config == mining_configuration(_K, _N, device=device)
     assert ctx.config.device is device
@@ -201,23 +208,20 @@ def test_first_job_runs_the_b_chain_and_publishes_in_place(layer, preps, device)
 
 
 @_DEVICES
-def test_same_header_target_change_rewrites_only_the_threshold(layer, preps, device):
-    """The 32 bytes that changed must not cost a full-model B prep.
-
-    Only the lottery threshold depends on the target: keyA/keyB come from the
-    header, seedB from keyB, the commitment and pB, and every B operand from
-    seedB. A target-only change therefore rewrites the threshold in place
-    (stream-ordered with the launches that read it) and republishes.
-    """
+@pytest.mark.parametrize("header", [_HEADER, _OTHER_HEADER], ids=["target", "header_and_target"])
+def test_same_parent_reuses_b_and_refreshes_the_context(layer, preps, device, header):
+    """Refresh key A and the threshold on the serving stream while retaining B."""
     first_job = _job(target=100)
     first = current_context(layer, first_job)
-    second_job = _job(target=200)
+    second_job = _job(target=200, header=header)
     published = current_context(layer, second_job)
 
-    assert len(preps) == 1, "a target-only change reran the B chain"
+    assert len(preps) == 1, "a job with the same parent reran the B chain"
     assert published is not first and layer.job_ctx is published
     assert published.job is second_job and published.target == 200
-    assert (published.key_a, published.key_b) == (first.key_a, first.key_b)
+    assert (published.key_a, published.key_b) == commitment_keys_for(second_job)
+    assert bytes(layer.buffers.key_a_dev.numpy()) == published.key_a
+    assert published.key_b == first.key_b
     assert published.seed_b == first.seed_b
     assert published.b_proof is first.b_proof
     for name in _ALIASED_OPERANDS:
@@ -245,7 +249,7 @@ def test_tall_shape_target_change_reuses_the_b_side(preps, device):
     )
 
 
-def test_header_change_reruns_the_b_chain(layer, preps, device):
+def test_parent_change_reruns_the_b_chain(layer, preps, device):
     first = current_context(layer, _job())
     # A new block template extends a new parent, which keys B.
     published = current_context(layer, _job(header=_OTHER_HEADER, parent=_OTHER_PARENT))
