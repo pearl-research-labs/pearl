@@ -2783,7 +2783,7 @@ mod tests {
             program.wl2(),
             program.device,
         );
-        let (mut rows, pis) = program.generate_trace::<F>(&[ones.clone()], &[ones.clone()]);
+        let (mut rows, pis) = program.generate_trace::<F>(&[ones], &[ones]);
         check_all(&program, &rows, &pis).unwrap();
         let honest: &ScaleColumnsView<F> = rows[0].borrow();
         let honest_grid_quotient = honest.grid_snap_quotient;
@@ -2812,7 +2812,7 @@ mod tests {
             max_abs: 0x3F80,
             dead_count: 0,
         };
-        let (mut rows, pis) = program.generate_trace::<F>(&[tuple.clone()], &[tuple.clone()]);
+        let (mut rows, pis) = program.generate_trace::<F>(&[tuple], &[tuple]);
         check_all(&program, &rows, &pis).unwrap();
         rebuild_with_claim(&program, &mut rows, 0, &tuple, SqrtClaim::from_tf(240, 140));
         let forged: &ScaleColumnsView<F> = rows[0].borrow();
