@@ -1,5 +1,6 @@
 import json
 import socket
+from contextlib import suppress
 from typing import Any, TextIO
 
 from miner_utils import get_logger
@@ -37,7 +38,13 @@ class JSONRPCClient:
         return _socket
 
     def close(self):
-        """Close the file objects and socket"""
+        """Close the file objects and socket.
+
+        The socket is shut down first so a ``recv_message`` blocked in another
+        thread wakes up instead of holding the connection open.
+        """
+        with suppress(OSError):
+            self._socket.shutdown(socket.SHUT_RDWR)
         self._reader.close()
         self._writer.close()
         self._socket.close()

@@ -164,7 +164,7 @@ impl Blake3Hasher {
                 B3F_CHUNK_END,
                 &mut simd_out,
             );
-            for (i, chunk_out) in simd_out.chunks_exact(OUT_LEN).enumerate() {
+            for (i, chunk_out) in simd_out.as_chunks::<OUT_LEN>().0.iter().enumerate() {
                 cv_slice[i].copy_from_slice(chunk_out);
             }
         }

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7"]
+build-backend = "maturin"
+
+[project]
+name = "pearl-blake3"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Lean keyed-BLAKE3 Merkle primitives for Pearl"
+
+[tool.maturin]
+features = ["extension-module"]
+module-name = "pearl_blake3"

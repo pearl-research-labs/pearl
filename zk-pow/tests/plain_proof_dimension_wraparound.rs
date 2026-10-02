@@ -1,8 +1,9 @@
 use blake3::CHUNK_LEN;
 
-use zk_pow::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern, SeedDerivation};
-use zk_pow::api::verify::verify_plain_proof;
-use zk_pow::ffi::mine::mine;
+use zk_pow::api::seed::SeedDerivation;
+use zk_pow::v2::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern};
+use zk_pow::v2::api::verify::verify_plain_proof;
+use zk_pow::v2::mine::mine;
 
 #[test]
 fn rejects_dimension_wraparound_after_leaf_count_check() {

@@ -205,7 +205,7 @@ where
 }
 
 /// Simulate the trace, ctl, and auxiliary polynomials using dummy values. This is used to bind the constraints before committing to the quotient polynomial.
-fn get_dummy_polys<F, C, const D: usize>(
+pub(crate) fn get_dummy_polys<F, C, const D: usize>(
     challenger: &mut Challenger<F, C::Hasher>,
     num_trace_polys: usize,
     num_aux_polys: usize,
@@ -506,7 +506,8 @@ where
 
     let stark_zeta = challenger.get_extension_challenge(builder);
 
-    challenger.observe_openings(&openings.to_fri_openings());
+    let zero = builder.zero();
+    challenger.observe_openings(&openings.to_fri_openings(zero));
 
     StarkProofChallengesTarget {
         lookup_challenge_set,
@@ -523,7 +524,7 @@ where
 }
 
 // Simulate the trace, ctl, and auxiliary polynomials using dummy values. This is used to bind the constraints before committing to the quotient polynomial.
-fn get_dummy_polys_circuit<F, C, const D: usize>(
+pub(crate) fn get_dummy_polys_circuit<F, C, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     challenger: &mut RecursiveChallenger<F, C::Hasher, D>,
     num_trace_polys: usize,

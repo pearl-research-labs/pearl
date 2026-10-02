@@ -11,8 +11,8 @@ use crate::merkle::{MerkleProof, MerkleTree};
 #[pymethods]
 impl MerkleTree {
     #[new]
-    #[pyo3(signature = (data, key))]
-    fn py_new(data: &[u8], key: &[u8]) -> PyResult<Self> {
+    #[pyo3(signature = (data, key, chunk_len = CHUNK_LEN))]
+    fn py_new(data: &[u8], key: &[u8], chunk_len: usize) -> PyResult<Self> {
         let key: [u8; OUT_LEN] = key.try_into().map_err(|_| {
             PyValueError::new_err(format!(
                 "key must be exactly {} bytes, got {}",
@@ -20,7 +20,7 @@ impl MerkleTree {
                 key.len()
             ))
         })?;
-        Ok(Self::new(data, key))
+        Self::with_chunk_len(data, key, chunk_len).map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     #[getter(root)]
@@ -43,11 +43,14 @@ impl MerkleTree {
 
     #[staticmethod]
     #[pyo3(name = "compute_leaf_indices_from_rows")]
+    #[pyo3(signature = (row_indices, shape, chunk_len = CHUNK_LEN))]
     fn py_compute_leaf_indices_from_rows(
         row_indices: Vec<usize>,
         shape: (usize, usize),
-    ) -> Vec<usize> {
-        Self::compute_leaf_indices_from_rows(&row_indices, shape)
+        chunk_len: usize,
+    ) -> PyResult<Vec<usize>> {
+        Self::compute_leaf_indices_from_rows(&row_indices, shape, chunk_len)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 }
 
@@ -61,14 +64,7 @@ impl MerkleProof {
         siblings: Vec<Vec<u8>>,
         total_leaves: usize,
     ) -> PyResult<Self> {
-        let leaf_data: Vec<[u8; CHUNK_LEN]> = leaf_data
-            .into_iter()
-            .map(|v| {
-                v.try_into().map_err(|_| {
-                    PyValueError::new_err(format!("leaf data must be exactly {} bytes", CHUNK_LEN))
-                })
-            })
-            .collect::<PyResult<_>>()?;
+        Self::check_equal_allowed_leaves(&leaf_data).map_err(PyValueError::new_err)?;
         let root: Digest = root.try_into().map_err(|_| {
             PyValueError::new_err(format!("root must be exactly {} bytes", OUT_LEN))
         })?;
@@ -90,5 +86,52 @@ impl MerkleProof {
             root,
             siblings,
         })
+    }
+
+    #[getter(leaf_data)]
+    fn py_leaf_data(&self) -> Vec<Vec<u8>> {
+        self.leaf_data.clone()
+    }
+
+    #[getter(leaf_indices)]
+    fn py_leaf_indices(&self) -> Vec<usize> {
+        self.leaf_indices.clone()
+    }
+
+    #[getter(total_leaves)]
+    fn py_total_leaves(&self) -> usize {
+        self.total_leaves
+    }
+
+    #[getter(root)]
+    fn py_root<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.root)
+    }
+
+    #[getter(siblings)]
+    fn py_siblings<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        self.siblings
+            .iter()
+            .map(|sibling| PyBytes::new(py, sibling))
+            .collect()
+    }
+
+    #[getter(chunk_len)]
+    fn py_chunk_len(&self) -> usize {
+        self.chunk_len()
+    }
+
+    #[pyo3(name = "verify")]
+    fn py_verify(&self, key: &[u8]) -> PyResult<bool> {
+        let key: Digest = key
+            .try_into()
+            .map_err(|_| PyValueError::new_err(format!("key must be exactly {} bytes", OUT_LEN)))?;
+        Ok(self.verify(key))
+    }
+
+    #[pyo3(name = "extract_bytes")]
+    fn py_extract_bytes(&self, global_start: usize, length: usize) -> PyResult<Vec<u8>> {
+        self.extract_bytes(global_start, length)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 }

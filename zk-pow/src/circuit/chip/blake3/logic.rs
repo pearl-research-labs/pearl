@@ -37,8 +37,10 @@ pub struct BlakeRoundLogic {
     /// Specifies what data to load into BLAKE3_MSG_BUFFER this round.
     /// In round 8 the loaded data (in BLAKE3_MSG_BUFFER) should match the correct message that blake3 were processing since first round.
     pub data_source: MessageDataType,
+    #[allow(dead_code)] // read by the STARK trace/constraints, which live in the v1/v2 clones
     pub(crate) blake3_tweak: Option<Blake3Tweak>, // Some only at round 1
     /// Round index within a blake3 compression, 1-indexed: 1,2,3,4,5,6,7,8.
+    #[allow(dead_code)] // read by the STARK trace/constraints, which live in the v1/v2 clones
     pub(crate) round_idx: usize,
 
     /// Which STARK row to read its CV_OUT into this row's CV_IN.
@@ -102,13 +104,11 @@ pub fn encode_is_msg_bits(data_source: &MessageDataType) -> [bool; 3] {
 ///
 /// - `is_msg_jackpot    = bit1 * (1-bit2)`  (only `010` activates)
 /// - `is_msg_uint8_data = bit0 + bit1*bit2` (`100` or `011` -- load UINT8_DATA into blake3_msg;
-///   for Matrix rows UINT8_DATA also goes through int7→uint8; for Aux/Routing rows it does not,
-///   and IS_FIRST_OUTER / IS_SECOND_OUTER further constrain whether UINT8_DATA must match
-///   preprocessed outer indices)
+///   source-specific constraints determine how UINT8_DATA is validated)
 /// - `is_msg_cv         = bit2 * (1-bit1)`  (only `001` activates)
 ///
-/// Note: `is_msg_mat = bit0` is not returned here; it is only used as a lookup filter column
-/// in `pearl_stark.rs` (int7→uint8 table), where the raw bit column is referenced directly.
+/// Note: `is_msg_mat = bit0` is not returned here; consumers that need it reference the raw
+/// bit column directly.
 pub(crate) fn decode_is_msg_bits<V: Copy, E: Evaluator<V, S>, S: Copy>(eval: &mut E, one: V, bits: [V; 3]) -> (V, V, V) {
     let [bit0, bit1, bit2] = bits;
     let not_bit_1 = eval.sub(one, bit1);

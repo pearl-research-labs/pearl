@@ -14,6 +14,7 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::circuit_data::VerifierCircuitTarget;
 use crate::plonk::config::{AlgebraicHasher, GenericHashOut, Hasher};
+use crate::util::log2_strict;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(bound = "")]
@@ -141,7 +142,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
     /// Same as `verify_merkle_proof_to_cap`, except with the final "cap index" as separate parameter,
     /// rather than being contained in `leaf_index_bits`.
-    pub(crate) fn verify_merkle_proof_to_cap_with_cap_index<H: AlgebraicHasher<F>>(
+    pub fn verify_merkle_proof_to_cap_with_cap_index<H: AlgebraicHasher<F>>(
         &mut self,
         leaf_data: Vec<Target>,
         leaf_index_bits: &[BoolTarget],
@@ -149,12 +150,48 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         merkle_cap: &MerkleCapTarget,
         proof: &MerkleProofTarget,
     ) {
+        // An exact walk is a conditional walk with an empty conditional prefix.
+        self.conditional_verify_merkle_proof_to_cap_with_cap_index::<H>(
+            leaf_data,
+            leaf_index_bits,
+            &[],
+            cap_index,
+            merkle_cap,
+            proof,
+        );
+    }
+
+    /// Circuit version of `verify_batch_merkle_proof_to_cap`, with the final "cap index" as a
+    /// separate parameter rather than being contained in `leaf_index_bits`.
+    ///
+    /// `leaf_data[i]` is the leaf group residing at height `leaf_heights[i]`; groups must be
+    /// sorted by height, from tallest to shortest, with no duplicates, and `leaf_heights[0]`
+    /// must equal `proof.siblings.len() + cap_height`.
+    pub fn verify_batch_merkle_proof_to_cap_with_cap_index<H: AlgebraicHasher<F>>(
+        &mut self,
+        leaf_data: &[Vec<Target>],
+        leaf_heights: &[usize],
+        leaf_index_bits: &[BoolTarget],
+        cap_index: Target,
+        merkle_cap: &MerkleCapTarget,
+        proof: &MerkleProofTarget,
+    ) {
         debug_assert!(H::AlgebraicPermutation::RATE >= NUM_HASH_OUT_ELTS);
+        // Build-time layout invariants: the walk must consume every sibling to reach the
+        // cap, and the tallest group must sit exactly `siblings` levels below it. A
+        // violation would silently build a circuit that binds the wrong tree.
+        assert!(leaf_index_bits.len() >= proof.siblings.len());
+        assert_eq!(
+            leaf_heights[0],
+            proof.siblings.len() + log2_strict(merkle_cap.0.len())
+        );
 
         let zero = self.zero();
-        let mut state: HashOutTarget = self.hash_or_noop::<H>(leaf_data);
+        let mut state: HashOutTarget = self.hash_or_noop::<H>(leaf_data[0].clone());
         debug_assert_eq!(state.elements.len(), NUM_HASH_OUT_ELTS);
 
+        let mut current_height = leaf_heights[0];
+        let mut leaf_data_index = 1;
         for (&bit, &sibling) in leaf_index_bits.iter().zip(&proof.siblings) {
             debug_assert_eq!(sibling.elements.len(), NUM_HASH_OUT_ELTS);
 
@@ -169,6 +206,86 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 .unwrap();
             state = HashOutTarget {
                 elements: hash_outs,
+            };
+            current_height -= 1;
+
+            if leaf_data_index < leaf_heights.len()
+                && current_height == leaf_heights[leaf_data_index]
+            {
+                let mut new_leaves = state.elements.to_vec();
+                new_leaves.extend_from_slice(&leaf_data[leaf_data_index]);
+                state = self.hash_or_noop::<H>(new_leaves);
+
+                leaf_data_index += 1;
+            }
+        }
+        // Every leaf group must have been injected exactly once (`leaf_heights` consistent
+        // with the walk's span); a miss would leave a group unbound by the cap.
+        assert_eq!(leaf_data_index, leaf_data.len());
+
+        for i in 0..NUM_HASH_OUT_ELTS {
+            let result = self.random_access(
+                cap_index,
+                merkle_cap.0.iter().map(|h| h.elements[i]).collect(),
+            );
+            self.connect(result, state.elements[i]);
+        }
+    }
+
+    /// Like [`Self::verify_merkle_proof_to_cap_with_cap_index`], but for a tree whose depth is
+    /// chosen at proving time within a build-time envelope: `proof` is allocated at the envelope's
+    /// maximum depth and `level_active[p]` gates hashing level `p`.
+    ///
+    /// The proof must be *cap-aligned*: for a tree walk of `d` real levels, the real siblings
+    /// occupy the last `d` slots of `proof.siblings`, so the walk is an idle prefix (the state
+    /// stays at the leaf hash; those levels' bits and siblings are ignored) followed by the real
+    /// climb, ending at the cap. `level_active` covers only the levels that *can* idle — the
+    /// first `hi − lo` of a depth range `[lo, hi]` — and may be shorter than `proof.siblings`;
+    /// the remaining levels are unconditionally active and use no selection gates. Every level
+    /// is hashed regardless, so the hash count is that of the envelope's maximum depth.
+    ///
+    /// Soundness requires the `level_active` prefix shape (zeros then ones) to be enforced by the
+    /// caller (e.g. derived from a one-hot depth selector); the final cap comparison is
+    /// unconditional. An empty `level_active` makes the walk exact.
+    pub fn conditional_verify_merkle_proof_to_cap_with_cap_index<H: AlgebraicHasher<F>>(
+        &mut self,
+        leaf_data: Vec<Target>,
+        leaf_index_bits: &[BoolTarget],
+        level_active: &[BoolTarget],
+        cap_index: Target,
+        merkle_cap: &MerkleCapTarget,
+        proof: &MerkleProofTarget,
+    ) {
+        debug_assert!(H::AlgebraicPermutation::RATE >= NUM_HASH_OUT_ELTS);
+        // Build-time layout invariants: the conditional prefix cannot exceed the walk, and
+        // the walk must consume every sibling to reach the cap. A violation would silently
+        // build a circuit that skips selects or binds the wrong tree level.
+        assert!(level_active.len() <= proof.siblings.len());
+        assert!(leaf_index_bits.len() >= proof.siblings.len());
+
+        let zero = self.zero();
+        let mut state: HashOutTarget = self.hash_or_noop::<H>(leaf_data);
+        debug_assert_eq!(state.elements.len(), NUM_HASH_OUT_ELTS);
+
+        for (p, (&bit, &sibling)) in leaf_index_bits.iter().zip(&proof.siblings).enumerate() {
+            debug_assert_eq!(sibling.elements.len(), NUM_HASH_OUT_ELTS);
+
+            let mut perm_inputs = H::AlgebraicPermutation::default();
+            perm_inputs.set_from_slice(&state.elements, 0);
+            perm_inputs.set_from_slice(&sibling.elements, NUM_HASH_OUT_ELTS);
+            // Ensure the rest of the state, if any, is zero:
+            perm_inputs.set_from_iter(core::iter::repeat(zero), 2 * NUM_HASH_OUT_ELTS);
+            let perm_outs = self.permute_swapped::<H>(perm_inputs, bit);
+            let hash_outs: [Target; NUM_HASH_OUT_ELTS] = perm_outs.squeeze()[0..NUM_HASH_OUT_ELTS]
+                .try_into()
+                .unwrap();
+            state = HashOutTarget {
+                elements: match level_active.get(p) {
+                    Some(&active) => core::array::from_fn(|i| {
+                        self.select(active, hash_outs[i], state.elements[i])
+                    }),
+                    None => hash_outs,
+                },
             };
         }
 

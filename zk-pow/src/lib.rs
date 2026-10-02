@@ -4,3 +4,4 @@ pub mod api;
 pub mod circuit;
 pub mod ffi;
 pub mod v1;
+pub mod v2;

@@ -27,10 +27,12 @@ pub(crate) const BLAKE3_IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
 ];
 
+#[allow(dead_code)] // exercised by this file's tests; the STARK consumer lives in the v1/v2 clones
 pub(crate) const BLAKE3_MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
 /// Apply BLAKE3_MSG_PERMUTATION in-place.
 #[inline(always)]
+#[allow(dead_code)] // exercised by this file's tests; the STARK consumer lives in the v1/v2 clones
 pub(crate) fn blake3_permute_msg<T: Copy>(msg: &mut [T; 16]) {
     // Cycle 1: 0→2→3→10→12→9→11→5→0
     let t = msg[5];

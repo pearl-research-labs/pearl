@@ -1,7 +1,7 @@
 //! Salted (certificate V3) Merkle-root pre-hashing and the seed-derivation
-//! selector. The seed chain lives in `PublicProofParams::commitment_hash`.
+//! selector. The seed chain lives in `v2::api::proof::PublicProofParams::commitment_hash`.
 
-use crate::api::proof::Hash256;
+use crate::api::primitives::Hash256;
 use pearl_blake3::blake3_digest;
 
 /// How the noise seeds are derived from the Merkle roots. Selected by the
@@ -61,7 +61,7 @@ pub fn bind_root_b(hash_b: &Hash256, n: u32) -> Hash256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::proof::{MoEParams, PublicProofParams};
+    use crate::v2::api::proof::{MoEParams, PublicProofParams};
 
     #[test]
     fn seed_salts_match_context_strings() {

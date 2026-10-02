@@ -216,6 +216,12 @@ extern crate alloc;
 
 mod get_challenges;
 
+pub mod batch_proof;
+pub mod batch_prover;
+pub mod batch_recursive_verifier;
+pub mod batch_stark;
+pub mod batch_universal;
+pub mod batch_verifier;
 pub mod config;
 pub mod constraint_consumer;
 pub mod cross_table_lookup;
@@ -230,6 +236,8 @@ pub mod util;
 mod vanishing_poly;
 pub mod verifier;
 
+#[cfg(test)]
+pub mod batch_stark_testing;
 #[cfg(test)]
 pub mod fibonacci_stark;
 #[cfg(test)]
