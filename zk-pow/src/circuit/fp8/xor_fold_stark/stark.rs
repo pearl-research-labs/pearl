@@ -73,7 +73,7 @@ use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsume
 use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
-use super::columns::{XorFoldColumnsView, NUM_XOR_FOLD_COLUMNS, NUM_XOR_FOLD_PUBLIC_INPUTS, SKIP_LIMIT_PUBLIC_INPUT};
+use super::columns::{NUM_XOR_FOLD_COLUMNS, NUM_XOR_FOLD_PUBLIC_INPUTS, SKIP_LIMIT_PUBLIC_INPUT, XorFoldColumnsView};
 use crate::api::layout::JACKPOT_ENTRIES as XOR_FOLD_LANES;
 use crate::circuit::utils::evaluator::Evaluator;
 use crate::circuit::utils::native_evaluator::NativeEvaluator;
@@ -363,9 +363,9 @@ mod tests {
     use super::super::ctl::xor_fold_lut_lookups;
     use super::*;
     use crate::api::fp8::utils::xor_fold_extract;
-    use crate::api::layout::{lane_assignment, AxisPattern, DimType};
-    use crate::circuit::fp8::matmul_b200_stark::columns::MATMUL_B200_COL_MAP;
+    use crate::api::layout::{AxisPattern, DimType, lane_assignment};
     use crate::circuit::fp8::matmul_b200_stark::MatmulStarkB200;
+    use crate::circuit::fp8::matmul_b200_stark::columns::MATMUL_B200_COL_MAP;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;

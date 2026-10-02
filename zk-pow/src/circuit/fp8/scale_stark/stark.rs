@@ -126,14 +126,14 @@ use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
 use super::columns::{
-    FmaBlock, MulBlock, ScaleColumnsView, ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT,
-    DEAD_LIMIT_B_PUBLIC_INPUT, DOS_EXP_PUBLIC_INPUT, DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT,
-    K_PUBLIC_INPUT, L2_SUM_LIMBS, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS, UPPER_BORROW_BITS, WL2_PUBLIC_INPUT,
+    ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT,
+    DOS_EXP_PUBLIC_INPUT, DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT, FmaBlock, K_PUBLIC_INPUT,
+    L2_SUM_LIMBS, MulBlock, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView, UPPER_BORROW_BITS, WL2_PUBLIC_INPUT,
 };
 use crate::api::fp8::compute::{bf16_div, bf16_fma, bf16_max, bf16_mul};
 use crate::api::fp8::dtype::f32_to_bf16;
 use crate::api::fp8::jackpot_policy::JackpotPolicy;
-use crate::api::fp8::prequant::{l2_frame_width, BLOCK_SIZE};
+use crate::api::fp8::prequant::{BLOCK_SIZE, l2_frame_width};
 use crate::api::fp8::public_params::{Device, PublicParams};
 use crate::api::fp8::quantization::{Fp8E4M3Quant, MAX_E4M3, NORM_FLOOR};
 
