@@ -4,8 +4,8 @@
 //! Each live row folds one Matmul cell. The leading class-(a) columns `cell_id`, `lane_id`,
 //! `is_lane_final`, and `is_pad` bind the committed lane layout; the remaining columns hold
 //! the raw f32 cell word, that cell's policy-skip subtotal, the tile-wide running skip count,
-//! the terminal budget slack, the input state, exact 64-bit multiply-add limbs, and rotation
-//! split.
+//! the terminal budget slack, the input state, the multiply-add's high limbs, and its low
+//! word split for rotation.
 //! `0x9E3779B1` and rotation distance 13 are fixed protocol mixing constants.
 
 use crate::circuit::fp8::columns_view::columns_view;
@@ -43,12 +43,9 @@ pub struct XorFoldColumnsView<T: Copy> {
     pub skip_gate_slack_hi: T,
     /// The lane's running fold state entering this row (0 at lane start).
     pub fold_state_in: T,
-    /// 16-bit limbs of the 64-bit multiply-add `FOLD_STATE_IN*0x9E3779B1 + W`, where
-    /// `W = CELL_RESULT_F32_LO + 2^16*CELL_RESULT_F32_HI` is the folded cell word: low half
-    /// (the pre-rotation u32) ...
-    pub muladd_low_limb_0: T,
-    pub muladd_low_limb_1: T,
-    /// ... and high half (the discarded overflow). The cap `MULADD_HIGH_LIMB_1 <= 0xFFFE`
+    /// Two 16-bit limbs of the high 32 bits of `FOLD_STATE_IN*0x9E3779B1 + W`, where
+    /// `W = CELL_RESULT_F32_LO + 2^16*CELL_RESULT_F32_HI`. The low 32 bits are represented
+    /// directly by the rotation fields below. The cap `MULADD_HIGH_LIMB_1 <= 0xFFFE`
     /// (RC16 of `MULADD_HIGH_LIMB_1 + 1`) keeps the recomposition below the Goldilocks modulus
     /// `p = 2^64 - 2^32 + 1`, preventing a `+p` limb alias (the honest top limb is at most
     /// `0x9E38`).
@@ -65,8 +62,8 @@ pub struct XorFoldColumnsView<T: Copy> {
 /// Total number of committed XorFoldStark columns.
 pub const NUM_XOR_FOLD_COLUMNS: usize = size_of::<XorFoldColumnsView<u8>>();
 
-// Committed-column count: 14 main + 4 class (a).
-const _: () = assert!(NUM_XOR_FOLD_COLUMNS == 18);
+// Committed-column count: 12 main + 4 class (a).
+const _: () = assert!(NUM_XOR_FOLD_COLUMNS == 16);
 
 /// Exact tile-wide skip allowance `floor(k*h*w/20)`, derived by the verifier from the public
 /// job dimensions rather than chosen by the prover.

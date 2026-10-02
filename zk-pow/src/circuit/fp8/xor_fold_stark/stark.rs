@@ -11,19 +11,21 @@
 //!
 //! # Integer arithmetic
 //!
-//! The multiply-add fits below `2^63.5`. Constraint group X1 recomposes it as four 16-bit
-//! limbs:
+//! The multiply-add fits below `2^63.5`. Constraint group X1 uses the rotation fields for
+//! its low word and two 16-bit limbs for its high word:
 //!
 //! ```text
-//! mixed = low_0 + 2^16*low_1 + 2^32*high_0 + 2^48*high_1.
+//! low   = bottom19_limb_0 + 2^16*bottom19_limb_1 + 2^19*top13
+//! mixed = low + 2^32*high_0 + 2^48*high_1.
 //! ```
 //!
-//! RC16 bounds every limb, and the top limb is additionally at most
+//! Range checks bound `bottom19_limb_0`, `bottom19_limb_1`, and `top13` to 16, 3, and 13
+//! bits respectively, so `low < 2^32`. Both high limbs are 16-bit, and `high_1` is at most
 //! `0xFFFE = 2^16 - 2`. That cap keeps the reconstructed integer below the Goldilocks modulus
 //! and rules out adding one modulus while preserving the same field equality.
 //!
-//! X2 splits the low 32-bit word into a 13-bit top part and 19-bit bottom part:
-//! `low = top13*2^19 + bottom19`. Therefore rotation by 13 is exactly
+//! X2 reuses this split: `bottom19 = bottom19_limb_0 + 2^16*bottom19_limb_1`.
+//! Therefore rotation by 13 is exactly
 //! `fold_out = bottom19*2^13 + top13`; the numbers 13 and 19 sum to the 32-bit word width.
 //!
 //! # Lane chaining and table boundaries
@@ -71,7 +73,7 @@ use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsume
 use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
-use super::columns::{NUM_XOR_FOLD_COLUMNS, NUM_XOR_FOLD_PUBLIC_INPUTS, SKIP_LIMIT_PUBLIC_INPUT, XorFoldColumnsView};
+use super::columns::{XorFoldColumnsView, NUM_XOR_FOLD_COLUMNS, NUM_XOR_FOLD_PUBLIC_INPUTS, SKIP_LIMIT_PUBLIC_INPUT};
 use crate::api::layout::JACKPOT_ENTRIES as XOR_FOLD_LANES;
 use crate::circuit::utils::evaluator::Evaluator;
 use crate::circuit::utils::native_evaluator::NativeEvaluator;
@@ -144,8 +146,6 @@ impl XorFoldProgram {
                     skip_gate_slack_lo: F::ZERO,
                     skip_gate_slack_hi: F::ZERO,
                     fold_state_in: F::from_canonical_u32(state),
-                    muladd_low_limb_0: F::from_canonical_u32(lo & 0xFFFF),
-                    muladd_low_limb_1: F::from_canonical_u32(lo >> 16),
                     muladd_high_limb_0: F::from_canonical_u32(hi & 0xFFFF),
                     muladd_high_limb_1: F::from_canonical_u32(hi >> 16),
                     rotation_input_top13: F::from_canonical_u32(lo >> 19),
@@ -206,7 +206,7 @@ impl XorFoldProgram {
     }
 }
 
-/// Evaluates the X1-X4 constraint groups (module docs). The 12 RC16 facts (limbs, split
+/// Evaluates the X1-X4 constraint groups (module docs). The 10 RC16 facts (limbs, split
 /// bounds, the `MULADD_HIGH_LIMB_1` canonicity cap, and budget-slack limbs) live in
 /// `super::ctl::xor_fold_lut_lookups`.
 pub(crate) fn eval_xor_fold_constraints<V, S, E>(
@@ -225,6 +225,13 @@ pub(crate) fn eval_xor_fold_constraints<V, S, E>(
     let one = eval.u64(1);
     let two16 = eval.u64(1 << 16);
 
+    // The rotation fields directly represent the low 32 bits. Their 16-, 3-, and 13-bit
+    // bounds imply 0 <= low_word < 2^32, without separate low-word limb columns.
+    let two19 = eval.u64(1 << 19);
+    let bottom19_high = eval.mul(two16, lv.rotation_input_bottom19_limb_1);
+    let bottom19 = eval.add(lv.rotation_input_bottom19_limb_0, bottom19_high);
+    let low_word = eval.mad(lv.rotation_input_top13, two19, bottom19);
+
     // X1 — multiply-add split: FOLD_STATE_IN*0x9E3779B1 + W = HI*2^32 + LO over the integers.
     // The honest value is < 2^63.5 (no field wrap); the MULADD_HIGH_LIMB_1 <= 0xFFFE cap
     // (RC16 inventory) keeps the limb side below p too — without it every row with value
@@ -234,23 +241,14 @@ pub(crate) fn eval_xor_fold_constraints<V, S, E>(
     let w_hi = eval.mul(two16, lv.cell_result_f32_hi);
     let w = eval.add(lv.cell_result_f32_lo, w_hi);
     let muladd = eval.mad(lv.fold_state_in, golden, w);
-    let lo_1 = eval.mul(two16, lv.muladd_low_limb_1);
-    let lo = eval.add(lv.muladd_low_limb_0, lo_1);
     let hi_1 = eval.mul(two16, lv.muladd_high_limb_1);
     let hi = eval.add(lv.muladd_high_limb_0, hi_1);
-    let limbs = eval.mad(hi, two32, lo);
+    let limbs = eval.mad(hi, two32, low_word);
     eval.constraint_eq(muladd, limbs);
 
-    // X2 — rotl32 by 13 is a pure re-split of the low word: LO = TOP13*2^19 + BOT19.
-    let two19 = eval.u64(1 << 19);
-    let bot19_1 = eval.mul(two16, lv.rotation_input_bottom19_limb_1);
-    let bot19 = eval.add(lv.rotation_input_bottom19_limb_0, bot19_1);
-    let split = eval.mad(lv.rotation_input_top13, two19, bot19);
-    eval.constraint_eq(lo, split);
-
-    // The rotated word: FOLD_OUT = BOT19*2^13 + TOP13 (affine, not a column).
+    // X2 — rotating the low word left by 13 gives BOTTOM19*2^13 + TOP13 (an expression).
     let two13 = eval.u64(1 << 13);
-    let fold_out = eval.mad(bot19, two13, lv.rotation_input_top13);
+    let fold_out = eval.mad(bottom19, two13, lv.rotation_input_top13);
 
     // X3 — chaining: 0 entering the first row; a lane-final row resets the next row's state;
     // otherwise the state chains. The next-row constraints are plain (cyclic): on the wrap pair
@@ -365,9 +363,9 @@ mod tests {
     use super::super::ctl::xor_fold_lut_lookups;
     use super::*;
     use crate::api::fp8::utils::xor_fold_extract;
-    use crate::api::layout::{AxisPattern, DimType, lane_assignment};
-    use crate::circuit::fp8::matmul_b200_stark::MatmulStarkB200;
+    use crate::api::layout::{lane_assignment, AxisPattern, DimType};
     use crate::circuit::fp8::matmul_b200_stark::columns::MATMUL_B200_COL_MAP;
+    use crate::circuit::fp8::matmul_b200_stark::MatmulStarkB200;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -635,8 +633,6 @@ mod tests {
             assert_eq!(v.fold_state_in, F::ZERO);
             let t = to_u64(v.cell_result_f32_lo) | (to_u64(v.cell_result_f32_hi) << 16);
             let lo = (t + 1) as u32;
-            v.muladd_low_limb_0 = F::from_canonical_u32(lo & 0xFFFF);
-            v.muladd_low_limb_1 = F::from_canonical_u32(lo >> 16);
             v.muladd_high_limb_0 = F::from_canonical_u32(0xFFFF);
             v.muladd_high_limb_1 = F::from_canonical_u32(0xFFFF);
             v.rotation_input_top13 = F::from_canonical_u32(lo >> 19);
@@ -654,8 +650,6 @@ mod tests {
             let (lo, hi) = (t as u32, (t >> 32) as u32);
             let v: &mut XorFoldColumnsView<F> = forged[step].borrow_mut();
             v.fold_state_in = F::from_canonical_u32(state);
-            v.muladd_low_limb_0 = F::from_canonical_u32(lo & 0xFFFF);
-            v.muladd_low_limb_1 = F::from_canonical_u32(lo >> 16);
             v.muladd_high_limb_0 = F::from_canonical_u32(hi & 0xFFFF);
             v.muladd_high_limb_1 = F::from_canonical_u32(hi >> 16);
             v.rotation_input_top13 = F::from_canonical_u32(lo >> 19);
@@ -675,6 +669,47 @@ mod tests {
     }
 
     #[test]
+    fn rotation_fields_reject_modular_aliases_of_the_low_word() {
+        // Each lane has one row, so a forged rotation cannot be rejected merely by a
+        // downstream state mismatch. These aliases preserve X1 and the scaled range check;
+        // only the unscaled range check rejects the forged rotation field.
+        let cases = [
+            (
+                XOR_FOLD_COL_MAP.rotation_input_top13,
+                7u32 << 16,
+                F::from_canonical_u64(7) / F::from_canonical_u64(8),
+            ),
+            (
+                XOR_FOLD_COL_MAP.rotation_input_bottom19_limb_1,
+                8191u32 << 3,
+                F::from_canonical_u64(8191) / F::from_canonical_u64(1 << 13),
+            ),
+        ];
+        for (column, word, alias) in cases {
+            let program = XorFoldProgram {
+                lanes: (0..16).map(|j| vec![j]).collect(),
+                skip_limit: 0,
+            };
+            let (mut rows, pis) = program.generate_trace::<F>(&[word; 16], &[0; 16]);
+            let row: &mut XorFoldColumnsView<F> = rows[0].borrow_mut();
+            row.rotation_input_top13 = F::ZERO;
+            row.rotation_input_bottom19_limb_0 = F::ZERO;
+            row.rotation_input_bottom19_limb_1 = F::ZERO;
+            rows[0][column] = alias;
+            assert!(alias.to_canonical_u64() >= 1 << 16);
+            assert!(!constraints_violated(&S::new(program), &rows, &pis));
+
+            let polys = trace_rows_to_poly_values(rows);
+            let failing_checks: Vec<_> = xor_fold_lut_lookups::<F>()
+                .iter()
+                .filter(|lookup| lookup.keys[0].eval_table(&polys, 0, &[]).to_canonical_u64() >= 1 << 16)
+                .map(|lookup| lookup.keys[0].eval_table(&polys, 0, &[]))
+                .collect();
+            assert_eq!(failing_checks, vec![alias], "the unscaled check must reject the alias");
+        }
+    }
+
+    #[test]
     fn tampered_traces_fail() {
         let (program, rows, pis) = test_trace();
         let stark = S::new(program);
@@ -683,8 +718,16 @@ mod tests {
             ("fold_state_in", XOR_FOLD_COL_MAP.fold_state_in),
             // The folded word itself (X1 breaks).
             ("cell_result_f32_lo", XOR_FOLD_COL_MAP.cell_result_f32_lo),
-            // The rotation split (X2 breaks).
+            // Each part of the low word is bound by X1.
             ("rotation_input_top13", XOR_FOLD_COL_MAP.rotation_input_top13),
+            (
+                "rotation_input_bottom19_limb_0",
+                XOR_FOLD_COL_MAP.rotation_input_bottom19_limb_0,
+            ),
+            (
+                "rotation_input_bottom19_limb_1",
+                XOR_FOLD_COL_MAP.rotation_input_bottom19_limb_1,
+            ),
             // A mid-lane final flag (0 -> 1): the reset forces the next state to 0 (false here).
             ("is_lane_final", XOR_FOLD_COL_MAP.is_lane_final),
         ];
