@@ -278,17 +278,8 @@ pub struct AuxiliaryCvLocation {
     pub source: ProofSource,
 }
 
-/// 64-byte row indices into the unpadded `m × top_k × 4` routing byte layout for each inner A-row index.
-pub fn routing_blake_hotspot_rows(routing_start_offset: u32, inner_indices: &[u32]) -> Vec<u32> {
-    let mut hotspots: Vec<u32> = inner_indices
-        .iter()
-        .map(|&i| ((routing_start_offset as u64 + i as u64) * 4 / BLOCK_LEN as u64) as u32)
-        .collect();
-
-    hotspots.sort_unstable();
-    hotspots.dedup();
-    hotspots
-}
+// Reuse the frozen implementation; v4 adds no version-specific rules here.
+pub use crate::v2::circuit::chip::blake3::program::routing_blake_hotspot_rows;
 
 impl BlakeProgram {
     /// Compile the ONE Blake membership program of a proof, derived entirely

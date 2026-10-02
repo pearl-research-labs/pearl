@@ -8,42 +8,8 @@ use crate::v4::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMs
 
 use pearl_blake3::blake3_digest;
 
-/// Convert Bitcoin's compact nbits format to an absolute difficulty target as U256
-///
-/// Bitcoin's nbits is a compact representation where:
-/// - First byte is the exponent (number of bytes in the full target)
-/// - Last 3 bytes are the mantissa (the significant digits)
-///
-/// The formula is: target = mantissa * 256^(exponent - 3)
-pub fn nbits_to_difficulty(nbits: u32) -> U256 {
-    // Extract exponent (first byte) and mantissa (last 3 bytes)
-    let exponent = (nbits >> 24) as usize;
-    let mantissa = nbits & 0x00ffffff;
-
-    // Handle edge case where mantissa is 0
-    if mantissa == 0 || exponent == 0 {
-        return U256::zero();
-    }
-
-    // Check for negative bit (0x00800000) - Bitcoin treats this as invalid/negative
-    if mantissa & 0x00800000 != 0 {
-        return U256::zero(); // Invalid/negative target
-    }
-
-    // Convert mantissa to U256
-    let mut target = U256::from(mantissa);
-
-    // Apply the exponent
-    if exponent <= 3 {
-        // Shift right
-        target >>= 8 * (3 - exponent);
-    } else {
-        // Shift left
-        target <<= 8 * (exponent - 3);
-    }
-
-    target
-}
+// Reuse the frozen implementation; v4 adds no version-specific rules here.
+pub use crate::v2::api::proof_utils::nbits_to_difficulty;
 
 impl IncompleteBlockHeader {
     /// Size of serialized IncompleteBlockHeader in bytes.

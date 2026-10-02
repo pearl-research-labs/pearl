@@ -9,10 +9,10 @@ use primitive_types::U256;
 use zk_pow::ffi::CertificateVersion;
 use zk_pow::v2::api::sanity_checks;
 use zk_pow::v2::api::seed::SeedDerivation;
-use zk_pow::v2::ffi::plain_proof::PlainProof;
+use zk_pow::v2::ffi::plain_proof::{MatrixMerkleProof, MoEProofParams, PlainProof};
 
 use zk_pow::v2::api::proof as v2_proof;
-use zk_pow::v2::api::proof::{MiningConfiguration, PublicProofParams, ZKProof};
+use zk_pow::v2::api::proof::{MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, PublicProofParams, ZKProof};
 use zk_pow::v2::api::{prove, verify};
 use zk_pow::v2::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
 use zk_pow::v2::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
@@ -277,4 +277,56 @@ pub fn mine_moe(
         seed_derivation_for(cert_version)?,
     )
     .map_err(|e| py_err("MoE mining failed", e))
+}
+
+pub fn register_constants(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("PUBLICDATA_SIZE", PublicProofParams::WIRE_SIZE)?;
+    m.add(
+        "MIN_MOE_PUBLICDATA_SIZE",
+        PublicProofParams::MIN_MOE_WIRE_SIZE,
+    )?;
+    m.add("PUBLICDATA_MAX_SIZE", PublicProofParams::MAX_WIRE_SIZE)?;
+    m.add(
+        "PENALTY_BASE_RANK",
+        zk_pow::v2::api::sanity_checks::PENALTY_BASE_RANK,
+    )?;
+    Ok(())
+}
+
+pub fn register_pattern(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PeriodicPattern>()?;
+    Ok(())
+}
+
+pub fn register_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<MiningConfiguration>()?;
+    m.add_class::<MoEConfig>()?;
+    m.add_class::<MMAType>()?;
+    m.add_class::<MatrixMerkleProof>()?;
+    m.add_class::<PlainProof>()?;
+    Ok(())
+}
+
+pub fn register_moe_proof_params(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<MoEProofParams>()?;
+    Ok(())
+}
+
+pub fn register_mining(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(mine, m)?)?;
+    m.add_function(wrap_pyfunction!(mine_moe, m)?)?;
+    m.add_function(wrap_pyfunction!(penalized_target_bound, m)?)?;
+    Ok(())
+}
+
+pub fn register_proofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(generate_proof_v2, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_proof_v2, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_plain_proof_v2, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_circuit_cache_v2, m)?)?;
+    m.add_function(wrap_pyfunction!(warmup_prove_v2, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_proof_v3, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_proof_v3, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_plain_proof_v3, m)?)?;
+    Ok(())
 }

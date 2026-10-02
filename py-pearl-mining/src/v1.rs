@@ -120,3 +120,16 @@ pub fn clear_v1_circuit_cache() -> PyResult<()> {
     acquire_v1_cache()?.clear();
     Ok(())
 }
+
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(
+        "V1_PUBLICDATA_SIZE",
+        v1_proof::PublicProofParams::PUBLICDATA_SIZE,
+    )?;
+    m.add_function(wrap_pyfunction!(generate_proof_v1, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_proof_v1, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_plain_proof_v1, m)?)?;
+    m.add_function(wrap_pyfunction!(warmup_prove_v1, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_v1_circuit_cache, m)?)?;
+    Ok(())
+}

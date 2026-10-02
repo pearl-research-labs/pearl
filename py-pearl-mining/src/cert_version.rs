@@ -127,3 +127,18 @@ fn extract_v4(plain_proof: &Bound<'_, PyAny>) -> PyResult<PlainProofV4> {
         pyo3::exceptions::PyTypeError::new_err("certificate version 4 requires PlainProofV4")
     })
 }
+
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("CERT_VERSION_ZK_DENSE", CertificateVersion::ZkDense as u32)?;
+    m.add("CERT_VERSION_ZK_MOE", CertificateVersion::ZkMoe as u32)?;
+    m.add("CERT_VERSION_ZK_V3", CertificateVersion::ZkV3 as u32)?;
+    m.add(
+        "CERT_VERSION_PLAIN_FP8",
+        CertificateVersion::PlainFp8 as u32,
+    )?;
+    m.add_function(wrap_pyfunction!(py_check_cert_version_eligible, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_proof_for_cert_version, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_proof_for_cert_version, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_plain_proof_for_cert_version, m)?)?;
+    Ok(())
+}

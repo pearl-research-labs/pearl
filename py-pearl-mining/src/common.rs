@@ -1,6 +1,7 @@
 //! Python-facing pieces shared by every version module.
 
-use pearl_blake3::pad_to_chunk_boundary;
+use blake3::CHUNK_LEN;
+use pearl_blake3::{MerkleProof, MerkleTree, pad_to_chunk_boundary};
 use pyo3::prelude::*;
 use zk_pow::v2::api::proof::PublicProofParams;
 
@@ -50,4 +51,30 @@ impl PyProof {
 #[pyo3(name = "pad_to_chunk_boundary")]
 pub fn py_pad_to_chunk_boundary(data: &[u8]) -> Vec<u8> {
     pad_to_chunk_boundary(data)
+}
+
+pub fn register_constants(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("MERKLE_LEAF_SIZE", CHUNK_LEN)?;
+    Ok(())
+}
+
+pub fn register_merkle_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<MerkleTree>()?;
+    m.add_class::<MerkleProof>()?;
+    Ok(())
+}
+
+pub fn register_header(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<IncompleteBlockHeader>()?;
+    Ok(())
+}
+
+pub fn register_proof_type(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyProof>()?;
+    Ok(())
+}
+
+pub fn register_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(py_pad_to_chunk_boundary, m)?)?;
+    Ok(())
 }
