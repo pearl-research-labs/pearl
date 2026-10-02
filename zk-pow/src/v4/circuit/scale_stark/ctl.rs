@@ -19,10 +19,11 @@ use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
 use super::super::ctl::Table;
-use super::super::luts::LutTable;
 use super::super::luts::ctl::LutLookup;
+use super::super::luts::LutTable;
 use super::columns::{
-    ALIGNED_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT, L2_SUM_LIMBS, SCALE_COL_MAP,
+    ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT, L2_SUM_LIMBS,
+    SCALE_COL_MAP,
 };
 use super::stark::ScaleProgram;
 
@@ -36,9 +37,11 @@ use super::stark::ScaleProgram;
 /// SIGMA_ENC, SIGMA_NORM)`, filter `1 - IS_PAD` — every live Scale row consumes exactly one
 /// InputQuant group; the power-of-two padding rows consume none (their tuple columns carry
 /// the canonical zero-row fill, which T2 ignores).
+/// The three beta components come directly from `beta_scale_multiply`'s output columns.
 ///
-/// Two components are not Scale columns but affine expressions the channel itself binds:
+/// Three components are not Scale columns but affine expressions the channel itself binds:
 ///
+/// - `MAX_ABS = 128*LINF_EXP + LINF_MANTISSA`, the decoded maximum's bf16 encoding;
 /// - `DEAD_BOUND` is the device-specific BF16 code of `tau_idle * delta * l2f`;
 /// - `SIGMA_ENC = ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_SIG_IS_WIDE + offset(device) = e(sigma) + 268`
 ///   (S2, jackpot check 4) — the row's exact sigma encoding
@@ -52,18 +55,17 @@ use super::stark::ScaleProgram;
 /// same 13-component order).
 pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWithColumns<F> {
     let m = &SCALE_COL_MAP;
-    let mut columns: Vec<Column<F>> = Column::singles([
-        m.group_key,
-        m.l2_frame_sum,
-        m.frame_doubled_scale_exponent,
-        m.max_abs,
-        m.alpha_exp,
-        m.alpha_mantissa,
-        m.beta_exp,
-        m.beta_mantissa,
-        m.beta_exp_is_zero,
-    ])
-    .collect();
+    let mut columns = vec![
+        Column::single(m.group_key),
+        Column::single(m.l2_frame_sum),
+        Column::single(m.frame_doubled_scale_exponent),
+        Column::linear_combination([(m.linf_exp, F::from_canonical_u64(128)), (m.linf_mantissa, F::ONE)]),
+        Column::single(m.alpha_exp),
+        Column::single(m.alpha_mantissa),
+        Column::single(m.beta_scale_multiply.out_exp),
+        Column::single(m.beta_scale_multiply.out_mantissa),
+        Column::single(m.beta_scale_multiply.out_exp_is_zero),
+    ];
     columns.push(Column::linear_combination_with_constant(
         [
             (m.l2_floored_exponent, F::from_canonical_u64(128)),
@@ -99,8 +101,8 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
     let m = &SCALE_COL_MAP;
     let one = F::ONE;
     let neg = -F::ONE;
-    let limb_shift = F::from_canonical_u64(1 << 16);
-    let neg_limb_shift = -limb_shift;
+    let limb_base = F::from_canonical_u64(1 << 16);
+    let neg_limb_base = -limb_base;
     let half = F::TWO.inverse();
     let mut lookups: Vec<LutLookup<F>> = Vec::new();
 
@@ -113,9 +115,9 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         F::from_canonical_u64(4),
     )])));
 
-    // ---- Q3: claim decode — EXPINFO (flag + exponent domain) and the mantissa/half pair.
-    // Deviation: the pair is (SQRT_MANTISSA, SQRT_MANTISSA_HALF), not the printed
-    // (SQRT_MANTISSA, 0) — HALF must be ranged for Q4's parity split to be two-sided. ----
+    // ---- Q3: range-check the exponent, mantissa, and mantissa-half witness.
+    // Checking HALF as well as MANTISSA makes Q4's equation
+    // MANTISSA = 2*HALF + PARITY exact over integers, preventing field wraparound. ----
     lookups.push(LutLookup {
         table: LutTable::ExpInfo,
         keys: vec![Column::single(m.sqrt_exp)],
@@ -150,8 +152,10 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         )])));
     }
 
-    // ---- Q5: the mod-16 shift residue r2 in [0, 15]: POW2D pins r2 >= 0 (key domain) and the
-    // power; RC16(15 - r2) the cap. ----
+    // ---- Q5: bound the extra left shift of l2_frame_sum to 0..15 bits.
+    // With r2 = sum_shift_remainder, POW2D permits r2 in 0..19 and fixes sum_shift_power
+    // to 2^r2. Range-checking 15-r2 excludes r2 > 15, whose negative difference wraps
+    // outside the 16-bit range. ----
     lookups.push(LutLookup {
         table: LutTable::Pow2D,
         keys: vec![Column::single(m.sum_shift_remainder)],
@@ -172,73 +176,71 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         lookups.push(LutLookup::rc16(Column::single(m.shifted_sum_carries[i])));
     }
 
-    // ---- Q8: the two borrow chains as per-digit affine RC16 keys. Digit ranges force each
-    // borrow bit and make the telescoped comparison exact over Z (no negative-difference alias:
-    // every digit is small, so the field equation is the integer equation).
-    //
-    // Layout (with the +32 rebias): 8 positions. Shifted sum SS8 = [0, 0, SS_0..SS_3,
-    // SHIFTED_SUM_CARRIES_3, 0] (i.e. SS * 2^32, positions 2..=6), aligned boundaries
-    // ACL8/ACU8 = [0, AC_0..AC_6] (positions 1..=7, limb offset q in {0..4}).
-    //
-    // LEFT (aligned lower boundary + ODD <= SS * 2^32): minuend SS8, subtrahend ACL8, ODD
-    // subtracted at digit 0:
-    //   digit_0 = -ODD + 2^16*BL_0                                  (both arrays 0 at position 0)
-    //   digit_i = SS8_i - ACL_{i-1} - BL_{i-1} + 2^16*BL_i          (i = 1..=6)
-    //   digit_7 = -ACL_6 - BL_6                                     (top: no borrow out; SS8_7 = 0)
-    // (digit_7 forces ACL_6 = BL_6 = 0 — an accepted lower arm never carries a borrow past the
-    // shifted sum's span, and a nonzero top aligned limb means the claim side exceeds
-    // SS * 2^32 < 2^109 outright; see stark.rs.) ----
-    let ss8 = |i: usize| -> Option<usize> {
-        match i {
-            0 | 1 | 7 => None, // structural zeros of SS * 2^32
-            2..=5 => Some(m.shifted_sum_limbs[i - 2]),
+    // ---- Q8: prove lower_bound + parity <= scaled_sum <= upper_bound - parity.
+    // scaled_sum = l2_frame_sum * 2^(32 + sum_shift_remainder); parity = sqrt_mantissa_parity.
+    // lower_bound and upper_bound are encoded by aligned_lower/upper_boundary_limbs,
+    // whose array entry i occupies position i+1; their position 0 is zero.
+    let scaled_sum_limb_column = |limb_position: usize| -> Option<usize> {
+        match limb_position {
+            0 | 1 | 7 => None, // two low zeros from the 2^32 shift; the top digit is also zero
+            2..=5 => Some(m.shifted_sum_limbs[limb_position - 2]),
             6 => Some(m.shifted_sum_carries[3]),
             _ => unreachable!(),
         }
     };
+    // Lower difference = scaled_sum - lower_bound - sqrt_mantissa_parity.
+    // scaled_sum_digit[i] reads the column selected by scaled_sum_limb_column(i), or 0 if absent:
+    //   digit[0] = -sqrt_mantissa_parity + 2^16*lower_comparison_borrows[0]
+    //   digit[i] = scaled_sum_digit[i] - aligned_lower_boundary_limbs[i-1]
+    //              - lower_comparison_borrows[i-1] + 2^16*lower_comparison_borrows[i]  (i=1..5)
+    //   digit[6] = scaled_sum_digit[6] - aligned_lower_boundary_limbs[5] - lower_comparison_borrows[5]
+    // Position 6 has no outgoing borrow: a negative final digit must be rejected.
+    // Both operands' position-7 digits are zero; stark.rs enforces this for the lower boundary.
     lookups.push(LutLookup::rc16(Column::linear_combination([
         (m.sqrt_mantissa_parity, neg),
-        (m.lower_comparison_borrows[0], limb_shift),
+        (m.lower_comparison_borrows[0], limb_base),
     ])));
-    for i in 1..=6 {
-        let mut terms = vec![
-            (m.aligned_lower_boundary_limbs[i - 1], neg),
-            (m.lower_comparison_borrows[i - 1], neg),
-            (m.lower_comparison_borrows[i], limb_shift),
+    for limb_position in 1..=ALIGNED_LOWER_LIMBS {
+        let mut lower_difference_terms = vec![
+            (m.aligned_lower_boundary_limbs[limb_position - 1], neg),
+            (m.lower_comparison_borrows[limb_position - 1], neg),
         ];
-        if let Some(ss) = ss8(i) {
-            terms.push((ss, one));
+        if let Some(&outgoing_borrow_column) = m.lower_comparison_borrows.get(limb_position) {
+            lower_difference_terms.push((outgoing_borrow_column, limb_base));
         }
-        lookups.push(LutLookup::rc16(Column::linear_combination(terms)));
+        if let Some(scaled_sum_column) = scaled_sum_limb_column(limb_position) {
+            lower_difference_terms.push((scaled_sum_column, one));
+        }
+        lookups.push(LutLookup::rc16(Column::linear_combination(lower_difference_terms)));
     }
-    lookups.push(LutLookup::rc16(Column::linear_combination([
-        (m.aligned_lower_boundary_limbs[ALIGNED_LIMBS - 1], neg),
-        (m.lower_comparison_borrows[6], neg),
-    ])));
-    // RIGHT (SS * 2^32 + ODD <= aligned upper boundary): minuend ACU8, subtrahend SS8, ODD at
-    // digit 0:
-    //   digit_0 = -ODD + 2^16*BR_0
-    //   digit_i = ACU_{i-1} - SS8_i - BR_{i-1} + 2^16*BR_i          (i = 1..=6)
-    //   digit_7 = ACU_6 - BR_6
+    // Upper difference = upper_bound - scaled_sum - sqrt_mantissa_parity.
+    //   digit[0] = -sqrt_mantissa_parity + 2^16*upper_comparison_borrows[0]
+    //   digit[i] = aligned_upper_boundary_limbs[i-1] - scaled_sum_digit[i]
+    //              - upper_comparison_borrows[i-1] + 2^16*upper_comparison_borrows[i]  (i=1..6)
+    //   digit[7] = aligned_upper_boundary_limbs[6] - upper_comparison_borrows[6]
+    // Again there is no outgoing borrow at position 7.
     lookups.push(LutLookup::rc16(Column::linear_combination([
         (m.sqrt_mantissa_parity, neg),
-        (m.upper_comparison_borrows[0], limb_shift),
+        (m.upper_comparison_borrows[0], limb_base),
     ])));
-    for i in 1..=6 {
-        let mut terms = vec![
-            (m.aligned_upper_boundary_limbs[i - 1], one),
-            (m.upper_comparison_borrows[i - 1], neg),
-            (m.upper_comparison_borrows[i], limb_shift),
+    for limb_position in 1..=6 {
+        let mut upper_difference_terms = vec![
+            (m.aligned_upper_boundary_limbs[limb_position - 1], one),
+            (m.upper_comparison_borrows[limb_position - 1], neg),
+            (m.upper_comparison_borrows[limb_position], limb_base),
         ];
-        if let Some(ss) = ss8(i) {
-            terms.push((ss, neg));
+        if let Some(scaled_sum_column) = scaled_sum_limb_column(limb_position) {
+            upper_difference_terms.push((scaled_sum_column, neg));
         }
-        lookups.push(LutLookup::rc16(Column::linear_combination(terms)));
+        lookups.push(LutLookup::rc16(Column::linear_combination(upper_difference_terms)));
     }
     lookups.push(LutLookup::rc16(Column::linear_combination([
-        (m.aligned_upper_boundary_limbs[ALIGNED_LIMBS - 1], one),
+        (m.aligned_upper_boundary_limbs[ALIGNED_UPPER_LIMBS - 1], one),
         (m.upper_comparison_borrows[6], neg),
     ])));
+
+    // ---- G1: the snap quotient, RC16'd so the snap equations are integer equations. ----
+    lookups.push(LutLookup::rc16(Column::single(m.grid_snap_quotient)));
 
     // ---- G2: the snap remainder window, two-sided. ----
     lookups.push(LutLookup::rc16(Column::single(m.grid_snap_remainder)));
@@ -269,9 +271,6 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         values: vec![Column::single(m.linf_exp_is_zero)],
         filter: Filter::default(),
     });
-
-    // ---- G1: the snap quotient, RC16'd so the snap equations are integer equations. ----
-    lookups.push(LutLookup::rc16(Column::single(m.grid_snap_quotient)));
 
     // ---- H0: the two norm-floor MAXes' order slacks (l2 and linf vs 2^-32; the muxes are
     // arithmetic constraints). ----
@@ -321,11 +320,11 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         (m.noised_bound_fma.compression_quotient_lsb, -half),
     ])));
 
-    // ---- H1, W10 (deviation): ROUNDING_SIGNIFICAND_KEY < 2^17 via the committed high bit — the RNERND key's
+    // ---- H1, W10: ROUNDING_SIGNIFICAND_KEY < 2^17 via the committed high bit — the RNERND key's
     // cut-slot aliasing fix (module docs). ----
     lookups.push(LutLookup::rc16(Column::linear_combination([
         (m.noised_bound_fma.rounding_significand_key, one),
-        (m.noised_bound_fma.rounding_significand_key_high_bit, neg_limb_shift),
+        (m.noised_bound_fma.rounding_significand_key_high_bit, neg_limb_base),
     ])));
 
     // ---- H1, W11: the cut depth and the shared RNE back-end. ----
@@ -516,9 +515,14 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
 #[cfg(test)]
 mod tests {
     use plonky2::field::goldilocks_field::GoldilocksField;
+    use starky::cross_table_lookup::{debug_utils::check_ctls, CrossTableLookup};
+    use starky::util::trace_rows_to_poly_values;
 
     use super::*;
     use crate::v4::api::public_params::Device;
+    use crate::v4::circuit::consistency::build_fixture;
+    use crate::v4::circuit::ctl::NUM_TABLES;
+    use crate::v4::circuit::input_quant_stark::ctl::ctl_group_tuples_looking_input_quant;
 
     type F = GoldilocksField;
 
@@ -528,10 +532,69 @@ mod tests {
 
     #[test]
     fn scale_ctl_looked_half_is_well_formed() {
-        // 12 tuple components, filter 1 - IS_PAD (padding rows consume no tuple).
+        // 13 tuple components, filter 1 - IS_PAD (padding rows consume no tuple).
         let looked = ctl_looked_scale_group_tuple::<F>(&test_program());
         // TableWithColumns exposes no accessors; construction itself checks the column algebra.
         let _ = looked;
+    }
+
+    #[test]
+    fn group_lookup_binds_linf_fields_to_input_quant_maximum() {
+        let fixture = build_fixture(false);
+        let ctl = CrossTableLookup::new(
+            ctl_group_tuples_looking_input_quant(),
+            vec![ctl_looked_scale_group_tuple(&fixture.scale)],
+        );
+        let mut traces = vec![Vec::new(); NUM_TABLES];
+        traces[Table::InputQuant as usize] = trace_rows_to_poly_values(fixture.iq_rows);
+        traces[Table::Scale as usize] = trace_rows_to_poly_values(fixture.scale_rows);
+        let ctls = [ctl];
+        check_ctls(&traces, &fixture.public_inputs, &ctls, &Default::default());
+
+        // InputQuant's maximum stays fixed. Changing either decoded field must
+        // break the group lookup, even though Scale has no separate max_abs column.
+        for column in [SCALE_COL_MAP.linf_exp, SCALE_COL_MAP.linf_mantissa] {
+            let mut tampered = traces.clone();
+            let value = &mut tampered[Table::Scale as usize][column].values[0];
+            *value = if *value == F::ZERO { F::ONE } else { *value - F::ONE };
+            assert!(
+                std::panic::catch_unwind(|| {
+                    check_ctls(&tampered, &fixture.public_inputs, &ctls, &Default::default());
+                })
+                .is_err(),
+                "a different linf encoding must not match InputQuant's maximum"
+            );
+        }
+    }
+
+    #[test]
+    fn group_lookup_binds_beta_multiply_outputs_to_input_quant() {
+        let fixture = build_fixture(false);
+        let ctl = CrossTableLookup::new(
+            ctl_group_tuples_looking_input_quant(),
+            vec![ctl_looked_scale_group_tuple(&fixture.scale)],
+        );
+        let mut traces = vec![Vec::new(); NUM_TABLES];
+        traces[Table::InputQuant as usize] = trace_rows_to_poly_values(fixture.iq_rows);
+        traces[Table::Scale as usize] = trace_rows_to_poly_values(fixture.scale_rows);
+        let ctls = [ctl];
+        check_ctls(&traces, &fixture.public_inputs, &ctls, &Default::default());
+
+        // Hold InputQuant's beta claim fixed. Each multiplication output must match it
+        // through the group lookup, including the exponent-zero classification.
+        let beta = &SCALE_COL_MAP.beta_scale_multiply;
+        for column in [beta.out_exp, beta.out_mantissa, beta.out_exp_is_zero] {
+            let mut tampered = traces.clone();
+            let value = &mut tampered[Table::Scale as usize][column].values[0];
+            *value = if *value == F::ZERO { F::ONE } else { *value - F::ONE };
+            assert!(
+                std::panic::catch_unwind(|| {
+                    check_ctls(&tampered, &fixture.public_inputs, &ctls, &Default::default());
+                })
+                .is_err(),
+                "changing beta output column {column} must break the group lookup"
+            );
+        }
     }
 
     #[test]
@@ -539,14 +602,14 @@ mod tests {
         let lookups = scale_lut_lookups::<F>(&test_program());
         let count = |t: LutTable| lookups.iter().filter(|l| l.table == t).count();
         // Inventory documented by `scale_lut_lookups`:
-        // RC16 x63, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, DIV448 x1.
-        assert_eq!(count(LutTable::Range16), 63);
+        // RC16 x62, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, DIV448 x1.
+        assert_eq!(count(LutTable::Range16), 62);
         assert_eq!(count(LutTable::Pair128), 3);
         assert_eq!(count(LutTable::ExpInfo), 3);
         assert_eq!(count(LutTable::Clamp22), 3);
         assert_eq!(count(LutTable::Pow2D), 3);
         assert_eq!(count(LutTable::RneRnd), 3);
         assert_eq!(count(LutTable::Div448), 1);
-        assert_eq!(lookups.len(), 79);
+        assert_eq!(lookups.len(), 78);
     }
 }

@@ -28,12 +28,16 @@ pub const L2_SUM_LIMBS: usize = 4;
 /// 16-bit limbs of the shifted claim-side midpoint products `B^2 * k * 2^15 < 2^53` (their limb
 /// 0 is provably zero and not committed — `k` is a multiple of 32, so `2^20 | B^2*k*2^15`).
 pub const CLAIM_LIMBS: usize = 3;
-/// Aligned claim-side limb positions `1..=7` (position 0 is provably zero); the borrow chains
-/// compare `ALIGNED_LIMBS + 1 = 8` limb positions. In the chains the shifted sum `SS` rides at
-/// the fixed +2-limb offset (the Q5 rebias's `2^32`), i.e. positions 2..=6.
-pub const ALIGNED_LIMBS: usize = 7;
-/// Borrow bits per chain (positions `0..=6`; position 7 admits no borrow-out).
-pub const BORROW_BITS: usize = 7;
+/// Stored lower-bound digits at positions `1..=6`; Q8 constrains position 7 to zero.
+/// Position 0 is zero because the unaligned boundary product is divisible by `2^16`.
+pub const ALIGNED_LOWER_LIMBS: usize = 6;
+/// Stored upper-bound digits at positions `1..=7`; position 0 is zero.
+/// The scaled sum occupies positions `2..=6` in both comparisons.
+pub const ALIGNED_UPPER_LIMBS: usize = 7;
+/// Lower subtraction borrows out of positions `0..=5`; position 6 admits no borrow-out.
+pub const LOWER_BORROW_BITS: usize = 6;
+/// Upper subtraction borrows out of positions `0..=6`; position 7 admits no borrow-out.
+pub const UPPER_BORROW_BITS: usize = 7;
 
 /// One shared bf16 multiply gadget instance (the M1-M6 constraint pattern, columns only):
 /// `out = RNE_bf16(a * b)` with the exact significand product, the CLAMP22 subnormal cut and the
@@ -85,7 +89,7 @@ pub struct FmaBlock<T: Copy> {
     /// W3: far-gap witness `d - THR` on far rows (RC16'd; 0 on near rows).
     pub far_gap_slack: T,
     /// W4: the gap actually used by the fold: `d` on near rows, `THR - 1` on far rows; POW2D key
-    /// (domain [0, 17] — its range proof).
+    /// (shared domain [0, 19]; the honest Scale fill uses at most 17).
     pub exp_gap_capped: T,
     /// W4: `2^EXP_GAP_CAPPED` (POW2D value).
     pub exp_gap_pow2: T,
@@ -93,10 +97,8 @@ pub struct FmaBlock<T: Copy> {
     pub aligned_product: T,
     /// W5: the addend magnitude in the common finer unit.
     pub aligned_addend: T,
-    /// W6: the exact fold `V = AL_P + AL_C < 2^34` (nonnegative variant: no sign, no zero pair).
-    pub folded_magnitude: T,
-    /// W8: wide flag — `V >= 2^17` overflows RNERND's key domain and is first compressed
-    /// round-to-odd to 17 bits.
+    /// W8: wide flag — `V = aligned_product + aligned_addend` with `V >= 2^17` overflows
+    /// RNERND's key domain and is first compressed round-to-odd to 17 bits.
     pub is_wide: T,
     /// W8: round-to-odd shift `width(V) - 17` on wide rows (0 on narrow rows); POW2D key.
     pub compression_shift: T,
@@ -180,18 +182,10 @@ pub struct ScaleColumnsView<T: Copy> {
     /// already doubled/even; the L2 alignment frame (a *scale-plane* frame, not the decoded
     /// max element's exponent).
     pub frame_doubled_scale_exponent: T,
-    /// bf16 code of the group's max `|X|` (sign cleared) — the linf code (group N).
-    pub max_abs: T,
     /// Alpha claim, exponent field (alpha is structurally normal; group H3 rederives it).
     pub alpha_exp: T,
     /// Alpha claim, mantissa field.
     pub alpha_mantissa: T,
-    /// Beta claim, exponent field (beta may be subnormal or zero).
-    pub beta_exp: T,
-    /// Beta claim, mantissa field.
-    pub beta_mantissa: T,
-    /// Beta claim, subnormal flag.
-    pub beta_exp_is_zero: T,
     /// The group's dead-entry count `|{u : ABS(X_u) >= DEAD_BOUND}|`, CTL-transported from
     /// InputQuant; T2 accumulates it into the per-side running totals. The bound itself is
     /// not a column: the looked tuple carries the device-specific affine BF16 code of
@@ -265,9 +259,11 @@ pub struct ScaleColumnsView<T: Copy> {
     /// PARITY forgeable).
     pub sqrt_mantissa_half: T,
 
-    // Binade-bottom lower-midpoint correction (quarter-ulp soundness fix; see module docs).
-    /// 1 iff the claim opens a binade above the subnormal boundary (`t = 128`, `EXP >= 2`):
-    /// its lower rounding boundary is `y - ulp/4`, not `y - ulp/2`.
+    // Lower-midpoint correction at normal powers of two.
+    /// Boolean correction: required to be 1 when MANTISSA = 0 and EXP >= 2.
+    /// For claim q, with Delta the spacing to the next larger value, this raises the lower midpoint
+    /// from `q - Delta/2` to `q - Delta/4`. Also allowed at the smallest normal value,
+    /// where it only tightens the bound; the honest witness uses 0 there.
     pub sqrt_is_binade_bottom: T,
     /// `SQRT_MANTISSA = 0` flag (with inverse witness).
     pub sqrt_mantissa_is_zero: T,
@@ -283,24 +279,22 @@ pub struct ScaleColumnsView<T: Copy> {
     /// square is the affine `B_LO^2 + 32t - 1021*SQRT_IS_BINADE_BOTTOM`.
     pub lower_boundary_squared_limbs: [T; 2],
 
-    // Q5 (the +32 rebias): binade-alignment shift G = 2f + Wl2 - 4 - E_MAX, decomposed
-    // G + 32 = 16q + 15 - r2 with q in {0..4} one-hot and r2 in [0, 15]; the equation *is* the
-    // comparison window G in [-32, 47], and every honest claim fits it (derived in stark.rs) —
-    // the block-integer sum admits G < 0 (small S under a large frame, subnormal block scales),
-    // hence the rebias. The `2^32` counterweight is the SS limbs' fixed +2-position offset in
-    // the Q8 chains, not a column.
-    /// One-hot: `q = 1`.
+    // Q5 alignment witnesses: q is the number of 16-bit limb positions by which Q8 shifts
+    // each squared-boundary product; r2 is the additional bit shift of l2_frame_sum.
+    // Q5 in stark.rs derives both shifts from the sum and claim exponents. At most one
+    // of these four flags may be 1; all zero means no whole-limb shift (q = 0).
+    /// Select a boundary shift of one 16-bit limb (`q = 1`).
     pub alignment_quotient_is_1: T,
-    /// One-hot: `q = 2`.
+    /// Select a boundary shift of two 16-bit limbs (`q = 2`).
     pub alignment_quotient_is_2: T,
-    /// One-hot: `q = 3`.
+    /// Select a boundary shift of three 16-bit limbs (`q = 3`).
     pub alignment_quotient_is_3: T,
-    /// One-hot: `q = 4`.
+    /// Select a boundary shift of four 16-bit limbs (`q = 4`).
     pub alignment_quotient_is_4: T,
-    /// `r2 = 16q + 15 - (G + 32)`, the up-shift applied to `S` (POW2D key; `<= 15` by
-    /// `RC16(15 - r2)`).
+    /// Additional left shift of `l2_frame_sum`, in bits (`r2`, between 0 and 15).
+    /// POW2D and `RC16(15 - r2)` enforce the range; Q5 binds it to the exponent difference.
     pub sum_shift_remainder: T,
-    /// `2^r2` (POW2D value).
+    /// Multiplier `2^sum_shift_remainder`, fixed by the POW2D lookup.
     pub sum_shift_power: T,
 
     /// Q6: low four 16-bit limbs of `S * 2^r2 < 2^77` (RC16'd); the top limb is the final carry.
@@ -308,23 +302,32 @@ pub struct ScaleColumnsView<T: Copy> {
     /// Q6: per-limb carries of the `S * 2^r2` schoolbook product (RC16'd).
     pub shifted_sum_carries: [T; L2_SUM_LIMBS],
 
-    /// Q7: 16-bit limbs 1..=3 of `B_LO^2 * k * 2^15 < 2^53` (limb 0 provably zero; RC16'd, top
-    /// limb capped `< 2^8`).
+    /// Q7: stores the integer `L = k*B_LO^2*2^15` used for the lower comparison before alignment.
+    /// Here `k` is the row length and `B_LO` is the lower boundary coefficient defined above.
+    /// Entries `[d0, d1, d2]` satisfy `L = d0*2^16 + d1*2^32 + d2*2^48`.
+    /// The lowest limb is omitted: `k` is a multiple of 32, so `L` is divisible by `2^20`.
+    /// The lookups bound each entry to 16 bits and the top entry to four bits.
     pub lower_boundary_product_limbs: [T; CLAIM_LIMBS],
     /// Q7: 16-bit limbs 1..=3 of `B_HI^2 * k * 2^15`, `B_HI^2 = B_LO^2 + 32t - 1021*b`.
     pub upper_boundary_product_limbs: [T; CLAIM_LIMBS],
-    /// Q8: the lower boundary's limbs aligned at limb offset `q` (positions 1..=7), gated to 0
-    /// by `LOWER_BRACKET_IS_ACTIVE` (zero-sum rows *and* live zero claims); bound by the
-    /// one-hot mux, so each is a range-checked limb or 0.
-    pub aligned_lower_boundary_limbs: [T; ALIGNED_LIMBS],
-    /// Q8: the upper boundary's aligned limbs (positions 1..=7), gated by
-    /// `1 - FRAME_SUM_IS_ZERO`.
-    pub aligned_upper_boundary_limbs: [T; ALIGNED_LIMBS],
-    /// Q8: borrow bits of the multi-limb comparison `ACL + ODD <= SS * 2^32`, where
-    /// `ODD = SQRT_MANTISSA_PARITY` turns the bound strict exactly when `t` is odd (ties-to-even).
-    pub lower_comparison_borrows: [T; BORROW_BITS],
-    /// Q8: borrow bits of the mirror comparison `SS * 2^32 + ODD <= ACU`.
-    pub upper_comparison_borrows: [T; BORROW_BITS],
+    /// Q8: digits of the scaled lower comparison bound; entry i has weight `2^(16*(i+1))`.
+    /// Copies `lower_boundary_product_limbs` shifted by q limb positions. Every entry is
+    /// zero when `lower_bracket_is_active = 0`; the lower comparison then checks `0 <= T`,
+    /// where `T = l2_frame_sum * 2^(32 + sum_shift_remainder)`.
+    /// Position 7 is omitted and its alignment equation requires the computed digit to be zero.
+    pub aligned_lower_boundary_limbs: [T; ALIGNED_LOWER_LIMBS],
+    /// Q8: digits of the scaled upper comparison bound, with the same weights as the lower bound.
+    /// Copies `upper_boundary_product_limbs` shifted by q limb positions. Every entry is
+    /// zero when `frame_sum_is_zero = 1`; otherwise the upper comparison remains active.
+    pub aligned_upper_boundary_limbs: [T; ALIGNED_UPPER_LIMBS],
+    /// Q8: borrow bits for subtracting the aligned lower bound and `sqrt_mantissa_parity`
+    /// from `T`. Range-checking the subtraction digits with no final borrow proves
+    /// `lower_bound + sqrt_mantissa_parity <= T` (strict when the mantissa is odd).
+    /// The final subtraction at position 6 has no outgoing borrow column.
+    pub lower_comparison_borrows: [T; LOWER_BORROW_BITS],
+    /// Q8: borrow bits for subtracting `T` and `sqrt_mantissa_parity` from the aligned upper
+    /// bound, proving `T + sqrt_mantissa_parity <= upper_bound` by the same digit checks.
+    pub upper_comparison_borrows: [T; UPPER_BORROW_BITS],
 
     // ------------------------------------------------------------------------------------------
     // Grid snap `l2 = grid4(y)` (group G): round the sqrt code to a multiple of four, ties up.
@@ -343,7 +346,8 @@ pub struct ScaleColumnsView<T: Copy> {
     pub l2_exp_is_zero: T,
 
     // ------------------------------------------------------------------------------------------
-    // Linf decode (group N): MAX_ABS *is* the linf code (no epsilon bump).
+    // Linf decode (group N): the group lookup binds 128*linf_exp + linf_mantissa
+    // directly to InputQuant's max-|X| encoding (no epsilon bump).
     // ------------------------------------------------------------------------------------------
     /// N1: linf exponent field.
     pub linf_exp: T,
@@ -408,16 +412,17 @@ pub struct ScaleColumnsView<T: Copy> {
 
     /// H4: `beta_1 = RNE_bf16(alpha * l2f)`.
     pub alpha_l2_multiply: MulBlock<T>,
-    /// H5: `beta = RNE_bf16(beta_1 * dos)`; its outputs are bound to the tuple's beta claim.
+    /// H5: `beta = RNE_bf16(beta_1 * dos)`; the group tuple carries its output exponent,
+    /// mantissa and exponent-zero flag directly (beta may be subnormal or zero).
     pub beta_scale_multiply: MulBlock<T>,
 }
 
 /// Total number of committed ScaleStark columns.
 pub const NUM_SCALE_COLUMNS: usize = size_of::<ScaleColumnsView<u8>>();
 
-// The committed-column count: 144 = 140 main + 4 class (a), of which the sqrt block is 67
+// The committed-column count: 137 = 133 main + 4 class (a), of which the sqrt block is 65
 // (the module docs derive its layout).
-const _: () = assert!(NUM_SCALE_COLUMNS == 144);
+const _: () = assert!(NUM_SCALE_COLUMNS == 137);
 
 // Public inputs (consumed by groups H and Q). `dr`/`dos` are the public scale constants
 // `bf16(DELTA*sqrt(r))` and `bf16(DELTA*sqrt(r)/NOISE_TARGET_NORM^2)` split into bf16 fields
