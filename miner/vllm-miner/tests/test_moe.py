@@ -10,7 +10,7 @@ from vllm_miner.mining_config import (
     mining_configuration,
     select_tile,
 )
-from vllm_miner.moe import topk_ids_shape_error, validate_moe_dims
+from vllm_miner.moe import topk_ids_shape_error, validate_moe_dims, validate_routing_count
 
 
 @pytest.mark.parametrize("experts,top_k", [(4, 2), (1, 1), (128, 8), (8, 8)])
@@ -20,7 +20,7 @@ def test_validate_moe_dims_accepts_positive_ints(experts, top_k):
 
 @pytest.mark.parametrize(
     "experts,top_k",
-    [(0, 1), (4, 0), (-4, 2), (4, -1), (True, 1), (4, True), (4.0, 2), (4, 2.0), (2, 4)],
+    [(0, 1), (4, 0), (-4, 2), (4, -1), (True, 1), (4, True), (4.0, 2), (4, 2.0), (2, 4), (1025, 1)],
     ids=[
         "no-experts",
         "no-topk",
@@ -31,6 +31,7 @@ def test_validate_moe_dims_accepts_positive_ints(experts, top_k):
         "float-e",
         "float-k",
         "k>e",
+        "e>1024",
     ],
 )
 def test_validate_moe_dims_rejects_non_dims(experts, top_k):
@@ -47,6 +48,14 @@ def test_topk_ids_shape_error_names_the_problem():
     assert "(16, 2)" in topk_ids_shape_error(good.reshape(-1), 16, 2)
     assert "int32/int64" in topk_ids_shape_error(good.float(), 16, 2)
     assert "tensor" in topk_ids_shape_error([[0, 1]] * 16, 16, 2)
+
+
+def test_routing_count_is_strictly_below_two_to_nineteen_before_allocation():
+    validate_routing_count((1 << 19) - 1, 1)
+    with pytest.raises(ValueError, match=r"fewer than 2\^19"):
+        validate_routing_count(1 << 18, 2)
+    oversized = torch.empty((1 << 18, 2), dtype=torch.int32, device="meta")
+    assert "fewer than 2^19" in topk_ids_shape_error(oversized, 1 << 18, 2)
 
 
 @pytest.mark.parametrize("device", list(Device), ids=lambda d: d.name.lower())

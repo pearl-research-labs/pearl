@@ -203,7 +203,7 @@ def _reference_chunk_stats(a_q) -> torch.Tensor:
     q = a_q.int_values.reshape(m, k // 8, 8).to(torch.float32)
     s = a_q.scales.to(torch.float32)
     group_sumsq = (s * s) * q.square().sum(dim=-1)
-    group_absmax = (s * q.abs().amax(dim=-1)).to(torch.bfloat16).float()
+    group_absmax = (s.abs() * q.abs().amax(dim=-1)).to(torch.bfloat16).float()
     sumsq = group_sumsq.reshape(-1, 64).sum(dim=1)
     absmax = group_absmax.reshape(-1, 64).amax(dim=1)
     return torch.stack((sumsq, absmax), dim=1).flatten()
@@ -434,6 +434,38 @@ def test_stats_bit_exact(m, k):
     stats = buffers["stats"].cpu()
     assert torch.equal(stats[1::2], ref_stats[1::2])
     torch.testing.assert_close(stats[0::2], ref_stats[0::2], rtol=1e-6, atol=0)
+
+
+def test_stats_absmax_with_negative_block_scales():
+    # Finite negative BF16 scales are valid commit data even though encode() emits
+    # positive scales. The committed row's maximum magnitude must ignore the sign.
+    m, k = 32, 512
+    ref = PrequantMatrix.encode(_exact_stats_input(m, k).cpu())
+    ref.int_values[0, 0] = -128
+    ref.scales = -ref.scales
+    codes = ref.int_values.cuda().contiguous()
+    scales = ref.scales.cuda().contiguous()
+    buffers = _buffers(m, k, blake3(b"negative-scale").digest(), blake3(b"negative-scale-cb").digest())
+    _launch(codes, scales, buffers)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(buffers["stats"].cpu(), _reference_chunk_stats(ref), rtol=0, atol=0)
+
+
+def test_stats_absmax_publishes_bf16():
+    # 127 * 1.21875 = 154.78125 in FP32, but the committed linf is BF16 155.
+    # The stats store must round its raw maximum before the scale chain reads it.
+    m, k = 32, 1024
+    a = torch.zeros((m, k), dtype=torch.bfloat16, device="cuda")
+    a[:, 0] = 155
+    ref = PrequantMatrix.encode(a.cpu())
+    assert ref.int_values[0, 0].item() == 127
+    assert float(ref.scales[0, 0]) == 1.21875
+    buffers = _buffers(m, k, blake3(b"round-max").digest(), blake3(b"round-max-cb").digest())
+    _launch(ref.int_values.cuda().contiguous(), ref.scales.cuda().contiguous(), buffers)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(buffers["stats"].cpu(), _reference_chunk_stats(ref), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("m,k", _SHAPES)

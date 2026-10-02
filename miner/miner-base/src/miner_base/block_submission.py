@@ -41,6 +41,7 @@ from .commitment import (
 )
 from .layout import AxisPattern
 from .mining_config import COMMITMENT_CHUNK_SIZE
+from .params import MAX_ROUTING_ENTRIES_EXCLUSIVE
 from .prequant import DEFAULT_BLOCK_SIZE
 
 # The pearl_mining binding currently exposes only ``(bool, str)``. Keep this
@@ -247,6 +248,8 @@ def _validate_opening(opened_block_info: OpenedBlockInfo) -> tuple[int, int, int
     # column indices are checked here as given: the expert-local values handed
     # to ``_validate_indices`` below are computed (``index - base``), so a bool
     # would already have become an int there.
+    if len(moe.routing) >= MAX_ROUTING_ENTRIES_EXCLUSIVE:
+        raise ValueError("MoE routing must contain fewer than 2^19 entries")
     witness = (
         moe.expert_index,
         *moe.offsets,
