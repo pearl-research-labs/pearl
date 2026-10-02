@@ -18,6 +18,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/term"
 )
 
 func TestOysterKeyMapEscBacksOut(t *testing.T) {
@@ -37,6 +38,29 @@ func TestOysterKeyMapEscBacksOut(t *testing.T) {
 		"confirm next":  &km.Confirm.Next,
 	} {
 		assert.Contains(t, b.Help().Desc, "esc back", name)
+	}
+}
+
+func TestWithSpinnerSlowPathReturnsFnError(t *testing.T) {
+	sentinel := errors.New("slow failure")
+	start := time.Now()
+	err := withSpinner("working...", func() error {
+		time.Sleep(2 * spinnerDelay)
+		return sentinel
+	})
+	require.ErrorIs(t, err, sentinel)
+	assert.Less(t, time.Since(start), 2*spinnerDelay+time.Second)
+}
+
+func TestTerminalCanHostSpinner(t *testing.T) {
+	stdoutTTY := term.IsTerminal(int(os.Stdout.Fd()))
+	stdinTTY := term.IsTerminal(int(os.Stdin.Fd()))
+	if stdoutTTY && stdinTTY {
+		assert.True(t, terminalCanHostSpinner())
+		return
+	}
+	if !stdoutTTY {
+		assert.False(t, terminalCanHostSpinner())
 	}
 }
 
