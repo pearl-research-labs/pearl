@@ -36,7 +36,7 @@
 //! `KEY_B`, `JACKPOT_KEY` (`Subkey(noise_seedA, "pearl/v4/FP8/jackpot")`),
 //! `HASH_A` / `HASH_B` (the job's side digests, bound in-AIR by the commit-fold wrappers —
 //! AIR spec Section 1.0), `HASH_ROUTING`, `HASH_JACKPOT`
-//! (the block's shipped claim, subsequently difficulty-checked), the geometry parameters
+//! (the block's shipped claim, difficulty-checked before proof verification), the geometry parameters
 //! `K` / `WL2` / `2^WL2` (Scale's and InputQuant's program-independence slots, all filled
 //! from the statement's `k`), the `dr`/`dos` scale constants (from the job's rank) and
 //! the jackpot liveness allowances `DEAD_LIMIT_A/B` (from the statement's geometry).
@@ -62,7 +62,7 @@
 //! `zero_knowledge: true` (stage 2) — mirroring the deployed v2 `pearl_circuit`
 //! architecture. [`Fp8Prover`] compiles each device's universal wrapper circuits once and
 //! reuses them afterwards. Wrapped verification applies the same statement derivation and
-//! native epilogues as the unwrapped path, with the batch-level checks replaced by the
+//! public jackpot check as the unwrapped path, with the batch-level checks replaced by the
 //! wrapper's public-input pinning (every slot recomputed from the statement, the class (a)
 //! columns natively re-evaluated at the
 //! proof's `zeta`) plus one plonky2 verification against the consensus stage-2 verifier
@@ -279,18 +279,16 @@ impl Fp8Verifier {
         proof_data: &[u8],
         share_nbits: u32,
     ) -> Result<()> {
-        let statement = decode_statement(public_data)?;
-        statement.job().check_ancestry(proposed_header, ancestor_chain)?;
+        let statement = validate_public_statement(proposed_header, ancestor_chain, public_data, share_nbits)?;
         let job = Fp8Job::derive(&statement, proposed_header)?;
-        self.verify_derived(&job, proof_data, share_nbits)
+        self.verify_derived(&job, proof_data)
     }
 
     /// The verification core on an already-derived statement (shared with
-    /// [`Fp8VerifierCache`], which derives the job once for both the setup
-    /// lookup and the verification).
+    /// [`Fp8VerifierCache`], which resolves the setup before deriving the job).
     ///
     /// `proof_data` is the compact wire encoding of the stage-2 proof.
-    fn verify_derived(&self, job: &Fp8Job, proof_data: &[u8], nbits: u32) -> Result<()> {
+    fn verify_derived(&self, job: &Fp8Job, proof_data: &[u8]) -> Result<()> {
         let expected = job.expected_public_inputs();
         verify_compact_wrapped_proof(
             &job.system,
@@ -299,16 +297,15 @@ impl Fp8Verifier {
             proof_data,
             &expected,
             job.params.digest(&job.proposed_header),
-        )?;
-        job.native_epilogue(nbits)
+        )
     }
 }
 
 impl Fp8VerifierCache {
-    /// The trusted setup for `job`'s device, from the cache alone. A missing
+    /// The trusted setup for the decoded statement's device, from the cache alone. A missing
     /// setup is an error: this cache never compiles circuits (see the type docs).
-    fn verifier_for_job(&self, job: &Fp8Job) -> Result<&Fp8Verifier> {
-        let device = job.params.common().device;
+    fn verifier_for_statement(&self, statement: &PublicParams) -> Result<&Fp8Verifier> {
+        let device = statement.common().device;
         self.get(device)
             .ok_or_else(|| anyhow!("no cached fp8 verifier setup for {device:?}; regenerate fp8_cache.bin with build_cache"))
     }
@@ -344,11 +341,10 @@ impl Fp8VerifierCache {
         proof_data: &[u8],
         share_nbits: u32,
     ) -> Result<()> {
-        let statement = decode_statement(public_data)?;
-        statement.job().check_ancestry(proposed_header, ancestor_chain)?;
+        let statement = validate_public_statement(proposed_header, ancestor_chain, public_data, share_nbits)?;
+        let verifier = self.verifier_for_statement(&statement)?;
         let job = Fp8Job::derive(&statement, proposed_header)?;
-        let verifier = self.verifier_for_job(&job)?;
-        verifier.verify_derived(&job, proof_data, share_nbits)
+        verifier.verify_derived(&job, proof_data)
     }
 }
 
@@ -408,6 +404,18 @@ pub(crate) fn decode_statement(public_data: &[u8]) -> Result<PublicParams> {
     PublicParams::from_bytes(public_data)
 }
 
+fn validate_public_statement(
+    proposed_header: &IncompleteBlockHeader,
+    ancestor_chain: &[BlockHeader],
+    public_data: &[u8],
+    nbits: u32,
+) -> Result<PublicParams> {
+    let statement = decode_statement(public_data)?;
+    statement.job().check_ancestry(proposed_header, ancestor_chain)?;
+    check_public_jackpot(&statement, nbits)?;
+    Ok(statement)
+}
+
 /// One fp8 batch proof (the twenty-table batched STARK argument with every table's
 /// public inputs), plus its wire encoding.
 #[derive(Clone, Debug)]
@@ -433,12 +441,12 @@ impl Fp8Proof {
 // ==================================================================================================
 
 /// One job's derived proving/verifying context: the batch [`Fp8System`] plus the
-/// key material the expected public inputs and the native epilogue need. Both sides
+/// key material the expected public inputs need. Both sides
 /// derive it from public data alone.
 pub struct Fp8Job {
     /// The statement the job was derived from, and the proposed header it is
     /// verified against: everything downstream (expected public inputs,
-    /// statement digests, the native epilogue) reads from this pair.
+    /// statement digests) reads from this pair.
     params: PublicParams,
     /// `σ̂`: the caller's expected block header (`params.ancestor_header()` is `σ_d`).
     proposed_header: IncompleteBlockHeader,
@@ -624,19 +632,13 @@ impl Fp8Job {
         let xor_fold = vec![F::from_canonical_u64(budget(iq.k, iq.h, iq.w))];
         [blake3, input_quant, scale, vec![], xor_fold]
     }
+}
 
-    /// The native epilogue shared by the batch and wrapped verification paths, run after
-    /// the proof itself (and its public-input pinning) has been checked: the plain
-    /// difficulty condition on the proven lottery digest, against `nbits`.
-    /// (`HASH_A`/`HASH_B` need no epilogue — the in-AIR folds bind them directly.)
-    ///
-    /// `Ok(())` accepts; a failed difficulty check rejects.
-    fn native_epilogue(&self, nbits: u32) -> Result<()> {
-        let params = &self.params;
-        // The winning condition on the proven lottery digest (HASH_JACKPOT was pinned to
-        // params.hash_jackpot by the public-input check).
-        check_jackpot_difficulty(&params.hash_jackpot(), nbits, params.h(), params.w(), params.common_dim())
-    }
+/// Reject a losing public jackpot claim before deriving known columns or verifying
+/// the proof. The proof must still bind `HASH_JACKPOT` to this exact statement
+/// value; this check alone never authenticates the claim.
+fn check_public_jackpot(params: &PublicParams, nbits: u32) -> Result<()> {
+    check_jackpot_difficulty(&params.hash_jackpot(), nbits, params.h(), params.w(), params.common_dim())
 }
 
 // ==================================================================================================
@@ -749,15 +751,17 @@ fn prove_wrapped_statement(
 
 /// Verifies one fp8 block proof end to end:
 ///
-/// 1. derives the statement from `public_params` (rejecting non-fp8 or out-of-envelope
-///    jobs; MoE and dense jobs both derive),
+/// 1. checks the public jackpot claim against `nbits`, then derives the statement
+///    from `public_params` (rejecting non-fp8 or out-of-envelope jobs; MoE and
+///    dense jobs both derive),
 /// 2. pins **every** public input slot to the verifier's own recomputation —
 ///    `HASH_A`/`HASH_B` to the job's side digests, `HASH_JACKPOT` to the block's
 ///    shipped claim,
 /// 3. runs the batched multi-STARK verification (constraints, class (a) openings against
-///    the recomputed known columns, the consensus LUT cap, CTLs, one FRI argument),
-/// 4. checks the plain difficulty condition on the proven lottery digest against `nbits`
-///    (or `nbits_override`, e.g. a pool share target).
+///    the recomputed known columns, the consensus LUT cap, CTLs, one FRI argument).
+///
+/// The public check uses `nbits_override` for pool shares; the proof then binds its
+/// lottery digest to the already-checked statement claim.
 ///
 /// `Ok(())` accepts, `Err` rejects.
 #[cfg(test)]
@@ -768,6 +772,8 @@ fn verify_fp8_block(
     setup: &Fp8ProverSetup,
     nbits_override: Option<u32>,
 ) -> Result<()> {
+    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
+    check_public_jackpot(public_params, nbits)?;
     let mut job = Fp8Job::derive(public_params, proposed_header)?;
     ensure!(
         setup.device == public_params.common().device,
@@ -775,19 +781,17 @@ fn verify_fp8_block(
         setup.device,
         public_params.common().device
     );
-    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
     let expected = job.expected_public_inputs();
     let digest = job.params.digest(&job.proposed_header);
     job.system.bind_statement_digest(digest);
-    job.system.verify::<C>(&proof.0, &expected, &setup.preprocessed.cap())?;
-    job.native_epilogue(nbits)
+    job.system.verify::<C>(&proof.0, &expected, &setup.preprocessed.cap())
 }
 
 /// Verifies one *wrapped* fp8 block proof end to end — the same statement derivation,
-/// public-input pinning and native epilogue as [`verify_fp8_block`], with the batch
+/// public-input pinning and early jackpot check as [`verify_fp8_block`], with the batch
 /// verification replaced by its in-circuit encoding:
 ///
-/// 1. derives the statement from `public_params`,
+/// 1. checks the public jackpot claim, then derives the statement from `public_params`,
 /// 2. pins **every** slot — the per-table public inputs to the verifier's own
 ///    expectations, the known-column digest to the statement's, and the known-column
 ///    evaluations to the verifier's native recomputation at the proof's `zeta`
@@ -795,8 +799,7 @@ fn verify_fp8_block(
 /// 3. verifies the stage-2 zero-knowledge plonky2 proof against `circuit` — the consensus
 ///    stage-2 verifier data ([`Fp8WrapperCircuits::verifier_data`]), which transitively
 ///    pins the whole baked statement shape (batch layout, AIR constraint set, CTLs, the LUT
-///    family cap),
-/// 4. runs the native epilogue (the plain difficulty condition).
+///    family cap).
 #[cfg(test)]
 fn verify_fp8_block_wrapped(
     public_params: &PublicParams,
@@ -805,8 +808,9 @@ fn verify_fp8_block_wrapped(
     verifier: &Fp8Verifier,
     nbits_override: Option<u32>,
 ) -> Result<()> {
-    let job = Fp8Job::derive(public_params, proposed_header)?;
     let nbits = nbits_override.unwrap_or(proposed_header.nbits);
+    check_public_jackpot(public_params, nbits)?;
+    let job = Fp8Job::derive(public_params, proposed_header)?;
     let expected = job.expected_public_inputs();
     verify_wrapped_proof(
         &job.system,
@@ -814,8 +818,7 @@ fn verify_fp8_block_wrapped(
         proof,
         &expected,
         job.params.digest(&job.proposed_header),
-    )?;
-    job.native_epilogue(nbits)
+    )
 }
 
 /// A 32-byte hash as 8 little-endian u32 words (the STARK witness key encoding).
@@ -945,6 +948,34 @@ mod tests {
             .verify_block(&IncompleteBlockHeader::zero(), &[], &statement.to_bytes(), &[])
             .unwrap_err();
         assert!(error.to_string().contains("depth 1 does not connect"), "{error:#}");
+    }
+
+    #[test]
+    fn losing_public_jackpot_rejects_before_job_derivation_or_proof_decoding() {
+        let mut statement = sample_dense_statement().unwrap();
+        statement.set_hash_jackpot([u8::MAX; 32]);
+        let proposed = IncompleteBlockHeader {
+            prev_block: statement.ancestor_header().block_hash(),
+            nbits: 0x1d00ffff,
+            ..IncompleteBlockHeader::zero()
+        };
+        // No setup and a malformed proof body: the public lottery claim must
+        // reject before either the expensive job derivation or proof decoding.
+        let error = Fp8VerifierCache::default()
+            .verify_block(&proposed, &[], &statement.to_bytes(), &[0])
+            .unwrap_err();
+        assert!(error.to_string().contains("Jackpot condition not satisfied"), "{error:#}");
+
+        // A pool share must use its stricter override even when the block header
+        // itself has an easy, saturating target.
+        let easy_header = IncompleteBlockHeader {
+            nbits: 0x207fffff,
+            ..proposed
+        };
+        let error = Fp8VerifierCache::default()
+            .verify_share(&easy_header, &[], &statement.to_bytes(), &[0], 0x1d00ffff)
+            .unwrap_err();
+        assert!(error.to_string().contains("Jackpot condition not satisfied"), "{error:#}");
     }
 
     #[test]

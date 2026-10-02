@@ -125,16 +125,17 @@ pub const STARK_QUERY_ROUNDS: usize = (STARK_SECURITY_BITS - STARK_POW_BITS as u
 /// |------------|------------------|---------|
 /// | InputQuant | `max(h,w)·k`     | 14..=22 |
 /// | Matmul     | `h·w·(k/32)`     | 13..=22 |
-/// | Blake3     | `8·compressions` | 13..=21 |
+/// | Blake3     | `8·compressions` | 13..=19 |
 /// | XorFold    | `h·w`            |  8..=11 |
 /// | Scale      | `h + w`          |  5..=10 |
 /// | LUTs       | [`lut_height`]   | {17, 16, 14, 11, 10, 8, 6, 5} |
 ///
-/// Blake3 bounds: opened bytes are `1.25·(h+w)·k ∈ [5·2^14, 5·2^20]` (values `k` plus
-/// scales `k/4` bytes per strip), so leaf compressions alone are `≥ 640 > 2^9`
-/// (rows `> 2^12`), while leaves (`16·chunks ≤ 16·((5/4096)·2^22 + 4(h+w)) < 2^17`) +
-/// strip membership paths (`≤ 2·chunks + 30·2(h+w)`) + MoE hotspot rows stay `< 2^18`
-/// (rows `≤ 2^21`). The union is `[5, 22] \ {12}`: no table lands on `2^12`
+/// Blake3 work is bounded in closed form from the statement's scalars before
+/// compilation (`PublicParams::check_blake3_work_bound`): four plane trees, MoE
+/// routing/offsets trees, two root folds, and the jackpot together consume at
+/// most `2^22` compression-message bytes. Thus there are at most `2^16`
+/// compressions and `2^19` rows. The minimum legal tile still has
+/// more than `2^12` Blake3 rows. The union is `[5, 22] \ {12}`: no table lands on `2^12`
 /// (Scale and XorFold top out at `2^10`/`2^11`, and Matmul, InputQuant, and Blake3 all start
 /// at `2^13`).
 /// Coverage and minimality are asserted by
@@ -146,7 +147,7 @@ pub const FP8_REACHABLE_DEGREE_BITS: [usize; 17] = [22, 21, 20, 19, 18, 17, 16, 
 /// canonical `Table` order — the rows of [`FP8_REACHABLE_DEGREE_BITS`]'s table. Exactness
 /// (each bound is attained by some envelope-legal job) is asserted by
 /// `ladder_covers_the_envelope`; Blake3's bounds are proven, not swept (see above).
-pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(13, 21), (14, 22), (5, 10), (13, 22), (8, 11)];
+pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(13, 19), (14, 22), (5, 10), (13, 22), (8, 11)];
 
 /// Batch indices of the *grouped* tables — the LUTs
 /// (`NUM_TABLES..NUM_ALL_TABLES`). Their heights are consensus constants, so each role
@@ -1020,7 +1021,7 @@ mod tests {
 
     /// [`FP8_REACHABLE_DEGREE_BITS`] is exactly the envelope's reach: sweep every lottery
     /// tile `(h, w)` and the job `k` range, apply each table's height formula, and compare
-    /// against the ladder (with Blake3 contributing its bounded `14..=21` — see the
+    /// against the ladder (with Blake3 contributing its bounded `13..=19` — see the
     /// constant's docs). Guards both directions: a formula landing off the ladder breaks
     /// batch FRI injection; a ladder stop nothing reaches taxes every proof with a dead
     /// fold layer.
@@ -1028,10 +1029,10 @@ mod tests {
     fn ladder_covers_the_envelope() {
         use std::collections::BTreeSet;
 
-        // Per-main-table reach, canonical `Table` order (Blake3's bounded 14..=21 is
+        // Per-main-table reach, canonical `Table` order (Blake3's bounded 13..=19 is
         // documented on the constant, not swept).
         let mut per_table: [BTreeSet<usize>; NUM_TABLES] = Default::default();
-        per_table[Table::Blake3 as usize].extend(13..=21);
+        per_table[Table::Blake3 as usize].extend(13..=19);
         // Envelope (`api::layout` tile bounds): h >= 4
         // (MIN_TILE_ROWS), w >= 16 (MIN_TILE_COLS), h*w <= 2048 (MAX_TILE_ELEMS),
         // h*w >= 16*16 (JACKPOT_ENTRIES lanes of >= MIN_SUBTILE_ELEMS), and the

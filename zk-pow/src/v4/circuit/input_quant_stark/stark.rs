@@ -116,7 +116,7 @@
 //!    `2^|EP-EC|` so both operands use the finer common scale.
 //! 2. For very large gaps, cap the shift and adjust the common scale so the dominant operand
 //!    remains exact. This moves the smaller operand to a position where only its nonzeroness can
-//!    affect the final rounding. The threshold is 10 for an eight-bit smaller operand. It is 20
+//!    affect the final rounding. The threshold is 12 for an eight-bit smaller operand. It is 20
 //!    in the opposite direction because a subtracted 16-bit product can borrow across a binade
 //!    boundary and expose two additional positions.
 //! 3. Add or subtract the aligned integers exactly, producing a sign and magnitude `V`.
@@ -622,10 +622,11 @@ fn fma_gadget(m_p: u64, ep_raw: i64, product_is_zero: bool, s_p: bool, m_c: u64,
     let product_scale_ge_addend = ep >= ec;
     let d = if product_scale_ge_addend { ep - ec } else { ec - ep } as u64;
     let scale_gap_slack = if product_scale_ge_addend { d } else { d - 1 };
-    // The far caps are one below their thresholds. Cap 9 gives
-    // M_C/2^9 < 2^8/2^9 = 1/2 product unit. In the reverse direction, cap 19 gives
+    // The far caps are one below their thresholds. Cap 11 gives
+    // M_C/2^11 < 2^8/2^11 = 1/8 product unit, below the 1/4-unit midpoint immediately
+    // below a product at a bf16 binade boundary. In the reverse direction, cap 19 gives
     // M_P/2^19 < 2^16/2^19 = 1/8 addend unit, below the worst 1/4-unit bf16 midpoint.
-    let thr = if product_scale_ge_addend { 10 } else { 20 };
+    let thr = if product_scale_ge_addend { 12 } else { 20 };
     let is_far_gap = d >= thr;
     let far_gap_slack = if is_far_gap { d - thr } else { 0 };
     let exp_gap_capped = if is_far_gap { thr - 1 } else { d };
@@ -1810,21 +1811,23 @@ where
     eval.constraint(c);
     // W3: IS_FAR_GAP may be set only when the smaller operand is sticky-only. Since a far cap
     // is one below its threshold:
-    //   GE = 1: M_C < 2^8, so cap 9 gives M_C/2^9 < 1/2 product unit; d >= 10 is smaller still.
+    //   GE = 1: M_C < 2^8, so cap 11 gives M_C/2^11 < 1/8 product unit; d >= 12 is smaller still.
+    //           This also stays below the 1/4-unit midpoint beneath a product at a bf16
+    //           binade boundary when the addend has the opposite sign.
     //   GE = 0: the worst subtraction is below M_C = 128, whose lower bf16 neighbor is 127.5;
     //           its midpoint is 127.75, only 1/4 addend unit away. Cap 19 gives
     //           M_P/2^19 < 2^16/2^19 = 1/8 < 1/4, retaining one safety bit.
-    // Hence the thresholds are 10 and 20. FAR_GAP_SLACK records d - threshold.
+    // Hence the thresholds are 12 and 20. FAR_GAP_SLACK records d - threshold.
     eval.constraint_bool(f.is_far_gap);
-    let c9 = eval.i32(9);
+    let c7 = eval.i32(7);
     let c19 = eval.i32(19);
-    let d_m_thr = eval.mad(c9, f.product_scale_ge_addend, f.scale_gap_slack);
+    let d_m_thr = eval.mad(c7, f.product_scale_ge_addend, f.scale_gap_slack);
     let d_m_thr = eval.sub(d_m_thr, c19);
     let far_diff = eval.sub(d_m_thr, f.far_gap_slack);
     let c = eval.mul(f.is_far_gap, far_diff);
     eval.constraint(c);
     // W4: near rows use the true gap d. Far rows use the last gap below the threshold:
-    // 9 when GE = 1, or 19 when GE = 0. W10 restores the omitted scale distance, so the
+    // 11 when GE = 1, or 19 when GE = 0. W10 restores the omitted scale distance, so the
     // dominant operand remains exact while the smaller operand becomes a sticky nudge.
     let not_far = eval.sub(one, f.is_far_gap);
     let d = eval.add(f.scale_gap_slack, one);
@@ -1832,9 +1835,9 @@ where
     let near_diff = eval.sub(f.exp_gap_capped, d);
     let c = eval.mul(not_far, near_diff);
     eval.constraint(c);
-    let c10 = eval.i32(10);
-    let ge10 = eval.mul(c10, f.product_scale_ge_addend);
-    let thr_m1 = eval.sub(c19, ge10);
+    let c8 = eval.i32(8);
+    let ge8 = eval.mul(c8, f.product_scale_ge_addend);
+    let thr_m1 = eval.sub(c19, ge8);
     let far_cap = eval.sub(f.exp_gap_capped, thr_m1);
     let c = eval.mul(f.is_far_gap, far_cap);
     eval.constraint(c);
@@ -2747,6 +2750,12 @@ mod tests {
         check(0x0401, 0x3F81, 0x8402); // V = 1 at EP = -133: exact subnormal result 2^-133
         check(0x1481, 0x3F81, 0x9482); // V = 1 at EP = -100: a normal result despite V < 128
         check(0x3F81, 0x3F81, 0xBF81); // V = 129 (mantissa-borrow pattern)
+        // At a binade boundary the lower bf16 midpoint is only 1/4 product unit away.
+        // A 9-bit far cap magnified this subtractive addend and rounded one ulp too low.
+        assert_eq!(bf16_fma(0x7100, 0x8001, 0x1941).unwrap(), 0xAE80);
+        check(0x7100, 0x8001, 0x1941);
+        assert_eq!(bf16_fma(0x4F80, 0x0001, 0x8541).unwrap(), 0x0D00);
+        check(0x4F80, 0x0001, 0x8541);
         // The formerly gapped cancellation band: V < 128 with KEY_SCALE in [-132, -127], the
         // signed-cut slots 1-6. Each subnormal below was misclassified as normal by the old
         // nonnegative-cut table; the two normal cases pin the in-band normal/subnormal split.

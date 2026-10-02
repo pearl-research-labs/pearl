@@ -162,7 +162,7 @@ pub struct FmaBlockView<T: Copy> {
     /// Exact scale-gap witness: `EP - EC` when `EP >= EC`, otherwise `EC - EP - 1`.
     /// The minus one makes the two order branches disjoint at equality (W2).
     pub scale_gap_slack: T,
-    /// Selects the sticky-only far-gap path. Its threshold is 10 when the smaller operand has
+    /// Selects the sticky-only far-gap path. Its threshold is 12 when the smaller operand has
     /// at most eight bits, or 20 when a subtracted 16-bit product can borrow across a binade
     /// boundary (W3).
     pub is_far_gap: T,
@@ -170,7 +170,7 @@ pub struct FmaBlockView<T: Copy> {
     /// Ignored on near rows (W3).
     pub far_gap_slack: T,
     /// Alignment shift used by the integer fold: the true gap `d` on near rows, or the last
-    /// pre-threshold gap (9 or 19) on far rows (W4).
+    /// pre-threshold gap (11 or 19) on far rows (W4).
     pub exp_gap_capped: T,
     /// `2^exp_gap_capped`, supplied by POW2D; its key domain also proves the shift is at most
     /// 19 (W4/W5).

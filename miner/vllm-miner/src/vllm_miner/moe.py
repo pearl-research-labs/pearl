@@ -12,6 +12,9 @@ noise is learned. Nothing here synchronizes with the host.
 from dataclasses import dataclass
 
 import torch
+from miner_base.params import MAX_ROUTING_ENTRIES_EXCLUSIVE
+
+MAX_EXPERTS = 1024
 
 
 @dataclass(frozen=True)
@@ -60,12 +63,22 @@ def _commit_u32(values: torch.Tensor, key_a_dev: torch.Tensor, root: torch.Tenso
 
 def validate_moe_dims(experts: int, top_k: int) -> None:
     """``experts`` and ``top_k`` are positive exact ints (no bools, no floats)
-    with ``top_k <= experts``: both become tensor extents downstream."""
+    with ``top_k <= experts <= 1024``: both become tensor extents downstream."""
     for name, value in (("experts", experts), ("top_k", top_k)):
         if type(value) is not int or value <= 0:
             raise ValueError(f"{name} must be a positive int, got {value!r}")
     if top_k > experts:
         raise ValueError(f"top_k={top_k} exceeds experts={experts}")
+    if experts > MAX_EXPERTS:
+        raise ValueError(f"experts={experts} exceeds the FP8 limit {MAX_EXPERTS}")
+
+
+def validate_routing_count(m_tokens: int, top_k: int) -> None:
+    """Reject an oversized table before sorting or hashing it on the device."""
+    if type(m_tokens) is not int or m_tokens <= 0:
+        raise ValueError(f"m_tokens must be a positive int, got {m_tokens!r}")
+    if m_tokens * top_k >= MAX_ROUTING_ENTRIES_EXCLUSIVE:
+        raise ValueError("MoE routing must contain fewer than 2^19 entries")
 
 
 def topk_ids_shape_error(topk_ids: torch.Tensor, m_tokens: int, top_k: int) -> str | None:
@@ -75,6 +88,8 @@ def topk_ids_shape_error(topk_ids: torch.Tensor, m_tokens: int, top_k: int) -> s
         return f"topk_ids must be a tensor, got {type(topk_ids).__name__}"
     if topk_ids.dim() != 2 or tuple(topk_ids.shape) != (m_tokens, top_k):
         return f"topk_ids must be ({m_tokens}, {top_k}), got {tuple(topk_ids.shape)}"
+    if m_tokens * top_k >= MAX_ROUTING_ENTRIES_EXCLUSIVE:
+        return "MoE routing must contain fewer than 2^19 entries"
     if topk_ids.dtype not in (torch.int32, torch.int64):
         return f"topk_ids must be int32/int64, got {topk_ids.dtype}"
     return None
@@ -96,6 +111,7 @@ def route_tokens(topk_ids: torch.Tensor, experts: int, key_a_dev: torch.Tensor) 
     if topk_ids.dim() != 2:
         raise ValueError(f"topk_ids must be (m_tokens, top_k), got {tuple(topk_ids.shape)}")
     validate_moe_dims(experts, topk_ids.shape[1])
+    validate_routing_count(topk_ids.shape[0], topk_ids.shape[1])
     if topk_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"topk_ids must be int32/int64, got {topk_ids.dtype}")
     if topk_ids.device != key_a_dev.device:

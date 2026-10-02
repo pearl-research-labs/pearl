@@ -271,6 +271,10 @@ impl PlainProofV4 {
             );
 
             let o_last = *witness.offsets.last().expect("|O| = e >= 1");
+            ensure!(
+                o_last < PublicParams::MAX_ROUTING_ENTRIES_EXCLUSIVE,
+                "MoE O_{{e-1}} must be < 2^19 || O_{{e-1}}={o_last}"
+            );
             check_tree_leaves(
                 &witness.routing,
                 &[o_last as usize, std::mem::size_of::<u32>()],
@@ -746,6 +750,14 @@ mod tests {
         proof.moe_witness.as_mut().unwrap().offsets = vec![2, 300];
         let err = proof.check_shape().unwrap_err();
         assert!(err.to_string().contains("routing"), "{err}");
+    }
+
+    #[test]
+    fn check_shape_rejects_oversized_routing_before_opening_work() {
+        let mut proof = tiny_moe_proof(2, vec![2, 4]);
+        proof.moe_witness.as_mut().unwrap().offsets[1] = PublicParams::MAX_ROUTING_ENTRIES_EXCLUSIVE;
+        let err = proof.check_shape().unwrap_err();
+        assert!(err.to_string().contains("O_{e-1} must be < 2^19"), "{err}");
     }
 
     #[test]
