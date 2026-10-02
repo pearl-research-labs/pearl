@@ -193,9 +193,6 @@ func setupPeerQuality(t *testing.T) (*rpctest.Harness, *scriptedPeer) {
 	}, 30*time.Second, 100*time.Millisecond,
 		"setupPeerQuality: tip didn't advance to >=1")
 
-	before, err := victim.Client.GetConnectionCount()
-	require.NoError(t, err, "setupPeerQuality: GetConnectionCount")
-
 	sp := newScriptedPeer(t, victim.P2PAddress())
 	t.Cleanup(func() {
 		sp.Disconnect()
@@ -205,9 +202,18 @@ func setupPeerQuality(t *testing.T) (*rpctest.Harness, *scriptedPeer) {
 	// The scripted peer's verack only means its own handshake finished.
 	// The victim registers the peer on its handler after that, and
 	// handleInvMsg drops an inv that arrives first.
+	local := sp.LocalAddr().String()
 	require.Eventually(t, func() bool {
-		n, err := victim.Client.GetConnectionCount()
-		return err == nil && n > before
+		peers, err := victim.Client.GetPeerInfo()
+		if err != nil {
+			return false
+		}
+		for _, p := range peers {
+			if p.Addr == local {
+				return true
+			}
+		}
+		return false
 	}, 15*time.Second, 10*time.Millisecond,
 		"setupPeerQuality: victim did not register the scripted peer")
 
