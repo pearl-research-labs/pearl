@@ -107,8 +107,6 @@ func (jt *JitterTicker) start() {
 			if !timer.Stop() {
 				<-timer.C
 			}
-
-			return
 		}
 	}
 }
