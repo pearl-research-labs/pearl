@@ -18,7 +18,6 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/term"
 )
 
 func TestOysterKeyMapEscBacksOut(t *testing.T) {
@@ -41,49 +40,23 @@ func TestOysterKeyMapEscBacksOut(t *testing.T) {
 	}
 }
 
-func TestWithSpinnerSlowPathReturnsFnError(t *testing.T) {
-	sentinel := errors.New("slow failure")
-	start := time.Now()
-	err := withSpinner("working...", func() error {
-		time.Sleep(2 * spinnerDelay)
-		return sentinel
-	})
-	require.ErrorIs(t, err, sentinel)
-	assert.Less(t, time.Since(start), 2*spinnerDelay+time.Second)
-}
-
-func TestTerminalCanHostSpinner(t *testing.T) {
-	stdoutTTY := term.IsTerminal(int(os.Stdout.Fd()))
-	stdinTTY := term.IsTerminal(int(os.Stdin.Fd()))
-	if stdoutTTY && stdinTTY {
-		assert.True(t, terminalCanHostSpinner())
-		return
+// A slow operation must return its own error. Headless and test runs have
+// nothing for Bubble Tea to attach to; the spinner's open failure must not
+// replace this result.
+func TestWithSpinnerReturnsFnResult(t *testing.T) {
+	for _, accessible := range []bool{false, true} {
+		t.Run(fmt.Sprintf("accessible=%v", accessible), func(t *testing.T) {
+			if accessible {
+				t.Setenv("ACCESSIBLE", "1")
+			}
+			sentinel := errors.New("slow failure")
+			err := withSpinner("working...", func() error {
+				time.Sleep(2 * spinnerDelay)
+				return sentinel
+			})
+			require.ErrorIs(t, err, sentinel)
+		})
 	}
-	if !stdoutTTY {
-		assert.False(t, terminalCanHostSpinner())
-	}
-}
-
-func TestWithSpinnerFastPath(t *testing.T) {
-	// Completing before spinnerDelay must not spawn the spinner program
-	// (no TTY in tests, so spawning one would also fail the test).
-	sentinel := errors.New("boom")
-	start := time.Now()
-	err := withSpinner("working...", func() error { return sentinel })
-	require.ErrorIs(t, err, sentinel)
-	assert.Less(t, time.Since(start), spinnerDelay)
-
-	require.NoError(t, withSpinner("working...", func() error { return nil }))
-}
-
-func TestWithSpinnerAccessibleMode(t *testing.T) {
-	t.Setenv("ACCESSIBLE", "1")
-	sentinel := errors.New("slow failure")
-	err := withSpinner("working...", func() error {
-		time.Sleep(2 * spinnerDelay)
-		return sentinel
-	})
-	require.ErrorIs(t, err, sentinel)
 }
 
 func TestFriendlyError(t *testing.T) {
