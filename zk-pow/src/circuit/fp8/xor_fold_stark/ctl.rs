@@ -49,7 +49,7 @@ pub fn ctl_lottery_words_looked_xor_fold<F: Field>() -> TableWithColumns<F> {
     )
 }
 
-/// XorFoldStark's per-row LUT inventory: RC16 x12 — the four mul-add limbs,
+/// XorFoldStark's per-row LUT inventory: RC16 x10 — the two high mul-add limbs,
 /// the rotation-split bounds and the canonicity cap `MULADD_HIGH_LIMB_1 + 1` that kills X1's
 /// `+p` limb alias, plus the two skip-budget slack limbs. The slack lookups apply on every row;
 /// only the final row enters the budget equality, and honest traces set both limbs to zero
@@ -61,13 +61,11 @@ pub fn ctl_lottery_words_looked_xor_fold<F: Field>() -> TableWithColumns<F> {
 /// - `ROTATION_INPUT_TOP13`: the unshifted check prevents wrap, then the `2^3`-scaled check
 ///   gives the 13-bit bound.
 /// - `ROTATION_INPUT_BOTTOM19_LIMB_1`: the unshifted check plus the `2^13`-scaled check gives
-///   the 3-bit bound. Without the unshifted half, an alias can satisfy X2's split while moving
+///   the 3-bit bound. Without the unshifted half, an alias can satisfy X1 while moving
 ///   `FOLD_OUT`, enabling free lottery grinding.
 pub fn xor_fold_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
     let m = &XOR_FOLD_COL_MAP;
     vec![
-        LutLookup::rc16(Column::single(m.muladd_low_limb_0)),
-        LutLookup::rc16(Column::single(m.muladd_low_limb_1)),
         LutLookup::rc16(Column::single(m.muladd_high_limb_0)),
         LutLookup::rc16(Column::single(m.muladd_high_limb_1)),
         LutLookup::rc16(Column::single(m.rotation_input_bottom19_limb_0)),
@@ -107,9 +105,9 @@ mod tests {
 
     #[test]
     fn xor_fold_lut_inventory_matches_documented_counts() {
-        // Documented inventory: 12 RC16 instances, nothing else.
+        // Documented inventory: 10 RC16 instances, nothing else.
         let lookups = xor_fold_lut_lookups::<F>();
-        assert_eq!(lookups.len(), 12);
+        assert_eq!(lookups.len(), 10);
         assert!(lookups.iter().all(|l| l.table == LutTable::Range16));
     }
 }
