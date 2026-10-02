@@ -5,9 +5,11 @@
 package rpctest
 
 import (
+	"fmt"
 	"reflect"
 	"time"
 
+	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/rpcclient"
 )
@@ -103,35 +105,60 @@ retry:
 	return nil
 }
 
+// connectNodeTimeout bounds how long ConnectNode waits for either end to
+// register the connection.
+const connectNodeTimeout = 30 * time.Second
+
 // ConnectNode establishes a new peer-to-peer connection between the "from"
 // harness and the "to" harness.  The connection made is flagged as persistent,
 // therefore in the case of disconnects, "from" will attempt to reestablish a
 // connection to the "to" harness.
+//
+// It returns once both ends have registered the connection. A node announces
+// new blocks only to peers it has registered, and "from" syncs only from a peer
+// that announced a block or advertised a greater height in its handshake, so a
+// block "to" mines before registering "from" never reaches it.
 func ConnectNode(from *Harness, to *Harness) error {
-	peerInfo, err := from.Client.GetPeerInfo()
-	if err != nil {
-		return err
-	}
-	numPeers := len(peerInfo)
-
 	targetAddr := to.node.config.listen
 	if err := from.Client.AddNode(targetAddr, rpcclient.ANAdd); err != nil {
 		return err
 	}
 
-	// Block until a new connection has been established.
-	peerInfo, err = from.Client.GetPeerInfo()
+	outbound, err := waitForPeer(from, func(p btcjson.GetPeerInfoResult) bool {
+		return p.Addr == targetAddr
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("%s did not register its connection to %s: %w", from.P2PAddress(), targetAddr, err)
 	}
-	for len(peerInfo) <= numPeers {
-		peerInfo, err = from.Client.GetPeerInfo()
-		if err != nil {
-			return err
-		}
+
+	_, err = waitForPeer(to, func(p btcjson.GetPeerInfoResult) bool {
+		return p.Addr == outbound.AddrLocal
+	})
+	if err != nil {
+		return fmt.Errorf("%s did not register the connection from %s: %w", targetAddr, outbound.AddrLocal, err)
 	}
 
 	return nil
+}
+
+// waitForPeer polls h until its peer list has an entry matching match.
+func waitForPeer(h *Harness, match func(btcjson.GetPeerInfoResult) bool) (btcjson.GetPeerInfoResult, error) {
+	deadline := time.Now().Add(connectNodeTimeout)
+	for {
+		peers, err := h.Client.GetPeerInfo()
+		if err != nil {
+			return btcjson.GetPeerInfoResult{}, err
+		}
+		for _, p := range peers {
+			if match(p) {
+				return p, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return btcjson.GetPeerInfoResult{}, fmt.Errorf("no matching peer after %v", connectNodeTimeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TearDownAll tears down all active test harnesses.
