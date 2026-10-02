@@ -21,6 +21,10 @@ from .layout import (
     AxisPattern,
 )
 
+# FP8/v4 public-shape limit, mirrored by zk-pow's PublicParams: the MoE
+# routing table holds strictly fewer than 2^19 u32 entries.
+MAX_ROUTING_ENTRIES_EXCLUSIVE = 1 << 19
+
 
 class HashId(enum.IntEnum):
     """Whitelisted keyed-BLAKE3 Merkle leaf size and wire discriminant."""

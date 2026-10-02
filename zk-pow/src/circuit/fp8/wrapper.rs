@@ -306,7 +306,13 @@ impl Fp8WrapperCircuits {
         // deployed v2 layer 2 which exposes the layer-1 digest as public inputs).
         let stage1_verifier_target = builder.constant_verifier_data(&stage1.verifier_only);
         builder.verify_proof::<InnerC>(&stage1_proof_target, &stage1_verifier_target, &stage1.common);
-        let stage2 = timed!(timing, "build the stage-2 (ZK) wrapper circuit", builder.build::<OuterC>());
+        // The constrained build connects each Z-blinding pair through the permutation
+        // argument; the frozen V1/V2 circuits keep building through plain `build`.
+        let stage2 = timed!(
+            timing,
+            "build the stage-2 (ZK) wrapper circuit",
+            builder.build_with_z_blinding_copy_constraints::<OuterC>()
+        );
         log::info!("stage-2 wrapper circuit: 2^{} gates", stage2.common.degree_bits());
 
         Ok(Self {

@@ -13,8 +13,8 @@ materializing a dequantized value:
   once -- bit-identical to the reference
   ``PrequantMatrix.exact_norms``, which defines the protocol row sum
   of squares over these exact code-scale products.
-- ``absmax``: ``max|bf16(q*s)| == bf16(max_groups s * max|q|)`` -- scaling by
-  a non-negative constant commutes with max, and BF16 RTNE is monotone, so
+- ``absmax``: ``max|bf16(q*s)| == bf16(max_groups |s| * max|q|)`` -- scaling by
+  the magnitude of each block scale commutes with max, and BF16 RTNE is monotone, so
   the rounding also moves out past the max over groups. An integer byte-max
   per group (prmt sign-extension + native ``max/min.s16x2``; the SIMD-video
   byte ops are emulated expensively on SM100), one exact multiply, and a
@@ -157,10 +157,10 @@ def _unit_stats(rCodes, word, scale_word):
         # Group sumsq term: s*s is exact, the product rounds once -- the same
         # single rounding as the reference row_norms.
         ssq = ssq + (s * s) * _u32_f32(q2)
-        # Group absmax: s * max|q| is exact in fp32 (8+7 significand bits).
+        # Group absmax: |s| * max|q| is exact in fp32 (8+7 significand bits).
         # BF16 RTNE is monotone, so the block's single rounding of the
         # largest product equals the reference's max over rounded groups.
-        mx = cute.arch.fmax(mx, s * _u32_f32(maxq))
+        mx = cute.arch.fmax(mx, cute.arch.fmax(s, -s) * _u32_f32(maxq))
     return ssq, mx
 
 

@@ -408,6 +408,12 @@ def test_moe_opening_rejects_non_canonical_witnesses():
     )
     header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
 
+    # A lazy range exercises the length gate without allocating a huge table.
+    with pytest.raises(ValueError, match=r"fewer than 2\^19"):
+        create_proof(
+            replace(opening, moe=replace(moe, routing=range(1 << 19))), header, PARENT_BYTES
+        )
+
     shifted = list(offsets)
     shifted[-1] -= 1  # no longer ends at len(routing)
     for bad_offsets in (tuple(shifted), tuple(reversed(offsets)), tuple(float(o) for o in offsets)):

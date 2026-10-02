@@ -298,6 +298,7 @@ fn matmul_fp8_windowed(
 /// f32 -> BF16 cast, round to nearest, ties to even: the COMPUTE-path operand
 /// conversion.
 pub fn fp32_to_bf16_rne(a: f32) -> u16 {
+    check_not_nan_or_inf_f32(a).expect("fp32_to_bf16 input must be a finite f32");
     let bits = a.to_bits();
 
     // Round to nearest, ties to even.
@@ -589,6 +590,13 @@ pub fn bf16_from_i8s(values: &[i8]) -> Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fp32_to_bf16_rejects_nonfinite_inputs_before_rounding() {
+        for bits in [0x7f80_0000, 0xff80_0000, 0x7fff_ffff, 0xffff_ffff] {
+            assert!(std::panic::catch_unwind(|| fp32_to_bf16_rne(f32::from_bits(bits))).is_err());
+        }
+    }
 
     #[test]
     fn h100_replay_resets_every_four_atoms_and_promotes_in_fp32() {

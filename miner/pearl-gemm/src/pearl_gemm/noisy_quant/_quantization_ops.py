@@ -187,8 +187,9 @@ def _scale_chain(ssq, amax, kf, delta_r, delta_over_std):
         _l2_grid_round_f32(cutlass.Float32(cute.math.sqrt(mean))),
         cutlass.Float32(_NORM_FLOOR),
     )
-    # amax is an exact bf16 value (no eps bump); 2^-32 is bf16-exact too.
-    linf = cute.arch.fmax(cutlass.Float32(amax), cutlass.Float32(_NORM_FLOOR))
+    # The committed FP10 norm rounds the maximum product to BF16 before the
+    # scale-chain FMA. Round here as well when stats came from another producer.
+    linf = cute.arch.fmax(_rndb(cutlass.Float32(amax)), cutlass.Float32(_NORM_FLOOR))
     nb = _rndb(cutlass.Float32(delta_r) * l2 + linf)
     alpha = _rndb(cutlass.Float32(MAX_E4M3) / nb)
     beta = _rndb(_rndb(alpha * l2) * cutlass.Float32(delta_over_std))
