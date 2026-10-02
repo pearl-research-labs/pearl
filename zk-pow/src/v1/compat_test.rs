@@ -154,15 +154,18 @@ mod test {
             main_config,
             None,
             false,
-            crate::api::seed::SeedDerivation::Legacy,
+            crate::v2::api::seed::SeedDerivation::Legacy,
         )
         .unwrap()
         .unwrap();
 
         // Parse with v2 module to get public/private params for hashing
-        let (private_params, public_params) =
-            crate::v2::api::plain_proof::parse_plain_proof(main_header, &plain_proof, crate::api::seed::SeedDerivation::Legacy)
-                .unwrap();
+        let (private_params, public_params) = crate::v2::api::plain_proof::parse_plain_proof(
+            main_header,
+            &plain_proof,
+            crate::v2::api::seed::SeedDerivation::Legacy,
+        )
+        .unwrap();
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(&public_params.block_header.to_bytes());
@@ -231,7 +234,7 @@ mod test {
     fn test_v1_proof_fixture() {
         let (header, _config, _m, _n, _k) = v1_params();
 
-        let buffer = include_bytes!("fixures/stark_proof.bin");
+        let buffer = include_bytes!("fixtures/stark_proof.bin");
         let public_data: &[u8; PublicProofParams::PUBLICDATA_SIZE] =
             buffer[..PublicProofParams::PUBLICDATA_SIZE].try_into().unwrap();
         let proof_data = &buffer[PublicProofParams::PUBLICDATA_SIZE..];

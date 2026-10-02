@@ -9,7 +9,6 @@ use blake3::BLOCK_LEN;
 use pearl_blake3::MerkleProof;
 
 use crate::ensure_eq;
-use crate::ffi::plain_proof::{MoEProofParams, PlainProof};
 use crate::v2::api::proof::{
     IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, MoEParams, PeriodicPattern, PrivateProofParams,
     PublicProofParams,
@@ -17,6 +16,7 @@ use crate::v2::api::proof::{
 use crate::v2::circuit::chip::blake3::program::{
     AuxiliaryCvLocation, AuxiliaryMsgLocation, ProofSource, routing_blake_hotspot_rows,
 };
+use crate::v2::ffi::plain_proof::{MoEProofParams, PlainProof};
 use pearl_blake3::{BLAKE3_CHUNK_LEN, BLAKE3_DIGEST_SIZE};
 
 fn extract_routing_strips(p: &PlainProof, params: &PublicProofParams) -> Result<Vec<Vec<u8>>> {
@@ -288,7 +288,7 @@ fn moe_inner_indices(p: &PlainProof) -> Result<(Vec<u32>, Vec<u32>, Option<MoEPa
 pub fn parse_plain_proof(
     header: IncompleteBlockHeader,
     p: &PlainProof,
-    seed_derivation: crate::api::seed::SeedDerivation,
+    seed_derivation: crate::v2::api::seed::SeedDerivation,
 ) -> Result<(PrivateProofParams, PublicProofParams)> {
     // Leaf-count binds usize; public dims are u32/u16 — wrap would unbind them.
     let m: u32 = p.m.try_into().context("m exceeds u32")?;

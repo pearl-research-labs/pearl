@@ -4,7 +4,7 @@ quantization, and peel kernel.
 The lottery-critical noise dot runs on the warp-level ``mma.sync`` e4m3 atom
 (``warp.MmaFP8Op`` m16n8k32), whose K = 32 datapath is bit-identical to the
 ``tcgen05`` kind::f8f6f4 atom the verifier's ``B200`` replay models
-(``zk-pow/src/api/fp8/utils.rs``), so the noise term entering the quantize
+(``zk-pow/src/v4/api/utils.rs``), so the noise term entering the quantize
 chain is bit-exact against SM100 by construction: the four consumer warps
 compute ``noise (16 rows x bk) = E1_half (16 x K, e4m3) @ F1_tile^T (K x bk,
 e4m3)`` per row half per k-tile straight into register accumulators, one

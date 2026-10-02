@@ -6,13 +6,13 @@ mod test {
     use std::io::Write;
     use std::path::Path;
 
-    use crate::api::seed::SeedDerivation;
-    use crate::ffi::plain_proof::PlainProof;
     use crate::v2::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern};
     use crate::v2::api::proof::{PublicProofParams, ZKProof};
+    use crate::v2::api::seed::SeedDerivation;
     use crate::v2::api::{prove, verify};
     use crate::v2::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
     use crate::v2::circuit::pearl_stark::PearlStark;
+    use crate::v2::ffi::plain_proof::PlainProof;
     use crate::v2::mine::try_mine_one;
 
     use plonky2_field::goldilocks_field::GoldilocksField;
@@ -282,7 +282,7 @@ mod test {
     #[test]
     #[ignore] // Run with: cargo test -- --ignored test_generate_v2_fixture
     fn test_generate_v2_fixture() {
-        let path = std::path::Path::new("fixures/v2_stark_proof.bin");
+        let path = std::path::Path::new("src/v2/fixtures/v2_stark_proof.bin");
         generate_and_write_stark_proof(path);
         println!("V2 non-MoE fixture written to {:?}", path);
     }
@@ -291,7 +291,7 @@ mod test {
     fn test_proof_fixture() {
         let params = params();
 
-        let buffer = include_bytes!("../../../fixures/v2_stark_proof.bin");
+        let buffer = include_bytes!("../fixtures/v2_stark_proof.bin");
         let public_data = &buffer[..PublicProofParams::WIRE_SIZE];
         let proof_data = &buffer[PublicProofParams::WIRE_SIZE..];
 
@@ -364,7 +364,7 @@ mod test {
     #[test]
     #[ignore] // Run with: cargo test -- --ignored test_generate_moe_fixture
     fn test_generate_moe_fixture() {
-        let path = std::path::Path::new("fixures/v2_stark_proof_moe.bin");
+        let path = std::path::Path::new("src/v2/fixtures/v2_stark_proof_moe.bin");
         generate_and_write_moe_proof(path);
         println!("MoE fixture written to {:?}", path);
     }
@@ -373,7 +373,7 @@ mod test {
     fn test_moe_proof_fixture() {
         let (header, _config, _m, _n, _k) = moe_params();
 
-        let buffer = include_bytes!("../../../fixures/v2_stark_proof_moe.bin");
+        let buffer = include_bytes!("../fixtures/v2_stark_proof_moe.bin");
         let public_data_len = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
         let public_data = &buffer[4..4 + public_data_len];
         let proof_data = &buffer[4 + public_data_len..];

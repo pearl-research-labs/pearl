@@ -32,7 +32,7 @@ MOE_LOTTERY_N = 128
 _MAX_256 = (1 << 256) - 1
 
 # Verifier bounds for a peel proof (pinned py-pearl-mining, zk-pow
-# api/fp8/public_params.rs). A winning tile exposes TILE_ROWS + TILE_COLS rows
+# v4/api/public_params.rs). A winning tile exposes TILE_ROWS + TILE_COLS rows
 # of k BF16 elements to one verifier worker, capped at 2^22 elements; cert-v4
 # rejects k below 1024 (and above 2^16) outright. Work outside this domain can
 # never become an accepted proof, so it must never be credited.

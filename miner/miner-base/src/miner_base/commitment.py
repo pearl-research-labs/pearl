@@ -4,7 +4,7 @@ v4 commitments: every committed tree is keyed with its side's
 opening key (``keyA`` / ``keyB``, :func:`~.transcript.commitment_keys`), and a
 prequantized operand's two plane roots combine into the side's aggregate
 digest ``HA`` / ``HB`` (``operand_digest_fp10`` in
-``zk-pow/src/api/proof_utils.rs``):
+``zk-pow/src/v4/api/proof_utils.rs``):
 
     HA / HB = blake3(keyed_merkle_root(int8 values) || keyed_merkle_root(BF16 scales), key=keyA/keyB)
 
@@ -194,7 +194,7 @@ def hash_offsets(
     The u32-LE encoding of ``O`` is zero-padded to the ``hash_idO`` chunk
     granularity first. A list that fits one chunk roots to the flat keyed
     BLAKE3 digest of the padded bytes; larger lists build the chunk tree
-    (twin: ``offsets_root`` in ``zk-pow/src/api/fp8/plain_proof.rs``).
+    (twin: ``offsets_root`` in ``zk-pow/src/v4/api/plain_proof.rs``).
     """
     raw = b"".join(encode_u32_le(offset) for offset in end_offsets)
     tree = MerkleTree(

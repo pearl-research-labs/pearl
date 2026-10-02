@@ -1,6 +1,6 @@
 """Committed extractor layout: typed mixed-radix axis patterns.
 
-Twin of the Rust verifier's ``zk-pow/src/api/layout.rs``.
+Twin of the Rust verifier's ``zk-pow/src/v4/api/layout.rs``.
 An :class:`AxisPattern` is an ordered list of dims ``(length, DimType)`` with
 implicit stride = product of the preceding lengths, covering one period
 ``[0..total)``. ``Fold`` dims span one subtile (folded by a single extractor
@@ -30,7 +30,7 @@ from dataclasses import dataclass
 LANES = 16
 
 # Per-subtile element bound. Mirrors MAX_SUBTILE_ELEMS in
-# zk-pow/src/api/layout.rs.
+# zk-pow/src/v4/api/layout.rs.
 MAX_SUBTILE_ELEMS = 256
 
 # Lower bound on the per-subtile element count (fold product across both

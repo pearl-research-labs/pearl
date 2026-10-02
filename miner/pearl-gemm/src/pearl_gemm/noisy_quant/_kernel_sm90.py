@@ -1,7 +1,7 @@
 """Hopper (SM90) variant of the fused stats, noising, quantization, and peel kernel.
 
 The noise dot runs on the Hopper QGMMA atom (``wgmma.mma_async`` e4m3), the
-opcode the verifier's H100 replay (``zk-pow/src/api/fp8/utils.rs``) models,
+opcode the verifier's H100 replay (``zk-pow/src/v4/api/utils.rs``) models,
 so the noise term is bit-exact against the Hopper reference. The
 ``A' @ F2^T`` peel uses warp-level f16 MMAs with f32 accumulators instead:
 the reference peel is a near-exact f32 path that QGMMA's 14-bit window

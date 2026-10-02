@@ -9,7 +9,6 @@ use log::info;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::time::Instant;
-use zk_pow::ffi::plain_proof::PlainProof;
 use zk_pow::v2::api::proof::MoEConfig;
 use zk_pow::v2::api::{
     proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern, PrivateProofParams, PublicProofParams},
@@ -18,6 +17,7 @@ use zk_pow::v2::api::{
 use zk_pow::v2::circuit::circuit_utils::CircuitCache;
 use zk_pow::v2::circuit::embedded_cache;
 use zk_pow::v2::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
+use zk_pow::v2::ffi::plain_proof::PlainProof;
 use zk_pow::v2::mine::mine_moe;
 
 fn test_block_header(nbits: u32) -> IncompleteBlockHeader {
@@ -83,7 +83,7 @@ fn setup(
 
     let mut public_params = PublicProofParams::new_dummy(
         block_header,
-        zk_pow::api::seed::SeedDerivation::Legacy,
+        zk_pow::v2::api::seed::SeedDerivation::Legacy,
         mining_configuration,
         6144, // m: rows of A
         4096, // n: columns of B
@@ -235,7 +235,7 @@ fn test_ffi_mine_prove_verify_with_rank(rank: u16, is_moe: bool) {
         mining_config,
         None,
         false,
-        zk_pow::api::seed::SeedDerivation::Legacy,
+        zk_pow::v2::api::seed::SeedDerivation::Legacy,
     )
     .expect("Mining failed");
 
@@ -258,7 +258,7 @@ fn test_ffi_mine_prove_verify_with_rank(rank: u16, is_moe: bool) {
     // Step 2: Parse plain proof to get private/public params
     let start = Instant::now();
     let (private_params, mut public_params) =
-        zk_pow::v2::api::plain_proof::parse_plain_proof(block_header, &pow_proof, zk_pow::api::seed::SeedDerivation::Legacy)
+        zk_pow::v2::api::plain_proof::parse_plain_proof(block_header, &pow_proof, zk_pow::v2::api::seed::SeedDerivation::Legacy)
             .expect("Failed to parse plain proof");
     info!("Parsing took {:?}", start.elapsed());
 

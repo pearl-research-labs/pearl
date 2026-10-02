@@ -4,12 +4,12 @@ use anyhow::Result;
 use primitive_types::U256;
 use rand::Rng;
 
-use crate::ffi::plain_proof::{MatrixMerkleProof, MoEProofParams, PlainProof};
 use crate::v2::api::proof::{IncompleteBlockHeader, MiningConfiguration, PeriodicPattern, SeedDerivation};
 use crate::v2::api::proof_utils::{compute_hash_activations, compute_jackpot_hash};
 use crate::v2::api::sanity_checks::extract_difficulty_bound;
 use crate::v2::circuit::pearl_noise::compute_noise_for_indices;
 use crate::v2::circuit::pearl_program::{JACKPOT_SIZE, LROT_PER_TILE};
+use crate::v2::ffi::plain_proof::{MatrixMerkleProof, MoEProofParams, PlainProof};
 use pearl_blake3::{BLAKE3_CHUNK_LEN, blake3_digest};
 
 const SIGNAL_MIN: i8 = -64;

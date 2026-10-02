@@ -85,9 +85,9 @@ fn main() -> Result<()> {
 /// setup derives its cap fresh from the LUT tables before baking it into the wrapper
 /// circuit; the degree profile and geometry remain public inputs.
 fn build_fp8_cache() -> Result<Vec<u8>> {
-    use zk_pow::api::fp8::public_params::Device;
-    use zk_pow::api::fp8::zk::{Fp8Verifier, Fp8VerifierCache, sample_dense_statement_for_device};
-    use zk_pow::api::primitives::IncompleteBlockHeader;
+    use zk_pow::v4::api::primitives::IncompleteBlockHeader;
+    use zk_pow::v4::api::public_params::Device;
+    use zk_pow::v4::api::zk::{Fp8Verifier, Fp8VerifierCache, sample_dense_statement_for_device};
 
     let mut cache = Fp8VerifierCache::default();
     for device in Device::ALL {

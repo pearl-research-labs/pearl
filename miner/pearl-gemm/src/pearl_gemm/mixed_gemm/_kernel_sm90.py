@@ -9,7 +9,7 @@ publish while those phases run.
 
 The lottery-critical accumulation is the Hopper device model's (Pearl
 whitepaper, Appendix "E4M3FN matrix multiplication"; the verifier's ``H100``
-replay in ``zk-pow/src/api/fp8/utils.rs``): each 128-term k-tile is one
+replay in ``zk-pow/src/v4/api/utils.rs``): each 128-term k-tile is one
 promotion window, accumulated from +0 and added to the FP32 total with one
 RNE rounding. ``_promoted_mainloop`` reuses one 64-row window across the
 warpgroup's M-atoms, so a thread holds the FP32 total plus a single window

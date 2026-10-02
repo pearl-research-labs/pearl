@@ -31,7 +31,7 @@ import (
 // (the node never compiles setups); regenerate it and the FFI library first:
 //
 //	cd zk-pow && cargo run --release --no-default-features --bin build_cache \
-//	    src/api/fp8/fp8_cache.bin
+//	    src/v4/api/fp8_cache.bin
 //	task build:zk-gobind && go clean -cache
 func loadFP8Fixture(t *testing.T) (*wire.BlockHeader, *wire.CertificateV4) {
 	return loadFP8FixtureForDevice(t, "b200")
