@@ -294,9 +294,17 @@ func resetCoinMetaCache(t *testing.T) {
 	t.Cleanup(func() { coinMetaCache = old })
 }
 
+// withoutSpinner runs withSpinner in accessible mode, which prints the title instead of starting Bubble Tea. Tests
+// have no terminal for Bubble Tea, and a fake wallet that answers slower than spinnerDelay under -race would reach it.
+func withoutSpinner(t *testing.T) {
+	t.Helper()
+	t.Setenv("ACCESSIBLE", "1")
+}
+
 // A wallet past the limit is searched first. Applying redraws the same search, Esc goes back to the search, and the
 // locked outputs the search did not list are never touched.
 func TestBrowseCoinsLargeWallet(t *testing.T) {
+	withoutSpinner(t)
 	resetCoinMetaCache(t)
 	wallet, free, hidden := newFakeCoinWallet("large", 600, 2)
 	c, _ := fakeRPCClient(t, wallet.respond)
@@ -359,6 +367,7 @@ func TestBrowseCoinsLargeWallet(t *testing.T) {
 }
 
 func TestBrowseCoinsSmallWallet(t *testing.T) {
+	withoutSpinner(t)
 	t.Run("lists everything, redraws after an apply and leaves on Esc without a search", func(t *testing.T) {
 		resetCoinMetaCache(t)
 		wallet, free, _ := newFakeCoinWallet("small", 3, 0)
@@ -387,6 +396,7 @@ func TestBrowseCoinsSmallWallet(t *testing.T) {
 }
 
 func TestBrowseCoinsSearchWithoutMatches(t *testing.T) {
+	withoutSpinner(t)
 	resetCoinMetaCache(t)
 	wallet, _, _ := newFakeCoinWallet("nomatch", coinListLimit+1, 0)
 	c, _ := fakeRPCClient(t, wallet.respond)

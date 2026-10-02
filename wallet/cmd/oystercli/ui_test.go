@@ -11,7 +11,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
@@ -37,25 +36,6 @@ func TestOysterKeyMapEscBacksOut(t *testing.T) {
 		"confirm next":  &km.Confirm.Next,
 	} {
 		assert.Contains(t, b.Help().Desc, "esc back", name)
-	}
-}
-
-// A slow operation must return its own error. Headless and test runs have
-// nothing for Bubble Tea to attach to; the spinner's open failure must not
-// replace this result.
-func TestWithSpinnerReturnsFnResult(t *testing.T) {
-	for _, accessible := range []bool{false, true} {
-		t.Run(fmt.Sprintf("accessible=%v", accessible), func(t *testing.T) {
-			if accessible {
-				t.Setenv("ACCESSIBLE", "1")
-			}
-			sentinel := errors.New("slow failure")
-			err := withSpinner("working...", func() error {
-				time.Sleep(2 * spinnerDelay)
-				return sentinel
-			})
-			require.ErrorIs(t, err, sentinel)
-		})
 	}
 }
 

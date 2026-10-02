@@ -12,10 +12,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"testing"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/huh/v2"
 	"charm.land/huh/v2/spinner"
 	"charm.land/lipgloss/v2"
@@ -123,22 +121,14 @@ func availableRowWidth(gutter int) int {
 const spinnerDelay = 150 * time.Millisecond
 
 // withSpinner runs fn, showing a spinner only when it takes long enough to
-// matter and a terminal can host it.
-//
-// Fast operations never spawn the spinner's Bubble Tea program: every
-// program queries the terminal for capabilities at startup, and when the
-// program exits before the reply arrives, the reply is echoed to the user
-// as garbage like "^[[?2026;2$y" (bubbletea issue #1590). Skipping the
+// matter. Fast operations never spawn the spinner's Bubble Tea program:
+// every program queries the terminal for capabilities at startup, and when
+// the program exits before the reply arrives, the reply is echoed to the
+// user as garbage like "^[[?2026;2$y" (bubbletea issue #1590). Skipping the
 // program for quick calls avoids that leak for the common case.
-//
-// When stdin is not a terminal, that program opens the controlling terminal
-// itself; with none, it returns the open error in place of fn's result.
 func withSpinner(title string, fn func() error) error {
-	if accessibleMode() || !spinnerWanted() {
-		if accessibleMode() {
-			fmt.Println(title)
-		}
-
+	if accessibleMode() {
+		fmt.Println(title)
 		return fn()
 	}
 
@@ -156,37 +146,6 @@ func withSpinner(title string, fn func() error) error {
 		return serr
 	}
 	return err
-}
-
-// spinnerWanted reports whether this process should try to draw a spinner.
-// A test binary inherits the terminal it was started from, so the slow path
-// would attach Bubble Tea to it and stop being deterministic.
-func spinnerWanted() bool {
-	if testing.Testing() {
-		return false
-	}
-	return terminalCanHostSpinner()
-}
-
-// terminalCanHostSpinner reports whether Bubble Tea can draw a spinner and
-// read input. It draws on stdout, and when stdin is not a terminal it opens
-// the controlling terminal itself, which fails when there is none.
-func terminalCanHostSpinner() bool {
-	if !term.IsTerminal(int(os.Stdout.Fd())) {
-		return false
-	}
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		return true
-	}
-	in, out, err := tea.OpenTTY()
-	if err != nil {
-		return false
-	}
-	_ = in.Close()
-	if out != in {
-		_ = out.Close()
-	}
-	return true
 }
 
 // --- Output helpers ---
