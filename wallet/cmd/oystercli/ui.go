@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/huh/v2"
 	"charm.land/huh/v2/spinner"
 	"charm.land/lipgloss/v2"
@@ -130,8 +131,8 @@ const spinnerDelay = 150 * time.Millisecond
 // as garbage like "^[[?2026;2$y" (bubbletea issue #1590). Skipping the
 // program for quick calls avoids that leak for the common case.
 //
-// With no controlling terminal, that program opens /dev/tty and returns the
-// open error in place of fn's result.
+// When stdin is not a terminal, that program opens the controlling terminal
+// itself; with none, it returns the open error in place of fn's result.
 func withSpinner(title string, fn func() error) error {
 	if accessibleMode() || !spinnerWanted() {
 		if accessibleMode() {
@@ -169,7 +170,7 @@ func spinnerWanted() bool {
 
 // terminalCanHostSpinner reports whether Bubble Tea can draw a spinner and
 // read input. It draws on stdout, and when stdin is not a terminal it opens
-// /dev/tty, which fails when this process has no controlling terminal.
+// the controlling terminal itself, which fails when there is none.
 func terminalCanHostSpinner() bool {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		return false
@@ -177,12 +178,15 @@ func terminalCanHostSpinner() bool {
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		return true
 	}
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	in, out, err := tea.OpenTTY()
 	if err != nil {
 		return false
 	}
-	defer tty.Close()
-	return term.IsTerminal(int(tty.Fd()))
+	_ = in.Close()
+	if out != in {
+		_ = out.Close()
+	}
+	return true
 }
 
 // --- Output helpers ---
