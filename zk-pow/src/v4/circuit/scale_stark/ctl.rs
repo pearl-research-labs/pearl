@@ -19,8 +19,8 @@ use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
 use super::super::ctl::Table;
-use super::super::luts::ctl::LutLookup;
 use super::super::luts::LutTable;
+use super::super::luts::ctl::LutLookup;
 use super::columns::{
     ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT, L2_SUM_LIMBS,
     SCALE_COL_MAP,
@@ -515,7 +515,7 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
 #[cfg(test)]
 mod tests {
     use plonky2::field::goldilocks_field::GoldilocksField;
-    use starky::cross_table_lookup::{debug_utils::check_ctls, CrossTableLookup};
+    use starky::cross_table_lookup::{CrossTableLookup, debug_utils::check_ctls};
     use starky::util::trace_rows_to_poly_values;
 
     use super::*;
