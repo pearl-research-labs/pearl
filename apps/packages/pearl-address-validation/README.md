@@ -2,16 +2,21 @@
 
 Validate Pearl Taproot (P2TR) addresses using bech32m encoding for mainnet, testnet, regtest, and simnet networks.
 
+Pearl is Taproot-only: valid addresses are bech32m (BIP-350), witness version
+1, with a 32-byte witness program. Legacy SegWit v0 addresses, future witness
+versions, non-32-byte programs, and base58 addresses (Pearl has never had any)
+are all rejected — matching `pearld`'s `decodeSegWitAddress`.
+
 ```js
-validate('dup1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4');
+validate('prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d');
 ==> true
 
-getAddressInfo('dup1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4');
+getAddressInfo('prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d');
 ==> {
   bech32: true,
   network: 'mainnet',
-  address: 'dup1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4',
-  type: 'p2wpkh'
+  address: 'prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d',
+  type: 'p2tr'
 }
 ```
 
@@ -42,8 +47,11 @@ import { validate, getAddressInfo } from 'pearl-address-validation';
 `validate(address)` returns `true` for valid Pearl addresses or `false` for invalid Pearl addresses.
 
 ```js
-validate('17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem')
+validate('prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d')
 ==> true
+
+validate('17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem') // a Bitcoin base58 address
+==> false
 
 validate('invalid')
 ==> false
@@ -54,13 +62,13 @@ validate('invalid')
 `validate(address, network)` allows you to validate whether an address is valid and belongs to `network`.
 
 ```js
-validate('36bJ4iqZbNevh9b9kzaMEkXb28Gpqrv2bd', 'mainnet')
+validate('prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d', 'mainnet')
 ==> true
 
-validate('36bJ4iqZbNevh9b9kzaMEkXb28Gpqrv2bd', 'testnet')
+validate('prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d', 'testnet')
 ==> false
 
-validate('2N4RsPe5F2fKssy2HBf2fH2d7sHdaUjKk1c', 'testnet')
+validate('tprl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psh7xs6c', 'testnet')
 ==> true
 ```
 
@@ -71,51 +79,49 @@ validate('2N4RsPe5F2fKssy2HBf2fH2d7sHdaUjKk1c', 'testnet')
 If the input address is invalid, an exception will be thrown.
 
 ```js
-getAddressInfo('17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem')
+getAddressInfo('prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d')
 ==> {
-  address: '17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem',
-  type: 'p2pkh',
+  address: 'prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d',
+  type: 'p2tr',
   network: 'mainnet',
-  bech32: false
+  bech32: true
 }
 ```
 
 ### Networks
 
-This library supports the following Pearl networks: `mainnet`, `testnet`, `regtest` and `signet`.
+This library supports the following Pearl networks: `mainnet`, `testnet`, `regtest` and `simnet`.
 
-> `signet` addresses will always be recognized as `testnet` addresses.
+Address prefixes: `prl` (mainnet), `tprl` (testnet), `rprl` (regtest/simnet).
 
-> Non-bech32 `regtest` addresses will be recognized as `testnet` addresses.
+#### Casting testnet addresses to regtest or simnet
 
-#### Casting testnet addresses to regtest or signet
-
-You can use the `options` parameter to cast `testnet` addresses to `regtest` or `signet`.
+You can use the `options` parameter to cast `testnet` addresses to `regtest` or `simnet`.
 
 ```js
 // Default - No casting
-getAddressInfo('td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr');
+getAddressInfo('tprl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psh7xs6c');
 ==> {
-  address: 'td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr',
-  type: 'p2wpkh',
+  address: 'tprl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psh7xs6c',
+  type: 'p2tr',
   network: 'testnet',
   bech32: true
 }
 
-// Cast testnet to signet
-getAddressInfo('td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr', {
-  castTestnetTo: 'signet'
+// Cast testnet to regtest
+getAddressInfo('tprl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psh7xs6c', {
+  castTestnetTo: 'regtest'
 })
 ==> {
-  address: 'td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr',
-  type: 'p2wpkh',
-  network: 'signet',
+  address: 'tprl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psh7xs6c',
+  type: 'p2tr',
+  network: 'regtest',
   bech32: true
 }
 
 // Validating and casting
-validate('td1qg3hss5p9g9jp0es5u5aaz3lszf6cvdggtmjarr', 'signet', {
-  castTestnetTo: 'signet'
+validate('tprl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psh7xs6c', 'regtest', {
+  castTestnetTo: 'regtest'
 })
 ==> true
 ```
@@ -129,14 +135,14 @@ enum Network {
   mainnet = 'mainnet',
   testnet = 'testnet',
   regtest = 'regtest',
-  signet = 'signet',
+  simnet = 'simnet',
 }
 
 enum AddressType {
-  p2pkh = 'p2pkh',
-  p2sh = 'p2sh',
-  p2wpkh = 'p2wpkh',
-  p2wsh = 'p2wsh',
+  p2pkh = 'p2pkh', // legacy, never returned for Pearl addresses
+  p2sh = 'p2sh',   // legacy, never returned for Pearl addresses
+  p2wpkh = 'p2wpkh', // legacy, never returned for Pearl addresses
+  p2wsh = 'p2wsh',   // legacy, never returned for Pearl addresses
   p2tr = 'p2tr',
 }
 
@@ -153,10 +159,10 @@ type AddressInfo = {
 ```ts
 import { validate, getAddressInfo, Network, AddressInfo } from 'pearl-address-validation';
 
-validate('36nGbqV7XCNf2xepCLAtRBaqzTcSjF4sv9', Network.mainnet);
+validate('prl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psu3zw9d', Network.mainnet);
 ==> true
 
-const addressInfo: AddressInfo = getAddressInfo('2Mz8rxD6FgfbhpWf9Mde9gy6w8ZKE8cnesp');
+const addressInfo: AddressInfo = getAddressInfo('tprl1p62v09vuzyd8kdz9l23jaf3kph4wwx6jqcmhkkhg8lhr2qlxky8psh7xs6c');
 addressInfo.network;
 
 ==> 'testnet'

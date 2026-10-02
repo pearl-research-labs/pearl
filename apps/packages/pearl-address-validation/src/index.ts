@@ -1,8 +1,4 @@
-import { base58_to_binary } from 'base58-js';
 import { bech32, bech32m } from 'bech32';
-import { createHash } from 'sha256-uint8array';
-
-const sha256 = (payload: Uint8Array) => createHash().update(payload).digest();
 
 enum Network {
   mainnet = 'mainnet',
@@ -11,6 +7,10 @@ enum Network {
   simnet = 'simnet',
 }
 
+// Pearl is Taproot-only (bech32m, witness v1+, 32-byte programs — see
+// node/btcutil/address.go `decodeSegWitAddress` in pearl-research-labs/pearl).
+// The legacy members below are kept only for API compatibility; the parser
+// never returns them.
 enum AddressType {
   p2pkh = 'p2pkh',
   p2sh = 'p2sh',
@@ -24,28 +24,6 @@ type AddressInfo = {
   network: Network;
   address: string;
   type: AddressType;
-};
-
-const addressTypes: { [key: number]: { type: AddressType; network: Network } } = {
-  0x00: {
-    type: AddressType.p2pkh,
-    network: Network.mainnet,
-  },
-
-  0x6f: {
-    type: AddressType.p2pkh,
-    network: Network.testnet,
-  },
-
-  0x05: {
-    type: AddressType.p2sh,
-    network: Network.mainnet,
-  },
-
-  0xc4: {
-    type: AddressType.p2sh,
-    network: Network.testnet,
-  },
 };
 
 type Options = {
@@ -128,10 +106,10 @@ const parseBech32 = (address: string, options?: Options): AddressInfo => {
 };
 
 const getAddressInfo = (address: string, options?: Options): AddressInfo => {
-  let decoded: Uint8Array;
-
   const lowerAddress = address.toLowerCase();
-  // Check if it's a bech32/bech32m address (starts with network prefix + '1')
+  // Pearl addresses are bech32m segwit (Taproot, witness v1+). There are no
+  // base58 Pearl addresses — base58 strings (e.g. Bitcoin '1…'/'3…' or any
+  // other chain's) are never valid here and must be rejected.
   if (lowerAddress.startsWith('prl1') || lowerAddress.startsWith('tprl1') || lowerAddress.startsWith('rprl1')) {
     try {
       return parseBech32(address, options);
@@ -140,49 +118,7 @@ const getAddressInfo = (address: string, options?: Options): AddressInfo => {
     }
   }
 
-  try {
-    decoded = base58_to_binary(address);
-  } catch (error) {
-    throw new Error('Invalid address');
-  }
-
-  const { length } = decoded;
-
-  if (length !== 25) {
-    throw new Error('Invalid address');
-  }
-
-  const version = decoded[0];
-
-  const checksum = decoded.slice(length - 4, length);
-  const body = decoded.slice(0, length - 4);
-
-  const expectedChecksum = sha256(sha256(body)).slice(0, 4);
-
-  if (checksum.some((value: number, index: number) => value !== expectedChecksum[index])) {
-    throw new Error('Invalid address');
-  }
-
-  const validVersions = Object.keys(addressTypes).map(Number);
-
-  if (version === undefined || !validVersions.includes(version)) {
-    throw new Error('Invalid address');
-  }
-
-  const addressType = addressTypes[version];
-
-  if (!addressType) {
-    throw new Error('Invalid address');
-  }
-
-  return normalizeAddressInfo(
-    {
-      ...addressType,
-      address,
-      bech32: false,
-    },
-    options,
-  );
+  throw new Error('Invalid address');
 };
 
 const validate = (address: string, network?: Network, options?: Options) => {

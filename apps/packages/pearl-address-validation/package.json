@@ -51,8 +51,6 @@
     "vitest": "^3.2.6"
   },
   "dependencies": {
-    "base58-js": "^3.0.2",
-    "bech32": "^2.0.0",
-    "sha256-uint8array": "^0.10.3"
+    "bech32": "^2.0.0"
   }
 }
