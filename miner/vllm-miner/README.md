@@ -53,7 +53,20 @@ To run the miner, use the following command. The container will start the `pearl
 Make sure to update `HF_TOKEN` to a good value, and also set `PEARLD_RPC_URL` to a known node URL or otherwise set `MINER_NO_GATEWAY` to true.
 
 ```bash
-docker run --rm -it --gpus all -p 8000:8000 -p 8337:8337 -p 8339:8339 -e MINER_NO_GATEWAY=0 -e PEARLD_RPC_URL=http://172.17.0.1:44107/ -e HF_TOKEN=<TOKEN HERE>   -v /.cache/huggingface:/root/.cache/huggingface   --shm-size 8g   vllm_miner:latest   pearl-ai/Llama-3.1-8B-Instruct-pearl   --host 0.0.0.0   --port 8000   --max-model-len 8192   --gpu-memory-utilization 0.9 --enforce-eager
+docker run --rm -it --gpus all \
+  -p 8000:8000 -p 8337:8337 -p 8339:8339 \
+  -e MINER_NO_GATEWAY=0 \
+  -e PEARLD_RPC_URL=http://172.17.0.1:44107/ \
+  -e HF_TOKEN=<TOKEN HERE> \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --shm-size 8g \
+  vllm_miner:latest \
+  pearl-ai/Llama-3.3-70B-Instruct-pearl \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.9 \
+  --enforce-eager
 ```
 
 ## Pushing to a Registry
