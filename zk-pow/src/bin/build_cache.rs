@@ -1,6 +1,6 @@
 //! Generates the verifier caches embedded by the `embedded_cache` feature
 //! (`v2::circuit::embedded_cache`, `v1::embedded_cache`,
-//! `api::fp8::embedded_cache`), as invoked by CI and the Taskfile's
+//! `v4::api::embedded_cache`), as invoked by CI and the Taskfile's
 //! `build:zk-cache` task. Run WITHOUT that feature (the caches are being
 //! produced, not consumed), from `zk-pow/`:
 //!
@@ -8,11 +8,11 @@
 //!
 //! With no arguments (the invocation the frozen `embedded_cache.rs` comments
 //! reference) every cache is rebuilt at its canonical gitignored path:
-//! `src/api/fp8/fp8_cache.bin`, `src/v2/circuit/v2_cache.bin`,
+//! `src/v4/api/fp8_cache.bin`, `src/v2/circuit/v2_cache.bin`,
 //! `src/v1/v1_cache.bin`. Explicit paths override the defaults:
 //!
 //!   cargo run --release --no-default-features --bin build_cache \
-//!       src/api/fp8/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
+//!       src/v4/api/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
 //!
 //! The trailing paths are optional: with fewer arguments only the leading
 //! caches are written (fp8, then v2, then v1), and a path of `-` skips that
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     );
     if args.is_empty() {
         args = vec![
-            "src/api/fp8/fp8_cache.bin".into(),
+            "src/v4/api/fp8_cache.bin".into(),
             "src/v2/circuit/v2_cache.bin".into(),
             "src/v1/v1_cache.bin".into(),
         ];
