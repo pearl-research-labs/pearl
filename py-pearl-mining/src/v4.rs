@@ -6,7 +6,9 @@ use zk_pow::ffi::py_v4::{PyFp8Prover, PyFp8Verifier};
 use zk_pow::v4::api::layout::{AxisPattern, DimType};
 use zk_pow::v4::api::plain_proof::{MoeWitness, PlainProofV4};
 use zk_pow::v4::api::primitives::BlockHeader;
-use zk_pow::v4::api::public_params::{CommonParams, Device, HashId, MoeParams, OperandParams, Quant};
+use zk_pow::v4::api::public_params::{
+    CommonParams, Device, HashId, MoeParams, OperandParams, Quant,
+};
 use zk_pow::v4::api::verify as fp8_verify;
 
 use crate::common::IncompleteBlockHeader;

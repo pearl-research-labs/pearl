@@ -1,7 +1,7 @@
 //! Python-facing pieces shared by every version module.
 
 use blake3::CHUNK_LEN;
-use pearl_blake3::{MerkleProof, MerkleTree, pad_to_chunk_boundary};
+use pearl_blake3::{pad_to_chunk_boundary, MerkleProof, MerkleTree};
 use pyo3::prelude::*;
 use zk_pow::v2::api::proof::PublicProofParams;
 

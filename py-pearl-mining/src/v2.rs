@@ -12,7 +12,9 @@ use zk_pow::v2::api::seed::SeedDerivation;
 use zk_pow::v2::ffi::plain_proof::{MatrixMerkleProof, MoEProofParams, PlainProof};
 
 use zk_pow::v2::api::proof as v2_proof;
-use zk_pow::v2::api::proof::{MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, PublicProofParams, ZKProof};
+use zk_pow::v2::api::proof::{
+    MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, PublicProofParams, ZKProof,
+};
 use zk_pow::v2::api::{prove, verify};
 use zk_pow::v2::circuit::pearl_circuit::{PearlRecursion, RecursionCircuit};
 use zk_pow::v2::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
