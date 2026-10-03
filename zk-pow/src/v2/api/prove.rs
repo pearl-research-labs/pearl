@@ -1,7 +1,6 @@
 use anyhow::Result;
 use plonky2_field::goldilocks_field::GoldilocksField;
 
-use crate::ffi::plain_proof::PlainProof;
 use crate::v2::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams, SeedDerivation};
 use crate::v2::api::proof::{PrivateProofParams, ZKProof};
 use crate::v2::api::proof_utils::u32_field_array_to_hash;
@@ -9,6 +8,7 @@ use crate::v2::circuit::circuit_utils::CircuitCache;
 use crate::v2::circuit::pearl_circuit::{PearlCircuitParams, PearlRecursion, RecursionCircuit};
 use crate::v2::circuit::pearl_layout::pearl_public;
 use crate::v2::circuit::pearl_stark::PearlStark;
+use crate::v2::ffi::plain_proof::PlainProof;
 
 pub struct ProveResult {
     /// [`PublicProofParams::WIRE_SIZE`] bytes for non-MoE; longer for MoE proof.

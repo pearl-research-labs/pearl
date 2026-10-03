@@ -8,14 +8,14 @@
 
 use rand_chacha::rand_core::SeedableRng;
 
-use zk_pow::api::seed::SeedDerivation;
-use zk_pow::ffi::plain_proof::PlainProof;
 use zk_pow::v2::api::proof::{
     IncompleteBlockHeader, MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, PublicProofParams, ZKProof,
 };
+use zk_pow::v2::api::seed::SeedDerivation;
 use zk_pow::v2::api::{prove, verify};
 use zk_pow::v2::circuit::chip::blake3::program::{BLOCK_LEN, routing_blake_hotspot_rows};
 use zk_pow::v2::circuit::circuit_utils::CircuitCache;
+use zk_pow::v2::ffi::plain_proof::PlainProof;
 use zk_pow::v2::mine::try_mine_one_moe;
 
 struct MoETestParams {

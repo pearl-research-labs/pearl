@@ -1,4 +1,4 @@
-use crate::ffi::plain_proof::OuterIndices;
+use crate::v2::ffi::plain_proof::OuterIndices;
 
 pub type Hash256 = [u8; 32];
 
@@ -71,7 +71,7 @@ pub struct MiningConfiguration {
     pub moe: Option<MoEConfig>,
 }
 
-pub use crate::api::seed::SeedDerivation;
+pub use crate::v2::api::seed::SeedDerivation;
 
 /// Plaintext public parameters associated with a proof and are required for verification.
 ///

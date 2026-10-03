@@ -1,6 +1,6 @@
 """The FP8/v4 transcript: domain-separated hashing, keys, and noise seeds.
 
-Twin of ``zk-pow/src/api/fp8/transcript.rs``
+Twin of ``zk-pow/src/v4/api/transcript.rs``
 
     Subkey(q, l)  = BLAKE3(l; key=q)          # keyed when q given, else unkeyed
     H_l(x; q)     = BLAKE3(x; key=Subkey(q, l))

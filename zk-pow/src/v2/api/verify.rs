@@ -17,7 +17,7 @@ use crate::v2::{
     },
 };
 
-use crate::ffi::plain_proof::PlainProof;
+use crate::v2::ffi::plain_proof::PlainProof;
 
 /// Verifies a block proof, compiling circuits into cache if needed.
 pub fn verify_block(public_params: &PublicProofParams, proof: &ZKProof, cache: &mut CircuitCache) -> Result<()> {

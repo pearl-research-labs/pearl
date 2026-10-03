@@ -5,7 +5,7 @@ import pytest
 from pearl_gemm.protocol_constants import delta_for_capability
 
 
-# ``Device::lg2_delta`` in ``zk-pow/src/api/fp8/public_params.rs``: the H100
+# ``Device::lg2_delta`` in ``zk-pow/src/v4/api/public_params.rs``: the H100
 # device commits the full-strength noise, B200 half of it. SM120 is
 # Blackwell-family arithmetic and commits the B200 device.
 @pytest.mark.parametrize(

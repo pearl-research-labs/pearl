@@ -8,25 +8,25 @@
 //! - `zk_verify`:    proof bytes -> accept/reject
 //!
 //! Fixtures (all committed):
-//! - `fixures/v2_plain_proof.bin`: bincode-serialized `PlainProof`, mined with
+//! - `src/v2/fixtures/v2_plain_proof.bin`: bincode-serialized `PlainProof`, mined with
 //!   the same seeded parameters as the v2 compat tests. v1 and v2 share the
 //!   non-MoE mining algorithm, so the same plain proof exercises both stacks.
-//! - `fixures/v2_plain_proof_moe.bin`: bincode-serialized MoE `PlainProof`,
+//! - `src/v2/fixtures/v2_plain_proof_moe.bin`: bincode-serialized MoE `PlainProof`,
 //!   mined with the same seeded parameters as the committed MoE ZK fixture.
-//! - `fixures/v2_stark_proof.bin`: `public_data | proof_data` of the v2 ZK
+//! - `src/v2/fixtures/v2_stark_proof.bin`: `public_data | proof_data` of the v2 ZK
 //!   proof for that same plain proof (see `test_generate_v2_fixture`).
-//! - `fixures/v2_stark_proof_moe.bin`: master-generated MoE ZK proof,
+//! - `src/v2/fixtures/v2_stark_proof_moe.bin`: master-generated MoE ZK proof,
 //!   `public_data_len(4 LE) | public_data | proof_data` (MoE public data is
 //!   variable-length, hence the prefix).
-//! - `src/v1/fixures/stark_proof.bin`: master-generated v1 ZK proof.
+//! - `src/v1/fixtures/stark_proof.bin`: master-generated v1 ZK proof.
 //!
 //! Regenerate the plain fixtures (only if the freeze is deliberately broken):
 //!   cargo test --release --test e2e_fixture_test -- --ignored generate_plain_fixture
 //!   cargo test --release --test e2e_fixture_test -- --ignored generate_moe_plain_fixture
 
 use rand_chacha::rand_core::SeedableRng;
-use zk_pow::api::seed::SeedDerivation;
-use zk_pow::ffi::plain_proof::PlainProof;
+use zk_pow::v2::api::seed::SeedDerivation;
+use zk_pow::v2::ffi::plain_proof::PlainProof;
 
 /// Mining/proving parameters. Must stay in sync with `v1_params()` /
 /// `params()` in the v1/v2 compat tests: the committed ZK fixtures were
@@ -100,13 +100,13 @@ fn mine_fixture_plain_proof() -> PlainProof {
     .expect("seeded mining must find a solution on the first attempt")
 }
 
-/// Writes `fixures/v2_plain_proof.bin`. Run once and commit the output.
+/// Writes `src/v2/fixtures/v2_plain_proof.bin`. Run once and commit the output.
 #[test]
 #[ignore] // Run with: cargo test --release --test e2e_fixture_test -- --ignored generate_plain_fixture
 fn generate_plain_fixture() {
     let proof = mine_fixture_plain_proof();
     let bytes = bincode::serialize(&proof).expect("serialize");
-    let path = fixture_path("fixures/v2_plain_proof.bin");
+    let path = fixture_path("src/v2/fixtures/v2_plain_proof.bin");
     std::fs::write(&path, &bytes).expect("write fixture");
     println!("plain proof fixture written to {path:?} ({} bytes)", bytes.len());
 }
@@ -115,11 +115,11 @@ fn generate_plain_fixture() {
 /// reproduce the committed fixture bytes exactly.
 #[test]
 fn plain_fixture_is_reproducible() {
-    let committed = read_fixture("fixures/v2_plain_proof.bin");
+    let committed = read_fixture("src/v2/fixtures/v2_plain_proof.bin");
     let regenerated = bincode::serialize(&mine_fixture_plain_proof()).expect("serialize");
     assert!(
         regenerated == committed,
-        "seeded mining no longer reproduces fixures/v2_plain_proof.bin \
+        "seeded mining no longer reproduces src/v2/fixtures/v2_plain_proof.bin \
          (lengths: regenerated {} vs committed {})",
         regenerated.len(),
         committed.len()
@@ -129,7 +129,7 @@ fn plain_fixture_is_reproducible() {
 /// v2 plain_verify: committed bytes -> accept; corrupted bytes -> reject.
 #[test]
 fn v2_plain_verify_bytes_to_bool() {
-    let bytes = read_fixture("fixures/v2_plain_proof.bin");
+    let bytes = read_fixture("src/v2/fixtures/v2_plain_proof.bin");
 
     let proof = PlainProof::deserialize_compat(&bytes).expect("fixture must deserialize");
     zk_pow::v2::api::verify::verify_plain_proof(&v2_header(), &proof, None, SeedDerivation::Legacy)
@@ -149,7 +149,7 @@ fn v2_plain_verify_bytes_to_bool() {
 /// v1 plain_verify: the same non-MoE plain proof through the frozen v1 stack.
 #[test]
 fn v1_plain_verify_bytes_to_bool() {
-    let bytes = read_fixture("fixures/v2_plain_proof.bin");
+    let bytes = read_fixture("src/v2/fixtures/v2_plain_proof.bin");
 
     let proof = PlainProof::deserialize_compat(&bytes).expect("fixture must deserialize");
     zk_pow::v1::api::verify::verify_plain_proof(&v1_header(), &proof, None)
@@ -187,7 +187,7 @@ fn v2_zk_prove_bytes_to_bytes() {
     use zk_pow::v2::api::proof::{PublicProofParams, ZKProof};
     use zk_pow::v2::circuit::circuit_utils::CircuitCache;
 
-    let plain_bytes = read_fixture("fixures/v2_plain_proof.bin");
+    let plain_bytes = read_fixture("src/v2/fixtures/v2_plain_proof.bin");
     let plain = PlainProof::deserialize_compat(&plain_bytes).expect("fixture must deserialize");
 
     let mut cache = CircuitCache::default();
@@ -197,7 +197,7 @@ fn v2_zk_prove_bytes_to_bytes() {
     let mut produced = result.public_data.clone();
     produced.extend_from_slice(&result.proof_data);
 
-    let expected = read_fixture("fixures/v2_stark_proof.bin");
+    let expected = read_fixture("src/v2/fixtures/v2_stark_proof.bin");
     assert_eq!(produced.len(), expected.len(), "proof byte length changed");
 
     // Deterministic prefix: public_data (WIRE_SIZE) + pow_bits(3) + rate_bits(3).
@@ -220,7 +220,7 @@ fn v2_zk_verify_bytes_to_bool() {
     use zk_pow::v2::api::proof::{PublicProofParams, ZKProof};
     use zk_pow::v2::circuit::circuit_utils::CircuitCache;
 
-    let buffer = read_fixture("fixures/v2_stark_proof.bin");
+    let buffer = read_fixture("src/v2/fixtures/v2_stark_proof.bin");
     let (public_data, proof_data) = buffer.split_at(PublicProofParams::WIRE_SIZE);
 
     let (params, proof) =
@@ -247,7 +247,7 @@ fn v1_zk_verify_bytes_to_bool() {
     use zk_pow::v1::api::proof::{PublicProofParams, ZKProof};
     use zk_pow::v1::circuit::circuit_utils::CircuitCache;
 
-    let buffer = read_fixture("src/v1/fixures/stark_proof.bin");
+    let buffer = read_fixture("src/v1/fixtures/stark_proof.bin");
     let (public_data, proof_data) = buffer.split_at(PublicProofParams::PUBLICDATA_SIZE);
 
     let header = v1_header();
@@ -274,7 +274,7 @@ fn v1_zk_verify_bytes_to_bool() {
 
 /// v1 zk_prove, bytes -> bytes: prove the committed plain proof through the
 /// frozen v1 prover and check the output against the committed v1 ZK fixture.
-/// `src/v1/fixures/stark_proof.bin` was master-generated from this same seeded
+/// `src/v1/fixtures/stark_proof.bin` was master-generated from this same seeded
 /// plain proof (its hash_a/hash_b bytes match the v2 fixture's), so the
 /// deterministic `public_data | pow_bits | rate_bits` prefix and the total
 /// length must reproduce exactly; the remaining bytes are ZK-blinded on every
@@ -284,7 +284,7 @@ fn v1_zk_prove_bytes_to_bytes() {
     use zk_pow::v1::api::proof::{PublicProofParams, ZKProof};
     use zk_pow::v1::circuit::circuit_utils::CircuitCache;
 
-    let plain_bytes = read_fixture("fixures/v2_plain_proof.bin");
+    let plain_bytes = read_fixture("src/v2/fixtures/v2_plain_proof.bin");
     let plain = PlainProof::deserialize_compat(&plain_bytes).expect("fixture must deserialize");
 
     let mut cache = CircuitCache::default();
@@ -294,7 +294,7 @@ fn v1_zk_prove_bytes_to_bytes() {
     let mut produced = result.public_data.to_vec();
     produced.extend_from_slice(&result.proof_data);
 
-    let expected = read_fixture("src/v1/fixures/stark_proof.bin");
+    let expected = read_fixture("src/v1/fixtures/stark_proof.bin");
     assert_eq!(produced.len(), expected.len(), "v1 proof byte length changed");
 
     // Deterministic prefix: public_data (PUBLICDATA_SIZE) + pow_bits(3) + rate_bits(3).
@@ -315,7 +315,7 @@ fn v1_zk_prove_bytes_to_bytes() {
 // =============================================================================
 
 /// MoE mining/proving parameters. Must stay in sync with `moe_params()` in the
-/// v2 compat tests: the committed `fixures/v2_stark_proof_moe.bin` was produced
+/// v2 compat tests: the committed `src/v2/fixtures/v2_stark_proof_moe.bin` was produced
 /// from exactly this seeded mining run.
 const MOE_MINING_SEED: u64 = 0xcafe_babe;
 const MOE_NBITS: u32 = 0x207FFFFF;
@@ -380,13 +380,13 @@ fn mine_moe_fixture_plain_proof() -> PlainProof {
     }
 }
 
-/// Writes `fixures/v2_plain_proof_moe.bin`. Run once and commit the output.
+/// Writes `src/v2/fixtures/v2_plain_proof_moe.bin`. Run once and commit the output.
 #[test]
 #[ignore] // Run with: cargo test --release --test e2e_fixture_test -- --ignored generate_moe_plain_fixture
 fn generate_moe_plain_fixture() {
     let proof = mine_moe_fixture_plain_proof();
     let bytes = bincode::serialize(&proof).expect("serialize");
-    let path = fixture_path("fixures/v2_plain_proof_moe.bin");
+    let path = fixture_path("src/v2/fixtures/v2_plain_proof_moe.bin");
     std::fs::write(&path, &bytes).expect("write fixture");
     println!("MoE plain proof fixture written to {path:?} ({} bytes)", bytes.len());
 }
@@ -395,11 +395,11 @@ fn generate_moe_plain_fixture() {
 /// committed fixture bytes exactly.
 #[test]
 fn moe_plain_fixture_is_reproducible() {
-    let committed = read_fixture("fixures/v2_plain_proof_moe.bin");
+    let committed = read_fixture("src/v2/fixtures/v2_plain_proof_moe.bin");
     let regenerated = bincode::serialize(&mine_moe_fixture_plain_proof()).expect("serialize");
     assert!(
         regenerated == committed,
-        "seeded MoE mining no longer reproduces fixures/v2_plain_proof_moe.bin \
+        "seeded MoE mining no longer reproduces src/v2/fixtures/v2_plain_proof_moe.bin \
          (lengths: regenerated {} vs committed {})",
         regenerated.len(),
         committed.len()
@@ -409,7 +409,7 @@ fn moe_plain_fixture_is_reproducible() {
 /// v2 plain_verify on an MoE proof: committed bytes -> accept; corrupted -> reject.
 #[test]
 fn v2_plain_verify_moe_bytes_to_bool() {
-    let bytes = read_fixture("fixures/v2_plain_proof_moe.bin");
+    let bytes = read_fixture("src/v2/fixtures/v2_plain_proof_moe.bin");
 
     let proof = PlainProof::deserialize_compat(&bytes).expect("fixture must deserialize");
     assert!(proof.moe.is_some(), "fixture must be an MoE proof");
@@ -434,7 +434,7 @@ fn v2_plain_verify_moe_bytes_to_bool() {
 /// the verifier itself.)
 #[test]
 fn v1_plain_verify_rejects_moe() {
-    let bytes = read_fixture("fixures/v2_plain_proof_moe.bin");
+    let bytes = read_fixture("src/v2/fixtures/v2_plain_proof_moe.bin");
     let proof = PlainProof::deserialize_compat(&bytes).expect("fixture must deserialize");
     assert!(
         zk_pow::v1::api::verify::verify_plain_proof(&moe_v1_header(), &proof, None).is_err(),
@@ -450,7 +450,7 @@ fn v2_zk_verify_moe_bytes_to_bool() {
     use zk_pow::v2::api::proof::ZKProof;
     use zk_pow::v2::circuit::circuit_utils::CircuitCache;
 
-    let buffer = read_fixture("fixures/v2_stark_proof_moe.bin");
+    let buffer = read_fixture("src/v2/fixtures/v2_stark_proof_moe.bin");
     let public_data_len = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
     let public_data = &buffer[4..4 + public_data_len];
     let proof_data = &buffer[4 + public_data_len..];
@@ -485,7 +485,7 @@ fn v2_zk_prove_moe_bytes_to_bytes() {
     use zk_pow::v2::api::proof::ZKProof;
     use zk_pow::v2::circuit::circuit_utils::CircuitCache;
 
-    let plain_bytes = read_fixture("fixures/v2_plain_proof_moe.bin");
+    let plain_bytes = read_fixture("src/v2/fixtures/v2_plain_proof_moe.bin");
     let plain = PlainProof::deserialize_compat(&plain_bytes).expect("fixture must deserialize");
     assert!(plain.moe.is_some(), "fixture must be an MoE proof");
 
@@ -497,7 +497,7 @@ fn v2_zk_prove_moe_bytes_to_bytes() {
     produced.extend_from_slice(&result.public_data);
     produced.extend_from_slice(&result.proof_data);
 
-    let expected = read_fixture("fixures/v2_stark_proof_moe.bin");
+    let expected = read_fixture("src/v2/fixtures/v2_stark_proof_moe.bin");
     let expected_public_len = u32::from_le_bytes(expected[..4].try_into().unwrap()) as usize;
     assert_eq!(
         result.public_data.len(),

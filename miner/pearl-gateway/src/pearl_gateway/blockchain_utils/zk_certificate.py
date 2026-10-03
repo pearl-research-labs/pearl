@@ -23,7 +23,7 @@ class CertificateVersion(IntEnum):
 
     The values are on-wire version numbers. Keep the discriminants in sync
     with Go ``wire.CertificateVersion`` and Rust
-    ``zk_pow::ffi::plain_proof::CertificateVersion``; add new versions as
+    ``zk_pow::ffi::CertificateVersion``; add new versions as
     new members instead of renumbering existing ones.
     """
 

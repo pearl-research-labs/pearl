@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod circuit;
+pub mod ffi;
 pub mod mine;
 
 // Re-export the ensure_eq macro from the main crate for use within this module

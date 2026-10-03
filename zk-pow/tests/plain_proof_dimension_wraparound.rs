@@ -1,7 +1,7 @@
 use blake3::CHUNK_LEN;
 
-use zk_pow::api::seed::SeedDerivation;
 use zk_pow::v2::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern};
+use zk_pow::v2::api::seed::SeedDerivation;
 use zk_pow::v2::api::verify::verify_plain_proof;
 use zk_pow::v2::mine::mine;
 

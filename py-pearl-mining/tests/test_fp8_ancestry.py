@@ -11,7 +11,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture(scope="module")
 def verifiers():
-    cache = _ROOT / "zk-pow/src/api/fp8/fp8_cache.bin"
+    cache = _ROOT / "zk-pow/src/v4/api/fp8_cache.bin"
     if not cache.exists():
         pytest.skip("requires the generated FP8 verifier cache (task build:zk-cache)")
     data = cache.read_bytes()
