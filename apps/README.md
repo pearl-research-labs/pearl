@@ -4,13 +4,6 @@ This monorepo contains the user-facing applications for the Pearl blockchain net
 
 ## 📦 Applications
 
-### 🌐 Landing Page (`@pearl/pearl-website`)
-
-The official landing page for the Pearl blockchain network, built with React and Vite. It provides
-information about the network, features, and documentation.
-
-**Location:** [apps/pearl-website](./apps/pearl-website)
-
 ### 💼 Pearl Desktop Wallet (`@pearl/pearl-desktop-wallet`)
 
 A modern, secure desktop wallet application for managing Pearl blockchain assets. Built with
@@ -56,14 +49,6 @@ This will install dependencies for all apps and packages in the monorepo workspa
 
 ## 🛠️ Development
 
-### Running the Landing Page
-
-To start the landing page in development mode:
-
-```bash
-pnpm --filter @pearl/pearl-website dev
-```
-
 ### Running the Desktop Wallet
 
 To start the Pearl Desktop Wallet in development mode:
@@ -73,19 +58,6 @@ pnpm --filter @pearl/pearl-desktop-wallet dev
 ```
 
 ## 🏗️ Building
-
-### Building the Landing Page
-
-```bash
-# From the apps root directory
-pnpm --filter @pearl/pearl-website build
-
-# Or from the pearl-website directory
-cd apps/pearl-website
-pnpm build
-```
-
-The production build will be output to `apps/pearl-website/dist`.
 
 ### Building the Desktop Wallet
 
@@ -169,7 +141,6 @@ pnpm lint
 ```
 apps/
 ├── apps/
-│   ├── pearl-website/          # Landing page application
 │   └── pearl-desktop-wallet/ # Desktop wallet application
 ├── packages/
 │   ├── ui/                    # Shared UI components
