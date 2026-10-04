@@ -282,7 +282,7 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 			if err != nil {
 				return err
 			}
-			b.Hash = *hash
+			bs.Hash = *hash
 
 			client := w.ChainClient()
 			header, err := client.GetBlockHeader(hash)
