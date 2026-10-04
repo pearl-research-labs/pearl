@@ -437,6 +437,10 @@ pub fn parse_axis(indices: &[u32], pattern: &AxisPattern) -> Result<u32> {
         pattern.offset_is_valid(base),
         "pattern parsing error: offset {base} is not a valid tile base for the committed pattern"
     );
+    ensure!(
+        indices.len() == pattern.tile_size() as usize,
+        "pattern parsing error: opened indices do not match the tile cardinality"
+    );
     // `o + base` cannot wrap u32: see `offset_is_valid`'s no-wrap guarantee.
     let expected: Vec<u32> = pattern.tile_offsets().iter().map(|&o| o + base).collect();
     ensure!(

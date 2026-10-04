@@ -447,11 +447,6 @@ pub(crate) struct MoEStatement {
 impl MoEStatement {
     fn check(&self, moe: MoeParams, a: &OperandParams, t_a: u32) -> Result<()> {
         ensure!(
-            self.o_last < PublicParams::MAX_ROUTING_ENTRIES_EXCLUSIVE,
-            "MoE O_{{e-1}} must be < 2^19 || O_{{e-1}}={}",
-            self.o_last
-        );
-        ensure!(
             self.w < moe.experts,
             "winner expert must satisfy 0 <= w < e || w={} e={}",
             self.w,
@@ -503,6 +498,13 @@ impl MoEStatement {
             "O_w - O_{{w-1}} must be <= m || s_w={} m={}",
             sw,
             a.num_rows
+        );
+        // Routing byte spans stay <= 2^31 after pad-to-16 (2^29 is 16-divisible):
+        // every downstream offset is plain `usize`/`u32` arithmetic on any platform.
+        ensure!(
+            self.o_last <= 1 << 29,
+            "O_{{e-1}} must be <= 2^29 || O_{{e-1}}={}",
+            self.o_last
         );
         let a_hi = t_a
             .checked_add(a.pattern.tile_max())
@@ -597,8 +599,6 @@ impl PublicParams {
     /// Inclusive consensus bounds for the common matmul dimension (`k ∈ [1024, 2^16]`).
     pub const MIN_K: usize = 1 << 10;
     pub const MAX_K: usize = 1 << 16;
-    /// Routing has strictly fewer than 2^19 u32 entries (< 2^21 raw bytes).
-    pub const MAX_ROUTING_ENTRIES_EXCLUSIVE: u32 = 1 << 19;
     /// Compression-message bytes in the four operand trees, optional MoE trees,
     /// the two root folds, and final jackpot. Touched Merkle parents count;
     /// unopened sibling CVs are supplied without compression work.
@@ -672,40 +672,40 @@ impl PublicParams {
     /// derivation lets the compiler allocate its per-instruction state.
     fn check_blake3_work_bound(&self) -> Result<()> {
         ensure!(
-            self.blake3_work_block_bound()? <= Self::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN,
+            self.blake3_work_block_bound()? <= (Self::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64,
             "FP8 Blake3 work exceeds 2^22 bytes"
         );
         Ok(())
     }
 
-    fn blake3_work_block_bound(&self) -> Result<usize> {
-        let mut count = 3; // Two operand-root folds and the final jackpot compression.
-        let k = self.common_dim() as usize;
-        let scale_row_bytes = 2 * (k / BLOCK_SIZE);
+    fn blake3_work_block_bound(&self) -> Result<u64> {
+        let mut count: u64 = 3; // Two operand-root folds and the final jackpot compression.
+        let k = u64::from(self.common_dim());
+        let scale_row_bytes = 2 * (k / BLOCK_SIZE as u64);
         let a_rows = self.a_rows_indices();
         let b_rows = self.b_rows_indices();
 
         for (total_rows, row_bytes, hash_id, rows) in [
-            (self.m() as usize, k, self.a().hash_id, &a_rows),
-            (self.n() as usize, k, self.b().hash_id, &b_rows),
-            (self.m() as usize, scale_row_bytes, self.a().hash_id, &a_rows),
-            (self.n() as usize, scale_row_bytes, self.b().hash_id, &b_rows),
+            (u64::from(self.m()), k, self.a().hash_id, &a_rows),
+            (u64::from(self.n()), k, self.b().hash_id, &b_rows),
+            (u64::from(self.m()), scale_row_bytes, self.a().hash_id, &a_rows),
+            (u64::from(self.n()), scale_row_bytes, self.b().hash_id, &b_rows),
         ] {
             count += blake_tree_block_bound(
                 total_rows * row_bytes,
                 hash_id,
                 rows.iter()
-                    .map(|&row| (row as usize * row_bytes, (row as usize + 1) * row_bytes)),
+                    .map(|&row| (u64::from(row) * row_bytes, (u64::from(row) + 1) * row_bytes)),
             )?;
         }
         if let (Some(moe), Some(stmt)) = (self.moe(), self.moe_statement()) {
-            let width = std::mem::size_of::<u32>();
+            let width = std::mem::size_of::<u32>() as u64;
             count += blake_tree_block_bound(
-                stmt.o_last as usize * width,
+                u64::from(stmt.o_last) * width,
                 moe.hash_id_r,
-                std::iter::once((stmt.o_w_prev as usize * width, stmt.o_w as usize * width)),
+                std::iter::once((u64::from(stmt.o_w_prev) * width, u64::from(stmt.o_w) * width)),
             )?;
-            let offsets_bytes = moe.experts as usize * width;
+            let offsets_bytes = u64::from(moe.experts) * width;
             count += blake_tree_block_bound(offsets_bytes, moe.hash_id_o, std::iter::once((0, offsets_bytes)))?;
         }
         Ok(count)
@@ -1036,21 +1036,19 @@ impl PublicParams {
 /// The compiler therefore never exceeds this bound, and
 /// `blake3_bound_dominates_the_compiled_stark_for_all_chunk_sizes` pins both the
 /// domination and its tightness.
-fn blake_tree_block_bound(
-    raw_bytes: usize,
-    hash_id: HashId,
-    opened_bytes: impl IntoIterator<Item = (usize, usize)>,
-) -> Result<usize> {
-    let chunk = hash_id.chunk_len();
-    let total_chunks = hash_id.padded_len(raw_bytes) / chunk;
+fn blake_tree_block_bound(raw_bytes: u64, hash_id: HashId, opened_bytes: impl IntoIterator<Item = (u64, u64)>) -> Result<u64> {
+    let chunk = hash_id.chunk_len() as u64;
+    // Identical to `padded_len(raw_bytes) / chunk`: every raw byte lands in a
+    // chunk, and padding adds at most one partial chunk.
+    let total_chunks = raw_bytes.div_ceil(chunk);
     ensure!(total_chunks > 0, "FP8 Blake3 tree must contain at least one chunk");
-    let mut ranges: Vec<(usize, usize)> = opened_bytes
+    let mut ranges: Vec<(u64, u64)> = opened_bytes
         .into_iter()
         .filter(|&(start, end)| start < end)
         .map(|(start, end)| (start / chunk, end.div_ceil(chunk)))
         .collect();
     ranges.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
     for (start, end) in ranges {
         ensure!(end <= total_chunks, "FP8 Blake3 opening exceeds its tree");
         if let Some(last) = merged.last_mut()
@@ -1062,8 +1060,8 @@ fn blake_tree_block_bound(
         }
     }
 
-    let chunk_blocks = chunk / blake3::BLOCK_LEN;
-    let depth = total_chunks.next_power_of_two().trailing_zeros() as usize;
+    let chunk_blocks = chunk / blake3::BLOCK_LEN as u64;
+    let depth = total_chunks.next_power_of_two().trailing_zeros() as u64;
     let blocks = merged
         .iter()
         .map(|(start, end)| (end - start) * (chunk_blocks + 1) + 2 * (depth + 1))
@@ -1879,6 +1877,37 @@ mod tests {
         assert!(err.to_string().contains("n must be divisible by e"));
     }
 
+    #[test]
+    fn try_new_rejects_o_last_above_the_2p29_cap() {
+        let p = dense_params();
+        let build = |o_last: u32| {
+            let mut stmt = empty_moe_statement(vec![0, 2, 4, 6]);
+            stmt.o_last = o_last;
+            PublicParams::try_new(
+                JobParams {
+                    ancestor_header: p.job.ancestor_header,
+                    common: p.job.common,
+                    operands: Sides {
+                        a: p.job.operands.a.clone(),
+                        b: p.job.operands.b.clone(),
+                    },
+                    moe: Some(MoeParams {
+                        experts: 3,
+                        hash_id_r: HashId::Blake3Chunk1024,
+                        hash_id_o: HashId::Blake3Chunk1024,
+                    }),
+                },
+                p.jackpot_statement.clone(),
+                Some(stmt),
+            )
+        };
+        // At and above the cap: rejected by MoEStatement::check.
+        let err = build((1 << 29) + 1).unwrap_err();
+        assert!(err.to_string().contains("O_{e-1} must be <= 2^29"), "{err}");
+        let err = build(u32::MAX).unwrap_err();
+        assert!(err.to_string().contains("O_{e-1} must be <= 2^29"), "{err}");
+    }
+
     // ---- check_ancestry: σ_d authenticated by the SHA256d walk from σ̂ ----
 
     fn job_with_ancestor(ancestor_header: BlockHeader) -> JobParams {
@@ -1981,7 +2010,7 @@ mod tests {
                     };
                     let stark = Blake3Program::from_blake_program(&program, k as usize, pins, schedule);
                     let bound = params.blake3_work_block_bound().unwrap();
-                    let compiled = stark.instructions.len();
+                    let compiled = stark.instructions.len() as u64;
                     assert!(
                         bound >= compiled,
                         "the bound must dominate the compiler: MoE={is_moe} hash_id={hash_id:?} k={k}: {bound} < {compiled}"
@@ -1990,25 +2019,89 @@ mod tests {
                         bound <= compiled + 4096,
                         "the bound must stay within root-path slack: MoE={is_moe} hash_id={hash_id:?} k={k}: {bound} >> {compiled}"
                     );
-                    assert!(compiled * blake3::BLOCK_LEN <= PublicParams::MAX_BLAKE3_WORK_BYTES);
+                    assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WORK_BYTES as u64);
                 }
             }
         }
     }
 
     #[test]
-    fn routing_and_aggregate_blake3_caps_reject_before_compilation() {
-        let mut seed = moe_params();
-        seed.moe_statement.as_mut().unwrap().o_last = PublicParams::MAX_ROUTING_ENTRIES_EXCLUSIVE - 1;
-        assert!(PublicParams::try_new(seed.job.clone(), seed.jackpot_statement.clone(), seed.moe_statement.clone()).is_ok());
-        seed.moe_statement.as_mut().unwrap().o_last = PublicParams::MAX_ROUTING_ENTRIES_EXCLUSIVE;
-        let err = PublicParams::try_new(seed.job, seed.jackpot_statement, seed.moe_statement).unwrap_err();
-        assert!(err.to_string().contains("O_{e-1} must be < 2^19"), "{err}");
-
+    fn aggregate_blake3_cap_rejects_before_compilation() {
         let mut seed = dense_params();
         seed.job.common.k = 31744;
         assert!((seed.h() as usize + seed.w() as usize) * seed.common_dim() as usize <= (1 << 22));
         let err = PublicParams::try_new(seed.job, seed.jackpot_statement, None).unwrap_err();
         assert!(err.to_string().contains("Blake3 work exceeds 2^22 bytes"), "{err}");
+    }
+
+    #[test]
+    fn maximal_moe_scalars_bound_and_compile_without_overflow() {
+        use crate::v4::circuit::blake3_stark::stark::{Blake3Program, MoeSchedule};
+        use crate::v4::circuit::chip::blake3::program::BlakeProgram;
+
+        // The maximal routing scalars: `o_last` at the 2^29 cap (a ~2^31-byte
+        // virtual routing tree), winner slice at the very front. The routing
+        // bound is O(tree depth) thanks to aux-CV pruning, so `try_new` must
+        // pass the work gate and the compiler must produce a program the bound
+        // dominates.
+        let p = dense_params();
+        let build = |stmt: MoEStatement| {
+            PublicParams::try_new(
+                JobParams {
+                    ancestor_header: p.job.ancestor_header,
+                    common: p.job.common,
+                    operands: Sides {
+                        a: p.job.operands.a.clone(),
+                        b: stacked_b(&p, 4),
+                    },
+                    moe: Some(MoeParams {
+                        experts: 4,
+                        hash_id_r: HashId::Blake3Chunk1024,
+                        hash_id_o: HashId::Blake3Chunk1024,
+                    }),
+                },
+                p.jackpot_statement.clone(),
+                Some(stmt),
+            )
+            .unwrap()
+        };
+
+        // Baseline: identical params except the routing tree is tiny
+        // (`o_last = 512` -> a 2048-byte tree).
+        let small = build(empty_moe_statement(vec![0, 1, 2, 3]));
+        let mut stmt = empty_moe_statement(vec![0, 1, 2, 3]);
+        stmt.w = 0;
+        stmt.o_w_prev = 0;
+        stmt.o_w = 16;
+        stmt.o_last = 1 << 29;
+        let params = build(stmt);
+
+        // The maximal tree adds only root-path parents: ~2 * depth-of-2^24-chunks
+        // extra blocks over the baseline, nothing proportional to 2^34 bytes.
+        let (bound, small_bound) = (
+            params.blake3_work_block_bound().unwrap(),
+            small.blake3_work_block_bound().unwrap(),
+        );
+        assert!(
+            bound <= small_bound + 128,
+            "maximal routing scalars must bound at O(depth): {bound} vs baseline {small_bound}"
+        );
+        assert!(
+            bound <= (PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64,
+            "maximal routing scalars must pass the work gate"
+        );
+
+        let (program, _, _) = BlakeProgram::compile(&params);
+        let (pins, schedule) = (
+            params.moe_statement().unwrap().routing_pins(&params.a_inner_indices()),
+            Some(MoeSchedule::new(params.moe_statement().unwrap(), params.moe().unwrap().experts, params.m()).unwrap()),
+        );
+        let stark = Blake3Program::from_blake_program(&program, 2048, pins, schedule);
+        let compiled = stark.instructions.len() as u64;
+        assert!(
+            bound >= compiled,
+            "the bound must dominate the compiled stark under maximal scalars: {bound} < {compiled}"
+        );
+        assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WORK_BYTES as u64);
     }
 }

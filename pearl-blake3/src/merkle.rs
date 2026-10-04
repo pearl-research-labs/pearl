@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use blake3::{CHUNK_LEN, OUT_LEN};
 use rayon::prelude::*;
 
@@ -387,15 +387,43 @@ impl MerkleProof {
     }
 
     /// Extract bytes from sparse merkle leaves.
+    ///
+    /// The range must be covered by the opened leaves, verified before the
+    /// `length`-byte allocation so a small proof cannot force a large one.
+    /// A leaf span whose arithmetic overflows `usize` cannot intersect the
+    /// range and is skipped.
     pub fn extract_bytes(&self, global_start: usize, length: usize) -> Result<Vec<u8>> {
-        let mut result = vec![0u8; length];
-        let global_end = global_start + length;
-        let mut copied = 0;
+        let global_end = global_start.checked_add(length).ok_or_else(|| {
+            anyhow!("extraction range overflows usize: start={global_start} length={length}")
+        })?;
 
-        for (&leaf_idx, data) in self.leaf_indices.iter().zip(&self.leaf_data) {
+        let leaf_span = |(&leaf_idx, data): (&usize, &Vec<u8>)| -> Option<(usize, usize)> {
             let chunk_len = data.len();
-            let leaf_start = leaf_idx * chunk_len;
-            let leaf_end = leaf_start + chunk_len;
+            let start = leaf_idx.checked_mul(chunk_len)?;
+            Some((start, start.checked_add(chunk_len)?))
+        };
+
+        // Opened indices are sorted and unique, so the sum of the leaf
+        // intersections with the range is the covered byte count.
+        let mut covered = 0usize;
+        for (leaf_idx, data) in self.leaf_indices.iter().zip(&self.leaf_data) {
+            if let Some((leaf_start, leaf_end)) = leaf_span((leaf_idx, data)) {
+                if leaf_start < global_end && global_start < leaf_end {
+                    covered += global_end.min(leaf_end) - global_start.max(leaf_start);
+                }
+            }
+        }
+        ensure!(
+            covered == length,
+            "Not all required bytes covered by leaves"
+        );
+
+        let mut result = vec![0u8; length];
+        let mut copied = 0;
+        for (leaf_idx, data) in self.leaf_indices.iter().zip(&self.leaf_data) {
+            let Some((leaf_start, leaf_end)) = leaf_span((leaf_idx, data)) else {
+                continue;
+            };
             if leaf_start < global_end && global_start < leaf_end {
                 let copy_start = global_start.max(leaf_start);
                 let copy_end = global_end.min(leaf_end);
@@ -405,7 +433,7 @@ impl MerkleProof {
                 copied += len;
             }
         }
-        ensure!(copied == length, "Not all required bytes covered by leaves");
+        debug_assert!(copied == length, "coverage pre-pass verified the copy");
         Ok(result)
     }
 
@@ -930,6 +958,28 @@ mod tests {
 
         // Leaf 0 not in proof
         assert!(proof.extract_bytes(0, 64).is_err());
+    }
+
+    #[test]
+    fn test_extract_bytes_fails_closed_on_overflowing_ranges() {
+        let key = test_key();
+        let data = test_data(2 * CHUNK_LEN);
+        let tree = MerkleTree::new(&data, key);
+
+        // (a) The requested range itself overflows `usize`.
+        let proof = tree.get_multileaf_proof(&[1]);
+        let err = proof.extract_bytes(usize::MAX, 1).unwrap_err();
+        assert!(err.to_string().contains("overflows usize"));
+
+        // (b) An uncovered range is rejected before any allocation.
+        let err = proof.extract_bytes(0, 4 * CHUNK_LEN).unwrap_err();
+        assert_eq!(err.to_string(), "Not all required bytes covered by leaves");
+
+        // (c) A leaf whose byte span overflows `usize` is skipped rather than
+        // wrapping into a bogus span.
+        let mut proof = tree.get_multileaf_proof(&[0]);
+        proof.leaf_indices[0] = (1usize << 60) + 1;
+        assert!(proof.extract_bytes(0, 32).is_err());
     }
 
     // ---- compute_sibling_ranges + compute_cv ----

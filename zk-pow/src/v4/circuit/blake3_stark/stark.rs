@@ -384,9 +384,9 @@ impl MoeSchedule {
     /// `(intra, inter, bound_first, bound_second)`. Intra/inter enforce strict increase over
     /// the winner slice `[O_{w-1}, O_w)`; the bound flags mark the slice's last word, whose
     /// row pins `m - 1` for the upper-bound check.
-    fn routing_chain_at(&self, g: u64) -> (bool, bool, bool, bool) {
-        let (lo, hi) = (u64::from(self.o_w_prev), u64::from(self.o_w));
-        let in_slice = |x: u64| lo <= x && x < hi;
+    fn routing_chain_at(&self, g: usize) -> (bool, bool, bool, bool) {
+        let (lo, hi) = (self.o_w_prev as usize, self.o_w as usize);
+        let in_slice = |x: usize| lo <= x && x < hi;
         (
             in_slice(g) && in_slice(g + 1),
             g > lo && in_slice(g),
@@ -747,9 +747,9 @@ impl Blake3Program {
                 );
                 let base = 16 * s.routing_block_base();
                 for &(pos, _) in &self.routing_pins {
-                    let g = (base + pos) as u64;
+                    let g = base + pos;
                     assert!(
-                        u64::from(s.o_w_prev) <= g && g < u64::from(s.o_w),
+                        s.o_w_prev as u64 <= g as u64 && (g as u64) < u64::from(s.o_w),
                         "sampled routing pin at global word {g} lies outside the winner slice"
                     );
                 }
@@ -964,7 +964,7 @@ impl Blake3Program {
                                 let s = self.moe.as_ref().expect("routing rows imply a MoE schedule");
                                 row.is_chain_data = F::ONE;
                                 row.is_chain_strict = F::ONE;
-                                let g = (16 * s.routing_block_base() + base) as u64;
+                                let g = 16 * s.routing_block_base() + base;
                                 let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
                                 if intra {
                                     row.is_chain_intra = F::ONE;
@@ -1422,7 +1422,7 @@ impl Blake3Program {
                                 let s = self.moe.as_ref().expect("routing rows imply a MoE schedule");
                                 bits |= 1 << 21; // IS_CHAIN_STRICT
                                 bits |= 1 << 24; // IS_CHAIN_DATA
-                                let g = (16 * s.routing_block_base() + base) as u64;
+                                let g = 16 * s.routing_block_base() + base;
                                 let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
                                 bits |= u64::from(intra) << 19;
                                 bits |= u64::from(inter) << 20;
