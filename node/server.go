@@ -346,6 +346,10 @@ type serverPeer struct {
 	// actually registered.
 	peerAdded atomic.Bool
 
+	// removed is set when this persistent peer is removed through addnode/node remove, so handleDonePeerMsg does
+	// not retry its connection. It is only accessed from the peerHandler goroutine.
+	removed bool
+
 	// The following chans are used to sync blockmanager and server.
 	txProcessed    chan struct{}
 	blockProcessed chan error
@@ -1976,6 +1980,10 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 	// process a peer's `done` message before its `add`.
 	if !sp.Inbound() {
 		switch {
+		// A removed persistent peer must not be redialed.
+		case sp.persistent && sp.removed:
+			s.connManager.Remove(sp.connReq.ID())
+
 		case sp.persistent:
 			s.connManager.Disconnect(sp.connReq.ID())
 
@@ -2199,6 +2207,7 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 			// Keep group counts ok since we remove from
 			// the list now.
 			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
+			sp.removed = true
 		})
 
 		if found {
