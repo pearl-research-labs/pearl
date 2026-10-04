@@ -499,6 +499,13 @@ impl MoEStatement {
             sw,
             a.num_rows
         );
+        // Routing byte spans stay <= 2^31 after pad-to-16 (2^29 is 16-divisible):
+        // every downstream offset is plain `usize`/`u32` arithmetic on any platform.
+        ensure!(
+            self.o_last <= 1 << 29,
+            "O_{{e-1}} must be <= 2^29 || O_{{e-1}}={}",
+            self.o_last
+        );
         let a_hi = t_a
             .checked_add(a.pattern.tile_max())
             .ok_or_else(|| anyhow::anyhow!("tA + tile max overflows u32"))?;
@@ -517,16 +524,9 @@ impl MoEStatement {
     /// `start = (o_w_prev * 4) / 64`, `end = ceil((o_w * 4) / 64)`. Empty if
     /// `o_w <= o_w_prev`. Not Merkle [`HashId`] chunks.
     pub(crate) fn opened_routing_blocks(&self) -> Vec<u32> {
-        // Byte offsets reach `u32::MAX * 4 ~ 2^34`: compute in u64. Block
-        // indices fit in u32 (pinned by the const assert).
-        const BLOCK: u64 = pearl_blake3::BLAKE3_MSG_LEN as u64;
-        const WIDTH: u64 = std::mem::size_of::<u32>() as u64;
-        const _: () = assert!(
-            (u32::MAX as u64 * WIDTH).div_ceil(BLOCK) <= u32::MAX as u64,
-            "routing block indices must fit in u32"
-        );
-        let byte_start = u64::from(self.o_w_prev) * WIDTH;
-        let byte_end = u64::from(self.o_w) * WIDTH;
+        const BLOCK: usize = pearl_blake3::BLAKE3_MSG_LEN;
+        let byte_start = self.o_w_prev as usize * std::mem::size_of::<u32>();
+        let byte_end = self.o_w as usize * std::mem::size_of::<u32>();
         if byte_end <= byte_start {
             return vec![];
         }
@@ -1003,9 +1003,8 @@ impl PublicParams {
 
     /// [`Self::num_routing_entries`] rounded up to a multiple of 16 so the routing byte
     /// length (`u32` entries → bytes) tiles evenly into 64-byte virtual rows.
-    /// `None` also on `usize` overflow (fail-closed instead of wrapping).
     pub(crate) fn num_padded_routing_entries(&self) -> Option<usize> {
-        self.num_routing_entries().and_then(|n| n.checked_next_multiple_of(16))
+        self.num_routing_entries().map(|n| n.next_multiple_of(16))
     }
 
     /// Unpadded byte length of the offsets list `O` (`e` u32 entries). `None` outside MoE.
@@ -1878,6 +1877,37 @@ mod tests {
         assert!(err.to_string().contains("n must be divisible by e"));
     }
 
+    #[test]
+    fn try_new_rejects_o_last_above_the_2p29_cap() {
+        let p = dense_params();
+        let build = |o_last: u32| {
+            let mut stmt = empty_moe_statement(vec![0, 2, 4, 6]);
+            stmt.o_last = o_last;
+            PublicParams::try_new(
+                JobParams {
+                    ancestor_header: p.job.ancestor_header,
+                    common: p.job.common,
+                    operands: Sides {
+                        a: p.job.operands.a.clone(),
+                        b: p.job.operands.b.clone(),
+                    },
+                    moe: Some(MoeParams {
+                        experts: 3,
+                        hash_id_r: HashId::Blake3Chunk1024,
+                        hash_id_o: HashId::Blake3Chunk1024,
+                    }),
+                },
+                p.jackpot_statement.clone(),
+                Some(stmt),
+            )
+        };
+        // At and above the cap: rejected by MoEStatement::check.
+        let err = build((1 << 29) + 1).unwrap_err();
+        assert!(err.to_string().contains("O_{e-1} must be <= 2^29"), "{err}");
+        let err = build(u32::MAX).unwrap_err();
+        assert!(err.to_string().contains("O_{e-1} must be <= 2^29"), "{err}");
+    }
+
     // ---- check_ancestry: σ_d authenticated by the SHA256d walk from σ̂ ----
 
     fn job_with_ancestor(ancestor_header: BlockHeader) -> JobParams {
@@ -2009,7 +2039,7 @@ mod tests {
         use crate::circuit::chip::blake3::program::BlakeProgram;
         use crate::circuit::fp8::blake3_stark::stark::{Blake3Program, MoeSchedule};
 
-        // The maximal routing scalars: `o_last = u32::MAX` (a ~2^34-byte
+        // The maximal routing scalars: `o_last` at the 2^29 cap (a ~2^31-byte
         // virtual routing tree), winner slice at the very front. The routing
         // bound is O(tree depth) thanks to aux-CV pruning, so `try_new` must
         // pass the work gate and the compiler must produce a program the bound
@@ -2043,7 +2073,7 @@ mod tests {
         stmt.w = 0;
         stmt.o_w_prev = 0;
         stmt.o_w = 16;
-        stmt.o_last = u32::MAX;
+        stmt.o_last = 1 << 29;
         let params = build(stmt);
 
         // The maximal tree adds only root-path parents: ~2 * depth-of-2^24-chunks

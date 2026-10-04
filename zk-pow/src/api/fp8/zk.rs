@@ -137,14 +137,11 @@ impl MoEStatement {
             .iter()
             .zip(&self.i_a)
             .map(|(&inner, &outer)| {
-                let slot = u64::from(self.o_w_prev) + u64::from(inner);
-                let block = u32::try_from(slot / words_per_block as u64)
-                    .expect("routing block index fits u32 (opened_routing_blocks pin)");
+                let slot = self.o_w_prev as usize + inner as usize;
                 let strip = blocks
-                    .binary_search(&block)
+                    .binary_search(&((slot / words_per_block) as u32))
                     .expect("sampled slot's block is opened by construction");
-                let pos = words_per_block as u64 * strip as u64 + slot % words_per_block as u64;
-                (usize::try_from(pos).expect("routing pin position <= 2^33 fits usize"), outer)
+                (words_per_block * strip + slot % words_per_block, outer)
             })
             .collect()
     }

@@ -414,13 +414,11 @@ impl BlakeProgram {
             // Routing is jagged: `Rflat` holds exactly `O_{e-1}` u32 entries.
             // We pad the entry count up to a multiple of 16 so the byte length tiles
             // evenly into the 64-byte virtual rows the commitment uses below.
-            let total_routing_entries = params
-                .num_padded_routing_entries()
-                .expect("MoE params present; padded routing entry count overflows usize");
-            let full_routing_size = total_routing_entries as u64 * mem::size_of::<u32>() as u64;
+            let total_routing_entries = params.num_padded_routing_entries().expect("MoE params present");
+            let full_routing_size = total_routing_entries * mem::size_of::<u32>();
             // Routing and offsets are flat byte strings with no natural row structure, so
             // both sections below use virtual rows of one Blake3 block (64 bytes) each.
-            let num_rows = usize::try_from(full_routing_size / BLOCK_LEN as u64).expect("routing rows <= 2^28 fit usize");
+            let num_rows = full_routing_size / BLOCK_LEN;
             let hotspots = moe.opened_routing_blocks();
             num_routing_strips = hotspots.len();
             let routing_hash_id = params.moe().expect("MoE").hash_id_r;

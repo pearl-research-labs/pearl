@@ -14,7 +14,6 @@ use crate::api::fp8::prequant::BLOCK_SIZE;
 use crate::api::fp8::public_params::{CommonParams, MoeParams, OperandParams};
 use crate::api::fp8::public_params::{HashId, JackpotStatement, JobParams, MoEStatement, PublicParams};
 use crate::api::fp8::transcript::{key_a, key_b};
-use crate::api::fp8::utils::routing_bytes;
 use crate::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader, Sides};
 use crate::api::proof_utils::operand_digest_fp10;
 use crate::circuit::utils::macros::ensure_eq;
@@ -312,6 +311,10 @@ impl PlainProofV4 {
             o_w - o_w_prev,
             self.job.operands.a.num_rows
         );
+        // Same for the routing-stream cap: MoEStatement::check bounds every
+        // `O` scalar <= 2^29, but only after the extraction below. Enforce it
+        // here so the byte-span arithmetic below stays plain `usize`.
+        ensure!(o_last <= 1 << 29, "O_{{e-1}} must be <= 2^29 || O_{{e-1}}={}", o_last);
 
         let r_w = extract_u32_span(&witness.routing, o_w_prev, o_w)?;
         ensure!(
@@ -399,7 +402,11 @@ fn check_tree_leaves(proof: &MerkleProof, dims: &[usize], hash_id: HashId, label
 
 fn extract_u32_span(proof: &MerkleProof, start: u32, end: u32) -> Result<Vec<u32>> {
     ensure!(end >= start, "routing slice end precedes start");
-    let (byte_start, byte_len) = routing_bytes::entry_span(start, end)?;
+    // `end <= o_last <= 2^29` (checked in moe_projection and MoEStatement::check):
+    // the byte span <= 2^31 fits usize on any platform.
+    let width = std::mem::size_of::<u32>();
+    let byte_start = start as usize * width;
+    let byte_len = (end - start) as usize * width;
     let bytes = proof
         .extract_bytes(byte_start, byte_len)
         .with_context(|| format!("extract routing entries [{start}, {end})"))?;
