@@ -398,9 +398,13 @@ fn check_tree_leaves(proof: &MerkleProof, dims: &[usize], hash_id: HashId, label
 
 fn extract_u32_span(proof: &MerkleProof, start: u32, end: u32) -> Result<Vec<u32>> {
     ensure!(end >= start, "routing slice end precedes start");
-    let width = std::mem::size_of::<u32>();
-    let byte_start = start as usize * width;
-    let byte_len = (end - start) as usize * width;
+    // u32 spans reach ~2^34 bytes; compute in u64 and fail closed if the
+    // platform's usize cannot represent them.
+    let width = std::mem::size_of::<u32>() as u64;
+    let byte_start = u64::from(start) * width;
+    let byte_len = u64::from(end - start) * width;
+    let byte_start = usize::try_from(byte_start).with_context(|| format!("routing slice start {start} overflows usize"))?;
+    let byte_len = usize::try_from(byte_len).with_context(|| format!("routing slice length {} overflows usize", end - start))?;
     let bytes = proof
         .extract_bytes(byte_start, byte_len)
         .with_context(|| format!("extract routing entries [{start}, {end})"))?;

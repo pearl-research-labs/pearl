@@ -375,9 +375,10 @@ impl MoeSchedule {
         (p + 1 < e, p >= 1 && p < e)
     }
 
-    /// First opened routing block (the routing stream's block base).
-    fn routing_block_base(&self) -> usize {
-        self.o_w_prev as usize * std::mem::size_of::<u32>() / BLAKE3_MSG_LEN
+    /// First opened routing block (the routing stream's block base). Byte
+    /// offsets reach `u32::MAX * 4 ~ 2^34`, so the math runs in u64.
+    fn routing_block_base(&self) -> u64 {
+        u64::from(self.o_w_prev) * std::mem::size_of::<u32>() as u64 / BLAKE3_MSG_LEN as u64
     }
 
     /// Chain gates of the routing row whose first *global* routing word is `g`:
@@ -741,13 +742,13 @@ impl Blake3Program {
             );
             if s.o_w > s.o_w_prev {
                 assert!(
-                    s.routing_block_base() + routing_blocks.len()
-                        >= (s.o_w as usize * std::mem::size_of::<u32>()).div_ceil(BLAKE3_MSG_LEN),
+                    s.routing_block_base() + routing_blocks.len() as u64
+                        >= (u64::from(s.o_w) * std::mem::size_of::<u32>() as u64).div_ceil(BLAKE3_MSG_LEN as u64),
                     "routing stream must cover the winner slice's block range"
                 );
                 let base = 16 * s.routing_block_base();
                 for &(pos, _) in &self.routing_pins {
-                    let g = (base + pos) as u64;
+                    let g = base + pos as u64;
                     assert!(
                         u64::from(s.o_w_prev) <= g && g < u64::from(s.o_w),
                         "sampled routing pin at global word {g} lies outside the winner slice"
@@ -964,7 +965,7 @@ impl Blake3Program {
                                 let s = self.moe.as_ref().expect("routing rows imply a MoE schedule");
                                 row.is_chain_data = F::ONE;
                                 row.is_chain_strict = F::ONE;
-                                let g = (16 * s.routing_block_base() + base) as u64;
+                                let g = 16 * s.routing_block_base() + base as u64;
                                 let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
                                 if intra {
                                     row.is_chain_intra = F::ONE;
@@ -1422,7 +1423,7 @@ impl Blake3Program {
                                 let s = self.moe.as_ref().expect("routing rows imply a MoE schedule");
                                 bits |= 1 << 21; // IS_CHAIN_STRICT
                                 bits |= 1 << 24; // IS_CHAIN_DATA
-                                let g = (16 * s.routing_block_base() + base) as u64;
+                                let g = 16 * s.routing_block_base() + base as u64;
                                 let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
                                 bits |= u64::from(intra) << 19;
                                 bits |= u64::from(inter) << 20;

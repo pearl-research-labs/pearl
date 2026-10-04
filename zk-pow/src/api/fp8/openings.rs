@@ -276,8 +276,10 @@ impl TreeSchedules {
             .map(|moe| {
                 let entries = params
                     .num_padded_routing_entries()
-                    .ok_or_else(|| anyhow::anyhow!("MoE params present but padded routing length missing"))?;
-                let bytes = entries * std::mem::size_of::<u32>();
+                    .ok_or_else(|| anyhow::anyhow!("MoE params present but padded routing length missing or overflows usize"))?;
+                let bytes = entries
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or_else(|| anyhow::anyhow!("routing: byte length overflow"))?;
                 Ok::<_, anyhow::Error>(TreeSchedule::new(cv_locs, ProofSource::Routing, bytes, moe.hash_id_r))
             })
             .transpose()?;
@@ -390,7 +392,10 @@ fn extract_routing_strips(routing: &MerkleProof, params: &PublicParams) -> Resul
         .opened_routing_blocks()
         .iter()
         .map(|&hotspot_idx| {
-            let block_start = hotspot_idx as usize * BLOCK_LEN;
+            // Block byte offsets reach `u32::MAX * 4 ~ 2^34`: compute in u64
+            // and fail closed if usize cannot represent them.
+            let block_start = usize::try_from(u64::from(hotspot_idx) * BLOCK_LEN as u64)
+                .with_context(|| format!("routing strip offset for block {hotspot_idx} overflows usize"))?;
             routing
                 .extract_bytes(block_start, BLOCK_LEN)
                 .with_context(|| format!("routing strip: extract 64 bytes at row_start={block_start}"))

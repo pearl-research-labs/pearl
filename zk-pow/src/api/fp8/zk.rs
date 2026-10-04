@@ -131,17 +131,26 @@ impl MoEStatement {
     /// witness, bound only by the hash to `HR`.
     pub(crate) fn routing_pins(&self, inner_indices: &[u32]) -> Vec<(usize, u32)> {
         assert_eq!(inner_indices.len(), self.i_a.len(), "inner/outer index lists must align");
+        // Routing slots are `o_w_prev + inner < o_w <= u32::MAX` u32 entries,
+        // so slot byte offsets reach ~2^34: the slot/word math runs in u64 and
+        // fails loud (`expect`, unreachable on 64-bit) if the platform's
+        // usize cannot represent a position.
         let words_per_block = pearl_blake3::BLAKE3_MSG_LEN / std::mem::size_of::<u32>();
         let blocks = self.opened_routing_blocks();
         inner_indices
             .iter()
             .zip(&self.i_a)
             .map(|(&inner, &outer)| {
-                let slot = self.o_w_prev as usize + inner as usize;
+                let slot = u64::from(self.o_w_prev) + u64::from(inner);
+                let block = u32::try_from(slot / words_per_block as u64).expect("sampled slot's block index overflows u32");
                 let strip = blocks
-                    .binary_search(&((slot / words_per_block) as u32))
+                    .binary_search(&block)
                     .expect("sampled slot's block is opened by construction");
-                (words_per_block * strip + slot % words_per_block, outer)
+                let pos = words_per_block as u64 * strip as u64 + slot % words_per_block as u64;
+                (
+                    usize::try_from(pos).expect("routing pin stream position overflows usize"),
+                    outer,
+                )
             })
             .collect()
     }
