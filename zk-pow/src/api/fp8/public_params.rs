@@ -447,11 +447,6 @@ pub(crate) struct MoEStatement {
 impl MoEStatement {
     fn check(&self, moe: MoeParams, a: &OperandParams, t_a: u32) -> Result<()> {
         ensure!(
-            self.o_last < PublicParams::MAX_ROUTING_ENTRIES_EXCLUSIVE,
-            "MoE O_{{e-1}} must be < 2^19 || O_{{e-1}}={}",
-            self.o_last
-        );
-        ensure!(
             self.w < moe.experts,
             "winner expert must satisfy 0 <= w < e || w={} e={}",
             self.w,
@@ -597,8 +592,6 @@ impl PublicParams {
     /// Inclusive consensus bounds for the common matmul dimension (`k ∈ [1024, 2^16]`).
     pub const MIN_K: usize = 1 << 10;
     pub const MAX_K: usize = 1 << 16;
-    /// Routing has strictly fewer than 2^19 u32 entries (< 2^21 raw bytes).
-    pub const MAX_ROUTING_ENTRIES_EXCLUSIVE: u32 = 1 << 19;
     /// Compression-message bytes in the four operand trees, optional MoE trees,
     /// the two root folds, and final jackpot. Touched Merkle parents count;
     /// unopened sibling CVs are supplied without compression work.
@@ -1997,14 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_and_aggregate_blake3_caps_reject_before_compilation() {
-        let mut seed = moe_params();
-        seed.moe_statement.as_mut().unwrap().o_last = PublicParams::MAX_ROUTING_ENTRIES_EXCLUSIVE - 1;
-        assert!(PublicParams::try_new(seed.job.clone(), seed.jackpot_statement.clone(), seed.moe_statement.clone()).is_ok());
-        seed.moe_statement.as_mut().unwrap().o_last = PublicParams::MAX_ROUTING_ENTRIES_EXCLUSIVE;
-        let err = PublicParams::try_new(seed.job, seed.jackpot_statement, seed.moe_statement).unwrap_err();
-        assert!(err.to_string().contains("O_{e-1} must be < 2^19"), "{err}");
-
+    fn aggregate_blake3_cap_rejects_before_compilation() {
         let mut seed = dense_params();
         seed.job.common.k = 31744;
         assert!((seed.h() as usize + seed.w() as usize) * seed.common_dim() as usize <= (1 << 22));

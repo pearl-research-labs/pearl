@@ -445,7 +445,9 @@ def test_stats_absmax_with_negative_block_scales():
     ref.scales = -ref.scales
     codes = ref.int_values.cuda().contiguous()
     scales = ref.scales.cuda().contiguous()
-    buffers = _buffers(m, k, blake3(b"negative-scale").digest(), blake3(b"negative-scale-cb").digest())
+    buffers = _buffers(
+        m, k, blake3(b"negative-scale").digest(), blake3(b"negative-scale-cb").digest()
+    )
     _launch(codes, scales, buffers)
     torch.cuda.synchronize()
 
