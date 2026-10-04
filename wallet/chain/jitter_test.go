@@ -91,8 +91,9 @@ func TestJitterTicker(t *testing.T) {
 		// Tick duration should be between 80ms and 120ms.
 		require.True(t, diff >= 80*time.Millisecond, "diff: %v", diff)
 
-		// We give 1ms more to account for the time it takes to run the
-		// code.
-		require.True(t, diff < 121*time.Millisecond, "diff: %v", diff)
+		// Reset runs after the fire is observed, so the gap between
+		// stamps includes the ticker goroutine's delay. The 120ms
+		// ceiling is only the jitter max.
+		require.True(t, diff < 120*time.Millisecond+100*time.Millisecond, "diff: %v", diff)
 	}
 }

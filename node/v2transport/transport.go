@@ -567,22 +567,7 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 		if bytes.Equal(recvGarbage[recvGarbageLen-16:],
 			p.recvGarbageTerm) {
 
-			log.Debugf("Found garbage terminator after %d total "+
-				"bytes", recvGarbageLen)
-
-			log.Tracef("Processing %d bytes preceding garbage "+
-				"terminator", recvGarbageLen-16)
-
-			// Process any potential packet data sent before the
-			// terminator.
-			_, err = p.V2ReceivePacket(
-				recvGarbage[:recvGarbageLen-16],
-			)
-			if err != nil {
-				log.Errorf("Error processing packet data "+
-					"before garbage terminator: %v", err)
-			}
-			return err
+			return p.processGarbageTerminator(recvGarbage)
 		}
 
 		log.Tracef("Garbage terminator not found, receiving 1 more "+
@@ -598,10 +583,36 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 		recvGarbage = append(recvGarbage, recvData...)
 	}
 
-	log.Warnf("Garbage terminator not received after %d "+
-		"bytes", len(recvGarbage))
+	// The loop checks before each read, so the final byte has not been
+	// checked yet. It completes the terminator when the peer sent the
+	// maximum MaxGarbageLen bytes of garbage.
+	recvGarbageLen := len(recvGarbage)
+	if !bytes.Equal(recvGarbage[recvGarbageLen-16:], p.recvGarbageTerm) {
+		log.Warnf("Garbage terminator not received after %d bytes", recvGarbageLen)
 
-	return errGarbageTermNotRecv
+		return errGarbageTermNotRecv
+	}
+
+	return p.processGarbageTerminator(recvGarbage)
+}
+
+// processGarbageTerminator is called once recvGarbage ends with the peer's
+// garbage terminator. It receives the first packet after the terminator,
+// authenticating the garbage that preceded it.
+func (p *Peer) processGarbageTerminator(recvGarbage []byte) error {
+	recvGarbageLen := len(recvGarbage)
+
+	log.Debugf("Found garbage terminator after %d total bytes", recvGarbageLen)
+
+	log.Tracef("Processing %d bytes preceding garbage terminator", recvGarbageLen-16)
+
+	// V2ReceivePacket authenticates the first packet with this garbage as AAD.
+	_, err := p.V2ReceivePacket(recvGarbage[:recvGarbageLen-16])
+	if err != nil {
+		log.Errorf("Error processing packet data before garbage "+
+			"terminator: %v", err)
+	}
+	return err
 }
 
 // V2EncPacket takes the contents and aad and returns a ciphertext.

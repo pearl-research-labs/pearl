@@ -60,7 +60,7 @@ export const useWalletStore = create<WalletState>()((set, get) => ({
         window.appBridge.manager.getWalletsStats(),
         window.appBridge.wallet.getBalance('default', 0),
         window.appBridge.wallet.getBalance('default', 0),
-        window.appBridge.wallet.listTransactions(3, 0),
+        window.appBridge.wallet.listRecentTransactions(3),
       ]);
       set({ activitiesPreview: transactions });
 

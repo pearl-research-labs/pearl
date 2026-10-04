@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"iter"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -2200,293 +2202,234 @@ func RecvCategory(details *wtxmgr.TxDetails, syncHeight int32, net *chaincfg.Par
 	return CreditReceive
 }
 
-// listTransactions creates a object that may be marshalled to a response result
-// for a listtransactions RPC.
+// IsChange reports whether a wallet credit is change: an output the wallet pays back to itself in a transaction it
+// funded. A payment received on one of the wallet's change addresses is therefore not change.
+func IsChange(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
+	return cred.Change && len(details.Debits) > 0
+}
+
+// transactionEntries returns the listtransactions entries for one wallet transaction, in output order. Every output
+// the wallet paid out lists a send and every output paid to the wallet lists a receive, so a payment from the wallet
+// to its own address lists both. Change lists nothing, and neither does spending a received output: the spend is
+// listed once, on the transaction that makes it.
 //
 // TODO: This should be moved to the legacyrpc package.
-func listTransactions(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *waddrmgr.Manager,
-	syncHeight int32, net *chaincfg.Params) []btcjson.ListTransactionsResult {
+func transactionEntries(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *waddrmgr.Manager, syncHeight int32,
+	net *chaincfg.Params) []btcjson.ListTransactionsResult {
 
 	addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
+	funded := len(details.Debits) > 0
+	fee := listingFee(details)
+	receiveCategory := RecvCategory(details, syncHeight, net).String()
 
-	var (
-		blockHashStr  string
-		blockTime     int64
-		confirmations int64
-	)
+	base := btcjson.ListTransactionsResult{
+		TxID:            details.Hash.String(),
+		Generated:       blockchain.IsCoinBaseTx(&details.MsgTx),
+		Time:            details.Received.Unix(),
+		TimeReceived:    details.Received.Unix(),
+		WalletConflicts: []string{},
+	}
 	if details.Block.Height != -1 {
-		blockHashStr = details.Block.Hash.String()
-		blockTime = details.Block.Time.Unix()
-		confirmations = int64(
-			calcConf(details.Block.Height, syncHeight),
-		)
+		base.BlockHash = details.Block.Hash.String()
+		base.BlockTime = details.Block.Time.Unix()
+		base.Confirmations = int64(calcConf(details.Block.Height, syncHeight))
 	}
 
-	results := []btcjson.ListTransactionsResult{}
-	txHashStr := details.Hash.String()
-	received := details.Received.Unix()
-	generated := blockchain.IsCoinBaseTx(&details.MsgTx)
-	recvCat := RecvCategory(details, syncHeight, net).String()
-
-	send := len(details.Debits) != 0
-
-	// Fee can only be determined if every input is a debit.
-	var feeF64 float64
-	if len(details.Debits) == len(details.MsgTx.TxIn) {
-		var debitTotal btcutil.Amount
-		for _, deb := range details.Debits {
-			debitTotal += deb.Amount
-		}
-		var outputTotal btcutil.Amount
-		for _, output := range details.MsgTx.TxOut {
-			outputTotal += btcutil.Amount(output.Value)
-		}
-		// Note: The actual fee is debitTotal - outputTotal.  However,
-		// this RPC reports negative numbers for fees, so the inverse
-		// is calculated.
-		feeF64 = (outputTotal - debitTotal).ToPRL()
+	credits := make(map[uint32]wtxmgr.CreditRecord, len(details.Credits))
+	for _, cred := range details.Credits {
+		credits[cred.Index] = cred
 	}
 
-outputs:
+	var entries []btcjson.ListTransactionsResult
 	for i, output := range details.MsgTx.TxOut {
-		// Determine if this output is a credit, and if so, determine
-		// its spentness.
-		var isCredit bool
-		var spentCredit bool
-		for _, cred := range details.Credits {
-			if cred.Index == uint32(i) {
-				// Change outputs are ignored.
-				if cred.Change {
-					continue outputs
-				}
-
-				isCredit = true
-				spentCredit = cred.Spent
-				break
-			}
+		cred, toWallet := credits[uint32(i)]
+		change := toWallet && IsChange(details, cred)
+		paidOut := funded && !change
+		received := toWallet && !change
+		if !paidOut && !received {
+			continue
 		}
 
-		var address string
-		var accountName string
+		entry := base
+		entry.Vout = uint32(i)
 		_, addrs, _, _ := txscript.ExtractPkScriptAddrs(output.PkScript, net)
 		if len(addrs) == 1 {
-			addr := addrs[0]
-			address = addr.EncodeAddress()
-			mgr, account, err := addrMgr.AddrAccount(addrmgrNs, addrs[0])
-			if err == nil {
-				accountName, err = mgr.AccountName(addrmgrNs, account)
-				if err != nil {
-					accountName = ""
-				}
+			entry.Address = addrs[0].EncodeAddress()
+		}
+		amount := btcutil.Amount(output.Value).ToPRL()
+
+		if paidOut {
+			send := entry
+			send.Category = "send"
+			send.Amount = -amount
+			send.Fee = &fee
+			entries = append(entries, send)
+		}
+		if received {
+			receive := entry
+			receive.Category = receiveCategory
+			receive.Amount = amount
+			if len(addrs) == 1 {
+				receive.Account = addressAccount(addrMgr, addrmgrNs, addrs[0])
 			}
-		}
-
-		amountF64 := btcutil.Amount(output.Value).ToPRL()
-		result := btcjson.ListTransactionsResult{
-			// Fields left zeroed:
-			//   InvolvesWatchOnly
-			//   BlockIndex
-			//
-			// Fields set below:
-			//   Account (only for non-"send" categories)
-			//   Category
-			//   Amount
-			//   Fee
-			Address:         address,
-			Vout:            uint32(i),
-			Confirmations:   confirmations,
-			Generated:       generated,
-			BlockHash:       blockHashStr,
-			BlockTime:       blockTime,
-			TxID:            txHashStr,
-			WalletConflicts: []string{},
-			Time:            received,
-			TimeReceived:    received,
-		}
-
-		// Add a received/generated/immature result if this is a credit.
-		// If the output was spent, create a second result under the
-		// send category with the inverse of the output amount.  It is
-		// therefore possible that a single output may be included in
-		// the results set zero, one, or two times.
-		//
-		// Since credits are not saved for outputs that are not
-		// controlled by this wallet, all non-credits from transactions
-		// with debits are grouped under the send category.
-
-		if send || spentCredit {
-			result.Category = "send"
-			result.Amount = -amountF64
-			result.Fee = &feeF64
-			results = append(results, result)
-		}
-		if isCredit {
-			result.Account = accountName
-			result.Category = recvCat
-			result.Amount = amountF64
-			result.Fee = nil
-			results = append(results, result)
+			entries = append(entries, receive)
 		}
 	}
-	return results
+	return entries
 }
 
-// ListSinceBlock returns a slice of objects with details about transactions
-// since the given block. If the block is -1 then all transactions are included.
-// This is intended to be used for listsinceblock RPC replies.
+// listingFee returns the fee as listtransactions reports it, negated. It is 0 unless every input is the wallet's,
+// since the wallet knows only the values of its own inputs.
+func listingFee(details *wtxmgr.TxDetails) float64 {
+	if len(details.Debits) != len(details.MsgTx.TxIn) {
+		return 0
+	}
+	var in, out btcutil.Amount
+	for _, debit := range details.Debits {
+		in += debit.Amount
+	}
+	for _, output := range details.MsgTx.TxOut {
+		out += btcutil.Amount(output.Value)
+	}
+	return (out - in).ToPRL()
+}
+
+// addressAccount names the account that owns addr. A listing shows an empty account rather than failing when the
+// wallet cannot name it.
+func addressAccount(addrMgr *waddrmgr.Manager, ns walletdb.ReadBucket, addr btcutil.Address) string {
+	mgr, account, err := addrMgr.AddrAccount(ns, addr)
+	if err != nil {
+		return ""
+	}
+	name, err := mgr.AccountName(ns, account)
+	if err != nil {
+		return ""
+	}
+	return name
+}
+
+// ListSinceBlock returns a slice of objects with details about transactions since the given block. If the block is
+// -1 then all transactions are included. This is intended to be used for listsinceblock RPC replies.
 func (w *Wallet) ListSinceBlock(start, end, syncHeight int32) ([]btcjson.ListTransactionsResult, error) {
-	txList := []btcjson.ListTransactionsResult{}
+	entries := []btcjson.ListTransactionsResult{}
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
-			for _, detail := range details {
-				detail := detail
-
-				jsonResults := listTransactions(
-					tx, &detail, w.Manager, syncHeight,
-					w.chainParams,
-				)
-				txList = append(txList, jsonResults...)
+		return w.TxStore.RangeTransactions(txmgrNs, start, end, func(details []wtxmgr.TxDetails) (bool, error) {
+			for i := range details {
+				entries = append(entries, transactionEntries(tx, &details[i], w.Manager, syncHeight, w.chainParams)...)
 			}
 			return false, nil
-		}
-
-		return w.TxStore.RangeTransactions(txmgrNs, start, end, rangeFn)
+		})
 	})
-	return txList, err
+	return entries, err
 }
 
-// ListTransactions returns a slice of objects with details about a recorded
-// transaction.  This is intended to be used for listtransactions RPC
-// replies.
+// ListTransactions returns a slice of objects with details about a recorded transaction.  This is intended to be used
+// for listtransactions RPC replies.
+//
+// Results are newest first. from and count are counted in transactions that list at least one entry, and one
+// transaction can list several (a payment to several addresses lists one send for each), so callers paging through
+// history must advance from by transactions, not entries.
 func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsResult, error) {
-	txList := []btcjson.ListTransactionsResult{}
+	entries := []btcjson.ListTransactionsResult{}
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		syncHeight := w.Manager.SyncedTo().Height
+		skipped, listed := 0, 0
+		for details, err := range w.newestFirst(tx.ReadBucket(wtxmgrNamespaceKey)) {
+			if err != nil {
+				return err
+			}
+			if listed >= count {
+				break
+			}
+			txEntries := transactionEntries(tx, details, w.Manager, syncHeight, w.chainParams)
+			// A transfer to the wallet's own change lists nothing and must not count, or pages would drift from what
+			// callers were shown.
+			if len(txEntries) == 0 {
+				continue
+			}
+			if skipped < from {
+				skipped++
+				continue
+			}
+			listed++
+			entries = append(entries, txEntries...)
+		}
+		return nil
+	})
+	return entries, err
+}
 
+// ListAddressTransactions returns a slice of objects with details about recorded transactions that pay any address in
+// a set of script addresses, oldest first. This is intended to be used for listaddresstransactions RPC replies.
+func (w *Wallet) ListAddressTransactions(scriptAddrs map[string]struct{}) ([]btcjson.ListTransactionsResult, error) {
+	entries := []btcjson.ListTransactionsResult{}
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
-
-		// Need to skip the first from transactions, and after those, only
-		// include the next count transactions.
-		skipped := 0
-		n := 0
-
-		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
-			// Iterate over transactions at this height in reverse order.
-			// This does nothing for unmined transactions, which are
-			// unsorted, but it will process mined transactions in the
-			// reverse order they were marked mined.
-			for i := len(details) - 1; i >= 0; i-- {
-				if from > skipped {
-					skipped++
+		syncHeight := w.Manager.SyncedTo().Height
+		return w.TxStore.RangeTransactions(txmgrNs, 0, -1, func(details []wtxmgr.TxDetails) (bool, error) {
+			for i := range details {
+				if !w.paysAnyOf(&details[i], scriptAddrs) {
 					continue
 				}
+				entries = append(entries, transactionEntries(tx, &details[i], w.Manager, syncHeight, w.chainParams)...)
+			}
+			return false, nil
+		})
+	})
+	return entries, err
+}
 
-				n++
-				if n > count {
+// paysAnyOf reports whether one of the transaction's credits pays a Taproot address in scriptAddrs.
+func (w *Wallet) paysAnyOf(details *wtxmgr.TxDetails, scriptAddrs map[string]struct{}) bool {
+	return slices.ContainsFunc(details.Credits, func(cred wtxmgr.CreditRecord) bool {
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(details.MsgTx.TxOut[cred.Index].PkScript, w.chainParams)
+		if err != nil || len(addrs) != 1 {
+			return false
+		}
+		taproot, ok := addrs[0].(*btcutil.AddressTaproot)
+		if !ok {
+			log.Warnf("Skipping non-Taproot address in ListAddressTransactions: %v", addrs[0])
+			return false
+		}
+		_, ok = scriptAddrs[string(taproot.ScriptAddress())]
+		return ok
+	})
+}
+
+// ListAllTransactions returns the listtransactions entries of every wallet transaction, newest first. This is
+// intended to be used for listalltransactions RPC replies.
+func (w *Wallet) ListAllTransactions() ([]btcjson.ListTransactionsResult, error) {
+	entries := []btcjson.ListTransactionsResult{}
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		syncHeight := w.Manager.SyncedTo().Height
+		for details, err := range w.newestFirst(tx.ReadBucket(wtxmgrNamespaceKey)) {
+			if err != nil {
+				return err
+			}
+			entries = append(entries, transactionEntries(tx, details, w.Manager, syncHeight, w.chainParams)...)
+		}
+		return nil
+	})
+	return entries, err
+}
+
+// newestFirst yields the wallet's transactions newest first: unmined ones in no particular order, then mined ones
+// from the tip down, the last one recorded in each block first.
+func (w *Wallet) newestFirst(txmgrNs walletdb.ReadBucket) iter.Seq2[*wtxmgr.TxDetails, error] {
+	return func(yield func(*wtxmgr.TxDetails, error) bool) {
+		err := w.TxStore.RangeTransactions(txmgrNs, -1, 0, func(details []wtxmgr.TxDetails) (bool, error) {
+			for i := range slices.Backward(details) {
+				if !yield(&details[i], nil) {
 					return true, nil
 				}
-
-				jsonResults := listTransactions(tx, &details[i],
-					w.Manager, syncBlock.Height, w.chainParams)
-				txList = append(txList, jsonResults...)
-
-				if len(jsonResults) > 0 {
-					n++
-				}
-			}
-
-			return false, nil
-		}
-
-		// Return newer results first by starting at mempool height and working
-		// down to the genesis block.
-		return w.TxStore.RangeTransactions(txmgrNs, -1, 0, rangeFn)
-	})
-	return txList, err
-}
-
-// ListAddressTransactions returns a slice of objects with details about
-// recorded transactions to or from any address belonging to a set.  This is
-// intended to be used for listaddresstransactions RPC replies.
-func (w *Wallet) ListAddressTransactions(pkHashes map[string]struct{}) ([]btcjson.ListTransactionsResult, error) {
-	txList := []btcjson.ListTransactionsResult{}
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
-		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
-		loopDetails:
-			for i := range details {
-				detail := &details[i]
-
-				for _, cred := range detail.Credits {
-					pkScript := detail.MsgTx.TxOut[cred.Index].PkScript
-					_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-						pkScript, w.chainParams)
-					if err != nil || len(addrs) != 1 {
-						continue
-					}
-					apkh, ok := addrs[0].(*btcutil.AddressTaproot)
-					if !ok {
-						log.Warnf("Skipping non-Taproot address in ListAddressTransactions: %v", addrs[0])
-						continue
-					}
-					_, ok = pkHashes[string(apkh.ScriptAddress())]
-					if !ok {
-						continue
-					}
-
-					jsonResults := listTransactions(tx, detail,
-						w.Manager, syncBlock.Height, w.chainParams)
-					txList = append(txList, jsonResults...)
-					continue loopDetails
-				}
 			}
 			return false, nil
+		})
+		if err != nil {
+			yield(nil, err)
 		}
-
-		return w.TxStore.RangeTransactions(txmgrNs, 0, -1, rangeFn)
-	})
-	return txList, err
-}
-
-// ListAllTransactions returns a slice of objects with details about a recorded
-// transaction.  This is intended to be used for listalltransactions RPC
-// replies.
-func (w *Wallet) ListAllTransactions() ([]btcjson.ListTransactionsResult, error) {
-	txList := []btcjson.ListTransactionsResult{}
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// Get current block.  The block height used for calculating
-		// the number of tx confirmations.
-		syncBlock := w.Manager.SyncedTo()
-
-		rangeFn := func(details []wtxmgr.TxDetails) (bool, error) {
-			// Iterate over transactions at this height in reverse order.
-			// This does nothing for unmined transactions, which are
-			// unsorted, but it will process mined transactions in the
-			// reverse order they were marked mined.
-			for i := len(details) - 1; i >= 0; i-- {
-				jsonResults := listTransactions(tx, &details[i], w.Manager,
-					syncBlock.Height, w.chainParams)
-				txList = append(txList, jsonResults...)
-			}
-			return false, nil
-		}
-
-		// Return newer results first by starting at mempool height and
-		// working down to the genesis block.
-		return w.TxStore.RangeTransactions(txmgrNs, -1, 0, rangeFn)
-	})
-	return txList, err
+	}
 }
 
 // BlockIdentifier identifies a block by either a height or a hash.

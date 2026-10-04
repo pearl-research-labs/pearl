@@ -27,14 +27,23 @@ for its exact location — point them at the built `oyster`, or pass
 - **Overview** — per-account balances, pending funds, recent activity.
 - **Send** — guided flow with address/amount validation, a review step, and
   automatic unlock prompting; the fee rate defaults to the network's minimum
-  relay fee (0.00001 PRL/kB).
+  relay fee (0.00001 PRL/kB). When no peer accepts the transaction it says
+  nothing was sent and offers to retry the same send.
 - **Receive** — fresh or current addresses, rendered with a scannable QR code.
-- **Transactions** — paged history browser with filtering and full detail view.
+- **Transactions** — paged history browser, newest first, with page filtering
+  and a full detail view. Pages are sized to the terminal, so the **Older** and
+  **Newer** rows always sit right under the list; `/` filters the current page.
+  A transaction with more entries than a page has rows lists what fits and ends
+  with a row that opens its detail view. A pending send's detail view offers
+  **Rebroadcast** and **Remove** (see below).
 - **Accounts** — list, create, rename, and inspect addresses.
-- **Coins** — UTXO listing plus lock/unlock coin control.
+- **Coins** — UTXO listing plus lock/unlock coin control. A wallet with more
+  than 500 outputs is searched first (address, txid, amount, or `locked`) and
+  lists what matches, since the list redraws every row on each key press.
 - **Security** — lock/unlock, passphrase change, WIF import/export (guarded),
   message signing and verification.
-- **Node & sync** — oyster and pearld state at a glance.
+- **Node & sync** — oyster and pearld state at a glance, including the SPV
+  peer count (a send needs at least one peer).
 - **Troubleshoot**
   - *RPC console*: run any wallet RPC (or node RPC via oyster's passthrough)
     with method autocompletion and pretty-printed results.
@@ -125,6 +134,35 @@ oystercli -c wallet-host:44207 -u <user> -P <pass> --cafile <copied rpc.cert>
 With a remote target the local bootstrapping steps — config provisioning,
 wallet creation, starting or stopping-and-restarting the daemon from triage —
 are not offered; that machine's operator owns its configuration.
+
+## Pending transactions
+
+Under SPV the daemon announces a transaction to its peers exactly once, when
+it is sent, and never re-announces on its own (Electrum's model). A send fails
+outright when no peer requests the transaction, so a pending entry is one a
+peer did take at the time. The daemon cannot see mempools, so it cannot tell
+whether peers still hold it later; if a send stays pending, rebroadcast it.
+
+The two actions below apply to sends this wallet made. An incoming payment
+that is still unconfirmed gets neither: the daemon never announced it, so
+there is no send to rebroadcast or remove.
+
+From a pending send's detail view:
+
+- **Rebroadcast** — announces it again, pending ancestors first, via
+  `rebroadcasttransaction`. Success means a peer requested it. "No peer
+  requested it" is ambiguous by construction: peers that already hold the
+  transaction stay silent, so it also happens when every connected peer has
+  it. A rejection is shown and the transaction stays pending; Remove drops it.
+- **Remove** — forgets it, and every pending transaction spending from it,
+  via `removetransaction`, so their inputs become spendable again. The
+  network is not consulted: a peer that already holds the transaction may
+  still mine it, and spending the freed inputs again is then a double-spend
+  attempt. The CLI always asks for confirmation first.
+
+Both are available in the RPC console as well, and neither is ever run
+automatically. Both also work with a pearld-backed daemon, which in addition
+resends pending transactions after each rescan.
 
 ## Testnet
 

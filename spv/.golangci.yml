@@ -17,9 +17,9 @@ linters-settings:
       - G115 # Integer overflow conversion.
   lll:
     # Max line length, lines longer will be reported.
-    line-length: 80
+    line-length: 120
     # Tab width in spaces.
-    tab-width: 8
+    tab-width: 4
 
 linters:
   enable-all: true

@@ -349,7 +349,20 @@ type GetSyncProgressResult struct {
 	FilterHeaderHeight int32 `json:"filter_header_height"`
 	BlockHeight        int32 `json:"block_height"`
 	BestPeerHeight     int32 `json:"best_peer_height"`
+	Connections        int32 `json:"connections"`
 	Synced             bool  `json:"synced"`
+}
+
+// RemoveTransactionResult models the data from the removetransaction command.
+type RemoveTransactionResult struct {
+	// Removed lists the requested transaction first, then every pending transaction that spent from it.
+	Removed []string `json:"removed"`
+}
+
+// RebroadcastTransactionResult models the data from the rebroadcasttransaction command.
+type RebroadcastTransactionResult struct {
+	// Announced lists the hashes a peer requested, pending ancestors first and the requested transaction last.
+	Announced []string `json:"announced"`
 }
 
 // BalanceDetailsResult models the details data from the `getbalances` command.

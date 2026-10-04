@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"charm.land/huh/v2"
 	"github.com/pearl-research-labs/pearl/version"
 )
 
@@ -61,16 +60,9 @@ func runDoctor(cfg *config, c *client) {
 		printWarn(fmt.Sprintf("%d check(s) failed; see details above.", failed))
 	}
 
-	export := false
-	ok, err := runForm(newForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Export a report file?").
-			Description("Credentials are never included, so it is safe to attach to a bug report.").
-			Affirmative("Export").
-			Negative("Skip").
-			Value(&export),
-	)))
-	if err != nil || !ok || !export {
+	export, err := confirm("Export a report file?",
+		"Credentials are never included, so it is safe to attach to a bug report.", "Export", "Skip", false)
+	if err != nil || !export {
 		return
 	}
 	path, err := exportDoctorReport(cfg, results)

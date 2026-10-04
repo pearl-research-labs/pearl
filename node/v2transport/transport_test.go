@@ -3,6 +3,7 @@ package v2transport
 import (
 	"bytes"
 	"encoding/hex"
+	"io"
 	"strings"
 	"testing"
 
@@ -547,4 +548,172 @@ func TestDeriveV2CiphersReleasesLease(t *testing.T) {
 		require.NoError(t, p.deriveV2Ciphers(ellswiftTheirs, true, PearlNet(1)))
 		assert.Zero(t, admission.acquired)
 	})
+}
+
+// TestCompleteHandshakeGarbageLengthBounds pins that the garbage terminator is found after up to MaxGarbageLen
+// bytes of garbage and that longer garbage is rejected. The receiver used to stop one check short and reject
+// MaxGarbageLen, failing roughly one in 2048 peer handshakes since both sides pick a length in [0, MaxGarbageLen].
+func TestCompleteHandshakeGarbageLengthBounds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		garbageLen int
+		wantErr    error
+	}{
+		{name: "no garbage"},
+		{name: "maximum garbage", garbageLen: MaxGarbageLen},
+		{name: "garbage over the maximum", garbageLen: MaxGarbageLen + 1, wantErr: errGarbageTermNotRecv},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var err error
+			initiator, responder := NewPeer(), NewPeer()
+			initiator.privkeyOurs, initiator.ellswiftOurs, err = ellswift.EllswiftCreate()
+			require.NoError(t, err)
+			responder.privkeyOurs, responder.ellswiftOurs, err = ellswift.EllswiftCreate()
+			require.NoError(t, err)
+
+			// Script the responder's side of the stream by hand: RespondV2Handshake refuses oversized garbage.
+			stream := bytes.NewBuffer(nil)
+			responder.UseReadWriter(stream)
+			garbage := make([]byte, tt.garbageLen)
+			_, err = responder.Send(append(responder.ellswiftOurs[:], garbage...))
+			require.NoError(t, err)
+			require.NoError(t, responder.deriveV2Ciphers(initiator.ellswiftOurs, false, mainNet))
+			_, err = responder.Send(responder.sendGarbageTerm[:])
+			require.NoError(t, err)
+			_, _, err = responder.V2EncPacket(transportVersion, garbage, false)
+			require.NoError(t, err)
+
+			initiator.UseReadWriter(struct {
+				io.Reader
+				io.Writer
+			}{stream, io.Discard})
+
+			err = initiator.CompleteHandshake(true, nil, mainNet)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestCompleteHandshakeResponderGarbageLengthBounds is the responder-side pair of
+// TestCompleteHandshakeGarbageLengthBounds. Bitcoin Core rejects too-long garbage on both
+// roles; each side expects the other side's send terminator.
+func TestCompleteHandshakeResponderGarbageLengthBounds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		garbageLen int
+		wantErr    error
+	}{
+		{name: "no garbage"},
+		{name: "maximum garbage", garbageLen: MaxGarbageLen},
+		{name: "garbage over the maximum", garbageLen: MaxGarbageLen + 1, wantErr: errGarbageTermNotRecv},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var err error
+			initiator, responder := NewPeer(), NewPeer()
+			initiator.privkeyOurs, initiator.ellswiftOurs, err = ellswift.EllswiftCreate()
+			require.NoError(t, err)
+			responder.privkeyOurs, responder.ellswiftOurs, err = ellswift.EllswiftCreate()
+			require.NoError(t, err)
+
+			// Script the initiator by hand: InitiateV2Handshake refuses oversized garbage.
+			stream := bytes.NewBuffer(nil)
+			initiator.UseReadWriter(stream)
+			garbage := make([]byte, tt.garbageLen)
+			_, err = initiator.Send(append(initiator.ellswiftOurs[:], garbage...))
+			require.NoError(t, err)
+			require.NoError(t, initiator.deriveV2Ciphers(responder.ellswiftOurs, true, mainNet))
+			_, err = initiator.Send(initiator.sendGarbageTerm[:])
+			require.NoError(t, err)
+			_, _, err = initiator.V2EncPacket(transportVersion, garbage, false)
+			require.NoError(t, err)
+
+			responder.UseReadWriter(struct {
+				io.Reader
+				io.Writer
+			}{stream, io.Discard})
+
+			err = responder.CompleteHandshake(false, nil, mainNet)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestCompleteHandshakeGarbageTerminatorPrefixDecoy embeds the first 15 bytes of the sender's
+// garbage terminator in the garbage and flips one bit of the 16th. A 15-byte match must not end
+// the scan: the real terminator and version packet still complete the handshake. lenBefore and
+// lenAfter plus the 16-byte decoy stay within MaxGarbageLen, matching Bitcoin Core's bounds.
+func TestCompleteHandshakeGarbageTerminatorPrefixDecoy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		lenBefore int
+		lenAfter  int
+	}{
+		{name: "prefix is the whole garbage", lenBefore: 0, lenAfter: 0},
+		{name: "prefix between garbage bytes", lenBefore: 20, lenAfter: 30},
+		{name: "prefix at the end of maximum garbage", lenBefore: MaxGarbageLen - garbageSize, lenAfter: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var err error
+			initiator, responder := NewPeer(), NewPeer()
+			initiator.privkeyOurs, initiator.ellswiftOurs, err = ellswift.EllswiftCreate()
+			require.NoError(t, err)
+			responder.privkeyOurs, responder.ellswiftOurs, err = ellswift.EllswiftCreate()
+			require.NoError(t, err)
+
+			stream := bytes.NewBuffer(nil)
+			responder.UseReadWriter(stream)
+			require.NoError(t, responder.deriveV2Ciphers(initiator.ellswiftOurs, false, mainNet))
+
+			garbageLen := tt.lenBefore + garbageSize + tt.lenAfter
+			require.LessOrEqual(t, garbageLen, MaxGarbageLen)
+			garbage := bytes.Repeat([]byte{0xa5}, garbageLen)
+			copy(garbage[tt.lenBefore:], responder.sendGarbageTerm[:])
+			garbage[tt.lenBefore+garbageSize-1] ^= 0x01
+			for off := 0; off+garbageSize <= len(garbage); off++ {
+				if bytes.Equal(garbage[off:off+garbageSize], responder.sendGarbageTerm[:]) {
+					t.Fatalf("decoy garbage contains the full send terminator at %d", off)
+				}
+			}
+
+			_, err = responder.Send(append(responder.ellswiftOurs[:], garbage...))
+			require.NoError(t, err)
+			_, err = responder.Send(responder.sendGarbageTerm[:])
+			require.NoError(t, err)
+			_, _, err = responder.V2EncPacket(transportVersion, garbage, false)
+			require.NoError(t, err)
+
+			initiator.UseReadWriter(struct {
+				io.Reader
+				io.Writer
+			}{stream, io.Discard})
+
+			require.NoError(t, initiator.CompleteHandshake(true, nil, mainNet))
+		})
+	}
 }

@@ -21,11 +21,12 @@ import (
 // and the help footer.
 const coinsChrome = 10
 
-// slowListThreshold is where rendering starts to lag. huh redraws every option
-// on every keystroke, about 15us each per BenchmarkCoinListFrame, so this sits
-// near a 30ms frame. Past it the list is warned about rather than truncated:
-// hiding outputs would defeat the point of the screen.
-const slowListThreshold = 2000
+// coinListLimit bounds the rows handed to huh, which is not virtualized: one
+// key press redraws every option about nine times at roughly 15ms per 1000
+// options each, so tens of thousands of outputs cost seconds per key press. A
+// larger wallet is searched first and lists what matches, since cutting the
+// list off would hide the output being looked for.
+const coinListLimit = 500
 
 // coinMeta is the part of an output's description that never changes.
 // listunspent omits locked outputs entirely and listlockunspent returns bare
@@ -52,63 +53,77 @@ type coinRow struct {
 	locked bool
 }
 
-// coinsScreen is a scrolling browser over every output the wallet holds.
+// coinsScreen is a scrolling browser over the outputs the wallet holds.
 // Locking excludes an output from coin selection until it is unlocked or the
 // daemon restarts.
 //
-// The whole list goes into one scrolling field rather than being split across
-// pages so that the filter searches every output and a single submit can lock
-// and unlock anywhere in the wallet. Submitting applies and redraws; esc
-// leaves.
+// Up to coinListLimit outputs go into one scrolling field, so the filter
+// searches every output and a single submit can lock and unlock anywhere in
+// the wallet. A larger wallet is searched first (see askCoinQuery) and the
+// field lists what matches; lock changes then apply to the listed outputs
+// only. Submitting applies and redraws; esc leaves, or goes back to the search.
 func coinsScreen(c *client) error {
+	return browseCoins(c, coinPrompts{query: askCoinQuery, pick: pickCoins})
+}
+
+// coinPrompts are the two interactions the coins screen runs, so its flow can be tested without a terminal.
+type coinPrompts struct {
+	// query asks what to look for and reports false when the user backs out.
+	query func(previous string, total int) (query string, ok bool, err error)
+	// pick lists the rows with the locked ones ticked and returns the keys left ticked, reporting false when the
+	// user backs out instead of submitting.
+	pick func(shown []coinRow) (picked []string, submitted bool, err error)
+}
+
+func browseCoins(c *client, prompts coinPrompts) error {
 	rows, err := loadCoins(c)
 	if err != nil {
 		return err
 	}
 
+	// ask is false right after an apply, which redraws the same search so the
+	// changed rows show in place.
+	query, ask := "", true
 	for {
 		if len(rows) == 0 {
 			printWarn("No unspent outputs.")
 			return nil
 		}
 
-		printTitle("Coins")
-		lipgloss.Println("  " + coinsSummary(rows))
-		if len(rows) > slowListThreshold {
-			printWarn(fmt.Sprintf("%d outputs is enough to make scrolling "+
-				"sluggish; press / to filter.", len(rows)))
-		}
-
-		opts := make([]huh.Option[string], 0, len(rows))
-		picked := make([]string, 0, len(rows))
-		for _, row := range rows {
-			opts = append(opts, huh.NewOption(coinRowLabel(row), row.key))
-			if row.locked {
-				picked = append(picked, row.key)
+		searching := len(rows) > coinListLimit
+		if searching && ask {
+			var ok bool
+			if query, ok, err = prompts.query(query, len(rows)); err != nil || !ok {
+				return err
 			}
 		}
+		ask = true
 
-		submitted, err := runForm(newForm(huh.NewGroup(
-			// Two huh constraints: Height counts the title and
-			// description as well, and only applies once the options are
-			// set; and the title doubles as the filter prompt, so it
-			// cannot be empty even though the screen already has a
-			// heading.
-			huh.NewMultiSelect[string]().
-				Title("Lock or unlock coins").
-				Description("✓ = locked, skipped when spending · space locks/unlocks · ↑↓ scroll · pgup/pgdown page · / filter · enter apply · esc cancel").
-				Options(opts...).
-				Height(listPageSize(coinsChrome) + 2).
-				Value(&picked),
-		)))
+		shown, matched := listedCoins(rows, query)
+		if len(shown) == 0 {
+			printWarn(fmt.Sprintf("No outputs match %q.", query))
+			continue
+		}
+
+		printTitle("Coins")
+		lipgloss.Println("  " + coinsSummary(rows))
+		if searching {
+			printWarn(coinsShownNote(matched, len(rows), query))
+		}
+
+		picked, submitted, err := prompts.pick(shown)
 		if err != nil {
 			return err
 		}
 		if !submitted {
+			if searching {
+				continue
+			}
 			return nil
 		}
 
-		locked, unlocked, applyErr := applyLockChanges(c, rows, picked)
+		ask = false
+		locked, unlocked, applyErr := applyLockChanges(c, shown, picked)
 		switch {
 		case applyErr != nil:
 			printError(applyErr)
@@ -125,6 +140,106 @@ func coinsScreen(c *client) error {
 				return err
 			}
 		}
+	}
+}
+
+// listedCoins returns the rows one pass of the screen lists and how many matched. A wallet within coinListLimit lists
+// whole; a larger one lists what query matched, capped.
+func listedCoins(rows []coinRow, query string) (shown []coinRow, matched int) {
+	if len(rows) <= coinListLimit {
+		return rows, len(rows)
+	}
+	found := searchCoins(rows, query)
+	return found[:min(len(found), coinListLimit)], len(found)
+}
+
+func pickCoins(shown []coinRow) (picked []string, submitted bool, err error) {
+	opts := make([]huh.Option[string], 0, len(shown))
+	for _, row := range shown {
+		opts = append(opts, huh.NewOption(coinRowLabel(row), row.key))
+		if row.locked {
+			picked = append(picked, row.key)
+		}
+	}
+
+	submitted, err = runForm(newForm(huh.NewGroup(
+		// Two huh constraints: Height counts the title and
+		// description as well, and only applies once the options are
+		// set; and the title doubles as the filter prompt, so it
+		// cannot be empty even though the screen already has a
+		// heading.
+		huh.NewMultiSelect[string]().
+			Title("Lock or unlock coins").
+			Description("✓ = locked, skipped when spending · space locks/unlocks · " +
+				"↑↓ scroll · pgup/pgdown page · / filter · enter apply · esc cancel").
+			Options(opts...).
+			Height(listPageSize(coinsChrome) + fieldHeaderRows).
+			Value(&picked),
+	)))
+	return picked, submitted, err
+}
+
+// askCoinQuery asks what to look for among a wallet too large to list whole.
+// An empty answer lists the largest outputs. It reports false when the user
+// backs out.
+func askCoinQuery(previous string, total int) (string, bool, error) {
+	query := previous
+	ok, err := runForm(newForm(huh.NewGroup(
+		huh.NewInput().
+			Title(fmt.Sprintf("Search %d outputs", total)).
+			Description(fmt.Sprintf("Address, txid, amount or \"locked\"; empty lists the largest %d.", coinListLimit)).
+			Value(&query),
+	)))
+	return strings.TrimSpace(query), ok, err
+}
+
+// searchCoins returns the rows matching every word of query, in the order the
+// rows are already in. Matching is case-insensitive over the whole outpoint,
+// address, amount and lock state, not just the shortened text a row shows.
+func searchCoins(rows []coinRow, query string) []coinRow {
+	words := strings.Fields(strings.ToLower(query))
+	if len(words) == 0 {
+		return rows
+	}
+
+	var found []coinRow
+	for _, row := range rows {
+		if containsAll(coinSearchText(row), words) {
+			found = append(found, row)
+		}
+	}
+	return found
+}
+
+func containsAll(text string, words []string) bool {
+	for _, word := range words {
+		if !strings.Contains(text, word) {
+			return false
+		}
+	}
+	return true
+}
+
+func coinSearchText(row coinRow) string {
+	parts := []string{row.key, row.meta.address}
+	if row.known {
+		parts = append(parts, fmtPRLFloat(row.meta.amount))
+	}
+	if row.locked {
+		parts = append(parts, "locked")
+	}
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+func coinsShownNote(matched, total int, query string) string {
+	shown := min(matched, coinListLimit)
+	switch {
+	case query == "":
+		return fmt.Sprintf("Showing the largest %d of %d outputs.", shown, total)
+	case shown < matched:
+		return fmt.Sprintf("Showing %d of the %d outputs matching %q (%d in the wallet).", shown, matched, query, total)
+	default:
+		return fmt.Sprintf("%d of %d outputs match %q.", shown, total, query)
 	}
 }
 

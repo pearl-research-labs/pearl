@@ -63,8 +63,12 @@ const (
 	//
 	//  [0:4]  Block file (4 bytes)
 	//  [4:8]  File offset (4 bytes)
-	//  [8:12] Block length (4 bytes)
+	//  [8:12] Record length (4 bytes)
 	blockLocSize = 12
+
+	// recordOverhead is the number of bytes a block record adds around the serialized block:
+	// 4 bytes network, 4 bytes block length, and 4 bytes checksum.
+	recordOverhead = 12
 )
 
 var (
@@ -189,7 +193,13 @@ type blockStore struct {
 type blockLocation struct {
 	blockFileNum uint32
 	fileOffset   uint32
-	blockLen     uint32
+	recordLen    uint32 // serialized block plus recordOverhead
+}
+
+// blockLen returns the length of the serialized block, excluding the record overhead.
+func (loc blockLocation) blockLen() uint32 {
+	// writeBlock always stores recordLen >= recordOverhead (no underflow)
+	return loc.recordLen - recordOverhead
 }
 
 // deserializeBlockLoc deserializes the passed serialized block location
@@ -203,11 +213,11 @@ func deserializeBlockLoc(serializedLoc []byte) blockLocation {
 	//
 	//  [0:4]  Block file (4 bytes)
 	//  [4:8]  File offset (4 bytes)
-	//  [8:12] Block length (4 bytes)
+	//  [8:12] Record length (4 bytes)
 	return blockLocation{
 		blockFileNum: byteOrder.Uint32(serializedLoc[0:4]),
 		fileOffset:   byteOrder.Uint32(serializedLoc[4:8]),
-		blockLen:     byteOrder.Uint32(serializedLoc[8:12]),
+		recordLen:    byteOrder.Uint32(serializedLoc[8:12]),
 	}
 }
 
@@ -218,11 +228,11 @@ func serializeBlockLoc(loc blockLocation) []byte {
 	//
 	//  [0:4]  Block file (4 bytes)
 	//  [4:8]  File offset (4 bytes)
-	//  [8:12] Block length (4 bytes)
+	//  [8:12] Record length (4 bytes)
 	var serializedData [12]byte
 	byteOrder.PutUint32(serializedData[0:4], loc.blockFileNum)
 	byteOrder.PutUint32(serializedData[4:8], loc.fileOffset)
-	byteOrder.PutUint32(serializedData[8:12], loc.blockLen)
+	byteOrder.PutUint32(serializedData[8:12], loc.recordLen)
 	return serializedData[:]
 }
 
@@ -434,7 +444,7 @@ func (s *blockStore) writeBlock(rawBlock []byte) (blockLocation, error) {
 	// 4 bytes each for block network + 4 bytes for block length +
 	// length of raw block + 4 bytes for checksum.
 	blockLen := uint32(len(rawBlock))
-	fullLen := blockLen + 12
+	recordLen := blockLen + recordOverhead
 
 	// Move to the next block file if adding the new block would exceed the
 	// max allowed size for the current block file.  Also detect overflow
@@ -446,7 +456,7 @@ func (s *blockStore) writeBlock(rawBlock []byte) (blockLocation, error) {
 	// called during a write transaction, of which there can be only one at
 	// a time.
 	wc := s.writeCursor
-	finalOffset := wc.curOffset + fullLen
+	finalOffset := wc.curOffset + recordLen
 	if finalOffset < wc.curOffset || finalOffset > s.maxBlockFileSize {
 		// This is done under the write cursor lock since the curFileNum
 		// field is accessed elsewhere by readers.
@@ -517,7 +527,7 @@ func (s *blockStore) writeBlock(rawBlock []byte) (blockLocation, error) {
 	loc := blockLocation{
 		blockFileNum: wc.curFileNum,
 		fileOffset:   origOffset,
-		blockLen:     fullLen,
+		recordLen:    recordLen,
 	}
 	return loc, nil
 }
@@ -544,7 +554,7 @@ func (s *blockStore) readBlock(hash *chainhash.Hash, loc blockLocation) ([]byte,
 		return nil, err
 	}
 
-	serializedData := make([]byte, loc.blockLen)
+	serializedData := make([]byte, loc.recordLen)
 	n, err := blockFile.file.ReadAt(serializedData, int64(loc.fileOffset))
 	blockFile.RUnlock()
 	if err != nil {

@@ -114,30 +114,41 @@ func sendScreen(c *client) error {
 	// user just built and reviewed, so Enter should commit it (matching the
 	// Enter-to-advance rhythm of the fields above). When the wallet is
 	// locked, the passphrase prompt in withAutoUnlock is the real gate.
-	confirmed := true
-	ok, err := runForm(newForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Broadcast this transaction?").
-			Description("This cannot be undone once confirmed by the network.").
-			Affirmative("Send").
-			Negative("Cancel").
-			Value(&confirmed),
-	)))
-	if err != nil || !ok || !confirmed {
-		if err == nil {
-			printWarn("Send cancelled. Nothing was broadcast.")
-		}
+	confirmed, err := confirm("Broadcast this transaction?", "This cannot be undone once confirmed by the network.",
+		"Send", "Cancel", true)
+	if err != nil {
 		return err
+	}
+	if !confirmed {
+		printWarn(sendCancelledMessage)
+		return nil
 	}
 
 	var txid *chainhash.Hash
-	err = withAutoUnlock(c, func() error {
-		return withSpinner("Signing and broadcasting...", func() error {
-			var sendErr error
-			txid, sendErr = c.send(fromAccount, address, amount, feeRate, 1)
-			return sendErr
+	for {
+		err = withAutoUnlock(c, func() error {
+			return withSpinner("Signing and broadcasting...", func() error {
+				var sendErr error
+				txid, sendErr = c.send(fromAccount, address, amount, feeRate, 1)
+				return sendErr
+			})
 		})
-	})
+		if !isNotRelayedError(err) {
+			break
+		}
+
+		printWarn(sendNotRelayedMessage)
+		printWarn(rawErrorDetail(err))
+		retry, askErr := confirm("Try again?", "Sends the same amount to the same address at the same fee rate.",
+			"Retry", "Cancel", true)
+		if askErr != nil {
+			return askErr
+		}
+		if !retry {
+			printWarn(sendCancelledMessage)
+			return nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -150,6 +161,13 @@ func sendScreen(c *client) error {
 	}))
 	return nil
 }
+
+const sendCancelledMessage = "Send cancelled. Nothing was broadcast."
+
+// sendNotRelayedMessage explains a send that no peer requested. It never left
+// this machine, so the funds are untouched and trying again is safe.
+const sendNotRelayedMessage = "No network peer accepted the transaction. Nothing was sent and your funds are " +
+	"untouched. Check your connection and try again."
 
 // validateRecipient checks the address decodes and belongs to the active
 // network. Validation is local so it can run on every submit attempt without

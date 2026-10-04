@@ -10,7 +10,6 @@ import (
 	"github.com/pearl-research-labs/pearl/spv/blockntfns"
 	"github.com/pearl-research-labs/pearl/spv/chanutils"
 	"github.com/pearl-research-labs/pearl/spv/filterdb"
-	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/pearl-research-labs/pearl/spv/query"
 )
 
@@ -40,7 +39,6 @@ func UseLogger(logger btclog.Logger) {
 	peer.UseLogger(logger)
 	addrmgr.UseLogger(logger)
 	blockntfns.UseLogger(logger)
-	pushtx.UseLogger(logger)
 	connmgr.UseLogger(logger)
 	query.UseLogger(logger)
 	filterdb.UseLogger(logger)
