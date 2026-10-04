@@ -194,3 +194,6 @@ miner/pearl-gemm/csrc/gemm/instantiations/
 miner/pearl-gemm/csrc/gemm/static_switch_matmul.h
 miner/pearl-gemm/csrc/gemm/static_switch_noisingA.h
 miner/pearl-gemm/csrc/gemm/static_switch_noisingB.h
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
