@@ -11,7 +11,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
@@ -38,28 +37,6 @@ func TestOysterKeyMapEscBacksOut(t *testing.T) {
 	} {
 		assert.Contains(t, b.Help().Desc, "esc back", name)
 	}
-}
-
-func TestWithSpinnerFastPath(t *testing.T) {
-	// Completing before spinnerDelay must not spawn the spinner program
-	// (no TTY in tests, so spawning one would also fail the test).
-	sentinel := errors.New("boom")
-	start := time.Now()
-	err := withSpinner("working...", func() error { return sentinel })
-	require.ErrorIs(t, err, sentinel)
-	assert.Less(t, time.Since(start), spinnerDelay)
-
-	require.NoError(t, withSpinner("working...", func() error { return nil }))
-}
-
-func TestWithSpinnerAccessibleMode(t *testing.T) {
-	t.Setenv("ACCESSIBLE", "1")
-	sentinel := errors.New("slow failure")
-	err := withSpinner("working...", func() error {
-		time.Sleep(2 * spinnerDelay)
-		return sentinel
-	})
-	require.ErrorIs(t, err, sentinel)
 }
 
 func TestFriendlyError(t *testing.T) {

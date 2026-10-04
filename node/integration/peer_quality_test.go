@@ -198,6 +198,25 @@ func setupPeerQuality(t *testing.T) (*rpctest.Harness, *scriptedPeer) {
 		sp.Disconnect()
 		sp.WaitForDisconnect()
 	})
+
+	// The scripted peer's verack only means its own handshake finished.
+	// The victim registers the peer on its handler after that, and
+	// handleInvMsg drops an inv that arrives first.
+	local := sp.LocalAddr().String()
+	require.Eventually(t, func() bool {
+		peers, err := victim.Client.GetPeerInfo()
+		if err != nil {
+			return false
+		}
+		for _, p := range peers {
+			if p.Addr == local {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 10*time.Millisecond,
+		"setupPeerQuality: victim did not register the scripted peer")
+
 	sp.drain()
 	return victim, sp
 }
