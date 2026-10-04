@@ -375,8 +375,7 @@ impl MoeSchedule {
         (p + 1 < e, p >= 1 && p < e)
     }
 
-    /// First opened routing block (the routing stream's block base). Byte
-    /// offsets reach `u32::MAX * 4 ~ 2^34`, so the math runs in u64.
+    /// First opened routing block (the routing stream's block base).
     fn routing_block_base(&self) -> u64 {
         u64::from(self.o_w_prev) * std::mem::size_of::<u32>() as u64 / BLAKE3_MSG_LEN as u64
     }

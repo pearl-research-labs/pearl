@@ -517,12 +517,10 @@ impl MoEStatement {
     /// `start = (o_w_prev * 4) / 64`, `end = ceil((o_w * 4) / 64)`. Empty if
     /// `o_w <= o_w_prev`. Not Merkle [`HashId`] chunks.
     pub(crate) fn opened_routing_blocks(&self) -> Vec<u32> {
-        // The byte offsets reach `u32::MAX * 4 ~ 2^34`; compute in u64. Block
-        // indices stay below u32::MAX for any scalar pair, pinned at compile
-        // time below.
+        // Byte offsets reach `u32::MAX * 4 ~ 2^34`: compute in u64. Block
+        // indices fit in u32 (pinned by the const assert).
         const BLOCK: u64 = pearl_blake3::BLAKE3_MSG_LEN as u64;
         const WIDTH: u64 = std::mem::size_of::<u32>() as u64;
-        // `ceil(u32::MAX * 4 / 64) <= u32::MAX`: block indices fit in u32.
         const _: () = assert!(
             (u32::MAX as u64 * WIDTH).div_ceil(BLOCK) <= u32::MAX as u64,
             "routing block indices must fit in u32"
@@ -2012,11 +2010,10 @@ mod tests {
         use crate::circuit::fp8::blake3_stark::stark::{Blake3Program, MoeSchedule};
 
         // The maximal routing scalars: `o_last = u32::MAX` (a ~2^34-byte
-        // virtual routing tree), winner slice at the very front. `try_new`
-        // must pass the work gate (the routing bound is O(tree depth) thanks
-        // to aux-CV pruning), and the compiler — whose routing byte
-        // arithmetic now runs in u64 — must compile a program the bound
-        // dominates. Pins the whole 2^34/2^36 pipeline end-to-end.
+        // virtual routing tree), winner slice at the very front. The routing
+        // bound is O(tree depth) thanks to aux-CV pruning, so `try_new` must
+        // pass the work gate and the compiler must produce a program the bound
+        // dominates.
         let p = dense_params();
         let build = |stmt: MoEStatement| {
             PublicParams::try_new(

@@ -22,12 +22,9 @@ const H100_WINDOW_PRODUCTS: usize = 128;
 /// Byte geometry of the flat MoE routing list `Rflat` (`u32` entries) and its
 /// 64-byte Blake3 blocks — the single home of the routing offset arithmetic.
 ///
-/// A valid statement carries at most `u32::MAX` routing entries, so byte
-/// offsets reach `u32::MAX · 4 ≈ 2^34` — past 32-bit `usize`. All products run
-/// in `u64` and narrow to `usize` only here, fail-closed. On 64-bit — the
-/// supported verifier platform — every span derived from a valid statement
-/// fits `usize` (routing ≤ 2^34, whole proof ≤ 2^40) and the narrowing never
-/// fires; 32-bit platforms are rejected at these boundaries instead of wrapping.
+/// Byte offsets reach `u32::MAX · 4 ≈ 2^34`: all products run in `u64` and
+/// narrow to `usize` only here, fail-closed (32-bit platforms are rejected
+/// at these boundaries; 64-bit spans always fit).
 pub(crate) mod routing_bytes {
     use anyhow::{Context, Result};
 
@@ -43,8 +40,7 @@ pub(crate) mod routing_bytes {
         Ok((span, len))
     }
 
-    /// Byte offset of the 64-byte routing block `block` (block indices fit
-    /// `u32` by the `opened_routing_blocks` pin).
+    /// Byte offset of the 64-byte routing block `block`.
     pub(crate) fn block_offset(block: u32) -> Result<usize> {
         usize::try_from(u64::from(block) * pearl_blake3::BLAKE3_MSG_LEN as u64)
             .with_context(|| format!("routing block {block} byte offset overflows usize"))

@@ -388,30 +388,23 @@ impl MerkleProof {
 
     /// Extract bytes from sparse merkle leaves.
     ///
-    /// The range must be covered by the opened leaves. Coverage is verified
-    /// *before* the `length`-byte allocation, so a caller passing
-    /// proof-controlled offsets and lengths cannot make a small proof force a
-    /// large allocation. Leaf byte spans use checked arithmetic: a
-    /// `leaf_idx * chunk_len` that overflows `usize` cannot name a byte the
-    /// range could intersect, so such leaves are skipped rather than wrapped
-    /// into a bogus intersecting span.
+    /// The range must be covered by the opened leaves, verified before the
+    /// `length`-byte allocation so a small proof cannot force a large one.
+    /// A leaf span whose arithmetic overflows `usize` cannot intersect the
+    /// range and is skipped.
     pub fn extract_bytes(&self, global_start: usize, length: usize) -> Result<Vec<u8>> {
         let global_end = global_start.checked_add(length).ok_or_else(|| {
             anyhow!("extraction range overflows usize: start={global_start} length={length}")
         })?;
 
-        // The byte span of one opened leaf: `[leaf_idx * chunk_len, .. +
-        // chunk_len)`, `None` where the arithmetic overflows `usize`.
         let leaf_span = |(&leaf_idx, data): (&usize, &Vec<u8>)| -> Option<(usize, usize)> {
             let chunk_len = data.len();
             let start = leaf_idx.checked_mul(chunk_len)?;
             Some((start, start.checked_add(chunk_len)?))
         };
 
-        // Coverage pre-pass over the disjoint opened leaves: the opened
-        // indices are sorted and unique, so the sum of the intersections with
-        // the requested range equals the covered byte count. Same check (and
-        // error) as before, moved ahead of the allocation.
+        // Opened indices are sorted and unique, so the sum of the leaf
+        // intersections with the range is the covered byte count.
         let mut covered = 0usize;
         for (leaf_idx, data) in self.leaf_indices.iter().zip(&self.leaf_data) {
             if let Some((leaf_start, leaf_end)) = leaf_span((leaf_idx, data)) {
@@ -978,14 +971,12 @@ mod tests {
         let err = proof.extract_bytes(usize::MAX, 1).unwrap_err();
         assert!(err.to_string().contains("overflows usize"));
 
-        // (b) An uncovered range is rejected by the coverage pre-pass, i.e.
-        // before any `length`-byte allocation.
+        // (b) An uncovered range is rejected before any allocation.
         let err = proof.extract_bytes(0, 4 * CHUNK_LEN).unwrap_err();
         assert_eq!(err.to_string(), "Not all required bytes covered by leaves");
 
-        // (c) A leaf whose byte span overflows `usize` is skipped instead of
-        // wrapping into a bogus span: previously `leaf_idx * chunk_len`
-        // wrapped and the leaf could serve bytes it does not cover.
+        // (c) A leaf whose byte span overflows `usize` is skipped rather than
+        // wrapping into a bogus span.
         let mut proof = tree.get_multileaf_proof(&[0]);
         proof.leaf_indices[0] = (1usize << 60) + 1;
         assert!(proof.extract_bytes(0, 32).is_err());
