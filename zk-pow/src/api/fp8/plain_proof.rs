@@ -766,13 +766,11 @@ mod tests {
 
     #[test]
     fn parse_proof_rejects_oversized_winner_slice_before_extraction() {
-        // A forged winner slice claims far more entries than the matrix has rows
-        // (m = 4). The winner-slice extraction below allocates from these raw
-        // scalars, and it runs before try_new's aggregate blake3-work bound, so the
-        // R[w] ⊆ [0, m) semantics must bound it here — not try_new, and no numeric cap.
-        // The routing "tree" only declares a leaf count consistent with O_{e-1}
-        // (check_shape's only routing gate), so the rejection must come from the
-        // winner-slice bound, not a tree-size mismatch.
+        // A forged winner slice claims far more entries than the matrix has
+        // rows (m = 4). The extraction allocates from these raw scalars before
+        // try_new's aggregate work bound, so the R[w] ⊆ [0, m) semantics must
+        // reject here. The routing tree's leaf count is consistent with
+        // O_{e-1}, so only this bound rejects.
         let (header, _, _) = ancestry(1);
         let mut proof = tiny_moe_proof(2, vec![2, 4]);
         let witness = proof.moe_witness.as_mut().unwrap();
