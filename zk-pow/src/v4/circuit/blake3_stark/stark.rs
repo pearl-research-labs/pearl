@@ -747,9 +747,9 @@ impl Blake3Program {
                 );
                 let base = 16 * s.routing_block_base();
                 for &(pos, _) in &self.routing_pins {
-                    let g = base + pos;
+                    let g = (base + pos) as u64;
                     assert!(
-                        s.o_w_prev as u64 <= g as u64 && (g as u64) < u64::from(s.o_w),
+                        u64::from(s.o_w_prev) <= g && g < u64::from(s.o_w),
                         "sampled routing pin at global word {g} lies outside the winner slice"
                     );
                 }
