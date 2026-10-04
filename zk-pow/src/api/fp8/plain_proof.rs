@@ -300,6 +300,17 @@ impl PlainProofV4 {
         let o_w_prev = if w == 0 { 0 } else { offsets[(w - 1) as usize] };
         let o_w = offsets[w as usize];
         let o_last = *offsets.last().expect("|O| = e >= 1");
+        // The winner slice is extracted below, before PublicParams::try_new runs the
+        // blake3-work bound. Bound the extraction by the statement's own semantics —
+        // R[w] ⊆ [0, m), so s_w = O_w - O_{w-1} <= m — rather than any numeric cap;
+        // try_new re-checks this via MoEStatement::check.
+        ensure!(o_w >= o_w_prev, "O_w must be >= O_{{w-1}} || O_w={o_w} O_{{w-1}}={o_w_prev}");
+        ensure!(
+            o_w - o_w_prev <= self.job.operands.a.num_rows,
+            "O_w - O_{{w-1}} must be <= m || s_w={} m={}",
+            o_w - o_w_prev,
+            self.job.operands.a.num_rows
+        );
 
         let r_w = extract_u32_span(&witness.routing, o_w_prev, o_w)?;
         ensure!(
@@ -745,6 +756,31 @@ mod tests {
         proof.moe_witness.as_mut().unwrap().offsets = vec![2, 300];
         let err = proof.check_shape().unwrap_err();
         assert!(err.to_string().contains("routing"), "{err}");
+    }
+
+    #[test]
+    fn parse_proof_rejects_oversized_winner_slice_before_extraction() {
+        // A forged winner slice claims far more entries than the matrix has rows
+        // (m = 4). The winner-slice extraction below allocates from these raw
+        // scalars, and it runs before try_new's aggregate blake3-work bound, so the
+        // R[w] ⊆ [0, m) semantics must bound it here — not try_new, and no numeric cap.
+        // The routing "tree" only declares a leaf count consistent with O_{e-1}
+        // (check_shape's only routing gate), so the rejection must come from the
+        // winner-slice bound, not a tree-size mismatch.
+        let (header, _, _) = ancestry(1);
+        let mut proof = tiny_moe_proof(2, vec![2, 4]);
+        let witness = proof.moe_witness.as_mut().unwrap();
+        witness.offsets = vec![1 << 31, 1 << 31];
+        witness.routing = MerkleProof {
+            leaf_data: vec![],
+            leaf_indices: vec![],
+            // 2^31 entries * 4 bytes / 1024-byte chunks = 2^23 leaves.
+            total_leaves: 1 << 23,
+            root: [0; 32],
+            siblings: vec![],
+        };
+        let err = proof.parse_proof(&header).unwrap_err();
+        assert!(err.to_string().contains("O_w - O_{w-1} must be <= m"), "{err}");
     }
 
     #[test]
