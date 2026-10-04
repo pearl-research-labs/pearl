@@ -12,6 +12,7 @@ use crate::api::fp8::dtype::check_not_nan_or_inf_bf16;
 use crate::api::fp8::plain_proof::{MoeWitness, offsets_root};
 use crate::api::fp8::prequant::{BLOCK_SIZE, PrequantOperand, PrequantSlice, open_prequant};
 use crate::api::fp8::public_params::{HashId, PublicParams};
+use crate::api::fp8::utils::routing_bytes;
 use crate::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
 use crate::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMsgLocation, BlakeProgram, DWORD_SIZE, ProofSource};
 use crate::ensure_eq;
@@ -392,10 +393,7 @@ fn extract_routing_strips(routing: &MerkleProof, params: &PublicParams) -> Resul
         .opened_routing_blocks()
         .iter()
         .map(|&hotspot_idx| {
-            // Block byte offsets reach `u32::MAX * 4 ~ 2^34`: compute in u64
-            // and fail closed if usize cannot represent them.
-            let block_start = usize::try_from(u64::from(hotspot_idx) * BLOCK_LEN as u64)
-                .with_context(|| format!("routing strip offset for block {hotspot_idx} overflows usize"))?;
+            let block_start = routing_bytes::block_offset(hotspot_idx)?;
             routing
                 .extract_bytes(block_start, BLOCK_LEN)
                 .with_context(|| format!("routing strip: extract 64 bytes at row_start={block_start}"))

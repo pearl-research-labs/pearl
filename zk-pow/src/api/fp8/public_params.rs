@@ -674,13 +674,13 @@ impl PublicParams {
     /// derivation lets the compiler allocate its per-instruction state.
     fn check_blake3_work_bound(&self) -> Result<()> {
         ensure!(
-            self.blake3_work_block_bound()? <= Self::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN,
+            self.blake3_work_block_bound()? <= (Self::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64,
             "FP8 Blake3 work exceeds 2^22 bytes"
         );
         Ok(())
     }
 
-    fn blake3_work_block_bound(&self) -> Result<usize> {
+    fn blake3_work_block_bound(&self) -> Result<u64> {
         let mut count: u64 = 3; // Two operand-root folds and the final jackpot compression.
         let k = u64::from(self.common_dim());
         let scale_row_bytes = 2 * (k / BLOCK_SIZE as u64);
@@ -710,7 +710,7 @@ impl PublicParams {
             let offsets_bytes = u64::from(moe.experts) * width;
             count += blake_tree_block_bound(offsets_bytes, moe.hash_id_o, std::iter::once((0, offsets_bytes)))?;
         }
-        usize::try_from(count).map_err(|_| anyhow::anyhow!("FP8 Blake3 work block bound overflows usize"))
+        Ok(count)
     }
 
     /// Builds the statement from its wire [`Self::to_bytes`] encoding.
@@ -1982,7 +1982,7 @@ mod tests {
                     };
                     let stark = Blake3Program::from_blake_program(&program, k as usize, pins, schedule);
                     let bound = params.blake3_work_block_bound().unwrap();
-                    let compiled = stark.instructions.len();
+                    let compiled = stark.instructions.len() as u64;
                     assert!(
                         bound >= compiled,
                         "the bound must dominate the compiler: MoE={is_moe} hash_id={hash_id:?} k={k}: {bound} < {compiled}"
@@ -1991,7 +1991,7 @@ mod tests {
                         bound <= compiled + 4096,
                         "the bound must stay within root-path slack: MoE={is_moe} hash_id={hash_id:?} k={k}: {bound} >> {compiled}"
                     );
-                    assert!(compiled * blake3::BLOCK_LEN <= PublicParams::MAX_BLAKE3_WORK_BYTES);
+                    assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WORK_BYTES as u64);
                 }
             }
         }
@@ -2060,7 +2060,7 @@ mod tests {
             "maximal routing scalars must bound at O(depth): {bound} vs baseline {small_bound}"
         );
         assert!(
-            bound <= PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN,
+            bound <= (PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64,
             "maximal routing scalars must pass the work gate"
         );
 
@@ -2070,11 +2070,11 @@ mod tests {
             Some(MoeSchedule::new(params.moe_statement().unwrap(), params.moe().unwrap().experts, params.m()).unwrap()),
         );
         let stark = Blake3Program::from_blake_program(&program, 2048, pins, schedule);
-        let compiled = stark.instructions.len();
+        let compiled = stark.instructions.len() as u64;
         assert!(
             bound >= compiled,
             "the bound must dominate the compiled stark under maximal scalars: {bound} < {compiled}"
         );
-        assert!(compiled * blake3::BLOCK_LEN <= PublicParams::MAX_BLAKE3_WORK_BYTES);
+        assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WORK_BYTES as u64);
     }
 }

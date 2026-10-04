@@ -268,11 +268,7 @@ pub fn parse_axis(indices: &[u32], pattern: &AxisPattern) -> Result<u32> {
         pattern.offset_is_valid(base),
         "pattern parsing error: offset {base} is not a valid tile base for the committed pattern"
     );
-    // Early necessary condition, checked before `tile_offsets()` builds the
-    // `tile_size`-entry vector: a proof's wire-carried index list is what pays
-    // for the allocation (4 bytes per entry), so the indices must first match
-    // the pattern's tile cardinality. The full equality below remains the
-    // single sufficient check.
+    // check allocation in tile_offsets() won't go beyond indices size.
     ensure!(
         indices.len() == pattern.tile_size() as usize,
         "pattern parsing error: opened indices do not match the tile cardinality"
