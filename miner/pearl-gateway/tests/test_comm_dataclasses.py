@@ -21,7 +21,7 @@ class TestMiningJob:
         result = job.to_dict()
         expected_header_bytes = sample_block_template.header.serialize_without_proof_commitment()
 
-        expected_keys = {"incomplete_header_bytes", "target", "cert_version"}
+        expected_keys = {"incomplete_header_bytes", "target", "cert_version", "ancestor_headers"}
         assert set(result.keys()) == expected_keys
 
         assert b64_decode(result["incomplete_header_bytes"]) == expected_header_bytes
@@ -71,6 +71,44 @@ class TestMiningJob:
         )
         assert job.target == sample_block_template.target
         assert job.cert_version == sample_block_template.required_cert_version
+
+    def test_mining_job_carries_the_template_ancestors(
+        self, sample_block_template_data, mining_address
+    ):
+        """The node's state-window headers reach the miner unchanged, parent first."""
+        from pearl_gateway.rpc_types import GetBlockTemplateResponse
+
+        ancestors = [bytes([i]) * 108 for i in range(1, 5)]
+        data = {
+            **sample_block_template_data,
+            "requiredcertversion": int(CertificateVersion.PLAIN_FP8),
+            "ancestorheaders": [header.hex() for header in ancestors],
+        }
+        template = BlockTemplate.from_get_block_template(
+            GetBlockTemplateResponse.model_validate(data), mining_address=mining_address
+        )
+        assert template.ancestor_headers == ancestors
+
+        job = MiningJob.from_dict(MiningJob.from_template(template).to_dict())
+        assert job.ancestor_headers == ancestors
+        assert job.parent_header == ancestors[0]
+
+        data["ancestorheaders"] = [bytes(76).hex()]
+        with pytest.raises(ValueError, match="108-byte"):
+            BlockTemplate.from_get_block_template(
+                GetBlockTemplateResponse.model_validate(data), mining_address=mining_address
+            )
+
+    def test_ancestor_selection_is_limited_to_the_four_header_window(self):
+        headers = [bytes([i]) * 108 for i in range(1, 6)]
+        job = MiningJob(b"", 1, CertificateVersion.PLAIN_FP8, headers)
+        for depth in range(1, 5):
+            assert job.keeps_ancestor(headers[depth - 1])
+            assert job.ancestor_chain_to(headers[depth - 1]) == headers[: depth - 1]
+        for ancestor in (headers[4], bytes(108)):
+            assert not job.keeps_ancestor(ancestor)
+            with pytest.raises(ValueError, match="outside.*state window"):
+                job.ancestor_chain_to(ancestor)
 
 
 class TestAdjustTarget:

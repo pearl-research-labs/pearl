@@ -63,6 +63,15 @@ pub fn eval_columns_at_point<F: RichField + Extendable<D>, const D: usize>(
     point: F::Extension,
     omega_pows: Option<&[F]>,
 ) -> Vec<F::Extension> {
+    eval_columns_at_point_impl::<F, D, false>(columns, point, omega_pows)
+}
+
+// With NEXT, append evaluations at g*point by rotating each column's row indices.
+fn eval_columns_at_point_impl<F: RichField + Extendable<D>, const D: usize, const NEXT: bool>(
+    columns: &[&PolynomialValues<F>],
+    point: F::Extension,
+    omega_pows: Option<&[F]>,
+) -> Vec<F::Extension> {
     // Impl specific to D=2.
     const { assert!(D == 2, "eval_columns_at_point only supports D=2") };
 
@@ -75,6 +84,7 @@ pub fn eval_columns_at_point<F: RichField + Extendable<D>, const D: usize>(
 
     let lg_n = log2_strict(n);
     let num_cols = columns.len();
+    let num_sums = if NEXT { 2 * num_cols } else { num_cols };
 
     // Extract [a, b] components of the extension-field point.
     let components = point.to_basefield_array();
@@ -103,10 +113,18 @@ pub fn eval_columns_at_point<F: RichField + Extendable<D>, const D: usize>(
 
     if b == F::ZERO {
         if let Some(j) = omega_pows.iter().position(|&op| op == a) {
-            return columns
+            let mut values: Vec<_> = columns
                 .iter()
                 .map(|c| F::Extension::from(c.values[j]))
                 .collect();
+            if NEXT {
+                values.extend(
+                    columns
+                        .iter()
+                        .map(|c| F::Extension::from(c.values[(j + 1) % n])),
+                );
+            }
+            return values;
         }
     }
 
@@ -129,22 +147,29 @@ pub fn eval_columns_at_point<F: RichField + Extendable<D>, const D: usize>(
     let sums: Vec<(F, F)> = (0..n)
         .into_par_iter()
         .fold(
-            || vec![(F::ZERO, F::ZERO); num_cols],
+            || vec![(F::ZERO, F::ZERO); num_sums],
             |mut acc, i| {
                 let op = omega_pows[i];
                 let base = inv_norms[i] * op; // inv_norm_i * omega^i
+                let next_i = (i + 1) & (n - 1); // = (i + 1) % n because n is a power of 2.
                 for (j, col) in col_slices.iter().enumerate() {
                     let q = base * col[i]; // inv_norm_i * y_ij * omega^i
                     acc[j].0 += q;
                     acc[j].1 += q * op; // * omega^i -> omega^{2i} term
+                    if NEXT {
+                        // f(g*z) uses the same barycentric weights as f(z), with y_i replaced by y_(i+1).
+                        let next_q = base * col[next_i];
+                        acc[j + num_cols].0 += next_q;
+                        acc[j + num_cols].1 += next_q * op;
+                    }
                 }
                 acc
             },
         )
         .reduce(
-            || vec![(F::ZERO, F::ZERO); num_cols],
+            || vec![(F::ZERO, F::ZERO); num_sums],
             |mut va, vb| {
-                for j in 0..num_cols {
+                for j in 0..num_sums {
                     va[j].0 += vb[j].0;
                     va[j].1 += vb[j].1;
                 }
@@ -179,11 +204,10 @@ pub fn eval_columns_at_zeta_and_next<F: RichField + Extendable<D>, const D: usiz
     zeta: F::Extension,
     degree_bits: usize,
 ) -> (Vec<F::Extension>, Vec<F::Extension>) {
-    let g = F::primitive_root_of_unity(degree_bits);
     let omega_pows = F::two_adic_subgroup(degree_bits);
-    let evals_at_zeta = eval_columns_at_point::<F, D>(columns, zeta, Some(&omega_pows));
-    let evals_at_g_zeta =
-        eval_columns_at_point::<F, D>(columns, zeta.scalar_mul(g), Some(&omega_pows));
+    let mut evals_at_zeta =
+        eval_columns_at_point_impl::<F, D, true>(columns, zeta, Some(&omega_pows));
+    let evals_at_g_zeta = evals_at_zeta.split_off(columns.len());
     (evals_at_zeta, evals_at_g_zeta)
 }
 
@@ -614,5 +638,48 @@ mod tests {
         let empty_refs: Vec<&PolynomialValues<F>> = Vec::new();
         let zeta = FE::rand();
         assert!(eval_columns_at_point::<F, D>(&empty_refs, zeta, None).is_empty());
+    }
+
+    #[test]
+    fn test_eval_columns_at_zeta_and_next_matches_polynomials() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+        const D: usize = 2;
+        for log_n in [0, 1, 2, 5, 10, 15] {
+            let n = 1 << log_n;
+            let roots = F::two_adic_subgroup(log_n);
+            let g = F::primitive_root_of_unity(log_n);
+            let columns: Vec<_> = (0..3)
+                .map(|_| PolynomialValues::new(F::rand_vec(n)))
+                .collect();
+            let refs: Vec<_> = columns.iter().collect();
+            let polynomials: Vec<_> = columns
+                .iter()
+                .map(|c| c.clone().ifft().to_extension::<D>())
+                .collect();
+            for zeta in [
+                FE::rand(),
+                FE::ZERO,
+                FE::from(roots[0]),
+                FE::from(roots[n - 1]),
+                FE::from(F::MULTIPLICATIVE_GROUP_GENERATOR),
+            ] {
+                let (at_zeta, at_next) =
+                    super::eval_columns_at_zeta_and_next::<F, D>(&refs, zeta, log_n);
+                assert_eq!(
+                    at_zeta,
+                    polynomials.iter().map(|p| p.eval(zeta)).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    at_next,
+                    polynomials
+                        .iter()
+                        .map(|p| p.eval(zeta * FE::from(g)))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let empty = super::eval_columns_at_zeta_and_next::<F, D>(&[], FE::rand(), 0);
+        assert!(empty.0.is_empty() && empty.1.is_empty());
     }
 }

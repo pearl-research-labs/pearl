@@ -1752,6 +1752,14 @@ func (state *gbtWorkState) blockTemplateResult(useCoinbaseValue bool, submitOld 
 	if cert := msgBlock.BlockCertificate(); cert != nil {
 		reply.RequiredCertVersion = uint32(cert.Version())
 	}
+	for i := range template.AncestorHeaders {
+		var buf bytes.Buffer
+		if err := template.AncestorHeaders[i].Serialize(&buf); err != nil {
+			context := "Failed to serialize ancestor header"
+			return nil, internalRPCError(err.Error(), context)
+		}
+		reply.AncestorHeaders = append(reply.AncestorHeaders, hex.EncodeToString(buf.Bytes()))
+	}
 	// SegWit is always active; include the witness commitment in the GBT result.
 	if template.WitnessCommitment != nil {
 		reply.DefaultWitnessCommitment = hex.EncodeToString(template.WitnessCommitment)

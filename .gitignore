@@ -186,11 +186,6 @@ simnet_data
 # OpenCode (OhMyOpenCode) work plans/state
 .omo/
 
-# Library .lock file
-miner/blake3-utils/*.lock
-
-# pearl-gemm auto-generated files (setup.py)
-miner/pearl-gemm/csrc/gemm/instantiations/
-miner/pearl-gemm/csrc/gemm/static_switch_matmul.h
-miner/pearl-gemm/csrc/gemm/static_switch_noisingA.h
-miner/pearl-gemm/csrc/gemm/static_switch_noisingB.h
+# Local working checkout of the upstream quack kernels, for reading and
+# experiments only; the package depends on quack-kernels via pyproject.
+miner/pearl-gemm/quack/

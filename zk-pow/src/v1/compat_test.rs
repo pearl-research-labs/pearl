@@ -134,18 +134,18 @@ mod test {
     fn v1_starky_fingerprint() -> String {
         let (header, config, m, n, k) = v1_params();
 
-        // Mine using the main module (same algorithm for non-MoE)
-        let main_config = crate::api::proof::MiningConfiguration {
+        // Mine using the v2 module (same algorithm for non-MoE)
+        let main_config = crate::v2::api::proof::MiningConfiguration {
             common_dim: config.common_dim,
             rank: config.rank,
-            mma_type: crate::api::proof::MMAType::Int7xInt7ToInt32,
-            rows_pattern: crate::api::proof::PeriodicPattern::from_list(&[0, 1, 8, 9, 64, 65, 72, 73]).unwrap(),
-            cols_pattern: crate::api::proof::PeriodicPattern::from_list(&[0, 1, 8, 9, 64, 65, 72, 73]).unwrap(),
+            mma_type: crate::v2::api::proof::MMAType::Int7xInt7ToInt32,
+            rows_pattern: crate::v2::api::proof::PeriodicPattern::from_list(&[0, 1, 8, 9, 64, 65, 72, 73]).unwrap(),
+            cols_pattern: crate::v2::api::proof::PeriodicPattern::from_list(&[0, 1, 8, 9, 64, 65, 72, 73]).unwrap(),
             moe: None,
         };
-        let main_header = crate::api::proof::IncompleteBlockHeader::new_for_test(0x1D2FFFFF);
+        let main_header = crate::v2::api::proof::IncompleteBlockHeader::new_for_test(0x1D2FFFFF);
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xdeadbeef);
-        let plain_proof = crate::ffi::mine::try_mine_one(
+        let plain_proof = crate::v2::mine::try_mine_one(
             &mut rng,
             m,
             n,
@@ -154,15 +154,18 @@ mod test {
             main_config,
             None,
             false,
-            crate::api::proof::SeedDerivation::Legacy,
+            crate::v2::api::seed::SeedDerivation::Legacy,
         )
         .unwrap()
         .unwrap();
 
-        // Parse with main module to get public/private params for hashing
-        let (private_params, public_params) = plain_proof
-            .parse_proof(main_header, crate::api::proof::SeedDerivation::Legacy)
-            .unwrap();
+        // Parse with v2 module to get public/private params for hashing
+        let (private_params, public_params) = crate::v2::api::plain_proof::parse_plain_proof(
+            main_header,
+            &plain_proof,
+            crate::v2::api::seed::SeedDerivation::Legacy,
+        )
+        .unwrap();
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(&public_params.block_header.to_bytes());
@@ -231,7 +234,7 @@ mod test {
     fn test_v1_proof_fixture() {
         let (header, _config, _m, _n, _k) = v1_params();
 
-        let buffer = include_bytes!("fixures/stark_proof.bin");
+        let buffer = include_bytes!("fixtures/stark_proof.bin");
         let public_data: &[u8; PublicProofParams::PUBLICDATA_SIZE] =
             buffer[..PublicProofParams::PUBLICDATA_SIZE].try_into().unwrap();
         let proof_data = &buffer[PublicProofParams::PUBLICDATA_SIZE..];

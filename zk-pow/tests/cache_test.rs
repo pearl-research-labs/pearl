@@ -1,11 +1,11 @@
-use zk_pow::circuit::circuit_utils::CircuitCache;
+use zk_pow::v2::circuit::circuit_utils::CircuitCache;
 
 /// Test cache serialization roundtrip using embedded CACHE_DATA.
 /// Only runs when embedded_cache feature is enabled (requires cache.bin to exist).
 #[test]
 #[cfg(feature = "embedded_cache")]
 fn test_cache_serialization_roundtrip() {
-    use zk_pow::circuit::embedded_cache::CACHE_DATA;
+    use zk_pow::v2::circuit::embedded_cache::CACHE_DATA;
 
     // Load cache from embedded CACHE_DATA
     let cache = CircuitCache::from_bytes(CACHE_DATA).expect("Failed to load embedded cache");

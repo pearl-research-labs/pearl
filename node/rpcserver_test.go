@@ -32,9 +32,10 @@ func TestBlockTemplateResultRequiredCertVersion(t *testing.T) {
 	)
 
 	testCases := []struct {
-		name string
-		cert wire.BlockCertificate
-		want uint32
+		name      string
+		cert      wire.BlockCertificate
+		want      uint32
+		ancestors []wire.BlockHeader
 	}{
 		{
 			name: "v1 placeholder before crossover",
@@ -50,6 +51,12 @@ func TestBlockTemplateResultRequiredCertVersion(t *testing.T) {
 			name: "v3 placeholder at/after the salted-seed fork",
 			cert: &wire.CertificateV3{},
 			want: uint32(wire.CertificateVersionV3),
+		},
+		{
+			name:      "v4 placeholder at/after the FP8 fork",
+			cert:      &wire.CertificateV4{},
+			want:      uint32(wire.CertificateVersionV4),
+			ancestors: []wire.BlockHeader{{Version: 1, ProofCommitment: chainhash.Hash{0x03}}, {Version: 2}},
 		},
 	}
 
@@ -75,9 +82,10 @@ func TestBlockTemplateResultRequiredCertVersion(t *testing.T) {
 			prevHash := &chainhash.Hash{}
 			state := &gbtWorkState{
 				template: &mining.BlockTemplate{
-					Block:  msgBlock,
-					Fees:   []int64{0},
-					Height: 1,
+					Block:           msgBlock,
+					Fees:            []int64{0},
+					Height:          1,
+					AncestorHeaders: tc.ancestors,
 				},
 				timeSource:           blockchain.NewMedianTime(),
 				maxTimeOffsetMinutes: maxTimeOffsetMinutes,
@@ -89,6 +97,15 @@ func TestBlockTemplateResultRequiredCertVersion(t *testing.T) {
 			result, err := state.blockTemplateResult(true, nil)
 			require.NoError(t, err)
 			require.Equal(t, tc.want, result.RequiredCertVersion)
+
+			// The V4 state window reaches miners as hex 108-byte wire headers, parent first.
+			require.Len(t, result.AncestorHeaders, len(tc.ancestors))
+			for i, ancestor := range tc.ancestors {
+				raw, err := hex.DecodeString(result.AncestorHeaders[i])
+				require.NoError(t, err)
+				require.Len(t, raw, wire.MaxBlockHeaderPayload)
+				require.Equal(t, ancestor.BlockHash(), chainhash.DoubleHashH(raw), "ancestor %d", i)
+			}
 		})
 	}
 }

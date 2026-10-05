@@ -186,6 +186,33 @@ type BlockTemplate struct {
 	// WitnessCommitment is the witness commitment included in the coinbase
 	// transaction. Always populated since SegWit is unconditionally active.
 	WitnessCommitment []byte
+
+	// AncestorHeaders holds the full headers of the template's most recent
+	// ancestors, parent first, up to the V4 state window depth (fewer near
+	// genesis). A V4 miner keys its proof by one of them and certifies the
+	// headers in between. Empty unless the template requires a V4 certificate.
+	AncestorHeaders []wire.BlockHeader
+}
+
+// v4StateWindowDepth is the number of most recent ancestors a V4 proof may key
+// its ancestor header from: the certificate carries at most
+// wire.MaxCertificateV4AncestorHeaders headers in between.
+const v4StateWindowDepth = wire.MaxCertificateV4AncestorHeaders + 1
+
+// stateWindowHeaders returns the full headers of the most recent ancestors of
+// a block extending best, parent first, stopping at genesis.
+func (g *BlkTmplGenerator) stateWindowHeaders(best *blockchain.BestState) ([]wire.BlockHeader, error) {
+	headers := make([]wire.BlockHeader, 0, v4StateWindowDepth)
+	hash := best.Hash
+	for range min(v4StateWindowDepth, int(best.Height)+1) {
+		header, err := g.chain.HeaderByHash(&hash)
+		if err != nil {
+			return nil, err
+		}
+		headers = append(headers, header)
+		hash = header.PrevBlock
+	}
+	return headers, nil
 }
 
 // mergeUtxoView adds all of the entries in viewB to viewA.  The result is that
@@ -656,7 +683,13 @@ mempoolLoop:
 	// Use a certificate placeholder whose version matches what consensus
 	// requires at this height, otherwise CheckConnectBlockTemplate rejects it.
 	var certificate wire.BlockCertificate
+	var ancestorHeaders []wire.BlockHeader
 	switch g.chainParams.RequiredCertVersion(nextBlockHeight) {
+	case wire.CertificateVersionV4:
+		certificate = &wire.CertificateV4{Hash: msgBlock.BlockHash()}
+		if ancestorHeaders, err = g.stateWindowHeaders(best); err != nil {
+			return nil, err
+		}
 	case wire.CertificateVersionV3:
 		certificate = &wire.CertificateV3{CertificateV2: wire.CertificateV2{Hash: msgBlock.BlockHash()}}
 	case wire.CertificateVersionV2:
@@ -693,6 +726,7 @@ mempoolLoop:
 		Height:            nextBlockHeight,
 		ValidPayAddress:   payToAddress != nil,
 		WitnessCommitment: witnessCommitment,
+		AncestorHeaders:   ancestorHeaders,
 	}, nil
 }
 

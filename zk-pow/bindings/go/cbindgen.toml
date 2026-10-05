@@ -15,10 +15,18 @@ include = [
     "CZKProof",
     "PUBLICDATA_SIZE",
     "PUBLICDATA_MAX_SIZE",
+    "V4_PUBLIC_PARAMS_WIRE_SIZE",
+    "V4_BLOCK_HEADER_SERIALIZED_SIZE",
+    "V4_MOE_PARAMS_MAX_NUM_EXPERTS",
+    "V4_AXIS_PATTERN_NUM_DIMS",
 ]
 
 [export.rename]
-# Keep the names as-is
+# Preserve the constant names emitted before version modules were separated.
+V4_PUBLIC_PARAMS_WIRE_SIZE = "PublicParams_WIRE_SIZE"
+V4_BLOCK_HEADER_SERIALIZED_SIZE = "BlockHeader_SERIALIZED_SIZE"
+V4_MOE_PARAMS_MAX_NUM_EXPERTS = "MoeParams_MAX_NUM_EXPERTS"
+V4_AXIS_PATTERN_NUM_DIMS = "AxisPattern_NUM_DIMS"
 
 [parse]
 # Parse dependencies to find types

@@ -1,0 +1,146 @@
+use anyhow::{Result, bail, ensure};
+
+use crate::v4::api::{
+    jackpot_policy::{JackpotPolicy, OperandStrip},
+    noise::{OperandNoise, compute_fp8_noise},
+    plain_proof::PlainProofV4,
+    prequant::{BLOCK_SIZE, PrequantOperand, exact_norms, open_prequant},
+    primitives::IncompleteBlockHeader,
+    proof_utils::check_jackpot_difficulty,
+    quantization::Fp8E4M3Quant,
+    transcript::compute_jackpot_ticket,
+};
+
+/// Open one operand's committed strips, compute (l2, linf) norms and noisy-quantize it:
+/// the full "prepare one operand for the jackpot policy" step.
+///
+/// Return an [`OperandStrip`] whose `clean` field is the opened BF16 codes (the
+/// operand as the miner committed it) and whose `built` field contains the noised
+/// FP8 rows `A' = Q(alpha·A + beta·E@F)`.
+fn open_and_noisy_quantize(
+    operand: &PrequantOperand,
+    k: usize,
+    noise: &OperandNoise,
+    quantization: &Fp8E4M3Quant,
+) -> Result<OperandStrip> {
+    ensure!(
+        operand.values.row_bytes() == k,
+        "int8 value strip must hold exactly k={k} bytes"
+    );
+    ensure!(
+        operand.scales.row_bytes() == 2 * (k / BLOCK_SIZE),
+        "scales strip must hold 2 bytes per {BLOCK_SIZE}-element block of k={k}"
+    );
+    let ints: Vec<i8> = operand.values.as_bytes().iter().map(|&b| b as i8).collect();
+    let scale_bits: Vec<u16> = operand
+        .scales
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let n = operand.num_rows()?;
+    let codes = open_prequant(&ints, &scale_bits, n, k, BLOCK_SIZE)?;
+    // Exact norms from the int8 blocks + scales, bypassing the codes' BF16
+    // rounding so miner and verifier agree despite a 1-ulp sum discrepancy.
+    let norms = exact_norms(&ints, &scale_bits, n, k, BLOCK_SIZE)?;
+    let built = quantization.noisy_quantize(&codes, noise, &norms)?;
+    Ok(OperandStrip { clean: codes, built })
+}
+
+/// Verifies a v4 FP8 plain proof under the whitepaper-fixed jackpot policy for
+/// the statement's committed device. The proof's `σ_d` is authenticated against
+/// `proposed_header` through its own [`PlainProofV4::ancestor_chain`].
+pub fn verify_plain_proof(
+    proposed_header: &IncompleteBlockHeader,
+    plain_proof: &PlainProofV4,
+    nbits_override: Option<u32>,
+) -> Result<()> {
+    let (private_params, public_params) = plain_proof.parse_proof(proposed_header)?;
+    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
+    let device = public_params.common().device;
+    let quantization = Fp8E4M3Quant::new(device);
+    let k = public_params.common_dim() as usize;
+
+    // Open each operand's committed strips, inject the deterministic noise,
+    // and quantize: A' = Q(alpha_a·A + beta_a·E1@F1), likewise for B'.
+    let noise = compute_fp8_noise(&public_params, proposed_header);
+    let tile_a = open_and_noisy_quantize(&private_params.operands.a, k, &noise.a, &quantization)?;
+    let tile_b = open_and_noisy_quantize(&private_params.operands.b, k, &noise.b, &quantization)?;
+
+    let Some(message) = JackpotPolicy::for_device(device).evaluate(
+        &tile_a,
+        &tile_b,
+        k,
+        &public_params.a().pattern,
+        &public_params.b().pattern,
+    )?
+    else {
+        bail!("The jackpot is not admissible");
+    };
+
+    let ticket = compute_jackpot_ticket(&public_params.noise_seeds(proposed_header).a, &message);
+
+    // The plain difficulty condition on the proven ticket digest.
+    check_jackpot_difficulty(&ticket.jackpot, nbits, public_params.h(), public_params.w(), k as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v4::circuit::consistency::{fixture_job, fixture_job_untamed};
+
+    /// The full plain-proof acceptance path: wire parse (Merkle openings),
+    /// deterministic noise replay, noisy quantization, the jackpot policy, and the
+    /// winning condition (the fixture header's easy nbits saturates the difficulty bound).
+    #[test]
+    fn plain_verifier_accepts_the_honest_fixture() {
+        let (header, plain) = fixture_job();
+        verify_plain_proof(&header, &plain, None).unwrap_or_else(|e| panic!("the honest fixture must verify: {e:#}"));
+    }
+
+    /// The fixture's σ_d is the grandparent: without the parent in its chain the
+    /// plain verifier cannot reach it.
+    #[test]
+    fn plain_verifier_rejects_a_chain_that_misses_sigma_d() {
+        let (header, mut plain) = fixture_job();
+        plain.ancestor_chain.clear();
+        let err = verify_plain_proof(&header, &plain, None).expect_err("an empty chain must reject");
+        assert!(format!("{err:#}").contains("depth 1 does not connect"), "{err:#}");
+    }
+
+    /// This historical coherent fixture also exceeds the new consolidated census, so
+    /// removing Check 3 must not accidentally turn it into an accepted proof.
+    #[test]
+    fn plain_verifier_rejects_coherent_fixture_under_new_census() {
+        let (header, plain) = fixture_job_untamed();
+        let err = verify_plain_proof(&header, &plain, None).expect_err("the consolidated census must reject");
+        assert!(format!("{err:#}").contains("not admissible"));
+    }
+
+    /// The v4 witness codec round-trips the dense consistency fixture: the
+    /// fixed-width job blob, both variable-chunk opening pairs, and the
+    /// optional MoE witness presence all survive `to_bytes`/`from_bytes`.
+    #[test]
+    fn plain_proof_v4_bincode_roundtrip() {
+        let (_, plain) = fixture_job();
+        let bytes = plain.to_bytes().expect("serialize");
+        let restored = PlainProofV4::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(restored.job, plain.job);
+        assert_eq!(restored.ancestor_chain, plain.ancestor_chain);
+        assert_eq!(restored.values.a.row_indices, plain.values.a.row_indices);
+        assert_eq!(restored.values.a.proof.root, plain.values.a.proof.root);
+        assert_eq!(restored.values.b.row_indices, plain.values.b.row_indices);
+        assert_eq!(restored.values.b.proof.root, plain.values.b.proof.root);
+        assert_eq!(restored.scales.a.row_indices, plain.scales.a.row_indices);
+        assert_eq!(restored.scales.a.proof.root, plain.scales.a.proof.root);
+        assert_eq!(restored.scales.b.row_indices, plain.scales.b.row_indices);
+        assert_eq!(restored.scales.b.proof.root, plain.scales.b.proof.root);
+        assert_eq!(restored.moe_witness.is_some(), plain.moe_witness.is_some());
+        // Non-canonical re-encodings are rejected (no compat ladder).
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(PlainProofV4::from_bytes(&trailing).is_err());
+    }
+}

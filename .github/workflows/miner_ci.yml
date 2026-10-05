@@ -62,16 +62,6 @@ jobs:
           else
             echo "No Python files changed"
           fi
-      - name: Check C++/CUDA formatting with clang-format
-        run: |
-          CPP_FILES=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA"...HEAD -- '*.cpp' '*.hpp' '*.h' '*.cu' '*.cuh' | grep -v 'third_party/' || true)
-          if [ -n "$CPP_FILES" ]; then
-            echo "Checking C++/CUDA formatting for:"
-            echo "$CPP_FILES"
-            echo "$CPP_FILES" | xargs clang-format --dry-run --Werror
-          else
-            echo "No C++/CUDA files changed"
-          fi
 
   pearl_gateway:
     name: Pearl Gateway
@@ -81,7 +71,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          submodules: recursive
           persist-credentials: false
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - name: Install dependencies
@@ -97,7 +86,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          submodules: recursive
           persist-credentials: false
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - name: Install dependencies

@@ -26,4 +26,3 @@ file. See the LICENSE in each sub-directory for details:
   dnsseeder/        Apache-2.0
   plonky2/          MIT OR Apache-2.0  (The Plonky2 Authors, Pearl Research Labs)
   xmss/external/    CC0-1.0
-  miner/pearl-gemm/third_party/cutlass/  BSD-3-Clause (NVIDIA)
