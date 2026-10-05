@@ -689,6 +689,7 @@ type GetMiningInfoResult struct {
 	NetworkHashPS     float64 `json:"networkhashps"`
 	PooledTx          uint64  `json:"pooledtx"`
 	TestNet           bool    `json:"testnet"`
+	BlockSubsidy      float64 `json:"blocksubsidy"`
 }
 
 // GetWorkResult models the data from the getwork command.
