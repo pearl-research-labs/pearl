@@ -266,7 +266,8 @@ fn matmul_fp8_windowed(
                     if record_partials {
                         cell_partials.push(group_sum);
                     }
-                    group_terms = vec![GFloat::from(group_sum)];
+                    group_terms.clear();
+                    group_terms.push(GFloat::from(group_sum));
                 }
             }
             // Finish a remainder group. When k is a multiple of MMA_GROUP_PRODUCTS,
