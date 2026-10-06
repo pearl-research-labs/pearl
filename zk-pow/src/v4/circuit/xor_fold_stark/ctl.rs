@@ -27,12 +27,7 @@ pub fn ctl_cell_results_looking_xor_fold<F: Field>() -> TableWithColumns<F> {
     )
 }
 
-/// XorFold's looked side of the **lottery words** channel: `(LANE_ID,
-/// FOLD_OUT)` with the affine `FOLD_OUT = (ROTATION_INPUT_BOTTOM19_LIMB_0
-/// + 2^16*ROTATION_INPUT_BOTTOM19_LIMB_1)*2^13 + ROTATION_INPUT_TOP13`, filter
-/// `IS_LANE_FINAL`. Blake3's looking side sends 16 tuples pairing each word position with the
-/// corresponding `BLAKE3_MSG` word on the lottery message-load row
-/// (`blake3_stark::ctl::ctl_lottery_words_looking_blake3`).
+/// Exports `(lane_id, fold_out)` on lane-final rows, binding Blake3's 16 lottery message words.
 pub fn ctl_lottery_words_looked_xor_fold<F: Field>() -> TableWithColumns<F> {
     let m = &XOR_FOLD_COL_MAP;
     TableWithColumns::new(
@@ -69,16 +64,22 @@ pub fn xor_fold_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
         LutLookup::rc16(Column::single(m.muladd_high_limb_0)),
         LutLookup::rc16(Column::single(m.muladd_high_limb_1)),
         LutLookup::rc16(Column::single(m.rotation_input_bottom19_limb_0)),
+        // Bound to 16 bits before scaling by 2^3, then require the scaled value to fit too.
+        // Together these give a 13-bit bound. A scaled check alone can wrap modulo p,
+        // admitting a large field value that changes FOLD_OUT while satisfying X2.
         LutLookup::rc16(Column::single(m.rotation_input_top13)),
         LutLookup::rc16(Column::linear_combination([(
             m.rotation_input_top13,
             F::from_canonical_u64(1 << 3),
         )])),
+        // The same pair with scale 2^13 bounds the upper part of the 19-bit split to 3 bits.
         LutLookup::rc16(Column::single(m.rotation_input_bottom19_limb_1)),
         LutLookup::rc16(Column::linear_combination([(
             m.rotation_input_bottom19_limb_1,
             F::from_canonical_u64(1 << 13),
         )])),
+        // Cap the highest limb at 65534, keeping the 64-bit recomposition below p.
+        // Otherwise X1 could accept the intended integer plus the field modulus.
         LutLookup::rc16(Column::linear_combination_with_constant(
             [(m.muladd_high_limb_1, F::ONE)],
             F::ONE,

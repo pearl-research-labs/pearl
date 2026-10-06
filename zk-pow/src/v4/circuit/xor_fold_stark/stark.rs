@@ -80,7 +80,7 @@ use crate::v4::circuit::utils::native_evaluator::NativeEvaluator;
 use crate::v4::circuit::utils::symbolic_evaluator::SymbolicEvaluator;
 
 /// The protocol's fixed odd mixing multiplier (the golden-ratio-derived XorFold constant).
-const GOLDEN: u64 = 0x9E3779B1;
+const FOLD_MULTIPLIER: u64 = 0x9E3779B1;
 
 /// The committed lane layout: `lanes[j]` lists lane `j`'s cell ids in fold order
 /// (`crate::v4::api::layout::lane_assignment`).
@@ -128,10 +128,10 @@ impl XorFoldProgram {
         for (j, lane) in self.lanes.iter().enumerate() {
             let mut state = 0u32;
             for (step, &cell) in lane.iter().enumerate() {
-                // The leading four columns are class (a) — keep in sync with known_values.
+                // The leading four columns are verifier-known — keep in sync with known_values.
                 let w = cell_words[cell];
                 running_skips += cell_skips[cell];
-                let t = state as u64 * GOLDEN + w as u64; // < 2^63.5: exact in the field too
+                let t = state as u64 * FOLD_MULTIPLIER + w as u64; // < 2^63.5: exact in the field too
                 let (lo, hi) = (t as u32, (t >> 32) as u32);
                 debug_assert!(hi >> 16 <= 0x9E38, "honest top limb under the 0xFFFE cap");
                 let row = XorFoldColumnsView::<F> {
@@ -176,12 +176,7 @@ impl XorFoldProgram {
         (rows, [F::from_canonical_u64(self.skip_limit)])
     }
 
-    /// The class (a) ("known") column values — the leading
-    /// [`NUM_XOR_FOLD_KNOWN_COLUMNS`](super::columns::NUM_XOR_FOLD_KNOWN_COLUMNS) trace columns
-    /// in their `columns.rs` order (`CELL_ID`, `LANE_ID`, `IS_LANE_FINAL`, `IS_PAD`), pure
-    /// functions of the committed lane layout. Bit-exact with [`Self::generate_trace`]'s fill;
-    /// the batch verifier recomputes exactly this and checks the trace openings against it
-    /// (`starky`'s `BatchKnownColumns`).
+    /// Recomputes the leading known columns in trace order from public geometry.
     pub fn known_values<F: RichField>(&self) -> Vec<PolynomialValues<F>> {
         let num_rows = self.num_rows();
         let mut cell_id = Vec::with_capacity(num_rows);
@@ -236,11 +231,11 @@ pub(crate) fn eval_xor_fold_constraints<V, S, E>(
     // The honest value is < 2^63.5 (no field wrap); the MULADD_HIGH_LIMB_1 <= 0xFFFE cap
     // (RC16 inventory) keeps the limb side below p too — without it every row with value
     // < 2^32 (all lane starts) would admit the `+p` limb alias, forging the folded word.
-    let golden = eval.u64(GOLDEN);
+    let fold_multiplier = eval.u64(FOLD_MULTIPLIER);
     let two32 = eval.u64(1 << 32);
     let w_hi = eval.mul(two16, lv.cell_result_f32_hi);
     let w = eval.add(lv.cell_result_f32_lo, w_hi);
-    let muladd = eval.mad(lv.fold_state_in, golden, w);
+    let muladd = eval.mad(lv.fold_state_in, fold_multiplier, w);
     let hi_1 = eval.mul(two16, lv.muladd_high_limb_1);
     let hi = eval.add(lv.muladd_high_limb_0, hi_1);
     let limbs = eval.mad(hi, two32, low_word);
@@ -250,12 +245,9 @@ pub(crate) fn eval_xor_fold_constraints<V, S, E>(
     let two13 = eval.u64(1 << 13);
     let fold_out = eval.mad(bottom19, two13, lv.rotation_input_top13);
 
-    // X3 — chaining: 0 entering the first row; a lane-final row resets the next row's state;
-    // otherwise the state chains. The next-row constraints are plain (cyclic): on the wrap pair
-    // the last row is lane-final — a class (a) fact carried by the known-column binding
-    // (IS_LANE_FINAL is verifier-recomputed and checked against the trace openings,
-    // `super::super::known_values`; the same binding gives its booleanness, which X3 and the
-    // lottery channel's filter rely on) — so the wrap instance is row 0's reset.
+    // X3: start row 0 at zero, reset after lane-final rows, otherwise carry fold_out.
+    // These constraints also apply to the cyclic wrap. The known schedule makes the
+    // last row lane-final, so the wrap resets row 0; padding states remain zero.
     eval.constraint_first_row(lv.fold_state_in);
     let reset = eval.mul(lv.is_lane_final, nv.fold_state_in);
     eval.constraint(reset);
@@ -284,9 +276,7 @@ pub(crate) fn eval_xor_fold_constraints<V, S, E>(
     eval.constraint_last_row(budget);
 }
 
-/// XorFoldStark. A CTL party of the fp8 batch (`requires_ctls()`): its proofs carry the
-/// cross-table openings of the channels declared in `super::ctl`, so the batch driver is the
-/// only supported proving path — there is no standalone uni-STARK proof object.
+/// Lottery-fold AIR, proved through the batch driver with the channels in `super::ctl`.
 #[derive(Clone, Debug)]
 pub struct XorFoldStark<F: RichField + Extendable<D>, const D: usize> {
     pub program: XorFoldProgram,
@@ -344,10 +334,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for XorFoldStark<
         true
     }
 }
-
-// ==================================================================================================
-// Tests
-// ==================================================================================================
 
 #[cfg(test)]
 mod tests {
@@ -739,7 +725,7 @@ mod tests {
         }
         // Clearing the trace-final flag: X3's wrap instance becomes a chain pair, forcing
         // FOLD_STATE_IN(0) = FOLD_OUT(last) — the anchored 0 vs. the lane-15 word — so the AIR
-        // still rejects this trace. (The flag is class (a) regardless: any divergence, even
+        // still rejects this trace. (The flag is verifier-known regardless: any divergence, even
         // one engineered so FOLD_OUT(last) = 0, is caught by the batch verifier's
         // known-column recompute.)
         let mut forged = rows.clone();

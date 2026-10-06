@@ -1,8 +1,19 @@
 //! FP8 recursion configuration, trusted verifier setup, and cache serialization.
 //!
-//! The API layer implements job derivation and verification on these types. The cache
-//! retains FP8's device keys, canonical bincode format and read-only lookup semantics;
-//! it does not use the legacy v2 per-degree cache format.
+//! [`crate::api::fp8::zk`] builds setups and uses them to verify proofs. This module
+//! caches them by device and encodes their circuit data and polynomials.
+//!
+//! The polynomial codec stores constant evaluations as little-endian u64s.
+//! Sigma polynomials describe the wire permutation. Each sigma evaluation
+//! identifies a wire position and is encoded as a smaller integer:
+//!
+//! ```text
+//! value = k_is[column] * subgroup[row]
+//! index = column * degree + row
+//! ```
+//!
+//! Here `degree` is the number of circuit rows, `k_is` holds one coset shift per
+//! routed-wire column, and `subgroup` holds the evaluation points for the rows.
 
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
@@ -21,7 +32,8 @@ use crate::v2::circuit::circuit_utils::build_recursion_config as v2_build_recurs
 pub use crate::v2::circuit::circuit_utils::num_query_rounds;
 use crate::v4::api::public_params::Device;
 
-/// Use v2's recursion config with additional routed wires in FP8's second stage.
+/// Build recursion settings for an FP8 wrapper stage.
+/// Stage 2 uses more routed wires to reduce the outer proof size.
 pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
     let mut config = v2_build_recursion_config(rate_bits, pow_bits, stage, is_zk);
     if stage == 2 {
@@ -43,8 +55,7 @@ pub struct Fp8Verifier {
 }
 
 impl Fp8Verifier {
-    /// Serializes trusted verifier setup for distribution to independent
-    /// verifier processes.
+    /// Serialize setup for storage or distribution to verifiers.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let circuit = self
             .circuit
@@ -59,8 +70,8 @@ impl Fp8Verifier {
             .context("serializing fp8 verifier setup")
     }
 
-    /// Loads verifier setup previously produced by [`Fp8Verifier::to_bytes`].
-    /// The bytes are consensus/trusted-setup data, not proof-controlled input.
+    /// Load setup serialized by [`Self::to_bytes`].
+    /// The bytes must come from a trusted source; format checks do not authenticate the setup.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let wire: Fp8VerifierWire = verifier_setup_codec_options()
             .deserialize(bytes)
@@ -71,8 +82,7 @@ impl Fp8Verifier {
             circuit.common.config.zero_knowledge,
             "the fp8 verifier setup must contain the ZK wrapper stage"
         );
-        // The codec pins the polynomial count and degree to `circuit.common` (and rejects
-        // trailing bytes), so a shape mismatch with the circuit fails closed here.
+        // The circuit determines the polynomial count and degree; the decoder rejects missing or extra data.
         let constants_sigmas_polynomials = deserialize_polynomials(&wire.constants_sigmas_polynomials, &circuit.common)
             .context("deserializing the fp8 verifier constants/sigmas polynomials")?;
         Ok(Self {
@@ -89,10 +99,8 @@ impl Fp8Verifier {
 /// [`embedded_cache::CACHE_DATA`](crate::v4::api::embedded_cache::CACHE_DATA), built
 /// offline by `build_cache` ([`Fp8Verifier::generate`] + [`Fp8VerifierCache::insert`]).
 ///
-/// Verification never compiles circuits: a setup missing from the cache rejects the
-/// proof. An on-demand fallback would let anyone force the expensive setup
-/// build through the verify path (denial of service); a stale or incomplete cache is a
-/// deployment error instead, surfaced by the returned message.
+/// Verification fails if the device has no cached setup. Compiling on a cache miss
+/// would let submitted proofs trigger expensive circuit builds.
 #[derive(Default)]
 pub struct Fp8VerifierCache {
     verifiers: HashMap<Fp8VerifierKey, Fp8Verifier>,
@@ -107,9 +115,8 @@ pub struct Fp8VerifierCache {
 type Fp8VerifierKey = Device;
 
 impl Fp8VerifierCache {
-    /// Loads a cache previously produced by [`Fp8VerifierCache::to_bytes`] (consensus /
-    /// trusted-setup data, not proof-controlled input). An empty blob — the embedded
-    /// default when no cache has been built — loads as an empty cache.
+    /// Load trusted cache bytes produced by [`Self::to_bytes`].
+    /// Empty bytes, used when no cache is embedded, produce an empty cache.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() {
             return Ok(Self::default());
@@ -129,7 +136,7 @@ impl Fp8VerifierCache {
         Ok(Self { verifiers })
     }
 
-    /// Serializes the cache (canonical entry order, so equal caches share bytes).
+    /// Serialize entries in device order, giving identical bytes regardless of insertion order.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut entries = self
             .verifiers
@@ -168,7 +175,7 @@ impl Fp8VerifierCache {
         self.verifiers.insert(device, verifier);
     }
 
-    /// Looks up a pre-built setup; never compiles circuits on a cache miss.
+    /// Look up the device's setup; return `None` if it has not been loaded.
     pub(crate) fn get(&self, hardware: Device) -> Option<&Fp8Verifier> {
         self.verifiers.get(&hardware)
     }
@@ -198,7 +205,7 @@ fn write_tight_le(buf: &mut Vec<u8>, val: usize, num_bytes: usize) {
     buf.extend_from_slice(&val.to_le_bytes()[..num_bytes]);
 }
 
-/// Precomputed coset geometry used by both the polynomial serializer and deserializer.
+/// Evaluation points and index width shared by the polynomial encoder and decoder.
 struct CosetLayout {
     bytes_per_index: usize,
     k_is: Vec<GoldilocksField>,
@@ -217,8 +224,7 @@ impl CosetLayout {
     }
 }
 
-/// Serialize constants_sigmas polynomials in compact form.
-/// Constants are stored as u64 evaluations; sigmas as tightly packed permutation indices.
+/// Encode setup polynomials as field evaluations and wire-permutation indices.
 fn serialize_polynomials(
     polys: &[PolynomialCoeffs<GoldilocksField>],
     common_data: &CommonCircuitData<GoldilocksField, 2>,
@@ -228,7 +234,7 @@ fn serialize_polynomials(
     let degree = common_data.degree();
     let layout = CosetLayout::new(common_data);
 
-    // Build reverse lookup: field element -> flat index
+    // Map each allowed sigma evaluation to its wire position.
     let mut reverse_map: HashMap<GoldilocksField, usize> = HashMap::with_capacity(num_routed_wires * degree);
     for col in 0..num_routed_wires {
         for row in 0..degree {
@@ -239,7 +245,7 @@ fn serialize_polynomials(
 
     let mut buf = Vec::new();
 
-    // Constants: FFT to get evaluations, store as u64
+    // Store constant evaluations as canonical little-endian field elements.
     for poly in &polys[..num_constants] {
         let evals = poly.clone().fft();
         for &v in &evals.values {
@@ -247,7 +253,7 @@ fn serialize_polynomials(
         }
     }
 
-    // Sigmas: FFT to get evaluations, map to tight indices
+    // Sigma evaluations use only enough bytes to encode a wire position.
     for poly in &polys[num_constants..num_constants + num_routed_wires] {
         let evals = poly.clone().fft();
         for &v in &evals.values {
@@ -259,8 +265,8 @@ fn serialize_polynomials(
     buf
 }
 
-/// Deserialize constants_sigmas polynomials from compact form.
-/// Reconstructs field elements from indices and runs iFFT to get coefficients.
+/// Decode the compact evaluations and recover polynomial coefficients.
+/// The circuit fixes the required polynomial count and degree.
 fn deserialize_polynomials(
     data: &[u8],
     common_data: &CommonCircuitData<GoldilocksField, 2>,
@@ -292,6 +298,7 @@ fn deserialize_polynomials(
                 .read_uint_le(layout.bytes_per_index)
                 .map_err(|_| anyhow::anyhow!("unexpected end of polynomial data"))?;
             ensure!(idx / degree < layout.k_is.len(), "sigma permutation index out of bounds");
+            // Split the wire index into column and row to recover its sigma evaluation.
             values.push(layout.k_is[idx / degree] * layout.subgroup[idx % degree]);
         }
         polys.push(PolynomialValues::new(values).ifft());
@@ -309,8 +316,8 @@ mod tests {
 
     use super::*;
 
-    // A small real circuit exercises setup serialization and compact verification without
-    // the full FP8 prover's memory requirements. The reduced FRI parameters are test-only.
+    // Small circuit for testing setup serialization and compact verification.
+    // The reduced FRI security is suitable only for these tests.
     fn cache_test_circuit() -> (
         plonky2::plonk::circuit_data::CircuitData<F, OuterC, D>,
         plonky2::iop::target::Target,
@@ -318,7 +325,7 @@ mod tests {
         use plonky2::fri::reduction_strategies::FriReductionStrategy;
         use plonky2::plonk::circuit_builder::CircuitBuilder;
 
-        // Keep the golden codec fixture independent of later production parameter tuning.
+        // Fix the parameters here so production tuning cannot change the expected serialized bytes.
         let config = CircuitConfig {
             num_wires: 135,
             num_routed_wires: 40,

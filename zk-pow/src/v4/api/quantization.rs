@@ -1,5 +1,4 @@
-//! The FP8 quant scheme (per-row scaled noising + FP8 quantization), mirroring
-//! `miner_base.quantization`.
+//! Per-row noise scaling and FP8 quantization.
 //!
 //! The scheme is *fused*: from each row's norms it derives per-row scales
 //! `alpha`, `beta` and forms `alpha (.) X + beta (.) (E @ F)` (`(.)` = per-row
@@ -32,15 +31,12 @@ use crate::v4::api::{
 #[cfg(test)]
 use crate::v4::api::{dtype::fp8_e4m3_to_f32, prequant::round_l2_to_grid};
 
-/// Largest finite FP8 E4M3 magnitude (the quant grid ceiling).
+/// Largest finite FP8 E4M3 magnitude.
 pub const MAX_E4M3: f32 = 448.0;
 /// Constant L2 norm every noise line is renormalized to (`NOISE_TARGET_NORM` in
 /// the reference); an `E @ F` entry is Cauchy-Schwarz-bounded by its square.
 pub const NOISE_TARGET_NORM: f64 = 256.0;
-/// Floor applied to both `l2` and `linf` before the scale derivation (the
-/// reference's `Fp8QuantScheme.row_norms`): a zero row would otherwise divide
-/// by zero in `noisy_quantize`, and the floor also guarantees every row a
-/// non-vanishing noise scale (`beta > 0`). Exact in BF16 (a power of two).
+/// Minimum RMS and absolute maximum for scale derivation; avoids division by zero on zero rows.
 pub const NORM_FLOOR: f32 = 1.0 / 4_294_967_296.0; // 2^-32, exact
 
 /// One side's rebuilt operand: the FP8 values of `A'` (or `B'`) plus the
@@ -103,18 +99,17 @@ impl Fp8E4M3Quant {
     pub(crate) fn row_norms(&self, row: &[u16]) -> Result<(u16, u16)> {
         let k = row.len();
         ensure!(k > 0, "row must be non-empty");
-        let sumsq: f32 = row
+        let sum_of_squares: f32 = row
             .iter()
             .map(|&x| {
-                let v = bf16_to_f32(x);
-                v * v
+                let value = bf16_to_f32(x);
+                value * value
             })
             .sum();
-        ensure!(sumsq.is_finite(), "row sum of squares overflows f32");
-        let l2 = round_l2_to_grid(f32_to_bf16((sumsq / k as f32).sqrt())?);
+        ensure!(sum_of_squares.is_finite(), "row sum of squares overflows f32");
+        let l2 = round_l2_to_grid(f32_to_bf16((sum_of_squares / k as f32).sqrt())?);
 
-        // BF16 abs/amax are exact (sign strip + compare), so folding over the
-        // decoded f32 values reproduces them bit-for-bit.
+        // Absolute value and maximum are exact for decoded BF16 inputs.
         let abs_max = row.iter().map(|&x| bf16_to_f32(x).abs()).fold(0.0f32, f32::max);
         let linf = f32_to_bf16(abs_max)?;
         Ok((l2, linf))
@@ -137,8 +132,10 @@ impl Fp8E4M3Quant {
         let delta_r = self.delta_r_bf16(r)?;
         let delta_over_std = self.delta_over_std_bf16(r)?;
 
+        // Round the magnitude bound once, after the multiply-add.
         let noised_bound = bf16_fma(delta_r, l2, linf).context("noised bound")?;
         let alpha = bf16_div(max_e4m3, noised_bound).context("alpha scale")?;
+        // Each multiplication in the noise scale has its own BF16 rounding.
         let beta = bf16_mul(bf16_mul(alpha, l2)?, delta_over_std).context("beta scale")?;
         Ok((alpha, beta))
     }
@@ -148,50 +145,49 @@ impl Fp8E4M3Quant {
     /// FMA `alpha*X + beta*(E@F)`, clamped to `±MAX_E4M3` before the BF16 -> E4M3
     /// cast.
     pub(crate) fn noisy_quantize(&self, rows: &[u16], noise: &OperandNoise, norms: &[(u16, u16)]) -> Result<BuiltRows> {
-        let e = &noise.e;
-        let f = &noise.f;
+        let row_factors = &noise.e;
+        let basis_factors = &noise.f;
         let num_rows = norms.len();
-        // The inputs are the verifier's own construction (`open_and_noisy_quantize`
-        // feeding `open_prequant`/`exact_norms`), so these are debug invariants,
-        // not runtime validation of untrusted data.
+        // The caller supplies rows, norms and noise factors with matching dimensions.
         debug_assert!(rows.len().is_multiple_of(num_rows), "rows must be num_rows x k");
-        debug_assert!(e.len().is_multiple_of(num_rows), "e must be num_rows x r");
+        debug_assert!(row_factors.len().is_multiple_of(num_rows), "e must be num_rows x r");
         let k = rows.len() / num_rows;
-        let r = e.len() / num_rows;
-        debug_assert!(f.len() == k * r, "f must be k x r");
+        let noise_rank = row_factors.len() / num_rows;
+        debug_assert!(basis_factors.len() == k * noise_rank, "f must be k x r");
 
-        let noise = self.device.matmul_fp8(e, f, None, num_rows, k, r)?;
-        let noise: Vec<u16> = noise.into_iter().map(fp32_to_bf16_rne).collect();
+        let noise = self
+            .device
+            .matmul_fp8(row_factors, basis_factors, None, num_rows, k, noise_rank)?;
+        let noise_bf16: Vec<u16> = noise.into_iter().map(fp32_to_bf16_rne).collect();
 
         let max_e4m3 = f32_to_bf16(MAX_E4M3)?;
         let floor = f32_to_bf16(NORM_FLOOR)?; // exact (power of two)
         let mut noised_part = Vec::with_capacity(num_rows * k);
         let mut alphas = Vec::with_capacity(num_rows);
         let mut betas = Vec::with_capacity(num_rows);
-        let mut l2s = Vec::with_capacity(num_rows);
+        let mut row_rms = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
             let row = &rows[i * k..(i + 1) * k];
-            // The scheme's norm floor (the reference's `row_norms` method).
             let l2 = bf16_max(norms[i].0, floor);
             let linf = bf16_max(norms[i].1, floor);
-            let (alpha, beta) = self.derive_row_scales(l2, linf, r).with_context(|| format!("row {i}"))?;
+            let (alpha, beta) = self
+                .derive_row_scales(l2, linf, noise_rank)
+                .with_context(|| format!("row {i}"))?;
             for j in 0..k {
-                // noised = fma(alpha, X, beta * noise): a single rounding, more
-                // accurate than a separate mul + add.
-                let noised = bf16_fma(alpha, row[j], bf16_mul(beta, noise[i * k + j])?)?;
-                // Very rarely this clamp has any effect (and only if r > 12).
+                // Round the noise term before the fused clean multiply-add.
+                let noised = bf16_fma(alpha, row[j], bf16_mul(beta, noise_bf16[i * k + j])?)?;
                 let clamped = bf16_clamp_sym(noised, max_e4m3);
                 noised_part.push(f32_to_fp8_e4m3(bf16_to_f32(clamped))?);
             }
             alphas.push(alpha);
             betas.push(beta);
-            l2s.push(l2);
+            row_rms.push(l2);
         }
         Ok(BuiltRows {
             noised_part,
             alpha: alphas,
             beta: betas,
-            l2: l2s,
+            l2: row_rms,
         })
     }
 }
@@ -201,8 +197,7 @@ mod tests {
     use super::*;
     use crate::v4::api::noise::decode_hex_for_test as decode_hex_bytes;
 
-    /// Reference single-rounding f64 -> bf16 (RNE), used to prove the production
-    /// f64 -> f32 -> bf16 path never double-rounds for any sanctioned rank.
+    /// Direct f64-to-BF16 rounding reference for the tested scale-constant inputs.
     fn f64_to_bf16_single(x: f64) -> u16 {
         let bits = x.to_bits();
         let sign = ((bits >> 63) as u16) << 15;
@@ -239,7 +234,7 @@ mod tests {
         }
     }
 
-    /// Cross-checked against the reference `ComputeOps.const` (torch), generated by running `miner_base` under torch.
+    /// Expected values generated with PyTorch.
     #[test]
     fn scale_constants_match_reference_vectors() {
         let cases: &[(usize, u16, u16)] = &[
@@ -262,8 +257,7 @@ mod tests {
         assert_eq!(h100.delta_over_std_bf16(32).unwrap(), 0x38B5);
     }
 
-    /// Cross-checked against the reference `Fp8QuantScheme.row_norms`, generated by
-    /// running `miner_base` under torch.
+    /// Expected values generated with PyTorch.
     #[test]
     fn row_norms_matches_reference_vectors() {
         let bf = |v: f32| f32_to_bf16(v).unwrap();
@@ -281,7 +275,7 @@ mod tests {
         }
     }
 
-    /// Cross-checked against the reference scale derivation (torch), generated by running `miner_base` under torch.
+    /// Expected values generated with PyTorch.
     #[test]
     fn derive_row_scales_matches_reference_vectors() {
         // (l2 bits, linf bits, r) -> (alpha bits, beta bits). Inputs are

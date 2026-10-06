@@ -8,10 +8,8 @@
 //! The generator derives each device's LUT cap and bakes it into that device's wrapper
 //! circuit before serializing the cache; no separate cap artifact is shipped.
 
-/// The embedded cache binary data (only when the `embedded_cache` feature is enabled).
 #[cfg(feature = "embedded_cache")]
 pub const CACHE_DATA: &[u8] = include_bytes!("fp8_cache.bin");
 
-/// Empty cache when the `embedded_cache` feature is disabled.
 #[cfg(not(feature = "embedded_cache"))]
 pub const CACHE_DATA: &[u8] = &[];

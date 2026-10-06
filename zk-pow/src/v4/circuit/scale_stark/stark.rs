@@ -1,28 +1,28 @@
-//! Proves the per-row scaling constants used by InputQuantStark.
+//! Per-row norms, scaling constants and policy checks used by InputQuant.
 //!
-//! # Input tuple and number conventions
+//! # Inputs and number conventions
 //!
-//! Each live row receives one completed InputQuant group:
-//! `(l2_frame_sum, frame_doubled_scale_exponent, max_abs, alpha/beta, dead bound/count)`. This header
-//! abbreviates the first three fields as `S`, `E_MAX`, and `MAX_ABS`; `k` is the number of
-//! elements in that matrix row. The AIR identity is program-independent: `k` and `Wl2` enter
-//! as public inputs, pinned by the verifier to statement-derived values.
+//! Each live row receives one completed InputQuant group. Its tuple contains the
+//! framed sum `S`, doubled frame exponent `F`, maximum decoded absolute value,
+//! claims for `alpha` and `beta`, and the dead-entry threshold and count.
+//! The verifier supplies `k` and `Wl2 = 27 - ceil(log2(k))` as public inputs.
 //!
-//! For finite bf16, `M(V)` is its eight-bit integer significand and `E*(V)` is its effective
-//! exponent field (`exp` for normals, 1 for subnormals/zero):
+//! The represented row mean square is:
 //!
 //! ```text
-//! V = (-1)^sign * M(V) * 2^(E*(V) - 134),   134 = exponent bias 127 + 7 fraction bits.
+//! v = S * 2^(F - 268 - Wl2) / k
 //! ```
 //!
-//! InputQuant computes, over eight-element scale blocks,
+//! [`super::super::input_quant_stark::stark`] defines the block floors that produce
+//! `S` and `F`. InputQuant keeps `S < 2^61`; this AIR allows `S < 2^62`.
+//! Both bounds lie below the Goldilocks modulus `p = 2^64 - 2^32 + 1`.
+//!
+//! For a finite nonnegative BF16 value, define:
 //!
 //! ```text
-//! p_b     = M(scale_b)^2 * sum_j int8_j^2
-//! E_MAX   = max_b 2*E*(scale_b) over nonzero p_b, or 0 if all p_b are zero
-//! sigma_b = E_MAX - 2*E*(scale_b) for nonzero p_b
-//! Wl2     = 27 - ceil(log2(k))                 // windowed-L2 precision shift
-//! S       = sum_{b: p_b != 0} floor(p_b * 2^Wl2 / 2^sigma_b)
+//! M(V)  = 128*(1 - exp_is_zero) + mantissa
+//! E*(V) = exp + exp_is_zero
+//! V     = M(V) * 2^(E*(V) - 134)
 //! ```
 //!
 //! `ceil(log2(k))` is the smallest integer `c` with `k <= 2^c`.
@@ -94,9 +94,8 @@
 //! In quarter-ulp units, the exact round-to-nearest-even acceptance boundaries are:
 //!
 //! ```text
-//! B_LO = 4*t - 2 + IS_BOTTOM
-//! B_HI = 4*t + 2
-//! B_LO^2*k <= S*2^(E_MAX + 4 - Wl2 - 2*f) <= B_HI^2*k
+//! dr  = RNE_bf16(delta*sqrt(r))
+//! dos = RNE_bf16(delta*sqrt(r)/N^2)
 //! ```
 //!
 //! Multiplication by four expresses quarter ulps; `+/-2` is half an ulp. The honest witness
@@ -106,10 +105,107 @@
 //! nonzero `S` keeps only the upper bound. The implementation clears powers of two and compares
 //! bounded 16-bit limbs, so these are integer—not field-wrapped—inequalities.
 //!
-//! The FMA rounding key is separately proved `< 2^17`: 17 is the shared RNERND significand-key
-//! width, while bf16 needs only eight precision bits. Arithmetic constraints share the generic
-//! `Evaluator`; `super::ctl` declares all lookup relations, and the verifier recomputes the
-//! structural schedule columns.
+//! 1. `l2 = grid4(RNE_bf16(sqrt(v)))`. This is the row's root mean square (RMS).
+//!    `grid4` rounds the BF16 code to the nearest multiple of four, with ties upward.
+//! 2. `linf` equals the maximum decoded `|X|` supplied by InputQuant.
+//! 3. `l2f = max(l2, 2^-32)` and `linf_f = max(linf, 2^-32)`.
+//! 4. `noised_bound = RNE_bf16(dr*l2f + linf_f)`, with one fused multiply-add rounding.
+//! 5. `alpha = RNE_bf16(448/noised_bound)`, where 448 is the largest finite E4M3 magnitude.
+//! 6. `beta = RNE_bf16(RNE_bf16(alpha*l2f)*dos)`, preserving both rounding steps.
+//!
+//! The norm floors keep `alpha` finite and the noise scale positive on zero rows.
+//! The denominator needs no further floor: rounding is monotone and
+//! `noised_bound >= linf_f >= 2^-32`.
+//!
+//! # Entry liveness (jackpot check 1)
+//!
+//! InputQuant proves and counts the per-element condition `|X| >= 4*l2f`.
+//! The factor four is the default `tau_idle * DELTA = 8 * 0.5`.
+//! The group-tuple lookup binds the threshold to the BF16 code `code(l2f) + 256`;
+//! adding 256 raises the exponent field by two, multiplying the value by four.
+//!
+//! Scale accumulates the counts separately for A and B. On the last trace row,
+//! the range checks require:
+//!
+//! ```text
+//! dead_total_A <= floor(eps_idle * h * k)
+//! dead_total_B <= floor(eps_idle * w * k)
+//! ```
+//!
+//! # Noise floor (jackpot check 2)
+//!
+//! Every live row must satisfy `sigma = alpha*l2f/2 >= 1`. Both factors are positive
+//! normal BF16 values. Their exact product can be written as:
+//!
+//! ```text
+//! SIG   = M(alpha)*M(l2f),          2^14 <= SIG < 2^16
+//! E_SUM = E*(alpha) + E*(l2f)
+//! alpha*l2f = SIG * 2^(E_SUM - 268)
+//! ```
+//!
+//! The floor check therefore becomes:
+//!
+//! ```text
+//! alpha*l2f >= 2  iff  SIG >= 2^(269 - E_SUM)
+//!                iff  E_SUM >= 255, or (E_SUM = 254 and SIG >= 2^15)
+//! ```
+//!
+//! The significand bounds rule out `E_SUM <= 253` and make `E_SUM >= 255`
+//! sufficient. Group F enforces the remaining choice with a branch bit and range
+//! checks. Scale exports the exact sigma significand and exponent to Tamed, and
+//! a normalized version of the same value to InputQuant for summand scoring.
+//!
+//! # Square-root certificate
+//!
+//! The square-root check uses a rescaled value, called the hat frame: multiply
+//! the square root by `2^127`, and hence its square by `2^254`. Then:
+//!
+//! ```text
+//! v_hat = 2^254*v = S*2^(F - 14 - Wl2)/k,    14 = 268 - 254
+//! y_hat = t*2^(f - 7),                      t = M(claim), f = E*(claim)
+//! ```
+//!
+//! For the claimed BF16 square root, define the rounding boundaries in units of
+//! one quarter of its binade's spacing. A binade is the interval between successive
+//! powers of two. The boundaries and the squared acceptance interval are:
+//!
+//! ```text
+//! B_LO = 4*t - 2 + is_bottom
+//! B_HI = 4*t + 2
+//! B_LO^2*k <= S*2^(F + 4 - Wl2 - 2*f) <= B_HI^2*k
+//! ```
+//!
+//! `is_bottom = 1` when `t = 128` and `f >= 2`. At such a power of two, the
+//! preceding binade has half the spacing, so the lower midpoint is one quarter
+//! unit away rather than one half. Both inequalities are strict when `t` is odd;
+//! this implements ties to even. `S = 0` forces positive zero. A zero claim on
+//! nonzero `S` needs only the upper bound.
+//!
+//! Q5 converts the power-of-two alignment into whole limbs and a small bit shift:
+//!
+//! ```text
+//! G      = 2*f + Wl2 - 4 - F
+//! G + 32 = 16*q + 15 - r2,    q in [0, 4], r2 in [0, 15]
+//! SS     = S*2^r2
+//! ```
+//!
+//! The equivalent bracket is:
+//!
+//! ```text
+//! (B_LO^2*k*2^15)*2^(16*q) <= SS*2^32 <= (B_HI^2*k*2^15)*2^(16*q)
+//! ```
+//!
+//! Multiplication by `2^(16*q)` shifts the claim by `q` base-`2^16` limbs;
+//! `2^32` shifts `SS` by two limbs. Range-checked digits and borrow bits enforce
+//! these comparisons over the integers. An initial borrow of `t mod 2` makes
+//! ties fail exactly when `t` is odd.
+//!
+//! # Trace binding
+//!
+//! Rows are ordered A then B, followed by padding excluded from imports and counts.
+//! The verifier recomputes and binds the schedule columns. [`super::ctl`] supplies
+//! the range and rounding lookups, including the `2^17` bound that prevents an
+//! oversized FMA significand from selecting another RNERND rounding slot.
 
 use core::borrow::{Borrow, BorrowMut};
 use core::cmp::Ordering;
@@ -137,9 +233,7 @@ use crate::v4::api::prequant::{BLOCK_SIZE, l2_frame_width};
 use crate::v4::api::public_params::{Device, PublicParams};
 use crate::v4::api::quantization::{Fp8E4M3Quant, MAX_E4M3, NORM_FLOOR};
 
-// ==================================================================================================
 // Frame constants (bf16 field conventions)
-// ==================================================================================================
 
 /// `value = M * 2^(E* - 134)`: the bf16 unit offset (127 bias + 7 mantissa denominator).
 const EXP_UNIT: i64 = 134;
@@ -147,9 +241,9 @@ const EXP_UNIT: i64 = 134;
 const PROD_UNIT: i64 = 2 * EXP_UNIT;
 /// bf16 code of `MAX_E4M3 = 448.0` (DIV448's numerator; asserted in `ScaleProgram::new`).
 pub(crate) const CODE_448: u16 = 0x43E0;
-/// bf16 code of `NORM_FLOOR = 2^-32` (exponent field `127 - 32 = 95`, mantissa 0) — the floor
-/// the reference scheme's `row_norms` applies to BOTH `l2` and `linf` before the scale chain
-/// (asserted against `quantization::NORM_FLOOR` in `ScaleProgram::new`).
+/// BF16 code of the floor applied to both norms before scale derivation.
+/// `2^-32` has exponent field `127 - 32 = 95` and mantissa zero.
+/// Checked against `quantization::NORM_FLOOR` in `ScaleProgram::new`.
 pub(crate) const NORM_FLOOR_CODE: u16 = 0x2F80;
 // The floor is a normal power of two, so its floored fields are M = 128, E* = exponent field.
 const _: () = assert!(NORM_FLOOR_CODE & 0x7F == 0 && NORM_FLOOR_CODE >> 7 >= 1 && NORM_FLOOR_CODE >> 7 <= 254);
@@ -177,9 +271,7 @@ const POW2D_MAX: u64 = 17;
 /// and `(4t+2)^2 - (4t-2+b)^2 = 32t + 3b - 8bt = 32t - 1021b`).
 const UPPER_SQ_BOTTOM_DELTA: i64 = 1021;
 
-// ==================================================================================================
 // Program, tuples and trace generation
-// ==================================================================================================
 
 /// The per-group aggregate tuple ScaleStark receives from InputQuantStark over the group-tuple
 /// CTL: everything this AIR knows about the raw row.
@@ -197,21 +289,16 @@ pub struct ScaleRowTuple {
 }
 
 impl ScaleRowTuple {
-    /// Builds the tuple InputQuantStark would commit for one prequant row (`int8` values plus
-    /// one bf16 scale code per block of [`BLOCK_SIZE`] = 8): the exact block-integer L2 frame
-    /// sum and frame exponent (InputQuantStark's group-B semantics — `n_b = sum int8^2`,
-    /// `p_b = M(scale_b)^2 * n_b`,
-    /// `TERM_b = floor(p_b * 2^Wl2 / 2^(FRAME_DOUBLED_SCALE_EXPONENT - 2*E*(scale_b)))`
-    /// for live blocks), the max-|X| code over the decoded elements
-    /// `X_j = RNE_bf16(int_j * scale_j)` (the exact native `open_prequant` semantics), and
-    /// the jackpot dead-entry count against the row's own floored L2.
+    /// Reproduce InputQuant's aggregate for one row of int8 values and BF16 block scales.
+    /// Uses the block-floor RMS calculation described in the module overview,
+    /// the maximum decoded magnitude, and the resulting dead-entry count.
     ///
     /// Panics on non-finite scales and on decoded elements overflowing bf16.
     pub fn from_prequant_row_for_device(int8: &[i8], scales: &[u16], wl2: u32, device: Device) -> Self {
         assert!(int8.len().is_multiple_of(BLOCK_SIZE), "row length is a multiple of 8");
         assert_eq!(scales.len(), int8.len() / BLOCK_SIZE, "one scale per block");
 
-        // linf: the max |X| over the decoded elements (decode = the native open_prequant).
+        // Decode with open_prequant's BF16 rounding before taking the maximum magnitude.
         let mut abs_codes = Vec::with_capacity(int8.len());
         let mut max_abs = 0u32;
         for (j, &v) in int8.iter().enumerate() {
@@ -228,8 +315,7 @@ impl ScaleRowTuple {
             max_abs = max_abs.max(abs);
         }
 
-        // The block-integer frame sum (InputQuantStark's group B): dead blocks (p_b = 0)
-        // contribute nothing and do not enter the frame max.
+        // Zero blocks contribute nothing and do not affect the common frame exponent.
         let mut frame_doubled_scale_exponent = 0u64;
         let blocks: Vec<(u64, u64)> = int8
             .chunks(BLOCK_SIZE)
@@ -254,9 +340,7 @@ impl ScaleRowTuple {
         }
         assert!(s < 1 << 62, "frame sum exceeds the Q1 cap");
 
-        // The dead count (jackpot check 1): |X| >= 4*l2f, with l2f the floored grid-snapped
-        // RNE sqrt of the row mean square — the exact threshold the group-tuple CTL pins
-        // in-circuit (T1: `code(l2f) + 256`; abs codes are value-ordered on finite bf16).
+        // Derive the row RMS with the same square-root rounding as the circuit.
         let claim = if s == 0 {
             SqrtClaim {
                 exp: 0,
@@ -266,6 +350,7 @@ impl ScaleRowTuple {
         } else {
             rne_sqrt_hat(s, frame_doubled_scale_exponent as i64, i64::from(wl2), int8.len() as u64)
         };
+        // Grid-round and floor the RMS; adding 256 to its code gives the threshold 4*l2f.
         let snapped = ((claim.exp << 7) + claim.mantissa + 2) & !3;
         let dead_bound = snapped.max(u64::from(NORM_FLOOR_CODE)) + device.liveness_code_shift();
         let dead_count = abs_codes.iter().filter(|&&abs| u64::from(abs) >= dead_bound).count() as u32;
@@ -397,12 +482,8 @@ impl ScaleProgram {
         pis
     }
 
-    /// Generates the ScaleStark trace and public inputs from the per-row aggregate tuples
-    /// (`h` A-row tuples, then `w` B-row tuples — the order the CTL keys assume).
-    ///
-    /// Panics on protocol-invalid tuples (oversized sums, zero-sum/zero-max mismatches) and
-    /// on the unprovable boundary rows the protocol treats as rejected (an l2 snap into the
-    /// infinity code) — a prover has no business tracing them.
+    /// Generates the trace and public inputs from h A-row tuples followed by w B-row tuples.
+    /// Panics on invalid tuples or rejected policy/rounding results.
     pub fn generate_trace<F: RichField>(
         &self,
         a_rows: &[ScaleRowTuple],
@@ -414,8 +495,7 @@ impl ScaleProgram {
         let wl2 = self.wl2();
         let k = self.k as u64;
 
-        // A policy-rejected tile is unprovable (the T3 gate has no satisfying RC16 row) —
-        // a prover has no business tracing it.
+        // Reject policy failures before constructing the trace.
         let total_dead = |rows: &[ScaleRowTuple]| rows.iter().map(|t| u64::from(t.dead_count)).sum::<u64>();
         let (limit_a, limit_b) = (self.dead_limit(self.h * self.k), self.dead_limit(self.w * self.k));
         let (total_a, total_b) = (total_dead(a_rows), total_dead(b_rows));
@@ -448,7 +528,7 @@ impl ScaleProgram {
             {
                 let v: &mut ScaleColumnsView<F> = row.borrow_mut();
 
-                // ---- Sqrt claim (group Q) + everything downstream of the tuple. ----
+                // Sqrt claim (group Q) + everything downstream of the tuple.
                 let claim = if tuple.l2_frame_sum == 0 {
                     SqrtClaim {
                         exp: 0,
@@ -464,7 +544,7 @@ impl ScaleProgram {
                     )
                 };
                 // Pad rows key like B row 0 inside fill_data_row and are re-keyed to the
-                // all-zero class (a) shape below (the CTL filter drops them anyway).
+                // all-zero verifier-known shape below (the CTL filter drops them anyway).
                 self.fill_data_row(v, tuple, is_a && !is_pad, if is_pad { self.h } else { i }, claim, true);
                 if is_pad {
                     v.group_key = F::ZERO;
@@ -473,7 +553,7 @@ impl ScaleProgram {
                 }
                 v.is_last_row = F::from_bool(i == num_rows - 1);
 
-                // ---- The jackpot running dead totals (group T; frozen through pads). ----
+                // The jackpot running dead totals (group T; frozen through pads).
                 if !is_pad {
                     if is_a {
                         running_dead_a += u64::from(tuple.dead_count);
@@ -494,12 +574,7 @@ impl ScaleProgram {
         (rows, self.public_inputs())
     }
 
-    /// The class (a) ("known") column values — the leading
-    /// [`NUM_SCALE_KNOWN_COLUMNS`](super::columns::NUM_SCALE_KNOWN_COLUMNS) trace columns in
-    /// their `columns.rs` order (`GROUP_KEY`, `IS_LAST_ROW`, `IS_A_ROW`, `IS_PAD`), pure
-    /// functions of the program geometry. Bit-exact with [`Self::generate_trace`]'s fill; the
-    /// batch verifier recomputes exactly this and checks the trace openings against it
-    /// (`starky`'s `BatchKnownColumns`).
+    /// Recomputes the leading schedule columns in trace order from public geometry.
     pub fn known_values<F: RichField>(&self) -> Vec<PolynomialValues<F>> {
         let num_rows = self.num_rows();
         let mut group_key = Vec::with_capacity(num_rows);
@@ -527,11 +602,9 @@ impl ScaleProgram {
             .collect()
     }
 
-    /// Fills one row's tuple, sqrt-bracket, grid, linf and scale-chain columns for the given
-    /// sqrt claim (`IS_CREDIT_ROW` is the caller's). Split out of
-    /// [`Self::generate_trace`] so the tamper tests can rebuild a row that is internally
-    /// consistent *except* for a wrong sqrt claim (`expect_valid = false` skips the honest-only
-    /// asserts) — proving the bracket alone rejects it.
+    /// Fills a row from its aggregate tuple and a chosen sqrt claim.
+    /// Tamper tests pass `expect_valid = false` to rebuild a consistent downstream
+    /// witness for a wrong claim, isolating rejection by the sqrt certificate.
     pub(crate) fn fill_data_row<F: RichField>(
         &self,
         v: &mut ScaleColumnsView<F>,
@@ -546,7 +619,7 @@ impl ScaleProgram {
         let dr = Bf16Fields::from_code(self.dr_code());
         let dos = Bf16Fields::from_code(self.dos_code());
 
-        // ---- Tuple sanity (CTL-guaranteed for honest tuples; hard-asserted here). ----
+        // Tuple sanity (CTL-guaranteed for honest tuples; hard-asserted here).
         assert!(tuple.l2_frame_sum < 1 << 62, "S exceeds the Q1 cap");
         assert!(
             tuple.max_abs < 1 << 15 && tuple.max_abs >> 7 != 255,
@@ -562,7 +635,7 @@ impl ScaleProgram {
         assert_eq!(tuple.l2_frame_sum == 0, tuple.max_abs == 0, "S = 0 iff the row is all zero");
         assert!(u64::from(tuple.dead_count) <= k, "at most k dead entries per row");
 
-        // ---- Class (a). ----
+        // Verifier-known.
         let group_index = if is_a { row_index } else { row_index - self.h };
         let key = if is_a {
             (group_index + 1) * self.k - 1
@@ -572,12 +645,12 @@ impl ScaleProgram {
         v.group_key = F::from_canonical_usize(key);
         v.is_a_row = F::from_bool(is_a);
 
-        // ---- Tuple columns. ----
+        // Tuple columns.
         v.l2_frame_sum = F::from_canonical_u64(tuple.l2_frame_sum);
         v.frame_doubled_scale_exponent = F::from_canonical_u64(u64::from(tuple.frame_doubled_scale_exponent));
         v.dead_count = F::from_canonical_u64(u64::from(tuple.dead_count));
 
-        // ---- Sqrt bracket witnesses (group Q). ----
+        // Sqrt bracket witnesses (group Q).
         fill_sqrt_block(
             v,
             tuple.l2_frame_sum,
@@ -588,7 +661,7 @@ impl ScaleProgram {
             expect_valid,
         );
 
-        // ---- Grid snap (group G) and linf decode (group N). ----
+        // Grid snap (group G) and linf decode (group N).
         let sqrt_code = (claim.exp << 7) + claim.mantissa;
         let snapped = (sqrt_code + 2) & !3;
         v.grid_snap_quotient = F::from_canonical_u64(snapped / 4);
@@ -603,8 +676,8 @@ impl ScaleProgram {
         v.linf_mantissa = F::from_canonical_u64(linf.mantissa);
         v.linf_exp_is_zero = F::from_bool(linf.exp_is_zero);
 
-        // ---- Norm floors (group H0), the reference scheme's `row_norms`:
-        // l2f = max(l2, 2^-32) and linf_f = max(linf, 2^-32), by code order on nonnegatives. ----
+        // Norm floors (group H0), the reference scheme's `row_norms`:
+        // l2f = max(l2, 2^-32) and linf_f = max(linf, 2^-32), by code order on nonnegatives.
         let (l2f, l2_ge, l2_slack) = floor_norm(l2);
         v.l2_ge_floor = F::from_bool(l2_ge);
         v.l2_floor_order_slack = F::from_canonical_u64(l2_slack);
@@ -616,7 +689,7 @@ impl ScaleProgram {
         v.linf_floored_significand = F::from_canonical_u64(linf_f.m());
         v.linf_floored_exponent = F::from_canonical_u64(linf_f.e_star() as u64);
 
-        // ---- The scale chain (group H), each step asserted bit-exact vs. native. ----
+        // The scale chain (group H), each step asserted bit-exact vs. native.
         let noised_bound_fma = fill_fma(dr, l2f, linf_f);
         write_fma(v, &noised_bound_fma);
         let nb_native = bf16_fma(self.dr_code(), l2f.code(), linf_f.code()).expect("native fma");
@@ -638,7 +711,7 @@ impl ScaleProgram {
         let sigma_sig_is_wide = sigma_significand >= 1 << 15;
         v.sigma_sig_is_wide = F::from_bool(sigma_sig_is_wide);
         // S3 (jackpot check 4): the normalized form, in [2^15, 2^16).
-        v.sigma_norm = F::from_canonical_u64(sigma_significand << u64::from(!sigma_sig_is_wide));
+        v.normalized_sigma_significand = F::from_canonical_u64(sigma_significand << u64::from(!sigma_sig_is_wide));
 
         let b1 = fill_mul(alpha, l2f);
         write_mul(&mut v.alpha_l2_multiply, &b1);
@@ -696,9 +769,7 @@ fn floor_norm(x: Bf16Fields) -> (Bf16Fields, bool, u64) {
     (floored, ge, slack)
 }
 
-// ==================================================================================================
 // bf16 field plumbing and the shared RNERND reference
-// ==================================================================================================
 
 /// The (sign-free) bf16 field triple: `M = 128*(1 - EXP_IS_ZERO) + MANTISSA`,
 /// `E* = EXP + EXP_IS_ZERO`, `value = M * 2^(E* - 134)`.
@@ -801,9 +872,7 @@ pub(crate) fn rnernd_reference(v: u64, slot: u64) -> (u64, u64, bool, bool) {
     }
 }
 
-// ==================================================================================================
 // The MUL and FMA gadget fills (trace-side mirrors of groups H4/H5 and H1)
-// ==================================================================================================
 
 /// Witness values of one MUL gadget instance.
 struct MulFill {
@@ -887,7 +956,9 @@ fn fill_fma(a: Bf16Fields, b: Bf16Fields, c: Bf16Fields) -> FmaFill {
     let ge = ep >= ec;
     let scale_gap_slack = if ge { ep - ec } else { ec - ep - 1 } as u64;
     let d = if ge { ep - ec } else { ec - ep } as u64;
-    // W3/W4 — Lemma A at mixed widths; the fold runs at the capped gap.
+    // W3/W4: cap the gap when the smaller operand affects only rounding.
+    // The thresholds are 10 for an 8-bit addend and 18 for a 16-bit product;
+    // all terms are positive, so no subtraction-borrow adjustment is needed.
     let thr = if ge { 10 } else { 18 };
     let is_far = d >= thr;
     let far_gap_slack = if is_far { d - thr } else { 0 };
@@ -996,9 +1067,7 @@ fn fe_i64<F: RichField>(x: i64) -> F {
     }
 }
 
-// ==================================================================================================
 // The exact sqrt claim (group Q trace side)
-// ==================================================================================================
 
 /// A sqrt claim's bf16 fields (sign-free).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1298,9 +1367,7 @@ fn borrow_bits(subtrahend: &[u64; 8], minuend: &[u64; 8], initial_borrow: u64) -
     (borrow_flags, borrow == 0)
 }
 
-// ==================================================================================================
 // Constraints, written once against the generic `Evaluator`
-// ==================================================================================================
 
 use crate::v4::circuit::utils::evaluator::Evaluator;
 use crate::v4::circuit::utils::native_evaluator::NativeEvaluator;
@@ -1382,16 +1449,11 @@ where
     let one = eval.i32(1);
     let limb = eval.u64(1 << 16);
 
-    // ==== A — class (a): no constraints. GROUP_KEY, IS_LAST_ROW, IS_A_ROW and IS_PAD are
-    // verifier-recomputed and checked against the trace openings
-    // (`super::super::known_values`), which binds every shape fact the groups below lean on:
-    // IS_A_ROW is the boolean A/B interleave, IS_PAD selects the group-tuple CTL's live rows,
-    // IS_LAST_ROW aims the T3 gate, and GROUP_KEY is the program's arithmetic progression
-    // (the group-tuple CTL keys). ====
+    // The verifier binds the group keys, row flags and padding schedule; see `known_values`.
 
-    // ==== Q — the sqrt bracket (frame derivation in the module docs). ====
+    // Q — the sqrt bracket (frame derivation in the module docs).
 
-    // Q1 — S recomposition from its RC16'd limbs (top limb capped < 2^14 by a lookup, so both
+    // Q1 — S recomposition from its range-checked limbs (top limb capped < 2^14 by a lookup, so both
     // sides are < 2^62 < p and the equality is over Z).
     let mut s_recomposed = lv.frame_sum_limbs[0];
     for i in 1..L2_SUM_LIMBS {
@@ -1544,7 +1606,7 @@ where
     let rhs = eval.sub(rhs, lv.sum_shift_remainder);
     eval.constraint_eq(g32_val, rhs);
 
-    // Q6 — SS = S * 2^r2, limb-wise schoolbook with RC16'd carries (each equation < 2^32 on
+    // Q6 — SS = S * 2^r2, limb-wise schoolbook with range-checked carries (each equation < 2^32 on
     // both sides, so exact over Z; the top limb of SS is SHIFTED_SUM_CARRIES_3).
     let mut carry_prev: Option<V> = None;
     for i in 0..L2_SUM_LIMBS {
@@ -1658,10 +1720,10 @@ where
         eval.constraint_bool(borrow);
     }
 
-    // ==== G — grid snap (nearest multiple of four code ulps, ties up):
+    // G — grid snap (nearest multiple of four code ulps, ties up):
     // SQRT_CODE + 2 = 4*GRID_SNAP_QUOTIENT + GRID_SNAP_REMAINDER,
     // with GRID_SNAP_REMAINDER in [0, 4). The snapped code is 4*GRID_SNAP_QUOTIENT; EXPINFO
-    // rejects a result in exponent field 255. ====
+    // rejects a result in exponent field 255.
     let c128 = eval.i32(128);
     let sqrt_code = eval.mad(lv.sqrt_exp, c128, lv.sqrt_mantissa);
     let code_plus2 = eval.add(sqrt_code, two);
@@ -1713,7 +1775,7 @@ where
         eval.constraint_bool(ge);
         let not_ge = eval.sub(one, ge);
         // Two-sided order proof: SLACK = GE*(code - floor) + (1 - GE)*(floor - code - 1),
-        // RC16'd (both codes < 2^15, so the field equation is the integer one).
+        // range-checked (both codes < 2^15, so the field equation is the integer one).
         let code_minus_floor = eval.sub(code, floor_code);
         let ge_side = eval.mul(ge, code_minus_floor);
         let floor_minus_code = eval.sub(floor_code, code);
@@ -1733,7 +1795,7 @@ where
         eval.constraint_eq(e_floored, e_sel);
     }
 
-    // ==== H1 — the all-nonnegative FMA `noised_bound = RNE(dr * l2f + linf_f)` (W1-W12). ====
+    // H1 — the all-nonnegative FMA `noised_bound = RNE(dr * l2f + linf_f)` (W1-W12).
     let noised_bound_fma: &FmaBlock<V> = &lv.noised_bound_fma;
     // W1: SIG_PRODUCT = (128 + DR_MANTISSA) * M(l2f); EP = DR_EXP + E*(l2f) - 268;
     // EC = E*(linf_f) - 134 (dr is normal, public).
@@ -1759,7 +1821,7 @@ where
     // The gap magnitude d = SLACK + 1 - GE (affine).
     let d_gap = eval.add(noised_bound_fma.scale_gap_slack, one);
     let d_gap = eval.sub(d_gap, noised_bound_fma.product_scale_ge_addend);
-    // W3: far flag; on far rows d - THR = FAR_GAP_SLACK (RC16'd), THR = 18 - 8*GE.
+    // W3: far flag; on far rows d - THR = FAR_GAP_SLACK (range-checked), THR = 18 - 8*GE.
     eval.constraint_bool(noised_bound_fma.is_far_gap);
     let eight = eval.i32(8);
     let thr = {
@@ -1840,10 +1902,8 @@ where
     let key_scale = eval.add(fine, far_restore);
     let key_scale = eval.add(key_scale, wide_shift);
     eval.constraint_eq(noised_bound_fma.key_scale, key_scale);
-    // W11 is the CLAMP22 + RNERND pair (LUT); the RNERND values bind the output flags,
-    // boolean by the table's construction.
-    // W12: OUT_EXP = KEY_SCALE + WIDTH_ADJUST on the normal path (c_FMA = 0 in this
-    // convention — module docs, generator-fixed constants), zero bindings elsewhere.
+    // W11: CLAMP22 selects the cut and RNERND binds the rounded fields and flags.
+    // W12 binds the exponent on normal outputs and zeroes it otherwise.
     let expected_exp = eval.add(noised_bound_fma.key_scale, noised_bound_fma.width_adjust);
     let inner = eval.sub(noised_bound_fma.out_exp, expected_exp);
     let not_oiz = eval.sub(one, noised_bound_fma.out_is_zero);
@@ -1858,26 +1918,26 @@ where
     let c = eval.mul(noised_bound_fma.out_is_zero, noised_bound_fma.out_mantissa);
     eval.constraint(c);
 
-    // ==== H3 — alpha = RNE(448 / noised_bound) is the DIV448 lookup on the FMA output's
+    // H3 — alpha = RNE(448 / noised_bound) is the DIV448 lookup on the FMA output's
     // affine code (+ its RC16s + the alpha-mantissa PAIR128); nothing arithmetic to do here.
     // No denominator floor exists — the reference floors the norms (H0), never the noised
-    // bound, and noised_bound >= linf_f >= 2^-32 by RNE monotonicity. ====
+    // bound, and noised_bound >= linf_f >= 2^-32 by RNE monotonicity.
 
-    // ==== H4 — beta_1 = RNE(alpha * l2f) (the FLOORED l2, exactly like the reference).
-    // Alpha is structurally normal: M = 128 + mantissa, E* = ALPHA_EXP. ====
+    // H4 — beta_1 = RNE(alpha * l2f) (the FLOORED l2, exactly like the reference).
+    // Alpha is structurally normal: M = 128 + mantissa, E* = ALPHA_EXP.
     let m_alpha = eval.add(c128, lv.alpha_mantissa);
     let sig_expected = eval.mul(m_alpha, lv.l2_floored_significand);
     let e_sum = eval.add(lv.alpha_exp, lv.l2_floored_exponent);
     mul_block_constraints(eval, &lv.alpha_l2_multiply, sig_expected, e_sum);
 
-    // ==== S1 — jackpot check 3: the committed sigma significand M(alpha)*M(l2f) (the sigma
-    // CTL tuple's degree-1 handle; its exponent rides the tuple as an affine expression). ====
+    // S1 — jackpot check 3: the committed sigma significand M(alpha)*M(l2f) (the sigma
+    // CTL tuple's degree-1 handle; its exponent rides the tuple as an affine expression).
     eval.constraint_eq(lv.sigma_significand, sig_expected);
 
-    // ==== S2 — jackpot check 4: the sigma significand's width bit. Boolean here; the two
+    // S2 — jackpot check 4: the sigma significand's width bit. Boolean here; the two
     // filtered RC16s (`ctl::scale_lut_lookups`) force it to 1 exactly when
     // SIGMA_SIGNIFICAND >= 2^15, making the sigma encoding exported on the group-tuple
-    // channel exact. ====
+    // channel exact.
     eval.constraint_bool(lv.sigma_sig_is_wide);
 
     // ==== S3 — jackpot check 4: SIGMA_NORM = SIGMA_SIGNIFICAND * (2 - SIGMA_SIG_IS_WIDE),
@@ -1886,7 +1946,7 @@ where
     let two = eval.i32(2);
     let doubling = eval.sub(two, lv.sigma_sig_is_wide);
     let norm_expected = eval.mul(lv.sigma_significand, doubling);
-    eval.constraint_eq(lv.sigma_norm, norm_expected);
+    eval.constraint_eq(lv.normalized_sigma_significand, norm_expected);
 
     // ==== H5 — beta = RNE(beta_1 * dos); its output columns are used directly in the group tuple. ====
     let b1 = &lv.alpha_l2_multiply;
@@ -1897,7 +1957,7 @@ where
     let e_sum = eval.add(e_b1, dos_exp);
     mul_block_constraints(eval, &lv.beta_scale_multiply, sig_expected, e_sum);
 
-    // ==== T — the jackpot liveness gate (check 1). ====
+    // T — the jackpot liveness gate (check 1).
 
     // T1 — the group-tuple CTL binds InputQuant's committed DEAD_BOUND to the floored-L2
     // threshold with no column and no constraint here: the looked tuple's bound component is
@@ -1907,7 +1967,7 @@ where
     // them into DEAD_COUNT, CTL-bound to this row.
 
     // T2 — the per-side running totals. Row 0 is an A row (`h >= 1`, pinned by the
-    // verifier-recomputed class (a) columns), so the anchors are unconditional. The B-side
+    // verifier-recomputed verifier-known columns), so the anchors are unconditional. The B-side
     // increment gate is 1 - IS_A - IS_PAD: equal to (1 - IS_A)*(1 - IS_PAD) because
     // IS_A*IS_PAD = 0 identically on the known columns, and one degree lower. Pad rows
     // increment neither side — their DEAD_COUNT is outside the group-tuple CTL's filter and
@@ -1944,9 +2004,7 @@ where
     // witness column or arithmetic constraint is needed. ====
 }
 
-// ==================================================================================================
 // The Stark impl
-// ==================================================================================================
 
 /// ScaleStark: one row per matrix row — the l2/linf norms and the alpha/beta scale chain
 /// (see the module docs). A CTL party of the fp8 batch; the batch driver is the only
@@ -2106,7 +2164,6 @@ mod tests {
         (program, rows, pis)
     }
 
-    // ==============================================================================================
     // Checking harnesses: arithmetic constraints (with the proper first/last/transition
     // selectors) and lookup membership in the actual committed table definitions.
     // ==============================================================================================
@@ -2184,9 +2241,7 @@ mod tests {
         check_lut_lookups(program, rows, pis)
     }
 
-    // ==============================================================================================
     // Honest-trace tests
-    // ==============================================================================================
 
     #[test]
     fn honest_trace_satisfies_all_constraints() {
@@ -2235,11 +2290,7 @@ mod tests {
 
     #[test]
     fn trace_chain_is_bit_exact_vs_native_derive_row_scales() {
-        // For EVERY row (all-zero and sub-floor rows included): the committed alpha/beta must
-        // equal the native scheme exactly as `noisy_quantize` computes them — floor both norms
-        // at 2^-32 (`bf16_max`, the reference `row_norms`), then `derive_row_scales`
-        // (FMA / DIV / MUL / MUL) on the floored values. The committed H0 fields must decode
-        // to the floored codes, bit for bit.
+        // Compare floored norms and derived alpha/beta with the native functions, including zero rows.
         let (program, rows, _) = test_trace();
         for (i, row) in rows.iter().enumerate() {
             let v: &ScaleColumnsView<F> = row.borrow();
@@ -2266,10 +2317,7 @@ mod tests {
 
     #[test]
     fn all_zero_row_is_provable_with_reference_scales() {
-        // The user-visible point of the H0 floors: an all-zero matrix row (l2 = linf = 0)
-        // floors to (2^-32, 2^-32) and derives the reference's finite alpha and strictly
-        // positive beta — and the whole trace (row 1 is the all-zero tuple) satisfies every
-        // constraint and LUT fact.
+        // A zero row must satisfy all constraints with finite alpha and positive beta after flooring.
         let (program, rows, pis) = test_trace();
         let v: &ScaleColumnsView<F> = rows[1].borrow();
         assert_eq!(v.frame_sum_is_zero, F::ONE, "test premise: row 1 is the all-zero row");
@@ -2289,11 +2337,8 @@ mod tests {
 
     #[test]
     fn sqrt_matches_native_row_norms_on_exact_rows() {
-        // Rows whose decoded f32 square-sum is exact (all-zero, single-element, constant rows
-        // with power-of-two k and power-of-two or exactly-decoded elements): the block-integer
-        // frame sum and the native f32 chain agree, so the trace's snapped l2 must equal
-        // `row_norms` (on the *decoded* row) bit for bit. (Generic rows differ by design: the
-        // block-integer sum is normative — module docs, auditor note.)
+        // For these rows, native f32 summation is exact and agrees with the framed integer
+        // sum. Compare the resulting snapped L2 values.
         let program = test_program();
         let k = program.k;
         let n_blocks = k / BLOCK_SIZE;
@@ -2303,9 +2348,8 @@ mod tests {
         single_scales[0] = (130 << 7) | 55;
         let mut single_decoded = vec![0u16; k];
         single_decoded[7] = (130 << 7) | 55;
-        // NOT in this set: rows decoding below exponent field 53 — their f32 squares underflow
-        // in the native chain (e.g. (2^-126)^2 = 2^-252 -> 0.0f32), the N3 divergence in the
-        // flesh: the native l2 collapses to 0 while the normative block-integer sum does not.
+        // Exclude rows whose f32 squares underflow. Their framed integer sums retain
+        // values that the native f32 chain loses.
         let rows: Vec<(Vec<i8>, Vec<u16>, Vec<u16>)> = vec![
             (vec![0i8; k], vec![0x3F80u16; n_blocks], vec![0u16; k]),
             (single_ints, single_scales, single_decoded),
@@ -2361,9 +2405,7 @@ mod tests {
         assert_eq!(tuple.l2_frame_sum, expected);
     }
 
-    // ==============================================================================================
-    // The sqrt bracket (O2): uniqueness, ties, the quarter-ulp zone, f64 differential
-    // ==============================================================================================
+    // The sqrt bracket : uniqueness, ties, the quarter-ulp zone, f64 differential
 
     fn claim_pred(c: SqrtClaim) -> SqrtClaim {
         let (mut t, mut f) = (c.t(), c.f());
@@ -2492,7 +2534,7 @@ mod tests {
 
     #[test]
     fn sqrt_bracket_quarter_ulp_zone_is_unambiguous() {
-        // The O2 zone: sqrt(v_hat) in [127.5, 128) * 2^(f-7) — between the top-of-binade
+        // The binade-boundary interval: sqrt(v_hat) in [127.5, 128) * 2^(f-7) — between the top-of-binade
         // claim's value (255 * 2^(f-8) = 127.5 * 2^(f-7)) and the binade start (128 * 2^(f-7)).
         // With the naive half-ulp lower midpoint both (255, f-1) and (128, f) accept the whole
         // zone; the IS_BOTTOM quarter-ulp correction partitions it exactly: (255, f-1) owns
@@ -2561,7 +2603,7 @@ mod tests {
 
     #[test]
     fn sqrt_bracket_differential_vs_f64() {
-        // Machine-check of the frame choice (O2): for exactly-representable v_hat, the bracket
+        // Machine-check of the frame choice : for exactly-representable v_hat, the bracket
         // claim equals RNE_bf16(sqrt(v_hat)) computed through f64 (correctly rounded) — skipping
         // samples too close to a rounding boundary for the double rounding f64 -> f32 -> bf16
         // to be trusted.
@@ -2606,11 +2648,8 @@ mod tests {
 
     #[test]
     fn sqrt_zero_claim_region_is_one_sided() {
-        // A zero claim on a live (nonzero) sum is legal iff sqrt(v_hat) <= 2^-7 (hat
-        // frame) — RNE's entire zero region, decided by the upper midpoint alone (non-strict:
-        // the boundary ties to even 0). Reachable honestly now (tiny-scale blocks push v_hat
-        // below the subnormal fade), so the bracket must accept everything at or below the
-        // boundary and reject everything above it.
+        // A zero claim on a nonzero sum is valid through the upper midpoint, inclusive
+        // (the tie rounds to even zero). Check below, at and above that boundary.
         let k = 4096u64;
         let wl2 = 15i64;
         // t = 0, f = 1: D = e_max + 4 - wl2 - 2 = e_max - 13; choose e_max = 2: D = -11:
@@ -2641,9 +2680,7 @@ mod tests {
         assert!(bracket_accepts(s_tie + 1, 2, wl2, k, above));
     }
 
-    // ==============================================================================================
     // Gadget fills vs. the native bf16 chain
-    // ==============================================================================================
 
     /// Deterministic nonnegative bf16 code: zero, subnormal-free normal small/large.
     fn fuzz_code(x: u64) -> u16 {
@@ -2704,9 +2741,7 @@ mod tests {
         assert!(checked > 15000);
     }
 
-    // ==============================================================================================
     // Stark harness: degree, circuit parity, prove/verify
-    // ==============================================================================================
 
     #[test]
     fn degree_is_at_most_three() {
@@ -2724,7 +2759,6 @@ mod tests {
 
     // ==============================================================================================
     // Tamper tests: every forgery class must be rejected by the constraints or the LUT facts
-    // ==============================================================================================
 
     /// Rebuilds row `idx` from its tuple with a chosen (tampered) sqrt claim, keeping the
     /// structural columns — the row stays internally consistent downstream of the claim,
@@ -2934,7 +2968,7 @@ mod tests {
         }
         assert!(
             check_all(&program, &tampered, &pis).is_err(),
-            "clearing IS_BOTTOM on a bottom-shaped claim must be rejected (the O2 force direction)"
+            "clearing IS_BOTTOM on a binade-bottom claim must be rejected"
         );
         let mut tampered = rows.clone();
         {
@@ -2993,8 +3027,7 @@ mod tests {
                 "flipping the {which} floor bit on row {idx} must be rejected"
             );
         }
-        // Forging a floored field itself (feeding the FMA an unfloored zero significand, the
-        // pre-fix divergence) breaks the H0 mux.
+        // An unfloored zero significand must fail the floor mux.
         let mut tampered = rows.clone();
         {
             let v: &mut ScaleColumnsView<F> = tampered[1].borrow_mut();
@@ -3132,9 +3165,7 @@ mod tests {
         );
     }
 
-    // ==============================================================================================
     // The jackpot noise-floor gate (group F)
-    // ==============================================================================================
 
     /// Fills one scratch row from a single-spike prequant row (`ints[0] = 1`, block-0 scale
     /// = `scale_code`, everything else zero) and returns the tuple with the gate's decision
