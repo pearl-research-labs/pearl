@@ -51,10 +51,16 @@ class Quant(enum.IntEnum):
 
 
 class Device(enum.IntEnum):
-    """Committed mining device and concrete arithmetic implementation."""
+    """Committed mining device and concrete arithmetic implementation.
+
+    ``HOPPER``/``BLACKWELL`` are the FP8/v4 FP8-MMA devices. ``A100`` (sm_80) is
+    the FP16/v5 scheme's device: its FP32-accumulated FP16 tensor core is a
+    distinct committed arithmetic, never mixed into an FP8 (v4) transcript.
+    """
 
     HOPPER = 0
     BLACKWELL = 1
+    A100 = 2
 
 
 @dataclass(frozen=True)

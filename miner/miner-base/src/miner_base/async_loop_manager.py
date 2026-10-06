@@ -20,15 +20,23 @@ from pearl_gateway.comm.dataclasses import MiningJob
 
 from .block_submission import (
     OpenedBlockInfo,
-    is_plain_fp8_job,
+    Scheme,
+    is_submittable_plain_job,
+    scheme_of,
     submit_opened_block,
 )
+from .fp16_block_submission import Fp16OpenedBlock, submit_fp16_block
 from .gateway_client import DummyMiningClient, MinerRpcConfig, MiningClient
 from .settings import MinerSettings
 
 _LOGGER = get_logger(__name__)
 _DRAIN_PROGRESS_LOG_INTERVAL_SECONDS = 5.0
 _MAX_STALE_JOB_POLLS = 3
+
+# The opening payload a submission carries: the FP8 (v4) planes+indices opening
+# or the FP16 (v5) full-operand tile opening. Both expose ``owned_copy()`` for
+# the asynchronous handoff; ``_submit_block`` dispatches construction by scheme.
+SubmittableBlock = OpenedBlockInfo | Fp16OpenedBlock
 
 
 @dataclass(frozen=True)
@@ -478,7 +486,7 @@ class AsyncLoopManager:
 
     def _enqueue_submission(
         self,
-        opened_block_info: OpenedBlockInfo,
+        opened_block_info: SubmittableBlock,
         mining_job: MiningJob,
         *,
         timeout: float | None,
@@ -489,7 +497,7 @@ class AsyncLoopManager:
         if (
             self._conf.no_gateway
             or self._conf.skip_block_submission
-            or not is_plain_fp8_job(mining_job)
+            or not is_submittable_plain_job(mining_job)
         ):
             return False
 
@@ -525,12 +533,16 @@ class AsyncLoopManager:
 
     def handle_submit_block(
         self,
-        opened_block_info: OpenedBlockInfo,
+        opened_block_info: SubmittableBlock,
         mining_job: MiningJob,
         *,
         timeout: float | None = None,
     ) -> bool:
-        """Reserve bounded capacity, applying backpressure before ownership transfer."""
+        """Reserve bounded capacity, applying backpressure before ownership transfer.
+
+        Accepts either scheme's opening (FP8 ``OpenedBlockInfo`` or FP16
+        ``Fp16OpenedBlock``); the executor builds and submits the matching proof.
+        """
         return self._enqueue_submission(
             opened_block_info,
             mining_job,
@@ -567,7 +579,7 @@ class AsyncLoopManager:
 
     def _submit_block(
         self,
-        opened_block_info: OpenedBlockInfo,
+        opened_block_info: SubmittableBlock,
         mining_job: MiningJob,
     ) -> bool:
         if self._conf.no_gateway or self._conf.skip_block_submission:
@@ -581,20 +593,52 @@ class AsyncLoopManager:
             self._inflight_clients.add(client)
         try:
             with client:
-                proof = submit_opened_block(opened_block_info, mining_job, client)
+                proof = self._build_and_submit_proof(opened_block_info, mining_job, client)
         finally:
             with self._inflight_lock:
                 self._inflight_clients.discard(client)
         if proof is None:
             _LOGGER.info("Lottery winner was not jackpot-admissible; filtered before RPC.")
             return False
-        _LOGGER.info("FP8 proof handed to the gateway submission queue.")
+        _LOGGER.info(
+            f"{scheme_of(mining_job).value} proof handed to the gateway submission queue."
+        )
         return True
+
+    def _build_and_submit_proof(
+        self,
+        opened_block_info: SubmittableBlock,
+        mining_job: MiningJob,
+        client: MiningClient,
+    ):
+        """Dispatch proof construction/verification/submission by scheme.
+
+        The submission plumbing (capacity, backpressure, one-shot clients) is
+        scheme-agnostic; only this dispatch knows FP8 vs. FP16. Keeping the FP8
+        branch calling ``submit_opened_block`` verbatim leaves the v4 datapath
+        byte-identical.
+        """
+        scheme = scheme_of(mining_job)
+        if scheme is Scheme.FP8:
+            if not isinstance(opened_block_info, OpenedBlockInfo):
+                raise TypeError("an FP8 (v4) job requires an OpenedBlockInfo opening")
+            return submit_opened_block(opened_block_info, mining_job, client)
+        if scheme is Scheme.FP16:
+            if not isinstance(opened_block_info, Fp16OpenedBlock):
+                raise TypeError("an FP16 (v5) job requires an Fp16OpenedBlock opening")
+            return submit_fp16_block(opened_block_info, mining_job, client)
+        raise ValueError(
+            f"cert version {int(mining_job.cert_version)} is not a submittable plain scheme"
+        )
 
     def _classify_mining_launch_locked(self, job: MiningJob) -> MiningLaunchDecision:
         if job != self._mining_job:
             return MiningLaunchDecision(False, False)
-        if self._conf.no_gateway or self._conf.skip_block_submission or not is_plain_fp8_job(job):
+        if (
+            self._conf.no_gateway
+            or self._conf.skip_block_submission
+            or not is_submittable_plain_job(job)
+        ):
             # The useful runtime may still execute and credit work, but it must
             # not inspect, construct, verify, or submit a winner.
             return MiningLaunchDecision(True, False)

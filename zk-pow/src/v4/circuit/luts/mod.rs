@@ -59,9 +59,10 @@ pub use columns::{
 };
 pub use ctl::ctl_looked_lut_slot;
 pub use stark::{
-    B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Int8DecStark, Log16Stark, LutStark, Pair128Stark,
-    Pow2DStark, Pow2GStark, Pow2GbStark, ProdAlign15Stark, QcastStark, Range16Stark, RneRndStark, Width16Stark, Width32Stark,
-    WidthNormStark, generate, lut_precommitted_values, lut_preprocessed_data, lut_preprocessed_inputs, lut_trace,
+    B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Fp16DecodeStark, Fp16Pow2Stark, Int8DecStark,
+    Log16Stark, LutStark, Pair128Stark, Pow2DStark, Pow2GStark, Pow2GbStark, ProdAlign15Stark, QcastStark, Range16Stark,
+    RneRndStark, Width16Stark, Width32Stark, WidthNormStark, generate, lut_precommitted_values, lut_preprocessed_data,
+    lut_preprocessed_inputs, lut_trace,
 };
 pub use witness::{LutChecker, LutMultiplicities};
 
@@ -153,6 +154,24 @@ pub enum LutTable {
     /// (0 at the key-0 sentinel). InputQuant binds it on the summand's sum of squares to
     /// build the lambda scores.
     Log16,
+    /// FP16 operand decode for the A100 matmul ([`crate::circuit::fp16::matmul_a100_stark`]),
+    /// keyed by the 16-bit FP16 code (`2^16` rows), tuple value
+    /// `(SIG, SIGN, EPS_BIASED, IS_ZERO)` = [`crate::api::fp16::dtype::fp16_decode_fields`]:
+    /// the integer significand `m`, the raw sign bit, the biased stored exponent `eps + 15`,
+    /// and `[m == 0]`. Two lookups per lane (A and B operand) pin the per-operand decode a
+    /// lane's in-AIR product/sign/exponent are derived from; FP16 operand pairs span `2^32`, so
+    /// (unlike FP8's `B200Align`) the product itself cannot be a single keyed lookup. This table
+    /// is **not** part of any FP8 device's committed inventory; it is used only by the FP16
+    /// batch ([`crate::circuit::fp16::ctl`]).
+    Fp16Decode,
+    /// A100 matmul alignment power-of-two, keyed `d in [0, 255]`, value `2^min(d, 26)`. Same
+    /// shape as [`LutTable::Pow2Gb`] but with the wider key domain FP16's exponent span needs:
+    /// a lane/carry relative shift `GROUP_MAX_BIASED_EXPONENT - PRODUCT_BIASED_EXPONENT` can
+    /// reach ~155 when a large carry (or product) dominates a tiny term (which the 2^26 cap
+    /// floors to zero, exactly as the window drops it). The missing negative keys prove
+    /// `GROUP_MAX_BIASED_EXPONENT >= PRODUCT_BIASED_EXPONENT` (the eta ">=" side). FP16 batch
+    /// only ([`crate::circuit::fp16::ctl`]).
+    Fp16Pow2,
 }
 
 #[cfg(test)]

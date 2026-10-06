@@ -1,0 +1,517 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newcommand{\Quant}{\textsf{Quant}}
+\newcommand{\Device}{\textsf{Device}}
+\newcommand{\Ticket}{\textsf{Ticket}}
+\newcommand{\Extract}{\textsf{Extract}}
+\newcommand{\Rows}{\textsf{Rows}}
+\newcommand{\Hb}{\mathsf{H}}
+\newcommand{\MatMul}{\textsf{MatMul}}
+\newcommand{\NoisyQuantize}{\textsf{NoisyQuantize}}
+\newcommand{\SampleLine}{\textsf{SampleLine}}
+\newcommand{\Trunc}{\textsf{Trunc}}
+\newcommand{\RZ}{\textsf{RZ}}
+\newcommand{\RNE}{\textsf{RNE}}
+\newcommand{\ulp}{\textsf{ulp}}
+\newcommand{\ufp}{\textsf{ufp}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\sg}{\mathrm{sgn}}
+\newcommand{\Ct}{\widetilde{C}}
+\newcommand{\At}{\widetilde{A}}
+\newcommand{\Bt}{\widetilde{B}}
+\newcommand{\T}{\mathsf{T}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\FP}[1]{\textsf{FP#1}}
+\newcommand{\sigmin}{\sigma_{\min}}
+
+\newtheorem{assumption}{Assumption}
+\newtheorem{conjecture}{Conjecture}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\title{\textbf{Pearl Floating-Point Scheme Specification:\\ FP16 Accumulation-Hardness Variant}}
+\author{Jon Pry\\ \texttt{jonpry@gmail.com}}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document specifies an alternative instantiation of the Pearl proof-of-useful-work
+protocol in which the unit of mining work is \FP{16} matrix multiplication on GPUs, with
+NVIDIA A100 (GA100) tensor cores as the first whitelisted device. It extends the \FP{8}
+certificate-v4 specification rather than replacing it: the commitment structure, seed chain,
+state window, ticket, target, mixture-of-experts extension, and zero-knowledge split are
+unchanged, and the \FP{8} scheme remains available as a separate \Quant{} value. The new
+content is a \emph{hardness source that does not rely on coarse quantization}. Where the
+\FP{8} scheme makes the lottery product hard to shortcut by rounding onto a coarse grid, the
+\FP{16} scheme derives hardness from the \emph{nonlinearity of the device's own accumulation}:
+the A100 tensor core truncates each product onto a per-group alignment grid before summing,
+an operation that does not commute with the reduction and therefore cannot be expressed as a
+matrix multiplication. We give the bit-exact A100 accumulation model (validated against
+silicon), a policy check---\emph{unpredictable accumulation steps}---that the verifier
+evaluates during its tile replay, and an analysis of the attack surface. The practical payoff
+is that recovered products carry \FP{16}-level accuracy rather than \FP{8}-residual accuracy,
+at the cost of a new, device-specific hardness assumption. We find \FP{16} robust and
+\textsf{BF16} too close to linear to admit the same argument.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}\label{sec:intro}
+
+Proof-of-useful-work (PoUW) replaces the artificial puzzle of classical proof of work with a
+computation someone already wants performed. The Pearl protocol instantiates the PoUW of
+Komargodski and Weinstein~\cite{KW25} for matrix multiplication: a miner multiplies matrices
+of its own choosing and every tile of the product doubles as a lottery ticket. The obstacle
+is permissionlessness---the miner chooses its inputs, so the protocol must guarantee that no
+choice of inputs, however degenerate, makes valid tickets cheaper than the prescribed amount
+of work.
+
+The original integer protocol~\cite{KW25} achieves this by hashing the \emph{transcript} of
+the computation: the product is formed in $r\times r$ blocks and a random oracle is applied to
+all $(n/r)^3$ intermediate blocks, so that even the all-zeroes product is as hard as a generic
+one. The Pearl \FP{8} specification~\cite{PearlFP8} instead hashes only output tiles and
+recovers hardness from quantization: because entrywise quantization is nonlinear, the low-rank
+noise injected before quantization destroys the low-rank shortcut, and tiles can be hashed
+directly. This is cheaper than transcript hashing, but its security depends on the rounding
+being coarse: the quantization error must be large enough that its contribution to the output
+survives the accumulator. At \FP{8} this holds comfortably; as the target format becomes more
+precise, the quantization error shrinks and the margin vanishes.
+
+This document describes a third point in the design space, aimed at \FP{16}. We keep output-
+tile hashing---so the miner runs its ordinary GEMM with no in-kernel hashing---but we obtain
+hardness from a different nonlinearity. Modern tensor cores do not accumulate in exact
+arithmetic. On the A100, each product is truncated toward zero onto an alignment grid shared by
+a group of eight products, the group is summed, and the running accumulator is rounded after
+every group. The truncation is applied \emph{per product, before the reduction}. This is the
+same structural device that makes transcript hashing hard---a per-summand operation that a
+single contraction cannot reproduce---except that it is performed by the hardware for free, on
+every multiply-accumulate the miner already issues. An honest miner's output therefore encodes,
+at no extra cost, a quantity that an adversary with the low-rank shortcut cannot cheaply
+reconstruct.
+
+\paragraph{Organization.} Section~\ref{sec:abstract} recalls the abstract protocol and states
+the new hardness premise. Section~\ref{sec:prelim} fixes notation and the work model.
+Section~\ref{sec:device} gives the bit-exact A100 accumulation model---the technical core of
+this variant. Section~\ref{sec:hardness} states the hardness argument and assumption.
+Section~\ref{sec:policy} specifies the jackpot policy, including the unpredictable-accumulation-
+steps check. Section~\ref{sec:attacks} surveys attack vectors. Section~\ref{sec:miner}
+describes the honest miner. Section~\ref{sec:compare} compares \FP{16}, \FP{8} and \textsf{BF16}.
+The appendices give the A100 arithmetic specification, the \FP{16} commit type, the noise and
+quantization procedures, the certified-work ratio, and a summary of the empirical validation.
+
+\section{The abstract protocol}\label{sec:abstract}
+
+Let $A\in\R^{m\times k}$ and $B\in\R^{n\times k}$, with useful product $C:=AB^\T$. As in the
+\FP{8} scheme, the protocol derives seed-dependent rank-$r$ noise matrices $N_A\in\R^{m\times k}$
+and $N_B\in\R^{n\times k}$ and computes
+\begin{equation}
+\Ct := Q(A+N_A)\,Q(B+N_B)^\T,
+\end{equation}
+where $Q$ is the protocol's quantization into the committed storage format and the
+multiplication is carried out by the committed device's native kernel. Each noise matrix is
+unpredictable before the inputs are committed. The product $\Ct$ drives the lottery; the honest
+miner recovers the useful product by the cheap low-rank correction
+$\widehat C := \Ct - A N_B^\T - N_A B^\T - N_A N_B^\T$, exactly as in~\cite{KW25,PearlFP8}.
+
+The difference from the \FP{8} scheme is in \emph{what makes $\Ct$ hard to shortcut}. Setting
+$A=B=0$ isolates the lottery product as $Q(N_A)\,Q(N_B)^\T$. The \FP{8} premise is that
+entrywise quantization raises the rank of $Q(N_A)$ enough that this product is as hard as a
+generic quantized product. The \FP{16} premise is weaker on quantization and stronger on the
+device: at \FP{16} the quantization barely raises the rank, but the device does not compute the
+exact product $Q(N_A)Q(N_B)^\T$---it computes a \emph{per-product-truncated} version of it,
+tile by tile, and it is that version the ticket hashes.
+
+\paragraph{The central object.} For operands stored in a format with $p$-bit significands, write
+the device dot product of row $i$ of $\At:=Q(A+N_A)$ with row $j$ of $\Bt:=Q(B+N_B)$ as
+\begin{equation}\label{eq:dotdevice}
+D_{ij} \;=\; \textsf{Acc}\big(\At_{i,0}\Bt_{j,0},\,\dots,\,\At_{i,k-1}\Bt_{j,k-1}\big),
+\end{equation}
+where $\textsf{Acc}$ is the device accumulation of Section~\ref{sec:device}, \emph{not} the
+exact sum. The exact sum $S_{ij}=\sum_u \At_{iu}\Bt_{ju}$ is, for low-rank-plus-noise operands,
+computable by an adversary in $O(r)$ work per cell through the low-rank structure. The quantity
+$D_{ij}$ differs from $\RZ(S_{ij})$ by the accumulated per-product truncation remainders, and
+reconstructing those remainders is what the protocol charges for. Section~\ref{sec:hardness}
+makes this precise.
+
+\section{Preliminaries}\label{sec:prelim}
+
+\paragraph{Notation.} Matrices are over the reals, stored in a committed floating-point format.
+$C:=AB^\T\in\R^{m\times n}$; $C_{ij}$ is the inner product of row $i$ of $A$ with row $j$ of $B$.
+For selected row-index sets $I_A,I_B$ (chosen by periodic partitions $\mathcal P_A,\mathcal P_B$,
+as in the \FP{8} scheme), $\Ct_{I_A,I_B}:=\At_{I_A}(\Bt_{I_B})^\T$ is the recomputed tile. The
+seeds $\texttt{noise\_seed}_A,\texttt{noise\_seed}_B$ determine the noise. The ticket digest is a
+keyed function $\Ticket$ from tiles to $\{0,1\}^\lambda$, $\lambda=256$:
+\[
+\Ticket(\Ct_{I_A,I_B}) := \Hb_{\text{``jackpot''}}\big(\Extract(\Ct_{I_A,I_B},\mathcal P_A,\mathcal P_B);\,\texttt{noise\_seed}_A\big).
+\]
+All of $\Ticket$, $\Extract$, the seed chain, the state window of depth $D$, the domain-separated
+BLAKE3 hashing, and the commitment format are shared with the \FP{8} specification~\cite{PearlFP8}
+and are not restated here except where \FP{16} changes them (Appendix~\ref{app:commit}).
+
+\paragraph{Work model.} Work is measured in multiply-accumulate operations (MACs). The direct
+cost of the selected tile is $T_{\text{tile}}:=|I_A|\cdot|I_B|\cdot k$. As in~\cite{PearlFP8} the
+MAC count fixes scale only; it excludes quantization, noise generation, hashing, and memory
+movement. The novelty of this variant is that the quantity securing the tile is produced
+\emph{inside} these MACs by the device, so no work beyond the GEMM is charged to the miner.
+
+\paragraph{Device and Quant.} $\Device$ and $\Quant$ are consensus-allowed enumerations. This
+document adds $\Device=\textsf{A100}$ with the accumulation model of Section~\ref{sec:device}, and
+a $\Quant$ value whose storage type is \FP{16} and whose commit type is the \FP{16} block format
+of Appendix~\ref{app:commit}. The \FP{8} values remain available unchanged.
+
+\section{The A100 accumulation model}\label{sec:device}
+
+We specify the arithmetic of the A100 \texttt{HMMA.16816.F32} instruction (and the
+equivalent \texttt{m16n8k8}/\texttt{m16n8k16} and \texttt{wmma} forms, which chain identically)
+for \FP{16} and \textsf{BF16} inputs with \FP{32} accumulation. The model is validated bit-exact
+against silicon in Appendix~\ref{app:validation}. The verifier's implementation is authoritative;
+the description below is phrased in exact arithmetic.
+
+Let the $k$-axis be partitioned into \emph{groups} of $G=8$ consecutive products, processed in
+order (two groups per \texttt{k16} instruction). The internal accumulator precision is
+$W=24$ significant bits (full \FP{32} significand). For a stored value $x$, let $\eps(x)$ be its
+unbiased stored exponent, with subnormal inputs taking the format minimum ($-14$ for \FP{16},
+$-126$ for \textsf{BF16}). For a nonzero \FP{32} accumulator $c$, let $\eps(c):=\max(\lfloor\log_2|c|\rfloor,-126)$.
+Let $\Trunc(x,g)$ denote truncation of $x$ toward zero onto the grid $2^{g}$ (sign-magnitude).
+
+\paragraph{One group step.} With incoming accumulator $c$ and group products $p_u=\At_{iu}\Bt_{ju}$
+(each exact; its exponent is $\eps(\At_{iu})+\eps(\Bt_{ju})$):
+\begin{enumerate}[nosep]
+\item If the group has no nonzero product and $c$ is unchanged, the step is a no-op.
+\item Compute the alignment exponent
+      $\eta := \max\big(\{\eps(\At_{iu})+\eps(\Bt_{ju}) : p_u\neq0\}\cup\{\eps(c)\}\big)$,
+      where $c=0$ does not participate and a subnormal $c$ contributes $-126$.
+\item Truncate every product and the accumulator onto the grid $2^{\eta-W}$:
+      $\bar p_u := \Trunc(p_u,\eta-W)$, $\bar c := \Trunc(c,\eta-W)$.
+\item Sum the integers exactly: $S := \bar c + \sum_u \bar p_u$.
+\item Round $S$ toward zero to \FP{32}: $c' := \RZ_{\FP{32}}(S)$, i.e.\ keep the top $24$
+      significant bits, place subnormal results on the $2^{-149}$ grid, and map $|S|\ge 2^{128}$
+      to $\pm\infty$.
+\end{enumerate}
+The final accumulator after all groups is $D_{ij}$. Boundary behavior: a zero result is always
+$+0$; $\infty$ and NaN follow IEEE-754 on the inputs (NaN sign and payload are unspecified); an
+overflowed accumulator is \emph{sticky}---a later opposite-sign overflow does not produce NaN,
+and the first overflow's sign is retained. The verifier rejects any tile whose operands or
+intermediates are non-finite (Appendix~\ref{app:arith}).
+
+\paragraph{The key feature.} Step 3 truncates each product \emph{individually} before step 4
+sums them. Write $p'$ for the product significand width (the product of two $p$-bit significands
+carries $p'=2p$ significant bits: $p'=22$ for \FP{16}, $p'=16$ for \textsf{BF16}). Once the running
+accumulator exceeds a group's products by more than about $W-p'$ bits---roughly a factor
+$2^{W-p'}$---the low bits of each product fall below the grid $2^{\eta-W}$ and are discarded. For
+\FP{16}, $p'=22$ and $W=24$, so a product loses bits as soon as the accumulator is more than
+$\sim\!4\times$ ($2^{W-p'}=2^2$) its magnitude; for a realistic dot product this happens for the
+majority of products. For \textsf{BF16}, $p'=16$, so products survive the window unless they are
+more than $W-p'=8$ binades below $\eta$; far fewer are truncated (Section~\ref{sec:compare}).
+
+\paragraph{Breakpoints.} Call a group step a \emph{breakpoint} if the accumulator truncation in
+step 3 or the round in step 5 discards a nonzero bit, i.e.\ if $\bar c\neq c$ or
+$\RZ_{\FP{32}}(S)\neq S$. Per-product truncations ($\bar p_u\neq p_u$) are \emph{not} breakpoints;
+they are counted separately as $N_{\text{pt}}$ (Section~\ref{sec:policy}), which is why $N_{\text{pt}}$
+is well defined as the truncated products in non-breakpoint steps. The density of breakpoints over a
+tile, $f_{\text{bp}}$, measures how much of the accumulation is irrecoverable from the exact sum
+alone; it is the quantity the policy of Section~\ref{sec:policy} bounds from below.
+
+\section{Hardness}\label{sec:hardness}
+
+\paragraph{Exact decomposition.} For any inputs, the device output admits the exact decomposition
+\begin{equation}\label{eq:decomp}
+D_{ij} \;=\; \mathcal R\Big(\, S_{ij} \;-\; \sum_{g}\sum_{u\in g}\rho_u \;-\; \sum_g \gamma_g \,\Big),
+\end{equation}
+where $S_{ij}=\sum_u p_u$ is the exact sum, $\rho_u = p_u - \Trunc(p_u,\eta_g-W)$ is the
+per-product truncation remainder in group $g$, $\gamma_g$ is the accumulator re-truncation and
+per-group rounding remainder, and $\mathcal R$ denotes the per-group $\RZ$ chain. (This
+reproduces the model of Section~\ref{sec:device} bit-for-bit; see Appendix~\ref{app:validation}.)
+For low-rank-plus-noise operands the adversary obtains $S_{ij}$---and prefix sums of it, hence
+every $\eta_g$---in $O(r)$ work per cell. The hardness therefore rests entirely on the correction
+terms $\sum_u\rho_u$ and $\sum_g\gamma_g$.
+
+\paragraph{Non-contractibility.} The decisive property is that the correction is a
+\emph{per-product nonlinearity applied before the reduction}. The map $p_u\mapsto\Trunc(p_u,\eta_g-W)$
+does not commute with summation:
+\[
+\sum_u \Trunc(p_u,\eta_g-W) \;\neq\; \Trunc\Big(\sum_u p_u,\ \eta_g-W\Big)\quad\text{in general.}
+\]
+Consequently $\sum_u\rho_u$ is not a function of the contracted sum $S_{ij}$, and it is not
+itself a bilinear form in the operand rows. No matrix multiplication---\FP{16}, integer, or
+binary---evaluates it: a contraction can produce $\sum_u p_u$ or any fixed linear image of the
+products, but not the sum of a nonlinear, exponent-dependent function applied to each product.
+The corrections must be computed elementwise, on the $mk$ (resp.\ $nk$) products, outside the
+tensor-core datapath. This is the same obstruction that makes the integer transcript scheme
+hard~\cite{KW25}; here the device applies it automatically to every MAC.
+
+\paragraph{Assumption.} We formalize the resulting premise, in the style
+of~\cite[Assumption~6.4]{KW25} and the \FP{8} transcript-unpredictability assumption.
+
+\begin{assumption}[Accumulation-unpredictability]\label{asm:acc}
+Fix $\Device=\textsf{A100}$, $\Quant$ with \FP{16} storage, noise rank $r=32$, and admissible
+tile dimensions. For operands drawn as in Appendix~\ref{app:noise} (low-rank noise added before
+quantization, any miner-chosen $A,B$ admitted by the policy of Section~\ref{sec:policy}), no
+algorithm reconstructs the device tile $\{D_{ij}\}$ bit-exactly in expected time substantially
+below the honest cost $|I_A|\,|I_B|\,k$ MACs. In particular the corrections
+$\sum_u\rho_u,\sum_g\gamma_g$ of \eqref{eq:decomp} cannot be batched onto any tensor-core path.
+\end{assumption}
+
+\paragraph{Evidence.} Appendix~\ref{app:validation} summarizes the experiments supporting
+Assumption~\ref{asm:acc}: (i) the exact model is validated on A100 silicon over $>10^7$ dot
+products; (ii) for every input strategy tried, including sixteen adversarial constructions, the
+\FP{16} breakpoint density stays in $[0.36,0.51]$ and a deliberately attacker-favorable
+certified-work ratio (Appendix~\ref{app:rho}) stays $\ge 1.38$; (iii) the cheapest shortcut
+predictors (exact sum rounded to \FP{32}; group sums without per-product truncation) reproduce
+at most a few percent of cells; (iv) the truncation-correction attack, costed concretely, is
+$6\text{--}13\times$ honest even under compute-bound-optimistic assumptions, because the
+corrections run on CUDA cores rather than tensor cores. Assumption~\ref{asm:acc} is a
+device-specific hardness conjecture and should be treated as such.
+
+\section{Jackpot policy}\label{sec:policy}
+
+Beyond the idealized setting, the miner may choose $A,B$ to make the accumulation cheaply
+predictable---chiefly by arranging that few products are truncated. The verifier defends with a
+pointwise policy evaluated \emph{during the bit-exact tile replay} of Section~\ref{sec:device},
+when all intermediate $\eta_g$, $\bar p_u$, $\bar c$, and $S$ are available at no extra cost. The
+policy approves exactly when every check below passes; it runs after the Infinity/NaN rejection.
+
+\paragraph{Recorded during replay.} For each cell $(i,j)$ and group $g$ the verifier records:
+\begin{itemize}[nosep]
+\item $\textsf{bp}_{ijg}\in\{0,1\}$: whether the step is a breakpoint (Section~\ref{sec:device});
+\item $\textsf{ptc}_{ijg}\in\{0,\dots,G\}$: the number of products in the group with a nonzero
+      truncation remainder $\rho_u$.
+\end{itemize}
+
+\paragraph{Shared checks.} The \FP{8} entry-liveness and noise-floor checks carry over to bound
+degenerate operands:
+\[
+\sigma_i^A\ge\sigmin\ (\forall i\in I_A),\qquad \sigma_j^B\ge\sigmin\ (\forall j\in I_B),
+\qquad |\mathcal D_A|\le\eps_{\text{idle}}|I_A|k,\quad |\mathcal D_B|\le\eps_{\text{idle}}|I_B|k,
+\]
+with $\sigmin=1$, $\eps_{\text{idle}}=1/64$, $\tau_{\text{idle}}=8$ and the idle sets $\mathcal D_X$
+as in~\cite{PearlFP8}. These keep every opened row carrying at least one quantized unit of noise
+and bound the fraction of noise-dominated entries.
+
+\paragraph{Unpredictable accumulation steps (new).} Define the tile breakpoint density and the
+certified-work ratio
+\[
+f_{\text{bp}} := \frac{1}{|I_A||I_B|\,G^{-1}k}\sum_{i,j,g}\textsf{bp}_{ijg},
+\qquad
+\rho := \frac{1}{|I_A||I_B|\,k}\sum_{i,j}\Big[\,G\cdot N^{ij}_{\text{bp}} + r\cdot N^{ij}_{\text{run}} + N^{ij}_{\text{pt}}\,\Big],
+\]
+where $N^{ij}_{\text{bp}}$ is the number of breakpoint steps in cell $(i,j)$, $N^{ij}_{\text{run}}$
+is the number of maximal runs of non-breakpoint steps, and $N^{ij}_{\text{pt}}=\sum_g\textsf{ptc}_{ijg}$
+counts truncated products outside breakpoints. The ratio $\rho$ is the attacker-favorable
+lower bound on reconstruction cost derived in Appendix~\ref{app:rho}. The check requires
+\begin{equation}\label{eq:policyfp16}
+f_{\text{bp}}\ \ge\ 0.30,\qquad \rho\ \ge\ 1.2.
+\end{equation}
+
+\paragraph{Calibration.} On A100 \FP{16}, honest and realistic workloads sit at
+$f_{\text{bp}}\in[0.44,0.48]$ and $\rho\in[1.64,1.83]$, with $f_{\text{bp}}$ concentrating to
+within $0.003$ across noise draws, so \eqref{eq:policyfp16} is a safety net rather than an active
+constraint: every adversarial construction tested also passes it, the worst observed being
+$f_{\text{bp}}=0.357$, $\rho=1.38$ (Appendix~\ref{app:validation}). Because the check is a density
+gate over the whole tile, honest tiles do not fail on fluctuations, and because it concentrates,
+grinding noise draws yields no advantage on honest-like data. \textsf{BF16} does not admit a
+separating threshold of this form at $k\le 1024$ (Section~\ref{sec:compare}); the \FP{16}
+thresholds \eqref{eq:policyfp16} apply only to the \FP{16} $\Quant$ value.
+
+\section{Attack vectors}\label{sec:attacks}
+
+\paragraph{Low-rank inputs.} A miner may choose low-rank $A,B$ so that $S_{ij}$ is cheap. This is
+allowed; hardness does not depend on the exact sum being hard. By \eqref{eq:decomp} the device
+output still requires the per-product corrections, which are non-contractible.
+
+\paragraph{Truncation / bit-slice correction.} The corrections $\rho_u$ are shallow (median
+$\sim\!4$ discarded bits per \FP{16} product), which suggests batching them on binary or int8
+tensor cores via bit-planes. This fails for the structural reason of Section~\ref{sec:hardness}:
+bit-planes accelerate \emph{contractions}, and the correction is not a contraction. Even granting
+the adversary free exact prefix sums and a free oracle for which steps are breakpoints, the
+corrections must be evaluated elementwise on CUDA cores, costing $6\text{--}13\times$ honest work
+under compute-bound-optimistic accounting and far more when memory-bound
+(Appendix~\ref{app:validation}).
+
+\paragraph{Exact-sum shortcut.} Computing $\RZ_{\FP{32}}(S_{ij})$ and returning it reproduces the
+device output in a negligible fraction of cells ($\le 1.6\%$ in all \FP{16} tests), because the
+per-product truncation changes almost every cell.
+
+\paragraph{Minimizing truncation.} The miner may seek operands with flat exponents or few
+significant bits to reduce $f_{\text{bp}}$. For \FP{16} this is self-defeating: the mandated noise
+(rank $r=32$, relative scale $\delta=1/2$) spreads product exponents enough that truncation
+remains dense, and the policy \eqref{eq:policyfp16} rejects any tile that nonetheless falls into a
+low-truncation regime. For \textsf{BF16} the same strategy succeeds, which is why \textsf{BF16} is
+excluded (Section~\ref{sec:compare}).
+
+\paragraph{Device emulation and ASICs.} Reproducing A100 accumulation on another GPU requires
+emulating the $G=8$ grouping and per-product truncation, which that device's tensor cores cannot
+do cheaply; it must fall back to the same elementwise path as any attacker. A custom ASIC could
+implement the per-product correction more cheaply than a full \FP{16} multiplier, so the argument
+is against commodity GPUs, not arbitrary silicon; this is the same economic question raised
+for the \FP{8} scheme and in the Pearl open-problems note.
+
+\paragraph{Seed and commitment grinding.} The noise is seed-derived after commitment; grinding
+seeds only yields additional lottery tickets, bounded by the usual Fiat--Shamir argument.
+
+\section{Honest miner overview}\label{sec:miner}
+
+The intended miner mines with \FP{16} multiplications it wants computed anyway.
+\begin{enumerate}[nosep]
+\item \textbf{Prequantize.} Encode $A,B$ in the \FP{16} commit format (Appendix~\ref{app:commit}).
+\item \textbf{Commit.} Hash $B$ under a recent header and derive $\texttt{noise\_seed}_B$; commit
+      $A$ under the proposed header and derive $\texttt{noise\_seed}_A$.
+\item \textbf{Noise and quantize.} Derive the rank-$r$ noise and compute
+      $\At=\NoisyQuantize(A,\dots)$, $\Bt=\NoisyQuantize(B,\dots)$ in $O((m+n)kr)$ MACs
+      (Appendix~\ref{app:noise}).
+\item \textbf{Multiply.} Run the A100 \FP{16} kernel once on the noised operands---$mnk$ MACs, the
+      dominant cost, identical to the kernel the job would run without the protocol.
+\item \textbf{Scan for winners.} Cut the output into tiles, compute $\Extract$ and the jackpot
+      hash per tile, and compare against the scaled target.
+\item \textbf{Open on a win.} For a winning tile admitted by the policy, assemble the proof.
+\end{enumerate}
+Recovering the useful product costs the low-rank correction plus the $O((mn+mk+nk)r)$ overhead of
+hashing, noising and scanning, for a $1+o(1)$ total overhead when $m,n,k\gg r$. The recovered
+product carries \FP{16}-level accuracy: the device truncation that secures the tile is of the same
+order as---and is reconstructed together with---the quantization error, so no accuracy beyond
+ordinary \FP{16} rounding is sacrificed. Critically, the miner's kernel must use the committed
+instruction order with no split-$k$ or atomic accumulation, since any reordering changes the
+bit-exact output (Appendix~\ref{app:arith}).
+
+\section{FP16 vs.\ FP8 vs.\ BF16}\label{sec:compare}
+
+\paragraph{Why \FP{16} works.} \FP{16} products carry $22$ significant bits against the $24$-bit
+accumulator window, so truncation is dense and, crucially, insensitive to the miner's choices:
+across all tested strategies $f_{\text{bp}}\in[0.36,0.51]$. The non-contractibility argument then
+applies with a wide margin.
+
+\paragraph{Why \textsf{BF16} does not.} \textsf{BF16} products carry only $16$ bits and fit inside
+the $24$-bit window unless more than $8$ binades below $\eta$. Flat rank-one sign-pattern operands
+leave $>\!99\%$ of products exact and only $6\text{--}8\%$ of steps as breakpoints; a groupwise
+model without per-product truncation already reproduces more than half the outputs, and the
+certified-work ratio falls to $\rho\approx 0.30$. These operands pass the liveness and noise-floor
+checks. Honest \textsf{BF16} is itself marginal ($\rho\in[0.84,1.10]$ at $k=1024$), so no
+threshold separates honest from adversarial \textsf{BF16} with margin. \textsf{BF16} mining, if
+desired, requires either \FP{16} storage, $k\ge 4096$, or a larger noise rank; this document does
+not specify it.
+
+\paragraph{Relation to \FP{8}.} The \FP{8} scheme remains the cheapest option and its hardness
+margin is ample; it is preferred for workloads tolerant of \FP{8}-residual accuracy. \FP{16}
+trades a modest constant factor (denser truncation to reconstruct, a slightly larger proof) for
+\FP{16}-level output accuracy and a hardness source independent of the rounding grid. A deployment
+may offer both $\Quant$ values and weight their targets so that each is mined at its true device
+throughput; the economics mirror the \FP{8} discussion in~\cite{PearlFP8}.
+
+\appendix
+
+\section{A100 arithmetic specification}\label{app:arith}
+Element-wise \FP{16}/\textsf{BF16}/\FP{32} operations follow IEEE-754-2019 with the roundings
+used by the device: casts to \FP{16} round to nearest even and saturate per the format; the
+matrix-multiply accumulation is specified in Section~\ref{sec:device}. The verifier rejects NaN
+and infinity in operands and in every intermediate, applying the test after rounding. The A100
+accumulator keeps $W=24$ significant bits (no sub-\FP{32} truncation at the accumulator level,
+unlike the Hopper/Blackwell \FP{8} paths of~\cite{PearlFP8}); the nonlinearity is entirely in the
+per-product, per-group truncation of Section~\ref{sec:device}. The \texttt{m16n8k8} instruction is
+identical to \texttt{m16n8k16} with $G=8$; the \FP{16}-accumulate variant (\texttt{HMMA.16816.F16})
+uses the same grouping and truncation followed by round-to-nearest-even to \FP{16} per group and is
+not used by this scheme.
+
+\section{FP16 commit type}\label{app:commit}
+An operand with $n$ rows is committed as a single matrix $V\in\FP{16}^{n\times k}$, each row a
+Merkle leaf-set under the key and hash identifier of the main protocol, with aggregate root $H_X$.
+Unlike the \FP{8} FP10 commit (int8 values plus a block scale), the \FP{16} format stores values
+directly, since \FP{16} already carries the target precision; no block scale is required. Row norms
+$\ell_2(X_t),\ell_\infty(X_t)$, used by the noisy-quantization scales, are computed from $V$ in
+\FP{32} and floored as in~\cite{PearlFP8}.
+
+\section{Noise and noisy quantization}\label{app:noise}
+The noise sampler, seed chain, and rank-$r$ construction $N=EF^\T$ are those of the \FP{8}
+specification, with $r=32$ and per-row relative scale $\delta=1/2$. Noisy quantization computes,
+per row, $\At_t=\RNE_{\FP{16}}(\alpha_t X_t+\beta_t N_t)$ with the scales $\alpha_t,\beta_t$ chosen
+so the noise carries relative Euclidean weight $\delta$; the clamp and norm-floor rules follow
+Appendix~C.4 of~\cite{PearlFP8} with target magnitude $Q$ set to the largest finite \FP{16} value
+$65504$. Because \FP{16} is the target precision, $\alpha_t$ performs only range normalization and
+the recovered product retains \FP{16} accuracy after the low-rank correction.
+
+\section{Certified-work ratio}\label{app:rho}
+The ratio $\rho$ of Section~\ref{sec:policy} is an attacker-favorable lower bound on the cost of
+reconstructing a tile under the following generous premises: (i) exact prefix sums over any
+$k$-range cost $r$ MAC-equivalents per cell via the low-rank structure; (ii) a run of consecutive
+non-breakpoint steps can be merged at cost $r$ plus one per truncated product; (iii) each
+breakpoint step costs $\min(G,r)=G$ to resolve its discarded low bits from the previous exact
+state; (iv) the breakpoint locations are supplied for free by an oracle. Summing gives the
+per-cell cost $G\,N_{\text{bp}}+r\,N_{\text{run}}+N_{\text{pt}}$ used in the definition, normalized
+by the honest $k$. Premises (i)--(iv) overstate the attacker's power---in particular, quantization
+makes the operands only approximately low rank---so a measured $\rho\ge 1.2$ is a conservative
+certificate that no such shortcut beats honest work.
+
+\section{Empirical validation}\label{app:validation}
+\paragraph{Scope of the bit-exactness claim.} The accumulation model is validated bit-exact
+\emph{only} on GA100 (\texttt{sm\_80}) silicon. Other Ampere/Ada parts (\texttt{sm\_86},
+\texttt{sm\_87}, \texttt{sm\_89}) are distinct tensor-core designs whose intra-instruction
+accumulation has not been characterized against this model---they may or may not agree---so the
+whitelisted device is GA100 (\texttt{sm\_80}) exactly, and the miner admits that capability alone
+(fail-closed). Whitelisting any further SKU requires repeating the validation below on that part.
+
+All experiments were run on A100-class (GA100, sm\_80) silicon. The accumulation model of
+Section~\ref{sec:device} matched the hardware bit-for-bit on $>1.1\times10^6$ random dot products
+per device (both devices agreeing), on $69$ directed edge-case scenarios totaling $6.9\times10^6$
+dot products (subnormal inputs and accumulators, exact cancellation, mixed signs, grid-boundary
+products, partial and empty groups, $k=2048$ chains, overflow, infinity, NaN, and $0\cdot\infty$),
+and on the adversarial and realistic noised operands below. One residual is known: \textsf{BF16}
+chains whose partial sums remain entirely in the \FP{32}-subnormal range can be off by one
+subnormal ulp in $<\!1\%$ of outputs; this cannot occur for \FP{16} or for $O(1)$-scaled operands
+and is excluded by policy.
+
+Adversarial study (tiles $16\times16$, $k=1024$, $r=32$, $\delta=1/2$, operands row-scaled to unit
+max magnitude): sixteen input strategies---realistic Gaussian with outlier channels, heavy-tailed,
+$A=B=0$, rank-two, several flat and few-bit constructions designed to minimize truncation, sparse,
+spiked, and geometric---all kept \FP{16} at $f_{\text{bp}}\in[0.36,0.51]$ and $\rho\ge 1.38$, with
+the cheapest shortcut predictors reproducing $\le 1.6\%$ of cells (one geometric case $13\%$, still
+$\rho=1.68$). The same strategies drive \textsf{BF16} to $f_{\text{bp}}$ as low as $0.06$ and
+$\rho\approx 0.30$. The truncation-correction attack, costed end-to-end, is $6\text{--}13\times$
+honest (compute-bound-optimistic) and $220\text{--}470\times$ (measured, memory-bound), because the
+per-product corrections cannot use tensor cores.
+
+\paragraph{Reproducible harness.} A self-contained harness is committed alongside this
+specification at \texttt{docs/fp16\_scheme/validation/} (it links only the CUDA runtime, so it runs
+on an \texttt{sm\_80} box without the miner's Python stack). On \textsf{A100}-class silicon
+(validated on a GA100 \texttt{sm\_80} device) it:
+(i) captures the output of the real \texttt{mma.sync.m16n8k16.f32.f16} and checks the model of
+Section~\ref{sec:device} against the device \emph{bit-for-bit} over $910$ dot products---the $238$
+committed reference vectors plus $272$ generated edge cases ($k$ up to $1024$, subnormal operands,
+subnormal accumulators, subnormal outputs, near-total cancellation, grid-boundary, and
+max-magnitude)---with zero mismatches, so the model is validated against the device rather than
+against another copy of itself;
+(ii) resolves the rounding mode on silicon, \emph{confirming round-toward-zero} at both the
+per-product alignment and the per-group \FP{32} encode: the device matches the \RZ model on all
+$400$ vectors constructed to separate \RZ from round-to-nearest-even, while each RNE variant
+disagrees with the device on a large fraction of them;
+(iii) recomputes the policy metrics $f_{\text{bp}},\rho$ and the shortcut-predictor rates over the
+adversarial strategies, through both an independent noise implementation and the exact consensus
+noise pipeline, reproducing the regime above ($f_{\text{bp}}\in[0.45,0.52]$,
+$\rho\in[1.67,1.94]$, cheapest shortcut $\le 1.6\%$); and
+(iv) micro-benchmarks the truncation-correction attack against the honest tensor-core \FP{16} GEMM
+(the miner's own kernel), measuring $\approx 38\text{--}43\times$ honest on this silicon even when
+the attacker is granted the exact sums and the breakpoint oracle for free---consistent with the
+accounting of Section~\ref{sec:attacks}. The model-vs-silicon corpus is enforced in CI by the Rust
+test \texttt{api::fp16::accumulate::matches\_hardware\_capture\_k1024}; the overflow guard was never
+triggered, confirming that a single \FP{16} dot product cannot overflow.
+
+\begin{thebibliography}{9}
+\bibitem{KW25} I.~Komargodski and O.~Weinstein. \emph{Proofs of Useful Work from Arbitrary Matrix
+Multiplication}. arXiv:2504.09971; IACR ePrint 2025/685, 2025.
+\bibitem{PearlFP8} Pearl Research Team. \emph{Pearl Floating Point Scheme Specification}
+(FP8 certificate-v4), September 2026.
+\bibitem{Hawkeye} E.~Badash, D.~Boneh, I.~Komargodski, and M.~Srivastava. \emph{Hawkeye:
+Reproducing GPU-level Non-determinism}. arXiv:2603.20421, 2026.
+\bibitem{BLAKE3} J.~O'Connor, J.-P.~Aumasson, S.~Neves, and Z.~Wilcox-O'Hearn. \emph{BLAKE3:
+one function, fast everywhere}, 2020.
+\end{thebibliography}
+
+\end{document}

@@ -2,7 +2,12 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from miner_utils import get_logger
-from pearl_mining import PlainProof, PlainProofV4, check_cert_version_eligible
+from pearl_mining import (
+    Fp16PlainProof,
+    PlainProof,
+    PlainProofV4,
+    check_cert_version_eligible,
+)
 
 from pearl_gateway.comm.dataclasses import BlockTemplate
 from pearl_gateway.pearl_client import PearlNodeClient
@@ -35,7 +40,16 @@ class SubmissionService:
         self.accepted_blocks = 0
         self.rejected_blocks = 0
 
-    async def _build_block(self, plain_proof: PlainProof | PlainProofV4, template: BlockTemplate):
+    async def _build_block(
+        self,
+        plain_proof: PlainProof | PlainProofV4 | Fp16PlainProof,
+        template: BlockTemplate,
+    ):
+        # V5 (FP16 / A100) now proves like every other ZK scheme: the miner's
+        # Fp16PlainProof is the opener bundle, and the prover (worker ``_prove_fp16``)
+        # turns it into the header-bound Fp16ZkCertificate that rides in ProofData
+        # (public_data = b""). It is no longer submit-direct — the plaintext proof is
+        # never the certificate.
         if self.proof_pool is not None:
             ancestor_headers = ()
             if isinstance(plain_proof, PlainProofV4):
@@ -50,7 +64,9 @@ class SubmissionService:
         return ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
 
     async def submit_plain_proof(
-        self, plain_proof: PlainProof | PlainProofV4, template: BlockTemplate
+        self,
+        plain_proof: PlainProof | PlainProofV4 | Fp16PlainProof,
+        template: BlockTemplate,
     ) -> dict[str, Any]:
         """
         Submit a block built from a plain proof and the current template.

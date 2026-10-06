@@ -4,12 +4,18 @@ import pytest
 import torch
 
 from pearl_gemm._utils._arch import Arch, arch_of, require_arch
-from pearl_gemm.protocol_constants import SM90_CC_MAJOR, SM100_CC_MAJOR, SM120_CC_MAJOR
+from pearl_gemm.protocol_constants import (
+    SM80_CC_MAJOR,
+    SM90_CC_MAJOR,
+    SM100_CC_MAJOR,
+    SM120_CC_MAJOR,
+)
 
 
 @pytest.mark.parametrize(
     ("capability", "arch"),
     [
+        ((8, 0), Arch.SM80),
         ((9, 0), Arch.SM90),
         ((10, 0), Arch.SM100),
         ((10, 3), Arch.SM100),
@@ -19,7 +25,7 @@ from pearl_gemm.protocol_constants import SM90_CC_MAJOR, SM100_CC_MAJOR, SM120_C
 )
 def test_known_majors_map_to_their_family(capability, arch):
     assert arch_of(capability) is arch
-    assert arch.value in (SM90_CC_MAJOR, SM100_CC_MAJOR, SM120_CC_MAJOR)
+    assert arch.value in (SM80_CC_MAJOR, SM90_CC_MAJOR, SM100_CC_MAJOR, SM120_CC_MAJOR)
 
 
 def test_smem_capacity_is_the_lead_target_opt_in_maximum():
@@ -28,7 +34,7 @@ def test_smem_capacity_is_the_lead_target_opt_in_maximum():
     assert Arch.SM120.smem_capacity_bytes == 101376
 
 
-@pytest.mark.parametrize("capability", [(8, 9), (11, 0), (13, 0)])
+@pytest.mark.parametrize("capability", [(7, 5), (11, 0), (13, 0)])
 def test_unknown_majors_fail_closed(capability):
     with pytest.raises(ValueError, match=f"sm{capability[0]}{capability[1]}"):
         arch_of(capability)

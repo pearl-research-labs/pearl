@@ -2126,6 +2126,8 @@ dependencies = [
  "itertools 0.14.0",
  "lazy_static",
  "log",
+ "plonky2",
+ "plonky2_field",
  "primitive-types 0.12.2",
  "rand 0.8.6",
  "rand_chacha 0.9.0",

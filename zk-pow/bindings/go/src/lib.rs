@@ -18,6 +18,7 @@ mod common;
 mod v1;
 mod v2;
 mod v4;
+mod fp16;
 
 pub use common::{CZKProof, ERROR_MSG_MAX_SIZE, MAX_ZK_PROOF_SIZE, PUBLICDATA_MAX_SIZE};
 pub use zk_pow::v2::api::proof::{IncompleteBlockHeader, MiningConfiguration};
@@ -33,6 +34,7 @@ pub use v2::{MINING_CONFIG_RESERVED_SIZE, MINING_CONFIG_SERIALIZED_SIZE, MIN_NOI
 
 pub use v4::plain::verify_plain_proof_v4_ffi;
 pub use v4::verify::verify_zk_proof_v4;
+pub use fp16::verify_fp16_zk_cert_ffi;
 pub use v4::{
     V4_AXIS_PATTERN_NUM_DIMS, V4_BLOCK_HEADER_SERIALIZED_SIZE, V4_MOE_PARAMS_MAX_NUM_EXPERTS, V4_PUBLIC_PARAMS_WIRE_SIZE,
 };

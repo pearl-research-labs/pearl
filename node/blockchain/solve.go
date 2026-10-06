@@ -23,6 +23,8 @@ func SolveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32)
 
 	if params.Net == wire.SimNet {
 		switch version {
+		case wire.CertificateVersionV5:
+			return &wire.CertificateV5{ProofData: []byte{0x00}}, nil
 		case wire.CertificateVersionV4:
 			return &wire.CertificateV4{ProofData: []byte{0x00}}, nil
 		case wire.CertificateVersionV3:
@@ -41,6 +43,9 @@ func SolveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32)
 	}
 	if version == wire.CertificateVersionV4 {
 		return nil, fmt.Errorf("FP8 (V4) CPU mining is not available; submit an fp8 certificate")
+	}
+	if version == wire.CertificateVersionV5 {
+		return nil, fmt.Errorf("FP16 (V5) CPU mining is not available; submit an fp16 certificate")
 	}
 	return zkpow.Mine(header, version)
 }

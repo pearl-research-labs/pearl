@@ -19,6 +19,7 @@ from blake3 import blake3
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_mining import (
     CERT_VERSION_PLAIN_FP8,
+    Fp16PlainProof,
     IncompleteBlockHeader,
     PlainProofV4,
     verify_plain_proof_for_cert_version,
@@ -42,6 +43,13 @@ from .commitment import (
 from .layout import AxisPattern
 from .mining_config import COMMITMENT_CHUNK_SIZE
 from .prequant import DEFAULT_BLOCK_SIZE
+from .schemes import (
+    Scheme,
+    is_plain_fp8_job,
+    is_plain_fp16_job,
+    is_submittable_plain_job,
+    scheme_of,
+)
 
 # The pearl_mining binding currently exposes only ``(bool, str)``. Keep this
 # exact consensus-policy message narrow until the binding exposes an error code.
@@ -61,7 +69,9 @@ def commit_planes_for_leaf(
 
 
 class PlainProofClient(Protocol):
-    def submit_plain_proof(self, plain_proof: PlainProofV4, mining_job: MiningJob) -> None: ...
+    def submit_plain_proof(
+        self, plain_proof: PlainProofV4 | Fp16PlainProof, mining_job: MiningJob
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -150,11 +160,6 @@ class OpenedBlockInfo:
             if self.b_ancestor_header is None
             else bytes(self.b_ancestor_header),
         )
-
-
-def is_plain_fp8_job(job: MiningJob) -> bool:
-    """Whether the issuing endpoint advertised certificate-v4 FP8 through ``job``."""
-    return int(job.cert_version) == CERT_VERSION_PLAIN_FP8
 
 
 def _validate_plane(plane: torch.Tensor, name: str, dtype: torch.dtype) -> None:
@@ -497,7 +502,11 @@ __all__ = [
     "OpenedBlockInfo",
     "PrebuiltCommitment",
     "PlainProofClient",
+    "Scheme",
     "create_proof",
     "is_plain_fp8_job",
+    "is_plain_fp16_job",
+    "is_submittable_plain_job",
+    "scheme_of",
     "submit_opened_block",
 ]

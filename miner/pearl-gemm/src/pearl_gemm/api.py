@@ -1,5 +1,18 @@
 """Caller-owned functional API for the new-scheme operations."""
 
+# FP16 (A100 / sm_80) scheme primitives, exposed as submodule namespaces so the
+# bit-exact PoUW datapath is reachable as `pearl_gemm.fp16_*` without colliding
+# with the FP8-family flat exports below (e.g. both schemes have a `noise_lines`).
+from . import (
+    fp16_commit,
+    fp16_gemm,
+    fp16_miner,
+    fp16_noise_lines,
+    fp16_noisy_quant,
+    fp16_pipeline,
+    fp16_policy,
+    fp16_search,
+)
 from .grouped_fp8_gemm import (
     GroupedFp8GemmConfig,
     grouped_fp8_gemm,
@@ -60,6 +73,14 @@ from .tensor_hash_plus_stats import (
 )
 
 __all__ = [
+    "fp16_commit",
+    "fp16_gemm",
+    "fp16_miner",
+    "fp16_noise_lines",
+    "fp16_noisy_quant",
+    "fp16_pipeline",
+    "fp16_policy",
+    "fp16_search",
     "GroupedFp8GemmConfig",
     "GroupedMixedGemmConfig",
     "Hit",

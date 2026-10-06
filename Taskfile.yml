@@ -6,15 +6,25 @@ env:
 
 tasks:
   build:zk-cache:
-    desc: Generate verifier circuit caches (main + v1 + fp8, one-time)
+    desc: Generate verifier circuit caches (main + v1 + fp8 + fp16, one-time)
     run: once
     dir: zk-pow
+    env:
+      # The FP16 (v5) wrapper verifier cache is embedded via include_bytes! by the
+      # Go binding's `embedded_cache` feature, so fp16_cache.bin must exist for the
+      # binding to compile. FP16_CACHE_SAMPLE=1 builds the single smallest legal
+      # profile — a cheap bootstrap blob that makes the crate compile and exercises
+      # the load path. The full per-profile FP16 envelope is a heavy (multi-GB,
+      # minutes-per-profile) offline build required only before V5 is activated on a
+      # network; drop this env (or run build_cache with the explicit fp16 path) for it.
+      FP16_CACHE_SAMPLE: "1"
     status:
       - test -s src/v2/circuit/v2_cache.bin
       - test -s src/v1/v1_cache.bin
       - test -s src/v4/api/fp8_cache.bin
+      - test -s src/v5/api/fp16_cache.bin
     cmds:
-      - cargo run --release --no-default-features --bin build_cache src/v4/api/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
+      - cargo run --release --no-default-features --bin build_cache src/v4/api/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin src/v5/api/fp16_cache.bin
 
   build:zk-gobind:
     desc: Build the Rust ZK verification library for Go FFI
@@ -92,7 +102,7 @@ tasks:
     cmds:
       - rm -rf bin
       - rm -f xmss/libxmss.a
-      - rm -f zk-pow/src/v4/api/fp8_cache.bin zk-pow/src/v2/circuit/v2_cache.bin zk-pow/src/v1/v1_cache.bin
+      - rm -f zk-pow/src/v4/api/fp8_cache.bin zk-pow/src/v2/circuit/v2_cache.bin zk-pow/src/v1/v1_cache.bin zk-pow/src/v5/api/fp16_cache.bin
       - rm -rf pearl-blake3/target py-pearl-mining/target zk-pow/target zk-pow/bindings/go/target
       - find . -name coverage.txt -type f -delete
 

@@ -41,7 +41,7 @@ var oneHeaderEncoded = []byte{
 }
 
 func TestHeadersMaxPayloadLength(t *testing.T) {
-	want := uint32(MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSize) * MaxBlockHeadersPerMsg))
+	want := uint32(MaxVarIntPayload + ((MaxBlockHeaderPayload + MaxCertificateSizeAnyVersion) * MaxBlockHeadersPerMsg))
 	require.Equal(t, want, NewMsgHeaders().MaxPayloadLength(ProtocolVersion))
 }
 

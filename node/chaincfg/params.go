@@ -288,6 +288,20 @@ type Params struct {
 	// scheduled (V4 supersedes V3), or before MoEForkHeight otherwise.
 	Fp8ForkHeight int32
 
+	// Fp16ForkHeight is the block height at which the FP16 (A100) hardfork
+	// activates: at and after it blocks must carry a V5 certificate
+	// (wire.CertificateVersionV5). A value of 0 disables the fork.
+	//
+	// STAGED, NOT ACTIVATED: this is 0 (disabled) on every network, so
+	// RequiredCertVersion never returns V5 and behavior is unchanged. It is the
+	// fork-height half of the V5 activation; the other half is allowing V5 in
+	// wire.IsCertVersionAllowed (deliberately still false). Activating V5 means
+	// setting this height AND flipping that allow-list entry together — see the
+	// activation note in node/wire/certificate.go.
+	//
+	// Must not activate before Fp8ForkHeight (V5 supersedes V4).
+	Fp16ForkHeight int32
+
 	// Mempool parameters
 	RelayNonStdTxs bool
 
@@ -337,11 +351,22 @@ func (p *Params) IsFp8ForkActive(height int32) bool {
 	return p.Fp8ForkHeight != 0 && height >= p.Fp8ForkHeight
 }
 
+// IsFp16ForkActive reports whether the FP16 (A100) hardfork is active at the
+// given block height. The fork is disabled when Fp16ForkHeight is 0 (its value
+// on every network today — the fork is staged but not activated).
+func (p *Params) IsFp16ForkActive(height int32) bool {
+	return p.Fp16ForkHeight != 0 && height >= p.Fp16ForkHeight
+}
+
 // RequiredCertVersion returns the block certificate version that a block at the
-// given height must use under the strict hardfork cutovers: V4 at and after the
-// FP8 fork, V3 at and after the salted noise-seed fork, V2 at and after the MoE
-// fork, V1 before those (and always, when the forks are disabled).
+// given height must use under the strict hardfork cutovers: V5 at and after the
+// FP16 fork, V4 at and after the FP8 fork, V3 at and after the salted noise-seed
+// fork, V2 at and after the MoE fork, V1 before those (and always, when the forks
+// are disabled). The FP16 branch is inert until Fp16ForkHeight is set (staged).
 func (p *Params) RequiredCertVersion(height int32) wire.CertificateVersion {
+	if p.IsFp16ForkActive(height) {
+		return wire.CertificateVersionV5
+	}
 	if p.IsFp8ForkActive(height) {
 		return wire.CertificateVersionV4
 	}

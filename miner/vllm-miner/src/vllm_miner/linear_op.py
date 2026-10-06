@@ -172,13 +172,71 @@ def _validate_bf16_contract(x: torch.Tensor, bias: torch.Tensor | None) -> None:
         raise TypeError(f"pearl::apply_linear requires bfloat16 bias, got {bias.dtype}")
 
 
+def _try_mine_fp16(state, x2d: torch.Tensor) -> None:
+    """Opportunistically run the FP16 (A100/v5) search for one forward.
+
+    FP16 does not fuse mining into serving: the layer's output is a plain linear
+    (computed by the caller) and this runs the standalone search as a side
+    effect, gated exactly like the FP8 eager path. A non-V5 live job, or no job,
+    is a no-op (the manager's admission declines a non-submittable scheme)."""
+    if _eager_mining_blocked_fp16(state, x2d.shape[0]):
+        return
+    from .fp16_mining import run_fp16_mining_forward
+    from .job_prep import current_job
+
+    job = current_job()
+    if job is None:
+        return
+    run_fp16_mining_forward(state, job, x2d.contiguous())
+
+
+def _eager_mining_blocked_fp16(state, m_tokens: int) -> bool:
+    return (
+        not state.mineable
+        or _mining_disabled()
+        or m_tokens < runtime_settings().min_mining_tokens
+        or in_graph_setup_no_mining()
+        or mining_launches_suspended()
+    )
+
+
+def _serve_fp16_linear(
+    state, x2d: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    """The FP16 layer's serving output: a plain linear against the committed
+    FP16 weight, returned in the activation (BF16) dtype."""
+    out = torch.nn.functional.linear(x2d.to(state.weight.dtype), state.weight)
+    out = out.to(x2d.dtype)
+    if bias is not None:
+        out = out + bias
+    return out
+
+
 @torch.library.impl(_LIB, "apply_linear", "CUDA")
 def _apply_linear_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor:
     _validate_bf16_contract(x, bias)
-    state = lookup_state(weight)
     x2d = x.reshape(-1, x.shape[-1])
+
+    # FP16 (A100/v5) is a parallel branch probed first: an FP16-registered
+    # weight serves a plain linear and mines via the standalone search; an
+    # FP8-registered or unregistered weight returns None here and falls through
+    # to the FP8 path below, which stays byte-identical to its prior behavior.
+    from .fp16_layer import lookup_fp16_state
+
+    fp16_state = lookup_fp16_state(weight)
+    if fp16_state is not None:
+        if x2d.shape[1] != fp16_state.k or x2d.device != fp16_state.weight.device:
+            raise ValueError(
+                f"pearl::apply_linear expected (*, {fp16_state.k}) on "
+                f"{fp16_state.weight.device}, got {tuple(x2d.shape)} on {x2d.device}"
+            )
+        _try_mine_fp16(fp16_state, x2d)
+        out = _serve_fp16_linear(fp16_state, x2d, bias)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+    state = lookup_state(weight)
     if x2d.shape[1] != state.k or x2d.device != state.weight.device:
         raise ValueError(
             f"pearl::apply_linear expected (*, {state.k}) on {state.weight.device}, "

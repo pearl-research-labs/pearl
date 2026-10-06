@@ -26,7 +26,7 @@ var allMessageCommands = []string{
 // the wire. Add new versions here so the size assertions cover them.
 var allCertificateVersions = []CertificateVersion{
 	CertificateVersionV1, CertificateVersionV2, CertificateVersionV3,
-	CertificateVersionV4,
+	CertificateVersionV4, CertificateVersionV5,
 }
 
 // TestMessageCapsFitProtocolLimit asserts that no message type declares a

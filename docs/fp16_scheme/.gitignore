@@ -1,0 +1,12 @@
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# hardware capture build artifact
+validation/a100_hmma_capture
+validation/attack_cost_benchmark
+validation/__pycache__/

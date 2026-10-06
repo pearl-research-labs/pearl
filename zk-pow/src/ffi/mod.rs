@@ -11,6 +11,7 @@ use crate::v2::ffi::plain_proof::PlainProof;
 
 pub mod py_v2;
 pub mod py_v4;
+pub mod py_v5;
 
 /// Block certificate version (the wire format a block's certificate uses).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,16 +24,21 @@ pub enum CertificateVersion {
     ZkV3 = 3,
     /// V4: FP8 proofs (dense or MoE).
     PlainFp8 = 4,
+    /// V5: FP16 (A100) header-bound ZK certificate. NOTE the `PlainFp16` name is
+    /// historical — the V5 consensus artifact is the header-bound ZK certificate
+    /// (`verify_fp16_zk_cert_ffi`), not a plaintext proof.
+    PlainFp16 = 5,
 }
 
 const _: () = assert!(CertificateVersion::PlainFp8 as u32 == crate::v4::CERT_VERSION);
+const _: () = assert!(CertificateVersion::PlainFp16 as u32 == crate::v5::CERT_VERSION);
 
 impl CertificateVersion {
     /// The noise-seed derivation this certificate version mandates. This is the
     /// single version→derivation mapping; the `api` layer only sees [`SeedDerivation`].
     pub fn seed_derivation(self) -> SeedDerivation {
         match self {
-            Self::ZkDense | Self::ZkMoe | Self::PlainFp8 => SeedDerivation::Legacy,
+            Self::ZkDense | Self::ZkMoe | Self::PlainFp8 | Self::PlainFp16 => SeedDerivation::Legacy,
             Self::ZkV3 => SeedDerivation::Salted,
         }
     }
@@ -47,6 +53,7 @@ impl TryFrom<u32> for CertificateVersion {
             v if v == Self::ZkMoe as u32 => Ok(Self::ZkMoe),
             v if v == Self::ZkV3 as u32 => Ok(Self::ZkV3),
             v if v == Self::PlainFp8 as u32 => Ok(Self::PlainFp8),
+            v if v == Self::PlainFp16 as u32 => Ok(Self::PlainFp16),
             v => bail!("unknown certificate version: {v}"),
         }
     }
@@ -70,6 +77,10 @@ impl PlainProof {
         ensure!(
             version != CertificateVersion::PlainFp8,
             "Int7 PlainProof is not eligible at certificate version 4 (PlainFp8); use PlainProofV4"
+        );
+        ensure!(
+            version != CertificateVersion::PlainFp16,
+            "Int7 PlainProof is not eligible at certificate version 5 (PlainFp16); use the FP16 ZK certificate"
         );
         let min_version = self.min_cert_version() as u32;
         ensure!(

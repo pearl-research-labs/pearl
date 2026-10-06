@@ -95,14 +95,20 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 }
 
 // readFp8Blob reads one length-prefixed (4-byte LE) blob, enforcing the common
-// blob-size cap. A zero length decodes as nil.
+// FP8 (V1-V4) blob-size cap. A zero length decodes as nil.
 func readFp8Blob(r io.Reader, fieldName string) ([]byte, error) {
+	return readBlobCapped(r, fieldName, MaxZKProofSize)
+}
+
+// readBlobCapped reads one length-prefixed (4-byte LE) blob, rejecting a length
+// above maxSize before allocating. A zero length decodes as nil.
+func readBlobCapped(r io.Reader, fieldName string, maxSize uint32) ([]byte, error) {
 	var length uint32
 	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return nil, err
 	}
-	if length > MaxZKProofSize {
-		return nil, fmt.Errorf("fp8 %s_len %d exceeds max %d", fieldName, length, MaxZKProofSize)
+	if length > maxSize {
+		return nil, fmt.Errorf("%s_len %d exceeds max %d", fieldName, length, maxSize)
 	}
 	if length == 0 {
 		return nil, nil

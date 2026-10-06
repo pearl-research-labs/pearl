@@ -20,15 +20,20 @@ pub const fn num_slots(table: LutTable) -> usize {
 /// Live rows per slot (the key-domain size; [`lut_height`] rounds it up to the AIR height).
 pub const fn slot_height(table: LutTable) -> usize {
     match table {
-        LutTable::Range16 | LutTable::Bytes2 | LutTable::Qcast | LutTable::Div448 | LutTable::Width16 | LutTable::Log16 => {
-            1 << 16
-        }
+        LutTable::Range16
+        | LutTable::Bytes2
+        | LutTable::Qcast
+        | LutTable::Div448
+        | LutTable::Width16
+        | LutTable::Log16
+        | LutTable::Fp16Decode => 1 << 16,
         LutTable::Pair128 => 1 << 14,
         LutTable::Int8Dec => 256,
         LutTable::ExpInfo => 255, // keys [0, 254]; the inf/NaN field 255 has no row
         LutTable::Clamp22 => 601, // keys x + 400, x in [-400, 200]
         LutTable::Pow2D => 20,    // keys [0, 19]; the FMA's gap cap of 19 sets the domain
         LutTable::Pow2G | LutTable::Pow2Gb => 64,
+        LutTable::Fp16Pow2 => 256, // keys [0, 255]; FP16's relative-shift span (see mod docs)
         LutTable::Width32 => 32, // keys [1, 32] — a shifted ramp, no key 0 (see `generate`)
         LutTable::RneRnd => 1 << 17,
         LutTable::ProdAlign15 | LutTable::B200Align | LutTable::WidthNorm => 1 << 16,
@@ -61,9 +66,10 @@ const fn num_value_columns(table: LutTable) -> usize {
         | LutTable::Clamp22
         | LutTable::Pow2D
         | LutTable::Pow2Gb
+        | LutTable::Fp16Pow2
         | LutTable::Log16 => 1,
         LutTable::Width32 | LutTable::Width16 => 2,
-        LutTable::Int8Dec => 4,
+        LutTable::Int8Dec | LutTable::Fp16Decode => 4,
         LutTable::WidthNorm => 6, // slot-zero outputs and four right-shifted ramps
         LutTable::Pow2G => 7,     // two saturated keys and five values
         LutTable::ProdAlign15 | LutTable::B200Align => 11, // eight truncations and three decode fields
@@ -152,9 +158,10 @@ pub fn lut_slot_layout<F: Field>(table: LutTable, slot: usize) -> LutSlotLayout<
         | LutTable::Clamp22
         | LutTable::Pow2D
         | LutTable::Pow2Gb
+        | LutTable::Fp16Pow2
         | LutTable::Log16 => (0, vec![Column::single(nk)]),
         LutTable::Width32 | LutTable::Width16 => (0, Column::singles([nk, nk + 1]).collect()),
-        LutTable::Int8Dec => (0, Column::singles(nk..nk + 4).collect()),
+        LutTable::Int8Dec | LutTable::Fp16Decode => (0, Column::singles(nk..nk + 4).collect()),
         LutTable::ProdAlign15 | LutTable::B200Align => {
             let shift = if table == LutTable::ProdAlign15 { 7 } else { 19 };
             let aligned = if slot <= shift {

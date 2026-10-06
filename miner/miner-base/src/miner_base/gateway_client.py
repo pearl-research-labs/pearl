@@ -7,7 +7,7 @@ from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gateway.comm.json_rpc_client import JSONRPCClient
 from pearl_gateway.config import MinerRpcConfig
-from pearl_mining import BlockHeader, IncompleteBlockHeader, PlainProof, PlainProofV4
+from pearl_mining import BlockHeader, Fp16PlainProof, IncompleteBlockHeader, PlainProof, PlainProofV4
 
 _LOGGER = get_logger(__name__)
 
@@ -55,12 +55,15 @@ class MiningClient(AbstractContextManager):
         return MiningJob.from_dict(result)
 
     def submit_plain_proof(
-        self, plain_proof: PlainProof | PlainProofV4, mining_job: MiningJob
+        self, plain_proof: PlainProof | PlainProofV4 | Fp16PlainProof, mining_job: MiningJob
     ) -> None:
         """Submit a plain proof to the gateway.
 
         Args:
-            plain_proof: PlainProof (int7 certs) or PlainProofV4 (cert v4) with the proof data
+            plain_proof: PlainProof (int7 certs), PlainProofV4 (cert v4 FP8), or
+                Fp16PlainProof (cert v5 FP16/A100) with the proof data. Transport
+                is base64 and version-agnostic (the gateway dispatches on the
+                job's cert_version), so the same RPC carries every scheme.
             mining_job: MiningJob associated with this proof
         """
         self.client.call(

@@ -9,6 +9,16 @@ per-process PoW hit signal (``HitSignal``).
 """
 
 from .api import (
+    fp16_commit,
+    fp16_gemm,
+    fp16_miner,
+    fp16_noise_lines,
+    fp16_noisy_quant,
+    fp16_pipeline,
+    fp16_policy,
+    fp16_search,
+)
+from .api import (
     LABEL_E1,
     LABEL_E2,
     LABEL_F1,
@@ -60,6 +70,14 @@ from .protocol_constants import (
 )
 
 __all__ = [
+    "fp16_commit",
+    "fp16_gemm",
+    "fp16_miner",
+    "fp16_noise_lines",
+    "fp16_noisy_quant",
+    "fp16_pipeline",
+    "fp16_policy",
+    "fp16_search",
     "BLOCK_SCALE_GROUP",
     "GroupedFp8GemmConfig",
     "GroupedMixedGemmConfig",

@@ -11,6 +11,8 @@ crate-type = ["staticlib"]
 [dependencies]
 blake3 = "1.5"
 zk-pow = { path = "../..", default-features = false, features = ["embedded_cache"] }
+plonky2 = { path = "../../../plonky2/plonky2" }
+plonky2_field = { path = "../../../plonky2/field" }
 lazy_static = "1.5"
 anyhow = "1.0"
 itertools = "0.14"

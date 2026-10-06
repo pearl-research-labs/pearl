@@ -214,6 +214,59 @@ func TestShippedNetworksFp8ForkHeights(t *testing.T) {
 		"simnet must require V4 certificates from genesis")
 }
 
+// TestFp16ForkActivation verifies the (staged) V5 activation boundary: when
+// Fp16ForkHeight is set, RequiredCertVersion returns V5 at and after it.
+func TestFp16ForkActivation(t *testing.T) {
+	const forkHeight = int32(400)
+	p := Params{MoEForkHeight: 100, SaltedSeedForkHeight: 200, Fp8ForkHeight: 300, Fp16ForkHeight: forkHeight}
+
+	tests := []struct {
+		name        string
+		height      int32
+		wantActive  bool
+		wantVersion wire.CertificateVersion
+	}{
+		{"just before fork", forkHeight - 1, false, wire.CertificateVersionV4},
+		{"at fork height", forkHeight, true, wire.CertificateVersionV5},
+		{"after fork height", forkHeight + 1, true, wire.CertificateVersionV5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, p.IsFp16ForkActive(tt.height))
+			require.Equal(t, tt.wantVersion, p.RequiredCertVersion(tt.height))
+		})
+	}
+}
+
+// TestFp16ForkDisabled confirms the staged-but-off default: with Fp16ForkHeight 0,
+// the fork is never active and RequiredCertVersion never returns V5.
+func TestFp16ForkDisabled(t *testing.T) {
+	p := Params{MoEForkHeight: 1, SaltedSeedForkHeight: 1, Fp8ForkHeight: 1, Fp16ForkHeight: 0}
+	for _, height := range []int32{1, 100, 1_000_000} {
+		require.False(t, p.IsFp16ForkActive(height))
+		require.Equal(t, wire.CertificateVersionV4, p.RequiredCertVersion(height))
+	}
+}
+
+// TestShippedNetworksFp16ForkDisabled asserts V5 is staged but NOT activated on
+// EVERY network (including regtest/simnet): Fp16ForkHeight must be 0 everywhere, so
+// RequiredCertVersion never requires V5 until a deployment sets it (and flips the
+// wire.IsCertVersionAllowed allow-list in tandem).
+func TestShippedNetworksFp16ForkDisabled(t *testing.T) {
+	for name, params := range map[string]*Params{
+		"mainnet":  &MainNetParams,
+		"testnet":  &TestNetParams,
+		"testnet2": &TestNet2Params,
+		"regtest":  &RegressionNetParams,
+		"simnet":   &SimNetParams,
+	} {
+		require.Zerof(t, params.Fp16ForkHeight, "%s must ship with Fp16ForkHeight disabled (V5 staged, not activated)", name)
+	}
+	// And V5 is not in the sanity allow-list either (the other half of the gate).
+	require.False(t, wire.IsCertVersionAllowed(wire.CertificateVersionV5),
+		"V5 must not be network-allowed while staged")
+}
+
 // TestRankPenaltyForkActivation verifies the activation boundary of the
 // rank-penalty softfork, including the disabled case.
 func TestRankPenaltyForkActivation(t *testing.T) {
