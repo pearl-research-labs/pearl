@@ -52,7 +52,7 @@ var scriptClassToName = []string{
 // the enum script class. If the enum is invalid then "Invalid" will be
 // returned.
 func (t ScriptClass) String() string {
-	if int(t) > len(scriptClassToName) || int(t) < 0 {
+	if int(t) >= len(scriptClassToName) || int(t) < 0 {
 		return "Invalid"
 	}
 	return scriptClassToName[t]
