@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -197,6 +198,13 @@ func validateFeeRate(s string) error {
 	if err != nil {
 		return fmt.Errorf("must be a number")
 	}
+	// ParseFloat accepts "NaN" and "Inf" without an error, and neither
+	// NaN < floor nor +Inf < floor is true, so non-finite rates would
+	// pass the floor check and only fail when the RPC layer tries to
+	// marshal them — after the user has confirmed the broadcast.
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Errorf("must be a finite number")
+	}
 	if v < minRelayFeeRate {
 		return fmt.Errorf("below the network minimum relay fee (%.5f PRL/kB)", minRelayFeeRate)
 	}
@@ -212,6 +220,13 @@ func parseFeeRate(s string) (float64, string, error) {
 	}
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
+		return 0, "", fmt.Errorf("invalid fee rate")
+	}
+	// Reject non-finite rates here too: validateFeeRate is the form's
+	// gate, but a NaN or +Inf that reached the RPC request would fail
+	// JSON marshaling with an opaque error, so the parser must not hand
+	// one back either.
+	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return 0, "", fmt.Errorf("invalid fee rate")
 	}
 	return v, fmtPRLFloat(v) + "/kB", nil

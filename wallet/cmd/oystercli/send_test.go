@@ -30,3 +30,15 @@ func TestValidateFeeRate(t *testing.T) {
 	assert.Error(t, validateFeeRate("0"), "zero fee can never relay")
 	assert.Error(t, validateFeeRate("0.000009"), "below relay floor")
 }
+
+// ParseFloat accepts the non-finite spellings without an error, and neither
+// NaN nor +Inf is below the relay floor, so without an explicit finiteness
+// check they passed validation and only failed when the RPC layer tried to
+// marshal the rate — after the user had confirmed the broadcast.
+func TestParseAndValidateFeeRateRejectNonFinite(t *testing.T) {
+	for _, s := range []string{"NaN", "nan", "Inf", "+Inf", "Infinity", "-Inf"} {
+		assert.Error(t, validateFeeRate(s), "validateFeeRate(%q)", s)
+		_, _, err := parseFeeRate(s)
+		assert.Error(t, err, "parseFeeRate(%q)", s)
+	}
+}
