@@ -98,13 +98,20 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		return next.ServeHTTP(w, r)
 	}
 
-	if entry, ok := h.cache.get(req.Method); ok && entry.fresh() {
+	// The cache key must cover the params, not just the method:
+	// cached methods such as getblocktemplate are parameter-bearing
+	// (mode, capabilities, rules), so two callers asking the same
+	// method with different params must not share an entry — neither
+	// through the cache nor through singleflight.
+	key := req.Method + "\x00" + string(req.Params)
+
+	if entry, ok := h.cache.get(key); ok && entry.fresh() {
 		return writeCachedResponse(w, entry, req.ID, true)
 	}
 
 	ttl := time.Duration(rule.TTL)
-	result, err, _ := h.cache.group.Do(req.Method, func() (any, error) {
-		return h.fetchFromUpstream(r, body, next, req.Method, ttl)
+	result, err, _ := h.cache.group.Do(key, func() (any, error) {
+		return h.fetchFromUpstream(r, body, next, req.Method, key, ttl)
 	})
 	if err != nil {
 		return err
@@ -122,7 +129,7 @@ func (h Handler) findRule(method string) *CacheRule {
 	return nil
 }
 
-func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.Handler, method string, ttl time.Duration) (*cacheEntry, error) {
+func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.Handler, method string, key string, ttl time.Duration) (*cacheEntry, error) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
 	rec := &responseRecorder{body: &bytes.Buffer{}, statusCode: http.StatusOK}
@@ -137,7 +144,7 @@ func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.
 	}
 
 	if rec.statusCode == http.StatusOK {
-		h.cache.set(method, entry)
+		h.cache.set(key, entry)
 
 		h.logger.Debug("cached JSON-RPC response",
 			zap.String("method", method),
@@ -149,24 +156,41 @@ func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.
 	return entry, nil
 }
 
-// cache holds the per-method cached responses behind a mutex.
+// cache holds the per-key (method + params) cached responses behind a mutex.
 type cache struct {
 	mu      sync.RWMutex
 	entries map[string]*cacheEntry
 	group   singleflight.Group
 }
 
-func (c *cache) get(method string) (*cacheEntry, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	e, ok := c.entries[method]
+func (c *cache) get(key string) (*cacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if ok && !e.fresh() {
+		// Evict on access: expired entries must not accumulate.
+		// Keys embed the request params, so each distinct params
+		// value is a distinct entry, and without eviction a caller
+		// minting distinct params could grow the map for the life
+		// of the process.
+		delete(c.entries, key)
+		return nil, false
+	}
 	return e, ok
 }
 
-func (c *cache) set(method string, entry *cacheEntry) {
+func (c *cache) set(key string, entry *cacheEntry) {
 	c.mu.Lock()
-	c.entries[method] = entry
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	c.entries[key] = entry
+
+	// Sweep every expired entry on insert, so retained memory is
+	// bounded to entries still inside their TTL window.
+	for k, e := range c.entries {
+		if !e.fresh() {
+			delete(c.entries, k)
+		}
+	}
 }
 
 func (c *cache) clear() {
@@ -188,6 +212,7 @@ func (e *cacheEntry) fresh() bool {
 type jsonrpcRequest struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 }
 
 type jsonrpcResponse struct {
