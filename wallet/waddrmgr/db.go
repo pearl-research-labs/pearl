@@ -713,6 +713,11 @@ func deserializeAccountRow(accountID []byte, serializedAccount []byte) (*dbAccou
 	row := dbAccountRow{}
 	row.acctType = accountType(serializedAccount[0])
 	rdlen := binary.LittleEndian.Uint32(serializedAccount[1:5])
+	if uint64(rdlen) > uint64(len(serializedAccount)-5) {
+		str := fmt.Sprintf("malformed serialized account for key %x",
+			accountID)
+		return nil, managerError(ErrDatabase, str, nil)
+	}
 	row.rawData = make([]byte, rdlen)
 	copy(row.rawData, serializedAccount[5:5+rdlen])
 
@@ -756,21 +761,48 @@ func deserializeDefaultAccountRow(accountID []byte, row *dbAccountRow) (*dbDefau
 		dbAccountRow: *row,
 	}
 
+	// Each length prefix must be checked against the bytes that
+	// actually remain: a corrupt record must produce the malformed
+	// error above, not a panic.
+	malformedErr := func() (*dbDefaultAccountRow, error) {
+		str := fmt.Sprintf("malformed serialized bip0044 account for "+
+			"key %x", accountID)
+		return nil, managerError(ErrDatabase, str, nil)
+	}
+	remaining := func(offset uint32) uint64 {
+		return uint64(len(row.rawData)) - uint64(offset)
+	}
+
 	pubLen := binary.LittleEndian.Uint32(row.rawData[0:4])
+	if uint64(pubLen) > remaining(4) {
+		return malformedErr()
+	}
 	retRow.pubKeyEncrypted = make([]byte, pubLen)
 	copy(retRow.pubKeyEncrypted, row.rawData[4:4+pubLen])
 	offset := 4 + pubLen
+	if remaining(offset) < 4 {
+		return malformedErr()
+	}
 	privLen := binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
 	offset += 4
+	if uint64(privLen) > remaining(offset) {
+		return malformedErr()
+	}
 	retRow.privKeyEncrypted = make([]byte, privLen)
 	copy(retRow.privKeyEncrypted, row.rawData[offset:offset+privLen])
 	offset += privLen
+	if remaining(offset) < 12 {
+		return malformedErr()
+	}
 	retRow.nextExternalIndex = binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
 	offset += 4
 	retRow.nextInternalIndex = binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
 	offset += 4
 	nameLen := binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
 	offset += 4
+	if uint64(nameLen) > remaining(offset) {
+		return malformedErr()
+	}
 	retRow.name = string(row.rawData[offset : offset+nameLen])
 
 	return &retRow, nil
@@ -1044,9 +1076,20 @@ func fetchAccountName(ns walletdb.ReadBucket, scope *KeyScope,
 		return "", managerError(ErrAccountNotFound, str, nil)
 	}
 
+	if len(val) < 4 {
+		str := fmt.Sprintf("malformed account name for account %d "+
+			"stored in database", account)
+		return "", managerError(ErrDatabase, str, nil)
+	}
+
 	offset := uint32(0)
 	nameLen := binary.LittleEndian.Uint32(val[offset : offset+4])
 	offset += 4
+	if uint64(nameLen) > uint64(len(val))-uint64(offset) {
+		str := fmt.Sprintf("malformed account name for account %d "+
+			"stored in database", account)
+		return "", managerError(ErrDatabase, str, nil)
+	}
 	acctName := string(val[offset : offset+nameLen])
 
 	return acctName, nil
@@ -1068,6 +1111,11 @@ func fetchAccountByName(ns walletdb.ReadBucket, scope *KeyScope,
 	if val == nil {
 		str := fmt.Sprintf("account name '%s' not found", name)
 		return 0, managerError(ErrAccountNotFound, str, nil)
+	}
+	if len(val) < 4 {
+		str := fmt.Sprintf("malformed account number for account "+
+			"name '%s' stored in database", name)
+		return 0, managerError(ErrDatabase, str, nil)
 	}
 
 	return binary.LittleEndian.Uint32(val), nil
@@ -1350,6 +1398,10 @@ func deserializeAddressRow(serializedAddress []byte) (*dbAddressRow, error) {
 	row.addTime = binary.LittleEndian.Uint64(serializedAddress[5:13])
 	row.syncStatus = syncStatus(serializedAddress[13])
 	rdlen := binary.LittleEndian.Uint32(serializedAddress[14:18])
+	if uint64(rdlen) > uint64(len(serializedAddress)-18) {
+		str := "malformed serialized address"
+		return nil, managerError(ErrDatabase, str, nil)
+	}
 	row.rawData = make([]byte, rdlen)
 	copy(row.rawData, serializedAddress[18:18+rdlen])
 
@@ -1441,12 +1493,29 @@ func deserializeImportedAddress(row *dbAddressRow) (*dbImportedAddressRow, error
 		dbAddressRow: *row,
 	}
 
+	malformedErr := func() (*dbImportedAddressRow, error) {
+		str := "malformed serialized imported address"
+		return nil, managerError(ErrDatabase, str, nil)
+	}
+	remaining := func(offset uint32) uint64 {
+		return uint64(len(row.rawData)) - uint64(offset)
+	}
+
 	pubLen := binary.LittleEndian.Uint32(row.rawData[0:4])
+	if uint64(pubLen) > remaining(4) {
+		return malformedErr()
+	}
 	retRow.encryptedPubKey = make([]byte, pubLen)
 	copy(retRow.encryptedPubKey, row.rawData[4:4+pubLen])
 	offset := 4 + pubLen
+	if remaining(offset) < 4 {
+		return malformedErr()
+	}
 	privLen := binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
 	offset += 4
+	if uint64(privLen) > remaining(offset) {
+		return malformedErr()
+	}
 	retRow.encryptedPrivKey = make([]byte, privLen)
 	copy(retRow.encryptedPrivKey, row.rawData[offset:offset+privLen])
 
@@ -1500,12 +1569,29 @@ func deserializeWitnessScriptAddress(
 		isSecretScript: row.rawData[1] == 1,
 	}
 
+	malformedErr := func() (*dbWitnessScriptAddressRow, error) {
+		str := "malformed serialized witness script address"
+		return nil, managerError(ErrDatabase, str, nil)
+	}
+	remaining := func(offset uint32) uint64 {
+		return uint64(len(row.rawData)) - uint64(offset)
+	}
+
 	hashLen := binary.LittleEndian.Uint32(row.rawData[2:6])
+	if uint64(hashLen) > remaining(6) {
+		return malformedErr()
+	}
 	retRow.encryptedHash = make([]byte, hashLen)
 	copy(retRow.encryptedHash, row.rawData[6:6+hashLen])
 	offset := 6 + hashLen
+	if remaining(offset) < 4 {
+		return malformedErr()
+	}
 	scriptLen := binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
 	offset += 4
+	if uint64(scriptLen) > remaining(offset) {
+		return malformedErr()
+	}
 	retRow.encryptedScript = make([]byte, scriptLen)
 	copy(retRow.encryptedScript, row.rawData[offset:offset+scriptLen])
 
