@@ -798,17 +798,19 @@ func TestLocateInventory(t *testing.T) {
 	for _, test := range tests {
 		// Ensure the expected headers with certificates are located.
 		var headers []wire.MsgHeader
+		var err error
 		if test.maxAllowed != 0 {
 			// Need to use the unexported function to override the
 			// max allowed for headers.
 			chain.chainLock.RLock()
-			headers = chain.locateHeaders(test.locator,
+			headers, err = chain.locateHeaders(test.locator,
 				&test.hashStop, test.maxAllowed, true)
 			chain.chainLock.RUnlock()
 		} else {
-			headers = chain.LocateHeaders(test.locator,
+			headers, err = chain.LocateHeaders(test.locator,
 				&test.hashStop, true)
 		}
+		require.NoError(err, "%s: unexpected error", test.name)
 		require.Equal(test.headers, headers, "%s: unexpected headers", test.name)
 
 		// Ensure the expected block hashes are located.
@@ -839,21 +841,101 @@ func TestLocateHeadersCertificateFiltering(t *testing.T) {
 
 	// With includeCerts=true, all headers should have certificates.
 	chain.chainLock.RLock()
-	headers := chain.locateHeaders(locator, &chainhash.Hash{}, 100, true)
+	headers, err := chain.locateHeaders(locator, &chainhash.Hash{}, 100, true)
 	chain.chainLock.RUnlock()
 
+	require.NoError(err)
 	require.Len(headers, 2)
 	require.NotNil(headers[0].BlockCertificate())
 	require.NotNil(headers[1].BlockCertificate())
 
 	// With includeCerts=false, no headers should have certificates.
 	chain.chainLock.RLock()
-	headers = chain.locateHeaders(locator, &chainhash.Hash{}, 100, false)
+	headers, err = chain.locateHeaders(locator, &chainhash.Hash{}, 100, false)
 	chain.chainLock.RUnlock()
+
+	require.NoError(err)
 
 	require.Len(headers, 2)
 	require.Nil(headers[0].BlockCertificate())
 	require.Nil(headers[1].BlockCertificate())
+}
+
+// addPrunedNode adds a block to the chain index and stores its header,
+// status, and vsize exactly like dbStoreBlock does, but deliberately omits
+// the block data itself. That is the state pruning leaves behind: the header
+// survives in the block index while the block file that held the block (and
+// its certificate) is gone.
+func addPrunedNode(t *testing.T, chain *BlockChain, tip *blockNode) *blockNode {
+	t.Helper()
+	require := require.New(t)
+
+	header := wire.BlockHeader{
+		Timestamp: time.Unix(int64(testNoncePrng.Uint32()), 0),
+	}
+	var height int32
+	if tip != nil {
+		header.PrevBlock = tip.hash
+		height = tip.height + 1
+	}
+	cert := &wire.CertificateV1{
+		Hash:      header.BlockHash(),
+		ProofData: []byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe},
+	}
+	block := btcutil.NewBlock(&wire.MsgBlock{
+		MsgHeader: wire.MsgHeader{
+			BlockHeader:    header,
+			MsgCertificate: wire.MsgCertificate{Certificate: cert},
+		},
+	})
+	block.SetHeight(height)
+	blockVsize := GetBlockVsize(block)
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		if err := dbStoreBlockHeader(dbTx, &header, uint32(height)); err != nil {
+			return err
+		}
+		if err := dbStoreBlockStatus(dbTx, *block.Hash(), statusDataStored); err != nil {
+			return err
+		}
+		return dbStoreBlockVsize(dbTx, *block.Hash(), blockVsize)
+	})
+	require.NoError(err, "failed to add pruned block header to database")
+	return chain.index.Add(&header, tip, statusNone, blockVsize)
+}
+
+// TestLocateHeadersPrunedBlock ensures that a headers request whose range
+// reaches a pruned block reports an error when certificates are requested,
+// instead of silently returning no headers at all. Before the fix, the
+// failed certificate read dropped the whole batch and the caller could not
+// distinguish "this range was pruned" from "no headers after the locator".
+func TestLocateHeadersPrunedBlock(t *testing.T) {
+	require := require.New(t)
+
+	chain, teardown, err := chainSetup("testprunedheaders", &chaincfg.MainNetParams)
+	require.NoError(err)
+	t.Cleanup(teardown)
+
+	// genesis -> pruned -> 1 -> 2, with the first block after genesis in
+	// the state pruning leaves behind.
+	genesis := chain.bestChain.Genesis()
+	pruned := addPrunedNode(t, chain, genesis)
+	nodes := addNodes(t, chain, pruned, 2)
+	chain.bestChain.SetTip(tstTip(nodes))
+
+	locator := BlockLocator{&genesis.hash}
+
+	// Without certificates the batch is served in full: headers are
+	// never pruned, only the block data holding the certificates is.
+	headers, err := chain.LocateHeaders(locator, &chainhash.Hash{}, false)
+	require.NoError(err)
+	require.Len(headers, 3)
+
+	// With certificates, the first block's certificate read fails, so
+	// the request must surface the error and return no headers rather
+	// than an empty result the caller would read as "fully synced".
+	headers, err = chain.LocateHeaders(locator, &chainhash.Hash{}, true)
+	require.Error(err)
+	require.Nil(headers)
 }
 
 // TestHeightToHashRange ensures that fetching a range of block hashes by start

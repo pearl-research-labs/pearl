@@ -2288,7 +2288,13 @@ func handleGetHeaders(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) 
 			return nil, rpcDecodeHexError(c.HashStop)
 		}
 	}
-	headers := s.cfg.SyncMgr.LocateHeaders(blockLocators, &hashStop, true)
+	headers, err := s.cfg.SyncMgr.LocateHeaders(blockLocators, &hashStop, true)
+	if err != nil {
+		return nil, &btcjson.RPCError{
+			Code:    btcjson.ErrRPCDatabase,
+			Message: "Failed to get block headers: " + err.Error(),
+		}
+	}
 
 	// Return the serialized headers (certificate + header) as hex-encoded strings.
 	hexBlockHeaders := make([]string, len(headers))
@@ -4826,7 +4832,7 @@ type rpcserverSyncManager interface {
 	// hashes. When includeCerts is true, each returned MsgHeader includes
 	// both the BlockHeader and its corresponding BlockCertificate.
 	// When false, certificates are omitted.
-	LocateHeaders(locators []*chainhash.Hash, hashStop *chainhash.Hash, includeCerts bool) []wire.MsgHeader
+	LocateHeaders(locators []*chainhash.Hash, hashStop *chainhash.Hash, includeCerts bool) ([]wire.MsgHeader, error)
 }
 
 // rpcserverConfig is a descriptor containing the RPC server configuration.

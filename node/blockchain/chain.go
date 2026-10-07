@@ -1805,13 +1805,13 @@ func (b *BlockChain) LocateBlocks(locator BlockLocator, hashStop *chainhash.Hash
 // See the comment on the exported function for more details on special cases.
 //
 // This function MUST be called with the chain state lock held (for reads).
-func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Hash, maxHeaders uint32, includeCerts bool) []wire.MsgHeader {
+func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Hash, maxHeaders uint32, includeCerts bool) ([]wire.MsgHeader, error) {
 	// Find the node after the first known block in the locator and the
 	// total number of nodes after it needed while respecting the stop hash
 	// and max entries.
 	node, total := b.locateInventory(locator, hashStop, maxHeaders)
 	if total == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Populate and return the found headers with their certificates.
@@ -1840,10 +1840,9 @@ func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Has
 		return nil
 	})
 	if err != nil {
-		log.Errorf("Error getting block headers: %v", err)
-		return nil
+		return nil, err
 	}
-	return headers
+	return headers, nil
 }
 
 // LocateHeaders returns the headers of the blocks after the first known block
@@ -1861,12 +1860,20 @@ func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Has
 //   - When locators are provided, but none of them are known, headers starting
 //     after the genesis block will be returned
 //
+// An error is returned instead of any headers when a located header or its
+// certificate cannot be read from the database, for example because the
+// block has been pruned: pruning deletes the block files that hold the
+// certificates while the headers themselves survive in the block index.
+// Callers can therefore distinguish "no headers after the locator" from
+// "the requested range cannot be served", which an empty result alone
+// cannot express.
+//
 // This function is safe for concurrent access.
-func (b *BlockChain) LocateHeaders(locator BlockLocator, hashStop *chainhash.Hash, includeCerts bool) []wire.MsgHeader {
+func (b *BlockChain) LocateHeaders(locator BlockLocator, hashStop *chainhash.Hash, includeCerts bool) ([]wire.MsgHeader, error) {
 	b.chainLock.RLock()
-	headers := b.locateHeaders(locator, hashStop, wire.MaxBlockHeadersPerMsg, includeCerts)
+	headers, err := b.locateHeaders(locator, hashStop, wire.MaxBlockHeadersPerMsg, includeCerts)
 	b.chainLock.RUnlock()
-	return headers
+	return headers, err
 }
 
 // InvalidateBlock invalidates the requested block and all its descedents.  If a block

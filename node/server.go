@@ -991,7 +991,17 @@ func (sp *serverPeer) OnGetHeaders(_ *peer.Peer, msg *wire.MsgGetHeaders) {
 	//
 	// This mirrors the behavior in the reference implementation.
 	chain := sp.server.chain
-	headers := chain.LocateHeaders(msg.BlockLocatorHashes, &msg.HashStop, msg.IncludeCertificates)
+	headers, err := chain.LocateHeaders(msg.BlockLocatorHashes, &msg.HashStop, msg.IncludeCertificates)
+	if err != nil {
+		// The requested range cannot be served, for example because
+		// it reaches below the prune horizon and the certificates
+		// are gone. Ignore the request rather than sending an empty
+		// headers message, which the requester would read as "you
+		// are synced" and stall on.
+		srvrLog.Debugf("Ignoring getheaders request from %s: %v",
+			sp, err)
+		return
+	}
 
 	// Send found headers to the requesting peer.
 	sp.QueueMessage(&wire.MsgHeaders{Headers: headers}, nil)
