@@ -15,6 +15,7 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/btcutil/psbt"
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
@@ -494,4 +495,67 @@ func TestFinalizePsbt(t *testing.T) {
 		[]btcutil.Amount{1000000, 1000000},
 	)
 	require.NoError(t, err)
+}
+
+// TestPsbtPrevOutputFetcherIndexOutOfRange ensures a PSBT whose unsigned
+// transaction spends an output index beyond the attached NonWitnessUtxo's
+// outputs does not panic the fetcher: the malformed input is skipped, so
+// callers see a missing prevout instead of a crash. PSBTs arrive from
+// untrusted counterparties, so this must never be a panic.
+func TestPsbtPrevOutputFetcherIndexOutOfRange(t *testing.T) {
+	prevHash := chainhash.Hash{0x01}
+	outPoint := wire.OutPoint{Hash: prevHash, Index: 5}
+	packet := &psbt.Packet{
+		UnsignedTx: &wire.MsgTx{
+			TxIn: []*wire.TxIn{
+				{PreviousOutPoint: outPoint},
+			},
+		},
+		Inputs: []psbt.PInput{
+			{
+				NonWitnessUtxo: &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{Value: 1000, PkScript: testScriptP2TR1},
+					},
+				},
+			},
+		},
+	}
+
+	fetcher := PsbtPrevOutputFetcher(packet)
+	require.Nil(t, fetcher.FetchPrevOutput(outPoint))
+}
+
+// TestFinalizePsbtMalformedNonWitnessIndex ensures FinalizePsbt rejects a
+// packet whose NonWitnessUtxo index is out of range with an error, instead
+// of panicking inside the sighash cache construction (which dereferences
+// the prevout the fetcher skipped) before the signing loop's own bounds
+// check can run.
+func TestFinalizePsbtMalformedNonWitnessIndex(t *testing.T) {
+	prevHash := chainhash.Hash{0x01}
+	outPoint := wire.OutPoint{Hash: prevHash, Index: 5}
+	packet := &psbt.Packet{
+		UnsignedTx: &wire.MsgTx{
+			TxIn: []*wire.TxIn{
+				{PreviousOutPoint: outPoint},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 900, PkScript: testScriptP2TR1},
+			},
+		},
+		Inputs: []psbt.PInput{
+			{
+				NonWitnessUtxo: &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{Value: 1000, PkScript: testScriptP2TR1},
+					},
+				},
+			},
+		},
+		Outputs: []psbt.POutput{{}},
+	}
+
+	w := &Wallet{}
+	err := w.FinalizePsbt(nil, 0, packet)
+	require.ErrorContains(t, err, "malformed NonWitnessUtxo")
 }
