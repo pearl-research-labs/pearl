@@ -20,7 +20,7 @@ const semanticAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 const (
 	Major uint = 1
 	Minor uint = 4
-	Patch uint = 12
+	Patch uint = 13
 
 	// PreRelease MUST only contain characters from semanticAlphabet
 	// per the semantic versioning spec.
