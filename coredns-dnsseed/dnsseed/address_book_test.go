@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,7 +35,6 @@ func TestAddressBook_AddSkipsNonDefaultPort(t *testing.T) {
 
 	ab.add(mustAddr("127.0.0.1:9999"))
 	assert.Equal(t, 0, ab.count())
-	assert.False(t, ab.isKnown(mustAddr("127.0.0.1:9999")))
 }
 
 func TestAddressBook_AddRespectsCap(t *testing.T) {
@@ -48,15 +48,25 @@ func TestAddressBook_AddRespectsCap(t *testing.T) {
 	overflow := mustAddr("192.168.1.1:44108")
 	ab.add(overflow)
 	assert.Equal(t, maxAddressBookSize, ab.count())
-	assert.False(t, ab.isKnown(overflow))
+	assert.NotContains(t, ab.snapshot(), overflow)
 }
 
-func TestAddressBook_IsKnown(t *testing.T) {
+func TestAddressBook_GaugeFollowsMembership(t *testing.T) {
+	gauge := func() float64 { return testutil.ToFloat64(addressCount) }
+	// addressCount is process-wide; start from a known value.
+	addressCount.Set(0)
 	ab := newAddressBook(testDefaultPort)
 	ab.add(mustAddr("127.0.0.1:44108"))
+	ab.add(mustAddr("127.0.0.2:44108"))
+	assert.Equal(t, 2.0, gauge())
 
-	assert.True(t, ab.isKnown(mustAddr("127.0.0.1:44108")))
-	assert.False(t, ab.isKnown(mustAddr("10.0.0.1:44108")))
+	_ = newAddressBook(testDefaultPort)
+	assert.Equal(t, 2.0, gauge(), "a new book must not reset another book's count")
+
+	ab.markFailed(mustAddr("127.0.0.1:44108"))
+	assert.Equal(t, 2.0, gauge(), "one failure keeps a verified peer served")
+	ab.markFailed(mustAddr("127.0.0.1:44108"))
+	assert.Equal(t, 1.0, gauge())
 }
 
 // TestAddressBook_MarkFailedUnverified verifies that a gossiped address that
@@ -67,8 +77,6 @@ func TestAddressBook_MarkFailedUnverified(t *testing.T) {
 
 	ab.markFailed(addr)
 	assert.True(t, ab.isCoolingDown(addr))
-	assert.True(t, ab.isKnown(addr),
-		"cooling-down addresses are known so gossip does not re-dial them")
 	assert.Equal(t, 0, ab.count())
 }
 
@@ -113,8 +121,6 @@ func TestAddressBook_CooldownExpires(t *testing.T) {
 	expireCooldown(ab, addr)
 
 	assert.False(t, ab.isCoolingDown(addr))
-	assert.False(t, ab.isKnown(addr),
-		"an expired entry must be re-dialable by gossip")
 }
 
 func TestAddressBook_PruneCooldown(t *testing.T) {

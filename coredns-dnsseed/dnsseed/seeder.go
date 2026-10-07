@@ -7,10 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/pearl-research-labs/pearl/node/addrmgr"
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
@@ -35,8 +32,6 @@ func addrPortFromNAV2(na *wire.NetAddressV2) (netip.AddrPort, bool) {
 }
 
 var (
-	errRepeatConnection    = errors.New("attempted repeat connection to existing peer")
-	errCoolingDown         = errors.New("peer is in failure cooldown")
 	errHandshakeTimeout    = errors.New("peer handshake timed out")
 	errHandshakeIncomplete = errors.New("peer disconnected before handshake completed")
 )
@@ -44,8 +39,8 @@ var (
 // DNS seed serving policy. Peers must carry the required service bits and
 // speak at least the configured wire protocol version to be served;
 // non-compliant peers are rejected during the version handshake and never
-// enter the live peer set or the served address book. The protocol floor
-// defaults to peer.MinAcceptableProtocolVersion and is raised per deployment
+// enter the served address book. The protocol floor defaults to
+// peer.MinAcceptableProtocolVersion and is raised per deployment
 // via the min_protocol_version directive (values below the library floor are
 // unsatisfiable: the handshake fails before policy runs). The minimum chain
 // height is derived per-network from the latest checkpoint (see
@@ -65,32 +60,23 @@ func latestCheckpointHeight(p *chaincfg.Params) int32 {
 }
 
 const (
-	// crawlerWorkerCount bounds concurrent connection attempts during
-	// crawls. A fixed count is used deliberately: runtime.NumCPU reports
-	// host cores rather than the container CPU limit, and the work is
-	// I/O bound, not CPU bound.
+	// Workers own the entire probe, including the address wait and socket
+	// closure. This bounds pending or open crawler connections per instance.
 	crawlerWorkerCount = 64
+	maxCrawlCandidates = 4096
 
-	maximumHandshakeWait  = 5 * time.Second
-	connectionDialTimeout = 5 * time.Second
-	crawlerIdleTimeout    = 30 * time.Second
-	addrQueueBufferSize   = 4096
+	maximumHandshakeWait   = 5 * time.Second
+	connectionDialTimeout  = 5 * time.Second
+	addressResponseTimeout = 10 * time.Second
 )
 
 // seeder discovers Pearl peers and maintains an address book for DNS serving.
 type seeder struct {
-	config *peer.Config
-
+	config             *peer.Config
 	minProtocolVersion uint32
-
-	// peersMu guards peers, the tracked outbound attempts and live
-	// connections. An address is tracked before TCP dial so a second worker
-	// cannot open a parallel connection to the same peer.
-	peersMu sync.Mutex
-	peers   map[netip.AddrPort]*peer.Peer
-
-	addrBook  *addressBook
-	addrQueue chan netip.AddrPort
+	dialContext        func(context.Context, string, string) (net.Conn, error)
+	lookupNetIP        func(context.Context, string, string) ([]netip.Addr, error)
+	addrBook           *addressBook
 }
 
 // newSeeder creates a seeder for the given network name that serves peers
@@ -110,13 +96,12 @@ func newSeeder(networkName string, minProtocolVersion uint32) (*seeder, error) {
 	s := &seeder{
 		config:             &cfg,
 		minProtocolVersion: minProtocolVersion,
-		peers:              make(map[netip.AddrPort]*peer.Peer),
+		dialContext:        (&net.Dialer{}).DialContext,
+		lookupNetIP:        net.DefaultResolver.LookupNetIP,
 		addrBook:           newAddressBook(params.DefaultPort),
-		addrQueue:          make(chan netip.AddrPort, addrQueueBufferSize),
 	}
 
 	s.config.Listeners.OnVersion = s.onVersion
-	s.config.Listeners.OnAddrV2 = s.onAddrV2
 
 	return s, nil
 }
@@ -179,96 +164,102 @@ func parseBootstrapPeer(addr string) (string, uint16, error) {
 	return host, uint16(port), nil
 }
 
-// bootstrap resolves each "host:port" bootstrap peer and connects to every
-// resolved address, reporting whether at least one new connection succeeded.
-// It only fails on network conditions, which the caller is expected to retry.
-func (s *seeder) bootstrap(ctx context.Context, peers []string) bool {
-	connected := false
-	for _, bootstrapPeer := range peers {
-		host, port, err := parseBootstrapPeer(bootstrapPeer)
-		if err != nil {
-			log.Warningf("Invalid bootstrap peer %q: %v", bootstrapPeer, err)
-			continue
-		}
-
-		addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-		if err != nil {
-			log.Infof("Resolving bootstrap peer %s: %v", host, err)
-			continue
-		}
-
-		for _, ip := range addrs {
-			addr := netip.AddrPortFrom(ip.Unmap(), port)
-			if _, err := s.dial(ctx, addr); err != nil {
-				log.Infof("Connecting to bootstrap peer %s: %v", addr, err)
-				continue
-			}
-			log.Infof("Connected to bootstrap peer %s", addr)
-			connected = true
-		}
-	}
-	return connected
+// probeResult separates verification from optional address collection: a
+// missing response or disconnect after verification does not strike the peer.
+type probeResult struct {
+	verified  bool
+	addresses []netip.AddrPort
+	err       error
 }
 
-// connect verifies a discovered peer, refusing addresses in cooldown and
-// recording failed attempts.
-func (s *seeder) connect(ctx context.Context, addr netip.AddrPort) (*peer.Peer, error) {
-	if s.addrBook.isCoolingDown(addr) {
-		return nil, errCoolingDown
-	}
-	p, err := s.dial(ctx, addr)
-	if err != nil && !errors.Is(err, errRepeatConnection) && ctx.Err() == nil {
-		s.addrBook.markFailed(addr)
-	}
-	return p, err
-}
-
-// dial establishes an outbound v2 encrypted connection and completes the
-// version handshake, without consulting the cooldown. Bootstrap uses it
-// directly: bootstrap peers are operator-configured, so they are re-dialed
-// even while cooling down.
-func (s *seeder) dial(ctx context.Context, addr netip.AddrPort) (*peer.Peer, error) {
+// probe owns a complete connection lifetime. Only crawl workers call it in
+// production, and no connected peer escapes to the caller.
+func (s *seeder) probe(ctx context.Context, addr netip.AddrPort) probeResult {
 	cfg := *s.config
-	done := make(chan struct{})
+	handshakeDone := make(chan struct{})
 	cfg.Listeners.OnVerAck = func(*peer.Peer, *wire.MsgVerAck) {
-		select {
-		case <-done:
-		default:
-			close(done)
-		}
+		close(handshakeDone)
 	}
+	batch := make(chan *wire.MsgAddrV2, 1)
+	cfg.Listeners.OnAddrV2 = keepFirstBatch(batch)
 
 	p, err := peer.NewOutboundPeer(&cfg, addr.String())
 	if err != nil {
-		return nil, err
+		return probeResult{err: err}
 	}
-
-	if err := s.trackPeer(addr, p); err != nil {
-		return nil, err
-	}
-
-	dialer := net.Dialer{Timeout: connectionDialTimeout}
-	conn, err := dialer.DialContext(ctx, "tcp", addr.String())
-	if err != nil {
+	defer func() {
 		p.Disconnect()
-		return nil, err
-	}
+		// A concurrent Disconnect may already be closing the socket.
+		// Done confirms closure, not a join of peer-library goroutines.
+		<-p.Done()
+	}()
 
+	dialCtx, cancelDial := context.WithTimeout(ctx, connectionDialTimeout)
+	conn, err := s.dialContext(dialCtx, "tcp", addr.String())
+	cancelDial()
+	if err != nil {
+		return probeResult{err: err}
+	}
 	p.AssociateConnection(conn)
 
-	hctx, cancel := context.WithTimeoutCause(ctx, maximumHandshakeWait, errHandshakeTimeout)
-	defer cancel()
-
-	if err := waitForHandshake(hctx, p, done); err != nil {
-		p.Disconnect()
-		return nil, err
+	hctx, cancelHandshake := context.WithTimeoutCause(ctx, maximumHandshakeWait, errHandshakeTimeout)
+	err = waitForHandshake(hctx, p, handshakeDone)
+	cancelHandshake()
+	if err != nil {
+		return probeResult{err: err}
 	}
 
-	log.Debugf("Handshake completed with peer %s", p.Addr())
-	// Book here so bootstrap peers, which gossip never verifies, enter the
-	// served set. add itself drops non-default ports.
+	// Preserve readiness as soon as verification completes, independently
+	// of gossip. add enforces the default port and the served-book limit.
 	s.addrBook.add(addr)
-	return p, nil
+	p.QueueMessage(wire.NewMsgGetAddr(), nil)
+	if msg := awaitBatch(ctx, batch, p.Done()); msg != nil {
+		return probeResult{verified: true, addresses: s.filterAddresses(msg)}
+	}
+	return probeResult{verified: true}
+}
+
+// keepFirstBatch's listener runs on the peer input goroutine, so it must
+// never block; the first batch completes the probe even when it is empty.
+func keepFirstBatch(batch chan<- *wire.MsgAddrV2) func(*peer.Peer, *wire.MsgAddrV2) {
+	return func(_ *peer.Peer, msg *wire.MsgAddrV2) {
+		select {
+		case batch <- msg:
+		default:
+		}
+	}
+}
+
+// awaitBatch prefers a batch that arrived before the disconnect: a peer may
+// send its addresses and close before the wait begins.
+func awaitBatch(ctx context.Context, batch <-chan *wire.MsgAddrV2, disconnected <-chan struct{}) *wire.MsgAddrV2 {
+	select {
+	case msg := <-batch:
+		return msg
+	case <-disconnected:
+		select {
+		case msg := <-batch:
+			return msg
+		default:
+		}
+	case <-time.After(addressResponseTimeout):
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+// filterAddresses preserves the normalization and routability policy. Book
+// membership, cooldown and crawl-wide deduplication belong to the coordinator.
+func (s *seeder) filterAddresses(msg *wire.MsgAddrV2) []netip.AddrPort {
+	addresses := make([]netip.AddrPort, 0, len(msg.AddrList))
+	for _, na := range msg.AddrList {
+		addr, ok := addrPortFromNAV2(na)
+		if !ok || (!s.config.AllowSelfConns && !addrmgr.IsRoutable(na)) {
+			continue
+		}
+		addresses = append(addresses, addr)
+	}
+	return addresses
 }
 
 // waitForHandshake prefers a completed verack over a simultaneous
@@ -290,171 +281,16 @@ func waitForHandshake(ctx context.Context, p *peer.Peer, done <-chan struct{}) e
 	}
 }
 
-// trackPeer atomically refuses a duplicate connection and keeps p registered
-// until it disconnects.
-func (s *seeder) trackPeer(addr netip.AddrPort, p *peer.Peer) error {
-	s.peersMu.Lock()
-	if _, exists := s.peers[addr]; exists {
-		s.peersMu.Unlock()
-		return errRepeatConnection
-	}
-	s.peers[addr] = p
-	s.peersMu.Unlock()
-
-	go func() {
-		p.WaitForDisconnect()
-		s.peersMu.Lock()
-		defer s.peersMu.Unlock()
-		if s.peers[addr] == p {
-			delete(s.peers, addr)
-		}
-	}()
-	return nil
-}
-
 // onVersion enforces the serving policy during the handshake. Returning a
 // reject message causes the peer library to disconnect the peer before the
-// verack, so non-compliant nodes never enter the live peer set or the served
-// address book, and we never request addresses from them.
+// verack, so non-compliant nodes never enter the served address book,
+// and we never request addresses from them.
 func (s *seeder) onVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgReject {
 	if ok, reason := s.meetsMinimum(msg.ProtocolVersion, msg.Services, msg.LastBlock); !ok {
 		log.Infof("Rejecting deprecated peer %s: %s", p.Addr(), reason)
 		return wire.NewMsgReject(msg.Command(), wire.RejectObsolete, reason)
 	}
 	return nil
-}
-
-// disconnectAllPeers terminates every tracked connection.
-func (s *seeder) disconnectAllPeers() {
-	s.peersMu.Lock()
-	peers := make([]*peer.Peer, 0, len(s.peers))
-	for _, p := range s.peers {
-		peers = append(peers, p)
-	}
-	clear(s.peers)
-	s.peersMu.Unlock()
-
-	for _, p := range peers {
-		p.Disconnect()
-		p.WaitForDisconnect()
-	}
-}
-
-// livePeerSnapshot returns handshake-complete, still-connected peers.
-func (s *seeder) livePeerSnapshot() []*peer.Peer {
-	s.peersMu.Lock()
-	defer s.peersMu.Unlock()
-	out := make([]*peer.Peer, 0, len(s.peers))
-	for _, p := range s.peers {
-		if p.VerAckReceived() && p.Connected() {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// queueAddr enqueues a gossiped peer address for verification, reporting
-// whether it was accepted. Address callbacks run on the peer's input
-// goroutine, so a blocking send on a full queue would stall the peer (and
-// strand its goroutine until the next crawl drains the queue). Dropped
-// addresses are rediscovered later.
-func (s *seeder) queueAddr(addr netip.AddrPort) bool {
-	select {
-	case s.addrQueue <- addr:
-		return true
-	default:
-		return false
-	}
-}
-
-// onAddrV2 enqueues gossiped addrv2 entries for verification. Unroutable
-// addresses and unsupported address types (tor, i2p, cjdns) are skipped.
-// pearld always negotiates sendaddrv2, so addrv2 is the only gossip format
-// on the network; legacy addr messages are deliberately not handled.
-func (s *seeder) onAddrV2(p *peer.Peer, msg *wire.MsgAddrV2) {
-	if len(msg.AddrList) == 0 {
-		log.Debugf("Got empty addrv2 from peer %s, disconnecting", p.Addr())
-		p.Disconnect()
-		return
-	}
-
-	dropped := 0
-	for _, nav2 := range msg.AddrList {
-		addr, ok := addrPortFromNAV2(nav2)
-		if !ok {
-			continue
-		}
-		if !addrmgr.IsRoutable(nav2) && !s.config.AllowSelfConns {
-			continue
-		}
-		if s.addrBook.isKnown(addr) {
-			continue
-		}
-		if !s.queueAddr(addr) {
-			dropped++
-		}
-	}
-	log.Debugf("Got %d addrv2s from peer %s (%d dropped, queue full)",
-		len(msg.AddrList), p.Addr(), dropped)
-}
-
-// discoverAddresses asks live peers for addresses, verifies each new address,
-// and repeats from newly verified peers. It returns after the queue stays idle
-// for crawlerIdleTimeout or ctx expires, once in-flight verification is done.
-func (s *seeder) discoverAddresses(ctx context.Context) {
-	for _, p := range s.livePeerSnapshot() {
-		log.Debugf("Requesting addresses from peer %s", p.Addr())
-		p.QueueMessage(wire.NewMsgGetAddr(), nil)
-	}
-
-	var g errgroup.Group
-	g.SetLimit(crawlerWorkerCount)
-	defer g.Wait()
-
-	idle := time.NewTimer(crawlerIdleTimeout)
-	defer idle.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case addr := <-s.addrQueue:
-			// Re-check: multiple peers gossip the same address, and
-			// another dial may have verified it since it was queued.
-			if !s.addrBook.isKnown(addr) {
-				g.Go(func() error {
-					newPeer, err := s.connect(ctx, addr)
-					if err == nil {
-						newPeer.QueueMessage(wire.NewMsgGetAddr(), nil)
-					}
-					return nil
-				})
-			}
-			idle.Reset(crawlerIdleTimeout)
-		case <-idle.C:
-			return
-		}
-	}
-}
-
-// refreshAddresses re-verifies all known-good addresses, dialing up to
-// crawlerWorkerCount peers concurrently. Verified peers tolerate up to
-// maxFailures consecutive failures before entering cooldown (see
-// addressBook.markFailed).
-func (s *seeder) refreshAddresses(ctx context.Context) {
-	log.Debugf("Refreshing address book")
-
-	var g errgroup.Group
-	g.SetLimit(crawlerWorkerCount)
-	for _, addr := range s.addrBook.snapshot() {
-		if ctx.Err() != nil {
-			break
-		}
-		g.Go(func() error {
-			_, _ = s.connect(ctx, addr)
-			return nil
-		})
-	}
-	g.Wait()
 }
 
 // ready reports whether the seeder has at least one servable address. The
