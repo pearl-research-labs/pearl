@@ -1,4 +1,4 @@
-//! The fp8 batch driver: one proof for the whole 20-table system.
+//! The fp8 batch driver: one proof for the whole 21-table system.
 //!
 //! [`Fp8System`] is the *statement* of one job: the five compiled programs and the public
 //! recompute inputs of the class (a) columns (plane
@@ -9,10 +9,10 @@
 //!   device's LUT inventory) — profile-independent within each device, so Fiat-Shamir observes every
 //!   trace/auxiliary/quotient cap in the same order for every job (a
 //!   universal-verifier prerequisite), and CTL table indices need no renumbering.
-//!   The five main tables commit solo (one tree per table per role); the fifteen
+//!   The five main tables commit solo (one tree per table per role); the sixteen
 //!   fixed-height LUT tables are *grouped* ([`FP8_GROUPED_TABLES`]): each role commits
 //!   all of them in one shared multi-height tree, so a proof carries `5 + 1` caps per
-//!   role instead of `20`. Batched FRI still folds by height internally
+//!   role instead of `21`. Batched FRI still folds by height internally
 //!   (`starky::batch_stark` sorts the *distinct* heights for its instances; the setup
 //!   tree's flat column order stays job-independent). The verifier derives the heights
 //!   from its own class (a) recompute — never from the proof — so a prover cannot
@@ -34,7 +34,7 @@
 //! the strips, Scale from InputQuant's group tuples, device-specific Matmul from the noised
 //! codes, XorFold from the cell results and census counts, Blake3 from the strip bytes and the folded lottery words),
 //! accumulates the committed-LUT multiplicities ([`LutChecker`] — which also re-checks that
-//! every instance is served by the committed tables), assembles the fifteen LUT traces,
+//! every instance is served by the committed tables), assembles the sixteen LUT traces,
 //! observes the generated lottery digest through its `derive_statement_digest` callback
 //! (the Fiat-Shamir salt may depend on `J`), binds the returned `statement_digest`, and
 //! hands the batch to `starky::batch_prover::batch_prove`. The main tables' public
@@ -152,8 +152,8 @@ pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(13, 19)
 /// Batch indices of the *grouped* tables — the LUTs
 /// (`NUM_TABLES..NUM_ALL_TABLES`). Their heights are consensus constants, so each role
 /// (trace / auxiliary / quotient) commits all of them in one shared multi-height Merkle
-/// tree: the proof carries `3` LUT caps instead of `3 * NUM_LUT_TABLES = 45`, and the
-/// recursive verifier walks 3 shared trees per query instead of 42 solo ones.
+/// tree: the proof carries `3` LUT caps instead of `3 * NUM_LUT_TABLES`, and the
+/// recursive verifier walks the same three shared trees per query.
 pub const FP8_GROUPED_TABLES: [usize; NUM_LUT_TABLES] = {
     let mut tables = [0; NUM_LUT_TABLES];
     let mut i = 0;
@@ -423,7 +423,7 @@ pub struct Fp8System<F: RichField + Extendable<D>, const D: usize> {
     /// Class (a) columns in canonical table order. The digest slot is empty until
     /// `bind_statement_digest` fills it.
     known: BatchKnownColumns<F>,
-    /// All 21 CTL channels, table indices in canonical order.
+    /// All 23 CTL channels, table indices in canonical order.
     ctls: Vec<CrossTableLookup<F>>,
 }
 
@@ -535,7 +535,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         self.matmul.as_stark().num_columns()
     }
 
-    /// The batch positions of the fifteen device-specific LUT tables
+    /// The batch positions of the sixteen device-specific LUT tables
     /// order. The batch order is canonical, so LUT `i` sits at `NUM_TABLES + i`.
     pub fn lut_positions(&self) -> [usize; NUM_LUT_TABLES] {
         core::array::from_fn(|i| NUM_TABLES + i)
@@ -1199,8 +1199,11 @@ mod tests {
         let (helpers, zs, _) = CrossTableLookup::num_ctl_helpers_zs_all(system.ctls(), pow2g, config.num_challenges, 3);
         assert_eq!((starks[pow2g].num_columns(), helpers, zs), (12, 6, 3));
         assert_eq!(starks[pow2g].num_columns() + helpers + zs + 6, 27);
-        assert_eq!(system.ctls().len(), 21);
-        assert_eq!(starks.len(), 20);
+        let blake3 = Table::Blake3 as usize;
+        let (helpers, zs, _) = CrossTableLookup::num_ctl_helpers_zs_all(system.ctls(), blake3, config.num_challenges, 3);
+        assert_eq!((starks[blake3].num_columns(), helpers, zs), (452, 303, 24));
+        assert_eq!(system.ctls().len(), 23);
+        assert_eq!(starks.len(), 21);
     }
 
     /// The full driver roundtrip on the consistency fixture: setup-time LUT precommitment,

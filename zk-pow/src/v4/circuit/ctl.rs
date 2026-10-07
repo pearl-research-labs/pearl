@@ -4,13 +4,13 @@
 //! Each AIR declares its halves in its own `ctl` module, including [`super::luts::ctl`].
 //! LUT descriptors live with those tables and are re-exported here.
 //!
-//! The full channel set is six main channels (below) plus one channel per committed LUT
+//! The full channel set is seven main channels (below) plus one channel per committed LUT
 //! ([`lut_cross_table_lookups`]): each LUT is its own AIR of the batch, its
 //! looking side collects every instance of the five main tables' inventories, and its looked
 //! side is the LUT's slots filtered by their per-proof multiplicity columns (folded tables are
-//! multi-slot looked sides). 21 [`CrossTableLookup`]s in total.
+//! multi-slot looked sides). 23 [`CrossTableLookup`]s in total.
 //!
-//! The eight main channels are:
+//! The seven main channels are:
 //!
 //! - two Blake3 -> InputQuant channels: packed int8 pairs and BF16 block-scale codes;
 //! - InputQuant -> Matmul: packed fp8 operand-code pairs, each element paired with its
@@ -19,6 +19,7 @@
 //!   liveness dead bound/count;
 //! - Matmul -> XorFold: cell id, the final f32 result, and the cell skip census;
 //! - XorFold -> Blake3: lane id and final folded word;
+//! - Blake3 -> Blake3: chaining values, keyed by the publishing trace row;
 //!
 //! The first three channels contain disjoint A/B key spaces, so each uses one CTL with two
 //! side-specific slots; so does the sigma channel (disjoint A/B group keys).
@@ -28,7 +29,8 @@ use starky::cross_table_lookup::{CrossTableLookup, TableIdx, TableWithColumns};
 
 use super::blake3_stark::columns::NUM_BLAKE3_KNOWN_COLUMNS;
 use super::blake3_stark::ctl::{
-    blake3_lut_lookups, ctl_block_scales_looking_blake3, ctl_int8_bytes_looking_blake3, ctl_lottery_words_looking_blake3,
+    blake3_lut_lookups, ctl_block_scales_looking_blake3, ctl_cv_routing_looked_blake3, ctl_cv_routing_looking_blake3,
+    ctl_int8_bytes_looking_blake3, ctl_lottery_words_looking_blake3,
 };
 use super::input_quant_stark::columns::NUM_INPUT_QUANT_KNOWN_COLUMNS;
 use super::input_quant_stark::ctl::{
@@ -92,7 +94,7 @@ impl From<Table> for TableIdx {
 }
 
 /// Number of committed LUT tables — each its own AIR of the batch (`super::luts`).
-pub const NUM_LUT_TABLES: usize = 15;
+pub const NUM_LUT_TABLES: usize = 16;
 
 /// Selects the LUT occupying a canonical batch position for `device`.
 const fn lut_for_device(device: Device, h100: LutTable, b200: LutTable) -> LutTable {
@@ -112,6 +114,7 @@ pub const fn lut_tables(device: Device) -> [LutTable; NUM_LUT_TABLES] {
         LutTable::RneRnd,
         LutTable::Range16,
         LutTable::Bytes2,
+        LutTable::Xor8,
         LutTable::Qcast,
         LutTable::Div448,
         lut_for_device(device, LutTable::ProdAlign15, LutTable::B200Align),
@@ -129,15 +132,15 @@ pub const fn lut_tables(device: Device) -> [LutTable; NUM_LUT_TABLES] {
 
 /// Total tables of the batch: the five main tables, then the family's LUTs.
 pub const NUM_ALL_TABLES: usize = NUM_TABLES + NUM_LUT_TABLES;
-/// Six main-table channels plus one channel for each committed LUT.
-pub const NUM_CTL_CHANNELS: usize = 6 + NUM_LUT_TABLES;
+/// Seven main-table channels plus one channel for each committed LUT.
+pub const NUM_CTL_CHANNELS: usize = 7 + NUM_LUT_TABLES;
 
 /// The batch table index of the family's `i`-th LUT (LUTs follow the five main tables).
 pub const fn lut_table_idx(i: usize) -> TableIdx {
     NUM_TABLES + i
 }
 
-/// All fp8 cross-table lookups: the six main channels in the module-docs order (the
+/// All fp8 cross-table lookups: the seven main channels in the module-docs order (the
 /// InputQuant-looked channels carry the A and B slots of one channel each), then one channel
 /// per committed LUT in the selected device's committed order. No half bakes a geometry constant
 /// (InputQuant's key offsets and multiplicities are public-input terms of its CTL
@@ -167,6 +170,7 @@ pub fn all_cross_table_lookups<F: Field>(device: Device, scale: &ScaleProgram) -
         ),
         CrossTableLookup::new(vec![ctl_cell_results_looking_xor_fold()], vec![cell_results]),
         CrossTableLookup::new(ctl_lottery_words_looking_blake3(), vec![ctl_lottery_words_looked_xor_fold()]),
+        CrossTableLookup::new(vec![ctl_cv_routing_looking_blake3()], vec![ctl_cv_routing_looked_blake3()]),
     ];
     ctls.extend(lut_cross_table_lookups(
         &lut_tables(device),
@@ -240,7 +244,7 @@ mod tests {
         for device in [Device::H100, Device::B200] {
             let scale = ScaleProgram::new_for_device(4, 4, 2048, 32, device);
             let ctls = all_cross_table_lookups::<F>(device, &scale);
-            assert_eq!(ctls.len(), NUM_CTL_CHANNELS, "six main channels + one per LUT");
+            assert_eq!(ctls.len(), NUM_CTL_CHANNELS, "seven main channels + one per LUT");
         }
     }
 }

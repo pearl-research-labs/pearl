@@ -11,7 +11,7 @@
 //! - this module's channel-balance test, which checks every AIR's constraints on its own
 //!   trace, every program's `known_values` (class (a) recompute) against its trace's leading
 //!   columns, every committed-LUT instance against the committed tables
-//!   ([`LutChecker`]), and the balance of all 21 CTL channels over the full 20-table batch
+//!   ([`LutChecker`]), and the balance of all 23 CTL channels over the full 21-table batch
 //!   via starky's `check_ctls`;
 //! - the batch driver's end-to-end proof test (`super::driver`), which proves the same job
 //!   with `starky::batch_prover::batch_prove` and verifies it back.
@@ -722,7 +722,7 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
 
 /// The end-to-end consistency driver: every AIR satisfied on its own trace, class (a)
 /// recompute bit-exact with the traces, every LUT instance served by the
-/// committed oracle, and all 21 CTL channels balanced over the full 20-table batch.
+/// committed oracle, and all 23 CTL channels balanced over the full 21-table batch.
 fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     let (h, w, k) = (fx.input_quant.h, fx.input_quant.w, fx.input_quant.k);
 
@@ -854,7 +854,7 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     }
     assert_constraints!(XorFoldStark::<F, D>::new(fx.xor_fold), &fx.xf_rows, pis[4], "XorFold");
 
-    // ---- Every CTL channel balances over the full batch: the six main channels
+    // ---- Every CTL channel balances over the full batch: the seven main channels
     // and one per committed LUT. `check_ctls` reads non-binary filter values as
     // multiplicities — notably the operand channels' `w/h * IS_EVEN_ROW` looked sides and
     // the LUT channels' multiplicity columns. The LUT tables have no public inputs. ----
@@ -971,7 +971,7 @@ fn moe_tampered_offsets_root_fails_parse_and_verify() {
 /// protocol-legal all-zero-row envelope (ledger N5). The scheme floors both norms at `2^-32`,
 /// alpha stays finite, beta strictly positive, and that row's noised elements are pure noise;
 /// every AIR (InputQuant's floored witness, ScaleStark's in-circuit H0 floors, Matmul on the
-/// noise-only codes), the class (a) recompute, the LUT domains and all 21 CTL channels must
+/// noise-only codes), the class (a) recompute, the LUT domains and all 23 CTL channels must
 /// still close. Regression: the InputQuant witness used to derive alpha from the unfloored
 /// zero norms and panic.
 #[test]
