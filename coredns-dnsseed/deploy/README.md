@@ -54,7 +54,7 @@ dig @127.0.0.1 -p 1053 . A +short
 
 ### Tests
 
-Unit tests (start mock peers on localhost, including the regtest P2P port):
+Unit tests (use controlled peers on ephemeral loopback ports):
 
 ```bash
 go test -race ./coredns-dnsseed/dnsseed
@@ -69,8 +69,10 @@ readiness, health, and metrics. The same test gates the image build in
 go test -tags e2e -v -timeout 10m ./coredns-dnsseed/integration
 ```
 
-Both bind the regtest P2P port (18444), so stop any local regtest node first
-and run them as separate invocations.
+The end-to-end fixture binds the regtest P2P port (18444), so stop any local
+regtest node first. Run unit and end-to-end tests as separate invocations.
+Before merge, require the existing repository CI gates: `task fmt:go fmt:rust
+tidy`, `task build:blockchain`, and `task test:go` (which includes the race detector).
 
 ### Configuration
 
@@ -105,9 +107,21 @@ seed.example.org:1053 {
 - Probes: readinessProbe on `:8181 /ready` (true once the seeder has at least
   one verified address) and livenessProbe on `:8180 /health`.
 - Run at least 2 replicas. The address book is in-memory, so a restarted pod
-  serves nothing until it re-bootstraps and completes a crawl; readiness keeps
-  it out of the Service until then.
+  serves nothing until its first compliant default-port handshake; readiness
+  keeps it out of the Service until then, without waiting for gossip.
 - The crawler needs outbound access to the P2P port (44108 on mainnet) for
   bootstrap peers and discovered nodes; account for this in egress policies.
 - The runtime image is `scratch` (binary plus CA bundle, no shell); use
   `kubectl debug` with an ephemeral container for in-pod troubleshooting.
+
+### Rollout checks
+
+Ship through the existing seeder image pipeline. During rollout, check `/ready`,
+`coredns_dnsseed_addresses`, crawl completion logs, and process open-file-descriptor
+usage. Logs include probes started, completed verifications, new endpoints
+admitted against the 4096-per-crawl limit, dropped over-budget advertisements,
+and the outcome of each bootstrap probe.
+The 64-worker bound covers pending and open crawler connections, not DNS serving
+sockets or every descriptor in the process. A completed or canceled crawl waits
+for workers to close their sockets; the in-memory address book remains available
+for DNS responses. No new Corefile directives or persistent storage are needed.

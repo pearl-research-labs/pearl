@@ -1,8 +1,5 @@
 // This file is ignored during the regular tests due to the following build
-// tag. It is deliberately not tagged rpctest (which `task test:go` enables
-// for ./...): this test and the dnsseed package's unit tests both need the
-// regtest default P2P port, so they must never share a test invocation.
-// It runs as the image-publish gate in .github/workflows/dnsseed_image.yml:
+// tag. It runs as the image-publish gate in .github/workflows/dnsseed_image.yml:
 //
 //	go test -tags e2e -v -timeout 10m ./coredns-dnsseed/integration
 //
@@ -53,11 +50,9 @@ func TestSeederEndToEnd(t *testing.T) {
 	work := t.TempDir()
 
 	// Fail fast (not skip) when the P2P port is taken: a skip here would
-	// silently pass the deploy gate. The dnsseed unit tests bind the same
-	// port for their mock peers, so the two cannot run in one invocation.
+	// silently pass the deploy gate.
 	l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", regtestPort))
-	require.NoError(t, err,
-		"port %s busy: a stray regtest node, or the dnsseed unit tests?", regtestPort)
+	require.NoError(t, err, "port %s busy: is a stray regtest node running?", regtestPort)
 	require.NoError(t, l.Close())
 
 	pearldBin := filepath.Join(work, "pearld")
