@@ -141,18 +141,22 @@ func (c *Cache[K, V]) Put(key K, value V) (bool, error) {
 			"cache with capacity %v", vs, c.capacity)
 	}
 
-	// Load the element.
-	el, ok := c.cache.Load(key)
-
-	// Update the internal list inside a lock.
+	// Update the internal list inside a lock. The lookup of any
+	// existing element and the store of its replacement happen under
+	// the same lock hold as the list and size mutations: loading the
+	// element before acquiring the lock (and storing after releasing
+	// it) let a concurrent LoadAndDelete or Put for the same key
+	// interleave, so this Put then mutated the list and size
+	// accounting for an element that was no longer the one in the
+	// map — subtracting its size a second time, or orphaning the
+	// newer element in the list, counted but unreachable via Get.
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 
 	// If the element already exists, remove it and decrease cache's size.
-	if ok {
+	if el, ok := c.cache.Load(key); ok {
 		es, err := el.Value.value.Size()
 		if err != nil {
-			c.mtx.Unlock()
-
 			return false, fmt.Errorf("couldn't determine size of "+
 				"existing cache value %v", err)
 		}
@@ -169,13 +173,12 @@ func (c *Cache[K, V]) Put(key K, value V) (bool, error) {
 	}
 
 	// We have made enough space in the cache, so just insert it.
-	el = c.ll.PushFront(entry[K, V]{key: key, value: value})
+	el := c.ll.PushFront(entry[K, V]{key: key, value: value})
 	c.size += vs
 
-	// Release the lock.
-	c.mtx.Unlock()
-
-	// Update the cache.
+	// Update the cache while still holding the lock, so the map, the
+	// list and the size accounting change atomically with respect to
+	// every other cache operation.
 	c.cache.Store(key, el)
 
 	return evicted, nil
@@ -221,7 +224,7 @@ func (c *Cache[K, V]) LoadAndDelete(key K) (V, bool) {
 	var defaultVal V
 
 	// Noop if the element doesn't exist.
-	el, ok := c.cache.LoadAndDelete(key)
+	el, ok := c.cache.Load(key)
 	if !ok {
 		return defaultVal, false
 	}
@@ -229,7 +232,20 @@ func (c *Cache[K, V]) LoadAndDelete(key K) (V, bool) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	// Get its size.
+	// A concurrent LoadAndDelete may have removed the element while we
+	// waited for the lock. Only proceed if the map still points at the
+	// exact element we loaded; the removal below happens under the same
+	// lock, so exactly one deleter can pass this check.
+	cur, ok := c.cache.Load(key)
+	if !ok || cur != el {
+		return defaultVal, false
+	}
+
+	// Get its size. Nothing has been mutated yet, so if sizing fails
+	// the entry stays fully in the cache — still reachable by key and
+	// still counted — instead of being stranded as a ghost that is
+	// gone from the map but still occupies the list and the size
+	// accounting.
 	vs, err := el.Value.value.Size()
 	if err != nil {
 		return defaultVal, false
@@ -240,7 +256,9 @@ func (c *Cache[K, V]) LoadAndDelete(key K) (V, bool) {
 		cb(key, el.Value.value)
 	})
 
-	// Remove the element from the list and update the cache's size.
+	// Remove the element from the cache and the list, and update the
+	// cache's size.
+	c.cache.Delete(key)
 	c.ll.Remove(el)
 	c.size -= vs
 
