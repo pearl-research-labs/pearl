@@ -317,15 +317,9 @@ importers:
 
   packages/pearl-address-validation:
     dependencies:
-      base58-js:
-        specifier: ^3.0.2
-        version: 3.0.3
       bech32:
         specifier: ^2.0.0
         version: 2.0.0
-      sha256-uint8array:
-        specifier: ^0.10.3
-        version: 0.10.7
     devDependencies:
       '@arethetypeswrong/cli':
         specifier: ^0.17.3
