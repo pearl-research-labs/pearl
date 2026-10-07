@@ -907,7 +907,7 @@ func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit,
 
 	// Check for mempool acceptance.
 	r, err := mp.checkMempoolAcceptance(
-		tx, isNew, rateLimit, rejectDupOrphans,
+		tx, isNew, rateLimit, rejectDupOrphans, false,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -917,6 +917,14 @@ func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit,
 	if len(r.MissingParents) > 0 {
 		return r.MissingParents, nil, nil
 	}
+
+	// The transaction passed every acceptance check and is about to
+	// be inserted: commit the free-relay charge (if any) that
+	// validateRelayFeeMet quoted. Committing here — rather than
+	// during the fee evaluation — means transactions rejected by a
+	// later check (replacement rules, script validation) never
+	// consume the penny-flooding budget.
+	mp.chargeFreeRelay(r.freeRelayCharge)
 
 	// Now that we've deemed the transaction as valid, we can add it to the
 	// mempool. If it ended up replacing any transactions, we'll remove them
@@ -1264,6 +1272,14 @@ type MempoolAcceptResult struct {
 	// field is not nil, then other fields must be empty.
 	MissingParents []*chainhash.Hash
 
+	// freeRelayCharge is the free-relay limiter charge (in vbytes)
+	// that validateRelayFeeMet evaluated for this transaction. It is
+	// only a quote: the charge is committed by chargeFreeRelay once
+	// the transaction has passed every acceptance check and is about
+	// to be inserted, so transactions rejected by a later check never
+	// consume the penny-flooding budget.
+	freeRelayCharge int64
+
 	// utxoView is a set of the unspent transaction outputs referenced by
 	// the inputs to this transaction.
 	utxoView *blockchain.UtxoViewpoint
@@ -1286,7 +1302,17 @@ func (mp *TxPool) CheckMempoolAcceptance(tx *btcutil.Tx) (
 	// which has the effect that we always check the fee paid from this tx
 	// is greater than min relay fee. We also reject this tx if it's
 	// already an orphan.
-	result, err := mp.checkMempoolAcceptance(tx, true, true, true)
+	//
+	// This is a dry run: the transaction is never inserted, and this
+	// function holds only the read lock, so the final dryRun argument
+	// tells the free-relay rate limiter to evaluate the transaction
+	// against the current budget without quoting a charge (a charge
+	// is only ever committed on actual insertion, by
+	// maybeAcceptTransaction; quoting one here would be discarded,
+	// and committing one would consume the budget for a transaction
+	// that was never accepted and race on the limiter state under
+	// the read lock).
+	result, err := mp.checkMempoolAcceptance(tx, true, true, true, true)
 	if err != nil {
 		log.Errorf("CheckMempoolAcceptance: %v", err)
 		return nil, err
@@ -1302,7 +1328,8 @@ func (mp *TxPool) CheckMempoolAcceptance(tx *btcutil.Tx) (
 // transaction. It returns an error when the transaction fails to meet the
 // mempool policy, otherwise a `mempoolAcceptResult` is returned.
 func (mp *TxPool) checkMempoolAcceptance(tx *btcutil.Tx,
-	isNew, rateLimit, rejectDupOrphans bool) (*MempoolAcceptResult, error) {
+	isNew, rateLimit, rejectDupOrphans, dryRun bool) (
+	*MempoolAcceptResult, error) {
 
 	txHash := tx.Hash()
 
@@ -1491,9 +1518,13 @@ func (mp *TxPool) checkMempoolAcceptance(tx *btcutil.Tx,
 	}
 
 	// Don't allow transactions with fees too low to get into a mined
-	// block.
-	err = mp.validateRelayFeeMet(
+	// block. This only evaluates the free-relay limiter and quotes
+	// the charge; the charge is committed by maybeAcceptTransaction
+	// once every remaining check (replacement rules, script
+	// validation) has passed and the transaction is inserted.
+	freeRelayCharge, err := mp.validateRelayFeeMet(
 		tx, txFee, txSize, utxoView, nextBlockHeight, isNew, rateLimit,
+		dryRun,
 	)
 	if err != nil {
 		return nil, err
@@ -1522,11 +1553,12 @@ func (mp *TxPool) checkMempoolAcceptance(tx *btcutil.Tx,
 	}
 
 	result := &MempoolAcceptResult{
-		TxFee:      btcutil.Amount(txFee),
-		TxSize:     txSize,
-		Conflicts:  conflicts,
-		utxoView:   utxoView,
-		bestHeight: bestHeight,
+		TxFee:           btcutil.Amount(txFee),
+		TxSize:          txSize,
+		Conflicts:       conflicts,
+		freeRelayCharge: freeRelayCharge,
+		utxoView:        utxoView,
+		bestHeight:      bestHeight,
 	}
 
 	return result, nil
@@ -1585,31 +1617,33 @@ func (mp *TxPool) validateStandardness(tx *btcutil.Tx, nextBlockHeight int32,
 }
 
 // validateRelayFeeMet checks that the min relay fee is covered by this
-// transaction.
+// transaction. It only EVALUATES the free-relay rate limiter: it never
+// mutates the limiter state, on any path. When the transaction is
+// admitted under the free-relay budget it returns the charge (the
+// transaction's vsize) that the caller must commit with chargeFreeRelay
+// once the transaction has passed every remaining acceptance check and
+// is actually inserted. Charging here instead would burn the
+// penny-flooding budget for transactions that a later check rejects
+// (replacement rules, script validation), and a dry run
+// (CheckMempoolAcceptance) holds only the read lock and never inserts
+// at all, so it must not be charged either.
 func (mp *TxPool) validateRelayFeeMet(tx *btcutil.Tx, txFee, txSize int64,
 	utxoView *blockchain.UtxoViewpoint, nextBlockHeight int32,
-	isNew, rateLimit bool) error {
+	isNew, rateLimit, dryRun bool) (int64, error) {
 
 	txHash := tx.Hash()
 
 	// Calculate the minimum required fee for this transaction.
 	minFee := calcMinRequiredTxRelayFee(txSize, mp.cfg.Policy.MinRelayTxFee)
 
-	if txFee < minFee {
-		str := fmt.Sprintf("transaction %v has %d fees which is under "+
-			"the required amount of %d", txHash, txFee, minFee)
-
-		return txRuleError(wire.RejectInsufficientFee, str)
-	}
-
 	// Exit early if the min relay fee is met.
 	if txFee >= minFee {
-		return nil
+		return 0, nil
 	}
 
 	// Exit early if this is neither a new tx or rate limited.
 	if !isNew && !rateLimit {
-		return nil
+		return 0, nil
 	}
 
 	// We can only end up here when the rateLimit is true. Free-to-relay
@@ -1617,27 +1651,57 @@ func (mp *TxPool) validateRelayFeeMet(tx *btcutil.Tx, txFee, txSize int64,
 	// tiny transactions as a form of attack.
 	nowUnix := time.Now().Unix()
 
-	// Decay passed data with an exponentially decaying ~10 minute window -
-	// matches bitcoind handling.
-	mp.pennyTotal *= math.Pow(
+	// Decay passed data with an exponentially decaying ~10 minute
+	// window — matches bitcoind handling. The decayed total is
+	// computed in a local only: committing the decay is deferred to
+	// chargeFreeRelay along with the charge itself. That is
+	// equivalent for every later evaluation, since the decay is a
+	// pure function of the elapsed time.
+	pennyTotal := mp.pennyTotal * math.Pow(
 		1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix),
 	)
-	mp.lastPennyUnix = nowUnix
 
 	// Are we still over the limit?
-	if mp.pennyTotal >= mp.cfg.Policy.FreeTxRelayLimit*10*1000 {
+	if pennyTotal >= mp.cfg.Policy.FreeTxRelayLimit*10*1000 {
 		str := fmt.Sprintf("transaction %v has been rejected "+
 			"by the rate limiter due to low fees", txHash)
 
-		return txRuleError(wire.RejectInsufficientFee, str)
+		return 0, txRuleError(wire.RejectInsufficientFee, str)
 	}
+
+	// A dry run is admitted against the current budget but never
+	// charged: the transaction is not entering the pool.
+	if dryRun {
+		return 0, nil
+	}
+
+	// Admitted under the free-relay budget: quote the charge for the
+	// caller to commit on actual insertion.
+	return txSize, nil
+}
+
+// chargeFreeRelay commits a free-relay charge previously quoted by
+// validateRelayFeeMet: it decays the penny total to now and adds the
+// transaction's vsize. It must only be called once the transaction has
+// passed every acceptance check and is about to be inserted, so that
+// rejected transactions never consume the penny-flooding budget.
+//
+// This function MUST be called with the mempool lock held (for writes).
+func (mp *TxPool) chargeFreeRelay(txSize int64) {
+	if txSize <= 0 {
+		return
+	}
+
+	nowUnix := time.Now().Unix()
+	mp.pennyTotal = mp.pennyTotal * math.Pow(
+		1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix),
+	)
+	mp.lastPennyUnix = nowUnix
 
 	oldTotal := mp.pennyTotal
 	mp.pennyTotal += float64(txSize)
 	log.Tracef("rate limit: curTotal %v, nextTotal: %v, limit %v",
 		oldTotal, mp.pennyTotal, mp.cfg.Policy.FreeTxRelayLimit*10*1000)
-
-	return nil
 }
 
 // trimToSize evicts the lowest fee-rate transactions from the pool until
