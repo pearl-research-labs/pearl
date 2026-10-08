@@ -998,6 +998,11 @@ func forEachAccount(ns walletdb.ReadBucket, scope *KeyScope,
 		if v == nil {
 			return nil
 		}
+		if len(k) != 4 {
+			str := fmt.Sprintf("malformed account key %x "+
+				"stored in database", k)
+			return managerError(ErrDatabase, str, nil)
+		}
 		return fn(binary.LittleEndian.Uint32(k))
 	})
 }
@@ -1828,6 +1833,10 @@ func fetchAddrAccount(ns walletdb.ReadBucket, scope *KeyScope,
 	if val == nil {
 		str := "address not found"
 		return 0, managerError(ErrAddressNotFound, str, nil)
+	}
+	if len(val) < 4 {
+		str := "malformed account for address stored in database"
+		return 0, managerError(ErrDatabase, str, nil)
 	}
 	return binary.LittleEndian.Uint32(val), nil
 }
