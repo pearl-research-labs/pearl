@@ -115,18 +115,31 @@ func (o *observedTransaction) Serialize(w io.Writer) {
 	binary.Write(w, binary.BigEndian, o.mined)
 }
 
+// observedTxSerializedSize is the number of bytes Serialize writes for one
+// observedTransaction: a 32-byte hash, an 8-byte fee rate, and two 4-byte
+// heights.
+const observedTxSerializedSize = 32 + 8 + 4 + 4
+
 func deserializeObservedTransaction(r io.Reader) (*observedTransaction, error) {
 	ot := observedTransaction{}
 
 	// The first 32 bytes should be a hash.
-	binary.Read(r, binary.BigEndian, &ot.hash)
+	if err := binary.Read(r, binary.BigEndian, &ot.hash); err != nil {
+		return nil, err
+	}
 
 	// The next 8 are GrainPerByte
-	binary.Read(r, binary.BigEndian, &ot.feeRate)
+	if err := binary.Read(r, binary.BigEndian, &ot.feeRate); err != nil {
+		return nil, err
+	}
 
 	// And next there are two uint32's.
-	binary.Read(r, binary.BigEndian, &ot.observed)
-	binary.Read(r, binary.BigEndian, &ot.mined)
+	if err := binary.Read(r, binary.BigEndian, &ot.observed); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.BigEndian, &ot.mined); err != nil {
+		return nil, err
+	}
 
 	return &ot, nil
 }
@@ -590,18 +603,32 @@ func (ef *FeeEstimator) EstimateFee(numBlocks uint32) (PrlPerKilobyte, error) {
 // start fee estimation over.
 const estimateFeeSaveVersion = 1
 
-func deserializeRegisteredBlock(r io.Reader, txs map[uint32]*observedTransaction) (*registeredBlock, error) {
+func deserializeRegisteredBlock(r *bytes.Reader, txs map[uint32]*observedTransaction) (*registeredBlock, error) {
 	var lenTransactions uint32
 
 	rb := &registeredBlock{}
-	binary.Read(r, binary.BigEndian, &rb.hash)
-	binary.Read(r, binary.BigEndian, &lenTransactions)
+	if err := binary.Read(r, binary.BigEndian, &rb.hash); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.BigEndian, &lenTransactions); err != nil {
+		return nil, err
+	}
+
+	// Each transaction reference takes 4 bytes; a count larger than the
+	// data that remains cannot come from Save and must not size an
+	// allocation.
+	if uint64(lenTransactions) > uint64(r.Len())/4 {
+		return nil, fmt.Errorf("registered block claims %d transactions "+
+			"but only %d bytes remain", lenTransactions, r.Len())
+	}
 
 	rb.transactions = make([]*observedTransaction, lenTransactions)
 
 	for i := uint32(0); i < lenTransactions; i++ {
 		var index uint32
-		binary.Read(r, binary.BigEndian, &index)
+		if err := binary.Read(r, binary.BigEndian, &index); err != nil {
+			return nil, err
+		}
 		rb.transactions[i] = txs[index]
 	}
 
@@ -704,18 +731,32 @@ func RestoreFeeEstimator(data FeeEstimatorState) (*FeeEstimator, error) {
 		observed: make(map[chainhash.Hash]*observedTransaction),
 	}
 
-	// Read basic parameters.
-	binary.Read(r, binary.BigEndian, &ef.maxRollback)
-	binary.Read(r, binary.BigEndian, &ef.binSize)
-	binary.Read(r, binary.BigEndian, &ef.maxReplacements)
-	binary.Read(r, binary.BigEndian, &ef.minRegisteredBlocks)
-	binary.Read(r, binary.BigEndian, &ef.lastKnownHeight)
-	binary.Read(r, binary.BigEndian, &ef.numBlocksRegistered)
+	// Read basic parameters. Every read is checked: a saved state that
+	// ends early is corrupt, and the caller (server startup) is built to
+	// log the error and start from a fresh estimator instead.
+	for _, field := range []any{
+		&ef.maxRollback, &ef.binSize, &ef.maxReplacements,
+		&ef.minRegisteredBlocks, &ef.lastKnownHeight,
+		&ef.numBlocksRegistered,
+	} {
+		if err := binary.Read(r, binary.BigEndian, field); err != nil {
+			return nil, err
+		}
+	}
 
 	// Read transactions.
 	var numObserved uint32
 	observed := make(map[uint32]*observedTransaction)
-	binary.Read(r, binary.BigEndian, &numObserved)
+	if err := binary.Read(r, binary.BigEndian, &numObserved); err != nil {
+		return nil, err
+	}
+	// Each observed transaction takes observedTxSerializedSize bytes; a
+	// count larger than the data that remains cannot come from Save and
+	// must not drive the loop (and its map allocations) past the input.
+	if uint64(numObserved) > uint64(r.Len())/observedTxSerializedSize {
+		return nil, fmt.Errorf("state claims %d observed transactions "+
+			"but only %d bytes remain", numObserved, r.Len())
+	}
 	for i := uint32(0); i < numObserved; i++ {
 		ot, err := deserializeObservedTransaction(r)
 		if err != nil {
@@ -728,11 +769,21 @@ func RestoreFeeEstimator(data FeeEstimatorState) (*FeeEstimator, error) {
 	// Read bins.
 	for i := 0; i < estimateFeeDepth; i++ {
 		var numTransactions uint32
-		binary.Read(r, binary.BigEndian, &numTransactions)
+		if err := binary.Read(r, binary.BigEndian, &numTransactions); err != nil {
+			return nil, err
+		}
+		// Each bin entry is a 4-byte index; reject counts the remaining
+		// data cannot hold before they size an allocation.
+		if uint64(numTransactions) > uint64(r.Len())/4 {
+			return nil, fmt.Errorf("bin %d claims %d transactions but "+
+				"only %d bytes remain", i, numTransactions, r.Len())
+		}
 		bin := make([]*observedTransaction, numTransactions)
 		for j := uint32(0); j < numTransactions; j++ {
 			var index uint32
-			binary.Read(r, binary.BigEndian, &index)
+			if err := binary.Read(r, binary.BigEndian, &index); err != nil {
+				return nil, err
+			}
 
 			var exists bool
 			bin[j], exists = observed[index]
@@ -745,7 +796,15 @@ func RestoreFeeEstimator(data FeeEstimatorState) (*FeeEstimator, error) {
 
 	// Read dropped transactions.
 	var numDropped uint32
-	binary.Read(r, binary.BigEndian, &numDropped)
+	if err := binary.Read(r, binary.BigEndian, &numDropped); err != nil {
+		return nil, err
+	}
+	// A serialized dropped block takes at least a 32-byte hash and a
+	// 4-byte transaction count.
+	if uint64(numDropped) > uint64(r.Len())/36 {
+		return nil, fmt.Errorf("state claims %d dropped blocks but only "+
+			"%d bytes remain", numDropped, r.Len())
+	}
 	ef.dropped = make([]*registeredBlock, numDropped)
 	for i := uint32(0); i < numDropped; i++ {
 		var err error
