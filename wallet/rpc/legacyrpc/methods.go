@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -302,20 +303,47 @@ func getAddressesByAccount(icmd interface{}, w *wallet.Wallet) (interface{}, err
 	return addrStrs, nil
 }
 
+// checkedConfCount validates a client-supplied confirmation count
+// (minconf/maxconf) before it is narrowed from int to int32. Without
+// the check, values above math.MaxInt32 wrap — a minconf of 2**32+1
+// reaches the wallet as 1 — and the query silently runs with a
+// different confirmation threshold than the caller requested.
+func checkedConfCount(param string, count int) (int32, error) {
+	switch {
+	case count < 0:
+		if param == "minconf" {
+			return 0, ErrNeedPositiveMinconf
+		}
+		return 0, InvalidParameterError{
+			fmt.Errorf("%s must be positive", param),
+		}
+	case count > math.MaxInt32:
+		return 0, InvalidParameterError{
+			fmt.Errorf("%s exceeds the maximum supported value", param),
+		}
+	default:
+		return int32(count), nil
+	}
+}
+
 // getBalance handles a getbalance request by returning the balance for an
 // account (wallet), or an error if the requested account does not
 // exist.
 func getBalance(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.GetBalanceCmd)
 
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+
 	var balance btcutil.Amount
-	var err error
 	accountName := "*"
 	if cmd.Account != nil {
 		accountName = *cmd.Account
 	}
 	if accountName == "*" {
-		balance, err = w.CalculateBalance(int32(*cmd.MinConf))
+		balance, err = w.CalculateBalance(minConf)
 		if err != nil {
 			return nil, err
 		}
@@ -325,7 +353,7 @@ func getBalance(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		bals, err := w.CalculateAccountBalances(account, int32(*cmd.MinConf))
+		bals, err := w.CalculateAccountBalances(account, minConf)
 		if err != nil {
 			return nil, err
 		}
@@ -735,6 +763,11 @@ func getRawChangeAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error
 func getReceivedByAccount(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.GetReceivedByAccountCmd)
 
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+
 	account, err := w.AccountNumber(waddrmgr.KeyScopeBIP0086, cmd.Account)
 	if err != nil {
 		return nil, err
@@ -744,7 +777,7 @@ func getReceivedByAccount(icmd interface{}, w *wallet.Wallet) (interface{}, erro
 	// algorithm is already dominated by reading every transaction in the
 	// wallet's history.
 	results, err := w.TotalReceivedForAccounts(
-		waddrmgr.KeyScopeBIP0086, int32(*cmd.MinConf),
+		waddrmgr.KeyScopeBIP0086, minConf,
 	)
 	if err != nil {
 		return nil, err
@@ -761,11 +794,16 @@ func getReceivedByAccount(icmd interface{}, w *wallet.Wallet) (interface{}, erro
 func getReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.GetReceivedByAddressCmd)
 
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+
 	addr, err := decodeAddress(cmd.Address, w.ChainParams())
 	if err != nil {
 		return nil, err
 	}
-	total, err := w.TotalReceivedForAddr(addr, int32(*cmd.MinConf))
+	total, err := w.TotalReceivedForAddr(addr, minConf)
 	if err != nil {
 		return nil, err
 	}
@@ -1030,8 +1068,13 @@ func help(icmd interface{}, _ *wallet.Wallet, chainClient *chain.RPCClient) (int
 func listAccounts(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.ListAccountsCmd)
 
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+
 	accountBalances := map[string]float64{}
-	results, err := w.AccountBalances(waddrmgr.KeyScopeBIP0086, int32(*cmd.MinConf))
+	results, err := w.AccountBalances(waddrmgr.KeyScopeBIP0086, minConf)
 	if err != nil {
 		return nil, err
 	}
@@ -1064,8 +1107,13 @@ func listLockUnspent(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 func listReceivedByAccount(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.ListReceivedByAccountCmd)
 
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+
 	results, err := w.TotalReceivedForAccounts(
-		waddrmgr.KeyScopeBIP0086, int32(*cmd.MinConf),
+		waddrmgr.KeyScopeBIP0086, minConf,
 	)
 	if err != nil {
 		return nil, err
@@ -1099,6 +1147,11 @@ func listReceivedByAccount(icmd interface{}, w *wallet.Wallet) (interface{}, err
 func listReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.ListReceivedByAddressCmd)
 
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+
 	// Intermediate data for each address.
 	type AddrData struct {
 		// Total amount received.
@@ -1126,12 +1179,11 @@ func listReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, err
 		allAddrData[address] = AddrData{}
 	}
 
-	minConf := *cmd.MinConf
 	var endHeight int32
 	if minConf == 0 {
 		endHeight = -1
 	} else {
-		endHeight = syncBlock.Height - int32(minConf) + 1
+		endHeight = syncBlock.Height - minConf + 1
 	}
 	err = wallet.UnstableAPI(w).RangeTransactions(0, endHeight, func(details []wtxmgr.TxDetails) (bool, error) {
 		confirmations := confirms(details[0].Block.Height, syncBlock.Height)
@@ -1307,7 +1359,16 @@ func listUnspent(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		}
 	}
 
-	return w.ListUnspent(int32(*cmd.MinConf), int32(*cmd.MaxConf), "")
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+	maxConf, err := checkedConfCount("maxconf", *cmd.MaxConf)
+	if err != nil {
+		return nil, err
+	}
+
+	return w.ListUnspent(minConf, maxConf, "")
 }
 
 // lockUnspent handles the lockunspent command.
@@ -1426,6 +1487,11 @@ func sendFrom(icmd interface{}, w *wallet.Wallet, chainClient *chain.RPCClient) 
 		}
 	}
 
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+
 	account, err := w.AccountNumber(
 		waddrmgr.KeyScopeBIP0086, cmd.FromAccount,
 	)
@@ -1436,10 +1502,6 @@ func sendFrom(icmd interface{}, w *wallet.Wallet, chainClient *chain.RPCClient) 
 	// Check that signed integer parameters are positive.
 	if cmd.Amount < 0 {
 		return nil, ErrNeedPositiveAmount
-	}
-	minConf := int32(*cmd.MinConf)
-	if minConf < 0 {
-		return nil, ErrNeedPositiveMinconf
 	}
 	amt, err := btcutil.NewAmount(cmd.Amount)
 	if err != nil {
@@ -1476,15 +1538,14 @@ func sendMany(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		}
 	}
 
-	account, err := w.AccountNumber(waddrmgr.KeyScopeBIP0086, cmd.FromAccount)
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check that minconf is positive.
-	minConf := int32(*cmd.MinConf)
-	if minConf < 0 {
-		return nil, ErrNeedPositiveMinconf
+	account, err := w.AccountNumber(waddrmgr.KeyScopeBIP0086, cmd.FromAccount)
+	if err != nil {
+		return nil, err
 	}
 
 	// Recreate address/amount pairs, using dcrutil.Amount.
