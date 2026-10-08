@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"math/rand"
 	"net"
@@ -851,6 +852,16 @@ func handleEstimateFee(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
 	if c.NumBlocks <= 0 {
 		return nil, btcjson.NewRPCError(btcjson.ErrRPCInvalidParameter,
 			"Parameter NumBlocks must be positive")
+	}
+
+	// The count arrives as an int64 but the estimator takes a uint32.
+	// Reject anything that does not fit instead of letting the cast
+	// wrap it: 2^32+1 would otherwise silently return a one-block
+	// estimate. In-range counts are still left for the estimator to
+	// judge against its own depth limit.
+	if c.NumBlocks > math.MaxUint32 {
+		return nil, btcjson.NewRPCError(btcjson.ErrRPCInvalidParameter,
+			"Parameter NumBlocks is out of range")
 	}
 
 	feeRate, err := s.cfg.FeeEstimator.EstimateFee(uint32(c.NumBlocks))
