@@ -112,7 +112,13 @@ func crawlIP(s *dnsseeder, r *result) ([]*wire.NetAddress, *crawlError) {
 			errors.New("no verack received within 30s")}
 	}
 
-	if len(s.theList) > s.maxSize {
+	// theList is mutated under s.mtx by processResult/auditNodes on the
+	// seeder goroutine; reading it here without the lock races with those
+	// writes (and can fatal with concurrent map read/write).
+	s.mtx.RLock()
+	full := len(s.theList) > s.maxSize
+	s.mtx.RUnlock()
+	if full {
 		p.Disconnect()
 		p.WaitForDisconnect()
 		return nil, nil

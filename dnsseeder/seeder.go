@@ -177,8 +177,12 @@ func (s *dnsseeder) runSeeder(done <-chan struct{}, wg *sync.WaitGroup) {
 // goroutines if there are spare goroutine slots available
 func (s *dnsseeder) startCrawlers(resultsChan chan *result) {
 
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
+	// This must be the write lock, not RLock: the scan below mutates
+	// nd.crawlActive and nd.crawlStart, and RLock does not exclude other
+	// RLock holders — the HTTP status handlers read those same fields
+	// under RLock, so the two raced.
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 
 	tcount := uint32(len(s.theList))
 	if tcount == 0 {
@@ -223,7 +227,7 @@ func (s *dnsseeder) startCrawlers(resultsChan chan *result) {
 	// for other work
 	go updateNodeCounts(s, tcount, started, totals)
 
-	// returns and read lock released
+	// returns and write lock released
 }
 
 // processResult will add new nodes to the list and update the status of the crawled node
