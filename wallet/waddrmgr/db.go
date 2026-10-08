@@ -413,6 +413,10 @@ func fetchManagerVersion(ns walletdb.ReadBucket) (uint32, error) {
 		str := "required version number not stored in database"
 		return 0, managerError(ErrDatabase, str, nil)
 	}
+	if len(verBytes) != 4 {
+		str := "malformed version number stored in database"
+		return 0, managerError(ErrDatabase, str, nil)
+	}
 	version := binary.LittleEndian.Uint32(verBytes)
 	return version, nil
 }
@@ -2409,8 +2413,10 @@ func fetchBirthdayBlockVerification(ns walletdb.ReadBucket) bool {
 	verifiedValue := bucket.Get(birthdayBlockVerifiedName)
 
 	// If there is no verification status, we can assume it has not been
-	// verified yet.
-	if verifiedValue == nil {
+	// verified yet. A stored value that is too short to hold the uint16
+	// written by putBirthdayBlockVerification is malformed; fail safe
+	// the same way rather than panicking or claiming verification.
+	if len(verifiedValue) != 2 {
 		return false
 	}
 
