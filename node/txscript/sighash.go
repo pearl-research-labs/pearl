@@ -58,7 +58,7 @@ func calcWitnessSignatureHashRaw(subScript []byte, sigHashes *TxSigHashes,
 	// is valid.
 	//
 	// TODO(roasbeef): check needs to be lifted elsewhere?
-	if idx > len(tx.TxIn)-1 {
+	if idx < 0 || idx > len(tx.TxIn)-1 {
 		return nil, fmt.Errorf("idx %d but %d txins", idx, len(tx.TxIn))
 	}
 
@@ -305,7 +305,7 @@ func calcTaprootSignatureHashRaw(sigHashes *TxSigHashes, hType SigHashType,
 
 	// As a sanity check, ensure the passed input index for the transaction
 	// is valid.
-	if idx > len(tx.TxIn)-1 {
+	if idx < 0 || idx > len(tx.TxIn)-1 {
 		return nil, fmt.Errorf("idx %d but %d txins", idx, len(tx.TxIn))
 	}
 
