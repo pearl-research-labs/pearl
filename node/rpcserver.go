@@ -3987,6 +3987,16 @@ func handleGetTxSpendingPrevOut(s *rpcServer, cmd interface{},
 	// Convert the outpoints.
 	ops := make([]wire.OutPoint, 0, len(c.Outputs))
 	for _, o := range c.Outputs {
+		// A JSON null array element unmarshals to a nil output;
+		// reject it instead of dereferencing it below.
+		if o == nil {
+			return nil, &btcjson.RPCError{
+				Code: btcjson.ErrRPCInvalidParameter,
+				Message: "Invalid output, expected an object " +
+					"with txid and vout",
+			}
+		}
+
 		hash, err := chainhash.NewHashFromStr(o.Txid)
 		if err != nil {
 			return nil, err
