@@ -1193,7 +1193,7 @@ func (a *AddrManager) GetBestLocalAddress(remoteAddr *wire.NetAddressV2) *wire.N
 				ip = net.IPv4zero
 			}
 		}
-		services := wire.SFNodeNetwork | wire.SFNodeWitness | wire.SFNodeBloom
+		services := wire.SFNodeNetwork | wire.SFNodeWitness
 		bestAddress = wire.NetAddressV2FromBytes(
 			time.Now(), services, ip, 0,
 		)

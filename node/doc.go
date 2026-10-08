@@ -88,7 +88,6 @@ Application Options:
 	                            --connect or --proxy options are used without
 	                            also specifying listen interfaces via --listen
 	    --noonion               Disable connecting to tor hidden services
-	    --nopeerbloomfilters    Disable bloom filtering support
 	    --norelaypriority       Do not require free or low-fee transactions to
 	                            have high priority for relaying
 	    --norpc                 Disable built-in RPC server -- NOTE: The RPC

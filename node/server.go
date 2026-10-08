@@ -27,7 +27,6 @@ import (
 	"github.com/pearl-research-labs/pearl/node/blockchain"
 	"github.com/pearl-research-labs/pearl/node/blockchain/indexers"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
-	"github.com/pearl-research-labs/pearl/node/btcutil/bloom"
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/connmgr"
@@ -47,7 +46,7 @@ const (
 	// defaultServices describes the default services that are supported by
 	// the server.
 	defaultServices = wire.SFNodeNetwork | wire.SFNodeNetworkLimited |
-		wire.SFNodeBloom | wire.SFNodeWitness | wire.SFNodeCF | wire.SFNodeP2PV2
+		wire.SFNodeWitness | wire.SFNodeCF | wire.SFNodeP2PV2
 
 	// defaultRequiredServices describes the default services that are
 	// required to be supported by outbound peers.
@@ -328,7 +327,6 @@ type serverPeer struct {
 	disableRelayTx bool
 	sentAddrs      bool
 	isWhitelisted  bool
-	filter         *bloom.Filter
 	addressesMtx   sync.RWMutex
 	knownAddresses lru.Cache
 	banScore       connmgr.DynamicBanScore
@@ -357,7 +355,6 @@ func newServerPeer(s *server, isPersistent bool) *serverPeer {
 	return &serverPeer{
 		server:         s,
 		persistent:     isPersistent,
-		filter:         bloom.LoadFilter(nil),
 		knownAddresses: lru.NewCache(5000),
 		quit:           make(chan struct{}),
 		verAckCh:       make(chan struct{}),
@@ -577,8 +574,6 @@ func (sp *serverPeer) OnVersion(_ *peer.Peer, msg *wire.MsgVersion) *wire.MsgRej
 	// the local clock to keep the network time in sync.
 	sp.server.timeSource.AddTimeSample(sp.Addr(), msg.Timestamp)
 
-	// Choose whether or not to relay transactions before a filter command
-	// is received.
 	sp.setDisableRelayTx(msg.DisableRelayTx)
 
 	return nil
@@ -594,54 +589,12 @@ func (sp *serverPeer) OnVerAck(_ *peer.Peer, _ *wire.MsgVerAck) {
 	})
 }
 
-// OnMemPool is invoked when a peer receives a mempool wire message.
-// It creates and sends an inventory message with the contents of the memory
-// pool up to the maximum inventory allowed per message.  When the peer has a
-// bloom filter loaded, the contents are filtered accordingly.
+// OnMemPool is invoked when a peer receives a mempool wire message.  The node
+// does not serve BIP0035 mempool requests, so the peer is disconnected.
 func (sp *serverPeer) OnMemPool(_ *peer.Peer, msg *wire.MsgMemPool) {
-	// Only allow mempool requests if the server has bloom filtering
-	// enabled.
-	if sp.server.services&wire.SFNodeBloom != wire.SFNodeBloom {
-		peerLog.Debugf("peer %v sent mempool request with bloom "+
-			"filtering disabled -- disconnecting", sp)
-		sp.Disconnect()
-		return
-	}
-
-	// A decaying ban score increase is applied to prevent flooding.
-	// The ban score accumulates and passes the ban threshold if a burst of
-	// mempool messages comes from a peer. The score decays each minute to
-	// half of its value.
-	if sp.addBanScore(0, 33, "mempool") {
-		return
-	}
-
-	// Generate inventory message with the available transactions in the
-	// transaction memory pool.  Limit it to the max allowed inventory
-	// per message.  The NewMsgInvSizeHint function automatically limits
-	// the passed hint to the maximum allowed, so it's safe to pass it
-	// without double checking it here.
-	txMemPool := sp.server.txMemPool
-	txDescs := txMemPool.TxDescs()
-	invMsg := wire.NewMsgInvSizeHint(uint(len(txDescs)))
-
-	for _, txDesc := range txDescs {
-		// Either add all transactions when there is no bloom filter,
-		// or only the transactions that match the filter when there is
-		// one.
-		if !sp.filter.IsLoaded() || sp.filter.MatchTxAndUpdate(txDesc.Tx) {
-			iv := wire.NewInvVect(wire.InvTypeTx, txDesc.Tx.Hash())
-			invMsg.AddInvVect(iv)
-			if len(invMsg.InvList)+1 > wire.MaxInvPerMsg {
-				break
-			}
-		}
-	}
-
-	// Send the inventory message if there is anything to send.
-	if len(invMsg.InvList) > 0 {
-		sp.QueueMessage(invMsg, nil)
-	}
+	peerLog.Debugf("peer %v sent an unsupported mempool request -- "+
+		"disconnecting", sp)
+	sp.Disconnect()
 }
 
 // OnTx is invoked when a peer receives a tx wire message.  It blocks
@@ -897,30 +850,14 @@ func (sp *serverPeer) OnGetData(_ *peer.Peer, msg *wire.MsgGetData) {
 func (s *server) pushInventory(sp *serverPeer, iv *wire.InvVect,
 	doneChan chan<- struct{}) error {
 
+	// Every peer on this network decodes witness data, so base and witness
+	// inv types are answered with the same serialization.
 	switch iv.Type {
-	case wire.InvTypeWitnessTx:
-		return s.pushTxMsg(sp, &iv.Hash, doneChan, wire.WitnessEncoding)
+	case wire.InvTypeTx, wire.InvTypeWitnessTx:
+		return s.pushTxMsg(sp, &iv.Hash, doneChan)
 
-	case wire.InvTypeTx:
-		return s.pushTxMsg(sp, &iv.Hash, doneChan, wire.BaseEncoding)
-
-	case wire.InvTypeWitnessBlock:
-		return s.pushBlockMsg(
-			sp, &iv.Hash, doneChan, wire.WitnessEncoding,
-		)
-
-	case wire.InvTypeBlock:
-		return s.pushBlockMsg(sp, &iv.Hash, doneChan, wire.BaseEncoding)
-
-	case wire.InvTypeFilteredWitnessBlock:
-		return s.pushMerkleBlockMsg(
-			sp, &iv.Hash, doneChan, wire.WitnessEncoding,
-		)
-
-	case wire.InvTypeFilteredBlock:
-		return s.pushMerkleBlockMsg(
-			sp, &iv.Hash, doneChan, wire.BaseEncoding,
-		)
+	case wire.InvTypeBlock, wire.InvTypeWitnessBlock:
+		return s.pushBlockMsg(sp, &iv.Hash, doneChan)
 
 	default:
 		peerLog.Warnf("Unknown type in inventory request %d", iv.Type)
@@ -1321,36 +1258,16 @@ func (sp *serverPeer) OnGetCFCheckpt(_ *peer.Peer, msg *wire.MsgGetCFCheckpt) {
 	sp.QueueMessage(checkptMsg, nil)
 }
 
-// enforceNodeBloomFlag disconnects the peer if the server is not configured to
-// allow bloom filters.  Additionally, if the peer has negotiated to a protocol
-// version  that is high enough to observe the bloom filter service support bit,
-// it will be banned since it is intentionally violating the protocol.
-func (sp *serverPeer) enforceNodeBloomFlag(cmd string) bool {
-	if sp.server.services&wire.SFNodeBloom != wire.SFNodeBloom {
-		// Ban the peer if the protocol version is high enough that the
-		// peer is knowingly violating the protocol and banning is
-		// enabled.
-		//
-		// NOTE: Even though the addBanScore function already examines
-		// whether or not banning is enabled, it is checked here as well
-		// to ensure the violation is logged and the peer is
-		// disconnected regardless.
-		if !cfg.DisableBanning {
-			// Disconnect the peer regardless of whether it was
-			// banned.
-			sp.addBanScore(100, 0, cmd)
-			sp.Disconnect()
-			return false
-		}
+// rejectBloomFilterMsg disconnects a peer that sent a BIP0037 filter message
+// and bans it unless banning is disabled or the peer is whitelisted.  The node
+// never advertises SFNodeBloom, so such a peer is violating BIP0111.
+func (sp *serverPeer) rejectBloomFilterMsg(cmd string) {
+	peerLog.Debugf("%s sent an unsupported %s request -- disconnecting",
+		sp, cmd)
 
-		// Disconnect the peer regardless of banning state.
-		peerLog.Debugf("%s sent an unsupported %s request -- "+
-			"disconnecting", sp, cmd)
-		sp.Disconnect()
-		return false
-	}
-
-	return true
+	// Must exceed defaultBanThreshold; addBanScore bans only above it.
+	sp.addBanScore(101, 0, cmd)
+	sp.Disconnect()
 }
 
 // OnFeeFilter is invoked when a peer receives a feefilter wire message and
@@ -1369,63 +1286,22 @@ func (sp *serverPeer) OnFeeFilter(_ *peer.Peer, msg *wire.MsgFeeFilter) {
 	atomic.StoreInt64(&sp.feeFilter, msg.MinFee)
 }
 
-// OnFilterAdd is invoked when a peer receives a filteradd wire
-// message and is used by remote peers to add data to an already loaded bloom
-// filter.  The peer will be disconnected if a filter is not loaded when this
-// message is received or the server is not configured to allow bloom filters.
+// OnFilterAdd is invoked when a peer receives a filteradd wire message.  The
+// peer is rejected as described by rejectBloomFilterMsg.
 func (sp *serverPeer) OnFilterAdd(_ *peer.Peer, msg *wire.MsgFilterAdd) {
-	// Disconnect and/or ban depending on the node bloom services flag and
-	// negotiated protocol version.
-	if !sp.enforceNodeBloomFlag(msg.Command()) {
-		return
-	}
-
-	if !sp.filter.IsLoaded() {
-		peerLog.Debugf("%s sent a filteradd request with no filter "+
-			"loaded -- disconnecting", sp)
-		sp.Disconnect()
-		return
-	}
-
-	sp.filter.Add(msg.Data)
+	sp.rejectBloomFilterMsg(msg.Command())
 }
 
-// OnFilterClear is invoked when a peer receives a filterclear wire
-// message and is used by remote peers to clear an already loaded bloom filter.
-// The peer will be disconnected if a filter is not loaded when this message is
-// received  or the server is not configured to allow bloom filters.
+// OnFilterClear is invoked when a peer receives a filterclear wire message.
+// The peer is rejected as described by rejectBloomFilterMsg.
 func (sp *serverPeer) OnFilterClear(_ *peer.Peer, msg *wire.MsgFilterClear) {
-	// Disconnect and/or ban depending on the node bloom services flag and
-	// negotiated protocol version.
-	if !sp.enforceNodeBloomFlag(msg.Command()) {
-		return
-	}
-
-	if !sp.filter.IsLoaded() {
-		peerLog.Debugf("%s sent a filterclear request with no "+
-			"filter loaded -- disconnecting", sp)
-		sp.Disconnect()
-		return
-	}
-
-	sp.filter.Unload()
+	sp.rejectBloomFilterMsg(msg.Command())
 }
 
-// OnFilterLoad is invoked when a peer receives a filterload wire
-// message and it used to load a bloom filter that should be used for
-// delivering merkle blocks and associated transactions that match the filter.
-// The peer will be disconnected if the server is not configured to allow bloom
-// filters.
+// OnFilterLoad is invoked when a peer receives a filterload wire message.  The
+// peer is rejected as described by rejectBloomFilterMsg.
 func (sp *serverPeer) OnFilterLoad(_ *peer.Peer, msg *wire.MsgFilterLoad) {
-	// Disconnect and/or ban depending on the node bloom services flag and
-	// negotiated protocol version.
-	if !sp.enforceNodeBloomFlag(msg.Command()) {
-		return
-	}
-
-	sp.setDisableRelayTx(false)
-
-	sp.filter.Reload(msg)
+	sp.rejectBloomFilterMsg(msg.Command())
 }
 
 // OnGetAddr is invoked when a peer receives a getaddr wire message
@@ -1689,7 +1565,7 @@ func (s *server) TransactionConfirmed(tx *btcutil.Tx) {
 // pushTxMsg sends a tx message for the provided transaction hash to the
 // connected peer.  An error is returned if the transaction hash is not known.
 func (s *server) pushTxMsg(sp *serverPeer, hash *chainhash.Hash,
-	doneChan chan<- struct{}, encoding wire.MessageEncoding) error {
+	doneChan chan<- struct{}) error {
 
 	// Attempt to fetch the requested transaction from the pool.  A
 	// call could be made to check for existence first, but simply trying
@@ -1705,7 +1581,7 @@ func (s *server) pushTxMsg(sp *serverPeer, hash *chainhash.Hash,
 		return err
 	}
 
-	sp.QueueMessageWithEncoding(tx.MsgTx(), doneChan, encoding)
+	sp.QueueMessage(tx.MsgTx(), doneChan)
 
 	return nil
 }
@@ -1713,7 +1589,7 @@ func (s *server) pushTxMsg(sp *serverPeer, hash *chainhash.Hash,
 // pushBlockMsg sends a block message for the provided block hash to the
 // connected peer.  An error is returned if the block hash is not known.
 func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash,
-	doneChan chan<- struct{}, encoding wire.MessageEncoding) error {
+	doneChan chan<- struct{}) error {
 
 	// Fetch the raw block bytes from the database.
 	var blockBytes []byte
@@ -1753,7 +1629,7 @@ func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash,
 	if !sendInv {
 		dc = doneChan
 	}
-	sp.QueueMessageWithEncoding(&msgBlock, dc, encoding)
+	sp.QueueMessage(&msgBlock, dc)
 
 	// When the peer requests the final block that was advertised in
 	// response to a getblocks message which requested more blocks than
@@ -1768,62 +1644,6 @@ func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash,
 		sp.QueueMessage(invMsg, doneChan)
 		sp.continueHash = nil
 	}
-	return nil
-}
-
-// pushMerkleBlockMsg sends a merkleblock message for the provided block hash to
-// the connected peer.  Since a merkle block requires the peer to have a filter
-// loaded, this call will simply be ignored if there is no filter loaded.  An
-// error is returned if the block hash is not known.
-func (s *server) pushMerkleBlockMsg(sp *serverPeer, hash *chainhash.Hash,
-	doneChan chan<- struct{}, encoding wire.MessageEncoding) error {
-
-	// Do not send a response if the peer doesn't have a filter loaded.
-	if !sp.filter.IsLoaded() {
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-		return nil
-	}
-
-	// Fetch the raw block bytes from the database.
-	blk, err := sp.server.chain.BlockByHash(hash)
-	if err != nil {
-		peerLog.Tracef("Unable to fetch requested block hash %v: %v",
-			hash, err)
-
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-		return err
-	}
-
-	// Generate a merkle block by filtering the requested block according
-	// to the filter for the peer.
-	merkle, matchedTxIndices := bloom.NewMerkleBlock(blk, sp.filter)
-
-	// Send the merkleblock.  Only send the done channel with this message
-	// if no transactions will be sent afterwards.
-	var dc chan<- struct{}
-	if len(matchedTxIndices) == 0 {
-		dc = doneChan
-	}
-	sp.QueueMessage(merkle, dc)
-
-	// Finally, send any matched transactions.
-	blkTransactions := blk.MsgBlock().Transactions
-	for i, txIndex := range matchedTxIndices {
-		// Only send the done channel on the final transaction.
-		var dc chan<- struct{}
-		if i == len(matchedTxIndices)-1 {
-			dc = doneChan
-		}
-		if txIndex < uint32(len(blkTransactions)) {
-			sp.QueueMessageWithEncoding(blkTransactions[txIndex], dc,
-				encoding)
-		}
-	}
-
 	return nil
 }
 
@@ -2072,14 +1892,6 @@ func (s *server) handleRelayInvMsg(state *peerState, msg relayMsg) {
 			feeFilter := atomic.LoadInt64(&sp.feeFilter)
 			if feeFilter > 0 && txD.FeePerKB < feeFilter {
 				return
-			}
-
-			// Don't relay the transaction if there is a bloom
-			// filter loaded and the transaction doesn't match it.
-			if sp.filter.IsLoaded() {
-				if !sp.filter.MatchTxAndUpdate(txD.Tx) {
-					return
-				}
 			}
 		}
 
@@ -2931,9 +2743,6 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	interrupt <-chan struct{}) (*server, error) {
 
 	services := defaultServices
-	if cfg.NoPeerBloomFilters {
-		services &^= wire.SFNodeBloom
-	}
 	if cfg.NoCFilters {
 		services &^= wire.SFNodeCF
 	}

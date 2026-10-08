@@ -142,7 +142,7 @@ type config struct {
 	DisableDNSSeed           bool          `long:"nodnsseed" description:"Disable DNS seeding for peers"`
 	DisableListen            bool          `long:"nolisten" description:"Disable listening for incoming connections -- NOTE: Listening is automatically disabled if the --connect or --proxy options are used without also specifying listen interfaces via --listen"`
 	NoOnion                  bool          `long:"noonion" description:"Disable connecting to tor hidden services"`
-	NoPeerBloomFilters       bool          `long:"nopeerbloomfilters" description:"Disable bloom filtering support"`
+	NoPeerBloomFilters       bool          `long:"nopeerbloomfilters" hidden:"true" description:"Deprecated: bloom filtering is no longer supported, so this option has no effect"`
 	NoRelayPriority          bool          `long:"norelaypriority" description:"Do not require free or low-fee transactions to have high priority for relaying"`
 	NoWinService             bool          `long:"nowinservice" description:"Do not start as a background service on Windows -- NOTE: This flag only works on the command line, not in the config file"`
 	DisableRPC               bool          `long:"norpc" description:"Disable built-in RPC server -- NOTE: The RPC server is disabled by default if no rpcuser/rpcpass or rpclimituser/rpclimitpass is specified"`
@@ -1159,6 +1159,10 @@ func loadConfig() (*config, []string, error) {
 	// options.  Note this should go directly before the return.
 	if configFileError != nil {
 		prldLog.Warnf("%v", configFileError)
+	}
+	if cfg.NoPeerBloomFilters {
+		prldLog.Warnf("The nopeerbloomfilters option is deprecated and " +
+			"has no effect: bloom filtering is no longer supported")
 	}
 
 	return &cfg, remainingArgs, nil
