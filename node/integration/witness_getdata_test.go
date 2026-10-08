@@ -64,6 +64,39 @@ func connectRawPeer(t *testing.T, nodeAddr string, cfg peer.Config) *peer.Peer {
 	return p
 }
 
+// startHarness starts a simnet node with the given extra arguments and tears
+// it down on test cleanup.
+func startHarness(t *testing.T, extraArgs []string) *rpctest.Harness {
+	t.Helper()
+
+	h, err := rpctest.New(&chaincfg.SimNetParams, nil, extraArgs, "")
+	require.NoError(t, err)
+	require.NoError(t, h.SetUp(false, 0))
+	t.Cleanup(func() { require.NoError(t, h.TearDown()) })
+	return h
+}
+
+// requireRegistered fails the test unless the node lists p as a connected
+// peer.
+func requireRegistered(t *testing.T, h *rpctest.Harness, p *peer.Peer) {
+	t.Helper()
+
+	local := p.LocalAddr().String()
+	require.Eventually(t, func() bool {
+		peers, err := h.Client.GetPeerInfo()
+		if err != nil {
+			return false
+		}
+		for _, info := range peers {
+			if info.Addr == local {
+				return true
+			}
+		}
+		return false
+	}, rawPeerTimeout, 50*time.Millisecond, "node did not register the peer")
+	require.True(t, p.Connected())
+}
+
 // receive returns the next value on ch or fails the test after rawPeerTimeout.
 func receive[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
@@ -91,10 +124,7 @@ func requestInv(t *testing.T, p *peer.Peer, invType wire.InvType, hash *chainhas
 // registers peers configured like the DNS seeders and the wallet's pruned-block
 // dispatcher, neither of which advertises SFNodeWitness.
 func TestPeersWithoutWitnessServiceConnect(t *testing.T) {
-	h, err := rpctest.New(&chaincfg.SimNetParams, nil, nil, "")
-	require.NoError(t, err)
-	require.NoError(t, h.SetUp(false, 0))
-	t.Cleanup(func() { require.NoError(t, h.TearDown()) })
+	h := startHarness(t, nil)
 
 	tests := []struct {
 		name string
@@ -108,21 +138,7 @@ func TestPeersWithoutWitnessServiceConnect(t *testing.T) {
 			p := connectRawPeer(t, h.P2PAddress(), tt.cfg)
 			require.True(t, p.Services().HasFlag(wire.SFNodeWitness),
 				"node must keep advertising witness support")
-
-			local := p.LocalAddr().String()
-			require.Eventually(t, func() bool {
-				peers, err := h.Client.GetPeerInfo()
-				if err != nil {
-					return false
-				}
-				for _, info := range peers {
-					if info.Addr == local {
-						return true
-					}
-				}
-				return false
-			}, rawPeerTimeout, 50*time.Millisecond, "node did not register the peer")
-			require.True(t, p.Connected())
+			requireRegistered(t, h, p)
 		})
 	}
 }

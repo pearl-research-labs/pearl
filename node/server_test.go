@@ -15,6 +15,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/internal/inbound"
 	"github.com/pearl-research-labs/pearl/node/peer"
+	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -217,6 +218,73 @@ func TestInboundPeerAdmissionSourceLimits(t *testing.T) {
 			assert.Equal(t, 1, v2Rejections, "the v2 source rate must reject a peer")
 		})
 	}
+}
+
+// TestBloomFilterMessagesRejected verifies that each BIP0037 filter message disconnects the peer and bans it unless
+// banning is disabled or the peer is whitelisted.
+func TestBloomFilterMessagesRejected(t *testing.T) {
+	originalCfg := cfg
+	t.Cleanup(func() { cfg = originalCfg })
+
+	messages := []struct {
+		name string
+		send func(sp *serverPeer)
+	}{
+		{"filterload", func(sp *serverPeer) {
+			sp.OnFilterLoad(nil, wire.NewMsgFilterLoad([]byte{0x01}, 1, 0, wire.BloomUpdateNone))
+		}},
+		{"filteradd", func(sp *serverPeer) { sp.OnFilterAdd(nil, wire.NewMsgFilterAdd([]byte{0x01})) }},
+		{"filterclear", func(sp *serverPeer) { sp.OnFilterClear(nil, wire.NewMsgFilterClear()) }},
+	}
+	modes := []struct {
+		name           string
+		disableBanning bool
+		whitelisted    bool
+		wantBan        bool
+	}{
+		{name: "banning enabled", wantBan: true},
+		{name: "banning disabled", disableBanning: true},
+		{name: "whitelisted peer", whitelisted: true},
+	}
+
+	for _, msg := range messages {
+		for _, mode := range modes {
+			t.Run(msg.name+"/"+mode.name, func(t *testing.T) {
+				cfg = &config{BanThreshold: defaultBanThreshold, DisableBanning: mode.disableBanning}
+				s := &server{banPeers: make(chan *serverPeer, 1)}
+				sp := newServerPeer(s, false)
+				sp.Peer = peer.NewInboundPeer(&peer.Config{ChainParams: &chaincfg.SimNetParams})
+				sp.isWhitelisted = mode.whitelisted
+
+				msg.send(sp)
+
+				requireClosed(t, sp.Done(), "peer must be disconnected")
+				select {
+				case banned := <-s.banPeers:
+					require.True(t, mode.wantBan, "peer must not be banned")
+					assert.Same(t, sp, banned)
+				default:
+					require.False(t, mode.wantBan, "peer must be banned")
+				}
+			})
+		}
+	}
+}
+
+// TestMemPoolRequestDisconnects verifies that a BIP0035 mempool request disconnects the peer without banning it.
+func TestMemPoolRequestDisconnects(t *testing.T) {
+	originalCfg := cfg
+	t.Cleanup(func() { cfg = originalCfg })
+	cfg = &config{BanThreshold: defaultBanThreshold}
+
+	s := &server{banPeers: make(chan *serverPeer, 1)}
+	sp := newServerPeer(s, false)
+	sp.Peer = peer.NewInboundPeer(&peer.Config{ChainParams: &chaincfg.SimNetParams})
+
+	sp.OnMemPool(nil, wire.NewMsgMemPool())
+
+	requireClosed(t, sp.Done(), "peer must be disconnected")
+	assert.Empty(t, s.banPeers, "peer must not be banned")
 }
 
 // TestPeerLifecycleOrdering verifies that verack before disconnect yields peerAdd followed by peerDone, never the

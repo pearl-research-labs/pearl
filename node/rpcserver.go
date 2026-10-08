@@ -2382,9 +2382,6 @@ func handleGetNetTotals(s *rpcServer, cmd interface{}, closeChan <-chan struct{}
 
 func getLocalServices() wire.ServiceFlag {
 	services := defaultServices
-	if cfg.NoPeerBloomFilters {
-		services &^= wire.SFNodeBloom
-	}
 	if cfg.NoCFilters {
 		services &^= wire.SFNodeCF
 	}
