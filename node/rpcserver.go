@@ -1046,8 +1046,20 @@ func getDifficultyRatio(bits uint32, params *chaincfg.Params) float64 {
 }
 
 // handleGetBlock implements the getblock command.
+// getBlockVerbosity resolves the effective getblock verbosity. An
+// explicit JSON null leaves c.Verbosity nil — btcjson only fills the
+// jsonrpcdefault for omitted parameters — and nil means the documented
+// default, 1.
+func getBlockVerbosity(c *btcjson.GetBlockCmd) int {
+	if c.Verbosity == nil {
+		return 1
+	}
+	return *c.Verbosity
+}
+
 func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	c := cmd.(*btcjson.GetBlockCmd)
+	verbosity := getBlockVerbosity(c)
 
 	// Load the raw block bytes from the database.
 	hash, err := chainhash.NewHashFromStr(c.Hash)
@@ -1078,7 +1090,7 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 	}
 
 	// If verbosity is 0, return the serialized block as a hex encoded string.
-	if c.Verbosity != nil && *c.Verbosity == 0 {
+	if verbosity == 0 {
 		return hex.EncodeToString(blkBytes), nil
 	}
 
@@ -1122,7 +1134,7 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 		ProofCommitment: blockHeader.ProofCommitment.String(),
 	}
 
-	if *c.Verbosity == 1 {
+	if verbosity == 1 {
 		transactions := blk.Transactions()
 		txNames := make([]string, len(transactions))
 		for i, tx := range transactions {
