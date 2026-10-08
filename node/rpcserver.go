@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"math/rand"
 	"net"
@@ -1296,6 +1297,18 @@ func handleGetBlockCount(s *rpcServer, cmd interface{}, closeChan <-chan struct{
 // handleGetBlockHash implements the getblockhash command.
 func handleGetBlockHash(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	c := cmd.(*btcjson.GetBlockHashCmd)
+
+	// The height arrives as an int64 but the chain API takes an int32.
+	// Reject anything outside the int32 range instead of letting the
+	// cast wrap it: 2^32 would otherwise silently return the genesis
+	// hash, and -2^32 would too.
+	if c.Index < 0 || c.Index > math.MaxInt32 {
+		return nil, &btcjson.RPCError{
+			Code:    btcjson.ErrRPCOutOfRange,
+			Message: "Block number out of range",
+		}
+	}
+
 	hash, err := s.cfg.Chain.BlockHashByHeight(int32(c.Index))
 	if err != nil {
 		return nil, &btcjson.RPCError{
