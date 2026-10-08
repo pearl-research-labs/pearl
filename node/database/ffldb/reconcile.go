@@ -31,6 +31,15 @@ func serializeWriteRow(curBlockFileNum, curFileOffset uint32) []byte {
 // deserializeWriteRow deserializes the write cursor location stored in the
 // metadata.  Returns ErrCorruption if the checksum of the entry doesn't match.
 func deserializeWriteRow(writeRow []byte) (uint32, uint32, error) {
+	// Ensure the row is long enough to hold the file number, offset, and
+	// checksum before slicing it below.  A shorter row is corrupt
+	// metadata, not a reason to panic while opening the database.
+	if len(writeRow) < 12 {
+		str := fmt.Sprintf("metadata for write cursor is too short - "+
+			"got %d bytes, want 12", len(writeRow))
+		return 0, 0, makeDbErr(database.ErrCorruption, str, nil)
+	}
+
 	// Ensure the checksum matches.  The checksum is at the end.
 	gotChecksum := crc32.Checksum(writeRow[:8], castagnoli)
 	wantChecksumBytes := writeRow[8:12]

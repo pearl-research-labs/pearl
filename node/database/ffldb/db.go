@@ -1105,6 +1105,11 @@ func (tx *transaction) deleteKey(key []byte, notifyIterators bool) {
 func (tx *transaction) nextBucketID() ([4]byte, error) {
 	// Load the currently highest used bucket ID.
 	curIDBytes := tx.fetchKey(curBucketIDKeyName)
+	if len(curIDBytes) != 4 {
+		str := fmt.Sprintf("corrupt current bucket ID in metadata - "+
+			"got %d bytes, want 4", len(curIDBytes))
+		return [4]byte{}, makeDbErr(database.ErrCorruption, str, nil)
+	}
 	curBucketNum := binary.BigEndian.Uint32(curIDBytes)
 
 	// Increment and update the current bucket ID and return it.
