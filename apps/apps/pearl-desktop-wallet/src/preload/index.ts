@@ -38,6 +38,9 @@ const walletIpc: Ipc<WalletApi> = {
   listRecentTransactions: count => ipcRenderer.invoke('wallet-list-recent-transactions', count),
   getBalance: (account, minconf) => ipcRenderer.invoke('wallet-get-balance', account, minconf),
   validateAddress: address => ipcRenderer.invoke('wallet-validate-address', address),
+  signMessage: (address, message) => ipcRenderer.invoke('wallet-sign-message', address, message),
+  verifyMessage: (address, signature, message) =>
+    ipcRenderer.invoke('wallet-verify-message', address, signature, message),
   estimateFee: numBlocks => ipcRenderer.invoke('wallet-estimate-fee', numBlocks),
 };
 

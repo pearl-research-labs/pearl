@@ -57,6 +57,10 @@ interface WalletApi {
 
   validateAddress: (address: string) => Promise<{ isValid: boolean }>;
 
+  signMessage: (address: string, message: string) => Promise<string>;
+
+  verifyMessage: (address: string, signature: string, message: string) => Promise<boolean>;
+
   estimateFee: (numBlocks: number) => Promise<number>;
 }
 
