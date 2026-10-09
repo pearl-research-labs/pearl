@@ -35,6 +35,12 @@ function registerWalletIpc(ms: ManagerService) {
   ipcMain.handle('wallet-validate-address', (_event, address: string) =>
     ms.ensureWalletService().validateAddress(address)
   );
+  ipcMain.handle('wallet-sign-message', (_event, address: string, message: string) =>
+    ms.ensureWalletService().signMessage(address, message)
+  );
+  ipcMain.handle('wallet-verify-message', (_event, address: string, signature: string, message: string) =>
+    ms.ensureWalletService().verifyMessage(address, signature, message)
+  );
   ipcMain.handle('wallet-get-new-address', _event => ms.ensureWalletService().getNewAddress());
   ipcMain.handle('wallet-estimate-fee', (_event, numBlocks: number) =>
     BlockbookClient.estimateFee(numBlocks)
