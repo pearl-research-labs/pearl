@@ -26,11 +26,12 @@ export default function SignMessage() {
     setSuccess(null);
   };
 
-  // A signature shown next to edited inputs would no longer match them.
+  // A signature or verify result shown next to edited inputs would no longer match them.
   const edit = (set: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     set(e.target.value);
     if (mode === 'sign') setSignature('');
     setSuccess(null);
+    setError(null);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -147,7 +148,7 @@ export default function SignMessage() {
                 <div className="relative">
                   <textarea
                     value={signature}
-                    onChange={e => setSignature(e.target.value)}
+                    onChange={edit(setSignature)}
                     readOnly={mode === 'sign'}
                     rows={3}
                     className={`${inputClasses} break-all pr-12 font-mono text-sm`}
