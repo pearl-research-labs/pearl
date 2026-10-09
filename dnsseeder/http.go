@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 	"html"
+	"html/template"
 	"log"
 	"net/http"
-	"text/template"
 	"time"
 )
 
@@ -186,8 +186,11 @@ func statusNGHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type webstatus struct {
-	Key    string
-	Value  string
+	Key string
+	// Value carries the summary cell's intentional <b> markup, so it is
+	// template.HTML; generateWebStatus escapes every dynamic string it
+	// interpolates (above all the peer-controlled UserAgent) first.
+	Value  template.HTML
 	Seeder string
 }
 
@@ -277,24 +280,24 @@ func generateWebStatus(s *dnsseeder, status uint32) (ws []webstatus) {
 		case statusRG:
 			valueStr = fmt.Sprintf("<b>Fail Count:</b> %v <b>DNS Type:</b> %s",
 				v.connectFails,
-				v.dns2str())
+				html.EscapeString(v.dns2str()))
 		case statusCG:
 			valueStr = fmt.Sprintf("<b>Remote Version:</b> %v%s <b>Last Block:</b> %v <b>DNS Type:</b> %s",
 				v.version,
-				v.strVersion,
+				html.EscapeString(v.strVersion),
 				v.lastBlock,
-				v.dns2str())
+				html.EscapeString(v.dns2str()))
 
 		case statusWG:
 			valueStr = fmt.Sprintf("<b>Last Try:</b> %s ago <b>Last Status:</b> %s\n",
 				time.Since(v.lastTry).String(),
-				v.statusStr)
+				html.EscapeString(v.statusStr))
 
 		case statusNG:
 			valueStr = fmt.Sprintf("<b>Fail Count:</b> %v <b>Last Try:</b> %s ago <b>Last Status:</b> %s\n",
 				v.connectFails,
 				time.Since(v.lastTry).String(),
-				v.statusStr)
+				html.EscapeString(v.statusStr))
 
 		default:
 			valueStr = ""
@@ -302,7 +305,7 @@ func generateWebStatus(s *dnsseeder, status uint32) (ws []webstatus) {
 
 		ows := webstatus{
 			Key:    k,
-			Value:  valueStr,
+			Value:  template.HTML(valueStr),
 			Seeder: s.name,
 		}
 		ws = append(ws, ows)
