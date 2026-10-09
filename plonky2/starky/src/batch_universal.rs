@@ -961,6 +961,9 @@ where
                         builder.mul_add(jm, boundary_x[s], acc)
                     });
 
+                // Σ_j α^j f_j(x) depends on the oracle slice, not the opening point.
+                let mut reduced_evals_by_range = HashMap::new();
+
                 // Merged combine numerators:
                 //   num(term) = Σ_runs α^{offset}·(Σ_j α^j ev_j − Σ_j α^j op_j).
                 let term_numerators: Vec<ExtensionTarget<D>> = terms
@@ -969,13 +972,14 @@ where
                         let mut acc = zero_ext;
                         for &r in &term.run_indices {
                             let run = &runs[r];
-                            let evals: Vec<Target> = (run.poly_start..run.poly_start + run.len)
-                                .map(|p| {
-                                    round.initial_trees_proof.evals_proofs[run.oracle_index].0[p]
-                                })
-                                .collect();
+                            let key = (run.oracle_index, run.poly_start, run.len);
                             let reduced_evals =
-                                ReducingFactorTarget::new(fri_alpha).reduce_base(&evals, builder);
+                                *reduced_evals_by_range.entry(key).or_insert_with(|| {
+                                    let evals = &round.initial_trees_proof.evals_proofs
+                                        [run.oracle_index]
+                                        .0[run.poly_start..run.poly_start + run.len];
+                                    ReducingFactorTarget::new(fri_alpha).reduce_base(evals, builder)
+                                });
                             let diff = builder.sub_extension(reduced_evals, reduced_openings[r]);
                             acc = builder.mul_add_extension(alpha_pows[r], diff, acc);
                         }

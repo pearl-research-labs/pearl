@@ -24,6 +24,9 @@ use crate::v4::api::public_params::Device;
 /// Use v2's recursion config with additional routed wires in FP8's second stage.
 pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
     let mut config = v2_build_recursion_config(rate_bits, pow_bits, stage, is_zk);
+    if stage == 1 {
+        config.num_routed_wires = 48;
+    }
     if stage == 2 {
         config.num_routed_wires = 40;
     }
