@@ -9,14 +9,15 @@
 //!   device's LUT inventory) — profile-independent within each device, so Fiat-Shamir observes every
 //!   trace/auxiliary/quotient cap in the same order for every job (a
 //!   universal-verifier prerequisite), and CTL table indices need no renumbering.
-//!   The five main tables commit solo (one tree per table per role); the sixteen
-//!   fixed-height LUT tables are *grouped* ([`FP8_GROUPED_TABLES`]): each role commits
-//!   all of them in one shared multi-height tree, so a proof carries `5 + 1` caps per
-//!   role instead of `21`. Batched FRI still folds by height internally
-//!   (`starky::batch_stark` sorts the *distinct* heights for its instances; the setup
-//!   tree's flat column order stays job-independent). The verifier derives the heights
-//!   from its own class (a) recompute — never from the proof — so a prover cannot
-//!   influence the layout;
+//!   Each role (trace / auxiliary / quotient) commits all 21 tables in one *merged*
+//!   multi-height tree (`merged = true`): every table enters as a per-row digest
+//!   at its runtime height, in table-index order at ties — so a proof
+//!   carries one cap per role instead of `21`, and the universal verifier walks one
+//!   conditional path per role per query. Batched FRI still folds by height
+//!   internally (`starky::batch_stark` sorts the *distinct* heights for its
+//!   instances; the setup tree's flat column order stays job-independent). The
+//!   verifier derives the heights from its own class (a) recompute — never from the
+//!   proof — so a prover cannot influence the layout;
 //! - the consensus [`StarkConfig`], whose fixed FRI reduction schedule is the consensus
 //!   ladder over every *reachable* table height — a job folds the ladder suffix from its
 //!   tallest table, so schedules agree across jobs ([`fp8_stark_config`]);
@@ -150,10 +151,10 @@ pub const FP8_REACHABLE_DEGREE_BITS: [usize; 17] = [22, 21, 20, 19, 18, 17, 16, 
 pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(13, 19), (14, 22), (5, 10), (13, 22), (8, 11)];
 
 /// Batch indices of the *grouped* tables — the LUTs
-/// (`NUM_TABLES..NUM_ALL_TABLES`). Their heights are consensus constants, so each role
-/// (trace / auxiliary / quotient) commits all of them in one shared multi-height Merkle
-/// tree: the proof carries `3` LUT caps instead of `3 * NUM_LUT_TABLES`, and the
-/// recursive verifier walks the same three shared trees per query.
+/// (`NUM_TABLES..NUM_ALL_TABLES`). Their heights are consensus constants. Each
+/// online table enters the merged tree as a row digest at its height; the proof
+/// carries one cap per role, and the
+/// recursive verifier walks one tree per role per query.
 pub const FP8_GROUPED_TABLES: [usize; NUM_LUT_TABLES] = {
     let mut tables = [0; NUM_LUT_TABLES];
     let mut i = 0;
@@ -812,6 +813,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             &self.batch_public_inputs(&generated),
             &self.ctls,
             &FP8_GROUPED_TABLES,
+            true,
             Some(preprocessed),
             Some(&self.known),
             timing,
@@ -863,6 +865,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             proof,
             &self.ctls,
             &FP8_GROUPED_TABLES,
+            true,
             Some(&self.preprocessed_verifier_data::<C>(lut_cap)),
             Some(&self.known),
             &Default::default(),
@@ -1017,6 +1020,64 @@ mod tests {
         fp8_stark_config(&FP8_REACHABLE_DEGREE_BITS)
             .check_config::<F, D>()
             .expect("consensus FRI parameters must meet the security target");
+    }
+
+    /// Construct the full consensus envelope, including independent main tables
+    /// whose maximum degrees coincide. No geometry-specific circuit is selected.
+    #[test]
+    fn universal_envelopes_build_for_both_devices() {
+        use hashbrown::HashMap;
+        use plonky2::plonk::circuit_builder::CircuitBuilder;
+        use starky::batch_recursive_verifier::BatchKnownColumnsTarget;
+        use starky::batch_universal::verify_universal_batch_stark_proof_circuit;
+
+        for device in [Device::H100, Device::B200] {
+            let (header, mut plain) = fixture_job();
+            plain.job.common.device = device;
+            let system = build_system(&build_fixture_from_job(header, plain));
+            let config = fp8_stark_config(&FP8_REACHABLE_DEGREE_BITS);
+            let envelope = fp8_universal_envelope(device);
+            let mut builder = CircuitBuilder::<F, D>::new(super::super::circuit_utils::build_recursion_config(3, 18, 1, false));
+            // Only the cap shape matters when constructing the verifier gates.
+            let cap = MerkleCap(vec![HashOut::ZERO; 1 << config.fri_config.cap_height]);
+            let prep = system.preprocessed_verifier_data::<C>(&cap).constant_target(&mut builder);
+            let columns = &system.known().columns_per_table;
+            let known = BatchKnownColumnsTarget {
+                digest: Some(builder.add_virtual_hash()),
+                columns_per_table: columns.clone(),
+                evals_at_zeta: columns
+                    .iter()
+                    .map(|c| builder.add_virtual_extension_targets(c.len()))
+                    .collect(),
+                evals_at_g_zeta: columns
+                    .iter()
+                    .map(|c| builder.add_virtual_extension_targets(c.len()))
+                    .collect(),
+            };
+            let target = verify_universal_batch_stark_proof_circuit::<F, C, D, NUM_ALL_TABLES>(
+                &mut builder,
+                &system.batch_starks(),
+                &config,
+                &envelope,
+                system.ctls(),
+                Some(&prep),
+                Some(&known),
+                &HashMap::new(),
+            )
+            .expect("one consensus circuit must support the entire device envelope");
+            let proof = &target.proof_with_pis.proof;
+            assert_eq!(proof.trace_caps.len(), 1);
+            assert_eq!(proof.auxiliary_polys_caps.as_ref().unwrap().len(), 1);
+            assert_eq!(proof.quotient_polys_caps.as_ref().unwrap().len(), 1);
+            for (t, flags) in target.degree_flags.iter().enumerate() {
+                let (lo, hi) = envelope.degree_ranges[t];
+                assert_eq!(
+                    flags.len(),
+                    envelope.ladder.iter().filter(|&&d| (lo..=hi).contains(&d)).count()
+                );
+            }
+            println!("{device:?} consensus verifier: {} gates before padding", builder.num_gates());
+        }
     }
 
     /// [`FP8_REACHABLE_DEGREE_BITS`] is exactly the envelope's reach: sweep every lottery

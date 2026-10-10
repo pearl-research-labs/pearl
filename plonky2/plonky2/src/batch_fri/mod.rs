@@ -33,13 +33,14 @@ use crate::hash::hash_types::RichField;
 ///
 ///   `E_i(X) = Σ_runs alpha^offset(run) · Σ_j alpha^j · (f_run,j(X) − f_run,j(z_run)) / (X − z_run)`
 ///
-/// Exponents are assigned *canonically*: runs are enumerated
-/// `(oracle_index, poly_start, batch)`-ascending and offsets accumulate run
-/// lengths in that order, so every claim gets a distinct power and a claim's
-/// power depends only on which claims are opened — not on how the instances
-/// group by degree. Prover and verifiers (native and recursive) must use the
-/// same assignment; a universal recursive verifier additionally relies on it
-/// being independent of the tables' degree profile.
+/// Exponents are assigned *canonically*: a claim's power is its rank in the
+/// `(oracle_index, batch, polynomial_index)` lexicographic order over all
+/// opened claims. Any partition of the claims into contiguous same-batch runs
+/// occupies contiguous rank segments (two runs of one `(oracle, batch)` have
+/// disjoint polynomial ranges), so the assignment is independent of how the
+/// instances group by degree — and of how finely the runs split. Prover and
+/// verifiers (native and recursive) must use the same assignment; a universal
+/// recursive verifier additionally relies on this profile-independence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlphaRun {
     /// Index of the run's instance (degree group).
@@ -121,10 +122,10 @@ fn alpha_runs(instances: Vec<Vec<&[FriPolynomialInfo]>>) -> Vec<AlphaRun> {
             }
         }
     }
-    // Canonical exponent assignment: enumerate runs by claim identity,
+    // Canonical exponent assignment: enumerate runs in claim-rank order,
     // accumulating lengths; runs stay (instance, batch, flat_start)-ascending.
     let mut order: Vec<usize> = (0..runs.len()).collect();
-    order.sort_by_key(|&r| (runs[r].oracle_index, runs[r].poly_start, runs[r].batch));
+    order.sort_by_key(|&r| (runs[r].oracle_index, runs[r].batch, runs[r].poly_start));
     let mut acc = 0;
     for &r in &order {
         runs[r].alpha_offset = acc;

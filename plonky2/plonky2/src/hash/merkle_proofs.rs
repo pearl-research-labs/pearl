@@ -69,7 +69,9 @@ pub fn verify_merkle_proof_to_cap<F: RichField, H: Hasher<F>>(
 }
 
 /// Verifies that the given leaf data is present at the given index in the Field Merkle tree with the
-/// given cap.
+/// given cap. Groups sharing a height are chained in order, as in [`BatchMerkleTree::new`].
+///
+/// [`BatchMerkleTree::new`]: crate::hash::batch_merkle_tree::BatchMerkleTree::new
 pub fn verify_batch_merkle_proof_to_cap<F: RichField, H: Hasher<F>>(
     leaf_data: &[Vec<F>],
     leaf_heights: &[usize],
@@ -81,7 +83,19 @@ pub fn verify_batch_merkle_proof_to_cap<F: RichField, H: Hasher<F>>(
     let mut current_digest = H::hash_or_noop(&leaf_data[0]);
     let mut current_height = leaf_heights[0];
     let mut leaf_data_index = 1;
-    for &sibling_digest in &proof.siblings {
+    let mut siblings = proof.siblings.iter();
+    loop {
+        while leaf_data_index < leaf_heights.len()
+            && current_height == leaf_heights[leaf_data_index]
+        {
+            let mut new_leaves = current_digest.to_vec();
+            new_leaves.extend_from_slice(&leaf_data[leaf_data_index]);
+            current_digest = H::hash_or_noop(&new_leaves);
+            leaf_data_index += 1;
+        }
+        let Some(&sibling_digest) = siblings.next() else {
+            break;
+        };
         let bit = leaf_index & 1;
         leaf_index >>= 1;
         current_digest = if bit == 1 {
@@ -90,13 +104,6 @@ pub fn verify_batch_merkle_proof_to_cap<F: RichField, H: Hasher<F>>(
             H::two_to_one(current_digest, sibling_digest)
         };
         current_height -= 1;
-
-        if leaf_data_index < leaf_heights.len() && current_height == leaf_heights[leaf_data_index] {
-            let mut new_leaves = current_digest.to_vec();
-            new_leaves.extend_from_slice(&leaf_data[leaf_data_index]);
-            current_digest = H::hash_or_noop(&new_leaves);
-            leaf_data_index += 1;
-        }
     }
     assert_eq!(leaf_data_index, leaf_data.len());
     ensure!(
@@ -165,8 +172,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     /// separate parameter rather than being contained in `leaf_index_bits`.
     ///
     /// `leaf_data[i]` is the leaf group residing at height `leaf_heights[i]`; groups must be
-    /// sorted by height, from tallest to shortest, with no duplicates, and `leaf_heights[0]`
-    /// must equal `proof.siblings.len() + cap_height`.
+    /// sorted by height, from tallest to shortest (groups sharing a height are chained in
+    /// order), and `leaf_heights[0]` must equal `proof.siblings.len() + cap_height`.
     pub fn verify_batch_merkle_proof_to_cap_with_cap_index<H: AlgebraicHasher<F>>(
         &mut self,
         leaf_data: &[Vec<Target>],
@@ -192,7 +199,21 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         let mut current_height = leaf_heights[0];
         let mut leaf_data_index = 1;
-        for (&bit, &sibling) in leaf_index_bits.iter().zip(&proof.siblings) {
+        let mut bits = leaf_index_bits.iter();
+        let mut siblings = proof.siblings.iter();
+        loop {
+            while leaf_data_index < leaf_heights.len()
+                && current_height == leaf_heights[leaf_data_index]
+            {
+                let mut new_leaves = state.elements.to_vec();
+                new_leaves.extend_from_slice(&leaf_data[leaf_data_index]);
+                state = self.hash_or_noop::<H>(new_leaves);
+
+                leaf_data_index += 1;
+            }
+            let (Some(&bit), Some(&sibling)) = (bits.next(), siblings.next()) else {
+                break;
+            };
             debug_assert_eq!(sibling.elements.len(), NUM_HASH_OUT_ELTS);
 
             let mut perm_inputs = H::AlgebraicPermutation::default();
@@ -208,16 +229,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 elements: hash_outs,
             };
             current_height -= 1;
-
-            if leaf_data_index < leaf_heights.len()
-                && current_height == leaf_heights[leaf_data_index]
-            {
-                let mut new_leaves = state.elements.to_vec();
-                new_leaves.extend_from_slice(&leaf_data[leaf_data_index]);
-                state = self.hash_or_noop::<H>(new_leaves);
-
-                leaf_data_index += 1;
-            }
         }
         // Every leaf group must have been injected exactly once (`leaf_heights` consistent
         // with the walk's span); a miss would leave a group unbound by the cap.

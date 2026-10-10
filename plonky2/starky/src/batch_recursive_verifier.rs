@@ -25,7 +25,7 @@ use crate::batch_proof::{
     BatchStarkProofWithPublicInputsTarget,
 };
 use crate::batch_prover::BatchStarkPreprocessedVerifierData;
-use crate::batch_stark::{BatchOracle, BatchStark, BatchStarkLayout};
+use crate::batch_stark::{BatchOracle, BatchRole, BatchStark, BatchStarkLayout};
 use crate::config::StarkConfig;
 use crate::cross_table_lookup::{
     verify_cross_table_lookups_circuit, CrossTableLookup, CtlCheckVarsTarget,
@@ -156,8 +156,9 @@ impl<const D: usize> BatchKnownColumnsTarget<D> {
 /// Adds a new [`BatchStarkProofWithPublicInputsTarget`] to this circuit.
 /// `degree_bits` are the per-table trace degrees (table-index order),
 /// `prep_columns` the per-table preprocessed column indices (pass all-empty
-/// when the batch has no preprocessed data) and `grouped_tables` the tables
-/// sharing one oracle per role (pass `&[]` for all-solo).
+/// when the batch has no preprocessed data), `grouped_tables` the tables
+/// sharing one oracle per role (pass `&[]` for all-solo) and `merged`
+/// whether each role commits one merged oracle.
 pub fn add_virtual_batch_stark_proof_with_pis<F, const D: usize, const N: usize>(
     builder: &mut CircuitBuilder<F, D>,
     starks: &[&dyn BatchStark<F, D>; N],
@@ -166,6 +167,7 @@ pub fn add_virtual_batch_stark_proof_with_pis<F, const D: usize, const N: usize>
     prep_columns: &[Vec<usize>],
     cross_table_lookups: &[CrossTableLookup<F>],
     grouped_tables: &[usize],
+    merged: bool,
 ) -> Result<BatchStarkProofWithPublicInputsTarget<D>>
 where
     F: RichField + Extendable<D>,
@@ -178,6 +180,7 @@ where
         prep_columns,
         cross_table_lookups,
         grouped_tables,
+        merged,
     )?;
     let public_inputs = starks
         .iter()
@@ -198,6 +201,7 @@ pub fn add_virtual_batch_stark_proof<F, const D: usize, const N: usize>(
     prep_columns: &[Vec<usize>],
     cross_table_lookups: &[CrossTableLookup<F>],
     grouped_tables: &[usize],
+    merged: bool,
 ) -> Result<BatchStarkProofTarget<D>>
 where
     F: RichField + Extendable<D>,
@@ -209,6 +213,7 @@ where
         prep_columns,
         cross_table_lookups,
         grouped_tables,
+        merged,
     )?;
     let fri_params = config.fri_params(layout.distinct_degree_bits[0]);
     let cap_height = fri_params.config.cap_height;
@@ -218,17 +223,23 @@ where
     let mut quotient_polys_caps: Option<Vec<MerkleCapTarget>> = None;
     for &oracle in &layout.oracles {
         match oracle {
-            BatchOracle::Trace(_) | BatchOracle::GroupedTrace => {
+            BatchOracle::Trace(_)
+            | BatchOracle::GroupedTrace
+            | BatchOracle::Merged(BatchRole::Trace) => {
                 trace_caps.push(builder.add_virtual_cap(cap_height))
             }
             // The preprocessed cap is a setup-time constant, not part of the proof.
             BatchOracle::Preprocessed => {}
-            BatchOracle::Auxiliary(_) | BatchOracle::GroupedAuxiliary => {
+            BatchOracle::Auxiliary(_)
+            | BatchOracle::GroupedAuxiliary
+            | BatchOracle::Merged(BatchRole::Auxiliary) => {
                 auxiliary_polys_caps
                     .get_or_insert_with(Vec::new)
                     .push(builder.add_virtual_cap(cap_height));
             }
-            BatchOracle::Quotient(_) | BatchOracle::GroupedQuotient => {
+            BatchOracle::Quotient(_)
+            | BatchOracle::GroupedQuotient
+            | BatchOracle::Merged(BatchRole::Quotient) => {
                 quotient_polys_caps
                     .get_or_insert_with(Vec::new)
                     .push(builder.add_virtual_cap(cap_height));
@@ -282,7 +293,9 @@ where
 /// associated with any table.
 ///
 /// `grouped_tables` must equal the list given to the prover (see
-/// [`batch_prove`][crate::batch_prover::batch_prove]).
+/// [`batch_prove`][crate::batch_prover::batch_prove]). Merged-mode proofs are
+/// not supported here; the universal verifier
+/// ([`crate::batch_universal`]) is their recursive verifier.
 ///
 /// Returns `zeta` so the caller can bind the known-column evaluations to it
 /// (and/or connect it to a public input).
@@ -325,6 +338,7 @@ where
         prep_columns,
         cross_table_lookups,
         grouped_tables,
+        false,
     )?;
 
     let has_aux = (0..N).any(|t| layout.num_aux_polys(t) > 0);
@@ -341,6 +355,9 @@ where
             BatchOracle::Preprocessed => has_prep = true,
             BatchOracle::Auxiliary(_) | BatchOracle::GroupedAuxiliary => n_aux += 1,
             BatchOracle::Quotient(_) | BatchOracle::GroupedQuotient => n_quot += 1,
+            BatchOracle::Merged(_) => {
+                bail!("merged-mode proofs are verified by the universal verifier")
+            }
         }
     }
     ensure!(proof.trace_caps.len() == n_trace);
@@ -603,6 +620,9 @@ where
                         .clone(),
                 );
                 quot_i += 1;
+            }
+            BatchOracle::Merged(_) => {
+                unreachable!("merged-mode proofs are verified by the universal verifier")
             }
         }
     }

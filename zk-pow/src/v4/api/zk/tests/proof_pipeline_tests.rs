@@ -352,13 +352,17 @@ fn medium_wrapped_roundtrip() {
 
     let prover = Fp8Prover::setup_with_timing(plain.job.common.device, &mut timing).expect("prover setup");
     let setup = prover.setups.get(&plain.job.common.device).expect("setup was prebuilt");
+    let start = std::time::Instant::now();
     let (public, _job, proof) =
         prove_wrapped_statement(setup, &header, &plain, &mut timing).expect("medium wrapped proving must succeed");
+    println!("proving took {:?}", std::time::Instant::now() - start);
     let verifier = Fp8Verifier {
         circuit: setup.circuits.verifier_data(),
         constants_sigmas_polynomials: setup.circuits.constants_sigmas_polynomials(),
     };
+    let start = std::time::Instant::now();
     verify_fp8_block_wrapped(&public, &header, &proof, &verifier, None).expect("honest medium wrapped proof must verify");
+    println!("verifying took {:?}", std::time::Instant::now() - start);
 }
 
 /// The MoE wire-level round trip and rejection surface.

@@ -19,6 +19,12 @@
 //! order within each role, then the role's grouped cap. FRI is unchanged:
 //! one instance per distinct degree, covering every table of that degree
 //! from its oracles.
+//!
+//! In *merged* mode ([`BatchStarkLayout::new`] with `merged = true`), each
+//! role instead commits a single multi-height tree holding every table:
+//! each table enters as a per-row digest matrix (leaf `H(row)`)
+//! injected at its runtime height in table-index order. One Merkle path per
+//! FRI query per role replaces one per oracle. Fiat-Shamir observes one cap per role.
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
@@ -254,7 +260,7 @@ where
 /// Preprocessed columns are committed once at setup time in a *single*
 /// multi-height oracle for the same reason.
 ///
-/// Every multi-height oracle (grouped or preprocessed) orders its
+/// Grouped and preprocessed oracles order their
 /// polynomials by descending trace degree, ties by table index; same-degree
 /// tables share a Merkle leaf.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -275,6 +281,9 @@ pub(crate) enum BatchOracle {
     Quotient(usize),
     /// The quotient polynomials of all grouped tables, in one oracle.
     GroupedQuotient,
+    /// Merged mode: all tables' polynomials of one role, in one oracle.
+    /// Flat order: all tables in table-index order, independent of height.
+    Merged(BatchRole),
 }
 
 /// A polynomial role within the batch: the per-table polynomial families
@@ -309,8 +318,10 @@ pub(crate) struct BatchStarkLayout {
     /// quotient oracles likewise.
     pub oracles: Vec<BatchOracle>,
     /// The tables sharing one multi-height oracle per role, sorted by table
-    /// index (possibly empty). All other tables are *solo*.
+    /// index (possibly empty). In merged mode all online tables share one tree.
     pub grouped_tables: Vec<usize>,
+    /// Whether each role commits one merged oracle instead of solo + grouped.
+    pub merged: bool,
     /// For each table, the sorted indices of its preprocessed columns.
     pub prep_columns: Vec<Vec<usize>>,
     /// For each table, the indices of its online trace columns (the
@@ -340,8 +351,9 @@ impl BatchStarkLayout {
     /// trace degree; tables need not be sorted. `prep_columns` holds, for each
     /// table, the sorted indices of its preprocessed columns (empty when the
     /// table has none). `grouped_tables` lists the tables sharing one
-    /// multi-height oracle per role (sorted; pass `&[]` for all-solo). It is
-    /// part of the transcript shape: prover and verifier must agree on it.
+    /// multi-height oracle per role (sorted; pass `&[]` for all-solo), and
+    /// `merged` selects one merged oracle per role instead. Both are part of
+    /// the transcript shape: prover and verifier must agree on them.
     pub(crate) fn new<F: RichField + Extendable<D>, const D: usize>(
         starks: &[&dyn BatchStark<F, D>],
         config: &StarkConfig,
@@ -349,6 +361,7 @@ impl BatchStarkLayout {
         prep_columns: &[Vec<usize>],
         cross_table_lookups: &[CrossTableLookup<F>],
         grouped_tables: &[usize],
+        merged: bool,
     ) -> Result<Self> {
         let num_tables = starks.len();
         ensure!(degree_bits.len() == num_tables);
@@ -466,12 +479,31 @@ impl BatchStarkLayout {
             oracles.push(BatchOracle::GroupedQuotient);
         }
 
+        if merged {
+            for oracle in &mut oracles {
+                *oracle = match *oracle {
+                    BatchOracle::Trace(_) | BatchOracle::GroupedTrace => {
+                        BatchOracle::Merged(BatchRole::Trace)
+                    }
+                    BatchOracle::Auxiliary(_) | BatchOracle::GroupedAuxiliary => {
+                        BatchOracle::Merged(BatchRole::Auxiliary)
+                    }
+                    BatchOracle::Quotient(_) | BatchOracle::GroupedQuotient => {
+                        BatchOracle::Merged(BatchRole::Quotient)
+                    }
+                    other => other,
+                };
+            }
+            oracles.dedup();
+        }
+
         Ok(Self {
             degree_bits: degree_bits.to_vec(),
             distinct_degree_bits,
             tables_by_group,
             oracles,
             grouped_tables: grouped_tables.to_vec(),
+            merged,
             prep_columns: prep_columns.to_vec(),
             online_columns,
             num_columns,
@@ -553,31 +585,43 @@ impl BatchStarkLayout {
         panic!("table {t} not in the grouped {role:?} oracle");
     }
 
-    /// The grouped `role` oracle's leaf groups as `(lde height, group
-    /// length)`, in tree order (descending height).
-    pub(crate) fn grouped_leaf_groups(
+    /// Merged polynomials keep table-index order, independent of runtime heights.
+    pub(crate) fn merged_role_tables(&self, role: BatchRole) -> Vec<usize> {
+        (0..self.num_tables())
+            .filter(|&t| self.role_num_polys(role, t) > 0)
+            .collect()
+    }
+
+    pub(crate) fn merged_num_polys(&self, role: BatchRole) -> usize {
+        (0..self.num_tables())
+            .map(|t| self.role_num_polys(role, t))
+            .sum()
+    }
+
+    pub(crate) fn merged_poly_start(&self, role: BatchRole, t: usize) -> usize {
+        (0..t).map(|u| self.role_num_polys(role, u)).sum()
+    }
+
+    /// Per-table rows in tree order: descending LDE height, ties by table index.
+    /// Ranges address the height-independent flat polynomial list.
+    pub(crate) fn merged_leaf_groups(
         &self,
         role: BatchRole,
         rate_bits: usize,
-    ) -> Vec<(usize, usize)> {
-        let mut groups: Vec<(usize, usize)> = Vec::new();
-        for &t in &self.grouped_role_tables(role) {
-            let height = self.degree_bits[t] + rate_bits;
-            let len = self.role_num_polys(role, t);
-            match groups.last_mut() {
-                Some((h, l)) if *h == height => *l += len,
-                _ => groups.push((height, len)),
-            }
-        }
+    ) -> Vec<(usize, core::ops::Range<usize>)> {
+        let mut groups: Vec<_> = self
+            .merged_role_tables(role)
+            .into_iter()
+            .map(|t| {
+                let start = self.merged_poly_start(role, t);
+                (
+                    self.degree_bits[t] + rate_bits,
+                    start..start + self.role_num_polys(role, t),
+                )
+            })
+            .collect();
+        groups.sort_by_key(|(height, range)| (core::cmp::Reverse(*height), range.start));
         groups
-    }
-
-    /// The table owning each flat polynomial of the grouped `role` oracle.
-    pub(crate) fn grouped_flat_tables(&self, role: BatchRole) -> Vec<usize> {
-        self.grouped_role_tables(role)
-            .iter()
-            .flat_map(|&t| core::iter::repeat_n(t, self.role_num_polys(role, t)))
-            .collect()
     }
 
     /// The oracle index of table `t`'s `role` polynomials, and the flat
@@ -585,7 +629,9 @@ impl BatchStarkLayout {
     /// tables).
     pub(crate) fn role_position(&self, role: BatchRole, t: usize) -> (usize, usize) {
         debug_assert!(self.role_num_polys(role, t) > 0);
-        let (target, start) = if self.is_grouped(t) {
+        let (target, start) = if self.merged {
+            (BatchOracle::Merged(role), self.merged_poly_start(role, t))
+        } else if self.is_grouped(t) {
             let target = match role {
                 BatchRole::Trace => BatchOracle::GroupedTrace,
                 BatchRole::Auxiliary => BatchOracle::GroupedAuxiliary,
@@ -620,6 +666,7 @@ impl BatchStarkLayout {
                 BatchOracle::GroupedTrace => self.grouped_num_polys(BatchRole::Trace),
                 BatchOracle::GroupedAuxiliary => self.grouped_num_polys(BatchRole::Auxiliary),
                 BatchOracle::GroupedQuotient => self.grouped_num_polys(BatchRole::Quotient),
+                BatchOracle::Merged(role) => self.merged_num_polys(role),
             })
             .collect()
     }
@@ -656,6 +703,11 @@ impl BatchStarkLayout {
                 BatchOracle::GroupedQuotient => {
                     self.degree_bits[self.grouped_role_tables(BatchRole::Quotient)[0]]
                 }
+                BatchOracle::Merged(role) => (0..self.num_tables())
+                    .filter(|&t| self.role_num_polys(role, t) > 0)
+                    .map(|t| self.degree_bits[t])
+                    .max()
+                    .expect("the merged oracle exists, so some table has polynomials of it"),
             })
             .collect()
     }
@@ -753,6 +805,19 @@ impl BatchStarkLayout {
                 BatchOracle::GroupedQuotient if with_quotient => {
                     polys.extend(self.grouped_batch_polys(g, oracle_index, BatchRole::Quotient));
                 }
+                BatchOracle::Merged(role) if role != BatchRole::Quotient || with_quotient => {
+                    for &t in &self.tables_by_group[g] {
+                        let n = self.role_num_polys(role, t);
+                        if n == 0 {
+                            continue;
+                        }
+                        let start = self.merged_poly_start(role, t);
+                        polys.extend(FriPolynomialInfo::from_range(
+                            oracle_index,
+                            start..start + n,
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
@@ -829,6 +894,10 @@ impl BatchStarkLayout {
                     BatchOracle::GroupedTrace => grouped_in_g(BatchRole::Trace),
                     BatchOracle::GroupedAuxiliary => grouped_in_g(BatchRole::Auxiliary),
                     BatchOracle::GroupedQuotient => grouped_in_g(BatchRole::Quotient),
+                    BatchOracle::Merged(role) => self.tables_by_group[g]
+                        .iter()
+                        .map(|&t| self.role_num_polys(role, t))
+                        .sum(),
                     _ => 0,
                 };
                 FriOracleInfo {
@@ -1069,6 +1138,33 @@ impl BatchStarkLayout {
                             self.num_quotient_polys[t]
                         );
                         values.extend(quotient_values.into_iter().flatten().copied());
+                    }
+                }
+                // Same order as `batch_polys`: the group's tables in table-index order.
+                BatchOracle::Merged(role) if role != BatchRole::Quotient || with_quotient => {
+                    for &t in &self.tables_by_group[g] {
+                        if self.role_num_polys(role, t) == 0 {
+                            continue;
+                        }
+                        let (trace_values, aux_values, quotient_values) = values_of_table(t);
+                        match role {
+                            BatchRole::Trace => values
+                                .extend(self.online_columns[t].iter().map(|&c| trace_values[c])),
+                            BatchRole::Auxiliary => {
+                                debug_assert_eq!(
+                                    aux_values.map_or(0, |v| v.len()),
+                                    self.num_aux_polys(t)
+                                );
+                                values.extend(aux_values.into_iter().flatten().copied());
+                            }
+                            BatchRole::Quotient => {
+                                debug_assert_eq!(
+                                    quotient_values.map_or(0, |v| v.len()),
+                                    self.num_quotient_polys[t]
+                                );
+                                values.extend(quotient_values.into_iter().flatten().copied());
+                            }
+                        }
                     }
                 }
                 _ => {}

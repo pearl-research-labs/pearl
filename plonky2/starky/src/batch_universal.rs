@@ -10,11 +10,12 @@
 //! height-dependent quantity in-circuit:
 //!
 //! - proof targets are allocated at the envelope maximum (`hi_t` per table);
-//!   variable-depth Merkle walks are conditional per level and idle below
-//!   their tree's real height
-//!   ([`CircuitBuilder::conditional_verify_merkle_proof_to_cap_with_cap_index`]),
-//!   while fixed-height oracles — including the shared preprocessed and
-//!   grouped-role trees — use exact walks;
+//!   each role's polynomials share one merged multi-height tree
+//!   ([`BatchOracle::Merged`]): a conditional walk injects each
+//!   table's row digest `R_t = H(row_t)` at its runtime height (flag-gated,
+//!   with `state ← select(started, H(state ‖ R_t), R_t)` chaining), and gates
+//!   each compress on whether anything above has started; the shared preprocessed oracle keeps its
+//!   exact multi-height walk;
 //! - the FRI fold runs over the fixed consensus `ladder` of degree boundaries;
 //!   commit-phase layers above the batch's tallest oracle are carried through
 //!   disabled: their caps are skipped in Fiat-Shamir by sponge-state
@@ -48,7 +49,7 @@ use itertools::Itertools;
 use plonky2::batch_fri::{batch_alpha_runs_target, AlphaRun};
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::Field;
-use plonky2::hash::hash_types::{HashOut, RichField};
+use plonky2::hash::hash_types::{HashOut, HashOutTarget, RichField, NUM_HASH_OUT_ELTS};
 use plonky2::hash::hashing::PlonkyPermutation;
 use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::iop::challenger::RecursiveChallenger;
@@ -83,11 +84,9 @@ pub struct UniversalVerifierEnvelope {
     /// `ladder[0]` must equal the tallest table's `hi`; every reachable table
     /// degree must be a member; every proof folds down to `ladder.last()`.
     pub ladder: Vec<usize>,
-    /// The tables sharing one multi-height Merkle tree per role (sorted;
-    /// see [`BatchOracle`]). Grouped tables must be fixed-height, so the
-    /// shared trees' shapes — and their exact Merkle walks — are
-    /// profile-independent. Part of the transcript shape: must equal the
-    /// list given to the prover.
+    /// Fixed-height tables marked as grouped by the batch API. Merged online
+    /// commitments hash each table separately; this list does not alter their
+    /// layout. Must equal the list given to the prover.
     pub grouped_tables: Vec<usize>,
 }
 
@@ -186,6 +185,10 @@ where
     for t in 0..N {
         let (lo, hi) = envelope.degree_ranges[t];
         ensure!(lo <= hi);
+        ensure!(
+            lo + rate_bits >= cap_height,
+            "table {t}: its shortest tree is below the cap"
+        );
         let cands = envelope.candidates(t);
         ensure!(
             cands.first() == Some(&hi) && cands.last() == Some(&lo),
@@ -240,6 +243,7 @@ where
         prep_columns,
         cross_table_lookups,
         &envelope.grouped_tables,
+        true,
     )?;
     let proof_with_pis = add_virtual_batch_stark_proof_with_pis(
         builder,
@@ -249,6 +253,7 @@ where
         prep_columns,
         cross_table_lookups,
         &envelope.grouped_tables,
+        true,
     )?;
     let proof = &proof_with_pis.proof;
     let public_inputs = &proof_with_pis.public_inputs;
@@ -630,9 +635,9 @@ where
 
     // ==========================================================================
     // Universal batched FRI. Claims are enumerated as canonical alpha runs
-    // (computed on the envelope-maximum layout; the run set and exponents are
-    // profile-independent because per-table oracles always contribute whole
-    // runs and preprocessed degrees are fixed) and merged per
+    // (computed on the envelope-maximum layout; a claim's exponent is
+    // canonical per `(oracle, polynomial, point)`, so envelope/runtime
+    // run-splitting differences are value-neutral) and merged per
     // `(degree source, point kind)`:
     //
     //   E_source = Σ_kind [Σ_runs α^{offset}·(Σ_j α^j ev_j − Σ_j α^j op_j)] / (x_source − z_kind)
@@ -641,45 +646,70 @@ where
     // boundary `d`, exactly like the native verifier.
     // ==========================================================================
     let instances = layout.fri_instances_target(builder, zeta);
-    let runs = batch_alpha_runs_target(&instances);
+    let mut runs = batch_alpha_runs_target(&instances);
     let fri_openings = layout.fri_openings_target(zero, &proof.openings);
 
-    // The degree source of a run. Multi-height oracles' runs never span
-    // degree classes (a run is contained in one instance), so the class of
-    // the first polynomial is the run's; their tables are fixed-height.
+    // The degree source of a run, from the flat-position → table maps.
     let prep_flat = prep_flat_columns(&layout);
-    let grouped_flat: [Vec<usize>; 3] = [
-        layout.grouped_flat_tables(BatchRole::Trace),
-        layout.grouped_flat_tables(BatchRole::Auxiliary),
-        layout.grouped_flat_tables(BatchRole::Quotient),
-    ];
-    let source_of = |run: &AlphaRun| -> DegreeSource {
-        match layout.oracles[run.oracle_index] {
-            BatchOracle::Trace(t) | BatchOracle::Auxiliary(t) | BatchOracle::Quotient(t) => {
-                if envelope.is_fixed(t) {
-                    DegreeSource::Fixed(envelope.degree_ranges[t].0)
-                } else {
-                    DegreeSource::Table(t)
-                }
-            }
-            BatchOracle::Preprocessed => {
-                let t = prep_flat[run.poly_start].0;
-                DegreeSource::Fixed(envelope.degree_ranges[t].0)
-            }
-            BatchOracle::GroupedTrace => {
-                let t = grouped_flat[0][run.poly_start];
-                DegreeSource::Fixed(envelope.degree_ranges[t].0)
-            }
-            BatchOracle::GroupedAuxiliary => {
-                let t = grouped_flat[1][run.poly_start];
-                DegreeSource::Fixed(envelope.degree_ranges[t].0)
-            }
-            BatchOracle::GroupedQuotient => {
-                let t = grouped_flat[2][run.poly_start];
-                DegreeSource::Fixed(envelope.degree_ranges[t].0)
-            }
+    let role_i = |role: BatchRole| match role {
+        BatchRole::Trace => 0,
+        BatchRole::Auxiliary => 1,
+        BatchRole::Quotient => 2,
+    };
+    let merged_flat: [Vec<usize>; 3] =
+        [BatchRole::Trace, BatchRole::Auxiliary, BatchRole::Quotient].map(|role| {
+            layout
+                .merged_role_tables(role)
+                .iter()
+                .flat_map(|&t| core::iter::repeat_n(t, layout.role_num_polys(role, t)))
+                .collect()
+        });
+    let table_source = |t: usize| -> DegreeSource {
+        if envelope.is_fixed(t) {
+            DegreeSource::Fixed(envelope.degree_ranges[t].0)
+        } else {
+            DegreeSource::Table(t)
         }
     };
+    let source_of = |run: &AlphaRun| -> DegreeSource {
+        match layout.oracles[run.oracle_index] {
+            BatchOracle::Merged(role) => table_source(merged_flat[role_i(role)][run.poly_start]),
+            BatchOracle::Preprocessed => {
+                DegreeSource::Fixed(envelope.degree_ranges[prep_flat[run.poly_start].0].0)
+            }
+            _ => unreachable!("merged layouts commit one oracle per role"),
+        }
+    };
+    // Equal envelope maxima do not imply equal runtime degrees. Split runs
+    // by degree source while preserving each claim's canonical exponent.
+    // Fixed tables of the same degree keep sharing a reduction and denominator.
+    runs = runs
+        .into_iter()
+        .flat_map(|run| {
+            let BatchOracle::Merged(role) = layout.oracles[run.oracle_index] else {
+                return vec![run];
+            };
+            let flat = &merged_flat[role_i(role)];
+            let mut parts = Vec::new();
+            let mut offset = 0;
+            while offset < run.len {
+                let t = flat[run.poly_start + offset];
+                let len = flat[run.poly_start + offset..run.poly_start + run.len]
+                    .iter()
+                    .take_while(|&&u| table_source(u) == table_source(t))
+                    .count();
+                parts.push(AlphaRun {
+                    poly_start: run.poly_start + offset,
+                    flat_start: run.flat_start + offset,
+                    alpha_offset: run.alpha_offset + offset,
+                    len,
+                    ..run
+                });
+                offset += len;
+            }
+            parts
+        })
+        .collect();
     let mut terms: Vec<CombineTerm> = Vec::new();
     for (r, run) in runs.iter().enumerate() {
         let source = source_of(run);
@@ -776,66 +806,38 @@ where
         })
         .collect();
 
-    // Initial-walk level activity per variable table: an oracle allocated at
-    // depth `hi + rate` idles below its real start, so level `p` (leaf side
-    // first) is active iff `b_t >= hi − p`. Only levels `p < hi − lo` can
-    // idle; the conditional prefix stops there and deeper levels are
-    // unconditionally active (no selection gates).
-    let walk_active: Vec<Vec<BoolTarget>> = (0..N)
-        .map(|t| {
-            if envelope.is_fixed(t) {
-                return vec![];
-            }
-            let (lo, hi) = envelope.degree_ranges[t];
-            (0..hi - lo)
-                .map(|p| BoolTarget::new_unsafe(geq(builder, &flags[t], &candidates[t], hi - p)))
-                .collect()
-        })
+    // The preprocessed oracle's leaf groups, `(lde height, group length)`:
+    // build-time constants, so its walk is exact.
+    let prep_groups = prep_leaf_groups(&layout, rate_bits);
+
+    let oracle_tops: Vec<usize> = layout
+        .oracle_degree_bits()
+        .iter()
+        .map(|&d| d + rate_bits)
         .collect();
 
-    // The multi-height oracles' leaf groups, `(lde height, group length)`.
-    // Grouped tables are fixed-height, so these — like the preprocessed
-    // groups — are build-time constants and their walks are exact.
-    let prep_groups = prep_leaf_groups(&layout, rate_bits);
-    let grouped_groups: [Vec<(usize, usize)>; 3] = [
-        layout.grouped_leaf_groups(BatchRole::Trace, rate_bits),
-        layout.grouped_leaf_groups(BatchRole::Auxiliary, rate_bits),
-        layout.grouped_leaf_groups(BatchRole::Quotient, rate_bits),
-    ];
-
-    // Initial-tree caps, in oracle order.
-    let caps = {
-        let (mut trace_i, mut aux_i, mut quot_i) = (0, 0, 0);
-        layout
-            .oracles
-            .iter()
-            .map(|&oracle| match oracle {
-                BatchOracle::Trace(_) | BatchOracle::GroupedTrace => {
-                    trace_i += 1;
-                    proof.trace_caps[trace_i - 1].clone()
-                }
-                BatchOracle::Preprocessed => {
-                    preprocessed.expect("missing preprocessed data").cap.clone()
-                }
-                BatchOracle::Auxiliary(_) | BatchOracle::GroupedAuxiliary => {
-                    aux_i += 1;
-                    proof
-                        .auxiliary_polys_caps
-                        .as_ref()
-                        .expect("missing auxiliary caps")[aux_i - 1]
-                        .clone()
-                }
-                BatchOracle::Quotient(_) | BatchOracle::GroupedQuotient => {
-                    quot_i += 1;
-                    proof
-                        .quotient_polys_caps
-                        .as_ref()
-                        .expect("missing quotient caps")[quot_i - 1]
-                        .clone()
-                }
-            })
-            .collect::<Vec<_>>()
-    };
+    // Initial-tree caps, in oracle order (one cap per merged role).
+    let caps = layout
+        .oracles
+        .iter()
+        .map(|&oracle| match oracle {
+            BatchOracle::Merged(BatchRole::Trace) => proof.trace_caps[0].clone(),
+            BatchOracle::Preprocessed => {
+                preprocessed.expect("missing preprocessed data").cap.clone()
+            }
+            BatchOracle::Merged(BatchRole::Auxiliary) => proof
+                .auxiliary_polys_caps
+                .as_ref()
+                .expect("missing auxiliary caps")[0]
+                .clone(),
+            BatchOracle::Merged(BatchRole::Quotient) => proof
+                .quotient_polys_caps
+                .as_ref()
+                .expect("missing quotient caps")[0]
+                .clone(),
+            _ => unreachable!("merged layouts commit one oracle per role"),
+        })
+        .collect::<Vec<_>>();
 
     // ==========================================================================
     // Query rounds.
@@ -876,53 +878,85 @@ where
                 // and commit layers share the cap index.
                 let cap_index = builder.le_sum(a_bits[lde_max - cap_height..].iter());
 
-                // Initial Merkle walks: conditional for variable oracles,
-                // exact for fixed ones, multi-height (and exact) for the
-                // preprocessed and grouped oracles.
+                // Initial Merkle walks: one conditional multi-height walk per
+                // merged role, an exact one for the preprocessed oracle.
                 let round = &proof.opening_proof.query_round_proofs[q];
                 for (o, &oracle) in layout.oracles.iter().enumerate() {
                     let (evals, merkle_proof) = &round.initial_trees_proof.evals_proofs[o];
                     match oracle {
-                        BatchOracle::Trace(t)
-                        | BatchOracle::Auxiliary(t)
-                        | BatchOracle::Quotient(t) => {
-                            let depth = envelope.degree_ranges[t].1 + rate_bits;
-                            let bits_window = &a_bits[lde_max - depth..lde_max - cap_height];
-                            if envelope.is_fixed(t) {
-                                builder.verify_merkle_proof_to_cap_with_cap_index::<C::Hasher>(
-                                    evals.clone(),
-                                    bits_window,
-                                    cap_index,
-                                    &caps[o],
-                                    merkle_proof,
-                                );
-                            } else {
-                                builder
-                                    .conditional_verify_merkle_proof_to_cap_with_cap_index::<C::Hasher>(
-                                        evals.clone(),
-                                        bits_window,
-                                        &walk_active[t],
-                                        cap_index,
-                                        &caps[o],
-                                        merkle_proof,
+                        BatchOracle::Merged(role) => {
+                            let top = oracle_tops[o];
+                            let tables = layout.merged_role_tables(role);
+                            // Fixed-width row hashes are computed once, before routing.
+                            let digests: Vec<HashOutTarget> = tables
+                                .iter()
+                                .map(|&t| {
+                                    let start = layout.merged_poly_start(role, t);
+                                    builder.hash_n_to_hash_no_pad::<C::Hasher>(
+                                        evals[start..start + layout.role_num_polys(role, t)]
+                                            .to_vec(),
+                                    )
+                                })
+                                .collect();
+                            let mut state = HashOutTarget {
+                                elements: [zero; NUM_HASH_OUT_ELTS],
+                            };
+                            let mut started = builder._false();
+                            assert_eq!(merkle_proof.siblings.len(), top - cap_height);
+                            for (p, height) in (cap_height..=top).rev().enumerate() {
+                                for (i, &t) in tables.iter().enumerate() {
+                                    let Some(j) =
+                                        candidates[t].iter().position(|&d| d + rate_bits == height)
+                                    else {
+                                        continue;
+                                    };
+                                    let value = inject::<F, C::Hasher, D>(
+                                        builder, state, digests[i], started,
                                     );
+                                    if envelope.is_fixed(t) {
+                                        state = value;
+                                        started = builder._true();
+                                    } else {
+                                        let flag = flags[t][j];
+                                        state = select_hash(builder, flag, value, state);
+                                        if started != builder._true() {
+                                            started = builder.or(started, flag);
+                                        }
+                                    }
+                                }
+                                // One-hot degree flags guarantee a digest once any table's
+                                // minimum height is reached, even without a fixed table.
+                                if tables
+                                    .iter()
+                                    .any(|&t| envelope.degree_ranges[t].0 + rate_bits >= height)
+                                {
+                                    started = builder._true();
+                                }
+                                // Above the runtime top, padded siblings are ignored and
+                                // the state stays unchanged. Below it, every compress is bound.
+                                if started != builder._false() {
+                                    if let Some(&sibling) = merkle_proof.siblings.get(p) {
+                                        let bit = a_bits[lde_max - top + p];
+                                        let next = compress::<F, C::Hasher, D>(
+                                            builder, state, sibling, bit,
+                                        );
+                                        state = select_hash(builder, started, next, state);
+                                    }
+                                }
+                            }
+                            for i in 0..NUM_HASH_OUT_ELTS {
+                                let result = builder.random_access(
+                                    cap_index,
+                                    caps[o].0.iter().map(|h| h.elements[i]).collect(),
+                                );
+                                builder.connect(result, state.elements[i]);
                             }
                         }
-                        BatchOracle::Preprocessed
-                        | BatchOracle::GroupedTrace
-                        | BatchOracle::GroupedAuxiliary
-                        | BatchOracle::GroupedQuotient => {
-                            let groups: &[(usize, usize)] = match oracle {
-                                BatchOracle::Preprocessed => &prep_groups,
-                                BatchOracle::GroupedTrace => &grouped_groups[0],
-                                BatchOracle::GroupedAuxiliary => &grouped_groups[1],
-                                BatchOracle::GroupedQuotient => &grouped_groups[2],
-                                _ => unreachable!(),
-                            };
-                            let mut leaf_groups = Vec::with_capacity(groups.len());
-                            let mut heights = Vec::with_capacity(groups.len());
+                        BatchOracle::Preprocessed => {
+                            let mut leaf_groups = Vec::with_capacity(prep_groups.len());
+                            let mut heights = Vec::with_capacity(prep_groups.len());
                             let mut start = 0;
-                            for &(height, group_len) in groups {
+                            for &(height, group_len) in &prep_groups {
                                 leaf_groups.push(evals[start..start + group_len].to_vec());
                                 heights.push(height);
                                 start += group_len;
@@ -937,22 +971,29 @@ where
                                 merkle_proof,
                             );
                         }
+                        _ => unreachable!("merged layouts commit one oracle per role"),
                     }
                 }
 
                 // Boundary subgroup points, from fixed leading slots:
-                //   x_d = shift·φ_m^{Σ_j A[lde_max−1−j]·2^j},  m = d + rate.
-                let coset_shift = builder.constant(F::coset_shift());
-                let boundary_x: Vec<Target> = ladder
-                    .iter()
-                    .map(|&d| {
-                        let m = d + rate_bits;
-                        let phi = F::primitive_root_of_unity(m);
-                        let leading = (0..m).map(|j| a_bits[lde_max - 1 - j]);
-                        let phi = builder.exp_from_bits_const_base(phi, leading);
-                        builder.mul(coset_shift, phi)
-                    })
-                    .collect();
+                //   x_s = shift·φ_{m_s}^{e_s},  m_s = ladder[s] + rate,
+                //   e_s = Σ_{j<m_s} A[lde_max−1−j]·2^j.
+                // Since e_{s+1} = e_s mod 2^{m_{s+1}} and ord(φ_{m_s}) = 2^{m_s}:
+                //   x_{s+1} = shift^{1−2^a}·x_s^{2^a},  a = m_s − m_{s+1}.
+                let boundary_x: Vec<Target> = {
+                    let m = ladder[0] + rate_bits;
+                    let phi = F::primitive_root_of_unity(m);
+                    let leading = (0..m).map(|j| a_bits[lde_max - 1 - j]);
+                    let e = builder.exp_from_bits_const_base(phi, leading);
+                    let mut xs = vec![builder.mul_const(F::coset_shift(), e)];
+                    for s in 1..ladder.len() {
+                        let a = ladder[s - 1] - ladder[s];
+                        let pow = builder.exp_power_of_2(xs[s - 1], a);
+                        let unshift = F::coset_shift().exp_u64((1 << a) - 1).inverse();
+                        xs.push(builder.mul_const(unshift, pow));
+                    }
+                    xs
+                };
                 // The fold starts at the job's top boundary.
                 let mut subgroup_x = jobmax_onehot
                     .iter()
@@ -1146,6 +1187,70 @@ fn prep_leaf_groups(layout: &BatchStarkLayout, rate_bits: usize) -> Vec<(usize, 
         }
     }
     groups
+}
+
+/// `select(started, H(state ‖ r), r)`: the state after chaining digest `r`
+/// onto a possibly-unstarted walk, with constant branches collapsed.
+fn inject<F, H, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    state: HashOutTarget,
+    r: HashOutTarget,
+    started: BoolTarget,
+) -> HashOutTarget
+where
+    F: RichField + Extendable<D>,
+    H: AlgebraicHasher<F>,
+{
+    if started == builder._false() {
+        return r;
+    }
+    let mut inputs = state.elements.to_vec();
+    inputs.extend(r.elements);
+    let chained = builder.hash_n_to_hash_no_pad::<H>(inputs);
+    select_hash(builder, started, chained, r)
+}
+
+/// `b ? x : y`, element-wise.
+fn select_hash<F, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    b: BoolTarget,
+    x: HashOutTarget,
+    y: HashOutTarget,
+) -> HashOutTarget
+where
+    F: RichField + Extendable<D>,
+{
+    if b == builder._true() {
+        return x;
+    }
+    if b == builder._false() {
+        return y;
+    }
+    HashOutTarget {
+        elements: core::array::from_fn(|i| builder.select(b, x.elements[i], y.elements[i])),
+    }
+}
+
+/// One Merkle compress: `H(state ‖ sibling)`, swapped by the index bit.
+fn compress<F, H, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    state: HashOutTarget,
+    sibling: HashOutTarget,
+    swap: BoolTarget,
+) -> HashOutTarget
+where
+    F: RichField + Extendable<D>,
+    H: AlgebraicHasher<F>,
+{
+    let zero = builder.zero();
+    let mut perm = H::AlgebraicPermutation::default();
+    perm.set_from_slice(&state.elements, 0);
+    perm.set_from_slice(&sibling.elements, NUM_HASH_OUT_ELTS);
+    perm.set_from_iter(core::iter::repeat(zero), 2 * NUM_HASH_OUT_ELTS);
+    let out = H::permute_swapped(perm, swap, builder);
+    HashOutTarget {
+        elements: out.squeeze()[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    }
 }
 
 /// Sets a universal verifier's targets to a runtime batch proof, padding the
@@ -1510,11 +1615,11 @@ mod tests {
     /// The full batch feature set — a CTL, a shared preprocessed oracle and a
     /// known column on two fixed tables — plus one variable-height table,
     /// proven at four different height profiles (merging with either fixed
-    /// table's degree group, above both, below both) and all verified by one
+    /// table's degree class, above both, below both) and all verified by one
     /// universal circuit whose public inputs are the claimed heights. The two
-    /// fixed tables are *grouped*: each role commits them in one multi-height
-    /// tree (heights 7 and 5), exercising the grouped exact walks, the CTL
-    /// batch order and the grouped alpha-run sourcing.
+    /// fixed tables are marked as grouped; all tables enter as row digests,
+    /// exercising fixed and conditional injections at tied heights, CTL
+    /// batch order and merged alpha-run sourcing.
     #[test]
     fn test_universal_batch_stark_full_system() -> Result<()> {
         let config = test_config();
@@ -1613,6 +1718,7 @@ mod tests {
                 &public_inputs,
                 &cross_table_lookups,
                 &envelope.grouped_tables,
+                true,
                 Some(&preprocessed),
                 Some(&known_columns),
                 &mut TimingTree::default(),
@@ -1623,6 +1729,7 @@ mod tests {
                 &proof,
                 &cross_table_lookups,
                 &envelope.grouped_tables,
+                true,
                 Some(&preprocessed.verifier_data()),
                 Some(&known_columns),
                 &HashMap::new(),
@@ -1645,6 +1752,36 @@ mod tests {
         // (the one-hot degree flags are bound to the proof).
         let proof = last_proof.unwrap();
         assert_eq!(proof.proof.degree_bits[2], 4);
+        // Trace, setup-time preprocessed, auxiliary and quotient rows are all
+        // bound by their caps, including the tables with fixed heights.
+        for oracle in 0..proof.proof.opening_proof.query_round_proofs[0]
+            .initial_trees_proof
+            .evals_proofs
+            .len()
+        {
+            let mut bad = proof.clone();
+            bad.proof.opening_proof.query_round_proofs[0]
+                .initial_trees_proof
+                .evals_proofs[oracle]
+                .0[0] += F::ONE;
+            assert!(batch_verify::<F, C, D, 3>(
+                &starks,
+                &config,
+                &bad,
+                &cross_table_lookups,
+                &envelope.grouped_tables,
+                true,
+                Some(&preprocessed.verifier_data()),
+                Some(&known_columns),
+                &HashMap::new(),
+            )
+            .is_err());
+            let mut pw = PartialWitness::new();
+            set_universal_batch_stark_proof_with_pis_target(
+                &mut pw, &universal, &bad, &envelope, &config,
+            )?;
+            assert!(data.prove(pw).and_then(|proof| data.verify(proof)).is_err());
+        }
         let mut pw = PartialWitness::new();
         let six = envelope.candidates(2).iter().position(|&d| d == 6).unwrap();
         pw.set_bool_target(universal.degree_flags[2][six], true)?;
@@ -1656,71 +1793,227 @@ mod tests {
         Ok(())
     }
 
-    /// Two quotient-only tables with the fixed one at the ladder *bottom*:
+    /// Two tables without auxiliary polynomials, with the fixed one at the ladder bottom:
     /// exercises deep conditional prefixes (up to four skipped commit
     /// layers), large top-aligned index shifts and padded Merkle walks.
     #[test]
     fn test_universal_batch_stark_deep_conditional() -> Result<()> {
-        let config = test_config();
-        let stark_a = SquareStark::<F, D>::new();
-        let stark_b = SquareStark::<F, D>::new();
-        let starks: [&dyn BatchStark<F, D>; 2] = [&stark_a, &stark_b];
-        let envelope = UniversalVerifierEnvelope {
-            degree_ranges: vec![(4, 4), (4, 8)],
-            ladder: vec![8, 7, 6, 5, 4],
-            grouped_tables: vec![],
-        };
+        for arity_bits in [1, 2] {
+            let mut config = test_config();
+            config.fri_config.reduction_strategy =
+                FriReductionStrategy::ConstantArityBits(arity_bits, 4);
+            let stark_a = SquareStark::<F, D>::new();
+            let stark_b = SquareStark::<F, D>::new();
+            let starks: [&dyn BatchStark<F, D>; 2] = [&stark_a, &stark_b];
+            let envelope = UniversalVerifierEnvelope {
+                degree_ranges: vec![(4, 4), (4, 8)],
+                ladder: (4..9).step_by(arity_bits).rev().collect(),
+                grouped_tables: vec![],
+            };
 
-        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
-        let universal = verify_universal_batch_stark_proof_circuit::<F, C, D, 2>(
-            &mut builder,
-            &starks,
-            &config,
-            &envelope,
-            &[],
-            None,
-            None,
-            &HashMap::new(),
-        )?;
-        builder.register_public_inputs(&universal.degree_bits);
-        let data = builder.build::<C>();
-
-        for var_bits in [8usize, 6, 4] {
-            let proof = batch_prove::<F, C, D, 2>(
+            let mut builder =
+                CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+            let universal = verify_universal_batch_stark_proof_circuit::<F, C, D, 2>(
+                &mut builder,
                 &starks,
                 &config,
-                [
-                    SquareStark::<F, D>::generate_trace(1 << 4),
-                    SquareStark::<F, D>::generate_trace(1 << var_bits),
-                ],
-                &[vec![], vec![]],
-                &[],
-                &[],
-                None,
-                None,
-                &mut TimingTree::default(),
-            )?;
-            batch_verify::<F, C, D, 2>(
-                &starks,
-                &config,
-                &proof,
-                &[],
+                &envelope,
                 &[],
                 None,
                 None,
                 &HashMap::new(),
             )?;
+            builder.register_public_inputs(&universal.degree_bits);
+            let data = builder.build::<C>();
 
-            let mut pw = PartialWitness::new();
-            set_universal_batch_stark_proof_with_pis_target(
-                &mut pw, &universal, &proof, &envelope, &config,
+            for var_bits in [8usize, 6, 4] {
+                let proof = batch_prove::<F, C, D, 2>(
+                    &starks,
+                    &config,
+                    [
+                        SquareStark::<F, D>::generate_trace(1 << 4),
+                        SquareStark::<F, D>::generate_trace(1 << var_bits),
+                    ],
+                    &[vec![], vec![]],
+                    &[],
+                    &[],
+                    true,
+                    None,
+                    None,
+                    &mut TimingTree::default(),
+                )?;
+                batch_verify::<F, C, D, 2>(
+                    &starks,
+                    &config,
+                    &proof,
+                    &[],
+                    &[],
+                    true,
+                    None,
+                    None,
+                    &HashMap::new(),
+                )?;
+
+                let mut pw = PartialWitness::new();
+                set_universal_batch_stark_proof_with_pis_target(
+                    &mut pw, &universal, &proof, &envelope, &config,
+                )?;
+                let rec_proof = data.prove(pw)?;
+                assert_eq!(
+                    rec_proof.public_inputs,
+                    [4, var_bits].map(F::from_canonical_usize).to_vec(),
+                );
+                data.verify(rec_proof)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Independent tables with identical envelope maxima must work when their
+    /// heights tie, cross, or leave a gap. Corruptions reach circuit proving,
+    /// rather than only testing the witness setter's consistency checks.
+    #[test]
+    fn test_universal_batch_stark_independent_heights() -> Result<()> {
+        let stark = SquareStark::<F, D>::new();
+        let starks: [&dyn BatchStark<F, D>; 2] = [&stark, &stark];
+        let envelope = UniversalVerifierEnvelope {
+            degree_ranges: vec![(4, 6), (4, 6)],
+            ladder: vec![6, 5, 4],
+            grouped_tables: vec![],
+        };
+        // The larger cap also exercises a table injected directly at the cap.
+        for cap_height in [2, 5] {
+            let mut config = test_config();
+            config.fri_config.cap_height = cap_height;
+            let mut builder =
+                CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+            let universal = verify_universal_batch_stark_proof_circuit::<F, C, D, 2>(
+                &mut builder,
+                &starks,
+                &config,
+                &envelope,
+                &[],
+                None,
+                None,
+                &HashMap::new(),
             )?;
-            let rec_proof = data.prove(pw)?;
-            assert_eq!(
-                rec_proof.public_inputs,
-                [4, var_bits].map(F::from_canonical_usize).to_vec(),
-            );
-            data.verify(rec_proof)?;
+            builder.register_public_inputs(&universal.degree_bits);
+            let data = builder.build::<C>();
+            let verify_native = |proof: &BatchStarkProofWithPublicInputs<F, C, D>| {
+                batch_verify::<F, C, D, 2>(
+                    &starks,
+                    &config,
+                    proof,
+                    &[],
+                    &[],
+                    true,
+                    None,
+                    None,
+                    &HashMap::new(),
+                )
+            };
+            let witness = |proof: &BatchStarkProofWithPublicInputs<F, C, D>| {
+                let mut pw = PartialWitness::new();
+                set_universal_batch_stark_proof_with_pis_target(
+                    &mut pw, &universal, proof, &envelope, &config,
+                )?;
+                Ok::<_, anyhow::Error>(pw)
+            };
+            let verify_circuit = |pw| data.prove(pw).and_then(|proof| data.verify(proof));
+            for a in 4..=6 {
+                for b in 4..=6 {
+                    let x: Vec<F> = (0..1 << b)
+                        .map(|i| F::from_canonical_usize(i + 100))
+                        .collect();
+                    let y = x.iter().map(|&v| v * v).collect();
+                    let proof = batch_prove::<F, C, D, 2>(
+                        &starks,
+                        &config,
+                        [
+                            SquareStark::<F, D>::generate_trace(1 << a),
+                            vec![PolynomialValues::new(x), PolynomialValues::new(y)],
+                        ],
+                        &[vec![], vec![]],
+                        &[],
+                        &[],
+                        true,
+                        None,
+                        None,
+                        &mut TimingTree::default(),
+                    )?;
+                    verify_native(&proof)?;
+                    let recursive = data.prove(witness(&proof)?)?;
+                    assert_eq!(recursive.public_inputs, [a, b].map(F::from_canonical_usize));
+                    data.verify(recursive)?;
+
+                    if a == 4 && b == 4 && cap_height == 2 {
+                        // Leading siblings belong to skipped envelope levels.
+                        let mut pw = witness(&proof)?;
+                        for (_, merkle) in &universal
+                            .proof_with_pis
+                            .proof
+                            .opening_proof
+                            .query_round_proofs[0]
+                            .initial_trees_proof
+                            .evals_proofs
+                        {
+                            for &limb in &merkle.siblings[0].elements {
+                                pw.target_values.insert(limb, F::from_canonical_u64(123));
+                            }
+                        }
+                        verify_circuit(pw)?;
+                    }
+                    if a != 5 || b != 5 || cap_height != 2 {
+                        continue;
+                    }
+                    // Every table's trace and quotient row is bound, including ties.
+                    for oracle in 0..2 {
+                        for table in 0..2 {
+                            let mut bad = proof.clone();
+                            bad.proof.opening_proof.query_round_proofs[0]
+                                .initial_trees_proof
+                                .evals_proofs[oracle]
+                                .0[2 * table] += F::ONE;
+                            assert!(verify_native(&bad).is_err());
+                            assert!(verify_circuit(witness(&bad)?).is_err());
+                        }
+                        let mut bad = proof.clone();
+                        bad.proof.opening_proof.query_round_proofs[0]
+                            .initial_trees_proof
+                            .evals_proofs[oracle]
+                            .1
+                            .siblings[0]
+                            .elements[0] += F::ONE;
+                        assert!(verify_native(&bad).is_err());
+                        assert!(verify_circuit(witness(&bad)?).is_err());
+                    }
+                    // Bypass the setter to submit a coherent but false public height.
+                    let mut pw = witness(&proof)?;
+                    for (&degree, flag) in envelope
+                        .candidates(0)
+                        .iter()
+                        .zip(&universal.degree_flags[0])
+                    {
+                        pw.target_values
+                            .insert(flag.target, F::from_bool(degree == 4));
+                    }
+                    pw.target_values
+                        .insert(universal.degree_bits[0], F::from_canonical_usize(4));
+                    assert!(verify_circuit(pw).is_err());
+                    for value in [F::ZERO, F::TWO] {
+                        let mut pw = witness(&proof)?;
+                        let flag = universal.degree_flags[0][1];
+                        pw.target_values.insert(flag.target, value);
+                        // Invalid degree flags can make a division generator invert
+                        // zero before the circuit prover reports unsatisfied constraints.
+                        let rejected =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                verify_circuit(pw)
+                            }));
+                        assert!(rejected.is_err() || rejected.unwrap().is_err());
+                    }
+                }
+            }
         }
         Ok(())
     }
