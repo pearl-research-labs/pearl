@@ -416,7 +416,7 @@ fn validate_public_statement(
     Ok(statement)
 }
 
-/// One fp8 batch proof (the twenty-table batched STARK argument with every table's
+/// One fp8 batch proof (the twenty-one-table batched STARK argument with every table's
 /// public inputs), plus its wire encoding.
 #[derive(Clone, Debug)]
 #[cfg(test)]

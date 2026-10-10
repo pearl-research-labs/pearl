@@ -4,7 +4,7 @@
 //! [`ctl`] declares their CTL halves, and [`witness`] checks lookups and counts multiplicities.
 //! Complete channels are assembled in [`super::ctl`].
 //!
-//! Each device family's fifteen [`LutTable`]s is its own table of
+//! Each device family's sixteen [`LutTable`]s is its own table of
 //! the batch STARK — a [`LutStark`] at its natural committed height [`lut_height`] (the
 //! array orders the batch by descending height, so nothing pays for another table's
 //! padding). A LUT AIR has no constraints of its own; its columns split into two classes:
@@ -61,7 +61,7 @@ pub use ctl::ctl_looked_lut_slot;
 pub use stark::{
     B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Int8DecStark, Log16Stark, LutStark, Pair128Stark,
     Pow2DStark, Pow2GStark, Pow2GbStark, ProdAlign15Stark, QcastStark, Range16Stark, RneRndStark, Width16Stark, Width32Stark,
-    WidthNormStark, generate, lut_precommitted_values, lut_preprocessed_data, lut_preprocessed_inputs, lut_trace,
+    WidthNormStark, Xor8Stark, generate, lut_precommitted_values, lut_preprocessed_data, lut_preprocessed_inputs, lut_trace,
 };
 pub use witness::{LutChecker, LutMultiplicities};
 
@@ -76,6 +76,10 @@ pub enum LutTable {
     Range16,
     /// Paired 8-bit range check; a lone byte checks `(d, 0)` — Blake message bytes.
     Bytes2,
+    /// Byte XOR, keyed by `x, y in [0, 256)`. Slot `t` returns `(z, h_t, t)`, where
+    /// `z = x ^ y` and `(h_0, h_1, h_2) = (0, z >> 4, z >> 7)`.
+    /// The high fragments support Blake3's rotations by 12 and 7.
+    Xor8,
     /// Paired 7-bit range check (2^14 keys, padded into the 2^16 height group) — mantissa
     /// fields, ScaleStark's sqrt parity/l2-linf pairs.
     Pair128,

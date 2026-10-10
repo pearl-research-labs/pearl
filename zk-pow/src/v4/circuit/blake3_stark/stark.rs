@@ -13,9 +13,9 @@
 //!
 //! Leaf and parent compressions build four keyed Merkle roots: int8 values and bf16 block-scale
 //! codes for each of matrices A and B. A separate keyed tree binds mixture-of-experts (MoE)
-//! routing data when present. Eight parallel lookups route an internal CV by packing each
-//! `(source trace row, CV word value)` pair injectively; `cv_route_key_or_tweak` carries the
-//! source-row pointer on fetch rows or the instruction's public tweak on initialization rows.
+//! routing data when present. A Blake3 -> Blake3 cross-table channel routes internal CVs as
+//! `(8 CV words, source trace row)` tuples; `cv_route_key_or_tweak` carries the source-row
+//! pointer on fetch rows or the instruction's public tweak on initialization rows.
 //!
 //! Two keyed wrapper compressions ([`append_commit_fold`]) fold the four roots into the
 //! per-side commitment digests `blake3(values_root || scales_root, key=keyA/keyB)`, bound to the
@@ -27,9 +27,9 @@
 //!
 //! The verifier recomputes the schedule columns and checks their openings. Cross-table lookups
 //! bind live int8/scale message blocks to InputQuantStark and lottery words to XorFoldStark;
-//! byte and MoE-limb lookups range-check packed message data. Thus neither padding
-//! compressions nor an alternative private instruction schedule can contribute to a public
-//! binding.
+//! byte and MoE-limb lookups range-check packed message data, and XOR8 lookups carry the
+//! round block's XORs and rotations (`super::ctl`). Thus neither padding compressions nor an
+//! alternative private instruction schedule can contribute to a public binding.
 
 // TODO: this file contains many asserts, that should be prevented in advance
 
@@ -47,13 +47,12 @@ use plonky2::iop::ext_target::ExtensionTarget;
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
 use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
-use starky::lookup::{Column, Filter, Lookup};
 use starky::stark::Stark;
 
 use super::columns::{
-    BLAKE3_COL_MAP, Blake3ColumnsView, Blake3StateCols, NUM_BLAKE3_COLUMNS, NUM_BLAKE3_PUBLIC_INPUTS, NUM_UINT8,
-    NUM_UNPACK_FLAGS, PI_HASH_A, PI_HASH_B, PI_HASH_JACKPOT, PI_HASH_OFFSETS, PI_HASH_ROUTING, PI_JACKPOT_KEY, PI_KEY_A,
-    PI_KEY_B,
+    B_ROTATIONS, Blake3ColumnsView, Blake3StateCols, NUM_BLAKE3_COLUMNS, NUM_BLAKE3_PUBLIC_INPUTS, NUM_UINT8, NUM_UNPACK_FLAGS,
+    PI_HASH_A, PI_HASH_B, PI_HASH_JACKPOT, PI_HASH_OFFSETS, PI_HASH_ROUTING, PI_JACKPOT_KEY, PI_KEY_A, PI_KEY_B, WordFragments,
+    half_round_lane, rotated_byte_indices,
 };
 use crate::v4::api::prequant::BLOCK_SIZE;
 use crate::v4::api::public_params::{HashId, MoEStatement};
@@ -73,11 +72,6 @@ const BLAKE3_MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12
 
 /// Rows per compression: 7 round rows + 1 finalization row.
 pub const ROWS_PER_COMPRESSION: usize = 8;
-
-/// Key factor of the CV-routing lookup: `key = word + 2^34 * trace_row_index`. The factor is
-/// 2^34, not 2^32, because the round block's unchecked-add slack admits words up to about 2^34;
-/// this keeps the packing injective for every value accepted by the constraints.
-const CV_ROUTING_KEY_FACTOR: u64 = 1 << 34;
 
 /// `apply BLAKE3_MSG_PERMUTATION`: `new[i] = old[BLAKE3_MSG_PERMUTATION[i]]` (the deployed
 /// chip's `blake3_permute_msg`, generic so the constraint side can permute column handles).
@@ -1123,33 +1117,23 @@ impl Blake3Program {
             }
             debug_assert_eq!(msg_j, m);
 
-            // Round states (rows 0..6) and per-row CV_OUT, the deployed fill.
+            // Round states (rows 0..6) and the finalization row's CV_OUT bytes.
             let mut state = init_state(&cvs_in[c], instr);
             let mut msg_j = m;
             for j in 0..ROWS_PER_COMPRESSION - 1 {
                 let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
-                write_state(&mut row.round[0], &state);
-                let row_input = state;
+                write_state(&mut row.round[0], &state, B_ROTATIONS[0]);
                 let states = compute_blake3_round(&mut state, &msg_j);
                 for (t, s) in states[..3].iter().enumerate() {
-                    write_state(&mut row.round[t + 1], s);
-                }
-                for i in 0..8 {
-                    // The unconditional CV_OUT = finalize-expression identity, on round rows.
-                    let v = if i < 4 {
-                        states[0][4 + i] ^ states[0][12 + i]
-                    } else {
-                        row_input[i] ^ row_input[8 + i]
-                    };
-                    row.cv_out[i] = F::from_canonical_u32(v);
+                    write_state(&mut row.round[t + 1], s, B_ROTATIONS[t + 1]);
                 }
                 blake3_permute(&mut msg_j);
             }
             let row: &mut Blake3ColumnsView<F> = rows[r0 + ROWS_PER_COMPRESSION - 1].borrow_mut();
-            write_state(&mut row.round[0], &state);
+            write_state(&mut row.round[0], &state, B_ROTATIONS[0]);
             for i in 0..8 {
-                row.cv_out[i] = F::from_canonical_u32(state[i] ^ state[8 + i]);
-                debug_assert_eq!(row.cv_out[i], F::from_canonical_u32(cvs_out[c][i]));
+                write_bytes(&mut row.cv_out[i], state[i] ^ state[8 + i]);
+                debug_assert_eq!(read_bytes(&row.cv_out[i]), cvs_out[c][i]);
             }
         }
 
@@ -1159,9 +1143,9 @@ impl Blake3Program {
             row.is_new_blake = F::ONE;
             row.trace_row_index = F::from_canonical_usize(r); // Constraint 8 spans padding too.
             for i in 0..4 {
-                row.round[0].row3[i] = F::from_canonical_u32(BLAKE3_IV[i]);
-                // The finalize expression on padding rows: [IV[0..4] ^ 0, 0 ^ 0].
-                row.cv_out[i] = F::from_canonical_u32(BLAKE3_IV[i]);
+                write_bytes(&mut row.round[0].c[i], BLAKE3_IV[i]);
+                // The finalization lookups on padding rows serve `[IV[0..4] ^ 0, 0 ^ 0]`.
+                write_bytes(&mut row.cv_out[i], BLAKE3_IV[i]);
             }
         }
 
@@ -1231,59 +1215,38 @@ impl Blake3Program {
             carry = carry_after(row, carry);
         }
 
-        // ---- Postprocess rows whose next row starts a compression (real finalization rows,
-        // ---- padding rows, and the cyclic wrap): fill STATE1..3 so the unconditional
-        // ---- add2/add3 constraints hold and STATE1 carries the finalize bit decompositions.
+        // Finalization and padding rows still satisfy the ungated additions.
+        // Their round XORs are disabled; choose states 1..3 to connect to the next input.
         for r in 0..num_rows {
             let next = (r + 1) % num_rows;
-            {
+            let s4 = {
                 let next_row: &Blake3ColumnsView<F> = rows[next].borrow();
                 if next_row.is_new_blake != F::ONE {
                     continue;
                 }
-            }
-            let (nr1, nr3, nr4) = {
-                let next_row: &Blake3ColumnsView<F> = rows[next].borrow();
-                (
-                    read_words(&next_row.round[0].row1),
-                    read_words(&next_row.round[0].row3),
-                    read_bits(&next_row.round[0].row4),
-                )
+                read_state(&next_row.round[0], B_ROTATIONS[0])
             };
             let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
             let msg: [u32; 16] = core::array::from_fn(|i| row.blake3_msg[i].to_canonical_u64() as u32);
-            let r1 = read_words(&row.round[0].row1);
-            let r2 = read_bits(&row.round[0].row2);
-            let r3 = read_words(&row.round[0].row3);
-
-            // STATE1: row2/row4 repurposed as the finalize decompositions of row1/row3.
-            let s1r1: [u32; 4] = core::array::from_fn(|i| r1[i].wrapping_add(r2[i]).wrapping_add(msg[2 * i]));
-            let s1r3: [u32; 4] = core::array::from_fn(|i| r3[i].wrapping_add(r3[i]));
-            write_words(&mut row.round[1].row1, &s1r1);
-            write_bits(&mut row.round[1].row2, &r1);
-            write_words(&mut row.round[1].row3, &s1r3);
-            write_bits(&mut row.round[1].row4, &r3);
-
-            // STATE2: bit halves zero; word halves from the unconditional adds.
-            let s2r1: [u32; 4] = core::array::from_fn(|i| s1r1[i].wrapping_add(r1[i]).wrapping_add(msg[2 * i + 1]));
-            write_words(&mut row.round[2].row1, &s2r1);
-            write_bits(&mut row.round[2].row2, &[0; 4]);
-            write_words(&mut row.round[2].row3, &s1r3);
-            write_bits(&mut row.round[2].row4, &[0; 4]);
-
-            // STATE3: solved backwards from the next row's input state (diagonal adds).
-            let s3r1: [u32; 4] = core::array::from_fn(|i| s2r1[i].wrapping_add(msg[8 + 2 * i]));
-            let (mut s3r2, mut s3r3, mut s3r4) = ([0u32; 4], [0u32; 4], [0u32; 4]);
+            let s0 = read_state(&row.round[0], B_ROTATIONS[0]);
+            let (mut s1, mut s2, mut s3) = ([0u32; 16], [0u32; 16], [0u32; 16]);
+            // States 1 and 2 first: the half-round-2 adds read state 2 across lanes.
             for i in 0..4 {
-                let (b, c, d) = ((i + 1) % 4, (i + 2) % 4, (i + 3) % 4);
-                s3r3[c] = nr3[c].wrapping_sub(nr4[d]);
-                s3r4[d] = s3r3[c].wrapping_sub(s1r3[c]);
-                s3r2[b] = nr1[i].wrapping_sub(s3r1[i]).wrapping_sub(msg[8 + 2 * i + 1]);
+                s1[i] = s0[i].wrapping_add(s0[4 + i]).wrapping_add(msg[2 * i]);
+                s1[8 + i] = s0[8 + i];
+                s2[i] = s1[i].wrapping_add(msg[2 * i + 1]);
+                s2[8 + i] = s1[8 + i];
             }
-            write_words(&mut row.round[3].row1, &s3r1);
-            write_bits(&mut row.round[3].row2, &s3r2);
-            write_words(&mut row.round[3].row3, &s3r3);
-            write_bits(&mut row.round[3].row4, &s3r4);
+            for i in 0..4 {
+                let (bi, ci, di, _) = half_round_lane(2, i);
+                s3[i] = s2[i].wrapping_add(msg[8 + 2 * i]);
+                s3[8 + ci] = s4[8 + ci].wrapping_sub(s4[12 + di]);
+                s3[12 + di] = s3[8 + ci].wrapping_sub(s2[8 + ci]);
+                s3[4 + bi] = s4[i].wrapping_sub(s3[i]).wrapping_sub(msg[8 + 2 * i + 1]);
+            }
+            write_state(&mut row.round[1], &s1, B_ROTATIONS[1]);
+            write_state(&mut row.round[2], &s2, B_ROTATIONS[2]);
+            write_state(&mut row.round[3], &s3, B_ROTATIONS[3]);
         }
 
         // ---- CV-routing multiplicities and the ROW_FLAGS_PACKED packing. ----
@@ -1691,7 +1654,7 @@ fn shift_buffer(buffer: &[u32; 16]) -> [u32; 16] {
     core::array::from_fn(|i| if i < 14 { buffer[i + 2] } else { 0 })
 }
 
-/// One half quarter-round (the native mirror of the AIR's `half_g`).
+/// One half quarter-round: `a += b + m; d = (d ^ a) >>> rot_1; c += d; b = (b ^ c) >>> rot_2`.
 fn half_quarter_round(mut a: u32, mut b: u32, mut c: u32, mut d: u32, m: u32, second_half: bool) -> (u32, u32, u32, u32) {
     let (rot_1, rot_2) = if second_half { (8, 7) } else { (16, 12) };
     a = a.wrapping_add(b).wrapping_add(m);
@@ -1748,43 +1711,51 @@ fn native_compress_state(cv: &[u32; 8], m: &[u32; 16], counter: u64, block_len: 
     state
 }
 
-fn write_state<F: RichField>(dst: &mut Blake3StateCols<F>, state: &[u32; 16]) {
-    write_words(&mut dst.row1, &core::array::from_fn(|i| state[i]));
-    write_bits(&mut dst.row2, &core::array::from_fn(|i| state[4 + i]));
-    write_words(&mut dst.row3, &core::array::from_fn(|i| state[8 + i]));
-    write_bits(&mut dst.row4, &core::array::from_fn(|i| state[12 + i]));
-}
-
-fn write_words<F: RichField>(dst: &mut [F; 4], words: &[u32; 4]) {
+/// Encodes `b` as split bytes of `b.rotate_left(rot)`; the other words use LE bytes.
+fn write_state<F: RichField>(dst: &mut Blake3StateCols<F>, state: &[u32; 16], rot: u32) {
+    let shift = rot % 8;
     for i in 0..4 {
-        dst[i] = F::from_canonical_u32(words[i]);
-    }
-}
-
-fn write_bits<F: RichField>(dst: &mut [[F; 32]; 4], words: &[u32; 4]) {
-    for i in 0..4 {
-        for b in 0..32 {
-            dst[i][b] = F::from_canonical_u32((words[i] >> b) & 1);
+        write_bytes(&mut dst.a[i], state[i]);
+        for (j, byte) in state[4 + i].rotate_left(rot).to_le_bytes().into_iter().enumerate() {
+            dst.b[i].xor_low[j] = F::from_canonical_u8(byte & ((1 << shift) - 1));
+            dst.b[i].xor_high[j] = F::from_canonical_u8(byte >> shift);
         }
+        write_bytes(&mut dst.c[i], state[8 + i]);
+        write_bytes(&mut dst.d[i], state[12 + i]);
     }
 }
 
-fn read_words<F: RichField>(src: &[F; 4]) -> [u32; 4] {
-    core::array::from_fn(|i| src[i].to_canonical_u64() as u32)
+/// Inverse of [`write_state`] under the same `rot`.
+fn read_state<F: RichField>(src: &Blake3StateCols<F>, rot: u32) -> [u32; 16] {
+    core::array::from_fn(|i| match i / 4 {
+        0 => read_bytes(&src.a[i % 4]),
+        1 => u32::from_le_bytes(core::array::from_fn(|j| {
+            let (hi, lo, weight) = rotated_byte_indices(rot, j);
+            let b = &src.b[i % 4];
+            (b.xor_high[hi].to_canonical_u64() + weight * b.xor_low[lo].to_canonical_u64()) as u8
+        })),
+        2 => read_bytes(&src.c[i % 4]),
+        _ => read_bytes(&src.d[i % 4]),
+    })
 }
 
-fn read_bits<F: RichField>(src: &[[F; 32]; 4]) -> [u32; 4] {
-    core::array::from_fn(|i| (0..32).fold(0u32, |acc, b| acc | (((src[i][b] == F::ONE) as u32) << b)))
+fn write_bytes<F: RichField>(dst: &mut [F; 4], word: u32) {
+    for (d, byte) in dst.iter_mut().zip(word.to_le_bytes()) {
+        *d = F::from_canonical_u8(byte);
+    }
+}
+
+fn read_bytes<F: RichField>(src: &[F; 4]) -> u32 {
+    u32::from_le_bytes(core::array::from_fn(|j| src[j].to_canonical_u64() as u8))
 }
 
 // ==================================================================================================
 // Constraints, written once against the generic `Evaluator`
 // ==================================================================================================
 
-/// Evaluates every arithmetic constraint of Blake3Stark. The CV-routing lookup is
-/// declared in [`Blake3Stark::lookups`] and evaluated by the framework; the BYTES2/RC16
-/// instances and the CTL halves are declared in `super::ctl` and assembled by the batch
-/// driver (module docs).
+/// Evaluates every arithmetic constraint of Blake3Stark. The CV-routing channel, the
+/// BYTES2/RC16/XOR8 lookup instances, and the CTL halves are declared in `super::ctl` and
+/// assembled by the batch driver (module docs).
 pub(crate) fn eval_blake3_constraints<V, S, E>(
     vars: &StarkFrame<V, S, NUM_BLAKE3_COLUMNS, NUM_BLAKE3_PUBLIC_INPUTS>,
     eval: &mut E,
@@ -1866,6 +1837,8 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
     }
 
     // ---- 4. Public bindings: the side digests, routing/offsets hashes, the lottery output. ----
+    // Finalization XOR8 lookups bound each CV byte, so its packing is a u32.
+    let cv_out: [V; 8] = core::array::from_fn(|i| eval.polyval(&lv.cv_out[i], c256));
     for (flag, target) in [
         (lv.is_bind_hash_a, hash_a),
         (lv.is_bind_hash_b, hash_b),
@@ -1873,7 +1846,7 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
         (lv.is_bind_offsets_hash, hash_offsets),
     ] {
         for i in 0..8 {
-            let diff = eval.sub(lv.cv_out[i], target[i]);
+            let diff = eval.sub(cv_out[i], target[i]);
             let c = eval.mul(flag, diff);
             eval.constraint(c);
         }
@@ -1881,7 +1854,7 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
     for i in 0..8 {
         // IS_BIND_JACKPOT_HASH spans all 8 lottery rows (the XorFold CTL filter needs it on the
         // load row), so the binding is anchored at the finalization row explicitly (degree 3).
-        let diff = eval.sub(lv.cv_out[i], hash_jackpot[i]);
+        let diff = eval.sub(cv_out[i], hash_jackpot[i]);
         let gate = eval.mul(lv.is_bind_jackpot_hash, lv.is_last_round);
         let c = eval.mul(gate, diff);
         eval.constraint(c);
@@ -1918,13 +1891,9 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
         eval.constraint_eq_if(lv.is_last_round, permuted[i], lv.blake3_msg_buffer[i]);
     }
 
-    // ---- 1. Round block (the deployed chip's constraint set, re-expressed on this layout). --
+    // ---- 1. Round additions; XORs, rotations and finalization are checked in ctl.rs. ----
     let states = [&lv.round[0], &lv.round[1], &lv.round[2], &lv.round[3], &nv.round[0]];
-    verify_round(eval, &states, &lv.blake3_msg, next_same_blake);
-    let blake3_output = finalize_blake(eval, states[0], states[1], nv.is_new_blake);
-    for i in 0..8 {
-        eval.constraint_eq(lv.cv_out[i], blake3_output[i]);
-    }
+    verify_round_adds(eval, &states, &lv.blake3_msg);
     // The packed tweak rides the *next* row's CV_ROUTE_KEY_OR_TWEAK (row 1 of the compression).
     verify_init_state(eval, states[0], lv.is_new_blake, &lv.blake3_cv, nv.cv_route_key_or_tweak);
 
@@ -2005,182 +1974,82 @@ pub(crate) fn eval_blake3_constraints<V, S, E>(
     eval.constraint_first_row(lv.trace_row_index);
 }
 
-/// One half quarter-round of the G-function cascade (the deployed chip's `half_g`):
-/// `ea = a + packed(b) + m` (mod 2^32, unconditional), `ea = d ^ (ed <<< rot1)` (gated),
-/// `ec = c + packed(ed)` (mod 2^32, unconditional), `ec = b ^ (eb <<< rot2)` (gated);
-/// the produced bit columns `eb`/`ed` are boolean-checked unconditionally.
-#[allow(clippy::too_many_arguments)]
-fn half_g<V, S, E>(
-    eval: &mut E,
-    a: V,
-    b: &[V; 32],
-    c: V,
-    d: &[V; 32],
-    m: V,
-    second_half: bool,
-    expected_a: V,
-    expected_b: &[V; 32],
-    expected_c: V,
-    expected_d: &[V; 32],
-    is_activated: V,
-) where
-    V: Copy,
-    S: Copy,
-    E: Evaluator<V, S>,
-{
-    let (rot_1, rot_2) = if second_half { (8, 7) } else { (16, 12) };
-    let two = eval.i32(2);
-    let b_packed = eval.polyval(b, two);
-    add3_unchecked(eval, expected_a, a, b_packed, m);
-    xor_32_shift_if(eval, expected_a, d, expected_d, is_activated, rot_1);
-    let expected_d_packed = eval.polyval(expected_d, two);
-    add2_unchecked(eval, expected_c, c, expected_d_packed);
-    xor_32_shift_if(eval, expected_c, b, expected_b, is_activated, rot_2);
-}
-
-/// One full round between `states[0]` and `states[4]` (= the next row's input state): two
-/// column half-rounds then two diagonal half-rounds, message words in schedule order.
-fn verify_round<V, S, E>(eval: &mut E, states: &[&Blake3StateCols<V>; 5], msg: &[V; 16], is_activated: V)
+/// Reassembles a rotated word as `sum_i 2^(8i) * byte[i]`.
+fn pack_rotated_word<V, S, E>(eval: &mut E, word: &WordFragments<V>, rot: u32) -> V
 where
     V: Copy,
     S: Copy,
     E: Evaluator<V, S>,
 {
-    for i in 0..4 {
-        half_g(
-            eval,
-            states[0].row1[i],
-            &states[0].row2[i],
-            states[0].row3[i],
-            &states[0].row4[i],
-            msg[2 * i],
-            false,
-            states[1].row1[i],
-            &states[1].row2[i],
-            states[1].row3[i],
-            &states[1].row4[i],
-            is_activated,
-        );
-    }
-    for i in 0..4 {
-        half_g(
-            eval,
-            states[1].row1[i],
-            &states[1].row2[i],
-            states[1].row3[i],
-            &states[1].row4[i],
-            msg[2 * i + 1],
-            true,
-            states[2].row1[i],
-            &states[2].row2[i],
-            states[2].row3[i],
-            &states[2].row4[i],
-            is_activated,
-        );
-    }
-    for i in 0..4 {
-        half_g(
-            eval,
-            states[2].row1[i],
-            &states[2].row2[(i + 1) % 4],
-            states[2].row3[(i + 2) % 4],
-            &states[2].row4[(i + 3) % 4],
-            msg[8 + 2 * i],
-            false,
-            states[3].row1[i],
-            &states[3].row2[(i + 1) % 4],
-            states[3].row3[(i + 2) % 4],
-            &states[3].row4[(i + 3) % 4],
-            is_activated,
-        );
-    }
-    for i in 0..4 {
-        half_g(
-            eval,
-            states[3].row1[i],
-            &states[3].row2[(i + 1) % 4],
-            states[3].row3[(i + 2) % 4],
-            &states[3].row4[(i + 3) % 4],
-            msg[8 + 2 * i + 1],
-            true,
-            states[4].row1[i],
-            &states[4].row2[(i + 1) % 4],
-            states[4].row3[(i + 2) % 4],
-            &states[4].row4[(i + 3) % 4],
-            is_activated,
-        );
-    }
+    let bytes: [V; 4] = core::array::from_fn(|i| {
+        let (hi, lo, weight) = rotated_byte_indices(rot, i);
+        let weight = eval.u64(weight);
+        eval.mad(weight, word.xor_low[lo], word.xor_high[hi])
+    });
+    let c256 = eval.i32(256);
+    eval.polyval(&bytes, c256)
 }
 
-/// The finalization identity (deployed `finalize_blake`): on `is_activated` rows STATE1's bit
-/// halves are repurposed as decompositions of STATE0's packed halves, and the returned output
-/// expression is `v[i] ^ v[8+i]` — a bona-fide u32 because it is packed from boolean-checked
-/// bits.
-fn finalize_blake<V, S, E>(eval: &mut E, state0: &Blake3StateCols<V>, state1: &Blake3StateCols<V>, is_activated: V) -> [V; 8]
+/// Each half-round checks `a' = a + b + m` and `c' = c + d'` modulo 2^32.
+/// XOR8 bounds the round outputs; initialization pins the input words, and message
+/// ingestion bounds the message words. On finalization rows, intermediate states satisfy
+/// only these additions, leaving the next compression's input independent.
+fn verify_round_adds<V, S, E>(eval: &mut E, states: &[&Blake3StateCols<V>; 5], msg: &[V; 16])
 where
     V: Copy,
     S: Copy,
     E: Evaluator<V, S>,
 {
-    let two = eval.i32(2);
-    for i in 0..4 {
-        let row2_packed = eval.polyval(&state1.row2[i], two);
-        eval.constraint_eq_if(is_activated, state0.row1[i], row2_packed);
-        let row4_packed = eval.polyval(&state1.row4[i], two);
-        eval.constraint_eq_if(is_activated, state0.row3[i], row4_packed);
-    }
-    core::array::from_fn(|i| {
-        if i < 4 {
-            xor_32(eval, &state1.row2[i], &state1.row4[i])
-        } else {
-            xor_32(eval, &state0.row2[i - 4], &state0.row4[i - 4])
+    let c256 = eval.i32(256);
+    for h in 0..4 {
+        let (s_in, s_out) = (states[h], states[h + 1]);
+        for i in 0..4 {
+            let (bi, ci, di, m) = half_round_lane(h, i);
+            let a = eval.polyval(&s_in.a[i], c256);
+            let ea = eval.polyval(&s_out.a[i], c256);
+            let b = pack_rotated_word(eval, &s_in.b[bi], B_ROTATIONS[h]);
+            add3_mod32(eval, ea, a, b, msg[m]);
+            let c = eval.polyval(&s_in.c[ci], c256);
+            let ec = eval.polyval(&s_out.c[ci], c256);
+            let ed = eval.polyval(&s_out.d[di], c256);
+            add2_mod32(eval, ec, c, ed);
         }
-    })
+    }
 }
 
-/// The init-state check on `IS_NEW_BLAKE` rows (deployed `verify_init_state`): words 0..8 equal
-/// the muxed CV, words 8..12 the BLAKE3 IV, and the row4 bit block packs to the tweak
-/// (`counter(48) | flags(8) | block_len(7)` window, remaining bits zero).
+/// Pins `v = [CV, IV[0..4], counter_lo, counter_hi, block_len, flags]` at initialization.
+/// The tweak is `counter + 2^48*flags + 2^56*block_len`. XOR8 bounds the `d` bytes and
+/// `block_len < 128`, so the packed tweak is below 2^63 < p and cannot wrap in Goldilocks.
 fn verify_init_state<V, S, E>(eval: &mut E, init_state: &Blake3StateCols<V>, is_new_blake: V, cv: &[V; 8], blake3_tweak: V)
 where
     V: Copy,
     S: Copy,
     E: Evaluator<V, S>,
 {
-    let two = eval.i32(2);
+    let c256 = eval.i32(256);
     for i in 0..4 {
-        eval.constraint_eq_if(is_new_blake, init_state.row1[i], cv[i]);
+        let a = eval.polyval(&init_state.a[i], c256);
+        eval.constraint_eq_if(is_new_blake, a, cv[i]);
+        let b = pack_rotated_word(eval, &init_state.b[i], B_ROTATIONS[0]);
+        eval.constraint_eq_if(is_new_blake, b, cv[4 + i]);
+        let c = eval.polyval(&init_state.c[i], c256);
         let iv = eval.u64(BLAKE3_IV[i] as u64);
-        eval.constraint_eq_if(is_new_blake, init_state.row3[i], iv);
-        let row2_packed = eval.polyval(&init_state.row2[i], two);
-        eval.constraint_eq_if(is_new_blake, row2_packed, cv[i + 4]);
+        eval.constraint_eq_if(is_new_blake, c, iv);
     }
-    let active_bits: Vec<V> = init_state.row4[0]
-        .iter()
-        .chain(&init_state.row4[1][0..16])
-        .chain(&init_state.row4[3][0..8])
-        .chain(&init_state.row4[2][0..7])
-        .copied()
-        .collect();
-    let packed = eval.polyval(&active_bits, two);
+    // d = [counter_lo, counter_hi, block_len, flags]: tweak bytes in packing order, then zeros.
+    let d = &init_state.d;
+    let tweak_bytes = [d[0][0], d[0][1], d[0][2], d[0][3], d[1][0], d[1][1], d[3][0], d[2][0]];
+    let packed = eval.polyval(&tweak_bytes, c256);
     eval.constraint_eq_if(is_new_blake, packed, blake3_tweak);
-    let zero_bits: Vec<V> = init_state.row4[1][16..]
-        .iter()
-        .chain(&init_state.row4[2][7..])
-        .chain(&init_state.row4[3][8..])
-        .copied()
-        .collect();
-    for bit in zero_bits {
-        let zeroed = eval.mul(is_new_blake, bit);
+    for byte in [d[1][2], d[1][3], d[2][1], d[2][2], d[2][3], d[3][1], d[3][2], d[3][3]] {
+        let zeroed = eval.mul(is_new_blake, byte);
         eval.constraint(zeroed);
     }
 }
 
-/// `res = a + b + c (mod 2^32)`: `(diff)(diff - 2^32)(diff - 2^33) = 0` — unconditional
-/// (finalization rows satisfy it via the postprocess fill). The mod-2^32 reading is sound only
-/// because every operand is elsewhere bounded (packed bits, byte packings, or the routing
-/// lookup's 2^34-injective keys).
-fn add3_unchecked<V, S, E>(eval: &mut E, res: V, a: V, b: V, c: V)
+/// With u32 operands, `diff = a + b + c - res` must be 0, 2^32 or 2^33.
+/// Its range `(-2^32, 3*2^32)` excludes any other representative of these field roots.
+fn add3_mod32<V, S, E>(eval: &mut E, res: V, a: V, b: V, c: V)
 where
     V: Copy,
     S: Copy,
@@ -2197,8 +2066,8 @@ where
     eval.constraint(poly);
 }
 
-/// `res = a + b (mod 2^32)`: `(diff)(diff - 2^32) = 0` — unconditional.
-fn add2_unchecked<V, S, E>(eval: &mut E, res: V, a: V, b: V)
+/// `res = a + b (mod 2^32)` as `(diff)(diff - 2^32) = 0`; see [`add3_mod32`].
+fn add2_mod32<V, S, E>(eval: &mut E, res: V, a: V, b: V)
 where
     V: Copy,
     S: Copy,
@@ -2210,40 +2079,6 @@ where
     let diff_1 = eval.sub(diff, c2_32);
     let c = eval.mul(diff, diff_1);
     eval.constraint(c);
-}
-
-/// If activated, `res = a ^ (b <<< shift)` over the bit columns (i.e. `b = (res ^ a) >>> shift`,
-/// the rotation absorbed into the reindexing); `b`'s bits are boolean-checked unconditionally,
-/// which is what makes every packed state word a range-checked u32.
-fn xor_32_shift_if<V, S, E>(eval: &mut E, res: V, a: &[V; 32], b: &[V; 32], is_activated: V, shift: usize)
-where
-    V: Copy,
-    S: Copy,
-    E: Evaluator<V, S>,
-{
-    let two = eval.i32(2);
-    for &bit in b.iter() {
-        eval.constraint_bool(bit);
-    }
-    let xor_bits: [V; 32] = core::array::from_fn(|i| {
-        let a_bit = a[i];
-        let b_bit = b[(i + 32 - shift) % 32];
-        eval.xor_bit(a_bit, b_bit)
-    });
-    let xor = eval.polyval(&xor_bits, two);
-    eval.constraint_eq_if(is_activated, res, xor);
-}
-
-/// The packed XOR of two boolean-checked bit columns (no new constraints; degree 2).
-fn xor_32<V, S, E>(eval: &mut E, a: &[V; 32], b: &[V; 32]) -> V
-where
-    V: Copy,
-    S: Copy,
-    E: Evaluator<V, S>,
-{
-    let two = eval.i32(2);
-    let xor_bits: [V; 32] = core::array::from_fn(|i| eval.xor_bit(a[i], b[i]));
-    eval.polyval(&xor_bits, two)
 }
 
 // ==================================================================================================
@@ -2303,33 +2138,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for Blake3Stark<F
         3
     }
 
-    // Party to the strip-bytes, block-scales and lottery-words channels, plus the committed
-    // LUT channels (declared in `super::ctl`).
+    // Party to the strip-bytes, block-scales, lottery-words and CV-routing channels, plus the
+    // committed LUT channels (all declared in `super::ctl`).
     fn requires_ctls(&self) -> bool {
         true
-    }
-
-    /// The CV-routing lookup: every row publishes `CV_OUT` at key
-    /// `TRACE_ROW_INDEX` with witness multiplicity `CV_OUT_FREQ`; fetch rows (`IS_CV_IN`) consume
-    /// `CV_IN` at key `CV_ROUTE_KEY_OR_TWEAK`. One [`Lookup`] per CV word, all sharing the
-    /// multiplicity column (a consumer fetches the 8 words together under the same filter).
-    /// Keys are `word + 2^34 * row` — injective because the round block bounds any accepted
-    /// word below 2^34 (the `CV_ROUTING_KEY_FACTOR` bound) and `TRACE_ROW_INDEX` is a committed
-    /// counter.
-    fn lookups(&self) -> Vec<Lookup<F>> {
-        let m = &BLAKE3_COL_MAP;
-        let factor = F::from_canonical_u64(CV_ROUTING_KEY_FACTOR);
-        (0..8)
-            .map(|i| Lookup {
-                columns: vec![Column::linear_combination([
-                    (m.cv_in[i], F::ONE),
-                    (m.cv_route_key_or_tweak, factor),
-                ])],
-                table_column: Column::linear_combination([(m.cv_out[i], F::ONE), (m.trace_row_index, factor)]),
-                frequencies_column: Column::single(m.cv_out_freq),
-                filter_columns: vec![Filter::from_column(Column::single(m.is_cv_in))],
-            })
-            .collect()
     }
 }
 
@@ -2612,6 +2424,25 @@ mod tests {
             }
         }
         false
+    }
+
+    /// The trace in column-major [`PolynomialValues`] form (the LUT checker's input shape).
+    fn column_major(rows: &[[F; NUM_BLAKE3_COLUMNS]]) -> Vec<PolynomialValues<F>> {
+        (0..NUM_BLAKE3_COLUMNS)
+            .map(|c| PolynomialValues::new(rows.iter().map(|r| r[c]).collect()))
+            .collect()
+    }
+
+    /// Runs the committed-LUT checker over the full instance inventory and returns the number
+    /// of XOR8 lookups served.
+    fn xor8_lookups_served(rows: &[[F; NUM_BLAKE3_COLUMNS]], pis: &[F; NUM_BLAKE3_PUBLIC_INPUTS]) -> Result<u64, String> {
+        use crate::v4::api::public_params::Device;
+        use crate::v4::circuit::ctl::lut_tables;
+        use crate::v4::circuit::luts::{LutChecker, LutTable};
+
+        let mut checker = LutChecker::<F>::new(&lut_tables(Device::B200));
+        checker.check_trace(&super::super::ctl::blake3_lut_lookups(), &column_major(rows), pis, "blake3")?;
+        Ok(checker.multiplicities.table_total(LutTable::Xor8))
     }
 
     #[test]
@@ -3111,12 +2942,12 @@ mod tests {
         let (h, w, k, r) = small_geometry();
         let (program, _, mut rows, pis) = generate(h, w, k, r);
         let stark = S::new(program);
-        // A state word mid-compression (row 2 of compression 0, STATE1's packed half).
+        // A state byte mid-compression (row 2 of compression 0, STATE1's `a[0]` word).
         let row: &mut Blake3ColumnsView<F> = rows[2].borrow_mut();
-        row.round[1].row1[0] += F::ONE;
+        row.round[1].a[0][0] += F::ONE;
         assert!(
             constraints_violated(&stark, &rows, &pis),
-            "corrupt state word must break add3"
+            "corrupt state byte must break add3"
         );
     }
 
@@ -3163,20 +2994,20 @@ mod tests {
     }
 
     #[test]
-    fn tampered_rotation_bit_breaks_constraints() {
+    fn tampered_rotation_fragment_breaks_constraints() {
         let (h, w, k, r) = small_geometry();
         let (program, _, mut rows, pis) = generate(h, w, k, r);
         let stark = S::new(program);
-        // Flip one bit of a rotated/xored state word (STATE1's row2 bits feed the first
-        // half-round's xor recomposition and the next add3).
+        // Bump a low fragment of STATE1's `b[0]`: the reassembled word shifts, breaking the
+        // next half-round's add3 (the fragment's own XOR8 pin is checked in
+        // `tampered_xor_output_is_rejected_by_the_xor8_table`).
         {
             let row: &mut Blake3ColumnsView<F> = rows[1].borrow_mut();
-            let bit = &mut row.round[1].row2[0][5];
-            *bit = F::ONE - *bit;
+            row.round[1].b[0].xor_low[1] += F::ONE;
         }
         assert!(
             constraints_violated(&stark, &rows, &pis),
-            "flipped rotation bit must break the xor"
+            "corrupt rotation fragment must break the add"
         );
     }
 
@@ -3192,7 +3023,7 @@ mod tests {
         {
             let row: &mut Blake3ColumnsView<F> = rows[ROWS_PER_COMPRESSION * lottery + 7].borrow_mut();
             assert_eq!(row.is_bind_jackpot_hash, F::ONE);
-            row.cv_out[0] += F::ONE;
+            row.cv_out[0][0] += F::ONE;
         }
         let stark = S::new(program);
         assert!(
@@ -3214,6 +3045,41 @@ mod tests {
             constraints_violated(&stark, &rows, &pis),
             "corrupt row counter must break the increment"
         );
+    }
+
+    #[test]
+    fn honest_trace_is_served_by_the_xor8_table() {
+        let (h, w, k, r) = small_geometry();
+        let (program, _, rows, pis) = generate(h, w, k, r);
+        let compressions = program.instructions.len() as u64;
+        let padding = (rows.len() - ROWS_PER_COMPRESSION * program.instructions.len()) as u64;
+        // Per compression: 7 round rows × 128 XORs, 32 finalization XORs, 1 length check.
+        // Each padding row also has 32 finalization XORs and 1 length check.
+        let expected = compressions * (7 * 128 + 33) + padding * 33;
+        assert_eq!(xor8_lookups_served(&rows, &pis), Ok(expected));
+    }
+
+    #[test]
+    fn tampered_xor_output_is_rejected_by_the_xor8_table() {
+        let (h, w, k, r) = small_geometry();
+        let (program, _, mut rows, pis) = generate(h, w, k, r);
+        // Preserve the packed word while changing its fragments: only XOR8 detects this.
+        {
+            let row: &mut Blake3ColumnsView<F> = rows[1].borrow_mut();
+            row.round[1].b[0].xor_low[2] += F::ONE;
+            row.round[1].b[0].xor_high[1] -= F::from_canonical_u64(16);
+        }
+        assert!(
+            !constraints_violated(&S::new(program), &rows, &pis),
+            "the fragment tamper must be invisible to the arithmetic constraints"
+        );
+        xor8_lookups_served(&rows, &pis).expect_err("the XOR8 table must reject the skewed fragments");
+
+        // Check finalization independently, starting from a valid trace.
+        let (_, _, mut rows, pis) = generate(h, w, k, r);
+        let row: &mut Blake3ColumnsView<F> = rows[ROWS_PER_COMPRESSION - 1].borrow_mut();
+        row.cv_out[3][2] += F::ONE;
+        xor8_lookups_served(&rows, &pis).expect_err("the XOR8 table must reject the forged CV byte");
     }
 
     #[test]

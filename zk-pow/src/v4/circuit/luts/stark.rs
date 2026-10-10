@@ -45,6 +45,7 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 | LutTable::Width32
                 | LutTable::Width16
                 | LutTable::Pow2G => 2,
+                LutTable::Xor8 => 3,
                 LutTable::Int8Dec | LutTable::RneRnd => 4,
                 LutTable::ProdAlign15 | LutTable::B200Align => 5,
                 _ => 1,
@@ -65,6 +66,18 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
             LutTable::Pair128 => {
                 columns[0].push(f(key & 0x7F));
                 columns[1].push(f(key >> 7));
+            }
+            // `(x ^ y, h_slot, slot)` for `(x, y) = (key & 0xFF, key >> 8)`.
+            LutTable::Xor8 => {
+                let z = (key & 0xFF) ^ (key >> 8);
+                let high = match slot {
+                    0 => 0,
+                    1 => z >> 4,
+                    _ => z >> 7,
+                };
+                columns[0].push(f(z));
+                columns[1].push(f(high));
+                columns[2].push(f(slot as u64));
             }
             // fp8 quantization of a bf16 code: `f32_to_fp8_e4m3(bf16_to_f32(clamp_±448(x)))`,
             // via InputQuant's mirror. Non-finite keys (exponent field 255) cannot decode; they
@@ -222,6 +235,17 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
         // The stored key tuple is the whole precommitted block (live == height: both are
         // powers of two, so there is no padding).
         LutTable::Bytes2 | LutTable::Pair128 => cols.extend(generate::<F>(table, 0)),
+        // The byte pair `(x, y)`, then `x ^ y`, `(x ^ y) >> 4` and `(x ^ y) >> 7`.
+        LutTable::Xor8 => {
+            cols.extend(generate::<F>(LutTable::Bytes2, 0));
+            for shift in [0, 4, 7] {
+                cols.push(
+                    (0..height)
+                        .map(|key| F::from_canonical_usize(((key & 0xFF) ^ (key >> 8)) >> shift))
+                        .collect(),
+                );
+            }
+        }
         // Sub-height (or exactly-full) small tables: a saturated key column `min(i, live - 1)`
         // and the value columns padded alike — padding repeats the last live row's fact.
         LutTable::Int8Dec | LutTable::ExpInfo | LutTable::Clamp22 | LutTable::Pow2D | LutTable::Pow2Gb => {
@@ -371,10 +395,11 @@ impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize> Stark<F, 
     }
 }
 
-/// The AIRs at their exact widths (the batch instantiates the selected device's fifteen).
+/// The AIRs at their exact widths (the batch instantiates the selected device's sixteen).
 pub type RneRndStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::RneRnd) }>;
 pub type Range16Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Range16) }>;
 pub type Bytes2Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Bytes2) }>;
+pub type Xor8Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Xor8) }>;
 pub type QcastStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Qcast) }>;
 pub type Div448Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Div448) }>;
 pub type Pair128Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Pair128) }>;
@@ -398,6 +423,7 @@ pub(crate) fn boxed_lut_stark<F: RichField + Extendable<D>, const D: usize>(tabl
         LutTable::RneRnd => Box::new(RneRndStark::<F, D>::new(table)),
         LutTable::Range16 => Box::new(Range16Stark::<F, D>::new(table)),
         LutTable::Bytes2 => Box::new(Bytes2Stark::<F, D>::new(table)),
+        LutTable::Xor8 => Box::new(Xor8Stark::<F, D>::new(table)),
         LutTable::Qcast => Box::new(QcastStark::<F, D>::new(table)),
         LutTable::Div448 => Box::new(Div448Stark::<F, D>::new(table)),
         LutTable::Pair128 => Box::new(Pair128Stark::<F, D>::new(table)),

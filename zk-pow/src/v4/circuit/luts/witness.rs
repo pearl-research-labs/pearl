@@ -43,8 +43,9 @@ impl LutMultiplicities {
 
     /// Resolves one looked key tuple to its `(slot, row)`. `Err` when the tuple falls outside
     /// the table's committed domain — for an honest trace that is a bug in the trace or the
-    /// descriptor (several tables use the key domain itself as a range proof).
-    pub fn resolve(table: LutTable, keys: &[u64]) -> Result<(usize, usize), String> {
+    /// descriptor (several tables use the key domain itself as a range proof). XOR8 selects
+    /// its slot by the tag it binds as its last value.
+    pub fn resolve(table: LutTable, keys: &[u64], values: &[u64]) -> Result<(usize, usize), String> {
         let fold = |width: u32| -> Result<(usize, usize), String> {
             let (slot, row) = ((keys[0] >> width) as usize, (keys[0] & ((1 << width) - 1)) as usize);
             if slot >= num_slots(table) {
@@ -60,7 +61,7 @@ impl LutMultiplicities {
             }
         };
         let expected_keys = match table {
-            LutTable::Bytes2 | LutTable::Pair128 => 2,
+            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 => 2,
             _ => 1,
         };
         if keys.len() != expected_keys {
@@ -84,6 +85,16 @@ impl LutMultiplicities {
                 }
                 Ok((0, (keys[0] + (keys[1] << 7)) as usize))
             }
+            LutTable::Xor8 => {
+                if keys[0] >= 256 || keys[1] >= 256 {
+                    return Err(format!("XOR8 tuple ({}, {}) has an oversized byte", keys[0], keys[1]));
+                }
+                let slot = match values {
+                    [_, _, tag] if (*tag as usize) < num_slots(table) => *tag as usize,
+                    _ => return Err(format!("XOR8 values {values:?} carry no valid slot tag")),
+                };
+                Ok((slot, (keys[0] + (keys[1] << 8)) as usize))
+            }
             // WIDTH32's stored key is the shifted ramp [1, 32]: row = key - 1. Key 0 has no
             // row — this is the "no zero-width claim" soundness point.
             LutTable::Width32 => {
@@ -106,9 +117,9 @@ impl LutMultiplicities {
         }
     }
 
-    /// Records `mult` lookups of `keys` into `table`.
-    pub fn add(&mut self, table: LutTable, keys: &[u64], mult: u64) -> Result<(), String> {
-        let (slot, row) = Self::resolve(table, keys)?;
+    /// Records `mult` lookups of `keys` (bound to `values`) into `table`.
+    pub fn add(&mut self, table: LutTable, keys: &[u64], values: &[u64], mult: u64) -> Result<(), String> {
+        let (slot, row) = Self::resolve(table, keys, values)?;
         let table_position = self.table_position(table);
         self.counts[table_position][slot][row] += mult;
         Ok(())
@@ -176,7 +187,12 @@ impl<F: PrimeField64> LutChecker<F> {
                     .iter()
                     .map(|c| c.eval_table(trace, row, public_inputs).to_canonical_u64())
                     .collect();
-                let (slot, table_row) = LutMultiplicities::resolve(lookup.table, &keys).map_err(err)?;
+                let values: Vec<u64> = lookup
+                    .values
+                    .iter()
+                    .map(|c| c.eval_table(trace, row, public_inputs).to_canonical_u64())
+                    .collect();
+                let (slot, table_row) = LutMultiplicities::resolve(lookup.table, &keys, &values).map_err(err)?;
                 let outputs = self
                     .cache
                     .entry((lookup.table, slot))
@@ -186,15 +202,11 @@ impl<F: PrimeField64> LutChecker<F> {
                     LutTable::Bytes2 | LutTable::Pair128 => 0,
                     _ => outputs.len(),
                 };
-                if lookup.values.len() != expected_arity {
-                    return Err(err(format!(
-                        "binds {} values, table returns {expected_arity}",
-                        lookup.values.len()
-                    )));
+                if values.len() != expected_arity {
+                    return Err(err(format!("binds {} values, table returns {expected_arity}", values.len())));
                 }
-                for (i, query) in lookup.values.iter().enumerate() {
-                    let got = query.eval_table(trace, row, public_inputs);
-                    let want = outputs[i][table_row];
+                for (i, &got) in values.iter().enumerate() {
+                    let want = outputs[i][table_row].to_canonical_u64();
                     if got != want {
                         return Err(err(format!(
                             "value {i} = {got:?} differs from {want:?} (slot {slot}, table row {table_row})"
