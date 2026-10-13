@@ -498,3 +498,115 @@ func TestWriteMessageWireErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestMessageSizeMatchesEncoding verifies MessageSize reports exactly the
+// number of payload bytes a message occupies on the wire for both the
+// base and witness encodings of populated samples of every message type
+// that can grow beyond a few bytes.
+func TestMessageSizeMatchesEncoding(t *testing.T) {
+	hash := chainhash.Hash{0x01}
+	hash2 := chainhash.Hash{0x02}
+
+	// inv with a varint count of three inventory vectors.
+	inv := NewMsgInv()
+	inv.AddInvVect(NewInvVect(InvTypeTx, &hash))
+	inv.AddInvVect(NewInvVect(InvTypeBlock, &hash2))
+	inv.AddInvVect(NewInvVect(InvTypeWitnessTx, &hash))
+
+	// getdata with the same shape as inv but a different command.
+	getData := NewMsgGetData()
+	getData.AddInvVect(NewInvVect(InvTypeTx, &hash))
+	getData.AddInvVect(NewInvVect(InvTypeBlock, &hash2))
+	getData.AddInvVect(NewInvVect(InvTypeWitnessTx, &hash))
+
+	// notfound with the same shape as inv but a different command.
+	notFound := NewMsgNotFound()
+	notFound.AddInvVect(NewInvVect(InvTypeTx, &hash))
+	notFound.AddInvVect(NewInvVect(InvTypeBlock, &hash2))
+	notFound.AddInvVect(NewInvVect(InvTypeWitnessTx, &hash))
+
+	// cfilter carrying an arbitrary amount of filter data.
+	cfilter := NewMsgCFilter(GCSFilterRegular, &hash, make([]byte, 300))
+
+	// cfcheckpt with three filter header hashes.
+	cfCheckpt := NewMsgCFCheckpt(GCSFilterRegular, &hash, 3)
+	cfCheckpt.AddCFHeader(&hash)
+	cfCheckpt.AddCFHeader(&hash2)
+	cfCheckpt.AddCFHeader(&hash)
+
+	// merkleblock with two transaction hashes and three flag bytes.
+	merkleBlock := NewMsgMerkleBlock(NewBlockHeader(1, &hash, &hash2, 1))
+	merkleBlock.Transactions = 2
+	merkleBlock.AddTxHash(&hash)
+	merkleBlock.AddTxHash(&hash2)
+	merkleBlock.Flags = []byte{0x01, 0x02, 0x03}
+
+	// reject carrying a hash (block rejection) and one without.
+	rejectBlock := NewMsgReject(CmdBlock, RejectDuplicate, "duplicate")
+	rejectBlock.Hash = hash
+	rejectMisc := NewMsgReject(CmdGetAddr, RejectMalformed, "bad")
+
+	// headers with two certified block headers carrying a near-maximum
+	// proof, the shape handlers use to stream large replies.
+	headers := NewMsgHeaders()
+	for i := 0; i < 2; i++ {
+		cert := &CertificateV1{
+			Hash:      chainhash.Hash{byte(i)},
+			ProofData: make([]byte, 51200),
+		}
+		err := headers.AddBlockHeader(*NewBlockHeader(1, &hash, &hash2, 1), cert)
+		require.NoError(t, err)
+	}
+
+	// A transaction with witness data, which encodes differently under
+	// the base and witness encodings.
+	witnessTx := NewMsgTx(1)
+	witnessTx.AddTxIn(&TxIn{
+		PreviousOutPoint: OutPoint{Hash: hash, Index: 0},
+		SignatureScript:  []byte{0x01, 0x02},
+		Witness:          TxWitness{{0x03}, {0x04}},
+	})
+	witnessTx.AddTxOut(&TxOut{
+		Value:    1,
+		PkScript: []byte{0x51},
+	})
+
+	// A block with a certified header and the witness transaction above.
+	block := &MsgBlock{
+		MsgHeader: MsgHeader{
+			BlockHeader: *NewBlockHeader(1, &hash, &hash2, 1),
+			MsgCertificate: MsgCertificate{
+				Certificate: &CertificateV1{
+					Hash:      hash,
+					ProofData: make([]byte, 51200),
+				},
+			},
+		},
+	}
+	require.NoError(t, block.AddTransaction(witnessTx))
+
+	tests := []struct {
+		name string
+		msg  Message
+	}{
+		{"inv", inv},
+		{"getdata", getData},
+		{"notfound", notFound},
+		{"cfilter", cfilter},
+		{"cfcheckpt", cfCheckpt},
+		{"merkleblock", merkleBlock},
+		{"reject with hash", rejectBlock},
+		{"reject without hash", rejectMisc},
+		{"headers", headers},
+		{"tx", witnessTx},
+		{"block", block},
+	}
+
+	for _, test := range tests {
+		for _, enc := range []MessageEncoding{BaseEncoding, WitnessEncoding} {
+			var buf bytes.Buffer
+			require.NoError(t, test.msg.PrlEncode(&buf, ProtocolVersion, enc), "%s (%v)", test.name, enc)
+			assert.Equal(t, buf.Len(), MessageSize(test.msg, ProtocolVersion, enc), "%s (%v)", test.name, enc)
+		}
+	}
+}

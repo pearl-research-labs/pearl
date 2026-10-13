@@ -17,6 +17,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/wire"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -801,10 +802,8 @@ func TestLocateInventory(t *testing.T) {
 		if test.maxAllowed != 0 {
 			// Need to use the unexported function to override the
 			// max allowed for headers.
-			chain.chainLock.RLock()
 			headers = chain.locateHeaders(test.locator,
 				&test.hashStop, test.maxAllowed, true)
-			chain.chainLock.RUnlock()
 		} else {
 			headers = chain.LocateHeaders(test.locator,
 				&test.hashStop, true)
@@ -838,18 +837,14 @@ func TestLocateHeadersCertificateFiltering(t *testing.T) {
 	locator := BlockLocator{&chain.bestChain.Genesis().hash}
 
 	// With includeCerts=true, all headers should have certificates.
-	chain.chainLock.RLock()
 	headers := chain.locateHeaders(locator, &chainhash.Hash{}, 100, true)
-	chain.chainLock.RUnlock()
 
 	require.Len(headers, 2)
 	require.NotNil(headers[0].BlockCertificate())
 	require.NotNil(headers[1].BlockCertificate())
 
 	// With includeCerts=false, no headers should have certificates.
-	chain.chainLock.RLock()
 	headers = chain.locateHeaders(locator, &chainhash.Hash{}, 100, false)
-	chain.chainLock.RUnlock()
 
 	require.Len(headers, 2)
 	require.Nil(headers[0].BlockCertificate())
@@ -1779,6 +1774,39 @@ func TestReconsiderBlock(t *testing.T) {
 					require.Equal(testChainTip, gotChainTip, "TestReconsiderBlock Failed test \"%s\". Expected chain tip with height %d, hash %s, branchlen %d, status \"%s\" but got height %d, hash %s, branchlen %d, status \"%s\"", test.name, testChainTip.Height, testChainTip.BlockHash.String(), testChainTip.BranchLen, testChainTip.Status.String(), gotChainTip.Height, gotChainTip.BlockHash.String(), gotChainTip.BranchLen, gotChainTip.Status.String())
 				}
 			}
+		})
+	}
+}
+
+func TestOrphanRootAndMissingAncestor(t *testing.T) {
+	chain := &BlockChain{orphans: make(map[chainhash.Hash]*orphanBlock)}
+	addOrphan := func(prev chainhash.Hash) chainhash.Hash {
+		block := btcutil.NewBlock(&wire.MsgBlock{
+			MsgHeader: wire.MsgHeader{BlockHeader: wire.BlockHeader{PrevBlock: prev}},
+		})
+		chain.orphans[*block.Hash()] = &orphanBlock{block: block}
+		return *block.Hash()
+	}
+	missing := chainhash.Hash{0x01}
+	root := addOrphan(missing)
+	middle := addOrphan(root)
+	tip := addOrphan(middle)
+
+	tests := []struct {
+		name        string
+		hash        chainhash.Hash
+		wantRoot    chainhash.Hash
+		wantMissing *chainhash.Hash
+	}{
+		{name: "tip", hash: tip, wantRoot: root, wantMissing: &missing},
+		{name: "middle", hash: middle, wantRoot: root, wantMissing: &missing},
+		{name: "root", hash: root, wantRoot: root, wantMissing: &missing},
+		{name: "not an orphan", hash: missing, wantRoot: missing},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantRoot, *chain.GetOrphanRoot(&tt.hash))
+			assert.Equal(t, tt.wantMissing, chain.MissingAncestor(&tt.hash))
 		})
 	}
 }

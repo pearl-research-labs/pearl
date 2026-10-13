@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/pearl-research-labs/pearl/xmss"
 )
 
 // TestOpcodeDisabled tests the opcodeDisabled function manually because all
@@ -218,5 +220,36 @@ func TestOpcodeDisasm(t *testing.T) {
 				expectedStr)
 			continue
 		}
+	}
+}
+
+func TestOpcodeCheckXmssSigWrongLengthNullFail(t *testing.T) {
+	t.Parallel()
+
+	const sigChunkSize = xmss.SignatureLen / 5
+	fullChunks := []int{sigChunkSize, sigChunkSize, sigChunkSize, sigChunkSize, sigChunkSize}
+	op := &opcodeArray[OP_CHECKXMSSSIG]
+
+	tests := []struct {
+		name      string
+		chunkLens []int
+		pk        []byte
+	}{
+		{"wrong-length pk", fullChunks, []byte{0x01}},
+		{"wrong-length sig chunk", []int{sigChunkSize, sigChunkSize, 10, sigChunkSize, sigChunkSize}, make([]byte, xmss.PKLen)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := &Engine{tapscriptCtx: &tapscriptExecutionCtx{}}
+			for _, n := range tc.chunkLens {
+				vm.dstack.PushByteArray(make([]byte, n))
+			}
+			vm.dstack.PushByteArray(tc.pk)
+
+			err := opcodeCheckXmssSig(op, nil, vm)
+			if !IsErrorCode(err, ErrNullFail) {
+				t.Fatalf("got %v, want ErrNullFail", err)
+			}
+		})
 	}
 }

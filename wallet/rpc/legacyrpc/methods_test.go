@@ -11,6 +11,26 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestSendTxError(t *testing.T) {
+	wrapped := fmt.Errorf("%w: no peers", chain.ErrTxNotRelayed)
+	for _, tt := range []struct {
+		name     string
+		err      error
+		wantCode btcjson.RPCErrorCode
+	}{
+		{"preflight", chain.ErrTxNotRelayed, btcjson.ErrRPCClientNotConnected},
+		{"wrapped preflight", wrapped, btcjson.ErrRPCClientNotConnected},
+		{"text lookalike", errors.New("peer says not relayed"), btcjson.ErrRPCInternal.Code},
+		{"other", errors.New("db closed"), btcjson.ErrRPCInternal.Code},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rpcErr := sendTxError(tt.err)
+			assert.Equal(t, tt.wantCode, rpcErr.Code)
+			assert.Equal(t, tt.err.Error(), rpcErr.Message)
+		})
+	}
+}
+
 // TestPendingTxError pins the RPC codes clients branch on for the pending-transaction commands.
 func TestPendingTxError(t *testing.T) {
 	notRelayed := fmt.Errorf("%w: no peer requested", chain.ErrTxNotRelayed)

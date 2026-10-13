@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 	"html"
+	"html/template"
 	"log"
 	"net/http"
-	"text/template"
 	"time"
 )
 
@@ -186,9 +186,16 @@ func statusNGHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type webstatus struct {
-	Key    string
-	Value  string
-	Seeder string
+	Key        string
+	Seeder     string
+	Kind       string
+	FailCount  uint32
+	DNSType    string
+	Version    int32
+	StrVersion string
+	LastBlock  int32
+	LastTryAgo string
+	StatusStr  string
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request, status uint32) {
@@ -221,7 +228,10 @@ func statusHandler(w http.ResponseWriter, r *http.Request, status uint32) {
 	       <a href="/node?s={{.Seeder}}&nd={{.Key}}">{{.Key}}</a>
 	  </td>
 	  <td>
-	       {{.Value}}
+	       {{if eq .Kind "rg"}}<b>Fail Count:</b> {{.FailCount}} <b>DNS Type:</b> {{.DNSType}}{{end}}
+	       {{if eq .Kind "cg"}}<b>Remote Version:</b> {{.Version}}{{.StrVersion}} <b>Last Block:</b> {{.LastBlock}} <b>DNS Type:</b> {{.DNSType}}{{end}}
+	       {{if eq .Kind "wg"}}<b>Last Try:</b> {{.LastTryAgo}} ago <b>Last Status:</b> {{.StatusStr}}{{end}}
+	       {{if eq .Kind "ng"}}<b>Fail Count:</b> {{.FailCount}} <b>Last Try:</b> {{.LastTryAgo}} ago <b>Last Status:</b> {{.StatusStr}}{{end}}
 	  </td>
 	  </tr>
 	     {{end}}
@@ -266,45 +276,38 @@ func generateWebStatus(s *dnsseeder, status uint32) (ws []webstatus) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	var valueStr string
-
 	for k, v := range s.theList {
 		if v.status != status {
 			continue
 		}
 
-		switch status {
-		case statusRG:
-			valueStr = fmt.Sprintf("<b>Fail Count:</b> %v <b>DNS Type:</b> %s",
-				v.connectFails,
-				v.dns2str())
-		case statusCG:
-			valueStr = fmt.Sprintf("<b>Remote Version:</b> %v%s <b>Last Block:</b> %v <b>DNS Type:</b> %s",
-				v.version,
-				v.strVersion,
-				v.lastBlock,
-				v.dns2str())
-
-		case statusWG:
-			valueStr = fmt.Sprintf("<b>Last Try:</b> %s ago <b>Last Status:</b> %s\n",
-				time.Since(v.lastTry).String(),
-				v.statusStr)
-
-		case statusNG:
-			valueStr = fmt.Sprintf("<b>Fail Count:</b> %v <b>Last Try:</b> %s ago <b>Last Status:</b> %s\n",
-				v.connectFails,
-				time.Since(v.lastTry).String(),
-				v.statusStr)
-
-		default:
-			valueStr = ""
-		}
-
 		ows := webstatus{
 			Key:    k,
-			Value:  valueStr,
 			Seeder: s.name,
 		}
+
+		switch status {
+		case statusRG:
+			ows.Kind = "rg"
+			ows.FailCount = v.connectFails
+			ows.DNSType = v.dns2str()
+		case statusCG:
+			ows.Kind = "cg"
+			ows.Version = v.version
+			ows.StrVersion = v.strVersion
+			ows.LastBlock = v.lastBlock
+			ows.DNSType = v.dns2str()
+		case statusWG:
+			ows.Kind = "wg"
+			ows.LastTryAgo = time.Since(v.lastTry).String()
+			ows.StatusStr = v.statusStr
+		case statusNG:
+			ows.Kind = "ng"
+			ows.FailCount = v.connectFails
+			ows.LastTryAgo = time.Since(v.lastTry).String()
+			ows.StatusStr = v.statusStr
+		}
+
 		ws = append(ws, ows)
 	}
 

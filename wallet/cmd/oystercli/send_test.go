@@ -5,11 +5,53 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRetryNotRelayedSend(t *testing.T) {
+	notRelayed := &btcjson.RPCError{Code: btcjson.ErrRPCClientNotConnected, Message: "no connected peers"}
+	lookalike := &btcjson.RPCError{Code: btcjson.ErrRPCInternal.Code, Message: "peer says not relayed"}
+	plain := errors.New("not relayed")
+	tests := []struct {
+		name      string
+		err       error
+		wantRetry bool
+		wantErr   error
+	}{
+		{"typed preflight", notRelayed, true, nil},
+		{"wrapped preflight", fmt.Errorf("wrap: %w", notRelayed), true, nil},
+		{"text lookalike", lookalike, false, lookalike},
+		{"wrapped text lookalike", fmt.Errorf("wrap: %w", lookalike), false, lookalike},
+		{"plain text lookalike", plain, false, plain},
+		{"success", nil, false, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			printed := scriptedTerminal(t, "\n")
+			retry, err := retryNotRelayedSend(tt.err)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantRetry, retry)
+			output := printed()
+			if tt.wantRetry {
+				assert.Contains(t, output, "funds are untouched")
+				assert.Contains(t, output, "Try again?")
+				assert.Contains(t, output, "[Y/n]")
+			} else {
+				assert.Empty(t, output, "generic errors must not claim untouched funds or offer Retry")
+			}
+		})
+	}
+}
 
 // An empty fee field must select the relay floor, never 0: oyster passes the
 // rate through literally, and a zero-fee transaction is rejected at broadcast

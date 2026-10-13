@@ -25,10 +25,10 @@ for its exact location — point them at the built `oyster`, or pass
 ## What it does
 
 - **Overview** — per-account balances, pending funds, recent activity.
-- **Send** — guided flow with address/amount validation, a review step, and
-  automatic unlock prompting; the fee rate defaults to the network's minimum
-  relay fee (0.00001 PRL/kB). When no peer accepts the transaction it says
-  nothing was sent and offers to retry the same send.
+- **Send** — guided flow with address/amount validation, a review step, and automatic unlock prompting; the fee rate
+  defaults to the network's minimum relay fee (0.00001 PRL/kB). Under SPV, an offline send is rejected before signing.
+  Once a payment is stored, the daemon returns its txid and keeps it pending even if peers reject it or do not request
+  it.
 - **Receive** — fresh or current addresses, rendered with a scannable QR code.
 - **Transactions** — paged history browser, newest first, with page filtering
   and a full detail view. Pages are sized to the terminal, so the **Older** and
@@ -137,32 +137,41 @@ are not offered; that machine's operator owns its configuration.
 
 ## Pending transactions
 
-Under SPV the daemon announces a transaction to its peers exactly once, when
-it is sent, and never re-announces on its own (Electrum's model). A send fails
-outright when no peer requests the transaction, so a pending entry is one a
-peer did take at the time. The daemon cannot see mempools, so it cannot tell
-whether peers still hold it later; if a send stays pending, rebroadcast it.
+Under SPV, a new send requires at least one connected peer. If none are connected, the daemon rejects the send before
+signing or storing a payment. Once the signed transaction is stored, the daemon retains it as pending and returns its
+txid even if peers reject it, disconnect, or never request it. The payment's inputs remain reserved while it is pending.
 
-The two actions below apply to sends this wallet made. An incoming payment
-that is still unconfirmed gets neither: the daemon never announced it, so
-there is no send to rebroadcast or remove.
+Fresh sends rejected by that check return JSON-RPC code `-9` (`btcjson.ErrRPCClientNotConnected`). Oystercli uses only
+this code to show that funds were untouched and offer **Retry** for a fresh send. It never infers this from the error
+message. Other failures, including text containing "not relayed" and older daemons' message-only errors, use the generic
+failure flow.
+
+A returned txid identifies a pending payment; it does not prove peer acceptance or confirmation. SPV makes one initial
+broadcast attempt and does not rebroadcast automatically. Retry using the original txid and signed transaction; creating
+another send can pay the recipient twice. A retained payment stays pending until confirmed, conflicted by a verified
+block, or explicitly removed.
+
+The offline check applies when the wallet is asked to create a new payment: it can stop before a signed transaction
+exists. `PublishTransaction` instead receives a transaction that has already been signed. For example, a caller could
+send that transaction through another node before asking this wallet to publish it. Having no SPV peers connected now
+does not rule out that earlier broadcast. The wallet therefore stores relevant signed transactions as pending and
+attempts to relay them, even with zero connected SPV peers.
+
+The two actions below apply to sends this wallet made. An incoming payment that is still unconfirmed gets neither: the
+daemon never announced it, so there is no send to rebroadcast or remove.
 
 From a pending send's detail view:
 
-- **Rebroadcast** — announces it again, pending ancestors first, via
-  `rebroadcasttransaction`. Success means a peer requested it. "No peer
-  requested it" is ambiguous by construction: peers that already hold the
-  transaction stay silent, so it also happens when every connected peer has
-  it. A rejection is shown and the transaction stays pending; Remove drops it.
-- **Remove** — forgets it, and every pending transaction spending from it,
-  via `removetransaction`, so their inputs become spendable again. The
-  network is not consulted: a peer that already holds the transaction may
-  still mine it, and spending the freed inputs again is then a double-spend
-  attempt. The CLI always asks for confirmation first.
+- **Rebroadcast** — announces it again, pending ancestors first, via `rebroadcasttransaction`, and reports that
+  attempt's relay result. Success does not prove acceptance or confirmation. "No peer requested it" can also mean peers
+  already hold the signed transaction, so this result keeps generic JSON-RPC code `-32603` and never offers a fresh-send
+  Retry. A rejection is shown and the transaction stays pending; Remove drops it.
+- **Remove** — forgets it, and every pending transaction spending from it, via `removetransaction`, so their inputs
+  become spendable again. The network is not consulted: a peer that already holds the transaction may still mine it, and
+  spending the freed inputs again is then a double-spend attempt. The CLI always asks for confirmation first.
 
-Both are available in the RPC console as well, and neither is ever run
-automatically. Both also work with a pearld-backed daemon, which in addition
-resends pending transactions after each rescan.
+Both are available in the RPC console as well, and neither is ever run automatically. Both also work with a
+pearld-backed daemon, which in addition resends pending transactions after each rescan.
 
 ## Testnet
 

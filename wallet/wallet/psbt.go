@@ -416,24 +416,24 @@ func (w *Wallet) FinalizePsbt(keyScope *waddrmgr.KeyScope, account uint32,
 			continue
 		}
 
-		// Find out what UTXO we are signing. Wallets _should_ always
-		// provide the full non-witness UTXO for segwit v0.
+		// Find out what UTXO we are signing. Wallets _should_ always provide the full
+		// non-witness UTXO for segwit v0.
 		var signOutput *wire.TxOut
 		if in.NonWitnessUtxo != nil {
 			prevIndex := txIn.PreviousOutPoint.Index
-			signOutput = in.NonWitnessUtxo.TxOut[prevIndex]
+			signOutput, err = psbt.NonWitnessUtxoOutput(in.NonWitnessUtxo, prevIndex)
+			if err != nil {
+				return err
+			}
 
 			if !psbt.TxOutsEqual(txOut, signOutput) {
-				return fmt.Errorf("found UTXO %#v but it "+
-					"doesn't match PSBT's input %v", txOut,
-					signOutput)
+				return fmt.Errorf("found UTXO %#v but it doesn't match PSBT's input %v",
+					txOut, signOutput)
 			}
 
 			if fullTx.TxHash() != txIn.PreviousOutPoint.Hash {
-				return fmt.Errorf("found UTXO tx %v but it "+
-					"doesn't match PSBT's input %v",
-					fullTx.TxHash(),
-					txIn.PreviousOutPoint.Hash)
+				return fmt.Errorf("found UTXO tx %v but it doesn't match PSBT's input %v",
+					fullTx.TxHash(), txIn.PreviousOutPoint.Hash)
 			}
 		}
 
@@ -522,19 +522,18 @@ func PsbtPrevOutputFetcher(packet *psbt.Packet) *txscript.MultiPrevOutFetcher {
 
 		if in.NonWitnessUtxo != nil {
 			prevIndex := txIn.PreviousOutPoint.Index
-			fetcher.AddPrevOut(
-				txIn.PreviousOutPoint,
-				in.NonWitnessUtxo.TxOut[prevIndex],
-			)
+			prevOut, err := psbt.NonWitnessUtxoOutput(in.NonWitnessUtxo, prevIndex)
+			if err != nil {
+				continue
+			}
+			fetcher.AddPrevOut(txIn.PreviousOutPoint, prevOut)
 
 			continue
 		}
 
 		// Fall back to witness UTXO only for older wallets.
 		if in.WitnessUtxo != nil {
-			fetcher.AddPrevOut(
-				txIn.PreviousOutPoint, in.WitnessUtxo,
-			)
+			fetcher.AddPrevOut(txIn.PreviousOutPoint, in.WitnessUtxo)
 		}
 	}
 

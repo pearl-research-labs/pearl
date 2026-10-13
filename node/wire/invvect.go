@@ -58,6 +58,18 @@ func (invtype InvType) String() string {
 	return fmt.Sprintf("Unknown InvType (%d)", uint32(invtype))
 }
 
+// IsBlock reports whether invtype refers to a full block, with or
+// without witness data.
+func (invtype InvType) IsBlock() bool {
+	return invtype == InvTypeBlock || invtype == InvTypeWitnessBlock
+}
+
+// IsTx reports whether invtype refers to a transaction, with or without
+// witness data.
+func (invtype InvType) IsTx() bool {
+	return invtype == InvTypeTx || invtype == InvTypeWitnessTx
+}
+
 // InvVect defines a inventory vector which is used to describe data,
 // as specified by the Type field, that a peer wants, has, or does not have to
 // another peer.

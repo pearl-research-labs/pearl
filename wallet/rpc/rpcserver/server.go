@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"time"
 
@@ -756,6 +757,27 @@ func (s *loaderServer) CloseWallet(ctx context.Context, req *pb.CloseWalletReque
 	return &pb.CloseWalletResponse{}, nil
 }
 
+// isLoopbackLiteral expects either "localhost" or some ip that means "loopback" like 127.0.0.1.
+// Strict parsing: non-canonical spellings are rejected (LOCALHOST, localhost., 127.1, [::1%lo0]).
+// Host names are never resolved, so one that resolves to loopback is rejected too.
+func isLoopbackLiteral(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		// Usually a missing port, so retry with the whole input as the host.
+		host = hostport
+	}
+
+	if host == "localhost" {
+		return true
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+
+	return false
+}
+
 func (s *loaderServer) StartConsensusRpc(ctx context.Context, // nolint:golint
 	req *pb.StartConsensusRpcRequest) (*pb.StartConsensusRpcResponse,
 	error) {
@@ -776,6 +798,17 @@ func (s *loaderServer) StartConsensusRpc(ctx context.Context, // nolint:golint
 			"Network address is ill-formed: %v", err)
 	}
 
+	// An omitted certificate disables TLS, which api.md permits only for a
+	// loopback backend.
+	disableTLS := len(req.Certificate) == 0
+	if disableTLS && !isLoopbackLiteral(networkAddress) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"Certificate is required: network address %v is not a "+
+				"loopback literal (\"localhost\", 127.0.0.0/8 or "+
+				"::1), and host names are not resolved",
+			networkAddress)
+	}
+
 	// Error if the wallet is already syncing with the network.
 	wallet, walletLoaded := s.loader.LoadedWallet()
 	if walletLoaded && wallet.SynchronizingToNetwork() {
@@ -784,7 +817,7 @@ func (s *loaderServer) StartConsensusRpc(ctx context.Context, // nolint:golint
 	}
 
 	rpcClient, err := chain.NewRPCClient(s.activeNet.Params, networkAddress, req.Username,
-		string(req.Password), req.Certificate, len(req.Certificate) == 0, 1)
+		string(req.Password), req.Certificate, disableTLS, 1)
 	if err != nil {
 		return nil, translateError(err)
 	}

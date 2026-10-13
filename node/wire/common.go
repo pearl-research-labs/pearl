@@ -622,6 +622,12 @@ func VarIntSerializeSize(val uint64) int {
 	return 9
 }
 
+// varLenSize returns the number of bytes n elements of elemSize bytes take
+// when serialized after their varint count.
+func varLenSize(n, elemSize int) int {
+	return VarIntSerializeSize(uint64(n)) + n*elemSize
+}
+
 // ReadVarString reads a variable length string from r and returns it as a Go
 // string.  A variable length string is encoded as a variable length integer
 // containing the length of the string followed by the bytes that represent the

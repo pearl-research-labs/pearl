@@ -319,17 +319,13 @@ func rebroadcastPendingTx(c *client, txid string) error {
 		announced, callErr = c.rebroadcastTransaction(txid)
 		return callErr
 	})
-	switch {
-	case isNotRelayedError(err):
-		printWarn("No peer requested it: either every connected peer already has it, or none will take it.")
-		printWarn(rawErrorDetail(err))
-		return nil
-	case err != nil:
+	if err != nil {
 		return err
 	}
 
 	if len(announced) > 1 {
-		printSuccess(fmt.Sprintf("A peer requested the transaction and %d pending ancestor(s).", len(announced)-1))
+		printSuccess(fmt.Sprintf("A peer requested the transaction and %d pending ancestor(s).",
+			len(announced)-1))
 	} else {
 		printSuccess("A peer requested the transaction.")
 	}

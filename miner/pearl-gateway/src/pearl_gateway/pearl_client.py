@@ -27,9 +27,7 @@ class PearlNodeClient:
 
         logger.info(f"Using mining address: {self.mining_address}")
 
-        logger.info(
-            f"PearlNodeClient initialized with rpc_url: {self.rpc_url}, rpc_user: {config.rpc_user}, rpc_password: {config.rpc_password}"
-        )
+        logger.info(f"PearlNodeClient initialized with rpc_url: {self.rpc_url}")
 
     def _create_session(self) -> aiohttp.ClientSession:
         """Create an HTTP session."""
