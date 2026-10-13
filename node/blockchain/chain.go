@@ -2241,6 +2241,20 @@ func New(config *Config) (*BlockChain, error) {
 		return nil, AssertError("blockchain.New SaltedSeedForkHeight must not " +
 			"precede MoEForkHeight")
 	}
+	if config.ChainParams.Fp8ForkHeight < 0 {
+		return nil, AssertError("blockchain.New Fp8ForkHeight must be >= 0")
+	}
+	// V4 supersedes V3 (or V2 when the salted-seed fork is disabled).
+	if config.ChainParams.Fp8ForkHeight != 0 {
+		predecessor := config.ChainParams.SaltedSeedForkHeight
+		if predecessor == 0 {
+			predecessor = config.ChainParams.MoEForkHeight
+		}
+		if predecessor != 0 && config.ChainParams.Fp8ForkHeight < predecessor {
+			return nil, AssertError("blockchain.New Fp8ForkHeight must not " +
+				"precede the V3/V2 cutover it supersedes")
+		}
+	}
 
 	// Generate a checkpoint by height map from the provided checkpoints
 	// and assert the provided checkpoints are sorted by height as required.

@@ -4,10 +4,11 @@ Test submission service functionality.
 
 import asyncio
 import dataclasses
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import pearl_mining
 import pytest
-from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion, ZKCertificate
 from pearl_gateway.submission_service import SubmissionService
 
 
@@ -30,6 +31,27 @@ def create_mock_block(hex_data: str):
     mock_block = MagicMock()
     mock_block.serialize.return_value = bytes.fromhex(hex_data)
     return mock_block
+
+
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("count", [0, 3])
+async def test_build_block_preserves_the_proof_chain(
+    mock_pearl_client, sample_block_template, pooled, count
+):
+    headers = tuple(bytes([i + 1]) * 108 for i in range(count))
+    plain_proof = Mock(
+        spec=pearl_mining.PlainProofV4,
+        ancestor_chain=[pearl_mining.BlockHeader.from_bytes(h) for h in headers],
+    )
+    template = dataclasses.replace(
+        sample_block_template, required_cert_version=CertificateVersion.PLAIN_FP8
+    )
+    pool = Mock(prove=AsyncMock(return_value=(b"public", b"proof"))) if pooled else None
+    service = SubmissionService(mock_pearl_client, proof_pool=pool)
+    with patch("pearl_gateway.proof_generator.prove", return_value=(b"public", b"proof")):
+        block = await service._build_block(plain_proof, template)
+    certificate = ZKCertificate.deserialize(block.zk_certificate.serialize())
+    assert tuple(h.serialize() for h in certificate.ancestor_headers) == headers
 
 
 class TestBlockSubmission:

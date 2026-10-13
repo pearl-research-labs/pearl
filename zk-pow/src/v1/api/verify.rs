@@ -2,7 +2,6 @@ use anyhow::{Result, bail, ensure};
 use plonky2_field::extension::FieldExtension;
 use plonky2_field::goldilocks_field::GoldilocksField;
 
-use crate::ffi::plain_proof::PlainProof;
 use crate::v1::{
     api::{
         plain_proof::parse_plain_proof,
@@ -18,6 +17,7 @@ use crate::v1::{
         pearl_stark::PearlStark,
     },
 };
+use crate::v2::ffi::plain_proof::PlainProof;
 
 /// Verifies a block proof, compiling circuits into cache if needed.
 pub fn verify_block(public_params: &PublicProofParams, proof: &ZKProof, cache: &mut CircuitCache) -> Result<()> {

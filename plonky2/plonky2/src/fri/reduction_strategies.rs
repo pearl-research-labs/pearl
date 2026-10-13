@@ -25,6 +25,16 @@ pub enum FriReductionStrategy {
     /// optional max `arity_bits`. If this proof will have recursive proofs on top of it, a max
     /// `arity_bits` of 3 is recommended.
     MinSize(Option<usize>),
+
+    /// `Ladder(boundaries)`: a strictly descending ladder of fold boundaries (degree bits).
+    /// The schedule for `degree_bits` (which must be a boundary) is the ladder's *suffix*
+    /// from `degree_bits` down to the last boundary: one fold per gap between consecutive
+    /// boundaries, gaps split into steps of at most 3 bits (arity <= 8, the recursion-friendly
+    /// cap). Unlike [`Self::Fixed`], [`Self::serialize`] emits the boundary list itself —
+    /// independent of `degree_bits` — so transcripts absorbing the strategy agree across
+    /// proofs of different degrees whose ladders coincide (the universal-verifier
+    /// prerequisite: a shallower proof's schedule is exactly a deeper one's suffix).
+    Ladder(Vec<usize>),
 }
 
 impl FriReductionStrategy {
@@ -53,6 +63,25 @@ impl FriReductionStrategy {
             FriReductionStrategy::MinSize(opt_max_arity_bits) => {
                 min_size_arity_bits(degree_bits, rate_bits, num_queries, *opt_max_arity_bits)
             }
+            FriReductionStrategy::Ladder(boundaries) => {
+                let start = boundaries
+                    .iter()
+                    .position(|&b| b == degree_bits)
+                    .unwrap_or_else(|| {
+                        panic!("degree {degree_bits} is not a ladder boundary ({boundaries:?})")
+                    });
+                let mut arities = Vec::new();
+                for w in boundaries[start..].windows(2) {
+                    assert!(w[0] > w[1], "ladder boundaries must be strictly descending");
+                    let mut gap = w[0] - w[1];
+                    while gap > 0 {
+                        let step = gap.min(3);
+                        arities.push(step);
+                        gap -= step;
+                    }
+                }
+                arities
+            }
         }
     }
 
@@ -75,6 +104,11 @@ impl FriReductionStrategy {
             FriReductionStrategy::MinSize(opt_max_arity_bits) => {
                 let max_arity = opt_max_arity_bits.unwrap_or(0);
                 vec![F::TWO, F::from_canonical_usize(max_arity)]
+            }
+            FriReductionStrategy::Ladder(boundaries) => {
+                core::iter::once(F::from_canonical_usize(3))
+                    .chain(boundaries.iter().map(|&b| F::from_canonical_usize(b)))
+                    .collect()
             }
         }
     }
@@ -183,4 +217,47 @@ fn relative_proof_size(
     total_elems += D * final_poly_len;
 
     total_elems
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+
+    #[test]
+    fn ladder_schedules_are_suffixes_with_constant_serialization() {
+        type F = GoldilocksField;
+        let ladder = FriReductionStrategy::Ladder(vec![21, 20, 19, 17, 13, 11, 10, 5]);
+
+        // The schedule from a boundary is the ladder's suffix: gaps split into <= 3-bit steps.
+        assert_eq!(
+            ladder.reduction_arity_bits(21, 1, 4, 10),
+            vec![1, 1, 2, 3, 1, 2, 1, 3, 2]
+        );
+        assert_eq!(
+            ladder.reduction_arity_bits(17, 1, 4, 10),
+            vec![3, 1, 2, 1, 3, 2]
+        );
+        assert_eq!(
+            ladder.reduction_arity_bits(5, 1, 4, 10),
+            Vec::<usize>::new()
+        );
+        let deep = ladder.reduction_arity_bits(21, 1, 4, 10);
+        let shallow = ladder.reduction_arity_bits(13, 1, 4, 10);
+        assert_eq!(&deep[deep.len() - shallow.len()..], shallow.as_slice());
+
+        // Serialization is the boundary list (tag 3), independent of any degree.
+        let expected: Vec<F> = [3, 21, 20, 19, 17, 13, 11, 10, 5]
+            .into_iter()
+            .map(F::from_canonical_usize)
+            .collect();
+        assert_eq!(ladder.serialize::<F>(), expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a ladder boundary")]
+    fn ladder_rejects_off_ladder_degrees() {
+        FriReductionStrategy::Ladder(vec![10, 8, 5]).reduction_arity_bits(9, 1, 4, 10);
+    }
 }

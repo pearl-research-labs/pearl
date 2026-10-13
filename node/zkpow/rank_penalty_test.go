@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Dense PublicData prefix layout, mirrored from zk-pow/src/api/proof_utils.rs.
+// Dense PublicData prefix layout, mirrored from zk-pow/src/v2/api/proof_utils.rs.
 const (
 	densePublicDataSize = 164
 	jackpotOffset       = 116
@@ -26,7 +26,7 @@ const (
 const hashTileSize = 4 * 8
 
 // Byte offsets of the two mining configuration fields these tests vary, mirrored
-// from MiningConfiguration::to_bytes in zk-pow/src/api/proof_utils.rs.
+// from MiningConfiguration::to_bytes in zk-pow/src/v2/api/proof_utils.rs.
 const (
 	commonDimOffset = 0
 	rankOffset      = 4

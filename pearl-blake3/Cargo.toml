@@ -6,11 +6,12 @@ description = "Blake3 utilities for pearl"
 
 [lib]
 name = "pearl_blake3"
-crate-type = ["rlib"]
+crate-type = ["rlib", "cdylib"]
 
 [features]
 serde = ["dep:serde", "dep:serde_with"]
 pyo3 = ["dep:pyo3"]
+extension-module = ["pyo3", "pyo3/extension-module"]
 
 [dependencies]
 blake3 = { version = "1.8", features = ["rayon"] }

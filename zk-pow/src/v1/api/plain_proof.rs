@@ -8,7 +8,7 @@ use crate::v1::circuit::chip::blake3::program::{AuxiliaryCvLocation, AuxiliaryMs
 use crate::v1::ensure_eq;
 use pearl_blake3::BLAKE3_DIGEST_SIZE;
 
-use crate::ffi::plain_proof::PlainProof;
+use crate::v2::ffi::plain_proof::PlainProof;
 
 fn extract_strips(indices: &[usize], k: usize, strip_len: usize, proof: &MerkleProof) -> Result<Vec<Vec<i8>>> {
     indices

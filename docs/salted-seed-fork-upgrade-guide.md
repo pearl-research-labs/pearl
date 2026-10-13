@@ -55,9 +55,9 @@ If you call the C FFI directly: `mine`, `mine_moe`, `verify_plain_proof_ffi`, an
 header; do not run old binaries against the new library.
 
 If you use the Rust crate directly: pass `SeedDerivation` (from
-`zk_pow::api::proof`) to `zk_prove_plain_proof` / `verify_plain_proof`, or map it
+`zk_pow::v2::api::proof`) to `zk_prove_plain_proof` / `verify_plain_proof`, or map it
 from the certificate version with `CertificateVersion::seed_derivation()`.
-Reference: `zk-pow/src/api/seed.rs`.
+Reference: `zk-pow/src/v2/api/seed.rs`.
 
 Only if you serialize certificates yourself: the V3 wire layout is identical to V2
 (`Version(4) | HeaderHash(32) | PublicDataLen(4) | PublicData(N) | ProofDataLen(4) |
@@ -98,10 +98,11 @@ If you built custom mining software, implement the new derivation:
    `m` = token count and `n` = the **per-expert** intermediate dimension (B holds
    all experts stacked, but `n` does not include the expert count).
 
-Reference implementations: `zk-pow/src/api/seed.rs` (Rust, with pinned test
-vectors), `miner/miner-base/src/miner_base/commitment_hash.py` (Python,
-`bind_root_a`/`bind_root_b`), and the CUDA kernel behind
-`commitment_hash_from_merkle_roots(..., salted_dims=(m, n))` in `pearl-gemm`.
+Reference implementations: `zk-pow/src/v2/api/seed.rs` (Rust, with pinned test
+vectors). The Python side of the historical V3 salted-seed derivation lived in
+the retired int8 miner (`miner/miner-base`), which the FP8 stack
+under `miner/` and `miner/pearl-gemm/` has replaced; the current Python
+transcript is `miner_base.transcript`.
 
 ## Questions
 

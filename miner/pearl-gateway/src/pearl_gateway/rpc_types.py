@@ -45,3 +45,5 @@ class GetBlockTemplateResponse(BaseModel):
     default_witness_commitment: str | None = None
     # Absent from nodes that predate the field; those only ever require V1.
     requiredcertversion: CertificateVersion = CertificateVersion.ZK_DENSE
+    # Hex 108-byte wire headers of the most recent ancestors, parent first (V4 only).
+    ancestorheaders: list[str] = Field(default_factory=list)

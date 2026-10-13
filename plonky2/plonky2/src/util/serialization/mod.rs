@@ -654,6 +654,10 @@ pub trait Read {
                     _ => Err(IoError),
                 }
             }
+            3 => {
+                let boundaries = self.read_usize_vec()?;
+                Ok(FriReductionStrategy::Ladder(boundaries))
+            }
             _ => Err(IoError),
         }
     }
@@ -1680,6 +1684,12 @@ pub trait Write {
                 } else {
                     self.write_u8(0)?;
                 }
+
+                Ok(())
+            }
+            FriReductionStrategy::Ladder(boundaries) => {
+                self.write_u8(3)?;
+                self.write_usize_vec(boundaries.as_slice())?;
 
                 Ok(())
             }

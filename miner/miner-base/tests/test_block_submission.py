@@ -1,0 +1,752 @@
+import ctypes
+import subprocess
+import sys
+from dataclasses import replace
+from functools import partial
+from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+import torch
+from miner_base.async_loop_manager import AsyncLoopManager
+from miner_base.block_submission import (
+    PROTOCOL_COMMITMENT_LEAF,
+    MoEBlockInfo,
+    OpenedBlockInfo,
+    PrebuiltCommitment,
+    commit_planes_for_leaf,
+    create_proof,
+    submit_opened_block,
+)
+from miner_base.commitment import (
+    Device,
+    MiningConfiguration,
+    commit_planes,
+    commitment_keys,
+    hash_id_for_leaf,
+)
+from miner_base.layout import AxisPattern
+from miner_base.mining_config import default_mining_config, tall_tile_mining_config
+from miner_base.prequant import PrequantMatrix
+from miner_base.settings import MinerSettings
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
+from pearl_gateway.comm.dataclasses import MiningJob
+from pearl_gateway.config import MinerRpcConfig
+from pearl_mining import (
+    CERT_VERSION_PLAIN_FP8,
+    BlockHeader,
+    IncompleteBlockHeader,
+    PlainProofV4,
+    verify_plain_proof_for_cert_version,
+)
+from pearl_mining import (
+    Device as NativeDevice,
+)
+
+_M = 256
+_N = 256
+_K = 2048  # cert-v4 verifier accepts k >= 1024; 2048 is a common test size
+# Hard default; the maximum compact target makes every lottery tile win.
+DEFAULT_NBITS = 0x173FFFFF
+ALWAYS_WIN_NBITS = 0x207FFFFF
+
+
+PARENT = BlockHeader(
+    IncompleteBlockHeader(
+        version=1,
+        prev_block=b"\x11" * 32,
+        merkle_root=b"\x33" * 32,
+        timestamp=1_699_999_000,
+        nbits=DEFAULT_NBITS,
+    ),
+    b"\x44" * 32,
+)
+PARENT_BYTES = bytes(PARENT.to_bytes())
+
+
+def make_plain_peel_header(
+    nbits: int = DEFAULT_NBITS, timestamp: int = 1_700_000_000, parent: BlockHeader = PARENT
+) -> IncompleteBlockHeader:
+    """A block-template header extending ``parent``."""
+    return IncompleteBlockHeader(
+        version=1,
+        prev_block=bytes(parent.block_hash()),
+        merkle_root=b"\x22" * 32,
+        timestamp=timestamp,
+        nbits=nbits,
+    )
+
+
+def _tile_indices(pattern: AxisPattern, tile_index: int) -> list[int]:
+    base = tile_index * pattern.total
+    return [base + offset for offset in pattern.tile_offsets]
+
+
+def _tall_config(k: int, rank: int = 32) -> MiningConfiguration:
+    """The committed 16x32 tall tile used for high-``k`` (GLM o_proj) proofs."""
+    return tall_tile_mining_config(k, rank, Device.BLACKWELL)
+
+
+_TILE_CONFIGS = {
+    "4x128": lambda: default_mining_config(k=_K, rank=32, ltile_cols=128),
+    "4x128-hopper": lambda: default_mining_config(
+        k=_K, rank=32, ltile_cols=128, device=Device.HOPPER
+    ),
+    "16x32": lambda: _tall_config(k=16384),
+}
+
+
+def _opening(
+    *, config: MiningConfiguration | None = None, policy_inadmissible: bool = False
+) -> OpenedBlockInfo:
+    if config is None:
+        config = default_mining_config(k=_K, rank=32, ltile_cols=128)
+    k = config.common_dim
+    a_values = torch.zeros(_M, k, dtype=torch.bfloat16)
+    if policy_inadmissible:
+        # 96 unit spikes per row (4.7% of k) exceed the cert-v4 policy's
+        # eps_idle = 1/64 entry-liveness budget while remaining a structurally
+        # valid, canonically committed opening. Each spike stays dead: the row
+        # norm l2 = sqrt(96/2048) ~ 0.217 keeps the dead bound
+        # tau_idle * DELTA * l2 ~ 0.87 below the unit spike. (128 spikes would
+        # sit exactly on the bound; more would lift l2 above it.)
+        a_values[:, :96] = 1
+    a = PrequantMatrix.encode(a_values)
+    b = PrequantMatrix.encode(torch.zeros(_N, k, dtype=torch.bfloat16))
+    return OpenedBlockInfo(
+        a_row_indices=tuple(_tile_indices(config.rows_pattern, 0)),
+        b_column_indices=tuple(_tile_indices(config.cols_pattern, 0)),
+        a_codes=a.int_values,
+        a_scales=a.scales,
+        b_codes=b.int_values,
+        b_scales=b.scales,
+        mining_config=config,
+    )
+
+
+def test_commit_planes_for_leaf_forwards_the_leaf():
+    """The resolver is ``commit_planes`` at the protocol 1024-byte leaf."""
+    planes = [
+        torch.zeros(4, _K, dtype=torch.int8),
+        torch.zeros(4, _K // 8, dtype=torch.bfloat16),
+    ]
+    key = bytes(32)
+    resolved = commit_planes_for_leaf(planes, key, PROTOCOL_COMMITMENT_LEAF)
+    expected = commit_planes(planes, key, hash_id_for_leaf(PROTOCOL_COMMITMENT_LEAF))
+    assert resolved.digest == expected.digest
+    assert commit_planes_for_leaf(planes, key).digest == resolved.digest
+
+
+@pytest.mark.parametrize("tile", list(_TILE_CONFIGS))
+def test_plain_peel_proof_verifies_and_binds_header(tile):
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+    config = _TILE_CONFIGS[tile]()
+    proof = create_proof(_opening(config=config), header, PARENT_BYTES)
+
+    assert proof.min_cert_version == CERT_VERSION_PLAIN_FP8
+    assert proof.a.hash_id == config.a_hash_id.value
+    assert proof.b.hash_id == config.b_hash_id.value
+    assert bytes(proof.ancestor_header.to_bytes()) == PARENT_BYTES
+    assert proof.ancestor_chain == []
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
+    assert accepted, message
+
+    other_header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS, timestamp=header.timestamp + 1)
+    accepted, _ = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, other_header, proof)
+    assert not accepted
+
+    # The parent must be the proposed header's: a header on another chain is rejected.
+    orphan = IncompleteBlockHeader(
+        version=header.version,
+        prev_block=b"\x55" * 32,
+        merkle_root=header.merkle_root,
+        timestamp=header.timestamp,
+        nbits=header.nbits,
+    )
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, orphan, proof)
+    assert not accepted
+    assert "does not connect" in message
+
+
+def test_plain_peel_proof_maps_hopper_to_native_h100():
+    config = default_mining_config(k=_K, rank=32, device=Device.HOPPER)
+    proof = create_proof(_opening(config=config), make_plain_peel_header(), PARENT_BYTES)
+
+    assert proof.common.device == NativeDevice.H100
+
+
+def _historical_plain_proof(depth: int):
+    lineage = [PARENT]
+    for _ in range(1, depth):
+        parent = lineage[-1]
+        lineage.append(
+            BlockHeader(
+                make_plain_peel_header(ALWAYS_WIN_NBITS, parent.incomplete.timestamp + 1, parent),
+                b"\x44" * 32,
+            )
+        )
+    parent = lineage[-1]
+    header = make_plain_peel_header(ALWAYS_WIN_NBITS, parent.incomplete.timestamp + 1, parent)
+    return header, create_proof(
+        _opening(), header, PARENT_BYTES, [bytes(h.to_bytes()) for h in reversed(lineage[1:])]
+    )
+
+
+def _with_ancestry(proof, ancestor, chain):
+    return PlainProofV4(
+        ancestor_header=ancestor,
+        common=proof.common,
+        a=proof.a,
+        b=proof.b,
+        values_a=proof.values_a,
+        values_b=proof.values_b,
+        scales_a=proof.scales_a,
+        scales_b=proof.scales_b,
+        ancestor_chain=chain,
+    )
+
+
+@pytest.fixture(scope="module", params=["python", "c"])
+def plain_v4_verifier(request, tmp_path_factory):
+    if request.param == "python":
+        return partial(verify_plain_proof_for_cert_version, CERT_VERSION_PLAIN_FP8)
+    # Link the existing Go static library so both interfaces use the same proof cases.
+    static = (
+        Path(__file__).resolve().parents[3] / "zk-pow/bindings/go/target/release/libzk_pow_ffi.a"
+    )
+    if sys.platform != "linux" or not static.exists():
+        pytest.skip("C verifier tests require Linux and task build:zk-gobind")
+    shared = tmp_path_factory.mktemp("plain-ffi") / "verify.so"
+    subprocess.run(
+        ["cc", "-shared", "-Wl,-u,verify_plain_proof_v4_ffi", str(static)]
+        + ["-ldl", "-lpthread", "-lm", "-o", str(shared)],
+        check=True,
+    )
+    verify = ctypes.CDLL(str(shared)).verify_plain_proof_v4_ffi
+    verify.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+    ]
+
+    def verify_proof(header, proof):
+        error = ctypes.create_string_buffer(128)
+        wire = bytes(proof.to_bytes())
+        code = verify(bytes(header.to_bytes()), wire, len(wire), 0, error)
+        assert code != 2, error.value
+        return code == 0, error.value.decode()
+
+    return verify_proof
+
+
+@pytest.mark.parametrize("depth", range(1, 5))
+def test_plain_fp8_accepts_all_ancestor_depths(depth, plain_v4_verifier):
+    header, proof = _historical_plain_proof(depth)
+    restored = PlainProofV4.from_bytes(proof.to_bytes())
+    accepted, message = plain_v4_verifier(header, restored)
+    assert accepted, message
+
+
+@pytest.fixture(scope="module")
+def historical_plain_proof():
+    return _historical_plain_proof(4)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "too_deep",
+        "proposed_as_ancestor",
+        "intermediate_commitment",
+        "ancestor_commitment",
+    ],
+)
+def test_plain_fp8_rejects_invalid_ancestry(historical_plain_proof, mutation, plain_v4_verifier):
+    header, proof = historical_plain_proof
+    ancestor, chain = proof.ancestor_header, proof.ancestor_chain
+    if mutation == "missing":
+        chain = []
+    elif mutation == "too_deep":
+        chain.append(ancestor)
+    elif mutation == "proposed_as_ancestor":
+        ancestor, chain = BlockHeader(header, bytes(32)), []
+    else:
+        wire = bytearray(
+            (chain[0] if mutation == "intermediate_commitment" else ancestor).to_bytes()
+        )
+        wire[76] ^= 1
+        tampered = BlockHeader.from_bytes(wire)
+        if mutation == "intermediate_commitment":
+            chain[0] = tampered
+        else:
+            ancestor = tampered
+    invalid = _with_ancestry(proof, ancestor, chain)
+    accepted, message = plain_v4_verifier(header, invalid)
+    assert not accepted
+    assert "does not connect" in message or "state window" in message
+
+
+def test_tall_tile_keeps_high_k_proof_under_the_verifier_cap():
+    """At k=16384 (GLM o_proj) the area-equivalent 16x32 tile's peel proof fits
+    the 4 MiB worker-input cap the 4x128 tile would blow -- why the tall tile
+    exists."""
+    k = 16384
+    config = _tall_config(k)
+    assert config.rows_pattern.tile_size == 16
+    assert config.cols_pattern.tile_size == 32
+    assert 16 * 32 == 4 * 128  # same area -> difficulty-invariant
+    cap = 1 << 22
+    assert (16 + 32) * k * 2 <= cap
+    assert (4 + 128) * k * 2 > cap
+
+
+def _round_robin_routing(experts: int, top_k: int) -> list[list[int]]:
+    """Token ``t`` reaches experts ``t % E`` and ``(t + 1) % E``, ...."""
+    return [
+        sorted(t for t in range(_M) for slot in range(top_k) if (t + slot) % experts == e)
+        for e in range(experts)
+    ]
+
+
+def _cumulative(per_expert: list[list[int]]) -> list[int]:
+    return [sum(len(rows) for rows in per_expert[: e + 1]) for e in range(len(per_expert))]
+
+
+# Expert 1's routing slice ends 200 bytes into the second 1024-byte routing
+# leaf, so its opening straddles a leaf boundary.
+_RAGGED_ROUTING = [
+    list(range(0, 100)),
+    list(range(50, 256)),
+    list(range(0, 200)),
+    list(range(100, 106)),
+]
+
+
+@pytest.mark.parametrize(
+    ("per_expert", "w", "tile"),
+    [(_round_robin_routing(4, 2), 2, 3), (_RAGGED_ROUTING, 1, 3)],
+    ids=["round-robin", "ragged-straddle"],
+)
+def test_moe_plain_peel_proof_verifies(per_expert, w, tile):
+    """An MoE opening -- the full activation and the stacked expert weights,
+    a tile of one expert's routed tokens against that expert's stacked rows,
+    plus the routing witness -- is accepted by the cert-v4 verifier."""
+    experts, n_e = len(per_expert), _N
+    config = replace(default_mining_config(k=_K, rank=32, ltile_cols=128), experts=experts)
+    a = PrequantMatrix.encode(torch.zeros(_M, _K, dtype=torch.bfloat16))
+    b = PrequantMatrix.encode(torch.zeros(experts * n_e, _K, dtype=torch.bfloat16))
+    routing = tuple(t for rows in per_expert for t in rows)
+    offsets = _cumulative(per_expert)
+    moe = MoEBlockInfo(
+        expert_index=w,
+        inner_a_rows=tuple(_tile_indices(config.rows_pattern, tile)),
+        routing=routing,
+        offsets=tuple(offsets),
+    )
+    expert_rows = moe.expert_rows()
+    opening = OpenedBlockInfo(
+        a_row_indices=tuple(expert_rows[i] for i in moe.inner_a_rows),
+        b_column_indices=tuple(w * n_e + c for c in _tile_indices(config.cols_pattern, 0)),
+        a_codes=a.int_values,
+        a_scales=a.scales,
+        b_codes=b.int_values,
+        b_scales=b.scales,
+        mining_config=config,
+        moe=moe,
+    )
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+    proof = create_proof(opening, header, PARENT_BYTES)
+
+    assert proof.moe is not None and proof.moe.experts == experts
+    assert proof.moe_witness is not None and proof.moe_witness.w == w
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
+    assert accepted, message
+
+    # The proof binds the routing: the same tile under other tokens is rejected.
+    wrong_rows = replace(opening, a_row_indices=tuple(expert_rows[i] for i in range(4)))
+    with pytest.raises(ValueError, match="routed tokens"):
+        create_proof(wrong_rows, header, PARENT_BYTES)
+    # A dense opening cannot carry a witness, nor an MoE configuration omit it.
+    with pytest.raises(ValueError, match="needs both"):
+        create_proof(replace(opening, moe=None), header, PARENT_BYTES)
+    with pytest.raises(ValueError, match="needs both"):
+        create_proof(
+            replace(opening, mining_config=replace(config, experts=0)), header, PARENT_BYTES
+        )
+
+
+def test_moe_opening_rejects_non_canonical_witnesses():
+    """The witness must be a canonical partition of exact integers: a slice
+    that still selects the right rows is not enough."""
+    experts = 4
+    per_expert = _round_robin_routing(experts, 2)
+    config = replace(default_mining_config(k=_K, rank=32, ltile_cols=128), experts=experts)
+    a = PrequantMatrix.encode(torch.zeros(_M, _K, dtype=torch.bfloat16))
+    b = PrequantMatrix.encode(torch.zeros(experts * _N, _K, dtype=torch.bfloat16))
+    routing = tuple(t for rows in per_expert for t in rows)
+    offsets = _cumulative(per_expert)
+    w = 2
+    moe = MoEBlockInfo(
+        expert_index=w,
+        inner_a_rows=tuple(_tile_indices(config.rows_pattern, 3)),
+        routing=routing,
+        offsets=tuple(offsets),
+    )
+    expert_rows = moe.expert_rows()
+    opening = OpenedBlockInfo(
+        a_row_indices=tuple(expert_rows[i] for i in moe.inner_a_rows),
+        b_column_indices=tuple(w * _N + c for c in _tile_indices(config.cols_pattern, 0)),
+        a_codes=a.int_values,
+        a_scales=a.scales,
+        b_codes=b.int_values,
+        b_scales=b.scales,
+        mining_config=config,
+        moe=moe,
+    )
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+
+    shifted = list(offsets)
+    shifted[-1] -= 1  # no longer ends at len(routing)
+    for bad_offsets in (tuple(shifted), tuple(reversed(offsets)), tuple(float(o) for o in offsets)):
+        with pytest.raises((ValueError, TypeError)):
+            create_proof(
+                replace(opening, moe=replace(moe, offsets=bad_offsets)), header, PARENT_BYTES
+            )
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(replace(opening, moe=replace(moe, expert_index=True)), header, PARENT_BYTES)
+    float_rows = tuple(float(r) for r in opening.a_row_indices)  # == the ints, but not ints
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(replace(opening, a_row_indices=float_rows), header, PARENT_BYTES)
+    bool_inner = (False, *moe.inner_a_rows[1:])  # == 0, but not an int
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(
+            replace(opening, moe=replace(moe, inner_a_rows=bool_inner)), header, PARENT_BYTES
+        )
+    float_cols = tuple(float(c) for c in opening.b_column_indices)
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(replace(opening, b_column_indices=float_cols), header, PARENT_BYTES)
+    # Expert 0's first column tile starts at 0, 1: bools there survive the
+    # expert-base subtraction as ints, so the given values must be checked.
+    moe0 = replace(moe, expert_index=0, inner_a_rows=tuple(_tile_indices(config.rows_pattern, 0)))
+    rows0 = moe0.expert_rows()
+    cols0 = tuple(_tile_indices(config.cols_pattern, 0))
+    opening0 = replace(
+        opening,
+        moe=moe0,
+        a_row_indices=tuple(rows0[i] for i in moe0.inner_a_rows),
+        b_column_indices=cols0,
+    )
+    assert cols0[:2] == (0, 1)
+    create_proof(opening0, header, PARENT_BYTES)  # the int form is a valid opening
+    with pytest.raises(TypeError, match="integers"):
+        create_proof(
+            replace(opening0, b_column_indices=(False, True, *cols0[2:])), header, PARENT_BYTES
+        )
+    # Columns outside the winning expert's stacked rows are not its tile.
+    with pytest.raises(ValueError, match="b_column_indices"):
+        create_proof(replace(opening, b_column_indices=cols0), header, PARENT_BYTES)
+
+    # Canonical routing lists every expert's tokens strictly ascending: a
+    # swapped pair or a duplicate anywhere in the table (even in another
+    # expert's segment) is a witness the verifier cannot reproduce.
+    swapped = list(routing)
+    swapped[0], swapped[1] = swapped[1], swapped[0]
+    duplicated = list(routing)
+    duplicated[offsets[0]] = duplicated[offsets[0] + 1]
+    for bad_routing in (tuple(swapped), tuple(duplicated)):
+        with pytest.raises(ValueError, match="strictly increasing"):
+            create_proof(
+                replace(opening, moe=replace(moe, routing=bad_routing)), header, PARENT_BYTES
+            )
+
+
+def test_owned_copy_snapshots_the_moe_witness():
+    """A list-backed witness mutated after the asynchronous handoff must not
+    change the queued proof's routing commitment."""
+    experts = 4
+    config = replace(default_mining_config(k=_K, rank=32, ltile_cols=128), experts=experts)
+    a = PrequantMatrix.encode(torch.zeros(_M, _K, dtype=torch.bfloat16))
+    b = PrequantMatrix.encode(torch.zeros(experts * _N, _K, dtype=torch.bfloat16))
+    per_expert = _round_robin_routing(experts, 2)
+    routing = [t for rows in per_expert for t in rows]
+    offsets = _cumulative(per_expert)
+    inner = list(_tile_indices(config.rows_pattern, 1))
+    moe = MoEBlockInfo(expert_index=1, inner_a_rows=inner, routing=routing, offsets=offsets)
+    expert_rows = moe.expert_rows()
+    opening = OpenedBlockInfo(
+        a_row_indices=[expert_rows[i] for i in inner],
+        b_column_indices=[_N + c for c in _tile_indices(config.cols_pattern, 0)],
+        a_codes=a.int_values,
+        a_scales=a.scales,
+        b_codes=b.int_values,
+        b_scales=b.scales,
+        mining_config=config,
+        moe=moe,
+    )
+    owned = opening.owned_copy()
+    assert owned.moe is not None and owned.moe is not moe
+    assert all(
+        type(seq) is tuple for seq in (owned.moe.routing, owned.moe.offsets, owned.moe.inner_a_rows)
+    )
+
+    routing[0], routing[1] = routing[1], routing[0]
+    offsets[-1] -= 1
+    inner[0] += 1
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+    proof = create_proof(owned, header, PARENT_BYTES)
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
+    assert accepted, message
+
+
+def test_moe_configuration_binds_experts_into_pa_and_pb():
+    """``pB`` carries the expert count and ``pA`` the routing/offset leaves;
+    a dense configuration encodes neither."""
+    dense = default_mining_config(k=_K, rank=32, ltile_cols=128)
+    moe = replace(dense, experts=8)
+    assert dense.moe_params() is None
+    params = moe.moe_params()
+    assert params is not None and params.experts == 8
+    assert params.hash_id_r is params.hash_id_o is moe.a_hash_id
+    assert moe.p_a(_M) == dense.p_a(_M) + bytes((moe.a_hash_id, moe.a_hash_id))
+    assert moe.p_b(_N)[:-2] == dense.p_b(_N)[:-2]
+    assert moe.p_b(_N)[-2:] == (8).to_bytes(2, "little")
+    assert dense.p_b(_N)[-2:] == bytes(2)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("a_codes", lambda value: value.to("meta"), "CPU"),
+        ("a_codes", lambda value: value.to(torch.int16), "int8"),
+        ("a_scales", lambda value: value[:, :-1].contiguous(), "a_scales must be"),
+        ("a_row_indices", lambda value: (value[0], value[0], *value[2:]), "lottery tile"),
+        ("a_row_indices", lambda value: value[:-1], "exactly one"),
+        ("a_row_indices", lambda value: (*value, value[-1] + 1), "exactly one"),
+        ("a_row_indices", lambda value: tuple(index + 1 for index in value), "lottery tile"),
+    ],
+)
+def test_opening_validation_rejects_malformed_planes(field, replacement, message):
+    opening = _opening()
+    malformed = replace(opening, **{field: replacement(getattr(opening, field))})
+
+    with pytest.raises(ValueError, match=message):
+        create_proof(malformed, make_plain_peel_header(), PARENT_BYTES)
+
+
+def test_opening_validation_rejects_non_integer_indices():
+    opening = _opening()
+    malformed = replace(opening, a_row_indices=("0", *opening.a_row_indices[1:]))
+
+    with pytest.raises(TypeError, match="must contain integers"):
+        create_proof(malformed, make_plain_peel_header(), PARENT_BYTES)
+
+
+def test_owned_copy_detaches_mutable_plane_storage():
+    ancestor = bytearray(PARENT_BYTES)
+    opening = replace(_opening(), b_ancestor_header=ancestor)
+    owned = opening.owned_copy()
+
+    ancestor[0] ^= 1
+    assert owned.b_ancestor_header == PARENT_BYTES
+    opening.a_codes.fill_(7)
+    opening.a_scales.fill_(3)
+    opening.b_codes.fill_(5)
+    opening.b_scales.fill_(2)
+
+    assert owned.a_row_indices is opening.a_row_indices
+    assert owned.b_column_indices is opening.b_column_indices
+    assert owned.mining_config is not opening.mining_config
+    assert owned.mining_config.p_a(_M) == opening.mining_config.p_a(_M)
+    assert owned.mining_config.p_b(_N) == opening.mining_config.p_b(_N)
+    assert not torch.equal(owned.a_codes, opening.a_codes)
+    assert not torch.equal(owned.a_scales, opening.a_scales)
+    assert not torch.equal(owned.b_codes, opening.b_codes)
+    assert not torch.equal(owned.b_scales, opening.b_scales)
+
+
+def test_owned_copy_reuses_b_planes_when_the_opening_tree_is_prebuilt():
+    opening = _opening()
+    header = make_plain_peel_header()
+    _, key_b = commitment_keys(bytes(header.to_bytes()), PARENT_BYTES)
+    commitment = commit_planes(
+        [opening.b_codes, opening.b_scales], key_b, opening.mining_config.b_hash_id
+    )
+    opening = replace(
+        opening,
+        b_commitment=PrebuiltCommitment(commitment=commitment, key=key_b),
+    )
+
+    owned = opening.owned_copy()
+
+    assert owned.a_codes is not opening.a_codes
+    assert owned.a_scales is not opening.a_scales
+    assert owned.b_codes is opening.b_codes
+    assert owned.b_scales is opening.b_scales
+    assert owned.b_commitment is opening.b_commitment
+    assert (
+        create_proof(owned, header, PARENT_BYTES).to_base64()
+        == create_proof(opening, header, PARENT_BYTES).to_base64()
+    )
+
+
+def test_prebuilt_a_commitment_is_reused_without_rehashing_or_recloning():
+    opening = _opening()
+    header = make_plain_peel_header()
+    key_a, key_b = commitment_keys(bytes(header.to_bytes()), PARENT_BYTES)
+    comm_a = commit_planes(
+        [opening.a_codes, opening.a_scales], key_a, opening.mining_config.a_hash_id
+    )
+    comm_b = commit_planes(
+        [opening.b_codes, opening.b_scales], key_b, opening.mining_config.b_hash_id
+    )
+    opening = replace(
+        opening,
+        a_commitment=PrebuiltCommitment(comm_a, key_a),
+        b_commitment=PrebuiltCommitment(comm_b, key_b),
+    )
+
+    owned = opening.owned_copy()
+
+    assert owned.a_codes is opening.a_codes
+    assert owned.a_scales is opening.a_scales
+    assert owned.a_commitment is opening.a_commitment
+    with patch(
+        "miner_base.block_submission.commit_planes",
+        side_effect=AssertionError("prebuilt operand was committed twice"),
+    ):
+        proof = create_proof(owned, header, PARENT_BYTES)
+    assert proof is not None
+
+
+def test_prebuilt_a_commitment_rejects_wrong_job_and_shape():
+    opening = _opening()
+    header = make_plain_peel_header()
+    key_a, _ = commitment_keys(bytes(header.to_bytes()), PARENT_BYTES)
+    commitment = commit_planes(
+        [opening.a_codes, opening.a_scales], key_a, opening.mining_config.a_hash_id
+    )
+
+    wrong_job = replace(
+        opening,
+        a_commitment=PrebuiltCommitment(commitment, b"wrong"),
+    )
+    with pytest.raises(ValueError, match="another job"):
+        create_proof(wrong_job, header, PARENT_BYTES)
+
+    wrong_shape = replace(
+        opening,
+        a_codes=torch.zeros(_M + 1, _K, dtype=torch.int8),
+        a_scales=torch.zeros(_M + 1, _K // 8, dtype=torch.bfloat16),
+        a_commitment=PrebuiltCommitment(commitment, key_a),
+    )
+    with pytest.raises(ValueError, match="covers"):
+        create_proof(wrong_shape, header, PARENT_BYTES)
+
+
+def _plain_job() -> MiningJob:
+    return MiningJob(
+        incomplete_header_bytes=bytes(make_plain_peel_header().to_bytes()),
+        target=1,
+        cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[PARENT_BYTES],
+    )
+
+
+def test_submission_requires_the_parent_header():
+    client = Mock()
+
+    with pytest.raises(ValueError, match="no ancestor headers"):
+        submit_opened_block(_opening(), replace(_plain_job(), ancestor_headers=[]), client)
+    client.submit_plain_proof.assert_not_called()
+
+
+@pytest.mark.parametrize("depth", range(1, 5))
+def test_submission_resolves_the_selected_b_ancestor(depth):
+    header, expected = _historical_plain_proof(depth)
+    job = MiningJob(
+        bytes(header.to_bytes()),
+        (1 << 256) - 1,
+        CertificateVersion.PLAIN_FP8,
+        [bytes(h.to_bytes()) for h in expected.ancestor_chain] + [PARENT_BYTES],
+    )
+    opening = replace(_opening(), b_ancestor_header=PARENT_BYTES)
+    client = Mock()
+    proof = submit_opened_block(opening, job, client)
+    assert bytes(proof.to_bytes()) == bytes(expected.to_bytes())
+    client.submit_plain_proof.assert_called_once_with(proof, job)
+    client.reset_mock()
+    with pytest.raises(ValueError, match="outside.*state window"):
+        submit_opened_block(
+            opening, replace(job, ancestor_headers=job.ancestor_headers[:-1]), client
+        )
+    client.submit_plain_proof.assert_not_called()
+
+
+def test_submission_rejects_non_fp8_job_before_gateway_handoff():
+    job = MiningJob(
+        incomplete_header_bytes=bytes(make_plain_peel_header().to_bytes()),
+        target=1,
+        cert_version=CertificateVersion.ZK_DENSE,
+    )
+    client = Mock()
+
+    with pytest.raises(ValueError, match="requires certificate version 4"):
+        submit_opened_block(_opening(), job, client)
+
+    client.submit_plain_proof.assert_not_called()
+
+
+def test_real_policy_inadmissibility_sentinel_is_filtered():
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+    job = MiningJob(
+        incomplete_header_bytes=bytes(header.to_bytes()),
+        target=(1 << 256) - 1,
+        cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[PARENT_BYTES],
+    )
+    opening = _opening(policy_inadmissible=True)
+    proof = create_proof(opening, header, PARENT_BYTES)
+
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
+    assert (accepted, message) == (False, "The jackpot is not admissible")
+
+    client = Mock()
+    assert submit_opened_block(opening, job, client) is None
+    client.submit_plain_proof.assert_not_called()
+
+
+@patch(
+    "miner_base.block_submission.verify_plain_proof_for_cert_version",
+    return_value=(False, "commitment mismatch"),
+)
+def test_unexpected_verifier_failure_remains_fatal(mock_verify):
+    client = Mock()
+
+    with pytest.raises(RuntimeError, match="commitment mismatch"):
+        submit_opened_block(_opening(), _plain_job(), client)
+
+    mock_verify.assert_called_once()
+    client.submit_plain_proof.assert_not_called()
+
+
+@patch(
+    "miner_base.block_submission.verify_plain_proof_for_cert_version",
+    return_value=(False, "commitment mismatch"),
+)
+def test_failed_canonical_proof_is_rejected(mock_verify):
+    client = MagicMock()
+    client.__enter__.return_value = client
+    config = MinerRpcConfig(transport="uds", socket_path="/tmp/unused-gateway.sock")
+    manager = AsyncLoopManager(config, MinerSettings(no_gateway=False))
+
+    with (
+        patch("miner_base.async_loop_manager._make_client", return_value=client),
+        pytest.raises(RuntimeError, match="commitment mismatch"),
+    ):
+        manager._submit_block(_opening(), _plain_job())
+
+    mock_verify.assert_called_once()
+    client.submit_plain_proof.assert_not_called()

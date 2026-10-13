@@ -58,8 +58,13 @@ impl<F: RichField> PlonkyPermutation<F> for Blake3Permutation<F> {
         debug_assert_eq!(F::BITS, 64);
         // Serialize state to bytes
         let mut state_bytes = [0u8; SPONGE_WIDTH * 8];
-        for (chunk, field) in state_bytes.chunks_exact_mut(8).zip(&self.state) {
-            chunk.copy_from_slice(&field.to_canonical_u64().to_le_bytes());
+        for (chunk, field) in state_bytes
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(&self.state)
+        {
+            *chunk = field.to_canonical_u64().to_le_bytes();
         }
 
         let mut reader = blake3::Hasher::new().update(&state_bytes).finalize_xof();
@@ -67,8 +72,8 @@ impl<F: RichField> PlonkyPermutation<F> for Blake3Permutation<F> {
         let mut buf = [0u8; 64];
         while idx < N {
             reader.fill(&mut buf);
-            for chunk in buf.chunks_exact(8) {
-                let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            for chunk in buf.as_chunks::<8>().0 {
+                let word = u64::from_le_bytes(*chunk);
                 if word < F::ORDER {
                     self.state[idx] = F::from_canonical_u64(word);
                     idx += 1;

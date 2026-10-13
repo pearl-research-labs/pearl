@@ -201,7 +201,13 @@ where
                 .collect::<Vec<_>>()
                 .into_par_iter()
                 .flat_map(|(lookup, challenge)| {
-                    lookup_helper_columns(lookup, trace_poly_values, challenge, constraint_degree)
+                    lookup_helper_columns(
+                        lookup,
+                        trace_poly_values,
+                        public_inputs,
+                        challenge,
+                        constraint_degree,
+                    )
                 })
                 .collect::<Vec<_>>()
         })

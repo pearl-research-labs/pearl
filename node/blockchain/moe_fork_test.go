@@ -23,8 +23,9 @@ func moeSimNetParams() chaincfg.Params {
 	params := chaincfg.SimNetParams
 	params.ReduceMinDifficulty = false
 	params.MoEForkHeight = moeForkTestHeight
-	// Exercise the V1/V2 cutover in isolation; disable the later V3 fork.
+	// Exercise the V1/V2 cutover in isolation; disable later forks.
 	params.SaltedSeedForkHeight = 0
+	params.Fp8ForkHeight = 0
 	return params
 }
 

@@ -23,6 +23,8 @@ func saltedSimNetParams() chaincfg.Params {
 	params.ReduceMinDifficulty = false
 	params.MoEForkHeight = 1
 	params.SaltedSeedForkHeight = saltedForkTestHeight
+	// Exercise the V2/V3 cutover in isolation; disable the later V4 fork.
+	params.Fp8ForkHeight = 0
 	return params
 }
 
