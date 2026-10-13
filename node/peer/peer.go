@@ -349,7 +349,6 @@ func newNetAddress(addr net.Addr, services wire.ServiceFlag) (*wire.NetAddress, 
 type outMsg struct {
 	msg      wire.Message
 	doneChan chan<- struct{}
-	encoding wire.MessageEncoding
 }
 
 // stallControlCmd represents the command of a stall control message.
@@ -469,8 +468,6 @@ type Peer struct {
 	sendAddrV2           bool
 
 	V2Transport *v2transport.Peer
-
-	wireEncoding wire.MessageEncoding
 
 	knownInventory     lru.Cache
 	prevGetBlocksMtx   sync.Mutex
@@ -1050,16 +1047,14 @@ func (p *Peer) handlePongMsg(msg *wire.MsgPong) {
 
 // readMessage reads the next v2 encrypted wire message from the peer with
 // logging.
-func (p *Peer) readMessage(encoding wire.MessageEncoding) (
-	wire.Message, []byte, error) {
-
+func (p *Peer) readMessage() (wire.Message, []byte, error) {
 	plaintext, err := p.V2Transport.V2ReceivePacket(nil)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	msg, buf, err := wire.ReadV2MessageN(
-		plaintext, p.ProtocolVersion(), encoding,
+		plaintext, p.ProtocolVersion(), wire.LatestEncoding,
 	)
 	n := len(plaintext)
 
@@ -1093,7 +1088,7 @@ func (p *Peer) readMessage(encoding wire.MessageEncoding) (
 }
 
 // writeMessage sends a wire message to the peer with logging.
-func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
+func (p *Peer) writeMessage(msg wire.Message) error {
 	// Don't do anything if we're disconnecting.
 	if atomic.LoadInt32(&p.disconnect) != 0 {
 		return nil
@@ -1105,7 +1100,7 @@ func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
 		err error
 	)
 
-	_, err = wire.WriteV2MessageN(&buf, msg, p.ProtocolVersion(), enc)
+	_, err = wire.WriteV2MessageN(&buf, msg, p.ProtocolVersion(), wire.LatestEncoding)
 	if err != nil {
 		return err
 	}
@@ -1403,7 +1398,7 @@ out:
 		// Read a message and stop the idle timer as soon as the read
 		// is done.  The timer is reset below for the next iteration if
 		// needed.
-		rmsg, buf, err := p.readMessage(p.wireEncoding)
+		rmsg, buf, err := p.readMessage()
 		idleTimer.Stop()
 		if err != nil {
 			// In order to allow regression tests with malformed messages, don't
@@ -1804,7 +1799,7 @@ out:
 
 			p.stallControl <- stallControlMsg{sccSendMessage, msg.msg}
 
-			err := p.writeMessage(msg.msg, msg.encoding)
+			err := p.writeMessage(msg.msg)
 			if err != nil {
 				p.Disconnect()
 				if p.shouldLogWriteError(err) {
@@ -1880,18 +1875,6 @@ out:
 //
 // This function is safe for concurrent access.
 func (p *Peer) QueueMessage(msg wire.Message, doneChan chan<- struct{}) {
-	p.QueueMessageWithEncoding(msg, doneChan, wire.BaseEncoding)
-}
-
-// QueueMessageWithEncoding adds the passed wire message to the peer send
-// queue. This function is identical to QueueMessage, however it allows the
-// caller to specify the wire encoding type that should be used when
-// encoding/decoding blocks and transactions.
-//
-// This function is safe for concurrent access.
-func (p *Peer) QueueMessageWithEncoding(msg wire.Message, doneChan chan<- struct{},
-	encoding wire.MessageEncoding) {
-
 	// Avoid risk of deadlock if goroutine already exited.  The goroutine
 	// we will be sending to hangs around until it knows for a fact that
 	// it is marked as disconnected and *then* it drains the channels.
@@ -1903,7 +1886,7 @@ func (p *Peer) QueueMessageWithEncoding(msg wire.Message, doneChan chan<- struct
 		}
 		return
 	}
-	p.outputQueue <- outMsg{msg: msg, encoding: encoding, doneChan: doneChan}
+	p.outputQueue <- outMsg{msg: msg, doneChan: doneChan}
 }
 
 // QueueInventory adds the passed inventory to the inventory send queue which
@@ -1969,7 +1952,7 @@ func (p *Peer) Disconnect() {
 // peer.  If the next message is not a version message or the version is not
 // acceptable then return an error.
 func (p *Peer) readRemoteVersionMsg() error {
-	remoteMsg, _, err := p.readMessage(wire.LatestEncoding)
+	remoteMsg, _, err := p.readMessage()
 	if err != nil {
 		return err
 	}
@@ -1981,7 +1964,7 @@ func (p *Peer) readRemoteVersionMsg() error {
 		reason := "a version message must precede all others"
 		rejectMsg := wire.NewMsgReject(msg.Command(), wire.RejectMalformed,
 			reason)
-		_ = p.writeMessage(rejectMsg, wire.LatestEncoding)
+		_ = p.writeMessage(rejectMsg)
 		return errors.New(reason)
 	}
 
@@ -2017,20 +2000,11 @@ func (p *Peer) readRemoteVersionMsg() error {
 
 	p.flagsMtx.Unlock()
 
-	// Once the version message has been exchanged, we're able to determine
-	// if this peer knows how to encode witness data over the wire
-	// protocol. If so, then we'll switch to a decoding mode which is
-	// prepared for the new transaction format introduced as part of
-	// BIP0144.
-	if p.services&wire.SFNodeWitness == wire.SFNodeWitness {
-		p.wireEncoding = wire.WitnessEncoding
-	}
-
 	// Invoke the callback if specified.
 	if p.cfg.Listeners.OnVersion != nil {
 		rejectMsg := p.cfg.Listeners.OnVersion(p, msg)
 		if rejectMsg != nil {
-			_ = p.writeMessage(rejectMsg, wire.LatestEncoding)
+			_ = p.writeMessage(rejectMsg)
 			return errors.New(rejectMsg.Reason)
 		}
 	}
@@ -2045,7 +2019,7 @@ func (p *Peer) readRemoteVersionMsg() error {
 			MinAcceptableProtocolVersion)
 		rejectMsg := wire.NewMsgReject(msg.Command(), wire.RejectObsolete,
 			reason)
-		_ = p.writeMessage(rejectMsg, wire.LatestEncoding)
+		_ = p.writeMessage(rejectMsg)
 		return errors.New(reason)
 	}
 
@@ -2140,13 +2114,13 @@ func (p *Peer) writeLocalVersionMsg() error {
 		return err
 	}
 
-	return p.writeMessage(localVerMsg, wire.LatestEncoding)
+	return p.writeMessage(localVerMsg)
 }
 
 // writeSendAddrV2Msg writes our sendaddrv2 message to the remote peer.
 func (p *Peer) writeSendAddrV2Msg(pver uint32) error {
 	sendAddrMsg := wire.NewMsgSendAddrV2()
-	return p.writeMessage(sendAddrMsg, wire.LatestEncoding)
+	return p.writeMessage(sendAddrMsg)
 }
 
 // waitToFinishNegotiation waits until desired negotiation messages are
@@ -2160,7 +2134,7 @@ func (p *Peer) waitToFinishNegotiation(pver uint32) error {
 	// can receive unknown messages before and after sendaddrv2 and still
 	// have to wait for verack.
 	for {
-		remoteMsg, _, err := p.readMessage(wire.LatestEncoding)
+		remoteMsg, _, err := p.readMessage()
 		if err == wire.ErrUnknownMessage {
 			continue
 		} else if err != nil {
@@ -2233,7 +2207,7 @@ func (p *Peer) negotiateInboundProtocol() error {
 		return err
 	}
 
-	if err := p.writeMessage(wire.NewMsgVerAck(), wire.LatestEncoding); err != nil {
+	if err := p.writeMessage(wire.NewMsgVerAck()); err != nil {
 		return err
 	}
 
@@ -2285,7 +2259,7 @@ func (p *Peer) negotiateOutboundProtocol() error {
 		return err
 	}
 
-	if err := p.writeMessage(wire.NewMsgVerAck(), wire.LatestEncoding); err != nil {
+	if err := p.writeMessage(wire.NewMsgVerAck()); err != nil {
 		return err
 	}
 
@@ -2428,7 +2402,6 @@ func newPeerBase(origCfg *Config, inbound bool) *Peer {
 
 	p := Peer{
 		inbound:         inbound,
-		wireEncoding:    wire.BaseEncoding,
 		knownInventory:  lru.NewCache(maxKnownInventory),
 		stallControl:    make(chan stallControlMsg, 1), // nonblocking sync
 		outputQueue:     make(chan outMsg, outputBufferSize),

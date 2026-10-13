@@ -11,10 +11,6 @@ const (
 	// allowed to be retried before it will fail.
 	defaultQueryTimeout = time.Second * 30
 
-	// defaultQueryEncoding specifies the default encoding (witness or not)
-	// for `getdata` and other similar messages.
-	defaultQueryEncoding = wire.WitnessEncoding
-
 	// defaultNumRetries is the default number of times that a query job
 	// will be retried.
 	defaultNumRetries = 2
@@ -26,10 +22,6 @@ type queryOptions struct {
 	// timeout specifies the total time a query is allowed to
 	// be retried before it will fail.
 	timeout time.Duration
-
-	// encoding lets the query know which encoding to use when queueing
-	// messages to a peer.
-	encoding wire.MessageEncoding
 
 	// cancelChan is an optional channel that can be closed to indicate
 	// that the query should be canceled.
@@ -55,7 +47,6 @@ type QueryOption func(*queryOptions) // nolint
 func defaultQueryOptions() *queryOptions {
 	return &queryOptions{
 		timeout:    defaultQueryTimeout,
-		encoding:   defaultQueryEncoding,
 		numRetries: defaultNumRetries,
 	}
 }
@@ -88,14 +79,6 @@ func NoRetryMax() QueryOption {
 func Timeout(timeout time.Duration) QueryOption {
 	return func(qo *queryOptions) {
 		qo.timeout = timeout
-	}
-}
-
-// Encoding is a query option that allows the caller to set a message encoding
-// for the query messages.
-func Encoding(encoding wire.MessageEncoding) QueryOption {
-	return func(qo *queryOptions) {
-		qo.encoding = encoding
 	}
 }
 
@@ -167,10 +150,8 @@ type Dispatcher interface {
 // Peer is the interface that defines the methods needed by the query package
 // to be able to make requests and receive responses from a network peer.
 type Peer interface {
-	// QueueMessageWithEncoding adds the passed wire message to the peer
-	// send queue.
-	QueueMessageWithEncoding(msg wire.Message, doneChan chan<- struct{},
-		encoding wire.MessageEncoding)
+	// QueueMessage adds the passed wire message to the peer send queue.
+	QueueMessage(msg wire.Message, doneChan chan<- struct{})
 
 	// SubscribeRecvMsg adds a OnRead subscription to the peer. All wire
 	// messages received from this peer will be sent on the returned

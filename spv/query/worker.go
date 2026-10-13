@@ -3,8 +3,6 @@ package query
 import (
 	"errors"
 	"time"
-
-	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
 var (
@@ -27,7 +25,6 @@ type queryJob struct {
 	tries              uint8
 	index              uint64
 	timeout            time.Duration
-	encoding           wire.MessageEncoding
 	cancelChan         <-chan struct{}
 	internalCancelChan <-chan struct{}
 	*Request
@@ -144,7 +141,7 @@ func (w *worker) Run(results chan<- *jobResult, quit <-chan struct{}) {
 			log.Tracef("Worker %v queuing job %T with index %v",
 				peer.Addr(), job.Req, job.Index())
 
-			peer.QueueMessageWithEncoding(job.Req, nil, job.encoding)
+			peer.QueueMessage(job.Req, nil)
 		}
 
 		// Wait for the correct response to be received from the peer,

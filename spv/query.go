@@ -56,10 +56,6 @@ var (
 	// on a query in case we don't have any peers.
 	QueryPeerConnectTimeout = time.Second * 30
 
-	// QueryEncoding specifies the default encoding (witness or not) for
-	// `getdata` and other similar messages.
-	QueryEncoding = wire.WitnessEncoding
-
 	// ErrFilterFetchFailed is returned in case fetching a compact filter
 	// fails.
 	ErrFilterFetchFailed = fmt.Errorf("unable to fetch cfilter")
@@ -101,10 +97,6 @@ type queryOptions struct {
 	// doneChan lets the query signal the caller when it's done, in case
 	// it's run in a goroutine.
 	doneChan chan<- struct{}
-
-	// encoding lets the query know which encoding to use when queueing
-	// messages to a peer.
-	encoding wire.MessageEncoding
 
 	// numRetries tells the query how many times to retry asking each peer
 	// the query.
@@ -153,7 +145,6 @@ func defaultQueryOptions() *queryOptions {
 		numRetries:         uint8(QueryNumRetries),
 		peerConnectTimeout: QueryPeerConnectTimeout,
 		rejectTimeout:      QueryRejectTimeout,
-		encoding:           QueryEncoding,
 		invalidTxThreshold: QueryInvalidTxThreshold,
 		optimisticBatch:    noBatch,
 	}
@@ -210,14 +201,6 @@ func PeerConnectTimeout(timeout time.Duration) QueryOption {
 func RejectTimeout(rejectTimeout time.Duration) QueryOption {
 	return func(qo *queryOptions) {
 		qo.rejectTimeout = rejectTimeout
-	}
-}
-
-// Encoding is a query option that allows the caller to set a message encoding
-// for the query messages.
-func Encoding(encoding wire.MessageEncoding) QueryOption {
-	return func(qo *queryOptions) {
-		qo.encoding = encoding
 	}
 }
 
@@ -327,8 +310,7 @@ func (s *ChainService) queryAllPeers(
 
 			for i := uint8(0); i < qo.numRetries; i++ {
 				timeout := time.After(qo.timeout)
-				sp.QueueMessageWithEncoding(queryMsg,
-					nil, qo.encoding)
+				sp.QueueMessage(queryMsg, nil)
 				select {
 				case <-queryQuit:
 					return
@@ -757,7 +739,6 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 
 	opts := []query.QueryOption{
 		query.Cancel(s.quit),
-		query.Encoding(qo.encoding),
 		query.NumRetries(qo.numRetries),
 	}
 
@@ -808,18 +789,11 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 			"from database", blockHash)
 	}
 
-	// Starting with the set of default options, we'll apply any specified
-	// functional options to the query so that we can check what inv type
-	// to use.
 	qo := defaultQueryOptions()
 	qo.applyQueryOptions(options...)
-	invType := wire.InvTypeWitnessBlock
-	if qo.encoding == wire.BaseEncoding {
-		invType = wire.InvTypeBlock
-	}
 
 	// Create an inv vector for getting this block.
-	inv := wire.NewInvVect(invType, &blockHash)
+	inv := wire.NewInvVect(wire.InvTypeWitnessBlock, &blockHash)
 
 	// If the block is already in the cache, we can return it immediately.
 	blockValue, err := s.BlockCache.Get(*inv)
@@ -917,7 +891,6 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 
 	// Prepare the query options.
 	queryOpts := []query.QueryOption{
-		query.Encoding(qo.encoding),
 		query.NumRetries(qo.numRetries),
 		query.Cancel(s.quit),
 	}
@@ -969,15 +942,9 @@ func newTransactionInv(tx *wire.MsgTx) *wire.MsgInv {
 // TODO(wilmer): Move to pushtx package after introducing a query package. This
 // cannot be done at the moment due to circular dependencies.
 func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) error {
-	// Starting with the set of default options, we'll apply any specified
-	// functional options to the query so we know which encoding to serve
-	// the transaction with. We broadcast an inv to all peers and respond to
-	// any getdata messages for the transaction.
 	qo := defaultQueryOptions()
 	qo.applyQueryOptions(options...)
 
-	// Announce the transaction by txid. A peer can request its preferred
-	// serialization in getdata, which we answer using qo.encoding below.
 	txHash := tx.TxHash()
 	inv := newTransactionInv(tx)
 
@@ -1014,9 +981,7 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 			case *wire.MsgGetData:
 				for _, vec := range response.InvList {
 					if vec.Hash == txHash {
-						sp.QueueMessageWithEncoding(
-							tx, nil, qo.encoding,
-						)
+						sp.QueueMessage(tx, nil)
 
 						// Peers might send the INV
 						// request multiple times, we

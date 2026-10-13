@@ -28,9 +28,7 @@ type mockPeer struct {
 
 var _ Peer = (*mockPeer)(nil)
 
-func (m *mockPeer) QueueMessageWithEncoding(msg wire.Message,
-	doneChan chan<- struct{}, encoding wire.MessageEncoding) {
-
+func (m *mockPeer) QueueMessage(msg wire.Message, doneChan chan<- struct{}) {
 	m.requests <- msg
 }
 
@@ -79,7 +77,6 @@ func makeJob() *queryJob {
 	return &queryJob{
 		index:      123,
 		timeout:    30 * time.Second,
-		encoding:   defaultQueryEncoding,
 		cancelChan: nil,
 		Request:    q,
 	}

@@ -322,6 +322,11 @@ func TestPeerListeners(t *testing.T) {
 		break
 	}
 
+	// A zero input count is the segwit marker, so the tx needs an input to
+	// decode.
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, nil))
+
 	tests := []struct {
 		listener string
 		msg      wire.Message
@@ -331,7 +336,7 @@ func TestPeerListeners(t *testing.T) {
 		{"OnPing", wire.NewMsgPing(42)},
 		{"OnPong", wire.NewMsgPong(42)},
 		{"OnMemPool", wire.NewMsgMemPool()},
-		{"OnTx", wire.NewMsgTx(wire.TxVersion)},
+		{"OnTx", tx},
 		{"OnBlock", &wire.MsgBlock{
 			MsgHeader: wire.MsgHeader{
 				BlockHeader: *wire.NewBlockHeader(1, &chainhash.Hash{}, &chainhash.Hash{}, 1),
@@ -379,6 +384,48 @@ func TestPeerListeners(t *testing.T) {
 	}
 	inPeer.Disconnect()
 	outPeer.Disconnect()
+}
+
+// TestWitnessSurvivesWithoutWitnessService verifies that a witness tx keeps
+// its witness when neither peer advertises any service bits.
+func TestWitnessSurvivesWithoutWitnessService(t *testing.T) {
+	verack := make(chan struct{}, 2)
+	received := make(chan *wire.MsgTx, 1)
+	cfg := &peer.Config{
+		Listeners: peer.MessageListeners{
+			OnVerAck: func(*peer.Peer, *wire.MsgVerAck) { verack <- struct{}{} },
+			OnTx:     func(_ *peer.Peer, msg *wire.MsgTx) { received <- msg },
+		},
+		ChainParams:    &chaincfg.MainNetParams,
+		Services:       0,
+		AllowSelfConns: true,
+	}
+	inPeer := peer.NewInboundPeer(cfg)
+	outPeer, err := peer.NewOutboundPeer(cfg, "10.0.0.2:8333")
+	require.NoError(t, err)
+	require.NoError(t, setupPeerConnection(inPeer, outPeer))
+	t.Cleanup(func() {
+		inPeer.Disconnect()
+		outPeer.Disconnect()
+		inPeer.WaitForDisconnect()
+		outPeer.WaitForDisconnect()
+	})
+	for i := 0; i < 2; i++ {
+		waitForSignal(t, verack, testWaitTimeout, "verack %d", i)
+	}
+
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, [][]byte{{0x01, 0x02}}))
+	tx.AddTxOut(wire.NewTxOut(1, []byte{0x51}))
+	outPeer.QueueMessage(tx, nil)
+
+	select {
+	case got := <-received:
+		require.True(t, got.HasWitness(), "witness was stripped")
+		require.Equal(t, tx.WitnessHash(), got.WitnessHash())
+	case <-time.After(testWaitTimeout):
+		t.Fatal("timed out waiting for tx")
+	}
 }
 
 // TestOutboundPeer tests outbound peer lifecycle: failed negotiation,
