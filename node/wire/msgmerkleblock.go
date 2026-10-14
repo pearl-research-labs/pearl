@@ -130,6 +130,14 @@ func (msg *MsgMerkleBlock) PrlEncode(w io.Writer, pver uint32, enc MessageEncodi
 	return err
 }
 
+// SerializeSize returns the number of bytes it would take to serialize the
+// receiver.
+func (msg *MsgMerkleBlock) SerializeSize() int {
+	// Header + transaction count + hashes + flags.
+	return msg.Header.SerializeSize() + 4 + varLenSize(len(msg.Hashes), chainhash.HashSize) +
+		varLenSize(len(msg.Flags), 1)
+}
+
 // Command returns the protocol command string for the message.  This is part
 // of the Message interface implementation.
 func (msg *MsgMerkleBlock) Command() string {

@@ -123,6 +123,10 @@ func (request *Request) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
+	if aux == nil {
+		return makeError(ErrInvalidType, "request must be a JSON object, got null")
+	}
+
 	// Step 4: Convert the raw fields to the desired types
 
 	version := RPCVersion(aux.Jsonrpc)

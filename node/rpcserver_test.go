@@ -1,9 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -604,4 +611,97 @@ func TestCheckCredentials(t *testing.T) {
 		})
 	}
 
+}
+
+func TestJsonRPCReadRejectsOversizedBody(t *testing.T) {
+	// jsonRPCRead consults the package-level cfg (cfg.RPCQuirks) when the body
+	// parses; initialize it to a zero config and restore it afterwards.
+	prevCfg := cfg
+	cfg = &config{}
+	defer func() { cfg = prevCfg }()
+
+	// A body just over the limit, mirroring the advisory's oversized PoC.
+	oversized := bytes.Repeat([]byte{'a'}, maxRequestSize+1)
+
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(oversized))
+	rec := httptest.NewRecorder()
+
+	var s rpcServer
+	s.statusLines = make(map[int]string)
+
+	// The oversized body is rejected before the connection is hijacked.
+	s.jsonRPCRead(rec, req, false)
+
+	// An oversized body must be rejected with 413 before being read in full.
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code,
+		"oversized body must be rejected with 413")
+}
+
+// recordingConn is a minimal net.Conn double used as the hijacked
+// connection in tests. Writes append to an in-memory buffer instead of
+// going over a real socket or net.Pipe, so they never block and the
+// response can be inspected synchronously after jsonRPCRead returns.
+type recordingConn struct {
+	net.Conn // nil; only the methods below are exercised by jsonRPCRead
+	written  bytes.Buffer
+}
+
+func (c *recordingConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *recordingConn) Write(b []byte) (int, error)      { return c.written.Write(b) }
+func (c *recordingConn) Close() error                     { return nil }
+func (c *recordingConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *recordingConn) SetWriteDeadline(time.Time) error { return nil }
+
+// hijackableResponseRecorder adds http.Hijacker support to
+// httptest.ResponseRecorder, backed by a recordingConn, so tests can drive
+// jsonRPCRead past the point where it takes over the raw connection.
+type hijackableResponseRecorder struct {
+	*httptest.ResponseRecorder
+	conn *recordingConn
+}
+
+func (h *hijackableResponseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	buf := bufio.NewReadWriter(bufio.NewReader(h.conn), bufio.NewWriter(&h.conn.written))
+	return h.conn, buf, nil
+}
+
+func TestJsonRPCReadAcceptsSubmitblockSizedBody(t *testing.T) {
+	prevCfg := cfg
+	cfg = &config{}
+	defer func() { cfg = prevCfg }()
+
+	// A hex-encoded max-size block plus JSON framing, as a real submitblock
+	// call would send it. This must fit comfortably under maxRequestSize.
+	blockHex := bytes.Repeat([]byte{'a'}, 2*wire.MaxBlockPayload)
+	body := append([]byte(`{"jsonrpc":"1.0","method":"submitblock","params":["`), blockHex...)
+	body = append(body, []byte(`"],"id":1}`)...)
+	require.Less(t, len(body), maxRequestSize,
+		"test fixture must itself fit under the limit it is exercising")
+
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+
+	rec := &hijackableResponseRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		conn:             &recordingConn{},
+	}
+
+	var s rpcServer
+	s.statusLines = make(map[int]string)
+
+	s.jsonRPCRead(rec, req, false)
+
+	resp, err := http.ReadResponse(bufio.NewReader(&rec.conn.written), req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.NotEqual(t, http.StatusRequestEntityTooLarge, resp.StatusCode,
+		"a submitblock-sized body must not be rejected as too large")
+
+	respBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	var rpcResp btcjson.Response
+	require.NoError(t, json.Unmarshal(respBody, &rpcResp))
+	require.NotNil(t, rpcResp.Error,
+		"garbage block payload should fail block decoding, not size limiting")
 }

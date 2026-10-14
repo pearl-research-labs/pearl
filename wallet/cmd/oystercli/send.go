@@ -21,9 +21,8 @@ import (
 // an empty fee field selects.
 const minRelayFeeRate = 1e-5
 
-// sendScreen walks through paying a single recipient: pick the source
-// account, enter and validate the destination and amount, review a summary,
-// then sign and broadcast (unlocking on demand).
+// sendScreen walks through paying a single recipient: pick the source account, enter and validate the destination and
+// amount, review a summary, then sign and broadcast (unlocking on demand).
 func sendScreen(c *client) error {
 	accounts, err := c.listAccounts(1)
 	if err != nil {
@@ -74,7 +73,8 @@ func sendScreen(c *client) error {
 						return err
 					}
 					if amt > accounts[fromAccount] {
-						return fmt.Errorf("exceeds spendable balance (%s)", fmtPRL(accounts[fromAccount]))
+						return fmt.Errorf("exceeds spendable balance (%s)",
+							fmtPRL(accounts[fromAccount]))
 					}
 					return nil
 				}).
@@ -110,10 +110,9 @@ func sendScreen(c *client) error {
 		{"Network", c.cfg.activeNet.Params.Name},
 	}))
 
-	// Default to Send: this confirm is the final step of a transaction the
-	// user just built and reviewed, so Enter should commit it (matching the
-	// Enter-to-advance rhythm of the fields above). When the wallet is
-	// locked, the passphrase prompt in withAutoUnlock is the real gate.
+	// Default to Send: this confirm is the final step of a transaction the user just built and reviewed, so Enter
+	// should commit it (matching the Enter-to-advance rhythm of the fields above). When the wallet is locked, the
+	// passphrase prompt in withAutoUnlock is the real gate.
 	confirmed, err := confirm("Broadcast this transaction?", "This cannot be undone once confirmed by the network.",
 		"Send", "Cancel", true)
 	if err != nil {
@@ -133,14 +132,11 @@ func sendScreen(c *client) error {
 				return sendErr
 			})
 		})
-		if !isNotRelayedError(err) {
+		if err == nil {
 			break
 		}
 
-		printWarn(sendNotRelayedMessage)
-		printWarn(rawErrorDetail(err))
-		retry, askErr := confirm("Try again?", "Sends the same amount to the same address at the same fee rate.",
-			"Retry", "Cancel", true)
+		retry, askErr := retryNotRelayedSend(err)
 		if askErr != nil {
 			return askErr
 		}
@@ -149,25 +145,30 @@ func sendScreen(c *client) error {
 			return nil
 		}
 	}
-	if err != nil {
-		return err
-	}
-
-	printSuccess("Transaction broadcast.")
+	printSuccess("Payment created and pending.")
 	printBox(kvLines([][2]string{
 		{"Txid", txid.String()},
 		{"Amount", fmtPRL(amount)},
 		{"To", address},
 	}))
+	printWarn("If needed, open Transactions, select this payment, and choose Rebroadcast to the network. " +
+		"Creating another payment could pay the recipient twice.")
 	return nil
 }
 
 const sendCancelledMessage = "Send cancelled. Nothing was broadcast."
 
-// sendNotRelayedMessage explains a send that no peer requested. It never left
-// this machine, so the funds are untouched and trying again is safe.
-const sendNotRelayedMessage = "No network peer accepted the transaction. Nothing was sent and your funds are " +
-	"untouched. Check your connection and try again."
+const sendNotRelayedMessage = "No peers are connected. Nothing was signed or sent and your funds are untouched. " +
+	"Check your connection and try again."
+
+func retryNotRelayedSend(err error) (bool, error) {
+	if !isNotRelayedError(err) {
+		return false, err
+	}
+	printWarn(sendNotRelayedMessage)
+	printWarn(rawErrorDetail(err))
+	return confirm("Try again?", "Uses the same amount, address, and fee rate.", "Retry", "Cancel", true)
+}
 
 // validateRecipient checks the address decodes and belongs to the active
 // network. Validation is local so it can run on every submit attempt without

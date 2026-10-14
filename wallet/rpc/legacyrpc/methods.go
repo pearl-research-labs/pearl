@@ -397,10 +397,16 @@ func decodeTxHash(txID string) (*chainhash.Hash, error) {
 	return txHash, nil
 }
 
-// internalError reports a broadcast failure. Clients recognize a not-relayed verdict by its message, so sends and
-// rebroadcasts must report it the same way.
 func internalError(err error) *btcjson.RPCError {
 	return &btcjson.RPCError{Code: btcjson.ErrRPCInternal.Code, Message: err.Error()}
+}
+
+// sendTxError maps fresh-send failures. Rebroadcast results must not use the pre-signing failure code.
+func sendTxError(err error) *btcjson.RPCError {
+	if errors.Is(err, chain.ErrTxNotRelayed) {
+		return &btcjson.RPCError{Code: btcjson.ErrRPCClientNotConnected, Message: err.Error()}
+	}
+	return internalError(err)
 }
 
 // pendingTxError maps the wallet's pending-transaction errors to RPC errors.
@@ -1356,21 +1362,16 @@ func makeOutputs(pairs map[string]btcutil.Amount, chainParams *chaincfg.Params) 
 	return outputs, nil
 }
 
-// sendPairs creates and sends payment transactions.
-// It returns the transaction hash in string format upon success
-// All errors are returned in btcjson.RPCError format
-func sendPairs(w *wallet.Wallet, amounts map[string]btcutil.Amount,
-	keyScope waddrmgr.KeyScope, account uint32, minconf int32,
-	feeSatPerKb btcutil.Amount) (string, error) {
+// sendPairs creates and sends payment transactions. It returns the transaction hash in string format upon success.
+// All errors are returned in btcjson.RPCError format.
+func sendPairs(w *wallet.Wallet, amounts map[string]btcutil.Amount, keyScope waddrmgr.KeyScope, account uint32,
+	minconf int32, feeSatPerKb btcutil.Amount) (string, error) {
 
 	outputs, err := makeOutputs(amounts, w.ChainParams())
 	if err != nil {
 		return "", err
 	}
-	tx, err := w.SendOutputs(
-		outputs, &keyScope, account, minconf, feeSatPerKb,
-		wallet.CoinSelectionLargest, "",
-	)
+	tx, err := w.SendOutputs(outputs, &keyScope, account, minconf, feeSatPerKb, wallet.CoinSelectionLargest, "")
 	if err != nil {
 		if err == txrules.ErrAmountNegative {
 			return "", ErrNeedPositiveAmount
@@ -1382,7 +1383,7 @@ func sendPairs(w *wallet.Wallet, amounts map[string]btcutil.Amount,
 			return "", err
 		}
 
-		return "", internalError(err)
+		return "", sendTxError(err)
 	}
 
 	txHashStr := tx.TxHash().String()

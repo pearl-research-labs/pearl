@@ -14,6 +14,7 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -95,9 +96,13 @@ func scriptedTerminal(t *testing.T, input string) (printed func() string) {
 	out, outW, err := os.Pipe()
 	require.NoError(t, err)
 
-	oldIn, oldOut := os.Stdin, os.Stdout
+	oldIn, oldOut, oldWriter := os.Stdin, os.Stdout, lipgloss.Writer.Forward
 	os.Stdin, os.Stdout = in, outW
-	restore := func() { os.Stdin, os.Stdout = oldIn, oldOut }
+	lipgloss.Writer.Forward = outW
+	restore := func() {
+		os.Stdin, os.Stdout = oldIn, oldOut
+		lipgloss.Writer.Forward = oldWriter
+	}
 	t.Cleanup(restore)
 
 	return func() string {

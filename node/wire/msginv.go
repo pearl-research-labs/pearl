@@ -104,6 +104,11 @@ func (msg *MsgInv) PrlEncode(w io.Writer, pver uint32, enc MessageEncoding) erro
 	return nil
 }
 
+// SerializeSize returns the number of bytes it would take to serialize the receiver.
+func (msg *MsgInv) SerializeSize() int {
+	return varLenSize(len(msg.InvList), maxInvVectPayload)
+}
+
 // Command returns the protocol command string for the message.  This is part
 // of the Message interface implementation.
 func (msg *MsgInv) Command() string {

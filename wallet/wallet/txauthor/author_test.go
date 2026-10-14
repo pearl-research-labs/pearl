@@ -5,12 +5,15 @@
 package txauthor
 
 import (
+	"math"
 	"testing"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/wallet/wallet/txrules"
 	"github.com/pearl-research-labs/pearl/wallet/wallet/txsizes"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func p2trOutputs(amounts ...btcutil.Amount) []*wire.TxOut {
@@ -45,6 +48,45 @@ func makeInputSource(unspents []*wire.TxOut) InputSource {
 		return currentTotal, currentInputs, currentInputValues, currentScripts, nil
 	}
 	return InputSource(f)
+}
+
+func TestSumOutputValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		outputs []*wire.TxOut
+		want    btcutil.Amount
+		wantErr error
+	}{
+		{name: "sums values", outputs: p2trOutputs(1e8, 2e8), want: 3e8},
+		{name: "accepts a zero value", outputs: p2trOutputs(0, 1e8), want: 1e8},
+		{name: "accepts a total of MaxInt64", outputs: p2trOutputs(math.MaxInt64-1, 1), want: math.MaxInt64},
+		{name: "rejects an overflowing total", outputs: p2trOutputs(math.MaxInt64, 1), wantErr: ErrOutputValueOverflow},
+		{name: "rejects a negative value", outputs: p2trOutputs(1e8, -1), wantErr: txrules.ErrAmountNegative},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := SumOutputValues(tt.outputs)
+			require.ErrorIs(t, err, tt.wantErr)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestNewUnsignedTransactionRejectsInvalidOutputValues(t *testing.T) {
+	t.Parallel()
+
+	changeSource := &ChangeSource{
+		NewScript:  func() ([]byte, error) { return make([]byte, txsizes.P2TRPkScriptSize), nil },
+		ScriptSize: txsizes.P2TRPkScriptSize,
+	}
+
+	_, err := NewUnsignedTransaction(p2trOutputs(math.MaxInt64, 1), 1e3, makeInputSource(nil), changeSource)
+	assert.ErrorIs(t, err, ErrOutputValueOverflow)
+
+	_, err = NewUnsignedTransaction(p2trOutputs(1e8, -1), 1e3, makeInputSource(nil), changeSource)
+	assert.ErrorIs(t, err, txrules.ErrAmountNegative)
 }
 
 func TestNewUnsignedTransaction(t *testing.T) {

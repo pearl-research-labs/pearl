@@ -237,6 +237,11 @@ func (b *BlockChain) GetOrphanRoot(hash *chainhash.Hash) *chainhash.Hash {
 	b.orphanLock.RLock()
 	defer b.orphanLock.RUnlock()
 
+	return b.orphanRoot(hash)
+}
+
+// orphanRoot is GetOrphanRoot for callers that already hold orphanLock.
+func (b *BlockChain) orphanRoot(hash *chainhash.Hash) *chainhash.Hash {
 	// Keep looping while the parent of each orphaned block is
 	// known and is an orphan itself.
 	orphanRoot := hash
@@ -251,6 +256,21 @@ func (b *BlockChain) GetOrphanRoot(hash *chainhash.Hash) *chainhash.Hash {
 	}
 
 	return orphanRoot
+}
+
+// MissingAncestor returns the block that hash's orphan chain is missing, or nil
+// if hash is not a known orphan.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) MissingAncestor(hash *chainhash.Hash) *chainhash.Hash {
+	b.orphanLock.RLock()
+	defer b.orphanLock.RUnlock()
+
+	root, exists := b.orphans[*b.orphanRoot(hash)]
+	if !exists {
+		return nil
+	}
+	return &root.block.MsgBlock().BlockHeader().PrevBlock
 }
 
 // removeOrphanBlock removes the passed orphan block from the orphan pool and
@@ -1702,9 +1722,6 @@ func (b *BlockChain) IntervalBlockHashes(endHash *chainhash.Hash, interval int,
 //   - When locators are provided, but none of them are known, nodes starting
 //     after the genesis block will be returned
 //
-// This is primarily a helper function for the locateBlocks and locateHeaders
-// functions.
-//
 // This function MUST be called with the chain state lock held (for reads).
 func (b *BlockChain) locateInventory(locator BlockLocator, hashStop *chainhash.Hash, maxEntries uint32) (*blockNode, uint32) {
 	// There are no block locators so a specific block is being requested
@@ -1753,29 +1770,25 @@ func (b *BlockChain) locateInventory(locator BlockLocator, hashStop *chainhash.H
 	return startNode, total
 }
 
-// locateBlocks returns the hashes of the blocks after the first known block in
-// the locator until the provided stop hash is reached, or up to the provided
-// max number of block hashes.
+// locateNodes resolves the locator into an ordered list of the nodes that
+// comprise the blocks to serve, walking the best chain.
 //
-// See the comment on the exported function for more details on special cases.
-//
-// This function MUST be called with the chain state lock held (for reads).
-func (b *BlockChain) locateBlocks(locator BlockLocator, hashStop *chainhash.Hash, maxHashes uint32) []chainhash.Hash {
-	// Find the node after the first known block in the locator and the
-	// total number of nodes after it needed while respecting the stop hash
-	// and max entries.
-	node, total := b.locateInventory(locator, hashStop, maxHashes)
+// This function is safe for concurrent access.
+func (b *BlockChain) locateNodes(locator BlockLocator, hashStop *chainhash.Hash, maxEntries uint32) []*blockNode {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	node, total := b.locateInventory(locator, hashStop, maxEntries)
 	if total == 0 {
 		return nil
 	}
 
-	// Populate and return the found hashes.
-	hashes := make([]chainhash.Hash, 0, total)
-	for i := uint32(0); i < total; i++ {
-		hashes = append(hashes, node.hash)
-		node = b.bestChain.Next(node)
+	nodes := make([]*blockNode, 0, total)
+	for ; node != nil && len(nodes) < cap(nodes); node = b.bestChain.Next(node) {
+		nodes = append(nodes, node)
 	}
-	return hashes
+
+	return nodes
 }
 
 // LocateBlocks returns the hashes of the blocks after the first known block in
@@ -1792,32 +1805,31 @@ func (b *BlockChain) locateBlocks(locator BlockLocator, hashStop *chainhash.Hash
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) LocateBlocks(locator BlockLocator, hashStop *chainhash.Hash, maxHashes uint32) []chainhash.Hash {
-	b.chainLock.RLock()
-	hashes := b.locateBlocks(locator, hashStop, maxHashes)
-	b.chainLock.RUnlock()
+	nodes := b.locateNodes(locator, hashStop, maxHashes)
+	if len(nodes) == 0 {
+		return nil
+	}
+	hashes := make([]chainhash.Hash, 0, len(nodes))
+	for _, node := range nodes {
+		hashes = append(hashes, node.hash)
+	}
 	return hashes
 }
 
-// locateHeaders returns the headers of the blocks after the first known block
-// in the locator until the provided stop hash is reached, or up to the provided
-// max number of block headers.
+// locateHeaders fetches the headers (and, optionally, certificates) for the
+// blocks after the first known block in the locator.
 //
-// See the comment on the exported function for more details on special cases.
-//
-// This function MUST be called with the chain state lock held (for reads).
+// NOTE: Can return stale results if re-organization happens while fetching from DB.
 func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Hash, maxHeaders uint32, includeCerts bool) []wire.MsgHeader {
-	// Find the node after the first known block in the locator and the
-	// total number of nodes after it needed while respecting the stop hash
-	// and max entries.
-	node, total := b.locateInventory(locator, hashStop, maxHeaders)
-	if total == 0 {
+	nodes := b.locateNodes(locator, hashStop, maxHeaders)
+	if len(nodes) == 0 {
 		return nil
 	}
 
-	// Populate and return the found headers with their certificates.
-	headers := make([]wire.MsgHeader, 0, total)
+	// Fetch headers and certificates with the lock released.
+	headers := make([]wire.MsgHeader, 0, len(nodes))
 	err := b.db.View(func(dbTx database.Tx) error {
-		for i := uint32(0); i < total; i++ {
+		for _, node := range nodes {
 			blockHeader, err := dbFetchBlockHeader(dbTx, node.hash, uint32(node.height))
 			if err != nil {
 				return err
@@ -1835,7 +1847,6 @@ func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Has
 				BlockHeader:    *blockHeader,
 				MsgCertificate: wire.MsgCertificate{Certificate: cert},
 			})
-			node = b.bestChain.Next(node)
 		}
 		return nil
 	})
@@ -1863,10 +1874,7 @@ func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Has
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) LocateHeaders(locator BlockLocator, hashStop *chainhash.Hash, includeCerts bool) []wire.MsgHeader {
-	b.chainLock.RLock()
-	headers := b.locateHeaders(locator, hashStop, wire.MaxBlockHeadersPerMsg, includeCerts)
-	b.chainLock.RUnlock()
-	return headers
+	return b.locateHeaders(locator, hashStop, wire.MaxBlockHeadersPerMsg, includeCerts)
 }
 
 // InvalidateBlock invalidates the requested block and all its descedents.  If a block

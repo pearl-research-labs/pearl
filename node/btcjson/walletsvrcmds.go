@@ -872,7 +872,11 @@ func (s *ScriptPubKey) UnmarshalJSON(data []byte) error {
 	case string:
 		s.Value = v
 	case map[string]interface{}:
-		s.Value = ScriptPubKeyAddress{Address: v["address"].(string)}
+		address, ok := v["address"].(string)
+		if !ok {
+			return fmt.Errorf("expected scriptPubKey object to have a string address, got: %v", v)
+		}
+		s.Value = ScriptPubKeyAddress{Address: address}
 	default:
 		return fmt.Errorf("invalid scriptPubKey value: %v", unmarshalled)
 	}

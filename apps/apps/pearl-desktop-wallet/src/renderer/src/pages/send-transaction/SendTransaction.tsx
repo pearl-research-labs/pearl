@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
-import { useForm } from '@tanstack/react-form';
-import { useNavigate } from 'react-router-dom';
-import { useWalletStore } from '../../store/walletStore';
+import {useState, useEffect} from 'react';
+import {useForm} from '@tanstack/react-form';
+import {useNavigate} from 'react-router-dom';
+import {useWalletStore} from '../../store/walletStore';
 import SendHeader from './SendHeader';
 import WalletInfo from './WalletInfo';
 import AmountInput from './AmountInput';
@@ -11,25 +11,19 @@ import ErrorAlert from './ErrorAlert';
 import SuccessBanner from './SuccessBanner';
 import TransactionPreview from './TransactionPreview';
 import SendButton from './SendButton';
-import { formatTxid } from '@/lib/crypto';
-import { getErrorMessage, isNotRelayedError } from '@/lib/utils';
+import {formatTxid} from '@/lib/crypto';
+import {getErrorMessage} from '@/lib/utils';
+import {getSendFailure} from '@/lib/send-result';
 
 type FeeLevel = 'fast' | 'medium' | 'slow';
 const MEMPOOL_MIN_FEE_PER_VBYTE = 0.00001;
 
-// The daemon reports this both with no peers connected and when none of
-// them asked for the transaction; either way nothing left this machine.
-const NOT_RELAYED_MESSAGE =
-  'No network peer accepted the transaction. Nothing was sent and your funds are untouched. ' +
-  'Check your connection and try again.';
-
 export default function SendTransaction() {
   const navigate = useNavigate();
-  const { walletName, availableBalance, validateAddress, syncWalletData } = useWalletStore();
+  const {walletName, availableBalance, validateAddress, syncWalletData} = useWalletStore();
   const [error, setError] = useState<string | null>(null);
-  // A not-relayed failure is fixed by retrying once peers are back, so it
-  // must not disable Send; submitting clears the error first.
-  const errorBlocksSend = error !== null && error !== NOT_RELAYED_MESSAGE;
+  const [canRetrySend, setCanRetrySend] = useState(false);
+  const errorBlocksSend = error !== null && !canRetrySend;
   const [success, setSuccess] = useState<string | null>(null);
   const [txid, setTxid] = useState<string | null>(null);
   const [isMaxSelected, setIsMaxSelected] = useState(false);
@@ -52,20 +46,30 @@ export default function SendTransaction() {
       amount: '',
       address: '',
     },
-    onSubmit: async ({ value }: { value: { amount: string; address: string } }) => {
+    onSubmit: async ({value}: {value: {amount: string; address: string}}) => {
       setError(null);
+      setCanRetrySend(false);
       setSuccess(null);
       try {
         const feeRate = estimatedFees[feeLevel];
 
-        const txId = await window.appBridge.wallet.sendFromDefaultAccount(
+        const result = await window.appBridge.wallet.sendFromDefaultAccount(
           value.address.trim(),
           parseFloat(value.amount),
-          feeRate,
+          feeRate
         );
-        setTxid(txId);
+        if (!result.ok) {
+          const failure = getSendFailure(result.error);
+          if (failure.canRetry) {
+            setError(failure.message);
+            setCanRetrySend(true);
+            return;
+          }
+          throw new Error(failure.message);
+        }
+        setTxid(result.txid);
         syncWalletData();
-        setSuccess('Transaction broadcast to the network!');
+        setSuccess('Payment created and pending.');
         form.reset();
       } catch (err) {
         const errorMessage = getErrorMessage(err, 'Failed to send transaction');
@@ -80,10 +84,11 @@ export default function SendTransaction() {
           setTimeout(() => {
             navigate('/unlock');
           }, 3000);
-        } else if (isNotRelayedError(errorMessage)) {
-          setError(NOT_RELAYED_MESSAGE);
         } else if (errorMessage.includes('mempool min fee not met')) {
-          setError('Seems like the transaction fee is too low. This often means that the transaction is too large. Try setting up smaller transactions.')
+          setError(
+            'Seems like the transaction fee is too low. This often means that the transaction is too large. ' +
+              'Try setting up smaller transactions.'
+          );
         } else {
           setError(errorMessage);
         }
@@ -100,7 +105,6 @@ export default function SendTransaction() {
         window.appBridge.wallet.estimateFee(10),
         window.appBridge.wallet.estimateFee(25),
       ]);
-
 
       const fastFeeEstimate = isNaN(Number(fastFee)) ? 0 : Number(fastFee);
       const mediumFeeEstimate = isNaN(Number(mediumFee)) ? 0 : Number(mediumFee);
@@ -152,7 +156,7 @@ export default function SendTransaction() {
     if (!val?.trim()) {
       return 'Please enter a recipient address';
     }
-    const { isValid } = await validateAddress(val);
+    const {isValid} = await validateAddress(val);
     if (!isValid) {
       return 'Invalid Pearl address format';
     }
@@ -178,9 +182,9 @@ export default function SendTransaction() {
               <form.Field
                 name="amount"
                 validators={{
-                  onSubmit: ({ value }) => {
+                  onSubmit: ({value}) => {
                     setSuccess(null);
-                    return validateAmount(value)
+                    return validateAmount(value);
                   },
                 }}
               >
@@ -211,7 +215,7 @@ export default function SendTransaction() {
               <form.Field
                 name="address"
                 validators={{
-                  onSubmitAsync: async ({ value }) => validateAddressField(value),
+                  onSubmitAsync: async ({value}) => validateAddressField(value),
                 }}
               >
                 {field => {
@@ -243,9 +247,7 @@ export default function SendTransaction() {
 
               {error && <ErrorAlert message={error} />}
 
-              {success && txid && (
-                <SuccessBanner message={success} txid={txid} formatTxid={formatTxid} />
-              )}
+              {success && txid && <SuccessBanner message={success} txid={txid} formatTxid={formatTxid} />}
 
               <form.Subscribe
                 selector={s => ({
@@ -255,14 +257,10 @@ export default function SendTransaction() {
                   isValid: s.isValid,
                 })}
               >
-                {({ amount, address, isSubmitting, isValid }) => (
+                {({amount, address, isSubmitting, isValid}) => (
                   <>
                     {amount && address && !error && (
-                      <TransactionPreview
-                        amount={amount}
-                        address={address}
-                        currentFee={currentFee}
-                      />
+                      <TransactionPreview amount={amount} address={address} currentFee={currentFee} />
                     )}
                     <SendButton
                       onClick={() => form.handleSubmit()}

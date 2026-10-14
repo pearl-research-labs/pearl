@@ -147,6 +147,20 @@ func (msg *MsgReject) PrlEncode(w io.Writer, pver uint32, enc MessageEncoding) e
 	return nil
 }
 
+// SerializeSize returns the number of bytes it would take to serialize the
+// receiver.
+func (msg *MsgReject) SerializeSize() int {
+	// Command + code + reason.
+	n := varLenSize(len(msg.Cmd), 1) + 1 + varLenSize(len(msg.Reason), 1)
+
+	// CmdBlock and CmdTx messages have an additional hash field.
+	if msg.Cmd == CmdBlock || msg.Cmd == CmdTx {
+		n += chainhash.HashSize
+	}
+
+	return n
+}
+
 // Command returns the protocol command string for the message.  This is part
 // of the Message interface implementation.
 func (msg *MsgReject) Command() string {

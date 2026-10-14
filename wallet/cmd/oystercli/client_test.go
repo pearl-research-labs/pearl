@@ -32,21 +32,6 @@ func TestIsRPCErrorCode(t *testing.T) {
 	assert.False(t, isRPCErrorCode(nil, btcjson.ErrRPCWalletUnlockNeeded))
 }
 
-func TestIsNotRelayedError(t *testing.T) {
-	// The daemon reports this verdict as a generic internal error, so the message is the only handle the CLI has.
-	notRelayed := &btcjson.RPCError{
-		Code:    btcjson.ErrRPCInternal.Code,
-		Message: "transaction not relayed to any peer: no peer requested it",
-	}
-	other := &btcjson.RPCError{Code: btcjson.ErrRPCInternal.Code, Message: "db closed"}
-
-	assert.True(t, isNotRelayedError(notRelayed))
-	assert.True(t, isNotRelayedError(fmt.Errorf("wrap: %w", notRelayed)))
-	assert.False(t, isNotRelayedError(other))
-	assert.False(t, isNotRelayedError(errors.New("not relayed")))
-	assert.False(t, isNotRelayedError(nil))
-}
-
 // rpcRequest is what fakeRPCClient recorded about the last call it served.
 type rpcRequest struct {
 	Method string        `json:"method"`

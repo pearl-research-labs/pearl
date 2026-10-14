@@ -3140,9 +3140,8 @@ func (w *Wallet) ReleaseOutput(id wtxmgr.LockID, op wire.OutPoint) error {
 	})
 }
 
-// resendUnminedTxs iterates through all transactions that spend from wallet
-// credits that are not known to have been mined into a block, and attempts
-// to send each to the chain server for relay.
+// resendUnminedTxs iterates through all transactions that spend from wallet credits that are not known to have been
+// mined into a block, and attempts to send each to the chain server for relay.
 func (w *Wallet) resendUnminedTxs() {
 	var txs []*wire.MsgTx
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
@@ -3156,16 +3155,20 @@ func (w *Wallet) resendUnminedTxs() {
 		return
 	}
 
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		log.Infof("Unable to rebroadcast unconfirmed transactions: %v", err)
+		return
+	}
+
 	for _, tx := range txs {
-		txHash, err := w.publishTransaction(tx)
+		txHash, err := w.publishTransaction(tx, chainClient)
 		if err != nil {
-			log.Debugf("Unable to rebroadcast transaction %v: %v",
-				tx.TxHash(), err)
+			log.Debugf("Unable to rebroadcast transaction %v: %v", tx.TxHash(), err)
 			continue
 		}
 
-		log.Debugf("Successfully rebroadcast unconfirmed transaction %v",
-			txHash)
+		log.Debugf("Successfully rebroadcast unconfirmed transaction %v", txHash)
 	}
 }
 
@@ -3465,22 +3468,16 @@ func (w *Wallet) TotalReceivedForAddr(addr btcutil.Address, minConf int32) (btcu
 	return amount, err
 }
 
-// SendOutputs creates and sends payment transactions. Coin selection is
-// performed by the wallet, choosing inputs that belong to the given key scope
-// and account, unless a key scope is not specified. In that case, inputs from
-// accounts matching the account number provided across all key scopes may be
-// selected. This is done to handle the default account case, where a user wants
-// to fund a PSBT with inputs regardless of their type (NP2WKH, P2WKH, etc.). It
-// returns the transaction upon success.
-func (w *Wallet) SendOutputs(outputs []*wire.TxOut, keyScope *waddrmgr.KeyScope,
-	account uint32, minconf int32, satPerKb btcutil.Amount,
-	coinSelectionStrategy CoinSelectionStrategy, label string) (*wire.MsgTx,
-	error) {
+// SendOutputs creates and sends payment transactions. Coin selection is performed by the wallet, choosing inputs that
+// belong to the given key scope and account, unless a key scope is not specified. In that case, inputs from accounts
+// matching the account number provided across all key scopes may be selected. This is done to handle the default
+// account case, where a user wants to fund a PSBT with inputs regardless of their type (NP2WKH, P2WKH, etc.). It
+// returns the transaction upon success. Under SPV, success means the payment is retained as pending, even if peers
+// reject it. Rebroadcast that transaction by txid instead of creating a retry.
+func (w *Wallet) SendOutputs(outputs []*wire.TxOut, keyScope *waddrmgr.KeyScope, account uint32, minconf int32,
+	satPerKb btcutil.Amount, coinSelectionStrategy CoinSelectionStrategy, label string) (*wire.MsgTx, error) {
 
-	return w.sendOutputs(
-		outputs, keyScope, account, minconf, satPerKb,
-		coinSelectionStrategy, label,
-	)
+	return w.sendOutputs(outputs, keyScope, account, minconf, satPerKb, coinSelectionStrategy, label)
 }
 
 // SendOutputsWithInput creates and sends payment transactions using the
@@ -3495,41 +3492,45 @@ func (w *Wallet) SendOutputsWithInput(outputs []*wire.TxOut,
 		coinSelectionStrategy, label, selectedUtxos...)
 }
 
-// sendOutputs creates and sends payment transactions. It returns the
-// transaction upon success.
-func (w *Wallet) sendOutputs(outputs []*wire.TxOut, keyScope *waddrmgr.KeyScope,
-	account uint32, minconf int32, satPerKb btcutil.Amount,
-	coinSelectionStrategy CoinSelectionStrategy, label string,
+// sendOutputs creates and sends payment transactions. It returns the transaction upon success.
+func (w *Wallet) sendOutputs(outputs []*wire.TxOut, keyScope *waddrmgr.KeyScope, account uint32, minconf int32,
+	satPerKb btcutil.Amount, coinSelectionStrategy CoinSelectionStrategy, label string,
 	selectedUtxos ...wire.OutPoint) (*wire.MsgTx, error) {
 
-	// Ensure the outputs to be created adhere to the network's consensus
-	// rules.
+	// Ensure the outputs to be created adhere to the network's consensus rules.
 	for _, output := range outputs {
-		err := txrules.CheckOutput(
-			output, txrules.DefaultRelayFeePerKb,
-		)
+		err := txrules.CheckOutput(output, txrules.DefaultRelayFeePerKb)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	// Create the transaction and broadcast it to the network. The
-	// transaction will be added to the database in order to ensure that we
-	// continue to re-broadcast the transaction upon restarts until it has
-	// been confirmed.
-	createdTx, err := w.CreateSimpleTx(
-		keyScope, account, outputs, minconf, satPerKb,
-		coinSelectionStrategy, false, WithCustomSelectUtxos(
-			selectedUtxos,
-		),
-	)
+	// Create the transaction and persist it before broadcasting. Under SPV, pending transactions are rebroadcast
+	// explicitly by txid.
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+	if chainClient.BackEnd() == "neutrino" && !w.Manager.WatchOnly() {
+		// Fail an offline send before signing or exposing any transaction. Peers can disconnect after this
+		// check, so a later relay failure must still leave the stored payment pending.
+		progress, err := chainClient.SyncProgress()
+		if err != nil {
+			return nil, fmt.Errorf("unable to check SPV peer connections: %w", err)
+		}
+		if progress.Connections == 0 {
+			return nil, fmt.Errorf("%w: no connected peers", chain.ErrTxNotRelayed)
+		}
+	}
+
+	createdTx, err := w.CreateSimpleTx(keyScope, account, outputs, minconf, satPerKb,
+		coinSelectionStrategy, false, WithCustomSelectUtxos(selectedUtxos))
 	if err != nil {
 		return nil, err
 	}
 
-	// If our wallet is read-only, we'll get a transaction with coins
-	// selected but no witness data. In such a case we need to inform our
-	// caller that they'll actually need to go ahead and sign the TX.
+	// If our wallet is read-only, we'll get a transaction with coins selected but no witness data. In such a case
+	// we need to inform our caller that they'll actually need to go ahead and sign the TX.
 	if w.Manager.WatchOnly() {
 		return createdTx.Tx, ErrTxUnsigned
 	}
@@ -3645,56 +3646,47 @@ func (e *ErrInMempool) Unwrap() error {
 	return e.backendError
 }
 
-// PublishTransaction sends the transaction to the consensus RPC server so it
-// can be propagated to other nodes and eventually mined.
+// PublishTransaction sends the transaction to the consensus RPC server so it can be propagated to other nodes and
+// eventually mined. Under SPV, peer rejection or silence leaves a relevant transaction pending and returns nil. Only
+// verified chain data establishes confirmation or conflict.
 //
-// This function is unstable and will be removed once syncing code is moved out
-// of the wallet.
+// This function is unstable and will be removed once syncing code is moved out of the wallet.
 func (w *Wallet) PublishTransaction(tx *wire.MsgTx, label string) error {
+	// The caller already has the signed bytes and may have published them elsewhere. A no-peer response cannot
+	// prove they never escaped.
 	_, err := w.reliablyPublishTransaction(tx, label)
 	return err
 }
 
-// reliablyPublishTransaction is a superset of publishTransaction which contains
-// the primary logic required for publishing a transaction, updating the
-// relevant database state, and finally possible removing the transaction from
-// the database (along with cleaning up all inputs used, and outputs created) if
-// the transaction is rejected by the backend.
+// reliablyPublishTransaction records a transaction before publishing it.
 func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx, label string) (*chainhash.Hash, error) {
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return nil, err
 	}
 
-	// As we aim for this to be general reliable transaction broadcast API,
-	// we'll write this tx to disk as an unconfirmed transaction. This way,
-	// upon restarts, we'll always rebroadcast it, and also add it to our
-	// set of records.
+	// Keep the signed transaction and its input reservations across restarts. SPV peer responses are relay
+	// observations, not authoritative wallet state.
 	txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
 	if err != nil {
 		return nil, err
 	}
 
-	// Along the way, we'll extract our relevant destination addresses from
-	// the transaction.
+	// Along the way, we'll extract our relevant destination addresses from the transaction.
 	var ourAddrs []btcutil.Address
 	err = walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
 		addrmgrNs := dbTx.ReadWriteBucket(waddrmgrNamespaceKey)
 		for _, txOut := range tx.TxOut {
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-				txOut.PkScript, w.chainParams,
-			)
+			_, addrs, _, err := txscript.ExtractPkScriptAddrs(txOut.PkScript, w.chainParams)
 			if err != nil {
-				// Non-standard outputs can safely be skipped
-				// because they're not supported by the wallet.
-				log.Warnf("Non-standard pkScript=%x in tx=%v",
-					txOut.PkScript, tx.TxHash())
+				// Non-standard outputs can safely be skipped because they're not supported by the
+				// wallet.
+				log.Warnf("Non-standard pkScript=%x in tx=%v", txOut.PkScript, tx.TxHash())
 
 				continue
 			}
 			for _, addr := range addrs {
-				// Skip any addresses which are not relevant to
-				// us.
+				// Skip any addresses which are not relevant to us.
 				_, err := w.Manager.Address(addrmgrNs, addr)
 				if waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound) {
 					continue
@@ -3706,8 +3698,7 @@ func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx, label string) (*chai
 			}
 		}
 
-		// If there is a label we should write, get the namespace key
-		// and record it in the tx store.
+		// If there is a label we should write, get the namespace key and record it in the tx store.
 		if len(label) != 0 {
 			txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
 			if err = w.TxStore.PutTxLabel(txmgrNs, tx.TxHash(), label); err != nil {
@@ -3721,29 +3712,37 @@ func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx, label string) (*chai
 		return nil, err
 	}
 
-	// We'll also ask to be notified of the transaction once it confirms
-	// on-chain. This is done outside of the database transaction to prevent
-	// backend interaction within it.
+	// We'll also ask to be notified of the transaction once it confirms on-chain. This is done outside of the
+	// database transaction to prevent backend interaction within it.
 	if err := chainClient.NotifyReceived(ourAddrs); err != nil {
-		return nil, err
+		if chainClient.BackEnd() != "neutrino" {
+			return nil, err
+		}
+		// The record is committed and notifications may already have exposed its signed bytes. Keep returning
+		// the pending payment's txid even if registration fails, so callers do not create another payment.
+		log.Warnf("Unable to watch pending SPV transaction %v: %v", txRec.Hash, err)
 	}
 
-	return w.publishTransaction(tx)
+	// Use the same backend after committing, even if the wallet disconnects or replaces its client while this
+	// publication is in progress.
+	return w.publishTransaction(tx, chainClient)
 }
 
-// publishTransaction attempts to send an unconfirmed transaction to the
-// wallet's current backend. In the event that sending the transaction fails for
-// whatever reason, it will be removed from the wallet's unconfirmed transaction
-// store.
-func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
-	chainClient, err := w.requireChainClient()
-	if err != nil {
-		return nil, err
-	}
-
+// publishTransaction republishes an existing transaction. SPV relay results never remove stored payments; the pearld
+// backend keeps its existing RPC error handling.
+func (w *Wallet) publishTransaction(tx *wire.MsgTx, chainClient chain.Interface) (*chainhash.Hash, error) {
 	txid := tx.TxHash()
 	_, rpcErr := chainClient.SendRawTransaction(tx, false)
 	if rpcErr == nil {
+		return &txid, nil
+	}
+
+	if chainClient.BackEnd() == "neutrino" {
+		// Even unanimous rejects (including claims of confirmation) cannot establish that a signed transaction
+		// will never confirm. Preserve the payment and return its txid so callers do not retry by signing a
+		// different transaction. Users can rebroadcast or explicitly remove it using the existing
+		// pending-transaction controls.
+		log.Warnf("Retaining pending transaction %v after SPV broadcast result: %q", txid, rpcErr)
 		return &txid, nil
 	}
 
@@ -3752,9 +3751,7 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 		log.Infof("%v: tx already in mempool", txid)
 		return &txid, nil
 
-	case errors.Is(rpcErr, chain.ErrTxAlreadyKnown),
-		errors.Is(rpcErr, chain.ErrTxAlreadyConfirmed):
-
+	case errors.Is(rpcErr, chain.ErrTxAlreadyKnown), errors.Is(rpcErr, chain.ErrTxAlreadyConfirmed):
 		dbErr := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
 			txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
 			txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
@@ -3764,7 +3761,8 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 			return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
 		})
 		if dbErr != nil {
-			log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v", tx.TxHash(), dbErr)
+			log.Warnf("Unable to remove confirmed transaction %v from unconfirmed store: %v",
+				tx.TxHash(), dbErr)
 		}
 
 		log.Infof("%v: tx already confirmed", txid)
@@ -3776,10 +3774,9 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 	// Log the causing error, even if we know how to handle it.
 	log.Infof("%v: broadcast failed because of: %v", txid, rpcErr)
 
-	// If the transaction was rejected for whatever other reason, then
-	// we'll remove it from the transaction store, as otherwise, we'll
-	// attempt to continually re-broadcast it, and the UTXO state of the
-	// wallet won't be accurate.
+	// If the transaction was rejected for whatever other reason, then we'll remove it from the transaction store,
+	// as otherwise, we'll attempt to continually re-broadcast it, and the UTXO state of the wallet won't be
+	// accurate.
 	dbErr := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
 		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
 		txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
@@ -3789,25 +3786,21 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 		return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
 	})
 	if dbErr != nil {
-		log.Warnf("Unable to remove invalid transaction %v: %v",
-			tx.TxHash(), dbErr)
+		log.Warnf("Unable to remove invalid transaction %v: %v", tx.TxHash(), dbErr)
 	} else {
 		log.Infof("Removed invalid transaction: %v", tx.TxHash())
 
-		// The serialized transaction is for logging only, don't fail
-		// on the error.
+		// The serialized transaction is for logging only, don't fail on the error.
 		var txRaw bytes.Buffer
 		_ = tx.Serialize(&txRaw)
 
 		// Optionally log the tx in debug when the size is manageable.
 		if txRaw.Len() < 1_000_000 {
-			log.Debugf("Removed invalid transaction: %v \n hex=%x",
-				newLogClosure(func() string {
-					return spew.Sdump(tx)
-				}), txRaw.Bytes())
+			log.Debugf("Removed invalid transaction: %v \n hex=%x", newLogClosure(func() string {
+				return spew.Sdump(tx)
+			}), txRaw.Bytes())
 		} else {
-			log.Debug("Removed invalid transaction due to size " +
-				"too large")
+			log.Debug("Removed invalid transaction due to size too large")
 		}
 	}
 

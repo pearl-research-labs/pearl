@@ -157,6 +157,12 @@ func (msg *MsgCFCheckpt) Deserialize(r io.Reader) error {
 	return msg.PrlDecode(r, 0, BaseEncoding)
 }
 
+// SerializeSize returns the number of bytes it would take to serialize the receiver.
+func (msg *MsgCFCheckpt) SerializeSize() int {
+	// Filter type + stop hash + filter headers.
+	return 1 + chainhash.HashSize + varLenSize(len(msg.FilterHeaders), chainhash.HashSize)
+}
+
 // Command returns the protocol command string for the message.  This is part
 // of the Message interface implementation.
 func (msg *MsgCFCheckpt) Command() string {

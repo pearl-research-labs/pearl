@@ -143,6 +143,17 @@ func (msg *MsgHeaders) PrlEncode(w io.Writer, pver uint32, enc MessageEncoding) 
 	return nil
 }
 
+// SerializeSize returns the number of bytes it would take to serialize the receiver.
+func (msg *MsgHeaders) SerializeSize() int {
+	// Varint count of headers + certificate + header bytes per header.
+	n := VarIntSerializeSize(uint64(len(msg.Headers)))
+	for i := range msg.Headers {
+		n += msg.Headers[i].SerializeSize()
+	}
+
+	return n
+}
+
 // Command returns the protocol command string for the message.  This is part
 // of the Message interface implementation.
 func (msg *MsgHeaders) Command() string {

@@ -130,9 +130,7 @@ func (v *blockHeadersImportSourceValidator) ValidatePair(
 	}
 
 	if err := blockchain.CheckBlockHeaderContext(
-		currBH.BlockHeader.BlockHeader, parentCtx,
-		v.flags, &lightChainCtx{params: &v.targetChainParams},
-		true,
+		currBH.BlockHeader.BlockHeader, parentCtx, v.flags, &lightChainCtx{params: &v.targetChainParams}, false,
 	); err != nil {
 		return fmt.Errorf("contextual validation failed at "+
 			"height %d: %w", currHeight, err)
@@ -211,10 +209,13 @@ func (l *lightChainCtx) ChainParams() *chaincfg.Params {
 	return l.params
 }
 
-func (l *lightChainCtx) VerifyCheckpoint(height int32,
-	hash *chainhash.Hash) bool {
-
-	return false
+func (l *lightChainCtx) VerifyCheckpoint(height int32, hash *chainhash.Hash) bool {
+	for _, checkpoint := range l.params.Checkpoints {
+		if checkpoint.Height == height {
+			return checkpoint.Hash.IsEqual(hash)
+		}
+	}
+	return true
 }
 
 func (l *lightChainCtx) FindPreviousCheckpoint() (chaincfg.HeaderCtx,

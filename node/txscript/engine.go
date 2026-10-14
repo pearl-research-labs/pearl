@@ -60,6 +60,9 @@ const (
 type tapscriptExecutionCtx struct {
 	annex []byte
 
+	// Hashed once at context setup so annex hashing stays O(1) in the number of sigops.
+	annexHash []byte
+
 	codeSepPos uint32
 
 	tapLeafHash chainhash.Hash
@@ -104,8 +107,14 @@ func (t *tapscriptExecutionCtx) tallyOpCost(cost int32) error {
 func newTapscriptExecutionCtx(witnessSize int32, annex []byte,
 	tapLeafHash chainhash.Hash) *tapscriptExecutionCtx {
 
+	var annexHash []byte
+	if annex != nil {
+		annexHash = hashTapAnnex(annex)
+	}
+
 	return &tapscriptExecutionCtx{
 		annex:       annex,
+		annexHash:   annexHash,
 		codeSepPos:  blankCodeSepValue,
 		tapLeafHash: tapLeafHash,
 		opsBudget:   sigOpsDelta + witnessSize,
@@ -1003,8 +1012,8 @@ func (vm *Engine) CalcTapscriptSigHash(hashCache *TxSigHashes, hashType SigHashT
 	opts = append(opts, WithBaseTapscriptVersion(
 		vm.tapscriptCtx.codeSepPos, vm.tapscriptCtx.tapLeafHash[:],
 	))
-	if vm.tapscriptCtx.annex != nil {
-		opts = append(opts, WithAnnex(vm.tapscriptCtx.annex))
+	if vm.tapscriptCtx.annexHash != nil {
+		opts = append(opts, withAnnexHash(vm.tapscriptCtx.annexHash))
 	}
 
 	return calcTaprootSignatureHashRaw(

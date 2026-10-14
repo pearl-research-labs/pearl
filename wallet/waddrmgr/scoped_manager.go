@@ -535,19 +535,34 @@ func (s *ScopedKeyManager) deriveTapscriptRoot(
 	return rootHash[:], nil
 }
 
-// maybeDeriveTapscriptRoot derives the XMSS tapscript root if all conditions are met:
-// 1. Scope is BIP-86 (taproot)
-// 2. includePQTapscript is true
-// 3. The key is private (not watch-only/imported account)
-// Returns nil (no tapscript root) if any condition is not met.
+// maybeDeriveTapscriptRoot returns the root of the script tree to commit to in a new address.
+// The only script this wallet commits to is the XMSS spend path, so the result is either the
+// XMSS root (a PQ address) or nil (a plain BIP-86 address, spendable only with the Schnorr key).
 func (s *ScopedKeyManager) maybeDeriveTapscriptRoot(
 	ns walletdb.ReadWriteBucket, path DerivationPath,
 	key *hdkeychain.ExtendedKey, includePQTapscript bool,
 ) ([]byte, error) {
-	if s.scope == KeyScopeBIP0086 && includePQTapscript && key.IsPrivate() {
-		return s.deriveTapscriptRoot(ns, path)
+	// The caller asked for a plain BIP-86 address.
+	if !includePQTapscript {
+		return nil, nil
 	}
-	return nil, nil
+
+	// Only BIP-86 addresses get an XMSS spend path. The PQ scope's keys are only
+	// used to derive XMSS keys; their EC pubkeys are not used as payment addresses.
+	if s.scope != KeyScopeBIP0086 {
+		return nil, nil
+	}
+
+	// The XMSS key is derived from a private key. Without one, fail.
+	if !key.IsPrivate() {
+		// A watching-only manager is also locked, so check it first.
+		if !s.rootManager.WatchOnly() && s.rootManager.IsLocked() {
+			return nil, managerError(ErrLocked, "cannot derive PQ address: "+errLocked, nil)
+		}
+		return nil, managerError(ErrWatchingOnly, "cannot derive PQ address: private key unavailable", nil)
+	}
+
+	return s.deriveTapscriptRoot(ns, path)
 }
 
 // deriveKey returns either a public or private derived extended key based on
@@ -955,8 +970,11 @@ func (s *ScopedKeyManager) DeriveFromKeyPath(ns walletdb.ReadWriteBucket,
 		return nil, err
 	}
 
-	// Derive XMSS tapscript root for BIP-86 scope if conditions are met
-	tapscriptRoot, err := s.maybeDeriveTapscriptRoot(ns, kp, addrKey, includePQTapscript)
+	// Must not fail without a private key: recovery re-derives known paths
+	// while locked or watching-only, and an error stalls chain sync.
+	tapscriptRoot, err := s.maybeDeriveTapscriptRoot(
+		ns, kp, addrKey, includePQTapscript && addrKey.IsPrivate(),
+	)
 	if err != nil {
 		return nil, err
 	}

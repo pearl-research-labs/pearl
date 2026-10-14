@@ -86,6 +86,10 @@ const (
 	// maxSearchRawTransactionsCount is the maximum allowed count for
 	// searchrawtransactions. Larger values are rejected.
 	maxSearchRawTransactionsCount = 10000
+
+	// maxRequestSize is the largest JSON-RPC request body size.
+	// larger values are rejected (enough to hold roughly two blocks).
+	maxRequestSize = 4 * wire.MaxBlockPayload
 )
 
 var (
@@ -4401,13 +4405,20 @@ func (s *rpcServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 		return
 	}
 
-	// Read and close the JSON-RPC request body from the caller.
-	body, err := io.ReadAll(r.Body)
-	r.Body.Close()
+	limitedBody := http.MaxBytesReader(w, r.Body, maxRequestSize)
+
+	body, err := io.ReadAll(limitedBody)
+	limitedBody.Close()
+
 	if err != nil {
 		errCode := http.StatusBadRequest
-		http.Error(w, fmt.Sprintf("%d error reading JSON message: %v",
-			errCode, err), errCode)
+
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			errCode = http.StatusRequestEntityTooLarge
+		}
+
+		http.Error(w, fmt.Sprintf("%d error reading JSON message: %v", errCode, err), errCode)
 		return
 	}
 

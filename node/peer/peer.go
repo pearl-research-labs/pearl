@@ -74,6 +74,20 @@ const (
 	// stalling.  The deadlines are adjusted for callback running times and
 	// only checked on each stall tick interval.
 	stallResponseTimeout = 30 * time.Second
+
+	// DefaultMaxQueuedBytes is the default maximum number of payload bytes
+	// of outbound messages that may wait for the message being written to
+	// a peer. if this value is exceeded the peer disconnects.
+	DefaultMaxQueuedBytes = 16 * 1024 * 1024 // 16 MiB
+
+	// DefaultMaxQueuedMsgs is the default maximum number of outbound
+	// messages that may wait for the message being written to a peer. It
+	// bounds the memory each message takes beyond its wire size.
+	DefaultMaxQueuedMsgs = 1000
+
+	// DefaultWriteStallTimeout is the default maximum amount of time
+	// a peer may not progress in write
+	DefaultWriteStallTimeout = 30 * time.Second
 )
 
 var (
@@ -293,6 +307,15 @@ type Config struct {
 
 	// V2HandshakeAdmission optionally leases CPU for inbound v2 keygen and ECDH. Unused for outbound peers.
 	V2HandshakeAdmission v2transport.HandshakeAdmission
+
+	// MaxQueuedBytes overrides DefaultMaxQueuedBytes when positive.
+	MaxQueuedBytes int
+
+	// MaxQueuedMsgs overrides DefaultMaxQueuedMsgs when positive.
+	MaxQueuedMsgs int
+
+	// WriteStallTimeout overrides DefaultWriteStallTimeout when positive.
+	WriteStallTimeout time.Duration
 }
 
 // minUint32 is a helper function to return the minimum of two uint32s.
@@ -542,8 +565,16 @@ func (p *Peer) UpdateLastAnnouncedBlock(blkHash *chainhash.Hash) {
 // for the peer.
 //
 // This function is safe for concurrent access.
-func (p *Peer) AddKnownInventory(invVect *wire.InvVect) {
+func (p *Peer) AddKnownInventory(invVect wire.InvVect) {
 	p.knownInventory.Add(invVect)
+}
+
+// IsKnownInventory returns whether the peer is already known to have the
+// passed inventory vector.
+//
+// This function is safe for concurrent access.
+func (p *Peer) IsKnownInventory(invVect wire.InvVect) bool {
+	return p.knownInventory.Contains(invVect)
 }
 
 // StatsSnapshot returns a snapshot of the current peer flags and statistics.
@@ -1110,6 +1141,8 @@ func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
 		return err
 	}
 
+	log.Tracef("%v", newLogClosure(func() string { return spew.Sdump(buf.Bytes()) }))
+
 	_, n, err = p.V2Transport.V2EncPacket(buf.Bytes(), nil, false)
 
 	// Use closures to log expensive operations so they are only run when
@@ -1125,9 +1158,6 @@ func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
 	}))
 	log.Tracef("%v", newLogClosure(func() string {
 		return spew.Sdump(msg)
-	}))
-	log.Tracef("%v", newLogClosure(func() string {
-		return spew.Sdump(buf.Bytes())
 	}))
 
 	atomic.AddUint64(&p.bytesSent, uint64(n))
@@ -1630,7 +1660,7 @@ out:
 func (p *Peer) queueHandler() {
 	defer close(p.queueQuit)
 
-	pendingMsgs := list.New()
+	pendingMsgs := new(msgQueue)
 	invSendQueue := list.New()
 	trickleTicker := time.NewTicker(p.cfg.TrickleInterval)
 	defer trickleTicker.Stop()
@@ -1645,11 +1675,16 @@ func (p *Peer) queueHandler() {
 	waiting := false
 
 	// To avoid duplication below.
-	queuePacket := func(msg outMsg, list *list.List, waiting bool) bool {
+	queuePacket := func(msg outMsg, q *msgQueue, waiting bool) bool {
 		if !waiting {
 			p.sendQueue <- msg
 		} else {
-			list.PushBack(msg)
+			queuedMsgs, queuedBytes := q.push(msg, p.ProtocolVersion())
+			if queuedMsgs > p.cfg.MaxQueuedMsgs || queuedBytes > p.cfg.MaxQueuedBytes {
+				log.Warnf("Disconnecting %s: %d unsent messages of %d bytes over limit", p, queuedMsgs, queuedBytes)
+
+				p.Disconnect()
+			}
 		}
 		// we are always waiting now.
 		return true
@@ -1665,16 +1700,15 @@ out:
 		case <-p.sendDoneQueue:
 			// No longer waiting if there are no more messages
 			// in the pending messages queue.
-			next := pendingMsgs.Front()
-			if next == nil {
+			next, ok := pendingMsgs.pop()
+			if !ok {
 				waiting = false
 				continue
 			}
 
 			// Notify the outHandler about the next item to
 			// asynchronously send.
-			val := pendingMsgs.Remove(next)
-			p.sendQueue <- val.(outMsg)
+			p.sendQueue <- next
 
 		case iv := <-p.outputInvChan:
 			// No handshake?  They'll find out soon enough.
@@ -1682,8 +1716,7 @@ out:
 				// If this is a new block, then we'll blast it
 				// out immediately, sipping the inv trickle
 				// queue.
-				if iv.Type == wire.InvTypeBlock ||
-					iv.Type == wire.InvTypeWitnessBlock {
+				if iv.Type.IsBlock() {
 
 					invMsg := wire.NewMsgInvSizeHint(1)
 					invMsg.AddInvVect(iv)
@@ -1711,7 +1744,7 @@ out:
 
 				// Don't send inventory that became known after
 				// the initial check.
-				if p.knownInventory.Contains(iv) {
+				if p.knownInventory.Contains(*iv) {
 					continue
 				}
 
@@ -1725,7 +1758,7 @@ out:
 
 				// Add the inventory that is being relayed to
 				// the known inventory for the peer.
-				p.AddKnownInventory(iv)
+				p.AddKnownInventory(*iv)
 			}
 			if len(invMsg.InvList) > 0 {
 				waiting = queuePacket(outMsg{msg: invMsg},
@@ -1739,9 +1772,7 @@ out:
 
 	// Drain any wait channels before we go away so we don't leave something
 	// waiting for us.
-	for e := pendingMsgs.Front(); e != nil; e = pendingMsgs.Front() {
-		val := pendingMsgs.Remove(e)
-		msg := val.(outMsg)
+	for msg, ok := pendingMsgs.pop(); ok; msg, ok = pendingMsgs.pop() {
 		if msg.doneChan != nil {
 			msg.doneChan <- struct{}{}
 		}
@@ -1914,7 +1945,7 @@ func (p *Peer) QueueMessageWithEncoding(msg wire.Message, doneChan chan<- struct
 func (p *Peer) QueueInventory(invVect *wire.InvVect) {
 	// Don't add the inventory to the send queue if the peer is already
 	// known to have it.
-	if p.knownInventory.Contains(invVect) {
+	if p.knownInventory.Contains(*invVect) {
 		return
 	}
 
@@ -2339,6 +2370,38 @@ func (p *Peer) start() error {
 	return nil
 }
 
+// stallWriteChunk is the most bytes a stallWriter writes under one deadline.
+const stallWriteChunk = 64 * 1024
+
+// stallWriter wraps a connection used for writing to the remote peer and
+// gives every stallWriteChunk bytes written a deadline, so a remote peer that
+// stops reading, or reads less than a chunk per timeout, cannot hold the
+// connection forever, while a slow peer that keeps reading is not dropped.
+type stallWriter struct {
+	net.Conn
+	timeout time.Duration
+}
+
+// Write writes b to the underlying connection in chunks of at most
+// stallWriteChunk bytes.  It returns an error wrapping os.ErrDeadlineExceeded
+// if a chunk is not fully written within the timeout.
+func (w *stallWriter) Write(b []byte) (int, error) {
+	var written int
+	for written < len(b) {
+		if err := w.Conn.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
+			return written, err
+		}
+
+		n, err := w.Conn.Write(b[written:min(written+stallWriteChunk, len(b))])
+		written += n
+		if err != nil {
+			return written, err
+		}
+	}
+
+	return written, nil
+}
+
 // AssociateConnection associates the given conn to the peer. Calling this function when the peer is already
 // connected will have no effect. When the peer is already disconnecting, the connection is closed instead.
 func (p *Peer) AssociateConnection(conn net.Conn) {
@@ -2360,7 +2423,8 @@ func (p *Peer) AssociateConnection(conn net.Conn) {
 	atomic.StoreInt32(&p.connected, 1)
 	p.connMtx.Unlock()
 
-	p.V2Transport.UseReadWriter(conn)
+	// Fail writes that take longer than the write stall timeout.
+	p.V2Transport.UseReadWriter(&stallWriter{Conn: conn, timeout: p.cfg.WriteStallTimeout})
 
 	if p.inbound {
 		p.addr = p.conn.RemoteAddr().String()
@@ -2424,6 +2488,21 @@ func newPeerBase(origCfg *Config, inbound bool) *Peer {
 	// Set the trickle interval if a non-positive value is specified.
 	if cfg.TrickleInterval <= 0 {
 		cfg.TrickleInterval = DefaultTrickleInterval
+	}
+
+	// Set the queued byte limit if a non-positive value is specified.
+	if cfg.MaxQueuedBytes <= 0 {
+		cfg.MaxQueuedBytes = DefaultMaxQueuedBytes
+	}
+
+	// Set the queued message limit if a non-positive value is specified.
+	if cfg.MaxQueuedMsgs <= 0 {
+		cfg.MaxQueuedMsgs = DefaultMaxQueuedMsgs
+	}
+
+	// Set the write stall timeout if a non-positive value is specified.
+	if cfg.WriteStallTimeout <= 0 {
+		cfg.WriteStallTimeout = DefaultWriteStallTimeout
 	}
 
 	p := Peer{

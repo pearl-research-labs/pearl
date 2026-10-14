@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -716,4 +717,50 @@ func TestCompleteHandshakeGarbageTerminatorPrefixDecoy(t *testing.T) {
 			require.NoError(t, initiator.CompleteHandshake(true, nil, mainNet))
 		})
 	}
+}
+
+// TestV2ReceivePacketAllocatesAsBytesArrive pins that the receive buffer follows the bytes that actually arrive
+// rather than the decrypted length field. A peer could otherwise claim a maxContentLen packet, send a few bytes and
+// stall, committing us to 16 MiB per connection for three bytes on the wire. Not parallel: it measures TotalAlloc.
+func TestV2ReceivePacketAllocatesAsBytesArrive(t *testing.T) {
+	sender, receiver := NewPeer(), NewPeer()
+
+	var err error
+	sender.privkeyOurs, sender.ellswiftOurs, err = ellswift.EllswiftCreate()
+	require.NoError(t, err)
+
+	receiver.privkeyOurs, receiver.ellswiftOurs, err = ellswift.EllswiftCreate()
+	require.NoError(t, err)
+
+	// perform DH.
+	require.NoError(t, sender.deriveV2Ciphers(receiver.ellswiftOurs, true, mainNet))
+	require.NoError(t, receiver.deriveV2Ciphers(sender.ellswiftOurs, false, mainNet))
+
+	stream := bytes.NewBuffer(nil)
+	sender.UseReadWriter(stream)
+	receiver.UseReadWriter(stream)
+
+	// An honest multi-megabyte packet still arrives whole.
+	contents := bytes.Repeat([]byte{0x5a}, 4_000_000)
+	// encrypts and sends.
+	_, _, err = sender.V2EncPacket(contents, nil, false)
+	require.NoError(t, err)
+
+	got, err := receiver.V2ReceivePacket(nil)
+	require.NoError(t, err)
+	require.Equal(t, contents, got)
+
+	// A packet claiming maxContentLen that stalls after 1000 bytes allocates for what arrived only.
+	encLen, err := sender.sendL.Crypt([]byte{0xff, 0xff, 0xff})
+	require.NoError(t, err)
+	stream.Write(encLen)
+	stream.Write(make([]byte, 1000))
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err = receiver.V2ReceivePacket(nil)
+	runtime.ReadMemStats(&after)
+
+	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(1<<20))
+	require.ErrorIs(t, err, io.EOF)
 }

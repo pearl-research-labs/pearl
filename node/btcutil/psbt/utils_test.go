@@ -7,6 +7,7 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSumUtxoInputValues(t *testing.T) {
@@ -71,6 +72,26 @@ func TestSumUtxoInputValues(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected sum of malformed packet to fail")
 	}
+}
+
+func TestNonWitnessUtxoIndexBounds(t *testing.T) {
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Index: 500}})
+	tx.AddTxOut(&wire.TxOut{Value: 1, PkScript: []byte{0x51}})
+
+	packet, err := NewFromUnsignedTx(tx)
+	require.NoError(t, err)
+	packet.Inputs[0].NonWitnessUtxo = &wire.MsgTx{TxOut: []*wire.TxOut{{Value: 1, PkScript: []byte{0x51}}}}
+
+	updater := &Updater{Upsbt: packet}
+	_, err = updater.Sign(0, []byte{0x30, 0x44}, []byte{0x02, 0x03}, nil, nil)
+	require.ErrorIs(t, err, ErrInvalidNonWitnessUtxoIndex)
+
+	require.ErrorIs(t, nonWitnessToWitness(packet, 0), ErrInvalidNonWitnessUtxoIndex)
+	require.ErrorIs(t, packet.SanityCheck(), ErrInvalidNonWitnessUtxoIndex)
+
+	_, err = SumUtxoInputValues(packet)
+	require.Error(t, err)
 }
 
 func TestTxOutsEqual(t *testing.T) {

@@ -243,18 +243,24 @@ func defaultTaprootSighashOptions() *taprootSigHashOptions {
 // used to modify the base sighash message with optional extensions.
 type TaprootSigHashOption func(*taprootSigHashOptions)
 
+// Untagged; BIP 341's annex digest is not a tagged hash.
+func hashTapAnnex(annex []byte) []byte {
+	var b bytes.Buffer
+	_ = wire.WriteVarBytes(&b, 0, annex)
+	return chainhash.HashB(b.Bytes())
+}
+
+func withAnnexHash(annexHash []byte) TaprootSigHashOption {
+	return func(o *taprootSigHashOptions) {
+		o.annexHash = annexHash
+	}
+}
+
 // WithAnnex is a functional option that allows the caller to specify the
 // existence of an annex in the final witness stack for the taproot/tapscript
 // spends.
 func WithAnnex(annex []byte) TaprootSigHashOption {
-	return func(o *taprootSigHashOptions) {
-		// It's just a bytes.Buffer which never returns an error on
-		// write.
-		var b bytes.Buffer
-		_ = wire.WriteVarBytes(&b, 0, annex)
-
-		o.annexHash = chainhash.HashB(b.Bytes())
-	}
+	return withAnnexHash(hashTapAnnex(annex))
 }
 
 // WithBaseTapscriptVersion is a functional option that specifies that the
