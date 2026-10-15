@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"math/rand"
 	"net"
@@ -2532,6 +2533,66 @@ func handleGetNetworkInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct
 	return result, nil
 }
 
+// validateNetworkHashPSCmd rejects getnetworkhashps parameters that do
+// not fit in the int32 heights handleGetNetworkHashPS computes with. The
+// parameters arrive as int (int64 on 64-bit platforms) and were
+// previously cast without a range check, so a height of 2^31 wrapped to
+// a negative value and was silently treated as "use the best height", a
+// height of 2^32+1 wrapped to height 1, and a block count of 2^31
+// wrapped to a negative count that sent the scan back to genesis. A
+// block count that is not positive never reaches the cast — the handler
+// substitutes the default below — so it is accepted at any magnitude.
+func validateNetworkHashPSCmd(c *btcjson.GetNetworkHashPSCmd) error {
+	if c.Height != nil &&
+		(int64(*c.Height) > math.MaxInt32 ||
+			int64(*c.Height) < math.MinInt32) {
+
+		return &btcjson.RPCError{
+			Code:    btcjson.ErrRPCInvalidParameter,
+			Message: "Height out of range",
+		}
+	}
+	if c.Blocks != nil && *c.Blocks > 0 &&
+		int64(*c.Blocks) > math.MaxInt32 {
+
+		return &btcjson.RPCError{
+			Code:    btcjson.ErrRPCInvalidParameter,
+			Message: "Blocks out of range",
+		}
+	}
+	return nil
+}
+
+// networkHashPSRange converts a validated getnetworkhashps command into
+// the inclusive height range to scan for a chain whose best height is
+// bestHeight. ok is false when no estimate applies: the passed height
+// is zero or above the best height. When it's negative, use the current
+// best block height.
+//
+// Calculate the starting block height based on the passed number of
+// blocks. With WTEMA difficulty adjustment (every block), we use a
+// default of 120 blocks when numBlocks is not specified or is negative.
+func networkHashPSRange(c *btcjson.GetNetworkHashPSCmd,
+	bestHeight int32) (startHeight, endHeight int32, ok bool) {
+
+	endHeight = int32(-1)
+	if c.Height != nil {
+		endHeight = int32(*c.Height)
+	}
+	if endHeight > bestHeight || endHeight == 0 {
+		return 0, 0, false
+	}
+	if endHeight < 0 {
+		endHeight = bestHeight
+	}
+
+	numBlocks := int32(120)
+	if c.Blocks != nil && *c.Blocks > 0 {
+		numBlocks = int32(*c.Blocks)
+	}
+	return max(endHeight-numBlocks, 0), endHeight, true
+}
+
 // handleGetNetworkHashPS implements the getnetworkhashps command.
 func handleGetNetworkHashPS(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	// Note: All valid error return paths should return a float64.
@@ -2540,30 +2601,21 @@ func handleGetNetworkHashPS(s *rpcServer, cmd interface{}, closeChan <-chan stru
 
 	c := cmd.(*btcjson.GetNetworkHashPSCmd)
 
-	// When the passed height is too high or zero, just return 0 now
-	// since we can't reasonably calculate the number of network hashes
-	// per second from invalid values.  When it's negative, use the current
-	// best block height.
-	best := s.cfg.Chain.BestSnapshot()
-	endHeight := int32(-1)
-	if c.Height != nil {
-		endHeight = int32(*c.Height)
-	}
-	if endHeight > best.Height || endHeight == 0 {
-		return float64(0), nil
-	}
-	if endHeight < 0 {
-		endHeight = best.Height
+	// Reject parameters that don't fit in int32 before touching the
+	// chain, so an out-of-range request errors instead of wrapping
+	// into a different range than the client asked for.
+	if err := validateNetworkHashPSCmd(c); err != nil {
+		return nil, err
 	}
 
-	// Calculate the starting block height based on the passed number of
-	// blocks. With WTEMA difficulty adjustment (every block), we use a
-	// default of 120 blocks when numBlocks is not specified or is negative.
-	numBlocks := int32(120)
-	if c.Blocks != nil && *c.Blocks > 0 {
-		numBlocks = int32(*c.Blocks)
+	// When the passed height is too high or zero, just return 0 now
+	// since we can't reasonably calculate the number of network hashes
+	// per second from invalid values.
+	best := s.cfg.Chain.BestSnapshot()
+	startHeight, endHeight, ok := networkHashPSRange(c, best.Height)
+	if !ok {
+		return float64(0), nil
 	}
-	startHeight := max(endHeight-numBlocks, 0)
 	rpcsLog.Debugf("Calculating network hashes per second from %d to %d",
 		startHeight, endHeight)
 
