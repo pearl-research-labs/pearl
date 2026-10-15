@@ -320,9 +320,16 @@ type serverPeer struct {
 
 	*peer.Peer
 
-	connReq        *connmgr.ConnReq
-	server         *server
-	persistent     bool
+	connReq    *connmgr.ConnReq
+	server     *server
+	persistent bool
+
+	// removed is set when a persistent peer is explicitly removed via
+	// addnode remove. handleDonePeerMsg uses it to drop the peer's
+	// connection request instead of letting the connection manager
+	// redial it. It is only accessed from the peerHandler goroutine,
+	// which handles both the removal and the peer's done message.
+	removed        bool
 	continueHash   *chainhash.Hash
 	relayMtx       sync.Mutex
 	disableRelayTx bool
@@ -1948,8 +1955,15 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 	// process a peer's `done` message before its `add`.
 	if !sp.Inbound() {
 		switch {
-		case sp.persistent:
+		case sp.persistent && !sp.removed:
 			s.connManager.Disconnect(sp.connReq.ID())
+
+		case sp.removed:
+			// The peer was explicitly removed via addnode
+			// remove, so drop its connection request entirely
+			// instead of scheduling the redial a persistent
+			// peer would otherwise get.
+			s.connManager.Remove(sp.connReq.ID())
 
 		default:
 			s.connManager.Remove(sp.connReq.ID())
@@ -2172,6 +2186,12 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		msg.reply <- nil
 	case removeNodeMsg:
 		found := disconnectPeer(state.persistentPeers, msg.cmp, func(sp *serverPeer) {
+			// Mark the peer as explicitly removed so that
+			// handleDonePeerMsg drops its permanent connection
+			// request instead of letting the connection manager
+			// redial it.
+			sp.removed = true
+
 			// Keep group counts ok since we remove from
 			// the list now.
 			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
