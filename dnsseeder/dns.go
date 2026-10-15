@@ -16,7 +16,7 @@ func updateDNS(s *dnsseeder) {
 	s.mtx.RLock()
 
 	// loop over each dns recprd type we need
-	for t := range []int{dnsV4Std, dnsV4Non, dnsV6Std, dnsV6Non} {
+	for _, t := range []int{dnsV4Std, dnsV4Non, dnsV6Std, dnsV6Non} {
 		// FIXME above needs to be convertwd into one scan of theList if possible
 
 		numRR := 0
@@ -86,7 +86,7 @@ func updateDNS(s *dnsseeder) {
 	config.dnsmtx.Lock()
 
 	// update the map holding the details for this seeder
-	for t := range []int{dnsV4Std, dnsV4Non, dnsV6Std, dnsV6Non} {
+	for _, t := range []int{dnsV4Std, dnsV4Non, dnsV6Std, dnsV6Non} {
 		switch t {
 		case dnsV4Std:
 			config.dns[s.dnsHost+".A"] = rr4std
@@ -133,6 +133,15 @@ func handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 	// the server's own payload limit, not the client's (RFC 6891 §6.2.3).
 	if opt := r.IsEdns0(); opt != nil {
 		m.SetEdns0(dns.DefaultMsgSize, opt.Do())
+	}
+
+	// A query with no questions (QDCOUNT=0) parses and dispatches
+	// fine, but there is no question to answer — reply FORMERR
+	// instead of panicking on r.Question[0] below.
+	if len(r.Question) == 0 {
+		m.Rcode = dns.RcodeFormatError
+		w.WriteMsg(m)
+		return
 	}
 
 	var qtype string
