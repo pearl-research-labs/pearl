@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"math/rand"
 	"net"
@@ -3248,9 +3249,31 @@ func handleReconsiderBlock(s *rpcServer, cmd interface{}, closeChan <-chan struc
 	return nil, err
 }
 
+// validateSearchRawTransactionsCmd rejects a skip count that does not
+// fit in a uint32. The handler narrows the skip to uint32 for both the
+// mempool fetch and the address-index query; an unchecked value of 2^32
+// or more wrapped to a small skip, so the handler silently returned an
+// early page of results instead of skipping past them. A negative skip
+// never reaches the casts (the handler clamps it to zero), so it stays
+// accepted at any magnitude.
+func validateSearchRawTransactionsCmd(c *btcjson.SearchRawTransactionsCmd) error {
+	if c.Skip != nil && *c.Skip > math.MaxUint32 {
+		return &btcjson.RPCError{
+			Code: btcjson.ErrRPCInvalidParameter,
+			Message: fmt.Sprintf("Skip exceeds maximum allowed (%d)",
+				uint64(math.MaxUint32)),
+		}
+	}
+	return nil
+}
+
 // handleSearchRawTransactions implements the searchrawtransactions command.
 func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	c := cmd.(*btcjson.SearchRawTransactionsCmd)
+
+	if err := validateSearchRawTransactionsCmd(c); err != nil {
+		return nil, err
+	}
 
 	numRequested := defaultSearchRawTransactionsCount
 	if c.Count != nil {
