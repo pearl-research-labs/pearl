@@ -317,15 +317,9 @@ importers:
 
   packages/pearl-address-validation:
     dependencies:
-      base58-js:
-        specifier: ^3.0.2
-        version: 3.0.3
       bech32:
         specifier: ^2.0.0
         version: 2.0.0
-      sha256-uint8array:
-        specifier: ^0.10.3
-        version: 0.10.7
     devDependencies:
       '@arethetypeswrong/cli':
         specifier: ^0.17.3
@@ -333,9 +327,6 @@ importers:
       '@changesets/cli':
         specifier: ^2.27.12
         version: 2.29.8
-      '@types/sha.js':
-        specifier: ^2.4.0
-        version: 2.4.4
       prettier:
         specifier: ^3.5.1
         version: 3.7.4
@@ -4161,12 +4152,6 @@ packages:
       '@types/node': 24.10.4
     dev: true
 
-  /@types/sha.js@2.4.4:
-    resolution: {integrity: sha512-Qukd+D6S2Hm0wLVt2Vh+/eWBIoUt+wF8jWjBsG4F8EFQRwKtYvtXCPcNl2OEUQ1R+eTr3xuSaBYUyM3WD1x/Qw==}
-    dependencies:
-      '@types/node': 24.10.4
-    dev: true
-
   /@types/verror@1.10.11:
     resolution: {integrity: sha512-RlDm9K7+o5stv0Co8i8ZRGxDbrTxhJtgjqjFyVh/tXQyl/rYtTKlnTvZ88oSTeYREWurwx20Js4kTuKCsFkUtg==}
     requiresBuild: true
@@ -4775,11 +4760,6 @@ packages:
 
   /base-x@5.0.1:
     resolution: {integrity: sha512-M7uio8Zt++eg3jPj+rHMfCC+IuygQHHCOU+IYsVtik6FWjuYpVt/+MRKcgsAMHh8mMFAwnB+Bs+mTrFiXjMzKg==}
-    dev: false
-
-  /base58-js@3.0.3:
-    resolution: {integrity: sha512-3hf42BysHnUqmZO7mK6e5X/hs1AvyEJIhdVLbG/Mxn/fhFnhGxOO37mWbMHg1RT4TxqcPKXgqj9/bp1YG0GBXA==}
-    engines: {node: '>=16.0.0', npm: '>=7.0.0'}
     dev: false
 
   /base64-js@1.5.1:
@@ -9332,10 +9312,6 @@ packages:
       safe-buffer: 5.2.1
       to-buffer: 1.2.2
     dev: true
-
-  /sha256-uint8array@0.10.7:
-    resolution: {integrity: sha512-1Q6JQU4tX9NqsDGodej6pkrUVQVNapLZnvkwIhddH/JqzBZF1fSaxSWNY6sziXBE8aEa2twtGkXUrwzGeZCMpQ==}
-    dev: false
 
   /sharp@0.34.5:
     resolution: {integrity: sha512-Ou9I5Ft9WNcCbXrU9cMgPBcCK8LiwLqcbywW3t4oDV37n1pzpuNLsYiAV8eODnjbtQlSDwZ2cUEeQz4E54Hltg==}

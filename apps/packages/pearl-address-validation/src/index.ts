@@ -1,100 +1,43 @@
-import { base58_to_binary } from 'base58-js';
-import { bech32, bech32m } from 'bech32';
-import { createHash } from 'sha256-uint8array';
-
-const sha256 = (payload: Uint8Array) => createHash().update(payload).digest();
+import { bech32m } from 'bech32';
 
 enum Network {
   mainnet = 'mainnet',
   testnet = 'testnet',
-  regtest = 'regtest',
   simnet = 'simnet',
 }
 
 enum AddressType {
-  p2pkh = 'p2pkh',
-  p2sh = 'p2sh',
-  p2wpkh = 'p2wpkh',
-  p2wsh = 'p2wsh',
   p2tr = 'p2tr',
+  p2mr = 'p2mr',
 }
 
 type AddressInfo = {
-  bech32: boolean;
   network: Network;
   address: string;
   type: AddressType;
 };
 
-const addressTypes: { [key: number]: { type: AddressType; network: Network } } = {
-  0x00: {
-    type: AddressType.p2pkh,
-    network: Network.mainnet,
-  },
-
-  0x6f: {
-    type: AddressType.p2pkh,
-    network: Network.testnet,
-  },
-
-  0x05: {
-    type: AddressType.p2sh,
-    network: Network.mainnet,
-  },
-
-  0xc4: {
-    type: AddressType.p2sh,
-    network: Network.testnet,
-  },
+const prefixToNetwork: { [key: string]: Network } = {
+  prl: Network.mainnet,
+  tprl: Network.testnet,
+  rprl: Network.simnet,
 };
 
-type Options = {
-  castTestnetTo?: Network.regtest | Network.simnet;
+const witnessVersionToType: { [key: number]: AddressType } = {
+  1: AddressType.p2tr,
+  2: AddressType.p2mr,
 };
 
-function castTestnetTo(fromNetwork: Network, toNetwork?: Network.regtest | Network.simnet): Network {
-  if (!toNetwork) {
-    return fromNetwork;
-  }
-
-  if (fromNetwork === Network.mainnet) {
-    throw new Error('Cannot cast mainnet to non-mainnet');
-  }
-
-  return toNetwork;
-}
-
-const normalizeAddressInfo = (addressInfo: AddressInfo, options?: Options): AddressInfo => {
-  return {
-    ...addressInfo,
-    network: castTestnetTo(addressInfo.network, options?.castTestnetTo),
-  };
-};
-
-const parseBech32 = (address: string, options?: Options): AddressInfo => {
+const getAddressInfo = (address: string): AddressInfo => {
   let decoded;
 
-  const lowerAddress = address.toLowerCase();
-  // Only accept Taproot addresses (witness v1) - reject legacy SegWit v0
-  // Check if address starts with 'p' (witness v1)
-  if (!lowerAddress.startsWith('prl1p') && !lowerAddress.startsWith('tprl1p') && !lowerAddress.startsWith('rprl1p')) {
-    throw new Error('Invalid address');
-  }
-
   try {
-    // Taproot uses bech32m encoding
     decoded = bech32m.decode(address);
-  } catch (error) {
+  } catch {
     throw new Error('Invalid address');
   }
 
-  const mapPrefixToNetwork: { [key: string]: Network } = {
-    prl: Network.mainnet,
-    tprl: Network.testnet,
-    rprl: Network.simnet,
-  };
-
-  const network: Network | undefined = mapPrefixToNetwork[decoded.prefix];
+  const network = prefixToNetwork[decoded.prefix];
 
   if (network === undefined) {
     throw new Error('Invalid address');
@@ -102,99 +45,35 @@ const parseBech32 = (address: string, options?: Options): AddressInfo => {
 
   const witnessVersion = decoded.words[0];
 
-  // Only accept witness version 1 (Taproot)
-  if (witnessVersion !== 1) {
-    throw new Error('Only Taproot (witness v1) addresses are supported. Found witness version: ' + witnessVersion);
+  if (witnessVersion === undefined) {
+    throw new Error('Invalid address');
   }
 
-  const data = bech32.fromWords(decoded.words.slice(1));
+  const type = witnessVersionToType[witnessVersion];
 
-  // Taproot addresses must have 32-byte programs
-  if (data.length !== 32) {
-    throw new Error('Invalid Taproot address: witness program must be 32 bytes');
+  if (type === undefined) {
+    throw new Error('Invalid address');
   }
 
-  const type = AddressType.p2tr;
+  const program = bech32m.fromWords(decoded.words.slice(1));
 
-  return normalizeAddressInfo(
-    {
-      bech32: true,
-      network,
-      address,
-      type,
-    },
-    options,
-  );
+  if (program.length !== 32) {
+    throw new Error('Invalid address');
+  }
+
+  return { network, address, type };
 };
 
-const getAddressInfo = (address: string, options?: Options): AddressInfo => {
-  let decoded: Uint8Array;
-
-  const lowerAddress = address.toLowerCase();
-  // Check if it's a bech32/bech32m address (starts with network prefix + '1')
-  if (lowerAddress.startsWith('prl1') || lowerAddress.startsWith('tprl1') || lowerAddress.startsWith('rprl1')) {
-    try {
-      return parseBech32(address, options);
-    } catch (error) {
-      throw new Error('Invalid address');
-    }
-  }
-
+const validate = (address: string, network?: Network): boolean => {
   try {
-    decoded = base58_to_binary(address);
-  } catch (error) {
-    throw new Error('Invalid address');
-  }
-
-  const { length } = decoded;
-
-  if (length !== 25) {
-    throw new Error('Invalid address');
-  }
-
-  const version = decoded[0];
-
-  const checksum = decoded.slice(length - 4, length);
-  const body = decoded.slice(0, length - 4);
-
-  const expectedChecksum = sha256(sha256(body)).slice(0, 4);
-
-  if (checksum.some((value: number, index: number) => value !== expectedChecksum[index])) {
-    throw new Error('Invalid address');
-  }
-
-  const validVersions = Object.keys(addressTypes).map(Number);
-
-  if (version === undefined || !validVersions.includes(version)) {
-    throw new Error('Invalid address');
-  }
-
-  const addressType = addressTypes[version];
-
-  if (!addressType) {
-    throw new Error('Invalid address');
-  }
-
-  return normalizeAddressInfo(
-    {
-      ...addressType,
-      address,
-      bech32: false,
-    },
-    options,
-  );
-};
-
-const validate = (address: string, network?: Network, options?: Options) => {
-  try {
-    const addressInfo = getAddressInfo(address, options);
+    const addressInfo = getAddressInfo(address);
 
     if (network) {
       return network === addressInfo.network;
     }
 
     return true;
-  } catch (error) {
+  } catch {
     return false;
   }
 };
