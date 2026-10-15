@@ -15,14 +15,30 @@ the serving policy: it speaks at least the minimum wire protocol version,
 carries the required full-node service bits, reports a chain height at or above
 the network's latest checkpoint (which weeds out nodes stranded on a pre-fork
 chain), and listens on the network's default P2P port. The policy is fixed in
-code, not configurable.
+code except for the configurable minimum protocol version.
 
-Each crawl re-verifies the served addresses, sends `getaddr` to the live peers,
-and verifies addresses received through `addrv2`. Newly verified peers are
-queried during the same crawl, so discovery continues until no candidate
-address arrives for 30 seconds or the crawl interval expires. Peer connections
-are then closed; the verified address book remains in memory for DNS serving
-and the next crawl.
+Each crawl snapshots and shuffles the served address book, then schedules its
+refresh probes before newly discovered candidates. A fixed pool of 64 workers
+handles bootstrap, refresh, and discovery. Each worker owns a complete probe:
+dial, verify the handshake, record verification, request one `addrv2` batch,
+and close the socket. At most 64 crawler connections per instance can be
+pending or open, including while waiting for addresses. Dial and handshake
+limits are 5 seconds each; address collection has a fixed 10-second deadline
+that incoming traffic cannot extend. All stages also respect the crawl deadline.
+
+Successful default-port handshakes enter the address book immediately, enabling
+readiness while address collection is pending. Empty responses, missing
+addresses, and later disconnects do not undo verification. Non-default-port
+peers and peers encountered when the 2000-entry book is full still receive one
+bounded address exchange. The book is independent of live connections.
+
+A crawl admits at most 4096 unique endpoints outside its initial book snapshot,
+including resolved bootstrap endpoints. Initial served peers do not consume
+this budget. Admitted endpoints remain deduplicated for the entire crawl;
+overflow advertisements are dropped. All candidate queues and results belong
+to that crawl. It finishes as soon as queued work and active probes are
+exhausted, or its deadline expires, with no extra idle grace period. Shutdown
+cancels the crawl and waits for workers to close their sockets and exit.
 
 A served peer that fails re-verification on two consecutive crawls stops being
 served and enters a three-hour cooldown; a gossiped address that fails its
@@ -30,7 +46,9 @@ first verification enters the cooldown immediately. Cooled-down addresses are
 not re-dialed until the cooldown expires, after which gossip naturally
 rediscovers and re-verifies them. Should the address book empty out entirely
 (every known peer died, or the instance lost egress), the crawler starts over
-from the bootstrap peers, which are always dialed regardless of cooldown.
+from the bootstrap peers after 30 seconds, regardless of cooldown. Cancellation,
+duplicate suppression, budget drops, and unattempted work do not strike peers.
+Crawls never overlap; normal periodic scheduling uses `crawl_interval`.
 
 Records exist only at the zone apex: A and AAAA queries answer with a random
 sample of up to 25 peer addresses (TTL 3600), SOA queries answer with a
@@ -88,7 +106,7 @@ are exported:
 * `coredns_dnsseed_request_count_total{server}` - count of queries handled by
   the plugin.
 * `coredns_dnsseed_addresses` - number of verified peer addresses available to
-  serve, updated after each crawl.
+  serve.
 
 The `server` label indicates which server handled the request, see the
 *metrics* plugin for details.

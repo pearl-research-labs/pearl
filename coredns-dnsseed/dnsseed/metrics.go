@@ -18,7 +18,7 @@ var (
 	}, []string{"server"})
 
 	// addressCount tracks the number of verified, servable peer addresses
-	// in the book. It is updated after each crawl.
+	// in the book.
 	addressCount = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: pluginName,

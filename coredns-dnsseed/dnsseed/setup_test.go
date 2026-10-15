@@ -1,12 +1,18 @@
 package dnsseed
 
 import (
+	"context"
+	"errors"
+	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/coredns/caddy"
 	"github.com/pearl-research-labs/pearl/node/peer"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -186,4 +192,123 @@ func TestParse(t *testing.T) {
 			assert.Equal(t, tt.minProto, opts.minProtocolVersion)
 		})
 	}
+}
+
+// Virtual time verifies both normal cadence and 30-second empty-book recovery
+// without sleeping through production intervals or changing their constants.
+func TestCrawlLoopSchedulingAndRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestSeeder(t, "regtest")
+		addr := crawlEndpoint(18, 1, s.addrBook.defaultPort)
+		recovered := crawlEndpoint(18, 2, s.addrBook.defaultPort)
+		s.addrBook.add(addr)
+		var attempts atomic.Int32
+		s.dialContext = func(context.Context, string, string) (net.Conn, error) {
+			// The third dial belongs to the recovery crawl; book a peer as
+			// a successful bootstrap probe would.
+			if attempts.Add(1) == 3 {
+				s.addrBook.add(recovered)
+			}
+			return nil, errors.New("controlled failure")
+		}
+		opts := &options{networkName: "regtest", updateInterval: 5 * time.Minute, bootstrapPeers: []string{addr.String()}}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		go func() { defer close(done); crawlLoop(ctx, s, opts) }()
+		synctest.Wait()
+		require.EqualValues(t, 1, attempts.Load())
+		time.Sleep(opts.updateInterval - time.Second)
+		synctest.Wait()
+		assert.EqualValues(t, 1, attempts.Load())
+		time.Sleep(time.Second)
+		synctest.Wait()
+		require.EqualValues(t, 2, attempts.Load())
+		require.False(t, s.ready(), "second failed refresh should empty the book")
+		time.Sleep(29 * time.Second)
+		synctest.Wait()
+		assert.EqualValues(t, 2, attempts.Load())
+		time.Sleep(time.Second)
+		synctest.Wait()
+		assert.EqualValues(t, 3, attempts.Load(), "empty-book recovery must retry after 30 seconds")
+		require.True(t, s.ready())
+		time.Sleep(opts.updateInterval - time.Second)
+		synctest.Wait()
+		assert.EqualValues(t, 3, attempts.Load(), "the next periodic crawl must wait a full interval after recovery")
+		time.Sleep(time.Second)
+		synctest.Wait()
+		assert.EqualValues(t, 4, attempts.Load())
+		cancel()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("crawl loop did not stop")
+		}
+	})
+}
+
+// Each crawl lasts the 5s dial timeout, so measuring the interval from the
+// crawl's end would start the second crawl 5s late.
+func TestCrawlLoopCadenceStartsFromCrawlStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestSeeder(t, "regtest")
+		addr := crawlEndpoint(18, 1, s.addrBook.defaultPort)
+		s.addrBook.add(addr)
+		var attempts atomic.Int32
+		s.dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			attempts.Add(1)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		opts := &options{networkName: "regtest", updateInterval: time.Minute, bootstrapPeers: []string{addr.String()}}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		go func() { defer close(done); crawlLoop(ctx, s, opts) }()
+		synctest.Wait()
+		require.EqualValues(t, 1, attempts.Load())
+		time.Sleep(opts.updateInterval)
+		synctest.Wait()
+		assert.EqualValues(t, 2, attempts.Load(), "the next crawl must start one interval after the previous one started")
+		cancel()
+		synctest.Wait()
+		<-done
+	})
+}
+
+func TestRunCrawlResyncsGauge(t *testing.T) {
+	s := newTestSeeder(t, "regtest")
+	s.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("controlled bootstrap failure")
+	}
+	// A replaced seeder may have written the shared gauge last.
+	addressCount.Set(3)
+	runCrawl(context.Background(), "regtest", s, []string{crawlEndpoint(18, 1, s.addrBook.defaultPort).String()})
+	assert.Zero(t, testutil.ToFloat64(addressCount), "an empty book must clear a predecessor's count")
+}
+
+func TestCrawlLoopCancellationClosesSockets(t *testing.T) {
+	s := newTestSeeder(t, "regtest")
+	h := newCrawlPeerHarness(t, s)
+	addr := crawlEndpoint(18, 1, s.addrBook.defaultPort)
+	waiting := make(chan struct{}, 1)
+	s.dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return h.dial(ctx, func(*peer.Peer) { waiting <- struct{}{} })
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		crawlLoop(ctx, s, &options{networkName: "regtest", updateInterval: time.Minute, bootstrapPeers: []string{addr.String()}})
+	}()
+	t.Cleanup(func() { cancel(); crawlReceive(t, done) })
+	crawlReceive(t, waiting)
+	require.Eventually(t, s.ready, time.Second, time.Millisecond)
+	cancel()
+	crawlReceive(t, done)
+	active, _ := h.connections()
+	assert.Zero(t, active, "shutdown completion must follow socket closure")
+	assert.True(t, s.ready(), "shutdown must not strike verified peers")
 }

@@ -73,6 +73,7 @@ func (ab *addressBook) add(addr netip.AddrPort) {
 	}
 	ab.peers[addr] = 0
 	delete(ab.failedAt, addr)
+	addressCount.Set(float64(len(ab.peers)))
 }
 
 // markFailed records a verification failure. Booked (previously verified)
@@ -90,6 +91,7 @@ func (ab *addressBook) markFailed(addr netip.AddrPort) {
 			return
 		}
 		delete(ab.peers, addr)
+		addressCount.Set(float64(len(ab.peers)))
 	}
 	ab.failedAt[addr] = time.Now()
 }
@@ -99,18 +101,6 @@ func (ab *addressBook) count() int {
 	ab.mu.RLock()
 	defer ab.mu.RUnlock()
 	return len(ab.peers)
-}
-
-// isKnown reports whether the peer is booked or in un-expired cooldown.
-// Known peers are not re-dialed by the gossip crawl.
-func (ab *addressBook) isKnown(addr netip.AddrPort) bool {
-	ab.mu.RLock()
-	defer ab.mu.RUnlock()
-	if _, good := ab.peers[addr]; good {
-		return true
-	}
-	failed, ok := ab.failedAt[addr]
-	return ok && time.Since(failed) < failureCooldown
 }
 
 // isCoolingDown reports whether the peer failed verification less than

@@ -55,11 +55,15 @@ func setup(c *caddy.Controller) error {
 	log.Infof("Serving verified %s full nodes for zones %v", opts.networkName, zones)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go crawlLoop(ctx, s, opts)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		crawlLoop(ctx, s, opts)
+	}()
 
 	c.OnShutdown(func() error {
 		cancel()
-		s.disconnectAllPeers()
+		<-done
 		return nil
 	})
 
@@ -74,62 +78,38 @@ func setup(c *caddy.Controller) error {
 	return nil
 }
 
-// crawlLoop bootstraps the seeder (retrying until at least one bootstrap
-// peer is reachable), then crawls the network on a fixed interval until ctx
-// is cancelled. Each crawl is bounded to the interval so a pathological
-// crawl cannot outlive its slot.
+// crawlLoop measures each interval from its crawl's start, so crawl duration
+// does not stretch the cadence.
 func crawlLoop(ctx context.Context, s *seeder, opts *options) {
-	for !s.bootstrap(ctx, opts.bootstrapPeers) {
-		log.Warningf("No bootstrap peer reachable, retrying in %s", bootstrapRetryInterval)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(bootstrapRetryInterval):
-		}
-	}
-
-	crawl := func() {
+	for ctx.Err() == nil {
+		next := time.After(opts.updateInterval)
 		crawlCtx, cancel := context.WithTimeout(ctx, opts.updateInterval)
-		defer cancel()
-		// An empty book means every known peer died (or the pod lost
-		// egress); gossip has no live source, so start over from the
-		// bootstrap peers.
-		if s.addrBook.count() == 0 {
-			log.Warningf("Address book is empty, re-bootstrapping")
-			s.bootstrap(crawlCtx, opts.bootstrapPeers)
+		runCrawl(crawlCtx, opts.networkName, s, opts.bootstrapPeers)
+		cancel()
+		if ctx.Err() == nil && !s.ready() {
+			log.Warningf("Address book is empty, retrying bootstrap in %s", bootstrapRetryInterval)
+			next = time.After(bootstrapRetryInterval)
 		}
-		runCrawl(crawlCtx, opts.networkName, s)
-	}
-
-	crawl()
-	log.Infof("Starting crawl timer on %s, interval %.1fm",
-		opts.networkName, opts.updateInterval.Minutes())
-
-	ticker := time.NewTicker(opts.updateInterval)
-	defer ticker.Stop()
-
-	for {
 		select {
 		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			crawl()
+		case <-next:
 		}
 	}
 }
 
-func runCrawl(ctx context.Context, name string, s *seeder) {
+func runCrawl(ctx context.Context, name string, s *seeder, bootstrapPeers []string) {
 	start := time.Now()
-	s.addrBook.pruneCooldown()
 	before := s.addrBook.count()
-	s.refreshAddresses(ctx)
-	s.discoverAddresses(ctx)
-	s.disconnectAllPeers()
+	stats := s.crawl(ctx, bootstrapPeers)
 	after := s.addrBook.count()
+	// A replaced seeder may have written the shared gauge last; resync so its
+	// count cannot outlive it when this book never changes.
 	addressCount.Set(float64(after))
 	elapsed := time.Since(start).Truncate(time.Second).Seconds()
-	log.Infof("[%s] crawl complete, %d new peers of %d total in %.0fs",
-		name, after-before, after, elapsed)
+	log.Infof("[%s] crawl complete: %d probes started, %d verified, %d/%d new endpoints admitted, "+
+		"%d over-budget advertisements dropped; %d served (%+d) in %.0fs, deadline/cancelled=%t",
+		name, stats.attempted, stats.verified, stats.admitted, maxCrawlCandidates,
+		stats.dropped, after, after-before, elapsed, ctx.Err() != nil)
 }
 
 func parse(c *caddy.Controller) (*options, error) {
