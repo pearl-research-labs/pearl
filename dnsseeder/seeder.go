@@ -357,7 +357,7 @@ func (s *dnsseeder) addNa(nNa *wire.NetAddress) bool {
 	if _, dup := s.theList[k]; dup == true {
 		return false
 	}
-	if nNa.Port <= minPort || nNa.Port >= maxPort {
+	if nNa.Port <= minPort || nNa.Port > maxPort {
 		return false
 	}
 

@@ -92,3 +92,39 @@ func TestAddnNa(t *testing.T) {
 /*
 
  */
+
+func TestAddNaPortBoundaries(t *testing.T) {
+	// 65535 is a valid TCP port (it is the largest uint16 port) and
+	// getNonStdIP already encodes it (see TestGetNonStdIP), so addNa
+	// must accept a node announcing it. Port 0 is not usable and must
+	// stay rejected.
+	var td = []struct {
+		ip   string
+		port int
+		want bool
+	}{
+		{"10.0.0.1", 1, true},
+		{"10.0.0.2", 44112, true},
+		{"10.0.0.3", 65534, true},
+		{"10.0.0.4", 65535, true},
+		{"10.0.0.5", 0, false},
+	}
+
+	s := &dnsseeder{
+		port:    44112,
+		pver:    1234,
+		maxSize: 100,
+	}
+	s.theList = make(map[string]*node)
+
+	for _, atest := range td {
+		tcpAddr := &net.TCPAddr{
+			IP:   net.ParseIP(atest.ip),
+			Port: atest.port,
+		}
+		na := wire.NewNetAddress(tcpAddr, 0)
+		if got := s.addNa(na); got != atest.want {
+			t.Errorf("addNa(%s:%d) = %v, want %v", atest.ip, atest.port, got, atest.want)
+		}
+	}
+}
