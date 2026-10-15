@@ -131,12 +131,14 @@ func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.
 	}
 
 	entry := &cacheEntry{
-		body:     rec.body.Bytes(),
-		storedAt: time.Now(),
-		ttl:      ttl,
+		body:        rec.body.Bytes(),
+		storedAt:    time.Now(),
+		ttl:         ttl,
+		statusCode:  rec.statusCode,
+		contentType: rec.Header().Get("Content-Type"),
 	}
 
-	if rec.statusCode == http.StatusOK {
+	if rec.statusCode == http.StatusOK && !isJSONRPCError(entry.body) {
 		h.cache.set(method, entry)
 
 		h.logger.Debug("cached JSON-RPC response",
@@ -147,6 +149,20 @@ func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.
 	}
 
 	return entry, nil
+}
+
+// isJSONRPCError reports whether body is a JSON-RPC response carrying an
+// error. pearld reports RPC failures (node warming up, bad params, ...) as
+// HTTP 200 with an error field set, so the status code alone cannot keep
+// failures out of the cache: a cached error would be replayed to every
+// caller for the whole TTL, long after the node recovered. Bodies that do
+// not parse as a JSON-RPC response are not treated as errors.
+func isJSONRPCError(body []byte) bool {
+	var resp jsonrpcResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false
+	}
+	return len(resp.Error) > 0 && string(resp.Error) != "null"
 }
 
 // cache holds the per-method cached responses behind a mutex.
@@ -179,6 +195,13 @@ type cacheEntry struct {
 	body     []byte
 	storedAt time.Time
 	ttl      time.Duration
+	// statusCode and contentType record the upstream response's status and
+	// Content-Type so a non-200 response can be replayed verbatim instead
+	// of being rewritten as a 200 (see writeCachedResponse). Only 200
+	// responses are ever stored in the cache, so cache hits always carry
+	// statusCode == http.StatusOK.
+	statusCode  int
+	contentType string
 }
 
 func (e *cacheEntry) fresh() bool {
@@ -198,6 +221,20 @@ type jsonrpcResponse struct {
 }
 
 func writeCachedResponse(w http.ResponseWriter, entry *cacheEntry, requestID json.RawMessage, hit bool) error {
+	// A non-200 upstream response is not a JSON-RPC success payload: replay
+	// it verbatim (status, Content-Type, body) instead of forcing HTTP 200.
+	// Rewriting e.g. a reverse_proxy 502 ("upstream unavailable", plain
+	// text) into a 200 would tell miners and health checks the call
+	// succeeded and hand them a non-JSON body labelled application/json.
+	if entry.statusCode != 0 && entry.statusCode != http.StatusOK {
+		if entry.contentType != "" {
+			w.Header().Set("Content-Type", entry.contentType)
+		}
+		w.WriteHeader(entry.statusCode)
+		_, writeErr := w.Write(entry.body)
+		return writeErr
+	}
+
 	var resp jsonrpcResponse
 	if err := json.Unmarshal(entry.body, &resp); err != nil {
 		w.Header().Set("Content-Type", "application/json")
