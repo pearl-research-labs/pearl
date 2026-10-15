@@ -1820,10 +1820,10 @@ func (b *BlockChain) LocateBlocks(locator BlockLocator, hashStop *chainhash.Hash
 // blocks after the first known block in the locator.
 //
 // NOTE: Can return stale results if re-organization happens while fetching from DB.
-func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Hash, maxHeaders uint32, includeCerts bool) []wire.MsgHeader {
+func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Hash, maxHeaders uint32, includeCerts bool) ([]wire.MsgHeader, error) {
 	nodes := b.locateNodes(locator, hashStop, maxHeaders)
 	if len(nodes) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Fetch headers and certificates with the lock released.
@@ -1851,10 +1851,9 @@ func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Has
 		return nil
 	})
 	if err != nil {
-		log.Errorf("Error getting block headers: %v", err)
-		return nil
+		return nil, err
 	}
-	return headers
+	return headers, nil
 }
 
 // LocateHeaders returns the headers of the blocks after the first known block
@@ -1872,8 +1871,16 @@ func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Has
 //   - When locators are provided, but none of them are known, headers starting
 //     after the genesis block will be returned
 //
+// An error is returned instead of any headers when a located header or its
+// certificate cannot be read from the database, for example because the
+// block has been pruned: pruning deletes the block files that hold the
+// certificates while the headers themselves survive in the block index.
+// Callers can therefore distinguish "no headers after the locator" from
+// "the requested range cannot be served", which an empty result alone
+// cannot express.
+//
 // This function is safe for concurrent access.
-func (b *BlockChain) LocateHeaders(locator BlockLocator, hashStop *chainhash.Hash, includeCerts bool) []wire.MsgHeader {
+func (b *BlockChain) LocateHeaders(locator BlockLocator, hashStop *chainhash.Hash, includeCerts bool) ([]wire.MsgHeader, error) {
 	return b.locateHeaders(locator, hashStop, wire.MaxBlockHeadersPerMsg, includeCerts)
 }
 
