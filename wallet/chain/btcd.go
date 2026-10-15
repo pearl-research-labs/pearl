@@ -597,6 +597,15 @@ func getTxSpendingPrevOut(op wire.OutPoint,
 
 	result := prevoutResps[0]
 
+	// A backend can return a JSON null element for the requested
+	// outpoint (the rpcclient result slice is []*..., and null
+	// unmarshals to a nil element with no error). Treat it like
+	// every other failure mode here — not spent — instead of
+	// dereferencing it.
+	if result == nil {
+		return chainhash.Hash{}, false
+	}
+
 	// If the "spendingtxid" field is empty, then the utxo has no spend in
 	// the mempool at the moment.
 	if result.SpendingTxid == "" {
