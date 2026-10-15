@@ -529,3 +529,23 @@ func TestNewScriptClass(t *testing.T) {
 		})
 	}
 }
+
+// TestScriptClassString ensures String names every defined class and
+// returns "Invalid" — without panicking — for out-of-range values,
+// including the exact boundary len(scriptClassToName).
+func TestScriptClassString(t *testing.T) {
+	for class, want := range scriptClassToName {
+		if got := ScriptClass(class).String(); got != want {
+			t.Errorf("ScriptClass(%d).String() = %q, want %q", class, got, want)
+		}
+	}
+	for _, class := range []ScriptClass{
+		ScriptClass(len(scriptClassToName)),
+		ScriptClass(len(scriptClassToName) + 1),
+		ScriptClass(255),
+	} {
+		if got := class.String(); got != "Invalid" {
+			t.Errorf("ScriptClass(%d).String() = %q, want %q", byte(class), got, "Invalid")
+		}
+	}
+}
