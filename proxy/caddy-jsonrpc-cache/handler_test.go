@@ -204,3 +204,106 @@ func TestGETRequestsPassthrough(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), backendCalls.Load(), "GET requests should pass through")
 }
+
+// echoParamsBackend returns the request's params as its result, so a
+// test can tell exactly which request a response was generated for.
+type echoParamsBackend struct {
+	calls atomic.Int64
+}
+
+func (b *echoParamsBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
+	b.calls.Add(1)
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		ID     json.RawMessage `json:"id"`
+		Params json.RawMessage `json:"params"`
+	}
+	json.Unmarshal(body, &req)
+
+	resp := jsonrpcResponse{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Result:  req.Params,
+	}
+	out, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+	return nil
+}
+
+func doRequestWithParams(t *testing.T, h *Handler, next caddyhttp.Handler, method string, params string, id any) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  json.RawMessage(params),
+		"id":      id,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, req, next))
+	return w
+}
+
+// TestCacheKeyIncludesParams ensures two requests for the same method
+// with different params do not share a cache entry: the cache (and the
+// singleflight group) must key on method + params, not method alone.
+// getblocktemplate — this module's headline cached method — is
+// parameter-bearing (mode, capabilities, rules), so a response
+// generated for one caller's params must never be replayed to another.
+func TestCacheKeyIncludesParams(t *testing.T) {
+	backend := &echoParamsBackend{}
+	h := newTestHandler(CacheRule{Method: "getblocktemplate", TTL: caddy.Duration(5 * time.Second)})
+
+	wA := doRequestWithParams(t, h, backend, "getblocktemplate", `[{"mode":"template"}]`, 1)
+	assert.JSONEq(t, `[{"mode":"template"}]`, resultOf(t, wA))
+
+	wB := doRequestWithParams(t, h, backend, "getblocktemplate", `[{"mode":"proposal"}]`, 2)
+	assert.Equal(t, int64(2), backend.calls.Load(),
+		"different params must reach the backend, not replay the first caller's response")
+	assert.JSONEq(t, `[{"mode":"proposal"}]`, resultOf(t, wB))
+
+	wA2 := doRequestWithParams(t, h, backend, "getblocktemplate", `[{"mode":"template"}]`, 3)
+	assert.Equal(t, int64(2), backend.calls.Load(),
+		"identical params should still be served from cache")
+	assert.Equal(t, "HIT", wA2.Header().Get("X-Jsonrpc-Cache"))
+	assert.JSONEq(t, `[{"mode":"template"}]`, resultOf(t, wA2))
+}
+
+func resultOf(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var resp jsonrpcResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	return string(resp.Result)
+}
+
+// TestCacheEvictsExpiredEntries ensures stale entries do not accumulate
+// for the life of the process: with params in the key, each distinct
+// params value is a distinct entry, so expired entries must be dropped
+// on access and swept on insert.
+func TestCacheEvictsExpiredEntries(t *testing.T) {
+	c := &cache{entries: make(map[string]*cacheEntry)}
+	stale := &cacheEntry{
+		body:     []byte(`{"result":1}`),
+		storedAt: time.Now().Add(-time.Minute),
+		ttl:      time.Millisecond,
+	}
+	c.set("getblocktemplate\x00{\"a\":1}", stale)
+	require.Empty(t, c.entries, "expired entry must be swept on set")
+
+	live := &cacheEntry{
+		body:     []byte(`{"result":2}`),
+		storedAt: time.Now(),
+		ttl:      time.Minute,
+	}
+	c.set("getblocktemplate\x00{\"a\":2}", live)
+	require.Len(t, c.entries, 1)
+
+	// An entry that expires while resident is dropped on get.
+	live.storedAt = time.Now().Add(-time.Minute)
+	live.ttl = time.Millisecond
+	_, ok := c.get("getblocktemplate\x00{\"a\":2}")
+	require.False(t, ok)
+	require.Empty(t, c.entries, "expired entry must be evicted on get")
+}
