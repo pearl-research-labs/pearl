@@ -489,6 +489,10 @@ func (s *utxoCache) connectTransaction(
 // the passed block.  In addition, when the 'stxos' argument is not nil, it will
 // be updated to append an entry for each spent txout.
 func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOut) error {
+	if err := checkBlockTransactionOrder(block); err != nil {
+		return err
+	}
+
 	for _, tx := range block.Transactions() {
 		err := s.connectTransaction(tx, block.Height(), stxos)
 		if err != nil {

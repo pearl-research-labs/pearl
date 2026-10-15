@@ -321,6 +321,10 @@ func (view *UtxoViewpoint) connectTransaction(tx *btcutil.Tx, blockHeight int32,
 // In addition, when the 'stxos' argument is not nil, it will be updated to
 // append an entry for each spent txout.
 func (view *UtxoViewpoint) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOut) error {
+	if err := checkBlockTransactionOrder(block); err != nil {
+		return err
+	}
+
 	for _, tx := range block.Transactions() {
 		err := view.connectTransaction(tx, block.Height(), stxos)
 		if err != nil {
@@ -540,10 +544,11 @@ func (view *UtxoViewpoint) findInputsToFetch(block *btcutil.Block) []wire.OutPoi
 			// It is acceptable for a transaction input to reference
 			// the output of another transaction in this block only
 			// if the referenced transaction comes before the
-			// current one in this block.  Add the outputs of the
-			// referenced transaction as available utxos when this
-			// is the case.  Otherwise, the utxo details are still
-			// needed.
+			// current one in this block.  Those outputs are created
+			// by connectTransaction when it reaches the parent, not
+			// during this prefetch pass.  Publishing them here would
+			// also make them available to earlier transactions.
+			// Otherwise, the utxo details are still needed.
 			//
 			// NOTE: The >= is correct here because i is one less
 			// than the actual position of the transaction within
@@ -552,8 +557,6 @@ func (view *UtxoViewpoint) findInputsToFetch(block *btcutil.Block) []wire.OutPoi
 			if inFlightIndex, ok := txInFlight[*originHash]; ok &&
 				i >= inFlightIndex {
 
-				originTx := transactions[inFlightIndex]
-				view.AddTxOuts(originTx, block.Height())
 				continue
 			}
 
@@ -572,9 +575,9 @@ func (view *UtxoViewpoint) findInputsToFetch(block *btcutil.Block) []wire.OutPoi
 
 // fetchInputUtxos loads the unspent transaction outputs for the inputs
 // referenced by the transactions in the given block into the view from the
-// cache as needed.  In particular, referenced entries that are earlier in
-// the block are added to the view and entries that are already in the view
-// are not modified.
+// cache as needed.  Outputs of earlier transactions in the block are left
+// for sequential connection to create.  Entries already in the view are
+// not modified.
 func (view *UtxoViewpoint) fetchInputUtxos(cache *utxoCache, block *btcutil.Block) error {
 	return view.fetchUtxosFromCache(cache, view.findInputsToFetch(block))
 }

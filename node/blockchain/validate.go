@@ -842,6 +842,32 @@ func (b *BlockChain) checkBIP0030(node *blockNode, block *btcutil.Block, view *U
 	return nil
 }
 
+// checkBlockTransactionOrder ensures that inputs referencing transactions in
+// this block only spend outputs of earlier transactions.  Check this before
+// connecting even previously validated blocks, since older versions could
+// incorrectly mark blocks with forward references as valid.
+func checkBlockTransactionOrder(block *btcutil.Block) error {
+	transactions := block.Transactions()
+	positions := make(map[chainhash.Hash]int, len(transactions))
+	for i, tx := range transactions {
+		positions[*tx.Hash()] = i
+	}
+	for i, tx := range transactions {
+		if IsCoinBase(tx) {
+			continue
+		}
+		for _, txIn := range tx.MsgTx().TxIn {
+			outpoint := txIn.PreviousOutPoint
+			if parent, ok := positions[outpoint.Hash]; ok && parent >= i {
+				str := fmt.Sprintf("output %v referenced from transaction %s "+
+					"is not from an earlier transaction in the block", outpoint, tx.Hash())
+				return ruleError(ErrMissingTxOut, str)
+			}
+		}
+	}
+	return nil
+}
+
 // CheckTransactionInputs performs a series of checks on the inputs to a
 // transaction to ensure they are valid.  An example of some of the checks
 // include verifying all inputs exist, ensuring the coinbase seasoning
