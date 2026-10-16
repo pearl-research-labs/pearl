@@ -118,7 +118,7 @@ requests receive HTTP 429 (Too Many Requests). Adjust in the `Caddyfile`:
 rate_limit {
     zone rpc {
         key    {remote_host}
-        events 120
+        events 100
         window 1m
     }
 }
