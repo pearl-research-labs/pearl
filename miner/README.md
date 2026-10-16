@@ -43,7 +43,16 @@ The `pearl-gemm` CUDA kernels are compiled automatically during sync. Set the `P
 
 All commands run from the **repository root**. Use `-n auto` to run tests in parallel (requires `pytest-xdist`).
 
-> **GPU requirement:** `pearl-gemm` and `vllm-miner` tests require an NVIDIA GPU. Currently only **sm90** (H100 / H200) GPUs are supported.
+>  **GPU requirement:** `pearl-gemm` and `vllm-miner` tests require an NVIDIA GPU. Currently only **sm_90/sm_90a** (H100 / H200) GPUs are supported.
+>
+> | Architecture | GPUs | sm version | Supported |
+> |---|---|---|---|
+> | Hopper | H100, H200 | sm_90 / sm_90a | Yes |
+> | Blackwell | RTX 50-series, B200 | sm_100 / sm_120 | Not yet |
+> | Ada Lovelace | RTX 40-series, L40 | sm_89 | No |
+> | Ampere | A100, RTX 30-series | sm_80 / sm_86 | No |
+> | Turing | RTX 20-series | sm_75 | No |
+> | Volta | V100 | sm_70 | No |
 
 ### Basic tests
 
