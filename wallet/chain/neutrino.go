@@ -816,6 +816,16 @@ out:
 				log.Errorf("Neutrino rescan ended with error: %s", err)
 			}
 
+			// A finished Rescan rejects Update(), so clear scanning to let NotifyReceived start a fresh one.
+			// rescanErr is a snapshot: a Rescan() restart may have replaced it, and clearing then would wipe the new
+			// rescan's live state.
+			s.clientMtx.Lock()
+			if s.rescanErr == rescanErr {
+				s.scanning = false
+				s.rescanErr = nil
+			}
+			s.clientMtx.Unlock()
+
 		case <-s.quit:
 			break out
 		}

@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
 	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/stretchr/testify/assert"
@@ -336,4 +338,120 @@ func TestNeutrinoClientBlockStampTracksChainService(t *testing.T) {
 	nc.WaitForShutdown()
 	_, err = nc.BlockStamp()
 	require.ErrorContains(t, err, "disconnected")
+}
+
+type failingRescanner struct {
+	errChan chan error
+	done    bool
+}
+
+func (f *failingRescanner) Start() <-chan error {
+	return f.errChan
+}
+
+func (f *failingRescanner) Update(...neutrino.UpdateOption) error {
+	if f.done {
+		return errors.New("Rescan is already done and cannot be updated.")
+	}
+	return nil
+}
+
+func (f *failingRescanner) WaitForShutdown() {}
+
+func TestNeutrinoClientNotifyReceivedRestartsAfterRescanExit(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu         sync.Mutex
+		rescanners []*failingRescanner
+	)
+	nc := &NeutrinoClient{
+		CS: &mockChainService{},
+		newRescan: func(...neutrino.RescanOption) rescanner {
+			mu.Lock()
+			defer mu.Unlock()
+			r := &failingRescanner{errChan: make(chan error, 1)}
+			rescanners = append(rescanners, r)
+			return r
+		},
+	}
+
+	require.NoError(t, nc.Start(t.Context()))
+	defer func() {
+		nc.Stop()
+		nc.WaitForShutdown()
+	}()
+
+	require.NoError(t, nc.NotifyReceived(nil))
+	require.Len(t, rescanners, 1)
+
+	rescanners[0].done = true
+	rescanners[0].errChan <- errors.New("peer disconnected")
+
+	require.Eventually(t, func() bool {
+		nc.clientMtx.Lock()
+		defer nc.clientMtx.Unlock()
+		return !nc.scanning
+	}, maxDur, 10*time.Millisecond)
+
+	require.NoError(t, nc.NotifyReceived(nil))
+	mu.Lock()
+	assert.Len(t, rescanners, 2)
+	mu.Unlock()
+}
+
+// TestNeutrinoClientStaleRescanExitKeepsReplacement pins that the exit of a rescan does not clear the state of the
+// rescan that replaced it while the handler was still waiting to act on the exit.
+func TestNeutrinoClientStaleRescanExitKeepsReplacement(t *testing.T) {
+	// Unbuffered so that a send completes only while the handler is parked on the channel.
+	stale := &failingRescanner{errChan: make(chan error)}
+	replacement := &failingRescanner{errChan: make(chan error)}
+	nc := &NeutrinoClient{
+		CS:        &mockChainService{},
+		newRescan: func(...neutrino.RescanOption) rescanner { return stale },
+	}
+
+	require.NoError(t, nc.Start(t.Context()))
+	defer func() {
+		nc.Stop()
+		nc.WaitForShutdown()
+	}()
+
+	// syncHandler returns once the handler has taken a notification, so its previous iteration is complete and its
+	// next snapshot of rescanErr sees everything done before the call.
+	syncHandler := func() {
+		select {
+		case nc.enqueueNotification <- struct{}{}:
+		case <-time.After(maxDur):
+			t.Fatal("timed out waiting for the notification handler")
+		}
+	}
+
+	require.NoError(t, nc.NotifyReceived(nil))
+	syncHandler()
+
+	// Holding clientMtx until the replacement is installed forces the handler's clear to run after it.
+	replacementErr := replacement.Start()
+	require.Eventually(t, func() bool {
+		nc.clientMtx.Lock()
+		defer nc.clientMtx.Unlock()
+
+		select {
+		case stale.errChan <- neutrino.ErrRescanExit:
+		default:
+			return false
+		}
+
+		nc.rescan = replacement
+		nc.rescanErr = replacementErr
+		return true
+	}, maxDur, time.Millisecond)
+	syncHandler()
+
+	nc.clientMtx.Lock()
+	scanning, rescanErr := nc.scanning, nc.rescanErr
+	nc.clientMtx.Unlock()
+
+	assert.True(t, scanning)
+	assert.Equal(t, replacementErr, rescanErr)
 }

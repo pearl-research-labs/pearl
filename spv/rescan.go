@@ -21,6 +21,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/spv/blockntfns"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
+	"github.com/pearl-research-labs/pearl/spv/query"
 )
 
 var (
@@ -588,12 +589,10 @@ rescanLoop:
 					}
 
 					err := rs.handleBlockConnected(ntfn)
-					switch err {
-					case nil:
+					switch {
+					case err == nil:
 
-					// We'll need to retry the block again
-					// as we couldn't fetch its filter.
-					case errRetryBlock:
+					case errors.Is(err, errRetryBlock):
 						log.Debugf("Retrying %v after %v",
 							ntfn, blockRetryInterval)
 						blockRetryQueue.push(ntfn)
@@ -647,17 +646,15 @@ rescanLoop:
 					err := rs.handleBlockConnected(
 						retryBlock,
 					)
-					switch err {
+					switch {
 					// We successfully notified the block
 					// this time, so we can remove it from
 					// our queue and move on to the next.
-					case nil:
+					case err == nil:
 						_ = blockRetryQueue.pop()
 						continue retryLoop
 
-					// We'll need to retry the block again
-					// as we couldn't fetch its filter.
-					case errRetryBlock:
+					case errors.Is(err, errRetryBlock):
 						log.Debugf("Retrying %v after "+
 							"%v", retryBlock,
 							blockRetryInterval)
@@ -754,6 +751,9 @@ rescanLoop:
 				return err
 			}
 
+			// notifyBlock reads curHeader/curStamp, while updateFilter in waitForRetry must see the last
+			// processed block if this fetch has to be retried.
+			prevHeader, prevStamp := rs.curHeader, rs.curStamp
 			rs.curHeader = *header
 			rs.curStamp.Height++
 			rs.curStamp.Hash = header.BlockHash()
@@ -765,10 +765,45 @@ rescanLoop:
 			}
 
 			err = rs.notifyBlock()
-			if err != nil {
+			switch {
+			case err == nil:
+
+			case errors.Is(err, errRetryBlock):
+				log.Errorf("Unable to process block %d (%s), retrying after %v: %v",
+					rs.curStamp.Height, rs.curStamp.Hash, blockRetryInterval, err)
+
+				rs.curHeader = prevHeader
+				rs.curStamp = prevStamp
+
+				err := rs.waitForRetry(blockRetryInterval)
+				if err != nil {
+					return err
+				}
+
+			default:
 				return err
 			}
 		}
+	}
+}
+
+// ro.update is unbuffered, so service filter updates during backoff or Rescan.Update callers stall on an unreachable
+// block.
+func (rs *rescanState) waitForRetry(interval time.Duration) error {
+	ro := rs.opts
+
+	select {
+	case <-ro.quit:
+		return ErrRescanExit
+
+	case update := <-ro.update:
+		_, err := ro.updateFilter(
+			rs.chain, update, &rs.curStamp, &rs.curHeader,
+		)
+		return err
+
+	case <-time.After(interval):
+		return nil
 	}
 }
 
@@ -864,8 +899,14 @@ func (rs *rescanState) notifyBlock() error {
 		matched, filter, err := blockFilterMatches(
 			chain, ro, &rs.curStamp.Hash,
 		)
-		if err != nil {
+		switch {
+		// ChainService.Stop stops workManager before closing s.quit, so both shutdown sentinels must exit.
+		case errors.Is(err, ErrShuttingDown), errors.Is(err, query.ErrWorkManagerShuttingDown):
 			return err
+
+		case err != nil:
+			return fmt.Errorf("%w: unable to get filter for block %d (%s): %w",
+				errRetryBlock, rs.curStamp.Height, rs.curStamp.Hash, err)
 		}
 
 		if matched {
@@ -965,7 +1006,7 @@ func (rs *rescanState) handleBlockConnected(ntfn *blockntfns.Connected) error {
 		// have any peers to fetch this filter from, or the peer(s) that
 		// we're trying to fetch from are in the progress of a re-org.
 		log.Errorf("unable to get filter for hash=%v, retrying: %v",
-			rs.curStamp.Hash, err)
+			newStamp.Hash, err)
 
 		return errRetryBlock
 	}
@@ -991,12 +1032,18 @@ func extractBlockMatches(chain ChainSource, ro *rescanOptions,
 	// We've matched. Now we actually get the block and cycle through the
 	// transactions to see which ones are relevant.
 	block, err := chain.GetBlock(curStamp.Hash, ro.queryOptions...)
-	if err != nil {
+	switch {
+	// ChainService.Stop stops workManager before closing s.quit, so both shutdown sentinels must exit.
+	case errors.Is(err, ErrShuttingDown), errors.Is(err, query.ErrWorkManagerShuttingDown):
 		return nil, err
-	}
-	if block == nil {
-		return nil, fmt.Errorf("couldn't get block %d (%s) from "+
-			"network", curStamp.Height, curStamp.Hash)
+
+	case err != nil:
+		return nil, fmt.Errorf("%w: couldn't get block %d (%s) from network: %w",
+			errRetryBlock, curStamp.Height, curStamp.Hash, err)
+
+	case block == nil:
+		return nil, fmt.Errorf("%w: couldn't get block %d (%s) from network",
+			errRetryBlock, curStamp.Height, curStamp.Hash)
 	}
 
 	// Before we go through the transactions, let's make sure the filter we
