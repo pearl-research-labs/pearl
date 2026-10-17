@@ -2340,6 +2340,17 @@ func handleGetMempoolInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct
 
 // handleGetMiningInfo implements the getmininginfo command. We only return the
 // fields that are not related to wallet functionality.
+// blockSubsidyPRL returns the block subsidy, in PRL, of the block at the
+// given height under the chain's polynomial-decay emission schedule. It is
+// the value the coinbase of that block is entitled to before fees, as
+// computed by blockchain.CalcBlockSubsidy. The genesis block (height 0)
+// has no subsidy.
+func blockSubsidyPRL(height int32, chainParams *chaincfg.Params) float64 {
+	return btcutil.Amount(
+		blockchain.CalcBlockSubsidy(height, chainParams),
+	).ToPRL()
+}
+
 func handleGetMiningInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	// Create a default getnetworkhashps command to use defaults and make
 	// use of the existing getnetworkhashps handler.
@@ -2360,6 +2371,7 @@ func handleGetMiningInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct{
 	best := s.cfg.Chain.BestSnapshot()
 	result := btcjson.GetMiningInfoResult{
 		Blocks:            int64(best.Height),
+		BlockSubsidy:      blockSubsidyPRL(best.Height, s.cfg.ChainParams),
 		CurrentBlockSize:  best.BlockSize,
 		CurrentBlockVsize: best.BlockVsize,
 		CurrentBlockTx:    best.NumTxns,
