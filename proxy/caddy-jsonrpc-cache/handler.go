@@ -19,6 +19,15 @@ func init() {
 	caddy.RegisterModule(Handler{})
 }
 
+// maxRequestBodySize bounds how much of a request body ServeHTTP buffers
+// while deciding whether the request is cacheable. The methods this
+// middleware caches (getblocktemplate in the shipped Caddyfile) have tiny
+// request bodies, so 1 MiB is far above any legitimate cacheable request.
+// Larger requests are not refused: they are streamed to the upstream
+// uncached, so the node's own request limit (4 * wire.MaxBlockPayload in
+// node/rpcserver.go) still applies exactly as without this middleware.
+const maxRequestBodySize = 1 << 20
+
 // Handler is a Caddy middleware that caches JSON-RPC responses by method name.
 // It parses incoming POST bodies, checks the JSON-RPC method field, and serves
 // cached responses for configured methods within their TTL. Concurrent requests
@@ -80,11 +89,31 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		return next.ServeHTTP(w, r)
 	}
 
-	body, err := io.ReadAll(r.Body)
-	r.Body.Close()
+	// Buffer at most maxRequestBodySize+1 bytes to decide cacheability.
+	// The +1 distinguishes "exactly at the limit" from "over the limit"
+	// without ever holding an unbounded body in memory: an unauthenticated
+	// client could otherwise force this middleware to allocate (and copy)
+	// arbitrarily large request bodies before the upstream's own request
+	// limit ever applies.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
 	if err != nil {
+		r.Body.Close()
 		return next.ServeHTTP(w, r)
 	}
+
+	if len(body) > maxRequestBodySize {
+		// Too large to inspect or cache. Stream it to the upstream
+		// untouched — the buffered prefix followed by the rest of the
+		// original body — so large legitimate requests (e.g. a raw
+		// transaction near the node's own limit) behave exactly as
+		// they would without this middleware.
+		r.Body = &prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(body), r.Body),
+			Closer: r.Body,
+		}
+		return next.ServeHTTP(w, r)
+	}
+	r.Body.Close()
 
 	var req jsonrpcRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -147,6 +176,13 @@ func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.
 	}
 
 	return entry, nil
+}
+
+// prefixReadCloser streams a buffered prefix followed by the remainder
+// of the original request body, closing the original body on Close.
+type prefixReadCloser struct {
+	io.Reader
+	io.Closer
 }
 
 // cache holds the per-method cached responses behind a mutex.
