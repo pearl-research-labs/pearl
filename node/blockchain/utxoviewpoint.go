@@ -487,7 +487,7 @@ func (view *UtxoViewpoint) fetchUtxosFromCache(cache *utxoCache, outpoints []wir
 	// will result in nil entries in the view.  This is intentionally done
 	// so other code can use the presence of an entry in the store as a way
 	// to unnecessarily avoid attempting to reload it from the database.
-	entries, err := cache.fetchEntries(outpoints)
+	entries, err := cache.fetchAndAddEntries(outpoints)
 	if err != nil {
 		return err
 	}
@@ -619,9 +619,20 @@ func (b *BlockChain) FetchUtxoView(tx *btcutil.Tx) (*UtxoViewpoint, error) {
 	// chain.
 	view := NewUtxoViewpoint()
 	b.chainLock.RLock()
-	err := view.fetchUtxosFromCache(b.utxoCache, needed)
-	b.chainLock.RUnlock()
-	return view, err
+	defer b.chainLock.RUnlock()
+
+	// Use the read-only fetch: peers choose these outpoints and could otherwise
+	// exhaust the cache budget.
+	entries, err := b.utxoCache.fetchEntries(needed)
+	if err != nil {
+		return nil, err
+	}
+	// Clone while holding the lock because block connection and flushing can
+	// mutate cached entries.
+	for i, entry := range entries {
+		view.entries[needed[i]] = entry.Clone()
+	}
+	return view, nil
 }
 
 // FetchUtxoEntry loads and returns the requested unspent transaction output
@@ -643,5 +654,19 @@ func (b *BlockChain) FetchUtxoEntry(outpoint wire.OutPoint) (*UtxoEntry, error) 
 		return nil, err
 	}
 
-	return entries[0], nil
+	// Callers read the entry after the lock is released, while block
+	// connection mutates cached entries.
+	return entries[0].Clone(), nil
+}
+
+// HaveUnspentInCache reports whether the UTXO cache holds the outpoint unspent.
+// A false result does not mean the output is spent or missing, since the
+// database is never read.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) HaveUnspentInCache(outpoint wire.OutPoint) bool {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	return b.utxoCache.haveUnspent(outpoint)
 }

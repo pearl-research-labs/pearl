@@ -810,7 +810,7 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 // https://github.com/bitcoin/bips/blob/master/bip-0030.mediawiki and
 // http://r6.ca/blog/20120206T005236Z.html.
 //
-// This function MUST be called with the chain state lock held (for reads).
+// This function MUST be called with the chain state lock held (for writes).
 func (b *BlockChain) checkBIP0030(node *blockNode, block *btcutil.Block, view *UtxoViewpoint) error {
 	// Fetch utxos for all of the transaction outputs in this block.
 	// Typically, there will not be any utxos for any of the outputs.
