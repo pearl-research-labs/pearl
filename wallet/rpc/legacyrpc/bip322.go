@@ -12,53 +12,69 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
-// BIP322SignMessageSimple creates a BIP-322 Simple Signature for a message using the given private key and address.
-// Returns: base64-encoded BIP-322 signature
-func BIP322SignMessageSimple(privKey *btcec.PrivateKey, addr *btcutil.AddressTaproot, message string) (string, error) {
-	// BIP-322 Simple Signature uses a virtual transaction approach:
-	// 1. Create to_spend transaction with message context
-	// 2. Create to_sign transaction that spends from to_spend
-	// 3. Sign the to_sign transaction
+// bip322MessageTag is the BIP340 tag BIP-322 uses for the message
+// hash committed to by the to_spend transaction.
+var bip322MessageTag = []byte("BIP0322-signed-message")
 
-	// Step 1: Create the to_spend transaction
-	// This is a virtual transaction with:
-	// - One input: previous outpoint is null (32 zero bytes + 0xffffffff)
-	// - One output: the scriptPubKey we're signing for
-	toSpend := wire.NewMsgTx(2)
+// bip322VirtualTxs builds the to_spend and to_sign virtual
+// transactions exactly as BIP-322 specifies, along with the
+// scriptPubKey of the address being proven:
+//
+//   - to_spend: nVersion 0, nLockTime 0; one input with the null
+//     prevout (32 zero bytes, index 0xffffffff), sequence 0 and
+//     scriptSig OP_0 PUSH32[message_hash], where message_hash is
+//     the BIP340-tagged hash of the message; one output of 0
+//     paying the address's scriptPubKey.
+//   - to_sign: nVersion 0, nLockTime 0; one input spending
+//     to_spend:0 with sequence 0; one output of 0 whose
+//     scriptPubKey is a bare OP_RETURN.
+//
+// The message is committed to only through the tagged hash in
+// to_spend, never embedded in an output, so its length is
+// unbounded. Signer and verifier must construct byte-identical
+// transactions or the signature is meaningless to every other
+// BIP-322 implementation, so both go through this one builder.
+func bip322VirtualTxs(addr *btcutil.AddressTaproot, message string) (*wire.MsgTx, []byte, error) {
+	messageHash := chainhash.TaggedHash(bip322MessageTag, []byte(message))
 
-	// Add the null input (BIP-322 convention)
+	scriptPubKey, err := txscript.PayToAddrScript(addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create script: %w", err)
+	}
+
+	toSpend := wire.NewMsgTx(0)
 	nullOutPoint := wire.OutPoint{
 		Hash:  chainhash.Hash{}, // 32 zero bytes
 		Index: 0xffffffff,       // max uint32
 	}
-	toSpend.AddTxIn(wire.NewTxIn(&nullOutPoint, nil, nil))
+	nullIn := wire.NewTxIn(&nullOutPoint, nil, nil)
+	nullIn.Sequence = 0
+	nullIn.SignatureScript = append(
+		[]byte{txscript.OP_0, 0x20}, messageHash[:]...,
+	)
+	toSpend.AddTxIn(nullIn)
+	toSpend.AddTxOut(wire.NewTxOut(0, scriptPubKey))
 
-	// Add output with the script we're proving we can spend
-	scriptPubKey, err := txscript.PayToAddrScript(addr)
-	if err != nil {
-		return "", fmt.Errorf("failed to create script: %w", err)
-	}
-
-	// For BIP-322, we use a fixed amount (doesn't matter since it's virtual)
-	amount := int64(0)
-	toSpend.AddTxOut(wire.NewTxOut(amount, scriptPubKey))
-
-	// Step 2: Create the to_sign transaction
-	// This spends from to_spend and includes the message in OP_RETURN
-	toSign := wire.NewMsgTx(2)
-
-	// Input: spend from the to_spend transaction
+	toSign := wire.NewMsgTx(0)
 	toSpendHash := toSpend.TxHash()
-	toSign.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&toSpendHash, 0), nil, nil))
+	signIn := wire.NewTxIn(wire.NewOutPoint(&toSpendHash, 0), nil, nil)
+	signIn.Sequence = 0
+	toSign.AddTxIn(signIn)
+	toSign.AddTxOut(wire.NewTxOut(0, []byte{txscript.OP_RETURN}))
 
-	// Output: OP_RETURN with the message
-	messageScript, err := txscript.NullDataScript([]byte(message))
+	return toSign, scriptPubKey, nil
+}
+
+// BIP322SignMessageSimple creates a BIP-322 Simple Signature for a message using the given private key and address.
+// Returns: base64-encoded BIP-322 signature
+func BIP322SignMessageSimple(privKey *btcec.PrivateKey, addr *btcutil.AddressTaproot, message string) (string, error) {
+	toSign, scriptPubKey, err := bip322VirtualTxs(addr, message)
 	if err != nil {
-		return "", fmt.Errorf("failed to create message script: %w", err)
+		return "", err
 	}
-	toSign.AddTxOut(wire.NewTxOut(0, messageScript))
 
-	// Step 3: Sign the to_sign transaction
+	// The virtual output being spent carries a fixed amount of 0.
+	amount := int64(0)
 	prevOutFetcher := txscript.NewCannedPrevOutputFetcher(scriptPubKey, amount)
 	sigHashes := txscript.NewTxSigHashes(toSign, prevOutFetcher)
 	witness, err := txscript.TaprootWitnessSignature(
@@ -69,10 +85,7 @@ func BIP322SignMessageSimple(privKey *btcec.PrivateKey, addr *btcutil.AddressTap
 		return "", fmt.Errorf("failed to create signature: %w", err)
 	}
 
-	toSign.TxIn[0].Witness = witness
-
-	// Step 4: Encode the signature
-	// BIP-322 simple signature format: just the witness stack
+	// BIP-322 simple signature format: just the witness stack.
 	witnessBytes, err := SerializeWitnessStack(witness)
 	if err != nil {
 		return "", fmt.Errorf("failed to serialize witness: %w", err)
@@ -95,47 +108,19 @@ func BIP322VerifyMessageSimple(addr *btcutil.AddressTaproot, signature, message 
 		return false, fmt.Errorf("invalid BIP-322 signature format: %w", err)
 	}
 
-	// Recreate the virtual transactions as per BIP-322
-	// Step 1: Create the to_spend transaction (same as in signing)
-	toSpend := wire.NewMsgTx(2)
-
-	// Add the null input (BIP-322 convention)
-	nullOutPoint := wire.OutPoint{
-		Hash:  chainhash.Hash{}, // 32 zero bytes
-		Index: 0xffffffff,       // max uint32
-	}
-	toSpend.AddTxIn(wire.NewTxIn(&nullOutPoint, nil, nil))
-
-	// Add output with the script for the address we're verifying
-	scriptPubKey, err := txscript.PayToAddrScript(addr)
+	// Recreate the virtual transactions as per BIP-322 and attach
+	// the signature as to_sign's witness.
+	toSign, scriptPubKey, err := bip322VirtualTxs(addr, message)
 	if err != nil {
-		return false, fmt.Errorf("failed to create script: %w", err)
+		return false, err
 	}
+	toSign.TxIn[0].Witness = witness
 
+	// Verify the signature by executing the script.
 	amount := int64(0) // Virtual amount
-	toSpend.AddTxOut(wire.NewTxOut(amount, scriptPubKey))
-
-	// Step 2: Create the to_sign transaction
-	toSign := wire.NewMsgTx(2)
-
-	// Input: spend from the to_spend transaction
-	toSpendHash := toSpend.TxHash()
-	toSignInput := wire.NewTxIn(wire.NewOutPoint(&toSpendHash, 0), nil, nil)
-	toSignInput.Witness = witness // Set the witness from the signature
-	toSign.AddTxIn(toSignInput)
-
-	// Output: OP_RETURN with the message
-	messageScript, err := txscript.NullDataScript([]byte(message))
-	if err != nil {
-		return false, fmt.Errorf("failed to create message script: %w", err)
-	}
-	toSign.AddTxOut(wire.NewTxOut(0, messageScript))
-
-	// Step 3: Verify the signature by executing the script
 	prevOutFetcher := txscript.NewCannedPrevOutputFetcher(scriptPubKey, amount)
 	sigHashes := txscript.NewTxSigHashes(toSign, prevOutFetcher)
 
-	// Verify the script execution
 	vm, err := txscript.NewEngine(
 		scriptPubKey, toSign, 0, txscript.StandardVerifyFlags,
 		nil, sigHashes, amount, prevOutFetcher,
