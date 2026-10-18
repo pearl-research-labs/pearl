@@ -3,10 +3,6 @@
 // license that can be found in the LICENSE file.
 package blockchain
 
-import (
-	"math"
-)
-
 // These constants are related to the wire protocol.
 const (
 	// outpointSize is the size of an outpoint.
@@ -89,6 +85,11 @@ const (
 	// increase it, we should probably use the same calculation as the
 	// standard library.
 	maxAlloc = (1 << heapAddrBits) - (1-_64bit)*1
+
+	// hmapSize is the number of bytes needed for the map header in a
+	// 64 bit system. Refer to hmap in runtime/map.go in the go
+	// standard library.
+	hmapSize = 48
 )
 
 var class_to_size = [_NumSizeClasses]uint16{0, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048, 2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912, 8192, 9472, 9728, 10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072, 20480, 21760, 24576, 27264, 28672, 32768}
@@ -153,41 +154,44 @@ func calculateRoughMapSize(hint int, bucketSize uintptr) int {
 		total += 24
 	}
 
-	// 48 is the number of bytes needed for the map header in a
-	// 64 bit system. Refer to hmap in runtime/map.go in the go
-	// standard library.
-	total += 48
+	total += hmapSize
 	return int(total)
 }
 
-// calculateMinEntries returns the minimum number of entries that will make the
-// map allocate the given total bytes.  -1 on the returned entry count will
-// make the map allocate half as much total bytes (for returned entry count that's
-// greater than 0).
-func calculateMinEntries(totalBytes int, bucketSize int) int {
-	// 48 is the number of bytes needed for the map header in a
-	// 64 bit system. Refer to hmap in runtime/map.go in the go
-	// standard library.
-	totalBytes -= 48
+// These constants bound the capacity of each map in the UTXO cache.
+const (
+	// minMapEntries keeps over-budget inserts, which block connection makes
+	// before its flush, from allocating one map per entry.
+	minMapEntries = 1024
 
-	numBuckets := totalBytes / bucketSize
-	B := uint8(math.Log2(float64(numBuckets)))
-	if B < 4 {
-		switch B {
-		case 0:
-			return 0
-		case 1:
-			return 9
-		case 2:
-			return 14
-		default:
-			return 27
-		}
+	// maxMapEntries keeps a large budget from preallocating one enormous map;
+	// past it the cache adds maps.  It is the full load of 2^24 buckets, the map
+	// a 16 GiB budget gets, and must stay at or below maxAlloc / bucketSize so
+	// calculateRoughMapSize still counts the map's memory.
+	maxMapEntries = 109_051_904
+)
+
+// mapCapacityFor returns how many entries to size a map for when it may use
+// budget bytes, clamped to [minMapEntries, maxMapEntries].  The map's buckets
+// get half the budget, each charged one average entry, which leaves room for
+// the entries the map holds.
+func mapCapacityFor(budget uint64) int {
+	bucketBudget := subOrZero(budget, hmapSize) / 2
+	maxBuckets := bucketBudget / (bucketSize + avgEntrySize)
+
+	// Maps allocate a power-of-two number of buckets, so use the largest that
+	// fits.
+	var capacity uint64
+	for buckets := uint64(1); buckets <= maxBuckets; buckets *= 2 {
+		capacity = entriesBeforeGrowth(buckets)
 	}
+	return int(min(max(capacity, minMapEntries), maxMapEntries))
+}
 
-	B -= 1
-
-	return (int(loadFactorNum * (bucketShift(B) / loadFactorDen))) + 1
+// entriesBeforeGrowth returns how many entries a map with the given
+// power-of-two number of buckets holds before it grows (see overLoadFactor).
+func entriesBeforeGrowth(buckets uint64) uint64 {
+	return max(bucketCnt, loadFactorNum*(buckets/loadFactorDen))
 }
 
 // mulUintptr returns a * b and whether the multiplication overflowed.
@@ -198,6 +202,11 @@ func mulUintptr(a, b uintptr) (uintptr, bool) {
 	}
 	overflow := b > MaxUintptr/a
 	return a * b, overflow
+}
+
+// subOrZero returns a - b, or 0 when b is larger than a.
+func subOrZero(a, b uint64) uint64 {
+	return a - min(a, b)
 }
 
 // divRoundUp returns ceil(n / a).

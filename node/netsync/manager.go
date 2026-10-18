@@ -1357,9 +1357,9 @@ func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 		}
 
 		// Check if the transaction exists from the point of view of the
-		// end of the main chain.  Note that this is only a best effort
-		// since it is expensive to check existence of every output and
-		// the only purpose of this check is to avoid downloading
+		// end of the main chain.  This is only a best effort, using the
+		// cache to avoid database reads for every peer announcement.  The
+		// only purpose of this check is to avoid downloading
 		// already known transactions.  Only the first two outputs are
 		// checked because the vast majority of transactions consist of
 		// two outputs where one is some form of "pay-to-somebody-else"
@@ -1367,11 +1367,7 @@ func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 		prevOut := wire.OutPoint{Hash: invVect.Hash}
 		for i := uint32(0); i < 2; i++ {
 			prevOut.Index = i
-			entry, err := sm.chain.FetchUtxoEntry(prevOut)
-			if err != nil {
-				return false, err
-			}
-			if entry != nil && !entry.IsSpent() {
+			if sm.chain.HaveUnspentInCache(prevOut) {
 				return true, nil
 			}
 		}

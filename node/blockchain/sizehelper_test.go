@@ -6,66 +6,43 @@ package blockchain
 import (
 	"math"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-// calculateEntries returns a number of entries that will make the map allocate
-// the given total bytes.  The returned number is always the maximum number of
-// entries that will allocate inside the given parameters.
-func calculateEntries(totalBytes int, bucketSize int) int {
-	// 48 is the number of bytes needed for the map header in a
-	// 64 bit system. Refer to hmap in runtime/map.go in the go
-	// standard library.
-	totalBytes -= 48
-
-	numBuckets := totalBytes / bucketSize
-	B := uint8(math.Log2(float64(numBuckets)))
-	if B == 0 {
-		// For 0 buckets, the max is the bucket count.
-		return bucketCnt
+func TestEntriesBeforeGrowth(t *testing.T) {
+	smallestHint := 0
+	for buckets := uint64(1); buckets <= 1<<28; buckets *= 2 {
+		capacity := int(entriesBeforeGrowth(buckets))
+		size := calculateRoughMapSize(capacity, bucketSize)
+		assert.Equal(t, calculateRoughMapSize(smallestHint, bucketSize), size, "%d buckets: too many", buckets)
+		assert.Less(t, size, calculateRoughMapSize(capacity+1, bucketSize), "%d buckets: too few", buckets)
+		smallestHint = capacity + 1
 	}
-
-	return int(loadFactorNum * (bucketShift(B) / loadFactorDen))
 }
 
-func TestCalculateEntries(t *testing.T) {
-	for i := 0; i < 10_000_000; i++ {
-		// It's not possible to calculate the exact amount of entries since
-		// the map will only allocate for 2^N where N is the amount of buckets.
-		//
-		// So to see if the calculate entries function is working correctly,
-		// we get the rough map size for i entries, then calculate the entries
-		// for that map size.  If the size is the same, the function is correct.
-		roughMapSize := calculateRoughMapSize(i, bucketSize)
-		entries := calculateEntries(roughMapSize, bucketSize)
-		gotRoughMapSize := calculateRoughMapSize(entries, bucketSize)
-
-		if roughMapSize != gotRoughMapSize {
-			t.Errorf("For hint of %d, expected %v, got %v\n",
-				i, roughMapSize, gotRoughMapSize)
-		}
-
-		// Test that the entries returned are the maximum for the given map size.
-		// If we increment the entries by one, we should get a bigger map.
-		gotRoughMapSizeWrong := calculateRoughMapSize(entries+1, bucketSize)
-		if roughMapSize == gotRoughMapSizeWrong {
-			t.Errorf("For hint %d incremented by 1, expected %v, got %v\n",
-				i, gotRoughMapSizeWrong*2, gotRoughMapSizeWrong)
-		}
-
-		minEntries := calculateMinEntries(roughMapSize, bucketSize)
-		gotMinRoughMapSize := calculateRoughMapSize(minEntries, bucketSize)
-		if roughMapSize != gotMinRoughMapSize {
-			t.Errorf("For hint of %d, expected %v, got %v\n",
-				i, roughMapSize, gotMinRoughMapSize)
-		}
-
-		// Can only test if they'll be half the size if the entries aren't 0.
-		if minEntries > 0 {
-			gotMinRoughMapSizeWrong := calculateRoughMapSize(minEntries-1, bucketSize)
-			if gotMinRoughMapSize == gotMinRoughMapSizeWrong {
-				t.Errorf("For hint %d decremented by 1, expected %v, got %v\n",
-					i, gotRoughMapSizeWrong/2, gotRoughMapSizeWrong)
-			}
-		}
+func TestMapCapacityFor(t *testing.T) {
+	tests := []struct {
+		name   string
+		budget uint64
+		want   int
+	}{
+		{name: "zero budget", budget: 0, want: minMapEntries},
+		{name: "small budget", budget: 64 << 10, want: minMapEntries},
+		{name: "default budget", budget: 250 << 20, want: 1_703_936},
+		{name: "8 GiB budget", budget: 8 << 30, want: 54_525_952},
+		{name: "16 GiB budget", budget: 16 << 30, want: maxMapEntries},
+		{name: "max budget", budget: math.MaxUint64, want: maxMapEntries},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, mapCapacityFor(tt.budget))
+		})
+	}
+}
+
+func TestMaxMapEntries(t *testing.T) {
+	assert.Equal(t, entriesBeforeGrowth(1<<24), uint64(maxMapEntries), "full load of 2^24 buckets")
+	assert.Greater(t, calculateRoughMapSize(maxMapEntries, bucketSize), calculateRoughMapSize(0, bucketSize),
+		"calculateRoughMapSize must count a map this large")
 }

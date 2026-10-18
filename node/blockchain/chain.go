@@ -1124,6 +1124,14 @@ func (b *BlockChain) verifyReorganizationValidity(detachNodes, attachNodes *list
 			}
 			err = view.connectTransactions(block, nil)
 			if err != nil {
+				if _, ok := err.(RuleError); ok {
+					b.index.UnsetStatusFlags(n, statusValid)
+					b.index.SetStatusFlags(n, statusValidateFailed)
+					for de := e.Next(); de != nil; de = de.Next() {
+						dn := de.Value.(*blockNode)
+						b.index.SetStatusFlags(dn, statusInvalidAncestor)
+					}
+				}
 				return nil, nil, nil, err
 			}
 
@@ -1252,6 +1260,11 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 		stxos := make([]SpentTxOut, 0, countSpentOutputs(block))
 		err := b.utxoCache.connectTransactions(block, &stxos)
 		if err != nil {
+			if _, ok := err.(RuleError); ok {
+				b.index.UnsetStatusFlags(node, statusValid)
+				b.index.SetStatusFlags(node, statusValidateFailed)
+				flushIndexState()
+			}
 			return false, err
 		}
 
