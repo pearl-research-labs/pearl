@@ -123,10 +123,12 @@ var rpcHandlers = map[string]struct {
 	"setaccount":    {handler: unsupported, noHelp: true},
 
 	// Extensions to the reference client JSON-RPC API
-	"chainsynced":      {handler: chainSynced},
-	"getsyncprogress":  {handler: getSyncProgress},
-	"createnewaccount": {handler: createNewAccount},
-	"getbestblock":     {handler: getBestBlock},
+	"chainsynced":            {handler: chainSynced},
+	"getsyncprogress":        {handler: getSyncProgress},
+	"removetransaction":      {handler: removeTransaction},
+	"rebroadcasttransaction": {handler: rebroadcastTransaction},
+	"createnewaccount":       {handler: createNewAccount},
+	"getbestblock":           {handler: getBestBlock},
 	// This was an extension but the reference implementation added it as
 	// well, but with a different API (no account parameter).  It's listed
 	// here because it hasn't been update to use the reference
@@ -379,8 +381,96 @@ func getSyncProgress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		FilterHeaderHeight: sp.FilterHeaderHeight,
 		BlockHeight:        w.Manager.SyncedTo().Height,
 		BestPeerHeight:     sp.BestPeerHeight,
+		Connections:        sp.Connections,
 		Synced:             w.ChainSynced(),
 	}, nil
+}
+
+func decodeTxHash(txID string) (*chainhash.Hash, error) {
+	txHash, err := chainhash.NewHashFromStr(txID)
+	if err != nil {
+		return nil, &btcjson.RPCError{
+			Code:    btcjson.ErrRPCDecodeHexString,
+			Message: "Transaction hash string decode failed: " + err.Error(),
+		}
+	}
+	return txHash, nil
+}
+
+func internalError(err error) *btcjson.RPCError {
+	return &btcjson.RPCError{Code: btcjson.ErrRPCInternal.Code, Message: err.Error()}
+}
+
+// sendTxError maps fresh-send failures. Rebroadcast results must not use the pre-signing failure code.
+func sendTxError(err error) *btcjson.RPCError {
+	if errors.Is(err, chain.ErrTxNotRelayed) {
+		return &btcjson.RPCError{Code: btcjson.ErrRPCClientNotConnected, Message: err.Error()}
+	}
+	return internalError(err)
+}
+
+// pendingTxError maps the wallet's pending-transaction errors to RPC errors.
+func pendingTxError(err error) error {
+	switch {
+	case errors.Is(err, wallet.ErrNoTx):
+		return &ErrNoTransactionInfo
+	case errors.Is(err, wallet.ErrTxConfirmed):
+		return InvalidParameterError{err}
+	default:
+		return internalError(err)
+	}
+}
+
+// removeTransaction handles a removetransaction request by forgetting a pending transaction and its pending dependents
+// so their inputs can be spent again.
+func removeTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
+	cmd := icmd.(*btcjson.RemoveTransactionCmd)
+
+	txHash, err := decodeTxHash(cmd.TxID)
+	if err != nil {
+		return nil, err
+	}
+
+	removed, err := w.RemoveTransaction(*txHash)
+	if err != nil {
+		return nil, pendingTxError(err)
+	}
+
+	log.Infof("Removed pending transaction %v and %d dependents", txHash, len(removed)-1)
+
+	return &btcjson.RemoveTransactionResult{
+		Removed: hashStrings(removed),
+	}, nil
+}
+
+// rebroadcastTransaction handles a rebroadcasttransaction request by announcing a pending transaction, and its pending
+// ancestors, to the network again.
+func rebroadcastTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
+	cmd := icmd.(*btcjson.RebroadcastTransactionCmd)
+
+	txHash, err := decodeTxHash(cmd.TxID)
+	if err != nil {
+		return nil, err
+	}
+
+	announced, err := w.RebroadcastTransaction(*txHash)
+	if err != nil {
+		return nil, pendingTxError(err)
+	}
+
+	log.Infof("Rebroadcast pending transaction %v (%d announced)", txHash, len(announced))
+
+	return &btcjson.RebroadcastTransactionResult{
+		Announced: hashStrings(announced),
+	}, nil
+}
+
+func hashStrings(hashes []chainhash.Hash) []string {
+	strs := make([]string, len(hashes))
+	for i := range hashes {
+		strs[i] = hashes[i].String()
+	}
+	return strs
 }
 
 // getInfo handles a getinfo request by returning the a structure containing
@@ -689,17 +779,13 @@ func getReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, erro
 	return total.ToPRL(), nil
 }
 
-// getTransaction handles a gettransaction request by returning details about
-// a single transaction saved by wallet.
+// getTransaction handles a gettransaction request by returning details about a single transaction saved by wallet.
 func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.GetTransactionCmd)
 
-	txHash, err := chainhash.NewHashFromStr(cmd.Txid)
+	txHash, err := decodeTxHash(cmd.Txid)
 	if err != nil {
-		return nil, &btcjson.RPCError{
-			Code:    btcjson.ErrRPCDecodeHexString,
-			Message: "Transaction hash string decode failed: " + err.Error(),
-		}
+		return nil, err
 	}
 
 	details, err := wallet.UnstableAPI(w).TxDetails(txHash)
@@ -740,7 +826,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 
 	var (
 		debitTotal  btcutil.Amount
-		creditTotal btcutil.Amount // Excludes change
+		creditTotal btcutil.Amount
 		fee         btcutil.Amount
 		feeF64      float64
 	)
@@ -748,7 +834,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		debitTotal += deb.Amount
 	}
 	for _, cred := range details.Credits {
-		if !cred.Change {
+		if !wallet.IsChange(details, cred) {
 			creditTotal += cred.Amount
 		}
 	}
@@ -790,8 +876,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 
 	credCat := wallet.RecvCategory(details, syncBlock.Height, w.ChainParams()).String()
 	for _, cred := range details.Credits {
-		// Change is ignored.
-		if cred.Change {
+		if wallet.IsChange(details, cred) {
 			continue
 		}
 
@@ -1277,21 +1362,16 @@ func makeOutputs(pairs map[string]btcutil.Amount, chainParams *chaincfg.Params) 
 	return outputs, nil
 }
 
-// sendPairs creates and sends payment transactions.
-// It returns the transaction hash in string format upon success
-// All errors are returned in btcjson.RPCError format
-func sendPairs(w *wallet.Wallet, amounts map[string]btcutil.Amount,
-	keyScope waddrmgr.KeyScope, account uint32, minconf int32,
-	feeSatPerKb btcutil.Amount) (string, error) {
+// sendPairs creates and sends payment transactions. It returns the transaction hash in string format upon success.
+// All errors are returned in btcjson.RPCError format.
+func sendPairs(w *wallet.Wallet, amounts map[string]btcutil.Amount, keyScope waddrmgr.KeyScope, account uint32,
+	minconf int32, feeSatPerKb btcutil.Amount) (string, error) {
 
 	outputs, err := makeOutputs(amounts, w.ChainParams())
 	if err != nil {
 		return "", err
 	}
-	tx, err := w.SendOutputs(
-		outputs, &keyScope, account, minconf, feeSatPerKb,
-		wallet.CoinSelectionLargest, "",
-	)
+	tx, err := w.SendOutputs(outputs, &keyScope, account, minconf, feeSatPerKb, wallet.CoinSelectionLargest, "")
 	if err != nil {
 		if err == txrules.ErrAmountNegative {
 			return "", ErrNeedPositiveAmount
@@ -1303,10 +1383,7 @@ func sendPairs(w *wallet.Wallet, amounts map[string]btcutil.Amount,
 			return "", err
 		}
 
-		return "", &btcjson.RPCError{
-			Code:    btcjson.ErrRPCInternal.Code,
-			Message: err.Error(),
-		}
+		return "", sendTxError(err)
 	}
 
 	txHashStr := tx.TxHash().String()

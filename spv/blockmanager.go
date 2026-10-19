@@ -5,6 +5,7 @@ package neutrino
 import (
 	"bytes"
 	"container/list"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -559,7 +560,7 @@ waitForHeaders:
 
 			log.Debugf("Getting filter checkpoints up to "+
 				"height=%v, hash=%v", bestHeight, bestHash)
-			allCFCheckpoints = b.getCheckpts(&bestHash, fType)
+			allCFCheckpoints = b.getCheckpts(&bestHash, bestHeight, fType)
 			if len(allCFCheckpoints) == 0 {
 				log.Warnf("Unable to fetch set of " +
 					"candidate checkpoints, trying again...")
@@ -873,25 +874,24 @@ func (c *checkpointedCFHeadersQuery) handleResponse(req, resp wire.Message,
 	}
 	nextCheckpoint := c.checkpoints[nextCheckPointIndex]
 
-	// The response doesn't match the checkpoint.
-	if !verifyCheckpoint(prevCheckpoint, nextCheckpoint, r) {
-		log.Warnf("Checkpoints at index %v don't match response!!!",
-			checkPointIndex)
-
-		// If the peer gives us a header that doesn't match what we
-		// know to be the best checkpoint, then we'll ban the peer so
-		// we can re-allocate the query elsewhere.
-		err := c.blockMgr.cfg.BanPeer(
-			peerAddr, banman.InvalidFilterHeaderCheckpoint,
-		)
+	reject := func() query.Progress {
+		err := c.blockMgr.cfg.BanPeer(peerAddr, banman.InvalidFilterHeaderCheckpoint)
 		if err != nil {
 			log.Errorf("Unable to ban peer %v: %v", peerAddr, err)
 		}
+		return query.Progress{Finished: false, Progressed: false}
+	}
 
-		return query.Progress{
-			Finished:   false,
-			Progressed: false,
-		}
+	// A wrong hash count can still hash to the checkpoint; an empty reply is treated as already written and stalls the
+	// fetch.
+	numHeights := (nextCheckPointIndex - checkPointIndex + 1) * wire.CFCheckptInterval
+	if uint32(len(r.FilterHashes)) != numHeights {
+		log.Warnf("Peer %v sent %d filter hashes, expected %d", peerAddr, len(r.FilterHashes), numHeights)
+		return reject()
+	}
+	if !verifyCheckpoint(prevCheckpoint, nextCheckpoint, r) {
+		log.Warnf("Checkpoints at index %v don't match response from peer %v", checkPointIndex, peerAddr)
+		return reject()
 	}
 
 	// At this point, the response matches the query, and the relevant
@@ -940,6 +940,11 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 	log.Infof("Starting to query for cfheaders from "+
 		"checkpoint_interval=%v, checkpoints=%v", startingInterval,
 		len(checkpoints))
+
+	// A list ending before the store's interval would wrap the unsigned numCheckpts and size the queries by ~2^32.
+	if startingInterval >= uint32(len(checkpoints)) {
+		return
+	}
 
 	// We'll determine how many queries we'll make based on our starting
 	// interval and our set of checkpoints. Each query will attempt to fetch
@@ -1123,7 +1128,11 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 				// range a bit so we don't write any duplicate
 				// headers.
 				r.PrevFilterHeader = *curHeader
-				offset := curHeight + 1 - startHeight
+				offset := int(curHeight) + 1 - int(startHeight)
+				if offset < 0 || offset > len(r.FilterHashes) {
+					log.Errorf("Invalid offset %d for %d initial filter hashes", offset, len(r.FilterHashes))
+					return
+				}
 				r.FilterHashes = r.FilterHashes[offset:]
 
 				log.Debugf("Using offset %d for initial "+
@@ -1138,8 +1147,8 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 			// the next message.
 			curHeader, curHeight, err = b.writeCFHeadersMsg(r, store)
 			if err != nil {
-				panic(fmt.Sprintf("couldn't write "+
-					"cfheaders msg: %v", err))
+				log.Errorf("couldn't write cfheaders msg: %v", err)
+				return
 			}
 
 			// Update the next interval to write to reflect our
@@ -1176,6 +1185,17 @@ func (b *blockManager) writeCFHeadersMsg(msg *wire.MsgCFHeaders,
 		return nil, 0, fmt.Errorf("attempt to write cfheaders out of "+
 			"order, tip=%v (height=%v), prev_hash=%v", *tip,
 			tipHeight, msg.PrevFilterHeader)
+	}
+
+	// The filter tip moves to StopHash's height, so the batch must cover exactly (tip, StopHash].
+	stopHeight, err := b.cfg.BlockHeaders.HeightFromHash(&msg.StopHash)
+	if err != nil {
+		return nil, 0, err
+	}
+	numHashes := uint32(len(msg.FilterHashes))
+	if stopHeight <= tipHeight || numHashes != stopHeight-tipHeight {
+		return nil, 0, fmt.Errorf("cfheaders batch has %d filter hashes for heights (%d, %d]",
+			numHashes, tipHeight, stopHeight)
 	}
 
 	// Cycle through the headers and compute each header based on the prev
@@ -1871,10 +1891,12 @@ func (b *blockManager) fetchFilterFromAllPeers(
 	return filterResponses
 }
 
-// getCheckpts runs a query for cfcheckpts against all peers and returns a map
-// of responses.
-func (b *blockManager) getCheckpts(lastHash *chainhash.Hash,
+// getCheckpts runs a query for cfcheckpts against all peers and returns a map of responses. lastHeight can't be looked
+// up from lastHash, which may be a block checkpoint that isn't in the header store yet.
+func (b *blockManager) getCheckpts(lastHash *chainhash.Hash, lastHeight uint32,
 	fType wire.FilterType) map[string][]*chainhash.Hash {
+
+	expectedCheckpts := int(lastHeight / wire.CFCheckptInterval)
 
 	checkpoints := make(map[string][]*chainhash.Hash)
 	getCheckptMsg := wire.NewMsgGetCFCheckpt(fType, lastHash)
@@ -1888,8 +1910,23 @@ func (b *blockManager) getCheckpts(lastHash *chainhash.Hash,
 				if m.FilterType == fType &&
 					m.StopHash == *lastHash {
 
-					checkpoints[sp.Addr()] = m.FilterHeaders
 					close(peerQuit)
+
+					// Honest peers send all checkpoints up to the stop hash or none, and a short list would pass
+					// checkCFCheckptSanity, which only compares the indexes it has.
+					if len(m.FilterHeaders) != expectedCheckpts {
+						log.Warnf("Banning peer=%v since it served %d filter checkpoints up to height %d, expected %d",
+							sp.Addr(), len(m.FilterHeaders), lastHeight, expectedCheckpts)
+
+						err := b.cfg.BanPeer(sp.Addr(), banman.InvalidFilterHeaderCheckpoint)
+						if err != nil {
+							log.Errorf("Unable to ban peer %v: %v", sp.Addr(), err)
+						}
+
+						return
+					}
+
+					checkpoints[sp.Addr()] = m.FilterHeaders
 				}
 			}
 		},
@@ -2048,8 +2085,7 @@ func (b *blockManager) findNextHeaderCheckpoint(height int32) *chaincfg.Checkpoi
 // findPreviousHeaderCheckpoint returns the last checkpoint before the passed
 // height. It returns a checkpoint matching the genesis block when the height
 // is earlier than the first checkpoint or there are no checkpoints for the
-// current network. This is used for resetting state when a malicious peer
-// sends us headers that don't lead up to a known checkpoint.
+// current network.
 func (b *blockManager) findPreviousHeaderCheckpoint(height int32) *chaincfg.Checkpoint {
 	// Start with the genesis block - earliest checkpoint to which our code
 	// will want to reset
@@ -2256,7 +2292,7 @@ func (b *blockManager) handleInvMsg(imsg *invMsg) {
 	lastBlock := -1
 	invVects := imsg.inv.InvList
 	for i := len(invVects) - 1; i >= 0; i-- {
-		if invVects[i].Type == wire.InvTypeBlock {
+		if invVects[i].Type.IsBlock() {
 			lastBlock = i
 			break
 		}
@@ -2288,8 +2324,8 @@ func (b *blockManager) handleInvMsg(imsg *invMsg) {
 
 	// Add blocks to the cache of known inventory for the peer.
 	for _, iv := range invVects {
-		if iv.Type == wire.InvTypeBlock {
-			imsg.peer.AddKnownInventory(iv)
+		if iv.Type.IsBlock() {
+			imsg.peer.AddKnownInventory(*iv)
 		}
 	}
 
@@ -2456,9 +2492,7 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 				&prevNodeHeader,
 			)
 			if err != nil {
-				log.Warnf("Header doesn't pass sanity check: "+
-					"%s -- disconnecting peer", err)
-				hmsg.peer.Disconnect()
+				b.punishHeaderSanityErr(hmsg.peer, err)
 				return
 			}
 
@@ -2537,13 +2571,9 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 				return
 			}
 
-			// We've found a branch we weren't aware of. If the
-			// branch is earlier than the latest synchronized
-			// checkpoint, it's invalid and we need to disconnect
-			// the reporting peer.
-			prevCheckpoint := b.findPreviousHeaderCheckpoint(
-				prevNode.Height,
-			)
+			// We've found a branch we weren't aware of. If it forks below the latest synchronized checkpoint, which may
+			// be our tip itself, it's invalid and we need to disconnect the reporting peer.
+			prevCheckpoint := b.findPreviousHeaderCheckpoint(prevNode.Height + 1)
 			if backHeight < uint32(prevCheckpoint.Height) {
 				log.Errorf("Attempt at a reorg earlier than a "+
 					"checkpoint past which we've already "+
@@ -2589,10 +2619,7 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 					int32(prevNodeHeight), prevNodeHeader,
 				)
 				if err != nil {
-					log.Warnf("Header doesn't pass sanity"+
-						" check: %s -- disconnecting "+
-						"peer", err)
-					hmsg.peer.Disconnect()
+					b.punishHeaderSanityErr(hmsg.peer, err)
 					return
 				}
 				totalWork.Add(totalWork,
@@ -2687,45 +2714,13 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 				Header: *blockHeader,
 				Height: int32(backHeight + 1),
 			})
+			b.nextCheckpoint = b.findNextHeaderCheckpoint(int32(backHeight + 1))
 		}
 
-		// Verify the header at the next checkpoint height matches.
 		if b.nextCheckpoint != nil && node.Height == b.nextCheckpoint.Height {
-			nodeHash := node.Header.BlockHash()
-			if nodeHash.IsEqual(b.nextCheckpoint.Hash) {
-				receivedCheckpoint = true
-				log.Infof("Verified downloaded block "+
-					"header against checkpoint at height "+
-					"%d/hash %s", node.Height, nodeHash)
-			} else {
-				log.Warnf("Block header at height %d/hash "+
-					"%s from peer %s does NOT match "+
-					"expected checkpoint hash of %s -- "+
-					"disconnecting", node.Height,
-					nodeHash, hmsg.peer.Addr(),
-					b.nextCheckpoint.Hash)
-
-				prevCheckpoint := b.findPreviousHeaderCheckpoint(
-					node.Height,
-				)
-
-				log.Infof("Rolling back to previous validated "+
-					"checkpoint at height %d/hash %s",
-					prevCheckpoint.Height,
-					prevCheckpoint.Hash)
-
-				err := b.rollBackToHeight(uint32(
-					prevCheckpoint.Height),
-				)
-				if err != nil {
-					log.Criticalf("Rollback failed: %s",
-						err)
-					// Should we panic here?
-				}
-
-				hmsg.peer.Disconnect()
-				return
-			}
+			receivedCheckpoint = true
+			log.Infof("Verified downloaded block header against checkpoint at height %d/hash %s", node.Height,
+				blockHash)
 			break
 		}
 	}
@@ -2820,6 +2815,43 @@ func areHeadersConnected(headers []*wire.BlockHeader) bool {
 	return true
 }
 
+// isPeerFaultHeaderErr reports whether the error proves the peer sent invalid
+// header data and is not just a disagreement with our local clock or rules.
+func isPeerFaultHeaderErr(err error) bool {
+	var ruleErr blockchain.RuleError
+	if !errors.As(err, &ruleErr) {
+		return false
+	}
+	switch ruleErr.ErrorCode {
+	case blockchain.ErrHighHash, // PoW certificate fails verification
+		blockchain.ErrCertificateMissing,   // header has no certificate
+		blockchain.ErrCertificateTooLarge,  // certificate exceeds the wire max
+		blockchain.ErrUnexpectedDifficulty, // bits zero, out of range, or not required
+		blockchain.ErrInvalidTime:          // timestamp not whole-second precision; malformed
+		return true
+	case blockchain.ErrTimeTooNew, // judged against our local clock
+		blockchain.ErrTimeTooOld,            // depends on our view of the parent and median time
+		blockchain.ErrDisallowedCertVersion, // may be a newer rule we don't know
+		blockchain.ErrRankPenalty:           // height-gated rule
+		return false
+	default: // unknown errors only disconnect
+		return false
+	}
+}
+
+func (b *blockManager) punishHeaderSanityErr(p *ServerPeer, err error) {
+	// User-configured persistent peers must stay reachable; disconnect only.
+	if isPeerFaultHeaderErr(err) && !p.persistent {
+		log.Warnf("Header doesn't pass sanity check: %s -- banning peer", err)
+		if banErr := b.cfg.BanPeer(p.Addr(), banman.InvalidBlock); banErr != nil {
+			log.Errorf("Unable to ban peer %v: %v", p.Addr(), banErr)
+		}
+	} else {
+		log.Warnf("Header doesn't pass sanity check: %s -- disconnecting peer", err)
+	}
+	p.Disconnect()
+}
+
 // checkHeaderSanity performs contextual and context-less checks on the passed
 // wire.BlockHeader and wire.BlockCertificate. This function calls blockchain.CheckBlockHeaderContext for
 // the contextual check and blockchain.CheckBlockHeaderSanity for context-less
@@ -2845,9 +2877,7 @@ func (b *blockManager) checkHeaderSanity(blockHeader *wire.BlockHeader,
 
 	flags := blockchain.NetBehaviorFlags(&b.cfg.ChainParams)
 
-	err := blockchain.CheckBlockHeaderContext(
-		blockHeader, parentHeaderCtx, flags, chainCtx, true,
-	)
+	err := blockchain.CheckBlockHeaderContext(blockHeader, parentHeaderCtx, flags, chainCtx, false)
 	if err != nil {
 		return err
 	}
@@ -2959,12 +2989,17 @@ func (l *lightChainCtx) ChainParams() *chaincfg.Params {
 	return l.params
 }
 
-// VerifyCheckpoint returns false as the lightChainCtx does not need to validate
-// checkpoints. This is already done inside the handleHeadersMsg function.
+// VerifyCheckpoint returns false if a checkpoint is configured at height with a different hash. Header sync depends on
+// it, through checkHeaderSanity, to keep such headers out of the store on both the connecting and the reorg path.
 //
 // NOTE: Part of the blockchain.ChainCtx interface.
-func (l *lightChainCtx) VerifyCheckpoint(int32, *chainhash.Hash) bool {
-	return false
+func (l *lightChainCtx) VerifyCheckpoint(height int32, hash *chainhash.Hash) bool {
+	for _, checkpoint := range l.params.Checkpoints {
+		if checkpoint.Height == height {
+			return checkpoint.Hash.IsEqual(hash)
+		}
+	}
+	return true
 }
 
 // FindPreviousCheckpoint returns nil values since the lightChainCtx does not

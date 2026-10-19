@@ -159,6 +159,34 @@ type Message interface {
 	MaxPayloadLength(uint32) uint32
 }
 
+// serializeSizer is implemented by messages that know their exact
+// serialized size regardless of the encoding.
+type serializeSizer interface {
+	SerializeSize() int
+}
+
+// encodedSizer is implemented by messages whose serialized size depends on
+// the encoding.
+type encodedSizer interface {
+	encodedSize(enc MessageEncoding) int
+}
+
+// MessageSize returns the number of payload bytes msg occupies on the wire
+// when encoded with the given protocol version and encoding
+//
+// Messages implementing encodedSizer or serializeSizer are measured exactly.
+// Every other message is measured by its maximum payload length.
+func MessageSize(msg Message, pver uint32, enc MessageEncoding) int {
+	switch m := msg.(type) {
+	case encodedSizer:
+		return m.encodedSize(enc)
+	case serializeSizer:
+		return m.SerializeSize()
+	default:
+		return int(msg.MaxPayloadLength(pver))
+	}
+}
+
 // makeEmptyMessage creates a message of the appropriate concrete type based
 // on the command.
 func makeEmptyMessage(command string) (Message, error) {

@@ -155,8 +155,9 @@ func TestAuthorizeRequest(t *testing.T) {
 // rpcServer. It returns the client-side connection and a channel that is
 // closed once the server-side client has fully shut down. The wsClient is
 // constructed directly (rather than via newWebsocketClient/WebsocketHandler)
-// to avoid the global daemon config those paths require.
-func startWSClient(t *testing.T, s *rpcServer, authenticated, isAdmin bool) (*websocket.Conn, <-chan struct{}) {
+// to avoid the global daemon config those paths require. opts may adjust the
+// wsClient before its goroutines start.
+func startWSClient(t *testing.T, s *rpcServer, authenticated, isAdmin bool, opts ...func(*wsClient)) (*websocket.Conn, <-chan struct{}) {
 	t.Helper()
 
 	done := make(chan struct{})
@@ -173,6 +174,7 @@ func startWSClient(t *testing.T, s *rpcServer, authenticated, isAdmin bool) (*we
 			addr:              r.RemoteAddr,
 			authenticated:     authenticated,
 			isAdmin:           isAdmin,
+			authTimeout:       time.Second * rpcAuthTimeoutSeconds,
 			sessionID:         1,
 			server:            s,
 			addrRequests:      make(map[string]struct{}),
@@ -181,6 +183,9 @@ func startWSClient(t *testing.T, s *rpcServer, authenticated, isAdmin bool) (*we
 			ntfnChan:          make(chan []byte, 1),
 			sendChan:          make(chan wsResponse, websocketSendBufferSize),
 			quit:              make(chan struct{}),
+		}
+		for _, opt := range opts {
+			opt(c)
 		}
 		c.wg.Add(3)
 		go c.inHandler()
@@ -275,6 +280,122 @@ func TestWebsocketBatchHandling(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("server did not shut the client down after failed auth")
 		}
+	})
+}
+
+// TestWebsocketPreAuthLimits verifies that a websocket client which has not
+// authenticated can neither hold its slot past the auth timeout nor make the
+// server read an oversized message, and that both restrictions are lifted once
+// the client authenticates in-band.  It also verifies that a frame which makes a
+// decoder panic only disconnects the client.
+func TestWebsocketPreAuthLimits(t *testing.T) {
+	t.Parallel()
+
+	s := &rpcServer{
+		adminCredHash: sha256.Sum256([]byte("admin:adminpass")),
+	}
+	shortAuthTimeout := func(c *wsClient) { c.authTimeout = 200 * time.Millisecond }
+
+	requireShutdown := func(t *testing.T, conn *websocket.Conn, done <-chan struct{}) {
+		t.Helper()
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, _, err := conn.ReadMessage()
+		require.Error(t, err, "server should disconnect rather than reply")
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("server did not shut the client down")
+		}
+	}
+
+	t.Run("idle unauthenticated client is disconnected", func(t *testing.T) {
+		t.Parallel()
+		conn, done := startWSClient(t, s, false, false, shortAuthTimeout)
+
+		// Send nothing: the auth timeout alone must free the slot.
+		requireShutdown(t, conn, done)
+	})
+
+	t.Run("oversized pre-auth message is rejected", func(t *testing.T) {
+		t.Parallel()
+		conn, done := startWSClient(t, s, false, false)
+
+		// A valid authenticate padded past the limit, so the only reason
+		// to disconnect is its size.  The write may fail if the server
+		// closes mid-frame; only the disconnect matters.
+		pad := strings.Repeat("x", wsPreAuthReadLimit)
+		_ = conn.WriteMessage(websocket.TextMessage,
+			[]byte(`{"jsonrpc":"1.0","method":"authenticate","params":["admin","adminpass"],"id":1,"pad":"`+pad+`"}`))
+		requireShutdown(t, conn, done)
+	})
+
+	t.Run("in-band auth lifts the limits", func(t *testing.T) {
+		t.Parallel()
+		conn, _ := startWSClient(t, s, false, false, shortAuthTimeout)
+
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage,
+			[]byte(`{"jsonrpc":"1.0","method":"authenticate","params":["admin","adminpass"],"id":1}`)))
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, msg, err := conn.ReadMessage()
+		require.NoError(t, err)
+		require.Contains(t, string(msg), `"error":null`)
+
+		// Outlive the auth timeout, then send a request larger than the
+		// pre-auth limit.  Both would disconnect an unauthenticated client.
+		time.Sleep(400 * time.Millisecond)
+		pad := strings.Repeat("x", wsPreAuthReadLimit)
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage,
+			[]byte(`{"jsonrpc":"1.0","method":"session","params":[],"id":2,"pad":"`+pad+`"}`)))
+
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, msg, err = conn.ReadMessage()
+		require.NoError(t, err)
+
+		var reply struct {
+			Result *btcjson.SessionResult `json:"result"`
+			ID     json.RawMessage        `json:"id"`
+		}
+		require.NoError(t, json.Unmarshal(msg, &reply))
+		require.Equal(t, "2", string(reply.ID))
+		require.NotNil(t, reply.Result)
+	})
+
+	for _, tc := range []struct {
+		name  string
+		frame string
+	}{
+		{
+			name:  "malformed importmulti scriptPubKey",
+			frame: `{"jsonrpc":"1.0","id":1,"method":"importmulti","params":[[{"scriptPubKey":{"x":1}}]]}`,
+		},
+		{
+			name:  "null request",
+			frame: `null`,
+		},
+		{
+			name:  "batched null request",
+			frame: `[null]`,
+		},
+	} {
+		t.Run(tc.name+" is rejected", func(t *testing.T) {
+			t.Parallel()
+			conn, done := startWSClient(t, s, false, false)
+
+			require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(tc.frame)))
+			requireShutdown(t, conn, done)
+		})
+	}
+
+	t.Run("panic in the input handler disconnects the client", func(t *testing.T) {
+		t.Parallel()
+
+		// authenticate dereferences the nil server, standing in for a bug in
+		// a decoder.
+		conn, done := startWSClient(t, nil, false, false)
+
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage,
+			[]byte(`{"jsonrpc":"1.0","method":"authenticate","params":["admin","adminpass"],"id":1}`)))
+		requireShutdown(t, conn, done)
 	})
 }
 

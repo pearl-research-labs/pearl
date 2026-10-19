@@ -572,6 +572,16 @@ func TestUnmarshalCmdErrors(t *testing.T) {
 			},
 			err: btcjson.Error{ErrorCode: btcjson.ErrInvalidType},
 		},
+		{
+			name: "scriptPubKey object without a string address",
+			request: btcjson.Request{
+				Jsonrpc: btcjson.RpcVersion1,
+				Method:  "importmulti",
+				Params:  []json.RawMessage{[]byte(`[{"scriptPubKey":{"x":1},"timestamp":0}]`)},
+				ID:      nil,
+			},
+			err: btcjson.Error{ErrorCode: btcjson.ErrInvalidType},
+		},
 	}
 
 	t.Logf("Running %d tests", len(tests))

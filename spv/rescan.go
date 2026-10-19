@@ -1049,13 +1049,6 @@ func extractBlockMatches(chain ChainSource, ro *rescanOptions,
 
 		if relevant {
 			relevantTxs = append(relevantTxs, tx)
-
-			chainSource, ok := chain.(*RescanChainSource)
-			if ok {
-				chainSource.broadcaster.MarkAsConfirmed(
-					*tx.Hash(),
-				)
-			}
 		}
 	}
 

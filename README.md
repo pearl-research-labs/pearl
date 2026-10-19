@@ -21,9 +21,7 @@ system, vLLM miner, and supporting tools.
 | [`node/`](node/) | **pearld** — reference implementation of the Pearl Protocol (full node) |
 | [`wallet/`](wallet/) | **Oyster** — HD wallet daemon with JSON-RPC and gRPC interfaces, plus [**oystercli**](wallet/cmd/oystercli/), an interactive terminal client for it |
 | [`spv/`](spv/) | **Pearl light client** — privacy-preserving SPV client using compact block filters |
-| [`dnsseeder/`](dnsseeder/) | DNS seeder for the Pearl network |
 | [`coredns-dnsseed/`](coredns-dnsseed/) | CoreDNS plugin — production DNS seeder |
-| [`proxy/`](proxy/) | Caddy reverse-proxy sidecar for RPC TLS termination and rate limiting |
 | [`xmss/`](xmss/) | XMSS post-quantum signature scheme (C + Go FFI) |
 | [`zk-pow/`](zk-pow/) | ZK proof-of-work circuit and verifier (Rust, Plonky2/STARKy) |
 | [`pearl-blake3/`](pearl-blake3/) | Blake3 hashing utilities (Rust) |

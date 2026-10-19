@@ -872,7 +872,11 @@ func (s *ScriptPubKey) UnmarshalJSON(data []byte) error {
 	case string:
 		s.Value = v
 	case map[string]interface{}:
-		s.Value = ScriptPubKeyAddress{Address: v["address"].(string)}
+		address, ok := v["address"].(string)
+		if !ok {
+			return fmt.Errorf("expected scriptPubKey object to have a string address, got: %v", v)
+		}
+		s.Value = ScriptPubKeyAddress{Address: address}
 	default:
 		return fmt.Errorf("invalid scriptPubKey value: %v", unmarshalled)
 	}
@@ -1106,6 +1110,27 @@ func NewGetSyncProgressCmd() *GetSyncProgressCmd {
 	return &GetSyncProgressCmd{}
 }
 
+// RemoveTransactionCmd defines the removetransaction JSON-RPC command.
+type RemoveTransactionCmd struct {
+	TxID string
+}
+
+// NewRemoveTransactionCmd returns a new instance which can be used to issue a removetransaction JSON-RPC command.
+func NewRemoveTransactionCmd(txID string) *RemoveTransactionCmd {
+	return &RemoveTransactionCmd{TxID: txID}
+}
+
+// RebroadcastTransactionCmd defines the rebroadcasttransaction JSON-RPC command.
+type RebroadcastTransactionCmd struct {
+	TxID string
+}
+
+// NewRebroadcastTransactionCmd returns a new instance which can be used to
+// issue a rebroadcasttransaction JSON-RPC command.
+func NewRebroadcastTransactionCmd(txID string) *RebroadcastTransactionCmd {
+	return &RebroadcastTransactionCmd{TxID: txID}
+}
+
 func init() {
 	// The commands in this file are only usable with a wallet server.
 	flags := UFWalletOnly
@@ -1161,4 +1186,6 @@ func init() {
 	MustRegisterCmd("walletcreatefundedpsbt", (*WalletCreateFundedPsbtCmd)(nil), flags)
 	MustRegisterCmd("walletprocesspsbt", (*WalletProcessPsbtCmd)(nil), flags)
 	MustRegisterCmd("getsyncprogress", (*GetSyncProgressCmd)(nil), flags)
+	MustRegisterCmd("removetransaction", (*RemoveTransactionCmd)(nil), flags)
+	MustRegisterCmd("rebroadcasttransaction", (*RebroadcastTransactionCmd)(nil), flags)
 }

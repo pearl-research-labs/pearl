@@ -35,7 +35,7 @@ func createWalletWizard(cfg *config) error {
 		seedInput  string
 		birthday   string
 		passphrase string
-		confirm    string
+		repeated   string
 	)
 	// Sequential forms: accessible mode prompts every group of a form even
 	// when hidden, so the import-only questions live in their own form.
@@ -87,7 +87,7 @@ func createWalletWizard(cfg *config) error {
 				}
 				return nil
 			}).
-			Value(&confirm),
+			Value(&repeated),
 	)))
 	if err != nil || !submitted {
 		return err
@@ -214,18 +214,11 @@ func seedBackupCeremony(seed string) error {
 	lipgloss.Println(th.subtle.Render("Anyone with these words can take your funds; anyone without them cannot\nrecover your wallet if this machine dies. Store them offline."))
 
 	for {
-		saved := false
-		ok, err := runForm(newForm(huh.NewGroup(
-			huh.NewConfirm().
-				Title("Have you written the seed down?").
-				Affirmative("Yes, it is safely stored").
-				Negative("Not yet").
-				Value(&saved),
-		)))
+		saved, err := confirm("Have you written the seed down?", "", "Yes, it is safely stored", "Not yet", false)
 		if err != nil {
 			return err
 		}
-		if ok && saved {
+		if saved {
 			return nil
 		}
 	}

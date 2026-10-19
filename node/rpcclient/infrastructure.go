@@ -181,6 +181,12 @@ type Client struct {
 	disconnect      chan struct{}
 	shutdown        chan struct{}
 	wg              sync.WaitGroup
+
+	// connHandlers counts the input and output handlers of the current
+	// websocket connection. They read wsConn and the disconnect channel on
+	// every pass, so one still running after a reconnect would use the
+	// replacement connection alongside its own handlers.
+	connHandlers sync.WaitGroup
 }
 
 // NextID returns the next id to be used when sending a JSON-RPC message.  This
@@ -498,6 +504,7 @@ out:
 
 	// Ensure the connection is closed.
 	c.Disconnect()
+	c.connHandlers.Done()
 	c.wg.Done()
 	log.Tracef("RPC client input handler done for %s", c.config.Host)
 }
@@ -543,6 +550,7 @@ cleanup:
 			break cleanup
 		}
 	}
+	c.connHandlers.Done()
 	c.wg.Done()
 	log.Tracef("RPC client output handler done for %s", c.config.Host)
 }
@@ -702,6 +710,11 @@ out:
 		case <-c.shutdown:
 			break out
 		}
+
+		// Replacing wsConn while the old connection's handlers still
+		// run would hand them the new connection. doDisconnect closed
+		// the old one, so they are already returning.
+		c.connHandlers.Wait()
 
 	reconnect:
 		for {
@@ -1174,6 +1187,7 @@ func (c *Client) start() {
 		}()
 	} else {
 		c.wg.Add(3)
+		c.connHandlers.Add(2)
 		go func() {
 			if c.ntfnHandlers != nil {
 				if c.ntfnHandlers.OnClientConnected != nil {

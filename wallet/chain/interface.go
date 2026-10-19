@@ -32,6 +32,7 @@ type SyncProgress struct {
 	HeaderHeight       int32
 	FilterHeaderHeight int32
 	BestPeerHeight     int32
+	Connections        int32
 }
 
 // Interface allows more than one backing blockchain source, such as a

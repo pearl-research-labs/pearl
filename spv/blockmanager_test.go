@@ -2,6 +2,7 @@ package neutrino
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -668,6 +669,254 @@ func TestBlockManagerInvalidInterval(t *testing.T) {
 	}
 }
 
+func TestWriteCFHeadersMsgInvalidBatch(t *testing.T) {
+	t.Parallel()
+
+	bm, hdrStore, cfStore, err := setupBlockManager(t)
+	require.NoError(t, err)
+
+	// A batch that slips past the check would otherwise block on its unread block notifications instead of failing.
+	close(bm.quit)
+
+	genesisBlock, _, err := hdrStore.ChainTip()
+	require.NoError(t, err)
+	tip, _, err := cfStore.ChainTip()
+	require.NoError(t, err)
+
+	const numBlocks = 4
+	blockHeaders := make([]headerfs.BlockHeader, numBlocks)
+	for i := uint32(1); i <= numBlocks; i++ {
+		blockHeaders[i-1] = headerfs.BlockHeader{BlockHeader: heightToHeader(i), Height: i}
+	}
+	require.NoError(t, hdrStore.WriteHeaders(blockHeaders...))
+
+	stopHash := blockHeaders[numBlocks-1].BlockHash()
+	tipHash := genesisBlock.BlockHash()
+
+	testCases := []struct {
+		name      string
+		stopHash  chainhash.Hash
+		numHashes int
+	}{
+		{name: "empty", stopHash: stopHash},
+		{name: "short", stopHash: stopHash, numHashes: numBlocks - 1},
+		{name: "long", stopHash: stopHash, numHashes: numBlocks + 1},
+		{name: "empty at tip", stopHash: tipHash},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			msg := &wire.MsgCFHeaders{StopHash: test.stopHash, PrevFilterHeader: *tip}
+			for i := 0; i < test.numHashes; i++ {
+				msg.FilterHashes = append(msg.FilterHashes, &chainhash.Hash{})
+			}
+
+			_, _, err := bm.writeCFHeadersMsg(msg, cfStore)
+			require.ErrorContains(t, err, "cfheaders batch has")
+
+			_, tipHeight, err := cfStore.ChainTip()
+			require.NoError(t, err)
+			require.Zero(t, tipHeight)
+		})
+	}
+}
+
+func TestBlockManagerInvalidHashCount(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		numHashes int
+	}{
+		{name: "empty", numHashes: 0},
+		{name: "short", numHashes: 1},
+		{name: "long", numHashes: wire.CFCheckptInterval + 1},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			bm, hdrStore, cfStore, err := setupBlockManager(t)
+			require.NoError(t, err)
+
+			genesisBlockHeader, _, err := hdrStore.ChainTip()
+			require.NoError(t, err)
+
+			genesisFilterHeader, _, err := cfStore.ChainTip()
+			require.NoError(t, err)
+
+			headers, err := generateHeaders(genesisBlockHeader, genesisFilterHeader, nil)
+			require.NoError(t, err)
+
+			err = hdrStore.WriteHeaders(headers.blockHeaders[1 : wire.CFCheckptInterval+1]...)
+			require.NoError(t, err)
+
+			// The checkpoint commits to this reply's hashes, so only the count check can reject it.
+			checkpoint := *genesisFilterHeader
+			filterHashes := make([]*chainhash.Hash, test.numHashes)
+			for i := range filterHashes {
+				filterHashes[i] = &headers.filterHashes[i+1]
+				checkpoint = chainhash.DoubleHashH(append(filterHashes[i][:], checkpoint[:]...))
+			}
+
+			var banned []string
+			bm.cfg.BanPeer = func(addr string, reason banman.Reason) error {
+				require.Equal(t, banman.InvalidFilterHeaderCheckpoint, reason)
+				banned = append(banned, addr)
+
+				return nil
+			}
+
+			bm.cfg.QueryDispatcher.(*mockDispatcher).query = func(requests []*query.Request,
+				options ...query.QueryOption) chan error {
+
+				q := requests[0].Req.(*wire.MsgGetCFHeaders)
+				resp := &wire.MsgCFHeaders{
+					FilterType:       q.FilterType,
+					StopHash:         q.StopHash,
+					PrevFilterHeader: *genesisFilterHeader,
+					FilterHashes:     filterHashes,
+				}
+				progress := requests[0].HandleResp(q, resp, "mallory:1")
+				require.False(t, progress.Finished)
+
+				errChan := make(chan error, 1)
+				errChan <- query.ErrWorkManagerShuttingDown
+
+				return errChan
+			}
+
+			bm.getCheckpointedCFHeaders([]*chainhash.Hash{&checkpoint}, cfStore, wire.GCSFilterRegular)
+
+			require.Equal(t, []string{"mallory:1"}, banned)
+
+			_, tipHeight, err := cfStore.ChainTip()
+			require.NoError(t, err)
+			require.Zero(t, tipHeight)
+		})
+	}
+}
+
+type failingWriteStore struct {
+	headerfs.FilterHeaderStore
+}
+
+func (failingWriteStore) WriteHeaders(...headerfs.FilterHeader) error {
+	return errors.New("write failed")
+}
+
+func TestBlockManagerWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	bm, hdrStore, cfStore, err := setupBlockManager(t)
+	require.NoError(t, err)
+
+	genesisBlockHeader, _, err := hdrStore.ChainTip()
+	require.NoError(t, err)
+
+	genesisFilterHeader, _, err := cfStore.ChainTip()
+	require.NoError(t, err)
+
+	headers, err := generateHeaders(genesisBlockHeader, genesisFilterHeader, nil)
+	require.NoError(t, err)
+
+	err = hdrStore.WriteHeaders(headers.blockHeaders[1 : wire.CFCheckptInterval+1]...)
+	require.NoError(t, err)
+
+	bm.cfg.QueryDispatcher.(*mockDispatcher).query = func(requests []*query.Request,
+		options ...query.QueryOption) chan error {
+
+		responses, err := generateResponses([]wire.Message{requests[0].Req}, headers)
+		require.NoError(t, err)
+
+		progress := requests[0].HandleResp(requests[0].Req, responses[0], "")
+		require.True(t, progress.Finished)
+
+		errChan := make(chan error, 1)
+		errChan <- nil
+
+		return errChan
+	}
+
+	require.NotPanics(t, func() {
+		bm.getCheckpointedCFHeaders(headers.checkpoints[:1], failingWriteStore{cfStore}, wire.GCSFilterRegular)
+	})
+}
+
+func TestBlockManagerShortCheckpointList(t *testing.T) {
+	t.Parallel()
+
+	bm, hdrStore, cfStore, err := setupBlockManager(t)
+	require.NoError(t, err)
+
+	genesisBlockHeader, _, err := hdrStore.ChainTip()
+	require.NoError(t, err)
+
+	genesisFilterHeader, _, err := cfStore.ChainTip()
+	require.NoError(t, err)
+
+	headers, err := generateHeaders(genesisBlockHeader, genesisFilterHeader, nil)
+	require.NoError(t, err)
+
+	// The stores must be past the checkpoint list, or the interval subtraction does not wrap.
+	const storeHeight = 3 * wire.CFCheckptInterval
+	err = hdrStore.WriteHeaders(headers.blockHeaders[1 : storeHeight+1]...)
+	require.NoError(t, err)
+
+	err = cfStore.WriteHeaders(headers.cfHeaders[1 : storeHeight+1]...)
+	require.NoError(t, err)
+
+	bm.getCheckpointedCFHeaders(headers.checkpoints[:1], cfStore, wire.GCSFilterRegular)
+
+	_, tipHeight, err := cfStore.ChainTip()
+	require.NoError(t, err)
+	require.EqualValues(t, storeHeight, tipHeight)
+}
+
+func TestBlockManagerGetCheckptsLength(t *testing.T) {
+	t.Parallel()
+
+	bm, _, _, err := setupBlockManager(t)
+	require.NoError(t, err)
+
+	// A stop height inside an interval must not count that interval.
+	const lastHeight = 3*wire.CFCheckptInterval + wire.CFCheckptInterval/2
+	lastHash := chainhash.Hash{1}
+
+	honest := []*chainhash.Hash{{1}, {2}, {3}}
+	replies := map[string][]*chainhash.Hash{
+		"honest:1": honest,
+		"empty:1":  {},
+		"short:1":  {{1}, {2}},
+		"long:1":   {{1}, {2}, {3}, {4}},
+	}
+
+	bm.cfg.queryAllPeers = func(_ wire.Message,
+		checkResponse func(*ServerPeer, wire.Message, chan<- struct{}, chan<- struct{}), _ ...QueryOption) {
+
+		for addr, list := range replies {
+			pp, err := peer.NewOutboundPeer(&peer.Config{}, addr)
+			require.NoError(t, err)
+
+			resp := &wire.MsgCFCheckpt{FilterType: wire.GCSFilterRegular, StopHash: lastHash, FilterHeaders: list}
+			checkResponse(&ServerPeer{Peer: pp}, resp, make(chan struct{}), make(chan struct{}))
+		}
+	}
+
+	var banned []string
+	bm.cfg.BanPeer = func(addr string, reason banman.Reason) error {
+		require.Equal(t, banman.InvalidFilterHeaderCheckpoint, reason)
+		banned = append(banned, addr)
+
+		return nil
+	}
+
+	checkpoints := bm.getCheckpts(&lastHash, lastHeight, wire.GCSFilterRegular)
+	require.Equal(t, map[string][]*chainhash.Hash{"honest:1": honest}, checkpoints)
+	require.ElementsMatch(t, []string{"empty:1", "short:1", "long:1"}, banned)
+}
+
 // buildNonPushScriptFilter creates a CFilter with all output scripts except all
 // OP_RETURNS with push-only scripts.
 //
@@ -945,4 +1194,136 @@ func TestHandleHeaders(t *testing.T) {
 	})
 	bm.handleHeadersMsg(hmsg)
 	assertPeerDisconnected(true)
+}
+
+// peerDisconnected reports whether Disconnect has been called on p by
+// reading the unexported "disconnect" counter, as TestHandleHeaders does.
+func peerDisconnected(p *peer.Peer) bool {
+	return reflect.ValueOf(p).Elem().FieldByName("disconnect").Int() != 0
+}
+
+// TestOnInvDisconnectsTxInv ensures an SPV node disconnects a peer that
+// announces transactions, for either tx inv type, and does not pass the
+// inv on to the block manager.
+func TestOnInvDisconnectsTxInv(t *testing.T) {
+	t.Parallel()
+
+	for _, typ := range []wire.InvType{
+		wire.InvTypeTx,
+		wire.InvTypeWitnessTx,
+	} {
+		t.Run(typ.String(), func(t *testing.T) {
+			t.Parallel()
+
+			bm, _, _, err := setupBlockManager(t)
+			require.NoError(t, err)
+
+			fakePeer, err := peer.NewOutboundPeer(
+				&peer.Config{}, "fake:123",
+			)
+			require.NoError(t, err)
+
+			sp := &ServerPeer{
+				Peer:   fakePeer,
+				server: &ChainService{blockManager: bm},
+			}
+
+			inv := wire.NewMsgInv()
+			require.NoError(t, inv.AddInvVect(
+				wire.NewInvVect(typ, &chainhash.Hash{0x01})))
+			sp.OnInv(fakePeer, inv)
+
+			require.True(t, peerDisconnected(fakePeer))
+			require.Zero(t, len(bm.peerChan))
+		})
+	}
+}
+
+func TestHandleHeadersBansPeerOnInvalidSanity(t *testing.T) {
+	t.Parallel()
+
+	genesis := chaincfg.SimNetParams.GenesisBlock.BlockHeader()
+	connecting := func(mut func(*wire.BlockHeader)) wire.BlockHeader {
+		h := *genesis
+		h.PrevBlock = genesis.BlockHash()
+		h.Timestamp = genesis.Timestamp.Add(time.Second)
+		mut(&h)
+		return h
+	}
+
+	tests := []struct {
+		name       string
+		header     wire.BlockHeader
+		cert       wire.BlockCertificate
+		persistent bool
+		wantBan    bool
+	}{
+		{
+			name: "zero target: ban",
+			header: connecting(func(h *wire.BlockHeader) {
+				h.Bits = 0
+			}),
+			wantBan: true,
+		},
+		{
+			name: "future timestamp: disconnect",
+			header: connecting(func(h *wire.BlockHeader) {
+				h.Timestamp = time.Now().Add(3 * time.Hour).Truncate(time.Second)
+			}),
+			cert:    &wire.CertificateV3{},
+			wantBan: false,
+		},
+		{
+			name: "persistent peer zero target: disconnect",
+			header: connecting(func(h *wire.BlockHeader) {
+				h.Bits = 0
+			}),
+			persistent: true,
+			wantBan:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			bm, _, _, err := setupBlockManager(t)
+			require.NoError(t, err)
+
+			const peerAddr = "127.0.0.1:18333"
+			fakePeer, err := peer.NewOutboundPeer(&peer.Config{}, peerAddr)
+			require.NoError(t, err)
+
+			var (
+				banCalls     int
+				bannedAddr   string
+				bannedReason banman.Reason
+			)
+			bm.cfg.BanPeer = func(addr string, reason banman.Reason) error {
+				banCalls++
+				bannedAddr = addr
+				bannedReason = reason
+				return nil
+			}
+
+			bm.handleHeadersMsg(&headersMsg{
+				headers: &wire.MsgHeaders{
+					Headers: []wire.MsgHeader{{
+						BlockHeader:    tc.header,
+						MsgCertificate: wire.MsgCertificate{Certificate: tc.cert},
+					}},
+				},
+				peer: &ServerPeer{Peer: fakePeer, persistent: tc.persistent},
+			})
+
+			require.True(t, peerDisconnected(fakePeer))
+			if tc.wantBan {
+				require.Equal(t, 1, banCalls)
+				require.Equal(t, peerAddr, bannedAddr)
+				require.Equal(t, banman.InvalidBlock, bannedReason)
+				return
+			}
+			require.Zero(t, banCalls)
+		})
+	}
 }

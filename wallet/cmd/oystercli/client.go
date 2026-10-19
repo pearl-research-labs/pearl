@@ -75,12 +75,20 @@ func traced[T any](c *client, method string, fn func() (T, error)) (T, error) {
 	return v, err
 }
 
-// rawCall invokes a parameterless RPC method and decodes the result into out
-// (skipped when out is nil). It exists for the oyster extension methods that
-// have no typed rpcclient binding.
-func (c *client) rawCall(method string, out interface{}) error {
+// rawCall invokes an RPC method with positional params and decodes the result into out (skipped when out is nil). It
+// exists for the oyster extension methods that have no typed rpcclient binding.
+func (c *client) rawCall(method string, out interface{}, params ...interface{}) error {
+	rawParams := make([]json.RawMessage, 0, len(params))
+	for _, p := range params {
+		raw, err := json.Marshal(p)
+		if err != nil {
+			return err
+		}
+		rawParams = append(rawParams, raw)
+	}
+
 	res, err := traced(c, method, func() (json.RawMessage, error) {
-		return c.rpc.RawRequest(method, nil)
+		return c.rpc.RawRequest(method, rawParams)
 	})
 	if err != nil {
 		return err
@@ -129,6 +137,7 @@ type syncInfo struct {
 	synced     bool
 	height     int32 // wallet height (best effort; 0 when unknown)
 	peerHeight int32 // best known peer height; only meaningful in SPV mode
+	peers      int32 // connected peer count; only meaningful in SPV mode
 	spv        bool  // true when getsyncprogress (SPV detail) was available
 }
 
@@ -141,6 +150,7 @@ func (c *client) fetchSyncInfo() (*syncInfo, error) {
 			synced:     sp.Synced,
 			height:     sp.BlockHeight,
 			peerHeight: sp.BestPeerHeight,
+			peers:      sp.Connections,
 			spv:        true,
 		}, nil
 	}
@@ -244,6 +254,31 @@ func (c *client) transaction(txid string) (*btcjson.GetTransactionResult, error)
 	return traced(c, "gettransaction", func() (*btcjson.GetTransactionResult, error) {
 		return c.rpc.GetTransaction(hash)
 	})
+}
+
+// removeTransaction forgets a pending transaction and its pending dependents
+// on the daemon; the returned hashes are the removed ones, txid first.
+func (c *client) removeTransaction(txid string) ([]string, error) {
+	var res btcjson.RemoveTransactionResult
+	if err := c.rawCall("removetransaction", &res, txid); err != nil {
+		return nil, err
+	}
+	return res.Removed, nil
+}
+
+// rebroadcastTransaction announces a pending transaction again, pending
+// ancestors first; the returned hashes are the ones a peer requested.
+func (c *client) rebroadcastTransaction(txid string) ([]string, error) {
+	var res btcjson.RebroadcastTransactionResult
+	if err := c.rawCall("rebroadcasttransaction", &res, txid); err != nil {
+		return nil, err
+	}
+	return res.Announced, nil
+}
+
+// isNotRelayedError recognizes the fresh-send preflight code, which guarantees no transaction was signed.
+func isNotRelayedError(err error) bool {
+	return isRPCErrorCode(err, btcjson.ErrRPCClientNotConnected)
 }
 
 func (c *client) send(fromAccount, toAddress string, amount btcutil.Amount, feeRatePerKb float64, minConf int) (*chainhash.Hash, error) {

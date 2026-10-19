@@ -5,7 +5,7 @@
 package main
 
 import (
-	"fmt"
+	"slices"
 
 	"charm.land/lipgloss/v2"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
@@ -58,32 +58,11 @@ func overviewScreen(c *client) error {
 	}
 
 	lipgloss.Println(th.title.Render("Recent activity"))
-	// listtransactions returns oldest first; show newest at the top.
-	for i := len(recent) - 1; i >= 0; i-- {
-		lipgloss.Println("  " + txRow(recent[i]))
+	layout := newTxLayout(recent, availableRowWidth(len(overviewIndent)))
+	for _, entry := range slices.Concat(newestFirst(groupTransactions(recent))...) {
+		lipgloss.Println(overviewIndent + txRow(entry, layout))
 	}
 	return nil
 }
 
-// txRow renders one transaction as a compact single line.
-func txRow(tx btcjson.ListTransactionsResult) string {
-	amount := fmtPRLFloat(tx.Amount)
-	var dir string
-	switch tx.Category {
-	case "send":
-		dir = th.bad.Render("▼ sent    ")
-	case "receive":
-		dir = th.good.Render("▲ received")
-	case "generate", "immature":
-		dir = th.accent.Render("◆ mined   ")
-	default:
-		dir = th.subtle.Render("· " + fmt.Sprintf("%-8s", tx.Category))
-	}
-	return fmt.Sprintf("%s  %s  %s  %s  %s",
-		dir,
-		th.value.Render(fmt.Sprintf("%16s", amount)),
-		th.subtle.Render(fmtUnixTime(tx.Time)),
-		th.subtle.Render(fmt.Sprintf("%-12s", fmtConfs(tx.Confirmations))),
-		th.subtle.Render(shortID(tx.TxID, 20)),
-	)
-}
+const overviewIndent = "  "

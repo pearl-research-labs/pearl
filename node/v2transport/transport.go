@@ -73,9 +73,6 @@ var (
 	// more than the maximum content length.
 	errContentLengthExceeded = fmt.Errorf("maximum content length exceeded")
 
-	// errFailedToRecv is returned when a Read call fails.
-	errFailedToRecv = fmt.Errorf("failed to recv data")
-
 	// errGarbageTooLarge is returned if a caller attempts to send garbage
 	// larger than normal.
 	errGarbageTooLarge = fmt.Errorf("garbage too large")
@@ -567,22 +564,7 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 		if bytes.Equal(recvGarbage[recvGarbageLen-16:],
 			p.recvGarbageTerm) {
 
-			log.Debugf("Found garbage terminator after %d total "+
-				"bytes", recvGarbageLen)
-
-			log.Tracef("Processing %d bytes preceding garbage "+
-				"terminator", recvGarbageLen-16)
-
-			// Process any potential packet data sent before the
-			// terminator.
-			_, err = p.V2ReceivePacket(
-				recvGarbage[:recvGarbageLen-16],
-			)
-			if err != nil {
-				log.Errorf("Error processing packet data "+
-					"before garbage terminator: %v", err)
-			}
-			return err
+			return p.processGarbageTerminator(recvGarbage)
 		}
 
 		log.Tracef("Garbage terminator not found, receiving 1 more "+
@@ -598,10 +580,36 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 		recvGarbage = append(recvGarbage, recvData...)
 	}
 
-	log.Warnf("Garbage terminator not received after %d "+
-		"bytes", len(recvGarbage))
+	// The loop checks before each read, so the final byte has not been
+	// checked yet. It completes the terminator when the peer sent the
+	// maximum MaxGarbageLen bytes of garbage.
+	recvGarbageLen := len(recvGarbage)
+	if !bytes.Equal(recvGarbage[recvGarbageLen-16:], p.recvGarbageTerm) {
+		log.Warnf("Garbage terminator not received after %d bytes", recvGarbageLen)
 
-	return errGarbageTermNotRecv
+		return errGarbageTermNotRecv
+	}
+
+	return p.processGarbageTerminator(recvGarbage)
+}
+
+// processGarbageTerminator is called once recvGarbage ends with the peer's
+// garbage terminator. It receives the first packet after the terminator,
+// authenticating the garbage that preceded it.
+func (p *Peer) processGarbageTerminator(recvGarbage []byte) error {
+	recvGarbageLen := len(recvGarbage)
+
+	log.Debugf("Found garbage terminator after %d total bytes", recvGarbageLen)
+
+	log.Tracef("Processing %d bytes preceding garbage terminator", recvGarbageLen-16)
+
+	// V2ReceivePacket authenticates the first packet with this garbage as AAD.
+	_, err := p.V2ReceivePacket(recvGarbage[:recvGarbageLen-16])
+	if err != nil {
+		log.Errorf("Error processing packet data before garbage "+
+			"terminator: %v", err)
+	}
+	return err
 }
 
 // V2EncPacket takes the contents and aad and returns a ciphertext.
@@ -784,42 +792,25 @@ func (p *Peer) Send(data []byte) (int, error) {
 	return n, err
 }
 
-// Receive receives numBytes bytes from the underlying connection.
+// Receive receives numBytes bytes from the underlying connection. The buffer
+// grows with the bytes that arrive rather than being sized to numBytes up
+// front, since numBytes may come from an unauthenticated length field.
 func (p *Peer) Receive(numBytes int) ([]byte, int, error) {
-	b := make([]byte, numBytes)
-	index := 0
-	total := 0
-
 	log.Tracef("Attempting to receive %d bytes", numBytes)
 
-	for {
-		// TODO: Use something that inherently prevents going over?
-		if total > numBytes {
-			// This should be logically impossible with io.ReadFull
-			// semantics used implicitly by the loop structure.
-			log.Criticalf("Receive logic error: total=%d > "+
-				"numBytes=%d", total, numBytes)
-			return nil, total, errFailedToRecv
-		}
-
-		if total == numBytes {
-			log.Tracef("Successfully received %d bytes", total)
-			return b, total, nil
-		}
-
-		log.Tracef("Calling Read (need %d bytes, have "+
-			"%d)", numBytes-total, total)
-
-		n, err := p.rw.Read(b[index:])
-		if err != nil {
-			log.Errorf("Receive failed after reading %d bytes "+
-				"(target %d): %v", total+n, numBytes, err)
-			return nil, total, err
-		}
-
-		log.Tracef("Read returned %d bytes", n)
-
-		total += n
-		index += n
+	b, err := io.ReadAll(io.LimitReader(p.rw, int64(numBytes)))
+	// ReadAll doesn't consider EOF as an error; check no premature EOF.
+	if err == nil && len(b) < numBytes {
+		err = io.EOF
 	}
+
+	if err != nil {
+		log.Errorf("Receive failed after reading %d bytes (target %d): %v", len(b), numBytes, err)
+
+		return nil, len(b), err
+	}
+
+	log.Tracef("Successfully received %d bytes", numBytes)
+
+	return b, numBytes, nil
 }

@@ -7,13 +7,66 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/pearl-research-labs/pearl/spv/headerfs"
+	"github.com/pearl-research-labs/pearl/spv/pushtx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // maxDur is the max duration a test has to execute successfully.
 var maxDur = 5 * time.Second
+
+// verdictChainService is a mockChainService whose broadcasts all end in verdict.
+type verdictChainService struct {
+	*mockChainService
+
+	verdict *pushtx.BroadcastError
+}
+
+func (m *verdictChainService) SendTransaction(*wire.MsgTx) error {
+	return m.verdict
+}
+
+// TestNeutrinoClientSendRawTransactionVerdicts pins how the peer verdicts the wallet branches on reach it. The mempool
+// case uses bitcoind's reject wording, which no string map knows, so only its code can identify it.
+func TestNeutrinoClientSendRawTransactionVerdicts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		verdict *pushtx.BroadcastError
+		wantErr error
+		wantMsg string
+	}{
+		{
+			name:    "not relayed keeps the reason",
+			verdict: &pushtx.BroadcastError{Code: pushtx.NotRelayed, Reason: "no connected peers to relay transaction"},
+			wantErr: ErrTxNotRelayed,
+			wantMsg: "no connected peers",
+		},
+		{
+			name:    "already in mempool",
+			verdict: &pushtx.BroadcastError{Code: pushtx.Mempool, Reason: "rejected by peer: txn-already-in-mempool"},
+			wantErr: ErrTxAlreadyInMempool,
+			wantMsg: "already in mempool",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			nc := newMockNeutrinoClient()
+			nc.CS = &verdictChainService{mockChainService: &mockChainService{}, verdict: tt.verdict}
+
+			hash, err := nc.SendRawTransaction(wire.NewMsgTx(wire.TxVersion), false)
+			assert.Nil(t, hash)
+			assert.ErrorIs(t, err, tt.wantErr)
+			assert.ErrorContains(t, err, tt.wantMsg)
+		})
+	}
+}
 
 // TestNeutrinoClientSequentialStartStop ensures that the client
 // can sequentially Start and Stop without errors or races.
@@ -215,4 +268,72 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 
 		require.Equal(t, wantMsgs, gotMsgs)
 	}
+}
+
+// advanceableChainService is a mock chain service whose best block the test
+// can advance without a BlockConnected notification.
+type advanceableChainService struct {
+	mockChainService
+
+	mu        sync.Mutex
+	bestBlock *headerfs.BlockStamp
+}
+
+func (m *advanceableChainService) BestBlock() (*headerfs.BlockStamp, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bs := *m.bestBlock
+	return &bs, nil
+}
+
+func (m *advanceableChainService) setBestBlock(bs *headerfs.BlockStamp) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bestBlock = bs
+}
+
+// TestNeutrinoClientBlockStampTracksChainService checks that BlockStamp
+// tracks the chain service tip with no BlockConnected notification (#322).
+func TestNeutrinoClientBlockStampTracksChainService(t *testing.T) {
+	stampAt := func(h int32) *headerfs.BlockStamp {
+		var hash chainhash.Hash
+		hash[0] = byte(h)
+		hash[1] = byte(h >> 8)
+		return &headerfs.BlockStamp{
+			Height:    h,
+			Hash:      hash,
+			Timestamp: time.Unix(int64(600*h), 0),
+		}
+	}
+
+	svc := &advanceableChainService{bestBlock: stampAt(100)}
+	nc := newMockNeutrinoClient()
+	nc.CS = svc
+
+	require.NoError(t, nc.Start(t.Context()))
+	defer func() {
+		nc.Stop()
+		nc.WaitForShutdown()
+	}()
+
+	bs, err := nc.BlockStamp()
+	require.NoError(t, err)
+	require.Equal(t, int32(100), bs.Height)
+	require.Equal(t, stampAt(100).Hash, bs.Hash)
+
+	svc.setBestBlock(stampAt(105))
+
+	require.Eventually(t, func() bool {
+		bs, err := nc.BlockStamp()
+		if err != nil {
+			return false
+		}
+		return bs.Height == 105 && bs.Hash == stampAt(105).Hash
+	}, maxDur, 10*time.Millisecond,
+		"BlockStamp did not advance with the chain service tip")
+
+	nc.Stop()
+	nc.WaitForShutdown()
+	_, err = nc.BlockStamp()
+	require.ErrorContains(t, err, "disconnected")
 }

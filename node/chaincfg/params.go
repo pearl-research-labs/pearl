@@ -342,17 +342,10 @@ var MainNetParams = Params{
 	Name:        "mainnet",
 	Net:         wire.MainNet,
 	DefaultPort: "44108",
-	// Both seed families are listed while the seeders migrate. The
-	// pearlresearch.ai names must stay until the nodes already deployed
-	// against them are retired, or those nodes lose their only way to
-	// bootstrap.
 	DNSSeeds: []DNSSeed{
 		{"reef.seeder.pearlnetwork.net", false},
 		{"tide.seeder.pearlnetwork.net", false},
 		{"stream.seeder.pearlnetwork.net", false},
-		{"seeder1.pearlresearch.ai", false},
-		{"seeder2.pearlresearch.ai", false},
-		{"seeder3.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
@@ -393,6 +386,7 @@ var MainNetParams = Params{
 		{90000, newHashFromStr("0738b30bb353820a4f97331d805d134de4321a5fc5c8b2955988e7291a0c8562")},
 		{100000, newHashFromStr("ca8d5f604a9021e538f31472d9a9641c7bc46a6b8d591748e2869429571edbfb")},
 		{110000, newHashFromStr("c119b81da722428e61dcda4ec1d6a2a56e6e40acb29592d11081538ab3d50630")},
+		{120000, newHashFromStr("a5f57e441de1da43a27b4bee471c7a7bdd8e36664050385bf0a1b760d2a84b7d")},
 	},
 
 	// Consensus rule change deployments.
@@ -560,9 +554,6 @@ var TestNetParams = Params{
 		{"reef.seeder.testnet.pearlnetwork.net", false},
 		{"tide.seeder.testnet.pearlnetwork.net", false},
 		{"stream.seeder.testnet.pearlnetwork.net", false},
-		{"seeder1.internal.pearlresearch.ai", false},
-		{"seeder2.internal.pearlresearch.ai", false},
-		{"seeder3.internal.pearlresearch.ai", false},
 	},
 
 	// Chain parameters
@@ -659,9 +650,6 @@ var TestNet2Params = Params{
 		{"reef.seeder.testnet2.pearlnetwork.net", false},
 		{"tide.seeder.testnet2.pearlnetwork.net", false},
 		{"stream.seeder.testnet2.pearlnetwork.net", false},
-		{"seeder1.testnet.pearlresearch.ai", false},
-		{"seeder2.testnet.pearlresearch.ai", false},
-		{"seeder3.testnet.pearlresearch.ai", false},
 	},
 
 	// Chain parameters

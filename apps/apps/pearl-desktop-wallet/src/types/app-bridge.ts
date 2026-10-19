@@ -41,9 +41,17 @@ interface WalletApi {
 
   sendFromDefaultAccount: (toAddress: string, amount: number, feeRate: number) => Promise<string>;
 
+  // Never call without the user's explicit confirmation: a peer may already
+  // hold the transaction, so spending its freed inputs is a double spend.
+  removeTransaction: (txid: string) => Promise<string[]>;
+
+  rebroadcastTransaction: (txid: string) => Promise<string[]>;
+
   listAllTransactions: () => Promise<Transaction[]>;
 
   listTransactions: (count?: number, from?: number) => Promise<Transaction[]>;
+
+  listRecentTransactions: (count: number) => Promise<Transaction[]>;
 
   getBalance: (account?: string, minconf?: number) => Promise<number>;
 
@@ -51,6 +59,17 @@ interface WalletApi {
 
   estimateFee: (numBlocks: number) => Promise<number>;
 }
+
+interface WalletSendError {
+  code?: number;
+  message: string;
+}
+
+type WalletSendResult = {ok: true; txid: string} | {ok: false; error: WalletSendError};
+
+type WalletBridgeApi = Omit<WalletApi, 'sendFromDefaultAccount'> & {
+  sendFromDefaultAccount: (...args: Parameters<WalletApi['sendFromDefaultAccount']>) => Promise<WalletSendResult>;
+};
 
 interface ManagerApi {
   getWalletsStats: () => { name?: string };
@@ -153,10 +172,25 @@ interface SyncApi {
 
 interface AppBridge {
   window: Ipc<WindowApi>;
-  wallet: Ipc<WalletApi>;
+  wallet: Ipc<WalletBridgeApi>;
   manager: Ipc<ManagerApi>;
   sync: Ipc<SyncApi>;
   update: UpdateApi;
 }
 
-export type { AppBridge, WindowApi, WalletApi, ManagerApi, SyncApi, SyncProgress, SyncPhase, UpdateApi, UpdateStatus, UpdateSeverity, Ipc };
+export type {
+  AppBridge,
+  WindowApi,
+  WalletApi,
+  WalletBridgeApi,
+  WalletSendError,
+  WalletSendResult,
+  ManagerApi,
+  SyncApi,
+  SyncProgress,
+  SyncPhase,
+  UpdateApi,
+  UpdateStatus,
+  UpdateSeverity,
+  Ipc,
+};

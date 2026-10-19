@@ -10,6 +10,9 @@
 // answered with `getheaders` first; once the peer has supplied a
 // tip-extending block (peerQualityCounter resets to 0), subsequent
 // block invs must be answered with `getdata` directly.
+//
+// The same scripted peer also withholds a requested block: the victim
+// must drop it and fetch the block from an honest node.
 
 package integration
 
@@ -198,6 +201,25 @@ func setupPeerQuality(t *testing.T) (*rpctest.Harness, *scriptedPeer) {
 		sp.Disconnect()
 		sp.WaitForDisconnect()
 	})
+
+	// The scripted peer's verack only means its own handshake finished.
+	// The victim registers the peer on its handler after that, and
+	// handleInvMsg drops an inv that arrives first.
+	local := sp.LocalAddr().String()
+	require.Eventually(t, func() bool {
+		peers, err := victim.Client.GetPeerInfo()
+		if err != nil {
+			return false
+		}
+		for _, p := range peers {
+			if p.Addr == local {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 10*time.Millisecond,
+		"setupPeerQuality: victim did not register the scripted peer")
+
 	sp.drain()
 	return victim, sp
 }
@@ -231,16 +253,23 @@ func blockOnVictimTip(t *testing.T, victim *rpctest.Harness) *btcutil.Block {
 // getdata.
 func TestPeerQualityInvGating(t *testing.T) {
 	t.Run("low_quality_peer_inv_triggers_getheaders", func(t *testing.T) {
-		_, sp := setupPeerQuality(t)
+		for _, typ := range []wire.InvType{
+			wire.InvTypeBlock,
+			wire.InvTypeWitnessBlock,
+		} {
+			t.Run(typ.String(), func(t *testing.T) {
+				_, sp := setupPeerQuality(t)
 
-		bogus := chainhash.Hash{0xab, 0xcd, 0xef}
-		inv := wire.NewMsgInv()
-		require.NoError(t, inv.AddInvVect(
-			wire.NewInvVect(wire.InvTypeBlock, &bogus)))
-		sp.QueueMessage(inv, nil)
+				bogus := chainhash.Hash{0xab, 0xcd, 0xef}
+				inv := wire.NewMsgInv()
+				require.NoError(t, inv.AddInvVect(
+					wire.NewInvVect(typ, &bogus)))
+				sp.QueueMessage(inv, nil)
 
-		sp.expectCertlessGetHeaders(t)
-		sp.assertQuiet(t)
+				sp.expectCertlessGetHeaders(t)
+				sp.assertQuiet(t)
+			})
+		}
 	})
 
 	t.Run("high_quality_peer_inv_triggers_getdata", func(t *testing.T) {
@@ -292,4 +321,119 @@ func TestPeerQualityInvGating(t *testing.T) {
 		sp.expectGetDataFor(t, &blockBHash)
 		sp.assertQuiet(t)
 	})
+}
+
+// The victim drops a peer that withholds a requested block once
+// blockDeliveryTimeout (30s) has passed, checked every
+// stallSampleInterval (30s); the rest is slack for a loaded machine.
+const withheldBlockDisconnectBudget = 90 * time.Second
+
+// pinBlockWithEmptyNotFound has an inbound attacker get the victim to
+// request the next block and answer with an empty notfound, then gives
+// that block to an honest node the victim is connected to. While the
+// request stays with the attacker, the victim skips the honest node's
+// announcement of the block.
+func pinBlockWithEmptyNotFound(t *testing.T) (
+	victim, honest *rpctest.Harness, attacker *scriptedPeer, requested time.Time,
+) {
+	t.Helper()
+
+	victim, attacker = setupPeerQuality(t)
+
+	honest, err := rpctest.New(&chaincfg.SimNetParams, nil, nil, "")
+	require.NoError(t, err)
+	require.NoError(t, honest.SetUp(true, 0))
+	t.Cleanup(func() { require.NoError(t, honest.TearDown()) })
+
+	require.NoError(t, rpctest.ConnectNode(victim, honest))
+	victimTip, _, err := victim.Client.GetBestBlock()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		tip, _, err := honest.Client.GetBestBlock()
+		return err == nil && tip.IsEqual(victimTip)
+	}, time.Minute, 100*time.Millisecond, "honest node did not sync the victim's tip")
+
+	withheld := blockOnVictimTip(t, victim)
+	attacker.drain()
+
+	inv := wire.NewMsgInv()
+	require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeWitnessBlock, withheld.Hash())))
+	attacker.QueueMessage(inv, nil)
+	attacker.expectCertlessGetHeaders(t)
+
+	headers := wire.NewMsgHeaders()
+	require.NoError(t, headers.AddBlockHeader(*withheld.MsgBlock().BlockHeader(), nil))
+	attacker.QueueMessage(headers, nil)
+	attacker.expectGetDataFor(t, withheld.Hash())
+	requested = time.Now()
+	attacker.QueueMessage(wire.NewMsgNotFound(), nil)
+
+	require.NoError(t, honest.Client.SubmitBlock(withheld, nil))
+	return victim, honest, attacker, requested
+}
+
+func requireDroppedWithinBudget(t *testing.T, attacker *scriptedPeer, requested time.Time) {
+	t.Helper()
+
+	disconnected := make(chan struct{})
+	go func() {
+		attacker.WaitForDisconnect()
+		close(disconnected)
+	}()
+	select {
+	case <-disconnected:
+		t.Logf("victim dropped the attacker %v after requesting the block", time.Since(requested))
+	case <-time.After(time.Until(requested.Add(withheldBlockDisconnectBudget))):
+		t.Fatal("victim kept the block request with a peer that withholds it")
+	}
+}
+
+func requireHeight(t *testing.T, node *rpctest.Harness, height int32, within time.Duration, msg string) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		_, best, err := node.Client.GetBestBlock()
+		return err == nil && best >= height
+	}, within, 100*time.Millisecond, msg)
+}
+
+func requireNotPenalized(t *testing.T, honest *rpctest.Harness) {
+	t.Helper()
+
+	peers, err := honest.Client.GetPeerInfo()
+	require.NoError(t, err)
+	require.Len(t, peers, 1)
+	require.Zero(t, peers[0].BanScore, "serving the victim's block requests must not count against it")
+}
+
+// TestEmptyNotFoundDoesNotPinBlockRequest covers the advisory's attack:
+// an inbound peer gets the victim to request a block and answers with
+// an empty notfound, so the victim skips honest announcements of that
+// block. The victim must drop the peer within the delivery timeout and
+// then fetch the block from the honest node that announced it, without
+// waiting for another block.
+func TestEmptyNotFoundDoesNotPinBlockRequest(t *testing.T) {
+	victim, honest, attacker, requested := pinBlockWithEmptyNotFound(t)
+
+	requireDroppedWithinBudget(t, attacker, requested)
+	requireHeight(t, victim, 2, 10*time.Second, "victim did not fetch the withheld block from its announcer")
+	requireNotPenalized(t, honest)
+}
+
+// TestOrphanFetchesBlockWithheldByAnotherPeer pins that a child of the
+// withheld block lets the victim fetch it from the child's sender at
+// once, without waiting for the withholding peer to be dropped.
+func TestOrphanFetchesBlockWithheldByAnotherPeer(t *testing.T) {
+	victim, honest, attacker, requested := pinBlockWithEmptyNotFound(t)
+
+	_, err := honest.Client.Generate(1)
+	require.NoError(t, err)
+	// The attacker cannot be dropped before blockDeliveryTimeout (30s)
+	// after the request, so recovering within this window proves the
+	// block arrived while the attacker still held its request.
+	requireHeight(t, victim, 3, 20*time.Second, "victim did not fetch the withheld block from the child's sender")
+	require.True(t, attacker.Connected(), "the attacker was dropped for another reason")
+
+	requireDroppedWithinBudget(t, attacker, requested)
+	requireNotPenalized(t, honest)
 }

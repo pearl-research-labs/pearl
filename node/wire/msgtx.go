@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 
@@ -104,12 +105,12 @@ const (
 	// (witness bytes count as 1/4 their actual size), a transaction with max
 	// vsize of 1,000,000 could theoretically contain up to 4,000,000 bytes of
 	// witness data.
-	maxWitnessItemsPerInput = 4_000_000
+	maxWitnessItemsPerInput = MaxBlockPayload
 
 	// maxWitnessItemSize is the maximum allowed size for an item within
 	// an input's witness data. This value is bounded by the largest
 	// possible block vsize, post segwit v1 (taproot).
-	maxWitnessItemSize = 4_000_000
+	maxWitnessItemSize = MaxBlockPayload
 )
 
 var (
@@ -480,6 +481,10 @@ func (msg *MsgTx) Copy() *MsgTx {
 // This is part of the Message interface implementation.
 // See Deserialize for decoding transactions stored to disk, such as in a
 // database, as opposed to decoding transactions from the wire.
+//
+// Input, output and witness item counts that cannot fit in the unread bytes of r are rejected before any memory is
+// allocated for them. This bound applies only when r reports its unread length through a Len method, as *bytes.Buffer,
+// *bytes.Reader and *strings.Reader do. Counts read from any other reader are limited only by the message size limits.
 func (msg *MsgTx) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) error {
 	buf := binarySerializer.Borrow()
 	defer binarySerializer.Return(buf)
@@ -491,9 +496,7 @@ func (msg *MsgTx) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) error
 	return err
 }
 
-func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
-	buf, sbuf []byte) error {
-
+func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding, buf, sbuf []byte) error {
 	if _, err := io.ReadFull(r, buf[:4]); err != nil {
 		return err
 	}
@@ -504,38 +507,41 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
 		return err
 	}
 
-	// A count of zero (meaning no TxIn's to the uninitiated) means that the
-	// value is a TxFlagMarker, and hence indicates the presence of a flag.
+	// A count of zero (meaning no TxIn's to the uninitiated) means that the value is a TxFlagMarker, and hence
+	// indicates the presence of a flag.
 	var flag [1]TxFlag
 	if count == TxFlagMarker && enc == WitnessEncoding {
-		// The count varint was in fact the flag marker byte. Next, we need to
-		// read the flag value, which is a single byte.
+		// The count varint was in fact the flag marker byte. Next, we need to read the flag value, which is a single byte.
 		if _, err = io.ReadFull(r, flag[:]); err != nil {
 			return err
 		}
 
-		// At the moment, the flag MUST be WitnessFlag (0x01). In the future
-		// other flag types may be supported.
+		// At the moment, the flag MUST be WitnessFlag (0x01). In the future other flag types may be supported.
 		if flag[0] != WitnessFlag {
 			str := fmt.Sprintf("witness tx but flag byte is %x", flag)
 			return messageError("MsgTx.PrlDecode", str)
 		}
 
-		// With the Segregated Witness specific fields decoded, we can
-		// now read in the actual txin count.
+		// With the Segregated Witness specific fields decoded, we can now read in the actual txin count.
 		count, err = ReadVarIntBuf(r, pver, buf)
 		if err != nil {
 			return err
 		}
 	}
 
-	// Prevent more input transactions than could possibly fit into a
-	// message.  It would be possible to cause memory exhaustion and panics
-	// without a sane upper bound on this count.
+	// Prevent more input transactions than could possibly fit into a message.  It would be possible to cause memory
+	// exhaustion and panics without a sane upper bound on this count.
 	if count > uint64(maxTxInPerMessage) {
-		str := fmt.Sprintf("too many input transactions to fit into "+
-			"max message size [count %d, max %d]", count,
-			maxTxInPerMessage)
+		str := fmt.Sprintf("too many input transactions to fit into max message size [count %d, max %d]",
+			count, maxTxInPerMessage)
+		return messageError("MsgTx.PrlDecode", str)
+	}
+
+	// The count sizes the allocation below, so also reject a count whose inputs cannot fit in the unread payload.
+	// Each input takes at least minTxInPayload bytes, so this never rejects a valid transaction.
+	if maxCount := uint64(unreadBytes(r) / minTxInPayload); count > maxCount {
+		str := fmt.Sprintf("too many input transactions for remaining payload [count %d, max %d]",
+			count, maxCount)
 		return messageError("MsgTx.PrlDecode", str)
 	}
 
@@ -544,8 +550,7 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
 	txIns := make([]TxIn, count)
 	msg.TxIn = make([]*TxIn, count)
 	for i := uint64(0); i < count; i++ {
-		// The pointer is set now in case a script buffer is borrowed
-		// and needs to be returned to the pool on error.
+		// The pointer is set now in case a script buffer is borrowed and needs to be returned to the pool on error.
 		ti := &txIns[i]
 		msg.TxIn[i] = ti
 		err = readTxInBuf(r, pver, msg.Version, ti, buf, sbuf)
@@ -561,13 +566,18 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
 		return err
 	}
 
-	// Prevent more output transactions than could possibly fit into a
-	// message.  It would be possible to cause memory exhaustion and panics
-	// without a sane upper bound on this count.
+	// Prevent more output transactions than could possibly fit into a message.  It would be possible to cause memory
+	// exhaustion and panics without a sane upper bound on this count.
 	if count > uint64(maxTxOutPerMessage) {
-		str := fmt.Sprintf("too many output transactions to fit into "+
-			"max message size [count %d, max %d]", count,
-			maxTxOutPerMessage)
+		str := fmt.Sprintf("too many output transactions to fit into max message size [count %d, max %d]",
+			count, maxTxOutPerMessage)
+		return messageError("MsgTx.PrlDecode", str)
+	}
+
+	// As for the inputs, each output takes at least MinTxOutPayload bytes of the unread payload.
+	if maxCount := uint64(unreadBytes(r) / MinTxOutPayload); count > maxCount {
+		str := fmt.Sprintf("too many output transactions for remaining payload [count %d, max %d]",
+			count, maxCount)
 		return messageError("MsgTx.PrlDecode", str)
 	}
 
@@ -575,8 +585,7 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
 	txOuts := make([]TxOut, count)
 	msg.TxOut = make([]*TxOut, count)
 	for i := uint64(0); i < count; i++ {
-		// The pointer is set now in case a script buffer is borrowed
-		// and needs to be returned to the pool on error.
+		// The pointer is set now in case a script buffer is borrowed and needs to be returned to the pool on error.
 		to := &txOuts[i]
 		msg.TxOut[i] = to
 		err = readTxOutBuf(r, pver, msg.Version, to, buf, sbuf)
@@ -587,35 +596,38 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
 		sbuf = sbuf[len(to.PkScript):]
 	}
 
-	// If the transaction's flag byte isn't 0x00 at this point, then one or
-	// more of its inputs has accompanying witness data.
+	// If the transaction's flag byte isn't 0x00 at this point, then one or more of its inputs has accompanying witness data.
 	if flag[0] != 0 && enc == WitnessEncoding {
-		for _, txin := range msg.TxIn {
-			// For each input, the witness is encoded as a stack
-			// with one or more items. Therefore, we first read a
+		for txInIndex, txin := range msg.TxIn {
+			// For each input, the witness is encoded as a stack with one or more items. Therefore, we first read a
 			// varint which encodes the number of stack items.
 			witCount, err := ReadVarIntBuf(r, pver, buf)
 			if err != nil {
 				return err
 			}
 
-			// Prevent a possible memory exhaustion attack by
-			// limiting the witCount value to a sane upper bound.
+			// Prevent a possible memory exhaustion attack by limiting the witCount value to a sane upper bound.
 			if witCount > maxWitnessItemsPerInput {
-				str := fmt.Sprintf("too many witness items to fit "+
-					"into max message size [count %d, max %d]",
+				str := fmt.Sprintf("too many witness items to fit into max message size [count %d, max %d]",
 					witCount, maxWitnessItemsPerInput)
 				return messageError("MsgTx.PrlDecode", str)
 			}
 
-			// Then for witCount number of stack items, each item
-			// has a varint length prefix, followed by the witness
+			// Each item takes at least one byte, its length prefix, so the items must fit in the unread bytes that
+			// remain after one witness count byte per later input and the 4-byte lock time that ends the transaction.
+			laterInputs := len(msg.TxIn) - txInIndex - 1
+			trailingBytes := laterInputs + 4
+			if maxCount := uint64(max(unreadBytes(r)-trailingBytes, 0)); witCount > maxCount {
+				str := fmt.Sprintf("too many witness items for remaining payload [count %d, max %d]",
+					witCount, maxCount)
+				return messageError("MsgTx.PrlDecode", str)
+			}
+
+			// Then for witCount number of stack items, each item has a varint length prefix, followed by the witness
 			// item itself.
 			txin.Witness = make([][]byte, witCount)
 			for j := uint64(0); j < witCount; j++ {
-				txin.Witness[j], err = readScriptBuf(
-					r, pver, buf, sbuf, "script witness item",
-				)
+				txin.Witness[j], err = readScriptBuf(r, pver, buf, sbuf, "script witness item")
 				if err != nil {
 					return err
 				}
@@ -624,8 +636,7 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
 			}
 		}
 
-		// Check that if the witness flag is set that we actually have
-		// witnesses. This check is also done by bitcoind.
+		// Check that if the witness flag is set that we actually have witnesses. This check is also done by bitcoind.
 		if !msg.HasWitness() {
 			return errSuperfluousWitnessRecord
 		}
@@ -636,44 +647,34 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
 	}
 	msg.LockTime = littleEndian.Uint32(buf[:4])
 
-	// Create a single allocation to house all of the scripts and set each
-	// input signature script and output public key script to the
-	// appropriate subslice of the overall contiguous buffer.  Then, return
-	// each individual script buffer back to the pool so they can be reused
-	// for future deserializations.  This is done because it significantly
-	// reduces the number of allocations the garbage collector needs to
-	// track, which in turn improves performance and drastically reduces the
-	// amount of runtime overhead that would otherwise be needed to keep
-	// track of millions of small allocations.
+	// Create a single allocation to house all of the scripts and set each input signature script and output public key
+	// script to the appropriate subslice of the overall contiguous buffer.  Then, return each individual script buffer
+	// back to the pool so they can be reused for future deserializations.  This is done because it significantly
+	// reduces the number of allocations the garbage collector needs to track, which in turn improves performance and
+	// drastically reduces the amount of runtime overhead that would otherwise be needed to keep track of millions of
+	// small allocations.
 	//
-	// NOTE: It is no longer valid to call the returnScriptBuffers closure
-	// after these blocks of code run because it is already done and the
-	// scripts in the transaction inputs and outputs no longer point to the
-	// buffers.
+	// NOTE: It is no longer valid to call the returnScriptBuffers closure after these blocks of code run because it is
+	// already done and the scripts in the transaction inputs and outputs no longer point to the buffers.
 	var offset uint64
 	scripts := make([]byte, totalScriptSize)
 	for i := 0; i < len(msg.TxIn); i++ {
-		// Copy the signature script into the contiguous buffer at the
-		// appropriate offset.
+		// Copy the signature script into the contiguous buffer at the appropriate offset.
 		signatureScript := msg.TxIn[i].SignatureScript
 		copy(scripts[offset:], signatureScript)
 
-		// Reset the signature script of the transaction input to the
-		// slice of the contiguous buffer where the script lives.
+		// Reset the signature script of the transaction input to the slice of the contiguous buffer where the script lives.
 		scriptSize := uint64(len(signatureScript))
 		end := offset + scriptSize
 		msg.TxIn[i].SignatureScript = scripts[offset:end:end]
 		offset += scriptSize
 
 		for j := 0; j < len(msg.TxIn[i].Witness); j++ {
-			// Copy each item within the witness stack for this
-			// input into the contiguous buffer at the appropriate
-			// offset.
+			// Copy each item within the witness stack for this input into the contiguous buffer at the appropriate offset.
 			witnessElem := msg.TxIn[i].Witness[j]
 			copy(scripts[offset:], witnessElem)
 
-			// Reset the witness item within the stack to the slice
-			// of the contiguous buffer where the witness lives.
+			// Reset the witness item within the stack to the slice of the contiguous buffer where the witness lives.
 			witnessElemSize := uint64(len(witnessElem))
 			end := offset + witnessElemSize
 			msg.TxIn[i].Witness[j] = scripts[offset:end:end]
@@ -681,13 +682,11 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding,
 		}
 	}
 	for i := 0; i < len(msg.TxOut); i++ {
-		// Copy the public key script into the contiguous buffer at the
-		// appropriate offset.
+		// Copy the public key script into the contiguous buffer at the appropriate offset.
 		pkScript := msg.TxOut[i].PkScript
 		copy(scripts[offset:], pkScript)
 
-		// Reset the public key script of the transaction output to the
-		// slice of the contiguous buffer where the script lives.
+		// Reset the public key script of the transaction output to the slice of the contiguous buffer where the script lives.
 		scriptSize := uint64(len(pkScript))
 		end := offset + scriptSize
 		msg.TxOut[i].PkScript = scripts[offset:end:end]
@@ -885,6 +884,16 @@ func (msg *MsgTx) SerializeSizeStripped() int {
 	return msg.baseSize()
 }
 
+// encodedSize returns the number of bytes it would take to serialize the
+// transaction with the given encoding.
+func (msg *MsgTx) encodedSize(enc MessageEncoding) int {
+	if enc == BaseEncoding {
+		return msg.SerializeSizeStripped()
+	}
+
+	return msg.SerializeSize()
+}
+
 // Command returns the protocol command string for the message.  This is part
 // of the Message interface implementation.
 func (msg *MsgTx) Command() string {
@@ -1006,6 +1015,24 @@ func writeOutPointBuf(w io.Writer, pver uint32, version int32, op *OutPoint,
 	littleEndian.PutUint32(buf[:4], op.Index)
 	_, err = w.Write(buf[:4])
 	return err
+}
+
+// lenReader is a reader that reports how many bytes it has not yet returned, as *bytes.Buffer, *bytes.Reader and
+// *strings.Reader do.
+type lenReader interface {
+	io.Reader
+	Len() int
+}
+
+// unreadBytes returns how many bytes of r have not been read yet. It returns math.MaxInt, which bounds nothing, when r
+// does not report its unread length.
+func unreadBytes(r io.Reader) int {
+	lr, ok := r.(lenReader)
+	if !ok {
+		return math.MaxInt
+	}
+
+	return lr.Len()
 }
 
 // readScript reads a variable length byte array that represents a transaction

@@ -76,6 +76,9 @@ var (
 	ErrInvalidPrevOutNonWitnessTransaction = errors.New("Prevout hash " +
 		"does not match the provided non-witness utxo serialization")
 
+	// ErrInvalidNonWitnessUtxoIndex is returned when PreviousOutPoint.Index is outside NonWitnessUtxo.TxOut.
+	ErrInvalidNonWitnessUtxoIndex = errors.New("input specifies output index that does not exist")
+
 	// ErrInvalidSignatureForInput indicates that the signature the user is
 	// trying to append to the PSBT is invalid, either because it does
 	// not correspond to the previous transaction hash, or redeem script,
@@ -492,16 +495,23 @@ func (p *Packet) IsComplete() bool {
 	return true
 }
 
-// SanityCheck checks conditions on a PSBT to ensure that it obeys the
-// rules of BIP174, and returns true if so, false if not.
+// SanityCheck checks conditions on a PSBT to ensure that it obeys the rules of BIP174, and returns
+// true if so, false if not.
 func (p *Packet) SanityCheck() error {
 	if !validateUnsignedTX(p.UnsignedTx) {
 		return ErrInvalidRawTxSigned
 	}
 
-	for _, tin := range p.Inputs {
+	for i, tin := range p.Inputs {
 		if !tin.IsSane() {
 			return ErrInvalidPsbtFormat
+		}
+		if tin.NonWitnessUtxo == nil || i >= len(p.UnsignedTx.TxIn) {
+			continue
+		}
+		opIdx := p.UnsignedTx.TxIn[i].PreviousOutPoint.Index
+		if _, err := NonWitnessUtxoOutput(tin.NonWitnessUtxo, opIdx); err != nil {
+			return err
 		}
 	}
 

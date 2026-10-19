@@ -129,6 +129,16 @@ func TestMiscErrors(t *testing.T) {
 			"%v (%[1]T), want %T", err, wantErr)
 		return
 	}
+
+	// Force an error in Request.UnmarshalJSON by giving it a JSON null,
+	// which is not a request object.
+	var request btcjson.Request
+	err = json.Unmarshal([]byte("null"), &request)
+	if jerr, ok := err.(btcjson.Error); !ok || jerr.ErrorCode != wantErr.ErrorCode {
+		t.Errorf("Request.UnmarshalJSON: did not receive expected error - "+
+			"got %v (%[1]T), want %v (%[2]T)", err, wantErr)
+		return
+	}
 }
 
 // TestRPCError tests the error output for the RPCError type.

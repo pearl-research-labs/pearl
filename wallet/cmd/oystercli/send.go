@@ -21,9 +21,8 @@ import (
 // an empty fee field selects.
 const minRelayFeeRate = 1e-5
 
-// sendScreen walks through paying a single recipient: pick the source
-// account, enter and validate the destination and amount, review a summary,
-// then sign and broadcast (unlocking on demand).
+// sendScreen walks through paying a single recipient: pick the source account, enter and validate the destination and
+// amount, review a summary, then sign and broadcast (unlocking on demand).
 func sendScreen(c *client) error {
 	accounts, err := c.listAccounts(1)
 	if err != nil {
@@ -74,7 +73,8 @@ func sendScreen(c *client) error {
 						return err
 					}
 					if amt > accounts[fromAccount] {
-						return fmt.Errorf("exceeds spendable balance (%s)", fmtPRL(accounts[fromAccount]))
+						return fmt.Errorf("exceeds spendable balance (%s)",
+							fmtPRL(accounts[fromAccount]))
 					}
 					return nil
 				}).
@@ -110,45 +110,64 @@ func sendScreen(c *client) error {
 		{"Network", c.cfg.activeNet.Params.Name},
 	}))
 
-	// Default to Send: this confirm is the final step of a transaction the
-	// user just built and reviewed, so Enter should commit it (matching the
-	// Enter-to-advance rhythm of the fields above). When the wallet is
-	// locked, the passphrase prompt in withAutoUnlock is the real gate.
-	confirmed := true
-	ok, err := runForm(newForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Broadcast this transaction?").
-			Description("This cannot be undone once confirmed by the network.").
-			Affirmative("Send").
-			Negative("Cancel").
-			Value(&confirmed),
-	)))
-	if err != nil || !ok || !confirmed {
-		if err == nil {
-			printWarn("Send cancelled. Nothing was broadcast.")
-		}
-		return err
-	}
-
-	var txid *chainhash.Hash
-	err = withAutoUnlock(c, func() error {
-		return withSpinner("Signing and broadcasting...", func() error {
-			var sendErr error
-			txid, sendErr = c.send(fromAccount, address, amount, feeRate, 1)
-			return sendErr
-		})
-	})
+	// Default to Send: this confirm is the final step of a transaction the user just built and reviewed, so Enter
+	// should commit it (matching the Enter-to-advance rhythm of the fields above). When the wallet is locked, the
+	// passphrase prompt in withAutoUnlock is the real gate.
+	confirmed, err := confirm("Broadcast this transaction?", "This cannot be undone once confirmed by the network.",
+		"Send", "Cancel", true)
 	if err != nil {
 		return err
 	}
+	if !confirmed {
+		printWarn(sendCancelledMessage)
+		return nil
+	}
 
-	printSuccess("Transaction broadcast.")
+	var txid *chainhash.Hash
+	for {
+		err = withAutoUnlock(c, func() error {
+			return withSpinner("Signing and broadcasting...", func() error {
+				var sendErr error
+				txid, sendErr = c.send(fromAccount, address, amount, feeRate, 1)
+				return sendErr
+			})
+		})
+		if err == nil {
+			break
+		}
+
+		retry, askErr := retryNotRelayedSend(err)
+		if askErr != nil {
+			return askErr
+		}
+		if !retry {
+			printWarn(sendCancelledMessage)
+			return nil
+		}
+	}
+	printSuccess("Payment created and pending.")
 	printBox(kvLines([][2]string{
 		{"Txid", txid.String()},
 		{"Amount", fmtPRL(amount)},
 		{"To", address},
 	}))
+	printWarn("If needed, open Transactions, select this payment, and choose Rebroadcast to the network. " +
+		"Creating another payment could pay the recipient twice.")
 	return nil
+}
+
+const sendCancelledMessage = "Send cancelled. Nothing was broadcast."
+
+const sendNotRelayedMessage = "No peers are connected. Nothing was signed or sent and your funds are untouched. " +
+	"Check your connection and try again."
+
+func retryNotRelayedSend(err error) (bool, error) {
+	if !isNotRelayedError(err) {
+		return false, err
+	}
+	printWarn(sendNotRelayedMessage)
+	printWarn(rawErrorDetail(err))
+	return confirm("Try again?", "Uses the same amount, address, and fee rate.", "Retry", "Cancel", true)
 }
 
 // validateRecipient checks the address decodes and belongs to the active

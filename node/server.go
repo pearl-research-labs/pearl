@@ -660,7 +660,7 @@ func (sp *serverPeer) OnTx(_ *peer.Peer, msg *wire.MsgTx) {
 	// methods and things such as hash caching.
 	tx := btcutil.NewTx(msg)
 	iv := wire.NewInvVect(wire.InvTypeTx, tx.Hash())
-	sp.AddKnownInventory(iv)
+	sp.AddKnownInventory(*iv)
 
 	// Queue the transaction up to be handled by the sync manager and
 	// intentionally block further receives until the transaction is fully
@@ -680,7 +680,7 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte) {
 
 	// Add the block to the known inventory for the peer.
 	iv := wire.NewInvVect(wire.InvTypeBlock, block.Hash())
-	sp.AddKnownInventory(iv)
+	sp.AddKnownInventory(*iv)
 
 	// Queue the block up to be handled by the block
 	// manager and intentionally block further receives
@@ -770,7 +770,7 @@ func (sp *serverPeer) OnInv(_ *peer.Peer, msg *wire.MsgInv) {
 
 	newInv := wire.NewMsgInvSizeHint(uint(len(msg.InvList)))
 	for _, invVect := range msg.InvList {
-		if invVect.Type == wire.InvTypeTx {
+		if invVect.Type.IsTx() {
 			peerLog.Infof("Peer %v is announcing "+
 				"transactions in blocksonly mode -- disconnecting", sp)
 			sp.Disconnect()
@@ -794,13 +794,65 @@ func (sp *serverPeer) OnHeaders(_ *peer.Peer, msg *wire.MsgHeaders) {
 	sp.server.syncManager.QueueHeaders(msg, sp.Peer)
 }
 
+// maxInflightReplies is how many getdata or getcfilters replies a handler
+// may have queued.
+const maxInflightReplies = 2
+
+// replyWindow paces the replies a handler sends to a peer, keeping at most
+// maxInflightReplies of them queued but unsent at once.
+type replyWindow struct {
+	quit     chan struct{}
+	done     chan struct{}
+	inflight int
+}
+
+// newReplyWindow returns an empty reply window that stops waiting once quit
+// is closed.
+func newReplyWindow(quit chan struct{}) *replyWindow {
+	return &replyWindow{
+		quit: quit,
+		done: make(chan struct{}, maxInflightReplies),
+	}
+}
+
+// send queues msg to p, first waiting for an earlier reply to be written
+// when the window is full. It returns false if w.quit is closed before completion.
+func (w *replyWindow) send(p *peer.Peer, msg wire.Message, enc wire.MessageEncoding) bool {
+	if w.inflight == maxInflightReplies && !w.waitOne() {
+		return false
+	}
+
+	p.QueueMessageWithEncoding(msg, w.done, enc)
+	w.inflight++
+
+	return true
+}
+
+// wait blocks until every queued reply is written or quit is closed.
+func (w *replyWindow) wait() {
+	for w.inflight > 0 {
+		if !w.waitOne() {
+			return
+		}
+	}
+}
+
+// waitOne waits for one queued reply to be written.  It returns false if
+// quit is closed first.
+// w.done has enough capacity to ensure the writer is never blocked on it.
+func (w *replyWindow) waitOne() bool {
+	select {
+	case <-w.done:
+		w.inflight--
+		return true
+	case <-w.quit:
+		return false
+	}
+}
+
 // OnGetData is invoked when a peer receives a getdata wire message and is
 // used to deliver block and transaction information.
 func (sp *serverPeer) OnGetData(_ *peer.Peer, msg *wire.MsgGetData) {
-	// failedMsg is an inventory that stores all the failed msgs - either
-	// the msg is an unknown type, or there's an error processing it.
-	failedMsg := wire.NewMsgNotFound()
-
 	length := len(msg.InvList)
 
 	// A decaying ban score increase is applied to prevent exhausting
@@ -816,64 +868,34 @@ func (sp *serverPeer) OnGetData(_ *peer.Peer, msg *wire.MsgGetData) {
 		return
 	}
 
-	// We wait on this wait channel periodically to prevent queuing far
-	// more data than we can send in a reasonable time, wasting memory. The
-	// waiting occurs after the database fetch for the next one to provide
-	// a little pipelining.
+	// failedMsg is an inventory that stores all the failed msgs - either
+	// the msg is an unknown type, or there's an error processing it.
+	failedMsg := wire.NewMsgNotFound()
 
-	// We now create a doneChans with a size of 5, which essentially
-	// behaves like a semaphore that allows 5 goroutines to be running at
-	// the same time.
-	const numBuffered = 5
-	doneChans := make([]chan struct{}, 0, numBuffered)
-
-	for i, iv := range msg.InvList {
-		// doneChan behaves like a semaphore - every time a msg is
-		// processed, either succeeded or failed, a signal is sent to
-		// this doneChan.
-		doneChan := make(chan struct{}, 1)
-
-		// Add this doneChan for tracking.
-		doneChans = append(doneChans, doneChan)
-
-		err := sp.server.pushInventory(sp, iv, doneChan)
-		if err != nil {
-			failedMsg.AddInvVect(iv)
+	// Fetch each reply and queue its messages through a reply window.
+	window := newReplyWindow(sp.quit)
+	for _, iv := range msg.InvList {
+		// Stop fetching once the peer is gone.
+		if !sp.Connected() {
+			return
 		}
 
-		// Move to the next item if we haven't processed 5 times yet.
-		if (i+1)%numBuffered != 0 {
+		replies, err := sp.server.fetchInventory(sp, iv)
+		if err != nil {
+			failedMsg.AddInvVect(iv)
+
 			continue
 		}
 
-		// Empty all the slots.
-		for _, dc := range doneChans {
-			select {
-			// NOTE: We always expect am empty struct to be sent to
-			// this doneChan, even when `pushInventory` failed.
-			case <-dc:
-
-			// Exit if the server is shutting down.
-			case <-sp.quit:
-				peerLog.Debug("Server shutting down in " +
-					"OnGetData")
-
+		for _, r := range replies {
+			if !window.send(sp.Peer, r.msg, r.encoding) {
 				return
 			}
 		}
-
-		// Re-initialize the done chans.
-		doneChans = make([]chan struct{}, 0, numBuffered)
 	}
 
 	if len(failedMsg.InvList) != 0 {
-		doneChan := make(chan struct{}, 1)
-
-		// Add this doneChan for tracking.
-		doneChans = append(doneChans, doneChan)
-
-		// Send the failed msgs.
-		sp.QueueMessage(failedMsg, doneChan)
+		window.send(sp.Peer, failedMsg, wire.BaseEncoding)
 	}
 
 	// Wait for messages to be sent. We can send quite a lot of data at
@@ -881,55 +903,44 @@ func (sp *serverPeer) OnGetData(_ *peer.Peer, msg *wire.MsgGetData) {
 	// time. We don't process anything else by them in this time so that we
 	// have an idea of when we should hear back from them - else the idle
 	// timeout could fire when we were only half done sending the blocks.
-	for _, dc := range doneChans {
-		select {
-		case <-dc:
-
-		// Exit if the server is shutting down.
-		case <-sp.quit:
-			peerLog.Debug("Server shutting down in OnGetData")
-			return
-		}
-	}
+	window.wait()
 }
 
-// pushInventory sends the requested inventory to the given peer.
-func (s *server) pushInventory(sp *serverPeer, iv *wire.InvVect,
-	doneChan chan<- struct{}) error {
+// invReply is a message answering a getdata request, paired with the
+// encoding to send it with.
+//
+// TODO: remove once base encoding support is dropped, and have the fetch helpers return []wire.Message.
+type invReply struct {
+	msg      wire.Message
+	encoding wire.MessageEncoding
+}
+
+// fetchInventory returns the messages that answer the requested inventory.
+func (s *server) fetchInventory(sp *serverPeer, iv *wire.InvVect) ([]invReply, error) {
 
 	switch iv.Type {
 	case wire.InvTypeWitnessTx:
-		return s.pushTxMsg(sp, &iv.Hash, doneChan, wire.WitnessEncoding)
+		return s.fetchTx(&iv.Hash, wire.WitnessEncoding)
 
 	case wire.InvTypeTx:
-		return s.pushTxMsg(sp, &iv.Hash, doneChan, wire.BaseEncoding)
+		return s.fetchTx(&iv.Hash, wire.BaseEncoding)
 
 	case wire.InvTypeWitnessBlock:
-		return s.pushBlockMsg(
-			sp, &iv.Hash, doneChan, wire.WitnessEncoding,
-		)
+		return s.fetchBlock(sp, &iv.Hash, wire.WitnessEncoding)
 
 	case wire.InvTypeBlock:
-		return s.pushBlockMsg(sp, &iv.Hash, doneChan, wire.BaseEncoding)
+		return s.fetchBlock(sp, &iv.Hash, wire.BaseEncoding)
 
 	case wire.InvTypeFilteredWitnessBlock:
-		return s.pushMerkleBlockMsg(
-			sp, &iv.Hash, doneChan, wire.WitnessEncoding,
-		)
+		return s.fetchMerkleBlock(sp, &iv.Hash, wire.WitnessEncoding)
 
 	case wire.InvTypeFilteredBlock:
-		return s.pushMerkleBlockMsg(
-			sp, &iv.Hash, doneChan, wire.BaseEncoding,
-		)
+		return s.fetchMerkleBlock(sp, &iv.Hash, wire.BaseEncoding)
 
 	default:
 		peerLog.Warnf("Unknown type in inventory request %d", iv.Type)
 
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-
-		return errors.New("unknown inventory type")
+		return nil, errors.New("unknown inventory type")
 	}
 }
 
@@ -999,8 +1010,7 @@ func (sp *serverPeer) OnGetHeaders(_ *peer.Peer, msg *wire.MsgGetHeaders) {
 
 // OnGetCFilters is invoked when a peer receives a getcfilters wire message.
 func (sp *serverPeer) OnGetCFilters(_ *peer.Peer, msg *wire.MsgGetCFilters) {
-	// Ignore getcfilters requests if not in sync.
-	if !sp.server.syncManager.IsCurrent() {
+	if sp.server.cfIndex == nil || !sp.server.syncManager.IsCurrent() {
 		return
 	}
 
@@ -1024,39 +1034,42 @@ func (sp *serverPeer) OnGetCFilters(_ *peer.Peer, msg *wire.MsgGetCFilters) {
 		return
 	}
 
-	// Create []*chainhash.Hash from []chainhash.Hash to pass to
-	// FiltersByBlockHashes.
-	hashPtrs := make([]*chainhash.Hash, len(hashes))
+	// Fetch each filter and queue it through a reply window, so a request
+	// for up to 1000 filters is never held in memory at once.
+	window := newReplyWindow(sp.quit)
 	for i := range hashes {
-		hashPtrs[i] = &hashes[i]
-	}
-
-	filters, err := sp.server.cfIndex.FiltersByBlockHashes(
-		hashPtrs, msg.FilterType,
-	)
-	if err != nil {
-		peerLog.Errorf("Error retrieving cfilters: %v", err)
-		return
-	}
-
-	for i, filterBytes := range filters {
-		if len(filterBytes) == 0 {
-			peerLog.Warnf("Could not obtain cfilter for %v",
-				hashes[i])
+		// Stop fetching once the peer is gone.
+		if !sp.Connected() {
 			return
 		}
 
-		filterMsg := wire.NewMsgCFilter(
-			msg.FilterType, &hashes[i], filterBytes,
-		)
-		sp.QueueMessage(filterMsg, nil)
+		filterBytes, err := sp.server.cfIndex.FilterByBlockHash(&hashes[i], msg.FilterType)
+		if err != nil {
+			peerLog.Errorf("Error retrieving cfilter for %v: %v", hashes[i], err)
+
+			return
+		}
+
+		if len(filterBytes) == 0 {
+			peerLog.Warnf("Could not obtain cfilter for %v", hashes[i])
+
+			return
+		}
+
+		filterMsg := wire.NewMsgCFilter(msg.FilterType, &hashes[i], filterBytes)
+
+		if !window.send(sp.Peer, filterMsg, wire.BaseEncoding) {
+			return
+		}
 	}
+
+	// Wait for the filters to be sent.
+	window.wait()
 }
 
 // OnGetCFHeaders is invoked when a peer receives a getcfheader wire message.
 func (sp *serverPeer) OnGetCFHeaders(_ *peer.Peer, msg *wire.MsgGetCFHeaders) {
-	// Ignore getcfilterheader requests if not in sync.
-	if !sp.server.syncManager.IsCurrent() {
+	if sp.server.cfIndex == nil || !sp.server.syncManager.IsCurrent() {
 		return
 	}
 
@@ -1172,8 +1185,7 @@ func (sp *serverPeer) OnGetCFHeaders(_ *peer.Peer, msg *wire.MsgGetCFHeaders) {
 
 // OnGetCFCheckpt is invoked when a peer receives a getcfcheckpt wire message.
 func (sp *serverPeer) OnGetCFCheckpt(_ *peer.Peer, msg *wire.MsgGetCFCheckpt) {
-	// Ignore getcfcheckpt requests if not in sync.
-	if !sp.server.syncManager.IsCurrent() {
+	if sp.server.cfIndex == nil || !sp.server.syncManager.IsCurrent() {
 		return
 	}
 
@@ -1686,34 +1698,26 @@ func (s *server) TransactionConfirmed(tx *btcutil.Tx) {
 	s.RemoveRebroadcastInventory(iv)
 }
 
-// pushTxMsg sends a tx message for the provided transaction hash to the
-// connected peer.  An error is returned if the transaction hash is not known.
-func (s *server) pushTxMsg(sp *serverPeer, hash *chainhash.Hash,
-	doneChan chan<- struct{}, encoding wire.MessageEncoding) error {
+// fetchTx returns the tx message for the provided transaction hash.  An
+// error is returned if the transaction hash is not known.
+func (s *server) fetchTx(hash *chainhash.Hash, encoding wire.MessageEncoding) ([]invReply, error) {
 
 	// Attempt to fetch the requested transaction from the pool.  A
 	// call could be made to check for existence first, but simply trying
 	// to fetch a missing transaction results in the same behavior.
 	tx, err := s.txMemPool.FetchTransaction(hash)
 	if err != nil {
-		peerLog.Tracef("Unable to fetch tx %v from transaction "+
-			"pool: %v", hash, err)
+		peerLog.Tracef("Unable to fetch tx %v from transaction pool: %v", hash, err)
 
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-		return err
+		return nil, err
 	}
 
-	sp.QueueMessageWithEncoding(tx.MsgTx(), doneChan, encoding)
-
-	return nil
+	return []invReply{{msg: tx.MsgTx(), encoding: encoding}}, nil
 }
 
-// pushBlockMsg sends a block message for the provided block hash to the
-// connected peer.  An error is returned if the block hash is not known.
-func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash,
-	doneChan chan<- struct{}, encoding wire.MessageEncoding) error {
+// fetchBlock returns messages for the provided block hash.  An error is
+// returned if the block hash is not known.
+func (s *server) fetchBlock(sp *serverPeer, hash *chainhash.Hash, encoding wire.MessageEncoding) ([]invReply, error) {
 
 	// Fetch the raw block bytes from the database.
 	var blockBytes []byte
@@ -1723,108 +1727,76 @@ func (s *server) pushBlockMsg(sp *serverPeer, hash *chainhash.Hash,
 		return err
 	})
 	if err != nil {
-		peerLog.Tracef("Unable to fetch requested block hash %v: %v",
-			hash, err)
+		peerLog.Tracef("Unable to fetch requested block hash %v: %v", hash, err)
 
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-		return err
+		return nil, err
 	}
 
 	// Deserialize the block.
 	var msgBlock wire.MsgBlock
 	err = msgBlock.Deserialize(bytes.NewReader(blockBytes))
 	if err != nil {
-		peerLog.Tracef("Unable to deserialize requested block hash "+
-			"%v: %v", hash, err)
+		peerLog.Tracef("Unable to deserialize requested block hash %v: %v", hash, err)
 
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-		return err
+		return nil, err
 	}
 
-	// We only send the channel for this message if we aren't sending
-	// an inv straight after.
-	var dc chan<- struct{}
-	continueHash := sp.continueHash
-	sendInv := continueHash != nil && continueHash.IsEqual(hash)
-	if !sendInv {
-		dc = doneChan
-	}
-	sp.QueueMessageWithEncoding(&msgBlock, dc, encoding)
+	msgs := []invReply{{msg: &msgBlock, encoding: encoding}}
 
 	// When the peer requests the final block that was advertised in
 	// response to a getblocks message which requested more blocks than
 	// would fit into a single message, send it a new inventory message
 	// to trigger it to issue another getblocks message for the next
 	// batch of inventory.
-	if sendInv {
+	continueHash := sp.continueHash
+	if continueHash != nil && continueHash.IsEqual(hash) {
 		best := sp.server.chain.BestSnapshot()
 		invMsg := wire.NewMsgInvSizeHint(1)
 		iv := wire.NewInvVect(wire.InvTypeBlock, &best.Hash)
 		invMsg.AddInvVect(iv)
-		sp.QueueMessage(invMsg, doneChan)
+		msgs = append(msgs, invReply{msg: invMsg, encoding: wire.BaseEncoding})
 		sp.continueHash = nil
 	}
-	return nil
+
+	return msgs, nil
 }
 
-// pushMerkleBlockMsg sends a merkleblock message for the provided block hash to
-// the connected peer.  Since a merkle block requires the peer to have a filter
-// loaded, this call will simply be ignored if there is no filter loaded.  An
-// error is returned if the block hash is not known.
-func (s *server) pushMerkleBlockMsg(sp *serverPeer, hash *chainhash.Hash,
-	doneChan chan<- struct{}, encoding wire.MessageEncoding) error {
+// fetchMerkleBlock returns messages for the provided block hash.  Since a
+// merkle block requires the peer to have a filter loaded, this call will
+// simply be ignored if there is no filter loaded.  An error is returned if
+// the block hash is not known.
+func (s *server) fetchMerkleBlock(sp *serverPeer, hash *chainhash.Hash,
+	encoding wire.MessageEncoding) ([]invReply, error) {
 
 	// Do not send a response if the peer doesn't have a filter loaded.
 	if !sp.filter.IsLoaded() {
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-		return nil
+		return nil, nil
 	}
 
 	// Fetch the raw block bytes from the database.
 	blk, err := sp.server.chain.BlockByHash(hash)
 	if err != nil {
-		peerLog.Tracef("Unable to fetch requested block hash %v: %v",
-			hash, err)
+		peerLog.Tracef("Unable to fetch requested block hash %v: %v", hash, err)
 
-		if doneChan != nil {
-			doneChan <- struct{}{}
-		}
-		return err
+		return nil, err
 	}
 
 	// Generate a merkle block by filtering the requested block according
 	// to the filter for the peer.
 	merkle, matchedTxIndices := bloom.NewMerkleBlock(blk, sp.filter)
 
-	// Send the merkleblock.  Only send the done channel with this message
-	// if no transactions will be sent afterwards.
-	var dc chan<- struct{}
-	if len(matchedTxIndices) == 0 {
-		dc = doneChan
-	}
-	sp.QueueMessage(merkle, dc)
+	msgs := make([]invReply, 0, len(matchedTxIndices)+1)
+	msgs = append(msgs, invReply{msg: merkle, encoding: wire.BaseEncoding})
 
 	// Finally, send any matched transactions.
 	blkTransactions := blk.MsgBlock().Transactions
-	for i, txIndex := range matchedTxIndices {
-		// Only send the done channel on the final transaction.
-		var dc chan<- struct{}
-		if i == len(matchedTxIndices)-1 {
-			dc = doneChan
-		}
+	for _, txIndex := range matchedTxIndices {
 		if txIndex < uint32(len(blkTransactions)) {
-			sp.QueueMessageWithEncoding(blkTransactions[txIndex], dc,
-				encoding)
+			msgs = append(msgs, invReply{msg: blkTransactions[txIndex], encoding: encoding})
 		}
 	}
 
-	return nil
+	return msgs, nil
 }
 
 // handleUpdatePeerHeight updates the heights of all peers who were known to
@@ -2036,7 +2008,10 @@ func (s *server) handleRelayInvMsg(state *peerState, msg relayMsg) {
 		// If the inventory is a block and the peer prefers headers,
 		// generate and send a headers message instead of an inventory
 		// message.
-		if msg.invVect.Type == wire.InvTypeBlock && sp.WantsHeaders() {
+		if msg.invVect.Type.IsBlock() && sp.WantsHeaders() {
+			if sp.IsKnownInventory(*msg.invVect) {
+				return
+			}
 			msgHeader, ok := msg.data.(wire.MsgHeader)
 			if !ok {
 				peerLog.Warnf("Underlying data for headers is not a MsgHeader: %T", msg.data)
@@ -2049,10 +2024,11 @@ func (s *server) handleRelayInvMsg(state *peerState, msg relayMsg) {
 				return
 			}
 			sp.QueueMessage(msgHeaders, nil)
+			sp.AddKnownInventory(*msg.invVect)
 			return
 		}
 
-		if msg.invVect.Type == wire.InvTypeTx {
+		if msg.invVect.Type.IsTx() {
 			// Don't relay the transaction to the peer when it has
 			// transaction relaying disabled.
 			if sp.relayTxDisabled() {
@@ -3095,6 +3071,9 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 			MaxTxVersion:         2,
 			RejectReplacement:    cfg.RejectReplacement,
 			MaxMempoolSize:       cfg.MaxMempool * 1000 * 1000,
+			LimitAncestorCount:   mempool.DefaultAncestorCountLimit,
+			LimitAncestorSize:    mempool.DefaultAncestorSizeLimit,
+			LimitDescendantCount: mempool.DefaultDescendantCountLimit,
 		},
 		ChainParams:    chainParams,
 		FetchUtxoView:  s.chain.FetchUtxoView,

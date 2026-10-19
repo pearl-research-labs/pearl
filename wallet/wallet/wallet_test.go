@@ -4,18 +4,22 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -660,4 +664,94 @@ func TestEndRecovery(t *testing.T) {
 	if !strings.EqualFold(err.Error(), "recovery: forced shutdown") {
 		t.Fatal("wrong error")
 	}
+}
+
+// TestListTransactions pins the listing rules and paging. Callers page by the transactions they were shown, so a
+// transaction listing several entries or none must not shift what from and count select.
+func TestListTransactions(t *testing.T) {
+	w, cleanup := testWallet(t)
+	t.Cleanup(cleanup)
+
+	var receives []string
+	for i := range 3 {
+		receives = append(receives, fundWallet(t, w, 100_000+int64(i)).Hash.String())
+	}
+
+	changeAddr, err := w.NewChangeAddress(0, waddrmgr.KeyScopeBIP0086, false)
+	require.NoError(t, err)
+	changeScript, err := txscript.PayToAddrScript(changeAddr)
+	require.NoError(t, err)
+	changePayment := &wire.MsgTx{TxIn: []*wire.TxIn{{}}, TxOut: []*wire.TxOut{wire.NewTxOut(50_000, changeScript)}}
+	rec, err := wtxmgr.NewTxRecordFromMsgTx(changePayment, time.Now())
+	require.NoError(t, err)
+	block := &wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Hash: *testBlockHash, Height: testBlockHeight},
+		Time:  time.Unix(1387737310, 0),
+	}
+	require.NoError(t, walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
+		return w.addRelevantTx(dbtx, rec, block)
+	}))
+
+	twoOutputs, err := w.SendOutputs(
+		[]*wire.TxOut{externalTaprootOutput(t, 20_000), externalTaprootOutput(t, 10_000)}, nil, 0, 1, 1000,
+		CoinSelectionLargest, "",
+	)
+	require.NoError(t, err)
+	oneOutput := sendTo(t, w, 30_000, 1)
+	consolidation, err := w.SendOutputs(
+		[]*wire.TxOut{wire.NewTxOut(20_000, changeScript)}, nil, 0, 1, 1000, CoinSelectionLargest, "",
+	)
+	require.NoError(t, err)
+
+	all, err := w.ListTransactions(0, 100)
+	require.NoError(t, err)
+	txids := listedTxids(all)
+	require.Len(t, txids, 6)
+	assert.ElementsMatch(t, []string{twoOutputs.TxHash().String(), oneOutput.TxHash().String()}, txids[:2],
+		"unmined first")
+	assert.Equal(t, []string{changePayment.TxHash().String(), receives[2], receives[1], receives[0]}, txids[2:],
+		"then mined, newest first")
+
+	t.Run("entries", func(t *testing.T) {
+		categories := make(map[string][]string)
+		for _, entry := range all {
+			categories[entry.TxID] = append(categories[entry.TxID], entry.Category)
+		}
+		assert.Equal(t, []string{"receive"}, categories[changePayment.TxHash().String()])
+		assert.Equal(t, []string{"send", "send"}, categories[twoOutputs.TxHash().String()])
+		assert.Equal(t, []string{"send"}, categories[oneOutput.TxHash().String()])
+		assert.NotContains(t, categories, consolidation.TxHash().String())
+		for _, txid := range receives {
+			assert.Equal(t, []string{"receive"}, categories[txid], "spent receive %s", txid)
+		}
+	})
+
+	t.Run("count", func(t *testing.T) {
+		for count := 1; count <= len(txids)+1; count++ {
+			page, err := w.ListTransactions(0, count)
+			require.NoError(t, err)
+			assert.Len(t, listedTxids(page), min(count, len(txids)), "count %d", count)
+		}
+	})
+
+	t.Run("paging", func(t *testing.T) {
+		for size := 1; size <= len(txids); size++ {
+			var paged []string
+			for from := 0; from < len(txids); from += size {
+				page, err := w.ListTransactions(from, size)
+				require.NoError(t, err)
+				paged = append(paged, listedTxids(page)...)
+			}
+			assert.Equal(t, txids, paged, "pages of %d", size)
+		}
+	})
+}
+
+// listedTxids compacts consecutive repeats only, since a transaction's entries arrive together.
+func listedTxids(entries []btcjson.ListTransactionsResult) []string {
+	var txids []string
+	for _, entry := range entries {
+		txids = append(txids, entry.TxID)
+	}
+	return slices.Compact(txids)
 }

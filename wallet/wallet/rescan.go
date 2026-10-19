@@ -222,13 +222,25 @@ out:
 				"%s, height %d)", len(addrs), noun, n.Hash,
 				n.Height)
 
-			go w.resendUnminedTxs()
+			go w.resendUnminedTxsAfterRescan()
 
 		case <-quit:
 			break out
 		}
 	}
 	w.wg.Done()
+}
+
+// resendUnminedTxsAfterRescan refills a full node's mempool, which forgets pending transactions across restarts. Under
+// SPV there is no mempool to refill and every announcement is the user's explicit call (rebroadcasttransaction), so
+// nothing is resent there.
+func (w *Wallet) resendUnminedTxsAfterRescan() {
+	chainClient := w.ChainClient()
+	if chainClient == nil || chainClient.BackEnd() == "neutrino" {
+		return
+	}
+
+	w.resendUnminedTxs()
 }
 
 // rescanRPCHandler reads batch jobs sent by rescanBatchHandler and sends the

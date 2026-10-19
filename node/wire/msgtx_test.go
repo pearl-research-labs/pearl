@@ -9,8 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
+	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
@@ -134,6 +137,180 @@ func TestTx(t *testing.T) {
 	if !reflect.DeepEqual(newMsg, msg) {
 		t.Errorf("Copy: mismatched tx messages - got %v, want %v",
 			spew.Sdump(newMsg), spew.Sdump(msg))
+	}
+}
+
+// serializeTx returns the witness serialization of tx.
+func serializeTx(t *testing.T, tx *MsgTx) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	require.NoError(t, tx.Serialize(&buf))
+	return buf.Bytes()
+}
+
+// TestTxCountsBoundedByRemainingPayload ensures a peer cannot make the decoder allocate for an input, output or
+// witness item count that cannot fit in the bytes left in the payload. Every payload leaves room for exactly one
+// element after its count: a count of one decodes, while a larger count, and a count with nothing after it, are
+// rejected before the slice that the count sizes is allocated.
+func TestTxCountsBoundedByRemainingPayload(t *testing.T) {
+	join := func(parts ...[]byte) []byte {
+		return bytes.Join(parts, nil)
+	}
+	varInt := func(n uint64) []byte {
+		var buf bytes.Buffer
+		require.NoError(t, WriteVarInt(&buf, ProtocolVersion, n))
+		return buf.Bytes()
+	}
+	decode := func(payload []byte) (*MsgTx, error) {
+		var tx MsgTx
+		err := tx.Deserialize(bytes.NewReader(payload))
+		return &tx, err
+	}
+	// Peers reach the decoder through ReadV2MessageN.
+	decodeV2 := func(payload []byte) error {
+		plaintext := append([]byte{v2Messages[CmdTx]}, payload...)
+		_, _, err := ReadV2MessageN(plaintext, ProtocolVersion, WitnessEncoding)
+		return err
+	}
+
+	version := []byte{1, 0, 0, 0}
+	witnessMarker := []byte{TxFlagMarker, WitnessFlag}
+	emptyTxIn := make([]byte, minTxInPayload)
+	emptyTxOut := make([]byte, MinTxOutPayload)
+	emptyItem := varInt(0)
+	lockTime := make([]byte, 4)
+	zero, one := varInt(0), varInt(1)
+
+	tests := []struct {
+		name string
+		// prefix holds everything before the count, element the single item after it, and suffix the rest.
+		prefix, element, suffix []byte
+		// ceiling is the largest count the per-message limits still accept.
+		ceiling uint64
+		wantErr string
+		// allocated returns the length of the slice that the count sizes.
+		allocated func(*MsgTx) int
+	}{
+		{
+			name:      "input count",
+			prefix:    version,
+			element:   emptyTxIn,
+			suffix:    join(zero, lockTime),
+			ceiling:   maxTxInPerMessage,
+			wantErr:   "input transactions for remaining payload",
+			allocated: func(tx *MsgTx) int { return len(tx.TxIn) },
+		},
+		{
+			name:      "output count",
+			prefix:    join(version, one, emptyTxIn),
+			element:   emptyTxOut,
+			suffix:    lockTime,
+			ceiling:   maxTxOutPerMessage,
+			wantErr:   "output transactions for remaining payload",
+			allocated: func(tx *MsgTx) int { return len(tx.TxOut) },
+		},
+		{
+			name:      "witness item count",
+			prefix:    join(version, witnessMarker, one, emptyTxIn, zero),
+			element:   emptyItem,
+			suffix:    lockTime,
+			ceiling:   maxWitnessItemsPerInput,
+			wantErr:   "witness items for remaining payload",
+			allocated: func(tx *MsgTx) int { return len(tx.TxIn[0].Witness) },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			withElement := func(count uint64) []byte {
+				return join(test.prefix, varInt(count), test.element, test.suffix)
+			}
+
+			_, err := decode(withElement(1))
+			require.NoError(t, err)
+
+			rejected := []struct {
+				name    string
+				payload []byte
+			}{
+				{"count of two", withElement(2)},
+				{"count at the ceiling", withElement(test.ceiling)},
+				{"payload ends after the count", join(test.prefix, varInt(test.ceiling))},
+			}
+			for _, tc := range rejected {
+				t.Run(tc.name, func(t *testing.T) {
+					tx, err := decode(tc.payload)
+					require.ErrorContains(t, err, test.wantErr)
+					require.Zero(t, test.allocated(tx), "slice allocated before the count was rejected")
+					require.ErrorContains(t, decodeV2(tc.payload), test.wantErr)
+				})
+			}
+		})
+	}
+}
+
+// TestTxRemainingPayloadBoundAcceptsTightEncodings ensures the remaining-payload bounds never reject a transaction
+// that is encoded as compactly as possible, whether or not the reader can report its unread length.
+func TestTxRemainingPayloadBoundAcceptsTightEncodings(t *testing.T) {
+	oneItem := TxWitness{{}}
+
+	tests := []struct {
+		name       string
+		witnesses  []TxWitness
+		numOutputs int
+	}{
+		{name: "one witness item", witnesses: []TxWitness{oneItem}},
+		{name: "witness on first of two inputs", witnesses: []TxWitness{oneItem, nil}},
+		{name: "witness on last of two inputs", witnesses: []TxWitness{nil, oneItem}},
+		// Eight elements are enough that a minimum size one byte too large would reject them.
+		{name: "eight empty inputs", witnesses: make([]TxWitness, 8)},
+		{name: "eight empty outputs", witnesses: []TxWitness{nil}, numOutputs: 8},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tx := NewMsgTx(1)
+			for _, witness := range test.witnesses {
+				tx.AddTxIn(NewTxIn(&OutPoint{}, nil, witness))
+			}
+			for range test.numOutputs {
+				tx.AddTxOut(NewTxOut(0, nil))
+			}
+			encoded := serializeTx(t, tx)
+
+			var bounded MsgTx
+			require.NoError(t, bounded.Deserialize(bytes.NewReader(encoded)))
+			require.Equal(t, encoded, serializeTx(t, &bounded))
+
+			var unbounded MsgTx
+			require.NoError(t, unbounded.Deserialize(iotest.OneByteReader(bytes.NewReader(encoded))))
+			require.Equal(t, encoded, serializeTx(t, &unbounded))
+		})
+	}
+}
+
+// TestUnreadBytes ensures only the bytes a reader has not returned are counted, and that a reader which cannot
+// report them is treated as having no bound.
+func TestUnreadBytes(t *testing.T) {
+	partlyRead := bytes.NewReader(make([]byte, 100))
+	_, err := io.CopyN(io.Discard, partlyRead, 60)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		r    io.Reader
+		want int
+	}{
+		{"bytes.Reader", bytes.NewReader(make([]byte, 7)), 7},
+		{"bytes.Buffer", bytes.NewBuffer(make([]byte, 7)), 7},
+		{"strings.Reader", strings.NewReader("abcdefg"), 7},
+		{"partly read", partlyRead, 40},
+		{"empty", bytes.NewReader(nil), 0},
+		{"no Len method", iotest.OneByteReader(bytes.NewReader(make([]byte, 7))), math.MaxInt},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, unreadBytes(test.r))
+		})
 	}
 }
 

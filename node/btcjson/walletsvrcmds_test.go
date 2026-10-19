@@ -542,6 +542,28 @@ func TestWalletSvrCmds(t *testing.T) {
 			},
 		},
 		{
+			name: "removetransaction",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("removetransaction", "123")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewRemoveTransactionCmd("123")
+			},
+			marshalled:   `{"jsonrpc":"1.0","method":"removetransaction","params":["123"],"id":1}`,
+			unmarshalled: &btcjson.RemoveTransactionCmd{TxID: "123"},
+		},
+		{
+			name: "rebroadcasttransaction",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("rebroadcasttransaction", "123")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewRebroadcastTransactionCmd("123")
+			},
+			marshalled:   `{"jsonrpc":"1.0","method":"rebroadcasttransaction","params":["123"],"id":1}`,
+			unmarshalled: &btcjson.RebroadcastTransactionCmd{TxID: "123"},
+		},
+		{
 			name: "getwalletinfo",
 			newCmd: func() (interface{}, error) {
 				return btcjson.NewCmd("getwalletinfo")

@@ -52,6 +52,11 @@ type prunedBlockDispatcherHarness struct {
 	blocksQueried map[chainhash.Hash]int
 
 	shouldReply uint32 // 0 == true, 1 == false, 2 == invalid reply
+
+	// beforeObserve, if set, runs after a query is submitted. A test uses
+	// it to let a fast success land on errChan before the caller looks;
+	// query must not read that channel or the success is lost.
+	beforeObserve func()
 }
 
 // newNetworkBlockTestHarness initializes a new PrunedBlockDispatcher test harness
@@ -271,10 +276,8 @@ func (h *prunedBlockDispatcherHarness) query(blocks []*chainhash.Hash,
 	cancelChan := make(chan error, 1)
 
 	blockChan, errChan := h.dispatcher.Query(blocks, cancelChan, opts...)
-	select {
-	case err := <-errChan:
-		require.NoError(h.t, err)
-	default:
+	if h.beforeObserve != nil {
+		h.beforeObserve()
 	}
 
 	for _, block := range blocks {
@@ -602,6 +605,22 @@ func TestPrunedBlockDispatcherMultipleGetData(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestPrunedBlockDispatcherEarlyCompletionSignal submits a query and waits
+// long enough for the reply to arrive before the caller reads errChan. A
+// nil on that channel is the success signal; it has to still be there.
+func TestPrunedBlockDispatcherEarlyCompletionSignal(t *testing.T) {
+	t.Parallel()
+
+	h := newNetworkBlockTestHarness(t, 1, 1, 1)
+	h.beforeObserve = func() { time.Sleep(200 * time.Millisecond) }
+	h.start()
+	defer h.stop()
+
+	blockChan, errChan, cancelChan := h.query(h.hashes)
+	h.assertPeerQueried()
+	h.assertPeerReplied(blockChan, errChan, cancelChan, true)
 }
 
 // TestPrunedBlockDispatcherMultipleQueryPeers tests that client requests are

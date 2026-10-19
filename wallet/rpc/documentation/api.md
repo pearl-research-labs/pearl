@@ -238,7 +238,8 @@ publishing transactions to the Pearl network.
 - `FailedPrecondition`: A consensus RPC client is already active.
 
 - `InvalidArgument`: The network address is ill-formatted or does not contain a
-  valid IP address.
+  valid IP address, or the certificate is missing for a non-loopback network
+  address.
 
 - `NotFound`: The consensus RPC server is unreachable.  This condition may not
   return `Unavailable` as that refers to `LoaderService` itself being
@@ -768,10 +769,30 @@ ___
 
 #### `PublishTransaction`
 
-The `PublishTransaction` method publishes a signed, serialized transaction to
-the Pearl network.  If the transaction spends any of the wallet's unspent
-outputs or creates a new output controlled by the wallet, it is saved by the
-wallet and republished later if it or a double spend are not mined.
+The `PublishTransaction` method publishes a signed, serialized transaction to the Pearl network. If the transaction
+spends any of the wallet's unspent outputs or creates a new output controlled by the wallet, it is saved by the wallet.
+Under SPV it remains pending despite peer rejection or a silent broadcast attempt, including when no peer requests it.
+Its inputs remain reserved until it confirms, conflicts with a verified mined transaction, or is explicitly removed. For
+a stored payment, a successful response means it is retained; it does not establish network acceptance or confirmation.
+Retry with the same signed transaction and txid; creating a new payment can pay the recipient twice. SPV does not
+automatically rebroadcast pending transactions. The existing `rebroadcasttransaction` and `removetransaction` JSON-RPC
+methods provide explicit controls for pending payments.
+
+The wallet's send commands create a new payment, so they can reject an offline send before any signed transaction
+exists. `PublishTransaction` receives an already signed transaction in `signed_transaction`. The caller may have sent
+that same transaction through another node before making this request. Zero connected SPV peers cannot rule out that
+earlier broadcast, so this method stores relevant transactions as pending and attempts to relay them even when offline.
+The send commands' pre-signing connection check therefore does not apply to this method.
+
+These retention rules apply to SPV. A pearld-backed wallet keeps its existing handling of RPC rejections, which can
+remove a pending transaction.
+
+For fresh JSON-RPC send commands only, typed `chain.ErrTxNotRelayed` from the zero-peer check maps to stable error code
+`-9` (`btcjson.ErrRPCClientNotConnected`). It means the send stopped before signing and left funds untouched. Oystercli
+and the desktop wallet use only this code to allow a fresh-send retry; they never infer it from error message text. The
+desktop preserves the code as structured data across IPC. Other failures, including messages containing "not relayed"
+and older daemons' message-only errors, stay on the generic failure path. A `rebroadcasttransaction` result of
+`chain.ErrTxNotRelayed` remains generic code `-32603`, since peers may already hold the previously signed transaction.
 
 **Request:** `PublishTransactionRequest`
 

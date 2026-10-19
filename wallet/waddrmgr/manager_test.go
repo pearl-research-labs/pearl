@@ -3028,6 +3028,55 @@ func assertAddressDerivation(t *testing.T, db walletdb.DB,
 	require.NoError(t, err)
 }
 
+// TestPQAddressErrorsWhenLockedOrWatchOnly tests that a new PQ address is
+// refused when the manager is locked or watching-only, instead of silently
+// dropping the XMSS commitment, while re-deriving a known path still works.
+func TestPQAddressErrorsWhenLockedOrWatchOnly(t *testing.T) {
+	t.Parallel()
+
+	teardown, db, mgr := setupManager(t)
+	defer teardown()
+
+	scopedMgr, err := mgr.FetchScopedKeyManager(KeyScopeBIP0086)
+	require.NoError(t, err)
+
+	path := DerivationPath{
+		InternalAccount: DefaultAccountNum,
+		Account:         hdkeychain.HardenedKeyStart,
+		Branch:          ExternalBranch,
+		Index:           0,
+	}
+
+	assertPQ := func(name string, wantErr ErrorCode) {
+		t.Helper()
+
+		err := walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+			_, err := scopedMgr.NextExternalAddresses(ns, 0, 1, true)
+			checkManagerError(t, name, err, wantErr)
+
+			// Must keep working: recovery re-derives known paths
+			// with the PQ flag set while locked.
+			_, err = scopedMgr.DeriveFromKeyPath(ns, path, true)
+			return err
+		})
+		require.NoError(t, err, "%s: DeriveFromKeyPath", name)
+	}
+
+	require.True(t, mgr.IsLocked())
+	assertPQ("locked", ErrLocked)
+
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		return mgr.ConvertToWatchingOnly(
+			tx.ReadWriteBucket(waddrmgrNamespaceKey),
+		)
+	})
+	require.NoError(t, err)
+
+	assertPQ("watching-only", ErrWatchingOnly)
+}
+
 // TestManagedAddressValidation tests that we're able to properly detect and
 // reject various fault cases for address/key derivation.
 func TestManagedAddressValidation(t *testing.T) {

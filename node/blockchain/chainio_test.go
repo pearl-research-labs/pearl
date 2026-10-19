@@ -7,9 +7,12 @@ package blockchain
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/big"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
@@ -38,6 +41,112 @@ func TestErrNotInMainChain(t *testing.T) {
 	err = errors.New("something else")
 	if isNotInMainChainErr(err) {
 		t.Fatalf("isNotInMainChainErr detected incorrect type")
+	}
+}
+
+func setupTestDB(tb testing.TB, name string) database.DB {
+	tb.Helper()
+
+	require.True(tb, isSupportedDbType(testDbType), "unsupported db type %v", testDbType)
+	db, err := database.Create(testDbType, filepath.Join(tb.TempDir(), name), blockDataNet)
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, db.Close()) })
+
+	return db
+}
+
+func TestDbFetchCertificate(t *testing.T) {
+	db := setupTestDB(t, "certfetch")
+
+	maxCert := &wire.CertificateV2{
+		PublicDataLen: wire.PublicDataMaxSizeV2,
+		ProofData:     bytes.Repeat([]byte{0x0a}, wire.MaxZKProofSize),
+	}
+
+	padTx := wire.NewMsgTx(1)
+	padTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, nil))
+	padTx.AddTxOut(wire.NewTxOut(0, make([]byte, 1000)))
+
+	tests := []struct {
+		name string
+		cert wire.BlockCertificate
+		txs  []*wire.MsgTx
+	}{
+		{
+			name: "null",
+		},
+		{
+			name: "v1",
+			cert: &wire.CertificateV1{
+				ProofData: []byte{0x01, 0x02, 0x03},
+			},
+		},
+		{
+			name: "v2",
+			cert: &wire.CertificateV2{
+				PublicDataLen: wire.PublicDataSizeDenseV2,
+				ProofData:     []byte{0x04, 0x05, 0x06, 0x07},
+			},
+		},
+		{
+			name: "v3",
+			cert: &wire.CertificateV3{
+				CertificateV2: wire.CertificateV2{
+					PublicDataLen: wire.PublicDataSizeDenseV2 + 1,
+					ProofData:     []byte{0x08, 0x09},
+				},
+			},
+		},
+		{
+			name: "v2 max size",
+			cert: maxCert,
+		},
+		{
+			name: "v2 max size, block greater than CertificateMaxSize",
+			cert: maxCert,
+			txs:  []*wire.MsgTx{padTx},
+		},
+	}
+
+	for i, test := range tests {
+		block := btcutil.NewBlock(&wire.MsgBlock{
+			MsgHeader: wire.MsgHeader{
+				BlockHeader: wire.BlockHeader{
+					Version:   int32(i + 1),
+					Timestamp: time.Unix(int64(i+1), 0),
+				},
+				MsgCertificate: wire.MsgCertificate{
+					Certificate: test.cert,
+				},
+			},
+			Transactions: test.txs,
+		})
+
+		blockHash := *block.Hash()
+		if test.txs != nil {
+			require.Greater(t, block.MsgBlock().SerializeSize(), wire.CertificateMaxSize, test.name)
+		}
+
+		// used to asses test inside a db view (Update, View, etc)
+		check := func(dbTx database.Tx) error {
+			gotCert, err := dbFetchCertificate(dbTx, blockHash)
+			if err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(gotCert, test.cert) {
+				return fmt.Errorf("got %#v, want %#v", gotCert, test.cert)
+			}
+			return nil
+		}
+
+		err := db.Update(func(dbTx database.Tx) error {
+			if err := dbTx.StoreBlock(block); err != nil {
+				return err
+			}
+			return check(dbTx)
+		})
+		require.NoError(t, err, "%s: pending block", test.name)
+		require.NoError(t, db.View(check), "%s: stored block", test.name)
 	}
 }
 

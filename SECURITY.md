@@ -10,7 +10,6 @@ This policy covers all components in the Pearl monorepo:
 - **ZK proof-of-work** circuits and verifier (`zk-pow/`, `plonky2/`)
 - **Mining infrastructure** (`miner/`, `py-pearl-mining/`)
 - **XMSS** post-quantum signatures (`xmss/`)
-- **DNS seeder** (`dnsseeder/`)
 - **Frontend applications** (`apps/`)
 
 All components are covered by this policy for vulnerability reporting and
@@ -73,7 +72,7 @@ scope. Nevertheless, such findings may still be reported privately via
 non-security bugs.
 
 Reports against other components in the repo (`miner/`, `py-pearl-mining/`,
-`dnsseeder/`, `apps/`) are **not bounty-eligible** and should be filed as
+`apps/`) are **not bounty-eligible** and should be filed as
 regular [GitHub issues](https://github.com/pearl-research-labs/pearl/issues).
 Severe vulnerabilities in those components may still be reported privately
 via [Reporting a Vulnerability](#reporting-a-vulnerability), but no reward

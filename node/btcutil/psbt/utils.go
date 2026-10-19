@@ -191,16 +191,13 @@ func readTransaction(txBytes []byte, noWitness bool) (*wire.MsgTx, error) {
 	return tx, nil
 }
 
-// SumUtxoInputValues tries to extract the sum of all inputs specified in the
-// UTXO fields of the PSBT. An error is returned if an input is specified that
-// does not contain any UTXO information.
+// SumUtxoInputValues tries to extract the sum of all inputs specified in the UTXO fields of the PSBT.
+// An error is returned if an input is specified that does not contain any UTXO information.
 func SumUtxoInputValues(packet *Packet) (int64, error) {
-	// We take the TX ins of the unsigned TX as the truth for how many
-	// inputs there should be, as the fields in the extra data part of the
-	// PSBT can be empty.
+	// We take the TX ins of the unsigned TX as the truth for how many inputs there should be, as the
+	// fields in the extra data part of the PSBT can be empty.
 	if len(packet.UnsignedTx.TxIn) != len(packet.Inputs) {
-		return 0, fmt.Errorf("TX input length doesn't match PSBT " +
-			"input length")
+		return 0, fmt.Errorf("TX input length doesn't match PSBT input length")
 	}
 
 	inputSum := int64(0)
@@ -211,27 +208,28 @@ func SumUtxoInputValues(packet *Packet) (int64, error) {
 			inputSum += in.WitnessUtxo.Value
 
 		case in.NonWitnessUtxo != nil:
-			// Non-witness UTXOs reference to the whole transaction
-			// the UTXO resides in.
-			utxOuts := in.NonWitnessUtxo.TxOut
+			// Non-witness UTXOs reference to the whole transaction the UTXO resides in.
 			txIn := packet.UnsignedTx.TxIn[idx]
-
-			// Check that utxOuts actually has enough space to
-			// contain the previous outpoint's index.
-			opIdx := txIn.PreviousOutPoint.Index
-			if opIdx >= uint32(len(utxOuts)) {
-				return 0, fmt.Errorf("input %d has malformed "+
-					"TxOut field", idx)
+			prevOut, err := NonWitnessUtxoOutput(in.NonWitnessUtxo, txIn.PreviousOutPoint.Index)
+			if err != nil {
+				return 0, fmt.Errorf("input %d has malformed TxOut field", idx)
 			}
 
-			inputSum += utxOuts[txIn.PreviousOutPoint.Index].Value
+			inputSum += prevOut.Value
 
 		default:
-			return 0, fmt.Errorf("input %d has no UTXO information",
-				idx)
+			return 0, fmt.Errorf("input %d has no UTXO information", idx)
 		}
 	}
 	return inputSum, nil
+}
+
+// NonWitnessUtxoOutput looks up TxOut[index]. PreviousOutPoint.Index is untrusted PSBT data.
+func NonWitnessUtxoOutput(utxo *wire.MsgTx, index uint32) (*wire.TxOut, error) {
+	if utxo == nil || index >= uint32(len(utxo.TxOut)) {
+		return nil, ErrInvalidNonWitnessUtxoIndex
+	}
+	return utxo.TxOut[index], nil
 }
 
 // TxOutsEqual returns true if two transaction outputs are equal.

@@ -29,6 +29,11 @@ const (
 	blockDbNamePrefix = "blocks"
 )
 
+// Empty host would expose unauthenticated pprof on every interface.
+func profileListenAddr(port string) string {
+	return net.JoinHostPort("127.0.0.1", port)
+}
+
 var (
 	cfg *config
 )
@@ -68,7 +73,7 @@ func pearldMain(serverChan chan<- *server) error {
 	// Enable http profiling server if requested.
 	if cfg.Profile != "" {
 		go func() {
-			listenAddr := net.JoinHostPort("", cfg.Profile)
+			listenAddr := profileListenAddr(cfg.Profile)
 			prldLog.Infof("Profile server listening on %s", listenAddr)
 			profileRedirect := http.RedirectHandler("/debug/pprof",
 				http.StatusSeeOther)
