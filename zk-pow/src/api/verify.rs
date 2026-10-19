@@ -120,6 +120,8 @@ pub fn verify_plain_proof(
     // Create CompiledPublicParams to compute noise
     let compiled = CompiledPublicParams::from(&public_params);
 
+    PearlCircuitParams::prover_defaults(compiled.degree_bits()).sanity_check(&compiled)?;
+
     // Compute noise matrices from commitment hash
     let noise = compute_noise(&compiled);
 

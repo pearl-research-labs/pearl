@@ -47,22 +47,13 @@ pub fn prove_block(
     let stark = PearlStark::<GoldilocksField, 2>::new_with_params(public_params);
     let compiled_params = &stark.config.as_ref().unwrap().compiled_public_params;
 
-    let (trace_rows, stark_pis) = stark.generate_trace(public_params, private_params);
+    let circuit_params = PearlCircuitParams::prover_defaults(compiled_params.degree_bits());
+    circuit_params.sanity_check(compiled_params)?;
 
-    let default_pow_bits = [18, 18, 22];
-    let default_rate_bits = if compiled_params.degree_bits() >= 15 {
-        [1, 3, 7]
-    } else {
-        [2, 3, 7]
-    };
+    let (trace_rows, stark_pis) = stark.generate_trace(public_params, private_params);
 
     public_params.hash_jackpot = u32_field_array_to_hash(&stark_pis[pearl_public::HASH_JACKPOT_RANGE].try_into().unwrap());
 
-    let circuit_params = PearlCircuitParams {
-        stark_degree_bits: compiled_params.degree_bits(),
-        pow_bits: default_pow_bits.map(|b| b as usize),
-        rate_bits: default_rate_bits.map(|b| b as usize),
-    };
     PearlRecursion::compile_circuits(circuit_params, cache, true)?;
 
     let hash_public_data = public_params.public_data_commitment(&circuit_params)?;
