@@ -26,6 +26,7 @@ pub fn zk_prove_plain_proof(
 ) -> Result<ProveResult> {
     // Convert PlainProof to proof parameters
     let (private, public) = proof.parse_proof(block_header, seed_derivation)?;
+    public.sanity_check()?;
     if sanity_check {
         public.sanity_check_private_params(&private)?;
     }
