@@ -1,14 +1,19 @@
 package legacyrpc
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"testing"
 
+	"github.com/pearl-research-labs/pearl/node/btcec"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
+	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/wallet/chain"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSendTxError(t *testing.T) {
@@ -72,6 +77,39 @@ func TestPendingTxError(t *testing.T) {
 			rpcErr := jsonError(pendingTxError(tt.err))
 			assert.Equal(t, tt.wantCode, rpcErr.Code)
 			assert.Equal(t, tt.wantMsg, rpcErr.Message)
+		})
+	}
+}
+
+// TestMakeOutputsNetworkCheck pins that send RPCs reject addresses for other networks, matching validateaddress.
+func TestMakeOutputsNetworkCheck(t *testing.T) {
+	t.Parallel()
+
+	_, pubKey := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{1}, 32))
+
+	pairsFor := func(t *testing.T, params *chaincfg.Params) map[string]btcutil.Amount {
+		t.Helper()
+
+		addr, err := createTaprootAddress(pubKey, params)
+		require.NoError(t, err)
+
+		return map[string]btcutil.Amount{addr.EncodeAddress(): 1000}
+	}
+
+	outputs, err := makeOutputs(pairsFor(t, &chaincfg.MainNetParams), &chaincfg.MainNetParams)
+	require.NoError(t, err)
+	require.Len(t, outputs, 1)
+
+	for _, params := range []*chaincfg.Params{&chaincfg.TestNetParams, &chaincfg.RegressionNetParams} {
+		t.Run(params.Name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := makeOutputs(pairsFor(t, params), &chaincfg.MainNetParams)
+			require.Error(t, err)
+
+			rpcErr := jsonError(err)
+			require.Equal(t, btcjson.ErrRPCInvalidAddressOrKey, rpcErr.Code)
+			require.Contains(t, rpcErr.Message, "not intended for use on mainnet")
 		})
 	}
 }
