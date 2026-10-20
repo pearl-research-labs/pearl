@@ -608,9 +608,10 @@ impl Blake3Program {
             .map(|i| self.routing_pins[i].1 as u64)
     }
 
-    /// Trace height: live rows padded to a power of two.
+    /// Trace height: live rows padded up to the consensus FRI ladder
+    /// ([`ladder_padded_rows`]).
     pub fn num_rows(&self) -> usize {
-        self.num_live_rows().next_power_of_two()
+        crate::v4::circuit::driver::ladder_padded_rows(self.num_live_rows())
     }
 
     /// Schedule sanity: back-references only, witness indices in bounds, at most one

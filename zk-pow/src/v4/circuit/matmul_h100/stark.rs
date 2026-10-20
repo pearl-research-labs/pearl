@@ -124,10 +124,10 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
         self.h * self.w * self.rows_per_cell()
     }
 
-    /// Trace height: the cell rows padded to the next power of two with single-row phantom
-    /// cells (all-zero, `is_padding = is_cell_final = 1`, `cell_id = h*w + t`).
+    /// Trace height: the cell rows padded up to the consensus FRI ladder with single-row
+    /// phantom cells (all-zero, `is_padding = is_cell_final = 1`, `cell_id = h*w + t`).
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        crate::v4::circuit::driver::ladder_padded_rows(self.live_rows())
     }
 
     /// Generates the H100 Matmul trace and public inputs.
@@ -1830,12 +1830,13 @@ mod tests {
         );
         assert_eq!(program.rows_per_cell(), 4);
         assert_eq!(program.live_rows(), 60);
-        assert_eq!(program.num_rows(), 64);
-        assert_eq!(rows.len(), 64);
+        // Natural 2^6, padded to the 2^7 ladder stop.
+        assert_eq!(program.num_rows(), 128);
+        assert_eq!(rows.len(), 128);
         let known = program.known_values();
         assert_eq!(known.len(), super::super::columns::NUM_MATMUL_H100_KNOWN_COLUMNS);
         for (c, col) in known.iter().enumerate() {
-            assert_eq!(col.len(), 64);
+            assert_eq!(col.len(), 128);
             for (r, row) in rows.iter().enumerate() {
                 assert_eq!(col.values[r], row[c], "known column {c} row {r}");
             }

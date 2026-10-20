@@ -309,13 +309,38 @@ fn fixture_job_with_zero_a_rows(
 
 /// [`fixture_job_with`] on explicit committed int8 value planes (`m` rows of `k` bytes
 /// each): adversarial planes ride the same wire layout as the honest fixtures.
-fn fixture_job_with_planes(
+pub(crate) fn fixture_job_with_planes(
     m: usize,
     k: usize,
     row_dims: &[(u32, DimType)],
     col_dims: &[(u32, DimType)],
     a_values: Vec<Vec<u8>>,
     b_values: Vec<Vec<u8>>,
+) -> (IncompleteBlockHeader, PlainProofV4) {
+    fixture_job_with_planes_and_hashes(
+        m,
+        k,
+        row_dims,
+        col_dims,
+        a_values,
+        b_values,
+        HashId::Blake3Chunk256,
+        HashId::Blake3Chunk128,
+    )
+}
+
+/// [`fixture_job_with_planes`] with explicit operand hash ids: large-`k` bench jobs need
+/// the cheap `Blake3Chunk1024` trees to stay inside the 2^22-byte Blake3 work cap.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fixture_job_with_planes_and_hashes(
+    m: usize,
+    k: usize,
+    row_dims: &[(u32, DimType)],
+    col_dims: &[(u32, DimType)],
+    a_values: Vec<Vec<u8>>,
+    b_values: Vec<Vec<u8>>,
+    a_hash_id: HashId,
+    b_hash_id: HashId,
 ) -> (IncompleteBlockHeader, PlainProofV4) {
     let n = m;
     let n_blocks = k / BLOCK_SIZE;
@@ -337,8 +362,6 @@ fn fixture_job_with_planes(
             })
             .collect()
     };
-    let a_hash_id = HashId::Blake3Chunk256;
-    let b_hash_id = HashId::Blake3Chunk128;
     let proof = PlainProofV4 {
         job: JobParams {
             ancestor_header,

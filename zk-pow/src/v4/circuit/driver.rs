@@ -116,39 +116,58 @@ pub const STARK_POW_BITS: u32 = 18;
 /// FRI query rounds: the minimal count meeting the security target at this rate (102).
 pub const STARK_QUERY_ROUNDS: usize = (STARK_SECURITY_BITS - STARK_POW_BITS as usize).div_ceil(STARK_RATE_BITS);
 
-/// Every trace height (degree bits) reachable by some table of some envelope-legal job,
-/// descending — the consensus FRI ladder's fold boundaries. The wire envelope
-/// (`api::layout` lottery-tile bounds) is
+/// Every committed trace height (degree bits) of the batch, descending — the consensus FRI
+/// ladder's fold boundaries. The wire envelope (`api::layout` lottery-tile bounds) is
 /// `k ∈ [2^10, 2^16]` with `32 | k`, `h ≥ 4`, `w ≥ 16`, `h·w ∈ [256, 2048]`,
-/// `(h + w)·k ≤ 2^22`; heights are `next_pow2` of each table's row formula:
+/// `(h + w)·k ≤ 2^22`; live rows are `next_pow2` of each table's row formula:
 ///
-/// | table      | rows             | bits    |
-/// |------------|------------------|---------|
-/// | InputQuant | `max(h,w)·k`     | 14..=22 |
-/// | Matmul     | `h·w·(k/32)`     | 13..=22 |
-/// | Blake3     | `8·compressions` | 13..=19 |
-/// | XorFold    | `h·w`            |  8..=11 |
-/// | Scale      | `h + w`          |  5..=10 |
-/// | LUTs       | [`lut_height`]   | {17, 16, 14, 11, 10, 8, 6, 5} |
+/// | table      | live rows          | bits    |
+/// |------------|--------------------|---------|
+/// | InputQuant | `max(h,w)·k`       | 14..=22 |
+/// | Matmul     | `h·w·(k/32)`       | 13..=22 |
+/// | Blake3     | `8·compressions`   | 13..=19 |
+/// | XorFold    | `h·w`              |  8..=11 |
+/// | Scale      | `h + w`            |  5..=10 |
+/// | LUTs       | [`lut_height`]      | {17, 16, 14, 11, 10, 8, 6, 5} |
 ///
-/// Blake3 work is bounded in closed form from the statement's scalars before
-/// compilation (`PublicParams::check_blake3_work_bound`): four plane trees, MoE
-/// routing/offsets trees, two root folds, and the jackpot together consume at
-/// most `2^22` compression-message bytes. Thus there are at most `2^16`
-/// compressions and `2^19` rows. The minimum legal tile still has
-/// more than `2^12` Blake3 rows. The union is `[5, 22] \ {12}`: no table lands on `2^12`
-/// (Scale and XorFold top out at `2^10`/`2^11`, and Matmul, InputQuant, and Blake3 all start
-/// at `2^13`).
-/// Coverage and minimality are asserted by
-/// `ladder_covers_the_envelope`; real jobs are gated onto the ladder at
+/// Blake3 work is bounded in closed form from the statement's scalars before compilation
+/// (`PublicParams::check_blake3_work_bound`), so no table's live height reaches `2^12` or
+/// `2^20`-and-beyond; see the envelope docs in [`FP8_MAIN_TABLE_DEGREE_RANGES`].
+///
+/// **Sparse-ladder consensus.** Instead of one stop per reachable height, the ladder keeps
+/// nine stops and every table *pads its committed trace up* to the smallest fitting stop
+/// ([`ladder_padded_rows`]). The `18..=22` span stays dense — the proving-heavy range's
+/// dominant tables (InputQuant and Matmul at `k(h+w)`-scale work) land on their natural
+/// stop and pad nothing — while the dropped stops (`17, 15, 14, 11, 9, 8, 6, 5`) cost only
+/// sub-`2^17` tables a ×2–×4 pad. In exchange, the stage-1 universal verifier walks 15 fold
+/// layers instead of 17, and each table's one-hot degree-flag set shrinks to the stops it
+/// can actually occupy. The ladder equals the padded image of the envelope's reach — asserted
+/// by `ladder_covers_the_envelope`; real jobs are gated onto the ladder at
 /// `Fp8Job::derive`.
-pub const FP8_REACHABLE_DEGREE_BITS: [usize; 17] = [22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 11, 10, 9, 8, 7, 6, 5];
+pub const FP8_REACHABLE_DEGREE_BITS: [usize; 9] = [22, 21, 20, 19, 18, 16, 13, 10, 7];
+
+/// The committed height of a table with `live` rows: the smallest power-of-two ladder stop
+/// that fits. Tables never commit at an off-ladder height, so every degree profile is a
+/// ladder profile by construction (the padding itself reuses each AIR's existing phantom /
+/// pad-row fill — see the per-table docs).
+pub const fn ladder_padded_rows(live: usize) -> usize {
+    let bits = live.next_power_of_two().trailing_zeros() as usize;
+    let mut i = FP8_REACHABLE_DEGREE_BITS.len();
+    while i > 0 {
+        i -= 1;
+        if FP8_REACHABLE_DEGREE_BITS[i] >= bits {
+            return 1 << FP8_REACHABLE_DEGREE_BITS[i];
+        }
+    }
+    panic!("live rows exceed the ladder's tallest stop");
+}
 
 /// Per-main-table inclusive degree-bits ranges `[lo, hi]` over the wire envelope, in
-/// canonical `Table` order — the rows of [`FP8_REACHABLE_DEGREE_BITS`]'s table. Exactness
-/// (each bound is attained by some envelope-legal job) is asserted by
-/// `ladder_covers_the_envelope`; Blake3's bounds are proven, not swept (see above).
-pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(13, 19), (14, 22), (5, 10), (13, 22), (8, 11)];
+/// canonical `Table` order — the *padded* image of each table's live-row reach: a table's
+/// degree flags range over the ladder stops its height can be padded onto, so both bounds
+/// are ladder stops by construction. `ladder_covers_the_envelope` asserts the ranges equal
+/// the padded reach; Blake3's bounds are proven, not swept (see above).
+pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(13, 19), (16, 22), (7, 10), (13, 22), (10, 13)];
 
 /// Batch indices of the *grouped* tables — the LUTs
 /// (`NUM_TABLES..NUM_ALL_TABLES`). Their heights are consensus constants. Each
@@ -965,10 +984,12 @@ mod tests {
         // `min(2^5, smallest table)`: the ladder always folds to its own bottom, so the
         // final-polynomial length is a consensus constant (every real job carries the
         // `2^5` LUT anyway; only sub-envelope test profiles can dip below it).
+        // Profiles are *committed* (post-padding) heights, so each one lies on the ladder;
+        // sub-envelope unit-test geometries may still add their own boundaries.
         for degrees in [
-            vec![19, 17, 16, 13, 10, 8, 6, 5],
-            vec![22, 16, 5],
-            vec![17, 16, 9, 3],
+            vec![19, 16, 13, 10, 7, 5],
+            vec![22, 16, 7],
+            vec![16, 13, 10, 3],
             vec![12, 7, 3],
             vec![12],
         ] {
@@ -990,9 +1011,9 @@ mod tests {
         // The universal-verifier property: one consensus ladder, so a shallower job's
         // schedule is exactly the suffix of a deeper one's from its own tallest table
         // (on-ladder maxima only: an off-ladder max adds its own boundary and diverges).
-        let deep = schedule_boundaries(&[22, 5]);
-        for max in [21, 20, 19, 18, 17, 16, 15, 14, 13] {
-            let shallow = schedule_boundaries(&[max, 5]);
+        let deep = schedule_boundaries(&[22, 7]);
+        for max in [21, 20, 19, 18, 16, 13] {
+            let shallow = schedule_boundaries(&[max, 7]);
             let offset = deep.iter().position(|&b| b == max).unwrap();
             assert_eq!(
                 shallow.as_slice(),
@@ -1004,7 +1025,7 @@ mod tests {
         // The Fiat-Shamir prerequisite: every on-ladder profile yields the *same* config
         // (same absorbed serialization), whatever its height span.
         let consensus = fp8_stark_config(&FP8_REACHABLE_DEGREE_BITS);
-        for degrees in [vec![22, 16, 5], vec![14, 5], vec![17, 16, 10, 8, 6, 5]] {
+        for degrees in [vec![22, 16, 7], vec![13, 7], vec![16, 13, 10, 7]] {
             let config = fp8_stark_config(&degrees);
             assert_eq!(
                 config.fri_config.reduction_strategy, consensus.fri_config.reduction_strategy,
@@ -1119,24 +1140,42 @@ mod tests {
             }
         }
 
-        // The universal envelope's per-table ranges are exactly each table's reach.
+        // Each table's *padded* reach (the ladder stops its live height can pad onto) must
+        // equal its envelope range, and the union must cover every ladder stop.
+        let up = |bits: usize| -> usize {
+            // The ladder is sorted descending: the smallest fitting stop is the last
+            // one `>= bits`, matching `ladder_padded_rows`' tail-first scan.
+            FP8_REACHABLE_DEGREE_BITS
+                .iter()
+                .rev()
+                .find(|&&stop| stop >= bits)
+                .copied()
+                .expect("live reach above the ladder's tallest stop")
+        };
         for (t, reach) in per_table.iter().enumerate() {
+            let padded: BTreeSet<usize> = reach.iter().map(|&b| up(b)).collect();
             let (lo, hi) = FP8_MAIN_TABLE_DEGREE_RANGES[t];
             assert_eq!(
-                (*reach.first().unwrap(), *reach.last().unwrap()),
+                (*padded.first().unwrap(), *padded.last().unwrap()),
                 (lo, hi),
-                "table {t}: envelope range must equal the swept reach"
+                "table {t}: envelope range must equal the padded reach"
             );
         }
 
-        let mut reachable: BTreeSet<usize> = per_table.into_iter().flatten().collect();
+        let mut padded_reach: BTreeSet<usize> = per_table.iter().flat_map(|r| r.iter().map(|&b| up(b))).collect();
         for device in [Device::H100, Device::B200] {
-            reachable.extend(lut_tables(device).into_iter().map(|t| bits(lut_height(t))));
+            padded_reach.extend(lut_tables(device).into_iter().map(|t| bits(lut_height(t))));
         }
 
-        assert!(!reachable.contains(&12), "2^12 must stay unreachable (the ladder's gap)");
         let ladder: BTreeSet<usize> = FP8_REACHABLE_DEGREE_BITS.into_iter().collect();
-        assert_eq!(reachable, ladder, "the consensus ladder must equal the envelope's reach");
+        assert!(
+            padded_reach.is_subset(&ladder),
+            "some table pads off the ladder: {padded_reach:?}"
+        );
+        assert_eq!(
+            padded_reach, ladder,
+            "the padded reach must cover every ladder stop (a stop nothing reaches is a dead fold layer)"
+        );
 
         // The universal envelope is well-formed: bounds on the ladder,
         // fixed LUT slots, and the ladder headed by the tallest reachable table.

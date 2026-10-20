@@ -228,26 +228,27 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
 /// [`num_precommitted_columns`] of its trace): the consensus-frozen data behind the setup
 /// commitment. Deterministic; padding repeats valid entries (module docs).
 pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
-    let height = lut_height(table);
+    let height = lut_height(table); // the committed (ladder-padded) height
     let live = slot_height(table);
     let mut cols: Vec<Vec<F>> = Vec::with_capacity(num_precommitted_columns(table));
     match table {
-        // The stored key tuple is the whole precommitted block (live == height: both are
-        // powers of two, so there is no padding).
+        // The stored key tuple is the whole precommitted block; the tail pad below repeats
+        // the last live row on ladder padding rows (PAIR128 is the padded case).
         LutTable::Bytes2 | LutTable::Pair128 => cols.extend(generate::<F>(table, 0)),
         // The byte pair `(x, y)`, then `x ^ y`, `(x ^ y) >> 4` and `(x ^ y) >> 7`.
         LutTable::Xor8 => {
             cols.extend(generate::<F>(LutTable::Bytes2, 0));
             for shift in [0, 4, 7] {
                 cols.push(
-                    (0..height)
+                    (0..live)
                         .map(|key| F::from_canonical_usize(((key & 0xFF) ^ (key >> 8)) >> shift))
                         .collect(),
                 );
             }
         }
         // Sub-height (or exactly-full) small tables: a saturated key column `min(i, live - 1)`
-        // and the value columns padded alike — padding repeats the last live row's fact.
+        // and the value columns padded alike — padding (key-domain or ladder) repeats the
+        // last live row's fact.
         LutTable::Int8Dec | LutTable::ExpInfo | LutTable::Clamp22 | LutTable::Pow2D | LutTable::Pow2Gb => {
             cols.push((0..height).map(|i| F::from_canonical_usize(i.min(live - 1))).collect());
             for mut col in generate::<F>(table, 0) {
@@ -259,12 +260,20 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
         // WIDTH32's key domain is [1, 32] — a *shifted* ramp (no key 0 row exists, so no
         // multiplicity can serve a zero width claim); live == height, no padding.
         LutTable::Width32 => {
-            cols.push((0..height).map(|i| F::from_canonical_usize(i + 1)).collect());
-            cols.extend(generate::<F>(table, 0));
+            // The stored key ramp runs [1, live] over the live rows and saturates at `live`
+            // on ladder padding rows (a repeated valid width fact).
+            cols.push((0..height).map(|i| F::from_canonical_usize((i + 1).min(live))).collect());
+            let mut generated = generate::<F>(table, 0);
+            for col in &mut generated {
+                let last = *col.last().unwrap();
+                col.resize(height, last);
+            }
+            cols.extend(generated);
         }
-        // Ramp-keyed tables fill their height exactly (live == height, a power of two).
+        // Ramp-keyed tables: the key ramp runs over the live rows and saturates at `live - 1`
+        // on ladder padding rows (a repeated valid entry).
         _ => {
-            cols.push((0..height).map(F::from_canonical_usize).collect());
+            cols.push((0..height).map(|i| F::from_canonical_usize(i.min(live - 1))).collect());
             match table {
                 LutTable::Range16 => {} // the ramp is the whole table
                 LutTable::Qcast | LutTable::Div448 | LutTable::Width16 | LutTable::Log16 => cols.extend(generate::<F>(table, 0)),
@@ -285,7 +294,7 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
                 LutTable::WidthNorm => {
                     cols.extend(generate::<F>(table, 0));
                     for shift in 3..=6 {
-                        cols.push((0..height).map(|x| F::from_canonical_usize(x >> shift)).collect());
+                        cols.push((0..live).map(|x| F::from_canonical_usize(x >> shift)).collect());
                     }
                 }
                 LutTable::RneRnd => {
@@ -299,8 +308,8 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
                     }
                 }
                 LutTable::Pow2G => {
-                    cols.push((0..height).map(|r| F::from_canonical_usize(r.min(25))).collect());
-                    cols.push((0..height).map(|r| F::from_canonical_usize((r + 1).min(49))).collect());
+                    cols.push((0..live).map(|r| F::from_canonical_usize(r.min(25))).collect());
+                    cols.push((0..live).map(|r| F::from_canonical_usize((r + 1).min(49))).collect());
                     cols.push(generate::<F>(table, 0).remove(0));
                     let mut gap = generate::<F>(table, 1);
                     for flag in &mut gap[1] {
@@ -315,6 +324,17 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
                 }
                 _ => unreachable!("handled above"),
             }
+        }
+    }
+    // Ladder padding: repeat the last live row's fact up to the committed height. The
+    // tables' own generators already produced `live` rows (or saturated to `height` for the
+    // small-key tables); a malicious multiplicity on a padding row only re-proves a fact the
+    // table already serves (module docs).
+    for col in &mut cols {
+        debug_assert!(col.len() == live || col.len() == height);
+        if col.len() < height {
+            let last = *col.last().unwrap();
+            col.resize(height, last);
         }
     }
     debug_assert_eq!(cols.len(), num_precommitted_columns(table));

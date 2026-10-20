@@ -40,11 +40,13 @@ pub const fn slot_height(table: LutTable) -> usize {
     }
 }
 
-/// Committed height of the table's AIR: the slot key domain rounded up to a power of two.
-/// Full-height for most tables; EXPINFO (255 -> 256), CLAMP22 (601 -> 1024) and POW2D
-/// (20 -> 32) pad by key saturation (module docs).
+/// Committed height of the table's AIR: the slot key domain rounded up to a power of two,
+/// then padded up to the consensus FRI ladder ([`ladder_padded_rows`]). Full-height for
+/// most tables; EXPINFO (255 -> 256), CLAMP22 (601 -> 1024) and POW2D (20 -> 32) pad by key
+/// saturation, and the ladder's own padding repeats the last live row's fact (module docs:
+/// a malicious multiplicity on a padding row only re-proves a fact the table already serves).
 pub const fn lut_height(table: LutTable) -> usize {
-    slot_height(table).next_power_of_two()
+    crate::v4::circuit::driver::ladder_padded_rows(slot_height(table).next_power_of_two())
 }
 
 /// Stored key columns: the enumerated tuple for BYTES2/PAIR128/XOR8, one ramp or saturated

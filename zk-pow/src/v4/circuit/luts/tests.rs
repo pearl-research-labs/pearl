@@ -85,15 +85,18 @@ fn heights_descend_and_widths_match_the_documented_layout() {
         heights.windows(2).all(|w| w[0] >= w[1]),
         "committed LUTs must descend: {heights:?}"
     );
-    assert_eq!(lut_height(LutTable::RneRnd), 1 << 17);
+    // Committed heights are ladder-padded: a table whose natural power-of-two height
+    // falls off the consensus FRI ladder pads up to the smallest fitting stop
+    // (`ladder_padded_rows`); every committed height is a ladder stop.
+    assert_eq!(lut_height(LutTable::RneRnd), 1 << 18); // natural 2^17 -> ladder stop 18
     assert_eq!(lut_height(LutTable::Range16), 1 << 16);
-    assert_eq!(lut_height(LutTable::Pair128), 1 << 14);
-    assert_eq!(lut_height(LutTable::Clamp22), 1 << 10); // 601 live rows
-    assert_eq!(lut_height(LutTable::Int8Dec), 256);
-    assert_eq!(lut_height(LutTable::ExpInfo), 256); // 255 live rows
-    assert_eq!(lut_height(LutTable::Pow2Gb), 64);
-    assert_eq!(lut_height(LutTable::Pow2D), 32); // 20 live rows
-    assert_eq!(lut_height(LutTable::Width32), 32);
+    assert_eq!(lut_height(LutTable::Pair128), 1 << 16); // natural 2^14 -> ladder stop 16
+    assert_eq!(lut_height(LutTable::Clamp22), 1 << 10); // 601 live rows; 10 is a ladder stop, no padding
+    assert_eq!(lut_height(LutTable::Int8Dec), 1 << 10); // natural 2^8 -> ladder stop 10
+    assert_eq!(lut_height(LutTable::ExpInfo), 1 << 10); // 255 live rows, natural 2^8 -> stop 10
+    assert_eq!(lut_height(LutTable::Pow2Gb), 1 << 7); // natural 2^6 -> ladder stop 7
+    assert_eq!(lut_height(LutTable::Pow2D), 1 << 7); // 20 live rows, natural 2^5 -> stop 7
+    assert_eq!(lut_height(LutTable::Width32), 1 << 7); // natural 2^5 -> ladder stop 7
     assert_eq!(lut_height(LutTable::Width16), 1 << 16);
     assert_eq!(lut_height(LutTable::Log16), 1 << 16);
 
@@ -485,15 +488,30 @@ fn precommitted_blocks_match_the_generators() {
         // Key column(s): the enumerated tuple, the shifted ramp, or the (saturated) ramp.
         match table {
             LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 => {
-                // XOR8's key tuple is BYTES2's enumeration.
+                // XOR8's key tuple is BYTES2's enumeration. Pair128 pads from its 2^14
+                // live rows up to the 2^16 ladder stop, repeating its last live tuple;
+                // Bytes2/Xor8 fill their height exactly.
                 let key_table = if table == LutTable::Xor8 { LutTable::Bytes2 } else { table };
                 let stored = generate::<F>(key_table, 0);
-                assert_eq!(block[0], stored[0], "{table:?} key tuple low");
-                assert_eq!(block[1], stored[1], "{table:?} key tuple high");
+                let live = stored[0].len();
+                assert_eq!(&block[0][..live], &stored[0], "{table:?} key tuple low");
+                assert_eq!(&block[1][..live], &stored[1], "{table:?} key tuple high");
+                // Ladder padding rows repeat the last live tuple.
+                let (last_lo, last_hi) = (*stored[0].last().unwrap(), *stored[1].last().unwrap());
+                assert!(
+                    block[0][live..].iter().all(|&k| k == last_lo),
+                    "{table:?} key tuple low must repeat on padding rows"
+                );
+                assert!(
+                    block[1][live..].iter().all(|&k| k == last_hi),
+                    "{table:?} key tuple high must repeat on padding rows"
+                );
             }
             LutTable::Width32 => assert!(
-                (0..height).all(|i| block[0][i] == F::from_canonical_usize(i + 1)),
-                "WIDTH32 shifted ramp key [1, 32]"
+                // The shifted ramp runs [1, 32] over the live rows and saturates at 32 on
+                // ladder padding rows (a repeated valid width fact).
+                (0..height).all(|i| block[0][i] == F::from_canonical_usize((i + 1).min(live))),
+                "WIDTH32 shifted ramp key [1, 32], saturated on padding rows"
             ),
             _ => assert!(
                 (0..height).all(|i| block[0][i] == F::from_canonical_usize(i.min(live - 1))),
@@ -684,14 +702,19 @@ fn multiplicities_resolve_add_and_land_in_table_columns() {
     assert_eq!(to_u64(mults.table_columns::<F>(LutTable::Xor8)[1][0xF0 + (0x0F << 8)]), 5);
     assert_eq!(mults.table_total(LutTable::Xor8), 5);
 
-    // `lut_trace` appends the multiplicities after the precommitted block.
+    // `lut_trace` appends the multiplicities after the precommitted block (Pow2Gb pads
+    // from its 64 live rows up to the 2^7 ladder stop).
     let trace = lut_trace::<F>(LutTable::Pow2Gb, mults.table_columns(LutTable::Pow2Gb));
     assert_eq!(trace.len(), lut_num_columns(LutTable::Pow2Gb));
-    assert!(trace.iter().all(|c| c.len() == 64));
+    let height = lut_height(LutTable::Pow2Gb);
+    assert!(trace.iter().all(|c| c.len() == height));
     let pow2gb = lut_slot_layout::<F>(LutTable::Pow2Gb, 0);
     assert_eq!(to_u64(trace[pow2gb.multiplicity_column].values[63]), 4);
     assert_eq!(to_u64(trace[pow2gb.key_columns[0]].values[63]), 63);
     assert_eq!(to_u64(pow2gb.value_columns[0].eval_table(&trace, 63, &[])), 1 << 26);
+    // Ladder padding rows repeat the last live row's fact (the saturated key `min(i, 63)`).
+    assert_eq!(to_u64(trace[pow2gb.key_columns[0]].values[height - 1]), 63);
+    assert_eq!(to_u64(pow2gb.value_columns[0].eval_table(&trace, height - 1, &[])), 1 << 26);
 }
 
 #[test]

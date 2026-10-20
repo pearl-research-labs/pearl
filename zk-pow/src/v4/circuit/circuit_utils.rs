@@ -25,7 +25,9 @@ use crate::v4::api::public_params::Device;
 pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
     let mut config = v2_build_recursion_config(rate_bits, pow_bits, stage, is_zk);
     if stage == 1 {
-        config.num_routed_wires = 48;
+        // The narrowest viable width: the vanishing-poly exponentiation gate needs
+        // 2 + TWO_ADICITY(32) routed slots, so nrw >= 34; narrower unsolders it.
+        config.num_routed_wires = 34;
     }
     if stage == 2 {
         config.num_routed_wires = 40;

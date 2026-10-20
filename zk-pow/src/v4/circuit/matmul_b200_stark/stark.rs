@@ -142,7 +142,7 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkB200<F, D> {
     /// Trace height: the cell rows padded to the next power of two with single-row phantom
     /// cells (all-zero, `is_padding = is_cell_final = 1`, `cell_id = h*w + t`).
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        crate::v4::circuit::driver::ladder_padded_rows(self.live_rows())
     }
 
     /// The class (a) ("known") column values — the leading
@@ -1163,10 +1163,11 @@ mod tests {
             &test_lambdas(program.w * program.k, 0x9FB21C651E98DF25),
         );
         assert_eq!(program.live_rows(), 60);
-        assert_eq!(rows.len(), 64);
+        // Natural 2^6, padded to the 2^7 ladder stop.
+        assert_eq!(rows.len(), 128);
         let known = program.known_values();
         for (c, col) in known.iter().enumerate() {
-            assert_eq!(col.len(), 64);
+            assert_eq!(col.len(), 128);
             for (r, row) in rows.iter().enumerate() {
                 assert_eq!(col.values[r], row[c], "known column {c} row {r}");
             }

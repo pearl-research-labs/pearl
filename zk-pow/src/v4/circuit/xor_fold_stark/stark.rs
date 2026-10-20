@@ -97,10 +97,10 @@ impl XorFoldProgram {
         self.lanes.iter().map(Vec::len).sum()
     }
 
-    /// Trace height: the live rows padded to the next power of two with all-zero
+    /// Trace height: the live rows padded up to the consensus FRI ladder with all-zero
     /// `IS_PAD = 1` rows.
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        crate::v4::circuit::driver::ladder_padded_rows(self.live_rows())
     }
 
     /// `cell_words[c]` is cell `c`'s f32 bit pattern and `cell_skips[c]` is its certified
@@ -447,9 +447,9 @@ mod tests {
         };
         let words: Vec<u32> = (0..48u32).map(|i| f32::to_bits(i as f32 - 20.5)).collect();
         let (rows, pis) = program.generate_trace::<F>(&words, &vec![1; words.len()]);
-        assert_eq!(rows.len(), 64, "48 live rows pad to 64");
+        assert_eq!(rows.len(), 128, "48 live rows pad to the 2^7 ladder stop");
         let known = program.known_values::<F>();
-        assert!(known.iter().all(|c| c.len() == 64));
+        assert!(known.iter().all(|c| c.len() == 128));
         // The known columns are bit-exact with the trace fill (the batch verifier's check).
         for (c, col) in known.iter().enumerate() {
             for (r, row) in rows.iter().enumerate() {
@@ -743,16 +743,20 @@ mod tests {
         // one engineered so FOLD_OUT(last) = 0, is caught by the batch verifier's
         // known-column recompute.)
         let mut forged = rows.clone();
-        let last: &mut XorFoldColumnsView<F> = forged.last_mut().unwrap().borrow_mut();
+        // The trace-final flag lives on the last *live* row (`skip_limit`); the ladder
+        // pad rows beyond it are all-zero phantom rows with no final flag to clear.
+        let last = &mut forged[stark.program.skip_limit as usize - 1];
+        let last: &mut XorFoldColumnsView<F> = last.borrow_mut();
         last.is_lane_final = F::ZERO;
         assert!(
             constraints_violated(&stark, &forged, &pis),
             "cleared trace-final flag undetected"
         );
         let known = stark.program.known_values::<F>();
+        let tampered_row = stark.program.skip_limit as usize - 1;
         assert_ne!(
-            known[XOR_FOLD_COL_MAP.is_lane_final].values[rows.len() - 1],
-            forged[rows.len() - 1][XOR_FOLD_COL_MAP.is_lane_final],
+            known[XOR_FOLD_COL_MAP.is_lane_final].values[tampered_row],
+            forged[tampered_row][XOR_FOLD_COL_MAP.is_lane_final],
             "IS_LANE_FINAL must diverge from the verifier's recompute"
         );
     }
