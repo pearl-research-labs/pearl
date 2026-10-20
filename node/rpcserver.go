@@ -581,6 +581,13 @@ func handleCreateRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan 
 			}
 		}
 
+		if !addr.IsForNet(params) {
+			return nil, &btcjson.RPCError{
+				Code:    btcjson.ErrRPCInvalidAddressOrKey,
+				Message: "Invalid address: " + encodedAddr + " is for the wrong network",
+			}
+		}
+
 		// Create a new script which pays to the provided address.
 		pkScript, err := txscript.PayToAddrScript(addr)
 		if err != nil {
@@ -3304,6 +3311,13 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 		}
 	}
 
+	if !addr.IsForNet(params) {
+		return nil, &btcjson.RPCError{
+			Code:    btcjson.ErrRPCInvalidAddressOrKey,
+			Message: "Invalid address: " + c.Address + " is for the wrong network",
+		}
+	}
+
 	if numRequested == 0 {
 		return nil, nil
 	}
@@ -3746,7 +3760,7 @@ func handleValidateAddress(s *rpcServer, cmd interface{}, closeChan <-chan struc
 
 	result := btcjson.ValidateAddressChainResult{}
 	addr, err := btcutil.DecodeAddress(c.Address, s.cfg.ChainParams)
-	if err != nil {
+	if err != nil || !addr.IsForNet(s.cfg.ChainParams) {
 		// Return the default value (false) for IsValid.
 		return result, nil
 	}
