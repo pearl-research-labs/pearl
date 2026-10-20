@@ -175,8 +175,7 @@ mod tests {
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xC0FFEE);
         let mut pp = None;
         for _ in 0..1000 {
-            if let Some(found) = try_mine_one(&mut rng, m, n, k, header, config, None, false, SeedDerivation::Legacy).unwrap()
-            {
+            if let Some(found) = try_mine_one(&mut rng, m, n, k, header, config, None, false, SeedDerivation::Legacy).unwrap() {
                 pp = Some(found);
                 break;
             }
