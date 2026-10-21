@@ -71,7 +71,8 @@ func TestChainSvrCustomResults(t *testing.T) {
 				},
 				Sequence: 4294967295,
 			},
-			expected: `{"txid":"123","vout":1,"scriptSig":{"asm":"0","hex":"00"},"prevOut":{"addresses":["addr1"],"value":0},"sequence":4294967295}`,
+			expected: `{"txid":"123","vout":1,"scriptSig":{"asm":"0","hex":"00"},` +
+				`"prevOut":{"addresses":["addr1"],"value":0.00000000},"sequence":4294967295}`,
 		},
 		{
 			name: "zmq notification",

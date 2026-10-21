@@ -731,15 +731,9 @@ func parseTxAcceptedNtfnParams(params []json.RawMessage) (*chainhash.Hash,
 		return nil, 0, err
 	}
 
-	// Unmarshal second parameter as a floating point number.
-	var famt float64
-	err = json.Unmarshal(params[1], &famt)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	// Bounds check amount.
-	amt, err := btcutil.NewAmount(famt)
+	// Decode the PRL number directly into grains without floating point.
+	var amt btcjson.Amount
+	err = json.Unmarshal(params[1], &amt)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -750,7 +744,7 @@ func parseTxAcceptedNtfnParams(params []json.RawMessage) (*chainhash.Hash,
 		return nil, 0, err
 	}
 
-	return txHash, amt, nil
+	return txHash, btcutil.Amount(amt), nil
 }
 
 // parseTxAcceptedVerboseNtfnParams parses out details about a raw transaction

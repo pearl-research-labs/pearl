@@ -293,6 +293,19 @@ func assignField(paramNum int, fieldName string, dest reflect.Value, src reflect
 		src = src.Elem()
 	}
 
+	// Amount stores grains in Go, but string arguments use the same PRL
+	// representation as JSON. Parse them without going through float64.
+	if dest.Type() == reflect.TypeOf(Amount(0)) && src.Kind() == reflect.String {
+		var amount Amount
+		if err := amount.UnmarshalJSON([]byte(src.String())); err != nil {
+			str := fmt.Sprintf("parameter #%d '%s' must parse to a PRL amount: %v",
+				paramNum, fieldName, err)
+			return makeError(ErrInvalidType, str)
+		}
+		dest.SetInt(int64(amount))
+		return nil
+	}
+
 	// Perform supported type conversions.
 	switch src.Kind() {
 	// Source value is a signed integer of various magnitude.
@@ -509,6 +522,8 @@ func assignField(paramNum int, fieldName string, dest reflect.Value, src reflect
 //     recognizes
 //   - Conversion from string to any size integer for everything
 //     strconv.ParseInt and strconv.ParseUint recognizes
+//   - Conversion from string to Amount using exact PRL JSON number syntax;
+//     integer arguments for Amount fields are interpreted as grains
 //   - Conversion from string to any size float for everything
 //     strconv.ParseFloat recognizes
 //   - Conversion from string to arrays, slices, structs, and maps by treating

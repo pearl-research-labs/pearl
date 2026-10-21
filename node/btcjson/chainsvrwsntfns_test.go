@@ -171,15 +171,15 @@ func TestChainSvrWsNtfns(t *testing.T) {
 		{
 			name: "txaccepted",
 			newNtfn: func() (interface{}, error) {
-				return btcjson.NewCmd("txaccepted", "123", 1.5)
+				return btcjson.NewCmd("txaccepted", "123", btcjson.Amount(150000000))
 			},
 			staticNtfn: func() interface{} {
-				return btcjson.NewTxAcceptedNtfn("123", 1.5)
+				return btcjson.NewTxAcceptedNtfn("123", btcjson.Amount(150000000))
 			},
-			marshalled: `{"jsonrpc":"1.0","method":"txaccepted","params":["123",1.5],"id":null}`,
+			marshalled: `{"jsonrpc":"1.0","method":"txaccepted","params":["123",1.50000000],"id":null}`,
 			unmarshalled: &btcjson.TxAcceptedNtfn{
 				TxID:   "123",
-				Amount: 1.5,
+				Amount: 150000000,
 			},
 		},
 		{

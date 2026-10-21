@@ -73,7 +73,8 @@ func subStructUsage(structType reflect.Type) string {
 		fieldKind := rtf.Type.Kind()
 		switch {
 		case isNumeric(fieldKind):
-			if fieldKind == reflect.Float32 || fieldKind == reflect.Float64 {
+			if fieldKind == reflect.Float32 || fieldKind == reflect.Float64 ||
+				rtf.Type == reflect.TypeOf(Amount(0)) {
 				fieldValue = "n.nnn"
 			} else {
 				fieldValue = "n"

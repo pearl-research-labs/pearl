@@ -100,9 +100,9 @@ type Request struct {
 	ID      interface{}       `json:"id"`
 }
 
-// UnmarshalJSON is a custom unmarshal func for the Request struct. The param
-// field defaults to an empty json.RawMessage array it is omitted by the request
-// or nil if the supplied value is invalid.
+// UnmarshalJSON decodes a request while preserving its raw parameter values.
+// Omitted or null params become an empty slice; other non-array values are
+// rejected.
 func (request *Request) UnmarshalJSON(b []byte) error {
 	// Step 1: Create a type alias of the original struct.
 	type Alias Request
@@ -110,8 +110,8 @@ func (request *Request) UnmarshalJSON(b []byte) error {
 	// Step 2: Create an anonymous struct with raw replacements for the special
 	// fields.
 	aux := &struct {
-		Jsonrpc string        `json:"jsonrpc"`
-		Params  []interface{} `json:"params"`
+		Jsonrpc string            `json:"jsonrpc"`
+		Params  []json.RawMessage `json:"params"`
 		*Alias
 	}{
 		Alias: (*Alias)(request),
@@ -134,19 +134,12 @@ func (request *Request) UnmarshalJSON(b []byte) error {
 		request.Jsonrpc = version
 	}
 
-	rawParams := make([]json.RawMessage, 0)
-
-	for _, param := range aux.Params {
-		marshalledParam, err := json.Marshal(param)
-		if err != nil {
-			return err
-		}
-
-		rawMessage := json.RawMessage(marshalledParam)
-		rawParams = append(rawParams, rawMessage)
+	// Preserve the original number text so exact amount decoders do not
+	// receive values that have already been rounded through float64.
+	request.Params = aux.Params
+	if request.Params == nil {
+		request.Params = make([]json.RawMessage, 0)
 	}
-
-	request.Params = rawParams
 
 	return nil
 }

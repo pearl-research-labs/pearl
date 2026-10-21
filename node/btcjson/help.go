@@ -147,7 +147,7 @@ func reflectTypeToJSONExample(xT descLookupFunc, rt reflect.Type, indentLevel in
 	}
 	kind := rt.Kind()
 	if isNumeric(kind) {
-		if kind == reflect.Float32 || kind == reflect.Float64 {
+		if kind == reflect.Float32 || kind == reflect.Float64 || rt == reflect.TypeOf(Amount(0)) {
 			return []string{"n.nnn"}, false
 		}
 

@@ -445,7 +445,7 @@ type ScriptPubKeyResult struct {
 type GetTxOutResult struct {
 	BestBlock     string             `json:"bestblock"`
 	Confirmations int64              `json:"confirmations"`
-	Value         float64            `json:"value"`
+	Value         Amount             `json:"value"`
 	ScriptPubKey  ScriptPubKeyResult `json:"scriptPubKey"`
 	Coinbase      bool               `json:"coinbase"`
 }
@@ -595,7 +595,7 @@ func (v *Vin) MarshalJSON() ([]byte, error) {
 // PrevOut represents previous output for an input Vin.
 type PrevOut struct {
 	Addresses []string `json:"addresses,omitempty"`
-	Value     float64  `json:"value"`
+	Value     Amount   `json:"value"`
 }
 
 // VinPrevOut is like Vin except it includes PrevOut.  It is used by searchrawtransaction
@@ -671,7 +671,7 @@ func (v *VinPrevOut) MarshalJSON() ([]byte, error) {
 // Vout models parts of the tx data.  It is defined separately since both
 // getrawtransaction and decoderawtransaction use the same structure.
 type Vout struct {
-	Value        float64            `json:"value"`
+	Value        Amount             `json:"value"`
 	N            uint32             `json:"n"`
 	ScriptPubKey ScriptPubKeyResult `json:"scriptPubKey"`
 }

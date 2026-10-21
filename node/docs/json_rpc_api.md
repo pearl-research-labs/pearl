@@ -1,6 +1,7 @@
 # JSON RPC API
 
 1. [Overview](#Overview)<br />
+1.1. [Transaction Amounts and Go API Migration](#TransactionAmounts)<br />
 2. [HTTP POST Versus Websockets](#HttpPostVsWebsockets)<br />
 3. [Authentication](#Authentication)<br />
 3.1.  [Overview](#AuthenticationOverview)<br />
@@ -55,6 +56,56 @@ While the [standard API](#Methods) is stable, the
 progress, incomplete, and susceptible to changes (both additions and removals).
 
 The original Bitcoin JSON-RPC API documentation is available at [https://en.bitcoin.it/wiki/Original_Bitcoin_client/API_Calls_list](https://en.bitcoin.it/wiki/Original_Bitcoin_client/API_Calls_list)
+
+<a name="TransactionAmounts" />
+
+**1.1 Transaction Amounts and Go API Migration**<br />
+
+Starting with 1.5.3, transaction output values, previous-output values,
+`gettxout` values, and `txaccepted` notification amounts are encoded directly
+from integer grains as numeric PRL values with eight decimal places. For example,
+6710886400000002 grains is encoded as `67108864.00000002`. The JSON field names
+and units remain unchanged. Clients must use exact decimal parsing to preserve
+every grain; decoding these numbers into floating-point values can lose precision.
+
+**The exported Go API changes in 1.5.3.** The following fields now use
+`btcjson.Amount`, an integer type whose Go value is measured in grains:
+
+- `btcjson.Vout.Value`
+- `btcjson.PrevOut.Value`
+- `btcjson.GetTxOutResult.Value`
+- `btcjson.TxAcceptedNtfn.Amount`, including the `NewTxAcceptedNtfn` argument
+
+Update Go callers when upgrading the Pearl module. Construct values from integer
+grains and convert decoded values directly to `btcutil.Amount` or `int64`:
+
+```go
+output := btcjson.Vout{Value: btcjson.Amount(125000000)} // 1.25 PRL
+grains := btcutil.Amount(output.Value)                 // 125000000 grains
+```
+
+Remove conversions through `ToPRL`, `NewAmount(float64)`, and multiplication by
+100000000 for these fields. Audit integer literals and comparisons as well:
+`Value: 1` still compiles but now means one grain, not one PRL. The module import
+path remains unchanged. Downstream consumers such as Blockbook must update their
+Pearl dependency and amount conversions together.
+
+The decoder accepts decimal and exponent notation, including `1e-8`, without
+using floating point. It rejects fractional-grain values and signed 64-bit
+overflow. It supports negative values for raw transaction inspection; consensus
+amount validation remains separate. Updated clients cannot recover precision
+already lost by older servers.
+
+RPC request parameters now retain their original JSON number text instead of
+being decoded and re-encoded through `float64`. Integer command parameters must
+therefore use integer JSON tokens such as `1`; spellings such as `1.0` and `1e0`
+are no longer implicitly normalized to integers. `btcjson.NewCmd` accepts
+`Amount` values or integer grain counts for amount arguments, and accepts PRL
+decimal strings such as `"1.25"`; floating-point arguments are rejected.
+
+This change does not alter transaction bytes, consensus rules, or storage
+formats. Wallet balance/send APIs and fee-rate fields retain their existing
+types and require separate work for exact arithmetic throughout those paths.
 
 <a name="HttpPostVsWebsockets" />
 
