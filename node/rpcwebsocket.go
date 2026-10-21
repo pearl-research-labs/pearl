@@ -748,6 +748,17 @@ func (m *wsNotificationManager) UnregisterNewMempoolTxsUpdates(wsc *wsClient) {
 	m.queueNotification <- (*notificationUnregisterNewMempoolTxs)(wsc)
 }
 
+// marshalTxNotification encodes transaction notifications with exact amounts.
+func marshalTxNotification(method string, params ...interface{}) ([]byte, error) {
+	// Use the exact server response types instead of the public notification
+	// structs, whose float64 amounts are retained for Go client compatibility.
+	request, err := btcjson.NewRequest(btcjson.RpcVersion1, nil, method, params)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(request)
+}
+
 // notifyForNewTx notifies websocket clients that have registered for updates
 // when a new transaction is added to the memory pool.
 func (m *wsNotificationManager) notifyForNewTx(clients map[chan struct{}]*wsClient, tx *btcutil.Tx) {
@@ -759,14 +770,13 @@ func (m *wsNotificationManager) notifyForNewTx(clients map[chan struct{}]*wsClie
 		amount += txOut.Value
 	}
 
-	ntfn := btcjson.NewTxAcceptedNtfn(txHashStr, btcutil.Amount(amount).ToPRL())
-	marshalledJSON, err := btcjson.MarshalCmd(btcjson.RpcVersion1, nil, ntfn)
+	marshalledJSON, err := marshalTxNotification(btcjson.TxAcceptedNtfnMethod,
+		txHashStr, rpcAmount(amount))
 	if err != nil {
 		rpcsLog.Errorf("Failed to marshal tx notification: %s", err.Error())
 		return
 	}
 
-	var verboseNtfn *btcjson.TxAcceptedVerboseNtfn
 	var marshalledJSONVerbose []byte
 	for _, wsc := range clients {
 		if wsc.verboseTxUpdates {
@@ -782,9 +792,8 @@ func (m *wsNotificationManager) notifyForNewTx(clients map[chan struct{}]*wsClie
 				return
 			}
 
-			verboseNtfn = btcjson.NewTxAcceptedVerboseNtfn(*rawTx)
-			marshalledJSONVerbose, err = btcjson.MarshalCmd(btcjson.RpcVersion1, nil,
-				verboseNtfn)
+			marshalledJSONVerbose, err = marshalTxNotification(
+				btcjson.TxAcceptedVerboseNtfnMethod, rawTx)
 			if err != nil {
 				rpcsLog.Errorf("Failed to marshal verbose tx "+
 					"notification: %s", err.Error())
