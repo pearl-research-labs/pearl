@@ -23,18 +23,7 @@ Oyster connects to a pearld instance for blockchain queries and notifications
 over websockets. An SPV mode is also available via the
 [Pearl light client](https://github.com/pearl-research-labs/pearl/tree/master/spv).
 
-Wallet clients can use one of two RPC servers:
-
-  1. A legacy JSON-RPC server
-
-     This server is enabled by default.
-
-  2. An experimental gRPC server
-
-     The gRPC server uses a new API built for Oyster, but the API is not
-     stabilized and the server is feature gated behind a config option
-     (`--experimentalrpclisten`). The gRPC server is documented
-     [here](./rpc/documentation/README.md).
+Wallet clients use the legacy JSON-RPC server, which is enabled by default.
 
 For day-to-day use from a terminal, [oystercli](cmd/oystercli/) provides an
 interactive menu-driven client over the JSON-RPC server, including guided

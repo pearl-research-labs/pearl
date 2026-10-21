@@ -16,7 +16,6 @@ import (
 	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/wallet/chain"
 	"github.com/pearl-research-labs/pearl/wallet/rpc/legacyrpc"
-	"github.com/pearl-research-labs/pearl/wallet/rpc/rpcserver"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
 )
@@ -57,7 +56,6 @@ var (
 	walletLog    = backendLog.Logger("WLLT")
 	txmgrLog     = backendLog.Logger("TMGR")
 	chainLog     = backendLog.Logger("CHNS")
-	grpcLog      = backendLog.Logger("GRPC")
 	legacyRPCLog = backendLog.Logger("RPCS")
 	prlnLog      = backendLog.Logger("PRLN")
 )
@@ -68,7 +66,6 @@ func init() {
 	wtxmgr.UseLogger(txmgrLog)
 	chain.UseLogger(chainLog)
 	rpcclient.UseLogger(chainLog)
-	rpcserver.UseLogger(grpcLog)
 	legacyrpc.UseLogger(legacyRPCLog)
 	neutrino.UseLogger(prlnLog)
 }
@@ -79,7 +76,6 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"WLLT": walletLog,
 	"TMGR": txmgrLog,
 	"CHNS": chainLog,
-	"GRPC": grpcLog,
 	"RPCS": legacyRPCLog,
 	"PRLN": prlnLog,
 }
