@@ -6,7 +6,7 @@ use crate::{
     api::{
         proof::{IncompleteBlockHeader, PublicProofParams, SeedDerivation, ZKProof},
         proof_utils::{CompiledPublicParams, compute_jackpot_hash, hash_to_u32_field_array},
-        sanity_checks::check_jackpot_against_nbits,
+        sanity_checks::{check_jackpot_against_nbits, check_rank_penalty},
     },
     circuit::{
         chip::compute_jackpot,
@@ -109,6 +109,7 @@ pub fn verify_plain_proof(
 
     // Perform public params sanity check
     public_params.sanity_check()?;
+    ensure!(public_params.moe.is_none(), "MoE proof rejected by the dense-only softfork");
 
     // Verify all strip values are in [-64, 64] (matching the ZK circuit's IRANGE7P1 range check)
     for strip in private_params.s_a.iter().chain(private_params.s_b.iter()) {
@@ -130,7 +131,10 @@ pub fn verify_plain_proof(
 
     // Compute the actual jackpot hash and check the difficulty condition
     public_params.hash_jackpot = compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
+
+    let nbits = nbits_override.unwrap_or(block_header.nbits);
     check_jackpot_against_nbits(&public_params, nbits_override)?;
+    check_rank_penalty(&public_params.mining_config, &public_params.hash_jackpot(), nbits)?;
 
     Ok(())
 }

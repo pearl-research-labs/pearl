@@ -141,15 +141,15 @@ mod tests {
 
     use bincode::Options;
     use rand_chacha::rand_core::SeedableRng;
-    use zk_pow::api::proof::{MMAType, MiningConfiguration, MoEConfig, PeriodicPattern, SeedDerivation};
-    use zk_pow::ffi::mine::try_mine_one_moe;
+    use zk_pow::api::proof::{MMAType, MiningConfiguration, PeriodicPattern, SeedDerivation};
+    use zk_pow::ffi::mine::try_mine_one;
 
     use crate::common::{ERROR_MSG_MAX_SIZE, MAX_ZK_PROOF_SIZE, PUBLICDATA_MAX_SIZE};
     use crate::verify::verify_zk_proof_v2;
 
-    /// CI-fast MoE parameters with permissive difficulty, mirroring zk-pow's moe_test baseline.
+    /// CI-fast parameters with permissive difficulty.
     fn test_params() -> (IncompleteBlockHeader, MiningConfiguration, usize, usize, usize) {
-        let k = 1024usize;
+        let k = 2048usize;
         let header = IncompleteBlockHeader {
             version: 0,
             prev_block: [0; 32],
@@ -159,29 +159,28 @@ mod tests {
         };
         let config = MiningConfiguration {
             common_dim: k as u32,
-            rank: 32,
+            rank: 128,
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
             cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41]).unwrap(),
-            moe: Some(MoEConfig { e: 4, top_k: 1 }),
+            moe: None,
         };
         (header, config, 1024, 128, k)
     }
 
-    /// Mine one PlainProof and serialize it the way a miner submits it (the inverse of
+    /// Mine one dense PlainProof and serialize it the way a miner submits it (the inverse of
     /// `PlainProof::deserialize_compat`).
     fn mine_plain_proof_bytes() -> (IncompleteBlockHeader, Vec<u8>) {
         let (header, config, m, n, k) = test_params();
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xC0FFEE);
         let mut pp = None;
         for _ in 0..1000 {
-            if let Some(found) = try_mine_one_moe(&mut rng, m, n, k, header, config, None, false, SeedDerivation::Legacy).unwrap()
-            {
+            if let Some(found) = try_mine_one(&mut rng, m, n, k, header, config, None, false, SeedDerivation::Legacy).unwrap() {
                 pp = Some(found);
                 break;
             }
         }
-        let pp = pp.unwrap_or_else(|| panic!("no MoE proof found in 1000 attempts — check test difficulty params"));
+        let pp = pp.unwrap_or_else(|| panic!("no proof found in 1000 attempts — check test difficulty params"));
         let bytes = bincode::options().with_fixint_encoding().serialize(&pp).unwrap();
         (header, bytes)
     }
