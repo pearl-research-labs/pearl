@@ -54,7 +54,7 @@ for its exact location — point them at the built `oyster`, or pass
 
 ## Connecting
 
-oystercli talks to a running oyster daemon over its legacy JSON-RPC port
+oystercli talks to a running oyster daemon over its JSON-RPC port
 (mainnet `44207`; see `wallet/netparams`). It resolves connection settings
 optimistically and needs no configuration from you:
 

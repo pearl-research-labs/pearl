@@ -99,7 +99,7 @@ func openRPCListeners() ([]net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	listeners := makeListeners(cfg.LegacyRPCListeners, listen)
+	listeners := makeListeners(cfg.RPCListeners, listen)
 	if len(listeners) == 0 {
 		return nil, errors.New("failed to create listeners for the RPC server")
 	}
@@ -122,8 +122,8 @@ func serveRPC(walletLoader *wallet.Loader, listeners []net.Listener) *jsonrpc.Se
 	opts := jsonrpc.Options{
 		Username:            cfg.Username,
 		Password:            cfg.Password,
-		MaxPOSTClients:      cfg.LegacyRPCMaxClients,
-		MaxWebsocketClients: cfg.LegacyRPCMaxWebsockets,
+		MaxPOSTClients:      cfg.RPCMaxClients,
+		MaxWebsocketClients: cfg.RPCMaxWebsockets,
 	}
 	server := jsonrpc.NewServer(&opts, walletLoader, listeners)
 	server.Start()

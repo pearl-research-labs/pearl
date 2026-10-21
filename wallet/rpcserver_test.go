@@ -37,13 +37,13 @@ func useTestConfig(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg = &config{
-		RPCKey:                 cfgutil.NewExplicitString(filepath.Join(dir, "rpc.key")),
-		RPCCert:                cfgutil.NewExplicitString(filepath.Join(dir, "rpc.cert")),
-		Username:               "rpcuser",
-		Password:               "rpcpass",
-		LegacyRPCListeners:     []string{"127.0.0.1:0"},
-		LegacyRPCMaxClients:    defaultRPCMaxClients,
-		LegacyRPCMaxWebsockets: defaultRPCMaxWebsockets,
+		RPCKey:           cfgutil.NewExplicitString(filepath.Join(dir, "rpc.key")),
+		RPCCert:          cfgutil.NewExplicitString(filepath.Join(dir, "rpc.cert")),
+		Username:         "rpcuser",
+		Password:         "rpcpass",
+		RPCListeners:     []string{"127.0.0.1:0"},
+		RPCMaxClients:    defaultRPCMaxClients,
+		RPCMaxWebsockets: defaultRPCMaxWebsockets,
 	}
 }
 

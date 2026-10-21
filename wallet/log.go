@@ -52,12 +52,12 @@ var (
 	// is written to by the Write method of the logWriter type.
 	logRotatorPipe *io.PipeWriter
 
-	log          = backendLog.Logger("PRLW")
-	walletLog    = backendLog.Logger("WLLT")
-	txmgrLog     = backendLog.Logger("TMGR")
-	chainLog     = backendLog.Logger("CHNS")
-	legacyRPCLog = backendLog.Logger("RPCS")
-	prlnLog      = backendLog.Logger("PRLN")
+	log       = backendLog.Logger("PRLW")
+	walletLog = backendLog.Logger("WLLT")
+	txmgrLog  = backendLog.Logger("TMGR")
+	chainLog  = backendLog.Logger("CHNS")
+	rpcLog    = backendLog.Logger("RPCS")
+	prlnLog   = backendLog.Logger("PRLN")
 )
 
 // Initialize package-global logger variables.
@@ -66,7 +66,7 @@ func init() {
 	wtxmgr.UseLogger(txmgrLog)
 	chain.UseLogger(chainLog)
 	rpcclient.UseLogger(chainLog)
-	jsonrpc.UseLogger(legacyRPCLog)
+	jsonrpc.UseLogger(rpcLog)
 	neutrino.UseLogger(prlnLog)
 }
 
@@ -76,7 +76,7 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"WLLT": walletLog,
 	"TMGR": txmgrLog,
 	"CHNS": chainLog,
-	"RPCS": legacyRPCLog,
+	"RPCS": rpcLog,
 	"PRLN": prlnLog,
 }
 

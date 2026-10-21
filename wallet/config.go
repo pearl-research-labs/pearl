@@ -88,18 +88,15 @@ type config struct {
 	BanThreshold uint32        `long:"banthreshold" description:"Maximum allowed ban score before disconnecting and banning misbehaving peers."`
 
 	// RPC server options.
-	//
-	// Usernames can also be used for the consensus RPC client, so they
-	// aren't considered legacy.
-	RPCCert                *cfgutil.ExplicitString `long:"rpccert" description:"File containing the certificate file"`
-	RPCKey                 *cfgutil.ExplicitString `long:"rpckey" description:"File containing the certificate key"`
-	OneTimeTLSKey          bool                    `long:"onetimetlskey" description:"Generate a new TLS certpair at startup, but only write the certificate to disk"`
-	DisableServerTLS       bool                    `long:"noservertls" description:"Disable TLS for the RPC server"`
-	LegacyRPCListeners     []string                `long:"rpclisten" description:"Listen for legacy RPC connections on this interface/port (default port: 44207, testnet: 44209, testnet2: 44211, simnet: 18554, regtest: 18332)"`
-	LegacyRPCMaxClients    int64                   `long:"rpcmaxclients" description:"Max number of legacy RPC clients for standard connections"`
-	LegacyRPCMaxWebsockets int64                   `long:"rpcmaxwebsockets" description:"Max number of legacy RPC websocket connections"`
-	Username               string                  `short:"u" long:"username" description:"Username for legacy RPC and pearld authentication (if pearldusername is unset)"`
-	Password               string                  `short:"P" long:"password" default-mask:"-" description:"Password for legacy RPC and pearld authentication (if pearldpassword is unset)"`
+	RPCCert          *cfgutil.ExplicitString `long:"rpccert" description:"File containing the certificate file"`
+	RPCKey           *cfgutil.ExplicitString `long:"rpckey" description:"File containing the certificate key"`
+	OneTimeTLSKey    bool                    `long:"onetimetlskey" description:"Generate a new TLS certpair at startup, but only write the certificate to disk"`
+	DisableServerTLS bool                    `long:"noservertls" description:"Disable TLS for the RPC server"`
+	RPCListeners     []string                `long:"rpclisten" description:"Listen for RPC connections on this interface/port (default port: 44207, testnet: 44209, testnet2: 44211, simnet: 18554, regtest: 18332)"`
+	RPCMaxClients    int64                   `long:"rpcmaxclients" description:"Max number of RPC clients for standard connections"`
+	RPCMaxWebsockets int64                   `long:"rpcmaxwebsockets" description:"Max number of RPC websocket connections"`
+	Username         string                  `short:"u" long:"username" description:"Username for RPC and pearld authentication (if pearldusername is unset)"`
+	Password         string                  `short:"P" long:"password" default-mask:"-" description:"Password for RPC and pearld authentication (if pearldpassword is unset)"`
 
 	// Deprecated options
 	DataDir *cfgutil.ExplicitString `short:"b" long:"datadir" default-mask:"-" description:"DEPRECATED -- use appdata instead"`
@@ -214,25 +211,25 @@ func parseAndSetDebugLevels(debugLevel string) error {
 func loadConfig() (*config, []string, error) {
 	// Default config.
 	cfg := config{
-		DebugLevel:             defaultLogLevel,
-		ConfigFile:             cfgutil.NewExplicitString(defaultConfigFile),
-		AppDataDir:             cfgutil.NewExplicitString(defaultAppDataDir),
-		LogDir:                 defaultLogDir,
-		LogSize:                defaultLogSizeKB,
-		WalletPass:             wallet.InsecurePubPassphrase,
-		CAFile:                 cfgutil.NewExplicitString(""),
-		RPCKey:                 cfgutil.NewExplicitString(defaultRPCKeyFile),
-		RPCCert:                cfgutil.NewExplicitString(defaultRPCCertFile),
-		LegacyRPCMaxClients:    defaultRPCMaxClients,
-		LegacyRPCMaxWebsockets: defaultRPCMaxWebsockets,
-		DataDir:                cfgutil.NewExplicitString(defaultAppDataDir),
-		UseSPV:                 false,
-		AddPeers:               []string{},
-		ConnectPeers:           []string{},
-		MaxPeers:               neutrino.MaxPeers,
-		BanDuration:            neutrino.BanDuration,
-		BanThreshold:           neutrino.BanThreshold,
-		DBTimeout:              wallet.DefaultDBTimeout,
+		DebugLevel:       defaultLogLevel,
+		ConfigFile:       cfgutil.NewExplicitString(defaultConfigFile),
+		AppDataDir:       cfgutil.NewExplicitString(defaultAppDataDir),
+		LogDir:           defaultLogDir,
+		LogSize:          defaultLogSizeKB,
+		WalletPass:       wallet.InsecurePubPassphrase,
+		CAFile:           cfgutil.NewExplicitString(""),
+		RPCKey:           cfgutil.NewExplicitString(defaultRPCKeyFile),
+		RPCCert:          cfgutil.NewExplicitString(defaultRPCCertFile),
+		RPCMaxClients:    defaultRPCMaxClients,
+		RPCMaxWebsockets: defaultRPCMaxWebsockets,
+		DataDir:          cfgutil.NewExplicitString(defaultAppDataDir),
+		UseSPV:           false,
+		AddPeers:         []string{},
+		ConnectPeers:     []string{},
+		MaxPeers:         neutrino.MaxPeers,
+		BanDuration:      neutrino.BanDuration,
+		BanThreshold:     neutrino.BanThreshold,
+		DBTimeout:        wallet.DefaultDBTimeout,
 	}
 
 	// Pre-parse the command line options to see if an alternative config
@@ -610,25 +607,25 @@ func loadConfig() (*config, []string, error) {
 		}
 	}
 
-	if len(cfg.LegacyRPCListeners) == 0 {
+	if len(cfg.RPCListeners) == 0 {
 		addrs, err := net.LookupHost("localhost")
 		if err != nil {
 			return nil, nil, err
 		}
-		cfg.LegacyRPCListeners = make([]string, 0, len(addrs))
+		cfg.RPCListeners = make([]string, 0, len(addrs))
 		for _, addr := range addrs {
 			addr = net.JoinHostPort(addr, activeNet.RPCServerPort)
-			cfg.LegacyRPCListeners = append(cfg.LegacyRPCListeners, addr)
+			cfg.RPCListeners = append(cfg.RPCListeners, addr)
 		}
 	}
 
 	// Add default port to all rpc listener addresses if needed and remove
 	// duplicate addresses.
-	cfg.LegacyRPCListeners, err = cfgutil.NormalizeAddresses(
-		cfg.LegacyRPCListeners, activeNet.RPCServerPort)
+	cfg.RPCListeners, err = cfgutil.NormalizeAddresses(
+		cfg.RPCListeners, activeNet.RPCServerPort)
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
-			"Invalid network address in legacy RPC listeners: %v\n", err)
+			"Invalid network address in RPC listeners: %v\n", err)
 		return nil, nil, err
 	}
 
@@ -637,7 +634,7 @@ func loadConfig() (*config, []string, error) {
 			fmt.Fprintln(os.Stderr, "Warning: Running on mainnet with --noservertls is not recommended")
 		}
 
-		for _, addr := range cfg.LegacyRPCListeners {
+		for _, addr := range cfg.RPCListeners {
 			_, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				str := "%s: RPC listen interface '%s' is " +
