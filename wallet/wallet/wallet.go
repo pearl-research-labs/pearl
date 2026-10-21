@@ -2213,7 +2213,7 @@ func IsChange(details *wtxmgr.TxDetails, cred wtxmgr.CreditRecord) bool {
 // to its own address lists both. Change lists nothing, and neither does spending a received output: the spend is
 // listed once, on the transaction that makes it.
 //
-// TODO: This should be moved to the legacyrpc package.
+// TODO: This should be moved to the jsonrpc package.
 func transactionEntries(tx walletdb.ReadTx, details *wtxmgr.TxDetails, addrMgr *waddrmgr.Manager, syncHeight int32,
 	net *chaincfg.Params) []btcjson.ListTransactionsResult {
 

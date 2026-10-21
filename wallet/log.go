@@ -15,7 +15,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/rpcclient"
 	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/wallet/chain"
-	"github.com/pearl-research-labs/pearl/wallet/rpc/legacyrpc"
+	"github.com/pearl-research-labs/pearl/wallet/rpc/jsonrpc"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
 )
@@ -66,7 +66,7 @@ func init() {
 	wtxmgr.UseLogger(txmgrLog)
 	chain.UseLogger(chainLog)
 	rpcclient.UseLogger(chainLog)
-	legacyrpc.UseLogger(legacyRPCLog)
+	jsonrpc.UseLogger(legacyRPCLog)
 	neutrino.UseLogger(prlnLog)
 }
 

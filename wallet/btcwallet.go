@@ -16,7 +16,7 @@ import (
 
 	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/wallet/chain"
-	"github.com/pearl-research-labs/pearl/wallet/rpc/legacyrpc"
+	"github.com/pearl-research-labs/pearl/wallet/rpc/jsonrpc"
 	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
@@ -131,7 +131,7 @@ func walletMain() error {
 //
 // The connected chain RPC client is associated with the wallet RPC server for
 // passthrough and to enable methods that require chain state.
-func rpcClientConnectLoop(rpcServer *legacyrpc.Server, loader *wallet.Loader) {
+func rpcClientConnectLoop(rpcServer *jsonrpc.Server, loader *wallet.Loader) {
 	var certs []byte
 	if !cfg.UseSPV {
 		certs = readCAFile()

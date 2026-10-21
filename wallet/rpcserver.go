@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
-	"github.com/pearl-research-labs/pearl/wallet/rpc/legacyrpc"
+	"github.com/pearl-research-labs/pearl/wallet/rpc/jsonrpc"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 )
 
@@ -106,7 +106,7 @@ func openRPCListeners() ([]net.Listener, error) {
 	return listeners, nil
 }
 
-func startRPCServer(walletLoader *wallet.Loader) (*legacyrpc.Server, error) {
+func startRPCServer(walletLoader *wallet.Loader) (*jsonrpc.Server, error) {
 	if cfg.Username == "" || cfg.Password == "" {
 		return nil, errors.New("the RPC server requires a username and password")
 	}
@@ -118,14 +118,14 @@ func startRPCServer(walletLoader *wallet.Loader) (*legacyrpc.Server, error) {
 	return serveRPC(walletLoader, listeners), nil
 }
 
-func serveRPC(walletLoader *wallet.Loader, listeners []net.Listener) *legacyrpc.Server {
-	opts := legacyrpc.Options{
+func serveRPC(walletLoader *wallet.Loader, listeners []net.Listener) *jsonrpc.Server {
+	opts := jsonrpc.Options{
 		Username:            cfg.Username,
 		Password:            cfg.Password,
 		MaxPOSTClients:      cfg.LegacyRPCMaxClients,
 		MaxWebsocketClients: cfg.LegacyRPCMaxWebsockets,
 	}
-	server := legacyrpc.NewServer(&opts, walletLoader, listeners)
+	server := jsonrpc.NewServer(&opts, walletLoader, listeners)
 	server.Start()
 	return server
 }
