@@ -86,7 +86,7 @@ func listenRPC() (listenFunc, error) {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{keyPair},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS13,
 		NextProtos:   []string{"http/1.1"},
 	}
 	return func(network, laddr string) (net.Listener, error) {

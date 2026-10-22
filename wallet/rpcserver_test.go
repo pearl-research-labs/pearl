@@ -194,14 +194,14 @@ func TestRPCServerTLS(t *testing.T) {
 	}
 	resp := postRPC(t, "https://"+addr+"/", cfg.Username, cfg.Password, tlsCfg)
 	require.NotNil(t, resp.TLS)
-	assert.GreaterOrEqual(t, resp.TLS.Version, uint16(tls.VersionTLS12))
+	assert.Equal(t, uint16(tls.VersionTLS13), resp.TLS.Version)
 	assert.Equal(t, "http/1.1", resp.TLS.NegotiatedProtocol)
 	assertJSONRPCReply(t, resp)
 
 	conn, err := tls.Dial("tcp", addr, &tls.Config{
 		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS10,
-		MaxVersion:         tls.VersionTLS11,
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS12,
 	})
 	if conn != nil {
 		conn.Close()

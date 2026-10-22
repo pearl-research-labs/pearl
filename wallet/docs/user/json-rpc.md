@@ -36,8 +36,9 @@ should trust that certificate.
 | `--onetimetlskey` | Generate a new pair each startup and write only the certificate. Refuses to start if the key file already exists |
 | `--noservertls` | Serve plain HTTP |
 
-When TLS is on, the server requires TLS 1.2 or newer and pins ALPN to
-HTTP/1.1 so websocket upgrades keep working.
+When TLS is on, the server requires TLS 1.3 and pins ALPN to HTTP/1.1 so
+websocket upgrades keep working. Clients that only support TLS 1.2 cannot
+connect.
 
 ## Listen address
 
