@@ -2,7 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
-package legacyrpc
+package jsonrpc
 
 import (
 	"crypto/sha256"
@@ -79,7 +79,7 @@ func jsonAuthFail(w http.ResponseWriter) {
 	http.Error(w, "401 Unauthorized.", http.StatusUnauthorized)
 }
 
-// NewServer creates a new server for serving legacy RPC client connections,
+// NewServer creates a new server for serving RPC client connections,
 // both HTTP POST and websocket.
 func NewServer(opts *Options, walletLoader *wallet.Loader, listeners []net.Listener) *Server {
 	serveMux := http.NewServeMux()
@@ -155,7 +155,7 @@ func (s *Server) Start() {
 	}
 }
 
-// serve serves HTTP POST and websocket RPC for the legacy JSON-RPC RPC server.
+// serve serves HTTP POST and websocket RPC for the JSON-RPC server.
 // This function does not block on lis.Accept.
 func (s *Server) serve(lis net.Listener) {
 	s.wg.Add(1)
@@ -167,7 +167,7 @@ func (s *Server) serve(lis net.Listener) {
 	}()
 }
 
-// RegisterWallet associates the legacy RPC server with the wallet.  This
+// RegisterWallet associates the RPC server with the wallet.  This
 // function must be called before any wallet RPCs can be called by clients.
 func (s *Server) RegisterWallet(w *wallet.Wallet) {
 	s.handlerMu.Lock()

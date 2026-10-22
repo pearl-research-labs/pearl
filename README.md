@@ -19,7 +19,7 @@ system, vLLM miner, and supporting tools.
 | Directory | Description |
 |-----------|-------------|
 | [`node/`](node/) | **pearld** — reference implementation of the Pearl Protocol (full node) |
-| [`wallet/`](wallet/) | **Oyster** — HD wallet daemon with JSON-RPC and gRPC interfaces, plus [**oystercli**](wallet/cmd/oystercli/), an interactive terminal client for it |
+| [`wallet/`](wallet/) | **Oyster** — HD wallet daemon with a JSON-RPC interface, plus [**oystercli**](wallet/cmd/oystercli/), an interactive terminal client for it |
 | [`spv/`](spv/) | **Pearl light client** — privacy-preserving SPV client using compact block filters |
 | [`coredns-dnsseed/`](coredns-dnsseed/) | CoreDNS plugin — production DNS seeder |
 | [`xmss/`](xmss/) | XMSS post-quantum signature scheme (C + Go FFI) |

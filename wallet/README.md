@@ -5,7 +5,7 @@
 
 Oyster is the Pearl wallet daemon. It handles wallet functionality for a single
 user, acting as both an RPC client to pearld and an RPC server for wallet
-clients and legacy RPC applications.
+clients.
 
 Public and private keys are derived using the hierarchical deterministic format
 described by [BIP0032](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki).
@@ -23,18 +23,8 @@ Oyster connects to a pearld instance for blockchain queries and notifications
 over websockets. An SPV mode is also available via the
 [Pearl light client](https://github.com/pearl-research-labs/pearl/tree/master/spv).
 
-Wallet clients can use one of two RPC servers:
-
-  1. A legacy JSON-RPC server
-
-     This server is enabled by default.
-
-  2. An experimental gRPC server
-
-     The gRPC server uses a new API built for Oyster, but the API is not
-     stabilized and the server is feature gated behind a config option
-     (`--experimentalrpclisten`). The gRPC server is documented
-     [here](./rpc/documentation/README.md).
+Wallet clients use the JSON-RPC server, which is enabled by default.
+The interface is documented in [JSON-RPC](docs/user/json-rpc.md).
 
 For day-to-day use from a terminal, [oystercli](cmd/oystercli/) provides an
 interactive menu-driven client over the JSON-RPC server, including guided
