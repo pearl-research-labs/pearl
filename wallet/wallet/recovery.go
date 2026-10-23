@@ -58,18 +58,16 @@ func NewRecoveryManager(recoveryWindow, batchSize uint32,
 // attempt.
 func (rm *RecoveryManager) Resurrect(ns walletdb.ReadWriteBucket,
 	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
-	credits []wtxmgr.Credit) error {
+	credits []wtxmgr.Credit, account uint32) error {
 
 	// First, for each scope that we are recovering, rederive all of the
 	// addresses up to the last found address known to each branch.
 	for keyScope, scopedMgr := range scopedMgrs {
-		// Load the current account properties for this scope, using the
-		// the default account number.
-		// TODO(conner): rescan for all created accounts if we allow
-		// users to use non-default address
+		// Load account properties for the specific (scope, account)
+		// recovery context. Each account has an independent horizon.
 		scopeState := rm.state.StateForScope(keyScope)
 		acctProperties, err := scopedMgr.AccountProperties(
-			ns, waddrmgr.DefaultAccountNum,
+			ns, account,
 		)
 		if err != nil {
 			return err
@@ -83,7 +81,7 @@ func (rm *RecoveryManager) Resurrect(ns walletdb.ReadWriteBucket,
 		// deriving each address and adding it to the external branch
 		// recovery state's set of addresses to look for.
 		for i := uint32(0); i < externalCount; i++ {
-			keyPath := externalKeyPath(i)
+			keyPath := externalKeyPath(account, i)
 			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath, true)
 			if err != nil && err != hdkeychain.ErrInvalidChild {
 				return err
@@ -103,7 +101,7 @@ func (rm *RecoveryManager) Resurrect(ns walletdb.ReadWriteBucket,
 		// deriving each address and adding it to the internal branch
 		// recovery state's set of addresses to look for.
 		for i := uint32(0); i < internalCount; i++ {
-			keyPath := internalKeyPath(i)
+			keyPath := internalKeyPath(account, i)
 			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath, true)
 			if err != nil && err != hdkeychain.ErrInvalidChild {
 				return err
