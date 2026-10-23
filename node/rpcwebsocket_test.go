@@ -16,6 +16,8 @@ import (
 	"github.com/btcsuite/btclog"
 	"github.com/btcsuite/websocket"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
+	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/require"
 )
@@ -472,5 +474,80 @@ func TestRunCommandPanicRecovery(t *testing.T) {
 			require.NoError(t, json.Unmarshal(reply, &response))
 			require.Equal(t, btcjson.ErrRPCInternal, response.Error)
 		})
+	}
+}
+
+func TestNotifyReceivedHandlersNetwork(t *testing.T) {
+	t.Parallel()
+
+	handlers := []struct {
+		name   string
+		handle func(*wsClient, []string) (any, error)
+	}{
+		{"notifyreceived", func(wsc *wsClient, addrs []string) (any, error) {
+			return handleNotifyReceived(wsc, &btcjson.NotifyReceivedCmd{Addresses: addrs})
+		}},
+		{"stopnotifyreceived", func(wsc *wsClient, addrs []string) (any, error) {
+			return handleStopNotifyReceived(wsc, &btcjson.StopNotifyReceivedCmd{Addresses: addrs})
+		}},
+	}
+
+	for _, h := range handlers {
+		for _, tt := range addressNetworkCases {
+			t.Run(h.name+" "+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				ntfnMgr := &wsNotificationManager{queueNotification: make(chan any, 1)}
+				wsc := &wsClient{server: &rpcServer{
+					cfg:     rpcserverConfig{ChainParams: &chaincfg.MainNetParams},
+					ntfnMgr: ntfnMgr,
+				}}
+
+				_, err := h.handle(wsc, []string{addressFor(t, tt.params)})
+				if tt.valid {
+					require.NoError(t, err)
+					require.Len(t, ntfnMgr.queueNotification, 1)
+
+					return
+				}
+
+				requireRPCErrorCode(t, err, btcjson.ErrRPCInvalidAddressOrKey)
+				require.Empty(t, ntfnMgr.queueNotification)
+			})
+		}
+	}
+}
+
+func TestHandleLoadTxFilterNetwork(t *testing.T) {
+	t.Parallel()
+
+	modes := []struct {
+		name   string
+		reload bool
+	}{
+		{"reload", true},
+		{"add to existing filter", false},
+	}
+
+	for _, mode := range modes {
+		for _, tt := range addressNetworkCases {
+			t.Run(mode.name+" "+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				wsc := &wsClient{server: &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}}
+				if !mode.reload {
+					wsc.filterData = newWSClientFilter(nil, nil, &chaincfg.MainNetParams)
+				}
+
+				encoded := addressFor(t, tt.params)
+				addr, err := btcutil.DecodeAddress(encoded, tt.params)
+				require.NoError(t, err)
+
+				cmd := btcjson.NewLoadTxFilterCmd(mode.reload, []string{encoded}, nil)
+				_, err = handleLoadTxFilter(wsc, cmd)
+				require.NoError(t, err)
+				require.Equal(t, tt.valid, wsc.filterData.existsAddress(addr))
+			})
+		}
 	}
 }
