@@ -497,6 +497,7 @@ func TestNotifyReceivedHandlersNetwork(t *testing.T) {
 			t.Run(h.name+" "+tt.name, func(t *testing.T) {
 				t.Parallel()
 
+				// A request only reaches the notification manager once the address is accepted.
 				ntfnMgr := &wsNotificationManager{queueNotification: make(chan any, 1)}
 				wsc := &wsClient{server: &rpcServer{
 					cfg:     rpcserverConfig{ChainParams: &chaincfg.MainNetParams},
@@ -518,6 +519,7 @@ func TestNotifyReceivedHandlersNetwork(t *testing.T) {
 	}
 }
 
+// loadtxfilter never reports an address it cannot use, so a rejection only shows in the filter itself.
 func TestHandleLoadTxFilterNetwork(t *testing.T) {
 	t.Parallel()
 

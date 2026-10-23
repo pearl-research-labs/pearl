@@ -80,8 +80,8 @@ func TestValidateRecipient(t *testing.T) {
 		wantErr string
 	}{
 		{"mainnet address", mainnetAddr, ""},
-		{"empty", "", "address is required"},
-		{"not an address", "not an address", "not a valid address"},
+		{"empty address", "", "address is required"},
+		{"malformed address", "not an address", "not a valid address"},
 		{"testnet address", testnetAddr, "address is not for mainnet"},
 	}
 
