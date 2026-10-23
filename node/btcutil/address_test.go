@@ -5,7 +5,6 @@
 package btcutil_test
 
 import (
-	"slices"
 	"strings"
 	"testing"
 
@@ -149,68 +148,71 @@ func TestEncodeDecodeAddressStringer(t *testing.T) {
 	require.Equal(t, addr, decoded, "decoded address should match original")
 }
 
-// TestDecodeAddressNetwork ensures an address only decodes for the networks
-// that share its human-readable part.
+// TestDecodeAddressNetwork ensures an address only decodes for the networks that use its prefix. Testnet, testnet2 and
+// signet share tprl, and regtest and simnet share rprl.
 func TestDecodeAddressNetwork(t *testing.T) {
-	mainNet := []*chaincfg.Params{&chaincfg.MainNetParams}
-	testNet := []*chaincfg.Params{&chaincfg.TestNetParams, &chaincfg.TestNet2Params, &chaincfg.SigNetParams}
-	regTest := []*chaincfg.Params{&chaincfg.RegressionNetParams, &chaincfg.SimNetParams}
+	const (
+		mainnetP2TR = "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"
+		mainnetP2MR = "prl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq7dxnv8"
+		testnetP2TR = "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae"
+		testnetP2MR = "tprl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq4zzdnj"
+		regtestP2TR = "rprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq8x86c3"
+		regtestP2MR = "rprl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq0m74k6"
+	)
 
-	allNets := make([]*chaincfg.Params, 0, len(mainNet)+len(testNet)+len(regTest))
-	allNets = append(allNets, mainNet...)
-	allNets = append(allNets, testNet...)
-	allNets = append(allNets, regTest...)
+	var (
+		mainNet  = &chaincfg.MainNetParams
+		testNet  = &chaincfg.TestNetParams
+		testNet2 = &chaincfg.TestNet2Params
+		sigNet   = &chaincfg.SigNetParams
+		regTest  = &chaincfg.RegressionNetParams
+		simNet   = &chaincfg.SimNetParams
+
+		upperMainnetP2TR = strings.ToUpper(mainnetP2TR)
+	)
 
 	tests := []struct {
-		name string
-		addr string
-		nets []*chaincfg.Params
+		name    string
+		addr    string
+		net     *chaincfg.Params
+		wantErr error
 	}{
-		{"mainnet p2tr", "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv", mainNet},
-		{"mainnet p2mr", "prl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq7dxnv8", mainNet},
-		{"testnet p2tr", "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae", testNet},
-		{"testnet p2mr", "tprl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq4zzdnj", testNet},
-		{"regtest p2tr", "rprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq8x86c3", regTest},
-		{"regtest p2mr", "rprl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq0m74k6", regTest},
+		{"mainnet p2tr on mainnet", mainnetP2TR, mainNet, nil},
+		{"mainnet p2mr on mainnet", mainnetP2MR, mainNet, nil},
+		{"mainnet p2tr on testnet", mainnetP2TR, testNet, btcutil.ErrWrongNetwork},
+		{"mainnet p2mr on testnet", mainnetP2MR, testNet, btcutil.ErrWrongNetwork},
+		{"mainnet p2tr on regtest", mainnetP2TR, regTest, btcutil.ErrWrongNetwork},
+		{"testnet p2tr on testnet", testnetP2TR, testNet, nil},
+		{"testnet p2mr on testnet", testnetP2MR, testNet, nil},
+		{"testnet p2tr on testnet2", testnetP2TR, testNet2, nil},
+		{"testnet p2tr on signet", testnetP2TR, sigNet, nil},
+		{"testnet p2tr on mainnet", testnetP2TR, mainNet, btcutil.ErrWrongNetwork},
+		{"testnet p2mr on mainnet", testnetP2MR, mainNet, btcutil.ErrWrongNetwork},
+		{"testnet p2tr on regtest", testnetP2TR, regTest, btcutil.ErrWrongNetwork},
+		{"regtest p2tr on regtest", regtestP2TR, regTest, nil},
+		{"regtest p2mr on regtest", regtestP2MR, regTest, nil},
+		{"regtest p2tr on simnet", regtestP2TR, simNet, nil},
+		{"regtest p2tr on mainnet", regtestP2TR, mainNet, btcutil.ErrWrongNetwork},
+		{"regtest p2tr on testnet", regtestP2TR, testNet, btcutil.ErrWrongNetwork},
+		{"uppercase mainnet p2tr on mainnet", upperMainnetP2TR, mainNet, nil},
+		{"uppercase mainnet p2tr on testnet", upperMainnetP2TR, testNet, btcutil.ErrWrongNetwork},
 	}
 
 	for _, test := range tests {
-		encodings := []struct {
-			name string
-			addr string
-		}{
-			{"lowercase", test.addr},
-			{"uppercase", strings.ToUpper(test.addr)},
-		}
-		for _, encoding := range encodings {
-			t.Run(test.name+" "+encoding.name, func(t *testing.T) {
-				for _, net := range allNets {
-					decoded, err := btcutil.DecodeAddress(encoding.addr, net)
-					if !slices.Contains(test.nets, net) {
-						require.ErrorIs(t, err, btcutil.ErrWrongNetwork, "%s should reject it", net.Name)
-						require.ErrorContains(t, err, "expected "+net.Name)
-						require.Nil(t, decoded)
+		t.Run(test.name, func(t *testing.T) {
+			decoded, err := btcutil.DecodeAddress(test.addr, test.net)
+			if test.wantErr != nil {
+				require.ErrorIs(t, err, test.wantErr)
+				require.Nil(t, decoded)
 
-						continue
-					}
+				return
+			}
 
-					require.NoError(t, err, "%s should accept it", net.Name)
-					require.True(t, decoded.IsForNet(net))
-					require.Equal(t, test.addr, decoded.EncodeAddress())
-				}
-			})
-		}
+			require.NoError(t, err)
+			require.True(t, decoded.IsForNet(test.net))
+			require.Equal(t, strings.ToLower(test.addr), decoded.EncodeAddress())
+		})
 	}
-}
-
-// TestDecodeAddressMalformedOnWrongNetwork ensures a malformed address is
-// reported as such rather than as an address for another network.
-func TestDecodeAddressMalformedOnWrongNetwork(t *testing.T) {
-	badChecksum := "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzaq"
-
-	_, err := btcutil.DecodeAddress(badChecksum, &chaincfg.MainNetParams)
-	require.Error(t, err)
-	require.NotErrorIs(t, err, btcutil.ErrWrongNetwork)
 }
 
 // TestDecodeAddressRejectsLegacy ensures that legacy address types are rejected

@@ -83,31 +83,34 @@ func TestPendingTxError(t *testing.T) {
 
 // TestMakeOutputsNetworkCheck pins that send RPCs reject addresses for other networks, matching validateaddress.
 func TestMakeOutputsNetworkCheck(t *testing.T) {
-	t.Parallel()
-
 	_, pubKey := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{1}, 32))
 
-	pairsFor := func(t *testing.T, params *chaincfg.Params) map[string]btcutil.Amount {
-		t.Helper()
-
-		addr, err := createTaprootAddress(pubKey, params)
-		require.NoError(t, err)
-
-		return map[string]btcutil.Amount{addr.EncodeAddress(): 1000}
+	tests := []struct {
+		name    string
+		params  *chaincfg.Params
+		wantErr bool
+	}{
+		{"mainnet destination", &chaincfg.MainNetParams, false},
+		{"testnet destination", &chaincfg.TestNetParams, true},
+		{"regtest destination", &chaincfg.RegressionNetParams, true},
 	}
 
-	outputs, err := makeOutputs(pairsFor(t, &chaincfg.MainNetParams), &chaincfg.MainNetParams)
-	require.NoError(t, err)
-	require.Len(t, outputs, 1)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, err := createTaprootAddress(pubKey, tt.params)
+			require.NoError(t, err)
 
-	for _, params := range []*chaincfg.Params{&chaincfg.TestNetParams, &chaincfg.RegressionNetParams} {
-		t.Run(params.Name, func(t *testing.T) {
-			t.Parallel()
+			pairs := map[string]btcutil.Amount{addr.EncodeAddress(): 1000}
+			outputs, err := makeOutputs(pairs, &chaincfg.MainNetParams)
+			if !tt.wantErr {
+				require.NoError(t, err)
+				require.Len(t, outputs, 1)
 
-			_, err := makeOutputs(pairsFor(t, params), &chaincfg.MainNetParams)
-			require.Error(t, err)
+				return
+			}
 
-			rpcErr := jsonError(err)
+			var rpcErr *btcjson.RPCError
+			require.ErrorAs(t, err, &rpcErr)
 			require.Equal(t, btcjson.ErrRPCInvalidAddressOrKey, rpcErr.Code)
 			require.Contains(t, rpcErr.Message, btcutil.ErrWrongNetwork.Error())
 		})

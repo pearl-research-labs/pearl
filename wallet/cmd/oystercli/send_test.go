@@ -67,17 +67,36 @@ func TestParseFeeRateEmptyUsesRelayFloor(t *testing.T) {
 }
 
 func TestValidateRecipient(t *testing.T) {
-	t.Parallel()
+	const (
+		mainnetAddr = "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"
+		testnetAddr = "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae"
+	)
 
 	c := &client{cfg: &config{activeNet: mainNetForTest()}}
 
-	require.NoError(t, validateRecipient(c, "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"))
-	require.EqualError(t, validateRecipient(c, ""), "address is required")
-	require.EqualError(t, validateRecipient(c, "not an address"), "not a valid address")
-	require.EqualError(t,
-		validateRecipient(c, "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae"),
-		"address is not for mainnet",
-	)
+	tests := []struct {
+		name    string
+		address string
+		wantErr string
+	}{
+		{"mainnet address", mainnetAddr, ""},
+		{"empty", "", "address is required"},
+		{"not an address", "not an address", "not a valid address"},
+		{"testnet address", testnetAddr, "address is not for mainnet"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateRecipient(c, tt.address)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
 }
 
 func TestValidateFeeRate(t *testing.T) {
