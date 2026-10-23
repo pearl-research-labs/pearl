@@ -64,6 +64,10 @@ func (m *mockRescanner) WaitForShutdown() {
 	// no-op
 }
 
+func (m *mockRescanner) ResumeOptions() []neutrino.RescanOption {
+	return nil
+}
+
 // mockChainService is a mock implementation of a chain service for use in
 // tests.  Only the Start, GetBlockHeader and BestBlock methods are implemented.
 type mockChainService struct {
