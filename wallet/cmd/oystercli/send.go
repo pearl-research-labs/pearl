@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -177,12 +178,12 @@ func validateRecipient(c *client, s string) error {
 	if s == "" {
 		return fmt.Errorf("address is required")
 	}
-	addr, err := btcutil.DecodeAddress(s, c.cfg.activeNet.Params)
-	if err != nil {
-		return fmt.Errorf("not a valid address")
-	}
-	if !addr.IsForNet(c.cfg.activeNet.Params) {
+	_, err := btcutil.DecodeAddress(s, c.cfg.activeNet.Params)
+	switch {
+	case errors.Is(err, btcutil.ErrWrongNetwork):
 		return fmt.Errorf("address is not for %s", c.cfg.activeNet.Params.Name)
+	case err != nil:
+		return fmt.Errorf("not a valid address")
 	}
 	return nil
 }

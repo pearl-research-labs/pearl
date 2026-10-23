@@ -66,6 +66,18 @@ func TestParseFeeRateEmptyUsesRelayFloor(t *testing.T) {
 	assert.Equal(t, 0.0002, rate)
 }
 
+func TestValidateRecipient(t *testing.T) {
+	c := &client{cfg: &config{activeNet: mainNetForTest()}}
+
+	assert.NoError(t, validateRecipient(c, "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"))
+	assert.EqualError(t, validateRecipient(c, ""), "address is required")
+	assert.EqualError(t, validateRecipient(c, "not an address"), "not a valid address")
+	assert.EqualError(t,
+		validateRecipient(c, "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae"),
+		"address is not for mainnet",
+	)
+}
+
 func TestValidateFeeRate(t *testing.T) {
 	assert.NoError(t, validateFeeRate(""))
 	assert.NoError(t, validateFeeRate("0.00001"))

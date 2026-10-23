@@ -109,7 +109,7 @@ func TestMakeOutputsNetworkCheck(t *testing.T) {
 
 			rpcErr := jsonError(err)
 			require.Equal(t, btcjson.ErrRPCInvalidAddressOrKey, rpcErr.Code)
-			require.Contains(t, rpcErr.Message, "not intended for use on mainnet")
+			require.Contains(t, rpcErr.Message, btcutil.ErrWrongNetwork.Error())
 		})
 	}
 }

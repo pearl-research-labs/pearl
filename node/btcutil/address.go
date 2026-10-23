@@ -76,11 +76,34 @@ type Address interface {
 	WitnessProgram() []byte
 }
 
+// ErrWrongNetwork describes an error where an address is well formed but
+// belongs to a different network than the one it was decoded for.
+var ErrWrongNetwork = errors.New("address is for the wrong network")
+
 // DecodeAddress decodes the string encoding of an address and returns
-// the Address if addr is a valid encoding for a known address type.
-// Taproot (witness version 1) and P2MR (witness version 2) are supported.
-// The network is determined from the bech32m human-readable part (HRP).
-func DecodeAddress(addr string, defaultNet *chaincfg.Params) (Address, error) {
+// the Address if addr is a valid encoding for a known address type that
+// belongs to net. Taproot (witness version 1) and P2MR (witness version 2)
+// are supported.
+//
+// The network of an address is determined from its bech32m human-readable
+// part (HRP). An address with a different HRP than net is rejected with an
+// error that wraps ErrWrongNetwork.
+func DecodeAddress(addr string, net *chaincfg.Params) (Address, error) {
+	decoded, err := decodeAddress(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	if !decoded.IsForNet(net) {
+		return nil, fmt.Errorf("%w: expected %s", ErrWrongNetwork, net.Name)
+	}
+
+	return decoded, nil
+}
+
+// decodeAddress decodes the address of any registered network. Only
+// DecodeAddress may call it, otherwise the network check can be skipped.
+func decodeAddress(addr string) (Address, error) {
 	// Bech32 encoded segwit addresses start with a human-readable part
 	// (hrp) followed by '1'. For mainnet the hrp is "bc", and for
 	// testnet it is "tb". If the address string has a prefix that matches

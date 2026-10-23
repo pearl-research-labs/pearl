@@ -5,6 +5,8 @@
 package btcutil_test
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
@@ -145,6 +147,70 @@ func TestEncodeDecodeAddressStringer(t *testing.T) {
 	decoded, err := btcutil.DecodeAddress(addr.String(), &chaincfg.MainNetParams)
 	require.NoError(t, err, "should decode address successfully")
 	require.Equal(t, addr, decoded, "decoded address should match original")
+}
+
+// TestDecodeAddressNetwork ensures an address only decodes for the networks
+// that share its human-readable part.
+func TestDecodeAddressNetwork(t *testing.T) {
+	mainNet := []*chaincfg.Params{&chaincfg.MainNetParams}
+	testNet := []*chaincfg.Params{&chaincfg.TestNetParams, &chaincfg.TestNet2Params, &chaincfg.SigNetParams}
+	regTest := []*chaincfg.Params{&chaincfg.RegressionNetParams, &chaincfg.SimNetParams}
+
+	allNets := make([]*chaincfg.Params, 0, len(mainNet)+len(testNet)+len(regTest))
+	allNets = append(allNets, mainNet...)
+	allNets = append(allNets, testNet...)
+	allNets = append(allNets, regTest...)
+
+	tests := []struct {
+		name string
+		addr string
+		nets []*chaincfg.Params
+	}{
+		{"mainnet p2tr", "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv", mainNet},
+		{"mainnet p2mr", "prl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq7dxnv8", mainNet},
+		{"testnet p2tr", "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae", testNet},
+		{"testnet p2mr", "tprl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq4zzdnj", testNet},
+		{"regtest p2tr", "rprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq8x86c3", regTest},
+		{"regtest p2mr", "rprl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq0m74k6", regTest},
+	}
+
+	for _, test := range tests {
+		encodings := []struct {
+			name string
+			addr string
+		}{
+			{"lowercase", test.addr},
+			{"uppercase", strings.ToUpper(test.addr)},
+		}
+		for _, encoding := range encodings {
+			t.Run(test.name+" "+encoding.name, func(t *testing.T) {
+				for _, net := range allNets {
+					decoded, err := btcutil.DecodeAddress(encoding.addr, net)
+					if !slices.Contains(test.nets, net) {
+						require.ErrorIs(t, err, btcutil.ErrWrongNetwork, "%s should reject it", net.Name)
+						require.ErrorContains(t, err, "expected "+net.Name)
+						require.Nil(t, decoded)
+
+						continue
+					}
+
+					require.NoError(t, err, "%s should accept it", net.Name)
+					require.True(t, decoded.IsForNet(net))
+					require.Equal(t, test.addr, decoded.EncodeAddress())
+				}
+			})
+		}
+	}
+}
+
+// TestDecodeAddressMalformedOnWrongNetwork ensures a malformed address is
+// reported as such rather than as an address for another network.
+func TestDecodeAddressMalformedOnWrongNetwork(t *testing.T) {
+	badChecksum := "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzaq"
+
+	_, err := btcutil.DecodeAddress(badChecksum, &chaincfg.MainNetParams)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, btcutil.ErrWrongNetwork)
 }
 
 // TestDecodeAddressRejectsLegacy ensures that legacy address types are rejected

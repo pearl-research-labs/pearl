@@ -48,7 +48,7 @@ func TestHandleCreateRawTransactionNetworkCheck(t *testing.T) {
 			addr := addressFor(t, params)
 			result, err := create(addr)
 			requireRPCErrorCode(t, err, btcjson.ErrRPCInvalidAddressOrKey)
-			require.ErrorContains(t, err, addr+" is for the wrong network")
+			require.ErrorContains(t, err, btcutil.ErrWrongNetwork.Error())
 			assert.Nil(t, result)
 		})
 	}
@@ -99,7 +99,7 @@ func TestHandleSearchRawTransactionsNetworkCheck(t *testing.T) {
 			cmd := btcjson.NewSearchRawTransactionsCmd(addr, nil, nil, nil, nil, nil, nil)
 			result, err := handleSearchRawTransactions(s, cmd, make(chan struct{}))
 			requireRPCErrorCode(t, err, btcjson.ErrRPCInvalidAddressOrKey)
-			require.ErrorContains(t, err, addr+" is for the wrong network")
+			require.ErrorContains(t, err, btcutil.ErrWrongNetwork.Error())
 			assert.Nil(t, result)
 		})
 	}
