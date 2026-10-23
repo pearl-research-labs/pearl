@@ -511,14 +511,6 @@ func decodeAddress(s string, params *chaincfg.Params) (btcutil.Address, error) {
 			Message: msg,
 		}
 	}
-	if !addr.IsForNet(params) {
-		msg := fmt.Sprintf("Invalid address %q: not intended for use on %s",
-			addr, params.Name)
-		return nil, &btcjson.RPCError{
-			Code:    btcjson.ErrRPCInvalidAddressOrKey,
-			Message: msg,
-		}
-	}
 	return addr, nil
 }
 
