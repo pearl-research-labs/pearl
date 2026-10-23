@@ -67,12 +67,14 @@ func TestParseFeeRateEmptyUsesRelayFloor(t *testing.T) {
 }
 
 func TestValidateRecipient(t *testing.T) {
+	t.Parallel()
+
 	c := &client{cfg: &config{activeNet: mainNetForTest()}}
 
-	assert.NoError(t, validateRecipient(c, "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"))
-	assert.EqualError(t, validateRecipient(c, ""), "address is required")
-	assert.EqualError(t, validateRecipient(c, "not an address"), "not a valid address")
-	assert.EqualError(t,
+	require.NoError(t, validateRecipient(c, "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"))
+	require.EqualError(t, validateRecipient(c, ""), "address is required")
+	require.EqualError(t, validateRecipient(c, "not an address"), "not a valid address")
+	require.EqualError(t,
 		validateRecipient(c, "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae"),
 		"address is not for mainnet",
 	)

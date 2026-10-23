@@ -248,7 +248,7 @@ func sweep() error {
 		User:         opts.RPCUsername,
 		Pass:         rpcPassword,
 		Certificates: rpcCertificate,
-		Params:       activeNet.Params.Name,
+		Params:       activeNet.Name,
 		HTTPPostMode: true,
 	}, nil)
 	if err != nil {
