@@ -82,7 +82,7 @@ func TestValidateRecipient(t *testing.T) {
 		{"mainnet address", mainnetAddr, ""},
 		{"empty address", "", "address is required"},
 		{"malformed address", "not an address", "not a valid address"},
-		{"testnet address", testnetAddr, "address is not for mainnet"},
+		{"testnet address", testnetAddr, "not a valid address"},
 	}
 
 	for _, tt := range tests {
