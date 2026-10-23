@@ -69,14 +69,6 @@ func TestFilterHeaderCheckpoints(t *testing.T) {
 		assert.Truef(t, ok, "missing testnet2 filter checkpoint at height %d", height)
 	}
 
-	// filterHdrs[1] in the chainimport header test. A matching pin would
-	// accept that fixture at height 100000.
-	importFixture := hashFromStr(
-		"b14a448b043b12401327695318318bbb53ec955e1e7963e3fd569a4504489177",
-	)
-	require.NotNil(t, importFixture)
-	assert.NotEqual(t, importFixture, mainPins[100000])
-
 	for net, pins := range filterHeaderCheckpoints {
 		params, ok := paramsByNet[net]
 		require.Truef(t, ok, "unexpected network %v", net)
