@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -681,7 +682,7 @@ type ChainService struct { // nolint:maligned
 // NewChainService returns a new chain service configured to connect to the
 // network type specified by chainParams.  Use start to begin syncing
 // with peers.
-func NewChainService(cfg Config) (*ChainService, error) {
+func NewChainService(cfg Config) (_ *ChainService, retErr error) {
 	// Use the default broadcast timeout if one isn't provided.
 	if cfg.BroadcastTimeout == 0 {
 		cfg.BroadcastTimeout = DefaultBroadcastTimeout
@@ -792,6 +793,14 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// An open file can't be moved aside on Windows.
+	defer func() {
+		if retErr != nil {
+			s.closeHeaderStores()
+		}
+	}()
+
 	s.RegFilterHeaders, err = headerfs.NewFilterHeaderStore(
 		cfg.DataDir, cfg.Database, headerfs.RegularFilter,
 		&cfg.ChainParams, cfg.AssertFilterHeader,
@@ -1697,7 +1706,20 @@ func (s *ChainService) Stop() error {
 	// Signal the remaining goroutines to quit.
 	close(s.quit)
 	s.wg.Wait()
+
+	s.closeHeaderStores()
+
 	return returnErr
+}
+
+// closeHeaderStores closes the header files. Not every store implementation has one, so Close isn't part of the store
+// interfaces.
+func (s *ChainService) closeHeaderStores() {
+	for _, store := range []interface{}{s.BlockHeaders, s.RegFilterHeaders} {
+		if closer, ok := store.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
 }
 
 // IsCurrent lets the caller know whether the chain service's block manager

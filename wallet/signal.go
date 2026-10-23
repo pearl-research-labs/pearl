@@ -23,7 +23,7 @@ var interruptHandlersDone = make(chan struct{})
 var simulateInterruptChannel = make(chan struct{}, 1)
 
 // signals defines the signals that are handled to do a clean shutdown.
-// Conditional compilation is used to also include SIGTERM on Unix.
+// Conditional compilation is used to also include SIGTERM on Unix and Windows.
 var signals = []os.Signal{os.Interrupt}
 
 // simulateInterrupt requests invoking the clean termination process by an

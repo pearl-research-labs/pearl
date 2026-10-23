@@ -7,6 +7,13 @@ import path from 'path';
 import { WalletService } from './wallet-service/wallet-service';
 import { getCurrentNetworkConfig } from '../config/network-config';
 import { removeSetupFile, setupFileGeneration, untrackSetupFile, writeSetupFile } from './setup-file';
+import { shutdownProcess } from './process-shutdown';
+
+// Oyster exits within moments of being asked to, unless the wallet is in the middle of a recovery batch.
+const STOP_TIMEOUT_MS = 10_000;
+// Locking during recovery can't wait that long.
+const FORCE_STOP_TIMEOUT_MS = 2_000;
+const SIGNAL_TIMEOUT_MS = 5_000;
 
 const binaryNameMap: Record<string, Record<string, string>> = {
   win32: {
@@ -430,49 +437,24 @@ class WalletProcess {
   }
 
   async stop(options: { force?: boolean } = {}) {
-    if (!this.isProcessRunning || !this.process) {
-      return { success: false as const, message: 'Wallet is not running' };
+    // A process that is still starting up has to be stopped too, or it outlives the app and keeps the wallet files and
+    // the RPC port.
+    const proc = this.process;
+    if (!proc) {
+      return;
     }
 
-    return new Promise<{ success: true; message: string }>(resolve => {
-      if (!this.process) {
-        resolve({ success: true, message: 'Wallet is not running' });
-        return;
-      }
-
-      const proc = this.process;
-
-      proc.once('exit', () => {
-        this.isProcessRunning = false;
-        this.process = null;
-        resolve({
-          success: true,
-          message: options.force ? 'Wallet force stopped' : 'Wallet stopped successfully',
-        });
-      });
-
-      // When `force` is set, skip the polite SIGTERM. The Go wallet's Stop()
-      // waits for `<-endRecovery()`, which only returns after the current
-      // 2000-block recovery batch completes; during block scanning that can
-      // take a minute or more. bbolt commits are atomic at txn boundaries, so
-      // a mid-batch SIGKILL is safe to replay on the next launch.
-      if (options.force) {
-        proc.kill('SIGKILL');
-        return;
-      }
-
-      proc.kill('SIGTERM');
-
-      // `ChildProcess.killed` flips to true as soon as *any* signal is
-      // dispatched, regardless of whether the process actually died. Use our
-      // own `isProcessRunning` flag (cleared in the 'exit' handler above) to
-      // detect a process that ignored SIGTERM.
-      setTimeout(() => {
-        if (this.isProcessRunning && this.process === proc) {
-          proc.kill('SIGKILL');
-        }
-      }, 5000);
+    const stopTimeoutMs = options.force ? FORCE_STOP_TIMEOUT_MS : STOP_TIMEOUT_MS;
+    const exited = await shutdownProcess(proc, {
+      requestStop: () => this.walletService.stopDaemon(stopTimeoutMs),
+      stopTimeoutMs,
+      signalTimeoutMs: SIGNAL_TIMEOUT_MS,
+      // A termination request would meet the same slow shutdown as the stop request.
+      skipTerminate: options.force,
     });
+    if (!exited) {
+      console.warn(`Wallet process ${proc.pid} did not exit`);
+    }
   }
 
   async killExistingWalletProcesses() {

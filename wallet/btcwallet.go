@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
 	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/wallet/chain"
@@ -24,7 +25,15 @@ import (
 
 var (
 	cfg *config
+
+	// chainClientRetryMin and chainClientRetryMax bound the delay between attempts to start the chain client.
+	chainClientRetryMin = time.Second
+	chainClientRetryMax = 30 * time.Second
 )
+
+// chainLoopStopTimeout bounds how long shutdown waits for the chain client to close its files, so a chain service that
+// is slow to stop can't hold up the exit.
+const chainLoopStopTimeout = 5 * time.Second
 
 func main() {
 	// Use all processor cores.
@@ -90,8 +99,16 @@ func walletMain() error {
 
 	// Create and start chain RPC client so it's ready to connect to
 	// the wallet when loaded later.
+	chainCtx, cancelChain := context.WithCancel(context.Background())
+	defer cancelChain()
+	chainLoopDone := make(chan struct{})
 	if !cfg.NoInitialLoad {
-		go rpcClientConnectLoop(legacyRPCServer, loader)
+		go func() {
+			defer close(chainLoopDone)
+			rpcClientConnectLoop(chainCtx, legacyRPCServer, loader)
+		}()
+	} else {
+		close(chainLoopDone)
 	}
 
 	loader.RunAfterLoad(func(w *wallet.Wallet) {
@@ -111,6 +128,15 @@ func walletMain() error {
 	// Add interrupt handlers to shutdown the various process components
 	// before exiting.  Interrupt handlers run in LIFO order, so the wallet
 	// (which should be closed last) is added first.
+	//
+	// Waiting for the chain client to close the chain database and header files is added before it, as the last step.
+	addInterruptHandler(func() {
+		select {
+		case <-chainLoopDone:
+		case <-time.After(chainLoopStopTimeout):
+			log.Warn("Timed out waiting for the chain client to stop")
+		}
+	})
 	addInterruptHandler(func() {
 		err := loader.UnloadWallet()
 		if err != nil && err != wallet.ErrNotLoaded {
@@ -138,6 +164,10 @@ func walletMain() error {
 		}()
 	}
 
+	// Added last so it runs first: whatever the wallet still waits for from the chain client, such as a recovery batch,
+	// then ends at once instead of holding up the shutdown.
+	addInterruptHandler(cancelChain)
+
 	<-interruptHandlersDone
 	log.Info("Shutdown complete")
 	return nil
@@ -150,57 +180,35 @@ func walletMain() error {
 // The legacy RPC is optional.  If set, the connected RPC client will be
 // associated with the server for RPC passthrough and to enable additional
 // methods.
-func rpcClientConnectLoop(legacyRPCServer *legacyrpc.Server, loader *wallet.Loader) {
+func rpcClientConnectLoop(ctx context.Context, legacyRPCServer *legacyrpc.Server, loader *wallet.Loader) {
 	var certs []byte
 	if !cfg.UseSPV {
 		certs = readCAFile()
 	}
 
-	for {
-		var (
-			chainClient chain.Interface
-			err         error
-		)
+	netDir := networkDir(cfg.AppDataDir.Value, activeNet.Params)
+	retryDelay := chainClientRetryMin
+	syncDataReset := false
 
-		if cfg.UseSPV {
-			var (
-				chainService *neutrino.ChainService
-				spvdb        walletdb.DB
-			)
-			netDir := networkDir(cfg.AppDataDir.Value, activeNet.Params)
-			spvdb, err = walletdb.Create(
-				"bdb", filepath.Join(netDir, "neutrino.db"),
-				true, cfg.DBTimeout, false,
-			)
-			if err != nil {
-				log.Errorf("Unable to create Neutrino DB: %s", err)
+	for ctx.Err() == nil {
+		chainClient, release, err := startChainClient(ctx, netDir, certs)
+		if err != nil {
+			// Resetting more than once can't help and would only throw away the sync progress over and over.
+			if !syncDataReset && isSyncDataCorrupt(err) && resetSyncData(netDir) == nil {
+				syncDataReset = true
 				continue
 			}
-			defer spvdb.Close()
-			chainService, err = neutrino.NewChainService(
-				neutrino.Config{
-					DataDir:      netDir,
-					Database:     spvdb,
-					ChainParams:  *activeNet.Params,
-					ConnectPeers: cfg.ConnectPeers,
-					AddPeers:     cfg.AddPeers,
-				})
-			if err != nil {
-				log.Errorf("Couldn't create Neutrino ChainService: %s", err)
-				continue
+
+			select {
+			case <-time.After(retryDelay):
+			case <-ctx.Done():
+				return
 			}
-			chainClient = chain.NewNeutrinoClient(activeNet.Params, chainService)
-			err = chainClient.Start(context.Background())
-			if err != nil {
-				log.Errorf("Couldn't start Neutrino client: %s", err)
-			}
-		} else {
-			chainClient, err = startChainRPC(certs)
-			if err != nil {
-				log.Errorf("Unable to open connection to consensus RPC server: %v", err)
-				continue
-			}
+			retryDelay = min(2*retryDelay, chainClientRetryMax)
+
+			continue
 		}
+		retryDelay = chainClientRetryMin
 
 		// Rather than inlining this logic directly into the loader
 		// callback, a function variable is used to avoid running any of
@@ -224,11 +232,19 @@ func rpcClientConnectLoop(legacyRPCServer *legacyrpc.Server, loader *wallet.Load
 			}
 		})
 
+		stopOnCancel := context.AfterFunc(ctx, chainClient.Stop)
 		chainClient.WaitForShutdown()
+		stopOnCancel()
 
 		mu.Lock()
 		associateRPCClient = nil
 		mu.Unlock()
+
+		// The next attempt opens the same files.
+		release()
+		if ctx.Err() != nil {
+			return
+		}
 
 		loadedWallet, ok := loader.LoadedWallet()
 		if ok {
@@ -247,6 +263,55 @@ func rpcClientConnectLoop(legacyRPCServer *legacyrpc.Server, loader *wallet.Load
 			loadedWallet.Start()
 		}
 	}
+}
+
+// startChainClient starts the chain client and returns what releases it once it has shut down. On failure nothing is
+// left open, so the next attempt can open the files again or move them aside.
+func startChainClient(ctx context.Context, netDir string, certs []byte) (chain.Interface, func(), error) {
+	if !cfg.UseSPV {
+		chainClient, err := startChainRPC(certs)
+		if err != nil {
+			log.Errorf("Unable to open connection to consensus RPC server: %v", err)
+			return nil, nil, err
+		}
+
+		return chainClient, func() {}, nil
+	}
+
+	spvdb, err := walletdb.Create("bdb", filepath.Join(netDir, neutrinoDBName), true, cfg.DBTimeout, false)
+	if err != nil {
+		log.Errorf("Unable to create Neutrino DB: %s", err)
+		return nil, nil, err
+	}
+	chainService, err := neutrino.NewChainService(neutrino.Config{
+		DataDir:      netDir,
+		Database:     spvdb,
+		ChainParams:  *activeNet.Params,
+		ConnectPeers: cfg.ConnectPeers,
+		AddPeers:     cfg.AddPeers,
+	})
+	if err != nil {
+		log.Errorf("Couldn't create Neutrino ChainService: %s", err)
+		_ = spvdb.Close()
+		return nil, nil, err
+	}
+
+	// The chain service uses the database until it has stopped.
+	release := func() {
+		if err := chainService.Stop(); err != nil {
+			log.Errorf("Couldn't stop Neutrino ChainService: %s", err)
+		}
+		_ = spvdb.Close()
+	}
+
+	chainClient := chain.NewNeutrinoClient(activeNet.Params, chainService)
+	if err := chainClient.Start(ctx); err != nil {
+		log.Errorf("Couldn't start Neutrino client: %s", err)
+		release()
+		return nil, nil, err
+	}
+
+	return chainClient, release, nil
 }
 
 func readCAFile() []byte {

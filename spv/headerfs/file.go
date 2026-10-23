@@ -3,7 +3,6 @@ package headerfs
 import (
 	"bytes"
 	"fmt"
-	"io"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
@@ -17,9 +16,8 @@ type ErrHeaderNotFound struct {
 
 // appendRaw appends a new raw header to the end of the flat file.
 func (h *headerStore) appendRaw(header []byte) error {
-	// Get current file position before writing. We'll use this position to
-	// revert to if the write fails partially.
-	currentPos, err := h.file.Seek(0, io.SeekCurrent)
+	// Roll back to the size, not the position: a file opened for appending is at position zero until its first write.
+	size, err := h.size()
 	if err != nil {
 		return err
 	}
@@ -30,7 +28,7 @@ func (h *headerStore) appendRaw(header []byte) error {
 		// truncate the file back to its original size to maintain
 		// consistency. This removes the partial/corrupt header.
 		if n > 0 {
-			truncErr := h.file.Truncate(currentPos)
+			truncErr := h.truncateToSize(size)
 			if truncErr != nil {
 				return fmt.Errorf("failed to write header "+
 					"type %s: partial write (%d bytes), "+
@@ -41,6 +39,16 @@ func (h *headerStore) appendRaw(header []byte) error {
 
 		return fmt.Errorf("failed to write header type %s: write "+
 			"error: %w", h.indexType, err)
+	}
+
+	// The index is durable once its transaction commits, so the headers it refers to must be on disk first. A crash
+	// would otherwise leave the index ahead of the file.
+	if err := h.file.Sync(); err != nil {
+		if truncErr := h.truncateToSize(size); truncErr != nil {
+			return fmt.Errorf("failed to sync header type %s: %w, truncate error: %v", h.indexType, err, truncErr)
+		}
+
+		return fmt.Errorf("failed to sync header type %s: %w", h.indexType, err)
 	}
 
 	return nil

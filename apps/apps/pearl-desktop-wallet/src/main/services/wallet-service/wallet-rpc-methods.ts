@@ -67,6 +67,10 @@ class WalletRpcMethods {
     return this.rpc.call<void>('walletlock', []);
   }
 
+  stopDaemon(timeoutMs: number) {
+    return this.rpc.call<string>('stop', [], timeoutMs);
+  }
+
   changeWalletPassphrase(oldPassphrase: string, newPassphrase: string) {
     return this.rpc.call<void>('walletpassphrasechange', [oldPassphrase, newPassphrase]);
   }

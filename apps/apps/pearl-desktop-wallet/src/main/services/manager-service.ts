@@ -103,9 +103,7 @@ class ManagerService implements ManagerApi {
     // Create and import spawn a child that is not the long-running daemon.
     // Stop it before will-quit wipes wallet-setup.json.
     await this.walletProcess.stopSetupChild();
-    if (this.walletProcess.getStatus().isRunning) {
-      await this.walletProcess.stop(options);
-    }
+    await this.walletProcess.stop(options);
   }
 
   async startWalletProcess() {
@@ -129,10 +127,9 @@ class ManagerService implements ManagerApi {
     this.currentWallet = null;
   }
 
-  // Fast path for the Lock button while the wallet is mid-block-recovery. The
-  // `walletlock` RPC would sit on Wallet.walletLocker -> `<-endRecovery()` for
-  // up to a minute, so we skip it entirely and SIGKILL the child. Safe because
-  // bbolt write txns are atomic at commit; a mid-batch kill just replays that
+  // Fast path for the Lock button while the wallet is mid-block-recovery. The `walletlock` RPC would sit on
+  // Wallet.walletLocker -> `<-endRecovery()` for up to a minute, so we skip it entirely and give the child two seconds
+  // to stop before killing it. Safe because bbolt write txns are atomic at commit; a mid-batch kill just replays that
   // batch on the next open.
   async forceLockWallet() {
     await this.stopWalletProcess({ force: true });

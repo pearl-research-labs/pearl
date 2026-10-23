@@ -19,7 +19,9 @@ func TestAppendRow(t *testing.T) {
 		initialData   []byte
 		headerToWrite []byte
 		writeFn       func([]byte, File) (int, error)
-		truncFn       func(int64, File) error
+		syncFn        func() error
+		truncFn       func(int64, string) error
+		reopened      bool
 		expected      []byte
 		wantErr       bool
 		errMsg        string
@@ -77,7 +79,7 @@ func TestAppendRow(t *testing.T) {
 				return n, errors.New("simulated partial " +
 					"write failure")
 			},
-			truncFn: func(size int64, _ File) error {
+			truncFn: func(size int64, _ string) error {
 				return errors.New("simulated truncate failure")
 			},
 			expected: []byte{0x01, 0x02, 0x03, 0x04},
@@ -102,13 +104,13 @@ func TestAppendRow(t *testing.T) {
 				return n, errors.New("simulated partial " +
 					"write failure")
 			},
-			truncFn: func(size int64, file File) error {
+			truncFn: func(size int64, path string) error {
 				// Simulate an incomplete truncation: shrink the
 				// file by just one byte, leaving part of the
 				// partial write data in place in other words
 				// not fully removing the partially written
 				// header from the end of the file.
-				err := file.Truncate(4)
+				err := os.Truncate(path, 4)
 				if err != nil {
 					return err
 				}
@@ -121,6 +123,37 @@ func TestAppendRow(t *testing.T) {
 				"%s: partial write (2 bytes), write error: "+
 				"simulated partial write failure, truncate "+
 				"error: simulated truncate failure", Block),
+		},
+		{
+			name:          "PartialWrite AfterReopen KeepsData",
+			initialData:   []byte{0x01, 0x02, 0x03},
+			headerToWrite: []byte{0x04, 0x05, 0x06},
+			writeFn: func(p []byte, file File) (int, error) {
+				if _, err := file.Seek(0, io.SeekEnd); err != nil {
+					return 0, err
+				}
+				n, err := file.Write(p[:1])
+				if err != nil {
+					return n, err
+				}
+
+				return n, errors.New("disk full")
+			},
+			reopened: true,
+			expected: []byte{0x01, 0x02, 0x03},
+			wantErr:  true,
+			errMsg:   "disk full",
+		},
+		{
+			name:          "SyncError RollsBack",
+			initialData:   []byte{0x01, 0x02, 0x03},
+			headerToWrite: []byte{0x04, 0x05, 0x06},
+			syncFn: func() error {
+				return errors.New("sync failure")
+			},
+			expected: []byte{0x01, 0x02, 0x03},
+			wantErr:  true,
+			errMsg:   "sync failure",
 		},
 		{
 			name:          "NormalWrite ValidHeader DataAppended",
@@ -144,9 +177,11 @@ func TestAppendRow(t *testing.T) {
 			}
 
 			// Reset the file position to the end of initial data.
-			_, err = tmpFile.Seek(
-				int64(len(test.initialData)), io.SeekStart,
-			)
+			position := int64(len(test.initialData))
+			if test.reopened {
+				position = 0
+			}
+			_, err = tmpFile.Seek(position, io.SeekStart)
 			if err != nil {
 				t.Fatalf("Failed to seek: %v", err)
 			}
@@ -155,10 +190,23 @@ func TestAppendRow(t *testing.T) {
 			mockFile := &mockFile{
 				File:    tmpFile,
 				writeFn: test.writeFn,
+				syncFn:  test.syncFn,
 				truncFn: test.truncFn,
 			}
 
 			hdrFile := &headerFile{file: mockFile}
+
+			// A rollback on Windows replaces the handle, and Windows can't remove an open file: close the current one.
+			defer func() { _ = hdrFile.file.Close() }()
+
+			// Windows truncates the closed file by path, bypassing mockFile.Truncate: fail that call too.
+			if test.truncFn != nil {
+				prev := truncatePath
+				truncatePath = func(path string, size int64) error {
+					return test.truncFn(size, path)
+				}
+				defer func() { truncatePath = prev }()
+			}
 
 			// Create a header store with our mock file.
 			h := &headerStore{
@@ -181,13 +229,8 @@ func TestAppendRow(t *testing.T) {
 					"in %q", test.errMsg, err.Error())
 			}
 
-			// Reset file position to start for reading.
-			if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-				t.Fatalf("Failed to seek to start: %v", err)
-			}
-
-			// Read the file contents.
-			actualData, err := io.ReadAll(tmpFile)
+			// Read by path: a rollback on Windows closes the handle created above.
+			actualData, err := os.ReadFile(tmpFile.Name())
 			if err != nil {
 				t.Fatalf("Failed to read file: %v", err)
 			}
@@ -243,7 +286,7 @@ type mockFile struct {
 	*os.File
 	writeFn func([]byte, File) (int, error)
 	syncFn  func() error
-	truncFn func(int64, File) error
+	truncFn func(int64, string) error
 }
 
 // Write implements the Write method for FileInterface.
@@ -265,7 +308,7 @@ func (m *mockFile) Sync() error {
 // Truncate implements the Truncate method for FileInterface.
 func (m *mockFile) Truncate(size int64) error {
 	if m.truncFn != nil {
-		return m.truncFn(size, m.File)
+		return m.truncFn(size, m.Name())
 	}
 	return m.File.Truncate(size)
 }
