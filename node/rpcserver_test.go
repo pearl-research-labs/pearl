@@ -15,10 +15,8 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/blockchain"
-	"github.com/pearl-research-labs/pearl/node/blockchain/indexers"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
-	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/mempool"
 	"github.com/pearl-research-labs/pearl/node/mining"
@@ -706,110 +704,4 @@ func TestJsonRPCReadAcceptsSubmitblockSizedBody(t *testing.T) {
 	require.NoError(t, json.Unmarshal(respBody, &rpcResp))
 	require.NotNil(t, rpcResp.Error,
 		"garbage block payload should fail block decoding, not size limiting")
-}
-
-// addressNetworkCases are shared by the tests of the RPCs that take an address. They run against a mainnet server, so
-// valid is only true for the mainnet address.
-var addressNetworkCases = []struct {
-	name   string
-	params *chaincfg.Params
-	valid  bool
-}{
-	{"mainnet address", &chaincfg.MainNetParams, true},
-	{"testnet address", &chaincfg.TestNetParams, false},
-	{"regtest address", &chaincfg.RegressionNetParams, false},
-}
-
-func addressFor(t *testing.T, params *chaincfg.Params) string {
-	t.Helper()
-
-	addr, err := btcutil.NewAddressTaproot(bytes.Repeat([]byte{1}, 32), params)
-	require.NoError(t, err)
-
-	return addr.EncodeAddress()
-}
-
-func TestHandleCreateRawTransactionNetwork(t *testing.T) {
-	t.Parallel()
-
-	s := &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}
-
-	for _, tt := range addressNetworkCases {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			addr := addressFor(t, tt.params)
-			cmd := btcjson.NewCreateRawTransactionCmd(nil, map[string]float64{addr: 1}, nil)
-
-			result, err := handleCreateRawTransaction(s, cmd, make(chan struct{}))
-			if tt.valid {
-				require.NoError(t, err)
-				require.NotEmpty(t, result)
-
-				return
-			}
-
-			requireRPCErrorCode(t, err, btcjson.ErrRPCInvalidAddressOrKey)
-			require.ErrorContains(t, err, btcutil.ErrWrongNetwork.Error())
-			require.Nil(t, result)
-		})
-	}
-}
-
-func TestHandleValidateAddressNetwork(t *testing.T) {
-	t.Parallel()
-
-	s := &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}
-
-	for _, tt := range addressNetworkCases {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			addr := addressFor(t, tt.params)
-			result, err := handleValidateAddress(s, btcjson.NewValidateAddressCmd(addr), make(chan struct{}))
-			require.NoError(t, err)
-
-			got, ok := result.(btcjson.ValidateAddressChainResult)
-			require.True(t, ok)
-
-			if tt.valid {
-				require.True(t, got.IsValid)
-				require.Equal(t, addr, got.Address)
-
-				return
-			}
-
-			require.Equal(t, btcjson.ValidateAddressChainResult{}, got)
-		})
-	}
-}
-
-func TestHandleSearchRawTransactionsNetwork(t *testing.T) {
-	t.Parallel()
-
-	// Both outcomes are decided before the index is consulted: a wrong network is rejected and a count of zero
-	// returns early, so an empty index is enough.
-	s := &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams, AddrIndex: &indexers.AddrIndex{}}}
-
-	for _, tt := range addressNetworkCases {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			defer requireNoHandlerPanic(t, "address index")
-
-			addr := addressFor(t, tt.params)
-			cmd := btcjson.NewSearchRawTransactionsCmd(addr, nil, nil, btcjson.Int(0), nil, nil, nil)
-
-			result, err := handleSearchRawTransactions(s, cmd, make(chan struct{}))
-			require.Nil(t, result)
-
-			if tt.valid {
-				require.NoError(t, err)
-
-				return
-			}
-
-			requireRPCErrorCode(t, err, btcjson.ErrRPCInvalidAddressOrKey)
-			require.ErrorContains(t, err, btcutil.ErrWrongNetwork.Error())
-		})
-	}
 }

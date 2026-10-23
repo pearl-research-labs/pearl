@@ -5,6 +5,7 @@
 package btcutil_test
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -148,70 +149,51 @@ func TestEncodeDecodeAddressStringer(t *testing.T) {
 	require.Equal(t, addr, decoded, "decoded address should match original")
 }
 
-// TestDecodeAddressNetwork ensures an address only decodes for the networks that use its prefix. Testnet, testnet2 and
-// signet share tprl, and regtest and simnet share rprl.
+// TestDecodeAddressNetwork ensures an address only decodes for the networks that use its prefix, for every pair of
+// networks. Testnet, testnet2 and signet share tprl, and regtest and simnet share rprl.
 func TestDecodeAddressNetwork(t *testing.T) {
-	const (
-		mainnetP2TR = "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"
-		mainnetP2MR = "prl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq7dxnv8"
-		testnetP2TR = "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae"
-		testnetP2MR = "tprl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq4zzdnj"
-		regtestP2TR = "rprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq8x86c3"
-		regtestP2MR = "rprl1zaardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnq0m74k6"
-	)
-
-	var (
-		mainNet  = &chaincfg.MainNetParams
-		testNet  = &chaincfg.TestNetParams
-		testNet2 = &chaincfg.TestNet2Params
-		sigNet   = &chaincfg.SigNetParams
-		regTest  = &chaincfg.RegressionNetParams
-		simNet   = &chaincfg.SimNetParams
-
-		upperMainnetP2TR = strings.ToUpper(mainnetP2TR)
-	)
-
-	tests := []struct {
-		name    string
-		addr    string
-		net     *chaincfg.Params
-		wantErr error
+	networks := []struct {
+		params *chaincfg.Params
+		prefix string
 	}{
-		{"mainnet p2tr on mainnet", mainnetP2TR, mainNet, nil},
-		{"mainnet p2mr on mainnet", mainnetP2MR, mainNet, nil},
-		{"mainnet p2tr on testnet", mainnetP2TR, testNet, btcutil.ErrWrongNetwork},
-		{"mainnet p2mr on testnet", mainnetP2MR, testNet, btcutil.ErrWrongNetwork},
-		{"mainnet p2tr on regtest", mainnetP2TR, regTest, btcutil.ErrWrongNetwork},
-		{"testnet p2tr on testnet", testnetP2TR, testNet, nil},
-		{"testnet p2mr on testnet", testnetP2MR, testNet, nil},
-		{"testnet p2tr on testnet2", testnetP2TR, testNet2, nil},
-		{"testnet p2tr on signet", testnetP2TR, sigNet, nil},
-		{"testnet p2tr on mainnet", testnetP2TR, mainNet, btcutil.ErrWrongNetwork},
-		{"testnet p2mr on mainnet", testnetP2MR, mainNet, btcutil.ErrWrongNetwork},
-		{"testnet p2tr on regtest", testnetP2TR, regTest, btcutil.ErrWrongNetwork},
-		{"regtest p2tr on regtest", regtestP2TR, regTest, nil},
-		{"regtest p2mr on regtest", regtestP2MR, regTest, nil},
-		{"regtest p2tr on simnet", regtestP2TR, simNet, nil},
-		{"regtest p2tr on mainnet", regtestP2TR, mainNet, btcutil.ErrWrongNetwork},
-		{"regtest p2tr on testnet", regtestP2TR, testNet, btcutil.ErrWrongNetwork},
-		{"uppercase mainnet p2tr on mainnet", upperMainnetP2TR, mainNet, nil},
-		{"uppercase mainnet p2tr on testnet", upperMainnetP2TR, testNet, btcutil.ErrWrongNetwork},
+		{&chaincfg.MainNetParams, "prl"},
+		{&chaincfg.TestNetParams, "tprl"},
+		{&chaincfg.TestNet2Params, "tprl"},
+		{&chaincfg.SigNetParams, "tprl"},
+		{&chaincfg.RegressionNetParams, "rprl"},
+		{&chaincfg.SimNetParams, "rprl"},
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			decoded, err := btcutil.DecodeAddress(test.addr, test.net)
-			if test.wantErr != nil {
-				require.ErrorIs(t, err, test.wantErr)
-				require.Nil(t, decoded)
+	witnessProg := bytes.Repeat([]byte{1}, 32)
 
-				return
-			}
+	for _, from := range networks {
+		p2tr, err := btcutil.NewAddressTaproot(witnessProg, from.params)
+		require.NoError(t, err)
 
-			require.NoError(t, err)
-			require.True(t, decoded.IsForNet(test.net))
-			require.Equal(t, strings.ToLower(test.addr), decoded.EncodeAddress())
-		})
+		p2mr, err := btcutil.NewAddressMerkleRoot(witnessProg, from.params)
+		require.NoError(t, err)
+
+		// The upper case form is the same address in a valid bech32m encoding.
+		addrs := []string{p2tr.EncodeAddress(), p2mr.EncodeAddress(), strings.ToUpper(p2tr.EncodeAddress())}
+		require.True(t, strings.HasPrefix(addrs[0], from.prefix+"1"))
+
+		for _, to := range networks {
+			t.Run(from.params.Name+" address on "+to.params.Name, func(t *testing.T) {
+				for _, addr := range addrs {
+					decoded, err := btcutil.DecodeAddress(addr, to.params)
+					if from.prefix != to.prefix {
+						require.ErrorIs(t, err, btcutil.ErrWrongNetwork, addr)
+						require.Nil(t, decoded)
+
+						continue
+					}
+
+					require.NoError(t, err, addr)
+					require.True(t, decoded.IsForNet(to.params))
+					require.Equal(t, strings.ToLower(addr), decoded.EncodeAddress())
+				}
+			})
+		}
 	}
 }
 

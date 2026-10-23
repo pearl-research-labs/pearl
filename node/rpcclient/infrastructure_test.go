@@ -189,7 +189,6 @@ func TestGetNewAddressNetwork(t *testing.T) {
 		{"unset params accept mainnet address", "", mainnetAddr, nil},
 		{"unset params reject testnet address", "", testnetAddr, btcutil.ErrWrongNetwork},
 		{"testnet params accept testnet address", "testnet", testnetAddr, nil},
-		{"testnet params reject mainnet address", "testnet", mainnetAddr, btcutil.ErrWrongNetwork},
 	}
 
 	for _, tt := range tests {

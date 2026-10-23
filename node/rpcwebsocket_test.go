@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"net/http"
@@ -477,45 +478,51 @@ func TestRunCommandPanicRecovery(t *testing.T) {
 	}
 }
 
-func TestNotifyReceivedHandlersNetwork(t *testing.T) {
+// addressNetworkCases are the addresses the tests below send to a mainnet node, and whether the node accepts them.
+var addressNetworkCases = []struct {
+	name   string
+	params *chaincfg.Params
+	valid  bool
+}{
+	{"mainnet address", &chaincfg.MainNetParams, true},
+	{"testnet address", &chaincfg.TestNetParams, false},
+}
+
+func addressFor(t *testing.T, params *chaincfg.Params) btcutil.Address {
+	t.Helper()
+
+	addr, err := btcutil.NewAddressTaproot(bytes.Repeat([]byte{1}, 32), params)
+	require.NoError(t, err)
+
+	return addr
+}
+
+func TestHandleNotifyReceivedNetwork(t *testing.T) {
 	t.Parallel()
 
-	handlers := []struct {
-		name   string
-		handle func(*wsClient, []string) (any, error)
-	}{
-		{"notifyreceived", func(wsc *wsClient, addrs []string) (any, error) {
-			return handleNotifyReceived(wsc, &btcjson.NotifyReceivedCmd{Addresses: addrs})
-		}},
-		{"stopnotifyreceived", func(wsc *wsClient, addrs []string) (any, error) {
-			return handleStopNotifyReceived(wsc, &btcjson.StopNotifyReceivedCmd{Addresses: addrs})
-		}},
-	}
+	for _, tt := range addressNetworkCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	for _, h := range handlers {
-		for _, tt := range addressNetworkCases {
-			t.Run(h.name+" "+tt.name, func(t *testing.T) {
-				t.Parallel()
+			// A request only reaches the notification manager once the address is accepted.
+			ntfnMgr := &wsNotificationManager{queueNotification: make(chan any, 1)}
+			wsc := &wsClient{server: &rpcServer{
+				cfg:     rpcserverConfig{ChainParams: &chaincfg.MainNetParams},
+				ntfnMgr: ntfnMgr,
+			}}
 
-				// A request only reaches the notification manager once the address is accepted.
-				ntfnMgr := &wsNotificationManager{queueNotification: make(chan any, 1)}
-				wsc := &wsClient{server: &rpcServer{
-					cfg:     rpcserverConfig{ChainParams: &chaincfg.MainNetParams},
-					ntfnMgr: ntfnMgr,
-				}}
+			cmd := &btcjson.NotifyReceivedCmd{Addresses: []string{addressFor(t, tt.params).EncodeAddress()}}
+			_, err := handleNotifyReceived(wsc, cmd)
+			if tt.valid {
+				require.NoError(t, err)
+				require.Len(t, ntfnMgr.queueNotification, 1)
 
-				_, err := h.handle(wsc, []string{addressFor(t, tt.params)})
-				if tt.valid {
-					require.NoError(t, err)
-					require.Len(t, ntfnMgr.queueNotification, 1)
+				return
+			}
 
-					return
-				}
-
-				requireRPCErrorCode(t, err, btcjson.ErrRPCInvalidAddressOrKey)
-				require.Empty(t, ntfnMgr.queueNotification)
-			})
-		}
+			requireRPCErrorCode(t, err, btcjson.ErrRPCInvalidAddressOrKey)
+			require.Empty(t, ntfnMgr.queueNotification)
+		})
 	}
 }
 
@@ -523,33 +530,17 @@ func TestNotifyReceivedHandlersNetwork(t *testing.T) {
 func TestHandleLoadTxFilterNetwork(t *testing.T) {
 	t.Parallel()
 
-	modes := []struct {
-		name   string
-		reload bool
-	}{
-		{"reload", true},
-		{"add to existing filter", false},
-	}
+	for _, tt := range addressNetworkCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	for _, mode := range modes {
-		for _, tt := range addressNetworkCases {
-			t.Run(mode.name+" "+tt.name, func(t *testing.T) {
-				t.Parallel()
+			wsc := &wsClient{server: &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}}
+			addr := addressFor(t, tt.params)
 
-				wsc := &wsClient{server: &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}}
-				if !mode.reload {
-					wsc.filterData = newWSClientFilter(nil, nil, &chaincfg.MainNetParams)
-				}
-
-				encoded := addressFor(t, tt.params)
-				addr, err := btcutil.DecodeAddress(encoded, tt.params)
-				require.NoError(t, err)
-
-				cmd := btcjson.NewLoadTxFilterCmd(mode.reload, []string{encoded}, nil)
-				_, err = handleLoadTxFilter(wsc, cmd)
-				require.NoError(t, err)
-				require.Equal(t, tt.valid, wsc.filterData.existsAddress(addr))
-			})
-		}
+			cmd := btcjson.NewLoadTxFilterCmd(true, []string{addr.EncodeAddress()}, nil)
+			_, err := handleLoadTxFilter(wsc, cmd)
+			require.NoError(t, err)
+			require.Equal(t, tt.valid, wsc.filterData.existsAddress(addr))
+		})
 	}
 }

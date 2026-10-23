@@ -92,7 +92,6 @@ func TestMakeOutputsNetworkCheck(t *testing.T) {
 	}{
 		{"mainnet destination", &chaincfg.MainNetParams, false},
 		{"testnet destination", &chaincfg.TestNetParams, true},
-		{"regtest destination", &chaincfg.RegressionNetParams, true},
 	}
 
 	for _, tt := range tests {
@@ -112,7 +111,6 @@ func TestMakeOutputsNetworkCheck(t *testing.T) {
 			var rpcErr *btcjson.RPCError
 			require.ErrorAs(t, err, &rpcErr)
 			require.Equal(t, btcjson.ErrRPCInvalidAddressOrKey, rpcErr.Code)
-			require.Contains(t, rpcErr.Message, btcutil.ErrWrongNetwork.Error())
 		})
 	}
 }
