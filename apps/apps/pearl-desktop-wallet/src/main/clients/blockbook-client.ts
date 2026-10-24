@@ -1,8 +1,12 @@
 import { getCurrentNetwork, type Network } from '../config/network-config';
 
 const BlockbookBaseUrlMap: Record<Network, string> = {
-    testnet: 'http://blockbook.testnet.pearlresearch.ai',
-    mainnet: 'http://blockbook.pearlresearch.ai',
+    // NOTE: plain-https only. The host 301-redirects http -> https, but the
+    // wallet must not send its first request in the clear (fee-estimate
+    // traffic is metadata about wallet activity; a MITM on the initial
+    // plaintext hop could also serve a forged estimate before the redirect).
+    testnet: 'https://blockbook.testnet.pearlresearch.ai',
+    mainnet: 'https://blockbook.pearlresearch.ai',
 };
 
 function getBaseUrl(): string {
