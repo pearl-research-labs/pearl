@@ -411,6 +411,13 @@ func getHeaderEntry(rootBucket walletdb.ReadBucket, hashBytes []byte) (uint32,
 		return getHeaderEntryFallback(rootBucket, hashBytes)
 	}
 
+	// A stored height is exactly 4 bytes; anything else is a corrupt
+	// entry and must not reach BigEndian.Uint32, which panics on a
+	// short slice.
+	if len(heightBytes) != 4 {
+		return 0, ErrHashNotFound
+	}
+
 	return binary.BigEndian.Uint32(heightBytes), nil
 }
 
@@ -425,6 +432,13 @@ func getHeaderEntryFallback(rootBucket walletdb.ReadBucket,
 	if heightBytes == nil {
 		// If the hash wasn't found, then we don't know of this hash
 		// within the index.
+		return 0, ErrHashNotFound
+	}
+
+	// A stored height is exactly 4 bytes; anything else is a corrupt
+	// entry and must not reach BigEndian.Uint32, which panics on a
+	// short slice.
+	if len(heightBytes) != 4 {
 		return 0, ErrHashNotFound
 	}
 
