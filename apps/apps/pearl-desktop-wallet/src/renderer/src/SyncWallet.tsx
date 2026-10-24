@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { useLocation } from 'react-router-dom';
 import { useWalletStore } from './store/walletStore';
 
-const UNLOCKED_ROUTES = ['/wallet', '/send', '/receive', '/activity', '/change-password'];
+const UNLOCKED_ROUTES = ['/wallet', '/send', '/receive', '/activity', '/change-password', '/sign-message'];
 
 function SyncWallet() {
   const { syncWalletData, updateSyncProgress, isBlockchainSynced } = useWalletStore();
