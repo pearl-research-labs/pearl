@@ -644,6 +644,11 @@ func unspendRawCredit(ns walletdb.ReadWriteBucket, k []byte) (btcutil.Amount, er
 	if v == nil {
 		return 0, nil
 	}
+	if len(v) < 9 {
+		str := fmt.Sprintf("%s: short read (expected %d bytes, "+
+			"read %d)", bucketCredits, 9, len(v))
+		return 0, storeError(ErrData, str, nil)
+	}
 	newv := make([]byte, 9)
 	copy(newv, v)
 	newv[8] &^= 1 << 0
