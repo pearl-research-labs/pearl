@@ -56,6 +56,14 @@ const (
 	// is excluded from re-selection.
 	syncPeerCooldown = 10 * time.Minute
 
+	// noSyncPeerRotateSamples is the number of consecutive stall
+	// samples with no sync peer and no viable candidate after which
+	// handleStallSample starts rotating out outbound peers that
+	// advertise a height below ours (see handleNoSyncPeer). At
+	// stallSampleInterval per sample this is a 5-minute grace period
+	// before the first rotation.
+	noSyncPeerRotateSamples = 10
+
 	// lowQualityStrikeLimit is the strike count at which a peer is
 	// downgraded back to low-quality (see nonTipStrikes).
 	lowQualityStrikeLimit = 5
@@ -271,6 +279,30 @@ type SyncManager struct {
 	// pickSyncCandidate skips entries within syncPeerCooldown and
 	// lazy-evicts expired ones.
 	recentlyFailedSync map[string]time.Time
+
+	// announcementSpent records, per outbound peer address, the
+	// announced block hash over which that peer has already
+	// stalled once (as sync peer, or by withholding a requested
+	// block — see coolDownSyncCandidate). Such an announcement is
+	// nothing new anywhere it is consulted: it no longer stands
+	// the no-candidate rotation down (the announcer had its
+	// chance to deliver that block and did not, so counting it
+	// again after its cooldown expires would let a set of
+	// announcers larger than one cooldown window keep rotation
+	// frozen forever, each leaving cooldown while the next is
+	// still being tried), and startSync no longer promotes the
+	// announcer on it (each such promotion would also reset the
+	// rotation grace in handleStallSample, so a cycle of spent
+	// announcers could keep the grace from ever elapsing). A
+	// different announcement from the same peer replaces the
+	// entry and counts again. Only accessed from the
+	// blockHandler thread.
+	announcementSpent map[string]chainhash.Hash
+
+	// noSyncPeerSamples counts consecutive stall samples on which no
+	// sync peer could be selected. Reset whenever a sync peer exists.
+	// Only accessed from the blockHandler thread (handleStallSample).
+	noSyncPeerSamples int
 }
 
 // resetHeaderState sets the headers-first mode state to values appropriate for
@@ -369,6 +401,36 @@ func (sm *SyncManager) pickSyncCandidate() *peerpkg.Peer {
 	return candidates[rand.Intn(len(candidates))]
 }
 
+// atTipSyncPromotionBlocked reports whether promoting a sync
+// candidate is barred while the chain believes it is current. The
+// bar is total: while current, no candidate is promoted, whatever
+// it announced or advertises. An earlier version of this guard
+// still promoted a candidate that announced a block we lack when
+// its advertised height was at or below ours, reasoning that such
+// a promotion cannot flip current() false. That only holds at
+// selection time. Once the peer is the sync peer, an orphan block
+// it serves raises its LastBlock to the height extracted from the
+// orphan's coinbase (handleBlockMsg) — an unauthenticated claim
+// that no contextual check has capped at our best — so current()
+// goes false after all and handleInvMsg silences every other
+// peer's announcements until the stall timer fires. The gate
+// cannot inspect its way out of a height the peer acquires after
+// promotion, so there is no safe at-tip promotion.
+//
+// Nothing is lost by barring it: while current with no sync peer,
+// handleInvMsg already fetches block announcements directly, and
+// promotions resume as soon as the chain is not current.
+// Factored out of startSync with the current flag explicit
+// because the in-process test chain is never current, so the
+// at-tip cases can only be pinned through this seam. The
+// announced/height parameters are retained so callers keep
+// passing the evidence the bar was weighed against, and so the
+// seam records that the bar is a decision about all of it, not
+// an oversight of one case.
+func atTipSyncPromotionBlocked(isCurrent bool, announced *chainhash.Hash, peerHeight, bestHeight int32) bool {
+	return isCurrent
+}
+
 // startSync will choose the best peer among the available candidate peers to
 // download/sync the blockchain from.  When syncing is already running, it
 // simply returns.
@@ -396,10 +458,45 @@ func (sm *SyncManager) startSync() {
 				bestPeer.Addr())
 			return
 		}
+		// An announcement this peer already stalled over once
+		// is nothing new either (see announcementSpent):
+		// promoting it again would hand it a second stall
+		// cycle over the same hash, and handleStallSample
+		// resets the no-candidate rotation streak on any
+		// promotion, so a set of spent announcers taking
+		// turns being promoted could keep the rotation
+		// grace from ever elapsing.
+		if spent, ok := sm.announcementSpent[bestPeer.Addr()]; ok &&
+			spent.IsEqual(announced) {
+			log.Debugf("Skipping sync: candidate %s already "+
+				"stalled over its announced block %s",
+				bestPeer.Addr(), announced)
+			return
+		}
 	} else if bestPeer.LastBlock() <= best.Height {
 		log.Debugf("Skipping sync: candidate %s advertises "+
 			"height %d, our best is %d",
 			bestPeer.Addr(), bestPeer.LastBlock(), best.Height)
+		return
+	}
+
+	// While the chain believes it is current, no candidate is
+	// promoted at all. The version height is unauthenticated and
+	// an announced hash is unverified until the block itself
+	// arrives and validates; worse, a promoted peer can raise its
+	// own LastBlock after promotion via an orphan's coinbase
+	// height, flipping current() false and silencing every other
+	// peer's announcements until the stall timer fires — see
+	// atTipSyncPromotionBlocked. A skipped candidate's announced
+	// block is not lost: with no sync peer, handleInvMsg still
+	// fetches announcements directly.
+	if atTipSyncPromotionBlocked(sm.chain.IsCurrent(),
+		bestPeer.LastAnnouncedBlock(), bestPeer.LastBlock(),
+		best.Height) {
+		log.Debugf("Skipping sync: candidate %s advertises "+
+			"height %d, our best is %d, and the chain is "+
+			"current", bestPeer.Addr(), bestPeer.LastBlock(),
+			best.Height)
 		return
 	}
 
@@ -532,13 +629,27 @@ func (sm *SyncManager) handleStallSample() {
 	sm.disconnectStalledBlockPeers()
 
 	// No syncpeer — retry selection periodically so cooled-down
-	// candidates get re-evaluated as their entries expire.
+	// candidates get re-evaluated as their entries expire. Selection
+	// is attempted regardless of IsCurrent: a node that loses its
+	// sync peer while at tip still looks current for up to 24h, and
+	// gating re-selection on !IsCurrent left it with no sync peer
+	// for that whole window (#301). startSync itself skips
+	// candidates that have nothing new to offer, so the retry is
+	// cheap when we are genuinely at tip — and while current it
+	// promotes no candidate at all, so a promotion can never flip
+	// current() false on unauthenticated claims (including a
+	// height a promoted peer acquires afterwards from an orphan's
+	// coinbase — see atTipSyncPromotionBlocked).
 	if sm.syncPeer == nil {
-		if !sm.chain.IsCurrent() {
-			sm.startSync()
+		sm.startSync()
+		if sm.syncPeer != nil {
+			sm.noSyncPeerSamples = 0
+			return
 		}
+		sm.handleNoSyncPeer(sm.chain.IsCurrent())
 		return
 	}
+	sm.noSyncPeerSamples = 0
 
 	// If the stall timeout has not elapsed, exit early.
 	if time.Since(sm.lastProgressTime) <= maxStallDuration {
@@ -578,10 +689,174 @@ func (sm *SyncManager) disconnectStalledBlockPeers() {
 // coolDownSyncCandidate keeps peer out of sync-peer selection for
 // syncPeerCooldown if it reconnects. An inbound address carries an ephemeral
 // port no reconnect would match.
+//
+// It also records the peer's currently announced block as spent for
+// the rotation stand-down (see announcementSpent): both call sites
+// are a delivery failure over whatever the peer had announced — a
+// sync peer that stalled, or a peer that withheld a requested
+// block — so that announcement has demonstrably had its chance.
 func (sm *SyncManager) coolDownSyncCandidate(peer *peerpkg.Peer) {
-	if !peer.Inbound() {
-		sm.recentlyFailedSync[peer.Addr()] = time.Now()
+	if peer.Inbound() {
+		return
 	}
+	sm.recentlyFailedSync[peer.Addr()] = time.Now()
+	if announced := peer.LastAnnouncedBlock(); announced != nil {
+		if sm.announcementSpent == nil {
+			sm.announcementSpent = make(map[string]chainhash.Hash)
+		}
+		sm.announcementSpent[peer.Addr()] = *announced
+	}
+}
+
+// handleNoSyncPeer runs on a stall sample where startSync found no
+// viable sync candidate. Once that state persists for
+// noSyncPeerRotateSamples consecutive samples, it disconnects one
+// outbound peer that advertises a height below ours per sample,
+// freeing its outbound slot so the connection manager dials a
+// replacement that may be able to serve us blocks.
+//
+// Without this, a node whose outbound slots are all held by peers
+// behind it (e.g. nodes stranded on the far side of a hardfork) can
+// never make progress: startSync only considers connected peers, and
+// nothing ever rotates the useless ones out (#301).
+//
+// Rotation only runs while the chain is not current. A node at a
+// fresh tip with no sync peer is the normal steady state, not the
+// wedge: its outbound peers' advertised heights lag the tip by
+// construction (LastBlock is set at handshake and only advances on
+// announcements), so rotating there would churn healthy connections
+// for no possible gain — no peer can serve a block that has not been
+// mined yet. The wedge is a node that is behind and stranded, and
+// that state always comes with a stale tip. The streak is reset, not
+// merely paused, so the grace period restarts when the node actually
+// becomes stranded.
+//
+// Rotation also stands down while an eligible sync candidate has
+// announced a block we do not have (see
+// anyPeerAnnouncedUnknownBlock for exactly which announcements
+// count). Such an announcement is evidence that reachable work
+// exists, whatever the advertised heights say: startSync picks one
+// random candidate per sample, so a viable candidate can take
+// several samples to be picked, and the inv path fetches
+// announcements directly while there is no sync peer. Rotating in
+// that window could churn the very peer set that is about to
+// un-wedge the node.
+func (sm *SyncManager) handleNoSyncPeer(isCurrent bool) {
+	if isCurrent {
+		sm.noSyncPeerSamples = 0
+		return
+	}
+
+	sm.noSyncPeerSamples++
+	if sm.noSyncPeerSamples < noSyncPeerRotateSamples {
+		return
+	}
+
+	if sm.anyPeerAnnouncedUnknownBlock() {
+		return
+	}
+
+	best := sm.chain.BestSnapshot()
+	victim := sm.pickStaleOutboundPeer(best.Height)
+	if victim == nil {
+		return
+	}
+
+	log.Infof("No sync candidate for %v — disconnecting outbound "+
+		"peer %s at height %d (our best is %d) to free the slot "+
+		"for a replacement",
+		time.Duration(sm.noSyncPeerSamples)*stallSampleInterval,
+		victim.Addr(), victim.LastBlock(), best.Height)
+	victim.Disconnect()
+}
+
+// anyPeerAnnouncedUnknownBlock reports whether an eligible sync
+// candidate's last announced block is one we do not have — evidence
+// that reachable work exists, whatever the peers' advertised
+// heights say.
+//
+// Only announcements startSync could actually act on count: the
+// announcer must be an outbound, high-quality sync candidate that
+// is not in post-stall cooldown. LastAnnouncedBlock is written
+// from an unauthenticated inv before any quality, header, or PoW
+// gate and is only cleared when a matching block is accepted, so
+// counting every connected peer would let one fake inv from an
+// inbound or low-quality peer — which pickSyncCandidate will not
+// promote while outbound candidates exist, and whose announcement
+// nothing will fetch as sync — freeze rotation for the whole
+// stranded window. An eligible announcer, by contrast, will be
+// promoted on a coming sample; if it then stalls, it lands in
+// cooldown and its stale announcement stops standing rotation
+// down — and once it has stalled over that announcement it is
+// recorded spent (see announcementSpent), so it never stands
+// rotation down for that hash again, even after its cooldown
+// expires. The bound therefore does not depend on every
+// announcer fitting inside one cooldown window at once: each
+// announcer can hold the stand-down only until its first stall
+// over the announcement, and there are finitely many announcers.
+// The same spent record keeps startSync from re-promoting the
+// announcer on that hash after its cooldown expires, which would
+// reset the rotation streak on every cycle.
+func (sm *SyncManager) anyPeerAnnouncedUnknownBlock() bool {
+	now := time.Now()
+	for peer, state := range sm.peerStates {
+		if peer.Inbound() || !state.syncCandidate ||
+			!isPeerHighQuality(state) {
+			continue
+		}
+		if t, ok := sm.recentlyFailedSync[peer.Addr()]; ok &&
+			now.Sub(t) < syncPeerCooldown {
+			continue
+		}
+		announced := peer.LastAnnouncedBlock()
+		if announced == nil {
+			continue
+		}
+		if spent, ok := sm.announcementSpent[peer.Addr()]; ok &&
+			spent.IsEqual(announced) {
+			continue
+		}
+		if have, _ := sm.chain.HaveBlock(announced); !have {
+			return true
+		}
+	}
+	return false
+}
+
+// pickStaleOutboundPeer returns the outbound peer advertising the
+// lowest height strictly below bestHeight, or nil if there is none.
+// Peers at our height are never selected: they may simply be waiting
+// for the same next block we are. Inbound peers are never selected:
+// disconnecting one frees no outbound slot for the connection manager
+// to refill.
+//
+// LastBlock is only a lower bound on a peer's real height: it is set
+// at the version handshake and advances when the peer announces or
+// serves blocks, so it can lag a peer that quietly holds our tip.
+// An earlier version exempted a peer whose last announced block was
+// our tip, treating the announcement as proof of possession. It is
+// not: LastAnnouncedBlock is written in handleInvMsg from an
+// unauthenticated inv before any possession check, the tip hash is
+// public (any peer can learn it, e.g. via getblocks), and the node
+// never requests a hash it already has, so the claim is never
+// tested — a peer that is still behind can repeat it and hold its
+// slot for as long as the tip is unchanged. The height update that
+// does prove possession (handleInvMsg raising LastBlock for a known
+// announced block) only runs while the chain is current, and
+// rotation never runs then, so every verifiable tip-holder is
+// already protected by the height rule above; the unverifiable
+// claim must not protect a liar instead.
+func (sm *SyncManager) pickStaleOutboundPeer(bestHeight int32) *peerpkg.Peer {
+	var victim *peerpkg.Peer
+	for peer := range sm.peerStates {
+		if peer.Inbound() || peer.LastBlock() >= bestHeight {
+			continue
+		}
+		if victim == nil || peer.LastBlock() < victim.LastBlock() {
+			victim = peer
+		}
+	}
+	return victim
 }
 
 // shouldDCStalledSyncPeer determines whether or not we should disconnect a
@@ -1970,6 +2245,7 @@ func New(config *Config) (*SyncManager, error) {
 		quit:               make(chan struct{}),
 		feeEstimator:       config.FeeEstimator,
 		recentlyFailedSync: make(map[string]time.Time),
+		announcementSpent:  make(map[string]chainhash.Hash),
 	}
 
 	best := sm.chain.BestSnapshot()
