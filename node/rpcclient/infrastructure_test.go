@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -166,6 +167,68 @@ func TestHTTPPostProxyResolvesAtProxy(t *testing.T) {
 		require.Equal(t, "nonexistent.invalid", got.host)
 	case <-time.After(5 * time.Second):
 		t.Fatal("SOCKS proxy did not receive a CONNECT request")
+	}
+}
+
+// TestGetNewAddressNetwork verifies that the address returned by the server is decoded for the network in
+// ConnConfig.Params, which is mainnet when unset.
+func TestGetNewAddressNetwork(t *testing.T) {
+	t.Parallel()
+
+	const (
+		mainnetAddr = "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"
+		testnetAddr = "tprl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqalmzae"
+	)
+
+	tests := []struct {
+		name    string
+		params  string
+		reply   string
+		wantErr error
+	}{
+		{"unset params accept mainnet address", "", mainnetAddr, nil},
+		{"unset params reject testnet address", "", testnetAddr, btcutil.ErrWrongNetwork},
+		{"testnet params accept testnet address", "testnet", testnetAddr, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					ID json.RawMessage `json:"id"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"result":"` + tt.reply + `","error":null,"id":` + string(req.ID) + `}`))
+			}))
+			t.Cleanup(rpcServer.Close)
+
+			client, err := New(&ConnConfig{
+				Host:         strings.TrimPrefix(rpcServer.URL, "http://"),
+				User:         "user",
+				Pass:         "pass",
+				Params:       tt.params,
+				DisableTLS:   true,
+				HTTPPostMode: true,
+			}, nil)
+			require.NoError(t, err)
+			t.Cleanup(client.Shutdown)
+
+			addr, err := client.GetNewAddress("default")
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.reply, addr.EncodeAddress())
+		})
 	}
 }
 

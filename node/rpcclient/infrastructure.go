@@ -1238,6 +1238,10 @@ type ConnConfig struct {
 	// Params is the string representing the network that the server
 	// is running. If there is no parameter set in the config, then
 	// mainnet will be used by default.
+	//
+	// It must be set for any other network: the methods that return
+	// addresses fail with btcutil.ErrWrongNetwork for addresses that
+	// belong to a different network.
 	Params string
 
 	// DisableTLS specifies whether transport layer security should be

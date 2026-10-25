@@ -511,14 +511,6 @@ func decodeAddress(s string, params *chaincfg.Params) (btcutil.Address, error) {
 			Message: msg,
 		}
 	}
-	if !addr.IsForNet(params) {
-		msg := fmt.Sprintf("Invalid address %q: not intended for use on %s",
-			addr, params.Name)
-		return nil, &btcjson.RPCError{
-			Code:    btcjson.ErrRPCInvalidAddressOrKey,
-			Message: msg,
-		}
-	}
 	return addr, nil
 }
 
@@ -1347,9 +1339,9 @@ func lockUnspent(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 func makeOutputs(pairs map[string]btcutil.Amount, chainParams *chaincfg.Params) ([]*wire.TxOut, error) {
 	outputs := make([]*wire.TxOut, 0, len(pairs))
 	for addrStr, amt := range pairs {
-		addr, err := btcutil.DecodeAddress(addrStr, chainParams)
+		addr, err := decodeAddress(addrStr, chainParams)
 		if err != nil {
-			return nil, fmt.Errorf("cannot decode address: %w", err)
+			return nil, err
 		}
 
 		pkScript, err := txscript.PayToAddrScript(addr)

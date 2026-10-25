@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"github.com/btcsuite/btclog"
 	"github.com/btcsuite/websocket"
 	"github.com/pearl-research-labs/pearl/node/btcjson"
+	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/require"
 )
@@ -471,6 +474,73 @@ func TestRunCommandPanicRecovery(t *testing.T) {
 			}
 			require.NoError(t, json.Unmarshal(reply, &response))
 			require.Equal(t, btcjson.ErrRPCInternal, response.Error)
+		})
+	}
+}
+
+// addressNetworkCases are the addresses the tests below send to a mainnet node, and whether the node accepts them.
+var addressNetworkCases = []struct {
+	name   string
+	params *chaincfg.Params
+	valid  bool
+}{
+	{"mainnet address", &chaincfg.MainNetParams, true},
+	{"testnet address", &chaincfg.TestNetParams, false},
+}
+
+func addressFor(t *testing.T, params *chaincfg.Params) btcutil.Address {
+	t.Helper()
+
+	addr, err := btcutil.NewAddressTaproot(bytes.Repeat([]byte{1}, 32), params)
+	require.NoError(t, err)
+
+	return addr
+}
+
+func TestHandleNotifyReceivedNetwork(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range addressNetworkCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// A request only reaches the notification manager once the address is accepted.
+			ntfnMgr := &wsNotificationManager{queueNotification: make(chan any, 1)}
+			wsc := &wsClient{server: &rpcServer{
+				cfg:     rpcserverConfig{ChainParams: &chaincfg.MainNetParams},
+				ntfnMgr: ntfnMgr,
+			}}
+
+			cmd := &btcjson.NotifyReceivedCmd{Addresses: []string{addressFor(t, tt.params).EncodeAddress()}}
+			_, err := handleNotifyReceived(wsc, cmd)
+			if tt.valid {
+				require.NoError(t, err)
+				require.Len(t, ntfnMgr.queueNotification, 1)
+
+				return
+			}
+
+			requireRPCErrorCode(t, err, btcjson.ErrRPCInvalidAddressOrKey)
+			require.Empty(t, ntfnMgr.queueNotification)
+		})
+	}
+}
+
+// loadtxfilter never reports an address it cannot use, so a rejection only shows in the filter itself.
+func TestHandleLoadTxFilterNetwork(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range addressNetworkCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			wsc := &wsClient{server: &rpcServer{cfg: rpcserverConfig{ChainParams: &chaincfg.MainNetParams}}}
+			addr := addressFor(t, tt.params)
+
+			cmd := btcjson.NewLoadTxFilterCmd(true, []string{addr.EncodeAddress()}, nil)
+			_, err := handleLoadTxFilter(wsc, cmd)
+			require.NoError(t, err)
+			require.Equal(t, tt.valid, wsc.filterData.existsAddress(addr))
 		})
 	}
 }
