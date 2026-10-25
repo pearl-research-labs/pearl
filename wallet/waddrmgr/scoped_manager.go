@@ -497,74 +497,6 @@ func (s *ScopedKeyManager) keyToManaged(derivedKey *hdkeychain.ExtendedKey,
 	return ma, nil
 }
 
-// deriveTapscriptRoot derives the XMSS tapscript root hash for the given path.
-// This function requires the wallet to be unlocked (not watch-only) to derive
-// the XMSS public key deterministically.
-//
-// Returns an error if XMSS derivation fails (wallet locked, scope missing, etc.)
-//
-// This function MUST be called with the manager lock held for writes.
-func (s *ScopedKeyManager) deriveTapscriptRoot(
-	ns walletdb.ReadWriteBucket, path DerivationPath,
-) ([]byte, error) {
-	// Fetch the PQ scope manager for XMSS derivation
-	pqMgr, err := s.rootManager.FetchScopedKeyManager(KeyScopePQ)
-	if err != nil {
-		return nil, fmt.Errorf("PQ scope required for XMSS: %w", err)
-	}
-
-	// Derive XMSS public key (requires wallet to be unlocked)
-	xmssPubKey, err := DeriveXMSSPublicKey(pqMgr, ns, path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to derive XMSS public key: %w", err)
-	}
-
-	// Build XMSS tapscript: <xmss_pubkey> OP_CHECKXMSSSIG
-	xmssScript, err := txscript.NewScriptBuilder().
-		AddData(xmssPubKey[:]).
-		AddOp(txscript.OP_CHECKXMSSSIG).
-		Script()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build XMSS script: %w", err)
-	}
-
-	// Build tapscript tree and get root hash
-	tapLeaf := txscript.NewBaseTapLeaf(xmssScript)
-	tapTree := txscript.AssembleTaprootScriptTree(tapLeaf)
-	rootHash := tapTree.RootNode.TapHash()
-	return rootHash[:], nil
-}
-
-// maybeDeriveTapscriptRoot returns the root of the script tree to commit to in a new address.
-// The only script this wallet commits to is the XMSS spend path, so the result is either the
-// XMSS root (a PQ address) or nil (a plain BIP-86 address, spendable only with the Schnorr key).
-func (s *ScopedKeyManager) maybeDeriveTapscriptRoot(
-	ns walletdb.ReadWriteBucket, path DerivationPath,
-	key *hdkeychain.ExtendedKey, includePQTapscript bool,
-) ([]byte, error) {
-	// The caller asked for a plain BIP-86 address.
-	if !includePQTapscript {
-		return nil, nil
-	}
-
-	// Only BIP-86 addresses get an XMSS spend path. The PQ scope's keys are only
-	// used to derive XMSS keys; their EC pubkeys are not used as payment addresses.
-	if s.scope != KeyScopeBIP0086 {
-		return nil, nil
-	}
-
-	// The XMSS key is derived from a private key. Without one, fail.
-	if !key.IsPrivate() {
-		// A watching-only manager is also locked, so check it first.
-		if !s.rootManager.WatchOnly() && s.rootManager.IsLocked() {
-			return nil, managerError(ErrLocked, "cannot derive PQ address: "+errLocked, nil)
-		}
-		return nil, managerError(ErrWatchingOnly, "cannot derive PQ address: private key unavailable", nil)
-	}
-
-	return s.deriveTapscriptRoot(ns, path)
-}
-
 // deriveKey returns either a public or private derived extended key based on
 // the private flag for the given an account info, branch, and index.
 func (s *ScopedKeyManager) deriveKey(acctInfo *accountInfo, branch,
@@ -949,8 +881,8 @@ func (s *ScopedKeyManager) DeriveFromKeyPathCache(
 //
 // NOTE: The key will be derived from the account stored in the database under
 // the InternalAccount number.
-func (s *ScopedKeyManager) DeriveFromKeyPath(ns walletdb.ReadWriteBucket,
-	kp DerivationPath, includePQTapscript bool) (ManagedAddress, error) {
+func (s *ScopedKeyManager) DeriveFromKeyPath(ns walletdb.ReadBucket,
+	kp DerivationPath) (ManagedAddress, error) {
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -970,16 +902,7 @@ func (s *ScopedKeyManager) DeriveFromKeyPath(ns walletdb.ReadWriteBucket,
 		return nil, err
 	}
 
-	// Must not fail without a private key: recovery re-derives known paths
-	// while locked or watching-only, and an error stalls chain sync.
-	tapscriptRoot, err := s.maybeDeriveTapscriptRoot(
-		ns, kp, addrKey, includePQTapscript && addrKey.IsPrivate(),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return s.keyToManaged(addrKey, kp, acctInfo, tapscriptRoot)
+	return s.keyToManaged(addrKey, kp, acctInfo, nil)
 }
 
 // deriveKeyFromPath returns either a public or private derived extended key
@@ -1242,8 +1165,7 @@ func (s *ScopedKeyManager) accountAddrType(acctInfo *accountInfo,
 //
 // This function MUST be called with the manager lock held for writes.
 func (s *ScopedKeyManager) nextAddresses(ns walletdb.ReadWriteBucket,
-	account uint32, numAddresses uint32, internal bool, includePQTapscript bool) ([]ManagedAddress,
-	error) {
+	account uint32, numAddresses uint32, internal bool) ([]ManagedAddress, error) {
 
 	// The next address can only be generated for accounts that have
 	// already been created.
@@ -1333,18 +1255,12 @@ func (s *ScopedKeyManager) nextAddresses(ns walletdb.ReadWriteBucket,
 			MasterKeyFingerprint: acctInfo.masterKeyFingerprint,
 		}
 
-		// Derive XMSS tapscript root for BIP-86 scope if conditions are met
-		tapscriptRoot, err := s.maybeDeriveTapscriptRoot(ns, derivationPath, nextKey, includePQTapscript)
-		if err != nil {
-			return nil, err
-		}
-
 		// Create a new managed address based on the public or private
 		// key depending on whether the generated key is private.
 		// Also, zero the next key after creating the managed address
 		// from it.
 		addr, err := newManagedAddressFromExtKey(
-			s, derivationPath, nextKey, addrType, acctInfo, tapscriptRoot,
+			s, derivationPath, nextKey, addrType, acctInfo, nil,
 		)
 		if err != nil {
 			return nil, err
@@ -1483,7 +1399,7 @@ func (s *ScopedKeyManager) nextAddresses(ns walletdb.ReadWriteBucket,
 //
 // This function MUST be called with the manager lock held for writes.
 func (s *ScopedKeyManager) extendAddresses(ns walletdb.ReadWriteBucket,
-	account uint32, lastIndex uint32, internal bool, includePQTapscript bool) error {
+	account uint32, lastIndex uint32, internal bool) error {
 
 	// The next address can only be generated for accounts that have
 	// already been created.
@@ -1578,18 +1494,12 @@ func (s *ScopedKeyManager) extendAddresses(ns walletdb.ReadWriteBucket,
 			Index:           nextIndex - 1,
 		}
 
-		// Derive XMSS tapscript root for BIP-86 scope if conditions are met
-		tapscriptRoot, err := s.maybeDeriveTapscriptRoot(ns, derivationPath, nextKey, includePQTapscript)
-		if err != nil {
-			return err
-		}
-
 		// Create a new managed address based on the public or private
 		// key depending on whether the generated key is private.
 		// Also, zero the next key after creating the managed address
 		// from it.
 		addr, err := newManagedAddressFromExtKey(
-			s, derivationPath, nextKey, addrType, acctInfo, tapscriptRoot,
+			s, derivationPath, nextKey, addrType, acctInfo, nil,
 		)
 		if err != nil {
 			return err
@@ -1681,10 +1591,8 @@ func (s *ScopedKeyManager) extendAddresses(ns walletdb.ReadWriteBucket,
 
 // NextExternalAddresses returns the specified number of next chained addresses
 // that are intended for external use from the address manager.
-// If includePQTapscript is true and scope is BIP-86, addresses will include XMSS
-// tapscript commitment for post-quantum security.
 func (s *ScopedKeyManager) NextExternalAddresses(ns walletdb.ReadWriteBucket,
-	account uint32, numAddresses uint32, includePQTapscript bool) ([]ManagedAddress, error) {
+	account uint32, numAddresses uint32) ([]ManagedAddress, error) {
 
 	// Enforce maximum account number.
 	if account > MaxAccountNum {
@@ -1695,15 +1603,13 @@ func (s *ScopedKeyManager) NextExternalAddresses(ns walletdb.ReadWriteBucket,
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	return s.nextAddresses(ns, account, numAddresses, false, includePQTapscript)
+	return s.nextAddresses(ns, account, numAddresses, false)
 }
 
 // NextInternalAddresses returns the specified number of next chained addresses
 // that are intended for internal use such as change from the address manager.
-// If includePQTapscript is true and scope is BIP-86, addresses will include XMSS
-// tapscript commitment for post-quantum security.
 func (s *ScopedKeyManager) NextInternalAddresses(ns walletdb.ReadWriteBucket,
-	account uint32, numAddresses uint32, includePQTapscript bool) ([]ManagedAddress, error) {
+	account uint32, numAddresses uint32) ([]ManagedAddress, error) {
 
 	// Enforce maximum account number.
 	if account > MaxAccountNum {
@@ -1714,17 +1620,15 @@ func (s *ScopedKeyManager) NextInternalAddresses(ns walletdb.ReadWriteBucket,
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	return s.nextAddresses(ns, account, numAddresses, true, includePQTapscript)
+	return s.nextAddresses(ns, account, numAddresses, true)
 }
 
 // ExtendExternalAddresses ensures that all valid external keys through
 // lastIndex are derived and stored in the wallet. This is used to ensure that
 // wallet's persistent state catches up to a external child that was found
 // during recovery.
-// If includePQTapscript is true and scope is BIP-86, addresses will include XMSS
-// tapscript commitment for post-quantum security.
 func (s *ScopedKeyManager) ExtendExternalAddresses(ns walletdb.ReadWriteBucket,
-	account uint32, lastIndex uint32, includePQTapscript bool) error {
+	account uint32, lastIndex uint32) error {
 
 	if account > MaxAccountNum {
 		err := managerError(ErrAccountNumTooHigh, errAcctTooHigh, nil)
@@ -1734,17 +1638,15 @@ func (s *ScopedKeyManager) ExtendExternalAddresses(ns walletdb.ReadWriteBucket,
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	return s.extendAddresses(ns, account, lastIndex, false, includePQTapscript)
+	return s.extendAddresses(ns, account, lastIndex, false)
 }
 
 // ExtendInternalAddresses ensures that all valid internal keys through
 // lastIndex are derived and stored in the wallet. This is used to ensure that
 // wallet's persistent state catches up to an internal child that was found
 // during recovery.
-// If includePQTapscript is true and scope is BIP-86, addresses will include XMSS
-// tapscript commitment for post-quantum security.
 func (s *ScopedKeyManager) ExtendInternalAddresses(ns walletdb.ReadWriteBucket,
-	account uint32, lastIndex uint32, includePQTapscript bool) error {
+	account uint32, lastIndex uint32) error {
 
 	if account > MaxAccountNum {
 		err := managerError(ErrAccountNumTooHigh, errAcctTooHigh, nil)
@@ -1754,7 +1656,7 @@ func (s *ScopedKeyManager) ExtendInternalAddresses(ns walletdb.ReadWriteBucket,
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	return s.extendAddresses(ns, account, lastIndex, true, includePQTapscript)
+	return s.extendAddresses(ns, account, lastIndex, true)
 }
 
 // LastExternalAddress returns the most recently requested chained external

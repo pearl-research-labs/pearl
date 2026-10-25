@@ -683,12 +683,11 @@ func getNewAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	if cmd.AddressType != nil && *cmd.AddressType != "bech32" {
 		return nil, &ErrAddressTypeUnknown
 	}
-	usePQ := cmd.PQ != nil && *cmd.PQ
 	account, err := w.AccountNumber(keyScope, acctName)
 	if err != nil {
 		return nil, err
 	}
-	addr, err := w.NewAddress(account, keyScope, usePQ)
+	addr, err := w.NewAddress(account, keyScope)
 	if err != nil {
 		return nil, err
 	}
@@ -714,12 +713,11 @@ func getRawChangeAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error
 	if cmd.AddressType != nil && *cmd.AddressType != "bech32" {
 		return nil, &ErrAddressTypeUnknown
 	}
-	usePQ := cmd.PQ != nil && *cmd.PQ
 	account, err := w.AccountNumber(keyScope, acctName)
 	if err != nil {
 		return nil, err
 	}
-	addr, err := w.NewChangeAddress(account, keyScope, usePQ)
+	addr, err := w.NewChangeAddress(account, keyScope)
 	if err != nil {
 		return nil, err
 	}

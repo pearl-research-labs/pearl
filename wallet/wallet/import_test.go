@@ -203,10 +203,10 @@ func testImportAccount(t *testing.T, w *Wallet, tc *testCase, watchOnly bool,
 	require.Equal(t, uint32(0), acct2.ImportedKeyCount)
 
 	// Test address derivation.
-	extAddr, err := w.NewAddress(acct1.AccountNumber, tc.expectedScope, false)
+	extAddr, err := w.NewAddress(acct1.AccountNumber, tc.expectedScope)
 	require.NoError(t, err)
 	require.Equal(t, tc.expectedAddr, extAddr.String())
-	intAddr, err := w.NewChangeAddress(acct1.AccountNumber, tc.expectedScope, false)
+	intAddr, err := w.NewChangeAddress(acct1.AccountNumber, tc.expectedScope)
 	require.NoError(t, err)
 	require.Equal(t, tc.expectedChangeAddr, intAddr.String())
 

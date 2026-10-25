@@ -84,7 +84,7 @@ func (rm *RecoveryManager) Resurrect(ns walletdb.ReadWriteBucket,
 		// recovery state's set of addresses to look for.
 		for i := uint32(0); i < externalCount; i++ {
 			keyPath := externalKeyPath(i)
-			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath, true)
+			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath)
 			if err != nil && err != hdkeychain.ErrInvalidChild {
 				return err
 			} else if err == hdkeychain.ErrInvalidChild {
@@ -104,7 +104,7 @@ func (rm *RecoveryManager) Resurrect(ns walletdb.ReadWriteBucket,
 		// recovery state's set of addresses to look for.
 		for i := uint32(0); i < internalCount; i++ {
 			keyPath := internalKeyPath(i)
-			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath, true)
+			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath)
 			if err != nil && err != hdkeychain.ErrInvalidChild {
 				return err
 			} else if err == hdkeychain.ErrInvalidChild {

@@ -479,11 +479,11 @@ func (w *Wallet) addrMgrWithChangeSource(dbtx walletdb.ReadWriteTx,
 		)
 		if account == waddrmgr.ImportedAddrAccount {
 			changeAddr, err = w.newChangeAddress(
-				addrmgrNs, 0, *changeKeyScope, false,
+				addrmgrNs, 0, *changeKeyScope,
 			)
 		} else {
 			changeAddr, err = w.newChangeAddress(
-				addrmgrNs, account, *changeKeyScope, false,
+				addrmgrNs, account, *changeKeyScope,
 			)
 		}
 		if err != nil {

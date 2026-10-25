@@ -512,7 +512,7 @@ func TestDuplicateAddressDerivation(t *testing.T) {
 				addrs := make([]btcutil.Address, 10)
 				for i := 0; i < 10; i++ {
 					addr, err := w.NewAddress(
-						0, waddrmgr.KeyScopeBIP0086, false,
+						0, waddrmgr.KeyScopeBIP0086,
 					)
 					if err != nil {
 						return err
@@ -677,7 +677,7 @@ func TestListTransactions(t *testing.T) {
 		receives = append(receives, fundWallet(t, w, 100_000+int64(i)).Hash.String())
 	}
 
-	changeAddr, err := w.NewChangeAddress(0, waddrmgr.KeyScopeBIP0086, false)
+	changeAddr, err := w.NewChangeAddress(0, waddrmgr.KeyScopeBIP0086)
 	require.NoError(t, err)
 	changeScript, err := txscript.PayToAddrScript(changeAddr)
 	require.NoError(t, err)

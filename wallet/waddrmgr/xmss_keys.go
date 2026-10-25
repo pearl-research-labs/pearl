@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	"github.com/pearl-research-labs/pearl/xmss"
 	"golang.org/x/crypto/hkdf"
@@ -33,8 +34,7 @@ func DeriveXMSSSeeds(pqMgr *ScopedKeyManager, ns walletdb.ReadWriteBucket, path 
 		}
 	}
 
-	// includePQTapscript=false because this IS the PQ scope - no recursion
-	addr, err := pqMgr.DeriveFromKeyPath(ns, path, false)
+	addr, err := pqMgr.DeriveFromKeyPath(ns, path)
 	if err != nil {
 		return privSeed, pubSeed, fmt.Errorf("failed to derive XMSS key path: %w", err)
 	}
@@ -67,8 +67,7 @@ func DeriveXMSSSeeds(pqMgr *ScopedKeyManager, ns walletdb.ReadWriteBucket, path 
 }
 
 // DeriveXMSSPublicKey is a convenience function that derives the XMSS seeds
-// and generates the public key. This is used during address creation to
-// compute the tapscript commitment.
+// and generates the public key.
 func DeriveXMSSPublicKey(pqMgr *ScopedKeyManager, ns walletdb.ReadWriteBucket,
 	path DerivationPath) ([xmss.PKLen]byte, error) {
 
@@ -91,4 +90,29 @@ func DeriveXMSSPublicKey(pqMgr *ScopedKeyManager, ns walletdb.ReadWriteBucket,
 	clear(pubSeed[:])
 
 	return pk, nil
+}
+
+// DeriveXMSSTapscriptRoot returns the root of the one-leaf script tree
+// <xmss_pubkey> OP_CHECKXMSSSIG for path. The manager must be unlocked because
+// the XMSS seeds come from a private key.
+func DeriveXMSSTapscriptRoot(pqMgr *ScopedKeyManager, ns walletdb.ReadWriteBucket,
+	path DerivationPath) ([]byte, error) {
+
+	xmssPubKey, err := DeriveXMSSPublicKey(pqMgr, ns, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive XMSS public key: %w", err)
+	}
+
+	xmssScript, err := txscript.NewScriptBuilder().
+		AddData(xmssPubKey[:]).
+		AddOp(txscript.OP_CHECKXMSSSIG).
+		Script()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build XMSS script: %w", err)
+	}
+
+	tapLeaf := txscript.NewBaseTapLeaf(xmssScript)
+	tapTree := txscript.AssembleTaprootScriptTree(tapLeaf)
+	rootHash := tapTree.RootNode.TapHash()
+	return rootHash[:], nil
 }

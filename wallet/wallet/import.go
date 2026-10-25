@@ -241,16 +241,14 @@ func (w *Wallet) ImportAccountDryRun(name string,
 		// attempt, we'll want to invalidate the cache for it.
 		defer manager.InvalidateAccountCache(accountProps.AccountNumber)
 
-		// includePQTapscript=false for imported accounts because we only have the
-		// Schnorr public key and can't know if it has PQ tapscript
 		externalAddrs, err = manager.NextExternalAddresses(
-			ns, accountProps.AccountNumber, numAddrs, false,
+			ns, accountProps.AccountNumber, numAddrs,
 		)
 		if err != nil {
 			return err
 		}
 		internalAddrs, err = manager.NextInternalAddresses(
-			ns, accountProps.AccountNumber, numAddrs, false,
+			ns, accountProps.AccountNumber, numAddrs,
 		)
 		if err != nil {
 			return err
