@@ -3205,3 +3205,65 @@ func TestExtendAddressesUnlocked(t *testing.T) {
 		require.NoError(t, err)
 	})
 }
+
+// TestUnlockWithWatchOnlyAccount tests that a manager holding a cached
+// watch-only account can be unlocked, and that unlocking still derives the
+// pending private keys of its other accounts.
+func TestUnlockWithWatchOnlyAccount(t *testing.T) {
+	t.Parallel()
+
+	teardown, db, mgr := setupManager(t)
+	defer teardown()
+
+	scopedMgr, err := mgr.FetchScopedKeyManager(KeyScopeBIP0086)
+	require.NoError(t, err)
+
+	accountKey := deriveTestAccountKey(t)
+	require.NotNil(t, accountKey)
+	acctKeyPub, err := accountKey.Neuter()
+	require.NoError(t, err)
+
+	const watchOnlyAccount = 1000
+	watchOnlyPath := DerivationPath{
+		InternalAccount: watchOnlyAccount,
+		Account:         hdkeychain.HardenedKeyStart,
+		Branch:          ExternalBranch,
+		Index:           0,
+	}
+
+	var lockedAddr ManagedAddress
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		err := scopedMgr.NewRawAccountWatchingOnly(
+			ns, watchOnlyAccount, acctKeyPub, 0, nil,
+		)
+		if err != nil {
+			return err
+		}
+		if _, err := scopedMgr.DeriveFromKeyPath(ns, watchOnlyPath); err != nil {
+			return err
+		}
+
+		addrs, err := scopedMgr.NextExternalAddresses(ns, DefaultAccountNum, 1)
+		if err != nil {
+			return err
+		}
+		lockedAddr = addrs[0]
+		return nil
+	})
+	require.NoError(t, err)
+
+	err = walletdb.View(db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		return mgr.Unlock(ns, privPassphrase)
+	})
+	require.NoError(t, err)
+
+	privKey, err := lockedAddr.(ManagedPubKeyAddress).PrivKey()
+	require.NoError(t, err)
+	require.Equal(t, expectedExternalAddrs[0].privKey, privKey.Serialize())
+
+	_, err = scopedMgr.DeriveFromKeyPathCache(watchOnlyPath)
+	require.ErrorIs(t, err, hdkeychain.ErrNotPrivExtKey)
+}

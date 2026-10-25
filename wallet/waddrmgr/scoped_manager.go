@@ -356,6 +356,10 @@ func (s *ScopedKeyManager) Unlock(cryptoKeyPriv EncryptorDecryptor,
 	defer s.mtx.Unlock()
 
 	for account, acctInfo := range s.acctInfo {
+		if len(acctInfo.acctKeyEncrypted) == 0 {
+			continue
+		}
+
 		decrypted, err := cryptoKeyPriv.Decrypt(
 			acctInfo.acctKeyEncrypted,
 		)
@@ -478,7 +482,7 @@ func (s *ScopedKeyManager) keyToManaged(derivedKey *hdkeychain.ExtendedKey,
 		return nil, err
 	}
 
-	if !derivedKey.IsPrivate() {
+	if !derivedKey.IsPrivate() && len(acctInfo.acctKeyEncrypted) > 0 {
 		// Add the managed address to the list of addresses that need
 		// their private keys derived when the address manager is next
 		// unlocked.
@@ -852,7 +856,7 @@ func (s *ScopedKeyManager) DeriveFromKeyPathCache(
 	}
 
 	watchOnly := s.rootManager.WatchOnly()
-	private := !s.rootManager.IsLocked() && !watchOnly
+	private := !s.rootManager.IsLocked() && !watchOnly && acctInfo.acctKeyPriv != nil
 
 	// Now that we have the account information, we can derive the key
 	// directly.
