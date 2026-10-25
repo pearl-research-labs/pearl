@@ -3139,3 +3139,69 @@ func TestLockUnlockRace(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestExtendAddressesUnlocked tests that addresses extended while the manager
+// is unlocked keep their private keys, and that a watch-only account in the
+// same manager is extended from its public key.
+func TestExtendAddressesUnlocked(t *testing.T) {
+	t.Parallel()
+
+	teardown, db, mgr := setupManager(t)
+	defer teardown()
+
+	err := walletdb.View(db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		return mgr.Unlock(ns, privPassphrase)
+	})
+	require.NoError(t, err)
+
+	scopedMgr, err := mgr.FetchScopedKeyManager(KeyScopeBIP0086)
+	require.NoError(t, err)
+
+	t.Run("default account", func(t *testing.T) {
+		want := expectedExternalAddrs[1]
+		addr, err := btcutil.DecodeAddress(want.address, &chaincfg.MainNetParams)
+		require.NoError(t, err)
+
+		var privKey *btcec.PrivateKey
+		err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+			err := scopedMgr.ExtendExternalAddresses(ns, DefaultAccountNum, 1)
+			if err != nil {
+				return err
+			}
+
+			ma, err := scopedMgr.Address(ns, addr)
+			if err != nil {
+				return err
+			}
+			privKey, err = ma.(ManagedPubKeyAddress).PrivKey()
+			return err
+		})
+		require.NoError(t, err)
+		require.Equal(t, want.privKey, privKey.Serialize())
+	})
+
+	t.Run("watch-only account", func(t *testing.T) {
+		accountKey := deriveTestAccountKey(t)
+		require.NotNil(t, accountKey)
+		acctKeyPub, err := accountKey.Neuter()
+		require.NoError(t, err)
+
+		const watchOnlyAccount = 1000
+		err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+			err := scopedMgr.NewRawAccountWatchingOnly(
+				ns, watchOnlyAccount, acctKeyPub, 0, nil,
+			)
+			if err != nil {
+				return err
+			}
+
+			return scopedMgr.ExtendExternalAddresses(ns, watchOnlyAccount, 0)
+		})
+		require.NoError(t, err)
+	})
+}
