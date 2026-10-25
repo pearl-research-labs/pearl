@@ -19,8 +19,8 @@ const semanticAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 // versioning 2.0.0 spec (http://semver.org/).
 const (
 	Major uint = 1
-	Minor uint = 6
-	Patch uint = 0
+	Minor uint = 5
+	Patch uint = 4
 
 	// PreRelease MUST only contain characters from semanticAlphabet
 	// per the semantic versioning spec.
