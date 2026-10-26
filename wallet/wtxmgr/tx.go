@@ -1249,10 +1249,21 @@ func FetchTxLabel(ns walletdb.ReadBucket, txid chainhash.Hash) (string, error) {
 // DeserializeLabel reads a deserializes a length-value encoded label from the
 // byte array provided.
 func DeserializeLabel(v []byte) (string, error) {
+	if len(v) < 2 {
+		str := fmt.Sprintf("short label (expected at least 2 bytes, "+
+			"read %d)", len(v))
+		return "", storeError(ErrData, str, nil)
+	}
+
 	// If the label is empty, return an error.
 	length := binary.BigEndian.Uint16(v[0:2])
 	if length == 0 {
 		return "", ErrEmptyLabel
+	}
+	if int(length) != len(v)-2 {
+		str := fmt.Sprintf("label length mismatch (declared %d "+
+			"bytes, read %d)", length, len(v)-2)
+		return "", storeError(ErrData, str, nil)
 	}
 
 	// Read the remainder of the bytes into a label string.
