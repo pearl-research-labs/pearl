@@ -109,22 +109,6 @@ func (s secretSource) GetKey(addr btcutil.Address) (*btcec.PrivateKey, bool, err
 	return privKey, ma.Compressed(), nil
 }
 
-// GetTapscriptRoot returns the tapscript root hash for the address if it has
-// tapscript commitment, or nil if it's a standard BIP-86 address.
-func (s secretSource) GetTapscriptRoot(addr btcutil.Address) []byte {
-	ma, err := s.Address(s.addrmgrNs, addr)
-	if err != nil {
-		return nil
-	}
-
-	mpka, ok := ma.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
-		return nil
-	}
-
-	return mpka.TapscriptRoot()
-}
-
 func (s secretSource) GetScript(addr btcutil.Address) ([]byte, error) {
 	ma, err := s.Address(s.addrmgrNs, addr)
 	if err != nil {

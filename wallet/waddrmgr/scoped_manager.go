@@ -446,8 +446,7 @@ func (s *ScopedKeyManager) ConvertToWatchingOnly() {
 //
 // This function MUST be called with the manager lock held for writes.
 func (s *ScopedKeyManager) keyToManaged(derivedKey *hdkeychain.ExtendedKey,
-	derivationPath DerivationPath, acctInfo *accountInfo,
-	tapscriptRoot []byte) (ManagedAddress, error) {
+	derivationPath DerivationPath, acctInfo *accountInfo) (ManagedAddress, error) {
 
 	// Choose the appropriate type of address to derive since it's possible
 	// for a watch-only account to have a different schema from the
@@ -459,7 +458,7 @@ func (s *ScopedKeyManager) keyToManaged(derivedKey *hdkeychain.ExtendedKey,
 	// depending on whether the passed key is private.  Also, zero the key
 	// after creating the managed address from it.
 	ma, err := newManagedAddressFromExtKey(
-		s, derivationPath, derivedKey, addrType, acctInfo, tapscriptRoot,
+		s, derivationPath, derivedKey, addrType, acctInfo,
 	)
 	defer derivedKey.Zero()
 	if err != nil {
@@ -620,101 +619,52 @@ func (s *ScopedKeyManager) loadAccountInfo(ns walletdb.ReadBucket,
 		return nil, managerError(ErrDatabase, str, nil)
 	}
 
-	// Load the last external and internal addresses from the database.
-	// We must load from DB rather than derive, because addresses may have
-	// XMSS commitment that can only be retrieved from the DB when locked.
-	lastExtAddr, lastIntAddr, err := s.loadLastAddresses(ns, account, acctInfo, hasPrivateKey)
+	acctInfo.lastExternalAddr, err = s.deriveLastAddress(
+		account, acctInfo, ExternalBranch, acctInfo.nextExternalIndex,
+		hasPrivateKey,
+	)
 	if err != nil {
 		return nil, err
 	}
-	acctInfo.lastExternalAddr = lastExtAddr
-	acctInfo.lastInternalAddr = lastIntAddr
+	acctInfo.lastInternalAddr, err = s.deriveLastAddress(
+		account, acctInfo, InternalBranch, acctInfo.nextInternalIndex,
+		hasPrivateKey,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	// Add it to the cache and return it when everything is successful.
 	s.acctInfo[account] = acctInfo
 	return acctInfo, nil
 }
 
-// loadLastAddresses loads the last external and internal addresses for an account
-// from the database. This is needed because addresses may have XMSS commitment
-// that can only be retrieved from the DB when the manager is locked.
+// deriveLastAddress returns the most recently created address on the given
+// branch, or nil if the account has none yet.
 //
 // This function MUST be called with the manager lock held for writes.
-func (s *ScopedKeyManager) loadLastAddresses(ns walletdb.ReadBucket,
-	account uint32, acctInfo *accountInfo, hasPrivateKey bool) (
-	lastExt ManagedAddress, lastInt ManagedAddress, err error) {
+func (s *ScopedKeyManager) deriveLastAddress(account uint32,
+	acctInfo *accountInfo, branch, nextIndex uint32,
+	private bool) (ManagedAddress, error) {
 
-	// Helper to load address at specific branch/index
-	// This avoids calling chainAddressRowToManaged which would cause recursion
-	// through loadAccountInfo
-	loadAddr := func(branch, index uint32) (ManagedAddress, error) {
-		if index == 0 {
-			// No addresses created yet
-			return nil, nil
-		}
-		// Adjust to get the last created address (index is next, so last is index-1)
-		idx := index - 1
-
-		path := DerivationPath{
-			InternalAccount:      account,
-			Account:              acctInfo.acctKeyPub.ChildIndex(),
-			Branch:               branch,
-			Index:                idx,
-			MasterKeyFingerprint: acctInfo.masterKeyFingerprint,
-		}
-
-		// Iterate through addresses to find the one with matching branch/index
-		// This avoids calling chainAddressRowToManaged which causes recursion
-		var foundAddr ManagedAddress
-		err := forEachAccountAddress(ns, &s.scope, account,
-			func(rowInterface interface{}) error {
-				row, ok := rowInterface.(*dbChainAddressRow)
-				if !ok {
-					return nil // Skip non-chained addresses
-				}
-				if row.branch == branch && row.index == idx {
-					// Found the address - build it directly
-					key, err := s.deriveKey(acctInfo, branch, idx, hasPrivateKey)
-					if err != nil {
-						return err
-					}
-
-					// Decrypt tapscript root if present (stored inline in row)
-					var tapscriptRoot []byte
-					if row.encryptedTapscriptRoot != nil {
-						tapscriptRoot, err = s.rootManager.CryptoKeyPub().Decrypt(row.encryptedTapscriptRoot)
-						if err != nil {
-							return managerError(ErrCrypto, "failed to decrypt tapscript root", err)
-						}
-					}
-
-					foundAddr, err = s.keyToManaged(key, path, acctInfo, tapscriptRoot)
-					return err
-				}
-				return nil
-			})
-		if err != nil {
-			return nil, err
-		}
-		if foundAddr != nil {
-			return foundAddr, nil
-		}
-
-		// Address not found at all - this shouldn't happen if nextIndex > 0
-		return nil, managerError(ErrAddressNotFound,
-			fmt.Sprintf("address not found: branch=%d index=%d", branch, idx), nil)
+	if nextIndex == 0 {
+		return nil, nil
 	}
 
-	lastExt, err = loadAddr(ExternalBranch, acctInfo.nextExternalIndex)
+	index := nextIndex - 1
+	key, err := s.deriveKey(acctInfo, branch, index, private)
 	if err != nil {
-		return nil, nil, err
-	}
-	lastInt, err = loadAddr(InternalBranch, acctInfo.nextInternalIndex)
-	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return lastExt, lastInt, nil
+	path := DerivationPath{
+		InternalAccount:      account,
+		Account:              acctInfo.acctKeyPub.ChildIndex(),
+		Branch:               branch,
+		Index:                index,
+		MasterKeyFingerprint: acctInfo.masterKeyFingerprint,
+	}
+	return s.keyToManaged(key, path, acctInfo)
 }
 
 // AccountProperties returns properties associated with the account, such as
@@ -890,7 +840,7 @@ func (s *ScopedKeyManager) DeriveFromKeyPath(ns walletdb.ReadBucket,
 		return nil, err
 	}
 
-	return s.keyToManaged(addrKey, kp, acctInfo, nil)
+	return s.keyToManaged(addrKey, kp, acctInfo)
 }
 
 // deriveKeyFromPath returns either a public or private derived extended key
@@ -950,17 +900,7 @@ func (s *ScopedKeyManager) chainAddressRowToManaged(ns walletdb.ReadBucket,
 		MasterKeyFingerprint: masterKeyFingerprint,
 	}
 
-	// Get tapscript root from the row (stored inline with address data)
-	var tapscriptRoot []byte
-	if row.encryptedTapscriptRoot != nil {
-		tapscriptRoot, err = s.rootManager.CryptoKeyPub().Decrypt(row.encryptedTapscriptRoot)
-		if err != nil {
-			str := "failed to decrypt tapscript root"
-			return nil, managerError(ErrCrypto, str, err)
-		}
-	}
-
-	return s.keyToManaged(addressKey, path, acctInfo, tapscriptRoot)
+	return s.keyToManaged(addressKey, path, acctInfo)
 }
 
 // importedAddressRowToManaged returns a new managed address based on imported
@@ -984,7 +924,7 @@ func (s *ScopedKeyManager) importedAddressRowToManaged(row *dbImportedAddressRow
 	compressed := len(pubBytes) == btcec.PubKeyBytesLenCompressed
 	ma, err := newManagedAddressWithoutPrivKey(
 		s, ImportedDerivationPath, pubKey, compressed,
-		s.addrSchema.ExternalAddrType, nil,
+		s.addrSchema.ExternalAddrType,
 	)
 	if err != nil {
 		return nil, err
@@ -1248,7 +1188,7 @@ func (s *ScopedKeyManager) nextAddresses(ns walletdb.ReadWriteBucket,
 		// Also, zero the next key after creating the managed address
 		// from it.
 		addr, err := newManagedAddressFromExtKey(
-			s, derivationPath, nextKey, addrType, acctInfo, nil,
+			s, derivationPath, nextKey, addrType, acctInfo,
 		)
 		if err != nil {
 			return nil, err
@@ -1275,19 +1215,9 @@ func (s *ScopedKeyManager) nextAddresses(ns walletdb.ReadWriteBucket,
 
 		switch a := ma.(type) {
 		case *managedAddress:
-			// Encrypt tapscript root if present
-			var encryptedRoot []byte
-			if root := a.TapscriptRoot(); root != nil {
-				encryptedRoot, err = s.rootManager.CryptoKeyPub().Encrypt(root)
-				if err != nil {
-					str := fmt.Sprintf("failed to encrypt tapscript root for %x", addressID)
-					return nil, managerError(ErrCrypto, str, err)
-				}
-			}
-
 			err := putChainedAddress(
 				ns, &s.scope, addressID, account, ssFull,
-				info.branch, info.index, adtChain, encryptedRoot,
+				info.branch, info.index, adtChain,
 			)
 			if err != nil {
 				return nil, maybeConvertDbError(err)
@@ -1487,7 +1417,7 @@ func (s *ScopedKeyManager) extendAddresses(ns walletdb.ReadWriteBucket,
 		// Also, zero the next key after creating the managed address
 		// from it.
 		addr, err := newManagedAddressFromExtKey(
-			s, derivationPath, nextKey, addrType, acctInfo, nil,
+			s, derivationPath, nextKey, addrType, acctInfo,
 		)
 		if err != nil {
 			return err
@@ -1514,19 +1444,9 @@ func (s *ScopedKeyManager) extendAddresses(ns walletdb.ReadWriteBucket,
 
 		switch a := ma.(type) {
 		case *managedAddress:
-			// Encrypt tapscript root if present
-			var encryptedRoot []byte
-			if root := a.TapscriptRoot(); root != nil {
-				encryptedRoot, err = s.rootManager.CryptoKeyPub().Encrypt(root)
-				if err != nil {
-					str := fmt.Sprintf("failed to encrypt tapscript root for %x", addressID)
-					return managerError(ErrCrypto, str, err)
-				}
-			}
-
 			err := putChainedAddress(
 				ns, &s.scope, addressID, account, ssFull,
-				info.branch, info.index, adtChain, encryptedRoot,
+				info.branch, info.index, adtChain,
 			)
 			if err != nil {
 				return maybeConvertDbError(err)
@@ -2213,12 +2133,11 @@ func (s *ScopedKeyManager) toImportedPrivateManagedAddress(
 	wif *btcutil.WIF) (*managedAddress, error) {
 
 	// Create a new managed address based on the imported address.
-	// Imported addresses don't have XMSS tapscript commitment.
 	//
 	// TODO: Handle imported key being part of internal branch.
 	managedAddr, err := newManagedAddress(
 		s, ImportedDerivationPath, wif.PrivKey, wif.CompressPubKey,
-		s.addrSchema.ExternalAddrType, nil, nil,
+		s.addrSchema.ExternalAddrType, nil,
 	)
 	if err != nil {
 		return nil, err
@@ -2237,12 +2156,11 @@ func (s *ScopedKeyManager) toImportedPublicManagedAddress(
 	pubKey *btcec.PublicKey, compressed bool) (*managedAddress, error) {
 
 	// Create a new managed address based on the imported address.
-	// Imported addresses don't have XMSS tapscript commitment.
 	//
 	// TODO: Handle imported key being part of internal branch.
 	managedAddr, err := newManagedAddressWithoutPrivKey(
 		s, ImportedDerivationPath, pubKey, compressed,
-		s.addrSchema.ExternalAddrType, nil,
+		s.addrSchema.ExternalAddrType,
 	)
 	if err != nil {
 		return nil, err

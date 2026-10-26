@@ -1,13 +1,57 @@
 package waddrmgr
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"testing"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
+	"github.com/stretchr/testify/require"
 )
+
+// TestDeserializeChainedAddress ensures chained address rows that carry an
+// encrypted tapscript root after the index, as written by earlier releases,
+// still parse.
+func TestDeserializeChainedAddress(t *testing.T) {
+	t.Parallel()
+
+	const branch, index = InternalBranch, 7
+	rawData := serializeChainedAddress(branch, index)
+
+	tests := []struct {
+		name    string
+		rawData []byte
+		wantErr bool
+	}{
+		{name: "branch and index", rawData: rawData},
+		{
+			name: "trailing tapscript root",
+			rawData: append(
+				bytes.Clone(rawData), bytes.Repeat([]byte{0xab}, 72)...,
+			),
+		},
+		{name: "truncated", rawData: rawData[:7], wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			row, err := deserializeChainedAddress(&dbAddressRow{
+				addrType: adtChain,
+				rawData:  test.rawData,
+			})
+			if test.wantErr {
+				require.True(t, IsError(err, ErrDatabase))
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, uint32(branch), row.branch)
+			require.Equal(t, uint32(index), row.index)
+		})
+	}
+}
 
 // TestStoreMaxReorgDepth ensures that we can only store up to MaxReorgDepth
 // blocks at any given time.

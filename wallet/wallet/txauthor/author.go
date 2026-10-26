@@ -204,9 +204,6 @@ type SecretsSource interface {
 	txscript.KeyDB
 	txscript.ScriptDB
 	ChainParams() *chaincfg.Params
-	// GetTapscriptRoot returns the tapscript root hash for the address if it has
-	// tapscript commitment, or nil if it's a standard BIP-86 address.
-	GetTapscriptRoot(btcutil.Address) []byte
 }
 
 // AddAllInputScripts modifies transaction a transaction by adding inputs
@@ -283,18 +280,15 @@ func spendTaprootKey(txIn *wire.TxIn, pkScript []byte,
 		return err
 	}
 
-	// Get tapscript root for the address (nil for standard BIP-86 addresses, non-nil for addresses with tapscript commitment like XMSS).
-	// Generate Schnorr signature with proper tapscript root tweaking (nil path matches TaprootWitnessSignature).
-	tapscriptRoot := secrets.GetTapscriptRoot(addrs[0])
-	sig, err := txscript.RawTxInTaprootSignature(
-		tx, hashCache, idx, inputValue, pkScript, tapscriptRoot,
+	witness, err := txscript.TaprootWitnessSignature(
+		tx, hashCache, idx, inputValue, pkScript,
 		txscript.SigHashDefault, privKey,
 	)
 	if err != nil {
 		return err
 	}
 
-	txIn.Witness = wire.TxWitness{sig}
+	txIn.Witness = witness
 
 	return nil
 }
