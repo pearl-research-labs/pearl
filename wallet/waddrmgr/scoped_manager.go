@@ -163,22 +163,12 @@ var (
 		Coin:    chaincfg.HDCoinTypePearl,
 	}
 
-	// KeyScopePQ is the key scope for post-quantum XMSS key derivation.
-	// Purpose 222 (0xDE) matches OP_CHECKXMSSSIG opcode.
-	// Keys derived here are cryptographically isolated from BIP-86 keys,
-	// providing quantum resistance even if BIP-86 keys are compromised.
-	KeyScopePQ = KeyScope{
-		Purpose: 222,
-		Coin:    chaincfg.HDCoinTypePearl,
-	}
-
 	// DefaultKeyScopes is the set of default key scopes that will be
 	// created by the root manager upon initial creation.
 	DefaultKeyScopes = []KeyScope{
 		// KeyScopeBIP0049Plus,
 		// KeyScopeBIP0084,
 		KeyScopeBIP0086,
-		KeyScopePQ, // Derives Post-quantum keys
 		// KeyScopeBIP0044,
 	}
 
@@ -187,10 +177,6 @@ var (
 	// the initial creation of the root key manager.
 	ScopeAddrMap = map[KeyScope]ScopeAddrSchema{
 		KeyScopeBIP0086: {
-			ExternalAddrType: TaprootPubKey,
-			InternalAddrType: TaprootPubKey,
-		},
-		KeyScopePQ: {
 			ExternalAddrType: TaprootPubKey,
 			InternalAddrType: TaprootPubKey,
 		},
@@ -212,11 +198,9 @@ var (
 // coin=808276 for mainnet (matching "m/86'/808276'/0'/0/0").
 func InitKeyScopes(coinType uint32) {
 	KeyScopeBIP0086 = KeyScope{Purpose: 86, Coin: coinType}
-	KeyScopePQ = KeyScope{Purpose: 222, Coin: coinType}
-	DefaultKeyScopes = []KeyScope{KeyScopeBIP0086, KeyScopePQ}
+	DefaultKeyScopes = []KeyScope{KeyScopeBIP0086}
 	ScopeAddrMap = map[KeyScope]ScopeAddrSchema{
 		KeyScopeBIP0086: {ExternalAddrType: TaprootPubKey, InternalAddrType: TaprootPubKey},
-		KeyScopePQ:      {ExternalAddrType: TaprootPubKey, InternalAddrType: TaprootPubKey},
 	}
 }
 
@@ -2577,17 +2561,13 @@ func (s *ScopedKeyManager) IsWatchOnlyAccount(ns walletdb.ReadBucket,
 // to the manager's key scope. This should only be used for non-watch-only
 // accounts as they are stored within the database using the legacy BIP-0044
 // version by default.
-//
-// Both BIP-86 and post-quantum scopes use the same HD version since both
-// derive taproot-compatible keys.
 func (s *ScopedKeyManager) cloneKeyWithVersion(key *hdkeychain.ExtendedKey) (
 	*hdkeychain.ExtendedKey, error) {
-	if s.scope != KeyScopeBIP0086 && s.scope != KeyScopePQ {
+	if s.scope != KeyScopeBIP0086 {
 		return nil, fmt.Errorf("unsupported scope %v", s.scope)
 	}
 
 	// Determine the appropriate version based on the current network.
-	// Both BIP-86 and PQ scopes use the same version.
 	var version HDVersion
 	net := s.rootManager.ChainParams().Net
 	switch net {
