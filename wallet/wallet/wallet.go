@@ -3192,9 +3192,7 @@ func (w *Wallet) SortedActivePaymentAddresses() ([]string, error) {
 }
 
 // NewAddress returns the next external chained address for a wallet.
-func (w *Wallet) NewAddress(account uint32,
-	scope waddrmgr.KeyScope) (btcutil.Address, error) {
-
+func (w *Wallet) NewAddress(account uint32, scope waddrmgr.KeyScope) (btcutil.Address, error) {
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return nil, err
@@ -3249,8 +3247,7 @@ func (w *Wallet) newAddress(addrmgrNs walletdb.ReadWriteBucket, account uint32,
 
 	props, err := manager.AccountProperties(addrmgrNs, account)
 	if err != nil {
-		log.Errorf("Cannot fetch account properties for notification "+
-			"after deriving next external address: %v", err)
+		log.Errorf("Cannot fetch account properties for notification after deriving next external address: %v", err)
 		return nil, nil, err
 	}
 
@@ -3930,13 +3927,10 @@ func (w *Wallet) InitAccounts(scope *waddrmgr.ScopedKeyManager, watchOnly bool, 
 }
 
 // DeriveFromKeyPath derives a private key using the given derivation path.
-func (w *Wallet) DeriveFromKeyPath(scope waddrmgr.KeyScope,
-	path waddrmgr.DerivationPath) (*btcec.PrivateKey, error) {
-
+func (w *Wallet) DeriveFromKeyPath(scope waddrmgr.KeyScope, path waddrmgr.DerivationPath) (*btcec.PrivateKey, error) {
 	scopedMgr, err := w.Manager.FetchScopedKeyManager(scope)
 	if err != nil {
-		return nil, fmt.Errorf("error fetching manager for scope %v: "+
-			"%w", scope, err)
+		return nil, fmt.Errorf("error fetching manager for scope %v: %w", scope, err)
 	}
 
 	// Let's see if we can hit the private key cache.
@@ -3954,7 +3948,14 @@ func (w *Wallet) DeriveFromKeyPath(scope waddrmgr.KeyScope,
 			return fmt.Errorf("error deriving private key: %w", err)
 		}
 
-		privKey, err = addr.(waddrmgr.ManagedPubKeyAddress).PrivKey()
+		mpka, ok := addr.(waddrmgr.ManagedPubKeyAddress)
+		if !ok {
+			err := fmt.Errorf("managed address type for %v is `%T` but want waddrmgr.ManagedPubKeyAddress",
+				addr, addr)
+
+			return err
+		}
+		privKey, err = mpka.PrivKey()
 
 		return err
 	})
