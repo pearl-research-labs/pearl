@@ -434,14 +434,6 @@ func (a *managedAddress) Validate(msg [32]byte, priv *btcec.PrivateKey) error {
 			a.pubKey.SerializeUncompressed())
 	}
 
-	// If we have internal private key data, verify it matches the passed key
-	if a.privKeyCT != nil {
-		internalPrivKey, _ := btcec.PrivKeyFromBytes(a.privKeyCT)
-		if !priv.Key.Equals(&internalPrivKey.Key) {
-			return ErrInvalidSignature
-		}
-	}
-
 	// Next, we'll verify that if we take the base public key, and generate
 	// an address of the corresponding type, that matches up w/ what we've
 	// stored internally.
@@ -466,17 +458,14 @@ func (a *managedAddress) Validate(msg [32]byte, priv *btcec.PrivateKey) error {
 	// TODO(roasbeef): potentially run _all_ checks then see which one
 	// fails?
 	var sig signature
-	// TODO Or: clean this up
-	switch a.addrType {
-	// For the "legacy" addr types, we'll generate an ECDSA signature to
-	// verify against.
-	// case NestedWitnessPubKey, PubKeyHash, WitnessPubKey:
-	// 	sig = ecdsa.Sign(addrPrivKey, msg[:])
 
+	addrPrivKey, _ := btcec.PrivKeyFromBytes(a.privKeyCT)
+
+	switch a.addrType {
 	// For the newer taproot addr type, we'll generate a schnorr signature
 	// to verify against.
 	case TaprootPubKey:
-		sig, err = schnorr.Sign(priv, msg[:])
+		sig, err = schnorr.Sign(addrPrivKey, msg[:])
 		if err != nil {
 			return fmt.Errorf("unable to generate validate "+
 				"schnorr sig: %w", err)
