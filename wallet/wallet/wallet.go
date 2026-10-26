@@ -798,13 +798,13 @@ func (w *Wallet) recovery(chainClient chain.Interface, birthdayBlock *waddrmgr.B
 	for _, scopedMgr := range w.Manager.ActiveScopedKeyManagers() {
 		scopedMgrs[scopedMgr.Scope()] = scopedMgr
 	}
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txMgrNS := tx.ReadBucket(wtxmgrNamespaceKey)
 		credits, err := w.TxStore.UnspentOutputs(txMgrNS)
 		if err != nil {
 			return err
 		}
-		addrMgrNS := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		addrMgrNS := tx.ReadBucket(waddrmgrNamespaceKey)
 		return recoveryMgr.Resurrect(addrMgrNS, scopedMgrs, credits)
 	})
 	if err != nil {
@@ -1022,7 +1022,7 @@ expandHorizons:
 // persistent state of the wallet. If any invalid child keys are detected, the
 // horizon will be properly extended such that our lookahead always includes the
 // proper number of valid child keys.
-func expandScopeHorizons(ns walletdb.ReadWriteBucket,
+func expandScopeHorizons(ns walletdb.ReadBucket,
 	scopedMgr *waddrmgr.ScopedKeyManager,
 	scopeState *ScopeRecoveryState) error {
 
