@@ -11,7 +11,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pearl-research-labs/pearl/node/btcec"
+	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/xmss"
+	"github.com/stretchr/testify/require"
 )
 
 // TestOpcodeDisabled tests the opcodeDisabled function manually because all
@@ -252,4 +255,69 @@ func TestOpcodeCheckXmssSigWrongLengthNullFail(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpcodeCheckXmssSigScriptPathSpend(t *testing.T) {
+	t.Parallel()
+
+	var privSeed [xmss.PrivateSeedLen]byte
+	var pubSeed [xmss.PublicSeedLen]byte
+	for i := range privSeed {
+		privSeed[i] = byte(i)
+	}
+	for i := range pubSeed {
+		pubSeed[i] = byte(0xff - i)
+	}
+
+	pk, sk, err := xmss.Keygen(privSeed, pubSeed)
+	if err != nil && strings.Contains(err.Error(), "-tags xmss") {
+		t.Skip(err)
+	}
+	require.NoError(t, err)
+
+	xmssScript, err := NewScriptBuilder().AddData(pk[:]).AddOp(OP_CHECKXMSSSIG).Script()
+	require.NoError(t, err)
+
+	internalPriv, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{0x01}, 32))
+	internalKey := internalPriv.PubKey()
+
+	tapLeaf := NewBaseTapLeaf(xmssScript)
+	tapTree := AssembleTaprootScriptTree(tapLeaf)
+	rootHash := tapTree.RootNode.TapHash()
+	pkScript, err := PayToTaprootScript(ComputeTaprootOutputKey(internalKey, rootHash[:]))
+	require.NoError(t, err)
+	ctrlBlock := tapTree.LeafMerkleProofs[0].ToControlBlock(internalKey)
+	ctrlBytes, err := ctrlBlock.ToBytes()
+	require.NoError(t, err)
+
+	const value = int64(1e8)
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Index: 0}})
+	tx.AddTxOut(&wire.TxOut{Value: value, PkScript: pkScript})
+
+	prevFetcher := NewCannedPrevOutputFetcher(pkScript, value)
+	sigHashes := NewTxSigHashes(tx, prevFetcher)
+	sigHash, err := CalcTapscriptSignaturehash(sigHashes, SigHashDefault, tx, 0, prevFetcher, tapLeaf)
+	require.NoError(t, err)
+
+	var msg [xmss.MsgLen]byte
+	copy(msg[:], sigHash)
+	sig, err := xmss.Sign(0, sk, msg)
+	require.NoError(t, err)
+
+	const chunk = xmss.SignatureLen / 5
+	execute := func(sig [xmss.SignatureLen]byte) error {
+		tx.TxIn[0].Witness = wire.TxWitness{
+			sig[:chunk], sig[chunk : 2*chunk], sig[2*chunk : 3*chunk], sig[3*chunk : 4*chunk], sig[4*chunk:],
+			xmssScript, ctrlBytes,
+		}
+		vm, err := NewEngine(pkScript, tx, 0, StandardVerifyFlags, nil, sigHashes, value, prevFetcher)
+		require.NoError(t, err)
+		return vm.Execute()
+	}
+
+	require.NoError(t, execute(sig))
+
+	sig[chunk-1] ^= 0x01
+	require.Error(t, execute(sig))
 }
