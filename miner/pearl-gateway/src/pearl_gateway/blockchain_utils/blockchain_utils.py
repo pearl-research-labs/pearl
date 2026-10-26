@@ -22,7 +22,19 @@ def calculate_merkle_root(txids: list[str]) -> bytes:
         bytes: The 32-byte merkle root hash
     """
     # Txids are in display order (big-endian); reverse to little-endian for merkle calc
-    tx_hashes = [bytes.fromhex(txid)[::-1] for txid in txids]
+    tx_hashes = []
+    for txid in txids:
+        tx_hash = bytes.fromhex(txid)
+        # A txid is a 32-byte hash. The pair-hashing below would
+        # otherwise mask a wrong length: concatenating a short or long
+        # hash still produces a plausible-looking 32-byte root that
+        # silently differs from the node's, so reject it here, at the
+        # parse boundary, instead of mining on a bad root.
+        if len(tx_hash) != 32:
+            raise ValueError(
+                f"Invalid txid length: {len(tx_hash)} bytes (expected 32)"
+            )
+        tx_hashes.append(tx_hash[::-1])
 
     # Calculate merkle root using the standard algorithm
     return _compute_merkle_root(tx_hashes)
