@@ -67,6 +67,12 @@
         "arch": [
           "x64"
         ]
+      },
+      {
+        "target": "rpm",
+        "arch": [
+          "x64"
+        ]
       }
     ],
     "extraResources": [
@@ -107,5 +113,10 @@
     "buildUniversalInstaller": false,
     "artifactName": "Pearl-Wallet-Setup-${version}.${ext}"
   },
-  "publish": null
+  "publish": null,
+  "rpm": {
+    "artifactName": "pearl-desktop-wallet-${version}.${arch}.${ext}",
+    "packageName": "pearl-desktop-wallet",
+    "compression": "xz"
+  }
 }
