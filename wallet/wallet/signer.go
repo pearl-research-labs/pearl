@@ -72,7 +72,7 @@ func (w *Wallet) ComputeInputScript(tx *wire.MsgTx, output *wire.TxOut,
 	// We need to produce a Schnorr signature for p2tr key spend addresses.
 	// We can now generate a valid witness which will allow us to
 	// spend this output.
-	witness, err := txscript.TaprootWitnessSignature(
+	witnessScript, err := txscript.TaprootWitnessSignature(
 		tx, sigHashes, inputIndex, output.Value,
 		output.PkScript, hashType, privKey,
 	)
@@ -80,5 +80,5 @@ func (w *Wallet) ComputeInputScript(tx *wire.MsgTx, output *wire.TxOut,
 		return nil, nil, err
 	}
 
-	return witness, nil, nil
+	return witnessScript, nil, nil
 }

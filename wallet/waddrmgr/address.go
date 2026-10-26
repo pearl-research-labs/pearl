@@ -623,7 +623,8 @@ func newManagedAddressFromExtKey(s *ScopedKeyManager,
 		}
 
 		managedAddr, err = newManagedAddressWithoutPrivKey(
-			s, derivationPath, pubKey, true, addrType,
+			s, derivationPath, pubKey, true,
+			addrType,
 		)
 		if err != nil {
 			return nil, err

@@ -446,7 +446,8 @@ func (s *ScopedKeyManager) ConvertToWatchingOnly() {
 //
 // This function MUST be called with the manager lock held for writes.
 func (s *ScopedKeyManager) keyToManaged(derivedKey *hdkeychain.ExtendedKey,
-	derivationPath DerivationPath, acctInfo *accountInfo) (ManagedAddress, error) {
+	derivationPath DerivationPath, acctInfo *accountInfo) (
+	ManagedAddress, error) {
 
 	// Choose the appropriate type of address to derive since it's possible
 	// for a watch-only account to have a different schema from the
@@ -839,7 +840,6 @@ func (s *ScopedKeyManager) DeriveFromKeyPath(ns walletdb.ReadBucket,
 	if err != nil {
 		return nil, err
 	}
-
 	return s.keyToManaged(addrKey, kp, acctInfo)
 }
 
@@ -892,15 +892,15 @@ func (s *ScopedKeyManager) chainAddressRowToManaged(ns walletdb.ReadBucket,
 	if err != nil {
 		return nil, err
 	}
-	path := DerivationPath{
-		InternalAccount:      row.account,
-		Account:              acctKey.ChildIndex(),
-		Branch:               row.branch,
-		Index:                row.index,
-		MasterKeyFingerprint: masterKeyFingerprint,
-	}
-
-	return s.keyToManaged(addressKey, path, acctInfo)
+	return s.keyToManaged(
+		addressKey, DerivationPath{
+			InternalAccount:      row.account,
+			Account:              acctKey.ChildIndex(),
+			Branch:               row.branch,
+			Index:                row.index,
+			MasterKeyFingerprint: masterKeyFingerprint,
+		}, acctInfo,
+	)
 }
 
 // importedAddressRowToManaged returns a new managed address based on imported
@@ -1093,7 +1093,8 @@ func (s *ScopedKeyManager) accountAddrType(acctInfo *accountInfo,
 //
 // This function MUST be called with the manager lock held for writes.
 func (s *ScopedKeyManager) nextAddresses(ns walletdb.ReadWriteBucket,
-	account uint32, numAddresses uint32, internal bool) ([]ManagedAddress, error) {
+	account uint32, numAddresses uint32, internal bool) ([]ManagedAddress,
+	error) {
 
 	// The next address can only be generated for accounts that have
 	// already been created.

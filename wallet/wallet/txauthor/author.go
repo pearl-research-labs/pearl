@@ -280,7 +280,7 @@ func spendTaprootKey(txIn *wire.TxIn, pkScript []byte,
 		return err
 	}
 
-	witness, err := txscript.TaprootWitnessSignature(
+	witnessScript, err := txscript.TaprootWitnessSignature(
 		tx, hashCache, idx, inputValue, pkScript,
 		txscript.SigHashDefault, privKey,
 	)
@@ -288,7 +288,7 @@ func spendTaprootKey(txIn *wire.TxIn, pkScript []byte,
 		return err
 	}
 
-	txIn.Witness = witness
+	txIn.Witness = witnessScript
 
 	return nil
 }
