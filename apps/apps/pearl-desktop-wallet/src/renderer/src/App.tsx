@@ -8,6 +8,7 @@ import SendTransaction from './pages/send-transaction/SendTransaction';
 import ReceiveTransaction from './pages/ReceiveTransaction';
 import WalletUnlock from './pages/WalletUnlock';
 import ChangePassword from './pages/ChangePassword';
+import SignMessage from './pages/SignMessage';
 import {useNavigate} from 'react-router-dom';
 import {SyncWallet} from './SyncWallet';
 import {MajorUpgradeBanner} from './components/MajorUpgradeBanner';
@@ -28,6 +29,7 @@ function AppContent() {
           <Route path="/receive" element={<ReceiveTransaction />} />
           <Route path="/unlock" element={<WalletUnlock />} />
           <Route path="/change-password" element={<ChangePassword />} />
+          <Route path="/sign-message" element={<SignMessage />} />
           <Route path="/import-account" element={<ImportAccount />} />
           <Route path="/onboarding/create" element={<CreateWallet />} />
           <Route path="/activity" element={<ActivityPage onBack={() => navigate('/wallet')} />} />
