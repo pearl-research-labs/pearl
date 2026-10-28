@@ -783,21 +783,15 @@ func (w *Wallet) recovery(chainClient chain.Interface, birthdayBlock *waddrmgr.B
 	w.recovering.Store(syncer)
 	defer close(syncer.done)
 
-	// We'll initialize the recovery manager with a default batch size of
-	// 2000.
-	recoveryMgr := NewRecoveryManager(
-		w.recoveryWindow, recoveryBatchSize, w.chainParams,
-	)
-
-	// In the event that this recovery is being resumed, we will need to
-	// repopulate all found addresses from the database. Ideally, for basic
-	// recovery, we would only do so for the default scopes, but due to a
-	// bug in which the wallet would create change addresses outside of the
-	// default scopes, it's necessary to attempt all registered key scopes.
-	scopedMgrs := make(map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager)
-	for _, scopedMgr := range w.Manager.ActiveScopedKeyManagers() {
-		scopedMgrs[scopedMgr.Scope()] = scopedMgr
+	// Recover each existing HD account independently. Address indexes are
+	// keyed by scope in FilterBlocksRequest, so merging accounts into one
+	// recovery state would collide at the same child indexes.
+	type accountRecovery struct {
+		manager    *RecoveryManager
+		scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager
+		account    uint32
 	}
+	var recoveries []accountRecovery
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txMgrNS := tx.ReadBucket(wtxmgrNamespaceKey)
 		credits, err := w.TxStore.UnspentOutputs(txMgrNS)
@@ -805,7 +799,28 @@ func (w *Wallet) recovery(chainClient chain.Interface, birthdayBlock *waddrmgr.B
 			return err
 		}
 		addrMgrNS := tx.ReadBucket(waddrmgrNamespaceKey)
-		return recoveryMgr.Resurrect(addrMgrNS, scopedMgrs, credits)
+		for _, scopedMgr := range w.Manager.ActiveScopedKeyManagers() {
+			scope := scopedMgr.Scope()
+			err := scopedMgr.ForEachAccount(addrMgrNS, func(account uint32) error {
+				if account == waddrmgr.ImportedAddrAccount {
+					return nil
+				}
+				// Each account watches all previously known UTXOs so that
+				// spends remain visible across account-specific filter passes.
+				// This preserves the original wallet-wide outpoint watch.
+				mgr := NewRecoveryManager(w.recoveryWindow, recoveryBatchSize, w.chainParams)
+				single := map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager{scope: scopedMgr}
+				if err := mgr.Resurrect(addrMgrNS, single, credits, account); err != nil {
+					return err
+				}
+				recoveries = append(recoveries, accountRecovery{mgr, single, account})
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err
@@ -852,53 +867,41 @@ func (w *Wallet) recovery(chainClient chain.Interface, birthdayBlock *waddrmgr.B
 		// if our birthday is after our reorg safe height, so we'll make
 		// sure to not add those to the batch.
 		if height >= birthdayBlock.Height {
-			recoveryMgr.AddToBlockBatch(
-				hash, height, header.Timestamp,
-			)
+			for i := range recoveries {
+				recoveries[i].manager.AddToBlockBatch(hash, height, header.Timestamp)
+			}
 		}
 
-		// We'll perform our recovery in batches of 2000 blocks.  It's
-		// possible for us to reach our best height without exceeding
-		// the recovery batch size, so we can proceed to commit our
-		// state to disk.
-		recoveryBatch := recoveryMgr.BlockBatch()
-		if len(recoveryBatch) == recoveryBatchSize || height == bestHeight {
+		// All account contexts must process a batch before the sync height
+		// advances, so interrupted scans can resume without skipping accounts.
+		if len(blocks) == recoveryBatchSize || height == bestHeight {
 			err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 				ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-				if err := w.recoverScopedAddresses(
-					chainClient, tx, ns, recoveryBatch,
-					recoveryMgr.State(), scopedMgrs,
-				); err != nil {
-					return err
-				}
-
-				// TODO: Any error here will roll back this
-				// entire tx. This may cause the in memory sync
-				// point to become desyncronized. Refactor so
-				// that this cannot happen.
-				for _, block := range blocks {
-					err := w.Manager.SetSyncedTo(ns, block)
-					if err != nil {
+				for i := range recoveries {
+					r := &recoveries[i]
+					if err := w.recoverScopedAddresses(
+						chainClient, tx, ns, r.manager.BlockBatch(),
+						r.manager.State(), r.scopedMgrs, r.account,
+					); err != nil {
 						return err
 					}
 				}
-
+				for _, block := range blocks {
+					if err := w.Manager.SetSyncedTo(ns, block); err != nil {
+						return err
+					}
+				}
 				return nil
 			})
 			if err != nil {
 				return err
 			}
-
-			if len(recoveryBatch) > 0 {
-				log.Infof("Recovered addresses from blocks %d-%d", recoveryBatch[0].Height,
-					recoveryBatch[len(recoveryBatch)-1].Height)
+			for i := range recoveries {
+				recoveries[i].manager.ResetBlockBatch()
 			}
-
-			// Clear the batch of all processed blocks to reuse the
-			// same memory for future batches.
 			blocks = blocks[:0]
-			recoveryMgr.ResetBlockBatch()
 		}
+
 	}
 
 	return nil
@@ -923,7 +926,8 @@ func (w *Wallet) recoverScopedAddresses(
 	ns walletdb.ReadWriteBucket,
 	batch []wtxmgr.BlockMeta,
 	recoveryState *RecoveryState,
-	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager) error {
+	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
+	account uint32) error {
 
 	// If there are no blocks in the batch, we are done.
 	if len(batch) == 0 {
@@ -935,7 +939,7 @@ func (w *Wallet) recoverScopedAddresses(
 expandHorizons:
 	for scope, scopedMgr := range scopedMgrs {
 		scopeState := recoveryState.StateForScope(scope)
-		err := expandScopeHorizons(ns, scopedMgr, scopeState)
+		err := expandScopeHorizons(ns, scopedMgr, scopeState, account)
 		if err != nil {
 			return err
 		}
@@ -974,7 +978,7 @@ expandHorizons:
 	// last-found index of either will result in the horizons being expanded
 	// upon the next iteration. Any found addresses are also marked used
 	// using the scoped key manager.
-	err = extendFoundAddresses(ns, filterResp, scopedMgrs, recoveryState)
+	err = extendFoundAddresses(ns, filterResp, scopedMgrs, recoveryState, account)
 	if err != nil {
 		return err
 	}
@@ -1024,7 +1028,7 @@ expandHorizons:
 // proper number of valid child keys.
 func expandScopeHorizons(ns walletdb.ReadBucket,
 	scopedMgr *waddrmgr.ScopedKeyManager,
-	scopeState *ScopeRecoveryState) error {
+	scopeState *ScopeRecoveryState, account uint32) error {
 
 	// Compute the current external horizon and the number of addresses we
 	// must derive to ensure we maintain a sufficient recovery window for
@@ -1032,7 +1036,7 @@ func expandScopeHorizons(ns walletdb.ReadBucket,
 	exHorizon, exWindow := scopeState.ExternalBranch.ExtendHorizon()
 	count, childIndex := uint32(0), exHorizon
 	for count < exWindow {
-		keyPath := externalKeyPath(childIndex)
+		keyPath := externalKeyPath(account, childIndex)
 		addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath)
 		switch {
 		case err == hdkeychain.ErrInvalidChild:
@@ -1062,7 +1066,7 @@ func expandScopeHorizons(ns walletdb.ReadBucket,
 	inHorizon, inWindow := scopeState.InternalBranch.ExtendHorizon()
 	count, childIndex = 0, inHorizon
 	for count < inWindow {
-		keyPath := internalKeyPath(childIndex)
+		keyPath := internalKeyPath(account, childIndex)
 		addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath)
 		switch {
 		case err == hdkeychain.ErrInvalidChild:
@@ -1089,21 +1093,21 @@ func expandScopeHorizons(ns walletdb.ReadBucket,
 	return nil
 }
 
-// externalKeyPath returns the relative external derivation path /0/0/index.
-func externalKeyPath(index uint32) waddrmgr.DerivationPath {
+// externalKeyPath returns the external derivation path for an account.
+func externalKeyPath(account, index uint32) waddrmgr.DerivationPath {
 	return waddrmgr.DerivationPath{
-		InternalAccount: waddrmgr.DefaultAccountNum,
-		Account:         waddrmgr.DefaultAccountNum,
+		InternalAccount: account,
+		Account:         account,
 		Branch:          waddrmgr.ExternalBranch,
 		Index:           index,
 	}
 }
 
-// internalKeyPath returns the relative internal derivation path /0/1/index.
-func internalKeyPath(index uint32) waddrmgr.DerivationPath {
+// internalKeyPath returns the internal derivation path for an account.
+func internalKeyPath(account, index uint32) waddrmgr.DerivationPath {
 	return waddrmgr.DerivationPath{
-		InternalAccount: waddrmgr.DefaultAccountNum,
-		Account:         waddrmgr.DefaultAccountNum,
+		InternalAccount: account,
+		Account:         account,
 		Branch:          waddrmgr.InternalBranch,
 		Index:           index,
 	}
@@ -1151,7 +1155,7 @@ func newFilterBlocksRequest(batch []wtxmgr.BlockMeta,
 func extendFoundAddresses(ns walletdb.ReadWriteBucket,
 	filterResp *chain.FilterBlocksResponse,
 	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
-	recoveryState *RecoveryState) error {
+	recoveryState *RecoveryState, account uint32) error {
 
 	// Mark all recovered external addresses as used. This will be done only
 	// for scopes that reported a non-zero number of external addresses in
@@ -1178,7 +1182,7 @@ func extendFoundAddresses(ns walletdb.ReadWriteBucket,
 		}
 
 		err := scopedMgr.ExtendExternalAddresses(
-			ns, waddrmgr.DefaultAccountNum, exLastFound,
+			ns, account, exLastFound,
 		)
 		if err != nil {
 			return err
@@ -1220,7 +1224,7 @@ func extendFoundAddresses(ns walletdb.ReadWriteBucket,
 			inLastFound--
 		}
 		err := scopedMgr.ExtendInternalAddresses(
-			ns, waddrmgr.DefaultAccountNum, inLastFound,
+			ns, account, inLastFound,
 		)
 		if err != nil {
 			return err
