@@ -390,7 +390,7 @@ func assertTxInputs(t *testing.T, packet *psbt.Packet,
 		}
 
 		require.Empty(t, txIn.SignatureScript)
-		require.Empty(t, txIn.Witness)
+		require.Empty(t, txIn.DecodeWitness())
 	}
 }
 

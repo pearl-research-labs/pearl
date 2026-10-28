@@ -908,3 +908,18 @@ func TestOwedBlockIsNotRequestedAgain(t *testing.T) {
 		})
 	}
 }
+
+// TestUnlinkedHeadersAreNotFetched pins that a headers batch outside headers-first mode is fetched only when every
+// header builds on the one before it, so we never fetch unconnected blocks.
+func TestUnlinkedHeadersAreNotFetched(t *testing.T) {
+	node := newTestNode(t)
+	p := node.outboundPeer()
+	known := node.block(nil, 0)
+	sibling := node.block(nil, 1)
+	orphan := node.block(sibling, 0)
+
+	p.sendHeaders(known, orphan)
+	p.expectNotAsked("getdata for a header that does not connect to the one before it")
+	assert.False(t, node.fetching(orphan))
+	assert.False(t, p.connected())
+}

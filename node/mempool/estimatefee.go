@@ -6,6 +6,7 @@ package mempool
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -45,6 +46,11 @@ const (
 	// number of blocks which must be observed by the fee estimator before
 	// it will provide fee estimations.
 	DefaultEstimateFeeMinRegisteredBlocks = 3
+
+	// maxObservedTransactions caps the unmined samples in observed:
+	// ObserveTransaction is not paired with mempool removal, and
+	// RegisterBlock only drops unmined samples after estimateFeeDepth.
+	maxObservedTransactions = 10000
 
 	bytePerKb = 1000
 
@@ -169,9 +175,15 @@ type FeeEstimator struct {
 	// The number of blocks that have been registered.
 	numBlocksRegistered uint32
 
-	mtx      sync.RWMutex
-	observed map[chainhash.Hash]*observedTransaction
-	bin      [estimateFeeDepth][]*observedTransaction
+	mtx         sync.RWMutex
+	maxObserved int
+	observed    map[chainhash.Hash]*observedTransaction
+	bin         [estimateFeeDepth][]*observedTransaction
+
+	// The samples added to observed, oldest first. An entry outlives its
+	// sample's place in observed once the sample is mined or removed, so
+	// check both before evicting.
+	recent list.List
 
 	// The cached estimates.
 	cached []GrainPerByte
@@ -191,8 +203,34 @@ func NewFeeEstimator(maxRollback, minRegisteredBlocks uint32) *FeeEstimator {
 		lastKnownHeight:     mining.UnminedHeight,
 		binSize:             estimateFeeBinSize,
 		maxReplacements:     estimateFeeMaxReplacements,
+		maxObserved:         maxObservedTransactions,
 		observed:            make(map[chainhash.Hash]*observedTransaction),
 		dropped:             make([]*registeredBlock, 0, maxRollback),
+	}
+}
+
+// release removes from observed the samples rb replaced in the bins. Call it
+// when rb leaves the rollback history: nothing references them after that,
+// and eviction never removes a mined sample.
+func (ef *FeeEstimator) release(rb *registeredBlock) {
+	for _, o := range rb.transactions {
+		delete(ef.observed, o.hash)
+	}
+}
+
+// evictOldest drops the oldest unmined samples until recent fits the cap.
+// RestoreFeeEstimator does not persist the cap, so 0 means the default.
+func (ef *FeeEstimator) evictOldest() {
+	limit := ef.maxObserved
+	if limit <= 0 {
+		limit = maxObservedTransactions
+	}
+
+	for ef.recent.Len() > limit {
+		oldest := ef.recent.Remove(ef.recent.Front()).(*observedTransaction)
+		if oldest.mined == mining.UnminedHeight && ef.observed[oldest.hash] == oldest {
+			delete(ef.observed, oldest.hash)
+		}
 	}
 }
 
@@ -208,16 +246,21 @@ func (ef *FeeEstimator) ObserveTransaction(t *TxDesc) {
 	}
 
 	hash := *t.Tx.Hash()
-	if _, ok := ef.observed[hash]; !ok {
-		size := uint32(blockchain.GetTransactionVsize(t.Tx))
-
-		ef.observed[hash] = &observedTransaction{
-			hash:     hash,
-			feeRate:  NewGrainPerByte(btcutil.Amount(t.Fee), size),
-			observed: t.Height,
-			mined:    mining.UnminedHeight,
-		}
+	if _, ok := ef.observed[hash]; ok {
+		return
 	}
+
+	size := uint32(blockchain.GetTransactionVsize(t.Tx))
+	o := &observedTransaction{
+		hash:     hash,
+		feeRate:  NewGrainPerByte(btcutil.Amount(t.Fee), size),
+		observed: t.Height,
+		mined:    mining.UnminedHeight,
+	}
+	ef.observed[hash] = o
+
+	ef.recent.PushBack(o)
+	ef.evictOldest()
 }
 
 // RegisterBlock informs the fee estimator of a new block to take into account.
@@ -239,7 +282,7 @@ func (ef *FeeEstimator) RegisterBlock(block *btcutil.Block) error {
 	ef.numBlocksRegistered++
 
 	// Randomly order txs in block.
-	transactions := make(map[*btcutil.Tx]struct{})
+	transactions := make(map[*btcutil.Tx]struct{}, len(block.Transactions()))
 	for _, t := range block.Transactions() {
 		transactions[t] = struct{}{}
 	}
@@ -296,8 +339,6 @@ func (ef *FeeEstimator) RegisterBlock(block *btcutil.Block) error {
 
 		o.mined = height
 
-		replacementCounts[blocksToConfirm]++
-
 		bin := ef.bin[blocksToConfirm]
 
 		// Remove a random element and replace it with this new tx.
@@ -313,6 +354,7 @@ func (ef *FeeEstimator) RegisterBlock(block *btcutil.Block) error {
 			bin = append(bin, o)
 		}
 		ef.bin[blocksToConfirm] = bin
+		replacementCounts[blocksToConfirm]++
 	}
 
 	// Go through the mempool for txs that have been in too long.
@@ -324,10 +366,12 @@ func (ef *FeeEstimator) RegisterBlock(block *btcutil.Block) error {
 
 	// Add dropped list to history.
 	if ef.maxRollback == 0 {
+		ef.release(dropped)
 		return nil
 	}
 
 	if uint32(len(ef.dropped)) == ef.maxRollback {
+		ef.release(ef.dropped[0])
 		ef.dropped = append(ef.dropped[1:], dropped)
 	} else {
 		ef.dropped = append(ef.dropped, dropped)
@@ -372,6 +416,7 @@ func (ef *FeeEstimator) Rollback(hash *chainhash.Hash) error {
 	for i := 0; i < n; i++ {
 		ef.rollback()
 	}
+	ef.queueUnmined()
 
 	return nil
 }
@@ -602,7 +647,13 @@ func deserializeRegisteredBlock(r io.Reader, txs map[uint32]*observedTransaction
 	for i := uint32(0); i < lenTransactions; i++ {
 		var index uint32
 		binary.Read(r, binary.BigEndian, &index)
-		rb.transactions[i] = txs[index]
+
+		o, exists := txs[index]
+		if !exists {
+			return nil, fmt.Errorf("Invalid transaction reference %d", index)
+		}
+
+		rb.transactions[i] = o
 	}
 
 	return rb, nil
@@ -685,6 +736,52 @@ func (ef *FeeEstimator) Save() FeeEstimatorState {
 	return FeeEstimatorState(w.Bytes())
 }
 
+// dropUnreferencedSamples removes from observed unused elements.
+func (ef *FeeEstimator) dropUnreferencedSamples() {
+	referenced := make(map[*observedTransaction]struct{})
+	for _, bin := range ef.bin {
+		for _, o := range bin {
+			referenced[o] = struct{}{}
+		}
+	}
+	for _, rb := range ef.dropped {
+		for _, o := range rb.transactions {
+			referenced[o] = struct{}{}
+		}
+	}
+
+	cleanObserved := map[chainhash.Hash]*observedTransaction{}
+	for hash, o := range ef.observed {
+		if _, ok := referenced[o]; ok || o.mined == mining.UnminedHeight {
+			cleanObserved[hash] = o
+		}
+	}
+
+	ef.observed = cleanObserved
+}
+
+// queueUnmined rebuilds recent from the unmined samples in observed, oldest
+// first, and applies the cap. Save does not store recent, a save from before
+// the cap can hold any number of unmined samples, and rollback can unmine
+// samples recent does not hold.
+func (ef *FeeEstimator) queueUnmined() {
+	ef.recent.Init()
+
+	var unmined []*observedTransaction
+	for _, o := range ef.observed {
+		if o.mined == mining.UnminedHeight {
+			unmined = append(unmined, o)
+		}
+	}
+
+	sort.Slice(unmined, func(i, j int) bool { return unmined[i].observed < unmined[j].observed })
+	for _, o := range unmined {
+		ef.recent.PushBack(o)
+	}
+
+	ef.evictOldest()
+}
+
 // RestoreFeeEstimator takes a FeeEstimatorState that was previously
 // returned by Save and restores it to a FeeEstimator
 func RestoreFeeEstimator(data FeeEstimatorState) (*FeeEstimator, error) {
@@ -754,6 +851,9 @@ func RestoreFeeEstimator(data FeeEstimatorState) (*FeeEstimator, error) {
 			return nil, err
 		}
 	}
+
+	ef.queueUnmined()
+	ef.dropUnreferencedSamples()
 
 	return ef, nil
 }

@@ -377,7 +377,7 @@ func newBlock(chain *BlockChain, prev *btcutil.Block,
 // avoids the import cycle (mining -> blockchain).
 func addTestWitnessCommitment(txns []*btcutil.Tx) {
 	var witnessNonce [CoinbaseWitnessDataLen]byte
-	txns[0].MsgTx().TxIn[0].Witness = wire.TxWitness{witnessNonce[:]}
+	txns[0].MsgTx().TxIn[0].SetWitness(wire.TxWitness{witnessNonce[:]})
 
 	witnessMerkleRoot := CalcMerkleRoot(txns, true)
 

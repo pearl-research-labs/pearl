@@ -151,7 +151,7 @@ func Example_manualTaprootTransaction() {
 	}
 
 	// Set the witness data for the input
-	redeemTx.TxIn[0].Witness = witnessScript
+	redeemTx.TxIn[0].SetWitness(witnessScript)
 	// SegWit inputs have empty signature scripts
 	redeemTx.TxIn[0].SignatureScript = nil
 

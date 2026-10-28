@@ -32,10 +32,7 @@ func newTapscriptVM(t *testing.T, tapScript []byte) *Engine {
 
 	const outputValue = int64(1e8)
 	tx := wire.NewMsgTx(2)
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{}, Index: 0},
-		Witness:          wire.TxWitness{tapScript, ctrlBytes},
-	})
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, wire.TxWitness{tapScript, ctrlBytes}))
 	tx.AddTxOut(&wire.TxOut{Value: outputValue, PkScript: p2trScript})
 
 	prevFetcher := NewCannedPrevOutputFetcher(p2trScript, outputValue)
@@ -103,15 +100,7 @@ func TestOpCatTapscriptEnabledAndTallyCost(t *testing.T) {
 
 	const outputValue = int64(1e8)
 	tx := wire.NewMsgTx(2)
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{
-			Hash:  chainhash.Hash{},
-			Index: 0,
-		},
-		Witness: wire.TxWitness{
-			tapScript, ctrlBytes,
-		},
-	})
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, wire.TxWitness{tapScript, ctrlBytes}))
 	tx.AddTxOut(&wire.TxOut{
 		Value:    outputValue,
 		PkScript: p2trScript,
@@ -123,7 +112,7 @@ func TestOpCatTapscriptEnabledAndTallyCost(t *testing.T) {
 	vm, err := NewEngine(p2trScript, tx, 0, flags, nil, nil, outputValue, prevFetcher)
 	require.NoError(t, err)
 
-	expectedInitialBudget := sigOpsDelta + int32(tx.TxIn[0].Witness.SerializeSize())
+	expectedInitialBudget := sigOpsDelta + int32(tx.TxIn[0].DecodeWitness().SerializeSize())
 
 	err = vm.Execute()
 	require.NoError(t, err)

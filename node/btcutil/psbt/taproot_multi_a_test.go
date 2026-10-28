@@ -53,7 +53,7 @@ func TestTaprootMultiAFinalizerOrdersSignatures(t *testing.T) {
 			require.NoError(t, MaybeFinalizeAll(packet))
 			finalTx, err := Extract(packet)
 			require.NoError(t, err)
-			assert.Equal(t, wire.TxWitness{sigB, sigA, script, make([]byte, 33)}, finalTx.TxIn[0].Witness)
+			assert.Equal(t, wire.TxWitness{sigB, sigA, script, make([]byte, 33)}, finalTx.TxIn[0].DecodeWitness())
 		})
 	}
 }
@@ -80,7 +80,7 @@ func TestTaprootMultiAFinalizerAddsPlaceholders(t *testing.T) {
 	require.NoError(t, MaybeFinalizeAll(packet))
 	finalTx, err := Extract(packet)
 	require.NoError(t, err)
-	assert.Equal(t, wire.TxWitness{sigC, []byte{}, sigA, script, make([]byte, 33)}, finalTx.TxIn[0].Witness)
+	assert.Equal(t, wire.TxWitness{sigC, []byte{}, sigA, script, make([]byte, 33)}, finalTx.TxIn[0].DecodeWitness())
 }
 
 func TestTaprootMultiAFinalizerIgnoresExcessSignatures(t *testing.T) {
@@ -107,7 +107,7 @@ func TestTaprootMultiAFinalizerIgnoresExcessSignatures(t *testing.T) {
 	require.NoError(t, MaybeFinalizeAll(packet))
 	finalTx, err := Extract(packet)
 	require.NoError(t, err)
-	assert.Equal(t, wire.TxWitness{[]byte{}, sigB, sigA, script, make([]byte, 33)}, finalTx.TxIn[0].Witness)
+	assert.Equal(t, wire.TxWitness{[]byte{}, sigB, sigA, script, make([]byte, 33)}, finalTx.TxIn[0].DecodeWitness())
 }
 
 func TestTaprootMultiAFinalizerRejectsInsufficientSignatures(t *testing.T) {

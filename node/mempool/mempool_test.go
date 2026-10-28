@@ -219,7 +219,6 @@ func (p *poolHarness) CreateSignedTx(inputs []spendableOutput,
 		tx.AddTxIn(&wire.TxIn{
 			PreviousOutPoint: input.outPoint,
 			SignatureScript:  nil,
-			Witness:          nil,
 			Sequence:         sequence,
 		})
 	}
@@ -257,7 +256,7 @@ func (p *poolHarness) CreateSignedTx(inputs []spendableOutput,
 		if err != nil {
 			return nil, err
 		}
-		tx.TxIn[i].Witness = witness
+		tx.TxIn[i].SetWitness(witness)
 	}
 
 	return btcutil.NewTx(tx), nil
@@ -278,7 +277,6 @@ func (p *poolHarness) CreateTxChain(firstOutput spendableOutput, numTxns uint32)
 		tx.AddTxIn(&wire.TxIn{
 			PreviousOutPoint: prevOutPoint,
 			SignatureScript:  nil,
-			Witness:          nil,
 			Sequence:         wire.MaxTxInSequenceNum,
 		})
 		outputAmount := spendableAmount - minTestFee
@@ -297,7 +295,7 @@ func (p *poolHarness) CreateTxChain(firstOutput spendableOutput, numTxns uint32)
 		if err != nil {
 			return nil, err
 		}
-		tx.TxIn[0].Witness = witness
+		tx.TxIn[0].SetWitness(witness)
 
 		txChain = append(txChain, btcutil.NewTx(tx))
 
@@ -335,7 +333,7 @@ func (p *poolHarness) createFatTx(prev spendableOutput, nOut int, fee btcutil.Am
 	if err != nil {
 		return nil, err
 	}
-	tx.TxIn[0].Witness = witness
+	tx.TxIn[0].SetWitness(witness)
 
 	return btcutil.NewTx(tx), nil
 }

@@ -339,7 +339,7 @@ func TestRawTxInTaprootSignature(t *testing.T) {
 
 			// Finally, ensure that the signature produced is valid.
 			txCopy := testTx.Copy()
-			txCopy.TxIn[0].Witness = wire.TxWitness{sig}
+			txCopy.TxIn[0].SetWitness(wire.TxWitness{sig})
 			vm, err := NewEngine(
 				txOut.PkScript, txCopy, 0, StandardVerifyFlags,
 				nil, sigHashes, txOut.Value, prevFetcher,
@@ -450,9 +450,9 @@ func TestRawTxInTapscriptSignature(t *testing.T) {
 			ctrlBlockBytes, err := ctrlBlock.ToBytes()
 			require.NoError(t, err)
 			txCopy := testTx.Copy()
-			txCopy.TxIn[0].Witness = wire.TxWitness{
+			txCopy.TxIn[0].SetWitness(wire.TxWitness{
 				sig, pkScript, ctrlBlockBytes,
-			}
+			})
 
 			// Finally, ensure that the signature produced is valid.
 			vm, err := NewEngine(

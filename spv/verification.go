@@ -97,7 +97,7 @@ func VerifyBasicBlockFilter(filter *gcs.Filter, block *btcutil.Block) (int,
 			//
 			// TODO(guggero): Add all those edge cases to
 			// ComputePkScript?
-			if len(in.Witness) == 0 {
+			if !in.HasWitness() {
 				continue
 			}
 
@@ -105,7 +105,7 @@ func VerifyBasicBlockFilter(filter *gcs.Filter, block *btcutil.Block) (int,
 			// P2PKH (P2SH-P2WKH). We can verify that one because
 			// the script hash has to be HASH160(OP_PUSH32 <PKH>).
 			script, err := txscript.ComputePkScript(
-				in.SignatureScript, in.Witness,
+				in.SignatureScript, in.DecodeWitness(),
 			)
 
 			// Just skip any inputs that we can't derive the pk

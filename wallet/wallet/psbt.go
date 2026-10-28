@@ -110,7 +110,7 @@ func (w *Wallet) FundPsbt(packet *psbt.Packet, keyScope *waddrmgr.KeyScope,
 		for idx := range packet.UnsignedTx.TxIn {
 			// We don't want to include the witness or any script
 			// on the unsigned TX just yet.
-			packet.UnsignedTx.TxIn[idx].Witness = wire.TxWitness{}
+			packet.UnsignedTx.TxIn[idx].SetWitness(wire.TxWitness{})
 			packet.UnsignedTx.TxIn[idx].SignatureScript = nil
 		}
 
@@ -128,7 +128,7 @@ func (w *Wallet) FundPsbt(packet *psbt.Packet, keyScope *waddrmgr.KeyScope,
 		for idx := range packet.UnsignedTx.TxIn {
 			// We don't want to include the witness or any script
 			// on the unsigned TX just yet.
-			packet.UnsignedTx.TxIn[idx].Witness = wire.TxWitness{}
+			packet.UnsignedTx.TxIn[idx].SetWitness(wire.TxWitness{})
 			packet.UnsignedTx.TxIn[idx].SignatureScript = nil
 		}
 

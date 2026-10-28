@@ -544,7 +544,7 @@ func (m *memWallet) CreateTransaction(outputs []*wire.TxOut,
 			return nil, err
 		}
 
-		txIn.Witness = witness
+		txIn.SetWitness(witness)
 
 		spentOutputs = append(spentOutputs, utxo)
 	}

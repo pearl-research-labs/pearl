@@ -154,7 +154,7 @@ type Packet struct {
 // is implicitly checked in the call to MsgTx.Deserialize().
 func validateUnsignedTX(tx *wire.MsgTx) bool {
 	for _, tin := range tx.TxIn {
-		if len(tin.SignatureScript) != 0 || len(tin.Witness) != 0 {
+		if len(tin.SignatureScript) != 0 || tin.HasWitness() {
 			return false
 		}
 	}

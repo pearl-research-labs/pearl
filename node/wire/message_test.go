@@ -561,11 +561,7 @@ func TestMessageSizeMatchesEncoding(t *testing.T) {
 	// A transaction with witness data, which encodes differently under
 	// the base and witness encodings.
 	witnessTx := NewMsgTx(1)
-	witnessTx.AddTxIn(&TxIn{
-		PreviousOutPoint: OutPoint{Hash: hash, Index: 0},
-		SignatureScript:  []byte{0x01, 0x02},
-		Witness:          TxWitness{{0x03}, {0x04}},
-	})
+	witnessTx.AddTxIn(NewTxIn(&OutPoint{Hash: hash, Index: 0}, []byte{0x01, 0x02}, TxWitness{{0x03}, {0x04}}))
 	witnessTx.AddTxOut(&TxOut{
 		Value:    1,
 		PkScript: []byte{0x51},

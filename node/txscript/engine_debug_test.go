@@ -79,9 +79,9 @@ func TestDebugEngine(t *testing.T) {
 	ctrlBlockBytes, err := ctrlBlock.ToBytes()
 	require.NoError(t, err)
 	txCopy := testTx.Copy()
-	txCopy.TxIn[0].Witness = wire.TxWitness{
+	txCopy.TxIn[0].SetWitness(wire.TxWitness{
 		sig, pkScript, ctrlBlockBytes,
-	}
+	})
 
 	expCallback := []StepInfo{
 		// First callback is looking at the OP_1 witness version.

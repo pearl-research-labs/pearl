@@ -1271,7 +1271,7 @@ func (ro *rescanOptions) spendsWatchedInput(tx *btcutil.Tx) bool {
 			// match on the output script being spent instead.
 			case input.OutPoint == zeroOutPoint:
 				pkScript, err := txscript.ComputePkScript(
-					in.SignatureScript, in.Witness,
+					in.SignatureScript, in.DecodeWitness(),
 				)
 				if err != nil {
 					continue

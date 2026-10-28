@@ -155,14 +155,10 @@ func spendP2TR(t *testing.T, privKey *btcec.PrivateKey, prevTx *wire.MsgTx,
 		dummySchnorrSig[i] = byte(i % 256)
 	}
 
-	return &wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{
-			Hash:  prevTx.TxHash(),
-			Index: idx,
-		},
-		SignatureScript: nil,                             // Taproot uses empty signature script
-		Witness:         [][]byte{dummySchnorrSignature}, // Single witness item for key-path spending
-	}
+	// Taproot uses an empty signature script, and a single witness item for key-path spending.
+	prevHash := prevTx.TxHash()
+
+	return wire.NewTxIn(wire.NewOutPoint(&prevHash, idx), nil, [][]byte{dummySchnorrSignature})
 }
 
 func makeP2TR(t *testing.T, pubKey *btcec.PublicKey) []byte {

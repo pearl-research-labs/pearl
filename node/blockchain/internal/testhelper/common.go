@@ -46,7 +46,8 @@ func SignTaprootInput(tx *wire.MsgTx, idx int, amt btcutil.Amount, pkScript []by
 	if err != nil {
 		panic(err)
 	}
-	tx.TxIn[idx].Witness = witness
+
+	tx.TxIn[idx].SetWitness(witness)
 }
 
 // CreateSpendTx creates a transaction that spends from the provided spendable

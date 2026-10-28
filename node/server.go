@@ -349,6 +349,7 @@ type serverPeer struct {
 	// The following chans are used to sync blockmanager and server.
 	txProcessed    chan struct{}
 	blockProcessed chan error
+	msgProcessed   chan struct{}
 }
 
 // newServerPeer returns a new serverPeer instance. The peer needs to be set by
@@ -363,6 +364,7 @@ func newServerPeer(s *server, isPersistent bool) *serverPeer {
 		verAckCh:       make(chan struct{}),
 		txProcessed:    make(chan struct{}, 1),
 		blockProcessed: make(chan error, 1),
+		msgProcessed:   make(chan struct{}, 1),
 	}
 }
 
@@ -760,10 +762,14 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte) {
 // used to examine the inventory being advertised by the remote peer and react
 // accordingly.  We pass the message down to blockmanager which will call
 // QueueMessage with any appropriate responses.
+//
+// Like OnTx and OnBlock, it blocks further receives until the sync manager has
+// processed the message, so a peer can hold at most one slot in its queue.
 func (sp *serverPeer) OnInv(_ *peer.Peer, msg *wire.MsgInv) {
 	if !cfg.BlocksOnly {
 		if len(msg.InvList) > 0 {
-			sp.server.syncManager.QueueInv(msg, sp.Peer)
+			sp.server.syncManager.QueueInv(msg, sp.Peer, sp.msgProcessed)
+			<-sp.msgProcessed
 		}
 		return
 	}
@@ -784,14 +790,17 @@ func (sp *serverPeer) OnInv(_ *peer.Peer, msg *wire.MsgInv) {
 	}
 
 	if len(newInv.InvList) > 0 {
-		sp.server.syncManager.QueueInv(newInv, sp.Peer)
+		sp.server.syncManager.QueueInv(newInv, sp.Peer, sp.msgProcessed)
+		<-sp.msgProcessed
 	}
 }
 
 // OnHeaders is invoked when a peer receives a headers wire
-// message.  The message is passed down to the sync manager.
+// message.  The message is passed down to the sync manager, and further
+// receives wait until it is processed.
 func (sp *serverPeer) OnHeaders(_ *peer.Peer, msg *wire.MsgHeaders) {
-	sp.server.syncManager.QueueHeaders(msg, sp.Peer)
+	sp.server.syncManager.QueueHeaders(msg, sp.Peer, sp.msgProcessed)
+	<-sp.msgProcessed
 }
 
 // maxInflightReplies is how many getdata or getcfilters replies a handler
@@ -1618,7 +1627,8 @@ func (sp *serverPeer) OnNotFound(p *peer.Peer, msg *wire.MsgNotFound) {
 		}
 	}
 
-	sp.server.syncManager.QueueNotFound(msg, p)
+	sp.server.syncManager.QueueNotFound(msg, p, sp.msgProcessed)
+	<-sp.msgProcessed
 }
 
 // randomUint16Number returns a random uint16 in a specified input range.  Note

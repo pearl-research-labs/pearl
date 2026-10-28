@@ -200,7 +200,6 @@ func createInvalidTestTx(t *testing.T) *wire.MsgTx {
 
 	// Add input referencing non-existent UTXO
 	prevOut := wire.NewOutPoint(nonExistentHash, 0)
-	txIn := wire.NewTxIn(prevOut, nil, nil)
 
 	// Add witness data to make it a witness transaction
 	// Use a dummy 64-byte signature (typical Taproot signature size)
@@ -208,9 +207,7 @@ func createInvalidTestTx(t *testing.T) *wire.MsgTx {
 	for i := range dummySignature {
 		dummySignature[i] = byte(i)
 	}
-	txIn.Witness = wire.TxWitness{dummySignature}
-
-	tx.AddTxIn(txIn)
+	tx.AddTxIn(wire.NewTxIn(prevOut, nil, wire.TxWitness{dummySignature}))
 
 	// Add a simple output to make it a complete transaction
 	// Create a dummy P2TR output

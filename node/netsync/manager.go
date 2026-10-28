@@ -80,8 +80,9 @@ type blockMsg struct {
 // invMsg packages an inv message and the peer it came from together
 // so the block handler has access to that information.
 type invMsg struct {
-	inv  *wire.MsgInv
-	peer *peerpkg.Peer
+	inv   *wire.MsgInv
+	peer  *peerpkg.Peer
+	reply chan struct{}
 }
 
 // headersMsg packages a headers message and the peer it came from
@@ -89,6 +90,7 @@ type invMsg struct {
 type headersMsg struct {
 	headers *wire.MsgHeaders
 	peer    *peerpkg.Peer
+	reply   chan struct{}
 }
 
 // notFoundMsg packages a notfound message and the peer it came from
@@ -96,6 +98,7 @@ type headersMsg struct {
 type notFoundMsg struct {
 	notFound *wire.MsgNotFound
 	peer     *peerpkg.Peer
+	reply    chan struct{}
 }
 
 // donePeerMsg signifies a newly disconnected peer to the block handler.
@@ -1152,8 +1155,20 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 
 		gdmsg := wire.NewMsgGetData()
+		prev := root
 		for _, h := range msg.Headers {
+			// Every header must build on the one before it. Otherwise we fetch unconnected blocks.
+			// Requests already tracked for this batch are released when the peer is gone.
+			if !h.BlockHeader.PrevBlock.IsEqual(&prev) {
+				log.Warnf("Peer %s sent headers that do not connect outside headersFirst mode -- disconnecting",
+					peer.Addr())
+				peer.Disconnect()
+
+				return
+			}
+
 			hash := h.BlockHeader.BlockHash()
+			prev = hash
 			if _, requested := sm.requestedBlocks[hash]; requested {
 				continue
 			}
@@ -1603,12 +1618,15 @@ func (sm *SyncManager) processMessage(m interface{}) {
 
 	case *invMsg:
 		sm.handleInvMsg(msg)
+		msg.reply <- struct{}{}
 
 	case *headersMsg:
 		sm.handleHeadersMsg(msg)
+		msg.reply <- struct{}{}
 
 	case *notFoundMsg:
 		sm.handleNotFoundMsg(msg)
+		msg.reply <- struct{}{}
 
 	case *donePeerMsg:
 		sm.handleDonePeerMsg(msg.peer)
@@ -1847,38 +1865,41 @@ func (sm *SyncManager) QueueBlock(block *btcutil.Block, peer *peerpkg.Peer, done
 }
 
 // QueueInv adds the passed inv message and peer to the block handling queue.
-func (sm *SyncManager) QueueInv(inv *wire.MsgInv, peer *peerpkg.Peer) {
-	// No channel handling here because peers do not need to block on inv
-	// messages.
+// Responds to the done channel argument after the inv message is processed.
+func (sm *SyncManager) QueueInv(inv *wire.MsgInv, peer *peerpkg.Peer, done chan struct{}) {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
+		done <- struct{}{}
+
 		return
 	}
 
-	sm.msgChan <- &invMsg{inv: inv, peer: peer}
+	sm.msgChan <- &invMsg{inv: inv, peer: peer, reply: done}
 }
 
 // QueueHeaders adds the passed headers message and peer to the block handling
-// queue.
-func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer) {
-	// No channel handling here because peers do not need to block on
-	// headers messages.
+// queue. Responds to the done channel argument after the headers message is
+// processed.
+func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer, done chan struct{}) {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
+		done <- struct{}{}
+
 		return
 	}
 
-	sm.msgChan <- &headersMsg{headers: headers, peer: peer}
+	sm.msgChan <- &headersMsg{headers: headers, peer: peer, reply: done}
 }
 
 // QueueNotFound adds the passed notfound message and peer to the block handling
-// queue.
-func (sm *SyncManager) QueueNotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) {
-	// No channel handling here because peers do not need to block on
-	// reject messages.
+// queue. Responds to the done channel argument after the notfound message is
+// processed.
+func (sm *SyncManager) QueueNotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer, done chan struct{}) {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
+		done <- struct{}{}
+
 		return
 	}
 
-	sm.msgChan <- &notFoundMsg{notFound: notFound, peer: peer}
+	sm.msgChan <- &notFoundMsg{notFound: notFound, peer: peer, reply: done}
 }
 
 // DonePeer informs the blockmanager that a peer has disconnected.

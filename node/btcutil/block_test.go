@@ -352,20 +352,19 @@ var Block100000 = wire.MsgBlock{
 		{
 			Version: 1,
 			TxIn: []*wire.TxIn{
-				{
-					PreviousOutPoint: wire.OutPoint{
+				wire.NewTxIn(
+					&wire.OutPoint{
 						Hash:  chainhash.Hash{},
 						Index: 0xffffffff,
 					},
-					SignatureScript: []byte{
+					[]byte{
 						0x04, 0x4c, 0x86, 0x04, 0x1b, 0x02, 0x06, 0x02,
 					},
-					Sequence: 0xffffffff,
-					Witness: [][]byte{
+					[][]byte{
 						{0x04, 0x31},
 						{0x01, 0x43},
 					},
-				},
+				),
 			},
 			TxOut: []*wire.TxOut{
 				{
