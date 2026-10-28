@@ -85,6 +85,10 @@ var (
 	// watch-only mode where we can select coins but not sign any inputs.
 	ErrTxUnsigned = errors.New("watch-only wallet, transaction not signed")
 
+	// errChainBehindWallet is returned when the chain's tip is below the wallet's and nothing shows a reorg, so the
+	// sync waits for the chain to catch up instead of rolling back history the chain has not reached yet.
+	errChainBehindWallet = errors.New("chain is behind the wallet")
+
 	// Namespace bucket keys.
 	waddrmgrNamespaceKey = []byte("waddrmgr")
 	wtxmgrNamespaceKey   = []byte("wtxmgr")
@@ -135,6 +139,10 @@ type Wallet struct {
 	chainClientSynced  bool
 	chainClientSyncMtx sync.Mutex
 
+	// newAddrMtx serializes complete operations that can advance address indexes, including transaction construction or
+	// funding that may create a change address. Seed recovery holds it across each filter batch to keep the recovery
+	// horizon fixed. It must remain held through transaction commit callbacks that update the address manager's
+	// in-memory state.
 	newAddrMtx sync.Mutex
 
 	lockedOutpoints    map[wire.OutPoint]struct{}
@@ -509,9 +517,11 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	return w.rescanWithTarget(addrs, unspent, nil)
 }
 
-// rollbackToChain compares the blocks the wallet has previously seen against
-// the current chain and rolls back the ones that are no longer part of it, so
-// that the rescan which follows re-applies the canonical chain.
+// rollbackToChain compares the blocks the wallet has previously seen against the current chain and rolls back the ones
+// that are no longer part of it, so that the rescan which follows re-applies the canonical chain. A chain whose tip is
+// below the wallet's only proves a reorg through a different block at a height it has. Without one, rollbackToChain
+// fails with errChainBehindWallet and leaves the wallet's history in place, so the sync retries until the chain catches
+// up.
 func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 	// The address manager's hash history is overwritten with canonical
 	// hashes as blocks are connected, so a reorg the wallet never applied
@@ -527,20 +537,26 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 		return fmt.Errorf("unable to read the wallet's recorded blocks: %w", err)
 	}
 
+	_, bestHeight, err := chainClient.GetBestBlock()
+	if err != nil {
+		return fmt.Errorf("unable to fetch the chain's best block: %w", err)
+	}
+
 	// Verify those blocks with no database transaction held, as this
 	// queries the backend once per recorded block.
-	staleHeight, err := lowestStaleBlockHeight(chainClient, blocks)
+	staleHeight, err := lowestStaleBlockHeight(chainClient, blocks, bestHeight)
 	if err != nil {
 		return fmt.Errorf("unable to verify the wallet's %d recorded blocks against the chain: %w", len(blocks), err)
 	}
 
 	syncedTo := w.Manager.SyncedTo()
+	start := min(syncedTo.Height, bestHeight)
 
 	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 
-		target, err := w.forkPoint(addrmgrNs, chainClient, syncedTo.Height)
+		target, err := w.forkPoint(addrmgrNs, chainClient, start)
 		if err != nil {
 			return err
 		}
@@ -556,7 +572,12 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 		}
 
 		// Nothing diverged, so there is nothing to detach.
-		if target.Height == syncedTo.Height && staleHeight == 0 {
+		if target.Height == start && staleHeight == 0 {
+			if start < syncedTo.Height {
+				return fmt.Errorf("%w: the wallet is synced to height %d and the chain's tip is at height %d",
+					errChainBehindWallet, syncedTo.Height, bestHeight)
+			}
+
 			return nil
 		}
 
@@ -575,13 +596,14 @@ func (w *Wallet) rollbackToChain(chainClient chainConn) error {
 	})
 }
 
-// forkPoint returns the highest block at or below the given height that both
-// the address manager and the chain have recorded.
+// forkPoint returns the highest block at or below the given height that both the address manager and the chain have
+// recorded. The height must not be above the chain's tip.
 func (w *Wallet) forkPoint(ns walletdb.ReadBucket, chainClient chainConn, height int32) (waddrmgr.BlockStamp, error) {
 	for {
 		hash, err := w.Manager.BlockHash(ns, height)
 		if err != nil {
-			return waddrmgr.BlockStamp{}, err
+			return waddrmgr.BlockStamp{}, fmt.Errorf(
+				"unable to read the wallet's block hash at height %d to compare with the chain: %w", height, err)
 		}
 
 		stamp, err := canonicalStampAt(chainClient, height)
@@ -616,31 +638,30 @@ func canonicalStampAt(chainClient chainConn, height int32) (waddrmgr.BlockStamp,
 	}, nil
 }
 
-// lowestStaleBlockHeight returns the height of the lowest given block that the
-// chain no longer has, or zero when the chain still has all of them. The
-// blocks must be ordered by ascending height.
-func lowestStaleBlockHeight(chainClient chainConn, blocks []wtxmgr.Block) (int32, error) {
-	_, bestHeight, err := chainClient.GetBestBlock()
-	if err != nil {
-		return 0, err
-	}
-
+// lowestStaleBlockHeight returns the height of the lowest given block that the chain has replaced with a different
+// block, or zero when there is none. Blocks above bestHeight count as unverified rather than stale, as a backend that
+// is still catching up may not have them yet. The blocks must be ordered by ascending height.
+func lowestStaleBlockHeight(chainClient chainConn, blocks []wtxmgr.Block, bestHeight int32) (int32, error) {
 	started := time.Now()
-	for _, b := range blocks {
+	verified := len(blocks)
+	for i, b := range blocks {
 		// Genesis cannot be reorged out, and skipping it keeps the
 		// parent of a stale block a real height.
 		if b.Height <= 0 {
 			continue
 		}
 
-		if b.Height <= bestHeight {
-			hash, err := chainClient.GetBlockHash(int64(b.Height))
-			if err != nil {
-				return 0, err
-			}
-			if *hash == b.Hash {
-				continue
-			}
+		if b.Height > bestHeight {
+			verified = i
+			break
+		}
+
+		hash, err := chainClient.GetBlockHash(int64(b.Height))
+		if err != nil {
+			return 0, err
+		}
+		if *hash == b.Hash {
+			continue
 		}
 
 		log.Warnf("Block %v at height %d is no longer on the chain, rolling back a reorg that was never applied",
@@ -649,7 +670,8 @@ func lowestStaleBlockHeight(chainClient chainConn, blocks []wtxmgr.Block) (int32
 		return b.Height, nil
 	}
 
-	log.Infof("Verified the wallet's %d recorded blocks against the chain in %v", len(blocks), time.Since(started))
+	log.Infof("Verified %d of the wallet's %d recorded blocks against the chain in %v", verified, len(blocks),
+		time.Since(started))
 
 	return 0, nil
 }
@@ -863,28 +885,7 @@ func (w *Wallet) recovery(chainClient chain.Interface, birthdayBlock *waddrmgr.B
 		// state to disk.
 		recoveryBatch := recoveryMgr.BlockBatch()
 		if len(recoveryBatch) == recoveryBatchSize || height == bestHeight {
-			err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-				ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-				if err := w.recoverScopedAddresses(
-					chainClient, tx, ns, recoveryBatch,
-					recoveryMgr.State(), scopedMgrs,
-				); err != nil {
-					return err
-				}
-
-				// TODO: Any error here will roll back this
-				// entire tx. This may cause the in memory sync
-				// point to become desyncronized. Refactor so
-				// that this cannot happen.
-				for _, block := range blocks {
-					err := w.Manager.SetSyncedTo(ns, block)
-					if err != nil {
-						return err
-					}
-				}
-
-				return nil
-			})
+			err := w.recoverBatch(chainClient, recoveryBatch, blocks, recoveryMgr.State(), scopedMgrs)
 			if err != nil {
 				return err
 			}
@@ -904,6 +905,42 @@ func (w *Wallet) recovery(chainClient chain.Interface, birthdayBlock *waddrmgr.B
 	return nil
 }
 
+// recoverBatch scans and commits one recovery batch. Operations that can advance address indexes, including transaction
+// construction and funding, are serialized across the backend scan and final commit. This keeps the recovery horizon
+// fixed while leaving the wallet database available to unrelated writers during backend I/O.
+func (w *Wallet) recoverBatch(chainClient chain.Interface, recoveryBatch []wtxmgr.BlockMeta,
+	blocks []*waddrmgr.BlockStamp, recoveryState *RecoveryState,
+	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager) error {
+
+	w.newAddrMtx.Lock()
+	defer w.newAddrMtx.Unlock()
+
+	filterResponses, err := w.recoverScopedAddresses(chainClient, recoveryBatch, recoveryState, scopedMgrs)
+	if err != nil {
+		return err
+	}
+
+	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		err := w.applyRecoveryResponses(tx, filterResponses, scopedMgrs, recoveryState)
+		if err != nil {
+			return err
+		}
+
+		// TODO: Any error here will roll back this entire tx. This may cause the in memory sync point to become
+		// desyncronized. Refactor so that this cannot happen.
+		for _, block := range blocks {
+			err := w.Manager.SetSyncedTo(ns, block)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
 // recoverScopedAddresses scans a range of blocks in attempts to recover any
 // previously used addresses for a particular account derivation path. At a high
 // level, the algorithm works as follows:
@@ -917,41 +954,50 @@ func (w *Wallet) recovery(chainClient chain.Interface, birthdayBlock *waddrmgr.B
 //  6. Repeat from (1) if there are still more blocks in the range.
 //
 // TODO(conner): parallelize/pipeline/cache intermediate network requests
-func (w *Wallet) recoverScopedAddresses(
-	chainClient chain.Interface,
-	tx walletdb.ReadWriteTx,
-	ns walletdb.ReadWriteBucket,
-	batch []wtxmgr.BlockMeta,
-	recoveryState *RecoveryState,
-	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager) error {
+func (w *Wallet) recoverScopedAddresses(chainClient chain.Interface, batch []wtxmgr.BlockMeta,
+	recoveryState *RecoveryState, scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager) (
+	[]*chain.FilterBlocksResponse, error) {
 
 	// If there are no blocks in the batch, we are done.
 	if len(batch) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	log.Infof("Scanning %d blocks for recoverable addresses", len(batch))
 
+	var filterResponses []*chain.FilterBlocksResponse
+
 expandHorizons:
-	for scope, scopedMgr := range scopedMgrs {
-		scopeState := recoveryState.StateForScope(scope)
-		err := expandScopeHorizons(ns, scopedMgr, scopeState)
-		if err != nil {
-			return err
+	var filterReq *chain.FilterBlocksRequest
+
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+
+		for scope, scopedMgr := range scopedMgrs {
+			scopeState := recoveryState.StateForScope(scope)
+
+			err := expandScopeHorizons(ns, scopedMgr, scopeState)
+			if err != nil {
+				return err
+			}
 		}
+
+		// With the internal and external horizons properly expanded, we now construct the filter blocks request. The
+		// request includes the range of blocks we intend to scan, in addition to the scope-index -> addr map for all
+		// internal and external branches.
+		filterReq = newFilterBlocksRequest(batch, scopedMgrs, recoveryState)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	// With the internal and external horizons properly expanded, we now
-	// construct the filter blocks request. The request includes the range
-	// of blocks we intend to scan, in addition to the scope-index -> addr
-	// map for all internal and external branches.
-	filterReq := newFilterBlocksRequest(batch, scopedMgrs, recoveryState)
-
-	// Initiate the filter blocks request using our chain backend. If an
-	// error occurs, we are unable to proceed with the recovery.
+	// Initiate the filter blocks request using our chain backend. If an error occurs, we are unable to proceed with the
+	// recovery. This call can perform remote I/O, so it must not run while a database write transaction is held.
 	filterResp, err := chainClient.FilterBlocks(filterReq)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// If the filter response is empty, this signals that the rest of the
@@ -959,8 +1005,10 @@ expandHorizons:
 	// result, no further modifications to our recovery state are required
 	// and we can proceed to the next batch.
 	if filterResp == nil {
-		return nil
+		return filterResponses, nil
 	}
+
+	filterResponses = append(filterResponses, filterResp)
 
 	// Otherwise, retrieve the block info for the block that detected a
 	// non-zero number of address matches.
@@ -969,38 +1017,16 @@ expandHorizons:
 	// Log any non-trivial findings of addresses or outpoints.
 	logFilterBlocksResp(block, filterResp)
 
-	// Report any external or internal addresses found as a result of the
-	// appropriate branch recovery state. Adding indexes above the
-	// last-found index of either will result in the horizons being expanded
-	// upon the next iteration. Any found addresses are also marked used
-	// using the scoped key manager.
-	err = extendFoundAddresses(ns, filterResp, scopedMgrs, recoveryState)
-	if err != nil {
-		return err
-	}
+	// Advance the in-memory branch horizons before filtering the remainder of the batch. This is the only place that
+	// reports found indexes to the recovery state. The corresponding persistent changes are committed atomically with
+	// the batch's synced-to update after all remote work is complete.
+	reportFoundAddresses(filterResp, recoveryState)
 
-	// Update the global set of watched outpoints with any that were found
-	// in the block.
+	// Update the in-memory watched-outpoint set before filtering the remainder of the batch. Relevant transactions and
+	// wallet sync state are persisted together after all remote work is complete.
 	for outPoint, addr := range filterResp.FoundOutPoints {
 		outPoint := outPoint
 		recoveryState.AddWatchedOutPoint(&outPoint, addr)
-	}
-
-	// Finally, record all of the relevant transactions that were returned
-	// in the filter blocks response. This ensures that these transactions
-	// and their outputs are tracked when the final rescan is performed.
-	for _, txn := range filterResp.RelevantTxns {
-		txRecord, err := wtxmgr.NewTxRecordFromMsgTx(
-			txn, filterResp.BlockMeta.Time,
-		)
-		if err != nil {
-			return err
-		}
-
-		err = w.addRelevantTx(tx, txRecord, &filterResp.BlockMeta)
-		if err != nil {
-			return err
-		}
 	}
 
 	// Update the batch to indicate that we've processed all block through
@@ -1011,6 +1037,54 @@ expandHorizons:
 	// filtering process again after expanding our horizons.
 	if len(batch) > 0 {
 		goto expandHorizons
+	}
+
+	return filterResponses, nil
+}
+
+// reportFoundAddresses advances the in-memory recovery horizons for the next filter request. The corresponding
+// address-manager writes are deferred until all remote filtering for the batch has completed.
+func reportFoundAddresses(filterResp *chain.FilterBlocksResponse, recoveryState *RecoveryState) {
+	for scope, indexes := range filterResp.FoundExternalAddrs {
+		scopeState := recoveryState.StateForScope(scope)
+		for index := range indexes {
+			scopeState.ExternalBranch.ReportFound(index)
+		}
+	}
+
+	for scope, indexes := range filterResp.FoundInternalAddrs {
+		scopeState := recoveryState.StateForScope(scope)
+		for index := range indexes {
+			scopeState.InternalBranch.ReportFound(index)
+		}
+	}
+}
+
+// applyRecoveryResponses persists all address and transaction discoveries for one recovery batch. The caller invokes
+// this in the same transaction that advances the wallet's synced-to marker, preserving the original atomic commit
+// boundary.
+func (w *Wallet) applyRecoveryResponses(tx walletdb.ReadWriteTx, filterResponses []*chain.FilterBlocksResponse,
+	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager, recoveryState *RecoveryState) error {
+
+	ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+	for _, filterResp := range filterResponses {
+		err := extendFoundAddresses(ns, filterResp, scopedMgrs, recoveryState)
+		if err != nil {
+			return err
+		}
+
+		for _, txn := range filterResp.RelevantTxns {
+			txRecord, err := wtxmgr.NewTxRecordFromMsgTx(txn, filterResp.BlockMeta.Time)
+			if err != nil {
+				return err
+			}
+
+			err = w.addRelevantTx(tx, txRecord, &filterResp.BlockMeta)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -1145,9 +1219,8 @@ func newFilterBlocksRequest(batch []wtxmgr.BlockMeta,
 	return filterReq
 }
 
-// extendFoundAddresses accepts a filter blocks response that contains addresses
-// found on chain, and advances the state of all relevant derivation paths to
-// match the highest found child index for each branch.
+// extendFoundAddresses accepts a filter blocks response that contains addresses found on chain and persists the
+// derivation paths already advanced during the scan phase.
 func extendFoundAddresses(ns walletdb.ReadWriteBucket,
 	filterResp *chain.FilterBlocksResponse,
 	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
@@ -1157,19 +1230,10 @@ func extendFoundAddresses(ns walletdb.ReadWriteBucket,
 	// for scopes that reported a non-zero number of external addresses in
 	// this block.
 	for scope, indexes := range filterResp.FoundExternalAddrs {
-		// First, report all external child indexes found for this
-		// scope. This ensures that the external last-found index will
-		// be updated to include the maximum child index seen thus far.
 		scopeState := recoveryState.StateForScope(scope)
-		for index := range indexes {
-			scopeState.ExternalBranch.ReportFound(index)
-		}
-
 		scopedMgr := scopedMgrs[scope]
 
-		// Now, with all found addresses reported, derive and extend all
-		// external addresses up to and including the current last found
-		// index for this scope.
+		// Derive and extend all external addresses up to and including the current last found index for this scope.
 		exNextUnfound := scopeState.ExternalBranch.NextUnfound()
 
 		exLastFound := exNextUnfound
@@ -1200,19 +1264,10 @@ func extendFoundAddresses(ns walletdb.ReadWriteBucket,
 	// for scopes that reported a non-zero number of internal addresses in
 	// this block.
 	for scope, indexes := range filterResp.FoundInternalAddrs {
-		// First, report all internal child indexes found for this
-		// scope. This ensures that the internal last-found index will
-		// be updated to include the maximum child index seen thus far.
 		scopeState := recoveryState.StateForScope(scope)
-		for index := range indexes {
-			scopeState.InternalBranch.ReportFound(index)
-		}
-
 		scopedMgr := scopedMgrs[scope]
 
-		// Now, with all found addresses reported, derive and extend all
-		// internal addresses up to and including the current last found
-		// index for this scope.
+		// Derive and extend all internal addresses up to and including the current last found index for this scope.
 		inNextUnfound := scopeState.InternalBranch.NextUnfound()
 
 		inLastFound := inNextUnfound
@@ -3120,11 +3175,21 @@ func (w *Wallet) LockedOutpoints() []btcjson.TransactionInput {
 // NOTE: This differs from LockOutpoint in that outputs are locked for a limited
 // amount of time and their locks are persisted to disk.
 func (w *Wallet) LeaseOutput(id wtxmgr.LockID, op wire.OutPoint, duration time.Duration) (time.Time, error) {
+	return w.LeaseOutputWithOptions(id, op, duration)
+}
+
+// LeaseOutputWithOptions locks an output to the given ID and applies optional transaction-store lock behavior.
+// Confirmation-controlled leases ignore the returned wall-clock expiration and require explicit release if no spend
+// reaches their requested depth.
+func (w *Wallet) LeaseOutputWithOptions(id wtxmgr.LockID, op wire.OutPoint, duration time.Duration,
+	optFuncs ...wtxmgr.LockOutputOption) (time.Time, error) {
+
 	var expiry time.Time
 	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 		var err error
-		expiry, err = w.TxStore.LockOutput(ns, id, op, duration)
+
+		expiry, err = w.TxStore.LockOutput(ns, id, op, duration, optFuncs...)
 		return err
 	})
 	return expiry, err

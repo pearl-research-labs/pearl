@@ -20,6 +20,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	_ "github.com/pearl-research-labs/pearl/wallet/walletdb/bdb"
+	"github.com/stretchr/testify/require"
 )
 
 // Received transaction output for mainnet outpoint
@@ -2341,6 +2342,86 @@ func TestInsertMempoolTxAndConfirm(t *testing.T) {
 	})
 }
 
+// blockIdentityRecord creates a synthetic non-coinbase transaction.
+func blockIdentityRecord(t *testing.T, n byte) *TxRecord {
+	t.Helper()
+
+	msg := wire.NewMsgTx(2)
+	msg.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{n}}, nil, nil))
+	msg.AddTxOut(wire.NewTxOut(1000, []byte{0x51}))
+
+	rec, err := NewTxRecordFromMsgTx(msg, time.Unix(1, 0))
+	require.NoError(t, err)
+
+	return rec
+}
+
+// TestInsertTxBlockIdentity verifies that a conflicting block cannot corrupt confirmed history or consume a previously
+// unmined transaction and its credit.
+func TestInsertTxBlockIdentity(t *testing.T) {
+	t.Parallel()
+
+	s, db, err := testStore(t)
+	require.NoError(t, err)
+
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	a, b := blockIdentityRecord(t, 1), blockIdentityRecord(t, 2)
+	block := &BlockMeta{
+		Block: Block{Height: 100, Hash: chainhash.Hash{3}},
+		Time:  time.Unix(1, 0),
+	}
+	replacement := *block
+	replacement.Hash = chainhash.Hash{4}
+
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(namespaceKey)
+		require.NoError(t, s.InsertTx(ns, a, block))
+		require.NoError(t, s.InsertTx(ns, b, nil))
+
+		return s.AddCredit(ns, b, nil, 0, false)
+	})
+	require.NoError(t, err)
+
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		return s.InsertTx(tx.ReadWriteBucket(namespaceKey), b, &replacement)
+	})
+
+	var inputErr Error
+	require.ErrorAs(t, err, &inputErr)
+	require.Equal(t, ErrInput, inputErr.Code)
+
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(namespaceKey)
+		details, err := s.TxDetails(ns, &b.Hash)
+		require.NoError(t, err)
+		require.NotNil(t, details)
+		require.EqualValues(t, -1, details.Block.Height)
+		assertBalance(t, s, ns, false, 100, 1000)
+		assertBalance(t, s, ns, true, 100, 0)
+
+		var count int
+
+		err = s.RangeTransactions(ns, 0, -1, func(txs []TxDetails) (bool, error) {
+			count += len(txs)
+			return false, nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, 2, count)
+
+		// Same-block insertion and replay remain valid.
+		require.NoError(t, s.InsertTx(ns, b, block))
+		require.NoError(t, s.InsertTx(ns, b, block))
+		assertBalance(t, s, ns, true, 100, 1000)
+
+		return s.RangeTransactions(ns, 100, 100, func(txs []TxDetails) (bool, error) {
+			require.Len(t, txs, 2)
+			return false, nil
+		})
+	})
+	require.NoError(t, err)
+}
+
 // TestTxLabel tests reading and writing of transaction labels.
 func TestTxLabel(t *testing.T) {
 	t.Parallel()
@@ -2460,6 +2541,10 @@ func assertUtxos(t *testing.T, s *Store, ns walletdb.ReadWriteBucket,
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	if len(utxos) != len(exp) {
+		t.Fatalf("expected %d utxos, got %d", len(exp), len(utxos))
+	}
 	for _, expUtxo := range exp {
 		found := false
 		for _, utxo := range utxos {
@@ -2514,6 +2599,28 @@ func assertOutputLocksExist(t *testing.T, s *Store, ns walletdb.ReadBucket,
 		if !exists {
 			t.Fatalf("expected output lock for %v to exist", expOp)
 		}
+	}
+}
+
+func assertRetainedLock(t *testing.T, s *Store, ns walletdb.ReadBucket, releaseConfs uint32, spendHeight int32) {
+	t.Helper()
+
+	locks, err := s.ListLockedOutputs(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(locks) != 1 {
+		t.Fatalf("expected one retained lock, got %d", len(locks))
+	}
+
+	lock := locks[0]
+	if lock.ReleaseAfterSpendConfs != releaseConfs {
+		t.Fatalf("expected maturity %d, got %d", releaseConfs, lock.ReleaseAfterSpendConfs)
+	}
+
+	if lock.ConfirmedSpendHeight != spendHeight {
+		t.Fatalf("expected spend height %d, got %d", spendHeight, lock.ConfirmedSpendHeight)
 	}
 }
 
@@ -2722,6 +2829,52 @@ func TestOutputLocks(t *testing.T) {
 			},
 		},
 		{
+			// Asserts that a confirmation-controlled lease ignores its wall-clock expiry but still permits explicit
+			// owner release.
+			name: "confirmation lease ignores wall clock",
+			run: func(t *testing.T, s *Store, ns walletdb.ReadWriteBucket) {
+				t.Helper()
+
+				lockID1 := LockID{1}
+				lockID2 := LockID{2}
+
+				expiry, err := s.LockOutput(ns, lockID1, confirmedOutPoint, 10*time.Minute, WithReleaseAfterSpend(3))
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				assertRetainedLock(t, s, ns, 3, 0)
+
+				testClock, ok := s.clock.(*clock.TestClock)
+				if !ok {
+					t.Fatal("expected test clock")
+				}
+
+				testClock.SetTime(expiry)
+				assertLocked(t, ns, confirmedOutPoint, s.clock.Now(), true)
+
+				err = s.DeleteExpiredLockedOutputs(ns)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertRetainedLock(t, s, ns, 3, 0)
+
+				_, err = s.LockOutput(ns, lockID2, confirmedOutPoint, 10*time.Minute)
+				if err != ErrOutputAlreadyLocked {
+					t.Fatalf("expected %v, got %v", ErrOutputAlreadyLocked, err)
+				}
+
+				unlock(t, s, ns, lockID2, confirmedOutPoint, ErrOutputUnlockNotAllowed)
+				unlock(t, s, ns, lockID1, confirmedOutPoint, nil)
+
+				_, err = s.LockOutput(ns, lockID1, confirmedOutPoint, 10*time.Minute)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertRetainedLock(t, s, ns, 0, 0)
+			},
+		},
+		{
 			// Asserts that balances are reflected properly after
 			// locking confirmed and unconfirmed outputs.
 			name: "balance after locked outputs",
@@ -2899,5 +3052,170 @@ func TestOutputLocks(t *testing.T) {
 				testCase.run(t, store, ns)
 			})
 		})
+	}
+}
+
+// TestDeserializeLegacyLockedOutput verifies that lock rows written before release-after-spend support remain readable
+// with the legacy lease behavior.
+func TestDeserializeLegacyLockedOutput(t *testing.T) {
+	t.Parallel()
+
+	lockID := LockID{1, 2, 3}
+	expiry := time.Unix(123456789, 0)
+	legacyValue := make([]byte, len(lockID)+8)
+	copy(legacyValue, lockID[:])
+	byteOrder.PutUint64(legacyValue[len(lockID):], uint64(expiry.Unix()))
+
+	gotID, gotExpiry, releaseConfs, spendHeight := deserializeLockedOutput(legacyValue)
+	if gotID != lockID {
+		t.Fatalf("expected lock ID %x, got %x", lockID, gotID)
+	}
+	if !gotExpiry.Equal(expiry) {
+		t.Fatalf("expected expiry %v, got %v", expiry, gotExpiry)
+	}
+	if releaseConfs != 0 {
+		t.Fatalf("expected legacy release depth 0, got %d", releaseConfs)
+	}
+	if spendHeight != 0 {
+		t.Fatalf("expected legacy spend height 0, got %d", spendHeight)
+	}
+}
+
+// TestOutputLockReleaseAfterSpendAcrossReorg verifies that a lock follows the confirmed spend, resets on rollback, and
+// releases only after the re-confirmed spend reaches its requested depth.
+func TestOutputLockReleaseAfterSpendAcrossReorg(t *testing.T) {
+	t.Parallel()
+
+	store, db, err := testStore(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	startTime := time.Now()
+	store.clock = clock.NewTestClock(startTime)
+
+	creditBlock := &BlockMeta{
+		Block: Block{
+			Hash:   chainhash.Hash{1},
+			Height: 100,
+		},
+		Time: time.Now(),
+	}
+	spendBlock := &BlockMeta{
+		Block: Block{
+			Hash:   chainhash.Hash{2},
+			Height: 101,
+		},
+		Time: time.Now().Add(time.Minute),
+	}
+
+	creditTx := newCoinBase(btcutil.GrainPerPearl)
+	insertConfirmedCredit(t, store, db, creditTx, 0, creditBlock)
+	creditHash := creditTx.TxHash()
+	creditOutpoint := wire.OutPoint{Hash: creditHash, Index: 0}
+	spendTx := spendOutput(&creditHash, 0, btcutil.GrainPerPearl-1000)
+	spendRec, err := NewTxRecordFromMsgTx(spendTx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lockID := LockID{1}
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(namespaceKey)
+		expiry, err := store.LockOutput(ns, lockID, creditOutpoint, 10*time.Minute, WithReleaseAfterSpend(3))
+		if err != nil {
+			return err
+		}
+
+		// The first confirmation may arrive after the wall-clock deadline. Confirmation-controlled leases must still
+		// record that spend.
+		store.clock.(*clock.TestClock).SetTime(expiry.Add(time.Second))
+		if err := store.DeleteExpiredLockedOutputs(ns); err != nil {
+			return err
+		}
+		assertRetainedLock(t, store, ns, 3, 0)
+
+		if err := store.InsertTx(ns, spendRec, spendBlock); err != nil {
+			return err
+		}
+
+		assertRetainedLock(t, store, ns, 3, spendBlock.Height)
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
+		if err := store.DeleteMaturedLockedOutputs(ns, 102); err != nil {
+			return err
+		}
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
+
+		if err := store.Rollback(ns, spendBlock.Height); err != nil {
+			return err
+		}
+
+		// Renewing the lease must preserve the disconnected spend state and its configured release depth.
+		renewedExpiry, err := store.LockOutput(ns, lockID, creditOutpoint, 10*time.Minute)
+		if err != nil {
+			return err
+		}
+
+		assertRetainedLock(t, store, ns, 3, -1)
+
+		// An explicit option replaces the release depth without clearing the disconnected spend state.
+		_, err = store.LockOutput(ns, lockID, creditOutpoint, 10*time.Minute, WithReleaseAfterSpend(4))
+		if err != nil {
+			return err
+		}
+
+		assertRetainedLock(t, store, ns, 4, -1)
+		if err := store.RemoveUnminedTx(ns, spendRec); err != nil {
+			return err
+		}
+
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
+		// The funding credit was restored, but the retained lease keeps it out of the spendable UTXO set.
+		assertUtxos(t, store, ns, nil)
+		if err := store.DeleteMaturedLockedOutputs(ns, 102); err != nil {
+			return err
+		}
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
+
+		// A lease that has observed a spend must survive its wall clock expiry while that spend is disconnected.
+		store.clock.(*clock.TestClock).SetTime(renewedExpiry.Add(time.Second))
+		if err := store.DeleteExpiredLockedOutputs(ns); err != nil {
+			return err
+		}
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
+		assertOutputLocksExist(t, store, ns, creditOutpoint)
+
+		reconfirmedBlock := &BlockMeta{
+			Block: Block{
+				Hash:   chainhash.Hash{3},
+				Height: 103,
+			},
+			Time: time.Now().Add(2 * time.Minute),
+		}
+		if err := store.InsertTx(ns, spendRec, reconfirmedBlock); err != nil {
+			return err
+		}
+		if err := store.DeleteMaturedLockedOutputs(ns, 104); err != nil {
+			return err
+		}
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
+
+		if err := store.DeleteMaturedLockedOutputs(ns, 105); err != nil {
+			return err
+		}
+
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
+
+		err = store.DeleteMaturedLockedOutputs(ns, 106)
+		if err != nil {
+			return err
+		}
+
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), false)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

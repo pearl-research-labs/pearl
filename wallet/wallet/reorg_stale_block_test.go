@@ -5,6 +5,7 @@
 package wallet
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -89,6 +90,9 @@ func (c *reorgChainConn) GetBestBlock() (*chainhash.Hash, int32, error) {
 
 func (c *reorgChainConn) GetBlockHash(height int64) (*chainhash.Hash, error) {
 	c.blockHashCalls++
+	if height > int64(c.tip) {
+		return nil, fmt.Errorf("block height %d is above the chain tip %d", height, c.tip)
+	}
 	hash := branchHash(c.branch, int32(height))
 
 	return &hash, nil
@@ -239,7 +243,10 @@ func lowestStaleHeight(t *testing.T, w *Wallet, conn chainConn) int32 {
 	})
 	require.NoError(t, err)
 
-	height, err := lowestStaleBlockHeight(conn, blocks)
+	_, bestHeight, err := conn.GetBestBlock()
+	require.NoError(t, err)
+
+	height, err := lowestStaleBlockHeight(conn, blocks, bestHeight)
 	require.NoError(t, err)
 
 	return height
@@ -287,14 +294,13 @@ func TestLowestStaleBlockHeight(t *testing.T) {
 		wantHeight: forkHeight,
 		wantCalls:  2,
 	}, {
-		name: "record above the chain tip",
+		name: "record above the chain tip is unverified",
 		records: []record{
 			{sharedBranch, forkHeight - 10},
 			{canonicalBranch, tipHeight + 5},
 		},
-		tip:        tipHeight,
-		wantHeight: tipHeight + 5,
-		wantCalls:  1,
+		tip:       tipHeight,
+		wantCalls: 1,
 	}, {
 		name: "stale record deeper than the manager keeps hashes",
 		records: []record{
@@ -429,21 +435,162 @@ func TestRollbackToChainStaleManager(t *testing.T) {
 	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
 }
 
-// TestDisconnectBlockNotChainSynced pins the current behavior of the live
-// disconnect path, which this change only instruments.
+// TestRollbackToChainAboveTip ensures a wallet synced past the tip of a shorter chain rewinds to the fork point instead
+// of failing on the heights that chain does not have.
+func TestRollbackToChainAboveTip(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	coinbase := mineCoinbase(t, w, orphanedBranch, forkHeight+10)
+	syncManagerTo(t, w, orphanedBranch, forkHeight-1, forkHeight+20)
+	setBirthdayBlock(t, w)
+
+	conn := &reorgChainConn{branch: canonicalBranch, tip: forkHeight + 5}
+	require.NoError(t, w.rollbackToChain(conn))
+
+	assert.False(t, hasStoredCredit(t, w, coinbase))
+	assert.Nil(t, txDetails(t, w, coinbase.Hash))
+	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
+	assert.Equal(t, branchHash(sharedBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
+}
+
+// TestRollbackToChainLaggingBackend ensures a backend that is behind the wallet, but agrees with it at the heights it
+// has, fails the sync instead of rolling back blocks it has not reached yet.
+func TestRollbackToChainLaggingBackend(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	coinbase := mineCoinbase(t, w, canonicalBranch, forkHeight+10)
+	syncManagerTo(t, w, canonicalBranch, forkHeight-1, forkHeight+20)
+	setBirthdayBlock(t, w)
+
+	conn := &reorgChainConn{branch: canonicalBranch, tip: forkHeight + 5}
+	require.ErrorIs(t, w.rollbackToChain(conn), errChainBehindWallet)
+
+	assert.True(t, hasStoredCredit(t, w, coinbase))
+	assert.Equal(t, forkHeight+20, w.Manager.SyncedTo().Height)
+}
+
+// TestRollbackToChainUnverifiableAboveTip ensures a wallet whose block hashes no longer reach down to the chain's tip
+// keeps its history, as nothing then shows where the two diverge.
+func TestRollbackToChainUnverifiableAboveTip(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	coinbase := mineCoinbase(t, w, orphanedBranch, forkHeight+10)
+	syncManagerTo(t, w, orphanedBranch, forkHeight+20, forkHeight+20)
+	setBirthdayBlock(t, w)
+
+	conn := &reorgChainConn{branch: canonicalBranch, tip: forkHeight + 5}
+	require.Error(t, w.rollbackToChain(conn))
+
+	assert.True(t, hasStoredCredit(t, w, coinbase))
+	assert.Equal(t, forkHeight+20, w.Manager.SyncedTo().Height)
+}
+
+// TestDisconnectBlockNotChainSynced ensures a disconnect that arrives before the wallet is chain synced still rolls the
+// block back, so its orphaned coinbase does not stay in the balance.
 func TestDisconnectBlockNotChainSynced(t *testing.T) {
 	w, cleanup := testWallet(t)
 	defer cleanup()
 
 	orphan := mineCoinbase(t, w, orphanedBranch, forkHeight)
-	syncManagerTo(t, w, orphanedBranch, forkHeight, forkHeight)
+	syncManagerTo(t, w, orphanedBranch, forkHeight-1, forkHeight)
 	w.SetChainSynced(false)
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: tipHeight,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight - 1)},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight): branchHash(canonicalBranch, forkHeight),
+		},
+	}
 
 	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		return w.disconnectBlock(tx, blockMeta(orphanedBranch, forkHeight))
 	})
 	require.NoError(t, err)
 
-	assert.True(t, hasStoredCredit(t, w, orphan))
-	assert.Equal(t, forkHeight, w.Manager.SyncedTo().Height)
+	assert.False(t, hasStoredCredit(t, w, orphan))
+	assert.Nil(t, txDetails(t, w, orphan.Hash))
+	assert.Equal(t, forkHeight-1, w.Manager.SyncedTo().Height)
+	assert.Equal(t, branchHash(sharedBranch, forkHeight-1), w.Manager.SyncedTo().Hash)
+}
+
+// TestDisconnectBlockPrunedAncestors ensures disconnecting an orphaned branch rewinds the manager to a block whose
+// ancestors it has already pruned, and leaves none of the branch's hashes above the new tip.
+func TestDisconnectBlockPrunedAncestors(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	orphan := mineCoinbase(t, w, orphanedBranch, forkHeight)
+	syncManagerTo(t, w, orphanedBranch, forkHeight-1, forkHeight+1)
+	setBirthdayBlock(t, w)
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: tipHeight,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight - 1)},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight):     branchHash(canonicalBranch, forkHeight),
+			int64(forkHeight + 1): branchHash(canonicalBranch, forkHeight+1),
+		},
+	}
+
+	for height := forkHeight + 1; height >= forkHeight; height-- {
+		err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+			return w.disconnectBlock(tx, blockMeta(orphanedBranch, height))
+		})
+		require.NoError(t, err, "disconnect at height %d", height)
+	}
+
+	assert.False(t, hasStoredCredit(t, w, orphan))
+	assert.Equal(t, waddrmgr.BlockStamp{
+		Height:    forkHeight - 1,
+		Hash:      branchHash(sharedBranch, forkHeight-1),
+		Timestamp: branchTime(forkHeight - 1),
+	}, w.Manager.SyncedTo())
+
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		for height := forkHeight; height <= forkHeight+1; height++ {
+			_, err := w.Manager.BlockHash(ns, height)
+			assert.True(t, waddrmgr.IsError(err, waddrmgr.ErrBlockNotFound), "hash left at height %d", height)
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+// TestDisconnectBlockStillOnChain ensures a disconnect of a block the backend still has leaves the manager in place, as
+// the next connect needs the hashes a rewind would discard.
+func TestDisconnectBlockStillOnChain(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	syncManagerTo(t, w, canonicalBranch, forkHeight-1, forkHeight+1)
+	setBirthdayBlock(t, w)
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: tipHeight,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight)},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight + 1): branchHash(canonicalBranch, forkHeight+1),
+		},
+	}
+
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		return w.disconnectBlock(tx, blockMeta(canonicalBranch, forkHeight+1))
+	})
+	require.NoError(t, err)
+	assert.Equal(t, forkHeight+1, w.Manager.SyncedTo().Height)
+
+	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		return w.connectBlock(tx, blockMeta(canonicalBranch, forkHeight+2))
+	})
+	require.NoError(t, err)
+	assert.Equal(t, forkHeight+2, w.Manager.SyncedTo().Height)
 }
