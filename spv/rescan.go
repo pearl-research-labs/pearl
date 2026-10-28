@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/spv/blockntfns"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
+	"github.com/pearl-research-labs/pearl/spv/query"
 )
 
 var (
@@ -100,6 +102,13 @@ type rescanOptions struct {
 	watchInputs []InputWithScript
 	watchList   [][]byte
 	txIdx       uint32
+
+	// notifiedSeed holds the blocks an exited rescan notified that this one, resuming it, continues from.
+	notifiedSeed []notifiedBlock
+
+	// reorgedFrom is set when this rescan resumes an exited one whose notified blocks have left the best chain. It is
+	// the first of those blocks.
+	reorgedFrom *notifiedBlock
 
 	update <-chan *updateOptions
 	quit   <-chan struct{}
@@ -515,6 +524,22 @@ func (rs *rescanState) rescan() error {
 	// the tip of the chain.
 	current := false
 
+	// The caller still holds the reorged blocks and learns they are gone only from this notification, which must come
+	// before the blocks that replaced them. Dropping the first drops every block after it as well.
+	if block := ro.reorgedFrom; block != nil {
+		if ro.ntfn.OnBlockDisconnected != nil { // nolint:staticcheck
+			ro.ntfn.OnBlockDisconnected( // nolint:staticcheck
+				&block.stamp.Hash, block.stamp.Height,
+				block.header.Timestamp,
+			)
+		}
+		if ro.ntfn.OnFilteredBlockDisconnected != nil {
+			ro.ntfn.OnFilteredBlockDisconnected(
+				block.stamp.Height, &block.header,
+			)
+		}
+	}
+
 	// Loop through blocks, one at a time. This relies on the underlying
 	// chain source to deliver notifications in the correct order.
 rescanLoop:
@@ -588,12 +613,10 @@ rescanLoop:
 					}
 
 					err := rs.handleBlockConnected(ntfn)
-					switch err {
-					case nil:
+					switch {
+					case err == nil:
 
-					// We'll need to retry the block again
-					// as we couldn't fetch its filter.
-					case errRetryBlock:
+					case errors.Is(err, errRetryBlock):
 						log.Debugf("Retrying %v after %v",
 							ntfn, blockRetryInterval)
 						blockRetryQueue.push(ntfn)
@@ -647,17 +670,15 @@ rescanLoop:
 					err := rs.handleBlockConnected(
 						retryBlock,
 					)
-					switch err {
+					switch {
 					// We successfully notified the block
 					// this time, so we can remove it from
 					// our queue and move on to the next.
-					case nil:
+					case err == nil:
 						_ = blockRetryQueue.pop()
 						continue retryLoop
 
-					// We'll need to retry the block again
-					// as we couldn't fetch its filter.
-					case errRetryBlock:
+					case errors.Is(err, errRetryBlock):
 						log.Debugf("Retrying %v after "+
 							"%v", retryBlock,
 							blockRetryInterval)
@@ -754,6 +775,9 @@ rescanLoop:
 				return err
 			}
 
+			// notifyBlock reads curHeader/curStamp, while updateFilter in waitForRetry must see the last
+			// processed block if this fetch has to be retried.
+			prevHeader, prevStamp := rs.curHeader, rs.curStamp
 			rs.curHeader = *header
 			rs.curStamp.Height++
 			rs.curStamp.Hash = header.BlockHash()
@@ -765,11 +789,198 @@ rescanLoop:
 			}
 
 			err = rs.notifyBlock()
-			if err != nil {
+			switch {
+			case err == nil:
+
+			case errors.Is(err, errRetryBlock):
+				log.Errorf("Unable to process block %d (%s), retrying after %v: %v",
+					rs.curStamp.Height, rs.curStamp.Hash, blockRetryInterval, err)
+
+				rs.curHeader = prevHeader
+				rs.curStamp = prevStamp
+
+				err := rs.waitForRetry(blockRetryInterval)
+				if err != nil {
+					return err
+				}
+
+			default:
+				// A rescan resumed from this one starts at curStamp, so it must name the last block notified.
+				rs.curHeader = prevHeader
+				rs.curStamp = prevStamp
+
 				return err
 			}
 		}
 	}
+}
+
+// ro.update is unbuffered, so service filter updates during backoff or Rescan.Update callers stall on an unreachable
+// block.
+func (rs *rescanState) waitForRetry(interval time.Duration) error {
+	ro := rs.opts
+
+	select {
+	case <-ro.quit:
+		return ErrRescanExit
+
+	case update := <-ro.update:
+		_, err := ro.updateFilter(
+			rs.chain, update, &rs.curStamp, &rs.curHeader,
+		)
+		return err
+
+	case <-time.After(interval):
+		return nil
+	}
+}
+
+// maxNotifiedBlocks is how many of the blocks a rescan notified it remembers. A reorg that replaced more of them while
+// the rescan was down is only reported from the oldest one remembered.
+const maxNotifiedBlocks = 100
+
+// notifiedBlock is a block a rescan reported connected.
+type notifiedBlock struct {
+	stamp  headerfs.BlockStamp
+	header wire.BlockHeader
+}
+
+// notifiedBlocks remembers the latest blocks a rescan reported connected, oldest first. A rescan that resumes after the
+// exit of this one needs them to tell which the best chain dropped meanwhile, since the header store forgets blocks it
+// reorgs out and the caller is only told of the reorg by a disconnect.
+type notifiedBlocks struct {
+	blocks []notifiedBlock
+}
+
+// connected remembers a block reported connected, replacing any remembered block at its height or above.
+func (n *notifiedBlocks) connected(height int32, header *wire.BlockHeader) {
+	n.disconnected(height)
+
+	n.blocks = append(n.blocks, notifiedBlock{
+		stamp: headerfs.BlockStamp{
+			Height:    height,
+			Hash:      header.BlockHash(),
+			Timestamp: header.Timestamp,
+		},
+		header: *header,
+	})
+
+	if excess := len(n.blocks) - maxNotifiedBlocks; excess > 0 {
+		n.blocks = slices.Delete(n.blocks, 0, excess)
+	}
+}
+
+// disconnected forgets the remembered blocks at the height and above.
+func (n *notifiedBlocks) disconnected(height int32) {
+	for len(n.blocks) > 0 && n.blocks[len(n.blocks)-1].stamp.Height >= height {
+		n.blocks = n.blocks[:len(n.blocks)-1]
+	}
+}
+
+// recordNotified makes a rescan remember the blocks it reports connected and disconnected. It wraps the handlers set
+// before it, so it must be applied after them. A rescan resuming an exited one starts from the blocks that one
+// remembered.
+func recordNotified(history *notifiedBlocks) RescanOption {
+	return func(ro *rescanOptions) {
+		history.blocks = slices.Clone(ro.notifiedSeed)
+
+		connected := ro.ntfn.OnFilteredBlockConnected
+		disconnected := ro.ntfn.OnFilteredBlockDisconnected
+
+		ro.ntfn.OnFilteredBlockConnected = func(height int32,
+			header *wire.BlockHeader, relevantTxs []*btcutil.Tx) {
+
+			if connected != nil {
+				connected(height, header, relevantTxs)
+			}
+			history.connected(height, header)
+		}
+		ro.ntfn.OnFilteredBlockDisconnected = func(height int32,
+			header *wire.BlockHeader) {
+
+			if disconnected != nil {
+				disconnected(height, header)
+			}
+			history.disconnected(height)
+		}
+	}
+}
+
+// resumeState is what a replacement rescan needs to continue from where an exited one stopped. The watch lists grow
+// while a rescan runs, with updates and with the outputs it matches, so the options it was created with are stale.
+type resumeState struct {
+	watchAddrs  []btcutil.Address
+	watchInputs []InputWithScript
+
+	// notified are the blocks the rescan remembered. It is never empty: a rescan that notified none stands at the block
+	// it started from, which its caller holds as well.
+	notified []notifiedBlock
+}
+
+// captureResume records the state a replacement rescan resumes from.
+func (rs *rescanState) captureResume(notified []notifiedBlock) *resumeState {
+	notified = slices.Clone(notified)
+	if len(notified) == 0 {
+		notified = []notifiedBlock{{stamp: rs.curStamp, header: rs.curHeader}}
+	}
+
+	return &resumeState{
+		watchAddrs:  slices.Clone(rs.opts.watchAddrs),
+		watchInputs: slices.Clone(rs.opts.watchInputs),
+		notified:    notified,
+	}
+}
+
+// option returns the rescan option that applies the state. Blocks the rescan notified can leave the best chain while it
+// is down, without its caller hearing of it. The resumed rescan then starts at the newest notified block still on the
+// best chain and reports the next one as disconnected, which makes the caller drop it and every block after it, before
+// it notifies the blocks that replaced them.
+func (s *resumeState) option(chain ChainSource) RescanOption {
+	forkIdx := len(s.notified) - 1
+	for ; forkIdx >= 0; forkIdx-- {
+		if !leftBestChain(chain, &s.notified[forkIdx].stamp.Hash) {
+			break
+		}
+	}
+
+	var (
+		start       headerfs.BlockStamp
+		seed        []notifiedBlock
+		reorgedFrom *notifiedBlock
+	)
+	switch {
+	case forkIdx == len(s.notified)-1:
+		start, seed = s.notified[forkIdx].stamp, s.notified
+
+	case forkIdx >= 0:
+		reorgedFrom = &s.notified[forkIdx+1]
+		start, seed = s.notified[forkIdx].stamp, s.notified[:forkIdx+1]
+
+	// Everything remembered is gone, so the block before the oldest of them is the best this can do.
+	default:
+		reorgedFrom = &s.notified[0]
+		start = headerfs.BlockStamp{
+			Height: max(s.notified[0].stamp.Height-1, 0),
+		}
+	}
+
+	return func(ro *rescanOptions) {
+		ro.watchAddrs = slices.Clone(s.watchAddrs)
+		ro.watchInputs = slices.Clone(s.watchInputs)
+		ro.notifiedSeed = slices.Clone(seed)
+		ro.reorgedFrom = reorgedFrom
+
+		startBlock := start
+		ro.startBlock = &startBlock
+	}
+}
+
+// leftBestChain returns whether the header store has dropped the block, which it does when it reorgs the block out.
+// Any other failure to look the block up says nothing about the chain, so it counts as still being on it.
+func leftBestChain(chain ChainSource, hash *chainhash.Hash) bool {
+	_, _, err := chain.GetBlockHeader(hash)
+
+	return errors.Is(err, headerfs.ErrHashNotFound)
 }
 
 // waitForBlocks is a helper function that can be used to wait on block
@@ -864,8 +1075,14 @@ func (rs *rescanState) notifyBlock() error {
 		matched, filter, err := blockFilterMatches(
 			chain, ro, &rs.curStamp.Hash,
 		)
-		if err != nil {
+		switch {
+		// ChainService.Stop stops workManager before closing s.quit, so both shutdown sentinels must exit.
+		case errors.Is(err, ErrShuttingDown), errors.Is(err, query.ErrWorkManagerShuttingDown):
 			return err
+
+		case err != nil:
+			return fmt.Errorf("%w: unable to get filter for block %d (%s): %w",
+				errRetryBlock, rs.curStamp.Height, rs.curStamp.Hash, err)
 		}
 
 		if matched {
@@ -965,7 +1182,7 @@ func (rs *rescanState) handleBlockConnected(ntfn *blockntfns.Connected) error {
 		// have any peers to fetch this filter from, or the peer(s) that
 		// we're trying to fetch from are in the progress of a re-org.
 		log.Errorf("unable to get filter for hash=%v, retrying: %v",
-			rs.curStamp.Hash, err)
+			newStamp.Hash, err)
 
 		return errRetryBlock
 	}
@@ -991,12 +1208,18 @@ func extractBlockMatches(chain ChainSource, ro *rescanOptions,
 	// We've matched. Now we actually get the block and cycle through the
 	// transactions to see which ones are relevant.
 	block, err := chain.GetBlock(curStamp.Hash, ro.queryOptions...)
-	if err != nil {
+	switch {
+	// ChainService.Stop stops workManager before closing s.quit, so both shutdown sentinels must exit.
+	case errors.Is(err, ErrShuttingDown), errors.Is(err, query.ErrWorkManagerShuttingDown):
 		return nil, err
-	}
-	if block == nil {
-		return nil, fmt.Errorf("couldn't get block %d (%s) from "+
-			"network", curStamp.Height, curStamp.Hash)
+
+	case err != nil:
+		return nil, fmt.Errorf("%w: couldn't get block %d (%s) from network: %w",
+			errRetryBlock, curStamp.Height, curStamp.Hash, err)
+
+	case block == nil:
+		return nil, fmt.Errorf("%w: couldn't get block %d (%s) from network",
+			errRetryBlock, curStamp.Height, curStamp.Hash)
 	}
 
 	// Before we go through the transactions, let's make sure the filter we
@@ -1355,6 +1578,7 @@ type Rescan struct { // nolint:maligned
 
 	errMtx sync.Mutex
 	err    error
+	resume *resumeState
 
 	wg sync.WaitGroup
 }
@@ -1392,22 +1616,54 @@ func (r *Rescan) Start() <-chan error {
 	go func() {
 		defer r.wg.Done()
 
-		rescanArgs := append(r.options, updateChan(r.updateChan)) // nolint
+		history := &notifiedBlocks{}
+		rescanArgs := append(slices.Clone(r.options),
+			recordNotified(history), updateChan(r.updateChan),
+		)
 		rs, err := newRescanState(r.chain, rescanArgs...)
 		if err == nil {
 			err = rs.rescan()
 		}
 
-		close(r.running)
-
+		// Whoever observes running closed must also see err and resume.
 		r.errMtx.Lock()
 		r.err = err
+		if rs != nil {
+			r.resume = rs.captureResume(history.blocks)
+		}
 		r.errMtx.Unlock()
+
+		close(r.running)
 
 		errChan <- err
 	}()
 
 	return errChan
+}
+
+// ResumeOptions returns the options for a new rescan that continues where this one exited. The new rescan watches every
+// address and input this one did, including the outputs it matched along the way, and starts at the last block this
+// one notified, or the block it started from if it notified none. If the best chain has dropped blocks this one
+// notified, or its start block, it starts at the newest that remains and first reports the oldest dropped block as
+// disconnected, which tells the caller to drop it and every block after it. The
+// options include those this rescan was created with, so a caller replaces one of them, such as QuitChan, by appending
+// its own. It returns nil while the rescan is running, and if it exited before it started scanning.
+func (r *Rescan) ResumeOptions() []RescanOption {
+	select {
+	case <-r.running:
+	default:
+		return nil
+	}
+
+	r.errMtx.Lock()
+	resume := r.resume
+	r.errMtx.Unlock()
+
+	if resume == nil {
+		return nil
+	}
+
+	return append(slices.Clone(r.options), resume.option(r.chain))
 }
 
 // updateOptions are a set of functional parameters for Update.

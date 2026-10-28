@@ -14,6 +14,10 @@ type rescanner interface {
 	// WaitForShutdown blocks until the underlying rescan object is shutdown.
 	// Close the quit channel before calling WaitForShutdown.
 	WaitForShutdown()
+
+	// ResumeOptions returns the options for a rescan that continues where
+	// this one exited, or nil if it has not exited or cannot be resumed.
+	ResumeOptions() []neutrino.RescanOption
 }
 
 // updater is the interface that wraps the Update method of a rescan object.
