@@ -13,6 +13,7 @@ use crate::hash::hash_types::RichField;
 
 pub(crate) mod context_tree;
 pub(crate) mod partial_products;
+pub mod fft_par;
 pub mod reducing;
 pub mod serialization;
 pub mod strided_view;
@@ -29,6 +30,68 @@ pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
         .into_par_iter()
         .map(|i| matrix.iter().map(|row| row[i]).collect())
         .collect()
+}
+
+/// Fused transpose + row bit-reversal:
+/// `out[reverse_bits(j, log2(n))][i] = matrix[i][j]` for `matrix` of shape
+/// `[rows][n]` with `n` a power of two — exactly
+/// `reverse_index_bits_in_place(&mut transpose(matrix))`, as one blocked pass.
+///
+/// The two-step form gathers each output row from `rows` distinct cache lines,
+/// then re-streams the whole matrix for the bit-reversal. Here input point
+/// `j = h*CB + r` maps to output row `rev(r) * (n/CB) + rev(h)`, so each input
+/// block `h` is a run of `CB` *contiguous* elements in every input row and
+/// produces `CB` complete, disjoint output rows: parallel tasks need no
+/// synchronization and the matrix streams through memory exactly once.
+pub fn transpose_bitrev<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
+    let rows = matrix.len();
+    debug_assert!(rows > 0);
+    let n = matrix[0].len();
+    debug_assert!(n.is_power_of_two());
+    if rows == 0 || n == 0 {
+        return Vec::new();
+    }
+    let lb = n.trailing_zeros() as usize;
+
+    // Block width: 64 elements = 512B = 8 cache lines per input row chunk.
+    const CB: usize = 64;
+    let cb = CB.min(n);
+    let num_blocks = n / cb;
+    let lb_cb = cb.trailing_zeros() as usize;
+
+    let mut out: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+
+    // SAFETY wrapper: the pointer is only used to write disjoint rows. The
+    // method (not a direct field access) makes closures capture the whole
+    // wrapper, so `Sync` applies despite the raw pointer inside.
+    struct OutPtr<T>(*mut Vec<T>);
+    unsafe impl<T> Sync for OutPtr<T> {}
+    impl<T> OutPtr<T> {
+        #[inline]
+        unsafe fn write_row(&self, idx: usize, row: Vec<T>) {
+            *self.0.add(idx) = row;
+        }
+    }
+    let out_ptr = OutPtr(out.as_mut_ptr());
+
+    (0..num_blocks).into_par_iter().for_each(|h| {
+        // Output rows owned by block h:
+        // {rev_cb(r) * num_blocks + rev_hi(h) : r in 0..cb} — a bijective
+        // cover of 0..n, so tasks write disjoint rows.
+        let rev_hi = reverse_bits(h, lb - lb_cb);
+        for r in 0..cb {
+            let out_idx = reverse_bits(r, lb_cb) * num_blocks + rev_hi;
+            let j = h * cb + r;
+            // Gather the j-th element of every input row into this output row.
+            let row: Vec<T> = matrix.iter().map(|m| m[j]).collect();
+            unsafe {
+                // SAFETY: `out_idx` < n and disjoint across tasks; `out`
+                // outlives the parallel scope and is not read until after.
+                out_ptr.write_row(out_idx, row);
+            }
+        }
+    });
+    out
 }
 
 /// Evaluate multiple polynomials at multiple points.
@@ -93,6 +156,32 @@ mod tests {
         assert_eq!(reverse_bits(0b1000000000, 10), 0b0000000001);
         assert_eq!(reverse_bits(0b00000, 5), 0b00000);
         assert_eq!(reverse_bits(0b01011, 5), 0b11010);
+    }
+
+    #[test]
+    fn test_transpose_bitrev() {
+        // Must equal transpose() followed by reverse_index_bits_in_place().
+        let check = |m: &[Vec<u64>]| {
+            let mut expected = transpose(m);
+            reverse_index_bits_in_place(&mut expected);
+            assert_eq!(transpose_bitrev(m), expected);
+        };
+        // 1x256: single poly, pure bit-reversal.
+        let m1: Vec<Vec<u64>> = vec![(0..256u64).collect()];
+        check(&m1);
+        // 3x256, 5x1024, 237x4096: odd row counts and non-power-of-two widths.
+        let m3: Vec<Vec<u64>> = (0..3u64)
+            .map(|i| (0..256u64).map(|j| i * 1000 + j).collect())
+            .collect();
+        check(&m3);
+        let m5: Vec<Vec<u64>> = (0..5u64)
+            .map(|i| (0..1024u64).map(|j| i * 4096 + j).collect())
+            .collect();
+        check(&m5);
+        let m237: Vec<Vec<u64>> = (0..237u64)
+            .map(|i| (0..4096u64).map(|j| i * 65536 + j).collect())
+            .collect();
+        check(&m237);
     }
 
     #[test]

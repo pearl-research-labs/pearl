@@ -91,14 +91,17 @@ pub(crate) fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUn
     }
 }
 
+/// Subtrees with at most this many leaves hash with a plain serial recursion;
+/// below this size the rayon `join` task-spawn overhead outweighs the work.
+const SUBTREE_PARALLEL_CUTOFF: usize = 1 << 6;
+
 pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     leaves: &[Vec<F>],
 ) -> H::Hash {
     assert_eq!(leaves.len(), digests_buf.len() / 2 + 1);
-    if digests_buf.is_empty() {
-        // Base case: single leaf
-        H::hash_or_noop(&leaves[0])
+    if leaves.len() <= SUBTREE_PARALLEL_CUTOFF {
+        fill_subtree_serial::<F, H>(digests_buf, leaves)
     } else {
         // Layout is: left recursive output || left child digest
         //             || right child digest || right recursive output.
@@ -114,6 +117,30 @@ pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
             || fill_subtree::<F, H>(left_digests_buf, left_leaves),
             || fill_subtree::<F, H>(right_digests_buf, right_leaves),
         );
+
+        left_digest_mem.write(left_digest);
+        right_digest_mem.write(right_digest);
+        H::two_to_one(left_digest, right_digest)
+    }
+}
+
+/// Serial twin of `fill_subtree`: identical buffer layout and digests, but no
+/// rayon `join` — small subtrees avoid the per-node task-spawn overhead.
+fn fill_subtree_serial<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [MaybeUninit<H::Hash>],
+    leaves: &[Vec<F>],
+) -> H::Hash {
+    if digests_buf.is_empty() {
+        // Base case: single leaf
+        H::hash_or_noop(&leaves[0])
+    } else {
+        let (left_digests_buf, right_digests_buf) = digests_buf.split_at_mut(digests_buf.len() / 2);
+        let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
+        let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
+        let (left_leaves, right_leaves) = leaves.split_at(leaves.len() / 2);
+
+        let left_digest = fill_subtree_serial::<F, H>(left_digests_buf, left_leaves);
+        let right_digest = fill_subtree_serial::<F, H>(right_digests_buf, right_leaves);
 
         left_digest_mem.write(left_digest);
         right_digest_mem.write(right_digest);

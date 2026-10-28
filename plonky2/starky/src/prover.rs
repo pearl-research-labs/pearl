@@ -28,8 +28,8 @@ use crate::constraint_consumer::ConstraintConsumer;
 use crate::cross_table_lookup::{get_ctl_auxiliary_polys, CtlCheckVars, CtlData};
 use crate::evaluation_frame::StarkEvaluationFrame;
 use crate::lookup::{
-    get_grand_product_challenge_set, lookup_helper_columns, GrandProductChallengeSet, Lookup,
-    LookupCheckVars,
+    get_grand_product_challenge_set, lookup_helper_columns, Column, Filter,
+    GrandProductChallenge, GrandProductChallengeSet, Lookup, LookupCheckVars,
 };
 use crate::proof::{StarkOpeningSet, StarkProof, StarkProofWithPublicInputs};
 use crate::stark::Stark;
@@ -598,6 +598,24 @@ where
         size,
     );
 
+    // CTL metadata is row-independent: the columns/filters/challenges of every
+    // CTL of this STARK, built once instead of per-16-row iteration.
+    struct CtlMeta<'cl, F: Field> {
+        columns: Vec<&'cl [Column<F>]>,
+        filter: Vec<Filter<F>>,
+        challenge: GrandProductChallenge<F>,
+    }
+    let ctl_meta: Option<Vec<CtlMeta<F>>> = ctl_data.map(|data| {
+        data.zs_columns
+            .iter()
+            .map(|zs| CtlMeta {
+                columns: zs.columns.clone(),
+                filter: zs.filter.clone(),
+                challenge: zs.challenge,
+            })
+            .collect()
+    });
+
     // We will step by `P::WIDTH`, and in each iteration, evaluate the quotient polynomial at
     // a batch of `P::WIDTH` points.
     let quotient_values = (0..size)
@@ -627,18 +645,28 @@ where
             );
             // Get the local and next row evaluations for the permutation argument,
             // as well as the associated challenges.
-            let lookup_vars = lookup_challenges.map(|challenges| LookupCheckVars {
-                local_values: auxiliary_polys_commitment
+            // The full auxiliary leaf at both points is gathered once and sliced
+            // below (lookup Zs, CTL helpers, CTL Zs) instead of one gather per
+            // consumer per CTL.
+            let (aux_local, aux_next) = match auxiliary_polys_commitment.as_ref() {
+                Some(aux) => (
+                    Some(aux.get_lde_values_packed(i_start, step)),
+                    Some(aux.get_lde_values_packed(i_next_start, step)),
+                ),
+                None => (None, None),
+            };
+            let lookup_vars = lookup_challenges.map(|challenges| {
+                let aux_local = aux_local
                     .as_ref()
-                    .unwrap()
-                    .get_lde_values_packed(i_start, step)[..num_lookup_columns]
-                    .to_vec(),
-                next_values: auxiliary_polys_commitment
+                    .expect("lookup challenges imply an auxiliary commitment");
+                let aux_next = aux_next
                     .as_ref()
-                    .unwrap()
-                    .get_lde_values_packed(i_next_start, step)[..num_lookup_columns]
-                    .to_vec(),
-                challenges: challenges.to_vec(),
+                    .expect("lookup challenges imply an auxiliary commitment");
+                LookupCheckVars {
+                    local_values: aux_local[..num_lookup_columns].to_vec(),
+                    next_values: aux_next[..num_lookup_columns].to_vec(),
+                    challenges: challenges.to_vec(),
+                }
             });
 
             // Get all the data for this STARK's CTLs, if any:
@@ -648,36 +676,28 @@ where
             //     - the filter `Column`
             //     - the `Column`s that form the looking/looked table.
 
-            let ctl_vars = ctl_data.map(|data| {
+            let ctl_vars = ctl_meta.as_ref().map(|meta| {
                 let mut start_index = 0;
-                data.zs_columns
-                    .iter()
+                meta.iter()
                     .enumerate()
-                    .map(|(i, zs_columns)| {
+                    .map(|(i, m)| {
                         let num_ctl_helper_cols = num_ctl_columns[i];
-                        let helper_columns = auxiliary_polys_commitment
-                            .as_ref()
-                            .unwrap()
-                            .get_lde_values_packed(i_start, step)
+                        let aux_local = aux_local.as_ref().unwrap();
+                        let aux_next = aux_next.as_ref().unwrap();
+                        let helper_columns = aux_local
                             [num_lookup_columns + start_index
                                 ..num_lookup_columns + start_index + num_ctl_helper_cols]
                             .to_vec();
 
                         let ctl_vars = CtlCheckVars::<F, F, P, 1> {
                             helper_columns,
-                            local_z: auxiliary_polys_commitment
-                                .as_ref()
-                                .unwrap()
-                                .get_lde_values_packed(i_start, step)
+                            local_z: aux_local
                                 [num_lookup_columns + total_num_helper_cols + i],
-                            next_z: auxiliary_polys_commitment
-                                .as_ref()
-                                .unwrap()
-                                .get_lde_values_packed(i_next_start, step)
+                            next_z: aux_next
                                 [num_lookup_columns + total_num_helper_cols + i],
-                            challenges: zs_columns.challenge,
-                            columns: zs_columns.columns.clone(),
-                            filter: zs_columns.filter.clone(),
+                            challenges: m.challenge,
+                            columns: m.columns.clone(),
+                            filter: m.filter.clone(),
                         };
 
                         start_index += num_ctl_helper_cols;

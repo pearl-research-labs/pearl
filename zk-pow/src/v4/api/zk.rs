@@ -83,6 +83,7 @@ use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
+use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::BatchStarkPreprocessedData;
@@ -152,6 +153,10 @@ struct Fp8ProverSetup {
     device: Device,
     preprocessed: BatchStarkPreprocessedData<F, C, D>,
     circuits: Fp8WrapperCircuits,
+    /// The sample job the setup was compiled from: the warmup's proving target. Its
+    /// system is shape-identical to every other job's (`Fp8WrapperCircuits` are
+    /// universal per device), so warming up on it warms every future job.
+    sample_job: Fp8Job,
 }
 
 impl Fp8ProverSetup {
@@ -164,7 +169,62 @@ impl Fp8ProverSetup {
             device,
             preprocessed,
             circuits,
+            sample_job: job,
         })
+    }
+
+    /// One dummy prove of the sample job, filling both wrapper stages'
+    /// `layered_generators` so every later `prove` runs the parallel witness
+    /// generator. The sample planes are zero (any bytes generate a valid trace; the
+    /// AIRs generate rows *from* the witness, so constraints hold by construction) —
+    /// the artifact is discarded. Idempotent in effect: a second call re-proves, but
+    /// `layered_generators` was already filled, so it only costs the proving time.
+    fn warmup(&mut self, timing: &mut TimingTree) -> Result<()> {
+        let job = &mut self.sample_job;
+        let (h, w, k) = (job.input_quant().h, job.input_quant().w, job.input_quant().k);
+        let (num_aux_msgs, num_aux_cvs) = job.system.blake3_aux_bounds();
+        // Zero planes and zero aux data: any witness bytes generate a valid trace (the
+        // AIRs build rows *from* the witness, so constraints hold by construction) —
+        // only the aux forest's *shape* is statement-fixed, and zeros fill it.
+        let a_values = vec![0u8; h * k];
+        let a_scales = vec![0u8; h * (k / BLOCK_SIZE) * 2];
+        let b_values = vec![0u8; w * k];
+        let b_scales = vec![0u8; w * (k / BLOCK_SIZE) * 2];
+        let aux_msgs = vec![[0u8; 64]; num_aux_msgs];
+        let aux_cvs = vec![[0u8; 32]; num_aux_cvs];
+        let witness = Fp8Witness {
+            a_values: &a_values,
+            a_scales: &a_scales,
+            b_values: &b_values,
+            b_scales: &b_scales,
+            routing_words: &[],
+            offsets_words: &[],
+            aux_msgs: &aux_msgs,
+            aux_cvs: &aux_cvs,
+            key_a: hash_words(&job.key_a()),
+            key_b: hash_words(&job.key_b()),
+            jackpot_key: hash_words(&job.jackpot_key()),
+            a_hash_id: job.params.a().hash_id,
+            b_hash_id: job.params.b().hash_id,
+            routing_hash_id: HashId::Blake3Chunk1024,
+            offsets_hash_id: HashId::Blake3Chunk1024,
+        };
+        // Bind the digest the way production does (`prove_batch_statement`): the
+        // generated jackpot is installed on the statement *before* digesting, and the
+        // same digest is what the wrapper's known-column slot must carry.
+        let header = IncompleteBlockHeader::zero();
+        let mut digest = Hash256::default();
+        let batch_proof = job.system.prove::<C>(
+            &witness,
+            |jackpot| {
+                job.params.set_hash_jackpot(jackpot);
+                digest = job.params.digest(&header);
+                digest
+            },
+            &self.preprocessed,
+            timing,
+        )?;
+        self.circuits.warmup_prove(&job.system, &batch_proof, digest, timing)
     }
 }
 
@@ -188,13 +248,32 @@ impl Fp8Prover {
     fn setup_with_timing(device: Device, timing: &mut TimingTree) -> Result<Self> {
         // Pay the LUT-preprocessing and wrapper-circuit compilation costs up front so
         // `prove` does not pay them.
-        // TODO: Add `Fp8Prover::warmup_prove(&mut self, input: &PlainProofV4)` if
-        // shape-specific first-proof warm-up is needed. It can prove once against
-        // `IncompleteBlockHeader::zero()` and discard the result.
         let setup = Fp8ProverSetup::build(device, timing)?;
         Ok(Self {
             setups: HashMap::from([(device, setup)]),
         })
+    }
+
+    /// Warms this device's prover state so the first real `prove` pays no first-call
+    /// costs: pre-generates the shared FFT root tables (`warm_fft_tables` — consult the
+    /// cache from then on instead of rebuilding tables per FFT call) and fills both
+    /// wrapper stages' `layered_generators` via a dummy prove of the setup's sample
+    /// job (discarded). One call covers every job shape on this device; the circuits
+    /// are universal, and the root tables are pure field data.
+    ///
+    /// The FFT tables are warmed for the *whole process* (both devices share them),
+    /// so calling this for a second device only pays the sample prove again.
+    pub fn warmup_prove(&mut self, device: Device) -> Result<()> {
+        // ---- The FFT root tables: sizes 2^5..=2^23 cover the layer-0 batch STARKs
+        // (degree 2^13..=2^22 tables at rate 2) and both recursion stages' traces,
+        // commitments and FRI folds; the degree-2 extension covers the FRI fold
+        // `coset_fft`s.
+        plonky2::field::fft::warm_fft_tables::<F>(5, 23);
+        plonky2::field::fft::warm_fft_tables::<<F as plonky2::field::extension::Extendable<D>>::Extension>(5, 22);
+
+        let mut timing = TimingTree::default();
+        let setup = self.setup_for_device(device, &mut timing)?;
+        setup.warmup(&mut timing)
     }
 
     fn setup_for_device(&mut self, device: Device, timing: &mut TimingTree) -> Result<&mut Fp8ProverSetup> {
@@ -703,8 +782,8 @@ fn prove_batch_statement(
     setup: &Fp8ProverSetup,
     timing: &mut TimingTree,
 ) -> Result<(PublicParams, Fp8Job, BatchStarkProofWithPublicInputs<F, C, D>)> {
-    let (private, mut public) = plain_proof.parse_proof(proposed_header)?;
-    let mut job = Fp8Job::derive(&public, proposed_header)?;
+    let (private, mut public) = timed!(timing, "parse plain proof", plain_proof.parse_proof(proposed_header)?);
+    let mut job = timed!(timing, "derive job", Fp8Job::derive(&public, proposed_header)?);
     ensure!(
         setup.device == public.common().device,
         "the FP8 prover setup is for {:?}, but the statement commits {:?}",
@@ -725,8 +804,11 @@ fn prove_batch_statement(
     // jobs) as u32 words, stream order — `parse_proof` already Merkle-verified them against
     // `moe.hash_routing`/`moe.hash_offsets` and checked the sampled entries against the
     // public outer indices.
-    let routing_words = stream_words(&private.s_routing);
-    let offsets_words = stream_words(&private.s_offsets);
+    let (routing_words, offsets_words) = timed!(
+        timing,
+        "stream routing words",
+        (stream_words(&private.s_routing), stream_words(&private.s_offsets),)
+    );
     let witness = Fp8Witness {
         a_values: private.operands.a.values.as_bytes(),
         a_scales: private.operands.a.scales.as_bytes(),
@@ -873,6 +955,31 @@ mod tests {
     // winning condition `hash_jackpot <= bound` is deterministic on pseudo-random data.
 
     mod proof_pipeline_tests;
+
+    mod bench_pipeline_tests;
+
+    mod bench_layer1_sweep;
+
+    #[test]
+    fn warmup_prove_fills_both_wrapper_stages_layered_generators() {
+        let mut prover = Fp8Prover::setup(Device::H100).expect("setup");
+        let setup = prover.setups.get_mut(&Device::H100).expect("setup was prebuilt");
+
+        // Cold: the wrapper compiles with no generator order (the stock `prove` path
+        // would run the single-threaded witness scheduler).
+        assert!(
+            !setup.circuits.is_warmed_up(),
+            "freshly compiled wrapper stages must start unwarmed"
+        );
+
+        prover.warmup_prove(Device::H100).expect("warmup prove");
+
+        let setup = prover.setups.get(&Device::H100).expect("setup was prebuilt");
+        assert!(
+            setup.circuits.is_warmed_up(),
+            "warmup must fill both stages' layered_generators"
+        );
+    }
 
     #[test]
     fn compile_jackpot_key_is_labelled_subkey_for_dense_and_moe() {

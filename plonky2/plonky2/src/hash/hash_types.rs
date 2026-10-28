@@ -6,6 +6,7 @@ use anyhow::ensure;
 use plonky2_field::extension::Extendable;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use plonky2_field::packable::Packable;
 
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::types::{Field, PrimeField64, Sample};
@@ -16,7 +17,7 @@ use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut};
 
 /// A prime order field with the features we need to use it as a base field in our argument system.
-pub trait RichField: PrimeField64 + Poseidon + 'static {}
+pub trait RichField: PrimeField64 + Poseidon + Packable + 'static {}
 
 impl RichField for GoldilocksField {}
 

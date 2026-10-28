@@ -12,6 +12,7 @@ use crate::hash::merkle_tree::{
 };
 use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
+use plonky2_maybe_rayon::*;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BatchMerkleTree<F: RichField, H: Hasher<F>> {
@@ -83,11 +84,11 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
             } else {
                 // The rest leaf layers
                 let new_leaves: Vec<Vec<F>> = cap
-                    .iter()
+                    .par_iter()
                     .enumerate()
                     .map(|(i, cap_hash)| {
                         let mut new_hash = Vec::with_capacity(NUM_HASH_OUT_ELTS + cur[i].len());
-                        new_hash.extend(&cap_hash.to_vec());
+                        new_hash.extend(cap_hash.to_vec());
                         new_hash.extend(&cur[i]);
                         new_hash
                     })

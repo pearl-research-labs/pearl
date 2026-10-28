@@ -48,19 +48,26 @@ use plonky2::iop::ext_target::ExtensionTarget;
 use plonky2::iop::target::Target;
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::config::GenericConfig;
+use plonky2_maybe_rayon::*;
 
 use crate::config::StarkConfig;
 use crate::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
 use crate::evaluation_frame::StarkEvaluationFrame;
 use crate::lookup::{
-    eval_helper_columns, eval_helper_columns_circuit, get_grand_product_challenge_set,
-    get_helper_cols, Column, ColumnFilter, Filter, GrandProductChallenge, GrandProductChallengeSet,
+    eval_helper_columns, eval_helper_columns_circuit, get_grand_product_challenge_set, Column,
+    Filter, GrandProductChallenge, GrandProductChallengeSet,
 };
 use crate::proof::{StarkOpeningSet, StarkOpeningSetTarget, StarkProof, StarkProofTarget};
 use crate::stark::Stark;
 
 /// An alias for `usize`, to represent the index of a STARK table in a multi-STARK setting.
 pub type TableIdx = usize;
+
+/// Row-chunk granularity for the per-chunk helper accumulation.
+const CTL_ACC_CHUNK: usize = 1 << 15;
+
+/// Number of blocks in the parallel Z suffix scan.
+const CTL_SCAN_BLOCKS: usize = 96;
 
 /// A `table` index with a linear combination of columns and a filter.
 /// `filter` is used to determine the rows to select in `table`.
@@ -262,6 +269,29 @@ impl<F: Field> CtlData<'_, F> {
         res
     }
 
+    /// Moves the CTL helper and Z polynomials' values out, leaving the table's
+    /// `CtlData` with its metadata (challenges, columns, filters) and helper
+    /// counts. The committed-oracle consumers of `CtlData` never read the
+    /// value polys — they read them back from the auxiliary commitment — so
+    /// proving pipelines that own their `CtlData` can hand the values to the
+    /// auxiliary-polynomial assembly without a multi-gigabyte deep copy.
+    /// The helper *counts* (`zs_columns[i].helper_columns.len()`) are
+    /// preserved for layout math downstream.
+    pub(crate) fn take_ctl_polys(&mut self) -> Vec<PolynomialValues<F>> {
+        let num_helpers: usize = self.zs_columns.iter().map(|z| z.helper_columns.len()).sum();
+        let num_zs = self.zs_columns.len();
+        let mut res = Vec::with_capacity(num_helpers + num_zs);
+        for z in &mut self.zs_columns {
+            for pv in &mut z.helper_columns {
+                res.push(core::mem::take(pv));
+            }
+        }
+        for z in &mut self.zs_columns {
+            res.push(core::mem::take(&mut z.z));
+        }
+        res
+    }
+
     /// Returns all the Z cross-table-lookup polynomials.
     pub(crate) fn ctl_z_polys(&self) -> Vec<PolynomialValues<F>> {
         let mut res = Vec::with_capacity(self.zs_columns.len());
@@ -324,6 +354,17 @@ pub(crate) fn get_ctl_auxiliary_polys<F: Field>(
     })
 }
 
+/// Move-based variant of [`get_ctl_auxiliary_polys`] for proving pipelines
+/// that own their [`CtlData`]: the helper and Z polynomials' buffers are
+/// moved into the auxiliary-polynomial assembly instead of cloned, and the
+/// `CtlData` retains its metadata and helper counts for downstream layout
+/// math. Functionally identical to the clone-based variant.
+pub(crate) fn take_ctl_auxiliary_polys<F: Field>(
+    ctl_data: Option<&mut CtlData<F>>,
+) -> Option<Vec<PolynomialValues<F>>> {
+    ctl_data.map(CtlData::take_ctl_polys)
+}
+
 /// Generates all the cross-table lookup data, for all tables.
 /// - `trace_poly_values` corresponds to the trace values for all tables.
 /// - `public_inputs` corresponds to the public inputs of all tables (the column expressions
@@ -340,133 +381,275 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
     ctl_challenges: &GrandProductChallengeSet<F>,
     constraint_degree: usize,
 ) -> [CtlData<'a, F>; N] {
-    let mut ctl_data_per_table = [0; N].map(|_| CtlData::default());
-    for CrossTableLookup {
-        looking_tables,
-        looked_tables,
-    } in cross_table_lookups
-    {
-        log::debug!("Processing CTL for {:?}", looked_tables[0].table);
-        for &challenge in &ctl_challenges.challenges {
-            // Both sides are processed identically: per trace, batch its instances into
-            // helper columns (when more than one) and one Z polynomial. The looking side
-            // comes first — `CtlCheckVars::from_openings` and
-            // `verify_cross_table_lookups` rely on this order.
-            for tables in [looking_tables, looked_tables] {
-                let helper_zs = ctl_helper_zs_cols(
-                    trace_poly_values,
-                    public_inputs,
-                    tables.clone(),
-                    challenge,
-                    constraint_degree,
-                );
+    // The unit of parallelizable work: one (table, side-instances) group of one side of
+    // one CTL under one challenge — exactly one `partial_sums_with_evals` call.
+    //
+    // The trace-side evaluations (column linear combinations and filters) are
+    // challenge-independent: only the beta/gamma combining, the batch inversion and
+    // the Z suffix sums vary per challenge. Pass 1 therefore evaluates each
+    // (ctl, side, table-group)'s columns and filters once; pass 2 enumerates works in
+    // the exact serial order the verifier mirrors (per CTL, per challenge, looking
+    // side's groups first), sharing the group's precomputed evaluations.
+    struct CtlWork<'a, F: Field> {
+        table: TableIdx,
+        group: usize,
+        challenge: GrandProductChallenge<F>,
+        columns: Vec<&'a [Column<F>]>,
+        filter: Vec<Filter<F>>,
+    }
 
-                for (table, helpers_zs) in helper_zs {
-                    let num_helpers = helpers_zs.len() - 1;
-                    let count = tables.iter().filter(|twc| twc.table == table).count();
-                    let cols_filts = tables.iter().filter_map(|twc| {
-                        if twc.table == table {
-                            Some((&twc.columns, &twc.filter))
-                        } else {
-                            None
-                        }
-                    });
-                    let mut columns = Vec::with_capacity(count);
-                    let mut filter = Vec::with_capacity(count);
-                    for (col, filt) in cols_filts {
-                        columns.push(&col[..]);
-                        filter.push(filt.clone());
-                    }
-                    ctl_data_per_table[table].zs_columns.push(CtlZData {
-                        helper_columns: helpers_zs[..num_helpers].to_vec(),
-                        z: helpers_zs[num_helpers].clone(),
+    // Pass 1: evaluate each group's columns and filters once. Groups are
+    // numbered in (ctl, side, table) order, matching pass 2's enumeration.
+    // The (table, instance) descriptors are collected first so the expensive
+    // evaluations can run in parallel across groups.
+    struct GroupDesc<'a, F: Field> {
+        table: TableIdx,
+        columns: Vec<&'a [Column<F>]>,
+        filters: Vec<&'a Filter<F>>,
+    }
+    struct GroupEvals<F: Field> {
+        columns: Vec<Vec<Vec<F>>>, // per instance: per column element: rows
+        filters: Vec<Vec<F>>,      // per instance: rows
+    }
+    let mut group_descs: Vec<GroupDesc<'a, F>> = Vec::new();
+    // Per CTL: the id of its first group.
+    let mut ctl_first_group: Vec<usize> = Vec::new();
+
+    for ctl in cross_table_lookups {
+        let CrossTableLookup {
+            looking_tables,
+            looked_tables,
+        } = ctl;
+        log::debug!("Processing CTL for {:?}", looked_tables[0].table);
+        ctl_first_group.push(group_descs.len());
+        for tables in [looking_tables, looked_tables] {
+            // Group this side's instances by trace: each group shares
+            // helper columns and one Z polynomial.
+            for (table, group) in &tables.iter().group_by(|twc| twc.table) {
+                let group: Vec<&TableWithColumns<F>> = group.collect();
+                group_descs.push(GroupDesc {
+                    table,
+                    columns: group.iter().map(|twc| &twc.columns[..]).collect(),
+                    filters: group.iter().map(|twc| &twc.filter).collect(),
+                });
+            }
+        }
+    }
+
+    // Evaluate the groups in parallel; each group's columns and filters are
+    // independent of every other group's. Within a group, the instances'
+    // evaluations are independent too, so big groups (many instances over a
+    // 2^21-row trace) also spread across the pool.
+    let group_evals: Vec<GroupEvals<F>> = group_descs
+        .into_par_iter()
+        .map(|desc| {
+            let trace = &trace_poly_values[desc.table];
+            let pis = &public_inputs[desc.table];
+            let columns = desc
+                .columns
+                .par_iter()
+                .map(|col| {
+                    col.iter()
+                        .map(|c| c.eval_all_rows_with_inputs(trace, pis))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let filters = desc
+                .filters
+                .par_iter()
+                .map(|f| f.eval_all_rows_with_inputs(trace, pis))
+                .collect::<Vec<_>>();
+            GroupEvals { columns, filters }
+        })
+        .collect();
+
+    // Pass 2: enumerate works in the exact serial order, pairing each with
+    // its group's shared evaluations.
+    let mut works: Vec<CtlWork<'a, F>> = Vec::new();
+    for (ctl, &first) in cross_table_lookups.iter().zip(&ctl_first_group) {
+        let CrossTableLookup {
+            looking_tables,
+            looked_tables,
+        } = ctl;
+        for &challenge in &ctl_challenges.challenges {
+            let mut group_id = first;
+            for tables in [looking_tables, looked_tables] {
+                for (table, group) in &tables.iter().group_by(|twc| twc.table) {
+                    let group: Vec<&TableWithColumns<F>> = group.collect();
+                    works.push(CtlWork {
+                        table,
+                        group: group_id,
                         challenge,
-                        columns,
-                        filter,
+                        columns: group.iter().map(|twc| &twc.columns[..]).collect(),
+                        filter: group.iter().map(|twc| twc.filter.clone()).collect(),
                     });
+                    group_id += 1;
                 }
             }
         }
     }
+
+    let results: Vec<Vec<PolynomialValues<F>>> = works
+        .par_iter()
+        .map(|work| {
+            let ge = &group_evals[work.group];
+            partial_sums_with_evals(&ge.columns, &ge.filters, work.challenge, constraint_degree)
+        })
+        .collect::<Vec<_>>();
+    let mut ctl_data_per_table = [0; N].map(|_| CtlData::default());
+    for (work, mut helpers_zs) in works.into_iter().zip(results) {
+        let z = helpers_zs
+            .pop()
+            .expect("partial sums always return a Z poly");
+        ctl_data_per_table[work.table].zs_columns.push(CtlZData {
+            helper_columns: helpers_zs,
+            z,
+            challenge: work.challenge,
+            columns: work.columns,
+            filter: work.filter,
+        });
+    }
     ctl_data_per_table
 }
 
-/// Computes helper columns and Z polynomials for all looking tables
-/// of one cross-table lookup (i.e. for one looked table).
-fn ctl_helper_zs_cols<F: Field, const N: usize>(
-    all_stark_traces: &[Vec<PolynomialValues<F>>; N],
-    public_inputs: &[Vec<F>; N],
-    looking_tables: Vec<TableWithColumns<F>>,
-    challenge: GrandProductChallenge<F>,
-    constraint_degree: usize,
-) -> Vec<(usize, Vec<PolynomialValues<F>>)> {
-    let grouped_lookups = looking_tables.iter().group_by(|a| a.table);
-
-    grouped_lookups
-        .into_iter()
-        .map(|(table, group)| {
-            let columns_filters = group
-                .map(|table| (&table.columns[..], &table.filter))
-                .collect::<Vec<(&[Column<F>], &Filter<F>)>>();
-            (
-                table,
-                partial_sums(
-                    &all_stark_traces[table],
-                    &public_inputs[table],
-                    &columns_filters,
-                    challenge,
-                    constraint_degree,
-                ),
-            )
-        })
-        .collect::<Vec<(usize, Vec<PolynomialValues<F>>)>>()
-}
-
-/// Computes the cross-table lookup partial sums for one table and given column linear combinations.
-/// `trace` represents the trace values for the given table.
-/// `columns` is a vector of column linear combinations to evaluate. Each element in the vector represents columns that need to be combined.
-/// `filter_cols` are column linear combinations used to determine whether a row should be selected.
-/// `challenge` is a cross-table lookup challenge.
-/// The initial sum `s` is 0.
-/// For each row, if the `filter_column` evaluates to 1, then the row is selected. All the column linear combinations are evaluated at said row.
-/// The evaluations of each elements of `columns` are then combined together to form a value `v`.
-/// The values `v`` are grouped together, in groups of size `constraint_degree - 1`. For each group, we construct a helper
-/// column: h = \sum_i 1/(v_i).
+/// Computes the cross-table lookup partial sums for one table and given column linear combinations,
+/// over pre-evaluated column and filter values.
 ///
-/// The sum is updated: `s += \sum h_i`, and is pushed to the vector of partial sums `z``.
+/// `columns` holds, per instance, the row values of each element of the instance's column linear
+/// combination; `filters` holds, per instance, the row values of the instance's filter.
+/// The combination with the challenge, the batch inversion, the filter multiply, and the Z suffix
+/// sum are the only challenge-dependent steps.
+///
+/// The values `v` are grouped together, in groups of size `constraint_degree - 1`. For each group,
+/// we construct a helper column: h = \sum_i 1/(v_i).
+///
+/// The sum is updated: `s += \sum h_i`, and is pushed to the vector of partial sums `z`.
 /// Returns the helper columns and `z`.
-fn partial_sums<F: Field>(
-    trace: &[PolynomialValues<F>],
-    public_inputs: &[F],
-    columns_filters: &[ColumnFilter<F>],
+///
+/// Rows are processed in parallel across the instance's row range: the per-instance
+/// `combine` map and the batch inversion both parallelize over row chunks, so a
+/// single work over a 2^22-row table can use the whole rayon pool even when few
+/// CTL works exist.
+fn partial_sums_with_evals<F: Field>(
+    columns: &[Vec<Vec<F>>],
+    filters: &[Vec<F>],
     challenge: GrandProductChallenge<F>,
     constraint_degree: usize,
 ) -> Vec<PolynomialValues<F>> {
-    let degree = trace[0].len();
-    let mut z = Vec::with_capacity(degree);
+    let degree = filters.first().map_or(0, |f| f.len());
+    debug_assert!(columns.iter().flatten().all(|c| c.len() == degree));
 
-    let mut helper_columns = get_helper_cols(
-        trace,
-        degree,
-        columns_filters,
-        public_inputs,
-        challenge,
-        constraint_degree,
-    );
+    let group = constraint_degree.checked_sub(1).unwrap_or(1);
 
-    let x = helper_columns
-        .iter()
-        .map(|col| col.values[degree - 1])
-        .sum::<F>();
-    z.push(x);
+    // Row-parallel combine+inverse+filter for one instance: splits `degree`
+    // rows into chunks, computes each chunk's `combine` (a pure map) into its
+    // slice of the single preallocated output buffer, inverts it with an
+    // independent Montgomery trick, and multiplies by the filter.
+    // Functionally identical to the serial version: the Montgomery trick is
+    // exact for any chunking, and the chunks are independent row ranges.
+    let combine_inverse_filter_into = |instance: &[Vec<F>], filter: &[F], out: &mut [F]| {
+        let num_chunks = if out.len() >= (1 << 15) { 16 } else { 1 };
+        let chunk_len = out.len().div_ceil(num_chunks);
+        out.par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(ci, combined)| {
+                let lo = ci * chunk_len;
+                if instance.len() == 1 {
+                    for (o, &x) in combined.iter_mut().zip(&instance[0][lo..]) {
+                        *o = x + challenge.gamma;
+                    }
+                } else {
+                    for (d, o) in combined.iter_mut().enumerate() {
+                        *o = challenge.combine_base(instance.iter().map(|vals| vals[lo + d]));
+                    }
+                }
+                let inverse = F::batch_multiplicative_inverse(combined);
+                combined.copy_from_slice(&inverse);
+                for (o, &f) in combined.iter_mut().zip(&filter[lo..]) {
+                    *o *= f;
+                }
+            });
+    };
 
-    for i in (0..degree - 1).rev() {
-        let x = helper_columns.iter().map(|col| col.values[i]).sum::<F>();
+    let chunks = (0..columns.len()).step_by(group);
+    // Helper columns: one per chunk of `group` instances. Chunks are
+    // independent — each accumulates its instances into its own pair of
+    // row buffers — so they run in parallel; within a chunk the instances
+    // stay serial (they share the combine buffer), but every buffer pass
+    // (combine+inverse+filter, and the accumulate into the helper column)
+    // is row-parallel.
+    let chunk_starts: Vec<usize> = chunks.collect();
+    let mut helper_columns: Vec<PolynomialValues<F>> = chunk_starts
+        .into_par_iter()
+        .map(|chunk_start| {
+            let instances = &columns[chunk_start..(chunk_start + group).min(columns.len())];
+            let chunk_filters = &filters[chunk_start..(chunk_start + group).min(filters.len())];
+            let mut combined = vec![F::ZERO; degree];
+            let mut acc = vec![F::ZERO; degree];
+            for (k, (instance, filter)) in instances.iter().zip(chunk_filters).enumerate() {
+                combine_inverse_filter_into(instance, filter, &mut combined);
+                acc.par_chunks_mut(CTL_ACC_CHUNK)
+                    .zip(combined.par_chunks(CTL_ACC_CHUNK))
+                    .for_each(|(a, c)| {
+                        if k == 0 {
+                            a.copy_from_slice(c);
+                        } else {
+                            for (a, c) in a.iter_mut().zip(c) {
+                                *a += *c;
+                            }
+                        }
+                    });
+            }
+            acc.into()
+        })
+        .collect();
 
-        z.push(z[z.len() - 1] + x);
+    // Z suffix sums: `z[degree-1] = sum of the last helper values`, then each
+    // earlier `z[i] = z[i+1] + sum_h h[i]` — i.e. `z[i] = sum_{j>=i}` of the
+    // per-row helper sums. The per-row sums parallelize over rows; the suffix
+    // scan itself uses a blocked two-level scheme: parallel block sums, a
+    // short serial scan over the block totals, then parallel in-block scans.
+    let num_helpers = helper_columns.len();
+    let per_row_sums: Vec<F> = if num_helpers == 1 {
+        helper_columns[0].values.clone()
+    } else {
+        (0..degree)
+            .into_par_iter()
+            .with_min_len(1024)
+            .map(|i| helper_columns.iter().map(|col| col.values[i]).sum::<F>())
+            .collect()
+    };
+    let mut z = vec![F::ZERO; degree];
+    let block_len = degree.div_ceil(CTL_SCAN_BLOCKS).max(1);
+    let num_blocks = degree.div_ceil(block_len);
+    // Parallel block totals…
+    let mut block_totals = vec![F::ZERO; num_blocks];
+    block_totals
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(b, total)| {
+            let lo = b * block_len;
+            let hi = ((b + 1) * block_len).min(degree);
+            *total = per_row_sums[lo..hi].iter().copied().sum();
+        });
+    // …a serial suffix scan over the (few) block totals: tails[b] holds the
+    // sum of every row after block b…
+    let mut tails = vec![F::ZERO; num_blocks + 1];
+    for b in (0..num_blocks).rev() {
+        tails[b] = tails[b + 1] + block_totals[b];
     }
-    z.reverse();
-    if columns_filters.len() > 1 {
+    // …then the in-block suffix scans in parallel.
+    z.par_chunks_mut(block_len).enumerate().for_each(|(b, zb)| {
+        let lo = b * block_len;
+        let mut acc = tails[b + 1];
+        let sums = &per_row_sums[lo..lo + zb.len()];
+        for i in (0..zb.len()).rev() {
+            acc += sums[i];
+            zb[i] = acc;
+        }
+    });
+
+    if columns.len() > 1 {
         helper_columns.push(z.into());
     } else {
         helper_columns = vec![z.into()];
@@ -637,20 +820,20 @@ pub(crate) fn eval_cross_table_lookup_checks<F, FE, P, S, const D: usize, const 
             filter,
         } = lookup_vars;
 
-        // Compute all linear combinations on the current table, and combine them using the challenge.
-        let evals = columns
-            .iter()
-            .map(|col| {
-                col.iter()
-                    .map(|c| c.eval_with_next(local_values, next_values, public_inputs))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        // Challenge-combine a column tuple on demand; each tuple is consumed at most
+        // once below, so no per-point tuple-evaluation vector is materialized.
+        let combine_tuple = |i: usize| {
+            challenges.combine_owned(
+                columns[i]
+                    .iter()
+                    .map(|c| c.eval_with_next(local_values, next_values, public_inputs)),
+            )
+        };
 
         // Check helper columns.
         eval_helper_columns(
             filter,
-            &evals,
+            columns,
             local_values,
             next_values,
             public_inputs,
@@ -667,8 +850,8 @@ pub(crate) fn eval_cross_table_lookup_checks<F, FE, P, S, const D: usize, const 
             // Check `Z(w) = Z(gw) + \sum h_i`
             consumer.constraint_transition(*local_z - *next_z - h_sum);
         } else if columns.len() > 1 {
-            let combin0 = challenges.combine(&evals[0]);
-            let combin1 = challenges.combine(&evals[1]);
+            let combin0 = combine_tuple(0);
+            let combin1 = combine_tuple(1);
 
             let f0 = filter[0].eval_filter(local_values, next_values, public_inputs);
             let f1 = filter[1].eval_filter(local_values, next_values, public_inputs);
@@ -679,7 +862,7 @@ pub(crate) fn eval_cross_table_lookup_checks<F, FE, P, S, const D: usize, const 
                 combin0 * combin1 * (*local_z - *next_z) - f0 * combin1 - f1 * combin0,
             );
         } else {
-            let combin0 = challenges.combine(&evals[0]);
+            let combin0 = combine_tuple(0);
             let f0 = filter[0].eval_filter(local_values, next_values, public_inputs);
             consumer.constraint_last_row(combin0 * *local_z - f0);
             consumer.constraint_transition(combin0 * (*local_z - *next_z) - f0);

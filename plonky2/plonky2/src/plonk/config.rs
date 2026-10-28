@@ -23,6 +23,7 @@ use crate::hash::keccak::KeccakHash;
 use crate::hash::poseidon::PoseidonHash;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
+use plonky2_maybe_rayon::*;
 
 pub trait GenericHashOut<F: RichField>:
     Copy + Clone + Debug + Eq + PartialEq + Send + Sync + Serialize + DeserializeOwned
@@ -72,6 +73,19 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         } else {
             Self::hash_no_pad(inputs)
         }
+    }
+
+    /// Hash many equal-width messages without padding, one output per input,
+    /// in parallel. Equivalent to mapping `hash_no_pad` over `rows`, but
+    /// hashers with SIMD batch implementations override this to amortize
+    /// permutation work across lanes.
+    fn hash_no_pad_batch(rows: &[Vec<F>]) -> Vec<Vec<F>>
+    where
+        F: Send + Sync,
+    {
+        rows.par_iter()
+            .map(|row| Self::hash_no_pad(row).to_vec())
+            .collect()
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;

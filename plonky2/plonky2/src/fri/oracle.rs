@@ -18,6 +18,7 @@ use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::timed;
+use crate::util::fft_par::coset_fft_par;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
@@ -248,7 +249,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             let lde_final_values = timed!(
                 timing,
                 &format!("perform final FFT {}", lde_final_poly.len()),
-                lde_final_poly.coset_fft(F::coset_shift().into())
+                coset_fft_par(&lde_final_poly, F::coset_shift().into())
             );
             (lde_final_poly, lde_final_values)
         };

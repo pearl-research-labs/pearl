@@ -110,6 +110,18 @@ impl XorFoldProgram {
         cell_words: &[u32],
         cell_skips: &[u64],
     ) -> (Vec<[F; NUM_XOR_FOLD_COLUMNS]>, [F; NUM_XOR_FOLD_PUBLIC_INPUTS]) {
+        let (rows, _lottery_words) = self.generate_rows_and_lottery::<F>(cell_words, cell_skips);
+        (rows, [F::from_canonical_u64(self.skip_limit)])
+    }
+
+    /// The joined-schedule fill: [`Self::generate_trace`]'s row fill plus, as a by-product
+    /// of the same fold, the 16 lane-final lottery words (`lo.rotate_left(13)`) that
+    /// Blake3's lottery channel consumes. Bit-exact with the row fill's lane-final states.
+    pub(crate) fn generate_rows_and_lottery<F: RichField>(
+        &self,
+        cell_words: &[u32],
+        cell_skips: &[u64],
+    ) -> (Vec<[F; NUM_XOR_FOLD_COLUMNS]>, [u32; XOR_FOLD_LANES]) {
         assert_eq!(self.lanes.len(), XOR_FOLD_LANES, "the lottery block has 16 lanes");
         assert_eq!(cell_skips.len(), cell_words.len(), "one skip count per folded cell");
         // Each cell folded exactly once; no lane empty (an empty lane has no IS_LANE_FINAL row
@@ -124,6 +136,7 @@ impl XorFoldProgram {
         assert!(seen.iter().all(|&s| s), "not every cell is folded");
 
         let mut rows: Vec<[F; NUM_XOR_FOLD_COLUMNS]> = Vec::with_capacity(self.num_rows());
+        let mut lottery_words = [0u32; XOR_FOLD_LANES];
         let mut running_skips = 0u64;
         for (j, lane) in self.lanes.iter().enumerate() {
             let mut state = 0u32;
@@ -155,6 +168,11 @@ impl XorFoldProgram {
                 rows.push(row.into());
                 state = lo.rotate_left(13);
             }
+            // The lottery word is the lane's final fold state — `lo.rotate_left(13)` of the
+            // last step, exactly the value the Blake3 lottery CTL reads off the lane-final
+            // row's rotation fields (`top13 + limb_0*2^13 + limb_1*2^29` recomposes the
+            // rotation) and `xor_fold_extract`'s lane output.
+            lottery_words[j] = state;
         }
         // Pad to the next power of two: mixer and cell-subtotal columns are zero, while
         // RUNNING_SKIPS carries the final count to the last-row budget gate. X1-X3 hold on
@@ -173,7 +191,7 @@ impl XorFoldProgram {
         let last: &mut XorFoldColumnsView<F> = rows.last_mut().expect("at least one row").borrow_mut();
         last.skip_gate_slack_lo = F::from_canonical_u64(slack & 0xFFFF);
         last.skip_gate_slack_hi = F::from_canonical_u64(slack >> 16);
-        (rows, [F::from_canonical_u64(self.skip_limit)])
+        (rows, lottery_words)
     }
 
     /// The class (a) ("known") column values — the leading
@@ -543,6 +561,32 @@ mod tests {
         }
         assert_eq!(finals, XOR_FOLD_LANES);
         drop(program);
+    }
+
+    /// The lottery words returned by the joined-schedule fill must be exactly the lane-final
+    /// rows' un-rotated low words — the values the Blake3 lottery CTL reads off the trace
+    /// (and the historical driver read-back).
+    #[test]
+    fn generate_rows_and_lottery_matches_read_back() {
+        let (tile, lanes) = test_layout();
+        let skips = vec![1u64; tile.len()];
+        let program = XorFoldProgram {
+            lanes,
+            skip_limit: skips.iter().sum(),
+        };
+        let words: Vec<u32> = tile.iter().map(|x| x.to_bits()).collect();
+        let (rows, lottery_words) = program.generate_rows_and_lottery::<F>(&words, &skips);
+        let mut read_back = [0u32; XOR_FOLD_LANES];
+        for row in &rows {
+            let v: &XorFoldColumnsView<F> = row.borrow();
+            if v.is_lane_final == F::ONE {
+                read_back[to_u64(v.lane_id) as usize] = (to_u64(v.rotation_input_top13)
+                    + (to_u64(v.rotation_input_bottom19_limb_0) << 13)
+                    + (to_u64(v.rotation_input_bottom19_limb_1) << 29))
+                    as u32;
+            }
+        }
+        assert_eq!(lottery_words, read_back);
     }
 
     #[test]

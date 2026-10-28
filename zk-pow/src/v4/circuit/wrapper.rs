@@ -354,16 +354,85 @@ impl Fp8WrapperCircuits {
             system.config(),
         )?;
         pw.set_hash_target(self.known_digest_target, statement_digest_to_hash_out(statement_digest))?;
-        let stage1_proof = timed!(timing, "prove the stage-1 wrapper", self.stage1.prove(pw))?;
+        let stage1_proof = timed!(timing, "prove the stage-1 wrapper", self.stage1.prove_with_timing(pw, timing))?;
 
         let mut pw = PartialWitness::new();
         pw.set_proof_with_pis_target(&self.stage1_proof_target, &stage1_proof)?;
-        timed!(timing, "prove the stage-2 (ZK) wrapper", self.stage2.prove(pw))
+        timed!(timing, "prove the stage-2 (ZK) wrapper", self.stage2.prove_with_timing(pw, timing))
+    }
+
+    /// Warmup variant of [`Self::prove`], discarding the result: proves both stages
+    /// through `prove_maybe_warmup`, which fills each stage's `layered_generators` so
+    /// every later `prove` runs the parallel witness generator. The circuits are
+    /// universal per device, so one warmup covers every job shape; the wrapped batch
+    /// proof is whatever the caller proves (the setup's sample job).
+    pub(crate) fn warmup_prove(
+        &mut self,
+        system: &Fp8System<F, D>,
+        batch_proof: &BatchStarkProofWithPublicInputs<F, InnerC, D>,
+        statement_digest: Hash256,
+        timing: &mut TimingTree,
+    ) -> Result<()> {
+        system.ensure_statement_digest_binding(statement_digest)?;
+        let mut pw = PartialWitness::new();
+        set_universal_batch_stark_proof_with_pis_target(
+            &mut pw,
+            &self.universal_target,
+            batch_proof,
+            &self.envelope,
+            system.config(),
+        )?;
+        pw.set_hash_target(self.known_digest_target, statement_digest_to_hash_out(statement_digest))?;
+        let stage1_proof = timed!(
+            timing,
+            "warmup: prove the stage-1 wrapper",
+            plonky2::plonk::prover::prove_maybe_warmup(&mut self.stage1.prover_only, &self.stage1.common, pw, timing)
+        )?;
+
+        let mut pw = PartialWitness::new();
+        pw.set_proof_with_pis_target(&self.stage1_proof_target, &stage1_proof)?;
+        let _ = timed!(
+            timing,
+            "warmup: prove the stage-2 (ZK) wrapper",
+            plonky2::plonk::prover::prove_maybe_warmup(&mut self.stage2.prover_only, &self.stage2.common, pw, timing)
+        )?;
+        Ok(())
     }
 
     /// The verifier's view: stage 2's verifier data (the only circuit a verifier needs).
     pub(crate) fn verifier_data(&self) -> VerifierCircuitData<F, OuterC, D> {
         self.stage2.verifier_data()
+    }
+
+    /// Test-only: whether both stages' `layered_generators` are populated (i.e. a
+    /// warmup prove has run and later `prove` calls take the parallel witness path).
+    #[cfg(test)]
+    pub(crate) fn is_warmed_up(&self) -> bool {
+        !self.stage1.prover_only.layered_generators.is_empty() && !self.stage2.prover_only.layered_generators.is_empty()
+    }
+
+    /// Test/bench-only: prove stage 1 through the public plonk prover entry with a *live*
+    /// timing tree (the stock `CircuitData::prove` discards its tree, hiding the phase
+    /// split — witness generation, wire commitment, partial products, quotient, opening).
+    /// Same code path as `Self::prove`'s stage-1 call.
+    #[cfg(test)]
+    pub(crate) fn prove_stage1_timed(
+        &self,
+        batch_proof: &BatchStarkProofWithPublicInputs<F, InnerC, D>,
+        envelope_system_config: &crate::v4::circuit::driver::Fp8System<F, D>,
+        statement_digest: Hash256,
+        timing: &mut TimingTree,
+    ) -> Result<ProofWithPublicInputs<F, InnerC, D>> {
+        let mut pw = PartialWitness::new();
+        set_universal_batch_stark_proof_with_pis_target(
+            &mut pw,
+            &self.universal_target,
+            batch_proof,
+            &self.envelope,
+            envelope_system_config.config(),
+        )?;
+        pw.set_hash_target(self.known_digest_target, statement_digest_to_hash_out(statement_digest))?;
+        plonky2::plonk::prover::prove(&self.stage1.prover_only, &self.stage1.common, pw, timing)
     }
 
     /// Stage 2's constants/sigmas polynomial coefficients.

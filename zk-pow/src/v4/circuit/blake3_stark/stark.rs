@@ -863,10 +863,105 @@ impl Blake3Program {
     /// roots over the chunk-padded full planes keyed with `key_a`/`key_b` (auxiliary CVs standing
     /// in for the unopened subtrees), and `HASH_JACKPOT` equals
     /// `blake3::keyed_hash(jackpot_key, lottery bytes)`.
+    ///
+    /// The fill is parallel: Phase A (`native_schedule`) is a few milliseconds of serial
+    /// native evaluation; the per-compression row writes and every per-row tail piece then
+    /// run across all cores. Row-exact with the original serial fill (asserted by
+    /// `blake3_parallel_fill_matches_serial`).
     pub fn generate_trace<F: RichField>(
         &self,
         inputs: &Blake3TraceInputs<'_>,
     ) -> (Vec<[F; NUM_BLAKE3_COLUMNS]>, [F; NUM_BLAKE3_PUBLIC_INPUTS]) {
+        // ---- Phase A: evaluate every compression natively (messages, CV chain, outputs). ----
+        let schedule = self.native_schedule(inputs);
+        let mut rows: Vec<[F; NUM_BLAKE3_COLUMNS]> = calloc_rows::<F, NUM_BLAKE3_COLUMNS>(self.num_rows());
+        let pis = self.parallel_fill::<F>(inputs, &schedule, &mut rows);
+        (rows, pis)
+    }
+
+    /// Phase B of [`Self::generate_trace`], factored out so the joined schedule can run it
+    /// on a prebuilt schedule with caller-owned (kernel-zeroed) rows. `rows.len()` must be
+    /// `self.num_rows()`; returns the witness-derived public inputs.
+    pub(crate) fn parallel_fill<F: RichField>(
+        &self,
+        inputs: &Blake3TraceInputs<'_>,
+        schedule: &Blake3NativeSchedule,
+        rows: &mut [[F; NUM_BLAKE3_COLUMNS]],
+    ) -> [F; NUM_BLAKE3_PUBLIC_INPUTS] {
+        let num_live = self.num_live_rows();
+        let num_rows = self.num_rows();
+        assert_eq!(rows.len(), num_rows, "blake3 fill destination height");
+
+        // Per-compression writes: one rayon job per compression.
+        let partials: Vec<_> = {
+            use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunksMut, ParallelIterator};
+            rows[..num_live]
+                .par_chunks_mut(ROWS_PER_COMPRESSION)
+                .enumerate()
+                .map(|(c, chunk)| {
+                    self.fill_compression(
+                        inputs,
+                        &schedule.planes,
+                        &schedule.raw_lens,
+                        &schedule.cvs_out,
+                        c,
+                        &self.instructions[c],
+                        schedule.msgs[c],
+                        schedule.cvs_in[c],
+                        chunk,
+                    )
+                })
+                .collect()
+        };
+        // CV-routing multiplicity table (fetch targets are global rows).
+        let mut freq = vec![0u64; num_rows];
+        // Deferred slice-bound limbs for the row after IS_BOUND_SECOND (at most one per job).
+        let mut bound_write: Option<(usize, [F; 2])> = None;
+        for (bound, incs) in partials {
+            if let Some(bound) = bound {
+                bound_write = Some(bound);
+            }
+            for src in incs {
+                freq[src] += 1;
+            }
+        }
+
+        // ---- The tail: padding, the sliding buffer, chain-carry, finalization states,
+        // ---- packed flags. Chunk-parallel; see `complete_rows` for the scan structure. ----
+        self.complete_rows(rows, &freq, &schedule.msgs, num_live, bound_write);
+
+        // ---- Public inputs. ----
+        let bound_cv = |bind: PublicBinding| -> [u32; 8] {
+            self.instructions
+                .iter()
+                .position(|i| i.bind == Some(bind))
+                .map(|i| schedule.cvs_out[i])
+                .unwrap_or([0; 8])
+        };
+        let mut pis = [F::ZERO; NUM_BLAKE3_PUBLIC_INPUTS];
+        let mut set = |base: usize, words: &[u32; 8]| {
+            for i in 0..8 {
+                pis[base + i] = F::from_canonical_u32(words[i]);
+            }
+        };
+        set(PI_KEY_A, &inputs.key_a);
+        set(PI_KEY_B, &inputs.key_b);
+        set(PI_JACKPOT_KEY, &inputs.jackpot_key);
+        set(PI_HASH_A, &bound_cv(PublicBinding::HashA));
+        set(PI_HASH_B, &bound_cv(PublicBinding::HashB));
+        set(PI_HASH_ROUTING, &bound_cv(PublicBinding::HashRouting));
+        set(PI_HASH_OFFSETS, &bound_cv(PublicBinding::HashOffsets));
+        set(PI_HASH_JACKPOT, &bound_cv(PublicBinding::HashJackpot));
+        pis
+    }
+
+    /// The native compression schedule: the chunk-padded plane streams plus, per
+    /// compression, its message, input CV, and output CV — everything the parallel row
+    /// fill needs. Phase A of [`Self::generate_trace`], factored out because it is a
+    /// pure function of the witness planes and the compiled program (no row writes).
+    /// Also the single owner of the witness-shape assertions (aux message/CV counts
+    /// and the pinned routing words), so every fill path validates identically.
+    pub(crate) fn native_schedule(&self, inputs: &Blake3TraceInputs<'_>) -> Blake3NativeSchedule {
         self.validate();
         assert_eq!(
             inputs.aux_msgs.len(),
@@ -916,7 +1011,7 @@ impl Blake3Program {
             hash_id(PlaneId::Offsets).pad(&offsets_bytes),
         ];
 
-        // ---- Phase A: evaluate every compression natively (messages, CV chain, outputs). ----
+        // ---- Evaluate every compression natively (messages, CV chain, outputs). ----
         let aux_cv_words = |idx: usize| -> [u32; 8] {
             core::array::from_fn(|i| u32::from_le_bytes(inputs.aux_cvs[idx][4 * i..4 * i + 4].try_into().unwrap()))
         };
@@ -972,310 +1067,377 @@ impl Blake3Program {
             cvs_in.push(cv);
             cvs_out.push(core::array::from_fn(|i| state[i] ^ state[8 + i]));
         }
+        Blake3NativeSchedule {
+            planes,
+            raw_lens,
+            msgs,
+            cvs_in,
+            cvs_out,
+        }
+    }
 
-        // ---- Phase B: fill the rows. ----
-        let num_live = self.num_live_rows();
-        let num_rows = self.num_rows();
-        let mut rows: Vec<[F; NUM_BLAKE3_COLUMNS]> = vec![[F::ZERO; NUM_BLAKE3_COLUMNS]; num_rows];
-        let mut freq = vec![0u64; num_rows];
-        // Deferred slice-bound limbs for the row after IS_BOUND_SECOND (at most one per job).
+    /// One compression's eight rows: flags, program columns, message bytes, the CV-routing
+    /// fetches, the message permutation chain, and the seven round states. Pure in
+    /// `(schedule, instruction)` — no cross-compression reads — so it runs as one rayon
+    /// job. Returns the deferred slice-bound write (if this compression ends a routing
+    /// slice) and the global rows whose CV_OUT the fetches reference (for `freq`).
+    #[allow(clippy::too_many_arguments)]
+    fn fill_compression<F: RichField>(
+        &self,
+        inputs: &Blake3TraceInputs<'_>,
+        planes: &[Vec<u8>; NUM_PLANES],
+        raw_lens: &[usize; NUM_PLANES],
+        cvs_out: &[[u32; 8]],
+        c: usize,
+        instr: &Blake3Instruction,
+        m: [u32; 16],
+        cv_in: [u32; 8],
+        chunk: &mut [[F; NUM_BLAKE3_COLUMNS]],
+    ) -> (Option<(usize, [F; 2])>, Vec<usize>) {
+        assert_eq!(chunk.len(), ROWS_PER_COMPRESSION);
+        let r0 = ROWS_PER_COMPRESSION * c;
         let mut bound_write: Option<(usize, [F; 2])> = None;
+        let mut freq_incs = Vec::new();
 
-        for (c, instr) in instrs.iter().enumerate() {
-            let r0 = ROWS_PER_COMPRESSION * c;
-            let m = msgs[c];
+        // Flags, program columns, message bytes (the buffer itself is filled globally).
+        for j in 0..ROWS_PER_COMPRESSION {
+            let row: &mut Blake3ColumnsView<F> = chunk[j].borrow_mut();
+            row.trace_row_index = F::from_canonical_usize(r0 + j);
+            if j == 0 {
+                row.is_new_blake = F::ONE;
+                match instr.cv {
+                    CvSource::KeyA => row.is_use_key_a = F::ONE,
+                    CvSource::KeyB => row.is_use_key_b = F::ONE,
+                    CvSource::JackpotKey => row.is_use_jackpot_key = F::ONE,
+                    CvSource::Iv => row.is_use_iv = F::ONE,
+                    CvSource::Chain(_) => {} // IS_CV_IN doubles as the mux selector (fetch below).
+                }
+                for i in 0..8 {
+                    row.blake3_cv[i] = F::from_canonical_u32(cv_in[i]);
+                }
+            }
+            if j == 1 {
+                row.cv_route_key_or_tweak = F::from_canonical_u64(instr.tweak_packed());
+            }
+            if j == ROWS_PER_COMPRESSION - 1 {
+                row.is_last_round = F::ONE;
+                match instr.bind {
+                    Some(PublicBinding::HashA) => row.is_bind_hash_a = F::ONE,
+                    Some(PublicBinding::HashB) => row.is_bind_hash_b = F::ONE,
+                    Some(PublicBinding::HashRouting) => row.is_bind_routing_hash = F::ONE,
+                    Some(PublicBinding::HashOffsets) => row.is_bind_offsets_hash = F::ONE,
+                    _ => {}
+                }
+            }
+            if instr.bind == Some(PublicBinding::HashJackpot) {
+                row.is_bind_jackpot_hash = F::ONE; // All 8 rows (CTL filter; see columns.rs).
+            }
 
-            // Flags, program columns, message bytes (the buffer itself is filled globally).
-            for j in 0..ROWS_PER_COMPRESSION {
-                let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
-                row.trace_row_index = F::from_canonical_usize(r0 + j);
-                if j == 0 {
-                    row.is_new_blake = F::ONE;
-                    match instr.cv {
-                        CvSource::KeyA => row.is_use_key_a = F::ONE,
-                        CvSource::KeyB => row.is_use_key_b = F::ONE,
-                        CvSource::JackpotKey => row.is_use_jackpot_key = F::ONE,
-                        CvSource::Iv => row.is_use_iv = F::ONE,
-                        CvSource::Chain(_) => {} // IS_CV_IN doubles as the mux selector (fetch below).
+            match instr.msg {
+                MessageSource::PlaneBytes { plane, offset, ctl_base } => {
+                    let byte_offset = offset + NUM_UINT8 * j;
+                    let is_moe_plane = plane == PlaneId::Routing || plane == PlaneId::Offsets;
+                    set_msg_mode(row, if is_moe_plane { MODE_AUX } else { MODE_BYTES });
+                    let bytes = &planes[plane.index()][byte_offset..byte_offset + NUM_UINT8];
+                    for (i, &b) in bytes.iter().enumerate() {
+                        row.uint8_data[i] = F::from_canonical_u8(b);
                     }
-                    for i in 0..8 {
-                        row.blake3_cv[i] = F::from_canonical_u32(cvs_in[c][i]);
+                    // MoE order chains: the gates and their limb witnesses.
+                    // `set_moe_chain` fails fast if the witness words are out of order.
+                    let stream_word = |i: usize| u32::from_le_bytes(planes[plane.index()][4 * i..4 * i + 4].try_into().unwrap());
+                    let live = byte_offset + NUM_UINT8 <= raw_lens[plane.index()];
+                    match plane {
+                        // One flag per channel serves both sides: `ctl_base` already
+                        // carries the B-plane key offset, keeping the key spaces disjoint.
+                        PlaneId::AValues | PlaneId::BValues if live => {
+                            row.is_int8_message = F::ONE;
+                            row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j) as u64);
+                        }
+                        PlaneId::AScales | PlaneId::BScales if live => {
+                            row.is_scale_message = F::ONE;
+                            row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j / 2) as u64);
+                        }
+                        PlaneId::Routing => {
+                            let base = offset / 4 + 2 * j;
+                            set_outer(row, self.routing_pin_at(base), self.routing_pin_at(base + 1));
+                            let s = self.moe.as_ref().expect("routing rows imply a MoE schedule");
+                            row.is_chain_data = F::ONE;
+                            row.is_chain_strict = F::ONE;
+                            let g = 16 * s.routing_block_base() + base;
+                            let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
+                            if intra {
+                                row.is_chain_intra = F::ONE;
+                                set_moe_chain(&mut row.chain_intra_limbs, stream_word(base + 1), stream_word(base), 1);
+                            }
+                            if inter {
+                                row.is_chain_inter = F::ONE;
+                                set_moe_chain(&mut row.chain_inter_limbs, stream_word(base), stream_word(base - 1), 1);
+                            }
+                            if bound_first {
+                                // The slice's last value is `word0`: the intra gate is
+                                // off, so its limbs hold `m - 1 - word0` instead.
+                                debug_assert!(!intra, "the intra gate must be idle on the bound row");
+                                row.is_bound_first = F::ONE;
+                                row.word_pin_first = F::from_canonical_u32(s.m - 1);
+                                set_moe_chain(&mut row.chain_intra_limbs, s.m - 1, stream_word(base), 0);
+                            }
+                            if bound_second {
+                                // The slice's last value is `word1`: the next row's
+                                // inter gate is off, so its limbs hold `m - 1 - word1`.
+                                // Written after the fill loop, since that row may
+                                // belong to the next compression.
+                                row.is_bound_second = F::ONE;
+                                row.word_pin_second = F::from_canonical_u32(s.m - 1);
+                                let mut limbs = [F::ZERO; 2];
+                                set_moe_chain(&mut limbs, s.m - 1, stream_word(base + 1), 0);
+                                bound_write = Some((r0 + j + 1, limbs));
+                            }
+                        }
+                        PlaneId::Offsets => {
+                            let s = self.moe.as_ref().expect("offsets rows imply a MoE schedule");
+                            row.is_chain_data = F::ONE;
+                            let p = offset / 4 + 2 * j;
+                            for (slot, flag, pin) in [
+                                (p, &mut row.is_word_pin_first, &mut row.word_pin_first),
+                                (p + 1, &mut row.is_word_pin_second, &mut row.word_pin_second),
+                            ] {
+                                if let Some(v) = s.offsets_pin_at(slot) {
+                                    assert_eq!(
+                                        u64::from(stream_word(slot)),
+                                        v,
+                                        "offsets word {slot} differs from its public pin"
+                                    );
+                                    *flag = F::ONE;
+                                    *pin = F::from_canonical_u64(v);
+                                }
+                            }
+                            let (intra, inter) = s.offsets_chain_at(p);
+                            if intra {
+                                row.is_chain_intra = F::ONE;
+                                set_moe_chain(&mut row.chain_intra_limbs, stream_word(p + 1), stream_word(p), 0);
+                            }
+                            if inter {
+                                row.is_chain_inter = F::ONE;
+                                set_moe_chain(&mut row.chain_inter_limbs, stream_word(p), stream_word(p - 1), 0);
+                            }
+                        }
+                        _ => {} // Chunk-padding row: channel filters stay off.
                     }
                 }
-                if j == 1 {
-                    row.cv_route_key_or_tweak = F::from_canonical_u64(instr.tweak_packed());
-                }
-                if j == ROWS_PER_COMPRESSION - 1 {
-                    row.is_last_round = F::ONE;
-                    match instr.bind {
-                        Some(PublicBinding::HashA) => row.is_bind_hash_a = F::ONE,
-                        Some(PublicBinding::HashB) => row.is_bind_hash_b = F::ONE,
-                        Some(PublicBinding::HashRouting) => row.is_bind_routing_hash = F::ONE,
-                        Some(PublicBinding::HashOffsets) => row.is_bind_offsets_hash = F::ONE,
-                        _ => {}
-                    }
-                }
-                if instr.bind == Some(PublicBinding::HashJackpot) {
-                    row.is_bind_jackpot_hash = F::ONE; // All 8 rows (CTL filter; see columns.rs).
-                }
-
-                match instr.msg {
-                    MessageSource::PlaneBytes { plane, offset, ctl_base } => {
-                        let byte_offset = offset + NUM_UINT8 * j;
-                        let is_moe_plane = plane == PlaneId::Routing || plane == PlaneId::Offsets;
-                        set_msg_mode(row, if is_moe_plane { MODE_AUX } else { MODE_BYTES });
+                MessageSource::PlaneBytesSplit {
+                    plane,
+                    offset,
+                    ctl_base,
+                    skip,
+                    take,
+                    aux_idx,
+                } => {
+                    if (skip..skip + take).contains(&j) {
+                        // Opened dword: exactly a `PlaneBytes` row of the window.
+                        let byte_offset = offset + NUM_UINT8 * (j - skip);
+                        set_msg_mode(row, MODE_BYTES);
                         let bytes = &planes[plane.index()][byte_offset..byte_offset + NUM_UINT8];
                         for (i, &b) in bytes.iter().enumerate() {
                             row.uint8_data[i] = F::from_canonical_u8(b);
                         }
-                        // MoE order chains: the gates and their limb witnesses.
-                        // `set_moe_chain` fails fast if the witness words are out of order.
-                        let stream_word =
-                            |i: usize| u32::from_le_bytes(planes[plane.index()][4 * i..4 * i + 4].try_into().unwrap());
                         let live = byte_offset + NUM_UINT8 <= raw_lens[plane.index()];
                         match plane {
-                            // One flag per channel serves both sides: `ctl_base` already
-                            // carries the B-plane key offset, keeping the key spaces disjoint.
                             PlaneId::AValues | PlaneId::BValues if live => {
                                 row.is_int8_message = F::ONE;
-                                row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j) as u64);
+                                row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip)) as u64);
                             }
                             PlaneId::AScales | PlaneId::BScales if live => {
                                 row.is_scale_message = F::ONE;
-                                row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j / 2) as u64);
+                                row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip) / 2) as u64);
                             }
-                            PlaneId::Routing => {
-                                let base = offset / 4 + 2 * j;
-                                set_outer(row, self.routing_pin_at(base), self.routing_pin_at(base + 1));
-                                let s = self.moe.as_ref().expect("routing rows imply a MoE schedule");
-                                row.is_chain_data = F::ONE;
-                                row.is_chain_strict = F::ONE;
-                                let g = 16 * s.routing_block_base() + base;
-                                let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
-                                if intra {
-                                    row.is_chain_intra = F::ONE;
-                                    set_moe_chain(&mut row.chain_intra_limbs, stream_word(base + 1), stream_word(base), 1);
-                                }
-                                if inter {
-                                    row.is_chain_inter = F::ONE;
-                                    set_moe_chain(&mut row.chain_inter_limbs, stream_word(base), stream_word(base - 1), 1);
-                                }
-                                if bound_first {
-                                    // The slice's last value is `word0`: the intra gate is
-                                    // off, so its limbs hold `m - 1 - word0` instead.
-                                    debug_assert!(!intra, "the intra gate must be idle on the bound row");
-                                    row.is_bound_first = F::ONE;
-                                    row.word_pin_first = F::from_canonical_u32(s.m - 1);
-                                    set_moe_chain(&mut row.chain_intra_limbs, s.m - 1, stream_word(base), 0);
-                                }
-                                if bound_second {
-                                    // The slice's last value is `word1`: the next row's
-                                    // inter gate is off, so its limbs hold `m - 1 - word1`.
-                                    // Written after the fill loop, since that row may
-                                    // belong to the next compression.
-                                    row.is_bound_second = F::ONE;
-                                    row.word_pin_second = F::from_canonical_u32(s.m - 1);
-                                    let mut limbs = [F::ZERO; 2];
-                                    set_moe_chain(&mut limbs, s.m - 1, stream_word(base + 1), 0);
-                                    bound_write = Some((r0 + j + 1, limbs));
-                                }
-                            }
-                            PlaneId::Offsets => {
-                                let s = self.moe.as_ref().expect("offsets rows imply a MoE schedule");
-                                row.is_chain_data = F::ONE;
-                                let p = offset / 4 + 2 * j;
-                                for (slot, flag, pin) in [
-                                    (p, &mut row.is_word_pin_first, &mut row.word_pin_first),
-                                    (p + 1, &mut row.is_word_pin_second, &mut row.word_pin_second),
-                                ] {
-                                    if let Some(v) = s.offsets_pin_at(slot) {
-                                        assert_eq!(
-                                            u64::from(stream_word(slot)),
-                                            v,
-                                            "offsets word {slot} differs from its public pin"
-                                        );
-                                        *flag = F::ONE;
-                                        *pin = F::from_canonical_u64(v);
-                                    }
-                                }
-                                let (intra, inter) = s.offsets_chain_at(p);
-                                if intra {
-                                    row.is_chain_intra = F::ONE;
-                                    set_moe_chain(&mut row.chain_intra_limbs, stream_word(p + 1), stream_word(p), 0);
-                                }
-                                if inter {
-                                    row.is_chain_inter = F::ONE;
-                                    set_moe_chain(&mut row.chain_inter_limbs, stream_word(p), stream_word(p - 1), 0);
-                                }
-                            }
-                            _ => {} // Chunk-padding row: channel filters stay off.
+                            _ => {}
+                        }
+                    } else {
+                        // Unopened-neighbor dword: an auxiliary-bytes row, filters off.
+                        set_msg_mode(row, MODE_AUX);
+                        for i in 0..NUM_UINT8 {
+                            row.uint8_data[i] = F::from_canonical_u8(inputs.aux_msgs[aux_idx][NUM_UINT8 * j + i]);
                         }
                     }
-                    MessageSource::PlaneBytesSplit {
-                        plane,
-                        offset,
-                        ctl_base,
-                        skip,
-                        take,
-                        aux_idx,
-                    } => {
-                        if (skip..skip + take).contains(&j) {
-                            // Opened dword: exactly a `PlaneBytes` row of the window.
-                            let byte_offset = offset + NUM_UINT8 * (j - skip);
-                            set_msg_mode(row, MODE_BYTES);
-                            let bytes = &planes[plane.index()][byte_offset..byte_offset + NUM_UINT8];
-                            for (i, &b) in bytes.iter().enumerate() {
-                                row.uint8_data[i] = F::from_canonical_u8(b);
-                            }
-                            let live = byte_offset + NUM_UINT8 <= raw_lens[plane.index()];
-                            match plane {
-                                PlaneId::AValues | PlaneId::BValues if live => {
-                                    row.is_int8_message = F::ONE;
-                                    row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip)) as u64);
-                                }
-                                PlaneId::AScales | PlaneId::BScales if live => {
-                                    row.is_scale_message = F::ONE;
-                                    row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip) / 2) as u64);
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            // Unopened-neighbor dword: an auxiliary-bytes row, filters off.
+                }
+                MessageSource::AuxBytes { idx } => {
+                    set_msg_mode(row, MODE_AUX);
+                    for i in 0..NUM_UINT8 {
+                        row.uint8_data[i] = F::from_canonical_u8(inputs.aux_msgs[idx][NUM_UINT8 * j + i]);
+                    }
+                }
+                MessageSource::Parent { left, right } => {
+                    let (child, local) = if j < 4 { (left, j) } else { (right, j - 4) };
+                    match child {
+                        // An auxiliary sibling CV: its 32 bytes enter as 4 dword rows.
+                        CvRef::Auxiliary(idx) => {
                             set_msg_mode(row, MODE_AUX);
                             for i in 0..NUM_UINT8 {
-                                row.uint8_data[i] = F::from_canonical_u8(inputs.aux_msgs[aux_idx][NUM_UINT8 * j + i]);
+                                row.uint8_data[i] = F::from_canonical_u8(inputs.aux_cvs[idx][NUM_UINT8 * local + i]);
                             }
                         }
-                    }
-                    MessageSource::AuxBytes { idx } => {
-                        set_msg_mode(row, MODE_AUX);
-                        for i in 0..NUM_UINT8 {
-                            row.uint8_data[i] = F::from_canonical_u8(inputs.aux_msgs[idx][NUM_UINT8 * j + i]);
-                        }
-                    }
-                    MessageSource::Parent { left, right } => {
-                        let (child, local) = if j < 4 { (left, j) } else { (right, j - 4) };
-                        match child {
-                            // An auxiliary sibling CV: its 32 bytes enter as 4 dword rows.
-                            CvRef::Auxiliary(idx) => {
-                                set_msg_mode(row, MODE_AUX);
-                                for i in 0..NUM_UINT8 {
-                                    row.uint8_data[i] = F::from_canonical_u8(inputs.aux_cvs[idx][NUM_UINT8 * local + i]);
-                                }
-                            }
-                            // An in-table child: one CV-window fetch on the half's last row.
-                            CvRef::Instruction(_) if local == 3 => set_msg_mode(row, MODE_CV),
-                            CvRef::Instruction(_) => {}
-                        }
-                    }
-                    MessageSource::Lottery => {
-                        // The 16 folded words as witness bytes (BYTES2-checked like any block);
-                        // the XorFold CTL pins BLAKE3_MSG on row 0.
-                        set_msg_mode(row, MODE_AUX);
-                        for i in 0..NUM_UINT8 {
-                            row.uint8_data[i] = F::from_canonical_u8(m[2 * j + i / 4].to_le_bytes()[i % 4]);
-                        }
+                        // An in-table child: one CV-window fetch on the half's last row.
+                        CvRef::Instruction(_) if local == 3 => set_msg_mode(row, MODE_CV),
+                        CvRef::Instruction(_) => {}
                     }
                 }
-            }
-
-            // CV-routing fetches.
-            for (j, src) in instr.fetches() {
-                let src_row = ROWS_PER_COMPRESSION * src + (ROWS_PER_COMPRESSION - 1);
-                freq[src_row] += 1;
-                let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
-                row.is_cv_in = F::ONE;
-                row.cv_route_key_or_tweak = F::from_canonical_usize(src_row);
-                for i in 0..8 {
-                    row.cv_in[i] = F::from_canonical_u32(cvs_out[src][i]);
-                    // The mux (constraint 3) holds on every row: with IS_CV_IN set it forces
-                    // BLAKE3_CV = CV_IN here too (harmless off IS_NEW_BLAKE rows).
-                    row.blake3_cv[i] = F::from_canonical_u32(cvs_out[src][i]);
+                MessageSource::Lottery => {
+                    // The 16 folded words as witness bytes (BYTES2-checked like any block);
+                    // the XorFold CTL pins BLAKE3_MSG on row 0.
+                    set_msg_mode(row, MODE_AUX);
+                    for i in 0..NUM_UINT8 {
+                        row.uint8_data[i] = F::from_canonical_u8(m[2 * j + i / 4].to_le_bytes()[i % 4]);
+                    }
                 }
-                // Row-0 fetches are chunk chaining (mux path); rows 3/7 are parent window
-                // fetches — the fetched CV words ARE message words, so the sliding buffer
-                // below already carries them and the window constraint (5) closes.
-            }
-
-            // Message words: row 0 holds the message; each next row is the permutation of the
-            // previous (permute^8 = id closes against the buffer at row 7).
-            let mut msg_j = m;
-            for j in 0..ROWS_PER_COMPRESSION {
-                let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
-                for i in 0..16 {
-                    row.blake3_msg[i] = F::from_canonical_u32(msg_j[i]);
-                }
-                blake3_permute(&mut msg_j);
-            }
-            debug_assert_eq!(msg_j, m);
-
-            // Round states (rows 0..6) and the finalization row's CV_OUT bytes.
-            let mut state = init_state(&cvs_in[c], instr);
-            let mut msg_j = m;
-            for j in 0..ROWS_PER_COMPRESSION - 1 {
-                let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
-                write_state(&mut row.round[0], &state, B_ROTATIONS[0]);
-                let states = compute_blake3_round(&mut state, &msg_j);
-                for (t, s) in states[..3].iter().enumerate() {
-                    write_state(&mut row.round[t + 1], s, B_ROTATIONS[t + 1]);
-                }
-                blake3_permute(&mut msg_j);
-            }
-            let row: &mut Blake3ColumnsView<F> = rows[r0 + ROWS_PER_COMPRESSION - 1].borrow_mut();
-            write_state(&mut row.round[0], &state, B_ROTATIONS[0]);
-            for i in 0..8 {
-                write_bytes(&mut row.cv_out[i], state[i] ^ state[8 + i]);
-                debug_assert_eq!(read_bytes(&row.cv_out[i]), cvs_out[c][i]);
             }
         }
+
+        // CV-routing fetches.
+        for (j, src) in instr.fetches() {
+            let src_row = ROWS_PER_COMPRESSION * src + (ROWS_PER_COMPRESSION - 1);
+            freq_incs.push(src_row);
+            let row: &mut Blake3ColumnsView<F> = chunk[j].borrow_mut();
+            row.is_cv_in = F::ONE;
+            row.cv_route_key_or_tweak = F::from_canonical_usize(src_row);
+            for i in 0..8 {
+                row.cv_in[i] = F::from_canonical_u32(cvs_out[src][i]);
+                // The mux (constraint 3) holds on every row: with IS_CV_IN set it forces
+                // BLAKE3_CV = CV_IN here too (harmless off IS_NEW_BLAKE rows).
+                row.blake3_cv[i] = F::from_canonical_u32(cvs_out[src][i]);
+            }
+            // Row-0 fetches are chunk chaining (mux path); rows 3/7 are parent window
+            // fetches — the fetched CV words ARE message words, so the sliding buffer
+            // below already carries them and the window constraint (5) closes.
+        }
+
+        // Message words: row 0 holds the message; each next row is the permutation of the
+        // previous (permute^8 = id closes against the buffer at row 7).
+        let mut msg_j = m;
+        for j in 0..ROWS_PER_COMPRESSION {
+            let row: &mut Blake3ColumnsView<F> = chunk[j].borrow_mut();
+            for i in 0..16 {
+                row.blake3_msg[i] = F::from_canonical_u32(msg_j[i]);
+            }
+            blake3_permute(&mut msg_j);
+        }
+        debug_assert_eq!(msg_j, m);
+
+        // Round states (rows 0..6) and the finalization row's CV_OUT bytes.
+        let mut state = init_state(&cv_in, instr);
+        let mut msg_j = m;
+        for j in 0..ROWS_PER_COMPRESSION - 1 {
+            let row: &mut Blake3ColumnsView<F> = chunk[j].borrow_mut();
+            write_state(&mut row.round[0], &state, B_ROTATIONS[0]);
+            let states = compute_blake3_round(&mut state, &msg_j);
+            for (t, s) in states[..3].iter().enumerate() {
+                write_state(&mut row.round[t + 1], s, B_ROTATIONS[t + 1]);
+            }
+            blake3_permute(&mut msg_j);
+        }
+        let row: &mut Blake3ColumnsView<F> = chunk[ROWS_PER_COMPRESSION - 1].borrow_mut();
+        write_state(&mut row.round[0], &state, B_ROTATIONS[0]);
+        for i in 0..8 {
+            write_bytes(&mut row.cv_out[i], state[i] ^ state[8 + i]);
+            debug_assert_eq!(read_bytes(&row.cv_out[i]), cvs_out[c][i]);
+        }
+        (bound_write, freq_incs)
+    }
+
+    /// The tail passes after [`Self::fill_compression`]: padding rows, the sliding message
+    /// buffer (with the last->first wrap fixup), the deferred slice-bound limbs,
+    /// `chain_carry`, the finalization states 1-3, and `cv_out_freq` / `row_flags_packed`.
+    ///
+    /// Every per-row piece runs across all cores:
+    /// - the buffer is gathered per row from a materialized 2-words-per-row stream
+    ///   (`buffer[r][w] = stream[2r - 14 + w]`, zero outside the stream);
+    /// - `chain_carry` is a parallel per-chunk data scan plus a serial combine over
+    ///   chunk boundaries only (the routing/offsets data rows are a tiny fraction);
+    /// - the finalization states read own + next row's phase-1 columns — disjoint column
+    ///   sets, so the shared row backing goes through a raw base+len wrapper.
+    ///
+    /// The wrap fixup (rows 0..6 carry the last row's shifted residue; 7 rows) and the
+    /// single deferred slice-bound write stay serial, exactly as in the serial fill.
+    fn complete_rows<F: RichField>(
+        &self,
+        rows: &mut [[F; NUM_BLAKE3_COLUMNS]],
+        freq: &[u64],
+        msgs: &[[u32; 16]],
+        num_live: usize,
+        bound_write: Option<(usize, [F; 2])>,
+    ) {
+        use core::borrow::Borrow;
+        use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeIntoParIter, MaybeParChunksMut, ParallelIterator};
+
+        let num_rows = rows.len();
 
         // ---- Padding rows: IS_NEW_BLAKE with the zero CV / zero tweak / zero message. ----
-        for (r, row) in rows.iter_mut().enumerate().take(num_rows).skip(num_live) {
-            let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
-            row.is_new_blake = F::ONE;
-            row.trace_row_index = F::from_canonical_usize(r); // Constraint 8 spans padding too.
-            for i in 0..4 {
-                write_bytes(&mut row.round[0].c[i], BLAKE3_IV[i]);
-                // The finalization lookups on padding rows serve `[IV[0..4] ^ 0, 0 ^ 0]`.
-                write_bytes(&mut row.cv_out[i], BLAKE3_IV[i]);
+        rows[num_live..].par_chunks_mut(1024).enumerate().for_each(|(chunk, out)| {
+            for (i, row) in out.iter_mut().enumerate() {
+                let r = num_live + chunk * 1024 + i;
+                let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
+                row.is_new_blake = F::ONE;
+                row.trace_row_index = F::from_canonical_usize(r); // Constraint 8 spans padding too.
+                for q in 0..4 {
+                    write_bytes(&mut row.round[0].c[q], BLAKE3_IV[q]);
+                    // The finalization lookups on padding rows serve `[IV[0..4] ^ 0, 0 ^ 0]`.
+                    write_bytes(&mut row.cv_out[q], BLAKE3_IV[q]);
+                }
             }
-        }
+        });
 
         // ---- Sliding message buffer: a 16-word window over the concatenated message stream
         // ---- (2 words appended per live row; padding rows append nothing and shift zeros
         // ---- in). This makes the unconditional shift-by-2 (constraint 5a) hold everywhere,
         // ---- and the CV-window pins (5b) are consistent automatically because the fetched
         // ---- CVs are message words. Matches the deployed generator's row layout.
-        let mut buffer = [0u32; 16];
-        for r in 0..num_rows {
-            buffer = shift_buffer(&buffer);
-            if r < num_live {
-                let (c, j) = (r / ROWS_PER_COMPRESSION, r % ROWS_PER_COMPRESSION);
-                buffer[14] = msgs[c][2 * j];
-                buffer[15] = msgs[c][2 * j + 1];
+        let stream: Vec<u32> = (0..num_rows)
+            .into_par_iter()
+            .flat_map(|r| {
+                if r < num_live {
+                    let (c, j) = (r / ROWS_PER_COMPRESSION, r % ROWS_PER_COMPRESSION);
+                    [msgs[c][2 * j], msgs[c][2 * j + 1]]
+                } else {
+                    [0u32; 2]
+                }
+            })
+            .collect();
+        rows.par_chunks_mut(1024).enumerate().for_each(|(chunk, out)| {
+            for (i, row) in out.iter_mut().enumerate() {
+                let r = chunk * 1024 + i;
+                let window: [F; 16] = core::array::from_fn(|w| {
+                    // Leading rows have not filled the window yet: their lookback
+                    // indices are negative and read as zero.
+                    let idx = 2 * r as i64 - 14 + w as i64;
+                    if idx >= 0 && (idx as usize) < stream.len() {
+                        F::from_canonical_u32(stream[idx as usize])
+                    } else {
+                        F::ZERO
+                    }
+                });
+                let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
+                row.blake3_msg_buffer = window;
             }
-            let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
-            for i in 0..16 {
-                row.blake3_msg_buffer[i] = F::from_canonical_u32(buffer[i]);
-            }
-            if r % ROWS_PER_COMPRESSION == ROWS_PER_COMPRESSION - 1 && r < num_live {
-                debug_assert_eq!(buffer, msgs[r / ROWS_PER_COMPRESSION], "buffer(7) must be the message");
-            }
-        }
+        });
         // Wrap fixup: the unconditional shift also binds the last -> first row pair, so rows
         // 0..6 must carry the shifted-out residue of the last row's buffer in their prefixes
-        // (the residue never reaches any message; the deployed generator does the same).
-        let mut fwd = buffer;
-        for off in 1..=(ROWS_PER_COMPRESSION - 1) {
-            fwd = shift_buffer(&fwd);
-            let row: &mut Blake3ColumnsView<F> = rows[(num_rows - 1 + off) % num_rows].borrow_mut();
-            for i in 0..16 - 2 * off {
-                row.blake3_msg_buffer[i] = F::from_canonical_u32(fwd[i]);
+        // (the residue never reaches any message; the serial fill does the same).
+        {
+            let last = {
+                let row: &Blake3ColumnsView<F> = rows[num_rows - 1].borrow();
+                core::array::from_fn(|i| row.blake3_msg_buffer[i].to_canonical_u64() as u32)
+            };
+            let mut fwd = shift_buffer(&last);
+            for off in 1..=(ROWS_PER_COMPRESSION - 1) {
+                fwd = shift_buffer(&fwd);
+                let row: &mut Blake3ColumnsView<F> = rows[(num_rows - 1 + off) % num_rows].borrow_mut();
+                for i in 0..16 - 2 * off {
+                    row.blake3_msg_buffer[i] = F::from_canonical_u32(fwd[i]);
+                }
             }
         }
 
         // ---- Write the deferred slice bound into the row after IS_BOUND_SECOND: its inter
-        // ---- limbs are idle, since that row's word pair starts past the slice.
+        // ---- limbs are idle, since that row's word pair starts past the slice. ----
         if let Some((r, limbs)) = bound_write {
             let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
             assert_eq!(
@@ -1288,90 +1450,122 @@ impl Blake3Program {
 
         // ---- Fill `chain_carry`: each row holds the last routing/offsets word before it.
         // ---- Data rows overwrite it with their second word, all other rows copy it. The
-        // ---- first pass computes the end-of-trace value: the constraint is cyclic, so
-        // ---- row 0 checks against the last row.
-        let carry_after = |row: &Blake3ColumnsView<F>, prev: F| -> F {
-            if row.is_chain_data == F::ONE {
-                F::from_canonical_u64((0..4).map(|i| row.uint8_data[4 + i].to_canonical_u64() << (8 * i)).sum())
-            } else {
-                prev
+        // ---- constraint is cyclic (row 0 checks against the last row), so the seed is the
+        // ---- end-of-trace value. Three phases: per-chunk data lists in parallel, a serial
+        // ---- combine over the (few) data rows, then a parallel per-row merge per chunk. ----
+        const CARRY_CHUNK: usize = 8192;
+        let n_chunks = num_rows.div_ceil(CARRY_CHUNK);
+        let data_lists: Vec<Vec<(usize, u64)>> = (0..n_chunks)
+            .into_par_iter()
+            .map(|k| {
+                let r0 = k * CARRY_CHUNK;
+                let r1 = (r0 + CARRY_CHUNK).min(num_rows);
+                let mut list = Vec::new();
+                for r in r0..r1 {
+                    let row: &Blake3ColumnsView<F> = rows[r].borrow();
+                    if row.is_chain_data == F::ONE {
+                        let v = (0..4).map(|q| row.uint8_data[4 + q].to_canonical_u64() << (8 * q)).sum();
+                        list.push((r, v));
+                    }
+                }
+                list
+            })
+            .collect();
+        // Serial combine over the data rows only: `carry_into[k]` is the value entering
+        // chunk k; the cyclic seed is the last data value (the end-of-trace carry).
+        let mut carry_into = vec![0u64; n_chunks];
+        let mut running = data_lists
+            .iter()
+            .rev()
+            .find_map(|list| list.last().map(|&(_, v)| v))
+            .unwrap_or(0);
+        for (k, list) in data_lists.iter().enumerate() {
+            carry_into[k] = running;
+            for &(_, v) in list {
+                running = v;
             }
-        };
-        let mut carry = F::ZERO;
-        for row in &rows {
-            carry = carry_after(row.borrow(), carry);
         }
-        for row in rows.iter_mut() {
-            let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
-            row.chain_carry = carry;
-            carry = carry_after(row, carry);
-        }
+        rows.par_chunks_mut(CARRY_CHUNK).enumerate().for_each(|(k, out)| {
+            let list = &data_lists[k];
+            let mut idx = 0usize;
+            for (i, row) in out.iter_mut().enumerate() {
+                let r = k * CARRY_CHUNK + i;
+                while idx < list.len() && list[idx].0 < r {
+                    idx += 1;
+                }
+                // The last data row strictly before r, else the chunk-entry value.
+                let value = if idx > 0 { list[idx - 1].1 } else { carry_into[k] };
+                let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
+                row.chain_carry = F::from_canonical_u64(value);
+            }
+        });
 
-        // Finalization and padding rows still satisfy the ungated additions.
-        // Their round XORs are disabled; choose states 1..3 to connect to the next input.
-        for r in 0..num_rows {
-            let next = (r + 1) % num_rows;
-            let s4 = {
-                let next_row: &Blake3ColumnsView<F> = rows[next].borrow();
-                if next_row.is_new_blake != F::ONE {
+        // ---- Finalization and padding rows still satisfy the ungated additions.
+        // ---- Their round XORs are disabled; choose states 1..3 to connect to the next
+        // ---- input. SAFETY: each job reads phase-1 columns of its own and the next row
+        // ---- (round[0], blake3_msg, is_new_blake) and writes only round[1..3] of its own
+        // ---- rows — disjoint column sets, and each job writes only its own chunk's rows.
+        // ---- The shared row backing therefore goes through a raw base+len wrapper.
+        struct SyncRows<T> {
+            base: *mut T,
+            len: usize,
+        }
+        unsafe impl<T> Send for SyncRows<T> {}
+        unsafe impl<T> Sync for SyncRows<T> {}
+        let rows_sync = SyncRows {
+            base: rows.as_mut_ptr(),
+            len: rows.len(),
+        };
+        let rows_sync = &rows_sync;
+        rows.par_chunks_mut(1024).enumerate().for_each(|(chunk, out)| {
+            let all: &mut [[F; NUM_BLAKE3_COLUMNS]] = unsafe { core::slice::from_raw_parts_mut(rows_sync.base, rows_sync.len) };
+            for (i, row_slot) in out.iter_mut().enumerate() {
+                let r = chunk * 1024 + i;
+                let next = (r + 1) % num_rows;
+                let next_is_new = {
+                    let next_row: &Blake3ColumnsView<F> = all[next].borrow();
+                    next_row.is_new_blake == F::ONE
+                };
+                if !next_is_new {
                     continue;
                 }
-                read_state(&next_row.round[0], B_ROTATIONS[0])
-            };
-            let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
-            let msg: [u32; 16] = core::array::from_fn(|i| row.blake3_msg[i].to_canonical_u64() as u32);
-            let s0 = read_state(&row.round[0], B_ROTATIONS[0]);
-            let (mut s1, mut s2, mut s3) = ([0u32; 16], [0u32; 16], [0u32; 16]);
-            // States 1 and 2 first: the half-round-2 adds read state 2 across lanes.
-            for i in 0..4 {
-                s1[i] = s0[i].wrapping_add(s0[4 + i]).wrapping_add(msg[2 * i]);
-                s1[8 + i] = s0[8 + i];
-                s2[i] = s1[i].wrapping_add(msg[2 * i + 1]);
-                s2[8 + i] = s1[8 + i];
+                let row: &mut Blake3ColumnsView<F> = row_slot.borrow_mut();
+                let msg: [u32; 16] = core::array::from_fn(|i| row.blake3_msg[i].to_canonical_u64() as u32);
+                let s0 = read_state(&row.round[0], B_ROTATIONS[0]);
+                let s4 = {
+                    let next_row: &Blake3ColumnsView<F> = all[next].borrow();
+                    read_state(&next_row.round[0], B_ROTATIONS[0])
+                };
+                let (mut s1, mut s2, mut s3) = ([0u32; 16], [0u32; 16], [0u32; 16]);
+                // States 1 and 2 first: the half-round-2 adds read state 2 across lanes.
+                for i in 0..4 {
+                    s1[i] = s0[i].wrapping_add(s0[4 + i]).wrapping_add(msg[2 * i]);
+                    s1[8 + i] = s0[8 + i];
+                    s2[i] = s1[i].wrapping_add(msg[2 * i + 1]);
+                    s2[8 + i] = s1[8 + i];
+                }
+                for i in 0..4 {
+                    let (bi, ci, di, _) = half_round_lane(2, i);
+                    s3[i] = s2[i].wrapping_add(msg[8 + 2 * i]);
+                    s3[8 + ci] = s4[8 + ci].wrapping_sub(s4[12 + di]);
+                    s3[12 + di] = s3[8 + ci].wrapping_sub(s2[8 + ci]);
+                    s3[4 + bi] = s4[i].wrapping_sub(s3[i]).wrapping_sub(msg[8 + 2 * i + 1]);
+                }
+                write_state(&mut row.round[1], &s1, B_ROTATIONS[1]);
+                write_state(&mut row.round[2], &s2, B_ROTATIONS[2]);
+                write_state(&mut row.round[3], &s3, B_ROTATIONS[3]);
             }
-            for i in 0..4 {
-                let (bi, ci, di, _) = half_round_lane(2, i);
-                s3[i] = s2[i].wrapping_add(msg[8 + 2 * i]);
-                s3[8 + ci] = s4[8 + ci].wrapping_sub(s4[12 + di]);
-                s3[12 + di] = s3[8 + ci].wrapping_sub(s2[8 + ci]);
-                s3[4 + bi] = s4[i].wrapping_sub(s3[i]).wrapping_sub(msg[8 + 2 * i + 1]);
-            }
-            write_state(&mut row.round[1], &s1, B_ROTATIONS[1]);
-            write_state(&mut row.round[2], &s2, B_ROTATIONS[2]);
-            write_state(&mut row.round[3], &s3, B_ROTATIONS[3]);
-        }
+        });
 
         // ---- CV-routing multiplicities and the ROW_FLAGS_PACKED packing. ----
-        for (r, row) in rows.iter_mut().enumerate() {
-            let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
-            row.cv_out_freq = F::from_canonical_u64(freq[r]);
-            row.row_flags_packed = pack_control(row);
-        }
-
-        // ---- Public inputs. ----
-        let bound_cv = |bind: PublicBinding| -> [u32; 8] {
-            instrs
-                .iter()
-                .position(|i| i.bind == Some(bind))
-                .map(|i| cvs_out[i])
-                .unwrap_or([0; 8])
-        };
-        let mut pis = [F::ZERO; NUM_BLAKE3_PUBLIC_INPUTS];
-        let mut set = |base: usize, words: &[u32; 8]| {
-            for i in 0..8 {
-                pis[base + i] = F::from_canonical_u32(words[i]);
+        rows.par_chunks_mut(1024).enumerate().for_each(|(chunk, out)| {
+            for (i, row) in out.iter_mut().enumerate() {
+                let r = chunk * 1024 + i;
+                let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
+                row.cv_out_freq = F::from_canonical_u64(freq[r]);
+                row.row_flags_packed = pack_control(row);
             }
-        };
-        set(PI_KEY_A, &inputs.key_a);
-        set(PI_KEY_B, &inputs.key_b);
-        set(PI_JACKPOT_KEY, &inputs.jackpot_key);
-        set(PI_HASH_A, &bound_cv(PublicBinding::HashA));
-        set(PI_HASH_B, &bound_cv(PublicBinding::HashB));
-        set(PI_HASH_ROUTING, &bound_cv(PublicBinding::HashRouting));
-        set(PI_HASH_OFFSETS, &bound_cv(PublicBinding::HashOffsets));
-        set(PI_HASH_JACKPOT, &bound_cv(PublicBinding::HashJackpot));
-
-        (rows, pis)
+        });
     }
 
     /// The class (a) ("known") column values — the leading
@@ -1620,6 +1814,31 @@ impl Blake3Program {
             cv_route_key_or_tweak[j] = F::from_canonical_usize(ROWS_PER_COMPRESSION * src + (ROWS_PER_COMPRESSION - 1));
         }
     }
+}
+
+/// The native compression schedule of one job: the chunk-padded plane streams plus, per
+/// compression, its message, input CV, and output CV. `Blake3Program::native_schedule`
+/// builds it once; the per-compression row fill and the tail passes read it concurrently.
+pub(crate) struct Blake3NativeSchedule {
+    pub(crate) planes: [Vec<u8>; NUM_PLANES],
+    pub(crate) raw_lens: [usize; NUM_PLANES],
+    pub(crate) msgs: Vec<[u32; 16]>,
+    pub(crate) cvs_in: Vec<[u32; 8]>,
+    pub(crate) cvs_out: Vec<[u32; 8]>,
+}
+
+/// A row matrix of `N`-column rows allocated zeroed without a serial memset: the kernel
+/// provides lazy zero pages, which the fill then fully overwrites. The allocation is
+/// `num_rows * N` field elements, one contiguous block.
+pub(crate) fn calloc_rows<F: RichField, const N: usize>(num_rows: usize) -> Vec<[F; N]> {
+    let layout = std::alloc::Layout::array::<[F; N]>(num_rows).expect("row matrix layout overflows");
+    // SAFETY: `alloc_zeroed` returns a valid, aligned, zeroed block of `layout` bytes; the
+    // field elements of every supported field are all-zero bit patterns for zero, so the
+    // zeroed memory is a valid `[F; N]` row matrix.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut [F; N];
+    // SAFETY: `ptr` covers exactly `num_rows` initialized rows and the allocation is
+    // uniquely owned here.
+    unsafe { Vec::from_raw_parts(ptr, num_rows, num_rows) }
 }
 
 /// Witness inputs of one job's hashing trace: the committed plane bytes (opened strips), the
@@ -3629,5 +3848,361 @@ mod tests {
             instructions: vec![],
         };
         let _ = Blake3Program::from_blake_program(&blake_proof, k, vec![], None);
+    }
+
+    /// The pre-parallel `generate_trace` fill: the serial loop over compressions followed
+    /// by the serial tail. Kept row-for-row as the correctness reference for the parallel
+    /// fill — the two must produce identical rows on every geometry the tests build.
+    fn serial_fill_rows<F: RichField>(
+        program: &Blake3Program,
+        inputs: &Blake3TraceInputs<'_>,
+        schedule: &Blake3NativeSchedule,
+    ) -> Vec<[F; NUM_BLAKE3_COLUMNS]> {
+        use core::borrow::Borrow;
+
+        let Blake3NativeSchedule {
+            planes,
+            raw_lens,
+            msgs,
+            cvs_in,
+            cvs_out,
+        } = schedule;
+        let instrs = &program.instructions;
+        let num_live = program.num_live_rows();
+        let num_rows = program.num_rows();
+        let mut rows: Vec<[F; NUM_BLAKE3_COLUMNS]> = vec![[F::ZERO; NUM_BLAKE3_COLUMNS]; num_rows];
+        let mut freq = vec![0u64; num_rows];
+        let mut bound_write: Option<(usize, [F; 2])> = None;
+
+        for (c, instr) in instrs.iter().enumerate() {
+            let r0 = ROWS_PER_COMPRESSION * c;
+            let m = msgs[c];
+
+            for j in 0..ROWS_PER_COMPRESSION {
+                let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
+                row.trace_row_index = F::from_canonical_usize(r0 + j);
+                if j == 0 {
+                    row.is_new_blake = F::ONE;
+                    match instr.cv {
+                        CvSource::KeyA => row.is_use_key_a = F::ONE,
+                        CvSource::KeyB => row.is_use_key_b = F::ONE,
+                        CvSource::JackpotKey => row.is_use_jackpot_key = F::ONE,
+                        CvSource::Iv => row.is_use_iv = F::ONE,
+                        CvSource::Chain(_) => {}
+                    }
+                    for i in 0..8 {
+                        row.blake3_cv[i] = F::from_canonical_u32(cvs_in[c][i]);
+                    }
+                }
+                if j == 1 {
+                    row.cv_route_key_or_tweak = F::from_canonical_u64(instr.tweak_packed());
+                }
+                if j == ROWS_PER_COMPRESSION - 1 {
+                    row.is_last_round = F::ONE;
+                    match instr.bind {
+                        Some(PublicBinding::HashA) => row.is_bind_hash_a = F::ONE,
+                        Some(PublicBinding::HashB) => row.is_bind_hash_b = F::ONE,
+                        Some(PublicBinding::HashRouting) => row.is_bind_routing_hash = F::ONE,
+                        Some(PublicBinding::HashOffsets) => row.is_bind_offsets_hash = F::ONE,
+                        _ => {}
+                    }
+                }
+                if instr.bind == Some(PublicBinding::HashJackpot) {
+                    row.is_bind_jackpot_hash = F::ONE;
+                }
+
+                match instr.msg {
+                    MessageSource::PlaneBytes { plane, offset, ctl_base } => {
+                        let byte_offset = offset + NUM_UINT8 * j;
+                        let is_moe_plane = plane == PlaneId::Routing || plane == PlaneId::Offsets;
+                        set_msg_mode(row, if is_moe_plane { MODE_AUX } else { MODE_BYTES });
+                        let bytes = &planes[plane.index()][byte_offset..byte_offset + NUM_UINT8];
+                        for (i, &b) in bytes.iter().enumerate() {
+                            row.uint8_data[i] = F::from_canonical_u8(b);
+                        }
+                        let stream_word =
+                            |i: usize| u32::from_le_bytes(planes[plane.index()][4 * i..4 * i + 4].try_into().unwrap());
+                        let live = byte_offset + NUM_UINT8 <= raw_lens[plane.index()];
+                        match plane {
+                            PlaneId::AValues | PlaneId::BValues if live => {
+                                row.is_int8_message = F::ONE;
+                                row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j) as u64);
+                            }
+                            PlaneId::AScales | PlaneId::BScales if live => {
+                                row.is_scale_message = F::ONE;
+                                row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j / 2) as u64);
+                            }
+                            PlaneId::Routing => {
+                                let base = offset / 4 + 2 * j;
+                                set_outer(row, program.routing_pin_at(base), program.routing_pin_at(base + 1));
+                                let s = program.moe.as_ref().expect("routing rows imply a MoE schedule");
+                                row.is_chain_data = F::ONE;
+                                row.is_chain_strict = F::ONE;
+                                let g = 16 * s.routing_block_base() + base;
+                                let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
+                                if intra {
+                                    row.is_chain_intra = F::ONE;
+                                    set_moe_chain(&mut row.chain_intra_limbs, stream_word(base + 1), stream_word(base), 1);
+                                }
+                                if inter {
+                                    row.is_chain_inter = F::ONE;
+                                    set_moe_chain(&mut row.chain_inter_limbs, stream_word(base), stream_word(base - 1), 1);
+                                }
+                                if bound_first {
+                                    row.is_bound_first = F::ONE;
+                                    row.word_pin_first = F::from_canonical_u32(s.m - 1);
+                                    set_moe_chain(&mut row.chain_intra_limbs, s.m - 1, stream_word(base), 0);
+                                }
+                                if bound_second {
+                                    row.is_bound_second = F::ONE;
+                                    row.word_pin_second = F::from_canonical_u32(s.m - 1);
+                                    let mut limbs = [F::ZERO; 2];
+                                    set_moe_chain(&mut limbs, s.m - 1, stream_word(base + 1), 0);
+                                    bound_write = Some((r0 + j + 1, limbs));
+                                }
+                            }
+                            PlaneId::Offsets => {
+                                let s = program.moe.as_ref().expect("offsets rows imply a MoE schedule");
+                                row.is_chain_data = F::ONE;
+                                let p = offset / 4 + 2 * j;
+                                for (slot, flag, pin) in [
+                                    (p, &mut row.is_word_pin_first, &mut row.word_pin_first),
+                                    (p + 1, &mut row.is_word_pin_second, &mut row.word_pin_second),
+                                ] {
+                                    if let Some(v) = s.offsets_pin_at(slot) {
+                                        assert_eq!(
+                                            u64::from(stream_word(slot)),
+                                            v,
+                                            "offsets word {slot} differs from its public pin"
+                                        );
+                                        *flag = F::ONE;
+                                        *pin = F::from_canonical_u64(v);
+                                    }
+                                }
+                                let (intra, inter) = s.offsets_chain_at(p);
+                                if intra {
+                                    row.is_chain_intra = F::ONE;
+                                    set_moe_chain(&mut row.chain_intra_limbs, stream_word(p + 1), stream_word(p), 0);
+                                }
+                                if inter {
+                                    row.is_chain_inter = F::ONE;
+                                    set_moe_chain(&mut row.chain_inter_limbs, stream_word(p), stream_word(p - 1), 0);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    MessageSource::PlaneBytesSplit {
+                        plane,
+                        offset,
+                        ctl_base,
+                        skip,
+                        take,
+                        aux_idx,
+                    } => {
+                        if (skip..skip + take).contains(&j) {
+                            let byte_offset = offset + NUM_UINT8 * (j - skip);
+                            set_msg_mode(row, MODE_BYTES);
+                            let bytes = &planes[plane.index()][byte_offset..byte_offset + NUM_UINT8];
+                            for (i, &b) in bytes.iter().enumerate() {
+                                row.uint8_data[i] = F::from_canonical_u8(b);
+                            }
+                            let live = byte_offset + NUM_UINT8 <= raw_lens[plane.index()];
+                            match plane {
+                                PlaneId::AValues | PlaneId::BValues if live => {
+                                    row.is_int8_message = F::ONE;
+                                    row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip)) as u64);
+                                }
+                                PlaneId::AScales | PlaneId::BScales if live => {
+                                    row.is_scale_message = F::ONE;
+                                    row.ctl_key_base = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip) / 2) as u64);
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            set_msg_mode(row, MODE_AUX);
+                            for i in 0..NUM_UINT8 {
+                                row.uint8_data[i] = F::from_canonical_u8(inputs.aux_msgs[aux_idx][NUM_UINT8 * j + i]);
+                            }
+                        }
+                    }
+                    MessageSource::AuxBytes { idx } => {
+                        set_msg_mode(row, MODE_AUX);
+                        for i in 0..NUM_UINT8 {
+                            row.uint8_data[i] = F::from_canonical_u8(inputs.aux_msgs[idx][NUM_UINT8 * j + i]);
+                        }
+                    }
+                    MessageSource::Parent { left, right } => {
+                        let (child, local) = if j < 4 { (left, j) } else { (right, j - 4) };
+                        match child {
+                            CvRef::Auxiliary(idx) => {
+                                set_msg_mode(row, MODE_AUX);
+                                for i in 0..NUM_UINT8 {
+                                    row.uint8_data[i] = F::from_canonical_u8(inputs.aux_cvs[idx][NUM_UINT8 * local + i]);
+                                }
+                            }
+                            CvRef::Instruction(_) if local == 3 => set_msg_mode(row, MODE_CV),
+                            CvRef::Instruction(_) => {}
+                        }
+                    }
+                    MessageSource::Lottery => {
+                        set_msg_mode(row, MODE_AUX);
+                        for i in 0..NUM_UINT8 {
+                            row.uint8_data[i] = F::from_canonical_u8(m[2 * j + i / 4].to_le_bytes()[i % 4]);
+                        }
+                    }
+                }
+            }
+
+            for (j, src) in instr.fetches() {
+                let src_row = ROWS_PER_COMPRESSION * src + (ROWS_PER_COMPRESSION - 1);
+                freq[src_row] += 1;
+                let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
+                row.is_cv_in = F::ONE;
+                row.cv_route_key_or_tweak = F::from_canonical_usize(src_row);
+                for i in 0..8 {
+                    row.cv_in[i] = F::from_canonical_u32(cvs_out[src][i]);
+                    row.blake3_cv[i] = F::from_canonical_u32(cvs_out[src][i]);
+                }
+            }
+
+            let mut msg_j = m;
+            for j in 0..ROWS_PER_COMPRESSION {
+                let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
+                for i in 0..16 {
+                    row.blake3_msg[i] = F::from_canonical_u32(msg_j[i]);
+                }
+                blake3_permute(&mut msg_j);
+            }
+
+            let mut state = init_state(&cvs_in[c], instr);
+            let mut msg_j = m;
+            for j in 0..ROWS_PER_COMPRESSION - 1 {
+                let row: &mut Blake3ColumnsView<F> = rows[r0 + j].borrow_mut();
+                write_state(&mut row.round[0], &state, B_ROTATIONS[0]);
+                let states = compute_blake3_round(&mut state, &msg_j);
+                for (t, s) in states[..3].iter().enumerate() {
+                    write_state(&mut row.round[t + 1], s, B_ROTATIONS[t + 1]);
+                }
+                blake3_permute(&mut msg_j);
+            }
+            let row: &mut Blake3ColumnsView<F> = rows[r0 + ROWS_PER_COMPRESSION - 1].borrow_mut();
+            write_state(&mut row.round[0], &state, B_ROTATIONS[0]);
+            for i in 0..8 {
+                write_bytes(&mut row.cv_out[i], state[i] ^ state[8 + i]);
+            }
+        }
+
+        for (r, row) in rows.iter_mut().enumerate().take(num_rows).skip(num_live) {
+            let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
+            row.is_new_blake = F::ONE;
+            row.trace_row_index = F::from_canonical_usize(r);
+            for q in 0..4 {
+                write_bytes(&mut row.round[0].c[q], BLAKE3_IV[q]);
+                write_bytes(&mut row.cv_out[q], BLAKE3_IV[q]);
+            }
+        }
+
+        let mut buffer = [0u32; 16];
+        for r in 0..num_rows {
+            buffer = shift_buffer(&buffer);
+            if r < num_live {
+                let (c, j) = (r / ROWS_PER_COMPRESSION, r % ROWS_PER_COMPRESSION);
+                buffer[14] = msgs[c][2 * j];
+                buffer[15] = msgs[c][2 * j + 1];
+            }
+            let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
+            for i in 0..16 {
+                row.blake3_msg_buffer[i] = F::from_canonical_u32(buffer[i]);
+            }
+        }
+        let mut fwd = buffer;
+        for off in 1..=(ROWS_PER_COMPRESSION - 1) {
+            fwd = shift_buffer(&fwd);
+            let row: &mut Blake3ColumnsView<F> = rows[(num_rows - 1 + off) % num_rows].borrow_mut();
+            for i in 0..16 - 2 * off {
+                row.blake3_msg_buffer[i] = F::from_canonical_u32(fwd[i]);
+            }
+        }
+
+        if let Some((r, limbs)) = bound_write {
+            let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
+            row.chain_inter_limbs = limbs;
+        }
+
+        let carry_after = |row: &Blake3ColumnsView<F>, prev: F| -> F {
+            if row.is_chain_data == F::ONE {
+                F::from_canonical_u64((0..4).map(|i| row.uint8_data[4 + i].to_canonical_u64() << (8 * i)).sum())
+            } else {
+                prev
+            }
+        };
+        let mut carry = F::ZERO;
+        for row in &rows {
+            carry = carry_after(row.borrow(), carry);
+        }
+        for row in rows.iter_mut() {
+            let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
+            row.chain_carry = carry;
+            carry = carry_after(row, carry);
+        }
+
+        for r in 0..num_rows {
+            let next = (r + 1) % num_rows;
+            let s4 = {
+                let next_row: &Blake3ColumnsView<F> = rows[next].borrow();
+                if next_row.is_new_blake != F::ONE {
+                    continue;
+                }
+                read_state(&next_row.round[0], B_ROTATIONS[0])
+            };
+            let row: &mut Blake3ColumnsView<F> = rows[r].borrow_mut();
+            let msg: [u32; 16] = core::array::from_fn(|i| row.blake3_msg[i].to_canonical_u64() as u32);
+            let s0 = read_state(&row.round[0], B_ROTATIONS[0]);
+            let (mut s1, mut s2, mut s3) = ([0u32; 16], [0u32; 16], [0u32; 16]);
+            for i in 0..4 {
+                s1[i] = s0[i].wrapping_add(s0[4 + i]).wrapping_add(msg[2 * i]);
+                s1[8 + i] = s0[8 + i];
+                s2[i] = s1[i].wrapping_add(msg[2 * i + 1]);
+                s2[8 + i] = s1[8 + i];
+            }
+            for i in 0..4 {
+                let (bi, ci, di, _) = half_round_lane(2, i);
+                s3[i] = s2[i].wrapping_add(msg[8 + 2 * i]);
+                s3[8 + ci] = s4[8 + ci].wrapping_sub(s4[12 + di]);
+                s3[12 + di] = s3[8 + ci].wrapping_sub(s2[8 + ci]);
+                s3[4 + bi] = s4[i].wrapping_sub(s3[i]).wrapping_sub(msg[8 + 2 * i + 1]);
+            }
+            write_state(&mut row.round[1], &s1, B_ROTATIONS[1]);
+            write_state(&mut row.round[2], &s2, B_ROTATIONS[2]);
+            write_state(&mut row.round[3], &s3, B_ROTATIONS[3]);
+        }
+
+        for (r, row) in rows.iter_mut().enumerate() {
+            let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
+            row.cv_out_freq = F::from_canonical_u64(freq[r]);
+            row.row_flags_packed = pack_control(row);
+        }
+        rows
+    }
+
+    /// The parallel `generate_trace` fill must equal the serial reference row for row, on
+    /// both dense and MoE geometries (the MoE case exercises the routing/offsets chain
+    /// tail, the pins, and the deferred slice-bound write).
+    #[test]
+    fn blake3_parallel_fill_matches_serial() {
+        type F = GoldilocksField;
+        for (h, w, k, routing_blocks) in [(4usize, 4usize, 64usize, 0usize), (2, 8, 128, 3)] {
+            let program = compile_forest(h, w, k, routing_blocks);
+            let data = TestData::new(h, w, k, routing_blocks);
+            let inputs = data.inputs();
+            let (par_rows, _) = program.generate_trace::<F>(&inputs);
+            let schedule = program.native_schedule(&inputs);
+            let ser_rows = serial_fill_rows::<F>(&program, &inputs, &schedule);
+            assert_eq!(par_rows.len(), ser_rows.len(), "row counts differ");
+            if let Some(row) = par_rows.iter().zip(ser_rows.iter()).position(|(a, b)| a != b) {
+                panic!("parallel fill differs from serial at row {row} (h={h} w={w} k={k} r={routing_blocks})");
+            }
+        }
     }
 }

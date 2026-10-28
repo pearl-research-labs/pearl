@@ -149,6 +149,7 @@
 
 use core::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::packed::PackedField;
@@ -161,16 +162,18 @@ use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
 use super::columns::{
-    B_KEY_OFFSET_PUBLIC_INPUT, B_LIVE_BOUND_PUBLIC_INPUT, Bf16FieldsView, BlockL2Columns, FmaBlockView, InputQuantColumnsView,
-    K_PUBLIC_INPUT, MulBlockView, MulDecodeBlockView, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_KNOWN_COLUMNS,
-    NUM_INPUT_QUANT_PUBLIC_INPUTS, WL2_POW_PUBLIC_INPUT,
+    B_KEY_OFFSET_PUBLIC_INPUT, B_LIVE_BOUND_PUBLIC_INPUT, Bf16FieldsView, BlockL2Columns, FmaBlockView, INPUT_QUANT_COL_MAP,
+    InputQuantColumnsView, K_PUBLIC_INPUT, MulBlockView, MulDecodeBlockView, NUM_INPUT_QUANT_COLUMNS,
+    NUM_INPUT_QUANT_KNOWN_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS, WL2_POW_PUBLIC_INPUT,
 };
 use crate::v4::api::compute::{bf16_clamp_sym, bf16_fma, bf16_max, bf16_mul};
 use crate::v4::api::dtype::{bf16_to_f32, f32_to_fp8_e4m3};
 use crate::v4::api::prequant::{BLOCK_SIZE, l2_frame_width};
 use crate::v4::api::public_params::Device;
 use crate::v4::api::quantization::Fp8E4M3Quant;
-use crate::v4::circuit::scale_stark::stark::{CUT_BIAS, NORM_FLOOR_CODE, SLOT_MAX, rne_sqrt_hat, rnernd_reference};
+use crate::v4::circuit::scale_stark::stark::{
+    CUT_BIAS, NORM_FLOOR_CODE, SLOT_MAX, ScaleRowTuple, rne_sqrt_hat, rnernd_reference,
+};
 use crate::v4::circuit::unpredictability::{LambdaWitness, lambda_witness};
 use crate::v4::circuit::utils::evaluator::Evaluator;
 use crate::v4::circuit::utils::native_evaluator::NativeEvaluator;
@@ -239,6 +242,234 @@ impl InputQuantProgram {
         l2_frame_width(self.k).expect("sanctioned k")
     }
 
+    /// The per-group side witnesses plus the compact per-side outputs the downstream
+    /// tables read (fp8 codes, summand scores, and the per-matrix-row CTL tuples) —
+    /// everything the trace fills and the driver's downstream inputs need, built once.
+    ///
+    /// Dead sides share one canonical witness by `Arc`: every dead side's build takes
+    /// all-zero inputs with `live = false`, so all full-length dead builds are
+    /// value-identical, and the (many) trailing dead groups avoid rebuilding the
+    /// gadget arithmetic. The (group, side) jobs are fused into one flat parallel
+    /// space, halving the grain versus one job per group.
+    pub(crate) fn build_native(
+        &self,
+        a_int8: &[i8],
+        a_scales: &[u16],
+        a_noise: &[u16],
+        b_int8: &[i8],
+        b_scales: &[u16],
+        b_noise: &[u16],
+    ) -> InputQuantNative {
+        use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
+
+        let (h, w, k) = (self.h, self.w, self.k);
+        let num_rows = self.num_rows();
+        assert_eq!(a_int8.len(), h * k, "a_int8 must be h*k values");
+        assert_eq!(b_int8.len(), w * k, "b_int8 must be w*k values");
+        assert_eq!(a_scales.len(), h * k / BLOCK_SIZE, "a_scales must be h*k/8 codes");
+        assert_eq!(b_scales.len(), w * k / BLOCK_SIZE, "b_scales must be w*k/8 codes");
+        assert_eq!(a_noise.len(), h * k, "a_noise must be h*k codes");
+        assert_eq!(b_noise.len(), w * k, "b_noise must be w*k codes");
+        let n_groups = num_rows.div_ceil(k);
+        let blocks = k / BLOCK_SIZE;
+        let zero_int8 = vec![0i8; k];
+        let zero_scales = vec![0u16; k / BLOCK_SIZE];
+        let zero_noise = vec![0u16; k];
+
+        // One side's group-tuple CTL entry, from its last element's block-L2 state — the
+        // same aggregate the old driver read back off the group-final trace row.
+        let tuple_of = |side: &SideWitness| {
+            let last = &side.elements[k - 1];
+            ScaleRowTuple {
+                l2_frame_sum: last.blk.running_l2_frame_sum,
+                frame_doubled_scale_exponent: side.scales.frame_doubled_scale_exponent as u32,
+                max_abs: last.max_abs as u32,
+                dead_count: last.dead_count as u32,
+            }
+        };
+
+        // Dead-side canonical witness: every dead side's build takes all-zero inputs
+        // with `live = false`, so all full-length dead builds are value-identical.
+        // Build one canonical witness and share it by Arc (the short trailing group
+        // reads only `elements[0..len]`).
+        let dead_canonical: Arc<SideWitness> = Arc::new(SideWitness::build(self, &zero_int8, &zero_scales, &zero_noise, false));
+        /// One (group, side) job's output: the side witness (shared for dead slots),
+        /// the noised fp8 codes, the jackpot lambdas, and the live group-tuple CTL
+        /// entry (dead sides contribute none).
+        type SideOutput = (Arc<SideWitness>, Vec<u8>, Vec<u64>, Option<ScaleRowTuple>);
+        let built: Vec<SideOutput> = (0..2 * n_groups)
+            .into_par_iter()
+            .map(|job| {
+                let (g, is_a) = (job / 2, job % 2 == 0);
+                let live = if is_a { g < h } else { g < w };
+                if !live {
+                    return (Arc::clone(&dead_canonical), Vec::new(), Vec::new(), None);
+                }
+                let (int8, scales, noise) = if is_a {
+                    (
+                        &a_int8[g * k..(g + 1) * k],
+                        &a_scales[g * blocks..(g + 1) * blocks],
+                        &a_noise[g * k..(g + 1) * k],
+                    )
+                } else {
+                    (
+                        &b_int8[g * k..(g + 1) * k],
+                        &b_scales[g * blocks..(g + 1) * blocks],
+                        &b_noise[g * k..(g + 1) * k],
+                    )
+                };
+                let side = Arc::new(SideWitness::build(self, int8, scales, noise, true));
+                let codes: Vec<u8> = side.elements.iter().map(|e| e.code_noised).collect();
+                let lambdas: Vec<u64> = side.elements.iter().map(|e| e.score.lambda).collect();
+                let tuple = tuple_of(&side);
+                (side, codes, lambdas, Some(tuple))
+            })
+            .collect();
+
+        // Reassemble in (group, side-A-then-B) order.
+        let mut native = InputQuantNative {
+            groups: Vec::with_capacity(n_groups),
+            a_codes: Vec::with_capacity(h * k),
+            b_codes: Vec::with_capacity(w * k),
+            a_lambdas: Vec::with_capacity(h * k),
+            b_lambdas: Vec::with_capacity(w * k),
+            a_tuples: Vec::with_capacity(h),
+            b_tuples: Vec::with_capacity(w),
+        };
+        let mut built_iter = built.into_iter();
+        for _ in 0..n_groups {
+            let (side_a, a_codes, a_lambdas, a_tuple) = built_iter.next().expect("A side output");
+            let (side_b, b_codes, b_lambdas, b_tuple) = built_iter.next().expect("B side output");
+            native.groups.push((side_a, side_b));
+            native.a_codes.extend(a_codes);
+            native.b_codes.extend(b_codes);
+            native.a_lambdas.extend(a_lambdas);
+            native.b_lambdas.extend(b_lambdas);
+            if let Some(tuple) = a_tuple {
+                native.a_tuples.push(tuple);
+            }
+            if let Some(tuple) = b_tuple {
+                native.b_tuples.push(tuple);
+            }
+        }
+        native
+    }
+
+    /// Fills the trace column-major: `cols[c][r]` is column `c` of row `r`, exactly
+    /// `column_major(&rows)` of [`Self::generate_trace`]'s output (including the row-0
+    /// blinding), with no intermediate row matrix and no transpose pass. Row-tile
+    /// workers compute each row once and scatter into the destination columns; the
+    /// flip witnesses use direct inversions of `element_index - limit` (value-identical
+    /// to `generate_trace`'s per-group Montgomery batches: each element's flip is
+    /// exactly `1/d`, zero when `d = 0`).
+    ///
+    /// `cols.len()` must be `NUM_INPUT_QUANT_COLUMNS` and every column `num_rows` long.
+    #[allow(clippy::field_reassign_with_default)]
+    pub(crate) fn fill_columns<F: RichField>(&self, native: &InputQuantNative, cols: &mut [&mut [F]]) {
+        use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
+
+        let (h, w, k) = (self.h, self.w, self.k);
+        let num_rows = self.num_rows();
+        assert_eq!(
+            native.groups.len(),
+            num_rows.div_ceil(k),
+            "native groups must cover the trace"
+        );
+        assert_eq!(cols.len(), NUM_INPUT_QUANT_COLUMNS, "direct fill destination width");
+        for col in cols.iter() {
+            assert_eq!(col.len(), num_rows, "direct fill column length");
+        }
+        const TILE: usize = 4096;
+
+        let group_final_inv: Vec<F> = (0..k)
+            .map(|j| {
+                (F::from_canonical_usize(j) - F::from_canonical_usize(k - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let block8_inv: [F; BLOCK_SIZE] = std::array::from_fn(|b| {
+            (F::from_canonical_usize(b) - F::from_canonical_usize(BLOCK_SIZE - 1))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        });
+
+        // Row-tile workers: compute rows, scatter fields into the destination columns.
+        // SAFETY: tile workers own disjoint row ranges and write only their own rows'
+        // slots — no two workers touch the same (column, row) — but the shared column
+        // vecs cannot be proven disjoint by the borrow checker, so go through a raw
+        // base pointer + length once. The wrapper only re-exports the pointer.
+        struct SyncCols<T> {
+            base: *mut T,
+            len: usize,
+        }
+        unsafe impl<T> Send for SyncCols<T> {}
+        unsafe impl<T> Sync for SyncCols<T> {}
+        let cols_ptr = SyncCols {
+            base: cols.as_mut_ptr(),
+            len: cols.len(),
+        };
+        // Rebind through a reference: without this, disjoint capture would grab the
+        // raw-pointer field directly, bypassing the manual Sync impl above.
+        let cols_ptr = &cols_ptr;
+        (0..num_rows.div_ceil(TILE)).into_par_iter().for_each(|tile| {
+            let cols: &mut [&mut [F]] = unsafe { core::slice::from_raw_parts_mut(cols_ptr.base, cols_ptr.len) };
+            let r0 = tile * TILE;
+            let r1 = (r0 + TILE).min(num_rows);
+            for r in r0..r1 {
+                let element_index = r;
+                let g = element_index / k;
+                let j = element_index % k;
+                let start = g * k;
+                let len = k.min(num_rows - start);
+                let (a_live, b_live) = (g < h, g < w);
+                let (side_a, side_b) = &native.groups[g];
+                // Value-identical to `generate_trace`'s batch flip: each element's flip
+                // is `1/d_j` with `d_j = (start+j) - limit`, zero when `d_j = 0`.
+                let flip = |limit: usize| -> F {
+                    let d = F::from_canonical_usize(element_index) - F::from_canonical_usize(limit);
+                    d.try_inverse().unwrap_or(F::ZERO)
+                };
+                let mut row = InputQuantColumnsView::<F>::default();
+                row.is_group_final = F::from_bool(j == len - 1);
+                row.element_index = F::from_canonical_usize(element_index);
+                row.is_even_row = F::from_bool(element_index % 2 == 0);
+                row.is_block_start = F::from_bool(element_index % BLOCK_SIZE == 0);
+                row.block_index = F::from_canonical_usize(element_index / BLOCK_SIZE);
+                row.a_live = F::from_bool(a_live);
+                row.b_live = F::from_bool(b_live);
+                row.group_counter = F::from_canonical_usize(j);
+                row.group_final_inv = group_final_inv[j];
+                row.block8_counter = F::from_canonical_usize(element_index % BLOCK_SIZE);
+                row.block8_counter_inv = block8_inv[element_index % BLOCK_SIZE];
+                row.a_flip_inv = flip(h * k);
+                row.b_flip_inv = flip(w * k);
+                side_a.fill_a(&mut row, j);
+                side_b.fill_b(&mut row, j);
+                // Pack the noise decodes for the verifier-known columns.
+                row.noise_code_a = bf16_code_of(&row.noise_a);
+                row.noise_code_b = bf16_code_of(&row.noise_b);
+                // Scatter: one write per column, into this row's slot.
+                let flat: [F; NUM_INPUT_QUANT_COLUMNS] = row.into();
+                for (c, value) in flat.iter().enumerate() {
+                    cols[c][r] = *value;
+                }
+            }
+        });
+
+        // Blinding: same cells, same semantics as `generate_trace`'s row-0 randomization.
+        let [a_rem, a_comp, b_rem, b_comp] = [
+            INPUT_QUANT_COL_MAP.block_l2_a.shift_remainder_power,
+            INPUT_QUANT_COL_MAP.block_l2_a.shift_complement_power,
+            INPUT_QUANT_COL_MAP.block_l2_b.shift_remainder_power,
+            INPUT_QUANT_COL_MAP.block_l2_b.shift_complement_power,
+        ];
+        cols[a_rem][0] = F::rand();
+        cols[a_comp][0] = F::rand();
+        cols[b_rem][0] = F::rand();
+        cols[b_comp][0] = F::rand();
+    }
+
     /// Generates the InputQuantStark trace and public inputs.
     ///
     /// - `a_int8` / `b_int8`: the int8 values planes, row-major (`h*k` resp. `w*k` values; the
@@ -279,80 +510,118 @@ impl InputQuantProgram {
         let zero_scales = vec![0u16; k / BLOCK_SIZE];
         let zero_noise = vec![0u16; k];
 
-        let mut rows: Vec<[F; NUM_INPUT_QUANT_COLUMNS]> = Vec::with_capacity(num_rows);
-        let mut start = 0;
-        while start < num_rows {
-            let g = start / k;
-            let len = k.min(num_rows - start);
-            let blocks = k / BLOCK_SIZE;
-            let (a_live, b_live) = (g < h, g < w);
-            let side_a = if a_live {
-                SideWitness::build(
-                    self,
-                    &a_int8[g * k..(g + 1) * k],
-                    &a_scales[g * blocks..(g + 1) * blocks],
-                    &a_noise[g * k..(g + 1) * k],
-                    true,
-                )
-            } else {
-                SideWitness::build(
-                    self,
-                    &zero_int8[..len],
-                    &zero_scales[..len / BLOCK_SIZE],
-                    &zero_noise[..len],
-                    false,
-                )
-            };
-            let side_b = if b_live {
-                SideWitness::build(
-                    self,
-                    &b_int8[g * k..(g + 1) * k],
-                    &b_scales[g * blocks..(g + 1) * blocks],
-                    &b_noise[g * k..(g + 1) * k],
-                    true,
-                )
-            } else {
-                SideWitness::build(
-                    self,
-                    &zero_int8[..len],
-                    &zero_scales[..len / BLOCK_SIZE],
-                    &zero_noise[..len],
-                    false,
-                )
-            };
-            for j in 0..len {
-                let mut row = InputQuantColumnsView::<F>::default();
-                let element_index = start + j;
-                row.is_group_final = F::from_bool(j == len - 1);
-                row.element_index = F::from_canonical_usize(element_index);
-                row.is_even_row = F::from_bool(element_index % 2 == 0);
-                row.is_block_start = F::from_bool(element_index % BLOCK_SIZE == 0);
-                row.block_index = F::from_canonical_usize(element_index / BLOCK_SIZE);
-                row.a_live = F::from_bool(a_live);
-                row.b_live = F::from_bool(b_live);
-                // Group-G counters and inverse witnesses for the schedule flags.
-                row.group_counter = F::from_canonical_usize(j);
-                row.group_final_inv = (row.group_counter - F::from_canonical_usize(k - 1))
+        // Groups are independent: one parallel job per group fills its chunk of rows. The
+        // per-row inverse witnesses take few distinct values each — the block and group
+        // finals as tiny tables, the flip witnesses via one Montgomery batch inversion
+        // per group (3 field mults per element instead of a full inversion each).
+        let group_final_inv: Vec<F> = (0..k)
+            .map(|j| {
+                (F::from_canonical_usize(j) - F::from_canonical_usize(k - 1))
                     .try_inverse()
-                    .unwrap_or(F::ZERO);
-                row.block8_counter = F::from_canonical_usize(element_index % BLOCK_SIZE);
-                row.block8_counter_inv = (row.block8_counter - F::from_canonical_usize(BLOCK_SIZE - 1))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO);
-                row.a_flip_inv = (row.element_index - F::from_canonical_usize(h * k))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO);
-                row.b_flip_inv = (row.element_index - F::from_canonical_usize(w * k))
-                    .try_inverse()
-                    .unwrap_or(F::ZERO);
-                side_a.fill_a(&mut row, j);
-                side_b.fill_b(&mut row, j);
-                // Pack the noise decodes for the verifier-known columns.
-                row.noise_code_a = bf16_code_of(&row.noise_a);
-                row.noise_code_b = bf16_code_of(&row.noise_b);
-                rows.push(row.into());
-            }
-            start += len;
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let block8_inv: [F; BLOCK_SIZE] = std::array::from_fn(|b| {
+            (F::from_canonical_usize(b) - F::from_canonical_usize(BLOCK_SIZE - 1))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        });
+        let mut rows: Vec<[F; NUM_INPUT_QUANT_COLUMNS]> = vec![[F::ZERO; NUM_INPUT_QUANT_COLUMNS]; num_rows];
+        {
+            // Group `g` starts at `g*k` (the trailing group may be shorter than `k`).
+            use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunksMut, ParallelIterator};
+            rows.par_chunks_mut(k).enumerate().for_each(|(g, chunk)| {
+                let start = g * k;
+                let len = chunk.len();
+                let blocks = k / BLOCK_SIZE;
+                let (a_live, b_live) = (g < h, g < w);
+                let side_a = if a_live {
+                    SideWitness::build(
+                        self,
+                        &a_int8[g * k..(g + 1) * k],
+                        &a_scales[g * blocks..(g + 1) * blocks],
+                        &a_noise[g * k..(g + 1) * k],
+                        true,
+                    )
+                } else {
+                    SideWitness::build(
+                        self,
+                        &zero_int8[..len],
+                        &zero_scales[..len / BLOCK_SIZE],
+                        &zero_noise[..len],
+                        false,
+                    )
+                };
+                let side_b = if b_live {
+                    SideWitness::build(
+                        self,
+                        &b_int8[g * k..(g + 1) * k],
+                        &b_scales[g * blocks..(g + 1) * blocks],
+                        &b_noise[g * k..(g + 1) * k],
+                        true,
+                    )
+                } else {
+                    SideWitness::build(
+                        self,
+                        &zero_int8[..len],
+                        &zero_scales[..len / BLOCK_SIZE],
+                        &zero_noise[..len],
+                        false,
+                    )
+                };
+                // Montgomery batch inversion of the A/B flip witnesses over this group's
+                // element indices — one field inversion total per group and side.
+                let flips: Vec<(F, F)> = {
+                    let batch_invert = |limit: usize| -> Vec<F> {
+                        let mut prods = Vec::with_capacity(len);
+                        let mut prod = F::ONE;
+                        for j in 0..len {
+                            prods.push(prod);
+                            let d = F::from_canonical_usize(start + j) - F::from_canonical_usize(limit);
+                            if d != F::ZERO {
+                                prod *= d;
+                            }
+                        }
+                        let mut inv = prod.try_inverse().unwrap_or(F::ONE);
+                        let mut invs = vec![F::ZERO; len];
+                        for j in (0..len).rev() {
+                            let d = F::from_canonical_usize(start + j) - F::from_canonical_usize(limit);
+                            if d != F::ZERO {
+                                invs[j] = inv * prods[j];
+                                inv *= d;
+                            }
+                        }
+                        invs
+                    };
+                    let (invs_a, invs_b) = (batch_invert(h * k), batch_invert(w * k));
+                    invs_a.into_iter().zip(invs_b).collect()
+                };
+                for (j, row_slot) in chunk.iter_mut().enumerate() {
+                    let mut row = InputQuantColumnsView::<F>::default();
+                    let element_index = start + j;
+                    row.is_group_final = F::from_bool(j == len - 1);
+                    row.element_index = F::from_canonical_usize(element_index);
+                    row.is_even_row = F::from_bool(element_index % 2 == 0);
+                    row.is_block_start = F::from_bool(element_index % BLOCK_SIZE == 0);
+                    row.block_index = F::from_canonical_usize(element_index / BLOCK_SIZE);
+                    row.a_live = F::from_bool(a_live);
+                    row.b_live = F::from_bool(b_live);
+                    // Group-G counters and inverse witnesses for the schedule flags.
+                    row.group_counter = F::from_canonical_usize(j);
+                    row.group_final_inv = group_final_inv[j];
+                    row.block8_counter = F::from_canonical_usize(element_index % BLOCK_SIZE);
+                    row.block8_counter_inv = block8_inv[element_index % BLOCK_SIZE];
+                    let (a_flip_inv, b_flip_inv) = flips[j];
+                    row.a_flip_inv = a_flip_inv;
+                    row.b_flip_inv = b_flip_inv;
+                    side_a.fill_a(&mut row, j);
+                    side_b.fill_b(&mut row, j);
+                    // Pack the noise decodes for the verifier-known columns.
+                    row.noise_code_a = bf16_code_of(&row.noise_a);
+                    row.noise_code_b = bf16_code_of(&row.noise_b);
+                    *row_slot = row.into();
+                }
+            });
         }
         blind_trace(&mut rows);
         (rows, self.public_inputs())
@@ -809,9 +1078,31 @@ struct ElementWitness {
 }
 
 /// One side's full group witness (k elements + the group scales).
-struct SideWitness {
+pub(crate) struct SideWitness {
     elements: Vec<ElementWitness>,
     scales: GroupScales,
+}
+
+/// The compact native advice for one InputQuant trace: per-group side witnesses (dead
+/// sides shared by `Arc`) plus the per-side outputs the downstream tables read — the
+/// noised fp8 codes, the summand scores, and the per-matrix-row CTL tuples. Built by
+/// [`InputQuantProgram::build_native`]; the trace fills and the driver's Matmul/Scale
+/// inputs read it without re-deriving the gadget arithmetic.
+pub(crate) struct InputQuantNative {
+    /// One `(A, B)` witness pair per trace group, in group order.
+    pub(crate) groups: Vec<(Arc<SideWitness>, Arc<SideWitness>)>,
+    /// A-side noised fp8 codes, `h*k` in element order.
+    pub(crate) a_codes: Vec<u8>,
+    /// B-side noised fp8 codes, `w*k` in element order.
+    pub(crate) b_codes: Vec<u8>,
+    /// A-side summand scores, `h*k` in element order.
+    pub(crate) a_lambdas: Vec<u64>,
+    /// B-side summand scores, `w*k` in element order.
+    pub(crate) b_lambdas: Vec<u64>,
+    /// A-side per-matrix-row scale tuples, `h` entries.
+    pub(crate) a_tuples: Vec<ScaleRowTuple>,
+    /// B-side per-matrix-row scale tuples, `w` entries.
+    pub(crate) b_tuples: Vec<ScaleRowTuple>,
 }
 
 impl SideWitness {
@@ -2465,6 +2756,105 @@ mod tests {
             }
         }
         true
+    }
+
+    /// The joined-schedule native build + direct column fill must be bit-exact with
+    /// `generate_trace`: same trace cells (modulo the intentionally random row-0 blinding
+    /// cells, which are checked for presence only), and the native outputs (codes,
+    /// lambdas, tuples) must equal the trace read-back.
+    #[test]
+    fn input_quant_native_fill_matches_generate_trace() {
+        let program = test_program();
+        let inp = test_inputs(&program);
+        let (rows, _) = program.generate_trace::<F>(
+            &inp.a_int8,
+            &inp.a_scales,
+            &inp.a_noise,
+            &inp.b_int8,
+            &inp.b_scales,
+            &inp.b_noise,
+        );
+
+        let native = program.build_native(
+            &inp.a_int8,
+            &inp.a_scales,
+            &inp.a_noise,
+            &inp.b_int8,
+            &inp.b_scales,
+            &inp.b_noise,
+        );
+
+        // The native outputs must equal the trace read-backs the old driver did.
+        let (h, w, k) = (program.h, program.w, program.k);
+        let read_codes = |b_side: bool| -> Vec<u8> {
+            let live = if b_side { w * k } else { h * k };
+            rows[..live]
+                .iter()
+                .map(|r| {
+                    let v: &InputQuantColumnsView<F> = r.borrow();
+                    (if b_side { v.code_noised_b } else { v.code_noised_a }).to_canonical_u64() as u8
+                })
+                .collect()
+        };
+        let read_lambdas = |b_side: bool| -> Vec<u64> {
+            let live = if b_side { w * k } else { h * k };
+            rows[..live]
+                .iter()
+                .map(|r| {
+                    let v: &InputQuantColumnsView<F> = r.borrow();
+                    (if b_side { v.lambda_b } else { v.lambda_a }).to_canonical_u64()
+                })
+                .collect()
+        };
+        assert_eq!(native.a_codes, read_codes(false));
+        assert_eq!(native.b_codes, read_codes(true));
+        assert_eq!(native.a_lambdas, read_lambdas(false));
+        assert_eq!(native.b_lambdas, read_lambdas(true));
+        for (g, tuple) in native.a_tuples.iter().enumerate() {
+            let v: &InputQuantColumnsView<F> = rows[g * k + k - 1].borrow();
+            assert_eq!(tuple.l2_frame_sum, v.block_l2_a.running_l2_frame_sum.to_canonical_u64());
+            assert_eq!(
+                u64::from(tuple.frame_doubled_scale_exponent),
+                v.block_l2_a.frame_doubled_scale_exponent.to_canonical_u64()
+            );
+            assert_eq!(u64::from(tuple.max_abs), v.max_abs_a.to_canonical_u64());
+            assert_eq!(u64::from(tuple.dead_count), v.dead_count_a.to_canonical_u64());
+        }
+        for (g, tuple) in native.b_tuples.iter().enumerate() {
+            let v: &InputQuantColumnsView<F> = rows[g * k + k - 1].borrow();
+            assert_eq!(tuple.l2_frame_sum, v.block_l2_b.running_l2_frame_sum.to_canonical_u64());
+            assert_eq!(
+                u64::from(tuple.frame_doubled_scale_exponent),
+                v.block_l2_b.frame_doubled_scale_exponent.to_canonical_u64()
+            );
+            assert_eq!(u64::from(tuple.max_abs), v.max_abs_b.to_canonical_u64());
+            assert_eq!(u64::from(tuple.dead_count), v.dead_count_b.to_canonical_u64());
+        }
+
+        // The direct column fill must reproduce every cell except the four row-0 blinding
+        // cells (fresh randomness by design); those must merely be overwritten (nonzero
+        // with overwhelming probability, and the equality constraints don't constrain them).
+        let num_rows = program.num_rows();
+        let mut cols: Vec<Vec<F>> = (0..NUM_INPUT_QUANT_COLUMNS).map(|_| vec![F::ZERO; num_rows]).collect();
+        {
+            let mut slices: Vec<&mut [F]> = cols.iter_mut().map(|c| c.as_mut_slice()).collect();
+            program.fill_columns::<F>(&native, &mut slices);
+        }
+        let [a_rem, a_comp, b_rem, b_comp] = [
+            INPUT_QUANT_COL_MAP.block_l2_a.shift_remainder_power,
+            INPUT_QUANT_COL_MAP.block_l2_a.shift_complement_power,
+            INPUT_QUANT_COL_MAP.block_l2_b.shift_remainder_power,
+            INPUT_QUANT_COL_MAP.block_l2_b.shift_complement_power,
+        ];
+        let blinded = |c: usize| c == a_rem || c == a_comp || c == b_rem || c == b_comp;
+        for (c, col) in cols.iter().enumerate() {
+            for r in 0..num_rows {
+                if r == 0 && blinded(c) {
+                    continue; // fresh randomness on both sides of the comparison
+                }
+                assert_eq!(col[r], rows[r][c], "column {c} row {r} differs from generate_trace");
+            }
+        }
     }
 
     #[test]

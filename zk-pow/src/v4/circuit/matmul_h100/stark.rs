@@ -51,6 +51,7 @@ use plonky2::field::packed::PackedField;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
 use plonky2::plonk::circuit_builder::CircuitBuilder;
+use plonky2_maybe_rayon::{IndexedParallelIterator, ParallelIterator};
 use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
 use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
@@ -157,18 +158,373 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
         let live_rows_per_cell = k / GROUP_WIDTH;
         let num_rows = self.num_rows();
 
-        let mut rows: Vec<[F; NUM_MATMUL_COLUMNS]> = Vec::with_capacity(num_rows);
-        for r in 0..h {
-            for c in 0..w {
-                // ---- The k/32 live group-steps (group-sum emulation columns). ----
+        // Cells are independent, so the trace fills one chunk of `rows_per_cell` (one cell)
+        // per parallel job; the schedule's inverse witnesses take only a handful of distinct
+        // values each, precomputed once below instead of inverted per row.
+        let step_inv: Vec<F> = (0..live_rows_per_cell)
+            .map(|s| {
+                (F::from_canonical_usize(s) - F::from_canonical_usize(live_rows_per_cell - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let col_inv: Vec<F> = (0..w)
+            .map(|c| {
+                (F::from_canonical_usize(c) - F::from_canonical_usize(w - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let window_inv: [F; WINDOW_ATOMS] = std::array::from_fn(|s| {
+            (F::from_canonical_usize(s) - F::from_canonical_usize(WINDOW_ATOMS - 1))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        });
+
+        let mut rows: Vec<[F; NUM_MATMUL_COLUMNS]> = vec![[F::ZERO; NUM_MATMUL_COLUMNS]; num_rows];
+        {
+            let live = self.live_rows();
+            let map = MATMUL_COL_MAP;
+            let rows = &mut rows;
+            // ---- Live cells: one chunk of `rows_per_cell` rows per cell. ----
+            use plonky2_maybe_rayon::MaybeParChunksMut;
+            rows[..live]
+                .par_chunks_mut(live_rows_per_cell)
+                .enumerate()
+                .for_each(|(cell, chunk)| {
+                    let (r, c) = (cell / w, cell % w);
+                    let cell_f = F::from_canonical_usize(cell);
+                    let (out_row, out_col) = (cell / w, cell % w);
+                    let (padding_onset_inv, col_carry, col_carry_inv, base_a, base_b) = (
+                        (cell_f - F::from_canonical_usize(h * w)).try_inverse().unwrap_or(F::ZERO),
+                        F::from_bool(c == w - 1),
+                        col_inv[c],
+                        F::from_canonical_usize(r * k),
+                        F::from_canonical_usize(h * k + c * k),
+                    );
+                    // ---- The k/32 live group-steps (group-sum emulation columns). ----
+                    let mut carry = OutTriple::ZERO;
+                    let mut incoming_carry_is_zero = true;
+                    let mut global = GlobalTriple::ZERO;
+                    // Consolidated policy anchors, filled in after the cell replay.
+                    let mut e_cell = 0u64;
+                    let mut e_z_window = 0u64;
+                    let mut e_z_windows = Vec::with_capacity(live_rows_per_cell.div_ceil(4));
+                    for (j, row_slot) in chunk.iter_mut().enumerate() {
+                        let is_final = j == live_rows_per_cell - 1;
+                        let is_window_final = (j + 1).is_multiple_of(4) || is_final;
+                        let mut row = MatmulColumnsView {
+                            is_cell_final: F::from_bool(is_final),
+                            is_window_final: F::from_bool(is_window_final),
+                            incoming_carry_is_zero: F::from_bool(incoming_carry_is_zero),
+                            ..Default::default()
+                        };
+
+                        // Decode the 32 lanes and receive their summand scores.
+                        let mut lanes = [Fp8Product::ZERO; GROUP_WIDTH];
+                        for i in 0..GROUP_WIDTH {
+                            let operand_codes_a = a_codes[r * k + j * GROUP_WIDTH + i];
+                            let operand_codes_b = b_codes[c * k + j * GROUP_WIDTH + i];
+                            lanes[i] = Fp8Product::new(operand_codes_a, operand_codes_b);
+                            row.operand_codes_a[i] = F::from_canonical_u8(operand_codes_a);
+                            row.operand_codes_b[i] = F::from_canonical_u8(operand_codes_b);
+                            row.prod_fp22_exp[i] = F::from_canonical_u64(lanes[i].fp22_exp);
+                            row.lambda_a[i] = F::from_canonical_u64(a_lambdas[r * k + j * GROUP_WIDTH + i]);
+                            row.lambda_b[i] = F::from_canonical_u64(b_lambdas[c * k + j * GROUP_WIDTH + i]);
+                            // M13: the lane's binade, as served by PRODALIGN15.
+                            let lane_binade = lanes[i].biased_binade();
+                            row.lane_binades[i] = F::from_canonical_u64(lane_binade);
+                            e_cell = e_cell.max(lane_binade);
+                            if lane_binade != 0 {
+                                // Add 5 to convert e(product)+139 to Hopper's grid encoding e(product)-13+157.
+                                e_z_window = e_z_window.max(lane_binade + 5);
+                            }
+                        }
+
+                        // The group's max FP22 exponent over the nonzero terms (zero terms never set
+                        // the max, mirroring the simulator's -139 sentinel); the free witness on
+                        // all-zero rows is pinned to the products' sentinel — the honest max of a
+                        // row of sentinels — so every PRODALIGN15 key stays in-domain (shift 0) and
+                        // the attainment chain vanishes through the sentinel factors.
+                        let mut group_max_product_exponent: Option<u64> = (!incoming_carry_is_zero).then_some(carry.exp);
+                        for lane in &lanes {
+                            if !lane.is_zero {
+                                group_max_product_exponent =
+                                    Some(group_max_product_exponent.map_or(lane.fp22_exp, |m| m.max(lane.fp22_exp)));
+                            }
+                        }
+                        let group_max_product_exponent = group_max_product_exponent.unwrap_or(FP22_ZERO_SENTINEL);
+                        row.group_max_product_exponent = F::from_canonical_u64(group_max_product_exponent);
+                        // The M3 attainment chain: running products of the affine lane factors
+                        // F_i = GROUP_MAX_PRODUCT_EXPONENT - PROD_FP22_EXP_i (three into the first link, two per link
+                        // after, the last one alone) — the definitional fill of the link equalities.
+                        let factor = |i: usize| F::from_canonical_u64(group_max_product_exponent) - row.prod_fp22_exp[i];
+                        row.max_exponent_attainment[0] = factor(0) * factor(1) * factor(2);
+                        for j in 1..NUM_ATT_LINKS - 1 {
+                            row.max_exponent_attainment[j] =
+                                row.max_exponent_attainment[j - 1] * factor(2 * j + 1) * factor(2 * j + 2);
+                        }
+                        row.max_exponent_attainment[NUM_ATT_LINKS - 1] =
+                            row.max_exponent_attainment[NUM_ATT_LINKS - 2] * factor(GROUP_WIDTH - 1);
+
+                        // Align the 33 terms to the max exponent and sum exactly, as `_group_sum`:
+                        // products at the 15-bit frame `sig_a*sig_b*2^7 = (sig << 17) >> 10`, the
+                        // carry at its 14-bit significand, both floor-shifted towards zero.
+                        let mut total: i64 = 0;
+                        for i in 0..GROUP_WIDTH {
+                            if lanes[i].is_zero {
+                                continue; // ALIGNED_LANE_TERMS stays 0 (the table's zero-pair rows hold 0).
+                            }
+                            let shift = group_max_product_exponent - lanes[i].fp22_exp; // >= 0: max dominates.
+                            let mag = ((lanes[i].sig << 7) >> shift.min(63)) as i64;
+                            row.aligned_lane_terms[i] = if lanes[i].sign {
+                                -F::from_canonical_u64(mag as u64)
+                            } else {
+                                F::from_canonical_u64(mag as u64)
+                            };
+                            total += if lanes[i].sign { -mag } else { mag };
+                        }
+                        if incoming_carry_is_zero {
+                            // Canonical witness on the inactive carry path.
+                            row.incoming_carry_shift_power = F::ONE;
+                        } else {
+                            let shift = (group_max_product_exponent - carry.exp).min(CARRY_SHIFT_CAP); // POW2G's min-cap.
+                            let shift_pow2 = 1u64 << shift;
+                            let aligned = carry.sig14 >> shift;
+                            let remainder = carry.sig14 - aligned * shift_pow2;
+                            row.incoming_carry_shift_power = F::from_canonical_u64(shift_pow2);
+                            row.aligned_incoming_carry = F::from_canonical_u64(aligned);
+                            row.incoming_carry_remainder = F::from_canonical_u64(remainder);
+                            total += if carry.sign { -(aligned as i64) } else { aligned as i64 };
+                        }
+
+                        // Sum, renormalize (WIDTHNORM semantics), and emit through the output mux.
+                        row.group_sum_sign = F::from_bool(total < 0);
+                        row.group_sum_abs = F::from_canonical_u64(total.unsigned_abs());
+                        row.group_sum_is_zero = F::from_bool(total == 0);
+                        debug_assert!(total.unsigned_abs() < 1 << 20, "frame sums fit 20 bits");
+                        let out = if total == 0 {
+                            OutTriple::ZERO // The +0 path (Z = GROUP_SUM_IS_ZERO; all-zero rows sum to 0).
+                        } else {
+                            let mag = total.unsigned_abs();
+                            let width = bit_length(mag);
+                            let sig14 = if width >= 14 {
+                                mag >> (width - 14)
+                            } else {
+                                mag << (14 - width)
+                            };
+                            row.group_sum_width = F::from_canonical_u64(width);
+                            let exp = group_max_product_exponent + width - 14;
+                            debug_assert!(exp >= FP22_ZERO_SENTINEL, "nonzero outputs never drop below the sentinel");
+                            OutTriple {
+                                sign: total < 0,
+                                exp,
+                                sig14,
+                            }
+                        };
+                        row.group_output_exponent = F::from_canonical_u64(out.exp);
+                        row.group_output_significand = F::from_canonical_u64(out.sig14);
+
+                        let (promotion, projected) = promotion_witness::<F>(global, out);
+                        let exact_binade = projected.exp - promotion.binade_correction.to_canonical_u64();
+                        row.promotion = promotion;
+                        let global_out = if is_window_final { projected } else { global };
+                        global = global_out;
+
+                        if is_final {
+                            let bits = u64::from(global.to_f32().to_bits());
+                            row.cell_result_f32_lo = F::from_canonical_u64(bits & 0xFFFF);
+                            row.cell_result_f32_hi = F::from_canonical_u64(bits >> 16);
+                        }
+                        // M covers each exact unrounded C+c, while Z covers each chained local c.
+                        e_cell = e_cell.max(exact_binade);
+                        if out.sig14 != 0 {
+                            // Add 5 to convert e(c)+139 to Hopper's grid encoding e(c)-13+157.
+                            e_z_window = e_z_window.max(out.exp + 5);
+                        }
+                        if is_window_final {
+                            e_z_windows.push(e_z_window);
+                            e_z_window = 0;
+                            incoming_carry_is_zero = true;
+                            carry = OutTriple::ZERO;
+                        } else {
+                            incoming_carry_is_zero = total == 0;
+                            carry = out;
+                        }
+
+                        // ---- Schedule witnesses (the shared MS block; values match
+                        // `MatmulScheduleView::at` exactly). ----
+                        row.cell_step = F::from_canonical_usize(j);
+                        row.cell_step_inv = step_inv[j];
+                        row.out_row = F::from_canonical_usize(out_row);
+                        row.out_col = F::from_canonical_usize(out_col);
+                        row.padding_onset_inv = padding_onset_inv;
+                        row.operand_index_base_a = base_a;
+                        row.operand_index_base_b = base_b;
+                        row.col_carry = col_carry;
+                        row.col_carry_inv = col_carry_inv;
+                        // The H100-only window gadget: the in-window atom position and its bound witness.
+                        let step = j % WINDOW_ATOMS;
+                        let is_w_final = is_final || step == WINDOW_ATOMS - 1;
+                        row.window_step = F::from_canonical_usize(step);
+                        row.window_step_inv = window_inv[step];
+                        row.is_window_final = F::from_bool(is_w_final);
+
+                        *row_slot = row.into();
+                    }
+
+                    // ---- M13-M16 post-pass: fill cell/window anchors and the skip census. ----
+                    let mut cell_skips = 0u64;
+                    for (j, row) in chunk.iter_mut().enumerate() {
+                        let e_grid = e_cell.max(e_z_windows[j / 4]);
+                        row[map.e_cell] = F::from_canonical_u64(e_cell);
+                        row[map.e_grid] = F::from_canonical_u64(e_grid);
+                        row[map.cell_nonzero] = F::from_bool(e_grid != 0);
+                        for i in 0..GROUP_WIDTH {
+                            let lambda_a = a_lambdas[r * k + j * GROUP_WIDTH + i];
+                            let lambda_b = b_lambdas[c * k + j * GROUP_WIDTH + i];
+                            let skipped = skip(lambda_a, lambda_b, e_grid);
+                            row[map.skip_flag[i]] = F::from_bool(skipped);
+                            cell_skips += u64::from(skipped);
+                        }
+                        row[map.cell_skips] = F::from_canonical_u64(cell_skips);
+                    }
+                });
+
+            // ---- Trailing padding: one all-zero single-row phantom cell per padding row,
+            // its schedule columns matching `MatmulScheduleView::at` exactly. ----
+            let live = self.live_rows();
+            rows[live..].par_chunks_mut(1).enumerate().for_each(|(t, chunk)| {
+                let row = &mut chunk[0];
+                *row = phantom_row::<F>().into();
+                let s = MatmulScheduleView::<F>::at(live + t, live_rows_per_cell, w, h * w);
+                row[map.is_cell_final] = s.is_cell_final;
+                row[map.is_padding] = s.is_padding;
+                row[map.cell_step] = s.cell_step;
+                row[map.cell_step_inv] = s.cell_step_inv;
+                row[map.out_row] = s.out_row;
+                row[map.out_col] = s.out_col;
+                row[map.padding_onset_inv] = s.padding_onset_inv;
+                row[map.operand_index_base_a] = s.operand_index_base_a;
+                row[map.operand_index_base_b] = s.operand_index_base_b;
+                row[map.col_carry] = s.col_carry;
+                row[map.col_carry_inv] = s.col_carry_inv;
+                // The H100-only window gadget: the in-window atom position and its bound witness.
+                let step = 0;
+                let is_window_final = row[map.is_cell_final] == F::ONE || step == WINDOW_ATOMS - 1;
+                row[map.window_step] = F::from_canonical_usize(step);
+                row[map.window_step_inv] = window_inv[step];
+                row[map.is_window_final] = F::from_bool(is_window_final);
+            });
+        }
+
+        (rows, self.public_inputs())
+    }
+
+    /// The joined-schedule trace fill: [`Self::generate_trace`]'s trace scattered
+    /// column-major straight into caller-owned buffers, computing each cell's result
+    /// (`cell_words[c]`, its promoted f32 bit pattern) and skip subtotal
+    /// (`cell_skips[c]`) as a by-product of the same cell replay instead of reading them
+    /// back out of the trace. Bit-exact with `generate_trace` (same replay, same post-pass;
+    /// the equivalence is asserted by `matmul_generate_columns_matches_generate_trace`).
+    ///
+    /// `cols.len()` must be `NUM_MATMUL_COLUMNS` and every column `num_rows` long; the
+    /// buffers must be zero-initialized (only live-cell rows are written by the scatter, the
+    /// padding rows are written by the trailing pass).
+    pub(crate) fn generate_columns(
+        &self,
+        a_codes: &[u8],
+        b_codes: &[u8],
+        a_lambdas: &[u64],
+        b_lambdas: &[u64],
+        cols: &mut [&mut [F]],
+    ) -> (Vec<u32>, Vec<u64>) {
+        let (h, w, k) = (self.h, self.w, self.k);
+        assert_eq!(a_codes.len(), h * k, "a_codes must be h*k row-major fp8 codes");
+        assert_eq!(b_codes.len(), w * k, "b_codes must be w*k column-major fp8 codes");
+        assert_eq!(a_lambdas.len(), h * k, "a_lambdas must align with a_codes");
+        assert_eq!(b_lambdas.len(), w * k, "b_lambdas must align with b_codes");
+        assert_eq!(k % GROUP_WIDTH, 0, "k must be a multiple of the group width");
+        let live_rows_per_cell = k / GROUP_WIDTH;
+        let num_rows = self.num_rows();
+        let live = self.live_rows();
+        assert_eq!(cols.len(), NUM_MATMUL_COLUMNS, "direct fill destination width");
+        for col in cols.iter() {
+            assert_eq!(col.len(), num_rows, "direct fill column length");
+        }
+
+        // The schedule's inverse witnesses take only a handful of distinct values each,
+        // precomputed once below instead of inverted per row.
+        let step_inv: Vec<F> = (0..live_rows_per_cell)
+            .map(|s| {
+                (F::from_canonical_usize(s) - F::from_canonical_usize(live_rows_per_cell - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let col_inv: Vec<F> = (0..w)
+            .map(|c| {
+                (F::from_canonical_usize(c) - F::from_canonical_usize(w - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO)
+            })
+            .collect();
+        let window_inv: [F; WINDOW_ATOMS] = std::array::from_fn(|s| {
+            (F::from_canonical_usize(s) - F::from_canonical_usize(WINDOW_ATOMS - 1))
+                .try_inverse()
+                .unwrap_or(F::ZERO)
+        });
+        let map = MATMUL_COL_MAP;
+
+        // Scatter destination: the parallel cell jobs write disjoint row ranges but shared
+        // column buffers, which the borrow checker cannot prove disjoint. Each write goes to
+        // a distinct (column, row) slot — jobs own disjoint rows — so wrap the raw slice
+        // pointer once per job.
+        // SAFETY: no two jobs write the same (column, row) slot; live jobs own disjoint
+        // live-row ranges and the trailing pass owns the padding rows.
+        struct SyncCols<T> {
+            base: *mut T,
+            len: usize,
+        }
+        unsafe impl<T> Send for SyncCols<T> {}
+        unsafe impl<T> Sync for SyncCols<T> {}
+        let cols_ptr = &SyncCols {
+            base: cols.as_mut_ptr(),
+            len: cols.len(),
+        };
+        let scatter = |r: usize, row: &[F; NUM_MATMUL_COLUMNS]| {
+            // SAFETY: the wrapper only re-exports `cols`; `r` is job-owned (see above).
+            let cols: &mut [&mut [F]] = unsafe { core::slice::from_raw_parts_mut(cols_ptr.base, cols_ptr.len) };
+            for (c, value) in row.iter().enumerate() {
+                cols[c][r] = *value;
+            }
+        };
+
+        // Live cells: one parallel job per cell, rows scattered in cell order. Each job
+        // also returns its promotion output and skip subtotal, so the cell results come
+        // out of the same replay instead of a trace read-back.
+        use plonky2_maybe_rayon::MaybeIntoParIter;
+        let results: Vec<(u32, u64)> = (0..h * w)
+            .into_par_iter()
+            .map(|cell| {
+                let (r, c) = (cell / w, cell % w);
+                let cell_f = F::from_canonical_usize(cell);
+                let (out_row, out_col) = (cell / w, cell % w);
+                let (padding_onset_inv, col_carry, col_carry_inv, base_a, base_b) = (
+                    (cell_f - F::from_canonical_usize(h * w)).try_inverse().unwrap_or(F::ZERO),
+                    F::from_bool(c == w - 1),
+                    col_inv[c],
+                    F::from_canonical_usize(r * k),
+                    F::from_canonical_usize(h * k + c * k),
+                );
                 let mut carry = OutTriple::ZERO;
                 let mut incoming_carry_is_zero = true;
                 let mut global = GlobalTriple::ZERO;
-                // Consolidated policy anchors, filled in after the cell replay.
-                let cell_start = rows.len();
                 let mut e_cell = 0u64;
                 let mut e_z_window = 0u64;
                 let mut e_z_windows = Vec::with_capacity(live_rows_per_cell.div_ceil(4));
+                // The cell's rows, computed then scattered in one pass.
+                let mut chunk: Vec<[F; NUM_MATMUL_COLUMNS]> = Vec::with_capacity(live_rows_per_cell);
                 for j in 0..live_rows_per_cell {
                     let is_final = j == live_rows_per_cell - 1;
                     let is_window_final = (j + 1).is_multiple_of(4) || is_final;
@@ -219,9 +575,9 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
                     // after, the last one alone) — the definitional fill of the link equalities.
                     let factor = |i: usize| F::from_canonical_u64(group_max_product_exponent) - row.prod_fp22_exp[i];
                     row.max_exponent_attainment[0] = factor(0) * factor(1) * factor(2);
-                    for j in 1..NUM_ATT_LINKS - 1 {
-                        row.max_exponent_attainment[j] =
-                            row.max_exponent_attainment[j - 1] * factor(2 * j + 1) * factor(2 * j + 2);
+                    for l in 1..NUM_ATT_LINKS - 1 {
+                        row.max_exponent_attainment[l] =
+                            row.max_exponent_attainment[l - 1] * factor(2 * l + 1) * factor(2 * l + 2);
                     }
                     row.max_exponent_attainment[NUM_ATT_LINKS - 1] =
                         row.max_exponent_attainment[NUM_ATT_LINKS - 2] * factor(GROUP_WIDTH - 1);
@@ -310,13 +666,31 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
                         incoming_carry_is_zero = total == 0;
                         carry = out;
                     }
-                    rows.push(row.into());
+
+                    // ---- Schedule witnesses (the shared MS block; values match
+                    // `MatmulScheduleView::at` exactly). ----
+                    row.cell_step = F::from_canonical_usize(j);
+                    row.cell_step_inv = step_inv[j];
+                    row.out_row = F::from_canonical_usize(out_row);
+                    row.out_col = F::from_canonical_usize(out_col);
+                    row.padding_onset_inv = padding_onset_inv;
+                    row.operand_index_base_a = base_a;
+                    row.operand_index_base_b = base_b;
+                    row.col_carry = col_carry;
+                    row.col_carry_inv = col_carry_inv;
+                    // The H100-only window gadget: the in-window atom position and its bound witness.
+                    let step = j % WINDOW_ATOMS;
+                    let is_w_final = is_final || step == WINDOW_ATOMS - 1;
+                    row.window_step = F::from_canonical_usize(step);
+                    row.window_step_inv = window_inv[step];
+                    row.is_window_final = F::from_bool(is_w_final);
+
+                    chunk.push(row.into());
                 }
 
                 // ---- M13-M16 post-pass: fill cell/window anchors and the skip census. ----
-                let map = MATMUL_COL_MAP;
-                let mut cell_skips = 0u64;
-                for (j, row) in rows[cell_start..].iter_mut().enumerate() {
+                let mut cell_skip_count = 0u64;
+                for (j, row) in chunk.iter_mut().enumerate() {
                     let e_grid = e_cell.max(e_z_windows[j / 4]);
                     row[map.e_cell] = F::from_canonical_u64(e_cell);
                     row[map.e_grid] = F::from_canonical_u64(e_grid);
@@ -326,22 +700,32 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
                         let lambda_b = b_lambdas[c * k + j * GROUP_WIDTH + i];
                         let skipped = skip(lambda_a, lambda_b, e_grid);
                         row[map.skip_flag[i]] = F::from_bool(skipped);
-                        cell_skips += u64::from(skipped);
+                        cell_skip_count += u64::from(skipped);
                     }
-                    row[map.cell_skips] = F::from_canonical_u64(cell_skips);
+                    row[map.cell_skips] = F::from_canonical_u64(cell_skip_count);
                 }
-            }
+                // The cell's promotion output and skip subtotal, read straight off the replay.
+                let cell_word = global.to_f32().to_bits();
+                let r0 = cell * live_rows_per_cell;
+                for (j, row) in chunk.iter().enumerate() {
+                    scatter(r0 + j, row);
+                }
+                (cell_word, cell_skip_count)
+            })
+            .collect();
+
+        let mut cell_words = vec![0u32; h * w];
+        let mut cell_skips = vec![0u64; h * w];
+        for (cell, (word, skips)) in results.into_iter().enumerate() {
+            cell_words[cell] = word;
+            cell_skips[cell] = skips;
         }
 
-        // ---- Trailing padding: one all-zero single-row phantom cell per padding row. ----
-        for _ in 0..num_rows - self.live_rows() {
-            rows.push(phantom_row::<F>().into());
-        }
-
-        // ---- Fill cell and window schedule witnesses for live and phantom rows. ----
-        let map = MATMUL_COL_MAP;
-        for (i, row) in rows.iter_mut().enumerate() {
-            let s = MatmulScheduleView::<F>::at(i, live_rows_per_cell, w, h * w);
+        // ---- Trailing padding rows: the phantom cell, scattered the same way (parallel —
+        // at degree 22 half the table's rows are padding). ----
+        (live..num_rows).into_par_iter().for_each(|t_row| {
+            let mut row: [F; NUM_MATMUL_COLUMNS] = phantom_row::<F>().into();
+            let s = MatmulScheduleView::<F>::at(t_row, live_rows_per_cell, w, h * w);
             row[map.is_cell_final] = s.is_cell_final;
             row[map.is_padding] = s.is_padding;
             row[map.cell_step] = s.cell_step;
@@ -354,20 +738,15 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
             row[map.col_carry] = s.col_carry;
             row[map.col_carry_inv] = s.col_carry_inv;
             // The H100-only window gadget: the in-window atom position and its bound witness.
-            let step = if row[map.is_padding] == F::ONE {
-                0
-            } else {
-                (i % live_rows_per_cell) % WINDOW_ATOMS
-            };
+            let step = 0;
             let is_window_final = row[map.is_cell_final] == F::ONE || step == WINDOW_ATOMS - 1;
             row[map.window_step] = F::from_canonical_usize(step);
-            row[map.window_step_inv] = (F::from_canonical_usize(step) - F::from_canonical_usize(WINDOW_ATOMS - 1))
-                .try_inverse()
-                .unwrap_or(F::ZERO);
+            row[map.window_step_inv] = window_inv[step];
             row[map.is_window_final] = F::from_bool(is_window_final);
-        }
+            scatter(t_row, &row);
+        });
 
-        (rows, self.public_inputs())
+        (cell_words, cell_skips)
     }
 
     /// The geometry public inputs the MS schedule constraints read:
@@ -1407,6 +1786,48 @@ mod tests {
     fn honest_trace_satisfies_all_constraints() {
         let (program, rows, pis) = test_trace();
         assert_all_constraints(program, &rows, &pis);
+    }
+
+    /// The joined-schedule direct fill must be bit-exact with `generate_trace`: same
+    /// rows (via the column buffers), same cell words, same skip subtotals, for both
+    /// a dense geometry and a padding-heavy one (live rows not a power of two).
+    #[test]
+    fn matmul_generate_columns_matches_generate_trace() {
+        for (h, w, k) in [(4, 4, 160), (3, 5, 128)] {
+            let program = S::new(h, w, k);
+            let a = test_codes(h * k, 0x9E3779B97F4A7C15, 8);
+            let b = test_codes(w * k, 0xC2B2AE3D27D4EB4F, 11);
+            let la = test_lambdas(h * k, 0xA24BAED4963EE407);
+            let lb = test_lambdas(w * k, 0x9FB21C651E98DF25);
+
+            let (rows, _) = program.generate_trace(&a, &b, &la, &lb);
+            let num_rows = program.num_rows();
+            let mut cols: Vec<Vec<F>> = (0..NUM_MATMUL_COLUMNS).map(|_| vec![F::ZERO; num_rows]).collect();
+            {
+                let mut slices: Vec<&mut [F]> = cols.iter_mut().map(|c| c.as_mut_slice()).collect();
+                let (got_words, got_skips) = program.generate_columns(&a, &b, &la, &lb, &mut slices);
+                // Cell results: exactly the read-back of the serial fill.
+                let mut exp_words = vec![0u32; h * w];
+                let mut exp_skips = vec![0u64; h * w];
+                for row in &rows {
+                    let v: &MatmulColumnsView<F> = row.borrow();
+                    if v.is_cell_final == F::ONE && v.is_padding == F::ZERO {
+                        let cell = v.out_row.to_canonical_u64() as usize * w + v.out_col.to_canonical_u64() as usize;
+                        exp_words[cell] =
+                            (v.cell_result_f32_lo.to_canonical_u64() | (v.cell_result_f32_hi.to_canonical_u64() << 16)) as u32;
+                        exp_skips[cell] = v.cell_skips.to_canonical_u64();
+                    }
+                }
+                assert_eq!(got_words, exp_words, "cell words (h={h} w={w} k={k})");
+                assert_eq!(got_skips, exp_skips, "cell skips (h={h} w={w} k={k})");
+            }
+            // Trace: column-for-column, row-for-row identical.
+            for (c, col) in cols.iter().enumerate() {
+                for r in 0..num_rows {
+                    assert_eq!(col[r], rows[r][c], "column {c} row {r} (h={h} w={w} k={k})");
+                }
+            }
+        }
     }
 
     fn promotion_rounding_trace(

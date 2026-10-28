@@ -1,5 +1,8 @@
 use alloc::vec::Vec;
+use core::any::{Any, TypeId};
 use core::cmp::{max, min};
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 use unroll::unroll_for_loops;
@@ -10,6 +13,48 @@ use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::types::Field;
 
 pub type FftRootTable<F> = Vec<Vec<F>>;
+
+/// Process-global warm root tables: one per `(field type, log2 FFT size)`.
+///
+/// Populated only by [`warm_fft_tables`] — `fft_dispatch` consults this cache when a
+/// caller does not pass its own table, but never inserts, so a process that never
+/// warms behaves exactly as before (tables are built per call and dropped).
+///
+/// Tables are pure field arithmetic (`fft_root_table`), independent of any circuit,
+/// device, or job shape, so one warming covers every later FFT at the warmed sizes —
+/// including `coset_fft`/`coset_ifft`, which delegate to the same dispatch.
+type WarmTableMap = HashMap<(TypeId, usize), &'static (dyn Any + Send + Sync)>;
+// RwLock, not Mutex: dispatch lookups happen inside rayon-parallel FFT loops (hundreds of
+// concurrent readers), so readers must share; only `warm_fft_tables` takes the write side.
+static WARM_FFT_TABLES: OnceLock<RwLock<WarmTableMap>> = OnceLock::new();
+
+/// Builds and caches root tables for every FFT size `2^lo_lg ..= 2^hi_lg` of field `F`,
+/// so later bare FFT calls at those sizes reuse them instead of rebuilding per call.
+/// Pure generation, nothing loaded; idempotent and safe to call again.
+pub fn warm_fft_tables<F: Field + Send + Sync + 'static>(lo_lg: usize, hi_lg: usize) {
+    debug_assert!(lo_lg > 0);
+    let cache = WARM_FFT_TABLES.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut guard = cache.write().expect("warm FFT table lock poisoned");
+    for lg in lo_lg..=hi_lg {
+        let key = (TypeId::of::<F>(), lg);
+        if guard.contains_key(&key) {
+            continue;
+        }
+        // Box::leak deliberately: the cache lives for the process, and dropping tables
+        // that later FFTs would just rebuild serves no purpose.
+        let leaked: &'static FftRootTable<F> = Box::leak(Box::new(fft_root_table::<F>(1 << lg)));
+        guard.insert(key, leaked as &'static (dyn Any + Send + Sync));
+    }
+}
+
+/// The warmed table for `(F, lg_n)`, if `warm_fft_tables::<F>` covered that size.
+fn warmed_table<F: 'static>(lg_n: usize) -> Option<&'static FftRootTable<F>> {
+    let cache = WARM_FFT_TABLES.get()?;
+    let guard = cache.read().ok()?;
+    // Copy the stored `&'static` out of the map, then downcast with its full lifetime.
+    let erased: &'static (dyn Any + Send + Sync) = *guard.get(&(TypeId::of::<F>(), lg_n))?;
+    erased.downcast_ref::<FftRootTable<F>>()
+}
 
 pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     let lg_n = log2_strict(n);
@@ -38,8 +83,18 @@ fn fft_dispatch<F: Field>(
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) {
-    let computed_root_table = root_table.is_none().then(|| fft_root_table(input.len()));
-    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
+    let lg_n = log2_strict(input.len());
+    // Consult (never insert into) the warm cache when the caller passed no table; a
+    // process that never warmed still builds-and-drops exactly as before.
+    let warmed = root_table
+        .is_none()
+        .then(|| warmed_table::<F>(lg_n))
+        .flatten();
+    let computed = warmed.is_none().then(|| fft_root_table(input.len()));
+    let used_root_table: &FftRootTable<F> = root_table
+        .or(warmed)
+        .or(computed.as_ref())
+        .expect("one of the three table sources is always present");
 
     fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
 }
@@ -209,10 +264,28 @@ mod tests {
 
     use plonky2_util::{log2_ceil, log2_strict};
 
-    use crate::fft::{fft, fft_with_options, ifft};
+    use crate::fft::{fft, fft_with_options, ifft, warm_fft_tables};
     use crate::goldilocks_field::GoldilocksField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
+
+    #[test]
+    fn warmed_tables_give_identical_ffts() {
+        type F = GoldilocksField;
+        let degree = 128usize;
+
+        let coeffs = (0..degree)
+            .map(|i| F::from_canonical_usize(i * 1337 % 100))
+            .collect::<Vec<_>>();
+        let coefficients = PolynomialCoeffs { coeffs };
+
+        let cold = fft(coefficients.clone());
+        // Warming mid-flight must not change any FFT's result — the cache is
+        // consulted-only, and a table is byte-identical to a freshly built one.
+        warm_fft_tables::<F>(1, 10);
+        let warm = fft(coefficients);
+        assert_eq!(cold, warm);
+    }
 
     #[test]
     fn fft_and_ifft() {

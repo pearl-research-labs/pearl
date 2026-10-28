@@ -6,9 +6,11 @@ use core::fmt::Debug;
 use crate::field::extension::Extendable;
 use crate::field::types::Field;
 use crate::hash::hash_types::{HashOut, HashOutTarget, RichField, NUM_HASH_OUT_ELTS};
+use crate::hash::poseidon::{SPONGE_RATE, SPONGE_WIDTH};
 use crate::iop::target::Target;
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::config::AlgebraicHasher;
+use plonky2_field::packed::PackedField;
 
 impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     pub fn hash_or_noop<H: AlgebraicHasher<F>>(&mut self, inputs: Vec<Target>) -> HashOutTarget {
@@ -148,4 +150,121 @@ pub fn hash_n_to_m_no_pad<F: RichField, P: PlonkyPermutation<F>>(
 
 pub fn hash_n_to_hash_no_pad<F: RichField, P: PlonkyPermutation<F>>(inputs: &[F]) -> HashOut<F> {
     HashOut::from_vec(hash_n_to_m_no_pad::<F, P>(inputs, NUM_HASH_OUT_ELTS))
+}
+
+/// Batched, packed-field version of [`hash_n_to_hash_no_pad`] for Poseidon
+/// over `F::Packable::Packing`.
+///
+/// Hashes `P::WIDTH` independent messages of the same length in lockstep,
+/// one message per SIMD lane, using the packed Poseidon permutation. For
+/// wide messages (many RATE-sized chunks) this amortizes the permutation
+/// cost across lanes; for the Merkle-leaf use case (one RATE chunk) it
+/// reduces the hashing work per leaf to roughly one packed permutation.
+///
+/// Requires every message to have the same length (fixed-width leaves);
+/// lengths need not be a multiple of the sponge rate — the final partial
+/// chunk overwrites only the first `chunk_len` state slots, exactly like
+/// the scalar sponge.
+pub fn poseidon_hash_batch_no_pad<F, P>(messages: &[&[F]]) -> Vec<HashOut<F>>
+where
+    F: RichField,
+    P: PackedField<Scalar = F>,
+{
+    assert!(!messages.is_empty());
+    assert!(messages.len() <= P::WIDTH);
+    let len = messages[0].len();
+    assert!(messages.iter().all(|m| m.len() == len));
+
+    let width = messages.len();
+    debug_assert!(width <= P::WIDTH);
+    let mut state = [P::ZEROS; SPONGE_WIDTH];
+
+    // Absorb all input chunks, overwriting the sponge rate portion like
+    // `hash_n_to_m_no_pad`. A partial final chunk overwrites only its own
+    // slots; the rest keep their pre-permutation values, matching the
+    // scalar sponge. Lane k absorbs messages[k]; unused lanes stay zero,
+    // which keeps them independent of the hashed lanes.
+    let mut lane = vec![F::ZERO; P::WIDTH];
+    for chunk_start in (0..len).step_by(SPONGE_RATE) {
+        let chunk_len = SPONGE_RATE.min(len - chunk_start);
+        for i in 0..chunk_len {
+            for (k, msg) in messages.iter().enumerate() {
+                lane[k] = msg[chunk_start + i];
+            }
+            state[i] = *P::from_slice(&lane);
+        }
+        state = F::poseidon_packed_base(state);
+    }
+
+    // Squeeze NUM_HASH_OUT_ELTS base-field elements per lane.
+    let mut outs = Vec::with_capacity(width);
+    for k in 0..width {
+        let mut elements = [F::ZERO; NUM_HASH_OUT_ELTS];
+        for (i, elem) in elements.iter_mut().enumerate() {
+            *elem = state[i].as_slice()[k];
+        }
+        outs.push(HashOut { elements });
+    }
+    outs
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::hash::poseidon::{Poseidon, PoseidonHash};
+    use crate::plonk::config::Hasher;
+    use plonky2_field::packable::Packable;
+
+    type F = GoldilocksField;
+    type P = <F as Packable>::Packing;
+
+    #[test]
+    fn packed_batch_hash_matches_scalar() {
+        // RATE-multiple and partial-chunk lengths (v4 digest leaf widths
+        // like 237 are not RATE multiples; the final partial chunk must
+        // overwrite only its own sponge slots).
+        for len in [
+            SPONGE_RATE,
+            2 * SPONGE_RATE,
+            3 * SPONGE_RATE,
+            237,
+            222,
+            339,
+            5,
+        ] {
+            let msgs: Vec<Vec<F>> = (0..P::WIDTH)
+                .map(|k| {
+                    (0..len)
+                        .map(|i| F::from_canonical_u64((k as u64) * 1009 + i as u64))
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[F]> = msgs.iter().map(|m| &m[..]).collect();
+            let packed = poseidon_hash_batch_no_pad::<F, P>(&refs);
+            for (k, msg) in msgs.iter().enumerate() {
+                let scalar = PoseidonHash::hash_no_pad(msg);
+                assert_eq!(packed[k], scalar, "len={} lane={}", len, k);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_permute_matches_scalar() {
+        // The packed permutation with a single active lane must equal the
+        // scalar permutation (unused lanes are zero, and Poseidon's zero
+        // state is a fixed point, so lane 0 is unaffected by idle lanes).
+        let input: [F; SPONGE_WIDTH] =
+            core::array::from_fn(|i| F::from_canonical_u64(17 * i as u64 + 1));
+        let scalar = F::poseidon(input);
+
+        let mut state = [P::ZEROS; SPONGE_WIDTH];
+        for (i, x) in input.iter().enumerate() {
+            state[i] = P::from(*x);
+        }
+        let packed = F::poseidon_packed_base(state);
+        for i in 0..SPONGE_WIDTH {
+            assert_eq!(packed[i].as_slice()[0], scalar[i]);
+        }
+    }
 }

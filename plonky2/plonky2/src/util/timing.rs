@@ -14,8 +14,31 @@ pub struct TimingTree {
     enter_time: Instant,
     /// The time when this scope was destroyed, or None if it has not yet been destroyed.
     exit_time: Option<Instant>,
+    /// Process-wide CPU ticks (user+system, all threads) when the scope opened.
+    enter_cpu: Option<u64>,
+    /// CPU ticks consumed while the scope was open, or None until it closes.
+    cpu_delta: Option<u64>,
     /// Any child scopes.
     children: Vec<TimingTree>,
+}
+
+/// Process-wide CPU time (user+system, all threads) in `USER_HZ` (100) clock
+/// ticks, read from `/proc/self/stat`. `None` off Linux or on any parse
+/// failure — callers fall back to wall time only.
+#[cfg(feature = "timing")]
+fn process_cpu_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The comm field (2nd) can contain spaces and parentheses; everything after
+    // the final ')' is fixed-format whitespace fields starting at `state`.
+    let mut fields = stat.rsplit(')').next()?.split_whitespace();
+    let _state = fields.next()?;
+    // Skip ppid..cmajflt (fields 4..=13); utime and stime follow.
+    for _ in 0..10 {
+        fields.next()?;
+    }
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime + stime)
 }
 
 #[cfg(not(feature = "timing"))]
@@ -44,6 +67,8 @@ impl TimingTree {
             level,
             enter_time: Instant::now(),
             exit_time: None,
+            enter_cpu: process_cpu_ticks(),
+            cpu_delta: None,
             children: vec![],
         }
     }
@@ -82,7 +107,7 @@ impl TimingTree {
         assert!(self.is_open());
 
         // We don't want a scope's log level to be stronger than that of its parent.
-        level = level.max(self.level);
+        level = level.min(self.level);
 
         if let Some(last_child) = self.children.last_mut() {
             if last_child.is_open() {
@@ -96,6 +121,8 @@ impl TimingTree {
             level,
             enter_time: Instant::now(),
             exit_time: None,
+            enter_cpu: process_cpu_ticks(),
+            cpu_delta: None,
             children: vec![],
         })
     }
@@ -116,6 +143,11 @@ impl TimingTree {
         }
 
         self.exit_time = Some(Instant::now());
+        if let Some(enter) = self.enter_cpu {
+            if let Some(now) = process_cpu_ticks() {
+                self.cpu_delta = Some(now.saturating_sub(enter));
+            }
+        }
     }
 
     #[cfg(not(feature = "timing"))]
@@ -136,6 +168,8 @@ impl TimingTree {
             level: self.level,
             enter_time: self.enter_time,
             exit_time: self.exit_time,
+            enter_cpu: self.enter_cpu,
+            cpu_delta: self.cpu_delta,
             children: self
                 .children
                 .iter()
@@ -161,11 +195,29 @@ impl TimingTree {
     #[cfg(feature = "timing")]
     fn print_helper(&self, depth: usize) {
         let prefix = "| ".repeat(depth);
+        // Mean busy cores while the scope was open: CPU-tick delta over the
+        // 100Hz process accounting clock, divided by the scope's wall time
+        // (ticks are 10ms, so short scopes read coarse; long scopes are exact).
+        let cores = match (self.cpu_delta, self.exit_time) {
+            (Some(ticks), Some(exit)) => {
+                let secs = exit.duration_since(self.enter_time).as_secs_f64();
+                if secs > 0.0 {
+                    Some(ticks as f64 / 100.0 / secs)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let cores = cores
+            .map(|c| format!(", {c:.1} avg cores"))
+            .unwrap_or_default();
         log!(
             self.level,
-            "{}{:.4}s to {}",
+            "{}{:.4}s{} to {}",
             prefix,
             self.duration().as_secs_f64(),
+            cores,
             self.name
         );
         for child in &self.children {

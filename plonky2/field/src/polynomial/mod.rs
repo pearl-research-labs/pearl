@@ -19,7 +19,7 @@ use crate::types::Field;
 ///
 /// The points are implicitly `g^i`, where `g` generates the subgroup whose size equals the number
 /// of points.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PolynomialValues<F: Field> {
     pub values: Vec<F>,
 }

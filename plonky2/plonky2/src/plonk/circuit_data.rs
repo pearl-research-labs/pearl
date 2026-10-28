@@ -188,6 +188,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         buffer.read_circuit_data(gate_serializer, generator_serializer)
     }
 
+    /// Like [`Self::prove`], but reports its sub-phase timings into `timing`,
+    /// so a parent (e.g. a wrapper prover) can attribute wrapper cost.
+    pub fn prove_with_timing(
+        &self,
+        inputs: PartialWitness<F>,
+        timing: &mut TimingTree,
+    ) -> Result<ProofWithPublicInputs<F, C, D>> {
+        prove::<F, C, D>(&self.prover_only, &self.common, inputs, timing)
+    }
+
     pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
         prove::<F, C, D>(
             &self.prover_only,

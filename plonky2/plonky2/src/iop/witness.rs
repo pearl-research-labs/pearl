@@ -18,6 +18,7 @@ use crate::iop::wire::Wire;
 use crate::plonk::circuit_data::{VerifierCircuitTarget, VerifierOnlyCircuitData};
 use crate::plonk::config::{AlgebraicHasher, GenericConfig};
 use crate::plonk::proof::{Proof, ProofTarget, ProofWithPublicInputs, ProofWithPublicInputsTarget};
+use plonky2_maybe_rayon::*;
 
 pub trait WitnessWrite<F: Field> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()>;
@@ -391,16 +392,27 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
-        for i in 0..self.degree {
-            for j in 0..self.num_wires {
-                let t = Target::Wire(Wire { row: i, column: j });
-                if let Some(x) = self.try_get_target(t) {
-                    wire_values[j][i] = x;
-                }
-            }
-        }
-
+        // Gather the wire matrix in parallel: each column only reads the
+        // partition values through the shared representative map.
+        let PartitionWitness {
+            values,
+            representative_map,
+            num_wires,
+            degree,
+        } = &self;
+        let wire_values: Vec<Vec<F>> = (0..*num_wires)
+            .into_par_iter()
+            .map(|j| {
+                (0..*degree)
+                    .map(|i| {
+                        let target_index =
+                            Target::Wire(Wire { row: i, column: j }).index(*num_wires, *degree);
+                        values[representative_map[target_index]].unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .collect();
+        drop(self);
         MatrixWitness { wire_values }
     }
 }

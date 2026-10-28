@@ -776,6 +776,131 @@ pub trait Poseidon: PrimeField64 {
         state
     }
 
+    /// Packed variant of [`Poseidon::poseidon`]: applies the same permutation
+    /// to `P::WIDTH` independent base-field states in lockstep, one lane per
+    /// state. This is exactly `P::WIDTH` independent scalar permutations
+    /// computed with packed (SIMD) field arithmetic, mirroring the scalar
+    /// round structure: `HALF_N_FULL_ROUNDS` full rounds, `N_PARTIAL_ROUNDS`
+    /// fast partial rounds, `HALF_N_FULL_ROUNDS` full rounds.
+    ///
+    /// Unlike the `*_packed_field` helpers (which pack a field *extension*,
+    /// so their permutation state is made of extension elements), this
+    /// operates on lanes of the Poseidon base field `Self`, matching the
+    /// scalar implementation round for round.
+    fn poseidon_packed_base<P>(input: [P; SPONGE_WIDTH]) -> [P; SPONGE_WIDTH]
+    where
+        P: PackedField<Scalar = Self>,
+    {
+        let mut state = input;
+
+        // Full rounds, first half.
+        for round_ctr in 0..HALF_N_FULL_ROUNDS {
+            for i in 0..SPONGE_WIDTH {
+                state[i] +=
+                    Self::from_canonical_u64(ALL_ROUND_CONSTANTS[i + SPONGE_WIDTH * round_ctr]);
+            }
+            for i in 0..SPONGE_WIDTH {
+                // x |--> x^7, via packed square/mul.
+                let x = state[i];
+                let x2 = x.square();
+                let x4 = x2.square();
+                let x3 = x * x2;
+                state[i] = x3 * x4;
+            }
+            // MDS layer: result[r] = sum_i CIRC[i] * state[(i + r) % W] + DIAG[r] * state[r].
+            // The circulant matrix rows are rotations, so each output reads
+            // the same lanes; accumulate per output row.
+            let mut result = [P::ZEROS; SPONGE_WIDTH];
+            for r in 0..SPONGE_WIDTH {
+                let mut acc = state[(0 + r) % SPONGE_WIDTH]
+                    * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[0]);
+                for i in 1..SPONGE_WIDTH {
+                    acc += state[(i + r) % SPONGE_WIDTH]
+                        * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[i]);
+                }
+                acc += state[r] * Self::from_canonical_u64(Self::MDS_MATRIX_DIAG[r]);
+                result[r] = acc;
+            }
+            state = result;
+        }
+
+        // Fast partial rounds.
+        for i in 0..SPONGE_WIDTH {
+            state[i] += Self::from_canonical_u64(Self::FAST_PARTIAL_FIRST_ROUND_CONSTANT[i]);
+        }
+        {
+            // Initial partial matrix: row 0 keeps state[0]; result[c] =
+            // sum_r INITIAL[r-1][c-1] * state[r] for c, r in 1..W.
+            let mut result = [P::ZEROS; SPONGE_WIDTH];
+            result[0] = state[0];
+            for r in 1..SPONGE_WIDTH {
+                for c in 1..SPONGE_WIDTH {
+                    result[c] += state[r]
+                        * Self::from_canonical_u64(
+                            Self::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c - 1],
+                        );
+                }
+            }
+            state = result;
+        }
+        for r in 0..N_PARTIAL_ROUNDS {
+            {
+                // Sbox on state[0] only.
+                let x = state[0];
+                let x2 = x.square();
+                let x4 = x2.square();
+                let x3 = x * x2;
+                state[0] = x3 * x4;
+            }
+            state[0] += Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_CONSTANTS[r]);
+            // d = M_00 * state[0] + sum_i W_HATS[r][i-1] * state[i]
+            let mut d = state[0]
+                * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[0] + Self::MDS_MATRIX_DIAG[0]);
+            for i in 1..SPONGE_WIDTH {
+                d += state[i] * Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_W_HATS[r][i - 1]);
+            }
+            // result = [d] concat [state[0] * V[r][i-1] + state[i]]
+            let mut result = [P::ZEROS; SPONGE_WIDTH];
+            result[0] = d;
+            let s0 = state[0];
+            for i in 1..SPONGE_WIDTH {
+                result[i] =
+                    s0 * Self::from_canonical_u64(Self::FAST_PARTIAL_ROUND_VS[r][i - 1]) + state[i];
+            }
+            state = result;
+        }
+
+        // Full rounds, second half.
+        for offset in 0..HALF_N_FULL_ROUNDS {
+            let round_ctr = HALF_N_FULL_ROUNDS + N_PARTIAL_ROUNDS + offset;
+            for i in 0..SPONGE_WIDTH {
+                state[i] +=
+                    Self::from_canonical_u64(ALL_ROUND_CONSTANTS[i + SPONGE_WIDTH * round_ctr]);
+            }
+            for i in 0..SPONGE_WIDTH {
+                let x = state[i];
+                let x2 = x.square();
+                let x4 = x2.square();
+                let x3 = x * x2;
+                state[i] = x3 * x4;
+            }
+            let mut result = [P::ZEROS; SPONGE_WIDTH];
+            for r in 0..SPONGE_WIDTH {
+                let mut acc = state[(0 + r) % SPONGE_WIDTH]
+                    * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[0]);
+                for i in 1..SPONGE_WIDTH {
+                    acc += state[(i + r) % SPONGE_WIDTH]
+                        * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[i]);
+                }
+                acc += state[r] * Self::from_canonical_u64(Self::MDS_MATRIX_DIAG[r]);
+                result[r] = acc;
+            }
+            state = result;
+        }
+
+        state
+    }
+
     // For testing only, to ensure that various tricks are correct.
     #[inline]
     fn partial_rounds_naive(state: &mut [Self; SPONGE_WIDTH], round_ctr: &mut usize) {
