@@ -4,6 +4,7 @@ Main application class that orchestrates all components.
 
 import os
 import tempfile
+from contextlib import AsyncExitStack
 
 from miner_utils import get_logger
 
@@ -72,14 +73,17 @@ class PearlGateway:
 
         self.logger.info("Starting PearlGateway")
 
-        # Start Pearl client
-        await self.pearl_client.__aenter__()
+        async with AsyncExitStack() as cleanup:
+            await self.pearl_client.__aenter__()
+            cleanup.push_async_callback(self.pearl_client.__aexit__, None, None, None)
 
-        # Start the scheduler (which will immediately fetch a block template)
-        await self.scheduler.start()
+            # Register cleanup before each start in case it fails partway through.
+            cleanup.push_async_callback(self.scheduler.stop)
+            await self.scheduler.start()
 
-        # Start the Miner RPC server
-        await self.miner_rpc.start()
+            cleanup.push_async_callback(self.miner_rpc.stop)
+            await self.miner_rpc.start()
+            cleanup.pop_all()
 
         self.running = True
 

@@ -137,6 +137,20 @@ class TestMinerRpcServerTransport:
         assert not os.path.exists(socket_path)
         assert uds_server.server is None
 
+    async def test_uds_does_not_delete_regular_file(
+        self, mock_work_cache, mock_submission_service, tmp_path
+    ):
+        socket_path = tmp_path / "miner.sock"
+        socket_path.write_text("keep me")
+        config = MinerRpcConfig(transport="uds", socket_path=str(socket_path))
+        server = MinerRpcServer(mock_work_cache, mock_submission_service, config)
+
+        with pytest.raises(FileExistsError):
+            await server.start()
+        await server.stop()
+
+        assert socket_path.read_text() == "keep me"
+
     async def test_uds_socket_permissions(self, uds_server):
         """Test UDS socket file permissions."""
         socket_path = uds_server.config.socket_path

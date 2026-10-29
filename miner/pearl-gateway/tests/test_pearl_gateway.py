@@ -201,6 +201,13 @@ class TestPearlGateway:
         with pytest.raises(RuntimeError, match="Scheduler failed"):
             await gateway.start()
 
+        assert gateway.running is False
+        mock_pearl_gateway_components["scheduler"].stop.assert_awaited_once()
+        mock_pearl_gateway_components["pearl_client"].__aexit__.assert_awaited_once_with(
+            None, None, None
+        )
+        mock_pearl_gateway_components["miner_rpc"].stop.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_pearl_gateway_start_miner_rpc_error(
         self, mock_pearl_gateway_components, config_env_vars
@@ -213,6 +220,16 @@ class TestPearlGateway:
 
         with pytest.raises(OSError, match="Port in use"):
             await gateway.start()
+
+        assert gateway.running is False
+        mock_pearl_gateway_components["miner_rpc"].stop.assert_awaited_once()
+        mock_pearl_gateway_components["scheduler"].stop.assert_awaited_once()
+        mock_pearl_gateway_components["pearl_client"].__aexit__.assert_awaited_once_with(
+            None, None, None
+        )
+
+        await gateway.stop()
+        mock_pearl_gateway_components["miner_rpc"].stop.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_pearl_gateway_full_lifecycle(
