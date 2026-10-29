@@ -120,7 +120,15 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, feeRatePerKb btcutil.Amount,
 		if err != nil {
 			return nil, err
 		}
-		if inputAmount < targetAmount+targetFee {
+		// The fee of a transaction without a change output, for the
+		// inputs selected so far.  A change output may not be created,
+		// so inputs that cannot cover the change-reserved fee may still
+		// be sufficient for the no-change transaction.
+		feeNoChange := txrules.FeeForSerializeSize(feeRatePerKb,
+			txsizes.EstimateVirtualSize(0, len(scripts), 0, 0, outputs, 0))
+
+		if inputAmount < targetAmount+targetFee &&
+			inputAmount < targetAmount+feeNoChange {
 			return nil, insufficientFundsError{}
 		}
 
@@ -138,8 +146,14 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, feeRatePerKb btcutil.Amount,
 		maxRequiredFee := txrules.FeeForSerializeSize(feeRatePerKb, maxSignedSize)
 		remainingAmount := inputAmount - targetAmount
 		if remainingAmount < maxRequiredFee {
-			targetFee = maxRequiredFee
-			continue
+			if remainingAmount >= feeNoChange {
+				// Pay the whole remainder as fee so no underfunded
+				// change output is created.
+				maxRequiredFee = remainingAmount
+			} else {
+				targetFee = maxRequiredFee
+				continue
+			}
 		}
 
 		unsignedTransaction := &wire.MsgTx{
@@ -151,17 +165,18 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, feeRatePerKb btcutil.Amount,
 
 		changeIndex := -1
 		changeAmount := inputAmount - targetAmount - maxRequiredFee
-		changeScript, err := changeSource.NewScript()
-		if err != nil {
-			return nil, err
-		}
-		change := wire.NewTxOut(int64(changeAmount), changeScript)
-		if changeAmount != 0 && !txrules.IsDustOutput(change,
-			txrules.DefaultRelayFeePerKb) {
-
-			l := len(outputs)
-			unsignedTransaction.TxOut = append(outputs[:l:l], change)
-			changeIndex = l
+		if changeAmount > 0 {
+			changeScript, err := changeSource.NewScript()
+			if err != nil {
+				return nil, err
+			}
+			change := wire.NewTxOut(int64(changeAmount), changeScript)
+			if !txrules.IsDustOutput(change,
+				txrules.DefaultRelayFeePerKb) {
+				l := len(outputs)
+				unsignedTransaction.TxOut = append(outputs[:l:l], change)
+				changeIndex = l
+			}
 		}
 
 		return &AuthoredTx{
