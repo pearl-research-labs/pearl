@@ -17,7 +17,7 @@ use crate::v4::circuit::columns_view::columns_view;
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct XorFoldColumnsView<T: Copy> {
-    /// The Matmul output cell this row folds, per the committed `lane_assignment`; key of the
+    /// The Matmul output cell this row folds, in fixed row-major chunk order; key of the
     /// cell-results CTL. Class (a), verifier-recomputed from the committed lane layout.
     pub cell_id: T,
     /// Which of the 16 lottery words this lane produces; key of the Blake3 channel. Class (a).

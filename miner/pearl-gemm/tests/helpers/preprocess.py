@@ -47,13 +47,8 @@ from pearl_gemm import (
 )
 from pearl_gemm.protocol_constants import R
 
-# Grid/subtile lottery layout: each subtile is exactly one thread's
-# natively-held TMEM accumulator fragment at fixed h within one
-# tile_cols-wide block, so the GPU fold is thread-local (no shuffles). The
-# merged tile is 4 contiguous rows x tile_cols contiguous cols, full
-# coverage. tile_cols is a per-job choice committed into ``pB``
-# (128 default; 64/192/256 legal -- subtile elems <= 256 for all four,
-# see mixed_gemm/).
+# Consecutive 4-row lottery tiles. Each row contributes four consecutive
+# chunks. tile_cols is committed into pB and supports 64/128/192/256 columns.
 TILE_ROWS = 4
 TILE_COLS = 128
 _MAX_256 = (1 << 256) - 1
@@ -71,11 +66,8 @@ def tall_tile_config(k: int, r: int = R, device: Device = Device.BLACKWELL) -> M
 
     Same 512-element area as 4x128 (difficulty-invariant) but rows+cols = 48,
     so the peel proof fits the verifier's 2^22 element limit up to k = 65536
-    (vs 31744 for 4x128) -- what makes k=16384 (GLM o_proj) mineable. Grid is
-    16x1 with a 1x32 subtile: one lane per tile row, each lane folding its
-    row's 32 contiguous columns in ascending order -- exactly the kernel's
-    thread-local single-row fold. Verifier bounds: blake product = 16*1 =
-    LANES, subtile 1*32 = 32 <= 256 elems.
+    (vs 31744 for 4x128). One consecutive 32-cell chunk per row gives
+    16 message words.
     """
     return tall_tile_mining_config(k, r, device)
 
@@ -121,8 +113,8 @@ class MinerContext:
 
     def threshold_for(self) -> int:
         """Lottery threshold ``min(target * work, 2^256-1)`` for the merged tile."""
-        rows = self.config.rows_pattern.tile_size
-        cols = self.config.cols_pattern.tile_size
+        rows = self.config.tile_rows
+        cols = self.config.tile_cols
         return min(self.target * rows * cols * self.k, _MAX_256)
 
     def threshold_bytes(self) -> bytes:

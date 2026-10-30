@@ -18,7 +18,6 @@ from .layout import (
     MIN_SUBTILE_ELEMS,
     MIN_TILE_COLS,
     MIN_TILE_ROWS,
-    AxisPattern,
 )
 
 
@@ -113,16 +112,19 @@ class CommonParams:
 
 @dataclass(frozen=True)
 class OperandParams:
-    """Committed row count, Merkle layout, and lottery pattern for one operand."""
+    """Committed full row count, Merkle layout, and tile size."""
 
     num_rows: int
     hash_id: HashId
-    pattern: AxisPattern
+    tile_size: int
 
     def __post_init__(self) -> None:
         _check_u32(self.num_rows, "num_rows")
         if self.num_rows == 0:
             raise ValueError("num_rows must be positive")
+        _check_u32(self.tile_size, "tile_size")
+        if self.tile_size == 0:
+            raise ValueError("tile_size must be positive")
         if not isinstance(self.hash_id, HashId):
             raise TypeError("hash_id must be a HashId")
 
@@ -145,15 +147,15 @@ class MoeParams:
 
 
 def encode_p_a(a: OperandParams, moe: MoeParams | None = None) -> bytes:
-    """Encode ``pA = (m, hash_idA, Prow[, hash_idR, hash_idO])``."""
-    out = struct.pack("<IB", a.num_rows, a.hash_id) + a.pattern.to_bytes()
+    """Encode ``pA = (m, hash_idA, h[, hash_idR, hash_idO])``."""
+    out = struct.pack("<IBI", a.num_rows, a.hash_id, a.tile_size)
     if moe is not None:
         out += bytes((moe.hash_id_r, moe.hash_id_o))
     return out
 
 
 def encode_p_b(common: CommonParams, b: OperandParams, experts: int = 0) -> bytes:
-    """Encode ``pB = (n, k, r, Quant, Device, hash_idB, Pcol, e)``."""
+    """Encode ``pB = (n, k, r, Quant, Device, hash_idB, w, e)``."""
     _check_u16(experts, "experts")
     return (
         struct.pack(
@@ -165,27 +167,26 @@ def encode_p_b(common: CommonParams, b: OperandParams, experts: int = 0) -> byte
             common.device,
             b.hash_id,
         )
-        + b.pattern.to_bytes()
+        + struct.pack("<I", b.tile_size)
         + struct.pack("<H", experts)
     )
 
 
 def validate_lottery_layout(a: OperandParams, b: OperandParams) -> None:
     """Validate the cross-axis lottery geometry shared by dense and MoE mining."""
-    n_lanes = a.pattern.blake_size * b.pattern.blake_size
-    if n_lanes != LANES:
-        raise ValueError(f"Blake dims must select exactly {LANES} subtiles, got {n_lanes}")
-    subtile_elems = a.pattern.fold_size * b.pattern.fold_size
+    tile_elems = a.tile_size * b.tile_size
+    if tile_elems % LANES:
+        raise ValueError(f"lottery tile element count must be divisible by {LANES}")
+    subtile_elems = tile_elems // LANES
     if not MIN_SUBTILE_ELEMS <= subtile_elems <= MAX_SUBTILE_ELEMS:
         raise ValueError(
             f"subtile has {subtile_elems} elements, "
             f"must be {MIN_SUBTILE_ELEMS}..{MAX_SUBTILE_ELEMS}"
         )
-    if a.pattern.tile_size < MIN_TILE_ROWS:
-        raise ValueError(f"rows tile selects {a.pattern.tile_size} strips, min is {MIN_TILE_ROWS}")
-    if b.pattern.tile_size < MIN_TILE_COLS:
-        raise ValueError(f"cols tile selects {b.pattern.tile_size} strips, min is {MIN_TILE_COLS}")
-    tile_elems = a.pattern.tile_size * b.pattern.tile_size
+    if a.tile_size < MIN_TILE_ROWS:
+        raise ValueError(f"rows tile selects {a.tile_size} strips, min is {MIN_TILE_ROWS}")
+    if b.tile_size < MIN_TILE_COLS:
+        raise ValueError(f"cols tile selects {b.tile_size} strips, min is {MIN_TILE_COLS}")
     if tile_elems > MAX_TILE_ELEMS:
         raise ValueError(f"lottery tile has {tile_elems} elements, max is {MAX_TILE_ELEMS}")
 

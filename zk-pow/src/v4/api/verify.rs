@@ -73,8 +73,8 @@ pub fn verify_plain_proof(
         &tile_a,
         &tile_b,
         k,
-        &public_params.a().pattern,
-        &public_params.b().pattern,
+        public_params.h() as usize,
+        public_params.w() as usize,
     )?
     else {
         bail!("The jackpot is not admissible");

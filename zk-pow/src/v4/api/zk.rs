@@ -87,7 +87,7 @@ use plonky2::util::timing::TimingTree;
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::BatchStarkPreprocessedData;
 
-use crate::v4::api::layout::{AxisPattern, DimType, lane_assignment};
+use crate::v4::api::layout::lane_assignment;
 use crate::v4::api::noise::compute_fp8_noise;
 use crate::v4::api::openings::stream_words;
 use crate::v4::api::plain_proof::PlainProofV4;
@@ -349,7 +349,7 @@ impl Fp8VerifierCache {
 }
 
 /// The canonical minimum-envelope dense statement — `m = n = 32`, `k = 1024`,
-/// rank 32, per-axis pattern `[(4, Fold), (4, Blake)]`:
+/// rank 32, `h = w = 16`:
 /// the statement `build_cache` compiles the universal setup from (any
 /// envelope-legal statement yields the same circuits) and the
 /// committed-LUT-cap tests pin. Its consumers only need an envelope-legal
@@ -363,7 +363,6 @@ pub fn sample_dense_statement() -> Result<PublicParams> {
 /// each device's job-independent prover setup, LUT commitment and universal
 /// verifier setup.
 pub fn sample_dense_statement_for_device(device: Device) -> Result<PublicParams> {
-    let pattern = AxisPattern::new(&[(4, DimType::Fold), (4, DimType::Blake)])?;
     let params = PublicParams::try_new(
         JobParams {
             ancestor_header: BlockHeader::zero(),
@@ -377,12 +376,12 @@ pub fn sample_dense_statement_for_device(device: Device) -> Result<PublicParams>
                 a: OperandParams {
                     num_rows: 32,
                     hash_id: HashId::Blake3Chunk1024,
-                    pattern: pattern.clone(),
+                    tile_size: 16,
                 },
                 b: OperandParams {
                     num_rows: 32,
                     hash_id: HashId::Blake3Chunk1024,
-                    pattern,
+                    tile_size: 16,
                 },
             },
             moe: None,
@@ -521,7 +520,7 @@ impl Fp8Job {
         };
         let scale = ScaleProgram::new_for_device(h, w, k, r, params.common().device);
         let xor_fold = XorFoldProgram {
-            lanes: lane_assignment(&params.a().pattern, &params.b().pattern),
+            lanes: lane_assignment(h, w),
             skip_limit: budget(k, h, w),
         };
 

@@ -1041,7 +1041,7 @@ mod tests {
         let bits = |rows: usize| rows.next_power_of_two().trailing_zeros() as usize;
         for h in 4..=128 {
             for w in 16..=(2048 / h) {
-                if h * w < 256 {
+                if h * w < 256 || (h * w) % 16 != 0 {
                     continue;
                 }
                 let k_max = ((1 << 22) / (h + w) / 32 * 32).min(PublicParams::MAX_K);

@@ -175,10 +175,10 @@ def test_tall_tile_pattern_satisfies_verifier_bounds():
     shrinks rows+cols to 48, which keeps a k=16384 peel proof under the
     verifier's 4 MiB worker-input cap -- the shape the tall tile exists for."""
     protocol = tall_tile_config(16384)
-    lanes = lane_assignment(protocol.rows_pattern, protocol.cols_pattern)
+    lanes = lane_assignment(protocol.tile_rows, protocol.tile_cols)
     assert len(lanes) == 16
-    assert protocol.rows_pattern.tile_size == 16
-    assert protocol.cols_pattern.tile_size == 32
+    assert protocol.tile_rows == 16
+    assert protocol.tile_cols == 32
     assert 16 * 32 == 4 * 128
     assert (16 + 32) * 16384 * 2 <= 1 << 22
     # subtile is 1x32 <= 256 elems; lane j is row j's 32 columns ascending.

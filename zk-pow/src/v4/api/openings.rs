@@ -21,8 +21,8 @@ use crate::v4::circuit::chip::blake3::program::{
 
 /// Opened strips and Blake3 auxiliary material from [`PublicParams::verify_openings`].
 ///
-/// - *operands.a*: A's opened prequant `rows_pattern.tile_size()` rows, each of length `common_dim`.
-/// - *operands.b*: B^T's opened prequant `cols_pattern.tile_size()` columns, each of length `common_dim`.
+/// - *operands.a*: A's opened prequant `h` rows, each of length `common_dim`.
+/// - *operands.b*: B^T's opened prequant `w` columns, each of length `common_dim`.
 /// - *s_routing*: 64-byte strips of raw routing data (see below).
 /// - *external_msgs*: additional leaf data, consumed to generate the Blake3 trace.
 /// - *external_cvs*: Merkle siblings in a Merkle proof.
@@ -502,8 +502,6 @@ fn reject_nonfinite_prequant(operand: &PrequantOperand, k: usize) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v4::api::layout::AxisPattern;
-    use crate::v4::api::layout::DimType::{Blake, Fold};
     use crate::v4::api::plain_proof::PlainProofV4;
     use crate::v4::api::primitives::IncompleteBlockHeader;
     use crate::v4::api::public_params::test_fixtures::ancestry;
@@ -544,14 +542,14 @@ mod tests {
         b_hash: HashId,
         commit_keys: impl FnOnce(Sides<Hash256>) -> Sides<Hash256>,
     ) -> (IncompleteBlockHeader, PlainProofV4) {
-        // k ≥ 2048, 16 Blake lanes, 4×64 tile (256 elements).
+        // k ≥ 2048, 16 extractor lanes, 4×64 tile (256 elements).
         // m > h and n > w so some rows stay unopened (auxiliary msgs/CVs).
         let (m, n) = (8usize, 128usize);
         let n_blocks = k / BLOCK_SIZE;
-        let rows_pattern = AxisPattern::new(&[(4, Blake)]).unwrap();
-        let cols_pattern = AxisPattern::new(&[(4, Blake), (16, Fold)]).unwrap();
-        let a_rows: Vec<usize> = rows_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
-        let b_rows: Vec<usize> = cols_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
+        let h = 4;
+        let w = 64;
+        let a_rows: Vec<usize> = (0..h).collect();
+        let b_rows: Vec<usize> = (0..w).collect();
         // σ_d is the parent of σ̂ in this fixture.
         let (proposed, ancestor_chain, ancestor_header) = ancestry(1);
         let keys = commit_keys(Sides {
@@ -583,12 +581,12 @@ mod tests {
                     a: OperandParams {
                         num_rows: m as u32,
                         hash_id: a_hash,
-                        pattern: rows_pattern,
+                        tile_size: h as u32,
                     },
                     b: OperandParams {
                         num_rows: n as u32,
                         hash_id: b_hash,
-                        pattern: cols_pattern,
+                        tile_size: w as u32,
                     },
                 },
                 moe: None,
@@ -662,12 +660,12 @@ mod tests {
                     a: OperandParams {
                         num_rows: f.public.m(),
                         hash_id: HashId::Blake3Chunk128,
-                        pattern: f.public.a().pattern.clone(),
+                        tile_size: f.public.a().tile_size,
                     },
                     b: OperandParams {
                         num_rows: f.public.n(),
                         hash_id: HashId::Blake3Chunk1024,
-                        pattern: f.public.b().pattern.clone(),
+                        tile_size: f.public.b().tile_size,
                     },
                 },
                 moe: None,

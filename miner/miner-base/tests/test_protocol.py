@@ -17,10 +17,10 @@ from miner_base.devices import device_for_capability, local_device
 from miner_base.mining_config import COMMITMENT_CHUNK_SIZE, activation_leaf, default_mining_config
 from miner_base.prequant import DEFAULT_BLOCK_SIZE, PrequantMatrix
 
-# cert-v4 ``pB`` wire: n(4) | k(4) | r(2) | quant(1) | device(1) | hash_idB(1) | Pcol | e(2)
+# cert-v4 ``pB`` wire: n(4) | k(4) | r(2) | quant(1) | device(1) | hash_idB(1) | w(4) | e(2)
 _P_B_DEVICE_OFFSET = 11
 _P_B_HASH_ID_OFFSET = 12
-# ``pA`` wire: m(4) | hash_idA(1) | Prow
+# ``pA`` wire: m(4) | hash_idA(1) | h(4)
 _P_A_HASH_ID_OFFSET = 4
 
 

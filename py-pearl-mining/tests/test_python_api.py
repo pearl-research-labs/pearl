@@ -430,9 +430,6 @@ def make_dummy_plain_proof_v4(
 ) -> pearl_mining.PlainProofV4:
     """Lightweight (non-verifiable) PlainProofV4 for eligibility checks only."""
     matrix_proof = pearl_mining.MatrixMerkleProof(proof=_dummy_merkle_proof(), row_indices=[0])
-    pattern = pearl_mining.AxisPattern(
-        [(4, pearl_mining.DimType.Fold), (4, pearl_mining.DimType.Blake)]
-    )
     header = pearl_mining.BlockHeader(
         pearl_mining.IncompleteBlockHeader(
             version=0,
@@ -449,8 +446,8 @@ def make_dummy_plain_proof_v4(
         pearl_mining.Quant.Fp8E4M3Prequant,
         pearl_mining.Device.B200,
     )
-    a = pearl_mining.OperandParams(32, pearl_mining.HashId.Blake3Chunk1024, pattern)
-    b = pearl_mining.OperandParams(32, pearl_mining.HashId.Blake3Chunk1024, pattern)
+    a = pearl_mining.OperandParams(32, pearl_mining.HashId.Blake3Chunk1024, 16)
+    b = pearl_mining.OperandParams(32, pearl_mining.HashId.Blake3Chunk1024, 16)
     return pearl_mining.PlainProofV4(
         header,
         common,

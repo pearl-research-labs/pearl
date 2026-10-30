@@ -539,17 +539,15 @@ impl H100 {
     }
 }
 
-/// Reference lottery epilogue (`XorFoldExtractor` in the reference miner): fold
-/// each of the tile's 16 committed subtiles into one lane. The lane layout
-/// (which tile element feeds which lane, and in what order) is committed in
-/// advance via the config's grid patterns — `lane_indices[j]` lists lane `j`'s
-/// flat indices into the row-major tile in fold order (the committed
-/// [`lane_assignment`](crate::v4::api::layout::lane_assignment), 8.8). Each lane
-/// folds its subtile's `matmul_dtype` (f32) words — reinterpreted as their
-/// same-width unsigned integers — as
-/// `lane = rotl32(lane * 0x9E3779B1 + word, 13)`, and the lanes serialize
-/// little-endian into 64 bytes: exactly one BLAKE3 block for the lottery hash
-/// `blake3(extracted, key=pow_key)`.
+/// Folds sixteen consecutive equal-sized chunks of the compact row-major output
+/// tile: `lane_indices[j]` lists lane `j`'s flat indices in fold order (the
+/// [`lane_assignment`](crate::v4::api::layout::lane_assignment)). Each f32 word
+/// contributes its raw bits to an independent zero-initialized accumulator:
+/// `lane = rotl32(lane * 0x9E3779B1 + word, 13)` (wrapping u32). The sixteen
+/// results serialize little-endian into one 64-byte BLAKE3 message.
+///
+/// # Panics
+/// Panics if `lane_indices` does not describe sixteen lanes covering the tile.
 pub fn xor_fold_extract(c_tile: &[f32], lane_indices: &[Vec<usize>]) -> [u8; 4 * JACKPOT_ENTRIES] {
     assert_eq!(lane_indices.len(), JACKPOT_ENTRIES, "expected {JACKPOT_ENTRIES} lanes");
     let tile_elems: usize = lane_indices.iter().map(Vec::len).sum();
@@ -688,28 +686,20 @@ mod tests {
         assert_eq!(exact_f32_sum_binade(1.0, -tiny), Some(-1));
     }
 
-    /// Cross-implementation test vector: the reference `XorFoldExtractor`
-    /// (each committed subtile's f32 words folded into its own rotl-mixed lane
-    /// per `lane_assignment`, lanes serialized LE) produces exactly these 64
-    /// bytes for this input. Layout: both axes use subtile [0, 1] on grid
-    /// [0, 2, 4, 6] — an 8x8 merged tile, 16 lanes of 4 words each.
+    /// Cross-implementation test vector, computed independently with Python
+    /// using f32 bit patterns, wrapping u32 arithmetic and little-endian words.
+    /// The 64-cell tile is split into sixteen consecutive chunks of four words.
     #[test]
     #[allow(clippy::approx_constant)]
     fn xor_fold_extract_matches_python_reference_vector() {
-        use crate::v4::api::layout::{
-            AxisPattern,
-            DimType::{Blake, Fold},
-            lane_assignment,
-        };
+        use crate::v4::api::layout::lane_assignment;
 
-        // Fold [0, 1] under Blake [0, 2, 4, 6]: the old subtile/grid pair.
-        let axis = AxisPattern::new(&[(2, Fold), (4, Blake)]).unwrap();
-        let lanes = lane_assignment(&axis, &axis);
-        assert_eq!(lanes[0], vec![0, 1, 8, 9], "lane 0 folds the top-left 2x2 subtile");
+        let lanes = lane_assignment(8, 8);
+        assert_eq!(lanes[0], vec![0, 1, 2, 3], "lane 0 folds the first four cells");
 
         let base = [1.0f32, -2.5, 0.0, 3.14159, 1e-3, -0.0, 448.0, 2.0, 0.5, -1.0];
         let tile: Vec<f32> = (0..64).map(|i| base[i % base.len()]).collect();
-        let expected_hex = "433c17856b70ae6a97e608b6a6578200a657820069d113a6433c17856b70ae6a6b70ae6a97e608b6a657820069d113a669d113a6433c17856b70ae6a97e608b6";
+        let expected_hex = "c02dd5dc7d74465fa2507ad4e868dae4de2ebea3c02dd5dc7d74465fa2507ad4e868dae4de2ebea3c02dd5dc7d74465fa2507ad4e868dae4de2ebea3c02dd5dc";
         let expected: Vec<u8> = (0..expected_hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&expected_hex[i..i + 2], 16).unwrap())

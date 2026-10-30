@@ -39,7 +39,6 @@ from .commitment import (
     hash_offsets,
     routing_leaf_indices,
 )
-from .layout import AxisPattern
 from .mining_config import COMMITMENT_CHUNK_SIZE
 from .prequant import DEFAULT_BLOCK_SIZE
 
@@ -204,22 +203,20 @@ def _validate_indices(
     name: str,
     indices: tuple[int, ...] | list[int],
     row_count: int,
-    pattern: AxisPattern,
+    size: int,
 ) -> None:
     normalized = tuple(indices)
     if any(type(index) is not int for index in normalized):
         raise TypeError(f"{name} must contain integers")
-    offsets = tuple(pattern.tile_offsets)
-    if len(normalized) != len(offsets):
+    if size <= 0 or len(normalized) != size:
         raise ValueError(
-            f"{name} must select exactly one {len(offsets)}-row lottery tile, "
-            f"got {len(normalized)} rows"
+            f"{name} must select exactly one {size}-row lottery tile, got {len(normalized)} rows"
         )
     if any(index < 0 or index >= row_count for index in normalized):
         raise ValueError(f"{name} contains an index outside [0, {row_count})")
-    base = normalized[0] - offsets[0]
-    expected = tuple(base + offset for offset in offsets)
-    if base < 0 or not pattern.offset_is_valid(base) or normalized != expected:
+    base = normalized[0]
+    expected = tuple(range(base, base + size))
+    if base % size or normalized != expected:
         raise ValueError(f"{name} does not match one committed lottery tile")
 
 
@@ -236,13 +233,13 @@ def _validate_opening(opened_block_info: OpenedBlockInfo) -> tuple[int, int, int
     if (moe is None) != (config.experts == 0):
         raise ValueError("an MoE opening needs both mining_config.experts and moe")
     if moe is None:
-        _validate_indices("a_row_indices", opened_block_info.a_row_indices, m, config.rows_pattern)
+        _validate_indices("a_row_indices", opened_block_info.a_row_indices, m, config.tile_rows)
         _validate_indices(
-            "b_column_indices", opened_block_info.b_column_indices, n, config.cols_pattern
+            "b_column_indices", opened_block_info.b_column_indices, n, config.tile_cols
         )
         return m, n, k
 
-    # MoE: the lottery lattice is expert-local. Rows are a tile of the expert's
+    # MoE: the consecutive lottery window is expert-local. Rows are a tile of the expert's
     # routing list, columns a tile of the expert's stacked weight rows. The
     # column indices are checked here as given: the expert-local values handed
     # to ``_validate_indices`` below are computed (``index - base``), so a bool
@@ -262,7 +259,7 @@ def _validate_opening(opened_block_info: OpenedBlockInfo) -> tuple[int, int, int
     n_e = n // config.experts
     _validate_routing_witness(moe, config.experts, m)
     expert_rows = moe.expert_rows()
-    _validate_indices("inner_a_rows", moe.inner_a_rows, len(expert_rows), config.rows_pattern)
+    _validate_indices("inner_a_rows", moe.inner_a_rows, len(expert_rows), config.tile_rows)
     if tuple(opened_block_info.a_row_indices) != tuple(expert_rows[i] for i in moe.inner_a_rows):
         raise ValueError("a_row_indices are not the routed tokens of inner_a_rows")
     base = moe.expert_index * n_e
@@ -270,7 +267,7 @@ def _validate_opening(opened_block_info: OpenedBlockInfo) -> tuple[int, int, int
         "b_column_indices",
         tuple(index - base for index in opened_block_info.b_column_indices),
         n_e,
-        config.cols_pattern,
+        config.tile_cols,
     )
     return m, n, k
 
@@ -393,7 +390,7 @@ def _native_operand(params: OperandParams) -> pearl_mining.OperandParams:
     return pearl_mining.OperandParams(
         params.num_rows,
         _NATIVE_HASH_ID[params.hash_id],
-        pearl_mining.AxisPattern.from_bytes(bytes(params.pattern.to_bytes())),
+        params.tile_size,
     )
 
 

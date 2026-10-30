@@ -186,8 +186,8 @@ impl PlainProofV4 {
         self.check_shape()?;
 
         let (inner_a, inner_b, moe_statement) = self.moe_projection()?;
-        let t_rows = parse_axis(&inner_a, &self.job.operands.a.pattern)?;
-        let t_cols = parse_axis(&inner_b, &self.job.operands.b.pattern)?;
+        let t_rows = parse_axis(&inner_a, self.job.operands.a.tile_size)?;
+        let t_cols = parse_axis(&inner_b, self.job.operands.b.tile_size)?;
 
         // Keys must be derived before the statement is built: they key the per-side folds below.
         let keys = Sides {
@@ -577,8 +577,6 @@ impl PlainProofV4 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v4::api::layout::AxisPattern;
-    use crate::v4::api::layout::DimType::Blake;
     use crate::v4::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader};
     use crate::v4::api::public_params::test_fixtures::ancestry;
     use crate::v4::api::public_params::{CommonParams, Device, MoeParams, OperandParams, Quant};
@@ -660,7 +658,6 @@ mod tests {
     fn tiny_moe_proof(experts: u16, offsets: Vec<u32>) -> PlainProofV4 {
         let hash_id = HashId::Blake3Chunk1024;
         let (m, n, k) = (4usize, 4usize, 256usize);
-        let pattern = AxisPattern::new(&[(2, Blake)]).unwrap();
         let matrix = |bytes: usize| MatrixMerkleProof {
             proof: tiny_tree(bytes, hash_id),
             row_indices: vec![0],
@@ -679,12 +676,12 @@ mod tests {
                     a: OperandParams {
                         num_rows: m as u32,
                         hash_id,
-                        pattern: pattern.clone(),
+                        tile_size: 2,
                     },
                     b: OperandParams {
                         num_rows: n as u32,
                         hash_id,
-                        pattern,
+                        tile_size: 2,
                     },
                 },
                 moe: Some(MoeParams {
