@@ -238,7 +238,7 @@ def test_tall_shape_target_change_reuses_the_b_side(preps, device):
     the tall tile made mineable."""
     state = _layer_state(_TALL_K)
     config = mining_configuration(_TALL_K, state.n, device=device)
-    assert (config.rows_pattern.tile_size, config.cols_pattern.tile_size) == (16, 32)
+    assert (config.tile_rows, config.tile_cols) == (16, 32)
 
     first = prepare_layer(state, _job(target=100))
     published = prepare_layer(state, _job(target=200))

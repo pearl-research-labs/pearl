@@ -63,8 +63,8 @@ def _matching_context(
         return None
     if (
         (hit.n, hit.k) != (state.lottery_n, state.k)
-        or hit.ltile_rows != ctx.config.rows_pattern.tile_size
-        or hit.ltile_cols != ctx.config.cols_pattern.tile_size
+        or hit.ltile_rows != ctx.config.tile_rows
+        or hit.ltile_cols != ctx.config.tile_cols
     ):
         _LOGGER.warning(
             "dropping hit with mismatched layer geometry: "
@@ -152,8 +152,8 @@ class WinnerCheckCallback:
             return
 
         config = ctx.config
-        a_rows = tile_indices(config.rows_pattern, hit.tile_row)
-        b_rows = tile_indices(config.cols_pattern, hit.tile_column)
+        a_rows = tile_indices(config.tile_rows, hit.tile_row)
+        b_rows = tile_indices(config.tile_cols, hit.tile_column)
         codes_cpu = hit.codes
         scales_cpu = hit.scales
         m = hit.m

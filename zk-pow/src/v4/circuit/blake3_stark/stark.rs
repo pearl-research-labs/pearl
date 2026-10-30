@@ -2350,7 +2350,6 @@ mod tests {
 
     use super::super::columns::NUM_BLAKE3_KNOWN_COLUMNS;
     use super::*;
-    use crate::v4::api::layout::{AxisPattern, DimType};
     use crate::v4::api::proof_utils::operand_digest_fp10;
 
     const D: usize = 2;
@@ -3246,19 +3245,18 @@ mod tests {
     #[test]
     fn adapter_consumes_deployed_blake_program() {
         use crate::v2::ffi::plain_proof::MatrixMerkleProof;
-        use crate::v4::api::layout::{AxisPattern, DimType};
         use crate::v4::api::plain_proof::PlainProofV4;
         use crate::v4::api::primitives::Sides;
         use crate::v4::api::public_params::{CommonParams, Device, HashId, JobParams, OperandParams, Quant};
-        // k = 2048, 4×64 tile, 16 Blake lanes. m > h and n > w so every
+        // k = 2048, 4×64 tile, 16 extractor lanes. m > h and n > w so every
         // plane tree still mixes opened blocks, auxiliary blocks (unopened rows sharing an
         // opened chunk) and auxiliary CVs (whole unopened subtrees).
         let (m, n, k) = (8usize, 128usize, 2048usize);
         let n_blocks = k / BLOCK_SIZE;
-        let rows_pattern = AxisPattern::new(&[(4, DimType::Blake)]).unwrap();
-        let cols_pattern = AxisPattern::new(&[(4, DimType::Blake), (16, DimType::Fold)]).unwrap();
-        let a_rows: Vec<usize> = rows_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
-        let b_rows: Vec<usize> = cols_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
+        let h = 4;
+        let w = 64;
+        let a_rows: Vec<usize> = (0..h).collect();
+        let b_rows: Vec<usize> = (0..w).collect();
         let (header, ancestor_chain, ancestor_header) = crate::v4::circuit::consistency::fixture_headers();
         let (key_a, key_b) = crate::v4::circuit::consistency::fixture_tree_keys(&header, &ancestor_header);
         let key_a_words = core::array::from_fn(|i| u32::from_le_bytes(key_a[4 * i..4 * i + 4].try_into().unwrap()));
@@ -3306,12 +3304,12 @@ mod tests {
                     a: OperandParams {
                         num_rows: m as u32,
                         hash_id: HashId::Blake3Chunk1024,
-                        pattern: rows_pattern,
+                        tile_size: h as u32,
                     },
                     b: OperandParams {
                         num_rows: n as u32,
                         hash_id: HashId::Blake3Chunk1024,
-                        pattern: cols_pattern,
+                        tile_size: w as u32,
                     },
                 },
                 moe: None,
@@ -3384,15 +3382,7 @@ mod tests {
     /// surface still covers exactly the opened elements/scales once each, `known_values`
     /// reproduces the known columns bit for bit, and every constraint holds. Returns the
     /// straddle-kind counts of the compiled schedule so callers can pin their geometry's mix.
-    fn k_mod_32_adapter_fixture(
-        m: usize,
-        n: usize,
-        k: usize,
-        a_rows: &[usize],
-        a_dims: &[(u32, DimType)],
-        b_rows: &[usize],
-        b_dims: &[(u32, DimType)],
-    ) -> (usize, usize, usize) {
+    fn k_mod_32_adapter_fixture(m: usize, n: usize, k: usize, a_rows: &[usize], b_rows: &[usize]) -> (usize, usize, usize) {
         use crate::v2::ffi::plain_proof::MatrixMerkleProof;
         use crate::v4::api::plain_proof::PlainProofV4;
         use crate::v4::api::primitives::Sides;
@@ -3401,8 +3391,7 @@ mod tests {
         assert_eq!(k % 32, 0);
         assert_ne!(k % 64, 0, "the fixture exists to exercise straddling rows");
         let n_blocks = k / BLOCK_SIZE;
-        let rows_pattern = AxisPattern::new(a_dims).unwrap();
-        let cols_pattern = AxisPattern::new(b_dims).unwrap();
+        let (h, w) = (a_rows.len(), b_rows.len());
         let (header, ancestor_chain, ancestor_header) = crate::v4::circuit::consistency::fixture_headers();
         let (key_a, key_b) = crate::v4::circuit::consistency::fixture_tree_keys(&header, &ancestor_header);
         let key_a_words = core::array::from_fn(|i| u32::from_le_bytes(key_a[4 * i..4 * i + 4].try_into().unwrap()));
@@ -3449,12 +3438,12 @@ mod tests {
                     a: OperandParams {
                         num_rows: m as u32,
                         hash_id: HashId::Blake3Chunk1024,
-                        pattern: rows_pattern,
+                        tile_size: h as u32,
                     },
                     b: OperandParams {
                         num_rows: n as u32,
                         hash_id: HashId::Blake3Chunk1024,
-                        pattern: cols_pattern,
+                        tile_size: w as u32,
                     },
                 },
                 moe: None,
@@ -3564,24 +3553,14 @@ mod tests {
         (cross_strip, split_opened_first, split_unopened_first)
     }
 
-    /// `k = 2080`, 8×32 tile: A opens the contiguous band `{0..7}` (cross-strip
-    /// blocks at even|odd row boundaries) and B the isolated odd rows `{1,3,…,63}` (fold
-    /// `{0,2,4,6}` (+) blake `{0,8,…,56}`, based at 1) of `n = 64`. Odd B rows start
-    /// mid-block against unopened even neighbors (`skip > 0` splits); the 520-byte scales
-    /// rows add opened-first splits (`skip = 0`).
+    /// At k=2080, A opens rows 0..8 and B opens the aligned band 34..68 of n=72.
+    /// Both bands contain adjacent rows whose blocks straddle strip boundaries;
+    /// the B band's 520-byte scales rows start and end mid-block against unopened neighbors.
     #[test]
     fn adapter_handles_row_straddling_blocks_at_k_mod_32() {
         let a_rows: Vec<usize> = (0..8).collect();
-        let b_rows: Vec<usize> = (0..32).map(|i| 1 + 2 * i).collect();
-        let (cross, opened_first, unopened_first) = k_mod_32_adapter_fixture(
-            8,
-            64,
-            2080,
-            &a_rows,
-            &[(4, DimType::Fold), (2, DimType::Blake)],
-            &b_rows,
-            &[(2, DimType::Null), (4, DimType::Fold), (8, DimType::Blake)],
-        );
+        let b_rows: Vec<usize> = (34..68).collect();
+        let (cross, opened_first, unopened_first) = k_mod_32_adapter_fixture(8, 72, 2080, &a_rows, &b_rows);
         assert!(cross > 0, "adjacent opened rows must yield cross-strip blocks");
         assert!(opened_first > 0, "opened-tail blocks must yield skip = 0 splits");
         assert!(unopened_first > 0, "opened-head blocks must yield skip > 0 splits");
@@ -3589,23 +3568,14 @@ mod tests {
 
     /// `m = 17` (odd) with every A row opened: the raw A plane ends mid-block
     /// (`17 * 2080 ≡ 32 (mod 64)`), so row 16's tail block straddles into the chunk padding —
-    /// an opened-first split whose auxiliary half carries the padding zeros. B keeps the
-    /// isolated-odd 32-col tile so values-plane splits against unopened neighbors still appear.
+    /// an opened-first split whose auxiliary half carries the padding zeros. B opens
+    /// the aligned consecutive band 32..64.
     #[test]
     fn adapter_handles_straddle_into_chunk_padding() {
         let a_rows: Vec<usize> = (0..17).collect();
-        let b_rows: Vec<usize> = (0..32).map(|i| 1 + 2 * i).collect();
-        let (_, opened_first, unopened_first) = k_mod_32_adapter_fixture(
-            17,
-            64,
-            2080,
-            &a_rows,
-            &[(17, DimType::Fold)],
-            &b_rows,
-            &[(2, DimType::Null), (2, DimType::Fold), (16, DimType::Blake)],
-        );
+        let b_rows: Vec<usize> = (32..64).collect();
+        let (_, opened_first, _) = k_mod_32_adapter_fixture(17, 64, 2080, &a_rows, &b_rows);
         assert!(opened_first > 0, "the raw-tail block must split into the chunk padding");
-        assert!(unopened_first > 0);
     }
 
     /// The scheme boundary: an Int7 job's `BlakeProgram` — with no scales sections — must be

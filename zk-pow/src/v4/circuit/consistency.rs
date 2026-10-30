@@ -50,7 +50,6 @@ use super::xor_fold_stark::columns::{NUM_XOR_FOLD_COLUMNS, XorFoldColumnsView};
 use super::xor_fold_stark::ctl::xor_fold_lut_lookups;
 use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
 use crate::v2::ffi::plain_proof::MatrixMerkleProof;
-use crate::v4::api::layout::{AxisPattern, DimType};
 use crate::v4::api::openings::stream_words;
 use crate::v4::api::plain_proof::{MoeWitness, PlainProofV4};
 use crate::v4::api::prequant::BLOCK_SIZE;
@@ -159,27 +158,18 @@ pub(crate) struct Fp8Fixture {
     pub xf_rows: Vec<[F; NUM_XOR_FOLD_COLUMNS]>,
 }
 
-/// The fixture job as the wire would carry it: the block header and the fp8 `PlainProof`
-/// (keyed Merkle trees over pseudo-random prequant planes).
-///
-/// Geometry: `m = n = 32` committed rows, `k = 2048`, `h = w = 16` opened strips (per axis
-/// `[(4, Fold), (4, Blake)]`: the tile `{0..15}`) — the smallest pad-free shape that
-/// satisfies every table and the consensus envelope at once
-/// (`api::layout` needs rank 32, 4 x 4 = 16 lottery lanes, a 16-element
-/// subtile and 16 opened cols; `h*k`, `h + w` and `h*w` are all powers of two here, so no
-/// table pads). Shared with the API round-trip test (`crate::v4::api::zk`), which drives the
-/// same job through the wire-level entry points; [`fixture_job_asym`] covers the padded
-/// geometries and [`fixture_job_k32`] the non-power-of-two `k` envelope.
+/// A 16x16 consecutive dense tile at `k = 2048`: sixteen chunks of sixteen
+/// output cells. All live table heights are powers of two, so no table pads.
+/// Shared with the API round-trip test; the asymmetric and k-mod-32 fixtures
+/// cover padding and block-straddling geometries.
 pub(crate) fn fixture_job() -> (IncompleteBlockHeader, PlainProofV4) {
-    let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
-    fixture_job_with(32, 2048, dims, dims)
+    fixture_job_with(32, 2048, 16, 16)
 }
 
 /// The minimum common-dimension envelope fixture (`k = 1024`) with the same
 /// 16x16 dense tile as [`fixture_job`].
 pub(crate) fn fixture_job_min_k() -> (IncompleteBlockHeader, PlainProofV4) {
-    let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
-    fixture_job_with(32, 1024, dims, dims)
+    fixture_job_with(32, 1024, 16, 16)
 }
 
 /// The fixture's linked headers: every fixture proves at depth 2,
@@ -205,19 +195,11 @@ fn keyed_plane_proof(rows_bytes: &[Vec<u8>], row_indices: &[usize], key: [u8; 32
     }
 }
 
-/// The asymmetric fixture job: `m = n = 32`, `k = 2048`, rows `[(4, Fold), (4, Blake)]` ->
-/// `h = 16`, cols `[(5, Fold), (4, Blake)]` -> `w = 20` (a 20-element subtile, still inside
-/// `MIN_SUBTILE_ELEMS..=MAX_SUBTILE_ELEMS`). Exercises every padding path [`fixture_job`]
-/// misses: `h != w` with a dead A-region (InputQuant, `16*2048` live A rows against
-/// `20*2048` live B rows), Scale pad rows (`h + w = 36` -> 64), XorFold pad rows
-/// (`h*w = 320` -> 512), and Matmul trailing phantom cells (`320*32` -> 2^14).
+/// A 16x20 tile with twenty cells per chunk at k=2048.
+/// Exercises dead A-regions, Scale padding (`h+w = 36`), XorFold padding
+/// (`h*w = 320`), and Matmul trailing phantom cells.
 pub(crate) fn fixture_job_asym() -> (IncompleteBlockHeader, PlainProofV4) {
-    fixture_job_with(
-        32,
-        2048,
-        &[(4, DimType::Fold), (4, DimType::Blake)],
-        &[(5, DimType::Fold), (4, DimType::Blake)],
-    )
+    fixture_job_with(32, 2048, 16, 20)
 }
 
 /// The `k % 32` fixture job: `m = n = 32`, `k = 2080` (`= 32 * 65`, so `k % 64 = 32` — the
@@ -229,24 +211,13 @@ pub(crate) fn fixture_job_asym() -> (IncompleteBlockHeader, PlainProofV4) {
 /// padding. Downstream, `k/32 = 65` rows per Matmul cell and `k/8 = 260` whole quantizer
 /// blocks per InputQuant group.
 pub(crate) fn fixture_job_k32() -> (IncompleteBlockHeader, PlainProofV4) {
-    let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
-    fixture_job_with(32, 2080, dims, dims)
+    fixture_job_with(32, 2080, 16, 16)
 }
 
-/// The mid-size fixture job: `m = n = 32` committed rows, `k = 4096`, `h = w = 16` opened
-/// strips with interleaved dims `[(2, Fold), (2, Blake), (2, Fold), (2, Blake)]` per axis
-/// (fold `{0, 1, 4, 5}`, blake `{0, 2, 8, 10}` — a non-contiguous lane geometry, unlike
-/// [`fixture_job`]'s) — InputQuant at 2^16 rows, Blake3 and Matmul at 2^15. Geometry
-/// comparable to the existing recursion test jobs, big enough that per-proof overheads
-/// stop dominating; used by the medium API round trip (`crate::v4::api::zk`).
+/// A 16x16 tile at `k = 4096`: InputQuant at 2^16 rows, Blake3 and
+/// Matmul at 2^15. Used by the medium API round trip.
 pub(crate) fn fixture_job_medium() -> (IncompleteBlockHeader, PlainProofV4) {
-    let dims = &[
-        (2, DimType::Fold),
-        (2, DimType::Blake),
-        (2, DimType::Fold),
-        (2, DimType::Blake),
-    ];
-    fixture_job_with(32, 4096, dims, dims)
+    fixture_job_with(32, 4096, 16, 16)
 }
 
 /// A policy-rejected wire job ([`fixture_job`]'s geometry): both sides commit the *same*
@@ -255,25 +226,15 @@ pub(crate) fn fixture_job_medium() -> (IncompleteBlockHeader, PlainProofV4) {
 /// consolidated census. `k = 8192` gives the fixture enough coherent mass to exceed the
 /// exact `floor(k*h*w/20)` allowance.
 pub(crate) fn fixture_job_untamed() -> (IncompleteBlockHeader, PlainProofV4) {
-    let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
     let (m, k) = (32, 8192);
     let plane: Vec<Vec<u8>> = (0..m).map(|i| (0..k).map(|j| plane_byte(0, i, j)).collect()).collect();
-    fixture_job_with_planes(m, k, dims, dims, plane.clone(), plane)
+    fixture_job_with_planes(m, k, 16, 16, plane.clone(), plane)
 }
 
-/// The shared fixture-job builder: `m = n` committed rows and, per axis, the opened strips
-/// = the tile of that axis' committed [`AxisPattern`] dims (based at 0). The dims must carry
-/// Blake sizes multiplying to the 16 lottery lanes (4 per axis here) and Fold sizes whose
-/// product is a legal subtile to stay inside the consensus envelope
-/// (`api::layout`); the two axes need not agree, so padded geometries
-/// (`h != w`, non-power-of-two `h + w` / `h*w`) are expressible.
-fn fixture_job_with(
-    m: usize,
-    k: usize,
-    row_dims: &[(u32, DimType)],
-    col_dims: &[(u32, DimType)],
-) -> (IncompleteBlockHeader, PlainProofV4) {
-    fixture_job_with_zero_a_rows(m, k, row_dims, col_dims, &[])
+/// Builds a dense job opening consecutive bands `0..h` and `0..w`.
+/// Asymmetric shapes exercise padding in the downstream tables.
+fn fixture_job_with(m: usize, k: usize, h: usize, w: usize) -> (IncompleteBlockHeader, PlainProofV4) {
+    fixture_job_with_zero_a_rows(m, k, h, w, &[])
 }
 
 /// One committed int8-plane byte: a splitmix64-style mix of `(seed, i, j)`, so committed rows
@@ -295,8 +256,8 @@ fn plane_byte(seed: usize, i: usize, j: usize) -> u8 {
 fn fixture_job_with_zero_a_rows(
     m: usize,
     k: usize,
-    row_dims: &[(u32, DimType)],
-    col_dims: &[(u32, DimType)],
+    h: usize,
+    w: usize,
     zero_a_rows: &[usize],
 ) -> (IncompleteBlockHeader, PlainProofV4) {
     let plane = |seed: usize| -> Vec<Vec<u8>> { (0..m).map(|i| (0..k).map(|j| plane_byte(seed, i, j)).collect()).collect() };
@@ -304,7 +265,7 @@ fn fixture_job_with_zero_a_rows(
     for &i in zero_a_rows {
         a_values[i].fill(0);
     }
-    fixture_job_with_planes(m, k, row_dims, col_dims, a_values, plane(7))
+    fixture_job_with_planes(m, k, h, w, a_values, plane(7))
 }
 
 /// [`fixture_job_with`] on explicit committed int8 value planes (`m` rows of `k` bytes
@@ -312,19 +273,16 @@ fn fixture_job_with_zero_a_rows(
 fn fixture_job_with_planes(
     m: usize,
     k: usize,
-    row_dims: &[(u32, DimType)],
-    col_dims: &[(u32, DimType)],
+    h: usize,
+    w: usize,
     a_values: Vec<Vec<u8>>,
     b_values: Vec<Vec<u8>>,
 ) -> (IncompleteBlockHeader, PlainProofV4) {
     let n = m;
     let n_blocks = k / BLOCK_SIZE;
 
-    // ---- The committed matrices and the sampled strips: each axis' tile (fold (+) blake). ----
-    let rows_pattern = AxisPattern::new(row_dims).unwrap();
-    let cols_pattern = AxisPattern::new(col_dims).unwrap();
-    let tile = |p: &AxisPattern| -> Vec<usize> { p.tile_offsets().iter().map(|&o| o as usize).collect() };
-    let (a_rows, b_rows) = (tile(&rows_pattern), tile(&cols_pattern));
+    // The sampled strips form consecutive bands in each operand.
+    let (a_rows, b_rows): (Vec<usize>, Vec<usize>) = ((0..h).collect(), (0..w).collect());
     let (header, ancestor_chain, ancestor_header) = fixture_headers();
     let (key_a, key_b) = fixture_tree_keys(&header, &ancestor_header);
 
@@ -352,12 +310,12 @@ fn fixture_job_with_planes(
                 a: OperandParams {
                     num_rows: m as u32,
                     hash_id: a_hash_id,
-                    pattern: rows_pattern,
+                    tile_size: h as u32,
                 },
                 b: OperandParams {
                     num_rows: n as u32,
                     hash_id: b_hash_id,
-                    pattern: cols_pattern,
+                    tile_size: w as u32,
                 },
             },
             moe: None,
@@ -376,21 +334,11 @@ fn fixture_job_with_planes(
     (header, proof)
 }
 
-/// The MoE fixture job: `m = 256` global tokens, `e = 4` experts
-/// with `top_k = 2` (512 flat routing entries — a two-chunk routing tree; the deployed
-/// membership verifier requires more than one chunk, see `MerkleProof::compute_root`), the
-/// proof for `expert_idx = 1` whose region spans slots `128..256` — the sampled entries
-/// (inner = the rows tile `{0..3, 8..11, 16..19, 24..27}` -> slots `{128..131, 136..139,
-/// 144..147, 152..155}`) straddle routing blocks 8 and 9, so the Blake3 routing tree opens
-/// two hotspot strips with interleaved pinned/neighbor words (the rest of the tree rides as
-/// auxiliary messages and CVs). The A tree commits the global 256-token activation plane and
-/// opens the 16 outer rows; the B^T tree commits all four experts' weight columns
-/// (stacked `n = n_e * e = 64`) and opens expert 1's `[16..32)`.
-///
-/// Geometry: rows `[(4, Fold), (2, Null), (4, Blake)]` (the Null dim spreads the subtiles
-/// out inside the expert's region), cols `[(4, Fold), (4, Blake)]` — `h = w = 16` opened
-/// strips, the same consensus envelope as [`fixture_job`] (`k = 2048`, 16 lanes,
-/// 16-element subtiles).
+/// A MoE job with 256 global tokens and four experts. Each expert's 128
+/// routing positions map to even-numbered physical A rows. Expert 1 opens
+/// its first sixteen consecutive routing positions (slots 128..144), while
+/// B opens that expert's sixteen consecutive weight rows (global 16..32).
+/// The selected tile is 16x16 at k=2048; physical A rows remain nonconsecutive.
 pub(crate) fn fixture_job_moe() -> (IncompleteBlockHeader, PlainProofV4) {
     // Each expert gets 0, 2, ..., 254 (strictly increasing). The same tokens repeat
     // across experts; never twice in one expert.
@@ -406,11 +354,10 @@ fn fixture_job_moe_with(routing_flat: Vec<u32>) -> (IncompleteBlockHeader, Plain
     let n_blocks = k / BLOCK_SIZE;
     assert_eq!(routing_flat.len(), 512);
 
-    let rows_pattern = AxisPattern::new(&[(4, DimType::Fold), (2, DimType::Null), (4, DimType::Blake)]).unwrap();
-    let cols_pattern = AxisPattern::new(&[(4, DimType::Fold), (4, DimType::Blake)]).unwrap();
+    let (h, w) = (16usize, 16usize);
 
     let routing_end_offsets: Vec<u32> = vec![128, 256, 384, 512];
-    let inner_a_rows: Vec<usize> = rows_pattern.tile_offsets().iter().map(|&o| o as usize).collect();
+    let inner_a_rows: Vec<usize> = (0..h).collect();
     let outer_rows: Vec<usize> = inner_a_rows.iter().map(|&i| routing_flat[128 + i] as usize).collect();
 
     let (header, ancestor_chain, ancestor_header) = fixture_headers();
@@ -470,12 +417,12 @@ fn fixture_job_moe_with(routing_flat: Vec<u32>) -> (IncompleteBlockHeader, Plain
                 a: OperandParams {
                     num_rows: m as u32,
                     hash_id,
-                    pattern: rows_pattern,
+                    tile_size: h as u32,
                 },
                 b: OperandParams {
                     num_rows: (n_e * e) as u32,
                     hash_id,
-                    pattern: cols_pattern,
+                    tile_size: w as u32,
                 },
             },
             moe: Some(MoeParams {
@@ -627,7 +574,7 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
     };
 
     // ---- XorFoldStark: fold Matmul's cell results into the 16 lottery lanes — the
-    // committed patterns' lane assignment, exactly what the API layer derives. ----
+    // fixed consecutive chunk schedule, exactly what the API layer derives. ----
     let xf_program = XorFoldProgram {
         lanes: public.lane_assignment(),
         skip_limit: budget(k, h, w),
@@ -976,8 +923,7 @@ fn moe_tampered_offsets_root_fails_parse_and_verify() {
 /// zero norms and panic.
 #[test]
 fn one_job_with_an_all_zero_opened_row_balances_every_ctl_channel() {
-    let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
-    let (header, proof) = fixture_job_with_zero_a_rows(32, 2048, dims, dims, &[0]);
+    let (header, proof) = fixture_job_with_zero_a_rows(32, 2048, 16, 16, &[0]);
     check_job_balances_every_ctl_channel(build_fixture_from_job(header, proof));
 }
 
@@ -1008,8 +954,7 @@ fn one_k_mod_32_job_balances_every_ctl_channel() {
 /// `PublicParams::try_new` must reject at parse time.
 #[test]
 fn wire_layer_rejects_k_not_multiple_of_32() {
-    let dims = &[(4, DimType::Fold), (4, DimType::Blake)];
-    let (header, proof) = fixture_job_with(32, 2064, dims, dims);
+    let (header, proof) = fixture_job_with(32, 2064, 16, 16);
     let err = proof.parse_proof(&header).expect_err("k % 32 != 0 must be rejected");
     assert!(
         format!("{err:#}").contains("k must be divisible by 32"),

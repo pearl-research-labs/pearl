@@ -25,7 +25,6 @@ from miner_base.commitment import (
     commitment_keys,
     hash_id_for_leaf,
 )
-from miner_base.layout import AxisPattern
 from miner_base.mining_config import default_mining_config, tall_tile_mining_config
 from miner_base.prequant import PrequantMatrix
 from miner_base.settings import MinerSettings
@@ -77,9 +76,9 @@ def make_plain_peel_header(
     )
 
 
-def _tile_indices(pattern: AxisPattern, tile_index: int) -> list[int]:
-    base = tile_index * pattern.total
-    return [base + offset for offset in pattern.tile_offsets]
+def _tile_indices(size: int, tile_index: int) -> list[int]:
+    base = tile_index * size
+    return list(range(base, base + size))
 
 
 def _tall_config(k: int, rank: int = 32) -> MiningConfiguration:
@@ -114,8 +113,8 @@ def _opening(
     a = PrequantMatrix.encode(a_values)
     b = PrequantMatrix.encode(torch.zeros(_N, k, dtype=torch.bfloat16))
     return OpenedBlockInfo(
-        a_row_indices=tuple(_tile_indices(config.rows_pattern, 0)),
-        b_column_indices=tuple(_tile_indices(config.cols_pattern, 0)),
+        a_row_indices=tuple(_tile_indices(config.tile_rows, 0)),
+        b_column_indices=tuple(_tile_indices(config.tile_cols, 0)),
         a_codes=a.int_values,
         a_scales=a.scales,
         b_codes=b.int_values,
@@ -295,8 +294,8 @@ def test_tall_tile_keeps_high_k_proof_under_the_verifier_cap():
     exists."""
     k = 16384
     config = _tall_config(k)
-    assert config.rows_pattern.tile_size == 16
-    assert config.cols_pattern.tile_size == 32
+    assert config.tile_rows == 16
+    assert config.tile_cols == 32
     assert 16 * 32 == 4 * 128  # same area -> difficulty-invariant
     cap = 1 << 22
     assert (16 + 32) * k * 2 <= cap
@@ -342,14 +341,14 @@ def test_moe_plain_peel_proof_verifies(per_expert, w, tile):
     offsets = _cumulative(per_expert)
     moe = MoEBlockInfo(
         expert_index=w,
-        inner_a_rows=tuple(_tile_indices(config.rows_pattern, tile)),
+        inner_a_rows=tuple(_tile_indices(config.tile_rows, tile)),
         routing=routing,
         offsets=tuple(offsets),
     )
     expert_rows = moe.expert_rows()
     opening = OpenedBlockInfo(
         a_row_indices=tuple(expert_rows[i] for i in moe.inner_a_rows),
-        b_column_indices=tuple(w * n_e + c for c in _tile_indices(config.cols_pattern, 0)),
+        b_column_indices=tuple(w * n_e + c for c in _tile_indices(config.tile_cols, 0)),
         a_codes=a.int_values,
         a_scales=a.scales,
         b_codes=b.int_values,
@@ -391,14 +390,14 @@ def test_moe_opening_rejects_non_canonical_witnesses():
     w = 2
     moe = MoEBlockInfo(
         expert_index=w,
-        inner_a_rows=tuple(_tile_indices(config.rows_pattern, 3)),
+        inner_a_rows=tuple(_tile_indices(config.tile_rows, 3)),
         routing=routing,
         offsets=tuple(offsets),
     )
     expert_rows = moe.expert_rows()
     opening = OpenedBlockInfo(
         a_row_indices=tuple(expert_rows[i] for i in moe.inner_a_rows),
-        b_column_indices=tuple(w * _N + c for c in _tile_indices(config.cols_pattern, 0)),
+        b_column_indices=tuple(w * _N + c for c in _tile_indices(config.tile_cols, 0)),
         a_codes=a.int_values,
         a_scales=a.scales,
         b_codes=b.int_values,
@@ -430,9 +429,9 @@ def test_moe_opening_rejects_non_canonical_witnesses():
         create_proof(replace(opening, b_column_indices=float_cols), header, PARENT_BYTES)
     # Expert 0's first column tile starts at 0, 1: bools there survive the
     # expert-base subtraction as ints, so the given values must be checked.
-    moe0 = replace(moe, expert_index=0, inner_a_rows=tuple(_tile_indices(config.rows_pattern, 0)))
+    moe0 = replace(moe, expert_index=0, inner_a_rows=tuple(_tile_indices(config.tile_rows, 0)))
     rows0 = moe0.expert_rows()
-    cols0 = tuple(_tile_indices(config.cols_pattern, 0))
+    cols0 = tuple(_tile_indices(config.tile_cols, 0))
     opening0 = replace(
         opening,
         moe=moe0,
@@ -473,12 +472,12 @@ def test_owned_copy_snapshots_the_moe_witness():
     per_expert = _round_robin_routing(experts, 2)
     routing = [t for rows in per_expert for t in rows]
     offsets = _cumulative(per_expert)
-    inner = list(_tile_indices(config.rows_pattern, 1))
+    inner = list(_tile_indices(config.tile_rows, 1))
     moe = MoEBlockInfo(expert_index=1, inner_a_rows=inner, routing=routing, offsets=offsets)
     expert_rows = moe.expert_rows()
     opening = OpenedBlockInfo(
         a_row_indices=[expert_rows[i] for i in inner],
-        b_column_indices=[_N + c for c in _tile_indices(config.cols_pattern, 0)],
+        b_column_indices=[_N + c for c in _tile_indices(config.tile_cols, 0)],
         a_codes=a.int_values,
         a_scales=a.scales,
         b_codes=b.int_values,
