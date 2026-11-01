@@ -548,3 +548,21 @@ class TestV1NbitsOverride:
             block_header, plain_proof, nbits_override=HARD_NBITS
         )
         assert not is_valid, "v1 verification accepted a proof above the override target"
+
+
+class TestMerkleTreeFromBuffer:
+    """Test MerkleTree.from_buffer against MerkleTree over padded bytes."""
+
+    KEY = b"0123456789abcdef" * 2
+
+    @pytest.mark.parametrize("size", [1, 100, 1023, 1025, 7777])
+    def test_root_matches_padded_bytes(self, size):
+        data = bytes(i % 256 for i in range(size))
+        expected = pearl_mining.MerkleTree(pearl_mining.pad_to_chunk_boundary(data), self.KEY).root
+        tree = pearl_mining.MerkleTree.from_buffer(memoryview(data).cast("b"), self.KEY)
+        assert tree.root == expected
+
+    def test_rejects_non_contiguous_buffer(self):
+        strided = memoryview(bytes(4096)).cast("b")[::2]
+        with pytest.raises(ValueError, match="C-contiguous"):
+            pearl_mining.MerkleTree.from_buffer(strided, self.KEY)
