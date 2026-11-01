@@ -23,7 +23,7 @@ class MatrixMerkleTree:
             raise ValueError(f"Expected 32-byte key, got {len(key)} bytes")
 
         self.tensor_shape = tensor.shape
-        self._tree = MerkleTree(data=self.pad_tensor(tensor), key=key)
+        self._tree = MerkleTree.from_buffer(tensor.detach().cpu().contiguous().numpy(), key)
 
     @classmethod
     def tensor_hash(cls, tensor: torch.Tensor, key: bytes) -> bytes:
