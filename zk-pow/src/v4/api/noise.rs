@@ -87,7 +87,6 @@ pub(crate) enum NoiseFactor {
 /// a constant 64 bytes (one BLAKE3 block) — to `rank` output bytes and normalizes
 /// them (see [`normalize_line`]). The caller resolves its `side` and the matching
 /// `seed`.
-
 fn sample_line(key: &Hash256, side: u8, factor: u8, line: u32, bytes: &mut [u8]) {
     let mut material = [0u8; 64];
     material[0] = side;

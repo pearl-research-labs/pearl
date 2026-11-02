@@ -454,7 +454,7 @@ pub fn expected_wrapper_public_inputs(
         assert!(BLAKE3_COL_MAP.word_pin_first == BLAKE3_COL_MAP.moe_outer_indices_packed + 1);
         assert!(BLAKE3_COL_MAP.word_pin_second == BLAKE3_COL_MAP.moe_outer_indices_packed + 2);
         assert!(NUM_BLAKE3_KNOWN_COLUMNS == BLAKE3_COL_MAP.moe_outer_indices_packed + 3);
-    }
+    };
     let evaluated_column_counts: [usize; NUM_ALL_TABLES] = core::array::from_fn(|t| {
         if t == Table::Blake3 as usize && !system.has_moe() {
             BLAKE3_COL_MAP.moe_outer_indices_packed // Index of the last nonzero known column, plus one for the count.
