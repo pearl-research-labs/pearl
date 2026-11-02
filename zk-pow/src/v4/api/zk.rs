@@ -853,7 +853,8 @@ mod tests {
     #[test]
     fn published_statement_rejects_an_unknown_device_byte() {
         let mut bytes = sample_dense_statement().unwrap().to_bytes();
-        const DEVICE_OFFSET: usize = BlockHeader::SERIALIZED_SIZE + 4 + 4 + 2 + 1;
+        // `pB = k(4) | r(2) | Quant(1) | Device(1) | n | hash_idB | w | e`.
+        const DEVICE_OFFSET: usize = BlockHeader::SERIALIZED_SIZE + 4 + 2 + 1;
         bytes[DEVICE_OFFSET] = 2;
         let error = decode_statement(&bytes).expect_err("unknown device byte must reject");
         assert!(error.to_string().contains("Device discriminant"), "{error}");
