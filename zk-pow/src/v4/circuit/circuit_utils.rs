@@ -25,11 +25,10 @@ use crate::v4::api::public_params::Device;
 
 /// FP8 recursion config. Owned here so a v2 parameter change cannot move this circuit.
 ///
-/// Stage 1 uses 48 routed wires, up from v2's 37. That is what fits the universal
-/// wrapper in 2^17 rows; 37 pads it to 2^18. Stage 2 uses 40, up from v2's 34.
-/// If a later change pushes stage 1 above 2^17 rows, drop stage 1 back to the
-/// minimum routed-wire count instead of raising it: a following optimization
-/// cuts gates without needing more routed wires.
+/// Stage 1 uses 48 routed wires and stage 2 uses 40. These counts are temporary
+/// and should change. Stage 2's degree depends on the stage-1 circuit, so the
+/// two counts have to move together. 48 currently keeps stage 1 in 2^17 rows;
+/// v2's 37 pads that circuit to 2^18.
 pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
     debug_assert!(rate_bits >= 3);
     debug_assert!(stage == 1 || stage == 2);
