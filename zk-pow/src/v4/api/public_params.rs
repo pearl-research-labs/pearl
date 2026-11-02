@@ -245,11 +245,20 @@ impl CommonParams {
 pub struct OperandParams {
     pub num_rows: u32,
     pub hash_id: HashId,
-    /// Number of consecutive rows selected from this operand (`h` for A, `w` for B).
+    /// Number of consecutive rows in each tile of this operand (`h` for A, `w` for B).
     pub tile_size: u32,
 }
 
 impl OperandParams {
+    /// `(num_rows, hash_id, tile_size)` as consumed by the `pA` / `pB` tuples.
+    fn encode(&self) -> [u8; 9] {
+        let mut out = [0u8; 9];
+        out[..4].copy_from_slice(&self.num_rows.to_le_bytes());
+        out[4] = self.hash_id as u8;
+        out[5..].copy_from_slice(&self.tile_size.to_le_bytes());
+        out
+    }
+
     fn check(&self) -> Result<()> {
         ensure!(self.num_rows >= 1, "num_rows must be >= 1 || num_rows={}", self.num_rows);
         ensure!(
@@ -397,13 +406,11 @@ impl JobParams {
     /// the common tuple rides `pB`. MoE `n` is stacked (`η · e`).
     pub(crate) fn encode_p_b(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::P_B_LEN);
-        out.extend_from_slice(&self.operands.b.num_rows.to_le_bytes());
         out.extend_from_slice(&self.common.k.to_le_bytes());
         out.extend_from_slice(&self.common.r.to_le_bytes());
         out.push(self.common.quant as u8);
         out.push(self.common.device as u8);
-        out.push(self.operands.b.hash_id as u8);
-        out.extend_from_slice(&self.operands.b.tile_size.to_le_bytes());
+        out.extend_from_slice(&self.operands.b.encode());
         out.extend_from_slice(&self.experts().to_le_bytes());
         out
     }
@@ -411,9 +418,7 @@ impl JobParams {
     /// The A-side tuple `pA = (m, hash_idA, h[, hash_idR, hash_idO])`.
     pub(crate) fn encode_p_a(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::P_A_LEN);
-        out.extend_from_slice(&self.operands.a.num_rows.to_le_bytes());
-        out.push(self.operands.a.hash_id as u8);
-        out.extend_from_slice(&self.operands.a.tile_size.to_le_bytes());
+        out.extend_from_slice(&self.operands.a.encode());
         if let Some(moe) = self.moe {
             out.push(moe.hash_id_r as u8);
             out.push(moe.hash_id_o as u8);
