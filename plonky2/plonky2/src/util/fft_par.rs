@@ -88,13 +88,11 @@ pub fn fft_par<F: Field + Send + Sync>(coeffs: PolynomialCoeffs<F>) -> Polynomia
     // Step 4: transpose B into natural order, X[k1 + N1*k2] = B[k1][k2].
     // Consecutive outputs run over k1 first, so each chunk of N1 holds one k2.
     let mut out = vec![F::ZERO; n];
-    out.par_chunks_mut(n1)
-        .enumerate()
-        .for_each(|(k2, chunk)| {
-            for (k1, dst) in chunk.iter_mut().enumerate() {
-                *dst = b[k1][k2];
-            }
-        });
+    out.par_chunks_mut(n1).enumerate().for_each(|(k2, chunk)| {
+        for (k1, dst) in chunk.iter_mut().enumerate() {
+            *dst = b[k1][k2];
+        }
+    });
     PolynomialValues::new(out)
 }
 
@@ -133,7 +131,9 @@ mod tests {
     #[test]
     fn matches_serial_below_threshold() {
         let n = 1 << 10;
-        let coeffs: Vec<F> = (0..n).map(|i| F::from_canonical_usize(i * 977 % 101)).collect();
+        let coeffs: Vec<F> = (0..n)
+            .map(|i| F::from_canonical_usize(i * 977 % 101))
+            .collect();
         let poly = PolynomialCoeffs::new(coeffs.clone());
         assert_eq!(fft_par(poly.clone()).values, fft(poly).values);
     }
@@ -143,7 +143,9 @@ mod tests {
         // Cross the parallel threshold and exercise the unbalanced split
         // (lg 19 = 10 + 9).
         let n = 1 << 19;
-        let coeffs: Vec<F> = (0..n).map(|i| F::from_canonical_u64((i as u64) * 0x9E37_79B9_7F4A_7C15 % (1 << 32))).collect();
+        let coeffs: Vec<F> = (0..n)
+            .map(|i| F::from_canonical_u64((i as u64) * 0x9E37_79B9_7F4A_7C15 % (1 << 32)))
+            .collect();
         let poly = PolynomialCoeffs::new(coeffs);
         let par = fft_par(poly.clone()).values;
         let serial = fft(poly).values;
@@ -153,7 +155,9 @@ mod tests {
     #[test]
     fn coset_matches_serial() {
         let n = 1 << 19;
-        let coeffs: Vec<F> = (0..n).map(|i| F::from_canonical_u64((i as u64) * 0xBF58_476D_1CE4_E5B9 % (1 << 32))).collect();
+        let coeffs: Vec<F> = (0..n)
+            .map(|i| F::from_canonical_u64((i as u64) * 0xBF58_476D_1CE4_E5B9 % (1 << 32)))
+            .collect();
         let poly = PolynomialCoeffs::new(coeffs);
         let shift = F::coset_shift();
         let par = coset_fft_par(&poly, shift).values;

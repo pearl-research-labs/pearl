@@ -58,10 +58,7 @@ where
 /// Value-identical to `PolynomialCoeffs::divide_by_linear`: the same
 /// `acc = acc * z + c` recurrence over the same coefficients, evaluated as
 /// independent segments.
-pub(crate) fn divide_by_linear_par<FE: Field>(
-    coeffs: &[FE],
-    z: FE,
-) -> PolynomialCoeffs<FE> {
+pub(crate) fn divide_by_linear_par<FE: Field>(coeffs: &[FE], z: FE) -> PolynomialCoeffs<FE> {
     let n = coeffs.len();
     if n == 0 {
         return PolynomialCoeffs::empty();
@@ -115,21 +112,19 @@ pub(crate) fn divide_by_linear_par<FE: Field>(
     // `q[i] = q[i+1] * z + c[i]` descending through the block (the original
     // scan's recurrence, restricted to the block).
     let mut q = vec![FE::ZERO; n - 1];
-    q.par_chunks_mut(BLOCK)
-        .enumerate()
-        .for_each(|(b, out)| {
-            let lo = b * BLOCK;
-            let hi = ((b + 1) * BLOCK).min(n);
-            let mut s = in_state[b];
-            for i in (lo..hi).rev() {
-                if i < n - 1 {
-                    out[i - lo] = s;
-                }
-                if i > lo {
-                    s = s * z + coeffs[i];
-                }
+    q.par_chunks_mut(BLOCK).enumerate().for_each(|(b, out)| {
+        let lo = b * BLOCK;
+        let hi = ((b + 1) * BLOCK).min(n);
+        let mut s = in_state[b];
+        for i in (lo..hi).rev() {
+            if i < n - 1 {
+                out[i - lo] = s;
             }
-        });
+            if i > lo {
+                s = s * z + coeffs[i];
+            }
+        }
+    });
     PolynomialCoeffs::new(q)
 }
 
@@ -450,7 +445,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                             let src = &p.coeffs[lo..hi];
                                             let src_packed =
                                                 <<F as Packable>::Packing as PackedField>::pack_slice(src);
-                                            let mut acc_packed =
+                                            let acc_packed =
                                                 <<F as Packable>::Packing as PackedField>::pack_slice_mut(acc_d);
                                             for (dst_chunk, src_chunk) in acc_packed
                                                 .iter_mut()

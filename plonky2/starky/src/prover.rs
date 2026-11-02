@@ -28,8 +28,8 @@ use crate::constraint_consumer::ConstraintConsumer;
 use crate::cross_table_lookup::{get_ctl_auxiliary_polys, CtlCheckVars, CtlData};
 use crate::evaluation_frame::StarkEvaluationFrame;
 use crate::lookup::{
-    get_grand_product_challenge_set, lookup_helper_columns, Column, Filter,
-    GrandProductChallenge, GrandProductChallengeSet, Lookup, LookupCheckVars,
+    get_grand_product_challenge_set, lookup_helper_columns, Column, Filter, GrandProductChallenge,
+    GrandProductChallengeSet, Lookup, LookupCheckVars,
 };
 use crate::proof::{StarkOpeningSet, StarkProof, StarkProofWithPublicInputs};
 use crate::stark::Stark;
@@ -684,17 +684,14 @@ where
                         let num_ctl_helper_cols = num_ctl_columns[i];
                         let aux_local = aux_local.as_ref().unwrap();
                         let aux_next = aux_next.as_ref().unwrap();
-                        let helper_columns = aux_local
-                            [num_lookup_columns + start_index
-                                ..num_lookup_columns + start_index + num_ctl_helper_cols]
+                        let helper_columns = aux_local[num_lookup_columns + start_index
+                            ..num_lookup_columns + start_index + num_ctl_helper_cols]
                             .to_vec();
 
                         let ctl_vars = CtlCheckVars::<F, F, P, 1> {
                             helper_columns,
-                            local_z: aux_local
-                                [num_lookup_columns + total_num_helper_cols + i],
-                            next_z: aux_next
-                                [num_lookup_columns + total_num_helper_cols + i],
+                            local_z: aux_local[num_lookup_columns + total_num_helper_cols + i],
+                            next_z: aux_next[num_lookup_columns + total_num_helper_cols + i],
                             challenges: m.challenge,
                             columns: m.columns.clone(),
                             filter: m.filter.clone(),

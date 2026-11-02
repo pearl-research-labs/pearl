@@ -735,36 +735,27 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             let as_int8 = |bytes: &[u8]| -> Vec<i8> {
                 use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunks, MaybeParChunksMut, ParallelIterator};
                 let mut out = vec![0i8; bytes.len()];
-                out.par_chunks_mut(1 << 20)
-                    .zip(bytes.par_chunks(1 << 20))
-                    .for_each(|(o, i)| {
-                        for (o, &b) in o.iter_mut().zip(i) {
-                            *o = b as i8;
-                        }
-                    });
+                out.par_chunks_mut(1 << 20).zip(bytes.par_chunks(1 << 20)).for_each(|(o, i)| {
+                    for (o, &b) in o.iter_mut().zip(i) {
+                        *o = b as i8;
+                    }
+                });
                 out
             };
             let le_codes = |bytes: &[u8]| -> Vec<u16> {
                 use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunks, MaybeParChunksMut, ParallelIterator};
                 let n = bytes.len() / 2;
                 let mut out = vec![0u16; n];
-                out.par_chunks_mut(1 << 20)
-                    .zip(bytes.par_chunks(1 << 21))
-                    .for_each(|(o, i)| {
-                        for (o, p) in o.iter_mut().zip(i.chunks(2)) {
-                            *o = u16::from_le_bytes([p[0], p[1]]);
-                        }
-                    });
+                out.par_chunks_mut(1 << 20).zip(bytes.par_chunks(1 << 21)).for_each(|(o, i)| {
+                    for (o, p) in o.iter_mut().zip(i.chunks(2)) {
+                        *o = u16::from_le_bytes([p[0], p[1]]);
+                    }
+                });
                 out
             };
-            let (a_int8, b_int8) = plonky2_maybe_rayon::join(
-                || as_int8(witness.a_values),
-                || as_int8(witness.b_values),
-            );
-            let (a_scale_codes, b_scale_codes) = plonky2_maybe_rayon::join(
-                || le_codes(witness.a_scales),
-                || le_codes(witness.b_scales),
-            );
+            let (a_int8, b_int8) = plonky2_maybe_rayon::join(|| as_int8(witness.a_values), || as_int8(witness.b_values));
+            let (a_scale_codes, b_scale_codes) =
+                plonky2_maybe_rayon::join(|| le_codes(witness.a_scales), || le_codes(witness.b_scales));
             timing.pop();
             (a_int8, b_int8, a_scale_codes, b_scale_codes)
         };
@@ -1067,22 +1058,20 @@ fn column_major<F: RichField, const N: usize>(rows: &[[F; N]]) -> Vec<Polynomial
         unsafe impl<F> Sync for ColPtr<F> {}
         let ptrs: Vec<ColPtr<F>> = cols.iter_mut().map(|c| ColPtr(c.as_mut_ptr())).collect();
 
-        (0..num_rows.div_ceil(ROW_TILE))
-            .into_par_iter()
-            .for_each(|tile| {
-                let r_lo = tile * ROW_TILE;
-                let r_hi = ((tile + 1) * ROW_TILE).min(num_rows);
-                for (i, row) in rows[r_lo..r_hi].iter().enumerate() {
-                    let i = r_lo + i;
-                    // SAFETY: the write targets column c's spare capacity
-                    // at offset i < num_rows; tiles own disjoint row ranges.
-                    unsafe {
-                        for (c, p) in ptrs.iter().enumerate() {
-                            *p.0.add(i) = row[c];
-                        }
+        (0..num_rows.div_ceil(ROW_TILE)).into_par_iter().for_each(|tile| {
+            let r_lo = tile * ROW_TILE;
+            let r_hi = ((tile + 1) * ROW_TILE).min(num_rows);
+            for (i, row) in rows[r_lo..r_hi].iter().enumerate() {
+                let i = r_lo + i;
+                // SAFETY: the write targets column c's spare capacity
+                // at offset i < num_rows; tiles own disjoint row ranges.
+                unsafe {
+                    for (c, p) in ptrs.iter().enumerate() {
+                        *p.0.add(i) = row[c];
                     }
                 }
-            });
+            }
+        });
     }
     for col in cols.iter_mut() {
         unsafe { col.set_len(num_rows) };

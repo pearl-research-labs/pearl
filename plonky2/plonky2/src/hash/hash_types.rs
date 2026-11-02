@@ -4,9 +4,9 @@ use core::fmt;
 
 use anyhow::ensure;
 use plonky2_field::extension::Extendable;
+use plonky2_field::packable::Packable;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use plonky2_field::packable::Packable;
 
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::types::{Field, PrimeField64, Sample};

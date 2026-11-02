@@ -358,7 +358,11 @@ impl Fp8WrapperCircuits {
 
         let mut pw = PartialWitness::new();
         pw.set_proof_with_pis_target(&self.stage1_proof_target, &stage1_proof)?;
-        timed!(timing, "prove the stage-2 (ZK) wrapper", self.stage2.prove_with_timing(pw, timing))
+        timed!(
+            timing,
+            "prove the stage-2 (ZK) wrapper",
+            self.stage2.prove_with_timing(pw, timing)
+        )
     }
 
     /// Warmup variant of [`Self::prove`], discarding the result: proves both stages
@@ -519,11 +523,13 @@ pub fn expected_wrapper_public_inputs(
     );
     // Dense programs have no routing or offsets instructions, so Blake3's final
     // three known columns are identically zero. Their opening slots remain present.
-    const {
+    // A const item, not an inline const block: cbindgen 0.26 parses this crate
+    // with syn 1.0, which rejects `const { ... }` in expression position.
+    const _: () = {
         assert!(BLAKE3_COL_MAP.word_pin_first == BLAKE3_COL_MAP.moe_outer_indices_packed + 1);
         assert!(BLAKE3_COL_MAP.word_pin_second == BLAKE3_COL_MAP.moe_outer_indices_packed + 2);
         assert!(NUM_BLAKE3_KNOWN_COLUMNS == BLAKE3_COL_MAP.moe_outer_indices_packed + 3);
-    }
+    };
     let evaluated_column_counts: [usize; NUM_ALL_TABLES] = core::array::from_fn(|t| {
         if t == Table::Blake3 as usize && !system.has_moe() {
             BLAKE3_COL_MAP.moe_outer_indices_packed // Index of the last nonzero known column, plus one for the count.

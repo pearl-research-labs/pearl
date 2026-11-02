@@ -55,8 +55,9 @@ use crate::vanishing_poly::{
 
 /// Object-safe view of a [`Stark`], usable as `&dyn BatchStark<F, D>` in the
 /// batch prover and verifiers. It is blanket-implemented for every
-/// `S: Stark<F, D>`.
-pub trait BatchStark<F: RichField + Extendable<D>, const D: usize>: Sync {
+/// `S: Stark<F, D> + Send + Sync`. `Send` is required so a
+/// `Box<dyn BatchStark>` can sit inside types that move across threads.
+pub trait BatchStark<F: RichField + Extendable<D>, const D: usize>: Send + Sync {
     /// The total number of columns in the trace (`Stark::COLUMNS`).
     fn num_columns(&self) -> usize;
 
@@ -134,7 +135,7 @@ pub trait BatchStark<F: RichField + Extendable<D>, const D: usize>: Sync {
 impl<F, S, const D: usize> BatchStark<F, D> for S
 where
     F: RichField + Extendable<D>,
-    S: Stark<F, D>,
+    S: Stark<F, D> + Send + Sync,
 {
     fn num_columns(&self) -> usize {
         S::COLUMNS

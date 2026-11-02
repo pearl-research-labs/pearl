@@ -12,8 +12,8 @@ use crate::field::types::Field;
 use crate::hash::hash_types::RichField;
 
 pub(crate) mod context_tree;
-pub(crate) mod partial_products;
 pub mod fft_par;
+pub(crate) mod partial_products;
 pub mod reducing;
 pub mod serialization;
 pub mod strided_view;
