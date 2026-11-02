@@ -144,7 +144,9 @@ mod tests {
         // (lg 19 = 10 + 9).
         let n = 1 << 19;
         let coeffs: Vec<F> = (0..n)
-            .map(|i| F::from_canonical_u64((i as u64) * 0x9E37_79B9_7F4A_7C15 % (1 << 32)))
+            .map(|i| {
+                F::from_canonical_u64((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % (1 << 32))
+            })
             .collect();
         let poly = PolynomialCoeffs::new(coeffs);
         let par = fft_par(poly.clone()).values;
@@ -156,7 +158,9 @@ mod tests {
     fn coset_matches_serial() {
         let n = 1 << 19;
         let coeffs: Vec<F> = (0..n)
-            .map(|i| F::from_canonical_u64((i as u64) * 0xBF58_476D_1CE4_E5B9 % (1 << 32)))
+            .map(|i| {
+                F::from_canonical_u64((i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) % (1 << 32))
+            })
             .collect();
         let poly = PolynomialCoeffs::new(coeffs);
         let shift = F::coset_shift();
