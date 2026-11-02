@@ -138,6 +138,13 @@ func dbFetchBlockIDByHash(dbTx database.Tx, hash *chainhash.Hash) (uint32, error
 	if serializedID == nil {
 		return 0, errNoBlockIDEntry
 	}
+	if len(serializedID) != 4 {
+		// A present but malformed entry is corruption, not a missing
+		// one, so report it as a deserialization error instead of
+		// errNoBlockIDEntry.
+		return 0, errDeserialize(fmt.Sprintf("corrupt block ID for "+
+			"block %s: %d bytes, want 4", hash, len(serializedID)))
+	}
 
 	return byteOrder.Uint32(serializedID), nil
 }
