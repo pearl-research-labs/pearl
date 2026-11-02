@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
-import { X, RotateCcw, Save, Globe, Server } from 'lucide-react';
+import { X, RotateCcw, Save, Globe, Server, Moon } from 'lucide-react';
+import { useTheme } from 'next-themes';
 import { Button } from '@pearl/ui/components/button';
+import { Switch } from '@/components/ui/switch';
 
 interface PeerSettingsModalProps {
     isOpen: boolean;
@@ -13,6 +15,7 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
     const [isCustom, setIsCustom] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
     const [network, setNetwork] = useState('');
+    const { resolvedTheme, setTheme } = useTheme();
 
     useEffect(() => {
         if (isOpen) {
@@ -189,6 +192,19 @@ export function PeerSettingsModal({ isOpen, onClose }: PeerSettingsModalProps) {
                     <p className="text-xs text-gray-500">
                         Note: You'll need to restart the wallet after changing peer settings.
                     </p>
+
+                    {/* Appearance (applies immediately, independent of peer Save) */}
+                    <div className="flex items-center justify-between border-t border-gray-200 pt-4">
+                        <div className="flex items-center gap-2">
+                            <Moon className="h-4 w-4 text-gray-500" />
+                            <label htmlFor="dark-mode-toggle" className="text-sm font-medium text-gray-700">Dark Mode</label>
+                        </div>
+                        <Switch
+                            id="dark-mode-toggle"
+                            checked={resolvedTheme === 'dark'}
+                            onCheckedChange={(checked) => setTheme(checked ? 'dark' : 'light')}
+                        />
+                    </div>
                 </div>
             </div>
         </div>

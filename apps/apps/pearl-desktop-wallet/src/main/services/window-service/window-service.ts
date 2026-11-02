@@ -3,6 +3,7 @@ import {
   BrowserWindow,
   dialog,
   MessageBoxOptions,
+  nativeTheme,
   OpenDialogOptions,
   SaveDialogOptions,
   shell,
@@ -54,6 +55,11 @@ class WindowService implements WindowApi {
 
   openExternal(url: string) {
     shell.openExternal(url);
+  }
+
+  // Dark mode forces a dark title bar; light keeps Electron's default of following the OS.
+  setNativeTheme(theme: 'light' | 'dark') {
+    nativeTheme.themeSource = theme === 'dark' ? 'dark' : 'system';
   }
   //   platform: process.platform;
   //   isElectron: true;
