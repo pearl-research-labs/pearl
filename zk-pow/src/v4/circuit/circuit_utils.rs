@@ -22,6 +22,8 @@ use crate::ensure_eq;
 pub use crate::v2::circuit::circuit_utils::num_query_rounds;
 use crate::v4::api::public_params::Device;
 
+const SECURITY_BITS: usize = 120;
+
 /// FP8 recursion config. The routed-wire counts are temporary and should change.
 pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
     debug_assert!(rate_bits >= 3);
@@ -31,7 +33,7 @@ pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, i
         num_routed_wires: if stage == 2 { 40 } else { 48 },
         num_constants: 2,
         use_base_arithmetic_gate: true,
-        security_bits: 120,
+        security_bits: SECURITY_BITS,
         num_challenges: 3,
         zero_knowledge: is_zk,
         max_quotient_degree_factor: 8,
@@ -40,7 +42,7 @@ pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, i
             cap_height: 5,
             proof_of_work_bits: pow_bits as u32,
             reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
-            num_query_rounds: num_query_rounds(120, pow_bits, rate_bits),
+            num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
         },
     }
 }
