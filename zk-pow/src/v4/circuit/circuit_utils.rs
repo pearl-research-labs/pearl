@@ -23,12 +23,7 @@ pub use crate::v2::circuit::circuit_utils::num_query_rounds;
 use crate::v2::circuit::pearl_circuit::SECURITY_BITS;
 use crate::v4::api::public_params::Device;
 
-/// FP8 recursion config. Owned here so a v2 parameter change cannot move this circuit.
-///
-/// Stage 1 uses 48 routed wires and stage 2 uses 40. These counts are temporary
-/// and should change. Stage 2's degree depends on the stage-1 circuit, so the
-/// two counts have to move together. 48 currently keeps stage 1 in 2^17 rows;
-/// v2's 37 pads that circuit to 2^18.
+/// FP8 recursion config. The routed-wire counts are temporary and should change.
 pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
     debug_assert!(rate_bits >= 3);
     debug_assert!(stage == 1 || stage == 2);
