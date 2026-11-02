@@ -259,6 +259,19 @@ impl OperandParams {
         out
     }
 
+    /// Inverse of [`Self::encode`]: parses `(num_rows, hash_id, tile_size)`
+    /// from the start of `s`, advancing it past the 9 consumed bytes.
+    fn decode(s: &mut &[u8]) -> Result<Self> {
+        let num_rows = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
+        let hash_id = HashId::try_from(take(s, 1)?[0])?;
+        let tile_size = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
+        Ok(Self {
+            num_rows,
+            hash_id,
+            tile_size,
+        })
+    }
+
     fn check(&self) -> Result<()> {
         ensure!(self.num_rows >= 1, "num_rows must be >= 1 || num_rows={}", self.num_rows);
         ensure!(
@@ -321,8 +334,8 @@ pub struct JobParams {
 }
 
 impl JobParams {
-    /// Wire length of `pB = (n, k, r, Quant, Device, hash_idB, w, e)`.
-    const P_B_LEN: usize = 4 + 4 + 2 + 1 + 1 + 1 + 4 + 2;
+    /// Wire length of `pB = (k, r, Quant, Device, n, hash_idB, w, e)`.
+    const P_B_LEN: usize = 4 + 2 + 1 + 1 + 4 + 1 + 4 + 2;
     /// Wire length of dense `pA = (m, hash_idA, h)` (MoE appends two hash-ids).
     const P_A_LEN: usize = 4 + 1 + 4;
 
@@ -402,8 +415,9 @@ impl JobParams {
         Ok(())
     }
 
-    /// The B-side tuple `pB = (n, k, r, Quant, Device, hash_idB, w, e)` —
-    /// the common tuple rides `pB`. MoE `n` is stacked (`η · e`).
+    /// The B-side tuple `pB = (k, r, Quant, Device, n, hash_idB, w, e)` —
+    /// the common tuple rides `pB`, then the B operand `(n, hash_idB, w)`.
+    /// MoE `n` is stacked (`η · e`).
     pub(crate) fn encode_p_b(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::P_B_LEN);
         out.extend_from_slice(&self.common.k.to_le_bytes());
@@ -1083,49 +1097,30 @@ fn take<'a>(s: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
     Ok(head)
 }
 
-/// Parse `pB = (n, k, r, Quant, Device, hash_idB, w, e)` — the shared
+/// Parse `pB = (k, r, Quant, Device, n, hash_idB, w, e)` — the shared
 /// B-side wire part ([`JobParams::encode_p_b`]). `pB` rides first so its `e`
 /// discriminates `pA`'s MoE suffix.
 fn parse_p_b(s: &mut &[u8]) -> Result<(CommonParams, OperandParams, u16)> {
-    let num_rows = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
     let k = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
     let r = u16::from_le_bytes(take(s, 2)?.try_into().unwrap());
     let quant = Quant::try_from(take(s, 1)?[0])?;
     let device = Device::try_from(take(s, 1)?[0])?;
-    let hash_id = HashId::try_from(take(s, 1)?[0])?;
-    let tile_size = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
+    let b = OperandParams::decode(s)?;
     let experts = u16::from_le_bytes(take(s, 2)?.try_into().unwrap());
-    Ok((
-        CommonParams { k, r, quant, device },
-        OperandParams {
-            num_rows,
-            hash_id,
-            tile_size,
-        },
-        experts,
-    ))
+    Ok((CommonParams { k, r, quant, device }, b, experts))
 }
 
 /// Parse `pA = (m, hash_idA, h[, hash_idR, hash_idO])` — the shared A-side
 /// wire part ([`JobParams::encode_p_a`]). MoE `pA` appends the routing/offset
 /// hash-ids; dense stops at `h`.
 fn parse_p_a(s: &mut &[u8], experts: u16) -> Result<(OperandParams, Option<(HashId, HashId)>)> {
-    let num_rows = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
-    let hash_id = HashId::try_from(take(s, 1)?[0])?;
-    let tile_size = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
+    let a = OperandParams::decode(s)?;
     let moe_hash_ids = if experts != 0 {
         Some((HashId::try_from(take(s, 1)?[0])?, HashId::try_from(take(s, 1)?[0])?))
     } else {
         None
     };
-    Ok((
-        OperandParams {
-            num_rows,
-            hash_id,
-            tile_size,
-        },
-        moe_hash_ids,
-    ))
+    Ok((a, moe_hash_ids))
 }
 
 #[cfg(feature = "pyo3")]
@@ -1294,9 +1289,9 @@ mod tests {
     };
 
     const DENSE_PA: &str = "000100000304000000";
-    const DENSE_PB: &str = "80000000000800002000000103800000000000";
+    const DENSE_PB: &str = "00080000200000018000000003800000000000";
     const MOE_PA: &str = "0001000003040000000303";
-    const MOE_PB: &str = "00020000000800002000000103800000000400";
+    const MOE_PB: &str = "00080000200000010002000003800000000400";
 
     fn hex_bytes(s: &str) -> Vec<u8> {
         (0..s.len() / 2)

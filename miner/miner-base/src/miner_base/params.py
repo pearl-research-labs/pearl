@@ -155,19 +155,17 @@ def encode_p_a(a: OperandParams, moe: MoeParams | None = None) -> bytes:
 
 
 def encode_p_b(common: CommonParams, b: OperandParams, experts: int = 0) -> bytes:
-    """Encode ``pB = (n, k, r, Quant, Device, hash_idB, w, e)``."""
+    """Encode ``pB = (k, r, Quant, Device, n, hash_idB, w, e)``."""
     _check_u16(experts, "experts")
     return (
         struct.pack(
-            "<IIHBBB",
-            b.num_rows,
+            "<IHBB",
             common.k,
             common.r,
             common.quant,
             common.device,
-            b.hash_id,
         )
-        + struct.pack("<I", b.tile_size)
+        + struct.pack("<IBI", b.num_rows, b.hash_id, b.tile_size)
         + struct.pack("<H", experts)
     )
 
