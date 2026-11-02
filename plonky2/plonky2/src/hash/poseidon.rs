@@ -812,8 +812,7 @@ pub trait Poseidon: PrimeField64 {
             // the same lanes; accumulate per output row.
             let mut result = [P::ZEROS; SPONGE_WIDTH];
             for r in 0..SPONGE_WIDTH {
-                let mut acc = state[(0 + r) % SPONGE_WIDTH]
-                    * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[0]);
+                let mut acc = state[r] * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[0]);
                 for i in 1..SPONGE_WIDTH {
                     acc += state[(i + r) % SPONGE_WIDTH]
                         * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[i]);
@@ -886,8 +885,7 @@ pub trait Poseidon: PrimeField64 {
             }
             let mut result = [P::ZEROS; SPONGE_WIDTH];
             for r in 0..SPONGE_WIDTH {
-                let mut acc = state[(0 + r) % SPONGE_WIDTH]
-                    * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[0]);
+                let mut acc = state[r] * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[0]);
                 for i in 1..SPONGE_WIDTH {
                     acc += state[(i + r) % SPONGE_WIDTH]
                         * Self::from_canonical_u64(Self::MDS_MATRIX_CIRC[i]);

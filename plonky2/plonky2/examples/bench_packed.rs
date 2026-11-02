@@ -1,6 +1,5 @@
 // Quick benchmark: scalar vs packed batch Poseidon leaf hashing.
 use plonky2::field::goldilocks_field::GoldilocksField;
-use plonky2::hash::hash_types::RichField;
 use plonky2::hash::hashing::poseidon_hash_batch_no_pad;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::Hasher;

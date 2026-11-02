@@ -451,7 +451,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                                 .iter_mut()
                                                 .zip(src_packed.iter())
                                             {
-                                                *dst_chunk = *dst_chunk + *src_chunk * wd;
+                                                *dst_chunk += *src_chunk * wd;
                                             }
                                         }
                                         w *= alpha;
