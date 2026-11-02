@@ -84,6 +84,14 @@ class WalletRpcMethods {
     return this.rpc.call<{ announced: string[] }>('rebroadcasttransaction', [txid]).then(r => r.announced);
   }
 
+  signMessage(address: string, message: string) {
+    return this.rpc.call<string>('signmessage', [address, message]);
+  }
+
+  verifyMessage(address: string, signature: string, message: string) {
+    return this.rpc.call<boolean>('verifymessage', [address, signature, message]);
+  }
+
   async validateAddress(address: string) {
     const validationResult = await this.rpc.call<{ isvalid: boolean }>('validateaddress', [address]);
     return { isValid: validationResult.isvalid };
