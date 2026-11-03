@@ -77,7 +77,7 @@
 //! [`verify_fp8_block_wrapped`] stays as the typed in-process gateway for callers that
 //! hold a full [`ProofWithPublicInputs`].
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use hashbrown::HashMap;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
@@ -104,14 +104,14 @@ use crate::v4::circuit::blake3_stark::columns::{
 use crate::v4::circuit::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, MoeSchedule};
 pub use crate::v4::circuit::circuit_utils::{Fp8Verifier, Fp8VerifierCache};
 use crate::v4::circuit::ctl::NUM_TABLES;
-use crate::v4::circuit::driver::{Fp8PublicData, Fp8System, Fp8Witness, FP8_REACHABLE_DEGREE_BITS};
+use crate::v4::circuit::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8PublicData, Fp8System, Fp8Witness};
 use crate::v4::circuit::input_quant_stark::stark::InputQuantProgram;
 use crate::v4::circuit::matmul_b200_stark::columns::GROUP_WIDTH as MATMUL_GROUP_WIDTH;
 use crate::v4::circuit::scale_stark::stark::ScaleProgram;
 use crate::v4::circuit::unpredictability::budget;
 #[cfg(test)]
 use crate::v4::circuit::wrapper::verify_wrapped_proof;
-use crate::v4::circuit::wrapper::{compact_proof_data, verify_compact_wrapped_proof, Fp8WrapperCircuits, OuterC};
+use crate::v4::circuit::wrapper::{Fp8WrapperCircuits, OuterC, compact_proof_data, verify_compact_wrapped_proof};
 use crate::v4::circuit::xor_fold_stark::stark::XorFoldProgram;
 // The u32-limb hash packing helpers live in the frozen v2 clone since the mainline
 // API no longer carries the legacy STARK plumbing.
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn compile_jackpot_key_is_labelled_subkey_for_dense_and_moe() {
-        use crate::v4::api::transcript::{subkey, LABEL_JACKPOT};
+        use crate::v4::api::transcript::{LABEL_JACKPOT, subkey};
 
         for (name, (header, plain)) in [("dense", fixture_job()), ("moe", fixture_job_moe())] {
             let (_, params) = plain.parse_proof(&header).expect("must parse");
@@ -892,7 +892,7 @@ mod tests {
     fn compact_preamble_zeta_binding() {
         use plonky2::field::extension::quadratic::QuadraticExtension;
 
-        use crate::v4::circuit::wrapper::{expected_wrapper_public_inputs, zeta_offset, COMPACT_ZETA_PREAMBLE};
+        use crate::v4::circuit::wrapper::{COMPACT_ZETA_PREAMBLE, expected_wrapper_public_inputs, zeta_offset};
 
         let (header, plain) = fixture_job();
         let (_, params) = plain.parse_proof(&header).expect("fixture job must parse");

@@ -4,19 +4,19 @@
 //! unique minimal leaf/sibling set for the statement's indices under `keyA` /
 //! `keyB`, extracts [`PrequantOperand`] strips, and rejects NaN/±Inf.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use blake3::BLOCK_LEN;
-use pearl_blake3::{MerkleProof, BLAKE3_DIGEST_SIZE};
+use pearl_blake3::{BLAKE3_DIGEST_SIZE, MerkleProof};
 
 use crate::ensure_eq;
 use crate::v2::ffi::plain_proof::MatrixMerkleProof;
 use crate::v4::api::dtype::check_not_nan_or_inf_bf16;
-use crate::v4::api::plain_proof::{offsets_root, MoeWitness};
-use crate::v4::api::prequant::{open_prequant, PrequantOperand, PrequantSlice, BLOCK_SIZE};
+use crate::v4::api::plain_proof::{MoeWitness, offsets_root};
+use crate::v4::api::prequant::{BLOCK_SIZE, PrequantOperand, PrequantSlice, open_prequant};
 use crate::v4::api::primitives::{Hash256, IncompleteBlockHeader, Sides};
 use crate::v4::api::public_params::{HashId, PublicParams};
 use crate::v4::circuit::chip::blake3::program::{
-    AuxiliaryCvLocation, AuxiliaryMsgLocation, BlakeProgram, ProofSource, DWORD_SIZE,
+    AuxiliaryCvLocation, AuxiliaryMsgLocation, BlakeProgram, DWORD_SIZE, ProofSource,
 };
 
 /// Opened strips and Blake3 auxiliary material from [`PublicParams::verify_openings`].
