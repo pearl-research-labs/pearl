@@ -14,6 +14,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/pearl-research-labs/pearl/wallet/chain"
 	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	_ "github.com/pearl-research-labs/pearl/wallet/walletdb/bdb"
@@ -160,12 +161,19 @@ func syncManagerTo(t *testing.T, w *Wallet, branch byte, from, to int32) {
 func mineCoinbase(t *testing.T, w *Wallet, branch byte, height int32) wire.OutPoint {
 	t.Helper()
 
+	return mineCoinbaseTo(t, w, branch, height, []byte{txscript.OP_TRUE})
+}
+
+// mineCoinbaseTo records a coinbase paying pkScript in the block at the given height on the given branch.
+func mineCoinbaseTo(t *testing.T, w *Wallet, branch byte, height int32, pkScript []byte) wire.OutPoint {
+	t.Helper()
+
 	coinbase := &wire.MsgTx{
 		TxIn: []*wire.TxIn{{
 			PreviousOutPoint: wire.OutPoint{Index: math.MaxUint32},
 			SignatureScript:  []byte{branch, byte(height >> 8), byte(height)},
 		}},
-		TxOut: []*wire.TxOut{wire.NewTxOut(5_000_000_000, []byte{txscript.OP_TRUE})},
+		TxOut: []*wire.TxOut{wire.NewTxOut(5_000_000_000, pkScript)},
 	}
 	rec, err := wtxmgr.NewTxRecordFromMsgTx(coinbase, branchTime(height))
 	require.NoError(t, err)
@@ -486,6 +494,54 @@ func TestRollbackToChainUnverifiableAboveTip(t *testing.T) {
 
 	assert.True(t, hasStoredCredit(t, w, coinbase))
 	assert.Equal(t, forkHeight+20, w.Manager.SyncedTo().Height)
+}
+
+// TestReconcileWithChainBeforeRecovery ensures a stale block above the wallet's sync point is rolled back before
+// recovery records the chain's block at that height, which the store would otherwise reject.
+func TestReconcileWithChainBeforeRecovery(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	// Recovery reads the address of every stored credit, so the stale coinbase pays the wallet.
+	addr, err := w.NewAddress(waddrmgr.DefaultAccountNum, waddrmgr.KeyScopeBIP0086)
+	require.NoError(t, err)
+	pkScript, err := txscript.PayToAddrScript(addr)
+	require.NoError(t, err)
+
+	stale := mineCoinbaseTo(t, w, orphanedBranch, forkHeight+1, pkScript)
+	syncManagerTo(t, w, canonicalBranch, forkHeight-1, forkHeight)
+	setBirthdayBlock(t, w)
+
+	var recovered *wire.MsgTx
+	client := &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: forkHeight + 1,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight + 1)},
+			filterBlocksFunc: func(req *chain.FilterBlocksRequest) (*chain.FilterBlocksResponse, error) {
+				if recovered != nil {
+					return nil, nil //nolint:nilnil
+				}
+
+				response, _, _, tx, err := newRecoveryTestResponse(req, waddrmgr.KeyScopeBIP0086, 1000)
+				recovered = tx
+
+				return response, err
+			},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight):     branchHash(canonicalBranch, forkHeight),
+			int64(forkHeight + 1): branchHash(canonicalBranch, forkHeight+1),
+		},
+	}
+	w.chainClient = client
+
+	require.NoError(t, w.reconcileWithChain(client, testBirthdayStamp()))
+
+	assert.False(t, hasStoredCredit(t, w, stale))
+	require.NotNil(t, recovered)
+	details := txDetails(t, w, recovered.TxHash())
+	require.NotNil(t, details)
+	assert.Equal(t, branchHash(canonicalBranch, forkHeight+1), details.Block.Hash)
 }
 
 // TestDisconnectBlockNotChainSynced ensures a disconnect that arrives before the wallet is chain synced still rolls the

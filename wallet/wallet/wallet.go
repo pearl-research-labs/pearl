@@ -472,18 +472,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 		}
 	}
 
-	// If the wallet requested an on-chain recovery of its funds, we'll do
-	// so now.
-	if w.recoveryWindow > 0 {
-		if err := w.recovery(chainClient, birthdayStamp); err != nil {
-			return fmt.Errorf("unable to perform wallet recovery: %w", err)
-		}
-	}
-
-	// Compare previously-seen blocks against the current chain. If any of
-	// these blocks no longer exist, rollback all of the missing blocks
-	// before catching up with the rescan.
-	if err := w.rollbackToChain(chainClient); err != nil {
+	if err := w.reconcileWithChain(chainClient, birthdayStamp); err != nil {
 		return err
 	}
 
@@ -515,6 +504,28 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	}
 
 	return w.rescanWithTarget(addrs, unspent, nil)
+}
+
+// reconcileWithChain rolls back the blocks the chain no longer has and then runs any requested recovery. The rollback
+// has to come first: the transaction store rejects a block that conflicts with the one it holds at the same height, so
+// a stale block would fail every recovery attempt.
+func (w *Wallet) reconcileWithChain(chainClient chain.Interface, birthdayStamp *waddrmgr.BlockStamp) error {
+	// Compare previously-seen blocks against the current chain. If any of
+	// these blocks no longer exist, rollback all of the missing blocks
+	// before catching up with the rescan.
+	if err := w.rollbackToChain(chainClient); err != nil {
+		return err
+	}
+
+	// If the wallet requested an on-chain recovery of its funds, we'll do
+	// so now.
+	if w.recoveryWindow > 0 {
+		if err := w.recovery(chainClient, birthdayStamp); err != nil {
+			return fmt.Errorf("unable to perform wallet recovery: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // rollbackToChain compares the blocks the wallet has previously seen against the current chain and rolls back the ones
