@@ -268,6 +268,19 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
 	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
 
+	// A disconnect can arrive after the backend has switched back to the block, for example as a duplicate from the
+	// other notification producer. Acting on it would roll back history that the chain still has or has not reached.
+	onChain, err := chainHasBlock(w.ChainClient(), &b.Block)
+	if err != nil {
+		return err
+	}
+
+	if onChain {
+		log.Infof("Ignoring disconnected block %v at height %d: the chain still has it", b.Hash, b.Height)
+
+		return nil
+	}
+
 	// A stale sync tip must not override a newer block in the store.
 	storedHash, err := w.TxStore.BlockHash(txmgrNs, b.Height)
 	if err != nil {
@@ -547,8 +560,7 @@ func retainedCoinbaseDescendants(details map[chainhash.Hash]wtxmgr.TxDetails,
 }
 
 // disconnectedBlockStamp returns the preceding sync stamp only when the address manager knows the exact disconnected
-// block and the chain no longer has it. Transaction history may be ahead of, or on a different chain from, the manager
-// during a rescan.
+// block. Transaction history may be ahead of, or on a different chain from, the manager during a rescan.
 //
 //nolint:nilnil // An unknown block does not require rewinding the manager.
 func (w *Wallet) disconnectedBlockStamp(ns walletdb.ReadBucket, block *wtxmgr.Block) (*waddrmgr.BlockStamp, error) {
@@ -567,13 +579,6 @@ func (w *Wallet) disconnectedBlockStamp(ns walletdb.ReadBucket, block *wtxmgr.Bl
 
 	if *hash != block.Hash {
 		return nil, nil
-	}
-
-	// A disconnect can arrive after the backend has switched back to the block, for example as a duplicate from the
-	// other notification producer. Rewinding would then delete hashes that the next connect needs.
-	onChain, err := chainHasBlock(w.ChainClient(), block)
-	if err != nil || onChain {
-		return nil, err
 	}
 
 	height := block.Height - 1

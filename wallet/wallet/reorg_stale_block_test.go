@@ -594,3 +594,33 @@ func TestDisconnectBlockStillOnChain(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, forkHeight+2, w.Manager.SyncedTo().Height)
 }
+
+// TestDisconnectBlockStillOnChainLaggingBackend ensures a disconnect for a block the backend still has keeps the
+// history above that backend's tip, which it has not reached yet.
+func TestDisconnectBlockStillOnChainLaggingBackend(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	disconnected := mineCoinbase(t, w, canonicalBranch, forkHeight+1)
+	aboveTip := mineCoinbase(t, w, canonicalBranch, forkHeight+2)
+	syncManagerTo(t, w, canonicalBranch, forkHeight-1, forkHeight+2)
+	setBirthdayBlock(t, w)
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: forkHeight + 1,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight)},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight + 1): branchHash(canonicalBranch, forkHeight+1),
+		},
+	}
+
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		return w.disconnectBlock(tx, blockMeta(canonicalBranch, forkHeight+1))
+	})
+	require.NoError(t, err)
+
+	assert.True(t, hasStoredCredit(t, w, disconnected))
+	assert.True(t, hasStoredCredit(t, w, aboveTip))
+	assert.Equal(t, forkHeight+2, w.Manager.SyncedTo().Height)
+}
