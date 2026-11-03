@@ -27,9 +27,13 @@ func addCoinbase(tb testing.TB, harness *poolHarness, numOutputs uint32) *btcuti
 // badSignature returns a copy of tx whose first signature no longer verifies.
 func badSignature(tx *btcutil.Tx) *btcutil.Tx {
 	msgTx := tx.MsgTx().Copy()
-	sig := append([]byte(nil), msgTx.TxIn[0].Witness[0]...)
+	witness := msgTx.TxIn[0].DecodeWitness()
+
+	sig := append([]byte(nil), witness[0]...)
 	sig[0] ^= 0x01
-	msgTx.TxIn[0].Witness[0] = sig
+	witness[0] = sig
+
+	msgTx.TxIn[0].SetWitness(witness)
 	return btcutil.NewTx(msgTx)
 }
 

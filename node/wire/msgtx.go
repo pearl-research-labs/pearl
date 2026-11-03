@@ -5,6 +5,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -97,15 +98,18 @@ const (
 	// 6,400,000 bytes.
 	freeListMaxItems = 125
 
-	// maxWitnessItemsPerInput is the maximum number of witness items to
-	// be read for the witness data for a single TxIn. This number is
-	// derived using a possible lower bound for the encoding of a witness
-	// item: 1 byte for length + 1 byte for the witness item itself, or two
-	// bytes. Since witness data receives a 75% discount in vsize calculations
-	// (witness bytes count as 1/4 their actual size), a transaction with max
-	// vsize of 1,000,000 could theoretically contain up to 4,000,000 bytes of
-	// witness data.
-	maxWitnessItemsPerInput = MaxBlockPayload
+	// MaxWitnessItemsPerInput is the maximum number of witness items a single TxIn can carry. It is the most that
+	// script validation can accept, so a larger witness is invalid:
+	//
+	//   - A script path spend has at most txscript.MaxStackSize (1000) items for the initial stack, plus the leaf
+	//     script, the control block and an optional annex.
+	//   - A key path spend has one item, or two with an annex, and a coinbase has exactly one.
+	//   - Inputs that do not spend a witness program must have none.
+	//
+	// The limit matters because an empty item takes one byte on the wire but 24 bytes as a slice header once
+	// DecodeWitness builds the items. It bounds that allocation to about 24 KB per call. wire cannot import txscript,
+	// so TestWitnessItemLimitScriptPath in txscript checks that this is txscript.MaxStackSize + 3.
+	MaxWitnessItemsPerInput = 1000 + 3
 
 	// maxWitnessItemSize is the maximum allowed size for an item within
 	// an input's witness data. This value is bounded by the largest
@@ -207,6 +211,10 @@ func (c scriptFreeList) Return(buf *scriptSlab) {
 // the number of allocations.
 var scriptPool = make(scriptFreeList, freeListMaxItems)
 
+// emptyWitness is the serialized form of a witness with zero items. It is what an input without a witness encodes
+// as, and must not be modified.
+var emptyWitness = []byte{0x00}
+
 // OutPoint defines a data type that is used to track previous
 // transaction outputs.
 type OutPoint struct {
@@ -270,8 +278,78 @@ func (o OutPoint) String() string {
 type TxIn struct {
 	PreviousOutPoint OutPoint
 	SignatureScript  []byte
-	Witness          TxWitness
 	Sequence         uint32
+
+	// witness is the serialized witness: a varint item count followed by a
+	// varint length and the bytes of each item. It is nil when no witness is
+	// set and a single 0x00 byte when the witness has zero items. Keeping
+	// the serialized form is much cheaper than storing it as [][]byte.
+	witness []byte
+}
+
+// SetWitness replaces the input's witness. It is the only way to change it.
+// A nil w clears the witness; an empty non-nil w sets a zero-item witness.
+func (t *TxIn) SetWitness(w TxWitness) {
+	if w == nil {
+		t.witness = nil
+
+		return
+	}
+
+	// Writes to a bytes.Buffer never fail.
+	var raw bytes.Buffer
+	raw.Grow(w.SerializeSize())
+	_ = WriteVarInt(&raw, 0, uint64(len(w)))
+	for _, item := range w {
+		_ = WriteVarBytes(&raw, 0, item)
+	}
+
+	t.witness = raw.Bytes()
+}
+
+// DecodeWitness decodes and returns the witness items. The returned slice is
+// new, but the items share memory with the TxIn and must not be modified; to
+// change the witness, build new items and call SetWitness. Returns nil for no
+// witness and an empty non-nil TxWitness for a zero-item one.
+func (t *TxIn) DecodeWitness() TxWitness {
+	if t.witness == nil {
+		return nil
+	}
+
+	// The bytes were checked when they were decoded or produced by SetWitness, so they are well formed. pos is
+	// where the next varint starts in t.witness.
+	count, pos := decodeVarInt(t.witness)
+	w := make(TxWitness, count)
+	for i := range w {
+		size, n := decodeVarInt(t.witness[pos:])
+		pos += n
+
+		// w[i] holds the bytes t.witness[pos:end]. The third index stops its capacity at end too; without it,
+		// append(w[i], b) would write b over the next item in t.witness.
+		end := pos + int(size)
+		w[i] = t.witness[pos:end:end]
+		pos = end
+	}
+
+	return w
+}
+
+// HasWitness reports whether the input has a witness with at least one item.
+func (t *TxIn) HasWitness() bool {
+	// The stored witness is the item count followed by each item, and every item has at least a length byte. So
+	// no witness is empty, a witness with zero items is the single byte 0x00, and only a witness with items is
+	// longer than one byte.
+	return len(t.witness) > 1
+}
+
+// witnessSerializeSize returns the serialized size of the witness. An input
+// without a witness is serialized as a witness with zero items.
+func (t *TxIn) witnessSerializeSize() int {
+	if t.witness == nil {
+		return len(emptyWitness)
+	}
+
+	return len(t.witness)
 }
 
 // SerializeSize returns the number of bytes it would take to serialize the
@@ -288,12 +366,14 @@ func (t *TxIn) SerializeSize() int {
 // previous outpoint point and signature script with a default sequence of
 // MaxTxInSequenceNum.
 func NewTxIn(prevOut *OutPoint, signatureScript []byte, witness [][]byte) *TxIn {
-	return &TxIn{
+	txIn := &TxIn{
 		PreviousOutPoint: *prevOut,
 		SignatureScript:  signatureScript,
-		Witness:          witness,
 		Sequence:         MaxTxInSequenceNum,
 	}
+	txIn.SetWitness(witness) // store in serialized form.
+
+	return txIn
 }
 
 // TxWitness defines the witness for a TxIn. A witness is to be interpreted as
@@ -438,17 +518,8 @@ func (msg *MsgTx) Copy() *MsgTx {
 			Sequence:         oldTxIn.Sequence,
 		}
 
-		// If the transaction is witnessy, then also copy the
-		// witnesses.
-		if len(oldTxIn.Witness) != 0 {
-			// Deep copy the old witness data.
-			newTxIn.Witness = make([][]byte, len(oldTxIn.Witness))
-			for i, oldItem := range oldTxIn.Witness {
-				newItem := make([]byte, len(oldItem))
-				copy(newItem, oldItem)
-				newTxIn.Witness[i] = newItem
-			}
-		}
+		// Deep copy the old witness data. Clone keeps nil as nil.
+		newTxIn.witness = bytes.Clone(oldTxIn.witness)
 
 		// Finally, append this fully copied txin.
 		newTx.TxIn = append(newTx.TxIn, &newTxIn)
@@ -598,48 +669,12 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding, buf, 
 
 	// If the transaction's flag byte isn't 0x00 at this point, then one or more of its inputs has accompanying witness data.
 	if flag[0] != 0 && enc == WitnessEncoding {
-		for txInIndex, txin := range msg.TxIn {
-			// For each input, the witness is encoded as a stack with one or more items. Therefore, we first read a
-			// varint which encodes the number of stack items.
-			witCount, err := ReadVarIntBuf(r, pver, buf)
-			if err != nil {
-				return err
-			}
-
-			// Prevent a possible memory exhaustion attack by limiting the witCount value to a sane upper bound.
-			if witCount > maxWitnessItemsPerInput {
-				str := fmt.Sprintf("too many witness items to fit into max message size [count %d, max %d]",
-					witCount, maxWitnessItemsPerInput)
-				return messageError("MsgTx.PrlDecode", str)
-			}
-
-			// Each item takes at least one byte, its length prefix, so the items must fit in the unread bytes that
-			// remain after one witness count byte per later input and the 4-byte lock time that ends the transaction.
-			laterInputs := len(msg.TxIn) - txInIndex - 1
-			trailingBytes := laterInputs + 4
-			if maxCount := uint64(max(unreadBytes(r)-trailingBytes, 0)); witCount > maxCount {
-				str := fmt.Sprintf("too many witness items for remaining payload [count %d, max %d]",
-					witCount, maxCount)
-				return messageError("MsgTx.PrlDecode", str)
-			}
-
-			// Then for witCount number of stack items, each item has a varint length prefix, followed by the witness
-			// item itself.
-			txin.Witness = make([][]byte, witCount)
-			for j := uint64(0); j < witCount; j++ {
-				txin.Witness[j], err = readScriptBuf(r, pver, buf, sbuf, "script witness item")
-				if err != nil {
-					return err
-				}
-				totalScriptSize += uint64(len(txin.Witness[j]))
-				sbuf = sbuf[len(txin.Witness[j]):]
-			}
+		witnessSize, err := msg.readWitnesses(r, pver, buf, sbuf)
+		if err != nil {
+			return err
 		}
 
-		// Check that if the witness flag is set that we actually have witnesses. This check is also done by bitcoind.
-		if !msg.HasWitness() {
-			return errSuperfluousWitnessRecord
-		}
+		totalScriptSize += uint64(witnessSize)
 	}
 
 	if _, err := io.ReadFull(r, buf[:4]); err != nil {
@@ -669,18 +704,16 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding, buf, 
 		msg.TxIn[i].SignatureScript = scripts[offset:end:end]
 		offset += scriptSize
 
-		for j := 0; j < len(msg.TxIn[i].Witness); j++ {
-			// Copy each item within the witness stack for this input into the contiguous buffer at the appropriate offset.
-			witnessElem := msg.TxIn[i].Witness[j]
-			copy(scripts[offset:], witnessElem)
-
-			// Reset the witness item within the stack to the slice of the contiguous buffer where the witness lives.
-			witnessElemSize := uint64(len(witnessElem))
-			end := offset + witnessElemSize
-			msg.TxIn[i].Witness[j] = scripts[offset:end:end]
-			offset += witnessElemSize
+		// move witness bytes from sbuf, which might be reclaimed and reused, to a buffer used by this msg.
+		if witness := msg.TxIn[i].witness; witness != nil {
+			copy(scripts[offset:], witness)
+			witnessSize := uint64(len(witness))
+			end := offset + witnessSize
+			msg.TxIn[i].witness = scripts[offset:end:end]
+			offset += witnessSize
 		}
 	}
+
 	for i := 0; i < len(msg.TxOut); i++ {
 		// Copy the public key script into the contiguous buffer at the appropriate offset.
 		pkScript := msg.TxOut[i].PkScript
@@ -787,8 +820,14 @@ func (msg *MsgTx) prlEncode(w io.Writer, pver uint32, enc MessageEncoding,
 	// within the transaction.
 	if doWitness {
 		for _, ti := range msg.TxIn {
-			err = writeTxWitnessBuf(w, pver, msg.Version, ti.Witness, buf)
-			if err != nil {
+			// The witness is stored serialized, so write it as is. An input with no witness is written as a
+			// witness with zero items.
+			wit := emptyWitness
+			if ti.witness != nil {
+				wit = ti.witness
+			}
+
+			if _, err = w.Write(wit); err != nil {
 				return err
 			}
 		}
@@ -803,7 +842,7 @@ func (msg *MsgTx) prlEncode(w io.Writer, pver uint32, enc MessageEncoding,
 // contain witness data, true false otherwise.
 func (msg *MsgTx) HasWitness() bool {
 	for _, txIn := range msg.TxIn {
-		if len(txIn.Witness) != 0 {
+		if txIn.HasWitness() {
 			return true
 		}
 	}
@@ -871,7 +910,7 @@ func (msg *MsgTx) SerializeSize() int {
 		// Additionally, factor in the serialized size of each of the
 		// witnesses for each txin.
 		for _, txin := range msg.TxIn {
-			n += txin.Witness.SerializeSize()
+			n += txin.witnessSerializeSize()
 		}
 	}
 
@@ -927,7 +966,7 @@ func (msg *MsgTx) PkScriptLocs() []int {
 
 	// If this transaction has a witness input, the an additional two bytes
 	// for the marker, and flag byte need to be taken into account.
-	if len(msg.TxIn) > 0 && msg.TxIn[0].Witness != nil {
+	if len(msg.TxIn) > 0 && msg.TxIn[0].witness != nil {
 		n += 2
 	}
 
@@ -1198,23 +1237,85 @@ func WriteTxOutBuf(w io.Writer, pver uint32, version int32, to *TxOut,
 	return WriteVarBytesBuf(w, pver, to.PkScript, buf)
 }
 
-// writeTxWitnessBuf encodes the wire protocol encoding for a transaction
-// input's witness into to w. If b is non-nil, the provided buffer will be used
-// for serializing small values. Otherwise a buffer will be drawn from the
-// binarySerializer's pool and return when the method finishes.
-func writeTxWitnessBuf(w io.Writer, pver uint32, version int32, wit [][]byte,
-	buf []byte) error {
-
-	err := WriteVarIntBuf(w, pver, uint64(len(wit)), buf)
-	if err != nil {
-		return err
-	}
-	for _, item := range wit {
-		err = WriteVarBytesBuf(w, pver, item, buf)
+// readWitnesses is in effect a copy of the witnesses from r to the front of s: the bytes it writes to s are exactly
+// the bytes it reads from r, one input after another, starting at s[0]:
+//
+//	txIn 1:	<item count> <item 1 length> <item 1 bytes> <item 2 length> <item 2 bytes> ...
+//	txIn 2:	<item count> <item 1 length> <item 1 bytes> <item 2 length> <item 2 bytes> ...
+//
+// Each line is the serialized form of the input's TxWitness ([][]byte), and every number is a varint.
+//
+// It cannot be a plain copy, because the witnesses carry no total length: the counts and lengths have to be read to
+// find where each witness ends. That is also where they are checked against the limits, and where a witness that
+// would not fit in s is rejected.
+//
+// When it returns, each txIn.witness points to its part of s, and the result is the number of bytes written.
+func (msg *MsgTx) readWitnesses(r io.Reader, pver uint32, buf, s []byte) (int, error) {
+	// pos is how many bytes of s are written.
+	var pos int
+	for _, txIn := range msg.TxIn {
+		// write witnesscount for this txIn.
+		witCount, err := ReadVarIntBuf(r, pver, buf)
 		if err != nil {
-			return err
+			return 0, err
 		}
+
+		if witCount > MaxWitnessItemsPerInput {
+			str := fmt.Sprintf("too many witness items for one input [count %d, max %d]",
+				witCount, MaxWitnessItemsPerInput)
+
+			return 0, messageError("readWitnesses", str)
+		}
+
+		// check we have enough space to copy witCount.
+		if VarIntSerializeSize(witCount) > len(s)-pos {
+			str := fmt.Sprintf("witness item count exceeds remaining script buffer [remaining %d]", len(s)-pos)
+
+			return 0, messageError("readWitnesses", str)
+		}
+		start := pos // used to define witness byte slice txIn.witness = s[start:pos]
+		pos += putVarInt(s[pos:], witCount)
+
+		// Each witness item is read from r, checked for its length and copied into s.
+		for j := uint64(0); j < witCount; j++ {
+			itemSize, err := ReadVarIntBuf(r, pver, buf)
+			if err != nil {
+				return 0, err
+			}
+
+			// Prevent byte array larger than the max message size.
+			if itemSize > maxWitnessItemSize {
+				str := fmt.Sprintf("script witness item is larger than the max allowed size [count %d, max %d]",
+					itemSize, maxWitnessItemSize)
+
+				return 0, messageError("readWitnesses", str)
+			}
+
+			// check we have enough space for the item and its length:
+			end := pos + VarIntSerializeSize(itemSize) + int(itemSize)
+			if end > len(s) {
+				str := fmt.Sprintf("script witness item exceeds remaining script buffer [size %d, remaining %d]",
+					itemSize, len(s)-pos)
+
+				return 0, messageError("readWitnesses", str)
+			}
+			pos += putVarInt(s[pos:], itemSize)
+
+			// read from stream and into our buffer.
+			if _, err := io.ReadFull(r, s[pos:end]); err != nil {
+				return 0, err
+			}
+
+			pos = end
+		}
+
+		txIn.witness = s[start:pos]
 	}
 
-	return nil
+	// Check that if the witness flag is set that we actually have witnesses. This check is also done by bitcoind.
+	if !msg.HasWitness() {
+		return 0, errSuperfluousWitnessRecord
+	}
+
+	return pos, nil
 }

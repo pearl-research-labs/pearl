@@ -86,7 +86,7 @@ func runTestCase(t *testing.T, w *Wallet, scope waddrmgr.KeyScope,
 	require.Equal(t, 1, len(witness), "unexpected witness stack length")
 
 	// Finally verify that the created witness is valid.
-	outgoingTx.TxIn[0].Witness = witness
+	outgoingTx.TxIn[0].SetWitness(witness)
 	outgoingTx.TxIn[0].SignatureScript = script
 	err = validateMsgTx(
 		outgoingTx, [][]byte{utxOut.PkScript}, []btcutil.Amount{100000},

@@ -73,17 +73,31 @@ func VerifyTaprootKeySpend(witnessProgram []byte, rawSig []byte, tx *wire.MsgTx,
 	inputIndex int, prevOuts PrevOutputFetcher, hashCache *TxSigHashes,
 	sigCache *SigCache) error {
 
-	// First, we'll need to extract the public key from the witness
-	// program.
-	rawKey := witnessProgram
-
 	// Extract the annex if it exists, so we can compute the proper
 	// sighash below.
 	var annex []byte
-	witness := tx.TxIn[inputIndex].Witness
+	witness := tx.TxIn[inputIndex].DecodeWitness()
 	if isAnnexedWitness(witness) {
 		annex, _ = extractAnnex(witness)
 	}
+
+	return verifyTaprootKeySpendWithAnnex(
+		witnessProgram, rawSig, annex, tx, inputIndex, prevOuts,
+		hashCache, sigCache,
+	)
+}
+
+// verifyTaprootKeySpendWithAnnex is VerifyTaprootKeySpend for a caller that
+// already holds the decoded witness. annex must be that witness's annex, or nil
+// if it has none: the signature commits to it, so any other value rejects valid
+// spends.
+func verifyTaprootKeySpendWithAnnex(witnessProgram, rawSig, annex []byte,
+	tx *wire.MsgTx, inputIndex int, prevOuts PrevOutputFetcher,
+	hashCache *TxSigHashes, sigCache *SigCache) error {
+
+	// First, we'll need to extract the public key from the witness
+	// program.
+	rawKey := witnessProgram
 
 	// Now that we have the public key, we can create a new top-level
 	// keyspend verifier that'll handle all the sighash and schnorr

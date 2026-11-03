@@ -69,7 +69,6 @@ func (v *txValidator) validateHandler() {
 
 			// Create a new script engine for the script pair.
 			sigScript := txIn.SignatureScript
-			witness := txIn.Witness
 			pkScript := utxo.PkScript()
 			inputAmount := utxo.Amount()
 			vm, err := txscript.NewEngine(
@@ -83,7 +82,7 @@ func (v *txValidator) validateHandler() {
 					"%v (input witness %x, input script "+
 					"bytes %x, prev output script bytes %x)",
 					txVI.tx.Hash(), txVI.txInIndex,
-					txIn.PreviousOutPoint, err, witness,
+					txIn.PreviousOutPoint, err, txIn.DecodeWitness(),
 					sigScript, pkScript)
 				err := ruleError(ErrScriptMalformed, str)
 				v.sendResult(err)
@@ -97,7 +96,7 @@ func (v *txValidator) validateHandler() {
 					"%v (input witness %x, input script "+
 					"bytes %x, prev output script bytes %x)",
 					txVI.tx.Hash(), txVI.txInIndex,
-					txIn.PreviousOutPoint, err, witness,
+					txIn.PreviousOutPoint, err, txIn.DecodeWitness(),
 					sigScript, pkScript)
 				err := ruleError(ErrScriptValidation, str)
 				v.sendResult(err)

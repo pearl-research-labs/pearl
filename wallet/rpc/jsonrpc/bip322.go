@@ -69,7 +69,7 @@ func BIP322SignMessageSimple(privKey *btcec.PrivateKey, addr *btcutil.AddressTap
 		return "", fmt.Errorf("failed to create signature: %w", err)
 	}
 
-	toSign.TxIn[0].Witness = witness
+	toSign.TxIn[0].SetWitness(witness)
 
 	// Step 4: Encode the signature
 	// BIP-322 simple signature format: just the witness stack
@@ -121,7 +121,7 @@ func BIP322VerifyMessageSimple(addr *btcutil.AddressTaproot, signature, message 
 	// Input: spend from the to_spend transaction
 	toSpendHash := toSpend.TxHash()
 	toSignInput := wire.NewTxIn(wire.NewOutPoint(&toSpendHash, 0), nil, nil)
-	toSignInput.Witness = witness // Set the witness from the signature
+	toSignInput.SetWitness(witness) // Set the witness from the signature
 	toSign.AddTxIn(toSignInput)
 
 	// Output: OP_RETURN with the message
@@ -180,6 +180,9 @@ func ParseWitnessStack(data []byte) (wire.TxWitness, error) {
 	witnessCount, err := wire.ReadVarInt(reader, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read witness count: %w", err)
+	}
+	if witnessCount > wire.MaxWitnessItemsPerInput {
+		return nil, fmt.Errorf("too many witness items: %d, max %d", witnessCount, wire.MaxWitnessItemsPerInput)
 	}
 
 	witness := make(wire.TxWitness, witnessCount)

@@ -85,7 +85,7 @@ func TestSPVMinedConflictRemovesRetainedDescendants(t *testing.T) {
 		1, 1000, CoinSelectionLargest, false)
 	require.NoError(t, err)
 	require.Equal(t, funding, conflict.Tx.TxIn[0].PreviousOutPoint)
-	require.NotEmpty(t, conflict.Tx.TxIn[0].Witness)
+	require.NotEmpty(t, conflict.Tx.TxIn[0].DecodeWitness())
 
 	w.chainClient = &scriptedChainClient{backEnd: "neutrino", send: func(*wire.MsgTx) error {
 		return chain.ErrMissingInputs

@@ -307,10 +307,10 @@ func TestOpcodeCheckXmssSigScriptPathSpend(t *testing.T) {
 
 	const chunk = xmss.SignatureLen / 5
 	execute := func(sig [xmss.SignatureLen]byte) error {
-		tx.TxIn[0].Witness = wire.TxWitness{
+		tx.TxIn[0].SetWitness(wire.TxWitness{
 			sig[:chunk], sig[chunk : 2*chunk], sig[2*chunk : 3*chunk], sig[3*chunk : 4*chunk], sig[4*chunk:],
 			xmssScript, ctrlBytes,
-		}
+		})
 		vm, err := NewEngine(pkScript, tx, 0, StandardVerifyFlags, nil, sigHashes, value, prevFetcher)
 		require.NoError(t, err)
 		return vm.Execute()

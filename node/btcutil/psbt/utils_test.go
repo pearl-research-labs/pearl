@@ -349,13 +349,11 @@ func TestVerifyInputOutputLen(t *testing.T) {
 }
 
 func TestNewFromSignedTx(t *testing.T) {
+	txIn := wire.NewTxIn(&wire.OutPoint{}, []byte("script"), [][]byte{[]byte("witness")})
+	txIn.Sequence = 1234
+
 	orig := &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{},
-			SignatureScript:  []byte("script"),
-			Witness:          [][]byte{[]byte("witness")},
-			Sequence:         1234,
-		}},
+		TxIn: []*wire.TxIn{txIn},
 		TxOut: []*wire.TxOut{{
 			PkScript: []byte{77, 88},
 			Value:    99,

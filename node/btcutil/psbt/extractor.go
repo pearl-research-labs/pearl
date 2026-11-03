@@ -60,11 +60,14 @@ func Extract(p *Packet) (*wire.MsgTx, error) {
 			if err != nil {
 				return nil, err
 			}
+			if witCount > wire.MaxWitnessItemsPerInput {
+				return nil, ErrInvalidPsbtFormat
+			}
 
 			// Now that we know how many inputs we'll need, we'll
 			// construct a packing slice, then read out each input
 			// (with a varint prefix) from the witnessReader.
-			tin.Witness = make(wire.TxWitness, witCount)
+			witness := make(wire.TxWitness, witCount)
 			for j := uint64(0); j < witCount; j++ {
 				wit, err := wire.ReadVarBytes(
 					witnessReader, 0,
@@ -73,12 +76,13 @@ func Extract(p *Packet) (*wire.MsgTx, error) {
 				if err != nil {
 					return nil, err
 				}
-				tin.Witness[j] = wit
+				witness[j] = wit
 			}
 
 			if err := assertFullyConsumed(witnessReader); err != nil {
 				return nil, err
 			}
+			tin.SetWitness(witness)
 		}
 	}
 

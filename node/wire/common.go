@@ -185,8 +185,8 @@ var binarySerializer binaryFreeList = make(chan []byte, binaryFreeListMaxItems)
 
 // errNonCanonicalVarInt is the common format string used for non-canonically
 // encoded variable length integer errors.
-var errNonCanonicalVarInt = "non-canonical varint %x - discriminant %x must " +
-	"encode a value greater than %x"
+var errNonCanonicalVarInt = "non-canonical varint %x - discriminant %x " +
+	"encodes a value that fits in fewer bytes"
 
 // uint32Time represents a unix timestamp encoded with a uint32.  It is used as
 // a way to signal the readElement function how to decode a timestamp into a Go
@@ -502,56 +502,60 @@ func ReadVarIntBuf(r io.Reader, pver uint32, buf []byte) (uint64, error) {
 		return 0, err
 	}
 	discriminant := buf[0]
+	if discriminant < 0xfd {
+		return uint64(discriminant), nil
+	}
 
-	var rv uint64
-	switch discriminant {
-	case 0xff:
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return 0, err
-		}
-		rv = littleEndian.Uint64(buf)
+	limitedBuf := buf[:discriminantToSize(discriminant)-1]
+	if _, err := io.ReadFull(r, limitedBuf); err != nil {
+		return 0, err
+	}
+	rv := varIntValue(limitedBuf)
 
-		// The encoding is not canonical if the value could have been
-		// encoded using fewer bytes.
-		min := uint64(0x100000000)
-		if rv < min {
-			return 0, messageError("ReadVarInt", fmt.Sprintf(
-				errNonCanonicalVarInt, rv, discriminant, min))
-		}
-
-	case 0xfe:
-		if _, err := io.ReadFull(r, buf[:4]); err != nil {
-			return 0, err
-		}
-		rv = uint64(littleEndian.Uint32(buf[:4]))
-
-		// The encoding is not canonical if the value could have been
-		// encoded using fewer bytes.
-		min := uint64(0x10000)
-		if rv < min {
-			return 0, messageError("ReadVarInt", fmt.Sprintf(
-				errNonCanonicalVarInt, rv, discriminant, min))
-		}
-
-	case 0xfd:
-		if _, err := io.ReadFull(r, buf[:2]); err != nil {
-			return 0, err
-		}
-		rv = uint64(littleEndian.Uint16(buf[:2]))
-
-		// The encoding is not canonical if the value could have been
-		// encoded using fewer bytes.
-		min := uint64(0xfd)
-		if rv < min {
-			return 0, messageError("ReadVarInt", fmt.Sprintf(
-				errNonCanonicalVarInt, rv, discriminant, min))
-		}
-
-	default:
-		rv = uint64(discriminant)
+	// The encoding is not canonical if the value could have been encoded using fewer bytes.
+	if VarIntSerializeSize(rv) != len(limitedBuf)+1 {
+		return 0, messageError("ReadVarInt", fmt.Sprintf(errNonCanonicalVarInt, rv, discriminant))
 	}
 
 	return rv, nil
+}
+
+// discriminantToSize returns the size of the varint that starts with discriminant d.
+func discriminantToSize(d byte) int {
+	switch d {
+	case 0xff:
+		return 9
+	case 0xfe:
+		return 5
+	case 0xfd:
+		return 3
+	default:
+		return 1
+	}
+}
+
+// varIntValue decodes b, the bytes that follow a 0xfd, 0xfe or 0xff discriminant: a little-endian uint16, uint32 or
+// uint64.
+func varIntValue(b []byte) uint64 {
+	switch len(b) {
+	case 8:
+		return littleEndian.Uint64(b)
+	case 4:
+		return uint64(littleEndian.Uint32(b))
+	default:
+		return uint64(littleEndian.Uint16(b))
+	}
+}
+
+// decodeVarInt decodes the varint at the front of b and returns it with its size. b must hold the whole varint, and
+// the varint is not checked for canonical encoding.
+func decodeVarInt(b []byte) (uint64, int) {
+	size := discriminantToSize(b[0])
+	if size == 1 {
+		return uint64(b[0]), 1
+	}
+
+	return varIntValue(b[1:size]), size
 }
 
 // WriteVarInt serializes val to w using a variable number of bytes depending
@@ -569,25 +573,8 @@ func WriteVarInt(w io.Writer, pver uint32, val uint64) error {
 //
 // NOTE: buf MUST at least an 8-byte slice.
 func WriteVarIntBuf(w io.Writer, pver uint32, val uint64, buf []byte) error {
-	switch {
-	case val < 0xfd:
-		buf[0] = uint8(val)
-		_, err := w.Write(buf[:1])
-		return err
-
-	case val <= math.MaxUint16:
-		buf[0] = 0xfd
-		littleEndian.PutUint16(buf[1:3], uint16(val))
-		_, err := w.Write(buf[:3])
-		return err
-
-	case val <= math.MaxUint32:
-		buf[0] = 0xfe
-		littleEndian.PutUint32(buf[1:5], uint32(val))
-		_, err := w.Write(buf[:5])
-		return err
-
-	default:
+	// buf may hold only 8 bytes, one short of a 9-byte varint, so that one is written in two parts.
+	if val > math.MaxUint32 {
 		buf[0] = 0xff
 		if _, err := w.Write(buf[:1]); err != nil {
 			return err
@@ -596,6 +583,31 @@ func WriteVarIntBuf(w io.Writer, pver uint32, val uint64, buf []byte) error {
 		littleEndian.PutUint64(buf, val)
 		_, err := w.Write(buf)
 		return err
+	}
+
+	_, err := w.Write(buf[:putVarInt(buf, val)])
+	return err
+}
+
+// putVarInt writes val as a varint to the front of b and returns its size. b must have room for
+// VarIntSerializeSize(val) bytes.
+func putVarInt(b []byte, val uint64) int {
+	switch {
+	case val < 0xfd:
+		b[0] = uint8(val)
+		return 1
+	case val <= math.MaxUint16:
+		b[0] = 0xfd
+		littleEndian.PutUint16(b[1:3], uint16(val))
+		return 3
+	case val <= math.MaxUint32:
+		b[0] = 0xfe
+		littleEndian.PutUint32(b[1:5], uint32(val))
+		return 5
+	default:
+		b[0] = 0xff
+		littleEndian.PutUint64(b[1:9], val)
+		return 9
 	}
 }
 

@@ -645,7 +645,7 @@ func createVinList(mtx *wire.MsgTx) []btcjson.Vin {
 		txIn := mtx.TxIn[0]
 		vinList[0].Coinbase = hex.EncodeToString(txIn.SignatureScript)
 		vinList[0].Sequence = txIn.Sequence
-		vinList[0].Witness = txIn.Witness.ToHexStrings()
+		vinList[0].Witness = txIn.DecodeWitness().ToHexStrings()
 		return vinList
 	}
 
@@ -665,7 +665,7 @@ func createVinList(mtx *wire.MsgTx) []btcjson.Vin {
 		}
 
 		if mtx.HasWitness() {
-			vinEntry.Witness = txIn.Witness.ToHexStrings()
+			vinEntry.Witness = txIn.DecodeWitness().ToHexStrings()
 		}
 	}
 
@@ -3151,8 +3151,8 @@ func createVinListPrevOut(s *rpcServer, mtx *wire.MsgTx, chainParams *chaincfg.P
 			},
 		}
 
-		if len(txIn.Witness) != 0 {
-			vinEntry.Witness = txIn.Witness.ToHexStrings()
+		if txIn.HasWitness() {
+			vinEntry.Witness = txIn.DecodeWitness().ToHexStrings()
 		}
 
 		// Add the entry to the list now if it already passed the filter

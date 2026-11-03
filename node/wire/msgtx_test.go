@@ -85,9 +85,9 @@ func TestTx(t *testing.T) {
 			spew.Sdump(txIn.SignatureScript),
 			spew.Sdump(sigScript))
 	}
-	if !reflect.DeepEqual(txIn.Witness, TxWitness(witnessData)) {
+	if !reflect.DeepEqual(txIn.DecodeWitness(), TxWitness(witnessData)) {
 		t.Errorf("NewTxIn: wrong witness data - got %v, want %v",
-			spew.Sdump(txIn.Witness),
+			spew.Sdump(txIn.DecodeWitness()),
 			spew.Sdump(witnessData))
 	}
 
@@ -189,7 +189,7 @@ func TestTxCountsBoundedByRemainingPayload(t *testing.T) {
 		// ceiling is the largest count the per-message limits still accept.
 		ceiling uint64
 		wantErr string
-		// allocated returns the length of the slice that the count sizes.
+		// allocated returns the length of the slice that the count sizes, or is nil when the count sizes nothing.
 		allocated func(*MsgTx) int
 	}{
 		{
@@ -211,13 +211,14 @@ func TestTxCountsBoundedByRemainingPayload(t *testing.T) {
 			allocated: func(tx *MsgTx) int { return len(tx.TxOut) },
 		},
 		{
-			name:      "witness item count",
-			prefix:    join(version, witnessMarker, one, emptyTxIn, zero),
-			element:   emptyItem,
-			suffix:    lockTime,
-			ceiling:   maxWitnessItemsPerInput,
-			wantErr:   "witness items for remaining payload",
-			allocated: func(tx *MsgTx) int { return len(tx.TxIn[0].Witness) },
+			// Nothing is sized by the witness item count, so a count larger than the payload is rejected when the
+			// payload runs out.
+			name:    "witness item count",
+			prefix:  join(version, witnessMarker, one, emptyTxIn, zero),
+			element: emptyItem,
+			suffix:  lockTime,
+			ceiling: MaxWitnessItemsPerInput,
+			wantErr: "EOF",
 		},
 	}
 	for _, test := range tests {
@@ -241,7 +242,9 @@ func TestTxCountsBoundedByRemainingPayload(t *testing.T) {
 				t.Run(tc.name, func(t *testing.T) {
 					tx, err := decode(tc.payload)
 					require.ErrorContains(t, err, test.wantErr)
-					require.Zero(t, test.allocated(tx), "slice allocated before the count was rejected")
+					if test.allocated != nil {
+						require.Zero(t, test.allocated(tx), "slice allocated before the count was rejected")
+					}
 					require.ErrorContains(t, decodeV2(tc.payload), test.wantErr)
 				})
 			}
@@ -380,8 +383,8 @@ func TestWTxSha(t *testing.T) {
 
 	// From block 23157 in a past version of segnet.
 	msgTx := NewMsgTx(1)
-	txIn := TxIn{
-		PreviousOutPoint: OutPoint{
+	txIn := NewTxIn(
+		&OutPoint{
 			Hash: chainhash.Hash{
 				0xa5, 0x33, 0x52, 0xd5, 0x13, 0x57, 0x66, 0xf0,
 				0x30, 0x76, 0x59, 0x74, 0x18, 0x26, 0x3d, 0xa2,
@@ -390,7 +393,8 @@ func TestWTxSha(t *testing.T) {
 			},
 			Index: 19,
 		},
-		Witness: [][]byte{
+		nil,
+		[][]byte{
 			{ // 70-byte signature
 				0x30, 0x43, 0x02, 0x1f, 0x4d, 0x23, 0x81, 0xdc,
 				0x97, 0xf1, 0x82, 0xab, 0xd8, 0x18, 0x5f, 0x51,
@@ -410,8 +414,7 @@ func TestWTxSha(t *testing.T) {
 				0x8f,
 			},
 		},
-		Sequence: 0xffffffff,
-	}
+	)
 	txOut := TxOut{
 		Value: 395019,
 		PkScript: []byte{
@@ -422,7 +425,7 @@ func TestWTxSha(t *testing.T) {
 			0x40, 0x6a, 0x85, 0x23, // 20-byte pub key hash
 		},
 	}
-	msgTx.AddTxIn(&txIn)
+	msgTx.AddTxIn(txIn)
 	msgTx.AddTxOut(&txOut)
 	msgTx.LockTime = 0
 
@@ -986,6 +989,116 @@ func TestTxWitnessSize(t *testing.T) {
 	}
 }
 
+// TestTxWitnessDecodeAllocs ensures decoding allocates the same for a witness with one item as for one with the
+// most items an input can carry, so that the decoded size of a witness does not grow with its number of items.
+func TestTxWitnessDecodeAllocs(t *testing.T) {
+	allocs := func(items int) float64 {
+		tx := NewMsgTx(1)
+		txIn := NewTxIn(&OutPoint{}, nil, make([][]byte, items))
+		tx.AddTxIn(txIn)
+		tx.AddTxOut(NewTxOut(1, []byte{0x51}))
+		var b bytes.Buffer
+		require.NoError(t, tx.Serialize(&b))
+
+		return testing.AllocsPerRun(10, func() {
+			var decoded MsgTx
+			require.NoError(t, decoded.Deserialize(bytes.NewReader(b.Bytes())))
+		})
+	}
+	require.Equal(t, allocs(1), allocs(1003))
+}
+
+// TestTxWitnessDecodeNoExtraAllocs ensures a transaction with a witness decodes with as many allocations as one
+// without, as every transaction a peer relays is decoded.
+func TestTxWitnessDecodeNoExtraAllocs(t *testing.T) {
+	allocs := func(w TxWitness) float64 {
+		tx := NewMsgTx(1)
+		tx.AddTxIn(NewTxIn(&OutPoint{}, nil, w))
+		tx.AddTxOut(NewTxOut(1, []byte{0x51}))
+		var b bytes.Buffer
+		require.NoError(t, tx.Serialize(&b))
+
+		return testing.AllocsPerRun(10, func() {
+			var decoded MsgTx
+			require.NoError(t, decoded.Deserialize(bytes.NewReader(b.Bytes())))
+		})
+	}
+	require.Equal(t, allocs(nil), allocs(TxWitness{make([]byte, 64)}))
+}
+
+// TestTxWitnessItemLimit ensures a witness may carry MaxWitnessItemsPerInput items and no more.
+func TestTxWitnessItemLimit(t *testing.T) {
+	encode := func(items int) []byte {
+		tx := NewMsgTx(1)
+		tx.AddTxIn(NewTxIn(&OutPoint{}, nil, make([][]byte, items)))
+		tx.AddTxOut(NewTxOut(1, []byte{0x51}))
+		var b bytes.Buffer
+		require.NoError(t, tx.Serialize(&b))
+		return b.Bytes()
+	}
+
+	var tx MsgTx
+	require.NoError(t, tx.Deserialize(bytes.NewReader(encode(MaxWitnessItemsPerInput))))
+	require.Len(t, tx.TxIn[0].DecodeWitness(), MaxWitnessItemsPerInput)
+
+	err := new(MsgTx).Deserialize(bytes.NewReader(encode(MaxWitnessItemsPerInput + 1)))
+	require.ErrorContains(t, err, "too many witness items for one input")
+}
+
+// TestTxInDecodeWitness ensures changes to the slice DecodeWitness returns, and appends to its items, do not reach
+// the input.
+func TestTxInDecodeWitness(t *testing.T) {
+	txIn := NewTxIn(&OutPoint{}, nil, [][]byte{{0x01, 0x02}, {}, {0x03}})
+	want := txIn.DecodeWitness()
+
+	got := txIn.DecodeWitness()
+	_ = append(got[1], 0xff)
+	got[2] = []byte{0xee}
+	require.Equal(t, TxWitness{{0x01, 0x02}, {}, {0x03}}, want)
+	require.Equal(t, want, txIn.DecodeWitness())
+	require.Equal(t, want.SerializeSize(), txIn.witnessSerializeSize())
+}
+
+// TestTxInWitnessNilVsEmpty ensures no witness and a witness with zero items stay distinct, as the offset PkScriptLocs
+// returns depends on it.
+func TestTxInWitnessNilVsEmpty(t *testing.T) {
+	newTx := func(w TxWitness) *MsgTx {
+		tx := NewMsgTx(1)
+		txIn := NewTxIn(&OutPoint{}, nil, w)
+		tx.AddTxIn(txIn)
+		tx.AddTxOut(NewTxOut(1, []byte{0x51}))
+		return tx
+	}
+	none, empty := newTx(nil), newTx(TxWitness{})
+
+	require.Nil(t, none.TxIn[0].DecodeWitness())
+	require.NotNil(t, empty.TxIn[0].DecodeWitness())
+	require.Empty(t, empty.TxIn[0].DecodeWitness())
+	require.Equal(t, 1, none.TxIn[0].witnessSerializeSize())
+	require.Equal(t, 1, empty.TxIn[0].witnessSerializeSize())
+	require.Equal(t, none.SerializeSize(), empty.SerializeSize())
+	require.Equal(t, none.PkScriptLocs()[0]+2, empty.PkScriptLocs()[0])
+}
+
+// TestTxDecodeWitnessOutlivesScriptBuffer ensures the decoded witness does not point into the script buffer, which
+// goes back to the pool after decoding and is overwritten by the next decode.
+func TestTxDecodeWitnessOutlivesScriptBuffer(t *testing.T) {
+	want := TxWitness{{0x01, 0x02}, {}, {0x03}}
+	tx := NewMsgTx(1)
+	tx.AddTxIn(NewTxIn(&OutPoint{}, nil, want))
+	var b bytes.Buffer
+	require.NoError(t, tx.Serialize(&b))
+
+	var decoded MsgTx
+	sbuf := make([]byte, 64)
+	require.NoError(t, decoded.prlDecode(bytes.NewReader(b.Bytes()), 0, WitnessEncoding, make([]byte, 8), sbuf))
+
+	for i := range sbuf {
+		sbuf[i] = 0xff
+	}
+	require.Equal(t, want, decoded.TxIn[0].DecodeWitness())
+}
+
 // TestTxOutPointFromString performs tests to ensure that the outpoint string
 // parser works as expected.
 func TestTxOutPointFromString(t *testing.T) {
@@ -1180,8 +1293,8 @@ var multiTxPkScriptLocs = []int{63, 139}
 var multiWitnessTx = &MsgTx{
 	Version: 1,
 	TxIn: []*TxIn{
-		{
-			PreviousOutPoint: OutPoint{
+		NewTxIn(
+			&OutPoint{
 				Hash: chainhash.Hash{
 					0xa5, 0x33, 0x52, 0xd5, 0x13, 0x57, 0x66, 0xf0,
 					0x30, 0x76, 0x59, 0x74, 0x18, 0x26, 0x3d, 0xa2,
@@ -1190,8 +1303,8 @@ var multiWitnessTx = &MsgTx{
 				},
 				Index: 19,
 			},
-			SignatureScript: []byte{},
-			Witness: [][]byte{
+			[]byte{},
+			[][]byte{
 				{ // 70-byte signature
 					0x30, 0x43, 0x02, 0x1f, 0x4d, 0x23, 0x81, 0xdc,
 					0x97, 0xf1, 0x82, 0xab, 0xd8, 0x18, 0x5f, 0x51,
@@ -1211,8 +1324,7 @@ var multiWitnessTx = &MsgTx{
 					0x8f,
 				},
 			},
-			Sequence: 0xffffffff,
-		},
+		),
 	},
 	TxOut: []*TxOut{
 		{

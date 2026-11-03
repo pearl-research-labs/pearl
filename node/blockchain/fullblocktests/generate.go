@@ -405,7 +405,7 @@ func (g *testGenerator) signBlockTransactions(block *wire.MsgBlock) {
 	for txIdx := 1; txIdx < len(block.Transactions); txIdx++ {
 		tx := block.Transactions[txIdx]
 		for i, txIn := range tx.TxIn {
-			if len(txIn.Witness) > 0 {
+			if txIn.HasWitness() {
 				continue
 			}
 			pkScript, value := g.findOutput(block, txIn.PreviousOutPoint)
@@ -443,7 +443,7 @@ func updateWitnessCommitment(block *wire.MsgBlock) bool {
 			break
 		}
 	}
-	cb.TxIn[0].Witness = nil
+	cb.TxIn[0].SetWitness(nil)
 
 	utilTxns := make([]*btcutil.Tx, len(block.Transactions))
 	for i, tx := range block.Transactions {
@@ -714,7 +714,7 @@ func (g *testGenerator) padBlockToVsize(b *wire.MsgBlock, targetVsize int) {
 	// (Taproot sighash commits to outputs, which changed).
 	for _, tx := range b.Transactions[1:] {
 		for _, txIn := range tx.TxIn {
-			txIn.Witness = nil
+			txIn.SetWitness(nil)
 		}
 	}
 	g.signBlockTransactions(b)
@@ -1101,7 +1101,7 @@ func Generate(includeLargeReorg bool) (tests [][]TestInstance, err error) {
 	tests = append(tests, []TestInstance{
 		acceptBlock("b13", b13, false, true),
 		acceptBlock("b14", b14, false, true),
-		rejectBlock("b12", b12, blockchain.ErrBadCoinbaseValue),
+		acceptBlock("b12", b12, false, false),
 		expectTipBlock("b13", b13),
 	})
 

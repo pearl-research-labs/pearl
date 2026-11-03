@@ -349,7 +349,7 @@ func createP2MRSpendingTx(leafScript []byte, controlBlock []byte,
 	fullWitness = append(fullWitness, witnessStack...)
 	fullWitness = append(fullWitness, leafScript)
 	fullWitness = append(fullWitness, controlBlock)
-	spendTx.TxIn[0].Witness = fullWitness
+	spendTx.TxIn[0].SetWitness(fullWitness)
 
 	return spendTx, pkScript
 }
@@ -451,7 +451,7 @@ func TestP2MRMultiLeafSpend(t *testing.T) {
 			witness = append(witness, test.witnessStack...)
 			witness = append(witness, test.leafScript)
 			witness = append(witness, cbBytes)
-			spendTx.TxIn[0].Witness = witness
+			spendTx.TxIn[0].SetWitness(witness)
 
 			prevOutFetcher := NewCannedPrevOutputFetcher(pkScript, 1e8)
 			hashCache := NewTxSigHashes(spendTx, prevOutFetcher)
@@ -484,9 +484,9 @@ func TestP2MRKeyPathRejected(t *testing.T) {
 	spendTx.AddTxOut(&wire.TxOut{Value: 1e8})
 
 	// Only one witness element (simulating a key-path spend attempt).
-	spendTx.TxIn[0].Witness = wire.TxWitness{
+	spendTx.TxIn[0].SetWitness(wire.TxWitness{
 		bytes.Repeat([]byte{0xaa}, 64),
-	}
+	})
 
 	prevOutFetcher := NewCannedPrevOutputFetcher(pkScript, 1e8)
 	hashCache := NewTxSigHashes(spendTx, prevOutFetcher)
@@ -526,7 +526,7 @@ func TestP2MRInvalidMerkleProof(t *testing.T) {
 		PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{}, Index: 0},
 	})
 	spendTx.AddTxOut(&wire.TxOut{Value: 1e8})
-	spendTx.TxIn[0].Witness = wire.TxWitness{leafScript, cbBytes}
+	spendTx.TxIn[0].SetWitness(wire.TxWitness{leafScript, cbBytes})
 
 	prevOutFetcher := NewCannedPrevOutputFetcher(pkScript, 1e8)
 	hashCache := NewTxSigHashes(spendTx, prevOutFetcher)
@@ -562,7 +562,7 @@ func TestP2MRInvalidParityBit(t *testing.T) {
 		PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{}, Index: 0},
 	})
 	spendTx.AddTxOut(&wire.TxOut{Value: 1e8})
-	spendTx.TxIn[0].Witness = wire.TxWitness{leafScript, rawCB}
+	spendTx.TxIn[0].SetWitness(wire.TxWitness{leafScript, rawCB})
 
 	prevOutFetcher := NewCannedPrevOutputFetcher(pkScript, 1e8)
 	hashCache := NewTxSigHashes(spendTx, prevOutFetcher)
@@ -615,13 +615,7 @@ func newP2MRSpendTx(pkScript []byte, witness wire.TxWitness) (*wire.MsgTx,
 	const value = int64(1e8)
 
 	tx := wire.NewMsgTx(wire.TxVersion)
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{
-			Hash:  chainhash.Hash{},
-			Index: 0,
-		},
-		Witness: witness,
-	})
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, witness))
 	tx.AddTxOut(&wire.TxOut{Value: value})
 
 	prevFetcher := NewCannedPrevOutputFetcher(pkScript, value)
@@ -732,7 +726,10 @@ func TestP2MRCheckSigValid(t *testing.T) {
 		NewBaseTapLeaf(leafScript), SigHashDefault, privKey,
 	)
 	require.NoError(t, err)
-	tx.TxIn[0].Witness[0] = sig
+
+	w := tx.TxIn[0].DecodeWitness()
+	w[0] = sig
+	tx.TxIn[0].SetWitness(w)
 
 	require.NoError(t, runP2MRSpend(t, pkScript, tx, hashCache, prevFetcher))
 }
@@ -765,7 +762,10 @@ func TestP2MRCheckSigNullFail(t *testing.T) {
 	corrupted := make([]byte, len(sig))
 	copy(corrupted, sig)
 	corrupted[0] ^= 0x01
-	tx.TxIn[0].Witness[0] = corrupted
+
+	w := tx.TxIn[0].DecodeWitness()
+	w[0] = corrupted
+	tx.TxIn[0].SetWitness(w)
 
 	err = runP2MRSpend(t, pkScript, tx, hashCache, prevFetcher)
 	require.Error(t, err)
@@ -802,7 +802,7 @@ func TestP2MRAnnexBreaksSighash(t *testing.T) {
 	// Now attach an annex. The engine will include it in sighash, so the
 	// signature computed above no longer matches.
 	annex := append([]byte{TaprootAnnexTag}, bytes.Repeat([]byte{0xcd}, 8)...)
-	tx.TxIn[0].Witness = wire.TxWitness{sig, leafScript, cbBytes, annex}
+	tx.TxIn[0].SetWitness(wire.TxWitness{sig, leafScript, cbBytes, annex})
 
 	// Recompute sighashes with the final tx shape; the annex itself lives
 	// in the witness (not the prevout), so TxSigHashes is recomputed only

@@ -260,7 +260,7 @@ func ValidateWitnessCommitment(blk *btcutil.Block) error {
 	// coinbase transaction MUST have exactly one witness element within
 	// its witness data and that element must be exactly
 	// CoinbaseWitnessDataLen bytes.
-	coinbaseWitness := coinbaseTx.MsgTx().TxIn[0].Witness
+	coinbaseWitness := coinbaseTx.MsgTx().TxIn[0].DecodeWitness()
 	if len(coinbaseWitness) != 1 {
 		str := fmt.Sprintf("the coinbase transaction has %d items in "+
 			"its witness stack when only one is allowed",

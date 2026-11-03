@@ -1083,18 +1083,6 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		return ruleError(ErrBadCoinbaseValue, str)
 	}
 
-	// Don't run scripts if this node is before the latest known good
-	// checkpoint since the validity is verified via the checkpoints (all
-	// transactions are included in the merkle root hash and any changes
-	// will therefore be detected by the next checkpoint).  This is a huge
-	// optimization because running the scripts is the most time consuming
-	// portion of block handling.
-	checkpoint := b.LatestCheckpoint()
-	runScripts := true
-	if checkpoint != nil && node.height <= checkpoint.Height {
-		runScripts = false
-	}
-
 	// All script validation behaviors are unconditional in Pearl.
 	var scriptFlags txscript.ScriptFlags
 
@@ -1126,12 +1114,12 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// transactions are actually allowed to spend the coins by running the
 	// expensive ECDSA signature check scripts.  Doing this last helps
 	// prevent CPU exhaustion attacks.
-	if runScripts {
-		err := checkBlockScripts(block, view, scriptFlags, b.sigCache,
-			b.hashCache)
-		if err != nil {
-			return err
-		}
+	//
+	// Scripts run below the latest checkpoint too: blocks matched against the checkpointed header list are fast-added
+	// and skip this check when they extend the tip, so a block reaching it there need not be on the checkpointed chain.
+	err = checkBlockScripts(block, view, scriptFlags, b.sigCache, b.hashCache)
+	if err != nil {
+		return err
 	}
 
 	// Update the best hash for view to include this block since all of its
