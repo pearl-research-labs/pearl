@@ -179,7 +179,8 @@ fn embedded_cache_verifies_the_committed_go_fixtures() {
 }
 
 /// Pin the entire recursive verifier configuration and its polynomial inventory.
-/// A changed signature requires recalibrating the fixed allowance in `PublicParams`.
+/// A changed signature requires reviewing resource usage and rerunning `bench_v4_verify`.
+/// `PublicParams` scores geometry-dependent work separately, excluding the fixed verifier.
 #[test]
 #[cfg(feature = "embedded_cache")]
 fn verifier_resource_signature_is_pinned() {
@@ -203,8 +204,8 @@ fn verifier_resource_signature_is_pinned() {
         hash.finalize().to_hex().to_string()
     });
     assert_eq!(
-        signatures, ["941d4125a7c4d603d7586e99f619e18ae0036baac8a5d0bd589a766483cf84a6"; 2],
-        "verifier resources changed; recalibrate the fixed work allowance"
+        signatures, ["eaa549805cf48ff3ff41594895722d680585789c4ea509f1c8348393b967b2c4"; 2],
+        "verifier resources changed; review resource usage and rerun bench_v4_verify"
     );
 }
 
