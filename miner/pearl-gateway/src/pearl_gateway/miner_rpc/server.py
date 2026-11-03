@@ -7,7 +7,13 @@ from typing import Any
 
 import fastjsonschema
 from miner_utils import get_logger
-from pearl_mining import CERT_VERSION_PLAIN_FP8, PlainProof, PlainProofV4
+from pearl_mining import (
+    CERT_VERSION_PLAIN_FP8,
+    CERT_VERSION_PLAIN_FP16,
+    Fp16PlainProof,
+    PlainProof,
+    PlainProofV4,
+)
 
 from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
@@ -215,13 +221,16 @@ class MinerRpcServer:
                 if error := self._validate_params(validate_submit_plain_proof, params, request_id):
                     return error
                 mining_job = MiningJob.from_dict(params["mining_job"])
-                # Certificate v4 (plain FP8) proofs ride their own wire type; the
-                # Int7 ZK certificate versions keep the legacy ``PlainProof``.
-                proof_type = (
-                    PlainProofV4
-                    if int(mining_job.cert_version) == CERT_VERSION_PLAIN_FP8
-                    else PlainProof
-                )
+                # Certificate v5 (plain FP16/A100) and v4 (plain FP8) proofs each
+                # ride their own wire type; the Int7 ZK certificate versions keep
+                # the legacy ``PlainProof``.
+                cert_version = int(mining_job.cert_version)
+                if cert_version == CERT_VERSION_PLAIN_FP16:
+                    proof_type: type = Fp16PlainProof
+                elif cert_version == CERT_VERSION_PLAIN_FP8:
+                    proof_type = PlainProofV4
+                else:
+                    proof_type = PlainProof
                 plain_proof = proof_type.from_base64(params["plain_proof"])
                 asyncio.create_task(self.handle_submit_plain_proof(plain_proof, mining_job))
                 return self._jsonrpc_success("submitted", request_id)
@@ -242,7 +251,7 @@ class MinerRpcServer:
             return self._jsonrpc_error(-32000, str(e), request_id)
 
     async def handle_submit_plain_proof(
-        self, plain_proof: PlainProof | PlainProofV4, mining_job: MiningJob
+        self, plain_proof: PlainProof | PlainProofV4 | Fp16PlainProof, mining_job: MiningJob
     ) -> None:
         """Handle submitPlainProof requests."""
         # Get the current template (needed to build the full block)

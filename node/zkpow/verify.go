@@ -42,6 +42,8 @@ const MinNoiseRank = C.MIN_NOISE_RANK
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
 	switch c := cert.(type) {
+	case *wire.CertificateV5:
+		return verifyCertificateV5(header, c)
 	case *wire.CertificateV4:
 		return verifyCertificateV4(header, c)
 	case *wire.CertificateV3:
@@ -283,6 +285,101 @@ func CheckRankPenalty(bits uint32, publicData []byte) error {
 		return fmt.Errorf("rank penalty check system error: %s", msg)
 	default:
 		return fmt.Errorf("unknown rank penalty check result %d: %s", result, msg)
+	}
+}
+
+// ================================================================================
+// V5 (FP16 / A100) CONSENSUS CERTIFICATE VERIFICATION
+// ================================================================================
+
+// verifyCertificateV5 verifies an FP16 (A100) header-bound ZK consensus
+// certificate. It mirrors verifyCertificateV4: it checks the block-hash and
+// proof-commitment binding, serializes the proposed header followed by the
+// ancestor headers, and hands them with the serialized Fp16ZkCertificate
+// (CertificateV5.ProofData, carried opaquely) to the Rust verifier. Rust owns
+// window authentication of the proof-carried ancestor (the SHA256d hash-walk) and
+// the full header-bound ZK verification (wrapped-proof verify + header-pinned
+// keys/seeds/jackpot-key + native difficulty). The difficulty target is the
+// proposed header's own Bits.
+func verifyCertificateV5(header *wire.BlockHeader, cert *wire.CertificateV5) error {
+	certHash := cert.BlockHash()
+	blockHash := header.BlockHash()
+	if !certHash.IsEqual(&blockHash) {
+		return fmt.Errorf("block hash mismatch: certificate has %s, header has %s",
+			certHash, blockHash)
+	}
+	proofCommitment := cert.ProofCommitment()
+	if header.ProofCommitment != proofCommitment {
+		return fmt.Errorf("proof commitment mismatch: header has %s, certificate has %s",
+			header.ProofCommitment, proofCommitment)
+	}
+
+	proofData := cert.ProofBytes()
+	if len(proofData) == 0 {
+		return fmt.Errorf("empty fp16 proof")
+	}
+	if len(cert.AncestorHeaders) > wire.MaxCertificateV5AncestorHeaders {
+		return fmt.Errorf("v5 certificate has %d ancestor headers, max %d",
+			len(cert.AncestorHeaders), wire.MaxCertificateV5AncestorHeaders)
+	}
+
+	// Serialize the proposed header, then the ancestors (parent, grandparent), in
+	// canonical 108-byte wire form; Rust authenticates the window from these.
+	var headers bytes.Buffer
+	headers.Grow((1 + len(cert.AncestorHeaders)) * wire.MaxBlockHeaderPayload)
+	if err := header.Serialize(&headers); err != nil {
+		return err
+	}
+	for i := range cert.AncestorHeaders {
+		if err := cert.AncestorHeaders[i].Serialize(&headers); err != nil {
+			return err
+		}
+	}
+	// nil override: consensus checks against the proposed header's own Bits.
+	return verifyFp16ZkCertFFI(headers.Bytes(), proofData, nil)
+}
+
+// verifyFp16ZkCertFFI hands a serialized header window and a serialized
+// Fp16ZkCertificate (the wrapped ZK proof + its public Fp16JobParams) to the Rust
+// consensus verifier (verify_fp16_zk_cert_ffi). nbitsOverride selects the
+// difficulty target: nil uses the proposed header's own Bits (FFI value 0); a
+// non-nil value is a pool-share target.
+func verifyFp16ZkCertFFI(headerBytes, certBytes []byte, nbitsOverride *uint32) error {
+	if len(headerBytes) == 0 {
+		return fmt.Errorf("empty fp16 header window")
+	}
+	if len(certBytes) == 0 {
+		return fmt.Errorf("empty fp16 proof")
+	}
+
+	var pinner runtime.Pinner
+	pinner.Pin(&headerBytes[0])
+	pinner.Pin(&certBytes[0])
+	defer pinner.Unpin()
+
+	var cNbits C.uint32_t
+	if nbitsOverride != nil {
+		cNbits = C.uint32_t(*nbitsOverride)
+	}
+
+	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
+	result := C.verify_fp16_zk_cert_ffi(
+		(*C.uint8_t)(unsafe.Pointer(&headerBytes[0])), C.uintptr_t(len(headerBytes)),
+		(*C.uint8_t)(unsafe.Pointer(&certBytes[0])), C.uintptr_t(len(certBytes)),
+		cNbits,
+		&errorBuf[0],
+	)
+	msg := C.GoString(&errorBuf[0])
+
+	switch result {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("fp16 proof rejected: %s", msg)
+	case 2:
+		return fmt.Errorf("fp16 verification system error: %s", msg)
+	default:
+		return fmt.Errorf("unknown fp16 verification result %d: %s", result, msg)
 	}
 }
 

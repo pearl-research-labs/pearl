@@ -48,9 +48,13 @@ Certificate types implement perfectly mirrored Serialize/Deserialize methods:
 
 # NETWORK RESTRICTIONS
 
-CertificateVersionV1 through CertificateVersionV4 are allowed.
-IsCertVersionAllowed(v) returns true for all four. blockchain.checkBlockSanity
-also validates via IsCertVersionAllowed.
+CertificateVersionV1 through CertificateVersionV4 are network-allowed.
+IsCertVersionAllowed(v) returns true for those four. blockchain.checkBlockSanity
+also validates via IsCertVersionAllowed. CertificateVersionV5 is the FP16 (A100)
+header-bound ZK certificate (see certificate_v5.go): it is fully decodable, routable,
+and verifiable (VerifyCertificate -> the FP16 FFI), but intentionally NOT yet in
+IsCertVersionAllowed — enabling it for consensus is a deployment activation
+decision (height / version bits).
 
 # GENESIS BLOCKS
 
@@ -59,7 +63,7 @@ Genesis blocks are never verified (hardcoded and trusted), only serialized.
 
 # IMPLEMENTATION NOTES
 
-- CertificateMaxSize: 65 KB for every certificate version
+- CertificateMaxSize: 65 KB for V1-V4; V5 (FP16/A100 header-bound ZK) uses the larger CertificateV5MaxSize (see MaxCertificateSize)
 - Integration: MsgHeader.BlockCertificate() and MsgBlock.BlockCertificate() accessors
 - Storage: Certificate-first serialization, stored with blocks (no separate indexing)
 */
@@ -73,11 +77,33 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
-// MaxZKProofSize is the maximum size of a serialized ZK proof blob.
+// MaxZKProofSize is the maximum size of a serialized ZK proof blob (V1-V4).
 const MaxZKProofSize = 60000
 
-// CertificateMaxSize is the maximum allowed certificate size. Has headroom on top of MaxZKProofSize.
+// CertificateMaxSize is the maximum allowed certificate size for V1-V4. Has
+// headroom on top of MaxZKProofSize.
 const CertificateMaxSize = 65000
+
+// MaxFp16ZkCertProofSize is the ProofData blob cap for a V5 (FP16/A100) header-
+// bound ZK certificate (a serialized Fp16ZkCertificate: a constant ~74 KiB
+// wrapped plonky2 proof + its small public Fp16JobParams). It MUST equal the Rust
+// FFI cap MAX_FP16_ZK_CERT_SIZE. The ceiling is bounded by the p2p relay budget:
+// a HEADERS message carries up to MaxBlockHeadersPerMsg (100) headers each
+// budgeting a certificate (see MsgHeaders.MaxPayloadLength) and must fit
+// MaxProtocolMessageLength (8 MB), which caps a V5 certificate at ~79.6 KiB. The
+// constant proof fits comfortably below this; TestMessageCapsFitProtocolLimit
+// enforces the bound.
+const MaxFp16ZkCertProofSize = 79_000
+
+// CertificateV5MaxSize is the overall encoded-size cap for a V5 certificate:
+// the ProofData blob plus the hash, length prefix, ancestor-count varint, and up
+// to MaxCertificateV5AncestorHeaders full ancestor headers.
+const CertificateV5MaxSize = MaxFp16ZkCertProofSize + 32 + 4 + 1 + MaxCertificateV5AncestorHeaders*MaxBlockHeaderPayload
+
+// MaxCertificateSizeAnyVersion is the largest MaxCertificateSize across all
+// certificate versions, used to bound the per-certificate contribution to the
+// block/headers message size caps. V5 (ZK) is the largest.
+const MaxCertificateSizeAnyVersion = CertificateV5MaxSize
 
 // CertificateVersion identifies the certificate format version.
 type CertificateVersion uint32
@@ -88,11 +114,17 @@ const (
 	CertificateVersionV2   CertificateVersion = 2
 	CertificateVersionV3   CertificateVersion = 3
 	CertificateVersionV4   CertificateVersion = 4
+	CertificateVersionV5   CertificateVersion = 5
 )
 
-// MaxCertificateSize returns the encoded-size cap for every certificate
-// version, including the 4-byte version prefix.
-func MaxCertificateSize(CertificateVersion) int {
+// MaxCertificateSize returns the encoded-size cap for the given certificate
+// version, including the 4-byte version prefix. V5 (FP16/A100 header-bound ZK)
+// carries a larger ZK-proof blob than the FP8 V1-V4 versions, so it has its own
+// cap; V1-V4 keep CertificateMaxSize.
+func MaxCertificateSize(v CertificateVersion) int {
+	if v == CertificateVersionV5 {
+		return CertificateV5MaxSize
+	}
 	return CertificateMaxSize
 }
 
@@ -133,6 +165,21 @@ func IsCertVersionAllowed(v CertificateVersion) bool {
 	case CertificateVersionV1, CertificateVersionV2, CertificateVersionV3, CertificateVersionV4:
 		return true
 	default:
+		// CertificateVersionV5 (FP16/A100) is intentionally NOT yet network-allowed:
+		// it is a genuine consensus activation decision (height / version bits) a
+		// deployment must make. The node can already decode, route, and fully
+		// verify a V5 certificate (MsgCertificate dispatch + VerifyCertificate ->
+		// the FP16 FFI). Until then V5 blocks fail checkBlockSanity.
+		//
+		// ACTIVATION (staged, not done): flip V5 into the allow-list above AND set
+		// chaincfg Params.Fp16ForkHeight (so RequiredCertVersion returns V5 at/after
+		// that height) — the two must move together. Prerequisites in place: the
+		// rank-penalty rule exempts V5 (blockchain.CheckCertificateRules), and the
+		// FP16 FFI now verifies the header-bound ZK certificate (VerifyCertificate ->
+		// verify_fp16_zk_cert_ffi -> the header-pinned wrapped-proof verify). Remaining
+		// activation blocker: the verifier currently rebuilds the FP16 wrapper circuit
+		// per tile geometry (an embedded FP16 verifier cache or the universal wrapper
+		// is needed before activation — see the zk-pow FFI notes).
 		return false
 	}
 }
@@ -187,6 +234,9 @@ func (m *MsgCertificate) PrlDecode(r io.Reader, pver uint32) error {
 
 	case CertificateVersionV4:
 		m.Certificate = &CertificateV4{}
+
+	case CertificateVersionV5:
+		m.Certificate = &CertificateV5{}
 
 	default:
 		return fmt.Errorf("unsupported certificate version: %d", version)

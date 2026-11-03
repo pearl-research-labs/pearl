@@ -685,6 +685,10 @@ mempoolLoop:
 	var certificate wire.BlockCertificate
 	var ancestorHeaders []wire.BlockHeader
 	switch g.chainParams.RequiredCertVersion(nextBlockHeight) {
+	case wire.CertificateVersionV5:
+		// FP16 (A100) is a submit-direct plaintext cert like V4; template
+		// assembly needs no special handling beyond the block-hash placeholder.
+		certificate = &wire.CertificateV5{Hash: msgBlock.BlockHash()}
 	case wire.CertificateVersionV4:
 		certificate = &wire.CertificateV4{Hash: msgBlock.BlockHash()}
 		if ancestorHeaders, err = g.stateWindowHeaders(best); err != nil {

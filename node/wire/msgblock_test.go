@@ -36,9 +36,10 @@ func TestBlock(t *testing.T) {
 
 	// Stated independently of the production expression on purpose: copying
 	// that expression here would make this assertion agree with any value the
-	// code produces. 4,065,000 is MaxBlockPayload plus a maximum-size
-	// certificate, which is the largest a BLOCK message can legitimately be.
-	wantPayload := uint32(4065000)
+	// code produces. 4,079,253 is MaxBlockPayload (4,000,000) plus a maximum-size
+	// V5 certificate (79,253 = 79,000-byte ProofData + 32 + 4 + 1 + two 108-byte
+	// ancestor headers), the largest a BLOCK message can legitimately be.
+	wantPayload := uint32(4079253)
 	maxPayload := msg.MaxPayloadLength(pver)
 	if maxPayload != wantPayload {
 		t.Errorf("MaxPayloadLength: wrong max payload length for "+

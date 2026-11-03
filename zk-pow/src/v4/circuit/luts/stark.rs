@@ -28,6 +28,7 @@ use super::super::unpredictability::{log2_fixed, sig_nonzero, sig_width};
 use super::LutTable;
 use super::columns::{lut_height, lut_num_columns, num_precommitted_columns, num_slots, rnernd_stored_values, slot_height};
 use crate::v4::api::compute::bf16_div;
+use crate::v5::api::dtype::fp16_decode_fields;
 
 /// Generates one slot's semantic values before fixed-column factoring, in the order
 /// the consumers' `LutLookup::values` bind them.
@@ -45,7 +46,7 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 | LutTable::Width32
                 | LutTable::Width16
                 | LutTable::Pow2G => 2,
-                LutTable::Int8Dec | LutTable::RneRnd => 4,
+                LutTable::Int8Dec | LutTable::RneRnd | LutTable::Fp16Decode => 4,
                 LutTable::ProdAlign15 | LutTable::B200Align => 5,
                 _ => 1,
             };
@@ -206,6 +207,16 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
             }
             // Jackpot check 4's fixed-point log: `floor(64 * log2 key)` (0 at key 0).
             LutTable::Log16 => columns[0].push(f(log2_fixed(key))),
+            // A100 matmul alignment: 2^min(d, 26), floor a far term to zero (P*16 < 2^26).
+            LutTable::Fp16Pow2 => columns[0].push(f(1 << key.min(26))),
+            // FP16 operand decode (A100 matmul): (SIG, SIGN, EPS_BIASED, IS_ZERO).
+            LutTable::Fp16Decode => {
+                let (sig, sign, eps_biased, is_zero) = fp16_decode_fields(key as u16);
+                columns[0].push(f(sig));
+                columns[1].push(f(sign));
+                columns[2].push(f(eps_biased));
+                columns[3].push(f(is_zero));
+            }
         }
     }
     columns
@@ -224,7 +235,7 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
         LutTable::Bytes2 | LutTable::Pair128 => cols.extend(generate::<F>(table, 0)),
         // Sub-height (or exactly-full) small tables: a saturated key column `min(i, live - 1)`
         // and the value columns padded alike — padding repeats the last live row's fact.
-        LutTable::Int8Dec | LutTable::ExpInfo | LutTable::Clamp22 | LutTable::Pow2D | LutTable::Pow2Gb => {
+        LutTable::Int8Dec | LutTable::ExpInfo | LutTable::Clamp22 | LutTable::Pow2D | LutTable::Pow2Gb | LutTable::Fp16Pow2 => {
             cols.push((0..height).map(|i| F::from_canonical_usize(i.min(live - 1))).collect());
             for mut col in generate::<F>(table, 0) {
                 let last = *col.last().unwrap();
@@ -243,7 +254,9 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
             cols.push((0..height).map(F::from_canonical_usize).collect());
             match table {
                 LutTable::Range16 => {} // the ramp is the whole table
-                LutTable::Qcast | LutTable::Div448 | LutTable::Width16 | LutTable::Log16 => cols.extend(generate::<F>(table, 0)),
+                LutTable::Qcast | LutTable::Div448 | LutTable::Width16 | LutTable::Log16 | LutTable::Fp16Decode => {
+                    cols.extend(generate::<F>(table, 0))
+                }
                 // Eight signed truncations span every alignment shift; decode fields are shared.
                 LutTable::ProdAlign15 | LutTable::B200Align => {
                     let shift = if table == LutTable::ProdAlign15 { 7 } else { 19 };
@@ -390,6 +403,8 @@ pub type Pow2GbStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTa
 pub type Width32Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Width32) }>;
 pub type Width16Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Width16) }>;
 pub type Log16Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Log16) }>;
+pub type Fp16DecodeStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Fp16Decode) }>;
+pub type Fp16Pow2Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Fp16Pow2) }>;
 
 /// One LUT AIR at its table's exact width (the width is a compile-time constant per table,
 /// so the dispatch is a static match).
@@ -413,6 +428,8 @@ pub(crate) fn boxed_lut_stark<F: RichField + Extendable<D>, const D: usize>(tabl
         LutTable::Width32 => Box::new(Width32Stark::<F, D>::new(table)),
         LutTable::Width16 => Box::new(Width16Stark::<F, D>::new(table)),
         LutTable::Log16 => Box::new(Log16Stark::<F, D>::new(table)),
+        LutTable::Fp16Decode => Box::new(Fp16DecodeStark::<F, D>::new(table)),
+        LutTable::Fp16Pow2 => Box::new(Fp16Pow2Stark::<F, D>::new(table)),
     }
 }
 

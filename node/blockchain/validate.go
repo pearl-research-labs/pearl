@@ -515,8 +515,9 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 //     carry a dense (non-MoE) proof
 //   - At and after RankPenaltyForkHeight (softfork): the proof's noise rank
 //     must meet a minimum and its jackpot must meet a difficulty bound scaled
-//     for that rank. V4 fp8 public data is a different encoding, so this
-//     rule is not applied to V4.
+//     for that rank. V4 fp8 public data is a different encoding and V5 (FP16)
+//     carries no public-data blob at all (its noise rank is fixed), so this
+//     rule is not applied to V4 or V5.
 //
 // These rules run here rather than alongside the proof verification in
 // checkProofOfWork because activation depends on the block height, which the
@@ -548,7 +549,14 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 		return ruleError(ErrDisallowedCertVersion, str)
 	}
 
-	if cert.Version() != wire.CertificateVersionV4 &&
+	// The rank-penalty rule reads a version-specific public-data encoding, so it
+	// applies only to the versions that carry one. V4 (fp8) uses a different
+	// encoding and V5 (FP16/A100) carries no public-data blob at all — its noise
+	// rank is fixed, not a penalised dimension, and CheckRankPenalty would reject
+	// its nil public data outright — so both are exempt.
+	rankPenaltyExempt := cert.Version() == wire.CertificateVersionV4 ||
+		cert.Version() == wire.CertificateVersionV5
+	if !rankPenaltyExempt &&
 		params.IsRankPenaltyForkActive(height) && flags&BFNoPoWCheck != BFNoPoWCheck {
 		if err := zkpow.CheckRankPenalty(header.Bits, cert.PublicDataBytes()); err != nil {
 			str := fmt.Sprintf("certificate fails the rank penalty rule at "+

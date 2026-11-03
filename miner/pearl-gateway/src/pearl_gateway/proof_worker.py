@@ -10,8 +10,11 @@ import pearl_mining
 from miner_utils import get_logger
 from pearl_mining import (
     CERT_VERSION_PLAIN_FP8,
+    CERT_VERSION_PLAIN_FP16,
     Fp8Prover,
     Fp8Verifier,
+    Fp16PlainProof,
+    Fp16Prover,
     IncompleteBlockHeader,
     PlainProof,
     PlainProofV4,
@@ -25,6 +28,7 @@ _LOGGER = get_logger(__name__)
 _MMA_BF16_TO_FP8_FP32 = 1
 
 _fp8_prover: Fp8Prover | None = None
+_fp16_prover: Fp16Prover | None = None
 
 
 def worker_init() -> None:
@@ -83,6 +87,32 @@ def _prove_fp8(
     return public_bytes, proof_bytes
 
 
+def _prove_fp16(
+    header: IncompleteBlockHeader,
+    plain_proof: Fp16PlainProof,
+    debug: bool,
+) -> tuple[bytes, bytes]:
+    """Prove a winning FP16 (A100) tile into the header-bound ``Fp16ZkCertificate``.
+
+    ``plain_proof`` is the opener bundle the miner assembles (job + the committed
+    Merkle openings at the winning tile); the prover re-opens + authenticates the
+    tile codes under ``header`` and produces the constant-size wrapped proof. The
+    V5 certificate carries no public-data blob, so public_data is empty and the
+    cert bytes ride entirely in proof_data (``CertificateV5.ProofData``).
+    """
+    global _fp16_prover
+    if _fp16_prover is None:
+        _LOGGER.info("Building Fp16Prover (per-geometry wrapper compiles on first proof)")
+        _fp16_prover = Fp16Prover()
+    cert_bytes = bytes(_fp16_prover.prove_from_plain_proof(header, plain_proof))
+    if debug:
+        # FP16 consensus verification is the node's job (verify_fp16_zk_cert_ffi);
+        # there is no in-process Python verifier, so there is nothing to self-check
+        # here without recompiling the (minutes-long) wrapper verifier.
+        _LOGGER.info("FP16 debug self-verify is node-side only; skipping in-worker check")
+    return b"", cert_bytes
+
+
 def prove(
     cert_version: int,
     incomplete_header_bytes: bytes,
@@ -93,6 +123,8 @@ def prove(
     header = IncompleteBlockHeader.from_bytes(incomplete_header_bytes)
     if cert_version == CERT_VERSION_PLAIN_FP8:
         return _prove_fp8(header, PlainProofV4.from_base64(plain_proof_b64), debug)
+    if cert_version == CERT_VERSION_PLAIN_FP16:
+        return _prove_fp16(header, Fp16PlainProof.from_base64(plain_proof_b64), debug)
     plain_proof = PlainProof.from_base64(plain_proof_b64)
 
     zk_proof = generate_proof_for_cert_version(cert_version, header, plain_proof)

@@ -8,6 +8,7 @@ pub mod ffi;
 pub mod v1;
 pub mod v2;
 pub mod v4;
+pub mod v5;
 
 /// Macro for checking equality with anyhow::Result error handling
 /// Similar to assert_eq! but returns an error instead of panicking

@@ -13,8 +13,10 @@ from .._utils._compile import get_or_compile
 from .._utils._stream import get_stream
 from ._hit_signal import HitRecordLayout
 
-# Plain sys/gpu-scope atomics and fences: one source for every family.
-_SUPPORTED_ARCHS = (Arch.SM90, Arch.SM100, Arch.SM120)
+# Plain sys/gpu-scope atomics and fences (CAS, acquire load, acq_rel/sys
+# fence -- all sm_70+), so one source serves every family -- including SM80
+# (A100), the FP16 scheme's target.
+_SUPPORTED_ARCHS = (Arch.SM80, Arch.SM90, Arch.SM100, Arch.SM120)
 
 _reset_cache: dict[tuple, object] = {}
 

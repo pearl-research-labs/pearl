@@ -11,3 +11,4 @@ bindings/go/target/
 bindings/python/target/
 bindings/python/.venv/
 bindings/python/uv.lock
+src/v5/api/fp16_cache.bin

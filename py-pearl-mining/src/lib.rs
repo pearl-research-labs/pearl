@@ -17,6 +17,7 @@ mod common;
 mod v1;
 mod v2;
 mod v4;
+mod v5;
 
 use pyo3::prelude::*;
 
@@ -56,6 +57,8 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     common::register_functions(m)?;
     v2::register_proofs(m)?;
     v4::register_proofs(m)?;
+    v5::register_types(m)?;
+    v5::register_proofs(m)?;
     v1::register(m)?;
     cert_version::register(m)?;
     Ok(())
