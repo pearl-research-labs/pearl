@@ -17,7 +17,9 @@
 //! MoE tail    := w ‖ O_{w-1} ‖ O_w ‖ O_{e-1} ‖ HR ‖ HO ‖ I_A
 //! ```
 //!
-//! where HA = BLAKE3(HA_values || HA_scales) and HB = BLAKE3(HB_values || HB_scales).
+//! where HA = BLAKE3(HA_values || HA_scales; key = key_A) and
+//! HB = BLAKE3(HB_values || HB_scales; key = key_B).
+
 //!
 //! `σ_d` (the complete 108-byte [`BlockHeader`] of the proof-carried
 //! ancestor, proof commitment included) leads the blob; the depth itself is not
@@ -578,13 +580,15 @@ impl JackpotStatement {
     fn check(&self, a: &OperandParams, b: &OperandParams, b_row_bound: u32) -> Result<()> {
         ensure!(
             self.tile_bases.a.is_multiple_of(a.tile_size),
-            "tA={} must be a valid tile base for the A-side pattern",
-            self.tile_bases.a
+            "tA={} must be a multiple of the A-side tile size {}",
+            self.tile_bases.a,
+            a.tile_size
         );
         ensure!(
             self.tile_bases.b.is_multiple_of(b.tile_size),
-            "tB={} must be a valid tile base for the B-side pattern",
-            self.tile_bases.b
+            "tB={} must be a multiple of the B-side tile size {}",
+            self.tile_bases.b,
+            b.tile_size
         );
         ensure!(
             u64::from(self.tile_bases.a) + u64::from(a.tile_size) <= u64::from(a.num_rows),
@@ -1566,15 +1570,12 @@ mod tests {
             PublicParams::try_new(p.job.clone(), jackpot, None)
         };
         assert!(build(0, 0).is_ok());
-        assert!(build(4, 0).is_ok(), "next A-period tA=4 still fits in m");
-        assert!(
-            build(4, 128).is_err(),
-            "tB=128 is on the B lattice but tB + tile_max must be < n"
-        );
-        assert!(build(1, 0).is_err(), "tA must sit on the A-side lattice");
-        assert!(build(0, 1).is_err(), "tB must sit on the B-side lattice");
-        assert!(build(u32::MAX, 0).is_err(), "tA must not wrap tile_offsets");
-        assert!(build(0, u32::MAX).is_err(), "tB must not wrap tile_offsets");
+        assert!(build(4, 0).is_ok(), "tA = 4 is the next A tile.");
+        assert!(build(4, 128).is_err(), "tB=128 is a multiple of w but tB + w must be <= n");
+        assert!(build(1, 0).is_err(), "tA must be a multiple of h");
+        assert!(build(0, 1).is_err(), "tB must be a multiple of w");
+        assert!(build(u32::MAX - 3, 0).is_err(), "tA + h must not overflow u32");
+        assert!(build(0, u32::MAX - 127).is_err(), "tB + w must not overflow u32");
     }
 
     fn with_kr(rank: u16, k: u32) -> Result<PublicParams> {
