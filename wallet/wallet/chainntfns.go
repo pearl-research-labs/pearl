@@ -195,7 +195,6 @@ func (w *Wallet) catchUpHashes(client chainConn, height int32) error {
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 
 		startBlock := w.Manager.SyncedTo()
-		catchUpHeight := startBlock.Height
 
 		for i := startBlock.Height + 1; i <= height; i++ {
 			hash, err := client.GetBlockHash(int64(i))
@@ -218,11 +217,9 @@ func (w *Wallet) catchUpHashes(client chainConn, height int32) error {
 			if err != nil {
 				return err
 			}
-
-			catchUpHeight = i
 		}
 
-		return w.TxStore.DeleteMaturedLockedOutputs(txmgrNs, catchUpHeight)
+		return w.TxStore.DeleteMaturedLockedOutputs(txmgrNs, max(startBlock.Height, height))
 	})
 	if err != nil {
 		log.Errorf("Failed to update address manager sync state for height %d: %v", height, err)
