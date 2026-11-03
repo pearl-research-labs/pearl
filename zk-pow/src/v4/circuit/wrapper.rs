@@ -417,7 +417,6 @@ pub fn verify_wrapped_proof(
         proof.public_inputs == expected,
         "wrapped proof: public inputs do not match the statement's expectations"
     );
-    println!("preverif: {} ms", start.elapsed().as_millis());
     verifier_data.verify(proof.clone())
 }
 
