@@ -1076,7 +1076,6 @@ mod tests {
                     envelope.ladder.iter().filter(|&&d| (lo..=hi).contains(&d)).count()
                 );
             }
-            println!("{device:?} consensus verifier: {} gates before padding", builder.num_gates());
         }
     }
 
