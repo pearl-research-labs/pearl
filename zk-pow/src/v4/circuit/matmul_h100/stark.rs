@@ -48,7 +48,6 @@ use std::marker::PhantomData;
 
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::packed::PackedField;
-use plonky2::field::polynomial::PolynomialValues;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
 use plonky2::plonk::circuit_builder::CircuitBuilder;
@@ -60,6 +59,7 @@ use super::super::unpredictability::skip;
 use super::columns::{
     GROUP_WIDTH, MATMUL_COL_MAP, MatmulColumnsView, NUM_ATT_LINKS, NUM_MATMUL_COLUMNS, NUM_MATMUL_PUBLIC_INPUTS, PromotionView,
 };
+use crate::v4::circuit::matmul_b200_stark::stark::{MatmulScheduleView, eval_matmul_schedule_constraints};
 use crate::v4::circuit::utils::evaluator::Evaluator;
 use crate::v4::circuit::utils::native_evaluator::NativeEvaluator;
 use crate::v4::circuit::utils::symbolic_evaluator::SymbolicEvaluator;
@@ -91,8 +91,8 @@ pub(crate) const BINADE_BIAS: u64 = 139;
 
 /// The H100 WGMMA AIR for one FP8 matmul: `out[r, c] = sum_t A[r, t] * B[t, c]`.
 ///
-/// The structural columns (`cell_id`, `is_cell_final`, and both operand index bases) are
-/// recomputable from this AIR's geometry; operand codes are witness data.
+/// Schedule witnesses use the shared MS constraints and H100's MW window constraints.
+/// MS13/MS14 constrain the canonical row/column progression.
 #[derive(Clone, Debug)]
 pub struct MatmulStarkH100<F: RichField + Extendable<D>, const D: usize> {
     /// Output rows (rows of A).
@@ -125,7 +125,8 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
     }
 
     /// Trace height: the cell rows padded to the next power of two with single-row phantom
-    /// cells (all-zero, `is_padding = is_cell_final = 1`, `cell_id = h*w + t`).
+    /// cells (all-zero, `is_padding = is_cell_final = 1`; the coordinate walk continues at
+    /// position `h*w + t`).
     pub fn num_rows(&self) -> usize {
         self.live_rows().next_power_of_two()
     }
@@ -135,7 +136,7 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
     /// - `a_codes`: fp8 E4M3 codes of A, row-major (`a_codes[r * k + t] = A[r, t]`).
     /// - `b_codes`: fp8 E4M3 codes of B, **column-major** (`b_codes[c * k + t] = B[t, c]`), i.e.
     ///   B-transposed row-major — the same operand layout as `Device::matmul_fp8`'s `b`, and
-    ///   the layout the `operand_index_base_b + lane` CTL keys assume.
+    ///   the layout the `operand_index_base_b + cell_step*32 + lane` CTL keys assume.
     /// - `a_lambdas`/`b_lambdas`: the elements' summand scores (jackpot check 4), same
     ///   layouts as the codes; the operand-code channel binds them to InputQuant's values.
     ///
@@ -159,8 +160,6 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
         let mut rows: Vec<[F; NUM_MATMUL_COLUMNS]> = Vec::with_capacity(num_rows);
         for r in 0..h {
             for c in 0..w {
-                let cell_id = r * w + c;
-
                 // ---- The k/32 live group-steps (group-sum emulation columns). ----
                 let mut carry = OutTriple::ZERO;
                 let mut incoming_carry_is_zero = true;
@@ -174,11 +173,8 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
                     let is_final = j == live_rows_per_cell - 1;
                     let is_window_final = (j + 1).is_multiple_of(4) || is_final;
                     let mut row = MatmulColumnsView {
-                        cell_id: F::from_canonical_usize(cell_id),
                         is_cell_final: F::from_bool(is_final),
                         is_window_final: F::from_bool(is_window_final),
-                        operand_index_base_a: F::from_canonical_usize(r * k + j * GROUP_WIDTH),
-                        operand_index_base_b: F::from_canonical_usize(h * k + c * k + j * GROUP_WIDTH),
                         incoming_carry_is_zero: F::from_bool(incoming_carry_is_zero),
                         ..Default::default()
                     };
@@ -338,77 +334,68 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
         }
 
         // ---- Trailing padding: one all-zero single-row phantom cell per padding row. ----
-        for t in 0..num_rows - self.live_rows() {
-            rows.push(phantom_row::<F>(h * w + t).into());
+        for _ in 0..num_rows - self.live_rows() {
+            rows.push(phantom_row::<F>().into());
         }
 
-        (rows, [])
+        // ---- Fill cell and window schedule witnesses for live and phantom rows. ----
+        let map = MATMUL_COL_MAP;
+        for (i, row) in rows.iter_mut().enumerate() {
+            let s = MatmulScheduleView::<F>::at(i, live_rows_per_cell, w, h * w);
+            row[map.is_cell_final] = s.is_cell_final;
+            row[map.is_padding] = s.is_padding;
+            row[map.cell_step] = s.cell_step;
+            row[map.cell_step_inv] = s.cell_step_inv;
+            row[map.out_row] = s.out_row;
+            row[map.out_col] = s.out_col;
+            row[map.padding_onset_inv] = s.padding_onset_inv;
+            row[map.operand_index_base_a] = s.operand_index_base_a;
+            row[map.operand_index_base_b] = s.operand_index_base_b;
+            row[map.col_carry] = s.col_carry;
+            row[map.col_carry_inv] = s.col_carry_inv;
+            // The H100-only window gadget: the in-window atom position and its bound witness.
+            let step = if row[map.is_padding] == F::ONE {
+                0
+            } else {
+                (i % live_rows_per_cell) % WINDOW_ATOMS
+            };
+            let is_window_final = row[map.is_cell_final] == F::ONE || step == WINDOW_ATOMS - 1;
+            row[map.window_step] = F::from_canonical_usize(step);
+            row[map.window_step_inv] = (F::from_canonical_usize(step) - F::from_canonical_usize(WINDOW_ATOMS - 1))
+                .try_inverse()
+                .unwrap_or(F::ZERO);
+            row[map.is_window_final] = F::from_bool(is_window_final);
+        }
+
+        (rows, self.public_inputs())
     }
 
-    /// The class (a) ("known") column values — the leading
-    /// [`NUM_MATMUL_H100_KNOWN_COLUMNS`](super::columns::NUM_MATMUL_H100_KNOWN_COLUMNS) trace columns in
-    /// their `columns.rs` order (`cell_id`, the cell/window boundary flags,
-    /// `operand_index_base_a`, `operand_index_base_b`, `is_padding`), pure functions of the
-    /// program geometry.
-    /// Bit-exact with [`Self::generate_trace`]'s fill; the batch verifier recomputes exactly
-    /// this and checks the trace openings against it (`starky`'s `BatchKnownColumns`).
-    pub fn known_values(&self) -> Vec<PolynomialValues<F>> {
-        let (h, w, k) = (self.h, self.w, self.k);
-        let live_rows_per_cell = k / GROUP_WIDTH;
-        let num_rows = self.num_rows();
-        let mut cell_id = Vec::with_capacity(num_rows);
-        let mut is_cell_final = Vec::with_capacity(num_rows);
-        let mut is_window_final = Vec::with_capacity(num_rows);
-        let mut operand_index_base_a = Vec::with_capacity(num_rows);
-        let mut operand_index_base_b = Vec::with_capacity(num_rows);
-        let mut is_padding = Vec::with_capacity(num_rows);
-        for r in 0..h {
-            for c in 0..w {
-                for j in 0..live_rows_per_cell {
-                    cell_id.push(F::from_canonical_usize(r * w + c));
-                    is_cell_final.push(F::from_bool(j == live_rows_per_cell - 1));
-                    is_window_final.push(F::from_bool((j + 1).is_multiple_of(4) || j == live_rows_per_cell - 1));
-                    operand_index_base_a.push(F::from_canonical_usize(r * k + j * GROUP_WIDTH));
-                    operand_index_base_b.push(F::from_canonical_usize(h * k + c * k + j * GROUP_WIDTH));
-                    is_padding.push(F::ZERO);
-                }
-            }
-        }
-        for t in 0..num_rows - self.live_rows() {
-            cell_id.push(F::from_canonical_usize(h * w + t));
-            is_cell_final.push(F::ONE);
-            is_window_final.push(F::ONE);
-            operand_index_base_a.push(F::ZERO);
-            operand_index_base_b.push(F::ZERO);
-            is_padding.push(F::ONE);
-        }
+    /// The geometry public inputs the MS schedule constraints read:
+    /// `[ROWS_PER_CELL, W, H*W, H*K]` — the same layout as the B200 AIR. Generated with the
+    /// trace and pinned by the verifier's expectation.
+    pub fn public_inputs(&self) -> [F; NUM_MATMUL_PUBLIC_INPUTS] {
         [
-            cell_id,
-            is_cell_final,
-            is_window_final,
-            operand_index_base_a,
-            operand_index_base_b,
-            is_padding,
+            F::from_canonical_usize(self.k / GROUP_WIDTH),
+            F::from_canonical_usize(self.w),
+            F::from_canonical_usize(self.h * self.w),
+            F::from_canonical_usize(self.h * self.k),
         ]
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
     }
 }
 
-/// The all-zero single-row trailing phantom cell. 32 zero products entering a zero carry —
-/// every group-sum constraint holds on the zero fill: the sentinel exponents make the M3
-/// attainment factors vanish (`GROUP_MAX_PRODUCT_EXPONENT = 114`, the honest max of a row of
-/// sentinels), the unfiltered M5 remainder identity pins `INCOMING_CARRY_SHIFT_POWER = 1`, and
-/// the zero sum takes the +0 path.
-fn phantom_row<F: RichField>(cell_id: usize) -> MatmulColumnsView<F> {
+/// Atoms per 128-product Hopper window (the group-MW gadget's modulus).
+const WINDOW_ATOMS: usize = 4;
+
+/// The all-zero single-row trailing phantom cell (the schedule columns are filled by the
+/// post-pass). 32 zero products entering a zero carry — every group-sum constraint holds on
+/// the zero fill: the sentinel exponents make the M3 attainment factors vanish
+/// (`GROUP_MAX_PRODUCT_EXPONENT = 114`, the honest max of a row of sentinels), the
+/// unfiltered M5 remainder identity pins `INCOMING_CARRY_SHIFT_POWER = 1`, and the zero sum
+/// takes the +0 path.
+fn phantom_row<F: RichField>() -> MatmulColumnsView<F> {
     // Check 3 on the zero fill: all lane binades and GROUP_OUTPUT_EXPONENT are 0, so
     // E_CELL = 0 passes every range check.
     MatmulColumnsView {
-        cell_id: F::from_canonical_usize(cell_id),
-        is_cell_final: F::ONE,
-        is_window_final: F::ONE,
-        is_padding: F::ONE,
         incoming_carry_is_zero: F::ONE,
         incoming_carry_shift_power: F::ONE,
         group_max_product_exponent: F::from_canonical_u64(FP22_ZERO_SENTINEL),
@@ -860,7 +847,9 @@ where
 
 /// Evaluates every arithmetic constraint of MatmulStark. Lookup-borne facts (LUT oracle) are
 /// *not* emitted here — the required relations are documented alongside the constraints.
-/// The constraint set is program-independent and reads no public inputs.
+/// The constraint set reads only the geometry public inputs `[ROWS_PER_CELL, W, H*W, H*K]` (the
+/// shared MS schedule constraints plus the H100-only group-MW window gadget); everything
+/// else is program-independent.
 pub(crate) fn eval_matmul_constraints<V, S, E>(
     vars: &StarkFrame<V, S, NUM_MATMUL_COLUMNS, NUM_MATMUL_PUBLIC_INPUTS>,
     eval: &mut E,
@@ -877,6 +866,59 @@ pub(crate) fn eval_matmul_constraints<V, S, E>(
     let one = eval.i32(1);
     let not_final = eval.sub(one, lv.is_cell_final);
     let not_window_final = eval.sub(one, lv.is_window_final);
+
+    // ---- Group MS — shared cell schedule constraints; see the B200 implementation. ----
+    eval_matmul_schedule_constraints(
+        &MatmulScheduleView {
+            is_cell_final: lv.is_cell_final,
+            is_padding: lv.is_padding,
+            cell_step: lv.cell_step,
+            cell_step_inv: lv.cell_step_inv,
+            out_row: lv.out_row,
+            out_col: lv.out_col,
+            padding_onset_inv: lv.padding_onset_inv,
+            operand_index_base_a: lv.operand_index_base_a,
+            operand_index_base_b: lv.operand_index_base_b,
+            col_carry: lv.col_carry,
+            col_carry_inv: lv.col_carry_inv,
+        },
+        &MatmulScheduleView {
+            is_cell_final: nv.is_cell_final,
+            is_padding: nv.is_padding,
+            cell_step: nv.cell_step,
+            cell_step_inv: nv.cell_step_inv,
+            out_row: nv.out_row,
+            out_col: nv.out_col,
+            padding_onset_inv: nv.padding_onset_inv,
+            operand_index_base_a: nv.operand_index_base_a,
+            operand_index_base_b: nv.operand_index_base_b,
+            col_carry: nv.col_carry,
+            col_carry_inv: nv.col_carry_inv,
+        },
+        vars.get_public_inputs().try_into().unwrap(),
+        eval,
+    );
+
+    // ---- Group MW — WINDOW_STEP starts at zero and resets after each window-final row.
+    // MW3–MW5 force IS_WINDOW_FINAL exactly at step 3 or cell-final, including phantoms
+    // and partial final windows. The cell-final last row closes the cyclic recurrence.
+    let window_bound = eval.i32(WINDOW_ATOMS as i32 - 1);
+    eval.constraint_first_row(lv.window_step);
+    let step_next = eval.add(lv.window_step, one);
+    let kept = eval.mul(step_next, not_window_final);
+    let c = eval.sub(nv.window_step, kept);
+    eval.constraint(c);
+    let flag_gap = eval.sub(lv.is_window_final, one);
+    let c = eval.mul(lv.is_cell_final, flag_gap);
+    eval.constraint(c);
+    let step_gap = eval.sub(lv.window_step, window_bound);
+    let witnessed = eval.mul(step_gap, lv.window_step_inv);
+    let witnessed = eval.sub(witnessed, one);
+    let c = eval.mul(not_window_final, witnessed);
+    eval.constraint(c);
+    let raised = eval.mul(lv.is_window_final, not_final);
+    let c = eval.mul(raised, step_gap);
+    eval.constraint(c);
     // Z := GROUP_SUM_IS_ZERO — "this row's output is zero" (degree 1; no separate all-zero
     // flag is needed). On an all-zero row, every ALIGNED_LANE_TERMS entry is table-bound to 0
     // and M5 kills ALIGNED_INCOMING_CARRY, so M6 forces GROUP_SUM_ABS = 0 and M7 forces Z = 1.
@@ -885,8 +927,8 @@ pub(crate) fn eval_matmul_constraints<V, S, E>(
 
     // The transition constraints below are *plain* (they also bind the last-row -> first-row
     // wrap); the AIR leans on the wrap for the row-0 instances of the M6 sum and the M4 carry
-    // anchor. Soundness of the wrap needs the last row to be cell-final — a class (a) fact of
-    // IS_CELL_FINAL, carried by the batch verifier's known-column binding (see M4).
+    // anchor. Soundness of the wrap needs the last row to be cell-final — forced by the
+    // MS schedule constraints above.
 
     // ---- M1 — product lookups x32 (PRODALIGN15; wired in ctl.rs). ----
     // The tuple binds ALIGNED_LANE_TERMS / PROD_FP22_EXP / OPERAND_CODES_A/B per lane. Its
@@ -951,11 +993,8 @@ pub(crate) fn eval_matmul_constraints<V, S, E>(
     eval.constraint(c);
     let first_anchor = eval.sub(lv.incoming_carry_is_zero, one);
     eval.constraint_first_row(first_anchor);
-    // IS_CELL_FINAL is class (a) (verifier-recomputed, checked against the trace openings —
-    // `MatmulStarkH100::known_values`), so its schedule facts hold without in-AIR pins: it is
-    // boolean, and the last row is cell-final or a padding cell-final. This makes every plain
-    // transition's cyclic wrap sound.
-    eval.constraint_bool(lv.is_padding);
+    // IS_CELL_FINAL's schedule facts — booleanness and the cell-final last row, the wrap
+    // soundness of every plain transition here — are forced by the MS constraints.
 
     // ---- M5 — carry alignment (anchored at the producing row). ----
     // POW2G(GROUP_MAX_PRODUCT_EXPONENT' - GROUP_OUTPUT_EXPONENT;
@@ -1011,7 +1050,7 @@ pub(crate) fn eval_matmul_constraints<V, S, E>(
 
     // ---- M11 — reset-and-promote FP32 accumulator. ----
     let p = &lv.promotion;
-    // e = window-final, f = cell-final, with f <= e from the known schedule.
+    // e = window-final, f = cell-final, with f <= e from the constrained schedule.
     // Directly select the next input: retain C, commit the projection, or reset to +0.
     let commit = eval.sub(lv.is_window_final, lv.is_cell_final);
     for (next, input, projected, reset) in [
@@ -1188,6 +1227,7 @@ mod tests {
     use core::borrow::BorrowMut;
 
     use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::polynomial::PolynomialValues;
     use plonky2::field::types::{Field, PrimeField64};
     use plonky2::plonk::config::PoseidonGoldilocksConfig;
     use starky::stark_testing::{test_stark_circuit_constraints, test_stark_low_degree};
@@ -1346,11 +1386,13 @@ mod tests {
         let n = rows.len();
         for i in 0..n {
             // Plain constraints must hold on every row *including* the last -> first wrap, which
-            // the AIR uses for the row-0 instances of the sum and the register resets.
+            // the AIR uses for the row-0 instances of the sum and the register resets; `z_last`
+            // is zero on the wrap pair, matching starky's semantics for the MS transition
+            // constraints (MS7/MS9).
             let frame = StarkFrame::from_values(&rows[i], &rows[(i + 1) % n], pis);
             let mut consumer = ConstraintConsumer::new(
                 vec![F::from_canonical_u64(2), F::from_canonical_u64(0x876543210)],
-                F::ONE,
+                F::from_bool(i != n - 1),
                 F::from_bool(i == 0),
                 F::from_bool(i == n - 1),
             );
@@ -1814,15 +1856,16 @@ mod tests {
     }
 
     #[test]
-    fn padded_trace_shape_and_known_values() {
+    fn padded_trace_shape_and_schedule_fill() {
         // 15 cells of k/32 = 4 rows -> 60 live rows, padded to 64 by 4 single-row phantom
-        // cells. The known columns must be bit-exact with the trace fill (the batch verifier's
-        // check), and every phantom row must hold zero products on the +0 path (M1's padding
-        // pin and the operand-channel filter).
+        // cells. The structural schedule columns must match the honest `MatmulScheduleView` (plus
+        // the H100-only window block) on every row — the values the MS/MW constraints pin
+        // — and every phantom row must hold zero products on the +0 path (M1's padding pin
+        // and the operand-channel filter).
         let program = S::new(3, 5, 128);
         let a = test_codes(program.h * program.k, 0x9E3779B97F4A7C15, 8);
         let b = test_codes(program.w * program.k, 0xC2B2AE3D27D4EB4F, 11);
-        let (rows, _) = program.generate_trace(
+        let (rows, pis) = program.generate_trace(
             &a,
             &b,
             &test_lambdas(program.h * program.k, 0xA24BAED4963EE407),
@@ -1832,13 +1875,37 @@ mod tests {
         assert_eq!(program.live_rows(), 60);
         assert_eq!(program.num_rows(), 64);
         assert_eq!(rows.len(), 64);
-        let known = program.known_values();
-        assert_eq!(known.len(), super::super::columns::NUM_MATMUL_H100_KNOWN_COLUMNS);
-        for (c, col) in known.iter().enumerate() {
-            assert_eq!(col.len(), 64);
-            for (r, row) in rows.iter().enumerate() {
-                assert_eq!(col.values[r], row[c], "known column {c} row {r}");
+        assert_eq!(pis, program.public_inputs());
+        let m = &MATMUL_COL_MAP;
+        let hw = program.h * program.w;
+        for (r, row) in rows.iter().enumerate() {
+            let s = MatmulScheduleView::<F>::at(r, program.rows_per_cell(), program.w, hw);
+            for (what, got, want) in [
+                ("IS_CELL_FINAL", row[m.is_cell_final], s.is_cell_final),
+                ("IS_PADDING", row[m.is_padding], s.is_padding),
+                ("CELL_STEP", row[m.cell_step], s.cell_step),
+                ("CELL_STEP_INV", row[m.cell_step_inv], s.cell_step_inv),
+                ("OUT_ROW", row[m.out_row], s.out_row),
+                ("OUT_COL", row[m.out_col], s.out_col),
+                ("PADDING_ONSET_INV", row[m.padding_onset_inv], s.padding_onset_inv),
+                ("OPERAND_INDEX_BASE_A", row[m.operand_index_base_a], s.operand_index_base_a),
+                ("OPERAND_INDEX_BASE_B", row[m.operand_index_base_b], s.operand_index_base_b),
+                ("COL_CARRY", row[m.col_carry], s.col_carry),
+                ("COL_CARRY_INV", row[m.col_carry_inv], s.col_carry_inv),
+            ] {
+                assert_eq!(got, want, "{what} row {r}");
             }
+            // The window block: step j mod 4 in-cell (0 on phantoms), final at step 3 or
+            // cell-final — including partial final windows.
+            let live = r < program.live_rows();
+            let step = if live {
+                (r % program.rows_per_cell()) % WINDOW_ATOMS
+            } else {
+                0
+            };
+            let window_final = !live || step == WINDOW_ATOMS - 1 || row[m.is_cell_final] == F::ONE;
+            assert_eq!(row[m.window_step], F::from_canonical_usize(step), "WINDOW_STEP row {r}");
+            assert_eq!(row[m.is_window_final], F::from_bool(window_final), "IS_WINDOW_FINAL row {r}");
         }
         for (r, row) in rows.iter().enumerate() {
             let v: &MatmulColumnsView<F> = row.borrow();

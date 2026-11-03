@@ -132,7 +132,7 @@ pub const STARK_QUERY_ROUNDS: usize = (STARK_SECURITY_BITS - STARK_POW_BITS as u
 /// | LUTs       | [`lut_height`]   | {17, 16, 14, 11, 10, 8, 6, 5} |
 ///
 /// Blake3 work is bounded in closed form from the statement's scalars before
-/// compilation (`PublicParams::check_blake3_work_bound`): four plane trees, MoE
+/// compilation (`PublicParams::check_work_bounds`): four plane trees, MoE
 /// routing/offsets trees, two root folds, and the jackpot together consume at
 /// most `2^22` compression-message bytes. Thus there are at most `2^16`
 /// compressions and `2^19` rows. The minimum legal tile still has
@@ -250,7 +250,7 @@ pub struct Fp8PublicData {
 }
 
 /// Verifier-recomputable leading columns for the five main tables. This is only an
-/// intermediate representation: [`Fp8System::derive_known_columns`] is the sole place
+/// intermediate representation: [`Fp8System::assemble_known_columns`] is the sole place
 /// that converts it to the positional layout the batch verifier requires.
 struct MainTableKnownValues<F: RichField> {
     blake3: Vec<PolynomialValues<F>>,
@@ -270,14 +270,16 @@ impl<F: RichField> MainTableKnownValues<F> {
                 table.known_column_count(device),
                 "{table:?}: wrong known-column count"
             );
-            assert!(!columns.is_empty(), "{table:?}: no known columns");
-            for column in columns {
-                assert_eq!(column.len(), columns[0].len(), "{table:?}: ragged known columns");
+            // Matmul has no known columns to shape-check.
+            if let Some(first) = columns.first() {
+                for column in columns {
+                    assert_eq!(column.len(), first.len(), "{table:?}: ragged known columns");
+                }
+                assert!(
+                    first.len().is_power_of_two(),
+                    "{table:?}: known columns do not have power-of-two height"
+                );
             }
-            assert!(
-                columns[0].len().is_power_of_two(),
-                "{table:?}: known columns do not have power-of-two height"
-            );
         }
 
         let mut columns_per_table = Table::ALL
@@ -322,23 +324,18 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
         }
     }
 
-    /// Recomputes Matmul's class-(a) columns from public geometry.
-    ///
-    /// This runs when either a prover or a native verifier derives an [`Fp8System`];
-    /// wrapper compilation consumes those same values through the system. It does not
-    /// generate a private trace.
-    fn known_values(&self) -> Vec<PolynomialValues<F>> {
+    /// Geometry-derived trace height, including power-of-two padding.
+    fn num_rows(&self) -> usize {
         match self {
-            Self::H100(stark) => stark.known_values(),
-            Self::B200(stark) => stark.known_values(),
+            Self::H100(stark) => stark.num_rows(),
+            Self::B200(stark) => stark.num_rows(),
         }
     }
 
     /// Generates the Matmul trace from InputQuant-bound operand data.
     ///
-    /// This runs only on the prover's per-proof path. Native verification never
-    /// regenerates the private trace; it checks its openings against the public
-    /// class-(a) columns above. Wrapper compilation only uses [`Self::as_stark`].
+    /// Only the prover generates this trace. Verification checks its AIR and CTL
+    /// constraints; wrapper compilation uses [`Self::as_stark`].
     ///
     /// `a_codes` and `b_codes` are the post-noise FP8 E4M3 codes produced by InputQuant
     /// and CTL-bound into Matmul. A is row-major (`h * k`); B is transposed/column-major
@@ -360,7 +357,8 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
                 for row in &rows {
                     let value: &MatmulColumnsView<F> = row.borrow();
                     if value.is_cell_final == F::ONE && value.is_padding == F::ZERO {
-                        let cell = value.cell_id.to_canonical_u64() as usize;
+                        let cell =
+                            value.out_row.to_canonical_u64() as usize * stark.w + value.out_col.to_canonical_u64() as usize;
                         cell_words[cell] = (value.cell_result_f32_lo.to_canonical_u64()
                             | (value.cell_result_f32_hi.to_canonical_u64() << 16))
                             as u32;
@@ -375,7 +373,8 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
                 for row in &rows {
                     let value: &MatmulB200ColumnsView<F> = row.borrow();
                     if value.is_cell_final == F::ONE && value.is_padding == F::ZERO {
-                        let cell = value.cell_id.to_canonical_u64() as usize;
+                        let cell =
+                            value.out_row.to_canonical_u64() as usize * stark.w + value.out_col.to_canonical_u64() as usize;
                         cell_words[cell] = (value.cell_result_f32_lo.to_canonical_u64()
                             | (value.cell_result_f32_hi.to_canonical_u64() << 16))
                             as u32;
@@ -432,32 +431,69 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// Derives the five main tables' verifier-known columns from a statement. This is
     /// the only cross-table owner of their canonical batch order and metadata.
     pub(super) fn derive_known_columns(data: &Fp8PublicData) -> BatchKnownColumns<F> {
+        let ((blake3, input_quant), (scale, xor_fold)) = plonky2_maybe_rayon::join(
+            || {
+                plonky2_maybe_rayon::join(
+                    || {
+                        data.blake3.known_values::<F>(&Blake3KnownInputs {
+                            a_values_len: data.a_values_len,
+                            a_scales_len: data.a_scales_len,
+                            b_values_len: data.b_values_len,
+                            b_scales_len: data.b_scales_len,
+                        })
+                    },
+                    || data.input_quant.known_values::<F>(&data.a_noise, &data.b_noise),
+                )
+            },
+            || plonky2_maybe_rayon::join(|| data.scale.known_values::<F>(), || data.xor_fold.known_values::<F>()),
+        );
+        Self::assemble_known_columns(data, blake3, input_quant, scale, xor_fold)
+    }
+
+    fn assemble_known_columns(
+        data: &Fp8PublicData,
+        blake3: Vec<PolynomialValues<F>>,
+        input_quant: Vec<PolynomialValues<F>>,
+        scale: Vec<PolynomialValues<F>>,
+        xor_fold: Vec<PolynomialValues<F>>,
+    ) -> BatchKnownColumns<F> {
         debug_assert_eq!(
             data.input_quant.device, data.scale.device,
             "InputQuant and Scale must use the same committed device"
         );
         let device = data.scale.device;
-        let matmul = MatmulBackend::<F, D>::new(device, data.input_quant.h, data.input_quant.w, data.input_quant.k);
         MainTableKnownValues {
-            blake3: data.blake3.known_values::<F>(&Blake3KnownInputs {
-                a_values_len: data.a_values_len,
-                a_scales_len: data.a_scales_len,
-                b_values_len: data.b_values_len,
-                b_scales_len: data.b_scales_len,
-            }),
-            input_quant: data.input_quant.known_values::<F>(&data.a_noise, &data.b_noise),
-            scale: data.scale.known_values::<F>(),
-            matmul: matmul.known_values(),
-            xor_fold: data.xor_fold.known_values::<F>(),
+            blake3,
+            input_quant,
+            scale,
+            matmul: Vec::new(),
+            xor_fold,
         }
         .into_batch_known_columns(device)
     }
 
-    /// Derives the full batching context from the statement: class (a) values (which fix
-    /// every main table's height), the consensus config, the CTL set and the known-column
-    /// data — all in the canonical table order.
+    /// Derives the full batching context from the statement: class (a) values, per-table
+    /// heights (each table's program pins its own), the consensus config, the CTL set and
+    /// the known-column data — all in the canonical table order.
     pub fn new(data: Fp8PublicData) -> Self {
         let known = Self::derive_known_columns(&data);
+        Self::with_known_columns(data, known)
+    }
+
+    /// Reuses columns generated alongside the programs; canonical layout and shape
+    /// checks remain owned by this driver.
+    pub(crate) fn new_with_known_values(
+        data: Fp8PublicData,
+        blake3: Vec<PolynomialValues<F>>,
+        input_quant: Vec<PolynomialValues<F>>,
+        scale: Vec<PolynomialValues<F>>,
+        xor_fold: Vec<PolynomialValues<F>>,
+    ) -> Self {
+        let known = Self::assemble_known_columns(&data, blake3, input_quant, scale, xor_fold);
+        Self::with_known_columns(data, known)
+    }
+
+    fn with_known_columns(data: Fp8PublicData, known: BatchKnownColumns<F>) -> Self {
         let Fp8PublicData {
             blake3,
             input_quant,
@@ -477,11 +513,23 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         let device = scale.device;
         let (h, w, k) = (input_quant.h, input_quant.w, input_quant.k);
         let lut_tables = lut_tables(device);
-        // Class (a) recompute — also the (only) source of the main tables' heights: the
-        // verifier must never take the batch layout from the proof.
+        let matmul = MatmulBackend::new(device, h, w, k);
+        // Heights come uniformly from each table's statement-derived program
+        // (power-of-two padded), never from the proof. Known columns, when
+        // present, are generated at exactly these heights.
         let mut heights = [0usize; NUM_ALL_TABLES];
+        heights[Table::Blake3 as usize] = blake3.num_rows();
+        heights[Table::InputQuant as usize] = input_quant.num_rows();
+        heights[Table::Scale as usize] = scale.num_rows();
+        heights[Table::Matmul as usize] = matmul.num_rows();
+        heights[Table::XorFold as usize] = xor_fold.num_rows();
         for table in Table::ALL {
-            heights[table as usize] = known.values_per_table[table as usize][0].len();
+            debug_assert!(
+                known.values_per_table[table as usize]
+                    .iter()
+                    .all(|column| column.len() == heights[table as usize]),
+                "{table:?} known columns must be generated at the table height"
+            );
         }
         for (i, &table) in lut_tables.iter().enumerate() {
             heights[NUM_TABLES + i] = lut_height(table);
@@ -500,7 +548,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             blake3: Blake3Stark::new(blake3),
             input_quant: InputQuantStark::new(input_quant),
             scale: ScaleStark::new(scale),
-            matmul: MatmulBackend::new(device, h, w, k),
+            matmul,
             xor_fold: XorFoldStark::new(xor_fold),
             luts: lut_tables.map(boxed_lut_stark::<F, D>),
             lut_tables,
@@ -590,6 +638,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// recompute). The digest slot is empty until `bind_statement_digest` fills it.
     pub(super) fn known(&self) -> &BatchKnownColumns<F> {
         &self.known
+    }
+
+    pub(super) fn has_moe(&self) -> bool {
+        self.blake3.program.moe.is_some()
     }
 
     /// Binds `statement_digest` into the known-column Fiat-Shamir slot. The caller of
@@ -1173,6 +1225,62 @@ mod tests {
         Fp8System::new(public_data(fx))
     }
 
+    #[test]
+    fn admission_work_covers_derived_known_layout() {
+        use crate::v4::api::prequant::BLOCK_SIZE;
+        use crate::v4::api::primitives::IncompleteBlockHeader;
+        use crate::v4::api::public_params::test_fixtures::{dense_params, empty_jackpot};
+        use crate::v4::api::public_params::{HashId, known_column_evaluation_products};
+        use crate::v4::api::zk::Fp8Job;
+        use crate::v4::circuit::blake3_stark::stark::ROWS_PER_COMPRESSION;
+
+        for device in [Device::H100, Device::B200] {
+            for hash_id in HashId::ALL {
+                let mut job = dense_params().job().clone();
+                job.common.device = device;
+                job.operands.a.hash_id = hash_id;
+                job.operands.b.hash_id = hash_id;
+                let params = PublicParams::try_new(job, empty_jackpot(), None).unwrap();
+                let system = Fp8Job::derive(&params, &IncompleteBlockHeader::zero()).unwrap().system;
+                let (h, w, k, r) = (
+                    params.h() as u64,
+                    params.w() as u64,
+                    params.common_dim() as u64,
+                    params.rank() as u64,
+                );
+                let blocks = params.blake3_work_block_bound().unwrap();
+                let heights = [
+                    (blocks * ROWS_PER_COMPRESSION as u64).next_power_of_two(),
+                    (h.max(w) * k).next_power_of_two(),
+                    (h + w).next_power_of_two(),
+                    (h * w * (k / 32)).next_power_of_two(),
+                    (h * w).next_power_of_two(),
+                ];
+                let compiled_bytes = (h + w) * k + 2 * (h + w) * (k / BLOCK_SIZE as u64) + blocks * blake3::BLOCK_LEN as u64;
+                let mut work = (h + w) * k * r + 2 * r * (h + w + 2 * k) + compiled_bytes;
+                for table in Table::ALL {
+                    let index = table as usize;
+                    let actual_height = 1u64 << system.degree_bits()[index];
+                    if table == Table::Blake3 {
+                        assert!(heights[index] >= actual_height, "{device:?} {hash_id:?}: Blake3 bound");
+                    } else {
+                        assert_eq!(heights[index], actual_height, "{device:?} {hash_id:?}: {table:?} height");
+                    }
+                    let values = &system.known().values_per_table[index];
+                    assert_eq!(values.len(), table.known_column_count(device), "{table:?} width");
+                    assert_eq!(values.len(), system.known().columns_per_table[index].len());
+                    assert!(values.iter().all(|column| column.len() as u64 == actual_height));
+                    if !values.is_empty() {
+                        let columns = values.len() as u64;
+                        work += heights[index] * columns + known_column_evaluation_products(heights[index], columns).unwrap();
+                    }
+                }
+                assert_eq!(params.verifier_work_units(blocks).unwrap(), work);
+                assert!(work <= PublicParams::MAX_VERIFIER_WORK);
+            }
+        }
+    }
+
     fn witness<'a>(fx: &'a Fp8Fixture) -> Fp8Witness<'a> {
         Fp8Witness {
             a_values: &fx.a_values,
@@ -1248,8 +1356,8 @@ mod tests {
         assert_eq!(config.fri_config.rate_bits, 1);
         assert_eq!(starks[matmul].constraint_degree(), 3);
         let (helpers, zs, _) = CrossTableLookup::num_ctl_helpers_zs_all(system.ctls(), matmul, config.num_challenges, 3);
-        assert_eq!((starks[matmul].num_columns(), helpers, zs), (331, 276, 18));
-        assert_eq!(starks[matmul].num_columns() + helpers + zs + 6, 631);
+        assert_eq!((starks[matmul].num_columns(), helpers, zs), (339, 276, 18));
+        assert_eq!(starks[matmul].num_columns() + helpers + zs + 6, 639);
         let pow2g = NUM_TABLES
             + system
                 .committed_lut_tables()

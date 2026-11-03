@@ -97,16 +97,16 @@ use crate::v4::api::proof_utils::check_jackpot_difficulty;
 use crate::v4::api::public_params::{
     CommonParams, Device, HashId, JackpotStatement, JobParams, MoEStatement, OperandParams, PublicParams, Quant,
 };
-use crate::v4::api::utils::{MMA_GROUP_PRODUCTS, fp32_to_bf16_rne};
 use crate::v4::circuit::blake3_stark::columns::{
     NUM_BLAKE3_PUBLIC_INPUTS, PI_HASH_A, PI_HASH_B, PI_HASH_JACKPOT, PI_HASH_OFFSETS, PI_HASH_ROUTING, PI_JACKPOT_KEY, PI_KEY_A,
     PI_KEY_B,
 };
-use crate::v4::circuit::blake3_stark::stark::{Blake3Program, MoeSchedule};
+use crate::v4::circuit::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, MoeSchedule};
 pub use crate::v4::circuit::circuit_utils::{Fp8Verifier, Fp8VerifierCache};
 use crate::v4::circuit::ctl::NUM_TABLES;
 use crate::v4::circuit::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8PublicData, Fp8System, Fp8Witness};
 use crate::v4::circuit::input_quant_stark::stark::InputQuantProgram;
+use crate::v4::circuit::matmul_b200_stark::columns::GROUP_WIDTH as MATMUL_GROUP_WIDTH;
 use crate::v4::circuit::scale_stark::stark::ScaleProgram;
 use crate::v4::circuit::unpredictability::budget;
 #[cfg(test)]
@@ -457,78 +457,95 @@ impl Fp8Job {
     /// Derives the statement of `params` (MoE or dense) from the proposed header. Fails
     /// (rather than panics) on any job outside the fp8 envelope.
     pub fn derive(params: &PublicParams, proposed_header: &IncompleteBlockHeader) -> Result<Self> {
-        params.recheck_moe()?;
-        let (compiled, _, _) = params.compile(proposed_header)?;
-        let (h, w, k, r) = (compiled.h, compiled.w, compiled.k, compiled.r);
-
-        // ---- Class (a) noise codes: bf16((E @ F)[elem]) on the bit-exact hardware MMA,
-        // exactly the intermediate `noisy_quantize` computes. ----
-        let noise = compute_fp8_noise(params, proposed_header);
-        let device = params.common().device;
-        // Each output cell is an independent length-`r` dot product, so the output
-        // columns split into `k / MMA_GROUP_PRODUCTS` blocks without touching any
-        // cell's value: every block `e @ (32 x r)` runs the identical per-cell
-        // kernel on both devices. One job set spans both sides.
-        let noise_codes = |e: &[u8], f: &[u8], rows: usize| -> Result<Vec<u16>> {
-            use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
-
-            let block = MMA_GROUP_PRODUCTS;
-            let blocks: Vec<Vec<f32>> = (0..k / block)
-                .into_par_iter()
-                .map(|b| device.matmul_fp8(e, &f[b * block * r..(b + 1) * block * r], None, rows, block, r))
-                .collect::<Result<_>>()?;
-            let mut codes = Vec::with_capacity(rows * k);
-            for i in 0..rows {
-                for b in 0..k / block {
-                    let block_row = &blocks[b][i * block..(i + 1) * block];
-                    codes.extend(block_row.iter().map(|&v| fp32_to_bf16_rne(v)));
-                }
-            }
-            Ok(codes)
-        };
-        let (a_noise, b_noise) = plonky2_maybe_rayon::join(
-            || noise_codes(&noise.a.e, &noise.a.f, h),
-            || noise_codes(&noise.b.e, &noise.b.f, w),
+        params.recheck_admission()?;
+        let (h, w, k, r) = (
+            params.h() as usize,
+            params.w() as usize,
+            params.common_dim() as usize,
+            params.rank() as usize,
         );
-        let a_noise = a_noise.context("A-side noise codes")?;
-        let b_noise = b_noise.context("B-side noise codes")?;
-
-        // ---- The five programs. ----
-        // The MoE sampled-entry pins (empty for a dense job): the deployed compiler already
-        // scheduled the routing tree's hotspot blocks from the same public data, so the pin
-        // positions land exactly on the scheduled routing leaves
-        // (`Blake3Program::validate` cross-checks).
-        let (routing_pins, moe_schedule) = match (params.moe_statement(), &compiled.moe) {
-            (Some(moe), Some(cm)) => (
-                moe.routing_pins(&cm.inner_indices),
-                Some(MoeSchedule::new(
-                    moe,
-                    params.moe().expect("MoE statement implies MoE params").experts,
-                    params.m(),
-                )?),
-            ),
-            (None, None) => (vec![], None),
-            _ => unreachable!("compilation mirrors params.moe"),
-        };
-        let blake3 = Blake3Program::from_blake_program(&compiled.blake_proof, k, routing_pins, moe_schedule);
+        let device = params.common().device;
         let input_quant = InputQuantProgram {
             h,
             w,
             k,
             block_size: BLOCK_SIZE,
             r,
-            device: params.common().device,
-        };
-        let scale = ScaleProgram::new_for_device(h, w, k, r, params.common().device);
-        let xor_fold = XorFoldProgram {
-            lanes: lane_assignment(&params.a().pattern, &params.b().pattern),
-            skip_limit: budget(k, h, w),
+            device,
         };
 
-        let system = Fp8System::new(Fp8PublicData {
+        // Independent table schedules share the Rayon pool; InputQuant waits only
+        // for noise replay, and Blake3 columns are filled as instructions are translated.
+        let ((blake, noise), (scale, xor_fold)) = plonky2_maybe_rayon::join(
+            || {
+                plonky2_maybe_rayon::join(
+                    || -> Result<_> {
+                        let (compiled, _, _) = params.compile(proposed_header)?;
+                        let (routing_pins, moe_schedule) = match (params.moe_statement(), &compiled.moe) {
+                            (Some(moe), Some(cm)) => (
+                                moe.routing_pins(&cm.inner_indices),
+                                Some(MoeSchedule::new(
+                                    moe,
+                                    params.moe().expect("MoE statement implies MoE params").experts,
+                                    params.m(),
+                                )?),
+                            ),
+                            (None, None) => (vec![], None),
+                            _ => unreachable!("compilation mirrors params.moe"),
+                        };
+                        Ok(Blake3Program::from_blake_program_with_known_values::<F>(
+                            &compiled.blake_proof,
+                            k,
+                            routing_pins,
+                            moe_schedule,
+                            &Blake3KnownInputs {
+                                a_values_len: h * k,
+                                a_scales_len: h * (k / BLOCK_SIZE) * 2,
+                                b_values_len: w * k,
+                                b_scales_len: w * (k / BLOCK_SIZE) * 2,
+                            },
+                        ))
+                    },
+                    || -> Result<_> {
+                        let noise = compute_fp8_noise(params, proposed_header);
+                        let (a_noise, b_noise) = plonky2_maybe_rayon::join(
+                            || device.matmul_fp8_bf16(&noise.a.e, &noise.a.f, h, k, r),
+                            || device.matmul_fp8_bf16(&noise.b.e, &noise.b.f, w, k, r),
+                        );
+                        let a_noise = a_noise.context("A-side noise codes")?;
+                        let b_noise = b_noise.context("B-side noise codes")?;
+                        let known = input_quant.known_values::<F>(&a_noise, &b_noise);
+                        Ok((a_noise, b_noise, known))
+                    },
+                )
+            },
+            || {
+                plonky2_maybe_rayon::join(
+                    || {
+                        let scale = ScaleProgram::new_for_device(h, w, k, r, device);
+                        let known = scale.known_values::<F>();
+                        (scale, known)
+                    },
+                    || {
+                        let xor_fold = XorFoldProgram {
+                            lanes: lane_assignment(&params.a().pattern, &params.b().pattern),
+                            skip_limit: budget(k, h, w),
+                        };
+                        let known = xor_fold.known_values::<F>();
+                        (xor_fold, known)
+                    },
+                )
+            },
+        );
+        let (blake3, blake_known) = blake?;
+        let (a_noise, b_noise, input_quant_known) = noise?;
+        let (scale, scale_known) = scale;
+        let (xor_fold, xor_fold_known) = xor_fold;
+
+        let data = Fp8PublicData {
             blake3,
-            input_quant: input_quant.clone(),
-            scale: scale.clone(),
+            input_quant,
+            scale,
             xor_fold,
             a_values_len: h * k,
             a_scales_len: h * (k / BLOCK_SIZE) * 2,
@@ -536,7 +553,8 @@ impl Fp8Job {
             b_scales_len: w * (k / BLOCK_SIZE) * 2,
             a_noise,
             b_noise,
-        });
+        };
+        let system = Fp8System::new_with_known_values(data, blake_known, input_quant_known, scale_known, xor_fold_known);
         // Consensus gate: every envelope-legal profile lands on the fixed FRI ladder
         // (`ladder_covers_the_envelope`); anything else is a bug upstream, not a job.
         ensure!(
@@ -629,8 +647,15 @@ impl Fp8Job {
         // expressions read.
         let iq = self.input_quant();
         let input_quant = iq.public_inputs::<F>().to_vec();
+        // Matmul schedule public inputs: [k/32, w, h*w, h*k].
+        let matmul = vec![
+            F::from_canonical_usize(iq.k / MATMUL_GROUP_WIDTH),
+            F::from_canonical_usize(iq.w),
+            F::from_canonical_usize(iq.h * iq.w),
+            F::from_canonical_usize(iq.h * iq.k),
+        ];
         let xor_fold = vec![F::from_canonical_u64(budget(iq.k, iq.h, iq.w))];
-        [blake3, input_quant, scale, vec![], xor_fold]
+        [blake3, input_quant, scale, matmul, xor_fold]
     }
 }
 

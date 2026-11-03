@@ -142,6 +142,184 @@ pub(super) fn regenerate_go_fixture() {
     }
 }
 
+#[cfg(feature = "embedded_cache")]
+fn go_fixture(device: Device) -> (IncompleteBlockHeader, Vec<BlockHeader>, Vec<u8>, Vec<u8>) {
+    let suffix = match device {
+        Device::H100 => "h100",
+        Device::B200 => "b200",
+    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../node/zkpow/testdata/fp8_zk_proof_{suffix}.bin"));
+    let data = std::fs::read(path).expect("read committed Go fixture");
+    let (header, rest) = data.split_at(IncompleteBlockHeader::SERIALIZED_SIZE);
+    let header = IncompleteBlockHeader::from_bytes(header).expect("fixture header");
+    let (len, rest) = rest.split_at(4);
+    let public_len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+    let (public_data, rest) = rest.split_at(public_len);
+    let (chain_len, mut rest) = rest.split_at(1);
+    let mut chain = Vec::new();
+    for _ in 0..chain_len[0] {
+        let (ancestor, tail) = rest.split_at(BlockHeader::SERIALIZED_SIZE);
+        chain.push(BlockHeader::from_bytes(ancestor).expect("fixture ancestor header"));
+        rest = tail;
+    }
+    (header, chain, public_data.to_vec(), rest.to_vec())
+}
+
+/// Check the published fixture bytes through the same cached verifier used by Go.
+#[test]
+#[cfg(feature = "embedded_cache")]
+fn embedded_cache_verifies_the_committed_go_fixtures() {
+    let cache = Fp8VerifierCache::from_bytes(crate::v4::api::embedded_cache::CACHE_DATA).expect("embedded cache must decode");
+    for device in Device::ALL {
+        let (header, chain, public_data, proof_data) = go_fixture(device);
+        cache
+            .verify_block(&header, &chain, &public_data, &proof_data)
+            .unwrap_or_else(|e| panic!("{device:?} fixture must verify: {e:#}"));
+    }
+}
+
+/// Pin the entire recursive verifier configuration and its polynomial inventory.
+/// A changed signature requires recalibrating the fixed allowance in `PublicParams`.
+#[test]
+#[cfg(feature = "embedded_cache")]
+fn verifier_resource_signature_is_pinned() {
+    use plonky2::util::serialization::DefaultGateSerializer;
+
+    let cache = Fp8VerifierCache::from_bytes(crate::v4::api::embedded_cache::CACHE_DATA).expect("embedded cache must decode");
+    let signatures = [Device::B200, Device::H100].map(|device| {
+        let verifier = cache.get(device).expect("device setup");
+        let mut hash = blake3::Hasher::new();
+        hash.update(
+            &verifier
+                .circuit
+                .common
+                .to_bytes(&DefaultGateSerializer)
+                .expect("serialize common circuit data"),
+        );
+        hash.update(&(verifier.constants_sigmas_polynomials.len() as u64).to_le_bytes());
+        for polynomial in &verifier.constants_sigmas_polynomials {
+            hash.update(&(polynomial.coeffs.len() as u64).to_le_bytes());
+        }
+        hash.finalize().to_hex().to_string()
+    });
+    assert_eq!(
+        signatures, ["941d4125a7c4d603d7586e99f619e18ae0036baac8a5d0bd589a766483cf84a6"; 2],
+        "verifier resources changed; recalibrate the fixed work allowance"
+    );
+}
+
+/// Median of nine warmed, single-thread cached verifications, including parsing.
+/// `cargo test --release --features embedded_cache bench_v4_verify -- --ignored --nocapture`
+#[test]
+#[cfg(feature = "embedded_cache")]
+#[ignore = "manual verifier calibration"]
+fn bench_v4_verify() {
+    let cache = Fp8VerifierCache::from_bytes(crate::v4::api::embedded_cache::CACHE_DATA).expect("embedded cache must decode");
+    let pool = plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        for device in Device::ALL {
+            let (header, chain, public_data, proof_data) = go_fixture(device);
+            cache
+                .verify_block(&header, &chain, &public_data, &proof_data)
+                .expect("warm-up");
+            let mut samples = [0.0; 9];
+            for sample in &mut samples {
+                let started = std::time::Instant::now();
+                cache
+                    .verify_block(&header, &chain, &public_data, &proof_data)
+                    .expect("fixture verifies");
+                *sample = started.elapsed().as_secs_f64() * 1000.0;
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{device:?}: full verification median {:.2} ms (min {:.2}, max {:.2})",
+                samples[4], samples[0], samples[8]
+            );
+        }
+    });
+}
+
+/// Complete wrapped proving with a reused setup; output verification is untimed.
+/// Run serially: `RAYON_NUM_THREADS=4 V4_BENCH_DEVICE=b200 cargo test --release
+/// bench_v4_prove -- --ignored --nocapture --test-threads=1` (also use `h100`).
+/// `V4_BENCH_SIZE=medium` uses k=4096; `V4_BENCH_REPETITIONS` defaults to 3 after one warm-up.
+#[test]
+#[ignore = "manual prover calibration; one device per process"]
+fn bench_v4_prove() {
+    let device = match std::env::var("V4_BENCH_DEVICE").as_deref().unwrap_or("b200") {
+        "b200" => Device::B200,
+        "h100" => Device::H100,
+        other => panic!("V4_BENCH_DEVICE must be b200 or h100, got {other}"),
+    };
+    let repetitions = std::env::var("V4_BENCH_REPETITIONS")
+        .map(|value| value.parse::<usize>().expect("positive repetition count"))
+        .unwrap_or(3);
+    assert!(repetitions > 0);
+    let (header, mut plain) = match std::env::var("V4_BENCH_SIZE").as_deref().unwrap_or("small") {
+        "small" => fixture_job(),
+        "medium" => fixture_job_medium(),
+        other => panic!("V4_BENCH_SIZE must be small or medium, got {other}"),
+    };
+    plain.job.common.device = device;
+    let (_, params) = plain.parse_proof(&header).expect("benchmark job is admitted");
+    let work = params.verifier_work_units(params.blake3_work_block_bound().unwrap()).unwrap();
+    println!("{device:?}: verifier work {work}/{} units", PublicParams::MAX_VERIFIER_WORK);
+    let mut prover = Fp8Prover::setup(device).expect("prover setup");
+    let setup = &prover.setups[&device];
+    let verifier = Fp8Verifier {
+        circuit: setup.circuits.verifier_data(),
+        constants_sigmas_polynomials: setup.circuits.constants_sigmas_polynomials(),
+    };
+    let mut samples = Vec::new();
+    for iteration in 0..=repetitions {
+        let started = std::time::Instant::now();
+        let (public_data, proof_data) = prover.prove(&header, &plain).expect("wrapped proof");
+        let seconds = started.elapsed().as_secs_f64();
+        verifier
+            .verify_block(&header, &plain.ancestor_chain, &public_data, &proof_data)
+            .expect("benchmark proof verifies");
+        println!(
+            "{device:?} iteration {iteration}: {seconds:.3} s, {} proof bytes",
+            proof_data.len()
+        );
+        if iteration > 0 {
+            samples.push(seconds);
+        }
+        if iteration == repetitions {
+            let pool = plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                verifier
+                    .verify_block(&header, &plain.ancestor_chain, &public_data, &proof_data)
+                    .unwrap();
+                let mut verify_ms = [0.0; 9];
+                for ms in &mut verify_ms {
+                    let started = std::time::Instant::now();
+                    verifier
+                        .verify_block(&header, &plain.ancestor_chain, &public_data, &proof_data)
+                        .unwrap();
+                    *ms = started.elapsed().as_secs_f64() * 1000.0;
+                }
+                verify_ms.sort_by(f64::total_cmp);
+                println!("{device:?}: single-thread verification median {:.2} ms", verify_ms[4]);
+            });
+        }
+    }
+    samples.sort_by(f64::total_cmp);
+    let median = (samples[(repetitions - 1) / 2] + samples[repetitions / 2]) / 2.0;
+    println!(
+        "{device:?}: proving median {:.3} s (min {:.3}, max {:.3})",
+        median,
+        samples[0],
+        samples[repetitions - 1]
+    );
+}
+
 #[test]
 #[cfg(feature = "embedded_cache")]
 #[ignore = "wrapped proving needs more memory than the default CI runner; invoked explicitly on a larger machine"]

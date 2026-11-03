@@ -576,7 +576,8 @@ mod tests {
             .filter(|row| row[MATMUL_B200_COL_MAP.is_cell_final] == F::ONE && row[MATMUL_B200_COL_MAP.is_padding] == F::ZERO)
             .map(|row| {
                 (
-                    to_u64(row[MATMUL_B200_COL_MAP.cell_id]),
+                    // The channel key: the PI-scaled coordinate sum `W*OUT_ROW + OUT_COL`.
+                    matmul.w as u64 * to_u64(row[MATMUL_B200_COL_MAP.out_row]) + to_u64(row[MATMUL_B200_COL_MAP.out_col]),
                     to_u64(row[MATMUL_B200_COL_MAP.cell_result_f32_lo]),
                     to_u64(row[MATMUL_B200_COL_MAP.cell_result_f32_hi]),
                     to_u64(row[MATMUL_B200_COL_MAP.cell_skips]),

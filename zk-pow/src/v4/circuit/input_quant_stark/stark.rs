@@ -161,8 +161,9 @@ use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
 use super::columns::{
-    Bf16FieldsView, BlockL2Columns, FmaBlockView, InputQuantColumnsView, MulBlockView, MulDecodeBlockView,
-    NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_KNOWN_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS, WL2_POW_PUBLIC_INPUT,
+    B_KEY_OFFSET_PUBLIC_INPUT, B_LIVE_BOUND_PUBLIC_INPUT, Bf16FieldsView, BlockL2Columns, FmaBlockView, InputQuantColumnsView,
+    K_PUBLIC_INPUT, MulBlockView, MulDecodeBlockView, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_KNOWN_COLUMNS,
+    NUM_INPUT_QUANT_PUBLIC_INPUTS, WL2_POW_PUBLIC_INPUT,
 };
 use crate::v4::api::compute::{bf16_clamp_sym, bf16_fma, bf16_max, bf16_mul};
 use crate::v4::api::dtype::{bf16_to_f32, f32_to_fp8_e4m3};
@@ -329,8 +330,26 @@ impl InputQuantProgram {
                 row.block_index = F::from_canonical_usize(element_index / BLOCK_SIZE);
                 row.a_live = F::from_bool(a_live);
                 row.b_live = F::from_bool(b_live);
+                // Group-G counters and inverse witnesses for the schedule flags.
+                row.group_counter = F::from_canonical_usize(j);
+                row.group_final_inv = (row.group_counter - F::from_canonical_usize(k - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO);
+                row.block8_counter = F::from_canonical_usize(element_index % BLOCK_SIZE);
+                row.block8_counter_inv = (row.block8_counter - F::from_canonical_usize(BLOCK_SIZE - 1))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO);
+                row.a_flip_inv = (row.element_index - F::from_canonical_usize(h * k))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO);
+                row.b_flip_inv = (row.element_index - F::from_canonical_usize(w * k))
+                    .try_inverse()
+                    .unwrap_or(F::ZERO);
                 side_a.fill_a(&mut row, j);
                 side_b.fill_b(&mut row, j);
+                // Pack the noise decodes for the verifier-known columns.
+                row.noise_code_a = bf16_code_of(&row.noise_a);
+                row.noise_code_b = bf16_code_of(&row.noise_b);
                 rows.push(row.into());
             }
             start += len;
@@ -340,7 +359,8 @@ impl InputQuantProgram {
     }
 
     /// The table's public inputs (`columns.rs` slot order): `2^Wl2` and the geometry scalars
-    /// `[h*k, h*k/8, w, h]` the CTL column expressions read.
+    /// `[h*k, h*k/8, w, h, k, w*k]` the CTL column expressions and the group-G schedule
+    /// gadgets read.
     pub fn public_inputs<F: RichField>(&self) -> [F; NUM_INPUT_QUANT_PUBLIC_INPUTS] {
         [
             F::from_canonical_u64(1u64 << self.wl2()),
@@ -348,45 +368,37 @@ impl InputQuantProgram {
             F::from_canonical_usize(self.h * self.k / BLOCK_SIZE),
             F::from_canonical_usize(self.w),
             F::from_canonical_usize(self.h),
+            F::from_canonical_usize(self.k),
+            F::from_canonical_usize(self.w * self.k),
         ]
     }
 
-    /// Values of the leading [`NUM_INPUT_QUANT_KNOWN_COLUMNS`] verifier-known columns. They
-    /// contain both sides' public-seed noise fields (or +0 on dead rows), plus geometry-derived
-    /// indices, schedule flags, and liveness. The batch verifier recomputes these values and
-    /// checks that the trace openings match them exactly.
+    /// Both sides' packed public-seed noise codes, padded with zeros. The batch verifier
+    /// checks their trace openings; group G constrains the decodes and schedule.
     pub fn known_values<F: RichField>(&self, a_noise: &[u16], b_noise: &[u16]) -> Vec<PolynomialValues<F>> {
-        let (h, w, k, num_rows) = (self.h, self.w, self.k, self.num_rows());
-        assert_eq!(a_noise.len(), h * k, "a_noise must be h*k codes");
-        assert_eq!(b_noise.len(), w * k, "b_noise must be w*k codes");
+        use plonky2_maybe_rayon::*;
 
-        let mut cols: Vec<Vec<F>> = (0..NUM_INPUT_QUANT_KNOWN_COLUMNS)
-            .map(|_| Vec::with_capacity(num_rows))
+        let (h, w, num_rows) = (self.h, self.w, self.num_rows());
+        assert_eq!(a_noise.len(), h * self.k, "a_noise must be h*k codes");
+        assert_eq!(b_noise.len(), w * self.k, "b_noise must be w*k codes");
+
+        let cols: Vec<PolynomialValues<F>> = [a_noise, b_noise]
+            .into_iter()
+            .map(|codes| {
+                let mut col = vec![F::ZERO; num_rows];
+                col[..codes.len()]
+                    .par_chunks_mut(1024)
+                    .zip(codes.par_chunks(1024))
+                    .for_each(|(outs, codes)| {
+                        for (out, &code) in outs.iter_mut().zip(codes) {
+                            *out = F::from_canonical_u16(code);
+                        }
+                    });
+                PolynomialValues::new(col)
+            })
             .collect();
-        for r in 0..num_rows {
-            for (base, codes) in [(0, a_noise), (4, b_noise)] {
-                // Dead rows carry the phantom +0 noise fields.
-                let f = if r < codes.len() {
-                    Bf16Fields::from_code(codes[r])
-                } else {
-                    Bf16Fields::default()
-                };
-                cols[base].push(F::from_bool(f.sign));
-                cols[base + 1].push(F::from_canonical_u64(f.exp));
-                cols[base + 2].push(F::from_canonical_u64(f.mantissa));
-                cols[base + 3].push(F::from_bool(f.exp_is_zero()));
-            }
-            // Period-k group finals, plus the trace's very last row (the trailing dead group
-            // may be truncated when k is not a power of two).
-            cols[8].push(F::from_bool(r % k == k - 1 || r == num_rows - 1));
-            cols[9].push(F::from_canonical_usize(r));
-            cols[10].push(F::from_bool(r % 2 == 0));
-            cols[11].push(F::from_bool(r % BLOCK_SIZE == 0));
-            cols[12].push(F::from_canonical_usize(r / BLOCK_SIZE));
-            cols[13].push(F::from_bool(r < h * k));
-            cols[14].push(F::from_bool(r < w * k));
-        }
-        cols.into_iter().map(PolynomialValues::new).collect()
+        debug_assert_eq!(cols.len(), NUM_INPUT_QUANT_KNOWN_COLUMNS);
+        cols
     }
 }
 
@@ -1245,6 +1257,11 @@ fn fill_bf16<F: RichField>(dst: &mut Bf16FieldsView<F>, f: Bf16Fields) {
     dst.exp = F::from_canonical_u64(f.exp);
     dst.mantissa = F::from_canonical_u64(f.mantissa);
     dst.exp_is_zero = F::from_bool(f.exp_is_zero());
+}
+
+/// The bf16 code of exact decode fields: `SIGN*2^15 + EXP*2^7 + MANTISSA`.
+fn bf16_code_of<F: RichField>(f: &Bf16FieldsView<F>) -> F {
+    f.sign * F::from_canonical_u64(1 << 15) + f.exp * F::from_canonical_u64(1 << 7) + f.mantissa
 }
 
 fn fill_mul_decode<F: RichField>(dst: &mut MulDecodeBlockView<F>, m: MulWitness) {
@@ -2115,11 +2132,110 @@ pub(crate) fn eval_input_quant_constraints<V, S, E>(
     let nv: &InputQuantColumnsView<V> = nv.borrow();
     let wl2_pow = eval.scalar(vars.get_public_inputs()[WL2_POW_PUBLIC_INPUT]);
 
-    // ---- Verifier-known columns need no duplicate AIR equations. The verifier recomputes the
-    // noise fields, indices, liveness, and row/block/group flags and checks their openings.
-    // This proves the boundary facts used below: the final row closes a block and group,
-    // even/odd rows alternate from row 0, and each block start has
-    // ELEMENT_INDEX = 8*BLOCK_INDEX. ----
+    // ---- Group G pins the schedule and noise decodes. The final row closes a block and
+    // group, even/odd rows alternate from row 0, and block starts satisfy
+    // ELEMENT_INDEX = 8*BLOCK_INDEX. Only the two packed noise codes are verifier-known. ----
+    let one = eval.u64(1);
+    let k_pi = eval.scalar(vars.get_public_inputs()[K_PUBLIC_INPUT]);
+    let hk = eval.scalar(vars.get_public_inputs()[B_KEY_OFFSET_PUBLIC_INPUT]);
+    let wk = eval.scalar(vars.get_public_inputs()[B_LIVE_BOUND_PUBLIC_INPUT]);
+
+    // G1/G2: code = 2^15*sign + 2^7*exp + mantissa. Sign is boolean; unfiltered
+    // EXPINFO/PAIR128 lookups give exp <= 254, mantissa < 128, exp_is_zero = [exp = 0].
+    // The sum is < 2^16 < p, so the decode is unique on live and padding rows.
+    let c128 = eval.u64(1 << 7);
+    let c_2_15 = eval.u64(1 << 15);
+    for (code, f) in [(lv.noise_code_a, &lv.noise_a), (lv.noise_code_b, &lv.noise_b)] {
+        let s = eval.mul(f.sign, c_2_15);
+        let e = eval.mul(f.exp, c128);
+        let se = eval.add(s, e);
+        let sem = eval.add(se, f.mantissa);
+        let recompose = eval.sub(code, sem);
+        eval.constraint(recompose);
+        eval.constraint_bool(f.sign);
+    }
+
+    // G3/G4: the flag/gap product and inverse enforce IS_GROUP_FINAL = [counter = k-1]
+    // off the last row. The last row is always group-final, closing any truncated tail.
+    // The cyclic counter resets after each final row, including the last -> first wrap.
+    eval.constraint_first_row(lv.group_counter);
+    let km1 = eval.sub(k_pi, one);
+    let cnt_gap = eval.sub(lv.group_counter, km1);
+    let igf_gap = eval.mul(lv.is_group_final, cnt_gap);
+    eval.constraint_transition(igf_gap);
+    let not_igf = eval.sub(one, lv.is_group_final);
+    let ginv_hit = eval.mul(cnt_gap, lv.group_final_inv);
+    let ginv_miss = eval.sub(ginv_hit, one);
+    let force_igf = eval.mul(not_igf, ginv_miss);
+    eval.constraint(force_igf);
+    eval.constraint_last_row(not_igf);
+    let cnt_p1 = eval.add(lv.group_counter, one);
+    let cnt_step = eval.mul(cnt_p1, not_igf);
+    let cnt_walk = eval.sub(nv.group_counter, cnt_step);
+    eval.constraint(cnt_walk);
+
+    // G6: ELEMENT_INDEX is the row counter.
+    eval.constraint_first_row(lv.element_index);
+    let ei_step = eval.sub(nv.element_index, lv.element_index);
+    let ei_walk = eval.sub(ei_step, one);
+    eval.constraint_transition(ei_walk);
+
+    // G7: alternate from 1, including the wrap pair (the trace height is even).
+    let ier_m1 = eval.sub(lv.is_even_row, one);
+    eval.constraint_first_row(ier_m1);
+    let ier_sum = eval.add(nv.is_even_row, lv.is_even_row);
+    let ier_alt = eval.sub(ier_sum, one);
+    eval.constraint(ier_alt);
+
+    // G8-G10: the product and inverse enforce next.IS_BLOCK_START = [counter = 7].
+    // Starting at 0, the counter therefore walks modulo 8 without a separate range check.
+    // The cyclic constraints close at the wrap because 8 divides the trace height.
+    eval.constraint_first_row(lv.block8_counter);
+    let ibs_m1 = eval.sub(lv.is_block_start, one);
+    eval.constraint_first_row(ibs_m1);
+    let c7 = eval.u64(BLOCK_SIZE as u64 - 1);
+    let c8_gap = eval.sub(lv.block8_counter, c7);
+    let ibs_gap = eval.mul(nv.is_block_start, c8_gap);
+    eval.constraint(ibs_gap);
+    let not_ibs_next = eval.sub(one, nv.is_block_start);
+    let c8inv_hit = eval.mul(c8_gap, lv.block8_counter_inv);
+    let c8inv_miss = eval.sub(c8inv_hit, one);
+    let force_ibs = eval.mul(not_ibs_next, c8inv_miss);
+    eval.constraint(force_ibs);
+    let c8_step = eval.sub(nv.block8_counter, lv.block8_counter);
+    let c8_step_m1 = eval.sub(c8_step, one);
+    let c8_modulus = eval.u64(BLOCK_SIZE as u64);
+    let ibs_reset = eval.mul(nv.is_block_start, c8_modulus);
+    let c8_walk = eval.add(c8_step_m1, ibs_reset);
+    eval.constraint(c8_walk);
+
+    // G11: BLOCK_INDEX increments exactly at block starts.
+    eval.constraint_first_row(lv.block_index);
+    let blk_step = eval.sub(nv.block_index, lv.block_index);
+    let blk_walk = eval.sub(blk_step, nv.is_block_start);
+    eval.constraint_transition(blk_walk);
+
+    // G12: boolean liveness starts at 1, can change only on entering `bound`, and is forced
+    // to 0 there by the inverse witness. Thus LIVE = [ELEM_IDX < bound]; when bound equals
+    // the trace height, no flip row exists and the side stays live throughout.
+    for (live_l, live_n, bound, flip_inv) in [
+        (lv.a_live, nv.a_live, hk, lv.a_flip_inv),
+        (lv.b_live, nv.b_live, wk, lv.b_flip_inv),
+    ] {
+        let live_m1 = eval.sub(live_l, one);
+        eval.constraint_first_row(live_m1);
+        let live_bool = eval.mul(live_l, live_m1);
+        eval.constraint(live_bool);
+        let live_step = eval.sub(live_l, live_n);
+        let next_gap = eval.sub(nv.element_index, bound);
+        let flip_only_at_bound = eval.mul(live_step, next_gap);
+        eval.constraint_transition(flip_only_at_bound);
+        let gap = eval.sub(lv.element_index, bound);
+        let inv_hit = eval.mul(gap, flip_inv);
+        let inv_miss = eval.sub(inv_hit, one);
+        let force_drop = eval.mul(live_l, inv_miss);
+        eval.constraint(force_drop);
+    }
 
     // ---- Both sides (groups P/U/V/S/B/F/M/W/Q/C). ----
     let lva = side_a(lv);
@@ -2331,9 +2447,8 @@ mod tests {
     /// Runs the constraint set over every row pair (including the last -> first wrap) and
     /// returns whether every accumulator vanished.
     ///
-    /// `z_last` is zero on the last pair, matching starky's semantics. This AIR has no
-    /// transition-only constraints, so every ordinary constraint—including each cyclic
-    /// accumulator's last-row-to-first-row boundary—is evaluated on the wrap pair.
+    /// `z_last` disables transition-only constraints on the last pair, matching starky's
+    /// semantics. Ordinary constraints, including cyclic accumulators, still check the wrap.
     fn constraints_vanish(stark: &S, rows: &[[F; NUM_INPUT_QUANT_COLUMNS]], pis: &[F; NUM_INPUT_QUANT_PUBLIC_INPUTS]) -> bool {
         let n = rows.len();
         for i in 0..n {
@@ -2358,9 +2473,8 @@ mod tests {
         let stark = S::new(program);
         let n = rows.len();
         for i in 0..n {
-            // Ordinary constraints also hold on the last-row-to-first-row wrap. The verifier-
-            // known schedule marks the last row group-final, so this pair correctly resets the
-            // group-0 accumulators and running maximum.
+            // Group G marks the last row group-final, so ordinary constraints reset the
+            // group-0 accumulators and running maximum on the last -> first wrap.
             let frame = StarkFrame::from_values(&rows[i], &rows[(i + 1) % n], &pis);
             let mut consumer = ConstraintConsumer::new(
                 vec![F::from_canonical_u64(2), F::from_canonical_u64(0x876543210)],
@@ -2401,7 +2515,7 @@ mod tests {
     }
 
     #[test]
-    fn padded_asymmetric_trace_satisfies_constraints_and_lut_domains() {
+    fn padded_asymmetric_trace_pins_liveness_and_lut_domains() {
         // The padded geometry in one program: h != w (dead A rows [288, 512), dead B rows
         // [480, 512)) and a truncated tail group (k = 96 is not a power of two: 512 = 5*96 +
         // 32, and the 32-row tail still closes with IS_GROUP_FINAL on the last row). The
@@ -2428,7 +2542,7 @@ mod tests {
         let stark = S::new(program.clone());
         assert!(constraints_vanish(&stark, &rows, &pis), "padded trace violates a constraint");
 
-        // Every verifier-known column, including liveness, matches independent recomputation.
+        // Both verifier-known noise-code columns match independent recomputation.
         let known = program.known_values::<F>(&inp.a_noise, &inp.b_noise);
         assert_eq!(known.len(), NUM_INPUT_QUANT_KNOWN_COLUMNS);
         for (c, poly) in known.iter().enumerate() {
@@ -2437,10 +2551,19 @@ mod tests {
             }
         }
         let m = &INPUT_QUANT_COL_MAP;
-        assert_eq!(rows[287][m.a_live], F::ONE);
-        assert_eq!(rows[288][m.a_live], F::ZERO);
-        assert_eq!(rows[479][m.b_live], F::ONE);
-        assert_eq!(rows[480][m.b_live], F::ZERO);
+        for (side, bound, live_column) in [("A", program.h * program.k, m.a_live), ("B", program.w * program.k, m.b_live)] {
+            assert!(bound > 0 && bound < rows.len(), "{side}: fixture must cross the live bound");
+            assert_eq!(rows[bound - 1][live_column], F::ONE);
+            assert_eq!(rows[bound][live_column], F::ZERO);
+
+            // G12 forces LIVE = 0 at its bound, where the inverse gap is zero.
+            let mut extended = rows.clone();
+            extended[bound][live_column] = F::ONE;
+            assert!(
+                !constraints_vanish(&stark, &extended, &pis),
+                "{side}: liveness must end at its public bound"
+            );
+        }
         assert_eq!(rows[511][m.is_group_final], F::ONE, "the truncated tail must close");
 
         // Every declared LUT instance stays in its table's domain on the padded trace (the
@@ -2462,6 +2585,50 @@ mod tests {
                 let values: Vec<u64> = lookup.values.iter().map(|c| to_u64(c.eval_table(&polys, r, &[]))).collect();
                 check_lut_semantics(lookup, &keys, &values, li, r);
             }
+        }
+    }
+
+    #[test]
+    fn noise_decode_range_lookups_are_unconditional() {
+        // G1's unique decode needs these range and zero-flag bindings on padding too.
+        let m = &INPUT_QUANT_COL_MAP;
+        let lookups = input_quant_lut_lookups::<F>();
+        for (table, keys, values) in [
+            (LutTable::ExpInfo, vec![m.noise_a.exp], vec![m.noise_a.exp_is_zero]),
+            (LutTable::ExpInfo, vec![m.noise_b.exp], vec![m.noise_b.exp_is_zero]),
+            (LutTable::Pair128, vec![m.noise_a.mantissa, m.noise_b.mantissa], vec![]),
+        ] {
+            let matches: Vec<_> = lookups
+                .iter()
+                .filter(|lookup| {
+                    lookup.table == table
+                        && lookup.keys.len() == keys.len()
+                        && lookup
+                            .keys
+                            .iter()
+                            .zip(&keys)
+                            .all(|(expr, &column)| expr.get_single_column_idx() == Some(column))
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{table:?}: expected one noise decode lookup");
+            let lookup = matches[0];
+            assert_eq!(lookup.values.len(), values.len());
+            assert!(
+                lookup
+                    .values
+                    .iter()
+                    .zip(values)
+                    .all(|(expr, column)| expr.get_single_column_idx() == Some(column))
+            );
+            assert!(
+                lookup.filter.relevant_columns().is_empty(),
+                "{table:?}: filter must be constant"
+            );
+            assert_eq!(
+                lookup.filter.eval_table(&[], 0, &[]),
+                F::ONE,
+                "{table:?}: filter must be enabled"
+            );
         }
     }
 
@@ -2888,7 +3055,7 @@ mod tests {
     #[test]
     fn tampered_traces_fail() {
         let (program, rows, pis) = test_trace();
-        let stark = S::new(program);
+        let stark = S::new(program.clone());
         assert!(constraints_vanish(&stark, &rows, &pis), "honest trace must pass");
         let m = &INPUT_QUANT_COL_MAP;
 
@@ -2957,9 +3124,9 @@ mod tests {
         );
 
         // Move a block boundary into the middle of a real block and adjust later block indices.
-        // This naive forgery already breaks the AIR because it resets the square accumulator on
-        // real mid-block data. More generally, even a forgery that rewrote every dependent
-        // witness would fail because the verifier independently recomputes the schedule.
+        // Group G pins the schedule to the mod-8 counter, so the relocation itself is rejected
+        // (G8: a raised IS_BLOCK_START off `BLOCK8_COUNTER = 0`); it also resets the square
+        // accumulator on real mid-block data.
         let mut t = rows.clone();
         t[9][m.is_block_start] = F::ONE;
         for row in t.iter_mut().skip(9) {
@@ -2969,13 +3136,44 @@ mod tests {
             !constraints_vanish(&stark, &t, &pis),
             "naive block-boundary relocation undetected"
         );
-        let program2 = test_program();
-        let inp = test_inputs(&program2);
-        let known = program2.known_values::<F>(&inp.a_noise, &inp.b_noise);
-        let bs_col = m.is_block_start;
-        let blk_col = m.block_index;
-        assert_ne!(known[bs_col].values[9], t[9][bs_col], "IS_BLOCK_START must diverge at row 9");
-        assert_ne!(known[blk_col].values[9], t[9][blk_col], "block_index must diverge at row 9");
+
+        // ---- Group G (schedule and noise-decode pinning) tampers. ----
+
+        // G1: the committed noise fields must recompose to the known packed code.
+        let mut t = rows.clone();
+        t[3][m.noise_a.exp] += F::ONE;
+        assert!(!constraints_vanish(&stark, &t, &pis), "G1 recomposition tamper undetected");
+
+        // G2: a non-boolean noise sign is rejected even when the recomposition is patched
+        // (sign 2 contributes exactly 2^16 to the code).
+        let mut t = rows.clone();
+        t[3][m.noise_b.sign] += F::TWO;
+        t[3][m.noise_code_b] += F::from_canonical_u64(1 << 16);
+        assert!(!constraints_vanish(&stark, &t, &pis), "G2 sign-booleanness tamper undetected");
+
+        // G3: IS_GROUP_FINAL raised mid-group (counter != k-1) is rejected.
+        let mut t = rows.clone();
+        t[5][m.is_group_final] = F::ONE;
+        assert!(!constraints_vanish(&stark, &t, &pis), "G3 group-final relocation undetected");
+
+        // G4: suppressing a true group boundary is rejected — the inverse witness cannot
+        // exist at `GROUP_COUNTER = k-1`.
+        let k = program.k;
+        let mut t = rows.clone();
+        t[k - 1][m.is_group_final] = F::ZERO;
+        assert!(!constraints_vanish(&stark, &t, &pis), "G4 group-final suppression undetected");
+
+        // G6: shifting the element index breaks the row counter at the splice.
+        let mut t = rows.clone();
+        for row in t.iter_mut().skip(5) {
+            row[m.element_index] += F::ONE;
+        }
+        assert!(!constraints_vanish(&stark, &t, &pis), "G6 element-index shift undetected");
+
+        // G12: dropping A-liveness on a live row (not the h*k flip row) is rejected.
+        let mut t = rows.clone();
+        t[2][m.a_live] = F::ZERO;
+        assert!(!constraints_vanish(&stark, &t, &pis), "G12 early liveness drop undetected");
 
         // ---- Group B (block-integer L2) tampers, one per constraint family. ----
         let n = rows.len();
@@ -3013,7 +3211,7 @@ mod tests {
         // B7: a forged (group-constant) frame no longer matches the attained max at the
         // group-final row — inflating the frame to shrink every TERM is rejected.
         let mut t = rows.clone();
-        for r in t.iter_mut().take(program2.k) {
+        for r in t.iter_mut().take(program.k) {
             r[m.block_l2_a.frame_doubled_scale_exponent] += F::TWO;
         }
         assert!(!constraints_vanish(&stark, &t, &pis), "B7 frame tamper undetected");

@@ -4,16 +4,19 @@ use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
-use super::columns::{GROUP_WIDTH, MATMUL_COL_MAP};
+use super::columns::{GROUP_WIDTH, MATMUL_COL_MAP, W_PUBLIC_INPUT};
 use crate::v4::circuit::ctl::Table;
 use crate::v4::circuit::luts::LutTable;
 use crate::v4::circuit::luts::ctl::LutLookup;
 use crate::v4::circuit::unpredictability::SKIP_THRESHOLD_OFFSET;
 
-/// H100 Matmul's looking side of the pair-packed operand-code channel.
+/// H100's pair-packed operand-code lookups use `BASE + CELL_STEP*32 + 2i` keys.
+/// MS11/MS12 bind the bases to the coordinate witnesses; CTL coefficients remain
+/// statement-independent. MS13/MS14 constrain canonical coordinates in the shared AIR.
 pub fn ctl_operand_codes_looking_matmul<F: Field>() -> Vec<TableWithColumns<F>> {
     let m = &MATMUL_COL_MAP;
     let byte_shift = F::from_canonical_u64(1 << 8);
+    let group_f = F::from_canonical_usize(GROUP_WIDTH);
     let not_padding = || Column::linear_combination_with_constant([(m.is_padding, -F::ONE)], F::ONE);
     let sides = [
         (m.operand_index_base_a, &m.operand_codes_a, &m.lambda_a),
@@ -26,7 +29,10 @@ pub fn ctl_operand_codes_looking_matmul<F: Field>() -> Vec<TableWithColumns<F>> 
                 TableWithColumns::new(
                     Table::Matmul.into(),
                     vec![
-                        Column::linear_combination_with_constant([(base, F::ONE)], F::from_canonical_usize(2 * i)),
+                        Column::linear_combination_with_constant(
+                            [(base, F::ONE), (m.cell_step, group_f)],
+                            F::from_canonical_usize(2 * i),
+                        ),
                         Column::linear_combination([(codes[2 * i], F::ONE), (codes[2 * i + 1], byte_shift)]),
                         Column::single(lambdas[2 * i]),
                         Column::single(lambdas[2 * i + 1]),
@@ -38,12 +44,19 @@ pub fn ctl_operand_codes_looking_matmul<F: Field>() -> Vec<TableWithColumns<F>> 
         .collect()
 }
 
-/// H100 Matmul's looked side of the result-and-census channel.
+/// H100 Matmul's looked side of the result-and-census channel: keyed on the
+/// public-input-scaled coordinate sum `W*OUT_ROW + OUT_COL` (see the B200 twin for the
+/// universality note).
 pub fn ctl_cell_results_looked_matmul<F: Field>() -> TableWithColumns<F> {
     let m = &MATMUL_COL_MAP;
     TableWithColumns::new(
         Table::Matmul.into(),
-        Column::singles([m.cell_id, m.cell_result_f32_lo, m.cell_result_f32_hi, m.cell_skips]).collect(),
+        vec![
+            Column::single_times_public_input_plus_single(m.out_row, W_PUBLIC_INPUT, m.out_col),
+            Column::single(m.cell_result_f32_lo),
+            Column::single(m.cell_result_f32_hi),
+            Column::single(m.cell_skips),
+        ],
         Filter::new(
             vec![(
                 Column::single(m.is_cell_final),
