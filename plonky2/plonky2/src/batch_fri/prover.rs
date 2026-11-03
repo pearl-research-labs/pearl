@@ -21,9 +21,40 @@ use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
 
-/// Builds a batch FRI proof.
+/// Builds a batch FRI proof, opening each initial oracle's leaf values directly from its
+/// tree (`values(i).concat()`): the layout [`BatchFriOracle`] commits to.
+///
+/// [`BatchFriOracle`]: crate::batch_fri::oracle::BatchFriOracle
 pub fn batch_fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     initial_merkle_trees: &[&BatchMerkleTree<F, C::Hasher>],
+    lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    lde_polynomial_values: &[PolynomialValues<F::Extension>],
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    timing: &mut TimingTree,
+) -> FriProof<F, C::Hasher, D> {
+    batch_fri_proof_with_openings::<F, C, D>(
+        initial_merkle_trees,
+        &|oracle_index, index| initial_merkle_trees[oracle_index].values(index).concat(),
+        lde_polynomial_coeffs,
+        lde_polynomial_values,
+        challenger,
+        fri_params,
+        timing,
+    )
+}
+
+/// Like [`batch_fri_proof`], but each query round's opened evaluations for initial oracle
+/// `o` at (height-shifted) index `i` come from `open_initial(o, i)`. Needed when an
+/// oracle's tree matrices are not its value rows (e.g. per-row digest matrices): the
+/// opened evaluations must then be assembled from the values backing the tree.
+pub fn batch_fri_proof_with_openings<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    initial_merkle_trees: &[&BatchMerkleTree<F, C::Hasher>],
+    open_initial: &(impl Fn(usize, usize) -> Vec<F> + Sync),
     lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
     lde_polynomial_values: &[PolynomialValues<F::Extension>],
     challenger: &mut Challenger<F, C::Hasher>,
@@ -75,6 +106,7 @@ pub fn batch_fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     // Query phase
     let query_round_proofs = batch_fri_prover_query_rounds::<F, C, D>(
         initial_merkle_trees,
+        open_initial,
         &trees,
         challenger,
         n,
@@ -155,6 +187,7 @@ fn batch_fri_prover_query_rounds<
     const D: usize,
 >(
     initial_merkle_trees: &[&BatchMerkleTree<F, C::Hasher>],
+    open_initial: &(impl Fn(usize, usize) -> Vec<F> + Sync),
     trees: &[MerkleTree<F, C::Hasher>],
     challenger: &mut Challenger<F, C::Hasher>,
     n: usize,
@@ -167,6 +200,7 @@ fn batch_fri_prover_query_rounds<
             let x_index = rand.to_canonical_u64() as usize % n;
             batch_fri_prover_query_round::<F, C, D>(
                 initial_merkle_trees,
+                open_initial,
                 trees,
                 x_index,
                 n,
@@ -182,6 +216,7 @@ fn batch_fri_prover_query_round<
     const D: usize,
 >(
     initial_merkle_trees: &[&BatchMerkleTree<F, C::Hasher>],
+    open_initial: &(impl Fn(usize, usize) -> Vec<F> + Sync),
     trees: &[MerkleTree<F, C::Hasher>],
     mut x_index: usize,
     n: usize,
@@ -191,7 +226,8 @@ fn batch_fri_prover_query_round<
     let mut query_steps = Vec::with_capacity(trees.len());
     let initial_proof = initial_merkle_trees
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             // Oracles whose tallest polynomial group is smaller than the tallest instance are
             // opened at the correspondingly shifted index.
             let oracle_lde_bits = t.leaf_heights[0];
@@ -200,7 +236,7 @@ fn batch_fri_prover_query_round<
                 "Oracle LDE height ({oracle_lde_bits}) exceeds the tallest FRI instance ({global_lde_bits})."
             );
             let oracle_index = x_index >> (global_lde_bits - oracle_lde_bits);
-            (t.values(oracle_index).concat(), t.open_batch(oracle_index))
+            (open_initial(i, oracle_index), t.open_batch(oracle_index))
         })
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {

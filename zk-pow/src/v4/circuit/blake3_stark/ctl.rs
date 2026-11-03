@@ -1,8 +1,10 @@
 //! CTL and LUT wiring for Blake3Stark.
 //!
 //! Int8 and scale message rows emit four keyed byte pairs from `ctl_key_base` and
-//! `uint8_data`. The jackpot load row emits 16 `blake3_msg` words. Every row checks four byte
-//! pairs, and the MoE index limbs receive unfiltered RC16 bounds.
+//! `uint8_data`. The jackpot load row emits 16 `blake3_msg` words. The CV-routing channel
+//! pairs CV fetches with the finalization rows that published them. Every row checks four
+//! byte pairs, the MoE index limbs receive unfiltered RC16 bounds, and the round block's
+//! XORs, rotations and finalization use 161 XOR8 instances ([`round_block_lookups`]).
 
 use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
@@ -11,7 +13,7 @@ use starky::lookup::{Column, Filter};
 use super::super::ctl::Table;
 use super::super::luts::LutTable;
 use super::super::luts::ctl::LutLookup;
-use super::columns::BLAKE3_COL_MAP;
+use super::columns::{B_ROTATIONS, BLAKE3_COL_MAP, half_round_lane, rotated_byte_indices};
 
 /// The shared shape of both message channels: 4 byte-pair instances per message row,
 /// `(CTL_KEY_BASE + key_stride*j, UINT8_DATA[2j] + 2^8*UINT8_DATA[2j+1])` for `j in 0..4`, under a
@@ -87,11 +89,137 @@ pub fn ctl_lottery_words_looking_blake3<F: Field>() -> Vec<TableWithColumns<F>> 
         .collect()
 }
 
+/// Fetches `(CV_IN[0..8], source row)` on `IS_CV_IN` rows.
+pub fn ctl_cv_routing_looking_blake3<F: Field>() -> TableWithColumns<F> {
+    let m = &BLAKE3_COL_MAP;
+    let mut columns: Vec<Column<F>> = Column::singles(m.cv_in).collect();
+    columns.push(Column::single(m.cv_route_key_or_tweak));
+    TableWithColumns::new(Table::Blake3.into(), columns, Filter::from_column(Column::single(m.is_cv_in)))
+}
+
+/// Publishes `(CV_OUT[0..8], TRACE_ROW_INDEX)` with multiplicity `CV_OUT_FREQ`.
+/// The row counter gives each source a unique key; CV words are packed from bytes.
+pub fn ctl_cv_routing_looked_blake3<F: Field>() -> TableWithColumns<F> {
+    let m = &BLAKE3_COL_MAP;
+    let mut columns: Vec<Column<F>> = m.cv_out.iter().map(|bytes| Column::le_bytes(bytes)).collect();
+    columns.push(Column::single(m.trace_row_index));
+    TableWithColumns::new(
+        Table::Blake3.into(),
+        columns,
+        Filter::from_column(Column::single(m.cv_out_freq)),
+    )
+}
+
+/// One XOR8 instance: keys `(x, y)`, values `(x ^ y, high, slot)` with `high = 0` in slot 0.
+fn xor8<F: Field>(x: Column<F>, y: Column<F>, z: Column<F>, high: Column<F>, slot: usize, filter: Filter<F>) -> LutLookup<F> {
+    LutLookup {
+        table: LutTable::Xor8,
+        keys: vec![x, y],
+        values: vec![z, high, Column::constant(F::from_canonical_usize(slot))],
+        filter,
+    }
+}
+
+/// Round rows check `d' = (a' ^ d).rotate_right(rot_d)` and
+/// `b' = (b ^ c').rotate_right(rot_b)`, bytewise: 4 half-rounds × 4 lanes × 8 XORs.
+/// When the next row starts a compression, 32 finalization XORs replace these checks.
+/// Initialization also checks `block_len ^ 128 = block_len + 128`, so `block_len < 128`.
+fn round_block_lookups<F: Field>() -> Vec<LutLookup<F>> {
+    let m = &BLAKE3_COL_MAP;
+    // State 4 is the next row's state 0.
+    let col = |t: usize, terms: Vec<(usize, F)>| {
+        if t == 4 {
+            Column::linear_combination_and_next_row_with_constant(vec![], terms, F::ZERO)
+        } else {
+            Column::linear_combination(terms)
+        }
+    };
+    let single = |t: usize, c: usize| col(t, vec![(c, F::ONE)]);
+    let b_byte = |t: usize, w: usize, i: usize| {
+        let (hi, lo, weight) = rotated_byte_indices(B_ROTATIONS[t], i);
+        let b = &m.round[t % 4].b[w];
+        col(
+            t,
+            vec![(b.xor_high[hi], F::ONE), (b.xor_low[lo], F::from_canonical_u64(weight))],
+        )
+    };
+    let round_filter = Filter::from_column(Column::linear_combination_and_next_row_with_constant(
+        vec![],
+        vec![(m.is_new_blake, -F::ONE)],
+        F::ONE,
+    ));
+    let final_filter = Filter::from_column(Column::single_next_row(m.is_new_blake));
+
+    let mut lookups = Vec::new();
+    for h in 0..4 {
+        let (rot_d, slot) = if h % 2 == 0 { (16, 1) } else { (8, 2) };
+        let rot_b = B_ROTATIONS[h + 1];
+        let (s_in, s_out) = (&m.round[h], &m.round[(h + 1) % 4]);
+        for i in 0..4 {
+            let (bi, ci, di, _) = half_round_lane(h, i);
+            for j in 0..4 {
+                lookups.push(xor8(
+                    single(h + 1, s_out.a[i][j]),
+                    single(h, s_in.d[di][j]),
+                    single(h + 1, s_out.d[di][(j + 4 - rot_d as usize / 8) % 4]),
+                    Column::zero(),
+                    0,
+                    round_filter.clone(),
+                ));
+                let b = &s_out.b[bi];
+                let xor_byte = col(
+                    h + 1,
+                    vec![
+                        (b.xor_low[j], F::ONE),
+                        (b.xor_high[j], F::from_canonical_u64(1 << (rot_b % 8))),
+                    ],
+                );
+                lookups.push(xor8(
+                    b_byte(h, bi, j),
+                    single(h + 1, s_out.c[ci][j]),
+                    xor_byte,
+                    single(h + 1, b.xor_high[j]),
+                    slot,
+                    round_filter.clone(),
+                ));
+            }
+        }
+    }
+    let s0 = &m.round[0];
+    for i in 0..8 {
+        for j in 0..4 {
+            let (x, y) = if i < 4 {
+                (single(0, s0.a[i][j]), single(0, s0.c[i][j]))
+            } else {
+                (b_byte(0, i - 4, j), single(0, s0.d[i - 4][j]))
+            };
+            lookups.push(xor8(
+                x,
+                y,
+                Column::single(m.cv_out[i][j]),
+                Column::zero(),
+                0,
+                final_filter.clone(),
+            ));
+        }
+    }
+    let block_len = m.round[0].d[2][0];
+    let c128 = F::from_canonical_u64(128);
+    lookups.push(xor8(
+        Column::single(block_len),
+        Column::constant(c128),
+        Column::linear_combination_with_constant([(block_len, F::ONE)], c128),
+        Column::zero(),
+        0,
+        Filter::from_column(Column::single(m.is_new_blake)),
+    ));
+    lookups
+}
+
 /// Blake3Stark's per-row LUT instance inventory: BYTES2 x4 (every message
 /// byte pair), RC16 x8 (the four 13-bit outer-index limb bounds, each as an unshifted +
-/// shifted pair, **unfiltered** — every row), RC16 x4 (the MoE order-chain limbs, unfiltered).
-/// The CV-routing lookup is *not* a LUT instance — it is in-trace with both sides in this
-/// table and lives in `Blake3Stark::lookups` (already wired and proven).
+/// shifted pair, **unfiltered** — every row), RC16 x4 (the MoE order-chain limbs, unfiltered),
+/// XOR8 x161 ([`round_block_lookups`]).
 ///
 /// The limb bounds must be unfiltered, exactly the deployed chip's unfiltered `URANGE13`
 /// lookups: constraint 6 decodes the known packed word through the limbs *unconditionally*,
@@ -145,6 +273,7 @@ pub fn blake3_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
         lookups.push(LutLookup::rc16(Column::single(limbs[0])));
         lookups.push(LutLookup::rc16(Column::single(limbs[1])));
     }
+    lookups.extend(round_block_lookups());
     lookups
 }
 
@@ -161,6 +290,7 @@ mod tests {
         assert_eq!(ctl_int8_bytes_looking_blake3::<F>().len(), 4);
         assert_eq!(ctl_block_scales_looking_blake3::<F>().len(), 4);
         assert_eq!(ctl_lottery_words_looking_blake3::<F>().len(), 16);
+        let _ = (ctl_cv_routing_looking_blake3::<F>(), ctl_cv_routing_looked_blake3::<F>());
     }
 
     #[test]
@@ -169,9 +299,41 @@ mod tests {
         let count = |t: LutTable| lookups.iter().filter(|l| l.table == t).count();
         // Documented inventory: BYTES2 x4 (byte pairs), RC16 x8 (outer-index limb bounds,
         // an unshifted + scaled pair per limb — see `blake3_lut_lookups` on aliasing),
-        // RC16 x4 (order-chain limbs).
+        // RC16 x4 (order-chain limbs), XOR8 x161 (4 half-rounds x 4 lanes x 4 bytes x
+        // 2 steps + 32 finalization bytes + the block-length bound).
         assert_eq!(count(LutTable::Bytes2), 4);
         assert_eq!(count(LutTable::Range16), 12);
-        assert_eq!(lookups.len(), 16);
+        assert_eq!(count(LutTable::Xor8), 161);
+        assert_eq!(lookups.len(), 177);
+    }
+
+    #[test]
+    fn block_length_lookup_bounds_the_byte_below_128() {
+        use plonky2::field::polynomial::PolynomialValues;
+        use plonky2::field::types::Field;
+
+        use super::super::columns::NUM_BLAKE3_COLUMNS;
+        use crate::v4::api::public_params::Device;
+        use crate::v4::circuit::ctl::lut_tables;
+        use crate::v4::circuit::luts::LutChecker;
+
+        let lookup = round_block_lookups::<F>().pop().unwrap();
+        let m = &BLAKE3_COL_MAP;
+        for (block_len, served) in [
+            (0u64, true),
+            (64, true),
+            (127, true),
+            (128, false),
+            (200, false),
+            (255, false),
+        ] {
+            // A one-row trace with only `IS_NEW_BLAKE` on: the block-length instance alone fires.
+            let mut trace = vec![PolynomialValues::new(vec![F::ZERO]); NUM_BLAKE3_COLUMNS];
+            trace[m.is_new_blake].values[0] = F::ONE;
+            trace[m.round[0].d[2][0]].values[0] = F::from_canonical_u64(block_len);
+            let mut checker = LutChecker::<F>::new(&lut_tables(Device::B200));
+            let result = checker.check_trace(core::slice::from_ref(&lookup), &trace, &[], "block_len");
+            assert_eq!(result.is_ok(), served, "block_len {block_len}: {result:?}");
+        }
     }
 }

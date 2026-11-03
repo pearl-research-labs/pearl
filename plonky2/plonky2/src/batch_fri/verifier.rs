@@ -19,11 +19,14 @@ use crate::plonk::config::{GenericConfig, Hasher};
 use crate::util::reducing::ReducingFactor;
 use crate::util::reverse_bits;
 
-/// Verifies a batch FRI proof.
+/// Verifies a batch FRI proof whose initial oracles each hold one raw leaf group per
+/// instance, in instance order — the layout [`BatchFriOracle`] commits to.
 ///
 /// `degree_bits` contains the degree (in bits, without the rate) of each FRI instance, sorted
 /// in descending order with no duplicates. `instances[i]`, `openings[i]` describe the
 /// polynomials of degree `degree_bits[i]` and their claimed openings.
+///
+/// [`BatchFriOracle`]: crate::batch_fri::oracle::BatchFriOracle
 pub fn verify_batch_fri_proof<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -34,6 +37,49 @@ pub fn verify_batch_fri_proof<
     openings: &[FriOpenings<F, D>],
     challenges: &FriChallenges<F, D>,
     initial_merkle_caps: &[MerkleCap<F, C::Hasher>],
+    proof: &FriProof<F, C::Hasher, D>,
+    params: &FriParams,
+) -> anyhow::Result<()> {
+    verify_batch_fri_proof_with_leaves::<F, C, D>(
+        degree_bits,
+        instances,
+        openings,
+        challenges,
+        initial_merkle_caps,
+        &|oracle, evals| {
+            let mut start = 0;
+            let mut leaves = Vec::new();
+            let mut heights = Vec::new();
+            for (inst, &db) in instances.iter().zip(degree_bits) {
+                let len = inst.oracles[oracle].num_polys;
+                if len > 0 {
+                    leaves.push(evals[start..start + len].to_vec());
+                    heights.push(db + params.config.rate_bits);
+                    start += len;
+                }
+            }
+            (leaves, heights)
+        },
+        proof,
+        params,
+    )
+}
+
+/// Verifies a batch FRI proof using `initial_leaves(oracle, evals)` to reconstruct
+/// the committed leaf groups and their LDE heights. The callback is verifier-owned:
+/// it must bind every evaluation once in the oracle's prescribed tree order.
+/// FRI combination continues to read the flat evaluations in polynomial order.
+pub fn verify_batch_fri_proof_with_leaves<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    degree_bits: &[usize],
+    instances: &[FriInstanceInfo<F, D>],
+    openings: &[FriOpenings<F, D>],
+    challenges: &FriChallenges<F, D>,
+    initial_merkle_caps: &[MerkleCap<F, C::Hasher>],
+    initial_leaves: &impl Fn(usize, &[F]) -> (Vec<Vec<F>>, Vec<usize>),
     proof: &FriProof<F, C::Hasher, D>,
     params: &FriParams,
 ) -> anyhow::Result<()> {
@@ -83,6 +129,7 @@ pub fn verify_batch_fri_proof<
             &reduced_openings,
             &alpha_pows,
             initial_merkle_caps,
+            initial_leaves,
             proof,
             x_index,
             round_proof,
@@ -94,43 +141,30 @@ pub fn verify_batch_fri_proof<
 }
 
 fn batch_fri_verify_initial_proof<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize>(
-    lde_bits: &[usize],
-    instances: &[FriInstanceInfo<F, D>],
+    global_lde_bits: usize,
+    initial_leaves: &impl Fn(usize, &[F]) -> (Vec<Vec<F>>, Vec<usize>),
     x_index: usize,
     proof: &FriInitialTreeProof<F, H>,
     initial_merkle_caps: &[MerkleCap<F, H>],
 ) -> anyhow::Result<()> {
+    ensure!(
+        proof.evals_proofs.len() == initial_merkle_caps.len(),
+        "Initial Merkle cap count does not match the oracles."
+    );
     for (oracle_index, ((evals, merkle_proof), cap)) in proof
         .evals_proofs
         .iter()
         .zip(initial_merkle_caps)
         .enumerate()
     {
-        // Reconstruct this oracle's leaf groups, skipping instances where the oracle holds no
-        // polynomials: such heights are absent from the oracle's batch Merkle tree.
-        let mut leaves = Vec::new();
-        let mut heights = Vec::new();
-        let mut leaf_index = 0;
-        for (inst, &height) in instances.iter().zip(lde_bits) {
-            let num_polys = inst.oracles[oracle_index].num_polys;
-            if num_polys == 0 {
-                continue;
-            }
-            leaves.push(evals[leaf_index..leaf_index + num_polys].to_vec());
-            heights.push(height);
-            leaf_index += num_polys;
-        }
-        ensure!(
-            leaf_index == evals.len(),
-            "Initial evals length does not match the instances."
-        );
-        ensure!(
-            !leaves.is_empty(),
-            "Oracle {oracle_index} holds no polynomials."
-        );
+        let (leaves, heights) = initial_leaves(oracle_index, evals);
+        ensure!(!leaves.is_empty() && leaves.len() == heights.len());
+        ensure!(heights.windows(2).all(|w| w[0] >= w[1]));
+        ensure!(heights[0] <= global_lde_bits);
+        ensure!(heights[0] == merkle_proof.siblings.len() + cap.height());
         // Oracles whose tallest group is smaller than the tallest instance are opened at the
         // correspondingly shifted index.
-        let oracle_x_index = x_index >> (lde_bits[0] - heights[0]);
+        let oracle_x_index = x_index >> (global_lde_bits - heights[0]);
 
         verify_batch_merkle_proof_to_cap::<F, H>(
             &leaves,
@@ -202,14 +236,15 @@ fn batch_fri_verifier_query_round<
     reduced_openings: &[F::Extension],
     alpha_pows: &[F::Extension],
     initial_merkle_caps: &[MerkleCap<F, C::Hasher>],
+    initial_leaves: &impl Fn(usize, &[F]) -> (Vec<Vec<F>>, Vec<usize>),
     proof: &FriProof<F, C::Hasher, D>,
     mut x_index: usize,
     round_proof: &FriQueryRound<F, C::Hasher, D>,
     params: &FriParams,
 ) -> anyhow::Result<()> {
     batch_fri_verify_initial_proof::<F, C::Hasher, D>(
-        lde_bits,
-        instances,
+        lde_bits[0],
+        initial_leaves,
         x_index,
         &round_proof.initial_trees_proof,
         initial_merkle_caps,

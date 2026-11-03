@@ -14,23 +14,43 @@
 
 use crate::v4::circuit::columns_view::columns_view;
 
-/// One tracked BLAKE3 state (16 words `v[0..16]`), in the deployed chip's representation
-/// (`chip/blake3/blake3_air.rs`): words 0..4 and 8..12 packed as u32 field elements, words 4..8
-/// and 12..16 as 32 little-endian bits each — the bit halves are exactly the words the
-/// G-function XOR/rotate steps consume, so no extra decompositions are needed.
-///
-/// 4 + 128 + 4 + 128 = 264 columns per state.
+/// State `v = [a, b, c, d]`: four words per group, 80 columns total.
+/// `a`, `c`, and `d` use little-endian bytes; `b` uses split XOR bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct Blake3StateCols<T: Copy> {
-    /// State words `v[0..4]`, packed u32.
-    pub row1: [T; 4],
-    /// State words `v[4..8]`, 32 LE bits each.
-    pub row2: [[T; 32]; 4],
-    /// State words `v[8..12]`, packed u32.
-    pub row3: [T; 4],
-    /// State words `v[12..16]`, 32 LE bits each.
-    pub row4: [[T; 32]; 4],
+    pub a: [[T; 4]; 4],
+    pub b: [WordFragments<T>; 4],
+    pub c: [[T; 4]; 4],
+    pub d: [[T; 4]; 4],
+}
+
+/// Stores `w = z.rotate_right(r)` for `r in {7, 12}`. With `s = r % 8`,
+/// `z[j] = xor_low[j] + 2^s * xor_high[j]`. XOR8 binds both `z[j]` and
+/// `xor_high[j] = z[j] >> s`, which also bounds `xor_low[j] < 2^s`.
+#[repr(C)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub struct WordFragments<T: Copy> {
+    pub xor_low: [T; 4],
+    pub xor_high: [T; 4],
+}
+
+/// `b`'s rotation at each state: row input, three intermediates, next row input.
+pub const B_ROTATIONS: [u32; 5] = [7, 12, 7, 12, 7];
+
+/// Byte `i` of `z.rotate_right(r)` is `xor_high[hi] + weight * xor_low[lo]`.
+/// Returns `(hi, lo, weight)`; `r` is 7 or 12.
+pub const fn rotated_byte_indices(r: u32, i: usize) -> (usize, usize, u64) {
+    let hi = (i + r as usize / 8) % 4;
+    (hi, (hi + 1) % 4, 1 << (8 - r % 8))
+}
+
+/// Lane `i` of half-round `h` mixes `(v[i], v[4 + bi], v[8 + ci], v[12 + di])` with message
+/// word `m`: columns (`h < 2`, offset 0) or diagonals (`h >= 2`, offset 1). Returns
+/// `(bi, ci, di, m)`.
+pub const fn half_round_lane(h: usize, i: usize) -> (usize, usize, usize, usize) {
+    let o = h / 2;
+    ((i + o) % 4, (i + 2 * o) % 4, (i + 3 * o) % 4, 8 * o + 2 * i + h % 2)
 }
 
 /// Columns per tracked state.
@@ -54,7 +74,7 @@ pub const NUM_UINT8: usize = 8;
 pub const NUM_UNPACK_FLAGS: usize = 25;
 
 /// View of one Blake3Stark trace row: control unpacking, routing-index limbs, row counter,
-/// streamed bytes, message buffer/schedule, CV selection/routing, four 264-column tracked
+/// streamed bytes, message buffer/schedule, CV selection/routing, four 80-column tracked
 /// states, verifier-known schedule columns, and public-root selectors. Constraint numbers
 /// 1..7 refer to `super::stark`'s constraint groups.
 #[repr(C)]
@@ -234,14 +254,12 @@ pub struct Blake3ColumnsView<T: Copy> {
     /// The CV entering the compression: one-hot mux of `KEY_A` / `KEY_B` / `JACKPOT_KEY`
     /// / `CV_IN` (constraint 3, the deployed mux plus the per-side key sources).
     pub blake3_cv: [T; 8],
-    /// The deployed round block: 4 tracked states of the G-function cascade (constraint 1);
-    /// `round[0]` is the row's input state (= the init state on `IS_NEW_BLAKE` rows).
+    /// Input state and three intermediates. The fourth half-round ends at the next row's input.
     pub round: [Blake3StateCols<T>; NUM_TRACKED_STATES],
-    /// The 8 output CV words: on finalization rows the compression output
-    /// (`v[i] ^ v[8+i]`), on other rows the same XOR expression over that row's tracked states
-    /// (published into the routing lookup with multiplicity 0).
-    pub cv_out: [T; 8],
-    /// Witness multiplicity of this row's `CV_OUT` in the CV-routing lookup (how many later
+    /// Eight output CV words in LE bytes. Finalization XOR8 checks `v[i] ^ v[8+i]`;
+    /// unused on round rows. Published with multiplicity `cv_out_freq`.
+    pub cv_out: [[T; 4]; 8],
+    /// Witness multiplicity of this row's `CV_OUT` in the CV-routing channel (how many later
     /// rows fetch it); nonzero only on finalization rows of consumed compressions.
     pub cv_out_freq: T,
 }
@@ -249,9 +267,9 @@ pub struct Blake3ColumnsView<T: Copy> {
 /// Total number of committed Blake3Stark columns.
 pub const NUM_BLAKE3_COLUMNS: usize = size_of::<Blake3ColumnsView<u8>>();
 
-// Committed-column count: 1164 (1156 main + 8 class (a)).
-const _: () = assert!(NUM_BLAKE3_COLUMNS == 1164);
-const _: () = assert!(BLAKE3_STATE_WIDTH == 264);
+// Committed-column count: 452 (444 main + 8 class (a)).
+const _: () = assert!(NUM_BLAKE3_COLUMNS == 452);
+const _: () = assert!(BLAKE3_STATE_WIDTH == 80);
 
 /// Public inputs of Blake3Stark, 8 u32 limbs each, in LE word order of the native 32-byte
 /// digests. `HASH_A`/`HASH_B` are the per-side aggregate commitment digests: an in-AIR
@@ -340,11 +358,30 @@ mod tests {
             assert_eq!(c, NUM_BLAKE3_KNOWN_COLUMNS + j, "unpack flag {j} not at its packing position");
         }
         assert_eq!(BLAKE3_COL_MAP.cv_out_freq, NUM_BLAKE3_COLUMNS - 1);
-        // The round block is 4 * 264 = 1056 contiguous columns.
+        // The round block is 4 * 80 = 320 contiguous columns.
         assert_eq!(
-            BLAKE3_COL_MAP.round[0].row1[0] + 4 * BLAKE3_STATE_WIDTH,
-            BLAKE3_COL_MAP.cv_out[0]
+            BLAKE3_COL_MAP.round[0].a[0][0] + 4 * BLAKE3_STATE_WIDTH,
+            BLAKE3_COL_MAP.cv_out[0][0]
         );
+    }
+
+    #[test]
+    fn fragment_bytes_rotate() {
+        // Reassemble the rotated bytes and compare with the native u32 rotation.
+        for rot in [12, 7] {
+            for z in [0u32, 1, 0xB3779AC2, 0x01234567, 0xFFFFFFFF, 0x80000001] {
+                let (mut low, mut high) = ([0u64; 4], [0u64; 4]);
+                for (j, byte) in z.to_le_bytes().into_iter().enumerate() {
+                    low[j] = u64::from(byte) & ((1 << (rot % 8)) - 1);
+                    high[j] = u64::from(byte) >> (rot % 8);
+                }
+                let rotated = u32::from_le_bytes(core::array::from_fn(|i| {
+                    let (hi, lo, weight) = rotated_byte_indices(rot, i);
+                    (high[hi] + weight * low[lo]) as u8
+                }));
+                assert_eq!(rotated, z.rotate_right(rot), "{rot:?} {z:#010x}");
+            }
+        }
     }
 
     #[test]
@@ -356,7 +393,10 @@ mod tests {
         let view: Blake3ColumnsView<u64> = arr.into();
         assert_eq!(view.row_flags_packed, 1);
         assert_eq!(view.uint8_data[0], BLAKE3_COL_MAP.uint8_data[0] as u64 * 3 + 1);
-        assert_eq!(view.round[2].row2[1][7], BLAKE3_COL_MAP.round[2].row2[1][7] as u64 * 3 + 1);
+        assert_eq!(
+            view.round[2].b[1].xor_high[3],
+            BLAKE3_COL_MAP.round[2].b[1].xor_high[3] as u64 * 3 + 1
+        );
         assert_eq!(view.cv_out_freq, (NUM_BLAKE3_COLUMNS as u64 - 1) * 3 + 1);
         let back: [u64; NUM_BLAKE3_COLUMNS] = view.into();
         assert_eq!(back, arr);

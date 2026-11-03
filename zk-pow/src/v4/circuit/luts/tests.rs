@@ -61,6 +61,7 @@ fn shapes_match_the_documented_layout_and_the_consumer_arities() {
         let arity = match table {
             LutTable::Range16 => 0,
             LutTable::Bytes2 | LutTable::Pair128 | LutTable::Width32 | LutTable::Width16 => 2,
+            LutTable::Xor8 => 3,
             LutTable::Int8Dec | LutTable::RneRnd => 4,
             LutTable::B200Align => 5,
             _ => 1,
@@ -104,6 +105,7 @@ fn heights_descend_and_widths_match_the_documented_layout() {
     assert_eq!(widths[&LutTable::RneRnd], (76, 102));
     assert_eq!(widths[&LutTable::Range16], (1, 2));
     assert_eq!(widths[&LutTable::Bytes2], (2, 3));
+    assert_eq!(widths[&LutTable::Xor8], (5, 8));
     assert_eq!(widths[&LutTable::B200Align], (12, 84));
     assert_eq!(widths[&LutTable::Int8Dec], (5, 6));
     assert_eq!(widths[&LutTable::Pow2Gb], (2, 3));
@@ -126,6 +128,17 @@ fn small_tables_match_their_closed_forms() {
     for i in 0..1 << 14 {
         assert_eq!(to_u64(pair128[0][i]), (i as u64) & 0x7F);
         assert_eq!(to_u64(pair128[1][i]), (i as u64) >> 7);
+    }
+    // XOR8: every byte pair, in all three slots, against the native `^`.
+    for slot in 0..num_slots(LutTable::Xor8) {
+        let xor8 = generate::<F>(LutTable::Xor8, slot);
+        for i in 0..1usize << 16 {
+            let z = ((i as u64) & 0xFF) ^ ((i as u64) >> 8);
+            let high = [0, z >> 4, z >> 7][slot];
+            assert_eq!(to_u64(xor8[0][i]), z, "x ^ y at key {i:#06x}");
+            assert_eq!(to_u64(xor8[1][i]), high, "slot {slot} fragment at key {i:#06x}");
+            assert_eq!(to_u64(xor8[2][i]), slot as u64);
+        }
     }
     let expinfo = generate::<F>(LutTable::ExpInfo, 0);
     assert_eq!(to_u64(expinfo[0][0]), 1);
@@ -471,8 +484,10 @@ fn precommitted_blocks_match_the_generators() {
 
         // Key column(s): the enumerated tuple, the shifted ramp, or the (saturated) ramp.
         match table {
-            LutTable::Bytes2 | LutTable::Pair128 => {
-                let stored = generate::<F>(table, 0);
+            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 => {
+                // XOR8's key tuple is BYTES2's enumeration.
+                let key_table = if table == LutTable::Xor8 { LutTable::Bytes2 } else { table };
+                let stored = generate::<F>(key_table, 0);
                 assert_eq!(block[0], stored[0], "{table:?} key tuple low");
                 assert_eq!(block[1], stored[1], "{table:?} key tuple high");
             }
@@ -502,11 +517,10 @@ fn precommitted_blocks_match_the_generators() {
             // Every exposed key resolves to an entry with the same tuple, including duplicate padding keys.
             let looked = layout.looked_columns();
             for row in 0..height {
-                let keys: Vec<_> = looked[..layout.key_columns.len()]
-                    .iter()
-                    .map(|key| to_u64(key.eval_table(&block, row, &[])))
-                    .collect();
-                let (resolved_slot, resolved_row) = LutMultiplicities::resolve(table, &keys).unwrap();
+                let (key_exprs, value_exprs) = looked.split_at(layout.key_columns.len());
+                let keys: Vec<_> = key_exprs.iter().map(|key| to_u64(key.eval_table(&block, row, &[]))).collect();
+                let values: Vec<_> = value_exprs.iter().map(|v| to_u64(v.eval_table(&block, row, &[]))).collect();
+                let (resolved_slot, resolved_row) = LutMultiplicities::resolve(table, &keys, &values).unwrap();
                 assert_eq!(resolved_slot, slot);
                 for (entry, canonical) in looked.iter().zip(&looked) {
                     assert_eq!(
@@ -546,6 +560,7 @@ fn stark_types_and_ctl_halves_are_consistent() {
     // The aliases pin the widths the `Stark` trait needs at compile time.
     assert_eq!(<RneRndStark<F, 2> as Stark<F, 2>>::COLUMNS, 102);
     assert_eq!(<Range16Stark<F, 2> as Stark<F, 2>>::COLUMNS, 2);
+    assert_eq!(<Xor8Stark<F, 2> as Stark<F, 2>>::COLUMNS, 8);
     assert_eq!(<ProdAlign15Stark<F, 2> as Stark<F, 2>>::COLUMNS, 71);
     assert_eq!(<WidthNormStark<F, 2> as Stark<F, 2>>::COLUMNS, 23);
     assert_eq!(<Pow2GStark<F, 2> as Stark<F, 2>>::COLUMNS, 12);
@@ -583,12 +598,13 @@ fn lut_ctls_assemble_from_inventories() {
     let tables = b200_tables();
     let dummy = |table: LutTable| -> LutLookup<F> {
         let keys = match table {
-            LutTable::Bytes2 | LutTable::Pair128 => vec![Column::single(0), Column::single(1)],
+            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 => vec![Column::single(0), Column::single(1)],
             _ => vec![Column::single(0)],
         };
         let values = (0..match table {
             LutTable::Range16 | LutTable::Bytes2 | LutTable::Pair128 => 0,
             LutTable::Width32 | LutTable::Width16 => 2,
+            LutTable::Xor8 => 3,
             LutTable::Int8Dec | LutTable::RneRnd => 4,
             LutTable::B200Align => 5,
             _ => 1,
@@ -621,20 +637,37 @@ fn lut_ctls_assemble_from_inventories() {
 fn multiplicities_resolve_add_and_land_in_table_columns() {
     let tables = b200_tables();
     let mut mults = LutMultiplicities::new(&tables);
-    mults.add(LutTable::Range16, &[0xFFFF], 2).unwrap();
-    mults.add(LutTable::RneRnd, &[(5 << 17) + 123], 1).unwrap();
-    mults.add(LutTable::Pair128, &[127, 127], 3).unwrap();
-    mults.add(LutTable::Pow2Gb, &[63], 4).unwrap();
+    mults.add(LutTable::Range16, &[0xFFFF], &[], 2).unwrap();
+    mults.add(LutTable::RneRnd, &[(5 << 17) + 123], &[], 1).unwrap();
+    mults.add(LutTable::Pair128, &[127, 127], &[], 3).unwrap();
+    mults.add(LutTable::Pow2Gb, &[63], &[], 4).unwrap();
+    // XOR8's slot comes from the bound tag: (0xF0 ^ 0x0F, (0xF0 ^ 0x0F) >> 4, slot 1).
+    mults.add(LutTable::Xor8, &[0xF0, 0x0F], &[0xFF, 0x0F, 1], 5).unwrap();
     // Out-of-domain tuples must be rejected, not folded into some other row.
-    assert!(mults.add(LutTable::Range16, &[1 << 16], 1).is_err());
+    assert!(mults.add(LutTable::Range16, &[1 << 16], &[], 1).is_err());
     assert!(
-        mults.add(LutTable::Bytes2, &[300, 0], 1).is_err(),
+        mults.add(LutTable::Bytes2, &[300, 0], &[], 1).is_err(),
         "oversized tuple component"
     );
-    assert!(mults.add(LutTable::RneRnd, &[26 << 17], 1).is_err(), "RNERND has no slot 26");
-    assert!(mults.add(LutTable::ExpInfo, &[255], 1).is_err(), "inf/NaN field has no row");
-    assert!(mults.add(LutTable::Pair128, &[128, 0], 1).is_err());
-    assert!(mults.add(LutTable::Bytes2, &[7], 1).is_err(), "missing tuple component");
+    assert!(
+        mults.add(LutTable::RneRnd, &[26 << 17], &[], 1).is_err(),
+        "RNERND has no slot 26"
+    );
+    assert!(
+        mults.add(LutTable::ExpInfo, &[255], &[], 1).is_err(),
+        "inf/NaN field has no row"
+    );
+    assert!(mults.add(LutTable::Pair128, &[128, 0], &[], 1).is_err());
+    assert!(mults.add(LutTable::Bytes2, &[7], &[], 1).is_err(), "missing tuple component");
+    assert!(
+        mults.add(LutTable::Xor8, &[300, 0], &[300, 0, 0], 1).is_err(),
+        "oversized XOR8 byte"
+    );
+    assert!(
+        mults.add(LutTable::Xor8, &[1, 2], &[3, 0, 3], 1).is_err(),
+        "XOR8 has no slot 3"
+    );
+    assert!(mults.add(LutTable::Xor8, &[1, 2], &[3], 1).is_err(), "missing XOR8 tag");
 
     assert_eq!(mults.table_total(LutTable::Range16), 2);
     assert_eq!(mults.table_total(LutTable::RneRnd), 1);
@@ -648,6 +681,8 @@ fn multiplicities_resolve_add_and_land_in_table_columns() {
     assert_eq!(rnernd.iter().flatten().map(|&x| to_u64(x)).sum::<u64>(), 1);
     assert_eq!(to_u64(mults.table_columns::<F>(LutTable::Range16)[0][0xFFFF]), 2);
     assert_eq!(to_u64(mults.table_columns::<F>(LutTable::Pair128)[0][(127 << 7) + 127]), 3);
+    assert_eq!(to_u64(mults.table_columns::<F>(LutTable::Xor8)[1][0xF0 + (0x0F << 8)]), 5);
+    assert_eq!(mults.table_total(LutTable::Xor8), 5);
 
     // `lut_trace` appends the multiplicities after the precommitted block.
     let trace = lut_trace::<F>(LutTable::Pow2Gb, mults.table_columns(LutTable::Pow2Gb));
@@ -664,20 +699,20 @@ fn multiplicities_resolve_the_matmul_backend_tables() {
     let tables = b200_tables();
     let mut mults = LutMultiplicities::new(&tables);
     // B200ALIGN folds at 2^16 into 72 slots.
-    mults.add(LutTable::B200Align, &[(71 << 16) + 0x1234], 2).unwrap();
+    mults.add(LutTable::B200Align, &[(71 << 16) + 0x1234], &[], 2).unwrap();
     assert!(
-        mults.add(LutTable::B200Align, &[72 << 16], 1).is_err(),
+        mults.add(LutTable::B200Align, &[72 << 16], &[], 1).is_err(),
         "B200ALIGN has no slot 72 (negative rel-shifts must stay unservable)"
     );
     // POW2GB is a plain [0, 63] key domain.
-    mults.add(LutTable::Pow2Gb, &[63], 1).unwrap();
-    assert!(mults.add(LutTable::Pow2Gb, &[64], 1).is_err());
+    mults.add(LutTable::Pow2Gb, &[63], &[], 1).unwrap();
+    assert!(mults.add(LutTable::Pow2Gb, &[64], &[], 1).is_err());
     // WIDTH32's shifted ramp: keys [1, 32] land on rows [0, 31]; keys 0 and 33 have no
     // row (a zero-width claim cannot be served).
-    mults.add(LutTable::Width32, &[1], 1).unwrap();
-    mults.add(LutTable::Width32, &[32], 5).unwrap();
-    assert!(mults.add(LutTable::Width32, &[0], 1).is_err(), "no zero-width row");
-    assert!(mults.add(LutTable::Width32, &[33], 1).is_err());
+    mults.add(LutTable::Width32, &[1], &[], 1).unwrap();
+    mults.add(LutTable::Width32, &[32], &[], 5).unwrap();
+    assert!(mults.add(LutTable::Width32, &[0], &[], 1).is_err(), "no zero-width row");
+    assert!(mults.add(LutTable::Width32, &[33], &[], 1).is_err());
 
     assert_eq!(to_u64(mults.table_columns::<F>(LutTable::B200Align)[71][0x1234]), 2);
     assert_eq!(to_u64(mults.table_columns::<F>(LutTable::Width32)[0][0]), 1);
@@ -689,13 +724,13 @@ fn multiplicities_resolve_the_matmul_backend_tables() {
 fn multiplicities_resolve_the_hopper_backend_tables() {
     let tables = h100_tables();
     let mut mults = LutMultiplicities::new(&tables);
-    mults.add(LutTable::ProdAlign15, &[(58 << 16) + 0x1234], 2).unwrap();
-    mults.add(LutTable::WidthNorm, &[(15 << 16) + 0xFFFF], 3).unwrap();
-    mults.add(LutTable::Pow2G, &[63], 1).unwrap();
-    mults.add(LutTable::Pow2G, &[128 + 25], 4).unwrap();
-    assert!(mults.add(LutTable::ProdAlign15, &[59 << 16], 1).is_err());
-    assert!(mults.add(LutTable::WidthNorm, &[16 << 16], 1).is_err());
-    assert!(mults.add(LutTable::Pow2G, &[218], 1).is_err());
+    mults.add(LutTable::ProdAlign15, &[(58 << 16) + 0x1234], &[], 2).unwrap();
+    mults.add(LutTable::WidthNorm, &[(15 << 16) + 0xFFFF], &[], 3).unwrap();
+    mults.add(LutTable::Pow2G, &[63], &[], 1).unwrap();
+    mults.add(LutTable::Pow2G, &[128 + 25], &[], 4).unwrap();
+    assert!(mults.add(LutTable::ProdAlign15, &[59 << 16], &[], 1).is_err());
+    assert!(mults.add(LutTable::WidthNorm, &[16 << 16], &[], 1).is_err());
+    assert!(mults.add(LutTable::Pow2G, &[218], &[], 1).is_err());
     assert_eq!(to_u64(mults.table_columns::<F>(LutTable::ProdAlign15)[58][0x1234]), 2);
     assert_eq!(to_u64(mults.table_columns::<F>(LutTable::WidthNorm)[15][0xFFFF]), 3);
     assert_eq!(to_u64(mults.table_columns::<F>(LutTable::Pow2G)[1][25]), 4);
@@ -782,7 +817,7 @@ fn checker_serves_honest_instances_and_rejects_forged_values() {
 
 #[test]
 fn preprocessed_inputs_place_the_tables_at_their_batch_positions() {
-    // The fp8 arrangement: the fifteen LUTs right after the five main tables.
+    // The fp8 arrangement: the sixteen LUTs right after the five main tables.
     let positions: [usize; NUM_LUT_TABLES] = core::array::from_fn(|i| NUM_TABLES + i);
     let tables = b200_tables();
     let (values, columns) = lut_preprocessed_inputs::<F>(NUM_TABLES + NUM_LUT_TABLES, positions, &tables);
@@ -867,6 +902,6 @@ fn pow2g_tags_exclude_other_operations_and_out_of_domain_keys() {
     assert!(!entries.contains(&(0, 1, 2)), "negative gap aliased carry alignment");
     assert!(!entries.contains(&(280, 1, 0)), "oversized carry gap aliased normalization");
     for key in [64, 127, 218, 256, 306, u64::MAX] {
-        assert!(LutMultiplicities::resolve(table, &[key]).is_err(), "invalid key {key}");
+        assert!(LutMultiplicities::resolve(table, &[key], &[]).is_err(), "invalid key {key}");
     }
 }

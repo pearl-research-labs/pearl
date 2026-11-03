@@ -1,5 +1,7 @@
 #[cfg(not(feature = "std"))]
-use alloc::{format, vec::Vec};
+use alloc::{format, vec, vec::Vec};
+
+use core::ops::Range;
 
 use itertools::Itertools;
 use plonky2_field::extension::Extendable;
@@ -11,7 +13,7 @@ use plonky2_maybe_rayon::*;
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 
 use crate::batch_fri::batch_alpha_runs;
-use crate::batch_fri::prover::batch_fri_proof;
+use crate::batch_fri::prover::batch_fri_proof_with_openings;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::FriProof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
@@ -19,7 +21,7 @@ use crate::fri::FriParams;
 use crate::hash::batch_merkle_tree::BatchMerkleTree;
 use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
@@ -36,6 +38,9 @@ pub struct BatchFriOracle<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     pub degree_bits: Vec<usize>,
     pub rate_bits: usize,
     pub blinding: bool,
+    // Digest trees retain raw rows for quotient evaluation and FRI openings.
+    row_values: Vec<Vec<Vec<F>>>,
+    leaf_ranges: Vec<Range<usize>>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -123,7 +128,97 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             degree_bits,
             rate_bits,
             blinding,
+            row_values: Vec::new(),
+            leaf_ranges: Vec::new(),
         }
+    }
+
+    /// Commits one digest matrix per table. `ranges` partition `polynomials` in
+    /// table order; each range has a fixed width and a single polynomial degree.
+    /// The tree sorts matrices by height, preserving table order at ties.
+    pub fn from_coeffs_with_digests(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        mut ranges: Vec<Range<usize>>,
+        rate_bits: usize,
+        cap_height: usize,
+        timing: &mut TimingTree,
+    ) -> Self {
+        let mut end = 0;
+        for range in &ranges {
+            assert_eq!(range.start, end);
+            assert!(!range.is_empty());
+            assert!(range.end <= polynomials.len());
+            let degree = polynomials[range.start].len();
+            assert!(polynomials[range.clone()].iter().all(|p| p.len() == degree));
+            end = range.end;
+        }
+        assert_eq!(end, polynomials.len());
+        ranges.sort_by_key(|r| (core::cmp::Reverse(polynomials[r.start].len()), r.start));
+        let degree_bits: Vec<_> = ranges
+            .iter()
+            .map(|r| log2_strict(polynomials[r.start].len()))
+            .collect();
+        let row_values: Vec<_> = ranges
+            .iter()
+            .map(|range| {
+                let lde = timed!(
+                    timing,
+                    "FFT",
+                    PolynomialBatch::<F, C, D>::lde_values(
+                        &polynomials[range.clone()],
+                        rate_bits,
+                        false,
+                        None,
+                    )
+                );
+                let mut rows = transpose(&lde);
+                reverse_index_bits_in_place(&mut rows);
+                rows
+            })
+            .collect();
+        let leaves = row_values
+            .iter()
+            .map(|rows| {
+                rows.par_iter()
+                    .map(|row| C::Hasher::hash_no_pad(row).to_vec())
+                    .collect()
+            })
+            .collect();
+        let batch_merkle_tree = timed!(
+            timing,
+            "build digest Merkle tree",
+            BatchMerkleTree::new(leaves, cap_height)
+        );
+        Self {
+            polynomials,
+            batch_merkle_tree,
+            degree_bits,
+            rate_bits,
+            blinding: false,
+            row_values,
+            leaf_ranges: ranges,
+        }
+    }
+
+    /// Flat opened evaluations in polynomial order, even when tree order differs.
+    pub fn open_values(&self, index: usize) -> Vec<F> {
+        if self.row_values.is_empty() {
+            return self.batch_merkle_tree.values(index).concat();
+        }
+        let mut values = vec![F::ZERO; self.polynomials.len()];
+        for (i, range) in self.leaf_ranges.iter().enumerate() {
+            let row = index >> (self.degree_bits[0] - self.degree_bits[i]);
+            values[range.clone()].copy_from_slice(&self.row_values[i][row]);
+        }
+        values
+    }
+
+    /// Tree group containing the polynomial at flat index `start`.
+    pub fn digest_leaf_index(&self, start: usize) -> usize {
+        self.leaf_ranges
+            .iter()
+            .position(|range| range.start == start)
+            .expect("a table starts at a digest leaf range")
     }
 
     /// Produces a batch opening proof.
@@ -193,11 +288,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             final_lde_polynomial_values.push(lde_final_values);
         }
 
-        batch_fri_proof::<F, C, D>(
+        batch_fri_proof_with_openings::<F, C, D>(
             &oracles
                 .iter()
                 .map(|o| &o.batch_merkle_tree)
                 .collect::<Vec<_>>(),
+            &|oracle, index| oracles[oracle].open_values(index),
             final_lde_polynomial_coeff[0].clone(),
             &final_lde_polynomial_values,
             challenger,
@@ -217,7 +313,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> &[F] {
         let index = index * step;
         let index = reverse_bits(index, self.degree_bits[degree_bits_index] + self.rate_bits);
-        let slice = &self.batch_merkle_tree.leaves[degree_bits_index][index];
+        let rows = if self.row_values.is_empty() {
+            &self.batch_merkle_tree.leaves
+        } else {
+            &self.row_values
+        };
+        let slice = &rows[degree_bits_index][index];
         &slice[slice_start..slice_start + slice_len]
     }
 
