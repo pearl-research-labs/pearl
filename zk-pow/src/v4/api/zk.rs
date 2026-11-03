@@ -279,12 +279,8 @@ impl Fp8Verifier {
         proof_data: &[u8],
         share_nbits: u32,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
         let statement = validate_public_statement(proposed_header, ancestor_chain, public_data, share_nbits)?;
-        println!("statement validation in {:.2} ms", start.elapsed().as_millis());
-        let start = std::time::Instant::now();
         let job = Fp8Job::derive(&statement, proposed_header)?;
-        println!("job derivation in {:.2} ms", start.elapsed().as_millis());
         self.verify_derived(&job, proof_data)
     }
 
@@ -838,15 +834,9 @@ fn verify_fp8_block_wrapped(
     nbits_override: Option<u32>,
 ) -> Result<()> {
     let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-    let start = std::time::Instant::now();
     check_public_jackpot(public_params, nbits)?;
-    println!("public jackpot check in {:.2} ms", start.elapsed().as_millis());
-    let start = std::time::Instant::now();
     let job = Fp8Job::derive(public_params, proposed_header)?;
-    println!("job derivation in {:.2} ms", start.elapsed().as_millis());
-    let start = std::time::Instant::now();
     let expected = job.expected_public_inputs();
-    println!("expected public inputs in {:.2} ms", start.elapsed().as_millis());
     verify_wrapped_proof(
         &job.system,
         &verifier.circuit,
