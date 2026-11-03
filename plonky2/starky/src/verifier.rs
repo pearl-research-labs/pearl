@@ -46,6 +46,23 @@ pub struct PreprocessedData<F: Field> {
     pub columns: Vec<PolynomialValues<F>>,
 }
 
+/// `len` terms `start * step^i`, in `len - 1` multiplications.
+fn successive_powers<F: Field>(start: F, step: F, len: usize) -> Vec<F> {
+    let mut powers = vec![start; len];
+    for i in 1..len {
+        powers[i] = powers[i - 1] * step;
+    }
+    powers
+}
+
+/// One barycentric term: `(s1, s2) += (weight * y, weight * y * omega)`.
+#[inline(always)]
+fn accumulate_barycentric<F: Field>(sum: &mut (F, F), weight: F, y: F, omega: F) {
+    let term = weight * y;
+    sum.0 += term;
+    sum.1 = sum.1.multiply_accumulate(term, omega);
+}
+
 /// Evaluate multiple polynomials (given as evaluations on an n-th roots-of-unity subgroup)
 /// at an extension-field point, using O(n) subgroup-specialized barycentric interpolation.
 ///
@@ -98,21 +115,25 @@ fn eval_columns_at_point_impl<F: RichField + Extendable<D>, const D: usize, cons
     // Precompute W*b^2 once (base field).
     let wb2 = w * b.square();
 
-    // Pass 1: build norms denom_i = (a - omega^i)^2 - W*b^2 (base field), then batch-invert.
-    // Split into chunks for parallel inversion.
     const PARALLEL_CHUNK_SIZE: usize = 1024;
-    let chunk_size = PARALLEL_CHUNK_SIZE.min(n).max(1);
-
-    let omega_pows = match omega_pows {
-        Some(slice) => {
-            debug_assert_eq!(slice.len(), n, "caller-provided omega_pows length mismatch");
-            Cow::Borrowed(slice)
-        }
-        None => Cow::Owned(F::two_adic_subgroup(lg_n)),
+    let g = if omega_pows.is_none() {
+        F::primitive_root_of_unity(lg_n)
+    } else {
+        F::ONE
     };
+    if let Some(roots) = omega_pows {
+        debug_assert_eq!(roots.len(), n, "caller-provided omega_pows length mismatch");
+    }
 
+    // A subgroup point has a zero denominator. Preserve the exact-value shortcut
+    // before inversion; callers with an extension-only point avoid this scan.
     if b == F::ZERO {
-        if let Some(j) = omega_pows.iter().position(|&op| op == a) {
+        let j = match omega_pows {
+            Some(roots) => roots.iter().position(|&op| op == a),
+            None if zn_minus_one.is_zero() => g.powers().take(n).position(|op| op == a),
+            None => None,
+        };
+        if let Some(j) = j {
             let mut values: Vec<_> = columns
                 .iter()
                 .map(|c| F::Extension::from(c.values[j]))
@@ -128,39 +149,63 @@ fn eval_columns_at_point_impl<F: RichField + Extendable<D>, const D: usize, cons
         }
     }
 
-    let mut inv_norms: Vec<F> = vec![F::ZERO; n];
-    inv_norms
-        .par_chunks_mut(chunk_size)
-        .zip(omega_pows.par_chunks(chunk_size))
-        .for_each(|(inv_chunk, omega_chunk)| {
-            for (slot, &op) in inv_chunk.iter_mut().zip(omega_chunk) {
-                *slot = (a - op).square() - wb2;
-            }
-            let inverses = F::batch_multiplicative_inverse(inv_chunk);
-            inv_chunk.copy_from_slice(&inverses);
-        });
+    // The first chunk is `1, g, ..., g^{len-1}` and is reused by its task.
+    // `g^len` then seeds later chunks, so each chunk spends `len - 1` products
+    // and root generation stays within `n` products.
+    let (first_chunk, chunk_starts) = if omega_pows.is_none() {
+        let chunk_len = PARALLEL_CHUNK_SIZE.min(n);
+        let first_chunk = successive_powers(F::ONE, g, chunk_len);
+        let chunk_count = n.div_ceil(PARALLEL_CHUNK_SIZE);
+        let chunk_starts = if chunk_count == 1 {
+            vec![F::ONE]
+        } else {
+            successive_powers(F::ONE, first_chunk[chunk_len - 1] * g, chunk_count)
+        };
+        (first_chunk, chunk_starts)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
-    // Pass 2: parallel fold-reduce over row indices; each thread accumulates (s1, s2)
-    // for all columns locally, then reduce combines the per-thread totals.
     let col_slices: Vec<&[F]> = columns.iter().map(|c| c.values.as_slice()).collect();
-
+    // Roots, inverses, and weights stay in one task, so scratch is one chunk.
+    // The shifted row still wraps on the full domain.
     let sums: Vec<(F, F)> = (0..n)
         .into_par_iter()
+        .step_by(PARALLEL_CHUNK_SIZE)
         .fold(
             || vec![(F::ZERO, F::ZERO); num_sums],
-            |mut acc, i| {
-                let op = omega_pows[i];
-                let base = inv_norms[i] * op; // inv_norm_i * omega^i
-                let next_i = (i + 1) & (n - 1); // = (i + 1) % n because n is a power of 2.
-                for (j, col) in col_slices.iter().enumerate() {
-                    let q = base * col[i]; // inv_norm_i * y_ij * omega^i
-                    acc[j].0 += q;
-                    acc[j].1 += q * op; // * omega^i -> omega^{2i} term
-                    if NEXT {
-                        // f(g*z) uses the same barycentric weights as f(z), with y_i replaced by y_(i+1).
-                        let next_q = base * col[next_i];
-                        acc[j + num_cols].0 += next_q;
-                        acc[j + num_cols].1 += next_q * op;
+            |mut acc, start| {
+                let end = (start + PARALLEL_CHUNK_SIZE).min(n);
+                let roots = match omega_pows {
+                    Some(all) => Cow::Borrowed(&all[start..end]),
+                    None if start == 0 => Cow::Borrowed(first_chunk.as_slice()),
+                    None => Cow::Owned(successive_powers(
+                        chunk_starts[start / PARALLEL_CHUNK_SIZE],
+                        g,
+                        end - start,
+                    )),
+                };
+                let norms: Vec<F> = roots
+                    .iter()
+                    .map(|&omega| (a - omega).square() - wb2)
+                    .collect();
+                let inverse_norms = F::batch_multiplicative_inverse(&norms);
+                for (offset, (&omega, inv)) in roots.iter().zip(inverse_norms).enumerate() {
+                    let i = start + offset;
+                    let weight = inv * omega;
+                    // Wrap at the table boundary, not the chunk boundary.
+                    let next_i = (i + 1) & (n - 1);
+                    for (j, col) in col_slices.iter().enumerate() {
+                        accumulate_barycentric(&mut acc[j], weight, col[i], omega);
+                        if NEXT {
+                            // f(g*z) reuses these weights with y_i replaced by y_(i+1).
+                            accumulate_barycentric(
+                                &mut acc[j + num_cols],
+                                weight,
+                                col[next_i],
+                                omega,
+                            );
+                        }
                     }
                 }
                 acc
@@ -204,9 +249,12 @@ pub fn eval_columns_at_zeta_and_next<F: RichField + Extendable<D>, const D: usiz
     zeta: F::Extension,
     degree_bits: usize,
 ) -> (Vec<F::Extension>, Vec<F::Extension>) {
-    let omega_pows = F::two_adic_subgroup(degree_bits);
-    let mut evals_at_zeta =
-        eval_columns_at_point_impl::<F, D, true>(columns, zeta, Some(&omega_pows));
+    assert!(degree_bits <= F::TWO_ADICITY);
+    assert!(
+        columns.iter().all(|c| c.len() == 1usize << degree_bits),
+        "column height must match degree_bits"
+    );
+    let mut evals_at_zeta = eval_columns_at_point_impl::<F, D, true>(columns, zeta, None);
     let evals_at_g_zeta = evals_at_zeta.split_off(columns.len());
     (evals_at_zeta, evals_at_g_zeta)
 }
@@ -681,5 +729,24 @@ mod tests {
         }
         let empty = super::eval_columns_at_zeta_and_next::<F, D>(&[], FE::rand(), 0);
         assert!(empty.0.is_empty() && empty.1.is_empty());
+    }
+
+    #[test]
+    fn test_next_evaluation_across_chunk_and_domain_boundaries() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+        const D: usize = 2;
+        let n = 2048;
+        let zeta = QuadraticExtension([F::from_canonical_u64(11), F::ONE]);
+        let g = F::primitive_root_of_unity(11);
+        for row in [0, 1023, 1024, 2047] {
+            let mut values = vec![F::ZERO; n];
+            values[row] = F::ONE;
+            let column = PolynomialValues::new(values);
+            let polynomial = column.clone().ifft().to_extension::<D>();
+            let (local, next) = super::eval_columns_at_zeta_and_next::<F, D>(&[&column], zeta, 11);
+            assert_eq!(local, vec![polynomial.eval(zeta)], "row={row}");
+            assert_eq!(next, vec![polynomial.eval(zeta * FE::from(g))], "row={row}");
+        }
     }
 }

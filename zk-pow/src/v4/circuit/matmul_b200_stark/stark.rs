@@ -67,10 +67,9 @@ use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsume
 use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
-use plonky2::field::polynomial::PolynomialValues;
-
 use super::columns::{
-    GROUP_WIDTH, MATMUL_B200_COL_MAP, MatmulB200ColumnsView, NUM_ATT_LINKS, NUM_MATMUL_B200_COLUMNS, NUM_MATMUL_PUBLIC_INPUTS,
+    GROUP_WIDTH, HK_PUBLIC_INPUT, HW_PUBLIC_INPUT, MATMUL_B200_COL_MAP, MatmulB200ColumnsView, NUM_ATT_LINKS,
+    NUM_MATMUL_B200_COLUMNS, NUM_MATMUL_PUBLIC_INPUTS, ROWS_PER_CELL_PUBLIC_INPUT, W_PUBLIC_INPUT,
 };
 use crate::v4::circuit::unpredictability::skip;
 use crate::v4::circuit::utils::evaluator::Evaluator;
@@ -106,8 +105,8 @@ pub(crate) const BINADE_BIAS: u64 = 139;
 
 /// The B200 tcgen05 AIR for one FP8 matmul: `out[r, c] = sum_t A[r, t] * B[t, c]`.
 ///
-/// The structural columns (`cell_id`, `is_cell_final`, and both operand index bases) are
-/// recomputable from this AIR's geometry; operand codes are witness data.
+/// Schedule constraints read `[ROWS_PER_CELL, W, H*W, H*K]`; the shared schedule docs
+/// constrain canonical coordinates. The AIR has no known columns.
 #[derive(Clone, Debug)]
 pub struct MatmulStarkB200<F: RichField + Extendable<D>, const D: usize> {
     /// Output rows (rows of A).
@@ -140,49 +139,74 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkB200<F, D> {
     }
 
     /// Trace height: the cell rows padded to the next power of two with single-row phantom
-    /// cells (all-zero, `is_padding = is_cell_final = 1`, `cell_id = h*w + t`).
+    /// cells (all-zero, `is_padding = is_cell_final = 1`; the coordinate walk continues at
+    /// position `h*w + t`).
     pub fn num_rows(&self) -> usize {
         self.live_rows().next_power_of_two()
     }
 
-    /// The class (a) ("known") column values — the leading
-    /// [`NUM_MATMUL_B200_KNOWN_COLUMNS`](super::columns::NUM_MATMUL_B200_KNOWN_COLUMNS)
-    /// trace columns in their `columns.rs` order (`cell_id`, `is_cell_final`,
-    /// `operand_index_base_a`, `operand_index_base_b`, `is_padding`), pure functions of this
-    /// AIR's geometry. Bit-exact with [`Self::generate_trace`]'s fill; the batch verifier
-    /// recomputes exactly this and checks the trace openings against it (`starky`'s
-    /// `BatchKnownColumns`).
-    pub fn known_values(&self) -> Vec<PolynomialValues<F>> {
-        let (h, w, k) = (self.h, self.w, self.k);
-        let live_rows_per_cell = k / GROUP_WIDTH;
-        let num_rows = self.num_rows();
-        let mut cell_id = Vec::with_capacity(num_rows);
-        let mut is_cell_final = Vec::with_capacity(num_rows);
-        let mut operand_index_base_a = Vec::with_capacity(num_rows);
-        let mut operand_index_base_b = Vec::with_capacity(num_rows);
-        let mut is_padding = Vec::with_capacity(num_rows);
-        for r in 0..h {
-            for c in 0..w {
-                for j in 0..live_rows_per_cell {
-                    cell_id.push(F::from_canonical_usize(r * w + c));
-                    is_cell_final.push(F::from_bool(j == live_rows_per_cell - 1));
-                    operand_index_base_a.push(F::from_canonical_usize(r * k + j * GROUP_WIDTH));
-                    operand_index_base_b.push(F::from_canonical_usize(h * k + c * k + j * GROUP_WIDTH));
-                    is_padding.push(F::ZERO);
-                }
-            }
+    /// The geometry public inputs the MS schedule constraints read:
+    /// `[ROWS_PER_CELL, W, H*W, H*K]`. Generated with the trace and pinned by the verifier's
+    /// expectation ([`super::super::driver::Fp8System::verify`]).
+    pub fn public_inputs(&self) -> [F; NUM_MATMUL_PUBLIC_INPUTS] {
+        [
+            F::from_canonical_usize(self.rows_per_cell()),
+            F::from_canonical_usize(self.w),
+            F::from_canonical_usize(self.h * self.w),
+            F::from_canonical_usize(self.h * self.k),
+        ]
+    }
+}
+
+/// Schedule columns shared by both device AIRs and their witness generators.
+pub(crate) struct MatmulScheduleView<F> {
+    pub is_cell_final: F,
+    pub is_padding: F,
+    pub cell_step: F,
+    pub cell_step_inv: F,
+    pub out_row: F,
+    pub out_col: F,
+    pub padding_onset_inv: F,
+    pub operand_index_base_a: F,
+    pub operand_index_base_b: F,
+    pub col_carry: F,
+    pub col_carry_inv: F,
+}
+
+impl<F: RichField> MatmulScheduleView<F> {
+    /// The honest schedule at global row `row` for `hw` live cells of `rows_per_cell` rows,
+    /// `w` output columns. Phantom rows (cell index >= `hw`) are single-row cells whose
+    /// `(OUT_ROW, OUT_COL)` walk — and with it the operand bases — simply continues.
+    pub fn at(row: usize, rows_per_cell: usize, w: usize, hw: usize) -> Self {
+        let live = hw * rows_per_cell;
+        let (cell, step) = if row < live {
+            (row / rows_per_cell, row % rows_per_cell)
+        } else {
+            (hw + (row - live), 0)
+        };
+        let is_padding = cell >= hw;
+        let is_cell_final = is_padding || step == rows_per_cell - 1;
+        let cell_f = F::from_canonical_usize(cell);
+        let hw_f = F::from_canonical_usize(hw);
+        let k = rows_per_cell * GROUP_WIDTH;
+        let hk = (hw / w) * k;
+        Self {
+            is_cell_final: F::from_bool(is_cell_final),
+            is_padding: F::from_bool(is_padding),
+            cell_step: F::from_canonical_usize(step),
+            cell_step_inv: (F::from_canonical_usize(step) - F::from_canonical_usize(rows_per_cell - 1))
+                .try_inverse()
+                .unwrap_or(F::ZERO),
+            out_row: F::from_canonical_usize(cell / w),
+            out_col: F::from_canonical_usize(cell % w),
+            padding_onset_inv: (cell_f - hw_f).try_inverse().unwrap_or(F::ZERO),
+            operand_index_base_a: F::from_canonical_usize((cell / w) * k),
+            operand_index_base_b: F::from_canonical_usize(hk + (cell % w) * k),
+            col_carry: F::from_bool(cell % w == w - 1),
+            col_carry_inv: (F::from_canonical_usize(cell % w) - F::from_canonical_usize(w - 1))
+                .try_inverse()
+                .unwrap_or(F::ZERO),
         }
-        for t in 0..num_rows - self.live_rows() {
-            cell_id.push(F::from_canonical_usize(h * w + t));
-            is_cell_final.push(F::ONE);
-            operand_index_base_a.push(F::ZERO);
-            operand_index_base_b.push(F::ZERO);
-            is_padding.push(F::ONE);
-        }
-        [cell_id, is_cell_final, operand_index_base_a, operand_index_base_b, is_padding]
-            .into_iter()
-            .map(PolynomialValues::new)
-            .collect()
     }
 }
 
@@ -306,8 +330,6 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkB200<F, D> {
         let mut rows: Vec<[F; NUM_MATMUL_B200_COLUMNS]> = Vec::with_capacity(num_rows);
         for r in 0..h {
             for c in 0..w {
-                let cell_id = r * w + c;
-
                 // ---- The k/32 live atom-steps (window-sum emulation columns). ----
                 let mut carry = OutTriple::ZERO;
                 let mut incoming_carry_is_zero = true;
@@ -318,10 +340,7 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkB200<F, D> {
                 for j in 0..live_rows_per_cell {
                     let is_final = j == live_rows_per_cell - 1;
                     let mut row = MatmulB200ColumnsView {
-                        cell_id: F::from_canonical_usize(cell_id),
                         is_cell_final: F::from_bool(is_final),
-                        operand_index_base_a: F::from_canonical_usize(r * k + j * GROUP_WIDTH),
-                        operand_index_base_b: F::from_canonical_usize(h * k + c * k + j * GROUP_WIDTH),
                         incoming_carry_is_zero: F::from_bool(incoming_carry_is_zero),
                         ..Default::default()
                     };
@@ -481,22 +500,37 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkB200<F, D> {
         }
 
         // ---- Trailing padding: one all-zero single-row phantom cell per padding row. ----
-        for t in 0..num_rows - self.live_rows() {
-            rows.push(phantom_row::<F>(h * w + t).into());
+        for _ in 0..num_rows - self.live_rows() {
+            rows.push(phantom_row::<F>().into());
         }
 
-        (rows, [])
+        // ---- Fill schedule witnesses for live and phantom rows. ----
+        let map = MATMUL_B200_COL_MAP;
+        for (i, row) in rows.iter_mut().enumerate() {
+            let s = MatmulScheduleView::<F>::at(i, live_rows_per_cell, w, h * w);
+            row[map.is_cell_final] = s.is_cell_final;
+            row[map.is_padding] = s.is_padding;
+            row[map.cell_step] = s.cell_step;
+            row[map.cell_step_inv] = s.cell_step_inv;
+            row[map.out_row] = s.out_row;
+            row[map.out_col] = s.out_col;
+            row[map.padding_onset_inv] = s.padding_onset_inv;
+            row[map.operand_index_base_a] = s.operand_index_base_a;
+            row[map.operand_index_base_b] = s.operand_index_base_b;
+            row[map.col_carry] = s.col_carry;
+            row[map.col_carry_inv] = s.col_carry_inv;
+        }
+
+        (rows, self.public_inputs())
     }
 }
 
-/// An all-zero single-row trailing phantom cell. It enters a zero carry with
-/// `GROUP_MAX_BIASED_EXPONENT = 0`, uses the inert `(0; 1, 1; 0; 0, 0)` width block,
-/// and sets `INCOMING_CARRY_SHIFT_POWER = 1` for the remainder identity.
-fn phantom_row<F: RichField>(cell_id: usize) -> MatmulB200ColumnsView<F> {
+/// An all-zero single-row trailing phantom cell (the schedule columns are filled by the
+/// post-pass). It enters a zero carry with `GROUP_MAX_BIASED_EXPONENT = 0`, uses the inert
+/// `(0; 1, 1; 0; 0, 0)` width block, and sets `INCOMING_CARRY_SHIFT_POWER = 1` for the
+/// remainder identity.
+fn phantom_row<F: RichField>() -> MatmulB200ColumnsView<F> {
     MatmulB200ColumnsView {
-        cell_id: F::from_canonical_usize(cell_id),
-        is_cell_final: F::ONE,
-        is_padding: F::ONE,
         incoming_carry_is_zero: F::ONE,
         incoming_carry_shift_power: F::ONE,
         group_sum_is_zero: F::ONE,
@@ -510,9 +544,143 @@ fn phantom_row<F: RichField>(cell_id: usize) -> MatmulB200ColumnsView<F> {
 // Constraints, written once against the generic `Evaluator`
 // ==================================================================================================
 
+/// Shared schedule constraints using `[ROWS_PER_CELL, W, H*W, H*K]`.
+///
+/// The counters fix each cell's length and the padding suffix. Anchored at `(0, 0)`,
+/// MS13/MS14 walk the canonical row-major coordinates `(OUT_ROW, OUT_COL)`; MS8 freezes
+/// them within a cell. The weighted sum `OUT_ROW*W + OUT_COL` is the flat cell position:
+/// the MS9/MS10 padding onset reads it, and the XorFold channel keys on it directly as a
+/// public-input-scaled CTL expression. MS11/MS12 bind the operand bases to `OUT_ROW*K`
+/// and `H*K + OUT_COL*K`. No coordinate range assumption comes from the CTLs.
+/// All constraints have degree <= 3, including transition selectors.
+pub(crate) fn eval_matmul_schedule_constraints<V, S, E>(
+    lv: &MatmulScheduleView<V>,
+    nv: &MatmulScheduleView<V>,
+    public_inputs: &[S; NUM_MATMUL_PUBLIC_INPUTS],
+    eval: &mut E,
+) where
+    V: Copy,
+    S: Copy,
+    E: Evaluator<V, S>,
+{
+    let rows_per_cell = eval.scalar(public_inputs[ROWS_PER_CELL_PUBLIC_INPUT]);
+    let w = eval.scalar(public_inputs[W_PUBLIC_INPUT]);
+    let hw = eval.scalar(public_inputs[HW_PUBLIC_INPUT]);
+    let one = eval.i32(1);
+    let not_final = eval.sub(one, lv.is_cell_final);
+    let not_padding = eval.sub(one, lv.is_padding);
+
+    // MS1 — the first row anchors the walk: step 0 of cell (0, 0), live.
+    eval.constraint_first_row(lv.cell_step);
+    eval.constraint_first_row(lv.out_row);
+    eval.constraint_first_row(lv.out_col);
+    eval.constraint_first_row(lv.is_padding);
+    eval.constraint_bool(lv.is_padding);
+
+    // The flat cell position `OUT_ROW*W + OUT_COL`: the MS7 advance and MS9/MS10
+    // padding-onset operand (the XorFold channel key reuses the same expression).
+    let cell_pos = eval.mad(lv.out_row, w, lv.out_col);
+
+    // MS3 — the in-cell step counter: +1 inside a cell, reset after a cell-final row
+    // (plain cyclic; the wrap closes because the last row is cell-final).
+    let step_next = eval.add(lv.cell_step, one);
+    let kept = eval.mul(step_next, not_final);
+    let c = eval.sub(nv.cell_step, kept);
+    eval.constraint(c);
+
+    // MS4/MS5 — IS_CELL_FINAL is exactly the cell-bound indicator on live rows: a raised
+    // flag forces CELL_STEP = ROWS_PER_CELL-1 (MS4, padding-gated: phantom steps stay 0),
+    // and a suppressed flag forces CELL_STEP != ROWS_PER_CELL-1 through the inverse witness
+    // (MS5; no gate needed — phantom rows have the flag raised).
+    let last_step = eval.sub(rows_per_cell, one);
+    let step_gap = eval.sub(lv.cell_step, last_step);
+    let raised = eval.mul(lv.is_cell_final, step_gap);
+    let c = eval.mul(not_padding, raised);
+    eval.constraint(c);
+    let witnessed = eval.mul(step_gap, lv.cell_step_inv);
+    let witnessed = eval.sub(witnessed, one);
+    let c = eval.mul(not_final, witnessed);
+    eval.constraint(c);
+
+    // MS6 — every phantom row is its own single-row cell.
+    let c = eval.mul(lv.is_padding, not_final);
+    eval.constraint(c);
+
+    // MS7 — advance the weighted coordinate sum by one at cell boundaries; exclude the wrap.
+    let next_pos = eval.mad(nv.out_row, w, nv.out_col);
+    let advance = eval.sub(next_pos, cell_pos);
+    let advance = eval.sub(advance, one);
+    let c = eval.mul(lv.is_cell_final, advance);
+    eval.constraint_transition(c);
+
+    // MS8 — the cell indices freeze inside a cell (plain cyclic; cell-final last row).
+    let dc = eval.sub(nv.out_col, lv.out_col);
+    let c = eval.mul(not_final, dc);
+    eval.constraint(c);
+    let dr = eval.sub(nv.out_row, lv.out_row);
+    let c = eval.mul(not_final, dr);
+    eval.constraint(c);
+
+    // MS9/MS10 — IS_PADDING: changes only entering position H*W (MS9, transition), forced
+    // to 1 there by the inverse witness (MS10): a live claim needs the position gap
+    // `OUT_ROW*W + OUT_COL - H*W` to be invertible.
+    let dpad = eval.sub(nv.is_padding, lv.is_padding);
+    let onset = eval.sub(next_pos, hw);
+    let c = eval.mul(dpad, onset);
+    eval.constraint_transition(c);
+    let gap = eval.sub(cell_pos, hw);
+    let witnessed = eval.mul(gap, lv.padding_onset_inv);
+    let witnessed = eval.sub(witnessed, one);
+    let c = eval.mul(not_padding, witnessed);
+    eval.constraint(c);
+
+    // MS11/MS12 — the operand flat-index bases: anchored on the first row (A at 0, B at the
+    // H*K public input) and stepped by K times the pinned cell-index deltas (transitions;
+    // K = ROWS_PER_CELL * GROUP_WIDTH).
+    let hk = eval.scalar(public_inputs[HK_PUBLIC_INPUT]);
+    let group_width = eval.i32(GROUP_WIDTH as i32);
+    let k = eval.mul(rows_per_cell, group_width);
+    eval.constraint_first_row(lv.operand_index_base_a);
+    let anchor_b = eval.sub(lv.operand_index_base_b, hk);
+    eval.constraint_first_row(anchor_b);
+    let dbase = eval.sub(nv.operand_index_base_a, lv.operand_index_base_a);
+    let dr = eval.sub(nv.out_row, lv.out_row);
+    let step = eval.mul(k, dr);
+    let c = eval.sub(dbase, step);
+    eval.constraint_transition(c);
+    let dbase = eval.sub(nv.operand_index_base_b, lv.operand_index_base_b);
+    let dc_col = eval.sub(nv.out_col, lv.out_col);
+    let step = eval.mul(k, dc_col);
+    let c = eval.sub(dbase, step);
+    eval.constraint_transition(c);
+
+    // MS13 — COL_CARRY = [OUT_COL = W-1]: a zero gap forces 1; a nonzero gap forces 0.
+    let w_minus_one = eval.sub(w, one);
+    let col_gap = eval.sub(lv.out_col, w_minus_one);
+    let c = eval.mul(lv.col_carry, col_gap);
+    eval.constraint(c);
+    let not_carry = eval.sub(one, lv.col_carry);
+    let witnessed = eval.mul(col_gap, lv.col_carry_inv);
+    let witnessed = eval.sub(witnessed, one);
+    let c = eval.mul(not_carry, witnessed);
+    eval.constraint(c);
+
+    // MS14 — at cell boundaries, COL' = COL + 1 - W*COL_CARRY and ROW' = ROW + COL_CARRY.
+    // MS13 makes the column reset linear; transitions exclude the last -> first wrap.
+    let w_carry = eval.mul(w, lv.col_carry);
+    let dc_step = eval.sub(dc_col, one);
+    let dc_step = eval.add(dc_step, w_carry);
+    let c = eval.mul(lv.is_cell_final, dc_step);
+    eval.constraint_transition(c);
+    let dr_boundary = eval.sub(dr, lv.col_carry);
+    let c = eval.mul(lv.is_cell_final, dr_boundary);
+    eval.constraint_transition(c);
+}
+
 /// Evaluates every arithmetic constraint of MatmulStarkB200. Lookup-borne facts (LUT oracle)
 /// are *not* emitted here — see `super::ctl::matmul_b200_lut_lookups`. The constraint set
-/// is program-independent and reads no public inputs.
+/// reads only the geometry public inputs `[ROWS_PER_CELL, W, H*W, H*K]` (the group-MS schedule
+/// gadgets); everything else is program-independent.
 pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     vars: &StarkFrame<V, S, NUM_MATMUL_B200_COLUMNS, NUM_MATMUL_PUBLIC_INPUTS>,
     eval: &mut E,
@@ -527,6 +695,36 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     let nv: &MatmulB200ColumnsView<V> = nv.borrow();
 
     let one = eval.i32(1);
+    eval_matmul_schedule_constraints(
+        &MatmulScheduleView {
+            is_cell_final: lv.is_cell_final,
+            is_padding: lv.is_padding,
+            cell_step: lv.cell_step,
+            cell_step_inv: lv.cell_step_inv,
+            out_row: lv.out_row,
+            out_col: lv.out_col,
+            padding_onset_inv: lv.padding_onset_inv,
+            operand_index_base_a: lv.operand_index_base_a,
+            operand_index_base_b: lv.operand_index_base_b,
+            col_carry: lv.col_carry,
+            col_carry_inv: lv.col_carry_inv,
+        },
+        &MatmulScheduleView {
+            is_cell_final: nv.is_cell_final,
+            is_padding: nv.is_padding,
+            cell_step: nv.cell_step,
+            cell_step_inv: nv.cell_step_inv,
+            out_row: nv.out_row,
+            out_col: nv.out_col,
+            padding_onset_inv: nv.padding_onset_inv,
+            operand_index_base_a: nv.operand_index_base_a,
+            operand_index_base_b: nv.operand_index_base_b,
+            col_carry: nv.col_carry,
+            col_carry_inv: nv.col_carry_inv,
+        },
+        vars.get_public_inputs().try_into().unwrap(),
+        eval,
+    );
     let not_final = eval.sub(one, lv.is_cell_final);
     // Z := GROUP_SUM_IS_ZERO — B200's output-zero condition is exactly SUM = 0.
     let z = lv.group_sum_is_zero;
@@ -549,8 +747,8 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     );
 
     // The transition constraints below are *plain* (they also bind the last-row -> first-row
-    // wrap); the wrap instances are made inert by the last row being cell-final (a class (a)
-    // fact, carried by the known-column binding — see MB4) and row 0's anchored zero carry.
+    // wrap); the wrap instances are made inert by the last row being cell-final (forced by
+    // the MS schedule constraints above) and row 0's anchored zero carry.
 
     // ---- MB1 — product lookups x32 (B200ALIGN; served by the LUT oracle). ----
     // The tuple binds ALIGNED_LANE_TERMS / PRODUCT_BIASED_EXPONENT / OPERAND_CODES_A/B per
@@ -613,12 +811,8 @@ pub(crate) fn eval_matmul_b200_constraints<V, S, E>(
     eval.constraint(c);
     let first_anchor = eval.sub(lv.incoming_carry_is_zero, one);
     eval.constraint_first_row(first_anchor);
-    // IS_CELL_FINAL is class (a) (verifier-recomputed, checked against the trace openings —
-    // `super::super::known_values`), so its schedule facts hold without in-AIR pins: it is
-    // boolean, and the last row is cell-final — the wrap soundness of every plain transition
-    // here.
-
-    eval.constraint_bool(lv.is_padding);
+    // IS_CELL_FINAL's schedule facts — booleanness and the cell-final last row, the wrap
+    // soundness of every plain transition here — are forced by the MS constraints.
 
     // ---- MB5 — carry alignment (anchored at the producing row). ----
     // POW2GB(GROUP_MAX_BIASED_EXPONENT' - GROUP_OUTPUT_BIASED_EXPONENT;
@@ -911,11 +1105,13 @@ mod tests {
     fn assert_all_constraints(stark: S, rows: &[[F; NUM_MATMUL_B200_COLUMNS]], pis: &[F]) {
         let n = rows.len();
         for i in 0..n {
-            // Plain constraints must hold on every row *including* the last -> first wrap.
+            // Plain constraints must hold on every row *including* the last -> first wrap;
+            // `z_last` is zero on the wrap pair, matching starky's semantics for the MS
+            // transition constraints (MS7/MS9).
             let frame = StarkFrame::from_values(&rows[i], &rows[(i + 1) % n], pis);
             let mut consumer = ConstraintConsumer::new(
                 vec![F::from_canonical_u64(2), F::from_canonical_u64(0x876543210)],
-                F::ONE,
+                F::from_bool(i != n - 1),
                 F::from_bool(i == 0),
                 F::from_bool(i == n - 1),
             );
@@ -1074,7 +1270,7 @@ mod tests {
                 let frame = StarkFrame::from_values(&rows[i], &rows[(i + 1) % n], &pis);
                 let mut consumer = ConstraintConsumer::new(
                     vec![F::from_canonical_u64(2), F::from_canonical_u64(0x876543210)],
-                    F::ONE,
+                    F::from_bool(i != n - 1),
                     F::from_bool(i == 0),
                     F::from_bool(i == n - 1),
                 );
@@ -1146,17 +1342,102 @@ mod tests {
             tampered[row][col] = F::ONE - tampered[row][col];
             assert!(violates(&tampered), "{what}: flip at row {row} must break a constraint");
         }
+
+        // ---- Group MS (schedule gadget) tampers. ----
+
+        // MS3/MS4: shifting the in-cell step counter breaks the walk at the splice (and the
+        // cell bound at the final row).
+        let mut t = rows.clone();
+        for row in t.iter_mut().skip(5) {
+            row[m.cell_step] += F::ONE;
+        }
+        assert!(violates(&t), "MS3 cell-step shift undetected");
+
+        // MS5: suppressing a true cell boundary is unsatisfiable (the inverse witness cannot
+        // exist at the bound).
+        let final_live = (0..rows.len())
+            .find(|&r| view(r).is_cell_final == F::ONE && view(r).is_padding == F::ZERO)
+            .unwrap();
+        let mut t = rows.clone();
+        t[final_live][m.is_cell_final] = F::ZERO;
+        assert!(violates(&t), "MS5 cell-final suppression undetected");
+
+        // MS7/MS8: a relocated cell walk (OUT_COL bumped from some row on) breaks the
+        // in-cell freeze or the single-step boundary advance of the weighted sum.
+        let mut t = rows.clone();
+        for row in t.iter_mut().skip(8) {
+            row[m.out_col] += F::ONE;
+        }
+        assert!(violates(&t), "MS7/MS8 cell-walk relocation undetected");
+
+        // MS9: raising IS_PADDING before the onset is rejected (the flag may change only
+        // entering position H*W).
+        let mut t = rows.clone();
+        for row in t.iter_mut().skip(rows.len() - 2) {
+            row[m.is_padding] = F::ONE;
+        }
+        assert!(violates(&t), "MS9 early padding onset undetected");
+
+        // MS11/MS12: relocating an operand base — pointing a cell's reads at another operand
+        // row/column — breaks the first-row anchor or the K-scaled walk recurrence, whether
+        // shifted from row 0 or from mid-trace.
+        for (what, col) in [
+            ("MS11 BASE_A", m.operand_index_base_a),
+            ("MS12 BASE_B", m.operand_index_base_b),
+        ] {
+            let mut t = rows.clone();
+            for row in t.iter_mut() {
+                row[col] += F::from_canonical_usize(stark.k);
+            }
+            assert!(violates(&t), "{what} whole-plane relocation undetected");
+            let mut t = rows.clone();
+            for row in t.iter_mut().skip(6) {
+                row[col] += F::from_canonical_usize(stark.k);
+            }
+            assert!(violates(&t), "{what} mid-trace relocation undetected");
+        }
+
+        // MS13/MS14: a dishonest coordinate *split* — every cell from cell 2 on claims
+        // (OUT_ROW + 1, OUT_COL - W), with the operand bases following. This preserves
+        // the weighted sum OUT_ROW*W + OUT_COL — hence the boundary advance (MS7), the
+        // padding onset (MS9/MS10) and the XorFold key — plus the freeze (MS8) and the
+        // base recurrences (MS11/MS12): it satisfies MS1..MS12 identically and redirects
+        // every A read of those cells at the next
+        // operand row. Only the explicit coordinate walk rejects it: the splice boundary
+        // has OUT_COL' - OUT_COL - 1 + W*COL_CARRY != 0 (MS14), whatever carry flag and
+        // inverse witness the forger supplies (MS13 leaves it no third option).
+        let w_f = F::from_canonical_usize(stark.w);
+        let splice = 2 * stark.rows_per_cell();
+        for carry_choice in [F::ZERO, F::ONE] {
+            let mut t = rows.clone();
+            for row in t.iter_mut().skip(splice) {
+                row[m.out_row] += F::ONE;
+                row[m.out_col] -= w_f;
+                row[m.operand_index_base_a] += F::from_canonical_usize(stark.k);
+                row[m.operand_index_base_b] -= F::from_canonical_usize(stark.w * stark.k);
+                row[m.col_carry] = carry_choice;
+                let gap = row[m.out_col] - (w_f - F::ONE);
+                row[m.col_carry_inv] = gap.try_inverse().unwrap_or(F::ZERO);
+            }
+            assert!(
+                violates(&t),
+                "MS13/MS14 dishonest coordinate split (carry={carry_choice}) undetected"
+            );
+        }
     }
 
     #[test]
-    fn padded_trace_matches_known_values() {
+    fn padded_trace_matches_schedule_fill() {
         // 15 cells of k/32 = 4 rows -> 60 live rows padded to 64 by 4 phantom cells; the
-        // class (a) columns (`MatmulStarkB200::known_values`) must be bit-exact with the
-        // trace fill, padding rows included.
+        // structural schedule columns must match the honest `MatmulScheduleView` on every row —
+        // padding rows included, where the `(OUT_ROW, OUT_COL)` walk simply continues —
+        // and the trace must satisfy the AIR (so the MS constraints pin exactly this
+        // fill). The AIR acceptance is covered by `tampered_traces_fail`'s honest check on
+        // the primary fixture; here we pin the padded geometry's schedule semantics.
         let program = S::new(3, 5, 128);
         let a = test_codes(program.h * program.k, 0x9E3779B97F4A7C15, 8);
         let b = test_codes(program.w * program.k, 0xC2B2AE3D27D4EB4F, 11);
-        let (rows, _) = program.generate_trace(
+        let (rows, pis) = program.generate_trace(
             &a,
             &b,
             &test_lambdas(program.h * program.k, 0xA24BAED4963EE407),
@@ -1164,13 +1445,38 @@ mod tests {
         );
         assert_eq!(program.live_rows(), 60);
         assert_eq!(rows.len(), 64);
-        let known = program.known_values();
-        for (c, col) in known.iter().enumerate() {
-            assert_eq!(col.len(), 64);
-            for (r, row) in rows.iter().enumerate() {
-                assert_eq!(col.values[r], row[c], "known column {c} row {r}");
+        assert_eq!(pis, program.public_inputs());
+        let m = &MATMUL_B200_COL_MAP;
+        let hw = program.h * program.w;
+        for (r, row) in rows.iter().enumerate() {
+            let s = MatmulScheduleView::<F>::at(r, program.rows_per_cell(), program.w, hw);
+            for (what, got, want) in [
+                ("IS_CELL_FINAL", row[m.is_cell_final], s.is_cell_final),
+                ("IS_PADDING", row[m.is_padding], s.is_padding),
+                ("CELL_STEP", row[m.cell_step], s.cell_step),
+                ("CELL_STEP_INV", row[m.cell_step_inv], s.cell_step_inv),
+                ("OUT_ROW", row[m.out_row], s.out_row),
+                ("OUT_COL", row[m.out_col], s.out_col),
+                ("PADDING_ONSET_INV", row[m.padding_onset_inv], s.padding_onset_inv),
+                ("OPERAND_INDEX_BASE_A", row[m.operand_index_base_a], s.operand_index_base_a),
+                ("OPERAND_INDEX_BASE_B", row[m.operand_index_base_b], s.operand_index_base_b),
+                ("COL_CARRY", row[m.col_carry], s.col_carry),
+                ("COL_CARRY_INV", row[m.col_carry_inv], s.col_carry_inv),
+            ] {
+                assert_eq!(got, want, "{what} row {r}");
+            }
+            // The phantom suffix: single-row cells continuing the walk at position hw + t.
+            if r >= program.live_rows() {
+                assert_eq!(row[m.is_padding], F::ONE, "row {r}");
+                assert_eq!(
+                    row[m.out_row] * F::from_canonical_usize(program.w) + row[m.out_col],
+                    F::from_canonical_usize(hw + r - program.live_rows()),
+                    "row {r}"
+                );
             }
         }
+        // The padded trace satisfies every constraint (phantom rows and the wrap included).
+        assert_all_constraints(program, &rows, &pis);
     }
 
     #[test]

@@ -29,23 +29,49 @@ pub const NUM_ATT_LINKS: usize = 16;
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct MatmulB200ColumnsView<T: Copy> {
     // ------------------------------------------------------------------------------------------
-    // Structural columns, class (a): verifier-recomputable from the AIR geometry
-    // (`MatmulStarkB200::known_values`); the batch verifier checks the trace openings against
-    // its own recomputed values.
+    // Schedule witnesses constrained by MS1..MS14 using `[ROWS_PER_CELL, W, H*W, H*K]`.
+    // MS13/MS14 bind the canonical row-major coordinate progression AIR-locally (no CTL
+    // structure is relied on for coordinate ranges).
+    // CTL coefficients stay statement-independent for the universal stage-1 wrapper.
     // ------------------------------------------------------------------------------------------
-    /// Output cell index, constant across the cell's `k/32` rows; the XorFold channel key.
-    pub cell_id: T,
-    /// 1 on each cell's last row. Gates the f32 encode, the XorFold channel and the carry reset.
+    /// 1 on each cell's last row. Gates the f32 encode, the XorFold channel and the carry
+    /// reset. Fully pinned: 1 exactly at `CELL_STEP = ROWS_PER_CELL - 1` on live rows
+    /// (MS4/MS5) and on every phantom row (MS6).
     pub is_cell_final: T,
-    /// Operand flat-index base for this row's 32 A lanes.
-    pub operand_index_base_a: T,
-    /// Operand flat-index base for the B lanes; carries the constant `h*k` key offset matching
-    /// InputQuantStark's B-channel keys.
-    pub operand_index_base_b: T,
     /// 1 on the rows that read no operands: the trailing power-of-two padding rows (single-row
-    /// phantom cells, `IS_CELL_FINAL = 1`, `CELL_ID >= h*w`). Padding rows are excluded from
-    /// the operand-code and cell-result channels, and their lanes are pinned to zero products.
+    /// phantom cells, `IS_CELL_FINAL = 1`, position `OUT_ROW*W + OUT_COL >= h*w`). Padding
+    /// rows are excluded from the operand-code and cell-result channels, and their lanes are
+    /// pinned to zero products. Pinned: 0 on the first row, changes only entering position
+    /// `H*W` (MS9), forced to 1 there by the inverse witness (MS10).
     pub is_padding: T,
+    /// In-cell step `j in [0, ROWS_PER_CELL)`; 0 on phantom rows. Cyclic walk
+    /// `CELL_STEP' = (CELL_STEP + 1)*(1 - IS_CELL_FINAL)` (MS3).
+    pub cell_step: T,
+    /// MS5 inverse witness for `CELL_STEP - (ROWS_PER_CELL - 1)` on non-final rows.
+    pub cell_step_inv: T,
+    /// Output-row witness: MS14 increments it exactly at column wraps (including phantom
+    /// rows, where the walk continues); anchored at 0 (MS1).
+    pub out_row: T,
+    /// Output-column witness: MS14 walks it `0..W-1` cyclically at cell boundaries,
+    /// resetting exactly on `COL_CARRY` rows; MS8 freezes it within a cell, MS7 advances
+    /// the pair's weighted sum `OUT_ROW*W + OUT_COL` by one per boundary. That sum is the
+    /// flat cell position: the XorFold channel key (public-input-scaled CTL expression)
+    /// and the MS9/MS10 padding-onset operand.
+    pub out_col: T,
+    /// MS10 inverse witness for `OUT_ROW*W + OUT_COL - H*W` on live rows.
+    pub padding_onset_inv: T,
+    /// `OUT_ROW * K`, enforced by MS11's first-row anchor and transition recurrence.
+    /// A operand keys are `BASE_A + CELL_STEP*32 + lane`.
+    pub operand_index_base_a: T,
+    /// `H*K + OUT_COL * K`, enforced by MS12's first-row anchor and transition recurrence.
+    /// B operand keys are `BASE_B + CELL_STEP*32 + lane`.
+    pub operand_index_base_b: T,
+    /// Column-wrap flag, pinned two-sidedly to `[OUT_COL = W-1]` on every row (MS13):
+    /// raised forces `OUT_COL = W-1`, suppressed forces a nonzero gap via `COL_CARRY_INV`.
+    /// Booleanity is implied. Drives the MS14 coordinate walk.
+    pub col_carry: T,
+    /// MS13 inverse witness for `OUT_COL - (W-1)` on non-carry rows.
+    pub col_carry_inv: T,
 
     // ------------------------------------------------------------------------------------------
     // Window-sum emulation (main).
@@ -174,19 +200,26 @@ pub struct MatmulB200ColumnsView<T: Copy> {
 /// Total number of committed MatmulB200Stark columns.
 pub const NUM_MATMUL_B200_COLUMNS: usize = size_of::<MatmulB200ColumnsView<u8>>();
 
-// Committed-column count: 256 per-lane (8 arrays of 32) + 40 fixed main + 5 class (a)
-// + 3 fixed jackpot (E_CELL, CELL_NONZERO, CELL_SKIPS).
-const _: () = assert!(NUM_MATMUL_B200_COLUMNS == 304);
+// Committed-column count: 256 per-lane (8 arrays of 32) + 40 fixed main + 11 structural
+// schedule + 3 fixed jackpot (E_CELL, CELL_NONZERO, CELL_SKIPS).
+const _: () = assert!(NUM_MATMUL_B200_COLUMNS == 310);
 
 columns_view!(MatmulB200ColumnsView, NUM_MATMUL_B200_COLUMNS, MATMUL_B200_COL_MAP);
 
-/// Number of leading class (a) ("known") columns: `CELL_ID`, `IS_CELL_FINAL`,
-/// `OPERAND_INDEX_BASE_A/B`, and `IS_PADDING` — pure functions of the AIR geometry
-/// (`MatmulStarkB200::known_values`).
-pub const NUM_MATMUL_B200_KNOWN_COLUMNS: usize = MATMUL_B200_COL_MAP.is_padding + 1;
+/// Matmul has no verifier-known columns; its schedule is carried in witness columns.
+pub const NUM_MATMUL_B200_KNOWN_COLUMNS: usize = 0;
 
-/// Number of MatmulB200Stark public inputs — none: the AIR is program-independent.
-pub const NUM_MATMUL_PUBLIC_INPUTS: usize = 0;
+/// Number of Matmul public inputs (shared by both device AIRs): the geometry scalars the
+/// MS schedule constraints read.
+pub const NUM_MATMUL_PUBLIC_INPUTS: usize = 4;
+/// `k / GROUP_WIDTH`: live rows per output cell.
+pub const ROWS_PER_CELL_PUBLIC_INPUT: usize = 0;
+/// `w`: output columns (the `CELL_ID = OUT_ROW*W + OUT_COL` recomposition base).
+pub const W_PUBLIC_INPUT: usize = 1;
+/// `h*w`: live cells — the padding onset (`CELL_ID = H*W` starts the phantom rows).
+pub const HW_PUBLIC_INPUT: usize = 2;
+/// `h*k`: the B plane's flat-index offset (the `OPERAND_INDEX_BASE_B` first-row anchor).
+pub const HK_PUBLIC_INPUT: usize = 3;
 
 #[cfg(test)]
 mod tests {
@@ -200,13 +233,19 @@ mod tests {
         for (i, &c) in as_array.iter().enumerate() {
             assert_eq!(c, i);
         }
-        // Class (a) columns come first (their indices feed `preprocessed_indices`).
-        assert_eq!(MATMUL_B200_COL_MAP.cell_id, 0);
-        assert_eq!(MATMUL_B200_COL_MAP.is_cell_final, 1);
-        assert_eq!(MATMUL_B200_COL_MAP.operand_index_base_a, 2);
-        assert_eq!(MATMUL_B200_COL_MAP.operand_index_base_b, 3);
-        assert_eq!(MATMUL_B200_COL_MAP.is_padding, 4);
-        assert_eq!(NUM_MATMUL_B200_KNOWN_COLUMNS, 5);
+        // The structural schedule block comes first.
+        assert_eq!(MATMUL_B200_COL_MAP.is_cell_final, 0);
+        assert_eq!(MATMUL_B200_COL_MAP.is_padding, 1);
+        assert_eq!(MATMUL_B200_COL_MAP.cell_step, 2);
+        assert_eq!(MATMUL_B200_COL_MAP.cell_step_inv, 3);
+        assert_eq!(MATMUL_B200_COL_MAP.out_row, 4);
+        assert_eq!(MATMUL_B200_COL_MAP.out_col, 5);
+        assert_eq!(MATMUL_B200_COL_MAP.padding_onset_inv, 6);
+        assert_eq!(MATMUL_B200_COL_MAP.operand_index_base_a, 7);
+        assert_eq!(MATMUL_B200_COL_MAP.operand_index_base_b, 8);
+        assert_eq!(MATMUL_B200_COL_MAP.col_carry, 9);
+        assert_eq!(MATMUL_B200_COL_MAP.col_carry_inv, 10);
+        assert_eq!(NUM_MATMUL_B200_KNOWN_COLUMNS, 0);
         assert_eq!(MATMUL_B200_COL_MAP.cell_skips, NUM_MATMUL_B200_COLUMNS - 1);
     }
 
@@ -217,7 +256,7 @@ mod tests {
             *v = i as u64 * 3 + 1;
         }
         let view: MatmulB200ColumnsView<u64> = arr.into();
-        assert_eq!(view.cell_id, 1);
+        assert_eq!(view.is_cell_final, 1);
         assert_eq!(view.operand_codes_a[0], MATMUL_B200_COL_MAP.operand_codes_a[0] as u64 * 3 + 1);
         assert_eq!(view.cell_skips, (NUM_MATMUL_B200_COLUMNS as u64 - 1) * 3 + 1);
         let back: [u64; NUM_MATMUL_B200_COLUMNS] = view.into();

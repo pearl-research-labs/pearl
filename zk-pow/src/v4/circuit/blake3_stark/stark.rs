@@ -51,9 +51,9 @@ use starky::lookup::{Column, Filter, Lookup};
 use starky::stark::Stark;
 
 use super::columns::{
-    BLAKE3_COL_MAP, Blake3ColumnsView, Blake3StateCols, NUM_BLAKE3_COLUMNS, NUM_BLAKE3_PUBLIC_INPUTS, NUM_UINT8,
-    NUM_UNPACK_FLAGS, PI_HASH_A, PI_HASH_B, PI_HASH_JACKPOT, PI_HASH_OFFSETS, PI_HASH_ROUTING, PI_JACKPOT_KEY, PI_KEY_A,
-    PI_KEY_B,
+    BLAKE3_COL_MAP, Blake3ColumnsView, Blake3StateCols, NUM_BLAKE3_COLUMNS, NUM_BLAKE3_KNOWN_COLUMNS, NUM_BLAKE3_PUBLIC_INPUTS,
+    NUM_UINT8, NUM_UNPACK_FLAGS, PI_HASH_A, PI_HASH_B, PI_HASH_JACKPOT, PI_HASH_OFFSETS, PI_HASH_ROUTING, PI_JACKPOT_KEY,
+    PI_KEY_A, PI_KEY_B,
 };
 use crate::v4::api::prequant::BLOCK_SIZE;
 use crate::v4::api::public_params::{HashId, MoEStatement};
@@ -239,20 +239,20 @@ impl Blake3Instruction {
     /// instruction)`. Row 0 is the chunk-chaining fetch; rows 3 / 7 are the parent window
     /// fetches — the positions that land each fetched CV at message words 0..8 / 8..16 through
     /// the shift-by-2 buffer.
-    fn fetches(&self) -> Vec<(usize, usize)> {
-        let mut fetches = Vec::new();
+    fn fetches(&self) -> impl Iterator<Item = (usize, usize)> {
+        let mut fetches = [None; 3];
         if let CvSource::Chain(src) = self.cv {
-            fetches.push((0, src));
+            fetches[0] = Some((0, src));
         }
         if let MessageSource::Parent { left, right } = self.msg {
             if let CvRef::Instruction(src) = left {
-                fetches.push((3, src));
+                fetches[1] = Some((3, src));
             }
             if let CvRef::Instruction(src) = right {
-                fetches.push((7, src));
+                fetches[2] = Some((7, src));
             }
         }
-        fetches
+        fetches.into_iter().flatten()
     }
 }
 
@@ -438,6 +438,103 @@ impl Blake3Program {
         routing_pins: Vec<(usize, u32)>,
         moe: Option<MoeSchedule>,
     ) -> Self {
+        use plonky2_maybe_rayon::*;
+
+        Self {
+            instructions: Self::translated_instructions(program, k).collect(),
+            num_aux_msgs: program.num_auxiliary_msgs,
+            num_aux_cvs: program.num_auxiliary_cvs,
+            routing_pins,
+            moe,
+        }
+    }
+
+    /// Translates each finalized chip instruction and fills its known rows in the
+    /// same Rayon task. The chip compiler must finish tagging roots before entry.
+    pub(crate) fn from_blake_program_with_known_values<F: RichField>(
+        program: &chip_program::BlakeProgram,
+        k: usize,
+        routing_pins: Vec<(usize, u32)>,
+        moe: Option<MoeSchedule>,
+        inputs: &Blake3KnownInputs,
+    ) -> (Self, Vec<PolynomialValues<F>>) {
+        use plonky2_maybe_rayon::*;
+
+        let instructions = Self::translated_instructions(program, k);
+        let num_rows = (ROWS_PER_COMPRESSION * instructions.len()).next_power_of_two();
+        // Padding rows carry IS_NEW_BLAKE alone.
+        let mut columns: [PolynomialValues<F>; NUM_BLAKE3_KNOWN_COLUMNS] = core::array::from_fn(|c| {
+            let padding = if c == BLAKE3_COL_MAP.row_flags_packed {
+                F::from_canonical_u64(1 << 9)
+            } else {
+                F::ZERO
+            };
+            PolynomialValues::new(vec![padding; num_rows])
+        });
+        let [
+            row_flags_packed,
+            ctl_key_base,
+            is_int8_message,
+            is_scale_message,
+            cv_route_key_or_tweak,
+            moe_outer_indices_packed,
+            word_pin_first,
+            word_pin_second,
+        ] = &mut columns;
+        let mut output = Self {
+            instructions: Vec::new(),
+            num_aux_msgs: program.num_auxiliary_msgs,
+            num_aux_cvs: program.num_auxiliary_cvs,
+            routing_pins,
+            moe,
+        };
+        output.instructions = instructions
+            .zip(
+                row_flags_packed
+                    .values
+                    .par_chunks_mut(ROWS_PER_COMPRESSION)
+                    .zip(ctl_key_base.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(is_int8_message.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(is_scale_message.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(cv_route_key_or_tweak.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(moe_outer_indices_packed.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(word_pin_first.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(word_pin_second.values.par_chunks_mut(ROWS_PER_COMPRESSION)),
+            )
+            .map(|(instruction, chunks)| {
+                let (chunks, word_pin_second) = chunks;
+                let (chunks, word_pin_first) = chunks;
+                let (chunks, moe_outer_indices_packed) = chunks;
+                let (chunks, cv_route_key_or_tweak) = chunks;
+                let (chunks, is_scale_message) = chunks;
+                let ((row_flags_packed, ctl_key_base), is_int8_message) = chunks;
+                output.fill_known_compression(
+                    &instruction,
+                    inputs,
+                    [
+                        row_flags_packed,
+                        ctl_key_base,
+                        is_int8_message,
+                        is_scale_message,
+                        cv_route_key_or_tweak,
+                        moe_outer_indices_packed,
+                        word_pin_first,
+                        word_pin_second,
+                    ],
+                );
+                instruction
+            })
+            .collect();
+        output.validate();
+        (output, columns.into())
+    }
+
+    fn translated_instructions(
+        program: &chip_program::BlakeProgram,
+        k: usize,
+    ) -> impl plonky2_maybe_rayon::IndexedParallelIterator<Item = Blake3Instruction> + '_ {
+        use plonky2_maybe_rayon::*;
+
         // Fail closed on the scheme using the four-plane shape; record the root indices the
         // fold wrappers reference.
         let mut plane_roots = [const { Vec::new() }; 4];
@@ -470,7 +567,7 @@ impl Blake3Program {
         // One dword's plane and byte offset in that plane's stream (the concatenated opened
         // strips). Adjacent committed rows open to adjacent strips, so the stream offsets of
         // a block straddling a row boundary stay contiguous.
-        let resolve_dword = |d: chip_program::MatDwordId| -> (PlaneId, usize) {
+        let resolve_dword = move |d: chip_program::MatDwordId| -> (PlaneId, usize) {
             let side_strips = if d.is_b_strip { w } else { h };
             let is_scales = d.strip_idx >= side_strips;
             let plane = match (d.is_b_strip, is_scales) {
@@ -482,7 +579,7 @@ impl Blake3Program {
             let row_bytes = if is_scales { scale_row_bytes } else { k };
             (plane, (d.strip_idx % side_strips) * row_bytes + d.idx_in_strip)
         };
-        let ctl_base = |plane: PlaneId, offset: usize| -> u64 {
+        let ctl_base = move |plane: PlaneId, offset: usize| -> u64 {
             match plane {
                 PlaneId::AValues => offset as u64,
                 PlaneId::BValues => (h * k + offset) as u64,
@@ -492,9 +589,7 @@ impl Blake3Program {
             }
         };
 
-        // + 3: one commitment fold per side plus the lottery.
-        let mut instructions = Vec::with_capacity(program.instructions.len() + 3);
-        for (i, instr) in program.instructions.iter().enumerate() {
+        let instructions = program.instructions.par_iter().enumerate().map(move |(i, instr)| {
             let msg = match instr.msg {
                 chip_program::MessageType::MatrixLeaf { mat_data } => {
                     let (plane, offset) = resolve_dword(mat_data.dwords[0]);
@@ -561,7 +656,7 @@ impl Blake3Program {
                 instr.key_source != chip_program::KeySource::Prev || i > 0,
                 "chained CV on the first instruction"
             );
-            instructions.push(Blake3Instruction {
+            Blake3Instruction {
                 cv: match instr.key_source {
                     chip_program::KeySource::KeyA => CvSource::KeyA,
                     chip_program::KeySource::KeyB => CvSource::KeyB,
@@ -573,31 +668,26 @@ impl Blake3Program {
                 block_len: instr.tweak.block_len,
                 flags: instr.tweak.flags,
                 bind,
-            });
-        }
-        // Append folding instructions -- to get one hash per side (keyed by the side's opening key).
+            }
+        });
+        // These final instructions follow the tree schedule in canonical order.
+        let mut final_instructions = Vec::with_capacity(3);
         append_commit_fold(
-            &mut instructions,
+            &mut final_instructions,
             a_values_root,
             a_scales_root,
             PublicBinding::HashA,
             CvSource::KeyA,
         );
         append_commit_fold(
-            &mut instructions,
+            &mut final_instructions,
             b_values_root,
             b_scales_root,
             PublicBinding::HashB,
             CvSource::KeyB,
         );
-        instructions.push(Blake3Instruction::lottery());
-        Self {
-            instructions,
-            num_aux_msgs: program.num_auxiliary_msgs,
-            num_aux_cvs: program.num_auxiliary_cvs,
-            routing_pins,
-            moe,
-        }
+        final_instructions.push(Blake3Instruction::lottery());
+        instructions.chain(final_instructions.into_par_iter())
     }
 
     /// Live (unpadded) trace rows.
@@ -1328,9 +1418,84 @@ impl Blake3Program {
     /// trace-commitment openings against it (`starky`'s `BatchKnownColumns`), so the schedule
     /// wiring is consensus data even though the columns are committed with the trace.
     pub fn known_values<F: RichField>(&self, inputs: &Blake3KnownInputs) -> Vec<PolynomialValues<F>> {
+        use plonky2_maybe_rayon::*;
+
         self.validate();
-        let num_live = self.num_live_rows();
         let num_rows = self.num_rows();
+        // Padding rows carry IS_NEW_BLAKE alone.
+        let mut columns: [PolynomialValues<F>; NUM_BLAKE3_KNOWN_COLUMNS] = core::array::from_fn(|c| {
+            let padding = if c == BLAKE3_COL_MAP.row_flags_packed {
+                F::from_canonical_u64(1 << 9)
+            } else {
+                F::ZERO
+            };
+            PolynomialValues::new(vec![padding; num_rows])
+        });
+        let [
+            row_flags_packed,
+            ctl_key_base,
+            is_int8_message,
+            is_scale_message,
+            cv_route_key_or_tweak,
+            moe_outer_indices_packed,
+            word_pin_first,
+            word_pin_second,
+        ] = &mut columns;
+        self.instructions
+            .par_iter()
+            .zip(
+                row_flags_packed
+                    .values
+                    .par_chunks_mut(ROWS_PER_COMPRESSION)
+                    .zip(ctl_key_base.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(is_int8_message.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(is_scale_message.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(cv_route_key_or_tweak.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(moe_outer_indices_packed.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(word_pin_first.values.par_chunks_mut(ROWS_PER_COMPRESSION))
+                    .zip(word_pin_second.values.par_chunks_mut(ROWS_PER_COMPRESSION)),
+            )
+            .for_each(|(instruction, chunks)| {
+                let (chunks, word_pin_second) = chunks;
+                let (chunks, word_pin_first) = chunks;
+                let (chunks, moe_outer_indices_packed) = chunks;
+                let (chunks, cv_route_key_or_tweak) = chunks;
+                let (chunks, is_scale_message) = chunks;
+                let ((row_flags_packed, ctl_key_base), is_int8_message) = chunks;
+                self.fill_known_compression(
+                    instruction,
+                    inputs,
+                    [
+                        row_flags_packed,
+                        ctl_key_base,
+                        is_int8_message,
+                        is_scale_message,
+                        cv_route_key_or_tweak,
+                        moe_outer_indices_packed,
+                        word_pin_first,
+                        word_pin_second,
+                    ],
+                );
+            });
+        columns.into()
+    }
+
+    fn fill_known_compression<F: RichField>(
+        &self,
+        instr: &Blake3Instruction,
+        inputs: &Blake3KnownInputs,
+        rows: [&mut [F]; NUM_BLAKE3_KNOWN_COLUMNS],
+    ) {
+        let [
+            row_flags_packed,
+            ctl_key_base,
+            is_int8_message,
+            is_scale_message,
+            cv_route_key_or_tweak,
+            moe_outer_indices_packed,
+            word_pin_first,
+            word_pin_second,
+        ] = rows;
         // The routing/offsets planes have no liveness length: their rows' class (a) data
         // (selectors, pins, chain gates) is driven by the MoE schedule, never by a byte count.
         let raw_lens: [usize; NUM_PLANES] = [
@@ -1347,180 +1512,148 @@ impl Blake3Program {
         const MODE_AUX_BITS: u64 = (1 << 12) | (1 << 13);
         const MODE_CV_BITS: u64 = 1 << 13;
 
-        let mut row_flags_packed = vec![0u64; num_rows];
-        let mut ctl_key_base = vec![F::ZERO; num_rows];
-        let mut is_int8_message = vec![F::ZERO; num_rows];
-        let mut is_scale_message = vec![F::ZERO; num_rows];
-        let mut cv_route_key_or_tweak = vec![F::ZERO; num_rows];
-        let mut moe_outer_indices_packed = vec![F::ZERO; num_rows];
-        let mut word_pin_first = vec![F::ZERO; num_rows];
-        let mut word_pin_second = vec![F::ZERO; num_rows];
+        for j in 0..ROWS_PER_COMPRESSION {
+            let r = j;
+            let mut bits = 0u64;
+            if j == 0 {
+                bits |= 1 << 9; // IS_NEW_BLAKE
+                match instr.cv {
+                    CvSource::KeyA => bits |= 1 << 0,
+                    CvSource::KeyB => bits |= 1 << 1,
+                    CvSource::JackpotKey => bits |= 1 << 2,
+                    CvSource::Iv => bits |= 1 << 3,
+                    CvSource::Chain(_) => {} // the row-0 fetch below carries IS_CV_IN instead
+                }
+            }
+            if j == 1 {
+                cv_route_key_or_tweak[r] = F::from_canonical_u64(instr.tweak_packed());
+            }
+            if j == ROWS_PER_COMPRESSION - 1 {
+                bits |= 1 << 10; // IS_LAST_ROUND
+                match instr.bind {
+                    Some(PublicBinding::HashA) => bits |= 1 << 4,
+                    Some(PublicBinding::HashB) => bits |= 1 << 5,
+                    Some(PublicBinding::HashRouting) => bits |= 1 << 6,
+                    Some(PublicBinding::HashOffsets) => bits |= 1 << 16,
+                    _ => {}
+                }
+            }
+            if instr.bind == Some(PublicBinding::HashJackpot) {
+                bits |= 1 << 7; // all 8 rows (the lottery CTL filter, see columns.rs)
+            }
 
-        for (c, instr) in self.instructions.iter().enumerate() {
-            let r0 = ROWS_PER_COMPRESSION * c;
-            for j in 0..ROWS_PER_COMPRESSION {
-                let r = r0 + j;
-                let mut bits = 0u64;
-                if j == 0 {
-                    bits |= 1 << 9; // IS_NEW_BLAKE
-                    match instr.cv {
-                        CvSource::KeyA => bits |= 1 << 0,
-                        CvSource::KeyB => bits |= 1 << 1,
-                        CvSource::JackpotKey => bits |= 1 << 2,
-                        CvSource::Iv => bits |= 1 << 3,
-                        CvSource::Chain(_) => {} // the row-0 fetch below carries IS_CV_IN instead
+            match instr.msg {
+                MessageSource::PlaneBytes { plane, offset, ctl_base } => {
+                    bits |= if plane == PlaneId::Routing || plane == PlaneId::Offsets {
+                        MODE_AUX_BITS
+                    } else {
+                        MODE_BYTES_BITS
+                    };
+                    let byte_offset = offset + NUM_UINT8 * j;
+                    let live = byte_offset + NUM_UINT8 <= raw_lens[plane.index()];
+                    match plane {
+                        PlaneId::AValues | PlaneId::BValues if live => {
+                            is_int8_message[r] = F::ONE;
+                            ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j) as u64);
+                        }
+                        PlaneId::AScales | PlaneId::BScales if live => {
+                            is_scale_message[r] = F::ONE;
+                            ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j / 2) as u64);
+                        }
+                        PlaneId::Routing => {
+                            // Selective pinning, exactly the deployed chip: a selector
+                            // fires only where this row ingests a sampled entry, and the
+                            // packed word carries only the pinned public values.
+                            let base = offset / 4 + 2 * j;
+                            let (w0, w1) = (self.routing_pin_at(base), self.routing_pin_at(base + 1));
+                            if w0.is_some() {
+                                bits |= 1 << 14; // IS_FIRST_OUTER
+                            }
+                            if w1.is_some() {
+                                bits |= 1 << 15; // IS_SECOND_OUTER
+                            }
+                            moe_outer_indices_packed[r] = F::from_canonical_u64(w0.unwrap_or(0) + (w1.unwrap_or(0) << 26));
+                            let s = self.moe.as_ref().expect("routing rows imply a MoE schedule");
+                            bits |= 1 << 21; // IS_CHAIN_STRICT
+                            bits |= 1 << 24; // IS_CHAIN_DATA
+                            let g = 16 * s.routing_block_base() + base;
+                            let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
+                            bits |= u64::from(intra) << 19;
+                            bits |= u64::from(inter) << 20;
+                            bits |= u64::from(bound_first) << 22;
+                            bits |= u64::from(bound_second) << 23;
+                            if bound_first {
+                                word_pin_first[r] = F::from_canonical_u32(s.m - 1);
+                            }
+                            if bound_second {
+                                word_pin_second[r] = F::from_canonical_u32(s.m - 1);
+                            }
+                        }
+                        PlaneId::Offsets => {
+                            let s = self.moe.as_ref().expect("offsets rows imply a MoE schedule");
+                            bits |= 1 << 24; // IS_CHAIN_DATA
+                            let p = offset / 4 + 2 * j;
+                            if let Some(v) = s.offsets_pin_at(p) {
+                                bits |= 1 << 17; // IS_WORD_PIN_FIRST
+                                word_pin_first[r] = F::from_canonical_u64(v);
+                            }
+                            if let Some(v) = s.offsets_pin_at(p + 1) {
+                                bits |= 1 << 18; // IS_WORD_PIN_SECOND
+                                word_pin_second[r] = F::from_canonical_u64(v);
+                            }
+                            let (intra, inter) = s.offsets_chain_at(p);
+                            bits |= u64::from(intra) << 19;
+                            bits |= u64::from(inter) << 20;
+                        }
+                        _ => {} // Chunk-padding row: channel filters stay off.
                     }
                 }
-                if j == 1 {
-                    cv_route_key_or_tweak[r] = F::from_canonical_u64(instr.tweak_packed());
-                }
-                if j == ROWS_PER_COMPRESSION - 1 {
-                    bits |= 1 << 10; // IS_LAST_ROUND
-                    match instr.bind {
-                        Some(PublicBinding::HashA) => bits |= 1 << 4,
-                        Some(PublicBinding::HashB) => bits |= 1 << 5,
-                        Some(PublicBinding::HashRouting) => bits |= 1 << 6,
-                        Some(PublicBinding::HashOffsets) => bits |= 1 << 16,
-                        _ => {}
-                    }
-                }
-                if instr.bind == Some(PublicBinding::HashJackpot) {
-                    bits |= 1 << 7; // all 8 rows (the lottery CTL filter, see columns.rs)
-                }
-
-                match instr.msg {
-                    MessageSource::PlaneBytes { plane, offset, ctl_base } => {
-                        bits |= if plane == PlaneId::Routing || plane == PlaneId::Offsets {
-                            MODE_AUX_BITS
-                        } else {
-                            MODE_BYTES_BITS
-                        };
-                        let byte_offset = offset + NUM_UINT8 * j;
+                MessageSource::PlaneBytesSplit {
+                    plane,
+                    ctl_base,
+                    offset,
+                    skip,
+                    take,
+                    ..
+                } => {
+                    if (skip..skip + take).contains(&j) {
+                        bits |= MODE_BYTES_BITS;
+                        let byte_offset = offset + NUM_UINT8 * (j - skip);
                         let live = byte_offset + NUM_UINT8 <= raw_lens[plane.index()];
                         match plane {
                             PlaneId::AValues | PlaneId::BValues if live => {
                                 is_int8_message[r] = F::ONE;
-                                ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j) as u64);
+                                ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip)) as u64);
                             }
                             PlaneId::AScales | PlaneId::BScales if live => {
                                 is_scale_message[r] = F::ONE;
-                                ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * j / 2) as u64);
+                                ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip) / 2) as u64);
                             }
-                            PlaneId::Routing => {
-                                // Selective pinning, exactly the deployed chip: a selector
-                                // fires only where this row ingests a sampled entry, and the
-                                // packed word carries only the pinned public values.
-                                let base = offset / 4 + 2 * j;
-                                let (w0, w1) = (self.routing_pin_at(base), self.routing_pin_at(base + 1));
-                                if w0.is_some() {
-                                    bits |= 1 << 14; // IS_FIRST_OUTER
-                                }
-                                if w1.is_some() {
-                                    bits |= 1 << 15; // IS_SECOND_OUTER
-                                }
-                                moe_outer_indices_packed[r] = F::from_canonical_u64(w0.unwrap_or(0) + (w1.unwrap_or(0) << 26));
-                                let s = self.moe.as_ref().expect("routing rows imply a MoE schedule");
-                                bits |= 1 << 21; // IS_CHAIN_STRICT
-                                bits |= 1 << 24; // IS_CHAIN_DATA
-                                let g = 16 * s.routing_block_base() + base;
-                                let (intra, inter, bound_first, bound_second) = s.routing_chain_at(g);
-                                bits |= u64::from(intra) << 19;
-                                bits |= u64::from(inter) << 20;
-                                bits |= u64::from(bound_first) << 22;
-                                bits |= u64::from(bound_second) << 23;
-                                if bound_first {
-                                    word_pin_first[r] = F::from_canonical_u32(s.m - 1);
-                                }
-                                if bound_second {
-                                    word_pin_second[r] = F::from_canonical_u32(s.m - 1);
-                                }
-                            }
-                            PlaneId::Offsets => {
-                                let s = self.moe.as_ref().expect("offsets rows imply a MoE schedule");
-                                bits |= 1 << 24; // IS_CHAIN_DATA
-                                let p = offset / 4 + 2 * j;
-                                if let Some(v) = s.offsets_pin_at(p) {
-                                    bits |= 1 << 17; // IS_WORD_PIN_FIRST
-                                    word_pin_first[r] = F::from_canonical_u64(v);
-                                }
-                                if let Some(v) = s.offsets_pin_at(p + 1) {
-                                    bits |= 1 << 18; // IS_WORD_PIN_SECOND
-                                    word_pin_second[r] = F::from_canonical_u64(v);
-                                }
-                                let (intra, inter) = s.offsets_chain_at(p);
-                                bits |= u64::from(intra) << 19;
-                                bits |= u64::from(inter) << 20;
-                            }
-                            _ => {} // Chunk-padding row: channel filters stay off.
+                            _ => {}
                         }
-                    }
-                    MessageSource::PlaneBytesSplit {
-                        plane,
-                        ctl_base,
-                        offset,
-                        skip,
-                        take,
-                        ..
-                    } => {
-                        if (skip..skip + take).contains(&j) {
-                            bits |= MODE_BYTES_BITS;
-                            let byte_offset = offset + NUM_UINT8 * (j - skip);
-                            let live = byte_offset + NUM_UINT8 <= raw_lens[plane.index()];
-                            match plane {
-                                PlaneId::AValues | PlaneId::BValues if live => {
-                                    is_int8_message[r] = F::ONE;
-                                    ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip)) as u64);
-                                }
-                                PlaneId::AScales | PlaneId::BScales if live => {
-                                    is_scale_message[r] = F::ONE;
-                                    ctl_key_base[r] = F::from_canonical_u64(ctl_base + (NUM_UINT8 * (j - skip) / 2) as u64);
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            bits |= MODE_AUX_BITS;
-                        }
-                    }
-                    MessageSource::AuxBytes { .. } | MessageSource::Lottery => bits |= MODE_AUX_BITS,
-                    MessageSource::Parent { left, right } => {
-                        let child = if j < ROWS_PER_COMPRESSION / 2 { left } else { right };
-                        match child {
-                            CvRef::Auxiliary(_) => bits |= MODE_AUX_BITS,
-                            CvRef::Instruction(_) if j % 4 == 3 => bits |= MODE_CV_BITS,
-                            CvRef::Instruction(_) => {}
-                        }
+                    } else {
+                        bits |= MODE_AUX_BITS;
                     }
                 }
-                row_flags_packed[r] = bits;
+                MessageSource::AuxBytes { .. } | MessageSource::Lottery => bits |= MODE_AUX_BITS,
+                MessageSource::Parent { left, right } => {
+                    let child = if j < ROWS_PER_COMPRESSION / 2 { left } else { right };
+                    match child {
+                        CvRef::Auxiliary(_) => bits |= MODE_AUX_BITS,
+                        CvRef::Instruction(_) if j % 4 == 3 => bits |= MODE_CV_BITS,
+                        CvRef::Instruction(_) => {}
+                    }
+                }
             }
-
-            // CV-routing fetches: IS_CV_IN plus the source-row pointer (rows 0/3/7 — never the
-            // tweak row 1).
-            for (j, src) in instr.fetches() {
-                row_flags_packed[r0 + j] |= 1 << 8;
-                cv_route_key_or_tweak[r0 + j] = F::from_canonical_usize(ROWS_PER_COMPRESSION * src + (ROWS_PER_COMPRESSION - 1));
-            }
+            row_flags_packed[r] = F::from_canonical_u64(bits);
         }
 
-        // Padding rows carry IS_NEW_BLAKE alone.
-        for bits in row_flags_packed.iter_mut().take(num_rows).skip(num_live) {
-            *bits = 1 << 9;
+        // CV-routing fetches: IS_CV_IN plus the source-row pointer (rows 0/3/7 — never the
+        // tweak row 1).
+        for (j, src) in instr.fetches() {
+            row_flags_packed[j] += F::from_canonical_u64(1 << 8);
+            cv_route_key_or_tweak[j] = F::from_canonical_usize(ROWS_PER_COMPRESSION * src + (ROWS_PER_COMPRESSION - 1));
         }
-
-        let row_flags_packed: Vec<F> = row_flags_packed.into_iter().map(F::from_canonical_u64).collect();
-        [
-            row_flags_packed,
-            ctl_key_base,
-            is_int8_message,
-            is_scale_message,
-            cv_route_key_or_tweak,
-            moe_outer_indices_packed,
-            word_pin_first,
-            word_pin_second,
-        ]
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
     }
 }
 

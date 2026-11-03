@@ -234,44 +234,75 @@ pub struct FmaBlockView<T: Copy> {
     pub out_exp_is_zero: T,
 }
 
-/// View of one InputQuantStark trace row: verifier-known columns first, followed by the A side
-/// and then the B side. The two sides carry identical column blocks.
+/// One InputQuantStark row: verifier-known codes, AIR-pinned schedule/noise decodes (group G),
+/// then identical A-side and B-side column blocks.
 #[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct InputQuantColumnsView<T: Copy> {
     // ------------------------------------------------------------------------------------------
-    // Verifier-known columns. They are committed with the trace, but the verifier independently
-    // recomputes the public-seed noise and geometry-derived schedule, then checks the opened
-    // values for equality. They need no duplicate AIR equations. These are the leading
-    // NUM_INPUT_QUANT_KNOWN_COLUMNS columns.
+    // Leading NUM_INPUT_QUANT_KNOWN_COLUMNS columns: committed with the trace, recomputed
+    // from public noise seeds, and checked by the verifier at the opening points.
     // ------------------------------------------------------------------------------------------
-    /// A-side bf16 noise `n = (E @ F)[element_index]`, derived from the public noise seeds.
-    /// The verifier recomputes these fields; finite subnormals are allowed.
+    /// A-side bf16 noise code `n = (E @ F)[element_index]`, derived from the public noise
+    /// seeds and packed as `SIGN*2^15 + EXP*2^7 + MANTISSA` (0 on dead rows). G binds the
+    /// committed decode fields `noise_a` to this code.
+    pub noise_code_a: T,
+    /// B-side packed noise code (see `noise_code_a`).
+    pub noise_code_b: T,
+
+    // ------------------------------------------------------------------------------------------
+    // Group G pins the schedule through boundary/transition constraints and the noise
+    // decodes through recomposition and EXPINFO/PAIR128 lookups.
+    // ------------------------------------------------------------------------------------------
+    /// A-side bf16 decode: G1 recomposes `noise_code_a`, G2 makes the sign boolean,
+    /// EXPINFO pins the finite exponent and zero flag, and PAIR128 bounds both mantissas
+    /// below 128. These checks make the decode unique, including finite subnormals.
     pub noise_a: Bf16FieldsView<T>,
     /// B-side noise decode fields (see `noise_a`).
     pub noise_b: Bf16FieldsView<T>,
     /// 1 on the last row of each k-element group; CTL filter of the Scale channel; gates the
-    /// accumulator resets. Period k (closed-form zeta evaluation).
+    /// accumulator resets. Pinned to `[GROUP_COUNTER = k-1]` off the last row (G3-G4) and
+    /// forced on the trace's last row (the trailing dead group may be truncated).
     pub is_group_final: T,
     /// Flat element index (= trace row index); define `ELEM_IDX = element_index` — the A CTL
     /// key. The B key is `ELEM_IDX + h*k` (the public input [`B_KEY_OFFSET_PUBLIC_INPUT`]),
-    /// keeping both sides' key spaces disjoint.
+    /// keeping both sides' key spaces disjoint. Pinned by the row counter (G6).
     pub element_index: T,
     /// Period-2 flag; filter of the pair-packed Blake3/Matmul channels (each even row's tuple
-    /// carries this row's and the next row's element).
+    /// carries this row's and the next row's element). Pinned by the alternation gadget (G7),
+    /// cyclically closed (the trace height is even).
     pub is_even_row: T,
-    /// Period-8 flag (`element_index ≡ 0 mod 8`); filter of the scales channel and anchor of the
-    /// scale-field copy constraints (P2).
+    /// Period-8 flag (`element_index ≡ 0 mod 8`); filter of the scales channel and anchor of
+    /// the scale-field copy constraints (P2). Pinned to the mod-8 counter (G8-G10),
+    /// cyclically closed (8 divides the trace height).
     pub is_block_start: T,
     /// Scales-plane block index `floor(element_index / 8)`; define `BLK_IDX = block_index` —
     /// the A scales CTL key. The B key is `BLK_IDX + h*k/8` (the public input
-    /// [`B_BLOCK_KEY_OFFSET_PUBLIC_INPUT`]).
+    /// [`B_BLOCK_KEY_OFFSET_PUBLIC_INPUT`]). Pinned by `IS_BLOCK_START` increments (G11).
     pub block_index: T,
     /// A-side liveness: one on rows `[0, h*k)`, zero beyond. It filters A-side CTLs; dead rows
-    /// carry the phantom fill.
+    /// carry the phantom fill. Pinned by the boolean/flip gadget (G12): changes only at
+    /// `ELEM_IDX = h*k`, where the drop is forced via `a_flip_inv`.
     pub a_live: T,
-    /// B-side liveness: 1 on rows `[0, w*k)`, 0 beyond (see `a_live`).
+    /// B-side liveness: 1 on rows `[0, w*k)`, 0 beyond (see `a_live`; bound
+    /// [`B_LIVE_BOUND_PUBLIC_INPUT`]).
     pub b_live: T,
+    /// In-group position `ELEM_IDX mod k` (G3-G4). A truncated tail closes on the last row
+    /// without requiring this counter to equal `k-1`.
+    pub group_counter: T,
+    /// Inverse witness for `GROUP_COUNTER - (k-1)` on non-group-final rows (G4); forces
+    /// `IS_GROUP_FINAL` exactly at the group boundary. Unconstrained on group-final rows.
+    pub group_final_inv: T,
+    /// Row index mod 8 (G8-G10): the `IS_BLOCK_START` driver.
+    pub block8_counter: T,
+    /// Inverse witness for `BLOCK8_COUNTER - 7` on non-block-final rows (G9); forces
+    /// `IS_BLOCK_START` exactly at block boundaries.
+    pub block8_counter_inv: T,
+    /// Inverse witness for `ELEM_IDX - h*k` on A-live rows (G12); forces the A-liveness drop
+    /// exactly at row `h*k`. Unconstrained on dead rows.
+    pub a_flip_inv: T,
+    /// Inverse witness for `ELEM_IDX - w*k` on B-live rows (see `a_flip_inv`).
+    pub b_flip_inv: T,
 
     // ------------------------------------------------------------------------------------------
     // A side (89 columns).
@@ -514,16 +545,17 @@ pub struct InputQuantColumnsView<T: Copy> {
 /// Total number of committed InputQuantStark columns.
 pub const NUM_INPUT_QUANT_COLUMNS: usize = size_of::<InputQuantColumnsView<u8>>();
 
-// Layout total: 15 verifier-known columns plus two identical 107-column sides. Each side
-// includes one FMA rounding-key high bit, 21 block-L2 columns, the three jackpot-liveness
-// columns, and the 22-column summand score (jackpot check 4).
-const _: () = assert!(NUM_INPUT_QUANT_COLUMNS == 229);
+// Layout total: 2 verifier-known columns, the 22-column AIR-pinned schedule/noise-decode
+// block (group G), plus two identical 107-column sides. Each side includes one FMA
+// rounding-key high bit, 21 block-L2 columns, the three jackpot-liveness columns, and the
+// 22-column summand score (jackpot check 4).
+const _: () = assert!(NUM_INPUT_QUANT_COLUMNS == 237);
 
 /// `2^Wl2`, the job's block-L2 precision scale
 /// (`Wl2 = 27 - ceil(log2 k)`, in `[11, 17]` over the envelope `1024 <= k <= 2^16`).
 pub const WL2_POW_PUBLIC_INPUT: usize = 0;
 /// `h*k`: the B slots' element-key offset. The B key spaces stay disjoint from A's
-/// (`ELEM_IDX` in `[0, h*k)`) as `ELEM_IDX + h*k`.
+/// (`ELEM_IDX` in `[0, h*k)`) as `ELEM_IDX + h*k`. Also the A-liveness flip bound (G12).
 pub const B_KEY_OFFSET_PUBLIC_INPUT: usize = 1;
 /// `h*k/8`: the B slot's block-key offset (`BLK_IDX + h*k/8`, one scales block per 8 elements).
 pub const B_BLOCK_KEY_OFFSET_PUBLIC_INPUT: usize = 2;
@@ -531,19 +563,20 @@ pub const B_BLOCK_KEY_OFFSET_PUBLIC_INPUT: usize = 2;
 pub const OPERAND_MULT_A_PUBLIC_INPUT: usize = 3;
 /// `h`: the B operand-code multiplicity — Matmul reads each B element in `h` output cells.
 pub const OPERAND_MULT_B_PUBLIC_INPUT: usize = 4;
-/// Number of InputQuantStark public inputs. The geometry slots (1..=4) feed the CTL column
-/// expressions (`ctl.rs`), keeping the CTL structure — hence the compiled verifier circuit —
-/// free of geometry constants; the native gateway pins every slot to its statement-derived
-/// value.
-pub const NUM_INPUT_QUANT_PUBLIC_INPUTS: usize = 5;
+/// `k`: the group length — the `GROUP_COUNTER`/`IS_GROUP_FINAL` tie (G3/G4).
+pub const K_PUBLIC_INPUT: usize = 5;
+/// `w*k`: the B-liveness flip bound (G12's B instance).
+pub const B_LIVE_BOUND_PUBLIC_INPUT: usize = 6;
+/// Number of public inputs. Geometry enters the CTL expressions and group G through these
+/// slots, keeping the verifier circuit independent of job geometry. The native gateway
+/// pins every slot to its statement-derived value.
+pub const NUM_INPUT_QUANT_PUBLIC_INPUTS: usize = 7;
 
 columns_view!(InputQuantColumnsView, NUM_INPUT_QUANT_COLUMNS, INPUT_QUANT_COL_MAP);
 
-/// Number of leading verifier-known columns: both noise decodes, schedule flags and indices,
-/// and per-side liveness.
-/// `InputQuantProgram::known_values` recomputes them from public seeds and geometry, and the
-/// batch verifier checks their trace openings.
-pub const NUM_INPUT_QUANT_KNOWN_COLUMNS: usize = INPUT_QUANT_COL_MAP.b_live + 1;
+/// Number of leading verifier-known columns: the two packed noise codes, recomputed by
+/// `InputQuantProgram::known_values` and checked against their trace openings.
+pub const NUM_INPUT_QUANT_KNOWN_COLUMNS: usize = INPUT_QUANT_COL_MAP.noise_code_b + 1;
 
 #[cfg(test)]
 mod tests {
@@ -558,36 +591,42 @@ mod tests {
             assert_eq!(c, i);
         }
         // Verifier-known columns occupy the leading contiguous range.
-        assert_eq!(INPUT_QUANT_COL_MAP.noise_a.sign, 0);
-        assert_eq!(INPUT_QUANT_COL_MAP.noise_b.exp_is_zero, 7);
-        assert_eq!(INPUT_QUANT_COL_MAP.is_group_final, 8);
-        assert_eq!(INPUT_QUANT_COL_MAP.block_index, 12);
-        assert_eq!(INPUT_QUANT_COL_MAP.a_live, 13);
-        assert_eq!(INPUT_QUANT_COL_MAP.b_live, 14);
-        assert_eq!(NUM_INPUT_QUANT_KNOWN_COLUMNS, 15);
-        // A side spans [15, 121], B side [122, 228].
-        assert_eq!(INPUT_QUANT_COL_MAP.int8_byte_a, 15);
-        assert_eq!(INPUT_QUANT_COL_MAP.dead_count_a, 99);
-        assert_eq!(INPUT_QUANT_COL_MAP.x_width_a, 100);
-        assert_eq!(INPUT_QUANT_COL_MAP.sigma_norm_a, 103);
-        assert_eq!(INPUT_QUANT_COL_MAP.sum_of_squares_top_a, 117);
-        assert_eq!(INPUT_QUANT_COL_MAP.lambda_a, 121);
-        assert_eq!(INPUT_QUANT_COL_MAP.int8_byte_b, 122);
+        assert_eq!(INPUT_QUANT_COL_MAP.noise_code_a, 0);
+        assert_eq!(INPUT_QUANT_COL_MAP.noise_code_b, 1);
+        assert_eq!(NUM_INPUT_QUANT_KNOWN_COLUMNS, 2);
+        // The AIR-pinned schedule/noise-decode block (group G) spans [2, 22].
+        assert_eq!(INPUT_QUANT_COL_MAP.noise_a.sign, 2);
+        assert_eq!(INPUT_QUANT_COL_MAP.noise_b.exp_is_zero, 9);
+        assert_eq!(INPUT_QUANT_COL_MAP.is_group_final, 10);
+        assert_eq!(INPUT_QUANT_COL_MAP.element_index, 11);
+        assert_eq!(INPUT_QUANT_COL_MAP.block_index, 14);
+        assert_eq!(INPUT_QUANT_COL_MAP.a_live, 15);
+        assert_eq!(INPUT_QUANT_COL_MAP.b_live, 16);
+        assert_eq!(INPUT_QUANT_COL_MAP.group_counter, 17);
+        assert_eq!(INPUT_QUANT_COL_MAP.b_flip_inv, 22);
+        // A side spans [23, 129], B side [130, 236].
+        assert_eq!(INPUT_QUANT_COL_MAP.int8_byte_a, 23);
+        assert_eq!(INPUT_QUANT_COL_MAP.dead_count_a, 107);
+        assert_eq!(INPUT_QUANT_COL_MAP.x_width_a, 108);
+        assert_eq!(INPUT_QUANT_COL_MAP.sigma_norm_a, 111);
+        assert_eq!(INPUT_QUANT_COL_MAP.sum_of_squares_top_a, 125);
+        assert_eq!(INPUT_QUANT_COL_MAP.lambda_a, 129);
+        assert_eq!(INPUT_QUANT_COL_MAP.int8_byte_b, 130);
         assert_eq!(INPUT_QUANT_COL_MAP.lambda_b, NUM_INPUT_QUANT_COLUMNS - 1);
         // Spot-check the nested blocks.
-        assert_eq!(INPUT_QUANT_COL_MAP.block_l2_a.block_int_squared_sum, 32);
-        assert_eq!(INPUT_QUANT_COL_MAP.block_l2_a.frame_doubled_scale_exponent, 38);
-        assert_eq!(INPUT_QUANT_COL_MAP.block_l2_a.running_l2_frame_sum, 52);
-        assert_eq!(INPUT_QUANT_COL_MAP.max_abs_a, 53);
-        assert_eq!(INPUT_QUANT_COL_MAP.noise_scale_multiply_a.sig_product, 59);
-        assert_eq!(INPUT_QUANT_COL_MAP.noised_fma_product_a, 66);
-        assert_eq!(INPUT_QUANT_COL_MAP.noised_value_fma_a.product_scale_ge_addend, 67);
-        assert_eq!(INPUT_QUANT_COL_MAP.noised_value_fma_a.out_exp_is_zero, 95);
-        assert_eq!(INPUT_QUANT_COL_MAP.code_noised_a, 96);
-        assert_eq!(INPUT_QUANT_COL_MAP.dead_bound_a, 97);
-        assert_eq!(INPUT_QUANT_COL_MAP.block_l2_b.scaled_block_product_limbs[0], 146);
-        assert_eq!(INPUT_QUANT_COL_MAP.noised_fma_product_b, 173);
-        assert_eq!(INPUT_QUANT_COL_MAP.code_noised_b, 203);
+        assert_eq!(INPUT_QUANT_COL_MAP.block_l2_a.block_int_squared_sum, 40);
+        assert_eq!(INPUT_QUANT_COL_MAP.block_l2_a.frame_doubled_scale_exponent, 46);
+        assert_eq!(INPUT_QUANT_COL_MAP.block_l2_a.running_l2_frame_sum, 60);
+        assert_eq!(INPUT_QUANT_COL_MAP.max_abs_a, 61);
+        assert_eq!(INPUT_QUANT_COL_MAP.noise_scale_multiply_a.sig_product, 67);
+        assert_eq!(INPUT_QUANT_COL_MAP.noised_fma_product_a, 74);
+        assert_eq!(INPUT_QUANT_COL_MAP.noised_value_fma_a.product_scale_ge_addend, 75);
+        assert_eq!(INPUT_QUANT_COL_MAP.noised_value_fma_a.out_exp_is_zero, 103);
+        assert_eq!(INPUT_QUANT_COL_MAP.code_noised_a, 104);
+        assert_eq!(INPUT_QUANT_COL_MAP.dead_bound_a, 105);
+        assert_eq!(INPUT_QUANT_COL_MAP.block_l2_b.scaled_block_product_limbs[0], 154);
+        assert_eq!(INPUT_QUANT_COL_MAP.noised_fma_product_b, 181);
+        assert_eq!(INPUT_QUANT_COL_MAP.code_noised_b, 211);
     }
 
     #[test]
@@ -597,7 +636,8 @@ mod tests {
             *v = i as u64 * 3 + 1;
         }
         let view: InputQuantColumnsView<u64> = arr.into();
-        assert_eq!(view.noise_a.sign, 1);
+        assert_eq!(view.noise_code_a, 1);
+        assert_eq!(view.noise_a.sign, INPUT_QUANT_COL_MAP.noise_a.sign as u64 * 3 + 1);
         assert_eq!(view.int8_byte_a, INPUT_QUANT_COL_MAP.int8_byte_a as u64 * 3 + 1);
         assert_eq!(
             view.noised_value_fma_b.rounding_significand_key,
