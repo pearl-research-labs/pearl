@@ -548,7 +548,8 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
                 vec![],
             ),
         ),
-        // ---- P3/S2: EXPINFO on the scale and beta exponents (finiteness + the flag). ----
+        // ---- P3/S2/G1: EXPINFO pins each scale/beta/noise exponent to [0, 254] and its
+        // zero flag. The noise lookup supplies the exponent bounds for G1's code decode. ----
         LutLookup {
             table: LutTable::ExpInfo,
             keys: vec![Column::single(s.scale_exp)],
@@ -559,6 +560,12 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
             table: LutTable::ExpInfo,
             keys: vec![Column::single(s.beta_exp)],
             values: vec![Column::single(s.beta_exp_is_zero)],
+            filter: Filter::default(),
+        },
+        LutLookup {
+            table: LutTable::ExpInfo,
+            keys: vec![Column::single(s.noise_exp)],
+            values: vec![Column::single(s.noise_exp_is_zero)],
             filter: Filter::default(),
         },
         // ---- P1: INT8DEC (key domain = the byte range proof). ----
@@ -793,9 +800,9 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
 
 /// InputQuantStark's complete per-row lookup inventory: RC16 x70 (including two FMA
 /// rounding-key range proofs, the four liveness certificates, and the sixteen summand-score
-/// certificates of jackpot check 4), PAIR128 x3, EXPINFO x4, CLAMP22 x6, INT8DEC x2,
-/// POW2D x12, RNERND x6, WIDTH16 x2, LOG16 x2, and QCAST x2. These 109 LUT instances plus
-/// the eight CTL fractions above give 117 logup fractions in total.
+/// certificates of jackpot check 4), PAIR128 x4, EXPINFO x6, CLAMP22 x6, INT8DEC x2,
+/// POW2D x12, RNERND x6, WIDTH16 x2, LOG16 x2, and QCAST x2. These 112 LUT instances plus
+/// the eight CTL fractions above give 120 logup fractions in total.
 pub fn input_quant_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
     let m = &INPUT_QUANT_COL_MAP;
     let a = side_cols_a();
@@ -804,11 +811,12 @@ pub fn input_quant_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
     let mut lookups = side_lut_lookups::<F>(&a);
     lookups.extend(side_lut_lookups::<F>(&b));
 
-    // ---- P3/S3: the cross-side mantissa pairs (PAIR128 x3). ----
+    // ---- P3/S3/G1: PAIR128 bounds both mantissas below 128, including G1's noise decode. ----
     for (ka, kb) in [
         (m.scale_a.mantissa, m.scale_b.mantissa),
         (m.alpha_a_mantissa, m.alpha_b_mantissa),
         (m.beta_a_mantissa, m.beta_b_mantissa),
+        (m.noise_a.mantissa, m.noise_b.mantissa),
     ] {
         lookups.push(LutLookup {
             table: LutTable::Pair128,
@@ -859,14 +867,14 @@ mod tests {
     #[test]
     fn lut_inventory_matches_documented_counts() {
         // Pinned inventory: RC16 x70 (including two FMA rounding-key checks, four liveness
-        // certificates, and sixteen summand-score certificates), PAIR128 x3, EXPINFO x4, CLAMP22 x6,
+        // certificates, and sixteen summand-score certificates), PAIR128 x4, EXPINFO x6, CLAMP22 x6,
         // INT8DEC x2, POW2D x12, RNERND x6, WIDTH16 x2, LOG16 x2, and QCAST x2. Adding the
-        // eight cross-table fractions gives 117.
+        // eight cross-table fractions gives 120.
         let lookups = input_quant_lut_lookups::<F>();
         let count = |t: LutTable| lookups.iter().filter(|l| l.table == t).count();
         assert_eq!(count(LutTable::Range16), 70);
-        assert_eq!(count(LutTable::Pair128), 3);
-        assert_eq!(count(LutTable::ExpInfo), 4);
+        assert_eq!(count(LutTable::Pair128), 4);
+        assert_eq!(count(LutTable::ExpInfo), 6);
         assert_eq!(count(LutTable::Clamp22), 6);
         assert_eq!(count(LutTable::Int8Dec), 2);
         assert_eq!(count(LutTable::Pow2D), 12);
@@ -874,7 +882,7 @@ mod tests {
         assert_eq!(count(LutTable::Width16), 2);
         assert_eq!(count(LutTable::Log16), 2);
         assert_eq!(count(LutTable::Qcast), 2);
-        assert_eq!(lookups.len(), 109);
+        assert_eq!(lookups.len(), 112);
         // Value-tuple arities per table.
         for l in &lookups {
             let expected_values = match l.table {

@@ -87,21 +87,16 @@ pub(crate) enum NoiseFactor {
 /// a constant 64 bytes (one BLAKE3 block) — to `rank` output bytes and normalizes
 /// them (see [`normalize_line`]). The caller resolves its `side` and the matching
 /// `seed`.
-pub(crate) fn sample_line(seed: &Hash256, side: Side, factor: NoiseFactor, line: u32, rank: u16) -> Vec<u8> {
-    let key = subkey(LABEL_NOISE_LINE, Some(seed));
-    let mut material = Vec::with_capacity(64);
-    material.push(side as u8);
-    material.push(factor as u8);
-    material.extend_from_slice(&line.to_le_bytes());
-    assert!(material.len() <= 64, "noise line material must fit one BLAKE3 block");
-    material.resize(64, 0);
-
-    let mut bytes = vec![0u8; usize::from(rank)];
-    let mut hasher = blake3::Hasher::new_keyed(&key);
+fn sample_line(key: &Hash256, side: u8, factor: u8, line: u32, bytes: &mut [u8]) {
+    let mut material = [0u8; 64];
+    material[0] = side;
+    material[1] = factor;
+    material[2..6].copy_from_slice(&line.to_le_bytes());
+    let mut hasher = blake3::Hasher::new_keyed(key);
     hasher.update(&material);
-    hasher.finalize_xof().fill(&mut bytes);
+    hasher.finalize_xof().fill(bytes);
 
-    normalize_line(&bytes)
+    normalize_line(bytes);
 }
 
 /// Decodes `bytes` into a signed integer line and renormalizes it to L2 norm
@@ -110,34 +105,30 @@ pub(crate) fn sample_line(seed: &Hash256, side: Side, factor: NoiseFactor, line:
 /// `norm_scaled = floor(||x||_2 * INT_SQRT_PREC)` (exact integer `isqrt`), then
 /// `scale = bf16(NOISE_TARGET_NORM * INT_SQRT_PREC) / bf16(norm_scaled)` (one
 /// BF16 rounding), then `entry_i = fp8(bf16(x_i) * scale)`.
-fn normalize_line(bytes: &[u8]) -> Vec<u8> {
+fn normalize_line(bytes: &mut [u8]) {
     // Each `x_i` in ±[1, 128]: bit 7 the sign, `(b & 0x7F) + 1` the magnitude.
-    // `x_i` is stored as i64 (only to carry the sign; the magnitude never
-    // exceeds 128) so `x_i^2 <= 2^14`, and with `r <= u16::MAX` the sum of
-    // squares stays within `u64` for the exact `.isqrt()` below.
-    let x: Vec<i64> = bytes
+    // The magnitude never exceeds 128, so `x_i^2 <= 2^14`, and with
+    // `r <= u16::MAX` the sum of squares stays within `u64` for the exact `.isqrt()`.
+    let sumsq: u64 = bytes
         .iter()
         .map(|&b| {
-            let sign = 1 - 2 * ((b >> 7) as i64); // +1 (bit 7 = 0) or -1
-            let magnitude = ((b & 0x7F) as i64) + 1; // uniform in [1, 128], never 0
-            sign * magnitude
+            let magnitude = u64::from(b & 0x7F) + 1;
+            magnitude * magnitude
         })
-        .collect();
-
-    let sumsq: u64 = x.iter().map(|&xi| (xi * xi) as u64).sum();
+        .sum();
     let norm_scaled = (sumsq * (INT_SQRT_PREC * INT_SQRT_PREC)).isqrt();
 
     let numer = f32_to_bf16((NOISE_TARGET_NORM * INT_SQRT_PREC as f64) as f32).expect("8192 is representable");
     let denom = f32_to_bf16(norm_scaled as f32).expect("norm_scaled < 2^24 is representable");
     let scale = bf16_div(numer, denom).expect("noise-line scale is finite");
 
-    x.iter()
-        .map(|&xi| {
-            let xb = f32_to_bf16(xi as f32).expect("|x_i| <= 128 is representable in bf16");
-            let entry = bf16_mul(xb, scale).expect("noise entry is finite");
-            f32_to_fp8_e4m3(bf16_to_f32(entry)).expect("noise entry is finite")
-        })
-        .collect()
+    for b in bytes {
+        let sign = 1 - 2 * i64::from(*b >> 7);
+        let xi = sign * (i64::from(*b & 0x7F) + 1);
+        let xb = f32_to_bf16(xi as f32).expect("|x_i| <= 128 is representable in bf16");
+        let entry = bf16_mul(xb, scale).expect("noise entry is finite");
+        *b = f32_to_fp8_e4m3(bf16_to_f32(entry)).expect("noise entry is finite");
+    }
 }
 
 /// Draws the four noise factors for one matmul instance.
@@ -152,22 +143,24 @@ fn normalize_line(bytes: &[u8]) -> Vec<u8> {
 pub(crate) fn sample_noise(k: usize, rank: u16, seeds: Sides<Hash256>, a_rows: &[u32], b_cols: &[u32]) -> Noise {
     use plonky2_maybe_rayon::*;
 
-    let e_a: Vec<u8> = a_rows
-        .par_iter()
-        .flat_map_iter(|&row| sample_line(&seeds.a, Side::A, NoiseFactor::E, row, rank))
-        .collect();
-    let e_b: Vec<u8> = b_cols
-        .par_iter()
-        .flat_map_iter(|&col| sample_line(&seeds.b, Side::B, NoiseFactor::E, col, rank))
-        .collect();
-    let f_a: Vec<u8> = (0..k as u32)
-        .into_par_iter()
-        .flat_map_iter(|i| sample_line(&seeds.b, Side::A, NoiseFactor::F, i, rank))
-        .collect();
-    let f_b: Vec<u8> = (0..k as u32)
-        .into_par_iter()
-        .flat_map_iter(|i| sample_line(&seeds.b, Side::B, NoiseFactor::F, i, rank))
-        .collect();
+    let rank = usize::from(rank);
+    let key_a = subkey(LABEL_NOISE_LINE, Some(&seeds.a));
+    let key_b = subkey(LABEL_NOISE_LINE, Some(&seeds.b));
+    let sample = |key: &Hash256, side: Side, factor: NoiseFactor, len: usize, indices: Option<&[u32]>| {
+        let mut values = vec![0u8; len * rank];
+        if len != 0 {
+            let (side, factor) = (side as u8, factor as u8);
+            values.par_chunks_mut(rank).enumerate().for_each(|(i, line)| {
+                let index = indices.map_or(i as u32, |indices| indices[i]);
+                sample_line(key, side, factor, index, line);
+            });
+        }
+        values
+    };
+    let e_a = sample(&key_a, Side::A, NoiseFactor::E, a_rows.len(), Some(a_rows));
+    let e_b = sample(&key_b, Side::B, NoiseFactor::E, b_cols.len(), Some(b_cols));
+    let f_a = sample(&key_b, Side::A, NoiseFactor::F, k, None);
+    let f_b = sample(&key_b, Side::B, NoiseFactor::F, k, None);
 
     Noise {
         a: OperandNoise { e: e_a, f: f_a },
@@ -199,6 +192,13 @@ mod tests {
     use crate::v4::api::primitives::Sides;
 
     use super::decode_hex_for_test as decode_hex;
+
+    fn sample_line_into(seed: &Hash256, side: Side, factor: NoiseFactor, line: u32, rank: u16) -> Vec<u8> {
+        let key = subkey(LABEL_NOISE_LINE, Some(seed));
+        let mut bytes = vec![0u8; usize::from(rank)];
+        sample_line(&key, side as u8, factor as u8, line, &mut bytes);
+        bytes
+    }
 
     fn fixed_seeds() -> Sides<Hash256> {
         Sides {
@@ -320,7 +320,7 @@ mod tests {
                 "59de69d9696352dee8cee7d4e6da66615be9df69dd66dfe0d7e44f685fe96553",
             ),
         ] {
-            assert_eq!(sample_line(seed, side, factor, line, 32), decode_hex(expected_hex));
+            assert_eq!(sample_line_into(seed, side, factor, line, 32), decode_hex(expected_hex));
         }
     }
 }

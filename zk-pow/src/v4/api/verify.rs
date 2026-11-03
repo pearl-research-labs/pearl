@@ -110,8 +110,7 @@ mod tests {
         assert!(format!("{err:#}").contains("depth 1 does not connect"), "{err:#}");
     }
 
-    /// This historical coherent fixture also exceeds the new consolidated census, so
-    /// removing Check 3 must not accidentally turn it into an accepted proof.
+    /// An admitted geometry still has to satisfy the consolidated skip census.
     #[test]
     fn plain_verifier_rejects_coherent_fixture_under_new_census() {
         let (header, plain) = fixture_job_untamed();

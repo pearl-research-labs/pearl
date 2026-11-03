@@ -34,6 +34,44 @@ impl Device {
             Self::B200 => B200 {}.matmul_fp8(a, b, acc, m, n, k),
         }
     }
+
+    /// Replay the noise matmul at its explicit rank and convert to row-major BF16.
+    /// Each `out[row * n + col]` replays the full rank-length rows of `a` and `b`;
+    /// output blocks do not split the products or change their accumulation order.
+    /// FP32 output blocks are bounded; no full FP32 matrix or reorder is needed.
+    pub(crate) fn matmul_fp8_bf16(self, a: &[u8], b: &[u8], m: usize, n: usize, rank: usize) -> Result<Vec<u16>> {
+        use plonky2_maybe_rayon::*;
+
+        ensure!(a.len() == m * rank);
+        ensure!(b.len() == n * rank);
+        let mut out = vec![0u16; m * n];
+        if out.is_empty() {
+            self.matmul_fp8(a, b, None, m, n, rank)?;
+            return Ok(out);
+        }
+        // 1024 FP32 outputs occupy at most 4 KiB per active block.
+        const OUTPUT_BLOCK: usize = 1024;
+        out.par_chunks_mut(OUTPUT_BLOCK)
+            .enumerate()
+            .try_for_each(|(block, out)| -> Result<()> {
+                let mut written = 0;
+                // A block may cross rows; each replay call stays within one row.
+                while written < out.len() {
+                    let cell = block * OUTPUT_BLOCK + written;
+                    let (row, col) = (cell / n, cell % n);
+                    let len = (n - col).min(out.len() - written);
+                    let a_row = &a[row * rank..(row + 1) * rank];
+                    let b_rows = &b[col * rank..(col + len) * rank];
+                    let values = self.matmul_fp8(a_row, b_rows, None, 1, len, rank)?;
+                    for (out, value) in out[written..written + len].iter_mut().zip(values) {
+                        *out = fp32_to_bf16_rne(value);
+                    }
+                    written += len;
+                }
+                Ok(())
+            })?;
+        Ok(out)
+    }
 }
 
 /// Intermediate fixed-point view of an f32 used by the matmul emulation.
@@ -254,7 +292,7 @@ fn matmul_fp8_windowed(
 
     let mut out: Vec<f32> = vec![0.0; m * n];
     let mut partials: Vec<Vec<f32>> = Vec::with_capacity(if record_partials { m * n } else { 0 });
-    let mut accumulator = Vec::with_capacity(group_size);
+    let mut accumulator = [GFloat::from(0.0); MMA_GROUP_PRODUCTS + 1];
     for i in 0..m {
         let a_row = &a[i * k..(i + 1) * k];
         for j in 0..n {
@@ -265,24 +303,27 @@ fn matmul_fp8_windowed(
             check_not_nan_or_inf_f32(initial)?;
             let mut cell_partials: Vec<f32> =
                 Vec::with_capacity(if record_partials { k.div_ceil(MMA_GROUP_PRODUCTS) } else { 0 });
-            accumulator.clear();
-            accumulator.push(GFloat::from(initial));
-            for (a_val, b_val) in a_row.iter().zip(b_col) {
-                accumulator.push(multiply_fp8_to_gfloat(*a_val, *b_val, zero_exp));
-                if accumulator.len() == group_size {
+            accumulator[0] = GFloat::from(initial);
+            let mut used = 1;
+            for (a_group, b_group) in a_row.chunks(MMA_GROUP_PRODUCTS).zip(b_col.chunks(MMA_GROUP_PRODUCTS)) {
+                for ((slot, &a), &b) in accumulator[1..].iter_mut().zip(a_group).zip(b_group) {
+                    *slot = multiply_fp8_to_gfloat(a, b, zero_exp);
+                }
+                used = a_group.len() + 1;
+                if used == group_size {
                     let collapsed: f32 = windowed_group_sum(&accumulator, zero_exp, significand_width).into();
                     if record_partials {
                         cell_partials.push(collapsed);
                     }
-                    accumulator.clear();
-                    accumulator.push(GFloat::from(collapsed));
+                    accumulator[0] = GFloat::from(collapsed);
+                    used = 1;
                 }
             }
             // The final (possibly partial) group; when k is a multiple of the
             // group size the accumulator holds a single already-collapsed
             // value and this renormalization is the identity.
-            let final_value: f32 = windowed_group_sum(&accumulator, zero_exp, significand_width).into();
-            if record_partials && accumulator.len() > 1 {
+            let final_value: f32 = windowed_group_sum(&accumulator[..used], zero_exp, significand_width).into();
+            if record_partials && used > 1 {
                 cell_partials.push(final_value);
             }
             out[i * n + j] = final_value;
@@ -469,6 +510,7 @@ impl H100 {
         let mut out = vec![0.0f32; m * n];
         let mut partials = Vec::with_capacity(if record_partials { m * n } else { 0 });
         let mut policy = Vec::with_capacity(if record_policy { m * n } else { 0 });
+        let mut values = [GFloat::from(0.0); MMA_GROUP_PRODUCTS + 1];
         for i in 0..m {
             let a_row = &a[i * k..(i + 1) * k];
             for j in 0..n {
@@ -482,10 +524,10 @@ impl H100 {
                     let mut local = 0.0f32;
                     let mut z_window = None;
                     for atom_start in (window_start..window_end).step_by(MMA_GROUP_PRODUCTS) {
-                        let mut values = Vec::with_capacity(MMA_GROUP_PRODUCTS + 1);
-                        values.push(GFloat::from(local));
-                        for (&a, &b) in a_row[atom_start..atom_start + MMA_GROUP_PRODUCTS]
-                            .iter()
+                        values[0] = GFloat::from(local);
+                        for ((value, &a), &b) in values[1..]
+                            .iter_mut()
+                            .zip(&a_row[atom_start..atom_start + MMA_GROUP_PRODUCTS])
                             .zip(&b_row[atom_start..atom_start + MMA_GROUP_PRODUCTS])
                         {
                             let product = multiply_fp8_to_gfloat(a, b, zero_exp);
@@ -496,7 +538,7 @@ impl H100 {
                                 z_window = z_window.max(exponent);
                                 m_cell = m_cell.max(exponent);
                             }
-                            values.push(product);
+                            *value = product;
                         }
                         local = windowed_group_sum(&values, zero_exp, H100_FP8_WIDTH).into();
                         if record_policy {
@@ -590,6 +632,99 @@ pub fn bf16_from_i8s(values: &[i8]) -> Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank32_noise_codes_match_full_device_replay() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let (m, n) = (5, 257); // Asymmetric output with multiple rows.
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut codes = |len| {
+            (0..len)
+                .map(|_| {
+                    let code: u8 = rng.random();
+                    if code & 0x7f == 0x7f { code ^ 1 } else { code }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut a = codes(m * MMA_GROUP_PRODUCTS);
+        let mut b = codes(n * MMA_GROUP_PRODUCTS);
+        a[..32].fill(0x80); // Signed zero.
+        a[32..64].fill(0x01); // Subnormals.
+        a[64..96].fill(0x38); // Unit products, including cancellation below.
+        b[..32].fill(0x80);
+        for (i, code) in b[32..64].iter_mut().enumerate() {
+            *code = if i % 2 == 0 { 0x38 } else { 0xb8 };
+        }
+        for device in Device::ALL {
+            let expected: Vec<u16> = device
+                .matmul_fp8(&a, &b, None, m, n, MMA_GROUP_PRODUCTS)
+                .unwrap()
+                .into_iter()
+                .map(fp32_to_bf16_rne)
+                .collect();
+            assert_eq!(
+                device.matmul_fp8_bf16(&a, &b, m, n, MMA_GROUP_PRODUCTS).unwrap(),
+                expected,
+                "{device:?}"
+            );
+        }
+
+        // Exercise every finite FP8 operand pair, including both zero signs.
+        let uniform_rows: Vec<u8> = (0..=u8::MAX)
+            .filter(|code| code & 0x7f != 0x7f)
+            .flat_map(|code| std::iter::repeat_n(code, MMA_GROUP_PRODUCTS))
+            .collect();
+        let rows = uniform_rows.len() / MMA_GROUP_PRODUCTS;
+        for device in Device::ALL {
+            let expected: Vec<u16> = device
+                .matmul_fp8(&uniform_rows, &uniform_rows, None, rows, rows, MMA_GROUP_PRODUCTS)
+                .unwrap()
+                .into_iter()
+                .map(fp32_to_bf16_rne)
+                .collect();
+            assert_eq!(
+                device
+                    .matmul_fp8_bf16(&uniform_rows, &uniform_rows, rows, rows, MMA_GROUP_PRODUCTS)
+                    .unwrap(),
+                expected,
+                "{device:?} operand pairs"
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_noise_replay_supports_independent_rank() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(52);
+        let mut codes = |len| {
+            (0..len)
+                .map(|_| {
+                    let code: u8 = rng.random();
+                    if code & 0x7f == 0x7f { code ^ 1 } else { code }
+                })
+                .collect::<Vec<_>>()
+        };
+        for rank in [0, 16, 32, 33, 64, 96, 128, 129, 160] {
+            for (m, n) in [(3, 1025), (0, 0), (0, 1), (1, 0)] {
+                let a = codes(m * rank);
+                let b = codes(n * rank);
+                for device in Device::ALL {
+                    let actual = device.matmul_fp8_bf16(&a, &b, m, n, rank);
+                    match device.matmul_fp8(&a, &b, None, m, n, rank) {
+                        Ok(values) => {
+                            let expected: Vec<_> = values.into_iter().map(fp32_to_bf16_rne).collect();
+                            assert_eq!(actual.unwrap(), expected, "{device:?} {m}x{n} rank={rank}");
+                        }
+                        Err(_) => assert!(actual.is_err(), "{device:?} {m}x{n} rank={rank}"),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn fp32_to_bf16_rejects_nonfinite_inputs_before_rounding() {

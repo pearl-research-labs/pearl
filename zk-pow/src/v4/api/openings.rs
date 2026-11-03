@@ -544,7 +544,7 @@ mod tests {
         b_hash: HashId,
         commit_keys: impl FnOnce(Sides<Hash256>) -> Sides<Hash256>,
     ) -> (IncompleteBlockHeader, PlainProofV4) {
-        // k ≥ 2048, 16 Blake lanes, 4×64 tile (256 elements).
+        // k ≥ 1024, 16 Blake lanes, 4×64 tile (256 elements).
         // m > h and n > w so some rows stay unopened (auxiliary msgs/CVs).
         let (m, n) = (8usize, 128usize);
         let n_blocks = k / BLOCK_SIZE;
@@ -707,8 +707,8 @@ mod tests {
     /// The compiled program and pearl-blake3 must encode one schedule: the
     /// program's leaf set (chunk-complement of its aux-CV ranges) equals the
     /// unique-minimal leaf set miners ship, and its aux-CV ranges equal the
-    /// wire proof's sibling ranges. `k = 2080` exercises blocks straddling row
-    /// boundaries (`k % 64 != 0`).
+    /// wire proof's sibling ranges. `k = 1056` exercises blocks straddling row
+    /// boundaries (`k % 64 != 0`) within the aggregate work budget.
     #[test]
     fn compiled_schedule_is_the_unique_minimal_opening() {
         for (a_hash, b_hash) in [
@@ -716,7 +716,7 @@ mod tests {
             (HashId::Blake3Chunk128, HashId::Blake3Chunk512),
             (HashId::Blake3Chunk256, HashId::Blake3Chunk128),
         ] {
-            for k in [2048usize, 2080] {
+            for k in [2048usize, 1056] {
                 let (proposed, proof) = build_dense_proof_with(k, honest_scale, a_hash, b_hash, |keys| keys);
                 let (_, public) = proof.parse_proof(&proposed).expect("honest fixture must parse");
                 let (_, _, cv_locs) = BlakeProgram::compile(&public);

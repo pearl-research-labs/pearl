@@ -13,15 +13,18 @@ use super::stark::PARTIAL_BINADE_OFFSET;
 use crate::v4::circuit::ctl::Table;
 use crate::v4::circuit::luts::LutTable;
 use crate::v4::circuit::luts::ctl::LutLookup;
+use crate::v4::circuit::matmul_h100::columns::W_PUBLIC_INPUT;
 use crate::v4::circuit::unpredictability::SKIP_THRESHOLD_OFFSET;
 
 /// Matmul's looking side of the operand-code channel: 16 pair-packed instances per side
 /// (A first, then B — 32 in total), filter `1 - IS_PADDING`, each element paired with its
 /// summand score `lambda`; the padding rows (trailing phantom cells) read no operands.
 /// Instance `i` of a side sends
-/// `(OPERAND_INDEX_BASE + 2i, OPERAND_CODES_{2i} + 2^8*OPERAND_CODES_{2i+1}, LAMBDA_{2i},
-/// LAMBDA_{2i+1})`; `OPERAND_INDEX_BASE_B` already carries the `h*k` B-plane key offset, so
-/// the A and B tuples occupy disjoint key spaces.
+/// `(BASE + CELL_STEP*32 + 2i, OPERAND_CODES_{2i} + 2^8*OPERAND_CODES_{2i+1}, LAMBDA_{2i},
+/// LAMBDA_{2i+1})`. MS11/MS12 bind `BASE` to `OUT_ROW*k` for A and `h*k + OUT_COL*k`
+/// for B. Coefficients stay statement-independent for the universal stage-1 wrapper.
+/// Both sides share one CTL; it does not separately enforce the coordinate ranges.
+/// MS13/MS14 constrain canonical coordinates in `eval_matmul_schedule_constraints`.
 ///
 /// Sound as a pair-packing because each code column is individually pinned into
 /// `[0, 256)`: here by MB1's `OPERAND_CODES_A/OPERAND_CODES_B` binding, on the InputQuant
@@ -35,6 +38,7 @@ use crate::v4::circuit::unpredictability::SKIP_THRESHOLD_OFFSET;
 pub fn ctl_operand_codes_looking_matmul_b200<F: Field>() -> Vec<TableWithColumns<F>> {
     let m = &MATMUL_B200_COL_MAP;
     let byte_shift = F::from_canonical_u64(1 << 8);
+    let group_f = F::from_canonical_usize(GROUP_WIDTH);
     let not_padding = || Column::linear_combination_with_constant([(m.is_padding, -F::ONE)], F::ONE);
     let sides = [
         (m.operand_index_base_a, &m.operand_codes_a, &m.lambda_a),
@@ -47,7 +51,10 @@ pub fn ctl_operand_codes_looking_matmul_b200<F: Field>() -> Vec<TableWithColumns
                 TableWithColumns::new(
                     Table::Matmul.into(),
                     vec![
-                        Column::linear_combination_with_constant([(base, F::ONE)], F::from_canonical_usize(2 * i)),
+                        Column::linear_combination_with_constant(
+                            [(base, F::ONE), (m.cell_step, group_f)],
+                            F::from_canonical_usize(2 * i),
+                        ),
                         Column::linear_combination([(codes[2 * i], F::ONE), (codes[2 * i + 1], byte_shift)]),
                         Column::single(lambdas[2 * i]),
                         Column::single(lambdas[2 * i + 1]),
@@ -59,15 +66,24 @@ pub fn ctl_operand_codes_looking_matmul_b200<F: Field>() -> Vec<TableWithColumns
         .collect()
 }
 
-/// Matmul's looked side of the cell-result channel: `(CELL_ID, CELL_RESULT_F32_LO,
-/// CELL_RESULT_F32_HI, CELL_SKIPS)`, filter `IS_CELL_FINAL * (1 - IS_PADDING)` — phantom
-/// padding cells emit no tuple. XorFold receives each finished real cell and its policy
-/// census exactly once.
+/// Matmul's looked side of the cell-result channel: `(W*OUT_ROW + OUT_COL,
+/// CELL_RESULT_F32_LO, CELL_RESULT_F32_HI, CELL_SKIPS)`, filter
+/// `IS_CELL_FINAL * (1 - IS_PADDING)` — phantom padding cells emit no tuple. The key is
+/// the public-input-scaled coordinate sum (the flat cell index XorFold's known `CELL_ID`
+/// column carries); the `W` scaling rides the public input, so the expression stays
+/// statement-independent for the universal stage-1 wrapper. XorFold receives each
+/// finished real cell and its policy census exactly once.
 pub fn ctl_cell_results_looked_matmul_b200<F: Field>() -> TableWithColumns<F> {
     let m = &MATMUL_B200_COL_MAP;
+    let cell_id = Column::single_times_public_input_plus_single(m.out_row, W_PUBLIC_INPUT, m.out_col);
     TableWithColumns::new(
         Table::Matmul.into(),
-        Column::singles([m.cell_id, m.cell_result_f32_lo, m.cell_result_f32_hi, m.cell_skips]).collect(),
+        vec![
+            cell_id,
+            Column::single(m.cell_result_f32_lo),
+            Column::single(m.cell_result_f32_hi),
+            Column::single(m.cell_skips),
+        ],
         Filter::new(
             vec![(
                 Column::single(m.is_cell_final),

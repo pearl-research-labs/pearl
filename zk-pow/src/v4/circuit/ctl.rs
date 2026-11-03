@@ -137,21 +137,16 @@ pub const fn lut_table_idx(i: usize) -> TableIdx {
     NUM_TABLES + i
 }
 
-/// All fp8 cross-table lookups: the six main channels in the module-docs order (the
-/// InputQuant-looked channels carry the A and B slots of one channel each), then one channel
-/// per committed LUT in the selected device's committed order. No half bakes a geometry constant
-/// (InputQuant's key offsets and multiplicities are public-input terms of its CTL
-/// expressions; the other tables' keys ride their class (a) schedule columns), so the CTL
-/// structure is a pure function of `scale.r` — and `r` is the wire constant 32, making the
-/// set a consensus constant. `scale` supplies the noise rank behind the H5 `E*(dos)` lookup
-/// offset.
+/// Six main channels, then the selected device's committed LUT channels. A/B slots share
+/// each InputQuant-looked channel. Geometry enters through public-input terms and trace
+/// columns; CTL coefficients remain statement-independent for the universal stage-1 wrapper.
+/// `scale.r` supplies H5's `E*(dos)` lookup offset and is fixed to 32 by the wire format.
+/// Matmul's AIR constrains canonical row/column progression.
 ///
-/// Balance preconditions (each documented on its halves): every table's live rows fill its
-/// power-of-two height exactly — Blake3 is the exception (its padding rows are all-zero, every
-/// filter off), and InputQuant's per-side liveness filters exclude each side's dead rows
-/// (`h` and `w` are independent — v19). Validated end-to-end by `super::consistency` via
-/// `starky::cross_table_lookup::debug_utils::check_ctls` (which reads non-binary filter values
-/// as multiplicities, the prover/constraint semantics).
+/// Each channel documents its padding filters and multiplicities. Blake3 excludes padding;
+/// InputQuant filters each side's dead rows; Matmul excludes phantom rows from operand and
+/// cell-result channels. `super::consistency` checks honest trace balance with `check_ctls`,
+/// treating non-binary filter values as multiplicities.
 pub fn all_cross_table_lookups<F: Field>(device: Device, scale: &ScaleProgram) -> Vec<CrossTableLookup<F>> {
     let (operand_codes, cell_results) = match device {
         Device::H100 => (ctl_operand_codes_looking_matmul(), ctl_cell_results_looked_matmul()),

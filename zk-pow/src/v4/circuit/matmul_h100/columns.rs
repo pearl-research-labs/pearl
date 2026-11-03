@@ -102,31 +102,53 @@ pub struct PromotionView<T: Copy> {
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct MatmulColumnsView<T: Copy> {
     // ------------------------------------------------------------------------------------------
-    // Shared structural columns, class (a): verifier-recomputable from the program (geometry).
-    // Committed *with the trace* (per-job data cannot live in a setup-time preprocessed
-    // oracle), but the verifier recomputes them (`MatmulStarkH100::known_values`) and checks the
-    // trace openings against its own values (`starky`'s batch "known columns") — that binding
-    // carries every schedule fact (booleanness, the cell-final last row), so they appear in no
-    // pinning constraint of their own.
+    // Schedule witnesses use the shared MS constraints and H100's MW window constraints.
+    // Public inputs: `[ROWS_PER_CELL, W, H*W, H*K]`. MS13/MS14 (see the shared schedule docs
+    // in `matmul_b200_stark::stark`) bind the canonical row-major coordinate progression
+    // AIR-locally; no CTL structure is relied on for coordinate ranges.
+    // CTL coefficients stay statement-independent for the universal stage-1 wrapper.
     // ------------------------------------------------------------------------------------------
-    /// Output cell index, constant across the cell's `k/32` rows; the XorFold channel key.
-    pub cell_id: T,
-    /// 1 on each cell's last row. Gates the f32 encode, the XorFold channel and the carry reset.
+    /// 1 on each cell's last row. Gates the f32 encode, the XorFold channel and the carry
+    /// reset. Fully pinned by MS4/MS5/MS6.
     pub is_cell_final: T,
-    /// 1 on the last live atom of each window, including partial final windows.
+    /// 1 on the last live atom of each window (every fourth atom), including partial final
+    /// windows. Fully pinned by the group-MW gadget: forced at `WINDOW_STEP = 3` and on
+    /// cell-final rows, banned elsewhere.
     pub is_window_final: T,
-    /// Operand flat-index base for this row's 32 A lanes (lane i reads
-    /// `operand_index_base_a + i`).
-    pub operand_index_base_a: T,
-    /// Operand flat-index base for the B lanes; carries the constant `h*k` key offset matching
-    /// InputQuantStark's B-channel keys.
-    pub operand_index_base_b: T,
     /// 1 on the rows that read no operands: the trailing power-of-two padding rows (each its
-    /// own single-row phantom cell, `IS_CELL_FINAL = 1`, `CELL_ID >= h*w`). Padding rows are
+    /// own single-row phantom cell, `IS_CELL_FINAL = 1`, position `OUT_ROW*W + OUT_COL >=
+    /// h*w`). Padding rows are
     /// excluded from the operand-code and cell-result channels, and their lanes are pinned to
     /// zero products (`is_padding * (PROD_FP22_EXP_i - 114) = 0` + the alignment-table
-    /// binding).
+    /// binding). Pinned by MS9/MS10.
     pub is_padding: T,
+    /// In-cell step `j in [0, ROWS_PER_CELL)`; 0 on phantom rows (MS3).
+    pub cell_step: T,
+    /// MS5 inverse witness for `CELL_STEP - (ROWS_PER_CELL - 1)` on non-final rows.
+    pub cell_step_inv: T,
+    /// Output row, pinned by the MS13/MS14 coordinate walk, including phantom rows. The
+    /// weighted sum `OUT_ROW*W + OUT_COL` is the flat cell position: the XorFold channel
+    /// key (public-input-scaled CTL expression) and the MS9/MS10 padding-onset operand.
+    pub out_row: T,
+    /// Output column, pinned by MS13/MS14 and constant within a cell (MS8).
+    pub out_col: T,
+    /// MS10 inverse witness for `CELL_ID - H*W` on live rows.
+    pub padding_onset_inv: T,
+    /// The A-plane operand flat-index base `OUT_ROW * K`, pinned by MS11 (see the B200
+    /// column docs); the operand-code CTL's A keys are `BASE_A + CELL_STEP*32 + lane`.
+    pub operand_index_base_a: T,
+    /// The B-plane operand flat-index base `H*K + OUT_COL * K`, pinned by MS12.
+    pub operand_index_base_b: T,
+    /// Column-wrap flag, pinned two-sidedly to `[OUT_COL = W-1]` on every row (MS13);
+    /// drives the MS14 coordinate walk. See the B200 column docs.
+    pub col_carry: T,
+    /// MS13 inverse witness for `OUT_COL - (W-1)` on non-carry rows.
+    pub col_carry_inv: T,
+    /// In-window atom position `in [0, 4)`: +1 per row, reset after each window-final row
+    /// (MW2); 0 on phantom rows.
+    pub window_step: T,
+    /// MW4 inverse witness for `WINDOW_STEP - 3` on rows that are not window-final.
+    pub window_step_inv: T,
 
     // ------------------------------------------------------------------------------------------
     // Group-sum emulation (main).
@@ -241,21 +263,21 @@ pub struct MatmulColumnsView<T: Copy> {
 /// Total number of committed MatmulStark columns.
 pub const NUM_MATMUL_COLUMNS: usize = size_of::<MatmulColumnsView<u8>>();
 
-// 256 per-lane + 6 known schedule + 65 arithmetic (including 36 promotion)
+// 256 per-lane + 15 structural schedule + 65 arithmetic (including 36 promotion)
 // + 4 jackpot (E_CELL, E_GRID, CELL_NONZERO, CELL_SKIPS).
 const _: () = assert!(size_of::<PromotionView<u8>>() == 36);
-const _: () = assert!(NUM_MATMUL_COLUMNS == 331);
+const _: () = assert!(NUM_MATMUL_COLUMNS == 339);
 
-/// Number of MatmulStark public inputs — none: the AIR is program-independent and the former
-/// `D_MEDIAN` policy threshold left with the jackpot policy.
-pub const NUM_MATMUL_PUBLIC_INPUTS: usize = 0;
+/// The Matmul public-input layout, shared with the B200 AIR (`[ROWS_PER_CELL, W, H*W, H*K]`
+/// — the geometry scalars the MS schedule constraints read).
+pub use crate::v4::circuit::matmul_b200_stark::columns::{
+    HK_PUBLIC_INPUT, HW_PUBLIC_INPUT, NUM_MATMUL_PUBLIC_INPUTS, ROWS_PER_CELL_PUBLIC_INPUT, W_PUBLIC_INPUT,
+};
 
 columns_view!(MatmulColumnsView, NUM_MATMUL_COLUMNS, MATMUL_COL_MAP);
 
-/// Number of leading class (a) ("known") columns: `cell_id`, the cell/window boundary flags,
-/// `operand_index_base_a`, `operand_index_base_b`, and `is_padding`. They are pure functions
-/// of the public geometry and are re-checked against the trace openings.
-pub const NUM_MATMUL_H100_KNOWN_COLUMNS: usize = MATMUL_COL_MAP.is_padding + 1;
+/// Matmul has no verifier-known columns; its schedule is carried in witness columns.
+pub const NUM_MATMUL_H100_KNOWN_COLUMNS: usize = 0;
 
 #[cfg(test)]
 mod tests {
@@ -269,14 +291,22 @@ mod tests {
         for (i, &c) in as_array.iter().enumerate() {
             assert_eq!(c, i);
         }
-        // Class (a) columns come first (their indices feed `preprocessed_indices`).
-        assert_eq!(MATMUL_COL_MAP.cell_id, 0);
-        assert_eq!(MATMUL_COL_MAP.is_cell_final, 1);
-        assert_eq!(MATMUL_COL_MAP.is_window_final, 2);
-        assert_eq!(MATMUL_COL_MAP.operand_index_base_a, 3);
-        assert_eq!(MATMUL_COL_MAP.operand_index_base_b, 4);
-        assert_eq!(MATMUL_COL_MAP.is_padding, 5);
-        assert_eq!(NUM_MATMUL_H100_KNOWN_COLUMNS, 6);
+        // The structural schedule block comes first.
+        assert_eq!(MATMUL_COL_MAP.is_cell_final, 0);
+        assert_eq!(MATMUL_COL_MAP.is_window_final, 1);
+        assert_eq!(MATMUL_COL_MAP.is_padding, 2);
+        assert_eq!(MATMUL_COL_MAP.cell_step, 3);
+        assert_eq!(MATMUL_COL_MAP.cell_step_inv, 4);
+        assert_eq!(MATMUL_COL_MAP.out_row, 5);
+        assert_eq!(MATMUL_COL_MAP.out_col, 6);
+        assert_eq!(MATMUL_COL_MAP.padding_onset_inv, 7);
+        assert_eq!(MATMUL_COL_MAP.operand_index_base_a, 8);
+        assert_eq!(MATMUL_COL_MAP.operand_index_base_b, 9);
+        assert_eq!(MATMUL_COL_MAP.col_carry, 10);
+        assert_eq!(MATMUL_COL_MAP.col_carry_inv, 11);
+        assert_eq!(MATMUL_COL_MAP.window_step, 12);
+        assert_eq!(MATMUL_COL_MAP.window_step_inv, 13);
+        assert_eq!(NUM_MATMUL_H100_KNOWN_COLUMNS, 0);
         assert_eq!(MATMUL_COL_MAP.cell_skips, NUM_MATMUL_COLUMNS - 1);
     }
 
@@ -287,7 +317,7 @@ mod tests {
             *v = i as u64 * 3 + 1;
         }
         let view: MatmulColumnsView<u64> = arr.into();
-        assert_eq!(view.cell_id, 1);
+        assert_eq!(view.is_cell_final, 1);
         assert_eq!(view.operand_codes_a[0], MATMUL_COL_MAP.operand_codes_a[0] as u64 * 3 + 1);
         assert_eq!(view.cell_skips, (NUM_MATMUL_COLUMNS as u64 - 1) * 3 + 1);
         let back: [u64; NUM_MATMUL_COLUMNS] = view.into();
