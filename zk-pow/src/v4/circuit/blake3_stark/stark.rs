@@ -1499,60 +1499,69 @@ impl Blake3Program {
             }
         });
 
-        // ---- Finalization and padding rows still satisfy the ungated additions.
-        // ---- Their round XORs are disabled; choose states 1..3 to connect to the next
-        // ---- input. SAFETY: each job reads phase-1 columns of its own and the next row
-        // ---- (round[0], blake3_msg, is_new_blake) and writes only round[1..3] of its own
-        // ---- rows — disjoint column sets, and each job writes only its own chunk's rows.
-        // ---- The shared row backing therefore goes through a raw base+len wrapper.
-        struct SyncRows<T> {
-            base: *mut T,
+        // Finalization reads only phase-1 inputs and writes round[1..3]. Row
+        // ownership is disjoint, but a worker can read its successor's inputs.
+        // Use raw row addresses and borrow only those individual state fields;
+        // a mutable reference to a whole row/chunk would overlap that read.
+        struct SyncRows<T: Copy> {
+            base: *mut Blake3ColumnsView<T>,
             len: usize,
         }
-        unsafe impl<T> Send for SyncRows<T> {}
-        unsafe impl<T> Sync for SyncRows<T> {}
-        let rows_sync = SyncRows {
-            base: rows.as_mut_ptr(),
-            len: rows.len(),
+        // SAFETY: the wrapper is local to this synchronous parallel phase. The
+        // input fields are immutable, output states belong to one row worker,
+        // and no references covering whole rows are created during the phase.
+        unsafe impl<T: Copy + Send> Send for SyncRows<T> {}
+        unsafe impl<T: Copy + Send + Sync> Sync for SyncRows<T> {}
+        impl<T: Copy> SyncRows<T> {
+            // Caller must supply an in-bounds row and restrict accesses to the
+            // phase's immutable inputs or this worker's output state fields.
+            unsafe fn row(&self, r: usize) -> *mut Blake3ColumnsView<T> {
+                debug_assert!(r < self.len);
+                unsafe { self.base.add(r) }
+            }
+        }
+        let rows_sync = &SyncRows {
+            // The columns view has the same repr(C) layout as its flat row.
+            base: rows.as_mut_ptr().cast::<Blake3ColumnsView<F>>(),
+            len: num_rows,
         };
-        let rows_sync = &rows_sync;
-        rows.par_chunks_mut(1024).enumerate().for_each(|(chunk, out)| {
-            let all: &mut [[F; NUM_BLAKE3_COLUMNS]] = unsafe { core::slice::from_raw_parts_mut(rows_sync.base, rows_sync.len) };
-            for (i, row_slot) in out.iter_mut().enumerate() {
-                let r = chunk * 1024 + i;
+        (0..num_rows.div_ceil(1024)).into_par_iter().for_each(|chunk| {
+            for r in chunk * 1024..((chunk + 1) * 1024).min(num_rows) {
                 let next = (r + 1) % num_rows;
-                let next_is_new = {
-                    let next_row: &Blake3ColumnsView<F> = all[next].borrow();
-                    next_row.is_new_blake == F::ONE
-                };
-                if !next_is_new {
-                    continue;
+                // SAFETY: r and next are in bounds. All workers only read
+                // is_new_blake, blake3_msg and round[0], which remain unchanged.
+                // Only this worker writes round[1..3] of row r. The narrow
+                // references below never cover a concurrently accessed field.
+                unsafe {
+                    let next_row = rows_sync.row(next);
+                    if core::ptr::addr_of!((*next_row).is_new_blake).read() != F::ONE {
+                        continue;
+                    }
+                    let row = rows_sync.row(r);
+                    let msg = core::ptr::addr_of!((*row).blake3_msg)
+                        .read()
+                        .map(|x| x.to_canonical_u64() as u32);
+                    let s0 = read_state(&*core::ptr::addr_of!((*row).round[0]), B_ROTATIONS[0]);
+                    let s4 = read_state(&*core::ptr::addr_of!((*next_row).round[0]), B_ROTATIONS[0]);
+                    let (mut s1, mut s2, mut s3) = ([0u32; 16], [0u32; 16], [0u32; 16]);
+                    // States 1 and 2 first: the half-round-2 adds read state 2 across lanes.
+                    for i in 0..4 {
+                        s1[i] = s0[i].wrapping_add(s0[4 + i]).wrapping_add(msg[2 * i]);
+                        s1[8 + i] = s0[8 + i];
+                        s2[i] = s1[i].wrapping_add(msg[2 * i + 1]);
+                        s2[8 + i] = s1[8 + i];
+                    }
+                    for i in 0..4 {
+                        let (bi, ci, di, _) = half_round_lane(2, i);
+                        s3[i] = s2[i].wrapping_add(msg[8 + 2 * i]);
+                        s3[8 + ci] = s4[8 + ci].wrapping_sub(s4[12 + di]);
+                        s3[12 + di] = s3[8 + ci].wrapping_sub(s2[8 + ci]);
+                        s3[4 + bi] = s4[i].wrapping_sub(s3[i]).wrapping_sub(msg[8 + 2 * i + 1]);
+                    }
+                    write_state(&mut *core::ptr::addr_of_mut!((*row).round[1]), &s1, B_ROTATIONS[1]);
+                    write_state(&mut *core::ptr::addr_of_mut!((*row).round[2]), &s2, B_ROTATIONS[2]);
+                    write_state(&mut *core::ptr::addr_of_mut!((*row).round[3]), &s3, B_ROTATIONS[3]);
                 }
-                let row: &mut Blake3ColumnsView<F> = row_slot.borrow_mut();
-                let msg: [u32; 16] = core::array::from_fn(|i| row.blake3_msg[i].to_canonical_u64() as u32);
-                let s0 = read_state(&row.round[0], B_ROTATIONS[0]);
-                let s4 = {
-                    let next_row: &Blake3ColumnsView<F> = all[next].borrow();
-                    read_state(&next_row.round[0], B_ROTATIONS[0])
-                };
-                let (mut s1, mut s2, mut s3) = ([0u32; 16], [0u32; 16], [0u32; 16]);
-                // States 1 and 2 first: the half-round-2 adds read state 2 across lanes.
-                for i in 0..4 {
-                    s1[i] = s0[i].wrapping_add(s0[4 + i]).wrapping_add(msg[2 * i]);
-                    s1[8 + i] = s0[8 + i];
-                    s2[i] = s1[i].wrapping_add(msg[2 * i + 1]);
-                    s2[8 + i] = s1[8 + i];
-                }
-                for i in 0..4 {
-                    let (bi, ci, di, _) = half_round_lane(2, i);
-                    s3[i] = s2[i].wrapping_add(msg[8 + 2 * i]);
-                    s3[8 + ci] = s4[8 + ci].wrapping_sub(s4[12 + di]);
-                    s3[12 + di] = s3[8 + ci].wrapping_sub(s2[8 + ci]);
-                    s3[4 + bi] = s4[i].wrapping_sub(s3[i]).wrapping_sub(msg[8 + 2 * i + 1]);
-                }
-                write_state(&mut row.round[1], &s1, B_ROTATIONS[1]);
-                write_state(&mut row.round[2], &s2, B_ROTATIONS[2]);
-                write_state(&mut row.round[3], &s3, B_ROTATIONS[3]);
             }
         });
 
@@ -4161,7 +4170,12 @@ mod tests {
     #[test]
     fn blake3_parallel_fill_matches_serial() {
         type F = GoldilocksField;
-        for (h, w, k, routing_blocks) in [(4usize, 4usize, 64usize, 0usize), (2, 8, 128, 3)] {
+        for (h, w, k, routing_blocks) in [
+            (4usize, 4usize, 64usize, 0usize),
+            (2, 8, 128, 3),
+            (4, 4, 2080, 0),
+            (2, 8, 2080, 3),
+        ] {
             let program = compile_forest(h, w, k, routing_blocks);
             let data = TestData::new(h, w, k, routing_blocks);
             let inputs = data.inputs();

@@ -2,3 +2,5 @@
 //! V4 constraints remain local; only their evaluation machinery is inherited.
 
 pub(crate) use crate::v2::circuit::utils::{evaluator, native_evaluator, symbolic_evaluator};
+
+pub(crate) mod witness;

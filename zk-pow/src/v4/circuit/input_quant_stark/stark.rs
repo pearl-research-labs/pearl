@@ -394,26 +394,9 @@ impl InputQuantProgram {
                 .unwrap_or(F::ZERO)
         });
 
-        // Row-tile workers: compute rows, scatter fields into the destination columns.
-        // SAFETY: tile workers own disjoint row ranges and write only their own rows'
-        // slots — no two workers touch the same (column, row) — but the shared column
-        // vecs cannot be proven disjoint by the borrow checker, so go through a raw
-        // base pointer + length once. The wrapper only re-exports the pointer.
-        struct SyncCols<T> {
-            base: *mut T,
-            len: usize,
-        }
-        unsafe impl<T> Send for SyncCols<T> {}
-        unsafe impl<T> Sync for SyncCols<T> {}
-        let cols_ptr = SyncCols {
-            base: cols.as_mut_ptr(),
-            len: cols.len(),
-        };
-        // Rebind through a reference: without this, disjoint capture would grab the
-        // raw-pointer field directly, bypassing the manual Sync impl above.
-        let cols_ptr = &cols_ptr;
+        // Tile workers share raw destination pointers and write disjoint rows.
+        let writer = super::super::utils::witness::DisjointColumnWriter::<F, NUM_INPUT_QUANT_COLUMNS>::new(cols);
         (0..num_rows.div_ceil(TILE)).into_par_iter().for_each(|tile| {
-            let cols: &mut [&mut [F]] = unsafe { core::slice::from_raw_parts_mut(cols_ptr.base, cols_ptr.len) };
             let r0 = tile * TILE;
             let r1 = (r0 + TILE).min(num_rows);
             for r in r0..r1 {
@@ -451,9 +434,9 @@ impl InputQuantProgram {
                 row.noise_code_b = bf16_code_of(&row.noise_b);
                 // Scatter: one write per column, into this row's slot.
                 let flat: [F; NUM_INPUT_QUANT_COLUMNS] = row.into();
-                for (c, value) in flat.iter().enumerate() {
-                    cols[c][r] = *value;
-                }
+                // SAFETY: tiles partition 0..num_rows. Only this worker writes
+                // row r; the destination columns are inaccessible until the join.
+                unsafe { writer.write_row(r, &flat) };
             }
         });
 
@@ -2764,95 +2747,104 @@ mod tests {
     /// lambdas, tuples) must equal the trace read-back.
     #[test]
     fn input_quant_native_fill_matches_generate_trace() {
-        let program = test_program();
-        let inp = test_inputs(&program);
-        let (rows, _) = program.generate_trace::<F>(
-            &inp.a_int8,
-            &inp.a_scales,
-            &inp.a_noise,
-            &inp.b_int8,
-            &inp.b_scales,
-            &inp.b_noise,
-        );
-
-        let native = program.build_native(
-            &inp.a_int8,
-            &inp.a_scales,
-            &inp.a_noise,
-            &inp.b_int8,
-            &inp.b_scales,
-            &inp.b_noise,
-        );
-
-        // The native outputs must equal the trace read-backs the old driver did.
-        let (h, w, k) = (program.h, program.w, program.k);
-        let read_codes = |b_side: bool| -> Vec<u8> {
-            let live = if b_side { w * k } else { h * k };
-            rows[..live]
-                .iter()
-                .map(|r| {
-                    let v: &InputQuantColumnsView<F> = r.borrow();
-                    (if b_side { v.code_noised_b } else { v.code_noised_a }).to_canonical_u64() as u8
-                })
-                .collect()
-        };
-        let read_lambdas = |b_side: bool| -> Vec<u64> {
-            let live = if b_side { w * k } else { h * k };
-            rows[..live]
-                .iter()
-                .map(|r| {
-                    let v: &InputQuantColumnsView<F> = r.borrow();
-                    (if b_side { v.lambda_b } else { v.lambda_a }).to_canonical_u64()
-                })
-                .collect()
-        };
-        assert_eq!(native.a_codes, read_codes(false));
-        assert_eq!(native.b_codes, read_codes(true));
-        assert_eq!(native.a_lambdas, read_lambdas(false));
-        assert_eq!(native.b_lambdas, read_lambdas(true));
-        for (g, tuple) in native.a_tuples.iter().enumerate() {
-            let v: &InputQuantColumnsView<F> = rows[g * k + k - 1].borrow();
-            assert_eq!(tuple.l2_frame_sum, v.block_l2_a.running_l2_frame_sum.to_canonical_u64());
-            assert_eq!(
-                u64::from(tuple.frame_doubled_scale_exponent),
-                v.block_l2_a.frame_doubled_scale_exponent.to_canonical_u64()
+        for program in [
+            test_program(),
+            InputQuantProgram {
+                h: 3,
+                w: 5,
+                k: 1056,
+                ..test_program()
+            },
+        ] {
+            let inp = test_inputs(&program);
+            let (rows, _) = program.generate_trace::<F>(
+                &inp.a_int8,
+                &inp.a_scales,
+                &inp.a_noise,
+                &inp.b_int8,
+                &inp.b_scales,
+                &inp.b_noise,
             );
-            assert_eq!(u64::from(tuple.max_abs), v.max_abs_a.to_canonical_u64());
-            assert_eq!(u64::from(tuple.dead_count), v.dead_count_a.to_canonical_u64());
-        }
-        for (g, tuple) in native.b_tuples.iter().enumerate() {
-            let v: &InputQuantColumnsView<F> = rows[g * k + k - 1].borrow();
-            assert_eq!(tuple.l2_frame_sum, v.block_l2_b.running_l2_frame_sum.to_canonical_u64());
-            assert_eq!(
-                u64::from(tuple.frame_doubled_scale_exponent),
-                v.block_l2_b.frame_doubled_scale_exponent.to_canonical_u64()
-            );
-            assert_eq!(u64::from(tuple.max_abs), v.max_abs_b.to_canonical_u64());
-            assert_eq!(u64::from(tuple.dead_count), v.dead_count_b.to_canonical_u64());
-        }
 
-        // The direct column fill must reproduce every cell except the four row-0 blinding
-        // cells (fresh randomness by design); those must merely be overwritten (nonzero
-        // with overwhelming probability, and the equality constraints don't constrain them).
-        let num_rows = program.num_rows();
-        let mut cols: Vec<Vec<F>> = (0..NUM_INPUT_QUANT_COLUMNS).map(|_| vec![F::ZERO; num_rows]).collect();
-        {
-            let mut slices: Vec<&mut [F]> = cols.iter_mut().map(|c| c.as_mut_slice()).collect();
-            program.fill_columns::<F>(&native, &mut slices);
-        }
-        let [a_rem, a_comp, b_rem, b_comp] = [
-            INPUT_QUANT_COL_MAP.block_l2_a.shift_remainder_power,
-            INPUT_QUANT_COL_MAP.block_l2_a.shift_complement_power,
-            INPUT_QUANT_COL_MAP.block_l2_b.shift_remainder_power,
-            INPUT_QUANT_COL_MAP.block_l2_b.shift_complement_power,
-        ];
-        let blinded = |c: usize| c == a_rem || c == a_comp || c == b_rem || c == b_comp;
-        for (c, col) in cols.iter().enumerate() {
-            for r in 0..num_rows {
-                if r == 0 && blinded(c) {
-                    continue; // fresh randomness on both sides of the comparison
+            let native = program.build_native(
+                &inp.a_int8,
+                &inp.a_scales,
+                &inp.a_noise,
+                &inp.b_int8,
+                &inp.b_scales,
+                &inp.b_noise,
+            );
+
+            // The native outputs must equal the trace read-backs the old driver did.
+            let (h, w, k) = (program.h, program.w, program.k);
+            let read_codes = |b_side: bool| -> Vec<u8> {
+                let live = if b_side { w * k } else { h * k };
+                rows[..live]
+                    .iter()
+                    .map(|r| {
+                        let v: &InputQuantColumnsView<F> = r.borrow();
+                        (if b_side { v.code_noised_b } else { v.code_noised_a }).to_canonical_u64() as u8
+                    })
+                    .collect()
+            };
+            let read_lambdas = |b_side: bool| -> Vec<u64> {
+                let live = if b_side { w * k } else { h * k };
+                rows[..live]
+                    .iter()
+                    .map(|r| {
+                        let v: &InputQuantColumnsView<F> = r.borrow();
+                        (if b_side { v.lambda_b } else { v.lambda_a }).to_canonical_u64()
+                    })
+                    .collect()
+            };
+            assert_eq!(native.a_codes, read_codes(false));
+            assert_eq!(native.b_codes, read_codes(true));
+            assert_eq!(native.a_lambdas, read_lambdas(false));
+            assert_eq!(native.b_lambdas, read_lambdas(true));
+            for (g, tuple) in native.a_tuples.iter().enumerate() {
+                let v: &InputQuantColumnsView<F> = rows[g * k + k - 1].borrow();
+                assert_eq!(tuple.l2_frame_sum, v.block_l2_a.running_l2_frame_sum.to_canonical_u64());
+                assert_eq!(
+                    u64::from(tuple.frame_doubled_scale_exponent),
+                    v.block_l2_a.frame_doubled_scale_exponent.to_canonical_u64()
+                );
+                assert_eq!(u64::from(tuple.max_abs), v.max_abs_a.to_canonical_u64());
+                assert_eq!(u64::from(tuple.dead_count), v.dead_count_a.to_canonical_u64());
+            }
+            for (g, tuple) in native.b_tuples.iter().enumerate() {
+                let v: &InputQuantColumnsView<F> = rows[g * k + k - 1].borrow();
+                assert_eq!(tuple.l2_frame_sum, v.block_l2_b.running_l2_frame_sum.to_canonical_u64());
+                assert_eq!(
+                    u64::from(tuple.frame_doubled_scale_exponent),
+                    v.block_l2_b.frame_doubled_scale_exponent.to_canonical_u64()
+                );
+                assert_eq!(u64::from(tuple.max_abs), v.max_abs_b.to_canonical_u64());
+                assert_eq!(u64::from(tuple.dead_count), v.dead_count_b.to_canonical_u64());
+            }
+
+            // The direct column fill must reproduce every cell except the four row-0 blinding
+            // cells (fresh randomness by design); those must merely be overwritten (nonzero
+            // with overwhelming probability, and the equality constraints don't constrain them).
+            let num_rows = program.num_rows();
+            let mut cols: Vec<Vec<F>> = (0..NUM_INPUT_QUANT_COLUMNS).map(|_| vec![F::ZERO; num_rows]).collect();
+            {
+                let mut slices: Vec<&mut [F]> = cols.iter_mut().map(|c| c.as_mut_slice()).collect();
+                program.fill_columns::<F>(&native, &mut slices);
+            }
+            let [a_rem, a_comp, b_rem, b_comp] = [
+                INPUT_QUANT_COL_MAP.block_l2_a.shift_remainder_power,
+                INPUT_QUANT_COL_MAP.block_l2_a.shift_complement_power,
+                INPUT_QUANT_COL_MAP.block_l2_b.shift_remainder_power,
+                INPUT_QUANT_COL_MAP.block_l2_b.shift_complement_power,
+            ];
+            let blinded = |c: usize| c == a_rem || c == a_comp || c == b_rem || c == b_comp;
+            for (c, col) in cols.iter().enumerate() {
+                for r in 0..num_rows {
+                    if r == 0 && blinded(c) {
+                        continue; // fresh randomness on both sides of the comparison
+                    }
+                    assert_eq!(col[r], rows[r][c], "column {c} row {r} differs from generate_trace");
                 }
-                assert_eq!(col[r], rows[r][c], "column {c} row {r} differs from generate_trace");
             }
         }
     }

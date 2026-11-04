@@ -476,28 +476,12 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
         });
         let map = MATMUL_COL_MAP;
 
-        // Scatter destination: the parallel cell jobs write disjoint row ranges but shared
-        // column buffers, which the borrow checker cannot prove disjoint. Each write goes to
-        // a distinct (column, row) slot — jobs own disjoint rows — so wrap the raw slice
-        // pointer once per job.
-        // SAFETY: no two jobs write the same (column, row) slot; live jobs own disjoint
-        // live-row ranges and the trailing pass owns the padding rows.
-        struct SyncCols<T> {
-            base: *mut T,
-            len: usize,
-        }
-        unsafe impl<T> Send for SyncCols<T> {}
-        unsafe impl<T> Sync for SyncCols<T> {}
-        let cols_ptr = &SyncCols {
-            base: cols.as_mut_ptr(),
-            len: cols.len(),
-        };
+        // Cell jobs share raw destination pointers and write disjoint rows.
+        let writer = super::super::utils::witness::DisjointColumnWriter::<F, NUM_MATMUL_COLUMNS>::new(cols);
         let scatter = |r: usize, row: &[F; NUM_MATMUL_COLUMNS]| {
-            // SAFETY: the wrapper only re-exports `cols`; `r` is job-owned (see above).
-            let cols: &mut [&mut [F]] = unsafe { core::slice::from_raw_parts_mut(cols_ptr.base, cols_ptr.len) };
-            for (c, value) in row.iter().enumerate() {
-                cols[c][r] = *value;
-            }
+            // SAFETY: each live cell owns a disjoint row range. The padding
+            // pass runs after all live jobs finish and owns the remaining rows.
+            unsafe { writer.write_row(r, row) };
         };
 
         // Live cells: one parallel job per cell, rows scattered in cell order. Each job
@@ -1793,7 +1777,7 @@ mod tests {
     /// a dense geometry and a padding-heavy one (live rows not a power of two).
     #[test]
     fn matmul_generate_columns_matches_generate_trace() {
-        for (h, w, k) in [(4, 4, 160), (3, 5, 128)] {
+        for (h, w, k) in [(4, 4, 160), (3, 5, 128), (3, 5, 1056)] {
             let program = S::new(h, w, k);
             let a = test_codes(h * k, 0x9E3779B97F4A7C15, 8);
             let b = test_codes(w * k, 0xC2B2AE3D27D4EB4F, 11);
