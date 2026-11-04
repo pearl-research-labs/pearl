@@ -284,22 +284,21 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 		return err
 	}
 
-	previous, err := w.disconnectedBlockStamp(addrmgrNs, &b.Block)
+	rewindTo, err := w.disconnectedBlockStamp(addrmgrNs, &b.Block)
 	if err != nil {
 		return err
 	}
 
 	// Use either store or manager identity to recognize the disconnect. Reconcile the whole affected range: its blocks
 	// may come from different notification producers and need not share an ancestry.
-	rollback := previous != nil
-	if storedHash != nil {
-		rollback = *storedHash == b.Hash
-		if !rollback && previous == nil {
-			return nil
-		}
+	storeHasBlock := storedHash != nil && *storedHash == b.Hash
+	storeHasOtherBlock := storedHash != nil && *storedHash != b.Hash
+
+	if storeHasOtherBlock && rewindTo == nil {
+		return nil
 	}
 
-	if rollback {
+	if storeHasBlock || (!storeHasOtherBlock && rewindTo != nil) {
 		log.Infof("Rolling the wallet back to height %d after block %v was disconnected", b.Height-1, b.Hash)
 
 		err := w.rollbackBlockHistory(txmgrNs, b.Height)
@@ -308,10 +307,10 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 		}
 	}
 
-	if previous != nil {
+	if rewindTo != nil {
 		// A delayed connection may leave the manager on the old block even when the store already holds its
 		// replacement.
-		err = w.Manager.Rollback(addrmgrNs, previous)
+		err = w.Manager.Rollback(addrmgrNs, rewindTo)
 		if err != nil {
 			return err
 		}
