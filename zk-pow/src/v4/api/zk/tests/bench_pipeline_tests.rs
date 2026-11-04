@@ -31,16 +31,14 @@ use plonky2::util::timing::TimingTree;
 
 use super::super::*;
 use crate::v2::ffi::plain_proof::MatrixMerkleProof;
-use crate::v4::api::layout::DimType;
 use crate::v4::api::plain_proof::PlainProofV4;
 use crate::v4::api::primitives::Sides;
 use crate::v4::api::public_params::JobParams;
 use crate::v4::circuit::consistency::{fixture_headers, fixture_tree_keys};
 
-/// The lottery tile: rows `[(4, Fold), (16, Blake)]` -> `h = 64`, cols `[(16, Fold)]`
-/// -> `w = 16`: 16 Blake lanes, subtile 4*16 = 64, `h*w = 1024` — envelope-legal.
-const ROWS_DIMS: &[(u32, DimType)] = &[(4, DimType::Fold), (16, DimType::Blake)];
-const COLS_DIMS: &[(u32, DimType)] = &[(16, DimType::Fold)];
+/// Contiguous 64-by-16 lottery tile.
+const TILE_H: u32 = 64;
+const TILE_W: u32 = 16;
 
 /// `(m = n, k)` pairs. InputQuant = `max(h,w)*k = 64k` hits 2^19..2^22; Matmul =
 /// `h*w*k/32 = 32k` hits 2^18..2^21; XorFold = 2^10 and Scale = 2^7 sit on stops of
@@ -86,10 +84,10 @@ pub(super) fn bench_job(m: usize, k: usize) -> (IncompleteBlockHeader, PlainProo
             .collect()
     };
     let n_blocks = k / BLOCK_SIZE;
-    let rows_pattern = AxisPattern::new(ROWS_DIMS).unwrap();
-    let cols_pattern = AxisPattern::new(COLS_DIMS).unwrap();
-    let tile = |p: &AxisPattern| -> Vec<usize> { p.tile_offsets().iter().map(|&o| o as usize).collect() };
-    let (a_rows, b_rows) = (tile(&rows_pattern), tile(&cols_pattern));
+    let (a_rows, b_rows) = (
+        (0..TILE_H as usize).collect::<Vec<_>>(),
+        (0..TILE_W as usize).collect::<Vec<_>>(),
+    );
     let (header, ancestor_chain, ancestor_header) = fixture_headers();
     let (key_a, key_b) = fixture_tree_keys(&header, &ancestor_header);
 
@@ -118,12 +116,12 @@ pub(super) fn bench_job(m: usize, k: usize) -> (IncompleteBlockHeader, PlainProo
                 a: OperandParams {
                     num_rows: m as u32,
                     hash_id: a_hash_id,
-                    pattern: rows_pattern,
+                    tile_size: TILE_H,
                 },
                 b: OperandParams {
                     num_rows: m as u32,
                     hash_id: b_hash_id,
-                    pattern: cols_pattern,
+                    tile_size: TILE_W,
                 },
             },
             moe: None,

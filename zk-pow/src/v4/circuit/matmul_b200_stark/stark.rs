@@ -574,7 +574,7 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkB200<F, D> {
 
 /// An all-zero single-row trailing phantom cell (the schedule columns are filled by the
 /// post-pass). It enters a zero carry with `GROUP_MAX_BIASED_EXPONENT = 0`, uses the inert
-/// `(0; 1, 1; 0, 0, 0)` width block, and sets `INCOMING_CARRY_SHIFT_POWER = 1` for the
+/// `(0; 1, 1; 0; 0, 0)` width block, and sets `INCOMING_CARRY_SHIFT_POWER = 1` for the
 /// remainder identity.
 fn phantom_row<F: RichField>() -> MatmulB200ColumnsView<F> {
     MatmulB200ColumnsView {

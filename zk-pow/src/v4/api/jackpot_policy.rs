@@ -38,7 +38,7 @@
 //! [`PublicParams`](crate::v4::api::public_params::PublicParams) bounds `k <= 2^16`.
 
 use crate::v4::api::dtype::{bf16_to_f32, fp8_e4m3_to_f32};
-use crate::v4::api::layout::{AxisPattern, JACKPOT_ENTRIES, lane_assignment};
+use crate::v4::api::layout::{JACKPOT_ENTRIES, lane_assignment};
 use crate::v4::api::public_params::Device;
 use crate::v4::api::quantization::BuiltRows;
 use crate::v4::api::utils::{B200, H100, xor_fold_extract};
@@ -84,9 +84,8 @@ pub struct OperandStrip {
     pub built: BuiltRows,
 }
 
-/// The lottery message: `xor_fold_extract(A' @ B'.T, lane_assignment(rows_pattern,
-/// cols_pattern))` — 64 bytes, one BLAKE3 block, the preimage hashed under
-/// `pow_key` to form `hash_jackpot`.
+/// The lottery message: `xor_fold_extract(A' @ B'.T, lane_assignment(h, w))` — 64
+/// bytes, one BLAKE3 block, hashed under `pow_key` to form `hash_jackpot`.
 pub type JackpotMessage = [u8; 4 * JACKPOT_ENTRIES];
 
 /// Per-row noise stds `sigma_i = DELTA * alpha_i * l2_i` (in quantized units),
@@ -103,25 +102,25 @@ fn sigmas(built: &BuiltRows, device: Device) -> Vec<f64> {
 impl JackpotPolicy {
     /// Computes the tile's policy verdict: `Ok(None)` on rejection, or
     /// `Ok(Some(message))` with the lottery message — the replayed first-stage
-    /// product folded over the committed 16-subtile lane layout, exactly one
+    /// product folded over sixteen consecutive row-major chunks, exactly one
     /// BLAKE3 block. Only the folded message leaves the policy (to be hashed
     /// under `pow_key`); the bit-exact `A' @ B'.T` never does.
     ///
-    /// `a` / `b` are the tile's two sides; `rows_pattern` / `cols_pattern`
-    /// commit the tile's grid layout. The committed device's bit-exact FP8
+    /// `a` / `b` are the tile's two sides; `h` / `w` commit the tile's shape.
+    /// The committed device's bit-exact FP8
     /// datapath ([`H100`] or [`B200`]) supplies the magnitudes for check 3.
     pub(crate) fn evaluate(
         &self,
         a: &OperandStrip,
         b: &OperandStrip,
         k: usize,
-        rows_pattern: &AxisPattern,
-        cols_pattern: &AxisPattern,
+        h: usize,
+        w: usize,
     ) -> Result<Option<JackpotMessage>> {
         let Some(acc) = self.run_checks(a, b, k)? else {
             return Ok(None);
         };
-        let lanes = lane_assignment(rows_pattern, cols_pattern);
+        let lanes = lane_assignment(h, w);
         Ok(Some(xor_fold_extract(&acc, &lanes)))
     }
 

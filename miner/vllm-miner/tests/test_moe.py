@@ -57,8 +57,8 @@ def test_moe_configuration_commits_the_expert_local_tile(device):
     dense_e = mining_configuration(k, n_e, device=device)
     assert config.device is device
     assert config.experts == experts and dense_e.experts == 0
-    assert config.rows_pattern == dense_e.rows_pattern
-    assert config.cols_pattern == dense_e.cols_pattern
+    assert config.tile_rows == dense_e.tile_rows
+    assert config.tile_cols == dense_e.tile_cols
     assert config.p_b(experts * n_e)[-2:] == experts.to_bytes(2, "little")
     assert expert_n(experts * n_e, experts) == n_e
     assert expert_n(n_e, 0) == n_e

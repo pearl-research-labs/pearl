@@ -227,8 +227,8 @@ def test_validated_persistent_hit_builds_canonical_opening(
         m=a.int_values.shape[0],
         n=state.n,
         k=k,
-        ltile_rows=config.rows_pattern.tile_size,
-        ltile_cols=config.cols_pattern.tile_size,
+        ltile_rows=config.tile_rows,
+        ltile_cols=config.tile_cols,
         tile_row=1,
         tile_column=0,
         commitment_hash_A=keys.jackpot_key,
@@ -285,8 +285,8 @@ def test_validated_persistent_hit_builds_canonical_opening(
     assert handoff_timeouts == [winners._WINNER_HANDOFF_TIMEOUT_S]
     opening, submitted_job = submitted[0]
     assert submitted_job is job
-    assert opening.a_row_indices == tuple(tile_indices(config.rows_pattern, 1))
-    assert opening.b_column_indices == tuple(tile_indices(config.cols_pattern, 0))
+    assert opening.a_row_indices == tuple(tile_indices(config.tile_rows, 1))
+    assert opening.b_column_indices == tuple(tile_indices(config.tile_cols, 0))
     assert opening.a_codes is a.int_values
     assert opening.a_scales is a.scales
     assert opening.b_codes is b.int_values
@@ -355,8 +355,8 @@ def test_hit_stamped_with_a_stale_b_seed_is_dropped(monkeypatch):
         m=8,
         n=256,
         k=2048,
-        ltile_rows=config.rows_pattern.tile_size,
-        ltile_cols=config.cols_pattern.tile_size,
+        ltile_rows=config.tile_rows,
+        ltile_cols=config.tile_cols,
         tile_row=0,
         tile_column=0,
         commitment_hash_B=b"\x02" * 32,
@@ -481,8 +481,8 @@ def _moe_winner_fixture(group_id: int):
         m=counts[min(group_id, experts - 1)],
         n=n_e,
         k=k,
-        ltile_rows=config.rows_pattern.tile_size,
-        ltile_cols=config.cols_pattern.tile_size,
+        ltile_rows=config.tile_rows,
+        ltile_cols=config.tile_cols,
         tile_row=2,
         tile_column=1,
         group_id=group_id,
@@ -546,12 +546,12 @@ def test_moe_hit_opens_the_routed_tokens_and_expert_rows(monkeypatch, previous_h
         return
     (opening,) = submitted
     config = state.job_ctx.config
-    inner = tile_indices(config.rows_pattern, hit.tile_row)
+    inner = tile_indices(config.tile_rows, hit.tile_row)
     assert opening.moe is not None and opening.moe.expert_index == w
     assert opening.moe.inner_a_rows == tuple(inner)
     assert opening.a_row_indices == tuple(per_expert[w][i] for i in inner)
     assert opening.b_column_indices == tuple(
-        w * state.lottery_n + c for c in tile_indices(config.cols_pattern, hit.tile_column)
+        w * state.lottery_n + c for c in tile_indices(config.tile_cols, hit.tile_column)
     )
     assert opening.a_codes is moe.codes and opening.b_codes is state.weight_cpu
     header = IncompleteBlockHeader.from_bytes(job.incomplete_header_bytes)

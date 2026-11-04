@@ -361,7 +361,7 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
         }
     }
 
-    /// The joined-schedule trace fill: [`Self::generate_trace`]'s trace written
+    /// The joined-schedule trace fill: the selected AIR's trace written
     /// column-major straight into the caller's zeroed column buffers, with the cell
     /// results (`cell_words`, `cell_skips`) returned by the cell workers instead of read
     /// back out of the trace. Only the H100 backend has the direct fill; B200 falls
@@ -1269,7 +1269,6 @@ mod tests {
                     envelope.ladder.iter().filter(|&&d| (lo..=hi).contains(&d)).count()
                 );
             }
-            println!("{device:?} consensus verifier: {} gates before padding", builder.num_gates());
         }
     }
 
@@ -1295,7 +1294,7 @@ mod tests {
         let bits = |rows: usize| rows.next_power_of_two().trailing_zeros() as usize;
         for h in 4..=128 {
             for w in 16..=(2048 / h) {
-                if h * w < 256 {
+                if h * w < 256 || (h * w) % 16 != 0 {
                     continue;
                 }
                 let k_max = ((1 << 22) / (h + w) / 32 * 32).min(PublicParams::MAX_K);

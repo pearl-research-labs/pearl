@@ -88,7 +88,7 @@ use plonky2::util::timing::TimingTree;
 use starky::batch_proof::BatchStarkProofWithPublicInputs;
 use starky::batch_prover::BatchStarkPreprocessedData;
 
-use crate::v4::api::layout::{AxisPattern, DimType, lane_assignment};
+use crate::v4::api::layout::lane_assignment;
 use crate::v4::api::noise::compute_fp8_noise;
 use crate::v4::api::openings::stream_words;
 use crate::v4::api::plain_proof::PlainProofV4;
@@ -358,12 +358,8 @@ impl Fp8Verifier {
         proof_data: &[u8],
         share_nbits: u32,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
         let statement = validate_public_statement(proposed_header, ancestor_chain, public_data, share_nbits)?;
-        println!("statement validation in {:.2} ms", start.elapsed().as_millis());
-        let start = std::time::Instant::now();
         let job = Fp8Job::derive(&statement, proposed_header)?;
-        println!("job derivation in {:.2} ms", start.elapsed().as_millis());
         self.verify_derived(&job, proof_data)
     }
 
@@ -432,7 +428,7 @@ impl Fp8VerifierCache {
 }
 
 /// The canonical minimum-envelope dense statement — `m = n = 32`, `k = 1024`,
-/// rank 32, per-axis pattern `[(4, Fold), (4, Blake)]`:
+/// rank 32, `h = w = 16`:
 /// the statement `build_cache` compiles the universal setup from (any
 /// envelope-legal statement yields the same circuits) and the
 /// committed-LUT-cap tests pin. Its consumers only need an envelope-legal
@@ -446,7 +442,6 @@ pub fn sample_dense_statement() -> Result<PublicParams> {
 /// each device's job-independent prover setup, LUT commitment and universal
 /// verifier setup.
 pub fn sample_dense_statement_for_device(device: Device) -> Result<PublicParams> {
-    let pattern = AxisPattern::new(&[(4, DimType::Fold), (4, DimType::Blake)])?;
     let params = PublicParams::try_new(
         JobParams {
             ancestor_header: BlockHeader::zero(),
@@ -460,12 +455,12 @@ pub fn sample_dense_statement_for_device(device: Device) -> Result<PublicParams>
                 a: OperandParams {
                     num_rows: 32,
                     hash_id: HashId::Blake3Chunk1024,
-                    pattern: pattern.clone(),
+                    tile_size: 16,
                 },
                 b: OperandParams {
                     num_rows: 32,
                     hash_id: HashId::Blake3Chunk1024,
-                    pattern,
+                    tile_size: 16,
                 },
             },
             moe: None,
@@ -499,7 +494,7 @@ fn validate_public_statement(
     Ok(statement)
 }
 
-/// One fp8 batch proof (the twenty-one-table batched STARK argument with every table's
+/// One fp8 batch proof (the multi-table batched STARK argument with every table's
 /// public inputs), plus its wire encoding.
 #[derive(Clone, Debug)]
 #[cfg(test)]
@@ -611,7 +606,7 @@ impl Fp8Job {
                     },
                     || {
                         let xor_fold = XorFoldProgram {
-                            lanes: lane_assignment(&params.a().pattern, &params.b().pattern),
+                            lanes: lane_assignment(h, w),
                             skip_limit: budget(k, h, w),
                         };
                         let known = xor_fold.known_values::<F>();
@@ -920,15 +915,9 @@ fn verify_fp8_block_wrapped(
     nbits_override: Option<u32>,
 ) -> Result<()> {
     let nbits = nbits_override.unwrap_or(proposed_header.nbits);
-    let start = std::time::Instant::now();
     check_public_jackpot(public_params, nbits)?;
-    println!("public jackpot check in {:.2} ms", start.elapsed().as_millis());
-    let start = std::time::Instant::now();
     let job = Fp8Job::derive(public_params, proposed_header)?;
-    println!("job derivation in {:.2} ms", start.elapsed().as_millis());
-    let start = std::time::Instant::now();
     let expected = job.expected_public_inputs();
-    println!("expected public inputs in {:.2} ms", start.elapsed().as_millis());
     verify_wrapped_proof(
         &job.system,
         &verifier.circuit,
@@ -996,7 +985,8 @@ mod tests {
     #[test]
     fn published_statement_rejects_an_unknown_device_byte() {
         let mut bytes = sample_dense_statement().unwrap().to_bytes();
-        const DEVICE_OFFSET: usize = BlockHeader::SERIALIZED_SIZE + 4 + 4 + 2 + 1;
+        // `pB = k(4) | r(2) | Quant(1) | Device(1) | n | hash_idB | w | e`.
+        const DEVICE_OFFSET: usize = BlockHeader::SERIALIZED_SIZE + 4 + 2 + 1;
         bytes[DEVICE_OFFSET] = 2;
         let error = decode_statement(&bytes).expect_err("unknown device byte must reject");
         assert!(error.to_string().contains("Device discriminant"), "{error}");

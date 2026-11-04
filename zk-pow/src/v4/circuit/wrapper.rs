@@ -466,7 +466,6 @@ pub fn verify_wrapped_proof(
     expected_public_inputs: &[Vec<F>; NUM_TABLES],
     statement_digest: Hash256,
 ) -> Result<()> {
-    let start = std::time::Instant::now();
     ensure!(
         verifier_data.common.config.zero_knowledge,
         "the wrapped verifier circuit must be the ZK stage"
@@ -490,7 +489,6 @@ pub fn verify_wrapped_proof(
         proof.public_inputs == expected,
         "wrapped proof: public inputs do not match the statement's expectations"
     );
-    println!("preverif: {} ms", start.elapsed().as_millis());
     verifier_data.verify(proof.clone())
 }
 

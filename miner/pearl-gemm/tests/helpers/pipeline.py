@@ -156,14 +156,11 @@ class MinerPipeline:
         self.inv_alpha_b = torch.reciprocal(ctx.alpha_b.reshape(-1).float()).contiguous()
         self.c = torch.zeros(m, ctx.n, dtype=torch.bfloat16, device=device)
         self.hit_signal = HitSignal(HitSignalConfig(max_m=m, max_k=ctx.k), device=self.device)
-        # The kernel implements one committed lottery pattern per instance
-        # (merged tile = ltile_rows rows x ltile_cols cols, thread-local
-        # subtiles; see mixed_gemm/) -- reject configs that
-        # committed anything else.
+        # The committed consecutive tile must match the kernel's geometry.
         assert (
-            ctx.config.rows_pattern.tile_size == self.gemm_config.ltile_rows
-            and ctx.config.cols_pattern.tile_size == self.gemm_config.ltile_cols
-        ), "committed pattern must match the gemm's lottery tile (default_config)"
+            ctx.config.tile_rows == self.gemm_config.ltile_rows
+            and ctx.config.tile_cols == self.gemm_config.ltile_cols
+        ), "committed tile must match the gemm's lottery tile (default_config)"
 
         self.threshold = torch.frombuffer(bytearray(ctx.threshold_bytes()), dtype=torch.uint8).to(
             device

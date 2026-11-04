@@ -5,7 +5,6 @@ from dataclasses import dataclass, replace
 from functools import cache
 
 from miner_base.commitment import Device, MiningConfiguration, commitment_keys
-from miner_base.layout import AxisPattern
 from miner_base.mining_config import (
     COMMITMENT_CHUNK_SIZE,
     default_mining_config,
@@ -163,9 +162,7 @@ def select_tile(n: int, k: int, *, device: Device) -> LotteryTileSpec | None:
 
 
 def _tall_tile_configuration(k: int, device: Device) -> MiningConfiguration:
-    """The committed 16x32 layout: a 16x1 grid of 1x32 subtiles -- one lane per
-    tile row, each lane folding its row's 32 contiguous cols ascending (the
-    kernel's thread-local single-row fold, ltile_rows=16 / ltile_cols=32)."""
+    """16 rows x 32 columns; each of the 16 extractor words folds one row."""
     return tall_tile_mining_config(
         k,
         RANK,
@@ -326,11 +323,10 @@ def threshold_bytes_for(job: MiningJob, k: int, n: int | None = None, *, device:
     return lottery_threshold(job.target, k, n, device=device).to_bytes(32, "little")
 
 
-def tile_indices(pattern: AxisPattern, tile_index: int) -> list[int]:
-    """Absolute row/col indices of the ``tile_index``-th committed tile,
-    in ``mixed_gemm`` hit-record order."""
-    base = tile_index * pattern.total
-    return [base + off for off in pattern.tile_offsets]
+def tile_indices(size: int, tile_index: int) -> list[int]:
+    """Absolute indices of the tile_index-th consecutive row/column tile."""
+    base = tile_index * size
+    return list(range(base, base + size))
 
 
 def is_mineable_shape(n: int, k: int, *, device: Device) -> bool:

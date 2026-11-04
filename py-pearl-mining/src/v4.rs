@@ -3,7 +3,6 @@
 use pyo3::prelude::*;
 
 use zk_pow::ffi::py_v4::{PyFp8Prover, PyFp8Verifier};
-use zk_pow::v4::api::layout::{AxisPattern, DimType};
 use zk_pow::v4::api::plain_proof::{MoeWitness, PlainProofV4};
 use zk_pow::v4::api::primitives::BlockHeader;
 use zk_pow::v4::api::public_params::{
@@ -44,8 +43,6 @@ pub fn register_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MoeParams>()?;
     m.add_class::<HashId>()?;
     m.add_class::<Quant>()?;
-    m.add_class::<DimType>()?;
-    m.add_class::<AxisPattern>()?;
     m.add_class::<Device>()?;
     Ok(())
 }

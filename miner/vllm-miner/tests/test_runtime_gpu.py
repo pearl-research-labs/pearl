@@ -239,7 +239,7 @@ def test_prepare_layer_matches_pinned_commitment_chain(layer_state):
     )
 
     # Every mineable shape here commits the preferred 4x64 tile.
-    assert (config.rows_pattern.tile_size, config.cols_pattern.tile_size) == (4, 64)
+    assert (config.tile_rows, config.tile_cols) == (4, 64)
     assert config.common_dim == k
     assert config.device is device
     # Cert-v4 can only open the native 1024-byte leaf.

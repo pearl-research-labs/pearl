@@ -11,26 +11,40 @@ use plonky2::field::cosets::get_unique_coset_shifts;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use plonky2::field::types::{Field, PrimeField64};
+use plonky2::fri::FriConfig;
+use plonky2::fri::reduction_strategies::FriReductionStrategy;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData, VerifierCircuitData};
 use plonky2::util::serialization::{Buffer, DefaultGateSerializer, Read, Remaining};
 use serde::{Deserialize, Serialize};
 
 use super::wrapper::{D, F, OuterC};
 use crate::ensure_eq;
-use crate::v2::circuit::circuit_utils::build_recursion_config as v2_build_recursion_config;
 pub use crate::v2::circuit::circuit_utils::num_query_rounds;
 use crate::v4::api::public_params::Device;
 
-/// Use v2's recursion config with additional routed wires in FP8's second stage.
+const SECURITY_BITS: usize = 120;
+
+/// FP8 recursion config. The routed-wire counts are temporary and should change.
 pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
-    let mut config = v2_build_recursion_config(rate_bits, pow_bits, stage, is_zk);
-    if stage == 1 {
-        config.num_routed_wires = 48;
+    debug_assert!(rate_bits >= 3);
+    debug_assert!(stage == 1 || stage == 2);
+    CircuitConfig {
+        num_wires: 135,
+        num_routed_wires: if stage == 2 { 40 } else { 48 },
+        num_constants: 2,
+        use_base_arithmetic_gate: true,
+        security_bits: SECURITY_BITS,
+        num_challenges: 3,
+        zero_knowledge: is_zk,
+        max_quotient_degree_factor: 8,
+        fri_config: FriConfig {
+            rate_bits,
+            cap_height: 5,
+            proof_of_work_bits: pow_bits as u32,
+            reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
+            num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
+        },
     }
-    if stage == 2 {
-        config.num_routed_wires = 40;
-    }
-    config
 }
 
 /// Trusted verifier setup: the universal wrapper's stage-2 verifier data plus the
