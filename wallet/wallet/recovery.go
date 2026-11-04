@@ -56,7 +56,7 @@ func NewRecoveryManager(recoveryWindow, batchSize uint32,
 // have been previously found. This method ensures that the recovery state's
 // horizons properly start from the last found address of a prior recovery
 // attempt.
-func (rm *RecoveryManager) Resurrect(ns walletdb.ReadWriteBucket,
+func (rm *RecoveryManager) Resurrect(ns walletdb.ReadBucket,
 	scopedMgrs map[waddrmgr.KeyScope]*waddrmgr.ScopedKeyManager,
 	credits []wtxmgr.Credit) error {
 
@@ -84,7 +84,7 @@ func (rm *RecoveryManager) Resurrect(ns walletdb.ReadWriteBucket,
 		// recovery state's set of addresses to look for.
 		for i := uint32(0); i < externalCount; i++ {
 			keyPath := externalKeyPath(i)
-			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath, true)
+			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath)
 			if err != nil && err != hdkeychain.ErrInvalidChild {
 				return err
 			} else if err == hdkeychain.ErrInvalidChild {
@@ -104,7 +104,7 @@ func (rm *RecoveryManager) Resurrect(ns walletdb.ReadWriteBucket,
 		// recovery state's set of addresses to look for.
 		for i := uint32(0); i < internalCount; i++ {
 			keyPath := internalKeyPath(i)
-			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath, true)
+			addr, err := scopedMgr.DeriveFromKeyPath(ns, keyPath)
 			if err != nil && err != hdkeychain.ErrInvalidChild {
 				return err
 			} else if err == hdkeychain.ErrInvalidChild {

@@ -147,6 +147,13 @@ type Policy struct {
 	// When the pool exceeds this limit, the lowest fee-rate transactions
 	// are evicted. A value of 0 means unlimited (no eviction).
 	MaxMempoolSize uint64
+
+	// The package limits cap a transaction plus its unconfirmed ancestors (by count and vsize), and each of those
+	// ancestors plus its descendants (by count). Zero skips a bound so harnesses that omit these fields can build long
+	// chains; newServer always writes the defaults.
+	LimitAncestorCount   int
+	LimitAncestorSize    int64
+	LimitDescendantCount int
 }
 
 // TxDesc is a descriptor containing a transaction in the mempool along with
@@ -175,6 +182,12 @@ type TxPool struct {
 	orphans       map[chainhash.Hash]*orphanTx
 	orphansByPrev map[wire.OutPoint]map[chainhash.Hash]*btcutil.Tx
 	outpoints     map[wire.OutPoint]*btcutil.Tx
+
+	// spenders lists, for each pool transaction, the pool transactions spending its outputs, so they are found without
+	// looking up each output. Spends of confirmed outputs are not listed, which keeps its memory proportional to the
+	// links between pool transactions.
+	spenders map[chainhash.Hash][]*btcutil.Tx
+
 	pennyTotal    float64 // exponentially decaying total for penny spends.
 	lastPennyUnix int64   // unix time of last ``penny spend''
 
@@ -471,8 +484,8 @@ func (mp *TxPool) HaveTransaction(hash *chainhash.Hash) bool {
 	return haveTx
 }
 
-// removeTransaction is the internal function which implements the public
-// RemoveTransaction.  See the comment for RemoveTransaction for more details.
+// removeTransaction is the internal function which implements the public RemoveTransaction. See the comment for
+// RemoveTransaction for more details.
 //
 // This function MUST be called with the mempool lock held (for writes).
 func (mp *TxPool) removeTransaction(tx *btcutil.Tx, removeRedeemers bool) {
@@ -489,8 +502,7 @@ func (mp *TxPool) removeTransaction(tx *btcutil.Tx, removeRedeemers bool) {
 
 	// Remove the transaction if needed.
 	if txDesc, exists := mp.pool[*txHash]; exists {
-		// Remove unconfirmed address index entries associated with the
-		// transaction if enabled.
+		// Remove unconfirmed address index entries associated with the transaction if enabled.
 		if mp.cfg.AddrIndex != nil {
 			mp.cfg.AddrIndex.RemoveUnconfirmedTx(txHash)
 		}
@@ -503,10 +515,46 @@ func (mp *TxPool) removeTransaction(tx *btcutil.Tx, removeRedeemers bool) {
 		// Mark the referenced outpoints as unspent by the pool.
 		for _, txIn := range txDesc.Tx.MsgTx().TxIn {
 			delete(mp.outpoints, txIn.PreviousOutPoint)
+			mp.removeSpender(txIn.PreviousOutPoint.Hash, *txHash)
 		}
+		delete(mp.spenders, *txHash)
 		delete(mp.pool, *txHash)
 		atomic.StoreInt64(&mp.lastUpdated, time.Now().Unix())
 	}
+}
+
+// addSpender records that spender spends an output of the pool transaction parent.
+//
+// This function MUST be called with the mempool lock held (for writes).
+func (mp *TxPool) addSpender(parent chainhash.Hash, spender *btcutil.Tx) {
+	for _, known := range mp.spenders[parent] {
+		if known.Hash().IsEqual(spender.Hash()) {
+			return
+		}
+	}
+	mp.spenders[parent] = append(mp.spenders[parent], spender)
+}
+
+// removeSpender forgets that spender spends an output of parent.
+//
+// This function MUST be called with the mempool lock held (for writes).
+func (mp *TxPool) removeSpender(parent, spender chainhash.Hash) {
+	spenders := mp.spenders[parent]
+	for i, known := range spenders {
+		if !known.Hash().IsEqual(&spender) {
+			continue
+		}
+		last := len(spenders) - 1
+		spenders[i] = spenders[last]
+		spenders[last] = nil
+		spenders = spenders[:last]
+		break
+	}
+	if len(spenders) == 0 {
+		delete(mp.spenders, parent)
+		return
+	}
+	mp.spenders[parent] = spenders
 }
 
 // RemoveTransaction removes the passed transaction from the mempool. When the
@@ -542,14 +590,12 @@ func (mp *TxPool) RemoveDoubleSpends(tx *btcutil.Tx) {
 	mp.mtx.Unlock()
 }
 
-// addTransaction adds the passed transaction to the memory pool.  It should
-// not be called directly as it doesn't perform any validation.  This is a
-// helper for maybeAcceptTransaction.
+// addTransaction adds the passed transaction to the memory pool. It should not be called directly as it doesn't perform
+// any validation. This is a helper for maybeAcceptTransaction.
 //
 // This function MUST be called with the mempool lock held (for writes).
 func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint, tx *btcutil.Tx, height int32, fee int64) *TxDesc {
-	// Add the transaction to the pool and mark the referenced outpoints
-	// as spent by the pool.
+	// Add the transaction to the pool and mark the referenced outpoints as spent by the pool.
 	txD := &TxDesc{
 		Tx:       tx,
 		Added:    time.Now(),
@@ -558,9 +604,24 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint, tx *btcutil
 		FeePerKB: fee * 1000 / blockchain.GetTransactionVsize(tx),
 	}
 
-	mp.pool[*tx.Hash()] = txD
+	txHash := *tx.Hash()
+	mp.pool[txHash] = txD
 	for _, txIn := range tx.MsgTx().TxIn {
 		mp.outpoints[txIn.PreviousOutPoint] = tx
+		if _, ok := mp.pool[txIn.PreviousOutPoint.Hash]; ok {
+			mp.addSpender(txIn.PreviousOutPoint.Hash, tx)
+		}
+	}
+
+	// A transaction re-added after its block is disconnected can already have children in the pool: confirming it left
+	// them there, and they are removed only if the re-add fails. Link them so descendant counts and replacements
+	// include them.
+	op := wire.OutPoint{Hash: txHash}
+	for i := range tx.MsgTx().TxOut {
+		op.Index = uint32(i)
+		if spender, ok := mp.outpoints[op]; ok {
+			mp.addSpender(txHash, spender)
+		}
 	}
 	atomic.StoreInt64(&mp.lastUpdated, time.Now().Unix())
 
@@ -569,8 +630,7 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint, tx *btcutil
 	mp.poolBytes += txSize
 	mp.feeRateHeap.Add(*tx.Hash(), txD.FeePerKB, int64(txSize))
 
-	// Add unconfirmed address index entries associated with the transaction
-	// if enabled.
+	// Add unconfirmed address index entries associated with the transaction if enabled.
 	if mp.cfg.AddrIndex != nil {
 		mp.cfg.AddrIndex.AddUnconfirmedTx(tx, utxoView)
 	}
@@ -583,30 +643,47 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint, tx *btcutil
 	return txD
 }
 
-// checkPoolDoubleSpend checks whether or not the passed transaction is
-// attempting to spend coins already spent by other transactions in the pool.
-// If it does, we'll check whether each of those transactions are signaling for
-// replacement. If just one of them isn't, an error is returned. Otherwise, a
-// boolean is returned signaling that the transaction is a replacement. Note it
-// does not check for double spends against transactions already in the main
-// chain.
+// checkPoolDoubleSpend checks whether or not the passed transaction is attempting to spend coins already spent by other
+// transactions in the pool. If it does, we'll check whether each of those transactions are signaling for replacement.
+// If just one of them isn't, or there are more of them than a replacement may evict, an error is returned. Otherwise, a
+// boolean is returned signaling that the transaction is a replacement. Note it does not check for double spends against
+// transactions already in the main chain.
 //
 // This function MUST be called with the mempool lock held (for reads).
 func (mp *TxPool) checkPoolDoubleSpend(tx *btcutil.Tx) (bool, error) {
-	var isReplacement bool
+	var (
+		isReplacement bool
+		checked       map[chainhash.Hash]struct{}
+		cache         map[chainhash.Hash]bool
+	)
 	for _, txIn := range tx.MsgTx().TxIn {
 		conflict, ok := mp.outpoints[txIn.PreviousOutPoint]
 		if !ok {
 			continue
 		}
 
-		// Reject the transaction if we don't accept replacement
-		// transactions or if it doesn't signal replacement.
-		if mp.cfg.Policy.RejectReplacement ||
-			!mp.signalsReplacement(conflict, nil) {
-			str := fmt.Sprintf("output already spent in mempool: "+
-				"output=%v, tx=%v", txIn.PreviousOutPoint,
-				conflict.Hash())
+		// Double-spending many inputs of one conflict must not walk its ancestors once per input.
+		if checked == nil {
+			checked = make(map[chainhash.Hash]struct{})
+			cache = make(map[chainhash.Hash]bool)
+		}
+		if _, ok := checked[*conflict.Hash()]; ok {
+			continue
+		}
+		checked[*conflict.Hash()] = struct{}{}
+
+		// Each conflict would be evicted, and validateReplacement rejects evicting more than MaxReplacementEvictions
+		// transactions. Reject now, before walking the ancestors of the rest.
+		if len(checked) > MaxReplacementEvictions {
+			str := fmt.Sprintf("%v: replacement transaction evicts more transactions than permitted: max is %v",
+				tx.Hash(), MaxReplacementEvictions)
+			return false, txRuleError(wire.RejectNonstandard, str)
+		}
+
+		// Reject the transaction if we don't accept replacement transactions or if it doesn't signal replacement.
+		if mp.cfg.Policy.RejectReplacement || !mp.signalsReplacement(conflict, cache) {
+			str := fmt.Sprintf("output already spent in mempool: output=%v, tx=%v",
+				txIn.PreviousOutPoint, conflict.Hash())
 			return false, txRuleError(wire.RejectDuplicate, str)
 		}
 
@@ -616,91 +693,66 @@ func (mp *TxPool) checkPoolDoubleSpend(tx *btcutil.Tx) (bool, error) {
 	return isReplacement, nil
 }
 
-// signalsReplacement determines if a transaction is signaling that it can be
-// replaced using the Replace-By-Fee (RBF) policy. This policy specifies two
-// ways a transaction can signal that it is replaceable:
+// signalsReplacement determines if a transaction is signaling that it can be replaced using the Replace-By-Fee (RBF)
+// policy. This policy specifies two ways a transaction can signal that it is replaceable:
 //
-// Explicit signaling: A transaction is considered to have opted in to allowing
-// replacement of itself if any of its inputs have a sequence number less than
-// 0xfffffffe.
+// Explicit signaling: A transaction is considered to have opted in to allowing replacement of itself if any of its
+// inputs have a sequence number less than 0xfffffffe.
 //
-// Inherited signaling: Transactions that don't explicitly signal replaceability
-// are replaceable under this policy for as long as any one of their ancestors
-// signals replaceability and remains unconfirmed.
+// Inherited signaling: Transactions that don't explicitly signal replaceability are replaceable under this policy for
+// as long as any one of their ancestors signals replaceability and remains unconfirmed.
 //
-// The cache is optional and serves as an optimization to avoid visiting
-// transactions we've already determined don't signal replacement.
+// The cache is optional. It holds the result for each transaction already visited, so calls sharing it visit each
+// transaction at most once.
 //
 // This function MUST be called with the mempool lock held (for reads).
-func (mp *TxPool) signalsReplacement(tx *btcutil.Tx,
-	cache map[chainhash.Hash]struct{}) bool {
-
-	// If a cache was not provided, we'll initialize one now to use for the
-	// recursive calls.
+func (mp *TxPool) signalsReplacement(tx *btcutil.Tx, cache map[chainhash.Hash]bool) bool {
+	// If a cache was not provided, we'll initialize one now to use for the recursive calls.
 	if cache == nil {
-		cache = make(map[chainhash.Hash]struct{})
+		cache = make(map[chainhash.Hash]bool)
+	}
+	if signals, ok := cache[*tx.Hash()]; ok {
+		return signals
 	}
 
+	signals := false
 	for _, txIn := range tx.MsgTx().TxIn {
 		if txIn.Sequence <= MaxRBFSequence {
-			return true
+			signals = true
+			break
 		}
 
-		hash := txIn.PreviousOutPoint.Hash
-		unconfirmedAncestor, ok := mp.pool[hash]
-		if !ok {
-			continue
+		unconfirmedAncestor, ok := mp.pool[txIn.PreviousOutPoint.Hash]
+		if ok && mp.signalsReplacement(unconfirmedAncestor.Tx, cache) {
+			signals = true
+			break
 		}
-
-		// If we've already determined the transaction doesn't signal
-		// replacement, we can avoid visiting it again.
-		if _, ok := cache[hash]; ok {
-			continue
-		}
-
-		if mp.signalsReplacement(unconfirmedAncestor.Tx, cache) {
-			return true
-		}
-
-		// Since the transaction doesn't signal replacement, we'll cache
-		// its result to ensure we don't attempt to determine so again.
-		cache[hash] = struct{}{}
 	}
 
-	return false
+	cache[*tx.Hash()] = signals
+	return signals
 }
 
-// txDescendants returns all of the unconfirmed descendants of the given
-// transaction. Given transactions A, B, and C where C spends B and B spends A,
-// B and C are considered descendants of A.
+// txDescendants returns all of the unconfirmed descendants of the given transaction. Given transactions A, B, and C
+// where C spends B and B spends A, B and C are considered descendants of A.
 //
-// Results accumulate into descendants; if nil a new map is allocated.
-// At most MaxReplacementEvictions entries are collected.
+// Results accumulate into descendants; if nil a new map is allocated. At most MaxReplacementEvictions entries are
+// collected.
 //
 // This function MUST be called with the mempool lock held (for reads).
 func (mp *TxPool) txDescendants(tx *btcutil.Tx,
 	descendants map[chainhash.Hash]*btcutil.Tx) map[chainhash.Hash]*btcutil.Tx {
 
-	// We'll go through all of the outputs of the transaction to determine
-	// if they are spent by any other mempool transactions.
 	if descendants == nil {
 		descendants = make(map[chainhash.Hash]*btcutil.Tx)
 	}
 
-	op := wire.OutPoint{Hash: *tx.Hash()}
-	for i := range tx.MsgTx().TxOut {
+	for _, descendant := range mp.spenders[*tx.Hash()] {
 		if len(descendants) > MaxReplacementEvictions {
 			break
 		}
 
-		op.Index = uint32(i)
-		descendant, ok := mp.outpoints[op]
-		if !ok {
-			continue
-		}
-
-		// The map is a visited set. If this descendant is already present,
-		// its descendants have already been expanded.
+		// The map is a visited set. If this descendant is already present, its descendants have already been expanded.
 		descendantHash := *descendant.Hash()
 		if _, ok := descendants[descendantHash]; ok {
 			continue
@@ -713,20 +765,28 @@ func (mp *TxPool) txDescendants(tx *btcutil.Tx,
 	return descendants
 }
 
-// txConflicts returns all of the unconfirmed transactions that would become
-// conflicts if we were to accept the given transaction into the mempool. An
-// unconfirmed conflict is known as a transaction that spends an output already
-// spent by a different transaction within the mempool. Any descendants of these
-// transactions are also considered conflicts as they would no longer exist.
-// These are generally not allowed except for transactions that signal RBF
-// support.
+// txConflicts returns all of the unconfirmed transactions that would become conflicts if we were to accept the given
+// transaction into the mempool. An unconfirmed conflict is known as a transaction that spends an output already spent
+// by a different transaction within the mempool. Any descendants of these transactions are also considered conflicts as
+// they would no longer exist. These are generally not allowed except for transactions that signal RBF support.
+//
+// Collection stops once more than MaxReplacementEvictions transactions are found, which validateReplacement rejects.
 //
 // This function MUST be called with the mempool lock held (for reads).
 func (mp *TxPool) txConflicts(tx *btcutil.Tx) map[chainhash.Hash]*btcutil.Tx {
 	conflicts := make(map[chainhash.Hash]*btcutil.Tx)
 	for _, txIn := range tx.MsgTx().TxIn {
+		if len(conflicts) > MaxReplacementEvictions {
+			break
+		}
+
 		conflict, ok := mp.outpoints[txIn.PreviousOutPoint]
 		if !ok {
+			continue
+		}
+
+		// A conflict already collected, directly or as a descendant of another, has had its descendants collected too.
+		if _, ok := conflicts[*conflict.Hash()]; ok {
 			continue
 		}
 
@@ -1272,28 +1332,26 @@ type MempoolAcceptResult struct {
 	bestHeight int32
 }
 
-// CheckMempoolAcceptance behaves similarly to bitcoind's `testmempoolaccept`
-// RPC method. It will perform a series of checks to decide whether this
-// transaction can be accepted to the mempool. If not, the specific error is
-// returned and the caller needs to take actions based on it.
-func (mp *TxPool) CheckMempoolAcceptance(tx *btcutil.Tx) (
-	*MempoolAcceptResult, error) {
-
+// CheckMempoolAcceptance behaves similarly to bitcoind's `testmempoolaccept` RPC method. It will perform a series of
+// checks to decide whether this transaction can be accepted to the mempool. If not, the specific error is returned and
+// the caller needs to take actions based on it.
+func (mp *TxPool) CheckMempoolAcceptance(tx *btcutil.Tx) (*MempoolAcceptResult, error) {
 	mp.mtx.RLock()
 	defer mp.mtx.RUnlock()
 
-	// Call checkMempoolAcceptance with isNew=true and rateLimit=true,
-	// which has the effect that we always check the fee paid from this tx
-	// is greater than min relay fee. We also reject this tx if it's
-	// already an orphan.
+	// Call checkMempoolAcceptance with isNew=true and rateLimit=true, which has the effect that we always check the fee
+	// paid from this tx is greater than min relay fee. We also reject this tx if it's already an orphan.
 	result, err := mp.checkMempoolAcceptance(tx, true, true, true)
 	if err != nil {
 		log.Errorf("CheckMempoolAcceptance: %v", err)
 		return nil, err
 	}
 
-	log.Tracef("Tx %v passed mempool acceptance check: %v", tx.Hash(),
-		spew.Sdump(result))
+	// Dumping a result that evicts large transactions takes hundreds of milliseconds under the pool lock, so only do
+	// it when trace logging is on.
+	log.Tracef("Tx %v passed mempool acceptance check: %v", tx.Hash(), newLogClosure(func() string {
+		return spew.Sdump(result)
+	}))
 
 	return result, nil
 }
@@ -1509,6 +1567,12 @@ func (mp *TxPool) checkMempoolAcceptance(tx *btcutil.Tx,
 		}
 	}
 
+	// Only transactions that pay their way in reach the package walk.
+	err = mp.checkPackageLimits(tx, txSize, conflicts)
+	if err != nil {
+		return nil, err
+	}
+
 	// Verify crypto signatures for each input and reject the transaction
 	// if any don't verify.
 	err = blockchain.ValidateTransactionScripts(tx, utxoView,
@@ -1704,6 +1768,7 @@ func New(cfg *Config) *TxPool {
 		orphansByPrev:  make(map[wire.OutPoint]map[chainhash.Hash]*btcutil.Tx),
 		nextExpireScan: time.Now().Add(orphanExpireScanInterval),
 		outpoints:      make(map[wire.OutPoint]*btcutil.Tx),
+		spenders:       make(map[chainhash.Hash][]*btcutil.Tx),
 		feeRateHeap:    newTxFeeRateHeap(),
 	}
 }

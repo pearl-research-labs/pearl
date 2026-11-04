@@ -50,22 +50,41 @@ func parsePRL(s string) (btcutil.Amount, error) {
 	return amt, nil
 }
 
+// shortIDMinWidth is the narrowest width shortID shortens to; asked for less it returns the id whole, so a column
+// narrower than this overflows.
+const shortIDMinWidth = 8
+
 // shortID renders long identifiers (txids, addresses) with a middle ellipsis
 // so rows stay compact while remaining recognizable.
 func shortID(s string, max int) string {
-	if len(s) <= max || max < 8 {
+	if len(s) <= max || max < shortIDMinWidth {
 		return s
 	}
 	half := (max - 1) / 2
 	return s[:half] + "…" + s[len(s)-half:]
 }
 
+// Both layouts are fixed width, so rows size their date column from them.
+const (
+	unixTimeLayout      = "2006-01-02 15:04"
+	unixTimeLayoutShort = "01-02 15:04"
+)
+
 // fmtUnixTime renders a unix timestamp compactly, in local time.
 func fmtUnixTime(unix int64) string {
+	return fmtUnix(unix, unixTimeLayout)
+}
+
+// fmtUnixTimeShort is fmtUnixTime without the year, for rows too narrow to fit it.
+func fmtUnixTimeShort(unix int64) string {
+	return fmtUnix(unix, unixTimeLayoutShort)
+}
+
+func fmtUnix(unix int64, layout string) string {
 	if unix == 0 {
 		return "-"
 	}
-	return time.Unix(unix, 0).Format("2006-01-02 15:04")
+	return time.Unix(unix, 0).Format(layout)
 }
 
 // fmtConfs renders a confirmation count, flagging unconfirmed transactions.
@@ -74,6 +93,14 @@ func fmtConfs(confs int64) string {
 		return "unconfirmed"
 	}
 	return fmt.Sprintf("%d conf", confs)
+}
+
+// fmtPeerCount renders the SPV peer count, flagging zero because nothing can be sent without a peer.
+func fmtPeerCount(peers int32) string {
+	if peers == 0 {
+		return "0 (cannot send: no peers)"
+	}
+	return fmt.Sprintf("%d", peers)
 }
 
 // syncPercent formats sync progress as a percentage of the best known peer

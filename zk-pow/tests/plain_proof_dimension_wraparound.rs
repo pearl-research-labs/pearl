@@ -6,7 +6,7 @@ use zk_pow::ffi::mine::mine;
 
 #[test]
 fn rejects_dimension_wraparound_after_leaf_count_check() {
-    let (m, n, k) = (256usize, 128usize, 1024usize);
+    let (m, n, k) = (256usize, 128usize, 2048usize);
     let header = IncompleteBlockHeader {
         version: 0,
         prev_block: [1; 32],
@@ -16,7 +16,7 @@ fn rejects_dimension_wraparound_after_leaf_count_check() {
     };
     let config = MiningConfiguration {
         common_dim: k as u32,
-        rank: 32,
+        rank: 128,
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
         cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41]).unwrap(),

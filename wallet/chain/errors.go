@@ -193,6 +193,10 @@ const (
 	// program hash mismatch).
 	ErrNonMandatoryScriptVerifyFlag
 
+	// ErrTxNotRelayed indicates that no peer requested a transaction, or a new send failed its zero-peer preflight.
+	// Only the preflight happens before signing; a broadcast result cannot prove signed bytes were never relayed.
+	ErrTxNotRelayed
+
 	// errSentinel is used to indicate the end of the error list. This
 	// should always be the last error code.
 	errSentinel
@@ -331,6 +335,9 @@ func (r RPCErr) Error() string {
 
 	case ErrNonMandatoryScriptVerifyFlag:
 		return "non mandatory script verify flag"
+
+	case ErrTxNotRelayed:
+		return "transaction not relayed to any peer"
 	}
 
 	return "unknown error"

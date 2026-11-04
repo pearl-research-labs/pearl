@@ -73,13 +73,24 @@ var (
 	// more than the maximum content length.
 	errContentLengthExceeded = fmt.Errorf("maximum content length exceeded")
 
-	// errFailedToRecv is returned when a Read call fails.
-	errFailedToRecv = fmt.Errorf("failed to recv data")
-
 	// errGarbageTooLarge is returned if a caller attempts to send garbage
 	// larger than normal.
 	errGarbageTooLarge = fmt.Errorf("garbage too large")
 )
+
+// HandshakeAdmission gates the CPU-bound phases of an inbound v2 handshake so a flood of accepted sockets cannot
+// pin ECDH.
+type HandshakeAdmission interface {
+	Acquire() (release func(), err error)
+}
+
+type PeerOption func(*Peer)
+
+func WithResponderHandshakeAdmission(admission HandshakeAdmission) PeerOption {
+	return func(p *Peer) {
+		p.responderAdmission = admission
+	}
+}
 
 // Peer defines the components necessary for sending/receiving data over the v2
 // transport.
@@ -131,6 +142,8 @@ type Peer struct {
 	// rw is the underlying object that will be read from / written to in
 	// calls to V2EncPacket and V2ReceivePacket.
 	rw io.ReadWriter
+
+	responderAdmission HandshakeAdmission
 }
 
 // NewPeer returns a new instance of Peer.
@@ -145,6 +158,30 @@ func NewPeer() *Peer {
 		responderP: make([]byte, 32),
 		sessionID:  make([]byte, 32),
 	}
+}
+
+func NewPeerWithOptions(options ...PeerOption) *Peer {
+	p := NewPeer()
+	for _, option := range options {
+		option(p)
+	}
+	return p
+}
+
+func (p *Peer) acquireResponderAdmission() (func(), error) {
+	if p.responderAdmission == nil {
+		return func() {}, nil
+	}
+
+	release, err := p.responderAdmission.Acquire()
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+
+	return release, nil
 }
 
 // createV2Ciphers constructs the packet-length and packet encryption ciphers.
@@ -347,16 +384,12 @@ func (p *Peer) InitiateV2Handshake(garbageLen int) error {
 func (p *Peer) RespondV2Handshake(garbageLen int) error {
 	log.Debugf("Responding to v2 handshake (garbageLen=%d)", garbageLen)
 
-	var err error
-	p.privkeyOurs, p.ellswiftOurs, err = ellswift.EllswiftCreate()
+	release, err := p.acquireResponderAdmission()
 	if err != nil {
-		log.Errorf("Failed to create ellswift keypair: %v", err)
 		return err
 	}
 
-	log.Tracef("Created ellswift keypair, pubkey=%x", p.ellswiftOurs)
-
-	data, err := p.generateKeyAndGarbage(garbageLen)
+	data, err := p.generateResponderKey(garbageLen, release)
 	if err != nil {
 		return err
 	}
@@ -366,6 +399,21 @@ func (p *Peer) RespondV2Handshake(garbageLen int) error {
 	p.Send(data)
 
 	return nil
+}
+
+func (p *Peer) generateResponderKey(garbageLen int, release func()) ([]byte, error) {
+	defer release()
+
+	var err error
+	p.privkeyOurs, p.ellswiftOurs, err = ellswift.EllswiftCreate()
+	if err != nil {
+		log.Errorf("Failed to create ellswift keypair: %v", err)
+		return nil, err
+	}
+
+	log.Tracef("Created ellswift keypair, pubkey=%x", p.ellswiftOurs)
+
+	return p.generateKeyAndGarbage(garbageLen)
 }
 
 // generateKeyAndGarbage returns a byte slice containing our ellswift-encoded
@@ -398,6 +446,37 @@ func (p *Peer) generateKeyAndGarbage(garbageLen int) ([]byte, error) {
 	return data, nil
 }
 
+// deriveV2Ciphers holds the responder admission lease for exactly the
+// CPU-bound ECDH and cipher setup; the deferred release cannot leak the
+// lease if either panics.
+func (p *Peer) deriveV2Ciphers(ellswiftTheirs [64]byte, initiating bool,
+	prlnet PearlNet) error {
+
+	release := func() {}
+	if !initiating {
+		var err error
+		release, err = p.acquireResponderAdmission()
+		if err != nil {
+			return err
+		}
+	}
+	defer release()
+
+	// Calculate the shared secret to be used in creating the packet
+	// ciphers.
+	ecdhSecret, err := ellswift.V2Ecdh(
+		p.privkeyOurs, ellswiftTheirs, p.ellswiftOurs, initiating,
+	)
+	if err != nil {
+		log.Errorf("Failed to calculate ECDH shared secret: %v", err)
+		return err
+	}
+
+	log.Tracef("Calculated ECDH shared secret: %x", ecdhSecret)
+
+	return p.createV2Ciphers(ecdhSecret[:], initiating, prlnet)
+}
+
 // CompleteHandshake finishes the v2 protocol negotiation and optionally sends
 // decoy packets after sending the garbage terminator.
 func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
@@ -425,19 +504,7 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 
 	log.Debug("Calculating ECDH shared secret")
 
-	// Calculate the shared secret to be used in creating the packet
-	// ciphers.
-	ecdhSecret, err := ellswift.V2Ecdh(
-		p.privkeyOurs, ellswiftTheirs, p.ellswiftOurs, initiating,
-	)
-	if err != nil {
-		log.Errorf("Failed to calculate ECDH shared secret: %v", err)
-		return err
-	}
-
-	log.Tracef("Calculated ECDH shared secret: %x", ecdhSecret)
-
-	err = p.createV2Ciphers(ecdhSecret[:], initiating, prlnet)
+	err = p.deriveV2Ciphers(ellswiftTheirs, initiating, prlnet)
 	if err != nil {
 		return err
 	}
@@ -497,22 +564,7 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 		if bytes.Equal(recvGarbage[recvGarbageLen-16:],
 			p.recvGarbageTerm) {
 
-			log.Debugf("Found garbage terminator after %d total "+
-				"bytes", recvGarbageLen)
-
-			log.Tracef("Processing %d bytes preceding garbage "+
-				"terminator", recvGarbageLen-16)
-
-			// Process any potential packet data sent before the
-			// terminator.
-			_, err = p.V2ReceivePacket(
-				recvGarbage[:recvGarbageLen-16],
-			)
-			if err != nil {
-				log.Errorf("Error processing packet data "+
-					"before garbage terminator: %v", err)
-			}
-			return err
+			return p.processGarbageTerminator(recvGarbage)
 		}
 
 		log.Tracef("Garbage terminator not found, receiving 1 more "+
@@ -528,10 +580,36 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 		recvGarbage = append(recvGarbage, recvData...)
 	}
 
-	log.Warnf("Garbage terminator not received after %d "+
-		"bytes", len(recvGarbage))
+	// The loop checks before each read, so the final byte has not been
+	// checked yet. It completes the terminator when the peer sent the
+	// maximum MaxGarbageLen bytes of garbage.
+	recvGarbageLen := len(recvGarbage)
+	if !bytes.Equal(recvGarbage[recvGarbageLen-16:], p.recvGarbageTerm) {
+		log.Warnf("Garbage terminator not received after %d bytes", recvGarbageLen)
 
-	return errGarbageTermNotRecv
+		return errGarbageTermNotRecv
+	}
+
+	return p.processGarbageTerminator(recvGarbage)
+}
+
+// processGarbageTerminator is called once recvGarbage ends with the peer's
+// garbage terminator. It receives the first packet after the terminator,
+// authenticating the garbage that preceded it.
+func (p *Peer) processGarbageTerminator(recvGarbage []byte) error {
+	recvGarbageLen := len(recvGarbage)
+
+	log.Debugf("Found garbage terminator after %d total bytes", recvGarbageLen)
+
+	log.Tracef("Processing %d bytes preceding garbage terminator", recvGarbageLen-16)
+
+	// V2ReceivePacket authenticates the first packet with this garbage as AAD.
+	_, err := p.V2ReceivePacket(recvGarbage[:recvGarbageLen-16])
+	if err != nil {
+		log.Errorf("Error processing packet data before garbage "+
+			"terminator: %v", err)
+	}
+	return err
 }
 
 // V2EncPacket takes the contents and aad and returns a ciphertext.
@@ -714,42 +792,25 @@ func (p *Peer) Send(data []byte) (int, error) {
 	return n, err
 }
 
-// Receive receives numBytes bytes from the underlying connection.
+// Receive receives numBytes bytes from the underlying connection. The buffer
+// grows with the bytes that arrive rather than being sized to numBytes up
+// front, since numBytes may come from an unauthenticated length field.
 func (p *Peer) Receive(numBytes int) ([]byte, int, error) {
-	b := make([]byte, numBytes)
-	index := 0
-	total := 0
-
 	log.Tracef("Attempting to receive %d bytes", numBytes)
 
-	for {
-		// TODO: Use something that inherently prevents going over?
-		if total > numBytes {
-			// This should be logically impossible with io.ReadFull
-			// semantics used implicitly by the loop structure.
-			log.Criticalf("Receive logic error: total=%d > "+
-				"numBytes=%d", total, numBytes)
-			return nil, total, errFailedToRecv
-		}
-
-		if total == numBytes {
-			log.Tracef("Successfully received %d bytes", total)
-			return b, total, nil
-		}
-
-		log.Tracef("Calling Read (need %d bytes, have "+
-			"%d)", numBytes-total, total)
-
-		n, err := p.rw.Read(b[index:])
-		if err != nil {
-			log.Errorf("Receive failed after reading %d bytes "+
-				"(target %d): %v", total+n, numBytes, err)
-			return nil, total, err
-		}
-
-		log.Tracef("Read returned %d bytes", n)
-
-		total += n
-		index += n
+	b, err := io.ReadAll(io.LimitReader(p.rw, int64(numBytes)))
+	// ReadAll doesn't consider EOF as an error; check no premature EOF.
+	if err == nil && len(b) < numBytes {
+		err = io.EOF
 	}
+
+	if err != nil {
+		log.Errorf("Receive failed after reading %d bytes (target %d): %v", len(b), numBytes, err)
+
+		return nil, len(b), err
+	}
+
+	log.Tracef("Successfully received %d bytes", numBytes)
+
+	return b, numBytes, nil
 }

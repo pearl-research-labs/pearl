@@ -172,3 +172,30 @@ func TestInvVectWire(t *testing.T) {
 		}
 	}
 }
+
+// TestInvTypeIsBlock ensures only MSG_BLOCK and MSG_WITNESS_BLOCK are
+// blocks.  It covers every type in ivStrings, so new types are checked.
+func TestInvTypeIsBlock(t *testing.T) {
+	t.Parallel()
+
+	blocks := map[InvType]bool{InvTypeBlock: true, InvTypeWitnessBlock: true}
+	for typ := range ivStrings {
+		if typ.IsBlock() != blocks[typ] {
+			t.Errorf("%s.IsBlock() = %v", typ, typ.IsBlock())
+		}
+	}
+}
+
+// TestInvTypeIsTx ensures only MSG_TX and MSG_WITNESS_TX are
+// transactions.  It covers every type in ivStrings, so new types are
+// checked.
+func TestInvTypeIsTx(t *testing.T) {
+	t.Parallel()
+
+	txs := map[InvType]bool{InvTypeTx: true, InvTypeWitnessTx: true}
+	for typ := range ivStrings {
+		if typ.IsTx() != txs[typ] {
+			t.Errorf("%s.IsTx() = %v", typ, typ.IsTx())
+		}
+	}
+}

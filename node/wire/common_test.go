@@ -8,12 +8,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/stretchr/testify/require"
 )
 
 // mainNetGenesisHash is the hash of the first block in the block chain for the
@@ -407,6 +409,142 @@ func TestVarIntNonCanonical(t *testing.T) {
 				test.name, val)
 			continue
 		}
+	}
+}
+
+// varIntEdges holds the first and last value of each varint size, and the values one either side of them.
+var varIntEdges = []uint64{
+	0, 1, 0xfb, 0xfc, // 1 byte: the first two values and the last two (0xfc is the largest single byte)
+	0xfd, 0xfe, 0xfffe, 0xffff, // 3 bytes (0xfd discriminant): the first two values and the last two
+	0x10000, 0x10001, 0xfffffffe, 0xffffffff, // 5 bytes (0xfe): the first two values and the last two
+	0x100000000, 0x100000001, math.MaxUint64 - 1, math.MaxUint64, // 9 bytes (0xff): the first two and the last two
+}
+
+// TestReadVarIntBuf ensures ReadVarIntBuf decodes a varint of each size into an 8-byte scratch buffer and reads no
+// further than the varint, and that decodeVarInt, which reads stored witnesses, decodes the same value and size.
+func TestReadVarIntBuf(t *testing.T) {
+	for _, want := range varIntEdges {
+		var b bytes.Buffer
+		require.NoError(t, WriteVarInt(&b, 0, want))
+		b.WriteByte(0xaa)
+
+		r := bytes.NewReader(b.Bytes())
+		got, err := ReadVarIntBuf(r, 0, make([]byte, 8))
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+		require.Equal(t, 1, r.Len(), "the byte after the varint must stay unread")
+
+		got, size := decodeVarInt(b.Bytes())
+		require.Equal(t, want, got)
+		require.Equal(t, b.Len()-1, size)
+	}
+}
+
+// TestVarIntBufTruncated ensures that a varint of each size cut off at any byte fails to read, and that writing it
+// fails when the writer runs out of room at any byte.
+func TestVarIntBufTruncated(t *testing.T) {
+	for _, val := range []uint64{0xfc, 0xffff, 0xffffffff, math.MaxUint64} {
+		var b bytes.Buffer
+		require.NoError(t, WriteVarInt(&b, 0, val))
+
+		for n := range b.Len() {
+			_, err := ReadVarIntBuf(bytes.NewReader(b.Bytes()[:n]), 0, make([]byte, 8))
+			require.ErrorContains(t, err, "EOF", "read of %x cut to %d bytes", b.Bytes(), n)
+
+			err = WriteVarIntBuf(newFixedWriter(n), 0, val, make([]byte, 8))
+			require.ErrorIs(t, err, io.ErrShortWrite, "write of %x with room for %d bytes", b.Bytes(), n)
+		}
+	}
+}
+
+// FuzzVarIntRoundTrip ensures every value survives WriteVarIntBuf and ReadVarIntBuf, and that putVarInt and
+// decodeVarInt, used for stored witnesses, agree with them.
+func FuzzVarIntRoundTrip(f *testing.F) {
+	for _, val := range varIntEdges {
+		f.Add(val)
+	}
+
+	f.Fuzz(func(t *testing.T, val uint64) {
+		var w bytes.Buffer
+		require.NoError(t, WriteVarIntBuf(&w, 0, val, make([]byte, 8)))
+		require.Equal(t, VarIntSerializeSize(val), w.Len())
+
+		put := make([]byte, 9)
+		require.Equal(t, w.Bytes(), put[:putVarInt(put, val)])
+
+		r := bytes.NewReader(w.Bytes())
+		got, err := ReadVarIntBuf(r, 0, make([]byte, 8))
+		require.NoError(t, err)
+		require.Equal(t, val, got)
+		require.Zero(t, r.Len())
+
+		got, size := decodeVarInt(w.Bytes())
+		require.Equal(t, val, got)
+		require.Equal(t, w.Len(), size)
+	})
+}
+
+// FuzzReadVarIntBuf ensures ReadVarIntBuf, given any bytes, reads exactly one varint, agrees with decodeVarInt,
+// rejects encodings that are not canonical and accepts only bytes that WriteVarIntBuf would write.
+func FuzzReadVarIntBuf(f *testing.F) {
+	// For each edge value: its encoding, the encoding one byte short and with a byte after it, and the value in each
+	// wider, non-canonical encoding.
+	f.Add([]byte{})
+	for _, val := range varIntEdges {
+		enc := make([]byte, 9)
+		enc = enc[:putVarInt(enc, val)]
+		f.Add(enc)
+		f.Add(enc[:len(enc)-1])
+		f.Add(append(bytes.Clone(enc), 0xaa))
+
+		if val < 0xfd {
+			f.Add(littleEndian.AppendUint16([]byte{0xfd}, uint16(val)))
+		}
+		if val <= math.MaxUint16 {
+			f.Add(littleEndian.AppendUint32([]byte{0xfe}, uint32(val)))
+		}
+		if val <= math.MaxUint32 {
+			f.Add(littleEndian.AppendUint64([]byte{0xff}, val))
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		r := bytes.NewReader(data)
+		val, err := ReadVarIntBuf(r, 0, make([]byte, 8))
+		if len(data) == 0 || len(data) < discriminantToSize(data[0]) {
+			require.ErrorContains(t, err, "EOF")
+
+			return
+		}
+
+		decoded, size := decodeVarInt(data)
+		require.Equal(t, size, len(data)-r.Len(), "ReadVarIntBuf must read exactly the varint")
+		if VarIntSerializeSize(decoded) != size {
+			var msgErr *MessageError
+			require.ErrorAs(t, err, &msgErr, "a non-canonical encoding must be rejected")
+
+			return
+		}
+
+		require.NoError(t, err)
+		require.Equal(t, decoded, val)
+
+		var w bytes.Buffer
+		require.NoError(t, WriteVarIntBuf(&w, 0, val, make([]byte, 8)))
+		require.Equal(t, data[:size], w.Bytes())
+	})
+}
+
+// TestWriteVarIntBuf ensures WriteVarIntBuf writes a varint of each size from an 8-byte scratch buffer, and that
+// putVarInt, which readWitnesses uses, writes the same bytes.
+func TestWriteVarIntBuf(t *testing.T) {
+	for _, val := range varIntEdges {
+		var b bytes.Buffer
+		require.NoError(t, WriteVarIntBuf(&b, 0, val, make([]byte, 8)))
+		require.Equal(t, VarIntSerializeSize(val), b.Len())
+
+		put := make([]byte, 9)
+		require.Equal(t, b.Bytes(), put[:putVarInt(put, val)])
 	}
 }
 

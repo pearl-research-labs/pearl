@@ -15,8 +15,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/rpcclient"
 	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/wallet/chain"
-	"github.com/pearl-research-labs/pearl/wallet/rpc/legacyrpc"
-	"github.com/pearl-research-labs/pearl/wallet/rpc/rpcserver"
+	"github.com/pearl-research-labs/pearl/wallet/rpc/jsonrpc"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 	"github.com/pearl-research-labs/pearl/wallet/wtxmgr"
 )
@@ -53,13 +52,12 @@ var (
 	// is written to by the Write method of the logWriter type.
 	logRotatorPipe *io.PipeWriter
 
-	log          = backendLog.Logger("PRLW")
-	walletLog    = backendLog.Logger("WLLT")
-	txmgrLog     = backendLog.Logger("TMGR")
-	chainLog     = backendLog.Logger("CHNS")
-	grpcLog      = backendLog.Logger("GRPC")
-	legacyRPCLog = backendLog.Logger("RPCS")
-	prlnLog      = backendLog.Logger("PRLN")
+	log       = backendLog.Logger("PRLW")
+	walletLog = backendLog.Logger("WLLT")
+	txmgrLog  = backendLog.Logger("TMGR")
+	chainLog  = backendLog.Logger("CHNS")
+	rpcLog    = backendLog.Logger("RPCS")
+	prlnLog   = backendLog.Logger("PRLN")
 )
 
 // Initialize package-global logger variables.
@@ -68,8 +66,7 @@ func init() {
 	wtxmgr.UseLogger(txmgrLog)
 	chain.UseLogger(chainLog)
 	rpcclient.UseLogger(chainLog)
-	rpcserver.UseLogger(grpcLog)
-	legacyrpc.UseLogger(legacyRPCLog)
+	jsonrpc.UseLogger(rpcLog)
 	neutrino.UseLogger(prlnLog)
 }
 
@@ -79,8 +76,7 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"WLLT": walletLog,
 	"TMGR": txmgrLog,
 	"CHNS": chainLog,
-	"GRPC": grpcLog,
-	"RPCS": legacyRPCLog,
+	"RPCS": rpcLog,
 	"PRLN": prlnLog,
 }
 

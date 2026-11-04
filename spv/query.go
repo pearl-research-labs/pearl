@@ -947,134 +947,119 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	return foundBlock, nil
 }
 
-// sendTransaction sends a transaction to all peers. It returns an error if any
-// peer rejects the transaction.
-//
-// TODO: Better privacy by sending to only one random peer and watching
-// propagation, requires better peer selection support in query API.
-//
-// TODO(wilmer): Move to pushtx package after introducing a query package. This
-// cannot be done at the moment due to circular dependencies.
-func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) error {
-	// Starting with the set of default options, we'll apply any specified
-	// functional options to the query so that we can check what inv type
-	// to use. Broadcast the inv to all peers, responding to any getdata
-	// messages for the transaction.
-	qo := defaultQueryOptions()
-	qo.applyQueryOptions(options...)
-	invType := wire.InvTypeWitnessTx
-	if qo.encoding == wire.BaseEncoding {
-		invType = wire.InvTypeTx
-	}
-
-	// Create an inv.
+// newTransactionInv creates the inventory used to announce a transaction.
+// BIP-144 reserves witness inventory types for getdata, where the requesting
+// peer selects the transaction encoding. The preceding inv therefore always
+// identifies the transaction by its txid using MSG_TX.
+func newTransactionInv(tx *wire.MsgTx) *wire.MsgInv {
 	txHash := tx.TxHash()
 	inv := wire.NewMsgInv()
-	_ = inv.AddInvVect(wire.NewInvVect(invType, &txHash))
+	_ = inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &txHash))
 
-	// We'll gather all the peers who replied to our query, along with
-	// the ones who rejected it and their reason for rejecting it. We'll use
-	// this to determine whether our transaction was actually rejected.
+	return inv
+}
+
+// sendTransaction sends a transaction to all peers. It reports rejections from peers that requested the transaction, or
+// pushtx.NotRelayed if none requested it. Peer verdicts are advisory: an error cannot prove that a transaction sent to
+// a peer will never confirm, and nil does not prove mempool acceptance.
+//
+// TODO: Better privacy by sending to only one random peer and watching propagation, requires better peer selection
+// support in query API.
+//
+// TODO(wilmer): Move to pushtx package after introducing a query package. This cannot be done at the moment due to
+// circular dependencies.
+func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) error {
+	// Starting with the set of default options, we'll apply any specified functional options to the query so we
+	// know which encoding to serve the transaction with. We broadcast an inv to all peers and respond to any
+	// getdata messages for the transaction.
+	qo := defaultQueryOptions()
+	qo.applyQueryOptions(options...)
+
+	// Announce the transaction by txid. A peer can request its preferred serialization in getdata, which we answer
+	// using qo.encoding below.
+	txHash := tx.TxHash()
+	inv := newTransactionInv(tx)
+
+	// We'll gather all the peers who replied to our query, along with the ones who rejected it and their reason for
+	// rejecting it. We'll use this to summarize the requesting peers' relay observations.
 	replies := make(map[int32]struct{})
 	rejections := make(map[int32]*pushtx.BroadcastError)
 	rejectCodes := make(map[pushtx.BroadcastErrorCode]int)
 
-	// closers is a map that tracks the delayed closers we need to make sure
-	// the peer quit channel is closed after a timeout.
+	// closers is a map that tracks the delayed closers we need to make sure the peer quit channel is closed after a
+	// timeout.
 	closers := make(map[int32]*delayedCloser)
 
 	// Send the peer query and listen for getdata.
-	s.queryAllPeers(
-		inv,
-		func(sp *ServerPeer, resp wire.Message, quit chan<- struct{},
-			peerQuit chan<- struct{}) {
+	s.queryAllPeers(inv, func(sp *ServerPeer, resp wire.Message, quit chan<- struct{}, peerQuit chan<- struct{}) {
+		// The "closer" can be used to either close the peer quit channel after a certain timeout or
+		// immediately.
+		closer, ok := closers[sp.ID()]
+		if !ok {
+			closer = newDelayedCloser(peerQuit, qo.rejectTimeout)
+			closers[sp.ID()] = closer
+		}
 
-			// The "closer" can be used to either close the peer
-			// quit channel after a certain timeout or immediately.
-			closer, ok := closers[sp.ID()]
-			if !ok {
-				closer = newDelayedCloser(
-					peerQuit, qo.rejectTimeout,
-				)
-				closers[sp.ID()] = closer
-			}
-
-			switch response := resp.(type) {
-			// A peer has replied with a GetData message, so we'll
-			// send them the transaction.
-			case *wire.MsgGetData:
-				for _, vec := range response.InvList {
-					if vec.Hash == txHash {
-						sp.QueueMessageWithEncoding(
-							tx, nil, qo.encoding,
-						)
-
-						// Peers might send the INV
-						// request multiple times, we
-						// need to de-duplicate them
-						// using a map.
-						replies[sp.ID()] = struct{}{}
-
-						// Okay, so the peer responded
-						// with an INV message, and we
-						// sent out the TX. If we never
-						// hear anything back from the
-						// peer it means they accepted
-						// the tx. If we get a reject,
-						// things are clear as well. But
-						// what if they are just slow to
-						// respond? We'll give them
-						// another bit of time to
-						// respond.
-						closer.closeEventually(s.quit)
+		switch response := resp.(type) {
+		// A peer has replied with a GetData message, so we'll send them the transaction.
+		case *wire.MsgGetData:
+			for _, vec := range response.InvList {
+				if vec.Hash == txHash && vec.Type.IsTx() {
+					if _, replied := replies[sp.ID()]; replied {
+						continue
 					}
+					sp.QueueMessageWithEncoding(tx, nil, qo.encoding)
+
+					// Record each requesting peer once, even if it repeats getdata.
+					replies[sp.ID()] = struct{}{}
+
+					// Allow time for a rejection after sending the transaction. Silence is not
+					// acceptance proof.
+					closer.closeEventually(s.quit)
 				}
-
-			// A peer has rejected our transaction for whatever
-			// reason. Rather than returning to the caller upon the
-			// first rejection, we'll gather them all to determine
-			// whether it is critical/fatal.
-			case *wire.MsgReject:
-				// Ensure this rejection is for the transaction
-				// we're attempting to broadcast.
-				if response.Hash != txHash {
-					return
-				}
-
-				broadcastErr := pushtx.ParseBroadcastError(
-					response, sp.Addr(),
-				)
-				rejections[sp.ID()] = broadcastErr
-				rejectCodes[broadcastErr.Code]++
-
-				log.Debugf("Transaction %v rejected by peer "+
-					"%v: code = %v, reason = %q", txHash,
-					sp.Addr(), broadcastErr.Code,
-					broadcastErr.Reason)
-
-				// A reject message is final, so we can close
-				// the peer quit channel now, we don't expect
-				// any further messages.
-				closer.closeNow()
 			}
-		},
-		append(
-			[]QueryOption{Timeout(s.broadcastTimeout)},
-			options...,
-		)...,
-	)
 
-	// If none of our peers replied to our query, we'll avoid returning an
-	// error as the reliable broadcaster will take care of broadcasting this
-	// transaction upon every block connected/disconnected.
+		// Collect requesting peers' rejections for relay diagnostics. The wallet retains stored SPV payments
+		// regardless of these results.
+		case *wire.MsgReject:
+			// Ensure this rejection is for the transaction we're attempting to broadcast.
+			if response.Cmd != wire.CmdTx || response.Hash != txHash {
+				return
+			}
+			// A peer that never requested these bytes cannot vote against the peers that did. Keep the
+			// rejection set a subset of the requester set, with at most one vote each.
+			if _, replied := replies[sp.ID()]; !replied {
+				return
+			}
+			if _, rejected := rejections[sp.ID()]; rejected {
+				return
+			}
+
+			broadcastErr := pushtx.ParseBroadcastError(response, sp.Addr())
+			rejections[sp.ID()] = broadcastErr
+			rejectCodes[broadcastErr.Code]++
+
+			log.Debugf("Transaction %v rejected by peer %v: code = %v, reason = %q",
+				txHash, sp.Addr(), broadcastErr.Code, broadcastErr.Reason)
+
+			// A reject message is final, so we can close the peer quit channel now, we don't expect any
+			// further messages.
+			closer.closeNow()
+		}
+	}, append([]QueryOption{Timeout(s.broadcastTimeout)}, options...)...)
+
+	// Nothing re-announces the transaction later, so a silent network must surface as NotRelayed, not as success.
 	if len(replies) == 0 {
-		log.Debugf("No peers replied to inv message for transaction %v",
-			txHash)
-		return nil
+		log.Debugf("No peers replied to inv message for transaction %v", txHash)
+
+		reason := fmt.Sprintf("no connected peers to relay transaction %v", txHash)
+		if n := s.ConnectedCount(); n > 0 {
+			reason = fmt.Sprintf("none of %d connected peers requested transaction %v", n, txHash)
+		}
+		return &pushtx.BroadcastError{Code: pushtx.NotRelayed, Reason: reason}
 	}
 
-	// firstRejectWithCode returns the first reject error that we have for
-	// a certain error code.
+	// firstRejectWithCode returns the first reject error that we have for a certain error code.
 	firstRejectWithCode := func(code pushtx.BroadcastErrorCode) error {
 		for _, broadcastErr := range rejections {
 			if broadcastErr.Code == code {
@@ -1082,19 +1067,15 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 			}
 		}
 
-		// We can't really get here unless something is totally wrong in
-		// the above error mapping code.
+		// We can't really get here unless something is totally wrong in the above error mapping code.
 		return fmt.Errorf("invalid error mapping")
 	}
 
-	// If all of our peers who replied to our query also rejected our
-	// transaction, we'll deem that there was actually something wrong with
-	// it, so we'll return the most rejected error between all of our peers.
-	log.Debugf("Got replies from %d peers and %d rejections", len(replies),
-		len(rejections))
+	// Every recorded rejection belongs to a requester, so equal counts now mean that every requester rejected.
+	// Report their most common verdict; callers must still retain any transaction that may have been exposed.
+	log.Debugf("Got replies from %d peers and %d rejections", len(replies), len(rejections))
 	if len(replies) == len(rejections) {
-		log.Warnf("All peers rejected transaction %v checking errors",
-			txHash)
+		log.Warnf("All peers rejected transaction %v checking errors", txHash)
 
 		// First, find the reject code that was returned most often.
 		var (
@@ -1108,32 +1089,23 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 			}
 		}
 
-		// Then return the first error we have for that code (it doesn't
-		// really matter which one, as long as our error code parsing is
-		// correct).
+		// Then return the first error we have for that code (it doesn't really matter which one, as long as our
+		// error code parsing is correct).
 		return firstRejectWithCode(mostRejectedCode)
 	}
 
-	// We did get some rejections, but not from all peers. Perhaps that's
-	// due to some peers responding too slowly. Or it could also be a
-	// malicious peer trying to block us from publishing a TX. That's why
-	// we want to check if more than 60% of the peers (by default) that
-	// replied in time also sent a reject, we can be pretty certain that
-	// this TX is probably invalid.
+	// Summarize invalid reports among the same set of requesting peers. The threshold is diagnostic; it does not
+	// establish consensus validity.
 	if len(rejections) > 0 {
 		numInvalid := float32(rejectCodes[pushtx.Invalid])
 		numPeersResponded := float32(len(replies))
 
-		log.Debugf("Of %d peers that replied, %d think the TX is "+
-			"invalid", numPeersResponded, numInvalid)
+		log.Debugf("Of %.0f peers that replied, %.0f think the TX is invalid", numPeersResponded, numInvalid)
 
-		// 60% or more (by default) of the peers declared this TX as
-		// invalid.
+		// 60% or more (by default) of the peers declared this TX as invalid.
 		if numInvalid/numPeersResponded >= qo.invalidTxThreshold {
-			log.Warnf("Threshold of %d reached (%d out of %d "+
-				"peers), declaring TX %v as invalid",
-				qo.invalidTxThreshold, numInvalid,
-				numPeersResponded, txHash)
+			log.Warnf("Threshold of %.2f reached (%.0f out of %.0f peers) reporting TX %v as invalid",
+				qo.invalidTxThreshold, numInvalid, numPeersResponded, txHash)
 
 			return firstRejectWithCode(pushtx.Invalid)
 		}

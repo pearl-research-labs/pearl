@@ -17,12 +17,26 @@ import (
 	"github.com/pearl-research-labs/pearl/wallet/wallet/txsizes"
 )
 
-// SumOutputValues sums up the list of TxOuts and returns an Amount.
-func SumOutputValues(outputs []*wire.TxOut) (totalOutput btcutil.Amount) {
+// ErrOutputValueOverflow is returned when summing TxOut values wraps int64.
+var ErrOutputValueOverflow = errors.New("sum of output values overflows")
+
+// SumOutputValues sums TxOut values. A wrap would become targetAmount and
+// under-fund the authored transaction.
+func SumOutputValues(outputs []*wire.TxOut) (btcutil.Amount, error) {
+	var totalOutput btcutil.Amount
 	for _, txOut := range outputs {
-		totalOutput += btcutil.Amount(txOut.Value)
+		v := btcutil.Amount(txOut.Value)
+		if v < 0 {
+			return 0, txrules.ErrAmountNegative
+		}
+
+		sum := totalOutput + v
+		if sum < totalOutput {
+			return 0, ErrOutputValueOverflow
+		}
+		totalOutput = sum
 	}
-	return totalOutput
+	return totalOutput, nil
 }
 
 // InputSource provides transaction inputs referencing spendable outputs to
@@ -92,7 +106,10 @@ type ChangeSource struct {
 func NewUnsignedTransaction(outputs []*wire.TxOut, feeRatePerKb btcutil.Amount,
 	fetchInputs InputSource, changeSource *ChangeSource) (*AuthoredTx, error) {
 
-	targetAmount := SumOutputValues(outputs)
+	targetAmount, err := SumOutputValues(outputs)
+	if err != nil {
+		return nil, err
+	}
 	estimatedSize := txsizes.EstimateVirtualSize(
 		0, 0, 1, 0, outputs, changeSource.ScriptSize,
 	)
@@ -187,9 +204,6 @@ type SecretsSource interface {
 	txscript.KeyDB
 	txscript.ScriptDB
 	ChainParams() *chaincfg.Params
-	// GetTapscriptRoot returns the tapscript root hash for the address if it has
-	// tapscript commitment, or nil if it's a standard BIP-86 address.
-	GetTapscriptRoot(btcutil.Address) []byte
 }
 
 // AddAllInputScripts modifies transaction a transaction by adding inputs
@@ -266,18 +280,15 @@ func spendTaprootKey(txIn *wire.TxIn, pkScript []byte,
 		return err
 	}
 
-	// Get tapscript root for the address (nil for standard BIP-86 addresses, non-nil for addresses with tapscript commitment like XMSS).
-	// Generate Schnorr signature with proper tapscript root tweaking (nil path matches TaprootWitnessSignature).
-	tapscriptRoot := secrets.GetTapscriptRoot(addrs[0])
-	sig, err := txscript.RawTxInTaprootSignature(
-		tx, hashCache, idx, inputValue, pkScript, tapscriptRoot,
+	witnessScript, err := txscript.TaprootWitnessSignature(
+		tx, hashCache, idx, inputValue, pkScript,
 		txscript.SigHashDefault, privKey,
 	)
 	if err != nil {
 		return err
 	}
 
-	txIn.Witness = wire.TxWitness{sig}
+	txIn.SetWitness(witnessScript)
 
 	return nil
 }
@@ -335,7 +346,7 @@ func spendMerkleRoot(txIn *wire.TxIn, pkScript []byte,
 		return err
 	}
 
-	txIn.Witness = wire.TxWitness{sig, redeemScript, cbBytes}
+	txIn.SetWitness(wire.TxWitness{sig, redeemScript, cbBytes})
 
 	return nil
 }

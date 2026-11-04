@@ -93,6 +93,14 @@ func minUint32(a, b uint32) uint32 {
 	return b
 }
 
+func validateMaxPeers(maxPeers int) error {
+	if maxPeers <= 0 {
+		return fmt.Errorf("maxpeers must be greater than zero: %d", maxPeers)
+	}
+
+	return nil
+}
+
 // config defines the configuration options for pearld.
 //
 // See loadConfig for details on the configuration load process.
@@ -126,7 +134,7 @@ type config struct {
 	LogSize                  uint32        `long:"logsize" description:"Maximum size in KB of the log file before it is rotated (default: 10240, ~10MB)"`
 	MaxMempool               uint64        `long:"maxmempool" description:"Maximum mempool size in MB (default: 300)"`
 	MaxOrphanTxs             int           `long:"maxorphantx" description:"Max number of orphan transactions to keep in memory"`
-	MaxPeers                 int           `long:"maxpeers" description:"Max number of inbound and outbound peers"`
+	MaxPeers                 int           `long:"maxpeers" description:"Max number of inbound and outbound peers. Must be greater than zero"`
 	MetricsListeners         []string      `long:"metricslisten" description:"Add an interface/port to listen for Prometheus metrics (default port: 9105)"`
 	MiningAddrs              []string      `long:"miningaddr" description:"Add the specified payment address to the list of addresses to use for generated blocks -- At least one address is required if the generate option is set"`
 	MinRelayTxFee            float64       `long:"minrelaytxfee" description:"The minimum transaction fee in PRL/kB to be considered a non-zero fee."`
@@ -623,6 +631,13 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
+	if err := validateMaxPeers(cfg.MaxPeers); err != nil {
+		err := fmt.Errorf("%s: %w", funcName, err)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
 	// If mainnet is active, then we won't allow the stall handler to be
 	// disabled.
 	if activeNetParams.Params.Net == wire.MainNet && cfg.DisableStallHandler {
@@ -944,13 +959,6 @@ func loadConfig() (*config, []string, error) {
 		if err != nil {
 			str := "%s: mining address '%s' failed to decode: %v"
 			err := fmt.Errorf(str, funcName, strAddr, err)
-			fmt.Fprintln(os.Stderr, err)
-			fmt.Fprintln(os.Stderr, usageMessage)
-			return nil, nil, err
-		}
-		if !addr.IsForNet(activeNetParams.Params) {
-			str := "%s: mining address '%s' is on the wrong network"
-			err := fmt.Errorf(str, funcName, strAddr)
 			fmt.Fprintln(os.Stderr, err)
 			fmt.Fprintln(os.Stderr, usageMessage)
 			return nil, nil, err

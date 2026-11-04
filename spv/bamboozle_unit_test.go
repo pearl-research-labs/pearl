@@ -16,6 +16,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
+	"github.com/stretchr/testify/require"
 )
 
 func decodeHashNoError(str string) *chainhash.Hash {
@@ -368,6 +369,15 @@ var (
 			idx:      0,
 			mismatch: true,
 		},
+		{
+			name: "mismatch zero hash",
+			headers: map[string]*wire.MsgCFHeaders{
+				"a": {FilterHashes: []*chainhash.Hash{{}}},
+				"b": headers2,
+			},
+			idx:      0,
+			mismatch: true,
+		},
 	}
 
 	resolveFilterTestCases = []*resolveFilterTestCase{
@@ -643,16 +653,25 @@ func TestCheckForCFHeadersMismatch(t *testing.T) {
 
 	for _, testCase := range checkCFHTestCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			mismatch := checkForCFHeaderMismatch(
-				testCase.headers, testCase.idx,
-			)
-			if mismatch != testCase.mismatch {
-				t.Fatalf("Wrong mismatch detected. Expected: "+
-					"%t, got: %t", testCase.mismatch,
-					mismatch)
-			}
+			require.Equal(t, testCase.mismatch, checkForCFHeaderMismatch(testCase.headers, testCase.idx))
 		})
 	}
+}
+
+// TestAllHashesEqual pins that a zero hash is compared like any other, in either position, so a peer serving one
+// cannot pass as agreeing with the others.
+func TestAllHashesEqual(t *testing.T) {
+	t.Parallel()
+
+	hash := checkpoints2[0]
+	zero := &chainhash.Hash{}
+
+	require.True(t, allHashesEqual(nil))
+	require.True(t, allHashesEqual([]*chainhash.Hash{hash}))
+	require.True(t, allHashesEqual([]*chainhash.Hash{hash, hash}))
+	require.True(t, allHashesEqual([]*chainhash.Hash{zero, zero}))
+	require.False(t, allHashesEqual([]*chainhash.Hash{hash, zero}))
+	require.False(t, allHashesEqual([]*chainhash.Hash{zero, hash}))
 }
 
 func TestResolveFilterMismatchFromBlock(t *testing.T) {

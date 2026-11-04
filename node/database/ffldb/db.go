@@ -1326,6 +1326,36 @@ func (tx *transaction) FetchBlocks(hashes []chainhash.Hash) ([][]byte, error) {
 	return blocks, nil
 }
 
+// FetchBlockSize returns the length of the raw serialized bytes for the block
+// identified by the given hash.
+//
+// Returns the following errors as required by the interface contract:
+//   - ErrBlockNotFound if the requested block hash does not exist
+//   - ErrTxClosed if the transaction has already been closed
+//
+// This function is part of the database.Tx interface implementation.
+func (tx *transaction) FetchBlockSize(hash *chainhash.Hash) (uint32, error) {
+	// Ensure transaction state is valid.
+	if err := tx.checkClosed(); err != nil {
+		return 0, err
+	}
+
+	// When the block is pending to be written on commit return the size
+	// from there.
+	if idx, exists := tx.pendingBlocks[*hash]; exists {
+		// doesn't truncate: blocks are capped at wire.MaxBlockPayload (4 MB), far below uint32 max value.
+		return uint32(len(tx.pendingBlockData[idx].bytes)), nil
+	}
+
+	// Lookup the location of the block in the files from the block index.
+	blockRow, err := tx.fetchBlockRow(hash)
+	if err != nil {
+		return 0, err
+	}
+
+	return deserializeBlockLoc(blockRow).blockLen(), nil
+}
+
 // fetchPendingRegion attempts to fetch the provided region from any block which
 // are pending to be written on commit.  It will return nil for the byte slice
 // when the region references a block which is not pending.  When the region
@@ -1407,10 +1437,11 @@ func (tx *transaction) FetchBlockRegion(region *database.BlockRegion) ([]byte, e
 
 	// Ensure the region is within the bounds of the block.
 	endOffset := region.Offset + region.Len
-	if endOffset < region.Offset || endOffset > location.blockLen {
+	blockLen := location.blockLen()
+	if endOffset < region.Offset || endOffset > blockLen {
 		str := fmt.Sprintf("block %s region offset %d, length %d "+
 			"exceeds block length of %d", region.Hash,
-			region.Offset, region.Len, location.blockLen)
+			region.Offset, region.Len, blockLen)
 		return nil, makeDbErr(database.ErrBlockRegionInvalid, str, nil)
 
 	}
@@ -1505,10 +1536,11 @@ func (tx *transaction) FetchBlockRegions(regions []database.BlockRegion) ([][]by
 
 		// Ensure the region is within the bounds of the block.
 		endOffset := region.Offset + region.Len
-		if endOffset < region.Offset || endOffset > location.blockLen {
+		blockLen := location.blockLen()
+		if endOffset < region.Offset || endOffset > blockLen {
 			str := fmt.Sprintf("block %s region offset %d, length "+
 				"%d exceeds block length of %d", region.Hash,
-				region.Offset, region.Len, location.blockLen)
+				region.Offset, region.Len, blockLen)
 			return nil, makeDbErr(database.ErrBlockRegionInvalid, str, nil)
 		}
 

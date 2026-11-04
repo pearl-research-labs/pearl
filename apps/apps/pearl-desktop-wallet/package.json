@@ -1,6 +1,6 @@
 {
   "name": "@pearl/pearl-desktop-wallet",
-  "version": "2.0.5",
+  "version": "3.0.0",
   "description": "Pearl Desktop Wallet - A modern cryptocurrency wallet application",
   "author": {
     "name": "Pearl Research Labs",
@@ -23,8 +23,6 @@
     "logs:open": "open ~/Library/Logs/@pearl/pearl-desktop-wallet/"
   },
   "dependencies": {
-    "@grpc/grpc-js": "^1.13.4",
-    "@grpc/proto-loader": "^0.8.0",
     "@hookform/resolvers": "^5.2.1",
     "@pearl/ui": "workspace:*",
     "@radix-ui/react-accordion": "^1.2.11",

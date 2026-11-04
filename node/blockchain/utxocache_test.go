@@ -496,7 +496,7 @@ func TestUtxoCacheFlush(t *testing.T) {
 	}
 
 	// Fetch the flushed utxos.
-	entries, err := cache.fetchEntries(outPoints)
+	entries, err := cache.fetchAndAddEntries(outPoints)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -677,7 +677,7 @@ func TestNonErasingFlushWithSpentEntries(t *testing.T) {
 	require.NoError(assertNbEntriesOnDisk(chain, 10))
 
 	// Fetch entries back from DB so they're cached as non-fresh, non-modified.
-	entries, err := cache.fetchEntries(outPoints)
+	entries, err := cache.fetchAndAddEntries(outPoints)
 	require.NoError(err)
 	for _, e := range entries {
 		require.NotNil(e)

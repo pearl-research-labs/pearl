@@ -251,11 +251,6 @@ func (s *secSource) ChainParams() *chaincfg.Params {
 	return s.params
 }
 
-// Returns nil since this test implementation uses non-tapscripts addresses.
-func (s *secSource) GetTapscriptRoot(addr btcutil.Address) []byte {
-	return nil
-}
-
 func newSecSource(params *chaincfg.Params) *secSource {
 	return &secSource{
 		keys:    make(map[string]*btcec.PrivateKey),

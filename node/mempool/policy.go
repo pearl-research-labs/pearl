@@ -57,6 +57,12 @@ const (
 	// DefaultMaxMempoolSize is the default maximum mempool size in bytes.
 	// Matching Bitcoin Core's default of 300 MB (SI megabytes).
 	DefaultMaxMempoolSize = 300 * 1000 * 1000
+
+	// Hard production package limits. The ancestor size is in vbytes: one maximum-size standard transaction plus 1,000
+	// vbytes of unconfirmed ancestors.
+	DefaultAncestorCountLimit   = 25
+	DefaultAncestorSizeLimit    = 101_000
+	DefaultDescendantCountLimit = 25
 )
 
 // calcMinRequiredTxRelayFee returns the minimum transaction fee required for a

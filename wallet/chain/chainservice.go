@@ -23,6 +23,7 @@ type NeutrinoChainService interface {
 	BlockHeaderTipHeight() (int32, error)
 	FilterHeaderTipHeight() (int32, error)
 	BestPeerHeight() int32
+	ConnectedCount() int32
 	GetBlockHash(int64) (*chainhash.Hash, error)
 	GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader, error)
 	IsCurrent() bool

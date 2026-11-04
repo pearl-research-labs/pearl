@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -37,6 +38,12 @@ const (
 	// handler since notifications have their own queuing mechanism
 	// independent of the send channel buffer.
 	websocketSendBufferSize = 50
+
+	// wsPreAuthReadLimit is the largest message accepted from a websocket
+	// client that has not yet authenticated.  The only message such a
+	// client may send is an authenticate command, so this is far below
+	// maxRequestSize.
+	wsPreAuthReadLimit = 64 * 1024
 )
 
 type semaphore chan struct{}
@@ -742,6 +749,17 @@ func (m *wsNotificationManager) UnregisterNewMempoolTxsUpdates(wsc *wsClient) {
 	m.queueNotification <- (*notificationUnregisterNewMempoolTxs)(wsc)
 }
 
+// marshalTxNotification encodes transaction notifications with exact amounts.
+func marshalTxNotification(method string, params ...interface{}) ([]byte, error) {
+	// Use the exact server response types instead of the public notification
+	// structs, whose float64 amounts are retained for Go client compatibility.
+	request, err := btcjson.NewRequest(btcjson.RpcVersion1, nil, method, params)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(request)
+}
+
 // notifyForNewTx notifies websocket clients that have registered for updates
 // when a new transaction is added to the memory pool.
 func (m *wsNotificationManager) notifyForNewTx(clients map[chan struct{}]*wsClient, tx *btcutil.Tx) {
@@ -753,14 +771,13 @@ func (m *wsNotificationManager) notifyForNewTx(clients map[chan struct{}]*wsClie
 		amount += txOut.Value
 	}
 
-	ntfn := btcjson.NewTxAcceptedNtfn(txHashStr, btcutil.Amount(amount).ToPRL())
-	marshalledJSON, err := btcjson.MarshalCmd(btcjson.RpcVersion1, nil, ntfn)
+	marshalledJSON, err := marshalTxNotification(btcjson.TxAcceptedNtfnMethod,
+		txHashStr, rpcAmount(amount))
 	if err != nil {
 		rpcsLog.Errorf("Failed to marshal tx notification: %s", err.Error())
 		return
 	}
 
-	var verboseNtfn *btcjson.TxAcceptedVerboseNtfn
 	var marshalledJSONVerbose []byte
 	for _, wsc := range clients {
 		if wsc.verboseTxUpdates {
@@ -776,9 +793,8 @@ func (m *wsNotificationManager) notifyForNewTx(clients map[chan struct{}]*wsClie
 				return
 			}
 
-			verboseNtfn = btcjson.NewTxAcceptedVerboseNtfn(*rawTx)
-			marshalledJSONVerbose, err = btcjson.MarshalCmd(btcjson.RpcVersion1, nil,
-				verboseNtfn)
+			marshalledJSONVerbose, err = marshalTxNotification(
+				btcjson.TxAcceptedVerboseNtfnMethod, rawTx)
 			if err != nil {
 				rpcsLog.Errorf("Failed to marshal verbose tx "+
 					"notification: %s", err.Error())
@@ -1186,6 +1202,10 @@ type wsClient struct {
 	// false means its access is only to the limited set of RPC calls.
 	isAdmin bool
 
+	// authTimeout is how long an unauthenticated client may stay connected
+	// before it must complete in-band authentication.
+	authTimeout time.Duration
+
 	// sessionID is a random ID generated for each client when connected.
 	// These IDs may be queried by a client using the session RPC.  A change
 	// to the session ID indicates that the client reconnected.
@@ -1263,6 +1283,13 @@ func (c *wsClient) authorizeRequest(req *btcjson.Request) requestOutcome {
 		return requestOutcome{disconnect: !c.authenticated}
 	}
 
+	// Keep this ahead of parseCmd so that no decoder except authenticate's runs
+	// on unauthenticated input.
+	if !c.authenticated && req.Method != "authenticate" {
+		rpcsLog.Warnf("Unauthenticated websocket message received")
+		return requestOutcome{disconnect: true}
+	}
+
 	cmd := parseCmd(req)
 	if cmd.err != nil {
 		// Only process requests from authenticated clients.
@@ -1319,10 +1346,23 @@ func (c *wsClient) authorizeRequest(req *btcjson.Request) requestOutcome {
 // must be run as a goroutine.
 func (c *wsClient) inHandler() {
 	defer func() {
+		// inHandler decodes untrusted frames: a decoder panic must cost this
+		// client its connection, not the process.
+		if r := recover(); r != nil {
+			rpcsLog.Errorf("Recovered panic in websocket client %s: %v\n%s", c.addr, r, debug.Stack())
+		}
 		rpcsLog.Tracef("Websocket client input handler done for %s", c.addr)
 		c.Disconnect()
 		c.wg.Done()
 	}()
+
+	// Until the client authenticates in-band, cap both how long it may hold
+	// a websocket slot and how large a message it may make us read.
+	preAuth := !c.authenticated
+	if preAuth {
+		c.conn.SetReadLimit(wsPreAuthReadLimit)
+		c.conn.SetReadDeadline(time.Now().Add(c.authTimeout))
+	}
 
 	for {
 		// Stop once the quit channel has been closed.  A non-blocking
@@ -1331,6 +1371,14 @@ func (c *wsClient) inHandler() {
 		case <-c.quit:
 			return
 		default:
+		}
+
+		// Lift the pre-auth restrictions once the previous message
+		// authenticated the client.
+		if preAuth && c.authenticated {
+			preAuth = false
+			c.conn.SetReadLimit(maxRequestSize)
+			c.conn.SetReadDeadline(timeZeroVal)
 		}
 
 		_, msg, err := c.conn.ReadMessage()
@@ -1724,11 +1772,18 @@ func newWebsocketClient(server *rpcServer, conn *websocket.Conn,
 		return nil, err
 	}
 
+	// Bound inbound message size the same as the JSON-RPC POST body, so an
+	// authenticated websocket client cannot force unbounded allocation via
+	// an oversized message.  inHandler tightens this further until an
+	// unauthenticated client completes in-band authentication.
+	conn.SetReadLimit(maxRequestSize)
+
 	client := &wsClient{
 		conn:              conn,
 		addr:              remoteAddr,
 		authenticated:     authenticated,
 		isAdmin:           isAdmin,
+		authTimeout:       time.Second * rpcAuthTimeoutSeconds,
 		sessionID:         sessionID,
 		server:            server,
 		addrRequests:      make(map[string]struct{}),
@@ -2073,7 +2128,7 @@ func rescanBlock(wsc *wsClient, lookups *rescanKeys, blk *btcutil.Block) {
 			// attempting to spend to determine whether it is
 			// relevant to us.
 			pkScript, err := txscript.ComputePkScript(
-				txin.SignatureScript, txin.Witness,
+				txin.SignatureScript, txin.DecodeWitness(),
 			)
 			if err != nil {
 				continue

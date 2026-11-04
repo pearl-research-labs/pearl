@@ -7,14 +7,20 @@ interface RpcConfig {
   rpcPassword: string;
 }
 
-class RpcClient {
-  constructor(private config: RpcConfig) { }
+class RpcError extends Error {
+  constructor(
+    readonly code: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'RpcError';
+  }
+}
 
-  async call<Result>(
-    method: string,
-    params: unknown[] = [],
-    timeoutMs: number = 60000,
-  ): Promise<Result> {
+class RpcClient {
+  constructor(private config: RpcConfig) {}
+
+  async call<Result>(method: string, params: unknown[] = [], timeoutMs: number = 60000): Promise<Result> {
     const rpcData = {
       jsonrpc: '2.0',
       method,
@@ -29,17 +35,17 @@ class RpcClient {
           username: this.config.rpcUser,
           password: this.config.rpcPassword,
         },
-        headers: { 'Content-Type': 'application/json' },
-        // Heavy methods such as `listalltransactions` walk the full wallet
-        // history and can exceed the previous 10s cap on wallets with a large
-        // history, causing the dashboard to time out and never render even
-        // when the node is fully synced. Default to 60s and allow per-call
-        // overrides for hot paths.
+        headers: {'Content-Type': 'application/json'},
+        // Methods such as `listalltransactions` walk the full wallet history and can exceed 10s on large wallets.
+        // Default to 60s so the dashboard can render, and allow per-call overrides for hot paths.
         timeout: timeoutMs,
       });
 
       if (response.data.error) {
-        throw new Error(response.data.error.message || 'RPC call failed');
+        const {code, message} = response.data.error;
+        const detail = typeof message === 'string' && message ? message : 'RPC call failed';
+        if (Number.isInteger(code)) throw new RpcError(code, detail);
+        throw new Error(detail);
       }
 
       return response.data.result as Result;
@@ -55,5 +61,5 @@ class RpcClient {
   }
 }
 
-export { RpcClient };
-export type { RpcConfig };
+export {RpcClient, RpcError};
+export type {RpcConfig};

@@ -423,7 +423,7 @@ func TestOutboundPeer(t *testing.T) {
 		// Queue operations must not block or panic on a disconnected peer.
 		fakeInv := wire.NewInvVect(wire.InvTypeBlock, &chainhash.Hash{0x00, 0x01})
 		p.QueueInventory(fakeInv)
-		p.AddKnownInventory(fakeInv)
+		p.AddKnownInventory(*fakeInv)
 		p.QueueInventory(fakeInv)
 
 		done := make(chan struct{})
@@ -683,4 +683,18 @@ func TestPushAddrV2MsgShuffleNoDuplicates(t *testing.T) {
 		require.Truef(t, ok, "address %q was not in the input set", key)
 		seen[key] = struct{}{}
 	}
+}
+
+func TestIsKnownInventory(t *testing.T) {
+	p, err := peer.NewOutboundPeer(&peer.Config{
+		UserAgentName:    "peer",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chaincfg.RegressionNetParams,
+	}, "10.0.0.1:8333")
+	require.NoError(t, err)
+
+	// Known inventory is matched by value, not by pointer identity.
+	assert.False(t, p.IsKnownInventory(*wire.NewInvVect(wire.InvTypeBlock, &chainhash.Hash{0x11})))
+	p.AddKnownInventory(*wire.NewInvVect(wire.InvTypeBlock, &chainhash.Hash{0x11}))
+	assert.True(t, p.IsKnownInventory(*wire.NewInvVect(wire.InvTypeBlock, &chainhash.Hash{0x11})))
 }

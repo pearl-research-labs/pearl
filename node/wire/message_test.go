@@ -15,6 +15,8 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // makeHeader is a convenience function to make a message header in the form of
@@ -203,7 +205,7 @@ func TestReadMessageWireErrors(t *testing.T) {
 
 	// Wire encoded bytes for a message that exceeds max overall message
 	// length.
-	mpl := uint32(MaxMessagePayload)
+	mpl := uint32(MaxProtocolMessageLength)
 	exceedMaxPayloadBytes := makeHeader(prlnet, "getaddr", mpl+1, 0)
 
 	// Wire encoded bytes for a command which is invalid utf-8.
@@ -378,6 +380,47 @@ func TestReadMessageWireErrors(t *testing.T) {
 	}
 }
 
+func TestReadMessageTrailingBytes(t *testing.T) {
+	t.Parallel()
+
+	pver := ProtocolVersion
+	prlnet := MainNet
+
+	me := &NetAddress{Timestamp: time.Time{}, IP: net.ParseIP("127.0.0.1"), Port: 8333}
+	you := &NetAddress{Timestamp: time.Time{}, IP: net.ParseIP("192.168.0.1"), Port: 8333}
+	verMsg := NewMsgVersion(me, you, 1, 0)
+
+	var payloadBuf bytes.Buffer
+	require.NoError(t, verMsg.PrlEncode(&payloadBuf, pver, BaseEncoding))
+
+	garbage := []byte{0xde, 0xad, 0xbe, 0xef}
+	dirtyPayload := append(payloadBuf.Bytes(), garbage...)
+
+	checksum := chainhash.DoubleHashB(dirtyPayload)
+	hdr := makeHeader(prlnet, CmdVersion, uint32(len(dirtyPayload)), 0)
+	copy(hdr[20:], checksum[:4])
+	wireBytes := append(hdr, dirtyPayload...)
+
+	_, _, _, err := ReadMessageN(bytes.NewReader(wireBytes), pver, prlnet)
+
+	var msgErr *MessageError
+	require.ErrorAs(t, err, &msgErr)
+	assert.Contains(t, msgErr.Description, "extra bytes")
+}
+
+func TestReadV2MessageTrailingBytes(t *testing.T) {
+	t.Parallel()
+
+	// Empty inv (count 0) followed by one unconsumed byte.
+	payload := []byte{v2Messages[CmdInv], 0x00, 0xaa}
+
+	_, _, err := ReadV2MessageN(payload, ProtocolVersion, BaseEncoding)
+
+	var msgErr *MessageError
+	require.ErrorAs(t, err, &msgErr)
+	assert.Contains(t, msgErr.Description, "extra bytes")
+}
+
 // TestWriteMessageWireErrors performs negative tests against wire encoding from
 // concrete messages to confirm error paths work correctly.
 func TestWriteMessageWireErrors(t *testing.T) {
@@ -392,7 +435,7 @@ func TestWriteMessageWireErrors(t *testing.T) {
 	encodeErrMsg := &fakeMessage{forceEncodeErr: true}
 
 	// Fake message that has payload which exceeds max overall message size.
-	exceedOverallPayload := make([]byte, MaxMessagePayload+1)
+	exceedOverallPayload := make([]byte, MaxProtocolMessageLength+1)
 	exceedOverallPayloadErrMsg := &fakeMessage{payload: exceedOverallPayload}
 
 	// Fake message that has payload which exceeds max allowed per message.
@@ -452,6 +495,114 @@ func TestWriteMessageWireErrors(t *testing.T) {
 					test.err, test.err)
 				continue
 			}
+		}
+	}
+}
+
+// TestMessageSizeMatchesEncoding verifies MessageSize reports exactly the
+// number of payload bytes a message occupies on the wire for both the
+// base and witness encodings of populated samples of every message type
+// that can grow beyond a few bytes.
+func TestMessageSizeMatchesEncoding(t *testing.T) {
+	hash := chainhash.Hash{0x01}
+	hash2 := chainhash.Hash{0x02}
+
+	// inv with a varint count of three inventory vectors.
+	inv := NewMsgInv()
+	inv.AddInvVect(NewInvVect(InvTypeTx, &hash))
+	inv.AddInvVect(NewInvVect(InvTypeBlock, &hash2))
+	inv.AddInvVect(NewInvVect(InvTypeWitnessTx, &hash))
+
+	// getdata with the same shape as inv but a different command.
+	getData := NewMsgGetData()
+	getData.AddInvVect(NewInvVect(InvTypeTx, &hash))
+	getData.AddInvVect(NewInvVect(InvTypeBlock, &hash2))
+	getData.AddInvVect(NewInvVect(InvTypeWitnessTx, &hash))
+
+	// notfound with the same shape as inv but a different command.
+	notFound := NewMsgNotFound()
+	notFound.AddInvVect(NewInvVect(InvTypeTx, &hash))
+	notFound.AddInvVect(NewInvVect(InvTypeBlock, &hash2))
+	notFound.AddInvVect(NewInvVect(InvTypeWitnessTx, &hash))
+
+	// cfilter carrying an arbitrary amount of filter data.
+	cfilter := NewMsgCFilter(GCSFilterRegular, &hash, make([]byte, 300))
+
+	// cfcheckpt with three filter header hashes.
+	cfCheckpt := NewMsgCFCheckpt(GCSFilterRegular, &hash, 3)
+	cfCheckpt.AddCFHeader(&hash)
+	cfCheckpt.AddCFHeader(&hash2)
+	cfCheckpt.AddCFHeader(&hash)
+
+	// merkleblock with two transaction hashes and three flag bytes.
+	merkleBlock := NewMsgMerkleBlock(NewBlockHeader(1, &hash, &hash2, 1))
+	merkleBlock.Transactions = 2
+	merkleBlock.AddTxHash(&hash)
+	merkleBlock.AddTxHash(&hash2)
+	merkleBlock.Flags = []byte{0x01, 0x02, 0x03}
+
+	// reject carrying a hash (block rejection) and one without.
+	rejectBlock := NewMsgReject(CmdBlock, RejectDuplicate, "duplicate")
+	rejectBlock.Hash = hash
+	rejectMisc := NewMsgReject(CmdGetAddr, RejectMalformed, "bad")
+
+	// headers with two certified block headers carrying a near-maximum
+	// proof, the shape handlers use to stream large replies.
+	headers := NewMsgHeaders()
+	for i := 0; i < 2; i++ {
+		cert := &CertificateV1{
+			Hash:      chainhash.Hash{byte(i)},
+			ProofData: make([]byte, 51200),
+		}
+		err := headers.AddBlockHeader(*NewBlockHeader(1, &hash, &hash2, 1), cert)
+		require.NoError(t, err)
+	}
+
+	// A transaction with witness data, which encodes differently under
+	// the base and witness encodings.
+	witnessTx := NewMsgTx(1)
+	witnessTx.AddTxIn(NewTxIn(&OutPoint{Hash: hash, Index: 0}, []byte{0x01, 0x02}, TxWitness{{0x03}, {0x04}}))
+	witnessTx.AddTxOut(&TxOut{
+		Value:    1,
+		PkScript: []byte{0x51},
+	})
+
+	// A block with a certified header and the witness transaction above.
+	block := &MsgBlock{
+		MsgHeader: MsgHeader{
+			BlockHeader: *NewBlockHeader(1, &hash, &hash2, 1),
+			MsgCertificate: MsgCertificate{
+				Certificate: &CertificateV1{
+					Hash:      hash,
+					ProofData: make([]byte, 51200),
+				},
+			},
+		},
+	}
+	require.NoError(t, block.AddTransaction(witnessTx))
+
+	tests := []struct {
+		name string
+		msg  Message
+	}{
+		{"inv", inv},
+		{"getdata", getData},
+		{"notfound", notFound},
+		{"cfilter", cfilter},
+		{"cfcheckpt", cfCheckpt},
+		{"merkleblock", merkleBlock},
+		{"reject with hash", rejectBlock},
+		{"reject without hash", rejectMisc},
+		{"headers", headers},
+		{"tx", witnessTx},
+		{"block", block},
+	}
+
+	for _, test := range tests {
+		for _, enc := range []MessageEncoding{BaseEncoding, WitnessEncoding} {
+			var buf bytes.Buffer
+			require.NoError(t, test.msg.PrlEncode(&buf, ProtocolVersion, enc), "%s (%v)", test.name, enc)
+			assert.Equal(t, buf.Len(), MessageSize(test.msg, ProtocolVersion, enc), "%s (%v)", test.name, enc)
 		}
 	}
 }

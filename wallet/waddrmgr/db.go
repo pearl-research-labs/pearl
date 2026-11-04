@@ -135,9 +135,8 @@ type dbAddressRow struct {
 // address in the database.
 type dbChainAddressRow struct {
 	dbAddressRow
-	branch                 uint32
-	index                  uint32
-	encryptedTapscriptRoot []byte // nil if no tapscript commitment
+	branch uint32
+	index  uint32
 }
 
 // dbImportedAddressRow houses additional information stored about an imported
@@ -1379,10 +1378,12 @@ func serializeAddressRow(row *dbAddressRow) []byte {
 // row as a chained address.
 func deserializeChainedAddress(row *dbAddressRow) (*dbChainAddressRow, error) {
 	// The serialized chain address raw data format is:
-	//   <branch><index>[<encryptedTapscriptRoot>]
+	//   <branch><index>
 	//
-	// Legacy format: 4 bytes branch + 4 bytes address index = 8 bytes
-	// New format: 8 bytes + encrypted tapscript root (variable, typically ~48 bytes)
+	// 4 bytes branch + 4 bytes address index
+	//
+	// Keep accepting longer rows: earlier releases appended an encrypted
+	// tapscript root, and rejecting those rows would break existing wallets.
 	if len(row.rawData) < 8 {
 		str := "malformed serialized chained address"
 		return nil, managerError(ErrDatabase, str, nil)
@@ -1395,29 +1396,19 @@ func deserializeChainedAddress(row *dbAddressRow) (*dbChainAddressRow, error) {
 	retRow.branch = binary.LittleEndian.Uint32(row.rawData[0:4])
 	retRow.index = binary.LittleEndian.Uint32(row.rawData[4:8])
 
-	// Check for tapscript root (new format)
-	if len(row.rawData) > 8 {
-		retRow.encryptedTapscriptRoot = row.rawData[8:]
-	}
-
 	return &retRow, nil
 }
 
 // serializeChainedAddress returns the serialization of the raw data field for
 // a chained address.
-func serializeChainedAddress(branch, index uint32, encryptedTapscriptRoot []byte) []byte {
+func serializeChainedAddress(branch, index uint32) []byte {
 	// The serialized chain address raw data format is:
-	//   <branch><index>[<encryptedTapscriptRoot>]
+	//   <branch><index>
 	//
-	// 4 bytes branch + 4 bytes address index + optional encrypted tapscript root
-	// Legacy format (no tapscript): 8 bytes
-	// New format (with tapscript): 8 + len(encryptedTapscriptRoot) bytes
-	rawData := make([]byte, 8+len(encryptedTapscriptRoot))
+	// 4 bytes branch + 4 bytes address index
+	rawData := make([]byte, 8)
 	binary.LittleEndian.PutUint32(rawData[0:4], branch)
 	binary.LittleEndian.PutUint32(rawData[4:8], index)
-	if len(encryptedTapscriptRoot) > 0 {
-		copy(rawData[8:], encryptedTapscriptRoot)
-	}
 	return rawData
 }
 
@@ -1666,7 +1657,7 @@ func putAddress(ns walletdb.ReadWriteBucket, scope *KeyScope,
 // database.
 func putChainedAddress(ns walletdb.ReadWriteBucket, scope *KeyScope,
 	addressID []byte, account uint32, status syncStatus, branch,
-	index uint32, addrType addressType, encryptedTapscriptRoot []byte) error {
+	index uint32, addrType addressType) error {
 
 	scopedBucket, err := fetchWriteScopeBucket(ns, scope)
 	if err != nil {
@@ -1678,7 +1669,7 @@ func putChainedAddress(ns walletdb.ReadWriteBucket, scope *KeyScope,
 		account:    account,
 		addTime:    uint64(time.Now().Unix()),
 		syncStatus: status,
-		rawData:    serializeChainedAddress(branch, index, encryptedTapscriptRoot),
+		rawData:    serializeChainedAddress(branch, index),
 	}
 	if err := putAddress(ns, scope, addressID, &addrRow); err != nil {
 		return err

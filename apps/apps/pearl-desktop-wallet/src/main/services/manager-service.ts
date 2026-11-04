@@ -7,6 +7,7 @@ import dns from 'dns';
 import { ManagerApi } from '../../types/app-bridge.ts';
 import { WalletService } from './wallet-service/wallet-service.ts';
 import { WalletProcess } from './wallet-process.ts';
+import { ensureDataDir, removeStaleSetupFiles } from './setup-file.ts';
 import { displayToFs, fsToDisplay } from '../../utils/filename-utils.ts';
 import { getCurrentNetworkConfig, getCurrentNetwork, setCurrentNetwork, getAllNetworks, type Network } from '../config/network-config';
 import { getCustomPeer, getPeerSettings as getConfigPeerSettings, setCustomPeer, resetToDefaultPeer } from '../config/peer-settings';
@@ -50,6 +51,16 @@ class ManagerService implements ManagerApi {
   private currentWallet: WalletData | null = null;
   private walletProcess: WalletProcess | null = null;
 
+  constructor() {
+    try {
+      ensureDataDir(path.dirname(baseWalletDir));
+      ensureDataDir(baseWalletDir);
+    } catch (error) {
+      console.log('Failed to prepare wallet data directory:', error);
+    }
+    removeStaleSetupFiles(baseWalletDir);
+  }
+
   private async loadWallet(walletName: string, mode: 'create' | 'open') {
     const walletDataDir = path.join(baseWalletDir, displayToFs(walletName));
     const existingWallets = await this.getExistingWallets();
@@ -63,7 +74,7 @@ class ManagerService implements ManagerApi {
     }
 
     try {
-      fs.mkdirSync(walletDataDir, { recursive: true });
+      ensureDataDir(walletDataDir);
     } catch (error) {
       if (isInvalidSeedWalletCreated) {
         console.log(
@@ -86,7 +97,13 @@ class ManagerService implements ManagerApi {
   }
 
   async stopWalletProcess(options: { force?: boolean } = {}) {
-    if (this.walletProcess && this.walletProcess.getStatus().isRunning) {
+    if (!this.walletProcess) {
+      return;
+    }
+    // Create and import spawn a child that is not the long-running daemon.
+    // Stop it before will-quit wipes wallet-setup.json.
+    await this.walletProcess.stopSetupChild();
+    if (this.walletProcess.getStatus().isRunning) {
       await this.walletProcess.stop(options);
     }
   }

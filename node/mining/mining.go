@@ -531,10 +531,10 @@ mempoolLoop:
 	// commitment overhead in the coinbase transaction.
 	{
 		coinbaseCopy := btcutil.NewTx(coinbaseTx.MsgTx().Copy())
-		coinbaseCopy.MsgTx().TxIn[0].Witness = [][]byte{
+		coinbaseCopy.MsgTx().TxIn[0].SetWitness([][]byte{
 			bytes.Repeat([]byte("a"),
 				blockchain.CoinbaseWitnessDataLen),
-		}
+		})
 		coinbaseCopy.MsgTx().AddTxOut(&wire.TxOut{
 			PkScript: bytes.Repeat([]byte("a"),
 				blockchain.CoinbaseWitnessPkScriptLength),
@@ -704,7 +704,7 @@ func AddWitnessCommitment(coinbaseTx *btcutil.Tx,
 	// The witness of the coinbase transaction MUST be exactly 32-bytes
 	// of all zeroes.
 	var witnessNonce [blockchain.CoinbaseWitnessDataLen]byte
-	coinbaseTx.MsgTx().TxIn[0].Witness = wire.TxWitness{witnessNonce[:]}
+	coinbaseTx.MsgTx().TxIn[0].SetWitness(wire.TxWitness{witnessNonce[:]})
 
 	// Next, obtain the merkle root of a tree which consists of the
 	// wtxid of all transactions in the block. The coinbase

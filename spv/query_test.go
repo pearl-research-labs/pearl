@@ -8,8 +8,10 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcutil/gcs"
 	"github.com/pearl-research-labs/pearl/node/btcutil/gcs/builder"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/spv/cache/lru"
 	"github.com/pearl-research-labs/pearl/spv/filterdb"
+	"github.com/stretchr/testify/require"
 )
 
 // genRandomBlockHash generates a random block hash using math/rand.
@@ -145,6 +147,21 @@ func TestBigFilterEvictsEverything(t *testing.T) {
 	cs.putFilterToCache(b3, filterdb.RegularFilter, f3)
 	assertEqual(t, cs.FilterCache.Len(), 1, "")
 	assertEqual(t, getFilter(cs, b3, t), f3, "")
+}
+
+// TestTransactionInv ensures transaction announcements use the txid-based
+// inventory type. Witness serialization is negotiated later when a peer sends
+// getdata, so it must not change the preceding announcement.
+func TestTransactionInv(t *testing.T) {
+	t.Parallel()
+
+	tx := wire.NewMsgTx(2)
+	txHash := tx.TxHash()
+	inv := newTransactionInv(tx)
+
+	require.Len(t, inv.InvList, 1)
+	require.Equal(t, wire.InvTypeTx, inv.InvList[0].Type)
+	require.Equal(t, txHash, inv.InvList[0].Hash)
 }
 
 // TestBlockCache checks that blocks are inserted and fetched from the cache

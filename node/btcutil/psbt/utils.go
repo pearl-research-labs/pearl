@@ -6,7 +6,6 @@ package psbt
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 
@@ -143,29 +142,62 @@ func getKey(r io.Reader) (int, []byte, error) {
 	return int(keyType), keyData, nil
 }
 
-// readTxOut is a limited version of wire.ReadTxOut, because the latter is not
-// exported.
-func readTxOut(txout []byte) (*wire.TxOut, error) {
-	if len(txout) < 10 {
-		return nil, ErrInvalidPsbtFormat
+func assertFullyConsumed(r *bytes.Reader) error {
+	if r.Len() > 0 {
+		return ErrInvalidPsbtFormat
 	}
 
-	valueSer := binary.LittleEndian.Uint64(txout[:8])
-	scriptPubKey := txout[9:]
-
-	return wire.NewTxOut(int64(valueSer), scriptPubKey), nil
+	return nil
 }
 
-// SumUtxoInputValues tries to extract the sum of all inputs specified in the
-// UTXO fields of the PSBT. An error is returned if an input is specified that
-// does not contain any UTXO information.
+func readTxOut(txout []byte) (*wire.TxOut, error) {
+	txOut := &wire.TxOut{}
+	reader := bytes.NewReader(txout)
+
+	if err := wire.ReadTxOut(reader, 0, 0, txOut); err != nil {
+		return nil, err
+	}
+	if err := assertFullyConsumed(reader); err != nil {
+		return nil, err
+	}
+
+	// ReadTxOut may keep PkScript in a large script slab; compact it so a tiny witness script does not retain the
+	// slab.
+	script := make([]byte, len(txOut.PkScript))
+	copy(script, txOut.PkScript)
+	txOut.PkScript = script
+
+	return txOut, nil
+}
+
+func readTransaction(txBytes []byte, noWitness bool) (*wire.MsgTx, error) {
+	tx := wire.NewMsgTx(2)
+	reader := bytes.NewReader(txBytes)
+
+	var err error
+	if noWitness {
+		err = tx.DeserializeNoWitness(reader)
+	} else {
+		err = tx.Deserialize(reader)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err := assertFullyConsumed(reader); err != nil {
+		return nil, err
+	}
+
+	return tx, nil
+}
+
+// SumUtxoInputValues tries to extract the sum of all inputs specified in the UTXO fields of the PSBT.
+// An error is returned if an input is specified that does not contain any UTXO information.
 func SumUtxoInputValues(packet *Packet) (int64, error) {
-	// We take the TX ins of the unsigned TX as the truth for how many
-	// inputs there should be, as the fields in the extra data part of the
-	// PSBT can be empty.
+	// We take the TX ins of the unsigned TX as the truth for how many inputs there should be, as the
+	// fields in the extra data part of the PSBT can be empty.
 	if len(packet.UnsignedTx.TxIn) != len(packet.Inputs) {
-		return 0, fmt.Errorf("TX input length doesn't match PSBT " +
-			"input length")
+		return 0, fmt.Errorf("TX input length doesn't match PSBT input length")
 	}
 
 	inputSum := int64(0)
@@ -176,27 +208,28 @@ func SumUtxoInputValues(packet *Packet) (int64, error) {
 			inputSum += in.WitnessUtxo.Value
 
 		case in.NonWitnessUtxo != nil:
-			// Non-witness UTXOs reference to the whole transaction
-			// the UTXO resides in.
-			utxOuts := in.NonWitnessUtxo.TxOut
+			// Non-witness UTXOs reference to the whole transaction the UTXO resides in.
 			txIn := packet.UnsignedTx.TxIn[idx]
-
-			// Check that utxOuts actually has enough space to
-			// contain the previous outpoint's index.
-			opIdx := txIn.PreviousOutPoint.Index
-			if opIdx >= uint32(len(utxOuts)) {
-				return 0, fmt.Errorf("input %d has malformed "+
-					"TxOut field", idx)
+			prevOut, err := NonWitnessUtxoOutput(in.NonWitnessUtxo, txIn.PreviousOutPoint.Index)
+			if err != nil {
+				return 0, fmt.Errorf("input %d has malformed TxOut field", idx)
 			}
 
-			inputSum += utxOuts[txIn.PreviousOutPoint.Index].Value
+			inputSum += prevOut.Value
 
 		default:
-			return 0, fmt.Errorf("input %d has no UTXO information",
-				idx)
+			return 0, fmt.Errorf("input %d has no UTXO information", idx)
 		}
 	}
 	return inputSum, nil
+}
+
+// NonWitnessUtxoOutput looks up TxOut[index]. PreviousOutPoint.Index is untrusted PSBT data.
+func NonWitnessUtxoOutput(utxo *wire.MsgTx, index uint32) (*wire.TxOut, error) {
+	if utxo == nil || index >= uint32(len(utxo.TxOut)) {
+		return nil, ErrInvalidNonWitnessUtxoIndex
+	}
+	return utxo.TxOut[index], nil
 }
 
 // TxOutsEqual returns true if two transaction outputs are equal.
@@ -311,8 +344,8 @@ func NewFromSignedTx(tx *wire.MsgTx) (*Packet, [][]byte,
 	for i, tin := range tx2.TxIn {
 		tin.SignatureScript = nil
 		scriptSigs = append(scriptSigs, tx.TxIn[i].SignatureScript)
-		tin.Witness = nil
-		witnesses = append(witnesses, tx.TxIn[i].Witness)
+		tin.SetWitness(nil)
+		witnesses = append(witnesses, tx.TxIn[i].DecodeWitness())
 	}
 
 	// Outputs always contain: (value, scriptPubkey) so don't need
@@ -329,7 +362,14 @@ func NewFromSignedTx(tx *wire.MsgTx) (*Packet, [][]byte,
 func FindLeafScript(pInput *PInput,
 	targetLeafHash []byte) (*TaprootTapLeafScript, error) {
 
-	for _, leaf := range pInput.TaprootLeafScript {
+	if pInput == nil {
+		return nil, fmt.Errorf("nil PSBT input: %w", ErrInvalidPsbtFormat)
+	}
+
+	for idx, leaf := range pInput.TaprootLeafScript {
+		if leaf == nil {
+			return nil, fmt.Errorf("nil taproot leaf script at index %d: %w", idx, ErrInvalidPsbtFormat)
+		}
 		leafHash := txscript.TapLeaf{
 			LeafVersion: leaf.LeafVersion,
 			Script:      leaf.Script,

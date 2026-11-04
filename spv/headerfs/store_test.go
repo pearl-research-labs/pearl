@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -349,6 +350,17 @@ func TestFilterHeaderStoreOperations(t *testing.T) {
 		}
 	}
 
+	lastHash := lastHeader.HeaderHash
+	_, startHeight, err := fhs.FetchHeaderAncestors(numHeaders, &lastHash)
+	if err != nil || startHeight != 0 {
+		t.Fatalf("expected walk back to genesis, got start height %v and error %v", startHeight, err)
+	}
+	// MaxUint32 would wrap startHeight and return no headers.
+	_, _, err = fhs.FetchHeaderAncestors(math.MaxUint32, &lastHash)
+	if err == nil {
+		t.Fatal("expected error walking back past genesis")
+	}
+
 	// Finally, we'll test the roll back scenario. Roll back the chain by a
 	// single block, the returned block stamp should exactly match the last
 	// header inserted, and the current chain tip should be the second to
@@ -515,6 +527,16 @@ func TestBlockHeadersFetchHeaderAncestors(t *testing.T) {
 			t.Fatalf("header mismatch, expected %v got %v",
 				spew.Sdump(blockHeader), spew.Sdump(diskHeader))
 		}
+	}
+
+	_, startHeight, err = bhs.FetchHeaderAncestors(numHeaders, &lastHash)
+	if err != nil || startHeight != 0 {
+		t.Fatalf("expected walk back to genesis, got start height %v and error %v", startHeight, err)
+	}
+	// MaxUint32 would wrap startHeight and return no headers.
+	_, _, err = bhs.FetchHeaderAncestors(math.MaxUint32, &lastHash)
+	if err == nil {
+		t.Fatal("expected error walking back past genesis")
 	}
 }
 

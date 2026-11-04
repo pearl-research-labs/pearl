@@ -15,6 +15,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/require"
 )
 
 // TestBlock tests the API for Block.
@@ -207,6 +208,18 @@ func TestNewBlockFromBytes(t *testing.T) {
 	}
 }
 
+func TestNewBlockFromBytesRejectsTrailing(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, Block100000.Serialize(&buf))
+
+	_, err := btcutil.NewBlockFromBytes(buf.Bytes())
+	require.NoError(t, err)
+
+	trailing := append(append([]byte(nil), buf.Bytes()...), 0x00)
+	_, err = btcutil.NewBlockFromBytes(trailing)
+	require.ErrorContains(t, err, "trailing bytes")
+}
+
 // TestNewBlockFromBlockAndBytes tests creation of a Block from a MsgBlock and
 // raw bytes.
 func TestNewBlockFromBlockAndBytes(t *testing.T) {
@@ -339,20 +352,19 @@ var Block100000 = wire.MsgBlock{
 		{
 			Version: 1,
 			TxIn: []*wire.TxIn{
-				{
-					PreviousOutPoint: wire.OutPoint{
+				wire.NewTxIn(
+					&wire.OutPoint{
 						Hash:  chainhash.Hash{},
 						Index: 0xffffffff,
 					},
-					SignatureScript: []byte{
+					[]byte{
 						0x04, 0x4c, 0x86, 0x04, 0x1b, 0x02, 0x06, 0x02,
 					},
-					Sequence: 0xffffffff,
-					Witness: [][]byte{
+					[][]byte{
 						{0x04, 0x31},
 						{0x01, 0x43},
 					},
-				},
+				),
 			},
 			TxOut: []*wire.TxOut{
 				{

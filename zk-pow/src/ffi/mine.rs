@@ -498,8 +498,7 @@ fn threads_partition(pattern: &PeriodicPattern, total_dimension: usize) -> Vec<V
 
 #[cfg(test)]
 mod tests {
-    use crate::api::proof::MoEConfig;
-    use crate::api::{proof::MMAType, verify::verify_plain_proof};
+    use crate::api::proof::{MMAType, MoEConfig};
 
     use super::*;
     use blake3::CHUNK_LEN;
@@ -642,26 +641,5 @@ mod tests {
 
         assert_eq!(b_mine, b_verify, "b_noise_seed must match between miner and verifier");
         assert_eq!(a_mine, a_verify, "a_noise_seed must match between miner and verifier");
-    }
-
-    #[test]
-    fn test_verify_moe() {
-        let e = 4;
-        let m = 1024;
-        let n = 1024; // per-expert cols in B (total = n * e = 4096)
-        let k = 1024;
-        let rank = 32; // noise rank
-
-        let header = IncompleteBlockHeader::new_for_test(0x207FFFFF);
-        let config = MiningConfiguration {
-            common_dim: k,
-            rank,
-            mma_type: MMAType::Int7xInt7ToInt32,
-            rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
-            cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105]).unwrap(),
-            moe: Some(MoEConfig { e: e as u16, top_k: 1 }),
-        };
-        let proof = mine_moe(m, n, k as usize, header, config, None, false, SeedDerivation::Legacy).unwrap();
-        verify_plain_proof(&header, &proof, None, SeedDerivation::Legacy).unwrap();
     }
 }

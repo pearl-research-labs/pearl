@@ -5,6 +5,8 @@
 package btcutil_test
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
@@ -145,6 +147,54 @@ func TestEncodeDecodeAddressStringer(t *testing.T) {
 	decoded, err := btcutil.DecodeAddress(addr.String(), &chaincfg.MainNetParams)
 	require.NoError(t, err, "should decode address successfully")
 	require.Equal(t, addr, decoded, "decoded address should match original")
+}
+
+// TestDecodeAddressNetwork ensures an address only decodes for the networks that use its prefix, for every pair of
+// networks. Testnet, testnet2 and signet share tprl, and regtest and simnet share rprl.
+func TestDecodeAddressNetwork(t *testing.T) {
+	networks := []struct {
+		params *chaincfg.Params
+		prefix string
+	}{
+		{&chaincfg.MainNetParams, "prl"},
+		{&chaincfg.TestNetParams, "tprl"},
+		{&chaincfg.TestNet2Params, "tprl"},
+		{&chaincfg.SigNetParams, "tprl"},
+		{&chaincfg.RegressionNetParams, "rprl"},
+		{&chaincfg.SimNetParams, "rprl"},
+	}
+
+	witnessProg := bytes.Repeat([]byte{1}, 32)
+
+	for _, from := range networks {
+		p2tr, err := btcutil.NewAddressTaproot(witnessProg, from.params)
+		require.NoError(t, err)
+
+		p2mr, err := btcutil.NewAddressMerkleRoot(witnessProg, from.params)
+		require.NoError(t, err)
+
+		// The upper case form is the same address in a valid bech32m encoding.
+		addrs := []string{p2tr.EncodeAddress(), p2mr.EncodeAddress(), strings.ToUpper(p2tr.EncodeAddress())}
+		require.True(t, strings.HasPrefix(addrs[0], from.prefix+"1"))
+
+		for _, to := range networks {
+			t.Run(from.params.Name+" address on "+to.params.Name, func(t *testing.T) {
+				for _, addr := range addrs {
+					decoded, err := btcutil.DecodeAddress(addr, to.params)
+					if from.prefix != to.prefix {
+						require.ErrorIs(t, err, btcutil.ErrWrongNetwork, addr)
+						require.Nil(t, decoded)
+
+						continue
+					}
+
+					require.NoError(t, err, addr)
+					require.True(t, decoded.IsForNet(to.params))
+					require.Equal(t, strings.ToLower(addr), decoded.EncodeAddress())
+				}
+			})
+		}
+	}
 }
 
 // TestDecodeAddressRejectsLegacy ensures that legacy address types are rejected

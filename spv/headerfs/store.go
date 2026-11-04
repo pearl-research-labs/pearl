@@ -389,6 +389,9 @@ func (h *blockHeaderStore) FetchHeaderAncestors(numHeaders uint32,
 	if err != nil {
 		return nil, 0, err
 	}
+	if numHeaders > endHeight {
+		return nil, 0, fmt.Errorf("cannot fetch %d header ancestors ending at height %d", numHeaders, endHeight)
+	}
 	startHeight := endHeight - numHeaders
 
 	headers, err := h.readHeaderRange(startHeight, endHeight)
@@ -987,6 +990,9 @@ func (f *filterHeaderStore) FetchHeaderAncestors(numHeaders uint32,
 	endHeight, err := f.heightFromHash(stopHash)
 	if err != nil {
 		return nil, 0, err
+	}
+	if numHeaders > endHeight {
+		return nil, 0, fmt.Errorf("cannot fetch %d header ancestors ending at height %d", numHeaders, endHeight)
 	}
 	startHeight := endHeight - numHeaders
 

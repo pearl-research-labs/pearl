@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"html/template"
 	"strconv"
 	"strings"
+	"text/template"
 )
 
 // ScriptTemplateOpt is a function type for configuring the script template.

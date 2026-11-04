@@ -419,11 +419,6 @@ func checkBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 
 	flags |= NetBehaviorFlags(chainParams)
 
-	err := CheckBlockHeaderSanity(header, cert, chainParams.PowLimit, timeSource, chainParams.MaxTimeOffsetMinutes, flags)
-	if err != nil {
-		return err
-	}
-
 	// A block must have at least one transaction.
 	numTx := len(msgBlock.Transactions)
 	if numTx == 0 {
@@ -500,7 +495,8 @@ func checkBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 		existingTxHashes[*hash] = struct{}{}
 	}
 
-	return nil
+	// certificate verification is compute intensive, so we ensure it is performed last.
+	return CheckBlockHeaderSanity(header, cert, chainParams.PowLimit, timeSource, chainParams.MaxTimeOffsetMinutes, flags)
 }
 
 // CheckBlockSanity performs some preliminary checks on a block to ensure it is
@@ -814,7 +810,7 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 // https://github.com/bitcoin/bips/blob/master/bip-0030.mediawiki and
 // http://r6.ca/blog/20120206T005236Z.html.
 //
-// This function MUST be called with the chain state lock held (for reads).
+// This function MUST be called with the chain state lock held (for writes).
 func (b *BlockChain) checkBIP0030(node *blockNode, block *btcutil.Block, view *UtxoViewpoint) error {
 	// Fetch utxos for all of the transaction outputs in this block.
 	// Typically, there will not be any utxos for any of the outputs.
@@ -843,6 +839,32 @@ func (b *BlockChain) checkBIP0030(node *blockNode, block *btcutil.Block, view *U
 		}
 	}
 
+	return nil
+}
+
+// checkBlockTransactionOrder ensures that inputs referencing transactions in
+// this block only spend outputs of earlier transactions.  Check this before
+// connecting even previously validated blocks, since older versions could
+// incorrectly mark blocks with forward references as valid.
+func checkBlockTransactionOrder(block *btcutil.Block) error {
+	transactions := block.Transactions()
+	positions := make(map[chainhash.Hash]int, len(transactions))
+	for i, tx := range transactions {
+		positions[*tx.Hash()] = i
+	}
+	for i, tx := range transactions {
+		if IsCoinBase(tx) {
+			continue
+		}
+		for _, txIn := range tx.MsgTx().TxIn {
+			outpoint := txIn.PreviousOutPoint
+			if parent, ok := positions[outpoint.Hash]; ok && parent >= i {
+				str := fmt.Sprintf("output %v referenced from transaction %s "+
+					"is not from an earlier transaction in the block", outpoint, tx.Hash())
+				return ruleError(ErrMissingTxOut, str)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1061,18 +1083,6 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		return ruleError(ErrBadCoinbaseValue, str)
 	}
 
-	// Don't run scripts if this node is before the latest known good
-	// checkpoint since the validity is verified via the checkpoints (all
-	// transactions are included in the merkle root hash and any changes
-	// will therefore be detected by the next checkpoint).  This is a huge
-	// optimization because running the scripts is the most time consuming
-	// portion of block handling.
-	checkpoint := b.LatestCheckpoint()
-	runScripts := true
-	if checkpoint != nil && node.height <= checkpoint.Height {
-		runScripts = false
-	}
-
 	// All script validation behaviors are unconditional in Pearl.
 	var scriptFlags txscript.ScriptFlags
 
@@ -1104,12 +1114,12 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// transactions are actually allowed to spend the coins by running the
 	// expensive ECDSA signature check scripts.  Doing this last helps
 	// prevent CPU exhaustion attacks.
-	if runScripts {
-		err := checkBlockScripts(block, view, scriptFlags, b.sigCache,
-			b.hashCache)
-		if err != nil {
-			return err
-		}
+	//
+	// Scripts run below the latest checkpoint too: blocks matched against the checkpointed header list are fast-added
+	// and skip this check when they extend the tip, so a block reaching it there need not be on the checkpointed chain.
+	err = checkBlockScripts(block, view, scriptFlags, b.sigCache, b.hashCache)
+	if err != nil {
+		return err
 	}
 
 	// Update the best hash for view to include this block since all of its

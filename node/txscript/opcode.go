@@ -2050,15 +2050,15 @@ func opcodeCheckXmssSig(op *opcode, data []byte, vm *Engine) error {
 
 	// Validate public key length.
 	if len(pkBytes) != xmss.PKLen {
-		vm.dstack.PushBool(false)
-		return nil
+		str := "invalid XMSS signature"
+		return scriptError(ErrNullFail, str)
 	}
 
 	// Validate each signature chunk is exactly sigChunkSize bytes.
 	for _, chunk := range sigChunks {
 		if len(chunk) != sigChunkSize {
-			vm.dstack.PushBool(false)
-			return nil
+			str := "invalid XMSS signature"
+			return scriptError(ErrNullFail, str)
 		}
 	}
 

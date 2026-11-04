@@ -106,6 +106,23 @@ func TestMapRPCErr(t *testing.T) {
 	}
 }
 
+// TestMapRPCErrTooLongMempoolChain checks that every package limit rejection pearld returns, from either
+// `testmempoolaccept` or `sendrawtransaction`, maps to ErrTooLongMempoolChain.
+func TestMapRPCErrTooLongMempoolChain(t *testing.T) {
+	t.Parallel()
+
+	for _, reason := range []string{
+		"too-long-mempool-chain: too many unconfirmed parents, 25 [limit: 25]",
+		"too-long-mempool-chain: too many unconfirmed ancestors, 25 [limit: 25]",
+		"too-long-mempool-chain: exceeds ancestor size limit, 101102 vbytes [limit: 101000]",
+		"too-long-mempool-chain: too many descendants for tx " +
+			"3b2cfd73f7ad590f2a1816da79f22d2117f92106ae5382d761250d456e0f1d44 [limit: 25]",
+	} {
+		require.ErrorIs(t, MapRPCErr(errors.New(reason)), ErrTooLongMempoolChain, reason)
+		require.ErrorIs(t, MapRPCErr(errors.New("TX rejected: "+reason)), ErrTooLongMempoolChain, reason)
+	}
+}
+
 // TestCompatErrorSentinel checks that all defined CompatRPCErr errors are
 // added to the method `Error`.
 func TestCompatErrorSentinel(t *testing.T) {

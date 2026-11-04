@@ -163,6 +163,10 @@ func (m *mockChainService) BestPeerHeight() int32 {
 	return 0
 }
 
+func (m *mockChainService) ConnectedCount() int32 {
+	return 0
+}
+
 func (m *mockChainService) BlockHeaderTipHeight() (int32, error) {
 	return 0, errNotImplemented
 }

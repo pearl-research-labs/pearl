@@ -126,7 +126,6 @@ pnpm build
 This monorepo also includes shared packages:
 
 - **`@pearl/ui`**: Shared UI components and design system
-- **`@pearl/address-validation`**: Address validation utilities for Pearl blockchain
 - **`@pearl/eslint-config`**: Shared ESLint configuration
 
 ## 🧹 Code Quality
@@ -173,7 +172,6 @@ apps/
 │   └── pearl-desktop-wallet/ # Desktop wallet application
 ├── packages/
 │   ├── ui/                    # Shared UI components
-│   ├── address-validation/    # Address validation utilities
 │   └── eslint-config/         # Shared ESLint config
 ├── package.json               # Root package.json with scripts
 ├── pnpm-workspace.yaml        # pnpm workspace configuration

@@ -110,14 +110,16 @@ func (u *Updater) Sign(inIndex int, sig []byte, pubKey []byte,
 			return SignInvalid, err
 		}
 
-	// Case 3: Neither provided only works for native p2wkh, or non-segwit
-	// non-p2sh. To check if it's segwit, check the scriptPubKey of the
-	// output.
+	// Case 3: Neither provided only works for native p2wkh, or non-segwit non-p2sh.
+	// To check if it's segwit, check the scriptPubKey of the output.
 	default:
 		if pInput.WitnessUtxo == nil {
 			txIn := u.Upsbt.UnsignedTx.TxIn[inIndex]
-			outIndex := txIn.PreviousOutPoint.Index
-			script := pInput.NonWitnessUtxo.TxOut[outIndex].PkScript
+			prevOut, err := NonWitnessUtxoOutput(pInput.NonWitnessUtxo, txIn.PreviousOutPoint.Index)
+			if err != nil {
+				return SignInvalid, err
+			}
+			script := prevOut.PkScript
 
 			if txscript.IsWitnessProgram(script) {
 				err := nonWitnessToWitness(u.Upsbt, inIndex)
@@ -136,13 +138,15 @@ func (u *Updater) Sign(inIndex int, sig []byte, pubKey []byte,
 	return SignSuccesful, nil
 }
 
-// nonWitnessToWitness extracts the TxOut from the existing NonWitnessUtxo
-// field in the given PSBT input and sets it as type witness by replacing the
-// NonWitnessUtxo field with a WitnessUtxo field. See
-// https://github.com/bitcoin/bitcoin/pull/14197.
+// nonWitnessToWitness extracts the TxOut from the existing NonWitnessUtxo field in the given PSBT
+// input and sets it as type witness by replacing the NonWitnessUtxo field with a WitnessUtxo field.
+// See https://github.com/bitcoin/bitcoin/pull/14197.
 func nonWitnessToWitness(p *Packet, inIndex int) error {
 	outIndex := p.UnsignedTx.TxIn[inIndex].PreviousOutPoint.Index
-	txout := p.Inputs[inIndex].NonWitnessUtxo.TxOut[outIndex]
+	txout, err := NonWitnessUtxoOutput(p.Inputs[inIndex].NonWitnessUtxo, outIndex)
+	if err != nil {
+		return err
+	}
 
 	// TODO(guggero): For segwit v1, we'll want to remove the NonWitnessUtxo
 	// from the packet. For segwit v0 it is unsafe to only rely on the

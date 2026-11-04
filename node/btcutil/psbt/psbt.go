@@ -76,6 +76,9 @@ var (
 	ErrInvalidPrevOutNonWitnessTransaction = errors.New("Prevout hash " +
 		"does not match the provided non-witness utxo serialization")
 
+	// ErrInvalidNonWitnessUtxoIndex is returned when PreviousOutPoint.Index is outside NonWitnessUtxo.TxOut.
+	ErrInvalidNonWitnessUtxoIndex = errors.New("input specifies output index that does not exist")
+
 	// ErrInvalidSignatureForInput indicates that the signature the user is
 	// trying to append to the PSBT is invalid, either because it does
 	// not correspond to the previous transaction hash, or redeem script,
@@ -151,7 +154,7 @@ type Packet struct {
 // is implicitly checked in the call to MsgTx.Deserialize().
 func validateUnsignedTX(tx *wire.MsgTx) bool {
 	for _, tin := range tx.TxIn {
-		if len(tin.SignatureScript) != 0 || len(tin.Witness) != 0 {
+		if len(tin.SignatureScript) != 0 || tin.HasWitness() {
 			return false
 		}
 	}
@@ -188,12 +191,8 @@ func NewFromUnsignedTx(tx *wire.MsgTx) (*Packet, error) {
 // NOTE: To create a Packet from one's own data, rather than reading in a
 // serialization from a counterparty, one should use a psbt.New.
 func NewFromRawBytes(r io.Reader, b64 bool) (*Packet, error) {
-	// If the PSBT is encoded in bas64, then we'll create a new wrapper
-	// reader that'll allow us to incrementally decode the contents of the
-	// io.Reader.
 	if b64 {
-		based64EncodedReader := r
-		r = base64.NewDecoder(base64.StdEncoding, based64EncodedReader)
+		r = newStrictBase64Decoder(r)
 	}
 
 	// The Packet struct does not store the fixed magic bytes, but they
@@ -225,11 +224,9 @@ func NewFromRawBytes(r io.Reader, b64 bool) (*Packet, error) {
 	if err != nil {
 		return nil, err
 	}
-	msgTx := wire.NewMsgTx(2)
-
 	// BIP-0174 states: "The transaction must be in the old serialization
 	// format (without witnesses)."
-	err = msgTx.DeserializeNoWitness(bytes.NewReader(value))
+	msgTx, err := readTransaction(value, true)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +323,71 @@ func NewFromRawBytes(r io.Reader, b64 bool) (*Packet, error) {
 		return nil, err
 	}
 
+	if b64 {
+		if err := assertBase64FullyConsumed(r); err != nil {
+			return nil, err
+		}
+	} else if lr, ok := r.(interface{ Len() int }); ok && lr.Len() > 0 {
+		return nil, ErrInvalidPsbtFormat
+	}
+
 	return &newPsbt, nil
+}
+
+type canonicalBase64Reader struct {
+	io.Reader
+}
+
+func (r *canonicalBase64Reader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if bytes.ContainsAny(p[:n], "\r\n") {
+		return 0, ErrInvalidPsbtFormat
+	}
+
+	return n, err
+}
+
+type strictBase64Decoder struct {
+	io.Reader
+}
+
+func (d *strictBase64Decoder) Read(p []byte) (int, error) {
+	n, err := d.Reader.Read(p)
+	if err == nil || errors.Is(err, io.EOF) {
+		return n, err
+	}
+
+	var corruptInput base64.CorruptInputError
+	if errors.As(err, &corruptInput) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, ErrInvalidPsbtFormat) {
+
+		return n, ErrInvalidPsbtFormat
+	}
+
+	return n, err
+}
+
+func newStrictBase64Decoder(r io.Reader) io.Reader {
+	canonicalReader := &canonicalBase64Reader{Reader: r}
+	decoder := base64.NewDecoder(base64.StdEncoding.Strict(), canonicalReader)
+
+	return &strictBase64Decoder{Reader: decoder}
+}
+
+func assertBase64FullyConsumed(r io.Reader) error {
+	var trailing [1]byte
+	_, err := io.ReadFull(r, trailing[:])
+	switch {
+	case err == nil:
+		return ErrInvalidPsbtFormat
+
+	case errors.Is(err, io.EOF):
+		return nil
+
+	default:
+		return err
+	}
 }
 
 // Serialize creates a binary serialization of the referenced Packet struct
@@ -434,16 +495,23 @@ func (p *Packet) IsComplete() bool {
 	return true
 }
 
-// SanityCheck checks conditions on a PSBT to ensure that it obeys the
-// rules of BIP174, and returns true if so, false if not.
+// SanityCheck checks conditions on a PSBT to ensure that it obeys the rules of BIP174, and returns
+// true if so, false if not.
 func (p *Packet) SanityCheck() error {
 	if !validateUnsignedTX(p.UnsignedTx) {
 		return ErrInvalidRawTxSigned
 	}
 
-	for _, tin := range p.Inputs {
+	for i, tin := range p.Inputs {
 		if !tin.IsSane() {
 			return ErrInvalidPsbtFormat
+		}
+		if tin.NonWitnessUtxo == nil || i >= len(p.UnsignedTx.TxIn) {
+			continue
+		}
+		opIdx := p.UnsignedTx.TxIn[i].PreviousOutPoint.Index
+		if _, err := NonWitnessUtxoOutput(tin.NonWitnessUtxo, opIdx); err != nil {
+			return err
 		}
 	}
 
