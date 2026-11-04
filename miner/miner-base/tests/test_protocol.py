@@ -17,10 +17,10 @@ from miner_base.devices import device_for_capability, local_device
 from miner_base.mining_config import COMMITMENT_CHUNK_SIZE, activation_leaf, default_mining_config
 from miner_base.prequant import DEFAULT_BLOCK_SIZE, PrequantMatrix
 
-# cert-v4 ``pB`` wire: n(4) | k(4) | r(2) | quant(1) | device(1) | hash_idB(1) | Pcol | e(2)
-_P_B_DEVICE_OFFSET = 11
+# cert-v4 ``pB`` wire: k(4) | r(2) | quant(1) | device(1) | n(4) | hash_idB(1) | w(4) | e(2)
+_P_B_DEVICE_OFFSET = 7
 _P_B_HASH_ID_OFFSET = 12
-# ``pA`` wire: m(4) | hash_idA(1) | Prow
+# ``pA`` wire: m(4) | hash_idA(1) | h(4)
 _P_A_HASH_ID_OFFSET = 4
 
 
@@ -40,9 +40,9 @@ def test_configuration_binds_device_rank_and_leaves_into_p_b_and_p_a():
         Device.BLACKWELL,
     )
     p_b = config.p_b(256)
-    assert int.from_bytes(p_b[:4], "little") == 256
-    assert int.from_bytes(p_b[4:8], "little") == 2048
-    assert int.from_bytes(p_b[8:10], "little") == 32
+    assert int.from_bytes(p_b[:4], "little") == 2048
+    assert int.from_bytes(p_b[4:6], "little") == 32
+    assert int.from_bytes(p_b[8:12], "little") == 256
     assert p_b[_P_B_DEVICE_OFFSET] == Device.BLACKWELL.value
     assert p_b[_P_B_HASH_ID_OFFSET] == HashId.BLAKE3_CHUNK_1024.value
     p_a = config.p_a(64)

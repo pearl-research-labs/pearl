@@ -13,27 +13,31 @@
 //! fixed-width `public_data` blob:
 //!
 //! ```text
-//! public_data := σ_d(108) ‖ pB ‖ HB_values ‖ HB_scales ‖ pA ‖ HA_values ‖ HA_scales ‖ tA ‖ tB ‖ J ‖ [ MoE tail ]
+//! public_data := σ_d(108) ‖ pB ‖ HB ‖ pA ‖ HA ‖ tA ‖ tB ‖ J ‖ [ MoE tail ]
 //! MoE tail    := w ‖ O_{w-1} ‖ O_w ‖ O_{e-1} ‖ HR ‖ HO ‖ I_A
 //! ```
+//!
+//! where HA = BLAKE3(HA_values || HA_scales; key = key_A) and
+//! HB = BLAKE3(HB_values || HB_scales; key = key_B).
+
 //!
 //! `σ_d` (the complete 108-byte [`BlockHeader`] of the proof-carried
 //! ancestor, proof commitment included) leads the blob; the depth itself is not
 //! transmitted. `tA`/`tB` (4 bytes each) and `J` (32 bytes) are consumed
 //! verbatim.
-//! `pB`/`pA` are the per-operand tuples below, each followed by its two plane
-//! commitment roots (32 bytes each: int8 values then BF16 scales). `pB`
+//! `pB`/`pA` are the per-operand tuples below, each followed by its 32-byte
+//! aggregate operand commitment (`HB`/`HA`, binding values and scales). `pB`
 //! precedes `pA` so its trailing `e` field (the MoE discriminator) is available
 //! before `pA`'s MoE-conditional suffix is read. The MoE tail is present iff
 //! `pB` encodes `e != 0`: `w` (2 bytes) and `O_{w-1}`/`O_w`/`O_{e-1}` (4 bytes
 //! each) are scalars, `HR`/`HO` are 32-byte roots, and `I_A` is the A-side index
 //! set (`outer_indices`, u32 LE each, no length prefix — its cardinality is
-//! `rows_pattern.tile_size()`, which the params already carry). The raw
+//! `h`, which the params already carry). The raw
 //! routing/offset lists (`O`, `R[w]`, `πR`) are witness data and never carried
 //! here.
 //!
-//! Dense `pA` is 11 bytes; MoE `pA` appends `hash_idR` and `hash_idO` (13
-//! bytes). `pB` is always 21 bytes (it carries the common `k`/`r`/`Quant`/
+//! Dense `pA` is 9 bytes; MoE `pA` appends `hash_idR` and `hash_idO` (11
+//! bytes). `pB` is always 19 bytes (it carries the common `k`/`r`/`Quant`/
 //! `Device` once); dense jobs encode `e = 0`.
 
 #![allow(dead_code)]
@@ -41,7 +45,7 @@
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::v4::api::layout::{AxisPattern, MAX_TILE_ROWS, check_lottery_layout, lane_assignment};
+use crate::v4::api::layout::{MAX_TILE_ROWS, check_lottery_layout, lane_assignment};
 use crate::v4::api::prequant::BLOCK_SIZE;
 use crate::v4::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader, Sides};
 use crate::v4::circuit::blake3_stark::stark::ROWS_PER_COMPRESSION;
@@ -235,7 +239,7 @@ impl CommonParams {
 
 /// Parameters of one matmul operand. The statement carries two of these:
 /// `a` is A (`m` rows), `b` is B (`n` rows), for the product `A * Bᵀ`.
-/// Both are stored as collections of row vectors, so `pattern` selects rows
+/// Both are stored as collections of row vectors, so `tile_size` selects consecutive rows
 /// of that operand (columns of C when this is the B side).
 ///
 /// For MoE, `b.num_rows` is the **stacked** B height (`η · e`); `try_new`
@@ -245,10 +249,33 @@ impl CommonParams {
 pub struct OperandParams {
     pub num_rows: u32,
     pub hash_id: HashId,
-    pub pattern: AxisPattern,
+    /// Number of consecutive rows in each tile of this operand (`h` for A, `w` for B).
+    pub tile_size: u32,
 }
 
 impl OperandParams {
+    /// `(num_rows, hash_id, tile_size)` as consumed by the `pA` / `pB` tuples.
+    fn encode(&self) -> [u8; 9] {
+        let mut out = [0u8; 9];
+        out[..4].copy_from_slice(&self.num_rows.to_le_bytes());
+        out[4] = self.hash_id as u8;
+        out[5..].copy_from_slice(&self.tile_size.to_le_bytes());
+        out
+    }
+
+    /// Inverse of [`Self::encode`]: parses `(num_rows, hash_id, tile_size)`
+    /// from the start of `s`, advancing it past the 9 consumed bytes.
+    fn decode(s: &mut &[u8]) -> Result<Self> {
+        let num_rows = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
+        let hash_id = HashId::try_from(take(s, 1)?[0])?;
+        let tile_size = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
+        Ok(Self {
+            num_rows,
+            hash_id,
+            tile_size,
+        })
+    }
+
     fn check(&self) -> Result<()> {
         ensure!(self.num_rows >= 1, "num_rows must be >= 1 || num_rows={}", self.num_rows);
         ensure!(
@@ -300,8 +327,8 @@ pub struct JobParams {
     pub ancestor_header: BlockHeader,
     /// The common tuple (`k`, `r`, `Quant`, `Device`) — rides `pB` on the wire.
     pub common: CommonParams,
-    /// The per-operand parameter tuples: `a` = A (`m`, `hash_idA`, `Prow`),
-    /// `b` = B (`n`, `hash_idB`, `Pcol`); `pB` = `common ‖ b ‖ e`.
+    /// The per-operand parameter tuples: `a` = A (`m`, `hash_idA`, `h`),
+    /// `b` = B (`n`, `hash_idB`, `w`); `pB` = `common ‖ b ‖ e`.
     ///
     /// Declared `a`-first, but serialized `b`-first on the wire (the commitment
     /// order — `pB` carries `e`, which discriminates `pA`'s MoE suffix).
@@ -311,10 +338,10 @@ pub struct JobParams {
 }
 
 impl JobParams {
-    /// Wire length of `pB = (n, k, r, Quant, Device, hash_idB, Pcol, e)`.
-    const P_B_LEN: usize = 4 + 4 + 2 + 1 + 1 + 1 + AxisPattern::NUM_DIMS + 2;
-    /// Wire length of dense `pA = (m, hash_idA, Prow)` (MoE appends two hash-ids).
-    const P_A_LEN: usize = 4 + 1 + AxisPattern::NUM_DIMS;
+    /// Wire length of `pB = (k, r, Quant, Device, n, hash_idB, w, e)`.
+    const P_B_LEN: usize = 4 + 2 + 1 + 1 + 4 + 1 + 4 + 2;
+    /// Wire length of dense `pA = (m, hash_idA, h)` (MoE appends two hash-ids).
+    const P_A_LEN: usize = 4 + 1 + 4;
 
     /// The single wire encoding of the job tuple: `ancestor_header(108) || pB || pA`.
     /// [`MoeParams`] rides inside the parts: `pB` ends with `e` (`0` when dense) and an
@@ -392,27 +419,24 @@ impl JobParams {
         Ok(())
     }
 
-    /// The B-side tuple `pB = (n, k, r, Quant, Device, hash_idB, Pcol, e)` —
-    /// the common tuple rides `pB`. MoE `n` is stacked (`η · e`).
+    /// The B-side tuple `pB = (k, r, Quant, Device, n, hash_idB, w, e)` —
+    /// the common tuple rides `pB`, then the B operand `(n, hash_idB, w)`.
+    /// MoE `n` is stacked (`η · e`).
     pub(crate) fn encode_p_b(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::P_B_LEN);
-        out.extend_from_slice(&self.operands.b.num_rows.to_le_bytes());
         out.extend_from_slice(&self.common.k.to_le_bytes());
         out.extend_from_slice(&self.common.r.to_le_bytes());
         out.push(self.common.quant as u8);
         out.push(self.common.device as u8);
-        out.push(self.operands.b.hash_id as u8);
-        out.extend_from_slice(&self.operands.b.pattern.to_bytes());
+        out.extend_from_slice(&self.operands.b.encode());
         out.extend_from_slice(&self.experts().to_le_bytes());
         out
     }
 
-    /// The A-side tuple `pA = (m, hash_idA, Prow[, hash_idR, hash_idO])`.
+    /// The A-side tuple `pA = (m, hash_idA, h[, hash_idR, hash_idO])`.
     pub(crate) fn encode_p_a(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::P_A_LEN);
-        out.extend_from_slice(&self.operands.a.num_rows.to_le_bytes());
-        out.push(self.operands.a.hash_id as u8);
-        out.extend_from_slice(&self.operands.a.pattern.to_bytes());
+        out.extend_from_slice(&self.operands.a.encode());
         if let Some(moe) = self.moe {
             out.push(moe.hash_id_r as u8);
             out.push(moe.hash_id_o as u8);
@@ -442,7 +466,7 @@ pub(crate) struct MoEStatement {
     pub hash_routing: Hash256,
     /// Offset root `HO`.
     pub hash_offsets: Hash256,
-    /// The A-side index set `I_A` (`outer_indices`); length = `rows_pattern.tile_size()`.
+    /// The A-side index set `I_A` (`outer_indices`); length = `h`.
     pub i_a: Vec<u32>,
 }
 
@@ -454,7 +478,7 @@ impl MoEStatement {
             self.w,
             moe.experts
         );
-        let h = a.pattern.tile_size() as usize;
+        let h = a.tile_size as usize;
         ensure!(
             self.i_a.len() == h,
             "I_A length must equal h || |I_A|={} h={}",
@@ -509,13 +533,13 @@ impl MoEStatement {
             self.o_last
         );
         let a_hi = t_a
-            .checked_add(a.pattern.tile_max())
+            .checked_add(a.tile_size - 1)
             .ok_or_else(|| anyhow::anyhow!("tA + tile max overflows u32"))?;
         ensure!(
             a_hi < sw,
             "tA={} + tile max={} must be < |R[w]|={} (U_A subset of [0, s_w))",
             t_a,
-            a.pattern.tile_max(),
+            a.tile_size - 1,
             sw
         );
         Ok(())
@@ -557,27 +581,29 @@ pub(crate) struct JackpotStatement {
 impl JackpotStatement {
     fn check(&self, a: &OperandParams, b: &OperandParams, b_row_bound: u32) -> Result<()> {
         ensure!(
-            a.pattern.offset_is_valid(self.tile_bases.a),
-            "tA={} must be a valid tile base for the A-side pattern",
-            self.tile_bases.a
-        );
-        ensure!(
-            b.pattern.offset_is_valid(self.tile_bases.b),
-            "tB={} must be a valid tile base for the B-side pattern",
-            self.tile_bases.b
-        );
-        ensure!(
-            self.tile_bases.a + a.pattern.tile_max() < a.num_rows,
-            "tA={} + tile max={} must be < m={}",
+            self.tile_bases.a.is_multiple_of(a.tile_size),
+            "tA={} must be a multiple of the A-side tile size {}",
             self.tile_bases.a,
-            a.pattern.tile_max(),
+            a.tile_size
+        );
+        ensure!(
+            self.tile_bases.b.is_multiple_of(b.tile_size),
+            "tB={} must be a multiple of the B-side tile size {}",
+            self.tile_bases.b,
+            b.tile_size
+        );
+        ensure!(
+            u64::from(self.tile_bases.a) + u64::from(a.tile_size) <= u64::from(a.num_rows),
+            "tA={} + tile size={} must be <= m={}",
+            self.tile_bases.a,
+            a.tile_size,
             a.num_rows
         );
         ensure!(
-            self.tile_bases.b + b.pattern.tile_max() < b_row_bound,
-            "tB={} + tile max={} must be < {} (per-expert B rows)",
+            u64::from(self.tile_bases.b) + u64::from(b.tile_size) <= u64::from(b_row_bound),
+            "tB={} + tile size={} must be <= {} (per-expert B rows)",
             self.tile_bases.b,
-            b.pattern.tile_max(),
+            b.tile_size,
             b_row_bound
         );
         Ok(())
@@ -615,8 +641,8 @@ impl PublicParams {
     pub(crate) const MAX_VERIFIER_WORK: u64 = 2 * 121_922_274;
 
     /// Byte length of a dense (non-MoE) statement:
-    /// σ_d (108) + pB (21) + HB (32) + pA (11) + HA (32) + tile bases (8) + J (32).
-    pub const WIRE_SIZE: usize = 244;
+    /// σ_d (108) + pB (19) + HB (32) + pA (9) + HA (32) + tile bases (8) + J (32).
+    pub const WIRE_SIZE: usize = 240;
 
     /// Largest statement byte length: the dense core plus the largest supported MoE tail.
     pub const MAX_WIRE_SIZE: usize = Self::WIRE_SIZE + 2 + 2 + 3 * 4 + 2 * 32 + 4 * MAX_TILE_ROWS;
@@ -633,10 +659,10 @@ impl PublicParams {
         moe_statement: Option<MoEStatement>,
     ) -> Result<Self> {
         job.check()?;
-        check_lottery_layout(&job.operands.a.pattern, &job.operands.b.pattern)?;
+        check_lottery_layout(job.operands.a.tile_size as usize, job.operands.b.tile_size as usize)?;
         check_opened_strips_bound(
-            job.operands.a.pattern.tile_size() as usize,
-            job.operands.b.pattern.tile_size() as usize,
+            job.operands.a.tile_size as usize,
+            job.operands.b.tile_size as usize,
             job.common.k as usize,
         )?;
         ensure!(
@@ -769,14 +795,13 @@ impl PublicParams {
             let hash_routing: Hash256 = take(&mut s, 32)?.try_into().unwrap();
             let hash_offsets: Hash256 = take(&mut s, 32)?.try_into().unwrap();
             // `I_A` carries no length prefix: its cardinality is the A-side
-            // pattern's tile size, which is proof-controlled (a canonical
-            // pattern admits tile sizes up to 2^24). Enforce the lottery
+            // committed tile size, which is proof-controlled. Enforce the lottery
             // envelope (bounding h to MAX_TILE_ROWS; `try_new` re-checks it
             // for every construction path) and the remaining byte budget
             // *before* reserving, so a small malformed blob cannot request a
             // large allocation.
-            check_lottery_layout(&a.pattern, &b.pattern)?;
-            let i_a_len = a.pattern.tile_size() as usize;
+            check_lottery_layout(a.tile_size as usize, b.tile_size as usize)?;
+            let i_a_len = a.tile_size as usize;
             let i_a_bytes = i_a_len
                 .checked_mul(std::mem::size_of::<u32>())
                 .ok_or_else(|| anyhow::anyhow!("|I_A| * 4 overflows usize || |I_A|={i_a_len}"))?;
@@ -938,7 +963,7 @@ impl PublicParams {
         2 * (self.value_row_bytes() / BLOCK_SIZE)
     }
     pub(crate) fn lane_assignment(&self) -> Vec<Vec<usize>> {
-        lane_assignment(&self.job.operands.a.pattern, &self.job.operands.b.pattern)
+        lane_assignment(self.h() as usize, self.w() as usize)
     }
 
     /// Common matmul dimension `k`.
@@ -951,14 +976,14 @@ impl PublicParams {
         self.job.common.r as u32
     }
 
-    /// Rows of the lottery tile: `rows_pattern.tile_size()`.
+    /// Rows of the lottery tile: `h`.
     pub(crate) fn h(&self) -> u32 {
-        self.job.operands.a.pattern.tile_size()
+        self.job.operands.a.tile_size
     }
 
-    /// Cols of the lottery tile: `cols_pattern.tile_size()`.
+    /// Cols of the lottery tile: `w`.
     pub(crate) fn w(&self) -> u32 {
-        self.job.operands.b.pattern.tile_size()
+        self.job.operands.b.tile_size
     }
 
     /// `m`: number of rows of `A`.
@@ -983,17 +1008,10 @@ impl PublicParams {
         }
     }
 
-    /// The lottery tile's A-row indices (dense): `rows_pattern` tile offsets based at `tA`.
+    /// The lottery tile's A-row indices (dense): `h` consecutive rows based at `tA`.
     pub(crate) fn a_inner_indices(&self) -> Vec<u32> {
         let base = self.jackpot_statement.tile_bases.a;
-        self.job
-            .operands
-            .a
-            .pattern
-            .tile_offsets()
-            .into_iter()
-            .map(|i| i + base)
-            .collect()
+        (base..base + self.h()).collect()
     }
 
     /// The A-row indices the committed values tree opens: MoE uses the winner's outer
@@ -1005,7 +1023,7 @@ impl PublicParams {
         }
     }
 
-    /// The lottery tile's B-row indices: `cols_pattern` tile offsets based at `tB`,
+    /// The lottery tile's B-row indices: `w` consecutive rows based at `tB`,
     /// offset by the winner's expert column block (`w · η`) in MoE.
     pub(crate) fn b_rows_indices(&self) -> Vec<u32> {
         let base = self.jackpot_statement.tile_bases.b;
@@ -1013,14 +1031,7 @@ impl PublicParams {
             .moe_statement
             .as_ref()
             .map_or(0, |stmt| self.expert_rows() * u32::from(stmt.w));
-        self.job
-            .operands
-            .b
-            .pattern
-            .tile_offsets()
-            .into_iter()
-            .map(|i| expert_col + base + i)
-            .collect()
+        (0..self.w()).map(|i| expert_col + base + i).collect()
     }
 
     /// Number of real (unpadded) entries in the flattened routing: the total cumulative
@@ -1215,49 +1226,30 @@ fn take<'a>(s: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
     Ok(head)
 }
 
-/// Parse `pB = (n, k, r, Quant, Device, hash_idB, Pcol, e)` — the shared
+/// Parse `pB = (k, r, Quant, Device, n, hash_idB, w, e)` — the shared
 /// B-side wire part ([`JobParams::encode_p_b`]). `pB` rides first so its `e`
 /// discriminates `pA`'s MoE suffix.
 fn parse_p_b(s: &mut &[u8]) -> Result<(CommonParams, OperandParams, u16)> {
-    let num_rows = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
     let k = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
     let r = u16::from_le_bytes(take(s, 2)?.try_into().unwrap());
     let quant = Quant::try_from(take(s, 1)?[0])?;
     let device = Device::try_from(take(s, 1)?[0])?;
-    let hash_id = HashId::try_from(take(s, 1)?[0])?;
-    let pattern = AxisPattern::from_bytes(take(s, AxisPattern::NUM_DIMS)?)?;
+    let b = OperandParams::decode(s)?;
     let experts = u16::from_le_bytes(take(s, 2)?.try_into().unwrap());
-    Ok((
-        CommonParams { k, r, quant, device },
-        OperandParams {
-            num_rows,
-            hash_id,
-            pattern,
-        },
-        experts,
-    ))
+    Ok((CommonParams { k, r, quant, device }, b, experts))
 }
 
-/// Parse `pA = (m, hash_idA, Prow[, hash_idR, hash_idO])` — the shared A-side
+/// Parse `pA = (m, hash_idA, h[, hash_idR, hash_idO])` — the shared A-side
 /// wire part ([`JobParams::encode_p_a`]). MoE `pA` appends the routing/offset
-/// hash-ids; dense stops at `Prow`.
+/// hash-ids; dense stops at `h`.
 fn parse_p_a(s: &mut &[u8], experts: u16) -> Result<(OperandParams, Option<(HashId, HashId)>)> {
-    let num_rows = u32::from_le_bytes(take(s, 4)?.try_into().unwrap());
-    let hash_id = HashId::try_from(take(s, 1)?[0])?;
-    let pattern = AxisPattern::from_bytes(take(s, AxisPattern::NUM_DIMS)?)?;
+    let a = OperandParams::decode(s)?;
     let moe_hash_ids = if experts != 0 {
         Some((HashId::try_from(take(s, 1)?[0])?, HashId::try_from(take(s, 1)?[0])?))
     } else {
         None
     };
-    Ok((
-        OperandParams {
-            num_rows,
-            hash_id,
-            pattern,
-        },
-        moe_hash_ids,
-    ))
+    Ok((a, moe_hash_ids))
 }
 
 #[cfg(feature = "pyo3")]
@@ -1273,11 +1265,11 @@ impl CommonParams {
 #[pyo3::pymethods]
 impl OperandParams {
     #[new]
-    fn py_new(num_rows: u32, hash_id: HashId, pattern: AxisPattern) -> Self {
+    fn py_new(num_rows: u32, hash_id: HashId, tile_size: u32) -> Self {
         Self {
             num_rows,
             hash_id,
-            pattern,
+            tile_size,
         }
     }
 }
@@ -1300,14 +1292,13 @@ impl MoeParams {
 #[cfg(test)]
 pub(crate) mod test_fixtures {
     use super::*;
-    use crate::v4::api::layout::DimType;
 
-    pub(crate) fn rows() -> AxisPattern {
-        AxisPattern::new(&[(4, DimType::Blake)]).unwrap()
+    pub(crate) fn rows() -> u32 {
+        4
     }
 
-    pub(crate) fn cols() -> AxisPattern {
-        AxisPattern::new(&[(2, DimType::Fold), (4, DimType::Blake), (8, DimType::Fold)]).unwrap()
+    pub(crate) fn cols() -> u32 {
+        128
     }
 
     pub(crate) fn empty_jackpot() -> JackpotStatement {
@@ -1363,7 +1354,7 @@ pub(crate) mod test_fixtures {
             JobParams {
                 ancestor_header: BlockHeader::zero(),
                 common: CommonParams {
-                    k: 1024,
+                    k: 2048,
                     r: 32,
                     quant: Quant::Fp8E4M3Prequant,
                     device: Device::B200,
@@ -1372,12 +1363,12 @@ pub(crate) mod test_fixtures {
                     a: OperandParams {
                         num_rows: 256,
                         hash_id: HashId::Blake3Chunk1024,
-                        pattern: rows(),
+                        tile_size: rows(),
                     },
                     b: OperandParams {
                         num_rows: 128,
                         hash_id: HashId::Blake3Chunk1024,
-                        pattern: cols(),
+                        tile_size: cols(),
                     },
                 },
                 moe: None,
@@ -1388,25 +1379,14 @@ pub(crate) mod test_fixtures {
         .unwrap()
     }
 
-    /// Contiguous dense benchmark tiles with four Blake lanes per axis.
+    /// Contiguous dense benchmark tiles: `h` A-rows and `w` B-rows opened from
+    /// the first `max(size, 256)` committed rows of each operand.
     pub(crate) fn dense_geometry_job(h: u32, w: u32, k: u32, device: Device) -> JobParams {
-        let axis = |size: u32| {
-            assert!(size.is_multiple_of(4));
-            let fold = size / 4;
-            let mut dims = vec![(4, DimType::Blake)];
-            if fold > 64 {
-                let divisor = (2..=64).find(|&d| fold.is_multiple_of(d) && fold / d <= 64).unwrap();
-                dims.extend([(divisor, DimType::Fold), (fold / divisor, DimType::Fold)]);
-            } else if fold > 1 {
-                dims.push((fold, DimType::Fold));
-            }
-            AxisPattern::new(&dims).unwrap()
-        };
         let mut job = dense_params().job().clone();
         job.common.k = k;
         job.common.device = device;
-        job.operands.a.pattern = axis(h);
-        job.operands.b.pattern = axis(w);
+        job.operands.a.tile_size = h;
+        job.operands.b.tile_size = w;
         job.operands.a.num_rows = h.max(256);
         job.operands.b.num_rows = w.max(256);
         job
@@ -1446,15 +1426,14 @@ pub(crate) mod test_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v4::api::layout::DimType::{Blake, Fold};
     use crate::v4::api::public_params::test_fixtures::{
         ancestry, cols, dense_params, empty_jackpot, empty_moe_statement, moe_params, rows, stacked_b,
     };
 
-    const DENSE_PA: &str = "00010000030e0303030303";
-    const DENSE_PB: &str = "80000000000400002000000103050e1d0303030000";
-    const MOE_PA: &str = "00010000030e03030303030303";
-    const MOE_PB: &str = "00020000000400002000000103050e1d0303030400";
+    const DENSE_PA: &str = "000100000304000000";
+    const DENSE_PB: &str = "00080000200000018000000003800000000000";
+    const MOE_PA: &str = "0001000003040000000303";
+    const MOE_PB: &str = "00080000200000010002000003800000000400";
 
     fn hex_bytes(s: &str) -> Vec<u8> {
         (0..s.len() / 2)
@@ -1468,8 +1447,8 @@ mod tests {
         assert_eq!(dense.job.experts(), 0);
         assert_eq!(dense.job.encode_p_a(), hex_bytes(DENSE_PA));
         assert_eq!(dense.job.encode_p_b(), hex_bytes(DENSE_PB));
-        assert_eq!(dense.value_row_bytes(), 1024);
-        assert_eq!(dense.scale_row_bytes(), 2 * (1024 / BLOCK_SIZE));
+        assert_eq!(dense.value_row_bytes(), 2048);
+        assert_eq!(dense.scale_row_bytes(), 2 * (2048 / BLOCK_SIZE));
         assert_eq!(dense.n(), 128);
         assert_eq!(dense.expert_rows(), 128);
 
@@ -1481,8 +1460,33 @@ mod tests {
         assert_eq!(moe.expert_rows(), 128);
     }
 
-    /// A truncated MoE tail must be rejected with an error, not panic — the
-    /// `public_data` blob is proof-controlled input.
+    #[test]
+    fn tile_sizes_are_committed_and_bases_are_per_proof() {
+        let params = dense_params();
+        assert_eq!(params.to_bytes().len(), PublicParams::WIRE_SIZE);
+        let header = IncompleteBlockHeader::new_for_test(0x207fffff);
+        let seeds = params.noise_seeds(&header);
+        for side_a in [true, false] {
+            let mut job = params.job.clone();
+            if side_a {
+                job.operands.a.tile_size = 8;
+            } else {
+                job.operands.b.tile_size = 64;
+            }
+            let changed = PublicParams::try_new(job, params.jackpot_statement.clone(), None).unwrap();
+            assert_ne!(params.digest(&header), changed.digest(&header));
+            assert_ne!(seeds.a, changed.noise_seeds(&header).a);
+        }
+        let mut jackpot = params.jackpot_statement.clone();
+        jackpot.tile_bases.a = 4;
+        let shifted = PublicParams::try_new(params.job.clone(), jackpot, None).unwrap();
+        assert_eq!(seeds.a, shifted.noise_seeds(&header).a);
+        assert_eq!(seeds.b, shifted.noise_seeds(&header).b);
+        assert_ne!(params.digest(&header), shifted.digest(&header));
+        assert_eq!(shifted.a_inner_indices(), vec![4, 5, 6, 7]);
+    }
+
+    /// Truncated proof-controlled MoE tails must return an error, never panic.
     #[test]
     fn from_bytes_rejects_truncated_moe_tail() {
         let full = moe_params().to_bytes();
@@ -1493,18 +1497,15 @@ mod tests {
         assert!(err.to_string().contains("truncated fp8 public_data"));
     }
 
-    /// Regression (allocation guard): an oversized-but-canonical rows pattern
+    /// Regression (allocation guard): an oversized committed row count
     /// used to size the `I_A` buffer before any validation, so a ~300-byte
-    /// blob with `tile_size() = 2^24` and a stream truncated before the first
+    /// blob with `h = 2^24` and a stream truncated before the first
     /// `I_A` entry made the decoder reserve 64 MiB before `take()` failed.
     /// The lottery envelope must reject it in `from_bytes` before reserving.
     #[test]
     fn from_bytes_rejects_oversized_pattern_before_i_a_alloc() {
-        let huge = AxisPattern::new(&[(1 << 24, Fold)]).unwrap();
-        assert_eq!(huge.tile_size(), 1 << 24);
-
         let mut job = moe_params().job().clone();
-        job.operands.a.pattern = huge;
+        job.operands.a.tile_size = 1 << 24;
 
         // Assemble `public_data` exactly as `to_bytes` lays it out, with the
         // fixed MoE tail fields present and no `I_A` entries.
@@ -1533,11 +1534,11 @@ mod tests {
 
     #[test]
     fn construction_rejects() {
-        let prow = rows().to_bytes();
-        let pcol = cols().to_bytes();
+        let h = rows();
+        let w = cols();
 
         // Builds params from unchecked parts so the rejection paths stay exercised.
-        let build = |m: usize, k: usize, row: &[u8], experts: Option<usize>| -> Result<PublicParams> {
+        let build = |m: usize, k: usize, h: u32, experts: Option<usize>| -> Result<PublicParams> {
             let (moe, moe_statement) = match experts {
                 None => (None, None),
                 Some(e) => (
@@ -1562,12 +1563,12 @@ mod tests {
                         a: OperandParams {
                             num_rows: u32::try_from(m)?,
                             hash_id: HashId::Blake3Chunk1024,
-                            pattern: AxisPattern::from_bytes(row)?,
+                            tile_size: h,
                         },
                         b: OperandParams {
                             num_rows: 128,
                             hash_id: HashId::Blake3Chunk1024,
-                            pattern: AxisPattern::from_bytes(&pcol)?,
+                            tile_size: w,
                         },
                     },
                     moe,
@@ -1577,9 +1578,9 @@ mod tests {
             )
         };
 
-        assert!(build(256, 1024, &prow, None).is_ok());
-        assert!(build(256, 7, &prow, None).is_err());
-        assert!(build(256, 2048, &prow, Some(0)).is_err());
+        assert!(build(256, 1024, h, None).is_ok());
+        assert!(build(256, 7, h, None).is_err());
+        assert!(build(256, 2048, h, Some(0)).is_err());
         let p = dense_params();
         let moe = Some(MoeParams {
             experts: 4,
@@ -1618,8 +1619,8 @@ mod tests {
             )
             .is_err()
         );
-        assert!(build((u32::MAX as usize).saturating_add(1), 1024, &prow, None).is_err());
-        assert!(build(256, 1024, &[0x00, 0x03, 0x03, 0x03, 0x03, 0x03], None).is_err());
+        assert!(build((u32::MAX as usize).saturating_add(1), 1024, h, None).is_err());
+        assert!(build(256, 1024, 0, None).is_err());
         assert!(Quant::try_from(1u8).is_err());
         assert_eq!(Device::try_from(0u8).unwrap(), Device::H100);
         assert!(Device::try_from(2u8).is_err());
@@ -1707,15 +1708,12 @@ mod tests {
             PublicParams::try_new(p.job.clone(), jackpot, None)
         };
         assert!(build(0, 0).is_ok());
-        assert!(build(4, 0).is_ok(), "next A-period tA=4 still fits in m");
-        assert!(
-            build(4, 128).is_err(),
-            "tB=128 is on the B lattice but tB + tile_max must be < n"
-        );
-        assert!(build(1, 0).is_err(), "tA must sit on the A-side lattice");
-        assert!(build(0, 1).is_err(), "tB must sit on the B-side lattice");
-        assert!(build(u32::MAX, 0).is_err(), "tA must not wrap tile_offsets");
-        assert!(build(0, u32::MAX).is_err(), "tB must not wrap tile_offsets");
+        assert!(build(4, 0).is_ok(), "tA = 4 is the next A tile.");
+        assert!(build(4, 128).is_err(), "tB=128 is a multiple of w but tB + w must be <= n");
+        assert!(build(1, 0).is_err(), "tA must be a multiple of h");
+        assert!(build(0, 1).is_err(), "tB must be a multiple of w");
+        assert!(build(u32::MAX - 3, 0).is_err(), "tA + h must not overflow u32");
+        assert!(build(0, u32::MAX - 127).is_err(), "tB + w must not overflow u32");
     }
 
     fn with_kr(rank: u16, k: u32) -> Result<PublicParams> {
@@ -1771,8 +1769,8 @@ mod tests {
     #[test]
     fn minimal_4x64_tile_passes() {
         let p = dense_params();
-        let rows = AxisPattern::new(&[(4, Blake)]).unwrap();
-        let cols = AxisPattern::new(&[(4, Blake), (16, Fold)]).unwrap();
+        let rows = 4;
+        let cols = 64;
         PublicParams::try_new(
             JobParams {
                 ancestor_header: p.job.ancestor_header,
@@ -1781,12 +1779,12 @@ mod tests {
                     a: OperandParams {
                         num_rows: 4,
                         hash_id: p.job.operands.a.hash_id,
-                        pattern: rows,
+                        tile_size: rows,
                     },
                     b: OperandParams {
                         num_rows: 64,
                         hash_id: p.job.operands.b.hash_id,
-                        pattern: cols,
+                        tile_size: cols,
                     },
                 },
                 moe: None,
@@ -1808,7 +1806,7 @@ mod tests {
                     a: OperandParams {
                         num_rows: 0,
                         hash_id: p.job.operands.a.hash_id,
-                        pattern: p.job.operands.a.pattern.clone(),
+                        tile_size: p.job.operands.a.tile_size,
                     },
                     b: p.job.operands.b.clone(),
                 },
@@ -1833,7 +1831,7 @@ mod tests {
                     b: OperandParams {
                         num_rows: 0,
                         hash_id: p.job.operands.b.hash_id,
-                        pattern: p.job.operands.b.pattern.clone(),
+                        tile_size: p.job.operands.b.tile_size,
                     },
                 },
                 moe: None,
@@ -1848,8 +1846,8 @@ mod tests {
     #[test]
     fn opened_strips_bound_rejects_4x64_at_k_2_16() {
         let p = dense_params();
-        let rows = AxisPattern::new(&[(4, Blake)]).unwrap();
-        let cols = AxisPattern::new(&[(4, Blake), (16, Fold)]).unwrap();
+        let rows = 4;
+        let cols = 64;
         let err = PublicParams::try_new(
             JobParams {
                 ancestor_header: p.job.ancestor_header,
@@ -1863,12 +1861,12 @@ mod tests {
                     a: OperandParams {
                         num_rows: 4,
                         hash_id: p.job.operands.a.hash_id,
-                        pattern: rows,
+                        tile_size: rows,
                     },
                     b: OperandParams {
                         num_rows: 64,
                         hash_id: p.job.operands.b.hash_id,
-                        pattern: cols,
+                        tile_size: cols,
                     },
                 },
                 moe: None,
@@ -2146,9 +2144,8 @@ mod tests {
                     let mut seed = if is_moe { moe_params() } else { dense_params() };
                     // A balanced admitted tile exercises both aligned and partial
                     // chunks without bypassing the aggregate admission budget.
-                    let pattern = AxisPattern::new(&[(4, Fold), (4, Blake)]).unwrap();
-                    seed.job.operands.a.pattern = pattern.clone();
-                    seed.job.operands.b.pattern = pattern;
+                    seed.job.operands.a.tile_size = 16;
+                    seed.job.operands.b.tile_size = 16;
                     if let Some(stmt) = seed.moe_statement.as_mut() {
                         stmt.i_a = (0..16).collect();
                     }
@@ -2190,7 +2187,8 @@ mod tests {
     fn aggregate_blake3_cap_rejects_before_compilation() {
         let mut seed = dense_params();
         seed.job.common.k = 31744;
-        seed.job.operands.b.pattern = AxisPattern::new(&[(2, Fold), (4, Blake), (16, Fold)]).unwrap();
+        // The B-side tile stays at the 4x128 default: `(h + w) * k` must fit
+        // the 2^22 aggregate byte cap while the total work still trips it.
         assert!((seed.h() as usize + seed.w() as usize) * seed.common_dim() as usize <= (1 << 22));
         let err = PublicParams::try_new(seed.job, seed.jackpot_statement, None).unwrap_err();
         assert!(err.to_string().contains("Blake3 work exceeds 2^22 bytes"), "{err}");
@@ -2205,7 +2203,9 @@ mod tests {
             let blocks = params.blake3_work_block_bound().unwrap();
             assert!(params.verifier_work_units(blocks).unwrap() <= PublicParams::MAX_VERIFIER_WORK);
 
-            // This geometry exceeded the 2^27 budget and is admitted under 2T.
+            // The 4x64 reference geometry: this profile exceeded the old 2^27
+            // score budget and is admitted under 2T.
+            params.job.operands.b.tile_size = 64;
             params.job.common.k = 40960;
             let blocks = params.blake3_work_block_bound().unwrap();
             assert!(blocks <= (PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64);
@@ -2278,9 +2278,10 @@ mod tests {
         }
     }
 
-    /// Dense, contiguous patterns with four Blake lanes on each axis, all encodable
-    /// h/w multiples of four and all K multiples of 32. Component caps are applied
-    /// first. This is a geometry census, not a claim about real mining-job frequency.
+    /// Dense census over the committed lottery envelope (`hw ∈ [256, 2048]`,
+    /// both sides multiples of four, K multiples of 32; component caps
+    /// applied first). This is a geometry census, not a claim about real
+    /// mining-job frequency.
     /// `cargo test --release report_verifier_work_coverage -- --ignored --nocapture`
     #[test]
     #[ignore = "manual admission-policy comparison"]
@@ -2292,8 +2293,7 @@ mod tests {
         let mut total = 0u64;
         for h in (4..=128u32).step_by(4) {
             for w in (16..=2048 / h).step_by(4) {
-                let fold = w / 4;
-                if h * w < 256 || (fold > 64 && !(2..=64).any(|d| fold.is_multiple_of(d) && fold / d <= 64)) {
+                if h * w < 256 {
                     continue;
                 }
                 let mut params = PublicParams {
@@ -2302,7 +2302,7 @@ mod tests {
                     moe_statement: None,
                 };
                 params.job.check().unwrap();
-                check_lottery_layout(&params.a().pattern, &params.b().pattern).unwrap();
+                check_lottery_layout(params.a().tile_size as usize, params.b().tile_size as usize).unwrap();
                 let k_max = PublicParams::MAX_K.min((1 << 22) / (h + w) as usize);
                 for k in (PublicParams::MIN_K..=k_max).step_by(32) {
                     params.job.common.k = k as u32;

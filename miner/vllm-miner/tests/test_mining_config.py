@@ -67,11 +67,11 @@ def test_mining_configuration_commits_the_kernel_tile(device):
     config = mining_configuration(_K, device=device)
     assert config.common_dim == _K
     assert config.rank == RANK
-    assert config.rows_pattern.tile_size == TILE_ROWS
-    assert config.cols_pattern.tile_size == TILE_COLS
+    assert config.tile_rows == TILE_ROWS
+    assert config.tile_cols == TILE_COLS
     # The committed ``pB``/``pA`` (noise-seed inputs) must be well-formed and cached.
-    assert len(config.p_b(6144)) == 21  # common params (k, r, device, hash) + B's operand params
-    assert len(config.p_a(256)) == 11  # A's operand params alone (dense: no routing)
+    assert len(config.p_b(6144)) == 19  # common params (k, r, device, hash) + B's operand params
+    assert len(config.p_a(256)) == 9  # A's operand params alone (dense: no routing)
     assert config.chunk_size == 1024
     assert config.device is device
     assert mining_configuration(_K, device=device) is config
@@ -113,12 +113,12 @@ def test_commitment_keys_match_reference_derivation():
 @_DEVICES
 def test_tile_indices_are_the_committed_offsets(device):
     config = mining_configuration(_K, device=device)
-    rows = config.rows_pattern
-    cols = config.cols_pattern
-    assert tile_indices(rows, 0) == list(rows.tile_offsets)
-    assert tile_indices(rows, 1) == [rows.total + off for off in rows.tile_offsets]
-    assert tile_indices(cols, 0) == list(cols.tile_offsets)
-    assert tile_indices(cols, 3) == [3 * cols.total + off for off in cols.tile_offsets]
+    rows = config.tile_rows
+    cols = config.tile_cols
+    assert tile_indices(rows, 0) == list(range(rows))
+    assert tile_indices(rows, 1) == list(range(rows, 2 * rows))
+    assert tile_indices(cols, 0) == list(range(cols))
+    assert tile_indices(cols, 3) == list(range(3 * cols, 4 * cols))
 
 
 @_DEVICES
@@ -269,21 +269,19 @@ def test_commitment_binds_n_and_k(device):
     for k in (1024, 31744, 16384):  # 16384 is within the 4x64 cap
         with_n = mining_configuration(k, 6144, device=device)
         without_n = mining_configuration(k, device=device)
-        assert (with_n.rows_pattern.tile_size, with_n.cols_pattern.tile_size) == (4, 64)
-        assert without_n.rows_pattern.tile_size == TILE_ROWS  # 4x128 back-compat
-        assert without_n.cols_pattern.tile_size == TILE_COLS
-        assert with_n.p_b(6144) != without_n.p_b(6144)  # tile bound (pB carries the cols pattern)
+        assert (with_n.tile_rows, with_n.tile_cols) == (4, 64)
+        assert without_n.tile_rows == TILE_ROWS  # 4x128 back-compat
+        assert without_n.tile_cols == TILE_COLS
+        assert with_n.p_b(6144) != without_n.p_b(6144)  # tile bound (pB carries the tile width)
     # k past the 4x64 proof cap falls back to the tall tile even at 64-aligned
     # n. On Hopper no committed tile takes it: the builder emits the 4x128
     # back-compat commitment, but ``select_tile`` refuses the shape so the
     # runtime (which gates on ``can_mine_layer``) never launches it.
     if _tall_committed(device):
-        assert mining_configuration(k=65536, n=6144, device=device).rows_pattern.tile_size == 16
+        assert mining_configuration(k=65536, n=6144, device=device).tile_rows == 16
     else:
         assert select_tile(6144, 65536, device=device) is None
-        assert (
-            mining_configuration(k=65536, n=6144, device=device).rows_pattern.tile_size == TILE_ROWS
-        )
+        assert mining_configuration(k=65536, n=6144, device=device).tile_rows == TILE_ROWS
     assert mining_configuration(16384, 6144, device=device).p_b(6144) != mining_configuration(
         12288, 6144, device=device
     ).p_b(6144)  # k bound
@@ -321,15 +319,15 @@ def test_tile_layout_matches_reference_and_kernel(device):
         if _tall_committed(device)
         else tall_tile_mining_config(65536, RANK, Device.BLACKWELL)
     )
-    tall_lanes = lane_assignment(tall.rows_pattern, tall.cols_pattern)
+    tall_lanes = lane_assignment(tall.tile_rows, tall.tile_cols)
     # 16x32: lane j is row j's 32 contiguous columns, ascending.
     assert tall_lanes == [
         [j * TALL_TILE.cols + c for c in range(TALL_TILE.cols)] for j in range(TALL_TILE.rows)
     ]
     default = mining_configuration(4096, device=device)
-    default_lanes = lane_assignment(default.rows_pattern, default.cols_pattern)
+    default_lanes = lane_assignment(default.tile_rows, default.tile_cols)
     small = mining_configuration(4096, 6144, device=device)
-    small_lanes = lane_assignment(small.rows_pattern, small.cols_pattern)
+    small_lanes = lane_assignment(small.tile_rows, small.tile_cols)
     # Every tile folds its rows*cols elements over the same 16 kernel lanes
     # (the 4x64 area is 256, half the others': its threshold halves to match).
     for lanes, tile in (
@@ -340,8 +338,8 @@ def test_tile_layout_matches_reference_and_kernel(device):
         assert len(lanes) == 16  # mixed_gemm's LANES
         assert sum(len(lane) for lane in lanes) == tile.rows * tile.cols
     # tile_indices enumerates whole tall tiles: 16-row and 32-col strides.
-    assert tile_indices(tall.rows_pattern, 1) == list(range(16, 32))
-    assert tile_indices(tall.cols_pattern, 1) == list(range(32, 64))
+    assert tile_indices(tall.tile_rows, 1) == list(range(16, 32))
+    assert tile_indices(tall.tile_cols, 1) == list(range(32, 64))
 
 
 def test_m_buckets_parse_and_validate(monkeypatch):

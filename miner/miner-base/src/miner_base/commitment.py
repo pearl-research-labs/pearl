@@ -22,7 +22,6 @@ import torch
 from blake3 import blake3
 from pearl_blake3 import MerkleProof, MerkleTree
 
-from .layout import AxisPattern
 from .params import (
     BlockHeader,
     CommonParams,
@@ -240,7 +239,7 @@ class MiningConfiguration:
     """The parameters one layer's launches and proofs commit to.
 
     ``device`` and the with-peel ``rank`` (r) sit alongside one committed
-    :class:`AxisPattern` per axis (the lottery tile), and one Merkle leaf per
+    tile size per axis (``tile_rows``, ``tile_cols``), and one Merkle leaf per
     committed tree: ``chunk_size`` for the weight (B) planes and
     ``a_chunk_size`` (defaulting to it) for the activation (A) planes. Both
     leaves are protocol-visible through the operands' ``HashId``.
@@ -254,8 +253,8 @@ class MiningConfiguration:
     device: Device
     common_dim: int  # k
     rank: int  # r (noise rank / peel width)
-    rows_pattern: AxisPattern
-    cols_pattern: AxisPattern
+    tile_rows: int
+    tile_cols: int
     chunk_size: int = HashId.BLAKE3_CHUNK_1024.chunk_len
     a_chunk_size: int | None = None
     experts: int = 0
@@ -281,12 +280,12 @@ class MiningConfiguration:
         return CommonParams(self.common_dim, self.rank, Quant.FP8_E4M3_PREQUANT, self.device)
 
     def a_params(self, m: int) -> OperandParams:
-        """The A operand's committed ``(m, hash_idA, Prow)``."""
-        return OperandParams(m, self.a_hash_id, self.rows_pattern)
+        """The A operand's committed ``(m, hash_idA, h)``."""
+        return OperandParams(m, self.a_hash_id, self.tile_rows)
 
     def b_params(self, n: int) -> OperandParams:
-        """The B operand's committed ``(n, hash_idB, Pcol)``."""
-        return OperandParams(n, self.b_hash_id, self.cols_pattern)
+        """The B operand's committed ``(n, hash_idB, w)``."""
+        return OperandParams(n, self.b_hash_id, self.tile_cols)
 
     def moe_params(self) -> MoeParams | None:
         """The MoE public fields (``None`` for a dense layer)."""

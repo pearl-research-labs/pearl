@@ -82,8 +82,9 @@ use crate::v4::circuit::utils::symbolic_evaluator::SymbolicEvaluator;
 /// The protocol's fixed odd mixing multiplier (the golden-ratio-derived XorFold constant).
 const GOLDEN: u64 = 0x9E3779B1;
 
-/// The committed lane layout: `lanes[j]` lists lane `j`'s cell ids in fold order
-/// (`crate::v4::api::layout::lane_assignment`).
+/// The fixed extractor schedule: `lanes[j]` lists lane `j`'s cell ids in fold order
+/// (`crate::v4::api::layout::lane_assignment`), sixteen consecutive chunks of the
+/// compact row-major output tile.
 #[derive(Clone, Debug)]
 pub struct XorFoldProgram {
     pub lanes: Vec<Vec<usize>>,
@@ -362,7 +363,7 @@ mod tests {
     use super::super::columns::XOR_FOLD_COL_MAP;
     use super::super::ctl::xor_fold_lut_lookups;
     use super::*;
-    use crate::v4::api::layout::{AxisPattern, DimType, lane_assignment};
+    use crate::v4::api::layout::lane_assignment;
     use crate::v4::api::utils::xor_fold_extract;
     use crate::v4::circuit::matmul_b200_stark::MatmulStarkB200;
     use crate::v4::circuit::matmul_b200_stark::columns::MATMUL_B200_COL_MAP;
@@ -376,13 +377,11 @@ mod tests {
         x.to_canonical_u64()
     }
 
-    /// The committed layout of `utils.rs`'s reference-vector test: an 8x8 merged tile, 16 lanes
-    /// of 4 cells each (per axis: fold offsets `{0, 1}`, blake offsets `{0, 2, 4, 6}`).
+    /// A 64-cell output tile, folded as sixteen consecutive chunks of four cells.
     fn test_layout() -> (Vec<f32>, Vec<Vec<usize>>) {
-        let axis = AxisPattern::new(&[(2, DimType::Fold), (4, DimType::Blake)]).unwrap();
         let base = [1.0f32, -2.5, 0.0, 3.171875, 1e-3, -0.0, 448.0, 2.0, 0.5, -1.0];
         let tile: Vec<f32> = (0..64).map(|i| base[i % base.len()]).collect();
-        (tile, lane_assignment(&axis, &axis))
+        (tile, lane_assignment(8, 8))
     }
 
     fn test_trace() -> (

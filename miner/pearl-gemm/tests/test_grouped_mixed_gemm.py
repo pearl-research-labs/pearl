@@ -245,7 +245,7 @@ def _fold_messages(tiles: torch.Tensor, protocol) -> list[bytes]:
     tiles: lane ``j`` folds its subtile's words in ``lane_assignment`` order
     as ``h = rotl13(h * 0x9E3779B1 + word)``; the 16 lanes are the 64-byte
     message."""
-    lanes = np.asarray(lane_assignment(protocol.rows_pattern, protocol.cols_pattern))
+    lanes = np.asarray(lane_assignment(protocol.tile_rows, protocol.tile_cols))
     words = tiles.reshape(tiles.shape[0], -1).contiguous().view(torch.int32).numpy()
     words = words.astype(np.uint32).astype(np.uint64)[:, lanes]
     h = np.zeros(words.shape[:2], dtype=np.uint64)
@@ -267,7 +267,7 @@ def _lottery_hashes(inputs, acc, protocol, *, rows=None) -> dict[tuple[int, int,
     the lattice restarting at the expert's first row and spanning only its
     real (``m_valid``) rows unless ``rows(g, s, e)`` overrides the count."""
     pow_key = bytes(inputs["pow_key"].cpu().numpy())
-    ltile_cols = protocol.cols_pattern.tile_size
+    ltile_cols = protocol.tile_cols
     col_tiles = acc.shape[1] // ltile_cols
     coords, tiles = [], []
     for (g, s, e), valid in zip(_groups(inputs), _valid_counts(inputs), strict=True):
@@ -922,7 +922,7 @@ def _straddling_tile_hashes(inputs, acc, protocol) -> dict:
     expert's end); these tiles are not protocol tiles and must never publish.
     """
     pow_key = bytes(inputs["pow_key"].cpu().numpy())
-    ltile_cols = protocol.cols_pattern.tile_size
+    ltile_cols = protocol.tile_cols
     coords, tiles = [], []
     for g, s, e in _groups(inputs):
         count = e - s
