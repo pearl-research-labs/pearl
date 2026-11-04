@@ -5,18 +5,18 @@ use alloc::{vec, vec::Vec};
 
 use anyhow::{bail, ensure, Result};
 use hashbrown::HashMap;
-use plonky2::batch_fri::verifier::verify_batch_fri_proof;
+use plonky2::batch_fri::verifier::verify_batch_fri_proof_with_leaves;
 use plonky2::field::extension::Extendable;
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::hash::hash_types::{HashOut, RichField};
 use plonky2::iop::challenger::Challenger;
-use plonky2::plonk::config::{GenericConfig, Hasher};
+use plonky2::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use plonky2::plonk::plonk_common::reduce_with_powers;
 
 use crate::batch_proof::BatchStarkProofWithPublicInputs;
 use crate::batch_prover::BatchStarkPreprocessedVerifierData;
-use crate::batch_stark::{BatchOracle, BatchStark, BatchStarkLayout};
+use crate::batch_stark::{BatchOracle, BatchRole, BatchStark, BatchStarkLayout};
 use crate::config::StarkConfig;
 use crate::cross_table_lookup::{verify_cross_table_lookups, CrossTableLookup, CtlCheckVars};
 use crate::get_challenges::get_dummy_polys;
@@ -122,8 +122,8 @@ impl<F: RichField> BatchKnownColumns<F> {
 /// openings, binding the proof to the known data. It must be `Some` iff the
 /// prover was given the same data.
 ///
-/// `grouped_tables` must equal the list given to the prover (see
-/// [`batch_prove`][crate::batch_prover::batch_prove]).
+/// `grouped_tables` and `merged` must equal the values given to the prover
+/// (see [`batch_prove`][crate::batch_prover::batch_prove]).
 ///
 /// The keys of `ctl_extra_looking_sums` are positions within
 /// `cross_table_lookups` of CTLs whose looking sums also include values not
@@ -134,6 +134,7 @@ pub fn batch_verify<F, C, const D: usize, const N: usize>(
     proof_with_pis: &BatchStarkProofWithPublicInputs<F, C, D>,
     cross_table_lookups: &[CrossTableLookup<F>],
     grouped_tables: &[usize],
+    merged: bool,
     preprocessed: Option<&BatchStarkPreprocessedVerifierData<F, C, D>>,
     known_columns: Option<&BatchKnownColumns<F>>,
     ctl_extra_looking_sums: &HashMap<usize, Vec<F>>,
@@ -162,6 +163,7 @@ where
         prep_columns,
         cross_table_lookups,
         grouped_tables,
+        merged,
     )?;
 
     validate_proof_shape(starks, &layout, proof_with_pis, preprocessed, config)?;
@@ -384,14 +386,18 @@ where
     let mut caps = Vec::with_capacity(layout.oracles.len());
     for &oracle in &layout.oracles {
         match oracle {
-            BatchOracle::Trace(_) | BatchOracle::GroupedTrace => {
+            BatchOracle::Trace(_)
+            | BatchOracle::GroupedTrace
+            | BatchOracle::Merged(BatchRole::Trace) => {
                 caps.push(proof.trace_caps[trace_i].clone());
                 trace_i += 1;
             }
             BatchOracle::Preprocessed => {
                 caps.push(preprocessed.expect("missing preprocessed data").cap.clone());
             }
-            BatchOracle::Auxiliary(_) | BatchOracle::GroupedAuxiliary => {
+            BatchOracle::Auxiliary(_)
+            | BatchOracle::GroupedAuxiliary
+            | BatchOracle::Merged(BatchRole::Auxiliary) => {
                 caps.push(
                     proof
                         .auxiliary_polys_caps
@@ -401,7 +407,9 @@ where
                 );
                 aux_i += 1;
             }
-            BatchOracle::Quotient(_) | BatchOracle::GroupedQuotient => {
+            BatchOracle::Quotient(_)
+            | BatchOracle::GroupedQuotient
+            | BatchOracle::Merged(BatchRole::Quotient) => {
                 caps.push(
                     proof
                         .quotient_polys_caps
@@ -413,12 +421,39 @@ where
             }
         }
     }
-    verify_batch_fri_proof::<F, C, D>(
+    // Digest rows are reconstructed from the same table ranges used by the
+    // prover; the proof cannot choose widths, heights or injection order.
+    let initial_leaves = |oracle_index: usize, evals: &[F]| {
+        if let BatchOracle::Merged(role) = layout.oracles[oracle_index] {
+            let groups = layout.merged_leaf_groups(role, config.fri_config.rate_bits);
+            let leaves = groups
+                .iter()
+                .map(|(_, range)| C::Hasher::hash_no_pad(&evals[range.clone()]).to_vec())
+                .collect();
+            let heights = groups.iter().map(|(height, _)| *height).collect();
+            (leaves, heights)
+        } else {
+            let mut leaves = Vec::new();
+            let mut heights = Vec::new();
+            let mut start = 0;
+            for (inst, &db) in instances.iter().zip(&layout.distinct_degree_bits) {
+                let len = inst.oracles[oracle_index].num_polys;
+                if len > 0 {
+                    leaves.push(evals[start..start + len].to_vec());
+                    heights.push(db + config.fri_config.rate_bits);
+                    start += len;
+                }
+            }
+            (leaves, heights)
+        }
+    };
+    verify_batch_fri_proof_with_leaves::<F, C, D>(
         &layout.distinct_degree_bits,
         &instances,
         &fri_openings,
         &fri_challenges,
         &caps,
+        &initial_leaves,
         &proof.opening_proof,
         &config.fri_params(max_degree_bits),
     )?;
@@ -448,10 +483,16 @@ where
     let mut n_quot = 0;
     for &oracle in &layout.oracles {
         match oracle {
-            BatchOracle::Trace(_) | BatchOracle::GroupedTrace => n_trace += 1,
+            BatchOracle::Trace(_)
+            | BatchOracle::GroupedTrace
+            | BatchOracle::Merged(BatchRole::Trace) => n_trace += 1,
             BatchOracle::Preprocessed => has_prep = true,
-            BatchOracle::Auxiliary(_) | BatchOracle::GroupedAuxiliary => n_aux += 1,
-            BatchOracle::Quotient(_) | BatchOracle::GroupedQuotient => n_quot += 1,
+            BatchOracle::Auxiliary(_)
+            | BatchOracle::GroupedAuxiliary
+            | BatchOracle::Merged(BatchRole::Auxiliary) => n_aux += 1,
+            BatchOracle::Quotient(_)
+            | BatchOracle::GroupedQuotient
+            | BatchOracle::Merged(BatchRole::Quotient) => n_quot += 1,
         }
     }
     ensure!(

@@ -149,6 +149,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 ///   challenger, and the verifier recomputes and checks their openings. Must
 ///   be `Some` iff the verifier is given the same data.
 /// - `cross_table_lookups` describe the CTLs connecting the tables.
+/// - `merged` commits every online table as a row digest at its runtime height
+///   in one multi-height tree per role. Polynomials keep table-index order;
+///   the tree uses descending height, ties by table index. In this mode
+///   `grouped_tables` does not affect the online commitment layout.
 /// - `grouped_tables` lists the tables (sorted) that share one multi-height
 ///   Merkle tree per role instead of per-table trees — worthwhile for tables
 ///   whose heights are protocol constants, as each role then costs one
@@ -166,6 +170,7 @@ pub fn batch_prove<F, C, const D: usize, const N: usize>(
     public_inputs: &[Vec<F>; N],
     cross_table_lookups: &[CrossTableLookup<F>],
     grouped_tables: &[usize],
+    merged: bool,
     preprocessed: Option<&BatchStarkPreprocessedData<F, C, D>>,
     known_columns: Option<&BatchKnownColumns<F>>,
     timing: &mut TimingTree,
@@ -195,6 +200,7 @@ where
         prep_columns,
         cross_table_lookups,
         grouped_tables,
+        merged,
     )?;
 
     for t in 0..N {
@@ -286,6 +292,29 @@ where
         if per_table.is_empty() {
             return None;
         }
+        if merged {
+            let mut start = 0;
+            let ranges = per_table
+                .iter()
+                .map(|(_, values)| {
+                    let range = start..start + values.len();
+                    start = range.end;
+                    range
+                })
+                .collect();
+            let values: Vec<_> = per_table
+                .into_iter()
+                .flat_map(|(_, values)| values)
+                .collect();
+            let coeffs = timed!(
+                timing,
+                "IFFT",
+                values.into_par_iter().map(|values| values.ifft()).collect()
+            );
+            return Some(BatchFriOracle::from_coeffs_with_digests(
+                coeffs, ranges, rate_bits, cap_height, timing,
+            ));
+        }
         per_table.sort_by_key(|&(t, _)| (core::cmp::Reverse(degree_bits[t]), t));
         let values: Vec<PolynomialValues<F>> = per_table
             .into_iter()
@@ -317,7 +346,7 @@ where
                 .filter(|(c, _)| online.binary_search(c).is_ok())
                 .map(|(_, poly)| poly)
                 .collect();
-            if layout.is_grouped(t) {
+            if merged || layout.is_grouped(t) {
                 grouped_values.push((t, values));
                 trace_oracles.push(None);
                 continue;
@@ -448,7 +477,7 @@ where
     let grouped_aux_oracle = timed!(timing, "compute auxiliary commitments", {
         let mut grouped_values: Vec<(usize, Vec<PolynomialValues<F>>)> = Vec::new();
         for (t, aux) in aux_polys_per_table.into_iter().enumerate() {
-            if layout.is_grouped(t) {
+            if merged || layout.is_grouped(t) {
                 grouped_values.push((t, aux));
                 aux_oracles.push(None);
                 continue;
@@ -544,13 +573,16 @@ where
     // at `(0, 0)`, grouped tables address the shared multi-height oracle.
     let role_oracle = |role: BatchRole, t: usize| -> (&BatchFriOracle<F, C, D>, usize, usize) {
         let (oracle, grouped) = match role {
-            BatchRole::Trace if layout.is_grouped(t) => (&grouped_trace_oracle, true),
+            BatchRole::Trace if merged || layout.is_grouped(t) => (&grouped_trace_oracle, true),
             BatchRole::Trace => (&trace_oracles[t], false),
-            BatchRole::Auxiliary if layout.is_grouped(t) => (&grouped_aux_oracle, true),
+            BatchRole::Auxiliary if merged || layout.is_grouped(t) => (&grouped_aux_oracle, true),
             BatchRole::Auxiliary => (&aux_oracles[t], false),
             BatchRole::Quotient => unreachable!("quotient oracles are not read back"),
         };
-        let (degree_index, leaf_offset) = if grouped {
+        let (degree_index, leaf_offset) = if merged {
+            let start = layout.merged_poly_start(role, t);
+            (oracle.as_ref().unwrap().digest_leaf_index(start), 0)
+        } else if grouped {
             layout.grouped_leaf_position(role, t)
         } else {
             (0, 0)
@@ -611,7 +643,7 @@ where
         let mut grouped_coeffs: Vec<(usize, Vec<PolynomialCoeffs<F>>)> = Vec::new();
         for (t, chunks) in quotient_chunks_per_table.into_iter().enumerate() {
             let coeffs = chunks.unwrap_or_default();
-            if layout.is_grouped(t) {
+            if merged || layout.is_grouped(t) {
                 grouped_coeffs.push((t, coeffs));
                 quotient_oracles.push(None);
                 continue;
@@ -637,7 +669,18 @@ where
         // Same canonical order as `commit_grouped`; quotient chunks each have
         // their table's trace degree, so the sort key is unchanged.
         grouped_coeffs.retain(|(_, coeffs)| !coeffs.is_empty());
-        grouped_coeffs.sort_by_key(|&(t, _)| (core::cmp::Reverse(degree_bits[t]), t));
+        if !merged {
+            grouped_coeffs.sort_by_key(|&(t, _)| (core::cmp::Reverse(degree_bits[t]), t));
+        }
+        let mut start = 0;
+        let ranges = grouped_coeffs
+            .iter()
+            .map(|(_, coeffs)| {
+                let range = start..start + coeffs.len();
+                start = range.end;
+                range
+            })
+            .collect();
         if grouped_coeffs.is_empty() {
             None
         } else {
@@ -646,14 +689,20 @@ where
                 .flat_map(|(_, coeffs)| coeffs)
                 .collect();
             let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; coeffs.len()];
-            let oracle = BatchFriOracle::from_coeffs(
-                coeffs,
-                rate_bits,
-                false,
-                cap_height,
-                timing,
-                &fft_tables,
-            );
+            let oracle = if merged {
+                BatchFriOracle::from_coeffs_with_digests(
+                    coeffs, ranges, rate_bits, cap_height, timing,
+                )
+            } else {
+                BatchFriOracle::from_coeffs(
+                    coeffs,
+                    rate_bits,
+                    false,
+                    cap_height,
+                    timing,
+                    &fft_tables,
+                )
+            };
             quotient_polys_caps
                 .as_mut()
                 .expect("grouped quotient polys imply has_quotient")
@@ -679,7 +728,7 @@ where
     // Resolves table `t`'s `role` oracle and the flat index of the table's
     // first polynomial within it (0 for solo tables).
     let poly_range = |role: BatchRole, t: usize| -> (&BatchFriOracle<F, C, D>, usize) {
-        let oracle = match (role, layout.is_grouped(t)) {
+        let oracle = match (role, merged || layout.is_grouped(t)) {
             (BatchRole::Trace, true) => &grouped_trace_oracle,
             (BatchRole::Trace, false) => &trace_oracles[t],
             (BatchRole::Auxiliary, true) => &grouped_aux_oracle,
@@ -687,7 +736,9 @@ where
             (BatchRole::Quotient, true) => &grouped_quotient_oracle,
             (BatchRole::Quotient, false) => &quotient_oracles[t],
         };
-        let start = if layout.is_grouped(t) {
+        let start = if merged {
+            layout.merged_poly_start(role, t)
+        } else if layout.is_grouped(t) {
             layout.grouped_poly_start(role, t)
         } else {
             0
@@ -737,6 +788,9 @@ where
             BatchOracle::GroupedTrace => grouped_trace_oracle.as_ref().unwrap(),
             BatchOracle::GroupedAuxiliary => grouped_aux_oracle.as_ref().unwrap(),
             BatchOracle::GroupedQuotient => grouped_quotient_oracle.as_ref().unwrap(),
+            BatchOracle::Merged(BatchRole::Trace) => grouped_trace_oracle.as_ref().unwrap(),
+            BatchOracle::Merged(BatchRole::Auxiliary) => grouped_aux_oracle.as_ref().unwrap(),
+            BatchOracle::Merged(BatchRole::Quotient) => grouped_quotient_oracle.as_ref().unwrap(),
         })
         .collect();
     let opening_proof = timed!(

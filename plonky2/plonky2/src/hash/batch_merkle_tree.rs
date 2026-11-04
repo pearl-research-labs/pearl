@@ -31,13 +31,15 @@ pub struct BatchMerkleTree<F: RichField, H: Hasher<F>> {
 impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
     /// Each element in the `leaves` vector represents a matrix (a vector of vectors).
     /// The height of each matrix should be a power of two.
-    /// The `leaves` vector should be sorted by matrix height, from tallest to shortest, with no duplicate heights.
+    /// The `leaves` vector should be sorted by matrix height, from tallest to shortest.
+    /// Matrices of equal height are chained: each is injected at that height in vector
+    /// order, contributing no siblings of its own.
     pub fn new(mut leaves: Vec<Vec<Vec<F>>>, cap_height: usize) -> Self {
         assert!(!leaves.is_empty());
         assert!(leaves.iter().all(|leaf| leaf.len().is_power_of_two()));
         assert!(leaves
             .windows(2)
-            .all(|pair| { pair[0].len() > pair[1].len() }));
+            .all(|pair| { pair[0].len() >= pair[1].len() }));
 
         let last_leaves_cap_height = log2_strict(leaves.last().unwrap().len());
         assert!(
@@ -56,7 +58,7 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
         let mut cap = vec![];
         let dummy_leaves = vec![vec![F::ZERO]; 1 << cap_height];
         leaves.push(dummy_leaves);
-        for window in leaves.windows(2) {
+        for (w, window) in leaves.windows(2).enumerate() {
             let cur = &window[0];
             let next = &window[1];
 
@@ -68,7 +70,7 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
 
             let num_tmp_digests = 2 * (cur_leaf_len - next_cap_len);
 
-            if cur_leaf_len == leaves_len {
+            if w == 0 {
                 // The bottom leaf layer
                 cap = Vec::with_capacity(next_cap_len);
                 let tmp_cap_buf = capacity_up_to_mut(&mut cap, next_cap_len);
@@ -301,6 +303,34 @@ mod tests {
             BatchMerkleTree::new(vec![leaves_1, leaves_2, leaves_3], 3);
         for index in [0, 1023, 512, 255] {
             let proof = fmt.open_batch(index);
+            let opened_values = fmt.values(index);
+            verify_batch_merkle_proof_to_cap(
+                &opened_values,
+                &fmt.leaf_heights,
+                index,
+                &fmt.cap,
+                &proof,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_batch_merkle_trees_tied_heights() -> Result<()> {
+        // Chained ties at the top (two matrices at 1024) and mid-walk (two at 64).
+        let leaves_1 = crate::hash::merkle_tree::tests::random_data::<F>(1024, 4);
+        let leaves_2 = crate::hash::merkle_tree::tests::random_data::<F>(1024, 7);
+        let leaves_3 = crate::hash::merkle_tree::tests::random_data::<F>(64, 3);
+        let leaves_4 = crate::hash::merkle_tree::tests::random_data::<F>(64, 100);
+        let leaves_5 = crate::hash::merkle_tree::tests::random_data::<F>(32, 2);
+
+        let fmt: BatchMerkleTree<GoldilocksField, H> =
+            BatchMerkleTree::new(vec![leaves_1, leaves_2, leaves_3, leaves_4, leaves_5], 3);
+        assert_eq!(fmt.leaf_heights, vec![10, 10, 6, 6, 5]);
+        for index in [0, 1023, 512, 255] {
+            let proof = fmt.open_batch(index);
+            assert_eq!(proof.siblings.len(), 10 - 3);
             let opened_values = fmt.values(index);
             verify_batch_merkle_proof_to_cap(
                 &opened_values,

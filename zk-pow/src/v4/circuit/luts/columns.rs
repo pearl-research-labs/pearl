@@ -13,6 +13,7 @@ pub const fn num_slots(table: LutTable) -> usize {
         LutTable::B200Align => 72,   // one per REL in [0, 71]
         LutTable::WidthNorm => 16,   // GROUP_SUM_ABS in [0, 2^20)
         LutTable::Pow2G => 4,        // carry, two gap ranges, normalization
+        LutTable::Xor8 => 3,         // plain, rotate-by-12 and rotate-by-7 fragments
         _ => 1,
     }
 }
@@ -20,9 +21,13 @@ pub const fn num_slots(table: LutTable) -> usize {
 /// Live rows per slot (the key-domain size; [`lut_height`] rounds it up to the AIR height).
 pub const fn slot_height(table: LutTable) -> usize {
     match table {
-        LutTable::Range16 | LutTable::Bytes2 | LutTable::Qcast | LutTable::Div448 | LutTable::Width16 | LutTable::Log16 => {
-            1 << 16
-        }
+        LutTable::Range16
+        | LutTable::Bytes2
+        | LutTable::Xor8
+        | LutTable::Qcast
+        | LutTable::Div448
+        | LutTable::Width16
+        | LutTable::Log16 => 1 << 16,
         LutTable::Pair128 => 1 << 14,
         LutTable::Int8Dec => 256,
         LutTable::ExpInfo => 255, // keys [0, 254]; the inf/NaN field 255 has no row
@@ -42,11 +47,11 @@ pub const fn lut_height(table: LutTable) -> usize {
     slot_height(table).next_power_of_two()
 }
 
-/// Stored key columns: the enumerated tuple for BYTES2/PAIR128, one ramp or saturated key
-/// column otherwise.
+/// Stored key columns: the enumerated tuple for BYTES2/PAIR128/XOR8, one ramp or saturated
+/// key column otherwise.
 const fn num_key_columns(table: LutTable) -> usize {
     match table {
-        LutTable::Bytes2 | LutTable::Pair128 => 2,
+        LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 => 2,
         _ => 1,
     }
 }
@@ -63,6 +68,7 @@ const fn num_value_columns(table: LutTable) -> usize {
         | LutTable::Pow2Gb
         | LutTable::Log16 => 1,
         LutTable::Width32 | LutTable::Width16 => 2,
+        LutTable::Xor8 => 3, // x ^ y and its two high fragments
         LutTable::Int8Dec => 4,
         LutTable::WidthNorm => 6, // slot-zero outputs and four right-shifted ramps
         LutTable::Pow2G => 7,     // two saturated keys and five values
@@ -155,6 +161,18 @@ pub fn lut_slot_layout<F: Field>(table: LutTable, slot: usize) -> LutSlotLayout<
         | LutTable::Log16 => (0, vec![Column::single(nk)]),
         LutTable::Width32 | LutTable::Width16 => (0, Column::singles([nk, nk + 1]).collect()),
         LutTable::Int8Dec => (0, Column::singles(nk..nk + 4).collect()),
+        // Columns 2, 3, 4 hold x ^ y, (x ^ y) >> 4, (x ^ y) >> 7; the constant tag pins the slot.
+        LutTable::Xor8 => {
+            let high = if slot == 0 {
+                Column::constant(F::ZERO)
+            } else {
+                Column::single(nk + slot)
+            };
+            (
+                0,
+                vec![Column::single(nk), high, Column::constant(F::from_canonical_usize(slot))],
+            )
+        }
         LutTable::ProdAlign15 | LutTable::B200Align => {
             let shift = if table == LutTable::ProdAlign15 { 7 } else { 19 };
             let aligned = if slot <= shift {

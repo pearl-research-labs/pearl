@@ -1,7 +1,7 @@
 //! ZK FP8: the multi-STARK proving system for prequant FP8 proof-of-work.
 //!
 //! Five main tables connected by cross-table lookups, all lookups (range checks included)
-//! targeting the precommitted consensus LUT oracle — fifteen more tables of the same batch,
+//! targeting the precommitted consensus LUT oracle — sixteen more tables of the same batch,
 //! one AIR per logical LUT. Each table's `stark.rs` module docs carry its full mathematical
 //! description:
 //!
@@ -11,9 +11,9 @@
 //! 4. Device-specific Matmul — H100 WGMMA ([`matmul_h100`]) or B200 tcgen05
 //!    ([`matmul_b200_stark`]).
 //! 5. XorFoldStark — lottery extractor folds: [`xor_fold_stark`].
-//! 6. The device's fifteen `LutStark`s: [`luts`], batch tables 5..19.
+//! 6. The device's sixteen `LutStark`s: [`luts`], batch tables 5..20.
 //!
-//! [`ctl`] carries the table indices and assembles every channel (six main channels +
+//! [`ctl`] carries the table indices and assembles every channel (seven main channels +
 //! one per LUT). Each table keeps its halves in its own `ctl` submodule. [`luts`] owns
 //! the LUT descriptors, column layouts, AIRs, witness multiplicities, and setup-time
 //! precommitment; [`driver`] assembles the per-table class (a) columns the batch verifier
