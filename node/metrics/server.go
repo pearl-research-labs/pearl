@@ -137,4 +137,12 @@ func (s *Server) Stop() {
 	for _, srv := range s.httpServers {
 		_ = srv.Shutdown(ctx)
 	}
+
+	// Serve takes ownership of each listener and closes it. Listeners never handed to Serve are
+	// still ours to close.
+	if !s.started {
+		for _, l := range s.listeners {
+			_ = l.Close()
+		}
+	}
 }

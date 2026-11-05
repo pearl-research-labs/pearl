@@ -3,6 +3,7 @@ package metrics
 import (
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -123,4 +124,17 @@ func TestServerAndPprofIsolation(t *testing.T) {
 
 	assert.Equal(t, http.StatusNotFound, pprofResp.StatusCode,
 		"Metrics endpoint MUST NOT expose DefaultServeMux or /debug/pprof/")
+}
+
+// A server stopped before Start must release its ports.
+func TestStopWithoutStartReleasesListeners(t *testing.T) {
+	server, err := NewServer([]string{"127.0.0.1:0"})
+	require.NoError(t, err)
+	addr := server.ListenAddrs()[0]
+
+	server.Stop()
+
+	l, err := net.Listen("tcp", addr)
+	require.NoError(t, err, "port %s is still bound after Stop", addr)
+	require.NoError(t, l.Close())
 }
