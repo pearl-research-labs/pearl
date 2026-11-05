@@ -228,9 +228,6 @@ func SanitizeRPCMethod(method string) string {
 	knownRPCMethodsMu.RLock()
 	defer knownRPCMethodsMu.RUnlock()
 
-	if knownRPCMethods == nil {
-		return method
-	}
 	if _, ok := knownRPCMethods[method]; ok {
 		return method
 	}
