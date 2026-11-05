@@ -28,22 +28,3 @@ func (noopMetrics) Reorganized(int)                      {}
 func (noopMetrics) BlockSanityChecked(time.Duration)     {}
 func (noopMetrics) UtxoCacheFlushed(time.Duration)       {}
 func (noopMetrics) UtxoCacheChanged(int, uint64, uint64) {}
-
-// OrphanCount returns the number of orphan blocks held.
-//
-// This function is safe for concurrent access.
-func (b *BlockChain) OrphanCount() int {
-	b.orphanLock.RLock()
-	defer b.orphanLock.RUnlock()
-
-	return len(b.orphans)
-}
-
-// reportUtxoCache pushes the UTXO cache occupancy to Metrics. Readers cannot pull it on demand
-// without taking the chain lock, which a flush can hold for minutes.
-//
-// This function MUST be called with the chain state lock held, or before the chain is shared.
-func (b *BlockChain) reportUtxoCache() {
-	b.metrics.UtxoCacheChanged(b.utxoCache.cachedEntries.length(), b.utxoCache.totalMemoryUsage(),
-		b.utxoCache.maxTotalMemoryUsage)
-}

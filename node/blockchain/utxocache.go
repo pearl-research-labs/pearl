@@ -658,6 +658,15 @@ func (b *BlockChain) flushUtxoCache(dbTx database.Tx, mode FlushMode, bestState 
 	return nil
 }
 
+// reportUtxoCache pushes the UTXO cache occupancy to Metrics. Readers cannot pull it on demand
+// without taking the chain lock, which a flush can hold for minutes.
+//
+// This function MUST be called with the chain state lock held, or before the chain is shared.
+func (b *BlockChain) reportUtxoCache() {
+	b.metrics.UtxoCacheChanged(b.utxoCache.cachedEntries.length(), b.utxoCache.totalMemoryUsage(),
+		b.utxoCache.maxTotalMemoryUsage)
+}
+
 // FlushUtxoCache flushes the UTXO state to the database if a flush is needed with the
 // given flush mode.
 //

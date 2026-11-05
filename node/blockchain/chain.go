@@ -274,6 +274,16 @@ func (b *BlockChain) MissingAncestor(hash *chainhash.Hash) *chainhash.Hash {
 	return &root.block.MsgBlock().BlockHeader().PrevBlock
 }
 
+// OrphanCount returns the number of orphan blocks held.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) OrphanCount() int {
+	b.orphanLock.RLock()
+	defer b.orphanLock.RUnlock()
+
+	return len(b.orphans)
+}
+
 // removeOrphanBlock removes the passed orphan block from the orphan pool and
 // previous orphan index.
 func (b *BlockChain) removeOrphanBlock(orphan *orphanBlock) {
