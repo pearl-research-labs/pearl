@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,9 +14,33 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// A native-only timing gives text-format readers, and any Prometheus not ingesting native histograms,
+// no buckets to compute quantiles from.
+func TestTimingsExposeBothForms(t *testing.T) {
+	RecordRPCRequest("getblock", time.Millisecond, nil)
+
+	families, err := registry.Gather()
+	require.NoError(t, err)
+
+	timings := 0
+	for _, mf := range families {
+		if mf.GetType() != dto.MetricType_HISTOGRAM || !strings.HasSuffix(mf.GetName(), "_seconds") {
+			continue
+		}
+		timings++
+		for _, m := range mf.GetMetric() {
+			h := m.GetHistogram()
+			assert.Len(t, h.GetBucket(), len(timingBuckets), "%s classic buckets", mf.GetName())
+			assert.NotNil(t, h.Schema, "%s native schema", mf.GetName())
+		}
+	}
+	assert.GreaterOrEqual(t, timings, 5)
+}
 
 func TestMethodSanitization(t *testing.T) {
 	InitKnownRPCMethods([]string{"getblock", "getpeerinfo", "getmempoolinfo"})

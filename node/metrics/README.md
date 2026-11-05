@@ -100,7 +100,7 @@ stalls between scrapes.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `pearld_rpc_requests_total` | Counter | `method`, `result` | Requests processed |
-| `pearld_rpc_request_duration_seconds` | Native histogram | `method` | Handler execution latency |
+| `pearld_rpc_request_duration_seconds` | Histogram | `method` | Handler execution latency |
 | `pearld_rpc_auth_failures_total` | Counter | | Failed authentication attempts, over HTTP Basic auth or the WebSocket `authenticate` command |
 | `pearld_rpc_websocket_clients` | Gauge | | Connected WebSocket clients |
 
@@ -121,8 +121,9 @@ caller cannot inflate series count with arbitrary method names.
 
 ### Timings
 
-Timings are native histograms: buckets grow exponentially. Only
-successful work is timed.
+Timings are histograms exposed in two forms: native, with buckets √2 apart, and
+classic, with buckets from 100µs to 250s in 1–2.5–5 steps. Only successful work
+is timed.
 
 | Metric | Measures |
 |--------|----------|
@@ -132,9 +133,14 @@ successful work is timed.
 | `pearld_utxo_cache_flush_duration_seconds` | Writing the UTXO cache into a flush transaction (database commit excluded) |
 | `pearld_rpc_request_duration_seconds` | JSON-RPC handler execution, per `method` |
 
-Native histograms are only sent over the protobuf format, so enable them on the Prometheus
-server (`scrape_native_histograms: true`, or `--enable-feature=native-histograms` on older
-versions). Then, for any window:
+Native histograms are only sent over the protobuf format, and Prometheus ingests
+them only when enabled (`scrape_native_histograms: true`, or
+`--enable-feature=native-histograms` on older versions). Text-format readers and
+servers without it read the classic buckets. A server with it enabled stores only
+the native form unless `always_scrape_classic_histograms` is also set, so
+exposing both costs no extra storage.
+
+With native histograms, for any window:
 
 ```promql
 histogram_avg(rate(pearld_chain_block_process_duration_seconds[5m]))
@@ -142,6 +148,12 @@ histogram_stddev(rate(pearld_chain_block_process_duration_seconds[5m]))
 histogram_stddev(rate(pearld_chain_block_process_duration_seconds[5m]))
   / sqrt(histogram_count(increase(pearld_chain_block_process_duration_seconds[5m])))  # stderr
 histogram_quantile(0.99, rate(pearld_chain_block_process_duration_seconds[5m]))
+```
+
+With classic buckets:
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(pearld_chain_block_process_duration_seconds_bucket[5m])))
 ```
 
 ## Scraping

@@ -222,13 +222,22 @@ func init() {
 	)
 }
 
-// timingOpts configures a native histogram with buckets √2 apart, capped at 34 (wider ranges halve
-// the resolution). PromQL's histogram_avg, histogram_stddev and histogram_quantile apply.
+// timingBuckets are the classic buckets timings expose beside their native ones, for consumers that
+// cannot read native histograms: the text format has no encoding for them, and Prometheus ingests them
+// only when configured to. The range spans a mempool transaction through a UTXO flush.
+var timingBuckets = []float64{
+	0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+	0.25, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250,
+}
+
+// timingOpts configures a histogram exposed in both forms: native, with buckets √2 apart capped at 34
+// (wider ranges halve the resolution), and classic, with timingBuckets.
 func timingOpts(name, help string) prometheus.HistogramOpts {
 	return prometheus.HistogramOpts{
 		Namespace:                      Namespace,
 		Name:                           name,
 		Help:                           help,
+		Buckets:                        timingBuckets,
 		NativeHistogramBucketFactor:    1.5,
 		NativeHistogramMaxBucketNumber: 34,
 	}
