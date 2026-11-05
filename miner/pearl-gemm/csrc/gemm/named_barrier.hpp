@@ -19,5 +19,10 @@ enum class NamedBarriers {
   DenoiseConvertEAxBpEBWrite = 8,
   Epilogue = 9,
   LoadScales = 10,
+  // Path 3 (Blackwell consumer SMEM-fit): signals that WGMMA1's consumer
+  // has released phase-1 denoise SMEM (EAL + EARxBpEB), so the producer
+  // may safely overwrite the aliased SMEM with phase-2 (AxEBL + EBR) TMA
+  // loads. Arrival count: kNumMmaThreads + NumThreadsPerWarp.
+  DenoisePhase1Consumed = 11,
 };
 }
