@@ -145,9 +145,12 @@ pub fn generate_partial_witness_fast<
     let values_ptr = AtomicPtr::new(witness.values.as_mut_ptr());
 
     for layer in layers {
-        // Each thread processes a chunk of generators
+        // Each rayon task processes a chunk of generators. The chunk is sized
+        // so each task does real work (the generators are tiny arithmetic ops),
+        // instead of paying scheduling per 4 generators.
+        let chunk = layer.len().div_ceil(96 * 8).clamp(4, 512);
         layer
-            .par_chunks(4)
+            .par_chunks(chunk)
             .for_each_init(GeneratedValues::empty, |buffer, chunk| {
                 let ptr = values_ptr.load(Ordering::Relaxed);
                 for &generator_idx in chunk {

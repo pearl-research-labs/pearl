@@ -25,10 +25,14 @@ use plonky2::plonk::plonk_common::{
     reduce_with_powers, reduce_with_powers_circuit, reduce_with_powers_ext_circuit,
 };
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
+use plonky2_maybe_rayon::*;
 
 use crate::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsumer};
 use crate::evaluation_frame::StarkEvaluationFrame;
 use crate::stark::Stark;
+
+/// Row-chunk granularity for parallel row-map passes in this module.
+const PAR_CHUNK: usize = 1 << 14;
 
 /// Represents a filter, which evaluates to 1 if the row must be considered and 0 if it should be ignored.
 /// It's an arbitrary degree 2 combination of columns: `products` are the degree 2 terms, and `constants` are
@@ -141,6 +145,12 @@ impl<F: Field> Filter<F> {
                 .sum()
     }
 
+    /// Read-only access to the compiled terms (consumed by the LUT counting
+    /// fast path, which compiles a walk plan once per inventory).
+    pub fn parts(&self) -> (&[(Column<F>, Column<F>)], &[Column<F>]) {
+        (&self.products, &self.constants)
+    }
+
     /// Evaluates the filter on all rows, with the public inputs.
     /// Optimized for batch evaluation
     pub fn eval_all_rows_with_inputs(
@@ -156,19 +166,27 @@ impl<F: Field> Filter<F> {
             let col1_vals = col1.eval_all_rows_with_inputs(table, public_inputs);
             let col2_vals = col2.eval_all_rows_with_inputs(table, public_inputs);
             result
-                .iter_mut()
-                .zip(col1_vals.iter())
-                .zip(col2_vals.iter())
-                .for_each(|((r, v1), v2)| *r += *v1 * *v2);
+                .par_chunks_mut(PAR_CHUNK)
+                .zip(col1_vals.par_chunks(PAR_CHUNK))
+                .zip(col2_vals.par_chunks(PAR_CHUNK))
+                .for_each(|((r, v1), v2)| {
+                    for ((r, v1), v2) in r.iter_mut().zip(v1).zip(v2) {
+                        *r += *v1 * *v2;
+                    }
+                });
         }
 
         // Accumulate linear terms
         for col in &self.constants {
             let col_vals = col.eval_all_rows_with_inputs(table, public_inputs);
             result
-                .iter_mut()
-                .zip(col_vals.iter())
-                .for_each(|(r, v)| *r += *v);
+                .par_chunks_mut(PAR_CHUNK)
+                .zip(col_vals.par_chunks(PAR_CHUNK))
+                .for_each(|(r, vals)| {
+                    for (r, v) in r.iter_mut().zip(vals) {
+                        *r += *v;
+                    }
+                });
         }
 
         result
@@ -561,6 +579,18 @@ impl<F: Field> Column<F> {
             + self.constant
     }
 
+    /// Read-only access to the compiled terms (consumed by the LUT counting
+    /// fast path, which compiles a walk plan once per inventory).
+    pub fn parts(&self) -> (&[(usize, F)], &[(usize, F)], &[(usize, usize)], &[usize], F) {
+        (
+            &self.linear_combination,
+            &self.next_row_linear_combination,
+            &self.public_input_scaled,
+            &self.public_input_offsets,
+            self.constant,
+        )
+    }
+
     /// Evaluates the column on all rows, with the public inputs.
     /// Optimized for batch evaluation.
     pub fn eval_all_rows_with_inputs(
@@ -588,17 +618,27 @@ impl<F: Field> Column<F> {
         for (col_idx, factor) in self.linear_combination.iter().copied().chain(scaled) {
             let col_values = &table[col_idx].values;
             result
-                .iter_mut()
-                .zip(col_values.iter())
-                .for_each(|(r, v)| *r += *v * factor);
+                .par_chunks_mut(PAR_CHUNK)
+                .zip(col_values.par_chunks(PAR_CHUNK))
+                .for_each(|(r, vals)| {
+                    for (r, v) in r.iter_mut().zip(vals) {
+                        *r += *v * factor;
+                    }
+                });
         }
 
         // Accumulate next-row linear combination terms
         for &(col_idx, factor) in &self.next_row_linear_combination {
             let col_values = &table[col_idx].values;
-            for (i, r) in result.iter_mut().enumerate() {
-                *r += col_values[(i + 1) % num_rows] * factor;
-            }
+            result
+                .par_chunks_mut(PAR_CHUNK)
+                .enumerate()
+                .for_each(|(ci, r)| {
+                    let lo = ci * PAR_CHUNK;
+                    for (i, r) in r.iter_mut().enumerate() {
+                        *r += col_values[(lo + i + 1) % num_rows] * factor;
+                    }
+                });
         }
 
         result
@@ -773,6 +813,23 @@ impl<F: Field> GrandProductChallenge<F> {
         T::IntoIter: DoubleEndedIterator,
     {
         reduce_with_powers(terms, FE::from_basefield(self.beta)) + FE::from_basefield(self.gamma)
+    }
+
+    /// Like [`Self::combine`], but takes an iterator of owned values, so tuples can be
+    /// evaluated and compressed on demand without materializing them.
+    pub fn combine_owned<FE, P, T: IntoIterator<Item = P>, const D2: usize>(&self, terms: T) -> P
+    where
+        FE: FieldExtension<D2, BaseField = F>,
+        P: PackedField<Scalar = FE>,
+        T::IntoIter: DoubleEndedIterator,
+    {
+        let beta = FE::from_basefield(self.beta);
+        let gamma = FE::from_basefield(self.gamma);
+        terms
+            .into_iter()
+            .rev()
+            .fold(P::ZEROS, |acc, term| acc * beta + term)
+            + gamma
     }
 
     /// Like `combine`, but takes an iterator of owned values instead of references.
@@ -1015,9 +1072,13 @@ fn constrain_helper_columns<P: PackedField>(
 }
 
 /// Given data associated to a lookup, check the associated helper polynomials.
+///
+/// Each column tuple is evaluated and challenge-combined on demand (each tuple is
+/// consumed exactly once per chunk of the helper-column walk), so no per-point
+/// `Vec` of tuple evaluations is materialized.
 pub(crate) fn eval_helper_columns<F, FE, P, const D: usize, const D2: usize>(
     filter: &[Filter<F>],
-    columns: &[Vec<P>],
+    columns: &[&[Column<F>]],
     local_values: &[P],
     next_values: &[P],
     public_inputs: &[FE],
@@ -1035,7 +1096,13 @@ pub(crate) fn eval_helper_columns<F, FE, P, const D: usize, const D2: usize>(
     }
     constrain_helper_columns(
         columns.len(),
-        |i| challenges.combine(&columns[i]),
+        |i| {
+            challenges.combine_owned(
+                columns[i]
+                    .iter()
+                    .map(|c| c.eval_with_next(local_values, next_values, public_inputs)),
+            )
+        },
         |i| filter[i].eval_filter(local_values, next_values, public_inputs),
         helper_columns,
         constraint_degree,

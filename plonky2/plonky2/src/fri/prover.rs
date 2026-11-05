@@ -17,6 +17,7 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
+use crate::util::fft_par::coset_fft_par;
 use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
 
@@ -116,7 +117,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
                 .collect::<Vec<_>>(),
         );
         shift = shift.exp_u64(arity as u64);
-        values = coeffs.coset_fft(shift.into())
+        values = coset_fft_par(&coeffs, shift.into())
     }
 
     // When verifying this proof in a circuit with a different number of query steps,
