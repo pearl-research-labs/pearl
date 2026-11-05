@@ -265,9 +265,15 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
 	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
 
+	// Stop can clear the chain client while a disconnect is still being handled.
+	client, err := w.requireChainClient()
+	if err != nil {
+		return err
+	}
+
 	// A disconnect can arrive after the backend has switched back to the block, for example as a duplicate from the
 	// other notification producer. Acting on it would roll back history that the chain still has or has not reached.
-	onChain, err := chainHasBlock(w.ChainClient(), &b.Block)
+	onChain, err := chainHasBlock(client, &b.Block)
 	if err != nil {
 		return err
 	}
@@ -382,7 +388,10 @@ func (w *Wallet) rollbackBlockHistory(ns walletdb.ReadWriteBucket, height int32)
 func (w *Wallet) partitionBlockHistory(ns walletdb.ReadBucket, height int32) (
 	[]wtxmgr.TxDetails, []wtxmgr.TxDetails, error) {
 
-	client := w.ChainClient()
+	client, err := w.requireChainClient()
+	if err != nil {
+		return nil, nil, err
+	}
 
 	_, tipHeight, err := client.GetBestBlock()
 	if err != nil {
@@ -584,7 +593,12 @@ func (w *Wallet) disconnectedBlockStamp(ns walletdb.ReadBucket, block *wtxmgr.Bl
 		return nil, err
 	}
 
-	header, err := w.ChainClient().GetBlockHeader(hash)
+	client, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+
+	header, err := client.GetBlockHeader(hash)
 	if err != nil {
 		return nil, err
 	}

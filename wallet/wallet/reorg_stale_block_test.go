@@ -680,3 +680,23 @@ func TestDisconnectBlockStillOnChainLaggingBackend(t *testing.T) {
 	assert.True(t, hasStoredCredit(t, w, aboveTip))
 	assert.Equal(t, forkHeight+2, w.Manager.SyncedTo().Height)
 }
+
+// TestDisconnectBlockWithoutChainClient ensures a disconnect handled after Stop has cleared the chain client fails
+// without touching the wallet's history, rather than crashing the wallet.
+func TestDisconnectBlockWithoutChainClient(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	coinbase := mineCoinbase(t, w, orphanedBranch, forkHeight+1)
+	syncManagerTo(t, w, orphanedBranch, forkHeight-1, forkHeight+1)
+	setBirthdayBlock(t, w)
+	w.chainClient = nil
+
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		return w.disconnectBlock(tx, blockMeta(orphanedBranch, forkHeight+1))
+	})
+	require.Error(t, err)
+
+	assert.True(t, hasStoredCredit(t, w, coinbase))
+	assert.Equal(t, forkHeight+1, w.Manager.SyncedTo().Height)
+}
