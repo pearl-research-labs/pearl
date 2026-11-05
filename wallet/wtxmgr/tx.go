@@ -228,6 +228,11 @@ type Store struct {
 	// Event callbacks.  These execute in the same goroutine as the wtxmgr
 	// caller.
 	NotifyUnspent func(hash *chainhash.Hash, index uint32)
+
+	// ChainConfirmations, when set, returns how many confirmations the chain gives a block, or zero when the chain does
+	// not have it. Releasing a confirmation-controlled lease by height alone would count blocks of a branch that
+	// replaced the spend's block before the wallet processed the reorg.
+	ChainConfirmations func(block *Block) uint32
 }
 
 // Open opens the wallet transaction store from a walletdb namespace.  If the
@@ -240,7 +245,7 @@ func Open(ns walletdb.ReadBucket, chainParams *chaincfg.Params) (*Store, error) 
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{chainParams, clock.NewDefaultClock(), nil} // TODO: set callbacks
+	s := &Store{chainParams, clock.NewDefaultClock(), nil, nil} // TODO: set callbacks
 	return s, nil
 }
 
@@ -1452,7 +1457,13 @@ func (s *Store) DeleteExpiredLockedOutputs(ns walletdb.ReadWriteBucket) error {
 // requested release depth. These leases ignore wall-clock expiration throughout their lifetime and otherwise require
 // explicit release.
 func (s *Store) DeleteMaturedLockedOutputs(ns walletdb.ReadWriteBucket, chainHeight int32) error {
-	var maturedOutputs []wire.OutPoint
+	type maturedOutput struct {
+		op                     wire.OutPoint
+		releaseAfterSpendConfs uint32
+		spendHeight            int32
+	}
+
+	var maturedOutputs []maturedOutput
 	lockedOutputs := ns.NestedReadBucket(bucketLockedOutputs)
 	if lockedOutputs == nil {
 		return nil
@@ -1473,7 +1484,7 @@ func (s *Store) DeleteMaturedLockedOutputs(ns walletdb.ReadWriteBucket, chainHei
 		if err := readCanonicalOutPoint(k, &op); err != nil {
 			return err
 		}
-		maturedOutputs = append(maturedOutputs, op)
+		maturedOutputs = append(maturedOutputs, maturedOutput{op, releaseAfterSpendConfs, spendHeight})
 
 		return nil
 	})
@@ -1481,13 +1492,37 @@ func (s *Store) DeleteMaturedLockedOutputs(ns walletdb.ReadWriteBucket, chainHei
 		return err
 	}
 
-	for _, op := range maturedOutputs {
-		if err := unlockOutput(ns, op); err != nil {
+	for _, output := range maturedOutputs {
+		buried, err := s.spendBuried(ns, output.spendHeight, output.releaseAfterSpendConfs)
+		if err != nil {
+			return err
+		}
+
+		if !buried {
+			continue
+		}
+
+		if err := unlockOutput(ns, output.op); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// spendBuried reports whether the chain still has the block recorded at spendHeight under at least confs
+// confirmations. Without ChainConfirmations, the caller's height is the only measure.
+func (s *Store) spendBuried(ns walletdb.ReadBucket, spendHeight int32, confs uint32) (bool, error) {
+	if s.ChainConfirmations == nil {
+		return true, nil
+	}
+
+	hash, err := s.BlockHash(ns, spendHeight)
+	if err != nil || hash == nil {
+		return false, err
+	}
+
+	return s.ChainConfirmations(&Block{Hash: *hash, Height: spendHeight}) >= confs, nil
 }
 
 // resetLockedOutputSpendHeights clears confirmation progress for spends in a block being disconnected by a rollback. A

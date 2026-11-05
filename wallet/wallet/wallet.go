@@ -4325,6 +4325,7 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 	w.TxStore.NotifyUnspent = func(hash *chainhash.Hash, index uint32) {
 		w.NtfnServer.notifyUnspentOutput(0, hash, index)
 	}
+	w.TxStore.ChainConfirmations = w.chainConfirmations
 
 	return w, nil
 }

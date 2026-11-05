@@ -348,7 +348,7 @@ func (w *Wallet) rollbackBlockHistory(ns walletdb.ReadWriteBucket, height int32)
 		return err
 	}
 
-	// Store holds only chain parameters, a clock and this callback. Use a private copy so replay cannot announce
+	// Store holds only chain parameters, a clock and callbacks. Use a private copy so replay cannot announce
 	// temporarily unspent credits or change notification behavior for other users of the shared store.
 	replay := *w.TxStore
 	replay.NotifyUnspent = nil
@@ -632,6 +632,27 @@ func chainBlockHash(client chainConn, height, bestHeight int32) (*chainhash.Hash
 	}
 
 	return hash, err
+}
+
+// chainConfirmations returns how many confirmations the chain gives the block, or zero when the chain does not have it
+// or cannot be asked. Zero keeps a lease that waits on the block in place until a later check.
+func (w *Wallet) chainConfirmations(block *wtxmgr.Block) uint32 {
+	client, err := w.requireChainClient()
+	if err != nil {
+		return 0
+	}
+
+	_, bestHeight, err := client.GetBestBlock()
+	if err != nil || block.Height > bestHeight {
+		return 0
+	}
+
+	hash, err := client.GetBlockHash(int64(block.Height))
+	if err != nil || hash == nil || *hash != block.Hash {
+		return 0
+	}
+
+	return uint32(bestHeight-block.Height) + 1
 }
 
 func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord, block *wtxmgr.BlockMeta) error {

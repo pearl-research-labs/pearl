@@ -3219,3 +3219,60 @@ func TestOutputLockReleaseAfterSpendAcrossReorg(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestDeleteMaturedLockedOutputsChecksChain verifies that a confirmation-controlled lease is released only once the
+// chain confirms the block its spend was recorded in deeply enough, whatever the given height counts.
+func TestDeleteMaturedLockedOutputsChecksChain(t *testing.T) {
+	t.Parallel()
+
+	store, db, err := testStore(t)
+	require.NoError(t, err)
+	defer db.Close()
+
+	creditBlock := &BlockMeta{Block: Block{Hash: chainhash.Hash{1}, Height: 100}, Time: time.Now()}
+	spendBlock := &BlockMeta{Block: Block{Hash: chainhash.Hash{2}, Height: 101}, Time: time.Now()}
+
+	creditTx := newCoinBase(btcutil.GrainPerPearl)
+	insertConfirmedCredit(t, store, db, creditTx, 0, creditBlock)
+	creditHash := creditTx.TxHash()
+	creditOutpoint := wire.OutPoint{Hash: creditHash, Index: 0}
+	spendRec, err := NewTxRecordFromMsgTx(spendOutput(&creditHash, 0, btcutil.GrainPerPearl-1000), time.Now())
+	require.NoError(t, err)
+
+	var (
+		confirmations uint32
+		checked       []Block
+	)
+	store.ChainConfirmations = func(block *Block) uint32 {
+		checked = append(checked, *block)
+
+		return confirmations
+	}
+
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(namespaceKey)
+		if _, err := store.LockOutput(ns, LockID{1}, creditOutpoint, time.Hour, WithReleaseAfterSpend(3)); err != nil {
+			return err
+		}
+		if err := store.InsertTx(ns, spendRec, spendBlock); err != nil {
+			return err
+		}
+
+		for _, confirmations = range []uint32{0, 2} {
+			if err := store.DeleteMaturedLockedOutputs(ns, 103); err != nil {
+				return err
+			}
+			assertLocked(t, ns, creditOutpoint, store.clock.Now(), true)
+		}
+
+		confirmations = 3
+		if err := store.DeleteMaturedLockedOutputs(ns, 103); err != nil {
+			return err
+		}
+		assertLocked(t, ns, creditOutpoint, store.clock.Now(), false)
+
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []Block{spendBlock.Block, spendBlock.Block, spendBlock.Block}, checked)
+}

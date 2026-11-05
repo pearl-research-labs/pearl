@@ -106,7 +106,7 @@ func (c *mockChainConn) GetBlockHeader(hash *chainhash.Hash) (*wire.BlockHeader,
 	return block.BlockHeader(), nil
 }
 
-func addMaturingOutputLock(t *testing.T, w *Wallet, spendHeight int32) {
+func addMaturingOutputLock(t *testing.T, w *Wallet, spend wtxmgr.Block) {
 	t.Helper()
 
 	creditTx := &wire.MsgTx{
@@ -120,7 +120,7 @@ func addMaturingOutputLock(t *testing.T, w *Wallet, spendHeight int32) {
 	creditBlock := &wtxmgr.BlockMeta{
 		Block: wtxmgr.Block{
 			Hash:   chainhash.Hash{1},
-			Height: spendHeight - 1,
+			Height: spend.Height - 1,
 		},
 		Time: time.Now(),
 	}
@@ -140,11 +140,8 @@ func addMaturingOutputLock(t *testing.T, w *Wallet, spendHeight int32) {
 	require.NoError(t, err)
 
 	spendBlock := &wtxmgr.BlockMeta{
-		Block: wtxmgr.Block{
-			Hash:   chainhash.Hash{2},
-			Height: spendHeight,
-		},
-		Time: time.Now(),
+		Block: spend,
+		Time:  time.Now(),
 	}
 
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
@@ -182,26 +179,56 @@ func TestCatchUpHashesMaturesOutputLocks(t *testing.T) {
 		spendHeight   = 2
 		catchUpHeight = 4
 	)
-	addMaturingOutputLock(t, w, spendHeight)
-
 	chainConn := createMockChainConn(w.chainParams.GenesisBlock, catchUpHeight, defaultBlockInterval)
+	addMaturingOutputLock(t, w, wtxmgr.Block{Hash: chainConn.blockHashes[spendHeight], Height: spendHeight})
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{getBestBlockHeight: catchUpHeight},
+		blockHashes:     map[int64]chainhash.Hash{spendHeight: chainConn.blockHashes[spendHeight]},
+	}
+
 	err := w.catchUpHashes(chainConn, catchUpHeight)
 	require.NoError(t, err)
+	require.Empty(t, lockedOutputs(t, w))
+	require.Equal(t, int32(catchUpHeight), w.Manager.SyncedTo().Height)
+}
+
+// TestCatchUpHashesKeepsReorgedSpendLease ensures a lease whose spend was recorded in a block the chain has since
+// replaced stays in place, even though the catch-up height alone counts enough confirmations.
+func TestCatchUpHashesKeepsReorgedSpendLease(t *testing.T) {
+	t.Parallel()
+
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	const (
+		spendHeight   = 2
+		catchUpHeight = 4
+	)
+	chainConn := createMockChainConn(w.chainParams.GenesisBlock, catchUpHeight, defaultBlockInterval)
+	addMaturingOutputLock(t, w, wtxmgr.Block{Hash: chainhash.Hash{2}, Height: spendHeight})
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{getBestBlockHeight: catchUpHeight},
+		blockHashes:     map[int64]chainhash.Hash{spendHeight: chainConn.blockHashes[spendHeight]},
+	}
+
+	err := w.catchUpHashes(chainConn, catchUpHeight)
+	require.NoError(t, err)
+	require.Len(t, lockedOutputs(t, w), 1)
+}
+
+func lockedOutputs(t *testing.T, w *Wallet) []*wtxmgr.LockedOutput {
+	t.Helper()
 
 	var locks []*wtxmgr.LockedOutput
-
-	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		ns := tx.ReadBucket(wtxmgrNamespaceKey)
-
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		var err error
-
-		locks, err = w.TxStore.ListLockedOutputs(ns)
+		locks, err = w.TxStore.ListLockedOutputs(tx.ReadBucket(wtxmgrNamespaceKey))
 
 		return err
 	})
 	require.NoError(t, err)
-	require.Empty(t, locks)
-	require.Equal(t, int32(catchUpHeight), w.Manager.SyncedTo().Height)
+
+	return locks
 }
 
 // mockBirthdayStore is a mock in-memory implementation of the birthdayStore interface
