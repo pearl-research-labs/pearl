@@ -10,7 +10,7 @@ use plonky2_field::packed::PackedField;
 use plonky2_field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
-use plonky2_util::log2_strict;
+use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 
 use crate::batch_fri::batch_alpha_runs;
 use crate::batch_fri::prover::batch_fri_proof_with_openings;
@@ -21,26 +21,25 @@ use crate::fri::FriParams;
 use crate::hash::batch_merkle_tree::BatchMerkleTree;
 use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::timed;
 use crate::util::fft_par::coset_fft_par;
 use crate::util::timing::TimingTree;
-use crate::util::{reverse_bits, transpose_bitrev};
+use crate::util::{reverse_bits, transpose, transpose_bitrev};
 use plonky2_field::extension::FieldExtension;
 use plonky2_field::packable::Packable;
 
 /// Hash commitment leaf rows into Merkle leaves (as field-element vectors).
 ///
-/// Delegates to the hasher's `hash_no_pad_batch`, which by default hashes
-/// rows in parallel with the scalar `hash_no_pad`; hashers with SIMD batch
-/// implementations may override it to amortize permutation work across
-/// lanes.
+/// Each row is hashed independently on the prover worker pool.
 fn hash_leaf_rows<F, C, const D: usize>(rows: &[Vec<F>]) -> Vec<Vec<F>>
 where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
 {
-    C::Hasher::hash_no_pad_batch(rows)
+    rows.par_iter()
+        .map(|row| C::Hasher::hash_no_pad(row).to_vec())
+        .collect()
 }
 
 /// `(self - self(z)) / (X - z)` with a blocked parallel scan.
@@ -188,36 +187,30 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .collect_vec();
         assert!(degree_bits.windows(2).all(|pair| { pair[0] >= pair[1] }));
 
-        // Partition into maximal same-degree groups (in order).
         let num_polynomials = polynomials.len();
-        let mut groups: Vec<Range<usize>> = Vec::new();
-        {
-            let mut group_start = 0;
-            for (i, d) in degree_bits.iter().enumerate() {
-                if i == num_polynomials - 1 || *d > degree_bits[i + 1] {
-                    groups.push(group_start..i + 1);
-                    group_start = i + 1;
-                }
+        let mut group_start = 0;
+        let mut leaves = Vec::new();
+
+        for (i, d) in degree_bits.iter().enumerate() {
+            if i == num_polynomials - 1 || *d > degree_bits[i + 1] {
+                let lde_values = timed!(
+                    timing,
+                    "FFT + blinding",
+                    PolynomialBatch::<F, C, D>::lde_values(
+                        &polynomials[group_start..i + 1],
+                        rate_bits,
+                        blinding,
+                        fft_root_table[i]
+                    )
+                );
+
+                let mut leaf_group = timed!(timing, "transpose LDEs", transpose(&lde_values));
+                reverse_index_bits_in_place(&mut leaf_group);
+                leaves.push(leaf_group);
+
+                group_start = i + 1;
             }
         }
-
-        // The degree groups are independent: run their LDE + transpose
-        // concurrently (nested parallel iterators cooperate through work
-        // stealing), instead of one group at a time with the pool idling
-        // whenever a group holds few polynomials. `leaves` keeps the
-        // original tall-first group order.
-        let leaves: Vec<Vec<Vec<F>>> = groups
-            .par_iter()
-            .map(|range| {
-                let lde_values = PolynomialBatch::<F, C, D>::lde_values(
-                    &polynomials[range.clone()],
-                    rate_bits,
-                    blinding,
-                    fft_root_table[range.start],
-                );
-                transpose_bitrev(&lde_values)
-            })
-            .collect();
 
         let batch_merkle_tree = timed!(
             timing,

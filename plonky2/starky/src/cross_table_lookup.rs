@@ -283,11 +283,14 @@ impl<F: Field> CtlData<'_, F> {
         let mut res = Vec::with_capacity(num_helpers + num_zs);
         for z in &mut self.zs_columns {
             for pv in &mut z.helper_columns {
-                res.push(core::mem::take(pv));
+                res.push(core::mem::replace(pv, PolynomialValues::new(Vec::new())));
             }
         }
         for z in &mut self.zs_columns {
-            res.push(core::mem::take(&mut z.z));
+            res.push(core::mem::replace(
+                &mut z.z,
+                PolynomialValues::new(Vec::new()),
+            ));
         }
         res
     }

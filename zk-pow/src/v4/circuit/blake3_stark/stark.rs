@@ -1425,7 +1425,7 @@ impl Blake3Program {
                 let row: &Blake3ColumnsView<F> = rows[num_rows - 1].borrow();
                 core::array::from_fn(|i| row.blake3_msg_buffer[i].to_canonical_u64() as u32)
             };
-            let mut fwd = shift_buffer(&last);
+            let mut fwd = last;
             for off in 1..=(ROWS_PER_COMPRESSION - 1) {
                 fwd = shift_buffer(&fwd);
                 let row: &mut Blake3ColumnsView<F> = rows[(num_rows - 1 + off) % num_rows].borrow_mut();
@@ -4162,6 +4162,21 @@ mod tests {
             row.row_flags_packed = pack_control(row);
         }
         rows
+    }
+
+    #[test]
+    fn blake3_parallel_fill_wraps_without_padding() {
+        let program = Blake3Program {
+            instructions: vec![Blake3Instruction::lottery()],
+            ..Default::default()
+        };
+        let data = TestData::new(1, 1, 32, 0);
+        let inputs = data.inputs();
+        let (rows, pis) = program.generate_trace::<F>(&inputs);
+        assert_eq!(rows.len(), ROWS_PER_COMPRESSION);
+        let schedule = program.native_schedule(&inputs);
+        assert_eq!(rows, serial_fill_rows::<F>(&program, &inputs, &schedule));
+        assert!(!constraints_violated(&S::new(program), &rows, &pis));
     }
 
     /// The parallel `generate_trace` fill must equal the serial reference row for row, on

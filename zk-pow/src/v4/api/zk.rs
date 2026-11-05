@@ -153,10 +153,8 @@ struct Fp8ProverSetup {
     device: Device,
     preprocessed: BatchStarkPreprocessedData<F, C, D>,
     circuits: Fp8WrapperCircuits,
-    /// The sample job the setup was compiled from: the warmup's proving target. Its
-    /// system is shape-identical to every other job's (`Fp8WrapperCircuits` are
-    /// universal per device), so warming up on it warms every future job.
-    sample_job: Fp8Job,
+    /// Public parameters of the sample job used for prover warmup.
+    sample_params: PublicParams,
 }
 
 impl Fp8ProverSetup {
@@ -169,7 +167,7 @@ impl Fp8ProverSetup {
             device,
             preprocessed,
             circuits,
-            sample_job: job,
+            sample_params: params,
         })
     }
 
@@ -180,7 +178,7 @@ impl Fp8ProverSetup {
     /// the artifact is discarded. Idempotent in effect: a second call re-proves, but
     /// `layered_generators` was already filled, so it only costs the proving time.
     fn warmup(&mut self, timing: &mut TimingTree) -> Result<()> {
-        let job = &mut self.sample_job;
+        let mut job = Fp8Job::derive(&self.sample_params, &IncompleteBlockHeader::zero())?;
         let (h, w, k) = (job.input_quant().h, job.input_quant().w, job.input_quant().k);
         let (num_aux_msgs, num_aux_cvs) = job.system.blake3_aux_bounds();
         // Zero planes and zero aux data: any witness bytes generate a valid trace (the
@@ -254,23 +252,9 @@ impl Fp8Prover {
         })
     }
 
-    /// Warms this device's prover state so the first real `prove` pays no first-call
-    /// costs: pre-generates the shared FFT root tables (`warm_fft_tables` — consult the
-    /// cache from then on instead of rebuilding tables per FFT call) and fills both
-    /// wrapper stages' `layered_generators` via a dummy prove of the setup's sample
-    /// job (discarded). One call covers every job shape on this device; the circuits
-    /// are universal, and the root tables are pure field data.
-    ///
-    /// The FFT tables are warmed for the *whole process* (both devices share them),
-    /// so calling this for a second device only pays the sample prove again.
+    /// Fills both wrapper stages' witness-generator schedules with a sample proof.
+    /// The resulting proof is discarded; subsequent proofs reuse the schedules.
     pub fn warmup_prove(&mut self, device: Device) -> Result<()> {
-        // ---- The FFT root tables: sizes 2^5..=2^23 cover the layer-0 batch STARKs
-        // (degree 2^13..=2^22 tables at rate 2) and both recursion stages' traces,
-        // commitments and FRI folds; the degree-2 extension covers the FRI fold
-        // `coset_fft`s.
-        plonky2::field::fft::warm_fft_tables::<F>(5, 23);
-        plonky2::field::fft::warm_fft_tables::<<F as plonky2::field::extension::Extendable<D>>::Extension>(5, 22);
-
         let mut timing = TimingTree::default();
         let setup = self.setup_for_device(device, &mut timing)?;
         setup.warmup(&mut timing)
