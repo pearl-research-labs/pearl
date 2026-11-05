@@ -85,23 +85,12 @@ func pearldMain(serverChan chan<- *server) error {
 	}
 
 	// Enable Prometheus metrics server if requested.
-	var metricsServer *metrics.Server
-	if len(cfg.MetricsListeners) > 0 {
-		var err error
-		metricsServer, err = metrics.NewServer(cfg.MetricsListeners)
-		if err != nil {
-			prldLog.Errorf("Unable to start metrics server on %v: %v",
-				cfg.MetricsListeners, err)
-			return err
-		}
-		metrics.SetInfo(version(), activeNetParams.Name, fmt.Sprintf("%d", peer.MaxProtocolVersion))
-		metricsServer.Start()
-		prldLog.Infof("Metrics server listening on %v", metricsServer.ListenAddrs())
-		go func() {
-			for err := range metricsServer.Errors() {
-				prldLog.Errorf("Metrics server error: %v", err)
-			}
-		}()
+	metricsServer, err := startMetricsServer(cfg.MetricsListeners)
+	if err != nil {
+		prldLog.Error(err)
+		return err
+	}
+	if metricsServer != nil {
 		defer func() {
 			prldLog.Infof("Gracefully shutting down the metrics server...")
 			metricsServer.Stop()
@@ -315,6 +304,30 @@ func pearldMain(serverChan chan<- *server) error {
 	// server.
 	<-interrupt
 	return nil
+}
+
+// startMetricsServer serves metrics on listeners and logs serve errors. It returns nil when no
+// listeners are configured.
+func startMetricsServer(listeners []string) (*metrics.Server, error) {
+	if len(listeners) == 0 {
+		return nil, nil
+	}
+
+	metrics.SetInfo(version(), activeNetParams.Name, fmt.Sprintf("%d", peer.MaxProtocolVersion))
+
+	srv, err := metrics.NewServer(listeners)
+	if err != nil {
+		return nil, fmt.Errorf("unable to start metrics server on %v: %w", listeners, err)
+	}
+	srv.Start()
+
+	prldLog.Infof("Metrics server listening on %v", srv.ListenAddrs())
+	go func() {
+		for err := range srv.Errors() {
+			prldLog.Errorf("Metrics server error: %v", err)
+		}
+	}()
+	return srv, nil
 }
 
 // removeRegressionDB removes the existing regression test database if running
