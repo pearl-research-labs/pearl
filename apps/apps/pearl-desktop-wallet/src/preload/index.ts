@@ -20,6 +20,7 @@ const windowIpc: Ipc<WindowApi> = {
   showOpenDialog: options => ipcRenderer.invoke('show-open-dialog', options),
   showSaveDialog: options => ipcRenderer.invoke('show-save-dialog', options),
   openExternal: url => ipcRenderer.invoke('open-external', url),
+  setNativeTheme: theme => ipcRenderer.invoke('window-set-native-theme', theme),
 };
 
 const walletIpc: Ipc<WalletBridgeApi> = {

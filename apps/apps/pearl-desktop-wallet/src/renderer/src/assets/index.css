@@ -70,6 +70,112 @@
   }
 }
 
+/* Palette colors used directly by pages, remapped for dark mode (see tailwind.config.ts).
+   The :root values are Tailwind's defaults, so light mode is unchanged. */
+@layer base {
+  :root {
+    --themed-bg-white: 255 255 255;
+    --themed-bg-gray-50: 249 250 251;
+    --themed-bg-gray-100: 243 244 246;
+    --themed-bg-gray-200: 229 231 235;
+    --themed-bg-gray-300: 209 213 219;
+    --themed-bg-red-50: 254 242 242;
+    --themed-bg-green-50: 240 253 244;
+    --themed-bg-green-100: 220 252 231;
+    --themed-bg-amber-50: 255 251 235;
+    --themed-bg-amber-100: 254 243 199;
+    --themed-bg-blue-50: 239 246 255;
+
+    --themed-gradient-gray-50: 249 250 251;
+    --themed-gradient-gray-100: 243 244 246;
+
+    --themed-text-gray-400: 156 163 175;
+    --themed-text-gray-500: 107 114 128;
+    --themed-text-gray-600: 75 85 99;
+    --themed-text-gray-700: 55 65 81;
+    --themed-text-gray-900: 17 24 39;
+    --themed-text-red-600: 220 38 38;
+    --themed-text-red-700: 185 28 28;
+    --themed-text-red-800: 153 27 27;
+    --themed-text-red-900: 127 29 29;
+    --themed-text-green-600: 22 163 74;
+    --themed-text-green-700: 21 128 61;
+    --themed-text-green-800: 22 101 52;
+    --themed-text-green-900: 20 83 45;
+    --themed-text-amber-600: 217 119 6;
+    --themed-text-amber-700: 180 83 9;
+    --themed-text-amber-800: 146 64 14;
+    --themed-text-amber-900: 120 53 15;
+    --themed-text-blue-700: 29 78 216;
+    --themed-text-orange-600: 234 88 12;
+    --themed-text-yellow-600: 202 138 4;
+
+    --themed-border-gray-100: 243 244 246;
+    --themed-border-gray-200: 229 231 235;
+    --themed-border-gray-300: 209 213 219;
+    --themed-border-gray-400: 156 163 175;
+    --themed-border-gray-900: 17 24 39;
+    --themed-border-red-200: 254 202 202;
+    --themed-border-red-300: 252 165 165;
+    --themed-border-green-200: 187 247 208;
+    --themed-border-green-300: 134 239 172;
+    --themed-border-amber-300: 252 211 77;
+  }
+
+  .dark {
+    /* Native inputs, scrollbars and number spinners follow the theme */
+    color-scheme: dark;
+
+    /* Surfaces built on the Grey Dark tones used by the tokens above */
+    --themed-bg-white: 49 58 58;
+    --themed-bg-gray-50: 40 47 47;
+    --themed-bg-gray-100: 60 69 69;
+    --themed-bg-gray-200: 72 82 82;
+    --themed-bg-gray-300: 86 96 96;
+    --themed-bg-red-50: 66 34 36;
+    --themed-bg-green-50: 30 56 42;
+    --themed-bg-green-100: 34 72 50;
+    --themed-bg-amber-50: 64 50 26;
+    --themed-bg-amber-100: 80 62 28;
+    --themed-bg-blue-50: 30 46 72;
+
+    --themed-gradient-gray-50: 27 32 32;
+    --themed-gradient-gray-100: 33 39 39;
+
+    --themed-text-gray-400: 120 129 129;
+    --themed-text-gray-500: 152 160 160;
+    --themed-text-gray-600: 184 191 191;
+    --themed-text-gray-700: 214 219 219;
+    --themed-text-gray-900: 240 243 243;
+    --themed-text-red-600: 248 113 113;
+    --themed-text-red-700: 252 165 165;
+    --themed-text-red-800: 254 202 202;
+    --themed-text-red-900: 254 226 226;
+    --themed-text-green-600: 74 222 128;
+    --themed-text-green-700: 134 239 172;
+    --themed-text-green-800: 187 247 208;
+    --themed-text-green-900: 220 252 231;
+    --themed-text-amber-600: 251 191 36;
+    --themed-text-amber-700: 252 211 77;
+    --themed-text-amber-800: 253 230 138;
+    --themed-text-amber-900: 254 243 199;
+    --themed-text-blue-700: 147 197 253;
+    --themed-text-orange-600: 251 146 60;
+    --themed-text-yellow-600: 250 204 21;
+
+    --themed-border-gray-100: 55 64 64;
+    --themed-border-gray-200: 66 76 76;
+    --themed-border-gray-300: 80 90 90;
+    --themed-border-gray-400: 105 114 114;
+    --themed-border-gray-900: 236 240 240;
+    --themed-border-red-200: 110 44 44;
+    --themed-border-red-300: 130 52 52;
+    --themed-border-green-200: 32 96 60;
+    --themed-border-green-300: 40 120 72;
+    --themed-border-amber-300: 130 96 30;
+  }
+}
+
 @layer base {
   * {
     @apply border-border;
