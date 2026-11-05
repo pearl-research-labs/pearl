@@ -3,10 +3,12 @@
 //! Provides `#[pymethods]` implementations that extend the pyo3 classes defined in [`merkle`].
 
 use blake3::{CHUNK_LEN, OUT_LEN};
-use pyo3::{exceptions::PyValueError, pymethods, types::PyBytes, Bound, PyResult, Python};
+use pyo3::{
+    buffer::PyBuffer, exceptions::PyValueError, pymethods, types::PyBytes, Bound, PyResult, Python,
+};
 
 use crate::hasher::Digest;
-use crate::merkle::{MerkleProof, MerkleTree};
+use crate::merkle::{padded_chunk_len, MerkleProof, MerkleTree};
 
 #[pymethods]
 impl MerkleTree {
@@ -21,6 +23,20 @@ impl MerkleTree {
             ))
         })?;
         Ok(Self::new(data, key))
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_buffer", signature = (data, key))]
+    fn py_from_buffer(py: Python<'_>, data: PyBuffer<i8>, key: Digest) -> PyResult<Self> {
+        if !data.is_c_contiguous() {
+            return Err(PyValueError::new_err("data must be C-contiguous"));
+        }
+        let (addr, len) = (data.buf_ptr() as usize, data.len_bytes());
+        Ok(py.allow_threads(|| {
+            let mut padded = vec![0u8; padded_chunk_len(len)];
+            unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, padded.as_mut_ptr(), len) };
+            Self::from_vec(padded, key)
+        }))
     }
 
     #[getter(root)]
