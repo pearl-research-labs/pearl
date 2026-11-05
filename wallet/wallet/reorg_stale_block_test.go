@@ -681,6 +681,34 @@ func TestDisconnectBlockStillOnChainLaggingBackend(t *testing.T) {
 	assert.Equal(t, forkHeight+2, w.Manager.SyncedTo().Height)
 }
 
+// TestDisconnectBlockAboveReportedTip ensures a disconnect for a block the backend still has is ignored even when the
+// block is above the backend's reported tip, as an SPV backend reports its lagging filter-header tip.
+func TestDisconnectBlockAboveReportedTip(t *testing.T) {
+	w, cleanup := testWallet(t)
+	defer cleanup()
+
+	coinbase := mineCoinbase(t, w, canonicalBranch, forkHeight+1)
+	syncManagerTo(t, w, canonicalBranch, forkHeight-1, forkHeight+1)
+	setBirthdayBlock(t, w)
+	w.chainClient = &reorgChainClient{
+		mockChainClient: &mockChainClient{
+			getBestBlockHeight: forkHeight - 1,
+			getBlockHeader:     &wire.BlockHeader{Timestamp: branchTime(forkHeight)},
+		},
+		blockHashes: map[int64]chainhash.Hash{
+			int64(forkHeight + 1): branchHash(canonicalBranch, forkHeight+1),
+		},
+	}
+
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		return w.disconnectBlock(tx, blockMeta(canonicalBranch, forkHeight+1))
+	})
+	require.NoError(t, err)
+
+	assert.True(t, hasStoredCredit(t, w, coinbase))
+	assert.Equal(t, forkHeight+1, w.Manager.SyncedTo().Height)
+}
+
 // TestDisconnectBlockWithoutChainClient ensures a disconnect handled after Stop has cleared the chain client fails
 // without touching the wallet's history, rather than crashing the wallet.
 func TestDisconnectBlockWithoutChainClient(t *testing.T) {

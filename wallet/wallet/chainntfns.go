@@ -403,14 +403,9 @@ func (w *Wallet) partitionBlockHistory(ns walletdb.ReadBucket, height int32) (
 	err = w.TxStore.RangeTransactions(ns, height, math.MaxInt32, func(details []wtxmgr.TxDetails) (bool, error) {
 		block := details[0].Block
 
-		var hash *chainhash.Hash
-		if block.Height <= tipHeight {
-			var err error
-
-			hash, err = client.GetBlockHash(int64(block.Height))
-			if err != nil {
-				return false, err
-			}
+		hash, err := chainBlockHash(client, block.Height, tipHeight)
+		if err != nil {
+			return false, err
 		}
 
 		if hash == nil || *hash != block.Hash {
@@ -617,16 +612,26 @@ func chainHasBlock(client chainConn, block *wtxmgr.Block) (bool, error) {
 		return false, err
 	}
 
-	if block.Height > bestHeight {
-		return false, nil
-	}
-
-	hash, err := client.GetBlockHash(int64(block.Height))
+	hash, err := chainBlockHash(client, block.Height, bestHeight)
 	if err != nil {
 		return false, err
 	}
 
 	return hash != nil && *hash == block.Hash, nil
+}
+
+// chainBlockHash returns the chain's block hash at the given height, or nil when the chain has no block there. An SPV
+// backend reports its filter-header tip as its best height but still answers for the block headers above it, so a
+// height above bestHeight is looked up before it counts as missing.
+//
+//nolint:nilnil // A height above the chain's headers has no block.
+func chainBlockHash(client chainConn, height, bestHeight int32) (*chainhash.Hash, error) {
+	hash, err := client.GetBlockHash(int64(height))
+	if err != nil && height > bestHeight {
+		return nil, nil
+	}
+
+	return hash, err
 }
 
 func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord, block *wtxmgr.BlockMeta) error {

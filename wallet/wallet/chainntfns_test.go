@@ -592,6 +592,7 @@ func TestDisconnectMixedHistory(t *testing.T) {
 		{"canonical suffix", 6, 4, 0, false},
 		{"all canonical", 7, 4, 0, false},
 		{"above backend tip", 7, 3, 0, false},
+		{"above backend tip without block", 7, 3, 4, false},
 		{"early lookup failure", 7, 4, 2, false},
 		{"late lookup failure", 0, 4, 4, false},
 		{"best block failure", 0, 4, 0, true},
@@ -627,7 +628,7 @@ func TestDisconnectMixedHistory(t *testing.T) {
 
 				delete(client.blockHashes, test.missing)
 
-				wantErr := test.bestErr || test.missing != 0
+				wantErr := test.bestErr || (test.missing != 0 && test.missing <= int64(test.tip))
 				if wantErr {
 					wantHeights = heights
 				}
@@ -692,7 +693,7 @@ func mixedHistoryRecords(t *testing.T, stored bool, test mixedHistoryCase, clien
 		hash := chainhash.Hash{byte(height + 10)}
 		if test.mask&(1<<i) != 0 {
 			hash = chainhash.Hash{byte(height)}
-			if height <= test.tip {
+			if int64(height) != test.missing {
 				want = height
 			}
 		}
