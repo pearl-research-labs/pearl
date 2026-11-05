@@ -262,17 +262,36 @@ func RecordBlockRejected(reason string) {
 }
 
 // RecordBlockProcessed times a block that was accepted (not an orphan).
-func RecordBlockProcessed(d time.Duration) { chainBlockProcessSeconds.Observe(d.Seconds()) }
+func RecordBlockProcessed(d time.Duration) {
+	chainBlockProcessSeconds.Observe(d.Seconds())
+}
+
+// RecordBlockSanityChecked times the context-free checks of a block that passed them.
+func RecordBlockSanityChecked(d time.Duration) {
+	chainBlockSanitySeconds.Observe(d.Seconds())
+}
+
+// RecordReorg records how many blocks a reorganization disconnected.
+func RecordReorg(depth int) {
+	chainReorgDepthBlocks.Observe(float64(depth))
+}
+
+// RecordUtxoCacheFlushed times a UTXO cache flush, excluding the database commit.
+func RecordUtxoCacheFlushed(d time.Duration) {
+	utxoCacheFlushSeconds.Observe(d.Seconds())
+}
 
 // RecordTxProcessed times a transaction that was accepted into the pool (not an orphan).
-func RecordTxProcessed(d time.Duration) { mempoolTxProcessSeconds.Observe(d.Seconds()) }
+func RecordTxProcessed(d time.Duration) {
+	mempoolTxProcessSeconds.Observe(d.Seconds())
+}
 
-// Recorder implements blockchain.Metrics.
+// Recorder adapts the Record functions to blockchain.Metrics, which blockchain uses to avoid importing this package.
 type Recorder struct{}
 
-func (Recorder) Reorganized(depth int)              { chainReorgDepthBlocks.Observe(float64(depth)) }
-func (Recorder) BlockSanityChecked(d time.Duration) { chainBlockSanitySeconds.Observe(d.Seconds()) }
-func (Recorder) UtxoCacheFlushed(d time.Duration)   { utxoCacheFlushSeconds.Observe(d.Seconds()) }
+func (Recorder) Reorganized(depth int)              { RecordReorg(depth) }
+func (Recorder) BlockSanityChecked(d time.Duration) { RecordBlockSanityChecked(d) }
+func (Recorder) UtxoCacheFlushed(d time.Duration)   { RecordUtxoCacheFlushed(d) }
 
 // RecordTxRejected counts a rejected transaction by its wire reject code name.
 func RecordTxRejected(reason string) {
