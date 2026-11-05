@@ -70,8 +70,8 @@ metric names.
 | `pearld_chain_blocks_rejected_total` | Counter | `reason` | Blocks rejected, by rule violated (`ErrHighHash`, ...) or `other` for internal failures; duplicates excluded |
 | `pearld_chain_reorg_depth_blocks` | Histogram (1, 2, 3, 4, 8, … 2048) | | Blocks disconnected per reorg |
 | `pearld_chain_orphan_blocks` | Gauge | | Orphan blocks held |
-| `pearld_utxo_cache_entries` | Gauge | | Entries in the UTXO cache |
-| `pearld_utxo_cache_bytes` | Gauge | | UTXO cache memory use |
+| `pearld_utxo_cache_entries` | Gauge | | Entries in the UTXO cache, as of the last block or flush |
+| `pearld_utxo_cache_bytes` | Gauge | | UTXO cache memory use, as of the last block or flush |
 | `pearld_utxo_cache_max_bytes` | Gauge | | Configured UTXO cache limit |
 
 Tip freshness is derived from the timestamp rather than exported as an age, so
@@ -101,12 +101,12 @@ stalls between scrapes.
 |--------|------|--------|-------------|
 | `pearld_rpc_requests_total` | Counter | `method`, `result` | Requests processed |
 | `pearld_rpc_request_duration_seconds` | Native histogram | `method` | Handler execution latency |
-| `pearld_rpc_auth_failures_total` | Counter | | Failed authentication attempts |
+| `pearld_rpc_auth_failures_total` | Counter | | Failed authentication attempts, over HTTP Basic auth or the WebSocket `authenticate` command |
 | `pearld_rpc_websocket_clients` | Gauge | | Connected WebSocket clients |
 
-`result` is `success` or `error`. `method` is restricted to registered RPC
-methods; anything else collapses to `unknown` so an unauthenticated caller
-cannot inflate series count with arbitrary method names.
+`result` is `success` or `error`. `method` is restricted to registered RPC and
+WebSocket methods; anything else collapses to `unknown` so an unauthenticated
+caller cannot inflate series count with arbitrary method names.
 
 ### Mempool
 
@@ -117,7 +117,7 @@ cannot inflate series count with arbitrary method names.
 | `pearld_mempool_max_bytes` | Gauge | | Configured mempool size limit |
 | `pearld_mempool_last_updated_timestamp_seconds` | Gauge | | When the mempool last changed |
 | `pearld_mempool_orphan_transactions` | Gauge | | Transactions in the orphan pool |
-| `pearld_mempool_tx_rejected_total` | Counter | `reason` | Transactions rejected from peers or `sendrawtransaction`, by reject code (`REJECT_DUST`, ...) |
+| `pearld_mempool_tx_rejected_total` | Counter | `reason` | Transactions rejected from peers or `sendrawtransaction`, by reject code (`REJECT_DUST`, ...); duplicates excluded |
 
 ### Timings
 
@@ -213,11 +213,23 @@ registers profiling handlers there — serving the default mux would expose
 `/debug/pprof` on the metrics port. `server_test.go` guards this by asserting
 `/debug/pprof/` returns 404.
 
+The endpoint is unauthenticated, so the server caps open connections at 16 and
+concurrent scrapes at 4, and times out slow requests. A gather that outlives the
+timeout keeps its slot until it returns, so the cap also bounds how many stalled
+gathers can accumulate.
+
 Values that can be read cheaply from live state — chain tip, peer counts,
 mempool size — are collected at scrape time through `Source`, a struct of
 accessor functions supplied by `package main`. There is no background polling
 goroutine. Event counts that cannot be sampled, such as block connections and
 RPC latency, are pushed from their call sites.
+
+A scrape must never wait on a node lock. Block processing and UTXO flushes hold
+the chain lock, a flush for up to several minutes, and a scrape stuck behind it
+makes Prometheus report the node as down. So the chain gauges come from
+`BestSnapshot`, peer counts from copies `peerHandler` publishes after each
+message it handles, and the UTXO cache gauges are pushed through
+`blockchain.Metrics` after each block and flush rather than read at scrape time.
 
 The package does no logging. `Server` reports bound addresses through
 `ListenAddrs` and unexpected serve failures through the `Errors` channel, both
@@ -231,8 +243,9 @@ atomic load needed to check it. The one place the distinction pays for itself is
 `OnWrite` closures entirely when no metrics endpoint is configured, keeping the
 per-frame path identical to an uninstrumented build.
 
-Instrumentation lives entirely in `package main` and hooks that already exist
-(`peer.Config.Listeners.OnRead`/`OnWrite`, `blockchain.Subscribe`), so shared
-packages like `node/blockchain` and `node/peer` gain no Prometheus dependency.
-That matters because they are imported by `spv/`, `wallet/`, `dnsseeder/`, and
-`coredns-dnsseed/`.
+Shared packages stay free of Prometheus, because `spv/`, `wallet/` and
+`coredns-dnsseed/` import them. `node/blockchain` reports through the
+`blockchain.Metrics` interface, which `metrics.Recorder` implements, and
+`node/peer` is instrumented from `package main` through its existing
+`OnRead`/`OnWrite` hooks. Only `node/netsync`, which nothing outside pearld
+imports, uses this package directly.

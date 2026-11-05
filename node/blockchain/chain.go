@@ -723,6 +723,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	// maximum size.  If we're pruned and have flushed already, this will be a no-op.
 	// Fast-path: skip db.Update if no flush is needed.
 	if !b.utxoCache.shouldFlush(FlushIfNeeded, state) {
+		b.reportUtxoCache()
 		return nil
 	}
 	return b.db.Update(func(dbTx database.Tx) error {
@@ -1355,10 +1356,17 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 //
 // This function MUST be called with the chain state lock held (for reads).
 func (b *BlockChain) isCurrent() bool {
+	tip := b.bestChain.Tip()
+	return b.isCurrentAt(tip.height, tip.timestamp)
+}
+
+// isCurrentAt applies the isCurrent rules to a best block at height whose header carries
+// timestamp.
+func (b *BlockChain) isCurrentAt(height int32, timestamp int64) bool {
 	// Not current if the latest main (best) chain height is before the
 	// latest known good checkpoint (when checkpoints are enabled).
 	checkpoint := b.LatestCheckpoint()
-	if checkpoint != nil && b.bestChain.Tip().height < checkpoint.Height {
+	if checkpoint != nil && height < checkpoint.Height {
 		return false
 	}
 
@@ -1368,7 +1376,7 @@ func (b *BlockChain) isCurrent() bool {
 	// The chain appears to be current if none of the checks reported
 	// otherwise.
 	minus24Hours := b.timeSource.AdjustedTime().Add(-24 * time.Hour).Unix()
-	return b.bestChain.Tip().timestamp >= minus24Hours
+	return timestamp >= minus24Hours
 }
 
 // IsCurrent returns whether or not the chain believes it is current.  Several
@@ -1383,6 +1391,16 @@ func (b *BlockChain) IsCurrent() bool {
 	defer b.chainLock.RUnlock()
 
 	return b.isCurrent()
+}
+
+// IsCurrentSnapshot is IsCurrent evaluated on BestSnapshot, so it never waits for the chain lock,
+// which block processing and UTXO flushes can hold for a long time. It can lag behind a block that
+// is still being connected.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) IsCurrentSnapshot() bool {
+	snapshot := b.BestSnapshot()
+	return b.isCurrentAt(snapshot.Height, snapshot.BlockTime.Unix())
 }
 
 // BestSnapshot returns information about the current best chain block and
@@ -2355,6 +2373,7 @@ func New(config *Config) (*BlockChain, error) {
 	if err := b.InitConsistentState(bestNode, config.Interrupt); err != nil {
 		return nil, err
 	}
+	b.reportUtxoCache()
 	log.Infof("Chain state (height %d, hash %v, totaltx %d, work %v)",
 		bestNode.height, bestNode.hash, b.stateSnapshot.TotalTxns,
 		bestNode.workSum)

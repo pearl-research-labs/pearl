@@ -11,6 +11,17 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/net/netutil"
+)
+
+// The endpoint is unauthenticated, so these bound what clients can make pearld hold: connections and
+// their file descriptors, concurrent gathers, and request duration. A gather that outlives
+// scrapeTimeout keeps its in-flight slot until it returns, so maxScrapesInFlight also caps how many
+// stalled gathers can pile up.
+const (
+	maxConnections     = 16
+	maxScrapesInFlight = 4
+	scrapeTimeout      = 10 * time.Second
 )
 
 // Server manages the standalone HTTP metrics server.  It does no logging of its
@@ -42,14 +53,17 @@ func NewServer(listenAddrs []string) (*Server, error) {
 			}
 			return nil, fmt.Errorf("failed to bind metrics listener on %s: %w", addr, err)
 		}
-		listeners = append(listeners, l)
+		listeners = append(listeners, netutil.LimitListener(l, maxConnections))
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+		MaxRequestsInFlight: maxScrapesInFlight,
+		Timeout:             scrapeTimeout,
+	}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 
 	var httpServers []*http.Server
@@ -57,6 +71,10 @@ func NewServer(listenAddrs []string) (*Server, error) {
 		httpServers = append(httpServers, &http.Server{
 			Handler:           mux,
 			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			// Longer than scrapeTimeout, so a timed-out scrape still gets its 503 written.
+			WriteTimeout: scrapeTimeout + 5*time.Second,
+			IdleTimeout:  time.Minute,
 		})
 	}
 

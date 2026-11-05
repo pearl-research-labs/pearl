@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
@@ -29,6 +30,11 @@ var (
 
 	// Mempool
 	mempoolTxRejectedTotal *prometheus.CounterVec
+
+	// UTXO cache
+	utxoCacheEntries  prometheus.Gauge
+	utxoCacheBytes    prometheus.Gauge
+	utxoCacheMaxBytes prometheus.Gauge
 
 	// P2P counters
 	p2pPeerConnectsTotal    *prometheus.CounterVec
@@ -101,8 +107,25 @@ func init() {
 	mempoolTxRejectedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: Namespace,
 		Name:      "mempool_tx_rejected_total",
-		Help:      "Total number of transactions rejected from peers or sendrawtransaction, by reject code",
+		Help:      "Total number of transactions rejected from peers or sendrawtransaction, by reject code; duplicates are not counted",
 	}, []string{"reason"})
+
+	// UTXO cache
+	utxoCacheEntries = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "utxo_cache_entries",
+		Help:      "Entries in the UTXO cache, as of the last connected block or cache flush",
+	})
+	utxoCacheBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "utxo_cache_bytes",
+		Help:      "Memory used by the UTXO cache in bytes, as of the last connected block or cache flush",
+	})
+	utxoCacheMaxBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: Namespace,
+		Name:      "utxo_cache_max_bytes",
+		Help:      "Configured UTXO cache memory limit in bytes",
+	})
 
 	// P2P metrics
 	p2pPeerConnectsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -182,6 +205,9 @@ func init() {
 		mempoolTxProcessSeconds,
 		utxoCacheFlushSeconds,
 		mempoolTxRejectedTotal,
+		utxoCacheEntries,
+		utxoCacheBytes,
+		utxoCacheMaxBytes,
 		p2pPeerConnectsTotal,
 		p2pPeerDisconnectsTotal,
 		p2pPeersBannedTotal,
@@ -283,16 +309,30 @@ func RecordTxProcessed(d time.Duration) {
 	mempoolTxProcessSeconds.Observe(d.Seconds())
 }
 
+// RecordUtxoCache sets the UTXO cache occupancy.
+func RecordUtxoCache(entries int, memoryBytes, maxMemoryBytes uint64) {
+	utxoCacheEntries.Set(float64(entries))
+	utxoCacheBytes.Set(float64(memoryBytes))
+	utxoCacheMaxBytes.Set(float64(maxMemoryBytes))
+}
+
 // Recorder adapts the Record functions to blockchain.Metrics, which blockchain uses to avoid importing this package.
 type Recorder struct{}
 
 func (Recorder) Reorganized(depth int)              { RecordReorg(depth) }
 func (Recorder) BlockSanityChecked(d time.Duration) { RecordBlockSanityChecked(d) }
 func (Recorder) UtxoCacheFlushed(d time.Duration)   { RecordUtxoCacheFlushed(d) }
+func (Recorder) UtxoCacheChanged(entries int, memoryBytes, maxMemoryBytes uint64) {
+	RecordUtxoCache(entries, memoryBytes, maxMemoryBytes)
+}
 
-// RecordTxRejected counts a rejected transaction by its wire reject code name.
-func RecordTxRejected(reason string) {
-	mempoolTxRejectedTotal.WithLabelValues(reason).Inc()
+// RecordTxRejected counts a rejected transaction by reject code. Duplicates are skipped, as for
+// blocks: wallets rebroadcast routinely, and every resend of a known transaction is rejected as one.
+func RecordTxRejected(code wire.RejectCode) {
+	if code == wire.RejectDuplicate {
+		return
+	}
+	mempoolTxRejectedTotal.WithLabelValues(code.String()).Inc()
 }
 
 // P2P recording helpers

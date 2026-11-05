@@ -3553,7 +3553,7 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 	acceptedTxs, err := s.cfg.TxMemPool.ProcessTransaction(tx, false, false, 0)
 	if err != nil {
 		rejectCode, _ := mempool.ErrToRejectErr(err)
-		metrics.RecordTxRejected(rejectCode.String())
+		metrics.RecordTxRejected(rejectCode)
 
 		// When the error is a rule error, it means the transaction was
 		// simply rejected as opposed to something actually going wrong,
@@ -4983,7 +4983,8 @@ func init() {
 	rpcHandlers = rpcHandlersBeforeInit
 	rand.Seed(time.Now().UnixNano())
 
-	knownMethods := make([]string, 0, len(rpcHandlers)+len(rpcAskWallet)+len(rpcUnimplemented))
+	knownMethods := make([]string, 0, len(rpcHandlers)+len(rpcAskWallet)+len(rpcUnimplemented)+
+		len(wsHandlersBeforeInit))
 	for m := range rpcHandlers {
 		knownMethods = append(knownMethods, m)
 	}
@@ -4991,6 +4992,10 @@ func init() {
 		knownMethods = append(knownMethods, m)
 	}
 	for m := range rpcUnimplemented {
+		knownMethods = append(knownMethods, m)
+	}
+	// wsHandlers is assigned by rpcwebsocket.go's init, which may not have run yet.
+	for m := range wsHandlersBeforeInit {
 		knownMethods = append(knownMethods, m)
 	}
 	metrics.InitKnownRPCMethods(knownMethods)

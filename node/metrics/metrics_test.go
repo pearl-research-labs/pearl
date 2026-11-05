@@ -5,9 +5,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -73,6 +77,72 @@ func TestMethodNotFoundRecordsNoLatency(t *testing.T) {
 		testutil.ToFloat64(rpcRequestsTotal.WithLabelValues("unknown", "error")))
 	assert.Equal(t, before, testutil.CollectAndCount(rpcRequestDurationSecs),
 		"rejected methods must not add a latency series")
+}
+
+// Rebroadcasts are routine, so a duplicate must not show up as a rejection at all.
+func TestRecordTxRejectedSkipsDuplicates(t *testing.T) {
+	series := testutil.CollectAndCount(mempoolTxRejectedTotal)
+	RecordTxRejected(wire.RejectDuplicate)
+	assert.Equal(t, series, testutil.CollectAndCount(mempoolTxRejectedTotal), "a duplicate must not create a series")
+
+	dust := testutil.ToFloat64(mempoolTxRejectedTotal.WithLabelValues(wire.RejectDust.String()))
+	RecordTxRejected(wire.RejectDust)
+	assert.Equal(t, dust+1, testutil.ToFloat64(mempoolTxRejectedTotal.WithLabelValues(wire.RejectDust.String())))
+}
+
+// blockingCollector holds every gather in Collect until release is closed, like a collector stuck
+// behind a node lock.
+type blockingCollector struct {
+	desc    *prometheus.Desc
+	entered atomic.Int32
+	release chan struct{}
+}
+
+func (c *blockingCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+
+func (c *blockingCollector) Collect(chan<- prometheus.Metric) {
+	c.entered.Add(1)
+	<-c.release
+}
+
+// Stalled gathers must not pile up on an unauthenticated endpoint: once every in-flight slot is held,
+// further scrapes are turned away instead of queuing.
+func TestServerRejectsScrapesBeyondInFlightLimit(t *testing.T) {
+	blocker := &blockingCollector{
+		desc:    prometheus.NewDesc("pearld_test_blocking", "Blocks every gather", nil, nil),
+		release: make(chan struct{}),
+	}
+	registry.MustRegister(blocker)
+	t.Cleanup(func() { registry.Unregister(blocker) })
+
+	server, err := NewServer([]string{"127.0.0.1:0"})
+	require.NoError(t, err)
+	server.Start()
+	t.Cleanup(server.Stop)
+	url := "http://" + server.ListenAddrs()[0] + "/metrics"
+
+	var stalled sync.WaitGroup
+	for range maxScrapesInFlight {
+		stalled.Add(1)
+		go func() {
+			defer stalled.Done()
+			if resp, err := http.Get(url); err == nil {
+				resp.Body.Close()
+			}
+		}()
+	}
+	require.Eventually(t, func() bool { return blocker.entered.Load() == maxScrapesInFlight },
+		5*time.Second, 10*time.Millisecond)
+
+	// The handler timeout would also answer 503, but only after scrapeTimeout; the cap answers at once.
+	impatient := &http.Client{Timeout: scrapeTimeout / 5}
+	resp, err := impatient.Get(url)
+	require.NoError(t, err, "a scrape over the cap must be turned away immediately")
+	resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+
+	close(blocker.release)
+	stalled.Wait()
 }
 
 func TestScrapeCollector(t *testing.T) {

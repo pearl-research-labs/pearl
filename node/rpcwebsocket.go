@@ -1319,6 +1319,7 @@ func (c *wsClient) authorizeRequest(req *btcjson.Request) requestOutcome {
 			authCmd.Username, authCmd.Passphrase)
 		if !authenticated {
 			rpcsLog.Warnf("Auth failure.")
+			metrics.RecordRPCAuthFailure()
 			return requestOutcome{disconnect: true}
 		}
 		c.authenticated = true
@@ -1539,7 +1540,9 @@ func (c *wsClient) runCommand(cmd *parsedRPCCmd) (reply json.RawMessage) {
 		err    error
 	)
 	if wsHandler, ok := wsHandlers[cmd.method]; ok {
+		start := time.Now()
 		result, err = wsHandler(c, cmd.cmd)
+		metrics.RecordRPCRequest(cmd.method, time.Since(start), err)
 	} else {
 		result, err = c.server.standardCmdResult(cmd, nil)
 	}

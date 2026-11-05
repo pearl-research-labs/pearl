@@ -641,17 +641,21 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 	return true, s.writeCache(dbTx, bestState, eraseCache)
 }
 
-// flushUtxoCache is utxoCache.flush plus its timing for Metrics.
+// flushUtxoCache is utxoCache.flush plus its timing and the resulting occupancy for Metrics.
 //
 // This function MUST be called with the chain state lock held (for writes).
 func (b *BlockChain) flushUtxoCache(dbTx database.Tx, mode FlushMode, bestState *BestState) error {
 	start := time.Now()
 	flushed, err := b.utxoCache.flush(dbTx, mode, bestState)
-	if err == nil && flushed {
+	if err != nil {
+		return err
+	}
+	if flushed {
 		b.metrics.UtxoCacheFlushed(time.Since(start))
 	}
+	b.reportUtxoCache()
 
-	return err
+	return nil
 }
 
 // FlushUtxoCache flushes the UTXO state to the database if a flush is needed with the

@@ -280,12 +280,18 @@ type server struct {
 	relayInv             chan relayMsg
 	broadcast            chan broadcastMsg
 	peerHeightsUpdate    chan updatePeerHeightsMsg
-	wg                   sync.WaitGroup
-	quit                 chan struct{}
-	nat                  NAT
-	db                   database.DB
-	timeSource           blockchain.MedianTimeSource
-	services             wire.ServiceFlag
+
+	// inboundPeerCount and outboundPeerCount mirror peerState for readers outside peerHandler, which
+	// owns peerState and is their only writer.
+	inboundPeerCount  atomic.Int64
+	outboundPeerCount atomic.Int64
+
+	wg         sync.WaitGroup
+	quit       chan struct{}
+	nat        NAT
+	db         database.DB
+	timeSource blockchain.MedianTimeSource
+	services   wire.ServiceFlag
 
 	// The following fields are used for optional indexes.  They will be nil
 	// if the associated index is not enabled.  These fields are set during
@@ -2265,11 +2271,21 @@ func disconnectPeer(peerList map[int32]*serverPeer, compareFunc func(*serverPeer
 			// This is ok because we are not continuing
 			// to iterate so won't corrupt the loop.
 			delete(peerList, addr)
+
+			// handleDonePeerMsg cannot find a peer removed here, so it
+			// would never count this disconnect.
+			metrics.RecordPeerDisconnect(peer.Inbound())
 			peer.Disconnect()
 			return true
 		}
 	}
 	return false
+}
+
+// publishPeerCounts makes the peer counts readable without a round trip through peerHandler.
+func (s *server) publishPeerCounts(state *peerState) {
+	s.inboundPeerCount.Store(int64(len(state.inboundPeers)))
+	s.outboundPeerCount.Store(int64(len(state.outboundPeers) + len(state.persistentPeers)))
 }
 
 // newPeerConfig returns the configuration for the given serverPeer.
@@ -2519,6 +2535,7 @@ out:
 			})
 			break out
 		}
+		s.publishPeerCounts(state)
 	}
 
 	s.connManager.Stop()
@@ -3666,31 +3683,12 @@ func (s *server) MetricsSource() metrics.Source {
 		},
 		ChainIsCurrent: func() bool {
 			if s.chain != nil {
-				return s.chain.IsCurrent()
+				return s.chain.IsCurrentSnapshot()
 			}
 			return false
 		},
 		PeerCount: func() (int64, int64) {
-			replyChan := make(chan []*serverPeer, 1)
-			select {
-			case s.query <- getPeersMsg{reply: replyChan}:
-			case <-s.quit:
-				return 0, 0
-			}
-			select {
-			case peers := <-replyChan:
-				var inbound, outbound int64
-				for _, p := range peers {
-					if p.Inbound() {
-						inbound++
-					} else {
-						outbound++
-					}
-				}
-				return inbound, outbound
-			case <-s.quit:
-				return 0, 0
-			}
+			return s.inboundPeerCount.Load(), s.outboundPeerCount.Load()
 		},
 		NetTotals: func() (uint64, uint64) {
 			return atomic.LoadUint64(&s.bytesReceived), atomic.LoadUint64(&s.bytesSent)
@@ -3730,13 +3728,6 @@ func (s *server) MetricsSource() metrics.Source {
 				return s.txMemPool.OrphanCount()
 			}
 			return 0
-		},
-		UtxoCache: func() (int, uint64, uint64) {
-			if s.chain != nil {
-				c := s.chain.UtxoCacheStats()
-				return c.Entries, c.MemoryBytes, c.MaxMemoryBytes
-			}
-			return 0, 0, 0
 		},
 	}
 }

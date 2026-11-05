@@ -798,7 +798,7 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 		// Convert the error into an appropriate reject message and
 		// send it.
 		code, reason := mempool.ErrToRejectErr(err)
-		metrics.RecordTxRejected(code.String())
+		metrics.RecordTxRejected(code)
 		peer.PushRejectMsg(wire.CmdTx, code, reason, txHash, false)
 		return
 	}
