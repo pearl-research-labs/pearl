@@ -105,6 +105,7 @@ type BlockChain struct {
 	sigCache            *txscript.SigCache
 	indexManager        IndexManager
 	hashCache           *txscript.HashCache
+	metrics             Metrics
 
 	// chainLock protects concurrent access to the vast majority of the
 	// fields in this struct below this point.
@@ -271,6 +272,16 @@ func (b *BlockChain) MissingAncestor(hash *chainhash.Hash) *chainhash.Hash {
 		return nil
 	}
 	return &root.block.MsgBlock().BlockHeader().PrevBlock
+}
+
+// OrphanCount returns the number of orphan blocks held.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) OrphanCount() int {
+	b.orphanLock.RLock()
+	defer b.orphanLock.RUnlock()
+
+	return len(b.orphans)
 }
 
 // removeOrphanBlock removes the passed orphan block from the orphan pool and
@@ -646,7 +657,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 				if needsFlush {
 					// Since the deleted hashes are past our last
 					// flush block, flush the utxo cache now.
-					err = b.utxoCache.flush(dbTx, FlushRequired, state)
+					err = b.flushUtxoCache(dbTx, FlushRequired, state)
 					if err != nil {
 						return err
 					}
@@ -722,10 +733,11 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	// maximum size.  If we're pruned and have flushed already, this will be a no-op.
 	// Fast-path: skip db.Update if no flush is needed.
 	if !b.utxoCache.shouldFlush(FlushIfNeeded, state) {
+		b.reportUtxoCache()
 		return nil
 	}
 	return b.db.Update(func(dbTx database.Tx) error {
-		return b.utxoCache.flush(dbTx, FlushIfNeeded, state)
+		return b.flushUtxoCache(dbTx, FlushIfNeeded, state)
 	})
 }
 
@@ -790,7 +802,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 		// reorganization modifies the database directly, the cache
 		// will be left in an inconsistent state if we don't flush it
 		// prior to the dbPutUtxoView that happens below.
-		err = b.utxoCache.flush(dbTx, FlushRequired, state)
+		err = b.flushUtxoCache(dbTx, FlushRequired, state)
 		if err != nil {
 			return err
 		}
@@ -976,6 +988,9 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	if forkNode != nil {
 		log.Infof("REORGANIZE: Chain forks at %v (height %v)", forkNode.hash,
 			forkNode.height)
+		if n := detachNodes.Len(); n > 0 {
+			b.metrics.Reorganized(n)
+		}
 	}
 	log.Infof("REORGANIZE: Old best chain head was %v (height %v)",
 		&oldBest.hash, oldBest.height)
@@ -1351,10 +1366,17 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 //
 // This function MUST be called with the chain state lock held (for reads).
 func (b *BlockChain) isCurrent() bool {
+	tip := b.bestChain.Tip()
+	return b.isCurrentAt(tip.height, tip.timestamp)
+}
+
+// isCurrentAt applies the isCurrent rules to a best block at height whose header carries
+// timestamp.
+func (b *BlockChain) isCurrentAt(height int32, timestamp int64) bool {
 	// Not current if the latest main (best) chain height is before the
 	// latest known good checkpoint (when checkpoints are enabled).
 	checkpoint := b.LatestCheckpoint()
-	if checkpoint != nil && b.bestChain.Tip().height < checkpoint.Height {
+	if checkpoint != nil && height < checkpoint.Height {
 		return false
 	}
 
@@ -1364,7 +1386,7 @@ func (b *BlockChain) isCurrent() bool {
 	// The chain appears to be current if none of the checks reported
 	// otherwise.
 	minus24Hours := b.timeSource.AdjustedTime().Add(-24 * time.Hour).Unix()
-	return b.bestChain.Tip().timestamp >= minus24Hours
+	return timestamp >= minus24Hours
 }
 
 // IsCurrent returns whether or not the chain believes it is current.  Several
@@ -1379,6 +1401,16 @@ func (b *BlockChain) IsCurrent() bool {
 	defer b.chainLock.RUnlock()
 
 	return b.isCurrent()
+}
+
+// IsCurrentSnapshot is IsCurrent evaluated on BestSnapshot, so it never waits for the chain lock,
+// which block processing and UTXO flushes can hold for a long time. It can lag behind a block that
+// is still being connected.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) IsCurrentSnapshot() bool {
+	snapshot := b.BestSnapshot()
+	return b.isCurrentAt(snapshot.Height, snapshot.BlockTime.Unix())
 }
 
 // BestSnapshot returns information about the current best chain block and
@@ -2218,6 +2250,9 @@ type Config struct {
 	// will target for with block files.  Prune at 0 specifies that no
 	// blocks will be deleted.
 	Prune uint64
+
+	// Metrics records events. Nil Metrics discards them.
+	Metrics Metrics
 }
 
 // New returns a BlockChain instance using the provided configuration details.
@@ -2281,6 +2316,11 @@ func New(config *Config) (*BlockChain, error) {
 		}
 	}
 
+	metrics := config.Metrics
+	if metrics == nil {
+		metrics = noopMetrics{}
+	}
+
 	params := config.ChainParams
 	b := BlockChain{
 		checkpoints:         config.Checkpoints,
@@ -2293,6 +2333,7 @@ func New(config *Config) (*BlockChain, error) {
 		index:               newBlockIndex(config.DB, params),
 		utxoCache:           newUtxoCache(config.DB, config.UtxoCacheMaxSize),
 		hashCache:           config.HashCache,
+		metrics:             metrics,
 		bestChain:           newChainView(nil),
 		orphans:             make(map[chainhash.Hash]*orphanBlock),
 		prevOrphans:         make(map[chainhash.Hash][]*orphanBlock),
@@ -2342,6 +2383,7 @@ func New(config *Config) (*BlockChain, error) {
 	if err := b.InitConsistentState(bestNode, config.Interrupt); err != nil {
 		return nil, err
 	}
+	b.reportUtxoCache()
 	log.Infof("Chain state (height %d, hash %v, totaltx %d, work %v)",
 		bestNode.height, bestNode.hash, b.stateSnapshot.TotalTxns,
 		bestNode.workSum)

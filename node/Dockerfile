@@ -57,6 +57,7 @@ VOLUME ["/root/.pearld"]
 
 # 44108  Mainnet Pearl peer-to-peer port
 # 44107  Mainnet RPC port
-EXPOSE 44108 44107
+# 9105   Prometheus metrics (only served with --metricslisten)
+EXPOSE 44108 44107 9105
 
 ENTRYPOINT ["pearld"]
