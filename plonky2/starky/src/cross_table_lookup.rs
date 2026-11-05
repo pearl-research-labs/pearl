@@ -283,14 +283,15 @@ impl<F: Field> CtlData<'_, F> {
         let mut res = Vec::with_capacity(num_helpers + num_zs);
         for z in &mut self.zs_columns {
             for pv in &mut z.helper_columns {
-                res.push(core::mem::replace(pv, PolynomialValues::new(Vec::new())));
+                res.push(PolynomialValues {
+                    values: core::mem::take(&mut pv.values),
+                });
             }
         }
         for z in &mut self.zs_columns {
-            res.push(core::mem::replace(
-                &mut z.z,
-                PolynomialValues::new(Vec::new()),
-            ));
+            res.push(PolynomialValues {
+                values: core::mem::take(&mut z.z.values),
+            });
         }
         res
     }
@@ -1377,5 +1378,39 @@ pub mod debug_utils {
                 l1 = looked_locations.len(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use plonky2::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn take_ctl_polys_moves_buffers_and_preserves_helper_counts() {
+        type F = GoldilocksField;
+        let mut data = CtlData {
+            zs_columns: vec![CtlZData::new(
+                vec![PolynomialValues::new(vec![F::ONE; 2])],
+                PolynomialValues::new(vec![F::ZERO; 2]),
+                GrandProductChallenge {
+                    beta: F::ONE,
+                    gamma: F::ZERO,
+                },
+                vec![],
+                vec![],
+            )],
+        };
+        let helper_ptr = data.zs_columns[0].helper_columns[0].values.as_ptr();
+        let z_ptr = data.zs_columns[0].z.values.as_ptr();
+        let polys = data.take_ctl_polys();
+        assert_eq!(polys.len(), 2);
+        assert_eq!(polys[0].values, vec![F::ONE; 2]);
+        assert_eq!(polys[1].values, vec![F::ZERO; 2]);
+        assert_eq!(polys[0].values.as_ptr(), helper_ptr);
+        assert_eq!(polys[1].values.as_ptr(), z_ptr);
+        assert_eq!(data.zs_columns[0].helper_columns.len(), 1);
+        assert!(data.zs_columns[0].helper_columns[0].values.is_empty());
+        assert!(data.zs_columns[0].z.values.is_empty());
     }
 }
