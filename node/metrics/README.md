@@ -222,7 +222,7 @@ package.
 The HTTP server builds its own `http.ServeMux`. It must not reuse
 `http.DefaultServeMux`, because `node/btcd.go` imports `net/http/pprof`, which
 registers profiling handlers there — serving the default mux would expose
-`/debug/pprof` on the metrics port. `server_test.go` guards this by asserting
+`/debug/pprof` on the metrics port. `metrics_test.go` guards this by asserting
 `/debug/pprof/` returns 404.
 
 The endpoint is unauthenticated, so the server caps open connections at 16 and
