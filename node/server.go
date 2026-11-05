@@ -34,6 +34,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/internal/inbound"
 	"github.com/pearl-research-labs/pearl/node/mempool"
+	"github.com/pearl-research-labs/pearl/node/metrics"
 	"github.com/pearl-research-labs/pearl/node/mining"
 	"github.com/pearl-research-labs/pearl/node/mining/cpuminer"
 	"github.com/pearl-research-labs/pearl/node/netsync"
@@ -279,12 +280,18 @@ type server struct {
 	relayInv             chan relayMsg
 	broadcast            chan broadcastMsg
 	peerHeightsUpdate    chan updatePeerHeightsMsg
-	wg                   sync.WaitGroup
-	quit                 chan struct{}
-	nat                  NAT
-	db                   database.DB
-	timeSource           blockchain.MedianTimeSource
-	services             wire.ServiceFlag
+
+	// inboundPeerCount and outboundPeerCount mirror peerState for readers outside peerHandler, which
+	// owns peerState and is their only writer.
+	inboundPeerCount  atomic.Int64
+	outboundPeerCount atomic.Int64
+
+	wg         sync.WaitGroup
+	quit       chan struct{}
+	nat        NAT
+	db         database.DB
+	timeSource blockchain.MedianTimeSource
+	services   wire.ServiceFlag
 
 	// The following fields are used for optional indexes.  They will be nil
 	// if the associated index is not enabled.  These fields are set during
@@ -1846,12 +1853,14 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 
 	// Disconnect peers with unwanted user agents.
 	if sp.HasUndesiredUserAgent(s.agentBlacklist, s.agentWhitelist) {
+		metrics.RecordPeerRejected("undesired_agent")
 		sp.Disconnect()
 		return false
 	}
 
 	// Ignore new peers if we're shutting down.
 	if atomic.LoadInt32(&s.shutdown) != 0 {
+		metrics.RecordPeerRejected("shutdown")
 		srvrLog.Infof("New peer %s ignored - server is shutting down", sp)
 		sp.Disconnect()
 		return false
@@ -1860,12 +1869,14 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 	// Disconnect banned peers.
 	host, _, err := net.SplitHostPort(sp.Addr())
 	if err != nil {
+		metrics.RecordPeerRejected("other")
 		srvrLog.Debugf("can't split hostport %v", err)
 		sp.Disconnect()
 		return false
 	}
 	if banEnd, ok := state.banned[host]; ok {
 		if time.Now().Before(banEnd) {
+			metrics.RecordPeerRejected("banned")
 			srvrLog.Debugf("Peer %s is banned for another %v - disconnecting",
 				host, time.Until(banEnd))
 			sp.Disconnect()
@@ -1880,6 +1891,7 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 
 	// Limit max number of total peers.
 	if state.Count() >= cfg.MaxPeers {
+		metrics.RecordPeerRejected("max_peers")
 		srvrLog.Infof("Max peers reached [%d] - disconnecting peer %s",
 			cfg.MaxPeers, sp)
 		sp.Disconnect()
@@ -1890,6 +1902,7 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 
 	// Add the new peer and start it.
 	srvrLog.Debugf("New peer %s", sp)
+	metrics.RecordPeerConnect(sp.Inbound())
 	if sp.Inbound() {
 		state.inboundPeers[sp.ID()] = sp
 	} else {
@@ -1972,6 +1985,7 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
 		}
 		delete(list, sp.ID())
+		metrics.RecordPeerDisconnect(sp.Inbound())
 		srvrLog.Debugf("Removed peer %s", sp)
 	}
 
@@ -2005,6 +2019,7 @@ func (s *server) handleBanPeerMsg(state *peerState, sp *serverPeer) {
 	srvrLog.Infof("Banned peer %s (%s) for %v", host, direction,
 		cfg.BanDuration)
 	state.banned[host] = time.Now().Add(cfg.BanDuration)
+	metrics.RecordPeerBanned()
 }
 
 // handleRelayInvMsg deals with relaying inventory to peers that are not already
@@ -2256,6 +2271,10 @@ func disconnectPeer(peerList map[int32]*serverPeer, compareFunc func(*serverPeer
 			// This is ok because we are not continuing
 			// to iterate so won't corrupt the loop.
 			delete(peerList, addr)
+
+			// handleDonePeerMsg cannot find a peer removed here, so it
+			// would never count this disconnect.
+			metrics.RecordPeerDisconnect(peer.Inbound())
 			peer.Disconnect()
 			return true
 		}
@@ -2263,34 +2282,66 @@ func disconnectPeer(peerList map[int32]*serverPeer, compareFunc func(*serverPeer
 	return false
 }
 
+// publishPeerCounts makes the peer counts readable without a round trip through peerHandler.
+func (s *server) publishPeerCounts(state *peerState) {
+	s.inboundPeerCount.Store(int64(len(state.inboundPeers)))
+	s.outboundPeerCount.Store(int64(len(state.outboundPeers) + len(state.persistentPeers)))
+}
+
 // newPeerConfig returns the configuration for the given serverPeer.
 func newPeerConfig(sp *serverPeer) *peer.Config {
+	listeners := peer.MessageListeners{
+		OnVersion:      sp.OnVersion,
+		OnVerAck:       sp.OnVerAck,
+		OnMemPool:      sp.OnMemPool,
+		OnTx:           sp.OnTx,
+		OnBlock:        sp.OnBlock,
+		OnInv:          sp.OnInv,
+		OnHeaders:      sp.OnHeaders,
+		OnGetData:      sp.OnGetData,
+		OnGetBlocks:    sp.OnGetBlocks,
+		OnGetHeaders:   sp.OnGetHeaders,
+		OnGetCFilters:  sp.OnGetCFilters,
+		OnGetCFHeaders: sp.OnGetCFHeaders,
+		OnGetCFCheckpt: sp.OnGetCFCheckpt,
+		OnFeeFilter:    sp.OnFeeFilter,
+		OnFilterAdd:    sp.OnFilterAdd,
+		OnFilterClear:  sp.OnFilterClear,
+		OnFilterLoad:   sp.OnFilterLoad,
+		OnGetAddr:      sp.OnGetAddr,
+		OnAddr:         sp.OnAddr,
+		OnAddrV2:       sp.OnAddrV2,
+		OnRead:         sp.OnRead,
+		OnWrite:        sp.OnWrite,
+		OnNotFound:     sp.OnNotFound,
+	}
+
+	// These hooks run on every P2P frame, so only pay for them when the metrics
+	// endpoint is actually configured.
+	if len(cfg.MetricsListeners) > 0 {
+		origOnRead := listeners.OnRead
+		listeners.OnRead = func(p *peer.Peer, bytesRead int, msg wire.Message, err error) {
+			if origOnRead != nil {
+				origOnRead(p, bytesRead, msg, err)
+			}
+			if err == nil && msg != nil {
+				metrics.RecordWireMessage(true, msg.Command(), bytesRead)
+			}
+		}
+
+		origOnWrite := listeners.OnWrite
+		listeners.OnWrite = func(p *peer.Peer, bytesWritten int, msg wire.Message, err error) {
+			if origOnWrite != nil {
+				origOnWrite(p, bytesWritten, msg, err)
+			}
+			if err == nil && msg != nil {
+				metrics.RecordWireMessage(false, msg.Command(), bytesWritten)
+			}
+		}
+	}
+
 	return &peer.Config{
-		Listeners: peer.MessageListeners{
-			OnVersion:      sp.OnVersion,
-			OnVerAck:       sp.OnVerAck,
-			OnMemPool:      sp.OnMemPool,
-			OnTx:           sp.OnTx,
-			OnBlock:        sp.OnBlock,
-			OnInv:          sp.OnInv,
-			OnHeaders:      sp.OnHeaders,
-			OnGetData:      sp.OnGetData,
-			OnGetBlocks:    sp.OnGetBlocks,
-			OnGetHeaders:   sp.OnGetHeaders,
-			OnGetCFilters:  sp.OnGetCFilters,
-			OnGetCFHeaders: sp.OnGetCFHeaders,
-			OnGetCFCheckpt: sp.OnGetCFCheckpt,
-			OnFeeFilter:    sp.OnFeeFilter,
-			OnFilterAdd:    sp.OnFilterAdd,
-			OnFilterClear:  sp.OnFilterClear,
-			OnFilterLoad:   sp.OnFilterLoad,
-			OnGetAddr:      sp.OnGetAddr,
-			OnAddr:         sp.OnAddr,
-			OnAddrV2:       sp.OnAddrV2,
-			OnRead:         sp.OnRead,
-			OnWrite:        sp.OnWrite,
-			OnNotFound:     sp.OnNotFound,
-		},
+		Listeners:           listeners,
 		NewestBlock:         sp.newestBlock,
 		HostToNetAddress:    sp.server.addrManager.HostToNetAddress,
 		Proxy:               cfg.Proxy,
@@ -2484,6 +2535,7 @@ out:
 			})
 			break out
 		}
+		s.publishPeerCounts(state)
 	}
 
 	s.connManager.Stop()
@@ -3035,10 +3087,25 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		HashCache:        s.hashCache,
 		Prune:            cfg.Prune * 1024 * 1024,
 		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+		Metrics:          metrics.Recorder{},
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	// Subscribe to blockchain notifications for metrics recording.
+	// This is done here (independent of RPC) so that metrics are
+	// recorded even when RPC is disabled.
+	s.chain.Subscribe(func(notification *blockchain.Notification) {
+		switch notification.Type {
+		case blockchain.NTBlockAccepted:
+			metrics.RecordBlockAccepted()
+		case blockchain.NTBlockConnected:
+			metrics.RecordBlockConnected()
+		case blockchain.NTBlockDisconnected:
+			metrics.RecordBlockDisconnected()
+		}
+	})
 
 	// Search for a FeeEstimator state in the database. If none can be found
 	// or if it cannot be loaded, create a new one.
@@ -3590,4 +3657,77 @@ func (sp *serverPeer) HasUndesiredUserAgent(blacklistedAgents,
 		"whitelist", sp, agent)
 
 	return true
+}
+
+// MetricsSource returns a metrics.Source populated with accessor closures for
+// pearld subsystem metrics.
+func (s *server) MetricsSource() metrics.Source {
+	return metrics.Source{
+		ChainTipHeight: func() int32 {
+			if s.chain != nil {
+				return s.chain.BestSnapshot().Height
+			}
+			return 0
+		},
+		ChainTipTimestamp: func() time.Time {
+			if s.chain != nil {
+				return s.chain.BestSnapshot().BlockTime
+			}
+			return time.Time{}
+		},
+		ChainTotalTxs: func() int64 {
+			if s.chain != nil {
+				return int64(s.chain.BestSnapshot().TotalTxns)
+			}
+			return 0
+		},
+		ChainIsCurrent: func() bool {
+			if s.chain != nil {
+				return s.chain.IsCurrentSnapshot()
+			}
+			return false
+		},
+		PeerCount: func() (int64, int64) {
+			return s.inboundPeerCount.Load(), s.outboundPeerCount.Load()
+		},
+		NetTotals: func() (uint64, uint64) {
+			return atomic.LoadUint64(&s.bytesReceived), atomic.LoadUint64(&s.bytesSent)
+		},
+		MempoolTxCount: func() int {
+			if s.txMemPool != nil {
+				return s.txMemPool.Count()
+			}
+			return 0
+		},
+		MempoolBytes: func() uint64 {
+			if s.txMemPool != nil {
+				return s.txMemPool.PoolBytes()
+			}
+			return 0
+		},
+		MempoolMaxBytes: func() uint64 {
+			if s.txMemPool != nil {
+				return s.txMemPool.MaxMempoolSize()
+			}
+			return 0
+		},
+		MempoolLastUpdated: func() time.Time {
+			if s.txMemPool != nil {
+				return s.txMemPool.LastUpdated()
+			}
+			return time.Time{}
+		},
+		OrphanBlocks: func() int {
+			if s.chain != nil {
+				return s.chain.OrphanCount()
+			}
+			return 0
+		},
+		OrphanTxs: func() int {
+			if s.txMemPool != nil {
+				return s.txMemPool.OrphanCount()
+			}
+			return 0
+		},
+	}
 }

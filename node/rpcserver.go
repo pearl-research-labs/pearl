@@ -35,6 +35,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/mempool"
+	"github.com/pearl-research-labs/pearl/node/metrics"
 	"github.com/pearl-research-labs/pearl/node/mining"
 	"github.com/pearl-research-labs/pearl/node/mining/cpuminer"
 	"github.com/pearl-research-labs/pearl/node/peer"
@@ -3548,8 +3549,12 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 	}
 
 	// Use 0 for the tag to represent local node.
+	start := time.Now()
 	acceptedTxs, err := s.cfg.TxMemPool.ProcessTransaction(tx, false, false, 0)
 	if err != nil {
+		rejectCode, _ := mempool.ErrToRejectErr(err)
+		metrics.RecordTxRejected(rejectCode)
+
 		// When the error is a rule error, it means the transaction was
 		// simply rejected as opposed to something actually going wrong,
 		// so log it as such. Otherwise, something really did go wrong,
@@ -3608,6 +3613,7 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 			tx.Hash())
 		return nil, internalRPCError(errStr, "")
 	}
+	metrics.RecordTxProcessed(time.Since(start))
 
 	// Generate and relay inventory vectors for all newly accepted
 	// transactions into the memory pool due to the original being
@@ -4228,6 +4234,7 @@ func (s *rpcServer) checkAuth(r *http.Request, require bool) (bool, bool, error)
 		if require {
 			rpcsLog.Warnf("RPC authentication failure from %s",
 				r.RemoteAddr)
+			metrics.RecordRPCAuthFailure()
 			return false, false, errors.New("auth failure")
 		}
 
@@ -4237,6 +4244,7 @@ func (s *rpcServer) checkAuth(r *http.Request, require bool) (bool, bool, error)
 	authenticated, isAdmin := s.checkCredentials(user, pass)
 	if !authenticated {
 		rpcsLog.Warnf("RPC authentication failure from %s", r.RemoteAddr)
+		metrics.RecordRPCAuthFailure()
 		return false, false, errors.New("auth failure")
 	}
 
@@ -4270,29 +4278,36 @@ type parsedRPCCmd struct {
 	err     *btcjson.RPCError
 }
 
+// rpcHandlerForMethod returns the handler for the given JSON-RPC method, or nil
+// if the method is not registered.
+func rpcHandlerForMethod(method string) commandHandler {
+	if handler, ok := rpcHandlers[method]; ok {
+		return handler
+	}
+	if _, ok := rpcAskWallet[method]; ok {
+		return handleAskWallet
+	}
+	if _, ok := rpcUnimplemented[method]; ok {
+		return handleUnimplemented
+	}
+	return nil
+}
+
 // standardCmdResult checks that a parsed command is a standard JSON-RPC
 // command and runs the appropriate handler to reply to the command.  Any
 // commands which are not recognized or not implemented will return an error
 // suitable for use in replies.
 func (s *rpcServer) standardCmdResult(cmd *parsedRPCCmd, closeChan <-chan struct{}) (interface{}, error) {
-	handler, ok := rpcHandlers[cmd.method]
-	if ok {
-		goto handled
+	handler := rpcHandlerForMethod(cmd.method)
+	if handler == nil {
+		metrics.RecordRPCMethodNotFound(cmd.method)
+		return nil, btcjson.ErrRPCMethodNotFound
 	}
-	_, ok = rpcAskWallet[cmd.method]
-	if ok {
-		handler = handleAskWallet
-		goto handled
-	}
-	_, ok = rpcUnimplemented[cmd.method]
-	if ok {
-		handler = handleUnimplemented
-		goto handled
-	}
-	return nil, btcjson.ErrRPCMethodNotFound
-handled:
 
-	return handler(s, cmd.cmd, closeChan)
+	start := time.Now()
+	res, err := handler(s, cmd.cmd, closeChan)
+	metrics.RecordRPCRequest(cmd.method, time.Since(start), err)
+	return res, err
 }
 
 // parseCmd parses a JSON-RPC request object into known concrete command.  The
@@ -4383,6 +4398,11 @@ func (s *rpcServer) processRequest(request *btcjson.Request, isAdmin bool, close
 		parsedCmd := parseCmd(request)
 		if parsedCmd.err != nil {
 			jsonErr = parsedCmd.err
+			// Record metric for method not found errors that happen
+			// during parsing (e.g., unregistered methods).
+			if jsonErr == btcjson.ErrRPCMethodNotFound {
+				metrics.RecordRPCMethodNotFound(request.Method)
+			}
 		} else {
 			result, err = s.standardCmdResult(parsedCmd,
 				closeChan)
@@ -4962,4 +4982,21 @@ func (s *rpcServer) handleBlockchainNotification(notification *blockchain.Notifi
 func init() {
 	rpcHandlers = rpcHandlersBeforeInit
 	rand.Seed(time.Now().UnixNano())
+
+	knownMethods := make([]string, 0, len(rpcHandlers)+len(rpcAskWallet)+len(rpcUnimplemented)+
+		len(wsHandlersBeforeInit))
+	for m := range rpcHandlers {
+		knownMethods = append(knownMethods, m)
+	}
+	for m := range rpcAskWallet {
+		knownMethods = append(knownMethods, m)
+	}
+	for m := range rpcUnimplemented {
+		knownMethods = append(knownMethods, m)
+	}
+	// wsHandlers is assigned by rpcwebsocket.go's init, which may not have run yet.
+	for m := range wsHandlersBeforeInit {
+		knownMethods = append(knownMethods, m)
+	}
+	metrics.InitKnownRPCMethods(knownMethods)
 }
