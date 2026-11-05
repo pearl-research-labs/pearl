@@ -78,6 +78,10 @@ Tip freshness is derived from the timestamp rather than exported as an age, so
 `time() - pearld_chain_tip_timestamp_seconds` stays correct even if the node
 stalls between scrapes.
 
+`pearld_utxo_cache_bytes` is the cache's own accounting: its entries plus the
+map it preallocates at startup, so it starts well above zero. A flush is forced
+once it reaches `pearld_utxo_cache_max_bytes`.
+
 ### P2P
 
 | Metric | Type | Labels | Description |
