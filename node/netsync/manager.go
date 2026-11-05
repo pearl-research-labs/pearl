@@ -17,6 +17,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/mempool"
+	"github.com/pearl-research-labs/pearl/node/metrics"
 	peerpkg "github.com/pearl-research-labs/pearl/node/peer"
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
@@ -766,6 +767,7 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 
 	// Process the transaction to include validation, insertion in the
 	// memory pool, orphan handling, etc.
+	start := time.Now()
 	acceptedTxs, err := sm.txMemPool.ProcessTransaction(tmsg.tx,
 		true, true, mempool.Tag(peer.ID()))
 
@@ -796,8 +798,12 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 		// Convert the error into an appropriate reject message and
 		// send it.
 		code, reason := mempool.ErrToRejectErr(err)
+		metrics.RecordTxRejected(code.String())
 		peer.PushRejectMsg(wire.CmdTx, code, reason, txHash, false)
 		return
+	}
+	if len(acceptedTxs) > 0 {
+		metrics.RecordTxProcessed(time.Since(start))
 	}
 
 	sm.peerNotifier.AnnounceNewTransactions(acceptedTxs)
@@ -903,7 +909,9 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 
 	// Process the block to include validation, best chain selection, orphan
 	// handling, etc.
+	start := time.Now()
 	isMainChain, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, behaviorFlags)
+	recordBlockResult(start, isOrphan, err)
 
 	// Strike accounting: a single decision point based on ProcessBlock's
 	// result rather than re-deriving it from chain state.
@@ -1639,8 +1647,10 @@ func (sm *SyncManager) processMessage(m interface{}) {
 		msg.reply <- peerID
 
 	case processBlockMsg:
+		start := time.Now()
 		_, isOrphan, err := sm.chain.ProcessBlock(
 			msg.block, msg.flags)
+		recordBlockResult(start, isOrphan, err)
 		msg.reply <- processBlockResponse{
 			isOrphan: isOrphan,
 			err:      err,
@@ -1944,6 +1954,29 @@ func (sm *SyncManager) SyncPeerID() int32 {
 	reply := make(chan int32)
 	sm.msgChan <- getSyncPeerMsg{reply: reply}
 	return <-reply
+}
+
+// recordBlockResult times accepted blocks and counts rejected ones; orphans are neither.
+func recordBlockResult(start time.Time, isOrphan bool, err error) {
+	if err != nil {
+		if reason, ok := blockRejectReason(err); ok {
+			metrics.RecordBlockRejected(reason)
+		}
+	} else if !isOrphan {
+		metrics.RecordBlockProcessed(time.Since(start))
+	}
+}
+
+// blockRejectReason labels err by rule code. Duplicates are skipped: peers re-announce blocks routinely.
+func blockRejectReason(err error) (string, bool) {
+	ruleErr, ok := err.(blockchain.RuleError)
+	if !ok {
+		return "other", true
+	}
+	if ruleErr.ErrorCode == blockchain.ErrDuplicateBlock {
+		return "", false
+	}
+	return ruleErr.ErrorCode.String(), true
 }
 
 // ProcessBlock makes use of ProcessBlock on an internal instance of a block

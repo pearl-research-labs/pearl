@@ -477,7 +477,8 @@ func TestUtxoCacheFlush(t *testing.T) {
 
 	// Flush.
 	err = chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+		return err
 	})
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
@@ -540,7 +541,8 @@ func TestUtxoCacheFlush(t *testing.T) {
 
 	// Flush.
 	err = chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+		return err
 	})
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
@@ -577,7 +579,8 @@ func TestUtxoCacheFlush(t *testing.T) {
 
 	// Attempt to flush with flush periodic.  Shouldn't flush.
 	err = chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		return err
 	})
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
@@ -592,7 +595,8 @@ func TestUtxoCacheFlush(t *testing.T) {
 
 	// Attempt to flush with flush periodic.  Should flush now.
 	err = chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		return err
 	})
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
@@ -670,7 +674,8 @@ func TestNonErasingFlushWithSpentEntries(t *testing.T) {
 	}
 
 	err := chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+		return err
 	})
 	require.NoError(err)
 	require.Equal(0, cache.cachedEntries.length())
@@ -706,7 +711,8 @@ func TestNonErasingFlushWithSpentEntries(t *testing.T) {
 	// Trigger a non-erasing periodic flush.
 	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
 	err = chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		return err
 	})
 	require.NoError(err)
 
@@ -749,7 +755,8 @@ func TestNonErasingFlushThenSpend(t *testing.T) {
 	// Non-erasing periodic flush writes entries to DB but keeps them in cache.
 	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
 	err := chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		return err
 	})
 	require.NoError(err)
 	require.Equal(5, cache.cachedEntries.length())
@@ -775,7 +782,8 @@ func TestNonErasingFlushThenSpend(t *testing.T) {
 
 	// Erasing flush removes spent entries from DB and clears cache.
 	err = chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+		return err
 	})
 	require.NoError(err)
 	require.Equal(0, cache.cachedEntries.length())
@@ -806,7 +814,8 @@ func TestPeriodicFlushErasesWhenCacheFull(t *testing.T) {
 	// perform an erasing flush (eraseCache = true).
 	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
 	err := chain.db.Update(func(dbTx database.Tx) error {
-		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+		return err
 	})
 	require.NoError(err)
 

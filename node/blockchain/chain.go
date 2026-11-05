@@ -105,6 +105,7 @@ type BlockChain struct {
 	sigCache            *txscript.SigCache
 	indexManager        IndexManager
 	hashCache           *txscript.HashCache
+	metrics             Metrics
 
 	// chainLock protects concurrent access to the vast majority of the
 	// fields in this struct below this point.
@@ -646,7 +647,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 				if needsFlush {
 					// Since the deleted hashes are past our last
 					// flush block, flush the utxo cache now.
-					err = b.utxoCache.flush(dbTx, FlushRequired, state)
+					err = b.flushUtxoCache(dbTx, FlushRequired, state)
 					if err != nil {
 						return err
 					}
@@ -725,7 +726,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		return nil
 	}
 	return b.db.Update(func(dbTx database.Tx) error {
-		return b.utxoCache.flush(dbTx, FlushIfNeeded, state)
+		return b.flushUtxoCache(dbTx, FlushIfNeeded, state)
 	})
 }
 
@@ -790,7 +791,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 		// reorganization modifies the database directly, the cache
 		// will be left in an inconsistent state if we don't flush it
 		// prior to the dbPutUtxoView that happens below.
-		err = b.utxoCache.flush(dbTx, FlushRequired, state)
+		err = b.flushUtxoCache(dbTx, FlushRequired, state)
 		if err != nil {
 			return err
 		}
@@ -976,6 +977,9 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	if forkNode != nil {
 		log.Infof("REORGANIZE: Chain forks at %v (height %v)", forkNode.hash,
 			forkNode.height)
+		if n := detachNodes.Len(); n > 0 {
+			b.metrics.Reorganized(n)
+		}
 	}
 	log.Infof("REORGANIZE: Old best chain head was %v (height %v)",
 		&oldBest.hash, oldBest.height)
@@ -2218,6 +2222,9 @@ type Config struct {
 	// will target for with block files.  Prune at 0 specifies that no
 	// blocks will be deleted.
 	Prune uint64
+
+	// Metrics records events. Nil Metrics discards them.
+	Metrics Metrics
 }
 
 // New returns a BlockChain instance using the provided configuration details.
@@ -2281,6 +2288,11 @@ func New(config *Config) (*BlockChain, error) {
 		}
 	}
 
+	metrics := config.Metrics
+	if metrics == nil {
+		metrics = noopMetrics{}
+	}
+
 	params := config.ChainParams
 	b := BlockChain{
 		checkpoints:         config.Checkpoints,
@@ -2293,6 +2305,7 @@ func New(config *Config) (*BlockChain, error) {
 		index:               newBlockIndex(config.DB, params),
 		utxoCache:           newUtxoCache(config.DB, config.UtxoCacheMaxSize),
 		hashCache:           config.HashCache,
+		metrics:             metrics,
 		bestChain:           newChainView(nil),
 		orphans:             make(map[chainhash.Hash]*orphanBlock),
 		prevOrphans:         make(map[chainhash.Hash][]*orphanBlock),

@@ -3549,8 +3549,12 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 	}
 
 	// Use 0 for the tag to represent local node.
+	start := time.Now()
 	acceptedTxs, err := s.cfg.TxMemPool.ProcessTransaction(tx, false, false, 0)
 	if err != nil {
+		rejectCode, _ := mempool.ErrToRejectErr(err)
+		metrics.RecordTxRejected(rejectCode.String())
+
 		// When the error is a rule error, it means the transaction was
 		// simply rejected as opposed to something actually going wrong,
 		// so log it as such. Otherwise, something really did go wrong,
@@ -3609,6 +3613,7 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 			tx.Hash())
 		return nil, internalRPCError(errStr, "")
 	}
+	metrics.RecordTxProcessed(time.Since(start))
 
 	// Generate and relay inventory vectors for all newly accepted
 	// transactions into the memory pool due to the original being

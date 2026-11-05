@@ -3070,6 +3070,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		HashCache:        s.hashCache,
 		Prune:            cfg.Prune * 1024 * 1024,
 		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+		Metrics:          metrics.Recorder{},
 	})
 	if err != nil {
 		return nil, err
@@ -3717,6 +3718,25 @@ func (s *server) MetricsSource() metrics.Source {
 				return s.txMemPool.LastUpdated()
 			}
 			return time.Time{}
+		},
+		OrphanBlocks: func() int {
+			if s.chain != nil {
+				return s.chain.OrphanCount()
+			}
+			return 0
+		},
+		OrphanTxs: func() int {
+			if s.txMemPool != nil {
+				return s.txMemPool.OrphanCount()
+			}
+			return 0
+		},
+		UtxoCache: func() (int, uint64, uint64) {
+			if s.chain != nil {
+				c := s.chain.UtxoCacheStats()
+				return c.Entries, c.MemoryBytes, c.MaxMemoryBytes
+			}
+			return 0, 0, 0
 		},
 	}
 }

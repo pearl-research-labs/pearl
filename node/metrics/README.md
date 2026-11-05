@@ -67,6 +67,12 @@ metric names.
 | `pearld_chain_blocks_connected_total` | Counter | | Blocks connected to the main chain |
 | `pearld_chain_blocks_disconnected_total` | Counter | | Blocks disconnected from the main chain |
 | `pearld_chain_blocks_accepted_total` | Counter | | Blocks accepted into the blockchain |
+| `pearld_chain_blocks_rejected_total` | Counter | `reason` | Blocks rejected, by rule violated (`ErrHighHash`, ...) or `other` for internal failures; duplicates excluded |
+| `pearld_chain_reorg_depth_blocks` | Histogram (1, 2, 3, 4, 8, … 2048) | | Blocks disconnected per reorg |
+| `pearld_chain_orphan_blocks` | Gauge | | Orphan blocks held |
+| `pearld_utxo_cache_entries` | Gauge | | Entries in the UTXO cache |
+| `pearld_utxo_cache_bytes` | Gauge | | UTXO cache memory use |
+| `pearld_utxo_cache_max_bytes` | Gauge | | Configured UTXO cache limit |
 
 Tip freshness is derived from the timestamp rather than exported as an age, so
 `time() - pearld_chain_tip_timestamp_seconds` stays correct even if the node
@@ -94,7 +100,7 @@ stalls between scrapes.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `pearld_rpc_requests_total` | Counter | `method`, `result` | Requests processed |
-| `pearld_rpc_request_duration_seconds` | Histogram | `method` | Handler execution latency |
+| `pearld_rpc_request_duration_seconds` | Native histogram | `method` | Handler execution latency |
 | `pearld_rpc_auth_failures_total` | Counter | | Failed authentication attempts |
 | `pearld_rpc_websocket_clients` | Gauge | | Connected WebSocket clients |
 
@@ -110,6 +116,33 @@ cannot inflate series count with arbitrary method names.
 | `pearld_mempool_bytes` | Gauge | | Mempool size in bytes |
 | `pearld_mempool_max_bytes` | Gauge | | Configured mempool size limit |
 | `pearld_mempool_last_updated_timestamp_seconds` | Gauge | | When the mempool last changed |
+| `pearld_mempool_orphan_transactions` | Gauge | | Transactions in the orphan pool |
+| `pearld_mempool_tx_rejected_total` | Counter | `reason` | Transactions rejected from peers or `sendrawtransaction`, by reject code (`REJECT_DUST`, ...) |
+
+### Timings
+
+Timings are native histograms: buckets grow exponentially. Only
+successful work is timed.
+
+| Metric | Measures |
+|--------|----------|
+| `pearld_chain_block_process_duration_seconds` | Processing of an accepted block from peers, `submitblock` or the miner, including sanity and certificate checks and any orphans it connects |
+| `pearld_chain_block_sanity_duration_seconds` | Context-free checks of a block that passed them: certificate, merkle root and transaction sanity |
+| `pearld_mempool_tx_process_duration_seconds` | Processing of an accepted transaction from peers or `sendrawtransaction`, including any orphans it promotes |
+| `pearld_utxo_cache_flush_duration_seconds` | Writing the UTXO cache into a flush transaction (database commit excluded) |
+| `pearld_rpc_request_duration_seconds` | JSON-RPC handler execution, per `method` |
+
+Native histograms are only sent over the protobuf format, so enable them on the Prometheus
+server (`scrape_native_histograms: true`, or `--enable-feature=native-histograms` on older
+versions). Then, for any window:
+
+```promql
+histogram_avg(rate(pearld_chain_block_process_duration_seconds[5m]))
+histogram_stddev(rate(pearld_chain_block_process_duration_seconds[5m]))
+histogram_stddev(rate(pearld_chain_block_process_duration_seconds[5m]))
+  / sqrt(histogram_count(increase(pearld_chain_block_process_duration_seconds[5m])))  # stderr
+histogram_quantile(0.99, rate(pearld_chain_block_process_duration_seconds[5m]))
+```
 
 ## Scraping
 

@@ -18,6 +18,17 @@ var (
 	chainBlocksConnectedTotal    prometheus.Counter
 	chainBlocksDisconnectedTotal prometheus.Counter
 	chainBlocksAcceptedTotal     prometheus.Counter
+	chainBlocksRejectedTotal     *prometheus.CounterVec
+	chainReorgDepthBlocks        prometheus.Histogram
+
+	// Timings
+	chainBlockProcessSeconds prometheus.Histogram
+	chainBlockSanitySeconds  prometheus.Histogram
+	mempoolTxProcessSeconds  prometheus.Histogram
+	utxoCacheFlushSeconds    prometheus.Histogram
+
+	// Mempool
+	mempoolTxRejectedTotal *prometheus.CounterVec
 
 	// P2P counters
 	p2pPeerConnectsTotal    *prometheus.CounterVec
@@ -64,6 +75,34 @@ func init() {
 		Name:      "chain_blocks_accepted_total",
 		Help:      "Total number of blocks accepted into the blockchain",
 	})
+	chainBlocksRejectedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: Namespace,
+		Name:      "chain_blocks_rejected_total",
+		Help:      "Total number of blocks rejected, by rule violated; duplicates are not counted",
+	}, []string{"reason"})
+	chainReorgDepthBlocks = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: Namespace,
+		Name:      "chain_reorg_depth_blocks",
+		Help:      "Blocks disconnected by each chain reorganization",
+		Buckets:   []float64{1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048},
+	})
+
+	// Timings
+	chainBlockProcessSeconds = newTiming("chain_block_process_duration_seconds",
+		"Time to process a block that was accepted, including sanity, certificate and orphan handling")
+	chainBlockSanitySeconds = newTiming("chain_block_sanity_duration_seconds",
+		"Time for the context-free checks of a block that passed them, mostly certificate verification")
+	mempoolTxProcessSeconds = newTiming("mempool_tx_process_duration_seconds",
+		"Time to process a transaction that was accepted, including any orphans it promoted")
+	utxoCacheFlushSeconds = newTiming("utxo_cache_flush_duration_seconds",
+		"Time to write the UTXO cache into a flush transaction, excluding the database commit")
+
+	// Mempool
+	mempoolTxRejectedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: Namespace,
+		Name:      "mempool_tx_rejected_total",
+		Help:      "Total number of transactions rejected from peers or sendrawtransaction, by reject code",
+	}, []string{"reason"})
 
 	// P2P metrics
 	p2pPeerConnectsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -109,12 +148,8 @@ func init() {
 		Help:      "Total JSON-RPC requests processed",
 	}, []string{"method", "result"})
 
-	rpcRequestDurationSecs = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: Namespace,
-		Name:      "rpc_request_duration_seconds",
-		Help:      "JSON-RPC request execution duration in seconds",
-		Buckets:   []float64{0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10},
-	}, []string{"method"})
+	rpcRequestDurationSecs = prometheus.NewHistogramVec(timingOpts("rpc_request_duration_seconds",
+		"JSON-RPC request execution duration in seconds"), []string{"method"})
 
 	rpcAuthFailuresTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: Namespace,
@@ -140,6 +175,13 @@ func init() {
 		chainBlocksConnectedTotal,
 		chainBlocksDisconnectedTotal,
 		chainBlocksAcceptedTotal,
+		chainBlocksRejectedTotal,
+		chainReorgDepthBlocks,
+		chainBlockProcessSeconds,
+		chainBlockSanitySeconds,
+		mempoolTxProcessSeconds,
+		utxoCacheFlushSeconds,
+		mempoolTxRejectedTotal,
 		p2pPeerConnectsTotal,
 		p2pPeerDisconnectsTotal,
 		p2pPeersBannedTotal,
@@ -152,6 +194,22 @@ func init() {
 		rpcWebsocketClients,
 		pearldInfo,
 	)
+}
+
+// timingOpts configures a native histogram with buckets √2 apart, capped at 34 (wider ranges halve
+// the resolution). PromQL's histogram_avg, histogram_stddev and histogram_quantile apply.
+func timingOpts(name, help string) prometheus.HistogramOpts {
+	return prometheus.HistogramOpts{
+		Namespace:                      Namespace,
+		Name:                           name,
+		Help:                           help,
+		NativeHistogramBucketFactor:    1.5,
+		NativeHistogramMaxBucketNumber: 34,
+	}
+}
+
+func newTiming(name, help string) prometheus.Histogram {
+	return prometheus.NewHistogram(timingOpts(name, help))
 }
 
 // InitKnownRPCMethods initializes the set of valid RPC methods for label sanitization.
@@ -195,6 +253,30 @@ func RecordBlockDisconnected() {
 
 func RecordBlockAccepted() {
 	chainBlocksAcceptedTotal.Inc()
+}
+
+// RecordBlockRejected counts a rejected block. reason must come from a fixed set, such as a
+// blockchain.ErrorCode name, so peers cannot grow the series count.
+func RecordBlockRejected(reason string) {
+	chainBlocksRejectedTotal.WithLabelValues(reason).Inc()
+}
+
+// RecordBlockProcessed times a block that was accepted (not an orphan).
+func RecordBlockProcessed(d time.Duration) { chainBlockProcessSeconds.Observe(d.Seconds()) }
+
+// RecordTxProcessed times a transaction that was accepted into the pool (not an orphan).
+func RecordTxProcessed(d time.Duration) { mempoolTxProcessSeconds.Observe(d.Seconds()) }
+
+// Recorder implements blockchain.Metrics.
+type Recorder struct{}
+
+func (Recorder) Reorganized(depth int)              { chainReorgDepthBlocks.Observe(float64(depth)) }
+func (Recorder) BlockSanityChecked(d time.Duration) { chainBlockSanitySeconds.Observe(d.Seconds()) }
+func (Recorder) UtxoCacheFlushed(d time.Duration)   { utxoCacheFlushSeconds.Observe(d.Seconds()) }
+
+// RecordTxRejected counts a rejected transaction by its wire reject code name.
+func RecordTxRejected(reason string) {
+	mempoolTxRejectedTotal.WithLabelValues(reason).Inc()
 }
 
 // P2P recording helpers

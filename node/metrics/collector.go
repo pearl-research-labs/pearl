@@ -18,6 +18,9 @@ type Source struct {
 	MempoolBytes       func() uint64
 	MempoolMaxBytes    func() uint64
 	MempoolLastUpdated func() time.Time
+	OrphanBlocks       func() int
+	OrphanTxs          func() int
+	UtxoCache          func() (entries int, memoryBytes, maxMemoryBytes uint64)
 }
 
 // ScrapeCollector implements prometheus.Collector to collect live state at scrape time.
@@ -35,6 +38,11 @@ type ScrapeCollector struct {
 	mempoolBytesDesc                *prometheus.Desc
 	mempoolMaxBytesDesc             *prometheus.Desc
 	mempoolLastUpdatedTimestampDesc *prometheus.Desc
+	orphanBlocksDesc                *prometheus.Desc
+	orphanTxsDesc                   *prometheus.Desc
+	utxoCacheEntriesDesc            *prometheus.Desc
+	utxoCacheBytesDesc              *prometheus.Desc
+	utxoCacheMaxBytesDesc           *prometheus.Desc
 }
 
 func NewScrapeCollector(src Source) *ScrapeCollector {
@@ -95,6 +103,31 @@ func NewScrapeCollector(src Source) *ScrapeCollector {
 			"Unix timestamp when mempool was last updated",
 			nil, nil,
 		),
+		orphanBlocksDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "chain_orphan_blocks"),
+			"Current number of orphan blocks held",
+			nil, nil,
+		),
+		orphanTxsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "mempool_orphan_transactions"),
+			"Current number of transactions in the orphan pool",
+			nil, nil,
+		),
+		utxoCacheEntriesDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "utxo_cache_entries"),
+			"Current number of entries in the UTXO cache",
+			nil, nil,
+		),
+		utxoCacheBytesDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "utxo_cache_bytes"),
+			"Current memory used by the UTXO cache in bytes",
+			nil, nil,
+		),
+		utxoCacheMaxBytesDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "utxo_cache_max_bytes"),
+			"Configured UTXO cache memory limit in bytes",
+			nil, nil,
+		),
 	}
 }
 
@@ -110,6 +143,11 @@ func (c *ScrapeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.mempoolBytesDesc
 	ch <- c.mempoolMaxBytesDesc
 	ch <- c.mempoolLastUpdatedTimestampDesc
+	ch <- c.orphanBlocksDesc
+	ch <- c.orphanTxsDesc
+	ch <- c.utxoCacheEntriesDesc
+	ch <- c.utxoCacheBytesDesc
+	ch <- c.utxoCacheMaxBytesDesc
 }
 
 func (c *ScrapeCollector) Collect(ch chan<- prometheus.Metric) {
@@ -158,5 +196,17 @@ func (c *ScrapeCollector) Collect(ch chan<- prometheus.Metric) {
 		if !lu.IsZero() {
 			ch <- prometheus.MustNewConstMetric(c.mempoolLastUpdatedTimestampDesc, prometheus.GaugeValue, float64(lu.Unix()))
 		}
+	}
+	if s.OrphanBlocks != nil {
+		ch <- prometheus.MustNewConstMetric(c.orphanBlocksDesc, prometheus.GaugeValue, float64(s.OrphanBlocks()))
+	}
+	if s.OrphanTxs != nil {
+		ch <- prometheus.MustNewConstMetric(c.orphanTxsDesc, prometheus.GaugeValue, float64(s.OrphanTxs()))
+	}
+	if s.UtxoCache != nil {
+		entries, memoryBytes, maxMemoryBytes := s.UtxoCache()
+		ch <- prometheus.MustNewConstMetric(c.utxoCacheEntriesDesc, prometheus.GaugeValue, float64(entries))
+		ch <- prometheus.MustNewConstMetric(c.utxoCacheBytesDesc, prometheus.GaugeValue, float64(memoryBytes))
+		ch <- prometheus.MustNewConstMetric(c.utxoCacheMaxBytesDesc, prometheus.GaugeValue, float64(maxMemoryBytes))
 	}
 }
