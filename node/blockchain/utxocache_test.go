@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +18,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/database/ffldb"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,9 +66,7 @@ func TestMapSlice(t *testing.T) {
 			ms.put(key, nil, 0)
 		}
 
-		if len(m) != ms.length() {
-			t.Fatalf("expected len of %d, got %d", len(m), ms.length())
-		}
+		require.Equal(t, len(m), ms.length())
 
 		// Delete the first element in the first map.
 		ms.delete(test.keys[0])
@@ -79,31 +77,20 @@ func TestMapSlice(t *testing.T) {
 		m[test.keys[len(test.keys)-1]] = &UtxoEntry{}
 
 		// Check that the duplicate didn't make it in.
-		if len(m) != ms.length() {
-			t.Fatalf("expected len of %d, got %d", len(m), ms.length())
-		}
+		require.Equal(t, len(m), ms.length())
 
 		ms.put(test.keys[0], &UtxoEntry{}, 0)
 		m[test.keys[0]] = &UtxoEntry{}
 
-		if len(m) != ms.length() {
-			t.Fatalf("expected len of %d, got %d", len(m), ms.length())
-		}
+		require.Equal(t, len(m), ms.length())
 
 		for _, key := range test.keys {
-			expected, found := m[key]
-			if !found {
-				t.Fatalf("expected key %s to exist in the go map", key.String())
-			}
+			want, found := m[key]
+			require.True(t, found, "key %s missing from the go map", key)
 
 			got, found := ms.get(key)
-			if !found {
-				t.Fatalf("expected key %s to exist in the map slice", key.String())
-			}
-
-			if !reflect.DeepEqual(got, expected) {
-				t.Fatalf("expected value of %v, got %v", expected, got)
-			}
+			require.True(t, found, "key %s missing from the map slice", key)
+			require.Equal(t, want, got)
 		}
 	}
 }
@@ -234,9 +221,9 @@ func TestUtxoCacheEntrySize(t *testing.T) {
 		txIns  []*wire.TxIn
 	}
 	tests := []struct {
-		name         string
-		blocks       []block
-		expectedSize uint64
+		name     string
+		blocks   []block
+		wantSize uint64
 	}{
 		{
 			name: "one entry",
@@ -252,7 +239,7 @@ func TestUtxoCacheEntrySize(t *testing.T) {
 					},
 				}
 			}(),
-			expectedSize: pubKeyHashLen + baseEntrySize,
+			wantSize: pubKeyHashLen + baseEntrySize,
 		},
 		{
 			name: "10 entries, 4 spend",
@@ -282,7 +269,7 @@ func TestUtxoCacheEntrySize(t *testing.T) {
 				return blocks
 			}(),
 			// Multiplied by 6 since we'll have 6 entries left.
-			expectedSize: (pubKeyHashLen + baseEntrySize) * 6,
+			wantSize: (pubKeyHashLen + baseEntrySize) * 6,
 		},
 		{
 			name: "spend everything",
@@ -309,29 +296,28 @@ func TestUtxoCacheEntrySize(t *testing.T) {
 				}
 				return blocks
 			}(),
-			expectedSize: 0,
+			wantSize: 0,
 		},
 	}
 
-	for _, test := range tests {
-		// Size is just something big enough so that the mapslice doesn't
-		// run out of memory.
-		s := newUtxoCache(nil, 1*1024*1024)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Size is just something big enough so that the mapslice doesn't
+			// run out of memory.
+			s := newUtxoCache(nil, 1*1024*1024)
 
-		for height, block := range test.blocks {
-			for i, out := range block.txOuts {
-				s.addTxOut(block.outOps[i], out, true, int32(height))
+			for height, block := range tt.blocks {
+				for i, out := range block.txOuts {
+					require.NoError(t, s.addTxOut(block.outOps[i], out, true, int32(height)))
+				}
+
+				for _, in := range block.txIns {
+					require.NoError(t, s.addTxIn(in, nil))
+				}
 			}
 
-			for _, in := range block.txIns {
-				s.addTxIn(in, nil)
-			}
-		}
-
-		if s.totalEntryMemory != test.expectedSize {
-			t.Errorf("Failed test %s. Expected size of %d, got %d",
-				test.name, test.expectedSize, s.totalEntryMemory)
-		}
+			assert.Equal(t, tt.wantSize, s.totalEntryMemory)
+		})
 	}
 }
 
@@ -401,6 +387,17 @@ func utxoCacheTestChain(testName string) (*BlockChain, *chaincfg.Params, func())
 	return chain, &params, tearDown
 }
 
+func flushCache(t *testing.T, chain *BlockChain, mode FlushMode) (flushed bool) {
+	t.Helper()
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		var err error
+		flushed, err = chain.utxoCache.flush(dbTx, mode, chain.stateSnapshot)
+		return err
+	})
+	require.NoError(t, err)
+	return flushed
+}
+
 func TestUtxoCacheFlush(t *testing.T) {
 	chain, params, tearDown := utxoCacheTestChain("TestUtxoCacheFlush")
 	defer tearDown()
@@ -408,21 +405,11 @@ func TestUtxoCacheFlush(t *testing.T) {
 	tip := btcutil.NewBlock(params.GenesisBlock)
 	genesisHash := params.GenesisBlock.BlockHash() // TODO Or: change to constant value after deciding on a pow struct and genesis block
 	// The chainSetup init triggers the consistency status write.
-	err := assertConsistencyState(chain, &genesisHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = assertNbEntriesOnDisk(chain, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, assertConsistencyState(chain, &genesisHash))
+	require.NoError(t, assertNbEntriesOnDisk(chain, 0))
 
 	// LastFlushHash starts with genesis.
-	if cache.lastFlushHash != genesisHash {
-		t.Fatalf("lastFlushHash before first flush expected to be "+
-			"genesis block hash, instead was %v", cache.lastFlushHash)
-	}
+	require.Equal(t, genesisHash, cache.lastFlushHash)
 
 	// First, add 10 utxos without flushing.
 	outPoints := make([]wire.OutPoint, 10)
@@ -432,98 +419,53 @@ func TestUtxoCacheFlush(t *testing.T) {
 
 		// Add the txout.
 		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
-		cache.addTxOut(op, &txOut, true, int32(i))
+		require.NoError(t, cache.addTxOut(op, &txOut, true, int32(i)))
 	}
 
-	if cache.cachedEntries.length() != len(outPoints) {
-		t.Fatalf("Expected 10 entries, has %d instead", cache.cachedEntries.length())
-	}
+	require.Equal(t, len(outPoints), cache.cachedEntries.length())
 
 	// All entries should be fresh and modified.
 	for _, m := range cache.cachedEntries.maps {
 		for outpoint, entry := range m {
-			if entry == nil {
-				t.Fatalf("Unexpected nil entry found for %v", outpoint)
-			}
-			if !entry.isModified() {
-				t.Fatal("Entry should be marked modified")
-			}
-			if !entry.isFresh() {
-				t.Fatal("Entry should be marked fresh")
-			}
+			require.NotNil(t, entry, "entry for %v", outpoint)
+			require.True(t, entry.isModified(), "entry should be marked modified")
+			require.True(t, entry.isFresh(), "entry should be marked fresh")
 		}
 	}
 
 	// Spend the last outpoint and pop it off from the outpoints slice.
 	var spendOp wire.OutPoint
 	spendOp, outPoints = outPoints[len(outPoints)-1], outPoints[:len(outPoints)-1]
-	cache.addTxIn(&wire.TxIn{PreviousOutPoint: spendOp}, nil)
+	require.NoError(t, cache.addTxIn(&wire.TxIn{PreviousOutPoint: spendOp}, nil))
 
-	if cache.cachedEntries.length() != len(outPoints) {
-		t.Fatalf("Expected %d entries, has %d instead",
-			len(outPoints), cache.cachedEntries.length())
-	}
+	require.Equal(t, len(outPoints), cache.cachedEntries.length())
 
 	// Not flushed yet.
-	err = assertConsistencyState(chain, &genesisHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = assertNbEntriesOnDisk(chain, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, assertConsistencyState(chain, &genesisHash))
+	require.NoError(t, assertNbEntriesOnDisk(chain, 0))
 
 	// Flush.
-	err = chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("unexpected error while flushing cache: %v", err)
-	}
-	if cache.cachedEntries.length() != 0 {
-		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
-	}
-
-	err = assertConsistencyState(chain, tip.Hash())
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = assertNbEntriesOnDisk(chain, len(outPoints))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.True(t, flushCache(t, chain, FlushRequired))
+	require.Equal(t, 0, cache.cachedEntries.length())
+	require.NoError(t, assertConsistencyState(chain, tip.Hash()))
+	require.NoError(t, assertNbEntriesOnDisk(chain, len(outPoints)))
 
 	// Fetch the flushed utxos.
 	entries, err := cache.fetchAndAddEntries(outPoints)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Check that the returned entries are not marked fresh and modified.
 	for _, entry := range entries {
-		if entry.isFresh() {
-			t.Fatal("Entry should not be marked fresh")
-		}
-		if entry.isModified() {
-			t.Fatal("Entry should not be marked modified")
-		}
+		require.False(t, entry.isFresh(), "entry should not be marked fresh")
+		require.False(t, entry.isModified(), "entry should not be marked modified")
 	}
 
 	// Check that the fetched entries in the cache are not marked fresh and modified.
 	for _, m := range cache.cachedEntries.maps {
 		for outpoint, elem := range m {
-			if elem == nil {
-				t.Fatalf("Unexpected nil entry found for %v", outpoint)
-			}
-			if elem.isFresh() {
-				t.Fatal("Entry should not be marked fresh")
-			}
-			if elem.isModified() {
-				t.Fatal("Entry should not be marked modified")
-			}
+			require.NotNil(t, elem, "entry for %v", outpoint)
+			require.False(t, elem.isFresh(), "entry should not be marked fresh")
+			require.False(t, elem.isModified(), "entry should not be marked modified")
 		}
 	}
 
@@ -531,34 +473,17 @@ func TestUtxoCacheFlush(t *testing.T) {
 	prevLen := len(outPoints)
 	for i := 0; i < 5; i++ {
 		spendOp, outPoints = outPoints[len(outPoints)-1], outPoints[:len(outPoints)-1]
-		cache.addTxIn(&wire.TxIn{PreviousOutPoint: spendOp}, nil)
+		require.NoError(t, cache.addTxIn(&wire.TxIn{PreviousOutPoint: spendOp}, nil))
 	}
 
 	// Should still have the entries in cache so they can be flushed to disk.
-	if cache.cachedEntries.length() != prevLen {
-		t.Fatalf("Expected 10 entries, has %d instead", cache.cachedEntries.length())
-	}
+	require.Equal(t, prevLen, cache.cachedEntries.length())
 
 	// Flush.
-	err = chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("unexpected error while flushing cache: %v", err)
-	}
-	if cache.cachedEntries.length() != 0 {
-		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
-	}
-
-	err = assertConsistencyState(chain, tip.Hash())
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = assertNbEntriesOnDisk(chain, len(outPoints))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.True(t, flushCache(t, chain, FlushRequired))
+	require.Equal(t, 0, cache.cachedEntries.length())
+	require.NoError(t, assertConsistencyState(chain, tip.Hash()))
+	require.NoError(t, assertNbEntriesOnDisk(chain, len(outPoints)))
 
 	// Add 5 utxos without flushing and test for periodic flushes.
 	outPoints1 := make([]wire.OutPoint, 5)
@@ -570,96 +495,68 @@ func TestUtxoCacheFlush(t *testing.T) {
 
 		// Add the txout.
 		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
-		cache.addTxOut(op, &txOut, true, int32(i+prevLen))
+		require.NoError(t, cache.addTxOut(op, &txOut, true, int32(i+prevLen)))
 	}
-	if cache.cachedEntries.length() != len(outPoints1) {
-		t.Fatalf("Expected %d entries, has %d instead",
-			len(outPoints1), cache.cachedEntries.length())
-	}
+	require.Equal(t, len(outPoints1), cache.cachedEntries.length())
 
 	// Attempt to flush with flush periodic.  Shouldn't flush.
-	err = chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("unexpected error while flushing cache: %v", err)
-	}
-	if cache.cachedEntries.length() == 0 {
-		t.Fatalf("Expected %d entries, has %d instead",
-			len(outPoints1), cache.cachedEntries.length())
-	}
+	require.False(t, flushCache(t, chain, FlushPeriodic))
+	require.Equal(t, len(outPoints1), cache.cachedEntries.length())
 
 	// Arbitrarily set the last flush time to 6 minutes ago.
 	cache.lastFlushTime = time.Now().Add(-time.Minute * 6)
 
 	// Attempt to flush with flush periodic.  Should flush now.
-	err = chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("unexpected error while flushing cache: %v", err)
-	}
-	if cache.cachedEntries.length() != len(outPoints1) {
-		t.Fatalf("Expected %d entries, has %d instead", len(outPoints1), cache.cachedEntries.length())
-	}
+	require.True(t, flushCache(t, chain, FlushPeriodic))
+	require.Equal(t, len(outPoints1), cache.cachedEntries.length())
 	for _, m := range cache.cachedEntries.maps {
 		for _, entry := range m {
-			if entry != nil && entry.isModified() {
-				t.Fatalf("Expected entry to not be modified after periodic flush")
+			if entry != nil {
+				require.False(t, entry.isModified(), "entry should not be modified after a periodic flush")
 			}
 		}
 	}
 
-	err = assertConsistencyState(chain, tip.Hash())
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = assertNbEntriesOnDisk(chain, len(outPoints)+len(outPoints1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, assertConsistencyState(chain, tip.Hash()))
+	assert.NoError(t, assertNbEntriesOnDisk(chain, len(outPoints)+len(outPoints1)))
 }
 
 func TestShouldFlush(t *testing.T) {
-	require := require.New(t)
 	cache := newUtxoCache(nil, 1*1024*1024)
 
 	bestState := &BestState{Hash: chainhash.Hash{0x01}}
 	otherState := &BestState{Hash: chainhash.Hash{0x02}}
 
 	// FlushRequired always returns true, even with an empty cache.
-	require.True(cache.shouldFlush(FlushRequired, bestState))
+	assert.True(t, cache.shouldFlush(FlushRequired, bestState))
 
 	// FlushIfNeeded returns false when bestState hash matches lastFlushHash.
 	cache.lastFlushHash = bestState.Hash
-	require.False(cache.shouldFlush(FlushIfNeeded, bestState))
+	assert.False(t, cache.shouldFlush(FlushIfNeeded, bestState))
 
 	// FlushIfNeeded returns false when cache is below max and hash differs.
 	cache.lastFlushHash = chainhash.Hash{}
-	require.False(cache.shouldFlush(FlushIfNeeded, otherState))
+	assert.False(t, cache.shouldFlush(FlushIfNeeded, otherState))
 
 	// FlushIfNeeded returns true when cache exceeds max.
 	cache.maxTotalMemoryUsage = 1
-	require.True(cache.shouldFlush(FlushIfNeeded, otherState))
+	assert.True(t, cache.shouldFlush(FlushIfNeeded, otherState))
 	cache.maxTotalMemoryUsage = 1 * 1024 * 1024
 
 	// FlushPeriodic returns false when timer is recent and cache is below max.
 	cache.lastFlushTime = time.Now()
-	require.False(cache.shouldFlush(FlushPeriodic, bestState))
+	assert.False(t, cache.shouldFlush(FlushPeriodic, bestState))
 
 	// FlushPeriodic returns true when timer has expired.
 	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
-	require.True(cache.shouldFlush(FlushPeriodic, bestState))
+	assert.True(t, cache.shouldFlush(FlushPeriodic, bestState))
 
 	// FlushPeriodic returns false again after timer is reset.
 	cache.lastFlushTime = time.Now()
-	require.False(cache.shouldFlush(FlushPeriodic, bestState))
+	assert.False(t, cache.shouldFlush(FlushPeriodic, bestState))
 }
 
 func TestNonErasingFlushWithSpentEntries(t *testing.T) {
-	require := require.New(t)
 	chain, _, tearDown := utxoCacheTestChain("TestNonErasingFlushSpent")
 	defer tearDown()
 	cache := chain.utxoCache
@@ -670,31 +567,27 @@ func TestNonErasingFlushWithSpentEntries(t *testing.T) {
 		op := outpointFromInt(i)
 		outPoints[i] = op
 		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
-		cache.addTxOut(op, &txOut, true, int32(i))
+		require.NoError(t, cache.addTxOut(op, &txOut, true, int32(i)))
 	}
 
-	err := chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
-		return err
-	})
-	require.NoError(err)
-	require.Equal(0, cache.cachedEntries.length())
-	require.NoError(assertNbEntriesOnDisk(chain, 10))
+	require.True(t, flushCache(t, chain, FlushRequired))
+	require.Equal(t, 0, cache.cachedEntries.length())
+	require.NoError(t, assertNbEntriesOnDisk(chain, 10))
 
 	// Fetch entries back from DB so they're cached as non-fresh, non-modified.
 	entries, err := cache.fetchAndAddEntries(outPoints)
-	require.NoError(err)
+	require.NoError(t, err)
 	for _, e := range entries {
-		require.NotNil(e)
-		require.False(e.isFresh())
-		require.False(e.isModified())
+		require.NotNil(t, e)
+		require.False(t, e.isFresh())
+		require.False(t, e.isModified())
 	}
 
 	// Spend 3 entries. They're not fresh, so they stay in cache as spent.
 	for i := 0; i < 3; i++ {
-		cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[i]}, nil)
+		require.NoError(t, cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[i]}, nil))
 	}
-	require.Equal(10, cache.cachedEntries.length(),
+	require.Equal(t, 10, cache.cachedEntries.length(),
 		"spent non-fresh entries should remain in cache until flushed")
 
 	// Add 2 new fresh entries.
@@ -703,24 +596,20 @@ func TestNonErasingFlushWithSpentEntries(t *testing.T) {
 		op := outpointFromInt(100 + i)
 		newOutPoints[i] = op
 		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
-		cache.addTxOut(op, &txOut, true, 100+int32(i))
+		require.NoError(t, cache.addTxOut(op, &txOut, true, 100+int32(i)))
 	}
-	require.Equal(12, cache.cachedEntries.length())
+	require.Equal(t, 12, cache.cachedEntries.length())
 	memBefore := cache.totalEntryMemory
 
 	// Trigger a non-erasing periodic flush.
 	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
-	err = chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
-		return err
-	})
-	require.NoError(err)
+	require.True(t, flushCache(t, chain, FlushPeriodic))
 
 	// Spent entries (3) removed; unspent fetched (7) + new flushed (2) = 9 remain.
-	require.Equal(9, cache.cachedEntries.length())
+	assert.Equal(t, 9, cache.cachedEntries.length())
 
 	// Memory should have decreased by the spent entries' memory.
-	require.Less(cache.totalEntryMemory, memBefore)
+	assert.Less(t, cache.totalEntryMemory, memBefore)
 
 	// All remaining entries should have modified and fresh flags cleared.
 	for _, m := range cache.cachedEntries.maps {
@@ -728,17 +617,16 @@ func TestNonErasingFlushWithSpentEntries(t *testing.T) {
 			if entry == nil {
 				continue
 			}
-			require.False(entry.isModified())
-			require.False(entry.isFresh())
+			assert.False(t, entry.isModified())
+			assert.False(t, entry.isFresh())
 		}
 	}
 
 	// DB should have 10 - 3 spent + 2 new = 9 entries.
-	require.NoError(assertNbEntriesOnDisk(chain, 9))
+	assert.NoError(t, assertNbEntriesOnDisk(chain, 9))
 }
 
 func TestNonErasingFlushThenSpend(t *testing.T) {
-	require := require.New(t)
 	chain, _, tearDown := utxoCacheTestChain("TestNonErasingFlushThenSpend")
 	defer tearDown()
 	cache := chain.utxoCache
@@ -749,25 +637,21 @@ func TestNonErasingFlushThenSpend(t *testing.T) {
 		op := outpointFromInt(i)
 		outPoints[i] = op
 		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
-		cache.addTxOut(op, &txOut, true, int32(i))
+		require.NoError(t, cache.addTxOut(op, &txOut, true, int32(i)))
 	}
 
 	// Non-erasing periodic flush writes entries to DB but keeps them in cache.
 	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
-	err := chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
-		return err
-	})
-	require.NoError(err)
-	require.Equal(5, cache.cachedEntries.length())
-	require.NoError(assertNbEntriesOnDisk(chain, 5))
+	require.True(t, flushCache(t, chain, FlushPeriodic))
+	require.Equal(t, 5, cache.cachedEntries.length())
+	require.NoError(t, assertNbEntriesOnDisk(chain, 5))
 
 	// Verify tfFresh was cleared (critical: without this, spending would
 	// delete the entry from cache but leave it orphaned in the database).
 	for _, m := range cache.cachedEntries.maps {
 		for _, entry := range m {
 			if entry != nil {
-				require.False(entry.isFresh())
+				require.False(t, entry.isFresh())
 			}
 		}
 	}
@@ -775,26 +659,21 @@ func TestNonErasingFlushThenSpend(t *testing.T) {
 	// Spend 2 entries. Since tfFresh was cleared by the non-erasing flush,
 	// addTxIn keeps them in cache as spent markers so writeCache can delete
 	// them from the database on the next flush.
-	cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[0]}, nil)
-	cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[1]}, nil)
-	require.Equal(5, cache.cachedEntries.length(),
+	require.NoError(t, cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[0]}, nil))
+	require.NoError(t, cache.addTxIn(&wire.TxIn{PreviousOutPoint: outPoints[1]}, nil))
+	require.Equal(t, 5, cache.cachedEntries.length(),
 		"spent non-fresh entries must remain in cache until flushed to DB")
 
 	// Erasing flush removes spent entries from DB and clears cache.
-	err = chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
-		return err
-	})
-	require.NoError(err)
-	require.Equal(0, cache.cachedEntries.length())
-	require.Equal(uint64(0), cache.totalEntryMemory)
+	require.True(t, flushCache(t, chain, FlushRequired))
+	assert.Equal(t, 0, cache.cachedEntries.length())
+	assert.Equal(t, uint64(0), cache.totalEntryMemory)
 
 	// DB should have 5 - 2 spent = 3 entries.
-	require.NoError(assertNbEntriesOnDisk(chain, 3))
+	assert.NoError(t, assertNbEntriesOnDisk(chain, 3))
 }
 
 func TestPeriodicFlushErasesWhenCacheFull(t *testing.T) {
-	require := require.New(t)
 	chain, _, tearDown := utxoCacheTestChain("TestPeriodicFlushErasesWhenFull")
 	defer tearDown()
 	cache := chain.utxoCache
@@ -803,7 +682,7 @@ func TestPeriodicFlushErasesWhenCacheFull(t *testing.T) {
 	for i := 0; i < numEntries; i++ {
 		op := outpointFromInt(i)
 		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
-		cache.addTxOut(op, &txOut, true, int32(i))
+		require.NoError(t, cache.addTxOut(op, &txOut, true, int32(i)))
 	}
 
 	// Lower the threshold below current usage to simulate a full cache.
@@ -813,26 +692,21 @@ func TestPeriodicFlushErasesWhenCacheFull(t *testing.T) {
 	// Periodic flush with expired timer AND cache exceeding max should
 	// perform an erasing flush (eraseCache = true).
 	cache.lastFlushTime = time.Now().Add(-utxoFlushPeriodicInterval - time.Second)
-	err := chain.db.Update(func(dbTx database.Tx) error {
-		_, err := cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
-		return err
-	})
-	require.NoError(err)
+	require.True(t, flushCache(t, chain, FlushPeriodic))
 
-	require.Equal(0, cache.cachedEntries.length(),
+	assert.Equal(t, 0, cache.cachedEntries.length(),
 		"periodic flush should erase cache when memory exceeds max")
-	require.Equal(uint64(0), cache.totalEntryMemory)
-	require.NoError(assertNbEntriesOnDisk(chain, numEntries))
+	assert.Equal(t, uint64(0), cache.totalEntryMemory)
+	assert.NoError(t, assertNbEntriesOnDisk(chain, numEntries))
 }
 
 func TestFlushNeededAfterPrune(t *testing.T) {
 	// Construct a synthetic block chain with a block index consisting of
 	// the following structure.
 	// 	genesis -> 1 -> 2 -> ... -> 15 -> 16  -> 17  -> 18
-	require := require.New(t)
 	tip := tstTip
 	chain, tearDown, err := chainSetup("TestFlushNeededAfterPrune", &chaincfg.MainNetParams)
-	require.NoError(err)
+	require.NoError(t, err)
 	defer tearDown()
 
 	chain.utxoCache = newUtxoCache(nil, 0)
@@ -846,7 +720,7 @@ func TestFlushNeededAfterPrune(t *testing.T) {
 		name          string
 		lastFlushHash chainhash.Hash
 		delHashes     []chainhash.Hash
-		expected      bool
+		want          bool
 	}{
 		{
 			name: "deleted block up to height 9, last flush hash at block 10",
@@ -861,13 +735,10 @@ func TestFlushNeededAfterPrune(t *testing.T) {
 				return delBlockHashes
 			}(),
 			lastFlushHash: func() chainhash.Hash {
-				// Just some sanity checking to make sure the height is 10.
-				if branchNodes[9].height != 10 {
-					panic("was looking for height 10")
-				}
+				require.Equal(t, int32(10), branchNodes[9].height)
 				return branchNodes[9].hash
 			}(),
-			expected: false,
+			want: false,
 		},
 		{
 			name: "deleted blocks up to height 10, last flush hash at block 10",
@@ -881,70 +752,51 @@ func TestFlushNeededAfterPrune(t *testing.T) {
 				return delBlockHashes
 			}(),
 			lastFlushHash: func() chainhash.Hash {
-				// Just some sanity checking to make sure the height is 10.
-				if branchNodes[9].height != 10 {
-					panic("was looking for height 10")
-				}
+				require.Equal(t, int32(10), branchNodes[9].height)
 				return branchNodes[9].hash
 			}(),
-			expected: true,
+			want: true,
 		},
 		{
 			name: "deleted block height 17, last flush hash at block 5",
 			delHashes: func() []chainhash.Hash {
-				delBlockHashes := make([]chainhash.Hash, 1)
-				delBlockHashes[0] = branchNodes[16].hash
-				// Just some sanity checking to make sure the height is 10.
-				if branchNodes[16].height != 17 {
-					panic("was looking for height 17")
-				}
-				return delBlockHashes
+				require.Equal(t, int32(17), branchNodes[16].height)
+				return []chainhash.Hash{branchNodes[16].hash}
 			}(),
 			lastFlushHash: func() chainhash.Hash {
-				// Just some sanity checking to make sure the height is 10.
-				if branchNodes[4].height != 5 {
-					panic("was looking for height 5")
-				}
+				require.Equal(t, int32(5), branchNodes[4].height)
 				return branchNodes[4].hash
 			}(),
-			expected: true,
+			want: true,
 		},
 		{
 			name: "deleted block height 3, last flush hash at block 4",
 			delHashes: func() []chainhash.Hash {
-				delBlockHashes := make([]chainhash.Hash, 1)
-				delBlockHashes[0] = branchNodes[2].hash
-				// Just some sanity checking to make sure the height is 10.
-				if branchNodes[2].height != 3 {
-					panic("was looking for height 3")
-				}
-				return delBlockHashes
+				require.Equal(t, int32(3), branchNodes[2].height)
+				return []chainhash.Hash{branchNodes[2].hash}
 			}(),
 			lastFlushHash: func() chainhash.Hash {
-				// Just some sanity checking to make sure the height is 10.
-				if branchNodes[3].height != 4 {
-					panic("was looking for height 4")
-				}
+				require.Equal(t, int32(4), branchNodes[3].height)
 				return branchNodes[3].hash
 			}(),
-			expected: false,
+			want: false,
 		},
 	}
 
-	for _, test := range tests {
-		chain.utxoCache.lastFlushHash = test.lastFlushHash
-		got, err := chain.flushNeededAfterPrune(test.delHashes)
-		require.NoError(err)
-		require.Equal(test.expected, got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chain.utxoCache.lastFlushHash = tt.lastFlushHash
+			got, err := chain.flushNeededAfterPrune(tt.delHashes)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
 	}
 }
 
 func TestFlushOnPrune(t *testing.T) {
 	t.Skip("Test files rely on Bitcoin block format, which is no longer supported") // TODO Or: re-enable with Pearl-format test fixtures
 	chain, tearDown, err := chainSetup("TestFlushOnPrune", &chaincfg.MainNetParams)
-	if err != nil {
-		panic(fmt.Sprintf("error loading blockchain with database: %v", err))
-	}
+	require.NoError(t, err)
 	defer tearDown()
 
 	chain.utxoCache.maxTotalMemoryUsage = 10 * 1024 * 1024
@@ -957,9 +809,7 @@ func TestFlushOnPrune(t *testing.T) {
 
 	// Read blocks from the file.
 	blocks, err := loadBlocks("blk_0_to_14131.dat")
-	if err != nil {
-		t.Fatalf("failed to read block from file. %v", err)
-	}
+	require.NoError(t, err)
 
 	syncBlocks := func() {
 		// Modify block 1 to be a different hash.  This is to artificially
@@ -976,9 +826,7 @@ func TestFlushOnPrune(t *testing.T) {
 		// (genesis block) -> 1 -> 2 -> 3 -> ...
 		//                \-> 1a
 		_, _, err = chain.ProcessBlock(staleBlock, BFNoPoWCheck)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 
 		for i, block := range blocks {
 			if i == 0 {
@@ -986,10 +834,7 @@ func TestFlushOnPrune(t *testing.T) {
 				continue
 			}
 			_, _, err = chain.ProcessBlock(block, BFNone)
-			if err != nil {
-				t.Fatalf("Failed to process block %v(%v). %v",
-					block.Hash().String(), block.Height(), err)
-			}
+			require.NoError(t, err, "block %v at height %d", block.Hash(), block.Height())
 		}
 	}
 
@@ -1055,9 +900,7 @@ func TestFlushOnPrune(t *testing.T) {
 
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 }
 
 func TestInitConsistentState(t *testing.T) {
@@ -1065,18 +908,14 @@ func TestInitConsistentState(t *testing.T) {
 	//  Boilerplate for creating a chain.
 	dbName := "TestFlushOnPrune"
 	chain, tearDown, err := chainSetup(dbName, &chaincfg.MainNetParams)
-	if err != nil {
-		panic(fmt.Sprintf("error loading blockchain with database: %v", err))
-	}
+	require.NoError(t, err)
 	defer tearDown()
 	chain.utxoCache.maxTotalMemoryUsage = 10 * 1024 * 1024
 	chain.utxoCache.cachedEntries.maxTotalMemoryUsage = chain.utxoCache.maxTotalMemoryUsage
 
 	// Read blocks from the file.
 	blocks, err := loadBlocks("blk_0_to_14131.dat")
-	if err != nil {
-		t.Fatalf("failed to read block from file. %v", err)
-	}
+	require.NoError(t, err)
 
 	// Sync up to height 13,000.  Flush the utxocache at height 11_000.
 	cacheFlushHeight := 9000
@@ -1088,19 +927,11 @@ func TestInitConsistentState(t *testing.T) {
 		}
 
 		isMainChain, _, err := chain.ProcessBlock(block, BFNone)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if !isMainChain {
-			t.Fatalf("expected block %s to be on the main chain", block.Hash())
-		}
+		require.NoError(t, err)
+		require.True(t, isMainChain, "block %s should be on the main chain", block.Hash())
 
 		if i == cacheFlushHeight {
-			err = chain.FlushUtxoCache(FlushRequired)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, chain.FlushUtxoCache(FlushRequired))
 		}
 		if i == initialSyncHeight {
 			break
@@ -1108,24 +939,17 @@ func TestInitConsistentState(t *testing.T) {
 	}
 
 	// Sanity check.
-	if chain.BestSnapshot().Height != int32(initialSyncHeight) {
-		t.Fatalf("expected the chain to sync up to height %d", initialSyncHeight)
-	}
+	require.Equal(t, int32(initialSyncHeight), chain.BestSnapshot().Height)
 
 	// Close the database without flushing the utxocache.  This leaves the
 	// chaintip at height 13,000 but the utxocache consistent state at 11,000.
-	err = chain.db.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, chain.db.Close())
 	chain.db = nil
 
 	// Re-open the database and pass the re-opened db to internal structs.
 	dbPath := filepath.Join(testDbRoot, dbName)
 	ndb, err := database.Open(testDbType, dbPath, blockDataNet)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	chain.db = ndb
 	chain.utxoCache.db = ndb
 	chain.index.db = ndb
@@ -1133,26 +957,18 @@ func TestInitConsistentState(t *testing.T) {
 	// Sanity check to see that the utxo cache was flushed before the
 	// current chain tip.
 	var statusBytes []byte
-	ndb.View(func(dbTx database.Tx) error {
+	require.NoError(t, ndb.View(func(dbTx database.Tx) error {
 		statusBytes = dbFetchUtxoStateConsistency(dbTx)
 		return nil
-	})
+	}))
 	statusHash, err := chainhash.NewHash(statusBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !statusHash.IsEqual(blocks[cacheFlushHeight].Hash()) {
-		t.Fatalf("expected the utxocache to be flushed at "+
-			"block hash %s but got %s",
-			blocks[cacheFlushHeight].Hash(), statusHash)
-	}
+	require.NoError(t, err)
+	require.True(t, statusHash.IsEqual(blocks[cacheFlushHeight].Hash()),
+		"utxocache flushed at block %s, want %s", statusHash, blocks[cacheFlushHeight].Hash())
 
 	// Call InitConsistentState.  This will make the utxocache catch back
 	// up to the tip.
-	err = chain.InitConsistentState(chain.bestChain.tip(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, chain.InitConsistentState(chain.bestChain.tip(), nil))
 
 	// Sync the reset of the blocks.
 	for i, block := range blocks {
@@ -1160,17 +976,9 @@ func TestInitConsistentState(t *testing.T) {
 			continue
 		}
 		isMainChain, _, err := chain.ProcessBlock(block, BFNone)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if !isMainChain {
-			t.Fatalf("expected block %s to be on the main chain", block.Hash())
-		}
+		require.NoError(t, err)
+		require.True(t, isMainChain, "block %s should be on the main chain", block.Hash())
 	}
 
-	if chain.BestSnapshot().Height != blocks[len(blocks)-1].Height() {
-		t.Fatalf("expected the chain to sync up to height %d",
-			blocks[len(blocks)-1].Height())
-	}
+	assert.Equal(t, blocks[len(blocks)-1].Height(), chain.BestSnapshot().Height)
 }
