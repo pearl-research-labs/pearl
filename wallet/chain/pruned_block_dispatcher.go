@@ -420,6 +420,11 @@ func filterPeers(peers []btcjson.GetPeerInfoResult) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(rawServices) != 8 {
+			return nil, fmt.Errorf("peer %v reported services "+
+				"%q: hex decodes to %d bytes, want 8",
+				peer.Addr, peer.Services, len(rawServices))
+		}
 		services := wire.ServiceFlag(binary.BigEndian.Uint64(rawServices))
 		if !satisfiesRequiredServices(services) {
 			continue
