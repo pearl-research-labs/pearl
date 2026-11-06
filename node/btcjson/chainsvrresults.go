@@ -679,6 +679,7 @@ type Vout struct {
 // GetMiningInfoResult models the data from the getmininginfo command.
 type GetMiningInfoResult struct {
 	Blocks            int64   `json:"blocks"`
+	BlockSubsidy      float64 `json:"blocksubsidy"`
 	CurrentBlockSize  uint64  `json:"currentblocksize"`
 	CurrentBlockVsize uint64  `json:"currentblockvsize"`
 	CurrentBlockTx    uint64  `json:"currentblocktx"`
