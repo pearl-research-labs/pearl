@@ -5,6 +5,7 @@
 package blockchain
 
 import (
+	"encoding/hex"
 	"testing"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
@@ -115,6 +116,43 @@ func TestRankPenaltyForkAcceptsTemplatesAndBlocks(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, chain.CheckConnectBlockTemplate(template),
 		"post-fork block template must be accepted")
+}
+
+// TestTestNetRankPenaltyReschedule embeds the certificate and header bits of
+// canonical testnet block 36761 (hash
+// 3ea775de59c8c812c4290fa2e4cca47a6962572d1514c738702b7bdeb516ba9e), which a
+// pre-fork build mined with a rank-64 certificate. Under the rescheduled
+// TestNetParams.RankPenaltyForkHeight the certificate rules must accept it at
+// the two heights the chain contains, while the same certificate remains a
+// rank-penalty violation from 36763 on. Guards against rescheduling the fork
+// onto the violating blocks again.
+func TestTestNetRankPenaltyReschedule(t *testing.T) {
+	publicData, err := hex.DecodeString("0020000040000000070103010000000103" +
+		"0101030000000000000000000000000000000000000000000000000000000000000000" +
+		"c269a4df54b936913d91d20eb138b69b4d08e7f9624400ea5064083743db6d3665" +
+		"3b23b547f2b6e172398da78efa9796b0e4ecccdc8c3b3395708ed4bfc606262d" +
+		"6c1902f88bed3a15e92776b55bc3fe565fa0449b278f188064dd000000000000" +
+		"08000000280000935e000004070000")
+	require.NoError(t, err)
+	require.Len(t, publicData, wire.PublicDataSizeDenseV2)
+
+	header := &wire.BlockHeader{Bits: 0x1948d970}
+	cert := &wire.CertificateV2{PublicDataLen: wire.PublicDataSizeDenseV2}
+	copy(cert.PublicData[:], publicData)
+
+	// The block must satisfy the certificate rules at the two heights the
+	// canonical chain holds: the dense-only and version rules still apply
+	// there, only the rank check is inactive.
+	require.NoError(t, CheckCertificateRules(header, cert, 36761,
+		&chaincfg.TestNetParams, BFNone))
+	require.NoError(t, CheckCertificateRules(header, cert, 36762,
+		&chaincfg.TestNetParams, BFNone))
+
+	// From the rescheduled activation height the same certificate is a
+	// rank-penalty violation (in non-zkpow builds the CheckRankPenalty stub's
+	// generic error still maps to ErrRankPenalty).
+	requireRuleError(t, CheckCertificateRules(header, cert, 36763,
+		&chaincfg.TestNetParams, BFNone), ErrRankPenalty)
 }
 
 // TestNewRejectsRankPenaltyBeforeMoEFork pins the params invariant the rule

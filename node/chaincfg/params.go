@@ -574,7 +574,12 @@ var TestNetParams = Params{
 	// Dense-only softfork: MoE proofs are rejected from this height on.
 	DenseOnlyForkHeight: 28262,
 
-	RankPenaltyForkHeight: 36761,
+	// Rank-penalty softfork: blocks whose certificate rank is below 128 are
+	// rejected from this height on. Blocks 36761 and 36762 were mined by a
+	// pre-fork build and carry rank-64 certificates, so activation is set to
+	// the first height the existing chain satisfies (same remedy as the
+	// testnet2 DenseOnlyForkHeight reschedule).
+	RankPenaltyForkHeight: 36763,
 
 	SaltedSeedForkHeight: 38648,
 

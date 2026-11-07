@@ -198,6 +198,33 @@ func TestRankPenaltyForkActivation(t *testing.T) {
 	}
 }
 
+// TestShippedNetworksRankPenaltyForkHeights pins the rank-penalty softfork
+// activation heights for the shipped networks so they cannot change
+// accidentally. Testnet's height is rescheduled: the canonical chain contains
+// two blocks (36761 and 36762) mined with rank-64 certificates before the
+// fleet enforced the rule, so activation must be the first height the chain
+// satisfies or fresh nodes reject the canonical chain during sync.
+func TestShippedNetworksRankPenaltyForkHeights(t *testing.T) {
+	heights := map[string]struct {
+		params *Params
+		want   int32
+	}{
+		"mainnet":  {&MainNetParams, 96251},
+		"testnet":  {&TestNetParams, 36763},
+		"testnet2": {&TestNet2Params, 80627},
+		"regtest":  {&RegressionNetParams, 1},
+	}
+	for name, tt := range heights {
+		require.Equalf(t, tt.want, tt.params.RankPenaltyForkHeight,
+			"%s must ship with RankPenaltyForkHeight %d", name, tt.want)
+	}
+
+	// The testnet activation boundary must sit above both violating blocks.
+	require.False(t, TestNetParams.IsRankPenaltyForkActive(36761))
+	require.False(t, TestNetParams.IsRankPenaltyForkActive(36762))
+	require.True(t, TestNetParams.IsRankPenaltyForkActive(36763))
+}
+
 // TestShippedNetworksRankPenaltyOrdering asserts the invariant the rule relies
 // on: only V2 certificates carry a noise rank, so the rank-penalty softfork must
 // never activate before the V2 cutover. blockchain.New rejects params that
