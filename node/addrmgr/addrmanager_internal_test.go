@@ -1,8 +1,12 @@
 package addrmgr
 
 import (
+	"encoding/json"
+	"errors"
 	"math/rand"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -204,4 +208,54 @@ func TestAddrManagerV1ToV2(t *testing.T) {
 	addrMgr = New(tempDir, nil)
 	addrMgr.loadPeers()
 	assertAddrs(t, addrMgr, expectedAddrs)
+}
+
+// TestLoadPeersFailedResetsCounters ensures that when peers.json is
+// valid JSON but internally inconsistent (an address listed in
+// Addresses that appears in no bucket and is not tried), the sanity
+// check in deserializePeers fails after it has already counted the
+// bucketed addresses — and loadPeers' "start fresh" reset leaves the
+// manager truly empty. Before the fix, reset() rebuilt the buckets
+// but left nNew/nTried stale, so NumAddresses reported phantom
+// addresses and GetAddress spun forever on empty buckets while
+// holding the manager lock.
+func TestLoadPeersFailedResetsCounters(t *testing.T) {
+	dir := t.TempDir()
+
+	sam := serializedAddrManager{Version: serialisationVersion}
+	sam.Addresses = []*serializedKnownAddress{
+		{Addr: "1.2.3.4:44108", Src: "1.2.3.4:44108", Services: wire.SFNodeNetwork, SrcServices: wire.SFNodeNetwork},
+		{Addr: "5.6.7.8:44108", Src: "5.6.7.8:44108", Services: wire.SFNodeNetwork, SrcServices: wire.SFNodeNetwork},
+	}
+	// Only the first address is bucketed; the second trips the
+	// "no references" sanity check, after nNew has been counted.
+	sam.NewBuckets[0] = []string{"1.2.3.4:44108"}
+
+	raw, err := json.Marshal(sam)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "peers.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	am := New(dir, func(string) ([]net.IP, error) {
+		return nil, errors.New("not implemented")
+	})
+	am.loadPeers()
+
+	if got := am.NumAddresses(); got != 0 {
+		t.Fatalf("NumAddresses = %d after failed load + reset, want 0", got)
+	}
+
+	done := make(chan *KnownAddress, 1)
+	go func() { done <- am.GetAddress() }()
+	select {
+	case ka := <-done:
+		if ka != nil {
+			t.Fatalf("GetAddress = %v after failed load + reset, want nil", ka)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetAddress did not return within 5s (spins on empty buckets)")
+	}
 }
