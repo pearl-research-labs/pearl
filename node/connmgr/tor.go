@@ -7,6 +7,7 @@ package connmgr
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 )
 
@@ -65,7 +66,7 @@ func TorLookupIP(host, proxy string) ([]net.IP, error) {
 	}
 
 	buf = make([]byte, 2)
-	_, err = conn.Read(buf)
+	_, err = io.ReadFull(conn, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +92,7 @@ func TorLookupIP(host, proxy string) ([]net.IP, error) {
 	}
 
 	buf = make([]byte, 4)
-	_, err = conn.Read(buf)
+	_, err = io.ReadFull(conn, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -112,11 +113,7 @@ func TorLookupIP(host, proxy string) ([]net.IP, error) {
 	}
 
 	buf = make([]byte, 4)
-	bytes, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-	if bytes != 4 {
+	if _, err := io.ReadFull(conn, buf); err != nil {
 		return nil, ErrTorInvalidAddressResponse
 	}
 
