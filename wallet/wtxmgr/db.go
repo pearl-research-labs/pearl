@@ -1236,13 +1236,17 @@ func fetchUnminedInputSpendTxHashes(ns walletdb.ReadBucket, k []byte) []chainhas
 		return nil
 	}
 
-	// Each transaction hash is 32 bytes.
-	spendTxHashes := make([]chainhash.Hash, 0, len(rawSpendTxHashes)/32)
-	for len(rawSpendTxHashes) > 0 {
+	// Each transaction hash is 32 bytes. Only complete hashes are
+	// consumed: a stored value whose length is not a multiple of the
+	// hash size is corrupt, and slicing a full hash out of its trailing
+	// partial bytes would panic.
+	spendTxHashes := make([]chainhash.Hash, 0,
+		len(rawSpendTxHashes)/chainhash.HashSize)
+	for len(rawSpendTxHashes) >= chainhash.HashSize {
 		var spendTxHash chainhash.Hash
-		copy(spendTxHash[:], rawSpendTxHashes[:32])
+		copy(spendTxHash[:], rawSpendTxHashes[:chainhash.HashSize])
 		spendTxHashes = append(spendTxHashes, spendTxHash)
-		rawSpendTxHashes = rawSpendTxHashes[32:]
+		rawSpendTxHashes = rawSpendTxHashes[chainhash.HashSize:]
 	}
 
 	return spendTxHashes
@@ -1296,12 +1300,18 @@ func serializeLockedOutput(id LockID, expiry time.Time) []byte {
 	return v[:]
 }
 
-// deserializeLockedOutput deserializes the value of a locked output.
-func deserializeLockedOutput(v []byte) (LockID, time.Time) {
+// deserializeLockedOutput deserializes the value of a locked output. The
+// third return value reports whether the value was long enough to hold a
+// lock ID and an expiry; a shorter value is corrupt and must not be
+// trusted (nor may it panic the caller).
+func deserializeLockedOutput(v []byte) (LockID, time.Time, bool) {
 	var id LockID
+	if len(v) < len(id)+8 {
+		return id, time.Time{}, false
+	}
 	copy(id[:], v[:len(id)])
 	expiry := time.Unix(int64(byteOrder.Uint64(v[len(id):])), 0)
-	return id, expiry
+	return id, expiry, true
 }
 
 // isLockedOutput determines whether an output is locked. If it is, its assigned
@@ -1324,7 +1334,14 @@ func isLockedOutput(ns walletdb.ReadBucket, op wire.OutPoint,
 	if v == nil {
 		return LockID{}, time.Time{}, false
 	}
-	lockID, expiry := deserializeLockedOutput(v)
+	lockID, expiry, ok := deserializeLockedOutput(v)
+	if !ok {
+		// The stored lock record is corrupt (shorter than a lock ID
+		// plus expiry). It cannot prove the output is locked, and
+		// crashing coin selection over it would wedge the wallet, so
+		// treat the output as unlocked.
+		return LockID{}, time.Time{}, false
+	}
 
 	// If the output lock has already expired, delete it now.
 	if !timeNow.Before(expiry) {
@@ -1397,7 +1414,12 @@ func forEachLockedOutput(ns walletdb.ReadBucket,
 		if err := readCanonicalOutPoint(k, &op); err != nil {
 			return err
 		}
-		lockID, expiry := deserializeLockedOutput(v)
+		lockID, expiry, ok := deserializeLockedOutput(v)
+		if !ok {
+			// Skip corrupt lock records rather than panicking
+			// the listing or reporting a fabricated lock.
+			return nil
+		}
 
 		f(op, lockID, expiry)
 
