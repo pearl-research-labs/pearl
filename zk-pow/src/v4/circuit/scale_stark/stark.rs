@@ -111,6 +111,7 @@
 //! `Evaluator`; `super::ctl` declares all lookup relations, and the verifier recomputes the
 //! structural schedule columns.
 
+use crate::v4::circuit::trace_padding::trace_padded_height;
 use core::borrow::{Borrow, BorrowMut};
 use core::cmp::Ordering;
 use std::marker::PhantomData;
@@ -337,10 +338,10 @@ impl ScaleProgram {
         self.h + self.w
     }
 
-    /// Trace height: the live rows padded to the next power of two with all-zero-tuple
+    /// Trace height: the live rows padded to the next supported height with all-zero-tuple
     /// `IS_PAD = 1` rows (excluded from the group-tuple CTL).
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        trace_padded_height(self.live_rows())
     }
 
     /// `dr = bf16(DELTA * sqrt(r))` — mirrors the private `quantization::delta_r_bf16`
@@ -2214,14 +2215,13 @@ mod tests {
 
     #[test]
     fn padded_trace_satisfies_constraints_and_lut_lookups() {
-        // Non-power-of-two geometry: 3 + 4 = 7 live rows pad to 8 (the last row is the pad
-        // row).
+        // Non-power-of-two geometry: 3 + 4 = 7 live rows pad to the minimum supported height 128.
         let program = ScaleProgram::new_for_device(3, 4, 4096, 4, Device::B200);
-        assert_eq!(program.num_rows(), 8);
+        assert_eq!(program.num_rows(), 128);
         let (a8, b) = test_tuples(&test_program());
         let a: Vec<ScaleRowTuple> = a8[..3].to_vec();
         let (rows, pis) = program.generate_trace::<F>(&a, &b);
-        assert_eq!(rows.len(), 8);
+        assert_eq!(rows.len(), 128);
         // The known columns are bit-exact with the trace fill (the batch verifier's check).
         let known = program.known_values::<F>();
         for (c, col) in known.iter().enumerate() {

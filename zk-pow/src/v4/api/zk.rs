@@ -105,7 +105,7 @@ use crate::v4::circuit::blake3_stark::columns::{
 use crate::v4::circuit::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, MoeSchedule};
 pub use crate::v4::circuit::circuit_utils::{Fp8Verifier, Fp8VerifierCache};
 use crate::v4::circuit::ctl::NUM_TABLES;
-use crate::v4::circuit::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8PublicData, Fp8System, Fp8Witness};
+use crate::v4::circuit::driver::{Fp8PublicData, Fp8System, Fp8Witness, V4_REACHABLE_DEGREE_BITS};
 use crate::v4::circuit::input_quant_stark::stark::InputQuantProgram;
 use crate::v4::circuit::matmul_b200_stark::columns::GROUP_WIDTH as MATMUL_GROUP_WIDTH;
 use crate::v4::circuit::scale_stark::stark::ScaleProgram;
@@ -609,7 +609,7 @@ impl Fp8Job {
             system
                 .degree_bits()
                 .iter()
-                .all(|bits| FP8_REACHABLE_DEGREE_BITS.contains(bits)),
+                .all(|bits| V4_REACHABLE_DEGREE_BITS.contains(bits)),
             "degree profile {:?} is off the consensus FRI ladder",
             system.degree_bits()
         );

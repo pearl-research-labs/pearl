@@ -60,6 +60,7 @@
 //! inequality `running_skips <= skip_limit`. Padding rows keep the final running count
 //! unchanged so the same terminal gate works whether or not `h*w` is a power of two.
 
+use crate::v4::circuit::trace_padding::trace_padded_height;
 use core::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
 
@@ -98,10 +99,10 @@ impl XorFoldProgram {
         self.lanes.iter().map(Vec::len).sum()
     }
 
-    /// Trace height: the live rows padded to the next power of two with all-zero
+    /// Trace height: the live rows padded to the next supported height with all-zero
     /// `IS_PAD = 1` rows.
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        trace_padded_height(self.live_rows())
     }
 
     /// `cell_words[c]` is cell `c`'s f32 bit pattern and `cell_skips[c]` is its certified
@@ -455,7 +456,7 @@ mod tests {
 
     #[test]
     fn padded_trace_satisfies_all_constraints() {
-        // A non-power-of-two live count: 16 lanes x 3 cells = 48 live rows, padded to 64. The
+        // A non-power-of-two live count: 16 lanes x 3 cells = 48 live rows, padded to 128. The
         // wrap pair is (pad, row 0), exercising the pad chain closing on the FOLD_STATE_IN = 0
         // anchor and the padded last-row anchor.
         let program = XorFoldProgram {
@@ -464,9 +465,9 @@ mod tests {
         };
         let words: Vec<u32> = (0..48u32).map(|i| f32::to_bits(i as f32 - 20.5)).collect();
         let (rows, pis) = program.generate_trace::<F>(&words, &vec![1; words.len()]);
-        assert_eq!(rows.len(), 64, "48 live rows pad to 64");
+        assert_eq!(rows.len(), 128, "48 live rows pad to the minimum supported height");
         let known = program.known_values::<F>();
-        assert!(known.iter().all(|c| c.len() == 64));
+        assert!(known.iter().all(|c| c.len() == 128));
         // The known columns are bit-exact with the trace fill (the batch verifier's check).
         for (c, col) in known.iter().enumerate() {
             for (r, row) in rows.iter().enumerate() {
@@ -781,13 +782,11 @@ mod tests {
             forged[1][col] += F::ONE;
             assert!(constraints_violated(&stark, &forged, &pis), "{name} tamper undetected");
         }
-        // Clearing the trace-final flag: X3's wrap instance becomes a chain pair, forcing
-        // FOLD_STATE_IN(0) = FOLD_OUT(last) — the anchored 0 vs. the lane-15 word — so the AIR
-        // still rejects this trace. (The flag is class (a) regardless: any divergence, even
-        // one engineered so FOLD_OUT(last) = 0, is caught by the batch verifier's
-        // known-column recompute.)
+        // Clearing the final live lane flag joins its nonzero output to the
+        // zero state in padding. The known-column recomputation also rejects it.
         let mut forged = rows.clone();
-        let last: &mut XorFoldColumnsView<F> = forged.last_mut().unwrap().borrow_mut();
+        let final_live = stark.program.lanes.iter().map(Vec::len).sum::<usize>() - 1;
+        let last: &mut XorFoldColumnsView<F> = forged[final_live].borrow_mut();
         last.is_lane_final = F::ZERO;
         assert!(
             constraints_violated(&stark, &forged, &pis),
@@ -795,8 +794,7 @@ mod tests {
         );
         let known = stark.program.known_values::<F>();
         assert_ne!(
-            known[XOR_FOLD_COL_MAP.is_lane_final].values[rows.len() - 1],
-            forged[rows.len() - 1][XOR_FOLD_COL_MAP.is_lane_final],
+            known[XOR_FOLD_COL_MAP.is_lane_final].values[final_live], forged[final_live][XOR_FOLD_COL_MAP.is_lane_final],
             "IS_LANE_FINAL must diverge from the verifier's recompute"
         );
     }

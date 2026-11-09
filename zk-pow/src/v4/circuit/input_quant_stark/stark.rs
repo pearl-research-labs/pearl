@@ -137,7 +137,7 @@
 //!
 //! # Trace and constraint binding
 //!
-//! The height is `next_power_of_two(max(h, w)*k)`. Each side is live only on its own prefix;
+//! The height rounds `max(h, w)*k` upward to the next supported height. Each side is live only on its own prefix;
 //! the rest uses a canonical phantom fill. The verifier recomputes the public noise, row
 //! schedule, indices, and liveness columns and checks their openings. These are called
 //! **known columns** below: their booleanness and boundary facts come from verifier equality,
@@ -147,6 +147,7 @@
 //! Flags returned by a lookup are boolean by that table; free witness flags are constrained
 //! boolean in this AIR.
 
+use crate::v4::circuit::trace_padding::trace_padded_height;
 use core::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -231,9 +232,9 @@ impl InputQuantProgram {
     }
 
     /// Trace height: one row per element pair, grouped into matrix rows of `k` consecutive
-    /// trace rows and padded to the next power of two with both-sides-dead phantom rows.
+    /// trace rows and padded to the next supported height with both-sides-dead phantom rows.
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        trace_padded_height(self.live_rows())
     }
 
     /// `Wl2 = 27 - ceil(log2 k)`: the job's block-L2 frame width ([`l2_frame_width`].
@@ -2920,7 +2921,7 @@ mod tests {
             &inp.b_scales,
             &inp.b_noise,
         );
-        assert_eq!(rows.len(), 512, "next_power_of_two(5 * 96)");
+        assert_eq!(rows.len(), 1024, "Trace padding for 5 * 96 live rows");
         let stark = S::new(program.clone());
         assert!(constraints_vanish(&stark, &rows, &pis), "padded trace violates a constraint");
 
@@ -2946,7 +2947,11 @@ mod tests {
                 "{side}: liveness must end at its public bound"
             );
         }
-        assert_eq!(rows[511][m.is_group_final], F::ONE, "the truncated tail must close");
+        assert_eq!(
+            rows[rows.len() - 1][m.is_group_final],
+            F::ONE,
+            "the truncated tail must close"
+        );
 
         // Every declared LUT instance stays in its table's domain on the padded trace (the
         // phantom fill's derived fields and keys must be as legal as live ones — unfiltered
@@ -3042,7 +3047,7 @@ mod tests {
             f64::from(bf16_to_f32(x_code).abs()) >= 8.0 * program.device.delta() * f64::from(bf16_to_f32(l2f(opened, g)))
         };
 
-        for (r, row) in rows.iter().enumerate() {
+        for (r, row) in rows.iter().take(h * k).enumerate() {
             let v: &InputQuantColumnsView<F> = row.borrow();
             let g = r / k;
             for (side, opened, noise) in [(&side_a(v), &opened_a, &inp.a_noise), (&side_b(v), &opened_b, &inp.b_noise)] {
