@@ -46,11 +46,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             "Final polynomial has wrong degree."
         );
 
-        with_context!(
-            self,
-            "check PoW",
+        with_context!(self, "check PoW", {
+            crate::fri::batching_pow::verify_batching_pow_target(
+                self,
+                challenges.batching_pow_response,
+                &params.config,
+            );
             self.fri_verify_proof_of_work(challenges.fri_pow_response, &params.config)
-        );
+        });
 
         // Check that parameters are coherent.
         assert_eq!(
@@ -409,6 +412,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             query_round_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness: (params.config.batching_proof_of_work_bits != 0)
+                .then(|| self.add_virtual_target()),
         }
     }
 

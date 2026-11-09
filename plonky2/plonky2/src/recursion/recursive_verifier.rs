@@ -368,6 +368,7 @@ mod tests {
             fri_config: FriConfig {
                 rate_bits: 7,
                 proof_of_work_bits: 16,
+                batching_proof_of_work_bits: 0,
                 num_query_rounds: 12,
                 ..standard_config.fri_config.clone()
             },
@@ -391,6 +392,7 @@ mod tests {
                 rate_bits: 8,
                 cap_height: 0,
                 proof_of_work_bits: 20,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::MinSize(None),
                 num_query_rounds: 10,
             },

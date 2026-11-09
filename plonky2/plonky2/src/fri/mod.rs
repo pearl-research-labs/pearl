@@ -15,6 +15,7 @@ use crate::iop::challenger::{Challenger, RecursiveChallenger};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::config::{AlgebraicHasher, Hasher};
 
+pub mod batching_pow;
 mod challenges;
 pub mod oracle;
 pub mod proof;
@@ -25,6 +26,10 @@ pub mod structure;
 pub(crate) mod validate_shape;
 pub mod verifier;
 pub mod witness_util;
+
+fn is_zero(bits: &u32) -> bool {
+    *bits == 0
+}
 
 /// A configuration for the FRI protocol.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -37,6 +42,11 @@ pub struct FriConfig {
 
     /// Number of bits used for grinding.
     pub proof_of_work_bits: u32,
+
+    /// Grinding immediately before deriving the column-batching challenges.
+    /// Zero omits the nonce and the transcript step entirely (legacy protocol).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub batching_proof_of_work_bits: u32,
 
     /// The reduction strategy to be applied at each layer during the commit phase.
     pub reduction_strategy: FriReductionStrategy,
@@ -76,6 +86,12 @@ impl FriConfig {
         challenger.observe_element(F::from_canonical_u32(self.proof_of_work_bits));
         challenger.observe_elements(&self.reduction_strategy.serialize());
         challenger.observe_element(F::from_canonical_usize(self.num_query_rounds));
+        if self.batching_proof_of_work_bits != 0 {
+            challenger.observe_elements(&[
+                F::from_canonical_u64(batching_pow::CONFIG_TAG),
+                F::from_canonical_u32(self.batching_proof_of_work_bits),
+            ]);
+        }
     }
 
     /// Observe the FRI configuration parameters for the recursive verifier.
@@ -94,6 +110,12 @@ impl FriConfig {
         challenger.observe_elements(&builder.constants(&self.reduction_strategy.serialize()));
         challenger
             .observe_element(builder.constant(F::from_canonical_usize(self.num_query_rounds)));
+        if self.batching_proof_of_work_bits != 0 {
+            challenger.observe_elements(&builder.constants(&[
+                F::from_canonical_u64(batching_pow::CONFIG_TAG),
+                F::from_canonical_u32(self.batching_proof_of_work_bits),
+            ]));
+        }
     }
 }
 

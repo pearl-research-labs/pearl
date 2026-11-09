@@ -30,6 +30,7 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     lde_polynomial_values: PolynomialValues<F::Extension>,
     challenger: &mut Challenger<F, C::Hasher>,
     fri_params: &FriParams,
+    batching_pow_witness: Option<F>,
     final_poly_coeff_len: Option<usize>,
     max_num_query_steps: Option<usize>,
     timing: &mut TimingTree,
@@ -67,6 +68,7 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
+        batching_pow_witness,
     }
 }
 
@@ -159,7 +161,20 @@ pub(crate) fn fri_proof_of_work<
     challenger: &mut Challenger<F, C::Hasher>,
     config: &FriConfig,
 ) -> F {
-    let min_leading_zeros = config.proof_of_work_bits + (64 - F::order().bits()) as u32;
+    proof_of_work::<F, C, D>(challenger, config.proof_of_work_bits)
+}
+
+/// Grind on the current transcript for the required number of bits.
+pub(crate) fn proof_of_work<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    challenger: &mut Challenger<F, C::Hasher>,
+    proof_of_work_bits: u32,
+) -> F {
+    assert!(proof_of_work_bits < F::order().bits() as u32);
+    let min_leading_zeros = proof_of_work_bits + (64 - F::order().bits()) as u32;
 
     // The easiest implementation would be repeatedly clone our Challenger. With each clone, we'd
     // observe an incrementing PoW witness, then get the PoW response. If it contained sufficient
@@ -184,7 +199,7 @@ pub(crate) fn fri_proof_of_work<
     // Assert RATE=8 since permute_n::<8>() is hardcoded below
     debug_assert_eq!(<C::Hasher as Hasher<F>>::Permutation::RATE, 8);
 
-    let chunk_size = 1u64 << config.proof_of_work_bits.saturating_sub(16);
+    let chunk_size = 1u64 << proof_of_work_bits.saturating_sub(16);
     let num_chunks = F::NEG_ONE.to_canonical_u64() / chunk_size;
     let pow_witness = (0..num_chunks)
         .into_par_iter()

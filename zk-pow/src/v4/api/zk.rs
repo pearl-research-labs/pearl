@@ -484,20 +484,6 @@ fn validate_public_statement(
 #[cfg(test)]
 struct Fp8Proof(BatchStarkProofWithPublicInputs<F, C, D>);
 
-#[cfg(test)]
-impl Fp8Proof {
-    /// Serializes the proof (and all its public inputs) for the wire.
-    fn to_bytes(&self) -> Result<Vec<u8>> {
-        bincode::serialize(&self.0).context("serializing an fp8 proof")
-    }
-
-    /// Deserializes a wire proof. Structural validity only — [`verify_fp8_block`] is the
-    /// judge of everything else.
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(Self(bincode::deserialize(bytes).context("deserializing an fp8 proof")?))
-    }
-}
-
 // ==================================================================================================
 // The statement derivation
 // ==================================================================================================

@@ -87,6 +87,10 @@ pub fn verify_batch_fri_proof_with_leaves<
     validate_batch_fri_proof_shape::<F, C, D>(proof, instances, degree_bits, params, &[])?;
 
     // Check PoW.
+    crate::fri::batching_pow::verify_batching_pow::<F, D>(
+        challenges.batching_pow_response,
+        &params.config,
+    )?;
     fri_verify_proof_of_work(challenges.fri_pow_response, &params.config)?;
 
     // Check that parameters are coherent.

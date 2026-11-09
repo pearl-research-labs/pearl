@@ -37,6 +37,7 @@ pub(crate) fn get_challenges<
     commit_phase_merkle_caps: &[MerkleCap<F, C::Hasher>],
     final_poly: &PolynomialCoeffs<F::Extension>,
     pow_witness: F,
+    batching_pow_witness: Option<F>,
     circuit_digest: &<<C as GenericConfig<D>>::Hasher as Hasher<C::F>>::Hash,
     common_data: &CommonCircuitData<F, D>,
 ) -> anyhow::Result<ProofChallenges<F, D>> {
@@ -92,6 +93,7 @@ pub(crate) fn get_challenges<
             commit_phase_merkle_caps,
             final_poly,
             pow_witness,
+            batching_pow_witness,
             common_data.degree_bits(),
             &config.fri_config,
             None,
@@ -131,6 +133,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     commit_phase_merkle_caps,
                     final_poly,
                     pow_witness,
+                    batching_pow_witness,
                     ..
                 },
         } = &self.proof;
@@ -144,6 +147,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             commit_phase_merkle_caps,
             final_poly,
             *pow_witness,
+            *batching_pow_witness,
             circuit_digest,
             common_data,
         )
@@ -170,6 +174,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     commit_phase_merkle_caps,
                     final_poly,
                     pow_witness,
+                    batching_pow_witness,
                     ..
                 },
         } = &self.proof;
@@ -183,12 +188,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             commit_phase_merkle_caps,
             final_poly,
             *pow_witness,
+            *batching_pow_witness,
             circuit_digest,
             common_data,
         )
     }
 
     /// Computes all coset elements that can be inferred in the FRI reduction steps.
+    // TODO: Validate compressed query maps before indexing: malformed transcripts can panic.
+    // This generic compressed-proof path is separate from the V2/V3/V4 compact codec.
     pub(crate) fn get_inferred_elements(
         &self,
         challenges: &ProofChallenges<F, D>,
@@ -275,6 +283,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         commit_phase_merkle_caps: &[MerkleCapTarget],
         final_poly: &PolynomialCoeffsExtTarget<D>,
         pow_witness: Target,
+        batching_pow_witness: Option<Target>,
         inner_circuit_digest: HashOutTarget,
         inner_common_data: &CommonCircuitData<F, D>,
     ) -> ProofChallengesTarget<D>
@@ -335,6 +344,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 commit_phase_merkle_caps,
                 final_poly,
                 pow_witness,
+                batching_pow_witness,
                 &inner_common_data.config.fri_config,
             ),
         }
@@ -362,6 +372,7 @@ impl<const D: usize> ProofWithPublicInputsTarget<D> {
                     commit_phase_merkle_caps,
                     final_poly,
                     pow_witness,
+                    batching_pow_witness,
                     ..
                 },
         } = &self.proof;
@@ -375,6 +386,7 @@ impl<const D: usize> ProofWithPublicInputsTarget<D> {
             commit_phase_merkle_caps,
             final_poly,
             *pow_witness,
+            *batching_pow_witness,
             inner_circuit_digest,
             inner_common_data,
         )

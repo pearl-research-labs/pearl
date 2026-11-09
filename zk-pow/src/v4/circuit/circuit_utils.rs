@@ -41,6 +41,7 @@ pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, i
             rate_bits,
             cap_height: 5,
             proof_of_work_bits: pow_bits as u32,
+            batching_proof_of_work_bits: if stage == 2 { 21 } else { 17 },
             reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
             num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
         },
@@ -349,6 +350,7 @@ mod tests {
                 rate_bits: 3,
                 cap_height: 2,
                 proof_of_work_bits: 0,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::ConstantArityBits(2, 2),
                 num_query_rounds: 2,
             },
@@ -487,5 +489,23 @@ mod tests {
                 .contains("sigma permutation index out of bounds")
         );
         Ok(())
+    }
+    #[test]
+    fn serde_freezes_legacy_fields_and_rejects_enabled_nonce() {
+        use plonky2::fri::proof::FriProof;
+        use plonky2::hash::poseidon::PoseidonHash;
+        let mut proof = FriProof::<F, PoseidonHash, 2> {
+            commit_phase_merkle_caps: vec![],
+            query_round_proofs: vec![],
+            final_poly: PolynomialCoeffs::new(vec![]),
+            pow_witness: F::ZERO,
+            batching_pow_witness: None,
+        };
+        let bytes = bincode::serialize(&proof).unwrap();
+        // Legacy encoding: three empty vectors and one field element.
+        assert_eq!(bytes, [0; 32]);
+        assert_eq!(bincode::deserialize::<FriProof<F, PoseidonHash, 2>>(&bytes).unwrap(), proof);
+        proof.batching_pow_witness = Some(F::ONE);
+        assert!(bincode::serialize(&proof).is_err());
     }
 }
