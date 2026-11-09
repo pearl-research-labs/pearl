@@ -20,7 +20,7 @@
 //!   proof — so a prover cannot influence the layout;
 //! - the consensus [`StarkConfig`], whose fixed FRI reduction schedule is the consensus
 //!   ladder over every *reachable* table height — a job folds the ladder suffix from its
-//!   tallest table, so schedules agree across jobs ([`fp8_stark_config`]);
+//!   tallest table, so schedules agree across jobs ([`v4_stark_config`]);
 //! - the [`BatchKnownColumns`]: the class (a) values at their batch positions. The
 //!   Fiat-Shamir digest slot is `statement_digest` (labelled hash of the proposed header
 //!   and [`crate::v4::api::public_params::PublicParams`]), bound via
@@ -61,8 +61,6 @@ use core::borrow::Borrow;
 use anyhow::{Result, anyhow, ensure};
 use plonky2::field::extension::Extendable;
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::fri::FriConfig;
-use plonky2::fri::reduction_strategies::FriReductionStrategy;
 use plonky2::hash::hash_types::{HashOut, RichField};
 use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::plonk::config::GenericConfig;
@@ -101,10 +99,7 @@ use crate::v4::circuit::trace_padding::trace_padded_height;
 // The consensus proof shape
 // ==================================================================================================
 
-pub use super::circuit_utils::{
-    STARK_BATCHING_POW_BITS, STARK_CAP_HEIGHT, STARK_NUM_CHALLENGES, STARK_POW_BITS, STARK_QUERY_ROUNDS, STARK_RATE_BITS,
-    STARK_SECURITY_BITS,
-};
+use super::config::v4_stark_config;
 
 /// Supported trace heights (degree bits), descending — the consensus FRI ladder's fold
 /// boundaries. The wire envelope (`api::layout` lottery-tile bounds) is
@@ -171,44 +166,6 @@ pub fn fp8_universal_envelope(device: Device) -> UniversalVerifierEnvelope {
         ladder: V4_REACHABLE_DEGREE_BITS.to_vec(),
         grouped_tables: FP8_GROUPED_TABLES.to_vec(),
     }
-}
-
-/// The consensus [`StarkConfig`] for a job whose batch tables have the given heights
-/// (`degree_bits` per table, any order, duplicates allowed). Everything is a consensus
-/// constant, including the FRI reduction strategy: a [`FriReductionStrategy::Ladder`] whose
-/// boundaries are every *reachable* height ([`V4_REACHABLE_DEGREE_BITS`]). A job's schedule
-/// is the ladder's suffix from its tallest table down to the `2^7` bottom, so any two jobs'
-/// schedules agree on their shared span, and — because the ladder serializes as the boundary
-/// list, not the suffix — the Fiat-Shamir transcript absorbs the *same* config for every
-/// envelope job: the universal-verifier prerequisite. Batch FRI injects each instance when
-/// the folded codeword reaches its LDE size and folds plainly through instance-free
-/// boundaries.
-///
-/// Sub-envelope profiles (unit-test geometries) add their own heights as extra boundaries;
-/// the config stays a pure function of the degree profile, and equals the consensus
-/// constant for every on-ladder profile (real jobs are ladder-gated at `Fp8Job::derive`).
-pub fn fp8_stark_config(degree_bits: &[usize]) -> StarkConfig {
-    // TODO: Move this configuration builder to the shared V4 config files.
-    let min = degree_bits.iter().copied().min().expect("at least one table");
-    assert!(
-        min + STARK_RATE_BITS >= STARK_CAP_HEIGHT,
-        "the smallest table's LDE must cover the Merkle cap"
-    );
-    let mut boundaries: Vec<usize> = V4_REACHABLE_DEGREE_BITS.iter().chain(degree_bits).copied().collect();
-    boundaries.sort_unstable_by_key(|&bits| core::cmp::Reverse(bits));
-    boundaries.dedup();
-    StarkConfig::new(
-        STARK_SECURITY_BITS,
-        STARK_NUM_CHALLENGES,
-        FriConfig {
-            rate_bits: STARK_RATE_BITS,
-            cap_height: STARK_CAP_HEIGHT,
-            proof_of_work_bits: STARK_POW_BITS,
-            batching_proof_of_work_bits: STARK_BATCHING_POW_BITS,
-            reduction_strategy: FriReductionStrategy::Ladder(boundaries),
-            num_query_rounds: STARK_QUERY_ROUNDS,
-        },
-    )
 }
 
 // ==================================================================================================
@@ -533,7 +490,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // the Fiat-Shamir cap/opening order, the statement digest and the CTL indices
         // are the same for every job; batched FRI folds by height internally.
         let degree_bits: [usize; NUM_ALL_TABLES] = core::array::from_fn(|t| log2_strict(heights[t]));
-        let config = fp8_stark_config(&degree_bits);
+        let config = v4_stark_config();
 
         // Every channel in the same canonical index space.
         let ctls = all_cross_table_lookups::<F>(device, &scale);
@@ -1091,9 +1048,11 @@ mod tests {
     use plonky2::field::types::Field;
     use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
-    use super::super::consistency::{Fp8Fixture, build_fixture, build_fixture_from_job, fixture_job};
     use super::*;
     use crate::v4::api::public_params::PublicParams;
+    use crate::v4::circuit::config::v4_recursion_config;
+    use crate::v4::circuit::consistency::{Fp8Fixture, build_fixture, build_fixture_from_job, fixture_job};
+    use crate::v4::circuit::luts::LutTable;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -1130,7 +1089,7 @@ mod tests {
 
     /// The boundary bits the config's schedule folds through, from the profile's max down.
     fn schedule_boundaries(degree_bits: &[usize]) -> Vec<usize> {
-        let config = fp8_stark_config(degree_bits);
+        let config = v4_stark_config();
         let max = *degree_bits.iter().max().unwrap();
         let mut reached = vec![max];
         for a in config.fri_params(max).reduction_arity_bits {
@@ -1142,18 +1101,14 @@ mod tests {
 
     #[test]
     fn fri_arities_fold_through_every_instance() {
-        // Envelope-shaped profiles (max ∈ [14, 22]) and sub-envelope test geometries: the
-        // schedule's partial sums must hit every table height (each instance's LDE) and
-        // every ladder boundary below the profile's max, and stop at the lowest boundary —
-        // `min(2^7, smallest table)`: the ladder always folds to its own bottom, so the
-        // final-polynomial length is a consensus constant (every real job carries the
-        // `2^7` LUT anyway; only sub-envelope test profiles can dip below it).
+        // Every padded table height and ladder stop below the tallest table must be
+        // reached. Folding always stops at 2^7, keeping the final-polynomial size fixed.
         for degrees in [
-            vec![19, 17, 16, 13, 10, 8, 6, 5],
-            vec![22, 16, 5],
-            vec![17, 16, 9, 3],
-            vec![12, 7, 3],
-            vec![12],
+            vec![22, 19, 18, 16, 13, 10, 7],
+            vec![22, 16, 7],
+            vec![18, 16, 10, 7],
+            vec![13, 7],
+            vec![13],
         ] {
             let reached = schedule_boundaries(&degrees);
             for &d in &degrees {
@@ -1162,17 +1117,15 @@ mod tests {
                     "schedule misses degree {d} ({degrees:?} -> {reached:?})"
                 );
             }
-            let (min, max) = (*degrees.last().unwrap(), degrees[0]);
+            let max = degrees[0];
             for &bits in V4_REACHABLE_DEGREE_BITS.iter().filter(|b| **b <= max) {
                 assert!(reached.contains(&bits), "schedule skips ladder stop {bits} ({degrees:?})");
             }
-            let bottom = min.min(*V4_REACHABLE_DEGREE_BITS.last().unwrap());
+            let bottom = *V4_REACHABLE_DEGREE_BITS.last().unwrap();
             assert_eq!(*reached.last().unwrap(), bottom, "folding must stop at the lowest boundary");
         }
 
-        // The universal-verifier property: one consensus ladder, so a shallower job's
-        // schedule is exactly the suffix of a deeper one's from its own tallest table
-        // (on-ladder maxima only: an off-ladder max adds its own boundary and diverges).
+        // A shallower job's schedule is a suffix of a deeper job's schedule.
         let deep = schedule_boundaries(&[22, 7]);
         for max in [21, 20, 19, 18, 16, 13, 10, 7] {
             let shallow = schedule_boundaries(&[max, 7]);
@@ -1183,24 +1136,13 @@ mod tests {
                 "max {max} schedule is not a ladder suffix"
             );
         }
-
-        // The Fiat-Shamir prerequisite: every on-ladder profile yields the *same* config
-        // (same absorbed serialization), whatever its height span.
-        let consensus = fp8_stark_config(&V4_REACHABLE_DEGREE_BITS);
-        for degrees in [vec![22, 16, 7], vec![16, 7], vec![18, 16, 10, 7]] {
-            let config = fp8_stark_config(&degrees);
-            assert_eq!(
-                config.fri_config.reduction_strategy, consensus.fri_config.reduction_strategy,
-                "on-ladder profile {degrees:?} must produce the consensus strategy"
-            );
-        }
     }
 
-    /// The consensus parameters meet [`STARK_SECURITY_BITS`]: the batch prove/verify path
+    /// The consensus parameters meet their configured security target: the batch prove/verify path
     /// never calls [`StarkConfig::check_config`] at runtime, so enforce it here.
     #[test]
     fn consensus_config_meets_the_security_target() {
-        fp8_stark_config(&V4_REACHABLE_DEGREE_BITS)
+        v4_stark_config()
             .check_config::<F, D>()
             .expect("consensus FRI parameters must meet the security target");
     }
@@ -1218,14 +1160,9 @@ mod tests {
             let (header, mut plain) = fixture_job();
             plain.job.common.device = device;
             let system = build_system(&build_fixture_from_job(header, plain));
-            let config = fp8_stark_config(&V4_REACHABLE_DEGREE_BITS);
+            let config = v4_stark_config();
             let envelope = fp8_universal_envelope(device);
-            let mut builder = CircuitBuilder::<F, D>::new(super::super::circuit_utils::build_recursion_config(
-                super::super::wrapper::STAGE_1_RATE_BITS,
-                super::super::wrapper::STAGE_1_POW_BITS,
-                1,
-                false,
-            ));
+            let mut builder = CircuitBuilder::<F, D>::new(v4_recursion_config(1));
             // Only the cap shape matters when constructing the verifier gates.
             let cap = MerkleCap(vec![HashOut::ZERO; 1 << config.fri_config.cap_height]);
             let prep = system.preprocessed_verifier_data::<C>(&cap).constant_target(&mut builder);
@@ -1507,7 +1444,7 @@ mod tests {
             + system
                 .committed_lut_tables()
                 .iter()
-                .position(|&t| t == super::super::luts::LutTable::Pow2G)
+                .position(|&t| t == LutTable::Pow2G)
                 .unwrap();
         let (helpers, zs, _) = CrossTableLookup::num_ctl_helpers_zs_all(system.ctls(), pow2g, config.num_challenges, 3);
         assert_eq!((starks[pow2g].num_columns(), helpers, zs), (12, 6, 3));
