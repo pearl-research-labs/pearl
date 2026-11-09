@@ -94,9 +94,10 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 	return nil
 }
 
-// readFp8Blob reads one length-prefixed (4-byte LE) blob, enforcing the common
-// blob-size cap. A zero length decodes as nil.
-func readFp8Blob(r io.Reader, fieldName string) ([]byte, error) {
+// readV4Blob reads a bounded blob with a fixed 4-byte little-endian length.
+// ReadVarBytes uses a varint and cannot decode this format.
+// A zero length decodes as nil.
+func readV4Blob(r io.Reader, fieldName string) ([]byte, error) {
 	var length uint32
 	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return nil, err
@@ -118,11 +119,11 @@ func (c *CertificateV4) Deserialize(r io.Reader) error {
 	if _, err := io.ReadFull(r, c.Hash[:]); err != nil {
 		return err
 	}
-	publicData, err := readFp8Blob(r, "public_data")
+	publicData, err := readV4Blob(r, "public_data")
 	if err != nil {
 		return err
 	}
-	proofData, err := readFp8Blob(r, "proof_data")
+	proofData, err := readV4Blob(r, "proof_data")
 	if err != nil {
 		return err
 	}
