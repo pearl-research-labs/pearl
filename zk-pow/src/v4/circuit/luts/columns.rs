@@ -18,8 +18,8 @@ pub const fn num_slots(table: LutTable) -> usize {
     }
 }
 
-/// Live rows per slot (the key-domain size; [`lut_height`] rounds it up to the AIR height).
-pub const fn slot_height(table: LutTable) -> usize {
+/// Live rows per slot (the key-domain size, before trace padding).
+pub const fn lut_live_rows(table: LutTable) -> usize {
     match table {
         LutTable::Range16
         | LutTable::Bytes2
@@ -38,13 +38,6 @@ pub const fn slot_height(table: LutTable) -> usize {
         LutTable::RneRnd => 1 << 17,
         LutTable::ProdAlign15 | LutTable::B200Align | LutTable::WidthNorm => 1 << 16,
     }
-}
-
-/// Committed height of the table's AIR: the slot key domain rounded up to a power of two.
-/// Full-height for most tables; EXPINFO (255 -> 256), CLAMP22 (601 -> 1024) and POW2D
-/// (20 -> 32) pad by key saturation (module docs).
-pub const fn lut_height(table: LutTable) -> usize {
-    slot_height(table).next_power_of_two()
 }
 
 /// Stored key columns: the enumerated tuple for BYTES2/PAIR128/XOR8, one ramp or saturated

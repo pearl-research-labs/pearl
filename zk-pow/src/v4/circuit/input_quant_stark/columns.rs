@@ -7,7 +7,7 @@
 //! constants. Each trace row carries the same flat element index from the A and B strips; a
 //! group is `k` rows and a scale block is eight rows.
 //!
-//! The trace is padded to `next_power_of_two(max(h, w) * k)`. Per-side liveness excludes
+//! The trace height rounds `max(h, w) * k` upward to the next supported height. Per-side liveness excludes
 //! phantom rows from CTLs; their data and beta are zero while alpha uses its required
 //! positive-normal filler. The final row remains group-final so cyclic AIR transitions close
 //! at the group-0 boundary.

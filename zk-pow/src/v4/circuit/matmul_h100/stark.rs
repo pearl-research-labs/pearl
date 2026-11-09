@@ -43,6 +43,7 @@
 //! WIDTHNORM lookup relations wired by the FP8 driver; evaluating this
 //! table's AIR alone does not supply those external table facts.
 
+use crate::v4::circuit::trace_padding::trace_padded_height;
 use core::borrow::Borrow;
 use std::marker::PhantomData;
 
@@ -125,11 +126,11 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkH100<F, D> {
         self.h * self.w * self.rows_per_cell()
     }
 
-    /// Trace height: the cell rows padded to the next power of two with single-row phantom
+    /// Trace height: the cell rows padded to the next supported height with single-row phantom
     /// cells (all-zero, `is_padding = is_cell_final = 1`; the coordinate walk continues at
     /// position `h*w + t`).
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        trace_padded_height(self.live_rows())
     }
 
     /// Generates the H100 Matmul trace and public inputs.
@@ -2278,8 +2279,8 @@ mod tests {
         );
         assert_eq!(program.rows_per_cell(), 4);
         assert_eq!(program.live_rows(), 60);
-        assert_eq!(program.num_rows(), 64);
-        assert_eq!(rows.len(), 64);
+        assert_eq!(program.num_rows(), 128);
+        assert_eq!(rows.len(), 128);
         assert_eq!(pis, program.public_inputs());
         let m = &MATMUL_COL_MAP;
         let hw = program.h * program.w;

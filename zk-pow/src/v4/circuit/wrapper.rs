@@ -107,7 +107,7 @@ use starky::verifier::eval_columns_at_zeta_and_next;
 
 use super::blake3_stark::columns::{BLAKE3_COL_MAP, NUM_BLAKE3_KNOWN_COLUMNS};
 use super::ctl::{NUM_ALL_TABLES, NUM_TABLES, Table};
-use super::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8System, fp8_universal_envelope, statement_digest_to_hash_out};
+use super::driver::{Fp8System, V4_REACHABLE_DEGREE_BITS, fp8_universal_envelope, statement_digest_to_hash_out};
 use crate::v4::api::primitives::Hash256;
 use crate::v4::circuit::circuit_utils::build_recursion_config;
 
@@ -120,14 +120,7 @@ pub type InnerC = PoseidonGoldilocksConfig;
 /// Stage-2 (published) configuration: Blake3 outer hashing, like the deployed v2 layer 2.
 pub type OuterC = Blake3GoldilocksConfig;
 
-/// Sanctioned FRI parameters of the two wrapper stages — the same consensus combinations as
-/// the deployed v2 wrapper (`pearl_circuit::STAGE_1_PARAMS` / `STAGE_2_PARAMS`). Rate
-/// `2^-3` is the floor for both stages: the recursion gates carry degree-7 constraints
-/// (Poseidon), so the quotient needs an LDE blowup of at least `2^3`.
-pub const STAGE_1_RATE_BITS: usize = 3;
-pub const STAGE_1_POW_BITS: usize = 18;
-pub const STAGE_2_RATE_BITS: usize = 7;
-pub const STAGE_2_POW_BITS: usize = 22;
+pub use super::circuit_utils::{STAGE_1_POW_BITS, STAGE_1_RATE_BITS, STAGE_2_POW_BITS, STAGE_2_RATE_BITS};
 
 /// Flat offset of batch position `position`'s STARK public inputs inside the wrapper's
 /// public-input vector (the batch tables' public inputs are the vector's prefix, in batch
@@ -224,7 +217,7 @@ impl Fp8WrapperCircuits {
             system
                 .degree_bits()
                 .iter()
-                .all(|bits| FP8_REACHABLE_DEGREE_BITS.contains(bits)),
+                .all(|bits| V4_REACHABLE_DEGREE_BITS.contains(bits)),
             "universal wrapper: the degree profile {:?} must lie on the consensus ladder",
             system.degree_bits()
         );
@@ -298,6 +291,8 @@ impl Fp8WrapperCircuits {
             stage1.common.degree_bits(),
         );
 
+        debug_assert!(stage1.common.degree_bits() <= 17, "V4 inner wrapper exceeds 2^17 rows");
+
         // ---- Stage 2: the ZK wrap. ----
         let config_2 = build_recursion_config(STAGE_2_RATE_BITS, STAGE_2_POW_BITS, 2, true);
         debug_assert!(config_2.zero_knowledge);
@@ -312,12 +307,17 @@ impl Fp8WrapperCircuits {
         builder.verify_proof::<InnerC>(&stage1_proof_target, &stage1_verifier_target, &stage1.common);
         // The constrained build connects each Z-blinding pair through the permutation
         // argument; the frozen V1/V2 circuits keep building through plain `build`.
+        let stage2_gates = builder.num_gates();
         let stage2 = timed!(
             timing,
             "build the stage-2 (ZK) wrapper circuit",
             builder.build_with_z_blinding_copy_constraints::<OuterC>()
         );
-        log::info!("stage-2 wrapper circuit: 2^{} gates", stage2.common.degree_bits());
+        log::info!(
+            "stage-2 wrapper circuit: {stage2_gates} gates -> 2^{} rows",
+            stage2.common.degree_bits()
+        );
+        debug_assert!(stage2.common.degree_bits() <= 13, "V4 outer wrapper exceeds 2^13 rows");
 
         Ok(Self {
             stage1,

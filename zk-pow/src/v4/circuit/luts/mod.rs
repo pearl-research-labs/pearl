@@ -5,9 +5,9 @@
 //! Complete channels are assembled in [`super::ctl`].
 //!
 //! Each device family's sixteen [`LutTable`]s is its own table of
-//! the batch STARK — a [`LutStark`] at its natural committed height [`lut_height`] (the
-//! array orders the batch by descending height, so nothing pays for another table's
-//! padding). A LUT AIR has no constraints of its own; its columns split into two classes:
+//! the batch STARK — a [`LutStark`] padded from [`lut_live_rows`] to the next supported
+//! trace height. The array orders the batch by descending height, so nothing pays for
+//! another table's padding. A LUT AIR has no constraints of its own; its columns split into two classes:
 //!
 //! - **Precommitted columns** (class (c)): the key column(s) — a plain ramp for tables whose
 //!   key domain fills the height, the enumerated key tuple for BYTES2/PAIR128, or a saturated
@@ -54,9 +54,7 @@ pub mod stark;
 pub mod witness;
 
 pub use super::ctl::lut_cross_table_lookups;
-pub use columns::{
-    LutSlotLayout, lut_height, lut_num_columns, lut_slot_layout, num_precommitted_columns, num_slots, slot_height,
-};
+pub use columns::{LutSlotLayout, lut_live_rows, lut_num_columns, lut_slot_layout, num_precommitted_columns, num_slots};
 pub use ctl::ctl_looked_lut_slot;
 pub use stark::{
     B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Int8DecStark, Log16Stark, LutStark, Pair128Stark,

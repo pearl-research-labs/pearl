@@ -33,6 +33,7 @@
 
 // TODO: this file contains many asserts, that should be prevented in advance
 
+use crate::v4::circuit::trace_padding::trace_padded_height;
 use core::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
 
@@ -456,7 +457,8 @@ impl Blake3Program {
         use plonky2_maybe_rayon::*;
 
         let instructions = Self::translated_instructions(program, k);
-        let num_rows = (ROWS_PER_COMPRESSION * instructions.len()).next_power_of_two();
+        // Keep translation and column generation fused.
+        let num_rows = trace_padded_height(ROWS_PER_COMPRESSION * instructions.len());
         // Padding rows carry IS_NEW_BLAKE alone.
         let mut columns: [PolynomialValues<F>; NUM_BLAKE3_KNOWN_COLUMNS] = core::array::from_fn(|c| {
             let padding = if c == BLAKE3_COL_MAP.row_flags_packed {
@@ -686,7 +688,7 @@ impl Blake3Program {
     }
 
     /// Live (unpadded) trace rows.
-    pub fn num_live_rows(&self) -> usize {
+    pub fn live_rows(&self) -> usize {
         ROWS_PER_COMPRESSION * self.instructions.len()
     }
 
@@ -699,9 +701,9 @@ impl Blake3Program {
             .map(|i| self.routing_pins[i].1 as u64)
     }
 
-    /// Trace height: live rows padded to a power of two.
+    /// Trace height: live rows padded to a supported height.
     pub fn num_rows(&self) -> usize {
-        self.num_live_rows().next_power_of_two()
+        trace_padded_height(self.live_rows())
     }
 
     /// Schedule sanity: back-references only, witness indices in bounds, at most one
@@ -887,7 +889,7 @@ impl Blake3Program {
         schedule: &Blake3NativeSchedule,
         rows: &mut [[F; NUM_BLAKE3_COLUMNS]],
     ) -> [F; NUM_BLAKE3_PUBLIC_INPUTS] {
-        let num_live = self.num_live_rows();
+        let num_live = self.live_rows();
         let num_rows = self.num_rows();
         assert_eq!(rows.len(), num_rows, "blake3 fill destination height");
 
@@ -3846,7 +3848,7 @@ mod tests {
             cvs_out,
         } = schedule;
         let instrs = &program.instructions;
-        let num_live = program.num_live_rows();
+        let num_live = program.live_rows();
         let num_rows = program.num_rows();
         let mut rows: Vec<[F; NUM_BLAKE3_COLUMNS]> = vec![[F::ZERO; NUM_BLAKE3_COLUMNS]; num_rows];
         let mut freq = vec![0u64; num_rows];
