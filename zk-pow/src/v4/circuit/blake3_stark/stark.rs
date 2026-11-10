@@ -4168,14 +4168,29 @@ mod tests {
 
     #[test]
     fn blake3_parallel_fill_wraps_without_padding() {
+        // Sixteen compressions fill T3's minimum 128-row trace exactly.
+        let mut instructions = vec![
+            Blake3Instruction {
+                cv: CvSource::Iv,
+                msg: MessageSource::AuxBytes { idx: 0 },
+                counter: 0,
+                block_len: BLAKE3_MSG_LEN as u32,
+                flags: (B3F_CHUNK_START | B3F_CHUNK_END) as u32,
+                bind: None,
+            };
+            15
+        ];
+        instructions.push(Blake3Instruction::lottery());
         let program = Blake3Program {
-            instructions: vec![Blake3Instruction::lottery()],
+            instructions,
+            num_aux_msgs: 1,
             ..Default::default()
         };
-        let data = TestData::new(1, 1, 32, 0);
+        let mut data = TestData::new(1, 1, 32, 0);
+        data.aux_msgs.push([0; BLAKE3_MSG_LEN]);
         let inputs = data.inputs();
         let (rows, pis) = program.generate_trace::<F>(&inputs);
-        assert_eq!(rows.len(), ROWS_PER_COMPRESSION);
+        assert_eq!(rows.len(), program.live_rows());
         let schedule = program.native_schedule(&inputs);
         assert_eq!(rows, serial_fill_rows::<F>(&program, &inputs, &schedule));
         assert!(!constraints_violated(&S::new(program), &rows, &pis));
