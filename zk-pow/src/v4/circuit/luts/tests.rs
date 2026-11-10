@@ -4,7 +4,7 @@ use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::PrimeField64;
 
 use super::super::ctl::lut_table_idx;
-use super::super::ctl::{NUM_LUT_TABLES, NUM_TABLES, lut_tables};
+use super::super::ctl::{NUM_B200_LUT_TABLES, NUM_TABLES, lut_tables};
 use super::super::input_quant_stark::stark::rnernd_scaled;
 use super::super::matmul_b200_stark::MatmulStarkB200;
 use super::super::matmul_b200_stark::columns::{GROUP_WIDTH, MATMUL_B200_COL_MAP, NUM_MATMUL_B200_COLUMNS};
@@ -22,11 +22,11 @@ use starky::lookup::Column;
 
 type F = GoldilocksField;
 
-fn b200_tables() -> [LutTable; NUM_LUT_TABLES] {
+fn b200_tables() -> Vec<LutTable> {
     lut_tables(Device::B200)
 }
 
-fn h100_tables() -> [LutTable; NUM_LUT_TABLES] {
+fn h100_tables() -> Vec<LutTable> {
     lut_tables(Device::H100)
 }
 
@@ -60,9 +60,9 @@ fn shapes_match_the_documented_layout_and_the_consumer_arities() {
         // tuple; RANGE16 is its ramp).
         let arity = match table {
             LutTable::Range16 => 0,
-            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Width32 | LutTable::Width16 => 2,
+            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Width32 | LutTable::Width16 | LutTable::Fp32Tools => 2,
             LutTable::Xor8 => 3,
-            LutTable::Int8Dec | LutTable::RneRnd => 4,
+            LutTable::DownscaleThreshold | LutTable::Int8Dec | LutTable::RneRnd => 4,
             LutTable::B200Align => 5,
             _ => 1,
         };
@@ -77,14 +77,15 @@ fn shapes_match_the_documented_layout_and_the_consumer_arities() {
 }
 
 #[test]
-fn heights_descend_and_widths_match_the_documented_layout() {
-    // Committed heights: the natural (power-of-two) height per table, descending in
-    // Committed device order — nothing is padded to another table's height.
+fn committed_heights_match_the_device_inventory() {
     let heights: Vec<usize> = b200_tables().iter().map(|&t| lut_height(t)).collect();
+    // The device-independent prefix (through `Width32`) descends; the appended tables
+    // (FP32TOOLS, then B200's downscale tables) follow at their own heights.
     assert!(
-        heights.windows(2).all(|w| w[0] >= w[1]),
+        heights[..16].windows(2).all(|w| w[0] >= w[1]),
         "committed LUTs must descend: {heights:?}"
     );
+    assert_eq!(&heights[16..], &[1024, 32768, 65536]);
     assert_eq!(lut_height(LutTable::RneRnd), 1 << 17);
     assert_eq!(lut_height(LutTable::Range16), 1 << 16);
     assert_eq!(lut_height(LutTable::Pair128), 1 << 14);
@@ -95,7 +96,7 @@ fn heights_descend_and_widths_match_the_documented_layout() {
     assert_eq!(lut_height(LutTable::Pow2D), 32); // 20 live rows
     assert_eq!(lut_height(LutTable::Width32), 32);
     assert_eq!(lut_height(LutTable::Width16), 1 << 16);
-    assert_eq!(lut_height(LutTable::Log16), 1 << 16);
+    assert_eq!(lut_height(LutTable::Log16), 1 << 17);
 
     // Widths: precommitted (keys + stored values) plus one multiplicity column per slot.
     let widths: BTreeMap<LutTable, (usize, usize)> = b200_tables()
@@ -111,7 +112,8 @@ fn heights_descend_and_widths_match_the_documented_layout() {
     assert_eq!(widths[&LutTable::Pow2Gb], (2, 3));
     assert_eq!(widths[&LutTable::Width32], (3, 4));
     assert_eq!(widths[&LutTable::Width16], (3, 4));
-    assert_eq!(widths[&LutTable::Log16], (2, 3));
+    assert_eq!(widths[&LutTable::Log16], (3, 4));
+    assert_eq!(widths[&LutTable::DownscaleThreshold], (7, 13));
     for t in [LutTable::Qcast, LutTable::Div448, LutTable::Pair128, LutTable::Clamp22] {
         assert_eq!(widths[&t].1, 3, "{t:?}");
     }
@@ -163,7 +165,8 @@ fn small_tables_match_their_closed_forms() {
     assert_eq!((to_u64(width16[0][0x8000]), to_u64(width16[1][0x8000])), (16, 1));
     assert_eq!((to_u64(width16[0][0xFFFF]), to_u64(width16[1][0xFFFF])), (16, 1));
     assert_eq!((to_u64(width16[0][255 * 255]), to_u64(width16[1][255 * 255])), (16, 1));
-    // LOG16: floor(64 * log2 key), 0 at the key-0 sentinel.
+    // LOG16: region 0 (rows [0, 2^16)) is floor(64 * log2 index), 0 at the key-0 sentinel;
+    // region 1 + c (rows 2^16 + 8192 c + d) is Gaussian class c at the lambda difference d.
     let log16 = generate::<F>(LutTable::Log16, 0);
     assert_eq!(to_u64(log16[0][0]), 0, "zero sentinel");
     assert_eq!(to_u64(log16[0][1]), 0);
@@ -172,6 +175,11 @@ fn small_tables_match_their_closed_forms() {
     for key in [3usize, 1000, 8192, 12345, 40000, 65535] {
         assert_eq!(to_u64(log16[0][key]), (64.0 * (key as f64).log2()).floor() as u64);
     }
+    assert_eq!(to_u64(log16[0][1 << 16]), 65173, "class 0 is uncapped at d = 0");
+    assert_eq!(to_u64(log16[0][(1 << 16) + 8192]), 23488, "class 1 is capped at d = 0");
+    assert_eq!(to_u64(log16[0][(1 << 16) + 289]), 1, "the kernel's last nonzero entry");
+    assert_eq!(to_u64(log16[0][(1 << 16) + 290]), 0, "the kernel's zero tail");
+    assert_eq!(to_u64(log16[0][(1 << 17) - 1]), 0);
     // WIDTH32: row r holds width W = r + 1; (2^max(W-24,0), 2^max(24-W,0)).
     let width32 = generate::<F>(LutTable::Width32, 0);
     assert_eq!((to_u64(width32[0][0]), to_u64(width32[1][0])), (1, 1 << 23), "W = 1");
@@ -491,6 +499,21 @@ fn precommitted_blocks_match_the_generators() {
                 assert_eq!(block[0], stored[0], "{table:?} key tuple low");
                 assert_eq!(block[1], stored[1], "{table:?} key tuple high");
             }
+            LutTable::Fp32Tools => {
+                for row in 0..height {
+                    let (operation, argument) = super::columns::fp32_tool_key(row.min(live - 1));
+                    assert_eq!(block[0][row], F::from_canonical_u64(operation));
+                    let magnitude = F::from_canonical_u64(argument.unsigned_abs());
+                    assert_eq!(block[1][row], if argument < 0 { -magnitude } else { magnitude });
+                }
+            }
+            LutTable::Log16 => {
+                for row in 0..height {
+                    let (region, index) = super::columns::log16_key(row);
+                    assert_eq!(block[0][row], F::from_canonical_u64(region));
+                    assert_eq!(block[1][row], F::from_canonical_u64(index));
+                }
+            }
             LutTable::Width32 => assert!(
                 (0..height).all(|i| block[0][i] == F::from_canonical_usize(i + 1)),
                 "WIDTH32 shifted ramp key [1, 32]"
@@ -568,7 +591,7 @@ fn stark_types_and_ctl_halves_are_consistent() {
     assert_eq!(<Pow2GbStark<F, 2> as Stark<F, 2>>::COLUMNS, 3);
     assert_eq!(<Width32Stark<F, 2> as Stark<F, 2>>::COLUMNS, 4);
     assert_eq!(<Width16Stark<F, 2> as Stark<F, 2>>::COLUMNS, 4);
-    assert_eq!(<Log16Stark<F, 2> as Stark<F, 2>>::COLUMNS, 3);
+    assert_eq!(<Log16Stark<F, 2> as Stark<F, 2>>::COLUMNS, 4);
     let stark = QcastStark::<F, 2>::new(LutTable::Qcast);
     assert!(stark.requires_ctls() && stark.lookups().is_empty());
 
@@ -598,14 +621,16 @@ fn lut_ctls_assemble_from_inventories() {
     let tables = b200_tables();
     let dummy = |table: LutTable| -> LutLookup<F> {
         let keys = match table {
-            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 => vec![Column::single(0), Column::single(1)],
+            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 | LutTable::Fp32Tools | LutTable::Log16 => {
+                vec![Column::single(0), Column::single(1)]
+            }
             _ => vec![Column::single(0)],
         };
         let values = (0..match table {
             LutTable::Range16 | LutTable::Bytes2 | LutTable::Pair128 => 0,
-            LutTable::Width32 | LutTable::Width16 => 2,
+            LutTable::Width32 | LutTable::Width16 | LutTable::Fp32Tools => 2,
             LutTable::Xor8 => 3,
-            LutTable::Int8Dec | LutTable::RneRnd => 4,
+            LutTable::DownscaleThreshold | LutTable::Int8Dec | LutTable::RneRnd => 4,
             LutTable::B200Align => 5,
             _ => 1,
         })
@@ -630,7 +655,7 @@ fn lut_ctls_assemble_from_inventories() {
         ),
     ];
     let ctls = lut_cross_table_lookups::<F>(&tables, &inventories);
-    assert_eq!(ctls.len(), NUM_LUT_TABLES, "one channel per LUT");
+    assert_eq!(ctls.len(), NUM_B200_LUT_TABLES, "one channel per LUT");
 }
 
 #[test]
@@ -817,13 +842,13 @@ fn checker_serves_honest_instances_and_rejects_forged_values() {
 
 #[test]
 fn preprocessed_inputs_place_the_tables_at_their_batch_positions() {
-    // The fp8 arrangement: the sixteen LUTs right after the five main tables.
-    let positions: [usize; NUM_LUT_TABLES] = core::array::from_fn(|i| NUM_TABLES + i);
+    // The committed LUTs follow the main tables.
+    let positions: Vec<usize> = (NUM_TABLES..NUM_TABLES + NUM_B200_LUT_TABLES).collect();
     let tables = b200_tables();
-    let (values, columns) = lut_preprocessed_inputs::<F>(NUM_TABLES + NUM_LUT_TABLES, positions, &tables);
+    let (values, columns) = lut_preprocessed_inputs::<F>(NUM_TABLES + NUM_B200_LUT_TABLES, &positions, &tables);
     assert_eq!(
         (values.len(), columns.len()),
-        (NUM_TABLES + NUM_LUT_TABLES, NUM_TABLES + NUM_LUT_TABLES)
+        (NUM_TABLES + NUM_B200_LUT_TABLES, NUM_TABLES + NUM_B200_LUT_TABLES)
     );
     for t in 0..NUM_TABLES {
         assert!(values[t].is_empty() && columns[t].is_empty(), "main tables commit nothing");
@@ -838,7 +863,7 @@ fn preprocessed_inputs_place_the_tables_at_their_batch_positions() {
     // the flat order already is the setup oracle's canonical polynomial order
     // (descending degree, ties by table index).
     let heights: Vec<usize> = values.iter().flatten().map(|v| v.len()).collect();
-    assert!(heights.windows(2).all(|w| w[0] >= w[1]));
+    assert!(heights.iter().all(|height| height.is_power_of_two()));
 }
 
 /// Builds the real setup commitment — LDEs and the batched Merkle tree over ~20M field
@@ -849,16 +874,16 @@ fn lut_precommitment_commits_all_tables_once() {
     use plonky2::plonk::config::PoseidonGoldilocksConfig;
 
     let config = StarkConfig::standard_fast_config();
-    let positions: [usize; NUM_LUT_TABLES] = core::array::from_fn(|i| NUM_TABLES + i);
+    let positions: Vec<usize> = (NUM_TABLES..NUM_TABLES + NUM_B200_LUT_TABLES).collect();
     let tables = b200_tables();
     let data = lut_preprocessed_data::<F, PoseidonGoldilocksConfig, 2>(
-        NUM_TABLES + NUM_LUT_TABLES,
-        positions,
+        NUM_TABLES + NUM_B200_LUT_TABLES,
+        &positions,
         &tables,
         &config,
         &mut TimingTree::default(),
     );
-    assert_eq!(data.columns_per_table.len(), NUM_TABLES + NUM_LUT_TABLES);
+    assert_eq!(data.columns_per_table.len(), NUM_TABLES + NUM_B200_LUT_TABLES);
     for (i, &table) in tables.iter().enumerate() {
         assert_eq!(
             data.columns_per_table[NUM_TABLES + i],

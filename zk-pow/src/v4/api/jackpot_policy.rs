@@ -31,19 +31,26 @@
 //!    `q=max(e(Z)-W,e(M)-18)` and `E_GRID=q+157`, omitting zero magnitudes.
 //!    The exact consensus rule is `lambda_A + lambda_B < 128*E_GRID + 45952`.
 //!    When both magnitudes are zero, `E_GRID=0` and no summands are skipped.
+//! 4. **Row security** (downscaling hardware only, i.e. B200). Every row `i`
+//!    of both sides keeps its mean Gaussian security proxy at or above `1/25`. With the
+//!    signal RMS `s_i = alpha_i * l2_i`, the row's E4M3 strip code `c_i` and
+//!    `g_iu = exp(-2 X_bar_iu^2 / s_i^2)`, the proxy is `21/16 * c_i / s_i * g_iu` for
+//!    `s_i >= 8` and `min(g_iu / 8, GET_CAP(c_i))` below. The consensus rule bounds `g`
+//!    through check 3's `lambda` certificate and is evaluated in exact integers; see
+//!    `JackpotPolicy::row_security_ok`.
 //!
 //! The verdict is a BINARY gate (rejected / accepted): a `D`-dependent credit
 //! would incentivize shaping data toward incoherence.
 //!
 //! [`PublicParams`](crate::v4::api::public_params::PublicParams) bounds `k <= 2^16`.
 
-use crate::v4::api::dtype::{bf16_to_f32, fp8_e4m3_to_f32};
+use crate::v4::api::dtype::{bf16_to_f32, f32_to_fp8_e4m3, fp8_e4m3_to_f32};
 use crate::v4::api::layout::{JACKPOT_ENTRIES, lane_assignment};
 use crate::v4::api::public_params::Device;
 use crate::v4::api::quantization::BuiltRows;
-use crate::v4::api::utils::{B200, H100, xor_fold_extract};
+use crate::v4::api::utils::{B200, H100, SMALL_RMS_THRESHOLD, downscale_g, xor_fold_extract};
 use crate::v4::circuit::unpredictability::{budget, grid_exponent, grid_exponent_from_binades, lambda, skip};
-use anyhow::Result;
+use anyhow::{Result, ensure};
 
 /// Whitepaper-fixed jackpot policy for one committed device.
 #[derive(Copy, Clone, Debug)]
@@ -54,8 +61,10 @@ pub(crate) struct JackpotPolicy {
     pub(crate) tau_idle: f64,
     /// Max fraction of dead entries per tile side (check 1).
     pub(crate) eps_idle: f64,
-    /// Floor on every row's injected noise std `sigma_i` (check 2).
-    pub(crate) sigma_min: f64,
+    /// Floor on every A row's injected noise std `sigma_i` (check 2).
+    pub(crate) rms_min_a: f64,
+    /// Floor on every B row's injected noise std `sigma_i` (check 2).
+    pub(crate) rms_min_b: f64,
 }
 
 impl Default for JackpotPolicy {
@@ -71,7 +80,8 @@ impl JackpotPolicy {
             device,
             tau_idle: 8.0,
             eps_idle: 0.015625, // 1/64
-            sigma_min: 1.0,
+            rms_min_a: 4.0,
+            rms_min_b: 16.0,
         }
     }
 }
@@ -87,6 +97,16 @@ pub struct OperandStrip {
 /// The lottery message: `xor_fold_extract(A' @ B'.T, lane_assignment(h, w))` — 64
 /// bytes, one BLAKE3 block, hashed under `pow_key` to form `hash_jackpot`.
 pub type JackpotMessage = [u8; 4 * JACKPOT_ENTRIES];
+
+/// Check 4's fixed-point resolution: the row coefficient `A`, the kernel `T` and the
+/// cap are integers in units of `1/PROXY_SCALE`, so a row's `A * sum_u T'_u` is in
+/// units of `1/PROXY_SCALE^2`.
+const PROXY_SCALE: u64 = 1 << 16;
+/// Check 4 accepts a row iff its mean proxy is at least `SECURITY_MIN = 1/SECURITY_MIN_INVERSE`.
+const SECURITY_MIN_INVERSE: u64 = 25;
+/// One-sided slack of check 3's certificate: `0 <= 64 (log2 S + 508) - lambda < LAMBDA_ERROR`
+/// (the exhaustive supremum over the LOG16 keys is 1.0105).
+const LAMBDA_ERROR: f64 = 1.02;
 
 /// Per-row noise stds `sigma_i = DELTA * alpha_i * l2_i` (in quantized units),
 /// from the floored norms and scales recorded at quantization time.
@@ -124,7 +144,7 @@ impl JackpotPolicy {
         Ok(Some(xor_fold_extract(&acc, &lanes)))
     }
 
-    /// Checks 1-3, returning the bit-exact replayed first-stage accumulator
+    /// Checks 1-4, returning the bit-exact replayed first-stage accumulator
     /// `A' @ B'.T` (row-major, one value per tile cell) on success, `None` on
     /// rejection.
     fn run_checks(&self, a: &OperandStrip, b: &OperandStrip, k: usize) -> Result<Option<Vec<f32>>> {
@@ -154,13 +174,23 @@ impl JackpotPolicy {
         let sigma_b = sigmas(&b.built, self.device);
 
         // Check 2: noise floor, sigma_i >= sigma_min on both sides.
-        if sigma_a.iter().chain(&sigma_b).any(|&s| s < self.sigma_min) {
+        if sigma_a.iter().any(|&s| s < self.device.delta() * self.rms_min_a)
+            || sigma_b.iter().any(|&s| s < self.device.delta() * self.rms_min_b)
+        {
             return Ok(None);
         }
 
         // Check 3: replay A' @ B'.T to measure M/Z and count skippable summands.
-        // Return the final matrix for the lottery fold if the count is within budget; otherwise None.
-        self.census_ok(a, b, k, sigma_a.len(), sigma_b.len())
+        let Some(acc) = self.census_ok(a, b, k, sigma_a.len(), sigma_b.len())? else {
+            return Ok(None);
+        };
+
+        // Check 4: row security of every row, on downscaling hardware only.
+        if self.device == Device::B200 && !(Self::row_security_ok(a, k)? && Self::row_security_ok(b, k)?) {
+            return Ok(None);
+        }
+        // The final matrix feeds the lottery fold.
+        Ok(Some(acc))
     }
 
     /// Check 1: the fraction of dead entries over all of the side's tile
@@ -258,13 +288,86 @@ impl JackpotPolicy {
         }
         Ok(Some(acc))
     }
+
+    /// Check 4: every row's mean row security proxy is at least
+    /// `1/SECURITY_MIN_INVERSE`.
+    /// Let `g_u = exp(-w_u/2)` such that `w_u = 4 * (X / sigma)^2`.
+    /// The security proxy function is:
+    /// if `sigma >= 8`:
+    ///     `p_u = 21/16 * 2 * X / sigma * exp(-w_u/2)`
+    /// else:
+    ///     `p_u = min(exp(-w_u/2) / 8, GET_CAP(X))`.
+    /// The security proxy check is then:
+    ///     sum_u p_u >= k / SECURITY_MIN_INVERSE.
+    /// This method approximates the security proxy check in integer arithmetic,
+    /// making use of the already computed `lambda` values from check 3.`
+    /// Returns `Ok(true)` if the check passes, `Ok(false)` if it fails, and Èrr` on error.`
+    fn row_security_ok(side: &OperandStrip, k: usize) -> Result<bool> {
+        let threshold = (k as u64 * PROXY_SCALE * PROXY_SCALE).div_ceil(SECURITY_MIN_INVERSE);
+        for (row, (&alpha, &l2)) in side.clean.chunks(k).zip(side.built.alpha.iter().zip(&side.built.l2)) {
+            let (coefficient, kernel_cap) = gauss_row_constants(alpha, l2)?;
+            let lambda_noise = lambda(Device::B200, alpha, 0, l2);
+            let kernel_sum: u64 = row
+                .iter()
+                .map(|&x| {
+                    // `lambda` is monotone in `|x|`, so the difference never underflows.
+                    let difference = lambda(Device::B200, alpha, x, l2) - lambda_noise;
+                    gauss_kernel(difference).min(kernel_cap)
+                })
+                .sum();
+            if coefficient * kernel_sum < threshold {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Check 4's per-row constants `(A, T_cap)`, which are used for the following check:
+/// A * sum_u min(T_u, T_cap) >= k * PROXY_SCALE^2 / SECURITY_MIN_INVERSE, where T_u is computed by [`gauss_kernel`].
+fn gauss_row_constants(alpha: u16, l2: u16) -> Result<(u64, u64)> {
+    const GAUSSIAN_SCALE: f64 = 1.3125;
+    // GET_CAP(code) = CAP_OFFSET + CAP_SLOPE * (code - CAP_PIVOT).
+    const CAP_OFFSET: f64 = 0.0431;
+    const CAP_SLOPE: f64 = 0.2738;
+    const CAP_PIVOT: f64 = 0.4;
+    /// The small-RMS branch scales the Gaussian by `1/8`.
+    const SMALL_RMS_DIVISOR: u64 = 8;
+
+    // The BF16 product has at most 16 significant bits: this f32 product is exact.
+    let scaled_rms = bf16_to_f32(alpha) * bf16_to_f32(l2);
+    ensure!(
+        (4.0..256.0).contains(&scaled_rms),
+        "B200 security proxy requires signal RMS in [4, 256)"
+    );
+    // Preserve the reference's RN32 multiplication followed by RN E4M3.
+    let code = f64::from(fp8_e4m3_to_f32(f32_to_fp8_e4m3(downscale_g(&[scaled_rms])[0] * scaled_rms)?));
+    let scale = PROXY_SCALE as f64;
+    if scaled_rms >= SMALL_RMS_THRESHOLD {
+        let coefficient = (scale * GAUSSIAN_SCALE * code / f64::from(scaled_rms)).floor() as u64;
+        Ok((coefficient, PROXY_SCALE))
+    } else {
+        let cap = (scale * (CAP_OFFSET + CAP_SLOPE * (code - CAP_PIVOT))).floor() as u64;
+        Ok((PROXY_SCALE / SMALL_RMS_DIVISOR, SMALL_RMS_DIVISOR * cap))
+    }
+}
+
+/// Check 4's Gaussian kernel at check 3's certified bound: the lambda difference `d`
+/// certifies `w <= w_hi(d) = 2^((d + LAMBDA_ERROR) / 64) - 1`, and
+/// `T(d) = floor(2^16 * exp(-w_hi(d) / 2))` is the matching lower bound on
+/// `2^16 * exp(-w / 2)`.
+fn gauss_kernel(difference: u64) -> u64 {
+    let w_hi = ((difference as f64 + LAMBDA_ERROR) / 64.0).exp2() - 1.0;
+    (PROXY_SCALE as f64 * (-0.5 * w_hi).exp()).floor() as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::v4::api::noise::OperandNoise;
+    use crate::v4::api::prequant::{BLOCK_SIZE, exact_norms, open_prequant};
     use crate::v4::api::quantization::Fp8E4M3Quant;
+    use crate::v4::circuit::unpredictability::LAMBDA_MAX;
 
     fn side(clean: Vec<u16>, built: BuiltRows) -> OperandStrip {
         OperandStrip { clean, built }
@@ -273,6 +376,10 @@ mod tests {
     /// Build one side from clean rows with real norms, scales, and noise.
     fn build(rows: &[u16], k: usize, r: usize, seed: u8) -> (Vec<u16>, BuiltRows) {
         let num_rows = rows.len() / k;
+        let codes: Vec<i8> = rows.iter().map(|&x| (bf16_to_f32(x) * 16.0) as i8).collect();
+        let scales = vec![0x3D80; num_rows * (k / BLOCK_SIZE)];
+        let clean = open_prequant(&codes, &scales, num_rows, k, BLOCK_SIZE).unwrap();
+        assert_eq!(clean, rows, "fixture must round-trip through int8 codes and block scales");
         // Deterministic mesh-like FP8 noise factors keyed off `seed`.
         let e: Vec<u8> = (0..num_rows * r)
             .map(|i| if (i + seed as usize).is_multiple_of(3) { 0xB0 } else { 0x30 })
@@ -282,9 +389,9 @@ mod tests {
             .collect();
         let noise = OperandNoise { e, f };
         let quant = Fp8E4M3Quant::new(Device::B200);
-        let norms: Vec<(u16, u16)> = rows.chunks(k).map(|row| quant.row_norms(row).unwrap()).collect();
-        let built = quant.noisy_quantize(rows, &noise, &norms).unwrap();
-        (rows.to_vec(), built)
+        let norms = exact_norms(&codes, &scales, num_rows, k, BLOCK_SIZE).unwrap();
+        let built = quant.noisy_quantize(&codes, &scales, &noise, &norms, Device::B200).unwrap();
+        (clean, built)
     }
 
     /// Varied, well-conditioned clean rows (values in [-2, 2], no outliers).
@@ -294,9 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn sigma_floor_is_one_for_every_device() {
+    fn sigma_floor_is_correct_for_every_device() {
         for device in [Device::H100, Device::B200] {
-            assert_eq!(JackpotPolicy::for_device(device).sigma_min, 1.0);
+            assert_eq!(JackpotPolicy::for_device(device).rms_min_a, 4.0);
+            assert_eq!(JackpotPolicy::for_device(device).rms_min_b, 16.0);
         }
     }
 
@@ -341,7 +449,8 @@ mod tests {
         // Disable the sigma floor so the liveness check is what rejects (the
         // zero-heavy row also has a tiny sigma).
         let policy = JackpotPolicy {
-            sigma_min: 0.0,
+            rms_min_a: 0.0,
+            rms_min_b: 0.0,
             ..JackpotPolicy::default()
         };
         let verdict = policy.run_checks(&side(a, a_built), &side(b, b_built), k).unwrap();
@@ -368,10 +477,54 @@ mod tests {
         // Neutralize checks 1-2 to isolate check 3.
         let policy = JackpotPolicy {
             eps_idle: 1.0,
-            sigma_min: 0.0,
+            rms_min_a: 0.0,
+            rms_min_b: 0.0,
             ..JackpotPolicy::default()
         };
         let verdict = policy.run_checks(&side(a, a_built), &side(b, b_built), k).unwrap();
         assert!(verdict.is_none(), "predictable summands must reject");
+    }
+
+    #[test]
+    fn gauss_kernel_matches_its_table_and_vanishes_past_289() {
+        // Spot values of T(d) = floor(2^16 exp(-(2^((d + 1.02)/64) - 1)/2)) from 60-digit arithmetic.
+        assert_eq!(gauss_kernel(0), 65173);
+        assert_eq!(gauss_kernel(1), 64815);
+        assert_eq!(gauss_kernel(100), 24273);
+        assert_eq!(gauss_kernel(150), 8300);
+        assert_eq!(gauss_kernel(289), 1);
+        assert_eq!((0..290).map(gauss_kernel).sum::<u64>(), 5_550_425);
+        // The floors are robust: no un-floored value lies within 1e-3 of an integer, far
+        // beyond a faithfully rounded libm's error, so every platform computes the same table.
+        for d in 0..290u64 {
+            let exact = PROXY_SCALE as f64 * (-0.5 * (((d as f64 + LAMBDA_ERROR) / 64.0).exp2() - 1.0)).exp();
+            assert!((exact - exact.round()).abs() > 1e-3, "d={d}: {exact}");
+        }
+        assert!((290..=LAMBDA_MAX).all(|d| gauss_kernel(d) == 0));
+    }
+
+    #[test]
+    fn gauss_row_constants_are_exact() {
+        // Large row, s = 16: code = e4m3(RN32(0.08 * 16)) = 1.25 and
+        // A = floor(2^16 * 21/16 * 1.25 / 16) = 6720; the cap is vacuous.
+        assert_eq!(gauss_row_constants(0x4180, 0x3F80).unwrap(), (6720, 65536));
+        // Small row, s = 4: code = e4m3(RN32(0.1 * 4)) = 0.40625, GET_CAP = 0.04481125,
+        // floor(2^16 * GET_CAP) = 2936, so A = 2^13 and T_cap = 8 * 2936.
+        assert_eq!(gauss_row_constants(0x4080, 0x3F80).unwrap(), (8192, 23488));
+        // Below the downscaling domain no B200 row exists.
+        assert!(gauss_row_constants(0x4040, 0x3F80).is_err());
+    }
+
+    #[test]
+    fn row_security_rejects_flat_rows_and_accepts_varied_rows() {
+        let (k, r) = (64usize, 16usize);
+        // The varied fixture rows sit comfortably above the 1/25 floor.
+        let (a, a_built) = build(&honest_rows(2, k), k, r, 0);
+        assert!(JackpotPolicy::row_security_ok(&side(a, a_built), k).unwrap());
+        // Rows whose entries all sit at the row's RMS (`X = +-l2`) have g = exp(-2)
+        // everywhere: mean proxy ~ 21/16 * 0.08 * 0.135 ~ 0.014 < 0.04.
+        let flat: Vec<u16> = (0..2 * k).map(|i| if i % 3 == 0 { 0xBF80 } else { 0x3F80 }).collect();
+        let (a, a_built) = build(&flat, k, r, 0);
+        assert!(!JackpotPolicy::row_security_ok(&side(a, a_built), k).unwrap());
     }
 }

@@ -18,19 +18,24 @@
 //! accumulation order to pin. The one exception is the `E @ F` noise product,
 //! which runs on the committed device's bit-exact rank-32 FP8 atom.
 
-#[cfg(test)]
 use anyhow::ensure;
 use anyhow::{Context, Result};
 
+use crate::v4::api::compute::fp32_fma;
+use crate::v4::api::dtype::fp8_e4m3_to_f32;
+use crate::v4::api::dtype::{check_not_nan_or_inf_bf16, f32_biased_exponent};
+#[cfg(test)]
+use crate::v4::api::prequant::round_l2_to_grid;
+use crate::v4::api::utils::{
+    DOWNSCALE_G, DOWNSCALE_G_SMALL_RMS, E4M3_EXP_SHIFT, E4M3_EXPONENT_BIAS, E4M3_SIGN_SHIFT, downscale_g,
+};
 use crate::v4::api::{
-    compute::{bf16_clamp_sym, bf16_div, bf16_fma, bf16_max, bf16_mul},
+    compute::{bf16_div, bf16_fma, bf16_max, bf16_mul},
     dtype::{bf16_to_f32, f32_to_bf16, f32_to_fp8_e4m3},
     noise::OperandNoise,
+    prequant::BLOCK_SIZE,
     public_params::Device,
-    utils::fp32_to_bf16_rne,
 };
-#[cfg(test)]
-use crate::v4::api::{dtype::fp8_e4m3_to_f32, prequant::round_l2_to_grid};
 
 /// Largest finite FP8 E4M3 magnitude (the quant grid ceiling).
 pub const MAX_E4M3: f32 = 448.0;
@@ -42,6 +47,16 @@ pub const NOISE_TARGET_NORM: f64 = 256.0;
 /// by zero in `noisy_quantize`, and the floor also guarantees every row a
 /// non-vanishing noise scale (`beta > 0`). Exact in BF16 (a power of two).
 pub const NORM_FLOOR: f32 = 1.0 / 4_294_967_296.0; // 2^-32, exact
+
+pub const DOWNSCALE_MIN_SCALED_RMS: f32 = 4.0;
+
+pub const DOWNSCALING_OFFSET: i32 = 9;
+
+pub const DOWNSCALE_COIN_BLOCK: usize = 4;
+
+pub const DOWNSCALE_COIN_THRESHOLD: f32 = 112.0;
+
+pub const DOWNSCALE_COIN_SHIFT: usize = 8;
 
 /// One side's rebuilt operand: the FP8 values of `A'` (or `B'`) plus the
 /// per-row scales used to build them (consumed again by the jackpot policy).
@@ -143,50 +158,135 @@ impl Fp8E4M3Quant {
         Ok((alpha, beta))
     }
 
+    fn downscale(mixed: &[f32], scaled_rms: &[f32]) -> Result<Vec<u8>> {
+        const _: () = assert!(DOWNSCALE_G_SMALL_RMS > DOWNSCALE_G);
+        let quantized = mixed.iter().map(|&x| f32_to_fp8_e4m3(x)).collect::<Result<Vec<u8>>>()?;
+        let (magnitudes, safe_mantissas) = quantized
+            .iter()
+            .map(|&b| (b & 0x7F, b & 0x7 | 1))
+            .unzip::<_, _, Vec<u8>, Vec<u8>>();
+
+        let mut safe_exp_unbiased = Vec::with_capacity(scaled_rms.len());
+        for &x in scaled_rms {
+            ensure!(
+                x.is_finite() && x >= DOWNSCALE_MIN_SCALED_RMS,
+                "downscaling requires finite scaled_rms >= 4"
+            );
+            let exp = f32_biased_exponent(x) as i32;
+            safe_exp_unbiased.push(exp - 127 - DOWNSCALING_OFFSET + E4M3_EXPONENT_BIAS);
+        }
+
+        let k = mixed.len() / scaled_rms.len();
+        let downscaled = (0..mixed.len())
+            .map(|i| {
+                let sign = (quantized[i] >> E4M3_SIGN_SHIFT) & 1;
+                fp8_e4m3_to_f32(
+                    sign << E4M3_SIGN_SHIFT | ((safe_exp_unbiased[i / k] as u8) << E4M3_EXP_SHIFT) | safe_mantissas[i],
+                )
+            })
+            .collect::<Vec<f32>>();
+
+        let gs = downscale_g(scaled_rms);
+        let mut in_strip = Vec::with_capacity(scaled_rms.len());
+        for i in 0..scaled_rms.len() {
+            let gs_magn = f32_to_fp8_e4m3(gs[i] * scaled_rms[i])?;
+            for j in 0..k {
+                in_strip.push(magnitudes[i * k + j] < gs_magn);
+            }
+        }
+
+        let mut inside = in_strip;
+        for (i, strip) in inside.iter_mut().enumerate() {
+            let group_start = i - (i % k) % DOWNSCALE_COIN_BLOCK;
+            let coin_field = (mixed[group_start].to_bits() >> DOWNSCALE_COIN_SHIFT) & 0x7F;
+            *strip &= (coin_field as f32) < DOWNSCALE_COIN_THRESHOLD;
+        }
+
+        (0..downscaled.len())
+            .map(|i| {
+                if inside[i] {
+                    f32_to_fp8_e4m3(downscaled[i])
+                } else {
+                    f32_to_fp8_e4m3(mixed[i])
+                }
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     /// The `E @ F` product runs on the bit-exact hardware FP8 MMA and is cast
     /// MATMUL -> COMPUTE (f32 -> BF16, RNE); the noised value is a single-rounding
     /// FMA `alpha*X + beta*(E@F)`, clamped to `±MAX_E4M3` before the BF16 -> E4M3
     /// cast.
-    pub(crate) fn noisy_quantize(&self, rows: &[u16], noise: &OperandNoise, norms: &[(u16, u16)]) -> Result<BuiltRows> {
+    pub(crate) fn noisy_quantize(
+        &self,
+        codes: &[i8],
+        scales: &[u16],
+        noise: &OperandNoise,
+        norms: &[(u16, u16)],
+        device: Device,
+    ) -> Result<BuiltRows> {
         let e = &noise.e;
         let f = &noise.f;
         let num_rows = norms.len();
         // The inputs are the verifier's own construction (`open_and_noisy_quantize`
         // feeding `open_prequant`/`exact_norms`), so these are debug invariants,
         // not runtime validation of untrusted data.
-        debug_assert!(rows.len().is_multiple_of(num_rows), "rows must be num_rows x k");
+        let k = codes.len() / num_rows;
+        const _: () = assert!(BLOCK_SIZE > 0);
+        ensure!(
+            k.is_multiple_of(BLOCK_SIZE),
+            "k={k} must be a multiple of BLOCK_SIZE={BLOCK_SIZE}"
+        );
+        let n_blocks = k / BLOCK_SIZE;
+        ensure!(codes.len() == num_rows * k, "int_values must be num_rows x k");
+        ensure!(
+            scales.len() == num_rows * n_blocks,
+            "scales must be num_rows x (k / block_size)"
+        );
+        for (i, &scale) in scales.iter().enumerate() {
+            check_not_nan_or_inf_bf16(scale).with_context(|| format!("scale {i}"))?;
+        }
         debug_assert!(e.len().is_multiple_of(num_rows), "e must be num_rows x r");
-        let k = rows.len() / num_rows;
+
         let r = e.len() / num_rows;
         debug_assert!(f.len() == k * r, "f must be k x r");
 
         let noise = self.device.matmul_fp8(e, f, None, num_rows, k, r)?;
-        let noise: Vec<u16> = noise.into_iter().map(fp32_to_bf16_rne).collect();
 
-        let max_e4m3 = f32_to_bf16(MAX_E4M3)?;
         let floor = f32_to_bf16(NORM_FLOOR)?; // exact (power of two)
-        let mut noised_part = Vec::with_capacity(num_rows * k);
+        let mut mixed = Vec::with_capacity(num_rows * k);
         let mut alphas = Vec::with_capacity(num_rows);
         let mut betas = Vec::with_capacity(num_rows);
         let mut l2s = Vec::with_capacity(num_rows);
+        let mut scaled_rms = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
-            let row = &rows[i * k..(i + 1) * k];
+            let row = &codes[i * k..(i + 1) * k];
             // The scheme's norm floor (the reference's `row_norms` method).
             let l2 = bf16_max(norms[i].0, floor);
             let linf = bf16_max(norms[i].1, floor);
             let (alpha, beta) = self.derive_row_scales(l2, linf, r).with_context(|| format!("row {i}"))?;
+
+            let (alpha_f32, beta_f32) = (bf16_to_f32(alpha), bf16_to_f32(beta));
+
             for j in 0..k {
+                let code_f32 = row[j] as f32;
+                let signal = (alpha_f32 * bf16_to_f32(scales[(i * k + j) / BLOCK_SIZE])) * code_f32;
                 // noised = fma(alpha, X, beta * noise): a single rounding, more
                 // accurate than a separate mul + add.
-                let noised = bf16_fma(alpha, row[j], bf16_mul(beta, noise[i * k + j])?)?;
-                // Very rarely this clamp has any effect (and only if r > 12).
-                let clamped = bf16_clamp_sym(noised, max_e4m3);
-                noised_part.push(f32_to_fp8_e4m3(bf16_to_f32(clamped))?);
+                mixed.push(fp32_fma(beta_f32, noise[i * k + j], signal)?);
             }
             alphas.push(alpha);
             betas.push(beta);
             l2s.push(l2);
+            scaled_rms.push(alpha_f32 * bf16_to_f32(l2));
         }
+
+        let noised_part = if device.requires_downscaling() {
+            Self::downscale(&mixed, &scaled_rms)?
+        } else {
+            mixed.into_iter().map(f32_to_fp8_e4m3).collect::<Result<Vec<u8>>>()?
+        };
+
         Ok(BuiltRows {
             noised_part,
             alpha: alphas,
@@ -200,6 +300,7 @@ impl Fp8E4M3Quant {
 mod tests {
     use super::*;
     use crate::v4::api::noise::decode_hex_for_test as decode_hex_bytes;
+    use crate::v4::api::prequant::exact_norms;
 
     /// Reference single-rounding f64 -> bf16 (RNE), used to prove the production
     /// f64 -> f32 -> bf16 path never double-rounds for any sanctioned rank.
@@ -320,15 +421,16 @@ mod tests {
     fn noisy_quantize_produces_valid_deterministic_codes() {
         let (num_rows, k, r) = (2usize, 64usize, 16usize);
         // Rows of alternating ±1.0.
-        let rows: Vec<u16> = (0..num_rows * k).map(|i| if i % 2 == 0 { 0x3F80 } else { 0xBF80 }).collect();
+        let codes: Vec<i8> = (0..num_rows * k).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+        let scales = vec![0x3F80; num_rows * (k / BLOCK_SIZE)];
         // Mesh-like noise factors: ±0.5 (E4M3 0x30 / 0xB0).
         let e: Vec<u8> = (0..num_rows * r).map(|i| if i % 3 == 0 { 0xB0 } else { 0x30 }).collect();
         let f: Vec<u8> = (0..k * r).map(|i| if i % 5 == 0 { 0xB0 } else { 0x30 }).collect();
         let noise = OperandNoise { e, f };
         let quant = Fp8E4M3Quant::new(Device::B200);
-        let norms: Vec<(u16, u16)> = rows.chunks(k).map(|row| quant.row_norms(row).unwrap()).collect();
+        let norms = exact_norms(&codes, &scales, num_rows, k, BLOCK_SIZE).unwrap();
 
-        let built = quant.noisy_quantize(&rows, &noise, &norms).unwrap();
+        let built = quant.noisy_quantize(&codes, &scales, &noise, &norms, Device::B200).unwrap();
         assert_eq!(built.noised_part.len(), num_rows * k);
         assert_eq!(built.alpha.len(), num_rows);
         assert_eq!(built.l2.len(), num_rows);
@@ -337,7 +439,7 @@ mod tests {
             assert!(fp8_e4m3_to_f32(c).abs() <= MAX_E4M3);
         }
         // Deterministic.
-        let again = quant.noisy_quantize(&rows, &noise, &norms).unwrap();
+        let again = quant.noisy_quantize(&codes, &scales, &noise, &norms, Device::B200).unwrap();
         assert_eq!(built.noised_part, again.noised_part);
         assert_eq!(built.alpha, again.alpha);
         assert_eq!(built.beta, again.beta);
@@ -350,7 +452,8 @@ mod tests {
     fn device_quantization_pins_noise_alpha_beta_and_code() {
         let e = decode_hex_bytes("be3adfead867e55be469dd50e9e85c50dfdc64e2dfe4eae2e8d6596a6746dd65");
         let f = decode_hex_bytes("c65268603369d96362e16a5f6ae6615fe6db43eae463e2d3eae55ae3bb5f54e3");
-        let clean = vec![16256u16];
+        let codes = vec![1i8; BLOCK_SIZE];
+        let scales = vec![16256u16];
         let norms = vec![(16256u16, 16384u16)];
         for (device, expected_noise_bits, expected_alpha, expected_beta, expected_code) in [
             (Device::H100, 1161306112u32, 17002u16, 15269u16, 105u8),
@@ -361,12 +464,14 @@ mod tests {
             assert_eq!(noise_bits, expected_noise_bits, "{device:?} noise");
             let built = quant
                 .noisy_quantize(
-                    &clean,
+                    &codes,
+                    &scales,
                     &OperandNoise {
                         e: e.clone(),
-                        f: f.clone(),
+                        f: f.repeat(BLOCK_SIZE),
                     },
                     &norms,
+                    device,
                 )
                 .unwrap();
             assert_eq!(built.alpha[0], expected_alpha, "{device:?} alpha");

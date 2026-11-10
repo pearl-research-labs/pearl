@@ -19,13 +19,13 @@ use starky::constraint_consumer::{ConstraintConsumer, RecursiveConstraintConsume
 use starky::evaluation_frame::StarkFrame;
 use starky::stark::Stark;
 
-use super::super::ctl::NUM_LUT_TABLES;
 use super::super::input_quant_stark::stark::qcast;
 use super::super::matmul_b200_stark::stark::B200Product;
 use super::super::matmul_h100::stark::Fp8Product;
 use super::super::scale_stark::stark::{CODE_448, rnernd_reference};
-use super::super::unpredictability::{log2_fixed, sig_nonzero, sig_width};
+use super::super::unpredictability::{sig_nonzero, sig_width};
 use super::LutTable;
+use super::columns::{fp32_tool_key, log16_key};
 use super::columns::{lut_height, lut_num_columns, num_precommitted_columns, num_slots, rnernd_stored_values, slot_height};
 use crate::v4::api::compute::bf16_div;
 
@@ -44,9 +44,10 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 | LutTable::WidthNorm
                 | LutTable::Width32
                 | LutTable::Width16
-                | LutTable::Pow2G => 2,
+                | LutTable::Pow2G
+                | LutTable::Fp32Tools => 2,
                 LutTable::Xor8 => 3,
-                LutTable::Int8Dec | LutTable::RneRnd => 4,
+                LutTable::DownscaleThreshold | LutTable::Int8Dec | LutTable::RneRnd => 4,
                 LutTable::ProdAlign15 | LutTable::B200Align => 5,
                 _ => 1,
             };
@@ -151,8 +152,9 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 columns[0].push(f(1 << w.saturating_sub(24)));
                 columns[1].push(f(1 << 24u64.saturating_sub(w)));
             }
-            // Shared bf16 RNE back-end (ScaleStark's mirror; one slot per signed cut). See the
-            // module header for the InputQuant cancellation case that also needs the LSB scale.
+            // Shared bf16 RNE back-end (ScaleStark's mirror; one slot per signed cut),
+            // used by Scale's arithmetic and InputQuant's bf16 decode. The signed cut
+            // retains the LSB-scale information needed to classify small significands.
             LutTable::RneRnd => {
                 let (mant, wa, oiz, oez) = rnernd_reference(key, slot as u64);
                 columns[0].push(f(mant));
@@ -217,8 +219,42 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 columns[0].push(f(sig_width(key)));
                 columns[1].push(f(sig_nonzero(key)));
             }
-            // Jackpot check 4's fixed-point log: `floor(64 * log2 key)` (0 at key 0).
-            LutTable::Log16 => columns[0].push(f(log2_fixed(key))),
+            // Region 0 is check 3's logarithm (0 at the phantom sentinel); region `1 + class` is
+            // check 4's capped Gaussian class at the lambda difference.
+            LutTable::Log16 => {
+                let (region, index) = log16_key(key as usize);
+                columns[0].push(f(super::super::unpredictability::security_lookup_value(region, index)));
+            }
+            LutTable::Fp32Tools => {
+                let (operation, argument) = fp32_tool_key(key as usize);
+                let (left, right) = match operation {
+                    0 if argument == 0 => (0, 1),
+                    0 => (1u64 << (32 - argument), 0),
+                    1 => (1u64 << (-argument).max(0), 1u64 << argument.clamp(0, 37)),
+                    2 => (1u64 << argument.min(35), 1u64 << (35 - argument.min(35))),
+                    _ => unreachable!(),
+                };
+                columns[0].push(f(left));
+                columns[1].push(f(right));
+            }
+            LutTable::DownscaleThreshold => {
+                let (threshold, coefficient, region, base) =
+                    super::super::unpredictability::security_row_parameters(32768 + key, 269 + slot as u64);
+                for (column, value) in columns.iter_mut().zip([threshold, coefficient, region, base]) {
+                    column.push(f(value));
+                }
+            }
+            LutTable::DownscaleRewrite => {
+                let code = key as u8;
+                let threshold = (key >> 8) & 127;
+                let inside = key >> 15 != 0 && u64::from(code & 127) < threshold;
+                let output = if inside {
+                    (code & 128) | (slot as u8 * 8) | (code & 7) | 1
+                } else {
+                    code
+                };
+                columns[0].push(f(u64::from(output)));
+            }
         }
     }
     columns
@@ -232,6 +268,51 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
     let live = slot_height(table);
     let mut cols: Vec<Vec<F>> = Vec::with_capacity(num_precommitted_columns(table));
     match table {
+        LutTable::Fp32Tools => {
+            let keys: Vec<_> = (0..height).map(|row| fp32_tool_key(row.min(live - 1))).collect();
+            cols.push(keys.iter().map(|&(operation, _)| F::from_canonical_u64(operation)).collect());
+            cols.push(
+                keys.iter()
+                    .map(|&(_, argument)| {
+                        let magnitude = F::from_canonical_u64(argument.unsigned_abs());
+                        if argument < 0 { -magnitude } else { magnitude }
+                    })
+                    .collect(),
+            );
+            for mut values in generate::<F>(table, 0) {
+                values.resize(height, *values.last().unwrap());
+                cols.push(values);
+            }
+        }
+        LutTable::DownscaleThreshold => {
+            cols.push((0..height).map(F::from_canonical_usize).collect());
+            let small = generate::<F>(table, 0);
+            let large = generate::<F>(table, 1);
+            cols.extend([
+                small[0].clone(),
+                large[0].clone(),
+                large[1].clone(),
+                small[2].clone(),
+                small[3].clone(),
+                large[3].clone(),
+            ]);
+        }
+        // The stored key tuple `(region, index)` and the value column (live == height).
+        LutTable::Log16 => {
+            let keys: Vec<_> = (0..height).map(log16_key).collect();
+            cols.push(keys.iter().map(|&(region, _)| F::from_canonical_u64(region)).collect());
+            cols.push(keys.iter().map(|&(_, index)| F::from_canonical_u64(index)).collect());
+            cols.extend(generate::<F>(table, 0));
+        }
+        LutTable::DownscaleRewrite => {
+            cols.push((0..height).map(F::from_canonical_usize).collect());
+            cols.push(generate::<F>(table, 0).remove(0));
+            cols.push(
+                (0..height)
+                    .map(|key| F::from_bool(key >> 15 != 0 && (key & 127) < ((key >> 8) & 127)))
+                    .collect(),
+            );
+        }
         // The stored key tuple is the whole precommitted block (live == height: both are
         // powers of two, so there is no padding).
         LutTable::Bytes2 | LutTable::Pair128 => cols.extend(generate::<F>(table, 0)),
@@ -267,7 +348,7 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
             cols.push((0..height).map(F::from_canonical_usize).collect());
             match table {
                 LutTable::Range16 => {} // the ramp is the whole table
-                LutTable::Qcast | LutTable::Div448 | LutTable::Width16 | LutTable::Log16 => cols.extend(generate::<F>(table, 0)),
+                LutTable::Qcast | LutTable::Div448 | LutTable::Width16 => cols.extend(generate::<F>(table, 0)),
                 // Eight signed truncations span every alignment shift; decode fields are shared.
                 LutTable::ProdAlign15 | LutTable::B200Align => {
                     let shift = if table == LutTable::ProdAlign15 { 7 } else { 19 };
@@ -395,7 +476,7 @@ impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize> Stark<F, 
     }
 }
 
-/// The AIRs at their exact widths (the batch instantiates the selected device's sixteen).
+/// The AIRs at their exact widths for the selected device.
 pub type RneRndStark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::RneRnd) }>;
 pub type Range16Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Range16) }>;
 pub type Bytes2Stark<F, const D: usize> = LutStark<F, D, { lut_num_columns(LutTable::Bytes2) }>;
@@ -439,21 +520,26 @@ pub(crate) fn boxed_lut_stark<F: RichField + Extendable<D>, const D: usize>(tabl
         LutTable::Width32 => Box::new(Width32Stark::<F, D>::new(table)),
         LutTable::Width16 => Box::new(Width16Stark::<F, D>::new(table)),
         LutTable::Log16 => Box::new(Log16Stark::<F, D>::new(table)),
+        LutTable::Fp32Tools => Box::new(LutStark::<F, D, { lut_num_columns(LutTable::Fp32Tools) }>::new(table)),
+        LutTable::DownscaleThreshold => Box::new(LutStark::<F, D, { lut_num_columns(LutTable::DownscaleThreshold) }>::new(
+            table,
+        )),
+        LutTable::DownscaleRewrite => Box::new(LutStark::<F, D, { lut_num_columns(LutTable::DownscaleRewrite) }>::new(table)),
     }
 }
 
 /// The `BatchStarkPreprocessedData::new` inputs for a batch of `num_tables` tables in which
 /// Committed LUT `i` is table `table_positions[i]`:
 /// `(values_per_table, columns_per_table)` — each LUT's precommitted columns at its position
-/// (empty elsewhere). Positions must be strictly increasing (LUT heights descend in
-/// device-specific committed order and the batch orders tables by descending height).
+/// (empty elsewhere). Positions must be strictly increasing in committed inventory order.
 pub fn lut_preprocessed_inputs<F: Field>(
     num_tables: usize,
-    table_positions: [usize; NUM_LUT_TABLES],
-    tables: &[LutTable; NUM_LUT_TABLES],
+    table_positions: &[usize],
+    tables: &[LutTable],
 ) -> (Vec<Vec<PolynomialValues<F>>>, Vec<Vec<usize>>) {
+    assert_eq!(table_positions.len(), tables.len(), "LUT position count");
     assert!(
-        table_positions.windows(2).all(|w| w[0] < w[1]) && table_positions[NUM_LUT_TABLES - 1] < num_tables,
+        table_positions.windows(2).all(|w| w[0] < w[1]) && *table_positions.last().expect("empty LUT inventory") < num_tables,
         "table positions must be strictly increasing and within the batch"
     );
     let mut values = vec![Vec::new(); num_tables];
@@ -475,8 +561,8 @@ pub fn lut_preprocessed_inputs<F: Field>(
 /// neither regenerates or recommits the tables per job.
 pub fn lut_preprocessed_data<F, C, const D: usize>(
     num_tables: usize,
-    table_positions: [usize; NUM_LUT_TABLES],
-    tables: &[LutTable; NUM_LUT_TABLES],
+    table_positions: &[usize],
+    tables: &[LutTable],
     config: &StarkConfig,
     timing: &mut TimingTree,
 ) -> BatchStarkPreprocessedData<F, C, D>

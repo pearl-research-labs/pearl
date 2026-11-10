@@ -466,6 +466,26 @@ columns_view!(ScaleColumnsView, NUM_SCALE_COLUMNS, SCALE_COL_MAP);
 /// by the batch verifier against the trace openings.
 pub const NUM_SCALE_KNOWN_COLUMNS: usize = SCALE_COL_MAP.is_pad + 1;
 
+/// B200 adds the strip threshold, the Gaussian row parameters (coefficient, LOG16 region,
+/// key base), the kernel sum, and a 48-bit nonnegative surplus.
+#[repr(C)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub struct B200ScaleColumnsView<T: Copy> {
+    pub common: ScaleColumnsView<T>,
+    pub strip_threshold: T,
+    pub security_coefficient: T,
+    pub security_region: T,
+    pub security_key_base: T,
+    pub security_sum: T,
+    pub security_surplus: [T; 3],
+}
+
+pub const NUM_B200_SCALE_COLUMNS: usize = size_of::<B200ScaleColumnsView<u8>>();
+pub const MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT: usize = NUM_SCALE_PUBLIC_INPUTS;
+pub const NUM_B200_SCALE_PUBLIC_INPUTS: usize = NUM_SCALE_PUBLIC_INPUTS + 1;
+const _: () = assert!(NUM_B200_SCALE_COLUMNS == 145);
+columns_view!(B200ScaleColumnsView, NUM_B200_SCALE_COLUMNS, B200_SCALE_COL_MAP);
+
 #[cfg(test)]
 mod tests {
     use core::borrow::Borrow;

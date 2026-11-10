@@ -200,6 +200,15 @@ impl Device {
     pub const fn sigma_encoding_offset(self) -> u64 {
         (14 + self.lg2_delta()) as u64
     }
+
+    /// Returns 1 when the quantization must include downscaling,
+    /// and 0 otherwise
+    pub const fn requires_downscaling(self) -> bool {
+        match self {
+            Self::H100 => false,
+            Self::B200 => true,
+        }
+    }
 }
 
 impl TryFrom<u8> for Device {
@@ -636,9 +645,13 @@ impl PublicParams {
     /// products, compilation bytes, and generated known-column entries each count once.
     /// This weighting is admission policy, not a conversion from bytes to MACs or time.
     /// Fixed recursive verification is geometry-independent; plain proofs share this rule.
-    /// Cap at 2T, where T = 121,922,274 is the score of the dense reference tile
-    /// h = w = 16, k = 2^16, r = 32, with four Blake lanes per axis (either device).
-    pub(crate) const MAX_VERIFIER_WORK: u64 = 2 * 121_922_274;
+    /// Cap at 2T, where T = 126,134,367 is the score of the dense reference tile
+    /// h = w = 16, k = 2^16, r = 32, with four Blake lanes per axis (either device). The
+    /// known-column terms count Blake3's schedule, InputQuant's two packed noise words
+    /// (its schedule is AIR-pinned) and Coefficient's block schedule, which the verifier
+    /// recomputes.
+    pub(crate) const REFERENCE_VERIFIER_WORK: u64 = 126_134_367;
+    pub(crate) const MAX_VERIFIER_WORK: u64 = 2 * Self::REFERENCE_VERIFIER_WORK;
 
     /// Byte length of a dense (non-MoE) statement:
     /// σ_d (108) + pB (19) + HB (32) + pA (9) + HA (32) + tile bases (8) + J (32).
@@ -1135,6 +1148,8 @@ fn verifier_work_units(device: Device, h: u64, w: u64, k: u64, r: u64, blake_blo
         strips.checked_next_power_of_two()?,
         h.checked_mul(w)?.checked_mul(k / 32)?.checked_next_power_of_two()?,
         h.checked_mul(w)?.checked_next_power_of_two()?,
+        // Coefficient: one row per eight-element block of both sides.
+        strips.checked_mul(k / BLOCK_SIZE as u64)?.checked_next_power_of_two()?,
     ];
 
     let mut work = replay.checked_add(expanded.checked_mul(2)?)?.checked_add(compiled)?;
@@ -2264,14 +2279,23 @@ mod tests {
     #[test]
     fn arithmetic_budget_is_twice_reference_work() {
         use super::test_fixtures::dense_geometry_job;
+        let mut reference_works = Vec::new();
         for device in Device::ALL {
             let reference = PublicParams::try_new(dense_geometry_job(16, 16, 65536, device), empty_jackpot(), None).unwrap();
             let reference_work = reference
                 .verifier_work_units(reference.blake3_work_block_bound().unwrap())
                 .unwrap();
-            assert_eq!(reference_work, 121_922_274);
+            reference_works.push((device, reference_work));
             assert!(reference_work <= PublicParams::MAX_VERIFIER_WORK);
-            assert_eq!(PublicParams::MAX_VERIFIER_WORK, 2 * reference_work);
+        }
+        // Both devices share the two verifier-known InputQuant noise words.
+        assert_eq!(reference_works, [(Device::H100, 126_134_367), (Device::B200, 126_134_367)]);
+        assert_eq!(PublicParams::MAX_VERIFIER_WORK, 2 * PublicParams::REFERENCE_VERIFIER_WORK);
+        assert_eq!(
+            PublicParams::REFERENCE_VERIFIER_WORK,
+            reference_works.iter().map(|&(_, work)| work).max().unwrap()
+        );
+        for device in Device::ALL {
             for (h, w, k) in [(4, 64, 30784), (4, 128, 16256), (32, 64, 22112), (32, 64, 22144)] {
                 PublicParams::try_new(dense_geometry_job(h, w, k, device), empty_jackpot(), None).unwrap();
             }

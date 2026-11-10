@@ -31,7 +31,7 @@ use super::stark::ScaleProgram;
 // Channel: group tuples — InputQuant (looking) -> Scale (looked)
 // ==================================================================================================
 
-/// Scale's looked half of the group-tuple channel: the 13-component tuple
+/// Scale's looked half of the common 13-component group tuple
 /// `(GROUP_KEY, L2_FRAME_SUM, FRAME_DOUBLED_SCALE_EXPONENT, MAX_ABS, ALPHA_EXP,
 /// ALPHA_MANTISSA, BETA_EXP, BETA_MANTISSA, BETA_EXP_IS_ZERO, DEAD_BOUND, DEAD_COUNT,
 /// SIGMA_ENC, SIGMA_NORM)`, filter `1 - IS_PAD` — every live Scale row consumes exactly one
@@ -52,7 +52,8 @@ use super::stark::ScaleProgram;
 ///
 /// InputQuant's looking half is `input_quant_stark::ctl::ctl_group_tuples_looking_input_quant`
 /// (2 instances on live `IS_GROUP_FINAL` rows, A and B planes with the `+ h*k` key offset, the
-/// same 13-component order).
+/// same common order). B200 appends the strip threshold, Gaussian LOG16 region, key base, and
+/// kernel sum.
 pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWithColumns<F> {
     let m = &SCALE_COL_MAP;
     let mut columns = vec![
@@ -83,6 +84,15 @@ pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWi
         F::from_canonical_u64(program.device.sigma_encoding_offset()),
     ));
     columns.push(Column::single(m.sigma_norm));
+    if program.device == crate::v4::api::public_params::Device::B200 {
+        let security = &super::columns::B200_SCALE_COL_MAP;
+        columns.extend(Column::singles([
+            security.strip_threshold,
+            security.security_region,
+            security.security_key_base,
+            security.security_sum,
+        ]));
+    }
     TableWithColumns::new(
         Table::Scale.into(),
         columns,
@@ -97,7 +107,7 @@ pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWi
 /// POW2D x3, RNERND x3, DIV448 x1 — 78 instances. Order: square root (Q), grid snap (G),
 /// `linf` (N), the scale chain (H: norm floors, FMA, alpha, beta steps B1/B2), the liveness
 /// gates (T3), the noise-floor gate (F3), then the sigma width bit (S2).
-pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> {
+pub(super) fn scale_common_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> {
     let m = &SCALE_COL_MAP;
     let one = F::ONE;
     let neg = -F::ONE;
@@ -486,13 +496,23 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
         Filter::from_column(Column::single(m.is_last_row)),
     ));
 
-    // ---- F: the jackpot noise-floor gate (check 2), every row:
-    // SIGMA_ENC = E_SUM + SIGMA_SIG_IS_WIDE + offset(device) = e(sigma) + 268, so
-    // sigma >= sigma_min = 1 iff SIGMA_ENC - 268 is nonnegative. Its maximum is 255 on
-    // the pinned exponent domain; a negative key wraps far outside RC16's range. ----
+    // ---- F: minimum scaled RMS (jackpot check 2), every row:
+    // Require alpha * l2 >= 4 for A rows and >= 16 for B rows.
+    // floor(log2(alpha * l2)) = ALPHA_EXP + L2_FLOORED_EXPONENT
+    //                          + SIGMA_SIG_IS_WIDE - 254.
+    // The 254 removes the two BF16 exponent biases of 127.
+    // log2(min_rms) = 4 - 2*IS_A_ROW.
+    // RC16 checks that the exponent slack is nonnegative.
+    // Passing keys fit within RC16 on the pinned exponent domain;
+    // a negative key wraps far outside its range. ----
     lookups.push(LutLookup::rc16(Column::linear_combination_with_constant(
-        [(m.alpha_exp, one), (m.l2_floored_exponent, one), (m.sigma_sig_is_wide, one)],
-        F::from_canonical_u64(program.device.sigma_encoding_offset()) - F::from_canonical_u64(268),
+        [
+            (m.alpha_exp, one),
+            (m.l2_floored_exponent, one),
+            (m.sigma_sig_is_wide, one),
+            (m.is_a_row, F::TWO),
+        ],
+        -F::from_canonical_u64(254) - F::from_canonical_u16(4),
     )));
 
     // ---- S2: the sigma significand's width bit (jackpot check 4), two-sided:
@@ -512,11 +532,45 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
     lookups
 }
 
+pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> {
+    let mut lookups = scale_common_lut_lookups(program);
+    let m = &SCALE_COL_MAP;
+    let one = F::ONE;
+    let neg = -one;
+    if program.device == crate::v4::api::public_params::Device::B200 {
+        let security = &super::columns::B200_SCALE_COL_MAP;
+        let live = Filter::from_column(Column::linear_combination_with_constant([(m.is_pad, neg)], one));
+        lookups.push(LutLookup {
+            table: LutTable::DownscaleThreshold,
+            keys: vec![Column::linear_combination_with_constant(
+                [
+                    (m.sigma_norm, one),
+                    (m.alpha_exp, F::from_canonical_u64(32768)),
+                    (m.l2_floored_exponent, F::from_canonical_u64(32768)),
+                    (m.sigma_sig_is_wide, F::from_canonical_u64(32768)),
+                ],
+                -F::from_canonical_u64(32768 * 257),
+            )],
+            values: Column::singles([
+                security.strip_threshold,
+                security.security_coefficient,
+                security.security_region,
+                security.security_key_base,
+            ])
+            .collect(),
+            filter: live.clone(),
+        });
+        for column in security.security_surplus {
+            lookups.push(LutLookup::rc16_filtered(Column::single(column), live.clone()));
+        }
+    }
+    lookups
+}
+
 #[cfg(test)]
 mod tests {
     use plonky2::field::goldilocks_field::GoldilocksField;
     use starky::cross_table_lookup::{CrossTableLookup, debug_utils::check_ctls};
-    use starky::util::trace_rows_to_poly_values;
 
     use super::*;
     use crate::v4::api::public_params::Device;
@@ -527,7 +581,7 @@ mod tests {
     type F = GoldilocksField;
 
     fn test_program() -> ScaleProgram {
-        ScaleProgram::new_for_device(4, 4, 2048, 4, Device::B200)
+        ScaleProgram::new_for_device(4, 4, 2048, 32, Device::B200)
     }
 
     #[test]
@@ -542,12 +596,12 @@ mod tests {
     fn group_lookup_binds_linf_fields_to_input_quant_maximum() {
         let fixture = build_fixture(false);
         let ctl = CrossTableLookup::new(
-            ctl_group_tuples_looking_input_quant(),
+            ctl_group_tuples_looking_input_quant(fixture.scale.device),
             vec![ctl_looked_scale_group_tuple(&fixture.scale)],
         );
         let mut traces = vec![Vec::new(); NUM_TABLES];
-        traces[Table::InputQuant as usize] = trace_rows_to_poly_values(fixture.iq_rows);
-        traces[Table::Scale as usize] = trace_rows_to_poly_values(fixture.scale_rows);
+        traces[Table::InputQuant as usize] = fixture.iq_trace();
+        traces[Table::Scale as usize] = fixture.scale_trace();
         let ctls = [ctl];
         check_ctls(&traces, &fixture.public_inputs, &ctls, &Default::default());
 
@@ -571,12 +625,12 @@ mod tests {
     fn group_lookup_binds_beta_multiply_outputs_to_input_quant() {
         let fixture = build_fixture(false);
         let ctl = CrossTableLookup::new(
-            ctl_group_tuples_looking_input_quant(),
+            ctl_group_tuples_looking_input_quant(fixture.scale.device),
             vec![ctl_looked_scale_group_tuple(&fixture.scale)],
         );
         let mut traces = vec![Vec::new(); NUM_TABLES];
-        traces[Table::InputQuant as usize] = trace_rows_to_poly_values(fixture.iq_rows);
-        traces[Table::Scale as usize] = trace_rows_to_poly_values(fixture.scale_rows);
+        traces[Table::InputQuant as usize] = fixture.iq_trace();
+        traces[Table::Scale as usize] = fixture.scale_trace();
         let ctls = [ctl];
         check_ctls(&traces, &fixture.public_inputs, &ctls, &Default::default());
 
@@ -603,13 +657,14 @@ mod tests {
         let count = |t: LutTable| lookups.iter().filter(|l| l.table == t).count();
         // Inventory documented by `scale_lut_lookups`:
         // RC16 x62, PAIR128 x3, EXPINFO x3, CLAMP22 x3, POW2D x3, RNERND x3, DIV448 x1.
-        assert_eq!(count(LutTable::Range16), 62);
+        assert_eq!(count(LutTable::Range16), 65);
         assert_eq!(count(LutTable::Pair128), 3);
         assert_eq!(count(LutTable::ExpInfo), 3);
         assert_eq!(count(LutTable::Clamp22), 3);
         assert_eq!(count(LutTable::Pow2D), 3);
         assert_eq!(count(LutTable::RneRnd), 3);
         assert_eq!(count(LutTable::Div448), 1);
-        assert_eq!(lookups.len(), 78);
+        assert_eq!(count(LutTable::DownscaleThreshold), 1);
+        assert_eq!(lookups.len(), 82);
     }
 }

@@ -74,14 +74,58 @@
 //!
 //! # Jackpot noise-floor gate (check 2)
 //!
-//! Every opened row must carry noise of scale at least `sigma_min` in quantized units:
-//! `sigma = delta * alpha * l2f >= sigma_min`, with the whitepaper-fixed `sigma_min = 1`.
-//! S2 normalizes H4's exact pre-rounding significand product, giving the affine encoding
-//! `SIGMA_ENC = E(alpha) + E(l2f) + SIGMA_SIG_IS_WIDE + offset(device) = e(sigma) + 268`.
-//! Therefore one unfiltered RC16 lookup of `SIGMA_ENC - 268` proves `sigma >= 1`; its maximum
-//! is only 255 on the pinned exponent domain, while a negative value wraps far outside the
-//! table range. This is bit-for-bit the plaintext policy comparison: the native check computes
-//! `delta * alpha * l2f` in f64, where the product of two 8-bit significands is exact.
+//! Every opened row must have scaled signal RMS `alpha * l2f >= min_rms`, with
+//! `min_rms = 4` for A rows and `16` for B rows. S2 certifies the exact product's width bit,
+//! so `floor(log2(alpha * l2f)) = E(alpha) + E(l2f) + SIGMA_SIG_IS_WIDE - 254`.
+//! One unfiltered RC16 lookup of
+//! `E(alpha) + E(l2f) + SIGMA_SIG_IS_WIDE + 2*IS_A_ROW - 258` proves the floor.
+//! Passing keys fit within RC16 on the pinned exponent domain; a negative key wraps far
+//! outside the table range. This matches the native policy's exact f64 comparison.
+//!
+//! # B200 strip parameters and row security gate (check 4)
+//!
+//! Let `s = alpha*l2f` be the exact signal RMS and `sigma=s/2` the B200 noise standard
+//! deviation. S2 normalizes the exact 16-bit product `P=M(alpha)*M(l2f)` using
+//! `wide=[P>=2^15]`, so
+//!
+//! ```text
+//! norm     = P * 2^(1-wide)                 // 2^15 <= norm < 2^16
+//! encoding = E(alpha)+E(l2f)+wide+13        // floor(log2(sigma))+268
+//! s        = norm * 2^(encoding-282).
+//! ```
+//!
+//! DOWNSCALETHRESHOLD takes the folded key
+//! `(norm-32768)+32768*(encoding-269)`. Its six exponent slots restrict `s` to `[4,256)`
+//! and jointly return the exact strip byte `t`, Q16 coefficient `A`, Gaussian region,
+//! and baseline score `base=lambda(0,sigma)`. Write `c=decode_E4M3(t)`. The constants are
+//!
+//! ```text
+//! t = Q8(RN32(g*s)),    g=0.1f32 for s<8, otherwise 0.08f32
+//! A = 8192                                      if s<8
+//!     floor(65536 * (21/16) * c/s)               otherwise.
+//! ```
+//!
+//! For `s<8`, the Gaussian region caps the Q16 kernel at
+//! `8*floor(65536*(0.0431+0.2738*(c-0.4)))`; caps above every kernel entry use the
+//! uncapped class. For `s>=8`, the region is always uncapped. The table preserves the
+//! binary32 multiplication followed by E4M3 rounding when deriving `t`, and binds all
+//! four outputs to the same exact row RMS rather than permitting independent choices.
+//!
+//! InputQuant binds these parameters through the group CTL and returns the exact sum
+//! `H=sum_u K(lambda_u-base)`. Here `K` is the region's capped Q16 Gaussian kernel;
+//! its formula, score slack, and accumulation are documented in
+//! [`crate::v4::circuit::input_quant_stark::stark`]. This table enforces
+//!
+//! ```text
+//! A*H = ceil(k*2^32/25) + surplus,      0 <= surplus < 2^48.
+//! ```
+//!
+//! Three RC16 limbs certify the surplus. Since `H < k*2^16 <= 2^32` and `A <= 8192`,
+//! the product is below `2^45`; both sides are below the Goldilocks modulus, so this
+//! equality proves an integer lower bound. Dividing by `k*2^32` gives the required mean
+//! proxy of at least `1/25`. Padding sets the B200 extensions to zero and disables the
+//! minimum. H100 carries none of these extensions. Check 3's tile-wide skip budget is
+//! enforced by Matmul/XorFold separately; this is an additional per-row gate.
 //!
 //! # Exact square-root check
 //!
@@ -126,9 +170,11 @@ use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
 use super::columns::{
-    ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT,
-    DOS_EXP_PUBLIC_INPUT, DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT, FmaBlock, K_PUBLIC_INPUT,
-    L2_SUM_LIMBS, MulBlock, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView, UPPER_BORROW_BITS, WL2_PUBLIC_INPUT,
+    ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, B200ScaleColumnsView, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT,
+    DEAD_LIMIT_B_PUBLIC_INPUT, DOS_EXP_PUBLIC_INPUT, DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT,
+    FmaBlock, K_PUBLIC_INPUT, L2_SUM_LIMBS, MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT, MulBlock, NUM_B200_SCALE_COLUMNS,
+    NUM_B200_SCALE_PUBLIC_INPUTS, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView, UPPER_BORROW_BITS,
+    WL2_PUBLIC_INPUT,
 };
 use crate::v4::api::compute::{bf16_div, bf16_fma, bf16_max, bf16_mul};
 use crate::v4::api::dtype::f32_to_bf16;
@@ -308,7 +354,7 @@ impl ScaleProgram {
             k.is_multiple_of(32) && (PublicParams::MIN_K..=PublicParams::MAX_K).contains(&k),
             "unsanctioned k"
         );
-        assert!(r >= 1, "noise rank must be positive");
+        assert_eq!(r, 32, "noise rank must be exactly 32");
         assert_eq!(
             f32_to_bf16(MAX_E4M3).expect("448 is finite"),
             CODE_448,
@@ -319,11 +365,18 @@ impl ScaleProgram {
             NORM_FLOOR_CODE,
             "NORM_FLOOR_CODE is the bf16 code of the scheme's norm floor"
         );
-        assert_eq!(
-            JackpotPolicy::for_device(device).sigma_min,
-            1.0,
-            "the circuit freezes the whitepaper sigma_min = 1"
-        );
+        const _: () = {
+            assert!(
+                JackpotPolicy::for_device(Device::H100).rms_min_a == 4.0
+                    && JackpotPolicy::for_device(Device::B200).rms_min_a == 4.0,
+                "the circuit freezes rms_min_a = 4"
+            );
+            assert!(
+                JackpotPolicy::for_device(Device::H100).rms_min_b == 16.0
+                    && JackpotPolicy::for_device(Device::B200).rms_min_b == 16.0,
+                "the circuit freezes rms_min_b = 16"
+            );
+        };
         Self { h, w, k, r, device }
     }
 
@@ -395,6 +448,60 @@ impl ScaleProgram {
         pis[DEAD_LIMIT_A_PUBLIC_INPUT] = F::from_canonical_u64(self.dead_limit(self.h * self.k));
         pis[DEAD_LIMIT_B_PUBLIC_INPUT] = F::from_canonical_u64(self.dead_limit(self.w * self.k));
         pis
+    }
+
+    pub fn public_inputs_for_device<F: RichField>(&self) -> Vec<F> {
+        let mut inputs = self.public_inputs::<F>().to_vec();
+        if self.device == Device::B200 {
+            inputs.push(F::from_canonical_u64(
+                super::super::unpredictability::minimum_security_product(self.k),
+            ));
+        }
+        inputs
+    }
+
+    pub fn generate_b200_trace<F: RichField>(
+        &self,
+        a_rows: &[ScaleRowTuple],
+        b_rows: &[ScaleRowTuple],
+        security_sums: &[u64],
+    ) -> Vec<[F; NUM_B200_SCALE_COLUMNS]> {
+        assert_eq!(self.device, Device::B200);
+        assert_eq!(security_sums.len(), self.live_rows());
+        let (rows, _) = self.generate_trace::<F>(a_rows, b_rows);
+        let minimum = super::super::unpredictability::minimum_security_product(self.k);
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut output = B200ScaleColumnsView::<F> {
+                    common: row.into(),
+                    ..Default::default()
+                };
+                if index < self.live_rows() {
+                    let common = &output.common;
+                    let norm = common.sigma_norm.to_canonical_u64();
+                    let encoding = common.alpha_exp.to_canonical_u64()
+                        + common.l2_floored_exponent.to_canonical_u64()
+                        + common.sigma_sig_is_wide.to_canonical_u64()
+                        + 13;
+                    let (threshold, coefficient, region, base) =
+                        super::super::unpredictability::security_row_parameters(norm, encoding);
+                    let sum = security_sums[index];
+                    let surplus = (coefficient * sum)
+                        .checked_sub(minimum)
+                        .expect("policy-rejected Gaussian row");
+                    assert!(surplus < 1 << 48);
+                    output.strip_threshold = F::from_canonical_u64(threshold);
+                    output.security_coefficient = F::from_canonical_u64(coefficient);
+                    output.security_region = F::from_canonical_u64(region);
+                    output.security_key_base = F::from_canonical_u64(base);
+                    output.security_sum = F::from_canonical_u64(sum);
+                    output.security_surplus =
+                        core::array::from_fn(|limb| F::from_canonical_u64((surplus >> (16 * limb)) & 65535));
+                }
+                output.into()
+            })
+            .collect()
     }
 
     /// Generates the ScaleStark trace and public inputs from the per-row aggregate tuples
@@ -631,13 +738,13 @@ impl ScaleProgram {
         assert!(!alpha.exp_is_zero && alpha.exp <= 254, "H3: alpha is structurally normal");
         v.alpha_exp = F::from_canonical_u64(alpha.exp);
         v.alpha_mantissa = F::from_canonical_u64(alpha.mantissa);
-        // S1 (jackpot check 3): the exact sigma significand M(alpha) * M(l2f).
+        // S1 (checks 2/3/4): the exact sigma significand M(alpha) * M(l2f).
         let sigma_significand = (128 + alpha.mantissa) * l2f.m();
         v.sigma_significand = F::from_canonical_u64(sigma_significand);
-        // S2 (jackpot check 4): its width bit — the significand spans [2^14, 2^16).
+        // S2 (checks 2/3/4): its width bit — the significand spans [2^14, 2^16).
         let sigma_sig_is_wide = sigma_significand >= 1 << 15;
         v.sigma_sig_is_wide = F::from_bool(sigma_sig_is_wide);
-        // S3 (jackpot check 4): the normalized form, in [2^15, 2^16).
+        // S3 (checks 3/4): the normalized form, in [2^15, 2^16).
         v.sigma_norm = F::from_canonical_u64(sigma_significand << u64::from(!sigma_sig_is_wide));
 
         let b1 = fill_mul(alpha, l2f);
@@ -667,14 +774,12 @@ impl ScaleProgram {
             "H: the scale chain diverged from the native derive_row_scales"
         );
 
-        // ---- The jackpot noise floor (group F): sigma = DELTA*alpha*l2f >= sigma_min = 1.
-        // S2 makes its exact exponent encoding affine; the matching RC16 gate checks that the
-        // encoding is at least 268, i.e. e(sigma) >= 0. ----
+        // ---- The jackpot noise floor (group F): alpha*l2f >= 4 on A, >= 16 on B.
+        // Mirror the CTL's exponent slack, including the two BF16 exponent biases. ----
         let e_sum = alpha.e_star() + l2f.e_star();
-        let sigma_enc = e_sum + i64::from(sigma_sig_is_wide) + self.device.sigma_encoding_offset() as i64;
         if expect_valid {
             assert!(
-                sigma_enc >= PROD_UNIT,
+                e_sum + i64::from(sigma_sig_is_wide) + 2 * i64::from(is_a) - 254 - 4 >= 0,
                 "policy-rejected witness: row noise scale below the sigma floor (jackpot check 2)"
             );
         }
@@ -1354,19 +1459,56 @@ fn mul_block_constraints<V: Copy + Default, S: Copy, E: Evaluator<V, S>>(
 /// Evaluates every arithmetic constraint of ScaleStark. Lookup-borne facts (LUT oracle) are
 /// *not* emitted here — see the module docs and `ctl::scale_lut_lookups`. The constraint set
 /// is program-independent: the geometry parameters `k` / `Wl2` enter as public inputs.
-pub(crate) fn eval_scale_constraints<V, S, E>(vars: &StarkFrame<V, S, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS>, eval: &mut E)
-where
+pub(crate) fn eval_scale_constraints<V, S, E, const WIDTH: usize, const PUBLIC_INPUTS: usize>(
+    vars: &StarkFrame<V, S, WIDTH, PUBLIC_INPUTS>,
+    eval: &mut E,
+) where
     V: Copy + Default,
     S: Copy + Default,
     E: Evaluator<V, S>,
 {
-    let lv: &[V; NUM_SCALE_COLUMNS] = vars.get_local_values().try_into().unwrap();
+    let lv: &[V; NUM_SCALE_COLUMNS] = vars.get_local_values()[..NUM_SCALE_COLUMNS].try_into().unwrap();
     let lv: &ScaleColumnsView<V> = lv.borrow();
     // Only the group-T running totals read the next row; every other group is local to one
     // row (one matrix row's aggregates per trace row).
-    let nv: &[V; NUM_SCALE_COLUMNS] = vars.get_next_values().try_into().unwrap();
+    let nv: &[V; NUM_SCALE_COLUMNS] = vars.get_next_values()[..NUM_SCALE_COLUMNS].try_into().unwrap();
     let nv: &ScaleColumnsView<V> = nv.borrow();
     let pis = vars.get_public_inputs();
+    const {
+        if WIDTH == NUM_B200_SCALE_COLUMNS {
+            assert!(PUBLIC_INPUTS == NUM_B200_SCALE_PUBLIC_INPUTS);
+        }
+    }
+    if WIDTH == NUM_B200_SCALE_COLUMNS {
+        let row: &[V; NUM_B200_SCALE_COLUMNS] = vars.get_local_values().try_into().unwrap();
+        let row: &B200ScaleColumnsView<V> = row.borrow();
+        let zero = eval.i32(0);
+        for value in [
+            row.strip_threshold,
+            row.security_coefficient,
+            row.security_region,
+            row.security_key_base,
+            row.security_sum,
+        ]
+        .into_iter()
+        .chain(row.security_surplus)
+        {
+            eval.constraint_eq_if(lv.is_pad, value, zero);
+        }
+        let mut surplus = zero;
+        for (limb, value) in row.security_surplus.into_iter().enumerate() {
+            let weight = eval.u64(1 << (16 * limb));
+            surplus = eval.mad(value, weight, surplus);
+        }
+        let minimum = eval.scalar(pis[MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT]);
+        let one = eval.i32(1);
+        let live = eval.sub(one, lv.is_pad);
+        let required = eval.mad(live, minimum, surplus);
+        let product = eval.mul(row.security_coefficient, row.security_sum);
+        // CTL-bound kernels give sum < 2^32 and coefficient <= 8192: product < 2^45.
+        // The three ranged limbs give surplus < 2^48, so this equality cannot wrap.
+        eval.constraint_eq(product, required);
+    }
     let dr_exp = eval.scalar(pis[DR_EXP_PUBLIC_INPUT]);
     let dr_mantissa = eval.scalar(pis[DR_MANTISSA_PUBLIC_INPUT]);
     let dos_exp = eval.scalar(pis[DOS_EXP_PUBLIC_INPUT]);
@@ -1870,17 +2012,17 @@ where
     let e_sum = eval.add(lv.alpha_exp, lv.l2_floored_exponent);
     mul_block_constraints(eval, &lv.alpha_l2_multiply, sig_expected, e_sum);
 
-    // ==== S1 — jackpot check 3: the committed sigma significand M(alpha)*M(l2f) (the sigma
+    // ==== S1 — checks 2/3/4: the committed sigma significand M(alpha)*M(l2f) (the sigma
     // CTL tuple's degree-1 handle; its exponent rides the tuple as an affine expression). ====
     eval.constraint_eq(lv.sigma_significand, sig_expected);
 
-    // ==== S2 — jackpot check 4: the sigma significand's width bit. Boolean here; the two
+    // ==== S2 — checks 2/3/4: the sigma significand's width bit. Boolean here; the two
     // filtered RC16s (`ctl::scale_lut_lookups`) force it to 1 exactly when
     // SIGMA_SIGNIFICAND >= 2^15, making the sigma encoding exported on the group-tuple
     // channel exact. ====
     eval.constraint_bool(lv.sigma_sig_is_wide);
 
-    // ==== S3 — jackpot check 4: SIGMA_NORM = SIGMA_SIGNIFICAND * (2 - SIGMA_SIG_IS_WIDE),
+    // ==== S3 — checks 3/4: SIGMA_NORM = SIGMA_SIGNIFICAND * (2 - SIGMA_SIG_IS_WIDE),
     // the significand normalized into [2^15, 2^16). Pad rows carry the same valid scale
     // chain but are excluded from the group-tuple CTL. ====
     let two = eval.i32(2);
@@ -1940,8 +2082,8 @@ where
     eval.constraint_bool(lv.dead_slack_hi_b);
 
     // ==== F — the jackpot noise floor (check 2) is the unfiltered RC16 lookup
-    // `SIGMA_ENC - 268`, where S2 makes `SIGMA_ENC = e(sigma) + 268` affine. No additional
-    // witness column or arithmetic constraint is needed. ====
+    // `ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_SIG_IS_WIDE + 2*IS_A_ROW - 258`.
+    // No additional witness column or arithmetic constraint is needed. ====
 }
 
 // ==================================================================================================
@@ -1952,13 +2094,30 @@ where
 /// (see the module docs). A CTL party of the fp8 batch; the batch driver is the only
 /// supported proving path.
 #[derive(Clone, Debug)]
-pub struct ScaleStark<F, const D: usize> {
+pub struct ScaleStark<
+    F,
+    const D: usize,
+    const WIDTH: usize = NUM_SCALE_COLUMNS,
+    const PUBLIC_INPUTS: usize = NUM_SCALE_PUBLIC_INPUTS,
+> {
     pub program: ScaleProgram,
     _phantom: PhantomData<F>,
 }
 
-impl<F: RichField + Extendable<D>, const D: usize> ScaleStark<F, D> {
+impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize, const PUBLIC_INPUTS: usize>
+    ScaleStark<F, D, WIDTH, PUBLIC_INPUTS>
+{
     pub fn new(program: ScaleProgram) -> Self {
+        assert_eq!(program.r, 32, "noise rank must be exactly 32");
+        const {
+            assert!(
+                (WIDTH == NUM_SCALE_COLUMNS && PUBLIC_INPUTS == NUM_SCALE_PUBLIC_INPUTS)
+                    || (WIDTH == NUM_B200_SCALE_COLUMNS && PUBLIC_INPUTS == NUM_B200_SCALE_PUBLIC_INPUTS)
+            );
+        }
+        if WIDTH == NUM_B200_SCALE_COLUMNS {
+            assert_eq!(program.device, Device::B200);
+        }
         Self {
             program,
             _phantom: PhantomData,
@@ -1966,14 +2125,16 @@ impl<F: RichField + Extendable<D>, const D: usize> ScaleStark<F, D> {
     }
 }
 
-impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for ScaleStark<F, D> {
+impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize, const PUBLIC_INPUTS: usize> Stark<F, D>
+    for ScaleStark<F, D, WIDTH, PUBLIC_INPUTS>
+{
     type EvaluationFrame<FE, P, const D2: usize>
-        = StarkFrame<P, P::Scalar, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS>
+        = StarkFrame<P, P::Scalar, WIDTH, PUBLIC_INPUTS>
     where
         FE: FieldExtension<D2, BaseField = F>,
         P: PackedField<Scalar = FE>;
 
-    type EvaluationFrameTarget = StarkFrame<ExtensionTarget<D>, ExtensionTarget<D>, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS>;
+    type EvaluationFrameTarget = StarkFrame<ExtensionTarget<D>, ExtensionTarget<D>, WIDTH, PUBLIC_INPUTS>;
 
     fn eval_packed_generic<FE, P, const D2: usize>(
         &self,
@@ -2021,12 +2182,190 @@ mod tests {
     use super::*;
     use crate::v4::circuit::luts::LutChecker;
     use crate::v4::circuit::scale_stark::columns::SCALE_COL_MAP;
-    use crate::v4::circuit::scale_stark::ctl::scale_lut_lookups;
+    use crate::v4::circuit::scale_stark::ctl::scale_common_lut_lookups;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = GoldilocksField;
     type S = ScaleStark<F, D>;
+
+    #[test]
+    fn b200_gaussian_rows_surplus_padding_and_recursive_constraints() {
+        use super::super::columns::B200_SCALE_COL_MAP;
+        use crate::v4::circuit::luts::{LutChecker, LutTable};
+        use crate::v4::circuit::unpredictability::{lambda, security_lookup_value, security_row_parameters};
+        type B200 = ScaleStark<F, D, NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS>;
+        let program = ScaleProgram::new_for_device(1, 2, 8192, 32, Device::B200);
+        let mut spike = vec![0i8; program.k];
+        spike[0] = 100;
+        let inputs = [
+            spike,
+            vec![0; program.k],
+            (0..program.k).map(|index| if index % 2 == 0 { 2 } else { 0 }).collect(),
+        ];
+        let scales = vec![0x3f80; program.k / BLOCK_SIZE];
+        let tuples: Vec<_> = inputs
+            .iter()
+            .map(|row| ScaleRowTuple::from_prequant_row_for_device(row, &scales, program.wl2(), program.device))
+            .collect();
+        let common = program.generate_trace::<F>(&tuples[..1], &tuples[1..]).0;
+        let sums: Vec<_> = inputs
+            .iter()
+            .zip(&common)
+            .map(|(input, row)| {
+                let row: &ScaleColumnsView<F> = row.borrow();
+                let encoding = to_u64(row.alpha_exp) + to_u64(row.l2_floored_exponent) + to_u64(row.sigma_sig_is_wide) + 13;
+                let (_, _, region, base) = security_row_parameters(to_u64(row.sigma_norm), encoding);
+                let alpha = (to_u64(row.alpha_exp) * 128 + to_u64(row.alpha_mantissa)) as u16;
+                let l2 = (to_u64(row.l2_floored_exponent) * 128 + to_u64(row.l2_floored_significand) - 128) as u16;
+                input
+                    .iter()
+                    .map(|&value| {
+                        let x = f32_to_bf16(f32::from(value)).unwrap();
+                        security_lookup_value(region, lambda(Device::B200, alpha, x, l2) - base)
+                    })
+                    .sum()
+            })
+            .collect();
+        let rows = program.generate_b200_trace::<F>(&tuples[..1], &tuples[1..], &sums);
+        let public_inputs = program.public_inputs_for_device::<F>();
+        let stark = B200::new(program.clone());
+        let m = &B200_SCALE_COL_MAP;
+        let tables = crate::v4::circuit::ctl::lut_tables(Device::B200);
+        let lookups = super::super::ctl::scale_lut_lookups::<F>(&program);
+        let mut checker = LutChecker::<F>::new(&tables);
+        let valid = |rows: &[[F; NUM_B200_SCALE_COLUMNS]], pis: &[F]| {
+            rows.iter().enumerate().all(|(index, row)| {
+                let frame = StarkFrame::from_values(row, &rows[(index + 1) % rows.len()], pis);
+                let mut consumer = ConstraintConsumer::new(
+                    vec![F::from_canonical_u64(7), F::from_canonical_u64(65537)],
+                    F::from_bool(index + 1 != rows.len()),
+                    F::from_bool(index == 0),
+                    F::from_bool(index + 1 == rows.len()),
+                );
+                stark.eval_packed_generic(&frame, &mut consumer);
+                consumer.accumulators().into_iter().all(|value| value == F::ZERO)
+            })
+        };
+        assert!(valid(&rows, &public_inputs));
+        checker
+            .check_trace(
+                &lookups,
+                &trace_rows_to_poly_values(rows.clone()),
+                &public_inputs,
+                "Gaussian rows",
+            )
+            .unwrap();
+        assert_eq!(rows[0][m.security_coefficient], F::from_canonical_u64(8192));
+        assert!(to_u64(rows[1][m.security_coefficient]) < 8192);
+        for index in [0, rows.len() - 1] {
+            for column in [
+                m.strip_threshold,
+                m.security_coefficient,
+                m.security_region,
+                m.security_key_base,
+                m.security_sum,
+            ]
+            .into_iter()
+            .chain(m.security_surplus)
+            {
+                let mut forged = rows.clone();
+                forged[index][column] += F::ONE;
+                assert!(
+                    !valid(&forged, &public_inputs)
+                        || checker
+                            .check_trace(
+                                &lookups,
+                                &trace_rows_to_poly_values(forged),
+                                &public_inputs,
+                                "forged Gaussian row"
+                            )
+                            .is_err(),
+                    "column {column}"
+                );
+            }
+        }
+        let mut forged = rows.clone();
+        forged[0][m.security_surplus[0]] = -F::ONE;
+        assert!(
+            !valid(&forged, &public_inputs)
+                || checker
+                    .check_trace(
+                        &lookups,
+                        &trace_rows_to_poly_values(forged),
+                        &public_inputs,
+                        "wrapped surplus"
+                    )
+                    .is_err()
+        );
+        let mut wrong_minimum = public_inputs.clone();
+        wrong_minimum[MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT] += F::ONE;
+        assert!(!valid(&rows, &wrong_minimum));
+        assert_eq!(
+            lookups
+                .iter()
+                .filter(|lookup| lookup.table == LutTable::DownscaleThreshold)
+                .count(),
+            1
+        );
+        use crate::v4::circuit::input_quant_stark::columns::{B200_INPUT_QUANT_COL_MAP, NUM_B200_INPUT_QUANT_COLUMNS};
+        use crate::v4::circuit::input_quant_stark::stark::InputQuantProgram;
+        use starky::cross_table_lookup::{CrossTableLookup, debug_utils::check_ctls};
+        let input_program = InputQuantProgram {
+            h: 1,
+            w: 2,
+            k: program.k,
+            block_size: 8,
+            r: 32,
+            device: Device::B200,
+        };
+        let b_input = [inputs[1].as_slice(), inputs[2].as_slice()].concat();
+        let (input_rows, input_pis) = input_program.generate_trace::<F, NUM_B200_INPUT_QUANT_COLUMNS>(
+            &inputs[0],
+            &scales,
+            &vec![0.0; program.k],
+            &b_input,
+            &scales.repeat(2),
+            &vec![0.0; program.k * 2],
+        );
+        let mut traces = vec![
+            vec![],
+            trace_rows_to_poly_values(input_rows),
+            trace_rows_to_poly_values(rows.clone()),
+        ];
+        let pis = vec![vec![], input_pis.to_vec(), public_inputs];
+        let channel = [CrossTableLookup::new(
+            crate::v4::circuit::input_quant_stark::ctl::ctl_group_tuples_looking_input_quant(Device::B200),
+            vec![super::super::ctl::ctl_looked_scale_group_tuple(&program)],
+        )];
+        check_ctls(&traces, &pis, &channel, &Default::default());
+        let iq = &B200_INPUT_QUANT_COL_MAP;
+        for (table, row, column) in [
+            (2, 0, m.strip_threshold),
+            (2, 0, m.security_region),
+            (2, 0, m.security_key_base),
+            (2, 0, m.security_sum),
+            (2, 0, m.common.group_key),
+            (1, program.k - 1, iq.a.security_region),
+            (1, program.k - 1, iq.b.security_region),
+            (1, program.k - 1, iq.a.security_key_base),
+            (1, program.k - 1, iq.b.security_key_base),
+            (1, program.k - 1, iq.a.security_sum),
+            (1, program.k - 1, iq.b.security_sum),
+            (1, program.k - 1, iq.schedule.element_index),
+            (1, program.k - 1, iq.schedule.a_live),
+            (1, program.k - 1, iq.schedule.is_group_final),
+        ] {
+            traces[table][column].values[row] += F::ONE;
+            assert!(
+                std::panic::catch_unwind(|| check_ctls(&traces, &pis, &channel, &Default::default())).is_err(),
+                "table {table}, column {column}"
+            );
+            traces[table][column].values[row] -= F::ONE;
+        }
+        test_stark_low_degree::<F, B200, D>(stark.clone()).unwrap();
+        test_stark_circuit_constraints::<F, C, B200, D>(stark).unwrap();
+    }
 
     fn to_u64(x: F) -> u64 {
         x.to_canonical_u64()
@@ -2035,7 +2374,7 @@ mod tests {
     /// 4 + 4 = 8 rows (power of two, no padding), k = 4096 (power of two: single-element and
     /// constant rows have *exact* f32 norms); `Wl2 = 27 - 12 = 15`.
     fn test_program() -> ScaleProgram {
-        ScaleProgram::new_for_device(4, 4, 4096, 4, Device::B200)
+        ScaleProgram::new_for_device(4, 4, 4096, 32, Device::B200)
     }
 
     /// A deterministic nonnegative finite bf16 code with exponent field in `[lo_exp, hi_exp]`
@@ -2143,7 +2482,10 @@ mod tests {
         rows: &[[F; NUM_SCALE_COLUMNS]],
         pis: &[F; NUM_SCALE_PUBLIC_INPUTS],
     ) -> Result<(), String> {
-        let lookups = scale_lut_lookups::<F>(program);
+        // The common inventory only: these traces are the device-independent rows, so the
+        // B200 security lookups (which read the appended columns) are checked by the
+        // dedicated B200 tests below.
+        let lookups = scale_common_lut_lookups::<F>(program);
         let mut tables: Vec<_> = lookups.iter().map(|lookup| lookup.table).collect();
         tables.sort_unstable();
         tables.dedup();
@@ -2216,7 +2558,7 @@ mod tests {
     fn padded_trace_satisfies_constraints_and_lut_lookups() {
         // Non-power-of-two geometry: 3 + 4 = 7 live rows pad to 8 (the last row is the pad
         // row).
-        let program = ScaleProgram::new_for_device(3, 4, 4096, 4, Device::B200);
+        let program = ScaleProgram::new_for_device(3, 4, 4096, 32, Device::B200);
         assert_eq!(program.num_rows(), 8);
         let (a8, b) = test_tuples(&test_program());
         let a: Vec<ScaleRowTuple> = a8[..3].to_vec();
@@ -2776,7 +3118,7 @@ mod tests {
 
     #[test]
     fn lower_comparison_rejects_underflow_without_final_borrow_column() {
-        let program = ScaleProgram::new_for_device(1, 1, 4096, 4, Device::B200);
+        let program = ScaleProgram::new_for_device(1, 1, 4096, 32, Device::B200);
         let ones = ScaleRowTuple::from_prequant_row_for_device(
             &vec![1i8; program.k],
             &vec![0x3F80u16; program.k / BLOCK_SIZE],
@@ -2803,7 +3145,7 @@ mod tests {
 
     #[test]
     fn lower_alignment_rejects_nonzero_omitted_digit() {
-        let program = ScaleProgram::new_for_device(1, 1, 1 << 16, 4, Device::B200);
+        let program = ScaleProgram::new_for_device(1, 1, 1 << 16, 32, Device::B200);
         // Isolate the alignment equation: choose a bounded aggregate and forged claim
         // with lower_bound = 7*2^112 + scaled_sum. Truncating position 7 would accept.
         let tuple = ScaleRowTuple {
@@ -3159,16 +3501,16 @@ mod tests {
     }
 
     /// Searches single-spike rows for one whose honest gate data lands in the boundary
-    /// binade `E_SUM = 254`, on the requested side of the significand pivot. A spike row
-    /// keeps `linf/l2f ~ sqrt(k)`, so `sigma = DELTA*alpha*l2f ~ 224/sqrt(k)`: k = 2^14
-    /// lands `alpha*l2f` in [2, 4) (`pass = true` reachable) and k = 2^16 in [1, 2)
+    /// binade `E_SUM = 255`, on the requested side of the significand pivot. A spike row
+    /// keeps `linf/l2f ~ sqrt(k)`, so `alpha*l2f ~ 448/sqrt(k)`: k = 2^12
+    /// lands `alpha*l2f` in [4, 8) (`pass = true` reachable) and k = 2^14 in [2, 4)
     /// (`pass = false` reachable); which binade of SIG the product decomposes into varies
     /// with the scale mantissa.
     fn find_boundary_spike(program: &ScaleProgram, pass: bool) -> ScaleRowTuple {
         for exp in [130u64, 131, 129] {
             for mantissa in 0..128u64 {
                 let (tuple, e_sum, sig) = spike_row_gate_data(program, ((exp << 7) | mantissa) as u16);
-                if e_sum == 254 && ((sig >= 1 << 15) == pass) {
+                if e_sum == 255 && ((sig >= 1 << 15) == pass) {
                     return tuple;
                 }
             }
@@ -3179,10 +3521,10 @@ mod tests {
         );
     }
 
-    /// A full honest B200 trace whose row 2 sits exactly at the sigma floor:
-    /// `E_SUM = 254`, `SIG >= 2^15`, hence `SIGMA_ENC = 254 + 1 + 13 = 268`.
+    /// A full honest B200 trace whose A row 2 sits in the minimum accepted RMS binade:
+    /// `E_SUM = 255`, `SIG >= 2^15`, hence `floor(log2(alpha*l2f)) = 255 + 1 - 254 = 2`.
     fn boundary_binade_trace() -> (ScaleProgram, Vec<[F; NUM_SCALE_COLUMNS]>, [F; NUM_SCALE_PUBLIC_INPUTS]) {
-        let program = ScaleProgram::new_for_device(4, 4, 1 << 14, 4, Device::B200);
+        let program = ScaleProgram::new_for_device(4, 4, 1 << 12, 32, Device::B200);
         let (mut a, b) = test_tuples(&program);
         a[2] = find_boundary_spike(&program, true);
         let (rows, pis) = program.generate_trace::<F>(&a, &b);
@@ -3195,23 +3537,20 @@ mod tests {
         {
             let v: &ScaleColumnsView<F> = rows[2].borrow();
             assert_eq!(
-                to_u64(v.alpha_exp)
-                    + to_u64(v.l2_floored_exponent)
-                    + to_u64(v.sigma_sig_is_wide)
-                    + program.device.sigma_encoding_offset(),
-                PROD_UNIT as u64,
-                "test premise: row 2 sits exactly at sigma = 1"
+                to_u64(v.alpha_exp) + to_u64(v.l2_floored_exponent) + to_u64(v.sigma_sig_is_wide) - 254,
+                2,
+                "test premise: A row 2 has scaled RMS in [4, 8)"
             );
         }
         check_all(&program, &rows, &pis).unwrap();
     }
 
-    /// A 2-row k = 2^16 trace whose A row violates the noise floor with `E_SUM = 254` and
+    /// A 2-row k = 2^14 trace whose A row violates the RMS floor with `E_SUM = 255` and
     /// `SIG < 2^15`, built with `expect_valid = false` (the honest builder panics on it) and
     /// honest running totals — every arithmetic constraint holds, so only the sigma-floor
     /// RC16 can reject.
     fn below_floor_trace() -> (ScaleProgram, Vec<[F; NUM_SCALE_COLUMNS]>, [F; NUM_SCALE_PUBLIC_INPUTS]) {
-        let program = ScaleProgram::new_for_device(1, 1, PublicParams::MAX_K, 4, Device::B200);
+        let program = ScaleProgram::new_for_device(1, 1, 1 << 14, 32, Device::B200);
         let spike = find_boundary_spike(&program, false);
         let ones = ScaleRowTuple::from_prequant_row_for_device(
             &vec![1i8; program.k],
@@ -3243,12 +3582,9 @@ mod tests {
         {
             let v: &ScaleColumnsView<F> = rows[0].borrow();
             assert_eq!(
-                to_u64(v.alpha_exp)
-                    + to_u64(v.l2_floored_exponent)
-                    + to_u64(v.sigma_sig_is_wide)
-                    + program.device.sigma_encoding_offset(),
-                PROD_UNIT as u64 - 1,
-                "test premise: the spike row sits immediately below sigma = 1"
+                to_u64(v.alpha_exp) + to_u64(v.l2_floored_exponent) + to_u64(v.sigma_sig_is_wide) - 254,
+                1,
+                "test premise: the A spike row has scaled RMS in [2, 4)"
             );
         }
         check_constraints(&program, &rows, &pis).expect("the sigma floor is lookup-only");
@@ -3261,7 +3597,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "below the sigma floor")]
     fn generate_trace_rejects_sigma_floor_violations() {
-        let program = ScaleProgram::new_for_device(1, 1, PublicParams::MAX_K, 4, Device::B200);
+        let program = ScaleProgram::new_for_device(1, 1, 1 << 14, 32, Device::B200);
         let spike = find_boundary_spike(&program, false);
         let ones = ScaleRowTuple::from_prequant_row_for_device(
             &vec![1i8; program.k],
@@ -3274,51 +3610,54 @@ mod tests {
 
     #[test]
     fn sigma_floor_gate_matches_native_policy_comparison() {
-        // The gate's affine encoding vs the plaintext jackpot comparison
-        // `delta * alpha * l2f >= sigma_min` in f64 (exact: 16-bit significand products,
-        // exponents far from f64's limits) — exhaustive around both devices' pivots and
-        // fuzzed across the full pinned domain.
+        // Compare the CTL's exponent slack against the native noise-floor comparison
+        // for both sides and devices. The f64 products are exact (16-bit significands,
+        // exponents far from f64's limits). Exhaust each side's boundary binades and
+        // fuzz the full pinned domain.
         let value = |m: u64, e_star: i64| m as f64 * ((e_star - 134) as f64).exp2();
         for device in [Device::H100, Device::B200] {
             let policy = JackpotPolicy::for_device(device);
-            let check = |alpha_exp: i64, alpha_mantissa: u64, l2f_e_star: i64, l2f_m: u64| {
-                let alpha_m = 128 + alpha_mantissa;
-                let e_sum = alpha_exp + l2f_e_star;
-                let sig = alpha_m * l2f_m;
-                let wide = i64::from(sig >= 1 << 15);
-                let gate = e_sum + wide + device.sigma_encoding_offset() as i64 >= PROD_UNIT;
-                let sigma = device.delta() * value(alpha_m, alpha_exp) * value(l2f_m, l2f_e_star);
-                assert_eq!(
-                    gate,
-                    sigma >= policy.sigma_min,
-                    "{device:?} gate vs plaintext at alpha = ({alpha_exp}, {alpha_mantissa}), \
-                     l2f = ({l2f_e_star}, {l2f_m})"
-                );
-            };
-            for e_sum in 252..=256i64 {
-                for l2f_e_star in [95i64, 200] {
-                    for alpha_mantissa in 0..128u64 {
-                        for l2f_mantissa in 0..128u64 {
-                            check(e_sum - l2f_e_star, alpha_mantissa, l2f_e_star, 128 + l2f_mantissa);
+            for (is_a, rms_min) in [(true, policy.rms_min_a), (false, policy.rms_min_b)] {
+                let check = |alpha_exp: i64, alpha_mantissa: u64, l2f_e_star: i64, l2f_m: u64| {
+                    let alpha_m = 128 + alpha_mantissa;
+                    let e_sum = alpha_exp + l2f_e_star;
+                    let sig = alpha_m * l2f_m;
+                    let wide = i64::from(sig >= 1 << 15);
+                    let gate = e_sum + wide + 2 * i64::from(is_a) - 254 - 4 >= 0;
+                    let sigma = device.delta() * value(alpha_m, alpha_exp) * value(l2f_m, l2f_e_star);
+                    assert_eq!(
+                        gate,
+                        sigma >= device.delta() * rms_min,
+                        "{device:?}, is_a = {is_a}: gate vs plaintext at \
+                         alpha = ({alpha_exp}, {alpha_mantissa}), l2f = ({l2f_e_star}, {l2f_m})"
+                    );
+                };
+                let boundary_e_sum = 254 + rms_min.log2() as i64;
+                for e_sum in boundary_e_sum - 2..=boundary_e_sum + 2 {
+                    for l2f_e_star in [95i64, 200] {
+                        for alpha_mantissa in 0..128u64 {
+                            for l2f_mantissa in 0..128u64 {
+                                check(e_sum - l2f_e_star, alpha_mantissa, l2f_e_star, 128 + l2f_mantissa);
+                            }
                         }
                     }
                 }
-            }
-            let mut x: u64 = 0x243F6A8885A308D3;
-            let mut step = || {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x
-            };
-            for _ in 0..100_000 {
-                let r = step();
-                // alpha structurally normal: exp in [1, 254]; l2f >= 2^-32: E* in [95, 254].
-                let alpha_exp = 1 + (r & 0xFF) as i64 % 254;
-                let alpha_mantissa = (r >> 8) & 0x7F;
-                let l2f_e_star = 95 + ((r >> 15) & 0xFF) as i64 % 160;
-                let l2f_mantissa = (r >> 23) & 0x7F;
-                check(alpha_exp, alpha_mantissa, l2f_e_star, 128 + l2f_mantissa);
+                let mut x: u64 = 0x243F6A8885A308D3;
+                let mut step = || {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x
+                };
+                for _ in 0..100_000 {
+                    let r = step();
+                    // alpha structurally normal: exp in [1, 254]; l2f >= 2^-32: E* in [95, 254].
+                    let alpha_exp = 1 + (r & 0xFF) as i64 % 254;
+                    let alpha_mantissa = (r >> 8) & 0x7F;
+                    let l2f_e_star = 95 + ((r >> 15) & 0xFF) as i64 % 160;
+                    let l2f_mantissa = (r >> 23) & 0x7F;
+                    check(alpha_exp, alpha_mantissa, l2f_e_star, 128 + l2f_mantissa);
+                }
             }
         }
     }

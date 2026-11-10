@@ -30,12 +30,12 @@
 //! **The statement and its public inputs.** [`Fp8Job::derive`] rebuilds the full
 //! statement from public data alone: the five programs (the Blake3 schedule from the shared
 //! job compiler, the geometry-parameterized InputQuant/Scale/Matmul programs, the extractor
-//! lanes), the class (a) recompute inputs (plane byte lengths and the bf16 noise codes
+//! lanes), the class (a) recompute inputs (plane byte lengths and the binary32 noise values
 //! `(E @ F)[elem]` from the public seeds), and the key material. The proof ships every
 //! table's public inputs; the verifier pins every slot to its own recomputation — `KEY_A` /
 //! `KEY_B`, `JACKPOT_KEY` (`Subkey(noise_seedA, "pearl/v4/FP8/jackpot")`),
-//! `HASH_A` / `HASH_B` (the job's side digests, bound in-AIR by the commit-fold wrappers —
-//! AIR spec Section 1.0), `HASH_ROUTING`, `HASH_JACKPOT`
+//! `HASH_A` / `HASH_B` (the job's side digests, bound in-AIR by the commit-fold wrappers in
+//! `Blake3Stark`), `HASH_ROUTING`, `HASH_JACKPOT`
 //! (the block's shipped claim, difficulty-checked before proof verification), the geometry parameters
 //! `K` / `WL2` / `2^WL2` (Scale's and InputQuant's program-independence slots, all filled
 //! from the statement's `k`), the `dr`/`dos` scale constants (from the job's rank) and
@@ -569,13 +569,15 @@ impl Fp8Job {
                         ))
                     },
                     || -> Result<_> {
+                        // Public noise is the device MMA output, without an intermediate
+                        // BF16 cast: the class (a) binary32 values `(E @ F)[elem]`.
                         let noise = compute_fp8_noise(params, proposed_header);
                         let (a_noise, b_noise) = plonky2_maybe_rayon::join(
-                            || device.matmul_fp8_bf16(&noise.a.e, &noise.a.f, h, k, r),
-                            || device.matmul_fp8_bf16(&noise.b.e, &noise.b.f, w, k, r),
+                            || device.matmul_fp8_parallel(&noise.a.e, &noise.a.f, h, k, r),
+                            || device.matmul_fp8_parallel(&noise.b.e, &noise.b.f, w, k, r),
                         );
-                        let a_noise = a_noise.context("A-side noise codes")?;
-                        let b_noise = b_noise.context("B-side noise codes")?;
+                        let a_noise = a_noise.context("A-side noise values")?;
+                        let b_noise = b_noise.context("B-side noise values")?;
                         let known = input_quant.known_values::<F>(&a_noise, &b_noise);
                         Ok((a_noise, b_noise, known))
                     },
@@ -703,7 +705,7 @@ impl Fp8Job {
         set(PI_HASH_OFFSETS, &self.hash_offsets().unwrap_or([0u8; 32]));
         set(PI_HASH_JACKPOT, &params.hash_jackpot());
 
-        let scale = self.scale().public_inputs::<F>().to_vec();
+        let scale = self.scale().public_inputs_for_device::<F>();
         // InputQuant: `2^Wl2` (the plaintext power of Scale's `Wl2` slot — the verifier pins
         // both; the wrapper only exposes the wires) and the geometry slots the CTL
         // expressions read.
@@ -717,7 +719,7 @@ impl Fp8Job {
             F::from_canonical_usize(iq.h * iq.k),
         ];
         let xor_fold = vec![F::from_canonical_u64(budget(iq.k, iq.h, iq.w))];
-        [blake3, input_quant, scale, matmul, xor_fold]
+        [blake3, input_quant, scale, matmul, xor_fold, vec![]]
     }
 }
 
@@ -989,6 +991,17 @@ mod tests {
         let (_, params) = plain.parse_proof(&header).expect("fixture job must parse");
         let job = Fp8Job::derive(&params, &header).expect("fixture job must derive");
         let expected_pis = job.expected_public_inputs();
+        use crate::v4::circuit::scale_stark::columns::{MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT, NUM_B200_SCALE_PUBLIC_INPUTS};
+        assert_eq!(
+            expected_pis[crate::v4::circuit::ctl::Table::Scale as usize].len(),
+            NUM_B200_SCALE_PUBLIC_INPUTS
+        );
+        assert_eq!(
+            expected_pis[crate::v4::circuit::ctl::Table::Scale as usize][MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT],
+            F::from_canonical_u64(crate::v4::circuit::unpredictability::minimum_security_product(
+                params.common_dim() as usize
+            ))
+        );
         let digest = params.digest(&header);
 
         // The preamble is exactly zeta's D basefield limbs, 8 bytes each.

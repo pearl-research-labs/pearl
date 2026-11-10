@@ -4,14 +4,13 @@
 //! [`ctl`] declares their CTL halves, and [`witness`] checks lookups and counts multiplicities.
 //! Complete channels are assembled in [`super::ctl`].
 //!
-//! Each device family's sixteen [`LutTable`]s is its own table of
-//! the batch STARK — a [`LutStark`] at its natural committed height [`lut_height`] (the
-//! array orders the batch by descending height, so nothing pays for another table's
-//! padding). A LUT AIR has no constraints of its own; its columns split into two classes:
+//! Each [`LutTable`] has its own batch AIR at its natural height [`lut_height`].
+//! Batch FRI sorts heights internally. A LUT AIR has no constraints of its own;
+//! its columns split into two classes:
 //!
 //! - **Precommitted columns** (class (c)): the key column(s) — a plain ramp for tables whose
-//!   key domain fills the height, the enumerated key tuple for BYTES2/PAIR128, or a saturated
-//!   key `min(i, live - 1)` for sub-height tables — and independent value columns
+//!   key domain fills the height, the enumerated key tuple for BYTES2/PAIR128/FP32TOOLS/LOG16,
+//!   or a saturated key `min(i, live - 1)` for sub-height tables — and independent value columns
 //!   ([`lut_precommitted_values`]). Slot expressions derive constant and affine outputs. Generated once system-wide and committed at
 //!   setup by [`lut_preprocessed_data`] into a `BatchStarkPreprocessedData` whose Merkle cap
 //!   is a consensus constant. Proofs never recommit these columns — the batch prover copies
@@ -85,7 +84,8 @@ pub enum LutTable {
     Pair128,
     /// Keyed bf16 code, value fp8 E4M3 code (one precommitted column; the binding pins the
     /// committed code into `[0, 256)`): `f32_to_fp8_e4m3(bf16_to_f32(clamp_±448(x)))` exactly
-    /// (RNE, saturation, subnormal region, signed zero) — InputQuant Q1-Q3.
+    /// (RNE, saturation, subnormal region, signed zero). InputQuant keys it with the
+    /// round-to-odd proxy of its binary32 fold, preserving the direct E4M3 cast.
     Qcast,
     /// Keyed int8 byte (raw two's complement, `[0, 255]`), tuple value
     /// `(SIGN, EXP, MANTISSA, EXP_IS_ZERO)`: the exact bf16 decode fields of the int8 value
@@ -147,16 +147,30 @@ pub enum LutTable {
     /// truncate-to-24-bits divisor/multiplier pair. Its key domain also proves
     /// `GROUP_SUM_WIDTH <= 32`, hence `GROUP_SUM_ABS < 2^32` through MB7.
     Width32,
-    /// Jackpot check 4's significand-product width, keyed `P in [0, 2^16)`, values
+    /// The shared policy score's significand-product width, keyed `P in [0, 2^16)`, values
     /// `(width(P), [P != 0])` — the bit length of a 16-bit product and its nonzero flag.
     /// InputQuant binds it on the summand's significand product to build the lambda scores;
     /// the nonzero flag pins the zero sentinel exactly, and the key domain doubles as the
     /// product's range proof.
     Width16,
-    /// Jackpot check 4's fixed-point log, keyed `n in [0, 2^16)`, value `floor(64 * log2 n)`
-    /// (0 at the key-0 sentinel). InputQuant binds it on the summand's sum of squares to
-    /// build the lambda scores.
+    /// Keyed `(region, index)`. Region 0 serves `floor(64 * log2 index)` over `[0, 2^16)` for
+    /// the sum-of-squares score used by check 3 (0 at the phantom sentinel). Region `1 + class`
+    /// serves check 4's Q16 capped Gaussian kernel at `index=lambda-lambda(0,sigma)` in
+    /// `[0,8192)`. The region is its own key component, so a negative or oversized index
+    /// cannot alias another region. See `unpredictability::security_lookup_value`.
     Log16,
+    /// `(operation, argument) -> (left_power, right_power)` for binary32 rounding/alignment.
+    Fp32Tools,
+    /// B200 row parameters: `(norm-32768)+32768*e`, with `norm=sigma_norm` in `[32768,65536)`
+    /// and `e=sigma_enc-269` in `0..=5`. The exact signal RMS is `norm*2^(e-13)`.
+    /// Six folded exponent slots jointly serve the strip byte, Q16 Gaussian coefficient,
+    /// LOG16 cap region, and baseline score `lambda(0,sigma)` (the kernel-key base).
+    DownscaleThreshold,
+    /// B200 quantize-first rewrite, keyed `code+256*threshold+32768*coin+65536*e`, with
+    /// byte code, 7-bit threshold, boolean coin, and `e=sigma_enc-269` in `0..=5`.
+    /// Returns `(code&128)|(8*e)|(code&7)|1` if `coin && (code&127)<threshold`, else code.
+    /// Six folded slots share the same comparison; only the replacement exponent differs.
+    DownscaleRewrite,
 }
 
 #[cfg(test)]

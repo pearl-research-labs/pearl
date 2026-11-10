@@ -18,7 +18,7 @@
 //!
 //!   ```text
 //!   every table's STARK public inputs (batch order)
-//!   | per-table trace degree bits (NUM_ALL_TABLES)
+//!   | per-table trace degree bits (device table count)
 //!   | known-column digest (4)
 //!   | zeta (2)
 //!   | known-column evals at zeta      (2 per column, batch order)
@@ -106,9 +106,10 @@ use starky::batch_universal::{
 use starky::verifier::eval_columns_at_zeta_and_next;
 
 use super::blake3_stark::columns::{BLAKE3_COL_MAP, NUM_BLAKE3_KNOWN_COLUMNS};
-use super::ctl::{NUM_ALL_TABLES, NUM_TABLES, Table};
+use super::ctl::{NUM_B200_ALL_TABLES, NUM_H100_ALL_TABLES, NUM_TABLES, Table};
 use super::driver::{FP8_REACHABLE_DEGREE_BITS, Fp8System, fp8_universal_envelope, statement_digest_to_hash_out};
 use crate::v4::api::primitives::Hash256;
+use crate::v4::api::public_params::Device;
 use crate::v4::circuit::circuit_utils::build_recursion_config;
 
 /// The wrapper's field, extension degree and per-stage hasher configurations.
@@ -136,16 +137,16 @@ pub fn table_pis_offset(system: &Fp8System<F, D>, position: usize) -> usize {
     system.batch_starks()[..position].iter().map(|s| s.num_public_inputs()).sum()
 }
 
-/// Flat offset of the per-table degree-bits slots (`NUM_ALL_TABLES` of them, canonical
+/// Flat offset of the per-table degree-bits slots (one per device table, canonical
 /// batch order), directly after the tables' STARK public inputs.
 pub fn degree_bits_offset(system: &Fp8System<F, D>) -> usize {
-    table_pis_offset(system, NUM_ALL_TABLES)
+    table_pis_offset(system, system.degree_bits().len())
 }
 
 /// Flat offset of the exposed challenge point `zeta`: the degree slots and the known-column
 /// digest occupy the slots before it, the known-column evaluations the slots after.
 pub fn zeta_offset(system: &Fp8System<F, D>) -> usize {
-    degree_bits_offset(system) + NUM_ALL_TABLES + NUM_HASH_OUT_ELTS
+    degree_bits_offset(system) + system.degree_bits().len() + NUM_HASH_OUT_ELTS
 }
 
 /// Total public-input count of a wrapper proof for this batch shape.
@@ -258,16 +259,27 @@ impl Fp8WrapperCircuits {
             evals_at_g_zeta,
         };
 
-        let universal = verify_universal_batch_stark_proof_circuit::<F, InnerC, D, NUM_ALL_TABLES>(
-            &mut builder,
-            &starks,
-            system.config(),
-            &envelope,
-            system.ctls(),
-            Some(&preprocessed_target),
-            Some(&known_target),
-            &HashMap::new(),
-        )?;
+        macro_rules! compile_verifier {
+            ($count:expr) => {
+                verify_universal_batch_stark_proof_circuit::<F, InnerC, D, $count>(
+                    &mut builder,
+                    &starks
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow!("device AIR table count"))?,
+                    system.config(),
+                    &envelope,
+                    system.ctls(),
+                    Some(&preprocessed_target),
+                    Some(&known_target),
+                    &HashMap::new(),
+                )
+            };
+        }
+        let universal = match system.device() {
+            Device::H100 => compile_verifier!(NUM_H100_ALL_TABLES),
+            Device::B200 => compile_verifier!(NUM_B200_ALL_TABLES),
+        }?;
 
         // The public-input layout (see the module docs): table public inputs, the degree
         // slots (the universal verifier's height inputs — the gateway pins them to the
@@ -528,15 +540,18 @@ pub fn expected_wrapper_public_inputs(
         assert!(BLAKE3_COL_MAP.word_pin_second == BLAKE3_COL_MAP.moe_outer_indices_packed + 2);
         assert!(NUM_BLAKE3_KNOWN_COLUMNS == BLAKE3_COL_MAP.moe_outer_indices_packed + 3);
     };
-    let evaluated_column_counts: [usize; NUM_ALL_TABLES] = core::array::from_fn(|t| {
-        if t == Table::Blake3 as usize && !system.has_moe() {
-            BLAKE3_COL_MAP.moe_outer_indices_packed // Index of the last nonzero known column, plus one for the count.
-        } else {
-            known.values_per_table[t].len()
-        }
-    });
+    let num_all_tables = system.degree_bits().len();
+    let evaluated_column_counts: Vec<usize> = (0..num_all_tables)
+        .map(|t| {
+            if t == Table::Blake3 as usize && !system.has_moe() {
+                BLAKE3_COL_MAP.moe_outer_indices_packed // Index of the last nonzero known column, plus one for the count.
+            } else {
+                known.values_per_table[t].len()
+            }
+        })
+        .collect();
     let mut by_height: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for t in 0..NUM_ALL_TABLES {
+    for t in 0..num_all_tables {
         if !known.columns_per_table[t].is_empty() {
             by_height.entry(system.degree_bits()[t]).or_default().push(t);
         }
@@ -552,7 +567,7 @@ pub fn expected_wrapper_public_inputs(
             eval_columns_at_zeta_and_next::<F, D>(&columns, zeta, *bits)
         })
         .collect();
-    let mut per_table: Vec<TableEvals> = (0..NUM_ALL_TABLES).map(|_| (vec![], vec![])).collect();
+    let mut per_table: Vec<TableEvals> = (0..num_all_tables).map(|_| (vec![], vec![])).collect();
     for ((_, tables), (mut at_zeta, mut at_g_zeta)) in groups.iter().zip(evaluated) {
         // Split from the back to preserve each table's column order.
         for &t in tables.iter().rev() {
@@ -700,7 +715,7 @@ mod tests {
                 let pis = core::array::from_fn(|t| vec![F::ZERO; system.batch_starks()[t].num_public_inputs()]);
                 let expected = expected_wrapper_public_inputs(system, &pis, params.digest(&header), zeta).unwrap();
                 let (mut at_zeta, mut at_next) = (Vec::new(), Vec::new());
-                for t in 0..NUM_ALL_TABLES {
+                for t in 0..system.degree_bits().len() {
                     let columns = system.known().values_per_table[t].iter().collect::<Vec<_>>();
                     let (local, next) = eval_columns_at_zeta_and_next::<F, D>(&columns, zeta, system.degree_bits()[t]);
                     at_zeta.extend(local);

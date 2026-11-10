@@ -19,6 +19,16 @@ const B200_FP8_WIDTH: u16 = 26;
 const H100_FP8_WIDTH: u16 = 14;
 const H100_WINDOW_PRODUCTS: usize = 128;
 
+pub const DOWNSCALE_G_SMALL_RMS: f32 = 0.1;
+
+pub const SMALL_RMS_THRESHOLD: f32 = 8.0;
+
+pub const DOWNSCALE_G: f32 = 0.08;
+
+pub const E4M3_EXP_SHIFT: i32 = 3;
+pub const E4M3_SIGN_SHIFT: i32 = 7;
+pub const E4M3_EXPONENT_BIAS: i32 = 7;
+
 pub trait Dtype<F, T> {
     fn mul(&self, a: F, b: F) -> T;
 
@@ -35,16 +45,17 @@ impl Device {
         }
     }
 
-    /// Replay the noise matmul at its explicit rank and convert to row-major BF16.
-    /// Each `out[row * n + col]` replays the full rank-length rows of `a` and `b`;
-    /// output blocks do not split the products or change their accumulation order.
-    /// FP32 output blocks are bounded; no full FP32 matrix or reorder is needed.
-    pub(crate) fn matmul_fp8_bf16(self, a: &[u8], b: &[u8], m: usize, n: usize, rank: usize) -> Result<Vec<u16>> {
+    /// Replay the noise matmul at its explicit rank in parallel output blocks. Each
+    /// `out[row * n + col]` replays the full rank-length rows of `a` and `b`; output blocks do
+    /// not split the products or change their accumulation order, so every value equals the
+    /// single-call [`Self::matmul_fp8`] replay's. FP32 output blocks are bounded; no full
+    /// matrix is materialized per worker.
+    pub(crate) fn matmul_fp8_parallel(self, a: &[u8], b: &[u8], m: usize, n: usize, rank: usize) -> Result<Vec<f32>> {
         use plonky2_maybe_rayon::*;
 
         ensure!(a.len() == m * rank);
         ensure!(b.len() == n * rank);
-        let mut out = vec![0u16; m * n];
+        let mut out = vec![0f32; m * n];
         if out.is_empty() {
             self.matmul_fp8(a, b, None, m, n, rank)?;
             return Ok(out);
@@ -63,9 +74,7 @@ impl Device {
                     let a_row = &a[row * rank..(row + 1) * rank];
                     let b_rows = &b[col * rank..(col + len) * rank];
                     let values = self.matmul_fp8(a_row, b_rows, None, 1, len, rank)?;
-                    for (out, value) in out[written..written + len].iter_mut().zip(values) {
-                        *out = fp32_to_bf16_rne(value);
-                    }
+                    out[written..written + len].copy_from_slice(&values);
                     written += len;
                 }
                 Ok(())
@@ -175,6 +184,19 @@ fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
             significand: result_significand,
         }
     }
+}
+
+pub fn downscale_g(scaled_rms: &[f32]) -> Vec<f32> {
+    scaled_rms
+        .iter()
+        .map(|&x| {
+            if x >= SMALL_RMS_THRESHOLD {
+                DOWNSCALE_G
+            } else {
+                DOWNSCALE_G_SMALL_RMS
+            }
+        })
+        .collect()
 }
 
 /// One hardware accumulation group at the given window width
@@ -632,12 +654,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rank32_noise_codes_match_full_device_replay() {
+    fn rank32_noise_values_match_full_device_replay() {
         use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha8Rng;
 
-        let (m, n) = (5, 257); // Asymmetric output with multiple rows.
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let (m, n) = (3usize, 1025usize);
+        let mut rng = ChaCha8Rng::seed_from_u64(51);
         let mut codes = |len| {
             (0..len)
                 .map(|_| {
@@ -656,17 +678,19 @@ mod tests {
             *code = if i % 2 == 0 { 0x38 } else { 0xb8 };
         }
         for device in Device::ALL {
-            let expected: Vec<u16> = device
+            let expected: Vec<u32> = device
                 .matmul_fp8(&a, &b, None, m, n, MMA_GROUP_PRODUCTS)
                 .unwrap()
                 .into_iter()
-                .map(fp32_to_bf16_rne)
+                .map(f32::to_bits)
                 .collect();
-            assert_eq!(
-                device.matmul_fp8_bf16(&a, &b, m, n, MMA_GROUP_PRODUCTS).unwrap(),
-                expected,
-                "{device:?}"
-            );
+            let actual: Vec<u32> = device
+                .matmul_fp8_parallel(&a, &b, m, n, MMA_GROUP_PRODUCTS)
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            assert_eq!(actual, expected, "{device:?}");
         }
 
         // Exercise every finite FP8 operand pair, including both zero signs.
@@ -676,24 +700,24 @@ mod tests {
             .collect();
         let rows = uniform_rows.len() / MMA_GROUP_PRODUCTS;
         for device in Device::ALL {
-            let expected: Vec<u16> = device
+            let expected: Vec<u32> = device
                 .matmul_fp8(&uniform_rows, &uniform_rows, None, rows, rows, MMA_GROUP_PRODUCTS)
                 .unwrap()
                 .into_iter()
-                .map(fp32_to_bf16_rne)
+                .map(f32::to_bits)
                 .collect();
-            assert_eq!(
-                device
-                    .matmul_fp8_bf16(&uniform_rows, &uniform_rows, rows, rows, MMA_GROUP_PRODUCTS)
-                    .unwrap(),
-                expected,
-                "{device:?} operand pairs"
-            );
+            let actual: Vec<u32> = device
+                .matmul_fp8_parallel(&uniform_rows, &uniform_rows, rows, rows, MMA_GROUP_PRODUCTS)
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            assert_eq!(actual, expected, "{device:?} operand pairs");
         }
     }
 
     #[test]
-    fn bf16_noise_replay_supports_independent_rank() {
+    fn parallel_noise_replay_supports_independent_rank() {
         use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha8Rng;
 
@@ -711,11 +735,12 @@ mod tests {
                 let a = codes(m * rank);
                 let b = codes(n * rank);
                 for device in Device::ALL {
-                    let actual = device.matmul_fp8_bf16(&a, &b, m, n, rank);
+                    let actual = device.matmul_fp8_parallel(&a, &b, m, n, rank);
                     match device.matmul_fp8(&a, &b, None, m, n, rank) {
                         Ok(values) => {
-                            let expected: Vec<_> = values.into_iter().map(fp32_to_bf16_rne).collect();
-                            assert_eq!(actual.unwrap(), expected, "{device:?} {m}x{n} rank={rank}");
+                            let expected: Vec<u32> = values.into_iter().map(f32::to_bits).collect();
+                            let actual: Vec<u32> = actual.unwrap().into_iter().map(f32::to_bits).collect();
+                            assert_eq!(actual, expected, "{device:?} {m}x{n} rank={rank}");
                         }
                         Err(_) => assert!(actual.is_err(), "{device:?} {m}x{n} rank={rank}"),
                     }

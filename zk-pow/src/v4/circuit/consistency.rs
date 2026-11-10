@@ -1,4 +1,4 @@
-//! One job, twenty traces, every CTL channel balanced.
+//! One job, device-specific traces, every CTL channel balanced.
 //!
 //! [`build_fixture`] assembles the same fixture the real verifier parses and generates every
 //! main table's trace from that one witness — InputQuant consumes the opened strips, Scale
@@ -11,7 +11,7 @@
 //! - this module's channel-balance test, which checks every AIR's constraints on its own
 //!   trace, every program's `known_values` (class (a) recompute) against its trace's leading
 //!   columns, every committed-LUT instance against the committed tables
-//!   ([`LutChecker`]), and the balance of all 23 CTL channels over the full 21-table batch
+//!   ([`LutChecker`]), and the balance of all device-specific CTL channels over the complete batch
 //!   via starky's `check_ctls`;
 //! - the batch driver's end-to-end proof test (`super::driver`), which proves the same job
 //!   with `starky::batch_prover::batch_prove` and verifies it back.
@@ -30,9 +30,10 @@ use starky::stark::Stark;
 use super::blake3_stark::columns::{Blake3ColumnsView, NUM_BLAKE3_COLUMNS};
 use super::blake3_stark::ctl::blake3_lut_lookups;
 use super::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, Blake3Stark, Blake3TraceInputs, MoeSchedule};
+use super::coefficient_stark::{CoefficientStark, NUM_COEFFICIENT_COLUMNS, coefficient_lookups};
 use super::ctl::{LutTable, NUM_TABLES, Table, all_cross_table_lookups, lut_tables};
 use super::driver::{Fp8PublicData, Fp8System};
-use super::input_quant_stark::columns::{InputQuantColumnsView, NUM_INPUT_QUANT_COLUMNS};
+use super::input_quant_stark::columns::{NUM_B200_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_COLUMNS, input_quant_column_map};
 use super::input_quant_stark::ctl::input_quant_lut_lookups;
 use super::input_quant_stark::stark::{InputQuantProgram, InputQuantStark};
 use super::luts::{LutChecker, lut_trace};
@@ -42,7 +43,7 @@ use super::matmul_b200_stark::{MatmulB200ColumnsView, MatmulStarkB200};
 use super::matmul_h100::columns::NUM_MATMUL_COLUMNS;
 use super::matmul_h100::ctl::matmul_lut_lookups;
 use super::matmul_h100::{MatmulColumnsView, MatmulStarkH100};
-use super::scale_stark::columns::NUM_SCALE_COLUMNS;
+use super::scale_stark::columns::{NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS, NUM_SCALE_COLUMNS};
 use super::scale_stark::ctl::scale_lut_lookups;
 use super::scale_stark::stark::{ScaleProgram, ScaleRowTuple, ScaleStark};
 use super::unpredictability::budget;
@@ -50,6 +51,7 @@ use super::xor_fold_stark::columns::{NUM_XOR_FOLD_COLUMNS, XorFoldColumnsView};
 use super::xor_fold_stark::ctl::xor_fold_lut_lookups;
 use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
 use crate::v2::ffi::plain_proof::MatrixMerkleProof;
+use crate::v4::api::dtype::bf16_to_f32;
 use crate::v4::api::openings::stream_words;
 use crate::v4::api::plain_proof::{MoeWitness, PlainProofV4};
 use crate::v4::api::prequant::BLOCK_SIZE;
@@ -62,6 +64,45 @@ use crate::v4::api::verify::verify_plain_proof;
 
 type F = GoldilocksField;
 const D: usize = 2;
+
+enum InputQuantRows {
+    H100(Vec<[F; NUM_INPUT_QUANT_COLUMNS]>),
+    B200(Vec<[F; NUM_B200_INPUT_QUANT_COLUMNS]>),
+}
+impl InputQuantRows {
+    fn columns(&self) -> Vec<PolynomialValues<F>> {
+        match self {
+            Self::H100(rows) => columns(rows),
+            Self::B200(rows) => columns(rows),
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::H100(rows) => rows.len(),
+            Self::B200(rows) => rows.len(),
+        }
+    }
+}
+
+enum ScaleRows {
+    H100(Vec<[F; NUM_SCALE_COLUMNS]>),
+    B200(Vec<[F; NUM_B200_SCALE_COLUMNS]>),
+}
+
+impl ScaleRows {
+    fn columns(&self) -> Vec<PolynomialValues<F>> {
+        match self {
+            Self::H100(rows) => columns(rows),
+            Self::B200(rows) => columns(rows),
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::H100(rows) => rows.len(),
+            Self::B200(rows) => rows.len(),
+        }
+    }
+}
 
 enum MatmulRows {
     H100(Vec<[F; NUM_MATMUL_COLUMNS]>),
@@ -129,8 +170,8 @@ pub(crate) struct Fp8Fixture {
     pub input_quant: InputQuantProgram,
     pub scale: ScaleProgram,
     pub xor_fold: XorFoldProgram,
-    pub a_noise: Vec<u16>,
-    pub b_noise: Vec<u16>,
+    pub a_noise: Vec<f32>,
+    pub b_noise: Vec<f32>,
     pub public_inputs: [Vec<F>; NUM_TABLES],
     // The witness: the opened strip planes (raw bytes) and Blake3's auxiliary inputs.
     pub a_values: Vec<u8>,
@@ -152,10 +193,23 @@ pub(crate) struct Fp8Fixture {
     pub offsets_hash_id: HashId,
     // The generated traces (row-major) and their geometry.
     pub b3_rows: Vec<[F; NUM_BLAKE3_COLUMNS]>,
-    pub iq_rows: Vec<[F; NUM_INPUT_QUANT_COLUMNS]>,
-    pub scale_rows: Vec<[F; NUM_SCALE_COLUMNS]>,
+    iq_rows: InputQuantRows,
+    coefficient_rows: Vec<[F; NUM_COEFFICIENT_COLUMNS]>,
+    scale_rows: ScaleRows,
     mat_rows: MatmulRows,
     pub xf_rows: Vec<[F; NUM_XOR_FOLD_COLUMNS]>,
+}
+
+impl Fp8Fixture {
+    /// InputQuant's generated trace, column-major, for the device the fixture was built on.
+    pub(crate) fn iq_trace(&self) -> Vec<PolynomialValues<F>> {
+        self.iq_rows.columns()
+    }
+
+    /// Scale's generated trace, column-major, for the device the fixture was built on.
+    pub(crate) fn scale_trace(&self) -> Vec<PolynomialValues<F>> {
+        self.scale_rows.columns()
+    }
 }
 
 /// A 16x16 consecutive dense tile at `k = 2048`: sixteen chunks of sixteen
@@ -246,7 +300,8 @@ fn plane_byte(seed: usize, i: usize, j: usize) -> u8 {
     x ^= x >> 31;
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x ^= x >> 27;
-    (x % 251) as u8
+    // A centered triangular distribution keeps honest rows above the Gaussian threshold.
+    ((x & 127) as i16 + ((x >> 16) & 127) as i16 - 127) as i8 as u8
 }
 
 /// [`fixture_job_with`] with the given committed A rows' int8 values zeroed (scales stay
@@ -482,66 +537,97 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
     let le_codes = |bytes: &[u8]| -> Vec<u16> { bytes.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes(*p)).collect() };
     let a_scale_codes = le_codes(private.operands.a.scales.as_bytes());
     let b_scale_codes = le_codes(private.operands.b.scales.as_bytes());
-    // Normal-or-zero bf16 noise codes (the real ones are `(E @ F)[elem]`, recomputed natively).
-    let noise = |len: usize, salt: u64| -> Vec<u16> {
+    // Public noise values are binary32; this fixture uses exactly representable values.
+    let noise = |len: usize, salt: u64| -> Vec<f32> {
         const POOL: [u16; 8] = [0x0000, 0x3F80, 0xBF00, 0x3E80, 0x4000, 0xBF80, 0x3D80, 0xC000];
         (0..len)
-            .map(|i| POOL[((i as u64).wrapping_mul(salt) >> 7) as usize % POOL.len()])
+            .map(|i| bf16_to_f32(POOL[((i as u64).wrapping_mul(salt) >> 7) as usize % POOL.len()]))
             .collect()
     };
     let a_noise = noise(h * k, 0xD1B54A32D192ED03);
     let b_noise = noise(w * k, 0x2545F4914F6CDD1D);
-    let (iq_rows, iq_pis) = iq_program.generate_trace::<F>(&a_int8, &a_scale_codes, &a_noise, &b_int8, &b_scale_codes, &b_noise);
+    let (iq_rows, iq_pis) = match public.common().device {
+        Device::H100 => {
+            let (rows, inputs) = iq_program.generate_trace::<F, NUM_INPUT_QUANT_COLUMNS>(
+                &a_int8,
+                &a_scale_codes,
+                &a_noise,
+                &b_int8,
+                &b_scale_codes,
+                &b_noise,
+            );
+            (InputQuantRows::H100(rows), inputs)
+        }
+        Device::B200 => {
+            let (rows, inputs) = iq_program.generate_trace::<F, NUM_B200_INPUT_QUANT_COLUMNS>(
+                &a_int8,
+                &a_scale_codes,
+                &a_noise,
+                &b_int8,
+                &b_scale_codes,
+                &b_noise,
+            );
+            (InputQuantRows::B200(rows), inputs)
+        }
+    };
+    let iq_columns = iq_rows.columns();
+    let input_map = input_quant_column_map(public.common().device);
+    let value = |column: usize, row: usize| to_u64(iq_columns[column].values[row]);
 
     // ---- ScaleStark: one tuple per matrix row, exactly what InputQuant committed. ----
     let scale_program = ScaleProgram::new_for_device(h, w, k, r, public.common().device);
-    let tuples = |b_side: bool| -> Vec<ScaleRowTuple> {
-        (0..if b_side { w } else { h })
-            .map(|g| {
-                let v: &InputQuantColumnsView<F> = iq_rows[g * k + k - 1].borrow();
-                if b_side {
-                    ScaleRowTuple {
-                        l2_frame_sum: to_u64(v.block_l2_b.running_l2_frame_sum),
-                        frame_doubled_scale_exponent: to_u64(v.block_l2_b.frame_doubled_scale_exponent) as u32,
-                        max_abs: to_u64(v.max_abs_b) as u32,
-                        dead_count: to_u64(v.dead_count_b) as u32,
-                    }
-                } else {
-                    ScaleRowTuple {
-                        l2_frame_sum: to_u64(v.block_l2_a.running_l2_frame_sum),
-                        frame_doubled_scale_exponent: to_u64(v.block_l2_a.frame_doubled_scale_exponent) as u32,
-                        max_abs: to_u64(v.max_abs_a) as u32,
-                        dead_count: to_u64(v.dead_count_a) as u32,
-                    }
+    let tuples = |is_b: bool| -> Vec<ScaleRowTuple> {
+        let side = &input_map.sides[usize::from(is_b)];
+        (0..if is_b { w } else { h })
+            .map(|group| {
+                let row = group * k + k - 1;
+                ScaleRowTuple {
+                    l2_frame_sum: value(side.block_l2.running_l2_frame_sum, row),
+                    frame_doubled_scale_exponent: value(side.block_l2.frame_doubled_scale_exponent, row) as u32,
+                    max_abs: value(side.max_abs, row) as u32,
+                    dead_count: value(side.dead_count, row) as u32,
                 }
             })
             .collect()
     };
-    let (scale_rows, scale_pis) = scale_program.generate_trace::<F>(&tuples(false), &tuples(true));
-
-    // ---- Matmul: the noised fp8 codes and summand scores InputQuant committed (same element
-    // order; live rows only — past `h*k`/`w*k` the InputQuant trace is the dead phantom
-    // fill). ----
-    let codes = |b_side: bool| -> Vec<u8> {
-        let live = if b_side { w * k } else { h * k };
-        iq_rows[..live]
-            .iter()
-            .map(|r| {
-                let v: &InputQuantColumnsView<F> = r.borrow();
-                to_u64(if b_side { v.code_noised_b } else { v.code_noised_a }) as u8
-            })
+    let scale_pis = scale_program.public_inputs_for_device::<F>();
+    let scale_rows = match &iq_rows {
+        InputQuantRows::H100(_) => ScaleRows::H100(scale_program.generate_trace::<F>(&tuples(false), &tuples(true)).0),
+        InputQuantRows::B200(rows) => {
+            let map = &super::input_quant_stark::columns::B200_INPUT_QUANT_COL_MAP;
+            let sums: Vec<_> = [(&map.a, h), (&map.b, w)]
+                .into_iter()
+                .flat_map(|(side, count)| (0..count).map(move |group| to_u64(rows[group * k + k - 1][side.security_sum])))
+                .collect();
+            ScaleRows::B200(scale_program.generate_b200_trace::<F>(&tuples(false), &tuples(true), &sums))
+        }
+    };
+    let codes = |is_b: bool| -> Vec<u8> {
+        let index = usize::from(is_b);
+        let column = input_map
+            .downscale
+            .map_or(input_map.sides[index].code_noised, |(_, sides)| sides[index].output_code);
+        (0..if is_b { w * k } else { h * k })
+            .map(|row| value(column, row) as u8)
             .collect()
     };
-    let lambdas = |b_side: bool| -> Vec<u64> {
-        let live = if b_side { w * k } else { h * k };
-        iq_rows[..live]
-            .iter()
-            .map(|r| {
-                let v: &InputQuantColumnsView<F> = r.borrow();
-                to_u64(if b_side { v.lambda_b } else { v.lambda_a })
-            })
+    let lambdas = |is_b: bool| -> Vec<u64> {
+        let side = &input_map.sides[usize::from(is_b)];
+        (0..if is_b { w * k } else { h * k })
+            .map(|row| value(side.lambda, row))
             .collect()
     };
+    let mut blocks = Vec::new();
+    for (index, scales) in [&a_scale_codes, &b_scale_codes].into_iter().enumerate() {
+        let side = &input_map.sides[index];
+        for (block, &scale) in scales.iter().enumerate() {
+            blocks.push([
+                (128 * value(side.alpha_exp, 8 * block) + value(side.alpha_mantissa, 8 * block)) as u16,
+                scale,
+            ]);
+        }
+    }
+    let coefficient_rows = CoefficientStark::<F, D>::new(h, w, k).generate_trace(&blocks).unwrap();
     let mut cell_words = vec![0u32; h * w];
     let mut cell_skips = vec![0u64; h * w];
     let (mat_rows, mat_pis) = match public.common().device {
@@ -662,7 +748,14 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
         xor_fold: xf_program,
         a_noise,
         b_noise,
-        public_inputs: [b3_pis.to_vec(), iq_pis.to_vec(), scale_pis.to_vec(), mat_pis, xf_pis.to_vec()],
+        public_inputs: [
+            b3_pis.to_vec(),
+            iq_pis.to_vec(),
+            scale_pis.to_vec(),
+            mat_pis,
+            xf_pis.to_vec(),
+            vec![],
+        ],
         a_values,
         a_scales,
         b_values,
@@ -680,6 +773,7 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
         offsets_hash_id,
         b3_rows,
         iq_rows,
+        coefficient_rows,
         scale_rows,
         mat_rows,
         xf_rows,
@@ -688,7 +782,7 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
 
 /// The end-to-end consistency driver: every AIR satisfied on its own trace, class (a)
 /// recompute bit-exact with the traces, every LUT instance served by the
-/// committed oracle, and all 23 CTL channels balanced over the full 21-table batch.
+/// committed oracle, and all device-specific CTL channels balanced over the complete batch.
 fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     let (h, w, k) = (fx.input_quant.h, fx.input_quant.w, fx.input_quant.k);
 
@@ -709,10 +803,11 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     // the LUT traces are appended below once their multiplicities are known). ----
     let mut traces = vec![
         columns(&fx.b3_rows),
-        columns(&fx.iq_rows),
-        columns(&fx.scale_rows),
+        fx.iq_rows.columns(),
+        fx.scale_rows.columns(),
         fx.mat_rows.columns(),
         columns(&fx.xf_rows),
+        columns(&fx.coefficient_rows),
     ];
 
     // ---- Class (a) ("known") columns: every program's `known_values` — recomputed from the
@@ -759,7 +854,7 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
         .unwrap();
     checker
         .check_trace(
-            &input_quant_lut_lookups::<F>(),
+            &input_quant_lut_lookups::<F>(fx.scale.device),
             &traces[1],
             &fx.public_inputs[1],
             "InputQuant",
@@ -778,13 +873,16 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     checker
         .check_trace(&xor_fold_lut_lookups::<F>(), &traces[4], &fx.public_inputs[4], "XorFold")
         .unwrap();
+    checker
+        .check_trace(&coefficient_lookups::<F>(), &traces[5], &[], "Coefficient")
+        .unwrap();
     // Unfiltered inventories give exact totals: RNERND x6 per InputQuant row and x3 per Scale
     // row; the Matmul backend table (B200ALIGN) x32 per Matmul row (one per
     // lane of the accumulation group).
     let mults = &checker.multiplicities;
     assert_eq!(
         mults.table_total(LutTable::RneRnd),
-        (6 * fx.iq_rows.len() + 3 * fx.scale_rows.len()) as u64
+        (2 * fx.iq_rows.len() + 3 * fx.scale_rows.len()) as u64
     );
     let matmul_table = match fx.scale.device {
         Device::H100 => LutTable::ProdAlign15,
@@ -805,13 +903,35 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     // ---- Every AIR satisfied on its own trace (the LUT AIRs have no constraints). ----
     let pis: [&[F]; NUM_TABLES] = core::array::from_fn(|t| fx.public_inputs[t].as_slice());
     assert_constraints!(Blake3Stark::<F, D>::new(fx.blake3), &fx.b3_rows, pis[0], "Blake3");
+    match &fx.iq_rows {
+        InputQuantRows::H100(rows) => assert_constraints!(
+            InputQuantStark::<F, D, NUM_INPUT_QUANT_COLUMNS>::new(fx.input_quant.clone()),
+            rows,
+            pis[1],
+            "InputQuant H100"
+        ),
+        InputQuantRows::B200(rows) => assert_constraints!(
+            InputQuantStark::<F, D, NUM_B200_INPUT_QUANT_COLUMNS>::new(fx.input_quant.clone()),
+            rows,
+            pis[1],
+            "InputQuant B200"
+        ),
+    }
     assert_constraints!(
-        InputQuantStark::<F, D>::new(fx.input_quant),
-        &fx.iq_rows,
-        pis[1],
-        "InputQuant"
+        CoefficientStark::<F, D>::new(h, w, k),
+        &fx.coefficient_rows,
+        pis[5],
+        "Coefficient"
     );
-    assert_constraints!(ScaleStark::<F, D>::new(fx.scale), &fx.scale_rows, pis[2], "Scale");
+    match &fx.scale_rows {
+        ScaleRows::H100(rows) => assert_constraints!(ScaleStark::<F, D>::new(fx.scale), rows, pis[2], "Scale"),
+        ScaleRows::B200(rows) => assert_constraints!(
+            ScaleStark::<F, D, NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS>::new(fx.scale),
+            rows,
+            pis[2],
+            "B200 Scale"
+        ),
+    }
     match &fx.mat_rows {
         MatmulRows::H100(rows) => assert_constraints!(MatmulStarkH100::<F, D>::new(h, w, k), rows, pis[3], "Matmul"),
         MatmulRows::B200(rows) => {
@@ -937,7 +1057,7 @@ fn moe_tampered_offsets_root_fails_parse_and_verify() {
 /// protocol-legal all-zero-row envelope (ledger N5). The scheme floors both norms at `2^-32`,
 /// alpha stays finite, beta strictly positive, and that row's noised elements are pure noise;
 /// every AIR (InputQuant's floored witness, ScaleStark's in-circuit H0 floors, Matmul on the
-/// noise-only codes), the class (a) recompute, the LUT domains and all 23 CTL channels must
+/// noise-only codes), the class (a) recompute, the LUT domains and all device-specific CTL channels must
 /// still close. Regression: the InputQuant witness used to derive alpha from the unfloored
 /// zero norms and panic.
 #[test]
