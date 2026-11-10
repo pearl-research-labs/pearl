@@ -1349,7 +1349,7 @@ impl Blake3Program {
     /// `chain_carry`, the finalization states 1-3, and `cv_out_freq` / `row_flags_packed`.
     ///
     /// Every per-row piece runs across all cores:
-    /// - the buffer is gathered per row from a materialized 2-words-per-row stream
+    /// - the buffer is gathered per row from the borrowed live-message stream
     ///   (`buffer[r][w] = stream[2r - 14 + w]`, zero outside the stream);
     /// - `chain_carry` is a parallel per-chunk data scan plus a serial combine over
     ///   chunk boundaries only (the routing/offsets data rows are a tiny fraction);
@@ -1391,17 +1391,8 @@ impl Blake3Program {
         // ---- in). This makes the unconditional shift-by-2 (constraint 5a) hold everywhere,
         // ---- and the CV-window pins (5b) are consistent automatically because the fetched
         // ---- CVs are message words. Matches the deployed generator's row layout.
-        let stream: Vec<u32> = (0..num_rows)
-            .into_par_iter()
-            .flat_map(|r| {
-                if r < num_live {
-                    let (c, j) = (r / ROWS_PER_COMPRESSION, r % ROWS_PER_COMPRESSION);
-                    [msgs[c][2 * j], msgs[c][2 * j + 1]]
-                } else {
-                    [0u32; 2]
-                }
-            })
-            .collect();
+        // Messages already form the live stream; padding reads implicit zeros.
+        let stream = &msgs.as_flattened()[..2 * num_live];
         rows.par_chunks_mut(1024).enumerate().for_each(|(chunk, out)| {
             for (i, row) in out.iter_mut().enumerate() {
                 let r = chunk * 1024 + i;
@@ -1417,6 +1408,9 @@ impl Blake3Program {
                 });
                 let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
                 row.blake3_msg_buffer = window;
+                // All flags are final before the tail's state-only passes.
+                row.cv_out_freq = F::from_canonical_u64(freq[r]);
+                row.row_flags_packed = pack_control(row);
             }
         });
         // Wrap fixup: the unconditional shift also binds the last -> first row pair, so rows
@@ -1454,7 +1448,7 @@ impl Blake3Program {
         // ---- constraint is cyclic (row 0 checks against the last row), so the seed is the
         // ---- end-of-trace value. Three phases: per-chunk data lists in parallel, a serial
         // ---- combine over the (few) data rows, then a parallel per-row merge per chunk. ----
-        const CARRY_CHUNK: usize = 8192;
+        const CARRY_CHUNK: usize = 1024;
         let n_chunks = num_rows.div_ceil(CARRY_CHUNK);
         let data_lists: Vec<Vec<(usize, u64)>> = (0..n_chunks)
             .into_par_iter()
@@ -1564,16 +1558,6 @@ impl Blake3Program {
                     write_state(&mut *core::ptr::addr_of_mut!((*row).round[2]), &s2, B_ROTATIONS[2]);
                     write_state(&mut *core::ptr::addr_of_mut!((*row).round[3]), &s3, B_ROTATIONS[3]);
                 }
-            }
-        });
-
-        // ---- CV-routing multiplicities and the ROW_FLAGS_PACKED packing. ----
-        rows.par_chunks_mut(1024).enumerate().for_each(|(chunk, out)| {
-            for (i, row) in out.iter_mut().enumerate() {
-                let r = chunk * 1024 + i;
-                let row: &mut Blake3ColumnsView<F> = row.borrow_mut();
-                row.cv_out_freq = F::from_canonical_u64(freq[r]);
-                row.row_flags_packed = pack_control(row);
             }
         });
     }
