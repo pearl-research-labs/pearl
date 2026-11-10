@@ -124,6 +124,20 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> Vec<Vec<F>> {
         let degree = polynomials[0].len();
 
+        // With few columns and a large blowup, parallelize the smaller coset FFTs.
+        let parallel_cosets =
+            rate_bits >= 4 && polynomials.len() * 2 < rayon::current_num_threads();
+        let small_roots = parallel_cosets.then(|| crate::field::fft::fft_root_table(degree));
+        let shifts: Vec<_> = if parallel_cosets {
+            F::primitive_root_of_unity(log2_strict(degree) + rate_bits)
+                .powers()
+                .take(1 << rate_bits)
+                .map(|w| F::coset_shift() * w)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // If blinding, salt with two random elements to each leaf vector.
         let salt_size = if blinding { SALT_SIZE } else { 0 };
 
@@ -131,9 +145,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                p.lde(rate_bits)
-                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
-                    .values
+                if let Some(roots) = &small_roots {
+                    Self::lde_on_cosets(p, &shifts, roots)
+                } else {
+                    p.lde(rate_bits)
+                        .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                        .values
+                }
             })
             .chain(
                 (0..salt_size)
@@ -141,6 +159,26 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     .map(|_| F::rand_vec(degree << rate_bits)),
             )
             .collect()
+    }
+
+    /// Evaluates `p` on the cosets in `shifts`, using degree-sized FFT roots.
+    /// Returns natural LDE order: index `j + shifts.len() * k` selects coset `j`,
+    /// point `k`, where `shifts[j] = coset_shift * full_domain_root^j`.
+    fn lde_on_cosets(p: &PolynomialCoeffs<F>, shifts: &[F], roots: &FftRootTable<F>) -> Vec<F> {
+        let cosets: Vec<_> = shifts
+            .par_iter()
+            .map(|&shift| p.coset_fft_with_options(shift, None, Some(roots)).values)
+            .collect();
+        let mut values = vec![F::ZERO; p.len() * shifts.len()];
+        values
+            .par_chunks_mut(shifts.len())
+            .enumerate()
+            .for_each(|(k, row)| {
+                for (j, value) in row.iter_mut().enumerate() {
+                    *value = cosets[j][k];
+                }
+            });
+        values
     }
 
     /// Fetches LDE values at the `index * step`th point.
@@ -271,6 +309,56 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 max_num_query_steps,
                 timing,
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn small_coset_ldes_match_original_fft() {
+        type F = GoldilocksField;
+        type C = PoseidonGoldilocksConfig;
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for degree_bits in [6, 10] {
+                    let p = PolynomialCoeffs::new(
+                        (0..1 << degree_bits)
+                            .map(|i| {
+                                F::from_noncanonical_u64(
+                                    (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                                )
+                            })
+                            .collect(),
+                    );
+                    for rate_bits in [0, 1, 3, 4, 8] {
+                        let roots = crate::field::fft::fft_root_table(p.len() << rate_bits);
+                        let expected = p
+                            .lde(rate_bits)
+                            .coset_fft_with_options(F::coset_shift(), Some(rate_bits), Some(&roots))
+                            .values;
+                        for cached_roots in [None, Some(&roots)] {
+                            assert_eq!(
+                                PolynomialBatch::<F, C, 2>::lde_values(
+                                    core::slice::from_ref(&p),
+                                    rate_bits,
+                                    false,
+                                    cached_roots
+                                ),
+                                vec![expected.clone()]
+                            );
+                        }
+                    }
+                }
+            });
         }
     }
 }
