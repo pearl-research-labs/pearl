@@ -95,8 +95,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
         );
 
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
+        let leaves = timed!(timing, "transpose LDEs", {
+            if lde_values.len() <= 32 {
+                crate::util::transpose_bitrev(&lde_values)
+            } else {
+                let mut leaves = transpose(&lde_values);
+                reverse_index_bits_in_place(&mut leaves);
+                leaves
+            }
+        });
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
@@ -294,7 +301,25 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
 
         let (lde_final_poly, lde_final_values) = {
-            let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
+            let rate_bits = fri_params.config.rate_bits;
+            let padded_len = final_poly.len() << rate_bits;
+            let lde_final_poly = if rate_bits >= 4 && padded_len >= 1 << 18 {
+                PolynomialCoeffs::new(
+                    (0..padded_len)
+                        .into_par_iter()
+                        .with_min_len(4096)
+                        .map(|i| {
+                            final_poly
+                                .coeffs
+                                .get(i)
+                                .copied()
+                                .unwrap_or(F::Extension::ZERO)
+                        })
+                        .collect(),
+                )
+            } else {
+                final_poly.lde(rate_bits)
+            };
             let lde_final_values = timed!(
                 timing,
                 &format!("perform final FFT {}", lde_final_poly.len()),

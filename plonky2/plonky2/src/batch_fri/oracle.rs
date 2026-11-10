@@ -418,7 +418,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     // per-run sweeps suffered behind the tall instance.
                     let mut composition_poly = PolynomialCoeffs::<F::Extension>::zero(degree);
                     {
-                        const TILE: usize = 4096;
+                        const TILE: usize = 1024;
                         composition_poly
                             .coeffs
                             .par_chunks_mut(TILE)

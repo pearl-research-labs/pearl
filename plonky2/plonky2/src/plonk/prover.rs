@@ -929,7 +929,67 @@ fn compute_quotient_polys<
             for batch in &quotient_batches {
                 values.extend_from_slice(&batch[challenge]);
             }
-            PolynomialValues::new(values).coset_ifft(F::coset_shift())
+            coset_ifft_parallel(PolynomialValues::new(values), F::coset_shift())
         })
         .collect()
+}
+
+/// Interpolates coset evaluations in natural order, using the existing parallel FFT
+/// for large inputs. Inverse normalization and coset scaling are fused in one pass.
+fn coset_ifft_parallel<F: RichField>(values: PolynomialValues<F>, shift: F) -> PolynomialCoeffs<F> {
+    let n = values.len();
+    if n < (1 << 18) {
+        return values.coset_ifft(shift);
+    }
+    let norm = F::inverse_2exp(crate::util::log2_strict(n));
+    let inv_shift = shift.inverse();
+    let transformed = crate::util::fft_par::fft_par(PolynomialCoeffs::new(values.values));
+    let mut coeffs = vec![F::ZERO; n];
+    coeffs
+        .par_chunks_mut(4096)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let start = ci * 4096;
+            let mut w = norm * inv_shift.exp_u64(start as u64);
+            for (offset, value) in chunk.iter_mut().enumerate() {
+                let index = start + offset;
+                *value = transformed.values[if index == 0 { 0 } else { n - index }] * w;
+                w *= inv_shift;
+            }
+        });
+    PolynomialCoeffs::new(coeffs)
+}
+
+#[cfg(test)]
+mod parallel_interpolation_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField as F;
+    #[test]
+    fn parallel_coset_ifft_matches_serial() {
+        for threads in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    for bits in [0, 1, 10, 18, 19] {
+                        let values = PolynomialValues::new(
+                            (0..1 << bits)
+                                .map(|i| {
+                                    F::from_noncanonical_u64(
+                                        (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                                    )
+                                })
+                                .collect(),
+                        );
+                        for shift in [F::ONE, F::coset_shift()] {
+                            assert_eq!(
+                                coset_ifft_parallel(values.clone(), shift),
+                                values.clone().coset_ifft(shift)
+                            );
+                        }
+                    }
+                });
+        }
+    }
 }
