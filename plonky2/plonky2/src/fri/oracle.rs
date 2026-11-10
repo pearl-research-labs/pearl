@@ -136,11 +136,19 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let parallel_cosets = rate_bits >= 4
             && (polynomials.len() * 2 < rayon::current_num_threads()
                 || (rate_bits >= 8 && degree <= 1 << 13));
-        let small_roots = parallel_cosets.then(|| crate::field::fft::fft_root_table(degree));
+        // Fewer, longer cosets amortize task and interleaving costs for small inputs.
+        let coset_bits = if rate_bits >= 8 && degree <= 1 << 13 {
+            5
+        } else {
+            rate_bits
+        };
+        let padding_bits = rate_bits - coset_bits;
+        let small_roots =
+            parallel_cosets.then(|| crate::field::fft::fft_root_table(degree << padding_bits));
         let shifts: Vec<_> = if parallel_cosets {
             F::primitive_root_of_unity(log2_strict(degree) + rate_bits)
                 .powers()
-                .take(1 << rate_bits)
+                .take(1 << coset_bits)
                 .map(|w| F::coset_shift() * w)
                 .collect()
         } else {
@@ -155,7 +163,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
                 if let Some(roots) = &small_roots {
-                    Self::lde_on_cosets(p, &shifts, roots)
+                    Self::lde_on_cosets(p, &shifts, roots, padding_bits)
                 } else if rate_bits >= 2
                     && degree << rate_bits >= 1 << 18
                     && polynomials.len() * 2 < rayon::current_num_threads()
@@ -185,15 +193,29 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .collect()
     }
 
-    /// Evaluates `p` on the cosets in `shifts`, using degree-sized FFT roots.
+    /// Evaluates `p` on `shifts`, padding each FFT by `2^padding_bits`.
+    /// `roots` must match that padded length.
     /// Returns natural LDE order: index `j + shifts.len() * k` selects coset `j`,
     /// point `k`, where `shifts[j] = coset_shift * full_domain_root^j`.
-    fn lde_on_cosets(p: &PolynomialCoeffs<F>, shifts: &[F], roots: &FftRootTable<F>) -> Vec<F> {
+    fn lde_on_cosets(
+        p: &PolynomialCoeffs<F>,
+        shifts: &[F],
+        roots: &FftRootTable<F>,
+        padding_bits: usize,
+    ) -> Vec<F> {
+        let fft_len = p.len() << padding_bits;
         let cosets: Vec<_> = shifts
             .par_iter()
-            .map(|&shift| p.coset_fft_with_options(shift, None, Some(roots)).values)
+            .map(|&shift| {
+                let mut coeffs: Vec<_> =
+                    shift.powers().zip(&p.coeffs).map(|(w, &x)| w * x).collect();
+                coeffs.resize(fft_len, F::ZERO);
+                PolynomialCoeffs::new(coeffs)
+                    .fft_with_options(Some(padding_bits), Some(roots))
+                    .values
+            })
             .collect();
-        let mut values = vec![F::ZERO; p.len() * shifts.len()];
+        let mut values = vec![F::ZERO; fft_len * shifts.len()];
         values
             .par_chunks_mut(shifts.len())
             .enumerate()
@@ -432,7 +454,7 @@ mod tests {
                             })
                             .collect(),
                     );
-                    for rate_bits in [0, 1, 3, 4, 8] {
+                    for rate_bits in [0, 1, 3, 4, 8, 9] {
                         let roots = crate::field::fft::fft_root_table(p.len() << rate_bits);
                         let expected = p
                             .lde(rate_bits)
