@@ -70,7 +70,11 @@ pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, i
             rate_bits,
             cap_height: 5,
             proof_of_work_bits: pow_bits as u32,
-            batching_proof_of_work_bits: if stage == 2 { STAGE_2_POW_BITS as u32 } else { STAGE_1_POW_BITS as u32 },
+            batching_proof_of_work_bits: if stage == 2 {
+                STAGE_2_POW_BITS as u32
+            } else {
+                STAGE_1_POW_BITS as u32
+            },
             reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
             num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
         },

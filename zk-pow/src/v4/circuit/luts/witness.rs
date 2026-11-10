@@ -7,10 +7,10 @@ use plonky2::field::types::{Field, PrimeField64};
 
 use super::LutTable;
 use super::columns::{lut_live_rows, num_slots};
-use starky::lookup::Column;
 use super::ctl::LutLookup;
 use super::stark::generate;
 use crate::v4::circuit::trace_padding::trace_padded_height;
+use starky::lookup::Column;
 
 /// The per-proof half of the committed oracle: for every table, one count column per slot —
 /// `counts[device LUT position][slot][row]`. Filled by
