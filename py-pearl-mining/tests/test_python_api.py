@@ -562,7 +562,9 @@ class TestMerkleTreeFromBuffer:
         tree = pearl_mining.MerkleTree.from_buffer(memoryview(data).cast("b"), self.KEY)
         assert tree.root == expected
 
-    def test_rejects_non_contiguous_buffer(self):
-        strided = memoryview(bytes(4096)).cast("b")[::2]
-        with pytest.raises(ValueError, match="C-contiguous"):
-            pearl_mining.MerkleTree.from_buffer(strided, self.KEY)
+    def test_root_of_non_contiguous_buffer(self):
+        strided = memoryview(bytes(i % 256 for i in range(4096))).cast("b")[::2]
+        expected = pearl_mining.MerkleTree(
+            pearl_mining.pad_to_chunk_boundary(strided.tobytes()), self.KEY
+        ).root
+        assert pearl_mining.MerkleTree.from_buffer(strided, self.KEY).root == expected

@@ -28,15 +28,12 @@ impl MerkleTree {
     #[staticmethod]
     #[pyo3(name = "from_buffer", signature = (data, key))]
     fn py_from_buffer(py: Python<'_>, data: PyBuffer<i8>, key: Digest) -> PyResult<Self> {
-        if !data.is_c_contiguous() {
-            return Err(PyValueError::new_err("data must be C-contiguous"));
-        }
-        let (addr, len) = (data.buf_ptr() as usize, data.len_bytes());
-        Ok(py.allow_threads(|| {
-            let mut padded = vec![0u8; padded_chunk_len(len)];
-            unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, padded.as_mut_ptr(), len) };
-            Self::from_vec(padded, key)
-        }))
+        let len = data.item_count();
+        let mut padded = vec![0u8; padded_chunk_len(len)];
+        let target =
+            unsafe { std::slice::from_raw_parts_mut(padded.as_mut_ptr().cast::<i8>(), len) };
+        data.copy_to_slice(py, target)?;
+        Ok(py.allow_threads(|| Self::from_vec(padded, key)))
     }
 
     #[getter(root)]
