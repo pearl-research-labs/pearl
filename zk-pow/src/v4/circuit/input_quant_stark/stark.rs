@@ -380,7 +380,7 @@ impl InputQuantProgram {
         for col in cols.iter() {
             assert_eq!(col.len(), num_rows, "direct fill column length");
         }
-        const TILE: usize = 4096;
+        const TILE: usize = 1024;
 
         let group_final_inv: Vec<F> = (0..k)
             .map(|j| {
