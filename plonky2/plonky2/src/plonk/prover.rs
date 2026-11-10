@@ -798,9 +798,9 @@ fn compute_quotient_polys<
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
-    let quotient_values: Vec<Vec<F>> = points_batches
+    let quotient_batches: Vec<Vec<Vec<F>>> = points_batches
         .enumerate()
-        .flat_map(|(batch_i, xs_batch)| {
+        .map(|(batch_i, xs_batch)| {
             // Each batch must be the same size, except the last one, which may be smaller.
             debug_assert!(
                 xs_batch.len() == BATCH_SIZE
@@ -917,19 +917,19 @@ fn compute_quotient_polys<
                     .iter_mut()
                     .for_each(|v| *v *= denominator_inv);
             }
-            quotient_values_batch
+            // Transpose and free point vectors on the worker that produced them.
+            transpose(&quotient_values_batch)
         })
         .collect();
 
-    let quotient_columns = transpose(&quotient_values);
-    // Dispose of point vectors across workers before transforming the columns.
-    quotient_values
+    (0..num_challenges)
         .into_par_iter()
-        .with_min_len(1 << 13)
-        .for_each(drop);
-    quotient_columns
-        .into_par_iter()
-        .map(PolynomialValues::new)
-        .map(|values| values.coset_ifft(F::coset_shift()))
+        .map(|challenge| {
+            let mut values = Vec::with_capacity(points.len());
+            for batch in &quotient_batches {
+                values.extend_from_slice(&batch[challenge]);
+            }
+            PolynomialValues::new(values).coset_ifft(F::coset_shift())
+        })
         .collect()
 }
