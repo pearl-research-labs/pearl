@@ -1474,11 +1474,7 @@ pub(crate) fn eval_scale_constraints<V, S, E, const WIDTH: usize, const PUBLIC_I
     let nv: &[V; NUM_SCALE_COLUMNS] = vars.get_next_values()[..NUM_SCALE_COLUMNS].try_into().unwrap();
     let nv: &ScaleColumnsView<V> = nv.borrow();
     let pis = vars.get_public_inputs();
-    const {
-        if WIDTH == NUM_B200_SCALE_COLUMNS {
-            assert!(PUBLIC_INPUTS == NUM_B200_SCALE_PUBLIC_INPUTS);
-        }
-    }
+    let () = ScaleShape::<WIDTH, PUBLIC_INPUTS>::VALID;
     if WIDTH == NUM_B200_SCALE_COLUMNS {
         let row: &[V; NUM_B200_SCALE_COLUMNS] = vars.get_local_values().try_into().unwrap();
         let row: &B200ScaleColumnsView<V> = row.borrow();
@@ -2104,17 +2100,26 @@ pub struct ScaleStark<
     _phantom: PhantomData<F>,
 }
 
+/// Compile-time pairing of a Scale trace width with its public-input count, evaluated at
+/// each monomorphization through `let () = ScaleShape::<W, P>::VALID;`. An associated
+/// const rather than an inline `const { .. }` block: cbindgen 0.26 parses this crate with
+/// syn 1.0, which rejects inline const blocks in statement position.
+struct ScaleShape<const WIDTH: usize, const PUBLIC_INPUTS: usize>;
+
+impl<const WIDTH: usize, const PUBLIC_INPUTS: usize> ScaleShape<WIDTH, PUBLIC_INPUTS> {
+    const VALID: () = assert!(
+        (WIDTH == NUM_SCALE_COLUMNS && PUBLIC_INPUTS == NUM_SCALE_PUBLIC_INPUTS)
+            || (WIDTH == NUM_B200_SCALE_COLUMNS && PUBLIC_INPUTS == NUM_B200_SCALE_PUBLIC_INPUTS),
+        "Scale trace width and public-input count must belong to the same device"
+    );
+}
+
 impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize, const PUBLIC_INPUTS: usize>
     ScaleStark<F, D, WIDTH, PUBLIC_INPUTS>
 {
     pub fn new(program: ScaleProgram) -> Self {
         assert_eq!(program.r, 32, "noise rank must be exactly 32");
-        const {
-            assert!(
-                (WIDTH == NUM_SCALE_COLUMNS && PUBLIC_INPUTS == NUM_SCALE_PUBLIC_INPUTS)
-                    || (WIDTH == NUM_B200_SCALE_COLUMNS && PUBLIC_INPUTS == NUM_B200_SCALE_PUBLIC_INPUTS)
-            );
-        }
+        let () = ScaleShape::<WIDTH, PUBLIC_INPUTS>::VALID;
         if WIDTH == NUM_B200_SCALE_COLUMNS {
             assert_eq!(program.device, Device::B200);
         }

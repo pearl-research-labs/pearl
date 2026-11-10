@@ -538,9 +538,7 @@ mod tests {
         );
         // The lowest possible encoded grid is still high enough that every
         // satisfiable non-skip key fits the RC16 range.
-        const {
-            assert!(2 * LAMBDA_MAX - 128 * 114 - SKIP_THRESHOLD_OFFSET < 1 << 16);
-        }
+        const _: () = assert!(2 * LAMBDA_MAX - 128 * 114 - SKIP_THRESHOLD_OFFSET < 1 << 16);
     }
 
     /// Bounds the integer skip rule's error against the real-valued threshold.
