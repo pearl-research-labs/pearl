@@ -651,6 +651,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// table's inputs from its producer), accumulates the committed-LUT multiplicities,
     /// assembles the LUT traces and runs the batch prover. `preprocessed` is the
     /// setup-time LUT commitment for this job's layout ([`Self::preprocessed_data`]).
+    /// `lut_values` optionally supplies cached fixed LUT columns in committed-table order.
     ///
     /// `derive_statement_digest` receives the lottery digest `J` (the 32-byte
     /// jackpot hash generated with the traces -- the block's shipped claim) and returns the
@@ -660,6 +661,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         witness: &Fp8Witness<'_>,
         derive_statement_digest: impl FnOnce(Hash256) -> Hash256,
         preprocessed: &BatchStarkPreprocessedData<F, C, D>,
+        lut_values: Option<&[Vec<PolynomialValues<F>>]>,
         timing: &mut TimingTree,
     ) -> Result<BatchStarkProofWithPublicInputs<F, C, D>> {
         let [a_values_len, a_scales_len, b_values_len, b_scales_len] = self.plane_lens;
@@ -849,10 +851,18 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             for counter in &counters {
                 checker.multiplicities.merge(&counter.multiplicities);
             }
-            for table in self.lut_tables {
+            for (i, table) in self.lut_tables.into_iter().enumerate() {
                 let label = format!("trace: lut-trace {table:?}");
                 timing.push(&label, log::Level::Debug);
-                let trace = lut_trace::<F>(table, checker.multiplicities.table_columns(table));
+                let multiplicities = checker.multiplicities.table_columns(table);
+                let trace = if let Some(values) = lut_values {
+                    use plonky2_maybe_rayon::{MaybeParIter, ParallelIterator};
+                    let mut trace: Vec<_> = values[i].par_iter().cloned().collect();
+                    trace.extend(multiplicities.into_iter().map(PolynomialValues::new));
+                    trace
+                } else {
+                    lut_trace::<F>(table, multiplicities)
+                };
                 timing.pop();
                 traces.push(trace);
             }
@@ -1477,7 +1487,7 @@ mod tests {
         let cap = preprocessed.cap();
 
         let proof = system
-            .prove::<C>(&witness(&fx), |_| STATEMENT_DIGEST, &preprocessed, &mut timing)
+            .prove::<C>(&witness(&fx), |_| STATEMENT_DIGEST, &preprocessed, None, &mut timing)
             .expect("proving must succeed");
 
         // Verify fails closed on an unbound digest: `fresh` never bound one, while

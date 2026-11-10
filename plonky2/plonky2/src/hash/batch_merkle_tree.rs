@@ -4,6 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use itertools::Itertools;
+use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParIter, ParallelIterator};
 
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::merkle_proofs::MerkleProof;
@@ -83,7 +84,8 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
             } else {
                 // The rest leaf layers
                 let new_leaves: Vec<Vec<F>> = cap
-                    .iter()
+                    .par_iter()
+                    .with_min_len(1 << 13)
                     .enumerate()
                     .map(|(i, cap_hash)| {
                         let mut new_hash = Vec::with_capacity(NUM_HASH_OUT_ELTS + cur[i].len());
