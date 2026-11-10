@@ -10,7 +10,7 @@ use alloc::{vec, vec::Vec};
 use anyhow::{ensure, Result};
 use hashbrown::HashSet;
 use plonky2::batch_fri::oracle::BatchFriOracle;
-use plonky2::field::extension::{Extendable, FieldExtension};
+use plonky2::field::extension::{Extendable, FieldExtension, OEF};
 use plonky2::field::fft::FftRootTable;
 use plonky2::field::packable::Packable;
 use plonky2::field::packed::PackedField;
@@ -1254,14 +1254,34 @@ where
     }
 }
 
-/// Evaluates base-field coefficients at an extension point. Four independent
-/// Horner chains shorten the dependency chain without changing the polynomial.
+/// Evaluates ascending base-field coefficients at `point` with four independent
+/// chains. Quadratic extensions use their trace/norm relation so each chain
+/// needs only base-field multiplications; other extensions use ordinary Horner.
 fn evaluate_opening<F: RichField + Extendable<D>, const D: usize>(
     coefficients: &[F],
     point: F::Extension,
 ) -> F::Extension {
     let step = point * point;
     let step = step * step;
+    if D == 2 {
+        // Y² = trace(Y)Y - norm(Y) for Y in a quadratic extension.
+        let coordinates = step.to_basefield_array();
+        let trace = coordinates[0] + coordinates[0];
+        let norm = coordinates[0] * coordinates[0]
+            - coordinates[1] * coordinates[1] * <F::Extension as OEF<D>>::W;
+        let mut linear = [F::ZERO; 4];
+        let mut constant = [F::ZERO; 4];
+        for chunk in coefficients.chunks(4).rev() {
+            for (i, &coefficient) in chunk.iter().enumerate() {
+                let previous = linear[i];
+                linear[i] = previous * trace + constant[i];
+                constant[i] = coefficient - previous * norm;
+            }
+        }
+        return (0..4).rev().fold(F::Extension::ZERO, |acc, i| {
+            acc * point + step.scalar_mul(linear[i]) + F::Extension::from_basefield(constant[i])
+        });
+    }
     let mut lanes = [F::Extension::ZERO; 4];
     for chunk in coefficients.chunks(4).rev() {
         for (lane, &coefficient) in lanes.iter_mut().zip(chunk) {
