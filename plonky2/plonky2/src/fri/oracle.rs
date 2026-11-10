@@ -156,6 +156,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
                 if let Some(roots) = &small_roots {
                     Self::lde_on_cosets(p, &shifts, roots)
+                } else if rate_bits >= 2
+                    && degree << rate_bits >= 1 << 18
+                    && polynomials.len() * 2 < rayon::current_num_threads()
+                {
+                    crate::util::fft_par::coset_lde_par(&p.coeffs, F::coset_shift(), rate_bits)
+                        .values
                 } else {
                     // Shift only the original coefficients; padding coefficients are zero.
                     let shifted = PolynomialCoeffs::new(
