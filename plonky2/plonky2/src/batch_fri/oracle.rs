@@ -271,11 +271,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let (row_values, digest_leaves): (Vec<_>, Vec<_>) = ranges
             .par_iter()
             .map(|range| {
+                let roots =
+                    crate::field::fft::fft_root_table(polynomials[range.start].len() << rate_bits);
                 let lde = PolynomialBatch::<F, C, D>::lde_values(
                     &polynomials[range.clone()],
                     rate_bits,
                     false,
-                    None,
+                    Some(&roots),
                 );
                 let rows = transpose_bitrev(&lde);
                 let digests = hash_leaf_rows::<F, C, D>(&rows);

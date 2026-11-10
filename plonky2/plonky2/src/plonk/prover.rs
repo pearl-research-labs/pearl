@@ -464,6 +464,7 @@ fn all_wires_permutation_partial_products<
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
     (0..common_data.config.num_challenges)
+        .into_par_iter()
         .map(|i| {
             wires_permutation_partial_products_and_zs(
                 witness,

@@ -23,7 +23,7 @@ use plonky2::iop::challenger::Challenger;
 use plonky2::plonk::config::GenericConfig;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_ceil, log2_strict, transpose};
+use plonky2::util::{log2_ceil, log2_strict};
 use plonky2_maybe_rayon::*;
 
 use crate::batch_proof::{BatchStarkProof, BatchStarkProofWithPublicInputs};
@@ -288,20 +288,23 @@ where
         })
         .collect();
     let mut sparse_traces: [Vec<PolynomialValues<F>>; N] = core::array::from_fn(|_| Vec::new());
-    sparse_traces.par_iter_mut().enumerate().for_each(|(t, trace)| {
-        let keep_flags = &keep_flags_per_table[t];
-        *trace = trace_poly_values[t]
-            .par_iter()
-            .enumerate()
-            .map(|(c, poly)| {
-                if keep_flags[c] {
-                    poly.clone()
-                } else {
-                    PolynomialValues::zero(1)
-                }
-            })
-            .collect();
-    });
+    sparse_traces
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(t, trace)| {
+            let keep_flags = &keep_flags_per_table[t];
+            *trace = trace_poly_values[t]
+                .par_iter()
+                .enumerate()
+                .map(|(c, poly)| {
+                    if keep_flags[c] {
+                        poly.clone()
+                    } else {
+                        PolynomialValues::zero(1)
+                    }
+                })
+                .collect();
+        });
 
     // Flattens per-table polynomial values into the grouped oracle's
     // canonical order — descending trace degree, ties by table index — and
@@ -1129,23 +1132,21 @@ where
                 *eval *= denominator_inv;
             }
 
-            let num_challenges = alphas.len();
-            (0..P::WIDTH)
-                .map(move |i| {
-                    (0..num_challenges)
-                        .map(|j| constraints_evals[j].as_slice()[i])
-                        .collect()
-                })
-                .collect::<Vec<_>>()
+            constraints_evals
         })
-        .flat_map_iter(|rows| rows)
         .collect::<Vec<_>>();
 
     Ok(Some(
-        transpose(&quotient_values)
+        (0..alphas.len())
             .into_par_iter()
-            .map(PolynomialValues::new)
-            .map(|values| values.coset_ifft(F::coset_shift()))
+            .map(|challenge| {
+                // Expand packed evaluations directly into each challenge's column.
+                let values = quotient_values
+                    .iter()
+                    .flat_map(|point| point[challenge].as_slice().iter().copied())
+                    .collect();
+                PolynomialValues::new(values).coset_ifft(F::coset_shift())
+            })
             .collect(),
     ))
 }

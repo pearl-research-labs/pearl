@@ -234,12 +234,12 @@ impl<F: PrimeField64> LutChecker<F> {
         if num_rows == 0 {
             return Ok(());
         }
-        // Chunk boundaries: fixed-size chunks of >= 2^13 rows, capped at 512
+        // Chunk boundaries: fixed-size chunks of >= 2^12 rows, capped at 512
         // chunks — enough to over-subscribe any pool (with the walk tasks of
         // all five tables sharing it) while keeping per-chunk counter
         // allocation amortized. The big tables (2^21..2^22 rows) dominate;
         // smaller ones fall back to one chunk.
-        let chunk_rows = (num_rows / 512).max(1 << 13).min(num_rows);
+        let chunk_rows = (num_rows / 512).max(1 << 12).min(num_rows);
         let num_chunks = num_rows.div_ceil(chunk_rows);
         debug_assert!(chunk_rows * num_chunks >= num_rows);
 
@@ -357,18 +357,15 @@ impl<F: PrimeField64> LutChecker<F> {
                 .par_iter_mut()
                 .enumerate()
                 .for_each(|(slot, dst_slot)| {
-                    dst_slot
-                        .par_chunks_mut(1 << 14)
-                        .enumerate()
-                        .for_each(|(block, dst)| {
-                            let start = block << 14;
-                            let end = start + dst.len();
-                            for src in &per_chunk {
-                                for (dst, src) in dst.iter_mut().zip(&src[slot][start..end]) {
-                                    *dst += src;
-                                }
+                    dst_slot.par_chunks_mut(1 << 14).enumerate().for_each(|(block, dst)| {
+                        let start = block << 14;
+                        let end = start + dst.len();
+                        for src in &per_chunk {
+                            for (dst, src) in dst.iter_mut().zip(&src[slot][start..end]) {
+                                *dst += src;
                             }
-                        });
+                        }
+                    });
                 });
         }
         Ok(())

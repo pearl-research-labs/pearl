@@ -148,8 +148,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 if let Some(roots) = &small_roots {
                     Self::lde_on_cosets(p, &shifts, roots)
                 } else {
-                    p.lde(rate_bits)
-                        .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                    // Shift only the original coefficients; padding coefficients are zero.
+                    let shifted = PolynomialCoeffs::new(
+                        F::coset_shift()
+                            .powers()
+                            .zip(&p.coeffs)
+                            .map(|(r, &c)| r * c)
+                            .collect(),
+                    );
+                    shifted
+                        .lde(rate_bits)
+                        .fft_with_options(Some(rate_bits), fft_root_table)
                         .values
                 }
             })
