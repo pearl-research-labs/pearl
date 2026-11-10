@@ -921,7 +921,13 @@ fn compute_quotient_polys<
         })
         .collect();
 
-    transpose(&quotient_values)
+    let quotient_columns = transpose(&quotient_values);
+    // Dispose of point vectors across workers before transforming the columns.
+    quotient_values
+        .into_par_iter()
+        .with_min_len(1 << 13)
+        .for_each(drop);
+    quotient_columns
         .into_par_iter()
         .map(PolynomialValues::new)
         .map(|values| values.coset_ifft(F::coset_shift()))

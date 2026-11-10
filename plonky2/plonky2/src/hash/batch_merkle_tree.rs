@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use itertools::Itertools;
-use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParIter, ParallelIterator};
+use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeIntoParIter, MaybeParIter, ParallelIterator};
 
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::merkle_proofs::MerkleProof;
@@ -103,6 +103,10 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
                     &new_leaves[..],
                     next_cap_height,
                 );
+                new_leaves
+                    .into_par_iter()
+                    .with_min_len(1 << 13)
+                    .for_each(drop);
             }
 
             unsafe {
