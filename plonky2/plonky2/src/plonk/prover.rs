@@ -263,27 +263,26 @@ where
     );
 
     // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
-    let plonk_z_vecs = partial_products_and_zs
+    let plonk_z_vecs: Vec<_> = partial_products_and_zs
         .iter_mut()
         .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
         .collect();
-    let zs_partial_products = [plonk_z_vecs, partial_products_and_zs.concat()].concat();
+    let mut zs_partial_products: Vec<_> = plonk_z_vecs
+        .into_iter()
+        .chain(partial_products_and_zs.into_iter().flatten())
+        .collect();
 
     // All lookup polys: RE and partial SLDCs.
     let lookup_polys =
         compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
 
-    let zs_partial_products_lookups = if has_lookup {
-        [zs_partial_products, lookup_polys].concat()
-    } else {
-        zs_partial_products
-    };
+    zs_partial_products.extend(lookup_polys);
 
     let partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
         PolynomialBatch::from_values(
-            zs_partial_products_lookups,
+            zs_partial_products,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
             config.fri_config.cap_height,

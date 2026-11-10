@@ -63,13 +63,20 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     let query_round_proofs =
         fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
 
-    FriProof {
+    let proof = FriProof {
         commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
         batching_pow_witness,
-    }
+    };
+    trees.into_par_iter().for_each(|tree| {
+        tree.leaves
+            .into_par_iter()
+            .with_min_len(1 << 13)
+            .for_each(drop);
+    });
+    proof
 }
 
 pub(crate) type FriCommitedTrees<F, C, const D: usize> = (

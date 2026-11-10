@@ -287,9 +287,10 @@ where
                 .collect()
         })
         .collect();
-    let sparse_traces: [Vec<PolynomialValues<F>>; N] = core::array::from_fn(|t| {
+    let mut sparse_traces: [Vec<PolynomialValues<F>>; N] = core::array::from_fn(|_| Vec::new());
+    sparse_traces.par_iter_mut().enumerate().for_each(|(t, trace)| {
         let keep_flags = &keep_flags_per_table[t];
-        trace_poly_values[t]
+        *trace = trace_poly_values[t]
             .par_iter()
             .enumerate()
             .map(|(c, poly)| {
@@ -299,7 +300,7 @@ where
                     PolynomialValues::zero(1)
                 }
             })
-            .collect()
+            .collect();
     });
 
     // Flattens per-table polynomial values into the grouped oracle's

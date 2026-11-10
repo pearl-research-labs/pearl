@@ -1040,7 +1040,9 @@ fn column_major<F: RichField, const N: usize>(rows: &[[F; N]]) -> Vec<Polynomial
 /// zero pages, so the allocation costs no serial memset and the fills' padding rows come
 /// pre-zeroed. The zeroed memory is a valid all-zero `[F]` for every supported field.
 fn calloc_columns<F: RichField>(num_columns: usize, num_rows: usize) -> Vec<Vec<F>> {
+    use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
     (0..num_columns)
+        .into_par_iter()
         .map(|_| {
             let layout = std::alloc::Layout::array::<F>(num_rows).expect("column layout overflows");
             // SAFETY: `alloc_zeroed` returns a valid, aligned, zeroed block of `layout` bytes.
