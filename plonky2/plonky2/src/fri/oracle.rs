@@ -131,9 +131,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> Vec<Vec<F>> {
         let degree = polynomials[0].len();
 
-        // With few columns and a large blowup, parallelize the smaller coset FFTs.
-        let parallel_cosets =
-            rate_bits >= 4 && polynomials.len() * 2 < rayon::current_num_threads();
+        // Small source polynomials avoid a large padded FFT even in wide batches.
+        // Narrow batches also use cosets to expose more parallel work.
+        let parallel_cosets = rate_bits >= 4
+            && (polynomials.len() * 2 < rayon::current_num_threads()
+                || (rate_bits >= 8 && degree <= 1 << 13));
         let small_roots = parallel_cosets.then(|| crate::field::fft::fft_root_table(degree));
         let shifts: Vec<_> = if parallel_cosets {
             F::primitive_root_of_unity(log2_strict(degree) + rate_bits)
@@ -379,16 +381,19 @@ mod tests {
                             .lde(rate_bits)
                             .coset_fft_with_options(F::coset_shift(), Some(rate_bits), Some(&roots))
                             .values;
-                        for cached_roots in [None, Some(&roots)] {
-                            assert_eq!(
-                                PolynomialBatch::<F, C, 2>::lde_values(
-                                    core::slice::from_ref(&p),
-                                    rate_bits,
-                                    false,
-                                    cached_roots
-                                ),
-                                vec![expected.clone()]
-                            );
+                        for num_polynomials in [1, threads + 1] {
+                            let polynomials = vec![p.clone(); num_polynomials];
+                            for cached_roots in [None, Some(&roots)] {
+                                assert_eq!(
+                                    PolynomialBatch::<F, C, 2>::lde_values(
+                                        &polynomials,
+                                        rate_bits,
+                                        false,
+                                        cached_roots
+                                    ),
+                                    vec![expected.clone(); num_polynomials]
+                                );
+                            }
                         }
                     }
                 }
