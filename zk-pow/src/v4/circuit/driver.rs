@@ -848,9 +848,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
                     .map_err(|e: String| anyhow!(e))?;
             }
             let mut checker = LutChecker::<F>::new(&self.lut_tables);
-            for counter in &counters {
-                checker.multiplicities.merge(&counter.multiplicities);
-            }
+            checker
+                .multiplicities
+                .merge_all(&counters.iter().map(|counter| &counter.multiplicities).collect::<Vec<_>>());
             for (i, table) in self.lut_tables.into_iter().enumerate() {
                 let label = format!("trace: lut-trace {table:?}");
                 timing.push(&label, log::Level::Debug);
