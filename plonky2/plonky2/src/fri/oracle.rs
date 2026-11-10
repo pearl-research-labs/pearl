@@ -100,7 +100,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 crate::util::transpose_bitrev(&lde_values)
             } else {
                 let mut leaves = transpose(&lde_values);
-                reverse_index_bits_in_place(&mut leaves);
+                reverse_leaf_indices(&mut leaves);
                 leaves
             }
         });
@@ -349,11 +349,62 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 }
 
+/// Reorders leaf headers in place; leaf payloads are never copied.
+fn reverse_leaf_indices<T: Send>(rows: &mut [T]) {
+    if rows.len() < 1 << 18 {
+        reverse_index_bits_in_place(rows);
+        return;
+    }
+    let bits = log2_strict(rows.len());
+    struct RowPtr<T>(*mut T);
+    // SAFETY: the mutable slice is inaccessible during the join. Workers
+    // transfer only disjoint pairs, and T: Send permits cross-thread moves.
+    unsafe impl<T: Send> Sync for RowPtr<T> {}
+    impl<T> RowPtr<T> {
+        unsafe fn swap(&self, i: usize, j: usize) {
+            unsafe {
+                core::ptr::swap(self.0.add(i), self.0.add(j));
+            }
+        }
+    }
+    let pointer = RowPtr(rows.as_mut_ptr());
+    (0..rows.len())
+        .into_par_iter()
+        .with_min_len(4096)
+        .for_each(|i| {
+            let j = reverse_bits(i, bits);
+            if i < j {
+                // Bit reversal is an involution: each non-fixed index belongs to
+                // exactly one pair, and only its smaller member performs the swap.
+                unsafe {
+                    pointer.swap(i, j);
+                }
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn parallel_leaf_reversal_matches_serial() {
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for bits in [0, 1, 7, 18, 19] {
+                let mut rows: Vec<_> = (0..1usize << bits).map(|i| vec![i, i ^ 0x5a5a]).collect();
+                let mut expected = rows.clone();
+                reverse_index_bits_in_place(&mut expected);
+                pool.install(|| reverse_leaf_indices(&mut rows));
+                assert_eq!(rows, expected);
+            }
+        }
+    }
 
     #[test]
     fn small_coset_ldes_match_original_fft() {
