@@ -1185,11 +1185,7 @@ where
      -> Vec<F::Extension> {
         oracle.polynomials[start + range.start..start + range.end]
             .par_iter()
-            .map(|p| {
-                p.coeffs.iter().rev().fold(F::Extension::ZERO, |acc, &c| {
-                    acc * z + F::Extension::from_basefield(c)
-                })
-            })
+            .map(|p| evaluate_opening::<F, D>(&p.coeffs, z))
             .collect()
     };
 
@@ -1255,5 +1251,50 @@ where
         auxiliary_polys_next,
         ctl_zs_first,
         quotient_polys,
+    }
+}
+
+/// Evaluates base-field coefficients at an extension point. Four independent
+/// Horner chains shorten the dependency chain without changing the polynomial.
+fn evaluate_opening<F: RichField + Extendable<D>, const D: usize>(
+    coefficients: &[F],
+    point: F::Extension,
+) -> F::Extension {
+    let step = point * point;
+    let step = step * step;
+    let mut lanes = [F::Extension::ZERO; 4];
+    for chunk in coefficients.chunks(4).rev() {
+        for (lane, &coefficient) in lanes.iter_mut().zip(chunk) {
+            *lane = *lane * step + F::Extension::from_basefield(coefficient);
+        }
+    }
+    lanes
+        .into_iter()
+        .rev()
+        .fold(F::Extension::ZERO, |acc, lane| acc * point + lane)
+}
+
+#[cfg(test)]
+mod opening_evaluation_tests {
+    use super::*;
+    use plonky2::field::goldilocks_field::GoldilocksField as F;
+
+    #[test]
+    fn four_lane_openings_match_horner() {
+        type E = <F as Extendable<2>>::Extension;
+        let extension_point =
+            E::from_basefield_array([F::from_canonical_u64(2), F::from_canonical_u64(3)]);
+        for length in [0, 1, 2, 3, 4, 5, 7, 31, 128, 1025] {
+            let coefficients: Vec<_> = (0..length)
+                .map(|i| F::from_canonical_usize(19 * i + 7))
+                .collect();
+            for point in [E::ZERO, E::ONE, extension_point] {
+                let expected = coefficients
+                    .iter()
+                    .rev()
+                    .fold(E::ZERO, |acc, &c| acc * point + E::from(c));
+                assert_eq!(evaluate_opening::<F, 2>(&coefficients, point), expected);
+            }
+        }
     }
 }
