@@ -20,7 +20,7 @@ ANCESTOR_BYTES = (
     bytes(range(108, 216)),
     bytes(range(216, 256)) + bytes(range(68)),
 )
-ZK_MAX_BLOB_SIZE = 60000
+ZK_MAX_BLOB_SIZE = 62000
 
 
 def _public_data(cert_version: CertificateVersion) -> bytes:
