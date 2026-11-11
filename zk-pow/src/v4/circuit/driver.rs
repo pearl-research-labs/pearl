@@ -651,6 +651,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     /// table's inputs from its producer), accumulates the committed-LUT multiplicities,
     /// assembles the LUT traces and runs the batch prover. `preprocessed` is the
     /// setup-time LUT commitment for this job's layout ([`Self::preprocessed_data`]).
+    /// `lut_values` optionally supplies cached fixed LUT columns in committed-table order.
     ///
     /// `derive_statement_digest` receives the lottery digest `J` (the 32-byte
     /// jackpot hash generated with the traces -- the block's shipped claim) and returns the
@@ -660,6 +661,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         witness: &Fp8Witness<'_>,
         derive_statement_digest: impl FnOnce(Hash256) -> Hash256,
         preprocessed: &BatchStarkPreprocessedData<F, C, D>,
+        lut_values: Option<&[Vec<PolynomialValues<F>>]>,
         timing: &mut TimingTree,
     ) -> Result<BatchStarkProofWithPublicInputs<F, C, D>> {
         let [a_values_len, a_scales_len, b_values_len, b_scales_len] = self.plane_lens;
@@ -846,13 +848,21 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
                     .map_err(|e: String| anyhow!(e))?;
             }
             let mut checker = LutChecker::<F>::new(&self.lut_tables);
-            for counter in &counters {
-                checker.multiplicities.merge(&counter.multiplicities);
-            }
-            for table in self.lut_tables {
+            checker
+                .multiplicities
+                .merge_all(&counters.iter().map(|counter| &counter.multiplicities).collect::<Vec<_>>());
+            for (i, table) in self.lut_tables.into_iter().enumerate() {
                 let label = format!("trace: lut-trace {table:?}");
                 timing.push(&label, log::Level::Debug);
-                let trace = lut_trace::<F>(table, checker.multiplicities.table_columns(table));
+                let multiplicities = checker.multiplicities.table_columns(table);
+                let trace = if let Some(values) = lut_values {
+                    use plonky2_maybe_rayon::{MaybeParIter, ParallelIterator};
+                    let mut trace: Vec<_> = values[i].par_iter().cloned().collect();
+                    trace.extend(multiplicities.into_iter().map(PolynomialValues::new));
+                    trace
+                } else {
+                    lut_trace::<F>(table, multiplicities)
+                };
                 timing.pop();
                 traces.push(trace);
             }
@@ -1030,7 +1040,9 @@ fn column_major<F: RichField, const N: usize>(rows: &[[F; N]]) -> Vec<Polynomial
 /// zero pages, so the allocation costs no serial memset and the fills' padding rows come
 /// pre-zeroed. The zeroed memory is a valid all-zero `[F]` for every supported field.
 fn calloc_columns<F: RichField>(num_columns: usize, num_rows: usize) -> Vec<Vec<F>> {
+    use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
     (0..num_columns)
+        .into_par_iter()
         .map(|_| {
             let layout = std::alloc::Layout::array::<F>(num_rows).expect("column layout overflows");
             // SAFETY: `alloc_zeroed` returns a valid, aligned, zeroed block of `layout` bytes.
@@ -1477,7 +1489,7 @@ mod tests {
         let cap = preprocessed.cap();
 
         let proof = system
-            .prove::<C>(&witness(&fx), |_| STATEMENT_DIGEST, &preprocessed, &mut timing)
+            .prove::<C>(&witness(&fx), |_| STATEMENT_DIGEST, &preprocessed, None, &mut timing)
             .expect("proving must succeed");
 
         // Verify fails closed on an unbound digest: `fresh` never bound one, while
