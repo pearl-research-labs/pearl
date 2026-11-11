@@ -300,9 +300,7 @@ impl Fp8Prover {
     pub fn prove(&mut self, proposed_header: &IncompleteBlockHeader, input: &PlainProofV4) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut timing = TimingTree::default();
         // Enter the worker pool once for the proof's nested parallel stages.
-        plonky2_maybe_rayon::rayon::scope(|_| {
-            self.prove_with_timing(proposed_header, input, &mut timing)
-        })
+        plonky2_maybe_rayon::rayon::scope(|_| self.prove_with_timing(proposed_header, input, &mut timing))
     }
 
     fn prove_with_timing(
