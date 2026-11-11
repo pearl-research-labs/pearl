@@ -343,6 +343,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             !fri_params.hiding,
             "Batch FRI does not support hiding mode."
         );
+        let batching_pow_witness =
+            crate::fri::batching_pow::prove::<F, C, D>(challenger, &fri_params.config);
         let alpha = challenger.get_extension_challenge::<D>();
         let runs = batch_alpha_runs(instances);
         timing.push("final-poly LDE", log::Level::Info);
@@ -493,6 +495,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &final_lde_polynomial_values,
             challenger,
             fri_params,
+            batching_pow_witness,
             timing,
         )
     }
@@ -631,6 +634,15 @@ mod test {
 
     #[test]
     fn batch_prove_openings() -> anyhow::Result<()> {
+        batch_prove_openings_with_pow(0)
+    }
+
+    #[test]
+    fn batch_prove_openings_with_batching_pow() -> anyhow::Result<()> {
+        batch_prove_openings_with_pow(4)
+    }
+
+    fn batch_prove_openings_with_pow(batching_bits: u32) -> anyhow::Result<()> {
         let mut timing = TimingTree::default();
 
         let k0 = 9;
@@ -642,6 +654,7 @@ mod test {
                 rate_bits: 1,
                 cap_height: 0,
                 proof_of_work_bits: 0,
+                batching_proof_of_work_bits: batching_bits,
                 reduction_strategy: FriReductionStrategy::Fixed(reduction_arity_bits.clone()),
                 num_query_rounds: 10,
             },
@@ -798,6 +811,7 @@ mod test {
             &proof.commit_phase_merkle_caps,
             &proof.final_poly,
             proof.pow_witness,
+            proof.batching_pow_witness,
             k0,
             &fri_params.config,
             None,
@@ -929,6 +943,7 @@ mod test {
             &fri_proof_target.commit_phase_merkle_caps,
             &fri_proof_target.final_poly,
             fri_proof_target.pow_witness,
+            fri_proof_target.batching_pow_witness,
             &fri_params.config,
         );
 

@@ -114,6 +114,8 @@ pub const STARK_RATE_BITS: usize = 1;
 pub const STARK_CAP_HEIGHT: usize = 4;
 /// FRI grinding bits.
 pub const STARK_POW_BITS: u32 = 18;
+/// Grinding before deriving column-batching challenges.
+pub const STARK_BATCHING_POW_BITS: u32 = 17;
 /// FRI query rounds: the minimal count meeting the security target at this rate (102).
 pub const STARK_QUERY_ROUNDS: usize = (STARK_SECURITY_BITS - STARK_POW_BITS as usize).div_ceil(STARK_RATE_BITS);
 
@@ -215,6 +217,7 @@ pub fn fp8_stark_config(degree_bits: &[usize]) -> StarkConfig {
             rate_bits: STARK_RATE_BITS,
             cap_height: STARK_CAP_HEIGHT,
             proof_of_work_bits: STARK_POW_BITS,
+            batching_proof_of_work_bits: STARK_BATCHING_POW_BITS,
             reduction_strategy: FriReductionStrategy::Ladder(boundaries),
             num_query_rounds: STARK_QUERY_ROUNDS,
         },

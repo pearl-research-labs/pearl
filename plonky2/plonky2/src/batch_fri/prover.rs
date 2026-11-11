@@ -31,6 +31,7 @@ pub fn batch_fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     lde_polynomial_values: &[PolynomialValues<F::Extension>],
     challenger: &mut Challenger<F, C::Hasher>,
     fri_params: &FriParams,
+    batching_pow_witness: Option<F>,
     timing: &mut TimingTree,
 ) -> FriProof<F, C::Hasher, D> {
     batch_fri_proof_with_openings::<F, C, D>(
@@ -40,6 +41,7 @@ pub fn batch_fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         lde_polynomial_values,
         challenger,
         fri_params,
+        batching_pow_witness,
         timing,
     )
 }
@@ -59,6 +61,7 @@ pub fn batch_fri_proof_with_openings<
     lde_polynomial_values: &[PolynomialValues<F::Extension>],
     challenger: &mut Challenger<F, C::Hasher>,
     fri_params: &FriParams,
+    batching_pow_witness: Option<F>,
     timing: &mut TimingTree,
 ) -> FriProof<F, C::Hasher, D> {
     assert!(
@@ -121,6 +124,7 @@ pub fn batch_fri_proof_with_openings<
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
+        batching_pow_witness,
     }
 }
 
@@ -368,6 +372,7 @@ mod tests {
                 rate_bits: 1,
                 cap_height: 5,
                 proof_of_work_bits: 0,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::Fixed(reduction_arity_bits.clone()),
                 num_query_rounds: 10,
             },
@@ -423,6 +428,7 @@ mod tests {
             &[lde_final_values],
             &mut challenger,
             &fri_params,
+            None,
             &mut timing,
         );
 
@@ -430,6 +436,7 @@ mod tests {
             &proof.commit_phase_merkle_caps,
             &proof.final_poly,
             proof.pow_witness,
+            proof.batching_pow_witness,
             k,
             &fri_params.config,
             None,
@@ -465,6 +472,7 @@ mod tests {
                 rate_bits: 1,
                 cap_height: 5,
                 proof_of_work_bits: 0,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::Fixed(reduction_arity_bits.clone()),
                 num_query_rounds: 10,
             },
@@ -529,6 +537,7 @@ mod tests {
             &[lde_final_values_0, lde_final_values_1, lde_final_values_2],
             &mut challenger,
             &fri_params,
+            None,
             &mut timing,
         );
 
@@ -556,6 +565,7 @@ mod tests {
             &proof.commit_phase_merkle_caps,
             &proof.final_poly,
             proof.pow_witness,
+            proof.batching_pow_witness,
             k0,
             &fri_params.config,
             None,
@@ -609,6 +619,7 @@ mod tests {
                 rate_bits: 1,
                 cap_height: 2,
                 proof_of_work_bits: 0,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::Fixed(reduction_arity_bits.clone()),
                 num_query_rounds: 10,
             },
@@ -756,6 +767,7 @@ mod tests {
             &proof.commit_phase_merkle_caps,
             &proof.final_poly,
             proof.pow_witness,
+            proof.batching_pow_witness,
             k0,
             &fri_params.config,
             None,
@@ -860,6 +872,7 @@ mod tests {
             &fri_proof_target.commit_phase_merkle_caps,
             &fri_proof_target.final_poly,
             fri_proof_target.pow_witness,
+            fri_proof_target.batching_pow_witness,
             &fri_params.config,
         );
 

@@ -529,6 +529,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &proof.opening_proof.commit_phase_merkle_caps,
             &proof.opening_proof.final_poly,
             proof.opening_proof.pow_witness,
+            proof.opening_proof.batching_pow_witness,
             &verifier_data.circuit_digest,
             common_data,
         )?;

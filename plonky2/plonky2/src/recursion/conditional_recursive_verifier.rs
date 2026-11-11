@@ -227,7 +227,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         proof0: &FriProofTarget<D>,
         proof1: &FriProofTarget<D>,
     ) -> FriProofTarget<D> {
+        let batching_pow_witness = match (proof0.batching_pow_witness, proof1.batching_pow_witness)
+        {
+            (None, None) => None,
+            (Some(a), Some(c)) => Some(self.select(b, a, c)),
+            _ => panic!("cannot select between different FRI protocols"),
+        };
         FriProofTarget {
+            batching_pow_witness,
             commit_phase_merkle_caps: self.select_vec_cap(
                 b,
                 &proof0.commit_phase_merkle_caps,

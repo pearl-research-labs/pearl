@@ -600,11 +600,17 @@ pub trait Read {
             self.read_field_ext_vec::<F, D>(common_data.fri_params.final_poly_len())?,
         );
         let pow_witness = self.read_field()?;
+        let batching_pow_witness = if config.fri_config.batching_proof_of_work_bits != 0 {
+            Some(self.read_field()?)
+        } else {
+            None
+        };
         Ok(FriProof {
             commit_phase_merkle_caps,
             query_round_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness,
         })
     }
 
@@ -617,13 +623,29 @@ pub trait Read {
             .collect::<Result<Vec<_>, _>>()?;
         let query_round_proofs = self.read_target_fri_query_rounds::<D>()?;
         let final_poly = PolynomialCoeffsExtTarget(self.read_target_ext_vec::<D>()?);
-        let pow_witness = self.read_target()?;
+        // Tag 2 extends trusted target metadata; old wire/virtual tags remain exact.
+        let tag = self.read_u8()?;
+        let (pow_witness, batching_pow_witness) = match tag {
+            0 => (
+                Target::VirtualTarget {
+                    index: self.read_usize()?,
+                },
+                None,
+            ),
+            1 => (Target::wire(self.read_usize()?, self.read_usize()?), None),
+            2 => {
+                let pow = self.read_target()?;
+                (pow, Some(self.read_target()?))
+            }
+            _ => return Err(IoError),
+        };
 
         Ok(FriProofTarget {
             commit_phase_merkle_caps,
             query_round_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness,
         })
     }
 
@@ -666,14 +688,25 @@ pub trait Read {
         let rate_bits = self.read_usize()?;
         let cap_height = self.read_usize()?;
         let num_query_rounds = self.read_usize()?;
-        let proof_of_work_bits = self.read_u32()?;
+        let encoded_pow = self.read_u32()?;
+        let proof_of_work_bits = encoded_pow & 0x7fff_ffff;
         let reduction_strategy = self.read_fri_reduction_strategy()?;
+        let batching_proof_of_work_bits = if encoded_pow >> 31 != 0 {
+            self.read_u32()?
+        } else {
+            0
+        };
+
+        if proof_of_work_bits >= 64 || batching_proof_of_work_bits >= 64 {
+            return Err(IoError);
+        }
 
         Ok(FriConfig {
             rate_bits,
             cap_height,
             num_query_rounds,
             proof_of_work_bits,
+            batching_proof_of_work_bits,
             reduction_strategy,
         })
     }
@@ -1133,11 +1166,17 @@ pub trait Read {
             self.read_field_ext_vec::<F, D>(common_data.fri_params.final_poly_len())?,
         );
         let pow_witness = self.read_field()?;
+        let batching_pow_witness = if config.fri_config.batching_proof_of_work_bits != 0 {
+            Some(self.read_field()?)
+        } else {
+            None
+        };
         Ok(CompressedFriProof {
             commit_phase_merkle_caps,
             query_round_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness,
         })
     }
 
@@ -1643,7 +1682,11 @@ pub trait Write {
         }
         self.write_fri_query_rounds::<F, C, D>(&fp.query_round_proofs, oracles_to_skip)?;
         self.write_field_ext_vec::<F, D>(&fp.final_poly.coeffs)?;
-        self.write_field(fp.pow_witness)
+        self.write_field(fp.pow_witness)?;
+        if let Some(nonce) = fp.batching_pow_witness {
+            self.write_field(nonce)?;
+        }
+        Ok(())
     }
 
     /// Writes a value `fpt` of type [`FriProofTarget`] to `self.`
@@ -1655,7 +1698,13 @@ pub trait Write {
         }
         self.write_target_fri_query_rounds::<D>(&fpt.query_round_proofs)?;
         self.write_target_ext_vec::<D>(&fpt.final_poly.0)?;
-        self.write_target(fpt.pow_witness)
+        if let Some(nonce) = fpt.batching_pow_witness {
+            self.write_u8(2)?;
+            self.write_target(fpt.pow_witness)?;
+            self.write_target(nonce)
+        } else {
+            self.write_target(fpt.pow_witness)
+        }
     }
 
     fn write_fri_reduction_strategy(
@@ -1702,14 +1751,28 @@ pub trait Write {
             cap_height,
             num_query_rounds,
             proof_of_work_bits,
+            batching_proof_of_work_bits,
             reduction_strategy,
         } = &config;
 
         self.write_usize(*rate_bits)?;
         self.write_usize(*cap_height)?;
         self.write_usize(*num_query_rounds)?;
-        self.write_u32(*proof_of_work_bits)?;
+        if *proof_of_work_bits >= 64 || *batching_proof_of_work_bits >= 64 {
+            return Err(IoError);
+        }
+        self.write_u32(
+            *proof_of_work_bits
+                | if *batching_proof_of_work_bits != 0 {
+                    1 << 31
+                } else {
+                    0
+                },
+        )?;
         self.write_fri_reduction_strategy(reduction_strategy)?;
+        if *batching_proof_of_work_bits != 0 {
+            self.write_u32(*batching_proof_of_work_bits)?;
+        }
 
         Ok(())
     }
@@ -2120,7 +2183,11 @@ pub trait Write {
         }
         self.write_compressed_fri_query_rounds::<F, C, D>(&fp.query_round_proofs)?;
         self.write_field_ext_vec::<F, D>(&fp.final_poly.coeffs)?;
-        self.write_field(fp.pow_witness)
+        self.write_field(fp.pow_witness)?;
+        if let Some(nonce) = fp.batching_pow_witness {
+            self.write_field(nonce)?;
+        }
+        Ok(())
     }
 
     /// Writes a value `proof` of type [`CompressedProof`] to `self.`

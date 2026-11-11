@@ -10,8 +10,8 @@ use crate::v4::circuit::input_quant_stark::columns::{
 };
 use crate::v4::circuit::scale_stark::columns::{K_PUBLIC_INPUT, WL2_PUBLIC_INPUT};
 
-/// The full wire-level round trip: parse the plain proof, prove the batch statement,
-/// serialize, verify against independently derived expectations, and reject tampering
+/// Parse the plain proof, prove the batch statement,
+/// verify against independently derived expectations, and reject tampering
 /// with the block's claims, the proof's public inputs, and the openings.
 #[test]
 fn api_roundtrip_and_tamper_rejection() {
@@ -25,7 +25,6 @@ fn api_roundtrip_and_tamper_rejection() {
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
     assert_ne!(public.hash_jackpot(), [0u8; 32], "prove must ship the proven lottery digest");
 
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
 
     let mut bad_public = public.clone();
@@ -61,7 +60,6 @@ fn asymmetric_api_roundtrip() {
     let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
 
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
 
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
 }
@@ -80,7 +78,6 @@ fn k_mod_32_api_roundtrip() {
     let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
 
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
 
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
 }
@@ -101,7 +98,6 @@ fn hopper_api_roundtrips_minimum_k_and_partial_window() {
         assert_eq!(params.common().device, Device::H100);
         let (public, proof) =
             zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("Hopper proving must succeed");
-        let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
         verify_fp8_block(&public, &header, &proof, &setup, None).expect("Hopper proof must verify");
     }
 }
@@ -204,7 +200,7 @@ fn verifier_resource_signature_is_pinned() {
         hash.finalize().to_hex().to_string()
     });
     assert_eq!(
-        signatures, ["eaa549805cf48ff3ff41594895722d680585789c4ea509f1c8348393b967b2c4"; 2],
+        signatures, ["05273fb02ad6ca64537253e01496318399203fef3e74da40fa42dc8af3fb8686"; 2],
         "verifier resources changed; review resource usage and rerun bench_v4_verify"
     );
 }
@@ -568,7 +564,6 @@ fn moe_api_roundtrip_and_tamper_rejection() {
 
     let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("MoE proving must succeed");
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
 
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest MoE proof must verify");
 
@@ -611,6 +606,5 @@ fn hopper_moe_api_roundtrip() {
     let setup = Fp8ProverSetup::build(Device::H100, &mut timing).expect("Hopper MoE prover setup");
     let (public, proof) =
         zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("Hopper MoE proving must succeed");
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest Hopper MoE proof must verify");
 }

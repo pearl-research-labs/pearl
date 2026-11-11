@@ -313,6 +313,7 @@ mod tests {
                 rate_bits: 3,
                 cap_height: 4,
                 proof_of_work_bits: 10,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 8),
                 num_query_rounds: 30,
             },
