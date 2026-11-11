@@ -8,10 +8,10 @@
 use alloc::{vec, vec::Vec};
 
 use anyhow::{ensure, Result};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use plonky2::batch_fri::oracle::BatchFriOracle;
-use plonky2::field::extension::{Extendable, FieldExtension};
-use plonky2::field::fft::FftRootTable;
+use plonky2::field::extension::{Extendable, FieldExtension, OEF};
+use plonky2::field::fft::{fft_root_table, ifft_with_options, FftRootTable};
 use plonky2::field::packable::Packable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -23,7 +23,7 @@ use plonky2::iop::challenger::Challenger;
 use plonky2::plonk::config::GenericConfig;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_ceil, log2_strict, transpose};
+use plonky2::util::{log2_ceil, log2_strict};
 use plonky2_maybe_rayon::*;
 
 use crate::batch_proof::{BatchStarkProof, BatchStarkProofWithPublicInputs};
@@ -287,20 +287,24 @@ where
                 .collect()
         })
         .collect();
-    let sparse_traces: [Vec<PolynomialValues<F>>; N] = core::array::from_fn(|t| {
-        let keep_flags = &keep_flags_per_table[t];
-        trace_poly_values[t]
-            .par_iter()
-            .enumerate()
-            .map(|(c, poly)| {
-                if keep_flags[c] {
-                    poly.clone()
-                } else {
-                    PolynomialValues::zero(1)
-                }
-            })
-            .collect()
-    });
+    let mut sparse_traces: [Vec<PolynomialValues<F>>; N] = core::array::from_fn(|_| Vec::new());
+    sparse_traces
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(t, trace)| {
+            let keep_flags = &keep_flags_per_table[t];
+            *trace = trace_poly_values[t]
+                .par_iter()
+                .enumerate()
+                .map(|(c, poly)| {
+                    if keep_flags[c] {
+                        poly.clone()
+                    } else {
+                        PolynomialValues::zero(1)
+                    }
+                })
+                .collect();
+        });
 
     // Flattens per-table polynomial values into the grouped oracle's
     // canonical order — descending trace degree, ties by table index — and
@@ -327,11 +331,22 @@ where
                 .into_iter()
                 .flat_map(|(_, values)| values)
                 .collect();
-            let coeffs = timed!(
-                timing,
-                "IFFT",
-                values.into_par_iter().map(|values| values.ifft()).collect()
-            );
+            let coeffs = timed!(timing, "IFFT", {
+                // Share one root table across all columns of the same height.
+                let mut roots = HashMap::new();
+                for column in &values {
+                    roots
+                        .entry(column.len())
+                        .or_insert_with(|| fft_root_table(column.len()));
+                }
+                values
+                    .into_par_iter()
+                    .map(|column| {
+                        let table = &roots[&column.len()];
+                        ifft_with_options(column, None, Some(table))
+                    })
+                    .collect()
+            });
             return Some(BatchFriOracle::from_coeffs_with_digests(
                 coeffs, ranges, rate_bits, cap_height, timing,
             ));
@@ -1128,23 +1143,21 @@ where
                 *eval *= denominator_inv;
             }
 
-            let num_challenges = alphas.len();
-            (0..P::WIDTH)
-                .map(move |i| {
-                    (0..num_challenges)
-                        .map(|j| constraints_evals[j].as_slice()[i])
-                        .collect()
-                })
-                .collect::<Vec<_>>()
+            constraints_evals
         })
-        .flat_map_iter(|rows| rows)
         .collect::<Vec<_>>();
 
     Ok(Some(
-        transpose(&quotient_values)
+        (0..alphas.len())
             .into_par_iter()
-            .map(PolynomialValues::new)
-            .map(|values| values.coset_ifft(F::coset_shift()))
+            .map(|challenge| {
+                // Expand packed evaluations directly into each challenge's column.
+                let values = quotient_values
+                    .iter()
+                    .flat_map(|point| point[challenge].as_slice().iter().copied())
+                    .collect();
+                PolynomialValues::new(values).coset_ifft(F::coset_shift())
+            })
             .collect(),
     ))
 }
@@ -1183,11 +1196,7 @@ where
      -> Vec<F::Extension> {
         oracle.polynomials[start + range.start..start + range.end]
             .par_iter()
-            .map(|p| {
-                p.coeffs.iter().rev().fold(F::Extension::ZERO, |acc, &c| {
-                    acc * z + F::Extension::from_basefield(c)
-                })
-            })
+            .map(|p| evaluate_opening::<F, D>(&p.coeffs, z))
             .collect()
     };
 
@@ -1253,5 +1262,70 @@ where
         auxiliary_polys_next,
         ctl_zs_first,
         quotient_polys,
+    }
+}
+
+/// Evaluates ascending base-field coefficients at `point` with four independent
+/// chains. Quadratic extensions use their trace/norm relation so each chain
+/// needs only base-field multiplications; other extensions use ordinary Horner.
+fn evaluate_opening<F: RichField + Extendable<D>, const D: usize>(
+    coefficients: &[F],
+    point: F::Extension,
+) -> F::Extension {
+    let step = point * point;
+    let step = step * step;
+    if D == 2 {
+        // Y² = trace(Y)Y - norm(Y) for Y in a quadratic extension.
+        let coordinates = step.to_basefield_array();
+        let trace = coordinates[0] + coordinates[0];
+        let norm = coordinates[0] * coordinates[0]
+            - coordinates[1] * coordinates[1] * <F::Extension as OEF<D>>::W;
+        let mut linear = [F::ZERO; 4];
+        let mut constant = [F::ZERO; 4];
+        for chunk in coefficients.chunks(4).rev() {
+            for (i, &coefficient) in chunk.iter().enumerate() {
+                let previous = linear[i];
+                linear[i] = previous * trace + constant[i];
+                constant[i] = coefficient - previous * norm;
+            }
+        }
+        return (0..4).rev().fold(F::Extension::ZERO, |acc, i| {
+            acc * point + step.scalar_mul(linear[i]) + F::Extension::from_basefield(constant[i])
+        });
+    }
+    let mut lanes = [F::Extension::ZERO; 4];
+    for chunk in coefficients.chunks(4).rev() {
+        for (lane, &coefficient) in lanes.iter_mut().zip(chunk) {
+            *lane = *lane * step + F::Extension::from_basefield(coefficient);
+        }
+    }
+    lanes
+        .into_iter()
+        .rev()
+        .fold(F::Extension::ZERO, |acc, lane| acc * point + lane)
+}
+
+#[cfg(test)]
+mod opening_evaluation_tests {
+    use super::*;
+    use plonky2::field::goldilocks_field::GoldilocksField as F;
+
+    #[test]
+    fn four_lane_openings_match_horner() {
+        type E = <F as Extendable<2>>::Extension;
+        let extension_point =
+            E::from_basefield_array([F::from_canonical_u64(2), F::from_canonical_u64(3)]);
+        for length in [0, 1, 2, 3, 4, 5, 7, 31, 128, 1025] {
+            let coefficients: Vec<_> = (0..length)
+                .map(|i| F::from_canonical_usize(19 * i + 7))
+                .collect();
+            for point in [E::ZERO, E::ONE, extension_point] {
+                let expected = coefficients
+                    .iter()
+                    .rev()
+                    .fold(E::ZERO, |acc, &c| acc * point + E::from(c));
+                assert_eq!(evaluate_opening::<F, 2>(&coefficients, point), expected);
+            }
+        }
     }
 }

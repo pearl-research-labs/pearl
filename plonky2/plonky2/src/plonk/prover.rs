@@ -263,27 +263,26 @@ where
     );
 
     // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
-    let plonk_z_vecs = partial_products_and_zs
+    let plonk_z_vecs: Vec<_> = partial_products_and_zs
         .iter_mut()
         .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
         .collect();
-    let zs_partial_products = [plonk_z_vecs, partial_products_and_zs.concat()].concat();
+    let mut zs_partial_products: Vec<_> = plonk_z_vecs
+        .into_iter()
+        .chain(partial_products_and_zs.into_iter().flatten())
+        .collect();
 
     // All lookup polys: RE and partial SLDCs.
     let lookup_polys =
         compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
 
-    let zs_partial_products_lookups = if has_lookup {
-        [zs_partial_products, lookup_polys].concat()
-    } else {
-        zs_partial_products
-    };
+    zs_partial_products.extend(lookup_polys);
 
     let partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
         PolynomialBatch::from_values(
-            zs_partial_products_lookups,
+            zs_partial_products,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
             config.fri_config.cap_height,
@@ -465,6 +464,7 @@ fn all_wires_permutation_partial_products<
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
     (0..common_data.config.num_challenges)
+        .into_par_iter()
         .map(|i| {
             wires_permutation_partial_products_and_zs(
                 witness,
@@ -798,9 +798,9 @@ fn compute_quotient_polys<
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
-    let quotient_values: Vec<Vec<F>> = points_batches
+    let quotient_batches: Vec<Vec<Vec<F>>> = points_batches
         .enumerate()
-        .flat_map(|(batch_i, xs_batch)| {
+        .map(|(batch_i, xs_batch)| {
             // Each batch must be the same size, except the last one, which may be smaller.
             debug_assert!(
                 xs_batch.len() == BATCH_SIZE
@@ -917,13 +917,79 @@ fn compute_quotient_polys<
                     .iter_mut()
                     .for_each(|v| *v *= denominator_inv);
             }
-            quotient_values_batch
+            // Transpose and free point vectors on the worker that produced them.
+            transpose(&quotient_values_batch)
         })
         .collect();
 
-    transpose(&quotient_values)
+    (0..num_challenges)
         .into_par_iter()
-        .map(PolynomialValues::new)
-        .map(|values| values.coset_ifft(F::coset_shift()))
+        .map(|challenge| {
+            let mut values = Vec::with_capacity(points.len());
+            for batch in &quotient_batches {
+                values.extend_from_slice(&batch[challenge]);
+            }
+            coset_ifft_parallel(PolynomialValues::new(values), F::coset_shift())
+        })
         .collect()
+}
+
+/// Interpolates coset evaluations in natural order, using the existing parallel FFT
+/// for large inputs. Inverse normalization and coset scaling are fused in one pass.
+fn coset_ifft_parallel<F: RichField>(values: PolynomialValues<F>, shift: F) -> PolynomialCoeffs<F> {
+    let n = values.len();
+    if n < (1 << 18) {
+        return values.coset_ifft(shift);
+    }
+    let norm = F::inverse_2exp(crate::util::log2_strict(n));
+    let inv_shift = shift.inverse();
+    let transformed = crate::util::fft_par::fft_par(PolynomialCoeffs::new(values.values));
+    let mut coeffs = vec![F::ZERO; n];
+    coeffs
+        .par_chunks_mut(4096)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let start = ci * 4096;
+            let mut w = norm * inv_shift.exp_u64(start as u64);
+            for (offset, value) in chunk.iter_mut().enumerate() {
+                let index = start + offset;
+                *value = transformed.values[if index == 0 { 0 } else { n - index }] * w;
+                w *= inv_shift;
+            }
+        });
+    PolynomialCoeffs::new(coeffs)
+}
+
+#[cfg(test)]
+mod parallel_interpolation_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField as F;
+    #[test]
+    fn parallel_coset_ifft_matches_serial() {
+        for threads in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    for bits in [0, 1, 10, 18, 19] {
+                        let values = PolynomialValues::new(
+                            (0..1 << bits)
+                                .map(|i| {
+                                    F::from_noncanonical_u64(
+                                        (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                                    )
+                                })
+                                .collect(),
+                        );
+                        for shift in [F::ONE, F::coset_shift()] {
+                            assert_eq!(
+                                coset_ifft_parallel(values.clone(), shift),
+                                values.clone().coset_ifft(shift)
+                            );
+                        }
+                    }
+                });
+        }
+    }
 }

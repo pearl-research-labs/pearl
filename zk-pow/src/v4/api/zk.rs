@@ -80,6 +80,7 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use hashbrown::HashMap;
 use plonky2::field::goldilocks_field::GoldilocksField;
+use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
@@ -155,12 +156,25 @@ struct Fp8ProverSetup {
     circuits: Fp8WrapperCircuits,
     /// Public parameters of the sample job used for prover warmup.
     sample_params: PublicParams,
+    /// Fixed LUT trace columns retained only by the prover.
+    lut_values: Vec<Vec<PolynomialValues<F>>>,
 }
 
 impl Fp8ProverSetup {
     fn build(device: Device, timing: &mut TimingTree) -> Result<Self> {
         let params = sample_dense_statement_for_device(device)?;
         let job = Fp8Job::derive(&params, &IncompleteBlockHeader::zero())?;
+        let lut_values = job
+            .system
+            .committed_lut_tables()
+            .iter()
+            .map(|&table| {
+                crate::v4::circuit::luts::lut_precommitted_values::<F>(table)
+                    .into_iter()
+                    .map(PolynomialValues::new)
+                    .collect()
+            })
+            .collect();
         let preprocessed = job.system.preprocessed_data::<C>(timing);
         let circuits = Fp8WrapperCircuits::build(&job.system, &preprocessed.cap(), timing)?;
         Ok(Self {
@@ -168,6 +182,7 @@ impl Fp8ProverSetup {
             preprocessed,
             circuits,
             sample_params: params,
+            lut_values,
         })
     }
 
@@ -220,6 +235,7 @@ impl Fp8ProverSetup {
                 digest
             },
             &self.preprocessed,
+            Some(&self.lut_values),
             timing,
         )?;
         self.circuits.warmup_prove(&job.system, &batch_proof, digest, timing)
@@ -800,6 +816,7 @@ fn prove_batch_statement(
             public.digest(proposed_header)
         },
         &setup.preprocessed,
+        Some(&setup.lut_values),
         timing,
     )?;
 
