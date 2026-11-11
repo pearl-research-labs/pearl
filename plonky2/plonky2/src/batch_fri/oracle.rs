@@ -577,29 +577,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) where
         P: PackedField<Scalar = F>,
     {
-        let slice_len = buf.len();
-        // The `P::WIDTH` point rows, fetched once and transposed column-wise
-        // into the buffer (mirrors `get_lde_values_packed` without the
-        // per-call allocation).
-        let rows: Vec<&[F]> = (0..P::WIDTH)
-            .map(|w| {
-                self.get_lde_values(
-                    degree_bits_index,
-                    index_start + w,
-                    step,
-                    slice_start,
-                    slice_len,
-                )
-            })
-            .collect();
-        for (j, slot) in buf.iter_mut().enumerate() {
-            let mut packed = P::ZEROS;
-            packed
-                .as_slice_mut()
-                .iter_mut()
-                .zip(rows.iter())
-                .for_each(|(packed_w, row_w)| *packed_w = row_w[j]);
-            *slot = packed;
+        for w in 0..P::WIDTH {
+            let row = self.get_lde_values(
+                degree_bits_index,
+                index_start + w,
+                step,
+                slice_start,
+                buf.len(),
+            );
+            for (slot, &value) in buf.iter_mut().zip(row) {
+                slot.as_slice_mut()[w] = value;
+            }
         }
     }
 }
@@ -633,6 +621,47 @@ mod test {
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
     type H = <C as GenericConfig<D>>::Hasher;
+
+    #[test]
+    fn packed_row_buffer_matches_allocating_getter() {
+        type P = <F as Packable>::Packing;
+        let polynomials: Vec<_> = (0..4)
+            .map(|c| PolynomialCoeffs::new(F::rand_vec(32 >> (c / 2))))
+            .collect();
+        let mut timing = TimingTree::default();
+        let ordinary = BatchFriOracle::<F, C, D>::from_coeffs(
+            polynomials.clone(),
+            2,
+            false,
+            1,
+            &mut timing,
+            &[None; 4],
+        );
+        let digests = BatchFriOracle::<F, C, D>::from_coeffs_with_digests(
+            polynomials,
+            vec![0..2, 2..4],
+            2,
+            1,
+            &mut timing,
+        );
+        for oracle in [ordinary, digests] {
+            for (group, &bits) in oracle.degree_bits.iter().enumerate() {
+                for step in [1, 2, 4] {
+                    for start in [0, (1 << (bits + 2)) / step - P::WIDTH] {
+                        for width in 0..=2 {
+                            let expected =
+                                oracle.get_lde_values_packed::<P>(group, start, step, 0, width);
+                            let mut actual = vec![P::ONES; width];
+                            oracle.get_lde_values_packed_into(group, start, step, 0, &mut actual);
+                            for (a, b) in actual.iter().zip(&expected) {
+                                assert_eq!(a.as_slice(), b.as_slice());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn batch_prove_openings() -> anyhow::Result<()> {

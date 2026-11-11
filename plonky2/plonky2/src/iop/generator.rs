@@ -164,13 +164,14 @@ pub fn generate_partial_witness_fast<
             }
         }
     };
+    let threads = plonky2_maybe_rayon::rayon::current_num_threads();
     let mut serial_buffer = GeneratedValues::empty();
     for layer in layers {
         // Tiny dependency layers cost less than a Rayon scheduling round.
-        if layer.len() <= 32 {
+        if layer.len() <= (2 * threads).max(32) {
             run_chunk(&mut serial_buffer, layer);
         } else {
-            let chunk = layer.len().div_ceil(96 * 8).clamp(4, 512);
+            let chunk = layer.len().div_ceil(threads * 8).clamp(4, 512);
             layer
                 .par_chunks(chunk)
                 .for_each_init(GeneratedValues::empty, run_chunk);
