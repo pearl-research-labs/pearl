@@ -48,3 +48,5 @@ pub mod unpredictability;
 pub mod utils;
 pub mod wrapper;
 pub mod xor_fold_stark;
+
+pub(crate) mod trace_padding;

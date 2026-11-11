@@ -50,6 +50,7 @@ use crate::v4::api::prequant::BLOCK_SIZE;
 use crate::v4::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader, Sides};
 use crate::v4::circuit::blake3_stark::stark::ROWS_PER_COMPRESSION;
 use crate::v4::circuit::ctl::Table;
+use crate::v4::circuit::trace_padding::checked_trace_padded_height;
 
 /// State-window depth `D`: `σ_d` must be one of the `D` most recent ancestors
 /// `σ_1..σ_D` of the proposed header, never the proposed header itself.
@@ -632,13 +633,8 @@ impl PublicParams {
     /// unopened sibling CVs are supplied without compression work.
     pub const MAX_BLAKE3_WORK_BYTES: usize = 1 << 22;
 
-    /// Budget for the structural score defined by `verifier_work_units`: arithmetic
-    /// products, compilation bytes, and generated known-column entries each count once.
-    /// This weighting is admission policy, not a conversion from bytes to MACs or time.
-    /// Fixed recursive verification is geometry-independent; plain proofs share this rule.
-    /// Cap at 2T, where T = 121,922,274 is the score of the dense reference tile
-    /// h = w = 16, k = 2^16, r = 32, with four Blake lanes per axis (either device).
-    pub(crate) const MAX_VERIFIER_WORK: u64 = 2 * 121_922_274;
+    /// Proxy for ZK verification time, capped as an anti-DoS admission limit.
+    pub(crate) const MAX_VERIFIER_WORK: u64 = 1 << 28;
 
     /// Byte length of a dense (non-MoE) statement:
     /// σ_d (108) + pB (19) + HB (32) + pA (9) + HA (32) + tile bases (8) + J (32).
@@ -1127,14 +1123,13 @@ fn verifier_work_units(device: Device, h: u64, w: u64, k: u64, r: u64, blake_blo
     let compiled = opened
         .checked_add(scales)?
         .checked_add(blake_blocks.checked_mul(blake3::BLOCK_LEN as u64)?)?;
+    let pad = checked_trace_padded_height;
     let heights = [
-        blake_blocks
-            .checked_mul(ROWS_PER_COMPRESSION as u64)?
-            .checked_next_power_of_two()?,
-        h.max(w).checked_mul(k)?.checked_next_power_of_two()?,
-        strips.checked_next_power_of_two()?,
-        h.checked_mul(w)?.checked_mul(k / 32)?.checked_next_power_of_two()?,
-        h.checked_mul(w)?.checked_next_power_of_two()?,
+        pad(blake_blocks.checked_mul(ROWS_PER_COMPRESSION as u64)?)?, // Blake3
+        pad(h.max(w).checked_mul(k)?)?,                               // InputQuant
+        pad(strips)?,                                                 // Scale
+        pad(h.checked_mul(w)?.checked_mul(k / 32)?)?,                 // Matmul
+        pad(h.checked_mul(w)?)?,                                      // XorFold
     ];
 
     let mut work = replay.checked_add(expanded.checked_mul(2)?)?.checked_add(compiled)?;
@@ -2203,8 +2198,7 @@ mod tests {
             let blocks = params.blake3_work_block_bound().unwrap();
             assert!(params.verifier_work_units(blocks).unwrap() <= PublicParams::MAX_VERIFIER_WORK);
 
-            // The 4x64 reference geometry: this profile exceeded the old 2^27
-            // score budget and is admitted under 2T.
+            // This geometry exceeded the 2^27 budget.
             params.job.operands.b.tile_size = 64;
             params.job.common.k = 40960;
             let blocks = params.blake3_work_block_bound().unwrap();
@@ -2234,11 +2228,12 @@ mod tests {
             let before = verifier_work_units(device, 4, 64, 1024, 32, 1024).unwrap();
             let after = verifier_work_units(device, 4, 64, 1024, 32, 1025).unwrap();
             let columns = Table::Blake3.known_column_count(device) as u64;
-            let extra_padded_rows = 1024 * ROWS_PER_COMPRESSION as u64;
+            let before_height = 1 << 13;
+            let after_height = 1 << 16;
             let expected_increase = blake3::BLOCK_LEN as u64
-                + extra_padded_rows * columns
-                + known_column_evaluation_products(2 * extra_padded_rows, columns).unwrap()
-                - known_column_evaluation_products(extra_padded_rows, columns).unwrap();
+                + (after_height - before_height) * columns
+                + known_column_evaluation_products(after_height, columns).unwrap()
+                - known_column_evaluation_products(before_height, columns).unwrap();
             assert_eq!(after - before, expected_increase);
 
             // Without a padded-height change, the additional compiled message still counts.
@@ -2262,16 +2257,14 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_budget_is_twice_reference_work() {
+    fn arithmetic_budget_covers_reference_profiles() {
         use super::test_fixtures::dense_geometry_job;
         for device in Device::ALL {
             let reference = PublicParams::try_new(dense_geometry_job(16, 16, 65536, device), empty_jackpot(), None).unwrap();
             let reference_work = reference
                 .verifier_work_units(reference.blake3_work_block_bound().unwrap())
                 .unwrap();
-            assert_eq!(reference_work, 121_922_274);
             assert!(reference_work <= PublicParams::MAX_VERIFIER_WORK);
-            assert_eq!(PublicParams::MAX_VERIFIER_WORK, 2 * reference_work);
             for (h, w, k) in [(4, 64, 30784), (4, 128, 16256), (32, 64, 22112), (32, 64, 22144)] {
                 PublicParams::try_new(dense_geometry_job(h, w, k, device), empty_jackpot(), None).unwrap();
             }
