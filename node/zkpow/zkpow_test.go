@@ -360,3 +360,22 @@ func BenchmarkVerifyProof(b *testing.B) {
 	b.StopTimer()
 	b.ReportMetric(float64(b.Elapsed().Milliseconds())/float64(b.N), "ms/op")
 }
+
+func TestVerifyCertificateLegacyProofSizeLimit(t *testing.T) {
+	for _, size := range []int{legacyMaxZKProofSize + 1, wire.MaxZKProofSize} {
+		proof := make([]byte, size)
+		for _, cert := range []wire.BlockCertificate{
+			&wire.CertificateV1{ProofData: proof},
+			&wire.CertificateV2{ProofData: proof},
+			&wire.CertificateV3{CertificateV2: wire.CertificateV2{ProofData: proof}},
+		} {
+			t.Run(fmt.Sprintf("v%d/%d", cert.Version(), size), func(t *testing.T) {
+				var buf bytes.Buffer
+				require.NoError(t, (&wire.MsgCertificate{Certificate: cert}).PrlEncode(&buf, wire.ProtocolVersion))
+				var decoded wire.MsgCertificate
+				require.NoError(t, decoded.PrlDecode(&buf, wire.ProtocolVersion))
+				require.ErrorContains(t, VerifyCertificate(nil, decoded.Certificate), "legacy proof data too large")
+			})
+		}
+	}
+}

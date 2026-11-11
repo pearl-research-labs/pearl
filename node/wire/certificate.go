@@ -74,7 +74,7 @@ import (
 )
 
 // MaxZKProofSize is the maximum size of a serialized ZK proof blob.
-const MaxZKProofSize = 60000
+const MaxZKProofSize = 62000
 
 // CertificateMaxSize is the maximum allowed certificate size. Has headroom on top of MaxZKProofSize.
 const CertificateMaxSize = 65000
