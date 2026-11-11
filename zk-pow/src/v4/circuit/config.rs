@@ -6,20 +6,12 @@ use starky::config::StarkConfig;
 
 use super::trace_padding::DEGREE_BITS as V4_REACHABLE_DEGREE_BITS;
 
-/// V4 query-plus-PoW target; generic checks remain capped by the extension field.
-const SECURITY_BITS: usize = 129;
-
-/// Query count meeting the FRI target for the supplied rate and grinding bits.
-const fn num_query_rounds(security_bits: usize, pow_bits: usize, rate_bits: usize) -> usize {
-    security_bits.saturating_sub(pow_bits).div_ceil(rate_bits)
-}
-
 /// Builds the V4 inner (stage 1) or ZK outer (stage 2) configuration.
 /// Panics for any other stage.
 pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
-    let (pow_bits, rate_bits, num_routed_wires, is_zk) = match stage {
-        1 => (18, 3, 36, false),
-        2 => (23, 8, 37, true),
+    let (pow_bits, rate_bits, num_query_rounds, num_routed_wires, is_zk) = match stage {
+        1 => (18, 3, 37, 36, false),
+        2 => (23, 8, 14, 37, true),
         _ => panic!("V4 recursion stage must be 1 or 2"),
     };
     CircuitConfig {
@@ -37,7 +29,7 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
             proof_of_work_bits: pow_bits as u32,
             batching_proof_of_work_bits: pow_bits as u32,
             reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
-            num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
+            num_query_rounds,
         },
     }
 }
@@ -52,7 +44,7 @@ pub fn v4_stark_config() -> StarkConfig {
         proof_of_work_bits: pow_bits as u32,
         batching_proof_of_work_bits: pow_bits as u32,
         reduction_strategy: FriReductionStrategy::Ladder(V4_REACHABLE_DEGREE_BITS.to_vec()),
-        num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
+        num_query_rounds: 113,
     };
     // Three CTL/Logup repetitions keep batched-lookup error below the FRI error.
     StarkConfig::new(128, 3, fri_config)
