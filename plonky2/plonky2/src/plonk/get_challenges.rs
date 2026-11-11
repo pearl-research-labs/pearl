@@ -201,7 +201,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         &self,
         challenges: &ProofChallenges<F, D>,
         common_data: &CommonCircuitData<F, D>,
-    ) -> FriInferredElements<F, D> {
+    ) -> anyhow::Result<FriInferredElements<F, D>> {
         let ProofChallenges {
             plonk_zeta,
             fri_challenges:
@@ -213,6 +213,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 },
             ..
         } = challenges;
+        let query_round_proofs = &self.proof.opening_proof.query_round_proofs;
         let mut fri_inferred_elements = Vec::new();
         // Holds the indices that have already been seen at each reduction depth.
         let mut seen_indices_by_depth =
@@ -229,11 +230,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             let mut subgroup_x = lde_coset_point(x_index, log_n);
             let mut old_eval = fri_combine_initial::<F, C, D>(
                 &common_data.get_fri_instance(*plonk_zeta),
-                &self
-                    .proof
-                    .opening_proof
-                    .query_round_proofs
-                    .initial_trees_proofs[&x_index],
+                query_round_proofs
+                    .initial_trees_proofs
+                    .get(&x_index)
+                    .ok_or_else(|| anyhow::anyhow!("Missing compressed FRI initial proof."))?,
                 *fri_alpha,
                 subgroup_x,
                 &precomputed_reduced_evals,
@@ -252,7 +252,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 }
                 fri_inferred_elements.push(old_eval);
                 let arity = 1 << arity_bits;
-                let mut evals = self.proof.opening_proof.query_round_proofs.steps[i][&coset_index]
+                let mut evals = query_round_proofs
+                    .steps
+                    .get(i)
+                    .and_then(|step| step.get(&coset_index))
+                    .ok_or_else(|| anyhow::anyhow!("Missing compressed FRI query step."))?
                     .evals
                     .clone();
                 let x_index_within_coset = x_index & (arity - 1);
@@ -268,7 +272,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 x_index = coset_index;
             }
         }
-        FriInferredElements(fri_inferred_elements)
+        Ok(FriInferredElements(fri_inferred_elements))
     }
 }
 
