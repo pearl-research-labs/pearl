@@ -434,12 +434,12 @@ def tensor_hash_plus_stats(
         seedA       = H_"seed-A"(HA || seedB || keyA || pA)
         a_keys      = seedA || Subkey("noise-line", seedA) || Subkey("jackpot", seedA)
 
-    ``seed_b`` is B's 32-byte noise seed and ``p_a`` the 11-byte dense ``pA``
+    ``seed_b`` is B's 32-byte noise seed and ``p_a`` the 9-byte dense ``pA``
     encoding (``MiningConfiguration.p_a(m)``; a compile-time constant, so a
     different lottery layout or leaf recompiles the finalize). ``a_keys`` is
     the 96-byte output (``miner_base.commitment_hash.AKeys``).
 
-    MoE launches pass the 13-byte MoE ``pA`` together with
+    MoE launches pass the 11-byte MoE ``pA`` together with
     ``routing_commitments``, the 64-byte ``HR || HO`` device digests of the
     routing table; the finalize then derives ``seedA = H_"seed-A"(HA || HR ||
     HO || seedB || keyA || pA)``. Supplying only one of the two is an error.

@@ -39,7 +39,7 @@ LABEL_SEED_A = b"pearl/v4/FP8/seed-A"
 LABEL_NOISE_LINE = b"pearl/v4/FP8/noise-line"
 LABEL_JACKPOT = b"pearl/v4/FP8/jackpot"
 
-P_A_BYTES = 11  # u32(m) | u8(hash_id) | pattern(6): the dense pA
+P_A_BYTES = 9  # u32(m) | u8(hash_id) | u32(h): the dense pA
 P_A_MOE_BYTES = P_A_BYTES + 2  # ... | u8(hash_idR) | u8(hash_idO): the MoE pA
 _P_A_WORDS = (P_A_MOE_BYTES + 3) // 4  # both encodings fit four words
 ROUTING_COMMITMENTS_BYTES = 64  # HR || HO
@@ -65,7 +65,7 @@ _JACKPOT_LABEL = _words(LABEL_JACKPOT)
 def p_a_words(p_a: bytes) -> tuple[int, ...]:
     """``pA`` as the constexpr words the finalize splices into seedA's last block.
 
-    Accepts the 11-byte dense encoding or the 13-byte MoE encoding; the word
+    Accepts the 9-byte dense encoding or the 11-byte MoE encoding; the word
     tuple is padded to four words either way, and ``len(p_a)`` (which also
     selects the routing-commitment message layout) is passed separately.
     """

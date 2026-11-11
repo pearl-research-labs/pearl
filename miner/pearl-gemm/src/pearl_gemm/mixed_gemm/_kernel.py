@@ -48,6 +48,7 @@ from ._lottery import (
     SUPPORTED_LTILE_ROWS,
     _fold_word,
     _HitPublishMixin,
+    _quad_transpose,
 )
 
 _EPI_THREADS = 128  # epilogue threads per CTA (4 warps): one hashed message each
@@ -58,9 +59,9 @@ def cta_tile_m(tile_m: int) -> int:
     return min(tile_m, 128)
 
 
-def _word_of(column: int, words_per_row: int) -> int:
-    """The word (within its column tile) a column feeds: its mod-8 pair class."""
-    return (column >> 1) % words_per_row
+def _word_of(column: int, words_per_row: int, ltile_cols: int) -> int:
+    """The word (within its lottery-tile row) a column feeds: its consecutive chunk."""
+    return (column % ltile_cols) * words_per_row // ltile_cols
 
 
 def _thread_fold_cells(tiled_copy_t2r, thread: int) -> dict[int, list[tuple[int, int]]]:
@@ -76,83 +77,52 @@ def _thread_fold_cells(tiled_copy_t2r, thread: int) -> dict[int, list[tuple[int,
     return {row: sorted(pairs, key=lambda p: p[1]) for row, pairs in sorted(by_row.items())}
 
 
-def _check_complete_words(groups, base: int, words_per_row: int, ltile_cols: int, n_size: int):
-    for group in groups:
-        by_word = {}
-        for _, column, slot in group:
-            by_word.setdefault((column // ltile_cols, slot), []).append(column)
-        for (column_tile, slot), columns in by_word.items():
-            complete = [
-                c
-                for c in range(n_size)
-                if c // ltile_cols == column_tile and _word_of(c, words_per_row) == base + slot
-            ]
-            assert columns == complete, (
-                f"a row class must fold complete words in ascending order: {columns}"
-            )
+def _fold_register_groups(
+    tiled_copy_t2r, words_per_row: int, ltile_cols: int
+) -> tuple[list[list[tuple[int, int]]], bool]:
+    """Static per-row-class fold mapping of the TMEM load, in ascending column order.
 
-
-def _check_fold_thread_invariance(tiled_copy_t2r, groups, words_per_row: int, ltile_cols: int):
+    The committed t2r families give a thread either whole accumulator rows
+    (128-row tiles, 32dp loads), which it folds into every word of the row
+    directly, or the mma fragment layout (64-row tiles, 16dp loads): the four
+    lanes of a quad share two rows, lane ``q`` holding columns ``8b + 2q +
+    {0, 1}``, so the quad exchanges its cells (``_quad_transpose``) and lane
+    ``q`` folds word ``q``. Returns the thread-invariant ``(register, subtile
+    column)`` pairs per row class and whether the quad exchange is needed.
+    Derived (and asserted) from the tiled copy's static TV layout so any
+    future atom change fails at compile time, not silently.
+    """
+    threads = cute.size(tiled_copy_t2r.layout_dst_tv_tiled, mode=[0])
+    m_size = cute.size(tiled_copy_t2r.tiler_mn[0])
+    n_size = cute.size(tiled_copy_t2r.tiler_mn[1])
+    groups = list(_thread_fold_cells(tiled_copy_t2r, 0).values())
+    quad = len(groups[0]) != n_size
+    if quad:
+        assert words_per_row == 4, "the quad exchange folds the 4-row family only"
+        assert (n_size % ltile_cols == 0 or ltile_cols % n_size == 0) and ltile_cols % 32 == 0, (
+            f"quad fold needs {ltile_cols}-column tiles aligned to subtiles of {n_size}"
+        )
     covered = set()
-    for thread in range(cute.size(tiled_copy_t2r.layout_dst_tv_tiled, mode=[0])):
+    for thread in range(threads):
         cells = _thread_fold_cells(tiled_copy_t2r, thread)
-        assert len(cells) == len(groups), "row-class count must be thread-invariant"
-        thread_base = _word_of(next(iter(cells.values()))[0][1], words_per_row)
-        for pairs, ref_group in zip(cells.values(), groups, strict=True):
-            for (value, column), (ref_value, ref_column, ref_slot) in zip(
-                pairs, ref_group, strict=True
-            ):
-                assert value == ref_value, "t2r register order must be thread-invariant"
-                # Relative word slot + lottery-tile, not exact column: the
-                # 64-row 16dp mapping gives each thread a different mod-8
-                # column-pair of the same word class, so ``column ==
-                # ref_column`` would reject the layout the fold is written
-                # for. Complete-word coverage is asserted separately.
-                assert _word_of(column, words_per_row) - thread_base == ref_slot, (
-                    "word slots must be thread-invariant"
-                )
-                assert column // ltile_cols == ref_column // ltile_cols, (
-                    "column tiles must be thread-invariant"
-                )
+        if quad:
+            columns = [8 * (i // 2) + 2 * (thread & 3) + i % 2 for i in range(n_size // 4)]
+            assert cells.keys() == _thread_fold_cells(tiled_copy_t2r, thread & ~3).keys(), (
+                "quad lanes must share their rows"
+            )
+        else:
+            columns = list(range(n_size))
+        for pairs, ref_pairs in zip(cells.values(), groups, strict=True):
+            assert [v for v, _ in pairs] == [v for v, _ in ref_pairs], (
+                "t2r register order must be thread-invariant"
+            )
+            assert [c for _, c in pairs] == columns, f"unexpected t2r columns: {pairs}"
         for row, pairs in cells.items():
             for _, column in pairs:
                 assert (row, column) not in covered, "t2r cells must not be shared"
                 covered.add((row, column))
-    m_size = cute.size(tiled_copy_t2r.tiler_mn[0])
-    n_size = cute.size(tiled_copy_t2r.tiler_mn[1])
     assert len(covered) == m_size * n_size, "t2r threads must cover the subtile exactly once"
-
-
-def _fold_register_groups(
-    tiled_copy_t2r, words_per_row: int, ltile_cols: int
-) -> tuple[list[list[tuple[int, int, int]]], int]:
-    """Static per-row-class fold mapping of the TMEM load, in fold order.
-
-    Every thread must fold complete lottery words. The committed t2r families
-    give a thread either one accumulator row with every subtile column
-    (128-row tiles, 32dp loads) or two rows whose columns are one word's
-    congruence classes per row (64-row tiles, 16dp loads: the mma-M 64
-    accumulator holds 16 lanes per warp block, so two threads split each row
-    at mod-8 column-pair granularity). Both reduce to per-row-class
-    ``(register, subtile column, word slot)`` triples in ascending column
-    order, where a thread's absolute word index is its runtime word base
-    (from its first column) plus the static slot. Derived (and asserted) from
-    the tiled copy's static TV layout so any future atom change fails at
-    compile time, not silently.
-    """
-    reference = _thread_fold_cells(tiled_copy_t2r, 0)
-    base = _word_of(next(iter(reference.values()))[0][1], words_per_row)
-    groups = [
-        [(value, column, _word_of(column, words_per_row) - base) for value, column in pairs]
-        for pairs in reference.values()
-    ]
-    slots = sorted({slot for group in groups for _, _, slot in group})
-    words_per_class = len(slots)
-    assert slots == list(range(words_per_class)), f"word slots must be contiguous: {slots}"
-    n_size = cute.size(tiled_copy_t2r.tiler_mn[1])
-    _check_complete_words(groups, base, words_per_row, ltile_cols, n_size)
-    _check_fold_thread_invariance(tiled_copy_t2r, groups, words_per_row, ltile_cols)
-    return groups, words_per_class
+    return groups, quad
 
 
 class _FusedGemmSm100(_HitPublishMixin, GemmSm100):
@@ -197,22 +167,18 @@ class _FusedGemmSm100(_HitPublishMixin, GemmSm100):
         self.cta_m = mma_m // (2 if use_2cta_instrs else 1)
         assert self.cta_m == cta_tile_m(tile_m)
         self.tile_n = tile_n
-        # Two committed tile families, both 512 elements (same effective work):
-        # - 4 rows x {64,128,192,256} cols: rows (subtile {0}, grid {0..3});
-        #   cols (subtile pairs {0,1} mod 8, grid {0,2,4,6}); each row
-        #   contributes 4 message words (one per column-grid offset).
-        # - 16 rows x 32 cols: rows (subtile {0}, grid {0..15}); cols
-        #   (subtile {0..31}, grid {0}); each row folds its whole 32-column
-        #   slice into 1 message word (lane = row within the tile).
+        # Committed tile families: message word j folds the j-th of 16
+        # consecutive chunks of the row-major tile, so a 4-row tile's row
+        # contributes 4 words of ltile_cols/4 columns and a 16x32 tile's row
+        # one whole-row word.
         assert ltile_rows in SUPPORTED_LTILE_ROWS, f"unsupported lottery tile rows: {ltile_rows}"
         supported_cols = SUPPORTED_LTILE_COLS[ltile_rows]
         assert ltile_cols in supported_cols, (
             f"unsupported lottery tile cols for {ltile_rows} rows: {ltile_cols}"
         )
-        # The 16-row family folds one contiguous 32-column row slice per word,
-        # but the 64-row tile's TMEM loads split every accumulator row between
-        # two threads, so no single thread can fold such a word (see
-        # _fold_register_groups). Only the 4-row family fits cta_m 64.
+        # The 64-row tile's TMEM loads split every accumulator row across a
+        # quad, whose exchange (see _fold_register_groups) yields one word
+        # per lane: only the 4-row family fits cta_m 64.
         assert not (self.cta_m == 64 and ltile_rows != 4), (
             f"tile_m 64 supports only the 4-row lottery family, got {ltile_rows} rows"
         )
@@ -400,39 +366,79 @@ class _FusedGemmSm100(_HitPublishMixin, GemmSm100):
         tTR_tAcc: cute.Tensor,  # grouped (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
         tTR_rAcc: cute.Tensor,
         fold_groups: cutlass.Constexpr,
+        quad: cutlass.Constexpr,
         words_per_class: cutlass.Constexpr,
         epi_tile_n: cutlass.Constexpr,
+        quad_lane: Int32,
     ) -> cute.Tensor:
         """Fold this thread's pre-peel accumulator cells into lottery words.
 
         ``fold_groups`` (from ``_fold_register_groups``) lists, per row class,
-        the thread's registers in ascending column order with their static
-        word slot. Each partial accumulates one complete message word (the
-        committed patterns guarantee whole words per thread; the thread's
-        runtime word base offsets the slot at staging time):
-
-        - 4-row tiles: word j of message (lottery row r, column tile ct)
-          folds row ``4r + (j >> 2)`` at columns congruent to
-          ``{2*(j&3), 2*(j&3)+1}`` mod 8 within the column tile.
-        - 16-row tiles: word j folds row ``16r + j`` over the whole
-          32-column tile.
+        the thread's registers in ascending column order. Word j of message
+        (lottery row r, column tile ct) folds, in ascending column order, the
+        j-th of 16 consecutive chunks of the row-major tile. A whole-row
+        thread folds every word of its rows; with ``quad``, lane ``q`` folds
+        word ``q`` of its rows after the quad exchange.
         """
         num_partials = len(fold_groups) * self.column_tiles * words_per_class
         partials = cute.make_rmem_tensor(num_partials, Uint32)
         for word in cutlass.range_constexpr(num_partials):
             partials[word] = Uint32(0)
-        for epi_n in cutlass.range_constexpr(self.tile_n // epi_tile_n):
-            cute.copy(tiled_copy_t2r, tTR_tAcc[None, None, None, (0, epi_n)], tTR_rAcc)
+        # The quad exchange needs a column tile's four words at once, so it
+        # loads every subtile the column tile spans before folding.
+        spans = max(1, self.ltile_cols // epi_tile_n) if const_expr(quad) else 1
+        for first in cutlass.range_constexpr(0, self.tile_n // epi_tile_n, spans):
+            regs = [tTR_rAcc] + [
+                cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype) for _ in range(spans - 1)
+            ]
+            for span in cutlass.range_constexpr(spans):
+                cute.copy(tiled_copy_t2r, tTR_tAcc[None, None, None, (0, first + span)], regs[span])
             for row_class, group in enumerate(fold_groups):
-                for value, column_offset, word_slot in group:
-                    # Trace-time (fold_groups and epi_n are static): the
-                    # partial this column feeds. epi_tile_n % 8 == 0 keeps
-                    # word slots subtile-invariant (asserted in kernel()).
-                    column_tile = (epi_n * epi_tile_n + column_offset) // self.ltile_cols
-                    word = (row_class * self.column_tiles + column_tile) * words_per_class
-                    word += word_slot
-                    partials[word] = _fold_word(partials[word], tTR_rAcc[value].bitcast(Uint32))
+                if const_expr(quad):
+                    first_tile = first * epi_tile_n // self.ltile_cols
+                    last_tile = max(first_tile + 1, (first + spans) * epi_tile_n // self.ltile_cols)
+                    for column_tile in cutlass.range_constexpr(first_tile, last_tile):
+                        word = row_class * self.column_tiles + column_tile
+                        partials[word] = self._fold_quad_word(
+                            partials[word], regs, group, first, column_tile, epi_tile_n, quad_lane
+                        )
+                else:
+                    for value, column_offset in group:
+                        column = first * epi_tile_n + column_offset
+                        word = (row_class * self.column_tiles + column // self.ltile_cols) * (
+                            words_per_class
+                        ) + _word_of(column, self.words_per_row, self.ltile_cols)
+                        partials[word] = _fold_word(partials[word], tTR_rAcc[value].bitcast(Uint32))
         return partials
+
+    @cute.jit
+    def _fold_quad_word(
+        self,
+        folded: Uint32,
+        regs,  # the loaded subtiles from ``first`` on
+        group: cutlass.Constexpr,
+        first: cutlass.Constexpr,
+        column_tile: cutlass.Constexpr,
+        epi_tile_n: cutlass.Constexpr,
+        quad_lane: Int32,
+    ) -> Uint32:
+        """Fold word ``quad_lane`` of one row of ``column_tile``: per 8-column
+        block of the lane's chunk, the quad exchanges its cells of the four
+        chunks, then the lane folds the block's columns in ascending order."""
+        chunk_blocks = self.ltile_cols // 32  # 8-column blocks per chunk
+        for block in cutlass.range_constexpr(chunk_blocks):
+            cells = []
+            for half in cutlass.range_constexpr(2):
+                chunk_cells = []
+                for chunk in cutlass.range_constexpr(4):
+                    column = column_tile * self.ltile_cols + 8 * (chunk * chunk_blocks + block)
+                    value = group[2 * ((column % epi_tile_n) // 8) + half][0]
+                    chunk_cells.append(regs[column // epi_tile_n - first][value].bitcast(Uint32))
+                cells.append(_quad_transpose(chunk_cells, quad_lane))
+            for lane in cutlass.range_constexpr(4):
+                for half in cutlass.range_constexpr(2):
+                    folded = _fold_word(folded, cells[half][lane])
+        return folded
 
     @cute.jit
     def _stage_lottery_words(
@@ -1108,15 +1114,13 @@ class _FusedGemmSm100(_HitPublishMixin, GemmSm100):
                 tiled_copy_t2r, self.d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
             )
 
-            # Static fold mapping (asserts whole-word ownership per thread)
-            # and the dynamic accumulator rows and word base this thread owns.
+            # Static fold mapping (asserted against the t2r layout) and the
+            # dynamic accumulator rows and word base this thread owns.
             epi_tile_n = const_expr(cute.size(epi_tile[1]))
-            # Word slots and column tiles must be subtile-invariant: subtile
-            # offsets may not rotate a column's mod-8 pair class.
-            assert epi_tile_n % 8 == 0, f"epi_tile_n must be a multiple of 8, got {epi_tile_n}"
-            fold_groups, words_per_class = _fold_register_groups(
+            fold_groups, quad = _fold_register_groups(
                 tiled_copy_t2r, self.words_per_row, self.ltile_cols
             )
+            words_per_class = 1 if quad else self.words_per_row
             cAcc = cute.make_identity_tensor((self.cta_m, self.tile_n))
             cAcc_epi = cute.flat_divide(cAcc, epi_tile)
             tTR_cAcc = tiled_copy_t2r.get_slice(epi_tidx).partition_D(cAcc_epi)
@@ -1190,8 +1194,10 @@ class _FusedGemmSm100(_HitPublishMixin, GemmSm100):
                     tTR_tAcc,
                     tTR_rAcc,
                     fold_groups,
+                    quad,
                     words_per_class,
                     epi_tile_n,
+                    word_base,
                 )
                 cute.arch.fence_view_async_tmem_load()
                 prepeel_pipeline.consumer_release(prepeel_consumer_state)

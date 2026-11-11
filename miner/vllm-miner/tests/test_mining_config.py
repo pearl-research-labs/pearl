@@ -200,25 +200,25 @@ def test_credited_work_is_mnk_and_rejects_unmineable(device):
 @_DEVICES
 def test_mineable_domain_and_tile_selection(device):
     """The mineable (n, k) domain and the tile it commits: the 4x64 tile is
-    preferred wherever it fits (n % 64, 1024 <= k <= 61440) -- the narrowest
+    preferred wherever it fits (n % 64, 1024 <= k <= 30720) -- the narrowest
     4-row tile mixed_gemm's 64-row decode kernel tile can run -- the tall
     16x32 covers what it cannot (n % 32 not 64-aligned, or k in
-    (61440, 65536]), the default 4x128 caps at k <= 31744, all stay within
-    the verifier's 2^22 element limit, and n is bounded exclusively below 2^24.
+    (30720, 43520]), the default 4x128 caps at k <= 15872, all stay within
+    the verifier's 4 MiB peel input, and n is bounded exclusively below 2^24.
     Out-of-domain shapes select no tile, so ``select_tile`` and
     ``is_mineable_shape`` agree."""
-    assert max_verifiable_k() == 31744  # 4x128 cap
-    assert max_verifiable_k(tile_cols=32, tile_rows=16) == 65536  # tall cap (MAX_K)
-    assert max_verifiable_k(tile_cols=64, tile_rows=4) == 61440  # 4x64 cap
-    assert max_mineable_k() == 65536  # full domain across tiles (MAX_K)
+    assert max_verifiable_k() == 15872  # 4x128 cap
+    assert max_verifiable_k(tile_cols=32, tile_rows=16) == 43520  # tall cap
+    assert max_verifiable_k(tile_cols=64, tile_rows=4) == 30720  # 4x64 cap
+    assert max_mineable_k() == 43520  # full domain across tiles
     # 4x64 preferred wherever it fits: it unlocks the 64-row decode tile.
-    for n, k in ((256, 1024), (256, 31744), (6144, 16384), (6144, 61440)):
+    for n, k in ((256, 1024), (256, 15872), (6144, 16384), (6144, 30720)):
         assert select_tile(n, k, device=device) == SMALL_TILE
         assert is_mineable_shape(n=n, k=k, device=device)
     # The tall tile covers what 4x64 cannot: 32-aligned n that is not
     # 64-aligned, and k past the 4x64 proof cap. On Hopper the tall tile is
     # not committed, so these shapes are refused instead of mis-tiled.
-    for n, k in ((96, 4096), (6144, 65536), (256, 61440 + 512)):
+    for n, k in ((96, 4096), (6144, 43520), (256, 30720 + 512)):
         if _tall_committed(device):
             assert select_tile(n, k, device=device) == TALL_TILE
             assert is_mineable_shape(n=n, k=k, device=device)
@@ -226,14 +226,14 @@ def test_mineable_domain_and_tile_selection(device):
             assert select_tile(n, k, device=device) is None
             assert not is_mineable_shape(n=n, k=k, device=device)
     # Out of domain -> no tile: under one 32-col tile, below the verifier's
-    # k floor (1024), k not 512-aligned, or past the tall cap (MAX_K).
-    for n, k in ((16, 4096), (256, 512), (256, 768), (256, 4104), (256, 65536 + 512)):
+    # k floor (1024), k not 512-aligned, or past the tall cap.
+    for n, k in ((16, 4096), (256, 512), (256, 768), (256, 4104), (256, 43520 + 512)):
         assert select_tile(n, k, device=device) is None
         assert not is_mineable_shape(n=n, k=k, device=device)
-    # Peel proof stays within the verifier's 2^22 element limit for every tile.
-    assert (TILE_ROWS + TILE_COLS) * max_verifiable_k() <= 1 << 22
-    assert (16 + 32) * max_verifiable_k(tile_cols=32, tile_rows=16) <= 1 << 22
-    assert (4 + 64) * max_verifiable_k(tile_cols=64, tile_rows=4) <= 1 << 22
+    # Peel proof stays within the verifier's 4 MiB worker input for every tile.
+    assert (TILE_ROWS + TILE_COLS) * max_verifiable_k() * 2 <= 1 << 22
+    assert (16 + 32) * max_verifiable_k(tile_cols=32, tile_rows=16) * 2 <= 1 << 22
+    assert (4 + 64) * max_verifiable_k(tile_cols=64, tile_rows=4) * 2 <= 1 << 22
     # The public dimension cap is exclusive: n == 2^24 is rejected after the
     # (n, k) buffers allocate; the largest aligned dim below it stays mineable.
     # (2^24 - 32 is 32- but not 64-aligned: tall-tile-only, so Blackwell-only.)
@@ -266,7 +266,7 @@ def test_commitment_binds_n_and_k(device):
     committed ``pA``/``pB`` (hence the noise seeds) -- a caller that
     omits/mismatches n publishes a commitment that matches no launch
     (``job_prep.prepare_layer`` target-only fast-path regression guard)."""
-    for k in (1024, 31744, 16384):  # 16384 is within the 4x64 cap
+    for k in (1024, 15872, 16384):  # 16384 is past the 4x128 cap (o_proj)
         with_n = mining_configuration(k, 6144, device=device)
         without_n = mining_configuration(k, device=device)
         assert (with_n.tile_rows, with_n.tile_cols) == (4, 64)
@@ -278,10 +278,10 @@ def test_commitment_binds_n_and_k(device):
     # back-compat commitment, but ``select_tile`` refuses the shape so the
     # runtime (which gates on ``can_mine_layer``) never launches it.
     if _tall_committed(device):
-        assert mining_configuration(k=65536, n=6144, device=device).tile_rows == 16
+        assert mining_configuration(k=43520, n=6144, device=device).tile_rows == 16
     else:
-        assert select_tile(6144, 65536, device=device) is None
-        assert mining_configuration(k=65536, n=6144, device=device).tile_rows == TILE_ROWS
+        assert select_tile(6144, 43520, device=device) is None
+        assert mining_configuration(k=43520, n=6144, device=device).tile_rows == TILE_ROWS
     assert mining_configuration(16384, 6144, device=device).p_b(6144) != mining_configuration(
         12288, 6144, device=device
     ).p_b(6144)  # k bound
@@ -303,9 +303,9 @@ def test_tile_layout_matches_reference_and_kernel(device):
     # The 4-row family is single-sourced from the miner-base builder (which
     # must be given the runtime's committed device to compare bytes).
     shared = default_mining_config(
-        31744, RANK, ltile_cols=TILE_COLS, ltile_rows=TILE_ROWS, device=device
+        15872, RANK, ltile_cols=TILE_COLS, ltile_rows=TILE_ROWS, device=device
     )
-    assert mining_configuration(31744, device=device).p_b(6144) == shared.p_b(6144)
+    assert mining_configuration(15872, device=device).p_b(6144) == shared.p_b(6144)
     small_shared = default_mining_config(
         16384, RANK, ltile_cols=SMALL_TILE.cols, ltile_rows=SMALL_TILE.rows, device=device
     )
@@ -315,9 +315,9 @@ def test_tile_layout_matches_reference_and_kernel(device):
     # The 16x32 layout checks are device-independent; only Blackwell actually
     # commits it through ``mining_configuration``.
     tall = (
-        mining_configuration(65536, 6144, device=device)
+        mining_configuration(43520, 6144, device=device)
         if _tall_committed(device)
-        else tall_tile_mining_config(65536, RANK, Device.BLACKWELL)
+        else tall_tile_mining_config(43520, RANK, Device.BLACKWELL)
     )
     tall_lanes = lane_assignment(tall.tile_rows, tall.tile_cols)
     # 16x32: lane j is row j's 32 contiguous columns, ascending.
