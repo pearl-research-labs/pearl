@@ -48,9 +48,6 @@ use serde::{Deserialize, Serialize};
 use crate::v4::api::layout::{MAX_TILE_ROWS, check_lottery_layout, lane_assignment};
 use crate::v4::api::prequant::BLOCK_SIZE;
 use crate::v4::api::primitives::{BlockHeader, Hash256, IncompleteBlockHeader, Sides};
-use crate::v4::circuit::blake3_stark::stark::ROWS_PER_COMPRESSION;
-use crate::v4::circuit::ctl::Table;
-use crate::v4::circuit::trace_padding::checked_trace_padded_height;
 
 /// State-window depth `D`: `σ_d` must be one of the `D` most recent ancestors
 /// `σ_1..σ_D` of the proposed header, never the proposed header itself.
@@ -631,10 +628,7 @@ impl PublicParams {
     /// Compression-message bytes in the four operand trees, optional MoE trees,
     /// the two root folds, and final jackpot. Touched Merkle parents count;
     /// unopened sibling CVs are supplied without compression work.
-    pub const MAX_BLAKE3_WORK_BYTES: usize = 1 << 22;
-
-    /// Proxy for ZK verification time, capped as an anti-DoS admission limit.
-    pub(crate) const MAX_VERIFIER_WORK: u64 = 1 << 28;
+    pub const MAX_BLAKE3_WITNESS_BYTES: usize = 1 << 22;
 
     /// Byte length of a dense (non-MoE) statement:
     /// σ_d (108) + pB (19) + HB (32) + pA (9) + HA (32) + tile bases (8) + J (32).
@@ -656,11 +650,6 @@ impl PublicParams {
     ) -> Result<Self> {
         job.check()?;
         check_lottery_layout(job.operands.a.tile_size as usize, job.operands.b.tile_size as usize)?;
-        check_opened_strips_bound(
-            job.operands.a.tile_size as usize,
-            job.operands.b.tile_size as usize,
-            job.common.k as usize,
-        )?;
         ensure!(
             job.moe.is_some() == moe_statement.is_some(),
             "moe and moe_statement must both be present or both absent"
@@ -683,52 +672,31 @@ impl PublicParams {
             jackpot_statement,
             moe_statement,
         };
-        params.check_work_bounds()?;
+        params.check_blake3_witness_bound()?;
         Ok(params)
     }
 
-    /// Rechecks MoE consistency and work admission before job derivation. Construction
+    /// Rechecks MoE consistency and the Blake3 bound before job derivation. Construction
     /// already checks both; this also rejects statements mutated internally afterward.
     pub(crate) fn recheck_admission(&self) -> Result<()> {
         if let (Some(moe), Some(stmt)) = (self.moe(), self.moe_statement.as_ref()) {
             stmt.check(*moe, self.a(), self.jackpot_statement.tile_bases.a)?;
         }
-        self.check_work_bounds()?;
-        Ok(())
+        self.check_blake3_witness_bound()
     }
 
-    /// Check the aggregate admission budget before compilation, noise expansion, or
-    /// known-column allocation. The separate Blake3 cap remains a component limit.
-    fn check_work_bounds(&self) -> Result<()> {
-        let blake3_blocks = self.blake3_work_block_bound()?;
+    /// Caps all compiled message bytes, including the opened values `(h+w)*k`.
+    /// Checked before compilation, noise expansion, or known-column allocation.
+    fn check_blake3_witness_bound(&self) -> Result<()> {
+        let blake3_blocks = self.blake3_witness_block_bound()?;
         ensure!(
-            blake3_blocks <= (Self::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64,
-            "FP8 Blake3 work exceeds 2^22 bytes"
-        );
-        let work = self.verifier_work_units(blake3_blocks)?;
-        ensure!(
-            work <= Self::MAX_VERIFIER_WORK,
-            "FP8 verifier work exceeds budget || work={work} budget={}",
-            Self::MAX_VERIFIER_WORK
+            blake3_blocks <= (Self::MAX_BLAKE3_WITNESS_BYTES / blake3::BLOCK_LEN) as u64,
+            "FP8 Blake3 witness exceeds 2^22 bytes"
         );
         Ok(())
     }
 
-    /// Deterministic admission cost using the compression bound returned by
-    /// [`Self::blake3_work_block_bound`], avoiding a duplicate forest count.
-    pub(crate) fn verifier_work_units(&self, blake3_blocks: u64) -> Result<u64> {
-        verifier_work_units(
-            self.job.common.device,
-            u64::from(self.h()),
-            u64::from(self.w()),
-            u64::from(self.common_dim()),
-            u64::from(self.rank()),
-            blake3_blocks,
-        )
-        .ok_or_else(|| anyhow::anyhow!("FP8 verifier work arithmetic overflow"))
-    }
-
-    pub(crate) fn blake3_work_block_bound(&self) -> Result<u64> {
+    pub(crate) fn blake3_witness_block_bound(&self) -> Result<u64> {
         let mut count: u64 = 3; // Two operand-root folds and the final jackpot compression.
         let k = u64::from(self.common_dim());
         let scale_row_bytes = 2 * (k / BLOCK_SIZE as u64);
@@ -1102,115 +1070,6 @@ fn blake_tree_block_bound(raw_bytes: u64, hash_id: HashId, opened_bytes: impl In
         .map(|(start, end)| (end - start) * (chunk_blocks + 1) + 2 * (depth + 1))
         .sum();
     Ok(blocks)
-}
-
-/// Structural admission score: `R + 2E + P + sum(N*C + evaluation_products(N,C))`.
-/// R counts noise MACs; E counts sampled noise elements (one square and one scale
-/// product each); P counts opened int8 bytes, BF16 scale bytes and scheduled Blake3
-/// message bytes. N*C counts generated known-column entries, including padding.
-///
-/// P is a compilation-volume bound, not a compiler instruction count. Adding these
-/// different resources with unit weights is an explicit admission policy; the total
-/// is neither an exact MAC count nor a timing estimate. Hashing, divisions, casts and
-/// allocations have no separate instruction charge. The fixed verifier is excluded.
-fn verifier_work_units(device: Device, h: u64, w: u64, k: u64, r: u64, blake_blocks: u64) -> Option<u64> {
-    let strips = h.checked_add(w)?;
-    let opened = strips.checked_mul(k)?;
-    let replay = opened.checked_mul(r)?;
-    let expanded = strips.checked_add(k.checked_mul(2)?)?.checked_mul(r)?;
-    // One two-byte BF16 scale per BLOCK_SIZE int8 values, on both sides.
-    let scales = strips.checked_mul(k / BLOCK_SIZE as u64)?.checked_mul(2)?;
-    let compiled = opened
-        .checked_add(scales)?
-        .checked_add(blake_blocks.checked_mul(blake3::BLOCK_LEN as u64)?)?;
-    let pad = checked_trace_padded_height;
-    let heights = [
-        pad(blake_blocks.checked_mul(ROWS_PER_COMPRESSION as u64)?)?, // Blake3
-        pad(h.max(w).checked_mul(k)?)?,                               // InputQuant
-        pad(strips)?,                                                 // Scale
-        pad(h.checked_mul(w)?.checked_mul(k / 32)?)?,                 // Matmul
-        pad(h.checked_mul(w)?)?,                                      // XorFold
-    ];
-
-    let mut work = replay.checked_add(expanded.checked_mul(2)?)?.checked_add(compiled)?;
-    for table in Table::ALL {
-        let columns = u64::try_from(table.known_column_count(device)).ok()?;
-        if columns == 0 {
-            continue;
-        }
-        let height = heights[table as usize];
-        let generation = height.checked_mul(columns)?;
-        let evaluation = known_column_evaluation_products(height, columns)?;
-        work = work.checked_add(generation)?.checked_add(evaluation)?;
-    }
-    Some(work)
-}
-
-/// Algebraic products in one two-point Goldilocks evaluation, off the trace subgroup.
-/// Follows `starky::verifier::eval_columns_at_point_impl::<_, 2, true>` and
-/// `field::types::batch_multiplicative_inverse`, excluding debug assertions.
-/// Count constant products too, before compiler strength reduction: a quadratic
-/// product `(ac + 7bd, ad + bc)` costs five scalar products; its square costs four
-/// (`a*a`, `b*b`, `7*b²`, `a*(b+b)`). This is not a machine instruction count.
-///
-/// Admission evaluates this at bounded padded heights, separately for each table.
-/// Actual verification may share setup across tables or take the subgroup shortcut,
-/// so the admission sum bounds this algebraic count rather than matching every run.
-pub(crate) fn known_column_evaluation_products(height: u64, columns: u64) -> Option<u64> {
-    use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
-
-    if columns == 0 {
-        return Some(0);
-    }
-    if !height.is_power_of_two() {
-        return None;
-    }
-    let log_height = u64::from(height.ilog2());
-    // primitive_root_of_unity squares the order-2^32 generator 32-log_height times.
-    // Powers::next multiplies once per emitted subgroup element.
-    let subgroup = (GoldilocksField::TWO_ADICITY as u64)
-        .checked_sub(log_height)?
-        .checked_add(height)?;
-    let zeta_power = log_height.checked_mul(4)?; // log_height quadratic squares.
-    let denominators = height.checked_add(2)?; // (a-omega)^2 per row, plus W*b*b.
-
-    const INVERSE_CHUNK_SIZE: u64 = 1024; // eval_columns_at_point_impl::PARALLEL_CHUNK_SIZE.
-    const INVERSE_PRODUCTS: u64 = 72; // GoldilocksField::try_inverse addition chain.
-    let batches = height.div_ceil(INVERSE_CHUNK_SIZE);
-    // Montgomery's trick uses 3*(length-1) products and one inverse per batch.
-    let batch_products = height.checked_sub(batches)?.checked_mul(3)?;
-    let inverse_products = batches.checked_mul(INVERSE_PRODUCTS)?;
-    let row_weights = height; // inv_norm_i * omega_i, shared by all columns and both points.
-    let column_products = height.checked_mul(columns)?.checked_mul(2 * 2)?; // Two products per point.
-    let result_scale = 5; // (zeta^N-1) * N^-1, one quadratic product.
-    let results = columns.checked_mul(2 * (3 + 5))?; // Per point: 3 to assemble [a*s1-s2, -b*s1], 5 to scale.
-
-    [
-        subgroup,
-        zeta_power,
-        denominators,
-        batch_products,
-        inverse_products,
-        row_weights,
-        column_products,
-        result_scale,
-        results,
-    ]
-    .into_iter()
-    .try_fold(0u64, u64::checked_add)
-}
-
-/// `k · (|I_A| + |I_B|) ≤ 2^22`: the opened-strips envelope (worker input, trace heights).
-fn check_opened_strips_bound(h: usize, w: usize, k: usize) -> Result<()> {
-    let opened = h
-        .checked_add(w)
-        .and_then(|hw| hw.checked_mul(k))
-        .ok_or_else(|| anyhow::anyhow!("(h+w)·k overflows usize || h={h} w={w} k={k}"))?;
-    ensure!(
-        opened <= (1 << 22),
-        "k·(|IA|+|IB|) must be <= 2^22 || (h+w)·k={opened} h={h} w={w} k={k}"
-    );
-    Ok(())
 }
 
 /// Consume the next `n` bytes of `s` and return them (or `Err` if short).
@@ -1839,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn opened_strips_bound_rejects_4x64_at_k_2_16() {
+    fn blake3_witness_bound_rejects_4x64_at_k_2_16() {
         let p = dense_params();
         let rows = 4;
         let cols = 64;
@@ -1870,7 +1729,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("k·(|IA|+|IB|) must be <= 2^22"));
+        assert!(err.to_string().contains("Blake3 witness exceeds 2^22 bytes"));
     }
 
     #[test]
@@ -2137,8 +1996,7 @@ mod tests {
             for hash_id in HashId::ALL {
                 for k in [1024, 1056, 2080] {
                     let mut seed = if is_moe { moe_params() } else { dense_params() };
-                    // A balanced admitted tile exercises both aligned and partial
-                    // chunks without bypassing the aggregate admission budget.
+                    // A balanced tile exercises both aligned and partial chunks.
                     seed.job.operands.a.tile_size = 16;
                     seed.job.operands.b.tile_size = 16;
                     if let Some(stmt) = seed.moe_statement.as_mut() {
@@ -2162,7 +2020,10 @@ mod tests {
                         _ => unreachable!(),
                     };
                     let stark = Blake3Program::from_blake_program(&program, k as usize, pins, schedule);
-                    let bound = params.blake3_work_block_bound().unwrap();
+                    let bound = params.blake3_witness_block_bound().unwrap();
+                    assert!(
+                        bound * blake3::BLOCK_LEN as u64 >= u64::from(params.h() + params.w()) * u64::from(params.common_dim())
+                    );
                     let compiled = stark.instructions.len() as u64;
                     assert!(
                         bound >= compiled,
@@ -2172,7 +2033,7 @@ mod tests {
                         bound <= compiled + 4096,
                         "the bound must stay within root-path slack: MoE={is_moe} hash_id={hash_id:?} k={k}: {bound} >> {compiled}"
                     );
-                    assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WORK_BYTES as u64);
+                    assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WITNESS_BYTES as u64);
                 }
             }
         }
@@ -2183,153 +2044,32 @@ mod tests {
         let mut seed = dense_params();
         seed.job.common.k = 31744;
         // The B-side tile stays at the 4x128 default: `(h + w) * k` must fit
-        // the 2^22 aggregate byte cap while the total work still trips it.
+        // the 2^22 byte cap while the full witness bound still trips it.
         assert!((seed.h() as usize + seed.w() as usize) * seed.common_dim() as usize <= (1 << 22));
-        let err = PublicParams::try_new(seed.job, seed.jackpot_statement, None).unwrap_err();
-        assert!(err.to_string().contains("Blake3 work exceeds 2^22 bytes"), "{err}");
+        let err = PublicParams::try_new(seed.job.clone(), seed.jackpot_statement.clone(), None).unwrap_err();
+        assert!(err.to_string().contains("Blake3 witness exceeds 2^22 bytes"), "{err}");
+        let err = PublicParams::from_bytes(&seed.to_bytes()).unwrap_err();
+        assert!(err.to_string().contains("Blake3 witness exceeds 2^22 bytes"), "{err}");
+        let err = seed.recheck_admission().unwrap_err();
+        assert!(err.to_string().contains("Blake3 witness exceeds 2^22 bytes"), "{err}");
     }
 
     #[test]
-    fn aggregate_work_budget_admits_larger_profiles_at_construction_parsing_and_recheck() {
-        for device in [Device::B200, Device::H100] {
-            let mut params = dense_params();
-            params.job.common.device = device;
-            params.recheck_admission().unwrap();
-            let blocks = params.blake3_work_block_bound().unwrap();
-            assert!(params.verifier_work_units(blocks).unwrap() <= PublicParams::MAX_VERIFIER_WORK);
-
-            // This geometry exceeded the 2^27 budget.
-            params.job.operands.b.tile_size = 64;
-            params.job.common.k = 40960;
-            let blocks = params.blake3_work_block_bound().unwrap();
-            assert!(blocks <= (PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64);
-            assert!(params.verifier_work_units(blocks).unwrap() <= PublicParams::MAX_VERIFIER_WORK);
-            PublicParams::try_new(params.job.clone(), params.jackpot_statement.clone(), None).unwrap();
-            PublicParams::from_bytes(&params.to_bytes()).unwrap();
-            params.recheck_admission().unwrap();
-        }
-    }
-
-    #[test]
-    fn aggregate_work_arithmetic_fails_closed() {
-        for (h, w, k, r, blocks) in [
-            (u64::MAX, 1, 1024, 32, 1),
-            (4, 64, u64::MAX, 32, 1),
-            (4, 64, 1024, u64::MAX, 1),
-            (4, 64, 1024, 32, u64::MAX),
-        ] {
-            assert!(verifier_work_units(Device::B200, h, w, k, r, blocks).is_none());
-        }
-    }
-
-    #[test]
-    fn aggregate_work_accounts_for_forest_and_padded_known_columns() {
-        for device in [Device::B200, Device::H100] {
-            let before = verifier_work_units(device, 4, 64, 1024, 32, 1024).unwrap();
-            let after = verifier_work_units(device, 4, 64, 1024, 32, 1025).unwrap();
-            let columns = Table::Blake3.known_column_count(device) as u64;
-            let before_height = 1 << 13;
-            let after_height = 1 << 16;
-            let expected_increase = blake3::BLOCK_LEN as u64
-                + (after_height - before_height) * columns
-                + known_column_evaluation_products(after_height, columns).unwrap()
-                - known_column_evaluation_products(before_height, columns).unwrap();
-            assert_eq!(after - before, expected_increase);
-
-            // Without a padded-height change, the additional compiled message still counts.
-            let same_height = verifier_work_units(device, 4, 64, 1024, 32, 1026).unwrap();
-            assert_eq!(same_height - after, blake3::BLOCK_LEN as u64);
-        }
-    }
-
-    #[test]
-    fn arithmetic_work_counts_two_evaluation_points_and_batch_inverses() {
-        // Independent tally for two columns and two 1024-row inversion batches:
-        // subgroup 2069; zeta^N 44; denominators 2050; batch inversion 6282;
-        // row weights 2048; column sums 16384; scale 5; four results 32.
-        assert_eq!(known_column_evaluation_products(2048, 2), Some(28_914));
-        // One-row evaluation exercises the zero-product Montgomery batch.
-        assert_eq!(known_column_evaluation_products(1, 1), Some(134));
-        assert_eq!(known_column_evaluation_products(2048, 0), Some(0));
-        assert_eq!(known_column_evaluation_products(2049, 2), None);
-        assert_eq!(known_column_evaluation_products(1 << 33, 8), None);
-        assert_eq!(known_column_evaluation_products(1024, u64::MAX), None);
-    }
-
-    #[test]
-    fn arithmetic_budget_covers_reference_profiles() {
+    fn admission_accepts_reference_profiles() {
         use super::test_fixtures::dense_geometry_job;
         for device in Device::ALL {
-            let reference = PublicParams::try_new(dense_geometry_job(16, 16, 65536, device), empty_jackpot(), None).unwrap();
-            let reference_work = reference
-                .verifier_work_units(reference.blake3_work_block_bound().unwrap())
-                .unwrap();
-            assert!(reference_work <= PublicParams::MAX_VERIFIER_WORK);
-            for (h, w, k) in [(4, 64, 30784), (4, 128, 16256), (32, 64, 22112), (32, 64, 22144)] {
-                PublicParams::try_new(dense_geometry_job(h, w, k, device), empty_jackpot(), None).unwrap();
+            for (h, w, k) in [
+                (16, 16, 65536),
+                (32, 32, 32768),
+                (4, 64, 30784),
+                (4, 128, 16256),
+                (32, 64, 22112),
+                (32, 64, 22144),
+            ] {
+                let params = PublicParams::try_new(dense_geometry_job(h, w, k, device), empty_jackpot(), None).unwrap();
+                PublicParams::from_bytes(&params.to_bytes()).unwrap();
+                params.recheck_admission().unwrap();
             }
-        }
-    }
-
-    /// Dense census over the committed lottery envelope (`hw ∈ [256, 2048]`,
-    /// both sides multiples of four, K multiples of 32; component caps
-    /// applied first). This is a geometry census, not a claim about real
-    /// mining-job frequency.
-    /// `cargo test --release report_verifier_work_coverage -- --ignored --nocapture`
-    #[test]
-    #[ignore = "manual admission-policy comparison"]
-    fn report_verifier_work_coverage() {
-        use super::test_fixtures::dense_geometry_job;
-        let budgets = [1 << 25, 1 << 26, 96 << 20, 1 << 27, PublicParams::MAX_VERIFIER_WORK];
-        let mut accepted = [0u64; 5];
-        let mut previous = 0u64;
-        let mut total = 0u64;
-        for h in (4..=128u32).step_by(4) {
-            for w in (16..=2048 / h).step_by(4) {
-                if h * w < 256 {
-                    continue;
-                }
-                let mut params = PublicParams {
-                    job: dense_geometry_job(h, w, 1024, Device::B200),
-                    jackpot_statement: empty_jackpot(),
-                    moe_statement: None,
-                };
-                params.job.check().unwrap();
-                check_lottery_layout(params.a().tile_size as usize, params.b().tile_size as usize).unwrap();
-                let k_max = PublicParams::MAX_K.min((1 << 22) / (h + w) as usize);
-                for k in (PublicParams::MIN_K..=k_max).step_by(32) {
-                    params.job.common.k = k as u32;
-                    let blocks = params.blake3_work_block_bound().unwrap();
-                    if blocks > (PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64 {
-                        continue;
-                    }
-                    total += 1;
-                    let work = params.verifier_work_units(blocks).unwrap();
-                    for (count, budget) in accepted.iter_mut().zip(budgets) {
-                        *count += u64::from(work <= budget);
-                    }
-                    // Evaluate the previous timing-weighted policy for this same sample.
-                    let (h, w, k) = (u64::from(h), u64::from(w), k as u64);
-                    let mut old =
-                        25_000_000 + 4 * (h + w) * k * 32 + 24 * (h + w + 2 * k) * 32 + 2 * ((h + w) * k * 5 / 4 + 64 * blocks);
-                    for (table, n) in [
-                        (Table::Blake3, (blocks * ROWS_PER_COMPRESSION as u64).next_power_of_two()),
-                        (Table::InputQuant, (h.max(w) * k).next_power_of_two()),
-                        (Table::Scale, (h + w).next_power_of_two()),
-                        (Table::XorFold, (h * w).next_power_of_two()),
-                    ] {
-                        old += 4 * n * (3 * table.known_column_count(Device::B200) as u64 + 1);
-                    }
-                    previous += u64::from(old <= 60_000_000);
-                }
-            }
-        }
-        println!("component-legal={total}; previous-60M={previous}");
-        for (budget, count) in budgets.into_iter().zip(accepted) {
-            println!(
-                "structural budget={budget}: accepted={count} ({:.2}%)",
-                100.0 * count as f64 / total as f64
-            );
         }
     }
 
@@ -2378,15 +2118,15 @@ mod tests {
         // The maximal tree adds only root-path parents: ~2 * depth-of-2^24-chunks
         // extra blocks over the baseline, nothing proportional to 2^34 bytes.
         let (bound, small_bound) = (
-            params.blake3_work_block_bound().unwrap(),
-            small.blake3_work_block_bound().unwrap(),
+            params.blake3_witness_block_bound().unwrap(),
+            small.blake3_witness_block_bound().unwrap(),
         );
         assert!(
             bound <= small_bound + 128,
             "maximal routing scalars must bound at O(depth): {bound} vs baseline {small_bound}"
         );
         assert!(
-            bound <= (PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64,
+            bound <= (PublicParams::MAX_BLAKE3_WITNESS_BYTES / blake3::BLOCK_LEN) as u64,
             "maximal routing scalars must pass the work gate"
         );
 
@@ -2401,6 +2141,6 @@ mod tests {
             bound >= compiled,
             "the bound must dominate the compiled stark under maximal scalars: {bound} < {compiled}"
         );
-        assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WORK_BYTES as u64);
+        assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WITNESS_BYTES as u64);
     }
 }

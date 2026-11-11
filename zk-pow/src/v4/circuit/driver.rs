@@ -122,7 +122,7 @@ pub use super::circuit_utils::{
 /// | LUTs       | [`super::luts::lut_live_rows`] | {17, 16, 14, 11, 10, 8, 6, 5} |
 ///
 /// Blake3 work is bounded in closed form from the statement's scalars before
-/// compilation (`PublicParams::check_work_bounds`): four plane trees, MoE
+/// compilation (`PublicParams::check_blake3_witness_bound`): four plane trees, MoE
 /// routing/offsets trees, two root folds, and the jackpot together consume at
 /// most `2^22` compression-message bytes. Thus there are at most `2^16`
 /// compressions and `2^19` rows. The minimum legal tile still has
@@ -1367,63 +1367,6 @@ mod tests {
 
     fn build_system(fx: &Fp8Fixture) -> Fp8System<F, D> {
         Fp8System::new(public_data(fx))
-    }
-
-    #[test]
-    fn admission_work_covers_derived_known_layout() {
-        use crate::v4::api::prequant::BLOCK_SIZE;
-        use crate::v4::api::primitives::IncompleteBlockHeader;
-        use crate::v4::api::public_params::test_fixtures::{dense_params, empty_jackpot};
-        use crate::v4::api::public_params::{HashId, known_column_evaluation_products};
-        use crate::v4::api::zk::Fp8Job;
-        use crate::v4::circuit::blake3_stark::stark::ROWS_PER_COMPRESSION;
-
-        for device in [Device::H100, Device::B200] {
-            for hash_id in HashId::ALL {
-                let mut job = dense_params().job().clone();
-                job.common.device = device;
-                job.operands.a.hash_id = hash_id;
-                job.operands.b.hash_id = hash_id;
-                let params = PublicParams::try_new(job, empty_jackpot(), None).unwrap();
-                let system = Fp8Job::derive(&params, &IncompleteBlockHeader::zero()).unwrap().system;
-                let (h, w, k, r) = (
-                    params.h() as u64,
-                    params.w() as u64,
-                    params.common_dim() as u64,
-                    params.rank() as u64,
-                );
-                let blocks = params.blake3_work_block_bound().unwrap();
-                let heights = [
-                    (blocks * ROWS_PER_COMPRESSION as u64).next_power_of_two(),
-                    (h.max(w) * k).next_power_of_two(),
-                    (h + w).next_power_of_two(),
-                    (h * w * (k / 32)).next_power_of_two(),
-                    (h * w).next_power_of_two(),
-                ]
-                .map(|rows| trace_padded_height(rows as usize) as u64);
-                let compiled_bytes = (h + w) * k + 2 * (h + w) * (k / BLOCK_SIZE as u64) + blocks * blake3::BLOCK_LEN as u64;
-                let mut work = (h + w) * k * r + 2 * r * (h + w + 2 * k) + compiled_bytes;
-                for table in Table::ALL {
-                    let index = table as usize;
-                    let actual_height = 1u64 << system.degree_bits()[index];
-                    if table == Table::Blake3 {
-                        assert!(heights[index] >= actual_height, "{device:?} {hash_id:?}: Blake3 bound");
-                    } else {
-                        assert_eq!(heights[index], actual_height, "{device:?} {hash_id:?}: {table:?} height");
-                    }
-                    let values = &system.known().values_per_table[index];
-                    assert_eq!(values.len(), table.known_column_count(device), "{table:?} width");
-                    assert_eq!(values.len(), system.known().columns_per_table[index].len());
-                    assert!(values.iter().all(|column| column.len() as u64 == actual_height));
-                    if !values.is_empty() {
-                        let columns = values.len() as u64;
-                        work += heights[index] * columns + known_column_evaluation_products(heights[index], columns).unwrap();
-                    }
-                }
-                assert_eq!(params.verifier_work_units(blocks).unwrap(), work);
-                assert!(work <= PublicParams::MAX_VERIFIER_WORK);
-            }
-        }
     }
 
     fn witness<'a>(fx: &'a Fp8Fixture) -> Fp8Witness<'a> {

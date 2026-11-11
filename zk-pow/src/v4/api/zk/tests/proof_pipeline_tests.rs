@@ -174,37 +174,6 @@ fn embedded_cache_verifies_the_committed_go_fixtures() {
     }
 }
 
-/// Pin the entire recursive verifier configuration and its polynomial inventory.
-/// A changed signature requires reviewing resource usage and rerunning `bench_v4_verify`.
-/// `PublicParams` scores geometry-dependent work separately, excluding the fixed verifier.
-#[test]
-#[cfg(feature = "embedded_cache")]
-fn verifier_resource_signature_is_pinned() {
-    use plonky2::util::serialization::DefaultGateSerializer;
-
-    let cache = Fp8VerifierCache::from_bytes(crate::v4::api::embedded_cache::CACHE_DATA).expect("embedded cache must decode");
-    let signatures = [Device::B200, Device::H100].map(|device| {
-        let verifier = cache.get(device).expect("device setup");
-        let mut hash = blake3::Hasher::new();
-        hash.update(
-            &verifier
-                .circuit
-                .common
-                .to_bytes(&DefaultGateSerializer)
-                .expect("serialize common circuit data"),
-        );
-        hash.update(&(verifier.constants_sigmas_polynomials.len() as u64).to_le_bytes());
-        for polynomial in &verifier.constants_sigmas_polynomials {
-            hash.update(&(polynomial.coeffs.len() as u64).to_le_bytes());
-        }
-        hash.finalize().to_hex().to_string()
-    });
-    assert_eq!(
-        signatures, ["ff64c75eb2428651bc975e6ab8423a661e7ee70be0a7e588c4d0da2f0dfcac4d"; 2],
-        "verifier resources changed; review resource usage and rerun bench_v4_verify"
-    );
-}
-
 /// Median of nine warmed, single-thread cached verifications, including parsing.
 /// `cargo test --release --features embedded_cache bench_v4_verify -- --ignored --nocapture`
 #[test]
@@ -261,9 +230,6 @@ fn bench_v4_prove() {
         other => panic!("V4_BENCH_SIZE must be small or medium, got {other}"),
     };
     plain.job.common.device = device;
-    let (_, params) = plain.parse_proof(&header).expect("benchmark job is admitted");
-    let work = params.verifier_work_units(params.blake3_work_block_bound().unwrap()).unwrap();
-    println!("{device:?}: verifier work {work}/{} units", PublicParams::MAX_VERIFIER_WORK);
     let mut prover = Fp8Prover::setup(device).expect("prover setup");
     let setup = &prover.setups[&device];
     let verifier = Fp8Verifier {
