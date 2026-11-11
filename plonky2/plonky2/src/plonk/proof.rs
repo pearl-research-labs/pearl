@@ -535,6 +535,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &verifier_data.circuit_digest,
             common_data,
         )?;
+        // PoW alone is a weak validity filter; the FRI verifier repeats these checks below.
+        // Reject bad PoW early, before expensive query-evaluation reconstruction.
         let fri_challenges = &challenges.fri_challenges;
         let fri_config = &common_data.fri_params.config;
         verify_batching_pow::<F, D>(fri_challenges.batching_pow_response, fri_config)?;
