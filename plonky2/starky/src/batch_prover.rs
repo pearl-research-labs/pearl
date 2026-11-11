@@ -1145,6 +1145,8 @@ where
 
             constraints_evals
         })
+        // Release each point buffer while collecting one flat evaluation array.
+        .flat_map_iter(|point| point)
         .collect::<Vec<_>>();
 
     Ok(Some(
@@ -1153,7 +1155,7 @@ where
             .map(|challenge| {
                 // Expand packed evaluations directly into each challenge's column.
                 let values = quotient_values
-                    .iter()
+                    .chunks_exact(alphas.len())
                     .flat_map(|point| point[challenge].as_slice().iter().copied())
                     .collect();
                 PolynomialValues::new(values).coset_ifft(F::coset_shift())
