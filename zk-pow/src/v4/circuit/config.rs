@@ -19,7 +19,7 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
         num_routed_wires,
         num_constants: 2,
         use_base_arithmetic_gate: true,
-        security_bits: 128,
+        security_bits: 108,
         num_challenges: 3,
         zero_knowledge: is_zk,
         max_quotient_degree_factor: 8,
@@ -47,5 +47,5 @@ pub fn v4_stark_config() -> StarkConfig {
         num_query_rounds: 113,
     };
     // Three CTL/Logup repetitions keep batched-lookup error below the FRI error.
-    StarkConfig::new(128, 3, fri_config)
+    StarkConfig::new(108, 3, fri_config)
 }
