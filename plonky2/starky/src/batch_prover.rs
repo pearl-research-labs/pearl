@@ -35,7 +35,9 @@ use crate::cross_table_lookup::{
     cross_table_lookup_data, take_ctl_auxiliary_polys, CrossTableLookup, CtlCheckVars, CtlData,
 };
 use crate::get_challenges::get_dummy_polys;
-use crate::lookup::{get_grand_product_challenge_set, lookup_helper_columns, LookupCheckVars};
+use crate::lookup::{
+    get_grand_product_challenge_set, lookup_helper_columns, Column, LookupCheckVars,
+};
 use crate::proof::StarkOpeningSet;
 
 /// Batched preprocessed data, committed once at setup time in a single
@@ -342,6 +344,12 @@ where
                 values
                     .into_par_iter()
                     .map(|column| {
+                        if column.values[1..].iter().all(|&v| v == column.values[0]) {
+                            // Constant traces need no transform.
+                            let mut coeffs = vec![F::ZERO; column.len()];
+                            coeffs[0] = column.values[0];
+                            return PolynomialCoeffs::new(coeffs);
+                        }
                         let table = &roots[&column.len()];
                         ifft_with_options(column, None, Some(table))
                     })
@@ -932,9 +940,9 @@ where
 
     // Evaluation of the first Lagrange polynomial on the LDE domain.
     let lagrange_first = PolynomialValues::selector(degree, 0).lde_onto_coset(quotient_degree_bits);
-    // Evaluation of the last Lagrange polynomial on the LDE domain.
-    let lagrange_last =
-        PolynomialValues::selector(degree, degree - 1).lde_onto_coset(quotient_degree_bits);
+    // L_last(x) = L_first(g*x): shift by one trace step on the coset.
+    let mut lagrange_last = lagrange_first.clone();
+    lagrange_last.values.rotate_left(next_step);
 
     let z_h_on_coset = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
 
@@ -989,6 +997,25 @@ where
     // every evaluation point; only the helper-column values and the Z
     // evaluations vary. Each rayon job takes one cloned template
     // (`map_init`) and refills only those point-dependent fields per batch.
+    // Combine each CTL tuple once, instead of at every evaluation point.
+    let combined_columns = ctl_data.map(|data| {
+        data.zs_columns
+            .iter()
+            .map(|zs| {
+                zs.columns
+                    .iter()
+                    .map(|columns| {
+                        [precombine_ctl_columns(
+                            columns,
+                            zs.challenge.beta,
+                            public_inputs,
+                            num_columns,
+                        )]
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    });
     let ctl_meta: Option<Vec<CtlCheckVars<F, F, P, 1>>> = ctl_data.map(|data| {
         let mut vars = Vec::with_capacity(data.zs_columns.len());
         for (i, zs_columns) in data.zs_columns.iter().enumerate() {
@@ -998,7 +1025,10 @@ where
                 local_z: P::ZEROS,
                 next_z: P::ZEROS,
                 challenges: zs_columns.challenge,
-                columns: zs_columns.columns.clone(),
+                columns: combined_columns.as_ref().unwrap()[i]
+                    .iter()
+                    .map(|c| c.as_slice())
+                    .collect(),
                 filter: zs_columns.filter.clone(),
             });
         }
@@ -1164,6 +1194,48 @@ where
     ))
 }
 
+/// Builds the single affine column `sum_i beta^i * columns[i]`, binding public
+/// inputs to their values. The ordinary CTL combiner still adds gamma once.
+/// Used only before native quotient evaluation; preserves the CTL polynomial.
+fn precombine_ctl_columns<F: Field>(
+    columns: &[Column<F>],
+    beta: F,
+    public_inputs: &[F],
+    num_columns: usize,
+) -> Column<F> {
+    let mut local = vec![F::ZERO; num_columns];
+    let mut next = vec![F::ZERO; num_columns];
+    let mut constant = F::ZERO;
+    for (column, weight) in columns.iter().zip(beta.powers()) {
+        let (linear, next_row, scaled, offsets, c) = column.parts();
+        for &(i, factor) in linear {
+            local[i] += weight * factor;
+        }
+        for &(i, factor) in next_row {
+            next[i] += weight * factor;
+        }
+        for &(i, slot) in scaled {
+            local[i] += weight * public_inputs[slot];
+        }
+        constant += weight * (c + offsets.iter().map(|&slot| public_inputs[slot]).sum::<F>());
+    }
+    let local: Vec<_> = local
+        .into_iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_nonzero())
+        .collect();
+    let next: Vec<_> = next
+        .into_iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_nonzero())
+        .collect();
+    if local.is_empty() && next.is_empty() {
+        Column::constant(constant)
+    } else {
+        Column::linear_combination_and_next_row_with_constant(local, next, constant)
+    }
+}
+
 /// Computes the opening set of table `t` at `zeta`, `g_t * zeta` (where `g_t`
 /// generates the table's trace subgroup) and, for CTL Z polynomials, `1`.
 /// `local_values`/`next_values` contain the full column set, with the online
@@ -1267,9 +1339,9 @@ where
     }
 }
 
-/// Evaluates ascending base-field coefficients at `point` with four independent
-/// chains. Quadratic extensions use their trace/norm relation so each chain
-/// needs only base-field multiplications; other extensions use ordinary Horner.
+/// Evaluates ascending base-field coefficients at `point`. Quadratic extensions
+/// use eight independent chains and their trace/norm relation, requiring only
+/// base-field multiplications within each chain. Other extensions use Horner.
 fn evaluate_opening<F: RichField + Extendable<D>, const D: usize>(
     coefficients: &[F],
     point: F::Extension,
@@ -1277,21 +1349,22 @@ fn evaluate_opening<F: RichField + Extendable<D>, const D: usize>(
     let step = point * point;
     let step = step * step;
     if D == 2 {
+        let step = step * step;
         // Y² = trace(Y)Y - norm(Y) for Y in a quadratic extension.
         let coordinates = step.to_basefield_array();
         let trace = coordinates[0] + coordinates[0];
         let norm = coordinates[0] * coordinates[0]
             - coordinates[1] * coordinates[1] * <F::Extension as OEF<D>>::W;
-        let mut linear = [F::ZERO; 4];
-        let mut constant = [F::ZERO; 4];
-        for chunk in coefficients.chunks(4).rev() {
+        let mut linear = [F::ZERO; 8];
+        let mut constant = [F::ZERO; 8];
+        for chunk in coefficients.chunks(8).rev() {
             for (i, &coefficient) in chunk.iter().enumerate() {
                 let previous = linear[i];
                 linear[i] = previous * trace + constant[i];
                 constant[i] = coefficient - previous * norm;
             }
         }
-        return (0..4).rev().fold(F::Extension::ZERO, |acc, i| {
+        return (0..8).rev().fold(F::Extension::ZERO, |acc, i| {
             acc * point + step.scalar_mul(linear[i]) + F::Extension::from_basefield(constant[i])
         });
     }
@@ -1311,13 +1384,14 @@ fn evaluate_opening<F: RichField + Extendable<D>, const D: usize>(
 mod opening_evaluation_tests {
     use super::*;
     use plonky2::field::goldilocks_field::GoldilocksField as F;
+    use plonky2::field::types::Sample;
 
     #[test]
-    fn four_lane_openings_match_horner() {
+    fn openings_match_horner() {
         type E = <F as Extendable<2>>::Extension;
         let extension_point =
             E::from_basefield_array([F::from_canonical_u64(2), F::from_canonical_u64(3)]);
-        for length in [0, 1, 2, 3, 4, 5, 7, 31, 128, 1025] {
+        for length in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 17, 31, 128, 1025] {
             let coefficients: Vec<_> = (0..length)
                 .map(|i| F::from_canonical_usize(19 * i + 7))
                 .collect();
@@ -1327,6 +1401,43 @@ mod opening_evaluation_tests {
                     .rev()
                     .fold(E::ZERO, |acc, &c| acc * point + E::from(c));
                 assert_eq!(evaluate_opening::<F, 2>(&coefficients, point), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn precombined_ctl_matches_original_expression() {
+        let columns = vec![
+            Column::constant(F::ONE),
+            Column::single(0),
+            Column::linear_combination_and_next_row_with_constant(
+                vec![(0, F::TWO), (1, -F::ONE)],
+                vec![(2, F::ONE)],
+                F::TWO,
+            ),
+            Column::single_times_public_input_plus_single(1, 0, 0),
+            Column::single_times_public_input_plus_public_input(2, 1, 0),
+            Column::public_input_minus_single(1, 2),
+        ];
+        for beta in [F::ZERO, F::ONE, -F::ONE, F::from_canonical_u64(19)] {
+            for public in [vec![F::ZERO; 2], F::rand_vec(2)] {
+                let local = F::rand_vec(3);
+                let next = F::rand_vec(3);
+                for tuple in [columns.as_slice(), &columns[..0], &columns[1..3]] {
+                    let combined = precombine_ctl_columns(tuple, beta, &public, 3);
+                    let challenge = crate::lookup::GrandProductChallenge {
+                        beta,
+                        gamma: F::TWO,
+                    };
+                    let expected = challenge.combine_base(
+                        tuple
+                            .iter()
+                            .map(|c| c.eval_with_next::<F, F, 1>(&local, &next, &public)),
+                    );
+                    let actual = challenge
+                        .combine_base([combined.eval_with_next::<F, F, 1>(&local, &next, &public)]);
+                    assert_eq!(actual, expected);
+                }
             }
         }
     }

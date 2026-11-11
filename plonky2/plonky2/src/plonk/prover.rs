@@ -495,31 +495,39 @@ fn wires_permutation_partial_products_and_zs<
     let subgroup = &prover_data.subgroup;
     let k_is = &common_data.k_is;
     let num_prods = common_data.num_partial_products;
+    // Multiply each quotient chunk before inversion, and share one inversion
+    // across a block of rows. Numerator/denominator scratch is reused per block.
+    const BLOCK: usize = 64;
+    let wires = common_data.config.num_routed_wires;
+    let products_per_row = wires.div_ceil(degree);
     let all_quotient_chunk_products = subgroup
-        .par_iter()
+        .par_chunks(BLOCK)
         .enumerate()
-        .map(|(i, &x)| {
-            let s_sigmas = &prover_data.sigmas[i];
-            let numerators = (0..common_data.config.num_routed_wires).map(|j| {
-                let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
-            });
-            let denominators = (0..common_data.config.num_routed_wires)
-                .map(|j| {
-                    let wire_value = witness.get_wire(i, j);
-                    let s_sigma = s_sigmas[j];
-                    wire_value + beta * s_sigma + gamma
-                })
-                .collect::<Vec<_>>();
-            let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
-
-            quotient_chunk_products(&quotient_values, degree)
+        .flat_map_iter(|(bi, xs)| {
+            let mut numerators = Vec::with_capacity(xs.len() * products_per_row);
+            let mut denominators = Vec::with_capacity(xs.len() * products_per_row);
+            let mut numerator = vec![F::ONE; wires];
+            let mut denominator = vec![F::ONE; wires];
+            for (row, &x) in xs.iter().enumerate() {
+                let i = bi * BLOCK + row;
+                for j in 0..wires {
+                    let wire = witness.get_wire(i, j);
+                    numerator[j] = wire + beta * (k_is[j] * x) + gamma;
+                    denominator[j] = wire + beta * prover_data.sigmas[i][j] + gamma;
+                }
+                numerators.extend(quotient_chunk_products(&numerator, degree));
+                denominators.extend(quotient_chunk_products(&denominator, degree));
+            }
+            for (n, inv) in numerators
+                .iter_mut()
+                .zip(F::batch_multiplicative_inverse(&denominators))
+            {
+                *n *= inv;
+            }
+            numerators
+                .chunks_exact(products_per_row)
+                .map(|row| row.to_vec())
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
 
