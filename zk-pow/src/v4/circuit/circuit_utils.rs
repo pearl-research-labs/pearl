@@ -1,4 +1,4 @@
-//! FP8 recursion configuration, trusted verifier setup, and cache serialization.
+//! FP8 trusted verifier setup and cache serialization.
 //!
 //! The API layer implements job derivation and verification on these types. The cache
 //! retains FP8's device keys, canonical bincode format and read-only lookup semantics;
@@ -11,75 +11,13 @@ use plonky2::field::cosets::get_unique_coset_shifts;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use plonky2::field::types::{Field, PrimeField64};
-use plonky2::fri::FriConfig;
-use plonky2::fri::reduction_strategies::FriReductionStrategy;
-use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData, VerifierCircuitData};
+use plonky2::plonk::circuit_data::{CommonCircuitData, VerifierCircuitData};
 use plonky2::util::serialization::{Buffer, DefaultGateSerializer, Read, Remaining};
 use serde::{Deserialize, Serialize};
 
 use super::wrapper::{D, F, OuterC};
 use crate::ensure_eq;
 use crate::v4::api::public_params::Device;
-
-/// V4 FRI security target.
-pub const SECURITY_BITS: usize = 119;
-
-/// FRI target shared with the recursive wrapper stages.
-/// `consensus_config_meets_the_security_target` checks the selected parameters.
-pub const STARK_SECURITY_BITS: usize = SECURITY_BITS;
-/// Logup/CTL challenge repetitions (soundness `~(rows + instances)/|F|` per repetition; three
-/// repetitions push the batched-lookup error far below the FRI error).
-pub const STARK_NUM_CHALLENGES: usize = 3;
-/// FRI rate `2^-1` — the fastest prover rate admitting the degree-3 constraint envelope.
-pub const STARK_RATE_BITS: usize = 1;
-/// Merkle cap height of every oracle and FRI commit layer.
-pub const STARK_CAP_HEIGHT: usize = 4;
-/// FRI grinding bits.
-pub const STARK_POW_BITS: u32 = 17;
-/// Grinding before deriving column-batching challenges.
-pub const STARK_BATCHING_POW_BITS: u32 = STARK_POW_BITS;
-/// FRI query rounds: the minimal count meeting the security target at this rate (102).
-pub const STARK_QUERY_ROUNDS: usize = num_query_rounds(STARK_SECURITY_BITS, STARK_POW_BITS as usize, STARK_RATE_BITS);
-
-/// FRI parameters of the two wrapper stages. Equal lower main/batching PoW bits
-/// preserve the original single-PoW nominal grinding work. Rate
-/// `2^-3` is the floor for both stages: the recursion gates carry degree-7 constraints
-/// (Poseidon), so the quotient needs an LDE blowup of at least `2^3`.
-pub const STAGE_1_RATE_BITS: usize = 3;
-pub const STAGE_1_POW_BITS: usize = 17;
-pub const STAGE_2_RATE_BITS: usize = 7;
-pub const STAGE_2_POW_BITS: usize = 21;
-
-/// Query count meeting the FRI target for the supplied rate and grinding bits.
-pub const fn num_query_rounds(security_bits: usize, pow_bits: usize, rate_bits: usize) -> usize {
-    security_bits.saturating_sub(pow_bits).div_ceil(rate_bits)
-}
-
-/// V4 recursion config with the original inner wire budget and one extra outer wire.
-pub fn build_recursion_config(rate_bits: usize, pow_bits: usize, stage: usize, is_zk: bool) -> CircuitConfig {
-    CircuitConfig {
-        num_wires: 135,
-        num_routed_wires: if stage == 2 { 35 } else { 37 },
-        num_constants: 2,
-        use_base_arithmetic_gate: true,
-        security_bits: SECURITY_BITS,
-        num_challenges: 3,
-        zero_knowledge: is_zk,
-        max_quotient_degree_factor: 8,
-        fri_config: FriConfig {
-            rate_bits,
-            cap_height: 5,
-            proof_of_work_bits: pow_bits as u32,
-            batching_proof_of_work_bits: if stage == 2 {
-                STAGE_2_POW_BITS as u32
-            } else {
-                STAGE_1_POW_BITS as u32
-            },
-            reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
-            num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
-        },
-    }
-}
 
 /// Trusted verifier setup: the universal wrapper's stage-2 verifier data plus the
 /// stage-2 constants/sigmas polynomial coefficients the compact proof encoding omits
@@ -357,6 +295,7 @@ fn deserialize_polynomials(
 mod tests {
     use plonky2::field::types::Field64;
     use plonky2::fri::FriConfig;
+    use plonky2::plonk::circuit_data::CircuitConfig;
 
     use super::*;
 
