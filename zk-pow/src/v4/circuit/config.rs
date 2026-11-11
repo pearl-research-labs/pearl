@@ -14,6 +14,7 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
         2 => (23, 8, 14, 38, true, 3),
         _ => panic!("V4 recursion stage must be 1 or 2"),
     };
+    debug_assert!(pow_bits + rate_bits * num_query_rounds >= 135);
     CircuitConfig {
         num_wires: 135,
         num_routed_wires,
@@ -46,6 +47,7 @@ pub fn v4_stark_config() -> StarkConfig {
         reduction_strategy: FriReductionStrategy::Ladder(V4_REACHABLE_DEGREE_BITS.to_vec()),
         num_query_rounds: 114,
     };
+    debug_assert!(pow_bits + rate_bits * fri_config.num_query_rounds >= 132);
     // Three CTL/Logup repetitions keep batched-lookup error below the FRI error.
     StarkConfig::new(108, 3, fri_config)
 }
