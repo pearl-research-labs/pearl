@@ -8,10 +8,10 @@
 use alloc::{vec, vec::Vec};
 
 use anyhow::{ensure, Result};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use plonky2::batch_fri::oracle::BatchFriOracle;
 use plonky2::field::extension::{Extendable, FieldExtension, OEF};
-use plonky2::field::fft::FftRootTable;
+use plonky2::field::fft::{fft_root_table, ifft_with_options, FftRootTable};
 use plonky2::field::packable::Packable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -331,11 +331,22 @@ where
                 .into_iter()
                 .flat_map(|(_, values)| values)
                 .collect();
-            let coeffs = timed!(
-                timing,
-                "IFFT",
-                values.into_par_iter().map(|values| values.ifft()).collect()
-            );
+            let coeffs = timed!(timing, "IFFT", {
+                // Share one root table across all columns of the same height.
+                let mut roots = HashMap::new();
+                for column in &values {
+                    roots
+                        .entry(column.len())
+                        .or_insert_with(|| fft_root_table(column.len()));
+                }
+                values
+                    .into_par_iter()
+                    .map(|column| {
+                        let table = &roots[&column.len()];
+                        ifft_with_options(column, None, Some(table))
+                    })
+                    .collect()
+            });
             return Some(BatchFriOracle::from_coeffs_with_digests(
                 coeffs, ranges, rate_bits, cap_height, timing,
             ));
