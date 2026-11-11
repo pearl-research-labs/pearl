@@ -8,11 +8,11 @@
 //!
 //! With no arguments (the invocation the frozen `embedded_cache.rs` comments
 //! reference) every cache is rebuilt at its canonical gitignored path:
-//! `src/v4/api/fp8_cache.bin`, `src/v2/circuit/v2_cache.bin`,
+//! `src/v4/api/v4_cache.bin`, `src/v2/circuit/v2_cache.bin`,
 //! `src/v1/v1_cache.bin`. Explicit paths override the defaults:
 //!
 //!   cargo run --release --no-default-features --bin build_cache \
-//!       src/v4/api/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
+//!       src/v4/api/v4_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
 //!
 //! The trailing paths are optional: with fewer arguments only the leading
 //! caches are written (fp8, then v2, then v1), and a path of `-` skips that
@@ -27,12 +27,12 @@ fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() <= 3,
-        "usage: build_cache [<fp8_cache.bin> [<v2_cache.bin> [<v1_cache.bin>]]] \
+        "usage: build_cache [<v4_cache.bin> [<v2_cache.bin> [<v1_cache.bin>]]] \
          (`-` skips a cache; no arguments rebuilds all three at their canonical paths)"
     );
     if args.is_empty() {
         args = vec![
-            "src/v4/api/fp8_cache.bin".into(),
+            "src/v4/api/v4_cache.bin".into(),
             "src/v2/circuit/v2_cache.bin".into(),
             "src/v1/v1_cache.bin".into(),
         ];
