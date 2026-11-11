@@ -122,7 +122,7 @@ pub use super::circuit_utils::{
 /// | LUTs       | [`super::luts::lut_live_rows`] | {17, 16, 14, 11, 10, 8, 6, 5} |
 ///
 /// Blake3 work is bounded in closed form from the statement's scalars before
-/// compilation (`PublicParams::check_blake3_work_bound`): four plane trees, MoE
+/// compilation (`PublicParams::check_blake3_witness_bound`): four plane trees, MoE
 /// routing/offsets trees, two root folds, and the jackpot together consume at
 /// most `2^22` compression-message bytes. Thus there are at most `2^16`
 /// compressions and `2^19` rows. The minimum legal tile still has

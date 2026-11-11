@@ -628,7 +628,7 @@ impl PublicParams {
     /// Compression-message bytes in the four operand trees, optional MoE trees,
     /// the two root folds, and final jackpot. Touched Merkle parents count;
     /// unopened sibling CVs are supplied without compression work.
-    pub const MAX_BLAKE3_WORK_BYTES: usize = 1 << 22;
+    pub const MAX_BLAKE3_WITNESS_BYTES: usize = 1 << 22;
 
     /// Byte length of a dense (non-MoE) statement:
     /// σ_d (108) + pB (19) + HB (32) + pA (9) + HA (32) + tile bases (8) + J (32).
@@ -650,11 +650,6 @@ impl PublicParams {
     ) -> Result<Self> {
         job.check()?;
         check_lottery_layout(job.operands.a.tile_size as usize, job.operands.b.tile_size as usize)?;
-        check_opened_strips_bound(
-            job.operands.a.tile_size as usize,
-            job.operands.b.tile_size as usize,
-            job.common.k as usize,
-        )?;
         ensure!(
             job.moe.is_some() == moe_statement.is_some(),
             "moe and moe_statement must both be present or both absent"
@@ -677,7 +672,7 @@ impl PublicParams {
             jackpot_statement,
             moe_statement,
         };
-        params.check_blake3_work_bound()?;
+        params.check_blake3_witness_bound()?;
         Ok(params)
     }
 
@@ -687,20 +682,21 @@ impl PublicParams {
         if let (Some(moe), Some(stmt)) = (self.moe(), self.moe_statement.as_ref()) {
             stmt.check(*moe, self.a(), self.jackpot_statement.tile_bases.a)?;
         }
-        self.check_blake3_work_bound()
+        self.check_blake3_witness_bound()
     }
 
-    /// Check the Blake3 cap before compilation, noise expansion, or known-column allocation.
-    fn check_blake3_work_bound(&self) -> Result<()> {
-        let blake3_blocks = self.blake3_work_block_bound()?;
+    /// Caps all compiled message bytes, including the opened values `(h+w)*k`.
+    /// Checked before compilation, noise expansion, or known-column allocation.
+    fn check_blake3_witness_bound(&self) -> Result<()> {
+        let blake3_blocks = self.blake3_witness_block_bound()?;
         ensure!(
-            blake3_blocks <= (Self::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64,
-            "FP8 Blake3 work exceeds 2^22 bytes"
+            blake3_blocks <= (Self::MAX_BLAKE3_WITNESS_BYTES / blake3::BLOCK_LEN) as u64,
+            "FP8 Blake3 witness exceeds 2^22 bytes"
         );
         Ok(())
     }
 
-    pub(crate) fn blake3_work_block_bound(&self) -> Result<u64> {
+    pub(crate) fn blake3_witness_block_bound(&self) -> Result<u64> {
         let mut count: u64 = 3; // Two operand-root folds and the final jackpot compression.
         let k = u64::from(self.common_dim());
         let scale_row_bytes = 2 * (k / BLOCK_SIZE as u64);
@@ -1074,19 +1070,6 @@ fn blake_tree_block_bound(raw_bytes: u64, hash_id: HashId, opened_bytes: impl In
         .map(|(start, end)| (end - start) * (chunk_blocks + 1) + 2 * (depth + 1))
         .sum();
     Ok(blocks)
-}
-
-/// `k · (|I_A| + |I_B|) ≤ 2^22`: the opened-strips envelope (worker input, trace heights).
-fn check_opened_strips_bound(h: usize, w: usize, k: usize) -> Result<()> {
-    let opened = h
-        .checked_add(w)
-        .and_then(|hw| hw.checked_mul(k))
-        .ok_or_else(|| anyhow::anyhow!("(h+w)·k overflows usize || h={h} w={w} k={k}"))?;
-    ensure!(
-        opened <= (1 << 22),
-        "k·(|IA|+|IB|) must be <= 2^22 || (h+w)·k={opened} h={h} w={w} k={k}"
-    );
-    Ok(())
 }
 
 /// Consume the next `n` bytes of `s` and return them (or `Err` if short).
@@ -1715,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn opened_strips_bound_rejects_4x64_at_k_2_16() {
+    fn blake3_witness_bound_rejects_4x64_at_k_2_16() {
         let p = dense_params();
         let rows = 4;
         let cols = 64;
@@ -1746,7 +1729,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("k·(|IA|+|IB|) must be <= 2^22"));
+        assert!(err.to_string().contains("Blake3 witness exceeds 2^22 bytes"));
     }
 
     #[test]
@@ -2037,7 +2020,10 @@ mod tests {
                         _ => unreachable!(),
                     };
                     let stark = Blake3Program::from_blake_program(&program, k as usize, pins, schedule);
-                    let bound = params.blake3_work_block_bound().unwrap();
+                    let bound = params.blake3_witness_block_bound().unwrap();
+                    assert!(
+                        bound * blake3::BLOCK_LEN as u64 >= u64::from(params.h() + params.w()) * u64::from(params.common_dim())
+                    );
                     let compiled = stark.instructions.len() as u64;
                     assert!(
                         bound >= compiled,
@@ -2047,7 +2033,7 @@ mod tests {
                         bound <= compiled + 4096,
                         "the bound must stay within root-path slack: MoE={is_moe} hash_id={hash_id:?} k={k}: {bound} >> {compiled}"
                     );
-                    assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WORK_BYTES as u64);
+                    assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WITNESS_BYTES as u64);
                 }
             }
         }
@@ -2058,14 +2044,14 @@ mod tests {
         let mut seed = dense_params();
         seed.job.common.k = 31744;
         // The B-side tile stays at the 4x128 default: `(h + w) * k` must fit
-        // the 2^22 aggregate byte cap while the total work still trips it.
+        // the 2^22 byte cap while the full witness bound still trips it.
         assert!((seed.h() as usize + seed.w() as usize) * seed.common_dim() as usize <= (1 << 22));
         let err = PublicParams::try_new(seed.job.clone(), seed.jackpot_statement.clone(), None).unwrap_err();
-        assert!(err.to_string().contains("Blake3 work exceeds 2^22 bytes"), "{err}");
+        assert!(err.to_string().contains("Blake3 witness exceeds 2^22 bytes"), "{err}");
         let err = PublicParams::from_bytes(&seed.to_bytes()).unwrap_err();
-        assert!(err.to_string().contains("Blake3 work exceeds 2^22 bytes"), "{err}");
+        assert!(err.to_string().contains("Blake3 witness exceeds 2^22 bytes"), "{err}");
         let err = seed.recheck_admission().unwrap_err();
-        assert!(err.to_string().contains("Blake3 work exceeds 2^22 bytes"), "{err}");
+        assert!(err.to_string().contains("Blake3 witness exceeds 2^22 bytes"), "{err}");
     }
 
     #[test]
@@ -2132,15 +2118,15 @@ mod tests {
         // The maximal tree adds only root-path parents: ~2 * depth-of-2^24-chunks
         // extra blocks over the baseline, nothing proportional to 2^34 bytes.
         let (bound, small_bound) = (
-            params.blake3_work_block_bound().unwrap(),
-            small.blake3_work_block_bound().unwrap(),
+            params.blake3_witness_block_bound().unwrap(),
+            small.blake3_witness_block_bound().unwrap(),
         );
         assert!(
             bound <= small_bound + 128,
             "maximal routing scalars must bound at O(depth): {bound} vs baseline {small_bound}"
         );
         assert!(
-            bound <= (PublicParams::MAX_BLAKE3_WORK_BYTES / blake3::BLOCK_LEN) as u64,
+            bound <= (PublicParams::MAX_BLAKE3_WITNESS_BYTES / blake3::BLOCK_LEN) as u64,
             "maximal routing scalars must pass the work gate"
         );
 
@@ -2155,6 +2141,6 @@ mod tests {
             bound >= compiled,
             "the bound must dominate the compiled stark under maximal scalars: {bound} < {compiled}"
         );
-        assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WORK_BYTES as u64);
+        assert!(compiled * blake3::BLOCK_LEN as u64 <= PublicParams::MAX_BLAKE3_WITNESS_BYTES as u64);
     }
 }
