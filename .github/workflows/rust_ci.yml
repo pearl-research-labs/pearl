@@ -85,11 +85,6 @@ jobs:
           workspaces: "zk-pow -> target"
           cache-on-failure: true
 
-      - name: Install system dependencies (jemalloc)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libjemalloc-dev
-
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -153,10 +148,6 @@ jobs:
           workspaces: "py-pearl-mining -> target"
           cache-on-failure: true
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-      - name: Install system dependencies (jemalloc)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libjemalloc-dev
       - name: Install package
         run: uv sync --package py-pearl-mining --no-editable
       - name: Run tests
