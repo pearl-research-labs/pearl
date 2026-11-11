@@ -10,7 +10,7 @@ use super::trace_padding::DEGREE_BITS as V4_REACHABLE_DEGREE_BITS;
 /// Panics for any other stage.
 pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
     let (pow_bits, rate_bits, num_query_rounds, num_routed_wires, is_zk) = match stage {
-        1 => (18, 3, 37, 36, false),
+        1 => (18, 3, 38, 36, false),
         2 => (23, 8, 14, 37, true),
         _ => panic!("V4 recursion stage must be 1 or 2"),
     };
@@ -28,7 +28,7 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
             cap_height: 4,
             proof_of_work_bits: pow_bits as u32,
             batching_proof_of_work_bits: pow_bits as u32,
-            reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
+            reduction_strategy: FriReductionStrategy::ConstantArityBits(if stage == 1 { 4 } else { 3 }, 7),
             num_query_rounds,
         },
     }
