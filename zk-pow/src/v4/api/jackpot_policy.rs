@@ -32,11 +32,12 @@
 //!    The exact consensus rule is `lambda_A + lambda_B < 128*E_GRID + 45952`.
 //!    When both magnitudes are zero, `E_GRID=0` and no summands are skipped.
 //! 4. **Row security** (downscaling hardware only, i.e. B200). Every row `i`
-//!    of both sides keeps its mean Gaussian security proxy at or above `1/25`. With the
+//!    of both sides keeps its computed mean Gaussian security proxy at or above `1/25`. With the
 //!    signal RMS `s_i = alpha_i * l2_i`, the row's E4M3 strip code `c_i` and
 //!    `g_iu = exp(-2 X_bar_iu^2 / s_i^2)`, the proxy is `21/16 * c_i / s_i * g_iu` for
-//!    `s_i >= 8` and `min(g_iu / 8, GET_CAP(c_i))` below. The consensus rule bounds `g`
-//!    through check 3's `lambda` certificate and is evaluated in exact integers; see
+//!    `s_i >= 8` and `min(g_iu / 8, GET_CAP(c_i))` below. The consensus rule approximates `g`
+//!    through check 3's `lambda` certificate; the ideal
+//!    mean proxy is guaranteed above `0.03928`, rather than `1/25`. See
 //!    `JackpotPolicy::row_security_ok`.
 //!
 //! The verdict is a BINARY gate (rejected / accepted): a `D`-dependent credit
@@ -104,9 +105,6 @@ pub type JackpotMessage = [u8; 4 * JACKPOT_ENTRIES];
 const PROXY_SCALE: u64 = 1 << 16;
 /// Check 4 accepts a row iff its mean proxy is at least `SECURITY_MIN = 1/SECURITY_MIN_INVERSE`.
 const SECURITY_MIN_INVERSE: u64 = 25;
-/// One-sided slack of check 3's certificate: `0 <= 64 (log2 S + 508) - lambda < LAMBDA_ERROR`
-/// (the exhaustive supremum over the LOG16 keys is 1.0105).
-const LAMBDA_ERROR: f64 = 1.02;
 
 /// Per-row noise stds `sigma_i = DELTA * alpha_i * l2_i` (in quantized units),
 /// from the floored norms and scales recorded at quantization time.
@@ -289,8 +287,8 @@ impl JackpotPolicy {
         Ok(Some(acc))
     }
 
-    /// Check 4: every row's mean row security proxy is at least
-    /// `1/SECURITY_MIN_INVERSE`.
+    /// Check 4: every row's computed mean security proxy is at least
+    /// `1/SECURITY_MIN_INVERSE`, using check 3's lambda differences directly.
     /// Let `g_u = exp(-w_u/2)` such that `w_u = 4 * (X / sigma)^2`.
     /// The security proxy function is:
     /// if `sigma >= 8`:
@@ -352,13 +350,17 @@ fn gauss_row_constants(alpha: u16, l2: u16) -> Result<(u64, u64)> {
     }
 }
 
-/// Check 4's Gaussian kernel at check 3's certified bound: the lambda difference `d`
-/// certifies `w <= w_hi(d) = 2^((d + LAMBDA_ERROR) / 64) - 1`, and
+/// Check 4's Q16 Gaussian approximation from the lambda difference `d`.
+/// The lambda difference `d` certifies
+/// `w <= w_hi(d) = 2^((d + LAMBDA_ERROR) / 64) - 1`, and
 /// `T(d) = floor(2^16 * exp(-w_hi(d) / 2))` is the matching lower bound on
 /// `2^16 * exp(-w / 2)`.
+/// We do not apply the lambda error:
+/// `w <= w_hi(d) = 2^(d / 64) - 1`.
+/// so this can overestimate the ideal Gaussian. But the ideal mean proxy is guaranteed above `0.03928`
 fn gauss_kernel(difference: u64) -> u64 {
-    let w_hi = ((difference as f64 + LAMBDA_ERROR) / 64.0).exp2() - 1.0;
-    (PROXY_SCALE as f64 * (-0.5 * w_hi).exp()).floor() as u64
+    let w = (difference as f64 / 64.0).exp2() - 1.0;
+    (PROXY_SCALE as f64 * (-0.5 * w).exp()).floor() as u64
 }
 
 #[cfg(test)]
@@ -486,21 +488,27 @@ mod tests {
     }
 
     #[test]
-    fn gauss_kernel_matches_its_table_and_vanishes_past_289() {
-        // Spot values of T(d) = floor(2^16 exp(-(2^((d + 1.02)/64) - 1)/2)) from 60-digit arithmetic.
-        assert_eq!(gauss_kernel(0), 65173);
-        assert_eq!(gauss_kernel(1), 64815);
-        assert_eq!(gauss_kernel(100), 24273);
-        assert_eq!(gauss_kernel(150), 8300);
-        assert_eq!(gauss_kernel(289), 1);
-        assert_eq!((0..290).map(gauss_kernel).sum::<u64>(), 5_550_425);
-        // The floors are robust: no un-floored value lies within 1e-3 of an integer, far
-        // beyond a faithfully rounded libm's error, so every platform computes the same table.
-        for d in 0..290u64 {
-            let exact = PROXY_SCALE as f64 * (-0.5 * (((d as f64 + LAMBDA_ERROR) / 64.0).exp2() - 1.0)).exp();
+    fn gauss_kernel_matches_its_table_and_vanishes_past_290() {
+        use crate::v4::circuit::unpredictability::{GAUSSIAN_CLASS_HEIGHT, GAUSSIAN_KERNEL};
+
+        // Spot values of T(d) = floor(2^16 exp(-(2^(d/64) - 1)/2)) from 60-digit arithmetic.
+        assert_eq!(gauss_kernel(0), 1 << 16);
+        assert_eq!(gauss_kernel(1), 65180);
+        assert_eq!(gauss_kernel(100), 24674);
+        assert_eq!(gauss_kernel(150), 8537);
+        assert_eq!(gauss_kernel(290), 1);
+        assert_eq!((0..291).map(gauss_kernel).sum::<u64>(), 5_617_275);
+        for d in 0..GAUSSIAN_CLASS_HEIGHT {
+            let expected = GAUSSIAN_KERNEL.get(d as usize).copied().unwrap_or(0) as u64;
+            assert_eq!(gauss_kernel(d), expected, "native/circuit kernel {d}");
+        }
+        // d=0 is exactly 65536. Every other supported value is more than 1e-3 from
+        // an integer, so faithfully rounded libm implementations compute the same floors.
+        for d in 1..291u64 {
+            let exact = PROXY_SCALE as f64 * (-0.5 * ((d as f64 / 64.0).exp2() - 1.0)).exp();
             assert!((exact - exact.round()).abs() > 1e-3, "d={d}: {exact}");
         }
-        assert!((290..=LAMBDA_MAX).all(|d| gauss_kernel(d) == 0));
+        assert!((291..=LAMBDA_MAX).all(|d| gauss_kernel(d) == 0));
     }
 
     #[test]

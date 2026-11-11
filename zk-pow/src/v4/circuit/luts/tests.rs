@@ -175,10 +175,10 @@ fn small_tables_match_their_closed_forms() {
     for key in [3usize, 1000, 8192, 12345, 40000, 65535] {
         assert_eq!(to_u64(log16[0][key]), (64.0 * (key as f64).log2()).floor() as u64);
     }
-    assert_eq!(to_u64(log16[0][1 << 16]), 65173, "class 0 is uncapped at d = 0");
+    assert_eq!(to_u64(log16[0][1 << 16]), 65536, "class 0 is uncapped at d = 0");
     assert_eq!(to_u64(log16[0][(1 << 16) + 8192]), 23488, "class 1 is capped at d = 0");
-    assert_eq!(to_u64(log16[0][(1 << 16) + 289]), 1, "the kernel's last nonzero entry");
-    assert_eq!(to_u64(log16[0][(1 << 16) + 290]), 0, "the kernel's zero tail");
+    assert_eq!(to_u64(log16[0][(1 << 16) + 290]), 1, "the kernel's last nonzero entry");
+    assert_eq!(to_u64(log16[0][(1 << 16) + 291]), 0, "the kernel's zero tail");
     assert_eq!(to_u64(log16[0][(1 << 17) - 1]), 0);
     // WIDTH32: row r holds width W = r + 1; (2^max(W-24,0), 2^max(24-W,0)).
     let width32 = generate::<F>(LutTable::Width32, 0);

@@ -120,11 +120,12 @@
 //! A*H = ceil(k*2^32/25) + surplus,      0 <= surplus < 2^48.
 //! ```
 //!
-//! Three RC16 limbs certify the surplus. Since `H < k*2^16 <= 2^32` and `A <= 8192`,
-//! the product is below `2^45`; both sides are below the Goldilocks modulus, so this
+//! Three RC16 limbs certify the surplus. Since `H <= k*2^16 <= 2^32` and `A <= 8192`,
+//! the product is at most `2^45`; both sides are below the Goldilocks modulus, so this
 //! equality proves an integer lower bound. Dividing by `k*2^32` gives the required mean
-//! proxy of at least `1/25`. Padding sets the B200 extensions to zero and disables the
-//! minimum. H100 carries none of these extensions. Check 3's tile-wide skip budget is
+//! computed proxy of at least `1/25`; its ideal-proxy bound is documented in
+//! [`crate::v4::circuit::unpredictability`]. Padding sets the B200 extensions to zero and
+//! disables the minimum. H100 carries none of these extensions. Check 3's tile-wide skip budget is
 //! enforced by Matmul/XorFold separately; this is an additional per-row gate.
 //!
 //! # Exact square-root check
@@ -1501,7 +1502,7 @@ pub(crate) fn eval_scale_constraints<V, S, E, const WIDTH: usize, const PUBLIC_I
         let live = eval.sub(one, lv.is_pad);
         let required = eval.mad(live, minimum, surplus);
         let product = eval.mul(row.security_coefficient, row.security_sum);
-        // CTL-bound kernels give sum < 2^32 and coefficient <= 8192: product < 2^45.
+        // CTL-bound kernels give sum <= 2^32 and coefficient <= 8192: product <= 2^45.
         // The three ranged limbs give surplus < 2^48, so this equality cannot wrap.
         eval.constraint_eq(product, required);
     }

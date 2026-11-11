@@ -106,23 +106,22 @@
 //! `a=alpha*X`, signal RMS `s=alpha*l2f`, and B200 noise RMS `sigma=s/2`. Its ideal
 //! Gaussian is `g=exp(-2*a^2/s^2)=exp(-a^2/(2*sigma^2))`. Subtract the zero-signal
 //! score `base=lambda(0,sigma)` and write `d=lambda(a,sigma)-base`. Monotonicity makes
-//! `d>=0`. The one-sided score error `E<65/64<51/50` gives
+//! `d>=0`. The consensus kernel uses this difference directly, without a score-error
+//! correction:
 //!
 //! ```text
-//! 64*log2(1+a^2/sigma^2) < d+51/50
-//! g > exp(-(2^((50*d+51)/3200)-1)/2).
+//! T(d) = floor(65536*exp(-(2^(d/64)-1)/2)).
 //! ```
 //!
-//! Consequently [`GAUSSIAN_KERNEL`] is a conservative Q16 bound
-//! `T(d)=floor(65536*exp(-(2^((50*d+51)/3200)-1)/2))`. Integer interval tests certify
-//! every nonzero entry and the zero at `d=290`; monotonicity proves the entire zero tail.
-//! This extra slack accounts for the difference of two rounded lambda scores without
-//! assuming their errors cancel.
+//! [`GAUSSIAN_KERNEL`] is a Q16 approximation, which can overestimate the ideal Gaussian.
+//! Integer interval tests certify every entry, including `T(0)=65536`, and the zero at
+//! `d=291`; monotonicity proves the entire zero tail. The lambda score itself and check 3's
+//! one-sided approximation guarantee remain unchanged.
 //!
 //! [`security_row_parameters`] derives the exact strip byte `t=Q8(RN32(g_strip*s))`,
 //! its decoded magnitude `c`, and the row coefficient/cap from the normalized sigma.
 //! Here `g_strip` is binary32 0.1 below `s=8`, otherwise binary32 0.08. The ideal proxies
-//! and their integer certificates are
+//! and their integer approximations are
 //!
 //! ```text
 //! s >= 8: proxy_u = (21/16)*(c/s)*g_u
@@ -134,15 +133,19 @@
 //!
 //! LOG16 region 0 remains the logarithm table. Regions `1+class` hold these capped
 //! kernels, keyed by the separate difference `d in [0,8192)`; oversized or negative
-//! differences cannot address another region. Class 0 is effectively uncapped because
-//! its cap 65535 exceeds every `T(d)`. DOWNSCALETHRESHOLD fixes the cap class and base,
+//! differences cannot address another region. Class 0 is uncapped because its cap 65536
+//! is the maximum `T(d)`. DOWNSCALETHRESHOLD fixes the cap class and base,
 //! so the prover cannot select a more favorable kernel for a row.
 //!
 //! InputQuant accumulates `H=sum_u K_u`; Scale proves
 //! `A*H >= ceil(k*2^32/25)` using a nonnegative ranged surplus. Thus the mean integer
-//! proxy, measured in units `2^-32`, is at least `1/25`. Every coefficient/kernel/cap
-//! floor is downward, so this also certifies the ideal mean proxy bound. This per-row
-//! B200 condition supplements the device-specific Matmul skip rule above.
+//! proxy, measured in units `2^-32`, is at least `1/25`. This threshold applies to the
+//! computed proxy. For the ideal proxy, the one-sided score error gives
+//! `64*log2(1+a^2/sigma^2) < d+E` with `E=65/64`. Put `r=2^(E/64)`; then
+//! `g >= exp(-(r-1)/2)*g_hat^r`, where `g_hat=exp(-(2^(d/64)-1)/2)`. Row coefficients
+//! are at most `1/8`, so Jensen's inequality, including the downward coefficient/kernel/cap
+//! floors, gives `mean_ideal >= exp(-(r-1)/2)*(8/25)^r/8 > 0.03928`.
+//! This per-row B200 condition supplements the device-specific Matmul skip rule above.
 
 use crate::v4::api::public_params::Device;
 
@@ -641,27 +644,28 @@ mod tests {
     }
 }
 
-/// Q16 kernel floors for `65536 * exp(-(2^((50*d+51)/3200) - 1)/2)`.
+/// Q16 kernel floors for `65536 * exp(-(2^(d/64) - 1)/2)`.
+/// The zero-signal value is exactly 65536, so the table needs 17 value bits.
 /// The integer interval certificate below proves every entry and the zero tail.
-pub const GAUSSIAN_KERNEL: [u16; 290] = [
-    65173, 64815, 64455, 64093, 63730, 63365, 62997, 62628, 62258, 61885, 61511, 61134, 60756, 60377, 59995, 59612, 59227, 58841,
-    58453, 58063, 57672, 57279, 56884, 56488, 56091, 55692, 55291, 54889, 54486, 54081, 53675, 53268, 52859, 52449, 52038, 51626,
-    51212, 50797, 50382, 49965, 49547, 49128, 48708, 48287, 47866, 47443, 47020, 46596, 46171, 45745, 45319, 44893, 44465, 44037,
-    43609, 43180, 42751, 42322, 41892, 41462, 41032, 40601, 40171, 39740, 39310, 38880, 38449, 38019, 37589, 37159, 36730, 36301,
-    35872, 35444, 35017, 34589, 34163, 33737, 33313, 32888, 32465, 32043, 31621, 31201, 30782, 30364, 29947, 29532, 29117, 28705,
-    28293, 27883, 27475, 27069, 26664, 26260, 25859, 25459, 25062, 24666, 24273, 23881, 23492, 23105, 22720, 22337, 21957, 21579,
-    21204, 20831, 20461, 20094, 19729, 19367, 19008, 18652, 18298, 17948, 17600, 17256, 16915, 16577, 16242, 15910, 15582, 15256,
-    14935, 14616, 14301, 13990, 13682, 13377, 13076, 12779, 12486, 12196, 11909, 11627, 11348, 11073, 10801, 10534, 10270, 10010,
-    9754, 9502, 9254, 9010, 8769, 8533, 8300, 8071, 7846, 7625, 7408, 7195, 6986, 6781, 6579, 6382, 6188, 5999, 5813, 5631, 5452,
-    5278, 5107, 4940, 4777, 4617, 4462, 4309, 4161, 4016, 3874, 3737, 3602, 3471, 3344, 3219, 3098, 2981, 2867, 2756, 2648, 2543,
-    2441, 2342, 2247, 2154, 2064, 1977, 1893, 1811, 1732, 1656, 1582, 1511, 1442, 1376, 1312, 1251, 1191, 1134, 1079, 1027, 976,
-    927, 880, 835, 792, 751, 711, 673, 637, 602, 569, 538, 508, 479, 451, 425, 400, 377, 354, 333, 312, 293, 275, 257, 241, 225,
-    211, 197, 184, 171, 160, 149, 138, 129, 120, 111, 103, 95, 88, 82, 76, 70, 64, 59, 55, 50, 46, 42, 39, 36, 33, 30, 27, 25,
-    23, 21, 19, 17, 15, 14, 13, 11, 10, 9, 8, 7, 7, 6, 5, 5, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1,
+pub const GAUSSIAN_KERNEL: [u32; 291] = [
+    65536, 65180, 64822, 64462, 64101, 63737, 63372, 63005, 62636, 62265, 61892, 61518, 61142, 60764, 60384, 60003, 59620, 59235,
+    58849, 58460, 58071, 57679, 57287, 56892, 56496, 56099, 55700, 55299, 54897, 54494, 54089, 53683, 53276, 52867, 52457, 52046,
+    51634, 51220, 50806, 50390, 49973, 49555, 49136, 48717, 48296, 47874, 47452, 47028, 46604, 46179, 45754, 45328, 44901, 44474,
+    44046, 43618, 43189, 42760, 42330, 41901, 41471, 41040, 40610, 40180, 39749, 39319, 38888, 38458, 38028, 37598, 37168, 36738,
+    36309, 35881, 35453, 35025, 34598, 34172, 33746, 33321, 32897, 32474, 32051, 31630, 31210, 30790, 30372, 29955, 29540, 29126,
+    28713, 28301, 27892, 27483, 27077, 26672, 26268, 25867, 25467, 25070, 24674, 24280, 23889, 23500, 23112, 22727, 22345, 21965,
+    21587, 21212, 20839, 20469, 20101, 19736, 19374, 19015, 18659, 18305, 17955, 17607, 17263, 16922, 16583, 16248, 15917, 15588,
+    15263, 14941, 14623, 14308, 13996, 13688, 13383, 13082, 12785, 12491, 12201, 11915, 11632, 11353, 11078, 10807, 10539, 10275,
+    10016, 9759, 9507, 9259, 9014, 8774, 8537, 8305, 8076, 7851, 7630, 7413, 7200, 6990, 6785, 6583, 6386, 6192, 6002, 5816,
+    5634, 5456, 5281, 5111, 4944, 4780, 4621, 4465, 4312, 4164, 4019, 3877, 3739, 3605, 3474, 3346, 3222, 3101, 2983, 2869, 2758,
+    2650, 2545, 2443, 2344, 2248, 2156, 2066, 1979, 1894, 1813, 1734, 1657, 1584, 1512, 1444, 1377, 1313, 1252, 1193, 1135, 1080,
+    1028, 977, 928, 881, 836, 793, 752, 712, 674, 638, 603, 570, 538, 508, 479, 452, 426, 401, 377, 354, 333, 313, 293, 275, 258,
+    241, 226, 211, 197, 184, 172, 160, 149, 139, 129, 120, 111, 103, 96, 89, 82, 76, 70, 65, 59, 55, 50, 46, 43, 39, 36, 33, 30,
+    27, 25, 23, 21, 19, 17, 15, 14, 13, 11, 10, 9, 8, 7, 7, 6, 5, 5, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1,
 ];
 
 /// Class zero is uncapped; the other classes cap the kernel at eight times the row cap.
-pub const GAUSSIAN_CAPS: [u64; 8] = [65535, 23488, 27976, 32464, 36944, 45920, 54888, 63864];
+pub const GAUSSIAN_CAPS: [u64; 8] = [65536, 23488, 27976, 32464, 36944, 45920, 54888, 63864];
 /// LOG16's region 0 is check 3's logarithm ramp over `[0, 2^16)`.
 pub const LOG16_LOGARITHM_ROWS: u64 = 1 << 16;
 /// LOG16's regions `1..=NUM_GAUSSIAN_CLASSES` hold one Gaussian class each.
@@ -765,9 +769,9 @@ mod gaussian_tests {
             power *= 9;
         }
         ln2.1 += ceil_div(unit * 9, power * (4 * 257));
-        for difference in 0..=290 {
-            let numerator = U512::from(50 * difference + 51);
-            let exponent = (ln2.0 * numerator / 3200, ceil_div(ln2.1 * numerator, U512::from(3200)));
+        for difference in 0..=291 {
+            let numerator = U512::from(difference);
+            let exponent = (ln2.0 * numerator / 64, ceil_div(ln2.1 * numerator, U512::from(64)));
             let power = exponential(exponent);
             let w = ((power.0 - unit) / 2, ceil_div(power.1 - unit, U512::from(2)));
             let denominator = exponential(w);
@@ -776,7 +780,7 @@ mod gaussian_tests {
             let expected = GAUSSIAN_KERNEL.get(difference as usize).copied().unwrap_or(0) as u64;
             assert_eq!((lower, upper), (expected, expected), "kernel {difference}");
         }
-        // Monotonicity extends the certified zero at 290 to every larger key.
+        // Monotonicity extends the certified zero at 291 to every larger key.
         for (index, &bound) in LOG_BOUNDS.iter().enumerate() {
             let power = |integer: u64| {
                 let mut result = (U512::from(integer) << 177, U512::from(integer) << 177);
@@ -851,7 +855,7 @@ mod gaussian_tests {
                     let c32 = (decoded * 32.0) as u64;
                     let cap = 65536 * (13690 * c32 - 3321 * 32) / (50000 * 32);
                     assert_eq!(coefficient, 8192);
-                    for difference in [0, 1, 78, 158, 289, 290, 1009, GAUSSIAN_CLASS_HEIGHT - 1] {
+                    for difference in [0, 1, 78, 158, 290, 291, 1009, GAUSSIAN_CLASS_HEIGHT - 1] {
                         let kernel = GAUSSIAN_KERNEL.get(difference as usize).copied().unwrap_or(0) as u64;
                         assert_eq!(security_lookup_value(region, difference), kernel.min(8 * cap));
                     }

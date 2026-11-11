@@ -733,10 +733,10 @@ pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
     // min(T(d),cap_class), where
     //
     //   base = lambda(alpha*X=0, sigma),   d = lambda(alpha*X,sigma)-base,
-    //   T(d) = floor(65536*exp(-(2^((50*d+51)/3200)-1)/2)).
+    //   T(d) = floor(65536*exp(-(2^(d/64)-1)/2)).
     //
-    // d measures the clean signal relative to that row's noise. The 51/50 score slack
-    // bounds the score approximation conservatively; the kernel is zero for d>=290.
+    // d measures the clean signal relative to that row's noise without a score-error
+    // correction. The kernel is 65536 at d=0 and zero for d>=291.
     // Scale's DOWNSCALETHRESHOLD lookup fixes the region and base from the exact row RMS,
     // and the group CTL binds both here. Keying (region,d) as two components is essential:
     // a negative d or d>=8192 has no row in this region and cannot borrow a neighboring

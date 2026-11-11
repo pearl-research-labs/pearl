@@ -157,12 +157,14 @@
 //! LOG16 serves the integer kernel
 //!
 //! ```text
-//! T(d) = floor(2^16 * exp(-(2^((50*d+51)/3200)-1)/2))
+//! T(d) = floor(2^16 * exp(-(2^(d/64)-1)/2))
 //! K(d) = min(T(d), cap_class),    0 <= d < 8192.
 //! ```
 //!
-//! `T(d)=0` for `d >= 290`. The `51/50 = 1.02` score slack makes this a conservative
-//! Gaussian proxy; its integer table is certified in `unpredictability::gaussian_tests`.
+//! `T(0)=65536` and `T(d)=0` for `d >= 291`. This proxy uses the lambda difference
+//! without a score-error correction and can overestimate the ideal Gaussian; see
+//! [`crate::v4::circuit::unpredictability`] for the ideal row bound. Its integer table
+//! is certified in `unpredictability::gaussian_tests`.
 //! The two-component key `(region, d)` prevents an invalid difference from aliasing
 //! another region. A running sum adds `K(d)` per element, resets at group boundaries,
 //! and exports its group-final value to Scale, which enforces the minimum row proxy.
@@ -3478,7 +3480,11 @@ mod tests {
                 r: 32,
                 device: Device::B200,
             };
-            let input = test_inputs(&program);
+            let mut input = test_inputs(&program);
+            // At maximum k, a zero row attains the inclusive Q16 sum bound 2^32.
+            if k == 65536 {
+                input.a_int8.fill(0);
+            }
             let (rows, public_inputs) = program.generate_trace::<F, NUM_B200_INPUT_QUANT_COLUMNS>(
                 &input.a_int8,
                 &input.a_scales,
@@ -3493,11 +3499,15 @@ mod tests {
             for side in [&map.a, &map.b] {
                 let expected: u64 = rows[..k].iter().map(|row| to_u64(row[side.gaussian_value])).sum();
                 assert_eq!(to_u64(rows[k - 1][side.security_sum]), expected);
-                assert!(expected < 1 << 32);
+                assert!(expected <= (k as u64) << 16);
                 for row in &rows[..k] {
+                    assert!(to_u64(row[side.gaussian_value]) <= 1 << 16);
                     assert!(to_u64(row[side.common.x_enc]) <= 276);
                     assert!(to_u64(row[side.common.sum_of_squares_top]) >= 8192);
                 }
+            }
+            if k == 65536 {
+                assert_eq!(to_u64(rows[k - 1][map.a.security_sum]), 1 << 32);
             }
         }
     }
