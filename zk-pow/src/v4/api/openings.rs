@@ -706,7 +706,7 @@ mod tests {
     /// program's leaf set (chunk-complement of its aux-CV ranges) equals the
     /// unique-minimal leaf set miners ship, and its aux-CV ranges equal the
     /// wire proof's sibling ranges. `k = 1056` exercises blocks straddling row
-    /// boundaries (`k % 64 != 0`) within the aggregate work budget.
+    /// boundaries (`k % 64 != 0`).
     #[test]
     fn compiled_schedule_is_the_unique_minimal_opening() {
         for (a_hash, b_hash) in [

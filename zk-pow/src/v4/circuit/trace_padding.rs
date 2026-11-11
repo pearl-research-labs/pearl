@@ -1,8 +1,8 @@
 //! Consensus trace padding for the supported native FRI heights.
 
 // Keeping every stop from 18 through 22 avoids padding large tables; sparse lower
-// stops reduce the inner verifier's FRI boundaries. Traces, LUTs, known-column
-// evaluation and work accounting all round up through this shared helper.
+// stops reduce the inner verifier's FRI boundaries. Traces, LUTs and known-column
+// evaluation all round up through this shared helper.
 // Re-exported as V4_REACHABLE_DEGREE_BITS for FRI setup and verifier profile checks.
 pub const DEGREE_BITS: [usize; 9] = [22, 21, 20, 19, 18, 16, 13, 10, 7];
 

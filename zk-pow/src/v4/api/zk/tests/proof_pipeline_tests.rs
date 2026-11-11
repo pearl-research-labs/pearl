@@ -176,7 +176,6 @@ fn embedded_cache_verifies_the_committed_go_fixtures() {
 
 /// Pin the entire recursive verifier configuration and its polynomial inventory.
 /// A changed signature requires reviewing resource usage and rerunning `bench_v4_verify`.
-/// `PublicParams` scores geometry-dependent work separately, excluding the fixed verifier.
 #[test]
 #[cfg(feature = "embedded_cache")]
 fn verifier_resource_signature_is_pinned() {
@@ -261,9 +260,6 @@ fn bench_v4_prove() {
         other => panic!("V4_BENCH_SIZE must be small or medium, got {other}"),
     };
     plain.job.common.device = device;
-    let (_, params) = plain.parse_proof(&header).expect("benchmark job is admitted");
-    let work = params.verifier_work_units(params.blake3_work_block_bound().unwrap()).unwrap();
-    println!("{device:?}: verifier work {work}/{} units", PublicParams::MAX_VERIFIER_WORK);
     let mut prover = Fp8Prover::setup(device).expect("prover setup");
     let setup = &prover.setups[&device];
     let verifier = Fp8Verifier {
