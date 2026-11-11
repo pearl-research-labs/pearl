@@ -344,6 +344,22 @@ impl Fp8WrapperCircuits {
     ) -> Result<ProofWithPublicInputs<F, OuterC, D>> {
         system.ensure_statement_digest_binding(statement_digest)?;
         let mut pw = PartialWitness::new();
+        // Reserve repeated query inputs to avoid rehashing.
+        let fri = &self.universal_target.proof_with_pis.proof.opening_proof;
+        let per_query = fri.query_round_proofs.first().map_or(0, |query| {
+            query
+                .initial_trees_proof
+                .evals_proofs
+                .iter()
+                .map(|(values, proof)| values.len() + NUM_HASH_OUT_ELTS * proof.siblings.len())
+                .sum::<usize>()
+                + query
+                    .steps
+                    .iter()
+                    .map(|step| D * step.evals.len() + NUM_HASH_OUT_ELTS * step.merkle_proof.siblings.len())
+                    .sum::<usize>()
+        });
+        pw.target_values.reserve(per_query * fri.query_round_proofs.len());
         set_universal_batch_stark_proof_with_pis_target(
             &mut pw,
             &self.universal_target,
