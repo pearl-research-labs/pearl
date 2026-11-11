@@ -38,6 +38,9 @@ sha2 = "0.10"
 pearl-blake3 = { path = "../pearl-blake3", features = ["serde"] }
 pyo3 = { version = "0.24", optional = true }
 
+[build-dependencies]
+blake3 = "1.8"
+
 
 [profile.devr]
 inherits = "release"
