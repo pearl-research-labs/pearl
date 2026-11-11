@@ -200,7 +200,7 @@ fn verifier_resource_signature_is_pinned() {
         hash.finalize().to_hex().to_string()
     });
     assert_eq!(
-        signatures, ["6d525c401d3a1ef9f6d845af0ddbaff2de55f394d1a024e9993604960af12cab"; 2],
+        signatures, ["97641d0b4222a99b5c55bd0e01cf379ec4541047689ec325a3bb2512e7c1ca21"; 2],
         "verifier resources changed; review resource usage and rerun bench_v4_verify"
     );
 }

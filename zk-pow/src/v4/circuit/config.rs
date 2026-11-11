@@ -9,19 +9,16 @@ use super::trace_padding::DEGREE_BITS as V4_REACHABLE_DEGREE_BITS;
 /// V4 FRI security target.
 const SECURITY_BITS: usize = 128;
 
-/// Query count meeting the FRI target for the supplied rate and grinding bits.
-const fn num_query_rounds(security_bits: usize, pow_bits: usize, rate_bits: usize) -> usize {
-    security_bits.saturating_sub(pow_bits).div_ceil(rate_bits)
-}
-
 /// Builds the V4 inner (stage 1) or ZK outer (stage 2) configuration.
 /// Panics for any other stage.
 pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
-    let (rate_bits, pow_bits, num_routed_wires, is_zk) = match stage {
-        1 => (3, 17, 36, false),
-        2 => (8, 23, 37, true),
+    // Query counts stay fixed when retuning PoW.
+    let (rate_bits, pow_bits, num_query_rounds, num_routed_wires, is_zk) = match stage {
+        1 => (3, 17, 37, 36, false),
+        2 => (8, 25, 14, 37, true),
         _ => panic!("V4 recursion stage must be 1 or 2"),
     };
+    debug_assert!(rate_bits * num_query_rounds + pow_bits >= SECURITY_BITS);
     CircuitConfig {
         num_wires: 135,
         num_routed_wires,
@@ -37,7 +34,7 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
             proof_of_work_bits: pow_bits as u32,
             batching_proof_of_work_bits: pow_bits as u32,
             reduction_strategy: FriReductionStrategy::ConstantArityBits(3, 7),
-            num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
+            num_query_rounds,
         },
     }
 }
@@ -45,14 +42,15 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
 /// Builds the V4 STARK config with the fixed T3 ladder used by trace padding.
 /// Every job absorbs the same config into its Fiat–Shamir transcript.
 pub fn v4_stark_config() -> StarkConfig {
-    let (rate_bits, pow_bits) = (1, 17);
+    let (rate_bits, pow_bits, num_query_rounds) = (1, 17, 111);
+    debug_assert!(rate_bits * num_query_rounds + pow_bits >= SECURITY_BITS);
     let fri_config = FriConfig {
         rate_bits,
         cap_height: 4,
         proof_of_work_bits: pow_bits as u32,
         batching_proof_of_work_bits: pow_bits as u32,
         reduction_strategy: FriReductionStrategy::Ladder(V4_REACHABLE_DEGREE_BITS.to_vec()),
-        num_query_rounds: num_query_rounds(SECURITY_BITS, pow_bits, rate_bits),
+        num_query_rounds,
     };
     // Three CTL/Logup repetitions keep batched-lookup error below the FRI error.
     StarkConfig::new(SECURITY_BITS, 3, fri_config)
