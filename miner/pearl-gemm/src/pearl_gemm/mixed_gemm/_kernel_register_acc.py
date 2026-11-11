@@ -60,7 +60,7 @@ from quack.tile_scheduler import (
 )
 
 from ..tensor_hash_plus_stats._blake3_ops import SINGLE_BLOCK_KEYED_FLAGS, compress
-from ._lottery import _SEXT_PAD, LANES, R2, _fold_word, _HitPublishMixin
+from ._lottery import _SEXT_PAD, LANES, R2, _fold_word, _HitPublishMixin, _quad_transpose
 
 LTILE_ROWS = 4  # the only register-accumulator lottery tile row count
 WG_THREADS = 128
@@ -275,11 +275,13 @@ class _RegisterAccFusedGemm(_HitPublishMixin):
 
         Both families' C fragments give lane ``T`` of warp ``w`` rows
         ``16 w + (T >> 2) + 8 h`` of each 64-row M-atom and columns
-        ``8 nb + 2 (T & 3) + c``, so word ``T & 15`` of lottery row
+        ``8 nb + 2 (T & 3) + c``. Word ``T & 15`` of lottery row
         ``4 w + 2 h + (T >> 4)`` folds, in ascending column order, the
-        column-tile cells at ``_lottery_fragment_index(mma_row, h, c, nb)``.
+        ``T & 3``-th consecutive quarter of its row's column tile, which the
+        lane gathers from its quad (``_quad_transpose``).
         """
         blocks_per_column_tile = self.ltile_cols // self.fragment_n_block
+        blocks_per_word = blocks_per_column_tile // 4
         cute.arch.barrier(
             barrier_id=int(_NamedBarrier.LOTTERY_BUFFER_FREE_WG0) + warp_group_idx,
             number_of_threads=WG_THREADS + cute.arch.WARP_SIZE,
@@ -288,17 +290,29 @@ class _RegisterAccFusedGemm(_HitPublishMixin):
             for row_half in cutlass.range_constexpr(2):
                 for column_tile in cutlass.range_constexpr(self.column_tiles):
                     folded = Uint32(0)
-                    for block in cutlass.range_constexpr(blocks_per_column_tile):
-                        for column in cutlass.range_constexpr(2):
-                            word = accumulator[
-                                self._lottery_fragment_index(
-                                    mma_row,
-                                    row_half,
-                                    column,
-                                    column_tile * blocks_per_column_tile + block,
-                                )
-                            ].bitcast(Uint32)
-                            folded = _fold_word(folded, word)
+                    for block in cutlass.range_constexpr(blocks_per_word):
+                        cells = [
+                            _quad_transpose(
+                                [
+                                    accumulator[
+                                        self._lottery_fragment_index(
+                                            mma_row,
+                                            row_half,
+                                            column,
+                                            column_tile * blocks_per_column_tile
+                                            + chunk * blocks_per_word
+                                            + block,
+                                        )
+                                    ].bitcast(Uint32)
+                                    for chunk in range(4)
+                                ],
+                                lane & 3,
+                            )
+                            for column in range(2)
+                        ]
+                        for quad_lane in cutlass.range_constexpr(4):
+                            for column in cutlass.range_constexpr(2):
+                                folded = _fold_word(folded, cells[column][quad_lane])
                     thread_row = 4 * warp_in_wg + 2 * row_half + (lane >> 4)
                     message = (
                         thread_row * self.mma_m_per_wg + mma_row

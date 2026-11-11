@@ -10,8 +10,10 @@ verifiable.
 
 from dataclasses import replace
 
+import numpy as np
 import pytest
 import torch
+from blake3 import blake3
 from miner_base.layout import lane_assignment
 
 from pearl_gemm import (
@@ -23,6 +25,7 @@ from pearl_gemm import (
     supports_lottery_family,
 )
 from pearl_gemm._utils._arch import Arch, arch_of
+from pearl_gemm.mixed_gemm._lottery import _FOLD_MUL
 from pearl_gemm.protocol_constants import R
 from tests.helpers.preprocess import tall_tile_config
 
@@ -67,6 +70,11 @@ else:
     _VARIANTS["4x64-tile64"] = {
         "config": MixedGemmConfig(tile_m=64, tile_n=64, cluster_m=1, cluster_n=1, ltile_cols=64),
         "lottery_shapes": [(256, 128, 512), (64, 192, 512)],
+    }
+    # A lottery tile wider than the 64-row tile's epilogue subtile.
+    _VARIANTS["4x128-tile64"] = {
+        "config": MixedGemmConfig(tile_m=64, tile_n=128, cluster_m=1, cluster_n=1),
+        "lottery_shapes": [(256, 256, 512)],
     }
 
 
@@ -193,6 +201,47 @@ def test_consistency(variant, m, n, k):
     out1, _, _ = _run(inputs, threshold=(1 << 255), config=config)
     out2, _, _ = _run(inputs, threshold=(1 << 255), config=config)
     assert torch.equal(out1, out2)
+
+
+def _lottery_hashes(inputs, rows: int, cols: int) -> dict[tuple[int, int], int]:
+    """Keyed digest of every lottery tile: lane ``j`` folds its
+    ``lane_assignment`` cells of the exact pre-peel accumulator as
+    ``h = rotl13(h * 0x9E3779B1 + word)``."""
+    acc = (inputs["a_prime"].double().cpu() @ inputs["b_prime"].double().cpu().T).float()
+    m, n = acc.shape
+    tiles = acc.reshape(m // rows, rows, n // cols, cols).permute(0, 2, 1, 3)
+    words = tiles.reshape(-1, rows * cols).contiguous().view(torch.int32).numpy()
+    words = words.astype(np.uint32).astype(np.uint64)[:, np.asarray(lane_assignment(rows, cols))]
+    h = np.zeros(words.shape[:2], dtype=np.uint64)
+    for step in range(words.shape[2]):
+        h = (h * _FOLD_MUL + words[:, :, step]) & 0xFFFFFFFF
+        h = ((h << 13) | (h >> 19)) & 0xFFFFFFFF
+    key = bytes(inputs["pow_key"].cpu().numpy())
+    return {
+        divmod(i, n // cols): int.from_bytes(
+            blake3(lanes.astype("<u4").tobytes(), key=key).digest(), "little"
+        )
+        for i, lanes in enumerate(h)
+    }
+
+
+@pytest.mark.parametrize("variant,m,n,k", _cases("lottery_shapes"))
+def test_first_winner_matches_committed_lottery(variant, m, n, k):
+    """A single-winner threshold pins the exact tile of the host lottery; one
+    below it publishes nothing. Integer-valued operands keep every partial
+    sum an exact FP32 integer, so the host accumulator is bit-exact."""
+    config = _VARIANTS[variant]["config"]
+    inputs = _make_inputs(m, n, k, seed=7)
+    for name, rows in (("a_prime", m), ("b_prime", n)):
+        inputs[name] = torch.randint(-2, 3, (rows, k), device="cuda").to(torch.float8_e4m3fn)
+    hashes = _lottery_hashes(inputs, config.ltile_rows, config.ltile_cols)
+    coordinate, minimum = min(hashes.items(), key=lambda item: item[1])
+    _, hit_signal, _ = _run(inputs, threshold=minimum, config=config)
+    hit = hit_signal.read_hit()
+    assert hit is not None and hit.valid
+    assert (hit.tile_row, hit.tile_column) == coordinate
+    _, hit_signal, _ = _run(inputs, threshold=minimum - 1, config=config)
+    assert not hit_signal.doorbell()
 
 
 @pytest.mark.slow

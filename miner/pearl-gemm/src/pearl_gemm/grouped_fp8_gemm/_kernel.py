@@ -59,7 +59,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from quack.utils import store_shared_remote
 
-from ..mixed_gemm._kernel import _fold_register_groups, _thread_fold_cells
+from ..mixed_gemm._kernel import _fold_register_groups, _thread_fold_cells, _word_of
 from ..mixed_gemm._lottery import (
     _SEXT_PAD,
     DEFAULT_LTILE_COLS,
@@ -2311,11 +2311,13 @@ class GroupedGemmSm100(_HitPublishMixin):
                 # and the dynamic accumulator row and word base this thread owns.
                 cta_m, cta_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
                 epi_tile_n = cutlass.const_expr(cute.size(epi_tile[1]))
-                assert epi_tile_n % 8 == 0, f"epi_tile_n must be a multiple of 8, got {epi_tile_n}"
-                fold_groups, words_per_class = _fold_register_groups(
+                fold_groups, quad = _fold_register_groups(
                     tiled_copy_t2r, self.words_per_row, self.ltile_cols
                 )
-                assert len(fold_groups) == 1, "the mining variant expects one row class per thread"
+                assert len(fold_groups) == 1 and not quad, (
+                    "the mining variant expects one whole row per thread"
+                )
+                words_per_class = self.words_per_row
                 fold_group = fold_groups[0]
                 cAcc = cute.make_identity_tensor((cta_m, cta_n))
                 cAcc_epi = cute.flat_divide(cAcc, epi_tile)
@@ -2377,12 +2379,12 @@ class GroupedGemmSm100(_HitPublishMixin):
                         cute.copy(
                             tiled_copy_t2r, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc
                         )
-                        for value, column_offset, word_slot in fold_group:
+                        for value, column_offset in fold_group:
                             # Trace-time: the partial this column feeds.
-                            column_tile = (
-                                subtile_idx * epi_tile_n + column_offset
-                            ) // self.ltile_cols
-                            word = column_tile * words_per_class + word_slot
+                            column = subtile_idx * epi_tile_n + column_offset
+                            word = (column // self.ltile_cols) * words_per_class + _word_of(
+                                column, self.words_per_row, self.ltile_cols
+                            )
                             partials[word] = _fold_word(
                                 partials[word], tTR_rAcc[value].bitcast(Uint32)
                             )
@@ -2393,8 +2395,8 @@ class GroupedGemmSm100(_HitPublishMixin):
 
                     # Stage this thread's folded words into their messages'
                     # 64-byte blocks: word j of message (lottery row r, column
-                    # tile ct) folds row ``ltile_rows*r + (j >> 2)`` at columns
-                    # congruent to ``{2*(j&3), 2*(j&3)+1}`` mod 8 (4-row family).
+                    # tile ct) folds the j-th of 16 consecutive chunks of the
+                    # row-major tile.
                     for column_tile in cutlass.range_constexpr(self.column_tiles):
                         message = (thread_row >> row_shift) * self.column_tiles + column_tile
                         for slot in cutlass.range_constexpr(words_per_class):

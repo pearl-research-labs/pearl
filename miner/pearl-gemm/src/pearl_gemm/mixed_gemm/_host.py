@@ -128,9 +128,8 @@ def sm90_accumulator_registers(config: MixedGemmConfig) -> int:
 def _validate_tile_shape_sm90(config: MixedGemmConfig) -> None:
     """SM90 tile shape limits (WGMMA warpgroup layouts, register budget)."""
     if config.ltile_rows != 4:
-        # WGMMA fragments split accumulator rows across four lanes at mod-8
-        # column-pair granularity, so no thread can fold a 16-row-family
-        # word thread-locally.
+        # The quad exchange of the WGMMA fragments yields one word per lane
+        # only for the 4-row family (four words per row).
         raise ValueError("the SM90 lottery implements only the 4-row lottery family")
     if config.tile_m not in (64, 128, 256):
         # 192 needs three consumer warpgroups (192x128) or an N-split atom
@@ -158,8 +157,8 @@ def _validate_tile_shape_sm120(config: MixedGemmConfig) -> None:
     if config.tile_m not in (64, 128):
         raise ValueError("SM120 tile_m must be 64 or 128 (4 or 8 mma warps of 16 rows)")
     if config.ltile_rows != 4:
-        # mma.sync fragments split every accumulator row across four lanes at
-        # mod-8 column-pair granularity, so no lane can fold a whole-row word.
+        # The quad exchange of the mma.sync fragments yields one word per lane
+        # only for the 4-row family (four words per row).
         raise ValueError("SM120 supports only the 4-row lottery family")
     if config.tile_n % 32 or not 32 <= config.tile_n <= 256:
         raise ValueError("SM120 tile_n must be a multiple of 32 in [32, 256]")

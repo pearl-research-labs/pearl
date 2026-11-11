@@ -623,14 +623,14 @@ def test_activation_finalize_uses_current_stream():
 
 
 def _moe_p_a(m: int, k: int) -> bytes:
-    """The 13-byte MoE ``pA``: the dense encoding plus ``hash_idR || hash_idO``."""
+    """The 11-byte MoE ``pA``: the dense encoding plus ``hash_idR || hash_idO``."""
     moe = MoeParams(experts=8, hash_id_r=_LEAF, hash_id_o=_LEAF)
     return encode_p_a(default_config(k).a_params(m), moe)
 
 
 def test_moe_routing_commitments_bind_into_seed_a():
     """MoE: ``seedA = H_"seed-A"(HA || HR || HO || seedB || keyA || pA)`` with
-    the 13-byte MoE ``pA``; the noise-line and jackpot keys follow from it,
+    the 11-byte MoE ``pA``; the noise-line and jackpot keys follow from it,
     and HR / HO each change every key."""
     m, k = 32, 512
     key_a, seed_b = blake3(b"moe-job").digest(), blake3(b"moe-cb").digest()
@@ -668,7 +668,7 @@ def test_moe_pa_and_routing_commitments_come_together():
     with pytest.raises(ValueError, match="routing_commitments must have shape"):
         tensor_hash_plus_stats(codes, scales, **buffers, routing_commitments=routing[:32])
     buffers["p_a"] = bytes(12)
-    with pytest.raises(ValueError, match="13-byte MoE pA"):
+    with pytest.raises(ValueError, match="11-byte MoE pA"):
         tensor_hash_plus_stats(codes, scales, **buffers, routing_commitments=routing)
 
 

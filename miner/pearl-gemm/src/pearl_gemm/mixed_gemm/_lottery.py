@@ -33,6 +33,33 @@ def _fold_word(folded, word):
     return _rotr32(folded * Uint32(_FOLD_MUL) + word, 19)
 
 
+def _select(pred, a, b):
+    return Uint32(cutlass.select_(pred, a, b))
+
+
+def _quad_transpose(x, quad_lane):
+    """Transpose four words across the four consecutive lanes of a quad:
+    lane ``q`` passes ``x[w]`` for lanes ``w = 0..3`` and gets back
+    ``x_{q'}[q]`` at index ``q'`` (``x_{q'}`` being lane ``q'``'s input).
+
+    The mma accumulator fragment gives quad lane ``q`` columns ``8b + 2q +
+    {0, 1}`` of a row, so a consecutive lottery word spans all four lanes;
+    after this exchange lane ``q`` holds every cell of word ``q``."""
+    hi = (quad_lane & 2) != 0
+    lo = (quad_lane & 1) != 0
+    t0 = cute.arch.shuffle_sync_bfly(_select(hi, x[0], x[2]), offset=2)
+    t1 = cute.arch.shuffle_sync_bfly(_select(hi, x[1], x[3]), offset=2)
+    z = (
+        (_select(hi, t0, x[0]), _select(hi, t1, x[1])),
+        (_select(hi, x[2], t0), _select(hi, x[3], t1)),
+    )
+    y = []
+    for z0, z1 in z:
+        u = cute.arch.shuffle_sync_bfly(_select(lo, z0, z1), offset=1)
+        y += [_select(lo, u, z0), _select(lo, z1, u)]
+    return y
+
+
 class _HitGroup(NamedTuple):
     """The expert of a grouped (MoE) hit: the record's ``M`` is its block's
     ``rows``, ``GROUP_ID`` its ``index``, and its payload the plane rows

@@ -237,11 +237,11 @@ def test_layer_state_creation_failure_stays_unquantized(mined_settings, async_ma
     torch.testing.assert_close(layer.weight.data, reference)
 
 
-@pytest.mark.parametrize(("k", "n"), [(1000, 24), (2048, 48), (1024, 64)])
+@pytest.mark.parametrize(("k", "n"), [(1000, 24), (2048, 48), (512, 64)])
 def test_unmineable_shapes_stay_unquantized(mined_settings, async_manager, k, n):
     """Unsupported (misaligned k), encodable-but-unmineable (n % 32, so below
     even the tall 16x32 tile's alignment) and below-the-cert-v4-floor
-    (k < 2048) shapes must all keep the original BF16 path: encoding without
+    (k < 1024) shapes must all keep the original BF16 path: encoding without
     mining is pure loss."""
     from vllm.model_executor.layers.linear import ReplicatedLinear
     from vllm_miner.vllm_pearl_config import PearlConfig

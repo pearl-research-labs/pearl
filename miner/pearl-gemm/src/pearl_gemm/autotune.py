@@ -242,8 +242,8 @@ MIXED_GEMM_SPACE: list[dict] = [
 # 4x64 wherever it fits, 16x32 next, 4x128 fallback. ltile_cols is a job-key
 # commitment, not a free knob; the sweep injects it so n=576 / n=2752 are
 # launchable.
-_LOTTERY_4X64_MAX_K = 61440
-_LOTTERY_16X32_MAX_K = 65536
+_LOTTERY_4X64_MAX_K = 30720
+_LOTTERY_16X32_MAX_K = 43520
 _LOTTERY_MIN_K = 1024
 
 _MIXED_GEMM_TILE_M = (128, 256)

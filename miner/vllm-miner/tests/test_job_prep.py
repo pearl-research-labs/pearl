@@ -43,10 +43,10 @@ from vllm_miner.state import (
 )
 
 _N, _K = 128, 2048
-# Past the 4x64 tile's verifier limit (61440), so this shape commits the tall
+# Past the 4x64 tile's verifier limit (30720), so this shape commits the tall
 # 16x32 tile instead of the preferred 4x64. Blackwell only: Hopper commits no
 # tall tile, so this k is unmineable there.
-_TALL_K = 65536
+_TALL_K = 43520
 _DEVICES = pytest.mark.parametrize("device", list(Device), ids=lambda d: d.name.lower())
 _HEADER = bytes(range(80))
 _OTHER_HEADER = bytes(range(1, 81))
