@@ -7,7 +7,7 @@ fn main() {
         let cache = std::fs::read("src/v4/api/v4_cache.bin").expect("missing V4 verifier cache; run build_cache");
         assert_eq!(
             &blake3::hash(&cache).to_hex().as_str()[..32],
-            "347f1ff521844c7033db5fb65ddfca6a",
+            "a04c7316cf77577d79328b5ebae23c00",
             "V4 verifier cache digest mismatch"
         );
     }

@@ -10,8 +10,8 @@ use super::trace_padding::DEGREE_BITS as V4_REACHABLE_DEGREE_BITS;
 /// Panics for any other stage.
 pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
     let (pow_bits, rate_bits, num_query_rounds, num_routed_wires, is_zk, arity_bits) = match stage {
-        1 => (18, 3, 38, 36, false, 4),
-        2 => (23, 8, 14, 37, true, 3),
+        1 => (18, 3, 39, 37, false, 4),
+        2 => (23, 8, 14, 38, true, 3),
         _ => panic!("V4 recursion stage must be 1 or 2"),
     };
     CircuitConfig {
@@ -44,7 +44,7 @@ pub fn v4_stark_config() -> StarkConfig {
         proof_of_work_bits: pow_bits as u32,
         batching_proof_of_work_bits: pow_bits as u32,
         reduction_strategy: FriReductionStrategy::Ladder(V4_REACHABLE_DEGREE_BITS.to_vec()),
-        num_query_rounds: 113,
+        num_query_rounds: 114,
     };
     // Three CTL/Logup repetitions keep batched-lookup error below the FRI error.
     StarkConfig::new(108, 3, fri_config)
