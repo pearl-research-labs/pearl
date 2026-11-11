@@ -3,6 +3,8 @@ use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use core::any::TypeId;
+
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
@@ -14,12 +16,14 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::config::{Blake3GoldilocksConfig, GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::fft_par::coset_fft_par;
 use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
+
+mod blake3_pow;
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -63,13 +67,20 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     let query_round_proofs =
         fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
 
-    FriProof {
+    let proof = FriProof {
         commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
         batching_pow_witness,
-    }
+    };
+    trees.into_par_iter().for_each(|tree| {
+        tree.leaves
+            .into_par_iter()
+            .with_min_len(1 << 13)
+            .for_each(drop);
+    });
+    proof
 }
 
 pub(crate) type FriCommitedTrees<F, C, const D: usize> = (
@@ -199,11 +210,16 @@ pub(crate) fn proof_of_work<
     // Assert RATE=8 since permute_n::<8>() is hardcoded below
     debug_assert_eq!(<C::Hasher as Hasher<F>>::Permutation::RATE, 8);
 
-    let chunk_size = 1u64 << proof_of_work_bits.saturating_sub(16);
-    let num_chunks = F::NEG_ONE.to_canonical_u64() / chunk_size;
-    let pow_witness = (0..num_chunks)
-        .into_par_iter()
-        .find_map_any(|chunk_idx| {
+    let pow_witness = if TypeId::of::<C>() == TypeId::of::<Blake3GoldilocksConfig>() {
+        blake3_pow::find_witness::<F, _>(
+            duplex_intermediate_state,
+            witness_input_pos,
+            proof_of_work_bits,
+        )
+    } else {
+        let chunk_size = 1u64 << proof_of_work_bits.saturating_sub(16);
+        let num_chunks = F::NEG_ONE.to_canonical_u64() / chunk_size;
+        (0..num_chunks).into_par_iter().find_map_any(|chunk_idx| {
             let base = chunk_idx * chunk_size;
             for offset in 0..chunk_size {
                 let candidate = base + offset;
@@ -217,8 +233,9 @@ pub(crate) fn proof_of_work<
             }
             None
         })
-        .map(F::from_canonical_u64)
-        .expect("Proof of work failed. This is highly unlikely!");
+    }
+    .map(F::from_canonical_u64)
+    .expect("Proof of work failed. This is highly unlikely!");
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
     challenger.observe_element(pow_witness);
     let pow_response = challenger.get_challenge();

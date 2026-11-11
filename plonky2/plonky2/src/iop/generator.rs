@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use anyhow::{anyhow, Result};
 use plonky2_maybe_rayon::rayon::iter::ParallelIterator;
 use plonky2_maybe_rayon::rayon::slice::ParallelSlice;
+use plonky2_maybe_rayon::MaybeIntoParIter;
 
 use crate::field::extension::Extendable;
 use crate::field::types::Field;
@@ -131,11 +132,15 @@ pub fn generate_partial_witness_fast<
     let generators = &prover_data.generators;
     let layers = &prover_data.layered_generators;
 
-    let mut witness = PartitionWitness::new(
-        config.num_wires,
-        common_data.degree(),
-        &prover_data.representative_map,
-    );
+    let mut witness = PartitionWitness {
+        values: (0..prover_data.representative_map.len())
+            .into_par_iter()
+            .map(|_| None)
+            .collect(),
+        representative_map: &prover_data.representative_map,
+        num_wires: config.num_wires,
+        degree: common_data.degree(),
+    };
 
     // Set initial inputs
     for (t, v) in inputs.target_values.into_iter() {
@@ -144,28 +149,32 @@ pub fn generate_partial_witness_fast<
 
     let values_ptr = AtomicPtr::new(witness.values.as_mut_ptr());
 
-    for layer in layers {
-        // Each rayon task processes a chunk of generators. The chunk is sized
-        // so each task does real work (the generators are tiny arithmetic ops),
-        // instead of paying scheduling per 4 generators.
-        let chunk = layer.len().div_ceil(96 * 8).clamp(4, 512);
-        layer
-            .par_chunks(chunk)
-            .for_each_init(GeneratedValues::empty, |buffer, chunk| {
-                let ptr = values_ptr.load(Ordering::Relaxed);
-                for &generator_idx in chunk {
-                    // SAFETY: generator_idx comes from layers which contain valid indices
-                    let finished = unsafe { generators.get_unchecked(generator_idx as usize) }
-                        .0
-                        .run(&witness, buffer);
-                    debug_assert!(finished);
+    let run_chunk = |buffer: &mut GeneratedValues<F>, chunk: &[u32]| {
+        let ptr = values_ptr.load(Ordering::Relaxed);
+        for &generator_idx in chunk {
+            // SAFETY: generator_idx comes from layers which contain valid indices
+            let finished = unsafe { generators.get_unchecked(generator_idx as usize) }
+                .0
+                .run(&witness, buffer);
+            debug_assert!(finished);
 
-                    // SAFETY: Each generator produces unique targets, so writes are disjoint.
-                    for (t, v) in buffer.target_values.drain(..) {
-                        unsafe { witness.set_target_unsafe(ptr, t, v) };
-                    }
-                }
-            });
+            // SAFETY: Each generator produces unique targets, so writes are disjoint.
+            for (t, v) in buffer.target_values.drain(..) {
+                unsafe { witness.set_target_unsafe(ptr, t, v) };
+            }
+        }
+    };
+    let mut serial_buffer = GeneratedValues::empty();
+    for layer in layers {
+        // Tiny dependency layers cost less than a Rayon scheduling round.
+        if layer.len() <= 32 {
+            run_chunk(&mut serial_buffer, layer);
+        } else {
+            let chunk = layer.len().div_ceil(96 * 8).clamp(4, 512);
+            layer
+                .par_chunks(chunk)
+                .for_each_init(GeneratedValues::empty, run_chunk);
+        }
     }
 
     Ok(witness)
@@ -507,5 +516,59 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Con
             wire_index,
             constant,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn fast_witness_matches_tracked_witness() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let inputs = builder.add_virtual_targets(64);
+        let mut outputs = inputs.clone();
+        let mut checked = inputs.clone();
+        for _ in 0..8 {
+            outputs = outputs.into_iter().map(|x| builder.square(x)).collect();
+            checked.extend(&outputs);
+        }
+        let mut sum = builder.zero();
+        for x in outputs {
+            sum = builder.add(sum, x);
+            checked.push(sum);
+        }
+        builder.register_public_input(sum);
+        let mut circuit = builder.build_prover::<C>();
+        for seed in [1, 17, 89] {
+            let mut pw = PartialWitness::new();
+            for (i, &target) in inputs.iter().enumerate() {
+                pw.set_target(target, F::from_canonical_usize(seed + i))?;
+            }
+            let (expected, layers) =
+                generate_partial_witness(pw.clone(), &circuit.prover_only, &circuit.common, true)?;
+            // Unused public-input wires are randomized independently.
+            let expected: Vec<_> = checked.iter().map(|&t| expected.get_target(t)).collect();
+            assert!(layers.iter().any(|layer| layer.len() > 32));
+            assert!(layers.iter().any(|layer| layer.len() <= 32));
+            circuit.prover_only.layered_generators = layers;
+            for threads in [1, 4] {
+                let pool = plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()?;
+                let actual = pool.install(|| {
+                    generate_partial_witness_fast(pw.clone(), &circuit.prover_only, &circuit.common)
+                })?;
+                let actual: Vec<_> = checked.iter().map(|&t| actual.get_target(t)).collect();
+                assert_eq!(actual, expected);
+            }
+        }
+        Ok(())
     }
 }

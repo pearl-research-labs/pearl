@@ -271,11 +271,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let (row_values, digest_leaves): (Vec<_>, Vec<_>) = ranges
             .par_iter()
             .map(|range| {
+                let roots =
+                    crate::field::fft::fft_root_table(polynomials[range.start].len() << rate_bits);
                 let lde = PolynomialBatch::<F, C, D>::lde_values(
                     &polynomials[range.clone()],
                     rate_bits,
                     false,
-                    None,
+                    Some(&roots),
                 );
                 let rows = transpose_bitrev(&lde);
                 let digests = hash_leaf_rows::<F, C, D>(&rows);
@@ -416,7 +418,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     // per-run sweeps suffered behind the tall instance.
                     let mut composition_poly = PolynomialCoeffs::<F::Extension>::zero(degree);
                     {
-                        const TILE: usize = 4096;
+                        const TILE: usize = 1024;
                         composition_poly
                             .coeffs
                             .par_chunks_mut(TILE)
