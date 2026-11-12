@@ -3,6 +3,7 @@ pub mod dtype;
 pub mod embedded_cache;
 pub mod jackpot_policy;
 pub mod layout;
+pub mod mine;
 pub mod noise;
 pub(crate) mod openings;
 pub mod plain_proof;
