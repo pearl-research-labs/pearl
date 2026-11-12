@@ -25,21 +25,55 @@ use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::timed;
 use crate::util::fft_par::coset_fft_par;
 use crate::util::timing::TimingTree;
-use crate::util::{reverse_bits, transpose, transpose_bitrev};
+use crate::util::{reverse_bits, transpose};
 use plonky2_field::extension::FieldExtension;
 use plonky2_field::packable::Packable;
 
-/// Hash commitment leaf rows into Merkle leaves (as field-element vectors).
+/// Hash natural-order rows into bit-reversed Merkle leaves.
 ///
 /// Each row is hashed independently on the prover worker pool.
-fn hash_leaf_rows<F, C, const D: usize>(rows: &[Vec<F>]) -> Vec<Vec<F>>
+fn hash_leaf_rows<F, C, const D: usize>(rows: &RowMatrix<F>) -> Vec<Vec<F>>
 where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
 {
-    rows.par_iter()
-        .map(|row| C::Hasher::hash_no_pad(row).to_vec())
+    let height = rows.values.len() / rows.width;
+    let bits = log2_strict(height);
+    (0..height)
+        .into_par_iter()
+        .map(|index| C::Hasher::hash_no_pad(rows.row(reverse_bits(index, bits))).to_vec())
         .collect()
+}
+
+/// Prover-only raw evaluations in natural point order; Merkle leaves are bit-reversed.
+#[derive(Eq, PartialEq, Debug)]
+struct RowMatrix<F> {
+    width: usize,
+    values: Vec<F>,
+}
+
+impl<F: RichField> RowMatrix<F> {
+    /// Transpose nonempty, equal-length columns into contiguous rows.
+    fn from_columns(columns: &[Vec<F>]) -> Self {
+        let width = columns.len();
+        let mut values = vec![F::ZERO; width * columns[0].len()];
+        // Read short contiguous runs from each column while filling adjacent rows.
+        values
+            .par_chunks_mut(64 * width)
+            .enumerate()
+            .for_each(|(block, chunk)| {
+                for (r, row) in chunk.chunks_exact_mut(width).enumerate() {
+                    for (c, value) in row.iter_mut().enumerate() {
+                        *value = columns[c][64 * block + r];
+                    }
+                }
+            });
+        Self { width, values }
+    }
+
+    fn row(&self, index: usize) -> &[F] {
+        &self.values[index * self.width..(index + 1) * self.width]
+    }
 }
 
 /// `(self - self(z)) / (X - z)` with a blocked parallel scan.
@@ -139,7 +173,7 @@ pub struct BatchFriOracle<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     pub rate_bits: usize,
     pub blinding: bool,
     // Digest trees retain raw rows for quotient evaluation and FRI openings.
-    row_values: Vec<Vec<Vec<F>>>,
+    row_values: Vec<RowMatrix<F>>,
     leaf_ranges: Vec<Range<usize>>,
 }
 
@@ -279,7 +313,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     false,
                     Some(&roots),
                 );
-                let rows = transpose_bitrev(&lde);
+                let rows = RowMatrix::from_columns(&lde);
                 let digests = hash_leaf_rows::<F, C, D>(&rows);
                 (rows, digests)
             })
@@ -310,7 +344,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let mut values = vec![F::ZERO; self.polynomials.len()];
         for (i, range) in self.leaf_ranges.iter().enumerate() {
             let row = index >> (self.degree_bits[0] - self.degree_bits[i]);
-            values[range.clone()].copy_from_slice(&self.row_values[i][row]);
+            let point = reverse_bits(row, self.degree_bits[i] + self.rate_bits);
+            values[range.clone()].copy_from_slice(self.row_values[i].row(point));
         }
         values
     }
@@ -511,14 +546,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         slice_start: usize,
         slice_len: usize,
     ) -> &[F] {
-        let index = index * step;
-        let index = reverse_bits(index, self.degree_bits[degree_bits_index] + self.rate_bits);
-        let rows = if self.row_values.is_empty() {
-            &self.batch_merkle_tree.leaves
+        let point = index * step;
+        let slice = if self.row_values.is_empty() {
+            let index = reverse_bits(point, self.degree_bits[degree_bits_index] + self.rate_bits);
+            &self.batch_merkle_tree.leaves[degree_bits_index][index]
         } else {
-            &self.row_values
+            self.row_values[degree_bits_index].row(point)
         };
-        let slice = &rows[degree_bits_index][index];
         &slice[slice_start..slice_start + slice_len]
     }
 
@@ -644,6 +678,20 @@ mod test {
             1,
             &mut timing,
         );
+        for index in 0..128 {
+            assert_eq!(ordinary.open_values(index), digests.open_values(index));
+        }
+        for (group, &bits) in ordinary.degree_bits.iter().enumerate() {
+            for point in 0..1 << (bits + 2) {
+                let expected = ordinary.get_lde_values(group, point, 1, 0, 2);
+                assert_eq!(digests.get_lde_values(group, point, 1, 0, 2), expected);
+                let leaf = point.reverse_bits() >> (usize::BITS as usize - bits - 2);
+                assert_eq!(
+                    digests.batch_merkle_tree.leaves[group][leaf],
+                    H::hash_no_pad(expected).to_vec()
+                );
+            }
+        }
         for oracle in [ordinary, digests] {
             for (group, &bits) in oracle.degree_bits.iter().enumerate() {
                 for step in [1, 2, 4] {
