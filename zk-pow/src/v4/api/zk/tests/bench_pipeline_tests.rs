@@ -243,7 +243,7 @@ fn bench_pipeline() {
         // allocator, fill any per-geometry caches. Its timing tree is the
         // phase split deliverable (the box is shared; phases of one rep only).
         let mut timing = TimingTree::new(&format!("bench-k{k}-warmrep"), log::Level::Info);
-        let warm = prove_batch_statement(&header, &plain, setup, &mut timing)
+        let warm = prove_batch_statement(&header, &plain, setup.device, &setup.preprocessed, &mut timing)
             .unwrap_or_else(|e| panic!("BENCH k={k} layer-0 warm-up failed: {e:#}"));
         drop(warm);
         timing.filter(Duration::from_millis(100)).print();
@@ -256,13 +256,14 @@ fn bench_pipeline() {
         for rep in 0..reps {
             let mut timing = TimingTree::new(&format!("bench-k{k}-rep{rep}"), log::Level::Info);
             let t = Instant::now();
-            let (public, job, batch_proof) = match prove_batch_statement(&header, &plain, setup, &mut timing) {
-                Ok(x) => x,
-                Err(e) => {
-                    eprintln!("BENCH k={k} layer-0 failed: {e:#}");
-                    break;
-                }
-            };
+            let (public, job, batch_proof) =
+                match prove_batch_statement(&header, &plain, setup.device, &setup.preprocessed, &mut timing) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        eprintln!("BENCH k={k} layer-0 failed: {e:#}");
+                        break;
+                    }
+                };
             let layer0 = t.elapsed().as_secs_f64();
 
             let t = Instant::now();

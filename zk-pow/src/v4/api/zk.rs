@@ -157,6 +157,24 @@ struct Fp8ProverSetup {
     sample_params: PublicParams,
 }
 
+#[cfg(test)]
+struct NativeTestSetup {
+    device: Device,
+    preprocessed: BatchStarkPreprocessedData<F, C, D>,
+}
+
+#[cfg(test)]
+impl NativeTestSetup {
+    fn build(device: Device, timing: &mut TimingTree) -> Result<Self> {
+        let params = sample_dense_statement_for_device(device)?;
+        let job = Fp8Job::derive(&params, &IncompleteBlockHeader::zero())?;
+        Ok(Self {
+            device,
+            preprocessed: job.system.preprocessed_data::<C>(timing),
+        })
+    }
+}
+
 impl Fp8ProverSetup {
     fn build(device: Device, timing: &mut TimingTree) -> Result<Self> {
         let params = sample_dense_statement_for_device(device)?;
@@ -731,10 +749,10 @@ fn check_public_jackpot(params: &PublicParams, nbits: u32) -> Result<()> {
 fn zk_prove_plain_proof_fp8(
     proposed_header: &IncompleteBlockHeader,
     plain_proof: &PlainProofV4,
-    setup: &Fp8ProverSetup,
+    setup: &NativeTestSetup,
     timing: &mut TimingTree,
 ) -> Result<(PublicParams, Fp8Proof)> {
-    let (public, _, proof) = prove_batch_statement(proposed_header, plain_proof, setup, timing)?;
+    let (public, _, proof) = prove_batch_statement(proposed_header, plain_proof, setup.device, &setup.preprocessed, timing)?;
     Ok((public, Fp8Proof(proof)))
 }
 
@@ -744,23 +762,24 @@ fn zk_prove_plain_proof_fp8(
 fn prove_batch_statement(
     proposed_header: &IncompleteBlockHeader,
     plain_proof: &PlainProofV4,
-    setup: &Fp8ProverSetup,
+    setup_device: Device,
+    preprocessed: &BatchStarkPreprocessedData<F, C, D>,
     timing: &mut TimingTree,
 ) -> Result<(PublicParams, Fp8Job, BatchStarkProofWithPublicInputs<F, C, D>)> {
     let (private, mut public) = timed!(timing, "parse plain proof", plain_proof.parse_proof(proposed_header)?);
     let mut job = timed!(timing, "derive job", Fp8Job::derive(&public, proposed_header)?);
     ensure!(
-        setup.device == public.common().device,
+        setup_device == public.common().device,
         "the FP8 prover setup is for {:?}, but the statement commits {:?}",
-        setup.device,
+        setup_device,
         public.common().device
     );
 
     // The cached precommitment must match this job's batch layout and the consensus cap.
-    let lut_cap = setup.preprocessed.cap();
+    let lut_cap = preprocessed.cap();
     let expected_prep = job.system.preprocessed_verifier_data::<C>(&lut_cap);
     ensure!(
-        setup.preprocessed.columns_per_table == expected_prep.columns_per_table,
+        preprocessed.columns_per_table == expected_prep.columns_per_table,
         "the cached LUT precommitment does not match this job's batch layout; \
          regenerate the prover data"
     );
@@ -799,7 +818,7 @@ fn prove_batch_statement(
             public.set_hash_jackpot(jackpot);
             public.digest(proposed_header)
         },
-        &setup.preprocessed,
+        preprocessed,
         timing,
     )?;
 
@@ -816,7 +835,7 @@ fn prove_wrapped_statement(
     input: &PlainProofV4,
     timing: &mut TimingTree,
 ) -> Result<(PublicParams, Fp8Job, ProofWithPublicInputs<F, OuterC, D>)> {
-    let (statement, job, batch_proof) = prove_batch_statement(proposed_header, input, setup, timing)?;
+    let (statement, job, batch_proof) = prove_batch_statement(proposed_header, input, setup.device, &setup.preprocessed, timing)?;
     // Digest the live `statement`, not `job.params`: proving sets the jackpot on the
     // returned statement after the job was derived.
     let wrapped = setup
@@ -845,7 +864,7 @@ fn verify_fp8_block(
     public_params: &PublicParams,
     proposed_header: &IncompleteBlockHeader,
     proof: &Fp8Proof,
-    setup: &Fp8ProverSetup,
+    setup: &NativeTestSetup,
     nbits_override: Option<u32>,
 ) -> Result<()> {
     let nbits = nbits_override.unwrap_or(proposed_header.nbits);
