@@ -38,16 +38,16 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
 /// Builds the V4 STARK config with the fixed T3 ladder used by trace padding.
 /// Every job absorbs the same config into its Fiat–Shamir transcript.
 pub fn v4_stark_config() -> StarkConfig {
-    let (pow_bits, rate_bits) = (18, 1);
+    let (pow_bits, rate_bits, num_query_rounds) = (18, 1, 114);
+    debug_assert!(pow_bits + rate_bits * num_query_rounds >= 132);
     let fri_config = FriConfig {
         rate_bits,
         cap_height: 4,
         proof_of_work_bits: pow_bits as u32,
         batching_proof_of_work_bits: pow_bits as u32,
         reduction_strategy: FriReductionStrategy::Ladder(V4_REACHABLE_DEGREE_BITS.to_vec()),
-        num_query_rounds: 114,
+        num_query_rounds,
     };
-    debug_assert!(pow_bits + rate_bits * fri_config.num_query_rounds >= 132);
     // Three CTL/Logup repetitions keep batched-lookup error below the FRI error.
     StarkConfig::new(108, 3, fri_config)
 }
