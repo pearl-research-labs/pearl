@@ -63,8 +63,8 @@ jobs:
         run: cargo test
         working-directory: pearl-blake3
 
-  zk-pow-tests:
-    name: zk-pow Complete Test Suite
+  zk-pow-prepare:
+    name: zk-pow Prepare
     runs-on: ubuntu-latest
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.zk_pow == 'true' }}
@@ -97,6 +97,42 @@ jobs:
           cargo run --release --bin build_cache src/v4/api/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
           cargo build --release --features embedded_cache
 
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zk-pow-verifier-cache
+          path: |
+            zk-pow/src/v4/api/fp8_cache.bin
+            zk-pow/src/v2/circuit/v2_cache.bin
+            zk-pow/src/v1/v1_cache.bin
+          if-no-files-found: error
+
+  zk-pow-tests:
+    name: zk-pow Complete Test Suite
+    runs-on: ubuntu-latest
+    needs: [detect-changes, zk-pow-prepare]
+    if: ${{ needs.detect-changes.outputs.zk_pow == 'true' }}
+    env:
+      RUSTFLAGS: -Copt-level=3 -Cdebug-assertions -Coverflow-checks=y -Cdebuginfo=0
+    defaults:
+      run:
+        working-directory: zk-pow
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "zk-pow -> target"
+          cache-on-failure: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zk-pow-verifier-cache
+          path: zk-pow/src
+
       - name: Run tests
         # FP8 wrapper-proof tests retain large compiled setups; parallel test
         # processes can exceed the GitHub runner's memory.
@@ -116,6 +152,31 @@ jobs:
 
       - name: Test invalid proofs mode
         run: cargo run --release --bin prove_verify -- invalid
+
+  go-ffi-tests:
+    name: Go FFI Tests
+    runs-on: ubuntu-latest
+    needs: [detect-changes, zk-pow-prepare]
+    if: ${{ needs.detect-changes.outputs.zk_pow == 'true' }}
+    env:
+      RUSTFLAGS: -Copt-level=3 -Cdebug-assertions -Coverflow-checks=y -Cdebuginfo=0
+    defaults:
+      run:
+        working-directory: zk-pow
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "zk-pow/bindings/go -> target"
+          cache-on-failure: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zk-pow-verifier-cache
+          path: zk-pow/src
 
       # Go FFI Build
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
@@ -156,7 +217,7 @@ jobs:
   ci_status:
     name: Rust CI Status
     runs-on: ubuntu-latest
-    needs: [pearl-blake3-tests, zk-pow-tests, py-pearl-mining-tests]
+    needs: [pearl-blake3-tests, zk-pow-prepare, zk-pow-tests, go-ffi-tests, py-pearl-mining-tests]
     if: always()
     steps:
       - run: |
