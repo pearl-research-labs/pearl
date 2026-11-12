@@ -122,7 +122,7 @@ use super::config::v4_stark_config;
 /// most `2^22` compression-message bytes. Thus there are at most `2^16`
 /// compressions and `2^19` rows. The minimum legal tile still has
 /// more than `2^12` Blake3 rows. Every natural height is rounded up to the next
-/// supported height below. In particular 17→18, 14/15→16, 11/12→13, 8/9→10,
+/// supported height below. In particular 14/15→16, 11/12→13, 8/9→10,
 /// and degrees below 7→7. Witness and known-column generators share that rule.
 /// Coverage is asserted by `ladder_covers_the_envelope`; proofs cannot select a
 /// height outside these stops.

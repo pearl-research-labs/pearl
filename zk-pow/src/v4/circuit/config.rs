@@ -10,7 +10,7 @@ use super::trace_padding::V4_REACHABLE_DEGREE_BITS;
 /// Panics for any other stage.
 pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
     let (pow_bits, rate_bits, num_query_rounds, is_zk, num_routed_wires, arity_bits) = match stage {
-        1 => (18, 3, 39, false, 37, 4),
+        1 => (18, 3, 39, false, 40, 4),
         2 => (23, 8, 14, true, 38, 3),
         _ => panic!("V4 recursion stage must be 1 or 2"),
     };
@@ -35,7 +35,7 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
     }
 }
 
-/// Builds the V4 STARK config with the fixed T3 ladder used by trace padding.
+/// Builds the V4 STARK config with the fixed degree ladder used by trace padding.
 /// Every job absorbs the same config into its Fiat–Shamir transcript.
 pub fn v4_stark_config() -> StarkConfig {
     let (pow_bits, rate_bits, num_query_rounds) = (18, 1, 114);
