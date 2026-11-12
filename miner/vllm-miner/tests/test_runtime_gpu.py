@@ -41,14 +41,13 @@ pytestmark = pytest.mark.gpu
 
 _M_BUCKET = 256
 _N, _K = 256, 2048
-_TALL_K = 16384  # GLM-5.2 o_proj: high k past the 4x128 proof-size cap (22016)
+_TALL_K = 16384  # GLM-5.2 o_proj: high k
 _MAX_256 = (1 << 256) - 1
 
 # Both mineable shapes commit the preferred 4x64 tile (4x128 is now only the
 # n-omitted back-compat commitment, never used by the runtime). The o_proj entry
 # carries the real GLM-5.2 shape -- (6144, 16384) -- so it exercises the true
-# wide-n allocation/indexing path plus the high-k B-build/kernel path the 4x128
-# proof-size cap (22016) could not reach. ``(name, n, k)``; used to parametrize
+# wide-n allocation/indexing path plus the high-k B-build/kernel path. ``(name, n, k)``; used to parametrize
 # the shared shape checks below.
 _MINED_SHAPES = {
     "low_k": ("test.mined.layer", _N, _K),
@@ -214,8 +213,7 @@ def test_fp8_fallback_matches_opened_planes(layer_state):
 @pytest.mark.parametrize("layer_state", _MINED_SHAPE_PARAMS, ids=_MINED_SHAPE_IDS, indirect=True)
 def test_prepare_layer_matches_pinned_commitment_chain(layer_state):
     """Load-time commitment + B preparation parity against the protocol's
-    operands, for both the low-k shape and the high-k o_proj shape (k=16384) the 4x128 tile
-    could not prove. Both commit the preferred 4x64 tile, which is bound into
+    operands, for both the low-k shape and the high-k o_proj shape (k=16384). Both commit the preferred 4x64 tile, which is bound into
     ``pB`` and so into noise seedB -- so the expected seed must pass the layer's
     ``n``."""
     n, k = layer_state.n, layer_state.k
@@ -496,7 +494,7 @@ def test_real_winner_is_detected_and_reports_committed_tile(
 ):
     """An always-win mine must produce a valid winner whose hit record carries
     the committed 4x64 tile geometry and the layer's k -- covering the low-k
-    path and the high-k o_proj path (k=16384) the 4x128 tile could not prove."""
+    path and the high-k o_proj path (k=16384)."""
     import vllm_miner.pipeline as pipeline
     from vllm_miner.winners import WinnerCheckCallback
 

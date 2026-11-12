@@ -146,7 +146,7 @@ def test_credited_work_is_mnk_and_rejects_unmineable(device):
     """Difficulty-normalized credit is exactly m*n*k (tiling-invariant, in the
     same unit as the threshold it credits) and is refused -- not silently fitted
     to the default tile -- for shapes no committed tile accepts."""
-    m, n, k = 2048, 6144, 16384  # o_proj: past the 4x128 cap; the 4x64 tile commits
+    m, n, k = 2048, 6144, 16384  # o_proj; the 4x64 tile commits
     assert select_tile(n, k, device=device) == SMALL_TILE
     assert effective_work_per_matmul(m, n, k, device=device) == m * n * k
     # Independently: it scales linearly in each of m and k. k*3=49152 needs
@@ -266,7 +266,7 @@ def test_commitment_binds_n_and_k(device):
     committed ``pA``/``pB`` (hence the noise seeds) -- a caller that
     omits/mismatches n publishes a commitment that matches no launch
     (``job_prep.prepare_layer`` target-only fast-path regression guard)."""
-    for k in (1024, 22016, 16384):  # 16384 is past the 4x128 cap (o_proj)
+    for k in (1024, 22016, 16384):  # 16384 is o_proj's k
         with_n = mining_configuration(k, 6144, device=device)
         without_n = mining_configuration(k, device=device)
         assert (with_n.tile_rows, with_n.tile_cols) == (4, 64)
