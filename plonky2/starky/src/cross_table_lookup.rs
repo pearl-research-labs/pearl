@@ -456,19 +456,13 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
                 .par_iter()
                 .map(|col| {
                     col.iter()
-                        .map(|c| {
-                            let (linear, next, scaled, offsets, constant) = c.parts();
-                            if let [(column, factor)] = linear {
-                                if *factor == F::ONE
-                                    && next.is_empty()
-                                    && scaled.is_empty()
-                                    && offsets.is_empty()
-                                    && constant == F::ZERO
-                                {
-                                    return Cow::Borrowed(trace[*column].values.as_slice());
-                                }
+                        .map(|c| match c.parts() {
+                            ([(column, factor)], [], [], [], constant)
+                                if *factor == F::ONE && constant == F::ZERO =>
+                            {
+                                Cow::Borrowed(trace[*column].values.as_slice())
                             }
-                            Cow::Owned(c.eval_all_rows_with_inputs(trace, pis))
+                            _ => Cow::Owned(c.eval_all_rows_with_inputs(trace, pis)),
                         })
                         .collect::<Vec<_>>()
                 })

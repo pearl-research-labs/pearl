@@ -131,13 +131,11 @@ pub(super) fn find_witness<F: RichField, P: PlonkyPermutation<F>>(
         for offset in (0..chunk_size).step_by(LANES) {
             let first = base + offset;
             let output = hash_batch(&input, pos, first);
-            for (lane, valid) in qualifies::<F, _>(&output, state, pos, first, bits)
-                .into_iter()
-                .enumerate()
+            if let Some(lane) = qualifies::<F, _>(&output, state, pos, first, bits)
+                .iter()
+                .position(|&valid| valid)
             {
-                if valid {
-                    return Some(first + lane as u64);
-                }
+                return Some(first + lane as u64);
             }
         }
         None

@@ -39,7 +39,6 @@ use crate::lookup::{get_grand_product_challenge_set, lookup_helper_columns, Look
 use crate::proof::StarkOpeningSet;
 
 mod polynomials;
-use polynomials::evaluate_opening;
 
 /// Batched preprocessed data, committed once at setup time in a single
 /// multi-height oracle shared by every table with preprocessed columns.
@@ -1194,7 +1193,11 @@ where
      -> Vec<F::Extension> {
         oracle.polynomials[start + range.start..start + range.end]
             .par_iter()
-            .map(|p| evaluate_opening::<F, D>(&p.coeffs, z))
+            .map(|p| {
+                p.coeffs.iter().rev().fold(F::Extension::ZERO, |acc, &c| {
+                    acc * z + F::Extension::from_basefield(c)
+                })
+            })
             .collect()
     };
 

@@ -1,11 +1,11 @@
-//! Prover-only interpolation, opening evaluation and CTL preparation.
+//! Prover-only interpolation, oracle row access and CTL preparation.
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
 use hashbrown::HashMap;
 use plonky2::batch_fri::oracle::BatchFriOracle;
-use plonky2::field::extension::{Extendable, FieldExtension, OEF};
+use plonky2::field::extension::Extendable;
 use plonky2::field::fft::{fft_root_table, ifft_with_options};
 use plonky2::field::packed::PackedField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -123,67 +123,11 @@ fn precombine_ctl_columns<F: Field>(
     }
 }
 
-/// Evaluates ascending base-field coefficients at `point`. Quadratic extensions
-/// use eight independent chains and their trace/norm relation, requiring only
-/// base-field multiplications within each chain. Other extensions use Horner.
-pub(super) fn evaluate_opening<F: RichField + Extendable<D>, const D: usize>(
-    coefficients: &[F],
-    point: F::Extension,
-) -> F::Extension {
-    let step = point * point;
-    let step = step * step;
-    if D == 2 {
-        let step = step * step;
-        // Y² = trace(Y)Y - norm(Y) for Y in a quadratic extension.
-        let coordinates = step.to_basefield_array();
-        let trace = coordinates[0] + coordinates[0];
-        let norm = coordinates[0] * coordinates[0]
-            - coordinates[1] * coordinates[1] * <F::Extension as OEF<D>>::W;
-        let mut linear = [F::ZERO; 8];
-        let mut constant = [F::ZERO; 8];
-        for chunk in coefficients.chunks(8).rev() {
-            for (i, &coefficient) in chunk.iter().enumerate() {
-                let previous = linear[i];
-                linear[i] = previous * trace + constant[i];
-                constant[i] = coefficient - previous * norm;
-            }
-        }
-        return (0..8).rev().fold(F::Extension::ZERO, |acc, i| {
-            acc * point + step.scalar_mul(linear[i]) + F::Extension::from_basefield(constant[i])
-        });
-    }
-    coefficients
-        .iter()
-        .rev()
-        .fold(F::Extension::ZERO, |acc, &c| {
-            acc * point + F::Extension::from_basefield(c)
-        })
-}
-
 #[cfg(test)]
-mod opening_evaluation_tests {
+mod tests {
     use super::*;
     use plonky2::field::goldilocks_field::GoldilocksField as F;
     use plonky2::field::types::Sample;
-
-    #[test]
-    fn openings_match_horner() {
-        type E = <F as Extendable<2>>::Extension;
-        let extension_point =
-            E::from_basefield_array([F::from_canonical_u64(2), F::from_canonical_u64(3)]);
-        for length in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 17, 31, 128, 1025] {
-            let coefficients: Vec<_> = (0..length)
-                .map(|i| F::from_canonical_usize(19 * i + 7))
-                .collect();
-            for point in [E::ZERO, E::ONE, extension_point] {
-                let expected = coefficients
-                    .iter()
-                    .rev()
-                    .fold(E::ZERO, |acc, &c| acc * point + E::from(c));
-                assert_eq!(evaluate_opening::<F, 2>(&coefficients, point), expected);
-            }
-        }
-    }
 
     #[test]
     fn precombined_ctl_matches_original_expression() {
