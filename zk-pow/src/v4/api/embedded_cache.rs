@@ -20,7 +20,6 @@ const CACHE_DATA: &[u8] = &[];
 
 /// Checks the pinned digest and loads the embedded verifier setups.
 pub fn load() -> Result<Fp8VerifierCache> {
-    #[cfg(feature = "embedded_cache")]
     assert_eq!(
         &blake3::hash(CACHE_DATA).to_hex().as_str()[..32],
         "9ded9d0a94cdb085ecd52ef2c6e4ab1c",
