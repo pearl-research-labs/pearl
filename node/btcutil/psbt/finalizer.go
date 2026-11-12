@@ -76,6 +76,10 @@ func isFinalizable(p *Packet, inIndex int) bool {
 // returning true with no error if it succeeds, OR if the input has already
 // been finalized.
 func MaybeFinalize(p *Packet, inIndex int) (bool, error) {
+	if inIndex < 0 || inIndex >= len(p.Inputs) {
+		return false, ErrInvalidPsbtFormat
+	}
+
 	if isFinalized(p, inIndex) {
 		return true, nil
 	}
@@ -112,6 +116,10 @@ func MaybeFinalizeAll(p *Packet) error {
 // are left intact as they may be needed for validation (?).  If there is any
 // invalid or incomplete data, an error is returned.
 func Finalize(p *Packet, inIndex int) error {
+	if inIndex < 0 || inIndex >= len(p.Inputs) {
+		return ErrInvalidPsbtFormat
+	}
+
 	pInput := p.Inputs[inIndex]
 	if pInput.WitnessUtxo == nil {
 		return fmt.Errorf("non-witness UTXO is not supported: %w", ErrInvalidPsbtFormat)
