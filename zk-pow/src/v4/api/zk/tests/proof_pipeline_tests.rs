@@ -1,6 +1,8 @@
 use plonky2::field::types::Field;
 
 use super::super::*;
+#[cfg(feature = "embedded_cache")]
+use crate::v4::api::embedded_cache;
 use crate::v4::circuit::consistency::{
     fixture_job, fixture_job_asym, fixture_job_k32, fixture_job_medium, fixture_job_min_k, fixture_job_moe,
 };
@@ -165,7 +167,7 @@ fn go_fixture(device: Device) -> (IncompleteBlockHeader, Vec<BlockHeader>, Vec<u
 #[test]
 #[cfg(feature = "embedded_cache")]
 fn embedded_cache_verifies_the_committed_go_fixtures() {
-    let cache = crate::v4::api::embedded_cache::load().expect("embedded cache must decode");
+    let cache = embedded_cache::load().expect("embedded cache must decode");
     for device in Device::ALL {
         let (header, chain, public_data, proof_data) = go_fixture(device);
         cache
@@ -180,7 +182,7 @@ fn embedded_cache_verifies_the_committed_go_fixtures() {
 #[cfg(feature = "embedded_cache")]
 #[ignore = "manual verifier calibration"]
 fn bench_v4_verify() {
-    let cache = crate::v4::api::embedded_cache::load().expect("embedded cache must decode");
+    let cache = embedded_cache::load().expect("embedded cache must decode");
     let pool = plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
@@ -287,7 +289,7 @@ fn bench_v4_prove() {
 #[cfg(feature = "embedded_cache")]
 #[ignore = "wrapped proving needs more memory than the default CI runner; invoked explicitly on a larger machine"]
 fn wrapped_devices_roundtrip_through_embedded_cache() {
-    let cache = crate::v4::api::embedded_cache::load().expect("embedded cache must decode");
+    let cache = embedded_cache::load().expect("embedded cache must decode");
     assert!(
         cache.contains_all_devices(),
         "the embedded cache must contain exactly both device setups"
