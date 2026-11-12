@@ -5,6 +5,9 @@
 **/*.egg-info
 **/.eggs
 **/build
+!wallet/build
+!miner/pearl-gemm/build_utils
+!miner/pearl-gemm-build-utils
 **/dist
 **/*.so
 **/.pytest_cache
