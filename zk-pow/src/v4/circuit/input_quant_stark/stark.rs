@@ -638,15 +638,13 @@ impl InputQuantProgram {
         let cols: Vec<PolynomialValues<F>> = [a_noise, b_noise]
             .into_iter()
             .map(|codes| {
-                let mut col = vec![F::ZERO; num_rows];
-                col[..codes.len()]
-                    .par_chunks_mut(1024)
-                    .zip(codes.par_chunks(1024))
-                    .for_each(|(outs, codes)| {
-                        for (out, &code) in outs.iter_mut().zip(codes) {
-                            *out = F::from_canonical_u16(code);
-                        }
-                    });
+                assert!(codes.len() <= num_rows);
+                // Fill live rows and padding together, without zeroing live rows first.
+                let col = codes
+                    .par_iter()
+                    .map(|&code| F::from_canonical_u16(code))
+                    .chain((codes.len()..num_rows).into_par_iter().map(|_| F::ZERO))
+                    .collect();
                 PolynomialValues::new(col)
             })
             .collect();
