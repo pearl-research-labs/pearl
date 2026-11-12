@@ -86,22 +86,10 @@ func NewInvVect(typ InvType, hash *chainhash.Hash) *InvVect {
 	}
 }
 
-// readInvVectBuf reads an encoded InvVect from r depending on the protocol
-// version.
-//
-// If b is non-nil, the provided buffer will be used for serializing small
-// values.  Otherwise a buffer will be drawn from the binarySerializer's pool
-// and return when the method finishes.
-//
-// NOTE: b MUST either be nil or at least an 8-byte slice.
-func readInvVectBuf(r io.Reader, pver uint32, iv *InvVect, buf []byte) error {
-	if _, err := io.ReadFull(r, buf[:4]); err != nil {
-		return err
-	}
-	iv.Type = InvType(littleEndian.Uint32(buf[:4]))
-
-	_, err := io.ReadFull(r, iv.Hash[:])
-	return err
+// decodeInvVect decodes an inventory vector record, a little-endian type followed by a hash, for readRecords. b must
+// hold at least maxInvVectPayload bytes.
+func decodeInvVect(b []byte) InvVect {
+	return InvVect{Type: InvType(littleEndian.Uint32(b[:4])), Hash: chainhash.Hash(b[4:])}
 }
 
 // writeInvVectBuf serializes an InvVect to w depending on the protocol version.

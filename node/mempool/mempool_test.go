@@ -5,8 +5,10 @@
 package mempool
 
 import (
+	"bytes"
 	"encoding/hex"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -2524,4 +2526,117 @@ func TestMaxMempoolZeroUnlimited(t *testing.T) {
 
 	assert.Equal(t, numTxns, harness.txPool.Count())
 	assert.NotZero(t, harness.txPool.PoolBytes())
+}
+
+// TestRejectedTxDoesNotPinWitnessInSigCache checks that a transaction rejected by script evaluation leaves no more
+// than a small, fixed amount of memory behind in the signature cache, however large its witness was.
+//
+// SigCache.Add used to keep the signature and public key as slices of the transaction's decoded witness. A peer could
+// send standard-size transactions whose tapscript leaf checks a valid signature and then fails (<pk> OP_CHECKSIG
+// OP_NOT). The valid signature was cached, the transaction rejected, and the cache entry kept the whole ~390 kB witness
+// alive. The cache is bounded by entry count (100,000 by default), not bytes.
+func TestRejectedTxDoesNotPinWitnessInSigCache(t *testing.T) {
+	const (
+		numTxs = 100
+		// annexSize keeps each attack transaction just under the 100,000-vbyte standardness limit.
+		annexSize = 390_000
+		// maxRetainedPerTx is far above an honest entry's cost (a 64-byte signature, a 32-byte key and a map slot)
+		// and far below one pinned witness buffer.
+		maxRetainedPerTx = 10_000
+	)
+
+	harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
+	require.NoError(t, err)
+	// Production builds the mempool with a shared SigCache of the default size.
+	harness.txPool.cfg.SigCache = txscript.NewSigCache(100_000)
+
+	// The attacker's own P2TR output, whose only leaf verifies a signature and then inverts the result.
+	internalKey := harness.signKey.PubKey()
+	leafScript, err := txscript.NewScriptBuilder().
+		AddData(schnorr.SerializePubKey(internalKey)).
+		AddOp(txscript.OP_CHECKSIG).
+		AddOp(txscript.OP_NOT).
+		Script()
+	require.NoError(t, err)
+	leaf := txscript.NewBaseTapLeaf(leafScript)
+	tree := txscript.AssembleTaprootScriptTree(leaf)
+	root := tree.RootNode.TapHash()
+	pkScript, err := txscript.PayToTaprootScript(txscript.ComputeTaprootOutputKey(internalKey, root[:]))
+	require.NoError(t, err)
+	cb := tree.LeafMerkleProofs[0].ToControlBlock(internalKey)
+	ctrlBlock, err := cb.ToBytes()
+	require.NoError(t, err)
+
+	// Fund it with a mature coinbase. The harness pays to payScript, so point that at the attacker's output.
+	harness.payScript = pkScript
+	prev := txOutToSpendableOut(addCoinbase(t, harness, 1), 0)
+
+	// attackTx returns the wire bytes of the i-th attack transaction. Each one spends the same output and differs in
+	// its lock time, so its txid is new to netsync's reject filter, and in its annex, so its sighash and SigCache key
+	// are new too.
+	attackTx := func(i int) []byte {
+		tx := wire.NewMsgTx(wire.TxVersion)
+		tx.LockTime = uint32(i)
+		tx.AddTxIn(&wire.TxIn{PreviousOutPoint: prev.outPoint, Sequence: wire.MaxTxInSequenceNum})
+		tx.AddTxOut(&wire.TxOut{PkScript: harness.payScript, Value: int64(prev.amount) - 1_000_000})
+
+		annex := make([]byte, annexSize)
+		annex[0] = txscript.TaprootAnnexTag
+		annex[1], annex[2] = byte(i), byte(i>>8)
+
+		fetcher := txscript.NewCannedPrevOutputFetcher(pkScript, int64(prev.amount))
+		sigHash, err := txscript.CalcTapscriptSignaturehash(
+			txscript.NewTxSigHashes(tx, fetcher), txscript.SigHashDefault, tx, 0, fetcher, leaf,
+			txscript.WithAnnex(annex),
+		)
+		require.NoError(t, err)
+		sig, err := schnorr.Sign(harness.signKey, sigHash)
+		require.NoError(t, err)
+		tx.TxIn[0].SetWitness(wire.TxWitness{sig.Serialize(), leafScript, ctrlBlock, annex})
+
+		var buf bytes.Buffer
+		require.NoError(t, tx.Serialize(&buf))
+		return buf.Bytes()
+	}
+
+	// submit decodes the bytes as the peer's tx message is decoded and hands the transaction to the mempool the way
+	// netsync does. It must be rejected by script evaluation.
+	submit := func(raw []byte) {
+		var msg wire.MsgTx
+		require.NoError(t, msg.Deserialize(bytes.NewReader(raw)))
+		tx := btcutil.NewTx(&msg)
+		require.LessOrEqual(t, blockchain.GetTransactionVsize(tx), int64(maxStandardTxVsize),
+			"attack tx must be standard size")
+
+		_, err := harness.txPool.ProcessTransaction(tx, true, true, 0)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "false stack entry")
+		require.False(t, harness.txPool.IsTransactionInPool(tx.Hash()))
+	}
+
+	// Warm up once so lazily allocated pool and cache state is not counted.
+	submit(attackTx(0))
+
+	heapAlloc := func() uint64 {
+		runtime.GC()
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		return ms.HeapAlloc
+	}
+	before := heapAlloc()
+	for i := 1; i <= numTxs; i++ {
+		submit(attackTx(i))
+	}
+	after := heapAlloc()
+
+	var retained uint64
+	if after > before {
+		retained = after - before
+	}
+	perTx := retained / numTxs
+	t.Logf("retained %d bytes after %d rejected txs (%d bytes/tx)", retained, numTxs, perTx)
+	require.Less(t, perTx, uint64(maxRetainedPerTx),
+		"each rejected transaction keeps its witness buffer alive in the SigCache")
+	runtime.KeepAlive(harness)
 }

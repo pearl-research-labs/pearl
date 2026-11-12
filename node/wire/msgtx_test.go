@@ -9,9 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"reflect"
-	"strings"
+	"runtime"
 	"testing"
 	"testing/iotest"
 
@@ -149,11 +148,12 @@ func serializeTx(t *testing.T, tx *MsgTx) []byte {
 	return buf.Bytes()
 }
 
-// TestTxCountsBoundedByRemainingPayload ensures a peer cannot make the decoder allocate for an input, output or
-// witness item count that cannot fit in the bytes left in the payload. Every payload leaves room for exactly one
-// element after its count: a count of one decodes, while a larger count, and a count with nothing after it, are
-// rejected before the slice that the count sizes is allocated.
-func TestTxCountsBoundedByRemainingPayload(t *testing.T) {
+// TestTxTruncatedCountsFail ensures that an input, output or witness item count claiming more elements than the
+// payload holds makes decoding fail, through Deserialize and ReadV2MessageN. Every payload holds exactly one element
+// after its count: a count of one decodes, while a larger count, and a count with nothing after it, fail at EOF.
+// TestTxTruncatedCountsPlainReader and TestReadV2MessageTruncatedCountsDoNotPreallocate check what such counts
+// allocate.
+func TestTxTruncatedCountsFail(t *testing.T) {
 	join := func(parts ...[]byte) []byte {
 		return bytes.Join(parts, nil)
 	}
@@ -189,30 +189,24 @@ func TestTxCountsBoundedByRemainingPayload(t *testing.T) {
 		// ceiling is the largest count the per-message limits still accept.
 		ceiling uint64
 		wantErr string
-		// allocated returns the length of the slice that the count sizes, or is nil when the count sizes nothing.
-		allocated func(*MsgTx) int
 	}{
 		{
-			name:      "input count",
-			prefix:    version,
-			element:   emptyTxIn,
-			suffix:    join(zero, lockTime),
-			ceiling:   maxTxInPerMessage,
-			wantErr:   "input transactions for remaining payload",
-			allocated: func(tx *MsgTx) int { return len(tx.TxIn) },
+			name:    "input count",
+			prefix:  version,
+			element: emptyTxIn,
+			suffix:  join(zero, lockTime),
+			ceiling: maxTxInPerMessage,
+			wantErr: "EOF",
 		},
 		{
-			name:      "output count",
-			prefix:    join(version, one, emptyTxIn),
-			element:   emptyTxOut,
-			suffix:    lockTime,
-			ceiling:   maxTxOutPerMessage,
-			wantErr:   "output transactions for remaining payload",
-			allocated: func(tx *MsgTx) int { return len(tx.TxOut) },
+			name:    "output count",
+			prefix:  join(version, one, emptyTxIn),
+			element: emptyTxOut,
+			suffix:  lockTime,
+			ceiling: maxTxOutPerMessage,
+			wantErr: "EOF",
 		},
 		{
-			// Nothing is sized by the witness item count, so a count larger than the payload is rejected when the
-			// payload runs out.
 			name:    "witness item count",
 			prefix:  join(version, witnessMarker, one, emptyTxIn, zero),
 			element: emptyItem,
@@ -240,11 +234,8 @@ func TestTxCountsBoundedByRemainingPayload(t *testing.T) {
 			}
 			for _, tc := range rejected {
 				t.Run(tc.name, func(t *testing.T) {
-					tx, err := decode(tc.payload)
+					_, err := decode(tc.payload)
 					require.ErrorContains(t, err, test.wantErr)
-					if test.allocated != nil {
-						require.Zero(t, test.allocated(tx), "slice allocated before the count was rejected")
-					}
 					require.ErrorContains(t, decodeV2(tc.payload), test.wantErr)
 				})
 			}
@@ -252,9 +243,9 @@ func TestTxCountsBoundedByRemainingPayload(t *testing.T) {
 	}
 }
 
-// TestTxRemainingPayloadBoundAcceptsTightEncodings ensures the remaining-payload bounds never reject a transaction
-// that is encoded as compactly as possible, whether or not the reader can report its unread length.
-func TestTxRemainingPayloadBoundAcceptsTightEncodings(t *testing.T) {
+// TestTxDecodeAcceptsTightEncodings ensures a transaction encoded as compactly as possible decodes, and re-encodes to
+// the same bytes, whether or not the reader can report its unread length.
+func TestTxDecodeAcceptsTightEncodings(t *testing.T) {
 	oneItem := TxWitness{{}}
 
 	tests := []struct {
@@ -265,9 +256,11 @@ func TestTxRemainingPayloadBoundAcceptsTightEncodings(t *testing.T) {
 		{name: "one witness item", witnesses: []TxWitness{oneItem}},
 		{name: "witness on first of two inputs", witnesses: []TxWitness{oneItem, nil}},
 		{name: "witness on last of two inputs", witnesses: []TxWitness{nil, oneItem}},
-		// Eight elements are enough that a minimum size one byte too large would reject them.
 		{name: "eight empty inputs", witnesses: make([]TxWitness, 8)},
 		{name: "eight empty outputs", witnesses: []TxWitness{nil}, numOutputs: 8},
+		// Several thousand elements are well past maxPrealloc, so a reader without Len grows the slices many times.
+		{name: "3000 empty inputs", witnesses: make([]TxWitness, 3000)},
+		{name: "5000 empty outputs", witnesses: []TxWitness{nil}, numOutputs: 5000},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -291,28 +284,48 @@ func TestTxRemainingPayloadBoundAcceptsTightEncodings(t *testing.T) {
 	}
 }
 
-// TestUnreadBytes ensures only the bytes a reader has not returned are counted, and that a reader which cannot
-// report them is treated as having no bound.
-func TestUnreadBytes(t *testing.T) {
-	partlyRead := bytes.NewReader(make([]byte, 100))
-	_, err := io.CopyN(io.Discard, partlyRead, 60)
-	require.NoError(t, err)
-
+// TestTxTruncatedCountsPlainReader covers readers that do not report their length, such as the base64 decoder PSBT
+// parsing reads through. The decoder cannot see how much data there is, so a count with nothing after it must fail
+// having allocated far less than the count claims. Readers that report their length are covered by
+// TestReadV2MessageTruncatedCountsDoNotPreallocate. iotest.HalfReader hides Len and also returns short reads.
+//
+// Not parallel: it measures allocation across the whole process.
+func TestTxTruncatedCountsPlainReader(t *testing.T) {
 	tests := []struct {
-		name string
-		r    io.Reader
-		want int
+		name     string
+		prefix   []byte // the payload before the count
+		count    uint64 // the largest count the decoder accepts
+		elemSize uint64 // the fewest bytes one element takes on the wire
 	}{
-		{"bytes.Reader", bytes.NewReader(make([]byte, 7)), 7},
-		{"bytes.Buffer", bytes.NewBuffer(make([]byte, 7)), 7},
-		{"strings.Reader", strings.NewReader("abcdefg"), 7},
-		{"partly read", partlyRead, 40},
-		{"empty", bytes.NewReader(nil), 0},
-		{"no Len method", iotest.OneByteReader(bytes.NewReader(make([]byte, 7))), math.MaxInt},
+		// The input count follows the version. It is not zero, so it is not read as a witness marker.
+		{"input count", []byte{1, 0, 0, 0}, maxTxInPerMessage, minTxInPayload},
+		// The output count follows the version, an input count of one and an empty input.
+		{"output count", append([]byte{1, 0, 0, 0, 1}, make([]byte, minTxInPayload)...), maxTxOutPerMessage,
+			MinTxOutPayload},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			require.Equal(t, test.want, unreadBytes(test.r))
+			var payload bytes.Buffer
+			payload.Write(test.prefix)
+			require.NoError(t, WriteVarInt(&payload, ProtocolVersion, test.count))
+
+			// Decode once first so the script buffer pool is warm and its allocation is not measured.
+			var tx MsgTx
+			require.ErrorIs(t, tx.Deserialize(iotest.HalfReader(bytes.NewReader(payload.Bytes()))), io.EOF)
+
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			err := tx.Deserialize(iotest.HalfReader(bytes.NewReader(payload.Bytes())))
+			runtime.ReadMemStats(&after)
+			// The payload ends right after the count, so reading the first element finds no data at all.
+			require.ErrorIs(t, err, io.EOF)
+
+			// Allocating for the count means allocating all of claimed; allocating for the data that arrived stays far
+			// below a tenth of it.
+			claimed := test.count * test.elemSize
+			allocated := after.TotalAlloc - before.TotalAlloc
+			require.Lessf(t, allocated, claimed/10, "%s claiming %d bytes allocated %d bytes", test.name, claimed,
+				allocated)
 		})
 	}
 }

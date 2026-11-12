@@ -603,6 +603,15 @@ func (sp *serverPeer) OnVerAck(_ *peer.Peer, _ *wire.MsgVerAck) {
 	})
 }
 
+// sendReply queues msg and waits until it is written or the peer quits.
+// Inbound messages are not read meanwhile, so a peer that pipelines requests
+// and stops reading holds at most one unsent reply.
+func (sp *serverPeer) sendReply(msg wire.Message) {
+	window := newReplyWindow(sp.quit)
+	window.send(sp.Peer, msg, wire.BaseEncoding)
+	window.wait()
+}
+
 // OnMemPool is invoked when a peer receives a mempool wire message.
 // It creates and sends an inventory message with the contents of the memory
 // pool up to the maximum inventory allowed per message.  When the peer has a
@@ -649,7 +658,7 @@ func (sp *serverPeer) OnMemPool(_ *peer.Peer, msg *wire.MsgMemPool) {
 
 	// Send the inventory message if there is anything to send.
 	if len(invMsg.InvList) > 0 {
-		sp.QueueMessage(invMsg, nil)
+		sp.sendReply(invMsg)
 	}
 }
 
@@ -995,7 +1004,7 @@ func (sp *serverPeer) OnGetBlocks(_ *peer.Peer, msg *wire.MsgGetBlocks) {
 			continueHash := invMsg.InvList[invListLen-1].Hash
 			sp.continueHash = &continueHash
 		}
-		sp.QueueMessage(invMsg, nil)
+		sp.sendReply(invMsg)
 	}
 }
 
@@ -1021,7 +1030,7 @@ func (sp *serverPeer) OnGetHeaders(_ *peer.Peer, msg *wire.MsgGetHeaders) {
 	headers := chain.LocateHeaders(msg.BlockLocatorHashes, &msg.HashStop, msg.IncludeCertificates)
 
 	// Send found headers to the requesting peer.
-	sp.QueueMessage(&wire.MsgHeaders{Headers: headers}, nil)
+	sp.sendReply(&wire.MsgHeaders{Headers: headers})
 }
 
 // OnGetCFilters is invoked when a peer receives a getcfilters wire message.
@@ -1196,7 +1205,7 @@ func (sp *serverPeer) OnGetCFHeaders(_ *peer.Peer, msg *wire.MsgGetCFHeaders) {
 	headersMsg.FilterType = msg.FilterType
 	headersMsg.StopHash = msg.StopHash
 
-	sp.QueueMessage(headersMsg, nil)
+	sp.sendReply(headersMsg)
 }
 
 // OnGetCFCheckpt is invoked when a peer receives a getcfcheckpt wire message.
@@ -1228,6 +1237,16 @@ func (sp *serverPeer) OnGetCFCheckpt(_ *peer.Peer, msg *wire.MsgGetCFCheckpt) {
 		return
 	}
 
+	// Send the reply after buildCFCheckpt has released the cache lock.
+	if checkptMsg := sp.buildCFCheckpt(msg, blockHashes); checkptMsg != nil {
+		sp.sendReply(checkptMsg)
+	}
+}
+
+// buildCFCheckpt returns the cfcheckpt reply for the filter headers at
+// blockHashes, using and extending the checkpoint cache under
+// cfCheckptCachesMtx. It returns nil if a filter header cannot be read.
+func (sp *serverPeer) buildCFCheckpt(msg *wire.MsgGetCFCheckpt, blockHashes []chainhash.Hash) *wire.MsgCFCheckpt {
 	checkptMsg := wire.NewMsgCFCheckpt(
 		msg.FilterType, &msg.StopHash, len(blockHashes),
 	)
@@ -1309,7 +1328,7 @@ func (sp *serverPeer) OnGetCFCheckpt(_ *peer.Peer, msg *wire.MsgGetCFCheckpt) {
 	)
 	if err != nil {
 		peerLog.Errorf("Error retrieving cfilter headers: %v", err)
-		return
+		return nil
 	}
 
 	// Now that we have the full set of filter headers, we'll add them to
@@ -1318,14 +1337,14 @@ func (sp *serverPeer) OnGetCFCheckpt(_ *peer.Peer, msg *wire.MsgGetCFCheckpt) {
 		if len(filterHeaderBytes) == 0 {
 			peerLog.Warnf("Could not obtain CF header for %v",
 				blockHashPtrs[i])
-			return
+			return nil
 		}
 
 		filterHeader, err := chainhash.NewHash(filterHeaderBytes)
 		if err != nil {
 			peerLog.Warnf("Committed filter header deserialize "+
 				"failed: %v", err)
-			return
+			return nil
 		}
 
 		checkptMsg.AddCFHeader(filterHeader)
@@ -1340,13 +1359,12 @@ func (sp *serverPeer) OnGetCFCheckpt(_ *peer.Peer, msg *wire.MsgGetCFCheckpt) {
 		}
 	}
 
-	// Finally, we'll update the cache if we need to, and send the final
-	// message back to the requesting peer.
+	// Finally, we'll update the cache if we need to.
 	if updateCache {
 		sp.server.cfCheckptCaches[msg.FilterType] = checkptCache
 	}
 
-	sp.QueueMessage(checkptMsg, nil)
+	return checkptMsg
 }
 
 // enforceNodeBloomFlag disconnects the peer if the server is not configured to
@@ -1626,16 +1644,17 @@ func (sp *serverPeer) OnNotFound(p *peer.Peer, msg *wire.MsgNotFound) {
 			return
 		}
 	}
-	if numTxns > 0 {
-		txStr := pickNoun(uint64(numTxns), "transaction", "transactions")
-		reason := fmt.Sprintf("%d %v not found", numTxns, txStr)
-		if sp.addBanScore(0, 10*numTxns, reason) {
-			return
-		}
-	}
 
-	sp.server.syncManager.QueueNotFound(msg, p, sp.msgProcessed)
-	<-sp.msgProcessed
+	// An honest peer can lose a transaction between announcing it and our request: replace-by-fee, a block or
+	// eviction removes it from its mempool. Only score the entries that did not answer a request of ours.
+	numRequested := sp.server.syncManager.HandleNotFound(msg, p)
+
+	if numTxns > numRequested {
+		unrequested := numTxns - numRequested
+		txStr := pickNoun(uint64(unrequested), "transaction", "transactions")
+		reason := fmt.Sprintf("%d unrequested %v not found", unrequested, txStr)
+		sp.addBanScore(0, 10*unrequested, reason)
+	}
 }
 
 // randomUint16Number returns a random uint16 in a specified input range.  Note

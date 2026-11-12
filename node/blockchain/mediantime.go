@@ -34,8 +34,9 @@ var (
 // used to determine a median time which is then used as an offset to the local
 // clock.
 type MedianTimeSource interface {
-	// AdjustedTime returns the current time adjusted by the median time
-	// offset as calculated from the time samples added by AddTimeSample.
+	// Must ignore peer-supplied offsets so untrusted version timestamps
+	// cannot shift consensus or mining clocks.
+	// TODO Or: replace AdjustedTime with a Clock interface and harden diagnostic peer time sampling.
 	AdjustedTime() time.Time
 
 	// AddTimeSample adds a time sample that is used when determining the
@@ -85,18 +86,8 @@ type medianTime struct {
 // Ensure the medianTime type implements the MedianTimeSource interface.
 var _ MedianTimeSource = (*medianTime)(nil)
 
-// AdjustedTime returns the current time adjusted by the median time offset as
-// calculated from the time samples added by AddTimeSample.
-//
-// This function is safe for concurrent access and is part of the
-// MedianTimeSource interface implementation.
 func (m *medianTime) AdjustedTime() time.Time {
-	m.mtx.Lock()
-	defer m.mtx.Unlock()
-
-	// Limit the adjusted time to 1 second precision.
-	now := time.Unix(time.Now().Unix(), 0)
-	return now.Add(time.Duration(m.offsetSecs) * time.Second)
+	return time.Unix(time.Now().Unix(), 0)
 }
 
 // AddTimeSample adds a time sample that is used when determining the median

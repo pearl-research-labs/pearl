@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"strconv"
 	"strings"
 
@@ -552,10 +551,6 @@ func (msg *MsgTx) Copy() *MsgTx {
 // This is part of the Message interface implementation.
 // See Deserialize for decoding transactions stored to disk, such as in a
 // database, as opposed to decoding transactions from the wire.
-//
-// Input, output and witness item counts that cannot fit in the unread bytes of r are rejected before any memory is
-// allocated for them. This bound applies only when r reports its unread length through a Len method, as *bytes.Buffer,
-// *bytes.Reader and *strings.Reader do. Counts read from any other reader are limited only by the message size limits.
 func (msg *MsgTx) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) error {
 	buf := binarySerializer.Borrow()
 	defer binarySerializer.Return(buf)
@@ -608,22 +603,14 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding, buf, 
 		return messageError("MsgTx.PrlDecode", str)
 	}
 
-	// The count sizes the allocation below, so also reject a count whose inputs cannot fit in the unread payload.
-	// Each input takes at least minTxInPayload bytes, so this never rejects a valid transaction.
-	if maxCount := uint64(unreadBytes(r) / minTxInPayload); count > maxCount {
-		str := fmt.Sprintf("too many input transactions for remaining payload [count %d, max %d]",
-			count, maxCount)
-		return messageError("MsgTx.PrlDecode", str)
-	}
-
 	// Deserialize the inputs.
 	var totalScriptSize uint64
-	txIns := make([]TxIn, count)
-	msg.TxIn = make([]*TxIn, count)
+	// capHint bounds preallocation so an adversarial count can't exhaust memory; append grows the slice past it as
+	// inputs arrive.
+	txIns := make([]TxIn, 0, capHint(r, count, minTxInPayload))
 	for i := uint64(0); i < count; i++ {
-		// The pointer is set now in case a script buffer is borrowed and needs to be returned to the pool on error.
+		txIns = append(txIns, TxIn{})
 		ti := &txIns[i]
-		msg.TxIn[i] = ti
 		err = readTxInBuf(r, pver, msg.Version, ti, buf, sbuf)
 		if err != nil {
 			return err
@@ -631,6 +618,7 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding, buf, 
 		totalScriptSize += uint64(len(ti.SignatureScript))
 		sbuf = sbuf[len(ti.SignatureScript):]
 	}
+	msg.TxIn = toPointers(txIns)
 
 	count, err = ReadVarIntBuf(r, pver, buf)
 	if err != nil {
@@ -645,20 +633,11 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding, buf, 
 		return messageError("MsgTx.PrlDecode", str)
 	}
 
-	// As for the inputs, each output takes at least MinTxOutPayload bytes of the unread payload.
-	if maxCount := uint64(unreadBytes(r) / MinTxOutPayload); count > maxCount {
-		str := fmt.Sprintf("too many output transactions for remaining payload [count %d, max %d]",
-			count, maxCount)
-		return messageError("MsgTx.PrlDecode", str)
-	}
-
-	// Deserialize the outputs.
-	txOuts := make([]TxOut, count)
-	msg.TxOut = make([]*TxOut, count)
+	// Deserialize the outputs, preallocated like the inputs.
+	txOuts := make([]TxOut, 0, capHint(r, count, MinTxOutPayload))
 	for i := uint64(0); i < count; i++ {
-		// The pointer is set now in case a script buffer is borrowed and needs to be returned to the pool on error.
+		txOuts = append(txOuts, TxOut{})
 		to := &txOuts[i]
-		msg.TxOut[i] = to
 		err = readTxOutBuf(r, pver, msg.Version, to, buf, sbuf)
 		if err != nil {
 			return err
@@ -666,6 +645,7 @@ func (msg *MsgTx) prlDecode(r io.Reader, pver uint32, enc MessageEncoding, buf, 
 		totalScriptSize += uint64(len(to.PkScript))
 		sbuf = sbuf[len(to.PkScript):]
 	}
+	msg.TxOut = toPointers(txOuts)
 
 	// If the transaction's flag byte isn't 0x00 at this point, then one or more of its inputs has accompanying witness data.
 	if flag[0] != 0 && enc == WitnessEncoding {
@@ -1054,24 +1034,6 @@ func writeOutPointBuf(w io.Writer, pver uint32, version int32, op *OutPoint,
 	littleEndian.PutUint32(buf[:4], op.Index)
 	_, err = w.Write(buf[:4])
 	return err
-}
-
-// lenReader is a reader that reports how many bytes it has not yet returned, as *bytes.Buffer, *bytes.Reader and
-// *strings.Reader do.
-type lenReader interface {
-	io.Reader
-	Len() int
-}
-
-// unreadBytes returns how many bytes of r have not been read yet. It returns math.MaxInt, which bounds nothing, when r
-// does not report its unread length.
-func unreadBytes(r io.Reader) int {
-	lr, ok := r.(lenReader)
-	if !ok {
-		return math.MaxInt
-	}
-
-	return lr.Len()
 }
 
 // readScript reads a variable length byte array that represents a transaction
