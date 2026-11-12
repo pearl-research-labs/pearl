@@ -14,7 +14,7 @@
 //! wrapper is the *universal* batch verifier (D1) — the degree profile and geometry are
 //! public inputs, not circuit shape — so a single setup covers every envelope-legal job.
 //! [`Fp8VerifierCache`] holds it keyed by the statement's device byte, preloaded
-//! from [`embedded_cache::CACHE_DATA`](crate::v4::api::embedded_cache::CACHE_DATA)
+//! through [`embedded_cache::load`](crate::v4::api::embedded_cache::load)
 //! (built offline by `build_cache`; each device's LUT cap is derived and baked into
 //! its cached circuit, so the verifier side never builds a LUT oracle).
 //! Verification is lookup-only: a setup missing from the cache rejects the proof

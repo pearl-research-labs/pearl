@@ -74,8 +74,8 @@ impl Fp8Verifier {
 /// A read-only store of verifier setups keyed by the statement's device byte. The
 /// stage-1 wrapper is universal within one device family: one compiled circuit covers
 /// every envelope-legal degree profile and geometry for that device, while Hopper and
-/// Blackwell occupy distinct cache entries. Deployments preload
-/// [`embedded_cache::CACHE_DATA`](crate::v4::api::embedded_cache::CACHE_DATA), built
+/// Blackwell occupy distinct cache entries. Deployments use
+/// [`embedded_cache::load`](crate::v4::api::embedded_cache::load) to load setups built
 /// offline by `build_cache` ([`Fp8Verifier::generate`] + [`Fp8VerifierCache::insert`]).
 ///
 /// Verification never compiles circuits: a setup missing from the cache rejects the

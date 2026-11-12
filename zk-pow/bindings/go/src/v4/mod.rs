@@ -23,7 +23,7 @@ lazy_static::lazy_static! {
     /// on demand, so no proof can force an expensive circuit build (denial of service).
     pub static ref FP8_VERIFIER_CACHE: Fp8VerifierCache = {
         use zk_pow::v4::api::embedded_cache;
-        let cache = Fp8VerifierCache::from_bytes(&embedded_cache::CACHE_DATA)
+        let cache = embedded_cache::load()
             .expect("fp8 verifier cache is missing or corrupt; cannot verify fp8 proofs");
         assert!(
             cache.contains_all_devices(),

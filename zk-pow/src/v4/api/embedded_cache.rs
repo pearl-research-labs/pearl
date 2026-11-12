@@ -8,20 +8,23 @@
 //! The generator derives each device's LUT cap and bakes it into that device's wrapper
 //! circuit before serializing the cache; no separate cap artifact is shipped.
 
-use std::sync::LazyLock;
+use anyhow::Result;
 
-/// Checks the pinned digest on first access, before any consumer can deserialize the cache.
+use super::zk::Fp8VerifierCache;
+
 #[cfg(feature = "embedded_cache")]
-pub static CACHE_DATA: LazyLock<&'static [u8]> = LazyLock::new(|| {
-    let bytes: &[u8] = include_bytes!("v4_cache.bin");
+const CACHE_DATA: &[u8] = include_bytes!("v4_cache.bin");
+
+#[cfg(not(feature = "embedded_cache"))]
+const CACHE_DATA: &[u8] = &[];
+
+/// Checks the pinned digest and loads the embedded verifier setups.
+pub fn load() -> Result<Fp8VerifierCache> {
+    #[cfg(feature = "embedded_cache")]
     assert_eq!(
-        &blake3::hash(bytes).to_hex().as_str()[..32],
+        &blake3::hash(CACHE_DATA).to_hex().as_str()[..32],
         "9ded9d0a94cdb085ecd52ef2c6e4ab1c",
         "V4 verifier cache digest mismatch; regenerate the cache and review the pinned digest"
     );
-    bytes
-});
-
-/// Empty cache when the `embedded_cache` feature is disabled.
-#[cfg(not(feature = "embedded_cache"))]
-pub static CACHE_DATA: LazyLock<&'static [u8]> = LazyLock::new(|| &[]);
+    Fp8VerifierCache::from_bytes(CACHE_DATA)
+}
