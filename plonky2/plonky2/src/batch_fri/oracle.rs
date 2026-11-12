@@ -23,7 +23,7 @@ use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::timed;
-use crate::util::fft_par::coset_fft_par;
+use crate::util::fft_par::coset_lde_par;
 use crate::util::timing::TimingTree;
 use crate::util::{reverse_bits, transpose};
 use plonky2_field::extension::FieldExtension;
@@ -508,8 +508,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 }
 
                 assert_eq!(final_poly.len(), degree);
+                let lde_final_values = coset_lde_par(
+                    &final_poly.coeffs, F::coset_shift().into(), fri_params.config.rate_bits,
+                );
                 let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
-                let lde_final_values = coset_fft_par(&lde_final_poly, F::coset_shift().into());
                 (lde_final_poly, lde_final_values)
             })
             .collect();

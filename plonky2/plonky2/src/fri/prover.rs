@@ -160,7 +160,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
 
 /// Flattens each arity-sized chunk of the bit-reversed codeword into a Merkle leaf.
 /// Gather from natural-order values directly, avoiding a full-buffer permutation.
-fn fri_leaves<F: RichField + Extendable<D>, const D: usize>(
+pub(crate) fn fri_leaves<F: RichField + Extendable<D>, const D: usize>(
     values: &[F::Extension],
     arity_bits: usize,
 ) -> Vec<Vec<F>> {

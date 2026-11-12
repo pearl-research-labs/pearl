@@ -160,19 +160,9 @@ impl LutMultiplicities {
             .for_each(|(&table, slots)| {
                 let sources: Vec<_> = sources
                     .iter()
-                    .filter_map(|src| src.tables.iter().position(|&t| t == table).map(|i| &src.counts[i]))
+                    .filter_map(|src| src.tables.iter().position(|&t| t == table).map(|i| src.counts[i].as_slice()))
                     .collect();
-                slots.par_iter_mut().enumerate().for_each(|(slot, dst)| {
-                    dst.par_chunks_mut(1 << 14).enumerate().for_each(|(block, dst)| {
-                        let start = block << 14;
-                        let end = start + dst.len();
-                        for src in &sources {
-                            for (dst, src) in dst.iter_mut().zip(&src[slot][start..end]) {
-                                *dst += src;
-                            }
-                        }
-                    });
-                });
+                add_counts(slots, &sources);
             });
     }
 
@@ -370,33 +360,29 @@ impl<F: PrimeField64> LutChecker<F> {
         for &table in inventory_tables.iter() {
             let dst_position = self.multiplicities.table_position(table);
             // Gather this table's per-chunk slot vectors once.
-            let per_chunk: Vec<&Vec<Vec<u64>>> = merged
+            let per_chunk: Vec<_> = merged
                 .iter()
-                .map(|counts| {
-                    let src_pos = counts.table_position(table);
-                    &counts.counts[src_pos]
-                })
+                .map(|counts| counts.counts[counts.table_position(table)].as_slice())
                 .collect();
-            self.multiplicities.counts[dst_position]
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(slot, dst_slot)| {
-                    dst_slot.par_chunks_mut(1 << 14).enumerate().for_each(|(block, dst)| {
-                        let start = block << 14;
-                        let end = start + dst.len();
-                        for src in &per_chunk {
-                            if src[slot].is_empty() {
-                                continue;
-                            }
-                            for (dst, src) in dst.iter_mut().zip(&src[slot][start..end]) {
-                                *dst += src;
-                            }
-                        }
-                    });
-                });
+            add_counts(&mut self.multiplicities.counts[dst_position], &per_chunk);
         }
         Ok(())
     }
+}
+
+/// Adds slot inventories; an empty source slot represents all zeroes.
+fn add_counts(destination: &mut [Vec<u64>], sources: &[&[Vec<u64>]]) {
+    destination.par_iter_mut().enumerate().for_each(|(slot, dst)| {
+        dst.par_chunks_mut(1 << 14).enumerate().for_each(|(block, dst)| {
+            let start = block << 14;
+            let end = start + dst.len();
+            for src in sources.iter().filter(|src| !src[slot].is_empty()) {
+                for (dst, src) in dst.iter_mut().zip(&src[slot][start..end]) {
+                    *dst += src;
+                }
+            }
+        });
+    });
 }
 
 /// A `LutLookup` compiled into flat term lists for the walk: the filter as a
