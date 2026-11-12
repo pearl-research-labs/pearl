@@ -925,6 +925,14 @@ where
         return Ok(None);
     }
 
+    // Scalar packing can borrow contiguous oracle rows directly.
+    let borrow_rows = P::WIDTH == 1;
+    let borrow_trace = borrow_rows
+        && layout.prep_columns[t].is_empty()
+        && layout.online_columns[t]
+            .iter()
+            .copied()
+            .eq(0..layout.num_columns[t]);
     let degree_bits = layout.degree_bits[t];
     let degree = 1 << degree_bits;
     let rate_bits = config.fri_config.rate_bits;
@@ -1095,35 +1103,60 @@ where
                 lagrange_basis_last,
             );
 
-            // Fetch the trace rows into the reusable buffers (no per-point
-            // allocation).
-            let ((local_buf, next_buf, online_buf, prep_buf), _) = (&mut scratch.2, &mut scratch.3);
-            get_trace_values_packed_into(i_start, local_buf, online_buf, prep_buf);
-            get_trace_values_packed_into(i_next_start, next_buf, online_buf, prep_buf);
-            let local_values: &mut [P] = local_buf;
-            let next_values: &mut [P] = next_buf;
+            let (local_values, next_values): (&[P], &[P]) = if borrow_trace {
+                let (oracle, degree_index, offset) = trace_oracle;
+                let row = |index| {
+                    P::pack_slice(oracle.get_lde_values(
+                        degree_index,
+                        index,
+                        step,
+                        offset,
+                        num_columns,
+                    ))
+                };
+                (row(i_start), row(i_next_start))
+            } else {
+                let ((local_buf, next_buf, online_buf, prep_buf), _) =
+                    (&mut scratch.2, &mut scratch.3);
+                get_trace_values_packed_into(i_start, local_buf, online_buf, prep_buf);
+                get_trace_values_packed_into(i_next_start, next_buf, online_buf, prep_buf);
+                (&local_buf[..], &next_buf[..])
+            };
 
             // Fetch the auxiliary rows into their reusable buffers.
-            let (aux_local, aux_next): (&mut [P], &mut [P]) = if num_aux > 0 {
+            let (aux_local, aux_next): (&[P], &[P]) = if num_aux > 0 {
                 let (aux_oracle, degree_index, leaf_offset) =
                     aux_oracle.expect("Auxiliary polys without an auxiliary oracle");
-                aux_oracle.get_lde_values_packed_into(
-                    degree_index,
-                    i_start,
-                    step,
-                    leaf_offset,
-                    &mut (scratch.3).0,
-                );
-                aux_oracle.get_lde_values_packed_into(
-                    degree_index,
-                    i_next_start,
-                    step,
-                    leaf_offset,
-                    &mut (scratch.3).1,
-                );
-                (&mut (scratch.3).0, &mut (scratch.3).1)
+                if borrow_rows {
+                    let row = |index| {
+                        P::pack_slice(aux_oracle.get_lde_values(
+                            degree_index,
+                            index,
+                            step,
+                            leaf_offset,
+                            num_aux,
+                        ))
+                    };
+                    (row(i_start), row(i_next_start))
+                } else {
+                    aux_oracle.get_lde_values_packed_into(
+                        degree_index,
+                        i_start,
+                        step,
+                        leaf_offset,
+                        &mut (scratch.3).0,
+                    );
+                    aux_oracle.get_lde_values_packed_into(
+                        degree_index,
+                        i_next_start,
+                        step,
+                        leaf_offset,
+                        &mut (scratch.3).1,
+                    );
+                    (&(scratch.3).0, &(scratch.3).1)
+                }
             } else {
-                (&mut [], &mut [])
+                (&[], &[])
             };
 
             // Refill the worker-local CTL template's point-dependent fields
