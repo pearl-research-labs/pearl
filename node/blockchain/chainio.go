@@ -890,6 +890,14 @@ func dbFetchHeightByHash(dbTx database.Tx, hash *chainhash.Hash) (int32, error) 
 		str := fmt.Sprintf("block %s is not in the main chain", hash)
 		return 0, errNotInMainChain(str)
 	}
+	if len(serializedHeight) != 4 {
+		// A present but malformed entry is corruption, not a missing
+		// block: callers treat errNotInMainChain as "not in the main
+		// chain", so report it as a deserialization error instead.
+		str := fmt.Sprintf("corrupt height for block %s: %d bytes, "+
+			"want 4", hash, len(serializedHeight))
+		return 0, errDeserialize(str)
+	}
 
 	return int32(byteOrder.Uint32(serializedHeight)), nil
 }
