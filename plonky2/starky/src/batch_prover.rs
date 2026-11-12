@@ -8,10 +8,10 @@
 use alloc::{vec, vec::Vec};
 
 use anyhow::{ensure, Result};
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 use plonky2::batch_fri::oracle::BatchFriOracle;
-use plonky2::field::extension::{Extendable, FieldExtension, OEF};
-use plonky2::field::fft::{fft_root_table, ifft_with_options, FftRootTable};
+use plonky2::field::extension::{Extendable, FieldExtension};
+use plonky2::field::fft::FftRootTable;
 use plonky2::field::packable::Packable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -35,10 +35,11 @@ use crate::cross_table_lookup::{
     cross_table_lookup_data, take_ctl_auxiliary_polys, CrossTableLookup, CtlCheckVars, CtlData,
 };
 use crate::get_challenges::get_dummy_polys;
-use crate::lookup::{
-    get_grand_product_challenge_set, lookup_helper_columns, Column, LookupCheckVars,
-};
+use crate::lookup::{get_grand_product_challenge_set, lookup_helper_columns, LookupCheckVars};
 use crate::proof::StarkOpeningSet;
+
+mod polynomials;
+use polynomials::evaluate_opening;
 
 /// Batched preprocessed data, committed once at setup time in a single
 /// multi-height oracle shared by every table with preprocessed columns.
@@ -333,28 +334,7 @@ where
                 .into_iter()
                 .flat_map(|(_, values)| values)
                 .collect();
-            let coeffs = timed!(timing, "IFFT", {
-                // Share one root table across all columns of the same height.
-                let mut roots = HashMap::new();
-                for column in &values {
-                    roots
-                        .entry(column.len())
-                        .or_insert_with(|| fft_root_table(column.len()));
-                }
-                values
-                    .into_par_iter()
-                    .map(|column| {
-                        if column.values[1..].iter().all(|&v| v == column.values[0]) {
-                            // Constant traces need no transform.
-                            let mut coeffs = vec![F::ZERO; column.len()];
-                            coeffs[0] = column.values[0];
-                            return PolynomialCoeffs::new(coeffs);
-                        }
-                        let table = &roots[&column.len()];
-                        ifft_with_options(column, None, Some(table))
-                    })
-                    .collect()
-            });
+            let coeffs = timed!(timing, "IFFT", { polynomials::ifft_columns(values) });
             return Some(BatchFriOracle::from_coeffs_with_digests(
                 coeffs, ranges, rate_bits, cap_height, timing,
             ));
@@ -926,8 +906,7 @@ where
     }
 
     // Scalar packing can borrow contiguous oracle rows directly.
-    let borrow_rows = P::WIDTH == 1;
-    let borrow_trace = borrow_rows
+    let borrow_trace = P::WIDTH == 1
         && layout.prep_columns[t].is_empty()
         && layout.online_columns[t]
             .iter()
@@ -1006,24 +985,8 @@ where
     // evaluations vary. Each rayon job takes one cloned template
     // (`map_init`) and refills only those point-dependent fields per batch.
     // Combine each CTL tuple once, instead of at every evaluation point.
-    let combined_columns = ctl_data.map(|data| {
-        data.zs_columns
-            .iter()
-            .map(|zs| {
-                zs.columns
-                    .iter()
-                    .map(|columns| {
-                        [precombine_ctl_columns(
-                            columns,
-                            zs.challenge.beta,
-                            public_inputs,
-                            num_columns,
-                        )]
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    });
+    let combined_columns =
+        ctl_data.map(|data| polynomials::combine_ctl_columns(data, public_inputs, num_columns));
     let ctl_meta: Option<Vec<CtlCheckVars<F, F, P, 1>>> = ctl_data.map(|data| {
         let mut vars = Vec::with_capacity(data.zs_columns.len());
         for (i, zs_columns) in data.zs_columns.iter().enumerate() {
@@ -1104,17 +1067,10 @@ where
             );
 
             let (local_values, next_values): (&[P], &[P]) = if borrow_trace {
-                let (oracle, degree_index, offset) = trace_oracle;
-                let row = |index| {
-                    P::pack_slice(oracle.get_lde_values(
-                        degree_index,
-                        index,
-                        step,
-                        offset,
-                        num_columns,
-                    ))
-                };
-                (row(i_start), row(i_next_start))
+                (
+                    polynomials::lde_row(trace_oracle, i_start, step, &mut (scratch.2).0),
+                    polynomials::lde_row(trace_oracle, i_next_start, step, &mut (scratch.2).1),
+                )
             } else {
                 let ((local_buf, next_buf, online_buf, prep_buf), _) =
                     (&mut scratch.2, &mut scratch.3);
@@ -1127,34 +1083,11 @@ where
             let (aux_local, aux_next): (&[P], &[P]) = if num_aux > 0 {
                 let (aux_oracle, degree_index, leaf_offset) =
                     aux_oracle.expect("Auxiliary polys without an auxiliary oracle");
-                if borrow_rows {
-                    let row = |index| {
-                        P::pack_slice(aux_oracle.get_lde_values(
-                            degree_index,
-                            index,
-                            step,
-                            leaf_offset,
-                            num_aux,
-                        ))
-                    };
-                    (row(i_start), row(i_next_start))
-                } else {
-                    aux_oracle.get_lde_values_packed_into(
-                        degree_index,
-                        i_start,
-                        step,
-                        leaf_offset,
-                        &mut (scratch.3).0,
-                    );
-                    aux_oracle.get_lde_values_packed_into(
-                        degree_index,
-                        i_next_start,
-                        step,
-                        leaf_offset,
-                        &mut (scratch.3).1,
-                    );
-                    (&(scratch.3).0, &(scratch.3).1)
-                }
+                let position = (aux_oracle, degree_index, leaf_offset);
+                (
+                    polynomials::lde_row(position, i_start, step, &mut (scratch.3).0),
+                    polynomials::lde_row(position, i_next_start, step, &mut (scratch.3).1),
+                )
             } else {
                 (&[], &[])
             };
@@ -1225,48 +1158,6 @@ where
             })
             .collect(),
     ))
-}
-
-/// Builds the single affine column `sum_i beta^i * columns[i]`, binding public
-/// inputs to their values. The ordinary CTL combiner still adds gamma once.
-/// Used only before native quotient evaluation; preserves the CTL polynomial.
-fn precombine_ctl_columns<F: Field>(
-    columns: &[Column<F>],
-    beta: F,
-    public_inputs: &[F],
-    num_columns: usize,
-) -> Column<F> {
-    let mut local = vec![F::ZERO; num_columns];
-    let mut next = vec![F::ZERO; num_columns];
-    let mut constant = F::ZERO;
-    for (column, weight) in columns.iter().zip(beta.powers()) {
-        let (linear, next_row, scaled, offsets, c) = column.parts();
-        for &(i, factor) in linear {
-            local[i] += weight * factor;
-        }
-        for &(i, factor) in next_row {
-            next[i] += weight * factor;
-        }
-        for &(i, slot) in scaled {
-            local[i] += weight * public_inputs[slot];
-        }
-        constant += weight * (c + offsets.iter().map(|&slot| public_inputs[slot]).sum::<F>());
-    }
-    let local: Vec<_> = local
-        .into_iter()
-        .enumerate()
-        .filter(|(_, v)| v.is_nonzero())
-        .collect();
-    let next: Vec<_> = next
-        .into_iter()
-        .enumerate()
-        .filter(|(_, v)| v.is_nonzero())
-        .collect();
-    if local.is_empty() && next.is_empty() {
-        Column::constant(constant)
-    } else {
-        Column::linear_combination_and_next_row_with_constant(local, next, constant)
-    }
 }
 
 /// Computes the opening set of table `t` at `zeta`, `g_t * zeta` (where `g_t`
@@ -1369,109 +1260,5 @@ where
         auxiliary_polys_next,
         ctl_zs_first,
         quotient_polys,
-    }
-}
-
-/// Evaluates ascending base-field coefficients at `point`. Quadratic extensions
-/// use eight independent chains and their trace/norm relation, requiring only
-/// base-field multiplications within each chain. Other extensions use Horner.
-fn evaluate_opening<F: RichField + Extendable<D>, const D: usize>(
-    coefficients: &[F],
-    point: F::Extension,
-) -> F::Extension {
-    let step = point * point;
-    let step = step * step;
-    if D == 2 {
-        let step = step * step;
-        // Y² = trace(Y)Y - norm(Y) for Y in a quadratic extension.
-        let coordinates = step.to_basefield_array();
-        let trace = coordinates[0] + coordinates[0];
-        let norm = coordinates[0] * coordinates[0]
-            - coordinates[1] * coordinates[1] * <F::Extension as OEF<D>>::W;
-        let mut linear = [F::ZERO; 8];
-        let mut constant = [F::ZERO; 8];
-        for chunk in coefficients.chunks(8).rev() {
-            for (i, &coefficient) in chunk.iter().enumerate() {
-                let previous = linear[i];
-                linear[i] = previous * trace + constant[i];
-                constant[i] = coefficient - previous * norm;
-            }
-        }
-        return (0..8).rev().fold(F::Extension::ZERO, |acc, i| {
-            acc * point + step.scalar_mul(linear[i]) + F::Extension::from_basefield(constant[i])
-        });
-    }
-    let mut lanes = [F::Extension::ZERO; 4];
-    for chunk in coefficients.chunks(4).rev() {
-        for (lane, &coefficient) in lanes.iter_mut().zip(chunk) {
-            *lane = *lane * step + F::Extension::from_basefield(coefficient);
-        }
-    }
-    lanes
-        .into_iter()
-        .rev()
-        .fold(F::Extension::ZERO, |acc, lane| acc * point + lane)
-}
-
-#[cfg(test)]
-mod opening_evaluation_tests {
-    use super::*;
-    use plonky2::field::goldilocks_field::GoldilocksField as F;
-    use plonky2::field::types::Sample;
-
-    #[test]
-    fn openings_match_horner() {
-        type E = <F as Extendable<2>>::Extension;
-        let extension_point =
-            E::from_basefield_array([F::from_canonical_u64(2), F::from_canonical_u64(3)]);
-        for length in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 17, 31, 128, 1025] {
-            let coefficients: Vec<_> = (0..length)
-                .map(|i| F::from_canonical_usize(19 * i + 7))
-                .collect();
-            for point in [E::ZERO, E::ONE, extension_point] {
-                let expected = coefficients
-                    .iter()
-                    .rev()
-                    .fold(E::ZERO, |acc, &c| acc * point + E::from(c));
-                assert_eq!(evaluate_opening::<F, 2>(&coefficients, point), expected);
-            }
-        }
-    }
-
-    #[test]
-    fn precombined_ctl_matches_original_expression() {
-        let columns = vec![
-            Column::constant(F::ONE),
-            Column::single(0),
-            Column::linear_combination_and_next_row_with_constant(
-                vec![(0, F::TWO), (1, -F::ONE)],
-                vec![(2, F::ONE)],
-                F::TWO,
-            ),
-            Column::single_times_public_input_plus_single(1, 0, 0),
-            Column::single_times_public_input_plus_public_input(2, 1, 0),
-            Column::public_input_minus_single(1, 2),
-        ];
-        for beta in [F::ZERO, F::ONE, -F::ONE, F::from_canonical_u64(19)] {
-            for public in [vec![F::ZERO; 2], F::rand_vec(2)] {
-                let local = F::rand_vec(3);
-                let next = F::rand_vec(3);
-                for tuple in [columns.as_slice(), &columns[..0], &columns[1..3]] {
-                    let combined = precombine_ctl_columns(tuple, beta, &public, 3);
-                    let challenge = crate::lookup::GrandProductChallenge {
-                        beta,
-                        gamma: F::TWO,
-                    };
-                    let expected = challenge.combine_base(
-                        tuple
-                            .iter()
-                            .map(|c| c.eval_with_next::<F, F, 1>(&local, &next, &public)),
-                    );
-                    let actual = challenge
-                        .combine_base([combined.eval_with_next::<F, F, 1>(&local, &next, &public)]);
-                    assert_eq!(actual, expected);
-                }
-            }
-        }
     }
 }

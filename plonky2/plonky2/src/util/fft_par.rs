@@ -121,35 +121,10 @@ fn fft_par_padded<F: Field + Send + Sync>(mut coeffs: Vec<F>, n: usize) -> Polyn
 }
 
 /// Evaluates `coeffs` on `shift * H`, in natural order, with `|H| = coeffs.len()`.
-/// Large transforms with at least three quarters trailing zeros use a shorter
-/// coefficient prefix. Dense transforms retain the ordinary four-step path.
 pub fn coset_fft_par<F: Field + Send + Sync>(
     coeffs: &PolynomialCoeffs<F>,
     shift: F,
 ) -> PolynomialValues<F> {
-    let n = coeffs.len();
-    // A nonzero quarter-point rules out a useful zero tail without scanning.
-    if n >= 1 << MIN_LG && coeffs.coeffs[n / 4].is_zero() && coeffs.coeffs[n - 1].is_zero() {
-        let lg_n = log2_strict(n);
-        let live = coeffs
-            .coeffs
-            .par_chunks(4096)
-            .enumerate()
-            .filter_map(|(i, row)| {
-                row.iter()
-                    .rposition(|x| x.is_nonzero())
-                    .map(|j| i * 4096 + j + 1)
-            })
-            .max()
-            .unwrap_or(0);
-        if live == 0 {
-            return PolynomialValues::new(vec![F::ZERO; n]);
-        }
-        let degree = live.next_power_of_two();
-        if degree <= n / 4 {
-            return coset_lde_par(&coeffs.coeffs[..degree], shift, lg_n - log2_strict(degree));
-        }
-    }
     coset_lde_par(&coeffs.coeffs, shift, 0)
 }
 
@@ -162,28 +137,34 @@ pub(crate) fn coset_lde_par<F: Field + Send + Sync>(
 ) -> PolynomialValues<F> {
     let n = coeffs.len() << rate_bits;
     if rate_bits >= 4 && coeffs.len() <= 1 << 13 && n >= 1 << MIN_LG {
-        let count = 1 << rate_bits;
-        let roots = fft_root_table::<F>(coeffs.len());
+        // Use fewer, longer transforms for small polynomials at high rates.
+        let coset_bits = if rate_bits >= 8 { 5 } else { rate_bits };
+        let padding_bits = rate_bits - coset_bits;
+        let count = 1 << coset_bits;
+        let roots = fft_root_table::<F>(coeffs.len() << padding_bits);
         let omega = F::primitive_root_of_unity(log2_strict(n));
-        let cosets: Vec<_> = (0..count)
-            .into_par_iter()
-            .map(|j| {
-                let coset_shift = shift * omega.exp_u64(j as u64);
-                let scaled = coset_shift
-                    .powers()
-                    .zip(coeffs)
-                    .map(|(w, &x)| w * x)
-                    .collect();
-                fft_with_options(PolynomialCoeffs::new(scaled), None, Some(&roots)).values
+        let shifts: Vec<_> = omega.powers().take(count).map(|w| shift * w).collect();
+        let fft_len = coeffs.len() << padding_bits;
+        let cosets: Vec<_> = shifts
+            .par_iter()
+            .map(|&shift| {
+                let mut coeffs: Vec<_> = shift.powers().zip(coeffs).map(|(w, &x)| w * x).collect();
+                coeffs.resize(fft_len, F::ZERO);
+                PolynomialCoeffs::new(coeffs)
+                    .fft_with_options(Some(padding_bits), Some(&roots))
+                    .values
             })
             .collect();
-        let mut out = vec![F::ZERO; n];
-        out.par_chunks_mut(count).enumerate().for_each(|(k, row)| {
-            for (j, x) in row.iter_mut().enumerate() {
-                *x = cosets[j][k];
-            }
-        });
-        return PolynomialValues::new(out);
+        let mut values = vec![F::ZERO; fft_len * shifts.len()];
+        values
+            .par_chunks_mut(shifts.len())
+            .enumerate()
+            .for_each(|(k, row)| {
+                for (j, value) in row.iter_mut().enumerate() {
+                    *value = cosets[j][k];
+                }
+            });
+        return PolynomialValues::new(values);
     }
     // Scale coeffs[i] *= shift^i in parallel, then transform.
     let mut scaled = vec![F::ZERO; coeffs.len()];
@@ -198,6 +179,35 @@ pub(crate) fn coset_lde_par<F: Field + Send + Sync>(
             }
         });
     fft_par_padded(scaled, n)
+}
+
+/// Interpolates coset evaluations in natural order, using the existing parallel FFT
+/// for large inputs. Inverse normalization and coset scaling are fused in one pass.
+pub(crate) fn coset_ifft_par<F: Field>(
+    values: PolynomialValues<F>,
+    shift: F,
+) -> PolynomialCoeffs<F> {
+    let n = values.len();
+    if n < (1 << 18) {
+        return values.coset_ifft(shift);
+    }
+    let norm = F::inverse_2exp(crate::util::log2_strict(n));
+    let inv_shift = shift.inverse();
+    let transformed = crate::util::fft_par::fft_par(PolynomialCoeffs::new(values.values));
+    let mut coeffs = vec![F::ZERO; n];
+    coeffs
+        .par_chunks_mut(4096)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let start = ci * 4096;
+            let mut w = norm * inv_shift.exp_u64(start as u64);
+            for (offset, value) in chunk.iter_mut().enumerate() {
+                let index = start + offset;
+                *value = transformed.values[if index == 0 { 0 } else { n - index }] * w;
+                w *= inv_shift;
+            }
+        });
+    PolynomialCoeffs::new(coeffs)
 }
 
 #[cfg(test)]
@@ -253,7 +263,7 @@ mod tests {
         assert_eq!(par, serial);
     }
 
-    fn check_zero_tails<FE: Field>(make: impl Fn(usize) -> FE, shift: FE) {
+    fn check_padded_prefixes<FE: Field>(make: impl Fn(usize) -> FE, shift: FE) {
         for (bits, live) in [
             (17, 512),
             (18, 0),
@@ -270,12 +280,16 @@ mod tests {
                     .map(|i| if i < live { make(i) } else { FE::ZERO })
                     .collect(),
             );
-            assert_eq!(coset_fft_par(&poly, shift), poly.coset_fft(shift));
+            let degree = live.max(1).next_power_of_two();
+            assert_eq!(
+                coset_lde_par(&poly.coeffs[..degree], shift, bits - log2_strict(degree)),
+                poly.coset_fft(shift),
+            );
         }
     }
 
     #[test]
-    fn zero_tails_match_serial() {
+    fn padded_prefixes_match_serial() {
         let word = |i: usize| {
             F::from_noncanonical_u64(
                 [
@@ -295,9 +309,9 @@ mod tests {
                 .build()
                 .unwrap()
                 .install(|| {
-                    check_zero_tails(word, F::coset_shift());
+                    check_padded_prefixes(word, F::coset_shift());
                     type E = <F as Extendable<2>>::Extension;
-                    check_zero_tails(
+                    check_padded_prefixes(
                         |i| E::from_basefield_array([word(i), word(i + 1)]),
                         F::coset_shift().into(),
                     );
@@ -307,6 +321,34 @@ mod tests {
                             coset_lde_par(&coeffs, shift, 8),
                             PolynomialCoeffs::new(coeffs).lde(8).coset_fft(shift)
                         );
+                    }
+                });
+        }
+    }
+    #[test]
+    fn parallel_coset_ifft_matches_serial() {
+        for threads in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    for bits in [0, 1, 10, 18, 19] {
+                        let values = PolynomialValues::new(
+                            (0..1 << bits)
+                                .map(|i| {
+                                    F::from_noncanonical_u64(
+                                        (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                                    )
+                                })
+                                .collect(),
+                        );
+                        for shift in [F::ONE, F::coset_shift()] {
+                            assert_eq!(
+                                coset_ifft_par(values.clone(), shift),
+                                values.clone().coset_ifft(shift)
+                            );
+                        }
                     }
                 });
         }
