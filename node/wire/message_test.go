@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -604,5 +605,65 @@ func TestMessageSizeMatchesEncoding(t *testing.T) {
 			require.NoError(t, test.msg.PrlEncode(&buf, ProtocolVersion, enc), "%s (%v)", test.name, enc)
 			assert.Equal(t, buf.Len(), MessageSize(test.msg, ProtocolVersion, enc), "%s (%v)", test.name, enc)
 		}
+	}
+}
+
+// TestReadV2MessageTruncatedCountsDoNotPreallocate ensures a peer cannot make a decoder allocate memory for elements a
+// message does not contain. Each payload is zero bytes up to a count field, then the largest count the decoder
+// accepts, and nothing after it. The decode must fail having allocated far less than the count claims.
+//
+// Not parallel: it measures allocation across the whole process.
+func TestReadV2MessageTruncatedCountsDoNotPreallocate(t *testing.T) {
+	tests := []struct {
+		command  string
+		prefix   int    // bytes before the count field
+		count    uint64 // the largest count the decoder accepts
+		elemSize uint64 // the fewest bytes one element takes on the wire
+	}{
+		// The count is the user agent length, after the version, services, time, two addresses and nonce.
+		{CmdVersion, 80, MaxMessagePayload, 1},
+		// The count is the length of the rejected command's name, the first field.
+		{CmdReject, 0, MaxMessagePayload, 1},
+		// The count is the number of hashes, after the block header and the transaction total.
+		{CmdMerkleBlock, 112, maxTxPerBlock, chainhash.HashSize},
+		// The count is the number of transactions, after the certificate and the block header.
+		{CmdBlock, 112, maxTxPerBlock, minTxPayload},
+		// The count is the number of inventory vectors, the first field.
+		{CmdInv, 0, MaxInvPerMsg, maxInvVectPayload},
+		{CmdGetData, 0, MaxInvPerMsg, maxInvVectPayload},
+		{CmdNotFound, 0, MaxInvPerMsg, maxInvVectPayload},
+		// The count is the number of filter headers, after the filter type and the stop hash.
+		{CmdCFCheckpt, 33, maxCFHeadersLen, chainhash.HashSize},
+		// The count is the number of inputs, after the version. It is not zero, so it is not read as a witness marker.
+		{CmdTx, 4, maxTxInPerMessage, minTxInPayload},
+	}
+	for _, test := range tests {
+		t.Run(test.command, func(t *testing.T) {
+			var count bytes.Buffer
+			require.NoError(t, WriteVarInt(&count, ProtocolVersion, test.count))
+			var command [CommandSize]byte
+			copy(command[:], test.command)
+			// A v2 message: a zero byte, the command name padded to CommandSize, then the payload. Zeros are
+			// enough for the fields before the count, since the decoders do not validate them.
+			plaintext := bytes.Join([][]byte{{0x00}, command[:], make([]byte, test.prefix), count.Bytes()}, nil)
+
+			// Decode once first: a block decode borrows a 4 MiB script buffer from a pool, and only the first
+			// borrow allocates it.
+			_, _, err := ReadV2MessageN(plaintext, ProtocolVersion, WitnessEncoding)
+			require.Error(t, err)
+
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			_, _, err = ReadV2MessageN(plaintext, ProtocolVersion, WitnessEncoding)
+			runtime.ReadMemStats(&after)
+			require.Error(t, err)
+
+			// Allocating for the count means allocating all of claimed. A decoder that allocates only for data it
+			// has may reserve a little up front, but stays far below a tenth of it.
+			claimed := test.count * test.elemSize
+			allocated := after.TotalAlloc - before.TotalAlloc
+			require.Lessf(t, allocated, claimed/10, "a %s message claiming %d bytes allocated %d bytes",
+				test.command, claimed, allocated)
+		})
 	}
 }

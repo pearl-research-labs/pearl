@@ -356,6 +356,12 @@ func (n *testNode) outboundPeer() *testPeer {
 	return n.connect(false)
 }
 
+// inboundPeer starts low-quality, so its block announcements go through the getheaders probe.
+func (n *testNode) inboundPeer() *testPeer {
+	n.t.Helper()
+	return n.connect(true)
+}
+
 func (n *testNode) connect(inbound bool) *testPeer {
 	n.t.Helper()
 
@@ -409,6 +415,17 @@ func (p *testPeer) expectAskedFor(blocks ...*btcutil.Block) {
 		}
 	case <-time.After(5 * time.Second):
 		require.FailNow(p.node.t, "expected a getdata for the blocks")
+	}
+}
+
+// expectProbed waits for the getheaders probe a low-quality peer gets in place of a getdata.
+func (p *testPeer) expectProbed() {
+	p.node.t.Helper()
+
+	select {
+	case <-p.inbox.getHeaders:
+	case <-time.After(5 * time.Second):
+		require.FailNow(p.node.t, "expected a getheaders probe")
 	}
 }
 
@@ -922,4 +939,34 @@ func TestUnlinkedHeadersAreNotFetched(t *testing.T) {
 	p.expectNotAsked("getdata for a header that does not connect to the one before it")
 	assert.False(t, node.fetching(orphan))
 	assert.False(t, p.connected())
+}
+
+// TestLowQualityFetchesShareOneBudget pins that blocks fetched on the word of low-quality peers draw on one
+// node-wide budget, since each fetched block costs a proof verification however little work its certificate holds.
+// Each extra connection must not bring its own allowance, while high-quality peers keep being served.
+func TestLowQualityFetchesShareOneBudget(t *testing.T) {
+	node := newTestNode(t)
+	burst := node.sm.lowQualityFetches.Burst()
+
+	// Every attacker connection walks the inv, getheaders probe, headers and getdata route for a block of its own.
+	for i := 0; i <= burst; i++ {
+		attacker := node.inboundPeer()
+		b := node.block(nil, byte(i))
+		attacker.announce(b)
+		attacker.expectProbed()
+		attacker.sendHeaders(b)
+		if i < burst {
+			attacker.expectAskedFor(b)
+			continue
+		}
+		attacker.expectNotAsked("getdata beyond the low-quality fetch budget")
+		assert.False(t, node.fetching(b))
+	}
+
+	honest := node.outboundPeer()
+	b := node.block(nil, 0xff)
+	honest.announce(b)
+	honest.expectAskedFor(b)
+	honest.deliver(b)
+	assert.Equal(t, *b.Hash(), node.tip())
 }

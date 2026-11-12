@@ -12,6 +12,7 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/btcec"
 	"github.com/pearl-research-labs/pearl/node/btcec/ellswift"
+	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
 // packetBit is a type used to represent the bits in the packet's header.
@@ -39,13 +40,11 @@ const (
 	// allowed to send.
 	MaxGarbageLen = 4095
 
-	// maxContentLen is the maximum length of content that can be encrypted
-	// or decrypted.
-	//
-	// TODO: This should be revisited. For some reason, the test vectors
-	// want us to encrypt 16777215 bytes even though bitcoind will only
-	// decrypt up to 1 + 12 + 4_000_000 bytes by default.
-	maxContentLen = 1<<24 - 1
+	// maxContentLen is the maximum length of packet content we encrypt or decrypt: the message type, at most 0x00 and
+	// a 12-byte command, followed by a payload of up to wire.MaxProtocolMessageLength. BIP324's 3-byte length field
+	// can encode up to 1<<24 - 1, but a longer packet can only carry a message that wire rejects, so V2ReceivePacket
+	// rejects it before reading the body.
+	maxContentLen = 1 + wire.CommandSize + wire.MaxProtocolMessageLength
 
 	// lengthFieldLen is the length of the length field when encrypting the
 	// content's length.
@@ -723,9 +722,10 @@ func (p *Peer) V2ReceivePacket(aad []byte) ([]byte, error) {
 
 		log.Tracef("Decrypted content length=%d", contentsLen)
 
+		// Check the length before reading the body, so a peer can't make us buffer a packet we'd reject anyway.
+		// Decoys are held to the same limit.
 		if contentsLen > maxContentLen {
-			log.Errorf("Decrypted content length %d exceeds "+
-				"max %d", contentsLen, maxContentLen)
+			log.Errorf("Decrypted content length %d exceeds max %d", contentsLen, maxContentLen)
 
 			return nil, errContentLengthExceeded
 		}
@@ -745,7 +745,7 @@ func (p *Peer) V2ReceivePacket(aad []byte) ([]byte, error) {
 
 		log.Tracef("Received encrypted packet body: %x", aeadCiphertext)
 
-		plaintext, err := p.recvP.Decrypt(aad, aeadCiphertext)
+		plaintext, err := p.recvP.DecryptInPlace(aad, aeadCiphertext)
 		if err != nil {
 			log.Errorf("Failed to decrypt packet body: %v", err)
 			return nil, err

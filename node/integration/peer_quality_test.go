@@ -437,3 +437,76 @@ func TestOrphanFetchesBlockWithheldByAnotherPeer(t *testing.T) {
 	requireDroppedWithinBudget(t, attacker, requested)
 	requireNotPenalized(t, honest)
 }
+
+// TestNotFoundScoresOnlyUnrequestedTxns: an honest relay can lose a transaction between announcing it and our
+// getdata, for instance when a replacement evicts it, and then answers with a notfound. A peer that sent eleven
+// replaceable transactions and their replacement got every neighbour to ban its relay this way.
+// The victim must score only the entries it never requested: a hash it did request counts once, and only an
+// unrequested entry or a repeat of a hash adds to the score.
+func TestNotFoundScoresOnlyUnrequestedTxns(t *testing.T) {
+	// announce sends an inv for `count` transaction hashes starting at `first` and returns the entries the victim
+	// requests in reply.
+	announce := func(t *testing.T, relay *scriptedPeer, first, count int) []*wire.InvVect {
+		t.Helper()
+
+		inv := wire.NewMsgInv()
+		for i := range count {
+			require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{1, byte(first + i)})))
+		}
+		relay.QueueMessage(inv, nil)
+
+		var requested []*wire.InvVect
+		for len(requested) < count {
+			select {
+			case getData := <-relay.getDataCh:
+				requested = append(requested, getData.InvList...)
+			case <-time.After(pqMessageBudget):
+				t.Fatalf("victim requested %d of the %d announced transactions", len(requested), count)
+			}
+		}
+
+		return requested
+	}
+
+	// Twelve entries are 120 points at 10 each, over the ban threshold of 100.
+	t.Run("requested entries are not scored", func(t *testing.T) {
+		victim, relay := setupPeerQuality(t)
+
+		notFound := wire.NewMsgNotFound()
+		for _, iv := range announce(t, relay, 0, 12) {
+			require.NoError(t, notFound.AddInvVect(iv))
+		}
+		relay.QueueMessage(notFound, nil)
+
+		// The victim handles a peer's messages in order, so the getdata for a later inv means it handled the notfound.
+		announce(t, relay, 12, 1)
+		requireNotPenalized(t, victim)
+	})
+
+	t.Run("unrequested entries are scored", func(t *testing.T) {
+		_, relay := setupPeerQuality(t)
+
+		notFound := wire.NewMsgNotFound()
+		for i := range 12 {
+			require.NoError(t, notFound.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &chainhash.Hash{2, byte(i)})))
+		}
+		relay.QueueMessage(notFound, nil)
+
+		require.Eventually(t, func() bool { return !relay.Connected() }, pqMessageBudget, 10*time.Millisecond,
+			"victim kept a peer that sent twelve unrequested notfound entries")
+	})
+
+	t.Run("repeated entries are scored", func(t *testing.T) {
+		_, relay := setupPeerQuality(t)
+
+		requested := announce(t, relay, 0, 1)[0]
+		notFound := wire.NewMsgNotFound()
+		for range 12 {
+			require.NoError(t, notFound.AddInvVect(requested))
+		}
+		relay.QueueMessage(notFound, nil)
+
+		require.Eventually(t, func() bool { return !relay.Connected() }, pqMessageBudget, 10*time.Millisecond,
+			"victim kept a peer that repeated one requested hash twelve times")
+	})
+}

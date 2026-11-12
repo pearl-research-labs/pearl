@@ -45,20 +45,20 @@ func NewFSChaCha20Poly1305(initialKey []byte) (*FSChaCha20Poly1305, error) {
 // Encrypt encrypts the plaintext using the associated data, returning the
 // ciphertext or an error.
 func (f *FSChaCha20Poly1305) Encrypt(aad, plaintext []byte) ([]byte, error) {
-	return f.crypt(aad, plaintext, false)
+	return f.crypt(nil, aad, plaintext, false)
 }
 
-// Decrypt decrypts the ciphertext using the assosicated data, returning the
-// plaintext or an error.
-func (f *FSChaCha20Poly1305) Decrypt(aad, ciphertext []byte) ([]byte, error) {
-	return f.crypt(aad, ciphertext, true)
+// DecryptInPlace decrypts ciphertext using the associated data, writing the plaintext over it, and returns the
+// plaintext or an error. The plaintext shares ciphertext's memory, and ciphertext is overwritten even when the
+// authentication fails, so callers must not use ciphertext afterwards.
+func (f *FSChaCha20Poly1305) DecryptInPlace(aad, ciphertext []byte) ([]byte, error) {
+	return f.crypt(ciphertext[:0], aad, ciphertext, true)
 }
 
 // crypt takes the aad and plaintext/ciphertext and either encrypts or decrypts
-// `text` and returns the result. If a failure was encountered, an error will
-// be returned.
-func (f *FSChaCha20Poly1305) crypt(aad, text []byte,
-	decrypt bool) ([]byte, error) {
+// `text`, appending the result to dst, and returns it. If a failure was
+// encountered, an error will be returned.
+func (f *FSChaCha20Poly1305) crypt(dst, aad, text []byte, decrypt bool) ([]byte, error) {
 
 	// The nonce is constructed as the 4-byte little-endian encoding of the
 	// number of messages crypted with the current key followed by the
@@ -73,7 +73,7 @@ func (f *FSChaCha20Poly1305) crypt(aad, text []byte,
 	if decrypt {
 		// Decrypt using the nonce, ciphertext, and aad.
 		var err error
-		result, err = f.cipher.Open(nil, nonce[:], text, aad)
+		result, err = f.cipher.Open(dst, nonce[:], text, aad)
 		if err != nil {
 			// It is ok to error here without incrementing
 			// packetCtr because we will no longer be decrypting
@@ -82,7 +82,7 @@ func (f *FSChaCha20Poly1305) crypt(aad, text []byte,
 		}
 	} else {
 		// Encrypt using the nonce, plaintext, and aad.
-		result = f.cipher.Seal(nil, nonce[:], text, aad)
+		result = f.cipher.Seal(dst, nonce[:], text, aad)
 	}
 
 	f.packetCtr++

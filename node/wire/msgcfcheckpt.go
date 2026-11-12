@@ -89,20 +89,14 @@ func (msg *MsgCFCheckpt) PrlDecode(r io.Reader, pver uint32, _ MessageEncoding) 
 		return nil
 	}
 
-	// Optimize memory allocation by creating a single backing array for
-	// all hashes. This reduces GC pressure and improves cache locality.
-	hashes := make([]chainhash.Hash, count)
-	msg.FilterHeaders = make([]*chainhash.Hash, count)
-
-	// Now we'll read all the hashes directly into the backing array we've
-	// created above. We'll then point the underlying filter header hashes
-	// into this backing array.
-	for i := uint64(0); i < count; i++ {
-		if _, err := io.ReadFull(r, hashes[i][:]); err != nil {
-			return err
-		}
-		msg.FilterHeaders[i] = &hashes[i]
+	// Read the hashes into a single backing array, which reduces GC
+	// pressure, and point the filter headers into it.
+	hashes, err := readRecords(r, count, chainhash.HashSize, decodeHash)
+	if err != nil {
+		return err
 	}
+
+	msg.FilterHeaders = toPointers(hashes)
 
 	return nil
 }

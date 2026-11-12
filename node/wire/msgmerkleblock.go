@@ -69,16 +69,11 @@ func (msg *MsgMerkleBlock) PrlDecode(r io.Reader, pver uint32, enc MessageEncodi
 
 	// Create a contiguous slice of hashes to deserialize into in order to
 	// reduce the number of allocations.
-	hashes := make([]chainhash.Hash, count)
-	msg.Hashes = make([]*chainhash.Hash, 0, count)
-	for i := uint64(0); i < count; i++ {
-		hash := &hashes[i]
-		_, err := io.ReadFull(r, hash[:])
-		if err != nil {
-			return err
-		}
-		msg.AddTxHash(hash)
+	hashes, err := readRecords(r, count, chainhash.HashSize, decodeHash)
+	if err != nil {
+		return err
 	}
+	msg.Hashes = toPointers(hashes)
 
 	msg.Flags, err = ReadVarBytesBuf(r, pver, buf, maxFlagsPerMerkleBlock,
 		"merkle block flags size")

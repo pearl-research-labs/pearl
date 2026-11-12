@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
@@ -640,6 +641,105 @@ func varLenSize(n, elemSize int) int {
 	return VarIntSerializeSize(uint64(n)) + n*elemSize
 }
 
+// maxPrealloc is how many elements, or bytes, a decoder allocates on the word of a count read off the wire when the
+// reader cannot show that the data is there. A count is only a claim, so past this a decoder allocates only for data
+// that has actually arrived.
+const maxPrealloc = 256
+
+// lenReader is a reader that reports how many bytes it has not yet returned, as *bytes.Buffer, *bytes.Reader and
+// *strings.Reader do.
+type lenReader interface {
+	io.Reader
+	Len() int
+}
+
+// capHint returns a capacity hint for a slice of count elements, each at least itemSize bytes on the wire, that a
+// decoder is about to read. It is only a hint: callers still read all count elements, growing the slice past the hint
+// as they arrive. The hint never exceeds what the data could hold when r reports its unread length, as *bytes.Reader
+// and *bytes.Buffer do; otherwise it is at most maxPrealloc.
+func capHint(r io.Reader, count uint64, itemSize int) uint64 {
+	if lr, ok := r.(lenReader); ok {
+		return min(count, uint64(lr.Len()/itemSize))
+	}
+
+	return min(count, maxPrealloc)
+}
+
+// guardedReadFull reads exactly count bytes from r, like io.ReadFull with a buffer of that size, and returns the same
+// errors. When r can't report how much data it holds, the buffer grows only as bytes arrive.
+func guardedReadFull(r io.Reader, count uint64) ([]byte, error) {
+	// When the hint covers the whole count, read once into an exact-size buffer.
+	if capHint(r, count, 1) == count {
+		b := make([]byte, count)
+		if _, err := io.ReadFull(r, b); err != nil {
+			return nil, err
+		}
+
+		return b, nil
+	}
+
+	// Otherwise let the buffer grow as bytes arrive; LimitReader stops it at count.
+	b, err := io.ReadAll(io.LimitReader(r, int64(count)))
+	if err != nil {
+		return nil, err
+	}
+
+	// Report missing data as io.ReadFull does: io.EOF when nothing was read, io.ErrUnexpectedEOF when some was.
+	if len(b) == 0 {
+		return nil, io.EOF
+	}
+
+	if uint64(len(b)) < count {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	return b, nil
+}
+
+// recordBatch is how many records readRecords reads from r at a time.
+const recordBatch = 128
+
+// readRecords reads count records of size bytes each from r and decodes each one with decode. It allocates up front
+// only as many records as capHint suggests, and grows the result as records arrive. Records are read recordBatch at a
+// time, so a long list costs few calls to r.
+//
+// decode may allocate, but a decode that returns its T by value, as decodeHash returns a chainhash.Hash, lets
+// readRecords decode without allocating per record: each value is copied straight into the result. Callers that need
+// pointers can get pointers to the result's elements with toPointers.
+func readRecords[T any](r io.Reader, count uint64, size int, decode func([]byte) T) ([]T, error) {
+	elems := make([]T, 0, capHint(r, count, size))
+	// each element is of `size` bytes, we allocate a buffer for few of those at once.
+	batch := make([]byte, min(count, recordBatch)*uint64(size))
+	for remaining := count; remaining > 0; {
+		b := batch[:min(remaining, recordBatch)*uint64(size)]
+		if _, err := io.ReadFull(r, b); err != nil {
+			return nil, err
+		}
+
+		for rec := range slices.Chunk(b, size) {
+			elems = append(elems, decode(rec))
+		}
+		remaining -= uint64(len(b) / size)
+	}
+
+	return elems, nil
+}
+
+// decodeHash decodes a hash record for readRecords.
+func decodeHash(b []byte) chainhash.Hash {
+	return chainhash.Hash(b)
+}
+
+// toPointers returns a new slice holding a pointer to each element of s, in order. The pointers refer to s's
+// elements; nothing is copied.
+func toPointers[T any](s []T) []*T {
+	ptrs := make([]*T, len(s))
+	for i := range s {
+		ptrs[i] = &s[i]
+	}
+	return ptrs
+}
+
 // ReadVarString reads a variable length string from r and returns it as a Go
 // string.  A variable length string is encoded as a variable length integer
 // containing the length of the string followed by the bytes that represent the
@@ -681,8 +781,7 @@ func readVarStringBuf(r io.Reader, pver uint32, buf []byte) (string, error) {
 		return "", messageError("ReadVarString", str)
 	}
 
-	str := make([]byte, count)
-	_, err = io.ReadFull(r, str)
+	str, err := guardedReadFull(r, count)
 	if err != nil {
 		return "", err
 	}
@@ -762,12 +861,7 @@ func ReadVarBytesBuf(r io.Reader, pver uint32, buf []byte, maxAllowed uint32,
 		return nil, messageError("ReadVarBytes", str)
 	}
 
-	bytes := make([]byte, count)
-	_, err = io.ReadFull(r, bytes)
-	if err != nil {
-		return nil, err
-	}
-	return bytes, nil
+	return guardedReadFull(r, count)
 }
 
 // WriteVarBytes serializes a variable length byte array to w as a varInt

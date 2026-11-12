@@ -20,6 +20,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/metrics"
 	peerpkg "github.com/pearl-research-labs/pearl/node/peer"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -60,6 +61,16 @@ const (
 	// lowQualityStrikeLimit is the strike count at which a peer is
 	// downgraded back to low-quality (see nonTipStrikes).
 	lowQualityStrikeLimit = 5
+
+	// lowQualityFetchRate (per second) and lowQualityFetchBurst bound,
+	// across all peers, how many blocks are fetched on a low-quality
+	// peer's headers. A certificate's claimed jackpot costs nothing to
+	// fake, yet every fetched block pays a full proof verification under
+	// the chain lock, and an attacker can open as many low-quality
+	// connections as it has addresses. Honest blocks arrive minutes
+	// apart, and high-quality peers are not limited.
+	lowQualityFetchRate  = rate.Limit(0.5)
+	lowQualityFetchBurst = 8
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -99,7 +110,9 @@ type headersMsg struct {
 type notFoundMsg struct {
 	notFound *wire.MsgNotFound
 	peer     *peerpkg.Peer
-	reply    chan struct{}
+
+	// reply receives the number of transaction entries that answered a request we sent the peer.
+	reply chan uint32
 }
 
 // donePeerMsg signifies a newly disconnected peer to the block handler.
@@ -275,6 +288,10 @@ type SyncManager struct {
 	// pickSyncCandidate skips entries within syncPeerCooldown and
 	// lazy-evicts expired ones.
 	recentlyFailedSync map[string]time.Time
+
+	// lowQualityFetches is the node-wide budget of blocks fetched on a
+	// low-quality peer's headers.
+	lowQualityFetches *rate.Limiter
 }
 
 // resetHeaderState sets the headers-first mode state to values appropriate for
@@ -1183,6 +1200,11 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			if have, err := sm.chain.HaveBlock(&hash); err != nil || have {
 				continue
 			}
+			if !isPeerHighQuality(state) && !sm.lowQualityFetches.Allow() {
+				log.Debugf("Not fetching block %v announced by low-quality peer %s: fetch budget spent", hash, peer)
+
+				break
+			}
 			if !sm.trackBlockRequest(state, hash) {
 				continue
 			}
@@ -1324,14 +1346,17 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	}
 }
 
-// handleNotFoundMsg handles notfound messages from all peers.
-func (sm *SyncManager) handleNotFoundMsg(nfmsg *notFoundMsg) {
+// handleNotFoundMsg handles notfound messages from all peers. It returns how many transaction entries settled a
+// request we had outstanding with the peer. A hash settles at most one request, so repeating it does not count.
+func (sm *SyncManager) handleNotFoundMsg(nfmsg *notFoundMsg) uint32 {
 	peer := nfmsg.peer
 	state, exists := sm.peerStates[peer]
 	if !exists {
 		log.Warnf("Received notfound message from unknown peer %s", peer)
-		return
+		return 0
 	}
+
+	var requestedTxns uint32
 	for _, inv := range nfmsg.notFound.InvList {
 		// verify the hash was actually announced by the peer
 		// before deleting from the global requested maps.
@@ -1351,9 +1376,12 @@ func (sm *SyncManager) handleNotFoundMsg(nfmsg *notFoundMsg) {
 			if _, exists := state.requestedTxns[inv.Hash]; exists {
 				delete(state.requestedTxns, inv.Hash)
 				delete(sm.requestedTxns, inv.Hash)
+				requestedTxns++
 			}
 		}
 	}
+
+	return requestedTxns
 }
 
 // haveInventory returns whether or not the inventory represented by the passed
@@ -1633,8 +1661,7 @@ func (sm *SyncManager) processMessage(m interface{}) {
 		msg.reply <- struct{}{}
 
 	case *notFoundMsg:
-		sm.handleNotFoundMsg(msg)
-		msg.reply <- struct{}{}
+		msg.reply <- sm.handleNotFoundMsg(msg)
 
 	case *donePeerMsg:
 		sm.handleDonePeerMsg(msg.peer)
@@ -1899,17 +1926,17 @@ func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer
 	sm.msgChan <- &headersMsg{headers: headers, peer: peer, reply: done}
 }
 
-// QueueNotFound adds the passed notfound message and peer to the block handling
-// queue. Responds to the done channel argument after the notfound message is
-// processed.
-func (sm *SyncManager) QueueNotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer, done chan struct{}) {
+// HandleNotFound queues the passed notfound message from peer to the sync manager and waits until it is processed.
+// It returns how many transaction entries answered a request we had outstanding with the peer.
+func (sm *SyncManager) HandleNotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) uint32 {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
-		done <- struct{}{}
-
-		return
+		return 0
 	}
 
-	sm.msgChan <- &notFoundMsg{notFound: notFound, peer: peer, reply: done}
+	reply := make(chan uint32, 1)
+	sm.msgChan <- &notFoundMsg{notFound: notFound, peer: peer, reply: reply}
+
+	return <-reply
 }
 
 // DonePeer informs the blockmanager that a peer has disconnected.
@@ -2024,6 +2051,7 @@ func New(config *Config) (*SyncManager, error) {
 		quit:               make(chan struct{}),
 		feeEstimator:       config.FeeEstimator,
 		recentlyFailedSync: make(map[string]time.Time),
+		lowQualityFetches:  rate.NewLimiter(lowQualityFetchRate, lowQualityFetchBurst),
 	}
 
 	best := sm.chain.BestSnapshot()
