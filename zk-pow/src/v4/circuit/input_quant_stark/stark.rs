@@ -643,16 +643,16 @@ impl InputQuantProgram {
         let columns: Vec<PolynomialValues<F>> = [a_noise, b_noise]
             .into_iter()
             .map(|noise| {
-                let mut column = vec![F::ZERO; num_rows];
-                column[..noise.len()]
-                    .par_chunks_mut(1024)
-                    .zip(noise.par_chunks(1024))
-                    .for_each(|(outputs, values)| {
-                        for (output, &value) in outputs.iter_mut().zip(values) {
-                            assert!(value.is_finite(), "nonfinite public noise");
-                            *output = F::from_canonical_u32(value.to_bits());
-                        }
-                    });
+                assert!(noise.len() <= num_rows);
+                // Fill live rows and padding together, without zeroing live rows first.
+                let column = noise
+                    .par_iter()
+                    .map(|&value| {
+                        assert!(value.is_finite(), "nonfinite public noise");
+                        F::from_canonical_u32(value.to_bits())
+                    })
+                    .chain((noise.len()..num_rows).into_par_iter().map(|_| F::ZERO))
+                    .collect();
                 PolynomialValues::new(column)
             })
             .collect();
