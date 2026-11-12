@@ -8,10 +8,20 @@
 //! The generator derives each device's LUT cap and bakes it into that device's wrapper
 //! circuit before serializing the cache; no separate cap artifact is shipped.
 
-/// The embedded cache binary data (only when the `embedded_cache` feature is enabled).
+use std::sync::LazyLock;
+
+/// Checks the pinned digest on first access, before any consumer can deserialize the cache.
 #[cfg(feature = "embedded_cache")]
-pub const CACHE_DATA: &[u8] = include_bytes!("v4_cache.bin");
+pub static CACHE_DATA: LazyLock<&'static [u8]> = LazyLock::new(|| {
+    let bytes: &[u8] = include_bytes!("v4_cache.bin");
+    assert_eq!(
+        &blake3::hash(bytes).to_hex().as_str()[..32],
+        "9ded9d0a94cdb085ecd52ef2c6e4ab1c",
+        "V4 verifier cache digest mismatch; regenerate the cache and review the pinned digest"
+    );
+    bytes
+});
 
 /// Empty cache when the `embedded_cache` feature is disabled.
 #[cfg(not(feature = "embedded_cache"))]
-pub const CACHE_DATA: &[u8] = &[];
+pub static CACHE_DATA: LazyLock<&'static [u8]> = LazyLock::new(|| &[]);
