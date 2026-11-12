@@ -155,7 +155,7 @@ pub fn generate_partial_witness_fast<
             // SAFETY: generator_idx comes from layers which contain valid indices
             let finished = unsafe { generators.get_unchecked(generator_idx as usize) }
                 .0
-                .run(&witness, buffer);
+                .run_on_ready_witness(&witness, buffer);
             debug_assert!(finished);
 
             // SAFETY: Each generator produces unique targets, so writes are disjoint.
@@ -195,6 +195,16 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// flag is true, the generator will never be run again, otherwise it will be queued for another
     /// run next time a target in its watch list is populated.
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool;
+
+    /// Run with all dependencies available, as guaranteed by the cached schedule.
+    /// Custom generators keep their normal readiness checks by default.
+    fn run_on_ready_witness(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> bool {
+        self.run(witness, out_buffer)
+    }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
@@ -338,6 +348,14 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         } else {
             false
         }
+    }
+
+    fn run_on_ready_witness(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> bool {
+        self.inner.run_once(witness, out_buffer).is_ok()
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
