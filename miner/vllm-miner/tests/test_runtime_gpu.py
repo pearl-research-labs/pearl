@@ -41,14 +41,14 @@ pytestmark = pytest.mark.gpu
 
 _M_BUCKET = 256
 _N, _K = 256, 2048
-_TALL_K = 16384  # GLM-5.2 o_proj: high k past the 4x128 proof-size cap (15872)
+_TALL_K = 16384  # GLM-5.2 o_proj: high k past the 4x128 proof-size cap (22016)
 _MAX_256 = (1 << 256) - 1
 
 # Both mineable shapes commit the preferred 4x64 tile (4x128 is now only the
 # n-omitted back-compat commitment, never used by the runtime). The o_proj entry
 # carries the real GLM-5.2 shape -- (6144, 16384) -- so it exercises the true
 # wide-n allocation/indexing path plus the high-k B-build/kernel path the 4x128
-# proof-size cap (15872) could not reach. ``(name, n, k)``; used to parametrize
+# proof-size cap (22016) could not reach. ``(name, n, k)``; used to parametrize
 # the shared shape checks below.
 _MINED_SHAPES = {
     "low_k": ("test.mined.layer", _N, _K),
