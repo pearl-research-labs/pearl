@@ -37,32 +37,6 @@ jobs:
             py_pearl_mining_src:
               - 'py-pearl-mining/**'
 
-  pearl-blake3-tests:
-    name: pearl-blake3 Tests
-    runs-on: ubuntu-latest
-    needs: detect-changes
-    if: ${{ needs.detect-changes.outputs.pearl_blake3 == 'true' }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: "pearl-blake3 -> target"
-          cache-on-failure: true
-      - name: Check formatting
-        run: cargo fmt --all --check
-        working-directory: pearl-blake3
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-        working-directory: pearl-blake3
-      - name: Run tests
-        run: cargo test
-        working-directory: pearl-blake3
-
   zk-pow-tests:
     name: zk-pow Complete Test Suite
     runs-on: ubuntu-latest
@@ -102,12 +76,6 @@ jobs:
         # processes can exceed the GitHub runner's memory.
         run: cargo test --release --features embedded_cache -- --test-threads=1
 
-      - name: Test binaries
-        run: cargo test --bins --release --features embedded_cache
-
-      - name: Run doc tests
-        run: cargo test --doc --release --features embedded_cache
-
       - name: Test layout-macro
         run: |
           if [ -d "src/v1/layout_macro" ]; then
@@ -117,46 +85,73 @@ jobs:
       - name: Test invalid proofs mode
         run: cargo run --release --bin prove_verify -- invalid
 
-      # Go FFI Build
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
-        with:
-          go-version: '1.26.6'
-
-      - name: Build zk_pow_ffi library for Go FFI
-        run: |
-          cd bindings/go
-          cargo build --release
-
-      - name: Test zk_pow_ffi library for Go FFI
-        run: |
-          cd bindings/go
-          cargo test --release
-
-  py-pearl-mining-tests:
-    name: py-pearl-mining Tests
+  supporting-tests:
+    name: Go FFI, pearl-blake3, and Python Tests
     runs-on: ubuntu-latest
     needs: detect-changes
-    if: ${{ needs.detect-changes.outputs.py_pearl_mining == 'true' }}
+    if: ${{ needs.detect-changes.outputs.zk_pow == 'true' || needs.detect-changes.outputs.pearl_blake3 == 'true' || needs.detect-changes.outputs.py_pearl_mining == 'true' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           submodules: recursive
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          workspaces: "py-pearl-mining -> target"
+          workspaces: |
+            pearl-blake3 -> target
+            zk-pow -> target
+            zk-pow/bindings/go -> target
+            py-pearl-mining -> target
           cache-on-failure: true
+
+      - name: Check formatting
+        if: ${{ needs.detect-changes.outputs.pearl_blake3 == 'true' }}
+        run: cargo fmt --all --check
+        working-directory: pearl-blake3
+      - name: Clippy
+        if: ${{ needs.detect-changes.outputs.pearl_blake3 == 'true' }}
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: pearl-blake3
+      - name: Run tests
+        if: ${{ needs.detect-changes.outputs.pearl_blake3 == 'true' }}
+        run: cargo test
+        working-directory: pearl-blake3
+
+      - name: Build zk_pow_ffi library for Go FFI
+        if: ${{ needs.detect-changes.outputs.zk_pow == 'true' }}
+        working-directory: zk-pow
+        env:
+          RUSTFLAGS: -Copt-level=3 -Cdebug-assertions -Coverflow-checks=y -Cdebuginfo=0
+        run: |
+          cargo run --release --bin build_cache
+          cd bindings/go
+          cargo build --release
+
+      - name: Test zk_pow_ffi library for Go FFI
+        if: ${{ needs.detect-changes.outputs.zk_pow == 'true' }}
+        working-directory: zk-pow
+        env:
+          RUSTFLAGS: -Copt-level=3 -Cdebug-assertions -Coverflow-checks=y -Cdebuginfo=0
+        run: |
+          cd bindings/go
+          cargo test --release
+
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        if: ${{ needs.detect-changes.outputs.py_pearl_mining == 'true' }}
       - name: Install package
+        if: ${{ needs.detect-changes.outputs.py_pearl_mining == 'true' }}
         run: uv sync --package py-pearl-mining --no-editable
       - name: Run tests
+        if: ${{ needs.detect-changes.outputs.py_pearl_mining == 'true' }}
         run: uv run pytest py-pearl-mining/tests/
 
   ci_status:
     name: Rust CI Status
     runs-on: ubuntu-latest
-    needs: [pearl-blake3-tests, zk-pow-tests, py-pearl-mining-tests]
+    needs: [zk-pow-tests, supporting-tests]
     if: always()
     steps:
       - run: |
