@@ -1,8 +1,9 @@
 //! V4 (FP8) Go FFI: ZK certificate verification ([`verify`]), plain-proof share validation
-//! ([`plain`]), and the read-only verifier cache the former uses.
+//! ([`plain`]), CPU mining ([`mine`]), and the read-only verifier cache.
 
 use zk_pow::v4::api::zk::Fp8VerifierCache;
 
+pub mod mine;
 pub mod plain;
 pub mod verify;
 
@@ -18,12 +19,12 @@ const _: () = assert!(V4_MOE_PARAMS_MAX_NUM_EXPERTS == zk_pow::v4::api::public_p
 
 lazy_static::lazy_static! {
     /// FP8 verifier cache: the trusted setup (LUT cap + universal wrapper circuits),
-    /// keyed by device byte and preloaded from the embedded `fp8_cache.bin`. Read-only —
+    /// keyed by device byte and preloaded from the embedded `v4_cache.bin`. Read-only —
     /// a device missing from the cache rejects the proof rather than compiling its setup
     /// on demand, so no proof can force an expensive circuit build (denial of service).
     pub static ref FP8_VERIFIER_CACHE: Fp8VerifierCache = {
         use zk_pow::v4::api::embedded_cache;
-        let cache = Fp8VerifierCache::from_bytes(embedded_cache::CACHE_DATA)
+        let cache = embedded_cache::load()
             .expect("fp8 verifier cache is missing or corrupt; cannot verify fp8 proofs");
         assert!(
             cache.contains_all_devices(),

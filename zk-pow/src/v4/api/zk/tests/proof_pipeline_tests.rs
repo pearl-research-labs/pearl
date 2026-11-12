@@ -1,6 +1,8 @@
 use plonky2::field::types::Field;
 
 use super::super::*;
+#[cfg(feature = "embedded_cache")]
+use crate::v4::api::embedded_cache;
 use crate::v4::circuit::consistency::{
     fixture_job, fixture_job_asym, fixture_job_k32, fixture_job_medium, fixture_job_min_k, fixture_job_moe,
 };
@@ -45,46 +47,31 @@ fn api_roundtrip_and_tamper_rejection() {
     assert!(verify_fp8_block(&public, &header, &tampered, &setup, None).is_err());
 }
 
-/// The padded-geometry wire-level round trip ([`fixture_job_asym`]: `h = 16 != w = 20`,
-/// `k = 2048` — a reference-legal job the pre-padding AIRs could not prove, since
-/// `h + w = 36` and `h*w = 320` are not powers of two). Exercises `derive` without the
-/// old envelope checks and every AIR's padding path through parse -> derive -> prove ->
-/// verify.
+/// Exercise padded asymmetric geometry (`h = 16`, `w = 20`, `k = 2048`) and
+/// partial Blake3 blocks (`k = 2080`) through parse -> derive -> prove -> verify.
 #[test]
-fn asymmetric_api_roundtrip() {
-    let (header, plain) = fixture_job_asym();
+fn b200_api_roundtrips_asymmetric_and_partial_window() {
+    let jobs = [fixture_job_asym(), fixture_job_k32()];
+    let (_, asymmetric) = jobs[0].1.parse_proof(&jobs[0].0).expect("asymmetric fixture job must parse");
+    assert_ne!(asymmetric.h(), asymmetric.w(), "the fixture must be asymmetric");
+    let (_, partial_window) = jobs[1].1.parse_proof(&jobs[1].0).expect("k % 32 fixture job must parse");
+    assert_eq!(
+        partial_window.common_dim() % 64,
+        32,
+        "the fixture must exercise the k % 32 envelope"
+    );
+
     let mut timing = TimingTree::default();
-
-    let (_, params) = plain.parse_proof(&header).expect("asymmetric fixture job must parse");
-    assert_ne!(params.h(), params.w(), "the fixture must be asymmetric");
-    let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
-
-    let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
-
-    verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
-}
-
-/// The `k % 32` wire-level round trip ([`fixture_job_k32`]: `k = 2080`, committed rows
-/// that never tile into whole 64-byte Blake3 blocks). Exercises the straddling-block
-/// schedule and the non-power-of-two row-mean scale derivation through parse -> derive ->
-/// prove -> verify.
-#[test]
-fn k_mod_32_api_roundtrip() {
-    let (header, plain) = fixture_job_k32();
-    let mut timing = TimingTree::default();
-
-    let (_, params) = plain.parse_proof(&header).expect("k % 32 fixture job must parse");
-    assert_eq!(params.common_dim() % 64, 32, "the fixture must exercise the k % 32 envelope");
-    let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
-
-    let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
-
-    verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
+    let setup = Fp8ProverSetup::build(asymmetric.common().device, &mut timing).expect("prover setup");
+    for (header, plain) in jobs {
+        let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
+        verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
+    }
 }
 
 #[test]
 fn hopper_api_roundtrips_minimum_k_and_partial_window() {
-    let mut jobs = [fixture_job_min_k(), fixture_job_k32()];
+    let mut jobs = [fixture_job_min_k(), fixture_job_k32(), fixture_job_moe()];
     for (_, plain) in &mut jobs {
         plain.job.common.device = Device::H100;
     }
@@ -165,7 +152,7 @@ fn go_fixture(device: Device) -> (IncompleteBlockHeader, Vec<BlockHeader>, Vec<u
 #[test]
 #[cfg(feature = "embedded_cache")]
 fn embedded_cache_verifies_the_committed_go_fixtures() {
-    let cache = Fp8VerifierCache::from_bytes(crate::v4::api::embedded_cache::CACHE_DATA).expect("embedded cache must decode");
+    let cache = embedded_cache::load().expect("embedded cache must decode");
     for device in Device::ALL {
         let (header, chain, public_data, proof_data) = go_fixture(device);
         cache
@@ -180,7 +167,7 @@ fn embedded_cache_verifies_the_committed_go_fixtures() {
 #[cfg(feature = "embedded_cache")]
 #[ignore = "manual verifier calibration"]
 fn bench_v4_verify() {
-    let cache = Fp8VerifierCache::from_bytes(crate::v4::api::embedded_cache::CACHE_DATA).expect("embedded cache must decode");
+    let cache = embedded_cache::load().expect("embedded cache must decode");
     let pool = plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
@@ -287,7 +274,7 @@ fn bench_v4_prove() {
 #[cfg(feature = "embedded_cache")]
 #[ignore = "wrapped proving needs more memory than the default CI runner; invoked explicitly on a larger machine"]
 fn wrapped_devices_roundtrip_through_embedded_cache() {
-    let cache = Fp8VerifierCache::from_bytes(crate::v4::api::embedded_cache::CACHE_DATA).expect("embedded cache must decode");
+    let cache = embedded_cache::load().expect("embedded cache must decode");
     assert!(
         cache.contains_all_devices(),
         "the embedded cache must contain exactly both device setups"
@@ -560,17 +547,4 @@ fn moe_api_roundtrip_and_tamper_rejection() {
         verify_fp8_block(&bad_expert, &header, &proof, &setup, None).is_err(),
         "a proof must not verify under a different expert's statement"
     );
-}
-
-#[test]
-fn hopper_moe_api_roundtrip() {
-    let (header, mut plain) = fixture_job_moe();
-    plain.job.common.device = Device::H100;
-    let mut timing = TimingTree::default();
-    let (_, params) = plain.parse_proof(&header).expect("Hopper MoE fixture must parse");
-    assert_eq!(params.common().device, Device::H100);
-    let setup = Fp8ProverSetup::build(Device::H100, &mut timing).expect("Hopper MoE prover setup");
-    let (public, proof) =
-        zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("Hopper MoE proving must succeed");
-    verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest Hopper MoE proof must verify");
 }
