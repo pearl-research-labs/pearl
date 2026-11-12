@@ -14,7 +14,7 @@
 //! wrapper is the *universal* batch verifier (D1) — the degree profile and geometry are
 //! public inputs, not circuit shape — so a single setup covers every envelope-legal job.
 //! [`Fp8VerifierCache`] holds it keyed by the statement's device byte, preloaded
-//! from [`embedded_cache::CACHE_DATA`](crate::v4::api::embedded_cache::CACHE_DATA)
+//! through [`embedded_cache::load`](crate::v4::api::embedded_cache::load)
 //! (built offline by `build_cache`; each device's LUT cap is derived and baked into
 //! its cached circuit, so the verifier side never builds a LUT oracle).
 //! Verification is lookup-only: a setup missing from the cache rejects the proof
@@ -370,7 +370,7 @@ impl Fp8VerifierCache {
     fn verifier_for_statement(&self, statement: &PublicParams) -> Result<&Fp8Verifier> {
         let device = statement.common().device;
         self.get(device)
-            .ok_or_else(|| anyhow!("no cached fp8 verifier setup for {device:?}; regenerate fp8_cache.bin with build_cache"))
+            .ok_or_else(|| anyhow!("no cached fp8 verifier setup for {device:?}; regenerate v4_cache.bin with build_cache"))
     }
 
     /// Verifies a published `(public_data, proof_data)` pair against the caller's

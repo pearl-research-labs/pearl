@@ -68,7 +68,7 @@ jobs:
       - name: Build project and generate verifier cache
         run: |
           cargo build --release
-          cargo run --release --bin build_cache src/v4/api/fp8_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
+          cargo run --release --bin build_cache src/v4/api/v4_cache.bin src/v2/circuit/v2_cache.bin src/v1/v1_cache.bin
           cargo build --release --features embedded_cache
 
       - name: Run tests
