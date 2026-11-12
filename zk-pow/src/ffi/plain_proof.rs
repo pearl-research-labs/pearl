@@ -18,7 +18,7 @@ use pearl_blake3::{BLAKE3_CHUNK_LEN, BLAKE3_DIGEST_SIZE};
 
 /// Merkle proof data for a single matrix.
 #[derive(Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MatrixMerkleProof"))]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MatrixMerkleProof", from_py_object))]
 pub struct MatrixMerkleProof {
     pub proof: MerkleProof,
     pub row_indices: Vec<usize>,
@@ -69,7 +69,7 @@ impl MatrixMerkleProof {
 /// This represents a proof before ZK transformation, containing the raw merkle
 /// proof data for both matrices A and B^T.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "PlainProof", get_all))]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "PlainProof", get_all, from_py_object))]
 pub struct PlainProof {
     // Shared fields (dense + MoE)
     pub m: usize,
@@ -85,7 +85,7 @@ pub struct PlainProof {
 
 /// MoE-specific proof parameters to be included in the `PlainProof` for MoE proofs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MoEProofParams", get_all))]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "MoEProofParams", get_all, from_py_object))]
 pub struct MoEProofParams {
     /// Total number of experts.
     pub e: usize,
