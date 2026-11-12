@@ -189,23 +189,31 @@ fn eval_columns_at_point_impl<F: RichField + Extendable<D>, const D: usize, cons
                     .iter()
                     .map(|&omega| (a - omega).square() - wb2)
                     .collect();
-                let inverse_norms = F::batch_multiplicative_inverse(&norms);
-                for (offset, (&omega, inv)) in roots.iter().zip(inverse_norms).enumerate() {
-                    let i = start + offset;
-                    let weight = inv * omega;
-                    // Wrap at the table boundary, not the chunk boundary.
-                    let next_i = (i + 1) & (n - 1);
-                    for (j, col) in col_slices.iter().enumerate() {
-                        accumulate_barycentric(&mut acc[j], weight, col[i], omega);
+                let mut weights = F::batch_multiplicative_inverse(&norms);
+                for (&omega, weight) in roots.iter().zip(&mut weights) {
+                    *weight *= omega;
+                }
+                // Reuse weights across columns and keep each column's running sums local.
+                for (j, col) in col_slices.iter().enumerate() {
+                    let mut sum = acc[j];
+                    let mut next_sum = if NEXT {
+                        acc[j + num_cols]
+                    } else {
+                        (F::ZERO, F::ZERO)
+                    };
+                    for (offset, (&omega, &weight)) in roots.iter().zip(&weights).enumerate() {
+                        let i = start + offset;
+                        accumulate_barycentric(&mut sum, weight, col[i], omega);
                         if NEXT {
+                            // Wrap at the table boundary, not the chunk boundary.
+                            let next_i = (i + 1) & (n - 1);
                             // f(g*z) reuses these weights with y_i replaced by y_(i+1).
-                            accumulate_barycentric(
-                                &mut acc[j + num_cols],
-                                weight,
-                                col[next_i],
-                                omega,
-                            );
+                            accumulate_barycentric(&mut next_sum, weight, col[next_i], omega);
                         }
+                    }
+                    acc[j] = sum;
+                    if NEXT {
+                        acc[j + num_cols] = next_sum;
                     }
                 }
                 acc
