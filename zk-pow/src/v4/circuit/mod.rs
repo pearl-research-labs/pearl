@@ -44,6 +44,7 @@ pub mod chip;
 pub mod circuit_utils;
 pub mod coefficient_stark;
 pub(crate) mod columns_view;
+pub mod config;
 #[cfg(test)]
 pub(crate) mod consistency;
 pub mod ctl;

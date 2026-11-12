@@ -105,10 +105,10 @@ fn committed_heights_match_the_device_inventory() {
     assert_eq!(lut_live_rows(LutTable::Width16), 1 << 16);
     assert_eq!(lut_live_rows(LutTable::Log16), 1 << 17);
     assert_eq!(lut_live_rows(LutTable::Fp32Tools), 780);
-    // Committed heights land on the consensus ladder: 2^17 -> 2^18, 2^14 -> 2^16,
+    // Committed heights land on the consensus ladder: 2^17 stays, 2^14 -> 2^16,
     // 601 and 780 -> 2^10, 20 -> 2^7.
-    assert_eq!(trace_padded_height(lut_live_rows(LutTable::RneRnd)), 1 << 18);
-    assert_eq!(trace_padded_height(lut_live_rows(LutTable::Log16)), 1 << 18);
+    assert_eq!(trace_padded_height(lut_live_rows(LutTable::RneRnd)), 1 << 17);
+    assert_eq!(trace_padded_height(lut_live_rows(LutTable::Log16)), 1 << 17);
     assert_eq!(trace_padded_height(lut_live_rows(LutTable::Pair128)), 1 << 16);
     assert_eq!(trace_padded_height(lut_live_rows(LutTable::Clamp22)), 1 << 10);
     assert_eq!(trace_padded_height(lut_live_rows(LutTable::Fp32Tools)), 1 << 10);

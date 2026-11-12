@@ -30,6 +30,10 @@ import (
 // exports matches the one it enforces.
 const MinNoiseRank = C.MIN_NOISE_RANK
 
+// Legacy proof-format checks already reject larger blobs. Retain the old limit
+// explicitly so raising the receipt limit is trivially consensus-neutral.
+const legacyMaxZKProofSize = 60000
+
 // ================================================================================
 // CERTIFICATE VERIFICATION
 // ================================================================================
@@ -41,6 +45,9 @@ const MinNoiseRank = C.MIN_NOISE_RANK
 // V2 certificates (CertificateV2) handle both MoE and non-MoE new proofs.
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
+	if err := checkProofSize(cert); err != nil {
+		return err
+	}
 	switch c := cert.(type) {
 	case *wire.CertificateV4:
 		return verifyCertificateV4(header, c)
@@ -53,6 +60,14 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	default:
 		return fmt.Errorf("unknown certificate type: %T", cert)
 	}
+}
+
+// checkProofSize preserves the historical size bound for versions before V4.
+func checkProofSize(cert wire.BlockCertificate) error {
+	if cert != nil && cert.Version() < wire.CertificateVersionV4 && len(cert.ProofBytes()) > legacyMaxZKProofSize {
+		return fmt.Errorf("v%d proof rejected: legacy proof data too large: %d bytes (max %d)", cert.Version(), len(cert.ProofBytes()), legacyMaxZKProofSize)
+	}
+	return nil
 }
 
 // ================================================================================

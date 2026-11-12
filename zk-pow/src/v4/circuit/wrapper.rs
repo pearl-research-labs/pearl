@@ -110,7 +110,7 @@ use super::ctl::{NUM_B200_ALL_TABLES, NUM_H100_ALL_TABLES, NUM_TABLES, Table};
 use super::driver::{Fp8System, V4_REACHABLE_DEGREE_BITS, fp8_universal_envelope, statement_digest_to_hash_out};
 use crate::v4::api::primitives::Hash256;
 use crate::v4::api::public_params::Device;
-use crate::v4::circuit::circuit_utils::build_recursion_config;
+use crate::v4::circuit::config::v4_recursion_config;
 
 /// The wrapper's field, extension degree and per-stage hasher configurations.
 pub type F = GoldilocksField;
@@ -120,8 +120,6 @@ pub const D: usize = 2;
 pub type InnerC = PoseidonGoldilocksConfig;
 /// Stage-2 (published) configuration: Blake3 outer hashing, like the deployed v2 layer 2.
 pub type OuterC = Blake3GoldilocksConfig;
-
-pub use super::circuit_utils::{STAGE_1_POW_BITS, STAGE_1_RATE_BITS, STAGE_2_POW_BITS, STAGE_2_RATE_BITS};
 
 /// Flat offset of batch position `position`'s STARK public inputs inside the wrapper's
 /// public-input vector (the batch tables' public inputs are the vector's prefix, in batch
@@ -225,7 +223,7 @@ impl Fp8WrapperCircuits {
         let envelope = fp8_universal_envelope(system.device());
 
         // ---- Stage 1: the universal batch verifier in-circuit. ----
-        let config_1 = build_recursion_config(STAGE_1_RATE_BITS, STAGE_1_POW_BITS, 1, false);
+        let config_1 = v4_recursion_config(1);
         let mut builder = CircuitBuilder::<F, D>::new(config_1);
         let starks = system.batch_starks();
         let preprocessed = system.preprocessed_verifier_data::<InnerC>(lut_cap);
@@ -306,7 +304,7 @@ impl Fp8WrapperCircuits {
         debug_assert!(stage1.common.degree_bits() <= 17, "V4 inner wrapper exceeds 2^17 rows");
 
         // ---- Stage 2: the ZK wrap. ----
-        let config_2 = build_recursion_config(STAGE_2_RATE_BITS, STAGE_2_POW_BITS, 2, true);
+        let config_2 = v4_recursion_config(2);
         debug_assert!(config_2.zero_knowledge);
         let mut builder = CircuitBuilder::<F, D>::new(config_2);
         let stage1_proof_target = builder.add_virtual_proof_with_pis(&stage1.common);
