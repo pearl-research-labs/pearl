@@ -49,8 +49,7 @@ fn bench_layer1_sweep() {
 
     // ---- Layer 0, once: its batch proof feeds every stage-1 repetition. ----
     let mut timing = TimingTree::new("sweep", log::Level::Info);
-    let (public, job, batch_proof) =
-        prove_batch_statement(&header, &plain, setup.device, &setup.preprocessed, &mut timing).expect("layer-0 prove");
+    let (public, job, batch_proof) = prove_batch_statement(&header, &plain, setup, &mut timing).expect("layer-0 prove");
     let digest = public.digest(&header);
     println!("SWEEP k={k} degree_bits={:?}", job.system.degree_bits());
 

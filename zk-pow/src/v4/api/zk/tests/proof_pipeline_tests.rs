@@ -20,7 +20,7 @@ fn api_roundtrip_and_tamper_rejection() {
 
     let (_, params) = plain.parse_proof(&header).expect("fixture job must parse");
     assert_eq!(params.common().device, Device::B200, "the wire byte must parse back");
-    let setup = NativeTestSetup::build(params.common().device, &mut timing).expect("prover setup");
+    let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
 
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
     assert_ne!(public.hash_jackpot(), [0u8; 32], "prove must ship the proven lottery digest");
@@ -57,7 +57,7 @@ fn asymmetric_api_roundtrip() {
 
     let (_, params) = plain.parse_proof(&header).expect("asymmetric fixture job must parse");
     assert_ne!(params.h(), params.w(), "the fixture must be asymmetric");
-    let setup = NativeTestSetup::build(params.common().device, &mut timing).expect("prover setup");
+    let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
 
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
 
@@ -75,7 +75,7 @@ fn k_mod_32_api_roundtrip() {
 
     let (_, params) = plain.parse_proof(&header).expect("k % 32 fixture job must parse");
     assert_eq!(params.common_dim() % 64, 32, "the fixture must exercise the k % 32 envelope");
-    let setup = NativeTestSetup::build(params.common().device, &mut timing).expect("prover setup");
+    let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
 
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
 
@@ -90,7 +90,7 @@ fn hopper_api_roundtrips_minimum_k_and_partial_window() {
     }
 
     let mut timing = TimingTree::default();
-    let setup = NativeTestSetup::build(Device::H100, &mut timing).expect("Hopper prover setup");
+    let setup = Fp8ProverSetup::build(Device::H100, &mut timing).expect("Hopper prover setup");
     assert_eq!(setup.device, Device::H100);
 
     for (header, plain) in jobs {
@@ -528,7 +528,7 @@ fn moe_api_roundtrip_and_tamper_rejection() {
     );
     assert_eq!(job.hash_routing(), Some(moe.hash_routing));
 
-    let setup = NativeTestSetup::build(params.common().device, &mut timing).expect("prover setup");
+    let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("MoE proving must succeed");
 
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest MoE proof must verify");
@@ -569,7 +569,7 @@ fn hopper_moe_api_roundtrip() {
     let mut timing = TimingTree::default();
     let (_, params) = plain.parse_proof(&header).expect("Hopper MoE fixture must parse");
     assert_eq!(params.common().device, Device::H100);
-    let setup = NativeTestSetup::build(Device::H100, &mut timing).expect("Hopper MoE prover setup");
+    let setup = Fp8ProverSetup::build(Device::H100, &mut timing).expect("Hopper MoE prover setup");
     let (public, proof) =
         zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("Hopper MoE proving must succeed");
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest Hopper MoE proof must verify");
