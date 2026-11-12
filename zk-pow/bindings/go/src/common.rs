@@ -67,7 +67,7 @@ pub(crate) unsafe fn set_error_msg(out: *mut c_char, msg: &str) {
     if out.is_null() {
         return;
     }
-    let buf = slice::from_raw_parts_mut(out as *mut u8, ERROR_MSG_MAX_SIZE);
+    let buf = slice::from_raw_parts_mut(out.cast::<u8>(), ERROR_MSG_MAX_SIZE);
     // Truncate at a UTF-8 char boundary that fits in ERROR_MSG_MAX_SIZE-1 bytes (reserve 1 for null)
     let max_len = ERROR_MSG_MAX_SIZE - 1;
     let mut end = msg.len().min(max_len);
