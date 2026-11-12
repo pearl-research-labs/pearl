@@ -321,6 +321,18 @@ fn matmul_fp8_windowed(
         }
         // Reuse these table rows across every output column.
         let products: Vec<_> = a_row.iter().map(|&a| &FP8_PRODUCTS[a as usize]).collect();
+        // A rank-32 replay is one FP8-only group, producing a normal FP32 value
+        // or zero. Its singleton re-sum only canonicalizes signed zero.
+        if k == MMA_GROUP_PRODUCTS && acc.is_none() && !record_partials && significand_width == B200_FP8_WIDTH {
+            for j in 0..n {
+                let b_col = &b[j * k..(j + 1) * k];
+                let values: [GFloat; MMA_GROUP_PRODUCTS] = core::array::from_fn(|k| products[k][b_col[k] as usize]);
+                let value: f32 = windowed_group_sum(&values, zero_exp, significand_width).into();
+                // The original singleton re-sum canonicalizes signed zero.
+                out[i * n + j] = if value == 0.0 { 0.0 } else { value };
+            }
+            continue;
+        }
         for j in 0..n {
             let b_col = &b[j * k..(j + 1) * k];
             // Seed the cell's accumulator with the carry-in (0 when absent).
