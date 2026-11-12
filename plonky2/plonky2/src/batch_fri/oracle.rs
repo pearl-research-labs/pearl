@@ -547,11 +547,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         slice_len: usize,
     ) -> &[F] {
         let point = index * step;
+        let bits = self.degree_bits[degree_bits_index] + self.rate_bits;
         let slice = if self.row_values.is_empty() {
-            let index = reverse_bits(point, self.degree_bits[degree_bits_index] + self.rate_bits);
+            let index = reverse_bits(point, bits);
             &self.batch_merkle_tree.leaves[degree_bits_index][index]
         } else {
-            self.row_values[degree_bits_index].row(point)
+            // Next-row SIMD lanes may straddle the domain boundary.
+            self.row_values[degree_bits_index].row(point & ((1 << bits) - 1))
         };
         &slice[slice_start..slice_start + slice_len]
     }
@@ -682,7 +684,7 @@ mod test {
             assert_eq!(ordinary.open_values(index), digests.open_values(index));
         }
         for (group, &bits) in ordinary.degree_bits.iter().enumerate() {
-            for point in 0..1 << (bits + 2) {
+            for point in 0..2 << (bits + 2) {
                 let expected = ordinary.get_lde_values(group, point, 1, 0, 2);
                 assert_eq!(digests.get_lde_values(group, point, 1, 0, 2), expected);
                 let leaf = point.reverse_bits() >> (usize::BITS as usize - bits - 2);
@@ -695,7 +697,8 @@ mod test {
         for oracle in [ordinary, digests] {
             for (group, &bits) in oracle.degree_bits.iter().enumerate() {
                 for step in [1, 2, 4] {
-                    for start in [0, (1 << (bits + 2)) / step - P::WIDTH] {
+                    let points = (1 << (bits + 2)) / step;
+                    for start in [0, points - P::WIDTH, points - 1, points, points + 1] {
                         for width in 0..=2 {
                             let expected =
                                 oracle.get_lde_values_packed::<P>(group, start, step, 0, width);
