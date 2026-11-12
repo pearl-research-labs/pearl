@@ -1,8 +1,9 @@
 //! V4 (FP8) Go FFI: ZK certificate verification ([`verify`]), plain-proof share validation
-//! ([`plain`]), and the read-only verifier cache the former uses.
+//! ([`plain`]), CPU mining ([`mine`]), and the read-only verifier cache.
 
 use zk_pow::v4::api::zk::Fp8VerifierCache;
 
+pub mod mine;
 pub mod plain;
 pub mod verify;
 

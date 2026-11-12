@@ -31,6 +31,7 @@ pub use v2::verify::{
 };
 pub use v2::{MINING_CONFIG_RESERVED_SIZE, MINING_CONFIG_SERIALIZED_SIZE, MIN_NOISE_RANK, PUBLICDATA_SIZE};
 
+pub use v4::mine::mine_v4;
 pub use v4::plain::verify_plain_proof_v4_ffi;
 pub use v4::verify::verify_zk_proof_v4;
 pub use v4::{V4_BLOCK_HEADER_SERIALIZED_SIZE, V4_MOE_PARAMS_MAX_NUM_EXPERTS, V4_PUBLIC_PARAMS_WIRE_SIZE};
