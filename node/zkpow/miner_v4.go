@@ -18,12 +18,16 @@ import (
 
 // MineV4 mines and ZK-proves a small dense V4 job entirely on CPU, using parent
 // as its ancestor. It retries random input commitments at header.Bits until one
-// wins. Use easy targets for regtest and integration tests: this blocking search
+// wins. Device selects the emulated device: 0 = H100, 1 = B200.
+// Use easy targets for regtest and integration tests: this blocking search
 // has no cancellation or attempt limit, and rebuilds prover setup on every call.
 // On success it sets header.ProofCommitment and returns the sealed certificate.
-func MineV4(header, parent *wire.BlockHeader) (*wire.CertificateV4, error) {
+func MineV4(header, parent *wire.BlockHeader, device int) (*wire.CertificateV4, error) {
 	if header == nil || parent == nil {
 		return nil, fmt.Errorf("V4 mining requires header and parent")
+	}
+	if device < 0 || device > 1 {
+		return nil, fmt.Errorf("unsupported V4 mining device %d (0 = H100, 1 = B200)", device)
 	}
 	var headerBuf, parentBuf bytes.Buffer
 	if err := header.Serialize(&headerBuf); err != nil {
@@ -41,6 +45,7 @@ func MineV4(header, parent *wire.BlockHeader) (*wire.CertificateV4, error) {
 	result := C.mine_v4(
 		(*C.uint8_t)(unsafe.Pointer(&headerBuf.Bytes()[0])),
 		(*C.uint8_t)(unsafe.Pointer(&parentBuf.Bytes()[0])),
+		C.uint8_t(device),
 		&out, &errorBuf[0],
 	)
 	if result != 0 {

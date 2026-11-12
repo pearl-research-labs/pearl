@@ -15,10 +15,10 @@ use crate::v4::api::{
     verify::verify_plain_proof,
 };
 
-/// Retries random dense 16x16x1024 B200-emulated jobs until one wins at
+/// Retries random dense 16x16x1024 jobs for `device` until one wins at
 /// `header.nbits`, using the immediate parent as ancestor. CPU-only; use easy
 /// targets, since the search has no attempt limit or cancellation.
-pub fn mine(header: &IncompleteBlockHeader, parent: &BlockHeader) -> Result<PlainProofV4> {
+pub fn mine(header: &IncompleteBlockHeader, parent: &BlockHeader, device: Device) -> Result<PlainProofV4> {
     const ROWS: usize = 16;
     const K: usize = 1024;
     ensure!(header.prev_block == parent.block_hash(), "V4 mining parent does not connect");
@@ -36,7 +36,7 @@ pub fn mine(header: &IncompleteBlockHeader, parent: &BlockHeader) -> Result<Plai
             k: K as u32,
             r: 32,
             quant: Quant::Fp8E4M3Prequant,
-            device: Device::B200,
+            device,
         },
         operands: Sides {
             a: operand.clone(),
@@ -97,7 +97,10 @@ mod tests {
             nbits: 0x1e0fffff, // About one quarter of 16x16x1024 tickets win.
             ..Default::default()
         };
-        let proof = mine(&header, &parent).unwrap();
-        verify_plain_proof(&header, &proof, None).unwrap();
+        for device in Device::ALL {
+            let proof = mine(&header, &parent, device).unwrap();
+            assert_eq!(proof.job.common.device, device);
+            verify_plain_proof(&header, &proof, None).unwrap();
+        }
     }
 }

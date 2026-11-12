@@ -6,11 +6,13 @@ use std::slice;
 use anyhow::{ensure, Result};
 use zk_pow::v4::api::mine::mine;
 use zk_pow::v4::api::primitives::{BlockHeader, IncompleteBlockHeader};
+use zk_pow::v4::api::public_params::Device;
 use zk_pow::v4::api::zk::Fp8Prover;
 
 use crate::common::{catch_panic, set_error_msg, CZKProof, MAX_ZK_PROOF_SIZE, PUBLICDATA_MAX_SIZE};
 
-/// Mines a fixed dense B200-emulated V4 job on CPU, then generates its ZK proof.
+/// Mines a fixed dense V4 job on CPU, then generates its ZK proof.
+/// `device` selects the emulated device: 0 = H100, 1 = B200.
 /// Random candidates are checked against the proposed header's nbits until one
 /// wins. Intended for easy regtest/integration targets; no GPU, attempt limit,
 /// cancellation, or optimized search. Prover setup is rebuilt on every call.
@@ -28,6 +30,7 @@ use crate::common::{catch_panic, set_error_msg, CZKProof, MAX_ZK_PROOF_SIZE, PUB
 pub unsafe extern "C" fn mine_v4(
     block_header: *const u8,
     parent_header: *const u8,
+    device: u8,
     zk_proof_out: *mut CZKProof,
     error_msg_out: *mut c_char,
 ) -> i32 {
@@ -44,11 +47,12 @@ pub unsafe extern "C" fn mine_v4(
         return 2;
     }
     let result = catch_panic(|| -> Result<()> {
+        let device = Device::try_from(device)?;
         // SAFETY: the caller supplies headers of the documented fixed wire sizes.
         let header =
             IncompleteBlockHeader::from_bytes(slice::from_raw_parts(block_header, IncompleteBlockHeader::SERIALIZED_SIZE))?;
         let parent = BlockHeader::from_bytes(slice::from_raw_parts(parent_header, BlockHeader::SERIALIZED_SIZE))?;
-        let plain = mine(&header, &parent)?;
+        let plain = mine(&header, &parent, device)?;
         let (public, proof) = Fp8Prover::setup(plain.job.common.device)?.prove(&header, &plain)?;
         ensure!(public.len() <= PUBLICDATA_MAX_SIZE, "V4 public data exceeds buffer");
         ensure!(proof.len() <= MAX_ZK_PROOF_SIZE, "V4 proof exceeds buffer");
