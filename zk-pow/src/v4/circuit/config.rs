@@ -9,9 +9,9 @@ use super::trace_padding::DEGREE_BITS as V4_REACHABLE_DEGREE_BITS;
 /// Builds the V4 inner (stage 1) or ZK outer (stage 2) configuration.
 /// Panics for any other stage.
 pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
-    let (pow_bits, rate_bits, num_query_rounds, num_routed_wires, is_zk, arity_bits) = match stage {
-        1 => (18, 3, 39, 37, false, 4),
-        2 => (23, 8, 14, 38, true, 3),
+    let (pow_bits, rate_bits, num_query_rounds, is_zk, num_routed_wires, arity_bits) = match stage {
+        1 => (18, 3, 39, false, 37, 4),
+        2 => (23, 8, 14, true, 38, 3),
         _ => panic!("V4 recursion stage must be 1 or 2"),
     };
     debug_assert!(pow_bits + rate_bits * num_query_rounds >= 135);
