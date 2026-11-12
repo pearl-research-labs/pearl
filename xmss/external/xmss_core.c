@@ -175,17 +175,28 @@ int xmss_core_sign(const xmss_params *params,
      * to be on the safe side (there is no index value left to indicate that the 
      * key is finished, hence external handling would be necessary)
      */ 
-    if (idx >= ((1ULL << params->full_height) - 1)) {
+    /* Whether this is the last usable index. The key is wiped when it is
+     * exhausted, but only once no signature is computed from it anymore:
+     * for idx == max a signature is still produced below, so the wipe of
+     * that case is deferred to the end of this function. Wiping here
+     * would destroy the key material the signature is computed from and
+     * corrupt the index copied into the signature. */
+    const int is_last = (idx == ((1ULL << params->full_height) - 1));
+    if (idx > ((1ULL << params->full_height) - 1)) {
         // Delete secret key here. We only do this in memory, production code
         // has to make sure that this happens on disk.
         memset(sk, 0xFF, params->index_bytes);
         memset(sk + params->index_bytes, 0, (params->sk_bytes - params->index_bytes));
-        if (idx > ((1ULL << params->full_height) - 1))
-            return -2; // We already used all one-time keys
-        if ((params->full_height == 64) && (idx == ((1ULL << params->full_height) - 1))) 
-                return -2; // We already used all one-time keys
+        return -2; // We already used all one-time keys
     }
-    
+    if ((params->full_height == 64) && is_last) {
+        // Delete secret key here. We only do this in memory, production code
+        // has to make sure that this happens on disk.
+        memset(sk, 0xFF, params->index_bytes);
+        memset(sk + params->index_bytes, 0, (params->sk_bytes - params->index_bytes));
+        return -2; // We already used all one-time keys
+    }
+
     memcpy(sm, sk, params->index_bytes);
 
     /*************************************************************************
@@ -223,6 +234,14 @@ int xmss_core_sign(const xmss_params *params,
         /* Compute the authentication path for the used WOTS leaf. */
         treehash(params, root, sm, sk_seed, pub_seed, idx_leaf, ots_addr);
         sm += params->tree_height*params->n;
+    }
+
+    if (is_last) {
+        // This was the last possible signature: delete the secret key.
+        // We only do this in memory, production code has to make sure
+        // that this happens on disk.
+        memset(sk, 0xFF, params->index_bytes);
+        memset(sk + params->index_bytes, 0, (params->sk_bytes - params->index_bytes));
     }
 
     return 0;
