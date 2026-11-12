@@ -102,12 +102,6 @@ jobs:
         # processes can exceed the GitHub runner's memory.
         run: cargo test --release --features embedded_cache -- --test-threads=1
 
-      - name: Test binaries
-        run: cargo test --bins --release --features embedded_cache
-
-      - name: Run doc tests
-        run: cargo test --doc --release --features embedded_cache
-
       - name: Test layout-macro
         run: |
           if [ -d "src/v1/layout_macro" ]; then

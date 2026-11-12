@@ -45,41 +45,26 @@ fn api_roundtrip_and_tamper_rejection() {
     assert!(verify_fp8_block(&public, &header, &tampered, &setup, None).is_err());
 }
 
-/// The padded-geometry wire-level round trip ([`fixture_job_asym`]: `h = 16 != w = 20`,
-/// `k = 2048` — a reference-legal job the pre-padding AIRs could not prove, since
-/// `h + w = 36` and `h*w = 320` are not powers of two). Exercises `derive` without the
-/// old envelope checks and every AIR's padding path through parse -> derive -> prove ->
-/// verify.
+/// Exercise padded asymmetric geometry (`h = 16`, `w = 20`, `k = 2048`) and
+/// partial Blake3 blocks (`k = 2080`) through parse -> derive -> prove -> verify.
 #[test]
-fn asymmetric_api_roundtrip() {
-    let (header, plain) = fixture_job_asym();
+fn b200_api_roundtrips_asymmetric_and_partial_window() {
+    let jobs = [fixture_job_asym(), fixture_job_k32()];
+    let (_, asymmetric) = jobs[0].1.parse_proof(&jobs[0].0).expect("asymmetric fixture job must parse");
+    assert_ne!(asymmetric.h(), asymmetric.w(), "the fixture must be asymmetric");
+    let (_, partial_window) = jobs[1].1.parse_proof(&jobs[1].0).expect("k % 32 fixture job must parse");
+    assert_eq!(
+        partial_window.common_dim() % 64,
+        32,
+        "the fixture must exercise the k % 32 envelope"
+    );
+
     let mut timing = TimingTree::default();
-
-    let (_, params) = plain.parse_proof(&header).expect("asymmetric fixture job must parse");
-    assert_ne!(params.h(), params.w(), "the fixture must be asymmetric");
-    let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
-
-    let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
-
-    verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
-}
-
-/// The `k % 32` wire-level round trip ([`fixture_job_k32`]: `k = 2080`, committed rows
-/// that never tile into whole 64-byte Blake3 blocks). Exercises the straddling-block
-/// schedule and the non-power-of-two row-mean scale derivation through parse -> derive ->
-/// prove -> verify.
-#[test]
-fn k_mod_32_api_roundtrip() {
-    let (header, plain) = fixture_job_k32();
-    let mut timing = TimingTree::default();
-
-    let (_, params) = plain.parse_proof(&header).expect("k % 32 fixture job must parse");
-    assert_eq!(params.common_dim() % 64, 32, "the fixture must exercise the k % 32 envelope");
-    let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
-
-    let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
-
-    verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
+    let setup = Fp8ProverSetup::build(asymmetric.common().device, &mut timing).expect("prover setup");
+    for (header, plain) in jobs {
+        let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
+        verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
+    }
 }
 
 #[test]
