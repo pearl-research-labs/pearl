@@ -126,7 +126,7 @@ use super::config::v4_stark_config;
 /// and degrees below 7→7. Witness and known-column generators share that rule.
 /// Coverage is asserted by `ladder_covers_the_envelope`; proofs cannot select a
 /// height outside these stops.
-pub use super::trace_padding::DEGREE_BITS as V4_REACHABLE_DEGREE_BITS;
+pub use super::trace_padding::V4_REACHABLE_DEGREE_BITS;
 
 /// Per-main-table inclusive degree-bits ranges `[lo, hi]` over the wire envelope, in
 /// canonical `Table` order — the rows of [`V4_REACHABLE_DEGREE_BITS`]'s table. Exactness

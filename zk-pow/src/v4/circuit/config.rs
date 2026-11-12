@@ -4,7 +4,7 @@ use plonky2::fri::{FriConfig, reduction_strategies::FriReductionStrategy};
 use plonky2::plonk::circuit_data::CircuitConfig;
 use starky::config::StarkConfig;
 
-use super::trace_padding::DEGREE_BITS as V4_REACHABLE_DEGREE_BITS;
+use super::trace_padding::V4_REACHABLE_DEGREE_BITS;
 
 /// Builds the V4 inner (stage 1) or ZK outer (stage 2) configuration.
 /// Panics for any other stage.
