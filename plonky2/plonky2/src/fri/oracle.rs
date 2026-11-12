@@ -193,6 +193,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             instance.oracles.len(),
             "Number of oracles mismatch"
         );
+        let batching_pow_witness =
+            crate::fri::batching_pow::prove::<F, C, D>(challenger, &fri_params.config);
         let alpha = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha);
 
@@ -254,7 +256,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             (lde_final_poly, lde_final_values)
         };
 
-        let fri_proof = {
+        {
             fri_proof::<F, C, D>(
                 &oracles
                     .par_iter()
@@ -264,12 +266,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 lde_final_values,
                 challenger,
                 fri_params,
+                batching_pow_witness,
                 final_poly_coeff_len,
                 max_num_query_steps,
                 timing,
             )
-        };
-
-        fri_proof
+        }
     }
 }

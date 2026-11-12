@@ -91,9 +91,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     }
 
     pub fn fri_verify_proof_of_work(&mut self, fri_pow_response: Target, config: &FriConfig) {
+        self.verify_proof_of_work(fri_pow_response, config.proof_of_work_bits);
+    }
+
+    pub fn verify_proof_of_work(&mut self, fri_pow_response: Target, proof_of_work_bits: u32) {
+        assert!(proof_of_work_bits < F::order().bits() as u32);
         self.assert_leading_zeros(
             fri_pow_response,
-            config.proof_of_work_bits + (64 - F::order().bits()) as u32,
+            proof_of_work_bits + (64 - F::order().bits()) as u32,
         );
     }
 
@@ -121,6 +126,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // Size of the LDE domain.
         let n = params.lde_size();
 
+        crate::fri::batching_pow::verify_batching_pow_target(
+            self,
+            challenges.batching_pow_response,
+            &params.config,
+        );
         with_context!(
             self,
             "check PoW",
@@ -211,6 +221,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         current_log_n = self.add(current_log_n, current_degree_bits);
         let min_log_n_to_support = params.config.rate_bits + min_degree_bits_to_support;
 
+        crate::fri::batching_pow::verify_batching_pow_target(
+            self,
+            challenges.batching_pow_response,
+            &params.config,
+        );
         with_context!(
             self,
             "check PoW",
@@ -685,6 +700,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             query_round_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness: (params.config.batching_proof_of_work_bits != 0)
+                .then(|| self.add_virtual_target()),
         }
     }
 

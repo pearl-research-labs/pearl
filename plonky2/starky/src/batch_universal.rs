@@ -500,6 +500,17 @@ where
     // FRI challenges, with a conditional Fiat-Shamir prefix: layer `i`'s
     // `observe(cap_i); β_i` reaches the sponge iff the layer is active.
     // ==========================================================================
+    let batching_pow_response = plonky2::fri::batching_pow::response_target(
+        builder,
+        &mut challenger,
+        proof.opening_proof.batching_pow_witness,
+        &config.fri_config,
+    );
+    plonky2::fri::batching_pow::verify_batching_pow_target(
+        builder,
+        batching_pow_response,
+        &config.fri_config,
+    );
     let fri_alpha = challenger.get_extension_challenge(builder);
     let mut fri_betas: Vec<ExtensionTarget<D>> = Vec::with_capacity(num_layers);
     for i in 0..num_layers {
@@ -1397,6 +1408,11 @@ where
     let cap_height = config.fri_config.cap_height;
     let rt = &proof.opening_proof;
     let tt = &target_proof.opening_proof;
+    match (tt.batching_pow_witness, rt.batching_pow_witness) {
+        (Some(t), Some(v)) => witness.set_target(t, v)?,
+        (None, None) => {}
+        _ => bail!("batching PoW witness does not match the trusted configuration"),
+    }
     ensure!(rt.commit_phase_merkle_caps.len() <= arities.len());
     let pad = arities.len() - rt.commit_phase_merkle_caps.len();
     let job_max = proof.degree_bits.iter().copied().max().unwrap();
@@ -1576,6 +1592,7 @@ mod tests {
                 rate_bits: 1,
                 cap_height: 2,
                 proof_of_work_bits: 8,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::ConstantArityBits(1, 4),
                 num_query_rounds: 40,
             },
@@ -1622,7 +1639,15 @@ mod tests {
     /// batch order and merged alpha-run sourcing.
     #[test]
     fn test_universal_batch_stark_full_system() -> Result<()> {
-        let config = test_config();
+        full_system(0)
+    }
+    #[test]
+    fn test_universal_batch_stark_with_batching_pow() -> Result<()> {
+        full_system(4)
+    }
+    fn full_system(batching_bits: u32) -> Result<()> {
+        let mut config = test_config();
+        config.fri_config.batching_proof_of_work_bits = batching_bits;
         let stark_a = BatchLookingStark::<F, D>::new();
         let stark_b = BatchLookedStark::<F, D>::new(true);
         let stark_c = SquareStark::<F, D>::new();

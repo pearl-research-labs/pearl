@@ -118,13 +118,12 @@ class _FusedGemmSm90(_RegisterAccFusedGemm, GemmSm90):
         self.tile_m, self.tile_n = tile_m, tile_n
         self.atom_m = self.atom_layout_mnk[0]
         self.mma_m_per_wg = tile_m // (WGMMA_M * self.atom_m)
-        # WGMMA fragments split accumulator rows across lanes: only the
-        # 4-row family's mod-8 column pairs are foldable thread-locally.
+        # The quad exchange yields one word per lane only for the 4-row family.
         assert ltile_rows == LTILE_ROWS, (
             f"the SM90 lottery implements only the {LTILE_ROWS}-row tile family, got {ltile_rows}"
         )
         self.ltile_rows = LTILE_ROWS
-        # Merged lottery tile: 4 x ltile_cols, 16 thread-local subtiles of
+        # Merged lottery tile: 4 x ltile_cols, 16 consecutive subtiles of
         # 1 x (ltile_cols/4). The job commits the width (``select_tile``
         # prefers the narrowest); the kernel accepts every supported width.
         assert ltile_cols in SUPPORTED_LTILE_COLS[LTILE_ROWS], (

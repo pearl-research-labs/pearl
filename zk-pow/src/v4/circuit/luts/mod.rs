@@ -4,9 +4,9 @@
 //! [`ctl`] declares their CTL halves, and [`witness`] checks lookups and counts multiplicities.
 //! Complete channels are assembled in [`super::ctl`].
 //!
-//! Each [`LutTable`] has its own batch AIR at its natural height [`lut_height`].
-//! Batch FRI sorts heights internally. A LUT AIR has no constraints of its own;
-//! its columns split into two classes:
+//! Each [`LutTable`] has its own batch AIR — a [`LutStark`] padded from [`lut_live_rows`]
+//! to the next supported trace height. Batch FRI sorts heights internally. A LUT AIR has
+//! no constraints of its own; its columns split into two classes:
 //!
 //! - **Precommitted columns** (class (c)): the key column(s) — a plain ramp for tables whose
 //!   key domain fills the height, the enumerated key tuple for BYTES2/PAIR128/FP32TOOLS/LOG16,
@@ -53,9 +53,7 @@ pub mod stark;
 pub mod witness;
 
 pub use super::ctl::lut_cross_table_lookups;
-pub use columns::{
-    LutSlotLayout, lut_height, lut_num_columns, lut_slot_layout, num_precommitted_columns, num_slots, slot_height,
-};
+pub use columns::{LutSlotLayout, lut_live_rows, lut_num_columns, lut_slot_layout, num_precommitted_columns, num_slots};
 pub use ctl::ctl_looked_lut_slot;
 pub use stark::{
     B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Int8DecStark, Log16Stark, LutStark, Pair128Stark,

@@ -55,6 +55,7 @@
 //! A complete batch proof also includes the B200ALIGN, POW2GB, WIDTH32, and RC16 relations
 //! declared in `super::ctl`.
 
+use crate::v4::circuit::trace_padding::trace_padded_height;
 use core::borrow::Borrow;
 use std::marker::PhantomData;
 
@@ -138,11 +139,11 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulStarkB200<F, D> {
         self.h * self.w * self.rows_per_cell()
     }
 
-    /// Trace height: the cell rows padded to the next power of two with single-row phantom
+    /// Trace height: the cell rows padded to the next supported height with single-row phantom
     /// cells (all-zero, `is_padding = is_cell_final = 1`; the coordinate walk continues at
     /// position `h*w + t`).
     pub fn num_rows(&self) -> usize {
-        self.live_rows().next_power_of_two()
+        trace_padded_height(self.live_rows())
     }
 
     /// The geometry public inputs the MS schedule constraints read:
@@ -1420,7 +1421,7 @@ mod tests {
         // MS9: raising IS_PADDING before the onset is rejected (the flag may change only
         // entering position H*W).
         let mut t = rows.clone();
-        for row in t.iter_mut().skip(rows.len() - 2) {
+        for row in t.iter_mut().skip(stark.live_rows() - 2) {
             row[m.is_padding] = F::ONE;
         }
         assert!(violates(&t), "MS9 early padding onset undetected");
@@ -1491,7 +1492,7 @@ mod tests {
             &test_lambdas(program.w * program.k, 0x9FB21C651E98DF25),
         );
         assert_eq!(program.live_rows(), 60);
-        assert_eq!(rows.len(), 64);
+        assert_eq!(rows.len(), 128);
         assert_eq!(pis, program.public_inputs());
         let m = &MATMUL_B200_COL_MAP;
         let hw = program.h * program.w;

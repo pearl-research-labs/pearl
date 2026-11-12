@@ -30,6 +30,7 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
         commit_phase_merkle_caps: &[MerkleCap<F, C::Hasher>],
         final_poly: &PolynomialCoeffs<F::Extension>,
         pow_witness: F,
+        batching_pow_witness: Option<F>,
         degree_bits: usize,
         config: &FriConfig,
         final_poly_coeff_len: Option<usize>,
@@ -40,6 +41,8 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
     {
         let num_fri_queries = config.num_query_rounds;
         let lde_size = 1 << (degree_bits + config.rate_bits);
+        let batching_pow_response =
+            crate::fri::batching_pow::response(self, batching_pow_witness, config);
         // Scaling factor to combine polynomials.
         let fri_alpha = self.get_extension_challenge::<D>();
 
@@ -82,6 +85,7 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
 
         FriChallenges {
             fri_alpha,
+            batching_pow_response,
             fri_betas,
             fri_pow_response,
             fri_query_indices,
@@ -104,9 +108,16 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
         commit_phase_merkle_caps: &[MerkleCapTarget],
         final_poly: &PolynomialCoeffsExtTarget<D>,
         pow_witness: Target,
+        batching_pow_witness: Option<Target>,
         inner_fri_config: &FriConfig,
     ) -> FriChallengesTarget<D> {
         let num_fri_queries = inner_fri_config.num_query_rounds;
+        let batching_pow_response = crate::fri::batching_pow::response_target(
+            builder,
+            self,
+            batching_pow_witness,
+            inner_fri_config,
+        );
         // Scaling factor to combine polynomials.
         let fri_alpha = self.get_extension_challenge(builder);
 
@@ -130,6 +141,7 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
 
         FriChallengesTarget {
             fri_alpha,
+            batching_pow_response,
             fri_betas,
             fri_pow_response,
             fri_query_indices,

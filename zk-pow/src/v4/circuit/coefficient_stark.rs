@@ -22,8 +22,8 @@
 //!
 //! # CTL contract and schedule
 //!
-//! The trace has `(h+w)*k/8` live rows, first A blocks then B blocks, padded to a power
-//! of two. Verifier-known `(block_key,is_live)` columns fix the enumeration. Padding
+//! The trace has `(h+w)*k/8` live rows, first A blocks then B blocks, padded to the next
+//! supported height. Verifier-known `(block_key,is_live)` columns fix the enumeration. Padding
 //! uses `alpha=1, scale=0`, hence a zero coefficient, and emits no CTL tuple.
 //!
 //! Each live row exports
@@ -55,6 +55,7 @@ use starky::stark::Stark;
 use super::columns_view::columns_view;
 use super::fp32::{Round32Columns, evaluate_rounding, rounding_lookups};
 use super::luts::ctl::LutLookup;
+use crate::v4::circuit::trace_padding::trace_padded_height;
 use crate::v4::circuit::utils::evaluator::Evaluator;
 use crate::v4::circuit::utils::native_evaluator::NativeEvaluator;
 use crate::v4::circuit::utils::symbolic_evaluator::SymbolicEvaluator;
@@ -122,9 +123,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CoefficientStark<F, D> {
         }
     }
 
-    /// Geometry-derived trace height, including power-of-two padding.
+    /// Geometry-derived trace height, including supported-height padding.
     pub fn num_rows(&self) -> usize {
-        self.live_blocks.next_power_of_two()
+        trace_padded_height(self.live_blocks)
     }
 
     pub fn known_values(&self) -> Vec<PolynomialValues<F>> {
@@ -150,7 +151,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CoefficientStark<F, D> {
             blocks.len() == self.live_blocks,
             "coefficient block count differs from geometry"
         );
-        (0..self.live_blocks.next_power_of_two())
+        (0..self.num_rows())
             .map(|index| {
                 let [alpha, scale] = blocks.get(index).copied().unwrap_or([0x3f80, 0]);
                 let alpha_exponent = u64::from(alpha >> 7);

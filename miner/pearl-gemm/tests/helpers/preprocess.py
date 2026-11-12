@@ -65,8 +65,8 @@ def tall_tile_config(k: int, r: int = R, device: Device = Device.BLACKWELL) -> M
     """16x32 merged tile (mixed_gemm's ltile_rows=16, ltile_cols=32 variant).
 
     Same 512-element area as 4x128 (difficulty-invariant) but rows+cols = 48,
-    so the peel proof fits the verifier's 2^22 element limit up to k = 65536
-    (vs 31744 for 4x128). One consecutive 32-cell chunk per row gives
+    so the peel proof fits the verifier's 4 MiB worker input up to k = 43520
+    (vs 15872 for 4x128). One consecutive 32-cell chunk per row gives
     16 message words.
     """
     return tall_tile_mining_config(k, r, device)

@@ -8,11 +8,11 @@ use plonky2::field::types::{Field, Field64, PrimeField64};
 
 use super::super::unpredictability::{GAUSSIAN_CLASS_HEIGHT, LOG16_LOGARITHM_ROWS, NUM_GAUSSIAN_CLASSES};
 use super::LutTable;
-use super::columns::{lut_height, num_slots, slot_height};
-use starky::lookup::Column;
-
+use super::columns::{lut_live_rows, num_slots};
 use super::ctl::LutLookup;
 use super::stark::generate;
+use crate::v4::circuit::trace_padding::trace_padded_height;
+use starky::lookup::Column;
 
 /// The per-proof half of the committed oracle: for every table, one count column per slot —
 /// `counts[device LUT position][slot][row]`. Filled by
@@ -29,7 +29,7 @@ impl LutMultiplicities {
     pub fn new(tables: &[LutTable]) -> Self {
         let counts = tables
             .iter()
-            .map(|&t| vec![vec![0u64; lut_height(t)]; num_slots(t)])
+            .map(|&t| vec![vec![0u64; trace_padded_height(lut_live_rows(t))]; num_slots(t)])
             .collect();
         Self {
             tables: tables.to_vec(),
@@ -58,10 +58,10 @@ impl LutMultiplicities {
             Ok((slot, row))
         };
         let single_slot = |row: u64| -> Result<(usize, usize), String> {
-            if (row as usize) < slot_height(table) {
+            if (row as usize) < lut_live_rows(table) {
                 Ok((0, row as usize))
             } else {
-                Err(format!("{table:?} key {row} out of domain [0, {})", slot_height(table)))
+                Err(format!("{table:?} key {row} out of domain [0, {})", lut_live_rows(table)))
             }
         };
         let expected_keys = match table {
@@ -128,7 +128,7 @@ impl LutMultiplicities {
             // WIDTH32's stored key is the shifted ramp [1, 32]: row = key - 1. Key 0 has no
             // row — this is the "no zero-width claim" soundness point.
             LutTable::Width32 => {
-                if (1..=slot_height(table) as u64).contains(&keys[0]) {
+                if (1..=lut_live_rows(table) as u64).contains(&keys[0]) {
                     Ok((0, keys[0] as usize - 1))
                 } else {
                     Err(format!("WIDTH32 key {} out of domain [1, 32]", keys[0]))

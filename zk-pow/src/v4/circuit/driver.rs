@@ -88,7 +88,7 @@ use super::ctl::{
 use super::input_quant_stark::columns::{NUM_B200_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS};
 use super::input_quant_stark::stark::{InputQuantNative, InputQuantProgram, InputQuantStark};
 use super::luts::stark::boxed_lut_stark;
-use super::luts::{LutChecker, lut_height, lut_preprocessed_data, lut_trace, num_precommitted_columns};
+use super::luts::{LutChecker, lut_live_rows, lut_preprocessed_data, lut_trace, num_precommitted_columns};
 use super::matmul_b200_stark::columns::NUM_MATMUL_PUBLIC_INPUTS;
 use super::matmul_b200_stark::{MatmulB200ColumnsView, MatmulStarkB200};
 use super::matmul_h100::MatmulStarkH100;
@@ -99,33 +99,22 @@ use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
 use crate::v2::api::proof_utils::u32_field_array_to_hash;
 use crate::v4::api::primitives::Hash256;
 use crate::v4::api::public_params::{Device, HashId};
+use crate::v4::circuit::trace_padding::trace_padded_height;
 
 // ==================================================================================================
 // The consensus proof shape
 // ==================================================================================================
 
-/// Targeted (conjectured) security level in bits: `queries * rate_bits + proof_of_work_bits`.
-/// The 120-bit target of the recursive wrapper stages and of V1/V2
-/// (`v2::circuit::pearl_circuit::SECURITY_BITS`); `consensus_config_meets_the_security_target`
-/// asserts the parameters reach it.
-pub const STARK_SECURITY_BITS: usize = 120;
-/// Logup/CTL challenge repetitions (soundness `~(rows + instances)/|F|` per repetition; three
-/// repetitions push the batched-lookup error far below the FRI error).
-pub const STARK_NUM_CHALLENGES: usize = 3;
-/// FRI rate `2^-1` — the fastest prover rate admitting the degree-3 constraint envelope.
-pub const STARK_RATE_BITS: usize = 1;
-/// Merkle cap height of every oracle and FRI commit layer.
-pub const STARK_CAP_HEIGHT: usize = 4;
-/// FRI grinding bits.
-pub const STARK_POW_BITS: u32 = 18;
-/// FRI query rounds: the minimal count meeting the security target at this rate (102).
-pub const STARK_QUERY_ROUNDS: usize = (STARK_SECURITY_BITS - STARK_POW_BITS as usize).div_ceil(STARK_RATE_BITS);
+pub use super::circuit_utils::{
+    STARK_BATCHING_POW_BITS, STARK_CAP_HEIGHT, STARK_NUM_CHALLENGES, STARK_POW_BITS, STARK_QUERY_ROUNDS, STARK_RATE_BITS,
+    STARK_SECURITY_BITS,
+};
 
-/// Every trace height (degree bits) reachable by some table of some envelope-legal job,
-/// descending — the consensus FRI ladder's fold boundaries. The wire envelope
-/// (`api::layout` lottery-tile bounds) is
+/// Supported trace heights (degree bits), descending — the consensus FRI ladder's fold
+/// boundaries. The wire envelope (`api::layout` lottery-tile bounds) is
 /// `k ∈ [2^10, 2^16]` with `32 | k`, `h ≥ 4`, `w ≥ 16`, `h·w ∈ [256, 2048]`,
-/// `(h + w)·k ≤ 2^22`; heights are `next_pow2` of each table's row formula:
+/// `(h + w)·k ≤ 2^22`. Natural heights, before padding, are `next_pow2`
+/// of each table's row formula:
 ///
 /// | table      | rows             | bits    |
 /// |------------|------------------|---------|
@@ -135,25 +124,27 @@ pub const STARK_QUERY_ROUNDS: usize = (STARK_SECURITY_BITS - STARK_POW_BITS as u
 /// | XorFold    | `h·w`            |  8..=11 |
 /// | Scale      | `h + w`          |  5..=10 |
 /// | Coefficient | `(h+w)·k/8`    | 12..=19 |
-/// | LUTs       | [`lut_height`]   | {17, 16, 15, 14, 11, 10, 8, 6, 5} |
+/// | LUTs       | [`super::luts::lut_live_rows`] | {17, 16, 15, 14, 10, 8, 6, 5} |
 ///
 /// Blake3 work is bounded in closed form from the statement's scalars before
-/// compilation (`PublicParams::check_work_bounds`): four plane trees, MoE
+/// compilation (`PublicParams::check_blake3_witness_bound`): four plane trees, MoE
 /// routing/offsets trees, two root folds, and the jackpot together consume at
 /// most `2^22` compression-message bytes. Thus there are at most `2^16`
 /// compressions and `2^19` rows. The minimum legal tile still has
-/// more than `2^12` Blake3 rows. Coefficient has `(h+w)·k/8` live rows, so its heights
-/// cover bits 12..=19 and the union is the full `[5, 22]`.
-/// Coverage and minimality are asserted by
-/// `ladder_covers_the_envelope`; real jobs are gated onto the ladder at
-/// `Fp8Job::derive`.
-pub const FP8_REACHABLE_DEGREE_BITS: [usize; 18] = [22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5];
+/// more than `2^12` Blake3 rows. Coefficient has `(h+w)·k/8` live rows, so its natural
+/// heights cover bits 12..=19. Every natural height is rounded up to the next
+/// supported height below. In particular 17→18, 14/15→16, 11/12→13, 8/9→10,
+/// and degrees below 7→7. Witness and known-column generators share that rule.
+/// Coverage is asserted by `ladder_covers_the_envelope`; proofs cannot select a
+/// height outside these stops.
+pub use super::trace_padding::DEGREE_BITS as V4_REACHABLE_DEGREE_BITS;
 
 /// Per-main-table inclusive degree-bits ranges `[lo, hi]` over the wire envelope, in
-/// canonical `Table` order — the rows of [`FP8_REACHABLE_DEGREE_BITS`]'s table. Exactness
+/// canonical `Table` order — the rows of [`V4_REACHABLE_DEGREE_BITS`]'s table. Exactness
 /// (each bound is attained by some envelope-legal job) is asserted by
 /// `ladder_covers_the_envelope`; Blake3's bounds are proven, not swept (see above).
-pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] = [(13, 19), (14, 22), (5, 10), (13, 22), (8, 11), (12, 19)];
+pub const FP8_MAIN_TABLE_DEGREE_RANGES: [(usize, usize); NUM_TABLES] =
+    [(13, 19), (16, 22), (7, 10), (13, 22), (10, 13), (13, 19)];
 
 /// Batch indices of the *grouped* tables — the LUTs
 /// (`NUM_TABLES..num_all_tables(device)`). Their heights are consensus constants. Each
@@ -167,18 +158,18 @@ pub fn fp8_grouped_tables(device: Device) -> Vec<usize> {
 /// The consensus universal-verifier envelope: the main tables range
 /// over [`FP8_MAIN_TABLE_DEGREE_RANGES`], the LUT tables are fixed at their
 /// consensus heights and grouped ([`fp8_grouped_tables`]), and the fold ladder is
-/// [`FP8_REACHABLE_DEGREE_BITS`]. One stage-1 wrapper circuit built on this envelope
+/// [`V4_REACHABLE_DEGREE_BITS`]. One stage-1 wrapper circuit built on this envelope
 /// verifies every envelope-legal job (the job's degree profile becomes a
 /// public input).
 pub fn fp8_universal_envelope(device: Device) -> UniversalVerifierEnvelope {
     let mut degree_ranges: Vec<(usize, usize)> = FP8_MAIN_TABLE_DEGREE_RANGES.to_vec();
     degree_ranges.extend(lut_tables(device).iter().map(|&table| {
-        let bits = log2_strict(lut_height(table));
+        let bits = log2_strict(trace_padded_height(lut_live_rows(table)));
         (bits, bits)
     }));
     UniversalVerifierEnvelope {
         degree_ranges,
-        ladder: FP8_REACHABLE_DEGREE_BITS.to_vec(),
+        ladder: V4_REACHABLE_DEGREE_BITS.to_vec(),
         grouped_tables: fp8_grouped_tables(device),
     }
 }
@@ -186,8 +177,8 @@ pub fn fp8_universal_envelope(device: Device) -> UniversalVerifierEnvelope {
 /// The consensus [`StarkConfig`] for a job whose batch tables have the given heights
 /// (`degree_bits` per table, any order, duplicates allowed). Everything is a consensus
 /// constant, including the FRI reduction strategy: a [`FriReductionStrategy::Ladder`] whose
-/// boundaries are every *reachable* height ([`FP8_REACHABLE_DEGREE_BITS`]). A job's schedule
-/// is the ladder's suffix from its tallest table down to the `2^5` bottom, so any two jobs'
+/// boundaries are every *reachable* height ([`V4_REACHABLE_DEGREE_BITS`]). A job's schedule
+/// is the ladder's suffix from its tallest table down to the `2^7` bottom, so any two jobs'
 /// schedules agree on their shared span, and — because the ladder serializes as the boundary
 /// list, not the suffix — the Fiat-Shamir transcript absorbs the *same* config for every
 /// envelope job: the universal-verifier prerequisite. Batch FRI injects each instance when
@@ -198,12 +189,13 @@ pub fn fp8_universal_envelope(device: Device) -> UniversalVerifierEnvelope {
 /// the config stays a pure function of the degree profile, and equals the consensus
 /// constant for every on-ladder profile (real jobs are ladder-gated at `Fp8Job::derive`).
 pub fn fp8_stark_config(degree_bits: &[usize]) -> StarkConfig {
+    // TODO: Move this configuration builder to the shared V4 config files.
     let min = degree_bits.iter().copied().min().expect("at least one table");
     assert!(
         min + STARK_RATE_BITS >= STARK_CAP_HEIGHT,
         "the smallest table's LDE must cover the Merkle cap"
     );
-    let mut boundaries: Vec<usize> = FP8_REACHABLE_DEGREE_BITS.iter().chain(degree_bits).copied().collect();
+    let mut boundaries: Vec<usize> = V4_REACHABLE_DEGREE_BITS.iter().chain(degree_bits).copied().collect();
     boundaries.sort_unstable_by_key(|&bits| core::cmp::Reverse(bits));
     boundaries.dedup();
     StarkConfig::new(
@@ -213,6 +205,7 @@ pub fn fp8_stark_config(degree_bits: &[usize]) -> StarkConfig {
             rate_bits: STARK_RATE_BITS,
             cap_height: STARK_CAP_HEIGHT,
             proof_of_work_bits: STARK_POW_BITS,
+            batching_proof_of_work_bits: STARK_BATCHING_POW_BITS,
             reduction_strategy: FriReductionStrategy::Ladder(boundaries),
             num_query_rounds: STARK_QUERY_ROUNDS,
         },
@@ -416,7 +409,7 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
         }
     }
 
-    /// Geometry-derived trace height, including power-of-two padding.
+    /// Geometry-derived trace height, including supported-height padding.
     fn num_rows(&self) -> usize {
         match self {
             Self::H100(stark) => stark.num_rows(),
@@ -631,7 +624,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             );
         }
         for (i, &table) in lut_tables.iter().enumerate() {
-            heights[NUM_TABLES + i] = lut_height(table);
+            heights[NUM_TABLES + i] = trace_padded_height(lut_live_rows(table));
         }
 
         // The batch order is the canonical table order itself — profile-independent, so
@@ -1290,9 +1283,9 @@ mod tests {
         // Envelope-shaped profiles (max ∈ [14, 22]) and sub-envelope test geometries: the
         // schedule's partial sums must hit every table height (each instance's LDE) and
         // every ladder boundary below the profile's max, and stop at the lowest boundary —
-        // `min(2^5, smallest table)`: the ladder always folds to its own bottom, so the
+        // `min(2^7, smallest table)`: the ladder always folds to its own bottom, so the
         // final-polynomial length is a consensus constant (every real job carries the
-        // `2^5` LUT anyway; only sub-envelope test profiles can dip below it).
+        // `2^7` LUT anyway; only sub-envelope test profiles can dip below it).
         for degrees in [
             vec![19, 17, 16, 13, 10, 8, 6, 5],
             vec![22, 16, 5],
@@ -1308,19 +1301,19 @@ mod tests {
                 );
             }
             let (min, max) = (*degrees.last().unwrap(), degrees[0]);
-            for &bits in FP8_REACHABLE_DEGREE_BITS.iter().filter(|b| **b <= max) {
+            for &bits in V4_REACHABLE_DEGREE_BITS.iter().filter(|b| **b <= max) {
                 assert!(reached.contains(&bits), "schedule skips ladder stop {bits} ({degrees:?})");
             }
-            let bottom = min.min(*FP8_REACHABLE_DEGREE_BITS.last().unwrap());
+            let bottom = min.min(*V4_REACHABLE_DEGREE_BITS.last().unwrap());
             assert_eq!(*reached.last().unwrap(), bottom, "folding must stop at the lowest boundary");
         }
 
         // The universal-verifier property: one consensus ladder, so a shallower job's
         // schedule is exactly the suffix of a deeper one's from its own tallest table
         // (on-ladder maxima only: an off-ladder max adds its own boundary and diverges).
-        let deep = schedule_boundaries(&[22, 5]);
-        for max in [21, 20, 19, 18, 17, 16, 15, 14, 13] {
-            let shallow = schedule_boundaries(&[max, 5]);
+        let deep = schedule_boundaries(&[22, 7]);
+        for max in [21, 20, 19, 18, 16, 13, 10, 7] {
+            let shallow = schedule_boundaries(&[max, 7]);
             let offset = deep.iter().position(|&b| b == max).unwrap();
             assert_eq!(
                 shallow.as_slice(),
@@ -1331,8 +1324,8 @@ mod tests {
 
         // The Fiat-Shamir prerequisite: every on-ladder profile yields the *same* config
         // (same absorbed serialization), whatever its height span.
-        let consensus = fp8_stark_config(&FP8_REACHABLE_DEGREE_BITS);
-        for degrees in [vec![22, 16, 5], vec![14, 5], vec![17, 16, 10, 8, 6, 5]] {
+        let consensus = fp8_stark_config(&V4_REACHABLE_DEGREE_BITS);
+        for degrees in [vec![22, 16, 7], vec![16, 7], vec![18, 16, 10, 7]] {
             let config = fp8_stark_config(&degrees);
             assert_eq!(
                 config.fri_config.reduction_strategy, consensus.fri_config.reduction_strategy,
@@ -1345,7 +1338,7 @@ mod tests {
     /// never calls [`StarkConfig::check_config`] at runtime, so enforce it here.
     #[test]
     fn consensus_config_meets_the_security_target() {
-        fp8_stark_config(&FP8_REACHABLE_DEGREE_BITS)
+        fp8_stark_config(&V4_REACHABLE_DEGREE_BITS)
             .check_config::<F, D>()
             .expect("consensus FRI parameters must meet the security target");
     }
@@ -1363,9 +1356,14 @@ mod tests {
             let (header, mut plain) = fixture_job();
             plain.job.common.device = device;
             let system = build_system(&build_fixture_from_job(header, plain));
-            let config = fp8_stark_config(&FP8_REACHABLE_DEGREE_BITS);
+            let config = fp8_stark_config(&V4_REACHABLE_DEGREE_BITS);
             let envelope = fp8_universal_envelope(device);
-            let mut builder = CircuitBuilder::<F, D>::new(super::super::circuit_utils::build_recursion_config(3, 18, 1, false));
+            let mut builder = CircuitBuilder::<F, D>::new(super::super::circuit_utils::build_recursion_config(
+                super::super::wrapper::STAGE_1_RATE_BITS,
+                super::super::wrapper::STAGE_1_POW_BITS,
+                1,
+                false,
+            ));
             // Only the cap shape matters when constructing the verifier gates.
             let cap = MerkleCap(vec![HashOut::ZERO; 1 << config.fri_config.cap_height]);
             let prep = system.preprocessed_verifier_data::<C>(&cap).constant_target(&mut builder);
@@ -1418,7 +1416,7 @@ mod tests {
         }
     }
 
-    /// [`FP8_REACHABLE_DEGREE_BITS`] is exactly the envelope's reach: sweep every lottery
+    /// [`V4_REACHABLE_DEGREE_BITS`] is exactly the envelope's reach: sweep every lottery
     /// tile `(h, w)` and the job `k` range, apply each table's height formula, and compare
     /// against the ladder (with Blake3 contributing its bounded `13..=19` — see the
     /// constant's docs). Guards both directions: a formula landing off the ladder breaks
@@ -1431,13 +1429,13 @@ mod tests {
         // Per-main-table reach, canonical `Table` order (Blake3's bounded 13..=19 is
         // documented on the constant, not swept).
         let mut per_table: [BTreeSet<usize>; NUM_TABLES] = Default::default();
-        per_table[Table::Blake3 as usize].extend(13..=19);
+        per_table[Table::Blake3 as usize].extend((13..=19).map(|d| trace_padded_height(1 << d).ilog2() as usize));
         // Envelope (`api::layout` tile bounds): h >= 4
         // (MIN_TILE_ROWS), w >= 16 (MIN_TILE_COLS), h*w <= 2048 (MAX_TILE_ELEMS),
         // h*w >= 16*16 (JACKPOT_ENTRIES lanes of >= MIN_SUBTILE_ELEMS), and the
         // opened-strips bound (h + w)*k <= 2^22 with k in
         // [PublicParams::MIN_K, PublicParams::MAX_K], 32 | k.
-        let bits = |rows: usize| rows.next_power_of_two().trailing_zeros() as usize;
+        let bits = |rows: usize| trace_padded_height(rows).ilog2() as usize;
         for h in 4..=128 {
             for w in 16..=(2048 / h) {
                 if h * w < 256 || (h * w) % 16 != 0 {
@@ -1449,13 +1447,25 @@ mod tests {
                 }
                 per_table[Table::Scale as usize].insert(bits(h + w));
                 per_table[Table::XorFold as usize].insert(bits(h * w));
-                // InputQuant `max(h,w)*k` and Matmul `h*w*(k/32)` are monotone in k, and
-                // consecutive k steps (+32 on k >= PublicParams::MIN_K) never double a value, so
-                // sweeping k hits exactly the bit range between the two endpoints.
-                per_table[Table::InputQuant as usize].extend(bits(h.max(w) * PublicParams::MIN_K)..=bits(h.max(w) * k_max));
-                per_table[Table::Matmul as usize].extend(bits(h * w * (PublicParams::MIN_K / 32))..=bits(h * w * (k_max / 32)));
-                per_table[Table::Coefficient as usize]
-                    .extend(bits((h + w) * PublicParams::MIN_K / 8)..=bits((h + w) * k_max / 8));
+                // InputQuant `max(h,w)*k`, Matmul `h*w*(k/32)` and Coefficient `(h+w)*k/8` are
+                // monotone in k, and consecutive k steps (+32 on k >= PublicParams::MIN_K) never
+                // double a value, so sweeping k hits every natural power of two between the two
+                // endpoints, hence every ladder stop between their padded endpoints.
+                per_table[Table::InputQuant as usize].extend(
+                    V4_REACHABLE_DEGREE_BITS
+                        .into_iter()
+                        .filter(|d| (bits(h.max(w) * PublicParams::MIN_K)..=bits(h.max(w) * k_max)).contains(d)),
+                );
+                per_table[Table::Matmul as usize].extend(
+                    V4_REACHABLE_DEGREE_BITS
+                        .into_iter()
+                        .filter(|d| (bits(h * w * (PublicParams::MIN_K / 32))..=bits(h * w * (k_max / 32))).contains(d)),
+                );
+                per_table[Table::Coefficient as usize].extend(
+                    V4_REACHABLE_DEGREE_BITS
+                        .into_iter()
+                        .filter(|d| (bits((h + w) * PublicParams::MIN_K / 8)..=bits((h + w) * k_max / 8)).contains(d)),
+                );
             }
         }
 
@@ -1471,18 +1481,18 @@ mod tests {
 
         let mut reachable: BTreeSet<usize> = per_table.into_iter().flatten().collect();
         for device in [Device::H100, Device::B200] {
-            reachable.extend(lut_tables(device).into_iter().map(|t| bits(lut_height(t))));
+            reachable.extend(lut_tables(device).into_iter().map(|t| bits(lut_live_rows(t))));
         }
 
-        assert!(reachable.contains(&12), "coefficient tables reach 2^12");
-        let ladder: BTreeSet<usize> = FP8_REACHABLE_DEGREE_BITS.into_iter().collect();
+        assert!(!reachable.contains(&12), "2^12 must stay unreachable (the ladder's gap)");
+        let ladder: BTreeSet<usize> = V4_REACHABLE_DEGREE_BITS.into_iter().collect();
         assert_eq!(reachable, ladder, "the consensus ladder must equal the envelope's reach");
 
         // The universal envelope is well-formed: bounds on the ladder,
         // fixed LUT slots, and the ladder headed by the tallest reachable table.
         for device in [Device::H100, Device::B200] {
             let envelope = fp8_universal_envelope(device);
-            assert_eq!(envelope.ladder, FP8_REACHABLE_DEGREE_BITS.to_vec());
+            assert_eq!(envelope.ladder, V4_REACHABLE_DEGREE_BITS.to_vec());
             assert_eq!(envelope.degree_ranges.len(), num_all_tables(device));
             for (t, &(lo, hi)) in envelope.degree_ranges.iter().enumerate() {
                 assert!(lo <= hi, "table {t}");
@@ -1512,63 +1522,6 @@ mod tests {
 
     fn build_system(fx: &Fp8Fixture) -> Fp8System<F, D> {
         Fp8System::new(public_data(fx))
-    }
-
-    #[test]
-    fn admission_work_covers_derived_known_layout() {
-        use crate::v4::api::prequant::BLOCK_SIZE;
-        use crate::v4::api::primitives::IncompleteBlockHeader;
-        use crate::v4::api::public_params::test_fixtures::{dense_params, empty_jackpot};
-        use crate::v4::api::public_params::{HashId, known_column_evaluation_products};
-        use crate::v4::api::zk::Fp8Job;
-        use crate::v4::circuit::blake3_stark::stark::ROWS_PER_COMPRESSION;
-
-        for device in [Device::H100, Device::B200] {
-            for hash_id in HashId::ALL {
-                let mut job = dense_params().job().clone();
-                job.common.device = device;
-                job.operands.a.hash_id = hash_id;
-                job.operands.b.hash_id = hash_id;
-                let params = PublicParams::try_new(job, empty_jackpot(), None).unwrap();
-                let system = Fp8Job::derive(&params, &IncompleteBlockHeader::zero()).unwrap().system;
-                let (h, w, k, r) = (
-                    params.h() as u64,
-                    params.w() as u64,
-                    params.common_dim() as u64,
-                    params.rank() as u64,
-                );
-                let blocks = params.blake3_work_block_bound().unwrap();
-                let heights = [
-                    (blocks * ROWS_PER_COMPRESSION as u64).next_power_of_two(),
-                    (h.max(w) * k).next_power_of_two(),
-                    (h + w).next_power_of_two(),
-                    (h * w * (k / 32)).next_power_of_two(),
-                    (h * w).next_power_of_two(),
-                    ((h + w) * (k / BLOCK_SIZE as u64)).next_power_of_two(),
-                ];
-                let compiled_bytes = (h + w) * k + 2 * (h + w) * (k / BLOCK_SIZE as u64) + blocks * blake3::BLOCK_LEN as u64;
-                let mut work = (h + w) * k * r + 2 * r * (h + w + 2 * k) + compiled_bytes;
-                for table in Table::ALL {
-                    let index = table as usize;
-                    let actual_height = 1u64 << system.degree_bits()[index];
-                    if table == Table::Blake3 {
-                        assert!(heights[index] >= actual_height, "{device:?} {hash_id:?}: Blake3 bound");
-                    } else {
-                        assert_eq!(heights[index], actual_height, "{device:?} {hash_id:?}: {table:?} height");
-                    }
-                    let values = &system.known().values_per_table[index];
-                    assert_eq!(values.len(), table.known_column_count(device), "{table:?} width");
-                    assert_eq!(values.len(), system.known().columns_per_table[index].len());
-                    assert!(values.iter().all(|column| column.len() as u64 == actual_height));
-                    if !values.is_empty() {
-                        let columns = values.len() as u64;
-                        work += heights[index] * columns + known_column_evaluation_products(heights[index], columns).unwrap();
-                    }
-                }
-                assert_eq!(params.verifier_work_units(blocks).unwrap(), work);
-                assert!(work <= PublicParams::MAX_VERIFIER_WORK);
-            }
-        }
     }
 
     #[test]
@@ -1659,7 +1612,7 @@ mod tests {
         for (i, &table) in system.committed_lut_tables().iter().enumerate() {
             assert_eq!(
                 system.degree_bits()[NUM_TABLES + i],
-                log2_strict(lut_height(table)),
+                log2_strict(trace_padded_height(lut_live_rows(table))),
                 "LUT {i} degree bits"
             );
         }

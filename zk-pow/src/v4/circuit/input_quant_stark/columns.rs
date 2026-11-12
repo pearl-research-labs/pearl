@@ -1,8 +1,9 @@
 //! Device-specific trace layouts for InputQuant's per-element AIR.
 //!
 //! One trace row pairs the same flat element index from the A and B strips. A group has
-//! `k` elements and each committed bf16 scale covers eight. The height is
-//! `next_power_of_two(max(h,w)*k)`; per-side liveness excludes phantom elements from CTLs.
+//! `k` elements and each committed bf16 scale covers eight. The height rounds `max(h,w)*k`
+//! upward to the next supported height (`trace_padding`); per-side liveness excludes
+//! phantom elements from CTLs.
 //! The two leading columns are verifier-known: both sides' packed binary32 noise words,
 //! recomputed from the public seeds. The schedule block that follows (group G) is pinned by
 //! the AIR instead of being recomputed: the noise decode fields with their recomposition and

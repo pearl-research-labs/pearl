@@ -41,14 +41,14 @@ pytestmark = pytest.mark.gpu
 
 _M_BUCKET = 256
 _N, _K = 256, 2048
-_TALL_K = 16384  # GLM-5.2 o_proj: high k past the 4x128 proof-size cap (31744)
+_TALL_K = 16384  # GLM-5.2 o_proj: high k past the 4x128 proof-size cap (15872)
 _MAX_256 = (1 << 256) - 1
 
 # Both mineable shapes commit the preferred 4x64 tile (4x128 is now only the
 # n-omitted back-compat commitment, never used by the runtime). The o_proj entry
 # carries the real GLM-5.2 shape -- (6144, 16384) -- so it exercises the true
 # wide-n allocation/indexing path plus the high-k B-build/kernel path the 4x128
-# proof-size cap (31744) could not reach. ``(name, n, k)``; used to parametrize
+# proof-size cap (15872) could not reach. ``(name, n, k)``; used to parametrize
 # the shared shape checks below.
 _MINED_SHAPES = {
     "low_k": ("test.mined.layer", _N, _K),
@@ -81,15 +81,12 @@ def _header() -> BlockHeader:
     )
 
 
-def _job(
-    target: int = 1,
-    cert_version: CertificateVersion = CertificateVersion.PLAIN_FP8,
-) -> MiningJob:
+def _job(target: int = 1) -> MiningJob:
     # target=1: winning is effectively impossible, keeping runs deterministic.
     return MiningJob(
         incomplete_header_bytes=bytes(_header().to_bytes()),
         target=target,
-        cert_version=cert_version,
+        cert_version=CertificateVersion.PLAIN_FP8,
         ancestor_headers=[bytes(_PARENT.to_bytes())],
     )
 
@@ -610,42 +607,6 @@ def test_decode_bucket_on_a_tall_tile_layer_mines_through_saved_records(
     assert hit.valid and hit.codes is not None and hit.scales is not None
     assert hit.m == 64
     assert (hit.ltile_rows, hit.ltile_cols) == (16, 32)
-
-
-@pytest.mark.parametrize("cert_version", [CertificateVersion.ZK_DENSE, CertificateVersion.ZK_MOE])
-def test_legacy_certificate_job_credits_hashrate_without_submission(
-    layer_state, async_manager, cert_version, monkeypatch
-):
-    """A non-V4 job from the node still measures hashrate; it must not submit."""
-    import vllm_miner.pipeline as pipeline
-    from vllm_miner.pipeline import (
-        WINNER_LEASES,
-        fallback_winner_checks_idle,
-        mine_launch,
-    )
-
-    monkeypatch.setattr(
-        pipeline,
-        "_start_launch_completion",
-        lambda *_args, **_kwargs: pytest.fail("legacy job scheduled a winner callback"),
-    )
-
-    job = _job(target=_MAX_256, cert_version=cert_version)
-    _wait_for_polled_job(async_manager, monkeypatch, job, no_gateway=False)
-    ctx = prepare_layer(layer_state, job)
-    hashes_before = async_manager._inner_hash_counter
-    leases_before = WINNER_LEASES.held()
-    assert fallback_winner_checks_idle()
-
-    assert mine_launch(layer_state, ctx, _M_BUCKET, 16, lambda a: a.zero_()) is not None
-    assert async_manager.wait_until_drained(timeout=30)
-
-    assert async_manager._inner_hash_counter - hashes_before == effective_work_per_matmul(
-        _M_BUCKET, _N, _K, device=layer_state.committed_device
-    )
-    assert WINNER_LEASES.held() == leases_before
-    assert fallback_winner_checks_idle()
-    assert async_manager.submission_acknowledgements == 0
 
 
 def test_a_failed_activation_build_does_not_retire_a_lease(layer_state, async_manager, monkeypatch):

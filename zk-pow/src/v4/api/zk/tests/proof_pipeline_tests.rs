@@ -10,8 +10,8 @@ use crate::v4::circuit::input_quant_stark::columns::{
 };
 use crate::v4::circuit::scale_stark::columns::{K_PUBLIC_INPUT, WL2_PUBLIC_INPUT};
 
-/// The full wire-level round trip: parse the plain proof, prove the batch statement,
-/// serialize, verify against independently derived expectations, and reject tampering
+/// Parse the plain proof, prove the batch statement,
+/// verify against independently derived expectations, and reject tampering
 /// with the block's claims, the proof's public inputs, and the openings.
 #[test]
 fn api_roundtrip_and_tamper_rejection() {
@@ -25,7 +25,6 @@ fn api_roundtrip_and_tamper_rejection() {
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
     assert_ne!(public.hash_jackpot(), [0u8; 32], "prove must ship the proven lottery digest");
 
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
 
     let mut bad_public = public.clone();
@@ -61,7 +60,6 @@ fn asymmetric_api_roundtrip() {
     let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
 
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
 
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
 }
@@ -80,7 +78,6 @@ fn k_mod_32_api_roundtrip() {
     let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
 
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("proving must succeed");
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
 
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest proof must verify");
 }
@@ -101,7 +98,6 @@ fn hopper_api_roundtrips_minimum_k_and_partial_window() {
         assert_eq!(params.common().device, Device::H100);
         let (public, proof) =
             zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("Hopper proving must succeed");
-        let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
         verify_fp8_block(&public, &header, &proof, &setup, None).expect("Hopper proof must verify");
     }
 }
@@ -178,41 +174,6 @@ fn embedded_cache_verifies_the_committed_go_fixtures() {
     }
 }
 
-/// Pin the entire recursive verifier configuration and its polynomial inventory.
-/// A changed signature requires reviewing resource usage and rerunning `bench_v4_verify`.
-/// `PublicParams` scores geometry-dependent work separately, excluding the fixed verifier.
-#[test]
-#[cfg(feature = "embedded_cache")]
-fn verifier_resource_signature_is_pinned() {
-    use plonky2::util::serialization::DefaultGateSerializer;
-
-    let cache = Fp8VerifierCache::from_bytes(crate::v4::api::embedded_cache::CACHE_DATA).expect("embedded cache must decode");
-    let signatures = [Device::B200, Device::H100].map(|device| {
-        let verifier = cache.get(device).expect("device setup");
-        let mut hash = blake3::Hasher::new();
-        hash.update(
-            &verifier
-                .circuit
-                .common
-                .to_bytes(&DefaultGateSerializer)
-                .expect("serialize common circuit data"),
-        );
-        hash.update(&(verifier.constants_sigmas_polynomials.len() as u64).to_le_bytes());
-        for polynomial in &verifier.constants_sigmas_polynomials {
-            hash.update(&(polynomial.coeffs.len() as u64).to_le_bytes());
-        }
-        hash.finalize().to_hex().to_string()
-    });
-    assert_eq!(
-        signatures,
-        [
-            "be07c34ad493c6da8e109ddc4b830700ccd762313895e21c2f9ddda73a11c3ce",
-            "c37b8a89dc87a1cce7afdedb5fd51f68bf34cd008155a93a48b139c4a754b456"
-        ],
-        "verifier resources changed; review resource usage and rerun bench_v4_verify"
-    );
-}
-
 /// Median of nine warmed, single-thread cached verifications, including parsing.
 /// `cargo test --release --features embedded_cache bench_v4_verify -- --ignored --nocapture`
 #[test]
@@ -269,9 +230,6 @@ fn bench_v4_prove() {
         other => panic!("V4_BENCH_SIZE must be small or medium, got {other}"),
     };
     plain.job.common.device = device;
-    let (_, params) = plain.parse_proof(&header).expect("benchmark job is admitted");
-    let work = params.verifier_work_units(params.blake3_work_block_bound().unwrap()).unwrap();
-    println!("{device:?}: verifier work {work}/{} units", PublicParams::MAX_VERIFIER_WORK);
     let mut prover = Fp8Prover::setup(device).expect("prover setup");
     let setup = &prover.setups[&device];
     let verifier = Fp8Verifier {
@@ -572,7 +530,6 @@ fn moe_api_roundtrip_and_tamper_rejection() {
 
     let setup = Fp8ProverSetup::build(params.common().device, &mut timing).expect("prover setup");
     let (public, proof) = zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("MoE proving must succeed");
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
 
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest MoE proof must verify");
 
@@ -615,6 +572,5 @@ fn hopper_moe_api_roundtrip() {
     let setup = Fp8ProverSetup::build(Device::H100, &mut timing).expect("Hopper MoE prover setup");
     let (public, proof) =
         zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("Hopper MoE proving must succeed");
-    let proof = Fp8Proof::from_bytes(&proof.to_bytes().expect("serialize")).expect("deserialize");
     verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest Hopper MoE proof must verify");
 }

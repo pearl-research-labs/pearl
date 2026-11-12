@@ -14,6 +14,7 @@ use super::*;
 use crate::v4::api::compute::bf16_div;
 use crate::v4::api::dtype::{bf16_to_f32, f32_to_bf16, fp8_e4m3_to_f32};
 use crate::v4::api::public_params::Device;
+use crate::v4::circuit::trace_padding::trace_padded_height;
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::util::timing::TimingTree;
@@ -68,35 +69,50 @@ fn shapes_match_the_documented_layout_and_the_consumer_arities() {
         };
         assert_eq!(columns.len(), arity, "{table:?} arity");
         for col in &columns {
-            assert_eq!(col.len(), slot_height(table), "{table:?} height");
+            assert_eq!(col.len(), lut_live_rows(table), "{table:?} height");
         }
     }
     // Documented entry counts (logical rows = slots * height).
-    assert_eq!(num_slots(LutTable::RneRnd) * slot_height(LutTable::RneRnd), 26 << 17);
-    assert_eq!(num_slots(LutTable::B200Align) * slot_height(LutTable::B200Align), 72 << 16);
+    assert_eq!(num_slots(LutTable::RneRnd) * lut_live_rows(LutTable::RneRnd), 26 << 17);
+    assert_eq!(num_slots(LutTable::B200Align) * lut_live_rows(LutTable::B200Align), 72 << 16);
 }
 
 #[test]
 fn committed_heights_match_the_device_inventory() {
-    let heights: Vec<usize> = b200_tables().iter().map(|&t| lut_height(t)).collect();
-    // The device-independent prefix (through `Width32`) descends; the appended tables
-    // (FP32TOOLS, then B200's downscale tables) follow at their own heights.
-    assert!(
-        heights[..16].windows(2).all(|w| w[0] >= w[1]),
-        "committed LUTs must descend: {heights:?}"
-    );
-    assert_eq!(&heights[16..], &[1024, 32768, 65536]);
-    assert_eq!(lut_height(LutTable::RneRnd), 1 << 17);
-    assert_eq!(lut_height(LutTable::Range16), 1 << 16);
-    assert_eq!(lut_height(LutTable::Pair128), 1 << 14);
-    assert_eq!(lut_height(LutTable::Clamp22), 1 << 10); // 601 live rows
-    assert_eq!(lut_height(LutTable::Int8Dec), 256);
-    assert_eq!(lut_height(LutTable::ExpInfo), 256); // 255 live rows
-    assert_eq!(lut_height(LutTable::Pow2Gb), 64);
-    assert_eq!(lut_height(LutTable::Pow2D), 32); // 20 live rows
-    assert_eq!(lut_height(LutTable::Width32), 32);
-    assert_eq!(lut_height(LutTable::Width16), 1 << 16);
-    assert_eq!(lut_height(LutTable::Log16), 1 << 17);
+    for device in Device::ALL {
+        let heights: Vec<usize> = lut_tables(device)
+            .iter()
+            .map(|&t| trace_padded_height(lut_live_rows(t)))
+            .collect();
+        // The device-independent prefix (sixteen tables) descends; the appended tables
+        // (FP32TOOLS, then B200's downscale tables) follow at their own heights.
+        assert!(
+            heights[..16].windows(2).all(|w| w[0] >= w[1]),
+            "{device:?}: committed LUTs must descend: {heights:?}"
+        );
+    }
+    let heights: Vec<usize> = b200_tables().iter().map(|&t| trace_padded_height(lut_live_rows(t))).collect();
+    assert_eq!(&heights[16..], &[1 << 10, 1 << 16, 1 << 16]);
+    assert_eq!(lut_live_rows(LutTable::RneRnd), 1 << 17);
+    assert_eq!(lut_live_rows(LutTable::Range16), 1 << 16);
+    assert_eq!(lut_live_rows(LutTable::Pair128), 1 << 14);
+    assert_eq!(lut_live_rows(LutTable::Clamp22), 601);
+    assert_eq!(lut_live_rows(LutTable::Int8Dec), 256);
+    assert_eq!(lut_live_rows(LutTable::ExpInfo), 255); // keys [0, 254]
+    assert_eq!(lut_live_rows(LutTable::Pow2Gb), 64);
+    assert_eq!(lut_live_rows(LutTable::Pow2D), 20);
+    assert_eq!(lut_live_rows(LutTable::Width32), 32);
+    assert_eq!(lut_live_rows(LutTable::Width16), 1 << 16);
+    assert_eq!(lut_live_rows(LutTable::Log16), 1 << 17);
+    assert_eq!(lut_live_rows(LutTable::Fp32Tools), 780);
+    // Committed heights land on the consensus ladder: 2^17 -> 2^18, 2^14 -> 2^16,
+    // 601 and 780 -> 2^10, 20 -> 2^7.
+    assert_eq!(trace_padded_height(lut_live_rows(LutTable::RneRnd)), 1 << 18);
+    assert_eq!(trace_padded_height(lut_live_rows(LutTable::Log16)), 1 << 18);
+    assert_eq!(trace_padded_height(lut_live_rows(LutTable::Pair128)), 1 << 16);
+    assert_eq!(trace_padded_height(lut_live_rows(LutTable::Clamp22)), 1 << 10);
+    assert_eq!(trace_padded_height(lut_live_rows(LutTable::Fp32Tools)), 1 << 10);
+    assert_eq!(trace_padded_height(lut_live_rows(LutTable::Pow2D)), 1 << 7);
 
     // Widths: precommitted (keys + stored values) plus one multiplicity column per slot.
     let widths: BTreeMap<LutTable, (usize, usize)> = b200_tables()
@@ -485,8 +501,8 @@ fn layout_is_consistent_and_disjoint() {
 fn precommitted_blocks_match_the_generators() {
     for table in all_tables() {
         let block = lut_precommitted_values::<F>(table);
-        let height = lut_height(table);
-        let live = slot_height(table);
+        let height = trace_padded_height(lut_live_rows(table));
+        let live = lut_live_rows(table);
         assert_eq!(block.len(), num_precommitted_columns(table), "{table:?} block width");
         assert!(block.iter().all(|c| c.len() == height), "{table:?} block heights");
 
@@ -495,7 +511,10 @@ fn precommitted_blocks_match_the_generators() {
             LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 => {
                 // XOR8's key tuple is BYTES2's enumeration.
                 let key_table = if table == LutTable::Xor8 { LutTable::Bytes2 } else { table };
-                let stored = generate::<F>(key_table, 0);
+                let mut stored = generate::<F>(key_table, 0);
+                for column in &mut stored {
+                    column.resize(height, *column.last().unwrap());
+                }
                 assert_eq!(block[0], stored[0], "{table:?} key tuple low");
                 assert_eq!(block[1], stored[1], "{table:?} key tuple high");
             }
@@ -509,13 +528,13 @@ fn precommitted_blocks_match_the_generators() {
             }
             LutTable::Log16 => {
                 for row in 0..height {
-                    let (region, index) = super::columns::log16_key(row);
+                    let (region, index) = super::columns::log16_key(row.min(live - 1));
                     assert_eq!(block[0][row], F::from_canonical_u64(region));
                     assert_eq!(block[1][row], F::from_canonical_u64(index));
                 }
             }
             LutTable::Width32 => assert!(
-                (0..height).all(|i| block[0][i] == F::from_canonical_usize(i + 1)),
+                (0..height).all(|i| block[0][i] == F::from_canonical_usize((i + 1).min(32))),
                 "WIDTH32 shifted ramp key [1, 32]"
             ),
             _ => assert!(
@@ -712,7 +731,11 @@ fn multiplicities_resolve_add_and_land_in_table_columns() {
     // `lut_trace` appends the multiplicities after the precommitted block.
     let trace = lut_trace::<F>(LutTable::Pow2Gb, mults.table_columns(LutTable::Pow2Gb));
     assert_eq!(trace.len(), lut_num_columns(LutTable::Pow2Gb));
-    assert!(trace.iter().all(|c| c.len() == 64));
+    assert!(
+        trace
+            .iter()
+            .all(|c| c.len() == trace_padded_height(lut_live_rows(LutTable::Pow2Gb)))
+    );
     let pow2gb = lut_slot_layout::<F>(LutTable::Pow2Gb, 0);
     assert_eq!(to_u64(trace[pow2gb.multiplicity_column].values[63]), 4);
     assert_eq!(to_u64(trace[pow2gb.key_columns[0]].values[63]), 63);
@@ -857,7 +880,7 @@ fn preprocessed_inputs_place_the_tables_at_their_batch_positions() {
         let (vals, cols) = (&values[NUM_TABLES + i], &columns[NUM_TABLES + i]);
         assert_eq!(vals.len(), num_precommitted_columns(table));
         assert_eq!(cols, &(0..num_precommitted_columns(table)).collect::<Vec<_>>());
-        assert!(vals.iter().all(|v| v.len() == lut_height(table)));
+        assert!(vals.iter().all(|v| v.len() == trace_padded_height(lut_live_rows(table))));
     }
     // Flattened column heights descend (batch positions are height-sorted), so
     // the flat order already is the setup oracle's canonical polynomial order
@@ -905,7 +928,7 @@ fn pow2g_tags_exclude_other_operations_and_out_of_domain_keys() {
     let mut entries = std::collections::BTreeSet::new();
     for slot in 0..num_slots(table) {
         let columns = lut_slot_layout::<F>(table, slot).looked_columns();
-        for row in 0..lut_height(table) {
+        for row in 0..trace_padded_height(lut_live_rows(table)) {
             let tuple: Vec<_> = columns.iter().map(|c| to_u64(c.eval_table(&fixed, row, &[]))).collect();
             entries.insert((tuple[0], tuple[1], tuple[2]));
         }

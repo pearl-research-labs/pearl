@@ -20,8 +20,8 @@ pub const fn num_slots(table: LutTable) -> usize {
     }
 }
 
-/// Live rows per slot (the key-domain size; [`lut_height`] rounds it up to the AIR height).
-pub const fn slot_height(table: LutTable) -> usize {
+/// Live rows per slot (the key-domain size, before trace padding).
+pub const fn lut_live_rows(table: LutTable) -> usize {
     match table {
         LutTable::Range16 | LutTable::Bytes2 | LutTable::Xor8 | LutTable::Qcast | LutTable::Div448 | LutTable::Width16 => 1 << 16,
         // The logarithm ramp plus eight Gaussian classes (`log16_key`).
@@ -39,13 +39,6 @@ pub const fn slot_height(table: LutTable) -> usize {
         LutTable::DownscaleThreshold => 1 << 15,
         LutTable::DownscaleRewrite => 1 << 16,
     }
-}
-
-/// Committed height of the table's AIR: the slot key domain rounded up to a power of two.
-/// Full-height for most tables; EXPINFO (255 -> 256), CLAMP22 (601 -> 1024) and POW2D
-/// (20 -> 32) pad by key saturation (module docs).
-pub const fn lut_height(table: LutTable) -> usize {
-    slot_height(table).next_power_of_two()
 }
 
 pub(crate) fn fp32_tool_key(row: usize) -> (u64, i64) {
@@ -70,7 +63,8 @@ pub(crate) fn log16_key(row: usize) -> (u64, u64) {
         (1 + offset / GAUSSIAN_CLASS_HEIGHT, offset % GAUSSIAN_CLASS_HEIGHT)
     }
 }
-const _: () = assert!(slot_height(LutTable::Log16) as u64 == LOG16_LOGARITHM_ROWS + NUM_GAUSSIAN_CLASSES * GAUSSIAN_CLASS_HEIGHT);
+const _: () =
+    assert!(lut_live_rows(LutTable::Log16) as u64 == LOG16_LOGARITHM_ROWS + NUM_GAUSSIAN_CLASSES * GAUSSIAN_CLASS_HEIGHT);
 
 /// Stored key columns: the enumerated tuple for BYTES2/PAIR128/XOR8, `(operation, argument)`
 /// for FP32TOOLS, `(region, index)` for LOG16, one ramp or saturated key column otherwise.

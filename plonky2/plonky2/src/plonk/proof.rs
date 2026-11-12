@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::field::extension::Extendable;
 use crate::field::polynomial::PolynomialCoeffs;
 use crate::field::types::Field;
+use crate::fri::batching_pow::verify_batching_pow;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::{
     CompressedFriProof, FriChallenges, FriChallengesTarget, FriProof, FriProofTarget,
@@ -21,6 +22,7 @@ use crate::fri::proof::{
 use crate::fri::structure::{
     FriOpeningBatch, FriOpeningBatchTarget, FriOpenings, FriOpeningsTarget,
 };
+use crate::fri::verifier::fri_verify_proof_of_work;
 use crate::fri::FriParams;
 use crate::hash::hash_types::{MerkleCapTarget, RichField};
 use crate::hash::merkle_tree::MerkleCap;
@@ -199,7 +201,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
         let challenges =
             self.get_challenges(self.get_public_inputs_hash(), circuit_digest, common_data)?;
-        let fri_inferred_elements = self.get_inferred_elements(&challenges, common_data);
+        let fri_inferred_elements = self.get_inferred_elements(&challenges, common_data)?;
         let decompressed_proof =
             self.proof
                 .decompress(&challenges, fri_inferred_elements, &common_data.fri_params);
@@ -224,7 +226,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &verifier_data.circuit_digest,
             common_data,
         )?;
-        let fri_inferred_elements = self.get_inferred_elements(&challenges, common_data);
+        let fri_inferred_elements = self.get_inferred_elements(&challenges, common_data)?;
         let decompressed_proof =
             self.proof
                 .decompress(&challenges, fri_inferred_elements, &common_data.fri_params);
@@ -529,9 +531,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &proof.opening_proof.commit_phase_merkle_caps,
             &proof.opening_proof.final_poly,
             proof.opening_proof.pow_witness,
+            proof.opening_proof.batching_pow_witness,
             &verifier_data.circuit_digest,
             common_data,
         )?;
+        // Reject bad PoW early. The check is weak, and done again in FRI verifier later.
+        let fri_challenges = &challenges.fri_challenges;
+        let fri_config = &common_data.fri_params.config;
+        verify_batching_pow::<F, D>(fri_challenges.batching_pow_response, fri_config)?;
+        fri_verify_proof_of_work::<F, D>(fri_challenges.fri_pow_response, fri_config)?;
         Self::fill_constants_sigmas_evals(
             &mut proof,
             &challenges,

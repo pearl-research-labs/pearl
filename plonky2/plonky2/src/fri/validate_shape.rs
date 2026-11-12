@@ -52,8 +52,13 @@ where
         query_round_proofs,
         final_poly,
         pow_witness: _pow_witness,
+        batching_pow_witness,
     } = proof;
 
+    ensure!(
+        batching_pow_witness.is_some() == (params.config.batching_proof_of_work_bits != 0),
+        "batching PoW nonce presence must match trusted configuration"
+    );
     ensure!(degree_bits.len() == instances.len());
     ensure!(degree_bits[0] == params.degree_bits);
     ensure!(degree_bits.windows(2).all(|pair| pair[0] > pair[1]));

@@ -9,10 +9,10 @@ the BF16 peel ``mma.sync`` into the same registers, and run the TMA-store
 epilogue with the row/column unscale fused into the subtile loads.
 
 Every mma warp owns one 16-row slab spanning the whole ``tile_n``
-(``atom_layout_mnk = (tile_m / 16, 1, 1)``), so a lane holds complete
-lottery words: rows ``T >> 2`` and ``(T >> 2) + 8`` of its slab at the
-mod-8 column pair ``2 * (T & 3)``. That is the 4-row lottery family only;
-the 16-row family's whole-row words are split across four lanes.
+(``atom_layout_mnk = (tile_m / 16, 1, 1)``): a lane holds rows ``T >> 2``
+and ``(T >> 2) + 8`` of its slab at the mod-8 column pair ``2 * (T & 3)``,
+and its quad's four lanes exchange cells so each folds one of its rows'
+four consecutive lottery words. That is the 4-row lottery family only.
 
 ``grouped_mixed_gemm``'s ``_GroupedFusedGemmSm120`` is the MoE variant of
 this kernel; it overrides the per-tile hooks of ``_kernel_register_acc``.
@@ -67,9 +67,7 @@ class _FusedGemmSm120(_RegisterAccFusedGemm, GemmSm120):
         ltile_cols: int = DEFAULT_LTILE_COLS,
     ):
         assert tile_m in (64, 128), f"SM120 fused GEMM needs tile_m 64 or 128, got {tile_m}"
-        # mma.sync fragments split every accumulator row across four lanes at
-        # mod-8 column-pair granularity: only the 4-row family's words are
-        # lane-local.
+        # The quad exchange yields one word per lane only for the 4-row family.
         assert ltile_rows == LTILE_ROWS, (
             f"the SM120 lottery implements only the {LTILE_ROWS}-row tile family, got {ltile_rows}"
         )

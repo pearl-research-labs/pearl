@@ -322,7 +322,7 @@ def supports_layer_shape(n: int, k: int) -> bool:
 def _lottery_family_available(n: int, k: int, device: torch.device) -> bool:
     """Whether ``device`` ships a kernel for the tile ``(n, k)`` commits to
     (SM120 has no tall 16x32 kernel, so 32-but-not-64-aligned ``n`` and
-    k > 61440 layers stay unquantized there)."""
+    k > 30720 layers stay unquantized there)."""
     from pearl_gemm import supports_lottery_family
 
     tile = select_tile(n, k, device=local_device(device))
