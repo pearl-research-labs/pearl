@@ -58,6 +58,9 @@ fn successive_powers<F: Field>(start: F, step: F, len: usize) -> Vec<F> {
 /// One barycentric term: `(s1, s2) += (weight * y, weight * y * omega)`.
 #[inline(always)]
 fn accumulate_barycentric<F: Field>(sum: &mut (F, F), weight: F, y: F, omega: F) {
+    if y.is_zero() {
+        return;
+    }
     let term = weight * y;
     sum.0 += term;
     sum.1 = sum.1.multiply_accumulate(term, omega);
