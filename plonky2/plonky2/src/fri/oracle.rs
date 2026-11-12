@@ -162,6 +162,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
+                if p.coeffs[1..].iter().all(|x| x.is_zero()) {
+                    return vec![p.coeffs[0]; degree << rate_bits];
+                }
+
                 if let Some(roots) = &small_roots {
                     Self::lde_on_cosets(p, &shifts, roots, padding_bits)
                 } else if rate_bits >= 2
@@ -444,7 +448,7 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                for degree_bits in [6, 10] {
+                for degree_bits in [0, 3, 6, 10] {
                     let p = PolynomialCoeffs::new(
                         (0..1 << degree_bits)
                             .map(|i| {
@@ -461,7 +465,16 @@ mod tests {
                             .coset_fft_with_options(F::coset_shift(), Some(rate_bits), Some(&roots))
                             .values;
                         for num_polynomials in [1, threads + 1] {
-                            let polynomials = vec![p.clone(); num_polynomials];
+                            let mut polynomials = vec![p.clone(); num_polynomials];
+                            let mut expected_batch = vec![expected.clone(); num_polynomials];
+                            if num_polynomials > 1 {
+                                for constant in [F::ZERO, F::from_canonical_u64(7)] {
+                                    let mut coeffs = vec![F::ZERO; p.len()];
+                                    coeffs[0] = constant;
+                                    polynomials.push(PolynomialCoeffs::new(coeffs));
+                                    expected_batch.push(vec![constant; expected.len()]);
+                                }
+                            }
                             for cached_roots in [None, Some(&roots)] {
                                 assert_eq!(
                                     PolynomialBatch::<F, C, 2>::lde_values(
@@ -470,7 +483,7 @@ mod tests {
                                         false,
                                         cached_roots
                                     ),
-                                    vec![expected.clone(); num_polynomials]
+                                    expected_batch
                                 );
                             }
                         }
