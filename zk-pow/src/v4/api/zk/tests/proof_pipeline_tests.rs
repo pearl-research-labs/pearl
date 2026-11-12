@@ -84,7 +84,7 @@ fn k_mod_32_api_roundtrip() {
 
 #[test]
 fn hopper_api_roundtrips_minimum_k_and_partial_window() {
-    let mut jobs = [fixture_job_min_k(), fixture_job_k32()];
+    let mut jobs = [fixture_job_min_k(), fixture_job_k32(), fixture_job_moe()];
     for (_, plain) in &mut jobs {
         plain.job.common.device = Device::H100;
     }
@@ -560,17 +560,4 @@ fn moe_api_roundtrip_and_tamper_rejection() {
         verify_fp8_block(&bad_expert, &header, &proof, &setup, None).is_err(),
         "a proof must not verify under a different expert's statement"
     );
-}
-
-#[test]
-fn hopper_moe_api_roundtrip() {
-    let (header, mut plain) = fixture_job_moe();
-    plain.job.common.device = Device::H100;
-    let mut timing = TimingTree::default();
-    let (_, params) = plain.parse_proof(&header).expect("Hopper MoE fixture must parse");
-    assert_eq!(params.common().device, Device::H100);
-    let setup = Fp8ProverSetup::build(Device::H100, &mut timing).expect("Hopper MoE prover setup");
-    let (public, proof) =
-        zk_prove_plain_proof_fp8(&header, &plain, &setup, &mut timing).expect("Hopper MoE proving must succeed");
-    verify_fp8_block(&public, &header, &proof, &setup, None).expect("honest Hopper MoE proof must verify");
 }
