@@ -189,11 +189,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         .values
                 }
             })
-            .chain(
-                (0..salt_size)
-                    .into_par_iter()
-                    .map(|_| F::rand_vec(degree << rate_bits)),
-            )
+            .chain((0..salt_size).into_par_iter().map(|_| {
+                // Split long salt columns so OS sampling can use the whole pool.
+                let mut salt = vec![F::ZERO; degree << rate_bits];
+                salt.par_chunks_mut(1 << 16)
+                    .for_each(|chunk| chunk.copy_from_slice(&F::rand_vec(chunk.len())));
+                salt
+            }))
             .collect()
     }
 
@@ -485,6 +487,19 @@ mod tests {
                                     ),
                                     expected_batch
                                 );
+                            }
+                            if degree_bits == 10 && rate_bits == 8 && num_polynomials == 1 {
+                                let blinded = PolynomialBatch::<F, C, 2>::lde_values(
+                                    &polynomials,
+                                    rate_bits,
+                                    true,
+                                    None,
+                                );
+                                assert_eq!(&blinded[..num_polynomials], &expected_batch);
+                                assert_eq!(blinded.len(), num_polynomials + SALT_SIZE);
+                                assert!(blinded
+                                    .iter()
+                                    .all(|column| column.len() == expected.len()));
                             }
                         }
                     }
