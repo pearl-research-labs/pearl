@@ -1084,9 +1084,9 @@ where
     let quotient_values = (0..size)
         .into_par_iter()
         .step_by(P::WIDTH)
-        // Coarse jobs bound how often `map_init` clones the per-job CTL
-        // template (and keep the rayon scheduling overhead negligible).
-        .with_min_len(1024)
+        // Bound CTL template cloning while leaving enough jobs to balance
+        // tables with different constraint-evaluation costs.
+        .with_min_len(128)
         .map_init(make_scratch, |scratch, i_start| {
             let i_next_start = (i_start + next_step) % size;
             let i_range = i_start..i_start + P::WIDTH;
