@@ -316,6 +316,11 @@ fn matmul_fp8_windowed(
     let mut accumulator = [GFloat::from(0.0); MMA_GROUP_PRODUCTS + 1];
     for i in 0..m {
         let a_row = &a[i * k..(i + 1) * k];
+        if n == 0 {
+            continue;
+        }
+        // Reuse these table rows across every output column.
+        let products: Vec<_> = a_row.iter().map(|&a| &FP8_PRODUCTS[a as usize]).collect();
         for j in 0..n {
             let b_col = &b[j * k..(j + 1) * k];
             // Seed the cell's accumulator with the carry-in (0 when absent).
@@ -326,9 +331,9 @@ fn matmul_fp8_windowed(
                 Vec::with_capacity(if record_partials { k.div_ceil(MMA_GROUP_PRODUCTS) } else { 0 });
             accumulator[0] = GFloat::from(initial);
             let mut used = 1;
-            for (a_group, b_group) in a_row.chunks(MMA_GROUP_PRODUCTS).zip(b_col.chunks(MMA_GROUP_PRODUCTS)) {
-                for ((slot, &a), &b) in accumulator[1..].iter_mut().zip(a_group).zip(b_group) {
-                    *slot = FP8_PRODUCTS[a as usize][b as usize];
+            for (a_group, b_group) in products.chunks(MMA_GROUP_PRODUCTS).zip(b_col.chunks(MMA_GROUP_PRODUCTS)) {
+                for ((slot, products), &b) in accumulator[1..].iter_mut().zip(a_group).zip(b_group) {
+                    *slot = products[b as usize];
                 }
                 used = a_group.len() + 1;
                 if used == group_size {
