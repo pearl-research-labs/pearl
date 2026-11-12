@@ -18,6 +18,7 @@ const B200_FP8_WIDTH: u16 = 26;
 /// Hopper WGMMA keeps 13 fractional bits below the atom anchor.
 const H100_FP8_WIDTH: u16 = 14;
 const H100_WINDOW_PRODUCTS: usize = 128;
+const FP8_PRODUCT_ZERO_EXP: i32 = -139;
 
 pub trait Dtype<F, T> {
     fn mul(&self, a: F, b: F) -> T;
@@ -142,7 +143,7 @@ impl From<GFloat> for f32 {
     }
 }
 
-fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
+const fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
     let sign_a = (a >> 7) & 1 == 1;
     let mut exp_a = (a >> 3) & 0x0F;
     let sig_a = a & 0x07;
@@ -176,6 +177,26 @@ fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
         }
     }
 }
+
+// Cache the unchanged product representation; the stored exponent is intentionally unnormalized.
+static FP8_PRODUCTS: [[GFloat; 256]; 256] = {
+    let zero = GFloat {
+        sign: false,
+        exponent: FP8_PRODUCT_ZERO_EXP,
+        significand: 0,
+    };
+    let mut products = [[zero; 256]; 256];
+    let mut a = 0;
+    while a < 256 {
+        let mut b = 0;
+        while b < 256 {
+            products[a][b] = multiply_fp8_to_gfloat(a as u8, b as u8, FP8_PRODUCT_ZERO_EXP);
+            b += 1;
+        }
+        a += 1;
+    }
+    products
+};
 
 /// One hardware accumulation group at the given window width
 /// (`significand_width`; B200 FP8: 26). Aligns every
@@ -285,7 +306,7 @@ fn matmul_fp8_windowed(
         ensure!(acc.len() == m * n, "accumulator must have length m * n");
     }
 
-    let zero_exp: i32 = -139;
+    let zero_exp = FP8_PRODUCT_ZERO_EXP;
     // The hardware collapses the accumulator every MMA_GROUP_PRODUCTS
     // products: each group_sum sees the carry plus 32 fresh products.
     let group_size = MMA_GROUP_PRODUCTS + 1;
@@ -307,7 +328,7 @@ fn matmul_fp8_windowed(
             let mut used = 1;
             for (a_group, b_group) in a_row.chunks(MMA_GROUP_PRODUCTS).zip(b_col.chunks(MMA_GROUP_PRODUCTS)) {
                 for ((slot, &a), &b) in accumulator[1..].iter_mut().zip(a_group).zip(b_group) {
-                    *slot = multiply_fp8_to_gfloat(a, b, zero_exp);
+                    *slot = FP8_PRODUCTS[a as usize][b as usize];
                 }
                 used = a_group.len() + 1;
                 if used == group_size {
@@ -505,7 +526,7 @@ impl H100 {
 
         let record_partials = matches!(mode, H100ReplayMode::Partials);
         let record_policy = matches!(mode, H100ReplayMode::Policy);
-        let zero_exp = -139;
+        let zero_exp = FP8_PRODUCT_ZERO_EXP;
         let events_per_cell = k / MMA_GROUP_PRODUCTS;
         let mut out = vec![0.0f32; m * n];
         let mut partials = Vec::with_capacity(if record_partials { m * n } else { 0 });
@@ -530,7 +551,7 @@ impl H100 {
                             .zip(&a_row[atom_start..atom_start + MMA_GROUP_PRODUCTS])
                             .zip(&b_row[atom_start..atom_start + MMA_GROUP_PRODUCTS])
                         {
-                            let product = multiply_fp8_to_gfloat(a, b, zero_exp);
+                            let product = FP8_PRODUCTS[a as usize][b as usize];
                             if record_policy {
                                 // Products are unnormalized: |p| = significand * 2^(exponent - 23).
                                 let exponent = (product.significand != 0)
