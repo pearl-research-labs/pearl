@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use plonky2_maybe_rayon::*;
+
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::{Field, PrimeField64};
 
@@ -27,7 +29,7 @@ impl LutMultiplicities {
     pub fn new(tables: &[LutTable]) -> Self {
         let counts = tables
             .iter()
-            .map(|&t| vec![vec![0u64; trace_padded_height(lut_live_rows(t))]; num_slots(t)])
+            .map(|&t| (0..num_slots(t)).map(|_| vec![0u64; lut_live_rows(t)]).collect())
             .collect();
         Self {
             tables: tables.to_vec(),
@@ -127,25 +129,41 @@ impl LutMultiplicities {
         Ok(())
     }
 
-    /// One table's multiplicity columns, in slot order — the AIR's trailing columns.
+    /// One table's padded multiplicity columns, in slot order.
+    /// Internal counters cover live keys only; padding multiplicities remain zero.
     pub fn table_columns<F: Field>(&self, table: LutTable) -> Vec<Vec<F>> {
         self.counts[self.table_position(table)]
-            .iter()
-            .map(|col| col.iter().map(|&c| F::from_canonical_u64(c)).collect())
+            .par_iter()
+            .map(|col| {
+                let mut values: Vec<F> = col.iter().map(|&c| F::from_canonical_u64(c)).collect();
+                values.resize(trace_padded_height(lut_live_rows(table)), F::ZERO);
+                values
+            })
             .collect()
     }
 
-    /// Adds `src`'s counts into `self` (every table `src` covers must be committed
-    /// here). Exact: u64 addition commutes.
-    pub fn merge(&mut self, src: &Self) {
-        for (src_pos, &table) in src.tables.iter().enumerate() {
-            let dst_position = self.table_position(table);
-            for (dst_slot, src_slot) in self.counts[dst_position].iter_mut().zip(&src.counts[src_pos]) {
-                for (dst_row, src_row) in dst_slot.iter_mut().zip(src_slot.iter()) {
-                    *dst_row += src_row;
-                }
-            }
-        }
+    /// Adds one source inventory's counts.
+    pub fn merge(&mut self, source: &Self) {
+        self.merge_all(&[source]);
+    }
+
+    /// Adds all sources in one destination pass. Every source table must be
+    /// committed here; each destination chunk has a single writer.
+    pub fn merge_all(&mut self, sources: &[&Self]) {
+        assert!(
+            sources.iter().all(|src| src.tables.iter().all(|t| self.tables.contains(t))),
+            "source LUT is not committed for this device"
+        );
+        self.tables
+            .par_iter()
+            .zip(self.counts.par_iter_mut())
+            .for_each(|(&table, slots)| {
+                let sources: Vec<_> = sources
+                    .iter()
+                    .filter_map(|src| src.tables.iter().position(|&t| t == table).map(|i| src.counts[i].as_slice()))
+                    .collect();
+                add_counts(slots, &sources);
+            });
     }
 
     /// Total lookups recorded into `table` (all slots, all rows).
@@ -216,18 +234,16 @@ impl<F: PrimeField64> LutChecker<F> {
         ctx: &str,
         validate: bool,
     ) -> Result<(), String> {
-        use plonky2_maybe_rayon::*;
-
         let num_rows = trace[0].len();
         if num_rows == 0 {
             return Ok(());
         }
-        // Chunk boundaries: fixed-size chunks of >= 2^15 rows, capped at 512
+        // Chunk boundaries: fixed-size chunks of >= 2^12 rows, capped at 512
         // chunks — enough to over-subscribe any pool (with the walk tasks of
         // all five tables sharing it) while keeping per-chunk counter
         // allocation amortized. The big tables (2^21..2^22 rows) dominate;
         // smaller ones fall back to one chunk.
-        let chunk_rows = (num_rows / 512).max(1 << 15).min(num_rows);
+        let chunk_rows = (num_rows / 512).max(1 << 12).min(num_rows);
         let num_chunks = num_rows.div_ceil(chunk_rows);
         debug_assert!(chunk_rows * num_chunks >= num_rows);
 
@@ -265,8 +281,14 @@ impl<F: PrimeField64> LutChecker<F> {
             .map(|chunk| {
                 let row_lo = chunk * chunk_rows;
                 let row_hi = (row_lo + chunk_rows).min(num_rows);
-                // Counters for this chunk: only the inventory's tables.
-                let mut counts = LutMultiplicities::new(&inventory_tables);
+                // Empty slot buffers represent zero counts until the first live lookup.
+                let mut counts = LutMultiplicities {
+                    tables: inventory_tables.clone(),
+                    counts: inventory_tables
+                        .iter()
+                        .map(|&table| vec![Vec::new(); num_slots(table)])
+                        .collect(),
+                };
                 for (li, plan) in plans.iter().enumerate() {
                     let table_position = counts.table_position(plan.table);
                     let chunk_counts = &mut counts.counts[table_position];
@@ -306,7 +328,11 @@ impl<F: PrimeField64> LutChecker<F> {
                                 }
                             }
                         }
-                        chunk_counts[slot][table_row] += mult;
+                        let column = &mut chunk_counts[slot];
+                        if column.is_empty() {
+                            column.resize(lut_live_rows(plan.table), 0);
+                        }
+                        column[table_row] += mult;
                     }
                 }
                 Ok(counts)
@@ -334,26 +360,29 @@ impl<F: PrimeField64> LutChecker<F> {
         for &table in inventory_tables.iter() {
             let dst_position = self.multiplicities.table_position(table);
             // Gather this table's per-chunk slot vectors once.
-            let per_chunk: Vec<&Vec<Vec<u64>>> = merged
+            let per_chunk: Vec<_> = merged
                 .iter()
-                .map(|counts| {
-                    let src_pos = counts.table_position(table);
-                    &counts.counts[src_pos]
-                })
+                .map(|counts| counts.counts[counts.table_position(table)].as_slice())
                 .collect();
-            self.multiplicities.counts[dst_position]
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(slot, dst_slot)| {
-                    for src in &per_chunk {
-                        for (dst_row, src_row) in dst_slot.iter_mut().zip(&src[slot]) {
-                            *dst_row += src_row;
-                        }
-                    }
-                });
+            add_counts(&mut self.multiplicities.counts[dst_position], &per_chunk);
         }
         Ok(())
     }
+}
+
+/// Adds slot inventories; an empty source slot represents all zeroes.
+fn add_counts(destination: &mut [Vec<u64>], sources: &[&[Vec<u64>]]) {
+    destination.par_iter_mut().enumerate().for_each(|(slot, dst)| {
+        dst.par_chunks_mut(1 << 14).enumerate().for_each(|(block, dst)| {
+            let start = block << 14;
+            let end = start + dst.len();
+            for src in sources.iter().filter(|src| !src[slot].is_empty()) {
+                for (dst, src) in dst.iter_mut().zip(&src[slot][start..end]) {
+                    *dst += src;
+                }
+            }
+        });
+    });
 }
 
 /// A `LutLookup` compiled into flat term lists for the walk: the filter as a
@@ -467,5 +496,57 @@ impl<'a, F: PrimeField64> WalkPlan<'a, F> {
             }
         }
         words
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plonky2::field::goldilocks_field::GoldilocksField as F;
+
+    #[test]
+    fn filtered_chunks_keep_zero_counts_and_merge_multiple_sources() {
+        let lookup = LutLookup::rc16_filtered(Column::single(0), starky::lookup::Filter::from_column(Column::single(1)));
+        let mut trace = vec![
+            PolynomialValues::new(vec![F::from_canonical_u64(42); 8192]),
+            PolynomialValues::zero(8192),
+        ];
+        let mut empty = LutChecker::<F>::new(&[LutTable::Range16]);
+        empty
+            .count_trace(std::slice::from_ref(&lookup), &trace, &[], "empty")
+            .unwrap();
+        assert_eq!(empty.multiplicities.table_total(LutTable::Range16), 0);
+        trace[1].values[4096] = F::from_canonical_u64(2);
+        trace[1].values[8191] = F::ONE;
+        let mut live = LutChecker::<F>::new(&[LutTable::Range16]);
+        live.count_trace(&[lookup], &trace, &[], "live").unwrap();
+        let mut merged = LutMultiplicities::new(&[LutTable::Range16]);
+        merged.merge_all(&[&empty.multiplicities, &live.multiplicities, &live.multiplicities]);
+        assert_eq!(merged.table_total(LutTable::Range16), 6);
+        assert_eq!(merged.table_columns::<F>(LutTable::Range16)[0][42], F::from_canonical_u64(6));
+    }
+
+    #[test]
+    fn live_counters_preserve_zero_padded_trace_columns() {
+        for (table, keys) in [
+            (LutTable::Pair128, vec![127, 127]),
+            (LutTable::RneRnd, vec![(1 << 17) - 1]),
+            (LutTable::Width32, vec![32]),
+        ] {
+            let mut counts = LutMultiplicities::new(&[table]);
+            counts.add(table, &keys, &[], 1).unwrap();
+            let mut other = LutMultiplicities::new(&[table]);
+            other.add(table, &keys, &[], 2).unwrap();
+            counts.merge(&other);
+            let live = lut_live_rows(table);
+            assert!(counts.counts[0].iter().all(|col| col.len() == live));
+            let columns = counts.table_columns::<F>(table);
+            assert_eq!(columns[0][live - 1], F::from_canonical_u64(3));
+            for column in &columns {
+                assert_eq!(column.len(), trace_padded_height(live));
+                assert!(column[live..].iter().all(|&value| value == F::ZERO));
+            }
+            assert_eq!(columns.iter().flatten().copied().sum::<F>(), F::from_canonical_u64(3));
+        }
     }
 }

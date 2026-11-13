@@ -23,23 +23,59 @@ use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::timed;
-use crate::util::fft_par::coset_fft_par;
+use crate::util::fft_par::coset_lde_par;
 use crate::util::timing::TimingTree;
-use crate::util::{reverse_bits, transpose, transpose_bitrev};
+use crate::util::{reverse_bits, transpose};
 use plonky2_field::extension::FieldExtension;
 use plonky2_field::packable::Packable;
 
-/// Hash commitment leaf rows into Merkle leaves (as field-element vectors).
+mod prover;
+
+/// Hash natural-order rows into bit-reversed Merkle leaves.
 ///
 /// Each row is hashed independently on the prover worker pool.
-fn hash_leaf_rows<F, C, const D: usize>(rows: &[Vec<F>]) -> Vec<Vec<F>>
+fn hash_leaf_rows<F, C, const D: usize>(rows: &RowMatrix<F>) -> Vec<Vec<F>>
 where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
 {
-    rows.par_iter()
-        .map(|row| C::Hasher::hash_no_pad(row).to_vec())
+    let height = rows.values.len() / rows.width;
+    let bits = log2_strict(height);
+    (0..height)
+        .into_par_iter()
+        .map(|index| C::Hasher::hash_no_pad(rows.row(reverse_bits(index, bits))).to_vec())
         .collect()
+}
+
+/// Prover-only raw evaluations in natural point order; Merkle leaves are bit-reversed.
+#[derive(Eq, PartialEq, Debug)]
+struct RowMatrix<F> {
+    width: usize,
+    values: Vec<F>,
+}
+
+impl<F: RichField> RowMatrix<F> {
+    /// Transpose nonempty, equal-length columns into contiguous rows.
+    fn from_columns(columns: &[Vec<F>]) -> Self {
+        let width = columns.len();
+        let mut values = vec![F::ZERO; width * columns[0].len()];
+        // Read short contiguous runs from each column while filling adjacent rows.
+        values
+            .par_chunks_mut(64 * width)
+            .enumerate()
+            .for_each(|(block, chunk)| {
+                for (r, row) in chunk.chunks_exact_mut(width).enumerate() {
+                    for (c, value) in row.iter_mut().enumerate() {
+                        *value = columns[c][64 * block + r];
+                    }
+                }
+            });
+        Self { width, values }
+    }
+
+    fn row(&self, index: usize) -> &[F] {
+        &self.values[index * self.width..(index + 1) * self.width]
+    }
 }
 
 /// `(self - self(z)) / (X - z)` with a blocked parallel scan.
@@ -139,7 +175,7 @@ pub struct BatchFriOracle<F: RichField + Extendable<D>, C: GenericConfig<D, F = 
     pub rate_bits: usize,
     pub blinding: bool,
     // Digest trees retain raw rows for quotient evaluation and FRI openings.
-    row_values: Vec<Vec<Vec<F>>>,
+    row_values: Vec<RowMatrix<F>>,
     leaf_ranges: Vec<Range<usize>>,
 }
 
@@ -181,6 +217,24 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: &[Option<&FftRootTable<F>>],
     ) -> Self {
+        Self::from_coeffs_with_options::<false>(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    fn from_coeffs_with_options<const PROVER: bool>(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: &[Option<&FftRootTable<F>>],
+    ) -> Self {
         let mut degree_bits = polynomials
             .iter()
             .map(|p| log2_strict(p.len()))
@@ -196,12 +250,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let lde_values = timed!(
                     timing,
                     "FFT + blinding",
-                    PolynomialBatch::<F, C, D>::lde_values(
-                        &polynomials[group_start..i + 1],
-                        rate_bits,
-                        blinding,
-                        fft_root_table[i]
-                    )
+                    if PROVER {
+                        crate::fri::oracle::lde_values_prover(
+                            &polynomials[group_start..i + 1],
+                            rate_bits,
+                            blinding,
+                            fft_root_table[i],
+                        )
+                    } else {
+                        PolynomialBatch::<F, C, D>::lde_values(
+                            &polynomials[group_start..i + 1],
+                            rate_bits,
+                            blinding,
+                            fft_root_table[i],
+                        )
+                    }
                 );
 
                 let mut leaf_group = timed!(timing, "transpose LDEs", transpose(&lde_values));
@@ -215,7 +278,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let batch_merkle_tree = timed!(
             timing,
             "build batch Merkle tree",
-            BatchMerkleTree::new(leaves, cap_height)
+            if PROVER {
+                BatchMerkleTree::new_prover(leaves, cap_height)
+            } else {
+                BatchMerkleTree::new(leaves, cap_height)
+            }
         );
 
         degree_bits.sort_unstable();
@@ -271,13 +338,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let (row_values, digest_leaves): (Vec<_>, Vec<_>) = ranges
             .par_iter()
             .map(|range| {
-                let lde = PolynomialBatch::<F, C, D>::lde_values(
+                let roots =
+                    crate::field::fft::fft_root_table(polynomials[range.start].len() << rate_bits);
+                let lde = crate::fri::oracle::lde_values_prover(
                     &polynomials[range.clone()],
                     rate_bits,
                     false,
-                    None,
+                    Some(&roots),
                 );
-                let rows = transpose_bitrev(&lde);
+                let rows = RowMatrix::from_columns(&lde);
                 let digests = hash_leaf_rows::<F, C, D>(&rows);
                 (rows, digests)
             })
@@ -287,7 +356,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let batch_merkle_tree = timed!(
             timing,
             "build digest Merkle tree",
-            BatchMerkleTree::new(digest_leaves, cap_height)
+            BatchMerkleTree::new_prover(digest_leaves, cap_height)
         );
         Self {
             polynomials,
@@ -308,7 +377,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let mut values = vec![F::ZERO; self.polynomials.len()];
         for (i, range) in self.leaf_ranges.iter().enumerate() {
             let row = index >> (self.degree_bits[0] - self.degree_bits[i]);
-            values[range.clone()].copy_from_slice(&self.row_values[i][row]);
+            let point = reverse_bits(row, self.degree_bits[i] + self.rate_bits);
+            values[range.clone()].copy_from_slice(self.row_values[i].row(point));
         }
         values
     }
@@ -416,7 +486,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     // per-run sweeps suffered behind the tall instance.
                     let mut composition_poly = PolynomialCoeffs::<F::Extension>::zero(degree);
                     {
-                        const TILE: usize = 4096;
+                        const TILE: usize = 1024;
                         composition_poly
                             .coeffs
                             .par_chunks_mut(TILE)
@@ -471,8 +541,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 }
 
                 assert_eq!(final_poly.len(), degree);
+                let lde_final_values = coset_lde_par(
+                    &final_poly.coeffs, F::coset_shift().into(), fri_params.config.rate_bits,
+                );
                 let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
-                let lde_final_values = coset_fft_par(&lde_final_poly, F::coset_shift().into());
                 (lde_final_poly, lde_final_values)
             })
             .collect();
@@ -509,14 +581,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         slice_start: usize,
         slice_len: usize,
     ) -> &[F] {
-        let index = index * step;
-        let index = reverse_bits(index, self.degree_bits[degree_bits_index] + self.rate_bits);
-        let rows = if self.row_values.is_empty() {
-            &self.batch_merkle_tree.leaves
+        let point = index * step;
+        let bits = self.degree_bits[degree_bits_index] + self.rate_bits;
+        let slice = if self.row_values.is_empty() {
+            let index = reverse_bits(point, bits);
+            &self.batch_merkle_tree.leaves[degree_bits_index][index]
         } else {
-            &self.row_values
+            // Next-row SIMD lanes may straddle the domain boundary.
+            self.row_values[degree_bits_index].row(point & ((1 << bits) - 1))
         };
-        let slice = &rows[degree_bits_index][index];
         &slice[slice_start..slice_start + slice_len]
     }
 
@@ -575,29 +648,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) where
         P: PackedField<Scalar = F>,
     {
-        let slice_len = buf.len();
-        // The `P::WIDTH` point rows, fetched once and transposed column-wise
-        // into the buffer (mirrors `get_lde_values_packed` without the
-        // per-call allocation).
-        let rows: Vec<&[F]> = (0..P::WIDTH)
-            .map(|w| {
-                self.get_lde_values(
-                    degree_bits_index,
-                    index_start + w,
-                    step,
-                    slice_start,
-                    slice_len,
-                )
-            })
-            .collect();
-        for (j, slot) in buf.iter_mut().enumerate() {
-            let mut packed = P::ZEROS;
-            packed
-                .as_slice_mut()
-                .iter_mut()
-                .zip(rows.iter())
-                .for_each(|(packed_w, row_w)| *packed_w = row_w[j]);
-            *slot = packed;
+        for w in 0..P::WIDTH {
+            let row = self.get_lde_values(
+                degree_bits_index,
+                index_start + w,
+                step,
+                slice_start,
+                buf.len(),
+            );
+            for (slot, &value) in buf.iter_mut().zip(row) {
+                slot.as_slice_mut()[w] = value;
+            }
         }
     }
 }
@@ -631,6 +692,71 @@ mod test {
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
     type H = <C as GenericConfig<D>>::Hasher;
+
+    #[test]
+    fn packed_row_buffer_matches_allocating_getter() {
+        type P = <F as Packable>::Packing;
+        let polynomials: Vec<_> = (0..4)
+            .map(|c| PolynomialCoeffs::new(F::rand_vec(32 >> (c / 2))))
+            .collect();
+        let mut timing = TimingTree::default();
+        let ordinary = BatchFriOracle::<F, C, D>::from_coeffs(
+            polynomials.clone(),
+            2,
+            false,
+            1,
+            &mut timing,
+            &[None; 4],
+        );
+        let prover = BatchFriOracle::<F, C, D>::from_values_prover(
+            polynomials.iter().cloned().map(|p| p.fft()).collect(),
+            2,
+            false,
+            1,
+            &mut timing,
+            &[None; 4],
+        );
+        assert_eq!(ordinary, prover);
+        let digests = BatchFriOracle::<F, C, D>::from_coeffs_with_digests(
+            polynomials,
+            vec![0..2, 2..4],
+            2,
+            1,
+            &mut timing,
+        );
+        for index in 0..128 {
+            assert_eq!(ordinary.open_values(index), digests.open_values(index));
+        }
+        for (group, &bits) in ordinary.degree_bits.iter().enumerate() {
+            for point in 0..2 << (bits + 2) {
+                let expected = ordinary.get_lde_values(group, point, 1, 0, 2);
+                assert_eq!(digests.get_lde_values(group, point, 1, 0, 2), expected);
+                let leaf = point.reverse_bits() >> (usize::BITS as usize - bits - 2);
+                assert_eq!(
+                    digests.batch_merkle_tree.leaves[group][leaf],
+                    H::hash_no_pad(expected).to_vec()
+                );
+            }
+        }
+        for oracle in [ordinary, digests] {
+            for (group, &bits) in oracle.degree_bits.iter().enumerate() {
+                for step in [1, 2, 4] {
+                    let points = (1 << (bits + 2)) / step;
+                    for start in [0, points - P::WIDTH, points - 1, points, points + 1] {
+                        for width in 0..=2 {
+                            let expected =
+                                oracle.get_lde_values_packed::<P>(group, start, step, 0, width);
+                            let mut actual = vec![P::ONES; width];
+                            oracle.get_lde_values_packed_into(group, start, step, 0, &mut actual);
+                            for (a, b) in actual.iter().zip(&expected) {
+                                assert_eq!(a.as_slice(), b.as_slice());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn batch_prove_openings() -> anyhow::Result<()> {

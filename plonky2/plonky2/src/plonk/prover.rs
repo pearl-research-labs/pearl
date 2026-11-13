@@ -212,7 +212,7 @@ where
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_values(
+        PolynomialBatch::<F, C, D>::from_values_prover(
             wires_values,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
@@ -263,27 +263,26 @@ where
     );
 
     // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
-    let plonk_z_vecs = partial_products_and_zs
+    let plonk_z_vecs: Vec<_> = partial_products_and_zs
         .iter_mut()
         .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
         .collect();
-    let zs_partial_products = [plonk_z_vecs, partial_products_and_zs.concat()].concat();
+    let mut zs_partial_products: Vec<_> = plonk_z_vecs
+        .into_iter()
+        .chain(partial_products_and_zs.into_iter().flatten())
+        .collect();
 
     // All lookup polys: RE and partial SLDCs.
     let lookup_polys =
         compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
 
-    let zs_partial_products_lookups = if has_lookup {
-        [zs_partial_products, lookup_polys].concat()
-    } else {
-        zs_partial_products
-    };
+    zs_partial_products.extend(lookup_polys);
 
     let partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
-        PolynomialBatch::from_values(
-            zs_partial_products_lookups,
+        PolynomialBatch::from_values_prover(
+            zs_partial_products,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
             config.fri_config.cap_height,
@@ -373,7 +372,7 @@ where
     let quotient_polys_random_commitment = timed!(
         timing,
         "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs(
+        PolynomialBatch::<F, C, D>::from_coeffs_prover(
             all_quotient_poly_chunks_random,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
@@ -465,6 +464,7 @@ fn all_wires_permutation_partial_products<
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
     (0..common_data.config.num_challenges)
+        .into_par_iter()
         .map(|i| {
             wires_permutation_partial_products_and_zs(
                 witness,
@@ -495,31 +495,39 @@ fn wires_permutation_partial_products_and_zs<
     let subgroup = &prover_data.subgroup;
     let k_is = &common_data.k_is;
     let num_prods = common_data.num_partial_products;
+    // Multiply each quotient chunk before inversion, and share one inversion
+    // across a block of rows. Numerator/denominator scratch is reused per block.
+    const BLOCK: usize = 64;
+    let wires = common_data.config.num_routed_wires;
+    let products_per_row = wires.div_ceil(degree);
     let all_quotient_chunk_products = subgroup
-        .par_iter()
+        .par_chunks(BLOCK)
         .enumerate()
-        .map(|(i, &x)| {
-            let s_sigmas = &prover_data.sigmas[i];
-            let numerators = (0..common_data.config.num_routed_wires).map(|j| {
-                let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
-            });
-            let denominators = (0..common_data.config.num_routed_wires)
-                .map(|j| {
-                    let wire_value = witness.get_wire(i, j);
-                    let s_sigma = s_sigmas[j];
-                    wire_value + beta * s_sigma + gamma
-                })
-                .collect::<Vec<_>>();
-            let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
-
-            quotient_chunk_products(&quotient_values, degree)
+        .flat_map_iter(|(bi, xs)| {
+            let mut numerators = Vec::with_capacity(xs.len() * products_per_row);
+            let mut denominators = Vec::with_capacity(xs.len() * products_per_row);
+            let mut numerator = vec![F::ONE; wires];
+            let mut denominator = vec![F::ONE; wires];
+            for (row, &x) in xs.iter().enumerate() {
+                let i = bi * BLOCK + row;
+                for j in 0..wires {
+                    let wire = witness.get_wire(i, j);
+                    numerator[j] = wire + beta * (k_is[j] * x) + gamma;
+                    denominator[j] = wire + beta * prover_data.sigmas[i][j] + gamma;
+                }
+                numerators.extend(quotient_chunk_products(&numerator, degree));
+                denominators.extend(quotient_chunk_products(&denominator, degree));
+            }
+            for (n, inv) in numerators
+                .iter_mut()
+                .zip(F::batch_multiplicative_inverse(&denominators))
+            {
+                *n *= inv;
+            }
+            numerators
+                .chunks_exact(products_per_row)
+                .map(|row| row.to_vec())
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
 
@@ -798,9 +806,9 @@ fn compute_quotient_polys<
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
-    let quotient_values: Vec<Vec<F>> = points_batches
+    let quotient_batches: Vec<Vec<Vec<F>>> = points_batches
         .enumerate()
-        .flat_map(|(batch_i, xs_batch)| {
+        .map(|(batch_i, xs_batch)| {
             // Each batch must be the same size, except the last one, which may be smaller.
             debug_assert!(
                 xs_batch.len() == BATCH_SIZE
@@ -917,13 +925,19 @@ fn compute_quotient_polys<
                     .iter_mut()
                     .for_each(|v| *v *= denominator_inv);
             }
-            quotient_values_batch
+            // Transpose and free point vectors on the worker that produced them.
+            transpose(&quotient_values_batch)
         })
         .collect();
 
-    transpose(&quotient_values)
+    (0..num_challenges)
         .into_par_iter()
-        .map(PolynomialValues::new)
-        .map(|values| values.coset_ifft(F::coset_shift()))
+        .map(|challenge| {
+            let mut values = Vec::with_capacity(points.len());
+            for batch in &quotient_batches {
+                values.extend_from_slice(&batch[challenge]);
+            }
+            crate::util::fft_par::coset_ifft_par(PolynomialValues::new(values), F::coset_shift())
+        })
         .collect()
 }

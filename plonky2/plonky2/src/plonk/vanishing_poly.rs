@@ -229,6 +229,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         Vec::new()
     };
 
+    // Invert all L_0 denominators together instead of once per point.
+    let degree = F::from_canonical_usize(common_data.degree());
+    let denominators: Vec<_> = xs_batch.iter().map(|&x| degree * (x - F::ONE)).collect();
+    let l_0_inverses = F::batch_multiplicative_inverse(&denominators);
+
     let mut res_batch: Vec<Vec<F>> = Vec::with_capacity(n);
     for k in 0..n {
         let index = indices_batch[k];
@@ -258,7 +263,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         let constraint_terms = PackedStridedView::new(&constraint_terms_batch, n, k);
 
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        let l_0_x = z_h_on_coset.eval(index) * l_0_inverses[k];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];

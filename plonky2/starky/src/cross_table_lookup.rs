@@ -32,8 +32,10 @@
 //! the current and next row values -- when computing the linear combinations.
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::{borrow::Cow, vec, vec::Vec};
 use core::fmt::Debug;
+#[cfg(feature = "std")]
+use std::borrow::Cow;
 
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
@@ -411,9 +413,9 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
         columns: Vec<&'a [Column<F>]>,
         filters: Vec<&'a Filter<F>>,
     }
-    struct GroupEvals<F: Field> {
-        columns: Vec<Vec<Vec<F>>>, // per instance: per column element: rows
-        filters: Vec<Vec<F>>,      // per instance: rows
+    struct GroupEvals<'a, F: Field> {
+        columns: Vec<Vec<Cow<'a, [F]>>>, // per instance: per column element: rows
+        filters: Vec<Vec<F>>,            // per instance: rows
     }
     let mut group_descs: Vec<GroupDesc<'a, F>> = Vec::new();
     // Per CTL: the id of its first group.
@@ -454,7 +456,14 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
                 .par_iter()
                 .map(|col| {
                     col.iter()
-                        .map(|c| c.eval_all_rows_with_inputs(trace, pis))
+                        .map(|c| match c.parts() {
+                            ([(column, factor)], [], [], [], constant)
+                                if *factor == F::ONE && constant == F::ZERO =>
+                            {
+                                Cow::Borrowed(trace[*column].values.as_slice())
+                            }
+                            _ => Cow::Owned(c.eval_all_rows_with_inputs(trace, pis)),
+                        })
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
@@ -535,7 +544,7 @@ pub(crate) fn cross_table_lookup_data<'a, F: RichField, const D: usize, const N:
 /// single work over a 2^22-row table can use the whole rayon pool even when few
 /// CTL works exist.
 fn partial_sums_with_evals<F: Field>(
-    columns: &[Vec<Vec<F>>],
+    columns: &[Vec<Cow<'_, [F]>>],
     filters: &[Vec<F>],
     challenge: GrandProductChallenge<F>,
     constraint_degree: usize,
@@ -551,7 +560,7 @@ fn partial_sums_with_evals<F: Field>(
     // independent Montgomery trick, and multiplies by the filter.
     // Functionally identical to the serial version: the Montgomery trick is
     // exact for any chunking, and the chunks are independent row ranges.
-    let combine_inverse_filter_into = |instance: &[Vec<F>], filter: &[F], out: &mut [F]| {
+    let combine_inverse_filter_into = |instance: &[Cow<'_, [F]>], filter: &[F], out: &mut [F]| {
         let num_chunks = if out.len() >= (1 << 15) { 16 } else { 1 };
         let chunk_len = out.len().div_ceil(num_chunks);
         out.par_chunks_mut(chunk_len)

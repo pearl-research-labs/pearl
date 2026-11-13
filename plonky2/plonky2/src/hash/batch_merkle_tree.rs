@@ -13,6 +13,8 @@ use crate::hash::merkle_tree::{
 use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
 
+mod prover;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BatchMerkleTree<F: RichField, H: Hasher<F>> {
     /// The data stored in the Merkle tree leaves.
@@ -34,7 +36,14 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
     /// The `leaves` vector should be sorted by matrix height, from tallest to shortest.
     /// Matrices of equal height are chained: each is injected at that height in vector
     /// order, contributing no siblings of its own.
-    pub fn new(mut leaves: Vec<Vec<Vec<F>>>, cap_height: usize) -> Self {
+    pub fn new(leaves: Vec<Vec<Vec<F>>>, cap_height: usize) -> Self {
+        Self::new_with_options::<false>(leaves, cap_height)
+    }
+
+    fn new_with_options<const PROVER: bool>(
+        mut leaves: Vec<Vec<Vec<F>>>,
+        cap_height: usize,
+    ) -> Self {
         assert!(!leaves.is_empty());
         assert!(leaves.iter().all(|leaf| leaf.len().is_power_of_two()));
         assert!(leaves
@@ -80,18 +89,23 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
                     &cur[..],
                     next_cap_height,
                 );
+            } else if PROVER && num_tmp_digests == 0 {
+                cap = prover::inject_at_equal_height::<F, H>(&cap, cur);
             } else {
                 // The rest leaf layers
-                let new_leaves: Vec<Vec<F>> = cap
-                    .iter()
-                    .enumerate()
-                    .map(|(i, cap_hash)| {
-                        let mut new_hash = Vec::with_capacity(NUM_HASH_OUT_ELTS + cur[i].len());
-                        new_hash.extend(&cap_hash.to_vec());
-                        new_hash.extend(&cur[i]);
-                        new_hash
-                    })
-                    .collect();
+                let new_leaves: Vec<Vec<F>> = if PROVER {
+                    prover::inject_rows::<F, H>(&cap, cur)
+                } else {
+                    cap.iter()
+                        .enumerate()
+                        .map(|(i, cap_hash)| {
+                            let mut new_hash = Vec::with_capacity(NUM_HASH_OUT_ELTS + cur[i].len());
+                            new_hash.extend(&cap_hash.to_vec());
+                            new_hash.extend(&cur[i]);
+                            new_hash
+                        })
+                        .collect()
+                };
                 cap.clear();
                 cap.reserve_exact(next_cap_len);
                 let tmp_cap_buf = capacity_up_to_mut(&mut cap, next_cap_len);
@@ -101,6 +115,9 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
                     &new_leaves[..],
                     next_cap_height,
                 );
+                if PROVER {
+                    prover::drop_rows(new_leaves);
+                }
             }
 
             unsafe {
@@ -181,6 +198,37 @@ mod tests {
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
     type H = <C as GenericConfig<D>>::Hasher;
+
+    #[test]
+    fn equal_height_injection_matches_hashing_concatenated_fields() {
+        fn check<H: Hasher<F>>() {
+            for width in [0, 3, 4, 7] {
+                let first: Vec<Vec<F>> = (0..8)
+                    .map(|i| vec![F::from_canonical_usize(i); 4])
+                    .collect();
+                let second: Vec<Vec<F>> = (0..8)
+                    .map(|i| vec![F::from_canonical_usize(i + 8); width])
+                    .collect();
+                let expected: Vec<_> = first
+                    .iter()
+                    .zip(&second)
+                    .map(|(a, b)| {
+                        let mut fields = H::hash_or_noop(a).to_vec();
+                        fields.extend(b);
+                        H::hash_or_noop(&fields)
+                    })
+                    .collect();
+                let leaves = vec![first, second];
+                let reference = BatchMerkleTree::<F, H>::new(leaves.clone(), 3);
+                let tree = BatchMerkleTree::<F, H>::new_prover(leaves, 3);
+                assert_eq!(tree, reference);
+                assert_eq!(tree.cap.0, expected);
+                assert!(tree.digests.is_empty());
+            }
+        }
+        check::<<C as GenericConfig<D>>::Hasher>();
+        check::<crate::hash::keccak::KeccakHash<32>>();
+    }
 
     #[test]
     fn commit_single() -> Result<()> {

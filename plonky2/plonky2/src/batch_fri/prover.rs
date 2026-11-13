@@ -151,28 +151,8 @@ pub(crate) fn batch_fri_committed_trees<
     for arity_bits in &fri_params.reduction_arity_bits {
         let arity = 1 << arity_bits;
 
-        // The committed leaf for chunk r is flatten(bitrev(values) chunked by
-        // arity): leaf r, element k is
-        //   values[ (rev_{ab}(k) << lb_chunk) | rev_{lb_chunk}(r) ].
-        // Gather each leaf directly instead of reversing the whole (up to
-        // ~1 GiB) codeword in place — the serial full-array pass sits on the
-        // critical path of every fold round.
-        let lb_full = log2_strict(final_values.len());
-        let lb_chunk = lb_full - arity_bits; // log2 of the number of chunks
-        let rev_bits = |x: usize, m: usize| x.reverse_bits() >> (usize::BITS - m as u32);
-        let chunked_values = (0..1usize << lb_chunk)
-            .into_par_iter()
-            .map(|r| {
-                let r_rev = rev_bits(r, lb_chunk);
-                let values = &final_values.values;
-                let mut leaf = Vec::with_capacity(arity * D);
-                for k in 0..arity {
-                    let src = (rev_bits(k, *arity_bits) << lb_chunk) | r_rev;
-                    leaf.extend_from_slice(values[src].to_basefield_array().as_slice());
-                }
-                leaf
-            })
-            .collect::<Vec<_>>();
+        let chunked_values =
+            crate::fri::prover::fri_leaves::<F, D>(&final_values.values, *arity_bits);
         let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
 
         challenger.observe_cap(&tree.cap);

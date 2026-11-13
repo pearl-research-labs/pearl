@@ -3,10 +3,12 @@ use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use core::any::TypeId;
+
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::extension::{flatten, unflatten, Extendable};
+use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
@@ -14,12 +16,14 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::config::{Blake3GoldilocksConfig, GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::fft_par::coset_fft_par;
-use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
+use crate::util::{log2_strict, reverse_bits};
+
+mod blake3_pow;
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -63,13 +67,20 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     let query_round_proofs =
         fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
 
-    FriProof {
+    let proof = FriProof {
         commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
         batching_pow_witness,
-    }
+    };
+    trees.into_par_iter().for_each(|tree| {
+        tree.leaves
+            .into_par_iter()
+            .with_min_len(1 << 13)
+            .for_each(drop);
+    });
+    proof
 }
 
 pub(crate) type FriCommitedTrees<F, C, const D: usize> = (
@@ -98,12 +109,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for arity_bits in &fri_params.reduction_arity_bits {
         let arity = 1 << arity_bits;
 
-        reverse_index_bits_in_place(&mut values.values);
-        let chunked_values = values
-            .values
-            .par_chunks(arity)
-            .map(|chunk: &[F::Extension]| flatten(chunk))
-            .collect();
+        let chunked_values = fri_leaves::<F, D>(&values.values, *arity_bits);
         let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
 
         challenger.observe_cap(&tree.cap);
@@ -150,6 +156,28 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     }
 
     (trees, coeffs)
+}
+
+/// Flattens each arity-sized chunk of the bit-reversed codeword into a Merkle leaf.
+/// Gather from natural-order values directly, avoiding a full-buffer permutation.
+pub(crate) fn fri_leaves<F: RichField + Extendable<D>, const D: usize>(
+    values: &[F::Extension],
+    arity_bits: usize,
+) -> Vec<Vec<F>> {
+    let arity = 1 << arity_bits;
+    let chunk_bits = log2_strict(values.len()) - arity_bits;
+    (0..values.len() / arity)
+        .into_par_iter()
+        .map(|row| {
+            let low = reverse_bits(row, chunk_bits);
+            let mut leaf = Vec::with_capacity(arity * D);
+            for k in 0..arity {
+                let index = (reverse_bits(k, arity_bits) << chunk_bits) | low;
+                leaf.extend_from_slice(&values[index].to_basefield_array());
+            }
+            leaf
+        })
+        .collect()
 }
 
 /// Performs the proof-of-work (a.k.a. grinding) step of the FRI protocol. Returns the PoW witness.
@@ -199,11 +227,16 @@ pub(crate) fn proof_of_work<
     // Assert RATE=8 since permute_n::<8>() is hardcoded below
     debug_assert_eq!(<C::Hasher as Hasher<F>>::Permutation::RATE, 8);
 
-    let chunk_size = 1u64 << proof_of_work_bits.saturating_sub(16);
-    let num_chunks = F::NEG_ONE.to_canonical_u64() / chunk_size;
-    let pow_witness = (0..num_chunks)
-        .into_par_iter()
-        .find_map_any(|chunk_idx| {
+    let pow_witness = if TypeId::of::<C>() == TypeId::of::<Blake3GoldilocksConfig>() {
+        blake3_pow::find_witness::<F, _>(
+            duplex_intermediate_state,
+            witness_input_pos,
+            proof_of_work_bits,
+        )
+    } else {
+        let chunk_size = 1u64 << proof_of_work_bits.saturating_sub(16);
+        let num_chunks = F::NEG_ONE.to_canonical_u64() / chunk_size;
+        (0..num_chunks).into_par_iter().find_map_any(|chunk_idx| {
             let base = chunk_idx * chunk_size;
             for offset in 0..chunk_size {
                 let candidate = base + offset;
@@ -217,8 +250,9 @@ pub(crate) fn proof_of_work<
             }
             None
         })
-        .map(F::from_canonical_u64)
-        .expect("Proof of work failed. This is highly unlikely!");
+    }
+    .map(F::from_canonical_u64)
+    .expect("Proof of work failed. This is highly unlikely!");
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
     challenger.observe_element(pow_witness);
     let pow_response = challenger.get_challenge();
@@ -281,5 +315,44 @@ fn fri_prover_query_round<
             evals_proofs: initial_proof,
         },
         steps: query_steps,
+    }
+}
+
+#[cfg(test)]
+mod leaf_tests {
+    use super::*;
+    use crate::field::extension::flatten;
+    use crate::field::goldilocks_field::GoldilocksField as F;
+    use crate::util::reverse_index_bits_in_place;
+
+    #[test]
+    fn gathered_leaves_match_bit_reversed_chunks() {
+        for threads in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    for bits in 0..=10 {
+                        let values: Vec<_> = (0..1 << bits)
+                            .map(|i| {
+                                <F as Extendable<2>>::Extension::from_basefield_array([
+                                    F::from_canonical_usize(i),
+                                    F::from_canonical_usize(i ^ 123),
+                                ])
+                            })
+                            .collect();
+                        let mut reversed = values.clone();
+                        reverse_index_bits_in_place(&mut reversed);
+                        for arity_bits in 0..=bits {
+                            let expected: Vec<_> = reversed
+                                .chunks(1 << arity_bits)
+                                .map(flatten::<F, 2>)
+                                .collect();
+                            assert_eq!(fri_leaves::<F, 2>(&values, arity_bits), expected);
+                        }
+                    }
+                });
+        }
     }
 }
