@@ -34,7 +34,7 @@ _OUTPUT_RTOL = 5e-3
 _DEFAULT_CONFIG = default_mixed_gemm_config()
 
 # Committed tile variants. The 16x32 variant exists for GLM-5.2 o_proj
-# (256x6144x16384): its k exceeds the 4x128 tile's 4 MiB verifier limit.
+# (256x6144x16384); its 48 strips keep the high-k peel proof small.
 _VARIANTS = {
     "4x128": {
         "config": _DEFAULT_CONFIG,
@@ -180,8 +180,7 @@ def _output_reference(inputs) -> torch.Tensor:
 
 def test_tall_tile_pattern_satisfies_verifier_bounds():
     """The 16x32 committed tile keeps the 4x128 area (difficulty-invariant) but
-    shrinks rows+cols to 48, which keeps a k=16384 peel proof under the
-    verifier's 4 MiB worker-input cap -- the shape the tall tile exists for."""
+    shrinks rows+cols to 48, which keeps a high-k (k=16384) peel proof small."""
     protocol = tall_tile_config(16384)
     lanes = lane_assignment(protocol.tile_rows, protocol.tile_cols)
     assert len(lanes) == 16

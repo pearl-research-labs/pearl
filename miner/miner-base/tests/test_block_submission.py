@@ -289,17 +289,15 @@ def test_plain_fp8_rejects_invalid_ancestry(historical_plain_proof, mutation, pl
 
 
 def test_tall_tile_keeps_high_k_proof_under_the_verifier_cap():
-    """At k=16384 (GLM o_proj) the area-equivalent 16x32 tile's peel proof fits
-    the 4 MiB worker-input cap the 4x128 tile would blow -- why the tall tile
-    exists."""
+    """The area-equivalent 16x32 tile opens 48 strips per proof instead of the
+    4x128 tile's 132, so its peel proof stays small at high k (GLM o_proj,
+    k=16384)."""
     k = 16384
     config = _tall_config(k)
     assert config.tile_rows == 16
     assert config.tile_cols == 32
     assert 16 * 32 == 4 * 128  # same area -> difficulty-invariant
-    cap = 1 << 22
-    assert (16 + 32) * k * 2 <= cap
-    assert (4 + 128) * k * 2 > cap
+    assert (16 + 32) * k * 2 <= 1 << 22
 
 
 def _round_robin_routing(experts: int, top_k: int) -> list[list[int]]:

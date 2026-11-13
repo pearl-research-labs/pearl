@@ -31,15 +31,16 @@ MOE_LOTTERY_N = 128
 _MAX_256 = (1 << 256) - 1
 
 # Verifier bounds for a peel proof (pinned py-pearl-mining, zk-pow
-# v4/api/public_params.rs). A winning tile exposes TILE_ROWS + TILE_COLS rows
-# of k BF16 elements to one verifier worker, capped at 4 MiB, which keeps the
-# opened strips inside the verifier's 2^22-byte Blake3 work bound; cert-v4
-# rejects k below 1024 (and above 2^16) outright. Work outside this domain can
-# never become an accepted proof, so it must never be credited.
+# v4/api/public_params.rs). cert-v4 rejects k below 1024 (and above 2^16)
+# outright, and a proof's Blake3 witness (its opened strips, their Merkle
+# paths and, for MoE, the routing openings) must fit 2^22 bytes. Per committed
+# tile, the largest 512-aligned k that fits at the deepest legal trees (2^24
+# rows), the worst tile placement, and an MoE opening of up to 2^16 routed
+# tokens. Work outside this domain can never become an accepted proof, so it
+# must never be credited.
 _VERIFIER_MIN_K = 1024
 _VERIFIER_MAX_K = 1 << 16
-_VERIFIER_MAX_WORKER_INPUT_BYTES = 1 << 22
-_PEEL_ELEM_BYTES = 2
+_VERIFIER_TILE_MAX_K = {(4, 64): 43008, (16, 32): 60928, (4, 128): 22016}
 # k must also stay a multiple of 512 for the four kernels.
 _K_ALIGNMENT = 512
 
@@ -77,13 +78,13 @@ class LotteryTileSpec:
 # - kernel reach: only the 4-row family can run mixed_gemm's 64-row kernel
 #   tile (the decode small-m fast path; 16-row words cannot be folded by a
 #   single thread there);
-# - peel-proof size (``(rows+cols)*k`` BF16 elements), capping verifiable k
-#   under the verifier's 4 MiB worker input: 30720 (4x64), 43520 (16x32),
-#   15872 (4x128);
+# - peel-proof size (``(rows+cols)*k`` elements), capping verifiable k under
+#   the verifier's Blake3 witness bound: 43008 (4x64), 60928 (16x32),
+#   22016 (4x128);
 # - n-alignment: ``n % cols`` must be 0.
 # 4x64 is preferred wherever it fits (it unlocks the measured 64-row decode
 # tile); the tall 16x32 covers what it cannot (n % 32 shapes that are not
-# 64-aligned, and k in (30720, 43520]). 4x128 is kept as the shape-omitted
+# 64-aligned, and k in (43008, 60928]). 4x128 is kept as the shape-omitted
 # (``n``-less) commitment for back-compat and as a coarse fallback.
 DEFAULT_TILE = LotteryTileSpec(TILE_ROWS, TILE_COLS)
 TALL_TILE = LotteryTileSpec(16, 32)
@@ -98,7 +99,7 @@ def _committed_tiles(device: Device) -> tuple[LotteryTileSpec, ...]:
 
     SM90's WGMMA fragments split accumulator rows across four lanes, so the
     Hopper kernel implements only the 4-row family: the tall 16x32 tile is
-    Blackwell-only, and tall-tile-only shapes (k in (30720, 43520], or
+    Blackwell-only, and tall-tile-only shapes (k in (43008, 60928], or
     32-but-not-64-aligned ``n``) are unmineable on Hopper.
     """
     if device is Device.HOPPER:
@@ -109,11 +110,9 @@ def _committed_tiles(device: Device) -> tuple[LotteryTileSpec, ...]:
 
 
 def max_verifiable_k(tile_cols: int = TILE_COLS, tile_rows: int = TILE_ROWS) -> int:
-    """Largest ``k`` whose peel proof fits the verifier's worker input for a
-    committed ``tile_rows x tile_cols`` lottery tile."""
-    bytes_per_k = (tile_rows + tile_cols) * _PEEL_ELEM_BYTES
-    k_from_input = (_VERIFIER_MAX_WORKER_INPUT_BYTES // bytes_per_k) // _K_ALIGNMENT * _K_ALIGNMENT
-    return min(k_from_input, _VERIFIER_MAX_K)
+    """Largest ``k`` whose peel proof fits the verifier's Blake3 witness bound
+    for a committed ``tile_rows x tile_cols`` lottery tile."""
+    return _VERIFIER_TILE_MAX_K[(tile_rows, tile_cols)]
 
 
 def _tile_max_k(tile: LotteryTileSpec) -> int:
@@ -334,9 +333,9 @@ def tile_indices(size: int, tile_index: int) -> list[int]:
 def is_mineable_shape(n: int, k: int, *, device: Device) -> bool:
     """Admissibility for both the kernels and the verifier: some committed tile
     accepts ``(n, k)`` -- ``k % 512`` inside that tile's legal ``k`` domain, and
-    whole lottery tiles in ``n``. High-``k`` layers up to 30720 (e.g. o_proj,
+    whole lottery tiles in ``n``. High-``k`` layers up to 43008 (e.g. o_proj,
     k=16384) are admitted via the preferred 4x64 tile; the tall 16x32 extends
-    the domain to k=43520 and to 32-but-not-64-aligned ``n`` on Blackwell.
+    the domain to k=60928 and to 32-but-not-64-aligned ``n`` on Blackwell.
 
     ``device`` selects the architecture's committed-tile set.
     """
