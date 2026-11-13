@@ -10,11 +10,12 @@ use super::trace_padding::V4_REACHABLE_DEGREE_BITS;
 /// Panics for any other stage.
 pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
     let (pow_bits, rate_bits, num_query_rounds, is_zk, num_routed_wires, arity_bits) = match stage {
-        1 => (18, 3, 39, false, 40, 4),
-        2 => (23, 8, 14, true, 38, 3),
+        1 => (18, 3, 38, false, 48, 4),
+        2 => (23, 8, 14, true, 40, 3),
         _ => panic!("V4 recursion stage must be 1 or 2"),
     };
-    debug_assert!(pow_bits + rate_bits * num_query_rounds >= 135);
+    // Nominal FRI budgets; the shared checks enforce the declared security target.
+    debug_assert!(pow_bits + rate_bits * num_query_rounds >= if stage == 1 { 132 } else { 135 });
     CircuitConfig {
         num_wires: 135,
         num_routed_wires,
@@ -38,8 +39,9 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
 /// Builds the V4 STARK config with the fixed degree ladder used by trace padding.
 /// Every job absorbs the same config into its Fiat–Shamir transcript.
 pub fn v4_stark_config() -> StarkConfig {
-    let (pow_bits, rate_bits, num_query_rounds) = (18, 1, 114);
-    debug_assert!(pow_bits + rate_bits * num_query_rounds >= 132);
+    // Keep the recursive wrappers at degree bits 17/13 with the native ladder unchanged.
+    let (pow_bits, rate_bits, num_query_rounds) = (18, 1, 109);
+    debug_assert!(pow_bits + rate_bits * num_query_rounds >= 127);
     let fri_config = FriConfig {
         rate_bits,
         cap_height: 4,

@@ -1,15 +1,16 @@
 //! Cross-table and committed lookup relations used by InputQuantStark.
 //!
 //! A cross-table lookup (CTL) proves multiset equality between this trace and another STARK.
-//! This file defines InputQuant's half of four channels: committed int8 bytes and block scales
+//! This file defines InputQuant's half of five channels: committed int8 bytes and block scales
 //! from Blake3Stark, fp8 operand codes to the device-specific Matmul table, and completed row-group tuples to
-//! ScaleStark. Their counterpart halves are assembled by
+//! ScaleStark, plus binary32 block coefficients from CoefficientStark. Their counterpart halves are assembled by
 //! `super::super::ctl::all_cross_table_lookups`.
 //!
 //! The LUT descriptors range-check values and bind decode, rounding, and quantization table
 //! outputs against the batch's committed lookup-table oracle. `super::stark` fills the witness
 //! columns; the batch assembler includes these descriptors in the complete proof. Constraint
-//! labels such as P1, U2, and W11 refer to `super::stark`'s documented constraint groups.
+//! labels such as P1 and U2 refer to `super::stark`'s documented constraint groups; binary32
+//! alignment/rounding certificates are documented in `super::super::fp32`.
 
 use plonky2::field::types::Field;
 use starky::cross_table_lookup::TableWithColumns;
@@ -19,9 +20,10 @@ use super::super::ctl::Table;
 use super::super::luts::LutTable;
 use super::super::luts::ctl::LutLookup;
 use super::columns::{
-    B_BLOCK_KEY_OFFSET_PUBLIC_INPUT, B_KEY_OFFSET_PUBLIC_INPUT, BlockL2Columns, INPUT_QUANT_COL_MAP, OPERAND_MULT_A_PUBLIC_INPUT,
-    OPERAND_MULT_B_PUBLIC_INPUT,
+    B_BLOCK_KEY_OFFSET_PUBLIC_INPUT, B_KEY_OFFSET_PUBLIC_INPUT, BlockL2Columns, INPUT_QUANT_COL_MAP, InputQuantScheduleColumns,
+    InputQuantSideColumns, OPERAND_MULT_A_PUBLIC_INPUT, OPERAND_MULT_B_PUBLIC_INPUT, input_quant_column_map,
 };
+use crate::v4::api::public_params::Device;
 
 /// The bf16 code of a committed field triple, as the affine expression
 /// `SIGN*2^15 + EXP*2^7 + MANTISSA`.
@@ -53,14 +55,14 @@ fn next_row_expr<F: Field>(col: usize) -> Column<F> {
 /// the boundary).
 fn is_even_live_filter<F: Field>(live: usize) -> Filter<F> {
     Filter::new(
-        vec![(Column::single(INPUT_QUANT_COL_MAP.is_even_row), Column::single(live))],
+        vec![(Column::single(INPUT_QUANT_COL_MAP.schedule.is_even_row), Column::single(live))],
         vec![],
     )
 }
 
 /// The B slots' element key `ELEM_IDX + h*k`, with `h*k` read from the public input.
 fn b_element_key<F: Field>() -> Column<F> {
-    Column::single_plus_public_input(INPUT_QUANT_COL_MAP.element_index, B_KEY_OFFSET_PUBLIC_INPUT)
+    Column::single_plus_public_input(INPUT_QUANT_COL_MAP.schedule.element_index, B_KEY_OFFSET_PUBLIC_INPUT)
 }
 
 /// InputQuant's looked side of the strip-int8 channel, as the two slots `[A, B]` of one
@@ -74,11 +76,15 @@ fn b_element_key<F: Field>() -> Column<F> {
 /// there, the INT8DEC key domain here). Dead (phantom-fill) rows are excluded by the liveness
 /// factor; the wrap instance of the next-row packing is filtered out: the last live row of a
 /// side is odd (`h*k`/`w*k` are even).
-pub fn ctl_int8_bytes_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F>> {
-    let m = &INPUT_QUANT_COL_MAP;
+pub fn ctl_int8_bytes_looked_input_quant<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
+    let m = &input_quant_column_map(device);
     [
-        (Column::single(m.element_index), m.int8_byte_a, m.a_live),
-        (b_element_key(), m.int8_byte_b, m.b_live),
+        (
+            Column::single(m.schedule.element_index),
+            m.sides[0].int8_byte,
+            m.schedule.a_live,
+        ),
+        (b_element_key(), m.sides[1].int8_byte, m.schedule.b_live),
     ]
     .map(|(key, col, live)| {
         TableWithColumns::new(
@@ -98,21 +104,24 @@ pub fn ctl_int8_bytes_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F>>
 /// `blake3_stark::ctl::ctl_block_scales_looking_blake3`; its LE byte-pair packing equals this
 /// affine code expression numerically). Dead rows' phantom scales are excluded by the
 /// liveness factor.
-pub fn ctl_block_scales_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F>> {
-    let m = &INPUT_QUANT_COL_MAP;
+pub fn ctl_block_scales_looked_input_quant<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
+    let m = &input_quant_column_map(device);
     [
-        (Column::single(m.block_index), &m.scale_a, m.a_live),
+        (Column::single(m.schedule.block_index), &m.sides[0].scale, m.schedule.a_live),
         (
-            Column::single_plus_public_input(m.block_index, B_BLOCK_KEY_OFFSET_PUBLIC_INPUT),
-            &m.scale_b,
-            m.b_live,
+            Column::single_plus_public_input(m.schedule.block_index, B_BLOCK_KEY_OFFSET_PUBLIC_INPUT),
+            &m.sides[1].scale,
+            m.schedule.b_live,
         ),
     ]
     .map(|(key, scale, live)| {
         TableWithColumns::new(
             Table::InputQuant.into(),
             vec![key, bf16_code_expr(scale.sign, scale.exp, scale.mantissa)],
-            Filter::new(vec![(Column::single(m.is_block_start), Column::single(live))], vec![]),
+            Filter::new(
+                vec![(Column::single(m.schedule.is_block_start), Column::single(live))],
+                vec![],
+            ),
         )
     })
     .to_vec()
@@ -121,28 +130,31 @@ pub fn ctl_block_scales_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F
 /// InputQuant's side of the fp8 operand-code channel to Matmul. Each tuple contains an
 /// element key (A: `ELEM_IDX`, B: `ELEM_IDX + h*k` — disjoint key spaces), two consecutive
 /// noised fp8 codes packed into one field element, and the same two elements' summand
-/// scores `LAMBDA` (jackpot check 4) as separate slots.
+/// scores `LAMBDA` (jackpot check 3) as separate slots.
 ///
-/// QCAST proves each packed component is a byte here, and Matmul's alignment lookup binds the
-/// same bytes there. Matmul reuses each A element in `w` output cells and each B element in `h`
+/// H100 exports QCAST's `code_noised`; B200 exports DOWNSCALEREWRITE's `output_code`, after
+/// the conditional byte rewrite. Those lookups prove each packed component is a byte, and
+/// Matmul's alignment lookup binds the same bytes there. The lambda scores still describe
+/// the clean-data `alpha*X` and sigma, independently of that rewrite. Matmul reuses each A
+/// element in `w` output cells and each B element in `h`
 /// output cells, so the CTL filter carries the multiplicity — the public-input term
 /// `w * IS_EVEN_ROW` (resp. `h * IS_EVEN_ROW`) times the liveness column — instead of
 /// physically repeating each tuple.
-pub fn ctl_operand_codes_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F>> {
-    let m = &INPUT_QUANT_COL_MAP;
+pub fn ctl_operand_codes_looked_input_quant<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
+    let m = &input_quant_column_map(device);
     [
         (
-            Column::single(m.element_index),
-            m.code_noised_a,
-            m.lambda_a,
-            m.a_live,
+            Column::single(m.schedule.element_index),
+            m.downscale.map_or(m.sides[0].code_noised, |(_, sides)| sides[0].output_code),
+            m.sides[0].lambda,
+            m.schedule.a_live,
             OPERAND_MULT_A_PUBLIC_INPUT,
         ),
         (
             b_element_key(),
-            m.code_noised_b,
-            m.lambda_b,
-            m.b_live,
+            m.downscale.map_or(m.sides[1].code_noised, |(_, sides)| sides[1].output_code),
+            m.sides[1].lambda,
+            m.schedule.b_live,
             OPERAND_MULT_B_PUBLIC_INPUT,
         ),
     ]
@@ -151,7 +163,10 @@ pub fn ctl_operand_codes_looked_input_quant<F: Field>() -> Vec<TableWithColumns<
             Table::InputQuant.into(),
             vec![key, byte_pair_expr(col), Column::single(lambda), next_row_expr(lambda)],
             Filter::new(
-                vec![(Column::single_times_public_input(m.is_even_row, mult), Column::single(live))],
+                vec![(
+                    Column::single_times_public_input(m.schedule.is_even_row, mult),
+                    Column::single(live),
+                )],
                 vec![],
             ),
         )
@@ -159,54 +174,59 @@ pub fn ctl_operand_codes_looked_input_quant<F: Field>() -> Vec<TableWithColumns<
     .to_vec()
 }
 
-/// InputQuant's looking side of the group-tuples channel into ScaleStark: the 13-component
+/// InputQuant's looking side of the group-tuples channel into ScaleStark: the common 13-component
 /// aggregate per matrix row, sent from *live* group-final rows (filter `IS_GROUP_FINAL *
 /// LIVE`; dead groups have no ScaleStark counterpart). The group-final key `(g+1)*k - 1` is
 /// ScaleStark's group key — `ELEM_IDX` for A, `ELEM_IDX + h*k` (public-input offset) for B.
 /// The last two slots bind the group's committed `SIGMA_ENC` and `SIGMA_NORM` to ScaleStark's
-/// exact sigma encoding and normalized significand.
-pub fn ctl_group_tuples_looking_input_quant<F: Field>() -> Vec<TableWithColumns<F>> {
-    let m = &INPUT_QUANT_COL_MAP;
-    let gf_live = |live: usize| Filter::new(vec![(Column::single(m.is_group_final), Column::single(live))], vec![]);
-    let a = TableWithColumns::new(
-        Table::InputQuant.into(),
-        vec![
-            Column::single(m.element_index),
-            Column::single(m.block_l2_a.running_l2_frame_sum),
-            Column::single(m.block_l2_a.frame_doubled_scale_exponent),
-            Column::single(m.max_abs_a),
-            Column::single(m.alpha_a_exp),
-            Column::single(m.alpha_a_mantissa),
-            Column::single(m.beta_a_exp),
-            Column::single(m.beta_a_mantissa),
-            Column::single(m.beta_a_exp_is_zero),
-            Column::single(m.dead_bound_a),
-            Column::single(m.dead_count_a),
-            Column::single(m.sigma_enc_a),
-            Column::single(m.sigma_norm_a),
-        ],
-        gf_live(m.a_live),
-    );
-    let b = TableWithColumns::new(
-        Table::InputQuant.into(),
-        vec![
-            b_element_key(),
-            Column::single(m.block_l2_b.running_l2_frame_sum),
-            Column::single(m.block_l2_b.frame_doubled_scale_exponent),
-            Column::single(m.max_abs_b),
-            Column::single(m.alpha_b_exp),
-            Column::single(m.alpha_b_mantissa),
-            Column::single(m.beta_b_exp),
-            Column::single(m.beta_b_mantissa),
-            Column::single(m.beta_b_exp_is_zero),
-            Column::single(m.dead_bound_b),
-            Column::single(m.dead_count_b),
-            Column::single(m.sigma_enc_b),
-            Column::single(m.sigma_norm_b),
-        ],
-        gf_live(m.b_live),
-    );
-    vec![a, b]
+/// exact sigma encoding and normalized significand. B200 appends the strip threshold,
+/// Gaussian LOG16 region, key base, and kernel sum.
+pub fn ctl_group_tuples_looking_input_quant<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
+    let m = &input_quant_column_map(device);
+    m.sides
+        .iter()
+        .enumerate()
+        .map(|(index, side)| {
+            let mut columns = vec![if index == 0 {
+                Column::single(m.schedule.element_index)
+            } else {
+                b_element_key()
+            }];
+            columns.extend(Column::singles([
+                side.block_l2.running_l2_frame_sum,
+                side.block_l2.frame_doubled_scale_exponent,
+                side.max_abs,
+                side.alpha_exp,
+                side.alpha_mantissa,
+                side.beta_exp,
+                side.beta_mantissa,
+                side.beta_exp_is_zero,
+                side.dead_bound,
+                side.dead_count,
+                side.sigma_enc,
+                side.sigma_norm,
+            ]));
+            if device == Device::B200 {
+                let map = &super::columns::B200_INPUT_QUANT_COL_MAP;
+                let noise_coverage = [&map.a, &map.b][index];
+                columns.extend(Column::singles([
+                    noise_coverage.downscale.strip_threshold,
+                    noise_coverage.noise_coverage_region,
+                    noise_coverage.noise_coverage_key_base,
+                    noise_coverage.noise_coverage_sum,
+                ]));
+            }
+            let live = [m.schedule.a_live, m.schedule.b_live][index];
+            TableWithColumns::new(
+                Table::InputQuant.into(),
+                columns,
+                Filter::new(
+                    vec![(Column::single(m.schedule.is_group_final), Column::single(live))],
+                    vec![],
+                ),
+            )
+        })
+        .collect()
 }
 
 // ==================================================================================================
@@ -234,11 +254,7 @@ struct SideCols {
     alpha_exp: usize,
     beta_exp: usize,
     beta_exp_is_zero: usize,
-    beta_mul: MulCols,
-    noise_exp: usize,
-    noise_exp_is_zero: usize,
-    fma: FmaCols,
-    fma_sig_product: usize,
+    scaled_decoded_significand: usize,
     is_group_final: usize,
     live: usize,
     dead_bound: usize,
@@ -256,161 +272,43 @@ struct SideCols {
     log_fraction: usize,
 }
 
-struct MulCols {
-    sig: usize,
-    cut: usize,
-    out_exp: usize,
-    out_mantissa: usize,
-    wa: usize,
-    out_is_zero: usize,
-    out_exp_is_zero: usize,
-}
-
-struct FmaCols {
-    scale_gap_slack: usize,
-    far_gap_slack: usize,
-    exp_gap_capped: usize,
-    exp_gap_pow2: usize,
-    is_wide: usize,
-    compression_shift: usize,
-    shift_pow2: usize,
-    compression_quotient: usize,
-    compression_quotient_lsb: usize,
-    compression_remainder: usize,
-    rounding_significand_key: usize,
-    rounding_significand_key_high_bit: usize,
-    key_scale: usize,
-    cut_used: usize,
-    out_exp: usize,
-    out_mantissa: usize,
-    wa: usize,
-    out_is_zero: usize,
-    out_exp_is_zero: usize,
-}
-
-fn mul_cols(m: &crate::v4::circuit::input_quant_stark::columns::MulBlockView<usize>) -> MulCols {
-    MulCols {
-        sig: m.sig_product,
-        cut: m.cut_depth,
-        out_exp: m.out_exp,
-        out_mantissa: m.out_mantissa,
-        wa: m.width_adjust,
-        out_is_zero: m.out_is_zero,
-        out_exp_is_zero: m.out_exp_is_zero,
-    }
-}
-
-fn fma_cols(f: &crate::v4::circuit::input_quant_stark::columns::FmaBlockView<usize>) -> FmaCols {
-    FmaCols {
-        scale_gap_slack: f.scale_gap_slack,
-        far_gap_slack: f.far_gap_slack,
-        exp_gap_capped: f.exp_gap_capped,
-        exp_gap_pow2: f.exp_gap_pow2,
-        is_wide: f.is_wide,
-        compression_shift: f.compression_shift,
-        shift_pow2: f.shift_pow2,
-        compression_quotient: f.compression_quotient,
-        compression_quotient_lsb: f.compression_quotient_lsb,
-        compression_remainder: f.compression_remainder,
-        rounding_significand_key: f.rounding_significand_key,
-        rounding_significand_key_high_bit: f.rounding_significand_key_high_bit,
-        key_scale: f.key_scale,
-        cut_used: f.cut_used,
-        out_exp: f.out_exp,
-        out_mantissa: f.out_mantissa,
-        wa: f.width_adjust,
-        out_is_zero: f.out_is_zero,
-        out_exp_is_zero: f.out_exp_is_zero,
-    }
-}
-
-fn side_cols_a() -> SideCols {
-    let m = &INPUT_QUANT_COL_MAP;
+fn side_cols(side: &InputQuantSideColumns<usize>, schedule: &InputQuantScheduleColumns<usize>, live: usize) -> SideCols {
     SideCols {
-        int8_byte: m.int8_byte_a,
-        int_sign: m.int_bf16_a.sign,
-        int_exp: m.int_bf16_a.exp,
-        int_mantissa: m.int_bf16_a.mantissa,
-        int_exp_is_zero: m.int_bf16_a.exp_is_zero,
-        scale_exp: m.scale_a.exp,
-        scale_exp_is_zero: m.scale_a.exp_is_zero,
-        dec_sig: m.decode_multiply_a.sig_product,
-        dec_cut: m.decode_multiply_a.cut_depth,
-        dec_wa: m.decode_multiply_a.width_adjust,
-        x_exp: m.x_a_exp,
-        x_mantissa: m.x_a_mantissa,
-        x_exp_is_zero: m.x_a_exp_is_zero,
-        x_is_zero: m.x_a_is_zero,
-        blk: m.block_l2_a,
-        max_abs: m.max_abs_a,
-        alpha_exp: m.alpha_a_exp,
-        beta_exp: m.beta_a_exp,
-        beta_exp_is_zero: m.beta_a_exp_is_zero,
-        beta_mul: mul_cols(&m.noise_scale_multiply_a),
-        noise_exp: m.noise_a.exp,
-        noise_exp_is_zero: m.noise_a.exp_is_zero,
-        fma: fma_cols(&m.noised_value_fma_a),
-        fma_sig_product: m.noised_fma_product_a,
-        is_group_final: m.is_group_final,
-        live: m.a_live,
-        dead_bound: m.dead_bound_a,
-        is_dead: m.is_dead_a,
-        x_width: m.x_width_a,
-        x_pow: m.x_pow_a,
-        exponent_gap: m.exponent_gap_a,
-        gap_is_far: m.gap_is_far_a,
-        near_gap: m.near_gap_a,
-        near_gap_pow: m.near_gap_pow_a,
-        half_remainder: m.half_remainder_a,
-        remainder: m.remainder_a,
-        sum_of_squares_top: m.sum_of_squares_top_a,
-        sum_of_squares_rest_lo: m.sum_of_squares_rest_lo_a,
-        log_fraction: m.log_fraction_a,
-    }
-}
-
-fn side_cols_b() -> SideCols {
-    let m = &INPUT_QUANT_COL_MAP;
-    SideCols {
-        int8_byte: m.int8_byte_b,
-        int_sign: m.int_bf16_b.sign,
-        int_exp: m.int_bf16_b.exp,
-        int_mantissa: m.int_bf16_b.mantissa,
-        int_exp_is_zero: m.int_bf16_b.exp_is_zero,
-        scale_exp: m.scale_b.exp,
-        scale_exp_is_zero: m.scale_b.exp_is_zero,
-        dec_sig: m.decode_multiply_b.sig_product,
-        dec_cut: m.decode_multiply_b.cut_depth,
-        dec_wa: m.decode_multiply_b.width_adjust,
-        x_exp: m.x_b_exp,
-        x_mantissa: m.x_b_mantissa,
-        x_exp_is_zero: m.x_b_exp_is_zero,
-        x_is_zero: m.x_b_is_zero,
-        blk: m.block_l2_b,
-        max_abs: m.max_abs_b,
-        alpha_exp: m.alpha_b_exp,
-        beta_exp: m.beta_b_exp,
-        beta_exp_is_zero: m.beta_b_exp_is_zero,
-        beta_mul: mul_cols(&m.noise_scale_multiply_b),
-        noise_exp: m.noise_b.exp,
-        noise_exp_is_zero: m.noise_b.exp_is_zero,
-        fma: fma_cols(&m.noised_value_fma_b),
-        fma_sig_product: m.noised_fma_product_b,
-        is_group_final: m.is_group_final,
-        live: m.b_live,
-        dead_bound: m.dead_bound_b,
-        is_dead: m.is_dead_b,
-        x_width: m.x_width_b,
-        x_pow: m.x_pow_b,
-        exponent_gap: m.exponent_gap_b,
-        gap_is_far: m.gap_is_far_b,
-        near_gap: m.near_gap_b,
-        near_gap_pow: m.near_gap_pow_b,
-        half_remainder: m.half_remainder_b,
-        remainder: m.remainder_b,
-        sum_of_squares_top: m.sum_of_squares_top_b,
-        sum_of_squares_rest_lo: m.sum_of_squares_rest_lo_b,
-        log_fraction: m.log_fraction_b,
+        int8_byte: side.int8_byte,
+        int_sign: side.int_bf16.sign,
+        int_exp: side.int_bf16.exp,
+        int_mantissa: side.int_bf16.mantissa,
+        int_exp_is_zero: side.int_bf16.exp_is_zero,
+        scale_exp: side.scale.exp,
+        scale_exp_is_zero: side.scale.exp_is_zero,
+        dec_sig: side.decode_multiply.sig_product,
+        dec_cut: side.decode_multiply.cut_depth,
+        dec_wa: side.decode_multiply.width_adjust,
+        x_exp: side.x_exp,
+        x_mantissa: side.x_mantissa,
+        x_exp_is_zero: side.x_exp_is_zero,
+        x_is_zero: side.x_is_zero,
+        blk: side.block_l2,
+        max_abs: side.max_abs,
+        alpha_exp: side.alpha_exp,
+        beta_exp: side.beta_exp,
+        beta_exp_is_zero: side.beta_exp_is_zero,
+        scaled_decoded_significand: side.scaled_decoded_significand,
+        is_group_final: schedule.is_group_final,
+        live,
+        dead_bound: side.dead_bound,
+        is_dead: side.is_dead,
+        x_width: side.x_width,
+        x_pow: side.x_pow,
+        exponent_gap: side.exponent_gap,
+        gap_is_far: side.gap_is_far,
+        near_gap: side.near_gap,
+        near_gap_pow: side.near_gap_pow,
+        half_remainder: side.half_remainder,
+        remainder: side.remainder,
+        sum_of_squares_top: side.sum_of_squares_top,
+        sum_of_squares_rest_lo: side.sum_of_squares_rest_lo,
+        log_fraction: side.log_fraction,
     }
 }
 
@@ -440,7 +338,6 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
     let one = F::ONE;
     let neg = -F::ONE;
     let c254 = F::from_canonical_u64(254);
-    let is_wide = Filter::from_column(Column::single(s.fma.is_wide));
     let not_group_final = Filter::from_column(Column::linear_combination_with_constant([(s.is_group_final, neg)], one));
     // Exactly one shift-limb selector is active for a nonzero, block-final, non-far block.
     // Their sum is therefore the filter for every lookup used by that block's limb split.
@@ -473,37 +370,7 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
         // ---- S1: alpha positive-normal (RC16 x2): ALPHA_EXP - 1 and 254 - ALPHA_EXP. ----
         LutLookup::rc16(Column::linear_combination_with_constant([(s.alpha_exp, one)], neg)),
         LutLookup::rc16(Column::linear_combination_with_constant([(s.alpha_exp, neg)], c254)),
-        // ---- W2/W3: range-check the exact exponent-order slack and, on far rows, d - threshold. ----
-        LutLookup::rc16(Column::single(s.fma.scale_gap_slack)),
-        LutLookup::rc16(Column::single(s.fma.far_gap_slack)),
-        // ---- W8/W9: prove the wide split has a 17-bit head, bounded remainder, and valid
-        // quotient parity.
-        LutLookup::rc16_filtered(
-            Column::linear_combination_with_constant([(s.fma.compression_quotient, one)], -F::from_canonical_u64(1 << 16)),
-            is_wide,
-        ),
-        LutLookup::rc16(Column::single(s.fma.compression_remainder)),
-        LutLookup::rc16(Column::linear_combination_with_constant(
-            [(s.fma.shift_pow2, one), (s.fma.compression_remainder, neg)],
-            neg,
-        )),
-        // `(compression_quotient - compression_quotient_lsb)/2` is an integer below 2^16,
-        // proving that the committed bit is the quotient's actual parity.
-        LutLookup::rc16(Column::linear_combination([
-            (s.fma.compression_quotient, F::TWO.inverse()),
-            (s.fma.compression_quotient_lsb, -F::TWO.inverse()),
-        ])),
-        // ---- W10: prove ROUNDING_SIGNIFICAND_KEY < 2^17 from its high bit and low 16 bits.
-        // This check is separate because the packed RNERND key could otherwise alias an
-        // oversized significand into the next cut slot. ----
-        LutLookup::rc16(Column::linear_combination([
-            (s.fma.rounding_significand_key, one),
-            (s.fma.rounding_significand_key_high_bit, -F::from_canonical_u64(1 << 16)),
-        ])),
-        // ---- U6/M6/W12: 254 - OUT_EXP overflow bans (RC16 x3 per side). ----
         LutLookup::rc16(Column::linear_combination_with_constant([(s.x_exp, neg)], c254)),
-        LutLookup::rc16(Column::linear_combination_with_constant([(s.beta_mul.out_exp, neg)], c254)),
-        LutLookup::rc16(Column::linear_combination_with_constant([(s.fma.out_exp, neg)], c254)),
         // ---- F3: two range checks turn F2's either/or equation into a true running maximum.
         // `MAX_ABS' - ABS(X') >= 0` proves the updated value covers the new element.
         // `MAX_ABS' - MAX_ABS >= 0`, filtered to in-group transitions, proves it never drops.
@@ -548,8 +415,7 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
                 vec![],
             ),
         ),
-        // ---- P3/S2/G1: EXPINFO pins each scale/beta/noise exponent to [0, 254] and its
-        // zero flag. The noise lookup supplies the exponent bounds for G1's code decode. ----
+        // ---- P3/S2: EXPINFO on the scale and beta exponents (finiteness + the flag). ----
         LutLookup {
             table: LutTable::ExpInfo,
             keys: vec![Column::single(s.scale_exp)],
@@ -560,12 +426,6 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
             table: LutTable::ExpInfo,
             keys: vec![Column::single(s.beta_exp)],
             values: vec![Column::single(s.beta_exp_is_zero)],
-            filter: Filter::default(),
-        },
-        LutLookup {
-            table: LutTable::ExpInfo,
-            keys: vec![Column::single(s.noise_exp)],
-            values: vec![Column::single(s.noise_exp_is_zero)],
             filter: Filter::default(),
         },
         // ---- P1: INT8DEC (key domain = the byte range proof). ----
@@ -592,30 +452,6 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
         },
         // ---- U3: decode RNERND — the outputs are the X fields. ----
         rnernd_lookup(s.dec_sig, s.dec_cut, s.x_mantissa, s.dec_wa, s.x_is_zero, s.x_exp_is_zero),
-        // ---- M2: beta-MUL cut depth — CLAMP22(535 - E*(BETA) - E*(NOISE)). ----
-        LutLookup {
-            table: LutTable::Clamp22,
-            keys: vec![Column::linear_combination_with_constant(
-                [
-                    (s.beta_exp, neg),
-                    (s.beta_exp_is_zero, neg),
-                    (s.noise_exp, neg),
-                    (s.noise_exp_is_zero, neg),
-                ],
-                F::from_canonical_u64(535),
-            )],
-            values: vec![Column::single(s.beta_mul.cut)],
-            filter: Filter::default(),
-        },
-        // ---- M3: beta-MUL RNERND. ----
-        rnernd_lookup(
-            s.beta_mul.sig,
-            s.beta_mul.cut,
-            s.beta_mul.out_mantissa,
-            s.beta_mul.wa,
-            s.beta_mul.out_is_zero,
-            s.beta_mul.out_exp_is_zero,
-        ),
         // ---- B6: dominance and in-group monotonicity pin
         // `running_max_doubled_scale_exponent` to the running maximum of
         // `block_doubled_scale_exponent`. B7 copies its group-final value into
@@ -692,50 +528,12 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
             ),
             nl_filter(),
         ),
-        // ---- W4/W8: bind 2^EXP_GAP_CAPPED and 2^COMPRESSION_SHIFT. POW2D's key domain
-        // `[0, 19]` also range-checks both shifts; a narrow row uses shift zero and power one. ----
-        LutLookup {
-            table: LutTable::Pow2D,
-            keys: vec![Column::single(s.fma.exp_gap_capped)],
-            values: vec![Column::single(s.fma.exp_gap_pow2)],
-            filter: Filter::default(),
-        },
-        LutLookup {
-            table: LutTable::Pow2D,
-            keys: vec![Column::single(s.fma.compression_shift)],
-            values: vec![Column::single(s.fma.shift_pow2)],
-            filter: Filter::default(),
-        },
-        // ---- W11: derive the RNERND slot `clamp(-133 - KEY_SCALE, -7, 18) + 7`. CLAMP22
-        // embeds its signed fade argument by adding 400, hence lookup key `267 - KEY_SCALE`.
-        // The signed cut makes `(ROUNDING_SIGNIFICAND_KEY, CUT_USED)` determine the
-        // normal/subnormal classification for every reachable scale, including cancellation
-        // results below 128. ----
-        LutLookup {
-            table: LutTable::Clamp22,
-            keys: vec![Column::linear_combination_with_constant(
-                [(s.fma.key_scale, neg)],
-                F::from_canonical_u64(267),
-            )],
-            values: vec![Column::single(s.fma.cut_used)],
-            filter: Filter::default(),
-        },
-        // ---- W11: round the bounded significand. The earlier high-bit/RC16 split, rather than
-        // this packed lookup key, proves ROUNDING_SIGNIFICAND_KEY < 2^17. ----
-        rnernd_lookup(
-            s.fma.rounding_significand_key,
-            s.fma.cut_used,
-            s.fma.out_mantissa,
-            s.fma.wa,
-            s.fma.out_is_zero,
-            s.fma.out_exp_is_zero,
-        ),
         // ---- V1: WIDTH16 binds X_WIDTH = bit_length(M(alpha)*M(X)) and pins the
         // product-nonzero flag to 1 - X_IS_ZERO (alpha's significand is at least 128, so the
         // product is zero exactly when X is; W1 pins the key to the committed factors). ----
         LutLookup {
             table: LutTable::Width16,
-            keys: vec![Column::single(s.fma_sig_product)],
+            keys: vec![Column::single(s.scaled_decoded_significand)],
             values: vec![
                 Column::single(s.x_width),
                 Column::linear_combination_with_constant([(s.x_is_zero, neg)], one),
@@ -786,124 +584,248 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
             neg,
         )),
         // ---- V10: the sum-of-squares rest's low limb, and the fixed-point log of the top
-        // slice — LOG16 bounds SUM_OF_SQUARES_TOP below 2^16 and serves
+        // slice — LOG16's logarithm region 0 bounds SUM_OF_SQUARES_TOP below 2^16 and serves
         // LOG_FRACTION = floor(64 * log2 SUM_OF_SQUARES_TOP) (0 at the phantom key 0). ----
         LutLookup::rc16(Column::single(s.sum_of_squares_rest_lo)),
         LutLookup {
             table: LutTable::Log16,
-            keys: vec![Column::single(s.sum_of_squares_top)],
+            keys: vec![Column::constant(F::ZERO), Column::single(s.sum_of_squares_top)],
             values: vec![Column::single(s.log_fraction)],
             filter: Filter::default(),
         },
     ]
 }
 
-/// InputQuantStark's complete per-row lookup inventory: RC16 x70 (including two FMA
-/// rounding-key range proofs, the four liveness certificates, and the sixteen summand-score
-/// certificates of jackpot check 4), PAIR128 x4, EXPINFO x6, CLAMP22 x6, INT8DEC x2,
-/// POW2D x12, RNERND x6, WIDTH16 x2, LOG16 x2, and QCAST x2. These 112 LUT instances plus
-/// the eight CTL fractions above give 120 logup fractions in total.
-pub fn input_quant_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
-    let m = &INPUT_QUANT_COL_MAP;
-    let a = side_cols_a();
-    let b = side_cols_b();
-
-    let mut lookups = side_lut_lookups::<F>(&a);
-    lookups.extend(side_lut_lookups::<F>(&b));
-
-    // ---- P3/S3/G1: PAIR128 bounds both mantissas below 128, including G1's noise decode. ----
-    for (ka, kb) in [
-        (m.scale_a.mantissa, m.scale_b.mantissa),
-        (m.alpha_a_mantissa, m.alpha_b_mantissa),
-        (m.beta_a_mantissa, m.beta_b_mantissa),
-        (m.noise_a.mantissa, m.noise_b.mantissa),
+/// Complete per-row inventory: 182 H100 instances (including group G's five noise-decode
+/// bindings); B200 adds eight downscale instances and two Gaussian-kernel instances.
+pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
+    let map = input_quant_column_map(device);
+    let mut lookups = Vec::new();
+    for (side, live) in map.sides.iter().zip([map.schedule.a_live, map.schedule.b_live]) {
+        lookups.extend(side_lut_lookups(&side_cols(side, &map.schedule, live)));
+        lookups.extend(crate::v4::circuit::fp32::alignment_lookups(&side.alignment));
+        lookups.extend(crate::v4::circuit::fp32::rounding_lookups(
+            &side.rounding,
+            side.alignment.binary_scale,
+        ));
+        let half = F::TWO.inverse();
+        lookups.push(LutLookup::rc16(Column::linear_combination([
+            (side.rounding.output.fraction_high, half),
+            (side.proxy.high_fraction_parity, -half),
+        ])));
+        lookups.push(LutLookup {
+            table: LutTable::Qcast,
+            keys: vec![Column::single(side.proxy.code)],
+            values: vec![Column::single(side.code_noised)],
+            filter: Filter::default(),
+        });
+    }
+    // ---- G1: the noise decode's exponent (EXPINFO: `[0, 254]` and the zero flag) and the
+    // fraction split `FRACTION = 2^16*HIGH + LOW` (RC16 on LOW here, PAIR128 on both HIGHs
+    // below), unfiltered so the decode of the known word is unique on phantom rows too. ----
+    for (noise, high) in [
+        (&map.schedule.noise_a, map.schedule.noise_fraction_high_a),
+        (&map.schedule.noise_b, map.schedule.noise_fraction_high_b),
+    ] {
+        lookups.push(LutLookup {
+            table: LutTable::ExpInfo,
+            keys: vec![Column::single(noise.exponent)],
+            values: vec![Column::single(noise.is_exponent_zero)],
+            filter: Filter::default(),
+        });
+        lookups.push(LutLookup::rc16(Column::linear_combination([
+            (noise.fraction, F::ONE),
+            (high, -F::from_canonical_u64(1 << 16)),
+        ])));
+    }
+    for (first, second) in [
+        (map.sides[0].scale.mantissa, map.sides[1].scale.mantissa),
+        (map.sides[0].alpha_mantissa, map.sides[1].alpha_mantissa),
+        (map.sides[0].beta_mantissa, map.sides[1].beta_mantissa),
+        (map.schedule.noise_fraction_high_a, map.schedule.noise_fraction_high_b),
     ] {
         lookups.push(LutLookup {
             table: LutTable::Pair128,
-            keys: vec![Column::single(ka), Column::single(kb)],
+            keys: Column::singles([first, second]).collect(),
             values: vec![],
             filter: Filter::default(),
         });
     }
-    // (No PAIR128 lookup on MAX_ABS: the L2 frame is `frame_doubled_scale_exponent`, pinned by
-    // B6/B7/B8/B11; MAX_ABS feeds linf only.)
-
-    // ---- Q1/Q2: QCAST on the noised output codes (the tuple binding pins the committed fp8
-    // codes, byte range included). ----
-    let qcast = |sign_expr: Column<F>, out: Column<F>| LutLookup {
-        table: LutTable::Qcast,
-        keys: vec![sign_expr],
-        values: vec![out],
-        filter: Filter::default(),
-    };
-    lookups.push(qcast(
-        bf16_code_expr(
-            m.noised_value_fma_a.out_sign,
-            m.noised_value_fma_a.out_exp,
-            m.noised_value_fma_a.out_mantissa,
-        ),
-        Column::single(m.code_noised_a),
-    ));
-    lookups.push(qcast(
-        bf16_code_expr(
-            m.noised_value_fma_b.out_sign,
-            m.noised_value_fma_b.out_exp,
-            m.noised_value_fma_b.out_mantissa,
-        ),
-        Column::single(m.code_noised_b),
-    ));
-
+    if let Some((start, downscale)) = map.downscale {
+        let start_filter = Filter::from_column(Column::single(start));
+        lookups.push(LutLookup {
+            table: LutTable::Pair128,
+            keys: downscale.iter().map(|side| Column::single(side.coin_field)).collect(),
+            values: vec![],
+            filter: start_filter.clone(),
+        });
+        lookups.push(LutLookup {
+            table: LutTable::Bytes2,
+            keys: map
+                .sides
+                .iter()
+                .zip(downscale)
+                .map(|(side, down)| {
+                    Column::linear_combination([
+                        (side.rounding.output.fraction_low, F::ONE),
+                        (down.fraction_bit_15, -F::from_canonical_u64(32768)),
+                        (down.coin_field, -F::from_canonical_u64(256)),
+                    ])
+                })
+                .collect(),
+            values: vec![],
+            filter: start_filter,
+        });
+        for ((side, down), live) in map
+            .sides
+            .iter()
+            .zip(downscale)
+            .zip([map.schedule.a_live, map.schedule.b_live])
+        {
+            lookups.push(LutLookup::rc16_filtered(
+                Column::linear_combination_with_constant([(down.coin_field, -F::ONE)], F::from_canonical_u64(111)),
+                Filter::new(vec![(Column::single(start), Column::single(down.coin))], vec![]),
+            ));
+            lookups.push(LutLookup::rc16_filtered(
+                Column::linear_combination_with_constant([(down.coin_field, F::ONE)], -F::from_canonical_u64(112)),
+                Filter::new(
+                    vec![(
+                        Column::single(start),
+                        Column::linear_combination_with_constant([(down.coin, -F::ONE)], F::ONE),
+                    )],
+                    vec![],
+                ),
+            ));
+            // Quantize-first rewrite: pack (c,t,b,e) into one mixed-radix key
+            //
+            //   key = c + 2^8*t + 2^15*b + 2^16*e,
+            //   c = code_noised in [0,256), t = strip_threshold in [0,128),
+            //   b = coin in {0,1}, e = sigma_enc-269 in 0..=5.
+            //
+            // QCAST bounds c, Scale's group tuple/threshold LUT binds t and e, and the
+            // coin extraction above plus evaluate_downscale bind b. The fields occupy
+            // disjoint bit ranges: code 0..7, threshold 8..14, coin 15. The exponent
+            // selects one of six folded slots, each offset by 65536, rather than a
+            // separate online table. Since sigma_enc=floor(log2(s/2))+268 on B200,
+            // e=floor(log2(s))-2 is precisely the replacement E4M3 exponent field.
+            //
+            // The table returns ((c&128)|(8*e)|(c&7)|1) when b && (c&127)<t,
+            // and c otherwise. Binding output_code here authenticates the final byte
+            // exported to Matmul. Only live elements participate in this relation.
+            lookups.push(LutLookup {
+                table: LutTable::DownscaleRewrite,
+                keys: vec![Column::linear_combination_with_constant(
+                    [
+                        (side.code_noised, F::ONE),
+                        (down.strip_threshold, F::from_canonical_u64(256)),
+                        (down.coin, F::from_canonical_u64(32768)),
+                        (side.sigma_enc, F::from_canonical_u64(65536)),
+                    ],
+                    -F::from_canonical_u64(65536 * 269),
+                )],
+                values: vec![Column::single(down.output_code)],
+                filter: Filter::from_column(Column::single(live)),
+            });
+        }
+    }
+    // ---- Check 4: one Q16 Gaussian contribution per live B200 element. ----
+    // LOG16 is shared: region 0 serves the score logarithm; region=1+class serves
+    // min(T(d),cap_class), where
+    //
+    //   base = lambda(alpha*X=0, sigma),   d = lambda(alpha*X,sigma)-base,
+    //   T(d) = floor(65536*exp(-(2^(d/64)-1)/2)).
+    //
+    // d measures the clean signal relative to that row's noise without a score-error
+    // correction. The kernel is 65536 at d=0 and zero for d>=291.
+    // Scale's DOWNSCALETHRESHOLD lookup fixes the region and base from the exact row RMS,
+    // and the group CTL binds both here. Keying (region,d) as two components is essential:
+    // a negative d or d>=8192 has no row in this region and cannot borrow a neighboring
+    // region's entry. InputQuant sums gaussian_value over the group and exports the total;
+    // Scale multiplies it by the row coefficient and proves the mean noise coverage >=1/25.
+    if device == Device::B200 {
+        let m = &super::columns::B200_INPUT_QUANT_COL_MAP;
+        for (side, live) in [(&m.a, m.schedule.a_live), (&m.b, m.schedule.b_live)] {
+            lookups.push(LutLookup {
+                table: LutTable::Log16,
+                keys: vec![
+                    Column::single(side.noise_coverage_region),
+                    Column::linear_combination([(side.common.lambda, F::ONE), (side.noise_coverage_key_base, -F::ONE)]),
+                ],
+                values: vec![Column::single(side.gaussian_value)],
+                filter: Filter::from_column(Column::single(live)),
+            });
+        }
+    }
     lookups
+}
+
+pub(crate) fn coefficient_looking<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
+    let map = input_quant_column_map(device);
+    map.sides
+        .iter()
+        .zip([map.schedule.a_live, map.schedule.b_live])
+        .enumerate()
+        .map(|(index, (side, live))| {
+            let mut tuple = vec![if index == 0 {
+                Column::single(map.schedule.block_index)
+            } else {
+                Column::single_plus_public_input(map.schedule.block_index, B_BLOCK_KEY_OFFSET_PUBLIC_INPUT)
+            }];
+            tuple.extend(Column::singles([
+                side.alpha_exp,
+                side.alpha_mantissa,
+                side.scale.exp,
+                side.scale.mantissa,
+                side.scale.exp_is_zero,
+                side.coefficient.exponent,
+                side.coefficient.fraction_low,
+                side.coefficient.fraction_high,
+                side.coefficient.is_exponent_zero,
+            ]));
+            TableWithColumns::new(
+                Table::InputQuant.into(),
+                tuple,
+                Filter::new(
+                    vec![(Column::single(map.schedule.is_block_start), Column::single(live))],
+                    vec![],
+                ),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use plonky2::field::goldilocks_field::GoldilocksField;
-
     use super::*;
-
-    type F = GoldilocksField;
+    use plonky2::field::goldilocks_field::GoldilocksField as F;
 
     #[test]
-    fn lut_inventory_matches_documented_counts() {
-        // Pinned inventory: RC16 x70 (including two FMA rounding-key checks, four liveness
-        // certificates, and sixteen summand-score certificates), PAIR128 x4, EXPINFO x6, CLAMP22 x6,
-        // INT8DEC x2, POW2D x12, RNERND x6, WIDTH16 x2, LOG16 x2, and QCAST x2. Adding the
-        // eight cross-table fractions gives 120.
-        let lookups = input_quant_lut_lookups::<F>();
-        let count = |t: LutTable| lookups.iter().filter(|l| l.table == t).count();
-        assert_eq!(count(LutTable::Range16), 70);
-        assert_eq!(count(LutTable::Pair128), 4);
-        assert_eq!(count(LutTable::ExpInfo), 6);
-        assert_eq!(count(LutTable::Clamp22), 6);
-        assert_eq!(count(LutTable::Int8Dec), 2);
-        assert_eq!(count(LutTable::Pow2D), 12);
-        assert_eq!(count(LutTable::RneRnd), 6);
-        assert_eq!(count(LutTable::Width16), 2);
-        assert_eq!(count(LutTable::Log16), 2);
-        assert_eq!(count(LutTable::Qcast), 2);
-        assert_eq!(lookups.len(), 112);
-        // Value-tuple arities per table.
-        for l in &lookups {
-            let expected_values = match l.table {
-                LutTable::Range16 | LutTable::Pair128 => 0,
-                LutTable::ExpInfo | LutTable::Clamp22 | LutTable::Pow2D | LutTable::Log16 | LutTable::Qcast => 1,
-                LutTable::Width16 => 2,
-                LutTable::Int8Dec | LutTable::RneRnd => 4,
-                _ => unreachable!(),
-            };
-            assert_eq!(l.values.len(), expected_values, "wrong value arity for {:?}", l.table);
-            let expected_keys = if l.table == LutTable::Pair128 { 2 } else { 1 };
-            assert_eq!(l.keys.len(), expected_keys, "wrong key arity for {:?}", l.table);
+    fn lookup_shapes_and_counts_match_each_device() {
+        for device in [Device::H100, Device::B200] {
+            let lookups = input_quant_lut_lookups::<F>(device);
+            let count = |table| lookups.iter().filter(|lookup| lookup.table == table).count();
+            let downscales = device == Device::B200;
+            assert_eq!(lookups.len(), if downscales { 192 } else { 182 });
+            assert_eq!(count(LutTable::Range16), if downscales { 142 } else { 138 });
+            assert_eq!(count(LutTable::Pair128), if downscales { 7 } else { 6 });
+            for (table, total) in [
+                (LutTable::ExpInfo, 10),
+                (LutTable::Clamp22, 2),
+                (LutTable::Int8Dec, 2),
+                (LutTable::Pow2D, 8),
+                (LutTable::RneRnd, 2),
+                (LutTable::Width16, 2),
+                (LutTable::Log16, if downscales { 4 } else { 2 }),
+                (LutTable::Qcast, 2),
+                (LutTable::Fp32Tools, 8),
+            ] {
+                assert_eq!(count(table), total, "{device:?} {table:?}");
+            }
+            assert_eq!(ctl_int8_bytes_looked_input_quant::<F>(device).len(), 2);
+            assert_eq!(ctl_block_scales_looked_input_quant::<F>(device).len(), 2);
+            assert_eq!(ctl_operand_codes_looked_input_quant::<F>(device).len(), 2);
+            assert_eq!(ctl_group_tuples_looking_input_quant::<F>(device).len(), 2);
+            assert_eq!(coefficient_looking::<F>(device).len(), 2);
         }
-    }
-
-    #[test]
-    fn ctl_halves_are_well_formed() {
-        assert_eq!(ctl_int8_bytes_looked_input_quant::<F>().len(), 2, "slots A, B");
-        assert_eq!(ctl_block_scales_looked_input_quant::<F>().len(), 2);
-        assert_eq!(ctl_operand_codes_looked_input_quant::<F>().len(), 2);
-        let groups = ctl_group_tuples_looking_input_quant::<F>();
-        assert_eq!(groups.len(), 2, "A and B group tuples");
     }
 }

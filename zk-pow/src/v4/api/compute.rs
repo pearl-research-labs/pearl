@@ -10,6 +10,8 @@
 
 use anyhow::Result;
 
+use crate::v4::api::dtype::check_not_nan_or_inf_f32;
+
 use super::dtype::{bf16_to_f32, f32_to_bf16};
 
 /// Element-wise BF16 op: decode both inputs exactly to f32, apply `op`, round
@@ -72,6 +74,29 @@ pub fn bf16_fma(a: u16, b: u16, c: u16) -> Result<u16> {
         s32
     };
     f32_to_bf16(rounded)
+}
+
+pub fn fp32_fma(a: f32, b: f32, c: f32) -> Result<f32> {
+    let a64 = a as f64;
+    let b64 = b as f64;
+    let c64 = c as f64;
+    let product = a64 * b64; // exact
+    let total = product + c64; // f64 RNE approximation of the exact sum x = a*b + c
+    let shift = total - c64;
+    let r = (product - shift) + (c64 - (total - shift)); // TwoSum: x - s, exact
+    let bits = total.to_bits();
+    let err = r; // sign(x - s32); nonzero iff x != s32
+    // Round-to-odd fixup: if x is not representable and s32's significand is
+    // even, the bracketing odd neighbour is the next f32 toward x.
+    let inexact_even = err != 0.0 && (bits & 1 == 0) && total.is_finite();
+    let rounded = if inexact_even {
+        (if err > 0.0 { total.next_up() } else { total.next_down() }) as f32
+    } else {
+        total as f32
+    };
+    check_not_nan_or_inf_f32(rounded)?;
+
+    Ok(rounded)
 }
 
 #[cfg(test)]

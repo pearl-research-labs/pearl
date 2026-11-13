@@ -2,9 +2,11 @@
 
 use std::collections::BTreeMap;
 
+use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::{Field, PrimeField64};
+use plonky2::field::types::{Field, Field64, PrimeField64};
 
+use super::super::unpredictability::{GAUSSIAN_CLASS_HEIGHT, LOG16_LOGARITHM_ROWS, NUM_GAUSSIAN_CLASSES};
 use super::LutTable;
 use super::columns::{lut_live_rows, num_slots};
 use super::ctl::LutLookup;
@@ -63,7 +65,7 @@ impl LutMultiplicities {
             }
         };
         let expected_keys = match table {
-            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 => 2,
+            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 | LutTable::Fp32Tools | LutTable::Log16 => 2,
             _ => 1,
         };
         if keys.len() != expected_keys {
@@ -73,6 +75,19 @@ impl LutMultiplicities {
             ));
         }
         match table {
+            LutTable::Fp32Tools => {
+                let argument = keys[1];
+                let row = match keys[0] {
+                    0 if argument <= 32 => argument as usize,
+                    1 if argument <= 167 => 56 + argument as usize,
+                    1 if (GoldilocksField::ORDER - 23..GoldilocksField::ORDER).contains(&argument) => {
+                        56 - (GoldilocksField::ORDER - argument) as usize
+                    }
+                    2 if argument <= 555 => 224 + argument as usize,
+                    _ => return Err(format!("binary32 tool key {keys:?} out of domain")),
+                };
+                Ok((0, row))
+            }
             // The tuple components must be in range individually — a component overflow must
             // not alias into another row's valid tuple.
             LutTable::Bytes2 => {
@@ -97,6 +112,19 @@ impl LutMultiplicities {
                 };
                 Ok((slot, (keys[0] + (keys[1] << 8)) as usize))
             }
+            // LOG16's region is its own key component: an index outside its region's domain
+            // addresses no row, so no lambda difference can alias into another class.
+            LutTable::Log16 => {
+                let (region, index) = (keys[0], keys[1]);
+                let row = match region {
+                    0 if index < LOG16_LOGARITHM_ROWS => index,
+                    1..=NUM_GAUSSIAN_CLASSES if index < GAUSSIAN_CLASS_HEIGHT => {
+                        LOG16_LOGARITHM_ROWS + (region - 1) * GAUSSIAN_CLASS_HEIGHT + index
+                    }
+                    _ => return Err(format!("LOG16 key ({region}, {index}) out of domain")),
+                };
+                Ok((0, row as usize))
+            }
             // WIDTH32's stored key is the shifted ramp [1, 32]: row = key - 1. Key 0 has no
             // row — this is the "no zero-width claim" soundness point.
             LutTable::Width32 => {
@@ -107,6 +135,8 @@ impl LutMultiplicities {
                 }
             }
             LutTable::RneRnd => fold(17),
+            LutTable::DownscaleThreshold => fold(15),
+            LutTable::DownscaleRewrite => fold(16),
             LutTable::ProdAlign15 | LutTable::B200Align | LutTable::WidthNorm => fold(16),
             LutTable::Pow2G => match keys[0] {
                 0..=63 => Ok((0, keys[0] as usize)),

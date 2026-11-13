@@ -4,22 +4,23 @@
 //! Each AIR declares its halves in its own `ctl` module, including [`super::luts::ctl`].
 //! LUT descriptors live with those tables and are re-exported here.
 //!
-//! The full channel set is seven main channels (below) plus one channel per committed LUT
+//! The full channel set is eight main channels (below) plus one channel per committed LUT
 //! ([`lut_cross_table_lookups`]): each LUT is its own AIR of the batch, its
-//! looking side collects every instance of the five main tables' inventories, and its looked
+//! looking side collects every instance of the main tables' inventories, and its looked
 //! side is the LUT's slots filtered by their per-proof multiplicity columns (folded tables are
-//! multi-slot looked sides). 23 [`CrossTableLookup`]s in total.
+//! multi-slot looked sides). 25 [`CrossTableLookup`]s in total on H100, 27 on B200.
 //!
-//! The seven main channels are:
+//! The eight main channels are:
 //!
 //! - two Blake3 -> InputQuant channels: packed int8 pairs and BF16 block-scale codes;
 //! - InputQuant -> Matmul: packed fp8 operand-code pairs, each element paired with its
-//!   summand score `lambda` (jackpot check 4);
+//!   summand score `lambda` (check 3, also reused for B200 check 4);
 //! - InputQuant -> Scale: group key, L2 frame sum/exponent, max absolute value, and the
 //!   liveness dead bound/count;
 //! - Matmul -> XorFold: cell id, the final f32 result, and the cell skip census;
 //! - XorFold -> Blake3: lane id and final folded word;
 //! - Blake3 -> Blake3: chaining values, keyed by the publishing trace row;
+//! - InputQuant -> Coefficient: block key, alpha/scale fields, and rounded binary32 coefficient.
 //!
 //! The first three channels contain disjoint A/B key spaces, so each uses one CTL with two
 //! side-specific slots; so does the sigma channel (disjoint A/B group keys).
@@ -32,7 +33,9 @@ use super::blake3_stark::ctl::{
     blake3_lut_lookups, ctl_block_scales_looking_blake3, ctl_cv_routing_looked_blake3, ctl_cv_routing_looking_blake3,
     ctl_int8_bytes_looking_blake3, ctl_lottery_words_looking_blake3,
 };
+use super::coefficient_stark::{NUM_COEFFICIENT_KNOWN_COLUMNS, coefficient_looked, coefficient_lookups};
 use super::input_quant_stark::columns::NUM_INPUT_QUANT_KNOWN_COLUMNS;
+use super::input_quant_stark::ctl::coefficient_looking;
 use super::input_quant_stark::ctl::{
     ctl_block_scales_looked_input_quant, ctl_group_tuples_looking_input_quant, ctl_int8_bytes_looked_input_quant,
     ctl_operand_codes_looked_input_quant, input_quant_lut_lookups,
@@ -63,14 +66,22 @@ pub enum Table {
     Scale = 2,
     Matmul = 3,
     XorFold = 4,
+    Coefficient = 5,
 }
 
 /// Number of fp8 main STARK tables.
-pub const NUM_TABLES: usize = 5;
+pub const NUM_TABLES: usize = 6;
 
 impl Table {
     /// The main tables in their fixed batch order.
-    pub(crate) const ALL: [Self; NUM_TABLES] = [Self::Blake3, Self::InputQuant, Self::Scale, Self::Matmul, Self::XorFold];
+    pub(crate) const ALL: [Self; NUM_TABLES] = [
+        Self::Blake3,
+        Self::InputQuant,
+        Self::Scale,
+        Self::Matmul,
+        Self::XorFold,
+        Self::Coefficient,
+    ];
 
     /// Number of verifier-recomputable leading columns for this table.
     pub(crate) const fn known_column_count(self, device: Device) -> usize {
@@ -83,6 +94,7 @@ impl Table {
                 Device::B200 => NUM_MATMUL_B200_KNOWN_COLUMNS,
             },
             Self::XorFold => NUM_XOR_FOLD_KNOWN_COLUMNS,
+            Self::Coefficient => NUM_COEFFICIENT_KNOWN_COLUMNS,
         }
     }
 }
@@ -94,7 +106,18 @@ impl From<Table> for TableIdx {
 }
 
 /// Number of committed LUT tables — each its own AIR of the batch (`super::luts`).
-pub const NUM_LUT_TABLES: usize = 16;
+pub const NUM_H100_LUT_TABLES: usize = 17;
+pub const NUM_B200_LUT_TABLES: usize = 19;
+/// Total tables of the batch: the six main tables, then the device's LUTs.
+pub const NUM_H100_ALL_TABLES: usize = NUM_TABLES + NUM_H100_LUT_TABLES;
+pub const NUM_B200_ALL_TABLES: usize = NUM_TABLES + NUM_B200_LUT_TABLES;
+
+pub const fn num_all_tables(device: Device) -> usize {
+    match device {
+        Device::H100 => NUM_H100_ALL_TABLES,
+        Device::B200 => NUM_B200_ALL_TABLES,
+    }
+}
 
 /// Selects the LUT occupying a canonical batch position for `device`.
 const fn lut_for_device(device: Device, h100: LutTable, b200: LutTable) -> LutTable {
@@ -104,14 +127,16 @@ const fn lut_for_device(device: Device, h100: LutTable, b200: LutTable) -> LutTa
     }
 }
 
-/// The device's LUT tables in canonical batch order.
+/// The device's LUT tables in canonical batch order (the two 2^17 tables first, then by
+/// descending height).
 ///
 /// The shared prefix is hardware-independent. Every later position explicitly records
 /// its H100/B200 choice, making the distinct committed orders visible without duplicating
 /// two complete arrays.
-pub const fn lut_tables(device: Device) -> [LutTable; NUM_LUT_TABLES] {
-    [
+pub fn lut_tables(device: Device) -> Vec<LutTable> {
+    let mut tables = vec![
         LutTable::RneRnd,
+        LutTable::Log16,
         LutTable::Range16,
         LutTable::Bytes2,
         LutTable::Xor8,
@@ -119,32 +144,46 @@ pub const fn lut_tables(device: Device) -> [LutTable; NUM_LUT_TABLES] {
         LutTable::Div448,
         lut_for_device(device, LutTable::ProdAlign15, LutTable::B200Align),
         lut_for_device(device, LutTable::WidthNorm, LutTable::Width16),
-        lut_for_device(device, LutTable::Width16, LutTable::Log16),
-        lut_for_device(device, LutTable::Log16, LutTable::Pair128),
+        lut_for_device(device, LutTable::Width16, LutTable::Pair128),
         lut_for_device(device, LutTable::Pair128, LutTable::Clamp22),
         lut_for_device(device, LutTable::Clamp22, LutTable::Int8Dec),
         lut_for_device(device, LutTable::Int8Dec, LutTable::ExpInfo),
         lut_for_device(device, LutTable::ExpInfo, LutTable::Pow2Gb),
         lut_for_device(device, LutTable::Pow2G, LutTable::Pow2D),
         lut_for_device(device, LutTable::Pow2D, LutTable::Width32),
-    ]
+        LutTable::Fp32Tools,
+    ];
+    if device == Device::B200 {
+        tables.extend([LutTable::DownscaleThreshold, LutTable::DownscaleRewrite]);
+    }
+    tables
 }
 
-/// Total tables of the batch: the five main tables, then the family's LUTs.
-pub const NUM_ALL_TABLES: usize = NUM_TABLES + NUM_LUT_TABLES;
-/// Seven main-table channels plus one channel for each committed LUT.
-pub const NUM_CTL_CHANNELS: usize = 7 + NUM_LUT_TABLES;
+/// The seven main-table channels (the module docs' first seven bullets).
+pub const NUM_MAIN_CHANNELS: usize = 7;
+/// The device-independent LUT prefix of [`lut_tables`] (through `Pow2D`/`Width32`): its
+/// channels directly follow the main channels, then comes the coefficient channel, then the
+/// appended LUTs (FP32TOOLS and B200's downscale tables).
+pub const LUT_CHANNEL_PREFIX: usize = 16;
+/// The channel index of the InputQuant -> Coefficient lookup.
+pub const COEFFICIENT_CHANNEL: usize = NUM_MAIN_CHANNELS + LUT_CHANNEL_PREFIX;
+/// Seven main-table channels, the coefficient channel, and one channel for each committed LUT.
+pub const fn num_ctl_channels(device: Device) -> usize {
+    num_all_tables(device) + 2
+}
 
-/// The batch table index of the family's `i`-th LUT (LUTs follow the five main tables).
+/// The batch table index of the family's `i`-th LUT.
 pub const fn lut_table_idx(i: usize) -> TableIdx {
     NUM_TABLES + i
 }
 
-/// Seven main channels, then the selected device's committed LUT channels. A/B slots share
-/// each InputQuant-looked channel. Geometry enters through public-input terms and trace
-/// columns; CTL coefficients remain statement-independent for the universal stage-1 wrapper.
-/// `scale.r` supplies H5's `E*(dos)` lookup offset and is fixed to 32 by the wire format.
-/// Matmul's AIR constrains canonical row/column progression.
+/// Seven main channels, then the selected device's committed LUT channels, with the
+/// InputQuant -> Coefficient channel at [`COEFFICIENT_CHANNEL`] (after the device-independent
+/// LUT prefix, before the appended LUTs). A/B slots share each InputQuant-looked channel.
+/// Geometry enters through public-input terms and trace columns; CTL coefficients remain
+/// statement-independent for the universal stage-1 wrapper. `scale.r` supplies H5's
+/// `E*(dos)` lookup offset and is fixed to 32 by the wire format. Matmul's AIR constrains
+/// canonical row/column progression.
 ///
 /// Each channel documents its padding filters and multiplicities. Blake3 excludes padding;
 /// InputQuant filters each side's dead rows; Matmul excludes phantom rows from operand and
@@ -156,21 +195,27 @@ pub fn all_cross_table_lookups<F: Field>(device: Device, scale: &ScaleProgram) -
         Device::B200 => (ctl_operand_codes_looking_matmul_b200(), ctl_cell_results_looked_matmul_b200()),
     };
     let mut ctls = vec![
-        CrossTableLookup::new(ctl_int8_bytes_looking_blake3(), ctl_int8_bytes_looked_input_quant()),
-        CrossTableLookup::new(ctl_block_scales_looking_blake3(), ctl_block_scales_looked_input_quant()),
-        CrossTableLookup::new(operand_codes, ctl_operand_codes_looked_input_quant()),
+        CrossTableLookup::new(ctl_int8_bytes_looking_blake3(), ctl_int8_bytes_looked_input_quant(device)),
+        CrossTableLookup::new(ctl_block_scales_looking_blake3(), ctl_block_scales_looked_input_quant(device)),
+        CrossTableLookup::new(operand_codes, ctl_operand_codes_looked_input_quant(device)),
         CrossTableLookup::new(
-            ctl_group_tuples_looking_input_quant(),
+            ctl_group_tuples_looking_input_quant(device),
             vec![ctl_looked_scale_group_tuple(scale)],
         ),
         CrossTableLookup::new(vec![ctl_cell_results_looking_xor_fold()], vec![cell_results]),
         CrossTableLookup::new(ctl_lottery_words_looking_blake3(), vec![ctl_lottery_words_looked_xor_fold()]),
         CrossTableLookup::new(vec![ctl_cv_routing_looking_blake3()], vec![ctl_cv_routing_looked_blake3()]),
     ];
-    ctls.extend(lut_cross_table_lookups(
+    let mut lut_channels = lut_cross_table_lookups(
         &lut_tables(device),
         &lut_inventories(device, scale).map(|(table, lookups)| (table.into(), lookups)),
+    );
+    ctls.extend(lut_channels.drain(..LUT_CHANNEL_PREFIX));
+    ctls.push(CrossTableLookup::new(
+        coefficient_looking(device),
+        vec![coefficient_looked(Table::Coefficient.into())],
     ));
+    ctls.extend(lut_channels);
     ctls
 }
 
@@ -182,10 +227,11 @@ pub(crate) fn lut_inventories<F: Field>(device: Device, scale: &ScaleProgram) ->
     };
     [
         (Table::Blake3, blake3_lut_lookups()),
-        (Table::InputQuant, input_quant_lut_lookups()),
+        (Table::InputQuant, input_quant_lut_lookups(device)),
         (Table::Scale, scale_lut_lookups(scale)),
         (Table::Matmul, matmul_luts),
         (Table::XorFold, xor_fold_lut_lookups()),
+        (Table::Coefficient, coefficient_lookups()),
     ]
 }
 
@@ -200,7 +246,7 @@ pub(crate) fn lut_inventories<F: Field>(device: Device, scale: &ScaleProgram) ->
 /// Every table must have at least one looking instance (a consumerless LUT signals a wiring
 /// bug); width consistency of every half is asserted by `CrossTableLookup::new`.
 pub fn lut_cross_table_lookups<F: Field>(
-    tables: &[LutTable; NUM_LUT_TABLES],
+    tables: &[LutTable],
     inventories: &[(TableIdx, Vec<LutLookup<F>>)],
 ) -> Vec<CrossTableLookup<F>> {
     tables
@@ -239,7 +285,7 @@ mod tests {
         for device in [Device::H100, Device::B200] {
             let scale = ScaleProgram::new_for_device(4, 4, 2048, 32, device);
             let ctls = all_cross_table_lookups::<F>(device, &scale);
-            assert_eq!(ctls.len(), NUM_CTL_CHANNELS, "seven main channels + one per LUT");
+            assert_eq!(ctls.len(), num_ctl_channels(device), "eight main channels + one per LUT");
         }
     }
 }

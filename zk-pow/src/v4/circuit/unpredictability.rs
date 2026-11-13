@@ -1,4 +1,4 @@
-//! Integer rule for the unpredictable-summands check and its tile-wide skip budget.
+//! Integer rules for unpredictable summands (check 3) and B200 noise coverage (check 4).
 //!
 //! For cell `(i, j)` and product index `u`, the real-valued test is `v_iju < T_iju`:
 //!
@@ -55,10 +55,10 @@
 //! one-sided:
 //!
 //! ```text
-//! 64*(log2 S + SCORE_BIAS) - 1.1  <  lambda  <=  64*(log2 S + SCORE_BIAS)
+//! 64*(log2 S + SCORE_BIAS) - 65/64  <  lambda  <=  64*(log2 S + SCORE_BIAS)
 //! ```
 //!
-//! (the `kappa` truncation `< 2^-13` relative plus the final floor — under `1.1` units of
+//! (the `kappa` truncation `< 2^-13` relative plus the final floor — under `65/64` units of
 //! `2^-6` octave in total, never above the true value).
 //!
 //! # The skip predicate
@@ -75,9 +75,9 @@
 //! `32 = 2^5`.
 //!
 //! The fixed-point rule relates to the ideal real-valued comparison as
-//! follows: `v < T` implies a skip, and a skip implies `v < T * 2^(2.2/64)` for
+//! follows: `v < T` implies a skip, and a skip implies `v < T * 2^(130/4096)` for
 //! `T > 0`. These bounds follow from each lambda's downward error of less than
-//! `1.1` units. The fixed-point rule defines the consensus count.
+//! `65/64` units. The fixed-point rule defines the consensus count.
 //!
 //! # AIR wiring and soundness direction
 //!
@@ -99,6 +99,53 @@
 //! # The budget
 //!
 //! The plaintext accepts iff `count <= floor(k*h*w/20)`, computed directly in integers.
+//!
+//! # B200 Gaussian noise coverage from the same score
+//!
+//! The additional row gate depends only on clean data and exact row scales. Put
+//! `a=alpha*X`, signal RMS `s=alpha*l2f`, and B200 noise RMS `sigma=s/2`. Its ideal
+//! Gaussian is `g=exp(-2*a^2/s^2)=exp(-a^2/(2*sigma^2))`. Subtract the zero-signal
+//! score `base=lambda(0,sigma)` and write `d=lambda(a,sigma)-base`. Monotonicity makes
+//! `d>=0`. The consensus kernel uses this difference directly, without a score-error
+//! correction:
+//!
+//! ```text
+//! T(d) = floor(65536*exp(-(2^(d/64)-1)/2)).
+//! ```
+//!
+//! [`GAUSSIAN_KERNEL`] is a Q16 approximation, which can overestimate the ideal Gaussian.
+//! Integer interval tests certify every entry, including `T(0)=65536`, and the zero at
+//! `d=291`; monotonicity proves the entire zero tail. The lambda score itself and check 3's
+//! one-sided approximation guarantee remain unchanged.
+//!
+//! [`noise_coverage_row_parameters`] derives the exact strip byte `t=Q8(RN32(g_strip*s))`,
+//! its decoded magnitude `c`, and the row coefficient/cap from the normalized sigma.
+//! Here `g_strip` is binary32 0.1 below `s=8`, otherwise binary32 0.08. The ideal noise-coverage terms
+//! and their integer approximations are
+//!
+//! ```text
+//! s >= 8: coverage_u = (21/16)*(c/s)*g_u
+//!         A = floor(65536*(21/16)*c/s),    K_u = T(d_u)
+//! s < 8:  coverage_u = min(g_u/8, cap(c))
+//!         A = 8192,                       K_u = min(T(d_u), 8*floor(65536*cap(c)))
+//! cap(c) = 0.0431 + 0.2738*(c-0.4).
+//! ```
+//!
+//! LOG16 region 0 remains the logarithm table. Regions `1+class` hold these capped
+//! kernels, keyed by the separate difference `d in [0,8192)`; oversized or negative
+//! differences cannot address another region. Class 0 is uncapped because its cap 65536
+//! is the maximum `T(d)`. DOWNSCALETHRESHOLD fixes the cap class and base,
+//! so the prover cannot select a more favorable kernel for a row.
+//!
+//! InputQuant accumulates `H=sum_u K_u`; Scale proves
+//! `A*H >= ceil(k*2^32/25)` using a nonnegative ranged surplus. Thus the mean integer
+//! noise coverage, measured in units `2^-32`, is at least `1/25`. This threshold applies to the
+//! computed coverage. For the ideal coverage, the one-sided score error gives
+//! `64*log2(1+a^2/sigma^2) < d+E` with `E=65/64`. Put `r=2^(E/64)`; then
+//! `g >= exp(-(r-1)/2)*g_hat^r`, where `g_hat=exp(-(2^(d/64)-1)/2)`. Row coefficients
+//! are at most `1/8`, so Jensen's inequality, including the downward coefficient/kernel/cap
+//! floors, gives `mean_ideal >= exp(-(r-1)/2)*(8/25)^r/8 > 0.03928`.
+//! This per-row B200 condition supplements the device-specific Matmul skip rule above.
 
 use crate::v4::api::public_params::Device;
 
@@ -494,9 +541,7 @@ mod tests {
         );
         // The lowest possible encoded grid is still high enough that every
         // satisfiable non-skip key fits the RC16 range.
-        const {
-            assert!(2 * LAMBDA_MAX - 128 * 114 - SKIP_THRESHOLD_OFFSET < 1 << 16);
-        }
+        const _: () = assert!(2 * LAMBDA_MAX - 128 * 114 - SKIP_THRESHOLD_OFFSET < 1 << 16);
     }
 
     /// Bounds the integer skip rule's error against the real-valued threshold.
@@ -596,5 +641,245 @@ mod tests {
         }
         assert_eq!(budget(20, 1, 1), 1);
         assert_eq!(budget(2048, 4, 16), 2048 * 64 / 20);
+    }
+}
+
+/// Q16 kernel floors for `65536 * exp(-(2^(d/64) - 1)/2)`.
+/// The zero-signal value is exactly 65536, so the table needs 17 value bits.
+/// The integer interval certificate below proves every entry and the zero tail.
+pub const GAUSSIAN_KERNEL: [u32; 291] = [
+    65536, 65180, 64822, 64462, 64101, 63737, 63372, 63005, 62636, 62265, 61892, 61518, 61142, 60764, 60384, 60003, 59620, 59235,
+    58849, 58460, 58071, 57679, 57287, 56892, 56496, 56099, 55700, 55299, 54897, 54494, 54089, 53683, 53276, 52867, 52457, 52046,
+    51634, 51220, 50806, 50390, 49973, 49555, 49136, 48717, 48296, 47874, 47452, 47028, 46604, 46179, 45754, 45328, 44901, 44474,
+    44046, 43618, 43189, 42760, 42330, 41901, 41471, 41040, 40610, 40180, 39749, 39319, 38888, 38458, 38028, 37598, 37168, 36738,
+    36309, 35881, 35453, 35025, 34598, 34172, 33746, 33321, 32897, 32474, 32051, 31630, 31210, 30790, 30372, 29955, 29540, 29126,
+    28713, 28301, 27892, 27483, 27077, 26672, 26268, 25867, 25467, 25070, 24674, 24280, 23889, 23500, 23112, 22727, 22345, 21965,
+    21587, 21212, 20839, 20469, 20101, 19736, 19374, 19015, 18659, 18305, 17955, 17607, 17263, 16922, 16583, 16248, 15917, 15588,
+    15263, 14941, 14623, 14308, 13996, 13688, 13383, 13082, 12785, 12491, 12201, 11915, 11632, 11353, 11078, 10807, 10539, 10275,
+    10016, 9759, 9507, 9259, 9014, 8774, 8537, 8305, 8076, 7851, 7630, 7413, 7200, 6990, 6785, 6583, 6386, 6192, 6002, 5816,
+    5634, 5456, 5281, 5111, 4944, 4780, 4621, 4465, 4312, 4164, 4019, 3877, 3739, 3605, 3474, 3346, 3222, 3101, 2983, 2869, 2758,
+    2650, 2545, 2443, 2344, 2248, 2156, 2066, 1979, 1894, 1813, 1734, 1657, 1584, 1512, 1444, 1377, 1313, 1252, 1193, 1135, 1080,
+    1028, 977, 928, 881, 836, 793, 752, 712, 674, 638, 603, 570, 538, 508, 479, 452, 426, 401, 377, 354, 333, 313, 293, 275, 258,
+    241, 226, 211, 197, 184, 172, 160, 149, 139, 129, 120, 111, 103, 96, 89, 82, 76, 70, 65, 59, 55, 50, 46, 43, 39, 36, 33, 30,
+    27, 25, 23, 21, 19, 17, 15, 14, 13, 11, 10, 9, 8, 7, 7, 6, 5, 5, 4, 4, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1,
+];
+
+/// Class zero is uncapped; the other classes cap the kernel at eight times the row cap.
+pub const GAUSSIAN_CAPS: [u64; 8] = [65536, 23488, 27976, 32464, 36944, 45920, 54888, 63864];
+/// LOG16's region 0 is check 3's logarithm ramp over `[0, 2^16)`.
+pub const LOG16_LOGARITHM_ROWS: u64 = 1 << 16;
+/// LOG16's regions `1..=NUM_GAUSSIAN_CLASSES` hold one Gaussian class each.
+pub const NUM_GAUSSIAN_CLASSES: u64 = GAUSSIAN_CAPS.len() as u64;
+/// Rows per Gaussian class; the row index is the entry's lambda difference `d`. Soundness
+/// needs nothing from this height — the region is its own key component, so an index at or
+/// beyond it addresses no row. Completeness needs every honest `d` below it: Scale proves
+/// `N >= max|X|` and `alpha = RN_bf16(RN32(448/N))`, so `|alpha X| < 452`; with noise RMS
+/// at least 2 and lambda error below 65/64, `d < 64*log2(1+226^2) + 65/64 < 1010`
+/// (certified by the const assertions below), eight times below this height.
+pub const GAUSSIAN_CLASS_HEIGHT: u64 = 8192;
+const _: () = assert!(1010 <= GAUSSIAN_CLASS_HEIGHT);
+
+/// Minimum row product, in units of 2^-32: `ceil(k * 65536^2 / 25)`.
+pub fn minimum_noise_coverage_product(k: usize) -> u64 {
+    ((k as u64) << 32).div_ceil(25)
+}
+
+/// The LOG16 value at the key tuple `(region, index)`: region 0 serves
+/// `floor(64 * log2 index)` for check 3 (0 at the phantom sentinel); region `1 + class`
+/// serves check 4's capped kernel `min(T(index), cap_class)`, zero at and beyond the
+/// kernel's support. Eight times each of the two largest small-RMS row caps exceeds every
+/// kernel value, so those rows and every large-RMS row use the uncapped class 0.
+pub fn noise_coverage_lookup_value(region: u64, index: u64) -> u64 {
+    assert!(region <= NUM_GAUSSIAN_CLASSES, "LOG16 region domain");
+    if region == 0 {
+        log2_fixed(index)
+    } else {
+        assert!(index < GAUSSIAN_CLASS_HEIGHT, "LOG16 class index domain");
+        (GAUSSIAN_KERNEL.get(index as usize).copied().unwrap_or(0) as u64).min(GAUSSIAN_CAPS[(region - 1) as usize])
+    }
+}
+
+/// Exact strip code, row coefficient, LOG16 region `1 + class`, and Gaussian key base for
+/// the B200 signal RMS `norm * 2^(encoding-282)`; the threshold retains both hardware
+/// rounds. An entry's lookup index is `lambda - key_base`, its lambda difference.
+pub fn noise_coverage_row_parameters(norm: u64, encoding: u64) -> (u64, u64, u64, u64) {
+    assert!((32768..65536).contains(&norm) && (269..=274).contains(&encoding));
+    // 155 = 282 - binary32's exponent bias; this scaling is exact.
+    let signal = norm as f32 * f32::from_bits((encoding as u32 - 155) << 23);
+    let factor = if encoding == 269 {
+        crate::v4::api::utils::DOWNSCALE_G_SMALL_RMS
+    } else {
+        crate::v4::api::utils::DOWNSCALE_G
+    };
+    let threshold = crate::v4::api::dtype::f32_to_fp8_e4m3(factor * signal).expect("finite strip threshold") as u64;
+    let class = if encoding == 269 && threshold <= 0x33 {
+        threshold - 0x2c
+    } else {
+        0
+    };
+    let coefficient = if encoding == 269 {
+        8192
+    } else {
+        let code_times_32 = (8 + (threshold & 7)) << ((threshold >> 3) - 5);
+        ((86016 * code_times_32) << (282 - encoding)) / (32 * norm)
+    };
+    let zero_log = log2_fixed((norm * norm) >> 17);
+    let key_base = 128 * encoding - 2624 + zero_log;
+    (threshold, coefficient, 1 + class, key_base)
+}
+
+#[cfg(test)]
+mod gaussian_tests {
+    use super::*;
+    use primitive_types::U512;
+
+    fn ceil_div(a: U512, b: U512) -> U512 {
+        a / b + U512::from(u64::from(a % b != U512::zero()))
+    }
+
+    fn multiply(a: (U512, U512), b: (U512, U512)) -> (U512, U512) {
+        ((a.0 * b.0) >> 192, ceil_div(a.1 * b.1, U512::one() << 192))
+    }
+
+    fn exponential(z: (U512, U512)) -> (U512, U512) {
+        let unit = U512::one() << 192;
+        let mut term = (unit, unit);
+        let mut sum = term;
+        for degree in 1..=128 {
+            term = multiply(term, z);
+            term = (term.0 / degree, ceil_div(term.1, U512::from(degree)));
+            sum = (sum.0 + term.0, sum.1 + term.1);
+        }
+        let next = multiply(term, z).1;
+        let next = ceil_div(next, U512::from(129));
+        assert!(z.1 < unit * 130);
+        let tail = ceil_div(next * unit * 130, unit * 130 - z.1);
+        (sum.0, sum.1 + tail)
+    }
+
+    #[test]
+    fn integer_intervals_certify_kernel_and_logarithm_floors() {
+        let unit = U512::one() << 192;
+        let mut ln2 = (U512::zero(), U512::zero());
+        let mut power = U512::from(3);
+        for index in 0..128 {
+            let denominator = power * (2 * index + 1);
+            ln2.0 += unit * 2 / denominator;
+            ln2.1 += ceil_div(unit * 2, denominator);
+            power *= 9;
+        }
+        ln2.1 += ceil_div(unit * 9, power * (4 * 257));
+        for difference in 0..=291 {
+            let numerator = U512::from(difference);
+            let exponent = (ln2.0 * numerator / 64, ceil_div(ln2.1 * numerator, U512::from(64)));
+            let power = exponential(exponent);
+            let w = ((power.0 - unit) / 2, ceil_div(power.1 - unit, U512::from(2)));
+            let denominator = exponential(w);
+            let lower = (unit * U512::from(65536) / denominator.1).low_u64();
+            let upper = (unit * U512::from(65536) / denominator.0).low_u64();
+            let expected = GAUSSIAN_KERNEL.get(difference as usize).copied().unwrap_or(0) as u64;
+            assert_eq!((lower, upper), (expected, expected), "kernel {difference}");
+        }
+        // Monotonicity extends the certified zero at 291 to every larger key.
+        for (index, &bound) in LOG_BOUNDS.iter().enumerate() {
+            let power = |integer: u64| {
+                let mut result = (U512::from(integer) << 177, U512::from(integer) << 177);
+                for _ in 0..6 {
+                    result = multiply(result, result);
+                }
+                result
+            };
+            let threshold = unit << index;
+            assert!(power(bound - 1).1 < threshold);
+            assert!(power(bound).0 >= threshold);
+        }
+    }
+
+    #[test]
+    fn regions_preserve_every_kernel_cap_and_logarithm() {
+        assert_eq!(NUM_GAUSSIAN_CLASSES, 8);
+        for (class, &cap) in GAUSSIAN_CAPS.iter().enumerate() {
+            for index in 0..GAUSSIAN_CLASS_HEIGHT {
+                let kernel = GAUSSIAN_KERNEL.get(index as usize).copied().unwrap_or(0) as u64;
+                assert_eq!(noise_coverage_lookup_value(1 + class as u64, index), kernel.min(cap));
+            }
+        }
+        for index in 0..LOG16_LOGARITHM_ROWS {
+            assert_eq!(noise_coverage_lookup_value(0, index), log2_fixed(index));
+        }
+    }
+
+    #[test]
+    fn row_parameters_match_exact_rationals_in_every_slot() {
+        let exact_threshold = |norm: u64, encoding: u64| {
+            let (factor, denominator_bits) = if encoding == 269 { (13421773, 27) } else { (5368709, 26) };
+            let product = norm * factor;
+            let shift = 64 - product.leading_zeros() - 24;
+            let quotient = product >> shift;
+            let remainder = product - (quotient << shift);
+            let halfway = 1 << (shift - 1);
+            let rounded = quotient + u64::from(remainder > halfway || (remainder == halfway && quotient & 1 != 0));
+            let numerator = rounded << shift;
+            let code_numerator = |code: u64| {
+                let units = if code < 8 {
+                    code
+                } else {
+                    (8 + (code & 7)) << ((code >> 3) - 1)
+                };
+                units << (282 + denominator_bits - encoding - 9)
+            };
+            let upper = (0..=126).find(|&code| code_numerator(code) >= numerator).unwrap();
+            let lower = upper - 1;
+            let low_distance = numerator - code_numerator(lower);
+            let high_distance = code_numerator(upper) - numerator;
+            if low_distance < high_distance || (low_distance == high_distance && lower & 1 == 0) {
+                lower
+            } else {
+                upper
+            }
+        };
+        for norm in 32768..65536 {
+            let mut large = None;
+            for encoding in 269..=274 {
+                let (code, coefficient, region, base) = noise_coverage_row_parameters(norm, encoding);
+                // 155 = 282 - binary32's exponent bias; this scaling is exact.
+                let signal = norm as f32 * f32::from_bits((encoding as u32 - 155) << 23);
+                let factor = if encoding == 269 { 0.1f32 } else { 0.08f32 };
+                assert_eq!(code, crate::v4::api::dtype::f32_to_fp8_e4m3(factor * signal).unwrap() as u64);
+                assert_eq!(code, exact_threshold(norm, encoding));
+                // A zero entry's lambda is the key base: its lookup index is 0.
+                assert_eq!(base, 128 * encoding - 2624 + log2_fixed((norm * norm) >> 17));
+                assert!((1..=NUM_GAUSSIAN_CLASSES).contains(&region));
+                let decoded = crate::v4::api::dtype::fp8_e4m3_to_f32(code as u8);
+                if encoding == 269 {
+                    let c32 = (decoded * 32.0) as u64;
+                    let cap = 65536 * (13690 * c32 - 3321 * 32) / (50000 * 32);
+                    assert_eq!(coefficient, 8192);
+                    for difference in [0, 1, 78, 158, 290, 291, 1009, GAUSSIAN_CLASS_HEIGHT - 1] {
+                        let kernel = GAUSSIAN_KERNEL.get(difference as usize).copied().unwrap_or(0) as u64;
+                        assert_eq!(noise_coverage_lookup_value(region, difference), kernel.min(8 * cap));
+                    }
+                } else {
+                    assert_eq!(region, 1, "large-RMS rows are uncapped");
+                    let c32 = (decoded * 32.0) as u64;
+                    let numerator = (86016 * c32) << (282 - encoding);
+                    let denominator = 32 * norm;
+                    assert!(coefficient * denominator <= numerator && numerator < (coefficient + 1) * denominator);
+                    assert!((6476..=7285).contains(&coefficient));
+                    if let Some((first_code, first_coefficient, first_base)) = large {
+                        assert_eq!(
+                            (code, coefficient, base),
+                            (
+                                first_code + 8 * (encoding - 270),
+                                first_coefficient,
+                                first_base + 128 * (encoding - 270)
+                            )
+                        );
+                    } else {
+                        large = Some((code, coefficient, base));
+                    }
+                }
+            }
+        }
     }
 }

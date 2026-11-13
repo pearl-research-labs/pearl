@@ -1,11 +1,13 @@
-//! InputQuantStark handles one A and one B element per trace row. It decodes
-//! `X = RNE_bf16(int8*block_scale)`, accumulates the row's prequant sum-of-squares and maximum,
-//! computes `noise_term = RNE_bf16(beta*n)`, and proves the fused
-//! `RNE_bf16(alpha*X + noise_term)` before casting to fp8. Here `n` is public-seed-derived
-//! noise; ScaleStark verifies the row statistics and `alpha`/`beta`. The table also proves
-//! the nonzero and flip counters it transports to ScaleStark. [`stark`] defines the AIR and
-//! witness, [`columns`] fixes the committed layout, and [`ctl`] declares cross-table and
-//! committed-LUT relations.
+//! Authenticated strip decode, row statistics, and device-specific FP8 input quantization.
+//!
+//! The fold proves `c=RN32(alpha*scale)`, exact `u=c*int8`, and fused
+//! `mixed=RN32(beta*noise+u)`. H100 exports `Q8(mixed)`; B200 additionally proves the
+//! quantize-first byte rewrite and accumulates the Gaussian noise coverage for the row policy gate.
+//! Norms and clean-data policy scores use the separate bf16 decode of `int8*scale`.
+//!
+//! [`stark`] gives the complete arithmetic statement, integer bounds, and boundary rules.
+//! [`columns`] defines the two physical layouts; [`ctl`] authenticates the inputs, imports
+//! Scale/Coefficient certificates, exports operands, and declares committed-LUT relations.
 
 pub mod columns;
 pub mod ctl;

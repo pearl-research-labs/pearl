@@ -198,6 +198,15 @@ impl Device {
     pub const fn sigma_encoding_offset(self) -> u64 {
         (14 + self.lg2_delta()) as u64
     }
+
+    /// Returns 1 when the quantization must include downscaling,
+    /// and 0 otherwise
+    pub const fn requires_downscaling(self) -> bool {
+        match self {
+            Self::H100 => false,
+            Self::B200 => true,
+        }
+    }
 }
 
 impl TryFrom<u8> for Device {
