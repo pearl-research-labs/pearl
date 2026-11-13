@@ -61,6 +61,9 @@ pub(super) fn drop_rows<F: RichField>(rows: Vec<Vec<F>>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
+
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField as F;
     use crate::field::types::Field;
