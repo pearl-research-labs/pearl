@@ -29,6 +29,8 @@ use crate::util::{reverse_bits, transpose};
 use plonky2_field::extension::FieldExtension;
 use plonky2_field::packable::Packable;
 
+mod prover;
+
 /// Hash natural-order rows into bit-reversed Merkle leaves.
 ///
 /// Each row is hashed independently on the prover worker pool.
@@ -215,6 +217,24 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: &[Option<&FftRootTable<F>>],
     ) -> Self {
+        Self::from_coeffs_with_options::<false>(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    fn from_coeffs_with_options<const PROVER: bool>(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: &[Option<&FftRootTable<F>>],
+    ) -> Self {
         let mut degree_bits = polynomials
             .iter()
             .map(|p| log2_strict(p.len()))
@@ -230,12 +250,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let lde_values = timed!(
                     timing,
                     "FFT + blinding",
-                    PolynomialBatch::<F, C, D>::lde_values(
-                        &polynomials[group_start..i + 1],
-                        rate_bits,
-                        blinding,
-                        fft_root_table[i]
-                    )
+                    if PROVER {
+                        crate::fri::oracle::lde_values_prover(
+                            &polynomials[group_start..i + 1],
+                            rate_bits,
+                            blinding,
+                            fft_root_table[i],
+                        )
+                    } else {
+                        PolynomialBatch::<F, C, D>::lde_values(
+                            &polynomials[group_start..i + 1],
+                            rate_bits,
+                            blinding,
+                            fft_root_table[i],
+                        )
+                    }
                 );
 
                 let mut leaf_group = timed!(timing, "transpose LDEs", transpose(&lde_values));
@@ -249,7 +278,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let batch_merkle_tree = timed!(
             timing,
             "build batch Merkle tree",
-            BatchMerkleTree::new(leaves, cap_height)
+            if PROVER {
+                BatchMerkleTree::new_prover(leaves, cap_height)
+            } else {
+                BatchMerkleTree::new(leaves, cap_height)
+            }
         );
 
         degree_bits.sort_unstable();
@@ -307,7 +340,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .map(|range| {
                 let roots =
                     crate::field::fft::fft_root_table(polynomials[range.start].len() << rate_bits);
-                let lde = PolynomialBatch::<F, C, D>::lde_values(
+                let lde = crate::fri::oracle::lde_values_prover(
                     &polynomials[range.clone()],
                     rate_bits,
                     false,
@@ -323,7 +356,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let batch_merkle_tree = timed!(
             timing,
             "build digest Merkle tree",
-            BatchMerkleTree::new(digest_leaves, cap_height)
+            BatchMerkleTree::new_prover(digest_leaves, cap_height)
         );
         Self {
             polynomials,
@@ -675,6 +708,15 @@ mod test {
             &mut timing,
             &[None; 4],
         );
+        let prover = BatchFriOracle::<F, C, D>::from_values_prover(
+            polynomials.iter().cloned().map(|p| p.fft()).collect(),
+            2,
+            false,
+            1,
+            &mut timing,
+            &[None; 4],
+        );
+        assert_eq!(ordinary, prover);
         let digests = BatchFriOracle::<F, C, D>::from_coeffs_with_digests(
             polynomials,
             vec![0..2, 2..4],

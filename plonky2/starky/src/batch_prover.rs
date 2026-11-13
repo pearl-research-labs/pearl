@@ -345,7 +345,7 @@ where
             .flat_map(|(_, values)| values)
             .collect();
         let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; values.len()];
-        Some(BatchFriOracle::from_values(
+        Some(BatchFriOracle::from_values_prover(
             values,
             rate_bits,
             false,
@@ -380,7 +380,7 @@ where
                 continue;
             }
             let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; values.len()];
-            let oracle = BatchFriOracle::from_values(
+            let oracle = BatchFriOracle::from_values_prover(
                 values,
                 rate_bits,
                 false,
@@ -518,8 +518,14 @@ where
                 continue;
             }
             let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; aux.len()];
-            let oracle =
-                BatchFriOracle::from_values(aux, rate_bits, false, cap_height, timing, &fft_tables);
+            let oracle = BatchFriOracle::from_values_prover(
+                aux,
+                rate_bits,
+                false,
+                cap_height,
+                timing,
+                &fft_tables,
+            );
             if let Some(caps) = &mut auxiliary_polys_caps {
                 caps.push(oracle.batch_merkle_tree.cap.clone());
             }
@@ -688,7 +694,7 @@ where
                 continue;
             }
             let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; coeffs.len()];
-            let oracle = BatchFriOracle::from_coeffs(
+            let oracle = BatchFriOracle::from_coeffs_prover(
                 coeffs,
                 rate_bits,
                 false,
@@ -729,7 +735,7 @@ where
                     coeffs, ranges, rate_bits, cap_height, timing,
                 )
             } else {
-                BatchFriOracle::from_coeffs(
+                BatchFriOracle::from_coeffs_prover(
                     coeffs,
                     rate_bits,
                     false,
