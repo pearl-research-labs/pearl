@@ -1,4 +1,4 @@
-//! Integer rules for unpredictable summands (check 3) and B200 row security (check 4).
+//! Integer rules for unpredictable summands (check 3) and B200 noise coverage (check 4).
 //!
 //! For cell `(i, j)` and product index `u`, the real-valued test is `v_iju < T_iju`:
 //!
@@ -100,7 +100,7 @@
 //!
 //! The plaintext accepts iff `count <= floor(k*h*w/20)`, computed directly in integers.
 //!
-//! # B200 Gaussian proxy from the same score
+//! # B200 Gaussian noise coverage from the same score
 //!
 //! The additional row gate depends only on clean data and exact row scales. Put
 //! `a=alpha*X`, signal RMS `s=alpha*l2f`, and B200 noise RMS `sigma=s/2`. Its ideal
@@ -118,15 +118,15 @@
 //! `d=291`; monotonicity proves the entire zero tail. The lambda score itself and check 3's
 //! one-sided approximation guarantee remain unchanged.
 //!
-//! [`security_row_parameters`] derives the exact strip byte `t=Q8(RN32(g_strip*s))`,
+//! [`noise_coverage_row_parameters`] derives the exact strip byte `t=Q8(RN32(g_strip*s))`,
 //! its decoded magnitude `c`, and the row coefficient/cap from the normalized sigma.
-//! Here `g_strip` is binary32 0.1 below `s=8`, otherwise binary32 0.08. The ideal proxies
+//! Here `g_strip` is binary32 0.1 below `s=8`, otherwise binary32 0.08. The ideal noise-coverage terms
 //! and their integer approximations are
 //!
 //! ```text
-//! s >= 8: proxy_u = (21/16)*(c/s)*g_u
+//! s >= 8: coverage_u = (21/16)*(c/s)*g_u
 //!         A = floor(65536*(21/16)*c/s),    K_u = T(d_u)
-//! s < 8:  proxy_u = min(g_u/8, cap(c))
+//! s < 8:  coverage_u = min(g_u/8, cap(c))
 //!         A = 8192,                       K_u = min(T(d_u), 8*floor(65536*cap(c)))
 //! cap(c) = 0.0431 + 0.2738*(c-0.4).
 //! ```
@@ -139,8 +139,8 @@
 //!
 //! InputQuant accumulates `H=sum_u K_u`; Scale proves
 //! `A*H >= ceil(k*2^32/25)` using a nonnegative ranged surplus. Thus the mean integer
-//! proxy, measured in units `2^-32`, is at least `1/25`. This threshold applies to the
-//! computed proxy. For the ideal proxy, the one-sided score error gives
+//! noise coverage, measured in units `2^-32`, is at least `1/25`. This threshold applies to the
+//! computed coverage. For the ideal coverage, the one-sided score error gives
 //! `64*log2(1+a^2/sigma^2) < d+E` with `E=65/64`. Put `r=2^(E/64)`; then
 //! `g >= exp(-(r-1)/2)*g_hat^r`, where `g_hat=exp(-(2^(d/64)-1)/2)`. Row coefficients
 //! are at most `1/8`, so Jensen's inequality, including the downward coefficient/kernel/cap
@@ -680,7 +680,7 @@ pub const GAUSSIAN_CLASS_HEIGHT: u64 = 8192;
 const _: () = assert!(1010 <= GAUSSIAN_CLASS_HEIGHT);
 
 /// Minimum row product, in units of 2^-32: `ceil(k * 65536^2 / 25)`.
-pub fn minimum_security_product(k: usize) -> u64 {
+pub fn minimum_noise_coverage_product(k: usize) -> u64 {
     ((k as u64) << 32).div_ceil(25)
 }
 
@@ -689,7 +689,7 @@ pub fn minimum_security_product(k: usize) -> u64 {
 /// serves check 4's capped kernel `min(T(index), cap_class)`, zero at and beyond the
 /// kernel's support. Eight times each of the two largest small-RMS row caps exceeds every
 /// kernel value, so those rows and every large-RMS row use the uncapped class 0.
-pub fn security_lookup_value(region: u64, index: u64) -> u64 {
+pub fn noise_coverage_lookup_value(region: u64, index: u64) -> u64 {
     assert!(region <= NUM_GAUSSIAN_CLASSES, "LOG16 region domain");
     if region == 0 {
         log2_fixed(index)
@@ -702,7 +702,7 @@ pub fn security_lookup_value(region: u64, index: u64) -> u64 {
 /// Exact strip code, row coefficient, LOG16 region `1 + class`, and Gaussian key base for
 /// the B200 signal RMS `norm * 2^(encoding-282)`; the threshold retains both hardware
 /// rounds. An entry's lookup index is `lambda - key_base`, its lambda difference.
-pub fn security_row_parameters(norm: u64, encoding: u64) -> (u64, u64, u64, u64) {
+pub fn noise_coverage_row_parameters(norm: u64, encoding: u64) -> (u64, u64, u64, u64) {
     assert!((32768..65536).contains(&norm) && (269..=274).contains(&encoding));
     // 155 = 282 - binary32's exponent bias; this scaling is exact.
     let signal = norm as f32 * f32::from_bits((encoding as u32 - 155) << 23);
@@ -801,11 +801,11 @@ mod gaussian_tests {
         for (class, &cap) in GAUSSIAN_CAPS.iter().enumerate() {
             for index in 0..GAUSSIAN_CLASS_HEIGHT {
                 let kernel = GAUSSIAN_KERNEL.get(index as usize).copied().unwrap_or(0) as u64;
-                assert_eq!(security_lookup_value(1 + class as u64, index), kernel.min(cap));
+                assert_eq!(noise_coverage_lookup_value(1 + class as u64, index), kernel.min(cap));
             }
         }
         for index in 0..LOG16_LOGARITHM_ROWS {
-            assert_eq!(security_lookup_value(0, index), log2_fixed(index));
+            assert_eq!(noise_coverage_lookup_value(0, index), log2_fixed(index));
         }
     }
 
@@ -841,7 +841,7 @@ mod gaussian_tests {
         for norm in 32768..65536 {
             let mut large = None;
             for encoding in 269..=274 {
-                let (code, coefficient, region, base) = security_row_parameters(norm, encoding);
+                let (code, coefficient, region, base) = noise_coverage_row_parameters(norm, encoding);
                 // 155 = 282 - binary32's exponent bias; this scaling is exact.
                 let signal = norm as f32 * f32::from_bits((encoding as u32 - 155) << 23);
                 let factor = if encoding == 269 { 0.1f32 } else { 0.08f32 };
@@ -857,7 +857,7 @@ mod gaussian_tests {
                     assert_eq!(coefficient, 8192);
                     for difference in [0, 1, 78, 158, 290, 291, 1009, GAUSSIAN_CLASS_HEIGHT - 1] {
                         let kernel = GAUSSIAN_KERNEL.get(difference as usize).copied().unwrap_or(0) as u64;
-                        assert_eq!(security_lookup_value(region, difference), kernel.min(8 * cap));
+                        assert_eq!(noise_coverage_lookup_value(region, difference), kernel.min(8 * cap));
                     }
                 } else {
                     assert_eq!(region, 1, "large-RMS rows are uncapped");

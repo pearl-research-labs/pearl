@@ -31,7 +31,7 @@
 //! [`Fp8System::prove`] regenerates the six main traces from the private strips, chaining
 //! each table's inputs from its producer exactly like the consistency driver (InputQuant from
 //! the strips and the public binary32 noise, Scale from InputQuant's group tuples — plus
-//! B200's per-row Gaussian security sums —, Coefficient from InputQuant's per-block
+//! B200's per-row Gaussian noise-coverage sums —, Coefficient from InputQuant's per-block
 //! alpha/scale fields, device-specific Matmul from the final noised codes (post-rewrite on
 //! B200) and lambda scores, XorFold from the cell results and census counts, Blake3 from the
 //! strip bytes and the folded lottery words), accumulates the committed-LUT multiplicities
@@ -341,13 +341,13 @@ impl<F: RichField + Extendable<D>, const D: usize> ScaleBackend<F, D> {
         &self,
         a_rows: &[ScaleRowTuple],
         b_rows: &[ScaleRowTuple],
-        security_sums: &[u64],
+        noise_coverage_sums: &[u64],
     ) -> (Vec<PolynomialValues<F>>, Vec<F>) {
         let program = self.program();
         let public_inputs = program.public_inputs_for_device::<F>();
         let trace = match self {
             Self::H100(_) => column_major(&program.generate_trace::<F>(a_rows, b_rows).0),
-            Self::B200(_) => column_major(&program.generate_b200_trace::<F>(a_rows, b_rows, security_sums)),
+            Self::B200(_) => column_major(&program.generate_b200_trace::<F>(a_rows, b_rows, noise_coverage_sums)),
         };
         (trace, public_inputs)
     }
@@ -808,7 +808,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
 
         // ---- Native InputQuant advice: per-group side witnesses plus the compact per-side
         // outputs the downstream tables consume (Matmul's final codes and lambda scores,
-        // Scale's row tuples and B200 security sums, Coefficient's block inputs) — one fused
+        // Scale's row tuples and B200 noise-coverage sums, Coefficient's block inputs) — one fused
         // parallel build, shared by `Arc` across the dead padding groups. ----
         let iq_native = timed!(
             timing,
@@ -852,10 +852,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
                     plonky2_maybe_rayon::join(
                         || {
                             // ---- Scale: one aggregate tuple per matrix row, exactly what
-                            // InputQuant committed, plus B200's per-row security sums. ----
-                            let (scale_trace, scale_pis) =
-                                self.scale
-                                    .generate_trace(&iq_native.a_tuples, &iq_native.b_tuples, &iq_native.security_sums);
+                            // InputQuant committed, plus B200's per-row noise-coverage sums. ----
+                            let (scale_trace, scale_pis) = self.scale.generate_trace(
+                                &iq_native.a_tuples,
+                                &iq_native.b_tuples,
+                                &iq_native.noise_coverage_sums,
+                            );
                             // ---- Coefficient: every block's binary32 `alpha * block_scale`. ----
                             let coefficient_rows = self.coefficient.generate_trace(&iq_native.coefficient_blocks);
                             (scale_trace, scale_pis, coefficient_rows)
@@ -1672,7 +1674,8 @@ mod tests {
         if system.device() == Device::B200 {
             let mut tampered = proof.clone();
             let position = system.main_table_positions()[Table::Scale as usize];
-            tampered.public_inputs[position][super::super::scale_stark::columns::MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT] -= F::ONE;
+            tampered.public_inputs[position][super::super::scale_stark::columns::MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT] -=
+                F::ONE;
             assert!(rejects(&mut system, &tampered, &fx.public_inputs, &cap, STATEMENT_DIGEST));
         }
 

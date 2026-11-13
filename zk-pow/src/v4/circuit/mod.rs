@@ -30,7 +30,7 @@
 //! published proof. `consistency` (test-only) builds the shared end-to-end fixture: one
 //! verifier-parsed job, every trace, every channel balanced. [`unpredictability`] is the
 //! canonical integer mirror of the census skip rule and consensus budget the AIRs enforce,
-//! and defines B200's Gaussian kernels for the row security gate. `fp32` documents the
+//! and defines B200's Gaussian kernels for the noise-coverage gate. `fp32` documents the
 //! shared signed alignment, single RNE, and round-to-odd proxy. Policy scores depend on
 //! clean decoded inputs, while Matmul consumes the device's noised output bytes, including
 //! B200's conditional downscale rewrite.

@@ -85,12 +85,12 @@ pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWi
     ));
     columns.push(Column::single(m.sigma_norm));
     if program.device == crate::v4::api::public_params::Device::B200 {
-        let security = &super::columns::B200_SCALE_COL_MAP;
+        let noise_coverage = &super::columns::B200_SCALE_COL_MAP;
         columns.extend(Column::singles([
-            security.strip_threshold,
-            security.security_region,
-            security.security_key_base,
-            security.security_sum,
+            noise_coverage.strip_threshold,
+            noise_coverage.noise_coverage_region,
+            noise_coverage.noise_coverage_key_base,
+            noise_coverage.noise_coverage_sum,
         ]));
     }
     TableWithColumns::new(
@@ -538,7 +538,7 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
     let one = F::ONE;
     let neg = -one;
     if program.device == crate::v4::api::public_params::Device::B200 {
-        let security = &super::columns::B200_SCALE_COL_MAP;
+        let noise_coverage = &super::columns::B200_SCALE_COL_MAP;
         let live = Filter::from_column(Column::linear_combination_with_constant([(m.is_pad, neg)], one));
         lookups.push(LutLookup {
             table: LutTable::DownscaleThreshold,
@@ -552,15 +552,15 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
                 -F::from_canonical_u64(32768 * 257),
             )],
             values: Column::singles([
-                security.strip_threshold,
-                security.security_coefficient,
-                security.security_region,
-                security.security_key_base,
+                noise_coverage.strip_threshold,
+                noise_coverage.noise_coverage_coefficient,
+                noise_coverage.noise_coverage_region,
+                noise_coverage.noise_coverage_key_base,
             ])
             .collect(),
             filter: live.clone(),
         });
-        for column in security.security_surplus {
+        for column in noise_coverage.noise_coverage_surplus {
             lookups.push(LutLookup::rc16_filtered(Column::single(column), live.clone()));
         }
     }

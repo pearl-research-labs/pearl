@@ -225,7 +225,7 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
             // check 4's capped Gaussian class at the lambda difference.
             LutTable::Log16 => {
                 let (region, index) = log16_key(key as usize);
-                columns[0].push(f(super::super::unpredictability::security_lookup_value(region, index)));
+                columns[0].push(f(super::super::unpredictability::noise_coverage_lookup_value(region, index)));
             }
             LutTable::Fp32Tools => {
                 let (operation, argument) = fp32_tool_key(key as usize);
@@ -241,7 +241,7 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
             }
             LutTable::DownscaleThreshold => {
                 let (threshold, coefficient, region, base) =
-                    super::super::unpredictability::security_row_parameters(32768 + key, 269 + slot as u64);
+                    super::super::unpredictability::noise_coverage_row_parameters(32768 + key, 269 + slot as u64);
                 for (column, value) in columns.iter_mut().zip([threshold, coefficient, region, base]) {
                     column.push(f(value));
                 }

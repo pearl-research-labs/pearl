@@ -31,14 +31,14 @@
 //!    `q=max(e(Z)-W,e(M)-18)` and `E_GRID=q+157`, omitting zero magnitudes.
 //!    The exact consensus rule is `lambda_A + lambda_B < 128*E_GRID + 45952`.
 //!    When both magnitudes are zero, `E_GRID=0` and no summands are skipped.
-//! 4. **Row security** (downscaling hardware only, i.e. B200). Every row `i`
-//!    of both sides keeps its computed mean Gaussian security proxy at or above `1/25`. With the
+//! 4. **Noise coverage** (downscaling hardware only, i.e. B200). Every row `i`
+//!    of both sides keeps its computed mean Gaussian noise coverage at or above `1/25`. With the
 //!    signal RMS `s_i = alpha_i * l2_i`, the row's E4M3 strip code `c_i` and
-//!    `g_iu = exp(-2 X_bar_iu^2 / s_i^2)`, the proxy is `21/16 * c_i / s_i * g_iu` for
+//!    `g_iu = exp(-2 X_bar_iu^2 / s_i^2)`, the noise-coverage term is `21/16 * c_i / s_i * g_iu` for
 //!    `s_i >= 8` and `min(g_iu / 8, GET_CAP(c_i))` below. The consensus rule approximates `g`
 //!    through check 3's `lambda` certificate; the ideal
-//!    mean proxy is guaranteed above `0.03928`, rather than `1/25`. See
-//!    `JackpotPolicy::row_security_ok`.
+//!    mean noise coverage is guaranteed above `0.03928`, rather than `1/25`. See
+//!    `JackpotPolicy::row_noise_coverage_ok`.
 //!
 //! The verdict is a BINARY gate (rejected / accepted): a `D`-dependent credit
 //! would incentivize shaping data toward incoherence.
@@ -100,11 +100,11 @@ pub struct OperandStrip {
 pub type JackpotMessage = [u8; 4 * JACKPOT_ENTRIES];
 
 /// Check 4's fixed-point resolution: the row coefficient `A`, the kernel `T` and the
-/// cap are integers in units of `1/PROXY_SCALE`, so a row's `A * sum_u T'_u` is in
-/// units of `1/PROXY_SCALE^2`.
-const PROXY_SCALE: u64 = 1 << 16;
-/// Check 4 accepts a row iff its mean proxy is at least `SECURITY_MIN = 1/SECURITY_MIN_INVERSE`.
-const SECURITY_MIN_INVERSE: u64 = 25;
+/// cap are integers in units of `1/COVERAGE_SCALE`, so a row's `A * sum_u T'_u` is in
+/// units of `1/COVERAGE_SCALE^2`.
+const COVERAGE_SCALE: u64 = 1 << 16;
+/// Check 4 accepts a row iff its mean noise coverage is at least `NOISE_COVERAGE_MIN = 1/NOISE_COVERAGE_MIN_INVERSE`.
+const NOISE_COVERAGE_MIN_INVERSE: u64 = 25;
 
 /// Per-row noise stds `sigma_i = DELTA * alpha_i * l2_i` (in quantized units),
 /// from the floored norms and scales recorded at quantization time.
@@ -183,8 +183,8 @@ impl JackpotPolicy {
             return Ok(None);
         };
 
-        // Check 4: row security of every row, on downscaling hardware only.
-        if self.device == Device::B200 && !(Self::row_security_ok(a, k)? && Self::row_security_ok(b, k)?) {
+        // Check 4: noise coverage of every row, on downscaling hardware only.
+        if self.device == Device::B200 && !(Self::row_noise_coverage_ok(a, k)? && Self::row_noise_coverage_ok(b, k)?) {
             return Ok(None);
         }
         // The final matrix feeds the lottery fold.
@@ -287,21 +287,21 @@ impl JackpotPolicy {
         Ok(Some(acc))
     }
 
-    /// Check 4: every row's computed mean security proxy is at least
-    /// `1/SECURITY_MIN_INVERSE`, using check 3's lambda differences directly.
+    /// Check 4: every row's computed mean noise coverage is at least
+    /// `1/NOISE_COVERAGE_MIN_INVERSE`, using check 3's lambda differences directly.
     /// Let `g_u = exp(-w_u/2)` such that `w_u = 4 * (X / sigma)^2`.
-    /// The security proxy function is:
+    /// The per-element noise-coverage term is:
     /// if `sigma >= 8`:
     ///     `p_u = 21/16 * 2 * X / sigma * exp(-w_u/2)`
     /// else:
     ///     `p_u = min(exp(-w_u/2) / 8, GET_CAP(X))`.
-    /// The security proxy check is then:
-    ///     sum_u p_u >= k / SECURITY_MIN_INVERSE.
-    /// This method approximates the security proxy check in integer arithmetic,
+    /// The noise-coverage check is then:
+    ///     sum_u p_u >= k / NOISE_COVERAGE_MIN_INVERSE.
+    /// This method approximates the noise-coverage check in integer arithmetic,
     /// making use of the already computed `lambda` values from check 3.`
     /// Returns `Ok(true)` if the check passes, `Ok(false)` if it fails, and Èrr` on error.`
-    fn row_security_ok(side: &OperandStrip, k: usize) -> Result<bool> {
-        let threshold = (k as u64 * PROXY_SCALE * PROXY_SCALE).div_ceil(SECURITY_MIN_INVERSE);
+    fn row_noise_coverage_ok(side: &OperandStrip, k: usize) -> Result<bool> {
+        let threshold = (k as u64 * COVERAGE_SCALE * COVERAGE_SCALE).div_ceil(NOISE_COVERAGE_MIN_INVERSE);
         for (row, (&alpha, &l2)) in side.clean.chunks(k).zip(side.built.alpha.iter().zip(&side.built.l2)) {
             let (coefficient, kernel_cap) = gauss_row_constants(alpha, l2)?;
             let lambda_noise = lambda(Device::B200, alpha, 0, l2);
@@ -322,7 +322,7 @@ impl JackpotPolicy {
 }
 
 /// Check 4's per-row constants `(A, T_cap)`, which are used for the following check:
-/// A * sum_u min(T_u, T_cap) >= k * PROXY_SCALE^2 / SECURITY_MIN_INVERSE, where T_u is computed by [`gauss_kernel`].
+/// A * sum_u min(T_u, T_cap) >= k * COVERAGE_SCALE^2 / NOISE_COVERAGE_MIN_INVERSE, where T_u is computed by [`gauss_kernel`].
 fn gauss_row_constants(alpha: u16, l2: u16) -> Result<(u64, u64)> {
     const GAUSSIAN_SCALE: f64 = 1.3125;
     // GET_CAP(code) = CAP_OFFSET + CAP_SLOPE * (code - CAP_PIVOT).
@@ -336,17 +336,17 @@ fn gauss_row_constants(alpha: u16, l2: u16) -> Result<(u64, u64)> {
     let scaled_rms = bf16_to_f32(alpha) * bf16_to_f32(l2);
     ensure!(
         (4.0..256.0).contains(&scaled_rms),
-        "B200 security proxy requires signal RMS in [4, 256)"
+        "B200 noise coverage requires signal RMS in [4, 256)"
     );
     // Preserve the reference's RN32 multiplication followed by RN E4M3.
     let code = f64::from(fp8_e4m3_to_f32(f32_to_fp8_e4m3(downscale_g(&[scaled_rms])[0] * scaled_rms)?));
-    let scale = PROXY_SCALE as f64;
+    let scale = COVERAGE_SCALE as f64;
     if scaled_rms >= SMALL_RMS_THRESHOLD {
         let coefficient = (scale * GAUSSIAN_SCALE * code / f64::from(scaled_rms)).floor() as u64;
-        Ok((coefficient, PROXY_SCALE))
+        Ok((coefficient, COVERAGE_SCALE))
     } else {
         let cap = (scale * (CAP_OFFSET + CAP_SLOPE * (code - CAP_PIVOT))).floor() as u64;
-        Ok((PROXY_SCALE / SMALL_RMS_DIVISOR, SMALL_RMS_DIVISOR * cap))
+        Ok((COVERAGE_SCALE / SMALL_RMS_DIVISOR, SMALL_RMS_DIVISOR * cap))
     }
 }
 
@@ -357,10 +357,10 @@ fn gauss_row_constants(alpha: u16, l2: u16) -> Result<(u64, u64)> {
 /// `2^16 * exp(-w / 2)`.
 /// We do not apply the lambda error:
 /// `w <= w_hi(d) = 2^(d / 64) - 1`.
-/// so this can overestimate the ideal Gaussian. But the ideal mean proxy is guaranteed above `0.03928`
+/// so this can overestimate the ideal Gaussian. But the ideal mean noise coverage is guaranteed above `0.03928`
 fn gauss_kernel(difference: u64) -> u64 {
     let w = (difference as f64 / 64.0).exp2() - 1.0;
-    (PROXY_SCALE as f64 * (-0.5 * w).exp()).floor() as u64
+    (COVERAGE_SCALE as f64 * (-0.5 * w).exp()).floor() as u64
 }
 
 #[cfg(test)]
@@ -505,7 +505,7 @@ mod tests {
         // d=0 is exactly 65536. Every other supported value is more than 1e-3 from
         // an integer, so faithfully rounded libm implementations compute the same floors.
         for d in 1..291u64 {
-            let exact = PROXY_SCALE as f64 * (-0.5 * ((d as f64 / 64.0).exp2() - 1.0)).exp();
+            let exact = COVERAGE_SCALE as f64 * (-0.5 * ((d as f64 / 64.0).exp2() - 1.0)).exp();
             assert!((exact - exact.round()).abs() > 1e-3, "d={d}: {exact}");
         }
         assert!((291..=LAMBDA_MAX).all(|d| gauss_kernel(d) == 0));
@@ -524,15 +524,15 @@ mod tests {
     }
 
     #[test]
-    fn row_security_rejects_flat_rows_and_accepts_varied_rows() {
+    fn row_noise_coverage_rejects_flat_rows_and_accepts_varied_rows() {
         let (k, r) = (64usize, 16usize);
         // The varied fixture rows sit comfortably above the 1/25 floor.
         let (a, a_built) = build(&honest_rows(2, k), k, r, 0);
-        assert!(JackpotPolicy::row_security_ok(&side(a, a_built), k).unwrap());
+        assert!(JackpotPolicy::row_noise_coverage_ok(&side(a, a_built), k).unwrap());
         // Rows whose entries all sit at the row's RMS (`X = +-l2`) have g = exp(-2)
-        // everywhere: mean proxy ~ 21/16 * 0.08 * 0.135 ~ 0.014 < 0.04.
+        // everywhere: mean noise coverage ~ 21/16 * 0.08 * 0.135 ~ 0.014 < 0.04.
         let flat: Vec<u16> = (0..2 * k).map(|i| if i % 3 == 0 { 0xBF80 } else { 0x3F80 }).collect();
         let (a, a_built) = build(&flat, k, r, 0);
-        assert!(!JackpotPolicy::row_security_ok(&side(a, a_built), k).unwrap());
+        assert!(!JackpotPolicy::row_noise_coverage_ok(&side(a, a_built), k).unwrap());
     }
 }

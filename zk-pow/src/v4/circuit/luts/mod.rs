@@ -155,7 +155,7 @@ pub enum LutTable {
     /// the sum-of-squares score used by check 3 (0 at the phantom sentinel). Region `1 + class`
     /// serves check 4's Q16 capped Gaussian kernel at `index=lambda-lambda(0,sigma)` in
     /// `[0,8192)`. The region is its own key component, so a negative or oversized index
-    /// cannot alias another region. See `unpredictability::security_lookup_value`.
+    /// cannot alias another region. See `unpredictability::noise_coverage_lookup_value`.
     Log16,
     /// `(operation, argument) -> (left_power, right_power)` for binary32 rounding/alignment.
     Fp32Tools,

@@ -221,13 +221,13 @@ pub struct B200InputQuantSideColumns<T: Copy> {
     pub common: InputQuantSideColumns<T>,
     pub downscale: DownscaleColumns<T>,
     /// Group-constant LOG16 region `1 + class` of the row's Gaussian lookups (0 on phantom rows).
-    pub security_region: T,
-    /// Group-constant offset; the Gaussian lookup index is `lambda - security_key_base`.
-    pub security_key_base: T,
+    pub noise_coverage_region: T,
+    /// Group-constant offset; the Gaussian lookup index is `lambda - noise_coverage_key_base`.
+    pub noise_coverage_key_base: T,
     /// Q16 Gaussian kernel, including the small-noise cap.
     pub gaussian_value: T,
     /// Inclusive kernel sum, reset at each operand row.
-    pub security_sum: T,
+    pub noise_coverage_sum: T,
 }
 
 #[repr(C)]

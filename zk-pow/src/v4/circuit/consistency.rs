@@ -597,7 +597,7 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
             let map = &super::input_quant_stark::columns::B200_INPUT_QUANT_COL_MAP;
             let sums: Vec<_> = [(&map.a, h), (&map.b, w)]
                 .into_iter()
-                .flat_map(|(side, count)| (0..count).map(move |group| to_u64(rows[group * k + k - 1][side.security_sum])))
+                .flat_map(|(side, count)| (0..count).map(move |group| to_u64(rows[group * k + k - 1][side.noise_coverage_sum])))
                 .collect();
             ScaleRows::B200(scale_program.generate_b200_trace::<F>(&tuples(false), &tuples(true), &sums))
         }

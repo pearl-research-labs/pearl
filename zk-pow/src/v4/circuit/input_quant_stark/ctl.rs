@@ -208,12 +208,12 @@ pub fn ctl_group_tuples_looking_input_quant<F: Field>(device: Device) -> Vec<Tab
             ]));
             if device == Device::B200 {
                 let map = &super::columns::B200_INPUT_QUANT_COL_MAP;
-                let security = [&map.a, &map.b][index];
+                let noise_coverage = [&map.a, &map.b][index];
                 columns.extend(Column::singles([
-                    security.downscale.strip_threshold,
-                    security.security_region,
-                    security.security_key_base,
-                    security.security_sum,
+                    noise_coverage.downscale.strip_threshold,
+                    noise_coverage.noise_coverage_region,
+                    noise_coverage.noise_coverage_key_base,
+                    noise_coverage.noise_coverage_sum,
                 ]));
             }
             let live = [m.schedule.a_live, m.schedule.b_live][index];
@@ -741,15 +741,15 @@ pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
     // and the group CTL binds both here. Keying (region,d) as two components is essential:
     // a negative d or d>=8192 has no row in this region and cannot borrow a neighboring
     // region's entry. InputQuant sums gaussian_value over the group and exports the total;
-    // Scale multiplies it by the row coefficient and proves the mean proxy >=1/25.
+    // Scale multiplies it by the row coefficient and proves the mean noise coverage >=1/25.
     if device == Device::B200 {
         let m = &super::columns::B200_INPUT_QUANT_COL_MAP;
         for (side, live) in [(&m.a, m.schedule.a_live), (&m.b, m.schedule.b_live)] {
             lookups.push(LutLookup {
                 table: LutTable::Log16,
                 keys: vec![
-                    Column::single(side.security_region),
-                    Column::linear_combination([(side.common.lambda, F::ONE), (side.security_key_base, -F::ONE)]),
+                    Column::single(side.noise_coverage_region),
+                    Column::linear_combination([(side.common.lambda, F::ONE), (side.noise_coverage_key_base, -F::ONE)]),
                 ],
                 values: vec![Column::single(side.gaussian_value)],
                 filter: Filter::from_column(Column::single(live)),

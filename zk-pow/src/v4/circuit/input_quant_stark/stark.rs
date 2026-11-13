@@ -161,13 +161,13 @@
 //! K(d) = min(T(d), cap_class),    0 <= d < 8192.
 //! ```
 //!
-//! `T(0)=65536` and `T(d)=0` for `d >= 291`. This proxy uses the lambda difference
+//! `T(0)=65536` and `T(d)=0` for `d >= 291`. This coverage term uses the lambda difference
 //! without a score-error correction and can overestimate the ideal Gaussian; see
 //! [`crate::v4::circuit::unpredictability`] for the ideal row bound. Its integer table
 //! is certified in `unpredictability::gaussian_tests`.
 //! The two-component key `(region, d)` prevents an invalid difference from aliasing
 //! another region. A running sum adds `K(d)` per element, resets at group boundaries,
-//! and exports its group-final value to Scale, which enforces the minimum row proxy.
+//! and exports its group-final value to Scale, which enforces the minimum row noise coverage.
 //! The Gaussian lookup and rewrite use the same authenticated sigma/threshold data.
 //!
 //! # Trace boundaries, lookups, and integer soundness
@@ -223,7 +223,9 @@ use crate::v4::circuit::fp32::{
 use crate::v4::circuit::scale_stark::stark::{
     CUT_BIAS, NORM_FLOOR_CODE, SLOT_MAX, ScaleRowTuple, rne_sqrt_hat, rnernd_reference,
 };
-use crate::v4::circuit::unpredictability::{LambdaWitness, lambda_witness, security_lookup_value, security_row_parameters};
+use crate::v4::circuit::unpredictability::{
+    LambdaWitness, lambda_witness, noise_coverage_lookup_value, noise_coverage_row_parameters,
+};
 use crate::v4::circuit::utils::evaluator::Evaluator;
 use crate::v4::circuit::utils::native_evaluator::NativeEvaluator;
 use crate::v4::circuit::utils::symbolic_evaluator::SymbolicEvaluator;
@@ -298,7 +300,7 @@ impl InputQuantProgram {
     /// Builds the per-group side witnesses natively, together with the compact per-side
     /// outputs the downstream tables consume: the final device codes (the downscale rewrite's
     /// output on B200) and summand scores for Matmul, the per-matrix-row tuples and B200's
-    /// Gaussian security sums for Scale, and every block's `(alpha, block scale)` codes for
+    /// Gaussian noise-coverage sums for Scale, and every block's `(alpha, block scale)` codes for
     /// Coefficient. One parallel job per (group, side); every dead side shares one canonical
     /// all-zero witness by `Arc` (the trailing group may be truncated and reads only its first
     /// `len` elements, whose values do not depend on the witness length).
@@ -349,7 +351,7 @@ impl InputQuantProgram {
                     let side = SideNative {
                         witness: Arc::clone(&dead_canonical),
                         live: false,
-                        security: None,
+                        noise_coverage: None,
                     };
                     return (side, Vec::new(), Vec::new(), None, Vec::new());
                 }
@@ -384,15 +386,15 @@ impl InputQuantProgram {
                     .collect();
                 // B200: the side's LOG16 region and key base, and each element's capped Gaussian
                 // value with the running sum Scale's row gate consumes.
-                let security = (self.device == Device::B200).then(|| {
-                    let (_, _, region, base) = security_row_parameters(witness.scales.sigma_norm, witness.scales.sigma_enc);
+                let noise_coverage = (self.device == Device::B200).then(|| {
+                    let (_, _, region, base) = noise_coverage_row_parameters(witness.scales.sigma_norm, witness.scales.sigma_enc);
                     let mut sum = 0u64;
                     let terms = witness
                         .elements
                         .iter()
                         .map(|e| {
                             let index = e.score.lambda.checked_sub(base).expect("Gaussian index is nonnegative");
-                            let value = security_lookup_value(region, index);
+                            let value = noise_coverage_lookup_value(region, index);
                             sum += value;
                             (value, sum)
                         })
@@ -402,13 +404,13 @@ impl InputQuantProgram {
                 let side = SideNative {
                     witness: Arc::new(witness),
                     live: true,
-                    security,
+                    noise_coverage,
                 };
                 (side, codes, lambdas, Some(tuple), coefficient_blocks)
             })
             .collect();
 
-        // Reassemble in (group, A then B) order. Security sums and Coefficient blocks list all
+        // Reassemble in (group, A then B) order. Noise-coverage sums and Coefficient blocks list all
         // of A's rows/blocks, then all of B's.
         let mut native = InputQuantNative {
             groups: Vec::with_capacity(n_groups),
@@ -418,20 +420,22 @@ impl InputQuantProgram {
             b_lambdas: Vec::with_capacity(w * k),
             a_tuples: Vec::with_capacity(h),
             b_tuples: Vec::with_capacity(w),
-            security_sums: Vec::new(),
+            noise_coverage_sums: Vec::new(),
             coefficient_blocks: Vec::with_capacity((h + w) * blocks),
         };
-        let mut b_security_sums = Vec::new();
+        let mut b_noise_coverage_sums = Vec::new();
         let mut b_blocks = Vec::with_capacity(w * blocks);
         let mut built = built.into_iter();
         for _ in 0..n_groups {
             let (side_a, a_codes, a_lambdas, a_tuple, a_blocks) = built.next().expect("A side output");
             let (side_b, b_codes, b_lambdas, b_tuple, blocks_b) = built.next().expect("B side output");
-            if let Some((_, _, terms)) = &side_a.security {
-                native.security_sums.push(terms.last().expect("live side has k elements").1);
+            if let Some((_, _, terms)) = &side_a.noise_coverage {
+                native
+                    .noise_coverage_sums
+                    .push(terms.last().expect("live side has k elements").1);
             }
-            if let Some((_, _, terms)) = &side_b.security {
-                b_security_sums.push(terms.last().expect("live side has k elements").1);
+            if let Some((_, _, terms)) = &side_b.noise_coverage {
+                b_noise_coverage_sums.push(terms.last().expect("live side has k elements").1);
             }
             native.a_codes.extend(a_codes);
             native.b_codes.extend(b_codes);
@@ -443,7 +447,7 @@ impl InputQuantProgram {
             b_blocks.extend(blocks_b);
             native.groups.push([side_a, side_b]);
         }
-        native.security_sums.extend(b_security_sums);
+        native.noise_coverage_sums.extend(b_noise_coverage_sums);
         native.coefficient_blocks.extend(b_blocks);
         native
     }
@@ -523,12 +527,12 @@ impl InputQuantProgram {
                 // Each live side's LOG16 region and key base, its element's capped Gaussian
                 // value and the running sum (phantom sides keep the zero columns).
                 for (output, side) in [(&mut row.a, side_a), (&mut row.b, side_b)] {
-                    if let Some((region, base, terms)) = &side.security {
+                    if let Some((region, base, terms)) = &side.noise_coverage {
                         let (value, sum) = terms[j];
-                        output.security_region = F::from_canonical_u64(*region);
-                        output.security_key_base = F::from_canonical_u64(*base);
+                        output.noise_coverage_region = F::from_canonical_u64(*region);
+                        output.noise_coverage_key_base = F::from_canonical_u64(*base);
                         output.gaussian_value = F::from_canonical_u64(value);
-                        output.security_sum = F::from_canonical_u64(sum);
+                        output.noise_coverage_sum = F::from_canonical_u64(sum);
                     }
                 }
                 let row: [F; NUM_B200_INPUT_QUANT_COLUMNS] = row.into();
@@ -962,12 +966,12 @@ struct SideWitness {
 pub(crate) struct SideNative {
     witness: Arc<SideWitness>,
     live: bool,
-    security: Option<SideSecurity>,
+    noise_coverage: Option<SideNoiseCoverage>,
 }
 
 /// A B200 live side's Gaussian gate inputs: the LOG16 region, the key base, and each element's
 /// `(capped Gaussian value, running sum)`.
-type SideSecurity = (u64, u64, Vec<(u64, u64)>);
+type SideNoiseCoverage = (u64, u64, Vec<(u64, u64)>);
 
 /// The native InputQuant advice: per-group side witnesses plus the compact per-side outputs
 /// the downstream tables consume (live rows only, A then B).
@@ -982,8 +986,8 @@ pub(crate) struct InputQuantNative {
     /// Scale's per-matrix-row tuples.
     pub(crate) a_tuples: Vec<ScaleRowTuple>,
     pub(crate) b_tuples: Vec<ScaleRowTuple>,
-    /// B200: every live row's final Gaussian security sum, A rows then B rows (empty on H100).
-    pub(crate) security_sums: Vec<u64>,
+    /// B200: every live row's final Gaussian noise-coverage sum, A rows then B rows (empty on H100).
+    pub(crate) noise_coverage_sums: Vec<u64>,
     /// Coefficient's `[alpha code, block scale magnitude code]` per block, A blocks then B.
     pub(crate) coefficient_blocks: Vec<[u16; 2]>,
 }
@@ -2248,21 +2252,21 @@ pub(crate) fn eval_input_quant_constraints<V, S, E, const WIDTH: usize>(
                 let phantom = evaluator.sub(one, live);
                 for value in [
                     side.downscale.strip_threshold,
-                    side.security_region,
-                    side.security_key_base,
+                    side.noise_coverage_region,
+                    side.noise_coverage_key_base,
                     side.gaussian_value,
-                    side.security_sum,
+                    side.noise_coverage_sum,
                 ] {
                     evaluator.constraint_eq_if(phantom, value, zero);
                 }
                 let not_final = evaluator.sub(one, current.schedule.is_group_final);
-                evaluator.constraint_eq_if(not_final, side.security_region, following.security_region);
-                evaluator.constraint_eq_if(not_final, side.security_key_base, following.security_key_base);
-                let initial = evaluator.sub(side.security_sum, side.gaussian_value);
+                evaluator.constraint_eq_if(not_final, side.noise_coverage_region, following.noise_coverage_region);
+                evaluator.constraint_eq_if(not_final, side.noise_coverage_key_base, following.noise_coverage_key_base);
+                let initial = evaluator.sub(side.noise_coverage_sum, side.gaussian_value);
                 evaluator.constraint_first_row(initial);
-                let carried = evaluator.mul(not_final, side.security_sum);
+                let carried = evaluator.mul(not_final, side.noise_coverage_sum);
                 let next_sum = evaluator.add(carried, following.gaussian_value);
-                evaluator.constraint_eq(following.security_sum, next_sum);
+                evaluator.constraint_eq(following.noise_coverage_sum, next_sum);
                 evaluate_downscale(
                     evaluator,
                     &side.downscale,
@@ -2586,11 +2590,11 @@ mod tests {
                 let b200 = &super::super::columns::B200_INPUT_QUANT_COL_MAP;
                 let sums: Vec<u64> = [(&b200.a, h), (&b200.b, w)]
                     .into_iter()
-                    .flat_map(|(side, count)| (0..count).map(move |g| read(side.security_sum, g * k + k - 1)))
+                    .flat_map(|(side, count)| (0..count).map(move |g| read(side.noise_coverage_sum, g * k + k - 1)))
                     .collect();
-                assert_eq!(native.security_sums, sums);
+                assert_eq!(native.noise_coverage_sums, sums);
             } else {
-                assert!(native.security_sums.is_empty());
+                assert!(native.noise_coverage_sums.is_empty());
             }
             let num_rows = program.num_rows();
             let mut cols: Vec<Vec<F>> = (0..WIDTH).map(|_| vec![F::ZERO; num_rows]).collect();
@@ -3474,7 +3478,7 @@ mod tests {
     }
 
     #[test]
-    fn b200_security_sums_cover_minimum_ragged_and_maximum_k() {
+    fn b200_noise_coverage_sums_cover_minimum_ragged_and_maximum_k() {
         use super::super::columns::B200_INPUT_QUANT_COL_MAP;
         for k in [1024, 1056, 65536] {
             let program = InputQuantProgram {
@@ -3503,7 +3507,7 @@ mod tests {
             let map = &B200_INPUT_QUANT_COL_MAP;
             for side in [&map.a, &map.b] {
                 let expected: u64 = rows[..k].iter().map(|row| to_u64(row[side.gaussian_value])).sum();
-                assert_eq!(to_u64(rows[k - 1][side.security_sum]), expected);
+                assert_eq!(to_u64(rows[k - 1][side.noise_coverage_sum]), expected);
                 assert!(expected <= (k as u64) << 16);
                 for row in &rows[..k] {
                     assert!(to_u64(row[side.gaussian_value]) <= 1 << 16);
@@ -3512,7 +3516,7 @@ mod tests {
                 }
             }
             if k == 65536 {
-                assert_eq!(to_u64(rows[k - 1][map.a.security_sum]), 1 << 32);
+                assert_eq!(to_u64(rows[k - 1][map.a.noise_coverage_sum]), 1 << 32);
             }
         }
     }
@@ -3572,8 +3576,8 @@ mod tests {
                     use crate::v4::circuit::unpredictability::{GAUSSIAN_CLASS_HEIGHT, NUM_GAUSSIAN_CLASSES};
                     assert!(to_u64(row[side.common.x_enc]) <= 276);
                     assert!(to_u64(row[side.common.sum_of_squares_top]) >= 8192);
-                    assert!((1..=NUM_GAUSSIAN_CLASSES).contains(&to_u64(row[side.security_region])));
-                    let index = to_u64(row[side.common.lambda] - row[side.security_key_base]);
+                    assert!((1..=NUM_GAUSSIAN_CLASSES).contains(&to_u64(row[side.noise_coverage_region])));
+                    let index = to_u64(row[side.common.lambda] - row[side.noise_coverage_key_base]);
                     assert!(index < GAUSSIAN_CLASS_HEIGHT);
                 }
             }
@@ -3594,10 +3598,10 @@ mod tests {
         for index in [0, 1, program.k - 1, program.k, program.h * program.k, rows.len() - 1] {
             for side in [&map.a, &map.b] {
                 for column in [
-                    side.security_region,
-                    side.security_key_base,
+                    side.noise_coverage_region,
+                    side.noise_coverage_key_base,
                     side.gaussian_value,
-                    side.security_sum,
+                    side.noise_coverage_sum,
                     side.downscale.strip_threshold,
                 ] {
                     let mut forged = rows.clone();

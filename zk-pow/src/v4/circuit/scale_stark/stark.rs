@@ -82,7 +82,7 @@
 //! Passing keys fit within RC16 on the pinned exponent domain; a negative key wraps far
 //! outside the table range. This matches the native policy's exact f64 comparison.
 //!
-//! # B200 strip parameters and row security gate (check 4)
+//! # B200 strip parameters and noise-coverage gate (check 4)
 //!
 //! Let `s = alpha*l2f` be the exact signal RMS and `sigma=s/2` the B200 noise standard
 //! deviation. S2 normalizes the exact 16-bit product `P=M(alpha)*M(l2f)` using
@@ -123,7 +123,7 @@
 //! Three RC16 limbs certify the surplus. Since `H <= k*2^16 <= 2^32` and `A <= 8192`,
 //! the product is at most `2^45`; both sides are below the Goldilocks modulus, so this
 //! equality proves an integer lower bound. Dividing by `k*2^32` gives the required mean
-//! computed proxy of at least `1/25`; its ideal-proxy bound is documented in
+//! computed noise coverage of at least `1/25`; its ideal-coverage bound is documented in
 //! [`crate::v4::circuit::unpredictability`]. Padding sets the B200 extensions to zero and
 //! disables the minimum. H100 carries none of these extensions. Check 3's tile-wide skip budget is
 //! enforced by Matmul/XorFold separately; this is an additional per-row gate.
@@ -174,7 +174,7 @@ use starky::stark::Stark;
 use super::columns::{
     ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, B200ScaleColumnsView, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT,
     DEAD_LIMIT_B_PUBLIC_INPUT, DOS_EXP_PUBLIC_INPUT, DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT,
-    FmaBlock, K_PUBLIC_INPUT, L2_SUM_LIMBS, MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT, MulBlock, NUM_B200_SCALE_COLUMNS,
+    FmaBlock, K_PUBLIC_INPUT, L2_SUM_LIMBS, MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT, MulBlock, NUM_B200_SCALE_COLUMNS,
     NUM_B200_SCALE_PUBLIC_INPUTS, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView, UPPER_BORROW_BITS,
     WL2_PUBLIC_INPUT,
 };
@@ -456,7 +456,7 @@ impl ScaleProgram {
         let mut inputs = self.public_inputs::<F>().to_vec();
         if self.device == Device::B200 {
             inputs.push(F::from_canonical_u64(
-                super::super::unpredictability::minimum_security_product(self.k),
+                super::super::unpredictability::minimum_noise_coverage_product(self.k),
             ));
         }
         inputs
@@ -466,12 +466,12 @@ impl ScaleProgram {
         &self,
         a_rows: &[ScaleRowTuple],
         b_rows: &[ScaleRowTuple],
-        security_sums: &[u64],
+        noise_coverage_sums: &[u64],
     ) -> Vec<[F; NUM_B200_SCALE_COLUMNS]> {
         assert_eq!(self.device, Device::B200);
-        assert_eq!(security_sums.len(), self.live_rows());
+        assert_eq!(noise_coverage_sums.len(), self.live_rows());
         let (rows, _) = self.generate_trace::<F>(a_rows, b_rows);
-        let minimum = super::super::unpredictability::minimum_security_product(self.k);
+        let minimum = super::super::unpredictability::minimum_noise_coverage_product(self.k);
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| {
@@ -487,18 +487,18 @@ impl ScaleProgram {
                         + common.sigma_sig_is_wide.to_canonical_u64()
                         + 13;
                     let (threshold, coefficient, region, base) =
-                        super::super::unpredictability::security_row_parameters(norm, encoding);
-                    let sum = security_sums[index];
+                        super::super::unpredictability::noise_coverage_row_parameters(norm, encoding);
+                    let sum = noise_coverage_sums[index];
                     let surplus = (coefficient * sum)
                         .checked_sub(minimum)
                         .expect("policy-rejected Gaussian row");
                     assert!(surplus < 1 << 48);
                     output.strip_threshold = F::from_canonical_u64(threshold);
-                    output.security_coefficient = F::from_canonical_u64(coefficient);
-                    output.security_region = F::from_canonical_u64(region);
-                    output.security_key_base = F::from_canonical_u64(base);
-                    output.security_sum = F::from_canonical_u64(sum);
-                    output.security_surplus =
+                    output.noise_coverage_coefficient = F::from_canonical_u64(coefficient);
+                    output.noise_coverage_region = F::from_canonical_u64(region);
+                    output.noise_coverage_key_base = F::from_canonical_u64(base);
+                    output.noise_coverage_sum = F::from_canonical_u64(sum);
+                    output.noise_coverage_surplus =
                         core::array::from_fn(|limb| F::from_canonical_u64((surplus >> (16 * limb)) & 65535));
                 }
                 output.into()
@@ -1483,26 +1483,26 @@ pub(crate) fn eval_scale_constraints<V, S, E, const WIDTH: usize, const PUBLIC_I
         let zero = eval.i32(0);
         for value in [
             row.strip_threshold,
-            row.security_coefficient,
-            row.security_region,
-            row.security_key_base,
-            row.security_sum,
+            row.noise_coverage_coefficient,
+            row.noise_coverage_region,
+            row.noise_coverage_key_base,
+            row.noise_coverage_sum,
         ]
         .into_iter()
-        .chain(row.security_surplus)
+        .chain(row.noise_coverage_surplus)
         {
             eval.constraint_eq_if(lv.is_pad, value, zero);
         }
         let mut surplus = zero;
-        for (limb, value) in row.security_surplus.into_iter().enumerate() {
+        for (limb, value) in row.noise_coverage_surplus.into_iter().enumerate() {
             let weight = eval.u64(1 << (16 * limb));
             surplus = eval.mad(value, weight, surplus);
         }
-        let minimum = eval.scalar(pis[MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT]);
+        let minimum = eval.scalar(pis[MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT]);
         let one = eval.i32(1);
         let live = eval.sub(one, lv.is_pad);
         let required = eval.mad(live, minimum, surplus);
-        let product = eval.mul(row.security_coefficient, row.security_sum);
+        let product = eval.mul(row.noise_coverage_coefficient, row.noise_coverage_sum);
         // CTL-bound kernels give sum <= 2^32 and coefficient <= 8192: product <= 2^45.
         // The three ranged limbs give surplus < 2^48, so this equality cannot wrap.
         eval.constraint_eq(product, required);
@@ -2200,7 +2200,7 @@ mod tests {
     fn b200_gaussian_rows_surplus_padding_and_recursive_constraints() {
         use super::super::columns::B200_SCALE_COL_MAP;
         use crate::v4::circuit::luts::{LutChecker, LutTable};
-        use crate::v4::circuit::unpredictability::{lambda, security_lookup_value, security_row_parameters};
+        use crate::v4::circuit::unpredictability::{lambda, noise_coverage_lookup_value, noise_coverage_row_parameters};
         type B200 = ScaleStark<F, D, NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS>;
         let program = ScaleProgram::new_for_device(1, 2, 8192, 32, Device::B200);
         let mut spike = vec![0i8; program.k];
@@ -2222,14 +2222,14 @@ mod tests {
             .map(|(input, row)| {
                 let row: &ScaleColumnsView<F> = row.borrow();
                 let encoding = to_u64(row.alpha_exp) + to_u64(row.l2_floored_exponent) + to_u64(row.sigma_sig_is_wide) + 13;
-                let (_, _, region, base) = security_row_parameters(to_u64(row.sigma_norm), encoding);
+                let (_, _, region, base) = noise_coverage_row_parameters(to_u64(row.sigma_norm), encoding);
                 let alpha = (to_u64(row.alpha_exp) * 128 + to_u64(row.alpha_mantissa)) as u16;
                 let l2 = (to_u64(row.l2_floored_exponent) * 128 + to_u64(row.l2_floored_significand) - 128) as u16;
                 input
                     .iter()
                     .map(|&value| {
                         let x = f32_to_bf16(f32::from(value)).unwrap();
-                        security_lookup_value(region, lambda(Device::B200, alpha, x, l2) - base)
+                        noise_coverage_lookup_value(region, lambda(Device::B200, alpha, x, l2) - base)
                     })
                     .sum()
             })
@@ -2263,18 +2263,18 @@ mod tests {
                 "Gaussian rows",
             )
             .unwrap();
-        assert_eq!(rows[0][m.security_coefficient], F::from_canonical_u64(8192));
-        assert!(to_u64(rows[1][m.security_coefficient]) < 8192);
+        assert_eq!(rows[0][m.noise_coverage_coefficient], F::from_canonical_u64(8192));
+        assert!(to_u64(rows[1][m.noise_coverage_coefficient]) < 8192);
         for index in [0, rows.len() - 1] {
             for column in [
                 m.strip_threshold,
-                m.security_coefficient,
-                m.security_region,
-                m.security_key_base,
-                m.security_sum,
+                m.noise_coverage_coefficient,
+                m.noise_coverage_region,
+                m.noise_coverage_key_base,
+                m.noise_coverage_sum,
             ]
             .into_iter()
-            .chain(m.security_surplus)
+            .chain(m.noise_coverage_surplus)
             {
                 let mut forged = rows.clone();
                 forged[index][column] += F::ONE;
@@ -2293,7 +2293,7 @@ mod tests {
             }
         }
         let mut forged = rows.clone();
-        forged[0][m.security_surplus[0]] = -F::ONE;
+        forged[0][m.noise_coverage_surplus[0]] = -F::ONE;
         assert!(
             !valid(&forged, &public_inputs)
                 || checker
@@ -2306,7 +2306,7 @@ mod tests {
                     .is_err()
         );
         let mut wrong_minimum = public_inputs.clone();
-        wrong_minimum[MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT] += F::ONE;
+        wrong_minimum[MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT] += F::ONE;
         assert!(!valid(&rows, &wrong_minimum));
         assert_eq!(
             lookups
@@ -2349,16 +2349,16 @@ mod tests {
         let iq = &B200_INPUT_QUANT_COL_MAP;
         for (table, row, column) in [
             (2, 0, m.strip_threshold),
-            (2, 0, m.security_region),
-            (2, 0, m.security_key_base),
-            (2, 0, m.security_sum),
+            (2, 0, m.noise_coverage_region),
+            (2, 0, m.noise_coverage_key_base),
+            (2, 0, m.noise_coverage_sum),
             (2, 0, m.common.group_key),
-            (1, program.k - 1, iq.a.security_region),
-            (1, program.k - 1, iq.b.security_region),
-            (1, program.k - 1, iq.a.security_key_base),
-            (1, program.k - 1, iq.b.security_key_base),
-            (1, program.k - 1, iq.a.security_sum),
-            (1, program.k - 1, iq.b.security_sum),
+            (1, program.k - 1, iq.a.noise_coverage_region),
+            (1, program.k - 1, iq.b.noise_coverage_region),
+            (1, program.k - 1, iq.a.noise_coverage_key_base),
+            (1, program.k - 1, iq.b.noise_coverage_key_base),
+            (1, program.k - 1, iq.a.noise_coverage_sum),
+            (1, program.k - 1, iq.b.noise_coverage_sum),
             (1, program.k - 1, iq.schedule.element_index),
             (1, program.k - 1, iq.schedule.a_live),
             (1, program.k - 1, iq.schedule.is_group_final),
@@ -2490,7 +2490,7 @@ mod tests {
         pis: &[F; NUM_SCALE_PUBLIC_INPUTS],
     ) -> Result<(), String> {
         // The common inventory only: these traces are the device-independent rows, so the
-        // B200 security lookups (which read the appended columns) are checked by the
+        // B200 noise-coverage lookups (which read the appended columns) are checked by the
         // dedicated B200 tests below.
         let lookups = scale_common_lut_lookups::<F>(program);
         let mut tables: Vec<_> = lookups.iter().map(|lookup| lookup.table).collect();

@@ -2,7 +2,7 @@
 //!
 //! The fold proves `c=RN32(alpha*scale)`, exact `u=c*int8`, and fused
 //! `mixed=RN32(beta*noise+u)`. H100 exports `Q8(mixed)`; B200 additionally proves the
-//! quantize-first byte rewrite and accumulates the Gaussian proxy for the row policy gate.
+//! quantize-first byte rewrite and accumulates the Gaussian noise coverage for the row policy gate.
 //! Norms and clean-data policy scores use the separate bf16 decode of `int8*scale`.
 //!
 //! [`stark`] gives the complete arithmetic statement, integer bounds, and boundary rules.

@@ -66,7 +66,11 @@ pub fn mine(header: &IncompleteBlockHeader, parent: &BlockHeader, device: Device
     loop {
         let mut values = |key| {
             let mut bytes = vec![0; ROWS * K];
-            rng.fill_bytes(&mut bytes);
+            // Match the fixtures' centered triangular distribution for B200 noise coverage.
+            for byte in &mut bytes {
+                let x = rng.next_u32();
+                *byte = ((x & 127) as i16 + ((x >> 16) & 127) as i16 - 127) as i8 as u8;
+            }
             plane(&bytes, key)
         };
         let proof = PlainProofV4 {

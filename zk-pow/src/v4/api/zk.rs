@@ -977,14 +977,16 @@ mod tests {
         let (_, params) = plain.parse_proof(&header).expect("fixture job must parse");
         let job = Fp8Job::derive(&params, &header).expect("fixture job must derive");
         let expected_pis = job.expected_public_inputs();
-        use crate::v4::circuit::scale_stark::columns::{MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT, NUM_B200_SCALE_PUBLIC_INPUTS};
+        use crate::v4::circuit::scale_stark::columns::{
+            MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT, NUM_B200_SCALE_PUBLIC_INPUTS,
+        };
         assert_eq!(
             expected_pis[crate::v4::circuit::ctl::Table::Scale as usize].len(),
             NUM_B200_SCALE_PUBLIC_INPUTS
         );
         assert_eq!(
-            expected_pis[crate::v4::circuit::ctl::Table::Scale as usize][MINIMUM_SECURITY_PRODUCT_PUBLIC_INPUT],
-            F::from_canonical_u64(crate::v4::circuit::unpredictability::minimum_security_product(
+            expected_pis[crate::v4::circuit::ctl::Table::Scale as usize][MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT],
+            F::from_canonical_u64(crate::v4::circuit::unpredictability::minimum_noise_coverage_product(
                 params.common_dim() as usize
             ))
         );
