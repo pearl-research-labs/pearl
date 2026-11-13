@@ -9,10 +9,62 @@ use crate::field::types::Field;
 use crate::hash::hash_types::RichField;
 use plonky2_maybe_rayon::*;
 
-use super::SALT_SIZE;
+use super::{PolynomialBatch, SALT_SIZE};
+use crate::field::extension::Extendable;
+use crate::field::polynomial::PolynomialValues;
+use crate::plonk::config::GenericConfig;
+use crate::util::timing::TimingTree;
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    PolynomialBatch<F, C, D>
+{
+    /// Commits prover columns using the optimized LDE and leaf preparation.
+    /// Verifier setup uses the original `from_values` constructor.
+    pub fn from_values_prover(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        let coeffs = crate::timed!(
+            timing,
+            "IFFT",
+            values.into_par_iter().map(|v| v.ifft()).collect()
+        );
+        Self::from_coeffs_prover(
+            coeffs,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    /// Prover-only counterpart of `from_coeffs`; commitments have identical encoding.
+    pub fn from_coeffs_prover(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        Self::from_coeffs_with_options::<true>(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+}
 
 /// Evaluates equal-degree columns on the LDE coset, then appends random salt columns.
-pub(super) fn values<F: RichField>(
+pub(crate) fn values<F: RichField>(
     polynomials: &[PolynomialCoeffs<F>],
     rate_bits: usize,
     blinding: bool,
@@ -80,6 +132,21 @@ pub(super) fn pad<F: Field>(poly: PolynomialCoeffs<F>, rate_bits: usize) -> Poly
 mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn prover_commitment_matches_original_constructor() {
+        type F = GoldilocksField;
+        type C = crate::plonk::config::PoseidonGoldilocksConfig;
+        let values = vec![PolynomialValues::new(
+            (0..32).map(F::from_canonical_usize).collect(),
+        )];
+        let mut timing = TimingTree::default();
+        let reference =
+            PolynomialBatch::<F, C, 2>::from_values(values.clone(), 2, false, 1, &mut timing, None);
+        let prover =
+            PolynomialBatch::<F, C, 2>::from_values_prover(values, 2, false, 1, &mut timing, None);
+        assert_eq!(prover, reference);
+    }
 
     #[test]
     fn small_coset_ldes_match_original_fft() {

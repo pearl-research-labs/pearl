@@ -21,9 +21,10 @@ use crate::timed;
 use crate::util::fft_par::coset_lde_par;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits};
+use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
 
 mod lde;
+pub(crate) use lde::values as lde_values_prover;
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
@@ -90,17 +91,45 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
+        Self::from_coeffs_with_options::<false>(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    fn from_coeffs_with_options<const PROVER: bool>(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
         let degree = polynomials[0].len();
         let lde_values = timed!(
             timing,
             "FFT + blinding",
-            Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
+            if PROVER {
+                lde::values(&polynomials, rate_bits, blinding, fft_root_table)
+            } else {
+                Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
+            }
         );
 
         let leaves = timed!(
             timing,
             "transpose LDEs",
-            crate::util::transpose_bitrev(&lde_values)
+            if PROVER {
+                crate::util::transpose_bitrev(&lde_values)
+            } else {
+                let mut leaves = transpose(&lde_values);
+                reverse_index_bits_in_place(&mut leaves);
+                leaves
+            }
         );
         let merkle_tree = timed!(
             timing,
@@ -127,7 +156,25 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         blinding: bool,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Vec<Vec<F>> {
-        lde::values(polynomials, rate_bits, blinding, fft_root_table)
+        let degree = polynomials[0].len();
+
+        // If blinding, salt with two random elements to each leaf vector.
+        let salt_size = if blinding { SALT_SIZE } else { 0 };
+
+        polynomials
+            .par_iter()
+            .map(|p| {
+                assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
+                p.lde(rate_bits)
+                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                    .values
+            })
+            .chain(
+                (0..salt_size)
+                    .into_par_iter()
+                    .map(|_| F::rand_vec(degree << rate_bits)),
+            )
+            .collect()
     }
 
     /// Fetches LDE values at the `index * step`th point.

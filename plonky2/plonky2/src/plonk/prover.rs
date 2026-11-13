@@ -212,7 +212,7 @@ where
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_values(
+        PolynomialBatch::<F, C, D>::from_values_prover(
             wires_values,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
@@ -281,7 +281,7 @@ where
     let partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
-        PolynomialBatch::from_values(
+        PolynomialBatch::from_values_prover(
             zs_partial_products,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
@@ -372,7 +372,7 @@ where
     let quotient_polys_random_commitment = timed!(
         timing,
         "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs(
+        PolynomialBatch::<F, C, D>::from_coeffs_prover(
             all_quotient_poly_chunks_random,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
