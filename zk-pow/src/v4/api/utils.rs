@@ -180,12 +180,7 @@ const fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
 
 // Cache the unchanged product representation; the stored exponent is intentionally unnormalized.
 static FP8_PRODUCTS: [[GFloat; 256]; 256] = {
-    let zero = GFloat {
-        sign: false,
-        exponent: FP8_PRODUCT_ZERO_EXP,
-        significand: 0,
-    };
-    let mut products = [[zero; 256]; 256];
+    let mut products = [[multiply_fp8_to_gfloat(0, 0, FP8_PRODUCT_ZERO_EXP); 256]; 256];
     let mut a = 0;
     while a < 256 {
         let mut b = 0;
@@ -320,21 +315,17 @@ fn matmul_fp8_windowed(
             continue;
         }
         // Reuse these table rows across every output column.
-        let products: Vec<_> = a_row.iter().map(|&a| &FP8_PRODUCTS[a as usize]).collect();
-        // A rank-32 replay is one FP8-only group, producing a normal FP32 value
-        // or zero. Its singleton re-sum only canonicalizes signed zero.
-        if k == MMA_GROUP_PRODUCTS && acc.is_none() && !record_partials && significand_width == B200_FP8_WIDTH {
-            for j in 0..n {
-                let b_col = &b[j * k..(j + 1) * k];
-                let values: [GFloat; MMA_GROUP_PRODUCTS] = core::array::from_fn(|k| products[k][b_col[k] as usize]);
-                let value: f32 = windowed_group_sum(&values, zero_exp, significand_width).into();
-                // The original singleton re-sum canonicalizes signed zero.
-                out[i * n + j] = if value == 0.0 { 0.0 } else { value };
-            }
-            continue;
-        }
+        let product_rows: Vec<_> = a_row.iter().map(|&a| &FP8_PRODUCTS[a as usize]).collect();
         for j in 0..n {
             let b_col = &b[j * k..(j + 1) * k];
+            // One rank-32 group needs no carry conversion or singleton re-sum.
+            if k == MMA_GROUP_PRODUCTS && acc.is_none() && !record_partials && significand_width == B200_FP8_WIDTH {
+                let values: [GFloat; MMA_GROUP_PRODUCTS] = core::array::from_fn(|k| product_rows[k][b_col[k] as usize]);
+                let value: f32 = windowed_group_sum(&values, zero_exp, significand_width).into();
+                // The singleton re-sum canonicalizes signed zero.
+                out[i * n + j] = if value == 0.0 { 0.0 } else { value };
+                continue;
+            }
             // Seed the cell's accumulator with the carry-in (0 when absent).
             let initial = acc.map_or(0.0, |acc| acc[i * n + j]);
             // NaN and ±inf are banned throughout the FP8 module.
@@ -343,7 +334,7 @@ fn matmul_fp8_windowed(
                 Vec::with_capacity(if record_partials { k.div_ceil(MMA_GROUP_PRODUCTS) } else { 0 });
             accumulator[0] = GFloat::from(initial);
             let mut used = 1;
-            for (a_group, b_group) in products.chunks(MMA_GROUP_PRODUCTS).zip(b_col.chunks(MMA_GROUP_PRODUCTS)) {
+            for (a_group, b_group) in product_rows.chunks(MMA_GROUP_PRODUCTS).zip(b_col.chunks(MMA_GROUP_PRODUCTS)) {
                 for ((slot, products), &b) in accumulator[1..].iter_mut().zip(a_group).zip(b_group) {
                     *slot = products[b as usize];
                 }
