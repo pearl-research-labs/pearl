@@ -151,7 +151,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CoefficientStark<F, D> {
             blocks.len() == self.live_blocks,
             "coefficient block count differs from geometry"
         );
+        use plonky2_maybe_rayon::*;
         (0..self.num_rows())
+            .into_par_iter()
+            .with_min_len(1024)
             .map(|index| {
                 let [alpha, scale] = blocks.get(index).copied().unwrap_or([0x3f80, 0]);
                 let alpha_exponent = u64::from(alpha >> 7);
