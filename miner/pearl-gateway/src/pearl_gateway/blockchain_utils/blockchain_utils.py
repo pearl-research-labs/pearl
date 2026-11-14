@@ -56,14 +56,22 @@ def _compute_merkle_root(hashes: list[bytes]) -> bytes:
 
 
 def bits_to_target(bits: int) -> int:
-    """Convert bits to target.
-    bits is a 4-byte value: 1 byte exponent, 3 bytes mantissa (big-endian)
-    target = mantissa * 2**(8*(exponent-3))
+    """Convert bits to target, mirroring the node's CompactToBig
+    (node/blockchain/internal/workmath).
+
+    bits is a 4-byte compact value: 1 byte exponent, 1 sign bit (bit 23),
+    and a 23-bit mantissa.
+    target = (-1 if sign bit set) * mantissa * 256**(exponent-3), where a
+    non-positive exponent shifts the mantissa right instead of left.
     """
     exponent = (bits >> 24) & 0xFF
-    mantissa = bits & 0xFFFFFF
-    target = mantissa * (1 << (8 * (exponent - 3)))
-    return target
+    mantissa = bits & 0x007FFFFF
+    is_negative = bits & 0x00800000 != 0
+    if exponent <= 3:
+        target = mantissa >> (8 * (3 - exponent))
+    else:
+        target = mantissa << (8 * (exponent - 3))
+    return -target if is_negative else target
 
 
 def create_coinbase_transaction(
