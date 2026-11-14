@@ -152,9 +152,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CoefficientStark<F, D> {
             "coefficient block count differs from geometry"
         );
         use plonky2_maybe_rayon::*;
-        (0..self.num_rows())
+        // Keep collection indexed: Result<Vec<_>> would concatenate temporary chunks serially.
+        let error = std::sync::OnceLock::new();
+        let rows = (0..self.num_rows())
             .into_par_iter()
-            .with_min_len(1024)
+            .with_min_len(256)
             .map(|index| {
                 let [alpha, scale] = blocks.get(index).copied().unwrap_or([0x3f80, 0]);
                 let alpha_exponent = u64::from(alpha >> 7);
@@ -197,7 +199,17 @@ impl<F: RichField + Extendable<D>, const D: usize> CoefficientStark<F, D> {
                 }
                 .into())
             })
-            .collect()
+            .map(|row| {
+                row.unwrap_or_else(|err| {
+                    let _ = error.set(err);
+                    [F::ZERO; NUM_COEFFICIENT_COLUMNS]
+                })
+            })
+            .collect();
+        match error.into_inner() {
+            Some(err) => Err(err),
+            None => Ok(rows),
+        }
     }
 }
 
@@ -363,8 +375,12 @@ mod tests {
             assert!(!accepts(&stark, &changed), "accepted changed column {column}");
         }
         assert!(stark.generate_trace(&[[0x7f7f, 0x7f7f]]).is_err());
-        for scale in [0x7f80, 0x7fc0, 0xff80] {
-            assert!(stark.generate_trace(&[[0x3f80, scale]]).is_err());
+        let stark = Certificate::new(1025, 0, 8);
+        let mut inputs = vec![[0x3f80, 0]; 1025];
+        for (index, scale) in [(0, 0x7f80), (512, 0x7fc0), (1024, 0xff80)] {
+            inputs[index][1] = scale;
+            assert!(stark.generate_trace(&inputs).is_err());
+            inputs[index][1] = 0;
         }
     }
 
