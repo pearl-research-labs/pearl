@@ -200,25 +200,25 @@ def test_credited_work_is_mnk_and_rejects_unmineable(device):
 @_DEVICES
 def test_mineable_domain_and_tile_selection(device):
     """The mineable (n, k) domain and the tile it commits: the 4x64 tile is
-    preferred wherever it fits (n % 64, 1024 <= k <= 43008) -- the narrowest
+    preferred wherever it fits (n % 64, 1024 <= k <= 42496) -- the narrowest
     4-row tile mixed_gemm's 64-row decode kernel tile can run -- the tall
     16x32 covers what it cannot (n % 32 not 64-aligned, or k in
-    (43008, 60928]), the default 4x128 caps at k <= 22016, all stay within
+    (42496, 58368]), the default 4x128 caps at k <= 22016, all stay within
     the verifier's Blake3 witness bound, and n is bounded exclusively below 2^24.
     Out-of-domain shapes select no tile, so ``select_tile`` and
     ``is_mineable_shape`` agree."""
     assert max_verifiable_k() == 22016  # 4x128 cap
-    assert max_verifiable_k(tile_cols=32, tile_rows=16) == 60928  # tall cap
-    assert max_verifiable_k(tile_cols=64, tile_rows=4) == 43008  # 4x64 cap
-    assert max_mineable_k() == 60928  # full domain across tiles
+    assert max_verifiable_k(tile_cols=32, tile_rows=16) == 58368  # tall cap
+    assert max_verifiable_k(tile_cols=64, tile_rows=4) == 42496  # 4x64 cap
+    assert max_mineable_k() == 58368  # full domain across tiles
     # 4x64 preferred wherever it fits: it unlocks the 64-row decode tile.
-    for n, k in ((256, 1024), (256, 22016), (6144, 16384), (6144, 43008)):
+    for n, k in ((256, 1024), (256, 22016), (6144, 16384), (6144, 42496)):
         assert select_tile(n, k, device=device) == SMALL_TILE
         assert is_mineable_shape(n=n, k=k, device=device)
     # The tall tile covers what 4x64 cannot: 32-aligned n that is not
     # 64-aligned, and k past the 4x64 proof cap. On Hopper the tall tile is
     # not committed, so these shapes are refused instead of mis-tiled.
-    for n, k in ((96, 4096), (6144, 60928), (256, 43008 + 512)):
+    for n, k in ((96, 4096), (6144, 58368), (256, 42496 + 512)):
         if _tall_committed(device):
             assert select_tile(n, k, device=device) == TALL_TILE
             assert is_mineable_shape(n=n, k=k, device=device)
@@ -227,7 +227,7 @@ def test_mineable_domain_and_tile_selection(device):
             assert not is_mineable_shape(n=n, k=k, device=device)
     # Out of domain -> no tile: under one 32-col tile, below the verifier's
     # k floor (1024), k not 512-aligned, or past the tall cap.
-    for n, k in ((16, 4096), (256, 512), (256, 768), (256, 4104), (256, 60928 + 512)):
+    for n, k in ((16, 4096), (256, 512), (256, 768), (256, 4104), (256, 58368 + 512)):
         assert select_tile(n, k, device=device) is None
         assert not is_mineable_shape(n=n, k=k, device=device)
     # The opened strips alone (one byte per element) fit the 2^22-byte witness.
@@ -278,10 +278,10 @@ def test_commitment_binds_n_and_k(device):
     # back-compat commitment, but ``select_tile`` refuses the shape so the
     # runtime (which gates on ``can_mine_layer``) never launches it.
     if _tall_committed(device):
-        assert mining_configuration(k=60928, n=6144, device=device).tile_rows == 16
+        assert mining_configuration(k=58368, n=6144, device=device).tile_rows == 16
     else:
-        assert select_tile(6144, 60928, device=device) is None
-        assert mining_configuration(k=60928, n=6144, device=device).tile_rows == TILE_ROWS
+        assert select_tile(6144, 58368, device=device) is None
+        assert mining_configuration(k=58368, n=6144, device=device).tile_rows == TILE_ROWS
     assert mining_configuration(16384, 6144, device=device).p_b(6144) != mining_configuration(
         12288, 6144, device=device
     ).p_b(6144)  # k bound
@@ -315,9 +315,9 @@ def test_tile_layout_matches_reference_and_kernel(device):
     # The 16x32 layout checks are device-independent; only Blackwell actually
     # commits it through ``mining_configuration``.
     tall = (
-        mining_configuration(60928, 6144, device=device)
+        mining_configuration(58368, 6144, device=device)
         if _tall_committed(device)
-        else tall_tile_mining_config(60928, RANK, Device.BLACKWELL)
+        else tall_tile_mining_config(58368, RANK, Device.BLACKWELL)
     )
     tall_lanes = lane_assignment(tall.tile_rows, tall.tile_cols)
     # 16x32: lane j is row j's 32 contiguous columns, ascending.

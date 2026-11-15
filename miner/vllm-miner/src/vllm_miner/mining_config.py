@@ -40,7 +40,7 @@ _MAX_256 = (1 << 256) - 1
 # must never be credited.
 _VERIFIER_MIN_K = 1024
 _VERIFIER_MAX_K = 1 << 16
-_VERIFIER_TILE_MAX_K = {(4, 64): 43008, (16, 32): 60928, (4, 128): 22016}
+_VERIFIER_TILE_MAX_K = {(4, 64): 42496, (16, 32): 58368, (4, 128): 22016}
 # k must also stay a multiple of 512 for the four kernels.
 _K_ALIGNMENT = 512
 
@@ -79,12 +79,12 @@ class LotteryTileSpec:
 #   tile (the decode small-m fast path; 16-row words cannot be folded by a
 #   single thread there);
 # - peel-proof size (``(rows+cols)*k`` elements), capping verifiable k under
-#   the verifier's Blake3 witness bound: 43008 (4x64), 60928 (16x32),
+#   the verifier's Blake3 witness bound: 42496 (4x64), 58368 (16x32),
 #   22016 (4x128);
 # - n-alignment: ``n % cols`` must be 0.
 # 4x64 is preferred wherever it fits (it unlocks the measured 64-row decode
 # tile); the tall 16x32 covers what it cannot (n % 32 shapes that are not
-# 64-aligned, and k in (43008, 60928]). 4x128 is kept as the shape-omitted
+# 64-aligned, and k in (42496, 58368]). 4x128 is kept as the shape-omitted
 # (``n``-less) commitment for back-compat and as a coarse fallback.
 DEFAULT_TILE = LotteryTileSpec(TILE_ROWS, TILE_COLS)
 TALL_TILE = LotteryTileSpec(16, 32)
@@ -99,7 +99,7 @@ def _committed_tiles(device: Device) -> tuple[LotteryTileSpec, ...]:
 
     SM90's WGMMA fragments split accumulator rows across four lanes, so the
     Hopper kernel implements only the 4-row family: the tall 16x32 tile is
-    Blackwell-only, and tall-tile-only shapes (k in (43008, 60928], or
+    Blackwell-only, and tall-tile-only shapes (k in (42496, 58368], or
     32-but-not-64-aligned ``n``) are unmineable on Hopper.
     """
     if device is Device.HOPPER:
@@ -333,9 +333,9 @@ def tile_indices(size: int, tile_index: int) -> list[int]:
 def is_mineable_shape(n: int, k: int, *, device: Device) -> bool:
     """Admissibility for both the kernels and the verifier: some committed tile
     accepts ``(n, k)`` -- ``k % 512`` inside that tile's legal ``k`` domain, and
-    whole lottery tiles in ``n``. High-``k`` layers up to 43008 (e.g. o_proj,
+    whole lottery tiles in ``n``. High-``k`` layers up to 42496 (e.g. o_proj,
     k=16384) are admitted via the preferred 4x64 tile; the tall 16x32 extends
-    the domain to k=60928 and to 32-but-not-64-aligned ``n`` on Blackwell.
+    the domain to k=58368 and to 32-but-not-64-aligned ``n`` on Blackwell.
 
     ``device`` selects the architecture's committed-tile set.
     """
