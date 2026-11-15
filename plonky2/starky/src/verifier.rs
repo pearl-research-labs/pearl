@@ -58,13 +58,17 @@ fn successive_powers<F: Field>(start: F, step: F, len: usize) -> Vec<F> {
 /// One barycentric term: `(s1, s2) += (weight * y, weight * y * omega)`.
 #[inline(always)]
 fn accumulate_barycentric<F: Field>(sum: &mut (F, F), weight: F, y: F, omega: F) {
+    if y.is_zero() {
+        return;
+    }
     let term = weight * y;
     sum.0 += term;
     sum.1 = sum.1.multiply_accumulate(term, omega);
 }
 
 /// Evaluate multiple polynomials (given as evaluations on an n-th roots-of-unity subgroup)
-/// at an extension-field point, using O(n) subgroup-specialized barycentric interpolation.
+/// at an extension-field point and its next-row shift, using O(n) barycentric interpolation.
+/// Returns local evaluations followed by next-row evaluations.
 ///
 /// Formula per column: f(z) = (z^n - 1) / n * sum_i (y_i * omega^i) / (z - omega^i)
 ///
@@ -75,22 +79,13 @@ fn accumulate_barycentric<F: Field>(sum: &mut (F, F), weight: F, y: F, omega: F)
 /// Rayon fold-reduce.
 ///
 /// All columns must have the same length (a power of two), equal to the trace domain size.
-pub fn eval_columns_at_point<F: RichField + Extendable<D>, const D: usize>(
-    columns: &[&PolynomialValues<F>],
-    point: F::Extension,
-    omega_pows: Option<&[F]>,
-) -> Vec<F::Extension> {
-    eval_columns_at_point_impl::<F, D, false>(columns, point, omega_pows)
-}
-
-// With NEXT, append evaluations at g*point by rotating each column's row indices.
-fn eval_columns_at_point_impl<F: RichField + Extendable<D>, const D: usize, const NEXT: bool>(
+fn eval_columns_at_zeta_and_next_impl<F: RichField + Extendable<D>, const D: usize>(
     columns: &[&PolynomialValues<F>],
     point: F::Extension,
     omega_pows: Option<&[F]>,
 ) -> Vec<F::Extension> {
     // Impl specific to D=2.
-    const { assert!(D == 2, "eval_columns_at_point only supports D=2") };
+    const { assert!(D == 2, "eval_columns_at_zeta_and_next only supports D=2") };
 
     if columns.is_empty() {
         return vec![];
@@ -101,7 +96,7 @@ fn eval_columns_at_point_impl<F: RichField + Extendable<D>, const D: usize, cons
 
     let lg_n = log2_strict(n);
     let num_cols = columns.len();
-    let num_sums = if NEXT { 2 * num_cols } else { num_cols };
+    let num_sums = 2 * num_cols;
 
     // Extract [a, b] components of the extension-field point.
     let components = point.to_basefield_array();
@@ -138,13 +133,11 @@ fn eval_columns_at_point_impl<F: RichField + Extendable<D>, const D: usize, cons
                 .iter()
                 .map(|c| F::Extension::from(c.values[j]))
                 .collect();
-            if NEXT {
-                values.extend(
-                    columns
-                        .iter()
-                        .map(|c| F::Extension::from(c.values[(j + 1) % n])),
-                );
-            }
+            values.extend(
+                columns
+                    .iter()
+                    .map(|c| F::Extension::from(c.values[(j + 1) % n])),
+            );
             return values;
         }
     }
@@ -189,24 +182,24 @@ fn eval_columns_at_point_impl<F: RichField + Extendable<D>, const D: usize, cons
                     .iter()
                     .map(|&omega| (a - omega).square() - wb2)
                     .collect();
-                let inverse_norms = F::batch_multiplicative_inverse(&norms);
-                for (offset, (&omega, inv)) in roots.iter().zip(inverse_norms).enumerate() {
-                    let i = start + offset;
-                    let weight = inv * omega;
-                    // Wrap at the table boundary, not the chunk boundary.
-                    let next_i = (i + 1) & (n - 1);
-                    for (j, col) in col_slices.iter().enumerate() {
-                        accumulate_barycentric(&mut acc[j], weight, col[i], omega);
-                        if NEXT {
-                            // f(g*z) reuses these weights with y_i replaced by y_(i+1).
-                            accumulate_barycentric(
-                                &mut acc[j + num_cols],
-                                weight,
-                                col[next_i],
-                                omega,
-                            );
-                        }
+                let mut weights = F::batch_multiplicative_inverse(&norms);
+                for (&omega, weight) in roots.iter().zip(&mut weights) {
+                    *weight *= omega;
+                }
+                // Reuse weights across columns and keep each column's running sums local.
+                for (j, col) in col_slices.iter().enumerate() {
+                    let mut sum = acc[j];
+                    let mut next_sum = acc[j + num_cols];
+                    for (offset, (&omega, &weight)) in roots.iter().zip(&weights).enumerate() {
+                        let i = start + offset;
+                        accumulate_barycentric(&mut sum, weight, col[i], omega);
+                        // Wrap at the table boundary, not the chunk boundary.
+                        let next_i = (i + 1) & (n - 1);
+                        // f(g*z) reuses these weights with y_i replaced by y_(i+1).
+                        accumulate_barycentric(&mut next_sum, weight, col[next_i], omega);
                     }
+                    acc[j] = sum;
+                    acc[j + num_cols] = next_sum;
                 }
                 acc
             },
@@ -254,7 +247,7 @@ pub fn eval_columns_at_zeta_and_next<F: RichField + Extendable<D>, const D: usiz
         columns.iter().all(|c| c.len() == 1usize << degree_bits),
         "column height must match degree_bits"
     );
-    let mut evals_at_zeta = eval_columns_at_point_impl::<F, D, true>(columns, zeta, None);
+    let mut evals_at_zeta = eval_columns_at_zeta_and_next_impl::<F, D>(columns, zeta, None);
     let evals_at_g_zeta = evals_at_zeta.split_off(columns.len());
     (evals_at_zeta, evals_at_g_zeta)
 }
@@ -606,7 +599,7 @@ mod tests {
     use plonky2::field::polynomial::PolynomialValues;
     use plonky2::field::types::{Field, Sample};
 
-    use super::eval_columns_at_point;
+    use super::eval_columns_at_zeta_and_next_impl;
     use crate::vanishing_poly::eval_l_0_and_l_last;
 
     #[test]
@@ -625,13 +618,13 @@ mod tests {
     }
 
     /// For random columns given as evaluations on the 2^log_n-th roots-of-unity subgroup,
-    /// `eval_columns_at_point` must agree with the canonical reference: IFFT the values to
+    /// The local evaluations must agree with the canonical reference: IFFT the values to
     /// coefficients and evaluate the resulting polynomial at the extension-field point.
     ///
     /// Covers a range of log_n (including the degenerate n=1 case), both `omega_pows = None`
     /// and a caller-supplied `omega_pows`, and the empty-columns edge case.
     #[test]
-    fn test_eval_columns_at_point_matches_ifft_and_eval() {
+    fn test_local_evaluations_match_ifft_and_eval() {
         type F = GoldilocksField;
         const D: usize = 2;
         type FE = QuadraticExtension<F>;
@@ -668,16 +661,22 @@ mod tests {
                     .map(|c| c.clone().ifft().to_extension::<D>().eval(zeta))
                     .collect();
 
-                let got_unsupplied = eval_columns_at_point::<F, D>(&column_refs, zeta, None);
+                let got_unsupplied =
+                    eval_columns_at_zeta_and_next_impl::<F, D>(&column_refs, zeta, None);
                 assert_eq!(
-                    got_unsupplied, expected,
+                    &got_unsupplied[..NUM_COLS],
+                    &expected,
                     "log_n={log_n}, zeta={label}, omega_pows = None"
                 );
 
-                let got_supplied =
-                    eval_columns_at_point::<F, D>(&column_refs, zeta, Some(&omega_pows));
+                let got_supplied = eval_columns_at_zeta_and_next_impl::<F, D>(
+                    &column_refs,
+                    zeta,
+                    Some(&omega_pows),
+                );
                 assert_eq!(
-                    got_supplied, expected,
+                    &got_supplied[..NUM_COLS],
+                    &expected,
                     "log_n={log_n}, zeta={label}, omega_pows supplied"
                 );
             }
@@ -685,7 +684,7 @@ mod tests {
 
         let empty_refs: Vec<&PolynomialValues<F>> = Vec::new();
         let zeta = FE::rand();
-        assert!(eval_columns_at_point::<F, D>(&empty_refs, zeta, None).is_empty());
+        assert!(eval_columns_at_zeta_and_next_impl::<F, D>(&empty_refs, zeta, None).is_empty());
     }
 
     #[test]

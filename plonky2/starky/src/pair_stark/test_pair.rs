@@ -39,7 +39,7 @@ use starky::recursive_verifier::{
 };
 use starky::stark::Stark;
 use starky::util::trace_rows_to_poly_values;
-use starky::verifier::{eval_columns_at_point, verify_stark_proof, PreprocessedData};
+use starky::verifier::{eval_columns_at_zeta_and_next, verify_stark_proof, PreprocessedData};
 
 use crate::pair_trace::generate_trace_rows;
 
@@ -380,19 +380,14 @@ mod tests {
 
         set_stark_proof_with_pis_target(&mut pw, &pt, stark_proof, degree_bits)?;
 
-        // Re-derive zeta and g*zeta from the STARK proof's Fiat-Shamir transcript.
-        let (zeta, g_zeta) = get_zeta_and_g_zeta(stark, stark_proof, config, preprocessed_data);
+        // Re-derive zeta from the STARK proof's Fiat-Shamir transcript.
+        let zeta = get_zeta(stark, stark_proof, config, preprocessed_data);
 
         // Compute evaluations and set witnesses for the eval PI targets.
-        let evals_at_zeta = eval_columns_at_point::<F, D>(
+        let (evals_at_zeta, evals_at_g_zeta) = eval_columns_at_zeta_and_next::<F, D>(
             &preprocessed_data.columns.iter().collect::<Vec<_>>(),
             zeta,
-            None,
-        );
-        let evals_at_g_zeta = eval_columns_at_point::<F, D>(
-            &preprocessed_data.columns.iter().collect::<Vec<_>>(),
-            g_zeta,
-            None,
+            degree_bits,
         );
 
         for (target, value) in evals_at_zeta_targets.iter().zip(evals_at_zeta.iter()) {
@@ -407,18 +402,13 @@ mod tests {
         Ok((circuit_data, proof))
     }
 
-    /// Re-derives the STARK challenge `zeta` and `g*zeta` from a proof's Fiat-Shamir transcript.
-    fn get_zeta_and_g_zeta<
-        F: RichField + Extendable<D>,
-        C: GenericConfig<D, F = F>,
-        const D: usize,
-    >(
+    /// Re-derives the STARK challenge `zeta` from a proof's Fiat-Shamir transcript.
+    fn get_zeta<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
         stark: PAirStark<F, D>,
         proof: &StarkProofWithPublicInputs<F, C, D>,
         config: &StarkConfig,
         preprocessed_data: &PreprocessedData<F>,
-    ) -> (F::Extension, F::Extension) {
-        let degree_bits = proof.proof.recover_degree_bits(config);
+    ) -> F::Extension {
         let mut challenger = Challenger::<F, C::Hasher>::new();
         let challenges = proof.get_challenges(
             &stark,
@@ -430,28 +420,7 @@ mod tests {
             None,
             Some(&preprocessed_data.digest),
         );
-        let zeta: F::Extension = challenges.stark_zeta;
-        let g = F::primitive_root_of_unity(degree_bits);
-        // In a generic context (F: RichField + Extendable<D>, g: F), scalar_mul is
-        // unambiguous because FieldExtension<D> is the only impl with BaseField = F.
-        let g_zeta: F::Extension = zeta.scalar_mul(g);
-        (zeta, g_zeta)
-    }
-
-    /// Computes extension-field evaluations for a set of preprocessed columns at a given point,
-    /// and flattens them into a Vec<F> for use as public inputs.
-    fn compute_evals_flat<F: RichField + Extendable<D>, const D: usize>(
-        preprocessed_data: &PreprocessedData<F>,
-        point: F::Extension,
-    ) -> Vec<F> {
-        eval_columns_at_point::<F, D>(
-            &preprocessed_data.columns.iter().collect::<Vec<_>>(),
-            point,
-            None,
-        )
-        .into_iter()
-        .flat_map(|e| e.to_basefield_array().to_vec())
-        .collect()
+        challenges.stark_zeta
     }
 
     /// Builds the public inputs vector with mismatched preprocessed column evaluations.
@@ -469,7 +438,7 @@ mod tests {
         config: &StarkConfig,
         preprocessed_data_correct: &PreprocessedData<F>,
     ) -> Vec<F> {
-        let (zeta, g_zeta) = get_zeta_and_g_zeta(
+        let zeta = get_zeta(
             stark_correct,
             stark_proof,
             config,
@@ -478,14 +447,20 @@ mod tests {
         let preprocessed_data_mismatch = stark_correct.with_mismatch().make_preprocessed_data();
         let (_, trace_pis) = stark_correct.generate_trace();
         let mut pis = trace_pis.to_vec();
-        pis.extend(compute_evals_flat::<F, D>(
-            &preprocessed_data_mismatch,
+        let (local, next) = eval_columns_at_zeta_and_next::<F, D>(
+            &preprocessed_data_mismatch
+                .columns
+                .iter()
+                .collect::<Vec<_>>(),
             zeta,
-        ));
-        pis.extend(compute_evals_flat::<F, D>(
-            &preprocessed_data_mismatch,
-            g_zeta,
-        ));
+            stark_proof.proof.recover_degree_bits(config),
+        );
+        pis.extend(
+            local
+                .into_iter()
+                .chain(next)
+                .flat_map(|e| e.to_basefield_array().to_vec()),
+        );
         pis
     }
 
