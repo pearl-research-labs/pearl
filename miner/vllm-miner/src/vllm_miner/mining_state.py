@@ -165,9 +165,9 @@ def _delete_state_locked() -> None:
             safe, error = _gpu_runtime_safe_to_release(_GPU_RUNTIME_DRAIN_TIMEOUT_SECONDS)
             if not safe:
                 raise RuntimeError(error)
-        unpublish_contexts()
         # Mining work is drained, so no upload reads the CPU B result slots.
         stop_cpu_b_service()
+        unpublish_contexts()
     except BaseException as exc:
         _runtime_poisoned = True
         failure = exc

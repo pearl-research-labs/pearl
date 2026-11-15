@@ -325,10 +325,11 @@ class CpuPrepared:
     prepared: CpuBContext
     _service: "CpuBService"
     _slot: int
+    _generation: int
 
     def uploaded(self, event: torch.cuda.Event) -> None:
         """Return the B' slot once ``event`` (recorded after the upload) completes."""
-        self._service._release(self._slot, event)
+        self._service._release(self._generation, self._slot, event)
 
 
 def b_key_depth(ancestor: bytes, job: MiningJob) -> int | None:
@@ -374,8 +375,9 @@ class CpuBService:
         self._ready: dict[int, tuple[CpuBContext, int]] = {}
         self._free = list(range(self._preparer.slots))
         self._pending: dict[int, torch.cuda.Event] = {}
-        # Slots taken by a layer whose upload is not yet enqueued.
-        self._taken: set[int] = set()
+        # (helper generation, slot) taken by a layer whose upload is not yet enqueued.
+        self._generation = 0
+        self._taken: set[tuple[int, int]] = set()
         self._pass_started = 0.0
         self._pass_prepared = 0
         self._pass_taken = 0
@@ -429,28 +431,29 @@ class CpuBService:
                 self._free.append(slot)
                 self._cond.notify_all()
                 return None
-            self._taken.add(slot)
+            self._taken.add((self._generation, slot))
             self._pass_taken += 1
             if self._pass_taken == self._pass_prepared and self._next_layer >= len(self._states):
                 _LOGGER.info(
                     f"CPU B: {self._pass_taken} layer(s) mine on B prepared for the job's parent, "
                     f"{time.monotonic() - self._pass_started:.2f}s after the job change"
                 )
-        return CpuPrepared(prepared, self, slot)
+        return CpuPrepared(prepared, self, slot, self._generation)
 
     def discard(self) -> None:
         """Drop every waiting result (the layers' published contexts are gone)."""
         with self._cond:
             self._free.extend(slot for _, slot in self._ready.values())
             self._ready.clear()
-            self._next_layer = 0
             self._cond.notify_all()
 
-    def _release(self, slot: int, event: torch.cuda.Event) -> None:
+    def _release(self, generation: int, slot: int, event: torch.cuda.Event) -> None:
         with self._cond:
-            self._taken.discard(slot)
-            self._pending[slot] = event
-            self._free.append(slot)
+            self._taken.discard((generation, slot))
+            # A slot of a replaced helper is not reused.
+            if generation == self._generation:
+                self._pending[slot] = event
+                self._free.append(slot)
             self._cond.notify_all()
 
     def _job_changed(self) -> None:
@@ -493,14 +496,14 @@ class CpuBService:
         """Respawn the helper over the layers' current planes (after a reload)."""
         with self._cond:
             self._ready.clear()
-            self._cond.wait_for(lambda: self._closed or not self._taken)
-            if self._closed:
-                return
+            # An upload still reading an old slot keeps it page-locked.
+            outstanding = any(gen == self._generation for gen, _ in self._taken)
+            self._generation += 1
             pending = list(self._pending.values())
             self._pending.clear()
         for event in pending:
             event.synchronize()
-        self._preparer.close()
+        self._preparer.close(unregister=not outstanding)
         _LOGGER.info("CPU B: the layers' planes changed; restarting the helper")
         preparer = ProcessPreparer(self._states, threads=self._threads, cpus=self._cpus)
         with self._cond:
