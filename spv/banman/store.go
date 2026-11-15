@@ -231,10 +231,22 @@ func fetchStatus(banIndex, reasonIndex walletdb.ReadWriteBucket,
 	ipNetKey []byte) Status {
 
 	v := banIndex.Get(ipNetKey)
-	if v == nil {
+	if len(v) != 8 {
+		// A missing entry has no expiration to read, and a value of
+		// any other length is corrupt: the store only ever writes
+		// 8-byte expirations. Report no ban rather than panic — the
+		// caller treats a zero expiration as expired and deletes the
+		// entry, so a corrupt value heals itself on first read.
 		return Status{}
 	}
-	reason := Reason(reasonIndex.Get(ipNetKey)[0])
+
+	// The reason is informational next to the expiration, so a missing
+	// reason entry degrades to the zero reason ("unknown reason")
+	// instead of panicking or dropping an otherwise readable ban.
+	var reason Reason
+	if reasonBytes := reasonIndex.Get(ipNetKey); len(reasonBytes) > 0 {
+		reason = Reason(reasonBytes[0])
+	}
 	banExpiration := time.Unix(int64(byteOrder.Uint64(v)), 0)
 
 	return Status{
