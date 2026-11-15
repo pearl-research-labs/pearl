@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::field::extension::Extendable;
 use crate::field::polynomial::PolynomialCoeffs;
+use crate::field::types::Field;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::{
     CompressedFriProof, FriChallenges, FriChallengesTarget, FriProof, FriProofTarget,
@@ -198,7 +199,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
         let challenges =
             self.get_challenges(self.get_public_inputs_hash(), circuit_digest, common_data)?;
-        let fri_inferred_elements = self.get_inferred_elements(&challenges, common_data);
+        let fri_inferred_elements = self.get_inferred_elements(&challenges, common_data)?;
         let decompressed_proof =
             self.proof
                 .decompress(&challenges, fri_inferred_elements, &common_data.fri_params);
@@ -223,7 +224,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &verifier_data.circuit_digest,
             common_data,
         )?;
-        let fri_inferred_elements = self.get_inferred_elements(&challenges, common_data);
+        let fri_inferred_elements = self.get_inferred_elements(&challenges, common_data)?;
         let decompressed_proof =
             self.proof
                 .decompress(&challenges, fri_inferred_elements, &common_data.fri_params);
@@ -528,6 +529,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &proof.opening_proof.commit_phase_merkle_caps,
             &proof.opening_proof.final_poly,
             proof.opening_proof.pow_witness,
+            proof.opening_proof.batching_pow_witness,
             &verifier_data.circuit_digest,
             common_data,
         )?;
@@ -554,8 +556,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         common_data: &CommonCircuitData<F, D>,
     ) {
         let cs_evals: Vec<F::Extension> = constants_sigmas_polynomials
-            .iter()
-            .map(|p| p.to_extension::<D>().eval(zeta))
+            .par_iter()
+            .map(|p| {
+                // Embed coefficients as they are used, without allocating an extension polynomial.
+                p.coeffs.iter().rev().fold(F::Extension::ZERO, |acc, &c| {
+                    acc * zeta + F::Extension::from(c)
+                })
+            })
             .collect();
         openings.constants = cs_evals[common_data.constants_range()].to_vec();
         openings.plonk_sigmas = cs_evals[common_data.sigmas_range()].to_vec();

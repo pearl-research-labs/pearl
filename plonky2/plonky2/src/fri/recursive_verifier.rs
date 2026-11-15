@@ -28,7 +28,7 @@ use crate::with_context;
 impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     /// Computes P'(x^arity) from {P(x*g^i)}_(i=0..arity), where g is a `arity`-th root of unity
     /// and P' is the FRI reduced polynomial.
-    pub(crate) fn compute_evaluation(
+    pub fn compute_evaluation(
         &mut self,
         x: Target,
         x_index_within_coset_bits: &[BoolTarget],
@@ -90,14 +90,15 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         );
     }
 
-    pub(crate) fn fri_verify_proof_of_work(
-        &mut self,
-        fri_pow_response: Target,
-        config: &FriConfig,
-    ) {
+    pub fn fri_verify_proof_of_work(&mut self, fri_pow_response: Target, config: &FriConfig) {
+        self.verify_proof_of_work(fri_pow_response, config.proof_of_work_bits);
+    }
+
+    pub fn verify_proof_of_work(&mut self, fri_pow_response: Target, proof_of_work_bits: u32) {
+        assert!(proof_of_work_bits < F::order().bits() as u32);
         self.assert_leading_zeros(
             fri_pow_response,
-            config.proof_of_work_bits + (64 - F::order().bits()) as u32,
+            proof_of_work_bits + (64 - F::order().bits()) as u32,
         );
     }
 
@@ -125,6 +126,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // Size of the LDE domain.
         let n = params.lde_size();
 
+        crate::fri::batching_pow::verify_batching_pow_target(
+            self,
+            challenges.batching_pow_response,
+            &params.config,
+        );
         with_context!(
             self,
             "check PoW",
@@ -215,6 +221,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         current_log_n = self.add(current_log_n, current_degree_bits);
         let min_log_n_to_support = params.config.rate_bits + min_degree_bits_to_support;
 
+        crate::fri::batching_pow::verify_batching_pow_target(
+            self,
+            challenges.batching_pow_response,
+            &params.config,
+        );
         with_context!(
             self,
             "check PoW",
@@ -661,7 +672,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     /// Thus ambiguous elements contribute a negligible amount to soundness error.
     ///
     /// Here we compare the probabilities as a sanity check, to verify the claim above.
-    pub(crate) fn assert_noncanonical_indices_ok(config: &FriConfig) {
+    pub fn assert_noncanonical_indices_ok(config: &FriConfig) {
         let num_ambiguous_elems = u64::MAX - F::ORDER + 1;
         let query_error = config.rate();
         let p_ambiguous = (num_ambiguous_elems as f64) / (F::ORDER as f64);
@@ -689,6 +700,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             query_round_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness: (params.config.batching_proof_of_work_bits != 0)
+                .then(|| self.add_virtual_target()),
         }
     }
 
@@ -733,7 +746,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         FriInitialTreeProofTarget { evals_proofs }
     }
 
-    fn add_virtual_fri_query_step(
+    pub(crate) fn add_virtual_fri_query_step(
         &mut self,
         arity_bits: usize,
         merkle_proof_len: usize,

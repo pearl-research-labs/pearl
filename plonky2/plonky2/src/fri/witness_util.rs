@@ -19,6 +19,16 @@ where
     W: WitnessWrite<F> + ?Sized,
     H: AlgebraicHasher<F>,
 {
+    anyhow::ensure!(
+        fri_proof_target.batching_pow_witness.is_some() == fri_proof.batching_pow_witness.is_some(),
+        "batching PoW nonce presence must match target configuration"
+    );
+    if let (Some(t), Some(v)) = (
+        fri_proof_target.batching_pow_witness,
+        fri_proof.batching_pow_witness,
+    ) {
+        witness.set_target(t, v)?;
+    }
     witness.set_target(fri_proof_target.pow_witness, fri_proof.pow_witness)?;
 
     let target_len = fri_proof_target.final_poly.0.len();
