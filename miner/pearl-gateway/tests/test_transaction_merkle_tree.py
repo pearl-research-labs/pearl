@@ -70,3 +70,35 @@ class TestMerkleBtcpy:
         expected = double_sha256(coinbase_hash + tx1_hash)[::-1]
 
         assert result == expected
+
+
+class TestMerkleTxidLength:
+    """A txid that does not decode to exactly 32 bytes must be rejected.
+
+    Regression: calculate_merkle_root previously fed any-length hashes
+    into the pair hashing, which masked the bad length — the result was
+    a plausible-looking 32-byte root that silently differed from the
+    node's, so the gateway would mine on a bad root with no error.
+    """
+
+    def test_rejects_short_txid_alongside_valid(self):
+        with pytest.raises(ValueError, match="Invalid txid length"):
+            calculate_merkle_root(["aa" * 32, "bb"])
+
+    def test_rejects_empty_txid(self):
+        with pytest.raises(ValueError, match="Invalid txid length"):
+            calculate_merkle_root(["aa" * 32, ""])
+
+    def test_rejects_long_txid(self):
+        with pytest.raises(ValueError, match="Invalid txid length"):
+            calculate_merkle_root(["aa" * 32, "cc" * 33])
+
+    def test_rejects_31_byte_txid(self):
+        with pytest.raises(ValueError, match="Invalid txid length"):
+            calculate_merkle_root(["aa" * 32, "dd" * 31])
+
+    def test_rejects_single_short_txid(self):
+        # The single-hash path returns the hash un-hashed, so a short
+        # txid used to pass straight through as the "root".
+        with pytest.raises(ValueError, match="Invalid txid length"):
+            calculate_merkle_root(["bb"])
