@@ -24,7 +24,6 @@ from .._utils._arch import Arch
 from ..protocol_constants import PACKED_NOISE_K
 from ._kernel_common import _C_FRAGMENT_VALUES, _NOISE_SKEW_ELEMS, _NamedBarrier
 from ._kernel_register_peel import _NoisyQuantRegisterPeel
-from ._quantization_ops import _f32x2_to_bf16x2
 
 _E1_PANEL_BYTES = 16  # one K_INTER K panel: 16 e4m3 codes per row
 
@@ -48,6 +47,8 @@ class _NoisyQuantSm90(_NoisyQuantRegisterPeel):
 
     # The output warp generates E1; consumer-side E1 is not tuned on SM90.
     _consumer_e1_enabled = False
+    # Hopper commits H100, whose quantizer has no strip rewrite.
+    _rewrites_strip = False
 
     def _make_noise_mma(self):
         """One ``(bk, rows)`` QGMMA tile over the consumer warpgroup."""
@@ -143,16 +144,14 @@ class _NoisyQuantSm90(_NoisyQuantRegisterPeel):
         )
 
     @cute.jit
-    def _noise_words(self, noise, row_half, first_fragment_row, noise_words):
-        """Two f32 staging reads, then one cvt.rn.bf16x2.f32 per pair (the
-        reference's single RNE rounding)."""
+    def _noise_values(self, noise, row_half, first_fragment_row, noise_values):
+        """Two f32 staging reads per pair."""
         coords = noise.fragment_coords
         for block in cutlass.range_constexpr(2 * self.bk // self.n_group):
             col_lo = coords[_C_FRAGMENT_VALUES * block][1]
             col_hi = coords[_C_FRAGMENT_VALUES * block + 1][1]
             for fragment_half in cutlass.range_constexpr(2):
                 noise_row = 16 * row_half + first_fragment_row + 8 * fragment_half
-                noise_words[fragment_half + 2 * block] = _f32x2_to_bf16x2(
-                    noise.staging[(noise_row, col_hi)],
-                    noise.staging[(noise_row, col_lo)],
-                )
+                pair = fragment_half + 2 * block
+                noise_values[2 * pair] = noise.staging[(noise_row, col_lo)]
+                noise_values[2 * pair + 1] = noise.staging[(noise_row, col_hi)]

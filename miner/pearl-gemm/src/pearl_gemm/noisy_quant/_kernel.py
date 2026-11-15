@@ -11,9 +11,8 @@ The ``E1 @ F1`` noise dot and the ``A' @ F2^T`` peel both run on the real
   the atom computes the reference's zero-padded K = 32 product bit-exactly
   (it *is* the pinned arithmetic, accumulating from +0);
 - consumers drain each accumulator stage through shared memory
-  (``tcgen05.ld`` -> STS f32) and the quantize chain reads bf16x2 noise
-  pairs with a single ``cvt.rn.bf16x2.f32`` rounding, so A' codes stay
-  bit-identical to the reference;
+  (``tcgen05.ld`` -> STS f32) and the quantize chain folds the fp32 noise
+  pairs, so A' codes stay bit-identical to the verifier's;
 - the peel UMMA consumes the staged A' tile (64-row operand buffer,
   pad rows zeroed once) against the staged F2 tile, accumulating the CTA's
   whole k-slice in TMEM.
@@ -53,14 +52,7 @@ from ._kernel_common import (
     _noise_n_permutation,
     _NoisyQuant,
 )
-from ._quantization_ops import (
-    _bf16x2_to_e4m3x2,
-    _f32x2_to_bf16x2,
-    _fma_bf16x2,
-    _mul_bf16x2,
-    _open_int8x2_bf16x2,
-    _splat_bf16x2,
-)
+from ._quantization_ops import _strip_state
 
 _SMEM_CAPACITY_BYTES = Arch.SM100.smem_capacity_bytes
 
@@ -82,8 +74,7 @@ class _NoisyQuantSm100(_NoisyQuant):
         # The noise UMMA consumes F1 in panels of at most 128 rows.
         self.bk_mma = min(self.bk, 128)
         self.nblk = self.bk // self.bk_mma
-        self.direct = False
-        self.acc_stages = 3 if self.direct else 2
+        self.acc_stages = 2
         self.consumer_warps = 4
         self.consumer_threads = WG_THREADS
         # Columns per C-fragment N-permutation group (16 per consumer warp).
@@ -115,40 +106,22 @@ class _NoisyQuantSm100(_NoisyQuant):
         acc_write,
         factor_index,
     ):
-        """Issue one k-tile's noise UMMA(s), fresh accumulation each.
-
-        Transposed orientation (rows < 64): one acc stage holds the whole
-        tile (``nblk`` M-blocks share the stage index). Direct orientation
-        (rows == 64): each 128-column panel is its own acc stage, E1 is the
-        A operand, and the F1 panel is B.
-        """
-        if cutlass.const_expr(self.direct):
-            for pan in cutlass.range_constexpr(self.nblk):
-                acc_pipe.producer_acquire(acc_write)
-                tiled_mma_noise.set(tcgen05.Field.ACCUMULATE, False)
-                cute.gemm(
-                    tiled_mma_noise,
-                    tCtNoiseBase[(None, None, None, acc_write.index)],
-                    tCrE1[(None, None, 0, 0)],
-                    tCrF1[(None, None, 0, factor_index * self.nblk + pan)],
-                    tCtNoiseBase[(None, None, None, acc_write.index)],
-                )
-                acc_pipe.producer_commit(acc_write)
-                acc_write.advance()
-        else:
-            acc_pipe.producer_acquire(acc_write)
-            tiled_mma_noise.set(tcgen05.Field.ACCUMULATE, False)
-            for blk in cutlass.range_constexpr(self.nblk):
-                slot = acc_write.index * self.nblk + blk
-                cute.gemm(
-                    tiled_mma_noise,
-                    tCtNoiseBase[(None, None, None, slot)],
-                    tCrF1[(None, None, 0, factor_index * self.nblk + blk)],
-                    tCrE1[(None, None, 0, 0)],
-                    tCtNoiseBase[(None, None, None, slot)],
-                )
-            acc_pipe.producer_commit(acc_write)
-            acc_write.advance()
+        """Issue one k-tile's noise UMMA(s), fresh accumulation each: one acc
+        stage holds the whole transposed tile (``nblk`` M-blocks share the
+        stage index)."""
+        acc_pipe.producer_acquire(acc_write)
+        tiled_mma_noise.set(tcgen05.Field.ACCUMULATE, False)
+        for blk in cutlass.range_constexpr(self.nblk):
+            slot = acc_write.index * self.nblk + blk
+            cute.gemm(
+                tiled_mma_noise,
+                tCtNoiseBase[(None, None, None, slot)],
+                tCrF1[(None, None, 0, factor_index * self.nblk + blk)],
+                tCrE1[(None, None, 0, 0)],
+                tCtNoiseBase[(None, None, None, slot)],
+            )
+        acc_pipe.producer_commit(acc_write)
+        acc_write.advance()
         return tiled_mma_noise, acc_write
 
     @cute.jit
@@ -284,7 +257,7 @@ class _NoisyQuantSm100(_NoisyQuant):
         mPeel, mStat = globals_.peel, globals_.stats
         sAq, sAs = shared.a_codes, shared.a_scales
         sAp = shared.a_prime
-        sE1, sAlpha, sBeta = shared.e1, shared.alpha, shared.beta
+        sE1, sAlpha, sBeta, sStrip = shared.e1, shared.alpha, shared.beta, shared.strip
         thread_idx, lane = coords.thread, coords.lane
         row_block = coords.row_block
         tile_count = coords.tile_count
@@ -300,10 +273,7 @@ class _NoisyQuantSm100(_NoisyQuant):
         quantized_word_fragments = [
             cute.make_rmem_tensor(pair_fragment_shape, cutlass.Uint16) for _ in range(row_halves)
         ]
-        a_fragment_shape = noise_thread.partition_C(cute.make_identity_tensor((16, self.bk))).shape
-        a_fragment = cute.make_rmem_tensor(a_fragment_shape, bf16)
-        a_words = cute.recast_tensor(a_fragment, cutlass.Uint32)
-        noise_words = cute.make_rmem_tensor(4 * self.bk // self.n_group, cutlass.Uint32)
+        noise_values = cute.make_rmem_tensor(8 * self.bk // self.n_group, Float32)
 
         consumer_warp = thread_idx // 32
         scale_group_base = 2 * consumer_warp + ((lane >> 1) & 1)
@@ -347,16 +317,17 @@ class _NoisyQuantSm100(_NoisyQuant):
 
         if thread_idx < self.rows:
             global_row = row_block * self.rows + thread_idx
-            alpha, beta = self._combine_row_stats(
+            alpha, beta, l2 = self._combine_row_stats(
                 mStat,
                 global_row,
                 tile_count * self.bk,
             )
             sAlpha[thread_idx] = alpha
             sBeta[thread_idx] = beta
+            sStrip[thread_idx] = _strip_state(alpha, l2)
             mAlpha[global_row] = alpha.to(bf16)
             mBeta[global_row] = beta.to(bf16)
-        elif cutlass.const_expr(self.consumer_e1):
+        elif cutlass.const_expr(self.consumer_e1):  # noqa: SIM102
             # E1 stays on threads 64..127 (warps 2-3).
             if thread_idx >= 64 and thread_idx < 128:
                 self._generate_e1_rows(
@@ -374,24 +345,10 @@ class _NoisyQuantSm100(_NoisyQuant):
             number_of_threads=self.consumer_threads,
         )
 
-        alpha_word_pairs = []
-        beta_word_pairs = []
+        row_scales = []
         for row_half in cutlass.range_constexpr(row_halves):
-            alpha_row_0 = sAlpha[row_half * 16 + first_fragment_row]
-            alpha_row_1 = sAlpha[row_half * 16 + first_fragment_row + 8]
-            beta_row_0 = sBeta[row_half * 16 + first_fragment_row]
-            beta_row_1 = sBeta[row_half * 16 + first_fragment_row + 8]
-            alpha_word_pairs.append(
-                (
-                    _f32x2_to_bf16x2(alpha_row_0, alpha_row_0),
-                    _f32x2_to_bf16x2(alpha_row_1, alpha_row_1),
-                )
-            )
-            beta_word_pairs.append(
-                (
-                    _f32x2_to_bf16x2(beta_row_0, beta_row_0),
-                    _f32x2_to_bf16x2(beta_row_1, beta_row_1),
-                )
+            row_scales.append(
+                self._row_scales(sAlpha, sBeta, sStrip, row_half * 16 + first_fragment_row)
             )
 
         cute.arch.barrier(
@@ -470,31 +427,23 @@ class _NoisyQuantSm100(_NoisyQuant):
                     shared_code_partition,
                     code_words,
                 )
-                # Noise pairs: two f32 staging reads and a single
-                # cvt.rn.bf16x2.f32 rounding.
                 for block in cutlass.range_constexpr(2 * self.bk // self.n_group):
                     col_lo = noise_coords[4 * block][1]
                     col_hi = noise_coords[4 * block + 1][1]
                     for fragment_half in cutlass.range_constexpr(2):
                         noise_row = 16 * row_half + first_fragment_row + 8 * fragment_half
-                        noise_words[fragment_half + 2 * block] = _f32x2_to_bf16x2(
-                            sNoiseF[(noise_row, col_hi)],
-                            sNoiseF[(noise_row, col_lo)],
-                        )
-                self._open_a_fragment(
+                        pair = fragment_half + 2 * block
+                        noise_values[2 * pair] = sNoiseF[(noise_row, col_lo)]
+                        noise_values[2 * pair + 1] = sNoiseF[(noise_row, col_hi)]
+                self._quantize_fragment(
+                    noise_values,
+                    code_words,
                     sAs,
                     stage,
                     scale_group_base,
                     first_fragment_row,
-                    code_words,
-                    a_words,
-                )
-                self._quantize_fragment(
-                    noise_words,
-                    a_words,
                     quantized_word_fragments[row_half],
-                    alpha_word_pairs[row_half],
-                    beta_word_pairs[row_half],
+                    row_scales[row_half],
                 )
                 if cutlass.const_expr(self.a_tile_pipe):
                     if cutlass.const_expr(row_half == row_halves - 1):
@@ -554,160 +503,6 @@ class _NoisyQuantSm100(_NoisyQuant):
             if local_row < self.rows:
                 peel_output[(local_row, R + peel_col)] = peel_rmem[item].to(bf16)
 
-    # noqa C901: the direct-topology hot loop; compile-time chunk dispatch.
-    @cute.jit
-    def _run_consumer_warpgroup_direct(  # noqa: C901
-        self,
-        globals_: _ConsumerGlobals,
-        sAq,
-        sAs,
-        sApU16,
-        sE1,
-        sAlpha,
-        sBeta,
-        tiled_t2r_noise,
-        tCtNoiseBase,
-        tiled_t2r_peel,
-        tCtPeel,
-        a_pipe,
-        acc_pipe,
-        output_pipe,
-        peel_pipe,
-        peel_done,
-        coords: _ConsumerCoords,
-    ):
-        """rows=64 consumers: noise arrives per 128-column panel straight
-        from TMEM in each thread's own registers; codes, scales, and the A'
-        store are all plain aligned shared-memory accesses. No
-        ldmatrix/stmatrix, no staging round-trip, no per-tile barrier.
-
-        Exactness of the orientation flip: the atom's K = 32 result here is
-        the order-independent exact integer dot rounded once to f32 (every
-        product lies on the 2^-8 grid, above the truncation window), so swapping which operand feeds which port cannot
-        change a bit. "Same bytes, roles swapped" alone would not be a
-        valid argument."""
-        mAlpha, mBeta = globals_.alpha, globals_.beta
-        mPeel, mStat = globals_.peel, globals_.stats
-        thread_idx = coords.thread
-        row_block = coords.row_block
-        tile_count = coords.tile_count
-        warp = thread_idx // 32
-
-        thr_t2r = tiled_t2r_noise.get_slice(thread_idx)
-        panel_coords = thr_t2r.partition_D(cute.make_identity_tensor((64, 128)))
-        noise_rmem = cute.make_rmem_tensor(panel_coords.shape, Float32)
-        n_vals = cute.size(panel_coords)
-        # Ld16x256b hands each thread ((2, 2, 16), ...) values: an adjacent
-        # column pair, times two rows 8 apart, times 16 8-column steps —
-        # value i = pair + 2*row_half + 4*step. Both rows sit inside the
-        # warp's own A half-tile. The bit-exact A' gate pins this shape.
-        assert n_vals % 4 == 0
-        row0 = panel_coords[0][0]
-        row1 = panel_coords[2][0]
-
-        if thread_idx < self.rows:
-            global_row = row_block * self.rows + thread_idx
-            alpha, beta = self._combine_row_stats(
-                mStat,
-                global_row,
-                tile_count * self.bk,
-            )
-            sAlpha[thread_idx] = alpha
-            sBeta[thread_idx] = beta
-            mAlpha[global_row] = alpha.to(cutlass.BFloat16)
-            mBeta[global_row] = beta.to(cutlass.BFloat16)
-        cute.arch.fence_proxy("async.shared", space="cta")
-        cute.arch.barrier(
-            barrier_id=_NamedBarrier.CONSUMER,
-            number_of_threads=WG_THREADS,
-        )
-        alpha_pairs = []
-        beta_pairs = []
-        for half in cutlass.range_constexpr(2):
-            row_h = row0 if half == 0 else row1
-            alpha_h = sAlpha[row_h]
-            beta_h = sBeta[row_h]
-            alpha_pairs.append(_f32x2_to_bf16x2(alpha_h, alpha_h))
-            beta_pairs.append(_f32x2_to_bf16x2(beta_h, beta_h))
-
-        cute.arch.barrier(
-            barrier_id=_NamedBarrier.E1_READY,
-            number_of_threads=WG_THREADS + (32 if self.consumer_e1 else 64),
-        )
-
-        # Mirror of the transposed path: beta * E1 is written up front
-        # (see _run_consumer_warpgroup_sm100).
-        if thread_idx < self.rows:
-            self._write_e1_peel_row(
-                sE1,
-                sBeta,
-                cute.local_tile(
-                    mPeel,
-                    (16, PEEL_COLS),
-                    (row_block * (self.rows // HALF_TILE_ROWS) + thread_idx // 16, 0),
-                ),
-                thread_idx,
-            )
-
-        acc_read = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.acc_stages)
-        output_write_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.out_stages
-        )
-        peel_write_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.out_stages
-        )
-        for tile_index in cutlass.range(tile_count, unroll=1):
-            stage = self._wait_a_half_tile(a_pipe, tile_index, warp)
-            for pan in cutlass.range_constexpr(self.nblk):
-                acc_pipe.consumer_wait(acc_read)
-                cute.copy(
-                    tiled_t2r_noise,
-                    thr_t2r.partition_S(tCtNoiseBase[((None, None), 0, 0, acc_read.index)]),
-                    noise_rmem,
-                )
-                cute.arch.fence_view_async_tmem_load()
-                acc_pipe.consumer_release(acc_read)
-                acc_read.advance()
-                # Acquire the A' stage only after the first panel's acc
-                # release: blocking on the output ring before releasing TMEM
-                # would couple the MMA warp's panel prefetch to the store
-                # drain for nothing.
-                if cutlass.const_expr(pan == 0):
-                    output_pipe.producer_acquire(output_write_state)
-                    peel_pipe.producer_acquire(peel_write_state)
-                for step in cutlass.range_constexpr(n_vals // 4):
-                    col0 = 128 * pan + panel_coords[4 * step][1]
-                    for half in cutlass.range_constexpr(2):
-                        i = 4 * step + 2 * half
-                        row_h = row0 if half == 0 else row1
-                        splat = _splat_bf16x2(
-                            cutlass.Uint32(sAs[(row_h % 16, col0 // BLOCK_SCALE_GROUP, stage)])
-                        )
-                        code_pair = sAq[(row_h % 16, col0 // 2, stage)]
-                        a_word = _open_int8x2_bf16x2(code_pair, splat)
-                        noise_word = _f32x2_to_bf16x2(noise_rmem[i + 1], noise_rmem[i])
-                        scaled = _fma_bf16x2(
-                            alpha_pairs[half], a_word, _mul_bf16x2(beta_pairs[half], noise_word)
-                        )
-                        sApU16[
-                            (row_h, ((col0 % 16) // 2, col0 // 16), output_write_state.index)
-                        ] = _bf16x2_to_e4m3x2(scaled)
-            self._release_a_half_tile(a_pipe, tile_index, warp)
-            cute.arch.fence_proxy("async.shared", space="cta")
-            output_pipe.producer_commit(output_write_state)
-            peel_pipe.producer_commit(peel_write_state)
-            output_write_state.advance()
-            peel_write_state.advance()
-
-        self._finalize_peel_sm100(
-            tiled_t2r_peel,
-            tCtPeel,
-            peel_done,
-            mPeel,
-            thread_idx,
-            row_block,
-        )
-
     # -- launch -------------------------------------------------------------
 
     @cute.jit
@@ -744,7 +539,7 @@ class _NoisyQuantSm100(_NoisyQuant):
             cute.nvgpu.OperandMajorMode.K,
             Float32,
             tcgen05.CtaGroup.ONE,
-            (64, 128) if self.direct else (self.bk_mma, self.rows),
+            (self.bk_mma, self.rows),
         )
         tiled_mma_peel = sm100_utils.make_trivial_tiled_mma(
             f8,
@@ -755,7 +550,7 @@ class _NoisyQuantSm100(_NoisyQuant):
             tcgen05.CtaGroup.ONE,
             (64, R),
         )
-        tiler_noise = (64, 128, 32) if self.direct else (self.bk_mma, self.rows, 32)
+        tiler_noise = (self.bk_mma, self.rows, 32)
         tiler_peel = (64, R, bk)
 
         # -- layout scaffolding (issues no MMA; see module docstring) --
@@ -788,19 +583,11 @@ class _NoisyQuantSm100(_NoisyQuant):
             (16, bk // BLOCK_SCALE_GROUP, a_stage_count),
             stride=(bk // BLOCK_SCALE_GROUP, 1, 16 * bk // BLOCK_SCALE_GROUP),
         )
-        # UMMA operand layouts. In the direct topology E1 is the noise A
-        # operand and the F1 panels are B; both byte images match the
-        # transposed orientation's (K-major (rows|panel, 32) tiles).
-        if cutlass.const_expr(self.direct):
-            sF1_layout = sm100_utils.make_smem_layout_b(
-                tiled_mma_noise, tiler_noise, f8, self.nblk * stages
-            )
-            sE1B_layout = sm100_utils.make_smem_layout_a(tiled_mma_noise, tiler_noise, f8, 1)
-        else:
-            sF1_layout = sm100_utils.make_smem_layout_a(
-                tiled_mma_noise, tiler_noise, f8, self.nblk * stages
-            )
-            sE1B_layout = sm100_utils.make_smem_layout_b(tiled_mma_noise, tiler_noise, f8, 1)
+        # UMMA operand layouts: the F1 panels are the noise A operand, E1 is B.
+        sF1_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma_noise, tiler_noise, f8, self.nblk * stages
+        )
+        sE1B_layout = sm100_utils.make_smem_layout_b(tiled_mma_noise, tiler_noise, f8, 1)
         sF2_layout = sm100_utils.make_smem_layout_b(tiled_mma_peel, tiler_peel, f8, stages)
         # The A' operand deliberately uses the unswizzled K_INTER canonical
         # atom (16-byte column panels every 64 rows): its byte image has an
@@ -858,22 +645,13 @@ class _NoisyQuantSm100(_NoisyQuant):
         tma_aq, tma_taq = _tma_load(mAqCodesU16, sAq_layout, (16, bk // 2))
         tma_as, tma_tas = _tma_load(mAqScales, sAs_layout, (16, bk // BLOCK_SCALE_GROUP))
 
-        if cutlass.const_expr(self.direct):
-            tma_f1, tma_tf1 = cute.nvgpu.make_tiled_tma_atom_B(
-                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
-                mF1e4,
-                cute.slice_(sF1_layout, (None, None, None, 0)),
-                tiler_noise,
-                tiled_mma_noise,
-            )
-        else:
-            tma_f1, tma_tf1 = cute.nvgpu.make_tiled_tma_atom_A(
-                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
-                mF1e4,
-                cute.slice_(sF1_layout, (None, None, None, 0)),
-                tiler_noise,
-                tiled_mma_noise,
-            )
+        tma_f1, tma_tf1 = cute.nvgpu.make_tiled_tma_atom_A(
+            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+            mF1e4,
+            cute.slice_(sF1_layout, (None, None, None, 0)),
+            tiler_noise,
+            tiled_mma_noise,
+        )
         tma_f2, tma_tf2 = cute.nvgpu.make_tiled_tma_atom_B(
             cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
             mF2,
@@ -907,11 +685,10 @@ class _NoisyQuantSm100(_NoisyQuant):
             peel_done_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             sAlpha: cute.struct.MemRange[Float32, 16 * row_halves]
             sBeta: cute.struct.MemRange[Float32, 16 * row_halves]
+            sStrip: cute.struct.MemRange[cutlass.Uint32, 16 * row_halves]
             sE1: cute.struct.Align[cute.struct.MemRange[cutlass.Float16, 16 * row_halves * R], 128]
             sNoise: cute.struct.Align[
-                cute.struct.MemRange[
-                    Float32, 4 if self.direct else self.rows * (bk + _NOISE_SKEW_ELEMS)
-                ],
+                cute.struct.MemRange[Float32, self.rows * (bk + _NOISE_SKEW_ELEMS)],
                 1024,
             ]
             sE1B: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(sE1B_layout)], 1024]
@@ -1026,13 +803,9 @@ class _NoisyQuantSm100(_NoisyQuant):
 
         producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         consumer_warpgroup = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.consumer_threads)
-        # Direct topology: each consumer warp owns exactly one A half-tile
-        # stage (its own rows), so a stage has a single releasing warp.
-        # Otherwise every consumer warp waits on and releases every half-tile
-        # stage (TMA-async releases arrive once per calling warp).
-        a_consumer = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 1 if self.direct else self.consumer_warps
-        )
+        # Every consumer warp waits on and releases every half-tile stage
+        # (TMA-async releases arrive once per calling warp).
+        a_consumer = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.consumer_warps)
         output_consumer = pipeline.CooperativeGroup(pipeline.Agent.Thread, 32)
         mma_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
@@ -1111,6 +884,7 @@ class _NoisyQuantSm100(_NoisyQuant):
         sE1 = storage.sE1.get_tensor(cute.make_layout((16, R, row_halves), stride=(R, 1, 16 * R)))
         sAlpha = storage.sAlpha.get_tensor(cute.make_layout(self.rows))
         sBeta = storage.sBeta.get_tensor(cute.make_layout(self.rows))
+        sStrip = storage.sStrip.get_tensor(cute.make_layout(self.rows))
 
         gAq = cute.local_tile(mAqCodes, (16, bk // 2), (None, None))
         gAs = cute.local_tile(mAqScales, (16, bk // BLOCK_SCALE_GROUP), (None, None))
@@ -1151,45 +925,19 @@ class _NoisyQuantSm100(_NoisyQuant):
         )
 
         # TMEM accumulators: noise (2 stages x nblk column blocks) + peel.
-        if cutlass.const_expr(self.direct):
-            # The interleaved M=64 fragment has no derivable stage stride
-            # (make_fragment_C leaves it dynamic), so stage the one-slot
-            # layout by hand: one 128-column panel per stage.
-            acc_shape_noise = tiled_mma_noise.partition_shape_C((64, 128))
-            fake_one = tiled_mma_noise.make_fragment_C(cute.append(acc_shape_noise, 1))
-            tCtNoise_fake = cute.make_tensor(
-                fake_one.iterator,
-                cute.make_layout(
-                    (*fake_one.layout.shape[:3], self.acc_stages),
-                    stride=(*fake_one.layout.stride[:3], 128),
-                ),
-            )
-            noise_cols = 128 * self.acc_stages
-        else:
-            acc_shape_noise = tiled_mma_noise.partition_shape_C((self.bk_mma, self.rows))
-            noise_slots = self.acc_stages * self.nblk
-            tCtNoise_fake = tiled_mma_noise.make_fragment_C(
-                cute.append(acc_shape_noise, noise_slots)
-            )
-            noise_cols = compute_tmem_cols_from_layout(tCtNoise_fake.layout, Float32)
+        acc_shape_noise = tiled_mma_noise.partition_shape_C((self.bk_mma, self.rows))
+        noise_slots = self.acc_stages * self.nblk
+        tCtNoise_fake = tiled_mma_noise.make_fragment_C(cute.append(acc_shape_noise, noise_slots))
+        noise_cols = compute_tmem_cols_from_layout(tCtNoise_fake.layout, Float32)
         acc_shape_peel = tiled_mma_peel.partition_shape_C((64, R))
         tCtPeel_fake = tiled_mma_peel.make_fragment_C(cute.append(acc_shape_peel, 1))
         peel_cols = compute_tmem_cols_from_layout(tCtPeel_fake.layout, Float32)
         total_cols = max(32, 1 << (int(noise_cols) + int(peel_cols) - 1).bit_length())
 
-        if cutlass.const_expr(self.direct):
-            # 16-dp loads: the M=64 accumulator interleaves rows into lane
-            # quads (row r -> lane r%16 + 32*(r//16)), so warp w's quad holds
-            # rows 16w..16w+15 -- exactly its A half-tile's rows.
-            tiled_t2r_noise = tcgen05.make_tmem_copy(
-                cute.make_copy_atom(tcgen05.Ld16x256bOp(tcgen05.Repetition(16)), Float32),
-                tCtNoise_fake[((None, None), 0, 0, 0)],
-            )
-        else:
-            tiled_t2r_noise = tcgen05.make_tmem_copy(
-                cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(self.rows)), Float32),
-                tCtNoise_fake[((None, None), 0, 0, 0)],
-            )
+        tiled_t2r_noise = tcgen05.make_tmem_copy(
+            cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(self.rows)), Float32),
+            tCtNoise_fake[((None, None), 0, 0, 0)],
+        )
         tiled_t2r_peel = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld16x128bOp(tcgen05.Repetition(4)), Float32),
             tCtPeel_fake[((None, None), 0, 0, 0)],
@@ -1238,12 +986,8 @@ class _NoisyQuantSm100(_NoisyQuant):
             # fences every consumer's last TMEM read before the free.
             tmem.allocate(total_cols)
             tmem.relinquish_alloc_permit()
-            if cutlass.const_expr(self.direct):
-                tCrE1 = tiled_mma_noise.make_fragment_A(sE1B)
-                tCrF1 = tiled_mma_noise.make_fragment_B(sF1)
-            else:
-                tCrF1 = tiled_mma_noise.make_fragment_A(sF1)
-                tCrE1 = tiled_mma_noise.make_fragment_B(sE1B)
+            tCrF1 = tiled_mma_noise.make_fragment_A(sF1)
+            tCrE1 = tiled_mma_noise.make_fragment_B(sE1B)
             tCrPa = tiled_mma_peel.make_fragment_A(sApE4)
             tCrPb = tiled_mma_peel.make_fragment_B(sF2)
             self._run_mma_warp(
@@ -1267,68 +1011,41 @@ class _NoisyQuantSm100(_NoisyQuant):
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem.retrieve_ptr(Float32))
         elif warp_idx < self.producer_warp:
-            if cutlass.const_expr(self.direct):
-                self._run_consumer_warpgroup_direct(
-                    _ConsumerGlobals(mAlpha, mBeta, mPeel, mStat),
+            self._run_consumer_warpgroup_sm100(
+                _ConsumerGlobals(mAlpha, mBeta, mPeel, mStat),
+                tiled_mma_n,
+                tiled_mma_u16,
+                _ConsumerShared(
                     sAq,
                     sAs,
+                    sF1,
+                    sF2,
                     sApU16,
                     sE1,
                     sAlpha,
                     sBeta,
-                    tiled_t2r_noise,
-                    # Retired path (statically off): predates the MMA-warp
-                    # TMEM alloc scheme and would need its own retrieve.
-                    tCtNoise_fake,
-                    tiled_t2r_peel,
-                    tCtPeel_fake[((None, None), 0, 0, 0)],
-                    a_pipe,
-                    acc_pipe,
-                    output_pipe,
-                    peel_pipe,
-                    peel_done,
-                    _ConsumerCoords(
-                        thread_idx,
-                        lane,
-                        row_block,
-                        tile_count,
-                    ),
-                )
-            else:
-                self._run_consumer_warpgroup_sm100(
-                    _ConsumerGlobals(mAlpha, mBeta, mPeel, mStat),
-                    tiled_mma_n,
-                    tiled_mma_u16,
-                    _ConsumerShared(
-                        sAq,
-                        sAs,
-                        sF1,
-                        sF2,
-                        sApU16,
-                        sE1,
-                        sAlpha,
-                        sBeta,
-                    ),
-                    mE1,
-                    mKey,
-                    sE1B,
-                    sNoise,
-                    tiled_t2r_noise,
-                    tmem,
-                    tCtNoise_fake,
-                    tCtPeel_fake,
-                    noise_cols,
-                    tiled_t2r_peel,
-                    a_pipe,
-                    acc_pipe,
-                    output_pipe,
-                    peel_pipe,
-                    peel_done,
-                    _ConsumerCoords(
-                        thread_idx,
-                        lane,
-                        row_block,
-                        tile_count,
-                    ),
-                )
+                    sStrip,
+                ),
+                mE1,
+                mKey,
+                sE1B,
+                sNoise,
+                tiled_t2r_noise,
+                tmem,
+                tCtNoise_fake,
+                tCtPeel_fake,
+                noise_cols,
+                tiled_t2r_peel,
+                a_pipe,
+                acc_pipe,
+                output_pipe,
+                peel_pipe,
+                peel_done,
+                _ConsumerCoords(
+                    thread_idx,
+                    lane,
+                    row_block,
+                    tile_count,
+                ),
+            )
             tmem_alloc_barrier.arrive()

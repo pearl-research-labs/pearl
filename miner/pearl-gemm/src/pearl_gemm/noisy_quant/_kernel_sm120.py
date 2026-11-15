@@ -32,7 +32,6 @@ from .._utils._arch import Arch
 from ..protocol_constants import PACKED_NOISE_K
 from ._kernel_common import _C_FRAGMENT_VALUES, HALF_TILE_ROWS, _noise_n_permutation
 from ._kernel_register_peel import _NoisyQuantRegisterPeel
-from ._quantization_ops import _f32x2_to_bf16x2
 
 _NOISE_ATOM_MNK = (16, 8, PACKED_NOISE_K)  # the warp-level e4m3 noise atom
 
@@ -145,11 +144,10 @@ class _NoisyQuantSm120(_NoisyQuantRegisterPeel):
         factor_pipe.consumer_release(factor_read)
 
     @cute.jit
-    def _noise_words(self, noise, row_half, first_fragment_row, noise_words):
+    def _noise_values(self, noise, row_half, first_fragment_row, noise_values):
         """noise (16, bk) = E1_half @ F1_tile^T, K = 32, one atom per output
-        from +0 -- the pinned arithmetic -- then the bf16x2 pairs straight
-        from the accumulator: fragment (c, h, nb) at 4 * nb + 2 * h + c, one
-        cvt.rn.bf16x2.f32 per pair (the reference's single RNE rounding)."""
+        from +0 -- the pinned arithmetic -- then the fp32 pairs straight from
+        the accumulator: fragment (c, h, nb) at 4 * nb + 2 * h + c."""
         noise_acc = noise.accumulator
         noise_acc.fill(0.0)
         cute.gemm(
@@ -161,8 +159,7 @@ class _NoisyQuantSm120(_NoisyQuantRegisterPeel):
         )
         for block in cutlass.range_constexpr(2 * self.bk // self.n_group):
             for fragment_half in cutlass.range_constexpr(2):
-                pair = _C_FRAGMENT_VALUES * block + 2 * fragment_half
-                noise_words[fragment_half + 2 * block] = _f32x2_to_bf16x2(
-                    noise_acc[pair + 1],
-                    noise_acc[pair],
-                )
+                value = _C_FRAGMENT_VALUES * block + 2 * fragment_half
+                pair = fragment_half + 2 * block
+                noise_values[2 * pair] = noise_acc[value]
+                noise_values[2 * pair + 1] = noise_acc[value + 1]

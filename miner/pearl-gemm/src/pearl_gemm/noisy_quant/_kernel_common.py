@@ -17,15 +17,15 @@ from quack.cute_dsl_utils import mlir_namedtuple
 
 from ..protocol_constants import PACKED_NOISE_K, R
 from ._quantization_ops import (
-    _bf16x2_to_e4m3x2,
-    _fma_bf16x2,
+    _bf16_bits_to_f32,
+    _coin_mask,
+    _f32x2_to_e4m3x2,
+    _fold,
     _generate_noise_line,
-    _mul_bf16x2,
-    _open_int8x2_bf16x2,
-    _open_int8x2_bf16x2_hi,
+    _mul_f32,
+    _rewrite_strip_pair,
     _rndb,
     _scale_chain,
-    _splat_bf16x2,
 )
 
 WG_THREADS = 128
@@ -95,6 +95,7 @@ class _ConsumerShared(NamedTuple):
     e1: cute.Tensor
     alpha: cute.Tensor
     beta: cute.Tensor
+    strip: cute.Tensor
 
 
 @mlir_namedtuple
@@ -115,6 +116,8 @@ class _NoisyQuant:
 
     # Consumer-side E1 overlaps the BLAKE3 prologue with the stats combine.
     _consumer_e1_enabled = True
+    # Whether the committed device's quantizer rewrites the strip (Blackwell).
+    _rewrites_strip = True
 
     def __init__(
         self,
@@ -326,7 +329,7 @@ class _NoisyQuant:
         row: cutlass.Int32,
         row_width: cutlass.Int32,
     ):
-        """Combine one row's commit partials and derive its scales.
+        """Combine one row's commit partials and derive ``(alpha, beta, l2)``.
 
         All (ssq, absmax) pairs are fetched into registers with independent
         wide loads first, then reduced in the pinned chunk order -- load
@@ -358,57 +361,69 @@ class _NoisyQuant:
         )
 
     @cute.jit
-    def _open_a_fragment(
+    def _quantize_fragment(
         self,
+        noise_values: cute.Tensor,
+        code_words: cute.Tensor,
         shared_scales,
         shared_stage,
         group_base,
         first_fragment_row,
-        code_words,
-        a_words,
+        a_prime_words: cute.Tensor,
+        row_scales,
     ):
-        """Open one tile's A codes: both u16 pairs of each raw ldmatrix word
-        share a scale splat and are opened in place by byte-pair prmt
-        selectors, skipping the u16 extraction."""
+        """Fold one tile's codes and fp32 noise into A' codes.
+
+        Each raw ldmatrix word holds four contiguous columns of one row (the
+        N permutation), sharing a block scale and one strip coin
+        (drawn from the word's first column). ``column_block`` runs over the
+        permuted MMA's N instances (``2 * bk / n_group``); the word map
+        ``(blk % 2) + 2h + 4*(blk // 2)`` is the (d, g) -> u16-fragment
+        decomposition and ``noise_values[2 * (h + 2 * blk) + {0, 1}]`` the
+        pair's (low, high) column noise.
+        """
         code_u32 = cute.recast_tensor(code_words, cutlass.Uint32)
         for repeat in cutlass.range_constexpr(self.bk // self.n_group):
             group = group_base + (self.n_group // 8) * repeat
             for row_half in cutlass.range_constexpr(2):
-                splat = _splat_bf16x2(
+                alpha, beta, strip_bound, strip_code = row_scales[row_half]
+                scale = _bf16_bits_to_f32(
                     cutlass.Uint32(
                         shared_scales[(first_fragment_row + 8 * row_half, group, shared_stage)]
                     )
                 )
-                word32 = code_u32[row_half + 2 * repeat]
-                a_words[row_half + 2 * (0 + 2 * repeat)] = _open_int8x2_bf16x2(word32, splat)
-                a_words[row_half + 2 * (1 + 2 * repeat)] = _open_int8x2_bf16x2_hi(word32, splat)
+                coefficient = _mul_f32(alpha, scale)
+                codes = code_u32[row_half + 2 * repeat]
+                coin_mask = cutlass.Uint32(0)
+                for word_half in cutlass.range_constexpr(2):
+                    column_block = 2 * repeat + word_half
+                    pair = row_half + 2 * column_block
+                    lo = _fold(coefficient, beta, codes, 2 * word_half, noise_values[2 * pair])
+                    hi = _fold(
+                        coefficient, beta, codes, 2 * word_half + 1, noise_values[2 * pair + 1]
+                    )
+                    quantized = _f32x2_to_e4m3x2(hi, lo)
+                    if cutlass.const_expr(self._rewrites_strip):
+                        if cutlass.const_expr(word_half == 0):
+                            coin_mask = _coin_mask(lo)
+                        quantized = _rewrite_strip_pair(
+                            quantized, strip_bound, strip_code, coin_mask
+                        )
+                    word = word_half + 2 * row_half + 4 * repeat
+                    a_prime_words[word] = cutlass.Uint16(quantized)
 
-    @cute.jit
-    def _quantize_fragment(
-        self,
-        noise_words: cute.Tensor,
-        a_words: cute.Tensor,
-        a_prime_words: cute.Tensor,
-        alpha_pairs,
-        beta_pairs,
-    ):
-        """The packed reference rounding chain, noise pre-packed as bf16x2.
-
-        ``column_block`` runs over the permuted MMA's N instances
-        (``2 * bk / n_group``); the word map ``(blk % 2) + 2h + 4*(blk // 2)``
-        is the (d, g) -> u16-fragment decomposition (verified by trace-time
-        coordinate prints).
-        """
-        for column_block in cutlass.range_constexpr(2 * self.bk // self.n_group):
-            for row_half in cutlass.range_constexpr(2):
-                pair = row_half + 2 * column_block
-                word = (column_block % 2) + 2 * row_half + 4 * (column_block // 2)
-                scaled = _fma_bf16x2(
-                    alpha_pairs[row_half],
-                    a_words[pair],
-                    _mul_bf16x2(beta_pairs[row_half], noise_words[pair]),
-                )
-                a_prime_words[word] = _bf16x2_to_e4m3x2(scaled)
+    def _row_scales(self, shared_alpha, shared_beta, shared_strip, first_row):
+        """``(alpha, beta, strip bound, strip code)`` of rows ``first_row`` and
+        ``first_row + 8``."""
+        return [
+            (
+                shared_alpha[row],
+                shared_beta[row],
+                shared_strip[row] & 0xFFFF,
+                shared_strip[row] >> 16,
+            )
+            for row in (first_row, first_row + 8)
+        ]
 
     @cute.jit
     def _generate_e1_rows(self, mE1, mKey, sE1, sE1B, first_row, lane, row_block):

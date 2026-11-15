@@ -6,13 +6,25 @@ import cutlass
 import cutlass.cute as cute
 
 from .._utils._stats_ops import _asm_f32, _asm_u32
-from ..protocol_constants import _INT_SQRT_PREC, NOISE_TARGET_NORM, QUANT_MAX, R
+from ..protocol_constants import (
+    _INT_SQRT_PREC,
+    NOISE_TARGET_NORM,
+    QUANT_MAX,
+    STRIP_COIN_SHIFT,
+    STRIP_COIN_THRESHOLD,
+    STRIP_EXP_OFFSET,
+    STRIP_G,
+    STRIP_G_SMALL_RMS,
+    STRIP_SMALL_RMS,
+    R,
+)
 from ..tensor_hash_plus_stats._blake3_ops import (
     SINGLE_BLOCK_KEYED_FLAGS,
     compress_rolled,
 )
 
 MAX_E4M3 = QUANT_MAX  # 448.0, the e4m3 quant-grid ceiling
+_E4M3_BIAS = 7
 _NORM_FLOOR = 2.0**-32  # row_norms' (near-)zero-row floor on l2 and linf
 # Noise-line normalization constants: the target norm times the
 # fixed-point isqrt factor, and the squared factor applied under the isqrt.
@@ -46,28 +58,6 @@ def _rndb(x):
     return cutlass.Float32(x).to(cutlass.BFloat16).to(cutlass.Float32)
 
 
-# Packed instructions preserve the reference's fp32-op-then-BF16-RTNE contract.
-
-
-def _mul_bf16x2(a, b):
-    """Two reference BF16 muls: bf16x2(a) * bf16x2(b), RTNE."""
-    return _asm_u32("mul.rn.bf16x2 $0, $1, $2;", "=r,r,r", cutlass.Uint32(a), cutlass.Uint32(b))
-
-
-def _fma_bf16x2(a, b, c):
-    """Two reference BF16 fmas: a*b + c per lane with a SINGLE RTNE rounding.
-
-    The product is exact; only the sum rounds once.
-    """
-    return _asm_u32(
-        "fma.rn.bf16x2 $0, $1, $2, $3;",
-        "=r,r,r,r",
-        cutlass.Uint32(a),
-        cutlass.Uint32(b),
-        cutlass.Uint32(c),
-    )
-
-
 def _e4m3x2_to_f16x2(v):
     """Packed exact widening of two e4m3 codes to f16x2 (register-direct peel operands)."""
     return _asm_u32("cvt.rn.f16x2.e4m3x2 $0, $1;", "=r,h", cutlass.Uint16(v))
@@ -83,73 +73,128 @@ def _f32x2_to_bf16x2(hi, lo):
     )
 
 
-def _splat_bf16x2(s):
-    """Broadcast a bf16 in the low half of ``s`` into both bf16x2 lanes."""
-    return _asm_u32("prmt.b32 $0, $1, $1, 0x1010;", "=r,r", cutlass.Uint32(s))
+def _f32_hex(x: float) -> str:
+    return f"0f{struct.unpack('<I', struct.pack('<f', x))[0]:08X}"
 
 
-def _open_codes_bf16x2(word, scale2, byte_selector):
-    """Open one int8 code pair of ``word`` into bf16x2: ``bf16(q * s)`` per lane.
+def _mul_f32(a, b):
+    """One RNE fp32 multiply (never contracted, subnormals kept)."""
+    return _asm_f32("mul.rn.f32 $0, $1, $2;", "=f,f,f", cutlass.Float32(a), cutlass.Float32(b))
 
-    ``byte_selector`` is the trace-time prmt selector choosing the pair's
-    bytes (0x4140: low u16 pair, 0x4342: high pair of a raw ldmatrix word);
-    ``scale2`` is the pair's group scale splatted into both lanes. Bit-exact
-    against ``PrequantMatrix.open()``'s ``bf16(f32(q)*f32(s))``, verified
-    exhaustively.
-    """
-    # The exponent byte 0x43 rides in a register and the selector is the
-    # immediate: with the roles reversed, ptxas rematerializes the selector
-    # before every call.
-    return _asm_u32(
-        "{\n\t"
-        ".reg .b32 t, mg, sb, v;\n\t"
-        f"prmt.b32 t, $1, $3, 0x{byte_selector:04X};\n\t"
-        "and.b32 mg, t, 0xFF7FFF7F;\n\t"
-        "and.b32 sb, t, 0xFF80FF80;\n\t"
-        "sub.rn.bf16x2 v, mg, sb;\n\t"
-        "mul.rn.bf16x2 $0, v, $2;\n\t"
-        "}",
-        "=r,r,r,r",
-        cutlass.Uint32(word),
-        cutlass.Uint32(scale2),
-        cutlass.Uint32(0x43434343),
+
+def _bf16_bits_to_f32(bits):
+    """Exact widening of the BF16 in the low half of ``bits``."""
+    return _asm_f32(
+        "{\n\t.reg .b32 t;\n\tshl.b32 t, $1, 16;\n\tmov.b32 $0, t;\n\t}",
+        "=f,r",
+        cutlass.Uint32(bits),
     )
 
 
-def _open_int8x2_bf16x2(codes, scale2):
-    """Open the LOW u16 code pair of ``codes`` (see ``_open_codes_bf16x2``)."""
-    return _open_codes_bf16x2(codes, scale2, 0x4140)
-
-
-def _open_int8x2_bf16x2_hi(codes_word, scale2):
-    """Open the HIGH u16 pair of a raw ldmatrix word, skipping the u16
-    extraction (see ``_open_codes_bf16x2``)."""
-    return _open_codes_bf16x2(codes_word, scale2, 0x4342)
-
-
-def _bf16x2_to_e4m3x2(v) -> cutlass.Uint16:
-    """Two reference quant steps: e4m3(clamp(x, +-448)) per bf16 lane."""
-    from cutlass._mlir import ir as _ir
-    from cutlass._mlir.dialects import llvm as _llvm
-
-    res = _llvm.inline_asm(
-        _ir.IntegerType.get_signless(16),
-        [cutlass.Uint32(v).ir_value()],
+def _fold(coefficient, beta, codes, byte: int, noise):
+    """``fma(beta, noise, coefficient * q)`` for int8 code ``byte`` of ``codes``,
+    each op one RNE fp32 rounding (the verifier's ``fp32_fma`` is the correctly
+    rounded FMA)."""
+    return _asm_f32(
         "{\n\t"
         ".reg .b32 t;\n\t"
-        ".reg .f32 vlo, vhi;\n\t"
-        "shl.b32 t, $1, 16;\n\t"
-        "mov.b32 vlo, t;\n\t"
-        "and.b32 t, $1, 0xffff0000;\n\t"
-        "mov.b32 vhi, t;\n\t"
-        "cvt.rn.satfinite.e4m3x2.f32 $0, vhi, vlo;\n\t"
+        ".reg .f32 q, s;\n\t"
+        f"bfe.s32 t, $3, {8 * byte}, 8;\n\t"
+        "cvt.rn.f32.s32 q, t;\n\t"
+        "mul.rn.f32 s, $1, q;\n\t"
+        "fma.rn.f32 $0, $2, $4, s;\n\t"
         "}",
-        "=h,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        "=f,f,f,r,f",
+        cutlass.Float32(coefficient),
+        cutlass.Float32(beta),
+        cutlass.Uint32(codes),
+        cutlass.Float32(noise),
     )
-    return cutlass.Uint16(res)
+
+
+def _f32x2_to_e4m3x2(hi, lo) -> cutlass.Uint32:
+    """e4m3 codes of two fp32 values (RNE, saturating to +-448), ``lo`` in the low byte."""
+    return _asm_u32(
+        "{\n\t.reg .b16 h;\n\tcvt.rn.satfinite.e4m3x2.f32 h, $1, $2;\n\tcvt.u32.u16 $0, h;\n\t}",
+        "=r,f,f",
+        cutlass.Float32(hi),
+        cutlass.Float32(lo),
+    )
+
+
+def _strip_state(alpha, l2):
+    """A row's strip state from its scaled RMS ``s = alpha * l2``, per
+    byte lane: ``0x7F + |e4m3(g * s)|`` in the low half (a code magnitude
+    below it borrows its byte's top bit into place) and ``safe exponent | 1``
+    in code position in the high half."""
+    return _asm_u32(
+        "{\n\t"
+        ".reg .f32 s, g, w;\n\t"
+        ".reg .b32 b, e, m;\n\t"
+        ".reg .b16 h;\n\t"
+        ".reg .pred p;\n\t"
+        "mul.rn.f32 s, $1, $2;\n\t"
+        f"setp.lt.f32 p, s, {_f32_hex(STRIP_SMALL_RMS)};\n\t"
+        f"selp.f32 g, {_f32_hex(STRIP_G_SMALL_RMS)}, {_f32_hex(STRIP_G)}, p;\n\t"
+        "mul.rn.f32 w, g, s;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32 h, w, w;\n\t"
+        "cvt.u32.u16 m, h;\n\t"
+        "and.b32 m, m, 0x7F;\n\t"
+        "add.u32 m, m, 0x7F;\n\t"
+        "mov.b32 b, s;\n\t"
+        "bfe.u32 e, b, 23, 8;\n\t"
+        f"sub.u32 e, e, {127 + STRIP_EXP_OFFSET - _E4M3_BIAS};\n\t"
+        "and.b32 e, e, 0xF;\n\t"
+        "shl.b32 e, e, 3;\n\t"
+        "or.b32 e, e, 1;\n\t"
+        "shl.b32 e, e, 16;\n\t"
+        "or.b32 m, m, e;\n\t"
+        "mul.lo.u32 $0, m, 0x0101;\n\t"
+        "}",
+        "=r,f,f",
+        cutlass.Float32(alpha),
+        cutlass.Float32(l2),
+    )
+
+
+def _coin_mask(mixed):
+    """``0x8080`` if the group-start mix's coin field passes, else 0."""
+    return _asm_u32(
+        "{\n\t"
+        ".reg .b32 t;\n\t"
+        ".reg .pred p;\n\t"
+        "mov.b32 t, $1;\n\t"
+        f"bfe.u32 t, t, {STRIP_COIN_SHIFT}, 7;\n\t"
+        f"setp.lt.u32 p, t, {STRIP_COIN_THRESHOLD};\n\t"
+        "selp.b32 $0, 0x8080, 0, p;\n\t"
+        "}",
+        "=r,f",
+        cutlass.Float32(mixed),
+    )
+
+
+def _rewrite_strip_pair(codes, strip_bound, strip_code, coin_mask):
+    """Rewrite each of the two e4m3 ``codes`` whose magnitude is below the
+    row's strip bound (when ``coin_mask`` is set) to ``sign | safe exponent |
+    mantissa | 1``; ``strip_bound`` / ``strip_code`` are the halves of
+    ``_strip_state``."""
+    return _asm_u32(
+        "{\n\t"
+        ".reg .b32 m, t, k, d;\n\t"
+        "and.b32 m, $1, 0x7F7F;\n\t"
+        "sub.u32 t, $2, m;\n\t"
+        "and.b32 t, t, $4;\n\t"
+        "prmt.b32 k, t, t, 0x0098;\n\t"
+        "and.b32 d, $1, 0x8787;\n\t"
+        "or.b32 d, d, $3;\n\t"
+        "lop3.b32 $0, d, $1, k, 0xE4;\n\t"
+        "}",
+        "=r,r,r,r,r",
+        cutlass.Uint32(codes),
+        cutlass.Uint32(strip_bound),
+        cutlass.Uint32(strip_code),
+        cutlass.Uint32(coin_mask),
+    )
 
 
 def _l2_grid_round_f32(x):
@@ -174,7 +219,7 @@ def _l2_grid_round_f32(x):
 
 
 def _scale_chain(ssq, amax, kf, delta_r, delta_over_std):
-    """Derive BF16-valued ``(alpha, beta)`` from row sumsq and absmax.
+    """Derive BF16-valued ``(alpha, beta, l2)`` from row sumsq and absmax.
 
     Mirrors the reference chain: ``row_norms`` floors both norms at
     ``2^-32`` (the zero-row guard), then ``derive_row_scales`` computes
@@ -193,7 +238,7 @@ def _scale_chain(ssq, amax, kf, delta_r, delta_over_std):
     nb = _rndb(cutlass.Float32(delta_r) * l2 + linf)
     alpha = _rndb(cutlass.Float32(MAX_E4M3) / nb)
     beta = _rndb(_rndb(alpha * l2) * cutlass.Float32(delta_over_std))
-    return alpha, beta
+    return alpha, beta, l2
 
 
 def _ge0_i32(x):

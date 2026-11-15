@@ -138,7 +138,7 @@ def _cpu_pq(state) -> PrequantMatrix:
 
 # SHA-256 digests of the protocol's job-constant B operands for the
 # ``layer_state`` weights, recorded from the former bit-exact CPU reference
-# implementation. Each shape
+# implementation (B' from the verifier's own quantizer). Each shape
 # also stores ``peel_tol``, the mid peel half's bound against its fp64-exact
 # product.
 _B_DIGESTS = json.loads(
