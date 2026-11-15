@@ -88,7 +88,7 @@ where
     let trace_commitment = timed!(
         timing,
         "compute trace commitment",
-        PolynomialBatch::<F, C, D>::from_values(
+        PolynomialBatch::<F, C, D>::from_values_prover(
             trace_poly_values,
             rate_bits,
             false,
@@ -237,7 +237,7 @@ where
         timed!(
             timing,
             "compute auxiliary polynomials commitment",
-            PolynomialBatch::from_values(
+            PolynomialBatch::from_values_prover(
                 aux_polys,
                 rate_bits,
                 false,
@@ -428,7 +428,7 @@ where
         let quotient_commitment = timed!(
             timing,
             "compute quotient commitment",
-            PolynomialBatch::from_coeffs(
+            PolynomialBatch::from_coeffs_prover(
                 all_quotient_chunks,
                 rate_bits,
                 false,
