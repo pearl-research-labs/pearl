@@ -142,6 +142,17 @@ pub(crate) fn lde_coset_point<F: RichField>(x_index: usize, lde_bits: usize) -> 
 }
 
 #[cfg(test)]
+pub(crate) fn in_thread_pools(test: impl Fn(usize) + Sync) {
+    for threads in [1, 4] {
+        plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| test(threads));
+    }
+}
+
+#[cfg(test)]
 mod tests {
 
     #[cfg(not(feature = "std"))]

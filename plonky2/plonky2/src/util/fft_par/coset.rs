@@ -139,54 +139,40 @@ mod tests {
                     .wrapping_add((i as u64 / 6).wrapping_mul(977)),
             )
         };
-        for threads in [1, 4] {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap()
-                .install(|| {
-                    check_padded_prefixes(word, F::coset_shift());
-                    type E = <F as Extendable<2>>::Extension;
-                    check_padded_prefixes(
-                        |i| E::from_basefield_array([word(i), word(i + 1)]),
-                        F::coset_shift().into(),
-                    );
-                    for shift in [F::ZERO, F::ONE] {
-                        let coeffs: Vec<_> = (0..1024).map(word).collect();
-                        assert_eq!(
-                            coset_lde_par(&coeffs, shift, 8),
-                            PolynomialCoeffs::new(coeffs).lde(8).coset_fft(shift)
-                        );
-                    }
-                });
-        }
+        crate::util::in_thread_pools(|_| {
+            check_padded_prefixes(word, F::coset_shift());
+            type E = <F as Extendable<2>>::Extension;
+            check_padded_prefixes(
+                |i| E::from_basefield_array([word(i), word(i + 1)]),
+                F::coset_shift().into(),
+            );
+            for shift in [F::ZERO, F::ONE] {
+                let coeffs: Vec<_> = (0..1024).map(word).collect();
+                assert_eq!(
+                    coset_lde_par(&coeffs, shift, 8),
+                    PolynomialCoeffs::new(coeffs).lde(8).coset_fft(shift)
+                );
+            }
+        });
     }
     #[test]
     fn parallel_coset_ifft_matches_serial() {
-        for threads in [1, 4] {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap()
-                .install(|| {
-                    for bits in [0, 1, 10, 18, 19] {
-                        let values = PolynomialValues::new(
-                            (0..1 << bits)
-                                .map(|i| {
-                                    F::from_noncanonical_u64(
-                                        (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
-                                    )
-                                })
-                                .collect(),
-                        );
-                        for shift in [F::ONE, F::coset_shift()] {
-                            assert_eq!(
-                                coset_ifft_par(values.clone(), shift),
-                                values.clone().coset_ifft(shift)
-                            );
-                        }
-                    }
-                });
-        }
+        crate::util::in_thread_pools(|_| {
+            for bits in [0, 1, 10, 18, 19] {
+                let values = PolynomialValues::new(
+                    (0..1 << bits)
+                        .map(|i| {
+                            F::from_noncanonical_u64((i as u64).wrapping_mul(0x9e3779b97f4a7c15))
+                        })
+                        .collect(),
+                );
+                for shift in [F::ONE, F::coset_shift()] {
+                    assert_eq!(
+                        coset_ifft_par(values.clone(), shift),
+                        values.clone().coset_ifft(shift)
+                    );
+                }
+            }
+        });
     }
 }

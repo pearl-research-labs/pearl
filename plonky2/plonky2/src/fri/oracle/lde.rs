@@ -151,57 +151,47 @@ mod tests {
     #[test]
     fn small_coset_ldes_match_original_fft() {
         type F = GoldilocksField;
-        for threads in [1, 4] {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap();
-            pool.install(|| {
-                for degree_bits in [0, 3, 6, 10] {
-                    let p = PolynomialCoeffs::new(
-                        (0..1 << degree_bits)
-                            .map(|i| {
-                                F::from_noncanonical_u64(
-                                    (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
-                                )
-                            })
-                            .collect(),
-                    );
-                    for rate_bits in [0, 1, 3, 4, 8, 9] {
-                        let roots = crate::field::fft::fft_root_table(p.len() << rate_bits);
-                        let expected = p
-                            .lde(rate_bits)
-                            .coset_fft_with_options(F::coset_shift(), Some(rate_bits), Some(&roots))
-                            .values;
-                        for num_polynomials in [1, threads + 1] {
-                            let mut polynomials = vec![p.clone(); num_polynomials];
-                            let mut expected_batch = vec![expected.clone(); num_polynomials];
-                            if num_polynomials > 1 {
-                                for constant in [F::ZERO, F::from_canonical_u64(7)] {
-                                    let mut coeffs = vec![F::ZERO; p.len()];
-                                    coeffs[0] = constant;
-                                    polynomials.push(PolynomialCoeffs::new(coeffs));
-                                    expected_batch.push(vec![constant; expected.len()]);
-                                }
+        crate::util::in_thread_pools(|threads| {
+            for degree_bits in [0, 3, 6, 10] {
+                let p = PolynomialCoeffs::new(
+                    (0..1 << degree_bits)
+                        .map(|i| {
+                            F::from_noncanonical_u64((i as u64).wrapping_mul(0x9e3779b97f4a7c15))
+                        })
+                        .collect(),
+                );
+                for rate_bits in [0, 1, 3, 4, 8, 9] {
+                    let roots = crate::field::fft::fft_root_table(p.len() << rate_bits);
+                    let expected = p
+                        .lde(rate_bits)
+                        .coset_fft_with_options(F::coset_shift(), Some(rate_bits), Some(&roots))
+                        .values;
+                    for num_polynomials in [1, threads + 1] {
+                        let mut polynomials = vec![p.clone(); num_polynomials];
+                        let mut expected_batch = vec![expected.clone(); num_polynomials];
+                        if num_polynomials > 1 {
+                            for constant in [F::ZERO, F::from_canonical_u64(7)] {
+                                let mut coeffs = vec![F::ZERO; p.len()];
+                                coeffs[0] = constant;
+                                polynomials.push(PolynomialCoeffs::new(coeffs));
+                                expected_batch.push(vec![constant; expected.len()]);
                             }
-                            for cached_roots in [None, Some(&roots)] {
-                                assert_eq!(
-                                    values(&polynomials, rate_bits, false, cached_roots),
-                                    expected_batch
-                                );
-                            }
-                            if degree_bits == 10 && rate_bits == 8 && num_polynomials == 1 {
-                                let blinded = values(&polynomials, rate_bits, true, None);
-                                assert_eq!(&blinded[..num_polynomials], &expected_batch);
-                                assert_eq!(blinded.len(), num_polynomials + SALT_SIZE);
-                                assert!(blinded
-                                    .iter()
-                                    .all(|column| column.len() == expected.len()));
-                            }
+                        }
+                        for cached_roots in [None, Some(&roots)] {
+                            assert_eq!(
+                                values(&polynomials, rate_bits, false, cached_roots),
+                                expected_batch
+                            );
+                        }
+                        if degree_bits == 10 && rate_bits == 8 && num_polynomials == 1 {
+                            let blinded = values(&polynomials, rate_bits, true, None);
+                            assert_eq!(&blinded[..num_polynomials], &expected_batch);
+                            assert_eq!(blinded.len(), num_polynomials + SALT_SIZE);
+                            assert!(blinded.iter().all(|column| column.len() == expected.len()));
                         }
                     }
                 }
-            });
-        }
+            }
+        });
     }
 }

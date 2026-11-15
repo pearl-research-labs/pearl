@@ -21,7 +21,7 @@ use crate::fri::FriParams;
 use crate::hash::batch_merkle_tree::BatchMerkleTree;
 use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::timed;
 use crate::util::fft_par::coset_lde_par;
 use crate::util::timing::TimingTree;
@@ -32,7 +32,23 @@ use plonky2_field::packable::Packable;
 mod prover;
 mod rows;
 
-use rows::{hash_leaf_rows, RowMatrix};
+use rows::RowMatrix;
+
+/// Hash natural-order rows into bit-reversed Merkle leaves.
+///
+/// Each row is hashed independently on the prover worker pool.
+fn hash_leaf_rows<F, C, const D: usize>(rows: &RowMatrix<F>) -> Vec<Vec<F>>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+{
+    let height = rows.values.len() / rows.width;
+    let bits = log2_strict(height);
+    (0..height)
+        .into_par_iter()
+        .map(|index| C::Hasher::hash_no_pad(rows.row(reverse_bits(index, bits))).to_vec())
+        .collect()
+}
 
 /// `(self - self(z)) / (X - z)` with a blocked parallel scan.
 ///
@@ -640,7 +656,7 @@ mod test {
     use crate::iop::witness::PartialWitness;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::CircuitConfig;
-    use crate::plonk::config::{GenericHashOut, Hasher, PoseidonGoldilocksConfig};
+    use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::prover::prove;
 
     const D: usize = 2;
@@ -652,34 +668,16 @@ mod test {
     #[test]
     fn packed_row_buffer_matches_allocating_getter() {
         type P = <F as Packable>::Packing;
-        let polynomials: Vec<_> = (0..4)
+        type Oracle = BatchFriOracle<F, C, D>;
+        let coeffs: Vec<_> = (0..4)
             .map(|c| PolynomialCoeffs::new(F::rand_vec(32 >> (c / 2))))
             .collect();
+        let values = coeffs.iter().cloned().map(|p| p.fft()).collect();
         let mut timing = TimingTree::default();
-        let ordinary = BatchFriOracle::<F, C, D>::from_coeffs(
-            polynomials.clone(),
-            2,
-            false,
-            1,
-            &mut timing,
-            &[None; 4],
-        );
-        let prover = BatchFriOracle::<F, C, D>::from_values_prover(
-            polynomials.iter().cloned().map(|p| p.fft()).collect(),
-            2,
-            false,
-            1,
-            &mut timing,
-            &[None; 4],
-        );
+        let ordinary = Oracle::from_coeffs(coeffs.clone(), 2, false, 1, &mut timing, &[None; 4]);
+        let prover = Oracle::from_values_prover(values, 2, false, 1, &mut timing, &[None; 4]);
         assert_eq!(ordinary, prover);
-        let digests = BatchFriOracle::<F, C, D>::from_coeffs_with_digests(
-            polynomials,
-            vec![0..2, 2..4],
-            2,
-            1,
-            &mut timing,
-        );
+        let digests = Oracle::from_coeffs_with_digests(coeffs, vec![0..2, 2..4], 2, 1, &mut timing);
         for index in 0..128 {
             assert_eq!(ordinary.open_values(index), digests.open_values(index));
         }
