@@ -87,14 +87,12 @@ var helpDescsEnUS = map[string]string{
 	"getnewaddress--synopsis":   "Generates and returns a new payment address.",
 	"getnewaddress-account":     "DEPRECATED -- Account name the new address will belong to (default=\"default\")",
 	"getnewaddress-addresstype": "The address type to use. Options are \"legacy\", \"p2sh-segwit\", and \"bech32\".(default=\"legacy\")",
-	"getnewaddress-pq":          "If true, derive a post-quantum resistant address (default=false)",
 	"getnewaddress--result0":    "The payment address",
 
 	// GetRawChangeAddressCmd help.
 	"getrawchangeaddress--synopsis":   "Generates and returns a new internal payment address for use as a change address in raw transactions.",
 	"getrawchangeaddress-account":     "Account name the new internal address will belong to (default=\"default\")",
 	"getrawchangeaddress-addresstype": "The address type to use. Options are \"legacy\", \"p2sh-segwit\", and \"bech32\".(default=\"legacy\")",
-	"getrawchangeaddress-pq":          "If true, derive a post-quantum resistant address (default=false)",
 	"getrawchangeaddress--result0":    "The internal payment address",
 
 	// GetReceivedByAccountCmd help.

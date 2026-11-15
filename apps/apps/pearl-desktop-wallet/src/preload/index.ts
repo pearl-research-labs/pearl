@@ -3,7 +3,7 @@ import {
   AppBridge,
   Ipc,
   WindowApi,
-  WalletApi,
+  WalletBridgeApi,
   ManagerApi,
   SyncApi,
   UpdateApi,
@@ -22,7 +22,7 @@ const windowIpc: Ipc<WindowApi> = {
   openExternal: url => ipcRenderer.invoke('open-external', url),
 };
 
-const walletIpc: Ipc<WalletApi> = {
+const walletIpc: Ipc<WalletBridgeApi> = {
   getNewAddress: () => ipcRenderer.invoke('wallet-get-new-address'),
   unlockWallet: (passphrase, timeout) => ipcRenderer.invoke('wallet-unlock', passphrase, timeout),
   lockWallet: () => ipcRenderer.invoke('wallet-lock'),

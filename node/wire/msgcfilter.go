@@ -100,6 +100,12 @@ func (msg *MsgCFilter) Deserialize(r io.Reader) error {
 	return msg.PrlDecode(r, 0, BaseEncoding)
 }
 
+// SerializeSize returns the number of bytes it would take to serialize the receiver.
+func (msg *MsgCFilter) SerializeSize() int {
+	// Filter type + block hash + filter data.
+	return 1 + chainhash.HashSize + varLenSize(len(msg.Data), 1)
+}
+
 // Command returns the protocol command string for the message.  This is part
 // of the Message interface implementation.
 func (msg *MsgCFilter) Command() string {

@@ -141,6 +141,16 @@ pub struct PearlCircuitParams {
 }
 
 impl PearlCircuitParams {
+    /// The FRI parameters `prove_block` uses by default
+    pub fn prover_defaults(stark_degree_bits: usize) -> Self {
+        let rate_bits = if stark_degree_bits >= 15 { [1, 3, 7] } else { [2, 3, 7] };
+        Self {
+            stark_degree_bits,
+            pow_bits: [18, 18, 22],
+            rate_bits,
+        }
+    }
+
     /// Validate proof and circuit parameters for security requirements.
     pub fn sanity_check(&self, compiled_params: &CompiledPublicParams) -> Result<()> {
         for stage in 0..3 {

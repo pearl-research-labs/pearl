@@ -147,13 +147,13 @@ type Interface interface {
 		btcutil.Address, error)
 
 	// NewAddress returns a new address for a given account and scope.
-	NewAddress(account uint32, scope waddrmgr.KeyScope,
-		includePQTapscript bool) (btcutil.Address, error)
+	NewAddress(account uint32, scope waddrmgr.KeyScope) (
+		btcutil.Address, error)
 
 	// NewChangeAddress returns a new change address for a given account
 	// and scope.
-	NewChangeAddress(account uint32, scope waddrmgr.KeyScope,
-		includePQTapscript bool) (btcutil.Address, error)
+	NewChangeAddress(account uint32, scope waddrmgr.KeyScope) (
+		btcutil.Address, error)
 
 	// AddressInfo returns detailed information about a managed address,
 	// including its derivation path and whether it's compressed.

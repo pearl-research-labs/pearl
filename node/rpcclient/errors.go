@@ -192,6 +192,10 @@ const (
 	// program hash mismatch).
 	ErrNonMandatoryScriptVerifyFlag
 
+	// ErrTooLongMempoolChain is returned when a transaction would exceed the mempool's limits on unconfirmed ancestors
+	// or descendants.
+	ErrTooLongMempoolChain
+
 	// errSentinel is used to indicate the end of the error list. This
 	// should always be the last error code.
 	errSentinel
@@ -327,6 +331,9 @@ func (r CompatRPCErr) Error() string {
 
 	case ErrNonMandatoryScriptVerifyFlag:
 		return "non-mandatory-script-verify-flag"
+
+	case ErrTooLongMempoolChain:
+		return "too-long-mempool-chain"
 	}
 
 	return "unknown error"
@@ -368,6 +375,9 @@ var PearldErrMap = map[string]error{
 	// A transaction that conflicts with an unconfirmed tx. Happens when
 	// RBF is not enabled.
 	"output already spent in mempool": ErrMempoolConflict,
+
+	// A transaction over the limits on unconfirmed ancestors or descendants.
+	"too-long-mempool-chain": ErrTooLongMempoolChain,
 
 	// A transaction with no outputs.
 	"transaction has no outputs": ErrEmptyOutput,

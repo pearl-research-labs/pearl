@@ -83,8 +83,8 @@ func (w *Wallet) RemoveTransaction(txHash chainhash.Hash) ([]chainhash.Hash, err
 // parent no peer holds would otherwise stay an orphan.
 //
 // An ancestor that no peer requests does not stop it, since peers that already hold the ancestor stay silent; any other
-// failure does. It sends through the backend directly because publishTransaction drops the record of a failed send:
-// under SPV one peer can reject what others still hold, so dropping a spend is the user's call via RemoveTransaction.
+// failure does. It sends through the backend directly to report this attempt's relay result while retaining the
+// existing record. Dropping a pending spend is the user's call via RemoveTransaction.
 func (w *Wallet) RebroadcastTransaction(txHash chainhash.Hash) ([]chainhash.Hash, error) {
 	chainClient, err := w.requireChainClient()
 	if err != nil {

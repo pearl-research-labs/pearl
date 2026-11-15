@@ -390,7 +390,7 @@ func assertTxInputs(t *testing.T, packet *psbt.Packet,
 		}
 
 		require.Empty(t, txIn.SignatureScript)
-		require.Empty(t, txIn.Witness)
+		require.Empty(t, txIn.DecodeWitness())
 	}
 }
 
@@ -494,4 +494,17 @@ func TestFinalizePsbt(t *testing.T) {
 		[]btcutil.Amount{1000000, 1000000},
 	)
 	require.NoError(t, err)
+}
+
+func TestPsbtPrevOutputFetcherOutOfRangeIndex(t *testing.T) {
+	t.Parallel()
+
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Index: 500}})
+	tx.AddTxOut(&wire.TxOut{Value: 1, PkScript: []byte{0x51}})
+	packet, err := psbt.NewFromUnsignedTx(tx)
+	require.NoError(t, err)
+	packet.Inputs[0].NonWitnessUtxo = &wire.MsgTx{TxOut: []*wire.TxOut{{Value: 1}}}
+
+	require.NotPanics(t, func() { _ = PsbtPrevOutputFetcher(packet) })
 }

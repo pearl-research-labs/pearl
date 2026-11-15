@@ -3,7 +3,7 @@
 FROM rust:1.96.1-alpine AS rust-toolchain
 
 # ===== Go + Rust + Task toolchain: rarely changes, fully cached =====
-FROM golang:1.26.6-alpine AS toolchain
+FROM golang:1.26.10-alpine AS toolchain
 
 RUN apk add --no-cache \
     curl \
@@ -57,6 +57,7 @@ VOLUME ["/root/.pearld"]
 
 # 44108  Mainnet Pearl peer-to-peer port
 # 44107  Mainnet RPC port
-EXPOSE 44108 44107
+# 9105   Prometheus metrics (only served with --metricslisten)
+EXPOSE 44108 44107 9105
 
 ENTRYPOINT ["pearld"]

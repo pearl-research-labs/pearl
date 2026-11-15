@@ -10,6 +10,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/pearl-research-labs/pearl/node/btcec"
+	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/pearl-research-labs/pearl/xmss"
+	"github.com/stretchr/testify/require"
 )
 
 // TestOpcodeDisabled tests the opcodeDisabled function manually because all
@@ -219,4 +224,100 @@ func TestOpcodeDisasm(t *testing.T) {
 			continue
 		}
 	}
+}
+
+func TestOpcodeCheckXmssSigWrongLengthNullFail(t *testing.T) {
+	t.Parallel()
+
+	const sigChunkSize = xmss.SignatureLen / 5
+	fullChunks := []int{sigChunkSize, sigChunkSize, sigChunkSize, sigChunkSize, sigChunkSize}
+	op := &opcodeArray[OP_CHECKXMSSSIG]
+
+	tests := []struct {
+		name      string
+		chunkLens []int
+		pk        []byte
+	}{
+		{"wrong-length pk", fullChunks, []byte{0x01}},
+		{"wrong-length sig chunk", []int{sigChunkSize, sigChunkSize, 10, sigChunkSize, sigChunkSize}, make([]byte, xmss.PKLen)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := &Engine{tapscriptCtx: &tapscriptExecutionCtx{}}
+			for _, n := range tc.chunkLens {
+				vm.dstack.PushByteArray(make([]byte, n))
+			}
+			vm.dstack.PushByteArray(tc.pk)
+
+			err := opcodeCheckXmssSig(op, nil, vm)
+			if !IsErrorCode(err, ErrNullFail) {
+				t.Fatalf("got %v, want ErrNullFail", err)
+			}
+		})
+	}
+}
+
+func TestOpcodeCheckXmssSigScriptPathSpend(t *testing.T) {
+	t.Parallel()
+
+	var privSeed [xmss.PrivateSeedLen]byte
+	var pubSeed [xmss.PublicSeedLen]byte
+	for i := range privSeed {
+		privSeed[i] = byte(i)
+	}
+	for i := range pubSeed {
+		pubSeed[i] = byte(0xff - i)
+	}
+
+	pk, sk, err := xmss.Keygen(privSeed, pubSeed)
+	if err != nil && strings.Contains(err.Error(), "-tags xmss") {
+		t.Skip(err)
+	}
+	require.NoError(t, err)
+
+	xmssScript, err := NewScriptBuilder().AddData(pk[:]).AddOp(OP_CHECKXMSSSIG).Script()
+	require.NoError(t, err)
+
+	internalPriv, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{0x01}, 32))
+	internalKey := internalPriv.PubKey()
+
+	tapLeaf := NewBaseTapLeaf(xmssScript)
+	tapTree := AssembleTaprootScriptTree(tapLeaf)
+	rootHash := tapTree.RootNode.TapHash()
+	pkScript, err := PayToTaprootScript(ComputeTaprootOutputKey(internalKey, rootHash[:]))
+	require.NoError(t, err)
+	ctrlBlock := tapTree.LeafMerkleProofs[0].ToControlBlock(internalKey)
+	ctrlBytes, err := ctrlBlock.ToBytes()
+	require.NoError(t, err)
+
+	const value = int64(1e8)
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Index: 0}})
+	tx.AddTxOut(&wire.TxOut{Value: value, PkScript: pkScript})
+
+	prevFetcher := NewCannedPrevOutputFetcher(pkScript, value)
+	sigHashes := NewTxSigHashes(tx, prevFetcher)
+	sigHash, err := CalcTapscriptSignaturehash(sigHashes, SigHashDefault, tx, 0, prevFetcher, tapLeaf)
+	require.NoError(t, err)
+
+	var msg [xmss.MsgLen]byte
+	copy(msg[:], sigHash)
+	sig, err := xmss.Sign(0, sk, msg)
+	require.NoError(t, err)
+
+	const chunk = xmss.SignatureLen / 5
+	execute := func(sig [xmss.SignatureLen]byte) error {
+		tx.TxIn[0].SetWitness(wire.TxWitness{
+			sig[:chunk], sig[chunk : 2*chunk], sig[2*chunk : 3*chunk], sig[3*chunk : 4*chunk], sig[4*chunk:],
+			xmssScript, ctrlBytes,
+		})
+		vm, err := NewEngine(pkScript, tx, 0, StandardVerifyFlags, nil, sigHashes, value, prevFetcher)
+		require.NoError(t, err)
+		return vm.Execute()
+	}
+
+	require.NoError(t, execute(sig))
+
+	sig[chunk-1] ^= 0x01
+	require.Error(t, execute(sig))
 }

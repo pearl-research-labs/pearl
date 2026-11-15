@@ -5,8 +5,10 @@
 package mempool
 
 import (
+	"bytes"
 	"encoding/hex"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -219,7 +221,6 @@ func (p *poolHarness) CreateSignedTx(inputs []spendableOutput,
 		tx.AddTxIn(&wire.TxIn{
 			PreviousOutPoint: input.outPoint,
 			SignatureScript:  nil,
-			Witness:          nil,
 			Sequence:         sequence,
 		})
 	}
@@ -257,7 +258,7 @@ func (p *poolHarness) CreateSignedTx(inputs []spendableOutput,
 		if err != nil {
 			return nil, err
 		}
-		tx.TxIn[i].Witness = witness
+		tx.TxIn[i].SetWitness(witness)
 	}
 
 	return btcutil.NewTx(tx), nil
@@ -278,7 +279,6 @@ func (p *poolHarness) CreateTxChain(firstOutput spendableOutput, numTxns uint32)
 		tx.AddTxIn(&wire.TxIn{
 			PreviousOutPoint: prevOutPoint,
 			SignatureScript:  nil,
-			Witness:          nil,
 			Sequence:         wire.MaxTxInSequenceNum,
 		})
 		outputAmount := spendableAmount - minTestFee
@@ -297,7 +297,7 @@ func (p *poolHarness) CreateTxChain(firstOutput spendableOutput, numTxns uint32)
 		if err != nil {
 			return nil, err
 		}
-		tx.TxIn[0].Witness = witness
+		tx.TxIn[0].SetWitness(witness)
 
 		txChain = append(txChain, btcutil.NewTx(tx))
 
@@ -307,6 +307,37 @@ func (p *poolHarness) CreateTxChain(firstOutput spendableOutput, numTxns uint32)
 	}
 
 	return txChain, nil
+}
+
+const (
+	// fatOutputs is the output count of the large transactions used to make package walks expensive.
+	fatOutputs = 2000
+	fatFee     = btcutil.Amount(100_000)
+	fatValue   = btcutil.Amount(1000)
+)
+
+// createFatTx returns a transaction spending prev into nOut outputs: the first keeps the remainder and the others pay
+// fatValue each.
+func (p *poolHarness) createFatTx(prev spendableOutput, nOut int, fee btcutil.Amount) (*btcutil.Tx, error) {
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(&wire.TxIn{PreviousOutPoint: prev.outPoint, Sequence: wire.MaxTxInSequenceNum})
+	remainder := prev.amount - fee - fatValue*btcutil.Amount(nOut-1)
+	tx.AddTxOut(&wire.TxOut{PkScript: p.payScript, Value: int64(remainder)})
+	for i := 1; i < nOut; i++ {
+		tx.AddTxOut(&wire.TxOut{PkScript: p.payScript, Value: int64(fatValue)})
+	}
+
+	fetcher := txscript.NewCannedPrevOutputFetcher(p.payScript, int64(prev.amount))
+	sigHashes := txscript.NewTxSigHashes(tx, fetcher)
+	witness, err := txscript.TaprootWitnessSignature(
+		tx, sigHashes, 0, int64(prev.amount), p.payScript, txscript.SigHashDefault, p.signKey,
+	)
+	if err != nil {
+		return nil, err
+	}
+	tx.TxIn[0].SetWitness(witness)
+
+	return btcutil.NewTx(tx), nil
 }
 
 // newPoolHarness returns a new instance of a pool harness initialized with a
@@ -383,6 +414,22 @@ func newPoolHarness(chainParams *chaincfg.Params) (*poolHarness, []spendableOutp
 	harness.chain.SetMedianTimePast(time.Now())
 
 	return &harness, outputs, nil
+}
+
+// applyPackageLimits sets the production package limits in p.
+func applyPackageLimits(p *Policy) {
+	p.LimitAncestorCount = DefaultAncestorCountLimit
+	p.LimitAncestorSize = DefaultAncestorSizeLimit
+	p.LimitDescendantCount = DefaultDescendantCountLimit
+}
+
+// newLimitedPoolHarness returns a pool harness that enforces the production package limits.
+func newLimitedPoolHarness(tb testing.TB) *poolHarness {
+	tb.Helper()
+	harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
+	require.NoError(tb, err)
+	applyPackageLimits(&harness.txPool.cfg.Policy)
+	return harness
 }
 
 // testContext houses a test-related state that is useful to pass to helper
@@ -476,6 +523,13 @@ func testPoolMembership(tc *testContext, tx *btcutil.Tx, inOrphanPool, inTxPool 
 		tc.t.Fatalf("HaveTransaction: want %v, got %v", wantHaveTx,
 			gotHaveTx)
 	}
+}
+
+// mustProcess adds tx to the pool and fails the test if it is rejected.
+func mustProcess(tb testing.TB, mp *TxPool, tx *btcutil.Tx) {
+	tb.Helper()
+	_, err := mp.ProcessTransaction(tx, false, false, 0)
+	require.NoError(tb, err)
 }
 
 // TestSimpleOrphanChain ensures that a simple chain of orphans is handled
@@ -1214,6 +1268,73 @@ func TestCheckPoolDoubleSpend(t *testing.T) {
 			},
 			isReplacement: true,
 		},
+		{
+			// Conflicts that don't signal replacement are valid to replace if a shared ancestor does, which is walked
+			// once for all of them.
+			name: "replacement of children sharing a parent",
+			setup: func(ctx *testContext) *btcutil.Tx {
+				coinbase := ctx.addCoinbaseTx(1)
+
+				coinbaseOut := txOutToSpendableOut(coinbase, 0)
+				outs := []spendableOutput{coinbaseOut}
+				grandparent := ctx.addSignedTx(outs, 1, minTestFee, true, false)
+
+				grandparentOut := txOutToSpendableOut(grandparent, 0)
+				outs = []spendableOutput{grandparentOut}
+				parent := ctx.addSignedTx(outs, 3, minTestFee, false, false)
+
+				// Spend each output of the parent with a child that doesn't signal replacement, then create a
+				// transaction double spending all of them.
+				var spent []spendableOutput
+				for i := uint32(0); i < 3; i++ {
+					out := txOutToSpendableOut(parent, i)
+					outs = []spendableOutput{out}
+					ctx.addSignedTx(outs, 1, minTestFee, false, false)
+					spent = append(spent, out)
+				}
+				tx, err := ctx.harness.CreateSignedTx(spent, 1, 0, false)
+				if err != nil {
+					ctx.t.Fatalf("unable to create transaction: %v", err)
+				}
+
+				return tx
+			},
+			isReplacement: true,
+		},
+		{
+			// A conflict that is also an ancestor of another conflict keeps the result found while walking from the
+			// other one.
+			name: "replacement of a conflict and its descendant",
+			setup: func(ctx *testContext) *btcutil.Tx {
+				coinbase := ctx.addCoinbaseTx(2)
+
+				coinbaseOut := txOutToSpendableOut(coinbase, 0)
+				outs := []spendableOutput{coinbaseOut}
+				signaling := ctx.addSignedTx(outs, 1, minTestFee, true, false)
+
+				signalingOut := txOutToSpendableOut(signaling, 0)
+				outs = []spendableOutput{signalingOut}
+				parent := ctx.addSignedTx(outs, 1, minTestFee, false, false)
+
+				parentOut := txOutToSpendableOut(parent, 0)
+				outs = []spendableOutput{parentOut}
+				child := ctx.addSignedTx(outs, 1, minTestFee, false, false)
+
+				otherOut := txOutToSpendableOut(coinbase, 1)
+				outs = []spendableOutput{txOutToSpendableOut(child, 0), otherOut}
+				ctx.addSignedTx(outs, 1, minTestFee, false, false)
+
+				// The grandchild's conflict comes first, so the child is resolved before it is checked itself.
+				outs = []spendableOutput{otherOut, parentOut}
+				tx, err := ctx.harness.CreateSignedTx(outs, 1, 0, false)
+				if err != nil {
+					ctx.t.Fatalf("unable to create transaction: %v", err)
+				}
+
+				return tx
+			},
+			isReplacement: true,
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -1365,6 +1486,37 @@ func TestConflicts(t *testing.T) {
 				return tx, []*btcutil.Tx{parent, child}
 			},
 		},
+		{
+			// Create a transaction double spending two inputs of one transaction and one input of another, whose
+			// descendants overlap. Each conflict is found once.
+			name: "repeated and shared conflicts",
+			setup: func(ctx *testContext) (*btcutil.Tx, []*btcutil.Tx) {
+				coinbase := ctx.addCoinbaseTx(3)
+				spent := []spendableOutput{
+					txOutToSpendableOut(coinbase, 0),
+					txOutToSpendableOut(coinbase, 1),
+					txOutToSpendableOut(coinbase, 2),
+				}
+				twoInputs := ctx.addSignedTx(spent[:2], 2, minTestFee, false, false)
+				oneInput := ctx.addSignedTx(spent[2:], 1, minTestFee, false, false)
+
+				outs := []spendableOutput{txOutToSpendableOut(twoInputs, 0), txOutToSpendableOut(oneInput, 0)}
+				shared := ctx.addSignedTx(outs, 1, minTestFee, false, false)
+
+				outs = []spendableOutput{txOutToSpendableOut(shared, 0)}
+				grandchild := ctx.addSignedTx(outs, 1, minTestFee, false, false)
+
+				outs = []spendableOutput{txOutToSpendableOut(twoInputs, 1)}
+				sibling := ctx.addSignedTx(outs, 1, minTestFee, false, false)
+
+				tx, err := ctx.harness.CreateSignedTx(spent, 1, minTestFee, false)
+				if err != nil {
+					ctx.t.Fatalf("unable to create transaction: %v", err)
+				}
+
+				return tx, []*btcutil.Tx{twoInputs, oneInput, shared, grandchild, sibling}
+			},
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -1503,6 +1655,121 @@ func TestDescendantsBounded(t *testing.T) {
 	}
 }
 
+// requireSpendersIndex fails unless the spenders index lists, once each, exactly the pool transactions spending outputs
+// of other pool transactions.
+func requireSpendersIndex(t *testing.T, mp *TxPool) {
+	t.Helper()
+	mp.mtx.RLock()
+	defer mp.mtx.RUnlock()
+
+	want := make(map[chainhash.Hash]map[chainhash.Hash]struct{})
+	for op, spender := range mp.outpoints {
+		if _, ok := mp.pool[op.Hash]; !ok {
+			continue
+		}
+		if want[op.Hash] == nil {
+			want[op.Hash] = make(map[chainhash.Hash]struct{})
+		}
+		want[op.Hash][*spender.Hash()] = struct{}{}
+	}
+
+	got := make(map[chainhash.Hash]map[chainhash.Hash]struct{}, len(mp.spenders))
+	for parent, spenders := range mp.spenders {
+		got[parent] = make(map[chainhash.Hash]struct{}, len(spenders))
+		for _, spender := range spenders {
+			got[parent][*spender.Hash()] = struct{}{}
+		}
+		require.Len(t, got[parent], len(spenders), "duplicate spenders of %v", parent)
+	}
+	require.Equal(t, want, got)
+}
+
+// TestSpendersIndexTracksPool ensures the spenders index follows additions, replacements and removals, and holds
+// nothing for spends of confirmed outputs.
+func TestSpendersIndexTracksPool(t *testing.T) {
+	t.Parallel()
+
+	harness := newLimitedPoolHarness(t)
+	ctx := &testContext{t, harness}
+	mp := harness.txPool
+
+	coinbase := ctx.addCoinbaseTx(2)
+	coinbaseOut := txOutToSpendableOut(coinbase, 0)
+	parent := ctx.addSignedTx([]spendableOutput{coinbaseOut}, 2, minTestFee, true, false)
+	child := ctx.addSignedTx(
+		[]spendableOutput{txOutToSpendableOut(parent, 0), txOutToSpendableOut(parent, 1)}, 1, minTestFee, false, false,
+	)
+	ctx.addSignedTx([]spendableOutput{txOutToSpendableOut(child, 0)}, 1, minTestFee, false, false)
+	other := ctx.addSignedTx([]spendableOutput{txOutToSpendableOut(coinbase, 1)}, 1, minTestFee, false, false)
+	requireSpendersIndex(t, mp)
+	require.Len(t, mp.spenders, 2)
+
+	// Replacing the parent evicts its descendants too.
+	replacement, err := harness.CreateSignedTx([]spendableOutput{coinbaseOut}, 1, minTestFee*20, false)
+	require.NoError(t, err)
+	mustProcess(t, mp, replacement)
+	requireSpendersIndex(t, mp)
+	require.Empty(t, mp.spenders)
+
+	mp.RemoveTransaction(other, false)
+	mp.RemoveTransaction(replacement, true)
+	requireSpendersIndex(t, mp)
+	require.Empty(t, mp.spenders)
+}
+
+// TestSpendersIndexLinksReaddedParent ensures a transaction re-added after its block is disconnected is linked to the
+// pool transactions already spending it, so they count as its descendants and are evicted with it when it is replaced,
+// and that it is unlinked when it is mined again.
+func TestSpendersIndexLinksReaddedParent(t *testing.T) {
+	t.Parallel()
+
+	harness := newLimitedPoolHarness(t)
+	ctx := &testContext{t, harness}
+	mp := harness.txPool
+
+	coinbase := ctx.addCoinbaseTx(1)
+	confirmed := ctx.addSignedTx(
+		[]spendableOutput{txOutToSpendableOut(coinbase, 0)}, DefaultDescendantCountLimit, minTestFee*10, true, true,
+	)
+	for i := uint32(0); i < DefaultDescendantCountLimit-1; i++ {
+		ctx.addSignedTx([]spendableOutput{txOutToSpendableOut(confirmed, i)}, 1, minTestFee, false, false)
+	}
+	requireSpendersIndex(t, mp)
+	require.Empty(t, mp.spenders)
+
+	for i := range confirmed.MsgTx().TxOut {
+		harness.chain.utxos.RemoveEntry(wire.OutPoint{Hash: *confirmed.Hash(), Index: uint32(i)})
+	}
+	_, _, err := mp.MaybeAcceptTransaction(confirmed, false, false)
+	require.NoError(t, err)
+	requireSpendersIndex(t, mp)
+	require.Len(t, mp.spenders[*confirmed.Hash()], DefaultDescendantCountLimit-1)
+
+	lastChild, err := harness.CreateSignedTx(
+		[]spendableOutput{txOutToSpendableOut(confirmed, DefaultDescendantCountLimit-1)}, 1, minTestFee, false,
+	)
+	require.NoError(t, err)
+	_, err = mp.ProcessTransaction(lastChild, false, false, 0)
+	require.ErrorContains(t, err, "too many descendants")
+
+	// Mining it again leaves its children with no pool parent.
+	mp.RemoveTransaction(confirmed, false)
+	requireSpendersIndex(t, mp)
+	require.Empty(t, mp.spenders)
+
+	// Re-adding it once more links the children again, so replacing it evicts them along with it.
+	_, _, err = mp.MaybeAcceptTransaction(confirmed, false, false)
+	require.NoError(t, err)
+	replacement, err := harness.CreateSignedTx(
+		[]spendableOutput{txOutToSpendableOut(coinbase, 0)}, 1, minTestFee*100, false,
+	)
+	require.NoError(t, err)
+	mustProcess(t, mp, replacement)
+	require.Equal(t, 1, mp.Count())
+	requireSpendersIndex(t, mp)
+	require.Empty(t, mp.spenders)
+}
+
 // TestRBFSpendsParentBeyondAncestorCap ensures a replacement that spends an
 // output of a transaction it would evict is rejected even when an earlier
 // input pulls in more unconfirmed ancestors than MaxReplacementEvictions. It
@@ -1553,6 +1820,20 @@ func TestRBF(t *testing.T) {
 	t.Parallel()
 
 	const defaultFee = btcutil.GrainPerPearl
+
+	// addReplaceable adds n transactions that signal replacement, each spending its own output of one coinbase, and
+	// returns them with the outputs they spend.
+	addReplaceable := func(ctx *testContext, n uint32) ([]spendableOutput, []*btcutil.Tx) {
+		coinbase := ctx.addCoinbaseTx(n)
+		outs := make([]spendableOutput, 0, n)
+		txs := make([]*btcutil.Tx, 0, n)
+		for i := uint32(0); i < n; i++ {
+			out := txOutToSpendableOut(coinbase, i)
+			outs = append(outs, out)
+			txs = append(txs, ctx.addSignedTx([]spendableOutput{out}, 1, minTestFee, true, false))
+		}
+		return outs, txs
+	}
 
 	testCases := []struct {
 		name  string
@@ -1663,6 +1944,35 @@ func TestRBF(t *testing.T) {
 				}
 
 				return tx, nil
+			},
+			err: "evicts more transactions than permitted",
+		},
+		{
+			// A transaction can replace as many as MaxReplacementEvictions transactions it double spends directly.
+			name: "maximum direct conflicts",
+			setup: func(ctx *testContext) (*btcutil.Tx, []*btcutil.Tx) {
+				outs, conflicts := addReplaceable(ctx, MaxReplacementEvictions)
+				tx, err := ctx.harness.CreateSignedTx(outs, 1, minTestFee*1000, false)
+				if err != nil {
+					ctx.t.Fatalf("unable to create transaction: %v", err)
+				}
+
+				return tx, conflicts
+			},
+			err: "",
+		},
+		{
+			// A transaction double spending more transactions than it may evict is rejected before its fee is checked,
+			// so one paying nothing gets this error too.
+			name: "exceeds maximum direct conflicts",
+			setup: func(ctx *testContext) (*btcutil.Tx, []*btcutil.Tx) {
+				outs, conflicts := addReplaceable(ctx, MaxReplacementEvictions+1)
+				tx, err := ctx.harness.CreateSignedTx(outs, 1, 0, false)
+				if err != nil {
+					ctx.t.Fatalf("unable to create transaction: %v", err)
+				}
+
+				return tx, conflicts
 			},
 			err: "evicts more transactions than permitted",
 		},
@@ -2216,4 +2526,117 @@ func TestMaxMempoolZeroUnlimited(t *testing.T) {
 
 	assert.Equal(t, numTxns, harness.txPool.Count())
 	assert.NotZero(t, harness.txPool.PoolBytes())
+}
+
+// TestRejectedTxDoesNotPinWitnessInSigCache checks that a transaction rejected by script evaluation leaves no more
+// than a small, fixed amount of memory behind in the signature cache, however large its witness was.
+//
+// SigCache.Add used to keep the signature and public key as slices of the transaction's decoded witness. A peer could
+// send standard-size transactions whose tapscript leaf checks a valid signature and then fails (<pk> OP_CHECKSIG
+// OP_NOT). The valid signature was cached, the transaction rejected, and the cache entry kept the whole ~390 kB witness
+// alive. The cache is bounded by entry count (100,000 by default), not bytes.
+func TestRejectedTxDoesNotPinWitnessInSigCache(t *testing.T) {
+	const (
+		numTxs = 100
+		// annexSize keeps each attack transaction just under the 100,000-vbyte standardness limit.
+		annexSize = 390_000
+		// maxRetainedPerTx is far above an honest entry's cost (a 64-byte signature, a 32-byte key and a map slot)
+		// and far below one pinned witness buffer.
+		maxRetainedPerTx = 10_000
+	)
+
+	harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
+	require.NoError(t, err)
+	// Production builds the mempool with a shared SigCache of the default size.
+	harness.txPool.cfg.SigCache = txscript.NewSigCache(100_000)
+
+	// The attacker's own P2TR output, whose only leaf verifies a signature and then inverts the result.
+	internalKey := harness.signKey.PubKey()
+	leafScript, err := txscript.NewScriptBuilder().
+		AddData(schnorr.SerializePubKey(internalKey)).
+		AddOp(txscript.OP_CHECKSIG).
+		AddOp(txscript.OP_NOT).
+		Script()
+	require.NoError(t, err)
+	leaf := txscript.NewBaseTapLeaf(leafScript)
+	tree := txscript.AssembleTaprootScriptTree(leaf)
+	root := tree.RootNode.TapHash()
+	pkScript, err := txscript.PayToTaprootScript(txscript.ComputeTaprootOutputKey(internalKey, root[:]))
+	require.NoError(t, err)
+	cb := tree.LeafMerkleProofs[0].ToControlBlock(internalKey)
+	ctrlBlock, err := cb.ToBytes()
+	require.NoError(t, err)
+
+	// Fund it with a mature coinbase. The harness pays to payScript, so point that at the attacker's output.
+	harness.payScript = pkScript
+	prev := txOutToSpendableOut(addCoinbase(t, harness, 1), 0)
+
+	// attackTx returns the wire bytes of the i-th attack transaction. Each one spends the same output and differs in
+	// its lock time, so its txid is new to netsync's reject filter, and in its annex, so its sighash and SigCache key
+	// are new too.
+	attackTx := func(i int) []byte {
+		tx := wire.NewMsgTx(wire.TxVersion)
+		tx.LockTime = uint32(i)
+		tx.AddTxIn(&wire.TxIn{PreviousOutPoint: prev.outPoint, Sequence: wire.MaxTxInSequenceNum})
+		tx.AddTxOut(&wire.TxOut{PkScript: harness.payScript, Value: int64(prev.amount) - 1_000_000})
+
+		annex := make([]byte, annexSize)
+		annex[0] = txscript.TaprootAnnexTag
+		annex[1], annex[2] = byte(i), byte(i>>8)
+
+		fetcher := txscript.NewCannedPrevOutputFetcher(pkScript, int64(prev.amount))
+		sigHash, err := txscript.CalcTapscriptSignaturehash(
+			txscript.NewTxSigHashes(tx, fetcher), txscript.SigHashDefault, tx, 0, fetcher, leaf,
+			txscript.WithAnnex(annex),
+		)
+		require.NoError(t, err)
+		sig, err := schnorr.Sign(harness.signKey, sigHash)
+		require.NoError(t, err)
+		tx.TxIn[0].SetWitness(wire.TxWitness{sig.Serialize(), leafScript, ctrlBlock, annex})
+
+		var buf bytes.Buffer
+		require.NoError(t, tx.Serialize(&buf))
+		return buf.Bytes()
+	}
+
+	// submit decodes the bytes as the peer's tx message is decoded and hands the transaction to the mempool the way
+	// netsync does. It must be rejected by script evaluation.
+	submit := func(raw []byte) {
+		var msg wire.MsgTx
+		require.NoError(t, msg.Deserialize(bytes.NewReader(raw)))
+		tx := btcutil.NewTx(&msg)
+		require.LessOrEqual(t, blockchain.GetTransactionVsize(tx), int64(maxStandardTxVsize),
+			"attack tx must be standard size")
+
+		_, err := harness.txPool.ProcessTransaction(tx, true, true, 0)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "false stack entry")
+		require.False(t, harness.txPool.IsTransactionInPool(tx.Hash()))
+	}
+
+	// Warm up once so lazily allocated pool and cache state is not counted.
+	submit(attackTx(0))
+
+	heapAlloc := func() uint64 {
+		runtime.GC()
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		return ms.HeapAlloc
+	}
+	before := heapAlloc()
+	for i := 1; i <= numTxs; i++ {
+		submit(attackTx(i))
+	}
+	after := heapAlloc()
+
+	var retained uint64
+	if after > before {
+		retained = after - before
+	}
+	perTx := retained / numTxs
+	t.Logf("retained %d bytes after %d rejected txs (%d bytes/tx)", retained, numTxs, perTx)
+	require.Less(t, perTx, uint64(maxRetainedPerTx),
+		"each rejected transaction keeps its witness buffer alive in the SigCache")
+	runtime.KeepAlive(harness)
 }

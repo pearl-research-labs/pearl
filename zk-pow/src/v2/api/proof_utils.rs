@@ -496,6 +496,7 @@ impl MiningConfiguration {
     pub fn dot_product_length(&self) -> usize {
         let common_dim = self.common_dim as usize;
         let rank = self.rank as usize;
+        debug_assert!(rank > 0, "dot_product_length: rank must be nonzero");
         common_dim - common_dim % rank
     }
 }
@@ -830,6 +831,14 @@ mod tests {
         assert_eq!(compiled.blake_proof.num_auxiliary_msgs, 136);
         assert_eq!(compiled.blake_proof.num_auxiliary_cvs, 65);
         assert_eq!(compiled.blake_proof.instructions.len(), 1525);
+    }
+
+    #[test]
+    fn sanity_check_rejects_zero_rank_without_dividing() {
+        let mut params = PublicProofParams::new_for_tests(256, 128, 4096);
+        params.mining_config.rank = 0;
+        let err = params.sanity_check().unwrap_err();
+        assert!(err.to_string().contains("Rank"), "unexpected error: {err}");
     }
 
     #[test]

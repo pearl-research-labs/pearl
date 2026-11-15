@@ -29,14 +29,11 @@ pay-to-script-hash address types.
 
 To decode/encode an address:
 
-	// NOTE: The default network is only used for address types which do not
-	// already contain that information.  At this time, that is only
-	// pay-to-pubkey addresses.
-	addrString := "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962" +
-		"e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d57" +
-		"8a4c702b6bf11d5f"
-	defaultNet := &chaincfg.MainNetParams
-	addr, err := btcutil.DecodeAddress(addrString, defaultNet)
+	// NOTE: The address must belong to the given network, otherwise the
+	// error returned wraps btcutil.ErrWrongNetwork.
+	addrString := "prl1paardr2nczq0rx5rqpfwnvpzm497zvux64y0f7wjgcs7xuuuh2nnqksluzv"
+	net := &chaincfg.MainNetParams
+	addr, err := btcutil.DecodeAddress(addrString, net)
 	if err != nil {
 		fmt.Println(err)
 		return

@@ -293,6 +293,31 @@ func TestSchnorrSignNoMutate(t *testing.T) {
 	}
 }
 
+func TestParseSignatureRejectsSGteN(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		sig  string
+	}{
+		{
+			name: "s == n",
+			sig:  "6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+		},
+		{
+			name: "s > n",
+			sig:  "6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364142",
+		},
+	}
+
+	for _, test := range tests {
+		_, err := ParseSignature(decodeHex(test.sig))
+		if !errors.Is(err, ecdsa_schnorr.ErrSigSTooBig) {
+			t.Errorf("%s: expected ErrSigSTooBig, got %v", test.name, err)
+		}
+	}
+}
+
 func TestParseSignatureComponentRange(t *testing.T) {
 	t.Parallel()
 

@@ -54,16 +54,11 @@ func (msg *MsgGetData) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) 
 
 	// Create a contiguous slice of inventory vectors to deserialize into in
 	// order to reduce the number of allocations.
-	invList := make([]InvVect, count)
-	msg.InvList = make([]*InvVect, 0, count)
-	for i := uint64(0); i < count; i++ {
-		iv := &invList[i]
-		err := readInvVectBuf(r, pver, iv, buf)
-		if err != nil {
-			return err
-		}
-		msg.AddInvVect(iv)
+	invList, err := readRecords(r, count, maxInvVectPayload, decodeInvVect)
+	if err != nil {
+		return err
 	}
+	msg.InvList = toPointers(invList)
 
 	return nil
 }
@@ -94,6 +89,11 @@ func (msg *MsgGetData) PrlEncode(w io.Writer, pver uint32, enc MessageEncoding) 
 	}
 
 	return nil
+}
+
+// SerializeSize returns the number of bytes it would take to serialize the receiver.
+func (msg *MsgGetData) SerializeSize() int {
+	return varLenSize(len(msg.InvList), maxInvVectPayload)
 }
 
 // Command returns the protocol command string for the message.  This is part

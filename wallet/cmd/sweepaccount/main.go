@@ -27,6 +27,7 @@ import (
 var (
 	walletDataDirectory = btcutil.AppDataDir("oyster", false)
 	newlineBytes        = []byte{'\n'}
+	activeNet           = &netparams.MainNetParams
 )
 
 func fatalf(format string, args ...interface{}) {
@@ -99,7 +100,6 @@ func init() {
 	if numNets > 1 {
 		fatalf("Multiple Pearl networks may not be used simultaneously")
 	}
-	var activeNet = &netparams.MainNetParams
 	if opts.TestNet {
 		activeNet = &netparams.TestNetParams
 	} else if opts.TestNet2 {
@@ -248,6 +248,7 @@ func sweep() error {
 		User:         opts.RPCUsername,
 		Pass:         rpcPassword,
 		Certificates: rpcCertificate,
+		Params:       activeNet.Name,
 		HTTPPostMode: true,
 	}, nil)
 	if err != nil {

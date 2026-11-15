@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcjson"
@@ -277,11 +276,9 @@ func (c *client) rebroadcastTransaction(txid string) ([]string, error) {
 	return res.Announced, nil
 }
 
-// isNotRelayedError reports whether err is the daemon's verdict that no peer requested a transaction it announced. The
-// daemon wraps it as an internal RPC error, so only the message identifies it.
+// isNotRelayedError recognizes the fresh-send preflight code, which guarantees no transaction was signed.
 func isNotRelayedError(err error) bool {
-	var rpcErr *btcjson.RPCError
-	return errors.As(err, &rpcErr) && strings.Contains(rpcErr.Message, "not relayed")
+	return isRPCErrorCode(err, btcjson.ErrRPCClientNotConnected)
 }
 
 func (c *client) send(fromAccount, toAddress string, amount btcutil.Amount, feeRatePerKb float64, minConf int) (*chainhash.Hash, error) {

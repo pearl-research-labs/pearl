@@ -22,12 +22,10 @@ const defaultTransactionAlloc = 2048
 // MaxBlocksPerMsg is the maximum number of blocks allowed per message.
 const MaxBlocksPerMsg = 500
 
-// MaxBlockPayload is the maximum bytes a block message can be in bytes.
-// This is derived from blockchain.MaxBlockVsize (1M) × WitnessScaleFactor (4),
-// representing the theoretical maximum when a block contains only witness data.
-// This limit is for wire protocol deserialization; actual consensus validation
-// uses vsize limits defined in the blockchain package.
-const MaxBlockPayload = 4000000 // Must equal blockchain.MaxBlockVsize × blockchain.WitnessScaleFactor
+// MaxBlockPayload is the maximum serialized size of a block's header and
+// transactions. It equals MaxBlockVsize × WitnessScaleFactor. Certificates are
+// not block payload and have their own limit (CertificateMaxSize).
+const MaxBlockPayload = 4_000_000
 
 // maxTxPerBlock is the maximum number of transactions that could
 // possibly fit into a block.
@@ -112,7 +110,7 @@ func (msg *MsgBlock) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) er
 	scriptBuf := scriptPool.Borrow()
 	defer scriptPool.Return(scriptBuf)
 
-	msg.Transactions = make([]*MsgTx, 0, txCount)
+	msg.Transactions = make([]*MsgTx, 0, capHint(r, txCount, minTxPayload))
 	for i := uint64(0); i < txCount; i++ {
 		tx := MsgTx{}
 		err := tx.prlDecode(r, pver, enc, buf, scriptBuf[:])
@@ -190,17 +188,17 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, error) {
 
 	// Deserialize each transaction while keeping track of its location
 	// within the byte stream.
-	msg.Transactions = make([]*MsgTx, 0, txCount)
-	txLocs := make([]TxLoc, txCount)
+	msg.Transactions = make([]*MsgTx, 0, capHint(r, txCount, minTxPayload))
+	txLocs := make([]TxLoc, 0, capHint(r, txCount, minTxPayload))
 	for i := uint64(0); i < txCount; i++ {
-		txLocs[i].TxStart = fullLen - r.Len()
+		txStart := fullLen - r.Len()
 		tx := MsgTx{}
 		err := tx.prlDecode(r, 0, WitnessEncoding, buf, scriptBuf[:])
 		if err != nil {
 			return nil, err
 		}
 		msg.Transactions = append(msg.Transactions, &tx)
-		txLocs[i].TxLen = (fullLen - r.Len()) - txLocs[i].TxStart
+		txLocs = append(txLocs, TxLoc{TxStart: txStart, TxLen: (fullLen - r.Len()) - txStart})
 	}
 
 	return txLocs, nil
@@ -291,6 +289,30 @@ func (msg *MsgBlock) SerializeSizeStripped() int {
 	return n
 }
 
+// SerializeSizeNoWitness returns the number of bytes it would take to
+// serialize the block with SerializeNoWitness (it includes the certificate).
+func (msg *MsgBlock) SerializeSizeNoWitness() int {
+	// MsgHeader (block header + certificate) + Serialized varint size for the number of
+	// transactions.
+	n := msg.MsgHeader.SerializeSize() + VarIntSerializeSize(uint64(len(msg.Transactions)))
+
+	for _, tx := range msg.Transactions {
+		n += tx.SerializeSizeStripped()
+	}
+
+	return n
+}
+
+// encodedSize returns the number of bytes it would take to serialize the
+// block with the given encoding.
+func (msg *MsgBlock) encodedSize(enc MessageEncoding) int {
+	if enc == BaseEncoding {
+		return msg.SerializeSizeNoWitness()
+	}
+
+	return msg.SerializeSize()
+}
+
 // SerializeWitnessSize returns the total size of witness data across all transactions.
 // This is used in vsize calculations where witness data is discounted.
 func (msg *MsgBlock) SerializeWitnessSize() int {
@@ -310,9 +332,11 @@ func (msg *MsgBlock) Command() string {
 // MaxPayloadLength returns the maximum length the payload can be for the
 // receiver.  This is part of the Message interface implementation.
 func (msg *MsgBlock) MaxPayloadLength(pver uint32) uint32 {
-	// Certificate + header + transactions. MaxBlockPayload covers the serialized txs at the 1M-vbyte consensus
-	// cap; the certificate is excluded from vsize and must be accounted for separately. Every certificate
-	// version is capped at CertificateMaxSize, so this ensures any valid block can be relayed.
+	// Wire body = certificate + block header + varint + transactions.
+	// Bound the block to MaxBlockPayload and additionally reserve
+	// CertificateMaxSize for the certificate that rides in the header.
+	// Every certificate version is capped at CertificateMaxSize, so this
+	// ensures any valid block can be relayed.
 	return MaxBlockPayload + CertificateMaxSize
 }
 

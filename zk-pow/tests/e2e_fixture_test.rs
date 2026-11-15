@@ -126,24 +126,34 @@ fn plain_fixture_is_reproducible() {
     );
 }
 
-/// v2 plain_verify: committed bytes -> accept; corrupted bytes -> reject.
+/// v2 plain_verify: the frozen fixture's rank is below the rank-penalty floor
+/// that plain verification enforces, which is checked last. Committed bytes
+/// must fail on that floor alone; corrupted bytes must fail before reaching it.
 #[test]
 fn v2_plain_verify_bytes_to_bool() {
+    const RANK_FLOOR_ERR: &str = "Rank must be >=";
     let bytes = read_fixture("src/v2/fixtures/v2_plain_proof.bin");
 
     let proof = PlainProof::deserialize_compat(&bytes).expect("fixture must deserialize");
-    zk_pow::v2::api::verify::verify_plain_proof(&v2_header(), &proof, None, SeedDerivation::Legacy)
-        .expect("committed v2 plain proof must be accepted");
+    let err = zk_pow::v2::api::verify::verify_plain_proof(&v2_header(), &proof, None, SeedDerivation::Legacy)
+        .expect_err("committed v2 plain proof is below the rank-penalty floor");
+    assert!(err.to_string().contains(RANK_FLOOR_ERR), "unexpected rejection reason: {err}");
 
     // Reject: flip one byte of committed matrix data near the end of the blob.
     let mut bad = bytes.clone();
     let idx = bad.len() - 100;
     bad[idx] ^= 0x01;
-    let rejected = match PlainProof::deserialize_compat(&bad) {
+    let rejected_before_rank_floor = match PlainProof::deserialize_compat(&bad) {
         Err(_) => true,
-        Ok(p) => zk_pow::v2::api::verify::verify_plain_proof(&v2_header(), &p, None, SeedDerivation::Legacy).is_err(),
+        Ok(p) => match zk_pow::v2::api::verify::verify_plain_proof(&v2_header(), &p, None, SeedDerivation::Legacy) {
+            Ok(()) => false,
+            Err(e) => !e.to_string().contains(RANK_FLOOR_ERR),
+        },
     };
-    assert!(rejected, "corrupted plain proof must be rejected");
+    assert!(
+        rejected_before_rank_floor,
+        "corrupted plain proof must be rejected before the rank floor"
+    );
 }
 
 /// v1 plain_verify: the same non-MoE plain proof through the frozen v1 stack.
@@ -406,24 +416,17 @@ fn moe_plain_fixture_is_reproducible() {
     );
 }
 
-/// v2 plain_verify on an MoE proof: committed bytes -> accept; corrupted -> reject.
+/// v2 plain_verify on an MoE proof: plain verification is dense-only, so the
+/// committed MoE proof must be rejected.
 #[test]
 fn v2_plain_verify_moe_bytes_to_bool() {
     let bytes = read_fixture("src/v2/fixtures/v2_plain_proof_moe.bin");
 
     let proof = PlainProof::deserialize_compat(&bytes).expect("fixture must deserialize");
     assert!(proof.moe.is_some(), "fixture must be an MoE proof");
-    zk_pow::v2::api::verify::verify_plain_proof(&moe_v2_header(), &proof, None, SeedDerivation::Legacy)
-        .expect("committed MoE plain proof must be accepted by the v2 verifier");
-
-    let mut bad = bytes.clone();
-    let idx = bad.len() - 100;
-    bad[idx] ^= 0x01;
-    let rejected = match PlainProof::deserialize_compat(&bad) {
-        Err(_) => true,
-        Ok(p) => zk_pow::v2::api::verify::verify_plain_proof(&moe_v2_header(), &p, None, SeedDerivation::Legacy).is_err(),
-    };
-    assert!(rejected, "corrupted MoE plain proof must be rejected");
+    let err = zk_pow::v2::api::verify::verify_plain_proof(&moe_v2_header(), &proof, None, SeedDerivation::Legacy)
+        .expect_err("committed MoE plain proof must be rejected by the v2 verifier");
+    assert!(err.to_string().contains("dense-only"), "unexpected rejection reason: {err}");
 }
 
 /// The frozen v1 stack predates MoE and must reject MoE proofs outright: its

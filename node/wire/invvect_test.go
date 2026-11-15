@@ -6,11 +6,11 @@ package wire
 
 import (
 	"bytes"
-	"reflect"
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/stretchr/testify/require"
 )
 
 // TestInvVectStringer tests the stringized output for inventory vector types.
@@ -158,17 +158,34 @@ func TestInvVectWire(t *testing.T) {
 		}
 
 		// Decode the message from wire format.
-		var iv InvVect
-		rbuf := bytes.NewReader(test.buf)
-		err = readInvVectBuf(rbuf, test.pver, &iv, b[:])
-		if err != nil {
-			t.Errorf("readInvVect #%d error %v", i, err)
-			continue
+		require.Len(t, test.buf, maxInvVectPayload, "decodeInvVect #%d", i)
+		require.Equal(t, test.out, decodeInvVect(test.buf), "decodeInvVect #%d", i)
+	}
+}
+
+// TestInvTypeIsBlock ensures only MSG_BLOCK and MSG_WITNESS_BLOCK are
+// blocks.  It covers every type in ivStrings, so new types are checked.
+func TestInvTypeIsBlock(t *testing.T) {
+	t.Parallel()
+
+	blocks := map[InvType]bool{InvTypeBlock: true, InvTypeWitnessBlock: true}
+	for typ := range ivStrings {
+		if typ.IsBlock() != blocks[typ] {
+			t.Errorf("%s.IsBlock() = %v", typ, typ.IsBlock())
 		}
-		if !reflect.DeepEqual(iv, test.out) {
-			t.Errorf("readInvVect #%d\n got: %s want: %s", i,
-				spew.Sdump(iv), spew.Sdump(test.out))
-			continue
+	}
+}
+
+// TestInvTypeIsTx ensures only MSG_TX and MSG_WITNESS_TX are
+// transactions.  It covers every type in ivStrings, so new types are
+// checked.
+func TestInvTypeIsTx(t *testing.T) {
+	t.Parallel()
+
+	txs := map[InvType]bool{InvTypeTx: true, InvTypeWitnessTx: true}
+	for typ := range ivStrings {
+		if typ.IsTx() != txs[typ] {
+			t.Errorf("%s.IsTx() = %v", typ, typ.IsTx())
 		}
 	}
 }

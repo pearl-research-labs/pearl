@@ -12,6 +12,7 @@ import (
 
 	"github.com/pearl-research-labs/pearl/node/btcec"
 	"github.com/pearl-research-labs/pearl/node/btcec/ellswift"
+	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
 // packetBit is a type used to represent the bits in the packet's header.
@@ -39,13 +40,11 @@ const (
 	// allowed to send.
 	MaxGarbageLen = 4095
 
-	// maxContentLen is the maximum length of content that can be encrypted
-	// or decrypted.
-	//
-	// TODO: This should be revisited. For some reason, the test vectors
-	// want us to encrypt 16777215 bytes even though bitcoind will only
-	// decrypt up to 1 + 12 + 4_000_000 bytes by default.
-	maxContentLen = 1<<24 - 1
+	// maxContentLen is the maximum length of packet content we encrypt or decrypt: the message type, at most 0x00 and
+	// a 12-byte command, followed by a payload of up to wire.MaxProtocolMessageLength. BIP324's 3-byte length field
+	// can encode up to 1<<24 - 1, but a longer packet can only carry a message that wire rejects, so V2ReceivePacket
+	// rejects it before reading the body.
+	maxContentLen = 1 + wire.CommandSize + wire.MaxProtocolMessageLength
 
 	// lengthFieldLen is the length of the length field when encrypting the
 	// content's length.
@@ -72,9 +71,6 @@ var (
 	// errContentLengthExceeded is returned when trying to encrypt or decrypt
 	// more than the maximum content length.
 	errContentLengthExceeded = fmt.Errorf("maximum content length exceeded")
-
-	// errFailedToRecv is returned when a Read call fails.
-	errFailedToRecv = fmt.Errorf("failed to recv data")
 
 	// errGarbageTooLarge is returned if a caller attempts to send garbage
 	// larger than normal.
@@ -726,9 +722,10 @@ func (p *Peer) V2ReceivePacket(aad []byte) ([]byte, error) {
 
 		log.Tracef("Decrypted content length=%d", contentsLen)
 
+		// Check the length before reading the body, so a peer can't make us buffer a packet we'd reject anyway.
+		// Decoys are held to the same limit.
 		if contentsLen > maxContentLen {
-			log.Errorf("Decrypted content length %d exceeds "+
-				"max %d", contentsLen, maxContentLen)
+			log.Errorf("Decrypted content length %d exceeds max %d", contentsLen, maxContentLen)
 
 			return nil, errContentLengthExceeded
 		}
@@ -748,7 +745,7 @@ func (p *Peer) V2ReceivePacket(aad []byte) ([]byte, error) {
 
 		log.Tracef("Received encrypted packet body: %x", aeadCiphertext)
 
-		plaintext, err := p.recvP.Decrypt(aad, aeadCiphertext)
+		plaintext, err := p.recvP.DecryptInPlace(aad, aeadCiphertext)
 		if err != nil {
 			log.Errorf("Failed to decrypt packet body: %v", err)
 			return nil, err
@@ -795,42 +792,25 @@ func (p *Peer) Send(data []byte) (int, error) {
 	return n, err
 }
 
-// Receive receives numBytes bytes from the underlying connection.
+// Receive receives numBytes bytes from the underlying connection. The buffer
+// grows with the bytes that arrive rather than being sized to numBytes up
+// front, since numBytes may come from an unauthenticated length field.
 func (p *Peer) Receive(numBytes int) ([]byte, int, error) {
-	b := make([]byte, numBytes)
-	index := 0
-	total := 0
-
 	log.Tracef("Attempting to receive %d bytes", numBytes)
 
-	for {
-		// TODO: Use something that inherently prevents going over?
-		if total > numBytes {
-			// This should be logically impossible with io.ReadFull
-			// semantics used implicitly by the loop structure.
-			log.Criticalf("Receive logic error: total=%d > "+
-				"numBytes=%d", total, numBytes)
-			return nil, total, errFailedToRecv
-		}
-
-		if total == numBytes {
-			log.Tracef("Successfully received %d bytes", total)
-			return b, total, nil
-		}
-
-		log.Tracef("Calling Read (need %d bytes, have "+
-			"%d)", numBytes-total, total)
-
-		n, err := p.rw.Read(b[index:])
-		if err != nil {
-			log.Errorf("Receive failed after reading %d bytes "+
-				"(target %d): %v", total+n, numBytes, err)
-			return nil, total, err
-		}
-
-		log.Tracef("Read returned %d bytes", n)
-
-		total += n
-		index += n
+	b, err := io.ReadAll(io.LimitReader(p.rw, int64(numBytes)))
+	// ReadAll doesn't consider EOF as an error; check no premature EOF.
+	if err == nil && len(b) < numBytes {
+		err = io.EOF
 	}
+
+	if err != nil {
+		log.Errorf("Receive failed after reading %d bytes (target %d): %v", len(b), numBytes, err)
+
+		return nil, len(b), err
+	}
+
+	log.Tracef("Successfully received %d bytes", numBytes)
+
+	return b, numBytes, nil
 }

@@ -58,6 +58,18 @@ func (invtype InvType) String() string {
 	return fmt.Sprintf("Unknown InvType (%d)", uint32(invtype))
 }
 
+// IsBlock reports whether invtype refers to a full block, with or
+// without witness data.
+func (invtype InvType) IsBlock() bool {
+	return invtype == InvTypeBlock || invtype == InvTypeWitnessBlock
+}
+
+// IsTx reports whether invtype refers to a transaction, with or without
+// witness data.
+func (invtype InvType) IsTx() bool {
+	return invtype == InvTypeTx || invtype == InvTypeWitnessTx
+}
+
 // InvVect defines a inventory vector which is used to describe data,
 // as specified by the Type field, that a peer wants, has, or does not have to
 // another peer.
@@ -74,22 +86,10 @@ func NewInvVect(typ InvType, hash *chainhash.Hash) *InvVect {
 	}
 }
 
-// readInvVectBuf reads an encoded InvVect from r depending on the protocol
-// version.
-//
-// If b is non-nil, the provided buffer will be used for serializing small
-// values.  Otherwise a buffer will be drawn from the binarySerializer's pool
-// and return when the method finishes.
-//
-// NOTE: b MUST either be nil or at least an 8-byte slice.
-func readInvVectBuf(r io.Reader, pver uint32, iv *InvVect, buf []byte) error {
-	if _, err := io.ReadFull(r, buf[:4]); err != nil {
-		return err
-	}
-	iv.Type = InvType(littleEndian.Uint32(buf[:4]))
-
-	_, err := io.ReadFull(r, iv.Hash[:])
-	return err
+// decodeInvVect decodes an inventory vector record, a little-endian type followed by a hash, for readRecords. b must
+// hold at least maxInvVectPayload bytes.
+func decodeInvVect(b []byte) InvVect {
+	return InvVect{Type: InvType(littleEndian.Uint32(b[:4])), Hash: chainhash.Hash(b[4:])}
 }
 
 // writeInvVectBuf serializes an InvVect to w depending on the protocol version.

@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/internal/inbound"
 	"github.com/pearl-research-labs/pearl/node/peer"
+	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -95,6 +97,17 @@ func TestHandshakeReleaseOnDisconnect(t *testing.T) {
 	event := recvLifecycleEvent(t, s.peerLifecycle)
 	assert.Equal(t, peerDone, event.action)
 	assert.Equal(t, uint32(1), releases.Load())
+}
+
+func TestCFHandlersNilIndexNoPanic(t *testing.T) {
+	t.Parallel()
+
+	_, sp := newTestServerPeer(t)
+	stop := &chainhash.Hash{}
+
+	require.NotPanics(t, func() { sp.OnGetCFilters(nil, wire.NewMsgGetCFilters(wire.GCSFilterRegular, 0, stop)) })
+	require.NotPanics(t, func() { sp.OnGetCFHeaders(nil, wire.NewMsgGetCFHeaders(wire.GCSFilterRegular, 0, stop)) })
+	require.NotPanics(t, func() { sp.OnGetCFCheckpt(nil, wire.NewMsgGetCFCheckpt(wire.GCSFilterRegular, stop)) })
 }
 
 // TestInboundPeerReservation pins the composition of the three budget functions: listener capacity derives from
@@ -268,4 +281,32 @@ func TestPeerLifecycleSimultaneousReady(t *testing.T) {
 	}
 
 	t.Logf("peerAdd emitted in %d/%d iterations", addEmitted, iterations)
+}
+
+// TestReplyWindow verifies a replyWindow lets at most maxInflightReplies
+// replies be queued but unsent, and stops waiting once the peer quits.
+func TestReplyWindow(t *testing.T) {
+	// The handshake writes to a pipe nobody reads, so the peer queues
+	// messages but never sends them and never signals their done channels.
+	local, remote := net.Pipe()
+	defer remote.Close()
+	p, err := peer.NewOutboundPeer(&peer.Config{}, "10.0.0.1:8333")
+	require.NoError(t, err)
+	p.AssociateConnection(local)
+	defer p.Disconnect()
+
+	quit := make(chan struct{})
+	w := newReplyWindow(quit)
+	ping := wire.NewMsgPing(1)
+	for i := 0; i < maxInflightReplies; i++ {
+		require.True(t, w.send(p, ping, wire.BaseEncoding))
+	}
+
+	// Once a reply is written the next one is queued.
+	w.done <- struct{}{}
+	require.True(t, w.send(p, ping, wire.BaseEncoding))
+
+	// With the window full, send waits and gives up when the peer quits.
+	close(quit)
+	require.False(t, w.send(p, ping, wire.BaseEncoding))
 }

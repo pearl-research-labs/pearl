@@ -21,14 +21,16 @@ pub fn public_params_sanity_check(public_params: &PublicProofParams) -> Result<(
     let n = public_params.n;
     let t_rows = public_params.t_rows;
     let t_cols = public_params.t_cols;
-    let dot_product_len = public_params.dot_product_length();
-    let worker_input_size = h.saturating_add(w).saturating_mul(dot_product_len);
 
+    // Remainder/division in the helpers below are undefined at rank 0.
     // Currently, noise generation supports only these ranks: powers of 2 from 2^5 to 2^10.
     ensure!(
         r.is_power_of_two() && (32..=1024).contains(&r),
         "Rank must be 2^5..2^10 || r={r}"
     );
+
+    let dot_product_len = public_params.dot_product_length();
+    let worker_input_size = h.saturating_add(w).saturating_mul(dot_product_len);
     ensure!(r.is_multiple_of(TILE_D), "r must be divisible by {TILE_D} || r={r}");
     ensure!(k <= (1 << 16), "k must be <= 2^16 || k={k}");
     ensure!(k.is_multiple_of(64), "k must be divisible by 64 || k={k}");
@@ -192,7 +194,9 @@ fn difficulty_adjustment_factor(config: &MiningConfiguration) -> usize {
 }
 
 fn penalized_adjustment_factor(config: &MiningConfiguration) -> usize {
-    tile_size(config) * (config.dot_product_length() / config.rank as usize) * PENALTY_BASE_RANK
+    let rank = config.rank as usize;
+    debug_assert!(rank > 0, "penalized_adjustment_factor: rank must be nonzero");
+    tile_size(config) * (config.dot_product_length() / rank) * PENALTY_BASE_RANK
 }
 
 fn scale_target(nbits: u32, adjustment_factor: usize) -> U256 {
@@ -300,6 +304,13 @@ mod rank_penalty_tests {
     #[test]
     fn rejects_rank_below_base() {
         let config = test_config(PENALTY_BASE_RANK / 2, 4096);
+        let err = check_rank_penalty(&config, &[0u8; 32], TEST_NBITS).unwrap_err();
+        assert!(err.to_string().contains("Rank must be"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_zero_rank_without_dividing() {
+        let config = test_config(0, 4096);
         let err = check_rank_penalty(&config, &[0u8; 32], TEST_NBITS).unwrap_err();
         assert!(err.to_string().contains("Rank must be"), "unexpected error: {err}");
     }

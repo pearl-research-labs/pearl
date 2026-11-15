@@ -1,10 +1,10 @@
-import { ArrowLeft, ArrowUpRight, ArrowDownLeft, Copy, Check, Loader2 } from 'lucide-react';
-import { Transaction } from '../../../types/transaction';
-import { usePagination } from '../hooks/usePagination';
-import { useWalletStore } from '../store/walletStore';
-import { Button } from '@/components/ui/button';
-import { getErrorMessage, isNotRelayedError } from '@/lib/utils';
-import { useState } from 'react';
+import {ArrowLeft, ArrowUpRight, ArrowDownLeft, Copy, Check, Loader2} from 'lucide-react';
+import {Transaction} from '../../../types/transaction';
+import {usePagination} from '../hooks/usePagination';
+import {useWalletStore} from '../store/walletStore';
+import {Button} from '@/components/ui/button';
+import {getErrorMessage} from '@/lib/utils';
+import {useState} from 'react';
 
 interface ActivityPageProps {
   onBack: () => void;
@@ -26,9 +26,6 @@ const formatTimeAgo = (timestamp: number): string => {
     return `${days}d ago`;
   }
 };
-
-const REBROADCAST_NOT_RELAYED_MESSAGE =
-  'No peer requested it: either every connected peer already has it, or none will take it.';
 
 const REMOVE_WARNING =
   'Its inputs become spendable again, and any pending transaction spending from it is removed too. ' +
@@ -58,36 +55,32 @@ interface PendingNotice {
   message: string;
 }
 
-export default function ActivityPage({ onBack }: ActivityPageProps) {
-  const { activities, loading, hasMore, loadMore, reload } = usePagination({
+export default function ActivityPage({onBack}: ActivityPageProps) {
+  const {activities, loading, hasMore, loadMore, reload} = usePagination({
     pageSize: 10,
   });
-  const { syncWalletData } = useWalletStore();
+  const {syncWalletData} = useWalletStore();
   const [copiedTxId, setCopiedTxId] = useState<string | null>(null);
   const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
-  const [busy, setBusy] = useState<{ txid: string; action: PendingAction } | null>(null);
+  const [busy, setBusy] = useState<{txid: string; action: PendingAction} | null>(null);
   const [notice, setNotice] = useState<PendingNotice | null>(null);
 
   // run resolves to the success notice, or null for none. Errors go to a dialog because the reload below can drop their
   // row, e.g. when a conflicting spend confirmed in the meantime.
   const runPendingAction = async (txid: string, action: PendingAction, run: () => Promise<string | null>) => {
-    setBusy({ txid, action });
+    setBusy({txid, action});
     setNotice(null);
     try {
       const message = await run();
-      if (message) setNotice({ txid, tone: 'success', message });
+      if (message) setNotice({txid, tone: 'success', message});
     } catch (err) {
       const message = getErrorMessage(err);
-      if (action === 'rebroadcast' && isNotRelayedError(message)) {
-        setNotice({ txid, tone: 'warning', message: REBROADCAST_NOT_RELAYED_MESSAGE });
-      } else {
-        void window.appBridge.window.showMessageBox({
-          type: 'error',
-          title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
-          message,
-          buttons: ['OK'],
-        });
-      }
+      void window.appBridge.window.showMessageBox({
+        type: 'error',
+        title: action === 'rebroadcast' ? 'Rebroadcast failed' : 'Remove failed',
+        message,
+        buttons: ['OK'],
+      });
     } finally {
       setBusy(null);
       await Promise.all([reload(), syncWalletData()]);
@@ -104,7 +97,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
     });
 
   const handleRemove = async (txid: string) => {
-    const { response } = await window.appBridge.window.showMessageBox({
+    const {response} = await window.appBridge.window.showMessageBox({
       type: 'warning',
       title: 'Remove pending transaction',
       message: 'Remove this pending transaction from the wallet?',
@@ -144,7 +137,12 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
   return (
     <div className="flex h-screen w-full flex-col bg-transparent">
       {/* Header */}
-      <div className="flex flex-shrink-0 items-center gap-4 border-b border-gray-200 bg-white/80 p-6 shadow-sm backdrop-blur-sm">
+      <div
+        className={
+          'flex flex-shrink-0 items-center gap-4 border-b border-gray-200 bg-white/80 p-6 ' +
+          'shadow-sm backdrop-blur-sm'
+        }
+      >
         <button onClick={onBack} className="rounded-lg p-2 transition-colors hover:bg-gray-100">
           <ArrowLeft className="h-5 w-5 text-gray-700" />
         </button>
@@ -186,9 +184,7 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                         {formatTimeAgo(activity.time)} • {formatFullDate(activity.time)}
                       </div>
                       <div className="mt-1 flex items-center gap-2">
-                        <span className="text-xs text-gray-500">
-                          Tx ID: {truncateTxId(activity.txid)}
-                        </span>
+                        <span className="text-xs text-gray-500">Tx ID: {truncateTxId(activity.txid)}</span>
                         <button
                           onClick={() => handleCopyTxId(activity.txid)}
                           className="rounded p-1 transition-colors hover:bg-gray-100"
@@ -205,19 +201,16 @@ export default function ActivityPage({ onBack }: ActivityPageProps) {
                   </div>
                   <div className="text-right">
                     <div
-                      className={`text-lg font-bold ${activity.type === 'received' ? 'text-green-700' : 'text-red-500'
-                        }`}
+                      className={`text-lg font-bold ${
+                        activity.type === 'received' ? 'text-green-700' : 'text-red-500'
+                      }`}
                     >
                       {activity.type === 'received' ? '+' : '-'}
                       {activity.amount} PRL
                     </div>
-                    <div className="text-sm text-gray-600">
-                      {activity.confirmations} confirmations
-                    </div>
+                    <div className="text-sm text-gray-600">{activity.confirmations} confirmations</div>
                     {activity.fee > 0 && (
-                      <div className="text-xs text-gray-500">
-                        Fee: {activity.fee.toFixed(8)} PRL
-                      </div>
+                      <div className="text-xs text-gray-500">Fee: {activity.fee.toFixed(8)} PRL</div>
                     )}
                   </div>
                 </div>

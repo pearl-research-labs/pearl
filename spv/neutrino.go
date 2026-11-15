@@ -283,7 +283,7 @@ func (sp *ServerPeer) OnInv(p *peer.Peer, msg *wire.MsgInv) {
 	log.Tracef("Got inv with %d items from %s", len(msg.InvList), p.Addr())
 	newInv := wire.NewMsgInvSizeHint(uint(len(msg.InvList)))
 	for _, invVect := range msg.InvList {
-		if invVect.Type == wire.InvTypeTx {
+		if invVect.Type.IsTx() {
 			log.Infof("Peer %v is announcing "+
 				"transactions in SPV mode -- disconnecting", sp)
 			sp.Disconnect()

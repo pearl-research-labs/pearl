@@ -6,13 +6,18 @@ package mempool
 
 import (
 	"bytes"
+	"encoding/binary"
+	"math"
 	"math/rand"
+	"slices"
 	"testing"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/mining"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // newTestFeeEstimator creates a feeEstimator with some different parameters
@@ -75,6 +80,7 @@ func (eft *estimateFeeTester) newBlock(txs []*wire.MsgTx) {
 	eft.last = &lastBlock{block.Hash(), eft.last}
 
 	eft.ef.RegisterBlock(block)
+	eft.checkObservedReferences()
 }
 
 func (eft *estimateFeeTester) rollback() {
@@ -90,6 +96,49 @@ func (eft *estimateFeeTester) rollback() {
 
 	eft.height--
 	eft.last = eft.last.prev
+	eft.checkObservedReferences()
+}
+
+// checkObservedReferences checks that observed holds a mined sample exactly
+// when a bin or the rollback history references it, and that recent holds
+// every unmined one. Save indexes referenced samples through observed, nothing
+// else ever removes a mined sample, and the cap evicts only through recent.
+func (eft *estimateFeeTester) checkObservedReferences() {
+	eft.t.Helper()
+	ef := eft.ef
+
+	referenced := make(map[*observedTransaction]struct{})
+	for _, bin := range ef.bin {
+		for _, o := range bin {
+			referenced[o] = struct{}{}
+		}
+	}
+	for _, rb := range ef.dropped {
+		for _, o := range rb.transactions {
+			referenced[o] = struct{}{}
+		}
+	}
+
+	for o := range referenced {
+		require.Same(eft.t, o, ef.observed[o.hash], "referenced sample %v missing from observed", o.hash)
+	}
+	for hash, o := range ef.observed {
+		if _, ok := referenced[o]; !ok {
+			require.Equal(eft.t, int32(mining.UnminedHeight), o.mined,
+				"sample %v is mined, unreferenced and still in observed", hash)
+		}
+	}
+
+	queued := make(map[*observedTransaction]struct{}, ef.recent.Len())
+	for e := ef.recent.Front(); e != nil; e = e.Next() {
+		queued[e.Value.(*observedTransaction)] = struct{}{}
+	}
+	for hash, o := range ef.observed {
+		if o.mined == mining.UnminedHeight {
+			_, ok := queued[o]
+			require.True(eft.t, ok, "unmined sample %v is not in recent", hash)
+		}
+	}
 }
 
 // TestEstimateFee tests basic functionality in the FeeEstimator.
@@ -417,5 +466,309 @@ func TestDatabase(t *testing.T) {
 	for round := 1; round <= rounds; round++ {
 		eft.rollback()
 		eft.checkSaveAndRestore(estimateHistory[len(estimateHistory)-round-1])
+	}
+}
+
+// TestObserveTransactionBoundsMap tests that the cap evicts the oldest unmined
+// samples first. Mined samples must stay out of both the eviction and the
+// count, or enough of them stop all sampling.
+func TestObserveTransactionBoundsMap(t *testing.T) {
+	const limit = 4
+	ef := newTestFeeEstimator(5, limit, 1)
+	ef.maxObserved = limit
+	eft := estimateFeeTester{ef: ef, t: t}
+
+	observe := func(n int, fee btcutil.Amount) []*TxDesc {
+		txs := make([]*TxDesc, n)
+		for i := range txs {
+			txs[i] = eft.testTx(fee)
+			ef.ObserveTransaction(txs[i])
+		}
+		return txs
+	}
+	assertObserved := func(name string, txs []*TxDesc, want bool) {
+		t.Helper()
+		for i, tx := range txs {
+			_, got := ef.observed[*tx.Tx.Hash()]
+			assert.Equal(t, want, got, "%s tx %d in observed", name, i)
+		}
+	}
+
+	mined := observe(limit, 1000)
+	minedMsgTxs := make([]*wire.MsgTx, len(mined))
+	for i, tx := range mined {
+		minedMsgTxs[i] = tx.Tx.MsgTx()
+	}
+	eft.newBlock(minedMsgTxs)
+
+	pending := observe(limit, 2000)
+	assertObserved("mined", mined, true)
+	assertObserved("pending", pending, true)
+
+	newest := observe(2, 3000)
+	assertObserved("mined", mined, true)
+	assertObserved("oldest pending", pending[:2], false)
+	assertObserved("newer pending", pending[2:], true)
+	assertObserved("newest", newest, true)
+	assert.Len(t, ef.observed, 2*limit)
+}
+
+// TestObserveTransactionKeepsReobservedSample tests that the entry a swept
+// sample leaves behind does not evict the sample of the same transaction when
+// it is observed again.
+func TestObserveTransactionKeepsReobservedSample(t *testing.T) {
+	const limit = 2
+	ef := newTestFeeEstimator(5, 3, 1)
+	ef.maxObserved = limit
+	eft := estimateFeeTester{ef: ef, t: t}
+
+	tx := eft.testTx(1000)
+	ef.ObserveTransaction(tx)
+	ef.ObserveTransaction(eft.testTx(1000))
+
+	for i := 0; i < estimateFeeDepth; i++ {
+		eft.newBlock(nil)
+	}
+	require.Empty(t, ef.observed, "unmined samples survived the sweep")
+
+	ef.ObserveTransaction(tx)
+	assert.Contains(t, ef.observed, *tx.Tx.Hash())
+}
+
+// TestRegisterBlockReleasesReplacedSamples tests that a sample replaced in a
+// bin leaves observed once its block leaves the rollback history, and not
+// before, since a rollback of that block puts it back in the bin.
+func TestRegisterBlockReleasesReplacedSamples(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxRollback uint32
+	}{
+		{"no history", 0},
+		{"one block of history", 1},
+		{"two blocks of history", 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ef := newTestFeeEstimator(2, 2, tt.maxRollback)
+			eft := estimateFeeTester{ef: ef, t: t}
+
+			filled := []*TxDesc{eft.testTx(1000), eft.testTx(1000)}
+			for _, tx := range filled {
+				ef.ObserveTransaction(tx)
+			}
+			eft.newBlock([]*wire.MsgTx{filled[0].Tx.MsgTx(), filled[1].Tx.MsgTx()})
+
+			// The bin is full, so this replaces one of the filled samples.
+			replacer := eft.testTx(2000)
+			ef.ObserveTransaction(replacer)
+			eft.newBlock([]*wire.MsgTx{replacer.Tx.MsgTx()})
+
+			for blocksSince := uint32(0); blocksSince < 3; blocksSince++ {
+				want := 1
+				if blocksSince < tt.maxRollback {
+					want = 2
+				}
+
+				got := 0
+				for _, tx := range filled {
+					if _, ok := ef.observed[*tx.Tx.Hash()]; ok {
+						got++
+					}
+				}
+				assert.Equal(t, want, got, "filled samples in observed %d blocks after replacement", blocksSince)
+
+				eft.newBlock(nil)
+			}
+		})
+	}
+}
+
+// TestRegisterBlockReplacesLastSlot tests that a full bin can replace the
+// sample in its last slot. Only the samples the current block added are
+// protected from replacement.
+func TestRegisterBlockReplacesLastSlot(t *testing.T) {
+	ef := newTestFeeEstimator(5, 5, 0)
+	eft := estimateFeeTester{ef: ef, t: t}
+
+	var filled []*wire.MsgTx
+	for i := 0; i < 5; i++ {
+		tx := eft.testTx(1000)
+		ef.ObserveTransaction(tx)
+		filled = append(filled, tx.Tx.MsgTx())
+	}
+	eft.newBlock(filled)
+	last := ef.bin[0][4]
+
+	for i := 0; i < 100 && slices.Contains(ef.bin[0], last); i++ {
+		tx := eft.testTx(1000)
+		ef.ObserveTransaction(tx)
+		eft.newBlock([]*wire.MsgTx{tx.Tx.MsgTx()})
+	}
+	assert.False(t, slices.Contains(ef.bin[0], last), "sample in the last slot never replaced")
+}
+
+// TestRestoreDropsReleasedSamples tests that RestoreFeeEstimator drops mined
+// samples that no bin or rollback entry references. Versions before release()
+// saved every sample a bin ever replaced, and nothing deletes them once
+// restored.
+func TestRestoreDropsReleasedSamples(t *testing.T) {
+	ef := newTestFeeEstimator(2, 2, 1)
+	eft := estimateFeeTester{ef: ef, t: t}
+
+	filled := []*TxDesc{eft.testTx(1000), eft.testTx(1000)}
+	for _, tx := range filled {
+		ef.ObserveTransaction(tx)
+	}
+	samples := []*observedTransaction{ef.observed[*filled[0].Tx.Hash()], ef.observed[*filled[1].Tx.Hash()]}
+	eft.newBlock([]*wire.MsgTx{filled[0].Tx.MsgTx(), filled[1].Tx.MsgTx()})
+
+	// The bin is full, so this replaces one of the filled samples, and the
+	// next block releases it.
+	replacer := eft.testTx(2000)
+	ef.ObserveTransaction(replacer)
+	eft.newBlock([]*wire.MsgTx{replacer.Tx.MsgTx()})
+	eft.newBlock(nil)
+
+	// Put the released sample back, as the old code saved it.
+	for _, o := range samples {
+		if _, ok := ef.observed[o.hash]; !ok {
+			ef.observed[o.hash] = o
+		}
+	}
+	require.Len(t, ef.observed, 3)
+
+	restored, err := RestoreFeeEstimator(ef.Save())
+	require.NoError(t, err)
+	eft.ef = restored
+	eft.checkObservedReferences()
+}
+
+// TestRestoreRejectsDanglingDroppedReference tests that RestoreFeeEstimator rejects a rollback entry referencing a
+// sample the save does not hold. It used to restore a nil sample, which release dereferences on a later block.
+func TestRestoreRejectsDanglingDroppedReference(t *testing.T) {
+	ef := newTestFeeEstimator(2, 2, 1)
+	eft := estimateFeeTester{ef: ef, t: t}
+
+	filled := []*TxDesc{eft.testTx(1000), eft.testTx(1000)}
+	for _, tx := range filled {
+		ef.ObserveTransaction(tx)
+	}
+	eft.newBlock([]*wire.MsgTx{filled[0].Tx.MsgTx(), filled[1].Tx.MsgTx()})
+
+	// The bin is full, so this replaces a sample and the rollback history references it.
+	replacer := eft.testTx(2000)
+	ef.ObserveTransaction(replacer)
+	eft.newBlock([]*wire.MsgTx{replacer.Tx.MsgTx()})
+	require.Len(t, ef.dropped[0].transactions, 1)
+
+	// The rollback history ends the save, so its last 4 bytes are that reference.
+	state := ef.Save()
+	binary.BigEndian.PutUint32(state[len(state)-4:], math.MaxUint32)
+
+	_, err := RestoreFeeEstimator(state)
+	require.ErrorContains(t, err, "Invalid transaction reference")
+}
+
+// TestRestoreAppliesCap tests that RestoreFeeEstimator queues the restored
+// unmined samples oldest first, so the cap applies to them. A save from before
+// the cap can hold any number of them.
+func TestRestoreAppliesCap(t *testing.T) {
+	ef := newTestFeeEstimator(5, 3, 1)
+	ef.maxObserved = 2 * maxObservedTransactions
+	eft := estimateFeeTester{ef: ef, t: t}
+
+	oldest := make([]*TxDesc, maxObservedTransactions/2)
+	for i := range oldest {
+		oldest[i] = eft.testTx(1000)
+		ef.ObserveTransaction(oldest[i])
+	}
+	eft.newBlock(nil)
+	for i := 0; i < maxObservedTransactions; i++ {
+		ef.ObserveTransaction(eft.testTx(1000))
+	}
+
+	restored, err := RestoreFeeEstimator(ef.Save())
+	require.NoError(t, err)
+	require.Equal(t, maxObservedTransactions, len(restored.observed))
+	for i, tx := range oldest {
+		_, ok := restored.observed[*tx.Tx.Hash()]
+		require.False(t, ok, "oldest tx %d survived the restore", i)
+	}
+
+	restored.ObserveTransaction(eft.testTx(1000))
+	assert.Equal(t, maxObservedTransactions, len(restored.observed))
+}
+
+// TestFeeEstimatorRollbackKeepsCap tests that the cap still applies to the
+// samples a rollback unmines. Eviction drops mined samples from recent, and
+// reorgs that hold the tip height never let the age sweep remove them.
+func TestFeeEstimatorRollbackKeepsCap(t *testing.T) {
+	ef := newTestFeeEstimator(5, 3, 1)
+	ef.maxObserved = 2
+	eft := estimateFeeTester{ef: ef, t: t}
+
+	for i := 0; i < 20; i++ {
+		mined := eft.testTx(1000)
+		ef.ObserveTransaction(mined)
+		eft.newBlock([]*wire.MsgTx{mined.Tx.MsgTx()})
+		for j := 0; j < 3; j++ {
+			ef.ObserveTransaction(eft.testTx(1000))
+		}
+		eft.rollback()
+
+		require.LessOrEqual(t, len(ef.observed), ef.maxObserved,
+			"reorg %d: observed=%d recent=%d cap=%d", i, len(ef.observed), ef.recent.Len(), ef.maxObserved)
+	}
+}
+
+// TestFeeEstimatorRollbackEvictsOldestFirst tests that eviction after a
+// rollback below the cap proceeds as if the block had never been registered:
+// every sample the rollback unmines stays, queued once, and the oldest goes
+// first.
+func TestFeeEstimatorRollbackEvictsOldestFirst(t *testing.T) {
+	ef := newTestFeeEstimator(5, 3, 1)
+	ef.maxObserved = 4
+	eft := estimateFeeTester{ef: ef, t: t}
+
+	older := eft.testTx(1000)
+	ef.ObserveTransaction(older)
+	eft.newBlock(nil)
+	newer := eft.testTx(1000)
+	ef.ObserveTransaction(newer)
+	eft.newBlock([]*wire.MsgTx{older.Tx.MsgTx(), newer.Tx.MsgTx()})
+	eft.rollback()
+
+	require.Contains(t, ef.observed, *older.Tx.Hash())
+	require.Contains(t, ef.observed, *newer.Tx.Hash())
+	require.Equal(t, 2, ef.recent.Len(), "rollback queued a sample twice")
+
+	pending := []*TxDesc{eft.testTx(1000), eft.testTx(1000), eft.testTx(1000)}
+	for _, tx := range pending {
+		ef.ObserveTransaction(tx)
+	}
+	assert.NotContains(t, ef.observed, *older.Tx.Hash())
+	assert.Contains(t, ef.observed, *newer.Tx.Hash())
+	for i, tx := range pending {
+		assert.Contains(t, ef.observed, *tx.Tx.Hash(), "pending tx %d", i)
+	}
+}
+
+// BenchmarkObserveTransactionAtCap measures ObserveTransaction once the
+// unmined samples have reached the cap, so that each call evicts one.
+func BenchmarkObserveTransactionAtCap(b *testing.B) {
+	ef := newTestFeeEstimator(estimateFeeBinSize, estimateFeeMaxReplacements, DefaultEstimateFeeMaxRollback)
+	eft := estimateFeeTester{ef: ef}
+
+	// A transaction is only observed again after the cap has evicted it.
+	txs := make([]*TxDesc, 2*maxObservedTransactions)
+	for i := range txs {
+		txs[i] = eft.testTx(1000)
+		ef.ObserveTransaction(txs[i])
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ef.ObserveTransaction(txs[i%len(txs)])
 	}
 }

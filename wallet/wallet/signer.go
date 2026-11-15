@@ -69,20 +69,16 @@ func (w *Wallet) ComputeInputScript(tx *wire.MsgTx, output *wire.TxOut,
 		}
 	}
 
-	// Get the tapscript root if present (for proper key tweaking during
-	// key-path spending of addresses with tapscript commitment).
-	tapscriptRoot := walletAddr.TapscriptRoot()
-
 	// We need to produce a Schnorr signature for p2tr key spend addresses.
 	// We can now generate a valid witness which will allow us to
 	// spend this output.
-	sig, err := txscript.RawTxInTaprootSignature(
+	witnessScript, err := txscript.TaprootWitnessSignature(
 		tx, sigHashes, inputIndex, output.Value,
-		output.PkScript, tapscriptRoot, hashType, privKey,
+		output.PkScript, hashType, privKey,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return wire.TxWitness{sig}, nil, nil
+	return witnessScript, nil, nil
 }

@@ -147,11 +147,6 @@ type ManagedPubKeyAddress interface {
 	// imported keys, the first value will be set to false to indicate that
 	// we don't know exactly how the key was derived.
 	DerivationInfo() (KeyScope, DerivationPath, bool)
-
-	// TapscriptRoot returns the 32-byte tapscript root hash if the address
-	// has tapscript commitment. Returns nil if this is a standard BIP-86
-	// address without commitment.
-	TapscriptRoot() []byte
 }
 
 // ValidatableManagedAddress is a type of managed pubkey address that can
@@ -208,7 +203,6 @@ type managedAddress struct {
 	privKeyEncrypted []byte // nil if part of watch-only account
 	privKeyCT        []byte // non-nil if unlocked
 	privKeyMutex     sync.Mutex
-	tapscriptRoot    []byte // 32-byte tapscript root hash (nil if no commitment)
 }
 
 // Enforce managedAddress satisfies the ManagedPubKeyAddress interface.
@@ -343,12 +337,6 @@ func (a *managedAddress) ExportPubKey() string {
 	return hex.EncodeToString(a.pubKeyBytes())
 }
 
-// TapscriptRoot returns the tapscript root hash if the address has tapscript
-// commitment. Returns nil if this is a standard BIP-86 address without commitment.
-func (a *managedAddress) TapscriptRoot() []byte {
-	return a.tapscriptRoot
-}
-
 // PrivKey returns the private key for the address.  It can fail if the address
 // manager is watching-only or locked, or the address does not have any keys.
 //
@@ -446,14 +434,6 @@ func (a *managedAddress) Validate(msg [32]byte, priv *btcec.PrivateKey) error {
 			a.pubKey.SerializeUncompressed())
 	}
 
-	// If we have internal private key data, verify it matches the passed key
-	if a.privKeyCT != nil {
-		internalPrivKey, _ := btcec.PrivKeyFromBytes(a.privKeyCT)
-		if !priv.Key.Equals(&internalPrivKey.Key) {
-			return ErrInvalidSignature
-		}
-	}
-
 	// Next, we'll verify that if we take the base public key, and generate
 	// an address of the corresponding type, that matches up w/ what we've
 	// stored internally.
@@ -461,7 +441,7 @@ func (a *managedAddress) Validate(msg [32]byte, priv *btcec.PrivateKey) error {
 	// This can potentially catch a hardware/software error when mapping
 	// the public key to an address.
 	addr, err := newManagedAddressWithoutPrivKey(
-		a.manager, a.derivationPath, a.pubKey, a.compressed, a.addrType, a.tapscriptRoot,
+		a.manager, a.derivationPath, a.pubKey, a.compressed, a.addrType,
 	)
 	if err != nil {
 		return fmt.Errorf("unable to re-create addr: %w", err)
@@ -478,17 +458,14 @@ func (a *managedAddress) Validate(msg [32]byte, priv *btcec.PrivateKey) error {
 	// TODO(roasbeef): potentially run _all_ checks then see which one
 	// fails?
 	var sig signature
-	// TODO Or: clean this up
-	switch a.addrType {
-	// For the "legacy" addr types, we'll generate an ECDSA signature to
-	// verify against.
-	// case NestedWitnessPubKey, PubKeyHash, WitnessPubKey:
-	// 	sig = ecdsa.Sign(addrPrivKey, msg[:])
 
+	addrPrivKey, _ := btcec.PrivKeyFromBytes(a.privKeyCT)
+
+	switch a.addrType {
 	// For the newer taproot addr type, we'll generate a schnorr signature
 	// to verify against.
 	case TaprootPubKey:
-		sig, err = schnorr.Sign(priv, msg[:])
+		sig, err = schnorr.Sign(addrPrivKey, msg[:])
 		if err != nil {
 			return fmt.Errorf("unable to generate validate "+
 				"schnorr sig: %w", err)
@@ -509,23 +486,11 @@ func (a *managedAddress) Validate(msg [32]byte, priv *btcec.PrivateKey) error {
 // newManagedAddressWithoutPrivKey returns a new managed address based on the
 // passed account, public key, and whether or not the public key should be
 // compressed.
-//
-// If tapscriptRoot is provided (non-nil, 32 bytes), the taproot address will
-// commit to that tapscript tree, enabling script-path spending in addition to
-// key-path spending.
 func newManagedAddressWithoutPrivKey(m *ScopedKeyManager,
 	derivationPath DerivationPath, pubKey *btcec.PublicKey, compressed bool,
-	addrType AddressType, tapscriptRoot []byte) (*managedAddress, error) {
+	addrType AddressType) (*managedAddress, error) {
 
-	var tapKey *btcec.PublicKey
-	if tapscriptRoot != nil && len(tapscriptRoot) == 32 {
-		// Compute taproot output key with script commitment
-		tapKey = txscript.ComputeTaprootOutputKey(pubKey, tapscriptRoot)
-	} else {
-		// Standard BIP-86 key-only commitment
-		tapKey = txscript.ComputeTaprootKeyNoScript(pubKey)
-	}
-
+	tapKey := txscript.ComputeTaprootKeyNoScript(pubKey)
 	address, err := btcutil.NewAddressTaproot(
 		schnorr.SerializePubKey(tapKey), m.rootManager.ChainParams(),
 	)
@@ -544,19 +509,15 @@ func newManagedAddressWithoutPrivKey(m *ScopedKeyManager,
 		pubKey:           pubKey,
 		privKeyEncrypted: nil,
 		privKeyCT:        nil,
-		tapscriptRoot:    tapscriptRoot,
 	}, nil
 }
 
 // newManagedAddress returns a new managed address based on the passed account,
 // private key, and whether or not the public key is compressed.  The managed
 // address will have access to the private and public keys.
-//
-// If tapscriptRoot is provided, the address will include tapscript commitment.
 func newManagedAddress(s *ScopedKeyManager, derivationPath DerivationPath,
 	privKey *btcec.PrivateKey, compressed bool,
-	addrType AddressType, acctInfo *accountInfo,
-	tapscriptRoot []byte) (*managedAddress, error) {
+	addrType AddressType, acctInfo *accountInfo) (*managedAddress, error) {
 
 	// Encrypt the private key.
 	//
@@ -573,7 +534,7 @@ func newManagedAddress(s *ScopedKeyManager, derivationPath DerivationPath,
 	// and then add the private key to it.
 	ecPubKey := privKey.PubKey()
 	managedAddr, err := newManagedAddressWithoutPrivKey(
-		s, derivationPath, ecPubKey, compressed, addrType, tapscriptRoot,
+		s, derivationPath, ecPubKey, compressed, addrType,
 	)
 	if err != nil {
 		return nil, err
@@ -634,12 +595,9 @@ func newManagedAddress(s *ScopedKeyManager, derivationPath DerivationPath,
 // account and extended key.  The managed address will have access to the
 // private and public keys if the provided extended key is private, otherwise it
 // will only have access to the public key.
-//
-// If tapscriptRoot is provided, the address will include tapscript commitment.
 func newManagedAddressFromExtKey(s *ScopedKeyManager,
 	derivationPath DerivationPath, key *hdkeychain.ExtendedKey,
-	addrType AddressType, acctInfo *accountInfo,
-	tapscriptRoot []byte) (*managedAddress, error) {
+	addrType AddressType, acctInfo *accountInfo) (*managedAddress, error) {
 
 	// Create a new managed address based on the public or private key
 	// depending on whether the generated key is private.
@@ -653,7 +611,7 @@ func newManagedAddressFromExtKey(s *ScopedKeyManager,
 		// Ensure the temp private key big integer is cleared after
 		// use.
 		managedAddr, err = newManagedAddress(
-			s, derivationPath, privKey, true, addrType, acctInfo, tapscriptRoot,
+			s, derivationPath, privKey, true, addrType, acctInfo,
 		)
 		if err != nil {
 			return nil, err
@@ -666,7 +624,7 @@ func newManagedAddressFromExtKey(s *ScopedKeyManager,
 
 		managedAddr, err = newManagedAddressWithoutPrivKey(
 			s, derivationPath, pubKey, true,
-			addrType, tapscriptRoot,
+			addrType,
 		)
 		if err != nil {
 			return nil, err

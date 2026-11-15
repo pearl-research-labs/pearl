@@ -19,7 +19,9 @@ import (
 	"github.com/pearl-research-labs/pearl/node/blockchain/indexers"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/limits"
+	"github.com/pearl-research-labs/pearl/node/metrics"
 	"github.com/pearl-research-labs/pearl/node/ossec"
+	"github.com/pearl-research-labs/pearl/node/peer"
 )
 
 const (
@@ -28,6 +30,11 @@ const (
 	// database name.
 	blockDbNamePrefix = "blocks"
 )
+
+// Empty host would expose unauthenticated pprof on every interface.
+func profileListenAddr(port string) string {
+	return net.JoinHostPort("127.0.0.1", port)
+}
 
 var (
 	cfg *config
@@ -68,12 +75,25 @@ func pearldMain(serverChan chan<- *server) error {
 	// Enable http profiling server if requested.
 	if cfg.Profile != "" {
 		go func() {
-			listenAddr := net.JoinHostPort("", cfg.Profile)
+			listenAddr := profileListenAddr(cfg.Profile)
 			prldLog.Infof("Profile server listening on %s", listenAddr)
 			profileRedirect := http.RedirectHandler("/debug/pprof",
 				http.StatusSeeOther)
 			http.Handle("/", profileRedirect)
 			prldLog.Errorf("%v", http.ListenAndServe(listenAddr, nil))
+		}()
+	}
+
+	// Enable Prometheus metrics server if requested.
+	metricsServer, err := startMetricsServer(cfg.MetricsListeners)
+	if err != nil {
+		prldLog.Error(err)
+		return err
+	}
+	if metricsServer != nil {
+		defer func() {
+			prldLog.Infof("Gracefully shutting down the metrics server...")
+			metricsServer.Stop()
 		}()
 	}
 
@@ -272,6 +292,9 @@ func pearldMain(serverChan chan<- *server) error {
 		srvrLog.Infof("Server shutdown complete")
 	}()
 	server.Start()
+	if metricsServer != nil {
+		metricsServer.SetSource(server.MetricsSource())
+	}
 	if serverChan != nil {
 		serverChan <- server
 	}
@@ -281,6 +304,30 @@ func pearldMain(serverChan chan<- *server) error {
 	// server.
 	<-interrupt
 	return nil
+}
+
+// startMetricsServer serves metrics on listeners and logs serve errors. It returns nil when no
+// listeners are configured.
+func startMetricsServer(listeners []string) (*metrics.Server, error) {
+	if len(listeners) == 0 {
+		return nil, nil
+	}
+
+	metrics.SetInfo(version(), activeNetParams.Name, fmt.Sprintf("%d", peer.MaxProtocolVersion))
+
+	srv, err := metrics.NewServer(listeners)
+	if err != nil {
+		return nil, fmt.Errorf("unable to start metrics server on %v: %w", listeners, err)
+	}
+	srv.Start()
+
+	prldLog.Infof("Metrics server listening on %v", srv.ListenAddrs())
+	go func() {
+		for err := range srv.Errors() {
+			prldLog.Errorf("Metrics server error: %v", err)
+		}
+	}()
+	return srv, nil
 }
 
 // removeRegressionDB removes the existing regression test database if running

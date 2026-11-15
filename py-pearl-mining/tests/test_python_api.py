@@ -10,8 +10,9 @@ import pytest
 
 # --- Constants ---
 DEFAULT_NBITS = 0x1D2FFFFF
+# k must be a multiple of 64 with k >= 16 * rank (sanity check).
 DEFAULT_K = 2048
-DEFAULT_RANK = 32
+DEFAULT_RANK = 128
 
 ROWS_PATTERN_LIST = [0, 8, 64, 72]
 COLS_PATTERN_LIST = [0, 1, 8, 9, 32, 33, 40, 41]
@@ -135,7 +136,7 @@ class TestTileConfiguration:
     """Test the 4x16 tile configuration (4 row indices, 8+8 col pattern)."""
 
     def test_4x16_tile(self):
-        m, n, k = 256, 128, 2048
+        m, n, k = 256, 128, DEFAULT_K
         block_header = create_test_block_header()
         plain_proof = generate_plain_proof(m, n, k, block_header)
 
@@ -209,7 +210,7 @@ class TestSoundness:
 
     def test_wrong_jackpot_hash(self):
         """Incorrect jackpot hash should fail verification."""
-        m, n, k = 256, 128, 1024
+        m, n, k = 256, 128, DEFAULT_K
         block_header = create_test_block_header(DEFAULT_NBITS)
         plain_proof = generate_plain_proof(
             m,
@@ -232,15 +233,16 @@ DEFAULT_TOP_K = 2
 DEFAULT_MOE_M = 1024
 DEFAULT_MOE_N = 256
 
+# k must satisfy the prover's sanity check: k >= 16 * rank (and k % 64 == 0).
 MOE_DIMENSION_CASES = [
-    pytest.param(1024, 256, 1024, 4, 2, 32, id="1024x1024_1024x256_e4_top2_r32"),
-    pytest.param(1024, 256, 1088, 4, 2, 32, id="1024x1088_1088x256_e4_top2_r32"),
-    pytest.param(1024, 384, 1024, 4, 2, 32, id="1024x1024_1024x384_e4_top2_r32"),
+    pytest.param(1024, 256, 2048, 4, 2, 128, id="1024x2048_2048x256_e4_top2_r128"),
+    pytest.param(1024, 256, 2176, 4, 2, 128, id="1024x2176_2176x256_e4_top2_r128"),
+    pytest.param(1024, 384, 2048, 4, 2, 128, id="1024x2048_2048x384_e4_top2_r128"),
 ]
 
 
 class TestMoEMineProveVerify:
-    """End-to-end MoE: mine -> verify plain -> ZK prove -> ZK verify."""
+    """End-to-end MoE: mine -> ZK prove -> ZK verify."""
 
     def test_basic_moe(self):
         block_header = create_test_block_header()
@@ -253,9 +255,6 @@ class TestMoEMineProveVerify:
             block_header,
         )
 
-        is_valid, msg = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
-        assert is_valid, f"MoE plain proof verification failed: {msg}"
-
         moe_prove_and_verify(block_header, moe_proof)
 
     @pytest.mark.parametrize("m, n, k, e, top_k, rank", MOE_DIMENSION_CASES)
@@ -263,16 +262,14 @@ class TestMoEMineProveVerify:
         block_header = create_test_block_header()
         moe_proof = generate_moe_plain_proof(m, n, k, e, top_k, block_header, rank=rank)
 
-        is_valid, msg = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
-        assert is_valid, f"MoE plain proof verification failed: {msg}"
-
         moe_prove_and_verify(block_header, moe_proof)
 
 
 class TestMoEVerifyPlainProof:
     """Test V3 plain-proof verification for MoE solutions."""
 
-    def test_valid_moe_plain_proof(self):
+    def test_moe_plain_proof_rejected(self):
+        """Plain verification accepts dense proofs only."""
         block_header = create_test_block_header()
         moe_proof = generate_moe_plain_proof(
             DEFAULT_MOE_M,
@@ -284,23 +281,8 @@ class TestMoEVerifyPlainProof:
         )
 
         is_valid, msg = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
-        assert is_valid, f"verify_plain_proof failed on valid proof: {msg}"
-
-    def test_wrong_range_moe_plain_proof(self):
-        """Out-of-range signal values should fail MoE plain proof verification."""
-        block_header = create_test_block_header()
-        moe_proof = generate_moe_plain_proof(
-            DEFAULT_MOE_M,
-            DEFAULT_MOE_N,
-            DEFAULT_K,
-            DEFAULT_E,
-            DEFAULT_TOP_K,
-            block_header,
-            signal_range=OUT_OF_RANGE_SIGNAL_RANGE,
-        )
-
-        is_valid, msg = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
-        assert not is_valid, "verify_plain_proof accepted out-of-range matrices -- soundness issue!"
+        assert not is_valid, "plain verify accepted an MoE proof"
+        assert "dense-only" in msg, f"unexpected rejection reason: {msg}"
 
 
 class TestMoESoundness:
@@ -354,9 +336,8 @@ class TestMoESerialization:
         encoded = moe_proof.to_base64()
         restored = pearl_mining.PlainProof.from_base64(encoded)
 
-        is_valid_original, _ = pearl_mining.verify_plain_proof_v3(block_header, moe_proof)
-        is_valid_restored, _ = pearl_mining.verify_plain_proof_v3(block_header, restored)
-        assert is_valid_original and is_valid_restored, "Round-trip serialization broke the proof"
+        # Round-trip fidelity: serialization must be lossless.
+        assert restored.to_base64() == encoded, "Round-trip serialization broke the proof"
 
 
 # --- Certificate-version dispatch (MoE fork crossover) ---
@@ -496,11 +477,11 @@ class TestLegacyV1Deserialization:
     """from_base64() must accept blobs from old miners (no trailing `moe` Option tag)."""
 
     def test_accepts_legacy_v1_blob(self):
-        m, n, k = 256, 128, DEFAULT_K
+        m, n, k = 256, 128, 1024
         block_header = create_test_block_header()
-        # Old V1 miners used the legacy derivation.
+        # Old V1 miners used the legacy derivation and rank-32 fixtures.
         plain_proof = generate_plain_proof(
-            m, n, k, block_header, cert_version=pearl_mining.CERT_VERSION_ZK_DENSE
+            m, n, k, block_header, rank=32, cert_version=pearl_mining.CERT_VERSION_ZK_DENSE
         )
 
         raw = base64.b64decode(plain_proof.to_base64())
@@ -509,7 +490,8 @@ class TestLegacyV1Deserialization:
 
         restored = pearl_mining.PlainProof.from_base64(legacy_blob)
         assert restored.min_cert_version == pearl_mining.CERT_VERSION_ZK_DENSE
-        is_valid, msg = pearl_mining.verify_plain_proof_v2(block_header, restored)
+        # A legacy V1 blob is verified on the V1 path.
+        is_valid, msg = pearl_mining.verify_plain_proof_v1(block_header, restored)
         assert is_valid, f"restored legacy proof failed verification: {msg}"
 
     def test_rejects_garbage(self):
@@ -660,11 +642,12 @@ class TestV1NbitsOverride:
     """verify_plain_proof_v1() supports pool share-difficulty overrides."""
 
     def test_share_difficulty_override(self):
-        m, n, k = 256, 128, DEFAULT_K
+        # V1 fixtures use the legacy rank-32 baseline.
+        m, n, k = 256, 128, 1024
         block_header = create_test_block_header()
         # V1 verification uses the legacy derivation.
         plain_proof = generate_plain_proof(
-            m, n, k, block_header, cert_version=pearl_mining.CERT_VERSION_ZK_DENSE
+            m, n, k, block_header, rank=32, cert_version=pearl_mining.CERT_VERSION_ZK_DENSE
         )
 
         is_valid, msg = pearl_mining.verify_plain_proof_v1(

@@ -144,25 +144,30 @@ func (ms *mapSlice) delete(op wire.OutPoint) {
 	}
 }
 
+// remainingMemory returns the budget left after the cached entries and existing
+// maps, or 0 once they exhaust it.
+//
+// This function is NOT safe for concurrent access and must be called with the
+// lock held.
+func (ms *mapSlice) remainingMemory(totalEntryMemory uint64) uint64 {
+	remaining := subOrZero(ms.maxTotalMemoryUsage, totalEntryMemory)
+	for _, capacity := range ms.maxEntries {
+		if remaining == 0 {
+			break
+		}
+		remaining = subOrZero(remaining, uint64(calculateRoughMapSize(capacity, bucketSize)))
+	}
+	return remaining
+}
+
 // makeNewMap makes and appends the new map into the map slice.
 //
 // This function is NOT safe for concurrent access and must be called with the
 // lock held.
 func (ms *mapSlice) makeNewMap(totalEntryMemory uint64) map[wire.OutPoint]*UtxoEntry {
-	// Get the size of the leftover memory.
-	memSize := ms.maxTotalMemoryUsage - totalEntryMemory
-	for _, maxNum := range ms.maxEntries {
-		memSize -= uint64(calculateRoughMapSize(maxNum, bucketSize))
-	}
-
-	// Get a new map that's sized to house inside the leftover memory.
-	// -1 on the returned value will make the map allocate half as much total
-	// bytes.  This is done to make sure there's still room left for utxo
-	// entries to take up.
-	numMaxElements := calculateMinEntries(int(memSize), bucketSize+avgEntrySize)
-	numMaxElements -= 1
-	ms.maxEntries = append(ms.maxEntries, numMaxElements)
-	ms.maps = append(ms.maps, make(map[wire.OutPoint]*UtxoEntry, numMaxElements))
+	capacity := mapCapacityFor(ms.remainingMemory(totalEntryMemory))
+	ms.maxEntries = append(ms.maxEntries, capacity)
+	ms.maps = append(ms.maps, make(map[wire.OutPoint]*UtxoEntry, capacity))
 
 	return ms.maps[len(ms.maps)-1]
 }
@@ -230,24 +235,16 @@ type utxoCache struct {
 // newUtxoCache initiates a new utxo cache instance with its memory usage limited
 // to the given maximum.
 func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
-	// While the entry isn't included in the map size, add the average size to the
-	// bucket size so we get some leftover space for entries to take up.
-	numMaxElements := calculateMinEntries(int(maxTotalMemoryUsage), bucketSize+avgEntrySize)
-	numMaxElements -= 1
-
 	log.Infof("Pre-allocating for %d MiB", maxTotalMemoryUsage/(1024*1024)+1)
 
-	m := make(map[wire.OutPoint]*UtxoEntry, numMaxElements)
-
-	return &utxoCache{
+	cache := &utxoCache{
 		db:                  db,
 		maxTotalMemoryUsage: maxTotalMemoryUsage,
-		cachedEntries: mapSlice{
-			maps:                []map[wire.OutPoint]*UtxoEntry{m},
-			maxEntries:          []int{numMaxElements},
-			maxTotalMemoryUsage: maxTotalMemoryUsage,
-		},
+		cachedEntries:       mapSlice{maxTotalMemoryUsage: maxTotalMemoryUsage},
 	}
+	cache.cachedEntries.makeNewMap(0)
+
+	return cache
 }
 
 // totalMemoryUsage returns the total memory usage in bytes of the UTXO cache.
@@ -260,10 +257,10 @@ func (s *utxoCache) totalMemoryUsage() uint64 {
 	return size
 }
 
-// fetchEntries returns the UTXO entries for the given outpoints.  The function always
-// returns as many entries as there are outpoints and the returns entries are in the
-// same order as the outpoints.  It returns nil if there is no entry for the outpoint
-// in the UTXO set.
+// fetchEntries returns the UTXO entries for the given outpoints, in order,
+// without modifying the cache.  Cached entries, including unflushed spends and
+// cached misses, take precedence over the database; an outpoint found in neither
+// gets a nil entry.
 //
 // The returned entries are NOT safe for concurrent access.
 func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error) {
@@ -315,23 +312,42 @@ func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error
 		return nil, err
 	}
 
-	// Add each of the entries to the UTXO cache and update their memory
-	// usage.
-	//
-	// NOTE: When the fetched entry is nil, it is still added to the cache
-	// as a miss; this prevents future lookups to perform the same database
-	// fetch.
-	for i := range dbEntries {
-		s.cachedEntries.put(missingOps[i], dbEntries[i], s.totalEntryMemory)
-		s.totalEntryMemory += dbEntries[i].memoryUsage()
-	}
-
 	// Fill in the entries with the ones fetched from the database.
 	for i := range missingOpsIdx {
 		entries[missingOpsIdx[i]] = dbEntries[i]
 	}
 
 	return entries, nil
+}
+
+// fetchAndAddEntries is fetchEntries followed by caching each entry read from the
+// database, misses included, once.  Block connection spends the returned entries
+// in place, so an uncached database entry would drop its spend from the next
+// flush.
+//
+// This function is NOT safe for concurrent access.  The caller must hold the
+// chain write lock when accessing a live chain's cache.
+func (s *utxoCache) fetchAndAddEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error) {
+	entries, err := s.fetchEntries(outpoints)
+	if err != nil {
+		return nil, err
+	}
+	for i, outpoint := range outpoints {
+		if _, ok := s.cachedEntries.get(outpoint); ok {
+			continue
+		}
+		s.cachedEntries.put(outpoint, entries[i], s.totalEntryMemory)
+		s.totalEntryMemory += entries[i].memoryUsage()
+	}
+	return entries, nil
+}
+
+// haveUnspent reports whether the cache holds an unspent entry for the outpoint.
+// It never reads the database.
+func (s *utxoCache) haveUnspent(outpoint wire.OutPoint) bool {
+	entry, _ := s.cachedEntries.get(outpoint)
+
+	return entry != nil && !entry.IsSpent()
 }
 
 // addTxOut adds the specified output to the cache if it is not provably
@@ -402,7 +418,7 @@ func (s *utxoCache) addTxOuts(tx *btcutil.Tx, blockHeight int32) error {
 func (s *utxoCache) addTxIn(txIn *wire.TxIn, stxos *[]SpentTxOut) error {
 	// Ensure the referenced utxo exists in the view.  This should
 	// never happen unless there is a bug is introduced in the code.
-	entries, err := s.fetchEntries([]wire.OutPoint{txIn.PreviousOutPoint})
+	entries, err := s.fetchAndAddEntries([]wire.OutPoint{txIn.PreviousOutPoint})
 	if err != nil {
 		return err
 	}
@@ -489,6 +505,10 @@ func (s *utxoCache) connectTransaction(
 // the passed block.  In addition, when the 'stxos' argument is not nil, it will
 // be updated to append an entry for each spent txout.
 func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOut) error {
+	if err := checkBlockTransactionOrder(block); err != nil {
+		return err
+	}
+
 	for _, tx := range block.Transactions() {
 		err := s.connectTransaction(tx, block.Height(), stxos)
 		if err != nil {
@@ -599,12 +619,13 @@ func (s *utxoCache) shouldFlush(mode FlushMode, bestState *BestState) bool {
 	return s.totalMemoryUsage() >= threshold
 }
 
-// flush flushes the UTXO state to the database if a flush is needed with the given flush mode.
+// flush flushes the UTXO state to the database if a flush is needed with the given flush mode,
+// and reports whether it did.
 //
 // This function MUST be called with the chain state lock held (for writes).
-func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState) error {
+func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState) (bool, error) {
 	if !s.shouldFlush(mode, bestState) {
-		return nil
+		return false, nil
 	}
 
 	var eraseCache bool
@@ -617,7 +638,33 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 	log.Infof("Flushing UTXO cache of %d MiB with %d entries to disk. For large sizes, "+
 		"this can take up to several minutes...", totalMiB, s.cachedEntries.length())
 
-	return s.writeCache(dbTx, bestState, eraseCache)
+	return true, s.writeCache(dbTx, bestState, eraseCache)
+}
+
+// flushUtxoCache is utxoCache.flush plus its timing and the resulting occupancy for Metrics.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) flushUtxoCache(dbTx database.Tx, mode FlushMode, bestState *BestState) error {
+	start := time.Now()
+	flushed, err := b.utxoCache.flush(dbTx, mode, bestState)
+	if err != nil {
+		return err
+	}
+	if flushed {
+		b.metrics.UtxoCacheFlushed(time.Since(start))
+	}
+	b.reportUtxoCache()
+
+	return nil
+}
+
+// reportUtxoCache pushes the UTXO cache occupancy to Metrics. Readers cannot pull it on demand
+// without taking the chain lock, which a flush can hold for minutes.
+//
+// This function MUST be called with the chain state lock held, or before the chain is shared.
+func (b *BlockChain) reportUtxoCache() {
+	b.metrics.UtxoCacheChanged(b.utxoCache.cachedEntries.length(), b.utxoCache.totalMemoryUsage(),
+		b.utxoCache.maxTotalMemoryUsage)
 }
 
 // FlushUtxoCache flushes the UTXO state to the database if a flush is needed with the
@@ -636,7 +683,7 @@ func (b *BlockChain) FlushUtxoCache(mode FlushMode) error {
 	}
 
 	return b.db.Update(func(dbTx database.Tx) error {
-		return b.utxoCache.flush(dbTx, mode, b.BestSnapshot())
+		return b.flushUtxoCache(dbTx, mode, b.BestSnapshot())
 	})
 }
 
@@ -747,7 +794,7 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 		// Fast-path: skip db.Update if no flush is needed.
 		if s.shouldFlush(FlushIfNeeded, bestState) {
 			err = s.db.Update(func(dbTx database.Tx) error {
-				return s.flush(dbTx, FlushIfNeeded, bestState)
+				return b.flushUtxoCache(dbTx, FlushIfNeeded, bestState)
 			})
 			if err != nil {
 				return err

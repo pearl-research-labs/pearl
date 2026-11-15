@@ -193,9 +193,8 @@ const (
 	// program hash mismatch).
 	ErrNonMandatoryScriptVerifyFlag
 
-	// ErrTxNotRelayed is returned by an SPV backend when no peer requested the transaction after it was announced.
-	// Peers that already hold it stay silent too, so only a transaction announced for the first time can safely be
-	// forgotten on this error.
+	// ErrTxNotRelayed indicates that no peer requested a transaction, or a new send failed its zero-peer preflight.
+	// Only the preflight happens before signing; a broadcast result cannot prove signed bytes were never relayed.
 	ErrTxNotRelayed
 
 	// errSentinel is used to indicate the end of the error list. This

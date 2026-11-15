@@ -16,7 +16,7 @@ import (
 
 	neutrino "github.com/pearl-research-labs/pearl/spv"
 	"github.com/pearl-research-labs/pearl/wallet/chain"
-	"github.com/pearl-research-labs/pearl/wallet/rpc/legacyrpc"
+	"github.com/pearl-research-labs/pearl/wallet/rpc/jsonrpc"
 	"github.com/pearl-research-labs/pearl/wallet/waddrmgr"
 	"github.com/pearl-research-labs/pearl/wallet/wallet"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
@@ -79,33 +79,26 @@ func walletMain() error {
 		activeNet.Params, dbDir, true, cfg.DBTimeout, 250,
 	)
 
-	// Create and start HTTP server to serve wallet client connections.
-	// This will be updated with the wallet and chain server RPC client
-	// created below after each is created.
-	rpcs, legacyRPCServer, err := startRPCServers(loader)
+	rpcServer, err := startRPCServer(loader)
 	if err != nil {
-		log.Errorf("Unable to create RPC servers: %v", err)
+		log.Errorf("Unable to create RPC server: %v", err)
 		return err
 	}
 
 	// Create and start chain RPC client so it's ready to connect to
 	// the wallet when loaded later.
-	if !cfg.NoInitialLoad {
-		go rpcClientConnectLoop(legacyRPCServer, loader)
-	}
+	go rpcClientConnectLoop(rpcServer, loader)
 
 	loader.RunAfterLoad(func(w *wallet.Wallet) {
-		startWalletRPCServices(w, rpcs, legacyRPCServer)
+		rpcServer.RegisterWallet(w)
 	})
 
-	if !cfg.NoInitialLoad {
-		// Load the wallet database.  It must have been created already
-		// or this will return an appropriate error.
-		_, err = loader.OpenExistingWallet([]byte(cfg.WalletPass), true)
-		if err != nil {
-			log.Error(err)
-			return err
-		}
+	// Load the wallet database.  It must have been created already
+	// or this will return an appropriate error.
+	_, err = loader.OpenExistingWallet([]byte(cfg.WalletPass), true)
+	if err != nil {
+		log.Error(err)
+		return err
 	}
 
 	// Add interrupt handlers to shutdown the various process components
@@ -117,26 +110,15 @@ func walletMain() error {
 			log.Errorf("Failed to close wallet: %v", err)
 		}
 	})
-	if rpcs != nil {
-		addInterruptHandler(func() {
-			// TODO: Does this need to wait for the grpc server to
-			// finish up any requests?
-			log.Warn("Stopping RPC server...")
-			rpcs.Stop()
-			log.Info("RPC server shutdown")
-		})
-	}
-	if legacyRPCServer != nil {
-		addInterruptHandler(func() {
-			log.Warn("Stopping legacy RPC server...")
-			legacyRPCServer.Stop()
-			log.Info("Legacy RPC server shutdown")
-		})
-		go func() {
-			<-legacyRPCServer.RequestProcessShutdown()
-			simulateInterrupt()
-		}()
-	}
+	addInterruptHandler(func() {
+		log.Warn("Stopping RPC server...")
+		rpcServer.Stop()
+		log.Info("RPC server shutdown")
+	})
+	go func() {
+		<-rpcServer.RequestProcessShutdown()
+		simulateInterrupt()
+	}()
 
 	<-interruptHandlersDone
 	log.Info("Shutdown complete")
@@ -147,10 +129,9 @@ func walletMain() error {
 // server.  When a connection is established, the client is used to sync the
 // loaded wallet, either immediately or when loaded at a later time.
 //
-// The legacy RPC is optional.  If set, the connected RPC client will be
-// associated with the server for RPC passthrough and to enable additional
-// methods.
-func rpcClientConnectLoop(legacyRPCServer *legacyrpc.Server, loader *wallet.Loader) {
+// The connected chain RPC client is associated with the wallet RPC server for
+// passthrough and to enable methods that require chain state.
+func rpcClientConnectLoop(rpcServer *jsonrpc.Server, loader *wallet.Loader) {
 	var certs []byte
 	if !cfg.UseSPV {
 		certs = readCAFile()
@@ -210,9 +191,7 @@ func rpcClientConnectLoop(legacyRPCServer *legacyrpc.Server, loader *wallet.Load
 		// mutex is used to make this concurrent safe.
 		associateRPCClient := func(w *wallet.Wallet) {
 			w.SynchronizeRPC(chainClient)
-			if legacyRPCServer != nil {
-				legacyRPCServer.SetChainServer(chainClient)
-			}
+			rpcServer.SetChainServer(chainClient)
 		}
 		mu := new(sync.Mutex)
 		loader.RunAfterLoad(func(w *wallet.Wallet) {
