@@ -172,16 +172,19 @@ def _publish_cpu_prepared(
     assert buffers is not None
     prepared = ready.prepared
     key_a, _ = commitment_keys_for(job, prepared.b_proof.ancestor_header)
-    for name in _CPU_UPLOADED:
-        getattr(buffers, name).copy_(getattr(prepared, name), non_blocking=True)
-    buffers.key_a_dev.copy_(_as_bytes_tensor(key_a))
-    buffers.key_b_dev.copy_(_as_bytes_tensor(prepared.key_b))
-    buffers.seed_b_dev.copy_(_as_bytes_tensor(prepared.seed_b))
-    buffers.noise_key_b_dev.copy_(_as_bytes_tensor(noise_line_key(prepared.seed_b)))
-    buffers.threshold_dev.copy_(threshold)
     uploaded = torch.cuda.Event()
-    uploaded.record()
-    ready.uploaded(uploaded)
+    try:
+        for name in _CPU_UPLOADED:
+            getattr(buffers, name).copy_(getattr(prepared, name), non_blocking=True)
+        buffers.key_a_dev.copy_(_as_bytes_tensor(key_a))
+        buffers.key_b_dev.copy_(_as_bytes_tensor(prepared.key_b))
+        buffers.seed_b_dev.copy_(_as_bytes_tensor(prepared.seed_b))
+        buffers.noise_key_b_dev.copy_(_as_bytes_tensor(noise_line_key(prepared.seed_b)))
+        buffers.threshold_dev.copy_(threshold)
+    finally:
+        # The slot returns even when a copy fails, once whatever was enqueued completes.
+        uploaded.record()
+        ready.uploaded(uploaded)
     ctx = _job_context(
         state, job, prepared.config, key_a, prepared.key_b, prepared.seed_b, prepared.b_proof
     )
