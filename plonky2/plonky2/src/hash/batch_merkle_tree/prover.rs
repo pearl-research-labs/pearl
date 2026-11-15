@@ -71,14 +71,22 @@ mod tests {
     #[test]
     fn prover_tree_matches_original_constructor() {
         fn check<H: Hasher<F>>() {
-            for heights in [vec![5], vec![5, 3, 2], vec![5, 5, 3, 3, 2]] {
-                let leaves: Vec<Vec<Vec<F>>> = heights
+            let mut layouts = vec![
+                vec![(5, 0)],
+                vec![(5, 0), (3, 3), (2, 4)],
+                vec![(5, 0), (5, 3), (3, 4), (3, 7), (2, 1)],
+            ];
+            for width in [0, 3, 4, 7] {
+                layouts.push(vec![(3, 4), (3, width)]);
+            }
+            for layout in layouts {
+                let leaves: Vec<Vec<Vec<F>>> = layout
                     .iter()
                     .enumerate()
-                    .map(|(group, &height)| {
+                    .map(|(group, &(height, width))| {
                         (0..1 << height)
                             .map(|row| {
-                                (0..[0, 3, 4, 7, 1][group])
+                                (0..width)
                                     .map(|column| {
                                         F::from_canonical_usize(group * 1000 + row * 10 + column)
                                     })
@@ -87,11 +95,22 @@ mod tests {
                             .collect()
                     })
                     .collect();
-                for cap in 0..=*heights.last().unwrap() {
-                    assert_eq!(
-                        BatchMerkleTree::<F, H>::new_prover(leaves.clone(), cap),
-                        BatchMerkleTree::<F, H>::new(leaves.clone(), cap)
-                    );
+                for cap in 0..=layout.last().unwrap().0 {
+                    let tree = BatchMerkleTree::<F, H>::new_prover(leaves.clone(), cap);
+                    assert_eq!(tree, BatchMerkleTree::<F, H>::new(leaves.clone(), cap));
+                    if layout.len() == 2 && layout.iter().all(|&(height, _)| height == cap) {
+                        let expected: Vec<_> = leaves[0]
+                            .iter()
+                            .zip(&leaves[1])
+                            .map(|(first, second)| {
+                                let mut fields = H::hash_or_noop(first).to_vec();
+                                fields.extend(second);
+                                H::hash_or_noop(&fields)
+                            })
+                            .collect();
+                        assert_eq!(tree.cap.0, expected);
+                        assert!(tree.digests.is_empty());
+                    }
                 }
             }
         }

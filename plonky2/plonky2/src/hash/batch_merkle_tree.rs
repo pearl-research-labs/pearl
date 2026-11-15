@@ -200,37 +200,6 @@ mod tests {
     type H = <C as GenericConfig<D>>::Hasher;
 
     #[test]
-    fn equal_height_injection_matches_hashing_concatenated_fields() {
-        fn check<H: Hasher<F>>() {
-            for width in [0, 3, 4, 7] {
-                let first: Vec<Vec<F>> = (0..8)
-                    .map(|i| vec![F::from_canonical_usize(i); 4])
-                    .collect();
-                let second: Vec<Vec<F>> = (0..8)
-                    .map(|i| vec![F::from_canonical_usize(i + 8); width])
-                    .collect();
-                let expected: Vec<_> = first
-                    .iter()
-                    .zip(&second)
-                    .map(|(a, b)| {
-                        let mut fields = H::hash_or_noop(a).to_vec();
-                        fields.extend(b);
-                        H::hash_or_noop(&fields)
-                    })
-                    .collect();
-                let leaves = vec![first, second];
-                let reference = BatchMerkleTree::<F, H>::new(leaves.clone(), 3);
-                let tree = BatchMerkleTree::<F, H>::new_prover(leaves, 3);
-                assert_eq!(tree, reference);
-                assert_eq!(tree.cap.0, expected);
-                assert!(tree.digests.is_empty());
-            }
-        }
-        check::<<C as GenericConfig<D>>::Hasher>();
-        check::<crate::hash::keccak::KeccakHash<32>>();
-    }
-
-    #[test]
     fn commit_single() -> Result<()> {
         // mat_1 = [
         //   0 1
