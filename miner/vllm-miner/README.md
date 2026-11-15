@@ -111,6 +111,22 @@ weights. Prefer a dynamic-activation checkpoint; a checkpoint-provided static
 activation scale adds a further uniform rounding factor and is warned about
 once at load.
 
+### CPU B preparation
+
+A layer's B side is keyed by a complete ancestor header and is reused while
+that ancestor stays in the four-header state window; once the window drops
+it, the first launch prepares a fresh B on the GPU inline, so every mined
+layer pays that preparation on the serving path at once. Instead, a helper process
+prepares the fresh B side on the host CPU ahead of time: the committed planes' digest,
+the noise lines, and B' and its peel, bit-identical to the GPU chain (native
+AVX-512 kernels, with a torch fallback). The next launch of that layer uploads
+it in place on the serving stream instead of running the GPU chain; a layer
+whose result is not ready in time still prepares inline. The helper maps the
+layers' host planes once (about one byte per weight element plus scales) and
+returns B' through a few page-locked shared slots, each the size of the
+largest mined layer. Blackwell commitments only: the CPU chain implements the
+Blackwell noise dot, so other devices keep inline GPU preparation.
+
 ## Installation
 
 The package is a member of the top-level `uv` workspace (see `pyproject.toml`
@@ -209,6 +225,9 @@ Unsupported devices or layer shapes stay on the serving fallback.
 | `PEARL_COMPLETION_INFLIGHT_LIMIT` | `8` | integer `1..256` | all mining launches | Caps all event-gated credited launches, including no-gateway launches that retain no winner. At the cap, mining is declined before GPU allocation. Also sizes the mining memory kept off the KV cache (peak reservation scales ~linearly with it); raise only when profiling shows spare memory. |
 | `PEARL_OOM_COOLDOWN_S` | `30` | finite float `> 0` | all mining GPU work | Suspends mining device-wide after OOM, then admits exactly one recovery probe; a no-op/stale attempt does not reopen ordinary admission. Serving continues on fallback without cache flush or device synchronization. |
 | `PEARL_RECON_CHUNK_ROWS` | `4096` | integer `>= 1` | quantized-checkpoint load | Identity rows fed per delegate `apply` when decoding a quantized weight back to BF16. Bounds the upcast's transient workspace; the free-memory budget check is the real OOM gate, so lower this only for a pathological shape whose per-chunk transient is too large. |
+| `PEARL_CPU_B_PREPARE_THREADS` | `8` | integer `>= 1` | job changes | Torch threads of the helper process that prepares each layer's next B side on the host CPU, before the state window drops the ancestor its current B is keyed by (see [CPU B preparation](#cpu-b-preparation)). Blackwell commitments; other devices keep inline GPU preparation. |
+| `PEARL_CPU_B_PREPARE_CPUS` | empty | Linux cpulist, or `auto` | job changes | The CPUs the CPU B helper runs on; empty leaves it on every CPU. `auto` gives each GPU's helper its own share of that GPU's NUMA-local CPUs. A data-parallel group sharing one list deals it evenly by rank. |
+| `PEARL_CPU_B_REPLACE_LEAD` | `1` | integer `1..3` | job changes | Tip changes ahead of the state window dropping a layer's B ancestor at which CPU B prepares its replacement: `1` replaces it one tip change early (once per four new parents), `3` on every new parent. |
 
 Every credited launch reports **difficulty-normalized effective work** (`m*n*k`)
 to the gateway, so `total_hash`/hashrate is comparable across shapes/`k` and to

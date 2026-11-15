@@ -148,6 +148,7 @@ def _delete_state_locked() -> None:
     """
     global _async_manager, _runtime_poisoned
 
+    from .cpu_b import stop_cpu_b_service
     from .job_prep import unpublish_contexts
 
     manager = _async_manager
@@ -158,6 +159,7 @@ def _delete_state_locked() -> None:
         # abandoning proofs, so close proof admission and wake RPCs immediately.
         manager.abort_pending_submissions()
     close_mining_admission()
+    stop_cpu_b_service()
     failure: BaseException | None = None
     try:
         if manager is not None:

@@ -3,10 +3,26 @@
 import re
 from collections.abc import Iterable
 from functools import cache
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+def parse_cpu_list(value: str) -> tuple[int, ...]:
+    """A Linux cpulist ("0-3,8,10-11") as its CPUs, in order. Raises
+    ``ValueError`` on a malformed entry or a reversed range."""
+    cpus: list[int] = []
+    for part in filter(None, (part.strip() for part in value.split(","))):
+        matched = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if matched is None:
+            raise ValueError(f"malformed cpulist entry {part!r} in {value!r}")
+        first = int(matched[1])
+        last = int(matched[2] or first)
+        if last < first:
+            raise ValueError(f"reversed cpulist range {part!r} in {value!r}")
+        cpus.extend(range(first, last + 1))
+    return tuple(cpus)
 
 
 class RuntimeSettings(BaseSettings):
@@ -39,6 +55,17 @@ class RuntimeSettings(BaseSettings):
     # rarely needs tuning -- lower it only for a pathological shape that the
     # budget still admits but whose per-chunk transient is too large.
     recon_chunk_rows: int = Field(default=4096, ge=1)
+    # Torch threads of the helper process that prepares each layer's next B
+    # on the host CPU (cpu_b.py).
+    cpu_b_prepare_threads: int = Field(default=8, ge=1)
+    # The CPUs that helper runs on, as a Linux cpulist (e.g. "80-159"); empty
+    # leaves it on every CPU. "auto" gives each GPU's helper its own share of
+    # that GPU's NUMA-local CPUs, so the helpers of one host do not overlap.
+    cpu_b_prepare_cpus: Annotated[tuple[int, ...] | Literal["auto"], NoDecode] = ()
+    # Prepare a layer's next B once the state window drops the ancestor its B
+    # is keyed by within this many tip changes: 1 waits until the next one
+    # would, 3 (the window depth minus one) replaces it on every new parent.
+    cpu_b_replace_lead: int = Field(default=1, ge=1, le=3)
 
     @field_validator("ignored_layers", mode="before")
     @classmethod
@@ -53,6 +80,15 @@ class RuntimeSettings(BaseSettings):
                 except re.error as exc:
                     raise ValueError(f"invalid ignored-layers regex {entry!r}: {exc}") from exc
         return entries
+
+    @field_validator("cpu_b_prepare_cpus", mode="before")
+    @classmethod
+    def _parse_cpu_list(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        if value.strip().lower() == "auto":
+            return "auto"
+        return parse_cpu_list(value)
 
     @field_validator("m_buckets", mode="before")
     @classmethod

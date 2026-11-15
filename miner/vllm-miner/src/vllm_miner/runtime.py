@@ -171,15 +171,26 @@ def _prepare_mining() -> bool:
     Runs synchronously on the worker thread; a failure never blocks serving
     (the affected layers stay on the FP8 fallback).
     """
+    from .cpu_b import start_cpu_b_service
     from .job_prep import current_job, prepare_mining
+    from .mining_state import try_get_async_manager
 
     try:
-        return prepare_mining(current_job())
+        ready = prepare_mining(current_job())
     except Exception:
         _LOGGER.opt(exception=True).warning(
             "Initial mining preparation failed; serving continues on the FP8 fallback."
         )
         return False
+    manager = try_get_async_manager()
+    if manager is not None:
+        try:
+            start_cpu_b_service(manager)
+        except Exception:
+            _LOGGER.opt(exception=True).warning(
+                "CPU B preparation failed to start; B stays on inline GPU preparation."
+            )
+    return ready
 
 
 def _make_worker_warmup_wrapper(original: object) -> object:

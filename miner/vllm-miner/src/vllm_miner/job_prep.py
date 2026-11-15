@@ -16,18 +16,22 @@ guarantees a launch never reads torn operands -- no background thread,
 reader quiesce, or scratch publication is involved. The cost is that the
 first launch after the ancestor expires or a reorg removes it pays that
 layer's B preparation inline. Other job changes reuse B and refresh key A
-and the threshold as needed.
+and the threshold as needed. On Blackwell, a B side prepared ahead of time
+on the host (``cpu_b``) replaces the inline GPU chain: it is uploaded in
+place on the same stream.
 """
 
 import time
 from dataclasses import replace
 
 import torch
+from miner_base.commitment import MiningConfiguration
 from miner_base.commitment_hash import noise_line_key, noise_seed_b, operand_digest
 from miner_utils import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob
 
 from .config import config as gpu_config
+from .cpu_b import CpuPrepared, cpu_prepared_waiting, discard_cpu_prepared, take_cpu_prepared
 from .mining_config import (
     commitment_keys_for,
     mining_configuration,
@@ -121,39 +125,23 @@ def _publish(state: LayerState, ctx: JobContext) -> bool:
     return True
 
 
-def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
-    """Rewrite this layer's B operands for ``job`` and publish the new context.
+# The B operands a CPU-prepared B side replaces (launches read all but f1,
+# which the GPU chain reads).
+_CPU_UPLOADED = ("f1", "f1_hl", "f2", "e2", "alpha_b", "beta_b", "inv_alpha_b", "b_prime", "b_peel")
 
-    Runs on the caller's current stream. While B's ancestor stays in the state
-    window, reuse B and refresh key A and the lottery threshold. Returns None
-    only when the layer was disabled meanwhile; failures propagate so the caller can isolate it.
-    """
-    assert state.buffers is not None
+
+def _job_context(
+    state: LayerState,
+    job: MiningJob,
+    config: MiningConfiguration,
+    key_a: bytes,
+    key_b: bytes,
+    seed_b: bytes,
+    b_proof: BProofContext,
+) -> JobContext:
     buffers = state.buffers
-    torch.cuda.set_device(state.weight.device)
-    started = time.monotonic()
-
-    device = state.committed_device
-    threshold = _as_bytes_tensor(threshold_bytes_for(job, state.k, state.lottery_n, device=device))
-    with state.lock:
-        current = state.job_ctx
-    if current is not None and job.keeps_ancestor(current.b_proof.ancestor_header):
-        key_a, _ = commitment_keys_for(job, current.b_proof.ancestor_header)
-        if current.key_a != key_a:
-            buffers.key_a_dev.copy_(_as_bytes_tensor(key_a))
-        buffers.threshold_dev.copy_(threshold)
-        ctx = replace(current, job=job, key_a=key_a, target=job.target)
-        if not _publish(state, ctx):
-            return None
-        _LOGGER.debug(f"{state.layer_name}: reused B (target={job.target})")
-        return ctx
-
-    key_a, key_b = commitment_keys_for(job)
-    config = mining_configuration(state.k, state.n, state.experts, device=device)
-    p_b = config.p_b(state.n)
-    seed_b = _prepare_b_on_gpu(state, key_a, key_b, p_b, buffers)
-    buffers.threshold_dev.copy_(threshold)
-    ctx = JobContext(
+    assert buffers is not None
+    return JobContext(
         job=job,
         config=config,
         key_a=key_a,
@@ -171,7 +159,83 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
         b_peel=buffers.b_peel,
         alpha_b=buffers.alpha_b,
         inv_alpha_b=buffers.inv_alpha_b,
-        b_proof=BProofContext(
+        b_proof=b_proof,
+    )
+
+
+def _publish_cpu_prepared(
+    state: LayerState, job: MiningJob, ready: CpuPrepared, threshold: torch.Tensor
+) -> JobContext | None:
+    """Upload a CPU-prepared B side into the layer's steady buffers on the
+    current stream and publish it for ``job``."""
+    buffers = state.buffers
+    assert buffers is not None
+    prepared = ready.prepared
+    key_a, _ = commitment_keys_for(job, prepared.b_proof.ancestor_header)
+    for name in _CPU_UPLOADED:
+        getattr(buffers, name).copy_(getattr(prepared, name), non_blocking=True)
+    buffers.key_a_dev.copy_(_as_bytes_tensor(key_a))
+    buffers.key_b_dev.copy_(_as_bytes_tensor(prepared.key_b))
+    buffers.seed_b_dev.copy_(_as_bytes_tensor(prepared.seed_b))
+    buffers.noise_key_b_dev.copy_(_as_bytes_tensor(noise_line_key(prepared.seed_b)))
+    buffers.threshold_dev.copy_(threshold)
+    uploaded = torch.cuda.Event()
+    uploaded.record()
+    ready.uploaded(uploaded)
+    ctx = _job_context(
+        state, job, prepared.config, key_a, prepared.key_b, prepared.seed_b, prepared.b_proof
+    )
+    if not _publish(state, ctx):
+        return None
+    _LOGGER.debug(f"{state.layer_name}: published CPU-prepared B")
+    return ctx
+
+
+def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
+    """Rewrite this layer's B operands for ``job`` and publish the new context.
+
+    Runs on the caller's current stream. While B's ancestor stays in the state
+    window, reuse B and refresh key A and the lottery threshold. Returns None
+    only when the layer was disabled meanwhile; failures propagate so the caller can isolate it.
+    """
+    assert state.buffers is not None
+    buffers = state.buffers
+    torch.cuda.set_device(state.weight.device)
+    started = time.monotonic()
+
+    device = state.committed_device
+    threshold = _as_bytes_tensor(threshold_bytes_for(job, state.k, state.lottery_n, device=device))
+    with state.lock:
+        current = state.job_ctx
+    ready = take_cpu_prepared(
+        state, job, None if current is None else current.b_proof.ancestor_header
+    )
+    if ready is not None:
+        return _publish_cpu_prepared(state, job, ready, threshold)
+    if current is not None and job.keeps_ancestor(current.b_proof.ancestor_header):
+        key_a, _ = commitment_keys_for(job, current.b_proof.ancestor_header)
+        if current.key_a != key_a:
+            buffers.key_a_dev.copy_(_as_bytes_tensor(key_a))
+        buffers.threshold_dev.copy_(threshold)
+        ctx = replace(current, job=job, key_a=key_a, target=job.target)
+        if not _publish(state, ctx):
+            return None
+        _LOGGER.debug(f"{state.layer_name}: reused B (target={job.target})")
+        return ctx
+
+    key_a, key_b = commitment_keys_for(job)
+    config = mining_configuration(state.k, state.n, state.experts, device=device)
+    p_b = config.p_b(state.n)
+    seed_b = _prepare_b_on_gpu(state, key_a, key_b, p_b, buffers)
+    buffers.threshold_dev.copy_(threshold)
+    ctx = _job_context(
+        state,
+        job,
+        config,
+        key_a,
+        key_b,
+        seed_b,
+        BProofContext(
             key_b=key_b,
             ancestor_header=bytes(job.parent_header),
             seed_b=seed_b,
@@ -214,7 +278,7 @@ def current_context(state: LayerState, job: MiningJob | None) -> JobContext | No
         return None
     with state.lock:
         ctx = state.job_ctx
-    if ctx is not None and ctx.job == job:
+    if ctx is not None and ctx.job == job and not cpu_prepared_waiting(state):
         return ctx
     return prepare_layer(state, job)
 
@@ -229,6 +293,7 @@ def unpublish_contexts() -> None:
     for state in all_states():
         with state.lock:
             state.job_ctx = None
+    discard_cpu_prepared()
 
 
 def prepare_mining(job: MiningJob | None) -> bool:

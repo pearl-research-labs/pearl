@@ -31,6 +31,7 @@ from .mining_config import (
     select_tile,
 )
 from .moe import validate_moe_dims
+from .shared_host import shared_copy
 from .tuning import device_config_name, tuned, with_committed_leaf
 
 _LOGGER = get_logger(__name__)
@@ -384,11 +385,12 @@ def _encode_static_weight(
     w_fp8 = w_fp8_scale = None
     if dense_fallback:
         w_fp8, w_fp8_scale = build_fp8_fallback(weight, weight_scale)
+    # CPU B preparation maps the host planes into its helper process.
     return _StaticLayerEncoding(
         weight=weight,
         weight_scale=weight_scale,
-        weight_cpu=weight.cpu(),
-        weight_scale_cpu=weight_scale.cpu(),
+        weight_cpu=shared_copy(weight),
+        weight_scale_cpu=shared_copy(weight_scale),
         w_fp8=w_fp8,
         w_fp8_scale=w_fp8_scale,
     )
