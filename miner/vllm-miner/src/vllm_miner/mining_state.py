@@ -148,6 +148,7 @@ def _delete_state_locked() -> None:
     """
     global _async_manager, _runtime_poisoned
 
+    from .cpu_b import stop_cpu_b_service
     from .job_prep import unpublish_contexts
 
     manager = _async_manager
@@ -165,6 +166,8 @@ def _delete_state_locked() -> None:
             if not safe:
                 raise RuntimeError(error)
         unpublish_contexts()
+        # Mining work is drained, so no upload reads the CPU B result slots.
+        stop_cpu_b_service()
     except BaseException as exc:
         _runtime_poisoned = True
         failure = exc
