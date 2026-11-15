@@ -159,7 +159,6 @@ def _delete_state_locked() -> None:
         # abandoning proofs, so close proof admission and wake RPCs immediately.
         manager.abort_pending_submissions()
     close_mining_admission()
-    stop_cpu_b_service()
     failure: BaseException | None = None
     try:
         if manager is not None:
@@ -167,6 +166,8 @@ def _delete_state_locked() -> None:
             if not safe:
                 raise RuntimeError(error)
         unpublish_contexts()
+        # Mining work is drained, so no upload reads the CPU B result slots.
+        stop_cpu_b_service()
     except BaseException as exc:
         _runtime_poisoned = True
         failure = exc

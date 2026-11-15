@@ -157,8 +157,10 @@ class ProcessPreparer:
         if threads < 1 or slots < 1:
             raise ValueError("the preparation process needs a thread and a result slot")
         self._states = tuple(states)
+        # The planes the helper maps for good: a reload replaces a layer's.
+        self._planes = tuple((state.weight_cpu, state.weight_scale_cpu) for state in self._states)
         # One e4m3 B' code per plane code.
-        slot_bytes = max(state.weight_cpu.numel() for state in self._states)
+        slot_bytes = max(codes.numel() for codes, _ in self._planes)
         self._slots = [_pinned_shared(slot_bytes) for _ in range(slots)]
         self._pinned = list(self._slots)
         context = mp.get_context("spawn")
@@ -170,8 +172,8 @@ class ProcessPreparer:
             target=_serve,
             args=(
                 [
-                    (_shared(state.weight_cpu), _shared(state.weight_scale_cpu), state.experts)
-                    for state in self._states
+                    (_shared(codes), _shared(scales), state.experts)
+                    for (codes, scales), state in zip(self._planes, self._states, strict=True)
                 ],
                 [_shared(slot) for slot in self._slots],
                 threads,
@@ -197,6 +199,13 @@ class ProcessPreparer:
     def slots(self) -> int:
         return len(self._slots)
 
+    def stale(self) -> bool:
+        """Whether a layer's planes were replaced since the helper mapped them."""
+        return any(
+            state.weight_cpu is not codes or state.weight_scale_cpu is not scales
+            for (codes, scales), state in zip(self._planes, self._states, strict=True)
+        )
+
     def prepare(
         self, layer: int, job: MiningJob, device: Device, slot: int, cancelled: Callable[[], bool]
     ) -> CpuBContext | None:
@@ -218,12 +227,14 @@ class ProcessPreparer:
                 raise PreparationProcessError(error)
             if detached is None:
                 return None
-            state = self._states[layer]
-            detached["b_prime"] = _slot_view(self._slots[slot], state.weight_cpu.shape)
-            return with_b_proof(detached, state.weight_cpu, state.weight_scale_cpu)
+            codes, scales = self._planes[layer]
+            detached["b_prime"] = _slot_view(self._slots[slot], codes.shape)
+            return with_b_proof(detached, codes, scales)
 
-    def close(self) -> None:
-        """Stop the helper after its current preparation, if any."""
+    def close(self, unregister: bool = True) -> None:
+        """Stop the helper after its current preparation, if any. Without
+        ``unregister`` the result slots stay page-locked (an upload may still
+        read them)."""
         if self._process.is_alive():
             self._cancel.set()
             self._tasks.put(None)
@@ -231,7 +242,7 @@ class ProcessPreparer:
         if self._process.is_alive():
             self._process.terminate()
             self._process.join()
-        while self._pinned:
+        while unregister and self._pinned:
             _check_cuda(torch.cuda.cudart().cudaHostUnregister(self._pinned.pop().data_ptr()))
 
 
@@ -355,6 +366,7 @@ class CpuBService:
         self._index = {id(state): layer for layer, state in enumerate(self._states)}
         self._manager = manager
         self._replace_lead = replace_lead
+        self._threads, self._cpus = threads, tuple(cpus)
         self._preparer = ProcessPreparer(self._states, threads=threads, cpus=cpus)
         self._cond = threading.Condition()
         self._job: MiningJob | None = None
@@ -362,6 +374,8 @@ class CpuBService:
         self._ready: dict[int, tuple[CpuBContext, int]] = {}
         self._free = list(range(self._preparer.slots))
         self._pending: dict[int, torch.cuda.Event] = {}
+        # Slots taken by a layer whose upload is not yet enqueued.
+        self._taken: set[int] = set()
         self._pass_started = 0.0
         self._pass_prepared = 0
         self._pass_taken = 0
@@ -376,9 +390,14 @@ class CpuBService:
             self._closed = True
             self._cond.notify_all()
         self._worker.join(_CLOSE_TIMEOUT_S)
-        for event in self._pending.values():
+        with self._cond:
+            drained = self._cond.wait_for(lambda: not self._taken, _CLOSE_TIMEOUT_S)
+            pending = list(self._pending.values())
+        for event in pending:
             event.synchronize()
-        self._preparer.close()
+        if not drained:
+            _LOGGER.warning("CPU B: an upload is still outstanding; its result slots stay pinned")
+        self._preparer.close(unregister=drained)
 
     def waiting(self, state: LayerState) -> bool:
         """Whether a ready B waits for ``state``."""
@@ -410,6 +429,7 @@ class CpuBService:
                 self._free.append(slot)
                 self._cond.notify_all()
                 return None
+            self._taken.add(slot)
             self._pass_taken += 1
             if self._pass_taken == self._pass_prepared and self._next_layer >= len(self._states):
                 _LOGGER.info(
@@ -428,6 +448,7 @@ class CpuBService:
 
     def _release(self, slot: int, event: torch.cuda.Event) -> None:
         with self._cond:
+            self._taken.discard(slot)
             self._pending[slot] = event
             self._free.append(slot)
             self._cond.notify_all()
@@ -468,8 +489,30 @@ class CpuBService:
         depth = b_key_depth(ctx.b_proof.ancestor_header, job)
         return depth is None or (depth > 0 and STATE_WINDOW_DEPTH - depth <= self._replace_lead)
 
+    def _restart_preparer(self) -> None:
+        """Respawn the helper over the layers' current planes (after a reload)."""
+        with self._cond:
+            self._ready.clear()
+            self._cond.wait_for(lambda: self._closed or not self._taken)
+            if self._closed:
+                return
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for event in pending:
+            event.synchronize()
+        self._preparer.close()
+        _LOGGER.info("CPU B: the layers' planes changed; restarting the helper")
+        preparer = ProcessPreparer(self._states, threads=self._threads, cpus=self._cpus)
+        with self._cond:
+            self._preparer = preparer
+            self._free = list(range(preparer.slots))
+            self._next_layer = 0
+            self._cond.notify_all()
+
     def _run(self) -> None:
         while True:
+            if self._preparer.stale():
+                self._restart_preparer()
             with self._cond:
                 self._cond.wait_for(
                     lambda: (
