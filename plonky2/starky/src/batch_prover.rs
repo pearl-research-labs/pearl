@@ -23,7 +23,7 @@ use plonky2::iop::challenger::Challenger;
 use plonky2::plonk::config::GenericConfig;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_ceil, log2_strict, transpose};
+use plonky2::util::{log2_ceil, log2_strict};
 use plonky2_maybe_rayon::*;
 
 use crate::batch_proof::{BatchStarkProof, BatchStarkProofWithPublicInputs};
@@ -37,6 +37,9 @@ use crate::cross_table_lookup::{
 use crate::get_challenges::get_dummy_polys;
 use crate::lookup::{get_grand_product_challenge_set, lookup_helper_columns, LookupCheckVars};
 use crate::proof::StarkOpeningSet;
+
+mod polynomials;
+use polynomials::evaluate_opening;
 
 /// Batched preprocessed data, committed once at setup time in a single
 /// multi-height oracle shared by every table with preprocessed columns.
@@ -287,20 +290,24 @@ where
                 .collect()
         })
         .collect();
-    let sparse_traces: [Vec<PolynomialValues<F>>; N] = core::array::from_fn(|t| {
-        let keep_flags = &keep_flags_per_table[t];
-        trace_poly_values[t]
-            .par_iter()
-            .enumerate()
-            .map(|(c, poly)| {
-                if keep_flags[c] {
-                    poly.clone()
-                } else {
-                    PolynomialValues::zero(1)
-                }
-            })
-            .collect()
-    });
+    let mut sparse_traces: [Vec<PolynomialValues<F>>; N] = core::array::from_fn(|_| Vec::new());
+    sparse_traces
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(t, trace)| {
+            let keep_flags = &keep_flags_per_table[t];
+            *trace = trace_poly_values[t]
+                .par_iter()
+                .enumerate()
+                .map(|(c, poly)| {
+                    if keep_flags[c] {
+                        poly.clone()
+                    } else {
+                        PolynomialValues::zero(1)
+                    }
+                })
+                .collect();
+        });
 
     // Flattens per-table polynomial values into the grouped oracle's
     // canonical order — descending trace degree, ties by table index — and
@@ -327,11 +334,7 @@ where
                 .into_iter()
                 .flat_map(|(_, values)| values)
                 .collect();
-            let coeffs = timed!(
-                timing,
-                "IFFT",
-                values.into_par_iter().map(|values| values.ifft()).collect()
-            );
+            let coeffs = timed!(timing, "IFFT", { polynomials::ifft_columns(values) });
             return Some(BatchFriOracle::from_coeffs_with_digests(
                 coeffs, ranges, rate_bits, cap_height, timing,
             ));
@@ -342,7 +345,7 @@ where
             .flat_map(|(_, values)| values)
             .collect();
         let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; values.len()];
-        Some(BatchFriOracle::from_values(
+        Some(BatchFriOracle::from_values_prover(
             values,
             rate_bits,
             false,
@@ -377,7 +380,7 @@ where
                 continue;
             }
             let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; values.len()];
-            let oracle = BatchFriOracle::from_values(
+            let oracle = BatchFriOracle::from_values_prover(
                 values,
                 rate_bits,
                 false,
@@ -515,8 +518,14 @@ where
                 continue;
             }
             let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; aux.len()];
-            let oracle =
-                BatchFriOracle::from_values(aux, rate_bits, false, cap_height, timing, &fft_tables);
+            let oracle = BatchFriOracle::from_values_prover(
+                aux,
+                rate_bits,
+                false,
+                cap_height,
+                timing,
+                &fft_tables,
+            );
             if let Some(caps) = &mut auxiliary_polys_caps {
                 caps.push(oracle.batch_merkle_tree.cap.clone());
             }
@@ -685,7 +694,7 @@ where
                 continue;
             }
             let fft_tables: Vec<Option<&FftRootTable<F>>> = vec![None; coeffs.len()];
-            let oracle = BatchFriOracle::from_coeffs(
+            let oracle = BatchFriOracle::from_coeffs_prover(
                 coeffs,
                 rate_bits,
                 false,
@@ -726,7 +735,7 @@ where
                     coeffs, ranges, rate_bits, cap_height, timing,
                 )
             } else {
-                BatchFriOracle::from_coeffs(
+                BatchFriOracle::from_coeffs_prover(
                     coeffs,
                     rate_bits,
                     false,
@@ -902,6 +911,13 @@ where
         return Ok(None);
     }
 
+    // Scalar packing can borrow contiguous oracle rows directly.
+    let borrow_trace = P::WIDTH == 1
+        && layout.prep_columns[t].is_empty()
+        && layout.online_columns[t]
+            .iter()
+            .copied()
+            .eq(0..layout.num_columns[t]);
     let degree_bits = layout.degree_bits[t];
     let degree = 1 << degree_bits;
     let rate_bits = config.fri_config.rate_bits;
@@ -917,9 +933,9 @@ where
 
     // Evaluation of the first Lagrange polynomial on the LDE domain.
     let lagrange_first = PolynomialValues::selector(degree, 0).lde_onto_coset(quotient_degree_bits);
-    // Evaluation of the last Lagrange polynomial on the LDE domain.
-    let lagrange_last =
-        PolynomialValues::selector(degree, degree - 1).lde_onto_coset(quotient_degree_bits);
+    // L_last(x) = L_first(g*x): shift by one trace step on the coset.
+    let mut lagrange_last = lagrange_first.clone();
+    lagrange_last.values.rotate_left(next_step);
 
     let z_h_on_coset = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
 
@@ -974,6 +990,9 @@ where
     // every evaluation point; only the helper-column values and the Z
     // evaluations vary. Each rayon job takes one cloned template
     // (`map_init`) and refills only those point-dependent fields per batch.
+    // Combine each CTL tuple once, instead of at every evaluation point.
+    let combined_columns =
+        ctl_data.map(|data| polynomials::combine_ctl_columns(data, public_inputs, num_columns));
     let ctl_meta: Option<Vec<CtlCheckVars<F, F, P, 1>>> = ctl_data.map(|data| {
         let mut vars = Vec::with_capacity(data.zs_columns.len());
         for (i, zs_columns) in data.zs_columns.iter().enumerate() {
@@ -983,7 +1002,10 @@ where
                 local_z: P::ZEROS,
                 next_z: P::ZEROS,
                 challenges: zs_columns.challenge,
-                columns: zs_columns.columns.clone(),
+                columns: combined_columns.as_ref().unwrap()[i]
+                    .iter()
+                    .map(|c| c.as_slice())
+                    .collect(),
                 filter: zs_columns.filter.clone(),
             });
         }
@@ -1031,9 +1053,9 @@ where
     let quotient_values = (0..size)
         .into_par_iter()
         .step_by(P::WIDTH)
-        // Coarse jobs bound how often `map_init` clones the per-job CTL
-        // template (and keep the rayon scheduling overhead negligible).
-        .with_min_len(1024)
+        // Bound CTL template cloning while leaving enough jobs to balance
+        // tables with different constraint-evaluation costs.
+        .with_min_len(128)
         .map_init(make_scratch, |scratch, i_start| {
             let i_next_start = (i_start + next_step) % size;
             let i_range = i_start..i_start + P::WIDTH;
@@ -1050,35 +1072,30 @@ where
                 lagrange_basis_last,
             );
 
-            // Fetch the trace rows into the reusable buffers (no per-point
-            // allocation).
-            let ((local_buf, next_buf, online_buf, prep_buf), _) = (&mut scratch.2, &mut scratch.3);
-            get_trace_values_packed_into(i_start, local_buf, online_buf, prep_buf);
-            get_trace_values_packed_into(i_next_start, next_buf, online_buf, prep_buf);
-            let local_values: &mut [P] = local_buf;
-            let next_values: &mut [P] = next_buf;
+            let (local_values, next_values): (&[P], &[P]) = if borrow_trace {
+                (
+                    polynomials::lde_row(trace_oracle, i_start, step, &mut (scratch.2).0),
+                    polynomials::lde_row(trace_oracle, i_next_start, step, &mut (scratch.2).1),
+                )
+            } else {
+                let ((local_buf, next_buf, online_buf, prep_buf), _) =
+                    (&mut scratch.2, &mut scratch.3);
+                get_trace_values_packed_into(i_start, local_buf, online_buf, prep_buf);
+                get_trace_values_packed_into(i_next_start, next_buf, online_buf, prep_buf);
+                (&local_buf[..], &next_buf[..])
+            };
 
             // Fetch the auxiliary rows into their reusable buffers.
-            let (aux_local, aux_next): (&mut [P], &mut [P]) = if num_aux > 0 {
+            let (aux_local, aux_next): (&[P], &[P]) = if num_aux > 0 {
                 let (aux_oracle, degree_index, leaf_offset) =
                     aux_oracle.expect("Auxiliary polys without an auxiliary oracle");
-                aux_oracle.get_lde_values_packed_into(
-                    degree_index,
-                    i_start,
-                    step,
-                    leaf_offset,
-                    &mut (scratch.3).0,
-                );
-                aux_oracle.get_lde_values_packed_into(
-                    degree_index,
-                    i_next_start,
-                    step,
-                    leaf_offset,
-                    &mut (scratch.3).1,
-                );
-                (&mut (scratch.3).0, &mut (scratch.3).1)
+                let position = (aux_oracle, degree_index, leaf_offset);
+                (
+                    polynomials::lde_row(position, i_start, step, &mut (scratch.3).0),
+                    polynomials::lde_row(position, i_next_start, step, &mut (scratch.3).1),
+                )
             } else {
-                (&mut [], &mut [])
+                (&[], &[])
             };
 
             // Refill the worker-local CTL template's point-dependent fields
@@ -1128,23 +1145,23 @@ where
                 *eval *= denominator_inv;
             }
 
-            let num_challenges = alphas.len();
-            (0..P::WIDTH)
-                .map(move |i| {
-                    (0..num_challenges)
-                        .map(|j| constraints_evals[j].as_slice()[i])
-                        .collect()
-                })
-                .collect::<Vec<_>>()
+            constraints_evals
         })
-        .flat_map_iter(|rows| rows)
+        // Release each point buffer while collecting one flat evaluation array.
+        .flat_map_iter(|point| point)
         .collect::<Vec<_>>();
 
     Ok(Some(
-        transpose(&quotient_values)
+        (0..alphas.len())
             .into_par_iter()
-            .map(PolynomialValues::new)
-            .map(|values| values.coset_ifft(F::coset_shift()))
+            .map(|challenge| {
+                // Expand packed evaluations directly into each challenge's column.
+                let values = quotient_values
+                    .chunks_exact(alphas.len())
+                    .flat_map(|point| point[challenge].as_slice().iter().copied())
+                    .collect();
+                PolynomialValues::new(values).coset_ifft(F::coset_shift())
+            })
             .collect(),
     ))
 }
@@ -1183,11 +1200,7 @@ where
      -> Vec<F::Extension> {
         oracle.polynomials[start + range.start..start + range.end]
             .par_iter()
-            .map(|p| {
-                p.coeffs.iter().rev().fold(F::Extension::ZERO, |acc, &c| {
-                    acc * z + F::Extension::from_basefield(c)
-                })
-            })
+            .map(|p| evaluate_opening::<F, D>(&p.coeffs, z))
             .collect()
     };
 

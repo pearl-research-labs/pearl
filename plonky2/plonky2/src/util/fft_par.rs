@@ -28,6 +28,9 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 use plonky2_util::log2_strict;
 
+mod coset;
+pub(crate) use coset::{coset_ifft_par, coset_lde_par};
+
 /// Transforms below this size run faster serially; the four-step's extra
 /// passes and task overheads only pay off on the big buffers.
 const MIN_LG: usize = 18;
@@ -37,10 +40,16 @@ const MIN_LG: usize = 18;
 /// Below the size threshold this is exactly `fft`; above it the transform
 /// decomposes into $\sqrt{N}$-sized sub-FFTs that share the rayon pool.
 pub fn fft_par<F: Field + Send + Sync>(coeffs: PolynomialCoeffs<F>) -> PolynomialValues<F> {
-    let PolynomialCoeffs { coeffs } = coeffs;
     let n = coeffs.len();
+    fft_par_padded(coeffs.coeffs, n)
+}
+
+/// The omitted suffix is zero; both the prefix and output lengths are powers of two.
+fn fft_par_padded<F: Field + Send + Sync>(mut coeffs: Vec<F>, n: usize) -> PolynomialValues<F> {
     if n < (1 << MIN_LG) {
-        return fft_with_options(PolynomialCoeffs::new(coeffs), None, None);
+        let zero_factor = log2_strict(n) - log2_strict(coeffs.len());
+        coeffs.resize(n, F::ZERO);
+        return fft_with_options(PolynomialCoeffs::new(coeffs), Some(zero_factor), None);
     }
 
     let lg_n = log2_strict(n);
@@ -58,30 +67,48 @@ pub fn fft_par<F: Field + Send + Sync>(coeffs: PolynomialCoeffs<F>) -> Polynomia
 
     // Step 1: A[n2][k1] = DFT_{N1} over n1 of the stride-N2 residue class n2.
     // Gather each class first so the sub-FFTs run on contiguous rows.
-    let a: Vec<Vec<F>> = (0..n2)
+    let a: Vec<Vec<F>> = (0..n2.min(coeffs.len()))
         .into_par_iter()
         .map(|n2_idx| {
-            let class: Vec<F> = (0..n1).map(|n1_idx| coeffs[n2_idx + n1_idx * n2]).collect();
-            fft_with_options(PolynomialCoeffs::new(class), None, Some(&table1)).values
+            let mut class: Vec<F> = (n2_idx..coeffs.len())
+                .step_by(n2)
+                .map(|i| coeffs[i])
+                .collect();
+            let zero_factor = lg_n1 - log2_strict(class.len());
+            class.resize(n1, F::ZERO);
+            fft_with_options(
+                PolynomialCoeffs::new(class),
+                Some(zero_factor),
+                Some(&table1),
+            )
+            .values
         })
         .collect();
 
     // Steps 2+3: B[k1][k2] = DFT_{N2} over n2 of
     //   A[n2][k1] * omega_N^{n2 k1},
     // the twiddle folded into the column gather.
+    let zero_factor = lg_n2 - log2_strict(a.len());
     let b: Vec<Vec<F>> = (0..n1)
         .into_par_iter()
         .map(|k1| {
             let step = omega.exp_u64(k1 as u64); // omega_N^{k1}
             let mut w = F::ONE;
-            let column: Vec<F> = (0..n2)
-                .map(|n2_idx| {
-                    let v = a[n2_idx][k1] * w;
+            let mut column: Vec<F> = a
+                .iter()
+                .map(|row| {
+                    let v = row[k1] * w;
                     w *= step;
                     v
                 })
                 .collect();
-            fft_with_options(PolynomialCoeffs::new(column), None, Some(&table2)).values
+            column.resize(n2, F::ZERO);
+            fft_with_options(
+                PolynomialCoeffs::new(column),
+                Some(zero_factor),
+                Some(&table2),
+            )
+            .values
         })
         .collect();
 
@@ -96,25 +123,12 @@ pub fn fft_par<F: Field + Send + Sync>(coeffs: PolynomialCoeffs<F>) -> Polynomia
     PolynomialValues::new(out)
 }
 
-/// `fft_par` followed by the coset pointwise scaling: the evaluation of
-/// `coeffs` on the coset `shift * H`, in canonical coset order.
+/// Evaluates `coeffs` on `shift * H`, in natural order, with `|H| = coeffs.len()`.
 pub fn coset_fft_par<F: Field + Send + Sync>(
     coeffs: &PolynomialCoeffs<F>,
     shift: F,
 ) -> PolynomialValues<F> {
-    // Scale coeffs[i] *= shift^i in parallel, then transform.
-    let mut scaled = vec![F::ZERO; coeffs.len()];
-    scaled
-        .par_chunks_mut(1 << 12)
-        .enumerate()
-        .for_each(|(ci, chunk)| {
-            let mut w = shift.exp_u64((ci << 12) as u64);
-            for (dst, &src) in chunk.iter_mut().zip(&coeffs.coeffs[ci << 12..]) {
-                *dst = src * w;
-                w *= shift;
-            }
-        });
-    fft_par(PolynomialCoeffs::new(scaled))
+    coset_lde_par(&coeffs.coeffs, shift, 0)
 }
 
 #[cfg(test)]

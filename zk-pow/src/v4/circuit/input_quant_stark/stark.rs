@@ -594,7 +594,7 @@ impl InputQuantProgram {
         for col in cols.iter() {
             assert_eq!(col.len(), num_rows, "direct fill column length");
         }
-        const TILE: usize = 4096;
+        const TILE: usize = 1024;
         let tables = self.schedule_tables::<F>();
         // Tile workers share raw destination pointers and write disjoint rows.
         let writer = super::super::utils::witness::DisjointColumnWriter::<F, WIDTH>::new(cols);
