@@ -327,7 +327,7 @@ class _NoisyQuantSm100(_NoisyQuant):
             sStrip[thread_idx] = _strip_state(alpha, l2)
             mAlpha[global_row] = alpha.to(bf16)
             mBeta[global_row] = beta.to(bf16)
-        elif cutlass.const_expr(self.consumer_e1):
+        elif cutlass.const_expr(self.consumer_e1):  # noqa: SIM102
             # E1 stays on threads 64..127 (warps 2-3).
             if thread_idx >= 64 and thread_idx < 128:
                 self._generate_e1_rows(
