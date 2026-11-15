@@ -183,8 +183,8 @@ def _smem_bytes(k: int, config: NoisyQuantConfig, arch: Arch) -> int:
         + (2 + geometry.extra_mbarriers_per_out_stage) * out_stages
         + geometry.extra_mbarriers
     )
-    # sAlpha/sBeta (f32 each), sE1 (f16 x rows x R).
-    scalar_bytes = 2 * _F32_BYTES * rows + 2 * rows * R
+    # sAlpha/sBeta/sStrip (4 bytes each), sE1 (f16 x rows x R).
+    scalar_bytes = 3 * _F32_BYTES * rows + 2 * rows * R
     aprime_rows = geometry.aprime_stage_rows or rows
     e1_rows = geometry.e1_operand_rows or rows
     noise_staging_bytes = (

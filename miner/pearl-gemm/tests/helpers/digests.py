@@ -2,8 +2,8 @@
 
 ``tests/fixtures/reference_digests.json`` holds SHA-256 digests of the noise
 lines and the noisy-quantized A/B operands for the fixed inputs these tests
-build, recorded from the former bit-exact CPU reference implementation. The
-inputs are drawn on the
+build, recorded from the former bit-exact CPU reference implementation (the
+A'/B' codes from the verifier's own quantizer). The inputs are drawn on the
 host so they reproduce exactly; any drift in a kernel's bits changes its
 digest. Each case also stores ``peel_tol``, the relative-error bound for the
 peel's matmul half (twice the reference's own deviation from the fp64-exact

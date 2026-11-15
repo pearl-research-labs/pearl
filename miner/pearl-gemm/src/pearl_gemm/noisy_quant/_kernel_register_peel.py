@@ -42,7 +42,7 @@ from ._kernel_common import (
     _noise_n_permutation,
     _NoisyQuant,
 )
-from ._quantization_ops import _e4m3x2_to_f16x2, _f32x2_to_bf16x2
+from ._quantization_ops import _e4m3x2_to_f16x2, _strip_state
 
 
 class _NoisyQuantRegisterPeel(_NoisyQuant):
@@ -52,7 +52,7 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
     A' staging, and the register-direct ``A' @ F2^T`` peel), the TMA
     producer warp, and the E1 / A'-store output warp. Subclasses supply the
     noise MMA through ``_make_noise_mma``, ``_make_noise_operands``,
-    ``_load_e1_operand``, ``_stage_noise_tile`` and ``_noise_words``, and the
+    ``_load_e1_operand``, ``_stage_noise_tile`` and ``_noise_values``, and the
     E1 operand and noise-staging shared memory through
     ``_e1_operand_layout``, ``_noise_staging_storage`` and
     ``_noise_smem_views``.
@@ -118,8 +118,8 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
         """Consume one F1 factor stage and release it."""
         raise NotImplementedError
 
-    def _noise_words(self, noise, row_half, first_fragment_row, noise_words):
-        """Pack one 16-row half's bf16x2 noise pairs into ``noise_words``."""
+    def _noise_values(self, noise, row_half, first_fragment_row, noise_values):
+        """One 16-row half's fp32 noise pairs into ``noise_values``."""
         raise NotImplementedError
 
     # -- device helpers -------------------------------------------------------
@@ -302,7 +302,7 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
         mPeel, mStat = globals_.peel, globals_.stats
         sAq, sAs = shared.a_codes, shared.a_scales
         sF1, sF2, sAp = shared.f1, shared.f2, shared.a_prime
-        sE1, sAlpha, sBeta = shared.e1, shared.alpha, shared.beta
+        sE1, sAlpha, sBeta, sStrip = shared.e1, shared.alpha, shared.beta, shared.strip
         thread_idx, lane = coords.thread, coords.lane
         row_block, tile_count = coords.row_block, coords.tile_count
         row_halves = self.rows // HALF_TILE_ROWS
@@ -321,9 +321,7 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
         fragment_coords = tiled_mma_n.get_slice(thread_idx).partition_C(
             cute.make_identity_tensor((16, self.bk))
         )
-        a_fragment = cute.make_rmem_tensor(fragment_coords.shape, bf16)
-        a_words = cute.recast_tensor(a_fragment, cutlass.Uint32)
-        noise_words = cute.make_rmem_tensor(4 * self.bk // self.n_group, cutlass.Uint32)
+        noise_values = cute.make_rmem_tensor(8 * self.bk // self.n_group, Float32)
 
         consumer_warp = cute.arch.make_warp_uniform(thread_idx // 32)
         scale_group_base = 2 * consumer_warp + ((lane >> 1) & 1)
@@ -364,9 +362,10 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
 
         if thread_idx < self.rows:
             global_row = row_block * self.rows + thread_idx
-            alpha, beta = self._combine_row_stats(mStat, global_row, tile_count * self.bk)
+            alpha, beta, l2 = self._combine_row_stats(mStat, global_row, tile_count * self.bk)
             sAlpha[thread_idx] = alpha
             sBeta[thread_idx] = beta
+            sStrip[thread_idx] = _strip_state(alpha, l2)
             mAlpha[global_row] = alpha.to(bf16)
             mBeta[global_row] = beta.to(bf16)
         elif cutlass.const_expr(self.consumer_e1):
@@ -387,24 +386,10 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
             number_of_threads=self.consumer_threads,
         )
 
-        alpha_word_pairs = []
-        beta_word_pairs = []
+        row_scales = []
         for row_half in cutlass.range_constexpr(row_halves):
-            alpha_row_0 = sAlpha[row_half * 16 + first_fragment_row]
-            alpha_row_1 = sAlpha[row_half * 16 + first_fragment_row + 8]
-            beta_row_0 = sBeta[row_half * 16 + first_fragment_row]
-            beta_row_1 = sBeta[row_half * 16 + first_fragment_row + 8]
-            alpha_word_pairs.append(
-                (
-                    _f32x2_to_bf16x2(alpha_row_0, alpha_row_0),
-                    _f32x2_to_bf16x2(alpha_row_1, alpha_row_1),
-                )
-            )
-            beta_word_pairs.append(
-                (
-                    _f32x2_to_bf16x2(beta_row_0, beta_row_0),
-                    _f32x2_to_bf16x2(beta_row_1, beta_row_1),
-                )
+            row_scales.append(
+                self._row_scales(sAlpha, sBeta, sStrip, row_half * 16 + first_fragment_row)
             )
             peel_accumulators[row_half].fill(0.0)
 
@@ -450,21 +435,16 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
                     shared_code_partition,
                     code_words,
                 )
-                self._noise_words(noise, row_half, first_fragment_row, noise_words)
-                self._open_a_fragment(
+                self._noise_values(noise, row_half, first_fragment_row, noise_values)
+                self._quantize_fragment(
+                    noise_values,
+                    code_words,
                     sAs,
                     stage,
                     scale_group_base,
                     first_fragment_row,
-                    code_words,
-                    a_words,
-                )
-                self._quantize_fragment(
-                    noise_words,
-                    a_words,
                     quantized_word_fragments[row_half],
-                    alpha_word_pairs[row_half],
-                    beta_word_pairs[row_half],
+                    row_scales[row_half],
                 )
                 if cutlass.const_expr(self.a_tile_pipe):
                     if cutlass.const_expr(row_half == row_halves - 1):
@@ -644,6 +624,7 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
             output_mbar: cute.struct.MemRange[cutlass.Int64, out_stages * 2]
             sAlpha: cute.struct.MemRange[Float32, 16 * row_halves]
             sBeta: cute.struct.MemRange[Float32, 16 * row_halves]
+            sStrip: cute.struct.MemRange[cutlass.Uint32, 16 * row_halves]
             # The publishing warps' peel partials (float4 groups); warp 0 combines.
             sPeelPartials: cute.struct.Align[
                 cute.struct.MemRange[Float32, _PEEL_PARTIAL_WARPS * 32 * _PEEL_VALUES_PER_THREAD],
@@ -798,6 +779,7 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
         sE1 = storage.sE1.get_tensor(cute.make_layout((16, R, row_halves), stride=(R, 1, 16 * R)))
         sAlpha = storage.sAlpha.get_tensor(cute.make_layout(self.rows))
         sBeta = storage.sBeta.get_tensor(cute.make_layout(self.rows))
+        sStrip = storage.sStrip.get_tensor(cute.make_layout(self.rows))
         shared_peel_partials = storage.sPeelPartials.get_tensor(
             cute.make_layout(
                 (_C_FRAGMENT_VALUES, 32, _PEEL_FRAGMENT_GROUPS, _PEEL_PARTIAL_WARPS),
@@ -888,6 +870,7 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
                     sE1,
                     sAlpha,
                     sBeta,
+                    sStrip,
                 ),
                 shared_peel_partials,
                 mE1,

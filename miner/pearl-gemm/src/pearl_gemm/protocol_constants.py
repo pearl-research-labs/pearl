@@ -13,6 +13,18 @@ QUANT_MAX = 448.0  # largest finite e4m3 magnitude (the quant grid ceiling)
 DELTA_SM90 = 1.0
 DELTA_SM100 = 0.5
 L2_ROUNDED_BITS = 2  # low explicit BF16 mantissa bits cleared from l2
+# Blackwell-committed strip rewrite: after the e4m3 cast, a code whose magnitude
+# is below e4m3(g * alpha * l2) takes the row's safe exponent
+# floor(log2(alpha * l2)) - STRIP_EXP_OFFSET (mantissa LSB forced to 1),
+# when the coin of its aligned STRIP_COIN_BLOCK columns passes: bits
+# 14..8 of the group's first FP32 mix below STRIP_COIN_THRESHOLD.
+STRIP_G = 0.08
+STRIP_G_SMALL_RMS = 0.1  # g for rows with alpha * l2 < STRIP_SMALL_RMS
+STRIP_SMALL_RMS = 8.0
+STRIP_EXP_OFFSET = 9
+STRIP_COIN_BLOCK = 4
+STRIP_COIN_SHIFT = 8
+STRIP_COIN_THRESHOLD = 112
 
 # pre_quant
 BLOCK_SCALE_GROUP = 8  # int8 codes sharing one BF16 block scale along k
