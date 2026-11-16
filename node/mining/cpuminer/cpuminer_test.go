@@ -8,6 +8,7 @@ package cpuminer
 
 import (
 	"math"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -123,7 +124,25 @@ func TestGenerateNBlocks(t *testing.T) {
 	}
 }
 
-// TestCPUMinerStop checks that Stop ends both mining modes and leaves the miner ready for a new run.
+// gatedSolver stands in for a slow V4 proof: its first call blocks until release is closed.
+type gatedSolver struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *gatedSolver) solve(header, parent *wire.BlockHeader, params *chaincfg.Params,
+	height int32) (*wire.CertificateV4, error) {
+
+	if s.calls.Add(1) == 1 {
+		close(s.entered)
+		<-s.release
+	}
+	return blockchain.SolveBlock(header, parent, params, height)
+}
+
+// TestCPUMinerStop checks that Stop ends both mining modes once the proof in progress finishes, without running the
+// proofs of workers queued behind it, and leaves the miner ready for a new run.
 func TestCPUMinerStop(t *testing.T) {
 	params := chaincfg.SimNetParams
 	for _, test := range []struct {
@@ -152,12 +171,31 @@ func TestCPUMinerStop(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			miner, chain := newTestMiner(t, &params)
+			solver := &gatedSolver{entered: make(chan struct{}), release: make(chan struct{})}
+			miner.solve = solver.solve
+			miner.SetNumWorkers(4)
 
 			errc := test.start(miner)
-			require.Eventually(t, func() bool { return chain.BestSnapshot().Height > 0 },
-				time.Minute, 10*time.Millisecond)
-			miner.Stop()
+			<-solver.entered
+			// Queued workers cannot be observed, so give them time to line up behind the proof in progress.
+			time.Sleep(100 * time.Millisecond)
+			miner.Lock()
+			quit := miner.quit
+			miner.Unlock()
+
+			stopped := make(chan struct{})
+			go func() {
+				miner.Stop()
+				close(stopped)
+			}()
+			<-quit
+			// The controller relays quit to each worker's own channel; let that happen before the proof finishes.
+			time.Sleep(100 * time.Millisecond)
+			close(solver.release)
+			<-stopped
+
 			require.False(t, miner.IsMining())
+			require.Equal(t, int32(1), solver.calls.Load(), "only the proof in progress may run after Stop")
 			if errc != nil {
 				require.ErrorIs(t, <-errc, errMinerStopped)
 			}
@@ -168,4 +206,27 @@ func TestCPUMinerStop(t *testing.T) {
 			require.Equal(t, height+1, chain.BestSnapshot().Height)
 		})
 	}
+}
+
+// TestCPUMinerQueuedWorkerSeesNewTip checks that a worker queued behind another's proof never proves against the tip
+// that the other worker's block is about to replace.
+func TestCPUMinerQueuedWorkerSeesNewTip(t *testing.T) {
+	params := chaincfg.SimNetParams
+	miner, chain := newTestMiner(t, &params)
+	var supersededProofs atomic.Int32
+	miner.solve = func(header, parent *wire.BlockHeader, p *chaincfg.Params,
+		height int32) (*wire.CertificateV4, error) {
+
+		time.Sleep(10 * time.Millisecond)
+		if header.PrevBlock != chain.BestSnapshot().Hash {
+			supersededProofs.Add(1)
+		}
+		return blockchain.SolveBlock(header, parent, p, height)
+	}
+	miner.SetNumWorkers(4)
+
+	miner.Start()
+	require.Eventually(t, func() bool { return chain.BestSnapshot().Height >= 5 }, time.Minute, 10*time.Millisecond)
+	miner.Stop()
+	require.Zero(t, supersededProofs.Load(), "proofs whose tip changed while they ran")
 }
