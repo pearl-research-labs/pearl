@@ -721,7 +721,10 @@ func (g *testGenerator) padBlockToVsize(b *wire.MsgBlock, targetVsize int) {
 	updateWitnessCommitment(b)
 
 	b.BlockHeader().MerkleRoot = calcMerkleRoot(b.Transactions)
-	cert, _ := blockchain.SolveBlock(b.BlockHeader(), g.tip.BlockHeader(), g.params, g.tipHeight+1)
+	cert, err := blockchain.SolveBlock(b.BlockHeader(), g.tip.BlockHeader(), g.params, g.tipHeight+1)
+	if err != nil {
+		panic(fmt.Sprintf("failed to solve block: %v", err))
+	}
 	b.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: cert}
 }
 

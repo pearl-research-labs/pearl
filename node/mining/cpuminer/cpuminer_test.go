@@ -71,11 +71,9 @@ func newTestMiner(t *testing.T, params *chaincfg.Params) (*CPUMiner, *blockchain
 }
 
 func TestGenerateNBlocks(t *testing.T) {
-	// Height 1 is mined on the pre-fork (V3) path, height 2 with a V4 proof.
-	fp8AtTwo := chaincfg.RegressionNetParams
-	fp8AtTwo.Fp8ForkHeight = 2
+	regTest := chaincfg.RegressionNetParams
 
-	// V1 is required at every height, and this build cannot mine it.
+	// Every height requires V1, and only V4 certificates can be mined.
 	noForks := chaincfg.RegressionNetParams
 	noForks.MoEForkHeight = 0
 	noForks.RankPenaltyForkHeight = 0
@@ -83,23 +81,21 @@ func TestGenerateNBlocks(t *testing.T) {
 	noForks.Fp8ForkHeight = 0
 
 	for _, test := range []struct {
-		name         string
-		params       *chaincfg.Params
-		numBlocks    uint32
-		wantVersions []wire.CertificateVersion
-		wantErr      string
+		name      string
+		params    *chaincfg.Params
+		numBlocks uint32
+		wantErr   string
 	}{
 		{
-			name:         "regtest crosses the fp8 fork",
-			params:       &fp8AtTwo,
-			numBlocks:    2,
-			wantVersions: []wire.CertificateVersion{wire.CertificateVersionV3, wire.CertificateVersionV4},
+			name:      "regtest mines V4 blocks",
+			params:    &regTest,
+			numBlocks: 2,
 		},
 		{
 			name:      "certificate cannot be produced",
 			params:    &noForks,
 			numBlocks: 1,
-			wantErr:   "V1 mining not supported",
+			wantErr:   "requires certificate version 1",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -113,13 +109,13 @@ func TestGenerateNBlocks(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			require.Len(t, hashes, len(test.wantVersions))
+			require.Len(t, hashes, int(test.numBlocks))
 			require.Equal(t, int32(len(hashes)), chain.BestSnapshot().Height)
 			for i, hash := range hashes {
 				block, err := chain.BlockByHeight(int32(i + 1))
 				require.NoError(t, err)
 				require.Equal(t, hash, block.Hash())
-				require.Equal(t, test.wantVersions[i], block.MsgBlock().BlockCertificate().Version())
+				require.Equal(t, wire.CertificateVersionV4, block.MsgBlock().BlockCertificate().Version())
 				require.NoError(t, blockchain.CheckProofOfWork(block, test.params.PowLimit),
 					"the stored certificate must still verify")
 			}

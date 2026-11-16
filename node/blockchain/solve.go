@@ -15,45 +15,16 @@ import (
 // cpuMinerV4Device selects the emulated device for zkpow.MineV4 (0 = H100).
 const cpuMinerV4Device = 0
 
-// SolveBlock mines a block certificate for the given header at the given height,
-// producing the certificate version consensus requires at that height. parent is
-// the header the block extends; only V4 mining reads it, keying the proof to it.
-//
-// On SimNet it returns a lightweight dummy certificate of the required version
-// (no actual mining). For real mining it modifies header.ProofCommitment to
-// match the mined certificate. V4 mining is a blocking CPU search at
-// header.Bits, so it is only practical at easy targets such as regtest's.
-func SolveBlock(header, parent *wire.BlockHeader, params *chaincfg.Params,
-	height int32) (wire.BlockCertificate, error) {
-
-	version := params.RequiredCertVersion(height)
-
+// SolveBlock mines the V4 certificate for header, keyed to its parent header, and sets header.ProofCommitment to match.
+// It fails for heights before the FP8 fork, since only V4 certificates can be mined. On SimNet it returns a dummy
+// certificate instead, as SimNet skips proof verification. Mining is a blocking CPU search at header.Bits, so it is
+// only practical at easy targets such as regtest's.
+func SolveBlock(header, parent *wire.BlockHeader, params *chaincfg.Params, height int32) (*wire.CertificateV4, error) {
+	if version := params.RequiredCertVersion(height); version != wire.CertificateVersionV4 {
+		return nil, fmt.Errorf("height %d requires certificate version %d, but only V4 can be mined", height, version)
+	}
 	if params.Net == wire.SimNet {
-		switch version {
-		case wire.CertificateVersionV4:
-			return &wire.CertificateV4{ProofData: []byte{0x00}}, nil
-		case wire.CertificateVersionV3:
-			cert := &wire.CertificateV3{}
-			cert.ProofData = []byte{0x00}
-			return cert, nil
-		case wire.CertificateVersionV2:
-			return &wire.CertificateV2{ProofData: []byte{0x00}}, nil
-		default:
-			return &wire.CertificateV1{ProofData: []byte{0x00}}, nil
-		}
+		return &wire.CertificateV4{ProofData: []byte{0x00}}, nil
 	}
-
-	switch version {
-	case wire.CertificateVersionV1:
-		return nil, fmt.Errorf("V1 mining not supported in this build; use a pre-fork binary")
-	case wire.CertificateVersionV4:
-		// Returning MineV4 directly would wrap a nil *CertificateV4 in a non-nil interface.
-		cert, err := zkpow.MineV4(header, parent, cpuMinerV4Device)
-		if err != nil {
-			return nil, err
-		}
-		return cert, nil
-	default:
-		return zkpow.Mine(header, version)
-	}
+	return zkpow.MineV4(header, parent, cpuMinerV4Device)
 }

@@ -148,9 +148,8 @@ func (m *CPUMiner) submitBlock(block *btcutil.Block) error {
 	return nil
 }
 
-// solveBlock attaches a certificate of the version required at the template's
-// height to the template's block.  It returns false without an error when the
-// block is stale (i.e. a new best block has appeared).
+// solveBlock attaches a V4 certificate to the template's block.  It returns false without an error when the block is
+// stale (i.e. a new best block has appeared).
 func (m *CPUMiner) solveBlock(template *mining.BlockTemplate) (bool, error) {
 	msgBlock := template.Block
 

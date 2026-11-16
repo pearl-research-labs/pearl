@@ -297,6 +297,29 @@ func calcMerkleRoot(txns []*wire.MsgTx) chainhash.Hash {
 	return CalcMerkleRoot(utilTxns, false)
 }
 
+// testCertificate returns the certificate for a test block at height. SimNet fork tests build blocks on both sides of a
+// cutover, but SolveBlock only produces V4, so pre-fork SimNet heights get a dummy of the version consensus requires.
+func testCertificate(header, parent *wire.BlockHeader, params *chaincfg.Params,
+	height int32) (wire.BlockCertificate, error) {
+
+	if params.Net == wire.SimNet {
+		dummyProof := []byte{0x00}
+		switch params.RequiredCertVersion(height) {
+		case wire.CertificateVersionV1:
+			return &wire.CertificateV1{ProofData: dummyProof}, nil
+		case wire.CertificateVersionV2:
+			return &wire.CertificateV2{ProofData: dummyProof}, nil
+		case wire.CertificateVersionV3:
+			return &wire.CertificateV3{CertificateV2: wire.CertificateV2{ProofData: dummyProof}}, nil
+		}
+	}
+	cert, err := SolveBlock(header, parent, params, height)
+	if err != nil {
+		return nil, err
+	}
+	return cert, nil
+}
+
 // newBlock creates a block to the blockchain that succeeds the previous block.
 // The blocks spends all the provided spendable outputs.  The new block and the
 // newly spendable outputs created in the block are returned.
@@ -349,7 +372,7 @@ func newBlock(chain *BlockChain, prev *btcutil.Block,
 		Bits:       chain.chainParams.PowLimitBits,
 		Timestamp:  ts,
 	}
-	cert, err := SolveBlock(&header, prev.MsgBlock().BlockHeader(), chain.chainParams, blockHeight)
+	cert, err := testCertificate(&header, prev.MsgBlock().BlockHeader(), chain.chainParams, blockHeight)
 	if err != nil {
 		return nil, nil, err
 	}

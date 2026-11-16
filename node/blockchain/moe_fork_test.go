@@ -147,24 +147,6 @@ func TestMoEForkActivationRejectsV1AtFork(t *testing.T) {
 	require.Equal(t, moeForkTestHeight-1, chain.BestSnapshot().Height)
 }
 
-// TestSolveBlockSelectsVersionSimNet asserts the height-aware SolveBlock picks
-// the certificate version required by the MoE cutover on SimNet (where it
-// returns a lightweight dummy certificate of the correct version).
-func TestSolveBlockSelectsVersionSimNet(t *testing.T) {
-	params := moeSimNetParams()
-	header := &wire.BlockHeader{}
-
-	cert, err := SolveBlock(header, nil, &params, moeForkTestHeight-1)
-	require.NoError(t, err)
-	require.Equal(t, wire.CertificateVersionV1, cert.Version(),
-		"pre-fork height must use the V1 certificate")
-
-	cert, err = SolveBlock(header, nil, &params, moeForkTestHeight)
-	require.NoError(t, err)
-	require.Equal(t, wire.CertificateVersionV2, cert.Version(),
-		"at/after fork height must use the V2 certificate")
-}
-
 // TestMoEForkBlockTemplateVersion verifies CheckConnectBlockTemplate enforces
 // the version cutover for block templates: at the fork height a V2 template is
 // accepted and a V1 template is rejected. This is the contract the height-aware

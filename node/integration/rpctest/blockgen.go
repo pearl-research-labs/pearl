@@ -17,13 +17,6 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
-// solveBlock generates a certificate for the given block header using the
-// height-aware SolveBlock which selects the correct certificate version.
-func solveBlock(header, parent *wire.BlockHeader, params *chaincfg.Params,
-	height int32) (wire.BlockCertificate, error) {
-	return blockchain.SolveBlock(header, parent, params, height)
-}
-
 // standardCoinbaseScript returns a standard script suitable for use as the
 // signature script of the coinbase transaction of a new block. In particular,
 // it starts with the block height that is required by version 2 blocks.
@@ -153,7 +146,7 @@ func CreateBlock(prevBlock *btcutil.Block, inclusionTxs []*btcutil.Tx,
 		}
 	}
 
-	cert, solveErr := solveBlock(block.BlockHeader(), prevHeader, net, blockHeight)
+	cert, solveErr := blockchain.SolveBlock(block.BlockHeader(), prevHeader, net, blockHeight)
 	if solveErr != nil {
 		return nil, fmt.Errorf("unable to solve block: %w", solveErr)
 	}
