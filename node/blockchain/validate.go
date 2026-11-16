@@ -306,7 +306,8 @@ func CheckTransactionSanity(tx *btcutil.Tx) error {
 // The flags modify the behavior of this function as follows:
 //   - BFNoPoWCheck: The check to ensure the block hash is less than the target
 //     difficulty is not performed.
-//   - BFCertificateVerified: The certificate is not verified again.
+//   - BFCertificateVerified: ZK verification is skipped; the caller already verified this exact
+//     certificate against this header.
 func checkProofOfWork(header *wire.BlockHeader, cert wire.BlockCertificate, powLimit *big.Int, flags BehaviorFlags) error {
 	// The target difficulty must be larger than zero.
 	target := CompactToBig(header.Bits)
@@ -327,13 +328,13 @@ func checkProofOfWork(header *wire.BlockHeader, cert wire.BlockCertificate, powL
 		return ruleError(ErrCertificateMissing, "certificate is missing")
 	}
 
-	// The block hash must be less than the claimed target unless the flag
-	// to avoid proof of work checks is set.
-	if flags&BFNoPoWCheck != BFNoPoWCheck && flags&BFCertificateVerified != BFCertificateVerified {
-		// Verify certificate against header
-		if err := zkpow.VerifyCertificate(header, cert); err != nil {
-			return ruleError(ErrHighHash, fmt.Sprintf("certificate verification failed: %v", err))
-		}
+	skipCert := flags&BFNoPoWCheck != 0 || flags&BFCertificateVerified != 0
+	if skipCert {
+		return nil
+	}
+
+	if err := zkpow.VerifyCertificate(header, cert); err != nil {
+		return ruleError(ErrHighHash, fmt.Sprintf("certificate verification failed: %v", err))
 	}
 
 	return nil
@@ -1196,14 +1197,16 @@ func (b *BlockChain) CheckHeaderSanity(header *wire.BlockHeader,
 // VerifyHeaderCertificates is the package-level VerifyHeaderCertificates,
 // wired with the chain's own time source and chain parameters.
 func (b *BlockChain) VerifyHeaderCertificates(msgHeaders []wire.MsgHeader, prevHash chainhash.Hash,
-	prevHeight, stopHeight int32) int {
+	prevHeight, stopHeight int32) (int, error) {
 
 	return VerifyHeaderCertificates(msgHeaders, prevHash, prevHeight, stopHeight, b.chainParams, b.timeSource)
 }
 
 // VerifyHeaderCertificates verifies in parallel the certificates that a header
 // sync loop is about to verify one at a time, and returns how many leading
-// headers have a valid one. The loop passes BFCertificateVerified for those.
+// headers have a valid one and, if a certificate failed, its error. The loop
+// passes BFCertificateVerified for the valid ones; on an error the caller drops
+// the peer.
 //
 // It takes the leading headers that connect to prevHash and to each other and
 // pass CheckCertificateRules and the cheap checks of CheckBlockHeaderSanity,
@@ -1211,11 +1214,11 @@ func (b *BlockChain) VerifyHeaderCertificates(msgHeaders []wire.MsgHeader, prevH
 // certificate that fails, so a bad header costs about one verification per
 // core, not one per header.
 func VerifyHeaderCertificates(msgHeaders []wire.MsgHeader, prevHash chainhash.Hash, prevHeight, stopHeight int32,
-	params *chaincfg.Params, timeSource MedianTimeSource) int {
+	params *chaincfg.Params, timeSource MedianTimeSource) (int, error) {
 
 	flags := NetBehaviorFlags(params)
 	if flags&BFNoPoWCheck != 0 {
-		return 0
+		return 0, nil
 	}
 	headers := make([]*wire.BlockHeader, 0, len(msgHeaders))
 	certs := make([]wire.BlockCertificate, 0, len(msgHeaders))
@@ -1234,13 +1237,15 @@ func VerifyHeaderCertificates(msgHeaders []wire.MsgHeader, prevHash chainhash.Ha
 		prevHash = header.BlockHash()
 	}
 	if len(headers) < 2 {
-		return 0
+		return 0, nil
 	}
 
-	// The loop verifies the first failing header again itself, so its error and disconnect are unchanged.
-	valid, _ := zkpow.BatchVerify(headers, certs)
+	valid, err := zkpow.BatchVerify(headers, certs)
+	if err != nil {
+		return valid, ruleError(ErrHighHash, fmt.Sprintf("certificate verification failed: %v", err))
+	}
 
-	return valid
+	return valid, nil
 }
 
 // VerifyCheckpoint checks that the height and hash match the stored

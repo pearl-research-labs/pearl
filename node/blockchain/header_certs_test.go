@@ -22,7 +22,8 @@ import (
 
 // TestVerifyHeaderCertificates runs a header sync loop that passes BFCertificateVerified for the
 // headers VerifyHeaderCertificates verified, and checks that every header gets the result it gets
-// without the flag, and that nothing is verified ahead past a header that fails the cheaper checks.
+// without the flag, that nothing is verified ahead past a header that fails the cheaper checks, and
+// that a bad certificate's error is the one the loop would report for it.
 func TestVerifyHeaderCertificates(t *testing.T) {
 	params := &chaincfg.RegressionNetParams
 	timeSource := NewMedianTime()
@@ -67,20 +68,31 @@ func TestVerifyHeaderCertificates(t *testing.T) {
 		headers    []wire.MsgHeader
 		stopHeight int32
 		verified   int
+		badCert    bool
 	}{
-		{"AllValid", valid, -1, numValid},
-		{"StopAtCheckpoint", valid, 3, 3},
-		{"BadCertificate", with(1, func(h *wire.MsgHeader) { h.MsgCertificate = corrupt }), -1, 1},
+		{"AllValid", valid, -1, numValid, false},
+		{"StopAtCheckpoint", valid, 3, 3, false},
+		{"BadCertificate", with(1, func(h *wire.MsgHeader) { h.MsgCertificate = corrupt }), -1, 1, true},
 		// Same block hash, but fails the timestamp precision check before the certificate.
 		{"CheapFailure", with(2, func(h *wire.MsgHeader) {
 			h.BlockHeader.Timestamp = h.BlockHeader.Timestamp.Add(time.Nanosecond)
-		}), -1, 2},
-		{"MissingCertificate", with(2, func(h *wire.MsgHeader) { h.MsgCertificate.Certificate = nil }), -1, 2},
+		}), -1, 2, false},
+		{"MissingCertificate", with(2, func(h *wire.MsgHeader) { h.MsgCertificate.Certificate = nil }), -1, 2, false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			verified := VerifyHeaderCertificates(test.headers, prevHash, 0, test.stopHeight, params, timeSource)
+			verified, err := VerifyHeaderCertificates(test.headers, prevHash, 0, test.stopHeight, params, timeSource)
 			require.Equal(t, test.verified, verified)
+			if test.badCert {
+				bad := &test.headers[verified]
+				want := CheckBlockHeaderSanity(&bad.BlockHeader, bad.BlockCertificate(), params.PowLimit, timeSource,
+					params.MaxTimeOffsetMinutes, flags)
+				require.Error(t, want)
+				require.Equal(t, want.Error(), fmt.Sprint(err))
+
+				return
+			}
+			require.NoError(t, err)
 
 			for i := range test.headers {
 				header, cert := &test.headers[i].BlockHeader, test.headers[i].BlockCertificate()

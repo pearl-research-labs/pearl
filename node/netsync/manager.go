@@ -1223,7 +1223,15 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	verified := 0
 	if tail := sm.headerList.Back(); tail != nil {
 		prev := tail.Value.(*headerNode)
-		verified = sm.chain.VerifyHeaderCertificates(msg.Headers, *prev.hash, prev.height, sm.nextCheckpoint.Height)
+		var err error
+		verified, err = sm.chain.VerifyHeaderCertificates(msg.Headers, *prev.hash, prev.height,
+			sm.nextCheckpoint.Height)
+		if err != nil {
+			log.Warnf("Header from peer %s failed sanity check: %v -- disconnecting", peer.Addr(), err)
+			peer.Disconnect()
+
+			return
+		}
 	}
 
 	// Process all of the received headers ensuring each one connects to the

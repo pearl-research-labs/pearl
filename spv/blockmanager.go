@@ -2468,8 +2468,14 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 		if b.nextCheckpoint != nil {
 			stopHeight = b.nextCheckpoint.Height
 		}
-		verified = blockchain.VerifyHeaderCertificates(msg.Headers, tail.Header.BlockHash(), tail.Height, stopHeight,
-			&b.cfg.ChainParams, b.cfg.TimeSource)
+		var err error
+		verified, err = blockchain.VerifyHeaderCertificates(msg.Headers, tail.Header.BlockHash(), tail.Height,
+			stopHeight, &b.cfg.ChainParams, b.cfg.TimeSource)
+		if err != nil {
+			b.punishHeaderSanityErr(hmsg.peer, err)
+
+			return
+		}
 	}
 
 	// Process all of the received headers ensuring each one connects to
