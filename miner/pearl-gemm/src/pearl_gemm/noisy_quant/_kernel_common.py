@@ -18,12 +18,10 @@ from quack.cute_dsl_utils import mlir_namedtuple
 from ..protocol_constants import PACKED_NOISE_K, R
 from ._quantization_ops import (
     _bf16_bits_to_f32,
-    _coin_mask,
-    _f32x2_to_e4m3x2,
-    _fold,
     _generate_noise_line,
     _mul_f32,
-    _rewrite_strip_pair,
+    _quantize_word,
+    _replicate_byte,
     _rndb,
     _scale_chain,
 )
@@ -118,6 +116,8 @@ class _NoisyQuant:
     _consumer_e1_enabled = True
     # Whether the committed device's quantizer rewrites the strip (Blackwell).
     _rewrites_strip = True
+    # Whether the family's target has the sm_100 f32x2 add/mul/fma forms.
+    _packed_f32 = False
 
     def __init__(
         self,
@@ -383,6 +383,7 @@ class _NoisyQuant:
         pair's (low, high) column noise.
         """
         code_u32 = cute.recast_tensor(code_words, cutlass.Uint32)
+        a_prime_u32 = cute.recast_tensor(a_prime_words, cutlass.Uint32)
         for repeat in cutlass.range_constexpr(self.bk // self.n_group):
             group = group_base + (self.n_group // 8) * repeat
             for row_half in cutlass.range_constexpr(2):
@@ -393,34 +394,30 @@ class _NoisyQuant:
                     )
                 )
                 coefficient = _mul_f32(alpha, scale)
-                codes = code_u32[row_half + 2 * repeat]
-                coin_mask = cutlass.Uint32(0)
+                noise = []
                 for word_half in cutlass.range_constexpr(2):
-                    column_block = 2 * repeat + word_half
-                    pair = row_half + 2 * column_block
-                    lo = _fold(coefficient, beta, codes, 2 * word_half, noise_values[2 * pair])
-                    hi = _fold(
-                        coefficient, beta, codes, 2 * word_half + 1, noise_values[2 * pair + 1]
-                    )
-                    quantized = _f32x2_to_e4m3x2(hi, lo)
-                    if cutlass.const_expr(self._rewrites_strip):
-                        if cutlass.const_expr(word_half == 0):
-                            coin_mask = _coin_mask(lo)
-                        quantized = _rewrite_strip_pair(
-                            quantized, strip_bound, strip_code, coin_mask
-                        )
-                    word = word_half + 2 * row_half + 4 * repeat
-                    a_prime_words[word] = cutlass.Uint16(quantized)
+                    pair = row_half + 2 * (2 * repeat + word_half)
+                    noise += [noise_values[2 * pair], noise_values[2 * pair + 1]]
+                a_prime_u32[row_half + 2 * repeat] = _quantize_word(
+                    code_u32[row_half + 2 * repeat],
+                    coefficient,
+                    beta,
+                    noise,
+                    strip_bound,
+                    strip_code,
+                    self._rewrites_strip,
+                    self._packed_f32,
+                )
 
     def _row_scales(self, shared_alpha, shared_beta, shared_strip, first_row):
         """``(alpha, beta, strip bound, strip code)`` of rows ``first_row`` and
-        ``first_row + 8``."""
+        ``first_row + 8``, the strip halves replicated over four byte lanes."""
         return [
             (
                 shared_alpha[row],
                 shared_beta[row],
-                shared_strip[row] & 0xFFFF,
-                shared_strip[row] >> 16,
+                _replicate_byte(shared_strip[row], 0),
+                _replicate_byte(shared_strip[row], 2),
             )
             for row in (first_row, first_row + 8)
         ]

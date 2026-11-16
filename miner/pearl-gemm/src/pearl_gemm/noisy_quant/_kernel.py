@@ -60,6 +60,8 @@ _SMEM_CAPACITY_BYTES = Arch.SM100.smem_capacity_bytes
 class _NoisyQuantSm100(_NoisyQuant):
     """Warp-specialized noising at 16-row MMA granularity on the f8f6f4 UMMA atom."""
 
+    _packed_f32 = True
+
     def __init__(
         self,
         bk: int,
