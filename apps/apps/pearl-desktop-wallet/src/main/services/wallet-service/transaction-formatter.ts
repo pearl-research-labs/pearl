@@ -2,6 +2,7 @@ import {Transaction} from '../../../types/transaction';
 
 export type RawTransaction = {
   txid: string;
+  vout?: number;
   category: string;
   amount: number;
   fee?: number;
@@ -19,6 +20,7 @@ export function formatTransaction(tx: RawTransaction): Transaction {
 
   return {
     txid: tx.txid,
+    vout: tx.vout ?? 0,
     type: isReceived ? 'received' : 'sent',
     amount: Math.abs(tx.amount),
     fee: tx.fee ? Math.abs(tx.fee) : 0,
