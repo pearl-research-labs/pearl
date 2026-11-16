@@ -525,6 +525,15 @@ func (m *CPUMiner) GenerateNBlocks(n uint32) ([]*chainhash.Hash, error) {
 			if errors.Is(err, errStaleBlock) {
 				continue
 			}
+			// A template rebuilt within the timestamp's second can reproduce a block the chain already
+			// holds, such as one marked invalid by invalidateblock; the next second yields a new hash.
+			var ruleErr blockchain.RuleError
+			if errors.As(err, &ruleErr) && ruleErr.ErrorCode == blockchain.ErrDuplicateBlock {
+				if waitOrQuit(quit) {
+					return nil, errMinerStopped
+				}
+				continue
+			}
 			return nil, err
 		}
 		blockHashes = append(blockHashes, block.Hash())

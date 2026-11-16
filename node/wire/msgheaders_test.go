@@ -48,14 +48,15 @@ func TestHeadersMaxPayloadLength(t *testing.T) {
 func TestHeadersLargeV4RoundTrip(t *testing.T) {
 	msg := NewMsgHeaders()
 	header := *blockOne.BlockHeader()
-	// version + hash + two length prefixes + ancestor count + two ancestors.
-	fixed := 4 + 32 + 4 + 4 + 1 + 2*MaxBlockHeaderPayload
 	cert := &CertificateV4{
-		PublicData:      bytes.Repeat([]byte{0x11}, CertificateMaxSize-fixed-MaxZKProofSize),
+		PublicData:      bytes.Repeat([]byte{0x11}, PublicDataMaxSizeV4),
 		ProofData:       bytes.Repeat([]byte{0x22}, MaxZKProofSize),
-		AncestorHeaders: []BlockHeader{header, header},
+		AncestorHeaders: []BlockHeader{header, header, header},
 	}
-	require.Equal(t, CertificateMaxSize, (&MsgCertificate{Certificate: cert}).SerializeSize())
+	// version + hash + two length prefixes + ancestor count + blobs + ancestors.
+	maxV4 := 4 + 32 + 4 + 4 + 1 + PublicDataMaxSizeV4 + MaxZKProofSize + MaxCertificateV4AncestorHeaders*MaxBlockHeaderPayload
+	require.Equal(t, maxV4, (&MsgCertificate{Certificate: cert}).SerializeSize())
+	require.LessOrEqual(t, maxV4, CertificateMaxSize)
 	for i := range MaxBlockHeadersPerMsg {
 		header.Version = int32(i)
 		require.NoError(t, msg.AddBlockHeader(header, cert))
