@@ -153,3 +153,25 @@ func TestVerifyCertificateV4EmptyProof(t *testing.T) {
 	cert.ProofData = nil
 	require.ErrorContains(t, VerifyCertificate(header, cert), "empty fp8 proof")
 }
+
+// TestVerifyZKProofFFIV4NbitsOverride checks the share-target path pools use:
+// the override replaces only the difficulty target, so the fixture still
+// verifies at its own bits and fails at a target it cannot meet.
+func TestVerifyZKProofFFIV4NbitsOverride(t *testing.T) {
+	header, cert := loadFP8Fixture(t)
+
+	require.NoError(t, VerifyZKProofFFI(header, cert, nil), "no override verifies at the header's bits")
+	bits := header.Bits
+	require.NoError(t, VerifyZKProofFFI(header, cert, &bits), "overriding with the header's bits is a no-op")
+
+	// The hardest representable target: no fixture jackpot meets it.
+	hardest := uint32(0x03000001)
+	require.ErrorContains(t, VerifyZKProofFFI(header, cert, &hardest), "v4 proof rejected")
+	require.Equal(t, bits, header.Bits, "the override must not touch the header")
+}
+
+func TestVerifyZKProofFFIV4NilCertificate(t *testing.T) {
+	header, _ := loadFP8Fixture(t)
+	var cert *wire.CertificateV4
+	require.ErrorContains(t, VerifyZKProofFFI(header, cert, nil), "nil v4 certificate")
+}

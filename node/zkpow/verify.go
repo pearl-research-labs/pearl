@@ -50,7 +50,7 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	}
 	switch c := cert.(type) {
 	case *wire.CertificateV4:
-		return verifyCertificateV4(header, c)
+		return verifyCertificateV4(header, c, header.Bits)
 	case *wire.CertificateV3:
 		return verifyCertificateV3(header, c)
 	case *wire.CertificateV2:
@@ -129,7 +129,10 @@ func verifyCertificateV3(header *wire.BlockHeader, c *wire.CertificateV3) error 
 	return VerifyZKProofFFI(header, c, nil)
 }
 
-func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) error {
+// verifyCertificateV4 verifies a V4 certificate's proof against nbits: the
+// header's own Bits for consensus, or a pool's share target via
+// VerifyZKProofFFI's override.
+func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4, nbits uint32) error {
 	certHash := cert.BlockHash()
 	blockHash := header.BlockHash()
 	if !certHash.IsEqual(&blockHash) {
@@ -180,7 +183,7 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
 	result := C.verify_zk_proof_v4(
 		(*C.uint8_t)(unsafe.Pointer(&headerBytes[0])), C.uintptr_t(len(headerBytes)),
-		&cZKProof, C.uint32_t(header.Bits), &errorBuf[0])
+		&cZKProof, C.uint32_t(nbits), &errorBuf[0])
 	msg := C.GoString(&errorBuf[0])
 
 	switch result {
@@ -195,12 +198,28 @@ func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) err
 	}
 }
 
-// VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.
+// VerifyZKProofFFI verifies a V2, V3 or V4 ZK proof via the Rust FFI. A non-nil
+// nbitsOverride replaces the header's Bits as the difficulty target, which lets a
+// pool check shares at its own (easier) share target. It must never be used with
+// an override in block acceptance or relay paths.
+//
+// V4 is dispatched to the same verifier VerifyCertificate uses: the certificate's
+// ancestor headers travel with it, so the override is the only difference.
 func VerifyZKProofFFI(
 	header *wire.BlockHeader,
 	cert wire.BlockCertificate,
 	nbitsOverride *uint32,
 ) error {
+	if c, ok := cert.(*wire.CertificateV4); ok {
+		if c == nil {
+			return fmt.Errorf("nil v4 certificate")
+		}
+		nbits := header.Bits
+		if nbitsOverride != nil {
+			nbits = *nbitsOverride
+		}
+		return verifyCertificateV4(header, c, nbits)
+	}
 	certHash := cert.BlockHash()
 	blockHash := header.BlockHash()
 	if !certHash.IsEqual(&blockHash) {
