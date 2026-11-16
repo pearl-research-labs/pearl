@@ -31,7 +31,7 @@ use super::stark::ScaleProgram;
 // Channel: group tuples — InputQuant (looking) -> Scale (looked)
 // ==================================================================================================
 
-/// Scale's looked half of the common 13-component group tuple
+/// Scale's looked half of the common 17-component group tuple
 /// `(GROUP_KEY, L2_FRAME_SUM, FRAME_DOUBLED_SCALE_EXPONENT, MAX_ABS, ALPHA_EXP,
 /// ALPHA_MANTISSA, BETA_EXP, BETA_MANTISSA, BETA_EXP_IS_ZERO, DEAD_BOUND, DEAD_COUNT,
 /// SIGMA_ENC, SIGMA_NORM)`, filter `1 - IS_PAD` — every live Scale row consumes exactly one
@@ -52,7 +52,7 @@ use super::stark::ScaleProgram;
 ///
 /// InputQuant's looking half is `input_quant_stark::ctl::ctl_group_tuples_looking_input_quant`
 /// (2 instances on live `IS_GROUP_FINAL` rows, A and B planes with the `+ h*k` key offset, the
-/// same common order). B200 appends the strip threshold, Gaussian LOG16 region, key base, and
+/// same common order), followed by the strip threshold, Gaussian LOG16 region, key base, and
 /// kernel sum.
 pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWithColumns<F> {
     let m = &SCALE_COL_MAP;
@@ -84,15 +84,12 @@ pub fn ctl_looked_scale_group_tuple<F: Field>(program: &ScaleProgram) -> TableWi
         F::from_canonical_u64(program.device.sigma_encoding_offset()),
     ));
     columns.push(Column::single(m.sigma_norm));
-    if program.device == crate::v4::api::public_params::Device::B200 {
-        let noise_coverage = &super::columns::B200_SCALE_COL_MAP;
-        columns.extend(Column::singles([
-            noise_coverage.strip_threshold,
-            noise_coverage.noise_coverage_region,
-            noise_coverage.noise_coverage_key_base,
-            noise_coverage.noise_coverage_sum,
-        ]));
-    }
+    columns.extend(Column::singles([
+        m.strip_threshold,
+        m.noise_coverage_region,
+        m.noise_coverage_key_base,
+        m.noise_coverage_sum,
+    ]));
     TableWithColumns::new(
         Table::Scale.into(),
         columns,
@@ -497,11 +494,11 @@ pub(super) fn scale_common_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<
     ));
 
     // ---- F: minimum scaled RMS (jackpot check 2), every row:
-    // Require alpha * l2 >= 4 for A rows and >= 16 for B rows.
+    // Require alpha * l2 >= 4 for A rows and >= 8 for B rows.
     // floor(log2(alpha * l2)) = ALPHA_EXP + L2_FLOORED_EXPONENT
     //                          + SIGMA_SIG_IS_WIDE - 254.
     // The 254 removes the two BF16 exponent biases of 127.
-    // log2(min_rms) = 4 - 2*IS_A_ROW.
+    // log2(min_rms) = 3 - IS_A_ROW.
     // RC16 checks that the exponent slack is nonnegative.
     // Passing keys fit within RC16 on the pinned exponent domain;
     // a negative key wraps far outside its range. ----
@@ -510,9 +507,9 @@ pub(super) fn scale_common_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<
             (m.alpha_exp, one),
             (m.l2_floored_exponent, one),
             (m.sigma_sig_is_wide, one),
-            (m.is_a_row, F::TWO),
+            (m.is_a_row, one),
         ],
-        -F::from_canonical_u64(254) - F::from_canonical_u16(4),
+        -F::from_canonical_u64(254) - F::from_canonical_u16(3),
     )));
 
     // ---- S2: the sigma significand's width bit (jackpot check 4), two-sided:
@@ -537,32 +534,33 @@ pub fn scale_lut_lookups<F: Field>(program: &ScaleProgram) -> Vec<LutLookup<F>> 
     let m = &SCALE_COL_MAP;
     let one = F::ONE;
     let neg = -one;
-    if program.device == crate::v4::api::public_params::Device::B200 {
-        let noise_coverage = &super::columns::B200_SCALE_COL_MAP;
-        let live = Filter::from_column(Column::linear_combination_with_constant([(m.is_pad, neg)], one));
-        lookups.push(LutLookup {
-            table: LutTable::DownscaleThreshold,
-            keys: vec![Column::linear_combination_with_constant(
-                [
-                    (m.sigma_norm, one),
-                    (m.alpha_exp, F::from_canonical_u64(32768)),
-                    (m.l2_floored_exponent, F::from_canonical_u64(32768)),
-                    (m.sigma_sig_is_wide, F::from_canonical_u64(32768)),
-                ],
-                -F::from_canonical_u64(32768 * 257),
-            )],
-            values: Column::singles([
-                noise_coverage.strip_threshold,
-                noise_coverage.noise_coverage_coefficient,
-                noise_coverage.noise_coverage_region,
-                noise_coverage.noise_coverage_key_base,
-            ])
-            .collect(),
-            filter: live.clone(),
-        });
-        for column in noise_coverage.noise_coverage_surplus {
-            lookups.push(LutLookup::rc16_filtered(Column::single(column), live.clone()));
-        }
+    let live = Filter::from_column(Column::linear_combination_with_constant([(m.is_pad, neg)], one));
+    let threshold_table = match program.device {
+        crate::v4::api::public_params::Device::H100 => LutTable::DownscaleThresholdH100,
+        crate::v4::api::public_params::Device::B200 => LutTable::DownscaleThreshold,
+    };
+    lookups.push(LutLookup {
+        table: threshold_table,
+        keys: vec![Column::linear_combination_with_constant(
+            [
+                (m.sigma_norm, one),
+                (m.alpha_exp, F::from_canonical_u64(32768)),
+                (m.l2_floored_exponent, F::from_canonical_u64(32768)),
+                (m.sigma_sig_is_wide, F::from_canonical_u64(32768)),
+            ],
+            -F::from_canonical_u64(32768 * 257),
+        )],
+        values: Column::singles([
+            m.strip_threshold,
+            m.noise_coverage_coefficient,
+            m.noise_coverage_region,
+            m.noise_coverage_key_base,
+        ])
+        .collect(),
+        filter: live.clone(),
+    });
+    for column in m.noise_coverage_surplus {
+        lookups.push(LutLookup::rc16_filtered(Column::single(column), live.clone()));
     }
     lookups
 }
@@ -586,7 +584,7 @@ mod tests {
 
     #[test]
     fn scale_ctl_looked_half_is_well_formed() {
-        // 13 tuple components, filter 1 - IS_PAD (padding rows consume no tuple).
+        // 17 tuple components, filter 1 - IS_PAD (padding rows consume no tuple).
         let looked = ctl_looked_scale_group_tuple::<F>(&test_program());
         // TableWithColumns exposes no accessors; construction itself checks the column algebra.
         let _ = looked;
@@ -596,7 +594,7 @@ mod tests {
     fn group_lookup_binds_linf_fields_to_input_quant_maximum() {
         let fixture = build_fixture(false);
         let ctl = CrossTableLookup::new(
-            ctl_group_tuples_looking_input_quant(fixture.scale.device),
+            ctl_group_tuples_looking_input_quant(),
             vec![ctl_looked_scale_group_tuple(&fixture.scale)],
         );
         let mut traces = vec![Vec::new(); NUM_TABLES];
@@ -625,7 +623,7 @@ mod tests {
     fn group_lookup_binds_beta_multiply_outputs_to_input_quant() {
         let fixture = build_fixture(false);
         let ctl = CrossTableLookup::new(
-            ctl_group_tuples_looking_input_quant(fixture.scale.device),
+            ctl_group_tuples_looking_input_quant(),
             vec![ctl_looked_scale_group_tuple(&fixture.scale)],
         );
         let mut traces = vec![Vec::new(); NUM_TABLES];

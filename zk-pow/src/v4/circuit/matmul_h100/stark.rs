@@ -2026,7 +2026,13 @@ mod tests {
         use crate::v4::circuit::luts::{LutChecker, LutTable};
         let (program, rows, pis) = test_trace();
         let lookups = super::super::ctl::matmul_lut_lookups::<F>();
-        let mut checker = LutChecker::<F>::new(&[LutTable::Range16, LutTable::Pow2G, LutTable::WidthNorm, LutTable::ProdAlign15]);
+        let mut checker = LutChecker::<F>::new(&[
+            LutTable::Range16,
+            LutTable::Bytes2,
+            LutTable::Pow2G,
+            LutTable::WidthNorm,
+            LutTable::ProdAlign15,
+        ]);
         let check = |checker: &mut LutChecker<F>, rows: &[[F; NUM_MATMUL_COLUMNS]]| {
             let trace: Vec<_> = (0..NUM_MATMUL_COLUMNS)
                 .map(|c| PolynomialValues::new(rows.iter().map(|r| r[c]).collect()))

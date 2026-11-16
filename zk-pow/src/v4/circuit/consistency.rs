@@ -33,7 +33,7 @@ use super::blake3_stark::stark::{Blake3KnownInputs, Blake3Program, Blake3Stark, 
 use super::coefficient_stark::{CoefficientStark, NUM_COEFFICIENT_COLUMNS, coefficient_lookups};
 use super::ctl::{LutTable, NUM_TABLES, Table, all_cross_table_lookups, lut_tables};
 use super::driver::{Fp8PublicData, Fp8System};
-use super::input_quant_stark::columns::{NUM_B200_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_COLUMNS, input_quant_column_map};
+use super::input_quant_stark::columns::{INPUT_QUANT_COL_MAP, NUM_INPUT_QUANT_COLUMNS};
 use super::input_quant_stark::ctl::input_quant_lut_lookups;
 use super::input_quant_stark::stark::{InputQuantProgram, InputQuantStark};
 use super::luts::{LutChecker, lut_trace};
@@ -43,7 +43,7 @@ use super::matmul_b200_stark::{MatmulB200ColumnsView, MatmulStarkB200};
 use super::matmul_h100::columns::NUM_MATMUL_COLUMNS;
 use super::matmul_h100::ctl::matmul_lut_lookups;
 use super::matmul_h100::{MatmulColumnsView, MatmulStarkH100};
-use super::scale_stark::columns::{NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS, NUM_SCALE_COLUMNS};
+use super::scale_stark::columns::NUM_SCALE_COLUMNS;
 use super::scale_stark::ctl::scale_lut_lookups;
 use super::scale_stark::stark::{ScaleProgram, ScaleRowTuple, ScaleStark};
 use super::unpredictability::budget;
@@ -64,45 +64,6 @@ use crate::v4::api::verify::verify_plain_proof;
 
 type F = GoldilocksField;
 const D: usize = 2;
-
-enum InputQuantRows {
-    H100(Vec<[F; NUM_INPUT_QUANT_COLUMNS]>),
-    B200(Vec<[F; NUM_B200_INPUT_QUANT_COLUMNS]>),
-}
-impl InputQuantRows {
-    fn columns(&self) -> Vec<PolynomialValues<F>> {
-        match self {
-            Self::H100(rows) => columns(rows),
-            Self::B200(rows) => columns(rows),
-        }
-    }
-    fn len(&self) -> usize {
-        match self {
-            Self::H100(rows) => rows.len(),
-            Self::B200(rows) => rows.len(),
-        }
-    }
-}
-
-enum ScaleRows {
-    H100(Vec<[F; NUM_SCALE_COLUMNS]>),
-    B200(Vec<[F; NUM_B200_SCALE_COLUMNS]>),
-}
-
-impl ScaleRows {
-    fn columns(&self) -> Vec<PolynomialValues<F>> {
-        match self {
-            Self::H100(rows) => columns(rows),
-            Self::B200(rows) => columns(rows),
-        }
-    }
-    fn len(&self) -> usize {
-        match self {
-            Self::H100(rows) => rows.len(),
-            Self::B200(rows) => rows.len(),
-        }
-    }
-}
 
 enum MatmulRows {
     H100(Vec<[F; NUM_MATMUL_COLUMNS]>),
@@ -193,22 +154,22 @@ pub(crate) struct Fp8Fixture {
     pub offsets_hash_id: HashId,
     // The generated traces (row-major) and their geometry.
     pub b3_rows: Vec<[F; NUM_BLAKE3_COLUMNS]>,
-    iq_rows: InputQuantRows,
+    iq_rows: Vec<[F; NUM_INPUT_QUANT_COLUMNS]>,
     coefficient_rows: Vec<[F; NUM_COEFFICIENT_COLUMNS]>,
-    scale_rows: ScaleRows,
+    scale_rows: Vec<[F; NUM_SCALE_COLUMNS]>,
     mat_rows: MatmulRows,
     pub xf_rows: Vec<[F; NUM_XOR_FOLD_COLUMNS]>,
 }
 
 impl Fp8Fixture {
-    /// InputQuant's generated trace, column-major, for the device the fixture was built on.
+    /// InputQuant's generated trace, column-major.
     pub(crate) fn iq_trace(&self) -> Vec<PolynomialValues<F>> {
-        self.iq_rows.columns()
+        columns(&self.iq_rows)
     }
 
-    /// Scale's generated trace, column-major, for the device the fixture was built on.
+    /// Scale's generated trace, column-major.
     pub(crate) fn scale_trace(&self) -> Vec<PolynomialValues<F>> {
-        self.scale_rows.columns()
+        columns(&self.scale_rows)
     }
 }
 
@@ -546,38 +507,15 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
     };
     let a_noise = noise(h * k, 0xD1B54A32D192ED03);
     let b_noise = noise(w * k, 0x2545F4914F6CDD1D);
-    let (iq_rows, iq_pis) = match public.common().device {
-        Device::H100 => {
-            let (rows, inputs) = iq_program.generate_trace::<F, NUM_INPUT_QUANT_COLUMNS>(
-                &a_int8,
-                &a_scale_codes,
-                &a_noise,
-                &b_int8,
-                &b_scale_codes,
-                &b_noise,
-            );
-            (InputQuantRows::H100(rows), inputs)
-        }
-        Device::B200 => {
-            let (rows, inputs) = iq_program.generate_trace::<F, NUM_B200_INPUT_QUANT_COLUMNS>(
-                &a_int8,
-                &a_scale_codes,
-                &a_noise,
-                &b_int8,
-                &b_scale_codes,
-                &b_noise,
-            );
-            (InputQuantRows::B200(rows), inputs)
-        }
-    };
-    let iq_columns = iq_rows.columns();
-    let input_map = input_quant_column_map(public.common().device);
+    let (iq_rows, iq_pis) = iq_program.generate_trace::<F>(&a_int8, &a_scale_codes, &a_noise, &b_int8, &b_scale_codes, &b_noise);
+    let iq_columns = columns(&iq_rows);
+    let input_map = &INPUT_QUANT_COL_MAP;
     let value = |column: usize, row: usize| to_u64(iq_columns[column].values[row]);
 
     // ---- ScaleStark: one tuple per matrix row, exactly what InputQuant committed. ----
     let scale_program = ScaleProgram::new_for_device(h, w, k, r, public.common().device);
     let tuples = |is_b: bool| -> Vec<ScaleRowTuple> {
-        let side = &input_map.sides[usize::from(is_b)];
+        let side = [&input_map.a, &input_map.b][usize::from(is_b)];
         (0..if is_b { w } else { h })
             .map(|group| {
                 let row = group * k + k - 1;
@@ -590,36 +528,34 @@ pub(crate) fn build_fixture_from_job(header: IncompleteBlockHeader, proof: Plain
             })
             .collect()
     };
-    let scale_pis = scale_program.public_inputs_for_device::<F>();
-    let scale_rows = match &iq_rows {
-        InputQuantRows::H100(_) => ScaleRows::H100(scale_program.generate_trace::<F>(&tuples(false), &tuples(true)).0),
-        InputQuantRows::B200(rows) => {
-            let map = &super::input_quant_stark::columns::B200_INPUT_QUANT_COL_MAP;
-            let sums: Vec<_> = [(&map.a, h), (&map.b, w)]
-                .into_iter()
-                .flat_map(|(side, count)| (0..count).map(move |group| to_u64(rows[group * k + k - 1][side.noise_coverage_sum])))
-                .collect();
-            ScaleRows::B200(scale_program.generate_b200_trace::<F>(&tuples(false), &tuples(true), &sums))
-        }
+    let scale_pis = scale_program.public_inputs::<F>().to_vec();
+    let scale_rows = {
+        let sums: Vec<_> = [(&input_map.a, h), (&input_map.b, w)]
+            .into_iter()
+            .flat_map(|(side, count)| {
+                let iq_rows = &iq_rows;
+                (0..count).map(move |group| to_u64(iq_rows[group * k + k - 1][side.noise_coverage_sum]))
+            })
+            .collect();
+        let (mut rows, _) = scale_program.generate_trace::<F>(&tuples(false), &tuples(true));
+        scale_program.fill_noise_coverage(&mut rows, &sums);
+        rows
     };
     let codes = |is_b: bool| -> Vec<u8> {
-        let index = usize::from(is_b);
-        let column = input_map
-            .downscale
-            .map_or(input_map.sides[index].code_noised, |(_, sides)| sides[index].output_code);
+        let column = [&input_map.a, &input_map.b][usize::from(is_b)].downscale.output_code;
         (0..if is_b { w * k } else { h * k })
             .map(|row| value(column, row) as u8)
             .collect()
     };
     let lambdas = |is_b: bool| -> Vec<u64> {
-        let side = &input_map.sides[usize::from(is_b)];
+        let side = [&input_map.a, &input_map.b][usize::from(is_b)];
         (0..if is_b { w * k } else { h * k })
             .map(|row| value(side.lambda, row))
             .collect()
     };
     let mut blocks = Vec::new();
     for (index, scales) in [&a_scale_codes, &b_scale_codes].into_iter().enumerate() {
-        let side = &input_map.sides[index];
+        let side = [&input_map.a, &input_map.b][index];
         for (block, &scale) in scales.iter().enumerate() {
             blocks.push([
                 (128 * value(side.alpha_exp, 8 * block) + value(side.alpha_mantissa, 8 * block)) as u16,
@@ -803,8 +739,8 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     // the LUT traces are appended below once their multiplicities are known). ----
     let mut traces = vec![
         columns(&fx.b3_rows),
-        fx.iq_rows.columns(),
-        fx.scale_rows.columns(),
+        columns(&fx.iq_rows),
+        columns(&fx.scale_rows),
         fx.mat_rows.columns(),
         columns(&fx.xf_rows),
         columns(&fx.coefficient_rows),
@@ -903,35 +839,19 @@ fn check_job_balances_every_ctl_channel(fx: Fp8Fixture) {
     // ---- Every AIR satisfied on its own trace (the LUT AIRs have no constraints). ----
     let pis: [&[F]; NUM_TABLES] = core::array::from_fn(|t| fx.public_inputs[t].as_slice());
     assert_constraints!(Blake3Stark::<F, D>::new(fx.blake3), &fx.b3_rows, pis[0], "Blake3");
-    match &fx.iq_rows {
-        InputQuantRows::H100(rows) => assert_constraints!(
-            InputQuantStark::<F, D, NUM_INPUT_QUANT_COLUMNS>::new(fx.input_quant.clone()),
-            rows,
-            pis[1],
-            "InputQuant H100"
-        ),
-        InputQuantRows::B200(rows) => assert_constraints!(
-            InputQuantStark::<F, D, NUM_B200_INPUT_QUANT_COLUMNS>::new(fx.input_quant.clone()),
-            rows,
-            pis[1],
-            "InputQuant B200"
-        ),
-    }
+    assert_constraints!(
+        InputQuantStark::<F, D>::new(fx.input_quant.clone()),
+        &fx.iq_rows,
+        pis[1],
+        "InputQuant"
+    );
     assert_constraints!(
         CoefficientStark::<F, D>::new(h, w, k),
         &fx.coefficient_rows,
         pis[5],
         "Coefficient"
     );
-    match &fx.scale_rows {
-        ScaleRows::H100(rows) => assert_constraints!(ScaleStark::<F, D>::new(fx.scale), rows, pis[2], "Scale"),
-        ScaleRows::B200(rows) => assert_constraints!(
-            ScaleStark::<F, D, NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS>::new(fx.scale),
-            rows,
-            pis[2],
-            "B200 Scale"
-        ),
-    }
+    assert_constraints!(ScaleStark::<F, D>::new(fx.scale), &fx.scale_rows, pis[2], "Scale");
     match &fx.mat_rows {
         MatmulRows::H100(rows) => assert_constraints!(MatmulStarkH100::<F, D>::new(h, w, k), rows, pis[3], "Matmul"),
         MatmulRows::B200(rows) => {

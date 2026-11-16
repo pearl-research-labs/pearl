@@ -199,12 +199,12 @@ impl Device {
         (14 + self.lg2_delta()) as u64
     }
 
-    /// Returns 1 when the quantization must include downscaling,
-    /// and 0 otherwise
-    pub const fn requires_downscaling(self) -> bool {
+    /// Strip width / signal RMS for the downscale rewrite: `(g, g_small_rms)`, the second
+    /// applied below `SMALL_RMS_THRESHOLD`.
+    pub const fn downscale_g(self) -> (f32, f32) {
         match self {
-            Self::H100 => false,
-            Self::B200 => true,
+            Self::H100 => (0.105, 0.105),
+            Self::B200 => (0.08, 0.1),
         }
     }
 }

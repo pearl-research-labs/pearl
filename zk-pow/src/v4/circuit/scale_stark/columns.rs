@@ -4,8 +4,9 @@
 //! bf16 square-root claim; rounding that claim's code to the nearest multiple of four (ties
 //! upward); `linf`; the `2^-32` norm floors; the noised-bound FMA; alpha/beta derivation; the
 //! jackpot liveness gate (the per-side running dead totals compared against the
-//! `DEAD_LIMIT_A/B` public inputs on the last row); and the jackpot noise-floor gate (every
-//! row's `sigma = DELTA * alpha * l2f` held at or above `sigma_min`).
+//! `DEAD_LIMIT_A/B` public inputs on the last row); the jackpot noise-floor gate (every
+//! row's `sigma = DELTA * alpha * l2f` held at or above `sigma_min`); and the jackpot
+//! noise-coverage gate (check 4).
 //!
 //! For the square-root check, `S` is InputQuant's framed sum,
 //! `Wl2 = 27 - ceil(log2(k))` is its precision shift, `E_MAX` is the doubled scale-frame
@@ -415,14 +416,25 @@ pub struct ScaleColumnsView<T: Copy> {
     /// H5: `beta = RNE_bf16(beta_1 * dos)`; the group tuple carries its output exponent,
     /// mantissa and exponent-zero flag directly (beta may be subnormal or zero).
     pub beta_scale_multiply: MulBlock<T>,
+
+    // ------------------------------------------------------------------------------------------
+    // Jackpot noise-coverage gate (check 4): the strip threshold, the Gaussian row parameters
+    // (coefficient, LOG16 region, key base), the kernel sum, and a 48-bit nonnegative surplus.
+    // ------------------------------------------------------------------------------------------
+    pub strip_threshold: T,
+    pub noise_coverage_coefficient: T,
+    pub noise_coverage_region: T,
+    pub noise_coverage_key_base: T,
+    pub noise_coverage_sum: T,
+    pub noise_coverage_surplus: [T; 3],
 }
 
 /// Total number of committed ScaleStark columns.
 pub const NUM_SCALE_COLUMNS: usize = size_of::<ScaleColumnsView<u8>>();
 
-// The committed-column count: 137 = 133 main + 4 class (a), of which the sqrt block is 65
-// (the module docs derive its layout).
-const _: () = assert!(NUM_SCALE_COLUMNS == 137);
+// The committed-column count: 145 = 133 main + 4 class (a) + 8 noise-coverage, of which the
+// sqrt block is 65 (the module docs derive its layout).
+const _: () = assert!(NUM_SCALE_COLUMNS == 145);
 
 // Public inputs (consumed by groups H and Q). `dr`/`dos` are the public scale constants
 // `bf16(DELTA*sqrt(r))` and `bf16(DELTA*sqrt(r)/NOISE_TARGET_NORM^2)` split into bf16 fields
@@ -456,8 +468,10 @@ pub const WL2_PUBLIC_INPUT: usize = 5;
 pub const DEAD_LIMIT_A_PUBLIC_INPUT: usize = 6;
 /// The B side's dead-entry allowance `floor(eps_idle * w*k)` (see `DEAD_LIMIT_A_PUBLIC_INPUT`).
 pub const DEAD_LIMIT_B_PUBLIC_INPUT: usize = 7;
+/// Check 4's minimum row product `ceil(k * 2^32 / 25)`.
+pub const MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT: usize = 8;
 /// Number of ScaleStark public inputs.
-pub const NUM_SCALE_PUBLIC_INPUTS: usize = 8;
+pub const NUM_SCALE_PUBLIC_INPUTS: usize = 9;
 
 columns_view!(ScaleColumnsView, NUM_SCALE_COLUMNS, SCALE_COL_MAP);
 
@@ -465,26 +479,6 @@ columns_view!(ScaleColumnsView, NUM_SCALE_COLUMNS, SCALE_COL_MAP);
 /// `IS_PAD` — pure functions of the public geometry (`ScaleProgram::known_values`), re-checked
 /// by the batch verifier against the trace openings.
 pub const NUM_SCALE_KNOWN_COLUMNS: usize = SCALE_COL_MAP.is_pad + 1;
-
-/// B200 adds the strip threshold, the Gaussian row parameters (coefficient, LOG16 region,
-/// key base), the kernel sum, and a 48-bit nonnegative surplus.
-#[repr(C)]
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub struct B200ScaleColumnsView<T: Copy> {
-    pub common: ScaleColumnsView<T>,
-    pub strip_threshold: T,
-    pub noise_coverage_coefficient: T,
-    pub noise_coverage_region: T,
-    pub noise_coverage_key_base: T,
-    pub noise_coverage_sum: T,
-    pub noise_coverage_surplus: [T; 3],
-}
-
-pub const NUM_B200_SCALE_COLUMNS: usize = size_of::<B200ScaleColumnsView<u8>>();
-pub const MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT: usize = NUM_SCALE_PUBLIC_INPUTS;
-pub const NUM_B200_SCALE_PUBLIC_INPUTS: usize = NUM_SCALE_PUBLIC_INPUTS + 1;
-const _: () = assert!(NUM_B200_SCALE_COLUMNS == 145);
-columns_view!(B200ScaleColumnsView, NUM_B200_SCALE_COLUMNS, B200_SCALE_COL_MAP);
 
 #[cfg(test)]
 mod tests {
@@ -503,7 +497,7 @@ mod tests {
         assert_eq!(SCALE_COL_MAP.is_last_row, 1);
         assert_eq!(SCALE_COL_MAP.is_a_row, 2);
         assert_eq!(SCALE_COL_MAP.is_pad, 3);
-        assert_eq!(SCALE_COL_MAP.beta_scale_multiply.out_exp_is_zero, NUM_SCALE_COLUMNS - 1);
+        assert_eq!(SCALE_COL_MAP.noise_coverage_surplus[2], NUM_SCALE_COLUMNS - 1);
     }
 
     #[test]
@@ -519,10 +513,7 @@ mod tests {
             view.noised_bound_fma.rounding_significand_key,
             SCALE_COL_MAP.noised_bound_fma.rounding_significand_key as u64 * 3 + 1
         );
-        assert_eq!(
-            view.beta_scale_multiply.out_exp_is_zero,
-            (NUM_SCALE_COLUMNS as u64 - 1) * 3 + 1
-        );
+        assert_eq!(view.noise_coverage_surplus[2], (NUM_SCALE_COLUMNS as u64 - 1) * 3 + 1);
         let back: [u64; NUM_SCALE_COLUMNS] = view.into();
         assert_eq!(back, arr);
 

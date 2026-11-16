@@ -225,8 +225,9 @@ pub struct MatmulColumnsView<T: Copy> {
     // Understatement is unsatisfiable; overstatement only adds skips.
     // ------------------------------------------------------------------------------------------
     /// M13: the lane product's `floor(log2 |product|) + 139` (0 for a zero product), served by
-    /// the same PRODALIGN15 lookup as the term. `RC16(E_CELL - LANE_BINADES_i)` proves the
-    /// bound; nonzero binades are >= 121, so E_CELL = 0 implies an all-zero cell.
+    /// the same PRODALIGN15 lookup as the term. One BYTES2 lookup per lane on
+    /// `(E_CELL - LANE_BINADES_i, E_GRID - LANE_BINADES_i - 5*CELL_NONZERO)` proves both
+    /// bounds; nonzero binades are >= 121, so E_CELL = 0 implies an all-zero cell.
     pub lane_binades: [T; GROUP_WIDTH],
     /// M13: `e(M)+139`, constant across the cell. M covers every product and every exact,
     /// unrounded `C+c` after a live atom.

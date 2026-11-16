@@ -1,5 +1,4 @@
-//! The fp8 batch driver: one proof for the whole device-specific batch (23 tables on H100,
-//! 25 on B200).
+//! The fp8 batch driver: one proof for the whole device-specific batch.
 //!
 //! # Statement, layout, and commitments
 //!
@@ -31,7 +30,7 @@
 //! [`Fp8System::prove`] regenerates the six main traces from the private strips, chaining
 //! each table's inputs from its producer exactly like the consistency driver (InputQuant from
 //! the strips and the public binary32 noise, Scale from InputQuant's group tuples — plus
-//! B200's per-row Gaussian noise-coverage sums —, Coefficient from InputQuant's per-block
+//! the per-row Gaussian noise-coverage sums —, Coefficient from InputQuant's per-block
 //! alpha/scale fields, device-specific Matmul from the final noised codes (post-rewrite on
 //! B200) and lambda scores, XorFold from the cell results and census counts, Blake3 from the
 //! strip bytes and the folded lottery words), accumulates the committed-LUT multiplicities
@@ -83,15 +82,15 @@ use super::ctl::{
     NUM_B200_ALL_TABLES, NUM_H100_ALL_TABLES, NUM_TABLES, Table, all_cross_table_lookups, lut_inventories, lut_tables,
     num_all_tables,
 };
-use super::input_quant_stark::columns::{NUM_B200_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS};
-use super::input_quant_stark::stark::{InputQuantNative, InputQuantProgram, InputQuantStark};
+use super::input_quant_stark::columns::{NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS};
+use super::input_quant_stark::stark::{InputQuantProgram, InputQuantStark};
 use super::luts::stark::boxed_lut_stark;
 use super::luts::{LutChecker, lut_live_rows, lut_preprocessed_data, lut_trace, num_precommitted_columns};
 use super::matmul_b200_stark::columns::NUM_MATMUL_PUBLIC_INPUTS;
 use super::matmul_b200_stark::{MatmulB200ColumnsView, MatmulStarkB200};
 use super::matmul_h100::MatmulStarkH100;
-use super::scale_stark::columns::{NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS, NUM_SCALE_PUBLIC_INPUTS};
-use super::scale_stark::stark::{ScaleProgram, ScaleRowTuple, ScaleStark};
+use super::scale_stark::columns::NUM_SCALE_PUBLIC_INPUTS;
+use super::scale_stark::stark::{ScaleProgram, ScaleStark};
 use super::xor_fold_stark::columns::NUM_XOR_FOLD_PUBLIC_INPUTS;
 use super::xor_fold_stark::stark::{XorFoldProgram, XorFoldStark};
 use crate::v2::api::proof_utils::u32_field_array_to_hash;
@@ -268,91 +267,6 @@ pub(super) fn statement_digest_to_hash_out<F: RichField>(digest: Hash256) -> Has
 
 /// The device-specific Matmul AIR of one FP8 statement. It owns the geometry the AIR
 /// constrains; callers do not maintain a second dimension-only program alongside it.
-enum InputQuantBackend<F: RichField + Extendable<D>, const D: usize> {
-    H100(InputQuantStark<F, D, NUM_INPUT_QUANT_COLUMNS>),
-    B200(InputQuantStark<F, D, NUM_B200_INPUT_QUANT_COLUMNS>),
-}
-
-impl<F: RichField + Extendable<D>, const D: usize> InputQuantBackend<F, D> {
-    fn new(program: InputQuantProgram) -> Self {
-        match program.device {
-            Device::H100 => Self::H100(InputQuantStark::new(program)),
-            Device::B200 => Self::B200(InputQuantStark::new(program)),
-        }
-    }
-    fn program(&self) -> &InputQuantProgram {
-        match self {
-            Self::H100(stark) => &stark.program,
-            Self::B200(stark) => &stark.program,
-        }
-    }
-    fn as_stark(&self) -> &dyn BatchStark<F, D> {
-        match self {
-            Self::H100(stark) => stark,
-            Self::B200(stark) => stark,
-        }
-    }
-    /// The selected AIR's trace width (the joined fill's column destination count).
-    fn num_columns(&self) -> usize {
-        match self {
-            Self::H100(_) => NUM_INPUT_QUANT_COLUMNS,
-            Self::B200(_) => NUM_B200_INPUT_QUANT_COLUMNS,
-        }
-    }
-
-    /// The joined-schedule trace fill at the selected AIR's width: the native advice written
-    /// column-major straight into the caller's zeroed column buffers.
-    fn fill_columns(&self, native: &InputQuantNative, cols: &mut [&mut [F]]) {
-        match self {
-            Self::H100(stark) => stark.program.fill_columns::<F, NUM_INPUT_QUANT_COLUMNS>(native, cols),
-            Self::B200(stark) => stark.program.fill_columns::<F, NUM_B200_INPUT_QUANT_COLUMNS>(native, cols),
-        }
-    }
-}
-
-enum ScaleBackend<F: RichField + Extendable<D>, const D: usize> {
-    H100(ScaleStark<F, D>),
-    B200(ScaleStark<F, D, NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS>),
-}
-
-impl<F: RichField + Extendable<D>, const D: usize> ScaleBackend<F, D> {
-    fn new(program: ScaleProgram) -> Self {
-        match program.device {
-            Device::H100 => Self::H100(ScaleStark::new(program)),
-            Device::B200 => Self::B200(ScaleStark::new(program)),
-        }
-    }
-
-    fn program(&self) -> &ScaleProgram {
-        match self {
-            Self::H100(stark) => &stark.program,
-            Self::B200(stark) => &stark.program,
-        }
-    }
-
-    fn as_stark(&self) -> &dyn BatchStark<F, D> {
-        match self {
-            Self::H100(stark) => stark,
-            Self::B200(stark) => stark,
-        }
-    }
-
-    fn generate_trace(
-        &self,
-        a_rows: &[ScaleRowTuple],
-        b_rows: &[ScaleRowTuple],
-        noise_coverage_sums: &[u64],
-    ) -> (Vec<PolynomialValues<F>>, Vec<F>) {
-        let program = self.program();
-        let public_inputs = program.public_inputs_for_device::<F>();
-        let trace = match self {
-            Self::H100(_) => column_major(&program.generate_trace::<F>(a_rows, b_rows).0),
-            Self::B200(_) => column_major(&program.generate_b200_trace::<F>(a_rows, b_rows, noise_coverage_sums)),
-        };
-        (trace, public_inputs)
-    }
-}
-
 enum MatmulBackend<F: RichField + Extendable<D>, const D: usize> {
     H100(MatmulStarkH100<F, D>),
     B200(MatmulStarkB200<F, D>),
@@ -447,9 +361,9 @@ impl<F: RichField + Extendable<D>, const D: usize> MatmulBackend<F, D> {
 /// One job's fully derived proving/verifying context. See the module docs.
 pub struct Fp8System<F: RichField + Extendable<D>, const D: usize> {
     blake3: Blake3Stark<F, D>,
-    input_quant: InputQuantBackend<F, D>,
+    input_quant: InputQuantStark<F, D>,
     coefficient: CoefficientStark<F, D>,
-    scale: ScaleBackend<F, D>,
+    scale: ScaleStark<F, D>,
     matmul: MatmulBackend<F, D>,
     xor_fold: XorFoldStark<F, D>,
     lut_tables: Vec<super::luts::LutTable>,
@@ -595,9 +509,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
 
         Self {
             blake3: Blake3Stark::new(blake3),
-            input_quant: InputQuantBackend::new(input_quant),
+            input_quant: InputQuantStark::new(input_quant),
             coefficient,
-            scale: ScaleBackend::new(scale),
+            scale: ScaleStark::new(scale),
             matmul,
             xor_fold: XorFoldStark::new(xor_fold),
             luts: lut_tables.iter().copied().map(boxed_lut_stark::<F, D>).collect(),
@@ -626,7 +540,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     }
 
     pub(crate) fn device(&self) -> Device {
-        self.scale.program().device
+        self.scale.program.device
     }
 
     /// The Blake3 witness bounds of this statement's schedule — how many auxiliary
@@ -732,8 +646,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
     pub(super) fn batch_starks(&self) -> Vec<&dyn BatchStark<F, D>> {
         let mut tables: Vec<&dyn BatchStark<F, D>> = vec![
             &self.blake3,
-            self.input_quant.as_stark(),
-            self.scale.as_stark(),
+            &self.input_quant,
+            &self.scale,
             self.matmul.as_stark(),
             &self.xor_fold,
             &self.coefficient,
@@ -810,19 +724,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
 
         // ---- Native InputQuant advice: per-group side witnesses plus the compact per-side
         // outputs the downstream tables consume (Matmul's final codes and lambda scores,
-        // Scale's row tuples and B200 noise-coverage sums, Coefficient's block inputs) — one fused
+        // Scale's row tuples and noise-coverage sums, Coefficient's block inputs) — one fused
         // parallel build, shared by `Arc` across the dead padding groups. ----
         let iq_native = timed!(
             timing,
             "trace: input_quant",
-            self.input_quant.program().build_native(
-                &a_int8,
-                &a_scale_codes,
-                &self.a_noise,
-                &b_int8,
-                &b_scale_codes,
-                &self.b_noise
-            )
+            self.input_quant
+                .program
+                .build_native(&a_int8, &a_scale_codes, &self.a_noise, &b_int8, &b_scale_codes, &self.b_noise)
         );
 
         // ---- Joined trace generation. Given the native advice, the fills are independent
@@ -834,9 +743,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // Blake3 in sequence. Every column destination is a kernel-zeroed allocation:
         // `alloc_zeroed` maps lazy zero pages, so no serial memset stands ahead of the fills
         // and the padding rows need no explicit zeroing pass. ----
-        let iq_num_rows = self.input_quant.program().num_rows();
+        let iq_num_rows = self.input_quant.program.num_rows();
         let mm_num_rows = self.matmul.num_rows();
-        let mut iq_cols = calloc_columns::<F>(self.input_quant.num_columns(), iq_num_rows);
+        let mut iq_cols = calloc_columns::<F>(NUM_INPUT_QUANT_COLUMNS, iq_num_rows);
         let mut mm_cols = calloc_columns::<F>(self.matmul.num_columns(), mm_num_rows);
 
         timing.push("trace: joined-fill", log::Level::Debug);
@@ -847,19 +756,22 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
             let mut mm_slices: Vec<&mut [F]> = mm_cols.iter_mut().map(|c| c.as_mut_slice()).collect();
             plonky2_maybe_rayon::join(
                 || {
-                    self.input_quant.fill_columns(&iq_native, &mut iq_slices);
-                    (self.input_quant.program().public_inputs(),)
+                    self.input_quant.program.fill_columns(&iq_native, &mut iq_slices);
+                    (self.input_quant.program.public_inputs(),)
                 },
                 || {
                     plonky2_maybe_rayon::join(
                         || {
                             // ---- Scale: one aggregate tuple per matrix row, exactly what
-                            // InputQuant committed, plus B200's per-row noise-coverage sums. ----
-                            let (scale_trace, scale_pis) = self.scale.generate_trace(
-                                &iq_native.a_tuples,
-                                &iq_native.b_tuples,
-                                &iq_native.noise_coverage_sums,
-                            );
+                            // InputQuant committed, plus the per-row noise-coverage sums. ----
+                            let (mut scale_rows, scale_pis) = self
+                                .scale
+                                .program
+                                .generate_trace::<F>(&iq_native.a_tuples, &iq_native.b_tuples);
+                            self.scale
+                                .program
+                                .fill_noise_coverage(&mut scale_rows, &iq_native.noise_coverage_sums);
+                            let scale_trace = column_major(&scale_rows);
                             // ---- Coefficient: every block's binary32 `alpha * block_scale`. ----
                             let coefficient_rows = self.coefficient.generate_trace(&iq_native.coefficient_blocks);
                             (scale_trace, scale_pis, coefficient_rows)
@@ -916,7 +828,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // The proof ships the public inputs the witness generates (keys, roots, the geometry
         // and dead-limit slots, the lottery digest); the verifier pins every slot to its own
         // expectations in [`Self::verify`].
-        let generated: [Vec<F>; NUM_TABLES] = [b3_pis.to_vec(), iq_pis.to_vec(), scale_pis, mat_pis, xf_pis.to_vec(), vec![]];
+        let generated: [Vec<F>; NUM_TABLES] = [
+            b3_pis.to_vec(),
+            iq_pis.to_vec(),
+            scale_pis.to_vec(),
+            mat_pis,
+            xf_pis.to_vec(),
+            vec![],
+        ];
 
         // ---- Column-major traces, canonical order. The IQ and Matmul traces' columns were
         // filled in place; wrap the calloc'd vectors without a transpose pass. ----
@@ -940,7 +859,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         // overlapped (one job per table, each internally row-parallel); each
         // job owns its counters, and the results merge exactly (u64 addition
         // commutes). ----
-        let inventories = lut_inventories::<F>(self.device(), self.scale.program());
+        let inventories = lut_inventories::<F>(self.device(), &self.scale.program);
         {
             let label = "trace: lut-check".to_string();
             timing.push(&label, log::Level::Debug);
@@ -1037,11 +956,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Fp8System<F, D> {
         for (t, expected) in [
             NUM_BLAKE3_PUBLIC_INPUTS,
             NUM_INPUT_QUANT_PUBLIC_INPUTS,
-            if self.device() == Device::B200 {
-                NUM_B200_SCALE_PUBLIC_INPUTS
-            } else {
-                NUM_SCALE_PUBLIC_INPUTS
-            },
+            NUM_SCALE_PUBLIC_INPUTS,
             NUM_MATMUL_PUBLIC_INPUTS,
             NUM_XOR_FOLD_PUBLIC_INPUTS,
             0,
@@ -1515,7 +1430,7 @@ mod tests {
         assert_eq!(
             observed,
             [
-                ((323, 288, 48), (137, 8, 123, 24), (1561, 1200, 189)),
+                ((343, 303, 54), (145, 9, 129, 27), (1608, 1191, 207)),
                 ((343, 303, 54), (145, 9, 129, 27), (1567, 1164, 204)),
             ],
             "H100 then B200"
@@ -1600,8 +1515,8 @@ mod tests {
         assert_eq!(config.fri_config.rate_bits, 1);
         assert_eq!(starks[matmul].constraint_degree(), 3);
         let (helpers, zs, _) = CrossTableLookup::num_ctl_helpers_zs_all(system.ctls(), matmul, config.num_challenges, 3);
-        assert_eq!((starks[matmul].num_columns(), helpers, zs), (339, 276, 18));
-        assert_eq!(starks[matmul].num_columns() + helpers + zs + 6, 639);
+        assert_eq!((starks[matmul].num_columns(), helpers, zs), (339, 228, 21));
+        assert_eq!(starks[matmul].num_columns() + helpers + zs + 6, 594);
         let pow2g = NUM_TABLES
             + system
                 .committed_lut_tables()
@@ -1614,8 +1529,8 @@ mod tests {
         let blake3 = Table::Blake3 as usize;
         let (helpers, zs, _) = CrossTableLookup::num_ctl_helpers_zs_all(system.ctls(), blake3, config.num_challenges, 3);
         assert_eq!((starks[blake3].num_columns(), helpers, zs), (452, 303, 24));
-        assert_eq!(system.ctls().len(), 25);
-        assert_eq!(starks.len(), 23);
+        assert_eq!(system.ctls().len(), 27);
+        assert_eq!(starks.len(), 25);
     }
 
     /// The full driver roundtrip on the consistency fixture: setup-time LUT precommitment,
