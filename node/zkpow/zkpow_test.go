@@ -360,3 +360,22 @@ func BenchmarkVerifyProof(b *testing.B) {
 	b.StopTimer()
 	b.ReportMetric(float64(b.Elapsed().Milliseconds())/float64(b.N), "ms/op")
 }
+
+// BenchmarkVerifyProofParallel verifies one certificate from GOMAXPROCS goroutines at once.
+func BenchmarkVerifyProofParallel(b *testing.B) {
+	header := testBlockHeader()
+	cert, err := Mine(header, wire.CertificateVersionV2)
+	require.NoError(b, err)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := VerifyCertificate(header, cert); err != nil {
+				b.Error(err)
+
+				return
+			}
+		}
+	})
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "certs/s")
+}
