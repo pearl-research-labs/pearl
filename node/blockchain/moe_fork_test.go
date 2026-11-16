@@ -154,12 +154,12 @@ func TestSolveBlockSelectsVersionSimNet(t *testing.T) {
 	params := moeSimNetParams()
 	header := &wire.BlockHeader{}
 
-	cert, err := SolveBlock(header, &params, moeForkTestHeight-1)
+	cert, err := SolveBlock(header, nil, &params, moeForkTestHeight-1)
 	require.NoError(t, err)
 	require.Equal(t, wire.CertificateVersionV1, cert.Version(),
 		"pre-fork height must use the V1 certificate")
 
-	cert, err = SolveBlock(header, &params, moeForkTestHeight)
+	cert, err = SolveBlock(header, nil, &params, moeForkTestHeight)
 	require.NoError(t, err)
 	require.Equal(t, wire.CertificateVersionV2, cert.Version(),
 		"at/after fork height must use the V2 certificate")

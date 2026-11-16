@@ -12,13 +12,20 @@ import (
 	"github.com/pearl-research-labs/pearl/node/zkpow"
 )
 
+// cpuMinerV4Device selects the emulated device for zkpow.MineV4 (0 = H100).
+const cpuMinerV4Device = 0
+
 // SolveBlock mines a block certificate for the given header at the given height,
-// producing the certificate version consensus requires at that height.
+// producing the certificate version consensus requires at that height. parent is
+// the header the block extends; only V4 mining reads it, keying the proof to it.
 //
 // On SimNet it returns a lightweight dummy certificate of the required version
 // (no actual mining). For real mining it modifies header.ProofCommitment to
-// match the mined certificate.
-func SolveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32) (wire.BlockCertificate, error) {
+// match the mined certificate. V4 mining is a blocking CPU search at
+// header.Bits, so it is only practical at easy targets such as regtest's.
+func SolveBlock(header, parent *wire.BlockHeader, params *chaincfg.Params,
+	height int32) (wire.BlockCertificate, error) {
+
 	version := params.RequiredCertVersion(height)
 
 	if params.Net == wire.SimNet {
@@ -36,11 +43,17 @@ func SolveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32)
 		}
 	}
 
-	if version == wire.CertificateVersionV1 {
+	switch version {
+	case wire.CertificateVersionV1:
 		return nil, fmt.Errorf("V1 mining not supported in this build; use a pre-fork binary")
+	case wire.CertificateVersionV4:
+		// Returning MineV4 directly would wrap a nil *CertificateV4 in a non-nil interface.
+		cert, err := zkpow.MineV4(header, parent, cpuMinerV4Device)
+		if err != nil {
+			return nil, err
+		}
+		return cert, nil
+	default:
+		return zkpow.Mine(header, version)
 	}
-	if version == wire.CertificateVersionV4 {
-		return nil, fmt.Errorf("FP8 (V4) CPU mining is not available; submit an fp8 certificate")
-	}
-	return zkpow.Mine(header, version)
 }

@@ -36,6 +36,9 @@ func MineV4(header, parent *wire.BlockHeader, device int) (*wire.CertificateV4, 
 	if err := parent.Serialize(&parentBuf); err != nil {
 		return nil, err
 	}
+	// mine_v4 takes the proposed header without its proof commitment, which
+	// mining has yet to produce, and the parent with it.
+	incompleteHeader := headerBuf.Bytes()[:C.IncompleteBlockHeader_SERIALIZED_SIZE]
 	proofBuf := make([]byte, C.MAX_ZK_PROOF_SIZE)
 	var pinner runtime.Pinner
 	pinner.Pin(&proofBuf[0])
@@ -43,7 +46,7 @@ func MineV4(header, parent *wire.BlockHeader, device int) (*wire.CertificateV4, 
 	out := C.CZKProof{proof_blob: (*C.uint8_t)(unsafe.Pointer(&proofBuf[0]))}
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
 	result := C.mine_v4(
-		(*C.uint8_t)(unsafe.Pointer(&headerBuf.Bytes()[0])),
+		(*C.uint8_t)(unsafe.Pointer(&incompleteHeader[0])),
 		(*C.uint8_t)(unsafe.Pointer(&parentBuf.Bytes()[0])),
 		C.uint8_t(device),
 		&out, &errorBuf[0],

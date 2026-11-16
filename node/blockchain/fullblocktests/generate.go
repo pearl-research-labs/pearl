@@ -552,7 +552,7 @@ func (g *testGenerator) nextBlock(blockName string, spend *testhelper.SpendableO
 
 	// Attach a certificate unless the munger already set one.
 	if block.BlockCertificate() == nil {
-		cert, err := blockchain.SolveBlock(block.BlockHeader(), g.params, nextHeight)
+		cert, err := blockchain.SolveBlock(block.BlockHeader(), g.tip.BlockHeader(), g.params, nextHeight)
 		if err != nil {
 			panic(fmt.Sprintf("failed to solve block %q: %v", blockName, err))
 		}
@@ -721,7 +721,7 @@ func (g *testGenerator) padBlockToVsize(b *wire.MsgBlock, targetVsize int) {
 	updateWitnessCommitment(b)
 
 	b.BlockHeader().MerkleRoot = calcMerkleRoot(b.Transactions)
-	cert, _ := blockchain.SolveBlock(b.BlockHeader(), g.params, g.tipHeight+1)
+	cert, _ := blockchain.SolveBlock(b.BlockHeader(), g.tip.BlockHeader(), g.params, g.tipHeight+1)
 	b.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: cert}
 }
 

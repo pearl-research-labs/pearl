@@ -485,8 +485,8 @@ var RegressionNetParams = Params{
 	// Salted noise-seed (V3) fork active from genesis.
 	SaltedSeedForkHeight: 1,
 
-	// FP8 (V4) fork active from genesis. CPU --generate cannot
-	// produce V4 blocks until an fp8 miner exists.
+	// FP8 (V4) fork active from genesis. CPU generate mines V4 blocks
+	// with zkpow.MineV4, so PowLimitBits must stay easy for its CPU search.
 	Fp8ForkHeight: 1,
 
 	// Chain parameters
