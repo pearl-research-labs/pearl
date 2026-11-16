@@ -148,48 +148,36 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash) error {
 	return nil
 }
 
-// ProcessBlock is the main workhorse for handling insertion of new blocks into
-// the block chain.  It includes functionality such as rejecting duplicate
-// blocks, ensuring blocks follow all rules, orphan handling, and insertion into
-// the block chain along with best chain selection and reorganization.
+// checkBlockNotKnown rejects a block that is already in the main chain, a side chain or the orphan pool.
 //
-// When no errors occurred during processing, the first return value indicates
-// whether or not the block is on the main chain and the second indicates
-// whether or not the block is an orphan.
-//
-// This function is safe for concurrent access.
-func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bool, bool, error) {
-	b.chainLock.Lock()
-	defer b.chainLock.Unlock()
-
-	fastAdd := flags&BFFastAdd == BFFastAdd
-
-	blockHash := block.Hash()
-	log.Tracef("Processing block %v", blockHash)
-
-	// The block must not already exist in the main chain or side chains.
-	exists, err := b.blockExists(blockHash)
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) checkBlockNotKnown(hash *chainhash.Hash) error {
+	exists, err := b.blockExists(hash)
 	if err != nil {
-		return false, false, err
+		return err
 	}
 	if exists {
-		str := fmt.Sprintf("already have block %v", blockHash)
-		return false, false, ruleError(ErrDuplicateBlock, str)
+		str := fmt.Sprintf("already have block %v", hash)
+		return ruleError(ErrDuplicateBlock, str)
 	}
 
-	// The block must not already exist as an orphan.
-	if _, exists := b.orphans[*blockHash]; exists {
-		str := fmt.Sprintf("already have block (orphan) %v", blockHash)
-		return false, false, ruleError(ErrDuplicateBlock, str)
+	if _, exists := b.orphans[*hash]; exists {
+		str := fmt.Sprintf("already have block (orphan) %v", hash)
+		return ruleError(ErrDuplicateBlock, str)
 	}
+	return nil
+}
 
-	// Perform preliminary sanity checks on the block and its transactions.
-	sanityStart := time.Now()
-	err = checkBlockSanity(block, b.chainParams, b.timeSource, flags)
-	if err != nil {
-		return false, false, err
-	}
-	b.metrics.BlockSanityChecked(time.Since(sanityStart))
+// checkBlockPosition performs the header checks that depend on where the block attaches to the chain: the previous
+// checkpoint and, when the parent is known, the parent's validity, the contextual header rules and the height-gated
+// certificate rules.  A block whose parent is unknown can only be checked against the checkpoint; maybeAcceptBlock
+// checks the rest once the parent arrives.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) checkBlockPosition(block *btcutil.Block, flags BehaviorFlags) error {
+	blockHash := block.Hash()
+	blockHeader := block.MsgBlock().BlockHeader()
+	prevNode := b.index.LookupNode(&blockHeader.PrevBlock)
 
 	// Find the previous checkpoint and perform some additional checks based
 	// on the checkpoint.  This provides a few nice properties such as
@@ -197,23 +185,20 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 	// rejecting easy to mine, but otherwise bogus, blocks that could be
 	// used to eat memory, and ensuring expected (versus claimed) proof of
 	// work requirements since the previous checkpoint are met.
-	blockHeader := block.MsgBlock().BlockHeader()
 	checkpointNode, err := b.findPreviousCheckpoint()
 	if err != nil {
-		return false, false, err
+		return err
 	}
 	if checkpointNode != nil {
 		// Reject blocks that fork the chain before the previous
 		// checkpoint. Orphans (parent not in our index) are deferred
 		// and re-evaluated when the parent arrives.
-		if prevNode := b.index.LookupNode(&blockHeader.PrevBlock); prevNode != nil &&
-			prevNode.height+1 < checkpointNode.height {
-
+		if prevNode != nil && prevNode.height+1 < checkpointNode.height {
 			str := fmt.Sprintf("block at height %d forks the main "+
 				"chain before the previous checkpoint at "+
 				"height %d", prevNode.height+1,
 				checkpointNode.height)
-			return false, false, ruleError(ErrForkTooOld, str)
+			return ruleError(ErrForkTooOld, str)
 		}
 
 		// Ensure the block timestamp is after the checkpoint timestamp.
@@ -222,9 +207,9 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 			str := fmt.Sprintf("block %v has timestamp %v before "+
 				"last checkpoint timestamp %v", blockHash,
 				blockHeader.Timestamp, checkpointTime)
-			return false, false, ruleError(ErrCheckpointTimeTooOld, str)
+			return ruleError(ErrCheckpointTimeTooOld, str)
 		}
-		if !fastAdd {
+		if flags&BFFastAdd != BFFastAdd {
 			// Even though the checks prior to now have already
 			// ensured the proof of work exceeds the claimed amount,
 			// the claimed amount is a field in the block header
@@ -240,13 +225,100 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 				str := fmt.Sprintf("block target difficulty of %064x "+
 					"is too low when compared to the previous "+
 					"checkpoint", currentTarget)
-				return false, false, ruleError(ErrDifficultyTooLow, str)
+				return ruleError(ErrDifficultyTooLow, str)
 			}
 		}
 	}
 
+	if prevNode == nil {
+		return nil
+	}
+	if b.index.NodeStatus(prevNode).KnownInvalid() {
+		str := fmt.Sprintf("previous block %s is known to be invalid", &blockHeader.PrevBlock)
+		return ruleError(ErrInvalidAncestorBlock, str)
+	}
+
+	flags |= NetBehaviorFlags(b.chainParams)
+	if err := CheckBlockHeaderContext(blockHeader, prevNode, flags, b, false); err != nil {
+		return err
+	}
+	cert := block.MsgBlock().BlockCertificate()
+	return CheckCertificateRules(blockHeader, cert, prevNode.height+1, b.chainParams, flags)
+}
+
+// verifyCertificateUnlocked verifies the block's certificate proof with the chain lock released, so the most expensive
+// check does not stall every other user of the chain.  The proof covers only the block's own header and certificate,
+// so nothing it reads is guarded by the lock, but the chain may change meanwhile: callers must repeat every chain
+// state check after it returns.
+//
+// This function MUST be called with the chain state lock held (for writes) and holds it again on return.
+func (b *BlockChain) verifyCertificateUnlocked(block *btcutil.Block) error {
+	header := block.MsgBlock().BlockHeader()
+	cert := block.MsgBlock().BlockCertificate()
+
+	b.chainLock.Unlock()
+	defer b.chainLock.Lock()
+	return checkCertificateProof(b.verifyCertificate, header, cert)
+}
+
+// ProcessBlock is the main workhorse for handling insertion of new blocks into
+// the block chain.  It includes functionality such as rejecting duplicate
+// blocks, ensuring blocks follow all rules, orphan handling, and insertion into
+// the block chain along with best chain selection and reorganization.
+//
+// Every check that is cheap compared to the certificate proof runs before it,
+// and the proof itself is verified with the chain lock released.
+//
+// When no errors occurred during processing, the first return value indicates
+// whether or not the block is on the main chain and the second indicates
+// whether or not the block is an orphan.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bool, bool, error) {
+	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
+
+	blockHash := block.Hash()
+	log.Tracef("Processing block %v", blockHash)
+
+	if err := b.checkBlockNotKnown(blockHash); err != nil {
+		return false, false, err
+	}
+
+	// Perform preliminary sanity checks on the block and its transactions.
+	// The certificate proof is verified below, after the cheaper checks
+	// against chain state.
+	sanityStart := time.Now()
+	err := checkBlockSanity(block, b.chainParams, b.timeSource, flags|BFNoPoWCheck)
+	if err != nil {
+		return false, false, err
+	}
+	sanityDuration := time.Since(sanityStart)
+
+	if err := b.checkBlockPosition(block, flags); err != nil {
+		return false, false, err
+	}
+
+	if (flags|NetBehaviorFlags(b.chainParams))&BFNoPoWCheck != BFNoPoWCheck {
+		proofStart := time.Now()
+		if err := b.verifyCertificateUnlocked(block); err != nil {
+			return false, false, err
+		}
+		sanityDuration += time.Since(proofStart)
+
+		// Another caller may have accepted this block or its parent, or
+		// moved the checkpoint, while the lock was released.
+		if err := b.checkBlockNotKnown(blockHash); err != nil {
+			return false, false, err
+		}
+		if err := b.checkBlockPosition(block, flags); err != nil {
+			return false, false, err
+		}
+	}
+	b.metrics.BlockSanityChecked(sanityDuration)
+
 	// Handle orphan blocks.
-	prevHash := &blockHeader.PrevBlock
+	prevHash := &block.MsgBlock().BlockHeader().PrevBlock
 	prevHashExists, err := b.blockExists(prevHash)
 	if err != nil {
 		return false, false, err

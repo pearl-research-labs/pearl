@@ -329,12 +329,20 @@ func checkProofOfWork(header *wire.BlockHeader, cert wire.BlockCertificate, powL
 	// The block hash must be less than the claimed target unless the flag
 	// to avoid proof of work checks is set.
 	if flags&BFNoPoWCheck != BFNoPoWCheck {
-		// Verify certificate against header
-		if err := zkpow.VerifyCertificate(header, cert); err != nil {
-			return ruleError(ErrHighHash, fmt.Sprintf("certificate verification failed: %v", err))
-		}
+		return checkCertificateProof(zkpow.VerifyCertificate, header, cert)
 	}
 
+	return nil
+}
+
+// certificateVerifier verifies a block certificate's proof against its header.
+type certificateVerifier func(header *wire.BlockHeader, cert wire.BlockCertificate) error
+
+// checkCertificateProof verifies the certificate proof with verify and reports a failure as ErrHighHash.
+func checkCertificateProof(verify certificateVerifier, header *wire.BlockHeader, cert wire.BlockCertificate) error {
+	if err := verify(header, cert); err != nil {
+		return ruleError(ErrHighHash, fmt.Sprintf("certificate verification failed: %v", err))
+	}
 	return nil
 }
 

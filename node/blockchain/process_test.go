@@ -6,7 +6,9 @@ package blockchain
 
 import (
 	"errors"
+	"fmt"
 	"math"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,7 +76,13 @@ func TestProcessBlock_CheckpointDifficulty(t *testing.T) {
 	require.Equal(t, int32(4), cpNode.height)
 	require.Equal(t, hardBits, cpNode.bits)
 
-	// Build a minimal block that passes checkBlockSanity (SimNet skips PoW).
+	var proofs atomic.Int32
+	verifyProofs(chain, func(*wire.BlockHeader, wire.BlockCertificate) error {
+		proofs.Add(1)
+		return nil
+	})
+
+	// Build a minimal block that passes checkBlockSanity.
 	block4Time := block4.MsgBlock().BlockHeader().Timestamp
 	coinbaseTx := testhelper.CreateCoinbaseTx(
 		6, CalcBlockSubsidy(6, chain.chainParams),
@@ -103,22 +111,24 @@ func TestProcessBlock_CheckpointDifficulty(t *testing.T) {
 		return btcutil.NewBlock(blk)
 	}
 
-	// Block with PowLimitBits (far too easy for the hard checkpoint).
+	// Orphan with PowLimitBits (far too easy for the hard checkpoint). Its
+	// proof must not be verified.
 	_, _, err = chain.ProcessBlock(
 		makeTestBlock(chain.chainParams.PowLimitBits, chainhash.Hash{0x01}),
-		BFNoPoWCheck,
+		BFNone,
 	)
 	require.Error(t, err)
 	var ruleErr RuleError
 	require.ErrorAs(t, err, &ruleErr)
 	assert.Equal(t, ErrDifficultyTooLow, ruleErr.ErrorCode,
 		"expected ErrDifficultyTooLow, got %v", ruleErr.ErrorCode)
+	require.Zero(t, proofs.Load())
 
 	// Block with checkpoint-level difficulty (should pass the checkpoint
 	// check; may fail later for other reasons, but not ErrDifficultyTooLow).
 	_, _, err = chain.ProcessBlock(
 		makeTestBlock(hardBits, chainhash.Hash{0x02}),
-		BFNoPoWCheck,
+		BFNone,
 	)
 	if err != nil {
 		var okRuleErr RuleError
@@ -133,9 +143,10 @@ func TestProcessBlock_CheckpointDifficulty(t *testing.T) {
 	// height must be rejected with ErrForkTooOld, not the difficulty or
 	// timestamp floor.
 	subCheckpointParent := blocks[0].Hash()
+	proofs.Store(0)
 	_, _, err = chain.ProcessBlock(
 		makeTestBlock(chain.chainParams.PowLimitBits, *subCheckpointParent),
-		BFNoPoWCheck,
+		BFNone,
 	)
 	require.Error(t, err)
 	var subErr RuleError
@@ -143,6 +154,7 @@ func TestProcessBlock_CheckpointDifficulty(t *testing.T) {
 	assert.Equal(t, ErrForkTooOld, subErr.ErrorCode,
 		"sub-checkpoint fork should be rejected with ErrForkTooOld, "+
 			"got %v", subErr.ErrorCode)
+	require.Zero(t, proofs.Load())
 }
 
 // TestProcessOrphansFastAddParent stages an overpaying child and a valid sibling as orphans, then processes their
@@ -204,4 +216,253 @@ func TestCheckConnectBlockScriptsBelowCheckpoint(t *testing.T) {
 	var ruleErr RuleError
 	require.ErrorAs(t, err, &ruleErr)
 	require.Equal(t, ErrScriptValidation, ruleErr.ErrorCode)
+}
+
+// verifyProofs makes chain verify certificate proofs with verify, as a network that checks proof of work does.
+// SolveBlock emits placeholder certificates only on SimNet, so build test blocks before calling it.
+func verifyProofs(chain *BlockChain, verify certificateVerifier) {
+	chain.chainParams.Net = wire.RegTest
+	chain.verifyCertificate = verify
+}
+
+// childBlock builds a block on prev and applies mutate to it.
+func childBlock(t *testing.T, chain *BlockChain, prev *btcutil.Block, mutate func(*wire.MsgBlock)) *btcutil.Block {
+	t.Helper()
+	block, _, err := newBlock(chain, prev, nil)
+	require.NoError(t, err)
+	if mutate == nil {
+		return block
+	}
+	msg := block.MsgBlock()
+	mutate(msg)
+	mutated := btcutil.NewBlock(msg)
+	mutated.SetHeight(block.Height())
+	return mutated
+}
+
+// laterTimestamp gives a block a distinct hash from an otherwise identical sibling.
+func laterTimestamp(msg *wire.MsgBlock) {
+	msg.MsgHeader.BlockHeader.Timestamp = msg.MsgHeader.BlockHeader.Timestamp.Add(time.Second)
+}
+
+// TestProcessBlockChecksBeforeProof covers that ProcessBlock rejects a block failing any check cheaper than the
+// certificate proof without verifying the proof, and still reports a bad proof as ErrHighHash.
+func TestProcessBlockChecksBeforeProof(t *testing.T) {
+	chain, teardown, err := chainSetup(t.Name(), &chaincfg.SimNetParams)
+	require.NoError(t, err)
+	defer teardown()
+
+	genesis := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	genesis.SetHeight(0)
+	tip := childBlock(t, chain, genesis, nil)
+	invalidParent := childBlock(t, chain, genesis, laterTimestamp)
+	badProof := childBlock(t, chain, tip, laterTimestamp)
+
+	tests := []struct {
+		name       string
+		block      *btcutil.Block
+		wantErr    error
+		wantProofs int32
+	}{
+		{
+			name:    "duplicate",
+			block:   tip,
+			wantErr: ruleError(ErrDuplicateBlock, ""),
+		},
+		{
+			name: "bad merkle root",
+			block: childBlock(t, chain, tip, func(msg *wire.MsgBlock) {
+				msg.MsgHeader.BlockHeader.MerkleRoot = chainhash.Hash{}
+			}),
+			wantErr: ruleError(ErrBadMerkleRoot, ""),
+		},
+		{
+			name: "difficulty is not the required value",
+			block: childBlock(t, chain, tip, func(msg *wire.MsgBlock) {
+				msg.MsgHeader.BlockHeader.Bits = chain.chainParams.PowLimitBits - 1
+			}),
+			wantErr: ruleError(ErrUnexpectedDifficulty, ""),
+		},
+		{
+			name: "timestamp not after parent",
+			block: childBlock(t, chain, tip, func(msg *wire.MsgBlock) {
+				msg.MsgHeader.BlockHeader.Timestamp = tip.MsgBlock().BlockHeader().Timestamp
+			}),
+			wantErr: ruleError(ErrTimeTooOld, ""),
+		},
+		{
+			name: "certificate version not required at height",
+			block: childBlock(t, chain, tip, func(msg *wire.MsgBlock) {
+				msg.MsgHeader.MsgCertificate.Certificate = &wire.CertificateV1{ProofData: []byte{0x00}}
+			}),
+			wantErr: ruleError(ErrDisallowedCertVersion, ""),
+		},
+		{
+			name:    "parent known invalid",
+			block:   childBlock(t, chain, invalidParent, nil),
+			wantErr: ruleError(ErrInvalidAncestorBlock, ""),
+		},
+		{
+			name:       "bad proof",
+			block:      badProof,
+			wantErr:    ruleError(ErrHighHash, ""),
+			wantProofs: 1,
+		},
+		{
+			name:       "valid",
+			block:      childBlock(t, chain, tip, nil),
+			wantProofs: 1,
+		},
+	}
+
+	var proofs atomic.Int32
+	verifyProofs(chain, func(header *wire.BlockHeader, _ wire.BlockCertificate) error {
+		proofs.Add(1)
+		if header.BlockHash() == *badProof.Hash() {
+			return errors.New("bad proof")
+		}
+		return nil
+	})
+	for _, block := range []*btcutil.Block{tip, invalidParent} {
+		_, _, err := chain.ProcessBlock(block, BFNone)
+		require.NoError(t, err)
+	}
+	chain.index.SetStatusFlags(chain.index.LookupNode(invalidParent.Hash()), statusValidateFailed)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proofs.Store(0)
+			_, _, err := chain.ProcessBlock(tc.block, BFNone)
+			var want RuleError
+			if errors.As(tc.wantErr, &want) {
+				requireRuleError(t, err, want.ErrorCode)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tc.wantProofs, proofs.Load())
+		})
+	}
+}
+
+// TestProcessBlockChainChangesDuringProof holds a block inside proof verification while the chain changes, then
+// checks the block is judged against the changed chain.  The change can only complete if the proof is verified
+// without the chain lock held.
+func TestProcessBlockChainChangesDuringProof(t *testing.T) {
+	processBlock := func(block *btcutil.Block) func(*BlockChain) error {
+		return func(chain *BlockChain) error {
+			_, _, err := chain.ProcessBlock(block, BFNone)
+			return err
+		}
+	}
+	type fixture struct {
+		inFlight  *btcutil.Block
+		meanwhile func(*BlockChain) error
+		wantTip   *chainhash.Hash
+	}
+
+	tests := []struct {
+		name     string
+		build    func(t *testing.T, chain *BlockChain, tip *btcutil.Block) fixture
+		wantErr  error
+		wantMain bool
+	}{
+		{
+			name: "same block accepted meanwhile",
+			build: func(t *testing.T, chain *BlockChain, tip *btcutil.Block) fixture {
+				block := childBlock(t, chain, tip, nil)
+				return fixture{block, processBlock(block), block.Hash()}
+			},
+			wantErr: ruleError(ErrDuplicateBlock, ""),
+		},
+		{
+			name: "parent accepted meanwhile",
+			build: func(t *testing.T, chain *BlockChain, tip *btcutil.Block) fixture {
+				parent := childBlock(t, chain, tip, nil)
+				child := childBlock(t, chain, parent, nil)
+				return fixture{child, processBlock(parent), child.Hash()}
+			},
+			wantMain: true,
+		},
+		{
+			name: "competing block accepted meanwhile",
+			build: func(t *testing.T, chain *BlockChain, tip *btcutil.Block) fixture {
+				block := childBlock(t, chain, tip, nil)
+				competitor := childBlock(t, chain, tip, laterTimestamp)
+				return fixture{block, processBlock(competitor), competitor.Hash()}
+			},
+		},
+		{
+			name: "parent invalidated meanwhile",
+			build: func(t *testing.T, chain *BlockChain, tip *btcutil.Block) fixture {
+				invalidate := func(chain *BlockChain) error { return chain.InvalidateBlock(tip.Hash()) }
+				return fixture{childBlock(t, chain, tip, nil), invalidate, chain.chainParams.GenesisHash}
+			},
+			wantErr: ruleError(ErrInvalidAncestorBlock, ""),
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			chain, teardown, err := chainSetup(fmt.Sprintf("chainchangesduringproof%d", i), &chaincfg.SimNetParams)
+			require.NoError(t, err)
+			defer teardown()
+
+			genesis := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+			genesis.SetHeight(0)
+			tip := childBlock(t, chain, genesis, nil)
+			fx := tc.build(t, chain, tip)
+
+			inFlightHash := *fx.inFlight.Hash()
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var held atomic.Bool
+			verifyProofs(chain, func(header *wire.BlockHeader, _ wire.BlockCertificate) error {
+				if header.BlockHash() == inFlightHash && held.CompareAndSwap(false, true) {
+					close(entered)
+					<-release
+				}
+				return nil
+			})
+			_, _, err = chain.ProcessBlock(tip, BFNone)
+			require.NoError(t, err)
+
+			type result struct {
+				isMainChain, isOrphan bool
+				err                   error
+			}
+			done := make(chan result, 1)
+			go func() {
+				isMainChain, isOrphan, err := chain.ProcessBlock(fx.inFlight, BFNone)
+				done <- result{isMainChain, isOrphan, err}
+			}()
+			select {
+			case <-entered:
+			case res := <-done:
+				t.Fatalf("ProcessBlock returned before verifying the proof: %v", res.err)
+			}
+
+			meanwhile := make(chan error, 1)
+			go func() { meanwhile <- fx.meanwhile(chain) }()
+			select {
+			case err := <-meanwhile:
+				require.NoError(t, err)
+			case <-time.After(30 * time.Second):
+				close(release)
+				t.Fatal("chain lock held during proof verification")
+			}
+			close(release)
+
+			res := <-done
+			var want RuleError
+			if errors.As(tc.wantErr, &want) {
+				requireRuleError(t, res.err, want.ErrorCode)
+			} else {
+				require.NoError(t, res.err)
+			}
+			require.Equal(t, tc.wantMain, res.isMainChain)
+			require.False(t, res.isOrphan)
+			require.Equal(t, *fx.wantTip, chain.BestSnapshot().Hash)
+			require.Zero(t, chain.OrphanCount())
+		})
+	}
 }
