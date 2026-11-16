@@ -360,8 +360,8 @@ func CheckBlockHeaderSanity(header *wire.BlockHeader, cert wire.BlockCertificate
 		return ruleError(ErrCertificateMissing, "block has no certificate")
 	}
 
-	// Verify certificate is not too large (4 bytes for version + certificate payload).
-	certSize := 4 + cert.SerializedSize()
+	// Verify certificate is not too large (version prefix + certificate payload).
+	certSize := wire.CertificateVersionSize + cert.SerializedSize()
 	maxCertSize := wire.MaxCertificateSize(cert.Version())
 	if certSize > maxCertSize {
 		str := fmt.Sprintf("certificate too large: %d bytes (max %d)",

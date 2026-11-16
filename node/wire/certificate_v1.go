@@ -6,7 +6,6 @@ package wire
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
@@ -61,6 +60,9 @@ func (c *CertificateV1) ProofCommitment() chainhash.Hash {
 // Serialize: BlockHash(32) + PublicData(164) + ProofLen(4) + ProofData
 // Version excluded - handled by MsgCertificate.
 func (c *CertificateV1) Serialize(w io.Writer) error {
+	if err := checkBlobLen("proof_data", uint64(len(c.ProofData)), MaxZKProofSize); err != nil {
+		return err
+	}
 	if _, err := w.Write(c.Hash[:]); err != nil {
 		return err
 	}
@@ -90,8 +92,8 @@ func (c *CertificateV1) Deserialize(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &proofLen); err != nil {
 		return err
 	}
-	if proofLen > MaxZKProofSize {
-		return fmt.Errorf("proof data too large: %d bytes (max %d)", proofLen, MaxZKProofSize)
+	if err := checkBlobLen("proof_data", uint64(proofLen), MaxZKProofSize); err != nil {
+		return err
 	}
 	c.ProofData = make([]byte, proofLen)
 	if _, err := io.ReadFull(r, c.ProofData); err != nil {
