@@ -190,35 +190,68 @@ func TestCPUMinerStop(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			miner, chain := newTestMiner(t, &params)
-			solver := &gatedSolver{entered: make(chan struct{}), release: make(chan struct{})}
-			miner.solve = solver.solve
+			t.Run("during solve", func(t *testing.T) {
+				miner, chain := newTestMiner(t, &params)
+				solver := &gatedSolver{entered: make(chan struct{}), release: make(chan struct{})}
+				miner.solve = solver.solve
 
-			errc := tt.start(miner)
-			<-solver.entered
-			r := miner.currentRun()
-			require.NotNil(t, r)
+				errc := tt.start(miner)
+				<-solver.entered
+				r := miner.currentRun()
+				require.NotNil(t, r)
 
-			stopped := make(chan struct{})
-			go func() {
-				tt.stop(miner)
-				close(stopped)
-			}()
-			<-r.quit
-			assert.True(t, miner.IsMining(), "IsMining must not block while Stop waits on a proof")
-			close(solver.release)
-			<-stopped
+				stopped := make(chan struct{})
+				go func() {
+					tt.stop(miner)
+					close(stopped)
+				}()
+				<-r.quit
+				assert.True(t, miner.IsMining(), "IsMining must not block while Stop waits on a proof")
+				close(solver.release)
+				<-stopped
 
-			assert.False(t, miner.IsMining())
-			assert.Equal(t, int32(1), solver.calls.Load())
-			if errc != nil {
-				assert.ErrorIs(t, <-errc, errMinerStopped)
-			}
+				assert.False(t, miner.IsMining())
+				assert.Equal(t, int32(1), solver.calls.Load())
+				if errc != nil {
+					assert.ErrorIs(t, <-errc, errMinerStopped)
+				}
 
-			height := chain.BestSnapshot().Height
-			_, err := miner.GenerateNBlocks(1)
-			require.NoError(t, err)
-			assert.Equal(t, height+1, chain.BestSnapshot().Height)
+				height := chain.BestSnapshot().Height
+				_, err := miner.GenerateNBlocks(1)
+				require.NoError(t, err)
+				assert.Equal(t, height+1, chain.BestSnapshot().Height)
+			})
+
+			t.Run("during template", func(t *testing.T) {
+				miner, _ := newTestMiner(t, &params)
+				var solves atomic.Int32
+				miner.solve = func(header, parent *wire.BlockHeader, p *chaincfg.Params,
+					height int32) (*wire.CertificateV4, error) {
+					solves.Add(1)
+					return blockchain.SolveBlock(header, parent, p, height)
+				}
+
+				// Holding submitBlockLock stalls template creation while Stop closes quit.
+				miner.submitBlockLock.Lock()
+				errc := tt.start(miner)
+				require.Eventually(t, miner.IsMining, time.Second, time.Millisecond)
+
+				stopped := make(chan struct{})
+				go func() {
+					tt.stop(miner)
+					close(stopped)
+				}()
+				r := miner.currentRun()
+				require.NotNil(t, r)
+				<-r.quit
+				miner.submitBlockLock.Unlock()
+				<-stopped
+
+				if errc != nil {
+					assert.ErrorIs(t, <-errc, errMinerStopped)
+				}
+				assert.Zero(t, solves.Load())
+			})
 		})
 	}
 }

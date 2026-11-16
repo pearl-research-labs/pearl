@@ -136,6 +136,9 @@ func (m *CPUMiner) submitBlock(block *btcutil.Block) error {
 }
 
 func (m *CPUMiner) solveAndSubmit(template *mining.BlockTemplate, r *run) (*btcutil.Block, error) {
+	if r.stopped() {
+		return nil, errMinerStopped
+	}
 	msgBlock := template.Block
 	if !msgBlock.BlockHeader().PrevBlock.IsEqual(&m.g.BestSnapshot().Hash) {
 		return nil, errStaleBlock
