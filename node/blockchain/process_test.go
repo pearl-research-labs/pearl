@@ -5,7 +5,6 @@
 package blockchain
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -257,7 +256,7 @@ func TestProcessBlockChecksBeforeProof(t *testing.T) {
 	genesis.SetHeight(0)
 	tip := childBlock(t, chain, genesis, nil)
 	invalidParent := childBlock(t, chain, genesis, laterTimestamp)
-	badProof := []byte{0xba, 0xd0}
+	badProof := childBlock(t, chain, tip, laterTimestamp)
 
 	tests := []struct {
 		name       string
@@ -304,10 +303,8 @@ func TestProcessBlockChecksBeforeProof(t *testing.T) {
 			wantErr: ruleError(ErrInvalidAncestorBlock, ""),
 		},
 		{
-			name: "bad proof",
-			block: childBlock(t, chain, tip, func(msg *wire.MsgBlock) {
-				msg.MsgHeader.MsgCertificate.Certificate.(*wire.CertificateV3).ProofData = badProof
-			}),
+			name:       "bad proof",
+			block:      badProof,
 			wantErr:    ruleError(ErrHighHash, ""),
 			wantProofs: 1,
 		},
@@ -319,9 +316,9 @@ func TestProcessBlockChecksBeforeProof(t *testing.T) {
 	}
 
 	var proofs atomic.Int32
-	verifyProofs(chain, func(_ *wire.BlockHeader, cert wire.BlockCertificate) error {
+	verifyProofs(chain, func(header *wire.BlockHeader, _ wire.BlockCertificate) error {
 		proofs.Add(1)
-		if bytes.Equal(cert.ProofBytes(), badProof) {
+		if header.BlockHash() == *badProof.Hash() {
 			return errors.New("bad proof")
 		}
 		return nil
