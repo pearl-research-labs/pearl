@@ -392,17 +392,6 @@ func TestCertificateBlobCaps(t *testing.T) {
 	}
 }
 
-func TestMaxCertificateSize(t *testing.T) {
-	for _, version := range []wire.CertificateVersion{
-		wire.CertificateVersionV1,
-		wire.CertificateVersionV2,
-		wire.CertificateVersionV3,
-		wire.CertificateVersionV4,
-	} {
-		require.Equal(t, wire.CertificateMaxSize, wire.MaxCertificateSize(version))
-	}
-}
-
 func TestIsCertVersionAllowedV4(t *testing.T) {
 	require.True(t, wire.IsCertVersionAllowed(wire.CertificateVersionV4))
 	require.False(t, wire.IsCertVersionAllowed(wire.CertificateVersion(5)))

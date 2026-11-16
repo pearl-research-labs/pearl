@@ -98,12 +98,6 @@ const (
 	CertificateVersionV4   CertificateVersion = 4
 )
 
-// MaxCertificateSize returns the encoded-size cap for every certificate
-// version, including the 4-byte version prefix.
-func MaxCertificateSize(CertificateVersion) int {
-	return CertificateMaxSize
-}
-
 // BlockCertificate is the interface that all certificate types must implement.
 // Certificate types are responsible for their own serialization of fields,
 // but the version-based dispatch is handled by MsgCertificate.
@@ -158,9 +152,8 @@ func (m *MsgCertificate) PrlEncode(w io.Writer, pver uint32) error {
 		return binary.Write(w, binary.LittleEndian, uint32(CertificateVersionNull))
 	}
 
-	maxSize := MaxCertificateSize(m.Certificate.Version())
-	if size := m.SerializeSize(); size > maxSize {
-		return fmt.Errorf("certificate too large: %d bytes (max %d)", size, maxSize)
+	if size := m.SerializeSize(); size > CertificateMaxSize {
+		return fmt.Errorf("certificate too large: %d bytes (max %d)", size, CertificateMaxSize)
 	}
 
 	// Write version first for polymorphic decoding
@@ -200,8 +193,7 @@ func (m *MsgCertificate) PrlDecode(r io.Reader, pver uint32) error {
 		return fmt.Errorf("unsupported certificate version: %d", version)
 	}
 
-	maxFields := MaxCertificateSize(CertificateVersion(version)) - CertificateVersionSize
-	return m.Certificate.Deserialize(io.LimitReader(r, int64(maxFields)))
+	return m.Certificate.Deserialize(io.LimitReader(r, CertificateMaxSize-CertificateVersionSize))
 }
 
 // SerializeSize returns the total number of bytes needed to serialize the certificate.
