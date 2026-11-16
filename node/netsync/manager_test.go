@@ -281,6 +281,25 @@ func TestIsSyncCandidate(t *testing.T) {
 }
 
 // TestLimitAdd pins that limitAdd evicts only to make room for a key it doesn't already hold.
+// TestCertificateVerifiedWithHeader checks that a block skips its certificate check only when it
+// carries exactly the certificate verified with its header.
+func TestCertificateVerifiedWithHeader(t *testing.T) {
+	cert := func(proof byte) wire.MsgCertificate {
+		return wire.MsgCertificate{Certificate: &wire.CertificateV2{PublicDataLen: 4, ProofData: []byte{1, 2, proof}}}
+	}
+	block := func(c wire.MsgCertificate) *btcutil.Block {
+		return btcutil.NewBlock(&wire.MsgBlock{MsgHeader: wire.MsgHeader{MsgCertificate: c}})
+	}
+	verified := cert(3)
+	node := &headerNode{certHash: certificateHash(&verified)}
+	require.NotNil(t, node.certHash)
+
+	require.True(t, certificateVerifiedWithHeader(node, block(cert(3))))
+	require.False(t, certificateVerifiedWithHeader(node, block(cert(4))), "different proof")
+	require.False(t, certificateVerifiedWithHeader(node, block(wire.MsgCertificate{})), "no certificate")
+	require.False(t, certificateVerifiedWithHeader(&headerNode{}, block(cert(3))), "anchor node")
+}
+
 func TestLimitAdd(t *testing.T) {
 	t.Parallel()
 
