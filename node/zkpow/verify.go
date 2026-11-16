@@ -19,6 +19,8 @@ import "C"
 import (
 	"fmt"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/pearl-research-labs/pearl/node/wire"
@@ -185,6 +187,59 @@ func VerifyZKProofFFI(
 	default:
 		return fmt.Errorf("unknown verification result %d: %s", result, msg)
 	}
+}
+
+// BatchVerify verifies certs[i] against headers[i], up to GOMAXPROCS at once, and returns how many
+// leading certificates are valid and, if not all are, the next one's VerifyCertificate error.
+// Verifying several at once has more throughput than verifying them in turn: one verification gains
+// little from the cores it spreads over.
+func BatchVerify(headers []*wire.BlockHeader, certs []wire.BlockCertificate) (int, error) {
+	if len(headers) != len(certs) {
+		return 0, fmt.Errorf("BatchVerify: %d headers but %d certificates", len(headers), len(certs))
+	}
+
+	// One buffered channel per certificate, so results are read in index order and sends never block.
+	results := make([]chan error, len(certs))
+	for i := range results {
+		results[i] = make(chan error, 1)
+	}
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	stop := make(chan struct{}) // close stop happens before we wait on wg.
+	defer close(stop)
+
+	var claimed atomic.Int64
+	for range batchWorkers() {
+		wg.Go(func() {
+			for {
+				i := int(claimed.Add(1) - 1)
+				if i >= len(certs) {
+					return
+				}
+
+				select {
+				case <-stop:
+					return
+				case results[i] <- VerifyCertificate(headers[i], certs[i]):
+				}
+			}
+		})
+	}
+
+	for i, result := range results {
+		if err := <-result; err != nil {
+			return i, err
+		}
+	}
+
+	return len(certs), nil
+}
+
+// batchWorkers returns how many certificates BatchVerify verifies at once.
+func batchWorkers() int {
+	return runtime.GOMAXPROCS(0)
 }
 
 // CheckRankPenalty checks public data against the rank-penalty rule, measuring the
