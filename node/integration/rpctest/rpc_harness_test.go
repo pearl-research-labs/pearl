@@ -221,7 +221,8 @@ func testJoinMempools(r *Harness, t *testing.T) {
 		for {
 			poolHashes, err := r.Client.GetRawMempool()
 			if err != nil {
-				t.Fatalf("failed to retrieve harness mempool: %v", err)
+				t.Errorf("failed to retrieve harness mempool: %v", err)
+				return
 			}
 			if len(poolHashes) > 0 {
 				break
@@ -241,7 +242,8 @@ func testJoinMempools(r *Harness, t *testing.T) {
 	poolsSynced := make(chan struct{})
 	go func() {
 		if err := JoinNodes(nodeSlice, Mempools); err != nil {
-			t.Fatalf("unable to join node on mempools: %v", err)
+			t.Errorf("unable to join node on mempools: %v", err)
+			return
 		}
 		poolsSynced <- struct{}{}
 	}()
@@ -294,7 +296,8 @@ func testJoinBlocks(r *Harness, t *testing.T) {
 	blocksSynced := make(chan struct{})
 	go func() {
 		if err := JoinNodes(nodeSlice, Blocks); err != nil {
-			t.Fatalf("unable to join node on blocks: %v", err)
+			t.Errorf("unable to join node on blocks: %v", err)
+			return
 		}
 		blocksSynced <- struct{}{}
 	}()
