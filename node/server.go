@@ -751,6 +751,8 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte) {
 				sp.addBanScore(101, 0, rErr.Error())
 
 			case blockchain.ErrDisallowedCertVersion,
+				blockchain.ErrRankPenalty,
+				blockchain.ErrInvalidAncestorBlock,
 				blockchain.ErrBadCheckpoint,
 				blockchain.ErrCheckpointTimeTooOld,
 				blockchain.ErrMissingCoinbaseHeight,
