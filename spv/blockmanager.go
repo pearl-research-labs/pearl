@@ -2461,6 +2461,17 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 	}
 
+	// Verify up front, in parallel, the certificates the loop below would verify.
+	verified := 0
+	if tail := b.headerList.Back(); tail != nil {
+		stopHeight := int32(-1)
+		if b.nextCheckpoint != nil {
+			stopHeight = b.nextCheckpoint.Height
+		}
+		verified = blockchain.VerifyHeaderCertificates(msg.Headers, tail.Header.BlockHash(), tail.Height, stopHeight,
+			&b.cfg.ChainParams, b.cfg.TimeSource)
+	}
+
 	// Process all of the received headers ensuring each one connects to
 	// the previous and that checkpoints match.
 	receivedCheckpoint := false
@@ -2507,9 +2518,13 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 		if prevHash.IsEqual(&blockHeader.PrevBlock) {
 			prevNodeHeight := prevNode.Height
 			prevNodeHeader := prevNode.Header
+			certFlags := blockchain.BFNone
+			if i < verified {
+				certFlags = blockchain.BFCertificateVerified
+			}
 			err := b.checkHeaderSanity(
 				blockHeader, cert, false, prevNodeHeight,
-				&prevNodeHeader,
+				&prevNodeHeader, certFlags,
 			)
 			if err != nil {
 				b.punishHeaderSanityErr(hmsg.peer, err)
@@ -2641,7 +2656,7 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 
 				err = b.checkHeaderSanity(
 					reorgHeader, reorgCert, true,
-					int32(prevNodeHeight), prevNodeHeader,
+					int32(prevNodeHeight), prevNodeHeader, blockchain.BFNone,
 				)
 				if err != nil {
 					b.punishHeaderSanityErr(hmsg.peer, err)
@@ -2895,10 +2910,10 @@ func (b *blockManager) punishHeaderSanityErr(p *ServerPeer, err error) {
 // checkHeaderSanity performs contextual and context-less checks on the passed
 // wire.BlockHeader and wire.BlockCertificate. This function calls blockchain.CheckBlockHeaderContext for
 // the contextual check and blockchain.CheckBlockHeaderSanity for context-less
-// checks.
+// checks, to which it passes certFlags.
 func (b *blockManager) checkHeaderSanity(blockHeader *wire.BlockHeader,
 	cert wire.BlockCertificate, reorgAttempt bool, prevNodeHeight int32,
-	prevNodeHeader *wire.BlockHeader) error {
+	prevNodeHeader *wire.BlockHeader, certFlags blockchain.BehaviorFlags) error {
 
 	// Create the lightHeaderCtx for the blockHeader's parent.
 	hList := b.headerList
@@ -2930,7 +2945,7 @@ func (b *blockManager) checkHeaderSanity(blockHeader *wire.BlockHeader,
 
 	return blockchain.CheckBlockHeaderSanity(
 		blockHeader, cert, b.cfg.ChainParams.PowLimit, b.cfg.TimeSource,
-		b.cfg.ChainParams.MaxTimeOffsetMinutes, flags,
+		b.cfg.ChainParams.MaxTimeOffsetMinutes, flags|certFlags,
 	)
 }
 
