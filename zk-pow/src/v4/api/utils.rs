@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 
 use crate::v4::api::dtype::{check_not_nan_or_inf_bf16, check_not_nan_or_inf_f32};
 use crate::v4::api::layout::JACKPOT_ENTRIES;
@@ -19,11 +19,8 @@ const B200_FP8_WIDTH: u16 = 26;
 const H100_FP8_WIDTH: u16 = 14;
 const H100_WINDOW_PRODUCTS: usize = 128;
 
-pub const DOWNSCALE_G_SMALL_RMS: f32 = 0.1;
-
 pub const SMALL_RMS_THRESHOLD: f32 = 8.0;
-
-pub const DOWNSCALE_G: f32 = 0.08;
+pub const RMS_THRESHOLD: f32 = 4.0;
 
 pub const E4M3_EXP_SHIFT: i32 = 3;
 pub const E4M3_SIGN_SHIFT: i32 = 7;
@@ -186,16 +183,11 @@ fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
     }
 }
 
-pub fn downscale_g(scaled_rms: &[f32]) -> Vec<f32> {
+pub fn downscale_g(scaled_rms: &[f32], device: Device) -> Vec<f32> {
+    let (g, g_small) = device.downscale_g();
     scaled_rms
         .iter()
-        .map(|&x| {
-            if x >= SMALL_RMS_THRESHOLD {
-                DOWNSCALE_G
-            } else {
-                DOWNSCALE_G_SMALL_RMS
-            }
-        })
+        .map(|&x| if x >= SMALL_RMS_THRESHOLD { g } else { g_small })
         .collect()
 }
 
@@ -664,7 +656,11 @@ mod tests {
             (0..len)
                 .map(|_| {
                     let code: u8 = rng.random();
-                    if code & 0x7f == 0x7f { code ^ 1 } else { code }
+                    if code & 0x7f == 0x7f {
+                        code ^ 1
+                    } else {
+                        code
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -726,7 +722,11 @@ mod tests {
             (0..len)
                 .map(|_| {
                     let code: u8 = rng.random();
-                    if code & 0x7f == 0x7f { code ^ 1 } else { code }
+                    if code & 0x7f == 0x7f {
+                        code ^ 1
+                    } else {
+                        code
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -876,8 +876,8 @@ mod tests {
     fn matmul_fp8_handles_zeros_without_panicking() {
         let hw = B200 {};
         let k = 16; // one TILE_D-deep tile
-        // 0x38 = fp8 E4M3 encoding of 1.0; 0x00 = zero. Interleave so every output
-        // cell mixes zero and non-zero products (the case that stressed group_sum).
+                    // 0x38 = fp8 E4M3 encoding of 1.0; 0x00 = zero. Interleave so every output
+                    // cell mixes zero and non-zero products (the case that stressed group_sum).
         let a: Vec<u8> = (0..2 * k).map(|i| if i % 3 == 0 { 0x00 } else { 0x38 }).collect();
         let b: Vec<u8> = (0..2 * k).map(|i| if i % 2 == 0 { 0x38 } else { 0x00 }).collect();
 

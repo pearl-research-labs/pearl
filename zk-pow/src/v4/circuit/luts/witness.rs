@@ -135,7 +135,7 @@ impl LutMultiplicities {
                 }
             }
             LutTable::RneRnd => fold(17),
-            LutTable::DownscaleThreshold => fold(15),
+            LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 => fold(15),
             LutTable::DownscaleRewrite => fold(16),
             LutTable::ProdAlign15 | LutTable::B200Align | LutTable::WidthNorm => fold(16),
             LutTable::Pow2G => match keys[0] {

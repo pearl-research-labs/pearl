@@ -49,7 +49,7 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 | LutTable::Pow2G
                 | LutTable::Fp32Tools => 2,
                 LutTable::Xor8 => 3,
-                LutTable::DownscaleThreshold | LutTable::Int8Dec | LutTable::RneRnd => 4,
+                LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 | LutTable::Int8Dec | LutTable::RneRnd => 4,
                 LutTable::ProdAlign15 | LutTable::B200Align => 5,
                 _ => 1,
             };
@@ -239,9 +239,18 @@ pub fn generate<F: Field>(table: LutTable, slot: usize) -> Vec<Vec<F>> {
                 columns[0].push(f(left));
                 columns[1].push(f(right));
             }
-            LutTable::DownscaleThreshold => {
-                let (threshold, coefficient, region, base) =
-                    super::super::unpredictability::noise_coverage_row_parameters(32768 + key, 269 + slot as u64);
+            LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 => {
+                let device = if table == LutTable::DownscaleThreshold {
+                    crate::v4::api::public_params::Device::B200
+                } else {
+                    crate::v4::api::public_params::Device::H100
+                };
+                let base_encoding = 256 + device.sigma_encoding_offset();
+                let (threshold, coefficient, region, base) = super::super::unpredictability::noise_coverage_row_parameters(
+                    device,
+                    32768 + key,
+                    base_encoding + slot as u64,
+                );
                 for (column, value) in columns.iter_mut().zip([threshold, coefficient, region, base]) {
                     column.push(f(value));
                 }
@@ -296,6 +305,14 @@ pub fn lut_precommitted_values<F: Field>(table: LutTable) -> Vec<Vec<F>> {
                 small[3].clone(),
                 large[3].clone(),
             ]);
+        }
+        LutTable::DownscaleThresholdH100 => {
+            cols.push((0..table_height).map(F::from_canonical_usize).collect());
+            let mut base = generate::<F>(table, 0);
+            cols.push(base.remove(0)); // Threshold at slot 0.
+            cols.push(base.remove(0)); // Shared coefficient.
+            base.remove(0);
+            cols.push(base.remove(0)); // Key base at slot 0.
         }
         // The stored key tuple `(region, index)` and the value column.
         LutTable::Log16 => {
@@ -527,6 +544,9 @@ pub(crate) fn boxed_lut_stark<F: RichField + Extendable<D>, const D: usize>(tabl
         LutTable::DownscaleThreshold => Box::new(LutStark::<F, D, { lut_num_columns(LutTable::DownscaleThreshold) }>::new(
             table,
         )),
+        LutTable::DownscaleThresholdH100 => Box::new(
+            LutStark::<F, D, { lut_num_columns(LutTable::DownscaleThresholdH100) }>::new(table),
+        ),
         LutTable::DownscaleRewrite => Box::new(LutStark::<F, D, { lut_num_columns(LutTable::DownscaleRewrite) }>::new(table)),
     }
 }

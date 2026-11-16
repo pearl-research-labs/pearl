@@ -17,11 +17,11 @@ use starky::cross_table_lookup::TableWithColumns;
 use starky::lookup::{Column, Filter};
 
 use super::super::ctl::Table;
-use super::super::luts::LutTable;
 use super::super::luts::ctl::LutLookup;
+use super::super::luts::LutTable;
 use super::columns::{
-    B_BLOCK_KEY_OFFSET_PUBLIC_INPUT, B_KEY_OFFSET_PUBLIC_INPUT, BlockL2Columns, INPUT_QUANT_COL_MAP, InputQuantScheduleColumns,
-    InputQuantSideColumns, OPERAND_MULT_A_PUBLIC_INPUT, OPERAND_MULT_B_PUBLIC_INPUT, input_quant_column_map,
+    BlockL2Columns, InputQuantScheduleColumns, InputQuantSideColumns, B_BLOCK_KEY_OFFSET_PUBLIC_INPUT, B_KEY_OFFSET_PUBLIC_INPUT,
+    INPUT_QUANT_COL_MAP, OPERAND_MULT_A_PUBLIC_INPUT, OPERAND_MULT_B_PUBLIC_INPUT,
 };
 use crate::v4::api::public_params::Device;
 
@@ -76,15 +76,11 @@ fn b_element_key<F: Field>() -> Column<F> {
 /// there, the INT8DEC key domain here). Dead (phantom-fill) rows are excluded by the liveness
 /// factor; the wrap instance of the next-row packing is filtered out: the last live row of a
 /// side is odd (`h*k`/`w*k` are even).
-pub fn ctl_int8_bytes_looked_input_quant<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
-    let m = &input_quant_column_map(device);
+pub fn ctl_int8_bytes_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F>> {
+    let m = &INPUT_QUANT_COL_MAP;
     [
-        (
-            Column::single(m.schedule.element_index),
-            m.sides[0].int8_byte,
-            m.schedule.a_live,
-        ),
-        (b_element_key(), m.sides[1].int8_byte, m.schedule.b_live),
+        (Column::single(m.schedule.element_index), m.a.int8_byte, m.schedule.a_live),
+        (b_element_key(), m.b.int8_byte, m.schedule.b_live),
     ]
     .map(|(key, col, live)| {
         TableWithColumns::new(
@@ -104,13 +100,13 @@ pub fn ctl_int8_bytes_looked_input_quant<F: Field>(device: Device) -> Vec<TableW
 /// `blake3_stark::ctl::ctl_block_scales_looking_blake3`; its LE byte-pair packing equals this
 /// affine code expression numerically). Dead rows' phantom scales are excluded by the
 /// liveness factor.
-pub fn ctl_block_scales_looked_input_quant<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
-    let m = &input_quant_column_map(device);
+pub fn ctl_block_scales_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F>> {
+    let m = &INPUT_QUANT_COL_MAP;
     [
-        (Column::single(m.schedule.block_index), &m.sides[0].scale, m.schedule.a_live),
+        (Column::single(m.schedule.block_index), &m.a.scale, m.schedule.a_live),
         (
             Column::single_plus_public_input(m.schedule.block_index, B_BLOCK_KEY_OFFSET_PUBLIC_INPUT),
-            &m.sides[1].scale,
+            &m.b.scale,
             m.schedule.b_live,
         ),
     ]
@@ -132,7 +128,7 @@ pub fn ctl_block_scales_looked_input_quant<F: Field>(device: Device) -> Vec<Tabl
 /// noised fp8 codes packed into one field element, and the same two elements' summand
 /// scores `LAMBDA` (jackpot check 3) as separate slots.
 ///
-/// H100 exports QCAST's `code_noised`; B200 exports DOWNSCALEREWRITE's `output_code`, after
+/// Each side exports DOWNSCALEREWRITE's `output_code`, after
 /// the conditional byte rewrite. Those lookups prove each packed component is a byte, and
 /// Matmul's alignment lookup binds the same bytes there. The lambda scores still describe
 /// the clean-data `alpha*X` and sigma, independently of that rewrite. Matmul reuses each A
@@ -140,20 +136,20 @@ pub fn ctl_block_scales_looked_input_quant<F: Field>(device: Device) -> Vec<Tabl
 /// output cells, so the CTL filter carries the multiplicity — the public-input term
 /// `w * IS_EVEN_ROW` (resp. `h * IS_EVEN_ROW`) times the liveness column — instead of
 /// physically repeating each tuple.
-pub fn ctl_operand_codes_looked_input_quant<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
-    let m = &input_quant_column_map(device);
+pub fn ctl_operand_codes_looked_input_quant<F: Field>() -> Vec<TableWithColumns<F>> {
+    let m = &INPUT_QUANT_COL_MAP;
     [
         (
             Column::single(m.schedule.element_index),
-            m.downscale.map_or(m.sides[0].code_noised, |(_, sides)| sides[0].output_code),
-            m.sides[0].lambda,
+            m.a.downscale.output_code,
+            m.a.lambda,
             m.schedule.a_live,
             OPERAND_MULT_A_PUBLIC_INPUT,
         ),
         (
             b_element_key(),
-            m.downscale.map_or(m.sides[1].code_noised, |(_, sides)| sides[1].output_code),
-            m.sides[1].lambda,
+            m.b.downscale.output_code,
+            m.b.lambda,
             m.schedule.b_live,
             OPERAND_MULT_B_PUBLIC_INPUT,
         ),
@@ -178,12 +174,12 @@ pub fn ctl_operand_codes_looked_input_quant<F: Field>(device: Device) -> Vec<Tab
 /// aggregate per matrix row, sent from *live* group-final rows (filter `IS_GROUP_FINAL *
 /// LIVE`; dead groups have no ScaleStark counterpart). The group-final key `(g+1)*k - 1` is
 /// ScaleStark's group key — `ELEM_IDX` for A, `ELEM_IDX + h*k` (public-input offset) for B.
-/// The last two slots bind the group's committed `SIGMA_ENC` and `SIGMA_NORM` to ScaleStark's
-/// exact sigma encoding and normalized significand. B200 appends the strip threshold,
+/// Slots 12 and 13 bind the group's committed `SIGMA_ENC` and `SIGMA_NORM` to ScaleStark's
+/// exact sigma encoding and normalized significand, followed by the strip threshold,
 /// Gaussian LOG16 region, key base, and kernel sum.
-pub fn ctl_group_tuples_looking_input_quant<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
-    let m = &input_quant_column_map(device);
-    m.sides
+pub fn ctl_group_tuples_looking_input_quant<F: Field>() -> Vec<TableWithColumns<F>> {
+    let m = &INPUT_QUANT_COL_MAP;
+    [&m.a, &m.b]
         .iter()
         .enumerate()
         .map(|(index, side)| {
@@ -205,17 +201,11 @@ pub fn ctl_group_tuples_looking_input_quant<F: Field>(device: Device) -> Vec<Tab
                 side.dead_count,
                 side.sigma_enc,
                 side.sigma_norm,
+                side.downscale.strip_threshold,
+                side.noise_coverage_region,
+                side.noise_coverage_key_base,
+                side.noise_coverage_sum,
             ]));
-            if device == Device::B200 {
-                let map = &super::columns::B200_INPUT_QUANT_COL_MAP;
-                let noise_coverage = [&map.a, &map.b][index];
-                columns.extend(Column::singles([
-                    noise_coverage.downscale.strip_threshold,
-                    noise_coverage.noise_coverage_region,
-                    noise_coverage.noise_coverage_key_base,
-                    noise_coverage.noise_coverage_sum,
-                ]));
-            }
             let live = [m.schedule.a_live, m.schedule.b_live][index];
             TableWithColumns::new(
                 Table::InputQuant.into(),
@@ -596,12 +586,12 @@ fn side_lut_lookups<F: Field>(s: &SideCols) -> Vec<LutLookup<F>> {
     ]
 }
 
-/// Complete per-row inventory: 182 H100 instances (including group G's five noise-decode
-/// bindings); B200 adds eight downscale instances and two Gaussian-kernel instances.
+/// Complete per-row inventory: 192 instances (including group G's five noise-decode
+/// bindings, eight downscale instances and two Gaussian-kernel instances).
 pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
-    let map = input_quant_column_map(device);
+    let map = &INPUT_QUANT_COL_MAP;
     let mut lookups = Vec::new();
-    for (side, live) in map.sides.iter().zip([map.schedule.a_live, map.schedule.b_live]) {
+    for (side, live) in [&map.a, &map.b].into_iter().zip([map.schedule.a_live, map.schedule.b_live]) {
         lookups.extend(side_lut_lookups(&side_cols(side, &map.schedule, live)));
         lookups.extend(crate::v4::circuit::fp32::alignment_lookups(&side.alignment));
         lookups.extend(crate::v4::circuit::fp32::rounding_lookups(
@@ -639,9 +629,9 @@ pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
         ])));
     }
     for (first, second) in [
-        (map.sides[0].scale.mantissa, map.sides[1].scale.mantissa),
-        (map.sides[0].alpha_mantissa, map.sides[1].alpha_mantissa),
-        (map.sides[0].beta_mantissa, map.sides[1].beta_mantissa),
+        (map.a.scale.mantissa, map.b.scale.mantissa),
+        (map.a.alpha_mantissa, map.b.alpha_mantissa),
+        (map.a.beta_mantissa, map.b.beta_mantissa),
         (map.schedule.noise_fraction_high_a, map.schedule.noise_fraction_high_b),
     ] {
         lookups.push(LutLookup {
@@ -651,37 +641,35 @@ pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
             filter: Filter::default(),
         });
     }
-    if let Some((start, downscale)) = map.downscale {
+    {
+        let start = map.is_coin_start;
         let start_filter = Filter::from_column(Column::single(start));
         lookups.push(LutLookup {
             table: LutTable::Pair128,
-            keys: downscale.iter().map(|side| Column::single(side.coin_field)).collect(),
+            keys: [&map.a, &map.b]
+                .iter()
+                .map(|side| Column::single(side.downscale.coin_field))
+                .collect(),
             values: vec![],
             filter: start_filter.clone(),
         });
         lookups.push(LutLookup {
             table: LutTable::Bytes2,
-            keys: map
-                .sides
+            keys: [&map.a, &map.b]
                 .iter()
-                .zip(downscale)
-                .map(|(side, down)| {
+                .map(|side| {
                     Column::linear_combination([
                         (side.rounding.output.fraction_low, F::ONE),
-                        (down.fraction_bit_15, -F::from_canonical_u64(32768)),
-                        (down.coin_field, -F::from_canonical_u64(256)),
+                        (side.downscale.fraction_bit_15, -F::from_canonical_u64(32768)),
+                        (side.downscale.coin_field, -F::from_canonical_u64(256)),
                     ])
                 })
                 .collect(),
             values: vec![],
             filter: start_filter,
         });
-        for ((side, down), live) in map
-            .sides
-            .iter()
-            .zip(downscale)
-            .zip([map.schedule.a_live, map.schedule.b_live])
-        {
+        for (side, live) in [&map.a, &map.b].into_iter().zip([map.schedule.a_live, map.schedule.b_live]) {
+            let down = side.downscale;
             lookups.push(LutLookup::rc16_filtered(
                 Column::linear_combination_with_constant([(down.coin_field, -F::ONE)], F::from_canonical_u64(111)),
                 Filter::new(vec![(Column::single(start), Column::single(down.coin))], vec![]),
@@ -700,13 +688,13 @@ pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
             //
             //   key = c + 2^8*t + 2^15*b + 2^16*e,
             //   c = code_noised in [0,256), t = strip_threshold in [0,128),
-            //   b = coin in {0,1}, e = sigma_enc-269 in 0..=5.
+            //   b = coin in {0,1}, e = sigma_enc - 256 - offset(device) in 0..=5.
             //
             // QCAST bounds c, Scale's group tuple/threshold LUT binds t and e, and the
             // coin extraction above plus evaluate_downscale bind b. The fields occupy
             // disjoint bit ranges: code 0..7, threshold 8..14, coin 15. The exponent
             // selects one of six folded slots, each offset by 65536, rather than a
-            // separate online table. Since sigma_enc=floor(log2(s/2))+268 on B200,
+            // separate online table. Since sigma_enc=floor(log2(delta*s))+268,
             // e=floor(log2(s))-2 is precisely the replacement E4M3 exponent field.
             //
             // The table returns ((c&128)|(8*e)|(c&7)|1) when b && (c&127)<t,
@@ -721,14 +709,14 @@ pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
                         (down.coin, F::from_canonical_u64(32768)),
                         (side.sigma_enc, F::from_canonical_u64(65536)),
                     ],
-                    -F::from_canonical_u64(65536 * 269),
+                    -F::from_canonical_u64(65536 * (256 + device.sigma_encoding_offset())),
                 )],
                 values: vec![Column::single(down.output_code)],
                 filter: Filter::from_column(Column::single(live)),
             });
         }
     }
-    // ---- Check 4: one Q16 Gaussian contribution per live B200 element. ----
+    // ---- Check 4: one Q16 Gaussian contribution per live element. ----
     // LOG16 is shared: region 0 serves the score logarithm; region=1+class serves
     // min(T(d),cap_class), where
     //
@@ -742,26 +730,23 @@ pub fn input_quant_lut_lookups<F: Field>(device: Device) -> Vec<LutLookup<F>> {
     // a negative d or d>=8192 has no row in this region and cannot borrow a neighboring
     // region's entry. InputQuant sums gaussian_value over the group and exports the total;
     // Scale multiplies it by the row coefficient and proves the mean noise coverage >=1/25.
-    if device == Device::B200 {
-        let m = &super::columns::B200_INPUT_QUANT_COL_MAP;
-        for (side, live) in [(&m.a, m.schedule.a_live), (&m.b, m.schedule.b_live)] {
-            lookups.push(LutLookup {
-                table: LutTable::Log16,
-                keys: vec![
-                    Column::single(side.noise_coverage_region),
-                    Column::linear_combination([(side.common.lambda, F::ONE), (side.noise_coverage_key_base, -F::ONE)]),
-                ],
-                values: vec![Column::single(side.gaussian_value)],
-                filter: Filter::from_column(Column::single(live)),
-            });
-        }
+    for (side, live) in [(&map.a, map.schedule.a_live), (&map.b, map.schedule.b_live)] {
+        lookups.push(LutLookup {
+            table: LutTable::Log16,
+            keys: vec![
+                Column::single(side.noise_coverage_region),
+                Column::linear_combination([(side.lambda, F::ONE), (side.noise_coverage_key_base, -F::ONE)]),
+            ],
+            values: vec![Column::single(side.gaussian_value)],
+            filter: Filter::from_column(Column::single(live)),
+        });
     }
     lookups
 }
 
-pub(crate) fn coefficient_looking<F: Field>(device: Device) -> Vec<TableWithColumns<F>> {
-    let map = input_quant_column_map(device);
-    map.sides
+pub(crate) fn coefficient_looking<F: Field>() -> Vec<TableWithColumns<F>> {
+    let map = &INPUT_QUANT_COL_MAP;
+    [&map.a, &map.b]
         .iter()
         .zip([map.schedule.a_live, map.schedule.b_live])
         .enumerate()
@@ -804,10 +789,9 @@ mod tests {
         for device in [Device::H100, Device::B200] {
             let lookups = input_quant_lut_lookups::<F>(device);
             let count = |table| lookups.iter().filter(|lookup| lookup.table == table).count();
-            let downscales = device == Device::B200;
-            assert_eq!(lookups.len(), if downscales { 192 } else { 182 });
-            assert_eq!(count(LutTable::Range16), if downscales { 142 } else { 138 });
-            assert_eq!(count(LutTable::Pair128), if downscales { 7 } else { 6 });
+            assert_eq!(lookups.len(), 192);
+            assert_eq!(count(LutTable::Range16), 142);
+            assert_eq!(count(LutTable::Pair128), 7);
             for (table, total) in [
                 (LutTable::ExpInfo, 10),
                 (LutTable::Clamp22, 2),
@@ -815,17 +799,17 @@ mod tests {
                 (LutTable::Pow2D, 8),
                 (LutTable::RneRnd, 2),
                 (LutTable::Width16, 2),
-                (LutTable::Log16, if downscales { 4 } else { 2 }),
+                (LutTable::Log16, 4),
                 (LutTable::Qcast, 2),
                 (LutTable::Fp32Tools, 8),
             ] {
                 assert_eq!(count(table), total, "{device:?} {table:?}");
             }
-            assert_eq!(ctl_int8_bytes_looked_input_quant::<F>(device).len(), 2);
-            assert_eq!(ctl_block_scales_looked_input_quant::<F>(device).len(), 2);
-            assert_eq!(ctl_operand_codes_looked_input_quant::<F>(device).len(), 2);
-            assert_eq!(ctl_group_tuples_looking_input_quant::<F>(device).len(), 2);
-            assert_eq!(coefficient_looking::<F>(device).len(), 2);
         }
+        assert_eq!(ctl_int8_bytes_looked_input_quant::<F>().len(), 2);
+        assert_eq!(ctl_block_scales_looked_input_quant::<F>().len(), 2);
+        assert_eq!(ctl_operand_codes_looked_input_quant::<F>().len(), 2);
+        assert_eq!(ctl_group_tuples_looking_input_quant::<F>().len(), 2);
+        assert_eq!(coefficient_looking::<F>().len(), 2);
     }
 }

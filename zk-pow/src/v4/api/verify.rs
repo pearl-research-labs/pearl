@@ -7,7 +7,6 @@ use crate::v4::api::{
     prequant::{BLOCK_SIZE, PrequantOperand, exact_norms, open_prequant},
     primitives::IncompleteBlockHeader,
     proof_utils::check_jackpot_difficulty,
-    public_params::Device,
     quantization::Fp8E4M3Quant,
     transcript::compute_jackpot_ticket,
 };
@@ -23,7 +22,6 @@ fn open_and_noisy_quantize(
     k: usize,
     noise: &OperandNoise,
     quantization: &Fp8E4M3Quant,
-    device: Device,
 ) -> Result<OperandStrip> {
     ensure!(
         operand.values.row_bytes() == k,
@@ -53,7 +51,7 @@ fn open_and_noisy_quantize(
         "scales must be num_rows x (k/BLOCK_SIZE)"
     );
     ensure!(norms.len() == n, "norms must be num_rows");
-    let built = quantization.noisy_quantize(&ints, &scale_bits, noise, &norms, device)?;
+    let built = quantization.noisy_quantize(&ints, &scale_bits, noise, &norms)?;
     Ok(OperandStrip { clean: codes, built })
 }
 
@@ -74,8 +72,8 @@ pub fn verify_plain_proof(
     // Open each operand's committed strips, inject the deterministic noise,
     // and quantize: A' = Q(alpha_a·A + beta_a·E1@F1), likewise for B'.
     let noise = compute_fp8_noise(&public_params, proposed_header);
-    let tile_a = open_and_noisy_quantize(&private_params.operands.a, k, &noise.a, &quantization, device)?;
-    let tile_b = open_and_noisy_quantize(&private_params.operands.b, k, &noise.b, &quantization, device)?;
+    let tile_a = open_and_noisy_quantize(&private_params.operands.a, k, &noise.a, &quantization)?;
+    let tile_b = open_and_noisy_quantize(&private_params.operands.b, k, &noise.b, &quantization)?;
 
     let Some(message) = JackpotPolicy::for_device(device).evaluate(
         &tile_a,

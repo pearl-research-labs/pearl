@@ -40,7 +40,7 @@ pub fn v4_recursion_config(stage: usize) -> CircuitConfig {
 /// Every job absorbs the same config into its Fiat–Shamir transcript.
 pub fn v4_stark_config() -> StarkConfig {
     // Keep the recursive wrappers at degree bits 17/13 with the native ladder unchanged.
-    let (pow_bits, rate_bits, num_query_rounds) = (18, 1, 109);
+    let (pow_bits, rate_bits, num_query_rounds) = (19, 1, 108);
     debug_assert!(pow_bits + rate_bits * num_query_rounds >= 127);
     let fri_config = FriConfig {
         rate_bits,

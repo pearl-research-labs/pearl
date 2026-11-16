@@ -691,7 +691,7 @@ impl Fp8Job {
         set(PI_HASH_OFFSETS, &self.hash_offsets().unwrap_or([0u8; 32]));
         set(PI_HASH_JACKPOT, &params.hash_jackpot());
 
-        let scale = self.scale().public_inputs_for_device::<F>();
+        let scale = self.scale().public_inputs::<F>().to_vec();
         // InputQuant: `2^Wl2` (the plaintext power of Scale's `Wl2` slot — the verifier pins
         // both; the wrapper only exposes the wires) and the geometry slots the CTL
         // expressions read.
@@ -977,12 +977,10 @@ mod tests {
         let (_, params) = plain.parse_proof(&header).expect("fixture job must parse");
         let job = Fp8Job::derive(&params, &header).expect("fixture job must derive");
         let expected_pis = job.expected_public_inputs();
-        use crate::v4::circuit::scale_stark::columns::{
-            MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT, NUM_B200_SCALE_PUBLIC_INPUTS,
-        };
+        use crate::v4::circuit::scale_stark::columns::{MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT, NUM_SCALE_PUBLIC_INPUTS};
         assert_eq!(
             expected_pis[crate::v4::circuit::ctl::Table::Scale as usize].len(),
-            NUM_B200_SCALE_PUBLIC_INPUTS
+            NUM_SCALE_PUBLIC_INPUTS
         );
         assert_eq!(
             expected_pis[crate::v4::circuit::ctl::Table::Scale as usize][MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT],
