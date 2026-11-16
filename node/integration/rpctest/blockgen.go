@@ -19,7 +19,8 @@ import (
 
 // solveBlock generates a certificate for the given block header using the
 // height-aware SolveBlock which selects the correct certificate version.
-func solveBlock(header, parent *wire.BlockHeader, params *chaincfg.Params, height int32) (wire.BlockCertificate, error) {
+func solveBlock(header, parent *wire.BlockHeader, params *chaincfg.Params,
+	height int32) (wire.BlockCertificate, error) {
 	return blockchain.SolveBlock(header, parent, params, height)
 }
 

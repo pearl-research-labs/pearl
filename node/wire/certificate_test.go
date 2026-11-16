@@ -385,7 +385,8 @@ func TestCertificateBlobCaps(t *testing.T) {
 
 			wantErr := fmt.Sprintf("%s_len %d exceeds max %d", test.field, test.max+1, test.max)
 			require.ErrorContains(t, test.newCert(test.max+1).Serialize(&bytes.Buffer{}), wantErr)
-			oversized := binary.LittleEndian.AppendUint32(buf.Bytes()[:test.lenOffset:test.lenOffset], uint32(test.max+1))
+			prefix := buf.Bytes()[:test.lenOffset:test.lenOffset]
+			oversized := binary.LittleEndian.AppendUint32(prefix, uint32(test.max+1))
 			require.ErrorContains(t, test.newCert(0).Deserialize(bytes.NewReader(oversized)), wantErr)
 		})
 	}
