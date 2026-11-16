@@ -13,8 +13,6 @@ from ..protocol_constants import (
     STRIP_COIN_SHIFT,
     STRIP_COIN_THRESHOLD,
     STRIP_EXP_OFFSET,
-    STRIP_G,
-    STRIP_G_SMALL_RMS,
     STRIP_SMALL_RMS,
     R,
 )
@@ -91,10 +89,12 @@ def _bf16_bits_to_f32(bits):
     )
 
 
-def _strip_state(alpha, l2):
+def _strip_state(alpha, l2, strip_g):
     """A row's strip state from its scaled RMS ``s = alpha * l2``, per
     byte lane: the strip bound ``|e4m3(g * s)|`` in the low half and
-    ``safe exponent | 1`` in code position in the high half."""
+    ``safe exponent | 1`` in code position in the high half. ``strip_g`` is the
+    device's ``(g, g for s < STRIP_SMALL_RMS)``."""
+    g, g_small = strip_g
     return _asm_u32(
         "{\n\t"
         ".reg .f32 s, g, w;\n\t"
@@ -103,7 +103,7 @@ def _strip_state(alpha, l2):
         ".reg .pred p;\n\t"
         "mul.rn.f32 s, $1, $2;\n\t"
         f"setp.lt.f32 p, s, {_f32_hex(STRIP_SMALL_RMS)};\n\t"
-        f"selp.f32 g, {_f32_hex(STRIP_G_SMALL_RMS)}, {_f32_hex(STRIP_G)}, p;\n\t"
+        f"selp.f32 g, {_f32_hex(g_small)}, {_f32_hex(g)}, p;\n\t"
         "mul.rn.f32 w, g, s;\n\t"
         "cvt.rn.satfinite.e4m3x2.f32 h, w, w;\n\t"
         "cvt.u32.u16 m, h;\n\t"
@@ -130,14 +130,13 @@ _CODE_MAGIC = 0x4B000000
 _CODE_BIAS = 2.0**23 + 128
 
 
-def _quantize_word(codes, coefficient, beta, noise, strip_bound, strip_code, rewrites, packed):
+def _quantize_word(codes, coefficient, beta, noise, strip_bound, strip_code, packed):
     """A' codes of one row's four contiguous columns under one block scale.
 
     Each column is ``e4m3(fma(beta, noise, coefficient * q))`` with one RNE
     rounding per operation (the verifier's ``fp32_fma`` is the correctly
     rounded FMA), saturating to +-448. The int8 codes become exact fp32
-    through the mantissa (``_CODE_MAGIC``). With ``rewrites``, the group's
-    coin (bits 14..8 of column 0's mix) decides whether codes whose
+    through the mantissa (``_CODE_MAGIC``). The group's coin (bits 14..8 of column 0's mix) decides whether codes whose
     magnitude is below the row's strip bound become ``sign | safe exponent |
     mantissa | 1``; ``strip_bound`` and ``strip_code`` are ``_strip_state``'s
     halves replicated over the word's four byte lanes. ``packed``
@@ -181,27 +180,24 @@ def _quantize_word(codes, coefficient, beta, noise, strip_bound, strip_code, rew
                 f"fma.rn.f32 x{i}, $3, ${4 + i}, q{i};\n\t"
             )
     body += "cvt.rn.satfinite.e4m3x2.f32 l, x1, x0;\n\tcvt.rn.satfinite.e4m3x2.f32 h, x3, x2;\n\t"
-    if rewrites:
-        assert (STRIP_COIN_SHIFT, STRIP_COIN_THRESHOLD) == (8, 112)
-        body += (
-            # The coin passes unless bits 14..12 are all set (bits 14..8 < 112);
-            # a failed coin zeroes the bound. With the sign forced on, a byte's
-            # top bit survives the subtraction iff its magnitude is >= bound.
-            "mov.b32 w, {l, h};\n\t"
-            "mov.b32 t, x0;\n\t"
-            "not.b32 t, t;\n\t"
-            "and.b32 t, t, 0x7000;\n\t"
-            "setp.ne.u32 p, t, 0;\n\t"
-            "selp.b32 cm, $8, 0, p;\n\t"
-            "or.b32 m, w, 0x80808080;\n\t"
-            "sub.u32 t, m, cm;\n\t"
-            "prmt.b32 k, t, t, 0xBA98;\n\t"
-            "and.b32 d, w, 0x87878787;\n\t"
-            "or.b32 d, d, $9;\n\t"
-            "lop3.b32 $0, d, w, k, 0xD8;\n\t"
-        )
-    else:
-        body += "mov.b32 $0, {l, h};\n\t"
+    assert (STRIP_COIN_SHIFT, STRIP_COIN_THRESHOLD) == (8, 112)
+    body += (
+        # The coin passes unless bits 14..12 are all set (bits 14..8 < 112);
+        # a failed coin zeroes the bound. With the sign forced on, a byte's
+        # top bit survives the subtraction iff its magnitude is >= bound.
+        "mov.b32 w, {l, h};\n\t"
+        "mov.b32 t, x0;\n\t"
+        "not.b32 t, t;\n\t"
+        "and.b32 t, t, 0x7000;\n\t"
+        "setp.ne.u32 p, t, 0;\n\t"
+        "selp.b32 cm, $8, 0, p;\n\t"
+        "or.b32 m, w, 0x80808080;\n\t"
+        "sub.u32 t, m, cm;\n\t"
+        "prmt.b32 k, t, t, 0xBA98;\n\t"
+        "and.b32 d, w, 0x87878787;\n\t"
+        "or.b32 d, d, $9;\n\t"
+        "lop3.b32 $0, d, w, k, 0xD8;\n\t"
+    )
     return _asm_u32(
         "{\n\t" + regs + body + "}",
         "=r,r,f,f,f,f,f,f,r,r",

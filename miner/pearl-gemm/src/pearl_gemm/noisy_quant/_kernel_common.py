@@ -15,7 +15,7 @@ import cutlass.pipeline as pipeline
 from cutlass import Float32
 from quack.cute_dsl_utils import mlir_namedtuple
 
-from ..protocol_constants import PACKED_NOISE_K, R
+from ..protocol_constants import PACKED_NOISE_K, STRIP_G, STRIP_G_SMALL_RMS, R
 from ._quantization_ops import (
     _bf16_bits_to_f32,
     _generate_noise_line,
@@ -114,8 +114,8 @@ class _NoisyQuant:
 
     # Consumer-side E1 overlaps the BLAKE3 prologue with the stats combine.
     _consumer_e1_enabled = True
-    # Whether the committed device's quantizer rewrites the strip (Blackwell).
-    _rewrites_strip = True
+    # The committed device's strip g (rows with alpha * l2 >= STRIP_SMALL_RMS, below it).
+    _strip_g = (STRIP_G, STRIP_G_SMALL_RMS)
     # Whether the family's target has the sm_100 f32x2 add/mul/fma forms.
     _packed_f32 = False
 
@@ -405,7 +405,6 @@ class _NoisyQuant:
                     noise,
                     strip_bound,
                     strip_code,
-                    self._rewrites_strip,
                     self._packed_f32,
                 )
 
