@@ -29,8 +29,8 @@ func (emptyTxSource) LastUpdated() time.Time               { return time.Time{} 
 func (emptyTxSource) MiningDescs() []*mining.TxDesc        { return nil }
 func (emptyTxSource) HaveTransaction(*chainhash.Hash) bool { return false }
 
-// newTestMiner builds a CPU miner on a fresh chain holding only the genesis
-// block. Solved blocks go through the chain's full ProcessBlock validation.
+// newTestMiner builds a CPU miner on a fresh chain holding only the genesis block. Solved blocks go through the chain's
+// full ProcessBlock validation.
 func newTestMiner(t *testing.T, params *chaincfg.Params) (*CPUMiner, *blockchain.BlockChain) {
 	t.Helper()
 
@@ -123,14 +123,12 @@ func TestGenerateNBlocks(t *testing.T) {
 	}
 }
 
-// TestCPUMinerStop checks that Stop ends both mining modes and leaves the
-// miner ready for a new run.
+// TestCPUMinerStop checks that Stop ends both mining modes and leaves the miner ready for a new run.
 func TestCPUMinerStop(t *testing.T) {
 	params := chaincfg.SimNetParams
 	for _, test := range []struct {
 		name string
-		// start begins mining and returns the channel that delivers the
-		// mining call's result, if it blocks.
+		// start begins mining and returns the channel that delivers the mining call's result, if it blocks.
 		start func(*CPUMiner) <-chan error
 	}{
 		{

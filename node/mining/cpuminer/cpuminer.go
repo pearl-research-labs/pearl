@@ -39,8 +39,7 @@ var (
 	errStaleBlock = errors.New("block is stale")
 )
 
-// failureBackoff paces a mining worker that keeps failing, so a persistent
-// error cannot spin it at full CPU.
+// failureBackoff paces a mining worker that keeps failing, so a persistent error cannot spin it at full CPU.
 const failureBackoff = time.Second
 
 // Config is a descriptor containing the cpu miner configuration.
@@ -102,9 +101,8 @@ type CPUMiner struct {
 	discreteDone chan struct{}
 }
 
-// submitBlock submits the passed block to network after ensuring it passes all
-// of the consensus validation rules.  It returns errStaleBlock when the block
-// no longer extends the best chain.
+// submitBlock submits the passed block to network after ensuring it passes all of the consensus validation rules.  It
+// returns errStaleBlock when the block no longer extends the best chain.
 func (m *CPUMiner) submitBlock(block *btcutil.Block) error {
 	m.submitBlockLock.Lock()
 	defer m.submitBlockLock.Unlock()
@@ -153,8 +151,8 @@ func (m *CPUMiner) submitBlock(block *btcutil.Block) error {
 func (m *CPUMiner) solveBlock(template *mining.BlockTemplate) (bool, error) {
 	msgBlock := template.Block
 
-	// A V4 proof takes gigabytes of memory, and workers solve competing blocks
-	// for the same tip, so proving them concurrently can only exhaust memory.
+	// A V4 proof takes gigabytes of memory, and workers solve competing blocks for the same tip, so proving them
+	// concurrently can only exhaust memory.
 	if m.cfg.ChainParams.RequiredCertVersion(template.Height) == wire.CertificateVersionV4 {
 		m.v4SolveLock.Lock()
 		defer m.v4SolveLock.Unlock()
@@ -178,8 +176,7 @@ func (m *CPUMiner) solveBlock(template *mining.BlockTemplate) (bool, error) {
 	return true, nil
 }
 
-// waitOrQuit pauses for failureBackoff and reports whether quit was signalled
-// in the meantime.
+// waitOrQuit pauses for failureBackoff and reports whether quit was signalled in the meantime.
 func waitOrQuit(quit <-chan struct{}) bool {
 	select {
 	case <-quit:
@@ -350,11 +347,9 @@ func (m *CPUMiner) Start() {
 	log.Infof("CPU miner started")
 }
 
-// Stop gracefully stops the mining process by signalling all workers, or a
-// running GenerateNBlocks call, to quit, and waits for them to finish.  A
-// certificate computation cannot be interrupted, so Stop also waits for one in
-// progress.  Calling this function when the CPU miner has not already been
-// started will have no effect.
+// Stop gracefully stops the mining process by signalling all workers, or a running GenerateNBlocks call, to quit, and
+// waits for them to finish.  A certificate computation cannot be interrupted, so Stop also waits for one in progress.
+// Calling this function when the CPU miner has not already been started will have no effect.
 //
 // This function is safe for concurrent access.
 func (m *CPUMiner) Stop() {
@@ -367,8 +362,7 @@ func (m *CPUMiner) Stop() {
 	}
 
 	if m.discreteMining {
-		// Concurrent Stop calls may both get here before GenerateNBlocks
-		// returns; only the first may close quit.
+		// Concurrent Stop calls may both get here before GenerateNBlocks returns; only the first may close quit.
 		select {
 		case <-m.quit:
 		default:
@@ -422,8 +416,8 @@ func (m *CPUMiner) SetNumWorkers(numWorkers int32) {
 		m.numWorkers = uint32(numWorkers)
 	}
 
-	// When the miner is already running, notify the controller about the
-	// the change.  Discrete mode has no controller to receive it.
+	// When the miner is already running, notify the controller about the change.  Discrete mode has no controller to
+	// receive it.
 	if m.started && !m.discreteMining {
 		m.updateNumWorkers <- struct{}{}
 	}
@@ -439,13 +433,11 @@ func (m *CPUMiner) NumWorkers() int32 {
 	return int32(m.numWorkers)
 }
 
-// GenerateNBlocks generates the requested number of blocks. It is self
-// contained in that it creates block templates and attempts to solve them while
-// detecting when it is performing stale work and reacting accordingly by
-// generating a new block template.  When a block is solved, it is submitted.
-// The function returns a list of the hashes of generated blocks.  It returns an
-// error instead when a template cannot be built, a certificate cannot be
-// produced, a solved block is rejected, or Stop is called.
+// GenerateNBlocks generates the requested number of blocks. It is self contained in that it creates block templates and
+// attempts to solve them while detecting when it is performing stale work and reacting accordingly by generating a new
+// block template.  When a block is solved, it is submitted. The function returns a list of the hashes of generated
+// blocks.  It returns an error instead when a template cannot be built, a certificate cannot be produced, a solved
+// block is rejected, or Stop is called.
 func (m *CPUMiner) GenerateNBlocks(n uint32) ([]*chainhash.Hash, error) {
 	m.Lock()
 
@@ -524,8 +516,8 @@ func (m *CPUMiner) GenerateNBlocks(n uint32) ([]*chainhash.Hash, error) {
 			if errors.Is(err, errStaleBlock) {
 				continue
 			}
-			// A template rebuilt within the timestamp's second can reproduce a block the chain already
-			// holds, such as one marked invalid by invalidateblock; the next second yields a new hash.
+			// A template rebuilt within the timestamp's second can reproduce a block the chain already holds, such as
+			// one marked invalid by invalidateblock; the next second yields a new hash.
 			var ruleErr blockchain.RuleError
 			if errors.As(err, &ruleErr) && ruleErr.ErrorCode == blockchain.ErrDuplicateBlock {
 				if waitOrQuit(quit) {

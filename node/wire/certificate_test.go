@@ -249,9 +249,8 @@ func TestCertificateV4Wire(t *testing.T) {
 	}
 }
 
-// TestMsgCertificateMaxSize checks that encoding and decoding agree on
-// CertificateMaxSize, version prefix included. Only V2/V3 blobs can reach the
-// cap, so a V2 certificate with full public data is padded via its proof.
+// TestMsgCertificateMaxSize checks that encoding and decoding agree on CertificateMaxSize, version prefix included.
+// Only V2/V3 blobs can reach the cap, so a V2 certificate with full public data is padded via its proof.
 func TestMsgCertificateMaxSize(t *testing.T) {
 	// version + hash + public length + public data + proof length.
 	fixed := wire.CertificateVersionSize + chainhash.HashSize + 4 + wire.PublicDataMaxSizeV2 + 4
@@ -336,15 +335,14 @@ func TestCertificateV4ProofCommitment(t *testing.T) {
 	require.Equal(t, want, cert.ProofCommitment())
 }
 
-// TestCertificateBlobCaps checks that Serialize and Deserialize accept each
-// length-prefixed blob at its cap and reject it one byte over.
+// TestCertificateBlobCaps checks that Serialize and Deserialize accept each length-prefixed blob at its cap and reject
+// it one byte over.
 func TestCertificateBlobCaps(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		field string
 		max   int
-		// lenOffset locates the blob's u32 length prefix in the serialized
-		// fields of newCert(max).
+		// lenOffset locates the blob's u32 length prefix in the serialized fields of newCert(max).
 		lenOffset int
 		newCert   func(n int) wire.BlockCertificate
 	}{

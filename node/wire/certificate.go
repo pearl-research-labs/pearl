@@ -36,9 +36,8 @@ Version-first design enables polymorphic decoding:
 
 	CertificateV4: BlockHash(32) + PublicDataLen(4) + PublicData + ProofLen(4) + ProofData
 	  + AncestorCount(varint) + AncestorHeaders(108 bytes each).
-	  PublicData is capped at PublicDataMaxSizeV4; ProofData shares the V1-V3
-	  bound. At most three full ancestor headers follow, ordered parent first,
-	  outside ProofCommitment.
+	  PublicData is capped at PublicDataMaxSizeV4; ProofData shares the V1-V3 bound. At most three full ancestor
+	  headers follow, ordered parent first, outside ProofCommitment.
 
 KEY DESIGN: SYMMETRIC SERIALIZATION
 
@@ -75,16 +74,15 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
-// MaxZKProofSize is the maximum size of a serialized ZK proof blob.
-// Must match MAX_ZK_PROOF_SIZE in zk-pow/bindings/go/src/common.rs.
+// MaxZKProofSize is the maximum size of a serialized ZK proof blob. Must match MAX_ZK_PROOF_SIZE in
+// zk-pow/bindings/go/src/common.rs.
 const MaxZKProofSize = 62000
 
-// CertificateMaxSize is the maximum encoded certificate size, including the
-// CertificateVersionSize prefix. Has headroom on top of MaxZKProofSize.
+// CertificateMaxSize is the maximum encoded certificate size, including the CertificateVersionSize prefix. Has headroom
+// on top of MaxZKProofSize.
 const CertificateMaxSize = 65000
 
-// CertificateVersionSize is the size of the version prefix MsgCertificate
-// writes before the certificate fields.
+// CertificateVersionSize is the size of the version prefix MsgCertificate writes before the certificate fields.
 const CertificateVersionSize = 4
 
 // CertificateVersion identifies the certificate format version.
@@ -196,8 +194,8 @@ func (m *MsgCertificate) PrlDecode(r io.Reader, pver uint32) error {
 	return m.Certificate.Deserialize(io.LimitReader(r, CertificateMaxSize-CertificateVersionSize))
 }
 
-// SerializeSize returns the total number of bytes needed to serialize the certificate.
-// This includes the version prefix plus the certificate-specific fields.
+// SerializeSize returns the total number of bytes needed to serialize the certificate. This includes the version prefix
+// plus the certificate-specific fields.
 func (m *MsgCertificate) SerializeSize() int {
 	if m.Certificate == nil {
 		return CertificateVersionSize
@@ -205,8 +203,8 @@ func (m *MsgCertificate) SerializeSize() int {
 	return CertificateVersionSize + m.Certificate.SerializedSize()
 }
 
-// checkBlobLen rejects a length-prefixed certificate blob longer than max, so
-// that encoding refuses exactly what decoding refuses.
+// checkBlobLen rejects a length-prefixed certificate blob longer than max, so that encoding refuses exactly what
+// decoding refuses.
 func checkBlobLen(field string, length uint64, max int) error {
 	if length > uint64(max) {
 		return fmt.Errorf("%s_len %d exceeds max %d", field, length, max)

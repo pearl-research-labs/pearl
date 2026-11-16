@@ -17,13 +17,12 @@ import (
 // three intermediate headers separate it from the proposed header.
 const MaxCertificateV4AncestorHeaders = 3
 
-// PublicDataMaxSizeV4 is the maximum PublicData size for V4 certificates.
-// Must match PublicParams::MAX_WIRE_SIZE in zk-pow/src/v4/api/public_params.rs.
+// PublicDataMaxSizeV4 is the maximum PublicData size for V4 certificates. Must match PublicParams::MAX_WIRE_SIZE in
+// zk-pow/src/v4/api/public_params.rs.
 const PublicDataMaxSizeV4 = 832
 
-// CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is
-// hash + length-prefixed public data + length-prefixed proof + ancestor count
-// + full ancestor headers. PublicData is capped at PublicDataMaxSizeV4,
+// CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is hash + length-prefixed public data +
+// length-prefixed proof + ancestor count + full ancestor headers. PublicData is capped at PublicDataMaxSizeV4,
 // ProofData at MaxZKProofSize and the whole certificate at CertificateMaxSize.
 type CertificateV4 struct {
 	Hash       chainhash.Hash

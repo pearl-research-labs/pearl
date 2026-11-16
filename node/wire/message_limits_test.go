@@ -45,11 +45,10 @@ func TestMessageCapsFitProtocolLimit(t *testing.T) {
 	}
 }
 
-// TestBlockCapHasRoomForCertificate asserts that the BLOCK message cap leaves
-// room for a maximum-size certificate on top of the consensus transaction
-// payload. Certificates are excluded from block vsize, so that room has to be
-// budgeted explicitly rather than assumed to be inside MaxBlockPayload. A
-// certificate that does not fit makes consensus-valid blocks unrelayable.
+// TestBlockCapHasRoomForCertificate asserts that the BLOCK message cap leaves room for a maximum-size certificate on
+// top of the consensus transaction payload. Certificates are excluded from block vsize, so that room has to be budgeted
+// explicitly rather than assumed to be inside MaxBlockPayload. A certificate that does not fit makes consensus-valid
+// blocks unrelayable.
 func TestBlockCapHasRoomForCertificate(t *testing.T) {
 	declared := int((&MsgBlock{}).MaxPayloadLength(ProtocolVersion))
 	room := declared - MaxBlockPayload

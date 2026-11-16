@@ -309,8 +309,8 @@ func BenchmarkMine(b *testing.B) {
 	}
 }
 
-// TestVerifyCertificateV4PublicDataSize pins wire.PublicDataMaxSizeV4 to the
-// largest statement the native verifier admits.
+// TestVerifyCertificateV4PublicDataSize pins wire.PublicDataMaxSizeV4 to the largest statement the native verifier
+// admits.
 func TestVerifyCertificateV4PublicDataSize(t *testing.T) {
 	const sizeErr = "invalid public_data_len"
 	for _, test := range []struct {
