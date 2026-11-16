@@ -204,9 +204,9 @@ func (m *MsgCertificate) SerializeSize() int {
 }
 
 // Width-agnostic bound: uint32 wire lengths wrap signed int on 32-bit; slice lengths wrap uint32 on 64-bit.
-func checkBlobLen[T int | uint32](field string, length T, max int) error {
-	if uint64(length) > uint64(max) {
-		return fmt.Errorf("%s_len %d exceeds max %d", field, length, max)
+func checkBlobLen[T int | uint32](field string, length T, maxLen int) error {
+	if uint64(length) > uint64(maxLen) {
+		return fmt.Errorf("%s_len %d exceeds max %d", field, length, maxLen)
 	}
 	return nil
 }
