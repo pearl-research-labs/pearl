@@ -21,6 +21,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/mining"
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,8 +31,6 @@ func (emptyTxSource) LastUpdated() time.Time               { return time.Time{} 
 func (emptyTxSource) MiningDescs() []*mining.TxDesc        { return nil }
 func (emptyTxSource) HaveTransaction(*chainhash.Hash) bool { return false }
 
-// newTestMiner builds a CPU miner on a fresh chain holding only the genesis block. Solved blocks go through the chain's
-// full ProcessBlock validation.
 func newTestMiner(t *testing.T, params *chaincfg.Params) (*CPUMiner, *blockchain.BlockChain) {
 	t.Helper()
 
@@ -73,24 +72,33 @@ func newTestMiner(t *testing.T, params *chaincfg.Params) (*CPUMiner, *blockchain
 
 func TestGenerateNBlocks(t *testing.T) {
 	regTest := chaincfg.RegressionNetParams
+	simNet := chaincfg.SimNetParams
 
-	// Every height requires V1, and only V4 certificates can be mined.
 	noForks := chaincfg.RegressionNetParams
 	noForks.MoEForkHeight = 0
 	noForks.RankPenaltyForkHeight = 0
 	noForks.SaltedSeedForkHeight = 0
 	noForks.Fp8ForkHeight = 0
 
-	for _, test := range []struct {
-		name      string
-		params    *chaincfg.Params
-		numBlocks uint32
-		wantErr   string
+	tests := []struct {
+		name             string
+		params           *chaincfg.Params
+		numBlocks        uint32
+		checkPoW         bool
+		invalidateAndGen bool
+		wantErr          string
 	}{
 		{
 			name:      "regtest mines V4 blocks",
 			params:    &regTest,
 			numBlocks: 2,
+			checkPoW:  true,
+		},
+		{
+			name:             "replaces invalidated tip ahead of wall clock",
+			params:           &simNet,
+			numBlocks:        10,
+			invalidateAndGen: true,
 		},
 		{
 			name:      "certificate cannot be produced",
@@ -98,33 +106,44 @@ func TestGenerateNBlocks(t *testing.T) {
 			numBlocks: 1,
 			wantErr:   "requires certificate version 1",
 		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			miner, chain := newTestMiner(t, test.params)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			miner, chain := newTestMiner(t, tt.params)
 
-			hashes, err := miner.GenerateNBlocks(test.numBlocks)
-			require.False(t, miner.IsMining())
-			if test.wantErr != "" {
-				require.ErrorContains(t, err, test.wantErr)
-				require.Zero(t, chain.BestSnapshot().Height)
+			hashes, err := miner.GenerateNBlocks(tt.numBlocks)
+			assert.False(t, miner.IsMining())
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				assert.Zero(t, chain.BestSnapshot().Height)
 				return
 			}
 			require.NoError(t, err)
-			require.Len(t, hashes, int(test.numBlocks))
-			require.Equal(t, int32(len(hashes)), chain.BestSnapshot().Height)
+			require.Len(t, hashes, int(tt.numBlocks))
+			assert.Equal(t, int32(len(hashes)), chain.BestSnapshot().Height)
 			for i, hash := range hashes {
 				block, err := chain.BlockByHeight(int32(i + 1))
 				require.NoError(t, err)
-				require.Equal(t, hash, block.Hash())
-				require.Equal(t, wire.CertificateVersionV4, block.MsgBlock().BlockCertificate().Version())
-				require.NoError(t, blockchain.CheckProofOfWork(block, test.params.PowLimit),
-					"the stored certificate must still verify")
+				assert.Equal(t, hash, block.Hash())
+				assert.Equal(t, wire.CertificateVersionV4, block.MsgBlock().BlockCertificate().Version())
+				if tt.checkPoW {
+					assert.NoError(t, blockchain.CheckProofOfWork(block, tt.params.PowLimit))
+				}
+			}
+
+			if tt.invalidateAndGen {
+				invalidated := hashes[len(hashes)-1]
+				require.NoError(t, chain.InvalidateBlock(invalidated))
+				replacement, err := miner.GenerateNBlocks(1)
+				require.NoError(t, err)
+				require.Len(t, replacement, 1)
+				assert.NotEqual(t, invalidated, replacement[0])
+				assert.Equal(t, int32(tt.numBlocks), chain.BestSnapshot().Height)
 			}
 		})
 	}
 }
 
-// gatedSolver stands in for a slow V4 proof: its first call blocks until release is closed.
 type gatedSolver struct {
 	calls   atomic.Int32
 	entered chan struct{}
@@ -141,13 +160,10 @@ func (s *gatedSolver) solve(header, parent *wire.BlockHeader, params *chaincfg.P
 	return blockchain.SolveBlock(header, parent, params, height)
 }
 
-// TestCPUMinerStop checks that Stop ends both mining modes once the proof in progress finishes, without running the
-// proofs of workers queued behind it, and leaves the miner ready for a new run.
 func TestCPUMinerStop(t *testing.T) {
 	params := chaincfg.SimNetParams
-	for _, test := range []struct {
-		name string
-		// start begins mining and returns the channel that delivers the mining call's result, if it blocks.
+	tests := []struct {
+		name  string
 		start func(*CPUMiner) <-chan error
 	}{
 		{
@@ -168,48 +184,48 @@ func TestCPUMinerStop(t *testing.T) {
 				return nil
 			},
 		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			miner, chain := newTestMiner(t, &params)
 			solver := &gatedSolver{entered: make(chan struct{}), release: make(chan struct{})}
 			miner.solve = solver.solve
 			miner.SetNumWorkers(4)
 
-			errc := test.start(miner)
+			errc := tt.start(miner)
 			<-solver.entered
-			// Queued workers cannot be observed, so give them time to line up behind the proof in progress.
-			time.Sleep(100 * time.Millisecond)
-			miner.Lock()
-			quit := miner.quit
-			miner.Unlock()
+			miner.SetNumWorkers(3)
+			miner.SetNumWorkers(4)
+			// Give the remaining workers time to queue behind solveLock while the first proof blocks.
+			time.Sleep(50 * time.Millisecond)
+			r := miner.currentRun()
+			require.NotNil(t, r)
 
 			stopped := make(chan struct{})
 			go func() {
 				miner.Stop()
 				close(stopped)
 			}()
-			<-quit
-			// The controller relays quit to each worker's own channel; let that happen before the proof finishes.
-			time.Sleep(100 * time.Millisecond)
+			<-r.quit
+			assert.True(t, miner.IsMining(), "IsMining must not block while Stop waits on a proof")
+			miner.SetNumWorkers(2)
 			close(solver.release)
 			<-stopped
 
-			require.False(t, miner.IsMining())
-			require.Equal(t, int32(1), solver.calls.Load(), "only the proof in progress may run after Stop")
+			assert.False(t, miner.IsMining())
+			assert.Equal(t, int32(1), solver.calls.Load(), "only the proof in progress may run after Stop")
 			if errc != nil {
-				require.ErrorIs(t, <-errc, errMinerStopped)
+				assert.ErrorIs(t, <-errc, errMinerStopped)
 			}
 
 			height := chain.BestSnapshot().Height
 			_, err := miner.GenerateNBlocks(1)
 			require.NoError(t, err)
-			require.Equal(t, height+1, chain.BestSnapshot().Height)
+			assert.Equal(t, height+1, chain.BestSnapshot().Height)
 		})
 	}
 }
 
-// TestCPUMinerQueuedWorkerSeesNewTip checks that a worker queued behind another's proof never proves against the tip
-// that the other worker's block is about to replace.
 func TestCPUMinerQueuedWorkerSeesNewTip(t *testing.T) {
 	params := chaincfg.SimNetParams
 	miner, chain := newTestMiner(t, &params)
@@ -228,5 +244,5 @@ func TestCPUMinerQueuedWorkerSeesNewTip(t *testing.T) {
 	miner.Start()
 	require.Eventually(t, func() bool { return chain.BestSnapshot().Height >= 5 }, time.Minute, 10*time.Millisecond)
 	miner.Stop()
-	require.Zero(t, supersededProofs.Load(), "proofs whose tip changed while they ran")
+	assert.Zero(t, supersededProofs.Load(), "proofs whose tip changed while they ran")
 }

@@ -20,26 +20,17 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
-const (
-	// maxExtraNonce is the maximum value an extra nonce used in a coinbase
-	// transaction can be.
-	maxExtraNonce = ^uint64(0) // 2^64 - 1
-)
-
 var (
 	// defaultNumWorkers is the default number of workers to use for mining
 	// and is based on the number of processor cores.  This helps ensure the
 	// system stays reasonably responsive under heavy load.
 	defaultNumWorkers = uint32(runtime.NumCPU())
 
-	// errMinerStopped is returned by GenerateNBlocks when Stop interrupts it.
 	errMinerStopped = errors.New("CPU miner stopped before generating all blocks")
-
-	// errStaleBlock reports a solved block that no longer extends the best chain.
-	errStaleBlock = errors.New("block is stale")
+	errStaleBlock   = errors.New("block is stale")
 )
 
-// failureBackoff paces a mining worker that keeps failing, so a persistent error cannot spin it at full CPU.
+// Pace persistent template, solve, or submit failures so workers do not spin at full CPU.
 const failureBackoff = time.Second
 
 // Config is a descriptor containing the cpu miner configuration.
@@ -71,11 +62,23 @@ type Config struct {
 
 	// IsCurrent defines the function to use to obtain whether or not the
 	// block chain is current.  This is used by the automatic persistent
-	// mining routine to determine whether or it should attempt mining.
+	// mining routine to determine whether or not it should attempt mining.
 	// This is useful because there is no point in mining if the chain is
 	// not current since any solved blocks would be on a side chain and and
 	// up orphaned anyways.
 	IsCurrent func() bool
+}
+
+// run holds per-session channels set once at start, so workers and Stop use them without holding the miner lock.
+type run struct {
+	quit          chan struct{}
+	done          chan struct{}
+	stopOnce      sync.Once
+	updateWorkers chan uint32 // nil in GenerateNBlocks sessions, which have no worker controller
+}
+
+func (r *run) stop() {
+	r.stopOnce.Do(func() { close(r.quit) })
 }
 
 // CPUMiner provides facilities for solving blocks (mining) using the CPU in
@@ -85,22 +88,14 @@ type Config struct {
 // of processor cores in the system which is typically sufficient.
 type CPUMiner struct {
 	sync.Mutex
-	g                *mining.BlkTmplGenerator
-	cfg              Config
-	numWorkers       uint32
-	started          bool
-	discreteMining   bool
-	submitBlockLock  sync.Mutex
-	solveLock        sync.Mutex
-	wg               sync.WaitGroup
-	workerWg         sync.WaitGroup
-	updateNumWorkers chan struct{}
-	quit             chan struct{}
+	g               *mining.BlkTmplGenerator
+	cfg             Config
+	numWorkers      uint32
+	run             *run
+	submitBlockLock sync.Mutex
+	solveLock       sync.Mutex
 
-	// discreteDone is closed once GenerateNBlocks has cleared its state.
-	discreteDone chan struct{}
-
-	// solve is blockchain.SolveBlock; tests substitute a slow solver, since SimNet's dummy certificates are instant.
+	// Overridden in tests to simulate slow V4 proving on SimNet.
 	solve func(header, parent *wire.BlockHeader, params *chaincfg.Params, height int32) (*wire.CertificateV4, error)
 }
 
@@ -142,30 +137,24 @@ func (m *CPUMiner) submitBlock(block *btcutil.Block) error {
 	return nil
 }
 
-// solveAndSubmit proves the template's block and submits it, returning the accepted block.  It returns
-// errMinerStopped when quit is signalled before proving or submitting, and errStaleBlock when the template no longer
-// extends the best chain.
-func (m *CPUMiner) solveAndSubmit(template *mining.BlockTemplate, quit <-chan struct{}) (*btcutil.Block, error) {
-	// A V4 proof takes gigabytes of memory and tens of seconds, and workers prove competing blocks for the same tip.
-	// Holding the lock through submission makes a queued worker's stale check see this block instead of proving a
-	// block that has already lost.
+func (m *CPUMiner) solveAndSubmit(template *mining.BlockTemplate, r *run,
+	workerQuit <-chan struct{}) (*btcutil.Block, error) {
+
+	// Hold solveLock through submission so multi-GB V4 provers never overlap and queued workers re-check against the
+	// newly submitted tip before proving.
 	m.solveLock.Lock()
 	defer m.solveLock.Unlock()
 
-	select {
-	case <-quit:
+	if stopped(r, workerQuit) {
 		return nil, errMinerStopped
-	default:
 	}
 	if err := m.solveBlock(template); err != nil {
 		return nil, err
 	}
 
-	// Proving can take long enough for a shutdown to begin meanwhile.
-	select {
-	case <-quit:
+	// Skip block validation and relay if shutdown began during the uninterruptible V4 proof.
+	if stopped(r, workerQuit) {
 		return nil, errMinerStopped
-	default:
 	}
 	block := btcutil.NewBlock(template.Block)
 	if err := m.submitBlock(block); err != nil {
@@ -174,8 +163,6 @@ func (m *CPUMiner) solveAndSubmit(template *mining.BlockTemplate, quit <-chan st
 	return block, nil
 }
 
-// solveBlock attaches a V4 certificate to the template's block.  It returns errStaleBlock when a new best block has
-// appeared since the template was built.
 func (m *CPUMiner) solveBlock(template *mining.BlockTemplate) error {
 	msgBlock := template.Block
 
@@ -196,10 +183,22 @@ func (m *CPUMiner) solveBlock(template *mining.BlockTemplate) error {
 	return nil
 }
 
-// waitOrQuit pauses for failureBackoff and reports whether quit was signalled in the meantime.
-func waitOrQuit(quit <-chan struct{}) bool {
+func stopped(r *run, workerQuit <-chan struct{}) bool {
 	select {
-	case <-quit:
+	case <-r.quit:
+		return true
+	case <-workerQuit:
+		return true
+	default:
+		return false
+	}
+}
+
+func waitOrQuit(r *run, workerQuit <-chan struct{}) bool {
+	select {
+	case <-r.quit:
+		return true
+	case <-workerQuit:
 		return true
 	case <-time.After(failureBackoff):
 		return false
@@ -213,24 +212,18 @@ func waitOrQuit(quit <-chan struct{}) bool {
 // is submitted.
 //
 // It must be run as a goroutine.
-func (m *CPUMiner) generateBlocks(quit chan struct{}) {
+func (m *CPUMiner) generateBlocks(r *run, workerQuit <-chan struct{}) {
 	log.Tracef("Starting generate blocks worker")
+	var extraNonce uint64
 
-out:
-	for {
-		// Quit when the miner is stopped.
-		select {
-		case <-quit:
-			break out
-		default:
-			// Non-blocking select to fall through
-		}
-
+	for !stopped(r, workerQuit) {
 		// Wait until there is a connection to at least one other peer
 		// since there is no way to relay a found block or receive
 		// transactions to work on when there are no connected peers.
 		if m.cfg.ConnectedCount() == 0 {
-			time.Sleep(time.Second)
+			if waitOrQuit(r, workerQuit) {
+				break
+			}
 			continue
 		}
 
@@ -243,41 +236,45 @@ out:
 		curHeight := m.g.BestSnapshot().Height
 		if curHeight != 0 && !m.cfg.IsCurrent() {
 			m.submitBlockLock.Unlock()
-			time.Sleep(time.Second)
-			continue
-		}
-
-		// Choose a payment address at random.
-		rand.Seed(time.Now().UnixNano())
-		payToAddr := m.cfg.MiningAddrs[rand.Intn(len(m.cfg.MiningAddrs))]
-
-		// Create a new block template using the available transactions
-		// in the memory pool as a source of transactions to potentially
-		// include in the block.
-		template, err := m.g.NewBlockTemplate(payToAddr)
-		m.submitBlockLock.Unlock()
-		if err != nil {
-			log.Errorf("Failed to create new block template: %v", err)
-			if waitOrQuit(quit) {
-				break out
+			if waitOrQuit(r, workerQuit) {
+				break
 			}
 			continue
 		}
 
-		_, err = m.solveAndSubmit(template, quit)
+		payToAddr := m.cfg.MiningAddrs[rand.Intn(len(m.cfg.MiningAddrs))]
+		template, err := m.g.NewBlockTemplate(payToAddr)
+		if err == nil && extraNonce > 0 {
+			err = m.g.UpdateExtraNonce(template.Block, template.Height, extraNonce)
+		}
+		m.submitBlockLock.Unlock()
+		if err != nil {
+			log.Errorf("Failed to create new block template: %v", err)
+			if waitOrQuit(r, workerQuit) {
+				break
+			}
+			continue
+		}
+
+		_, err = m.solveAndSubmit(template, r, workerQuit)
+		var ruleErr blockchain.RuleError
 		switch {
 		case err == nil, errors.Is(err, errStaleBlock):
+			extraNonce = 0
+		case errors.As(err, &ruleErr) && ruleErr.ErrorCode == blockchain.ErrDuplicateBlock:
+			extraNonce++
 		case errors.Is(err, errMinerStopped):
-			break out
+			log.Tracef("Generate blocks worker done")
+			return
 		default:
 			log.Errorf("CPU miner: %v", err)
-			if waitOrQuit(quit) {
-				break out
+			if waitOrQuit(r, workerQuit) {
+				log.Tracef("Generate blocks worker done")
+				return
 			}
 		}
 	}
 
-	m.workerWg.Done()
 	log.Tracef("Generate blocks worker done")
 }
 
@@ -286,49 +283,47 @@ out:
 // dynamically adjust the number of running worker goroutines.
 //
 // It must be run as a goroutine.
-func (m *CPUMiner) miningWorkerController() {
-	// launchWorkers groups common code to launch a specified number of
-	// workers for generating blocks.
+func (m *CPUMiner) miningWorkerController(r *run, numWorkers uint32) {
+	defer m.endRun(r)
+
+	var workerWg sync.WaitGroup
 	var runningWorkers []chan struct{}
-	launchWorkers := func(numWorkers uint32) {
-		for i := uint32(0); i < numWorkers; i++ {
+	launchWorkers := func(n uint32) {
+		for range n {
 			quit := make(chan struct{})
 			runningWorkers = append(runningWorkers, quit)
 
-			m.workerWg.Add(1)
-			go m.generateBlocks(quit)
+			workerWg.Add(1)
+			go func() {
+				defer workerWg.Done()
+				m.generateBlocks(r, quit)
+			}()
 		}
 	}
 
-	// Launch the current number of workers by default.
-	runningWorkers = make([]chan struct{}, 0, m.numWorkers)
-	launchWorkers(m.numWorkers)
+	runningWorkers = make([]chan struct{}, 0, numWorkers)
+	launchWorkers(numWorkers)
 
 out:
 	for {
 		select {
-		// Update the number of running workers.
-		case <-m.updateNumWorkers:
-			// No change.
+		case target := <-r.updateWorkers:
 			numRunning := uint32(len(runningWorkers))
-			if m.numWorkers == numRunning {
+			if target == numRunning {
 				continue
 			}
-
-			// Add new workers.
-			if m.numWorkers > numRunning {
-				launchWorkers(m.numWorkers - numRunning)
+			if target > numRunning {
+				launchWorkers(target - numRunning)
 				continue
 			}
-
-			// Signal the most recently created goroutines to exit.
-			for i := numRunning - 1; i >= m.numWorkers; i-- {
-				close(runningWorkers[i])
-				runningWorkers[i] = nil
-				runningWorkers = runningWorkers[:i]
+			for uint32(len(runningWorkers)) > target {
+				last := len(runningWorkers) - 1
+				close(runningWorkers[last])
+				runningWorkers[last] = nil
+				runningWorkers = runningWorkers[:last]
 			}
 
-		case <-m.quit:
+		case <-r.quit:
 			for _, quit := range runningWorkers {
 				close(quit)
 			}
@@ -336,8 +331,22 @@ out:
 		}
 	}
 
-	m.workerWg.Wait()
-	m.wg.Done()
+	workerWg.Wait()
+	log.Infof("CPU miner stopped")
+}
+
+func (m *CPUMiner) currentRun() *run {
+	m.Lock()
+	defer m.Unlock()
+
+	return m.run
+}
+
+func (m *CPUMiner) endRun(r *run) {
+	m.Lock()
+	m.run = nil
+	m.Unlock()
+	close(r.done)
 }
 
 // Start begins the CPU mining process.  Calling this function when the CPU
@@ -348,17 +357,18 @@ func (m *CPUMiner) Start() {
 	m.Lock()
 	defer m.Unlock()
 
-	// Nothing to do if the miner is already running or if running in
-	// discrete mode (using GenerateNBlocks).
-	if m.started || m.discreteMining {
+	if m.run != nil {
 		return
 	}
 
-	m.quit = make(chan struct{})
-	m.wg.Add(1)
-	go m.miningWorkerController()
+	r := &run{
+		quit:          make(chan struct{}),
+		done:          make(chan struct{}),
+		updateWorkers: make(chan uint32),
+	}
+	m.run = r
+	go m.miningWorkerController(r, m.numWorkers)
 
-	m.started = true
 	log.Infof("CPU miner started")
 }
 
@@ -368,33 +378,14 @@ func (m *CPUMiner) Start() {
 //
 // This function is safe for concurrent access.
 func (m *CPUMiner) Stop() {
-	m.Lock()
-
-	// Nothing to do if the miner is not currently running.
-	if !m.started {
-		m.Unlock()
+	r := m.currentRun()
+	if r == nil {
 		return
 	}
 
-	if m.discreteMining {
-		// Concurrent Stop calls may both get here before GenerateNBlocks returns; only the first may close quit.
-		select {
-		case <-m.quit:
-		default:
-			close(m.quit)
-		}
-		done := m.discreteDone
-		// GenerateNBlocks takes the lock to clear its state, so wait unlocked.
-		m.Unlock()
-		<-done
-		return
-	}
-
-	close(m.quit)
-	m.wg.Wait()
-	m.started = false
-	m.Unlock()
-	log.Infof("CPU miner stopped")
+	r.stop()
+	// endRun takes the miner lock to clear m.run, so wait unlocked.
+	<-r.done
 }
 
 // IsMining returns whether or not the CPU miner has been started and is
@@ -402,10 +393,7 @@ func (m *CPUMiner) Stop() {
 //
 // This function is safe for concurrent access.
 func (m *CPUMiner) IsMining() bool {
-	m.Lock()
-	defer m.Unlock()
-
-	return m.started
+	return m.currentRun() != nil
 }
 
 // SetNumWorkers sets the number of workers to create which solve blocks.  Any
@@ -431,10 +419,12 @@ func (m *CPUMiner) SetNumWorkers(numWorkers int32) {
 		m.numWorkers = uint32(numWorkers)
 	}
 
-	// When the miner is already running, notify the controller about the change.  Discrete mode has no controller to
-	// receive it.
-	if m.started && !m.discreteMining {
-		m.updateNumWorkers <- struct{}{}
+	// Stop waits unlocked, so r.quit may close before the controller receives this update.
+	if m.run != nil && m.run.updateWorkers != nil {
+		select {
+		case m.run.updateWorkers <- m.numWorkers:
+		case <-m.run.quit:
+		}
 	}
 }
 
@@ -455,70 +445,54 @@ func (m *CPUMiner) NumWorkers() int32 {
 // block is rejected, or Stop is called.
 func (m *CPUMiner) GenerateNBlocks(n uint32) ([]*chainhash.Hash, error) {
 	m.Lock()
-
-	// Respond with an error if server is already mining.
-	if m.started || m.discreteMining {
+	if m.run != nil {
 		m.Unlock()
 		return nil, errors.New("Server is already CPU mining. Please call " +
 			"`setgenerate 0` before calling discrete `generate` commands.")
 	}
-
-	m.started = true
-	m.discreteMining = true
-	m.quit = make(chan struct{})
-	m.discreteDone = make(chan struct{})
-	quit, done := m.quit, m.discreteDone
-
+	r := &run{
+		quit: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	m.run = r
 	m.Unlock()
-
-	defer func() {
-		m.Lock()
-		m.started = false
-		m.discreteMining = false
-		m.Unlock()
-		close(done)
-	}()
+	defer m.endRun(r)
 
 	log.Tracef("Generating %d blocks", n)
 
+	var extraNonce uint64
 	var blockHashes []*chainhash.Hash
 	for uint32(len(blockHashes)) < n {
-		select {
-		case <-quit:
+		if stopped(r, nil) {
 			return nil, errMinerStopped
-		default:
 		}
 
 		// Grab the lock used for block submission, since the current block will
 		// be changing and this would otherwise end up building a new block
 		// template on a block that is in the process of becoming stale.
 		m.submitBlockLock.Lock()
-
-		// Choose a payment address at random.
-		rand.Seed(time.Now().UnixNano())
 		payToAddr := m.cfg.MiningAddrs[rand.Intn(len(m.cfg.MiningAddrs))]
-
-		// Create a new block template using the available transactions
-		// in the memory pool as a source of transactions to potentially
-		// include in the block.
 		template, err := m.g.NewBlockTemplate(payToAddr)
+		if err == nil && extraNonce > 0 {
+			err = m.g.UpdateExtraNonce(template.Block, template.Height, extraNonce)
+		}
 		m.submitBlockLock.Unlock()
 		if err != nil {
 			return nil, fmt.Errorf("failed to create new block template: %w", err)
 		}
 
-		block, err := m.solveAndSubmit(template, quit)
+		block, err := m.solveAndSubmit(template, r, nil)
 		var ruleErr blockchain.RuleError
 		switch {
 		case err == nil:
 			blockHashes = append(blockHashes, block.Hash())
+			extraNonce = 0
 		case errors.Is(err, errStaleBlock):
+			extraNonce = 0
 		case errors.As(err, &ruleErr) && ruleErr.ErrorCode == blockchain.ErrDuplicateBlock:
-			// A template rebuilt within the timestamp's second can reproduce a block the chain already holds, such as
-			// one marked invalid by invalidateblock; the next second yields a new hash.
-			if waitOrQuit(quit) {
-				return nil, errMinerStopped
-			}
+			// Bumping extraNonce changes the coinbase merkle root immediately, even when MinBlockTimestamp pins the
+			// header timestamp ahead of wall-clock time after invalidateblock.
+			extraNonce++
 		default:
 			return nil, err
 		}
@@ -533,10 +507,9 @@ func (m *CPUMiner) GenerateNBlocks(n uint32) ([]*chainhash.Hash, error) {
 // type for more details.
 func New(cfg *Config) *CPUMiner {
 	return &CPUMiner{
-		g:                cfg.BlockTemplateGenerator,
-		cfg:              *cfg,
-		numWorkers:       defaultNumWorkers,
-		updateNumWorkers: make(chan struct{}),
-		solve:            blockchain.SolveBlock,
+		g:          cfg.BlockTemplateGenerator,
+		cfg:        *cfg,
+		numWorkers: defaultNumWorkers,
+		solve:      blockchain.SolveBlock,
 	}
 }
