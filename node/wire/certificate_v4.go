@@ -70,10 +70,10 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
 			len(c.AncestorHeaders), MaxCertificateV4AncestorHeaders)
 	}
-	if err := checkBlobLen("fp8 public_data", uint64(len(c.PublicData)), PublicDataMaxSizeV4); err != nil {
+	if err := checkBlobLen("fp8 public_data", len(c.PublicData), PublicDataMaxSizeV4); err != nil {
 		return err
 	}
-	if err := checkBlobLen("fp8 proof_data", uint64(len(c.ProofData)), MaxZKProofSize); err != nil {
+	if err := checkBlobLen("fp8 proof_data", len(c.ProofData), MaxZKProofSize); err != nil {
 		return err
 	}
 	if _, err := w.Write(c.Hash[:]); err != nil {
@@ -110,7 +110,7 @@ func readV4Blob(r io.Reader, fieldName string, maxLen int) ([]byte, error) {
 	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return nil, err
 	}
-	if err := checkBlobLen("fp8 "+fieldName, uint64(length), maxLen); err != nil {
+	if err := checkBlobLen("fp8 "+fieldName, length, maxLen); err != nil {
 		return nil, err
 	}
 	if length == 0 {

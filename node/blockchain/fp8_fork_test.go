@@ -130,11 +130,11 @@ func TestSolveBlockRequiresFp8Fork(t *testing.T) {
 		{"simnet at the fork", &simNet, fp8ForkTestHeight, ""},
 		{"regtest before the fork", &regTest, fp8ForkTestHeight - 1, "requires certificate version 3"},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			cert, err := SolveBlock(&wire.BlockHeader{}, &wire.BlockHeader{}, test.params, test.height)
-			if test.wantErr != "" {
-				require.ErrorContains(t, err, test.wantErr)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cert, err := SolveBlock(&wire.BlockHeader{}, &wire.BlockHeader{}, tt.params, tt.height)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
 				return
 			}
 			require.NoError(t, err)

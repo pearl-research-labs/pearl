@@ -8,12 +8,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/node/zkpow"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -249,48 +251,47 @@ func TestCertificateV4Wire(t *testing.T) {
 	}
 }
 
-// TestMsgCertificateMaxSize checks that encoding and decoding agree on CertificateMaxSize, version prefix included.
-// Only V2/V3 blobs can reach the cap, so a V2 certificate with full public data is padded via its proof.
+// Only V2/V3 blobs can reach CertificateMaxSize, so pad a V2 certificate via ProofData.
 func TestMsgCertificateMaxSize(t *testing.T) {
-	// version + hash + public length + public data + proof length.
 	fixed := wire.CertificateVersionSize + chainhash.HashSize + 4 + wire.PublicDataMaxSizeV2 + 4
-	for _, test := range []struct {
+	tests := []struct {
 		name string
 		size int
 	}{
 		{"at limit", wire.CertificateMaxSize},
 		{"one over", wire.CertificateMaxSize + 1},
 		{"version size over", wire.CertificateMaxSize + wire.CertificateVersionSize},
-	} {
-		t.Run(test.name, func(t *testing.T) {
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			cert := &wire.CertificateV2{
 				Hash:          chainhash.Hash{0x01},
 				PublicDataLen: wire.PublicDataMaxSizeV2,
-				ProofData:     bytes.Repeat([]byte{0x22}, test.size-fixed),
+				ProofData:     bytes.Repeat([]byte{0x22}, tt.size-fixed),
 			}
 			msg := &wire.MsgCertificate{Certificate: cert}
-			require.Equal(t, test.size, msg.SerializeSize())
+			require.Equal(t, tt.size, msg.SerializeSize())
 
 			// Bypass PrlEncode's cap so oversized bytes reach the decoder.
 			raw := binary.LittleEndian.AppendUint32(nil, uint32(cert.Version()))
 			buf := bytes.NewBuffer(raw)
 			require.NoError(t, cert.Serialize(buf))
 			raw = buf.Bytes()
-			require.Len(t, raw, test.size)
+			require.Len(t, raw, tt.size)
 
 			var encoded bytes.Buffer
 			encodeErr := msg.PrlEncode(&encoded, wire.ProtocolVersion)
 			var decoded wire.MsgCertificate
 			decodeErr := decoded.PrlDecode(bytes.NewReader(raw), wire.ProtocolVersion)
-			if test.size > wire.CertificateMaxSize {
-				require.ErrorContains(t, encodeErr, "certificate too large")
-				require.Error(t, decodeErr)
+			if tt.size > wire.CertificateMaxSize {
+				assert.ErrorContains(t, encodeErr, "certificate too large")
+				assert.ErrorIs(t, decodeErr, io.ErrUnexpectedEOF)
 				return
 			}
 			require.NoError(t, encodeErr)
-			require.Equal(t, raw, encoded.Bytes())
+			assert.Equal(t, raw, encoded.Bytes())
 			require.NoError(t, decodeErr)
-			require.Equal(t, msg, &decoded)
+			assert.Equal(t, msg, &decoded)
 		})
 	}
 }
@@ -335,14 +336,11 @@ func TestCertificateV4ProofCommitment(t *testing.T) {
 	require.Equal(t, want, cert.ProofCommitment())
 }
 
-// TestCertificateBlobCaps checks that Serialize and Deserialize accept each length-prefixed blob at its cap and reject
-// it one byte over.
 func TestCertificateBlobCaps(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		field string
-		max   int
-		// lenOffset locates the blob's u32 length prefix in the serialized fields of newCert(max).
+	tests := []struct {
+		name      string
+		field     string
+		max       int
 		lenOffset int
 		newCert   func(n int) wire.BlockCertificate
 	}{
@@ -371,21 +369,22 @@ func TestCertificateBlobCaps(t *testing.T) {
 			lenOffset: chainhash.HashSize + 4,
 			newCert:   func(n int) wire.BlockCertificate { return &wire.CertificateV4{ProofData: make([]byte, n)} },
 		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			require.NoError(t, test.newCert(test.max).Serialize(&buf))
-			decoded := test.newCert(0)
+			require.NoError(t, tt.newCert(tt.max).Serialize(&buf))
+			decoded := tt.newCert(0)
 			require.NoError(t, decoded.Deserialize(bytes.NewReader(buf.Bytes())))
 			var reencoded bytes.Buffer
 			require.NoError(t, decoded.Serialize(&reencoded))
-			require.Equal(t, buf.Bytes(), reencoded.Bytes())
+			assert.Equal(t, buf.Bytes(), reencoded.Bytes())
 
-			wantErr := fmt.Sprintf("%s_len %d exceeds max %d", test.field, test.max+1, test.max)
-			require.ErrorContains(t, test.newCert(test.max+1).Serialize(&bytes.Buffer{}), wantErr)
-			prefix := buf.Bytes()[:test.lenOffset:test.lenOffset]
-			oversized := binary.LittleEndian.AppendUint32(prefix, uint32(test.max+1))
-			require.ErrorContains(t, test.newCert(0).Deserialize(bytes.NewReader(oversized)), wantErr)
+			wantErr := fmt.Sprintf("%s_len %d exceeds max %d", tt.field, tt.max+1, tt.max)
+			assert.ErrorContains(t, tt.newCert(tt.max+1).Serialize(&bytes.Buffer{}), wantErr)
+			prefix := buf.Bytes()[:tt.lenOffset:tt.lenOffset]
+			oversized := binary.LittleEndian.AppendUint32(prefix, uint32(tt.max+1))
+			assert.ErrorContains(t, tt.newCert(0).Deserialize(bytes.NewReader(oversized)), wantErr)
 		})
 	}
 }

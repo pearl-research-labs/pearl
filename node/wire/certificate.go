@@ -203,10 +203,9 @@ func (m *MsgCertificate) SerializeSize() int {
 	return CertificateVersionSize + m.Certificate.SerializedSize()
 }
 
-// checkBlobLen rejects a length-prefixed certificate blob longer than max, so that encoding refuses exactly what
-// decoding refuses.
-func checkBlobLen(field string, length uint64, max int) error {
-	if length > uint64(max) {
+// Width-agnostic bound: uint32 wire lengths wrap signed int on 32-bit; slice lengths wrap uint32 on 64-bit.
+func checkBlobLen[T int | uint32](field string, length T, max int) error {
+	if uint64(length) > uint64(max) {
 		return fmt.Errorf("%s_len %d exceeds max %d", field, length, max)
 	}
 	return nil

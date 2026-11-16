@@ -36,8 +36,7 @@ func MineV4(header, parent *wire.BlockHeader, device int) (*wire.CertificateV4, 
 	if err := parent.Serialize(&parentBuf); err != nil {
 		return nil, err
 	}
-	// mine_v4 takes the proposed header without its proof commitment, which mining has yet to produce, and the parent
-	// with it.
+	// mine_v4 reads a 76-byte proposed header (pre-commitment) and a full 108-byte parent header.
 	incompleteHeader := headerBuf.Bytes()[:C.IncompleteBlockHeader_SERIALIZED_SIZE]
 	proofBuf := make([]byte, C.MAX_ZK_PROOF_SIZE)
 	var pinner runtime.Pinner

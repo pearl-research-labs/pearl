@@ -9,6 +9,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,8 +54,7 @@ func TestHeadersLargeV4RoundTrip(t *testing.T) {
 		ProofData:       bytes.Repeat([]byte{0x22}, MaxZKProofSize),
 		AncestorHeaders: []BlockHeader{header, header, header},
 	}
-	// version + hash + two length prefixes + ancestor count + blobs + ancestors.
-	maxV4 := 4 + 32 + 4 + 4 + 1 + PublicDataMaxSizeV4 + MaxZKProofSize +
+	maxV4 := CertificateVersionSize + chainhash.HashSize + 4 + 4 + 1 + PublicDataMaxSizeV4 + MaxZKProofSize +
 		MaxCertificateV4AncestorHeaders*MaxBlockHeaderPayload
 	require.Equal(t, maxV4, (&MsgCertificate{Certificate: cert}).SerializeSize())
 	require.LessOrEqual(t, maxV4, CertificateMaxSize)

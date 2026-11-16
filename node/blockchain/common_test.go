@@ -297,8 +297,7 @@ func calcMerkleRoot(txns []*wire.MsgTx) chainhash.Hash {
 	return CalcMerkleRoot(utilTxns, false)
 }
 
-// testCertificate returns the certificate for a test block at height. SimNet fork tests build blocks on both sides of a
-// cutover, but SolveBlock only produces V4, so pre-fork SimNet heights get a dummy of the version consensus requires.
+// SimNet fork tests build pre-FP8 blocks, which V4-only SolveBlock rejects.
 func testCertificate(header, parent *wire.BlockHeader, params *chaincfg.Params,
 	height int32) (wire.BlockCertificate, error) {
 

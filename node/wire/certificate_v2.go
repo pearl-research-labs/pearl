@@ -78,10 +78,10 @@ func proofCommitment(version CertificateVersion, publicData []byte) chainhash.Ha
 // Serialize: BlockHash(32) + PublicDataLen(4) + PublicData(PublicDataLen) + ProofLen(4) + ProofData
 // Version excluded - handled by MsgCertificate.
 func (c *CertificateV2) Serialize(w io.Writer) error {
-	if err := checkBlobLen("public_data", uint64(c.PublicDataLen), PublicDataMaxSizeV2); err != nil {
+	if err := checkBlobLen("public_data", c.PublicDataLen, PublicDataMaxSizeV2); err != nil {
 		return err
 	}
-	if err := checkBlobLen("proof_data", uint64(len(c.ProofData)), MaxZKProofSize); err != nil {
+	if err := checkBlobLen("proof_data", len(c.ProofData), MaxZKProofSize); err != nil {
 		return err
 	}
 	if _, err := w.Write(c.Hash[:]); err != nil {
@@ -111,7 +111,7 @@ func (c *CertificateV2) Deserialize(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &c.PublicDataLen); err != nil {
 		return err
 	}
-	if err := checkBlobLen("public_data", uint64(c.PublicDataLen), PublicDataMaxSizeV2); err != nil {
+	if err := checkBlobLen("public_data", c.PublicDataLen, PublicDataMaxSizeV2); err != nil {
 		return err
 	}
 	if _, err := io.ReadFull(r, c.PublicData[:c.PublicDataLen]); err != nil {
@@ -122,7 +122,7 @@ func (c *CertificateV2) Deserialize(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &proofLen); err != nil {
 		return err
 	}
-	if err := checkBlobLen("proof_data", uint64(proofLen), MaxZKProofSize); err != nil {
+	if err := checkBlobLen("proof_data", proofLen, MaxZKProofSize); err != nil {
 		return err
 	}
 	c.ProofData = make([]byte, proofLen)

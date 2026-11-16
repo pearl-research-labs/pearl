@@ -309,11 +309,10 @@ func BenchmarkMine(b *testing.B) {
 	}
 }
 
-// TestVerifyCertificateV4PublicDataSize pins wire.PublicDataMaxSizeV4 to the largest statement the native verifier
-// admits.
+// Pin wire.PublicDataMaxSizeV4 against the native verifier's PublicParams::MAX_WIRE_SIZE.
 func TestVerifyCertificateV4PublicDataSize(t *testing.T) {
 	const sizeErr = "invalid public_data_len"
-	for _, test := range []struct {
+	tests := []struct {
 		publicLen int
 		wantErr   string
 	}{
@@ -321,18 +320,19 @@ func TestVerifyCertificateV4PublicDataSize(t *testing.T) {
 		{wire.PublicDataMaxSizeV4, "v4 proof rejected"},
 		{wire.PublicDataMaxSizeV4 + 1, sizeErr},
 		{wire.PublicDataMaxSizeV2 + 1, "fp8 public data too large"}, // Reject before the C-buffer copy.
-	} {
-		t.Run(fmt.Sprint(test.publicLen), func(t *testing.T) {
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprint(tt.publicLen), func(t *testing.T) {
 			header := testBlockHeader()
 			cert := &wire.CertificateV4{
-				PublicData: make([]byte, test.publicLen),
+				PublicData: make([]byte, tt.publicLen),
 				ProofData:  []byte{0x02},
 			}
 			header.ProofCommitment = cert.ProofCommitment()
 			cert.Hash = header.BlockHash()
 			err := VerifyCertificate(header, cert)
-			require.ErrorContains(t, err, test.wantErr)
-			if test.wantErr != sizeErr {
+			require.ErrorContains(t, err, tt.wantErr)
+			if tt.wantErr != sizeErr {
 				require.NotContains(t, err.Error(), sizeErr)
 			}
 		})

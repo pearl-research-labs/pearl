@@ -166,8 +166,7 @@ func TestCheckBlockSanity(t *testing.T) {
 		Bits:       chainParams.PowLimitBits,
 	}
 
-	// Mine a valid V3 certificate. CheckBlockSanity only allowlists the version and verifies the proof; it does not
-	// apply the height-gated V4 cutover, and a V3 proof is far cheaper to mine than a V4 one.
+	// CheckBlockSanity is height-free, so a cheap V3 proof exercises real PoW verification without ~40s V4 proving.
 	cert, err := zkpow.Mine(&header, wire.CertificateVersionV3)
 	if err != nil {
 		t.Fatalf("Mine failed: %v", err)
