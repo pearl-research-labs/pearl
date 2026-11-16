@@ -261,7 +261,7 @@ out:
 			continue
 		}
 		if solved {
-			// submitBlock logs rejections; the worker just moves on.
+			// submitBlock already logs every failure.
 			_ = m.submitBlock(btcutil.NewBlock(template.Block))
 		}
 	}
@@ -352,9 +352,10 @@ func (m *CPUMiner) Start() {
 }
 
 // Stop gracefully stops the mining process by signalling all workers, or a
-// running GenerateNBlocks call, to quit, and waits for them to finish.  A block
-// that is being solved when Stop is called is finished first.  Calling this
-// function when the CPU miner has not already been started will have no effect.
+// running GenerateNBlocks call, to quit, and waits for them to finish.  A
+// certificate computation cannot be interrupted, so Stop also waits for one in
+// progress.  Calling this function when the CPU miner has not already been
+// started will have no effect.
 //
 // This function is safe for concurrent access.
 func (m *CPUMiner) Stop() {
