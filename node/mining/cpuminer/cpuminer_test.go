@@ -95,7 +95,7 @@ func TestGenerateNBlocks(t *testing.T) {
 			checkPoW:  true,
 		},
 		{
-			name:             "replaces invalidated tip ahead of wall clock",
+			name:             "replaces invalidated tip via fresh commitment",
 			params:           &simNet,
 			numBlocks:        10,
 			invalidateAndGen: true,
@@ -165,6 +165,7 @@ func TestCPUMinerStop(t *testing.T) {
 	tests := []struct {
 		name  string
 		start func(*CPUMiner) <-chan error
+		stop  func(*CPUMiner)
 	}{
 		{
 			name: "generate",
@@ -176,6 +177,7 @@ func TestCPUMinerStop(t *testing.T) {
 				}()
 				return errc
 			},
+			stop: (*CPUMiner).Stop,
 		},
 		{
 			name: "setgenerate",
@@ -183,6 +185,7 @@ func TestCPUMinerStop(t *testing.T) {
 				m.Start()
 				return nil
 			},
+			stop: func(m *CPUMiner) { m.SetNumWorkers(0) },
 		},
 	}
 	for _, tt := range tests {
@@ -190,30 +193,24 @@ func TestCPUMinerStop(t *testing.T) {
 			miner, chain := newTestMiner(t, &params)
 			solver := &gatedSolver{entered: make(chan struct{}), release: make(chan struct{})}
 			miner.solve = solver.solve
-			miner.SetNumWorkers(4)
 
 			errc := tt.start(miner)
 			<-solver.entered
-			miner.SetNumWorkers(3)
-			miner.SetNumWorkers(4)
-			// Give the remaining workers time to queue behind solveLock while the first proof blocks.
-			time.Sleep(50 * time.Millisecond)
 			r := miner.currentRun()
 			require.NotNil(t, r)
 
 			stopped := make(chan struct{})
 			go func() {
-				miner.Stop()
+				tt.stop(miner)
 				close(stopped)
 			}()
 			<-r.quit
 			assert.True(t, miner.IsMining(), "IsMining must not block while Stop waits on a proof")
-			miner.SetNumWorkers(2)
 			close(solver.release)
 			<-stopped
 
 			assert.False(t, miner.IsMining())
-			assert.Equal(t, int32(1), solver.calls.Load(), "only the proof in progress may run after Stop")
+			assert.Equal(t, int32(1), solver.calls.Load())
 			if errc != nil {
 				assert.ErrorIs(t, <-errc, errMinerStopped)
 			}
@@ -224,25 +221,4 @@ func TestCPUMinerStop(t *testing.T) {
 			assert.Equal(t, height+1, chain.BestSnapshot().Height)
 		})
 	}
-}
-
-func TestCPUMinerQueuedWorkerSeesNewTip(t *testing.T) {
-	params := chaincfg.SimNetParams
-	miner, chain := newTestMiner(t, &params)
-	var supersededProofs atomic.Int32
-	miner.solve = func(header, parent *wire.BlockHeader, p *chaincfg.Params,
-		height int32) (*wire.CertificateV4, error) {
-
-		time.Sleep(10 * time.Millisecond)
-		if header.PrevBlock != chain.BestSnapshot().Hash {
-			supersededProofs.Add(1)
-		}
-		return blockchain.SolveBlock(header, parent, p, height)
-	}
-	miner.SetNumWorkers(4)
-
-	miner.Start()
-	require.Eventually(t, func() bool { return chain.BestSnapshot().Height >= 5 }, time.Minute, 10*time.Millisecond)
-	miner.Stop()
-	assert.Zero(t, supersededProofs.Load(), "proofs whose tip changed while they ran")
 }

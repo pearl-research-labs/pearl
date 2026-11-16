@@ -132,13 +132,16 @@ func TestSolveBlockRequiresFp8Fork(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cert, err := SolveBlock(&wire.BlockHeader{}, &wire.BlockHeader{}, tt.params, tt.height)
+			header := &wire.BlockHeader{}
+			cert, err := SolveBlock(header, &wire.BlockHeader{}, tt.params, tt.height)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				return
 			}
 			require.NoError(t, err)
 			require.Equal(t, wire.CertificateVersionV4, cert.Version())
+			require.Equal(t, cert.ProofCommitment(), header.ProofCommitment)
+			require.Equal(t, header.BlockHash(), cert.BlockHash())
 		})
 	}
 }
