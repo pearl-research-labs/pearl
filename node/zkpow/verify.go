@@ -219,11 +219,14 @@ func BatchVerify(headers []*wire.BlockHeader, certs []wire.BlockCertificate) (in
 					return
 				}
 
+				// Check stop before verifying: a select case's send value is evaluated before any case is chosen.
 				select {
 				case <-stop:
 					return
-				case results[i] <- VerifyCertificate(headers[i], certs[i]):
+				default:
 				}
+
+				results[i] <- VerifyCertificate(headers[i], certs[i])
 			}
 		})
 	}
