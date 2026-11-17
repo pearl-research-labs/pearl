@@ -20,11 +20,8 @@ const H100_FP8_WIDTH: u16 = 14;
 const H100_WINDOW_PRODUCTS: usize = 128;
 const FP8_PRODUCT_ZERO_EXP: i32 = -139;
 
-pub const DOWNSCALE_G_SMALL_RMS: f32 = 0.1;
-
 pub const SMALL_RMS_THRESHOLD: f32 = 8.0;
-
-pub const DOWNSCALE_G: f32 = 0.08;
+pub const RMS_THRESHOLD: f32 = 4.0;
 
 pub const E4M3_EXP_SHIFT: i32 = 3;
 pub const E4M3_SIGN_SHIFT: i32 = 7;
@@ -187,16 +184,11 @@ const fn multiply_fp8_to_gfloat(a: u8, b: u8, zero_exp: i32) -> GFloat {
     }
 }
 
-pub fn downscale_g(scaled_rms: &[f32]) -> Vec<f32> {
+pub fn downscale_g(scaled_rms: &[f32], device: Device) -> Vec<f32> {
+    let (g, g_small) = device.downscale_g();
     scaled_rms
         .iter()
-        .map(|&x| {
-            if x >= SMALL_RMS_THRESHOLD {
-                DOWNSCALE_G
-            } else {
-                DOWNSCALE_G_SMALL_RMS
-            }
-        })
+        .map(|&x| if x >= SMALL_RMS_THRESHOLD { g } else { g_small })
         .collect()
 }
 

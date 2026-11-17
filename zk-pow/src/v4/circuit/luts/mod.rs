@@ -164,8 +164,14 @@ pub enum LutTable {
     /// Six folded exponent slots jointly serve the strip byte, Q16 Gaussian coefficient,
     /// LOG16 cap region, and baseline score `lambda(0,sigma)` (the kernel-key base).
     DownscaleThreshold,
-    /// B200 quantize-first rewrite, keyed `code+256*threshold+32768*coin+65536*e`, with
-    /// byte code, 7-bit threshold, boolean coin, and `e=sigma_enc-269` in `0..=5`.
+    /// H100 row parameters, same key shape with `e=sigma_enc-270` in `0..=5` (the exact
+    /// signal RMS is `norm*2^(e-13)`, `sigma = s`). The strip factor is 0.105 on every
+    /// slot, the region is always the uncapped class, and the threshold/key base are
+    /// slot-affine, so the coefficient column is shared by all six slots.
+    DownscaleThresholdH100,
+    /// Quantize-first rewrite, keyed `code+256*threshold+32768*coin+65536*e`, with
+    /// byte code, 7-bit threshold, boolean coin, and `e=sigma_enc-256-offset(device)` in
+    /// `0..=5`.
     /// Returns `(code&128)|(8*e)|(code&7)|1` if `coin && (code&127)<threshold`, else code.
     /// Six folded slots share the same comparison; only the replacement exponent differs.
     DownscaleRewrite,

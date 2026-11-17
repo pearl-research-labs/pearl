@@ -75,39 +75,40 @@
 //! # Jackpot noise-floor gate (check 2)
 //!
 //! Every opened row must have scaled signal RMS `alpha * l2f >= min_rms`, with
-//! `min_rms = 4` for A rows and `16` for B rows. S2 certifies the exact product's width bit,
+//! `min_rms = 4` for A rows and `8` for B rows. S2 certifies the exact product's width bit,
 //! so `floor(log2(alpha * l2f)) = E(alpha) + E(l2f) + SIGMA_SIG_IS_WIDE - 254`.
 //! One unfiltered RC16 lookup of
-//! `E(alpha) + E(l2f) + SIGMA_SIG_IS_WIDE + 2*IS_A_ROW - 258` proves the floor.
+//! `E(alpha) + E(l2f) + SIGMA_SIG_IS_WIDE + IS_A_ROW - 257` proves the floor.
 //! Passing keys fit within RC16 on the pinned exponent domain; a negative key wraps far
 //! outside the table range. This matches the native policy's exact f64 comparison.
 //!
-//! # B200 strip parameters and noise-coverage gate (check 4)
+//! # Strip parameters and noise-coverage gate (check 4)
 //!
-//! Let `s = alpha*l2f` be the exact signal RMS and `sigma=s/2` the B200 noise standard
+//! Let `s = alpha*l2f` be the exact signal RMS and `sigma = delta*s` the noise standard
 //! deviation. S2 normalizes the exact 16-bit product `P=M(alpha)*M(l2f)` using
 //! `wide=[P>=2^15]`, so
 //!
 //! ```text
-//! norm     = P * 2^(1-wide)                 // 2^15 <= norm < 2^16
-//! encoding = E(alpha)+E(l2f)+wide+13        // floor(log2(sigma))+268
-//! s        = norm * 2^(encoding-282).
+//! norm     = P * 2^(1-wide)                        // 2^15 <= norm < 2^16
+//! encoding = E(alpha)+E(l2f)+wide+offset(device)   // floor(log2(sigma))+268
+//! s        = norm * 2^(encoding-283-lg2(delta)).
 //! ```
 //!
-//! DOWNSCALETHRESHOLD takes the folded key
-//! `(norm-32768)+32768*(encoding-269)`. Its six exponent slots restrict `s` to `[4,256)`
-//! and jointly return the exact strip byte `t`, Q16 coefficient `A`, Gaussian region,
-//! and baseline score `base=lambda(0,sigma)`. Write `c=decode_E4M3(t)`. The constants are
+//! The device's DOWNSCALETHRESHOLD table takes the folded key
+//! `(norm-32768)+32768*(encoding-256-offset(device))`. Its six exponent slots restrict `s`
+//! to `[4,256)` and jointly return the exact strip byte `t`, Q16 coefficient `A`, Gaussian
+//! region, and baseline score `base=lambda(0,sigma)`. Write `c=decode_E4M3(t)`. The
+//! constants are
 //!
 //! ```text
-//! t = Q8(RN32(g*s)),    g=0.1f32 for s<8, otherwise 0.08f32
-//! A = 8192                                      if s<8
-//!     floor(65536 * (21/16) * c/s)               otherwise.
+//! t = Q8(RN32(g*s)),    g = downscale_g(device) (the small-RMS factor for s<8)
+//! A = 8192                                      if sigma<4
+//!     floor(65536 * (21/32) * c/sigma)           otherwise.
 //! ```
 //!
-//! For `s<8`, the Gaussian region caps the Q16 kernel at
+//! For `sigma<4` (B200 slot 0 only), the Gaussian region caps the Q16 kernel at
 //! `8*floor(65536*(0.0431+0.2738*(c-0.4)))`; caps above every kernel entry use the
-//! uncapped class. For `s>=8`, the region is always uncapped. The table preserves the
+//! uncapped class, and every other slot is uncapped. The table preserves the
 //! binary32 multiplication followed by E4M3 rounding when deriving `t`, and binds all
 //! four outputs to the same exact row RMS rather than permitting independent choices.
 //!
@@ -124,8 +125,8 @@
 //! the product is at most `2^45`; both sides are below the Goldilocks modulus, so this
 //! equality proves an integer lower bound. Dividing by `k*2^32` gives the required mean
 //! computed noise coverage of at least `1/25`; its ideal-coverage bound is documented in
-//! [`crate::v4::circuit::unpredictability`]. Padding sets the B200 extensions to zero and
-//! disables the minimum. H100 carries none of these extensions. Check 3's tile-wide skip budget is
+//! [`crate::v4::circuit::unpredictability`]. Padding sets the noise-coverage columns to zero
+//! and disables the minimum. Check 3's tile-wide skip budget is
 //! enforced by Matmul/XorFold separately; this is an additional per-row gate.
 //!
 //! # Exact square-root check
@@ -172,11 +173,10 @@ use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
 use super::columns::{
-    ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, B200ScaleColumnsView, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT,
-    DEAD_LIMIT_B_PUBLIC_INPUT, DOS_EXP_PUBLIC_INPUT, DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT,
-    FmaBlock, K_PUBLIC_INPUT, L2_SUM_LIMBS, MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT, MulBlock, NUM_B200_SCALE_COLUMNS,
-    NUM_B200_SCALE_PUBLIC_INPUTS, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS, ScaleColumnsView, UPPER_BORROW_BITS,
-    WL2_PUBLIC_INPUT,
+    ALIGNED_LOWER_LIMBS, ALIGNED_UPPER_LIMBS, CLAIM_LIMBS, DEAD_LIMIT_A_PUBLIC_INPUT, DEAD_LIMIT_B_PUBLIC_INPUT,
+    DOS_EXP_PUBLIC_INPUT, DOS_MANTISSA_PUBLIC_INPUT, DR_EXP_PUBLIC_INPUT, DR_MANTISSA_PUBLIC_INPUT, FmaBlock, K_PUBLIC_INPUT,
+    L2_SUM_LIMBS, MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT, MulBlock, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS,
+    ScaleColumnsView, UPPER_BORROW_BITS, WL2_PUBLIC_INPUT,
 };
 use crate::v4::api::compute::{bf16_div, bf16_fma, bf16_max, bf16_mul};
 use crate::v4::api::dtype::f32_to_bf16;
@@ -374,9 +374,9 @@ impl ScaleProgram {
                 "the circuit freezes rms_min_a = 4"
             );
             assert!(
-                JackpotPolicy::for_device(Device::H100).rms_min_b == 16.0
-                    && JackpotPolicy::for_device(Device::B200).rms_min_b == 16.0,
-                "the circuit freezes rms_min_b = 16"
+                JackpotPolicy::for_device(Device::H100).rms_min_b == 8.0
+                    && JackpotPolicy::for_device(Device::B200).rms_min_b == 8.0,
+                "the circuit freezes rms_min_b = 8"
             );
         };
         Self { h, w, k, r, device }
@@ -449,61 +449,38 @@ impl ScaleProgram {
         pis[WL2_PUBLIC_INPUT] = F::from_canonical_u64(u64::from(self.wl2()));
         pis[DEAD_LIMIT_A_PUBLIC_INPUT] = F::from_canonical_u64(self.dead_limit(self.h * self.k));
         pis[DEAD_LIMIT_B_PUBLIC_INPUT] = F::from_canonical_u64(self.dead_limit(self.w * self.k));
+        pis[MINIMUM_NOISE_COVERAGE_PRODUCT_PUBLIC_INPUT] =
+            F::from_canonical_u64(super::super::unpredictability::minimum_noise_coverage_product(self.k));
         pis
     }
 
-    pub fn public_inputs_for_device<F: RichField>(&self) -> Vec<F> {
-        let mut inputs = self.public_inputs::<F>().to_vec();
-        if self.device == Device::B200 {
-            inputs.push(F::from_canonical_u64(
-                super::super::unpredictability::minimum_noise_coverage_product(self.k),
-            ));
-        }
-        inputs
-    }
-
-    pub fn generate_b200_trace<F: RichField>(
-        &self,
-        a_rows: &[ScaleRowTuple],
-        b_rows: &[ScaleRowTuple],
-        noise_coverage_sums: &[u64],
-    ) -> Vec<[F; NUM_B200_SCALE_COLUMNS]> {
-        assert_eq!(self.device, Device::B200);
+    /// Appends the per-row noise-coverage columns (check 4) to the common trace: the strip
+    /// threshold, coefficient, region, key base, kernel sum, and the ranged surplus of
+    /// `A*H` over the public minimum product.
+    pub fn fill_noise_coverage<F: RichField>(&self, rows: &mut [[F; NUM_SCALE_COLUMNS]], noise_coverage_sums: &[u64]) {
         assert_eq!(noise_coverage_sums.len(), self.live_rows());
-        let (rows, _) = self.generate_trace::<F>(a_rows, b_rows);
         let minimum = super::super::unpredictability::minimum_noise_coverage_product(self.k);
-        rows.into_iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let mut output = B200ScaleColumnsView::<F> {
-                    common: row.into(),
-                    ..Default::default()
-                };
-                if index < self.live_rows() {
-                    let common = &output.common;
-                    let norm = common.sigma_norm.to_canonical_u64();
-                    let encoding = common.alpha_exp.to_canonical_u64()
-                        + common.l2_floored_exponent.to_canonical_u64()
-                        + common.sigma_sig_is_wide.to_canonical_u64()
-                        + 13;
-                    let (threshold, coefficient, region, base) =
-                        super::super::unpredictability::noise_coverage_row_parameters(norm, encoding);
-                    let sum = noise_coverage_sums[index];
-                    let surplus = (coefficient * sum)
-                        .checked_sub(minimum)
-                        .expect("policy-rejected Gaussian row");
-                    assert!(surplus < 1 << 48);
-                    output.strip_threshold = F::from_canonical_u64(threshold);
-                    output.noise_coverage_coefficient = F::from_canonical_u64(coefficient);
-                    output.noise_coverage_region = F::from_canonical_u64(region);
-                    output.noise_coverage_key_base = F::from_canonical_u64(base);
-                    output.noise_coverage_sum = F::from_canonical_u64(sum);
-                    output.noise_coverage_surplus =
-                        core::array::from_fn(|limb| F::from_canonical_u64((surplus >> (16 * limb)) & 65535));
-                }
-                output.into()
-            })
-            .collect()
+        for (index, row) in rows.iter_mut().take(self.live_rows()).enumerate() {
+            let output: &mut ScaleColumnsView<F> = row.borrow_mut();
+            let norm = output.sigma_norm.to_canonical_u64();
+            let encoding = output.alpha_exp.to_canonical_u64()
+                + output.l2_floored_exponent.to_canonical_u64()
+                + output.sigma_sig_is_wide.to_canonical_u64()
+                + self.device.sigma_encoding_offset();
+            let (threshold, coefficient, region, base) =
+                super::super::unpredictability::noise_coverage_row_parameters(self.device, norm, encoding);
+            let sum = noise_coverage_sums[index];
+            let surplus = (coefficient * sum)
+                .checked_sub(minimum)
+                .expect("policy-rejected Gaussian row");
+            assert!(surplus < 1 << 48);
+            output.strip_threshold = F::from_canonical_u64(threshold);
+            output.noise_coverage_coefficient = F::from_canonical_u64(coefficient);
+            output.noise_coverage_region = F::from_canonical_u64(region);
+            output.noise_coverage_key_base = F::from_canonical_u64(base);
+            output.noise_coverage_sum = F::from_canonical_u64(sum);
+            output.noise_coverage_surplus = core::array::from_fn(|limb| F::from_canonical_u64((surplus >> (16 * limb)) & 65535));
+        }
     }
 
     /// Generates the ScaleStark trace and public inputs from the per-row aggregate tuples
@@ -776,12 +753,12 @@ impl ScaleProgram {
             "H: the scale chain diverged from the native derive_row_scales"
         );
 
-        // ---- The jackpot noise floor (group F): alpha*l2f >= 4 on A, >= 16 on B.
+        // ---- The jackpot noise floor (group F): alpha*l2f >= 4 on A, >= 8 on B.
         // Mirror the CTL's exponent slack, including the two BF16 exponent biases. ----
         let e_sum = alpha.e_star() + l2f.e_star();
         if expect_valid {
             assert!(
-                e_sum + i64::from(sigma_sig_is_wide) + 2 * i64::from(is_a) - 254 - 4 >= 0,
+                e_sum + i64::from(sigma_sig_is_wide) + i64::from(is_a) - 254 - 3 >= 0,
                 "policy-rejected witness: row noise scale below the sigma floor (jackpot check 2)"
             );
         }
@@ -1461,40 +1438,35 @@ fn mul_block_constraints<V: Copy + Default, S: Copy, E: Evaluator<V, S>>(
 /// Evaluates every arithmetic constraint of ScaleStark. Lookup-borne facts (LUT oracle) are
 /// *not* emitted here — see the module docs and `ctl::scale_lut_lookups`. The constraint set
 /// is program-independent: the geometry parameters `k` / `Wl2` enter as public inputs.
-pub(crate) fn eval_scale_constraints<V, S, E, const WIDTH: usize, const PUBLIC_INPUTS: usize>(
-    vars: &StarkFrame<V, S, WIDTH, PUBLIC_INPUTS>,
-    eval: &mut E,
-) where
+pub(crate) fn eval_scale_constraints<V, S, E>(vars: &StarkFrame<V, S, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS>, eval: &mut E)
+where
     V: Copy + Default,
     S: Copy + Default,
     E: Evaluator<V, S>,
 {
-    let lv: &[V; NUM_SCALE_COLUMNS] = vars.get_local_values()[..NUM_SCALE_COLUMNS].try_into().unwrap();
+    let lv: &[V; NUM_SCALE_COLUMNS] = vars.get_local_values().try_into().unwrap();
     let lv: &ScaleColumnsView<V> = lv.borrow();
     // Only the group-T running totals read the next row; every other group is local to one
     // row (one matrix row's aggregates per trace row).
-    let nv: &[V; NUM_SCALE_COLUMNS] = vars.get_next_values()[..NUM_SCALE_COLUMNS].try_into().unwrap();
+    let nv: &[V; NUM_SCALE_COLUMNS] = vars.get_next_values().try_into().unwrap();
     let nv: &ScaleColumnsView<V> = nv.borrow();
     let pis = vars.get_public_inputs();
-    let () = ScaleShape::<WIDTH, PUBLIC_INPUTS>::VALID;
-    if WIDTH == NUM_B200_SCALE_COLUMNS {
-        let row: &[V; NUM_B200_SCALE_COLUMNS] = vars.get_local_values().try_into().unwrap();
-        let row: &B200ScaleColumnsView<V> = row.borrow();
+    {
         let zero = eval.i32(0);
         for value in [
-            row.strip_threshold,
-            row.noise_coverage_coefficient,
-            row.noise_coverage_region,
-            row.noise_coverage_key_base,
-            row.noise_coverage_sum,
+            lv.strip_threshold,
+            lv.noise_coverage_coefficient,
+            lv.noise_coverage_region,
+            lv.noise_coverage_key_base,
+            lv.noise_coverage_sum,
         ]
         .into_iter()
-        .chain(row.noise_coverage_surplus)
+        .chain(lv.noise_coverage_surplus)
         {
             eval.constraint_eq_if(lv.is_pad, value, zero);
         }
         let mut surplus = zero;
-        for (limb, value) in row.noise_coverage_surplus.into_iter().enumerate() {
+        for (limb, value) in lv.noise_coverage_surplus.into_iter().enumerate() {
             let weight = eval.u64(1 << (16 * limb));
             surplus = eval.mad(value, weight, surplus);
         }
@@ -1502,7 +1474,7 @@ pub(crate) fn eval_scale_constraints<V, S, E, const WIDTH: usize, const PUBLIC_I
         let one = eval.i32(1);
         let live = eval.sub(one, lv.is_pad);
         let required = eval.mad(live, minimum, surplus);
-        let product = eval.mul(row.noise_coverage_coefficient, row.noise_coverage_sum);
+        let product = eval.mul(lv.noise_coverage_coefficient, lv.noise_coverage_sum);
         // CTL-bound kernels give sum <= 2^32 and coefficient <= 8192: product <= 2^45.
         // The three ranged limbs give surplus < 2^48, so this equality cannot wrap.
         eval.constraint_eq(product, required);
@@ -2080,7 +2052,7 @@ pub(crate) fn eval_scale_constraints<V, S, E, const WIDTH: usize, const PUBLIC_I
     eval.constraint_bool(lv.dead_slack_hi_b);
 
     // ==== F — the jackpot noise floor (check 2) is the unfiltered RC16 lookup
-    // `ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_SIG_IS_WIDE + 2*IS_A_ROW - 258`.
+    // `ALPHA_EXP + L2_FLOORED_EXPONENT + SIGMA_SIG_IS_WIDE + IS_A_ROW - 257`.
     // No additional witness column or arithmetic constraint is needed. ====
 }
 
@@ -2092,39 +2064,14 @@ pub(crate) fn eval_scale_constraints<V, S, E, const WIDTH: usize, const PUBLIC_I
 /// (see the module docs). A CTL party of the fp8 batch; the batch driver is the only
 /// supported proving path.
 #[derive(Clone, Debug)]
-pub struct ScaleStark<
-    F,
-    const D: usize,
-    const WIDTH: usize = NUM_SCALE_COLUMNS,
-    const PUBLIC_INPUTS: usize = NUM_SCALE_PUBLIC_INPUTS,
-> {
+pub struct ScaleStark<F, const D: usize> {
     pub program: ScaleProgram,
     _phantom: PhantomData<F>,
 }
 
-/// Compile-time pairing of a Scale trace width with its public-input count, evaluated at
-/// each monomorphization through `let () = ScaleShape::<W, P>::VALID;`. An associated
-/// const rather than an inline `const { .. }` block: cbindgen 0.26 parses this crate with
-/// syn 1.0, which rejects inline const blocks in statement position.
-struct ScaleShape<const WIDTH: usize, const PUBLIC_INPUTS: usize>;
-
-impl<const WIDTH: usize, const PUBLIC_INPUTS: usize> ScaleShape<WIDTH, PUBLIC_INPUTS> {
-    const VALID: () = assert!(
-        (WIDTH == NUM_SCALE_COLUMNS && PUBLIC_INPUTS == NUM_SCALE_PUBLIC_INPUTS)
-            || (WIDTH == NUM_B200_SCALE_COLUMNS && PUBLIC_INPUTS == NUM_B200_SCALE_PUBLIC_INPUTS),
-        "Scale trace width and public-input count must belong to the same device"
-    );
-}
-
-impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize, const PUBLIC_INPUTS: usize>
-    ScaleStark<F, D, WIDTH, PUBLIC_INPUTS>
-{
+impl<F: RichField + Extendable<D>, const D: usize> ScaleStark<F, D> {
     pub fn new(program: ScaleProgram) -> Self {
         assert_eq!(program.r, 32, "noise rank must be exactly 32");
-        let () = ScaleShape::<WIDTH, PUBLIC_INPUTS>::VALID;
-        if WIDTH == NUM_B200_SCALE_COLUMNS {
-            assert_eq!(program.device, Device::B200);
-        }
         Self {
             program,
             _phantom: PhantomData,
@@ -2132,16 +2079,14 @@ impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize, const PUB
     }
 }
 
-impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize, const PUBLIC_INPUTS: usize> Stark<F, D>
-    for ScaleStark<F, D, WIDTH, PUBLIC_INPUTS>
-{
+impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for ScaleStark<F, D> {
     type EvaluationFrame<FE, P, const D2: usize>
-        = StarkFrame<P, P::Scalar, WIDTH, PUBLIC_INPUTS>
+        = StarkFrame<P, P::Scalar, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS>
     where
         FE: FieldExtension<D2, BaseField = F>,
         P: PackedField<Scalar = FE>;
 
-    type EvaluationFrameTarget = StarkFrame<ExtensionTarget<D>, ExtensionTarget<D>, WIDTH, PUBLIC_INPUTS>;
+    type EvaluationFrameTarget = StarkFrame<ExtensionTarget<D>, ExtensionTarget<D>, NUM_SCALE_COLUMNS, NUM_SCALE_PUBLIC_INPUTS>;
 
     fn eval_packed_generic<FE, P, const D2: usize>(
         &self,
@@ -2198,10 +2143,10 @@ mod tests {
 
     #[test]
     fn b200_gaussian_rows_surplus_padding_and_recursive_constraints() {
-        use super::super::columns::B200_SCALE_COL_MAP;
+        use super::super::columns::SCALE_COL_MAP;
         use crate::v4::circuit::luts::{LutChecker, LutTable};
         use crate::v4::circuit::unpredictability::{lambda, noise_coverage_lookup_value, noise_coverage_row_parameters};
-        type B200 = ScaleStark<F, D, NUM_B200_SCALE_COLUMNS, NUM_B200_SCALE_PUBLIC_INPUTS>;
+        type B200 = ScaleStark<F, D>;
         let program = ScaleProgram::new_for_device(1, 2, 8192, 32, Device::B200);
         let mut spike = vec![0i8; program.k];
         spike[0] = 100;
@@ -2222,7 +2167,7 @@ mod tests {
             .map(|(input, row)| {
                 let row: &ScaleColumnsView<F> = row.borrow();
                 let encoding = to_u64(row.alpha_exp) + to_u64(row.l2_floored_exponent) + to_u64(row.sigma_sig_is_wide) + 13;
-                let (_, _, region, base) = noise_coverage_row_parameters(to_u64(row.sigma_norm), encoding);
+                let (_, _, region, base) = noise_coverage_row_parameters(Device::B200, to_u64(row.sigma_norm), encoding);
                 let alpha = (to_u64(row.alpha_exp) * 128 + to_u64(row.alpha_mantissa)) as u16;
                 let l2 = (to_u64(row.l2_floored_exponent) * 128 + to_u64(row.l2_floored_significand) - 128) as u16;
                 input
@@ -2234,14 +2179,18 @@ mod tests {
                     .sum()
             })
             .collect();
-        let rows = program.generate_b200_trace::<F>(&tuples[..1], &tuples[1..], &sums);
-        let public_inputs = program.public_inputs_for_device::<F>();
+        let rows = {
+            let (mut rows, _) = program.generate_trace::<F>(&tuples[..1], &tuples[1..]);
+            program.fill_noise_coverage(&mut rows, &sums);
+            rows
+        };
+        let public_inputs = program.public_inputs::<F>().to_vec();
         let stark = B200::new(program.clone());
-        let m = &B200_SCALE_COL_MAP;
+        let m = &SCALE_COL_MAP;
         let tables = crate::v4::circuit::ctl::lut_tables(Device::B200);
         let lookups = super::super::ctl::scale_lut_lookups::<F>(&program);
         let mut checker = LutChecker::<F>::new(&tables);
-        let valid = |rows: &[[F; NUM_B200_SCALE_COLUMNS]], pis: &[F]| {
+        let valid = |rows: &[[F; NUM_SCALE_COLUMNS]], pis: &[F]| {
             rows.iter().enumerate().all(|(index, row)| {
                 let frame = StarkFrame::from_values(row, &rows[(index + 1) % rows.len()], pis);
                 let mut consumer = ConstraintConsumer::new(
@@ -2315,7 +2264,7 @@ mod tests {
                 .count(),
             1
         );
-        use crate::v4::circuit::input_quant_stark::columns::{B200_INPUT_QUANT_COL_MAP, NUM_B200_INPUT_QUANT_COLUMNS};
+        use crate::v4::circuit::input_quant_stark::columns::INPUT_QUANT_COL_MAP;
         use crate::v4::circuit::input_quant_stark::stark::InputQuantProgram;
         use starky::cross_table_lookup::{CrossTableLookup, debug_utils::check_ctls};
         let input_program = InputQuantProgram {
@@ -2327,7 +2276,7 @@ mod tests {
             device: Device::B200,
         };
         let b_input = [inputs[1].as_slice(), inputs[2].as_slice()].concat();
-        let (input_rows, input_pis) = input_program.generate_trace::<F, NUM_B200_INPUT_QUANT_COLUMNS>(
+        let (input_rows, input_pis) = input_program.generate_trace::<F>(
             &inputs[0],
             &scales,
             &vec![0.0; program.k],
@@ -2342,17 +2291,17 @@ mod tests {
         ];
         let pis = vec![vec![], input_pis.to_vec(), public_inputs];
         let channel = [CrossTableLookup::new(
-            crate::v4::circuit::input_quant_stark::ctl::ctl_group_tuples_looking_input_quant(Device::B200),
+            crate::v4::circuit::input_quant_stark::ctl::ctl_group_tuples_looking_input_quant(),
             vec![super::super::ctl::ctl_looked_scale_group_tuple(&program)],
         )];
         check_ctls(&traces, &pis, &channel, &Default::default());
-        let iq = &B200_INPUT_QUANT_COL_MAP;
+        let iq = &INPUT_QUANT_COL_MAP;
         for (table, row, column) in [
             (2, 0, m.strip_threshold),
             (2, 0, m.noise_coverage_region),
             (2, 0, m.noise_coverage_key_base),
             (2, 0, m.noise_coverage_sum),
-            (2, 0, m.common.group_key),
+            (2, 0, m.group_key),
             (1, program.k - 1, iq.a.noise_coverage_region),
             (1, program.k - 1, iq.b.noise_coverage_region),
             (1, program.k - 1, iq.a.noise_coverage_key_base),
@@ -2445,10 +2394,38 @@ mod tests {
         (a, b)
     }
 
+    fn fill_test_noise_coverage(program: &ScaleProgram, rows: &mut [[F; NUM_SCALE_COLUMNS]]) {
+        use crate::v4::circuit::unpredictability::{minimum_noise_coverage_product, noise_coverage_row_parameters};
+        let minimum = minimum_noise_coverage_product(program.k);
+        let base = 256 + program.device.sigma_encoding_offset();
+        for row in rows[..program.live_rows()].iter_mut() {
+            let v: &mut ScaleColumnsView<F> = row.borrow_mut();
+            let encoding = to_u64(v.alpha_exp)
+                + to_u64(v.l2_floored_exponent)
+                + to_u64(v.sigma_sig_is_wide)
+                + program.device.sigma_encoding_offset();
+            let (threshold, coefficient, region, key_base) = if (base..base + 6).contains(&encoding) {
+                noise_coverage_row_parameters(program.device, to_u64(v.sigma_norm), encoding)
+            } else {
+                // Out-of-domain rows satisfy the surplus arithmetic; the threshold lookup rejects.
+                (0, minimum, 0, 0)
+            };
+            let sum = minimum.div_ceil(coefficient);
+            let surplus = coefficient * sum - minimum;
+            v.strip_threshold = F::from_canonical_u64(threshold);
+            v.noise_coverage_coefficient = F::from_canonical_u64(coefficient);
+            v.noise_coverage_region = F::from_canonical_u64(region);
+            v.noise_coverage_key_base = F::from_canonical_u64(key_base);
+            v.noise_coverage_sum = F::from_canonical_u64(sum);
+            v.noise_coverage_surplus = core::array::from_fn(|limb| F::from_canonical_u64((surplus >> (16 * limb)) & 65535));
+        }
+    }
+
     fn test_trace() -> (ScaleProgram, Vec<[F; NUM_SCALE_COLUMNS]>, [F; NUM_SCALE_PUBLIC_INPUTS]) {
         let program = test_program();
         let (a, b) = test_tuples(&program);
-        let (rows, pis) = program.generate_trace::<F>(&a, &b);
+        let (mut rows, pis) = program.generate_trace::<F>(&a, &b);
+        fill_test_noise_coverage(&program, &mut rows);
         (program, rows, pis)
     }
 
@@ -2550,7 +2527,8 @@ mod tests {
             assert_eq!(program.dr_code(), dr);
             assert_eq!(program.dos_code(), dos);
             let (a, b) = test_tuples(&program);
-            let (rows, pis) = program.generate_trace::<F>(&a, &b);
+            let (mut rows, pis) = program.generate_trace::<F>(&a, &b);
+            fill_test_noise_coverage(&program, &mut rows);
             check_all(&program, &rows, &pis).unwrap();
         }
     }
@@ -2568,7 +2546,8 @@ mod tests {
         assert_eq!(program.num_rows(), 128);
         let (a8, b) = test_tuples(&test_program());
         let a: Vec<ScaleRowTuple> = a8[..3].to_vec();
-        let (rows, pis) = program.generate_trace::<F>(&a, &b);
+        let (mut rows, pis) = program.generate_trace::<F>(&a, &b);
+        fill_test_noise_coverage(&program, &mut rows);
         assert_eq!(rows.len(), 128);
         // The known columns are bit-exact with the trace fill (the batch verifier's check).
         let known = program.known_values::<F>();
@@ -3132,6 +3111,7 @@ mod tests {
             program.device,
         );
         let (mut rows, pis) = program.generate_trace::<F>(&[ones], &[ones]);
+        fill_test_noise_coverage(&program, &mut rows);
         check_all(&program, &rows, &pis).unwrap();
         let honest: &ScaleColumnsView<F> = rows[0].borrow();
         let honest_grid_quotient = honest.grid_snap_quotient;
@@ -3139,6 +3119,7 @@ mod tests {
         // sqrt(1) = 1, but claim its successor 129/128. Both codes snap to 1,
         // so the remaining scale chain cannot detect this incorrect square-root claim.
         rebuild_with_claim(&program, &mut rows, 0, &ones, SqrtClaim::from_tf(129, 127));
+        fill_test_noise_coverage(&program, &mut rows);
         let forged: &ScaleColumnsView<F> = rows[0].borrow();
         assert_eq!(forged.grid_snap_quotient, honest_grid_quotient);
         check_constraints(&program, &rows, &pis).expect("the lower subtraction must reject through its lookup");
@@ -3161,6 +3142,7 @@ mod tests {
             dead_count: 0,
         };
         let (mut rows, pis) = program.generate_trace::<F>(&[tuple], &[tuple]);
+        fill_test_noise_coverage(&program, &mut rows);
         check_all(&program, &rows, &pis).unwrap();
         rebuild_with_claim(&program, &mut rows, 0, &tuple, SqrtClaim::from_tf(240, 140));
         let forged: &ScaleColumnsView<F> = rows[0].borrow();
@@ -3533,7 +3515,8 @@ mod tests {
         let program = ScaleProgram::new_for_device(4, 4, 1 << 12, 32, Device::B200);
         let (mut a, b) = test_tuples(&program);
         a[2] = find_boundary_spike(&program, true);
-        let (rows, pis) = program.generate_trace::<F>(&a, &b);
+        let (mut rows, pis) = program.generate_trace::<F>(&a, &b);
+        fill_test_noise_coverage(&program, &mut rows);
         (program, rows, pis)
     }
 
@@ -3578,6 +3561,7 @@ mod tests {
             v.running_dead_a = F::from_canonical_u64(u64::from(spike.dead_count));
             v.running_dead_b = F::from_canonical_u64(if i == 1 { u64::from(ones.dead_count) } else { 0 });
         }
+        fill_test_noise_coverage(&program, &mut rows);
         let pis = program.public_inputs();
         (program, rows, pis)
     }
@@ -3629,7 +3613,7 @@ mod tests {
                     let e_sum = alpha_exp + l2f_e_star;
                     let sig = alpha_m * l2f_m;
                     let wide = i64::from(sig >= 1 << 15);
-                    let gate = e_sum + wide + 2 * i64::from(is_a) - 254 - 4 >= 0;
+                    let gate = e_sum + wide + i64::from(is_a) - 254 - 3 >= 0;
                     let sigma = device.delta() * value(alpha_m, alpha_exp) * value(l2f_m, l2f_e_star);
                     assert_eq!(
                         gate,

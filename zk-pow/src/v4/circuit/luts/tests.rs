@@ -55,16 +55,22 @@ fn to_u64(x: F) -> u64 {
 
 #[test]
 fn shapes_match_the_documented_layout_and_the_consumer_arities() {
-    for table in b200_tables() {
+    for table in all_tables() {
         let columns = generate::<F>(table, 0);
         // Stored-column count = the consumers' value arity (BYTES2/PAIR128 store their key
         // tuple; RANGE16 is its ramp).
         let arity = match table {
             LutTable::Range16 => 0,
-            LutTable::Bytes2 | LutTable::Pair128 | LutTable::Width32 | LutTable::Width16 | LutTable::Fp32Tools => 2,
+            LutTable::Bytes2
+            | LutTable::Pair128
+            | LutTable::Width32
+            | LutTable::Width16
+            | LutTable::Fp32Tools
+            | LutTable::WidthNorm
+            | LutTable::Pow2G => 2,
             LutTable::Xor8 => 3,
-            LutTable::DownscaleThreshold | LutTable::Int8Dec | LutTable::RneRnd => 4,
-            LutTable::B200Align => 5,
+            LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 | LutTable::Int8Dec | LutTable::RneRnd => 4,
+            LutTable::ProdAlign15 | LutTable::B200Align => 5,
             _ => 1,
         };
         assert_eq!(columns.len(), arity, "{table:?} arity");
@@ -115,7 +121,7 @@ fn committed_heights_match_the_device_inventory() {
     assert_eq!(trace_padded_height(lut_live_rows(LutTable::Pow2D)), 1 << 7);
 
     // Widths: precommitted (keys + stored values) plus one multiplicity column per slot.
-    let widths: BTreeMap<LutTable, (usize, usize)> = b200_tables()
+    let widths: BTreeMap<LutTable, (usize, usize)> = all_tables()
         .iter()
         .map(|&t| (t, (num_precommitted_columns(t), lut_num_columns(t))))
         .collect();
@@ -130,6 +136,7 @@ fn committed_heights_match_the_device_inventory() {
     assert_eq!(widths[&LutTable::Width16], (3, 4));
     assert_eq!(widths[&LutTable::Log16], (3, 4));
     assert_eq!(widths[&LutTable::DownscaleThreshold], (7, 13));
+    assert_eq!(widths[&LutTable::DownscaleThresholdH100], (4, 10));
     for t in [LutTable::Qcast, LutTable::Div448, LutTable::Pair128, LutTable::Clamp22] {
         assert_eq!(widths[&t].1, 3, "{t:?}");
     }
@@ -649,7 +656,7 @@ fn lut_ctls_assemble_from_inventories() {
             LutTable::Range16 | LutTable::Bytes2 | LutTable::Pair128 => 0,
             LutTable::Width32 | LutTable::Width16 | LutTable::Fp32Tools => 2,
             LutTable::Xor8 => 3,
-            LutTable::DownscaleThreshold | LutTable::Int8Dec | LutTable::RneRnd => 4,
+            LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 | LutTable::Int8Dec | LutTable::RneRnd => 4,
             LutTable::B200Align => 5,
             _ => 1,
         })

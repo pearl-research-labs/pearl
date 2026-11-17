@@ -13,8 +13,7 @@
 //! signal     = c*q                                  // exact binary32 product
 //! mixed      = RN32(beta*n + signal)                // one fused rounding
 //! code_noised = Q8(mixed)                           // saturating RNE E4M3 cast
-//! output     = code_noised                          // H100
-//!              rewrite(code_noised, row data, coin) // B200
+//! output     = rewrite(code_noised, row data, coin) // the downscale strip rewrite
 //! ```
 //!
 //! `RN_bf16` and `RN32` mean round-to-nearest, ties-to-even into the named finite format.
@@ -129,13 +128,13 @@
 //! than `65/64` score units; [`crate::v4::circuit::unpredictability`] derives this bound
 //! and the Matmul skip predicate. Phantom elements use the all-zero score sentinel.
 //!
-//! # B200 quantize-first downscaling and Gaussian row gate (check 4)
+//! # Quantize-first downscaling and Gaussian row gate (check 4)
 //!
-//! Put `s = alpha*l2f` (signal RMS), so `sigma = s/2` on B200. Scale binds the normalized
+//! Put `s = alpha*l2f` (signal RMS), so `sigma = delta(device)*s`. Scale binds the normalized
 //! pair `(SIGMA_NORM, SIGMA_ENC)` and the strip byte
-//! `t = Q8(RN32(g*s))`, where `g` is binary32 0.1 for `s < 8` and 0.08 otherwise.
-//! It also restricts `s` to `[4, 256)`. Consequently
-//! `e = SIGMA_ENC-269 = floor(log2(s))-2` is an E4M3 exponent field in `0..=5`.
+//! `t = Q8(RN32(g*s))`, where `g` is the device's strip factor (the small-RMS factor below
+//! `s = 8`). It also restricts `s` to `[4, 256)`. Consequently
+//! `e = SIGMA_ENC-256-offset(device) = floor(log2(s))-2` is an E4M3 exponent field in `0..=5`.
 //!
 //! Each four-element block shares a deterministic coin: extract bits 8..14 from the
 //! first element's rounded binary32 `mixed` word and test whether that 7-bit integer is
@@ -182,7 +181,7 @@
 //! index is the row counter, the parity, block-start and group-final flags follow cyclic
 //! counters whose inverse witnesses force each flag exactly at its boundary, the block index
 //! increments at block starts, and each side's liveness starts at one and is forced to zero
-//! exactly at its public bound `h*k` resp. `w*k`. B200 ties the coin-start flag to the block
+//! exactly at its public bound `h*k` resp. `w*k`. The coin-start flag is tied to the block
 //! counter the same way (G13).
 //!
 //! [`super::ctl`] declares the complementary range, decode, rounding, and CTL relations.
@@ -207,10 +206,10 @@ use starky::evaluation_frame::{StarkEvaluationFrame, StarkFrame};
 use starky::stark::Stark;
 
 use super::columns::{
-    B_KEY_OFFSET_PUBLIC_INPUT, B_LIVE_BOUND_PUBLIC_INPUT, B200InputQuantColumnsView, Bf16FieldsView, BlockL2Columns,
+    B_KEY_OFFSET_PUBLIC_INPUT, B_LIVE_BOUND_PUBLIC_INPUT, Bf16FieldsView, BlockL2Columns, INPUT_QUANT_COL_MAP,
     InputQuantColumnsView, InputQuantKnownColumns, InputQuantScheduleColumns, InputQuantSideColumns, K_PUBLIC_INPUT,
-    MulDecodeBlockView, NUM_B200_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_KNOWN_COLUMNS,
-    NUM_INPUT_QUANT_PUBLIC_INPUTS, WL2_POW_PUBLIC_INPUT, input_quant_column_map,
+    MulDecodeBlockView, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_KNOWN_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS,
+    WL2_POW_PUBLIC_INPUT,
 };
 use crate::v4::api::compute::{bf16_clamp_sym, bf16_max, bf16_mul, fp32_fma};
 use crate::v4::api::dtype::{bf16_to_f32, f32_to_fp8_e4m3};
@@ -369,7 +368,7 @@ impl InputQuantProgram {
                     )
                 };
                 let witness = SideWitness::build(self, int8, scales, noise, true);
-                let codes: Vec<u8> = (0..k).map(|j| witness.output_code(self.device, j, true)).collect();
+                let codes: Vec<u8> = (0..k).map(|j| witness.output_code(j, true)).collect();
                 let lambdas: Vec<u64> = witness.elements.iter().map(|e| e.score.lambda).collect();
                 // The group-final row's block-L2 state is the side's Scale tuple.
                 let last = &witness.elements[k - 1];
@@ -384,10 +383,11 @@ impl InputQuantProgram {
                     .iter()
                     .map(|&scale| [witness.scales.alpha_code, scale & 0x7FFF])
                     .collect();
-                // B200: the side's LOG16 region and key base, and each element's capped Gaussian
+                // The side's LOG16 region and key base, and each element's capped Gaussian
                 // value with the running sum Scale's row gate consumes.
-                let noise_coverage = (self.device == Device::B200).then(|| {
-                    let (_, _, region, base) = noise_coverage_row_parameters(witness.scales.sigma_norm, witness.scales.sigma_enc);
+                let noise_coverage = Some({
+                    let (_, _, region, base) =
+                        noise_coverage_row_parameters(self.device, witness.scales.sigma_norm, witness.scales.sigma_enc);
                     let mut sum = 0u64;
                     let terms = witness
                         .elements
@@ -463,16 +463,16 @@ impl InputQuantProgram {
     }
 
     /// One trace row from the native witnesses: the verifier-known noise words, group G's
-    /// decode and schedule columns, then both sides' columns (plus the B200 coin and
+    /// decode and schedule columns, then both sides' columns (with the coin and
     /// downscale/Gaussian columns). Shared by the row-major generator and the direct column
     /// fill, so the two are value-identical.
     #[allow(clippy::field_reassign_with_default)]
-    fn fill_row<F: RichField, const WIDTH: usize>(
+    fn fill_row<F: RichField>(
         &self,
         native: &InputQuantNative,
         tables: &ScheduleTables<F>,
         r: usize,
-    ) -> [F; WIDTH] {
+    ) -> [F; NUM_INPUT_QUANT_COLUMNS] {
         let (h, w, k, num_rows) = (self.h, self.w, self.k, self.num_rows());
         let (g, j) = (r / k, r % k);
         let len = k.min(num_rows - g * k);
@@ -504,47 +504,32 @@ impl InputQuantProgram {
             a_flip_inv: inverse_or_zero::<F>(r, h * k),
             b_flip_inv: inverse_or_zero::<F>(r, w * k),
         };
-        match (self.device, WIDTH) {
-            (Device::H100, NUM_INPUT_QUANT_COLUMNS) => {
-                let mut row = InputQuantColumnsView::<F>::default();
-                row.known = known;
-                row.schedule = schedule;
-                side_a.witness.fill(&mut row.a, j);
-                side_b.witness.fill(&mut row.b, j);
-                let row: [F; NUM_INPUT_QUANT_COLUMNS] = row.into();
-                row.as_slice().try_into().unwrap()
+        let mut row = InputQuantColumnsView::<F>::default();
+        row.known = known;
+        row.schedule = schedule;
+        row.is_coin_start = F::from_bool(block_position.is_multiple_of(4));
+        row.coin_inv = tables.coin_inv[block_position];
+        side_a.witness.fill(&mut row.a, j);
+        side_b.witness.fill(&mut row.b, j);
+        side_a.witness.fill_downscale(&mut row.a.downscale, j, a_live);
+        side_b.witness.fill_downscale(&mut row.b.downscale, j, b_live);
+        // Each live side's LOG16 region and key base, its element's capped Gaussian
+        // value and the running sum (phantom sides keep the zero columns).
+        for (output, side) in [(&mut row.a, side_a), (&mut row.b, side_b)] {
+            if let Some((region, base, terms)) = &side.noise_coverage {
+                let (value, sum) = terms[j];
+                output.noise_coverage_region = F::from_canonical_u64(*region);
+                output.noise_coverage_key_base = F::from_canonical_u64(*base);
+                output.gaussian_value = F::from_canonical_u64(value);
+                output.noise_coverage_sum = F::from_canonical_u64(sum);
             }
-            (Device::B200, NUM_B200_INPUT_QUANT_COLUMNS) => {
-                let mut row = B200InputQuantColumnsView::<F>::default();
-                row.known = known;
-                row.schedule = schedule;
-                row.is_coin_start = F::from_bool(block_position.is_multiple_of(4));
-                row.coin_inv = tables.coin_inv[block_position];
-                side_a.witness.fill(&mut row.a.common, j);
-                side_b.witness.fill(&mut row.b.common, j);
-                side_a.witness.fill_downscale(&mut row.a.downscale, j, a_live);
-                side_b.witness.fill_downscale(&mut row.b.downscale, j, b_live);
-                // Each live side's LOG16 region and key base, its element's capped Gaussian
-                // value and the running sum (phantom sides keep the zero columns).
-                for (output, side) in [(&mut row.a, side_a), (&mut row.b, side_b)] {
-                    if let Some((region, base, terms)) = &side.noise_coverage {
-                        let (value, sum) = terms[j];
-                        output.noise_coverage_region = F::from_canonical_u64(*region);
-                        output.noise_coverage_key_base = F::from_canonical_u64(*base);
-                        output.gaussian_value = F::from_canonical_u64(value);
-                        output.noise_coverage_sum = F::from_canonical_u64(sum);
-                    }
-                }
-                let row: [F; NUM_B200_INPUT_QUANT_COLUMNS] = row.into();
-                row.as_slice().try_into().unwrap()
-            }
-            _ => panic!("input width differs from committed device"),
         }
+        row.into()
     }
 
     /// The row-major trace (padding rows included) from the native witnesses, one parallel
     /// row at a time, without the row-0 blinding.
-    pub(crate) fn rows_from_native<F: RichField, const WIDTH: usize>(&self, native: &InputQuantNative) -> Vec<[F; WIDTH]> {
+    pub(crate) fn rows_from_native<F: RichField>(&self, native: &InputQuantNative) -> Vec<[F; NUM_INPUT_QUANT_COLUMNS]> {
         use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
 
         let num_rows = self.num_rows();
@@ -563,7 +548,7 @@ impl InputQuantProgram {
     /// Generates the trace from the opened strips and the public binary32 noise: the native
     /// build, the parallel row fill, then the row-0 blinding.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_trace<F: RichField, const WIDTH: usize>(
+    pub fn generate_trace<F: RichField>(
         &self,
         a_int8: &[i8],
         a_scales: &[u16],
@@ -571,17 +556,17 @@ impl InputQuantProgram {
         b_int8: &[i8],
         b_scales: &[u16],
         b_noise: &[f32],
-    ) -> (Vec<[F; WIDTH]>, [F; NUM_INPUT_QUANT_PUBLIC_INPUTS]) {
+    ) -> (Vec<[F; NUM_INPUT_QUANT_COLUMNS]>, [F; NUM_INPUT_QUANT_PUBLIC_INPUTS]) {
         let native = self.build_native(a_int8, a_scales, a_noise, b_int8, b_scales, b_noise);
-        let mut rows = self.rows_from_native::<F, WIDTH>(&native);
-        blind_trace(&mut rows, self.device);
+        let mut rows = self.rows_from_native::<F>(&native);
+        blind_trace(&mut rows);
         (rows, self.public_inputs())
     }
 
     /// The direct column fill: the trace written column-major straight into the caller's
     /// zeroed column buffers (tile workers own disjoint rows), then the same row-0 blinding
     /// as [`Self::generate_trace`].
-    pub(crate) fn fill_columns<F: RichField, const WIDTH: usize>(&self, native: &InputQuantNative, cols: &mut [&mut [F]]) {
+    pub(crate) fn fill_columns<F: RichField>(&self, native: &InputQuantNative, cols: &mut [&mut [F]]) {
         use plonky2_maybe_rayon::{MaybeIntoParIter, ParallelIterator};
 
         let num_rows = self.num_rows();
@@ -590,26 +575,26 @@ impl InputQuantProgram {
             num_rows.div_ceil(self.k),
             "native groups must cover the trace"
         );
-        assert_eq!(cols.len(), WIDTH, "direct fill destination width");
+        assert_eq!(cols.len(), NUM_INPUT_QUANT_COLUMNS, "direct fill destination width");
         for col in cols.iter() {
             assert_eq!(col.len(), num_rows, "direct fill column length");
         }
         const TILE: usize = 1024;
         let tables = self.schedule_tables::<F>();
         // Tile workers share raw destination pointers and write disjoint rows.
-        let writer = super::super::utils::witness::DisjointColumnWriter::<F, WIDTH>::new(cols);
+        let writer = super::super::utils::witness::DisjointColumnWriter::<F, NUM_INPUT_QUANT_COLUMNS>::new(cols);
         (0..num_rows.div_ceil(TILE)).into_par_iter().for_each(|tile| {
             let r0 = tile * TILE;
             let r1 = (r0 + TILE).min(num_rows);
             for r in r0..r1 {
-                let row: [F; WIDTH] = self.fill_row(native, &tables, r);
+                let row: [F; NUM_INPUT_QUANT_COLUMNS] = self.fill_row(native, &tables, r);
                 // SAFETY: tiles partition 0..num_rows. Only this worker writes row r; the
                 // destination columns are inaccessible until the join.
                 unsafe { writer.write_row(r, &row) };
             }
         });
         // Blinding: the same cells, with the same semantics, as `blind_trace`.
-        for side in input_quant_column_map(self.device).sides {
+        for side in [INPUT_QUANT_COL_MAP.a, INPUT_QUANT_COL_MAP.b] {
             cols[side.block_l2.shift_remainder_power][0] = F::rand();
             cols[side.block_l2.shift_complement_power][0] = F::rand();
         }
@@ -687,8 +672,8 @@ struct ScheduleTables<F> {
 /// contributes no block-L2 term. The shift-power lookups are filtered off there, and every AIR
 /// expression that could read these values is multiplied by a zero selector. Randomizing them
 /// therefore changes the commitment but not the proved computation.
-fn blind_trace<F: RichField, const WIDTH: usize>(rows: &mut [[F; WIDTH]], device: Device) {
-    for side in input_quant_column_map(device).sides {
+fn blind_trace<F: RichField>(rows: &mut [[F; NUM_INPUT_QUANT_COLUMNS]]) {
+    for side in [INPUT_QUANT_COL_MAP.a, INPUT_QUANT_COL_MAP.b] {
         rows[0][side.block_l2.shift_remainder_power] = F::rand();
         rows[0][side.block_l2.shift_complement_power] = F::rand();
     }
@@ -1181,20 +1166,18 @@ impl SideWitness {
         } else {
             (0, 0)
         };
-        let (strip_threshold, downscale_exponent) = if live && program.device == Device::B200 {
+        let (strip_threshold, downscale_exponent) = if live {
+            let base = 256 + program.device.sigma_encoding_offset();
             let scaled_rms = bf16_to_f32(alpha_code) * bf16_to_f32(bf16_max(l2_code, NORM_FLOOR_CODE));
             assert!(
-                scaled_rms >= 4.0 && (269..=274).contains(&sigma_enc),
+                scaled_rms >= 4.0 && (base..base + 6).contains(&sigma_enc),
                 "downscale RMS out of domain"
             );
-            let factor = if scaled_rms < 8.0 {
-                crate::v4::api::utils::DOWNSCALE_G_SMALL_RMS
-            } else {
-                crate::v4::api::utils::DOWNSCALE_G
-            };
+            let (g, g_small) = program.device.downscale_g();
+            let factor = if scaled_rms < 8.0 { g_small } else { g };
             (
                 f32_to_fp8_e4m3(factor * scaled_rms).expect("finite strip threshold") & 127,
-                (sigma_enc - 269) as u8,
+                (sigma_enc - base) as u8,
             )
         } else {
             (0, 0)
@@ -1369,7 +1352,7 @@ impl SideWitness {
         row.lambda = F::from_canonical_u64(e.score.lambda);
     }
 
-    /// The B200 downscale decision at `index`: the four-element block's coin and the code
+    /// The downscale decision at `index`: the four-element block's coin and the code
     /// Matmul consumes (the strip rewrite when the coin and threshold select it).
     fn downscale_decision(&self, index: usize, live: bool) -> (bool, u8) {
         let start_word = self.elements[index / 4 * 4].mixed_word;
@@ -1384,13 +1367,9 @@ impl SideWitness {
         (coin, output)
     }
 
-    /// The operand code Matmul consumes at `index`: the downscale rewrite's output on B200,
-    /// the noised code on every other device.
-    fn output_code(&self, device: Device, index: usize, live: bool) -> u8 {
-        match device {
-            Device::B200 => self.downscale_decision(index, live).1,
-            Device::H100 => self.elements[index].code_noised,
-        }
+    /// The operand code Matmul consumes at `index`: the downscale rewrite's output.
+    fn output_code(&self, index: usize, live: bool) -> u8 {
+        self.downscale_decision(index, live).1
     }
 
     fn fill_downscale<F: RichField>(&self, output: &mut DownscaleColumns<F>, index: usize, live: bool) {
@@ -2197,8 +2176,8 @@ fn evaluate_downscale<V: Copy, S: Copy, E: Evaluator<V, S>>(
     evaluator.constraint_eq_if(not_final, current.strip_threshold, next.strip_threshold);
 }
 
-pub(crate) fn eval_input_quant_constraints<V, S, E, const WIDTH: usize>(
-    frame: &StarkFrame<V, S, WIDTH, NUM_INPUT_QUANT_PUBLIC_INPUTS>,
+pub(crate) fn eval_input_quant_constraints<V, S, E>(
+    frame: &StarkFrame<V, S, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS>,
     evaluator: &mut E,
 ) where
     V: Copy + Default,
@@ -2212,72 +2191,52 @@ pub(crate) fn eval_input_quant_constraints<V, S, E, const WIDTH: usize>(
         a_bound: evaluator.scalar(public_inputs[B_KEY_OFFSET_PUBLIC_INPUT]),
         b_bound: evaluator.scalar(public_inputs[B_LIVE_BOUND_PUBLIC_INPUT]),
     };
-    match WIDTH {
-        NUM_INPUT_QUANT_COLUMNS => {
-            let current: &[V; NUM_INPUT_QUANT_COLUMNS] = frame.get_local_values().try_into().unwrap();
-            let next: &[V; NUM_INPUT_QUANT_COLUMNS] = frame.get_next_values().try_into().unwrap();
-            let current: &InputQuantColumnsView<V> = current.borrow();
-            let next: &InputQuantColumnsView<V> = next.borrow();
-            evaluate_schedule(evaluator, &current.known, &current.schedule, &next.schedule, geometry);
-            evaluate_sides(
-                evaluator,
-                &current.schedule,
-                &next.schedule,
-                [&current.a, &current.b],
-                [&next.a, &next.b],
-                precision,
-            );
+    let current: &[V; NUM_INPUT_QUANT_COLUMNS] = frame.get_local_values().try_into().unwrap();
+    let next: &[V; NUM_INPUT_QUANT_COLUMNS] = frame.get_next_values().try_into().unwrap();
+    let current: &InputQuantColumnsView<V> = current.borrow();
+    let next: &InputQuantColumnsView<V> = next.borrow();
+    evaluate_schedule(evaluator, &current.known, &current.schedule, &next.schedule, geometry);
+    evaluate_coin_start(evaluator, &current.schedule, current.is_coin_start, current.coin_inv);
+    evaluate_sides(
+        evaluator,
+        &current.schedule,
+        &next.schedule,
+        [&current.a, &current.b],
+        [&next.a, &next.b],
+        precision,
+    );
+    for ((side, following), live) in [(&current.a, &next.a), (&current.b, &next.b)]
+        .into_iter()
+        .zip([current.schedule.a_live, current.schedule.b_live])
+    {
+        let one = evaluator.i32(1);
+        let zero = evaluator.i32(0);
+        let phantom = evaluator.sub(one, live);
+        for value in [
+            side.downscale.strip_threshold,
+            side.noise_coverage_region,
+            side.noise_coverage_key_base,
+            side.gaussian_value,
+            side.noise_coverage_sum,
+        ] {
+            evaluator.constraint_eq_if(phantom, value, zero);
         }
-        NUM_B200_INPUT_QUANT_COLUMNS => {
-            let current: &[V; NUM_B200_INPUT_QUANT_COLUMNS] = frame.get_local_values().try_into().unwrap();
-            let next: &[V; NUM_B200_INPUT_QUANT_COLUMNS] = frame.get_next_values().try_into().unwrap();
-            let current: &B200InputQuantColumnsView<V> = current.borrow();
-            let next: &B200InputQuantColumnsView<V> = next.borrow();
-            evaluate_schedule(evaluator, &current.known, &current.schedule, &next.schedule, geometry);
-            evaluate_coin_start(evaluator, &current.schedule, current.is_coin_start, current.coin_inv);
-            evaluate_sides(
-                evaluator,
-                &current.schedule,
-                &next.schedule,
-                [&current.a.common, &current.b.common],
-                [&next.a.common, &next.b.common],
-                precision,
-            );
-            for ((side, following), live) in [(&current.a, &next.a), (&current.b, &next.b)]
-                .into_iter()
-                .zip([current.schedule.a_live, current.schedule.b_live])
-            {
-                let one = evaluator.i32(1);
-                let zero = evaluator.i32(0);
-                let phantom = evaluator.sub(one, live);
-                for value in [
-                    side.downscale.strip_threshold,
-                    side.noise_coverage_region,
-                    side.noise_coverage_key_base,
-                    side.gaussian_value,
-                    side.noise_coverage_sum,
-                ] {
-                    evaluator.constraint_eq_if(phantom, value, zero);
-                }
-                let not_final = evaluator.sub(one, current.schedule.is_group_final);
-                evaluator.constraint_eq_if(not_final, side.noise_coverage_region, following.noise_coverage_region);
-                evaluator.constraint_eq_if(not_final, side.noise_coverage_key_base, following.noise_coverage_key_base);
-                let initial = evaluator.sub(side.noise_coverage_sum, side.gaussian_value);
-                evaluator.constraint_first_row(initial);
-                let carried = evaluator.mul(not_final, side.noise_coverage_sum);
-                let next_sum = evaluator.add(carried, following.gaussian_value);
-                evaluator.constraint_eq(following.noise_coverage_sum, next_sum);
-                evaluate_downscale(
-                    evaluator,
-                    &side.downscale,
-                    &following.downscale,
-                    current.is_coin_start,
-                    next.is_coin_start,
-                    current.schedule.is_group_final,
-                );
-            }
-        }
-        _ => panic!("unsupported input width"),
+        let not_final = evaluator.sub(one, current.schedule.is_group_final);
+        evaluator.constraint_eq_if(not_final, side.noise_coverage_region, following.noise_coverage_region);
+        evaluator.constraint_eq_if(not_final, side.noise_coverage_key_base, following.noise_coverage_key_base);
+        let initial = evaluator.sub(side.noise_coverage_sum, side.gaussian_value);
+        evaluator.constraint_first_row(initial);
+        let carried = evaluator.mul(not_final, side.noise_coverage_sum);
+        let next_sum = evaluator.add(carried, following.gaussian_value);
+        evaluator.constraint_eq(following.noise_coverage_sum, next_sum);
+        evaluate_downscale(
+            evaluator,
+            &side.downscale,
+            &following.downscale,
+            current.is_coin_start,
+            next.is_coin_start,
+            current.schedule.is_group_final,
+        );
     }
 }
 
@@ -2290,21 +2249,14 @@ pub(crate) fn eval_input_quant_constraints<V, S, E, const WIDTH: usize>(
 /// only supported proving path. There are no in-trace lookups (`lookups()` stays empty): every
 /// lookup instance targets the committed LUT oracle.
 #[derive(Clone, Debug)]
-pub struct InputQuantStark<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize = NUM_INPUT_QUANT_COLUMNS> {
+pub struct InputQuantStark<F: RichField + Extendable<D>, const D: usize> {
     pub program: InputQuantProgram,
     _phantom: PhantomData<F>,
 }
 
-impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize> InputQuantStark<F, D, WIDTH> {
+impl<F: RichField + Extendable<D>, const D: usize> InputQuantStark<F, D> {
     pub fn new(program: InputQuantProgram) -> Self {
         assert_eq!(program.r, 32, "noise rank must be exactly 32");
-        assert!(
-            matches!(
-                (program.device, WIDTH),
-                (Device::H100, NUM_INPUT_QUANT_COLUMNS) | (Device::B200, NUM_B200_INPUT_QUANT_COLUMNS)
-            ),
-            "input AIR width differs from device"
-        );
         Self {
             program,
             _phantom: PhantomData,
@@ -2312,14 +2264,15 @@ impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize> InputQuan
     }
 }
 
-impl<F: RichField + Extendable<D>, const D: usize, const WIDTH: usize> Stark<F, D> for InputQuantStark<F, D, WIDTH> {
+impl<F: RichField + Extendable<D>, const D: usize> Stark<F, D> for InputQuantStark<F, D> {
     type EvaluationFrame<FE, P, const D2: usize>
-        = StarkFrame<P, P::Scalar, WIDTH, NUM_INPUT_QUANT_PUBLIC_INPUTS>
+        = StarkFrame<P, P::Scalar, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS>
     where
         FE: FieldExtension<D2, BaseField = F>,
         P: PackedField<Scalar = FE>;
 
-    type EvaluationFrameTarget = StarkFrame<ExtensionTarget<D>, ExtensionTarget<D>, WIDTH, NUM_INPUT_QUANT_PUBLIC_INPUTS>;
+    type EvaluationFrameTarget =
+        StarkFrame<ExtensionTarget<D>, ExtensionTarget<D>, NUM_INPUT_QUANT_COLUMNS, NUM_INPUT_QUANT_PUBLIC_INPUTS>;
 
     fn eval_packed_generic<FE, P, const D2: usize>(
         &self,
@@ -2472,7 +2425,7 @@ mod tests {
     ) {
         let program = test_program();
         let inp = test_inputs(&program);
-        let (rows, pis) = program.generate_trace::<F, NUM_INPUT_QUANT_COLUMNS>(
+        let (rows, pis) = program.generate_trace::<F>(
             &inp.a_int8,
             &inp.a_scales,
             &inp.a_noise,
@@ -2493,9 +2446,9 @@ mod tests {
     /// `z_last` is zero on the last pair, matching starky's semantics. This AIR has no
     /// transition-only constraints, so every ordinary constraint—including each cyclic
     /// accumulator's last-row-to-first-row boundary—is evaluated on the wrap pair.
-    fn constraints_vanish<const WIDTH: usize>(
-        stark: &InputQuantStark<F, D, WIDTH>,
-        rows: &[[F; WIDTH]],
+    fn constraints_vanish(
+        stark: &InputQuantStark<F, D>,
+        rows: &[[F; NUM_INPUT_QUANT_COLUMNS]],
         pis: &[F; NUM_INPUT_QUANT_PUBLIC_INPUTS],
     ) -> bool {
         let n = rows.len();
@@ -2520,9 +2473,9 @@ mod tests {
     /// blinding cells (fresh randomness on both sides of the comparison).
     #[test]
     fn native_build_and_column_fill_match_generate_trace() {
-        fn check<const WIDTH: usize>(program: &InputQuantProgram) {
+        fn check(program: &InputQuantProgram) {
             let inp = test_inputs(program);
-            let (rows, _) = program.generate_trace::<F, WIDTH>(
+            let (rows, _) = program.generate_trace::<F>(
                 &inp.a_int8,
                 &inp.a_scales,
                 &inp.a_noise,
@@ -2539,30 +2492,31 @@ mod tests {
                 &inp.b_noise,
             );
             let (h, w, k) = (program.h, program.w, program.k);
-            let map = input_quant_column_map(program.device);
+            let map = &INPUT_QUANT_COL_MAP;
+            let sides = [&map.a, &map.b];
             let read = |column: usize, row: usize| to_u64(rows[row][column]);
-            let code_column = |side: usize| {
-                map.downscale
-                    .map_or(map.sides[side].code_noised, |(_, sides)| sides[side].output_code)
-            };
             assert_eq!(
                 native.a_codes,
-                (0..h * k).map(|r| read(code_column(0), r) as u8).collect::<Vec<_>>()
+                (0..h * k)
+                    .map(|r| read(map.a.downscale.output_code, r) as u8)
+                    .collect::<Vec<_>>()
             );
             assert_eq!(
                 native.b_codes,
-                (0..w * k).map(|r| read(code_column(1), r) as u8).collect::<Vec<_>>()
+                (0..w * k)
+                    .map(|r| read(map.b.downscale.output_code, r) as u8)
+                    .collect::<Vec<_>>()
             );
             assert_eq!(
                 native.a_lambdas,
-                (0..h * k).map(|r| read(map.sides[0].lambda, r)).collect::<Vec<_>>()
+                (0..h * k).map(|r| read(map.a.lambda, r)).collect::<Vec<_>>()
             );
             assert_eq!(
                 native.b_lambdas,
-                (0..w * k).map(|r| read(map.sides[1].lambda, r)).collect::<Vec<_>>()
+                (0..w * k).map(|r| read(map.b.lambda, r)).collect::<Vec<_>>()
             );
             for (side, count, tuples) in [(0, h, &native.a_tuples), (1, w, &native.b_tuples)] {
-                let columns = &map.sides[side];
+                let columns = sides[side];
                 assert_eq!(tuples.len(), count);
                 for (g, tuple) in tuples.iter().enumerate() {
                     let row = g * k + k - 1;
@@ -2577,7 +2531,7 @@ mod tests {
             }
             let mut blocks = Vec::new();
             for (side, count) in [(0, h), (1, w)] {
-                let columns = &map.sides[side];
+                let columns = sides[side];
                 for row in (0..count * k).step_by(BLOCK_SIZE) {
                     blocks.push([
                         (128 * read(columns.alpha_exp, row) + read(columns.alpha_mantissa, row)) as u16,
@@ -2586,24 +2540,18 @@ mod tests {
                 }
             }
             assert_eq!(native.coefficient_blocks, blocks);
-            if program.device == Device::B200 {
-                let b200 = &super::super::columns::B200_INPUT_QUANT_COL_MAP;
-                let sums: Vec<u64> = [(&b200.a, h), (&b200.b, w)]
-                    .into_iter()
-                    .flat_map(|(side, count)| (0..count).map(move |g| read(side.noise_coverage_sum, g * k + k - 1)))
-                    .collect();
-                assert_eq!(native.noise_coverage_sums, sums);
-            } else {
-                assert!(native.noise_coverage_sums.is_empty());
-            }
+            let sums: Vec<u64> = [(&map.a, h), (&map.b, w)]
+                .into_iter()
+                .flat_map(|(side, count)| (0..count).map(move |g| read(side.noise_coverage_sum, g * k + k - 1)))
+                .collect();
+            assert_eq!(native.noise_coverage_sums, sums);
             let num_rows = program.num_rows();
-            let mut cols: Vec<Vec<F>> = (0..WIDTH).map(|_| vec![F::ZERO; num_rows]).collect();
+            let mut cols: Vec<Vec<F>> = (0..NUM_INPUT_QUANT_COLUMNS).map(|_| vec![F::ZERO; num_rows]).collect();
             {
                 let mut slices: Vec<&mut [F]> = cols.iter_mut().map(|c| c.as_mut_slice()).collect();
-                program.fill_columns::<F, WIDTH>(&native, &mut slices);
+                program.fill_columns::<F>(&native, &mut slices);
             }
-            let blinded: Vec<usize> = map
-                .sides
+            let blinded: Vec<usize> = sides
                 .iter()
                 .flat_map(|side| [side.block_l2.shift_remainder_power, side.block_l2.shift_complement_power])
                 .collect();
@@ -2616,14 +2564,14 @@ mod tests {
                 }
             }
         }
-        check::<NUM_INPUT_QUANT_COLUMNS>(&test_program());
-        check::<NUM_INPUT_QUANT_COLUMNS>(&InputQuantProgram {
+        check(&test_program());
+        check(&InputQuantProgram {
             h: 3,
             w: 5,
             k: 1056,
             ..test_program()
         });
-        check::<NUM_B200_INPUT_QUANT_COLUMNS>(&InputQuantProgram {
+        check(&InputQuantProgram {
             h: 3,
             w: 5,
             k: 1056,
@@ -2668,7 +2616,7 @@ mod tests {
             };
             assert_eq!(program.wl2(), 17);
             let inp = test_inputs(&program);
-            let (rows, pis) = program.generate_trace::<F, NUM_INPUT_QUANT_COLUMNS>(
+            let (rows, pis) = program.generate_trace::<F>(
                 &inp.a_int8,
                 &inp.a_scales,
                 &inp.a_noise,
@@ -2697,7 +2645,7 @@ mod tests {
             device: Device::H100,
         };
         let inp = test_inputs(&program);
-        let (rows, pis) = program.generate_trace::<F, NUM_INPUT_QUANT_COLUMNS>(
+        let (rows, pis) = program.generate_trace::<F>(
             &inp.a_int8,
             &inp.a_scales,
             &inp.a_noise,
@@ -2923,7 +2871,7 @@ mod tests {
         let mut inp = test_inputs(&program);
         let k = program.k;
         inp.a_int8[..k].fill(0);
-        let (rows, pis) = program.generate_trace::<F, NUM_INPUT_QUANT_COLUMNS>(
+        let (rows, pis) = program.generate_trace::<F>(
             &inp.a_int8,
             &inp.a_scales,
             &inp.a_noise,
@@ -3162,9 +3110,27 @@ mod tests {
                 assert_eq!(values[1], u64::from(keys[0] != 0), "lookup {li} row {r}: WIDTH16 nonzero");
             }
             LutTable::Log16 => {
-                assert_eq!(keys[0], 0, "lookup {li} row {r}: LOG16 logarithm region");
-                assert!(keys[1] < 1 << 16, "lookup {li} row {r}: LOG16 key out of domain");
-                assert_eq!(values[0], log2_fixed(keys[1]), "lookup {li} row {r}: LOG16 value");
+                if keys[0] == 0 {
+                    assert!(keys[1] < 1 << 16, "lookup {li} row {r}: LOG16 key out of domain");
+                    assert_eq!(values[0], log2_fixed(keys[1]), "lookup {li} row {r}: LOG16 value");
+                } else {
+                    assert_eq!(
+                        values[0],
+                        noise_coverage_lookup_value(keys[0], keys[1]),
+                        "lookup {li} row {r}: LOG16 Gaussian value"
+                    );
+                }
+            }
+            LutTable::DownscaleRewrite => {
+                let (code, threshold, coin, e) = (keys[0] & 255, (keys[0] >> 8) & 127, (keys[0] >> 15) & 1, keys[0] >> 16);
+                assert!(e < 6, "lookup {li} row {r}: DOWNSCALEREWRITE exponent out of domain");
+                let inside = coin == 1 && (code & 127) < threshold;
+                let expected = if inside {
+                    (code & 128) | (8 * e) | (code & 7) | 1
+                } else {
+                    code
+                };
+                assert_eq!(values[0], expected, "lookup {li} row {r}: DOWNSCALEREWRITE value");
             }
             _ => panic!("lookup {li}: table {:?} is not in InputQuant's inventory", lookup.table),
         }
@@ -3479,7 +3445,7 @@ mod tests {
 
     #[test]
     fn b200_noise_coverage_sums_cover_minimum_ragged_and_maximum_k() {
-        use super::super::columns::B200_INPUT_QUANT_COL_MAP;
+        use super::super::columns::INPUT_QUANT_COL_MAP;
         for k in [1024, 1056, 65536] {
             let program = InputQuantProgram {
                 h: 1,
@@ -3494,7 +3460,7 @@ mod tests {
             if k == 65536 {
                 input.a_int8.fill(0);
             }
-            let (rows, public_inputs) = program.generate_trace::<F, NUM_B200_INPUT_QUANT_COLUMNS>(
+            let (rows, public_inputs) = program.generate_trace::<F>(
                 &input.a_int8,
                 &input.a_scales,
                 &input.a_noise,
@@ -3502,17 +3468,17 @@ mod tests {
                 &input.b_scales,
                 &input.b_noise,
             );
-            let stark = InputQuantStark::<F, D, NUM_B200_INPUT_QUANT_COLUMNS>::new(program);
+            let stark = InputQuantStark::<F, D>::new(program);
             assert!(constraints_vanish(&stark, &rows, &public_inputs));
-            let map = &B200_INPUT_QUANT_COL_MAP;
+            let map = &INPUT_QUANT_COL_MAP;
             for side in [&map.a, &map.b] {
                 let expected: u64 = rows[..k].iter().map(|row| to_u64(row[side.gaussian_value])).sum();
                 assert_eq!(to_u64(rows[k - 1][side.noise_coverage_sum]), expected);
                 assert!(expected <= (k as u64) << 16);
                 for row in &rows[..k] {
                     assert!(to_u64(row[side.gaussian_value]) <= 1 << 16);
-                    assert!(to_u64(row[side.common.x_enc]) <= 276);
-                    assert!(to_u64(row[side.common.sum_of_squares_top]) >= 8192);
+                    assert!(to_u64(row[side.x_enc]) <= 276);
+                    assert!(to_u64(row[side.sum_of_squares_top]) >= 8192);
                 }
             }
             if k == 65536 {
@@ -3523,9 +3489,9 @@ mod tests {
 
     #[test]
     fn b200_padding_coin_ranges_and_recursive_constraints() {
-        use super::super::columns::B200_INPUT_QUANT_COL_MAP;
+        use super::super::columns::INPUT_QUANT_COL_MAP;
         use crate::v4::circuit::luts::LutChecker;
-        type B200 = InputQuantStark<F, D, NUM_B200_INPUT_QUANT_COLUMNS>;
+        type B200 = InputQuantStark<F, D>;
         let program = InputQuantProgram {
             h: 3,
             w: 5,
@@ -3535,7 +3501,7 @@ mod tests {
             device: Device::B200,
         };
         let inputs = test_inputs(&program);
-        let (rows, public_inputs) = program.generate_trace::<F, NUM_B200_INPUT_QUANT_COLUMNS>(
+        let (rows, public_inputs) = program.generate_trace::<F>(
             &inputs.a_int8,
             &inputs.a_scales,
             &inputs.a_noise,
@@ -3569,20 +3535,20 @@ mod tests {
         LutChecker::<F>::new(&tables)
             .check_trace(&lookups, &polynomials, &public_inputs, "B200")
             .unwrap();
-        let map = &B200_INPUT_QUANT_COL_MAP;
+        let map = &INPUT_QUANT_COL_MAP;
         for row in &rows {
             for (side, live) in [(&map.a, map.schedule.a_live), (&map.b, map.schedule.b_live)] {
                 if row[live] == F::ONE {
                     use crate::v4::circuit::unpredictability::{GAUSSIAN_CLASS_HEIGHT, NUM_GAUSSIAN_CLASSES};
-                    assert!(to_u64(row[side.common.x_enc]) <= 276);
-                    assert!(to_u64(row[side.common.sum_of_squares_top]) >= 8192);
+                    assert!(to_u64(row[side.x_enc]) <= 276);
+                    assert!(to_u64(row[side.sum_of_squares_top]) >= 8192);
                     assert!((1..=NUM_GAUSSIAN_CLASSES).contains(&to_u64(row[side.noise_coverage_region])));
-                    let index = to_u64(row[side.common.lambda] - row[side.noise_coverage_key_base]);
+                    let index = to_u64(row[side.lambda] - row[side.noise_coverage_key_base]);
                     assert!(index < GAUSSIAN_CLASS_HEIGHT);
                 }
             }
         }
-        let valid = |trace: &[[F; NUM_B200_INPUT_QUANT_COLUMNS]]| {
+        let valid = |trace: &[[F; NUM_INPUT_QUANT_COLUMNS]]| {
             trace.iter().enumerate().all(|(index, row)| {
                 let frame = StarkFrame::from_values(row, &trace[(index + 1) % trace.len()], &public_inputs);
                 let mut consumer = ConstraintConsumer::new(
@@ -3648,7 +3614,7 @@ mod tests {
     #[test]
     fn noise_decode_range_lookups_are_unconditional() {
         use starky::lookup::Column;
-        fn padded_polys<const WIDTH: usize>(device: Device, k: usize) -> Vec<PolynomialValues<F>> {
+        fn padded_polys(device: Device, k: usize) -> Vec<PolynomialValues<F>> {
             let program = InputQuantProgram {
                 h: 3,
                 w: 5,
@@ -3658,7 +3624,7 @@ mod tests {
                 device,
             };
             let inp = test_inputs(&program);
-            let (rows, _) = program.generate_trace::<F, WIDTH>(
+            let (rows, _) = program.generate_trace::<F>(
                 &inp.a_int8,
                 &inp.a_scales,
                 &inp.a_noise,
@@ -3670,10 +3636,10 @@ mod tests {
         }
         for device in [Device::H100, Device::B200] {
             let polys = match device {
-                Device::H100 => padded_polys::<NUM_INPUT_QUANT_COLUMNS>(device, 96),
-                Device::B200 => padded_polys::<NUM_B200_INPUT_QUANT_COLUMNS>(device, 1056),
+                Device::H100 => padded_polys(device, 96),
+                Device::B200 => padded_polys(device, 1056),
             };
-            let m = input_quant_column_map(device);
+            let m = &INPUT_QUANT_COL_MAP;
             let lookups = input_quant_lut_lookups::<F>(device);
             let mut expected = Vec::new();
             for (noise, high) in [

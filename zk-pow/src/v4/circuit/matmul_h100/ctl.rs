@@ -210,14 +210,19 @@ pub fn matmul_lut_lookups<F: Field>() -> Vec<LutLookup<F>> {
     }
 
     for i in 0..GROUP_WIDTH {
-        lookups.push(LutLookup::rc16(Column::linear_combination([
-            (m.e_cell, one),
-            (m.lane_binades[i], neg),
-        ])));
-        lookups.push(LutLookup::rc16_filtered(
-            Column::linear_combination_with_constant([(m.e_grid, one), (m.lane_binades[i], neg)], -F::from_canonical_u64(5)),
-            Filter::from_column(Column::single(m.cell_nonzero)),
-        ));
+        lookups.push(LutLookup {
+            table: LutTable::Bytes2,
+            keys: vec![
+                Column::linear_combination([(m.e_cell, one), (m.lane_binades[i], neg)]),
+                Column::linear_combination([
+                    (m.e_grid, one),
+                    (m.lane_binades[i], neg),
+                    (m.cell_nonzero, -F::from_canonical_u64(5)),
+                ]),
+            ],
+            values: vec![],
+            filter: Filter::default(),
+        });
     }
 
     let offset = -F::from_canonical_u64(SKIP_THRESHOLD_OFFSET);
@@ -256,10 +261,11 @@ mod tests {
     fn lut_inventory_matches_documented_counts() {
         let lookups = matmul_lut_lookups::<F>();
         let count = |table| lookups.iter().filter(|lookup| lookup.table == table).count();
-        assert_eq!(count(LutTable::Range16), 115);
+        assert_eq!(count(LutTable::Range16), 51);
+        assert_eq!(count(LutTable::Bytes2), 32);
         assert_eq!(count(LutTable::ProdAlign15), 32);
         assert_eq!(count(LutTable::Pow2G), 3);
         assert_eq!(count(LutTable::WidthNorm), 1);
-        assert_eq!(lookups.len(), 151);
+        assert_eq!(lookups.len(), 119);
     }
 }

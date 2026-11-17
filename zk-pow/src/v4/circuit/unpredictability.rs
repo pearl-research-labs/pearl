@@ -1,4 +1,4 @@
-//! Integer rules for unpredictable summands (check 3) and B200 noise coverage (check 4).
+//! Integer rules for unpredictable summands (check 3) and noise coverage (check 4).
 //!
 //! For cell `(i, j)` and product index `u`, the real-valued test is `v_iju < T_iju`:
 //!
@@ -100,10 +100,10 @@
 //!
 //! The plaintext accepts iff `count <= floor(k*h*w/20)`, computed directly in integers.
 //!
-//! # B200 Gaussian noise coverage from the same score
+//! # Gaussian noise coverage from the same score
 //!
 //! The additional row gate depends only on clean data and exact row scales. Put
-//! `a=alpha*X`, signal RMS `s=alpha*l2f`, and B200 noise RMS `sigma=s/2`. Its ideal
+//! `a=alpha*X`, signal RMS `s=alpha*l2f`, and noise RMS `sigma=delta(device)*s`. Its ideal
 //! Gaussian is `g=exp(-2*a^2/s^2)=exp(-a^2/(2*sigma^2))`. Subtract the zero-signal
 //! score `base=lambda(0,sigma)` and write `d=lambda(a,sigma)-base`. Monotonicity makes
 //! `d>=0`. The consensus kernel uses this difference directly, without a score-error
@@ -120,14 +120,14 @@
 //!
 //! [`noise_coverage_row_parameters`] derives the exact strip byte `t=Q8(RN32(g_strip*s))`,
 //! its decoded magnitude `c`, and the row coefficient/cap from the normalized sigma.
-//! Here `g_strip` is binary32 0.1 below `s=8`, otherwise binary32 0.08. The ideal noise-coverage terms
-//! and their integer approximations are
+//! Here `g_strip` is the device's strip factor (its small-RMS variant below `s=8`). The
+//! ideal noise-coverage terms and their integer approximations are
 //!
 //! ```text
-//! s >= 8: coverage_u = (21/16)*(c/s)*g_u
-//!         A = floor(65536*(21/16)*c/s),    K_u = T(d_u)
-//! s < 8:  coverage_u = min(g_u/8, cap(c))
-//!         A = 8192,                       K_u = min(T(d_u), 8*floor(65536*cap(c)))
+//! sigma >= 4: coverage_u = (21/32)*(c/sigma)*g_u
+//!             A = floor(65536*(21/32)*c/sigma),    K_u = T(d_u)
+//! sigma < 4:  coverage_u = min(g_u/8, cap(c))
+//!             A = 8192,                       K_u = min(T(d_u), 8*floor(65536*cap(c)))
 //! cap(c) = 0.0431 + 0.2738*(c-0.4).
 //! ```
 //!
@@ -700,17 +700,21 @@ pub fn noise_coverage_lookup_value(region: u64, index: u64) -> u64 {
 }
 
 /// Exact strip code, row coefficient, LOG16 region `1 + class`, and Gaussian key base for
-/// the B200 signal RMS `norm * 2^(encoding-282)`; the threshold retains both hardware
-/// rounds. An entry's lookup index is `lambda - key_base`, its lambda difference.
-pub fn noise_coverage_row_parameters(norm: u64, encoding: u64) -> (u64, u64, u64, u64) {
-    assert!((32768..65536).contains(&norm) && (269..=274).contains(&encoding));
-    // 155 = 282 - binary32's exponent bias; this scaling is exact.
-    let signal = norm as f32 * f32::from_bits((encoding as u32 - 155) << 23);
-    let factor = if encoding == 269 {
-        crate::v4::api::utils::DOWNSCALE_G_SMALL_RMS
-    } else {
-        crate::v4::api::utils::DOWNSCALE_G
-    };
+/// the sigma encoding `sigma = norm * 2^(encoding-283)`, signal RMS `s = sigma / delta`;
+/// the threshold retains both hardware rounds. An entry's lookup index is
+/// `lambda - key_base`, its lambda difference. The slot `encoding - 256 - offset(device)`
+/// spans `s in [4*2^slot, 8*2^slot)`; the capped small-noise classes exist only below
+/// `sigma = 4` (B200 slot 0), and the coefficient is `floor(65536 * 21/32 * c / sigma)`
+/// elsewhere.
+pub fn noise_coverage_row_parameters(device: Device, norm: u64, encoding: u64) -> (u64, u64, u64, u64) {
+    let lg2_delta = device.lg2_delta();
+    let base = (2 * (127 + 7) + 2 + lg2_delta) as u64;
+    assert!((32768..65536).contains(&norm) && (base..base + 6).contains(&encoding));
+    let sigma_exponent = encoding as i32 - 2 * (127 + 7) - 15;
+    let signal_exponent = (sigma_exponent - lg2_delta + 127) as u32;
+    let signal = norm as f32 * f32::from_bits(signal_exponent << 23);
+    let (g, g_small) = device.downscale_g();
+    let factor = if encoding == base { g_small } else { g };
     let threshold = crate::v4::api::dtype::f32_to_fp8_e4m3(factor * signal).expect("finite strip threshold") as u64;
     let class = if encoding == 269 && threshold <= 0x33 {
         threshold - 0x2c
@@ -721,7 +725,7 @@ pub fn noise_coverage_row_parameters(norm: u64, encoding: u64) -> (u64, u64, u64
         8192
     } else {
         let code_times_32 = (8 + (threshold & 7)) << ((threshold >> 3) - 5);
-        ((86016 * code_times_32) << (282 - encoding)) / (32 * norm)
+        ((43008 * code_times_32) << (283 - encoding)) / (32 * norm)
     };
     let zero_log = log2_fixed((norm * norm) >> 17);
     let key_base = 128 * encoding - 2624 + zero_log;
@@ -811,22 +815,30 @@ mod gaussian_tests {
 
     #[test]
     fn row_parameters_match_exact_rationals_in_every_slot() {
-        let exact_threshold = |norm: u64, encoding: u64| {
-            let (factor, denominator_bits) = if encoding == 269 { (13421773, 27) } else { (5368709, 26) };
+        // The strip factors as exact rationals: 0.1f32 = 13421773/2^27, 0.08f32 = 5368709/2^26,
+        // 0.105f32 = 14092861/2^27. The signal is norm * 2^(base_encoding - 283 + slot - 15 + 15)
+        // in units of 2^-(denominator_bits - ...): the shift below folds all of it.
+        let exact_threshold = |device: Device, norm: u64, encoding: u64| {
+            let (factor, denominator_bits): (u64, u64) = match (device, encoding) {
+                (Device::B200, 269) => (13421773, 27),
+                (Device::B200, _) => (5368709, 26),
+                (Device::H100, _) => (14092861, 27),
+            };
             let product = norm * factor;
-            let shift = 64 - product.leading_zeros() - 24;
+            let shift = u64::from(64 - product.leading_zeros() - 24);
             let quotient = product >> shift;
             let remainder = product - (quotient << shift);
             let halfway = 1 << (shift - 1);
             let rounded = quotient + u64::from(remainder > halfway || (remainder == halfway && quotient & 1 != 0));
             let numerator = rounded << shift;
+            let signal_bias = (283 + device.lg2_delta()) as u64;
             let code_numerator = |code: u64| {
                 let units = if code < 8 {
                     code
                 } else {
                     (8 + (code & 7)) << ((code >> 3) - 1)
                 };
-                units << (282 + denominator_bits - encoding - 9)
+                units << (signal_bias + denominator_bits - encoding - 9)
             };
             let upper = (0..=126).find(|&code| code_numerator(code) >= numerator).unwrap();
             let lower = upper - 1;
@@ -838,45 +850,50 @@ mod gaussian_tests {
                 upper
             }
         };
-        for norm in 32768..65536 {
-            let mut large = None;
-            for encoding in 269..=274 {
-                let (code, coefficient, region, base) = noise_coverage_row_parameters(norm, encoding);
-                // 155 = 282 - binary32's exponent bias; this scaling is exact.
-                let signal = norm as f32 * f32::from_bits((encoding as u32 - 155) << 23);
-                let factor = if encoding == 269 { 0.1f32 } else { 0.08f32 };
-                assert_eq!(code, crate::v4::api::dtype::f32_to_fp8_e4m3(factor * signal).unwrap() as u64);
-                assert_eq!(code, exact_threshold(norm, encoding));
-                // A zero entry's lambda is the key base: its lookup index is 0.
-                assert_eq!(base, 128 * encoding - 2624 + log2_fixed((norm * norm) >> 17));
-                assert!((1..=NUM_GAUSSIAN_CLASSES).contains(&region));
-                let decoded = crate::v4::api::dtype::fp8_e4m3_to_f32(code as u8);
-                if encoding == 269 {
-                    let c32 = (decoded * 32.0) as u64;
-                    let cap = 65536 * (13690 * c32 - 3321 * 32) / (50000 * 32);
-                    assert_eq!(coefficient, 8192);
-                    for difference in [0, 1, 78, 158, 290, 291, 1009, GAUSSIAN_CLASS_HEIGHT - 1] {
-                        let kernel = GAUSSIAN_KERNEL.get(difference as usize).copied().unwrap_or(0) as u64;
-                        assert_eq!(noise_coverage_lookup_value(region, difference), kernel.min(8 * cap));
-                    }
-                } else {
-                    assert_eq!(region, 1, "large-RMS rows are uncapped");
-                    let c32 = (decoded * 32.0) as u64;
-                    let numerator = (86016 * c32) << (282 - encoding);
-                    let denominator = 32 * norm;
-                    assert!(coefficient * denominator <= numerator && numerator < (coefficient + 1) * denominator);
-                    assert!((6476..=7285).contains(&coefficient));
-                    if let Some((first_code, first_coefficient, first_base)) = large {
-                        assert_eq!(
-                            (code, coefficient, base),
-                            (
-                                first_code + 8 * (encoding - 270),
-                                first_coefficient,
-                                first_base + 128 * (encoding - 270)
-                            )
-                        );
+        for (device, coefficient_range) in [(Device::B200, 6476..=7285), (Device::H100, 4200..=4800)] {
+            let base_encoding = 256 + device.sigma_encoding_offset();
+            for norm in 32768..65536 {
+                let mut large = None;
+                for encoding in base_encoding..base_encoding + 6 {
+                    let (code, coefficient, region, base) = noise_coverage_row_parameters(device, norm, encoding);
+                    // The exact binary32 signal scale `2^(encoding - 283 - lg2_delta)`.
+                    let signal_exponent = (encoding as i32 - 156 - device.lg2_delta()) as u32;
+                    let signal = norm as f32 * f32::from_bits(signal_exponent << 23);
+                    let (g, g_small) = device.downscale_g();
+                    let factor = if encoding == base_encoding { g_small } else { g };
+                    assert_eq!(code, crate::v4::api::dtype::f32_to_fp8_e4m3(factor * signal).unwrap() as u64);
+                    assert_eq!(code, exact_threshold(device, norm, encoding));
+                    // A zero entry's lambda is the key base: its lookup index is 0.
+                    assert_eq!(base, 128 * encoding - 2624 + log2_fixed((norm * norm) >> 17));
+                    assert!((1..=NUM_GAUSSIAN_CLASSES).contains(&region));
+                    let decoded = crate::v4::api::dtype::fp8_e4m3_to_f32(code as u8);
+                    if encoding == 269 {
+                        let c32 = (decoded * 32.0) as u64;
+                        let cap = 65536 * (13690 * c32 - 3321 * 32) / (50000 * 32);
+                        assert_eq!(coefficient, 8192);
+                        for difference in [0, 1, 78, 158, 290, 291, 1009, GAUSSIAN_CLASS_HEIGHT - 1] {
+                            let kernel = GAUSSIAN_KERNEL.get(difference as usize).copied().unwrap_or(0) as u64;
+                            assert_eq!(noise_coverage_lookup_value(region, difference), kernel.min(8 * cap));
+                        }
                     } else {
-                        large = Some((code, coefficient, base));
+                        assert_eq!(region, 1, "large-noise rows are uncapped");
+                        let c32 = (decoded * 32.0) as u64;
+                        let numerator = (43008 * c32) << (283 - encoding);
+                        let denominator = 32 * norm;
+                        assert!(coefficient * denominator <= numerator && numerator < (coefficient + 1) * denominator);
+                        assert!(coefficient_range.contains(&coefficient), "{device:?} {coefficient}");
+                        if let Some((first_encoding, first_code, first_coefficient, first_base)) = large {
+                            assert_eq!(
+                                (code, coefficient, base),
+                                (
+                                    first_code + 8 * (encoding - first_encoding),
+                                    first_coefficient,
+                                    first_base + 128 * (encoding - first_encoding)
+                                )
+                            );
+                        } else {
+                            large = Some((encoding, code, coefficient, base));
+                        }
                     }
                 }
             }
