@@ -21,19 +21,6 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	return fmt.Errorf("zkpow: build with -tags zkpow to enable proof verification")
 }
 
-func BatchVerify(headers []*wire.BlockHeader, certs []wire.BlockCertificate) (int, error) {
-	if len(headers) != len(certs) {
-		return 0, fmt.Errorf("BatchVerify: %d headers but %d certificates", len(headers), len(certs))
-	}
-	for i := range certs {
-		if err := VerifyCertificate(headers[i], certs[i]); err != nil {
-			return i, err
-		}
-	}
-
-	return len(certs), nil
-}
-
 func VerifyZKProofFFI(
 	header *wire.BlockHeader,
 	cert wire.BlockCertificate,
