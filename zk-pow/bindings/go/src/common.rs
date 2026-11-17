@@ -3,7 +3,7 @@
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::slice;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::Result;
 use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams, SeedDerivation};
@@ -35,33 +35,18 @@ const _: () = assert!(MIN_NOISE_RANK as usize == zk_pow::api::sanity_checks::PEN
 type CircuitCache = <PearlRecursion as RecursionCircuit>::CircuitCache;
 type V1CircuitCache = zk_pow::v1::circuit::circuit_utils::CircuitCache;
 
-lazy_static::lazy_static! {
-    /// Global circuit cache shared across Go FFI functions (verify and prove).
-    /// Protected by a Mutex for thread-safe access from multiple Go goroutines.
-    pub static ref CIRCUIT_CACHE: Mutex<CircuitCache> = {
-        use zk_pow::circuit::embedded_cache;
-        Mutex::new(CircuitCache::from_bytes(embedded_cache::CACHE_DATA)
-            .expect("V2 circuit cache is missing or corrupt; cannot verify proofs"))
-    };
+/// Verifier circuits, parsed once from the embedded cache. Nothing writes to them, so verifiers share
+/// them without a lock.
+pub(crate) static VERIFIER_CACHE: LazyLock<CircuitCache> = LazyLock::new(|| {
+    CircuitCache::from_bytes(zk_pow::circuit::embedded_cache::CACHE_DATA)
+        .expect("V2 circuit cache is missing or corrupt; cannot verify proofs")
+});
 
-    /// V1 circuit cache for verifying version-1 (master-format) proofs.
-    pub static ref V1_CIRCUIT_CACHE: Mutex<V1CircuitCache> = {
-        use zk_pow::v1::embedded_cache;
-        Mutex::new(V1CircuitCache::from_bytes(embedded_cache::CACHE_DATA)
-            .expect("V1 circuit cache is missing or corrupt; cannot verify V1 proofs"))
-    };
-}
-
-/// Acquires the circuit cache. Recovers from poisoned mutex if a prior panic occurred.
-/// The cache data is still valid for verifier after a panic, since the CircuitCache is read only.
-pub(crate) fn acquire_cache() -> std::sync::MutexGuard<'static, CircuitCache> {
-    CIRCUIT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Acquires the V1 circuit cache for version-1 proof verification.
-pub(crate) fn acquire_v1_cache() -> std::sync::MutexGuard<'static, V1CircuitCache> {
-    V1_CIRCUIT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+/// Verifier circuits for version-1 (master-format) proofs, parsed once from the embedded cache.
+pub(crate) static V1_VERIFIER_CACHE: LazyLock<V1CircuitCache> = LazyLock::new(|| {
+    V1CircuitCache::from_bytes(zk_pow::v1::embedded_cache::CACHE_DATA)
+        .expect("V1 circuit cache is missing or corrupt; cannot verify V1 proofs")
+});
 
 /// Catches panics from a closure and returns Ok(result) or Err(panic_message).
 /// The closure is wrapped in AssertUnwindSafe internally.
@@ -126,7 +111,10 @@ pub(crate) unsafe fn zk_prove(
     proof: &PlainProof,
     seed_derivation: SeedDerivation,
 ) -> Option<prove::ProveResult> {
-    let mut cache = acquire_cache();
+    // The prover's own circuits, compiled on first use; the verifier caches never see them.
+    static PROVER_CACHE: LazyLock<Mutex<CircuitCache>> = LazyLock::new(|| Mutex::new(CircuitCache::default()));
+
+    let mut cache = PROVER_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match catch_panic(|| prove::zk_prove_plain_proof(header, proof, &mut cache, false, seed_derivation)) {
         Ok(Ok(r)) => Some(r),
         Ok(Err(e)) => {

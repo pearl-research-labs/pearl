@@ -2057,7 +2057,6 @@ dependencies = [
  "cbindgen",
  "env_logger 0.10.2",
  "itertools 0.14.0",
- "lazy_static",
  "log",
  "primitive-types 0.12.2",
  "rand 0.8.6",

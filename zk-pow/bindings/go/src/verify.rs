@@ -11,7 +11,7 @@ use zk_pow::api::proof::{IncompleteBlockHeader, PublicProofParams, SeedDerivatio
 use zk_pow::api::sanity_checks;
 use zk_pow::api::verify;
 
-use crate::common::{acquire_cache, catch_panic, set_error_msg, CZKProof};
+use crate::common::{catch_panic, set_error_msg, CZKProof, V1_VERIFIER_CACHE, VERIFIER_CACHE};
 
 // ============================================================================
 // ZK Proof Verification FFI
@@ -67,11 +67,8 @@ unsafe fn verify_zk_proof_inner(
             }
         };
 
-        // Acquire circuit cache (immutable - verifier doesn't modify cache)
-        let cache = acquire_cache();
-
         // Verify using cached circuits only (no compilation)
-        match verify::verify_block_cached_circuits_only(&params, &zk_proof, &cache, nbits_override) {
+        match verify::verify_block_cached_circuits_only(&params, &zk_proof, &VERIFIER_CACHE, nbits_override) {
             Ok(_) => {
                 set_error_msg(error_msg_out, "Proof verified successfully");
                 0
@@ -285,9 +282,7 @@ pub unsafe extern "C" fn verify_zk_proof_v1(
         let public_data = &zk_proof_ref.public_data[..zk_proof_ref.public_data_len];
         let proof_data = slice::from_raw_parts(zk_proof_ref.proof_blob, zk_proof_ref.proof_blob_len);
 
-        let cache = crate::common::acquire_v1_cache();
-
-        match zk_pow::v1::verify_v1(&block_header_bytes, public_data, proof_data, &cache, None) {
+        match zk_pow::v1::verify_v1(&block_header_bytes, public_data, proof_data, &V1_VERIFIER_CACHE, None) {
             Ok(_) => {
                 set_error_msg(error_msg_out, "V1 proof verified successfully");
                 0

@@ -31,6 +31,12 @@ const (
 	// not be performed.
 	BFNoPoWCheck
 
+	// BFCertificateVerified may be set when the caller has already verified
+	// this exact certificate (all of its bytes, not only the block hash)
+	// against this header. The ZK verification is skipped; the target checks
+	// still run.
+	BFCertificateVerified
+
 	// BFNone is a convenience value to specifically indicate no flags.
 	BFNone BehaviorFlags = 0
 )
