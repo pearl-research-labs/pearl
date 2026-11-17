@@ -1194,29 +1194,35 @@ func (b *BlockChain) CheckHeaderSanity(header *wire.BlockHeader,
 	)
 }
 
-// VerifyHeaderCertificates is the package-level VerifyHeaderCertificates,
-// wired with the chain's own time source and chain parameters.
-func (b *BlockChain) VerifyHeaderCertificates(msgHeaders []wire.MsgHeader, prevHash chainhash.Hash,
-	prevHeight, stopHeight int32) (int, error) {
-
-	return VerifyHeaderCertificates(msgHeaders, prevHash, prevHeight, stopHeight, b.chainParams, b.timeSource)
+// HeaderBatch is a headers message as a sync loop sees it: the headers should build on the header PrevHash at
+// PrevHeight, and the loop stops after the one at StopHeight, the next checkpoint, or never if StopHeight is -1.
+type HeaderBatch struct {
+	Headers    []wire.MsgHeader
+	PrevHash   chainhash.Hash
+	PrevHeight int32
+	StopHeight int32
 }
 
-// VerifyHeaderCertificates verifies in parallel the certificates that a header
-// sync loop is about to verify one at a time, and returns how many leading
-// headers have a valid one and, if a certificate failed, its error. The loop
-// passes BFCertificateVerified for the valid ones; on an error the caller drops
-// the peer. It starts no verification after the first certificate that fails,
-// so a bad header costs about one verification per core, not one per header.
-func VerifyHeaderCertificates(msgHeaders []wire.MsgHeader, prevHash chainhash.Hash, prevHeight, stopHeight int32,
-	params *chaincfg.Params, timeSource MedianTimeSource) (int, error) {
+// VerifyHeaderCertificates verifies in parallel the certificates that the header sync loop is about to verify one at a
+// time, and returns how many leading headers have a valid one and, if a certificate failed, its error. The loop passes
+// BFCertificateVerified for the valid ones; on an error the caller drops the peer.
+func (b *BlockChain) VerifyHeaderCertificates(batch HeaderBatch) (int, error) {
+	return verifyHeaderCertificates(batch, b.chainParams, b.timeSource)
+}
 
-	flags := NetBehaviorFlags(params)
-	if flags&BFNoPoWCheck != 0 {
+// verifyHeaderCertificates is VerifyHeaderCertificates with the chain parameters and time source passed in. It verifies
+// nothing on networks that skip proof checks.
+func verifyHeaderCertificates(batch HeaderBatch, params *chaincfg.Params, timeSource MedianTimeSource) (int, error) {
+	if NetBehaviorFlags(params)&BFNoPoWCheck != 0 {
 		return 0, nil
 	}
 
-	headers, certs := batchableHeaders(msgHeaders, prevHash, prevHeight, stopHeight, params, timeSource, flags)
+	n := precheckHeaders(batch, params, timeSource)
+	headers := make([]*wire.BlockHeader, n)
+	certs := make([]wire.BlockCertificate, n)
+	for i := range n {
+		headers[i], certs[i] = &batch.Headers[i].BlockHeader, batch.Headers[i].BlockCertificate()
+	}
 
 	valid, err := zkpow.BatchVerify(headers, certs)
 	if err != nil {
@@ -1226,41 +1232,37 @@ func VerifyHeaderCertificates(msgHeaders []wire.MsgHeader, prevHash chainhash.Ha
 	return valid, nil
 }
 
-// batchableHeaders returns the leading headers that connect to prevHash and to each other and pass
-// CheckCertificateRules and the cheap checks of CheckBlockHeaderSanity, up to the one at stopHeight.
-// Headers that fail these are left to the sync loop, which reports them or, in spv, may treat them
-// as a reorg.
-func batchableHeaders(msgHeaders []wire.MsgHeader, prevHash chainhash.Hash, prevHeight, stopHeight int32,
-	params *chaincfg.Params, timeSource MedianTimeSource, flags BehaviorFlags) ([]*wire.BlockHeader,
-	[]wire.BlockCertificate) {
-
-	headers := make([]*wire.BlockHeader, 0, len(msgHeaders))
-	certs := make([]wire.BlockCertificate, 0, len(msgHeaders))
-	for i := range msgHeaders {
-		header, cert, height := &msgHeaders[i].BlockHeader, msgHeaders[i].BlockCertificate(), prevHeight+int32(i)+1
+// precheckHeaders returns how many leading headers of batch pass every context-free check but certificate
+// verification: each connects to the one before it (the first to PrevHash) and passes CheckCertificateRules and
+// CheckBlockHeaderSanity without the ZK call. It stops at the first header that fails, which it leaves to the sync
+// loop to report, and after the one at StopHeight.
+func precheckHeaders(batch HeaderBatch, params *chaincfg.Params, timeSource MedianTimeSource) int {
+	flags := NetBehaviorFlags(params)
+	prevHash := batch.PrevHash
+	for i := range batch.Headers {
+		msgHeader := &batch.Headers[i]
+		header, cert, height := &msgHeader.BlockHeader, msgHeader.BlockCertificate(), batch.PrevHeight+int32(i)+1
 		if !header.PrevBlock.IsEqual(&prevHash) {
-			break
+			return i
 		}
 
 		if CheckCertificateRules(header, cert, height, params, flags) != nil {
-			break
+			return i
 		}
 
-		sanityFlags := flags | BFNoPoWCheck
 		if CheckBlockHeaderSanity(header, cert, params.PowLimit, timeSource, params.MaxTimeOffsetMinutes,
-			sanityFlags) != nil {
-			break
+			flags|BFNoPoWCheck) != nil {
+			return i
 		}
 
-		headers, certs = append(headers, header), append(certs, cert)
-		if height == stopHeight {
-			break
+		if height == batch.StopHeight {
+			return i + 1
 		}
 
 		prevHash = header.BlockHash()
 	}
 
-	return headers, certs
+	return len(batch.Headers)
 }
 
 // VerifyCheckpoint checks that the height and hash match the stored

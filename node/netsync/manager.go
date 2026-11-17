@@ -1219,13 +1219,18 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	// Verify up front, in parallel, the certificates the loop below would verify.
+	// Batch-verify the certificates of the leading headers that pass the loop's other checks; the loop then skips
+	// verifying those certificates.
 	verified := 0
 	if tail := sm.headerList.Back(); tail != nil {
 		prev := tail.Value.(*headerNode)
 		var err error
-		verified, err = sm.chain.VerifyHeaderCertificates(msg.Headers, *prev.hash, prev.height,
-			sm.nextCheckpoint.Height)
+		verified, err = sm.chain.VerifyHeaderCertificates(blockchain.HeaderBatch{
+			Headers:    msg.Headers,
+			PrevHash:   *prev.hash,
+			PrevHeight: prev.height,
+			StopHeight: sm.nextCheckpoint.Height,
+		})
 		if err != nil {
 			log.Warnf("Header from peer %s failed sanity check: %v -- disconnecting", peer.Addr(), err)
 			peer.Disconnect()

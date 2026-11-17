@@ -21,7 +21,7 @@ import (
 )
 
 // TestVerifyHeaderCertificates runs a header sync loop that passes BFCertificateVerified for the
-// headers VerifyHeaderCertificates verified, and checks that every header gets the result it gets
+// headers verifyHeaderCertificates verified, and checks that every header gets the result it gets
 // without the flag, that nothing is verified ahead past a header that fails the cheaper checks, and
 // that a bad certificate's error is the one the loop would report for it.
 func TestVerifyHeaderCertificates(t *testing.T) {
@@ -81,7 +81,8 @@ func TestVerifyHeaderCertificates(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			verified, err := VerifyHeaderCertificates(test.headers, prevHash, 0, test.stopHeight, params, timeSource)
+			batch := HeaderBatch{Headers: test.headers, PrevHash: prevHash, StopHeight: test.stopHeight}
+			verified, err := verifyHeaderCertificates(batch, params, timeSource)
 			require.Equal(t, test.verified, verified)
 			if test.badCert {
 				bad := &test.headers[verified]
