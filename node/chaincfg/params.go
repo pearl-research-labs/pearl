@@ -600,6 +600,10 @@ var TestNetParams = Params{
 
 	SaltedSeedForkHeight: 38648,
 
+	// FP8 (V4) hardfork. Scheduled at tip 67302 (2026-11-17 15:40 UTC) plus
+	// ~4 hours at the observed ~209s block interval: ~19:40 UTC.
+	Fp8ForkHeight: 67370,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
