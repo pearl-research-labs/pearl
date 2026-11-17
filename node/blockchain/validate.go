@@ -528,8 +528,11 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 // checkProofOfWork because activation depends on the block height, which the
 // context-free sanity checks do not have. Reading the certificate apart from
 // its proof is sound: the header's proof commitment covers the certificate
-// version and public data, so the proof verified there binds everything these
-// rules read.
+// version and public data, and proof verification checks the certificate
+// against it before a block is accepted. ProcessBlock applies these rules
+// before that verification because they are cheaper. A certificate that fails
+// them there rejects only the copy of the block that carried it, since nothing
+// is recorded for the block's hash.
 //
 // The rank-penalty rule reads the proof's public data, so it is skipped
 // whenever proof of work is not verified (BFNoPoWCheck), which covers block
