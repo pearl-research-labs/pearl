@@ -21,7 +21,7 @@ from cutlass.cute.nvgpu import warpgroup
 from quack.sm90_utils import gemm_w_idx
 
 from .._utils._arch import Arch
-from ..protocol_constants import PACKED_NOISE_K
+from ..protocol_constants import PACKED_NOISE_K, STRIP_G_HOPPER
 from ._kernel_common import _C_FRAGMENT_VALUES, _NOISE_SKEW_ELEMS, _NamedBarrier
 from ._kernel_register_peel import _NoisyQuantRegisterPeel
 
@@ -47,8 +47,7 @@ class _NoisyQuantSm90(_NoisyQuantRegisterPeel):
 
     # The output warp generates E1; consumer-side E1 is not tuned on SM90.
     _consumer_e1_enabled = False
-    # Hopper commits H100, whose quantizer has no strip rewrite.
-    _rewrites_strip = False
+    _strip_g = (STRIP_G_HOPPER, STRIP_G_HOPPER)
 
     def _make_noise_mma(self):
         """One ``(bk, rows)`` QGMMA tile over the consumer warpgroup."""

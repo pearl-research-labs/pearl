@@ -98,9 +98,7 @@ constexpr uint32_t kE4m3MinNormal = UINT32_C(121) << 23;
 constexpr uint32_t kE4m3NormalBias = (static_cast<uint32_t>(7 - 127) << 23) + 0x7FFFF;
 constexpr uint32_t kE4m3Nan = 0x7F;
 
-// The strip rewrite of the Blackwell commitment (protocol_constants.STRIP_*).
-constexpr float kStripG = 0.08f;
-constexpr float kStripGSmallRms = 0.1f;
+// The strip rewrite (protocol_constants.STRIP_*); g is the committed device's.
 constexpr float kStripSmallRms = 8.0f;
 constexpr int kStripExpOffset = 9;
 constexpr int kStripCoinBlock = 4;
@@ -179,9 +177,9 @@ struct Strip {
   uint32_t code;
 };
 
-inline Strip strip_of(float alpha, float l2) {
+inline Strip strip_of(float alpha, float l2, float strip_g, float strip_g_small_rms) {
   const float s = alpha * l2;
-  const float g = s < kStripSmallRms ? kStripGSmallRms : kStripG;
+  const float g = s < kStripSmallRms ? strip_g_small_rms : strip_g;
   const uint32_t field = ((f32_bits(s) >> 23) & 0xFF) - (127 + kStripExpOffset - 7);
   return {static_cast<uint32_t>(e4m3_bits(g * s) & 0x7F), ((field & 0xF) << 3) | 1};
 }
@@ -417,7 +415,7 @@ inline uint32_t load_pair(const void* p) {
 // block, starting on one) under the atom's fp32 noise. Writes B' and the
 // peel's mid input diff = bf16(beta * bf16(noise) - B').
 void prepare_row(
-    float a, float b, Strip strip, bool rewrites, const int8_t* code, const uint16_t* scale,
+    float a, float b, Strip strip, const int8_t* code, const uint16_t* scale,
     const float* noises, int64_t cols, uint8_t* bp, uint16_t* diff) {
   int64_t c = 0;
 #ifdef __AVX512F__
@@ -435,7 +433,7 @@ void prepare_row(
     const __m512 noise = _mm512_loadu_ps(noises + c);
     const __m512 mixed = _mm512_fmadd_ps(b_v, noise, _mm512_mul_ps(coefficient, codes));
     __m512i q = e4m3_bits_v(mixed);
-    if (rewrites) q = rewrite_v(q, mixed, strip);
+    q = rewrite_v(q, mixed, strip);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(bp + c), _mm512_cvtepi32_epi8(q));
     const __m512 d =
         round_bf16_v(_mm512_fmsub_ps(b_v, round_bf16_v(noise), e4m3_value_v(q)));
@@ -450,7 +448,7 @@ void prepare_row(
     const float mixed = mix_cell(coefficient, b, code[c], noises[c]);
     if (c % kStripCoinBlock == 0) coin = coin_passes(mixed);
     uint8_t q = e4m3_bits(mixed);
-    if (rewrites) q = rewrite(q, strip, coin);
+    q = rewrite(q, strip, coin);
     bp[c] = q;
     diff[c] = bf16_bits(std::fma(b, round_bf16(noises[c]), -kE4m3Values[q]));
   }
@@ -603,7 +601,8 @@ torch::Tensor noise_lines(
 std::vector<torch::Tensor> prepare_rows(
     const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& alpha,
     const torch::Tensor& beta, const torch::Tensor& l2, const torch::Tensor& e2,
-    const torch::Tensor& f1, const torch::Tensor& f2, int64_t window_bits, bool rewrites) {
+    const torch::Tensor& f1, const torch::Tensor& f2, int64_t window_bits,
+    double strip_g, double strip_g_small_rms) {
   TORCH_CHECK(codes.dim() == 2 && codes.scalar_type() == at::kChar && codes.is_contiguous());
   const int64_t n = codes.size(0), k = codes.size(1);
   TORCH_CHECK(k % kTileCols == 0, "k must be a multiple of the column tile");
@@ -695,8 +694,9 @@ std::vector<torch::Tensor> prepare_rows(
         for (int64_t i = 0; i < rows; ++i) {
           const int64_t r = r0 + i;
           const float a = bf16_value(alpha_p[r]);
+          const Strip strip = strip_of(a, bf16_value(l2_p[r]), strip_g, strip_g_small_rms);
           prepare_row(
-              a, bf16_value(beta_p[r]), strip_of(a, bf16_value(l2_p[r])), rewrites,
+              a, bf16_value(beta_p[r]), strip,
               code_p + r * k + c0, scale_p + r * (k / kPrequantBlock) + c0 / kPrequantBlock,
               noise.data() + i * kTileCols, kTileCols, bp_p + r * k + c0,
               diff.data() + i * kTileCols);

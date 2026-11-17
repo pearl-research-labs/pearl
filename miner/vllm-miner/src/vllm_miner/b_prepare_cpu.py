@@ -10,7 +10,7 @@ a dense one, and only its committed configuration (hence ``pB`` and
 
 It composes only the protocol's arithmetic: the verifier's exact row norms,
 keyed-BLAKE3 noise lines, the fp32 fold ``fma(beta, E@F, (alpha * scale) *
-q)`` with the e4m3 cast (and the strip rewrite on Blackwell), and the
+q)`` with the e4m3 cast (and the strip rewrite), and the
 committed device's FP8 noise-dot atom: one K = 32 group from +0 whose terms
 are truncated to the device's window (Blackwell's ``tcgen05.mma`` and SM120's
 ``mma.sync``: 26 bits; Hopper's QGMMA: 14). Everything is therefore
@@ -55,6 +55,7 @@ LABEL_E2 = bytes((1, 0))
 LABEL_F2 = bytes((1, 1))
 STRIP_G = 0.08
 STRIP_G_SMALL_RMS = 0.1
+STRIP_G_HOPPER = 0.105
 STRIP_SMALL_RMS = 8.0
 STRIP_EXP_OFFSET = 9
 STRIP_COIN_BLOCK = 4
@@ -80,16 +81,21 @@ _E4M3_MAGNITUDE_MASK = 0x7F
 @dataclass(frozen=True)
 class DeviceArithmetic:
     """The committed device's B-side arithmetic: its noise fraction (the
-    per-row scales), its FP8 atom's window, and whether it rewrites the strip."""
+    per-row scales), its FP8 atom's window, and its strip g (rows with
+    alpha * l2 >= STRIP_SMALL_RMS, below it)."""
 
     delta: float
     window_bits: int
-    rewrites_strip: bool
+    strip_g: tuple[float, float]
 
 
 ARITHMETIC = {
-    Device.BLACKWELL: DeviceArithmetic(delta=0.5, window_bits=26, rewrites_strip=True),
-    Device.HOPPER: DeviceArithmetic(delta=1.0, window_bits=14, rewrites_strip=False),
+    Device.BLACKWELL: DeviceArithmetic(
+        delta=0.5, window_bits=26, strip_g=(STRIP_G, STRIP_G_SMALL_RMS)
+    ),
+    Device.HOPPER: DeviceArithmetic(
+        delta=1.0, window_bits=14, strip_g=(STRIP_G_HOPPER, STRIP_G_HOPPER)
+    ),
 }
 
 # The FP8 atom: e4m3 values are integers in units of 2^-9, so products are in
@@ -344,7 +350,7 @@ def _native_rows(
         f1,
         f2,
         arithmetic.window_bits,
-        arithmetic.rewrites_strip,
+        *arithmetic.strip_g,
     )
     peel = torch.cat([mid, -(row_scales.beta_b.unsqueeze(1) * e2.to(_BF16))], dim=1)
     return b_prime, peel
@@ -417,10 +423,7 @@ def _prepare_rows(
     alpha32 = alpha.float()
     coefficient = (alpha32 * scales.float()).repeat_interleave(codes.shape[1] // scales.shape[1], 1)
     mixed = _fma_f32(beta.float(), noise, coefficient * codes.float())
-    if arithmetic.rewrites_strip:
-        b_prime = rewrite_strip(mixed, alpha32 * l2.float())
-    else:
-        b_prime = _e4m3(mixed)
+    b_prime = rewrite_strip(mixed, alpha32 * l2.float(), arithmetic.strip_g)
 
     ebfb = (e.float() @ f2.float()).to(_BF16)
     diff = _fma_bf16(beta, ebfb, -b_prime.to(_BF16))
@@ -434,18 +437,19 @@ def _e4m3(x: torch.Tensor) -> torch.Tensor:
     return x.clamp(-QUANT_MAX, QUANT_MAX).to(_E4M3)
 
 
-def rewrite_strip(mixed: torch.Tensor, scaled_rms: torch.Tensor) -> torch.Tensor:
-    """e4m3 codes of the ``(rows, k)`` fp32 ``mixed`` under the Blackwell strip
-    rewrite, ``scaled_rms`` the ``(rows, 1)`` fp32 ``alpha * l2``.
+def rewrite_strip(
+    mixed: torch.Tensor, scaled_rms: torch.Tensor, strip_g: tuple[float, float]
+) -> torch.Tensor:
+    """e4m3 codes of the ``(rows, k)`` fp32 ``mixed`` under the strip rewrite, ``scaled_rms`` the ``(rows, 1)`` fp32 ``alpha * l2``.
 
     A code whose magnitude byte is below that of ``e4m3(g * scaled_rms)``
-    (``g`` per row) takes the row's safe exponent ``floor(log2(scaled_rms)) -
+    (``g`` per row from ``strip_g``) takes the row's safe exponent ``floor(log2(scaled_rms)) -
     STRIP_EXP_OFFSET`` with its mantissa LSB set, when the coin of its aligned
     ``STRIP_COIN_BLOCK`` columns passes: bits 14..8 of the group's first fp32
     mix below ``STRIP_COIN_THRESHOLD``.
     """
     code = _e4m3(mixed).view(torch.uint8).int()
-    g = torch.where(scaled_rms < STRIP_SMALL_RMS, STRIP_G_SMALL_RMS, STRIP_G).float()
+    g = torch.where(scaled_rms < STRIP_SMALL_RMS, strip_g[1], strip_g[0]).float()
     bound = _e4m3(g * scaled_rms).view(torch.uint8).int() & _E4M3_MAGNITUDE_MASK
     field = ((scaled_rms.view(torch.int32) >> 23) & 0xFF) - (127 + STRIP_EXP_OFFSET - 7)
     safe = ((field & 0xF) << 3) | 1
