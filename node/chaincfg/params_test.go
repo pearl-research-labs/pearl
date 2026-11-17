@@ -207,7 +207,7 @@ func TestShippedNetworksFp8ForkHeights(t *testing.T) {
 	} {
 		require.Zerof(t, params.Fp8ForkHeight, "%s must ship with Fp8ForkHeight disabled", name)
 	}
-	require.Equal(t, int32(67370), TestNetParams.Fp8ForkHeight,
+	require.Equal(t, int32(67415), TestNetParams.Fp8ForkHeight,
 		"testnet FP8 fork height changed")
 	require.Greater(t, TestNetParams.Fp8ForkHeight, TestNetParams.SaltedSeedForkHeight,
 		"testnet FP8 fork must follow the salted-seed fork")
