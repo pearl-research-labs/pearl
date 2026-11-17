@@ -11,7 +11,6 @@ crate-type = ["staticlib"]
 [dependencies]
 blake3 = "1.5"
 zk-pow = { path = "../..", default-features = false, features = ["embedded_cache"] }
-lazy_static = "1.5"
 anyhow = "1.0"
 itertools = "0.14"
 log = "0.4"
