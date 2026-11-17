@@ -60,6 +60,8 @@ _SMEM_CAPACITY_BYTES = Arch.SM100.smem_capacity_bytes
 class _NoisyQuantSm100(_NoisyQuant):
     """Warp-specialized noising at 16-row MMA granularity on the f8f6f4 UMMA atom."""
 
+    _packed_f32 = True
+
     def __init__(
         self,
         bk: int,
@@ -324,7 +326,7 @@ class _NoisyQuantSm100(_NoisyQuant):
             )
             sAlpha[thread_idx] = alpha
             sBeta[thread_idx] = beta
-            sStrip[thread_idx] = _strip_state(alpha, l2)
+            sStrip[thread_idx] = _strip_state(alpha, l2, self._strip_g)
             mAlpha[global_row] = alpha.to(bf16)
             mBeta[global_row] = beta.to(bf16)
         elif cutlass.const_expr(self.consumer_e1):  # noqa: SIM102

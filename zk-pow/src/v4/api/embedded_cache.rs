@@ -22,7 +22,7 @@ const CACHE_DATA: &[u8] = &[];
 pub fn load() -> Result<Fp8VerifierCache> {
     assert_eq!(
         &blake3::hash(CACHE_DATA).to_hex().as_str()[..32],
-        "b450767bbfcd907c752b0f850df17e31",
+        "99c0f7da1c9814e94484f4031a3dfa34",
         "V4 verifier cache digest mismatch; regenerate the cache and review the pinned digest"
     );
     Fp8VerifierCache::from_bytes(CACHE_DATA)

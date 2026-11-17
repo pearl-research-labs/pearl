@@ -15,7 +15,7 @@ pub const fn num_slots(table: LutTable) -> usize {
         LutTable::WidthNorm => 16,   // GROUP_SUM_ABS in [0, 2^20)
         LutTable::Pow2G => 4,        // carry, two gap ranges, normalization
         LutTable::Xor8 => 3,         // plain, rotate-by-12 and rotate-by-7 fragments
-        LutTable::DownscaleThreshold | LutTable::DownscaleRewrite => 6,
+        LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 | LutTable::DownscaleRewrite => 6,
         _ => 1,
     }
 }
@@ -36,7 +36,7 @@ pub const fn lut_live_rows(table: LutTable) -> usize {
         LutTable::RneRnd => 1 << 17,
         LutTable::ProdAlign15 | LutTable::B200Align | LutTable::WidthNorm => 1 << 16,
         LutTable::Fp32Tools => 780,
-        LutTable::DownscaleThreshold => 1 << 15,
+        LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 => 1 << 15,
         LutTable::DownscaleRewrite => 1 << 16,
     }
 }
@@ -95,6 +95,7 @@ const fn num_value_columns(table: LutTable) -> usize {
         LutTable::RneRnd => 75,   // independent rounding outputs
         LutTable::Fp32Tools | LutTable::DownscaleRewrite => 2,
         LutTable::DownscaleThreshold => 6,
+        LutTable::DownscaleThresholdH100 => 3,
     }
 }
 
@@ -282,6 +283,18 @@ pub fn lut_slot_layout<F: Field>(table: LutTable, slot: usize) -> LutSlotLayout<
                     Column::linear_combination_with_constant([(6, F::ONE)], F::from_canonical_usize(128 * (slot - 1))),
                 ]
             },
+        ),
+        // Columns 1..=3: slot-0 threshold, coefficient, slot-0 key base. Every slot serves
+        // the shared coefficient and the uncapped region 1; the threshold and key base are
+        // slot-affine in the exponent.
+        LutTable::DownscaleThresholdH100 => (
+            (slot as u64) << 15,
+            vec![
+                Column::linear_combination_with_constant([(1, F::ONE)], F::from_canonical_usize(8 * slot)),
+                Column::single(2),
+                Column::constant(F::ONE),
+                Column::linear_combination_with_constant([(3, F::ONE)], F::from_canonical_usize(128 * slot)),
+            ],
         ),
         LutTable::DownscaleRewrite => (
             (slot as u64) << 16,

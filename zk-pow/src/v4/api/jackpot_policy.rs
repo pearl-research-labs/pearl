@@ -31,11 +31,12 @@
 //!    `q=max(e(Z)-W,e(M)-18)` and `E_GRID=q+157`, omitting zero magnitudes.
 //!    The exact consensus rule is `lambda_A + lambda_B < 128*E_GRID + 45952`.
 //!    When both magnitudes are zero, `E_GRID=0` and no summands are skipped.
-//! 4. **Noise coverage** (downscaling hardware only, i.e. B200). Every row `i`
+//! 4. **Noise coverage.** Every row `i`
 //!    of both sides keeps its computed mean Gaussian noise coverage at or above `1/25`. With the
-//!    signal RMS `s_i = alpha_i * l2_i`, the row's E4M3 strip code `c_i` and
-//!    `g_iu = exp(-2 X_bar_iu^2 / s_i^2)`, the noise-coverage term is `21/16 * c_i / s_i * g_iu` for
-//!    `s_i >= 8` and `min(g_iu / 8, GET_CAP(c_i))` below. The consensus rule approximates `g`
+//!    signal RMS `s_i = alpha_i * l2_i`, the noise RMS `sigma_i = delta * s_i`, the row's E4M3
+//!    strip code `c_i` and `g_iu = exp(-X_bar_iu^2 / (2 sigma_i^2))`, the noise-coverage term is
+//!    `21/32 * c_i / sigma_i * g_iu` for
+//!    `sigma_i >= 4` and `min(g_iu / 8, GET_CAP(c_i))` below. The consensus rule approximates `g`
 //!    through check 3's `lambda` certificate; the ideal
 //!    mean noise coverage is guaranteed above `0.03928`, rather than `1/25`. See
 //!    `JackpotPolicy::row_noise_coverage_ok`.
@@ -49,7 +50,7 @@ use crate::v4::api::dtype::{bf16_to_f32, f32_to_fp8_e4m3, fp8_e4m3_to_f32};
 use crate::v4::api::layout::{JACKPOT_ENTRIES, lane_assignment};
 use crate::v4::api::public_params::Device;
 use crate::v4::api::quantization::BuiltRows;
-use crate::v4::api::utils::{B200, H100, SMALL_RMS_THRESHOLD, downscale_g, xor_fold_extract};
+use crate::v4::api::utils::{B200, H100, RMS_THRESHOLD, downscale_g, xor_fold_extract};
 use crate::v4::circuit::unpredictability::{budget, grid_exponent, grid_exponent_from_binades, lambda, skip};
 use anyhow::{Result, ensure};
 
@@ -82,7 +83,7 @@ impl JackpotPolicy {
             tau_idle: 8.0,
             eps_idle: 0.015625, // 1/64
             rms_min_a: 4.0,
-            rms_min_b: 16.0,
+            rms_min_b: 8.0,
         }
     }
 }
@@ -183,8 +184,8 @@ impl JackpotPolicy {
             return Ok(None);
         };
 
-        // Check 4: noise coverage of every row, on downscaling hardware only.
-        if self.device == Device::B200 && !(Self::row_noise_coverage_ok(a, k)? && Self::row_noise_coverage_ok(b, k)?) {
+        // Check 4: noise coverage of every row.
+        if !(self.row_noise_coverage_ok(a, k)? && self.row_noise_coverage_ok(b, k)?) {
             return Ok(None);
         }
         // The final matrix feeds the lottery fold.
@@ -289,27 +290,27 @@ impl JackpotPolicy {
 
     /// Check 4: every row's computed mean noise coverage is at least
     /// `1/NOISE_COVERAGE_MIN_INVERSE`, using check 3's lambda differences directly.
-    /// Let `g_u = exp(-w_u/2)` such that `w_u = 4 * (X / sigma)^2`.
-    /// The per-element noise-coverage term is:
-    /// if `sigma >= 8`:
-    ///     `p_u = 21/16 * 2 * X / sigma * exp(-w_u/2)`
+    /// Let `g_u = exp(-w_u/2)` such that `w_u = (X / sigma)^2`, with `sigma = delta * s` the
+    /// noise RMS. The per-element noise-coverage term is:
+    /// if `sigma >= 4`:
+    ///     `p_u = 21/32 * c / sigma * exp(-w_u/2)`
     /// else:
-    ///     `p_u = min(exp(-w_u/2) / 8, GET_CAP(X))`.
+    ///     `p_u = min(exp(-w_u/2) / 8, GET_CAP(c))`.
     /// The noise-coverage check is then:
     ///     sum_u p_u >= k / NOISE_COVERAGE_MIN_INVERSE.
     /// This method approximates the noise-coverage check in integer arithmetic,
     /// making use of the already computed `lambda` values from check 3.`
     /// Returns `Ok(true)` if the check passes, `Ok(false)` if it fails, and Èrr` on error.`
-    fn row_noise_coverage_ok(side: &OperandStrip, k: usize) -> Result<bool> {
+    fn row_noise_coverage_ok(&self, side: &OperandStrip, k: usize) -> Result<bool> {
         let threshold = (k as u64 * COVERAGE_SCALE * COVERAGE_SCALE).div_ceil(NOISE_COVERAGE_MIN_INVERSE);
         for (row, (&alpha, &l2)) in side.clean.chunks(k).zip(side.built.alpha.iter().zip(&side.built.l2)) {
-            let (coefficient, kernel_cap) = gauss_row_constants(alpha, l2)?;
-            let lambda_noise = lambda(Device::B200, alpha, 0, l2);
+            let (coefficient, kernel_cap) = gauss_row_constants(alpha, l2, self.device)?;
+            let lambda_noise = lambda(self.device, alpha, 0, l2);
             let kernel_sum: u64 = row
                 .iter()
                 .map(|&x| {
                     // `lambda` is monotone in `|x|`, so the difference never underflows.
-                    let difference = lambda(Device::B200, alpha, x, l2) - lambda_noise;
+                    let difference = lambda(self.device, alpha, x, l2) - lambda_noise;
                     gauss_kernel(difference).min(kernel_cap)
                 })
                 .sum();
@@ -323,26 +324,30 @@ impl JackpotPolicy {
 
 /// Check 4's per-row constants `(A, T_cap)`, which are used for the following check:
 /// A * sum_u min(T_u, T_cap) >= k * COVERAGE_SCALE^2 / NOISE_COVERAGE_MIN_INVERSE, where T_u is computed by [`gauss_kernel`].
-fn gauss_row_constants(alpha: u16, l2: u16) -> Result<(u64, u64)> {
-    const GAUSSIAN_SCALE: f64 = 1.3125;
+fn gauss_row_constants(alpha: u16, l2: u16, device: Device) -> Result<(u64, u64)> {
+    // 21/32: the Gaussian proxy is GAUSSIAN_SCALE * code / (noise RMS).
+    const GAUSSIAN_SCALE: f64 = 0.65625;
     // GET_CAP(code) = CAP_OFFSET + CAP_SLOPE * (code - CAP_PIVOT).
     const CAP_OFFSET: f64 = 0.0431;
     const CAP_SLOPE: f64 = 0.2738;
     const CAP_PIVOT: f64 = 0.4;
-    /// The small-RMS branch scales the Gaussian by `1/8`.
+    /// The small-noise branch scales the Gaussian by `1/8`.
     const SMALL_RMS_DIVISOR: u64 = 8;
 
     // The BF16 product has at most 16 significant bits: this f32 product is exact.
     let scaled_rms = bf16_to_f32(alpha) * bf16_to_f32(l2);
     ensure!(
         (4.0..256.0).contains(&scaled_rms),
-        "B200 noise coverage requires signal RMS in [4, 256)"
+        "noise coverage requires signal RMS in [4, 256)"
     );
     // Preserve the reference's RN32 multiplication followed by RN E4M3.
-    let code = f64::from(fp8_e4m3_to_f32(f32_to_fp8_e4m3(downscale_g(&[scaled_rms])[0] * scaled_rms)?));
+    let code = f64::from(fp8_e4m3_to_f32(f32_to_fp8_e4m3(
+        downscale_g(&[scaled_rms], device)[0] * scaled_rms,
+    )?));
     let scale = COVERAGE_SCALE as f64;
-    if scaled_rms >= SMALL_RMS_THRESHOLD {
-        let coefficient = (scale * GAUSSIAN_SCALE * code / f64::from(scaled_rms)).floor() as u64;
+    let noise_rms = device.delta() * f64::from(scaled_rms);
+    if noise_rms >= f64::from(RMS_THRESHOLD) {
+        let coefficient = (scale * GAUSSIAN_SCALE * code / noise_rms).floor() as u64;
         Ok((coefficient, COVERAGE_SCALE))
     } else {
         let cap = (scale * (CAP_OFFSET + CAP_SLOPE * (code - CAP_PIVOT))).floor() as u64;
@@ -392,7 +397,7 @@ mod tests {
         let noise = OperandNoise { e, f };
         let quant = Fp8E4M3Quant::new(Device::B200);
         let norms = exact_norms(&codes, &scales, num_rows, k, BLOCK_SIZE).unwrap();
-        let built = quant.noisy_quantize(&codes, &scales, &noise, &norms, Device::B200).unwrap();
+        let built = quant.noisy_quantize(&codes, &scales, &noise, &norms).unwrap();
         (clean, built)
     }
 
@@ -406,7 +411,7 @@ mod tests {
     fn sigma_floor_is_correct_for_every_device() {
         for device in [Device::H100, Device::B200] {
             assert_eq!(JackpotPolicy::for_device(device).rms_min_a, 4.0);
-            assert_eq!(JackpotPolicy::for_device(device).rms_min_b, 16.0);
+            assert_eq!(JackpotPolicy::for_device(device).rms_min_b, 8.0);
         }
     }
 
@@ -515,12 +520,12 @@ mod tests {
     fn gauss_row_constants_are_exact() {
         // Large row, s = 16: code = e4m3(RN32(0.08 * 16)) = 1.25 and
         // A = floor(2^16 * 21/16 * 1.25 / 16) = 6720; the cap is vacuous.
-        assert_eq!(gauss_row_constants(0x4180, 0x3F80).unwrap(), (6720, 65536));
+        assert_eq!(gauss_row_constants(0x4180, 0x3F80, Device::B200).unwrap(), (6720, 65536));
         // Small row, s = 4: code = e4m3(RN32(0.1 * 4)) = 0.40625, GET_CAP = 0.04481125,
         // floor(2^16 * GET_CAP) = 2936, so A = 2^13 and T_cap = 8 * 2936.
-        assert_eq!(gauss_row_constants(0x4080, 0x3F80).unwrap(), (8192, 23488));
+        assert_eq!(gauss_row_constants(0x4080, 0x3F80, Device::B200).unwrap(), (8192, 23488));
         // Below the downscaling domain no B200 row exists.
-        assert!(gauss_row_constants(0x4040, 0x3F80).is_err());
+        assert!(gauss_row_constants(0x4040, 0x3F80, Device::B200).is_err());
     }
 
     #[test]
@@ -528,11 +533,11 @@ mod tests {
         let (k, r) = (64usize, 16usize);
         // The varied fixture rows sit comfortably above the 1/25 floor.
         let (a, a_built) = build(&honest_rows(2, k), k, r, 0);
-        assert!(JackpotPolicy::row_noise_coverage_ok(&side(a, a_built), k).unwrap());
+        assert!(JackpotPolicy::default().row_noise_coverage_ok(&side(a, a_built), k).unwrap());
         // Rows whose entries all sit at the row's RMS (`X = +-l2`) have g = exp(-2)
         // everywhere: mean noise coverage ~ 21/16 * 0.08 * 0.135 ~ 0.014 < 0.04.
         let flat: Vec<u16> = (0..2 * k).map(|i| if i % 3 == 0 { 0xBF80 } else { 0x3F80 }).collect();
         let (a, a_built) = build(&flat, k, r, 0);
-        assert!(!JackpotPolicy::row_noise_coverage_ok(&side(a, a_built), k).unwrap());
+        assert!(!JackpotPolicy::default().row_noise_coverage_ok(&side(a, a_built), k).unwrap());
     }
 }

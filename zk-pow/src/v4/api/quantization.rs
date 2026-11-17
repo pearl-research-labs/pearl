@@ -26,9 +26,7 @@ use crate::v4::api::dtype::fp8_e4m3_to_f32;
 use crate::v4::api::dtype::{check_not_nan_or_inf_bf16, f32_biased_exponent};
 #[cfg(test)]
 use crate::v4::api::prequant::round_l2_to_grid;
-use crate::v4::api::utils::{
-    DOWNSCALE_G, DOWNSCALE_G_SMALL_RMS, E4M3_EXP_SHIFT, E4M3_EXPONENT_BIAS, E4M3_SIGN_SHIFT, downscale_g,
-};
+use crate::v4::api::utils::{E4M3_EXP_SHIFT, E4M3_EXPONENT_BIAS, E4M3_SIGN_SHIFT, downscale_g};
 use crate::v4::api::{
     compute::{bf16_div, bf16_fma, bf16_max, bf16_mul},
     dtype::{bf16_to_f32, f32_to_bf16, f32_to_fp8_e4m3},
@@ -158,8 +156,7 @@ impl Fp8E4M3Quant {
         Ok((alpha, beta))
     }
 
-    fn downscale(mixed: &[f32], scaled_rms: &[f32]) -> Result<Vec<u8>> {
-        const _: () = assert!(DOWNSCALE_G_SMALL_RMS > DOWNSCALE_G);
+    fn downscale(mixed: &[f32], scaled_rms: &[f32], device: Device) -> Result<Vec<u8>> {
         let quantized = mixed.iter().map(|&x| f32_to_fp8_e4m3(x)).collect::<Result<Vec<u8>>>()?;
         let (magnitudes, safe_mantissas) = quantized
             .iter()
@@ -186,7 +183,7 @@ impl Fp8E4M3Quant {
             })
             .collect::<Vec<f32>>();
 
-        let gs = downscale_g(scaled_rms);
+        let gs = downscale_g(scaled_rms, device);
         let mut in_strip = Vec::with_capacity(scaled_rms.len());
         for i in 0..scaled_rms.len() {
             let gs_magn = f32_to_fp8_e4m3(gs[i] * scaled_rms[i])?;
@@ -223,7 +220,6 @@ impl Fp8E4M3Quant {
         scales: &[u16],
         noise: &OperandNoise,
         norms: &[(u16, u16)],
-        device: Device,
     ) -> Result<BuiltRows> {
         let e = &noise.e;
         let f = &noise.f;
@@ -281,11 +277,7 @@ impl Fp8E4M3Quant {
             scaled_rms.push(alpha_f32 * bf16_to_f32(l2));
         }
 
-        let noised_part = if device.requires_downscaling() {
-            Self::downscale(&mixed, &scaled_rms)?
-        } else {
-            mixed.into_iter().map(f32_to_fp8_e4m3).collect::<Result<Vec<u8>>>()?
-        };
+        let noised_part = Self::downscale(&mixed, &scaled_rms, self.device)?;
 
         Ok(BuiltRows {
             noised_part,
@@ -430,7 +422,7 @@ mod tests {
         let quant = Fp8E4M3Quant::new(Device::B200);
         let norms = exact_norms(&codes, &scales, num_rows, k, BLOCK_SIZE).unwrap();
 
-        let built = quant.noisy_quantize(&codes, &scales, &noise, &norms, Device::B200).unwrap();
+        let built = quant.noisy_quantize(&codes, &scales, &noise, &norms).unwrap();
         assert_eq!(built.noised_part.len(), num_rows * k);
         assert_eq!(built.alpha.len(), num_rows);
         assert_eq!(built.l2.len(), num_rows);
@@ -439,7 +431,7 @@ mod tests {
             assert!(fp8_e4m3_to_f32(c).abs() <= MAX_E4M3);
         }
         // Deterministic.
-        let again = quant.noisy_quantize(&codes, &scales, &noise, &norms, Device::B200).unwrap();
+        let again = quant.noisy_quantize(&codes, &scales, &noise, &norms).unwrap();
         assert_eq!(built.noised_part, again.noised_part);
         assert_eq!(built.alpha, again.alpha);
         assert_eq!(built.beta, again.beta);
@@ -471,7 +463,6 @@ mod tests {
                         f: f.repeat(BLOCK_SIZE),
                     },
                     &norms,
-                    device,
                 )
                 .unwrap();
             assert_eq!(built.alpha[0], expected_alpha, "{device:?} alpha");

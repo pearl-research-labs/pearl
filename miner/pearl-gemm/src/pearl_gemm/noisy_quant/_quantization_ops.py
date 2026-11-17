@@ -13,8 +13,6 @@ from ..protocol_constants import (
     STRIP_COIN_SHIFT,
     STRIP_COIN_THRESHOLD,
     STRIP_EXP_OFFSET,
-    STRIP_G,
-    STRIP_G_SMALL_RMS,
     STRIP_SMALL_RMS,
     R,
 )
@@ -91,42 +89,12 @@ def _bf16_bits_to_f32(bits):
     )
 
 
-def _fold(coefficient, beta, codes, byte: int, noise):
-    """``fma(beta, noise, coefficient * q)`` for int8 code ``byte`` of ``codes``,
-    each op one RNE fp32 rounding (the verifier's ``fp32_fma`` is the correctly
-    rounded FMA)."""
-    return _asm_f32(
-        "{\n\t"
-        ".reg .b32 t;\n\t"
-        ".reg .f32 q, s;\n\t"
-        f"bfe.s32 t, $3, {8 * byte}, 8;\n\t"
-        "cvt.rn.f32.s32 q, t;\n\t"
-        "mul.rn.f32 s, $1, q;\n\t"
-        "fma.rn.f32 $0, $2, $4, s;\n\t"
-        "}",
-        "=f,f,f,r,f",
-        cutlass.Float32(coefficient),
-        cutlass.Float32(beta),
-        cutlass.Uint32(codes),
-        cutlass.Float32(noise),
-    )
-
-
-def _f32x2_to_e4m3x2(hi, lo) -> cutlass.Uint32:
-    """e4m3 codes of two fp32 values (RNE, saturating to +-448), ``lo`` in the low byte."""
-    return _asm_u32(
-        "{\n\t.reg .b16 h;\n\tcvt.rn.satfinite.e4m3x2.f32 h, $1, $2;\n\tcvt.u32.u16 $0, h;\n\t}",
-        "=r,f,f",
-        cutlass.Float32(hi),
-        cutlass.Float32(lo),
-    )
-
-
-def _strip_state(alpha, l2):
+def _strip_state(alpha, l2, strip_g):
     """A row's strip state from its scaled RMS ``s = alpha * l2``, per
-    byte lane: ``0x7F + |e4m3(g * s)|`` in the low half (a code magnitude
-    below it borrows its byte's top bit into place) and ``safe exponent | 1``
-    in code position in the high half."""
+    byte lane: the strip bound ``|e4m3(g * s)|`` in the low half and
+    ``safe exponent | 1`` in code position in the high half. ``strip_g`` is the
+    device's ``(g, g for s < STRIP_SMALL_RMS)``."""
+    g, g_small = strip_g
     return _asm_u32(
         "{\n\t"
         ".reg .f32 s, g, w;\n\t"
@@ -135,12 +103,11 @@ def _strip_state(alpha, l2):
         ".reg .pred p;\n\t"
         "mul.rn.f32 s, $1, $2;\n\t"
         f"setp.lt.f32 p, s, {_f32_hex(STRIP_SMALL_RMS)};\n\t"
-        f"selp.f32 g, {_f32_hex(STRIP_G_SMALL_RMS)}, {_f32_hex(STRIP_G)}, p;\n\t"
+        f"selp.f32 g, {_f32_hex(g_small)}, {_f32_hex(g)}, p;\n\t"
         "mul.rn.f32 w, g, s;\n\t"
         "cvt.rn.satfinite.e4m3x2.f32 h, w, w;\n\t"
         "cvt.u32.u16 m, h;\n\t"
         "and.b32 m, m, 0x7F;\n\t"
-        "add.u32 m, m, 0x7F;\n\t"
         "mov.b32 b, s;\n\t"
         "bfe.u32 e, b, 23, 8;\n\t"
         f"sub.u32 e, e, {127 + STRIP_EXP_OFFSET - _E4M3_BIAS};\n\t"
@@ -157,44 +124,95 @@ def _strip_state(alpha, l2):
     )
 
 
-def _coin_mask(mixed):
-    """``0x8080`` if the group-start mix's coin field passes, else 0."""
-    return _asm_u32(
-        "{\n\t"
-        ".reg .b32 t;\n\t"
+# A biased code byte ``q + 128`` in the low mantissa byte of ``2^23`` is
+# exactly ``2^23 + 128 + q``.
+_CODE_MAGIC = 0x4B000000
+_CODE_BIAS = 2.0**23 + 128
+
+
+def _quantize_word(codes, coefficient, beta, noise, strip_bound, strip_code, packed):
+    """A' codes of one row's four contiguous columns under one block scale.
+
+    Each column is ``e4m3(fma(beta, noise, coefficient * q))`` with one RNE
+    rounding per operation (the verifier's ``fp32_fma`` is the correctly
+    rounded FMA), saturating to +-448. The int8 codes become exact fp32
+    through the mantissa (``_CODE_MAGIC``). The group's coin (bits 14..8 of column 0's mix) decides whether codes whose
+    magnitude is below the row's strip bound become ``sign | safe exponent |
+    mantissa | 1``; ``strip_bound`` and ``strip_code`` are ``_strip_state``'s
+    halves replicated over the word's four byte lanes. ``packed``
+    (trace-time) uses the sm_100 f32x2 forms.
+    """
+    regs = (
+        ".reg .b32 t, u, b0, b1, b2, b3, w, m, k, d, cm;\n\t"
+        ".reg .f32 q0, q1, q2, q3, x0, x1, x2, x3;\n\t"
+        ".reg .b16 l, h;\n\t"
         ".reg .pred p;\n\t"
-        "mov.b32 t, $1;\n\t"
-        f"bfe.u32 t, t, {STRIP_COIN_SHIFT}, 7;\n\t"
-        f"setp.lt.u32 p, t, {STRIP_COIN_THRESHOLD};\n\t"
-        "selp.b32 $0, 0x8080, 0, p;\n\t"
-        "}",
-        "=r,f",
-        cutlass.Float32(mixed),
     )
-
-
-def _rewrite_strip_pair(codes, strip_bound, strip_code, coin_mask):
-    """Rewrite each of the two e4m3 ``codes`` whose magnitude is below the
-    row's strip bound (when ``coin_mask`` is set) to ``sign | safe exponent |
-    mantissa | 1``; ``strip_bound`` / ``strip_code`` are the halves of
-    ``_strip_state``."""
+    body = "xor.b32 u, $1, 0x80808080;\n\t"
+    for i in range(4):
+        body += f"prmt.b32 b{i}, u, {_CODE_MAGIC:#010x}, 0x765{i};\n\t"
+    if packed:
+        regs += ".reg .b32 kb;\n\t.reg .b64 Q01, Q23, K, C, B, N01, N23, X01, X23;\n\t"
+        body += (
+            f"mov.b32 kb, {_f32_hex(_CODE_BIAS)};\n\t"
+            "mov.b64 K, {kb, kb};\n\t"
+            "mov.b64 Q01, {b0, b1};\n\t"
+            "mov.b64 Q23, {b2, b3};\n\t"
+            "sub.rn.f32x2 Q01, Q01, K;\n\t"
+            "sub.rn.f32x2 Q23, Q23, K;\n\t"
+            "mov.b64 C, {$2, $2};\n\t"
+            "mul.rn.f32x2 Q01, Q01, C;\n\t"
+            "mul.rn.f32x2 Q23, Q23, C;\n\t"
+            "mov.b64 B, {$3, $3};\n\t"
+            "mov.b64 N01, {$4, $5};\n\t"
+            "mov.b64 N23, {$6, $7};\n\t"
+            "fma.rn.f32x2 X01, B, N01, Q01;\n\t"
+            "fma.rn.f32x2 X23, B, N23, Q23;\n\t"
+            "mov.b64 {x0, x1}, X01;\n\t"
+            "mov.b64 {x2, x3}, X23;\n\t"
+        )
+    else:
+        for i in range(4):
+            body += (
+                f"mov.b32 q{i}, b{i};\n\t"
+                f"sub.rn.f32 q{i}, q{i}, {_f32_hex(_CODE_BIAS)};\n\t"
+                f"mul.rn.f32 q{i}, $2, q{i};\n\t"
+                f"fma.rn.f32 x{i}, $3, ${4 + i}, q{i};\n\t"
+            )
+    body += "cvt.rn.satfinite.e4m3x2.f32 l, x1, x0;\n\tcvt.rn.satfinite.e4m3x2.f32 h, x3, x2;\n\t"
+    assert (STRIP_COIN_SHIFT, STRIP_COIN_THRESHOLD) == (8, 112)
+    body += (
+        # The coin passes unless bits 14..12 are all set (bits 14..8 < 112);
+        # a failed coin zeroes the bound. With the sign forced on, a byte's
+        # top bit survives the subtraction iff its magnitude is >= bound.
+        "mov.b32 w, {l, h};\n\t"
+        "mov.b32 t, x0;\n\t"
+        "not.b32 t, t;\n\t"
+        "and.b32 t, t, 0x7000;\n\t"
+        "setp.ne.u32 p, t, 0;\n\t"
+        "selp.b32 cm, $8, 0, p;\n\t"
+        "or.b32 m, w, 0x80808080;\n\t"
+        "sub.u32 t, m, cm;\n\t"
+        "prmt.b32 k, t, t, 0xBA98;\n\t"
+        "and.b32 d, w, 0x87878787;\n\t"
+        "or.b32 d, d, $9;\n\t"
+        "lop3.b32 $0, d, w, k, 0xD8;\n\t"
+    )
     return _asm_u32(
-        "{\n\t"
-        ".reg .b32 m, t, k, d;\n\t"
-        "and.b32 m, $1, 0x7F7F;\n\t"
-        "sub.u32 t, $2, m;\n\t"
-        "and.b32 t, t, $4;\n\t"
-        "prmt.b32 k, t, t, 0x0098;\n\t"
-        "and.b32 d, $1, 0x8787;\n\t"
-        "or.b32 d, d, $3;\n\t"
-        "lop3.b32 $0, d, $1, k, 0xE4;\n\t"
-        "}",
-        "=r,r,r,r,r",
+        "{\n\t" + regs + body + "}",
+        "=r,r,f,f,f,f,f,f,r,r",
         cutlass.Uint32(codes),
+        cutlass.Float32(coefficient),
+        cutlass.Float32(beta),
+        *(cutlass.Float32(n) for n in noise),
         cutlass.Uint32(strip_bound),
         cutlass.Uint32(strip_code),
-        cutlass.Uint32(coin_mask),
     )
+
+
+def _replicate_byte(word, byte: int):
+    """Byte ``byte`` of ``word`` in all four byte lanes."""
+    return _asm_u32(f"prmt.b32 $0, $1, $1, 0x{byte * 0x1111:04X};", "=r,r", cutlass.Uint32(word))
 
 
 def _l2_grid_round_f32(x):

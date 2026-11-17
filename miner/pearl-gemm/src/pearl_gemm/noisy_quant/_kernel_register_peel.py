@@ -365,7 +365,7 @@ class _NoisyQuantRegisterPeel(_NoisyQuant):
             alpha, beta, l2 = self._combine_row_stats(mStat, global_row, tile_count * self.bk)
             sAlpha[thread_idx] = alpha
             sBeta[thread_idx] = beta
-            sStrip[thread_idx] = _strip_state(alpha, l2)
+            sStrip[thread_idx] = _strip_state(alpha, l2, self._strip_g)
             mAlpha[global_row] = alpha.to(bf16)
             mBeta[global_row] = beta.to(bf16)
         elif cutlass.const_expr(self.consumer_e1):  # noqa: SIM102

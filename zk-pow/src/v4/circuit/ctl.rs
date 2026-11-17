@@ -106,7 +106,7 @@ impl From<Table> for TableIdx {
 }
 
 /// Number of committed LUT tables — each its own AIR of the batch (`super::luts`).
-pub const NUM_H100_LUT_TABLES: usize = 17;
+pub const NUM_H100_LUT_TABLES: usize = 19;
 pub const NUM_B200_LUT_TABLES: usize = 19;
 /// Total tables of the batch: the six main tables, then the device's LUTs.
 pub const NUM_H100_ALL_TABLES: usize = NUM_TABLES + NUM_H100_LUT_TABLES;
@@ -153,9 +153,10 @@ pub fn lut_tables(device: Device) -> Vec<LutTable> {
         lut_for_device(device, LutTable::Pow2D, LutTable::Width32),
         LutTable::Fp32Tools,
     ];
-    if device == Device::B200 {
-        tables.extend([LutTable::DownscaleThreshold, LutTable::DownscaleRewrite]);
-    }
+    tables.extend([
+        lut_for_device(device, LutTable::DownscaleThresholdH100, LutTable::DownscaleThreshold),
+        LutTable::DownscaleRewrite,
+    ]);
     tables
 }
 
@@ -163,7 +164,7 @@ pub fn lut_tables(device: Device) -> Vec<LutTable> {
 pub const NUM_MAIN_CHANNELS: usize = 7;
 /// The device-independent LUT prefix of [`lut_tables`] (through `Pow2D`/`Width32`): its
 /// channels directly follow the main channels, then comes the coefficient channel, then the
-/// appended LUTs (FP32TOOLS and B200's downscale tables).
+/// appended LUTs (FP32TOOLS and the downscale tables).
 pub const LUT_CHANNEL_PREFIX: usize = 16;
 /// The channel index of the InputQuant -> Coefficient lookup.
 pub const COEFFICIENT_CHANNEL: usize = NUM_MAIN_CHANNELS + LUT_CHANNEL_PREFIX;
@@ -195,11 +196,11 @@ pub fn all_cross_table_lookups<F: Field>(device: Device, scale: &ScaleProgram) -
         Device::B200 => (ctl_operand_codes_looking_matmul_b200(), ctl_cell_results_looked_matmul_b200()),
     };
     let mut ctls = vec![
-        CrossTableLookup::new(ctl_int8_bytes_looking_blake3(), ctl_int8_bytes_looked_input_quant(device)),
-        CrossTableLookup::new(ctl_block_scales_looking_blake3(), ctl_block_scales_looked_input_quant(device)),
-        CrossTableLookup::new(operand_codes, ctl_operand_codes_looked_input_quant(device)),
+        CrossTableLookup::new(ctl_int8_bytes_looking_blake3(), ctl_int8_bytes_looked_input_quant()),
+        CrossTableLookup::new(ctl_block_scales_looking_blake3(), ctl_block_scales_looked_input_quant()),
+        CrossTableLookup::new(operand_codes, ctl_operand_codes_looked_input_quant()),
         CrossTableLookup::new(
-            ctl_group_tuples_looking_input_quant(device),
+            ctl_group_tuples_looking_input_quant(),
             vec![ctl_looked_scale_group_tuple(scale)],
         ),
         CrossTableLookup::new(vec![ctl_cell_results_looking_xor_fold()], vec![cell_results]),
@@ -212,7 +213,7 @@ pub fn all_cross_table_lookups<F: Field>(device: Device, scale: &ScaleProgram) -
     );
     ctls.extend(lut_channels.drain(..LUT_CHANNEL_PREFIX));
     ctls.push(CrossTableLookup::new(
-        coefficient_looking(device),
+        coefficient_looking(),
         vec![coefficient_looked(Table::Coefficient.into())],
     ));
     ctls.extend(lut_channels);
