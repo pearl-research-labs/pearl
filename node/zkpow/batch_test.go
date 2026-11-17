@@ -8,11 +8,6 @@ package zkpow
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
-	"strconv"
-	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -183,76 +178,34 @@ func TestBatchVerify(t *testing.T) {
 	require.ErrorContains(t, err, "1 headers but 3 certificates")
 }
 
-// cpuTime returns the CPU time, user plus system, this process has used.
-func cpuTime(b *testing.B) time.Duration {
-	var ru syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
-		b.Fatal(err)
-	}
-
-	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
-}
-
-// threadCount returns the number of OS threads in this process, or -1 if it can't tell.
-func threadCount() int {
-	out, err := exec.Command("ps", "-M", "-p", strconv.Itoa(os.Getpid())).Output()
-	if err != nil {
-		return -1
-	}
-
-	return len(strings.Split(strings.TrimSpace(string(out)), "\n")) - 1
-}
-
-// BenchmarkVerifyCertificates compares N VerifyCertificate calls in a loop with one
-// BatchVerify call over N valid certificates.
-//
-// Run with: go test -tags zkpow,xmss -run '^$' -bench BenchmarkVerifyCertificates ./zkpow
+// BenchmarkVerifyCertificates compares N VerifyCertificate calls in a loop with one BatchVerify call over N valid
+// certificates.
 func BenchmarkVerifyCertificates(b *testing.B) {
 	header := testBlockHeader()
 	cert, err := Mine(header, wire.CertificateVersionV2)
 	require.NoError(b, err)
+
 	for _, n := range []int{1, 16, 100} {
 		headers := make([]*wire.BlockHeader, n)
 		certs := make([]wire.BlockCertificate, n)
 		for i := range headers {
 			headers[i], certs[i] = header, cert
 		}
-		modes := map[string]func() []error{
-			"Sequential": func() []error {
-				errs := make([]error, n)
+
+		b.Run(fmt.Sprintf("N=%d/Sequential", n), func(b *testing.B) {
+			for range b.N {
 				for i := range headers {
-					errs[i] = VerifyCertificate(headers[i], certs[i])
+					require.NoError(b, VerifyCertificate(headers[i], certs[i]))
 				}
-
-				return errs
-			},
-			"Batch": func() []error {
+			}
+			b.ReportMetric(float64(b.N*n)/b.Elapsed().Seconds(), "certs/s")
+		})
+		b.Run(fmt.Sprintf("N=%d/Batch", n), func(b *testing.B) {
+			for range b.N {
 				_, err := BatchVerify(headers, certs)
-
-				return []error{err}
-			},
-		}
-		for _, name := range []string{"Sequential", "Batch"} {
-			b.Run(fmt.Sprintf("N=%d/%s", n, name), func(b *testing.B) {
-				modes[name]() // warm up the thread pools
-				b.ResetTimer()
-				startCPU := cpuTime(b)
-				start := time.Now()
-				for i := 0; i < b.N; i++ {
-					for _, err := range modes[name]() {
-						require.NoError(b, err)
-					}
-				}
-				wall := time.Since(start)
-				cpu := cpuTime(b) - startCPU
-				b.StopTimer()
-
-				certsDone := float64(b.N * n)
-				b.ReportMetric(float64(wall.Microseconds())/1000/certsDone, "wall-ms/cert")
-				b.ReportMetric(float64(cpu.Microseconds())/1000/certsDone, "cpu-ms/cert")
-				b.ReportMetric(certsDone/wall.Seconds(), "certs/s")
-				b.ReportMetric(float64(threadCount()), "threads")
-			})
-		}
+				require.NoError(b, err)
+			}
+			b.ReportMetric(float64(b.N*n)/b.Elapsed().Seconds(), "certs/s")
+		})
 	}
 }
