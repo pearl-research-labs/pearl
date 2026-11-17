@@ -45,7 +45,7 @@ func loadFP8FixtureForDevice(t *testing.T, device string) (*wire.BlockHeader, *w
 	require.Greater(t, len(raw), 80, "fixture too short for header and length prefix")
 
 	publicLen := binary.LittleEndian.Uint32(raw[76:80])
-	require.LessOrEqual(t, int(publicLen), wire.MaxZKProofSize, "fixture public data too large")
+	require.LessOrEqual(t, int(publicLen), wire.PublicDataMaxSizeV4, "fixture public data too large")
 	require.Greater(t, len(raw)-80, int(publicLen), "fixture missing proof data")
 
 	rest := bytes.NewReader(raw[80+publicLen:])

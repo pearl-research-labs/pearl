@@ -552,7 +552,7 @@ func (g *testGenerator) nextBlock(blockName string, spend *testhelper.SpendableO
 
 	// Attach a certificate unless the munger already set one.
 	if block.BlockCertificate() == nil {
-		cert, err := blockchain.SolveBlock(block.BlockHeader(), g.params, nextHeight)
+		cert, err := blockchain.SolveBlock(block.BlockHeader(), g.tip.BlockHeader(), g.params, nextHeight)
 		if err != nil {
 			panic(fmt.Sprintf("failed to solve block %q: %v", blockName, err))
 		}
@@ -721,7 +721,10 @@ func (g *testGenerator) padBlockToVsize(b *wire.MsgBlock, targetVsize int) {
 	updateWitnessCommitment(b)
 
 	b.BlockHeader().MerkleRoot = calcMerkleRoot(b.Transactions)
-	cert, _ := blockchain.SolveBlock(b.BlockHeader(), g.params, g.tipHeight+1)
+	cert, err := blockchain.SolveBlock(b.BlockHeader(), g.tip.BlockHeader(), g.params, g.tipHeight+1)
+	if err != nil {
+		panic(fmt.Sprintf("failed to solve block: %v", err))
+	}
 	b.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: cert}
 }
 
@@ -1406,11 +1409,7 @@ func Generate(includeLargeReorg bool) (tests [][]TestInstance, err error) {
 	b46a := g.nextBlock("b46a", outs[14])
 	{
 		origHash := b46a.BlockHash()
-		// Set a V1 certificate with ProofData exceeding the V1 cap. Sized
-		// against V1 explicitly: CertificateMaxSize is the V1-V3 constant, not
-		// the largest certificate size, so naming the version keeps this case
-		// meaningful as newer versions are added.
-		oversizedProof := make([]byte, wire.MaxCertificateSize(wire.CertificateVersionV1)+1)
+		oversizedProof := make([]byte, wire.CertificateMaxSize+1)
 		b46a.MsgHeader.MsgCertificate = wire.MsgCertificate{
 			Certificate: &wire.CertificateV1{
 				Hash:      b46a.BlockHash(),
@@ -1418,27 +1417,6 @@ func Generate(includeLargeReorg bool) (tests [][]TestInstance, err error) {
 			},
 		}
 		g.updateBlockState("b46a", origHash, "b46a", b46a)
-	}
-	rejected(blockchain.ErrCertificateTooLarge)
-
-	// Create block with a V4 certificate that exceeds the V4 maximum size.
-	// The V4 cap is roughly four times the V1-V3 one, so the case above says
-	// nothing about this code path.
-	//
-	//   ... -> b43(13)
-	//                 \-> b46b(14)
-	g.setTip("b43")
-	b46b := g.nextBlock("b46b", outs[14])
-	{
-		origHash := b46b.BlockHash()
-		oversizedProof := make([]byte, wire.MaxCertificateSize(wire.CertificateVersionV4)+1)
-		b46b.MsgHeader.MsgCertificate = wire.MsgCertificate{
-			Certificate: &wire.CertificateV4{
-				Hash:      b46b.BlockHash(),
-				ProofData: oversizedProof,
-			},
-		}
-		g.updateBlockState("b46b", origHash, "b46b", b46b)
 	}
 	rejected(blockchain.ErrCertificateTooLarge)
 

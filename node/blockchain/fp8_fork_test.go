@@ -115,6 +115,37 @@ func TestFp8ForkBlockTemplateVersion(t *testing.T) {
 		ErrDisallowedCertVersion)
 }
 
+func TestSolveBlockRequiresFp8Fork(t *testing.T) {
+	simNet := fp8SimNetParams()
+	regTest := chaincfg.RegressionNetParams
+	regTest.Fp8ForkHeight = fp8ForkTestHeight
+
+	tests := []struct {
+		name    string
+		params  *chaincfg.Params
+		height  int32
+		wantErr string
+	}{
+		{"simnet before the fork", &simNet, fp8ForkTestHeight - 1, "requires certificate version 3"},
+		{"simnet at the fork", &simNet, fp8ForkTestHeight, ""},
+		{"regtest before the fork", &regTest, fp8ForkTestHeight - 1, "requires certificate version 3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := &wire.BlockHeader{}
+			cert, err := SolveBlock(header, &wire.BlockHeader{}, tt.params, tt.height)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, wire.CertificateVersionV4, cert.Version())
+			require.Equal(t, cert.ProofCommitment(), header.ProofCommitment)
+			require.Equal(t, header.BlockHash(), cert.BlockHash())
+		})
+	}
+}
+
 func TestCheckCertificateRulesV4SkipsRankPenalty(t *testing.T) {
 	params := &chaincfg.Params{
 		MoEForkHeight:         1,

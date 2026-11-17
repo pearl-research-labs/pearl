@@ -17,11 +17,13 @@ import (
 // three intermediate headers separate it from the proposed header.
 const MaxCertificateV4AncestorHeaders = 3
 
-// CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is
-// hash + length-prefixed public data + length-prefixed proof + ancestor count
-// + full ancestor headers. It uses the common certificate and proof-size
-// bounds: each blob is capped at MaxZKProofSize and the whole certificate at
-// CertificateMaxSize.
+// PublicDataMaxSizeV4 is the maximum PublicData size for V4 certificates. Must match PublicParams::MAX_WIRE_SIZE in
+// zk-pow/src/v4/api/public_params.rs.
+const PublicDataMaxSizeV4 = 832
+
+// CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is hash + length-prefixed public data +
+// length-prefixed proof + ancestor count + full ancestor headers. PublicData is capped at PublicDataMaxSizeV4,
+// ProofData at MaxZKProofSize and the whole certificate at CertificateMaxSize.
 type CertificateV4 struct {
 	Hash       chainhash.Hash
 	PublicData []byte
@@ -68,6 +70,12 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
 			len(c.AncestorHeaders), MaxCertificateV4AncestorHeaders)
 	}
+	if err := checkBlobLen("fp8 public_data", len(c.PublicData), PublicDataMaxSizeV4); err != nil {
+		return err
+	}
+	if err := checkBlobLen("fp8 proof_data", len(c.ProofData), MaxZKProofSize); err != nil {
+		return err
+	}
 	if _, err := w.Write(c.Hash[:]); err != nil {
 		return err
 	}
@@ -97,13 +105,13 @@ func (c *CertificateV4) Serialize(w io.Writer) error {
 // readV4Blob reads a bounded blob with a fixed 4-byte little-endian length.
 // ReadVarBytes uses a varint and cannot decode this format.
 // A zero length decodes as nil.
-func readV4Blob(r io.Reader, fieldName string) ([]byte, error) {
+func readV4Blob(r io.Reader, fieldName string, maxLen int) ([]byte, error) {
 	var length uint32
 	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return nil, err
 	}
-	if length > MaxZKProofSize {
-		return nil, fmt.Errorf("fp8 %s_len %d exceeds max %d", fieldName, length, MaxZKProofSize)
+	if err := checkBlobLen("fp8 "+fieldName, length, maxLen); err != nil {
+		return nil, err
 	}
 	if length == 0 {
 		return nil, nil
@@ -119,11 +127,11 @@ func (c *CertificateV4) Deserialize(r io.Reader) error {
 	if _, err := io.ReadFull(r, c.Hash[:]); err != nil {
 		return err
 	}
-	publicData, err := readV4Blob(r, "public_data")
+	publicData, err := readV4Blob(r, "public_data", PublicDataMaxSizeV4)
 	if err != nil {
 		return err
 	}
-	proofData, err := readV4Blob(r, "proof_data")
+	proofData, err := readV4Blob(r, "proof_data", MaxZKProofSize)
 	if err != nil {
 		return err
 	}

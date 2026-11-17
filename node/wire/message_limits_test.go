@@ -22,13 +22,6 @@ var allMessageCommands = []string{
 	CmdWTxIdRelay,
 }
 
-// allCertificateVersions is every certificate version this build can place on
-// the wire. Add new versions here so the size assertions cover them.
-var allCertificateVersions = []CertificateVersion{
-	CertificateVersionV1, CertificateVersionV2, CertificateVersionV3,
-	CertificateVersionV4,
-}
-
 // TestMessageCapsFitProtocolLimit asserts that no message type declares a
 // per-type payload cap larger than the protocol-wide message limit. A type that
 // does is unreadable at its own declared maximum: the read path rejects the
@@ -52,25 +45,19 @@ func TestMessageCapsFitProtocolLimit(t *testing.T) {
 	}
 }
 
-// TestBlockCapHasRoomForEveryCertificateVersion asserts that the BLOCK message
-// cap leaves room for a certificate of any version on top of the consensus
-// transaction payload. Certificates are excluded from block vsize, so that room
-// has to be budgeted explicitly rather than assumed to be inside
-// MaxBlockPayload. A version whose certificate does not fit makes
-// consensus-valid blocks unrelayable.
-func TestBlockCapHasRoomForEveryCertificateVersion(t *testing.T) {
+// TestBlockCapHasRoomForCertificate asserts that the BLOCK message cap leaves room for a maximum-size certificate on
+// top of the consensus transaction payload. Certificates are excluded from block vsize, so that room has to be budgeted
+// explicitly rather than assumed to be inside MaxBlockPayload. A certificate that does not fit makes consensus-valid
+// blocks unrelayable.
+func TestBlockCapHasRoomForCertificate(t *testing.T) {
 	declared := int((&MsgBlock{}).MaxPayloadLength(ProtocolVersion))
 	room := declared - MaxBlockPayload
 
-	for _, version := range allCertificateVersions {
-		needed := MaxCertificateSize(version)
-		if room < needed {
-			t.Errorf("BLOCK declares a %d-byte cap, leaving %d bytes above the "+
-				"%d-byte transaction payload, but a version-%d certificate can "+
-				"be %d bytes; a maximum-size block carrying one would be "+
-				"rejected on receipt", declared, room, MaxBlockPayload, version,
-				needed)
-		}
+	if room < CertificateMaxSize {
+		t.Errorf("BLOCK declares a %d-byte cap, leaving %d bytes above the "+
+			"%d-byte transaction payload, but a certificate can be %d bytes; "+
+			"a maximum-size block carrying one would be rejected on receipt",
+			declared, room, MaxBlockPayload, CertificateMaxSize)
 	}
 }
 
