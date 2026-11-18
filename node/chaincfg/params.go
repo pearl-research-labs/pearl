@@ -700,6 +700,8 @@ var TestNet2Params = Params{
 
 	SaltedSeedForkHeight: 83109,
 
+	Fp8ForkHeight: 150283,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
