@@ -127,7 +127,7 @@ jobs:
             bin_ext: ""
             electron_build_cmd: pnpm -F @pearl/pearl-desktop-wallet run build:linux
           - name: macOS Intel
-            os: macos-15
+            os: macos-15-intel
             goos: darwin
             goarch: amd64
             electron_arch: x64
@@ -191,6 +191,17 @@ jobs:
           mv bin/oyster bin/oyster.exe
           echo "Renamed binaries:"
           ls -lh bin/
+
+      - name: Check Go binary architecture (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          want=$([ "${{ matrix.goarch }}" = "amd64" ] && echo x86_64 || echo arm64)
+          for b in bin/pearld bin/prlctl bin/oyster; do
+            got=$(lipo -archs "$b")
+            echo "$b: $got"
+            [ "$got" = "$want" ] || { echo "::error::$b is $got, expected $want"; exit 1; }
+          done
 
       - name: Package Go binaries (Unix)
         if: matrix.goos != 'windows'
