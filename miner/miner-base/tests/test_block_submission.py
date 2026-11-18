@@ -715,6 +715,52 @@ def test_real_policy_inadmissibility_sentinel_is_filtered():
     client.submit_plain_proof.assert_not_called()
 
 
+def _always_win_plain_job() -> MiningJob:
+    header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
+    return MiningJob(
+        incomplete_header_bytes=bytes(header.to_bytes()),
+        target=(1 << 256) - 1,
+        cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[PARENT_BYTES],
+    )
+
+
+def test_jackpot_rejection_logs_the_check_and_operands():
+    opening = _opening(policy_inadmissible=True)
+    client = Mock()
+    with patch("miner_base.block_submission._LOGGER") as logger:
+        assert submit_opened_block(opening, _always_win_plain_job(), client) is None
+
+    client.submit_plain_proof.assert_not_called()
+    logged = logger.debug.call_args.args[0]
+    assert "liveness (A): fail" in logged
+    assert "dead=" in logged
+    assert "min_sigma=" in logged
+    assert "skippable=unknown" in logged
+    assert "blake3=" in logged
+    assert "base64" not in logged
+
+
+def test_jackpot_rejection_log_caps_and_warns_once():
+    import miner_base.block_submission as submission
+
+    opening = _opening(policy_inadmissible=True)
+    job = _always_win_plain_job()
+    client = Mock()
+    submission._jackpot_logs_emitted = submission._JACKPOT_LOG_LIMIT
+    submission._jackpot_log_cap_warned = False
+    try:
+        with patch("miner_base.block_submission._LOGGER") as logger:
+            assert submit_opened_block(opening, job, client) is None
+            assert submit_opened_block(opening, job, client) is None
+        logger.debug.assert_not_called()
+        logger.warning.assert_called_once()
+        assert "not reset per job" in logger.warning.call_args.args[0]
+    finally:
+        submission._jackpot_logs_emitted = 0
+        submission._jackpot_log_cap_warned = False
+
+
 @patch(
     "miner_base.block_submission.verify_plain_proof_for_cert_version",
     return_value=(False, "commitment mismatch"),
