@@ -151,5 +151,5 @@ func TestVerifyCertificateV4EmptyProof(t *testing.T) {
 	header, cert := loadFP8Fixture(t)
 
 	cert.ProofData = nil
-	require.ErrorContains(t, VerifyCertificate(header, cert), "empty fp8 proof")
+	require.ErrorContains(t, VerifyCertificate(header, cert), "empty proof data")
 }
