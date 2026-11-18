@@ -1,4 +1,5 @@
 pub mod compute;
+pub mod cpu_b;
 pub mod dtype;
 pub mod embedded_cache;
 pub mod jackpot_policy;
