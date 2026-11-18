@@ -16,6 +16,7 @@ from typing import Protocol
 import pearl_mining
 import torch
 from blake3 import blake3
+from miner_utils.logging_config import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_mining import (
     CERT_VERSION_PLAIN_FP8,
@@ -39,12 +40,29 @@ from .commitment import (
     hash_offsets,
     routing_leaf_indices,
 )
+from .jackpot_log import format_report
 from .mining_config import COMMITMENT_CHUNK_SIZE
 from .prequant import DEFAULT_BLOCK_SIZE
 
-# The pearl_mining binding currently exposes only ``(bool, str)``. Keep this
-# exact consensus-policy message narrow until the binding exposes an error code.
+_LOGGER = get_logger(__name__)
+
+# Every cert-v4 policy rejection arrives as this sentence. Which of the
+# checks failed is recovered from the opened tile and written to the debug log.
 _JACKPOT_INADMISSIBLE = "The jackpot is not admissible"
+
+# Detailed rejection logs are capped for the life of the process. The counter
+# is not reset per job: a miner that keeps losing the policy should not fill
+# the log. One warning marks the cap.
+_JACKPOT_LOG_LIMIT = 32
+_jackpot_logs_emitted = 0
+_jackpot_log_cap_warned = False
+
+_PLANE_LABELS = {
+    "codes_a": "A codes",
+    "scales_a": "A scales",
+    "codes_b": "B codes",
+    "scales_b": "B scales",
+}
 
 # Merkle leaf the GPU commit and the CPU proof chain open by default. Aliased
 # here so winner handoff, B-proof rebuild, and ``MiningConfiguration.chunk_size``
@@ -452,6 +470,99 @@ def create_proof(
     )
 
 
+def _commitment_part(opened: OpenedBlockInfo, side: int, index: int):
+    prebuilt = (opened.a_commitment, opened.b_commitment)[side]
+    if prebuilt is None or index >= len(prebuilt.commitment.parts):
+        return None
+    return prebuilt.commitment.parts[index]
+
+
+def _tile_tensor(
+    plane: torch.Tensor | None,
+    rows: Sequence[int],
+    part,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """The opened rows of one plane, from the tensor or its commitment leaves."""
+    if plane is not None:
+        index = torch.as_tensor(list(rows), dtype=torch.int64)
+        return plane.detach().cpu().index_select(0, index).contiguous()
+    if part is None:
+        return None
+    selected = list(rows)
+    width = part.row_nbytes
+    proof = part.open(selected).proof
+    raw = b"".join(bytes(proof.extract_bytes(int(row) * width, width)) for row in selected)
+    return torch.frombuffer(bytearray(raw), dtype=dtype).reshape(len(selected), -1).clone()
+
+
+def _format_plane(tile: torch.Tensor | None) -> str:
+    """Shape, dtype, and a digest. The raw opened bytes are not logged."""
+    if tile is None:
+        return "-"
+    raw = tile.detach().contiguous().view(torch.uint8).numpy().tobytes()
+    dtype = str(tile.dtype).removeprefix("torch.")
+    return f"shape={tuple(tile.shape)} dtype={dtype} blake3={blake3(raw).hexdigest()}"
+
+
+def _opened_tiles(opened: OpenedBlockInfo) -> dict[str, torch.Tensor | None]:
+    """Named planes of the opened tile. Keys match ``format_report``."""
+    return {
+        "codes_a": _tile_tensor(
+            opened.a_codes, opened.a_row_indices, _commitment_part(opened, 0, 0), torch.int8
+        ),
+        "scales_a": _tile_tensor(
+            opened.a_scales,
+            opened.a_row_indices,
+            _commitment_part(opened, 0, 1),
+            torch.bfloat16,
+        ),
+        "codes_b": _tile_tensor(
+            opened.b_codes,
+            opened.b_column_indices,
+            _commitment_part(opened, 1, 0),
+            torch.int8,
+        ),
+        "scales_b": _tile_tensor(
+            opened.b_scales,
+            opened.b_column_indices,
+            _commitment_part(opened, 1, 1),
+            torch.bfloat16,
+        ),
+    }
+
+
+def _log_jackpot_rejection(opened: OpenedBlockInfo, message: str) -> None:
+    """Debug-log every check and a digest of the opened operands. Never raises."""
+    global _jackpot_logs_emitted, _jackpot_log_cap_warned
+    if _jackpot_logs_emitted >= _JACKPOT_LOG_LIMIT:
+        if not _jackpot_log_cap_warned:
+            _jackpot_log_cap_warned = True
+            _LOGGER.warning(
+                f"jackpot rejection log capped at {_JACKPOT_LOG_LIMIT} for this process; "
+                "the counter is not reset per job"
+            )
+        return
+    _jackpot_logs_emitted += 1
+    detail = ""
+    try:
+        tiles = _opened_tiles(opened)
+        detail = " ".join(
+            f"{_PLANE_LABELS[name]} {_format_plane(tile)}" for name, tile in tiles.items()
+        )
+        if any(tile is None for tile in tiles.values()):
+            raise ValueError("opened tile is incomplete")
+        report = format_report(
+            **tiles,
+            device=opened.mining_config.device,
+            rank=opened.mining_config.rank,
+        )
+    except Exception as exc:
+        _LOGGER.opt(exception=exc).debug(f"jackpot policy rejected ({message}): {detail}")
+        return
+    _LOGGER.debug(f"{report}\n  {detail}")
+
+
 def submit_opened_block(
     opened_block_info: OpenedBlockInfo,
     mining_job: MiningJob,
@@ -481,7 +592,8 @@ def submit_opened_block(
         mining_job.cert_version, header, plain_proof
     )
     if not is_valid:
-        if message == _JACKPOT_INADMISSIBLE:
+        if message.startswith(_JACKPOT_INADMISSIBLE):
+            _log_jackpot_rejection(opened_block_info, message)
             return None
         raise RuntimeError(f"Plain proof verification failed: {message}")
 

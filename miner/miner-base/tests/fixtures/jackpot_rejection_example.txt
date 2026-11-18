@@ -1,0 +1,8 @@
+jackpot policy rejected (liveness (A))
+  liveness (A): fail dead=128 limit=64
+  liveness (B): pass dead=0 limit=64
+  noise floor (A): pass min_sigma=26.191406 floor=2 failing_rows=0
+  noise floor (B): pass min_sigma=58.5 floor=4 failing_rows=0
+  unpredictable summands: unevaluated skippable=unknown budget=409
+  noise coverage (A): pass min_product=853993848832 threshold=351843720889 failing_rows=0
+  noise coverage (B): fail min_product=118883909632 threshold=351843720889 failing_rows=2
