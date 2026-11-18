@@ -619,12 +619,13 @@ func (s *utxoCache) shouldFlush(mode FlushMode, bestState *BestState) bool {
 	return s.totalMemoryUsage() >= threshold
 }
 
-// flush flushes the UTXO state to the database if a flush is needed with the given flush mode.
+// flush flushes the UTXO state to the database if a flush is needed with the given flush mode,
+// and reports whether it did.
 //
 // This function MUST be called with the chain state lock held (for writes).
-func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState) error {
+func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState) (bool, error) {
 	if !s.shouldFlush(mode, bestState) {
-		return nil
+		return false, nil
 	}
 
 	var eraseCache bool
@@ -637,7 +638,33 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 	log.Infof("Flushing UTXO cache of %d MiB with %d entries to disk. For large sizes, "+
 		"this can take up to several minutes...", totalMiB, s.cachedEntries.length())
 
-	return s.writeCache(dbTx, bestState, eraseCache)
+	return true, s.writeCache(dbTx, bestState, eraseCache)
+}
+
+// flushUtxoCache is utxoCache.flush plus its timing and the resulting occupancy for Metrics.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) flushUtxoCache(dbTx database.Tx, mode FlushMode, bestState *BestState) error {
+	start := time.Now()
+	flushed, err := b.utxoCache.flush(dbTx, mode, bestState)
+	if err != nil {
+		return err
+	}
+	if flushed {
+		b.metrics.UtxoCacheFlushed(time.Since(start))
+	}
+	b.reportUtxoCache()
+
+	return nil
+}
+
+// reportUtxoCache pushes the UTXO cache occupancy to Metrics. Readers cannot pull it on demand
+// without taking the chain lock, which a flush can hold for minutes.
+//
+// This function MUST be called with the chain state lock held, or before the chain is shared.
+func (b *BlockChain) reportUtxoCache() {
+	b.metrics.UtxoCacheChanged(b.utxoCache.cachedEntries.length(), b.utxoCache.totalMemoryUsage(),
+		b.utxoCache.maxTotalMemoryUsage)
 }
 
 // FlushUtxoCache flushes the UTXO state to the database if a flush is needed with the
@@ -656,7 +683,7 @@ func (b *BlockChain) FlushUtxoCache(mode FlushMode) error {
 	}
 
 	return b.db.Update(func(dbTx database.Tx) error {
-		return b.utxoCache.flush(dbTx, mode, b.BestSnapshot())
+		return b.flushUtxoCache(dbTx, mode, b.BestSnapshot())
 	})
 }
 
@@ -767,7 +794,7 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 		// Fast-path: skip db.Update if no flush is needed.
 		if s.shouldFlush(FlushIfNeeded, bestState) {
 			err = s.db.Update(func(dbTx database.Tx) error {
-				return s.flush(dbTx, FlushIfNeeded, bestState)
+				return b.flushUtxoCache(dbTx, FlushIfNeeded, bestState)
 			})
 			if err != nil {
 				return err

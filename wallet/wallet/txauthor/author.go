@@ -288,7 +288,7 @@ func spendTaprootKey(txIn *wire.TxIn, pkScript []byte,
 		return err
 	}
 
-	txIn.Witness = witnessScript
+	txIn.SetWitness(witnessScript)
 
 	return nil
 }
@@ -346,7 +346,7 @@ func spendMerkleRoot(txIn *wire.TxIn, pkScript []byte,
 		return err
 	}
 
-	txIn.Witness = wire.TxWitness{sig, redeemScript, cbBytes}
+	txIn.SetWitness(wire.TxWitness{sig, redeemScript, cbBytes})
 
 	return nil
 }

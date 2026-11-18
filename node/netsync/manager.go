@@ -17,8 +17,10 @@ import (
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/mempool"
+	"github.com/pearl-research-labs/pearl/node/metrics"
 	peerpkg "github.com/pearl-research-labs/pearl/node/peer"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -59,6 +61,16 @@ const (
 	// lowQualityStrikeLimit is the strike count at which a peer is
 	// downgraded back to low-quality (see nonTipStrikes).
 	lowQualityStrikeLimit = 5
+
+	// lowQualityFetchRate (per second) and lowQualityFetchBurst bound,
+	// across all peers, how many blocks are fetched on a low-quality
+	// peer's headers. A certificate's claimed jackpot costs nothing to
+	// fake, yet every fetched block pays a full proof verification under
+	// the chain lock, and an attacker can open as many low-quality
+	// connections as it has addresses. Honest blocks arrive minutes
+	// apart, and high-quality peers are not limited.
+	lowQualityFetchRate  = rate.Limit(0.5)
+	lowQualityFetchBurst = 8
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -80,8 +92,9 @@ type blockMsg struct {
 // invMsg packages an inv message and the peer it came from together
 // so the block handler has access to that information.
 type invMsg struct {
-	inv  *wire.MsgInv
-	peer *peerpkg.Peer
+	inv   *wire.MsgInv
+	peer  *peerpkg.Peer
+	reply chan struct{}
 }
 
 // headersMsg packages a headers message and the peer it came from
@@ -89,6 +102,7 @@ type invMsg struct {
 type headersMsg struct {
 	headers *wire.MsgHeaders
 	peer    *peerpkg.Peer
+	reply   chan struct{}
 }
 
 // notFoundMsg packages a notfound message and the peer it came from
@@ -96,6 +110,9 @@ type headersMsg struct {
 type notFoundMsg struct {
 	notFound *wire.MsgNotFound
 	peer     *peerpkg.Peer
+
+	// reply receives the number of transaction entries that answered a request we sent the peer.
+	reply chan uint32
 }
 
 // donePeerMsg signifies a newly disconnected peer to the block handler.
@@ -271,6 +288,10 @@ type SyncManager struct {
 	// pickSyncCandidate skips entries within syncPeerCooldown and
 	// lazy-evicts expired ones.
 	recentlyFailedSync map[string]time.Time
+
+	// lowQualityFetches is the node-wide budget of blocks fetched on a
+	// low-quality peer's headers.
+	lowQualityFetches *rate.Limiter
 }
 
 // resetHeaderState sets the headers-first mode state to values appropriate for
@@ -763,6 +784,7 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 
 	// Process the transaction to include validation, insertion in the
 	// memory pool, orphan handling, etc.
+	start := time.Now()
 	acceptedTxs, err := sm.txMemPool.ProcessTransaction(tmsg.tx,
 		true, true, mempool.Tag(peer.ID()))
 
@@ -793,8 +815,12 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 		// Convert the error into an appropriate reject message and
 		// send it.
 		code, reason := mempool.ErrToRejectErr(err)
+		metrics.RecordTxRejected(code)
 		peer.PushRejectMsg(wire.CmdTx, code, reason, txHash, false)
 		return
+	}
+	if len(acceptedTxs) > 0 {
+		metrics.RecordTxProcessed(time.Since(start))
 	}
 
 	sm.peerNotifier.AnnounceNewTransactions(acceptedTxs)
@@ -900,7 +926,9 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 
 	// Process the block to include validation, best chain selection, orphan
 	// handling, etc.
+	start := time.Now()
 	isMainChain, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, behaviorFlags)
+	recordBlockResult(start, isOrphan, err)
 
 	// Strike accounting: a single decision point based on ProcessBlock's
 	// result rather than re-deriving it from chain state.
@@ -1152,13 +1180,30 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 
 		gdmsg := wire.NewMsgGetData()
+		prev := root
 		for _, h := range msg.Headers {
+			// Every header must build on the one before it. Otherwise we fetch unconnected blocks.
+			// Requests already tracked for this batch are released when the peer is gone.
+			if !h.BlockHeader.PrevBlock.IsEqual(&prev) {
+				log.Warnf("Peer %s sent headers that do not connect outside headersFirst mode -- disconnecting",
+					peer.Addr())
+				peer.Disconnect()
+
+				return
+			}
+
 			hash := h.BlockHeader.BlockHash()
+			prev = hash
 			if _, requested := sm.requestedBlocks[hash]; requested {
 				continue
 			}
 			if have, err := sm.chain.HaveBlock(&hash); err != nil || have {
 				continue
+			}
+			if !isPeerHighQuality(state) && !sm.lowQualityFetches.Allow() {
+				log.Debugf("Not fetching block %v announced by low-quality peer %s: fetch budget spent", hash, peer)
+
+				break
 			}
 			if !sm.trackBlockRequest(state, hash) {
 				continue
@@ -1301,14 +1346,17 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	}
 }
 
-// handleNotFoundMsg handles notfound messages from all peers.
-func (sm *SyncManager) handleNotFoundMsg(nfmsg *notFoundMsg) {
+// handleNotFoundMsg handles notfound messages from all peers. It returns how many transaction entries settled a
+// request we had outstanding with the peer. A hash settles at most one request, so repeating it does not count.
+func (sm *SyncManager) handleNotFoundMsg(nfmsg *notFoundMsg) uint32 {
 	peer := nfmsg.peer
 	state, exists := sm.peerStates[peer]
 	if !exists {
 		log.Warnf("Received notfound message from unknown peer %s", peer)
-		return
+		return 0
 	}
+
+	var requestedTxns uint32
 	for _, inv := range nfmsg.notFound.InvList {
 		// verify the hash was actually announced by the peer
 		// before deleting from the global requested maps.
@@ -1328,9 +1376,12 @@ func (sm *SyncManager) handleNotFoundMsg(nfmsg *notFoundMsg) {
 			if _, exists := state.requestedTxns[inv.Hash]; exists {
 				delete(state.requestedTxns, inv.Hash)
 				delete(sm.requestedTxns, inv.Hash)
+				requestedTxns++
 			}
 		}
 	}
+
+	return requestedTxns
 }
 
 // haveInventory returns whether or not the inventory represented by the passed
@@ -1603,12 +1654,14 @@ func (sm *SyncManager) processMessage(m interface{}) {
 
 	case *invMsg:
 		sm.handleInvMsg(msg)
+		msg.reply <- struct{}{}
 
 	case *headersMsg:
 		sm.handleHeadersMsg(msg)
+		msg.reply <- struct{}{}
 
 	case *notFoundMsg:
-		sm.handleNotFoundMsg(msg)
+		msg.reply <- sm.handleNotFoundMsg(msg)
 
 	case *donePeerMsg:
 		sm.handleDonePeerMsg(msg.peer)
@@ -1621,8 +1674,10 @@ func (sm *SyncManager) processMessage(m interface{}) {
 		msg.reply <- peerID
 
 	case processBlockMsg:
+		start := time.Now()
 		_, isOrphan, err := sm.chain.ProcessBlock(
 			msg.block, msg.flags)
+		recordBlockResult(start, isOrphan, err)
 		msg.reply <- processBlockResponse{
 			isOrphan: isOrphan,
 			err:      err,
@@ -1847,38 +1902,41 @@ func (sm *SyncManager) QueueBlock(block *btcutil.Block, peer *peerpkg.Peer, done
 }
 
 // QueueInv adds the passed inv message and peer to the block handling queue.
-func (sm *SyncManager) QueueInv(inv *wire.MsgInv, peer *peerpkg.Peer) {
-	// No channel handling here because peers do not need to block on inv
-	// messages.
+// Responds to the done channel argument after the inv message is processed.
+func (sm *SyncManager) QueueInv(inv *wire.MsgInv, peer *peerpkg.Peer, done chan struct{}) {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
+		done <- struct{}{}
+
 		return
 	}
 
-	sm.msgChan <- &invMsg{inv: inv, peer: peer}
+	sm.msgChan <- &invMsg{inv: inv, peer: peer, reply: done}
 }
 
 // QueueHeaders adds the passed headers message and peer to the block handling
-// queue.
-func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer) {
-	// No channel handling here because peers do not need to block on
-	// headers messages.
+// queue. Responds to the done channel argument after the headers message is
+// processed.
+func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer, done chan struct{}) {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
+		done <- struct{}{}
+
 		return
 	}
 
-	sm.msgChan <- &headersMsg{headers: headers, peer: peer}
+	sm.msgChan <- &headersMsg{headers: headers, peer: peer, reply: done}
 }
 
-// QueueNotFound adds the passed notfound message and peer to the block handling
-// queue.
-func (sm *SyncManager) QueueNotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) {
-	// No channel handling here because peers do not need to block on
-	// reject messages.
+// HandleNotFound queues the passed notfound message from peer to the sync manager and waits until it is processed.
+// It returns how many transaction entries answered a request we had outstanding with the peer.
+func (sm *SyncManager) HandleNotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) uint32 {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
-		return
+		return 0
 	}
 
-	sm.msgChan <- &notFoundMsg{notFound: notFound, peer: peer}
+	reply := make(chan uint32, 1)
+	sm.msgChan <- &notFoundMsg{notFound: notFound, peer: peer, reply: reply}
+
+	return <-reply
 }
 
 // DonePeer informs the blockmanager that a peer has disconnected.
@@ -1923,6 +1981,29 @@ func (sm *SyncManager) SyncPeerID() int32 {
 	reply := make(chan int32)
 	sm.msgChan <- getSyncPeerMsg{reply: reply}
 	return <-reply
+}
+
+// recordBlockResult times accepted blocks and counts rejected ones; orphans are neither.
+func recordBlockResult(start time.Time, isOrphan bool, err error) {
+	if err != nil {
+		if reason, ok := blockRejectReason(err); ok {
+			metrics.RecordBlockRejected(reason)
+		}
+	} else if !isOrphan {
+		metrics.RecordBlockProcessed(time.Since(start))
+	}
+}
+
+// blockRejectReason labels err by rule code. Duplicates are skipped: peers re-announce blocks routinely.
+func blockRejectReason(err error) (string, bool) {
+	ruleErr, ok := err.(blockchain.RuleError)
+	if !ok {
+		return "other", true
+	}
+	if ruleErr.ErrorCode == blockchain.ErrDuplicateBlock {
+		return "", false
+	}
+	return ruleErr.ErrorCode.String(), true
 }
 
 // ProcessBlock makes use of ProcessBlock on an internal instance of a block
@@ -1970,6 +2051,7 @@ func New(config *Config) (*SyncManager, error) {
 		quit:               make(chan struct{}),
 		feeEstimator:       config.FeeEstimator,
 		recentlyFailedSync: make(map[string]time.Time),
+		lowQualityFetches:  rate.NewLimiter(lowQualityFetchRate, lowQualityFetchBurst),
 	}
 
 	best := sm.chain.BestSnapshot()

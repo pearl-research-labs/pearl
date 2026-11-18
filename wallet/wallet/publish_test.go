@@ -322,7 +322,7 @@ func TestSPVSendRetainsPayment(t *testing.T) {
 			require.NotNil(t, published)
 			assert.Equal(t, published.TxHash(), tx.TxHash())
 			assert.Equal(t, funding, tx.TxIn[0].PreviousOutPoint)
-			assert.NotEmpty(t, tx.TxIn[0].Witness)
+			assert.NotEmpty(t, tx.TxIn[0].DecodeWitness())
 
 			unmined, unspent := walletTxState(t, w)
 			require.Len(t, unmined, 1)
@@ -508,7 +508,7 @@ func TestSPVNotificationBeforeRelayResult(t *testing.T) {
 	require.Len(t, notification.UnminedTransactions, 1)
 	var exposed wire.MsgTx
 	require.NoError(t, exposed.Deserialize(bytes.NewReader(notification.UnminedTransactions[0].Transaction)))
-	require.NotEmpty(t, exposed.TxIn[0].Witness, "a subscriber already has signed bytes it can relay")
+	require.NotEmpty(t, exposed.TxIn[0].DecodeWitness(), "a subscriber already has signed bytes it can relay")
 	require.NoError(t, <-result)
 	unmined, unspent := walletTxState(t, w)
 	require.Len(t, unmined, 1)

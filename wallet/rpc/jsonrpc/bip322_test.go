@@ -181,6 +181,12 @@ func TestBIP322WitnessStackParsing(t *testing.T) {
 			expectErr: false,
 			expected:  1,
 		},
+		{
+			// 1004 (wire.MaxWitnessItemsPerInput + 1) empty items.
+			name:      "too_many_items",
+			data:      append([]byte{0xfd, 0xec, 0x03}, make([]byte, 1004)...),
+			expectErr: true,
+		},
 	}
 
 	for _, tt := range tests {

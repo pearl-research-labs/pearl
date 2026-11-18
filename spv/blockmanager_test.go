@@ -23,6 +23,7 @@ import (
 	"github.com/pearl-research-labs/pearl/spv/banman"
 	"github.com/pearl-research-labs/pearl/spv/blockntfns"
 	"github.com/pearl-research-labs/pearl/spv/headerfs"
+	"github.com/pearl-research-labs/pearl/spv/headerlist"
 	"github.com/pearl-research-labs/pearl/spv/query"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
 	"github.com/stretchr/testify/require"
@@ -1326,4 +1327,134 @@ func TestHandleHeadersBansPeerOnInvalidSanity(t *testing.T) {
 			require.Zero(t, banCalls)
 		})
 	}
+}
+
+func simnetHeader(prev *wire.BlockHeader, timestamp time.Time) wire.MsgHeader {
+	return wire.MsgHeader{
+		BlockHeader: wire.BlockHeader{
+			PrevBlock: prev.BlockHash(),
+			Timestamp: timestamp,
+			Bits:      chaincfg.SimNetParams.PowLimitBits,
+		},
+		MsgCertificate: wire.MsgCertificate{Certificate: &wire.CertificateV3{}},
+	}
+}
+
+// simnetChain's timestamps are recent so that a block manager holding the chain counts as synced.
+func simnetChain(n int) []wire.MsgHeader {
+	chain := make([]wire.MsgHeader, n)
+	prev := chaincfg.SimNetParams.GenesisBlock.BlockHeader()
+	start := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for i := range chain {
+		chain[i] = simnetHeader(prev, start.Add(time.Duration(i)*time.Second))
+		prev = &chain[i].BlockHeader
+	}
+
+	return chain
+}
+
+func handleHeaders(t *testing.T, bm *blockManager, sp *ServerPeer, headers []wire.MsgHeader) {
+	t.Helper()
+
+	bm.handleHeadersMsg(&headersMsg{headers: &wire.MsgHeaders{Headers: headers}, peer: sp})
+	require.False(t, peerDisconnected(sp.Peer))
+}
+
+func requireHeaderTip(t *testing.T, bm *blockManager, store headerfs.BlockHeaderStore, height uint32,
+	hash chainhash.Hash) {
+
+	t.Helper()
+
+	storeTip, storeHeight, err := store.ChainTip()
+	require.NoError(t, err)
+	require.Equal(t, height, storeHeight)
+	require.Equal(t, hash, storeTip.BlockHash())
+
+	bm.newHeadersMtx.RLock()
+	defer bm.newHeadersMtx.RUnlock()
+	require.Equal(t, height, bm.headerTip)
+	require.Equal(t, hash, bm.headerTipHash)
+}
+
+// TestHandleHeadersKnownBatchKeepsTip guards the invariant cfHandler relies on: a headers message with nothing new
+// must not republish the header tip, or its wait-at-tip loop spins on a hash that never matches.
+func TestHandleHeadersKnownBatchKeepsTip(t *testing.T) {
+	t.Parallel()
+
+	bm, hdrStore, _, err := setupBlockManager(t)
+	require.NoError(t, err)
+
+	fakePeer, err := peer.NewOutboundPeer(&peer.Config{}, "fake:123")
+	require.NoError(t, err)
+	sp := &ServerPeer{Peer: fakePeer}
+
+	const chainLen = 4
+	chain := simnetChain(chainLen)
+	tipHash := chain[chainLen-1].BlockHeader.BlockHash()
+
+	handleHeaders(t, bm, sp, chain)
+	requireHeaderTip(t, bm, hdrStore, chainLen, tipHash)
+	require.True(t, bm.BlockHeadersSynced())
+
+	handleHeaders(t, bm, sp, chain[:chainLen-1])
+	requireHeaderTip(t, bm, hdrStore, chainLen, tipHash)
+}
+
+// TestHandleHeadersLoneForkHeaderPublishesTip covers a reorg whose only new header is the fork header, so no later
+// header in the message connects and sets the tip height.
+func TestHandleHeadersLoneForkHeaderPublishesTip(t *testing.T) {
+	t.Parallel()
+
+	bm, hdrStore, _, err := setupBlockManager(t)
+	require.NoError(t, err)
+
+	// The reorg disconnects a block and nothing reads the notification.
+	close(bm.quit)
+
+	fakePeer, err := peer.NewOutboundPeer(&peer.Config{}, "fake:123")
+	require.NoError(t, err)
+	sp := &ServerPeer{Peer: fakePeer}
+
+	chain := simnetChain(2)
+	handleHeaders(t, bm, sp, chain)
+
+	// A tip with negligible work lets a single competing header win the work comparison.
+	parent := &chain[1].BlockHeader
+	weakTip := simnetHeader(parent, parent.Timestamp.Add(time.Second)).BlockHeader
+	weakTip.Bits = 0x207fffff
+	require.NoError(t, hdrStore.WriteHeaders(headerfs.BlockHeader{BlockHeader: &weakTip, Height: 3}))
+	bm.headerList.PushBack(headerlist.Node{Header: weakTip, Height: 3})
+
+	fork := simnetHeader(parent, parent.Timestamp.Add(2*time.Second))
+	handleHeaders(t, bm, sp, []wire.MsgHeader{fork})
+	requireHeaderTip(t, bm, hdrStore, 3, fork.BlockHeader.BlockHash())
+}
+
+// TestHandleHeadersSanityFailureKeepsStoreInSync: a message whose valid headers are followed by an
+// invalid one must not leave headerList ahead of the store, or the next valid batch is written at the wrong heights.
+func TestHandleHeadersSanityFailureKeepsStoreInSync(t *testing.T) {
+	t.Parallel()
+
+	bm, hdrStore, _, err := setupBlockManager(t)
+	require.NoError(t, err)
+
+	honestPeer, err := peer.NewOutboundPeer(&peer.Config{}, "honest:123")
+	require.NoError(t, err)
+	honest := &ServerPeer{Peer: honestPeer}
+
+	chain := simnetChain(4)
+	handleHeaders(t, bm, honest, chain[:2])
+
+	attackerPeer, err := peer.NewOutboundPeer(&peer.Config{}, "attacker:123")
+	require.NoError(t, err)
+	invalid := chain[3]
+	invalid.BlockHeader.Bits = 0
+	bm.handleHeadersMsg(&headersMsg{
+		headers: &wire.MsgHeaders{Headers: []wire.MsgHeader{chain[2], invalid}},
+		peer:    &ServerPeer{Peer: attackerPeer},
+	})
+	require.True(t, peerDisconnected(attackerPeer))
+
+	handleHeaders(t, bm, honest, chain[2:])
+	requireHeaderTip(t, bm, hdrStore, 4, chain[3].BlockHeader.BlockHash())
 }

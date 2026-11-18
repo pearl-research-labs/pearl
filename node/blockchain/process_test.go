@@ -6,6 +6,7 @@ package blockchain
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -142,4 +143,65 @@ func TestProcessBlock_CheckpointDifficulty(t *testing.T) {
 	assert.Equal(t, ErrForkTooOld, subErr.ErrorCode,
 		"sub-checkpoint fork should be rejected with ErrForkTooOld, "+
 			"got %v", subErr.ErrorCode)
+}
+
+// TestProcessOrphansFastAddParent stages an overpaying child and a valid sibling as orphans, then processes their
+// parent with every flag set, BFFastAdd included.  No flag may reach the orphans: the bad child must be fully validated
+// and rejected without failing the parent, and the sibling must still connect.
+func TestProcessOrphansFastAddParent(t *testing.T) {
+	chain, teardown, err := chainSetup(t.Name(), &chaincfg.SimNetParams)
+	require.NoError(t, err)
+	defer teardown()
+
+	genesis := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	genesis.SetHeight(0)
+	parent, _, err := newBlock(chain, genesis, nil)
+	require.NoError(t, err)
+	good, _, err := newBlock(chain, parent, nil)
+	require.NoError(t, err)
+	bad, _, err := newBlock(chain, parent, nil)
+	require.NoError(t, err)
+	msg := bad.MsgBlock()
+	msg.Transactions[0].TxOut[0].Value++
+	msg.MsgHeader.BlockHeader.MerkleRoot = calcMerkleRoot(msg.Transactions)
+	bad = btcutil.NewBlock(msg)
+
+	for _, orphan := range []*btcutil.Block{bad, good} {
+		_, isOrphan, err := chain.ProcessBlock(orphan, BFNone)
+		require.NoError(t, err)
+		require.True(t, isOrphan)
+	}
+	isMainChain, _, err := chain.ProcessBlock(parent, BehaviorFlags(math.MaxUint32))
+	require.NoError(t, err)
+	require.True(t, isMainChain)
+	require.Equal(t, *good.Hash(), chain.BestSnapshot().Hash)
+}
+
+// TestCheckConnectBlockScriptsBelowCheckpoint connects a block below the latest checkpoint without BFFastAdd.  Nothing
+// proved it against the checkpoint, so its bad signature must still be rejected.
+func TestCheckConnectBlockScriptsBelowCheckpoint(t *testing.T) {
+	chain, funding := inputOrderTestChain(t)
+	chain.checkpoints = []chaincfg.Checkpoint{{Height: 100, Hash: &chainhash.Hash{0x01}}}
+
+	spend := testhelper.MakeSpendableOut(funding.MsgBlock(), 0, 0)
+	tx := testhelper.CreateSpendTx(&spend, testhelper.LowFee)
+
+	// decode->modify->set witness
+	witness := tx.TxIn[0].DecodeWitness()
+	sig := append([]byte(nil), witness[0]...)
+	sig[0] ^= 0xff
+	witness[0] = sig
+	tx.TxIn[0].SetWitness(witness)
+
+	block, _, err := newBlock(chain, funding, nil)
+	require.NoError(t, err)
+	msg := block.MsgBlock()
+	msg.Transactions = append(msg.Transactions, tx)
+	addTestWitnessCommitment([]*btcutil.Tx{btcutil.NewTx(msg.Transactions[0]), btcutil.NewTx(tx)})
+	msg.MsgHeader.BlockHeader.MerkleRoot = calcMerkleRoot(msg.Transactions)
+
+	_, _, err = chain.ProcessBlock(btcutil.NewBlock(msg), BFNone)
+	var ruleErr RuleError
+	require.ErrorAs(t, err, &ruleErr)
+	require.Equal(t, ErrScriptValidation, ruleErr.ErrorCode)
 }

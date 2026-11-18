@@ -2,6 +2,7 @@ package v2transport
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"io"
 	"runtime"
@@ -199,6 +200,9 @@ func TestPacketEncodingVectors(t *testing.T) {
 			outCiphertext:         "",
 			outCiphertextEndsWith: "e0ad2a576d06dfb1b994c43e31fa7eb65c0ea8fd930a241748990e78538e74d6",
 		},
+		// BIP324's vector repeats inContents 69,615 times, a 16,777,215-byte packet, which is longer than maxContentLen.
+		// Here it repeats 33,195 times (7,999,995 bytes), and outCiphertextEndsWith was regenerated for that size with
+		// code that matched the official vector (...a9139d5e...5ba7). Every other field is unchanged from BIP324.
 		{
 			inIdx:                 1024,
 			inPrivOurs:            "f90e080c64b05824c5a24b2501d5aeaf08af3872ee860aa80bdcd430f7b63494",
@@ -206,7 +210,7 @@ func TestPacketEncodingVectors(t *testing.T) {
 			inEllswiftTheirs:      "12a50f3fafea7c1eeada4cf8d33777704b77361453afc83bda91eef349ae044d20126c6200547ea5a6911776c05dee2a7f1a9ba7dfbabbbd273c3ef29ef46e46",
 			inInitiating:          true,
 			inContents:            "5f67d15d22ca9b2804eeab0a66f7f8e3a10fa5de5809a046084348cbc5304e843ef96f59a59c7d7fdfe5946489f3ea297d941bac326225df316a25fc90f0e65b0d31a9c497e960fdbf8c482516bc8a9c1c77b7f6d0e1143810c737f76f9224e6f2c9af5186b4f7259c7e8d165b6e4fe3d38a60bdbdd4d06ecdcaaf62086070dbb68686b802d53dfd7db14b18743832605f5461ad81e2af4b7e8ff0eff0867a25b93cec7becf15c43131895fed09a83bf1ee4a87d44dd0f02a837bf5a1232e201cb882734eb9643dc2dc4d4e8b5690840766212c7ac8f38ad8a9ec47c7a9b3e022ae3eb6a32522128b518bd0d0085dd81c5",
-			inMultiply:            69615,
+			inMultiply:            33195,
 			inAad:                 "",
 			inIgnore:              true,
 			midXOurs:              "8b8de966150bf872b4b695c9983df519c909811954d5d76e99ed0d5f1860247b",
@@ -221,7 +225,7 @@ func TestPacketEncodingVectors(t *testing.T) {
 			midRecvGarbageTerm:    "84ec180cc1cd3c71ac9404ea1cf1fab8",
 			outSessionID:          "2d88d5c4764f1915ae9c46925aa74ca67578a37c37930853bc45a97a84c34531",
 			outCiphertext:         "",
-			outCiphertextEndsWith: "a9139d5e7a34bf0d95dd32e64e2cc42a38cd563186d88b5d022c2a7e73ed5ba7",
+			outCiphertextEndsWith: "82b341c28d3ce15b2c934d971b1273d10a891e83143bf3845b30303051fb053e",
 		},
 	}
 
@@ -495,7 +499,8 @@ func TestPacketEncodingVectors(t *testing.T) {
 		if len(test.outCiphertextEndsWith) != 0 {
 			ciphertextHex := hex.EncodeToString(ciphertext)
 			if !strings.HasSuffix(ciphertextHex, test.outCiphertextEndsWith) {
-				t.Fatalf("suffix mismatch")
+				t.Fatalf("vector %d: ciphertext suffix mismatch: got ...%s, want ...%s", test.inIdx,
+					ciphertextHex[max(0, len(ciphertextHex)-len(test.outCiphertextEndsWith)):], test.outCiphertextEndsWith)
 			}
 		}
 	}
@@ -721,7 +726,7 @@ func TestCompleteHandshakeGarbageTerminatorPrefixDecoy(t *testing.T) {
 
 // TestV2ReceivePacketAllocatesAsBytesArrive pins that the receive buffer follows the bytes that actually arrive
 // rather than the decrypted length field. A peer could otherwise claim a maxContentLen packet, send a few bytes and
-// stall, committing us to 16 MiB per connection for three bytes on the wire. Not parallel: it measures TotalAlloc.
+// stall, committing us to about 8 MB per connection for three bytes on the wire. Not parallel: it measures TotalAlloc.
 func TestV2ReceivePacketAllocatesAsBytesArrive(t *testing.T) {
 	sender, receiver := NewPeer(), NewPeer()
 
@@ -751,7 +756,9 @@ func TestV2ReceivePacketAllocatesAsBytesArrive(t *testing.T) {
 	require.Equal(t, contents, got)
 
 	// A packet claiming maxContentLen that stalls after 1000 bytes allocates for what arrived only.
-	encLen, err := sender.sendL.Crypt([]byte{0xff, 0xff, 0xff})
+	var lenLE [4]byte
+	binary.LittleEndian.PutUint32(lenLE[:], maxContentLen)
+	encLen, err := sender.sendL.Crypt(lenLE[:lengthFieldLen])
 	require.NoError(t, err)
 	stream.Write(encLen)
 	stream.Write(make([]byte, 1000))
@@ -763,4 +770,109 @@ func TestV2ReceivePacketAllocatesAsBytesArrive(t *testing.T) {
 
 	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(1<<20))
 	require.ErrorIs(t, err, io.EOF)
+}
+
+// newConnectedPeers returns a sender and receiver that share keys and read and write one in-memory stream.
+func newConnectedPeers(t *testing.T) (*Peer, *Peer, *bytes.Buffer) {
+	t.Helper()
+
+	sender, receiver := NewPeer(), NewPeer()
+
+	var err error
+	sender.privkeyOurs, sender.ellswiftOurs, err = ellswift.EllswiftCreate()
+	require.NoError(t, err)
+
+	receiver.privkeyOurs, receiver.ellswiftOurs, err = ellswift.EllswiftCreate()
+	require.NoError(t, err)
+
+	require.NoError(t, sender.deriveV2Ciphers(receiver.ellswiftOurs, true, mainNet))
+	require.NoError(t, receiver.deriveV2Ciphers(sender.ellswiftOurs, false, mainNet))
+
+	stream := bytes.NewBuffer(nil)
+	sender.UseReadWriter(stream)
+	receiver.UseReadWriter(stream)
+
+	return sender, receiver, stream
+}
+
+// TestV2ReceivePacketMaxContentLen checks that V2ReceivePacket accepts packets up to maxContentLen, decoys included,
+// and rejects a longer one from its length field alone, before reading the body. The ignore bit sits in the encrypted
+// body, so the length check cannot tell a decoy from a real packet. It also checks V2EncPacket refuses to send one.
+func TestV2ReceivePacketMaxContentLen(t *testing.T) {
+	t.Parallel()
+
+	t.Run("packet at the limit is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		sender, receiver, _ := newConnectedPeers(t)
+
+		contents := bytes.Repeat([]byte{0x5a}, maxContentLen)
+		_, _, err := sender.V2EncPacket(contents, nil, false)
+		require.NoError(t, err)
+
+		got, err := receiver.V2ReceivePacket(nil)
+		require.NoError(t, err)
+		require.Equal(t, contents, got)
+	})
+
+	t.Run("decoy at the limit is skipped", func(t *testing.T) {
+		t.Parallel()
+
+		sender, receiver, _ := newConnectedPeers(t)
+
+		_, _, err := sender.V2EncPacket(make([]byte, maxContentLen), nil, true)
+		require.NoError(t, err)
+		_, _, err = sender.V2EncPacket([]byte{0x01}, nil, false)
+		require.NoError(t, err)
+
+		got, err := receiver.V2ReceivePacket(nil)
+		require.NoError(t, err)
+		require.Equal(t, []byte{0x01}, got)
+	})
+
+	t.Run("length above the limit is rejected before the body", func(t *testing.T) {
+		t.Parallel()
+
+		sender, receiver, stream := newConnectedPeers(t)
+
+		// Only the encrypted length field is sent. Reading the body would fail with io.EOF instead.
+		var lenLE [4]byte
+		binary.LittleEndian.PutUint32(lenLE[:], maxContentLen+1)
+		encLen, err := sender.sendL.Crypt(lenLE[:lengthFieldLen])
+		require.NoError(t, err)
+		stream.Write(encLen)
+
+		_, err = receiver.V2ReceivePacket(nil)
+		require.ErrorIs(t, err, errContentLengthExceeded)
+	})
+
+	t.Run("sending above the limit fails", func(t *testing.T) {
+		t.Parallel()
+
+		sender, _, _ := newConnectedPeers(t)
+
+		_, _, err := sender.V2EncPacket(make([]byte, maxContentLen+1), nil, false)
+		require.ErrorIs(t, err, errContentLengthExceeded)
+	})
+}
+
+// TestDecryptInPlace checks that DecryptInPlace writes the plaintext over the ciphertext instead of allocating a second
+// buffer, so a received packet is held in memory once.
+func TestDecryptInPlace(t *testing.T) {
+	t.Parallel()
+
+	key := bytes.Repeat([]byte{0x42}, 32)
+	enc, err := NewFSChaCha20Poly1305(key)
+	require.NoError(t, err)
+	dec, err := NewFSChaCha20Poly1305(key)
+	require.NoError(t, err)
+
+	plaintext := bytes.Repeat([]byte{0x5a}, 4096)
+	ciphertext, err := enc.Encrypt(nil, plaintext)
+	require.NoError(t, err)
+
+	got, err := dec.DecryptInPlace(nil, ciphertext)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, got)
+	require.Same(t, &ciphertext[0], &got[0])
 }

@@ -23,39 +23,6 @@ import (
 // Test vectors from:
 // // https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#test-vectors
 
-// createPsbtFromSignedTx is a utility function to create a PSBT from an
-// already-signed transaction, so we can test reconstructing, signing and
-// extracting it. Returned are: an unsigned transaction serialization, a list
-// of scriptSigs, one per input, and a list of witnesses, one per input.
-func createPsbtFromSignedTx(serializedSignedTx []byte) (
-	*Packet, [][]byte, []wire.TxWitness, error) {
-
-	tx := wire.NewMsgTx(2)
-	err := tx.Deserialize(bytes.NewReader(serializedSignedTx))
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	scriptSigs := make([][]byte, 0, len(tx.TxIn))
-	witnesses := make([]wire.TxWitness, 0, len(tx.TxIn))
-	tx2 := tx.Copy()
-
-	// Blank out signature info in inputs
-	for i, tin := range tx2.TxIn {
-		tin.SignatureScript = nil
-		scriptSigs = append(scriptSigs, tx.TxIn[i].SignatureScript)
-		tin.Witness = nil
-		witnesses = append(witnesses, tx.TxIn[i].Witness)
-	}
-
-	// Outputs always contain: (value, scriptPubkey) so don't need
-	// amending.  Now tx2 is tx with all signing data stripped out
-	unsignedPsbt, err := NewFromUnsignedTx(tx2)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return unsignedPsbt, scriptSigs, witnesses, nil
-}
-
 // These are all valid PSBTs encoded as hex. The items with a comment are taken
 // from the BIP174 test vectors:
 // https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#test-vectors
@@ -646,11 +613,27 @@ func TestPsbtExtractor(t *testing.T) {
 	// Basic assertions.
 	require.Equal(t, 1, len(tx.TxIn), "unexpected input count")
 
-	wit := tx.TxIn[0].Witness
+	wit := tx.TxIn[0].DecodeWitness()
 	require.Equal(t, 1, len(wit), "unexpected witness stack size")
 
 	l := len(wit[0])
 	require.True(t, l == 64 || l == 65, "unexpected witness sig length: %d", l)
+}
+
+func TestPsbtExtractorRejectsTooManyWitnessItems(t *testing.T) {
+	unsigned := wire.NewMsgTx(2)
+	unsigned.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{}})
+	psbtPkt, err := NewFromUnsignedTx(unsigned)
+	require.NoError(t, err)
+
+	// One item over the consensus maximum, each item empty.
+	var witness bytes.Buffer
+	require.NoError(t, wire.WriteVarInt(&witness, 0, wire.MaxWitnessItemsPerInput+1))
+	witness.Write(make([]byte, wire.MaxWitnessItemsPerInput+1))
+	psbtPkt.Inputs[0].FinalScriptWitness = witness.Bytes()
+
+	_, err = Extract(psbtPkt)
+	require.ErrorIs(t, err, ErrInvalidPsbtFormat)
 }
 
 func TestFinalizerAddSigHashFlags(t *testing.T) {

@@ -574,7 +574,9 @@ var TestNetParams = Params{
 	// Dense-only softfork: MoE proofs are rejected from this height on.
 	DenseOnlyForkHeight: 28262,
 
-	RankPenaltyForkHeight: 36761,
+	// Blocks 36761-36762 carry pre-fork rank-64 certificates, so activation
+	// is set to the first height the existing chain satisfies.
+	RankPenaltyForkHeight: 36763,
 
 	SaltedSeedForkHeight: 38648,
 

@@ -650,7 +650,7 @@ func applyInputWitness(t *testing.T, tx *wire.MsgTx, idx int, iw *inputWitness) 
 		require.NoError(t, err, "decoding witness element")
 		witness = append(witness, witElem)
 	}
-	tx.TxIn[idx].Witness = witness
+	tx.TxIn[idx].SetWitness(witness)
 }
 
 // executeRejectedTaprootRefTest verifies that a taproot reference test case

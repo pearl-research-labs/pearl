@@ -8,12 +8,17 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
+	"math/rand/v2"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/stretchr/testify/require"
 )
 
 // mainNetGenesisHash is the hash of the first block in the block chain for the
@@ -410,6 +415,142 @@ func TestVarIntNonCanonical(t *testing.T) {
 	}
 }
 
+// varIntEdges holds the first and last value of each varint size, and the values one either side of them.
+var varIntEdges = []uint64{
+	0, 1, 0xfb, 0xfc, // 1 byte: the first two values and the last two (0xfc is the largest single byte)
+	0xfd, 0xfe, 0xfffe, 0xffff, // 3 bytes (0xfd discriminant): the first two values and the last two
+	0x10000, 0x10001, 0xfffffffe, 0xffffffff, // 5 bytes (0xfe): the first two values and the last two
+	0x100000000, 0x100000001, math.MaxUint64 - 1, math.MaxUint64, // 9 bytes (0xff): the first two and the last two
+}
+
+// TestReadVarIntBuf ensures ReadVarIntBuf decodes a varint of each size into an 8-byte scratch buffer and reads no
+// further than the varint, and that decodeVarInt, which reads stored witnesses, decodes the same value and size.
+func TestReadVarIntBuf(t *testing.T) {
+	for _, want := range varIntEdges {
+		var b bytes.Buffer
+		require.NoError(t, WriteVarInt(&b, 0, want))
+		b.WriteByte(0xaa)
+
+		r := bytes.NewReader(b.Bytes())
+		got, err := ReadVarIntBuf(r, 0, make([]byte, 8))
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+		require.Equal(t, 1, r.Len(), "the byte after the varint must stay unread")
+
+		got, size := decodeVarInt(b.Bytes())
+		require.Equal(t, want, got)
+		require.Equal(t, b.Len()-1, size)
+	}
+}
+
+// TestVarIntBufTruncated ensures that a varint of each size cut off at any byte fails to read, and that writing it
+// fails when the writer runs out of room at any byte.
+func TestVarIntBufTruncated(t *testing.T) {
+	for _, val := range []uint64{0xfc, 0xffff, 0xffffffff, math.MaxUint64} {
+		var b bytes.Buffer
+		require.NoError(t, WriteVarInt(&b, 0, val))
+
+		for n := range b.Len() {
+			_, err := ReadVarIntBuf(bytes.NewReader(b.Bytes()[:n]), 0, make([]byte, 8))
+			require.ErrorContains(t, err, "EOF", "read of %x cut to %d bytes", b.Bytes(), n)
+
+			err = WriteVarIntBuf(newFixedWriter(n), 0, val, make([]byte, 8))
+			require.ErrorIs(t, err, io.ErrShortWrite, "write of %x with room for %d bytes", b.Bytes(), n)
+		}
+	}
+}
+
+// FuzzVarIntRoundTrip ensures every value survives WriteVarIntBuf and ReadVarIntBuf, and that putVarInt and
+// decodeVarInt, used for stored witnesses, agree with them.
+func FuzzVarIntRoundTrip(f *testing.F) {
+	for _, val := range varIntEdges {
+		f.Add(val)
+	}
+
+	f.Fuzz(func(t *testing.T, val uint64) {
+		var w bytes.Buffer
+		require.NoError(t, WriteVarIntBuf(&w, 0, val, make([]byte, 8)))
+		require.Equal(t, VarIntSerializeSize(val), w.Len())
+
+		put := make([]byte, 9)
+		require.Equal(t, w.Bytes(), put[:putVarInt(put, val)])
+
+		r := bytes.NewReader(w.Bytes())
+		got, err := ReadVarIntBuf(r, 0, make([]byte, 8))
+		require.NoError(t, err)
+		require.Equal(t, val, got)
+		require.Zero(t, r.Len())
+
+		got, size := decodeVarInt(w.Bytes())
+		require.Equal(t, val, got)
+		require.Equal(t, w.Len(), size)
+	})
+}
+
+// FuzzReadVarIntBuf ensures ReadVarIntBuf, given any bytes, reads exactly one varint, agrees with decodeVarInt,
+// rejects encodings that are not canonical and accepts only bytes that WriteVarIntBuf would write.
+func FuzzReadVarIntBuf(f *testing.F) {
+	// For each edge value: its encoding, the encoding one byte short and with a byte after it, and the value in each
+	// wider, non-canonical encoding.
+	f.Add([]byte{})
+	for _, val := range varIntEdges {
+		enc := make([]byte, 9)
+		enc = enc[:putVarInt(enc, val)]
+		f.Add(enc)
+		f.Add(enc[:len(enc)-1])
+		f.Add(append(bytes.Clone(enc), 0xaa))
+
+		if val < 0xfd {
+			f.Add(littleEndian.AppendUint16([]byte{0xfd}, uint16(val)))
+		}
+		if val <= math.MaxUint16 {
+			f.Add(littleEndian.AppendUint32([]byte{0xfe}, uint32(val)))
+		}
+		if val <= math.MaxUint32 {
+			f.Add(littleEndian.AppendUint64([]byte{0xff}, val))
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		r := bytes.NewReader(data)
+		val, err := ReadVarIntBuf(r, 0, make([]byte, 8))
+		if len(data) == 0 || len(data) < discriminantToSize(data[0]) {
+			require.ErrorContains(t, err, "EOF")
+
+			return
+		}
+
+		decoded, size := decodeVarInt(data)
+		require.Equal(t, size, len(data)-r.Len(), "ReadVarIntBuf must read exactly the varint")
+		if VarIntSerializeSize(decoded) != size {
+			var msgErr *MessageError
+			require.ErrorAs(t, err, &msgErr, "a non-canonical encoding must be rejected")
+
+			return
+		}
+
+		require.NoError(t, err)
+		require.Equal(t, decoded, val)
+
+		var w bytes.Buffer
+		require.NoError(t, WriteVarIntBuf(&w, 0, val, make([]byte, 8)))
+		require.Equal(t, data[:size], w.Bytes())
+	})
+}
+
+// TestWriteVarIntBuf ensures WriteVarIntBuf writes a varint of each size from an 8-byte scratch buffer, and that
+// putVarInt, which readWitnesses uses, writes the same bytes.
+func TestWriteVarIntBuf(t *testing.T) {
+	for _, val := range varIntEdges {
+		var b bytes.Buffer
+		require.NoError(t, WriteVarIntBuf(&b, 0, val, make([]byte, 8)))
+		require.Equal(t, VarIntSerializeSize(val), b.Len())
+
+		put := make([]byte, 9)
+		require.Equal(t, b.Bytes(), put[:putVarInt(put, val)])
+	}
+}
+
 // TestVarIntWire tests the serialize size for variable length integers.
 func TestVarIntSerializeSize(t *testing.T) {
 	tests := []struct {
@@ -756,4 +897,190 @@ func TestRandomUint64Errors(t *testing.T) {
 	if nonce != 0 {
 		t.Errorf("Nonce is not 0 [%v]", nonce)
 	}
+}
+
+// TestCapHint ensures the hint follows a count up to what a length-reporting reader's unread bytes can hold, and
+// only up to maxPrealloc for any other reader.
+func TestCapHint(t *testing.T) {
+	// A reader that has already returned 60 of its 100 bytes: only the 40 unread bytes may count.
+	partlyRead := bytes.NewReader(make([]byte, 100))
+	_, err := io.CopyN(io.Discard, partlyRead, 60)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name  string
+		r     io.Reader
+		count uint64
+		size  int // the fewest bytes one element takes on the wire
+		want  uint64
+	}{
+		{"fits exactly", bytes.NewReader(make([]byte, 100)), 10, 10, 10},
+		{"one too many", bytes.NewReader(make([]byte, 99)), 10, 10, 9},
+		{"only unread bytes count", partlyRead, 10, 10, 4},
+		{"bytes.Buffer", bytes.NewBuffer(make([]byte, 100)), 1000, 1, 100},
+		{"empty", bytes.NewReader(nil), 5, 1, 0},
+		{"large count that fits", bytes.NewReader(make([]byte, 1<<20)), 1 << 15, 32, 1 << 15},
+		{"plain reader, small count", iotest.OneByteReader(bytes.NewReader(nil)), 7, 1, 7},
+		{"plain reader, large count", iotest.OneByteReader(bytes.NewReader(nil)), 1 << 20, 1, maxPrealloc},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, capHint(test.r, test.count, test.size))
+		})
+	}
+}
+
+// TestGuardedReadFullLengthReportingReader covers readers that report their unread length, as the peer message paths
+// do. When all count bytes are there, the reader shows it, so any count is read with one exact allocation. When some
+// are missing, guardedReadFull reads with a growing buffer instead and must fail without allocating for the gap.
+func TestGuardedReadFullLengthReportingReader(t *testing.T) {
+	// Pseudo-random bytes with a fixed seed: no repeating pattern, so a read that drops or reorders bytes does not go
+	// unnoticed, and the same bytes every run.
+	data := make([]byte, 100_000)
+	_, _ = rand.NewChaCha8([32]byte{}).Read(data)
+
+	// Small and large counts alike are read exactly.
+	for _, n := range []int{0, 1, len(data)} {
+		got, err := guardedReadFull(bytes.NewReader(data[:n]), uint64(n))
+		require.NoError(t, err, "count %d", n)
+		require.Equal(t, data[:n], got, "count %d", n)
+	}
+
+	// Missing data gives io.ReadFull's errors: no data gives io.EOF, some gives io.ErrUnexpectedEOF.
+	_, err := guardedReadFull(bytes.NewReader(nil), 10)
+	require.ErrorIs(t, err, io.EOF)
+	_, err = guardedReadFull(bytes.NewReader(data[:3]), 10)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+
+	// Three bytes of data and a count claiming MaxMessagePayload: allocate far less than the claim.
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err = guardedReadFull(bytes.NewReader(data[:3]), MaxMessagePayload)
+	runtime.ReadMemStats(&after)
+	require.Error(t, err)
+	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(MaxMessagePayload/10))
+}
+
+// TestGuardedReadFullPlainReader covers readers that do not report their length, such as the base64 decoder PSBT
+// parsing reads through. guardedReadFull cannot see how much data there is, so it reads a count within maxPrealloc
+// with one exact allocation and a larger count with a buffer that grows as bytes arrive. iotest.HalfReader hides Len
+// and also returns short reads, so every read loop is exercised.
+func TestGuardedReadFullPlainReader(t *testing.T) {
+	// Pseudo-random bytes with a fixed seed: no repeating pattern, so a read that drops or reorders bytes does not go
+	// unnoticed, and the same bytes every run.
+	data := make([]byte, 100_000)
+	_, _ = rand.NewChaCha8([32]byte{}).Read(data)
+
+	// Counts on both sides of maxPrealloc, where the exact read gives way to the growing one, plus a count large
+	// enough for the buffer to grow several times.
+	for _, n := range []int{0, 1, maxPrealloc, maxPrealloc + 1, len(data)} {
+		got, err := guardedReadFull(iotest.HalfReader(bytes.NewReader(data[:n])), uint64(n))
+		require.NoError(t, err, "count %d", n)
+		require.Equal(t, data[:n], got, "count %d", n)
+	}
+
+	// Missing data gives io.ReadFull's errors on both paths: 10 is read exactly, maxPrealloc+1 with a growing buffer.
+	// No data gives io.EOF, some gives io.ErrUnexpectedEOF.
+	for _, count := range []uint64{10, maxPrealloc + 1} {
+		_, err := guardedReadFull(iotest.HalfReader(bytes.NewReader(nil)), count)
+		require.ErrorIs(t, err, io.EOF, "count %d", count)
+
+		_, err = guardedReadFull(iotest.HalfReader(bytes.NewReader(data[:3])), count)
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF, "count %d", count)
+	}
+
+	// Three bytes of data and a count claiming MaxMessagePayload: allocate far less than the claim.
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := guardedReadFull(iotest.HalfReader(bytes.NewReader(data[:3])), MaxMessagePayload)
+	runtime.ReadMemStats(&after)
+	require.Error(t, err)
+	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(MaxMessagePayload/10))
+}
+
+// TestReadRecordsLengthReportingReader ensures records are decoded in order across batch boundaries when the reader
+// reports its length, as the peer message paths do, and that a count the reader cannot back fails without
+// allocating for the missing records.
+func TestReadRecordsLengthReportingReader(t *testing.T) {
+	const size = chainhash.HashSize
+
+	// Hash records, each carrying its index in its first two bytes, so the order can be checked. Each case reads a
+	// prefix of them.
+	const maxRecords = 3*recordBatch + 5
+	raw := make([]byte, maxRecords*size)
+	for i := range maxRecords {
+		raw[i*size] = byte(i)
+		raw[i*size+1] = byte(i >> 8)
+	}
+
+	// Counts around one batch of recordBatch records, and one spanning several batches with a partial last batch.
+	for _, n := range []int{0, 1, recordBatch - 1, recordBatch, recordBatch + 1, maxRecords} {
+		r := bytes.NewReader(raw[:n*size])
+		hashes, err := readRecords(r, uint64(n), size, decodeHash)
+		require.NoError(t, err, "count %d", n)
+		require.Len(t, hashes, n)
+		for i, hash := range hashes {
+			require.Equal(t, [2]byte{byte(i), byte(i >> 8)}, [2]byte{hash[0], hash[1]}, "count %d", n)
+		}
+	}
+
+	// The data ends exactly where a batch ends, giving io.EOF, and partway through one, giving io.ErrUnexpectedEOF.
+	r := bytes.NewReader(raw[:recordBatch*size])
+	_, err := readRecords(r, recordBatch+1, size, decodeHash)
+	require.ErrorIs(t, err, io.EOF)
+	r = bytes.NewReader(raw[:(recordBatch-1)*size])
+	_, err = readRecords(r, recordBatch, size, decodeHash)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+
+	// One hash of data and a count claiming maxCFHeadersLen hashes: allocate far less than the claim.
+	r = bytes.NewReader(raw[:size])
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err = readRecords(r, maxCFHeadersLen, size, decodeHash)
+	runtime.ReadMemStats(&after)
+	require.Error(t, err)
+	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(maxCFHeadersLen*size/10))
+}
+
+// TestReadRecordsPlainReader is TestReadRecordsLengthReportingReader for a reader that does not report its length.
+// iotest.HalfReader hides Len and also returns short reads, so every read loop is exercised.
+func TestReadRecordsPlainReader(t *testing.T) {
+	const size = chainhash.HashSize
+
+	// Hash records, each carrying its index in its first two bytes, so the order can be checked. Each case reads a
+	// prefix of them.
+	const maxRecords = 3*recordBatch + 5
+	raw := make([]byte, maxRecords*size)
+	for i := range maxRecords {
+		raw[i*size] = byte(i)
+		raw[i*size+1] = byte(i >> 8)
+	}
+
+	// Counts around one batch of recordBatch records, and one spanning several batches with a partial last batch.
+	for _, n := range []int{0, 1, recordBatch - 1, recordBatch, recordBatch + 1, maxRecords} {
+		r := iotest.HalfReader(bytes.NewReader(raw[:n*size]))
+		hashes, err := readRecords(r, uint64(n), size, decodeHash)
+		require.NoError(t, err, "count %d", n)
+		require.Len(t, hashes, n)
+		for i, hash := range hashes {
+			require.Equal(t, [2]byte{byte(i), byte(i >> 8)}, [2]byte{hash[0], hash[1]}, "count %d", n)
+		}
+	}
+
+	// The data ends exactly where a batch ends, giving io.EOF, and partway through one, giving io.ErrUnexpectedEOF.
+	r := iotest.HalfReader(bytes.NewReader(raw[:recordBatch*size]))
+	_, err := readRecords(r, recordBatch+1, size, decodeHash)
+	require.ErrorIs(t, err, io.EOF)
+	r = iotest.HalfReader(bytes.NewReader(raw[:(recordBatch-1)*size]))
+	_, err = readRecords(r, recordBatch, size, decodeHash)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+
+	// One hash of data and a count claiming maxCFHeadersLen hashes: allocate far less than the claim.
+	r = iotest.HalfReader(bytes.NewReader(raw[:size]))
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err = readRecords(r, maxCFHeadersLen, size, decodeHash)
+	runtime.ReadMemStats(&after)
+	require.Error(t, err)
+	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(maxCFHeadersLen*size/10))
 }

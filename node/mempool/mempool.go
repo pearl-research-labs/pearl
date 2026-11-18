@@ -1206,6 +1206,16 @@ func (mp *TxPool) Count() int {
 	return count
 }
 
+// OrphanCount returns the number of transactions in the orphan pool.
+//
+// This function is safe for concurrent access.
+func (mp *TxPool) OrphanCount() int {
+	mp.mtx.RLock()
+	defer mp.mtx.RUnlock()
+
+	return len(mp.orphans)
+}
+
 // TxHashes returns a slice of hashes for all the transactions in the memory
 // pool.
 //

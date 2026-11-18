@@ -88,11 +88,14 @@ func (b *BlockChain) blockExists(hash *chainhash.Hash) (bool, error) {
 // It repeats the process for the newly accepted blocks (to detect further
 // orphans which may no longer be orphans) until there are no more.
 //
-// The flags do not modify the behavior of this function directly, however they
-// are needed to pass along to maybeAcceptBlock.
+// Orphans are accepted with BFNone. Whatever the caller vouched for, such as BFFastAdd for a block matched against the
+// verified header list, applies to the block it passed, not to orphans nobody vouched for.
+//
+// An orphan that fails validation is dropped and logged rather than returned, so its error is not charged to the peer
+// that delivered the valid parent and the remaining orphans are still processed.
 //
 // This function MUST be called with the chain state lock held (for writes).
-func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) error {
+func (b *BlockChain) processOrphans(hash *chainhash.Hash) error {
 	// Start with processing at least the passed hash.  Leave a little room
 	// for additional orphan blocks that need to be processed without
 	// needing to grow the array in the common case.
@@ -126,8 +129,12 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 			b.removeOrphanBlock(orphan)
 			i--
 
-			// Potentially accept the block into the block chain.
-			_, err := b.maybeAcceptBlock(orphan.block, flags)
+			// Orphan blocks must not be exempt from any validation, so they get none of the caller's BehaviorFlags.
+			_, err := b.maybeAcceptBlock(orphan.block, BFNone)
+			if _, ok := err.(RuleError); ok {
+				log.Infof("Rejected orphan block %v: %v", orphanHash, err)
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -177,10 +184,12 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 	}
 
 	// Perform preliminary sanity checks on the block and its transactions.
+	sanityStart := time.Now()
 	err = checkBlockSanity(block, b.chainParams, b.timeSource, flags)
 	if err != nil {
 		return false, false, err
 	}
+	b.metrics.BlockSanityChecked(time.Since(sanityStart))
 
 	// Find the previous checkpoint and perform some additional checks based
 	// on the checkpoint.  This provides a few nice properties such as
@@ -259,7 +268,7 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 	// Accept any orphan blocks that depend on this block (they are
 	// no longer orphans) and repeat for those accepted blocks until
 	// there are no more.
-	err = b.processOrphans(blockHash, flags)
+	err = b.processOrphans(blockHash)
 	if err != nil {
 		return false, false, err
 	}
