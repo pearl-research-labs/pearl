@@ -18,9 +18,13 @@ use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::timed;
+use crate::util::fft_par::coset_lde_par;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
+
+mod lde;
+pub(crate) use lde::values as lde_values_prover;
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
@@ -87,15 +91,46 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
+        Self::from_coeffs_with_options::<false>(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    fn from_coeffs_with_options<const PROVER: bool>(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
         let degree = polynomials[0].len();
         let lde_values = timed!(
             timing,
             "FFT + blinding",
-            Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
+            if PROVER {
+                lde::values(&polynomials, rate_bits, blinding, fft_root_table)
+            } else {
+                Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
+            }
         );
 
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
+        let leaves = timed!(
+            timing,
+            "transpose LDEs",
+            if PROVER {
+                crate::util::transpose_bitrev(&lde_values)
+            } else {
+                let mut leaves = transpose(&lde_values);
+                reverse_index_bits_in_place(&mut leaves);
+                leaves
+            }
+        );
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
@@ -192,6 +227,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             instance.oracles.len(),
             "Number of oracles mismatch"
         );
+        let batching_pow_witness =
+            crate::fri::batching_pow::prove::<F, C, D>(challenger, &fri_params.config);
         let alpha = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha);
 
@@ -244,16 +281,25 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
 
         let (lde_final_poly, lde_final_values) = {
-            let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
             let lde_final_values = timed!(
                 timing,
-                &format!("perform final FFT {}", lde_final_poly.len()),
-                lde_final_poly.coset_fft(F::coset_shift().into())
+                &format!(
+                    "perform final FFT {}",
+                    final_poly.len() << fri_params.config.rate_bits
+                ),
+                coset_lde_par(
+                    &final_poly.coeffs,
+                    F::coset_shift().into(),
+                    fri_params.config.rate_bits
+                )
             );
-            (lde_final_poly, lde_final_values)
+            (
+                lde::pad(final_poly, fri_params.config.rate_bits),
+                lde_final_values,
+            )
         };
 
-        let fri_proof = {
+        {
             fri_proof::<F, C, D>(
                 &oracles
                     .par_iter()
@@ -263,12 +309,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 lde_final_values,
                 challenger,
                 fri_params,
+                batching_pow_witness,
                 final_poly_coeff_len,
                 max_num_query_steps,
                 timing,
             )
-        };
-
-        fri_proof
+        }
     }
 }

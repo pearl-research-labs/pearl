@@ -1,0 +1,181 @@
+//! The committed LUT oracle: one AIR per logical table.
+//!
+//! [`columns`] defines the layout, [`stark`] generates and commits the tables,
+//! [`ctl`] declares their CTL halves, and [`witness`] checks lookups and counts multiplicities.
+//! Complete channels are assembled in [`super::ctl`].
+//!
+//! Each [`LutTable`] has its own batch AIR — a [`LutStark`] padded from [`lut_live_rows`]
+//! to the next supported trace height. Batch FRI sorts heights internally. A LUT AIR has
+//! no constraints of its own; its columns split into two classes:
+//!
+//! - **Precommitted columns** (class (c)): the key column(s) — a plain ramp for tables whose
+//!   key domain fills the height, the enumerated key tuple for BYTES2/PAIR128/FP32TOOLS/LOG16,
+//!   or a saturated key `min(i, live - 1)` for sub-height tables — and independent value columns
+//!   ([`lut_precommitted_values`]). Slot expressions derive constant and affine outputs. Generated once system-wide and committed at
+//!   setup by [`lut_preprocessed_data`] into a `BatchStarkPreprocessedData` whose Merkle cap
+//!   is a consensus constant. Proofs never recommit these columns — the batch prover copies
+//!   the setup commitment and FRI opens it alongside the trace oracles, while constraints and
+//!   lookups keep addressing them through the table's ordinary column indices.
+//! - **Multiplicity columns** (per-proof): one trace column per slot, counting how often each
+//!   row is looked up — [`LutMultiplicities`], job-dependent, committed with the trace like
+//!   any online column.
+//!
+//! The lookup argument is one [`starky::cross_table_lookup::CrossTableLookup`] per table ([`lut_cross_table_lookups`]):
+//! the looking side collects every instance of every AIR's inventory (`keys ++ values` over
+//! the consumer's own trace), the looked side is the table's slots — a multi-slot looked side
+//! for the folded tables — each slot's key and value expressions form a tuple filtered
+//! by its multiplicity column, whose value *is* the row's multiplicity in the channel (the
+//! logup numerator semantics).
+//!
+//! Values are produced by exhaustively evaluating the canonical Rust mirror each table binds —
+//! reusing the starks' own mirror functions wherever one exists, so the tables and the traces
+//! cannot drift apart. [`generate`] returns the semantic value columns before factoring;
+//! exhaustive tests compare them with the committed slot expressions. Folded keys usually
+//! add a slot offset (`2^17 * slot` for RNERND, `2^16 * rel` for B200ALIGN).
+//! `RANGE16` stores nothing: its ramp
+//! key column *is* the table, and `BYTES2`/`PAIR128` store the enumerated key tuple itself.
+//!
+//! Padding (sub-height tables only) is always a *repeated valid entry*, never an
+//! out-of-domain key: the saturated key column repeats the last live key and the value columns
+//! are padded alike, so a malicious nonzero multiplicity on a padding row only re-proves a
+//! fact the table already serves.
+//!
+//! RNERND's slot index is a *signed* subnormal fade cut biased by +7: slot `s` serves
+//! `cut = s - 7 in [-7, 18]`, i.e. `KEY_SCALE = -133 - cut`. The negative cuts (slots 0-6)
+//! distinguish normal from subnormal cancellation results with `V < 128`, which share a
+//! significand but not a scale; slot 0 also serves every `KEY_SCALE >= -126` (all normal)
+//! and slot 25 every `KEY_SCALE <= -151` (all zero), so 26 slots cover the full scale range
+//! bit-exactly.
+
+pub mod columns;
+pub mod ctl;
+pub mod stark;
+pub mod witness;
+
+pub use super::ctl::lut_cross_table_lookups;
+pub use columns::{LutSlotLayout, lut_live_rows, lut_num_columns, lut_slot_layout, num_precommitted_columns, num_slots};
+pub use ctl::ctl_looked_lut_slot;
+pub use stark::{
+    B200AlignStark, Bytes2Stark, Clamp22Stark, Div448Stark, ExpInfoStark, Int8DecStark, Log16Stark, LutStark, Pair128Stark,
+    Pow2DStark, Pow2GStark, Pow2GbStark, ProdAlign15Stark, QcastStark, Range16Stark, RneRndStark, Width16Stark, Width32Stark,
+    WidthNormStark, Xor8Stark, generate, lut_precommitted_values, lut_preprocessed_data, lut_preprocessed_inputs, lut_trace,
+};
+pub use witness::{LutChecker, LutMultiplicities};
+
+/// The consensus lookup tables (every AIR lookup, range checks included,
+/// targets one of these; there are no in-trace tables). Each is
+/// generated once by exhaustively evaluating the canonical Rust function it mirrors,
+/// precommitted at setup time (`stark::lut_preprocessed_data`) and served as its own
+/// AIR of the batch (`stark::LutStark`) through one [`starky::cross_table_lookup::CrossTableLookup`] channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LutTable {
+    /// 16-bit range check (the ramp itself is the key) — every `RC16` instance.
+    Range16,
+    /// Paired 8-bit range check; a lone byte checks `(d, 0)` — Blake message bytes.
+    Bytes2,
+    /// Byte XOR, keyed by `x, y in [0, 256)`. Slot `t` returns `(z, h_t, t)`, where
+    /// `z = x ^ y` and `(h_0, h_1, h_2) = (0, z >> 4, z >> 7)`.
+    /// The high fragments support Blake3's rotations by 12 and 7.
+    Xor8,
+    /// Paired 7-bit range check (2^14 keys, padded into the 2^16 height group) — mantissa
+    /// fields, ScaleStark's sqrt parity/l2-linf pairs.
+    Pair128,
+    /// Keyed bf16 code, value fp8 E4M3 code (one precommitted column; the binding pins the
+    /// committed code into `[0, 256)`): `f32_to_fp8_e4m3(bf16_to_f32(clamp_±448(x)))` exactly
+    /// (RNE, saturation, subnormal region, signed zero). InputQuant keys it with the
+    /// round-to-odd proxy of its binary32 fold, preserving the direct E4M3 cast.
+    Qcast,
+    /// Keyed int8 byte (raw two's complement, `[0, 255]`), tuple value
+    /// `(SIGN, EXP, MANTISSA, EXP_IS_ZERO)`: the exact bf16 decode fields of the int8 value
+    /// (byte 0 -> +0; byte 0x80 -> `(1, 134, 0, 0)`); the key domain doubles as the byte range
+    /// proof — InputQuant P1.
+    Int8Dec,
+    /// Keyed denominator (noised-bound) bf16 code, value bf16 code `RNE_bf16(448 / denom)` —
+    /// the alpha definition; native error paths map to sentinel codes (exponent 255) rejected
+    /// by the alpha validity RCs — Scale H3.
+    Div448,
+    /// Keyed exponent field `[0, 254]` (the inf/NaN field 255 has **no row**), value the
+    /// `EXP_IS_ZERO` flag: subnormal-flag derivation *and* the exponent range/finiteness proof
+    /// via the out-of-domain pattern — every decode carrying the flag.
+    ExpInfo,
+    /// Keyed `x + 400` for `x in [-400, 200]`, value `clamp(x, -7, 18) + 7`: the RNERND slot
+    /// (the signed subnormal fade cut, biased by +7) for MUL and FMA; the domain doubles as the
+    /// key's range proof.
+    Clamp22,
+    /// Keyed `d in [0, 19]`, value `2^d`: the shared power-of-two table for every capped
+    /// shift — the FMA's gap (capped at 19, the largest key anywhere) and round-to-odd
+    /// shift, Scale's sqrt mod-16 shift, InputQuant's block split and summand-score
+    /// stages (keys at most 16). The domain doubles as each consumer's range proof.
+    Pow2D,
+    /// Keyed `V + 2^17*CUT_DEPTH` (26 slots, one per slot = signed fade cut + 7 with cuts in
+    /// `[-7, 18]`; `V in [0, 2^17)`), tuple value
+    /// `(OUT_MANTISSA, WIDTH_ADJUST, OUT_IS_ZERO, OUT_EXP_IS_ZERO)`: the shared bf16 RNE
+    /// back-end of every MUL and FMA — width detection, guard/round/sticky, ties-to-even,
+    /// mantissa-overflow renormalization, subnormal fade and the normal/subnormal
+    /// classification all in-table; cut 18 provably rounds every `V < 2^17` to zero and cut -7
+    /// covers every scale with only normal small-significand results.
+    RneRnd,
+    /// H100 carry alignment and FP32 promotion: `(key, power, tagged_flag)`.
+    /// Carry gaps use keys 0..=63 and flag 0; promotion gaps use 128..=217 and
+    /// flag `2 + is_far`; widths use 257..=305 and flag `4 + is_low`.
+    Pow2G,
+    /// H100 product decode and 15-bit-frame alignment, folded over shifts `[0, 58]`.
+    ProdAlign15,
+    /// H100 group-sum width and normalized 14-bit significand, folded over the key's high
+    /// four bits.
+    WidthNorm,
+    /// The B200 product decode + window truncation (`matmul_b200_stark`), keyed
+    /// `OPERAND_CODES_A + 2^8*OPERAND_CODES_B + 2^16*REL` with `REL in [0, 71]` slot-folded; values
+    /// `(ALIGNED_LANE_TERMS, PRODUCT_BIASED_EXPONENT, OPERAND_CODES_A, OPERAND_CODES_B, BINADE)`:
+    /// `ALIGNED_LANE_TERMS = ±floor(P*2^19 / 2^REL)` (P = mag_a*mag_b <= 225, sign folded, < 2^27),
+    /// `PRODUCT_BIASED_EXPONENT = sh_a + sh_b + 26 in [26, 54]`
+    /// the biased stored-exponent sum (sentinel 0 for zero products, with zero lane terms in
+    /// every slot), `BINADE` the product's check-3 binade `floor(log2 |prod|) + 139` (0 for
+    /// zero products, same in every slot) — MB13's per-lane bound. Slots `REL >= 27` hold
+    /// zero lane terms; negative rel-shifts have no slot
+    /// (this proves `GROUP_MAX_BIASED_EXPONENT >= PRODUCT_BIASED_EXPONENT_i`) — MB1.
+    B200Align,
+    /// Keyed `d in [0, 63]`, value `2^min(d, 26)` — Matmul's carry alignment (MB5): the
+    /// divisor for `floor(4*GROUP_OUTPUT_SIGNIFICAND / 2^d)`; the 26-cap makes the floor total
+    /// (`4*GROUP_OUTPUT_SIGNIFICAND < 2^26`), and missing negative keys prove
+    /// `GROUP_MAX_BIASED_EXPONENT >= GROUP_OUTPUT_BIASED_EXPONENT`.
+    Pow2Gb,
+    /// Keyed `GROUP_SUM_WIDTH in [1, 32]` (a shifted ramp: 32 live rows, no key 0), tuple value
+    /// `(TRUNCATION_POWER, LIFTING_POWER) = (2^max(W-24, 0), 2^max(24-W, 0))`: the
+    /// truncate-to-24-bits divisor/multiplier pair. Its key domain also proves
+    /// `GROUP_SUM_WIDTH <= 32`, hence `GROUP_SUM_ABS < 2^32` through MB7.
+    Width32,
+    /// The shared policy score's significand-product width, keyed `P in [0, 2^16)`, values
+    /// `(width(P), [P != 0])` — the bit length of a 16-bit product and its nonzero flag.
+    /// InputQuant binds it on the summand's significand product to build the lambda scores;
+    /// the nonzero flag pins the zero sentinel exactly, and the key domain doubles as the
+    /// product's range proof.
+    Width16,
+    /// Keyed `(region, index)`. Region 0 serves `floor(64 * log2 index)` over `[0, 2^16)` for
+    /// the sum-of-squares score used by check 3 (0 at the phantom sentinel). Region `1 + class`
+    /// serves check 4's Q16 capped Gaussian kernel at `index=lambda-lambda(0,sigma)` in
+    /// `[0,8192)`. The region is its own key component, so a negative or oversized index
+    /// cannot alias another region. See `unpredictability::noise_coverage_lookup_value`.
+    Log16,
+    /// `(operation, argument) -> (left_power, right_power)` for binary32 rounding/alignment.
+    Fp32Tools,
+    /// B200 row parameters: `(norm-32768)+32768*e`, with `norm=sigma_norm` in `[32768,65536)`
+    /// and `e=sigma_enc-269` in `0..=5`. The exact signal RMS is `norm*2^(e-13)`.
+    /// Six folded exponent slots jointly serve the strip byte, Q16 Gaussian coefficient,
+    /// LOG16 cap region, and baseline score `lambda(0,sigma)` (the kernel-key base).
+    DownscaleThreshold,
+    /// H100 row parameters, same key shape with `e=sigma_enc-270` in `0..=5` (the exact
+    /// signal RMS is `norm*2^(e-13)`, `sigma = s`). The strip factor is 0.105 on every
+    /// slot, the region is always the uncapped class, and the threshold/key base are
+    /// slot-affine, so the coefficient column is shared by all six slots.
+    DownscaleThresholdH100,
+    /// Quantize-first rewrite, keyed `code+256*threshold+32768*coin+65536*e`, with
+    /// byte code, 7-bit threshold, boolean coin, and `e=sigma_enc-256-offset(device)` in
+    /// `0..=5`.
+    /// Returns `(code&128)|(8*e)|(code&7)|1` if `coin && (code&127)<threshold`, else code.
+    /// Six folded slots share the same comparison; only the replacement exponent differs.
+    DownscaleRewrite,
+}
+
+#[cfg(test)]
+mod tests;

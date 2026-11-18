@@ -141,36 +141,44 @@ Reference: `miner/pearl-gateway/src/pearl_gateway/blockchain_utils/zk_certificat
 If your pool links against the `zk-pow` Rust crate instead of the Python package,
 the same logic is available in Rust:
 
-- New V2 prover: `zk_pow::api::{prove, verify}`.
+- New V2 prover: `zk_pow::v2::api::{prove, verify}`.
 - Old V1 prover: `zk_pow::v1::api::{prove, verify}`. Note that V1 uses its own
   `IncompleteBlockHeader` and `MiningConfiguration` types, and a **separate circuit
   cache type**. Keep one cache of each kind.
 - `verify_plain_proof` in both modules accepts `nbits_override` for share-difficulty
   checks.
 
-The crossover rule and legacy parsing live in `zk_pow::ffi::plain_proof`:
+The crossover rule and `CertificateVersion` live in `zk_pow::ffi`; the plain-proof
+types and legacy parsing live in `zk_pow::v2::ffi::plain_proof`:
 
 ```rust
-use zk_pow::ffi::plain_proof::{check_cert_version_eligible, CertificateVersion, PlainProof};
+use zk_pow::ffi::CertificateVersion;
+use zk_pow::v2::api::proof::SeedDerivation;
+use zk_pow::v2::ffi::plain_proof::PlainProof;
 
 // Accepts both the current format and the legacy (pre-fork) format.
 let proof = PlainProof::deserialize_compat(&share_bytes)?;
 
 // Errors for an MoE share before the fork, or an unknown version.
-let zk_proof = match check_cert_version_eligible(required_cert_version, &proof)? {
+let (public_data, proof_data) = match proof.check_cert_version_eligible(required_cert_version)? {
     CertificateVersion::ZkDense => {
-        zk_pow::v1::api::prove::zk_prove_plain_proof(v1_header, &proof, &mut v1_cache, true)?
+        let result = zk_pow::v1::api::prove::zk_prove_plain_proof(v1_header, &proof, &mut v1_cache, true)?;
+        (result.public_data.to_vec(), result.proof_data)
     }
     CertificateVersion::ZkMoe => {
-        zk_pow::api::prove::zk_prove_plain_proof(header, &proof, &mut v2_cache, true)?
+        let result = zk_pow::v2::api::prove::zk_prove_plain_proof(
+            header, &proof, &mut v2_cache, true, SeedDerivation::Legacy,
+        )?;
+        (result.public_data, result.proof_data)
     }
+    CertificateVersion::ZkV3 | CertificateVersion::PlainFp8 => todo!(),
 };
 ```
 
 `proof.min_cert_version()` gives the lowest certificate version that can certify a
 share (V1 for dense, V2 for MoE), if you want the cheap check by itself.
 
-Reference: `py-pearl-mining/src/lib.rs` (the Python wrapper is a thin layer over
+Reference: `py-pearl-mining/src/cert_version.rs` (the Python wrapper is a thin layer over
 exactly these calls).
 
 ## Step 3 (optional, after the fork): Upgrade your miners

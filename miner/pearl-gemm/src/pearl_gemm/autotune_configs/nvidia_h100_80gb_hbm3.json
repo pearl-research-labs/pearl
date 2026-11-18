@@ -1,0 +1,246 @@
+{
+  "pre_quant": [
+    {
+      "shape": {
+        "m": 2048,
+        "k": 4096
+      },
+      "runtime": 9.23520028591156e-06,
+      "threads_per_block": 128
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "k": 4096
+      },
+      "runtime": 3.824959993362427e-05,
+      "threads_per_block": 256
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "k": 8192
+      },
+      "runtime": 7.398080229759217e-05,
+      "threads_per_block": 512
+    },
+    {
+      "shape": {
+        "m": 4096,
+        "k": 16384
+      },
+      "runtime": 7.390400171279907e-05,
+      "threads_per_block": 512
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "k": 7168
+      },
+      "runtime": 6.504319906234741e-05,
+      "threads_per_block": 512
+    },
+    {
+      "shape": {
+        "m": 256,
+        "k": 4096
+      },
+      "runtime": 2.5631999596953393e-06,
+      "threads_per_block": 256
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "k": 2048
+      },
+      "runtime": 1.8902400135993956e-05,
+      "threads_per_block": 128
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "k": 16384
+      },
+      "runtime": 0.00014511679410934448,
+      "threads_per_block": 512
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "k": 6144
+      },
+      "runtime": 5.6134402751922614e-05,
+      "threads_per_block": 512
+    }
+  ],
+  "noisy_quant": [
+    {
+      "shape": {
+        "m": 8192,
+        "k": 4096
+      },
+      "runtime": 5.4355198144912726e-05,
+      "noise_rows": 32,
+      "noise_bk": 128,
+      "noise_stages": 3,
+      "noise_out_stages": 2,
+      "noise_load_mode": "ring"
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "k": 2048
+      },
+      "runtime": 2.9539200663566587e-05,
+      "noise_rows": 32,
+      "noise_bk": 128,
+      "noise_stages": 3,
+      "noise_out_stages": 2,
+      "noise_load_mode": "ring"
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "k": 6144
+      },
+      "runtime": 7.822080254554748e-05,
+      "noise_rows": 32,
+      "noise_bk": 128,
+      "noise_stages": 3,
+      "noise_out_stages": 2,
+      "noise_load_mode": "ring"
+    }
+  ],
+  "mixed_gemm": [
+    {
+      "shape": {
+        "m": 2048,
+        "n": 8192,
+        "k": 4096
+      },
+      "runtime": 0.00011653759479522704,
+      "tile_m": 128,
+      "tile_n": 128,
+      "cluster_m": 2,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "n": 8192,
+        "k": 4096
+      },
+      "runtime": 0.0004821216106414795,
+      "tile_m": 128,
+      "tile_n": 128,
+      "cluster_m": 2,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "n": 8192,
+        "k": 8192
+      },
+      "runtime": 0.0009281536102294923,
+      "tile_m": 128,
+      "tile_n": 192,
+      "cluster_m": 2,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 4096,
+        "n": 8192,
+        "k": 16384
+      },
+      "runtime": 0.000886518383026123,
+      "tile_m": 256,
+      "tile_n": 128,
+      "cluster_m": 1,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 2048,
+        "n": 32768,
+        "k": 4096
+      },
+      "runtime": 0.0004846752166748047,
+      "tile_m": 128,
+      "tile_n": 128,
+      "cluster_m": 2,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "n": 36864,
+        "k": 7168
+      },
+      "runtime": 0.0036402751922607426,
+      "tile_m": 256,
+      "tile_n": 128,
+      "cluster_m": 1,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 256,
+        "n": 8192,
+        "k": 4096
+      },
+      "runtime": 1.6345599293708802e-05,
+      "tile_m": 128,
+      "tile_n": 128,
+      "cluster_m": 2,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "n": 16384,
+        "k": 2048
+      },
+      "runtime": 0.0005632959842681886,
+      "tile_m": 128,
+      "tile_n": 128,
+      "cluster_m": 2,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "n": 6144,
+        "k": 16384
+      },
+      "runtime": 0.0013321056365966795,
+      "tile_m": 256,
+      "tile_n": 128,
+      "cluster_m": 1,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    },
+    {
+      "shape": {
+        "m": 8192,
+        "n": 24576,
+        "k": 6144
+      },
+      "runtime": 0.0021282943725585935,
+      "tile_m": 256,
+      "tile_n": 128,
+      "cluster_m": 1,
+      "cluster_n": 1,
+      "ltile_cols": 64
+    }
+  ]
+}
