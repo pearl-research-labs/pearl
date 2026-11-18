@@ -24,6 +24,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, fields
 from fractions import Fraction
 
+import numpy as np
+import pearl_mining
 import torch
 from blake3 import blake3
 from miner_base.block_submission import commit_planes_for_leaf
@@ -34,7 +36,6 @@ from miner_base.prequant import PrequantMatrix, RowNorms, round_l2_to_grid
 from miner_base.transcript import encode_u32_le
 from pearl_gateway.comm.dataclasses import MiningJob
 
-from .b_prepare_native import native
 from .mining_config import (
     PACKED_NOISE_K,
     RANK,
@@ -181,7 +182,7 @@ def prepare_b_cpu(
     chain's row chunks; returns None once it reports True. ``row_scales``,
     from an earlier preparation of these planes, skips the per-row norms.
     ``reference`` runs the torch chain instead of the native kernels
-    (``b_prepare_native``).
+    (``pearl_mining.cpu_b_*``, on ``torch.get_num_threads()`` threads).
     """
     arithmetic = ARITHMETIC.get(device)
     if arithmetic is None:
@@ -305,7 +306,16 @@ def _planes_digest(planes: list[torch.Tensor], key: bytes, leaf: int) -> bytes:
 def _lines(key: bytes, label: bytes, count: int, reference: bool) -> torch.Tensor:
     if reference:
         return _noise_lines(key, label, range(count))
-    return native().noise_lines(key, label, count, NOISE_TARGET_NORM, INT_SQRT_PREC)
+    lines = torch.empty(count, RANK, dtype=_E4M3)
+    side, factor = label
+    pearl_mining.cpu_b_noise_lines(key, side, factor, _bytes(lines), torch.get_num_threads())
+    return lines
+
+
+def _bytes(t: torch.Tensor) -> np.ndarray:
+    """A contiguous host tensor's buffer, by element width."""
+    view = {1: torch.uint8, 2: torch.uint16}[t.element_size()]
+    return t.view(view).numpy()
 
 
 def _layer_row_scales(
@@ -340,17 +350,21 @@ def _native_rows(
     arithmetic: DeviceArithmetic,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(B', peel)`` from the fused native rows."""
-    b_prime, mid = native().prepare_rows(
-        codes,
-        scales,
-        row_scales.alpha_b,
-        row_scales.beta_b,
-        row_scales.l2_b,
-        e2,
-        f1,
-        f2,
+    n, k = codes.shape
+    b_prime = torch.empty(n, k, dtype=_E4M3)
+    mid = torch.empty(n, RANK, dtype=_BF16)
+    pearl_mining.cpu_b_prepare_rows(
+        codes.contiguous().numpy(),
+        *(
+            _bytes(t.contiguous())
+            for t in (scales, row_scales.alpha_b, row_scales.beta_b, row_scales.l2_b)
+        ),
+        *(_bytes(t.contiguous()) for t in (e2, f1, f2)),
         arithmetic.window_bits,
         *arithmetic.strip_g,
+        _bytes(b_prime),
+        _bytes(mid),
+        torch.get_num_threads(),
     )
     peel = torch.cat([mid, -(row_scales.beta_b.unsqueeze(1) * e2.to(_BF16))], dim=1)
     return b_prime, peel
