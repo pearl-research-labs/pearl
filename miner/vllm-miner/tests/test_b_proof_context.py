@@ -2,9 +2,8 @@
 
 import pytest
 import torch
-from miner_base.block_submission import PROTOCOL_COMMITMENT_LEAF
-from miner_base.commitment import commit_planes, hash_id_for_leaf
-from miner_base.commitment_hash import noise_seed_b
+from miner_base.commitment import commit_planes
+from miner_base.protocol import COMMITMENT_CHUNK_SIZE, hash_id_for_leaf, noise_seed_b
 from vllm_miner.state import BProofContext
 
 _KEY_B = bytes(range(32))
@@ -27,9 +26,7 @@ def _planes() -> list[torch.Tensor]:
 
 def test_prebuilt_commitment_rebuilds_at_the_protocol_leaf():
     codes, scales = _planes()
-    digest = commit_planes(
-        [codes, scales], _KEY_B, hash_id_for_leaf(PROTOCOL_COMMITMENT_LEAF)
-    ).digest
+    digest = commit_planes([codes, scales], _KEY_B, hash_id_for_leaf(COMMITMENT_CHUNK_SIZE)).digest
     seed_b = noise_seed_b(digest, _KEY_B, _P_B)
     ctx = BProofContext(
         key_b=_KEY_B, ancestor_header=_ANCESTOR, seed_b=seed_b, p_b=_P_B, codes=codes, scales=scales

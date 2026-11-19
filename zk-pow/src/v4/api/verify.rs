@@ -55,16 +55,11 @@ fn open_and_noisy_quantize(
     Ok(OperandStrip { clean: codes, built })
 }
 
-/// Verifies a v4 FP8 plain proof under the whitepaper-fixed jackpot policy for
-/// the statement's committed device. The proof's `σ_d` is authenticated against
-/// `proposed_header` through its own [`PlainProofV4::ancestor_chain`].
-pub fn verify_plain_proof(
+fn prepare_policy_inputs(
     proposed_header: &IncompleteBlockHeader,
     plain_proof: &PlainProofV4,
-    nbits_override: Option<u32>,
-) -> Result<()> {
+) -> Result<(crate::v4::api::public_params::PublicParams, OperandStrip, OperandStrip)> {
     let (private_params, public_params) = plain_proof.parse_proof(proposed_header)?;
-    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
     let device = public_params.common().device;
     let quantization = Fp8E4M3Quant::new(device);
     let k = public_params.common_dim() as usize;
@@ -74,6 +69,21 @@ pub fn verify_plain_proof(
     let noise = compute_fp8_noise(&public_params, proposed_header);
     let tile_a = open_and_noisy_quantize(&private_params.operands.a, k, &noise.a, &quantization)?;
     let tile_b = open_and_noisy_quantize(&private_params.operands.b, k, &noise.b, &quantization)?;
+    Ok((public_params, tile_a, tile_b))
+}
+
+/// Verifies a v4 FP8 plain proof under the whitepaper-fixed jackpot policy for
+/// the statement's committed device. The proof's `σ_d` is authenticated against
+/// `proposed_header` through its own [`PlainProofV4::ancestor_chain`].
+pub fn verify_plain_proof(
+    proposed_header: &IncompleteBlockHeader,
+    plain_proof: &PlainProofV4,
+    nbits_override: Option<u32>,
+) -> Result<()> {
+    let (public_params, tile_a, tile_b) = prepare_policy_inputs(proposed_header, plain_proof)?;
+    let nbits = nbits_override.unwrap_or(proposed_header.nbits);
+    let device = public_params.common().device;
+    let k = public_params.common_dim() as usize;
 
     let Some(message) = JackpotPolicy::for_device(device).evaluate(
         &tile_a,
@@ -90,6 +100,15 @@ pub fn verify_plain_proof(
 
     // The plain difficulty condition on the proven ticket digest.
     check_jackpot_difficulty(&ticket.jackpot, nbits, public_params.h(), public_params.w(), k as u32)
+}
+
+/// Evaluates every jackpot policy check (including the unpredictable-summand
+/// census) and formats a multi-line diagnostic report for miner logging.
+pub fn diagnose_jackpot_policy(proposed_header: &IncompleteBlockHeader, plain_proof: &PlainProofV4) -> Result<String> {
+    let (public_params, tile_a, tile_b) = prepare_policy_inputs(proposed_header, plain_proof)?;
+    let device = public_params.common().device;
+    let k = public_params.common_dim() as usize;
+    JackpotPolicy::for_device(device).diagnose(&tile_a, &tile_b, k)
 }
 
 #[cfg(test)]
@@ -122,6 +141,9 @@ mod tests {
         let (header, plain) = fixture_job_untamed();
         let err = verify_plain_proof(&header, &plain, None).expect_err("the consolidated census must reject");
         assert!(format!("{err:#}").contains("not admissible"));
+        let report = diagnose_jackpot_policy(&header, &plain).expect("diagnose must succeed");
+        assert!(report.starts_with("jackpot policy rejected ("), "{report}");
+        assert!(report.contains("unpredictable summands: fail"), "{report}");
     }
 
     /// The v4 witness codec round-trips the dense consistency fixture: the

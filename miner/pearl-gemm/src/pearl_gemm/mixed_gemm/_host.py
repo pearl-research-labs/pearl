@@ -11,7 +11,12 @@ from quack.cute_dsl_utils import get_max_active_clusters
 from .._utils._arch import Arch, arch_of, require_arch
 from .._utils._compile import get_or_compile
 from .._utils._stream import get_stream
-from .._utils._validation import require_tensor
+from .._utils._validation import (
+    require_bool,
+    require_hit_signal,
+    require_tensor,
+    require_u32,
+)
 from ..pow import HIT_PAYLOAD_K_ALIGN, HitSignal
 from ..protocol_constants import BLOCK_SCALE_GROUP, SM90_PROMOTE_K
 from ._kernel import _EPI_THREADS, _FusedGemmSm100, cta_tile_m
@@ -223,14 +228,6 @@ def _validate_lottery_tile(config: MixedGemmConfig) -> None:
         raise ValueError("ltile_cols must divide tile_n")
 
 
-def _validate_u32_tag(name: str, value: int) -> None:
-    if type(value) is not int or not 0 <= value < 2**32:
-        raise ValueError(
-            f"{name} must be an int fitting an unsigned 32-bit record word, got "
-            f"{value!r} ({type(value).__name__})"
-        )
-
-
 def validate_mixed_gemm_config(
     m: int,
     n: int,
@@ -242,8 +239,6 @@ def validate_mixed_gemm_config(
     """Validate a config for ``arch``'s kernel family (the current device's
     when omitted)."""
     arch = arch_of() if arch is None else arch
-    if arch not in _SUPPORTED_ARCHS:
-        raise ValueError(f"mixed_gemm has no kernel for {arch.name}")
     if m <= 0 or n <= 0 or k <= 0:
         raise ValueError("m, n, and k must be positive")
     if k % HIT_PAYLOAD_K_ALIGN:
@@ -290,11 +285,6 @@ def _fused_kernel(arch: Arch, config: MixedGemmConfig, *, snapshot_payload: bool
         return _FusedGemmSm90(cluster_m=config.cluster_m, cluster_n=config.cluster_n, **tile_kwargs)
     # Validated to cluster 1x1: the SM120 kernel has no cluster mode.
     return _FusedGemmSm120(**tile_kwargs)
-
-
-def _validate_record_hits(record_hits: bool) -> None:
-    if type(record_hits) is not bool:
-        raise TypeError(f"record_hits must be bool, got {type(record_hits).__name__}")
 
 
 def _validate_output_operands(
@@ -428,13 +418,9 @@ def mixed_gemm(
         n,
         device,
     )
-    _validate_u32_tag("layer_id", layer_id)
-    _validate_record_hits(record_hits)
-    if not isinstance(hit_signal, HitSignal):
-        raise TypeError("hit_signal must be a pearl_gemm.pow.HitSignal")
-    if hit_signal.device != device:
-        raise ValueError(f"hit_signal must live on {device}, got {hit_signal.device}")
-    hit_signal.require_usable()
+    require_u32("layer_id", layer_id)
+    require_bool("record_hits", record_hits)
+    require_hit_signal(hit_signal, device)
     require_tensor(
         "a_prime",
         a_prime,

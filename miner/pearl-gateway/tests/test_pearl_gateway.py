@@ -23,8 +23,6 @@ def mock_pearl_gateway_components():
         # Create mock instances
         mock_work_cache = AsyncMock()
         mock_pearl_client = AsyncMock()
-        mock_pearl_client.__aenter__ = AsyncMock(return_value=mock_pearl_client)
-        mock_pearl_client.__aexit__ = AsyncMock(return_value=None)
         mock_proof_pool = AsyncMock()
         mock_submission_service = AsyncMock()
         mock_miner_rpc = AsyncMock()
@@ -86,9 +84,6 @@ class TestPearlGateway:
         # Verify initial state
         assert gateway.running is False
 
-        # Verify logger message
-        mock_pearl_gateway_components["logger"].info.assert_called_with("PearlGateway initialized")
-
     def test_pearl_gateway_initialization_no_config_path(self, mock_pearl_gateway_components):
         """Test PearlGateway initialization without explicit config path."""
         with patch("pearl_gateway.pearl_gateway.load_config") as mock_load_config:
@@ -111,14 +106,12 @@ class TestPearlGateway:
         assert gateway.running is True
 
         # Verify components are started in order
-        mock_pearl_gateway_components["pearl_client"].__aenter__.assert_called_once()
+        mock_pearl_gateway_components["pearl_client"].start.assert_called_once()
         mock_pearl_gateway_components["scheduler"].start.assert_called_once()
         mock_pearl_gateway_components["proof_pool"].start.assert_called_once()
         mock_pearl_gateway_components["miner_rpc"].start.assert_called_once()
 
-        # Verify log messages
         calls = mock_pearl_gateway_components["logger"].info.call_args_list
-        assert call("Starting PearlGateway") in calls
         assert call("PearlGateway started successfully") in calls
 
     @pytest.mark.asyncio
@@ -132,7 +125,7 @@ class TestPearlGateway:
         await gateway.start()
 
         # Should not call any start methods
-        mock_pearl_gateway_components["pearl_client"].__aenter__.assert_not_called()
+        mock_pearl_gateway_components["pearl_client"].start.assert_not_called()
         mock_pearl_gateway_components["scheduler"].start.assert_not_called()
         mock_pearl_gateway_components["proof_pool"].start.assert_not_called()
         mock_pearl_gateway_components["miner_rpc"].start.assert_not_called()
@@ -152,13 +145,9 @@ class TestPearlGateway:
         mock_pearl_gateway_components["miner_rpc"].stop.assert_called_once()
         mock_pearl_gateway_components["proof_pool"].stop.assert_called_once()
         mock_pearl_gateway_components["scheduler"].stop.assert_called_once()
-        mock_pearl_gateway_components["pearl_client"].__aexit__.assert_called_once_with(
-            None, None, None
-        )
+        mock_pearl_gateway_components["pearl_client"].stop.assert_called_once()
 
-        # Verify log messages
         calls = mock_pearl_gateway_components["logger"].info.call_args_list
-        assert call("Stopping PearlGateway") in calls
         assert call("PearlGateway stopped") in calls
 
     @pytest.mark.asyncio
@@ -174,7 +163,7 @@ class TestPearlGateway:
         # Should not call any stop methods
         mock_pearl_gateway_components["miner_rpc"].stop.assert_not_called()
         mock_pearl_gateway_components["scheduler"].stop.assert_not_called()
-        mock_pearl_gateway_components["pearl_client"].__aexit__.assert_not_called()
+        mock_pearl_gateway_components["pearl_client"].stop.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_pearl_gateway_start_pearl_client_error(
@@ -184,7 +173,7 @@ class TestPearlGateway:
         gateway = PearlGateway()
 
         # Make pearl client start fail
-        mock_pearl_gateway_components["pearl_client"].__aenter__.side_effect = ConnectionError(
+        mock_pearl_gateway_components["pearl_client"].start.side_effect = ConnectionError(
             "Connection failed"
         )
 
@@ -241,7 +230,7 @@ class TestPearlGateway:
         assert gateway.running is False
 
         # Verify all components were properly managed
-        mock_pearl_gateway_components["pearl_client"].__aenter__.assert_called_once()
+        mock_pearl_gateway_components["pearl_client"].start.assert_called_once()
         mock_pearl_gateway_components["scheduler"].start.assert_called_once()
         mock_pearl_gateway_components["proof_pool"].start.assert_called_once()
         mock_pearl_gateway_components["miner_rpc"].start.assert_called_once()
@@ -249,4 +238,4 @@ class TestPearlGateway:
         mock_pearl_gateway_components["miner_rpc"].stop.assert_called_once()
         mock_pearl_gateway_components["proof_pool"].stop.assert_called_once()
         mock_pearl_gateway_components["scheduler"].stop.assert_called_once()
-        mock_pearl_gateway_components["pearl_client"].__aexit__.assert_called_once()
+        mock_pearl_gateway_components["pearl_client"].stop.assert_called_once()

@@ -62,30 +62,6 @@ class TestMinerRpcIntegrationTcp:
 
         await server.stop()
 
-    @pytest.fixture
-    async def running_auth_server(self, mock_services, sample_block_template):
-        """Start a TCP server with authentication for testing."""
-        work_cache, submission_service = mock_services
-
-        # Setup mock responses
-        mining_job = MiningJob.from_template(sample_block_template)
-        work_cache.get_mining_job.return_value = mining_job
-        work_cache.current_template = sample_block_template
-        submission_service.submit_plain_proof.return_value = {"status": "accepted"}
-
-        config = MinerRpcConfig(
-            transport="tcp",
-            socket_path="",
-            port=18447,
-        )
-
-        server = MinerRpcServer(work_cache, submission_service, config)
-        await server.start()
-
-        yield server, work_cache, submission_service
-
-        await server.stop()
-
     async def test_full_mining_workflow_tcp(self, running_tcp_server, submit_block_data):
         """Test complete mining workflow via TCP."""
         server, work_cache, submission_service = running_tcp_server
@@ -116,31 +92,6 @@ class TestMinerRpcIntegrationTcp:
         # Verify submission service was called (may take a moment due to background task)
         await asyncio.sleep(0.1)
         submission_service.submit_plain_proof.assert_called()
-
-    async def test_authentication_tcp(self, running_auth_server):
-        """Test that authentication is not required (local communication only)."""
-        server, work_cache, submission_service = running_auth_server
-
-        # Test without authentication - should succeed (no auth required)
-        async with MockMinerClient(transport="tcp", port=18447) as client:
-            status, response = await client.get_mining_info()
-
-            assert status == 200
-            assert response["jsonrpc"] == "2.0"
-            assert response.get("error") is None
-            assert "result" in response
-
-        # Test with authentication token - should also succeed (token ignored)
-        async with MockMinerClient(
-            transport="tcp",
-            port=18447,
-        ) as client:
-            status, response = await client.get_mining_info()
-
-            assert status == 200
-            assert response["jsonrpc"] == "2.0"
-            assert response.get("error") is None
-            assert "result" in response
 
     async def test_concurrent_requests_tcp(self, running_tcp_server):
         """Test handling concurrent requests via TCP."""

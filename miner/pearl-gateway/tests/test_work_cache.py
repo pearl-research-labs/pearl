@@ -3,7 +3,6 @@ Test work cache functionality.
 """
 
 import asyncio
-from unittest.mock import patch
 
 import pytest
 from bitcoinutils.transactions import Transaction
@@ -48,24 +47,15 @@ class TestTemplateUpdate:
 
     @pytest.mark.asyncio
     async def test_update_template_first_time(self, work_cache, sample_block_template):
-        """Test updating template for the first time."""
-        with patch("time.time", return_value=1000.0):
-            result = await work_cache.update_template(sample_block_template)
+        result = await work_cache.update_template(sample_block_template)
 
         assert result is True
         assert work_cache.current_template == sample_block_template
-        assert work_cache.last_update_time == 1000.0
 
     @pytest.mark.asyncio
     async def test_update_template_same_template(self, work_cache, sample_block_template):
-        """Test updating with the same template doesn't change anything."""
-        # First update
-        with patch("time.time", return_value=1000.0):
-            result1 = await work_cache.update_template(sample_block_template)
-
-        # Second update with same template
-        with patch("time.time", return_value=1005.0):
-            result2 = await work_cache.update_template(sample_block_template)
+        result1 = await work_cache.update_template(sample_block_template)
+        result2 = await work_cache.update_template(sample_block_template)
 
         assert result1 is True
         assert result2 is False
@@ -74,18 +64,11 @@ class TestTemplateUpdate:
     async def test_update_template_different_template(
         self, work_cache, sample_block_template, different_block_template
     ):
-        """Test updating with a different template."""
-        # First update
-        with patch("time.time", return_value=1000.0):
-            await work_cache.update_template(sample_block_template)
-
-        # Update with different template
-        with patch("time.time", return_value=1010.0):
-            result = await work_cache.update_template(different_block_template)
+        await work_cache.update_template(sample_block_template)
+        result = await work_cache.update_template(different_block_template)
 
         assert result is True
         assert work_cache.current_template == different_block_template
-        assert work_cache.last_update_time == 1010.0
 
     @pytest.mark.asyncio
     async def test_update_template_thread_safety(
@@ -170,40 +153,6 @@ class TestMiningJob:
             assert job.target == sample_block_template.target
 
 
-class TestCacheInvalidation:
-    """Test cache invalidation functionality."""
-
-    @pytest.mark.asyncio
-    async def test_invalidate_empty_cache(self, work_cache):
-        """Test invalidating an empty cache."""
-        await work_cache.invalidate()
-
-        assert work_cache.current_template is None
-        assert work_cache.last_update_time == 0
-
-    @pytest.mark.asyncio
-    async def test_invalidate_cache_with_template(self, work_cache, sample_block_template):
-        """Test invalidating cache with existing template."""
-        # Set up cache with template
-        await work_cache.update_template(sample_block_template)
-        await work_cache.get_mining_job()  # Get a job
-
-        # Invalidate
-        await work_cache.invalidate()
-
-        assert work_cache.current_template is None
-        assert work_cache.last_update_time == 0
-
-    @pytest.mark.asyncio
-    async def test_get_mining_job_after_invalidation(self, work_cache, sample_block_template):
-        """Test getting mining job after invalidation raises error."""
-        await work_cache.update_template(sample_block_template)
-        await work_cache.invalidate()
-
-        with pytest.raises(MiningPausedError, match="no block template available"):
-            await work_cache.get_mining_job()
-
-
 class TestCacheIntegration:
     """Test WorkCache integration scenarios."""
 
@@ -211,43 +160,21 @@ class TestCacheIntegration:
     async def test_full_cache_workflow(
         self, work_cache, sample_block_template, different_block_template
     ):
-        """Test a complete cache workflow."""
-        # 1. Start with empty cache
         assert work_cache.current_template is None
 
-        # 2. Update with first template
-        result1 = await work_cache.update_template(sample_block_template)
-        assert result1 is True
-
-        # 3. Get mining jobs
+        assert await work_cache.update_template(sample_block_template) is True
         job1 = await work_cache.get_mining_job()
         job2 = await work_cache.get_mining_job()
-
-        # Jobs should be identical since they're from the same template
         assert job1.incomplete_header_bytes == job2.incomplete_header_bytes
         assert job1.target == job2.target
 
-        # 4. Update with same template (should not update)
-        result2 = await work_cache.update_template(sample_block_template)
-        assert result2 is False
-
-        # 5. Update with different template
-        result3 = await work_cache.update_template(different_block_template)
-        assert result3 is True
+        assert await work_cache.update_template(sample_block_template) is False
+        assert await work_cache.update_template(different_block_template) is True
         assert work_cache.current_template == different_block_template
 
-        # 6. Get job from new template
         job3 = await work_cache.get_mining_job()
         assert (
             job3.incomplete_header_bytes
             == different_block_template.header.serialize_without_proof_commitment()
         )
         assert job3.target == different_block_template.target
-
-        # 7. Invalidate
-        await work_cache.invalidate()
-        assert work_cache.current_template is None
-
-        # 8. Try to get job after invalidation
-        with pytest.raises(MiningPausedError):
-            await work_cache.get_mining_job()

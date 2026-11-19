@@ -68,11 +68,6 @@ class TensorHashConfig:
 # resolve ``config=None`` from the device autotune records instead.
 _DEFAULT_CONFIG = TensorHashConfig()
 
-# When True, commitment wrappers reject leaves other than BLAKE3's native
-# 1024. Production miners overlay that protocol leaf on autotune knobs;
-# tests keep this False to run other leaves.
-_REQUIRE_PROTOCOL_LEAF = False
-
 
 def tensor_hash_plus_stats_record_is_legal(kwargs: dict, arch: Arch | None = None) -> bool:
     """True when ``kwargs`` construct a config a commitment record may carry.
@@ -166,46 +161,20 @@ def _resolve_config(
     return get_tensor_hash_plus_stats_config(m, k, device=device) if config is None else config
 
 
-def tensor_hash_workspace_split(
-    m: int,
-    k: int,
-    config: TensorHashConfig | None = None,
-    device: torch.device | int | None = None,
-) -> tuple[int, int]:
-    """Return the per-blob roots workspace sizes ``(codes, scales)`` in bytes.
-
-    A sizing/capacity formula only: the runtime split point between the two
-    blobs' slices is internal to the launch (it shrinks when thread
-    coarsening takes effect) and the digests land in ``root_codes`` /
-    ``root_scales`` regardless. ``config=None`` uses the same autotune
-    record the plus-stats launch would pick for ``(m, k)`` on ``device``
-    (current CUDA device when omitted).
-    """
-    config = _resolve_config(config, m, k, device)
-    codes_shape, scales_shape = pre_quant_output_shapes(m, k)
-    codes_bytes = codes_shape[0] * codes_shape[1]
-    scales_bytes = scales_shape[0] * scales_shape[1] * 2
-    return (
-        tensor_hash_scratchpad_bytes(codes_bytes, config),
-        tensor_hash_scratchpad_bytes(scales_bytes, config),
-    )
-
-
 def tensor_hash_workspace_bytes(
     m: int,
     k: int,
     config: TensorHashConfig | None = None,
     device: torch.device | int | None = None,
 ) -> int:
-    """Return the required caller-owned roots workspace size.
-
-    ``(m, k)`` is the logical activation shape; the two hashed payloads are
-    the ``(m, k)`` int8 codes blob and the ``(m, k/8)`` BF16 scales blob,
-    which share one workspace as two back-to-back slices. ``config=None``
-    uses the autotune record for ``(m, k)`` on ``device`` (current CUDA
-    device when omitted).
-    """
-    return sum(tensor_hash_workspace_split(m, k, config, device))
+    """Return required caller-owned roots workspace bytes for both (m, k) planes."""
+    config = _resolve_config(config, m, k, device)
+    codes_shape, scales_shape = pre_quant_output_shapes(m, k)
+    codes_bytes = codes_shape[0] * codes_shape[1]
+    scales_bytes = scales_shape[0] * scales_shape[1] * 2
+    return tensor_hash_scratchpad_bytes(codes_bytes, config) + tensor_hash_scratchpad_bytes(
+        scales_bytes, config
+    )
 
 
 def tensor_hash_scratchpad_bytes(
@@ -276,12 +245,6 @@ def _validate_committed_planes(
     operands (the activation path's ``seed_b``/``a_keys``), so each
     wrapper runs one complete disjoint-storage validation.
     """
-    if _REQUIRE_PROTOCOL_LEAF and config.chunk_size != _blake3.CHUNK_SIZE:
-        raise ValueError(
-            f"commitments require the fixed {_blake3.CHUNK_SIZE}-byte proof leaf, "
-            f"got chunk_size={config.chunk_size} (the proof chain cannot open "
-            "other leaves; they stay an offline protocol-leaf experiment)"
-        )
     m, k = codes.shape
     codes_shape, scales_shape = pre_quant_output_shapes(m, k)
     device = codes.device
@@ -391,7 +354,7 @@ def tensor_hash_plus_stats_b(
     is bit-identical to a standalone ``tensor_hash`` over its bytes (``key``
     is ``keyB``); ``HB = blake3(root_codes || root_scales, key=keyB)`` and
     ``noise seedB`` are two host-side combines that stay on the caller's CPU
-    path (``miner_base.commitment_hash``; they run once per job, off the hot
+    path (``miner_base.protocol``; they run once per job, off the hot
     path).
 
     ``stats`` receives the fp32 ``(sumsq, absmax)`` pair per 512-element
@@ -437,7 +400,7 @@ def tensor_hash_plus_stats(
     ``seed_b`` is B's 32-byte noise seed and ``p_a`` the 9-byte dense ``pA``
     encoding (``MiningConfiguration.p_a(m)``; a compile-time constant, so a
     different lottery layout or leaf recompiles the finalize). ``a_keys`` is
-    the 96-byte output (``miner_base.commitment_hash.AKeys``).
+    the 96-byte output (``miner_base.protocol.AKeys``).
 
     MoE launches pass the 11-byte MoE ``pA`` together with
     ``routing_commitments``, the 64-byte ``HR || HO`` device digests of the

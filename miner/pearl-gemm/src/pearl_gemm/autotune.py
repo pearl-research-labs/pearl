@@ -491,13 +491,8 @@ def tune_tensor_hash_plus_stats(m: int, k: int) -> list[dict]:
 
 
 def tune_noisy_quant(m: int, k: int) -> list[dict]:
-    from .api import (
-        NoisyQuantConfig,
-        noisy_quant,
-        pack_noise_factor,
-        pre_quant,
-        pre_quant_output_shapes,
-    )
+    from .noisy_quant import NoisyQuantConfig, noisy_quant, pack_noise_factor
+    from .pre_quant import pre_quant, pre_quant_output_shapes
 
     # Noising timing is data-independent, but the blob slots come from
     # pre_quant so the staged scales stay finite.
@@ -550,7 +545,8 @@ def tune_noisy_quant(m: int, k: int) -> list[dict]:
 
 
 def tune_mixed_gemm(m: int, n: int, k: int) -> list[dict]:
-    from .api import HitSignal, HitSignalConfig, MixedGemmConfig, mixed_gemm
+    from .mixed_gemm import MixedGemmConfig, mixed_gemm
+    from .pow import HitSignal, HitSignalConfig
 
     a_slots = [
         (

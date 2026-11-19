@@ -10,7 +10,7 @@ from pearl_gateway.blockchain_utils.zk_certificate import (
     CertificateVersion,
     ZKCertificate,
 )
-from pearl_gateway.proof_generator import ProofGenerator
+from pearl_gateway.submission_service import build_block
 from pearl_mining import MIN_MOE_PUBLICDATA_SIZE, PUBLICDATA_SIZE
 
 HEADER_HASH = bytes(range(32))
@@ -61,7 +61,6 @@ def test_serialize_round_trip(cert_version):
     if cert_version == CertificateVersion.PLAIN_FP8:
         expected += b"\x00"
     assert wire == expected
-    assert len(wire) == certificate.get_serialized_size()
     assert restored.cert_version == cert_version
     assert restored.header_hash == HEADER_HASH
     assert bytes(restored.proof.public_data) == public_data
@@ -84,7 +83,6 @@ def test_v4_serializes_complete_ancestors_in_order(count):
     expected = _v4_wire(public_data, PROOF_DATA, bytes([count]) + b"".join(raw_headers))
 
     assert certificate.serialize() == expected
-    assert certificate.get_serialized_size() == len(expected)
     restored = ZKCertificate.deserialize(expected)
     assert [header.serialize() for header in restored.ancestor_headers] == list(raw_headers)
     committed = struct.pack("<I", 4) + public_data
@@ -135,8 +133,6 @@ def test_v4_blob_size_limits(field):
     certificate.proof = CertificateProof(**parts)
     with pytest.raises(ValueError):
         certificate.serialize()
-    with pytest.raises(ValueError):
-        certificate.get_serialized_size()
 
 
 @pytest.mark.parametrize("cert_version", list(CertificateVersion))
@@ -150,8 +146,6 @@ def test_ancestor_count_limit_for_each_version(cert_version):
     )
     with pytest.raises(ValueError):
         certificate.serialize()
-    with pytest.raises(ValueError):
-        certificate.get_serialized_size()
 
 
 @pytest.mark.parametrize("commitment", [None, b"\x00"])
@@ -191,10 +185,10 @@ def test_v4_block_framing(count):
 
 def test_build_block_certifies_the_supplied_ancestor_chain(sample_block_template):
     template = replace(sample_block_template, required_cert_version=CertificateVersion.PLAIN_FP8)
-    block = ProofGenerator.build_block(b"public", PROOF_DATA, template, ANCESTOR_BYTES[1:])
+    block = build_block(b"public", PROOF_DATA, template, ANCESTOR_BYTES[1:])
     restored = ZKCertificate.deserialize(block.zk_certificate.serialize())
     assert [header.serialize() for header in restored.ancestor_headers] == list(ANCESTOR_BYTES[1:])
-    block = ProofGenerator.build_block(b"public", PROOF_DATA, template)
+    block = build_block(b"public", PROOF_DATA, template)
     assert block.zk_certificate.ancestor_headers == []
 
 
@@ -207,17 +201,3 @@ def test_all_versions_reject_oversized_proofs(cert_version):
 
     with pytest.raises(ValueError, match="Proof data is too large"):
         ZKCertificate(HEADER_HASH, proof, cert_version)
-
-
-@pytest.mark.parametrize(
-    ("cert_version", "expected"),
-    [
-        (CertificateVersion.ZK_DENSE, False),
-        (CertificateVersion.ZK_MOE, False),
-        (CertificateVersion.ZK_V3, True),
-        (CertificateVersion.PLAIN_FP8, True),
-    ],
-)
-def test_uses_salted_seeds(cert_version, expected):
-    """Test that only V3 and later select the salted noise-seed derivation."""
-    assert cert_version.uses_salted_seeds is expected

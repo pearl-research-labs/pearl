@@ -17,7 +17,7 @@ kernel's reassociated epilogue sits ~3e-3 from the fp64-exact mid.
 import pytest
 import torch
 from blake3 import blake3
-from miner_base.commitment_hash import noise_line_key
+from miner_base.protocol import noise_line_key
 
 from pearl_gemm import (
     NoiseLoadMode,

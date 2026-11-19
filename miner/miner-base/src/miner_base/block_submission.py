@@ -1,104 +1,72 @@
-"""CPU construction and gateway handoff for certificate-v4 FP8 plain proofs.
+"""CPU construction, local verification, and gateway handoff for cert-v4 FP8 plain proofs."""
 
-GPU and framework adapters extract the committed planes for a winning tile;
-this module validates that opening, builds and verifies the consensus
-``PlainProofV4``, and submits admissible candidates through the miner RPC
-client. The proof opens A's trees under ``keyA``, derived from the proposed
-header, and B's under ``keyB``, derived from a complete ancestor header in
-the four-header state window. The proof carries the intermediate headers
-that connect the proposed header to that ancestor, parent first.
-"""
+from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Any
 
 import pearl_mining
 import torch
 from blake3 import blake3
-from miner_utils.logging_config import get_logger
+from miner_utils import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_mining import (
     CERT_VERSION_PLAIN_FP8,
     IncompleteBlockHeader,
     PlainProofV4,
+    diagnose_jackpot_policy_v4,
     verify_plain_proof_for_cert_version,
 )
 
 from .commitment import (
-    BlockHeader,
-    Device,
-    HashId,
     MatrixMerkleProof,
-    MiningConfiguration,
-    OperandParams,
     PlanarCommitment,
     commit_planes,
     commit_routing,
-    commitment_keys,
-    hash_id_for_leaf,
     hash_offsets,
     routing_leaf_indices,
+    tensor_bytes,
 )
-from .jackpot_log import format_report
-from .mining_config import COMMITMENT_CHUNK_SIZE
 from .prequant import DEFAULT_BLOCK_SIZE
+from .protocol import (
+    Device,
+    HashId,
+    MiningConfiguration,
+    OperandParams,
+    commitment_keys,
+)
 
 _LOGGER = get_logger(__name__)
 
-# Every cert-v4 policy rejection arrives as this sentence. Which of the
-# checks failed is recovered from the opened tile and written to the debug log.
 _JACKPOT_INADMISSIBLE = "The jackpot is not admissible"
 
-# Detailed rejection logs are capped for the life of the process. The counter
-# is not reset per job: a miner that keeps losing the policy should not fill
-# the log. One warning marks the cap.
+# Detailed rejection logs are capped for the life of the process so repeated
+# rejections cannot flood logs. One warning marks the cap.
 _JACKPOT_LOG_LIMIT = 32
 _jackpot_logs_emitted = 0
 _jackpot_log_cap_warned = False
 
-_PLANE_LABELS = {
-    "codes_a": "A codes",
-    "scales_a": "A scales",
-    "codes_b": "B codes",
-    "scales_b": "B scales",
+_NATIVE_DEVICE = {
+    Device.HOPPER: pearl_mining.Device.H100,
+    Device.BLACKWELL: pearl_mining.Device.B200,
 }
-
-# Merkle leaf the GPU commit and the CPU proof chain open by default. Aliased
-# here so winner handoff, B-proof rebuild, and ``MiningConfiguration.chunk_size``
-# share one definition.
-PROTOCOL_COMMITMENT_LEAF = COMMITMENT_CHUNK_SIZE
-
-
-def commit_planes_for_leaf(
-    planes: list[torch.Tensor], key: bytes, leaf: int = PROTOCOL_COMMITMENT_LEAF
-) -> PlanarCommitment:
-    """The CPU commitment for planes the GPU committed at ``leaf`` under ``key``."""
-    return commit_planes(planes, key, hash_id_for_leaf(leaf))
-
-
-class PlainProofClient(Protocol):
-    def submit_plain_proof(self, plain_proof: PlainProofV4, mining_job: MiningJob) -> None: ...
+_NATIVE_HASH_ID = {
+    HashId.BLAKE3_CHUNK_128: pearl_mining.HashId.Blake3Chunk128,
+    HashId.BLAKE3_CHUNK_256: pearl_mining.HashId.Blake3Chunk256,
+    HashId.BLAKE3_CHUNK_512: pearl_mining.HashId.Blake3Chunk512,
+    HashId.BLAKE3_CHUNK_1024: pearl_mining.HashId.Blake3Chunk1024,
+}
 
 
 @dataclass(frozen=True)
 class PrebuiltCommitment:
-    """A planar commitment paired with the side's opening key it was built under."""
-
     commitment: PlanarCommitment
     key: bytes
 
 
 @dataclass(frozen=True)
 class MoEBlockInfo:
-    """The routing witness of one MoE winning tile.
-
-    ``routing`` is the canonical flat table ``R[0] || ... || R[E-1]`` (each
-    expert's token indices ascending) and ``offsets`` its cumulative end
-    offsets ``O``. The tile's rows are ``R[expert_index][inner_a_rows]``, and
-    the opening's ``a_row_indices`` must be exactly those global tokens.
-    """
-
     expert_index: int
     inner_a_rows: tuple[int, ...]
     routing: tuple[int, ...]
@@ -108,9 +76,7 @@ class MoEBlockInfo:
         start = self.offsets[self.expert_index - 1] if self.expert_index else 0
         return tuple(self.routing[start : self.offsets[self.expert_index]])
 
-    def owned_copy(self) -> "MoEBlockInfo":
-        """Snapshot every sequence: a list-backed witness handed off
-        asynchronously must not change under the queued proof."""
+    def owned_copy(self) -> MoEBlockInfo:
         return MoEBlockInfo(
             expert_index=self.expert_index,
             inner_a_rows=tuple(self.inner_a_rows),
@@ -121,13 +87,7 @@ class MoEBlockInfo:
 
 @dataclass(frozen=True)
 class OpenedBlockInfo:
-    """CPU-resident committed planes and indices for one winning tile.
-
-    For an MoE layer (``mining_config.experts``) the planes are the full
-    activation ``A`` and the stacked expert weights, ``a_row_indices`` are the
-    global token indices of the tile and ``b_column_indices`` the global
-    stacked weight rows; ``moe`` carries the routing witness.
-    """
+    """CPU-resident committed planes and indices for one winning tile."""
 
     a_row_indices: tuple[int, ...] | list[int]
     b_column_indices: tuple[int, ...] | list[int]
@@ -139,30 +99,22 @@ class OpenedBlockInfo:
     b_commitment: PrebuiltCommitment | None = None
     a_commitment: PrebuiltCommitment | None = None
     moe: MoEBlockInfo | None = None
-    b_ancestor_header: bytes | None = None  # Full 108-byte header; None selects the parent.
+    b_ancestor_header: bytes | None = None  # Full 108-byte header; None selects parent.
 
-    def owned_copy(self) -> "OpenedBlockInfo":
-        """Validate and snapshot mutable inputs for an asynchronous handoff."""
+    def owned_copy(self) -> OpenedBlockInfo:
+        """Validate and snapshot mutable inputs for async handoff (keeping prebuilt bundles by ref)."""
         _validate_opening(self)
-        prebuilt_a = self.a_commitment
-        prebuilt_b = self.b_commitment
         return OpenedBlockInfo(
             moe=None if self.moe is None else self.moe.owned_copy(),
             a_row_indices=tuple(self.a_row_indices),
             b_column_indices=tuple(self.b_column_indices),
-            # A prebuilt tree was built from these exact owned hit planes. Keep
-            # that immutable ownership bundle together instead of cloning the
-            # tensors away from the tree that will open them.
-            a_codes=self.a_codes if prebuilt_a is not None else self.a_codes.clone(),
-            a_scales=self.a_scales if prebuilt_a is not None else self.a_scales.clone(),
-            # A prebuilt tree owns the B opening. Keep its stable plane metadata
-            # by reference instead of cloning a weights-sized operand solely
-            # for asynchronous proof construction.
-            b_codes=self.b_codes if prebuilt_b is not None else self.b_codes.clone(),
-            b_scales=self.b_scales if prebuilt_b is not None else self.b_scales.clone(),
+            a_codes=self.a_codes if self.a_commitment is not None else self.a_codes.clone(),
+            a_scales=self.a_scales if self.a_commitment is not None else self.a_scales.clone(),
+            b_codes=self.b_codes if self.b_commitment is not None else self.b_codes.clone(),
+            b_scales=self.b_scales if self.b_commitment is not None else self.b_scales.clone(),
             mining_config=replace(self.mining_config),
-            b_commitment=prebuilt_b,
-            a_commitment=prebuilt_a,
+            b_commitment=self.b_commitment,
+            a_commitment=self.a_commitment,
             b_ancestor_header=None
             if self.b_ancestor_header is None
             else bytes(self.b_ancestor_header),
@@ -170,48 +122,36 @@ class OpenedBlockInfo:
 
 
 def is_plain_fp8_job(job: MiningJob) -> bool:
-    """Whether the issuing endpoint advertised certificate-v4 FP8 through ``job``."""
     return int(job.cert_version) == CERT_VERSION_PLAIN_FP8
 
 
-def _validate_plane(plane: torch.Tensor, name: str, dtype: torch.dtype) -> None:
-    if not isinstance(plane, torch.Tensor):
-        raise ValueError(f"{name} must be a torch.Tensor, got {type(plane).__name__}")
-    if plane.dim() != 2:
-        raise ValueError(f"{name} must be 2D, got shape {tuple(plane.shape)}")
-    if plane.device.type != "cpu":
-        raise ValueError(f"{name} must be a CPU tensor, got device {plane.device}")
-    if plane.dtype is not dtype:
-        raise ValueError(f"{name} must be {dtype}, got {plane.dtype}")
-
-
-def _validate_operand(
-    codes: torch.Tensor,
-    scales: torch.Tensor,
-    codes_name: str,
-    scales_name: str,
-) -> None:
-    _validate_plane(codes, codes_name, torch.int8)
-    _validate_plane(scales, scales_name, torch.bfloat16)
-    rows, cols = codes.shape
-    if cols % DEFAULT_BLOCK_SIZE:
-        raise ValueError(
-            f"{codes_name} columns ({cols}) must be divisible by the block size "
-            f"{DEFAULT_BLOCK_SIZE}"
-        )
-    expected = (rows, cols // DEFAULT_BLOCK_SIZE)
-    if tuple(scales.shape) != expected:
-        raise ValueError(
-            f"{scales_name} must be {expected} for {codes_name} {(rows, cols)}, "
-            f"got {tuple(scales.shape)}"
-        )
-
-
 def _validate_planes(name: str, codes: torch.Tensor, scales: torch.Tensor) -> tuple[int, int]:
-    _validate_operand(codes, scales, f"{name.lower()}_codes", f"{name.lower()}_scales")
+    for plane, label, dtype in (
+        (codes, f"{name.lower()}_codes", torch.int8),
+        (scales, f"{name.lower()}_scales", torch.bfloat16),
+    ):
+        if not isinstance(plane, torch.Tensor):
+            raise ValueError(f"{label} must be a torch.Tensor, got {type(plane).__name__}")
+        if plane.dim() != 2:
+            raise ValueError(f"{label} must be 2D, got shape {tuple(plane.shape)}")
+        if plane.device.type != "cpu":
+            raise ValueError(f"{label} must be a CPU tensor, got device {plane.device}")
+        if plane.dtype is not dtype:
+            raise ValueError(f"{label} must be {dtype}, got {plane.dtype}")
     rows, k = codes.shape
     if rows <= 0 or k <= 0:
         raise ValueError(f"{name} codes shape must be positive, got {codes.shape}")
+    if k % DEFAULT_BLOCK_SIZE:
+        raise ValueError(
+            f"{name.lower()}_codes columns ({k}) must be divisible by the block size "
+            f"{DEFAULT_BLOCK_SIZE}"
+        )
+    expected = (rows, k // DEFAULT_BLOCK_SIZE)
+    if tuple(scales.shape) != expected:
+        raise ValueError(
+            f"{name.lower()}_scales must be {expected} for {name.lower()}_codes {(rows, k)}, "
+            f"got {tuple(scales.shape)}"
+        )
     if not codes.is_contiguous() or not scales.is_contiguous():
         raise ValueError(f"{name} committed planes must be contiguous")
     return rows, k
@@ -219,7 +159,7 @@ def _validate_planes(name: str, codes: torch.Tensor, scales: torch.Tensor) -> tu
 
 def _validate_indices(
     name: str,
-    indices: tuple[int, ...] | list[int],
+    indices: Sequence[int],
     row_count: int,
     size: int,
 ) -> None:
@@ -233,42 +173,34 @@ def _validate_indices(
     if any(index < 0 or index >= row_count for index in normalized):
         raise ValueError(f"{name} contains an index outside [0, {row_count})")
     base = normalized[0]
-    expected = tuple(range(base, base + size))
-    if base % size or normalized != expected:
+    if base % size or normalized != tuple(range(base, base + size)):
         raise ValueError(f"{name} does not match one committed lottery tile")
 
 
-def _validate_opening(opened_block_info: OpenedBlockInfo) -> tuple[int, int, int]:
-    m, k = _validate_planes("A", opened_block_info.a_codes, opened_block_info.a_scales)
-    n, b_k = _validate_planes("B", opened_block_info.b_codes, opened_block_info.b_scales)
+def _validate_opening(opened: OpenedBlockInfo) -> tuple[int, int, int]:
+    m, k = _validate_planes("A", opened.a_codes, opened.a_scales)
+    n, b_k = _validate_planes("B", opened.b_codes, opened.b_scales)
     if k != b_k:
         raise ValueError(f"common dimension mismatch: A has k={k}, B has k={b_k}")
 
-    config = opened_block_info.mining_config
+    config = opened.mining_config
     if k != config.common_dim:
         raise ValueError(f"opening k={k} does not match mining configuration k={config.common_dim}")
-    moe = opened_block_info.moe
+    moe = opened.moe
     if (moe is None) != (config.experts == 0):
         raise ValueError("an MoE opening needs both mining_config.experts and moe")
     if moe is None:
-        _validate_indices("a_row_indices", opened_block_info.a_row_indices, m, config.tile_rows)
-        _validate_indices(
-            "b_column_indices", opened_block_info.b_column_indices, n, config.tile_cols
-        )
+        _validate_indices("a_row_indices", opened.a_row_indices, m, config.tile_rows)
+        _validate_indices("b_column_indices", opened.b_column_indices, n, config.tile_cols)
         return m, n, k
 
-    # MoE: the consecutive lottery window is expert-local. Rows are a tile of the expert's
-    # routing list, columns a tile of the expert's stacked weight rows. The
-    # column indices are checked here as given: the expert-local values handed
-    # to ``_validate_indices`` below are computed (``index - base``), so a bool
-    # would already have become an int there.
     witness = (
         moe.expert_index,
         *moe.offsets,
         *moe.routing,
         *moe.inner_a_rows,
-        *opened_block_info.a_row_indices,
-        *opened_block_info.b_column_indices,
+        *opened.a_row_indices,
+        *opened.b_column_indices,
     )
     if any(type(v) is not int for v in witness):
         raise TypeError("MoE witness fields must be integers")
@@ -278,12 +210,12 @@ def _validate_opening(opened_block_info: OpenedBlockInfo) -> tuple[int, int, int
     _validate_routing_witness(moe, config.experts, m)
     expert_rows = moe.expert_rows()
     _validate_indices("inner_a_rows", moe.inner_a_rows, len(expert_rows), config.tile_rows)
-    if tuple(opened_block_info.a_row_indices) != tuple(expert_rows[i] for i in moe.inner_a_rows):
+    if tuple(opened.a_row_indices) != tuple(expert_rows[i] for i in moe.inner_a_rows):
         raise ValueError("a_row_indices are not the routed tokens of inner_a_rows")
     base = moe.expert_index * n_e
     _validate_indices(
         "b_column_indices",
-        tuple(index - base for index in opened_block_info.b_column_indices),
+        tuple(index - base for index in opened.b_column_indices),
         n_e,
         config.tile_cols,
     )
@@ -291,15 +223,6 @@ def _validate_opening(opened_block_info: OpenedBlockInfo) -> tuple[int, int, int
 
 
 def _validate_routing_witness(moe: MoEBlockInfo, experts: int, m: int) -> None:
-    """``(routing, offsets)`` is the canonical routing table.
-
-    The witness is committed and Merkle-indexed as exact integers (checked by
-    the caller). ``offsets`` is the cumulative partition of the flat table:
-    one end offset per expert, non-decreasing, the last being its length;
-    every token index lies in the activation; and each expert's segment is
-    strictly ascending, the only form the verifier reproduces the routing
-    root from.
-    """
     if (
         len(moe.offsets) != experts
         or any(moe.offsets[i] > moe.offsets[i + 1] for i in range(experts - 1))
@@ -320,10 +243,8 @@ def _checked_commitment(
     planes: tuple[torch.Tensor, ...],
     hash_id: HashId,
 ) -> PlanarCommitment:
-    """Validate a prebuilt commitment without rehashing its operand planes."""
     if prebuilt.key != expected_key:
         raise ValueError("prebuilt commitment belongs to another job")
-
     commitment = prebuilt.commitment
     if len(commitment.parts) != len(planes):
         raise ValueError(
@@ -352,20 +273,18 @@ def _checked_commitment(
     return commitment
 
 
-_NATIVE_DEVICE = {
-    Device.HOPPER: pearl_mining.Device.H100,
-    Device.BLACKWELL: pearl_mining.Device.B200,
-}
-_NATIVE_HASH_ID = {
-    HashId.BLAKE3_CHUNK_128: pearl_mining.HashId.Blake3Chunk128,
-    HashId.BLAKE3_CHUNK_256: pearl_mining.HashId.Blake3Chunk256,
-    HashId.BLAKE3_CHUNK_512: pearl_mining.HashId.Blake3Chunk512,
-    HashId.BLAKE3_CHUNK_1024: pearl_mining.HashId.Blake3Chunk1024,
-}
+def _resolve_commitment(
+    prebuilt: PrebuiltCommitment | None,
+    planes: tuple[torch.Tensor, ...],
+    key: bytes,
+    hash_id: HashId,
+) -> PlanarCommitment:
+    if prebuilt is None:
+        return commit_planes(planes, key, hash_id)
+    return _checked_commitment(prebuilt, key, planes, hash_id)
 
 
 def _native_merkle_proof(proof) -> pearl_mining.MerkleProof:
-    """A ``pearl_blake3`` multi-leaf proof as the verifier's own type."""
     return pearl_mining.MerkleProof(
         [bytes(leaf) for leaf in proof.leaf_data],
         list(proof.leaf_indices),
@@ -376,7 +295,6 @@ def _native_merkle_proof(proof) -> pearl_mining.MerkleProof:
 
 
 def _native_matrix_proof(opening: MatrixMerkleProof) -> pearl_mining.MatrixMerkleProof:
-    """The reference opening (a ``pearl_blake3`` proof) as the verifier's own type."""
     return pearl_mining.MatrixMerkleProof(
         _native_merkle_proof(opening.proof), list(opening.row_indices)
     )
@@ -385,7 +303,6 @@ def _native_matrix_proof(opening: MatrixMerkleProof) -> pearl_mining.MatrixMerkl
 def _native_moe(
     moe: MoEBlockInfo, config: MiningConfiguration, key_a: bytes
 ) -> tuple[pearl_mining.MoeParams, pearl_mining.MoeWitness]:
-    """The MoE public fields and witness: ``HR``'s opening of ``R[w]`` and ``O``."""
     params = config.moe_params()
     assert params is not None
     routing, offsets, w = list(moe.routing), list(moe.offsets), moe.expert_index
@@ -414,35 +331,26 @@ def _native_operand(params: OperandParams) -> pearl_mining.OperandParams:
 
 def create_proof(
     opened_block_info: OpenedBlockInfo,
-    header: BlockHeader | IncompleteBlockHeader,
+    header: IncompleteBlockHeader,
     ancestor_header: bytes,
     ancestor_chain: Sequence[bytes] = (),
 ) -> PlainProofV4:
-    """Build a certificate-v4 FP8 ``PlainProofV4`` from a validated winning opening.
-
-    ``header`` is the proposed (incomplete) block header, which keys A's trees;
-    ``ancestor_header`` is the complete 108-byte header that keys B's trees.
-    ``ancestor_chain`` contains the intermediate headers, parent first, and
-    is empty when B is keyed by the parent.
-    """
-    m, n, k = _validate_opening(opened_block_info)
+    """Build a cert-v4 FP8 ``PlainProofV4`` from a validated winning opening."""
+    m, n, _ = _validate_opening(opened_block_info)
     config = opened_block_info.mining_config
-    header_bytes = bytes(header.to_bytes())
-    key_a, key_b = commitment_keys(header_bytes, ancestor_header)
-    a_planes = (opened_block_info.a_codes, opened_block_info.a_scales)
-    if opened_block_info.a_commitment is None:
-        comm_a = commit_planes(list(a_planes), key_a, config.a_hash_id)
-    else:
-        comm_a = _checked_commitment(
-            opened_block_info.a_commitment, key_a, a_planes, config.a_hash_id
-        )
-    b_planes = (opened_block_info.b_codes, opened_block_info.b_scales)
-    if opened_block_info.b_commitment is None:
-        comm_b = commit_planes(list(b_planes), key_b, config.b_hash_id)
-    else:
-        comm_b = _checked_commitment(
-            opened_block_info.b_commitment, key_b, b_planes, config.b_hash_id
-        )
+    key_a, key_b = commitment_keys(bytes(header.to_bytes()), ancestor_header)
+    comm_a = _resolve_commitment(
+        opened_block_info.a_commitment,
+        (opened_block_info.a_codes, opened_block_info.a_scales),
+        key_a,
+        config.a_hash_id,
+    )
+    comm_b = _resolve_commitment(
+        opened_block_info.b_commitment,
+        (opened_block_info.b_codes, opened_block_info.b_scales),
+        key_b,
+        config.b_hash_id,
+    )
     a_values, a_scales = comm_a.open(list(opened_block_info.a_row_indices))
     bt_values, bt_scales = comm_b.open(list(opened_block_info.b_column_indices))
     moe = moe_witness = None
@@ -470,70 +378,31 @@ def create_proof(
     )
 
 
-def _commitment_part(opened: OpenedBlockInfo, side: int, index: int):
-    prebuilt = (opened.a_commitment, opened.b_commitment)[side]
-    if prebuilt is None or index >= len(prebuilt.commitment.parts):
-        return None
-    return prebuilt.commitment.parts[index]
+def _format_tile_digests(opened: OpenedBlockInfo) -> str:
+    a_idx = torch.as_tensor(list(opened.a_row_indices), dtype=torch.int64)
+    b_idx = torch.as_tensor(list(opened.b_column_indices), dtype=torch.int64)
+    parts = []
+    for label, plane, idx in (
+        ("A codes", opened.a_codes, a_idx),
+        ("A scales", opened.a_scales, a_idx),
+        ("B codes", opened.b_codes, b_idx),
+        ("B scales", opened.b_scales, b_idx),
+    ):
+        tile = plane.index_select(0, idx)
+        dtype = str(tile.dtype).removeprefix("torch.")
+        parts.append(
+            f"{label} shape={tuple(tile.shape)} dtype={dtype} blake3={blake3(tensor_bytes(tile)).hexdigest()}"
+        )
+    return " ".join(parts)
 
 
-def _tile_tensor(
-    plane: torch.Tensor | None,
-    rows: Sequence[int],
-    part,
-    dtype: torch.dtype,
-) -> torch.Tensor | None:
-    """The opened rows of one plane, from the tensor or its commitment leaves."""
-    if plane is not None:
-        index = torch.as_tensor(list(rows), dtype=torch.int64)
-        return plane.detach().cpu().index_select(0, index).contiguous()
-    if part is None:
-        return None
-    selected = list(rows)
-    width = part.row_nbytes
-    proof = part.open(selected).proof
-    raw = b"".join(bytes(proof.extract_bytes(int(row) * width, width)) for row in selected)
-    return torch.frombuffer(bytearray(raw), dtype=dtype).reshape(len(selected), -1).clone()
-
-
-def _format_plane(tile: torch.Tensor | None) -> str:
-    """Shape, dtype, and a digest. The raw opened bytes are not logged."""
-    if tile is None:
-        return "-"
-    raw = tile.detach().contiguous().view(torch.uint8).numpy().tobytes()
-    dtype = str(tile.dtype).removeprefix("torch.")
-    return f"shape={tuple(tile.shape)} dtype={dtype} blake3={blake3(raw).hexdigest()}"
-
-
-def _opened_tiles(opened: OpenedBlockInfo) -> dict[str, torch.Tensor | None]:
-    """Named planes of the opened tile. Keys match ``format_report``."""
-    return {
-        "codes_a": _tile_tensor(
-            opened.a_codes, opened.a_row_indices, _commitment_part(opened, 0, 0), torch.int8
-        ),
-        "scales_a": _tile_tensor(
-            opened.a_scales,
-            opened.a_row_indices,
-            _commitment_part(opened, 0, 1),
-            torch.bfloat16,
-        ),
-        "codes_b": _tile_tensor(
-            opened.b_codes,
-            opened.b_column_indices,
-            _commitment_part(opened, 1, 0),
-            torch.int8,
-        ),
-        "scales_b": _tile_tensor(
-            opened.b_scales,
-            opened.b_column_indices,
-            _commitment_part(opened, 1, 1),
-            torch.bfloat16,
-        ),
-    }
-
-
-def _log_jackpot_rejection(opened: OpenedBlockInfo, message: str) -> None:
-    """Debug-log every check and a digest of the opened operands. Never raises."""
+def _log_jackpot_rejection(
+    opened: OpenedBlockInfo,
+    header: IncompleteBlockHeader,
+    plain_proof: PlainProofV4,
+    message: str,
+) -> None:
+    """Debug-log Rust jackpot policy diagnostics and tile plane digests. Never raises."""
     global _jackpot_logs_emitted, _jackpot_log_cap_warned
     if _jackpot_logs_emitted >= _JACKPOT_LOG_LIMIT:
         if not _jackpot_log_cap_warned:
@@ -546,17 +415,8 @@ def _log_jackpot_rejection(opened: OpenedBlockInfo, message: str) -> None:
     _jackpot_logs_emitted += 1
     detail = ""
     try:
-        tiles = _opened_tiles(opened)
-        detail = " ".join(
-            f"{_PLANE_LABELS[name]} {_format_plane(tile)}" for name, tile in tiles.items()
-        )
-        if any(tile is None for tile in tiles.values()):
-            raise ValueError("opened tile is incomplete")
-        report = format_report(
-            **tiles,
-            device=opened.mining_config.device,
-            rank=opened.mining_config.rank,
-        )
+        detail = _format_tile_digests(opened)
+        report = diagnose_jackpot_policy_v4(header, plain_proof)
     except Exception as exc:
         _LOGGER.opt(exception=exc).debug(f"jackpot policy rejected ({message}): {detail}")
         return
@@ -566,15 +426,9 @@ def _log_jackpot_rejection(opened: OpenedBlockInfo, message: str) -> None:
 def submit_opened_block(
     opened_block_info: OpenedBlockInfo,
     mining_job: MiningJob,
-    client: PlainProofClient,
+    client: Any,
 ) -> PlainProofV4 | None:
-    """Verify and hand one certificate-v4 FP8 proof to the gateway.
-
-    ``None`` means the lottery winner failed the independent jackpot policy and
-    was filtered normally. Otherwise, completion means the gateway accepted the
-    JSON-RPC request into its own submission queue; downstream acceptance is a
-    separate gateway-owned lifecycle.
-    """
+    """Verify and hand one cert-v4 FP8 proof to the gateway. Returns ``None`` if policy-filtered."""
     if not is_plain_fp8_job(mining_job):
         raise ValueError(
             "FP8 proof submission requires certificate version "
@@ -582,9 +436,11 @@ def submit_opened_block(
         )
 
     header = IncompleteBlockHeader.from_bytes(mining_job.incomplete_header_bytes)
-    ancestor = opened_block_info.b_ancestor_header
-    if ancestor is None:
-        ancestor = mining_job.parent_header
+    ancestor = (
+        opened_block_info.b_ancestor_header
+        if opened_block_info.b_ancestor_header is not None
+        else mining_job.parent_header
+    )
     plain_proof = create_proof(
         opened_block_info, header, ancestor, mining_job.ancestor_chain_to(ancestor)
     )
@@ -593,20 +449,9 @@ def submit_opened_block(
     )
     if not is_valid:
         if message.startswith(_JACKPOT_INADMISSIBLE):
-            _log_jackpot_rejection(opened_block_info, message)
+            _log_jackpot_rejection(opened_block_info, header, plain_proof, message)
             return None
         raise RuntimeError(f"Plain proof verification failed: {message}")
 
     client.submit_plain_proof(plain_proof, mining_job)
     return plain_proof
-
-
-__all__ = [
-    "MoEBlockInfo",
-    "OpenedBlockInfo",
-    "PrebuiltCommitment",
-    "PlainProofClient",
-    "create_proof",
-    "is_plain_fp8_job",
-    "submit_opened_block",
-]

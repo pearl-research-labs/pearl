@@ -14,11 +14,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from miner_base.commitment import Device
-from miner_base.commitment_hash import noise_seed_b
+from miner_base.protocol import Device, noise_seed_b
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
-from vllm_miner import health, job_prep
+from vllm_miner import capture as health
+from vllm_miner import job_prep
 from vllm_miner import settings as settings_module
 from vllm_miner.job_prep import (
     current_context,
@@ -135,11 +135,11 @@ def async_manager():
 def host_only_runtime(monkeypatch):
     """No CUDA device to pin; kernel warmup is not part of the preparation decision."""
     monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
-    monkeypatch.setattr(job_prep.gpu_config, "settings", SimpleNamespace(no_mining=False))
+    monkeypatch.setattr(job_prep, "miner_settings", lambda: SimpleNamespace(no_mining=False))
     monkeypatch.setattr(settings_module, "_settings", RuntimeSettings(warmup_compile=False))
-    health._BREAKER.reset_for_tests()
+    health._BREAKER._states.clear()
     yield
-    health._BREAKER.reset_for_tests()
+    health._BREAKER._states.clear()
 
 
 @pytest.fixture
@@ -200,10 +200,6 @@ def test_first_job_runs_the_b_chain_and_publishes_in_place(layer, preps, device)
     assert ctx.seed_b == noise_seed_b(b"\x00" * 32, ctx.key_b, ctx.config.p_b(_N))
     assert ctx.b_proof.commit_leaf == layer.buffers.commit_config.chunk_size
     assert ctx.b_proof.ancestor_header == job.parent_header
-    # Every device operand is the steady buffer itself: launches read the
-    # same addresses forever.
-    for name in _ALIASED_OPERANDS:
-        assert getattr(ctx, name) is getattr(layer.buffers, name), name
     assert _threshold_words(layer) == threshold_bytes_for(job, _K, _N, device=device)
     assert bytes(layer.buffers.seed_b_dev.numpy()) == ctx.seed_b
 
@@ -225,8 +221,6 @@ def test_same_parent_reuses_b_and_refreshes_the_context(layer, preps, device, he
     assert published.key_b == first.key_b
     assert published.seed_b == first.seed_b
     assert published.b_proof is first.b_proof
-    for name in _ALIASED_OPERANDS:
-        assert getattr(published, name) is getattr(first, name), name
     assert published.config.device is device
     assert _threshold_words(layer) == threshold_bytes_for(second_job, _K, _N, device=device)
 
@@ -342,7 +336,7 @@ def test_unpublish_forgets_every_registered_layer(layer, preps):
 
 
 def test_current_job_is_none_without_a_runtime(monkeypatch):
-    from vllm_miner import mining_state as runtime
+    from vllm_miner import runtime
 
     monkeypatch.setattr(runtime, "_async_manager", None)
     assert current_job() is None
@@ -355,7 +349,7 @@ def test_startup_preparation_readies_every_layer(layer, preps, monkeypatch):
     monkeypatch.setattr(settings_module, "_settings", RuntimeSettings(warmup_compile=True))
     monkeypatch.setattr(
         "vllm_miner.pipeline.warmup_layer_variants",
-        lambda state, cancelled=None: warmed.append(state) or True,
+        lambda state: warmed.append(state) or True,
     )
     job = _job()
 
@@ -369,7 +363,7 @@ def test_startup_preparation_without_a_job_warms_but_is_not_ready(layer, preps, 
     monkeypatch.setattr(settings_module, "_settings", RuntimeSettings(warmup_compile=True))
     monkeypatch.setattr(
         "vllm_miner.pipeline.warmup_layer_variants",
-        lambda state, cancelled=None: warmed.append(state) or True,
+        lambda state: warmed.append(state) or True,
     )
 
     assert prepare_mining(None) is False
@@ -397,15 +391,13 @@ def test_startup_preparation_isolates_a_failing_layer(layer, monkeypatch):
 
 def test_startup_preparation_incomplete_warmup_disables_only_that_layer(layer, preps, monkeypatch):
     monkeypatch.setattr(settings_module, "_settings", RuntimeSettings(warmup_compile=True))
-    monkeypatch.setattr(
-        "vllm_miner.pipeline.warmup_layer_variants", lambda state, cancelled=None: False
-    )
+    monkeypatch.setattr("vllm_miner.pipeline.warmup_layer_variants", lambda state: False)
     assert prepare_mining(_job()) is False
     assert not layer.mineable
     assert preps == []
 
 
 def test_kill_switch_skips_preparation(layer, preps, monkeypatch):
-    monkeypatch.setattr(job_prep.gpu_config, "settings", SimpleNamespace(no_mining=True))
+    monkeypatch.setattr(job_prep, "miner_settings", lambda: SimpleNamespace(no_mining=True))
     assert prepare_mining(_job()) is False
     assert preps == [] and layer.job_ctx is None

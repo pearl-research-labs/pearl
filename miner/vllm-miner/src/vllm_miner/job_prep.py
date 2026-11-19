@@ -1,45 +1,31 @@
-"""Per-job B-side preparation: in place, synchronous, on the caller's stream.
-
-v4 keys B under a complete ancestor header, choosing the parent for a fresh
-B side and retaining it while that ancestor stays in the four-header state
-window. :func:`prepare_layer` runs the GPU B chain
-(``tensor_hash_plus_stats_b -> seedB -> noise_lines -> noisy_quant_b``) into
-the layer's steady :class:`~vllm_miner.state.LayerBuffers` on the
-current CUDA stream and publishes a :class:`~vllm_miner.state.JobContext`
-describing the job those operands now hold.
-
-:func:`current_context` is the single entry every launch path takes first:
-it returns the published context when it already describes ``job`` and
-prepares in place otherwise. Preparation and mined launches are all
-enqueued by the serving worker thread on its stream, so stream order alone
-guarantees a launch never reads torn operands -- no background thread,
-reader quiesce, or scratch publication is involved. The cost is that the
-first launch after the ancestor expires or a reorg removes it pays that
-layer's B preparation inline. Other job changes reuse B and refresh key A
-and the threshold as needed. On Blackwell, a B side prepared ahead of time
-on the host (``cpu_b``) replaces the inline GPU chain: it is uploaded in
-place on the same stream.
-"""
+"""Per-job B-side preparation: in place, synchronous, on the caller's stream."""
 
 import time
 from dataclasses import replace
 
 import torch
-from miner_base.commitment import MiningConfiguration
-from miner_base.commitment_hash import noise_line_key, noise_seed_b, operand_digest
+from miner_base.protocol import noise_line_key, noise_seed_b, operand_digest
 from miner_utils import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob
 
-from .config import config as gpu_config
+from .capture import mining_attempt
 from .cpu_b import CpuPrepared, cpu_prepared_waiting, discard_cpu_prepared, take_cpu_prepared
-from .mining_config import (
-    commitment_keys_for,
-    mining_configuration,
-    threshold_bytes_for,
-)
+from .mining_config import commitment_keys_for, mining_configuration, threshold_bytes_for
+from .settings import miner_settings, runtime_settings
 from .state import BProofContext, JobContext, LayerBuffers, LayerState, all_states
 
 _LOGGER = get_logger(__name__)
+_CPU_UPLOADED = (
+    "f1",
+    "f1_hl",
+    "f2",
+    "e2",
+    "alpha_b",
+    "beta_b",
+    "inv_alpha_b",
+    "b_prime",
+    "b_peel",
+)
 
 
 def _as_bytes_tensor(payload: bytes) -> torch.Tensor:
@@ -49,17 +35,7 @@ def _as_bytes_tensor(payload: bytes) -> torch.Tensor:
 def _prepare_b_on_gpu(
     state: LayerState, key_a: bytes, key_b: bytes, p_b: bytes, buffers: LayerBuffers
 ) -> bytes:
-    """Run commit, noise generation, and noisy quantization on the current stream.
-
-    Returns B's noise seed. The v4 B chain: ``HB = blake3(roots, key=keyB)``,
-    ``seedB = H_"seed-B"(HB || keyB || pB)``, and every B-side line (``E_B``
-    in-kernel, ``F_B`` here) plus ``F_A`` (``Side.A`` addresses under the same
-    key) is drawn under ``Subkey("noise-line", seedB)``. Nothing on the B side
-    depends on A, so ``noisy_quant_b`` runs against the real ``F_A`` and emits
-    the complete peel; the launches read ``f1_hl``, ``b_peel`` and friends
-    unchanged. The root readback (``.cpu()``) synchronizes the stream, which
-    is what makes ``seedB`` available to derive the noise key.
-    """
+    """Run B-side commit, noise lines, and noisy quantization into ``buffers``."""
     from pearl_gemm import (
         LABEL_F1,
         LABEL_F2,
@@ -88,8 +64,6 @@ def _prepare_b_on_gpu(
 
     buffers.seed_b_dev.copy_(_as_bytes_tensor(seed_b))
     buffers.noise_key_b_dev.copy_(_as_bytes_tensor(noise_line_key(seed_b)))
-    # Each factor is the materialized transpose of its (k, R) line draw; the
-    # packed form is the sibling kernel's noise-UMMA operand.
     for label, factor, packed in (
         (LABEL_F1, buffers.f1, buffers.f1_hl),
         (LABEL_F2, buffers.f2, buffers.f2_hl),
@@ -125,49 +99,9 @@ def _publish(state: LayerState, ctx: JobContext) -> bool:
     return True
 
 
-# The B operands a CPU-prepared B side replaces (launches read all but f1,
-# which the GPU chain reads).
-_CPU_UPLOADED = ("f1", "f1_hl", "f2", "e2", "alpha_b", "beta_b", "inv_alpha_b", "b_prime", "b_peel")
-
-
-def _job_context(
-    state: LayerState,
-    job: MiningJob,
-    config: MiningConfiguration,
-    key_a: bytes,
-    key_b: bytes,
-    seed_b: bytes,
-    b_proof: BProofContext,
-) -> JobContext:
-    buffers = state.buffers
-    assert buffers is not None
-    return JobContext(
-        job=job,
-        config=config,
-        key_a=key_a,
-        key_b=key_b,
-        seed_b=seed_b,
-        target=job.target,
-        key_a_dev=buffers.key_a_dev,
-        seed_b_dev=buffers.seed_b_dev,
-        threshold_dev=buffers.threshold_dev,
-        f1_hl=buffers.f1_hl,
-        f2=buffers.f2,
-        e2=buffers.e2,
-        beta_b=buffers.beta_b,
-        b_prime=buffers.b_prime,
-        b_peel=buffers.b_peel,
-        alpha_b=buffers.alpha_b,
-        inv_alpha_b=buffers.inv_alpha_b,
-        b_proof=b_proof,
-    )
-
-
 def _publish_cpu_prepared(
     state: LayerState, job: MiningJob, ready: CpuPrepared, threshold: torch.Tensor
 ) -> JobContext | None:
-    """Upload a CPU-prepared B side into the layer's steady buffers on the
-    current stream and publish it for ``job``."""
     buffers = state.buffers
     assert buffers is not None
     prepared = ready.prepared
@@ -182,11 +116,16 @@ def _publish_cpu_prepared(
         buffers.noise_key_b_dev.copy_(_as_bytes_tensor(noise_line_key(prepared.seed_b)))
         buffers.threshold_dev.copy_(threshold)
     finally:
-        # The slot returns even when a copy fails, once whatever was enqueued completes.
         uploaded.record()
         ready.uploaded(uploaded)
-    ctx = _job_context(
-        state, job, prepared.config, key_a, prepared.key_b, prepared.seed_b, prepared.b_proof
+    ctx = JobContext(
+        job=job,
+        config=prepared.config,
+        key_a=key_a,
+        key_b=prepared.key_b,
+        seed_b=prepared.seed_b,
+        target=job.target,
+        b_proof=prepared.b_proof,
     )
     if not _publish(state, ctx):
         return None
@@ -195,12 +134,7 @@ def _publish_cpu_prepared(
 
 
 def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
-    """Rewrite this layer's B operands for ``job`` and publish the new context.
-
-    Runs on the caller's current stream. While B's ancestor stays in the state
-    window, reuse B and refresh key A and the lottery threshold. Returns None
-    only when the layer was disabled meanwhile; failures propagate so the caller can isolate it.
-    """
+    """Update this layer's steady B buffers for ``job`` and publish the new JobContext."""
     assert state.buffers is not None
     buffers = state.buffers
     torch.cuda.set_device(state.weight.device)
@@ -210,11 +144,13 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
     threshold = _as_bytes_tensor(threshold_bytes_for(job, state.k, state.lottery_n, device=device))
     with state.lock:
         current = state.job_ctx
+
     ready = take_cpu_prepared(
         state, job, None if current is None else current.b_proof.ancestor_header
     )
     if ready is not None:
         return _publish_cpu_prepared(state, job, ready, threshold)
+
     if current is not None and job.keeps_ancestor(current.b_proof.ancestor_header):
         key_a, _ = commitment_keys_for(job, current.b_proof.ancestor_header)
         if current.key_a != key_a:
@@ -231,22 +167,20 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
     p_b = config.p_b(state.n)
     seed_b = _prepare_b_on_gpu(state, key_a, key_b, p_b, buffers)
     buffers.threshold_dev.copy_(threshold)
-    ctx = _job_context(
-        state,
-        job,
-        config,
-        key_a,
-        key_b,
-        seed_b,
-        BProofContext(
+    ctx = JobContext(
+        job=job,
+        config=config,
+        key_a=key_a,
+        key_b=key_b,
+        seed_b=seed_b,
+        target=job.target,
+        b_proof=BProofContext(
             key_b=key_b,
             ancestor_header=bytes(job.parent_header),
             seed_b=seed_b,
             p_b=p_b,
             codes=state.weight_cpu,
             scales=state.weight_scale_cpu,
-            # The leaf the GPU commit above ran at; the proof-side rebuild
-            # must open the same tree.
             commit_leaf=buffers.commit_config.chunk_size,
         ),
     )
@@ -260,9 +194,7 @@ def prepare_layer(state: LayerState, job: MiningJob) -> JobContext | None:
 
 
 def current_job() -> MiningJob | None:
-    """The manager's live job, or None before the runtime is up (or after a
-    poisoned teardown)."""
-    from .mining_state import try_get_async_manager
+    from .runtime import try_get_async_manager
 
     try:
         manager = try_get_async_manager()
@@ -272,11 +204,6 @@ def current_job() -> MiningJob | None:
 
 
 def current_context(state: LayerState, job: MiningJob | None) -> JobContext | None:
-    """The layer's context for ``job``, preparing in place when it is not current.
-
-    Returns None when there is no job or the layer cannot mine. Must be called
-    on the stream the caller's launches use.
-    """
     if job is None or not state.mineable:
         return None
     with state.lock:
@@ -287,12 +214,6 @@ def current_context(state: LayerState, job: MiningJob | None) -> JobContext | No
 
 
 def unpublish_contexts() -> None:
-    """Forget every layer's job after mining GPU work has been drained.
-
-    The next launch re-prepares. Used by lifecycle boundaries (runtime
-    teardown, weight reload) where the buffers may be rewritten or the job
-    they hold can no longer be trusted.
-    """
     for state in all_states():
         with state.lock:
             state.job_ctx = None
@@ -300,20 +221,10 @@ def unpublish_contexts() -> None:
 
 
 def prepare_mining(job: MiningJob | None) -> bool:
-    """Startup preparation on the calling (serving worker) thread.
-
-    Compiles every configured pipeline variant of each mineable layer
-    (``PEARL_WARMUP_COMPILE``) and, when a job is already known, prepares each
-    layer's B operands for it so the first serving forwards mine without an
-    inline preparation stall. Returns whether every mineable layer is ready
-    to mine ``job`` (always False without a job). Layer failures are isolated
-    to the layer; serving keeps the FP8 fallback for it.
-    """
-    from .health import mining_attempt
+    """Compile configured variants and prepare B for ``job`` on the worker thread."""
     from .pipeline import warmup_layer_variants
-    from .settings import runtime_settings
 
-    if gpu_config.settings.no_mining:
+    if miner_settings().no_mining:
         _LOGGER.warning(
             "MINER_NO_MINING is set: skipping B preparation and kernel warmup. "
             "Encoded layers serve on the FP8 fallback.",

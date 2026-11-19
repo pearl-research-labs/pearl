@@ -33,16 +33,20 @@ import pearl_mining
 import pytest
 import torch
 from blake3 import blake3
-from miner_base.commitment import HashId, commit_planes
-from miner_base.commitment_hash import a_keys as ref_a_keys
-from miner_base.params import MoeParams, encode_p_a
+from miner_base.commitment import commit_planes
 from miner_base.prequant import PrequantMatrix
-from miner_base.transcript import (
+from miner_base.protocol import (
     LABEL_JACKPOT,
     LABEL_NOISE_LINE,
     LABEL_SEED_A,
+    HashId,
+    MoeParams,
+    encode_p_a,
     hash_labelled,
     subkey,
+)
+from miner_base.protocol import (
+    a_keys as ref_a_keys,
 )
 
 from pearl_gemm import (
@@ -54,7 +58,7 @@ from pearl_gemm import (
     tensor_hash_scratchpad_bytes,
     tensor_hash_workspace_bytes,
 )
-from pearl_gemm.tensor_hash_plus_stats import _blake3, _host, _merkle_host
+from pearl_gemm.tensor_hash_plus_stats import _blake3, _merkle_host
 from pearl_gemm.tensor_hash_plus_stats._merkle_host import (
     SUPPORTED_NUM_STAGES,
     SUPPORTED_THREAD_LOAD_SIZES,
@@ -100,11 +104,9 @@ _SMOKE_CHUNKS = [
 
 
 @pytest.fixture
-def experimental_leaves(monkeypatch):
-    """Explicitly allow non-1024 leaves. The wrappers already default to
-    that (miners overlay a committed leaf); the fixture keeps older tests
-    that opted in from depending on the module default."""
-    monkeypatch.setattr(_host, "_REQUIRE_PROTOCOL_LEAF", False)
+def experimental_leaves():
+    """No-op fixture kept for tests covering non-1024 experimental leaves."""
+    yield
 
 
 def _make_input(m, k, seed):

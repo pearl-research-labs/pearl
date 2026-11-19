@@ -1,8 +1,5 @@
 #! /usr/bin/env python3
-
-"""
-CLI for PearlGateway.
-"""
+"""CLI for PearlGateway."""
 
 import argparse
 import asyncio
@@ -15,37 +12,23 @@ from pearl_gateway.pearl_gateway import PearlGateway
 logger = get_logger(__name__)
 
 
-def parse_args():
-    """Parse command line arguments."""
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PearlGateway - Pearl Mining Proxy")
-
-    parser.add_argument(
-        "command",
-        choices=["start", "stop", "status", "version"],
-        help="Command to execute",
-    )
-
-    # Debug mode (can also be set via MINER_DEBUG env var)
+    parser.add_argument("command", choices=["start"], help="Command to execute")
     parser.add_argument(
         "--debug",
         action="store_true",
         default=os.environ.get("MINER_DEBUG", "").lower() in ("1", "true", "yes"),
         help="Enable debug mode (default: from MINER_DEBUG env var)",
     )
-
     return parser.parse_args()
 
 
-async def start_gateway(debug: bool = False):
-    """Start the PearlGateway service."""
+async def start_gateway(debug: bool = False) -> None:
     logger.debug("Starting PearlGateway...")
-
     gateway = PearlGateway(debug_mode=debug)
     await gateway.start()
-
     print("PearlGateway is running. Press Ctrl+C to stop.")
-
-    # Keep the service running until interrupted
     try:
         while True:
             await asyncio.sleep(1)
@@ -55,41 +38,9 @@ async def start_gateway(debug: bool = False):
         await gateway.stop()
 
 
-def stop_gateway():
-    """Stop a running PearlGateway service."""
-    # In a production implementation, this would find and signal the running process
-    # For now, just print instructions
-    print("To stop PearlGateway, press Ctrl+C in the terminal where it's running.")
-    print("For a system service, use: sudo systemctl stop pearlgw")
-
-
-def show_status():
-    """Show the status of the PearlGateway service."""
-    # In a production implementation, this would check if the process is running
-    # For now, just print instructions
-    print("To check PearlGateway status, use:")
-    print("  - For a system service: sudo systemctl status pearlgw")
-    print("  - For metrics: curl http://127.0.0.1:9109/metrics")
-
-
-def show_version():
-    """Show the version of PearlGateway."""
-    # This would normally read from a version file or package
-    print("PearlGateway v0.1.0")
-
-
-def main():
-    """Main entry point."""
+def main() -> None:
     args = parse_args()
-
-    if args.command == "start":
-        asyncio.run(start_gateway(args.debug))
-    elif args.command == "stop":
-        stop_gateway()
-    elif args.command == "status":
-        show_status()
-    elif args.command == "version":
-        show_version()
+    asyncio.run(start_gateway(args.debug))
 
 
 if __name__ == "__main__":
