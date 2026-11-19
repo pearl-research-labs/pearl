@@ -6,9 +6,10 @@ import pytest
 import torch
 from blake3 import blake3
 from miner_base.block_submission import PrebuiltCommitment, _checked_commitment
-from miner_base.commitment import commit_planes, hash_id_for_leaf
-from miner_base.commitment_hash import a_keys as ref_a_keys
+from miner_base.commitment import commit_planes
 from miner_base.prequant import PrequantMatrix
+from miner_base.protocol import a_keys as ref_a_keys
+from miner_base.protocol import hash_id_for_leaf
 from pearl_mining import MERKLE_LEAF_SIZE
 
 from pearl_gemm import (

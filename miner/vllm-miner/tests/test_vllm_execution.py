@@ -52,7 +52,7 @@ def test_generation_matches_reference(model_id, mining, references, monkeypatch)
     from vllm import LLM, SamplingParams
 
     def credited_hashes(_worker):
-        from vllm_miner.mining_state import get_async_manager
+        from vllm_miner.runtime import get_async_manager
 
         return get_async_manager().credited_hashes
 

@@ -28,7 +28,6 @@ jobs:
           filters: |
             common:
               - '.github/workflows/miner_ci.yml'
-              - 'miner/conftest.py'
               - 'miner/miner-utils/**'
               - 'pearl-blake3/**'
               - 'zk-pow/**'

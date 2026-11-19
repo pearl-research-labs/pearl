@@ -11,21 +11,19 @@ class PearlBlock:
         zk_certificate: ZKCertificate,
     ):
         self.header = header
-
+        commitment = zk_certificate.get_proof_commitment()
         if header.proof_commitment is None:
-            header.proof_commitment = zk_certificate.get_proof_commitment()
-        elif header.proof_commitment != zk_certificate.get_proof_commitment():
+            header.proof_commitment = commitment
+        elif header.proof_commitment != commitment:
             raise ValueError("Proof commitment mismatch")
-
         self.raw_txns = raw_txns
         self.zk_certificate = zk_certificate
 
     def serialize(self) -> bytes:
-        """
-        Format: ZK_CERTIFICATE|BLOCK_HEADER|TX_COUNT (varint)|TRANSACTIONS
-        """
-        zk_certificate_bytes = self.zk_certificate.serialize()
-        header_bytes = self.header.serialize()
-        tx_count_bytes = encode_varint(len(self.raw_txns))
-        transactions_bytes = b"".join(self.raw_txns)
-        return zk_certificate_bytes + header_bytes + tx_count_bytes + transactions_bytes
+        """Format: ZK_CERTIFICATE | BLOCK_HEADER | TX_COUNT (varint) | TRANSACTIONS."""
+        return (
+            self.zk_certificate.serialize()
+            + self.header.serialize()
+            + encode_varint(len(self.raw_txns))
+            + b"".join(self.raw_txns)
+        )

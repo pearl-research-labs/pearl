@@ -7,11 +7,9 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
-from miner_base.block_submission import commit_planes_for_leaf
-from miner_base.commitment import Device, commit_routing, hash_offsets
-from miner_base.commitment_hash import a_keys, noise_seed_b
-from miner_base.mining_config import activation_leaf
+from miner_base.commitment import commit_planes, commit_routing, hash_offsets
 from miner_base.prequant import PrequantMatrix
+from miner_base.protocol import Device, a_keys, noise_seed_b
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from vllm_miner import pipeline, winners
@@ -65,7 +63,6 @@ def test_winner_callback_always_releases_its_winner_lease(published):
     leases = _Leases()
     callback = WinnerCheckCallback(
         signal=signal,
-        event=object(),
         leases=leases,
         manager=SimpleNamespace(),
     )
@@ -96,7 +93,6 @@ def test_winner_callback_rearms_before_slow_validation(monkeypatch):
     leases = _Leases()
     callback = WinnerCheckCallback(
         signal=signal,
-        event=object(),
         leases=leases,
         manager=SimpleNamespace(),
     )
@@ -125,7 +121,6 @@ def test_winner_callback_releases_its_lease_when_signal_consume_raises(monkeypat
     signal.take_owned_hit.side_effect = RuntimeError("synthetic consume failure")
     callback = WinnerCheckCallback(
         signal=signal,
-        event=object(),
         leases=leases,
         manager=SimpleNamespace(),
     )
@@ -150,7 +145,6 @@ def test_hit_signal_poison_disables_device_and_releases_lease(monkeypatch):
 
     WinnerCheckCallback(
         signal=signal,
-        event=object(),
         leases=leases,
         manager=SimpleNamespace(),
     )()
@@ -188,15 +182,15 @@ def test_validated_persistent_hit_builds_canonical_opening(
     assert lottery_threshold(target, k, n, device=_DEVICE) != lottery_threshold(
         target, k, device=_DEVICE
     )
-    comm_a = commit_planes_for_leaf(a.planes(), key_a, activation_leaf(config))
-    comm_b = commit_planes_for_leaf(b.planes(), key_b, config.chunk_size)
+    comm_a = commit_planes(a.planes(), key_a, config.a_hash_id)
+    comm_b = commit_planes(b.planes(), key_b, config.b_hash_id)
     seed_b = noise_seed_b(comm_b.digest, key_b, config.p_b(n))
     keys = a_keys(comm_a.digest, seed_b, key_a, config.p_a(a.int_values.shape[0]))
     if previous_header:
         old_job = replace(job, incomplete_header_bytes=bytes(range(1, 77)))
         old_a, old_b = commitment_keys_for(old_job)
         assert old_a != key_a and old_b == key_b
-        old_comm = commit_planes_for_leaf(a.planes(), old_a, activation_leaf(config))
+        old_comm = commit_planes(a.planes(), old_a, config.a_hash_id)
         keys = a_keys(old_comm.digest, seed_b, old_a, config.p_a(a.int_values.shape[0]))
     prebuilt = object()
     ctx = SimpleNamespace(
@@ -254,7 +248,7 @@ def test_validated_persistent_hit_builds_canonical_opening(
             return True
 
     monkeypatch.setattr(winners, "lookup_state_by_layer_id", lambda _layer_id: state)
-    original_commit = winners.commit_planes_for_leaf
+    original_commit = winners.commit_planes
 
     def commit(*args, **kwargs):
         result = original_commit(*args, **kwargs)
@@ -267,10 +261,9 @@ def test_validated_persistent_hit_builds_canonical_opening(
             )
         return result
 
-    monkeypatch.setattr(winners, "commit_planes_for_leaf", commit)
+    monkeypatch.setattr(winners, "commit_planes", commit)
     callback = WinnerCheckCallback(
         signal=_Signal(hit),
-        event=object(),
         leases=_Leases(),
         manager=Manager(),
     )
@@ -304,7 +297,6 @@ def test_hit_without_a_published_context_is_dropped(monkeypatch):
     submit = Mock(side_effect=AssertionError("stale hit reached submission"))
     callback = WinnerCheckCallback(
         signal=object(),
-        event=object(),
         leases=_Leases(),
         manager=SimpleNamespace(
             get_mining_job=lambda: Mock(spec=MiningJob),
@@ -327,7 +319,6 @@ def test_hit_for_a_replaced_job_is_dropped(monkeypatch):
     submit = Mock(side_effect=AssertionError("retired context reached submission"))
     callback = WinnerCheckCallback(
         signal=object(),
-        event=object(),
         leases=_Leases(),
         manager=SimpleNamespace(
             get_mining_job=lambda: Mock(spec=MiningJob),
@@ -380,24 +371,21 @@ def test_winner_callback_consumes_only_its_launch_record():
     leases = _Leases()
     WinnerCheckCallback(
         signal=Signal(),
-        event=object(),
         leases=leases,
         manager=SimpleNamespace(),
         pow_key_host=torch.tensor(list(key), dtype=torch.uint8),
     )()
     assert owners == [key] and leases.releases == 1
     with pytest.raises(ValueError, match="pow_key"):
-        WinnerCheckCallback(
-            signal=Signal(), event=object(), leases=leases, manager=SimpleNamespace(), moe=object()
-        )
+        WinnerCheckCallback(signal=Signal(), leases=leases, manager=SimpleNamespace(), moe=object())
 
 
 def _moe_winner_fixture(group_id: int):
     """A retained MoE launch's host view: 4 experts of ``n_e = 256`` stacked
     rows, round-robin top-2 routing of 64 tokens, and an always-win job."""
     from miner_base.block_submission import PrebuiltCommitment
-    from miner_base.commitment import BlockHeader
     from pearl_mining import BlockHeader as CompleteBlockHeader
+    from pearl_mining import IncompleteBlockHeader as BlockHeader
     from vllm_miner.moe import MoeLaunch, MoeRouting
 
     k, experts, n_e, top_k, m = 2048, 4, 256, 2, 64
@@ -420,7 +408,7 @@ def _moe_winner_fixture(group_id: int):
     a = PrequantMatrix.encode(torch.randn(m, k, dtype=torch.bfloat16))
     b = PrequantMatrix.encode(torch.randn(experts * n_e, k, dtype=torch.bfloat16))
     key_a, key_b = commitment_keys_for(job)
-    comm_b = commit_planes_for_leaf(b.planes(), key_b, config.chunk_size)
+    comm_b = commit_planes(b.planes(), key_b, config.b_hash_id)
     seed_b = noise_seed_b(comm_b.digest, key_b, config.p_b(experts * n_e))
     per_expert = [
         [t for t in range(m) if any((t + slot) % experts == e for slot in range(top_k))]
@@ -447,7 +435,7 @@ def _moe_winner_fixture(group_id: int):
             dtype=torch.uint8,
         )
     )
-    comm_a = commit_planes_for_leaf(a.planes(), key_a, activation_leaf(config))
+    comm_a = commit_planes(a.planes(), key_a, config.a_hash_id)
     jackpot_key = a_keys(
         comm_a.digest, seed_b, key_a, config.p_a(m), bytes(routing.commitments)
     ).jackpot_key
@@ -533,7 +521,6 @@ def test_moe_hit_opens_the_routed_tokens_and_expert_rows(monkeypatch, previous_h
     monkeypatch.setattr(winners, "lookup_state_by_layer_id", lambda _layer_id: state)
     callback = WinnerCheckCallback(
         signal=_Signal(hit),
-        event=object(),
         leases=_Leases(),
         manager=Manager(),
         pow_key_host=torch.zeros(32, dtype=torch.uint8),
@@ -602,7 +589,7 @@ def test_launch_asks_submission_gate_about_its_captured_job(monkeypatch):
     launch_args = []
     monkeypatch.setattr(pipeline, "get_async_manager", lambda: manager)
     monkeypatch.setattr(pipeline, "_hit_signal_for", lambda _device: object())
-    monkeypatch.setattr(pipeline, "_ensure_fallback_runner_started", lambda: None)
+    monkeypatch.setattr(pipeline, "_ensure_completion_worker_started", lambda: None)
     activation = MagicMock()
     monkeypatch.setattr(pipeline.torch, "empty", lambda *_args, **_kwargs: activation)
 
@@ -621,14 +608,15 @@ def test_launch_asks_submission_gate_about_its_captured_job(monkeypatch):
         *,
         manager,
         credited_hashes,
-        completion_lease,
+        holds_completion_lease,
         **_kwargs,
     ):
         try:
             manager.increment_credited_hashes(credited_hashes)
             callback()
         finally:
-            completion_lease.release()
+            if holds_completion_lease:
+                pipeline._COMPLETION_LEASES.release()
 
     monkeypatch.setattr(pipeline, "_start_launch_completion", complete)
     state = SimpleNamespace(
@@ -639,6 +627,7 @@ def test_launch_asks_submission_gate_about_its_captured_job(monkeypatch):
         top_k=0,
         committed_device=_DEVICE,
         weight=SimpleNamespace(device="cuda:0"),
+        buffers=SimpleNamespace(),
     )
     ctx = SimpleNamespace(
         job=legacy_job,
@@ -698,9 +687,10 @@ def test_serving_activation_writes_live_prefix_and_zeros_only_tail(monkeypatch):
         top_k=0,
         committed_device=_DEVICE,
         weight=SimpleNamespace(device=torch.device("cpu")),
+        buffers=SimpleNamespace(),
     )
     ctx = SimpleNamespace(config=object())
-    monkeypatch.setattr(pipeline, "_ensure_fallback_runner_started", lambda: None)
+    monkeypatch.setattr(pipeline, "_ensure_completion_worker_started", lambda: None)
     monkeypatch.setattr(pipeline, "_hit_signal_for", lambda _device: object())
     monkeypatch.setattr(pipeline, "register_mining_completion", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(pipeline.torch.cuda, "Event", Event)
@@ -708,11 +698,12 @@ def test_serving_activation_writes_live_prefix_and_zeros_only_tail(monkeypatch):
     # credited-work path is exercised elsewhere, so stub it out of the shape.
     monkeypatch.setattr(pipeline, "effective_work_per_matmul", lambda *_a, **_k: 0)
 
-    def complete(_event, callback, _release, *, completion_lease, **_kwargs):
+    def complete(_event, callback, _release, *, holds_completion_lease, **_kwargs):
         try:
             callback()
         finally:
-            completion_lease.release()
+            if holds_completion_lease:
+                pipeline._COMPLETION_LEASES.release()
 
     monkeypatch.setattr(pipeline, "_start_launch_completion", complete)
 
@@ -749,11 +740,15 @@ def test_serving_activation_writes_live_prefix_and_zeros_only_tail(monkeypatch):
 
 
 def test_partial_fill_failure_registers_cleanup_before_releasing_slot(monkeypatch):
-    pool = pipeline._CompletionLeasePool()
-    cleanup_event = object()
+    pool = pipeline.LeasePool("test")
+    cleanup_events: list[object] = []
+
+    class FakeEvent:
+        def record(self):
+            cleanup_events.append(self)
 
     def observe_registration(_event):
-        assert pool.in_use() == 1
+        assert pool.held() == 1
 
     register = Mock(side_effect=observe_registration)
     state = SimpleNamespace(
@@ -764,6 +759,7 @@ def test_partial_fill_failure_registers_cleanup_before_releasing_slot(monkeypatc
         top_k=0,
         committed_device=_DEVICE,
         weight=SimpleNamespace(device=torch.device("cpu")),
+        buffers=SimpleNamespace(),
     )
     ctx = SimpleNamespace(config=object())
     decision = SimpleNamespace(retain_winner=False)
@@ -774,9 +770,9 @@ def test_partial_fill_failure_registers_cleanup_before_releasing_slot(monkeypatc
         "runtime_settings",
         lambda: SimpleNamespace(completion_inflight_limit=2),
     )
-    monkeypatch.setattr(pipeline, "_ensure_fallback_runner_started", lambda: None)
+    monkeypatch.setattr(pipeline, "_ensure_completion_worker_started", lambda: None)
     monkeypatch.setattr(pipeline.torch, "empty", lambda *_args, **_kwargs: MagicMock())
-    monkeypatch.setattr(pipeline, "_record_stream_event", lambda: cleanup_event)
+    monkeypatch.setattr(pipeline.torch.cuda, "Event", FakeEvent)
     monkeypatch.setattr(pipeline, "_register_launch_event", register)
 
     def partial_fill(_activation):
@@ -793,17 +789,23 @@ def test_partial_fill_failure_registers_cleanup_before_releasing_slot(monkeypatc
             partial_fill,
         )
 
-    register.assert_called_once_with(cleanup_event)
-    assert pool.in_use() == 0
+    assert len(cleanup_events) == 1
+    register.assert_called_once_with(cleanup_events[0])
+    assert pool.held() == 0
 
 
 def test_unretained_launches_decline_before_allocation_when_completions_are_full(
     monkeypatch,
 ):
     held = []
-    pool = pipeline._CompletionLeasePool()
+    pool = pipeline.LeasePool("test")
     allocate = Mock(return_value=MagicMock())
     output = object()
+
+    class FakeEvent:
+        def record(self):
+            pass
+
     state = SimpleNamespace(
         layer_id=5,
         k=8,
@@ -812,6 +814,7 @@ def test_unretained_launches_decline_before_allocation_when_completions_are_full
         top_k=0,
         committed_device=_DEVICE,
         weight=SimpleNamespace(device=torch.device("cpu")),
+        buffers=SimpleNamespace(),
     )
     ctx = SimpleNamespace(config=object())
     decision = SimpleNamespace(retain_winner=False)
@@ -822,10 +825,8 @@ def test_unretained_launches_decline_before_allocation_when_completions_are_full
         "runtime_settings",
         lambda: SimpleNamespace(completion_inflight_limit=2),
     )
-    monkeypatch.setattr(pipeline, "_ensure_fallback_runner_started", lambda: None)
+    monkeypatch.setattr(pipeline, "_ensure_completion_worker_started", lambda: None)
     monkeypatch.setattr(pipeline.torch, "empty", allocate)
-    # Toy (n, k) here drives only lease/decline plumbing; credited work is
-    # covered elsewhere, so keep it out of the shape.
     monkeypatch.setattr(pipeline, "effective_work_per_matmul", lambda *_a, **_k: 0)
     monkeypatch.setattr(pipeline, "_hit_signal_for", lambda _device: object())
     monkeypatch.setattr(
@@ -833,11 +834,12 @@ def test_unretained_launches_decline_before_allocation_when_completions_are_full
         "_launch_stages",
         lambda *_args, **_kwargs: (object(), object(), object(), output),
     )
-    monkeypatch.setattr(pipeline, "_record_stream_event", lambda: object())
+    monkeypatch.setattr(pipeline.torch.cuda, "Event", FakeEvent)
     monkeypatch.setattr(pipeline, "_register_launch_event", lambda *_args: None)
 
-    def hold_completion(_event, _callback, _release, *, completion_lease, **_kwargs):
-        held.append(completion_lease)
+    def hold_completion(_event, _callback, _release, *, holds_completion_lease, **_kwargs):
+        assert holds_completion_lease
+        held.append(pool.release)
 
     monkeypatch.setattr(pipeline, "_start_launch_completion", hold_completion)
 
@@ -851,11 +853,11 @@ def test_unretained_launches_decline_before_allocation_when_completions_are_full
     assert launch()
     assert not launch()
     assert allocate.call_count == 2
-    assert pool.in_use() == 2
+    assert pool.held() == 2
 
-    for lease in held:
-        lease.release()
-    assert pool.in_use() == 0
+    for release in held:
+        release()
+    assert pool.held() == 0
 
 
 def test_launch_declines_a_job_replaced_before_launch_admission(monkeypatch):
@@ -887,9 +889,9 @@ def test_launch_declines_a_job_replaced_before_launch_admission(monkeypatch):
 
 
 def test_winner_check_lease_underflow_is_an_error():
-    leases = pipeline.WinnerCheckLeases()
+    leases = pipeline.LeasePool("winner-check")
 
-    with pytest.raises(RuntimeError, match="without an owner"):
+    with pytest.raises(RuntimeError, match="underflow"):
         leases.release()
 
 
@@ -913,14 +915,14 @@ def test_fallback_runner_failure_happens_before_retained_gpu_launch(monkeypatch)
         )
     )
     monkeypatch.setattr(pipeline, "get_async_manager", lambda: manager)
-    monkeypatch.setattr(pipeline, "_fallback_thread", None)
+    monkeypatch.setattr(pipeline, "_completion_thread", None)
     monkeypatch.setattr(pipeline.threading, "Thread", BrokenThread)
     allocate = Mock(side_effect=AssertionError("GPU work started before fallback setup"))
     monkeypatch.setattr(pipeline.torch, "empty", allocate)
     state = SimpleNamespace(
         k=2048, n=128, experts=0, top_k=0, weight=SimpleNamespace(device="cuda:0")
     )
-    ctx = SimpleNamespace(job=job, threshold_dev=object())
+    ctx = SimpleNamespace(job=job)
 
     with pytest.raises(RuntimeError, match="thread exhaustion"):
         pipeline.mine_launch(state, ctx, 256, 8, lambda _activation: None)
@@ -935,34 +937,34 @@ def _run_fallback_for_test(
     *,
     manager=None,
     credited_hashes=0,
-    completion_lease=None,
+    holds_completion_lease=False,
 ):
-    completion = pipeline._FallbackCompletion()
-    with pipeline._fallback_check_lock:
-        pipeline._fallback_checks += 1
-    pipeline._run_fallback_work(
-        pipeline._FallbackWork(
+    token = pipeline._CompletionToken()
+    with pipeline._completion_cond:
+        pipeline._pending_completions_count += 1
+    pipeline._run_completion_work(
+        pipeline._CompletionWork(
             event=event,
             callback=callback,
             release=release,
-            completion=completion,
+            token=token,
             manager=manager,
             credited_hashes=credited_hashes,
-            completion_lease=completion_lease,
+            holds_completion_lease=holds_completion_lease,
         )
     )
-    assert completion.done.is_set()
+    assert token.done.is_set()
 
 
 def test_lifecycle_wait_includes_event_gated_host_continuations():
-    with pipeline._fallback_check_lock:
-        pipeline._fallback_checks += 1
+    with pipeline._completion_cond:
+        pipeline._pending_completions_count += 1
     try:
         assert not pipeline.wait_for_mining_continuations_idle(0)
     finally:
-        with pipeline._fallback_check_lock:
-            pipeline._fallback_checks -= 1
-            pipeline._fallback_check_lock.notify_all()
+        with pipeline._completion_cond:
+            pipeline._pending_completions_count -= 1
+            pipeline._completion_cond.notify_all()
     assert pipeline.wait_for_mining_continuations_idle(0)
 
 
@@ -979,7 +981,7 @@ def test_lifecycle_wait_blocks_on_a_real_host_continuation():
         callback_entered.set()
         assert allow_callback.wait(1)
 
-    pipeline._ensure_fallback_runner_started()
+    pipeline._ensure_completion_worker_started()
     pipeline._start_launch_completion(Event(), callback, lambda: None)
     assert callback_entered.wait(1)
     assert not pipeline.wait_for_mining_continuations_idle(0)
@@ -1003,7 +1005,7 @@ def test_fallback_check_runs_after_its_event():
     )
 
     assert order == ["event", "callback"]
-    assert pipeline.fallback_winner_checks_idle()
+    assert pipeline.completions_idle()
 
 
 def test_credit_is_published_only_after_successful_event_completion():
@@ -1028,11 +1030,11 @@ def test_credit_is_published_only_after_successful_event_completion():
     assert order == [("event", None), ("credit", 17), ("callback", None)]
 
 
-def test_fallback_check_releases_when_event_wait_fails():
+def test_fallback_check_releases_when_event_wait_fails(monkeypatch):
     releases = []
-    pool = pipeline._CompletionLeasePool()
-    completion_lease = pool.try_acquire(1)
-    assert completion_lease is not None
+    pool = pipeline.LeasePool("test")
+    monkeypatch.setattr(pipeline, "_COMPLETION_LEASES", pool)
+    assert pool.try_acquire(1)
 
     class Event:
         @staticmethod
@@ -1046,13 +1048,13 @@ def test_fallback_check_releases_when_event_wait_fails():
         lambda: releases.append(True),
         manager=manager,
         credited_hashes=17,
-        completion_lease=completion_lease,
+        holds_completion_lease=True,
     )
 
     assert releases == [True]
-    assert pool.in_use() == 0
+    assert pool.held() == 0
     manager.increment_credited_hashes.assert_not_called()
-    assert pipeline.fallback_winner_checks_idle()
+    assert pipeline.completions_idle()
 
 
 @pytest.mark.parametrize("failure", ["register", "publish"])
@@ -1077,14 +1079,14 @@ def test_failed_fallback_publication_runs_check_synchronously(monkeypatch, failu
         register.side_effect = RuntimeError("synthetic registration failure")
     else:
         publish.side_effect = RuntimeError("synthetic publication failure")
-    monkeypatch.setattr(pipeline, "_ensure_fallback_runner_started", lambda: None)
+    monkeypatch.setattr(pipeline, "_ensure_completion_worker_started", lambda: None)
     monkeypatch.setattr(pipeline, "register_mining_completion", register)
-    monkeypatch.setattr(pipeline, "_fallback_queue", SimpleNamespace(put_nowait=publish))
+    monkeypatch.setattr(pipeline, "_completion_queue", SimpleNamespace(put_nowait=publish))
 
     pipeline._start_launch_completion(Event(), callback, release)
 
     assert order == ["event", "callback", "release"]
-    assert pipeline.fallback_winner_checks_idle()
+    assert pipeline.completions_idle()
 
 
 def test_winner_retention_uses_its_own_configured_capacity(monkeypatch):

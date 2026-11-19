@@ -30,6 +30,16 @@ pub fn verify_plain_proof_v4(
     }
 }
 
+/// Diagnostic report naming every jackpot policy check for a v4 plain proof.
+#[pyfunction]
+pub fn diagnose_jackpot_policy_v4(
+    block_header: IncompleteBlockHeader,
+    plain_proof: PlainProofV4,
+) -> PyResult<String> {
+    fp8_verify::diagnose_jackpot_policy(&block_header, &plain_proof)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
 pub fn register_header(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BlockHeader>()?;
     Ok(())
@@ -49,6 +59,7 @@ pub fn register_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 pub fn register_proofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(verify_plain_proof_v4, m)?)?;
+    m.add_function(wrap_pyfunction!(diagnose_jackpot_policy_v4, m)?)?;
     m.add_class::<PyFp8Prover>()?;
     m.add_class::<PyFp8Verifier>()?;
     Ok(())

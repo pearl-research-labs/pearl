@@ -56,7 +56,6 @@ jobs:
               - 'miner/miner-base/**'
               - 'miner/vllm-miner/**'
               - 'miner/pearl-gateway/**'
-              - 'miner/conftest.py'
               - 'zk-pow/**'
               - 'node/zkpow/**'
               - 'py-pearl-mining/**'

@@ -77,3 +77,29 @@ def require_buffer(
         raise ValueError(
             f"{name} must contain at least {min_elements} elements, got {tensor.numel()}"
         )
+
+
+def require_u32(name: str, value: int) -> int:
+    if type(value) is not int or not 0 <= value < 2**32:
+        raise ValueError(
+            f"{name} must be an int fitting an unsigned 32-bit record word, got "
+            f"{value!r} ({type(value).__name__})"
+        )
+    return value
+
+
+def require_bool(name: str, value: bool) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{name} must be bool, got {type(value).__name__}")
+    return value
+
+
+def require_hit_signal(hit_signal: object, device: torch.device):
+    from ..pow import HitSignal
+
+    if not isinstance(hit_signal, HitSignal):
+        raise TypeError("hit_signal must be a HitSignal")
+    if hit_signal.device != device:
+        raise ValueError(f"hit_signal must be on {device}, got {hit_signal.device}")
+    hit_signal.require_usable()
+    return hit_signal

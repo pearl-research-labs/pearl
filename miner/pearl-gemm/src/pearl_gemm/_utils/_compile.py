@@ -54,11 +54,14 @@ def get_or_compile[CompiledT](
     key: tuple,
     factory: Callable[[], CompiledT],
 ) -> CompiledT:
-    """Return a compiled variant, creating it once for a metadata key."""
+    """Return a compiled variant, creating it once under ``_compile_lock``."""
     compiled = cache.get(key)
     if compiled is None:
-        compiled = factory()
-        cache[key] = compiled
+        with _compile_lock:
+            compiled = cache.get(key)
+            if compiled is None:
+                compiled = factory()
+                cache[key] = compiled
     return compiled
 
 

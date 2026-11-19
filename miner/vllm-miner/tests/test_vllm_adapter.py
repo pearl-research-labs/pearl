@@ -199,7 +199,7 @@ def test_checkpoint_reload_refreshes_graph_visible_state_in_place(mined_settings
 def test_runtime_startup_rollback_keeps_initial_weights_unquantized(
     mined_settings, async_manager, monkeypatch
 ):
-    import vllm_miner.mining_state as gpu_runtime
+    import vllm_miner.runtime as gpu_runtime
     from vllm_miner.vllm_pearl_config import PearlConfig
 
     monkeypatch.setattr(gpu_runtime, "mining_disabled_by_runtime_failure", lambda: True)

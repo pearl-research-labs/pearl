@@ -151,17 +151,9 @@ class _NoisyQuant:
         row_halves = self.rows // HALF_TILE_ROWS
         if was_merged:
             self.load_mode = NoiseLoadMode.RING
-            self.ring_a_stages = self.stages * row_halves
-        else:
-            self.ring_a_stages = self.stages
-        # Merged-mode configs use a tile-granular A handshake: one mbarrier
-        # transaction covers a whole tile's half-tile TMA copies, so each
-        # side pays one sleep/wake round trip per tile instead of one per
-        # half-tile. Native-RING pins keep the classic per-half-tile pipe.
         self.a_tile_pipe = was_merged
         self.a_pipe_stages = self.stages if self.a_tile_pipe else 0
-        if self.a_tile_pipe:
-            self.ring_a_stages = self.a_pipe_stages * row_halves
+        self.ring_a_stages = self.a_pipe_stages * row_halves if self.a_tile_pipe else self.stages
         self.consumer_e1 = self._consumer_e1_enabled and self.rows == 64
 
     # -- device helpers -----------------------------------------------------
@@ -445,13 +437,6 @@ class _NoisyQuant:
                 e1_line,
             )
             e1_codes.store(e1_line.load().to(f8))
-            # Pad the noise-MMA operand to the atom's K. Zero pad products are
-            # exact zeros; skipped when R already fills the atom.
-            if cutlass.const_expr(R < PACKED_NOISE_K):
-                e1_zeros = cute.make_tensor(
-                    e1_padded.iterator + R, cute.make_layout(PACKED_NOISE_K - R)
-                )
-                e1_zeros.fill(f8(0.0))
             e1_values.store(e1_codes.load().to(Float32).to(f16))  # exact hops
             cute.autovec_copy(
                 e1_values,
@@ -510,7 +495,7 @@ class _NoisyQuant:
         return factor_write_state, f2_write_state
 
     @cute.jit
-    def _produce_factors_and_a(
+    def _run_producer_warp(
         self,
         tma_aq,
         tma_as,
@@ -611,51 +596,6 @@ class _NoisyQuant:
                     )
                     a_pipe.producer_commit(a_write_state)
                     a_write_state.advance()
-
-    @cute.jit
-    def _run_producer_warp(
-        self,
-        tma_aq,
-        tma_as,
-        tma_f1,
-        tma_f2,
-        tAsAq,
-        tAgAq,
-        tAsAs,
-        tAgAs,
-        tFsF1,
-        tFgF1,
-        tFsF2,
-        tFgF2,
-        factor_pipe,
-        f2_pipe,
-        a_pipe,
-        first_row_half,
-        tile_count,
-    ):
-        """Produce factor stages and A half-tiles.
-
-        Architecture-neutral: the TMA producer is the same on every family.
-        """
-        self._produce_factors_and_a(
-            tma_aq,
-            tma_as,
-            tma_f1,
-            tma_f2,
-            tAsAq,
-            tAgAq,
-            tAsAs,
-            tAgAs,
-            tFsF1,
-            tFgF1,
-            tFsF2,
-            tFgF2,
-            factor_pipe,
-            f2_pipe,
-            a_pipe,
-            first_row_half,
-            tile_count,
-        )
 
     @cute.jit
     def _run_output_warp(

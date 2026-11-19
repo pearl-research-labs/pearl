@@ -5,36 +5,22 @@ from typing import TYPE_CHECKING
 
 import torch
 from miner_base.async_loop_manager import AsyncLoopManager
-from miner_base.block_submission import (
-    MoEBlockInfo,
-    OpenedBlockInfo,
-    PrebuiltCommitment,
-    commit_planes_for_leaf,
-)
-from miner_base.commitment_hash import a_keys
-from miner_base.mining_config import activation_leaf
+from miner_base.block_submission import MoEBlockInfo, OpenedBlockInfo, PrebuiltCommitment
+from miner_base.commitment import commit_planes
+from miner_base.protocol import a_keys
 from miner_utils import get_logger
 
-from .health import disable_device_mining
+from .capture import disable_device_mining
 from .mining_config import threshold_bytes_for, tile_indices
-from .state import (
-    JobContext,
-    LayerState,
-    all_states,
-    lookup_state_by_layer_id,
-)
+from .state import JobContext, LayerState, all_states, lookup_state_by_layer_id
 
 if TYPE_CHECKING:
     from pearl_gemm import Hit, HitSignal
 
     from .moe import MoeLaunch
-    from .pipeline import WinnerCheckLeases
+    from .pipeline import LeasePool
 
 _LOGGER = get_logger(__name__)
-# Established gateway reads are intentionally unbounded, but a winner must not
-# wait forever behind saturated proof capacity. This matches the
-# integration/measurement flush budget and remains below the framework's
-# 60-second mining-quiescence bound.
 _WINNER_HANDOFF_TIMEOUT_S = 30.0
 
 
@@ -45,14 +31,6 @@ def _matching_context(
     *,
     moe: "MoeLaunch | None" = None,
 ) -> JobContext | None:
-    """Return the live context described by a persistent record, if any.
-
-    The seedB and target words below were stamped by the kernel from the
-    device buffers at launch time. They select B and the target; the jackpot
-    key check in ``_handle_hit`` also binds the proposed header. A dense record
-    must carry its payload (the tile's committed A rows); an MoE record is payload-less by design
-    and is opened from the launch's retained planes (``moe``).
-    """
     with state.lock:
         ctx = state.job_ctx
     if ctx is None:
@@ -98,18 +76,9 @@ class WinnerCheckCallback:
     """Consume at most one record after an admitted launch event completes."""
 
     signal: "HitSignal"
-    event: torch.cuda.Event
-    leases: "WinnerCheckLeases"
+    leases: "LeasePool"
     manager: AsyncLoopManager
-    # The launch's jackpot key (``pow_key``), copied to pinned host memory on
-    # the launch stream ahead of ``event``: the record's ``HASH_A`` names the
-    # launch that published it, and this callback consumes only that
-    # launch's record (``HitSignal.take_owned_hit``).
     pow_key_host: torch.Tensor | None = None
-    # MoE launches keep their routing and unpermuted planes alive until the
-    # check: the record is payload-less (the expert's rows are a slice of
-    # the committed activation), and the proof opens the full committed
-    # activation at the tile's tokens.
     moe: "MoeLaunch | None" = None
 
     def __post_init__(self) -> None:
@@ -118,10 +87,6 @@ class WinnerCheckCallback:
 
     def __call__(self) -> None:
         try:
-            # One signal-level critical section owns the reusable payload and
-            # re-arms before slow CPU validation. Concurrent manager/fallback
-            # callbacks cannot both consume one record or reset a newer claim,
-            # and a record another launch published is left for its owner.
             owner = None if self.pow_key_host is None else bytes(self.pow_key_host.tolist())
             hit = self.signal.take_owned_hit(owner)
             if hit is None:
@@ -160,9 +125,6 @@ class WinnerCheckCallback:
         moe_info = None
         routing_commitments = b""
         if self.moe is not None:
-            # The record's ``m`` and ``tile_row`` are the winning expert's; the
-            # committed A is the launch's full activation, and the
-            # tile's rows are that expert's tokens at the expert-local rows.
             routing = self.moe.routing
             routing_commitments = bytes(routing.commitments.cpu())
             moe_info = MoEBlockInfo(
@@ -176,19 +138,15 @@ class WinnerCheckCallback:
             b_rows = [hit.group_id * state.lottery_n + r for r in b_rows]
             codes_cpu, scales_cpu = self.moe.codes.cpu(), self.moe.scales.cpu()
             m = codes_cpu.shape[0]
-        # The hit's GPU commit ran at the committed ACTIVATION leaf (forced on
-        # every launchable A-side TensorHashConfig); rebuild the same tree for
-        # the opening.
-        comm_a = commit_planes_for_leaf(
-            [codes_cpu, scales_cpu], ctx.key_a, activation_leaf(ctx.config)
-        )
+
+        comm_a = commit_planes([codes_cpu, scales_cpu], ctx.key_a, config.a_hash_id)
         expected_key = a_keys(
             comm_a.digest, ctx.seed_b, ctx.key_a, config.p_a(m), routing_commitments
         ).jackpot_key
-        # B's seed and the target can outlive the header that produced a hit.
         if expected_key != hit.commitment_hash_A:
             _LOGGER.info(f"dropping winner keyed by another header on {state.layer_name}")
             return
+
         expert = "" if moe_info is None else f" expert={moe_info.expert_index}"
         _LOGGER.info(
             f"block candidate! layer={state.layer_name} "
@@ -224,9 +182,6 @@ class WinnerCheckCallback:
 
 
 def disable_mining_after_poisoning(signal: "HitSignal") -> None:
-    """A signal that could not be re-armed stops mining on its device: the
-    device breaker and every layer living there. Called from the handler of
-    the ``HitSignalPoisonedError`` so the log carries its traceback."""
     reason = "persistent hit signal could not be re-armed"
     disable_device_mining(signal.device, reason)
     for state in all_states():

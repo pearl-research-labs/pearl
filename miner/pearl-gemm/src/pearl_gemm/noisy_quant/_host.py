@@ -218,8 +218,6 @@ def _validate_noisy_quant_tunables(config: NoisyQuantConfig) -> None:
     _require_int_tunable("noise_bk", config.noise_bk, (128, 256))
     _require_int_tunable("noise_stages", config.noise_stages, (2, 3, 4))
     _require_int_tunable("noise_out_stages", config.noise_out_stages, (2, 3, 4))
-    if not isinstance(config.noise_load_mode, NoiseLoadMode):
-        raise ValueError("noise_load_mode must be a NoiseLoadMode")
 
 
 def validate_noisy_quant_config(
@@ -266,11 +264,7 @@ def pack_noise_factor(f1: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"f1 must be ({R}, k) float8_e4m3fn, got {f1.dtype} {tuple(f1.shape)}")
     if not torch.isfinite(f1.float()).all():
         raise ValueError("f1 contains non-finite e4m3 codes")
-    codes = f1.view(torch.int8).t().contiguous()
-    if PACKED_NOISE_K == R:
-        return codes
-    pad = torch.zeros(codes.shape[0], PACKED_NOISE_K - R, dtype=codes.dtype, device=codes.device)
-    return torch.cat([codes, pad], dim=1).contiguous()
+    return f1.view(torch.int8).t().contiguous()
 
 
 def _scale_constants(device_capability: tuple[int, int]) -> tuple[float, float]:

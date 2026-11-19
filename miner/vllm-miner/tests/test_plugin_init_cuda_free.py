@@ -28,8 +28,8 @@ def test_worker_hook_runs_runtime_after_init_device(monkeypatch):
     """The deferral hook must boot the runtime *after* the wrapped ``init_device``,
     and be idempotent (a second install must not double-wrap)."""
     import vllm.v1.worker.worker_base as worker_base
+    import vllm_miner.plugin as worker_hooks
     import vllm_miner.runtime as runtime
-    import vllm_miner.worker_hooks as worker_hooks
 
     order = []
 
@@ -56,9 +56,8 @@ def test_worker_hook_runs_runtime_after_init_device(monkeypatch):
 
 
 def test_worker_runtime_failure_rolls_back_and_preserves_native_serving(monkeypatch):
-    import vllm_miner.mining_state as gpu_runtime
     import vllm_miner.runtime as runtime
-    from vllm_miner.worker_hooks import _init_runtime_if_cuda
+    from vllm_miner.plugin import _init_runtime_if_cuda
 
     disabled = []
     monkeypatch.setattr(
@@ -68,11 +67,11 @@ def test_worker_runtime_failure_rolls_back_and_preserves_native_serving(monkeypa
     )
     monkeypatch.setattr(runtime, "rollback_pearl_runtime_startup", lambda: True)
     monkeypatch.setattr(
-        gpu_runtime,
+        runtime,
         "disable_mining_after_runtime_failure",
         disabled.append,
     )
-    monkeypatch.setattr(gpu_runtime, "mining_disabled_by_runtime_failure", lambda: True)
+    monkeypatch.setattr(runtime, "mining_disabled_by_runtime_failure", lambda: True)
     wrapper = SimpleNamespace(
         vllm_config=SimpleNamespace(device_config=SimpleNamespace(device_type="cuda"))
     )
@@ -84,12 +83,11 @@ def test_worker_runtime_failure_rolls_back_and_preserves_native_serving(monkeypa
 
 
 def test_worker_listener_failure_preserves_native_serving(monkeypatch):
-    import vllm_miner.mining_state as gpu_runtime
     import vllm_miner.runtime as runtime
-    from vllm_miner.worker_hooks import _init_runtime_if_cuda
+    from vllm_miner.plugin import _init_runtime_if_cuda
 
     monkeypatch.setattr(runtime, "ensure_pearl_runtime_initialized", lambda: None)
-    monkeypatch.setattr(gpu_runtime, "mining_disabled_by_runtime_failure", lambda: True)
+    monkeypatch.setattr(runtime, "mining_disabled_by_runtime_failure", lambda: True)
     wrapper = SimpleNamespace(
         vllm_config=SimpleNamespace(device_config=SimpleNamespace(device_type="cuda"))
     )
@@ -99,7 +97,7 @@ def test_worker_listener_failure_preserves_native_serving(monkeypatch):
 
 def test_tp_workers_boot_process_local_mining_runtime(monkeypatch):
     import vllm_miner.runtime as runtime
-    from vllm_miner.worker_hooks import _init_runtime_if_cuda
+    from vllm_miner.plugin import _init_runtime_if_cuda
 
     initialized = []
     monkeypatch.setattr(

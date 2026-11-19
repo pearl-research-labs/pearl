@@ -278,31 +278,17 @@ class HitSignal:
     def scales_payload_capacity_bytes(self) -> int:
         return self.scales_payload.numel() * self.scales_payload.element_size()
 
-    def _raise_if_poisoned(self) -> None:
+    def require_usable(self) -> None:
+        """Fail before launch if a prior consumer could not re-arm the latch."""
         if self._poisoned_error is not None:
             raise HitSignalPoisonedError(
                 "persistent hit signal is poisoned after a failed reset"
             ) from self._poisoned_error
 
-    def require_usable(self) -> None:
-        """Fail before launch if a prior consumer could not re-arm the latch."""
-        self._raise_if_poisoned()
-
     def doorbell(self) -> bool:
-        """Poll for a published hit (one native acquire load, no CUDA API).
-
-        The acquire pairs with the producer's system-scope release store of
-        the status word, ordering every record read behind it.
-        """
-        self._raise_if_poisoned()
+        """Poll for a published hit (one native acquire load, no CUDA API)."""
+        self.require_usable()
         return _bind_atomic_load_u32()(self._status_addr, _ATOMIC_ACQUIRE) != 0
-
-    def _read_published_hit_locked(self) -> Hit:
-        """Parse/fetch a record after this consumer observed publication."""
-        header, has_payload = self._parse_record_locked()
-        if header.valid and has_payload:
-            return self._fetch_payload_locked(header)
-        return header
 
     def _parse_record_locked(self) -> tuple[Hit, bool]:
         """Parse and bounds-check the published header; no device traffic.
@@ -393,16 +379,13 @@ class HitSignal:
         self._consumer_stream.synchronize()
 
     def read_hit(self) -> Hit | None:
-        """Read without consuming; payload views live until the next read.
-
-        Multi-threaded consumers should use :meth:`take_owned_hit` instead of
-        splitting ownership across this method and :meth:`reset_hit`.
-        """
+        """Read without consuming; multi-threaded consumers should use :meth:`take_owned_hit`."""
         with self._consumer_mu:
-            self._raise_if_poisoned()
+            self.require_usable()
             if not self.doorbell():
                 return None
-            return self._read_published_hit_locked()
+            header, has_payload = self._parse_record_locked()
+            return self._fetch_payload_locked(header) if header.valid and has_payload else header
 
     def _reset_or_poison_locked(self, prior_error: BaseException | None = None) -> None:
         try:
@@ -442,7 +425,7 @@ class HitSignal:
         if owner is not None and len(owner) != 32:
             raise ValueError(f"owner must be the 32-byte launch pow_key, got {len(owner)} bytes")
         with self._consumer_mu:
-            self._raise_if_poisoned()
+            self.require_usable()
             if not self.doorbell():
                 return None
             try:
@@ -469,7 +452,7 @@ class HitSignal:
         still want.
         """
         with self._consumer_mu:
-            self._raise_if_poisoned()
+            self.require_usable()
             if not self.doorbell():
                 return False
             self._reset_or_poison_locked()
@@ -486,7 +469,7 @@ class HitSignal:
         The final synchronize makes re-arming a postcondition of returning.
         """
         with self._consumer_mu:
-            self._raise_if_poisoned()
+            self.require_usable()
             # lock=1/status=0 is an in-flight producer claim, not consumer
             # ownership. Blind reset would reopen the latch under its payload.
             if not self.doorbell():

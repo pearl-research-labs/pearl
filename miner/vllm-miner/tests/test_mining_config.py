@@ -2,11 +2,11 @@
 credited-hash formulas, and the layer-selection settings."""
 
 import pytest
-from miner_base.commitment import BlockHeader, Device, commitment_keys
-from miner_base.mining_config import COMMITMENT_CHUNK_SIZE
 from miner_base.prequant import DEFAULT_BLOCK_SIZE
+from miner_base.protocol import COMMITMENT_CHUNK_SIZE, Device, commitment_keys
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
+from pearl_mining import IncompleteBlockHeader as BlockHeader
 from vllm_miner.mining_config import (
     DEFAULT_TILE,
     PACKED_NOISE_K,
@@ -297,8 +297,7 @@ def test_tile_layout_matches_reference_and_kernel(device):
     job key), each tile exposes exactly the kernel's 16 fold lanes over its
     rows*cols elements, and the tall ``tile_indices`` enumerate with 16-row /
     32-col strides."""
-    from miner_base.layout import lane_assignment
-    from miner_base.mining_config import default_mining_config, tall_tile_mining_config
+    from miner_base.protocol import default_mining_config, lane_assignment, tall_tile_mining_config
 
     # The 4-row family is single-sourced from the miner-base builder (which
     # must be given the runtime's committed device to compare bytes).

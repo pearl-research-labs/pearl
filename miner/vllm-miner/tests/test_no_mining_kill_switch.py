@@ -21,14 +21,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 import vllm_miner.capture as gcs
-from miner_base.commitment import Device
+from miner_base.protocol import Device
 from miner_base.settings import MinerSettings
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
-from vllm_miner import health, job_prep, linear_op, pipeline
+from vllm_miner import job_prep, linear_op, pipeline
 from vllm_miner import settings as settings_module
 from vllm_miner.capture import suspend_mining_launches
-from vllm_miner.config import config as gpu_config
 from vllm_miner.settings import RuntimeSettings
 from vllm_miner.state import (
     LayerState,
@@ -167,11 +166,11 @@ def test_no_mining_gates_the_serving_path(layer, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     x2d = torch.zeros(_MIN_MINING_TOKENS, _K, dtype=torch.bfloat16)
 
-    monkeypatch.setattr(gpu_config, "settings", MinerSettings(no_mining=True))
+    monkeypatch.setattr(settings_module, "_miner_settings", MinerSettings(no_mining=True))
     assert linear_op._try_mine(layer, x2d, None) is None
     assert reached == [], "MINER_NO_MINING did not gate the serving path"
 
-    monkeypatch.setattr(gpu_config, "settings", MinerSettings(no_mining=False))
+    monkeypatch.setattr(settings_module, "_miner_settings", MinerSettings(no_mining=False))
     assert linear_op._try_mine(layer, x2d, None) is None  # no bucket: fallback
     assert reached == [_MIN_MINING_TOKENS], "the guard chain blocked for some other reason"
 
@@ -180,7 +179,7 @@ def _prepare_failing_mined_forward(layer, monkeypatch, error):
     attempts = []
     job = object()
     layer.job_ctx = SimpleNamespace(job=job)
-    monkeypatch.setattr(gpu_config, "settings", MinerSettings(no_mining=False))
+    monkeypatch.setattr(settings_module, "_miner_settings", MinerSettings(no_mining=False))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(job_prep, "current_job", lambda: job)
     monkeypatch.setattr(pipeline, "pick_bucket", lambda _tokens: 256)
@@ -191,7 +190,7 @@ def _prepare_failing_mined_forward(layer, monkeypatch, error):
         raise error
 
     monkeypatch.setattr(pipeline, "run_mining_forward", fail)
-    health._BREAKER.reset_for_tests()
+    gcs._BREAKER._states.clear()
     return attempts
 
 
@@ -238,7 +237,7 @@ def test_framework_warmup_gate_stops_serving_launches(layer, monkeypatch):
 
     monkeypatch.setattr(pipeline, "pick_bucket", reach_detector)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(gpu_config, "settings", MinerSettings(no_mining=False))
+    monkeypatch.setattr(settings_module, "_miner_settings", MinerSettings(no_mining=False))
     x2d = torch.zeros(_MIN_MINING_TOKENS, _K, dtype=torch.bfloat16)
 
     with suspend_mining_launches():
@@ -336,18 +335,14 @@ def test_hit_signal_concurrent_first_access_constructs_once(monkeypatch):
 @pytest.mark.parametrize(
     ("interrupt", "expected_launches", "expected_ready"),
     [
-        # One mixed-GEMM compile variant per bucket, two buckets.
         (None, 2, True),
         ("process-gate", 1, False),
-        ("caller-cancel", 1, False),
     ],
 )
 def test_pipeline_warmup_reports_completion_or_stops(
     monkeypatch, interrupt, expected_launches, expected_ready
 ):
-    """A full warmup reports ready; interruption stops after the current bucket."""
     launched: list[object] = []
-    locally_cancelled = False
 
     class FakeEvent:
         def record(self):
@@ -357,12 +352,9 @@ def test_pipeline_warmup_reports_completion_or_stops(
             pass
 
     def launch_once(*_args, **_kwargs):
-        nonlocal locally_cancelled
         launched.append(object())
         if interrupt == "process-gate":
             gcs.close_mining_admission()
-        elif interrupt == "caller-cancel":
-            locally_cancelled = True
 
     monkeypatch.setattr(gcs, "_admission_closed", False)
     monkeypatch.setattr(
@@ -388,20 +380,13 @@ def test_pipeline_warmup_reports_completion_or_stops(
         layer_id=1,
     )
 
-    ready = pipeline.warmup_layer_variants(state, cancelled=lambda: locally_cancelled)
+    ready = pipeline.warmup_layer_variants(state)
 
     assert len(launched) == expected_launches
     assert ready is expected_ready
 
 
 def test_no_mining_stops_b_preparation_and_warmup(layer, monkeypatch):
-    """The switch must stop startup preparation, not only credited launches.
-
-    ``prepare_mining`` is the boundary the adapter reaches at the framework's
-    readiness barrier. With a job available and a registered mineable layer,
-    the gated preparation must prepare nothing and warm up nothing, while the
-    same call with the switch off does both.
-    """
     job = MiningJob(
         incomplete_header_bytes=_HEADER,
         target=100,
@@ -415,20 +400,20 @@ def test_no_mining_stops_b_preparation_and_warmup(layer, monkeypatch):
         prepared.append(state)
         return SimpleNamespace(job=prepare_job)
 
-    def fake_warmup(state, cancelled=None):
+    def fake_warmup(state):
         warmed.append(state.layer_name)
         return True
 
     monkeypatch.setattr(job_prep, "prepare_layer", fake_prepare)
     monkeypatch.setattr(pipeline, "warmup_layer_variants", fake_warmup)
 
-    monkeypatch.setattr(gpu_config, "settings", MinerSettings(no_mining=True))
+    monkeypatch.setattr(settings_module, "_miner_settings", MinerSettings(no_mining=True))
     assert job_prep.prepare_mining(job) is False
 
     assert prepared == [], "MINER_NO_MINING did not stop B preparation"
     assert warmed == [], "MINER_NO_MINING did not stop kernel warmup"
 
-    monkeypatch.setattr(gpu_config, "settings", MinerSettings(no_mining=False))
+    monkeypatch.setattr(settings_module, "_miner_settings", MinerSettings(no_mining=False))
     assert job_prep.prepare_mining(job) is True
 
     assert prepared == [layer], "preparation was blocked for some reason other than the switch"

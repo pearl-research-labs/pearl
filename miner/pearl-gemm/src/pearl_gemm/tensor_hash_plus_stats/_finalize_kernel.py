@@ -1,26 +1,24 @@
 """Finalize the A-side v4 chain on the caller's CUDA stream.
 
 From the two device-produced plane roots down to everything the mining
-launches consume, in five compressions of one thread
-(``miner_base.commitment_hash``):
+launches consume, in five compressions of one thread (``miner_base.protocol``):
 
     HA            = blake3(root_codes || root_scales, key=keyA)          (64 B, keyed)
-    noise seedA   = blake3(HA || seedB || keyA || pA, key=Subkey("seed-A"))  (107 B: 2 blocks)
+    noise seedA   = blake3(HA || seedB || keyA || pA, key=Subkey("seed-A"))  (105 B: 2 blocks)
     noise-line kA = blake3("pearl/v4/FP8/noise-line", key=seedA)       (23 B, keyed)
     jackpot key   = blake3("pearl/v4/FP8/jackpot",    key=seedA)       (20 B, keyed)
 
-``pA = u32(m) || u8(hash_id) || pattern(6)`` is 11 bytes and a per-shape
+``pA = u32(m) || u8(hash_id) || u32(h)`` is 9 bytes and a per-shape
 compile-time constant; ``seedB`` and ``keyA`` are device words (per B and per
 header). The output is the 96-byte ``a_keys = seedA || noise-line keyA ||
-jackpot key`` (``miner_base.commitment_hash.AKeys``): word ``[8, 16)`` keys
-``noisy_quant``'s E1 draw and the ``F_A`` ``noise_lines`` draw, word ``[16,
-24)`` is ``mixed_gemm``'s ``pow_key``.
+jackpot key`` (``miner_base.protocol.AKeys``): word ``[8, 16)`` keys
+``noisy_quant``'s E1 draw, word ``[16, 24)`` is ``mixed_gemm``'s ``pow_key``.
 
-MoE (``miner_base.transcript.noise_seeds`` with routing commitments) splices
+MoE (``miner_base.protocol.noise_seed_a`` with routing commitments) splices
 the two 32-byte routing roots right after ``HA`` and appends ``hash_idR ||
-hash_idO`` to ``pA``:
+hash_idO`` to ``pA`` (11 bytes):
 
-    noise seedA = blake3(HA || HR || HO || seedB || keyA || pA, key=Subkey("seed-A"))  (173 B: 3 blocks)
+    noise seedA = blake3(HA || HR || HO || seedB || keyA || pA, key=Subkey("seed-A"))  (171 B: 3 blocks)
 """
 
 import struct

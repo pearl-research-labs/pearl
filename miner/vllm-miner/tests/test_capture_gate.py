@@ -3,7 +3,6 @@ work already in flight. Pure host logic: no GPU needed."""
 
 import threading
 import time
-import weakref
 from collections import deque
 
 import pytest
@@ -17,7 +16,6 @@ from vllm_miner.capture import (
     in_graph_setup_no_mining,
     mining_launches_suspended,
     suspend_mining_launches,
-    suspend_mining_producers_until_resumed,
     wait_for_mining_producers_idle,
 )
 
@@ -43,7 +41,7 @@ def test_shared_capture_scope_gates_before_wait_and_holds_through_capture(monkey
         return True
 
     monkeypatch.setattr(gcs, "wait_for_mining_producers_idle", wait)
-    with gcs.mining_suspended_for_capture("lazy-vision", framework="vLLM", timeout=7.0):
+    with gcs.mining_suspended_for_capture("lazy-vision", timeout=7.0):
         events.append(("capture", in_graph_setup_no_mining()))
 
     assert events == [("wait", 7.0, True), ("capture", True)]
@@ -55,12 +53,10 @@ def test_shared_capture_scope_timeout_retains_durable_gate(_open_admission, monk
 
     with (
         pytest.raises(TimeoutError, match="vLLM CUDA-graph capture"),
-        gcs.mining_suspended_for_capture("lazy-vision", framework="vLLM"),
+        gcs.mining_suspended_for_capture("lazy-vision"),
     ):
         pytest.fail("capture began before mining quiesced")
 
-    # The temporary graph-depth marker unwinds, but unresolved CUDA ownership
-    # leaves producer admission durably closed until the worker is restarted.
     assert not in_graph_setup_no_mining()
     assert mining_launches_suspended()
     with gpu_mining_producer() as admitted:
@@ -72,7 +68,7 @@ def test_shared_capture_scope_exception_retains_durable_gate(_open_admission, mo
 
     with (
         pytest.raises(RuntimeError, match="partial capture"),
-        gcs.mining_suspended_for_capture("decode", framework="vLLM"),
+        gcs.mining_suspended_for_capture("decode"),
     ):
         raise RuntimeError("partial capture")
 
@@ -83,30 +79,11 @@ def test_shared_capture_scope_exception_retains_durable_gate(_open_admission, mo
 
 
 def test_launch_suspension_does_not_block_context_preparation(_open_admission):
-    """Framework dummy forwards must fall back without blocking the startup
-    B preparation that runs under the same producer gate during model warmup."""
     with suspend_mining_launches():
         assert mining_launches_suspended()
         with gpu_mining_producer() as admitted:
             assert admitted
     assert not mining_launches_suspended()
-
-
-def test_cross_hook_producer_suspensions_are_nested(_open_admission):
-    first = suspend_mining_producers_until_resumed("sleep")
-    second = suspend_mining_producers_until_resumed("reload")
-    assert mining_launches_suspended()
-    with gpu_mining_producer() as admitted:
-        assert not admitted
-
-    gcs.resume_mining_producers(first)
-    with gpu_mining_producer() as admitted:
-        assert not admitted
-    gcs.resume_mining_producers(second)
-
-    assert not mining_launches_suspended()
-    with gpu_mining_producer() as admitted:
-        assert admitted
 
 
 def test_capture_waits_for_inflight_producer():
@@ -158,8 +135,8 @@ def _open_admission(monkeypatch):
     monkeypatch.setattr(gcs, "_admission_closed", False)
     monkeypatch.setattr(gcs, "_process_global_depth", 0)
     monkeypatch.setattr(gcs, "_launch_suspension_depth", 0)
-    monkeypatch.setattr(gcs, "_launch_suspension_ids", set())
-    monkeypatch.setattr(gcs, "_producer_suspension_ids", set())
+    monkeypatch.setattr(gcs, "_capture_launch_suspended", False)
+    monkeypatch.setattr(gcs, "_producer_permanently_suspended", False)
     monkeypatch.setattr(gcs, "_pending_completions", deque())
 
 
@@ -197,46 +174,6 @@ def test_registration_reclaims_completed_work_without_growing(_open_admission):
     for _ in range(500):
         gcs.register_mining_completion(_FakeEvent(done=True))
     assert len(gcs._pending_completions) == 0
-
-
-class _Keepalive:
-    """Stands in for device storage the registered launch's kernels still read."""
-
-
-def test_keepalive_is_held_until_its_own_event_completes(_open_admission):
-    """A launch's fence owns whatever the launch dereferences: the registry is
-    the last reference once the launching frame returns (a retired
-    ``threshold_dev``), so it must not drop it while the event is pending, and
-    must drop it when the event completes -- not wait for global quiescence.
-    """
-    event = _FakeEvent()
-    held = _Keepalive()
-    keepalive = weakref.ref(held)
-    gcs.register_mining_completion(event, keepalive=held)
-    del held  # as when the launching frame returns: the registry holds the last ref
-    assert keepalive() is not None
-
-    # An unrelated launch retiring must not free work still in flight.
-    gcs.register_mining_completion(_FakeEvent(done=True))
-    assert keepalive() is not None
-
-    event.done = True
-    gcs.register_mining_completion(_FakeEvent(done=True))
-    assert keepalive() is None, "the fenced keepalive outlived its completion event"
-
-
-def test_keepalives_are_released_by_the_idle_sweep(_open_admission):
-    """Capture and drain prune with a full sweep, so a lagging event at the
-    front must not pin a later launch's keepalive either."""
-    slow, fast = _FakeEvent(), _FakeEvent(done=True)
-    gcs.register_mining_completion(slow, keepalive=_Keepalive())
-    held = _Keepalive()
-    fast_keepalive = weakref.ref(held)
-    gcs.register_mining_completion(fast, keepalive=held)
-    del held
-
-    assert not gcs.mining_gpu_work_idle()  # the sweep ran, slow is still pending
-    assert fast_keepalive() is None, "a completed launch's keepalive was pinned behind a slow one"
 
 
 def test_closed_admission_refuses_producers(_open_admission):

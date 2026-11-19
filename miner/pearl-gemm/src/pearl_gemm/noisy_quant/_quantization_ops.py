@@ -21,7 +21,6 @@ from ..tensor_hash_plus_stats._blake3_ops import (
     compress_rolled,
 )
 
-MAX_E4M3 = QUANT_MAX  # 448.0, the e4m3 quant-grid ceiling
 _E4M3_BIAS = 7
 _NORM_FLOOR = 2.0**-32  # row_norms' (near-)zero-row floor on l2 and linf
 # Noise-line normalization constants: the target norm times the
@@ -78,15 +77,6 @@ def _f32_hex(x: float) -> str:
 def _mul_f32(a, b):
     """One RNE fp32 multiply (never contracted, subnormals kept)."""
     return _asm_f32("mul.rn.f32 $0, $1, $2;", "=f,f,f", cutlass.Float32(a), cutlass.Float32(b))
-
-
-def _bf16_bits_to_f32(bits):
-    """Exact widening of the BF16 in the low half of ``bits``."""
-    return _asm_f32(
-        "{\n\t.reg .b32 t;\n\tshl.b32 t, $1, 16;\n\tmov.b32 $0, t;\n\t}",
-        "=f,r",
-        cutlass.Uint32(bits),
-    )
 
 
 def _strip_state(alpha, l2, strip_g):
@@ -254,7 +244,7 @@ def _scale_chain(ssq, amax, kf, delta_r, delta_over_std):
     # scale-chain FMA. Round here as well when stats came from another producer.
     linf = cute.arch.fmax(_rndb(cutlass.Float32(amax)), cutlass.Float32(_NORM_FLOOR))
     nb = _rndb(cutlass.Float32(delta_r) * l2 + linf)
-    alpha = _rndb(cutlass.Float32(MAX_E4M3) / nb)
+    alpha = _rndb(cutlass.Float32(QUANT_MAX) / nb)
     beta = _rndb(_rndb(alpha * l2) * cutlass.Float32(delta_over_std))
     return alpha, beta, l2
 
@@ -283,7 +273,7 @@ def _generate_noise_line(key, index_u32, msg_base, output):
         mag = (b & 0x7F) + 1
         xs.append((1 - 2 * (b >> 7)) * mag)
         ssq = ssq + mag * mag
-    v = ssq * _LINE_SQRT_SQ  # <= 16 * 128^2 * 1024 = 2^28
+    v = ssq * _LINE_SQRT_SQ  # <= 32 * 128^2 * 1024 = 2^29
     c = cutlass.Float32(cute.math.sqrt(cutlass.Float32(v))).to(cutlass.Int32)
     c = c + _ge0_i32(v - (c + 1) * (c + 1))
     c = c + _ge0_i32(v - (c + 1) * (c + 1))

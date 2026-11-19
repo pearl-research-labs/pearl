@@ -713,8 +713,5 @@ std::vector<torch::Tensor> prepare_rows(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("noise_lines", &noise_lines, "(count, R) e4m3 keyed-BLAKE3 noise lines");
-  m.def(
-      "integer_noise_dot_exact", &integer_noise_dot_exact,
-      "whether prepare_rows's integer noise dot is exact for these lines");
   m.def("prepare_rows", &prepare_rows, "(B', the peel's mid half) of every B row");
 }
