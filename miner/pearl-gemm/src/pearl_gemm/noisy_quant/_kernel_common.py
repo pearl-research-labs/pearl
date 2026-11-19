@@ -15,9 +15,9 @@ import cutlass.pipeline as pipeline
 from cutlass import Float32
 from quack.cute_dsl_utils import mlir_namedtuple
 
+from .._utils._stats_ops import bf16x2_lo_f32 as _bf16_bits_to_f32
 from ..protocol_constants import PACKED_NOISE_K, STRIP_G, STRIP_G_SMALL_RMS, R
 from ._quantization_ops import (
-    _bf16_bits_to_f32,
     _generate_noise_line,
     _mul_f32,
     _quantize_word,

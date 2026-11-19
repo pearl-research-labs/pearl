@@ -63,6 +63,7 @@ class AsyncLoopManager:
         self._stopping = False
         self._starting = False
         self._starting_thread_id: int | None = None
+        self._startup_rollback = False
         self._stop_in_progress = False
         self._restart_permitted = True
         self._lifecycle_generation = 0
@@ -92,7 +93,9 @@ class AsyncLoopManager:
 
     def start(self) -> None:
         with self._lifecycle_cond:
-            self._lifecycle_cond.wait_for(lambda: not self._stop_in_progress)
+            self._lifecycle_cond.wait_for(
+                lambda: not self._stop_in_progress and not self._startup_rollback
+            )
             if not self._restart_permitted:
                 raise RuntimeError("Cannot restart after an abandoned submission shutdown")
             if (
@@ -113,16 +116,20 @@ class AsyncLoopManager:
             self._start(stop_event)
         except BaseException:
             with self._lifecycle_cond:
+                self._startup_rollback = True
                 self._starting = False
                 self._starting_thread_id = None
                 self._lifecycle_cond.notify_all()
+            rollback_ok = False
             try:
                 self.stop(wait_for_submissions=True)
-            except BaseException:
+                rollback_ok = True
+            finally:
                 with self._lifecycle_cond:
-                    self._restart_permitted = False
+                    if not rollback_ok:
+                        self._restart_permitted = False
+                    self._startup_rollback = False
                     self._lifecycle_cond.notify_all()
-                raise
             raise
         else:
             with self._lifecycle_cond:
