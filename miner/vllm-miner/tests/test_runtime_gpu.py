@@ -943,13 +943,14 @@ def test_moe_tail_runs_inside_the_launch_and_holds_drain(
     x = torch.randn(16, _K, dtype=torch.bfloat16, device="cuda")
     topk_ids = _moe_topk_ids(16)
     order: list[str] = []
-    record_event = pipeline._record_stream_event
+    real_event = torch.cuda.Event
 
-    def observed_record():
-        order.append("event")
-        return record_event()
+    class ObservedEvent(real_event):
+        def record(self, stream=None):
+            order.append("event")
+            return super().record(stream) if stream is not None else super().record()
 
-    monkeypatch.setattr(pipeline, "_record_stream_event", observed_record)
+    monkeypatch.setattr(pipeline.torch.cuda, "Event", ObservedEvent)
     tail_entered = threading.Event()
     release_tail = threading.Event()
     result: list[object] = []
