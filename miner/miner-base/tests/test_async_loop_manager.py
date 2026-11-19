@@ -363,14 +363,19 @@ class TestSubmissionBackpressureAndDrain:
 
         cfg = MinerRpcConfig(transport="uds", socket_path=socket_path)
         manager = AsyncLoopManager(cfg, MinerSettings(no_gateway=False))
+        calling = threading.Event()
         done = threading.Event()
         errors: list[Exception] = []
+
+        def blocked_call(_o, _j, client):
+            calling.set()
+            return client.client.call("submitPlainProof", {})
 
         def blocked_submit():
             try:
                 with patch(
                     "miner_base.async_loop_manager.submit_opened_block",
-                    side_effect=lambda _o, _j, client: client.client.call("submitPlainProof", {}),
+                    side_effect=blocked_call,
                 ):
                     manager._submit_block(Mock(), mock_mining_job)
             except Exception as exc:
@@ -382,6 +387,7 @@ class TestSubmissionBackpressureAndDrain:
         worker.start()
         try:
             assert accepted.wait(timeout=_TIMEOUT_S)
+            assert calling.wait(timeout=_TIMEOUT_S)
             manager.abort_pending_submissions()
             assert done.wait(timeout=_TIMEOUT_S)
             assert len(errors) == 1
