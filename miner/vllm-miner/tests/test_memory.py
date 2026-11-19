@@ -21,17 +21,15 @@ def test_peak_reservation_uses_process_wide_completion_bound(monkeypatch):
     )
     monkeypatch.setattr(memory, "all_states", lambda: [state])
     monkeypatch.setattr(memory, "runtime_settings", lambda: settings)
-    monkeypatch.setattr(memory.gpu_config.settings, "no_mining", False)
+    monkeypatch.setattr(memory, "miner_settings", lambda: SimpleNamespace(no_mining=False))
     monkeypatch.setattr(memory, "max_mineable_k", lambda: 8)
     monkeypatch.setattr(memory, "_launch_bytes", lambda *_args: 100)
     monkeypatch.setattr(memory, "_FRAGMENTATION_FACTOR", 1.0)
     monkeypatch.setattr(memory, "_RESERVE_ALIGNMENT", 1)
 
     # signal payload=20, signal lock+payload=24, owned CPU snapshot allowance=20,
-    # seven launch leases=700 (warmup runs before any launch and needs no slot),
-    # reload transient=2048, signal/owned payload=44, then the fixed one-byte
-    # cushion.
-    assert memory.estimate_peak_mining_bytes() == 2793
+    # seven launch leases=700, plus the fixed one-byte cushion.
+    assert memory.estimate_peak_mining_bytes() == 745
 
 
 def test_moe_launch_bytes_cover_the_gathered_operands():
@@ -70,7 +68,7 @@ def test_peak_reservation_counts_one_moe_tail(monkeypatch):
     )
     settings = SimpleNamespace(m_buckets=(2,), completion_inflight_limit=7, warmup_compile=True)
     monkeypatch.setattr(memory, "runtime_settings", lambda: settings)
-    monkeypatch.setattr(memory.gpu_config.settings, "no_mining", False)
+    monkeypatch.setattr(memory, "miner_settings", lambda: SimpleNamespace(no_mining=False))
     monkeypatch.setattr(memory, "max_mineable_k", lambda: 8)
     monkeypatch.setattr(memory, "_launch_bytes", lambda *_args: 100)
     monkeypatch.setattr(memory, "_moe_tail_bytes", lambda *_args: 1000)
@@ -84,7 +82,7 @@ def test_peak_reservation_counts_one_moe_tail(monkeypatch):
 
 
 def test_peak_reservation_is_zero_when_mining_is_disabled(monkeypatch):
-    monkeypatch.setattr(memory.gpu_config.settings, "no_mining", True)
+    monkeypatch.setattr(memory, "miner_settings", lambda: SimpleNamespace(no_mining=True))
     monkeypatch.setattr(
         memory,
         "all_states",

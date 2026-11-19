@@ -1,17 +1,17 @@
-"""GPU runtime knobs; see ``vllm-miner/README.md`` (Runtime configuration)."""
+"""Process runtime settings (PEARL_* and MINER_*)."""
 
 import re
 from collections.abc import Iterable
 from functools import cache
 from typing import Annotated, Literal, cast
 
+from miner_base.settings import MinerSettings
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def parse_cpu_list(value: str) -> tuple[int, ...]:
-    """A Linux cpulist ("0-3,8,10-11") as its CPUs, in order. Raises
-    ``ValueError`` on a malformed entry or a reversed range."""
+    """Parse a Linux cpulist ('0-3,8,10-11') into ordered CPU indices."""
     cpus: list[int] = []
     for part in filter(None, (part.strip() for part in value.split(","))):
         matched = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
@@ -28,43 +28,16 @@ def parse_cpu_list(value: str) -> tuple[int, ...]:
 class RuntimeSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="pearl_")
 
-    # Exclusion list, vLLM ignore-list style: exact layer prefixes or "re:"
-    # regexes re.match-ed against the unique runtime prefix. Empty: mine all.
     ignored_layers: Annotated[tuple[str, ...], NoDecode] = ()
-    # Forwards below this token count (decode) take the FP8 fallback GEMM.
     min_mining_tokens: int = Field(default=1024, ge=4)
-    # Ascending activation-row buckets; a forward uses the smallest fit (bounds JIT variants).
     m_buckets: Annotated[tuple[int, ...], NoDecode] = (2048, 8192)
-    # Compile pipeline variants off the serving path before mining engages.
     warmup_compile: bool = True
-    # Pending event-gated checks of the process-wide hit signal.
     winner_check_inflight_limit: int = Field(default=8, ge=1)
-    # Every credited launch, including no-gateway launches without a retained
-    # winner, owns one bounded event-completion slot. This bound also sizes the
-    # mining memory vLLM must keep off the KV cache (see memory.py): the peak
-    # reservation scales roughly linearly with it, so a high value can starve KV
-    # on large models. 8 keeps ample overlap while leaving KV headroom; raise it
-    # only when profiling shows spare memory.
     completion_inflight_limit: int = Field(default=8, ge=1, le=256)
-    # Device-wide serving protection after a mining allocation OOM. Exactly one
-    # probe is admitted after this cooldown; another OOM restarts it.
     oom_cooldown_s: float = Field(default=30.0, gt=0.0, allow_inf_nan=False)
-    # Identity rows fed per delegate ``apply`` when decoding a quantized weight
-    # back to BF16 (upcast). Bounds the transient workspace instead of a full
-    # ``k x k`` eye; the free-memory budget check is the real OOM gate, so this
-    # rarely needs tuning -- lower it only for a pathological shape that the
-    # budget still admits but whose per-chunk transient is too large.
     recon_chunk_rows: int = Field(default=4096, ge=1)
-    # Torch threads of the helper process that prepares each layer's next B
-    # on the host CPU (cpu_b.py).
     cpu_b_prepare_threads: int = Field(default=8, ge=1)
-    # The CPUs that helper runs on, as a Linux cpulist (e.g. "80-159"); empty
-    # leaves it on every CPU. "auto" gives each GPU's helper its own share of
-    # that GPU's NUMA-local CPUs, so the helpers of one host do not overlap.
     cpu_b_prepare_cpus: Annotated[tuple[int, ...] | Literal["auto"], NoDecode] = ()
-    # Prepare a layer's next B once the state window drops the ancestor its B
-    # is keyed by within this many tip changes: 1 waits until the next one
-    # would, 3 (the window depth minus one) replaces it on every new parent.
     cpu_b_replace_lead: int = Field(default=1, ge=1, le=3)
 
     @field_validator("ignored_layers", mode="before")
@@ -98,18 +71,10 @@ class RuntimeSettings(BaseSettings):
         buckets = tuple(sorted(int(v) for v in cast(Iterable[int | str], value)))
         if not buckets:
             raise ValueError("m_buckets must not be empty")
-        # 64 keeps every committed lottery tile's row alignment (m % 16) and is
-        # the smallest bucket the 64-row decode kernel tile fills. Sub-256
-        # buckets fit small decode batches more tightly; on 4-row commitments those
-        # buckets use the 64-row tile unless an exact autotune record exists.
         if any(b <= 0 or b % 64 for b in buckets):
             raise ValueError(f"m_buckets must be positive multiples of 64, got {buckets}")
-        # The persistent hit signal reserves an ``(max_m, max_k)`` A-codes plane
-        # whose element count is a uint32 (pearl_gemm HitSignalConfig). max_k is
-        # the largest mineable k across committed tiles, so an oversized largest
-        # bucket would overflow that product -- reject it here with the offending
-        # value rather than failing opaquely at signal allocation.
-        from .mining_config import max_mineable_k  # local: keep settings import-light
+        # HitSignal reserves (max_m, max_k) indexed by uint32.
+        from .mining_config import max_mineable_k
 
         max_m = ((1 << 32) - 1) // max_mineable_k()
         if buckets[-1] > max_m:
@@ -121,6 +86,7 @@ class RuntimeSettings(BaseSettings):
 
 
 _settings: RuntimeSettings | None = None
+_miner_settings: MinerSettings | None = None
 
 
 def runtime_settings() -> RuntimeSettings:
@@ -130,13 +96,24 @@ def runtime_settings() -> RuntimeSettings:
     return _settings
 
 
+def miner_settings() -> MinerSettings:
+    global _miner_settings
+    if _miner_settings is None:
+        _miner_settings = MinerSettings()
+    return _miner_settings
+
+
+def set_miner_settings(settings: MinerSettings) -> None:
+    global _miner_settings
+    _miner_settings = settings
+
+
 @cache
 def _compiled(entry: str) -> re.Pattern[str]:
     return re.compile(entry[3:])
 
 
 def is_layer_ignored(prefix: str, ignored_layers: tuple[str, ...]) -> bool:
-    """vLLM ignore-list semantics: exact prefix, or ``re:`` regex via re.match."""
     for entry in ignored_layers:
         if entry.startswith("re:"):
             if _compiled(entry).match(prefix):

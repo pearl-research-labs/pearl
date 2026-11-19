@@ -5,7 +5,7 @@ root uv workspace. Everything is pure Python: kernels
 JIT-compile at runtime via `nvidia-cutlass-dsl`, so there is no C++ build,
 and autotuning is a plain parameter sweep (`pearl_gemm.autotune`).
 
-## The 4-op API (`pearl_gemm.api`)
+## The functional API (`pearl_gemm`)
 
 | Op | Kernel | Status |
 |---|---|---|

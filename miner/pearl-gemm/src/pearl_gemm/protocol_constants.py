@@ -12,18 +12,16 @@ QUANT_MAX = 448.0  # largest finite e4m3 magnitude (the quant grid ceiling)
 # enters the kernels only through the per-row alpha/beta scale constants.
 DELTA_SM90 = 1.0
 DELTA_SM100 = 0.5
-L2_ROUNDED_BITS = 2  # low explicit BF16 mantissa bits cleared from l2
 # Strip rewrite: after the e4m3 cast, a code whose magnitude
 # is below e4m3(g * alpha * l2) takes the row's safe exponent
 # floor(log2(alpha * l2)) - STRIP_EXP_OFFSET (mantissa LSB forced to 1),
-# when the coin of its aligned STRIP_COIN_BLOCK columns passes: bits
+# when the coin of its aligned 4-column group passes: bits
 # 14..8 of the group's first FP32 mix below STRIP_COIN_THRESHOLD.
 STRIP_G = 0.08  # Blackwell
 STRIP_G_SMALL_RMS = 0.1  # g for rows with alpha * l2 < STRIP_SMALL_RMS
 STRIP_G_HOPPER = 0.105  # Hopper's g, for every row
 STRIP_SMALL_RMS = 8.0
 STRIP_EXP_OFFSET = 9
-STRIP_COIN_BLOCK = 4
 STRIP_COIN_SHIFT = 8
 STRIP_COIN_THRESHOLD = 112
 

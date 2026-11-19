@@ -3247,28 +3247,14 @@ class GroupedGemmSm100(_HitPublishMixin):
 
         ``tAcc_final=None`` (mining fold) skips the register -> TMEM store side.
         """
-        tmem_load_atom = None
-        tmem_store_atom = None
-        if cutlass.const_expr(self.mma_tiler[0] == 64):
-            tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
-                self.acc_dtype,
-            )
-        else:
-            tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-                self.acc_dtype,
-            )
-        if cutlass.const_expr(self.mma_tiler[0] == 64):
-            tmem_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)),
-                self.acc_dtype,
-            )
-        else:
-            tmem_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
-                self.acc_dtype,
-            )
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+            self.acc_dtype,
+        )
+        tmem_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
+            self.acc_dtype,
+        )
 
         tAcc_epi = cute.flat_divide(tAcc[((None, None), 0, 0, None)], epi_tile)
         tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tAcc_epi[(None, None, 0, 0, 0)])

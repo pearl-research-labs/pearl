@@ -10,23 +10,23 @@ import pytest
 import torch
 from miner_base.async_loop_manager import AsyncLoopManager
 from miner_base.block_submission import (
-    PROTOCOL_COMMITMENT_LEAF,
     MoEBlockInfo,
     OpenedBlockInfo,
     PrebuiltCommitment,
-    commit_planes_for_leaf,
     create_proof,
     submit_opened_block,
 )
-from miner_base.commitment import (
+from miner_base.commitment import commit_planes
+from miner_base.prequant import PrequantMatrix
+from miner_base.protocol import (
+    COMMITMENT_CHUNK_SIZE,
     Device,
     MiningConfiguration,
-    commit_planes,
     commitment_keys,
+    default_mining_config,
     hash_id_for_leaf,
+    tall_tile_mining_config,
 )
-from miner_base.mining_config import default_mining_config, tall_tile_mining_config
-from miner_base.prequant import PrequantMatrix
 from miner_base.settings import MinerSettings
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
@@ -123,17 +123,15 @@ def _opening(
     )
 
 
-def test_commit_planes_for_leaf_forwards_the_leaf():
-    """The resolver is ``commit_planes`` at the protocol 1024-byte leaf."""
+def test_commit_planes_accepts_int_leaf():
     planes = [
         torch.zeros(4, _K, dtype=torch.int8),
         torch.zeros(4, _K // 8, dtype=torch.bfloat16),
     ]
     key = bytes(32)
-    resolved = commit_planes_for_leaf(planes, key, PROTOCOL_COMMITMENT_LEAF)
-    expected = commit_planes(planes, key, hash_id_for_leaf(PROTOCOL_COMMITMENT_LEAF))
+    resolved = commit_planes(planes, key, COMMITMENT_CHUNK_SIZE)
+    expected = commit_planes(planes, key, hash_id_for_leaf(COMMITMENT_CHUNK_SIZE))
     assert resolved.digest == expected.digest
-    assert commit_planes_for_leaf(planes, key).digest == resolved.digest
 
 
 @pytest.mark.parametrize("tile", list(_TILE_CONFIGS))
@@ -736,7 +734,8 @@ def test_jackpot_rejection_logs_the_check_and_operands():
     assert "liveness (A): fail" in logged
     assert "dead=" in logged
     assert "min_sigma=" in logged
-    assert "skippable=unknown" in logged
+    assert "skippable=" in logged
+    assert "budget=" in logged
     assert "blake3=" in logged
     assert "base64" not in logged
 

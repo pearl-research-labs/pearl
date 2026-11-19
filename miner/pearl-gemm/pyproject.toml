@@ -15,7 +15,6 @@ dependencies = [
     "apache-tvm-ffi>=0.1.11,<0.1.12",
     "cuda-python>=13.0,<13.1",
     "blake3>=1.0.7",
-    "numpy>=1.24.0",
     # The mixed_gemm substrate. The SM100 pieces (gemm_sm100,
     # PipelineUmmaAsync, CLC tile scheduler) shipped in 0.6.1, but 0.6.4 is
     # the first release with the epilogue package (quack.epilogue.ops /
@@ -33,6 +32,7 @@ dev = [
     # miner-base protocol modules drive kernel tests that need
     # commitments, keys, and prequantized planes.
     "miner-base",
+    "numpy>=1.24.0",
     # Merkle-tree oracle used by tensor-hash tests.
     "py-pearl-mining>=0.2.0",
     "pytest>=7.0.0",

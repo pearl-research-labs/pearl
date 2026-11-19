@@ -1,4 +1,0 @@
-# vLLM miner configuration
-
-# Path to the Gateway Unix Domain Socket
-gateway_socket_path: "/tmp/pearlgw.sock"

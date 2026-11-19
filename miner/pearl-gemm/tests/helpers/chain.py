@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import torch
 from blake3 import blake3
-from miner_base.commitment_hash import AKeys, noise_line_key
+from miner_base.protocol import AKeys, noise_line_key
 
 from pearl_gemm import (
     LABEL_F1,

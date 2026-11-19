@@ -1,102 +1,63 @@
-"""Capture gate: blocks new GPU-touching mining work and waits for in-flight
-work to finish, so CUDA-graph capture never races a mining producer.
+"""Process-wide mining admission, CUDA-graph capture quiescence, and OOM isolation.
 
-Framework compilation and kernel warmup use the narrower
-:func:`suspend_mining_launches`: credited launches stop while startup
-preparation (variant warmup, B preparation) may still run. That gate does not
-prove quiescence and is never sufficient for capture.
-
-Mining launches do host<->device work (events, host callbacks, pinned signals,
-allocations) that is illegal during capture and pointless during the warmup
-preceding it. Capture raises the gate with :func:`graph_setup_no_mining`, then
-waits with :func:`wait_for_mining_producers_idle`. Every GPU-touching mining
-section runs inside :func:`gpu_mining_producer`, which refuses to start once
-the gate is up. Both operate under one condition variable, so a producer can
-never slip in between capture's raise and its wait.
-
-``torch.cuda.is_current_stream_capturing()`` misses eager graph-break ops that
-run while capture is in progress, so readers combine it with this gate. The
-depth is a lock-guarded process global because capture applies process-wide:
-the framework raises it on the worker thread while completion continuations
-run on their own threads. It is reentrant.
+Every GPU-touching mining section enters ``gpu_mining_producer()``, which shares
+one condition variable with ``graph_setup_no_mining()`` and
+``wait_for_mining_producers_idle()`` so CUDA-graph capture never races a mining
+kernel or completion continuation.
 """
 
 import collections
 import contextlib
-import itertools
 import math
 import threading
 import time
 from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Protocol
 
+import torch
 from miner_utils import get_logger
 
-_LOGGER = get_logger(__name__)
-# The drain polls the idle predicate several times a second; report at most this
-# often so a stuck drain is explained without flooding the log.
-_IDLE_REPORT_INTERVAL_S = 5.0
-_idle_report_after = 0.0
+from .settings import runtime_settings
 
-# One condition guards both the gate depth and the in-flight producer count:
-# checking the gate and registering as a producer must be a single atomic step.
+_LOGGER = get_logger(__name__)
+_IDLE_REPORT_INTERVAL_S = 5.0
+_COMPLETION_POLL_S = 0.005
+DEFAULT_CAPTURE_QUIESCE_TIMEOUT_S = 60.0
+
 _STATE = threading.Condition()
 _process_global_depth = 0
 _launch_suspension_depth = 0
-_launch_suspension_ids: set[int] = set()
-_next_launch_suspension_id = itertools.count()
-_producer_suspension_ids: set[int] = set()
-_next_producer_suspension_id = itertools.count()
+_capture_launch_suspended = False
+_producer_permanently_suspended = False
+_admission_closed = False
 _active_producers = 0
-# Held producer slots per thread: a slot that is never released is the hard case
-# to diagnose, and the holder's name says which subsystem leaked it. Counted, not
-# a bare name, because one thread can hold nested slots and releasing the inner
-# one must not erase a holder the outer one still owns.
 _producer_slots: collections.Counter[str] = collections.Counter()
+_idle_report_after = 0.0
 
 
 class _CompletionEvent(Protocol):
     def query(self) -> bool: ...
 
 
-class _PendingCompletion:
-    """A recorded completion event plus whatever its launch must outlive.
-
-    ``keepalive`` is an object the queued kernels read through a raw device
-    pointer, so freeing it while they run would be a use-after-free. The
-    registry holds the last reference once the launching frame returns and drops
-    it when this event's own query proves the kernels are done -- the same fence
-    capture and drain already wait on. Reclamation is therefore O(1) per launch
-    and needs no process-wide quiet window.
-    """
-
-    __slots__ = ("event", "keepalive")
-
-    def __init__(self, event: _CompletionEvent, keepalive: object) -> None:
-        self.event = event
-        self.keepalive = keepalive
-
-    def query(self) -> bool:
-        return self.event.query()
-
-
-# Recorded mining GPU work whose kernels may still be running after the host
-# producer slot was released. Capture and drain must wait for these too.
 _pending_completions: deque[_CompletionEvent] = deque()
-_COMPLETION_POLL_S = 0.005
-DEFAULT_CAPTURE_QUIESCE_TIMEOUT_S = 60.0
-# Closed while a reusable flush or runtime teardown owns producer admission.
-_admission_closed = False
+
+
+def cuda_device_index(device: torch.device) -> int:
+    if device.type != "cuda":
+        return -1
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+# ---------------------------------------------------------------------------
+# CUDA-graph capture quiescence & admission gates
+# ---------------------------------------------------------------------------
 
 
 @contextlib.contextmanager
 def graph_setup_no_mining() -> Iterator[None]:
-    """Raise the capture gate for the enclosed scope (mining disabled).
-
-    Blocks new producers immediately; callers that need in-flight producers
-    finished must also call :func:`wait_for_mining_producers_idle`.
-    """
+    """Raise the process-wide capture gate for the enclosed scope."""
     global _process_global_depth
     with _STATE:
         _process_global_depth += 1
@@ -109,15 +70,12 @@ def graph_setup_no_mining() -> Iterator[None]:
 
 
 def in_graph_setup_no_mining() -> bool:
-    """Whether the capture gate is currently up."""
-    # A GIL-atomic read; the lock is only needed for the paired
-    # check-and-register in gpu_mining_producer.
     return _process_global_depth > 0
 
 
 @contextlib.contextmanager
 def suspend_mining_launches() -> Iterator[None]:
-    """Suppress credited mined launches while startup preparation may continue."""
+    """Suppress credited mined launches while startup preparation may still run."""
     global _launch_suspension_depth
     with _STATE:
         _launch_suspension_depth += 1
@@ -128,70 +86,55 @@ def suspend_mining_launches() -> Iterator[None]:
             _launch_suspension_depth -= 1
 
 
-def suspend_mining_launches_until_resumed(reason: str = "") -> int:
-    """Suspend launches across separate framework hook calls.
+def _will_capture_cuda_graphs() -> bool:
+    try:
+        from vllm.config import get_current_vllm_config
+        from vllm.config.compilation import CUDAGraphMode
 
-    Returns an id for :func:`resume_mining_launches`; suspensions are reentrant
-    and remain active until every id has been released.
-    """
-    suspension_id = next(_next_launch_suspension_id)
+        config = get_current_vllm_config()
+        if bool(config.model_config.enforce_eager):
+            return False
+        mode = config.compilation_config.cudagraph_mode
+        return mode is not None and mode != CUDAGraphMode.NONE
+    except Exception:
+        _LOGGER.warning(
+            "Could not resolve vLLM CUDA-graph mode; not pre-suspending mining.",
+            exc_info=True,
+        )
+        return False
+
+
+def suspend_submissions_until_capture_complete() -> None:
+    """Suspend mined launches across model-load -> capture_model when graphs are enabled."""
+    global _capture_launch_suspended
+    if not _will_capture_cuda_graphs():
+        return
     with _STATE:
-        _launch_suspension_ids.add(suspension_id)
-    _LOGGER.debug(f"Mining launches suspended (id={suspension_id}, reason={reason!r})")
-    return suspension_id
+        _capture_launch_suspended = True
 
 
-def resume_mining_launches(suspension_id: int) -> None:
-    """Release one cross-hook suspension; unknown/released ids are no-ops."""
+def resume_submissions_after_capture() -> None:
+    """Resume mined launches after capture_model or on the first real execute step."""
+    global _capture_launch_suspended
     with _STATE:
-        removed = suspension_id in _launch_suspension_ids
-        _launch_suspension_ids.discard(suspension_id)
-    if removed:
-        _LOGGER.debug(f"Mining launches resumed (id={suspension_id})")
+        _capture_launch_suspended = False
 
 
 def mining_launches_suspended() -> bool:
-    """Whether framework initialization permits actual mining launches."""
     return (
-        _launch_suspension_depth > 0
-        or bool(_launch_suspension_ids)
-        or bool(_producer_suspension_ids)
+        _launch_suspension_depth > 0 or _capture_launch_suspended or _producer_permanently_suspended
     )
 
 
-def suspend_mining_producers_until_resumed(reason: str = "") -> int:
-    """Block every GPU-touching producer across separate lifecycle hooks."""
-    suspension_id = next(_next_producer_suspension_id)
-    with _STATE:
-        _producer_suspension_ids.add(suspension_id)
-        _STATE.notify_all()
-    _LOGGER.debug(f"Mining producers suspended (id={suspension_id}, reason={reason!r})")
-    return suspension_id
-
-
-def resume_mining_producers(suspension_id: int) -> None:
-    """Release one cross-hook producer gate; unknown/released ids are no-ops."""
-    with _STATE:
-        removed = suspension_id in _producer_suspension_ids
-        _producer_suspension_ids.discard(suspension_id)
-        _STATE.notify_all()
-    if removed:
-        _LOGGER.debug(f"Mining producers resumed (id={suspension_id})")
-
-
 def mining_producer_admission_open() -> bool:
-    """Whether a long producer should continue optional preparation work."""
-    return not _admission_closed and _process_global_depth == 0 and not _producer_suspension_ids
+    return (
+        not _admission_closed and _process_global_depth == 0 and not _producer_permanently_suspended
+    )
 
 
 @contextlib.contextmanager
 def gpu_mining_producer() -> Iterator[bool]:
-    """Enter a GPU-touching mining section.
-
-    Yields False (and registers nothing) when the capture gate is up, so the
-    caller must skip its GPU work. Yields True while holding a producer slot
-    that :func:`wait_for_mining_producers_idle` waits on.
-    """
+    """Atomically check admission and hold a producer slot that capture waits on."""
     global _active_producers
     with _STATE:
         admitted = mining_producer_admission_open()
@@ -213,25 +156,15 @@ def gpu_mining_producer() -> Iterator[bool]:
             _STATE.notify_all()
 
 
-def register_mining_completion(event: _CompletionEvent, keepalive: object = None) -> None:
-    """Record GPU work that outlives its producer slot (see the module docstring).
-
-    ``keepalive`` is released once ``event`` completes: pass anything the queued
-    kernels dereference but the caller stops referencing when it returns (see
-    :class:`_PendingCompletion`).
-    """
+def register_mining_completion(event: _CompletionEvent) -> None:
+    """Record GPU/continuation work that outlives its producer slot."""
     with _STATE:
-        _pending_completions.append(
-            event if keepalive is None else _PendingCompletion(event, keepalive)
-        )
-        # Work on a stream completes in order, so reclaiming the finished prefix
-        # keeps this hot path amortized O(1) instead of a scan per launch.
+        _pending_completions.append(event)
         while _pending_completions and _pending_completions[0].query():
             _pending_completions.popleft()
 
 
 def close_mining_admission() -> None:
-    """Refuse every future mining producer until a new runtime lifecycle opens one."""
     global _admission_closed
     with _STATE:
         _admission_closed = True
@@ -239,25 +172,18 @@ def close_mining_admission() -> None:
 
 
 def open_mining_admission() -> None:
-    """Admit mining producers after a flush or new runtime initialization."""
     global _admission_closed
     with _STATE:
         _admission_closed = False
 
 
 def _prune_completions_locked() -> None:
-    """Full sweep for the waiters: two streams can retire out of order, so the
-    idle checks must not be fooled by a lagging event at the front."""
     survivors = [e for e in _pending_completions if not e.query()]
     _pending_completions.clear()
     _pending_completions.extend(survivors)
 
 
 def mining_gpu_work_idle() -> bool:
-    """Whether no mining section or recorded launch is running.
-
-    As a drain predicate, it logs the unmet cause at a throttled rate.
-    """
     global _idle_report_after
     with _STATE:
         producers, completions = _active_producers, 0
@@ -266,10 +192,8 @@ def mining_gpu_work_idle() -> bool:
             _prune_completions_locked()
             completions = len(_pending_completions)
         if not producers and not completions:
-            # Re-arm after idle so the next stall, including after restart, reports once.
             _idle_report_after = 0.0
             return True
-        # Serialize the throttle because drain predicates can be polled concurrently.
         now = time.monotonic()
         if now < _idle_report_after:
             return False
@@ -282,12 +206,6 @@ def mining_gpu_work_idle() -> bool:
 
 
 def wait_for_mining_producers_idle(timeout: float) -> bool:
-    """Wait until mining is fully quiescent on both host and GPU, or time out.
-
-    Host sections are waited on by condition; recorded completion events are
-    then polled, because a producer releases its slot once its kernels are
-    merely enqueued.
-    """
     if not math.isfinite(timeout):
         raise ValueError(f"timeout must be finite, got {timeout!r}")
     deadline = time.monotonic() + timeout
@@ -309,33 +227,151 @@ def wait_for_mining_producers_idle(timeout: float) -> bool:
 def mining_suspended_for_capture(
     reason: str,
     *,
-    framework: str,
     timeout: float = DEFAULT_CAPTURE_QUIESCE_TIMEOUT_S,
 ) -> Iterator[None]:
-    """Raise the process gate, then prove all old mining GPU work complete.
-
-    An unsuccessful boundary is fail-closed. A timeout leaves old GPU ownership
-    unresolved, while an exception from the yielded framework scope can leave a
-    partial graph epoch. In either case a durable producer suspension replaces
-    the temporary graph gate before it is lowered; only a worker-process restart
-    may admit mining again.
-    """
+    """Raise the gate and prove all mining GPU work complete; fail closed on any error."""
+    global _producer_permanently_suspended
     with graph_setup_no_mining():
         try:
             if not wait_for_mining_producers_idle(timeout):
                 raise TimeoutError(
                     f"Mining GPU work did not quiesce within {timeout}s before "
-                    f"{framework} CUDA-graph capture ({reason=}); refusing to enter capture"
+                    f"vLLM CUDA-graph capture ({reason=}); refusing to enter capture"
                 )
             yield
         except BaseException:
-            # Install the durable gate while graph_setup_no_mining still owns
-            # admission, so exception unwinding never exposes a producer gap.
-            suspension_id = suspend_mining_producers_until_resumed(
-                f"failed {framework} capture boundary: {reason}"
-            )
+            with _STATE:
+                _producer_permanently_suspended = True
+                _STATE.notify_all()
             _LOGGER.critical(
-                f"{framework} CUDA-graph setup failed ({reason=}); mining producer "
-                f"admission remains closed until worker restart (id={suspension_id})"
+                f"vLLM CUDA-graph setup failed ({reason=}); mining producer "
+                "admission remains closed until worker restart"
             )
             raise
+
+
+# ---------------------------------------------------------------------------
+# Device OOM circuit breaker
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _DeviceState:
+    cooldown_until: float = 0.0
+    probe_in_flight: bool = False
+    disabled_reason: str | None = None
+
+
+class DeviceMiningAttempt:
+    def __init__(
+        self,
+        breaker: "DeviceCircuitBreaker",
+        device_index: int,
+        *,
+        allowed: bool,
+        probe: bool,
+        cooldown_s: float,
+    ) -> None:
+        self._breaker = breaker
+        self._device_index = device_index
+        self.allowed = allowed
+        self.probe = probe
+        self._cooldown_s = cooldown_s
+        self._resolved = not allowed
+        self._succeeded = False
+
+    def __bool__(self) -> bool:
+        return self.allowed
+
+    def __enter__(self) -> "DeviceMiningAttempt":
+        return self
+
+    def mark_success(self, successful: bool = True) -> None:
+        self._succeeded = self._succeeded or (self.allowed and successful)
+
+    def __exit__(self, exc_type, _exc, _tb) -> bool:
+        if self._resolved:
+            return False
+        self._resolved = True
+        if exc_type is not None and issubclass(exc_type, torch.cuda.OutOfMemoryError):
+            self._breaker._record_oom(self._device_index, self._cooldown_s)
+        elif exc_type is None and self._succeeded:
+            self._breaker._record_success(self._device_index, probe=self.probe)
+        else:
+            self._breaker._release_probe(self._device_index, probe=self.probe)
+        return False
+
+
+class DeviceCircuitBreaker:
+    """Cooldown after OOM, then admit exactly one bounded recovery probe."""
+
+    def __init__(self, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._states: dict[int, _DeviceState] = {}
+
+    def begin(self, device_index: int, cooldown_s: float) -> DeviceMiningAttempt:
+        with self._lock:
+            state = self._states.setdefault(device_index, _DeviceState())
+            if state.disabled_reason is not None:
+                return DeviceMiningAttempt(
+                    self, device_index, allowed=False, probe=False, cooldown_s=cooldown_s
+                )
+            if state.cooldown_until > 0.0:
+                if self._clock() < state.cooldown_until or state.probe_in_flight:
+                    return DeviceMiningAttempt(
+                        self, device_index, allowed=False, probe=False, cooldown_s=cooldown_s
+                    )
+                state.probe_in_flight = True
+                return DeviceMiningAttempt(
+                    self, device_index, allowed=True, probe=True, cooldown_s=cooldown_s
+                )
+            return DeviceMiningAttempt(
+                self, device_index, allowed=True, probe=False, cooldown_s=cooldown_s
+            )
+
+    def _record_oom(self, device_index: int, cooldown_s: float) -> None:
+        with self._lock:
+            state = self._states.setdefault(device_index, _DeviceState())
+            state.cooldown_until = self._clock() + cooldown_s
+            state.probe_in_flight = False
+
+    def _record_success(self, device_index: int, *, probe: bool) -> None:
+        if not probe:
+            return
+        with self._lock:
+            state = self._states.setdefault(device_index, _DeviceState())
+            state.cooldown_until = 0.0
+            state.probe_in_flight = False
+
+    def _release_probe(self, device_index: int, *, probe: bool) -> None:
+        if not probe:
+            return
+        with self._lock:
+            self._states.setdefault(device_index, _DeviceState()).probe_in_flight = False
+
+    def disable(self, device_index: int, reason: str) -> None:
+        with self._lock:
+            state = self._states.setdefault(device_index, _DeviceState())
+            if state.disabled_reason is None:
+                state.disabled_reason = reason
+            state.probe_in_flight = False
+
+    def disabled_reason(self, device_index: int) -> str | None:
+        with self._lock:
+            return self._states.get(device_index, _DeviceState()).disabled_reason
+
+
+_BREAKER = DeviceCircuitBreaker()
+
+
+def mining_attempt(device: torch.device) -> DeviceMiningAttempt:
+    return _BREAKER.begin(cuda_device_index(device), runtime_settings().oom_cooldown_s)
+
+
+def report_device_oom(device: torch.device) -> None:
+    _BREAKER._record_oom(cuda_device_index(device), runtime_settings().oom_cooldown_s)
+
+
+def disable_device_mining(device: torch.device, reason: str) -> None:
+    _BREAKER.disable(cuda_device_index(device), reason)

@@ -96,31 +96,8 @@ class _HitPublishMixin:
 
     @cute.jit
     def _hit_warp_copy(self, dst: cute.Tensor, src: cute.Tensor, lane: Int32):
-        """Warp-cooperative 16-byte-vector copy of a payload plane.
-
-        The vector loop keeps ``_HIT_COPY_UNROLL`` independent loads in
-        flight per lane -- a single dependent load/store chain leaves a lone
-        warp at ~1 GB/s, which for a multi-hundred-MB plane would stall the
-        hit kernel for hundreds of ms. Plane bytes are multiples of 16
-        (k is a multiple of 64), so there is no byte tail.
-        """
-        src_vec = cute.recast_tensor(src, cutlass.Uint128)
-        dst_vec = cute.recast_tensor(dst, cutlass.Uint128)
-        num_vecs = cute.size(src_vec)
-        stride = cute.arch.WARP_SIZE * _HIT_COPY_UNROLL
-        staged = cute.make_rmem_tensor(_HIT_COPY_UNROLL, cutlass.Uint128)
-        for it in cutlass.range(num_vecs // stride):
-            base = it * stride + lane
-            for u in cutlass.range_constexpr(_HIT_COPY_UNROLL):
-                staged[u] = src_vec[base + u * cute.arch.WARP_SIZE]
-            for u in cutlass.range_constexpr(_HIT_COPY_UNROLL):
-                dst_vec[base + u * cute.arch.WARP_SIZE] = staged[u]
-        for tail_base in cutlass.range_constexpr(
-            (num_vecs // stride) * stride, num_vecs, cute.arch.WARP_SIZE
-        ):
-            tail = tail_base + lane
-            if tail < num_vecs:
-                dst_vec[tail] = src_vec[tail]
+        """Warp-cooperative 16-byte-vector copy of a full payload plane."""
+        self._hit_warp_copy_rows(dst, src, Int64(0), Int32(cute.size(src)), lane)
 
     @cute.jit
     def _hit_warp_copy_rows(
