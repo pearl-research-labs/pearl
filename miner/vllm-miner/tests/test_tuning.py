@@ -346,4 +346,4 @@ def test_hopper_device_names_load_the_h100_records(monkeypatch, name):
         stem = tuning.device_config_name(torch.device("cuda", 0))
     finally:
         tuning._device_config_name.cache_clear()
-    assert tuning._load_config(stem).get("mixed_gemm")
+    assert tuning._load_autotune_config(stem).get("mixed_gemm")

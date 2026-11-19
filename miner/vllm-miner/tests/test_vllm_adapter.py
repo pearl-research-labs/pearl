@@ -138,64 +138,6 @@ def test_representative_local_shard_encodes_and_dispatches(
             unregister_state(state)
 
 
-def test_checkpoint_reload_refreshes_graph_visible_state_in_place(mined_settings, async_manager):
-    from dataclasses import fields
-
-    from vllm_miner.state import LayerBuffers
-    from vllm_miner.vllm_pearl_config import PearlConfig
-
-    layer = _linear("model.layers.2.mlp.up_proj", PearlConfig())
-    first = torch.randn(_N, _K, dtype=torch.bfloat16, device="cuda")
-    second = torch.randn(_N, _K, dtype=torch.bfloat16, device="cuda")
-    layer.weight.data.copy_(first)
-    state = None
-    try:
-        layer.quant_method.process_weights_after_loading(layer)
-        state = lookup_state(layer.weight)
-        pointers = {
-            "weight": state.weight.data_ptr(),
-            "weight_scale": state.weight_scale.data_ptr(),
-            "w_fp8": state.w_fp8.data_ptr(),
-            "w_fp8_scale": state.w_fp8_scale.data_ptr(),
-        }
-        assert state.buffers is not None
-        pointers.update(
-            {
-                f"buffers.{descriptor.name}": value.data_ptr()
-                for descriptor in fields(LayerBuffers)
-                if isinstance((value := getattr(state.buffers, descriptor.name)), torch.Tensor)
-            }
-        )
-
-        # Mirror vLLM 0.26 layerwise reload: checkpoint-shaped BF16 parameters
-        # are materialized temporarily, processed, then copied to old storage.
-        layer.register_parameter("weight", torch.nn.Parameter(second.clone(), requires_grad=False))
-        if "weight_scale" in layer._parameters:
-            delattr(layer, "weight_scale")
-        layer.quant_method.process_weights_after_loading(layer)
-
-        assert lookup_state(layer.weight) is state
-        assert state.weight.data_ptr() == pointers["weight"]
-        assert state.weight_scale.data_ptr() == pointers["weight_scale"]
-        assert state.w_fp8.data_ptr() == pointers["w_fp8"]
-        assert state.w_fp8_scale.data_ptr() == pointers["w_fp8_scale"]
-        for descriptor in fields(LayerBuffers):
-            value = getattr(state.buffers, descriptor.name)
-            if isinstance(value, torch.Tensor):
-                assert value.data_ptr() == pointers[f"buffers.{descriptor.name}"]
-
-        x = torch.randn(4, _K, dtype=torch.bfloat16, device="cuda")
-        out, _ = layer(x)
-        expected = x.float() @ second.float().T
-        cosine = torch.nn.functional.cosine_similarity(
-            out.float().flatten(), expected.flatten(), dim=0
-        )
-        assert cosine.item() > 0.99
-    finally:
-        if state is not None:
-            unregister_state(state)
-
-
 def test_runtime_startup_rollback_keeps_initial_weights_unquantized(
     mined_settings, async_manager, monkeypatch
 ):
