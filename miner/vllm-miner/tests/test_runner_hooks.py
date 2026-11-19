@@ -333,7 +333,7 @@ def test_quantized_source_returning_unquantized_for_linearbase_is_rejected():
         layer = LinearBase(64, 64, disable_tp=True)  # a real LinearBase
         assert isinstance(layer, LinearBase)
 
-        with pytest.raises(ValueError, match="refusing to mine it as BF16"):
+        with pytest.raises(ValueError, match="refusing to mine a packed weight as BF16"):
             config.get_quant_method(layer, "model.layers.0.mlp.gate_up_proj")
 
 
