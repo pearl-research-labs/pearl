@@ -2335,8 +2335,8 @@ mod tests {
 
     /// A deterministic nonnegative finite bf16 code with exponent field in `[lo_exp, hi_exp]`
     /// (normal for exponents >= 1; subnormal or zero at exponent 0).
-    fn test_code(i: usize, salt: u64, lo_exp: u64, hi_exp: u64) -> u16 {
-        let x = (i as u64).wrapping_mul(salt).rotate_left(17) ^ salt;
+    fn test_code(i: usize, seed: u64, lo_exp: u64, hi_exp: u64) -> u16 {
+        let x = (i as u64).wrapping_mul(seed).rotate_left(17) ^ seed;
         let exp = lo_exp + x % (hi_exp - lo_exp + 1);
         let mant = (x >> 32) & 0x7F;
         ((exp << 7) | mant) as u16
@@ -2345,15 +2345,15 @@ mod tests {
     /// A deterministic prequant row: pseudorandom full-range int8 values and normal
     /// (positive) block scales with exponent fields in `[lo_exp, hi_exp]` — every decoded
     /// element is normal or zero, since `|int * scale| in [2^(lo_exp-127), 2^(hi_exp-119))`.
-    fn gen_prequant_row(k: usize, salt: u64, lo_exp: u64, hi_exp: u64) -> (Vec<i8>, Vec<u16>) {
+    fn gen_prequant_row(k: usize, seed: u64, lo_exp: u64, hi_exp: u64) -> (Vec<i8>, Vec<u16>) {
         let ints = (0..k)
             .map(|i| {
-                let x = (i as u64).wrapping_mul(salt).rotate_left(23) ^ salt;
+                let x = (i as u64).wrapping_mul(seed).rotate_left(23) ^ seed;
                 (x & 0xFF) as u8 as i8
             })
             .collect();
         let scales = (0..k / BLOCK_SIZE)
-            .map(|b| test_code(b, salt ^ 0xABCD_EF01_2345_6789, lo_exp, hi_exp))
+            .map(|b| test_code(b, seed ^ 0xABCD_EF01_2345_6789, lo_exp, hi_exp))
             .collect();
         (ints, scales)
     }
