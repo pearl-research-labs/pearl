@@ -1,0 +1,313 @@
+//! Column positions, key domains, and folded-slot layouts of the committed LUTs.
+
+use plonky2::field::types::Field;
+use starky::lookup::Column;
+
+use super::super::unpredictability::{GAUSSIAN_CLASS_HEIGHT, LOG16_LOGARITHM_ROWS, NUM_GAUSSIAN_CLASSES};
+use super::LutTable;
+
+/// Number of slots of a folded table (1 = unfolded).
+pub const fn num_slots(table: LutTable) -> usize {
+    match table {
+        LutTable::RneRnd => 26,      // one per slot = signed cut + 7, cut in [-7, 18]
+        LutTable::ProdAlign15 => 59, // one per SHIFT in [0, 58]
+        LutTable::B200Align => 72,   // one per REL in [0, 71]
+        LutTable::WidthNorm => 16,   // GROUP_SUM_ABS in [0, 2^20)
+        LutTable::Pow2G => 4,        // carry, two gap ranges, normalization
+        LutTable::Xor8 => 3,         // plain, rotate-by-12 and rotate-by-7 fragments
+        LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 | LutTable::DownscaleRewrite => 6,
+        _ => 1,
+    }
+}
+
+/// Live rows per slot (the key-domain size, before trace padding).
+pub const fn lut_live_rows(table: LutTable) -> usize {
+    match table {
+        LutTable::Range16 | LutTable::Bytes2 | LutTable::Xor8 | LutTable::Qcast | LutTable::Div448 | LutTable::Width16 => 1 << 16,
+        // The logarithm ramp plus eight Gaussian classes (`log16_key`).
+        LutTable::Log16 => 1 << 17,
+        LutTable::Pair128 => 1 << 14,
+        LutTable::Int8Dec => 256,
+        LutTable::ExpInfo => 255, // keys [0, 254]; the inf/NaN field 255 has no row
+        LutTable::Clamp22 => 601, // keys x + 400, x in [-400, 200]
+        LutTable::Pow2D => 20,    // keys [0, 19]; the FMA's gap cap of 19 sets the domain
+        LutTable::Pow2G | LutTable::Pow2Gb => 64,
+        LutTable::Width32 => 32, // keys [1, 32] — a shifted ramp, no key 0 (see `generate`)
+        LutTable::RneRnd => 1 << 17,
+        LutTable::ProdAlign15 | LutTable::B200Align | LutTable::WidthNorm => 1 << 16,
+        LutTable::Fp32Tools => 780,
+        LutTable::DownscaleThreshold | LutTable::DownscaleThresholdH100 => 1 << 15,
+        LutTable::DownscaleRewrite => 1 << 16,
+    }
+}
+
+pub(crate) fn fp32_tool_key(row: usize) -> (u64, i64) {
+    match row {
+        0..=32 => (0, row as i64),
+        33..=223 => (1, row as i64 - 56),
+        224..=779 => (2, row as i64 - 224),
+        _ => panic!("binary32 tool row out of domain"),
+    }
+}
+
+/// LOG16's stored key tuple `(region, index)` at `row`: region 0 is the logarithm ramp over
+/// `[0, 2^16)`; region `1 + class` holds Gaussian class `class` over
+/// `[0, GAUSSIAN_CLASS_HEIGHT)`. The region is a separate key component, so a lookup index
+/// outside its region's domain addresses no row (no aliasing between classes).
+pub(crate) fn log16_key(row: usize) -> (u64, u64) {
+    let row = row as u64;
+    if row < LOG16_LOGARITHM_ROWS {
+        (0, row)
+    } else {
+        let offset = row - LOG16_LOGARITHM_ROWS;
+        (1 + offset / GAUSSIAN_CLASS_HEIGHT, offset % GAUSSIAN_CLASS_HEIGHT)
+    }
+}
+const _: () =
+    assert!(lut_live_rows(LutTable::Log16) as u64 == LOG16_LOGARITHM_ROWS + NUM_GAUSSIAN_CLASSES * GAUSSIAN_CLASS_HEIGHT);
+
+/// Stored key columns: the enumerated tuple for BYTES2/PAIR128/XOR8, `(operation, argument)`
+/// for FP32TOOLS, `(region, index)` for LOG16, one ramp or saturated key column otherwise.
+const fn num_key_columns(table: LutTable) -> usize {
+    match table {
+        LutTable::Bytes2 | LutTable::Pair128 | LutTable::Xor8 | LutTable::Fp32Tools | LutTable::Log16 => 2,
+        _ => 1,
+    }
+}
+
+/// Additional fixed columns, including Pow2G's two saturated keys.
+const fn num_value_columns(table: LutTable) -> usize {
+    match table {
+        LutTable::Range16 | LutTable::Bytes2 | LutTable::Pair128 => 0,
+        LutTable::Qcast
+        | LutTable::Div448
+        | LutTable::ExpInfo
+        | LutTable::Clamp22
+        | LutTable::Pow2D
+        | LutTable::Pow2Gb
+        | LutTable::Log16 => 1,
+        LutTable::Width32 | LutTable::Width16 => 2,
+        LutTable::Xor8 => 3, // x ^ y and its two high fragments
+        LutTable::Int8Dec => 4,
+        LutTable::WidthNorm => 6, // slot-zero outputs and four right-shifted ramps
+        LutTable::Pow2G => 7,     // two saturated keys and five values
+        LutTable::ProdAlign15 | LutTable::B200Align => 11, // eight truncations and three decode fields
+        LutTable::RneRnd => 75,   // independent rounding outputs
+        LutTable::Fp32Tools | LutTable::DownscaleRewrite => 2,
+        LutTable::DownscaleThreshold => 6,
+        LutTable::DownscaleThresholdH100 => 3,
+    }
+}
+
+/// Number of setup-time committed columns, shared by all folded slots.
+pub const fn num_precommitted_columns(table: LutTable) -> usize {
+    num_key_columns(table) + num_value_columns(table)
+}
+
+/// Total column count of the table's AIR: the precommitted block, then one per-proof
+/// multiplicity column per slot.
+pub const fn lut_num_columns(table: LutTable) -> usize {
+    num_precommitted_columns(table) + num_slots(table)
+}
+
+/// One folded slot's keys, value expressions, and per-proof multiplicity.
+#[derive(Clone, Debug)]
+pub struct LutSlotLayout<F: Field> {
+    /// Constant added to each key column to distinguish folded slots.
+    pub key_offset: u64,
+    /// Stored key columns; small tables may use a saturated ramp.
+    pub key_columns: Vec<usize>,
+    /// Value expressions in the order consumers bind them.
+    pub value_columns: Vec<Column<F>>,
+    /// The slot's per-proof multiplicity column.
+    pub multiplicity_column: usize,
+}
+
+impl<F: Field> LutSlotLayout<F> {
+    /// The slot's looked tuple, with its key offset included.
+    pub fn looked_columns(&self) -> Vec<Column<F>> {
+        let offset = F::from_canonical_u64(self.key_offset);
+        let mut cols: Vec<Column<F>> = self
+            .key_columns
+            .iter()
+            .map(|&c| Column::linear_combination_with_constant([(c, F::ONE)], offset))
+            .collect();
+        cols.extend(self.value_columns.iter().cloned());
+        cols
+    }
+}
+
+/// Independent RNERND outputs, in stored-column order after the key.
+pub(crate) fn rnernd_stored_values() -> Vec<(usize, usize)> {
+    (0..26)
+        .flat_map(|slot| (0..4).map(move |value| (slot, value)))
+        .filter(|&(slot, value)| {
+            !matches!(
+                (slot, value),
+                (0, 3) | (1..=8, 2) | (17, 3) | (18..=24, 1 | 3) | (24, 2) | (25, _)
+            )
+        })
+        .collect()
+}
+
+fn rnernd_value_columns<F: Field>(slot: usize) -> Vec<Column<F>> {
+    let stored = rnernd_stored_values();
+    let column = |slot, value| 1 + stored.iter().position(|&source| source == (slot, value)).unwrap();
+    (0..4)
+        .map(|value| match (slot, value) {
+            (0, 3) | (1..=7, 2) => Column::single(column(0, 2)),
+            (8, 2) => Column::single(column(1, 3)),
+            // At cut 10, WIDTH_ADJUST is 144 for normal results and 0 for zero/subnormal results.
+            (17, 3) => Column::linear_combination_with_constant([(column(17, 1), -F::from_canonical_u64(144).inverse())], F::ONE),
+            (18..=24, 1) | (25, 0 | 1) => Column::constant(F::ZERO),
+            (18..=25, 3) | (25, 2) => Column::constant(F::ONE),
+            (24, 2) => Column::linear_combination_with_constant([(column(24, 0), -F::ONE)], F::ONE),
+            _ => Column::single(column(slot, value)),
+        })
+        .collect()
+}
+
+/// Resolves a slot to affine expressions over its table's fixed columns.
+pub fn lut_slot_layout<F: Field>(table: LutTable, slot: usize) -> LutSlotLayout<F> {
+    assert!(slot < num_slots(table), "slot {slot} out of range for {table:?}");
+    let nk = num_key_columns(table);
+    let mut key_columns = (0..nk).collect();
+    let (key_offset, value_columns) = match table {
+        LutTable::Range16 | LutTable::Bytes2 | LutTable::Pair128 => (0, vec![]),
+        LutTable::Qcast
+        | LutTable::Div448
+        | LutTable::ExpInfo
+        | LutTable::Clamp22
+        | LutTable::Pow2D
+        | LutTable::Pow2Gb
+        | LutTable::Log16 => (0, vec![Column::single(nk)]),
+        LutTable::Width32 | LutTable::Width16 => (0, Column::singles([nk, nk + 1]).collect()),
+        LutTable::Int8Dec => (0, Column::singles(nk..nk + 4).collect()),
+        // Columns 2, 3, 4 hold x ^ y, (x ^ y) >> 4, (x ^ y) >> 7; the constant tag pins the slot.
+        LutTable::Xor8 => {
+            let high = if slot == 0 {
+                Column::constant(F::ZERO)
+            } else {
+                Column::single(nk + slot)
+            };
+            (
+                0,
+                vec![Column::single(nk), high, Column::constant(F::from_canonical_usize(slot))],
+            )
+        }
+        LutTable::ProdAlign15 | LutTable::B200Align => {
+            let shift = if table == LutTable::ProdAlign15 { 7 } else { 19 };
+            let aligned = if slot <= shift {
+                Column::linear_combination([(1, F::from_canonical_u64(1 << (shift - slot)))])
+            } else if slot <= shift + 7 {
+                Column::single(1 + slot - shift)
+            } else {
+                Column::constant(F::ZERO)
+            };
+            // key = a + 256*b. Columns 9, 10, 11 hold exponent, a, and product binade.
+            let byte_inverse = F::from_canonical_u64(256).inverse();
+            (
+                (slot as u64) << 16,
+                vec![
+                    aligned,
+                    Column::single(9),
+                    Column::single(10),
+                    Column::linear_combination([(0, byte_inverse), (10, -byte_inverse)]),
+                    Column::single(11),
+                ],
+            )
+        }
+        LutTable::WidthNorm => {
+            let values = if slot == 0 {
+                Column::singles([1, 2]).collect()
+            } else {
+                let width = slot.ilog2() as usize + 1;
+                let shift = width + 2;
+                vec![
+                    Column::constant(F::from_canonical_usize(16 + width)),
+                    Column::linear_combination_with_constant([(shift, F::ONE)], F::from_canonical_usize(slot << (16 - shift))),
+                ]
+            };
+            ((slot as u64) << 16, values)
+        }
+        // Flag ranges 0, 2..=3, and 4..=5 separate operations even for forged keys.
+        LutTable::Pow2G => match slot {
+            0 => (0, vec![Column::single(3), Column::constant(F::ZERO)]),
+            1 => (
+                128,
+                vec![
+                    Column::single(4),
+                    Column::linear_combination_with_constant([(5, F::ONE)], F::TWO),
+                ],
+            ),
+            2 => {
+                key_columns = vec![1];
+                (
+                    192,
+                    vec![Column::constant(F::ONE), Column::constant(F::from_canonical_u64(3))],
+                )
+            }
+            3 => {
+                key_columns = vec![2];
+                (
+                    256,
+                    vec![
+                        Column::single(6),
+                        Column::linear_combination_with_constant([(7, F::ONE)], F::from_canonical_u64(4)),
+                    ],
+                )
+            }
+            _ => unreachable!(),
+        },
+        LutTable::RneRnd => ((slot as u64) << 17, rnernd_value_columns(slot)),
+        LutTable::Fp32Tools => (0, Column::singles([2, 3]).collect()),
+        // Columns 1..=6: small-RMS threshold, large-RMS threshold, large-RMS coefficient,
+        // small-RMS LOG16 region, small-RMS key base, large-RMS key base. Slot 0 (small RMS)
+        // serves the constant coefficient 8192 and its row's capped region; slots 1..=5
+        // (large RMS) serve the table coefficient and the uncapped region 1, with the
+        // threshold and key base slot-affine in the exponent.
+        LutTable::DownscaleThreshold => (
+            (slot as u64) << 15,
+            if slot == 0 {
+                vec![
+                    Column::single(1),
+                    Column::constant(F::from_canonical_u64(8192)),
+                    Column::single(4),
+                    Column::single(5),
+                ]
+            } else {
+                vec![
+                    Column::linear_combination_with_constant([(2, F::ONE)], F::from_canonical_usize(8 * (slot - 1))),
+                    Column::single(3),
+                    Column::constant(F::ONE),
+                    Column::linear_combination_with_constant([(6, F::ONE)], F::from_canonical_usize(128 * (slot - 1))),
+                ]
+            },
+        ),
+        // Columns 1..=3: slot-0 threshold, coefficient, slot-0 key base. Every slot serves
+        // the shared coefficient and the uncapped region 1; the threshold and key base are
+        // slot-affine in the exponent.
+        LutTable::DownscaleThresholdH100 => (
+            (slot as u64) << 15,
+            vec![
+                Column::linear_combination_with_constant([(1, F::ONE)], F::from_canonical_usize(8 * slot)),
+                Column::single(2),
+                Column::constant(F::ONE),
+                Column::linear_combination_with_constant([(3, F::ONE)], F::from_canonical_usize(128 * slot)),
+            ],
+        ),
+        LutTable::DownscaleRewrite => (
+            (slot as u64) << 16,
+            vec![Column::linear_combination([
+                (1, F::ONE),
+                (2, F::from_canonical_usize(8 * slot)),
+            ])],
+        ),
+    };
+    LutSlotLayout {
+        key_offset,
+        key_columns,
+        value_columns,
+        multiplicity_column: num_precommitted_columns(table) + slot,
+    }
+}
