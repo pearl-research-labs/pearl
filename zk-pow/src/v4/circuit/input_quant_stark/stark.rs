@@ -2345,14 +2345,14 @@ mod tests {
     }
 
     /// Deterministic int8 plane: mixes zeros, ±127, -128 and mid-range values.
-    fn test_int8(len: usize, salt: u64) -> Vec<i8> {
+    fn test_int8(len: usize, seed: u64) -> Vec<i8> {
         const POOL: [i8; 12] = [5, -3, 127, 0, 1, -1, 64, -64, 100, -100, -128, 33];
         (0..len)
             .map(|i| {
                 if i % 9 == 0 {
                     0
                 } else {
-                    POOL[((i as u64).wrapping_mul(salt) ^ (i as u64 >> 2)) as usize % POOL.len()]
+                    POOL[((i as u64).wrapping_mul(seed) ^ (i as u64 >> 2)) as usize % POOL.len()]
                 }
             })
             .collect()
@@ -2362,7 +2362,7 @@ mod tests {
     /// zero-scale block per group. The zero block exercises the sum-of-squares, policy, and
     /// zero-product FMA paths; the subnormal scales decode elements into bf16's subnormal
     /// range (and, with large ints, back into the normal range through rounding).
-    fn test_scales(len: usize, salt: u64) -> Vec<u16> {
+    fn test_scales(len: usize, seed: u64) -> Vec<u16> {
         // 1.0, 2.0, 0.5, -1.5, 3.0, 0.25, -0.375, 1.25, 2^-133, -2^-127 as bf16 codes.
         const POOL: [u16; 10] = [0x3F80, 0x4000, 0x3F00, 0xBFC0, 0x4040, 0x3E80, 0xBEC0, 0x3FA0, 0x0001, 0x8040];
         (0..len)
@@ -2370,7 +2370,7 @@ mod tests {
                 if i % 8 == 1 {
                     0x0000 // one zero-scale block per 8 blocks
                 } else {
-                    POOL[((i as u64).wrapping_mul(salt) ^ (i as u64 >> 1)) as usize % POOL.len()]
+                    POOL[((i as u64).wrapping_mul(seed) ^ (i as u64 >> 1)) as usize % POOL.len()]
                 }
             })
             .collect()
@@ -2378,7 +2378,7 @@ mod tests {
 
     /// Deterministic noise plane: zero, subnormal, tiny and mid-range bf16 codes of both signs —
     /// exercises far/near gaps, wide/narrow folds and subnormal noise terms.
-    fn test_noise(len: usize, salt: u64) -> Vec<f32> {
+    fn test_noise(len: usize, seed: u64) -> Vec<f32> {
         const POOL: [u16; 10] = [
             0x3E80, // 0.25
             0xBE80, // -0.25
@@ -2392,7 +2392,7 @@ mod tests {
             0xC280, // -64.0
         ];
         (0..len)
-            .map(|i| POOL[((i as u64).wrapping_mul(salt) ^ (i as u64 >> 3)) as usize % POOL.len()])
+            .map(|i| POOL[((i as u64).wrapping_mul(seed) ^ (i as u64 >> 3)) as usize % POOL.len()])
             .map(bf16_to_f32)
             .collect()
     }

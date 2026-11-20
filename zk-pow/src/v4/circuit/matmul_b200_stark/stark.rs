@@ -1095,13 +1095,13 @@ mod tests {
     /// exponents land in {127, 128, 129}, so with the zero run at most 4 runs per cell.
     const CODE_POOL: [u8; 8] = [0x38, 0x40, 0xB9, 0x3A, 0xC1, 0x3B, 0xBA, 0x42];
 
-    fn test_codes(len: usize, salt: u64, zero_every: usize) -> Vec<u8> {
+    fn test_codes(len: usize, seed: u64, zero_every: usize) -> Vec<u8> {
         (0..len)
             .map(|i| {
                 if zero_every != 0 && i % zero_every == 0 {
                     0x00
                 } else {
-                    CODE_POOL[((i as u64).wrapping_mul(salt) ^ (i as u64 >> 3)) as usize % CODE_POOL.len()]
+                    CODE_POOL[((i as u64).wrapping_mul(seed) ^ (i as u64 >> 3)) as usize % CODE_POOL.len()]
                 }
             })
             .collect()
@@ -1111,13 +1111,13 @@ mod tests {
     /// rel-shifts, window drops and truncation in both width directions.
     const WIDE_POOL: [u8; 10] = [0x08, 0x78, 0xF9, 0x0F, 0x30, 0xC5, 0x58, 0x01, 0xB3, 0x62];
 
-    fn wide_codes(len: usize, salt: u64, zero_every: usize) -> Vec<u8> {
+    fn wide_codes(len: usize, seed: u64, zero_every: usize) -> Vec<u8> {
         (0..len)
             .map(|i| {
                 if zero_every != 0 && i % zero_every == 0 {
                     0x00
                 } else {
-                    WIDE_POOL[((i as u64).wrapping_mul(salt) ^ (i as u64 >> 2)) as usize % WIDE_POOL.len()]
+                    WIDE_POOL[((i as u64).wrapping_mul(seed) ^ (i as u64 >> 2)) as usize % WIDE_POOL.len()]
                 }
             })
             .collect()
@@ -1125,8 +1125,8 @@ mod tests {
 
     /// Deterministic summand scores in the honest range (`lambda <= 54207`), spread so both
     /// skip verdicts occur.
-    fn test_lambdas(len: usize, salt: u64) -> Vec<u64> {
-        (0..len).map(|i| 12_928 + (i as u64).wrapping_mul(salt) % 41_280).collect()
+    fn test_lambdas(len: usize, seed: u64) -> Vec<u64> {
+        (0..len).map(|i| 12_928 + (i as u64).wrapping_mul(seed) % 41_280).collect()
     }
 
     fn test_program() -> S {
