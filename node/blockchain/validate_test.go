@@ -166,9 +166,8 @@ func TestCheckBlockSanity(t *testing.T) {
 		Bits:       chainParams.PowLimitBits,
 	}
 
-	// Mine a valid certificate (only 1 block, so longer ZK proof time is
-	// acceptable), of the version regtest requires at height 1.
-	cert, err := zkpow.Mine(&header, chainParams.RequiredCertVersion(1))
+	// CheckBlockSanity is height-free, so a cheap V3 proof exercises real PoW verification without ~40s V4 proving.
+	cert, err := zkpow.Mine(&header, wire.CertificateVersionV3)
 	if err != nil {
 		t.Fatalf("Mine failed: %v", err)
 	}

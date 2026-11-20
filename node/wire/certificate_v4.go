@@ -1,0 +1,163 @@
+// Copyright (c) 2025-2026 The Pearl Research Labs developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package wire
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+)
+
+// MaxCertificateV4AncestorHeaders bounds the ancestor chain: the proof's
+// ancestor header lies at depth at most four (the state window), so at most
+// three intermediate headers separate it from the proposed header.
+const MaxCertificateV4AncestorHeaders = 3
+
+// PublicDataMaxSizeV4 is the maximum PublicData size for V4 certificates. Must match PublicParams::MAX_WIRE_SIZE in
+// zk-pow/src/v4/api/public_params.rs.
+const PublicDataMaxSizeV4 = 832
+
+// CertificateV4 is a version-4 (FP8) block certificate. Its wire layout is hash + length-prefixed public data +
+// length-prefixed proof + ancestor count + full ancestor headers. PublicData is capped at PublicDataMaxSizeV4,
+// ProofData at MaxZKProofSize and the whole certificate at CertificateMaxSize.
+type CertificateV4 struct {
+	Hash       chainhash.Hash
+	PublicData []byte
+	ProofData  []byte
+
+	// AncestorHeaders supplies the headers strictly between the proposed
+	// header and the proof's ancestor header (carried in PublicData), parent
+	// first: empty when that ancestor is the parent. They are excluded from
+	// ProofCommitment and authenticated through the proposed header's
+	// PrevBlock hash.
+	AncestorHeaders []BlockHeader
+}
+
+func (c *CertificateV4) Version() CertificateVersion {
+	return CertificateVersionV4
+}
+
+func (c *CertificateV4) BlockHash() chainhash.Hash {
+	return c.Hash
+}
+
+func (c *CertificateV4) PublicDataBytes() []byte {
+	return c.PublicData
+}
+
+func (c *CertificateV4) ProofBytes() []byte {
+	return c.ProofData
+}
+
+// IsMoE returns false because V4 is outside the legacy V2/V3 MoE classification.
+func (c *CertificateV4) IsMoE() bool {
+	return false
+}
+
+func (c *CertificateV4) ProofCommitment() chainhash.Hash {
+	return proofCommitment(c.Version(), c.PublicDataBytes())
+}
+
+// Serialize writes the certificate fields, followed by a canonical varint
+// ancestor count and the full headers in parent-to-grandparent order.
+// The count is mandatory, including zero for a depth-1 (parent) ancestor.
+func (c *CertificateV4) Serialize(w io.Writer) error {
+	if len(c.AncestorHeaders) > MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
+			len(c.AncestorHeaders), MaxCertificateV4AncestorHeaders)
+	}
+	if err := checkBlobLen("fp8 public_data", len(c.PublicData), PublicDataMaxSizeV4); err != nil {
+		return err
+	}
+	if err := checkBlobLen("fp8 proof_data", len(c.ProofData), MaxZKProofSize); err != nil {
+		return err
+	}
+	if _, err := w.Write(c.Hash[:]); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(c.PublicData))); err != nil {
+		return err
+	}
+	if _, err := w.Write(c.PublicData); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(c.ProofData))); err != nil {
+		return err
+	}
+	if _, err := w.Write(c.ProofData); err != nil {
+		return err
+	}
+	if err := WriteVarInt(w, 0, uint64(len(c.AncestorHeaders))); err != nil {
+		return err
+	}
+	for i := range c.AncestorHeaders {
+		if err := c.AncestorHeaders[i].Serialize(w); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readV4Blob reads a bounded blob with a fixed 4-byte little-endian length.
+// ReadVarBytes uses a varint and cannot decode this format.
+// A zero length decodes as nil.
+func readV4Blob(r io.Reader, fieldName string, maxLen int) ([]byte, error) {
+	var length uint32
+	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
+		return nil, err
+	}
+	if err := checkBlobLen("fp8 "+fieldName, length, maxLen); err != nil {
+		return nil, err
+	}
+	if length == 0 {
+		return nil, nil
+	}
+	blob := make([]byte, length)
+	if _, err := io.ReadFull(r, blob); err != nil {
+		return nil, err
+	}
+	return blob, nil
+}
+
+func (c *CertificateV4) Deserialize(r io.Reader) error {
+	if _, err := io.ReadFull(r, c.Hash[:]); err != nil {
+		return err
+	}
+	publicData, err := readV4Blob(r, "public_data", PublicDataMaxSizeV4)
+	if err != nil {
+		return err
+	}
+	proofData, err := readV4Blob(r, "proof_data", MaxZKProofSize)
+	if err != nil {
+		return err
+	}
+	count, err := ReadVarInt(r, 0)
+	if err != nil {
+		return err
+	}
+	if count > MaxCertificateV4AncestorHeaders {
+		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
+			count, MaxCertificateV4AncestorHeaders)
+	}
+	var ancestors []BlockHeader
+	for range count {
+		var header BlockHeader
+		if err := header.Deserialize(r); err != nil {
+			return err
+		}
+		ancestors = append(ancestors, header)
+	}
+	c.PublicData = publicData
+	c.ProofData = proofData
+	c.AncestorHeaders = ancestors
+	return nil
+}
+
+func (c *CertificateV4) SerializedSize() int {
+	return 32 + 4 + len(c.PublicData) + 4 + len(c.ProofData) +
+		VarIntSerializeSize(uint64(len(c.AncestorHeaders))) + len(c.AncestorHeaders)*MaxBlockHeaderPayload
+}

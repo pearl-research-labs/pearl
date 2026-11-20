@@ -335,6 +335,8 @@ func (msg *MsgBlock) MaxPayloadLength(pver uint32) uint32 {
 	// Wire body = certificate + block header + varint + transactions.
 	// Bound the block to MaxBlockPayload and additionally reserve
 	// CertificateMaxSize for the certificate that rides in the header.
+	// Every certificate version is capped at CertificateMaxSize, so this
+	// ensures any valid block can be relayed.
 	return MaxBlockPayload + CertificateMaxSize
 }
 
