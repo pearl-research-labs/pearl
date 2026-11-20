@@ -157,6 +157,27 @@ func TestCheckCertificateRulesV4SkipsRankPenalty(t *testing.T) {
 	require.NoError(t, CheckCertificateRules(&wire.BlockHeader{}, cert, 1, params, BFNone))
 }
 
+// TestCheckBlockSanityRejectsV4WithoutFp8Fork asserts that the context-free block checks reject a V4 certificate on a
+// network with no FP8 fork height, and leave the version to the height rule when the fork is scheduled.
+func TestCheckBlockSanityRejectsV4WithoutFp8Fork(t *testing.T) {
+	params := fp8SimNetParams()
+	chain, teardown, err := chainSetup("fp8_fork_unscheduled", &params)
+	require.NoError(t, err)
+	defer teardown()
+
+	tip := btcutil.NewBlock(chain.chainParams.GenesisBlock)
+	tip.SetHeight(0)
+	block := newBlockForcedCert(t, chain, tip, v4Cert([]byte{0x00}, nil))
+
+	require.NoError(t, CheckBlockSanity(block, &params, chain.timeSource))
+
+	unscheduled := params
+	unscheduled.Fp8ForkHeight = 0
+	err = CheckBlockSanity(block, &unscheduled, chain.timeSource)
+	requireRuleError(t, err, ErrDisallowedCertVersion)
+	require.ErrorContains(t, err, "FP8 fork is not scheduled")
+}
+
 func TestNewRejectsFp8BeforeSaltedSeedFork(t *testing.T) {
 	params := fp8SimNetParams()
 	params.SaltedSeedForkHeight = 5

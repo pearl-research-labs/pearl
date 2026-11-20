@@ -494,6 +494,14 @@ func checkBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 		existingTxHashes[*hash] = struct{}{}
 	}
 
+	// A V4 certificate can never be valid on a network with no FP8 fork height. These checks do not know the block
+	// height, so reject it here: otherwise the V4 verifier runs on the block before CheckCertificateRules rejects it.
+	if cert != nil && cert.Version() == wire.CertificateVersionV4 && chainParams.Fp8ForkHeight == 0 {
+		str := fmt.Sprintf("certificate version %d is not allowed: the FP8 fork is not scheduled on %s",
+			cert.Version(), chainParams.Name)
+		return ruleError(ErrDisallowedCertVersion, str)
+	}
+
 	// certificate verification is compute intensive, so we ensure it is performed last.
 	return CheckBlockHeaderSanity(header, cert, chainParams.PowLimit, timeSource, chainParams.MaxTimeOffsetMinutes, flags)
 }
