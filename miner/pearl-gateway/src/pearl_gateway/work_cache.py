@@ -60,10 +60,3 @@ class WorkCache:
             if self.current_template is None:
                 return None
             return time.time() - self.last_update_time
-
-    async def invalidate(self) -> None:
-        """Invalidate the current template, forcing a refresh on next request."""
-        async with self.lock:
-            logger.info("Invalidating current template")
-            self.current_template = None
-            self.last_update_time = 0

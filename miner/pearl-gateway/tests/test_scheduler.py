@@ -22,7 +22,6 @@ def mock_work_cache():
     """Create a mock WorkCache."""
     cache = AsyncMock()
     cache.update_template = AsyncMock(return_value=True)
-    cache.invalidate = AsyncMock()
     return cache
 
 

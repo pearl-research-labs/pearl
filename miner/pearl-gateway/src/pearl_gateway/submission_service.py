@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from miner_utils import get_logger
 from pearl_mining import PlainProof, check_cert_version_eligible
@@ -7,6 +7,10 @@ from pearl_mining import PlainProof, check_cert_version_eligible
 from pearl_gateway.comm.dataclasses import BlockTemplate
 from pearl_gateway.pearl_client import PearlNodeClient
 from pearl_gateway.proof_generator import ProofGenerator
+
+if TYPE_CHECKING:
+    from pearl_gateway.blockchain_utils.pearl_block import PearlBlock
+    from pearl_gateway.proof_pool import ProofPool
 
 logger = get_logger(__name__)
 
@@ -17,14 +21,27 @@ class SubmissionService:
     Receives PlainProof from miners and generates complete blocks.
     """
 
-    def __init__(self, pearl_client: PearlNodeClient, debug_mode: bool = False):
+    def __init__(
+        self, pearl_client: PearlNodeClient, proof_pool: "ProofPool", debug_mode: bool = False
+    ):
         self.pearl_client = pearl_client
+        self.proof_pool = proof_pool
         self.submission_lock = asyncio.Lock()  # Ensure serialized submissions
         self.submission_log = set()
         self.debug_mode = debug_mode
         self.submitted_blocks = 0
         self.accepted_blocks = 0
         self.rejected_blocks = 0
+
+    async def _build_block(self, plain_proof: PlainProof, template: BlockTemplate) -> "PearlBlock":
+        """Prove in a worker process and assemble the block from the returned bytes."""
+        public_data, proof_data = await self.proof_pool.prove(
+            int(template.required_cert_version),
+            template.header.serialize_without_proof_commitment(),
+            plain_proof.to_base64(),
+            self.debug_mode,
+        )
+        return ProofGenerator.build_block(public_data, proof_data, template)
 
     async def submit_plain_proof(
         self, plain_proof: PlainProof, template: BlockTemplate
@@ -50,7 +67,7 @@ class SubmissionService:
                     logger.warning(f"Rejecting proof: {e}")
                     return {"status": f"error: {e}"}
 
-                block = ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
+                block = await self._build_block(plain_proof, template)
 
                 # Submit to the Pearl node
                 self.submitted_blocks += 1
