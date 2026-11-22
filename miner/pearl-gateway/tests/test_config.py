@@ -207,7 +207,7 @@ class TestPoolConfig:
         with pytest.raises(ValidationError, match="must include a host"):
             PoolConfig(stratum_url="stratum+tcp://")
 
-    @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+    @pytest.mark.parametrize("value", [0, -1, 0.5, "0.5", "1e3", float("inf"), float("nan")])
     def test_pool_config_difficulty_rejects_invalid(self, value):
         with pytest.raises(ValidationError, match="difficulty"):
             PoolConfig(stratum_url="stratum+tcp://pool.example.com", difficulty=value)
@@ -219,14 +219,14 @@ class TestPoolConfig:
                 "PEARLD_MINING_ADDRESS": mining_address,
                 "POOL_STRATUM_URL": "stratum+tcp://pool.example.com:3333",
                 "POOL_WORKER": "rig-1",
-                "POOL_DIFFICULTY": "0.5",
+                "POOL_DIFFICULTY": "128",
             },
         ):
             config = load_config()
 
         assert config.pool is not None
         assert config.pool.worker == "rig-1"
-        assert config.pool.difficulty == 0.5
+        assert config.pool.difficulty == 128
 
     def test_load_config_pool_mode_without_pearld(self, mining_address):
         env = {"POOL_STRATUM_URL": "stratum+tcp://pool.example.com", "POOL_ADDRESS": mining_address}

@@ -51,8 +51,8 @@ class PoolConfig(BaseSettings):
     password: str = "x"
     reconnect_delay_seconds: int = 1
     max_reconnect_delay_seconds: int = 60
-    # Start share difficulty in the pool's unit, sent as d=N in the password.
-    difficulty: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    # Start share difficulty, a whole number in the pool's unit, sent as d=N in the password.
+    difficulty: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_stratum_url(self) -> "PoolConfig":

@@ -65,7 +65,7 @@ class PoolStratumClient:
         difficulty convention Pearl pools read from the password."""
         if self.config.difficulty is None:
             return self.config.password
-        return ";".join(p for p in (self.config.password, f"d={self.config.difficulty:g}") if p)
+        return ";".join(p for p in (self.config.password, f"d={self.config.difficulty}") if p)
 
     async def start(self) -> None:
         await self._conn.start()

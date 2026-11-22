@@ -265,7 +265,7 @@ class TestPoolStratumClient:
     async def test_subscribe_and_authorize_sends_difficulty_in_password(
         self, work_cache: WorkCache
     ):
-        config = PoolConfig(stratum_url="stratum+tcp://127.0.0.1:3333", difficulty=0.5)
+        config = PoolConfig(stratum_url="stratum+tcp://127.0.0.1:3333", difficulty=128)
         client, reader, writer = make_connected_client(config, work_cache)
         listen_task = start_listener(client)
 
@@ -276,7 +276,7 @@ class TestPoolStratumClient:
         await wait_for_write_count(writer, 2)
         authorize_req = latest_request(writer)
         assert authorize_req["method"] == "mining.authorize"
-        assert authorize_req["params"][1] == "x;d=0.5"
+        assert authorize_req["params"][1] == "x;d=128"
         reader.feed_line({"id": authorize_req["id"], "result": True})
 
         await handshake
@@ -287,8 +287,8 @@ class TestPoolStratumClient:
         ("password", "difficulty", "expected"),
         [
             ("x", None, "x"),
-            ("x", 32768.0, "x;d=32768"),
-            ("", 0.25, "d=0.25"),
+            ("x", 32768, "x;d=32768"),
+            ("", 1, "d=1"),
         ],
     )
     def test_authorize_password(self, work_cache: WorkCache, password, difficulty, expected):

@@ -122,7 +122,7 @@ so the `PEARLD_RPC_*` settings are ignored.
 - `POOL_ADDRESS` - Payout address sent as the Stratum username (default: `PEARLD_MINING_ADDRESS`; one of the two is required)
 - `POOL_WORKER` - Worker name, appended as `address.worker` (default: `gateway`)
 - `POOL_PASSWORD` - Stratum password (default: `x`)
-- `POOL_DIFFICULTY` - Start share difficulty, in the pool's difficulty unit (the one its dashboard shows). Sent as `d=N` appended to the password, e.g. `x;d=0.5`. Unset: the pool default. The pool then adjusts it.
+- `POOL_DIFFICULTY` - Start share difficulty, a whole number ≥ 1 in the pool's difficulty unit (the one its dashboard shows). Sent as `d=N` appended to the password, e.g. `x;d=128`. Unset: the pool default. The pool then adjusts it.
 - `POOL_RECONNECT_DELAY_SECONDS` / `POOL_MAX_RECONNECT_DELAY_SECONDS` - Reconnect backoff (defaults: `1` / `60`)
 
 ```bash
