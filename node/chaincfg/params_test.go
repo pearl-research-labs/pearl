@@ -202,7 +202,7 @@ func TestFp8ForkDisabled(t *testing.T) {
 
 func TestShippedNetworksFp8ForkHeights(t *testing.T) {
 	for name, params := range map[string]*Params{
-		"mainnet":  &MainNetParams,
+		"mainnet": &MainNetParams,
 	} {
 		require.Zerof(t, params.Fp8ForkHeight, "%s must ship with Fp8ForkHeight disabled", name)
 	}
