@@ -1612,13 +1612,13 @@ mod tests {
 
     /// Deterministic operand codes: a zero every `zero_every` positions (0 = never), pool codes
     /// elsewhere.
-    fn test_codes(len: usize, salt: u64, zero_every: usize) -> Vec<u8> {
+    fn test_codes(len: usize, seed: u64, zero_every: usize) -> Vec<u8> {
         (0..len)
             .map(|i| {
                 if zero_every != 0 && i % zero_every == 0 {
                     0x00
                 } else {
-                    CODE_POOL[((i as u64).wrapping_mul(salt) ^ (i as u64 >> 3)) as usize % CODE_POOL.len()]
+                    CODE_POOL[((i as u64).wrapping_mul(seed) ^ (i as u64 >> 3)) as usize % CODE_POOL.len()]
                 }
             })
             .collect()
@@ -1626,8 +1626,8 @@ mod tests {
 
     /// Deterministic summand scores in the honest range (`lambda <= 54207`), spread so both
     /// skip verdicts occur.
-    fn test_lambdas(len: usize, salt: u64) -> Vec<u64> {
-        (0..len).map(|i| 12_928 + (i as u64).wrapping_mul(salt) % 41_280).collect()
+    fn test_lambdas(len: usize, seed: u64) -> Vec<u64> {
+        (0..len).map(|i| 12_928 + (i as u64).wrapping_mul(seed) % 41_280).collect()
     }
 
     fn test_program() -> S {

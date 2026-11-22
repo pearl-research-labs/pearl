@@ -376,14 +376,14 @@ fn rnernd_matches_both_stark_mirrors_and_the_exact_encode_exhaustively() {
 }
 
 /// The shared operand recipe of the alignment-table trace tests.
-fn alignment_test_codes(len: usize, salt: u64) -> Vec<u8> {
+fn alignment_test_codes(len: usize, seed: u64) -> Vec<u8> {
     const POOL: [u8; 8] = [0x38, 0x40, 0xB9, 0x3A, 0xC1, 0x3B, 0xBA, 0x42];
     (0..len)
         .map(|i| {
             if i % 8 == 0 {
                 0
             } else {
-                POOL[((i as u64).wrapping_mul(salt) ^ (i as u64 >> 3)) as usize % POOL.len()]
+                POOL[((i as u64).wrapping_mul(seed) ^ (i as u64 >> 3)) as usize % POOL.len()]
             }
         })
         .collect()
@@ -391,8 +391,8 @@ fn alignment_test_codes(len: usize, salt: u64) -> Vec<u8> {
 
 /// Summand scores for the alignment-table trace tests, in the live domain
 /// `[12_928, 54_207]` (the alignment assertions never read them).
-fn alignment_test_lambdas(len: usize, salt: u64) -> Vec<u64> {
-    (0..len).map(|i| 12_928 + (i as u64).wrapping_mul(salt) % 41_280).collect()
+fn alignment_test_lambdas(len: usize, seed: u64) -> Vec<u64> {
+    (0..len).map(|i| 12_928 + (i as u64).wrapping_mul(seed) % 41_280).collect()
 }
 
 #[test]
