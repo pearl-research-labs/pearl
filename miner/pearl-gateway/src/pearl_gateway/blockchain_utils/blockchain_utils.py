@@ -55,6 +55,18 @@ def _compute_merkle_root(hashes: list[bytes]) -> bytes:
     return current_level[0][::-1]  # Convert back to big-endian for final result
 
 
+def reconstruct_stratum_merkle_root(coinbase_hash: bytes, merkle_branch: list[bytes]) -> bytes:
+    """Walk a Stratum merkle branch (internal-order hashes) up from the coinbase hash.
+
+    Returns the root in display order, matching calculate_merkle_root and what
+    IncompleteBlockHeader expects.
+    """
+    current = coinbase_hash
+    for sibling in merkle_branch:
+        current = double_sha256(current + sibling)
+    return current[::-1]
+
+
 def bits_to_target(bits: int) -> int:
     """Convert bits to target.
     bits is a 4-byte value: 1 byte exponent, 3 bytes mantissa (big-endian)
@@ -62,8 +74,24 @@ def bits_to_target(bits: int) -> int:
     """
     exponent = (bits >> 24) & 0xFF
     mantissa = bits & 0xFFFFFF
-    target = mantissa * (1 << (8 * (exponent - 3)))
-    return target
+    if exponent < 3:
+        return mantissa >> (8 * (3 - exponent))
+    return mantissa * (1 << (8 * (exponent - 3)))
+
+
+def target_to_bits(target: int) -> int:
+    """Convert target to compact bits (inverse of bits_to_target for valid encodings)."""
+    if target <= 0:
+        return 0
+
+    size = (target.bit_length() + 7) // 8
+    compact = target << (8 * (3 - size)) if size <= 3 else target >> (8 * (size - 3))
+
+    if compact & 0x800000:
+        compact >>= 8
+        size += 1
+
+    return compact | (size << 24)
 
 
 def create_coinbase_transaction(

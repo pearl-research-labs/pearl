@@ -306,6 +306,9 @@ class MinerRpcServer:
         if mining_job.incomplete_header_bytes != current_header:
             logger.info("Job changed since submission was queued; dropping stale proof")
             return
+        if template.share_target is not None and mining_job.target > template.share_target:
+            logger.info("Share difficulty increased since queued; dropping stale proof")
+            return
 
         # Submit the block via the submission service
         result = await self.submission_service.submit_plain_proof(plain_proof, template)

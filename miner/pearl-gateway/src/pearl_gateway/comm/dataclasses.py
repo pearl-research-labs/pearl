@@ -1,6 +1,6 @@
 import base64
-from dataclasses import dataclass
-from typing import Any, ClassVar
+from dataclasses import dataclass, field
+from typing import Annotated, Any, ClassVar
 
 import torch
 from bitcoinutils.transactions import Transaction
@@ -8,6 +8,8 @@ from pearl_gateway.blockchain_utils.blockchain_utils import (
     bits_to_target,
     calculate_merkle_root,
     create_coinbase_transaction,
+    double_sha256,
+    reconstruct_stratum_merkle_root,
 )
 from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
@@ -20,6 +22,7 @@ from pearl_gateway.rpc_types import (
     GetBlockTemplateResponse,
 )
 from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 
 def get_bytes(data: str | bytes) -> bytes:
@@ -41,16 +44,130 @@ def decode_dtype(encoded_dtype: str) -> torch.dtype:
     return getattr(torch, encoded_dtype.replace("torch.", ""))
 
 
+def _hex_to_bytes(value: str | bytes) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("value must be hex encoded")
+    try:
+        return bytes.fromhex(value)
+    except ValueError as exc:
+        raise ValueError("value must be hex encoded") from exc
+
+
+def _hex_to_32_bytes(value: str | bytes) -> bytes:
+    decoded = _hex_to_bytes(value)
+    if len(decoded) != 32:
+        raise ValueError("value must be 32 bytes")
+    return decoded
+
+
+def _hex_to_internal_hash32(value: str | bytes) -> bytes:
+    # Pool branch hashes are display-order hex; merkle hashing uses internal order.
+    return _hex_to_32_bytes(value)[::-1]
+
+
+def _hex_to_uint32(value: str) -> int:
+    if not isinstance(value, str):
+        raise ValueError("value must be hex encoded")
+    decoded = _hex_to_bytes(value)
+    if len(decoded) != 4:
+        raise ValueError("value must be 4 bytes")
+    return int.from_bytes(decoded, byteorder="big")
+
+
+def _to_cert_version(value: int) -> CertificateVersion:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("cert_version must be an integer")
+    return CertificateVersion(value)
+
+
+HexBytes = Annotated[bytes, BeforeValidator(_hex_to_bytes)]
+Hash32 = Annotated[bytes, BeforeValidator(_hex_to_32_bytes)]
+InternalHash32 = Annotated[bytes, BeforeValidator(_hex_to_internal_hash32)]
+HexUint32 = Annotated[int, BeforeValidator(_hex_to_uint32)]
+CertVersion = Annotated[CertificateVersion, BeforeValidator(_to_cert_version)]
+
+
+class StratumNotify(BaseModel):
+    """Validated mining.notify payload from a Stratum pool."""
+
+    model_config = ConfigDict(strict=True)
+    PARAM_FIELDS: ClassVar[tuple[str, ...]] = (
+        "job_id",
+        "prev_hash",
+        "coinb1",
+        "coinb2",
+        "merkle_branch",
+        "version",
+        "bits",
+        "ntime",
+        "clean_jobs",
+        "cert_version",
+    )
+
+    job_id: str = Field(min_length=1)
+    prev_hash: Hash32
+    coinb1: HexBytes
+    coinb2: HexBytes
+    merkle_branch: list[InternalHash32]
+    version: HexUint32
+    bits: HexUint32
+    ntime: HexUint32
+    clean_jobs: bool
+    cert_version: CertVersion
+    # extranonce1 exactly as the pool assigned it at subscribe.
+    extranonce: bytes
+    # Miner/proxy bytes appended after extranonce1; empty when the pool advertises no extranonce2.
+    extranonce2: bytes = b""
+
+    @classmethod
+    def from_params(
+        cls,
+        params: list[Any],
+        extranonce: bytes,
+        extranonce2: bytes = b"",
+    ) -> "StratumNotify":
+        """Validate positional Stratum mining.notify params."""
+
+        data = dict(zip(cls.PARAM_FIELDS, params, strict=True))
+        data["extranonce"] = extranonce
+        data["extranonce2"] = extranonce2
+        return cls.model_validate(data)
+
+
+class StratumSetDifficulty(BaseModel):
+    """Validated mining.set_difficulty payload from a Stratum pool."""
+
+    model_config = ConfigDict(strict=True)
+
+    bits: int = Field(ge=1, le=0xFFFFFFFF)
+
+    @classmethod
+    def from_params(cls, params: list[Any]) -> "StratumSetDifficulty":
+        """Validate positional Stratum mining.set_difficulty params."""
+        if len(params) != 1:
+            raise ValueError(f"mining.set_difficulty expects 1 param, got {len(params)}")
+        return cls.model_validate({"bits": params[0]})
+
+
 @dataclass
 class BlockTemplate:
-    """Represents a block template fetched from the Pearl node."""
+    """Represents a block template fetched from the Pearl node or a pool."""
 
     header: PearlHeader
-    height: int
+    # None for pool templates: mining.notify carries no height.
+    height: int | None
     raw_transactions: list[bytes]
     coinbase_tx: Transaction
     # Certificate version this block must carry under the crossover cutover.
     required_cert_version: CertificateVersion
+    # Pool mode only: the Stratum job id, the pool's share target (easier than
+    # the network target, so miners find shares), and the extranonce2 echoed
+    # back in mining.submit (None when the pool advertises none).
+    job_id: str | None = field(default=None)
+    share_target: int | None = field(default=None)
+    extranonce2: bytes | None = field(default=None)
 
     @classmethod
     def from_get_block_template(
@@ -93,6 +210,41 @@ class BlockTemplate:
             raw_transactions=raw_transactions,
             coinbase_tx=coinbase_tx,
             required_cert_version=CertificateVersion(data.requiredcertversion),
+        )
+
+    @classmethod
+    def from_stratum_notify(cls, notify: StratumNotify) -> "BlockTemplate":
+        """Build a BlockTemplate from a Stratum mining.notify message.
+
+        Reconstructs coinbase = coinb1 + extranonce1 + extranonce2 + coinb2, then
+        hashes it and walks the merkle branch to get the merkle root.
+        """
+        extranonce2 = notify.extranonce2
+        coinbase_bytes = notify.coinb1 + notify.extranonce + extranonce2 + notify.coinb2
+        merkle_root = reconstruct_stratum_merkle_root(
+            double_sha256(coinbase_bytes), notify.merkle_branch
+        )
+
+        return cls(
+            header=PearlHeader(
+                incomplete_header=IncompleteBlockHeader(
+                    version=notify.version,
+                    prev_block=notify.prev_hash,
+                    merkle_root=merkle_root,
+                    timestamp=notify.ntime,
+                    nbits=notify.bits,
+                ),
+            ),
+            height=None,
+            raw_transactions=[],
+            # from_raw() is safe here because coinbase scripts are all <=75 bytes
+            # (scriptSig ~20 B, P2TR output 34 B, witness commitment 38 B)
+            # so Script.from_raw() never hits the OP_PUSHDATA1 parse bug that
+            # silently drops data in segwit mode.
+            coinbase_tx=Transaction.from_raw(coinbase_bytes.hex()),
+            required_cert_version=notify.cert_version,
+            job_id=notify.job_id,
+            extranonce2=extranonce2 if extranonce2 else None,
         )
 
     def get_raw_transactions(self) -> list[bytes]:
@@ -205,7 +357,8 @@ class MiningJob:
         """Create MiningJob from BlockTemplate."""
         return cls(
             incomplete_header_bytes=template.header.serialize_without_proof_commitment(),
-            target=template.target,
+            # Pool mode: mine to the pool's share target so miners submit shares.
+            target=template.share_target if template.share_target is not None else template.target,
             cert_version=template.required_cert_version,
         )
 

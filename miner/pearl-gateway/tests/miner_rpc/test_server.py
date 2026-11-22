@@ -207,6 +207,19 @@ class TestMinerRpcServerHandlers:
 
         server.submission_service.submit_plain_proof.assert_not_called()
 
+    async def test_handle_submit_plain_proof_drops_on_difficulty_increase(
+        self, server, sample_plain_proof, sample_mining_job, sample_block_template
+    ):
+        """A queued share is dropped when the pool raised difficulty past its target."""
+        # Same job/header, but the current share target is now harder (smaller) than
+        # the target this submission was mined against.
+        sample_block_template.share_target = sample_mining_job.target - 1
+        server.work_cache.current_template = sample_block_template
+
+        await server.handle_submit_plain_proof(sample_plain_proof, sample_mining_job)
+
+        server.submission_service.submit_plain_proof.assert_not_called()
+
     async def test_handle_submit_plain_proof_drops_without_template(
         self, server, sample_plain_proof, sample_mining_job
     ):

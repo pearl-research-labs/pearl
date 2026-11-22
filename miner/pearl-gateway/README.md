@@ -109,6 +109,29 @@ All configuration can be set via environment variables:
 **Logging:**
 - `LOGGING_LEVEL` - Log level: `debug`, `info`, `warning`, `error` (default: `info`)
 
+**Pool Mode:**
+
+Setting `POOL_STRATUM_URL` switches the gateway from solo mode (templates from
+pearld, blocks submitted to pearld) to pool mode: it takes work from a Pearl
+Stratum v1 pool and sends each proof to the pool as a share. Proving still
+happens locally, and the pool receives the ZK certificate. Miners need no
+changes: their job target becomes the pool's share target. pearld is not used,
+so the `PEARLD_RPC_*` settings are ignored.
+
+- `POOL_STRATUM_URL` - Pool endpoint, e.g. `stratum+ssl://host:3443` (`ssl`/`tls` = TLS, `tcp` = plaintext; port defaults to `3333`)
+- `POOL_ADDRESS` - Payout address sent as the Stratum username (default: `PEARLD_MINING_ADDRESS`; one of the two is required)
+- `POOL_WORKER` - Worker name, appended as `address.worker` (default: `gateway`)
+- `POOL_PASSWORD` - Stratum password (default: `x`)
+- `POOL_DIFFICULTY` - Start share difficulty, in the pool's difficulty unit (the one its dashboard shows). Sent as `d=N` appended to the password, e.g. `x;d=0.5`. Unset: the pool default. The pool then adjusts it.
+- `POOL_RECONNECT_DELAY_SECONDS` / `POOL_MAX_RECONNECT_DELAY_SECONDS` - Reconnect backoff (defaults: `1` / `60`)
+
+```bash
+export PEARLD_MINING_ADDRESS="prl1p..."
+export POOL_STRATUM_URL="stratum+ssl://pool.example.com:3443"
+export POOL_WORKER="rig-01"
+pearl-gateway start
+```
+
 ## Usage
 
 ### Starting the Gateway
