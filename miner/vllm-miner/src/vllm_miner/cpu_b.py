@@ -45,7 +45,6 @@ from .b_prepare_cpu import (
     with_b_proof,
     without_b_proof,
 )
-from .b_prepare_native import native
 from .settings import parse_cpu_list, runtime_settings
 from .shared_host import SharedHandle, attach, shared_empty, shared_handle
 from .state import LayerState, all_states
@@ -285,10 +284,10 @@ def _serve(
 ) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     if cpus:
-        # Before the first parallel region: the intra-op pool inherits it.
+        # Before the first parallel region: the intra-op pool and the native
+        # kernels' pool inherit it.
         os.sched_setaffinity(0, cpus)
     torch.set_num_threads(threads)
-    native()
     layers = [(_attached(codes), _attached(scales), experts) for codes, scales, experts in layers]
     slots = [_attached(slot) for slot in slots]
     row_scales: dict[int, RowScales] = {}
