@@ -28,9 +28,10 @@ class ProofPool:
         if self._executor is not None:
             # shutdown(wait=False) does not interrupt a proof already running, and the
             # worker is not a daemon, so interpreter exit would block until it finishes.
-            # An in-flight proof is dropped on stop anyway, so kill the worker.
+            # An in-flight proof is dropped on stop anyway, so kill the worker
+            # (SIGKILL: it cannot be caught or delayed).
             for process in list((self._executor._processes or {}).values()):
-                process.terminate()
+                process.kill()
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
 

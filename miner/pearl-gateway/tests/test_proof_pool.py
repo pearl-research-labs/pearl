@@ -1,6 +1,7 @@
 """ProofPool lifecycle against a real spawned worker process."""
 
 import asyncio
+import os
 import time
 from unittest.mock import MagicMock
 
@@ -22,9 +23,23 @@ async def test_stop_kills_a_worker_busy_with_a_proof():
     await pool.stop()
 
     for worker in workers:
-        worker.join(timeout=10)
-        assert not worker.is_alive()
+        assert await _exited(worker)
     busy.cancel()
+
+
+async def _exited(worker, timeout: float = 10.0) -> bool:
+    """True once the worker process is gone. is_alive() alone can report a dead child
+    as alive if the executor's own thread reaped it first, so also ask the OS."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if worker.exitcode is not None:
+            return True
+        try:
+            os.kill(worker.pid, 0)
+        except ProcessLookupError:
+            return True
+        await asyncio.sleep(0.05)
+    return False
 
 
 @pytest.mark.asyncio
