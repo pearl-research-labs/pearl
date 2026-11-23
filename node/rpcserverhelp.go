@@ -432,6 +432,7 @@ var helpDescsEnUS = map[string]string{
 
 	// GetMiningInfoResult help.
 	"getmininginforesult-blocks":            "Height of the latest best block",
+	"getmininginforesult-blocksubsidy":      "Block subsidy of the latest best block, in PRL",
 	"getmininginforesult-currentblocksize":  "Size of the latest best block in bytes",
 	"getmininginforesult-currentblockvsize": "Virtual size of the latest best block",
 	"getmininginforesult-currentblocktx":    "Number of transactions in the latest best block",
