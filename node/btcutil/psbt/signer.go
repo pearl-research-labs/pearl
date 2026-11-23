@@ -46,6 +46,10 @@ const (
 func (u *Updater) Sign(inIndex int, sig []byte, pubKey []byte,
 	redeemScript []byte, witnessScript []byte) (SignOutcome, error) {
 
+	if inIndex < 0 || inIndex >= len(u.Upsbt.Inputs) {
+		return SignInvalid, ErrInvalidPsbtFormat
+	}
+
 	if isFinalized(u.Upsbt, inIndex) {
 		return SignFinalized, nil
 	}
