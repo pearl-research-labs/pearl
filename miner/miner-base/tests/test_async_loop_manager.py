@@ -498,6 +498,7 @@ class TestSubmissionBackpressureAndDrain:
         client.get_mining_info.return_value = mock_mining_job
 
         manager = AsyncLoopManager(miner_config, MinerSettings(no_gateway=False))
+        allow_crash = threading.Event()
         crashed = threading.Event()
         real_publish = manager._publish_mining_job
         publish_calls = 0
@@ -506,6 +507,7 @@ class TestSubmissionBackpressureAndDrain:
             nonlocal publish_calls
             publish_calls += 1
             if publish_calls == 2:
+                assert allow_crash.wait(timeout=_TIMEOUT_S)
                 crashed.set()
                 raise RuntimeError("unexpected publish failure")
             return real_publish(job)
@@ -518,12 +520,19 @@ class TestSubmissionBackpressureAndDrain:
         ):
             manager.start()
             try:
+                poll_thread = manager._thread
+                assert poll_thread is not None
+                allow_crash.set()
                 assert crashed.wait(timeout=_TIMEOUT_S)
-                assert manager._thread is not None
-                manager._thread.join(timeout=_TIMEOUT_S)
+                poll_thread.join(timeout=_TIMEOUT_S)
                 assert not manager.started
+                assert manager._thread is None
+                assert manager._submission_executor is None
                 assert manager.get_mining_job() is None
                 assert not manager._accepting_submissions
                 logger.exception.assert_called_with("Async loop manager thread crashed")
+                # Clean teardown allows a fresh restart without leaking the old pool.
+                manager.start()
+                assert manager.started
             finally:
                 manager.stop()

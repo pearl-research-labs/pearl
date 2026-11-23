@@ -626,39 +626,52 @@ class AsyncLoopManager:
             connected.close()
         return published
 
+    def _poll_once(self, stop_event: threading.Event) -> bool:
+        """Poll the gateway once; return False when the loop should exit."""
+        client: MiningClient | None = None
+        try:
+            client = self._polling_client(stop_event)
+            if client is None:
+                return False
+            new_job = client.get_mining_info()
+            self._consecutive_job_failures = 0
+        except Exception:
+            if client is not None:
+                self._discard_client(client)
+            if stop_event.is_set():
+                return False
+            self._consecutive_job_failures += 1
+            _LOGGER.exception("Failed to get mining info")
+            if (
+                self.get_mining_job() is not None
+                and self._consecutive_job_failures >= _MAX_STALE_JOB_POLLS
+            ):
+                _LOGGER.warning("Retiring a stale mining job after repeated poll failures.")
+                self._publish_mining_job(None)
+        else:
+            self._publish_mining_job(new_job)
+        return True
+
+    def _teardown_after_poll_crash(self) -> None:
+        with self._lifecycle_cond:
+            if self._stop_in_progress:
+                return
+            self._stop_in_progress = True
+        try:
+            self._stop(wait_for_submissions=True)
+            with suppress(Exception):
+                self._publish_mining_job(None)
+        finally:
+            with self._lifecycle_cond:
+                self._stop_in_progress = False
+                self._lifecycle_cond.notify_all()
+
     def _poll_loop(self, stop_event: threading.Event) -> None:
         try:
             while not stop_event.is_set():
-                client: MiningClient | None = None
-                try:
-                    client = self._polling_client(stop_event)
-                    if client is None:
-                        return
-                    new_job = client.get_mining_info()
-                    self._consecutive_job_failures = 0
-                except Exception:
-                    if stop_event.is_set():
-                        if client is not None:
-                            self._discard_client(client)
-                        return
-                    self._consecutive_job_failures += 1
-                    _LOGGER.exception("Failed to get mining info")
-                    if client is not None:
-                        self._discard_client(client)
-                    if (
-                        self.get_mining_job() is not None
-                        and self._consecutive_job_failures >= _MAX_STALE_JOB_POLLS
-                    ):
-                        _LOGGER.warning("Retiring a stale mining job after repeated poll failures.")
-                        self._publish_mining_job(None)
-                else:
-                    self._publish_mining_job(new_job)
+                if not self._poll_once(stop_event):
+                    return
                 stop_event.wait(_POLL_INTERVAL_SECONDS)
         except Exception:
             _LOGGER.exception("Async loop manager thread crashed")
-            client = self._detach_polling_client(stopping=True, close_admission=True)
-            if client is not None:
-                with suppress(Exception):
-                    client.close()
-            with suppress(Exception):
-                self._publish_mining_job(None)
+            self._teardown_after_poll_crash()
