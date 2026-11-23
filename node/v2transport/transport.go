@@ -213,7 +213,7 @@ func (p *Peer) createV2Ciphers(ecdhSecret []byte, initiating bool,
 		return err
 	}
 
-	log.Tracef("Using prk=%x for HKDF-Expand", prk)
+	log.Trace("Using prk for HKDF-Expand")
 
 	log.Tracef("Derived session_id=%x", p.sessionID)
 
@@ -227,7 +227,7 @@ func (p *Peer) createV2Ciphers(ecdhSecret []byte, initiating bool,
 		return err
 	}
 
-	log.Tracef("Derived initiator_L=%x", p.initiatorL)
+	log.Trace("Derived initiator_L")
 
 	initiatorPInfo := []byte("initiator_P")
 	initiatorPReader := hkdf.Expand(sha256.New, prk, initiatorPInfo)
@@ -237,7 +237,7 @@ func (p *Peer) createV2Ciphers(ecdhSecret []byte, initiating bool,
 		return err
 	}
 
-	log.Tracef("Derived initiator_P=%x", p.initiatorP)
+	log.Trace("Derived initiator_P")
 
 	responderLInfo := []byte("responder_L")
 	responderLReader := hkdf.Expand(sha256.New, prk, responderLInfo)
@@ -247,7 +247,7 @@ func (p *Peer) createV2Ciphers(ecdhSecret []byte, initiating bool,
 		return err
 	}
 
-	log.Tracef("Derived responder_L=%x", p.responderL)
+	log.Trace("Derived responder_L")
 
 	responderPInfo := []byte("responder_P")
 	responderPReader := hkdf.Expand(sha256.New, prk, responderPInfo)
@@ -257,7 +257,7 @@ func (p *Peer) createV2Ciphers(ecdhSecret []byte, initiating bool,
 		return err
 	}
 
-	log.Tracef("Derived responder_P=%x", p.responderP)
+	log.Trace("Derived responder_P")
 
 	// Create the garbage terminators that each side will use.
 	garbageInfo := []byte("garbage_terminators")
@@ -272,11 +272,9 @@ func (p *Peer) createV2Ciphers(ecdhSecret []byte, initiating bool,
 	initiatorGarbageTerminator := garbageTerminators[:garbageSize]
 	responderGarbageTerminator := garbageTerminators[garbageSize:]
 
-	log.Tracef("Derived initiator garbage terminator=%x",
-		initiatorGarbageTerminator)
+	log.Trace("Derived initiator garbage terminator")
 
-	log.Tracef("Derived responder garbage terminator=%x",
-		responderGarbageTerminator)
+	log.Trace("Derived responder garbage terminator")
 
 	if initiating {
 		p.sendL, err = NewFSChaCha20(p.initiatorL)
@@ -471,7 +469,7 @@ func (p *Peer) deriveV2Ciphers(ellswiftTheirs [64]byte, initiating bool,
 		return err
 	}
 
-	log.Tracef("Calculated ECDH shared secret: %x", ecdhSecret)
+	log.Trace("Calculated ECDH shared secret")
 
 	return p.createV2Ciphers(ecdhSecret[:], initiating, prlnet)
 }
@@ -509,7 +507,7 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 	}
 
 	// Send garbage terminator.
-	log.Debugf("Sending garbage terminator: %x", p.sendGarbageTerm)
+	log.Debug("Sending garbage terminator")
 	p.Send(p.sendGarbageTerm[:])
 
 	// Optionally send decoy packets after garbage terminator.
@@ -541,8 +539,7 @@ func (p *Peer) CompleteHandshake(initiating bool, decoyContentLens []int,
 		return err
 	}
 
-	log.Debugf("Receiving garbage, looking for terminator: %x",
-		p.recvGarbageTerm)
+	log.Debug("Receiving garbage, looking for terminator")
 
 	// Skip garbage until encountering garbage terminator.
 	recvGarbage, _, err := p.Receive(16)
