@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import torch
 from blake3 import blake3
-from miner_base.layout import lane_assignment
+from miner_base.protocol import lane_assignment
 
 from pearl_gemm import GroupedMixedGemmConfig, HitSignal, HitSignalConfig, grouped_mixed_gemm
 from pearl_gemm._utils._arch import Arch, arch_of

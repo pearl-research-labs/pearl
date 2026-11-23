@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import torch
 from blake3 import blake3
-from miner_base.layout import lane_assignment
+from miner_base.protocol import lane_assignment
 
 from pearl_gemm import (
     HitSignal,

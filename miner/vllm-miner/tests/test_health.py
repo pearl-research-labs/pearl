@@ -4,7 +4,7 @@ import threading
 
 import pytest
 import torch
-from vllm_miner.health import DeviceCircuitBreaker
+from vllm_miner.capture import DeviceCircuitBreaker
 
 
 def _open_cooldown(breaker: DeviceCircuitBreaker, device: int, cooldown: float) -> None:

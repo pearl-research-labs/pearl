@@ -22,13 +22,9 @@ copies and re-arms it before validating a candidate, so the first-wins latch is
 reusable across launches.
 
 Lottery candidates are opened from the retained FP10 planes into
-certificate-v3 `PlainProof` objects and canonically verified. Jackpot-policy-inadmissible candidates are filtered;
-admissible proofs are submitted to `pearl-gateway`. The gateway and Go node still do
-not support the certificate-v3 block wire format, so production node acceptance
-remains unavailable; integration uses the real miner RPC plus the consensus
-PlainPeel verifier. B-side per-job preparation runs the GPU chain
-(`tensor_hash_plus_stats_b -> noise_lines -> noisy_quant_b`) off the serving
-path; there is no CPU fallback.
+certificate-v4 `PlainProofV4` objects and canonically verified. Jackpot-policy-inadmissible candidates are filtered;
+admissible proofs are submitted to `pearl-gateway`. B-side per-job preparation runs the GPU chain
+(`tensor_hash_plus_stats_b -> noise_lines -> noisy_quant_b`) on the serving stream, with an optional background CPU helper preparing the next B ahead of time.
 
 Capability gates:
 
@@ -119,14 +115,12 @@ it, the first launch prepares a fresh B on the GPU inline, so every mined
 layer pays that preparation on the serving path at once. Instead, a helper process
 prepares the fresh B side on the host CPU ahead of time: the committed planes' digest,
 the noise lines, and B' and its peel, bit-identical to the GPU chain (the
-`pearl_mining` CPU B kernels, AVX-512 where the CPU has it, with a torch
-fallback). The next launch of that layer uploads
+`pearl_mining` CPU B kernels, AVX-512 where the CPU has it). The next launch of that layer uploads
 it in place on the serving stream instead of running the GPU chain; a layer
 whose result is not ready in time still prepares inline. The helper maps the
 layers' host planes once (about one byte per weight element plus scales) and
 returns B' through a few page-locked shared slots, each the size of the
-largest mined layer. Blackwell commitments only: the CPU chain implements the
-Blackwell noise dot, so other devices keep inline GPU preparation.
+largest mined layer (Hopper and Blackwell commitments).
 
 ## Installation
 
@@ -142,23 +136,6 @@ uv sync --package vllm-miner
 ```bash
 vllm serve meta-llama/Llama-3.1-8B-Instruct --quantization pearl ...
 ```
-
-### vLLM 0.26 reload and sleep mode
-
-The worker hooks support checkpoint-format `reload_weights` and both CuMem
-sleep levels. They first close all mining-producer admission, drain exact CUDA
-completions, and forget every layer's prepared job. Reload
-re-encodes FP10 and FP8 operands **in place**, preserving every model/graph
-pointer; wake verifies CuMem restored the same virtual addresses before mining
-restarts. A standalone `collective_rpc("reload_weights")` first pauses the
-engine scheduler, aborts active requests, clears prefix/MM/encoder caches, and
-waits asynchronously for the final executor step before touching weights; it
-resumes scheduling only after every worker succeeds. Level-2 sleep follows
-vLLM's required order: wake `weights`, call `collective_rpc("reload_weights")`,
-then wake `kv_cache`. Kernel-format reload
-is rejected because it does not contain Pearl's derived operands. A failed
-transition leaves mining suspended and requires worker restart rather than
-exposing partially updated state.
 
 The authoritative names, defaults, bounds, and example for all `PEARL_*`
 execution controls are under [Runtime configuration](#runtime-configuration).

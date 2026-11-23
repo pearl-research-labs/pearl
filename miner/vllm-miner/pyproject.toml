@@ -31,7 +31,6 @@ authors = [
   {name = "Pearl Research", email = "research@pearl.org"}
 ]
 dependencies = [
-  "PyYAML>=6.0.1",
   "miner-base",
   "cuda-python>=13.0,<13.1",
   "flashinfer-cubin==0.6.16.post3; sys_platform == 'linux'",

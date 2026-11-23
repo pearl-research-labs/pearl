@@ -9,7 +9,6 @@ from ._host import (
     tensor_hash_plus_stats_record_is_legal,
     tensor_hash_scratchpad_bytes,
     tensor_hash_workspace_bytes,
-    tensor_hash_workspace_split,
 )
 
 __all__ = [
@@ -21,5 +20,4 @@ __all__ = [
     "tensor_hash_plus_stats_record_is_legal",
     "tensor_hash_scratchpad_bytes",
     "tensor_hash_workspace_bytes",
-    "tensor_hash_workspace_split",
 ]

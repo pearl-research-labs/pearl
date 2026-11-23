@@ -12,13 +12,13 @@ from pathlib import Path
 import pearl_mining
 import pytest
 import torch
-from miner_base.block_submission import commit_planes_for_leaf
-from miner_base.commitment import BlockHeader
-from miner_base.commitment_hash import noise_seed_b
+from miner_base.commitment import commit_planes
 from miner_base.prequant import PrequantMatrix
+from miner_base.protocol import noise_seed_b
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gemm import pack_noise_factor, supports_lottery_family
+from pearl_mining import IncompleteBlockHeader as BlockHeader
 from vllm_miner import settings as settings_module
 from vllm_miner.job_prep import prepare_layer
 from vllm_miner.mining_config import (
@@ -185,7 +185,7 @@ def test_create_layer_state_validates_input(mined_settings):
 
 
 def test_fp8_fallback_matches_opened_planes(layer_state):
-    from vllm_miner.fp8_fallback import fp8_fallback_gemm
+    from vllm_miner.state import fp8_fallback_gemm
 
     torch.manual_seed(5)
     x = torch.randn(8, _K, dtype=torch.bfloat16, device="cuda")
@@ -224,7 +224,7 @@ def test_prepare_layer_matches_pinned_commitment_chain(layer_state):
     weight_pq = _cpu_pq(layer_state)
     device = layer_state.committed_device
     config = mining_configuration(k, n, device=device)
-    comm_b = commit_planes_for_leaf(weight_pq.planes(), key_b, config.chunk_size)
+    comm_b = commit_planes(weight_pq.planes(), key_b, config.b_hash_id)
     # The committed tile (4x64) is bound into pB, hence into seedB.
     expected_seed_b = noise_seed_b(comm_b.digest, key_b, config.p_b(n))
     assert (ctx.key_a, ctx.key_b) == (key_a, key_b)
@@ -260,7 +260,6 @@ def test_prepare_layer_matches_pinned_commitment_chain(layer_state):
     assert _digest(buffers.beta_b) == expected["beta_b"], "beta_b"
     assert _digest(buffers.b_prime) == expected["b_prime"], "B'"
     assert torch.equal(buffers.f1_hl.cpu(), pack_noise_factor(buffers.f1.cpu()))
-    assert torch.equal(ctx.f1_hl, buffers.f1_hl)
     b_peel = buffers.b_peel.cpu()
     # The element-wise second half (-(beta_b (.) E_B)) is bit-exact; the mid
     # half is the peel matmul, which the fused kernel's epilogue reassociates,
@@ -378,23 +377,24 @@ def test_failed_completion_record_fences_real_launch_before_fallback(
     _wait_for_polled_job(async_manager, monkeypatch, job, no_gateway=True)
     prepare_layer(layer_state, job)
     x = torch.randn(16, _K, dtype=torch.bfloat16, device="cuda")
-    record_event = pipeline._record_stream_event
+    real_event = torch.cuda.Event
     register_completion = pipeline.register_mining_completion
     attempts = 0
     registered = []
 
-    def fail_first_record():
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise RuntimeError("synthetic event record failure")
-        return record_event()
+    class FailFirstRecordEvent(real_event):
+        def record(self, stream=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("synthetic event record failure")
+            return super().record(stream) if stream is not None else super().record()
 
-    def observe_completion(event, keepalive=None):
+    def observe_completion(event):
         registered.append(event)
-        register_completion(event, keepalive)
+        register_completion(event)
 
-    monkeypatch.setattr(pipeline, "_record_stream_event", fail_first_record)
+    monkeypatch.setattr(pipeline.torch.cuda, "Event", FailFirstRecordEvent)
     monkeypatch.setattr(pipeline, "register_mining_completion", observe_completion)
 
     output = linear_op._apply_linear_impl(x, layer_state.weight, None)
@@ -529,7 +529,7 @@ def test_decode_bucket_routes_to_the_64_row_tile_and_wins(layer_state, async_man
     the (64, 64) kernel tile and mines end-to-end: an always-win launch on the
     4x64-committed layer publishes a valid winner."""
     import vllm_miner.pipeline as pipeline
-    from vllm_miner.tuning import device_config_name
+    from vllm_miner.state import device_config_name
     from vllm_miner.winners import WinnerCheckCallback
 
     *_, gemm = pipeline._configs(
@@ -575,7 +575,7 @@ def test_decode_bucket_on_a_tall_tile_layer_mines_through_saved_records(
     fold still publishes a valid winner -- an edge 64-multiple buckets made
     reachable (pre-change buckets were at least 256)."""
     import vllm_miner.pipeline as pipeline
-    from vllm_miner.tuning import device_config_name
+    from vllm_miner.state import device_config_name
     from vllm_miner.winners import WinnerCheckCallback
 
     *_, gemm = pipeline._configs(
@@ -628,8 +628,8 @@ def test_a_failed_activation_build_does_not_retire_a_lease(layer_state, async_ma
 
 
 def test_mined_forward_approximates_fallback(layer_state, async_manager, monkeypatch):
-    from vllm_miner.fp8_fallback import fp8_fallback_gemm
     from vllm_miner.pipeline import run_mining_forward
+    from vllm_miner.state import fp8_fallback_gemm
 
     job = _job()
     _wait_for_polled_job(async_manager, monkeypatch, job, no_gateway=True)
@@ -890,7 +890,8 @@ def test_moe_mined_forward_approximates_each_experts_gemm(
 def test_moe_routing_commitments_match_the_host_tree(moe_layer_state):
     """``HR || HO`` computed on the device equal the CPU routing-tree root and
     offsets hash the proof opens."""
-    from miner_base.commitment import HashId, commit_routing, hash_offsets
+    from miner_base.commitment import commit_routing, hash_offsets
+    from miner_base.protocol import HashId
     from vllm_miner.moe import route_tokens
 
     key = torch.arange(32, dtype=torch.uint8, device="cuda")
@@ -942,13 +943,14 @@ def test_moe_tail_runs_inside_the_launch_and_holds_drain(
     x = torch.randn(16, _K, dtype=torch.bfloat16, device="cuda")
     topk_ids = _moe_topk_ids(16)
     order: list[str] = []
-    record_event = pipeline._record_stream_event
+    real_event = torch.cuda.Event
 
-    def observed_record():
-        order.append("event")
-        return record_event()
+    class ObservedEvent(real_event):
+        def record(self, stream=None):
+            order.append("event")
+            return super().record(stream) if stream is not None else super().record()
 
-    monkeypatch.setattr(pipeline, "_record_stream_event", observed_record)
+    monkeypatch.setattr(pipeline.torch.cuda, "Event", ObservedEvent)
     tail_entered = threading.Event()
     release_tail = threading.Event()
     result: list[object] = []
@@ -981,7 +983,7 @@ def test_moe_tail_oom_declines_the_forward_and_opens_the_cooldown(
     serves unmined), the device cooldown opens like for any launch OOM, the
     layer stays enabled, no credit is booked, and no lease leaks."""
     import vllm_miner.pipeline as pipeline
-    from vllm_miner import health
+    from vllm_miner import capture as health
     from vllm_miner.linear_op import try_mine_moe
 
     state = moe_layer_state
@@ -1001,9 +1003,9 @@ def test_moe_tail_oom_declines_the_forward_and_opens_the_cooldown(
             assert not attempt, "the device cooldown did not open after the tail OOM"
         assert async_manager.wait_until_drained(timeout=30)
         assert async_manager._inner_hash_counter == before
-        assert pipeline._COMPLETION_LEASES.in_use() == 0
+        assert pipeline._COMPLETION_LEASES.held() == 0
     finally:
-        health._BREAKER.reset_for_tests()  # the cooldown is process-wide
+        health._BREAKER._states.clear()  # the cooldown is process-wide
 
 
 def test_moe_forward_declines_a_malformed_router_table(moe_layer_state, async_manager, monkeypatch):
@@ -1080,7 +1082,7 @@ def test_moe_routing_is_enqueued_only_for_admitted_launches(
         return moe.route_tokens(*args, **kwargs)
 
     monkeypatch.setattr(pipeline, "route_tokens", counting_route)
-    monkeypatch.setattr(pipeline._COMPLETION_LEASES, "try_acquire", lambda *_: None)
+    monkeypatch.setattr(pipeline._COMPLETION_LEASES, "try_acquire", lambda *_: False)
     x = torch.randn(16, _K, dtype=torch.bfloat16, device="cuda")
     assert pipeline.run_mining_moe_forward(state, ctx, x, _moe_topk_ids(16), _M_BUCKET) is None
     assert routed == []
@@ -1090,14 +1092,14 @@ def _capture_completions(pipeline, monkeypatch) -> list:
     works = []
 
     def capture(event, callback, release, **kwargs):
-        with pipeline._fallback_check_lock:
-            pipeline._fallback_checks += 1
+        with pipeline._completion_cond:
+            pipeline._pending_completions_count += 1
         works.append(
-            pipeline._FallbackWork(
+            pipeline._CompletionWork(
                 event=event,
                 callback=callback,
                 release=release,
-                completion=pipeline._FallbackCompletion(),
+                token=pipeline._CompletionToken(),
                 **kwargs,
             )
         )
@@ -1172,10 +1174,10 @@ def test_winner_check_consumes_only_its_own_launch_record(
     assert signal.doorbell(), "the first launch should have published under the always-win target"
 
     # The second launch's consumer runs first: the record is not its own.
-    pipeline._run_fallback_work(works[1])
+    pipeline._run_completion_work(works[1])
     assert signal.doorbell() and submitted == []
 
-    pipeline._run_fallback_work(works[0])
+    pipeline._run_completion_work(works[0])
     assert done.wait(timeout=60), "the owning launch's consumer did not submit"
     assert async_manager.wait_until_drained(timeout=30)
     assert not signal.doorbell()
@@ -1194,32 +1196,32 @@ def test_winner_check_consumes_only_its_own_launch_record(
 
 
 def _inject_post_publication_failure(pipeline, monkeypatch, point: str) -> None:
-    """Make the next retained launch fail after its publisher was enqueued:
-    at the terminal event's record (the cleanup event that follows must
-    still succeed) or at the winner continuation's construction."""
     if point == "event":
-        record_event = pipeline._record_stream_event
+        real_event = torch.cuda.Event
         calls = 0
 
-        def fail_first_record():
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise RuntimeError("synthetic terminal event failure")
-            return record_event()
+        class FailFirstEvent(real_event):
+            def record(self, stream=None):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("synthetic terminal event failure")
+                return super().record(stream) if stream is not None else super().record()
 
-        monkeypatch.setattr(pipeline, "_record_stream_event", fail_first_record)
+        monkeypatch.setattr(pipeline.torch.cuda, "Event", FailFirstEvent)
     else:
-        continuation = pipeline._winner_continuation
+        from vllm_miner import winners
+
+        original = winners.WinnerCheckCallback
         armed = [True]
 
-        def fail_once(**kwargs):
+        def fail_once(*args, **kwargs):
             if armed:
                 armed.clear()
                 raise RuntimeError("synthetic continuation failure")
-            return continuation(**kwargs)
+            return original(*args, **kwargs)
 
-        monkeypatch.setattr(pipeline, "_winner_continuation", fail_once)
+        monkeypatch.setattr(winners, "WinnerCheckCallback", fail_once)
 
 
 @pytest.mark.parametrize("point", ["event", "continuation"])
@@ -1255,7 +1257,7 @@ def test_failed_continuation_after_publication_frees_the_latch(
     assert async_manager.wait_until_drained(timeout=30)
     assert not signal.doorbell(), "the failed launch's own record was left latched"
     assert pipeline.WINNER_LEASES.held() == winner_leases_before
-    assert pipeline._COMPLETION_LEASES.in_use() == 0
+    assert pipeline._COMPLETION_LEASES.held() == 0
     assert submitted == []
 
     out = pipeline.mine_launch(layer_state, dense_ctx, _M_BUCKET, 16, lambda a: a.zero_())
@@ -1299,9 +1301,9 @@ def test_failed_continuation_discard_leaves_a_foreign_record_in_place(
     assert len(works) == 2
     assert isinstance(works[1].callback, pipeline._OwnedRecordDiscard)
 
-    pipeline._run_fallback_work(works[1])  # the failed launch's discard: not its record
+    pipeline._run_completion_work(works[1])  # the failed launch's discard: not its record
     assert signal.doorbell() and submitted == []
-    pipeline._run_fallback_work(works[0])  # the owner's winner check
+    pipeline._run_completion_work(works[0])  # the owner's winner check
     assert done.wait(timeout=60), "the owning launch's consumer did not submit"
     assert async_manager.wait_until_drained(timeout=30)
     assert not signal.doorbell()

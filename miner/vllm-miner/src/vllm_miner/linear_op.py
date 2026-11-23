@@ -1,11 +1,4 @@
-"""The ``pearl`` torch.library namespace: one opaque mining-aware linear op.
-
-``pearl::apply_linear`` hides the whole mining decision (the ``MINER_NO_MINING``
-kill switch, context lookup, m bucketing, variant readiness, the four-op
-pipeline, callback scheduling) from torch.compile / CUDA-graph tracing. When the
-layer cannot or must not mine right now it runs the job-independent FP8 fallback
-GEMM -- the only path a captured graph ever replays.
-"""
+"""Opaque ``pearl::apply_linear`` torch custom op and eager MoE mining entry point."""
 
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -16,13 +9,11 @@ from miner_utils import get_logger
 from .capture import (
     gpu_mining_producer,
     in_graph_setup_no_mining,
+    mining_attempt,
     mining_launches_suspended,
 )
-from .config import config as gpu_config
-from .fp8_fallback import fp8_fallback_gemm
-from .health import mining_attempt
-from .settings import runtime_settings
-from .state import JobContext, LayerState, lookup_state
+from .settings import miner_settings, runtime_settings
+from .state import JobContext, LayerState, fp8_fallback_gemm, lookup_state
 
 if TYPE_CHECKING:
     from .moe import MoeRouting
@@ -30,15 +21,10 @@ if TYPE_CHECKING:
 _LOGGER = get_logger(__name__)
 
 
-def _mining_disabled() -> bool:
-    """Read the process-wide kill switch directly so malformed settings fail closed."""
-    return gpu_config.settings.no_mining
-
-
 def _eager_mining_blocked(state: LayerState, m_tokens: int) -> bool:
     return (
         not state.mineable
-        or _mining_disabled()
+        or miner_settings().no_mining
         or m_tokens < runtime_settings().min_mining_tokens
         or in_graph_setup_no_mining()
         or mining_launches_suspended()
@@ -46,7 +32,6 @@ def _eager_mining_blocked(state: LayerState, m_tokens: int) -> bool:
 
 
 def _eager_bucket(state: LayerState, m_tokens: int) -> int | None:
-    """The bucket for one eager forward, or None when it cannot mine."""
     from .pipeline import pick_bucket, variant_ready
 
     settings = runtime_settings()
@@ -65,11 +50,7 @@ def _eager_bucket(state: LayerState, m_tokens: int) -> int | None:
 def _try_mine(
     state: LayerState, x2d: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor | None:
-    """Run the mined forward when this layer can mine right now, else None."""
     if torch.cuda.is_current_stream_capturing():
-        # The per-launch host machinery (admission, events, completion
-        # callbacks) is illegal inside a CUDA-graph capture; captured graphs
-        # always record the job-independent FP8 fallback.
         return None
     from .pipeline import run_mining_forward
 
@@ -86,25 +67,12 @@ def try_mine_moe[T](
     topk_ids: torch.Tensor,
     tail: "Callable[[torch.Tensor, MoeRouting], T]",
 ) -> T | None:
-    """Mine one MoE layer's first grouped GEMM when it can mine right now.
-
-    ``tail`` receives the permuted ``(cum_m, n_e)`` output and the routing
-    that orders it and finishes the layer (activation, down GEMM, combine);
-    it runs inside the admitted launch, before the launch's terminal event
-    (``pipeline.run_mining_moe_forward``), so lifecycle drain and capture
-    quiescence cover the whole mined forward. Returns the tail's result, or
-    None -- the caller then serves its own unmined path (a tail OOM opens the
-    device cooldown, any other tail failure disables the layer, exactly as
-    for the launch itself). The routing is data dependent, so MoE layers
-    never mine inside a CUDA graph capture.
-    """
+    """Mine one MoE layer's first grouped GEMM when admissible; else return None."""
     if torch.cuda.is_current_stream_capturing():
         return None
     from .moe import topk_ids_shape_error
     from .pipeline import run_mining_moe_forward
 
-    # A malformed router table declines this call only; it is not a layer
-    # failure (``_mine_eager`` disables the layer on any other exception).
     problem = topk_ids_shape_error(topk_ids, x2d.shape[0], state.top_k)
     if problem is None and topk_ids.device != x2d.device:
         problem = f"topk_ids on {topk_ids.device} but activations on {x2d.device}"
@@ -124,7 +92,6 @@ def try_mine_moe[T](
 def _mine_eager[T](
     state: LayerState, m_tokens: int, launch: Callable[[JobContext, int], T | None]
 ) -> T | None:
-    """Admit and run one eager launch against the layer's live context."""
     if _eager_mining_blocked(state, m_tokens):
         return None
     bucket = _eager_bucket(state, m_tokens)
@@ -134,15 +101,12 @@ def _mine_eager[T](
     from .job_prep import current_context, current_job
 
     try:
-        # The producer slot is what CUDA-graph capture waits on; taking it and
-        # checking the gate is atomic, so a launch cannot start after capture.
         with gpu_mining_producer() as admitted:
             if not admitted:
                 return None
             with mining_attempt(state.weight.device) as attempt:
                 if not attempt:
                     return None
-                # Prepares B in place on this stream when the job changed.
                 ctx = current_context(state, current_job())
                 if ctx is None:
                     return None
@@ -161,7 +125,6 @@ def _mine_eager[T](
 
 
 _LIB = torch.library.Library("pearl", "DEF")
-
 _LIB.define("apply_linear(Tensor x, Tensor weight, Tensor? bias) -> Tensor")
 
 
@@ -189,13 +152,7 @@ def _apply_linear_impl(
     if out is None:
         if state.w_fp8 is None or state.w_fp8_scale is None:
             raise ValueError(f"pearl::apply_linear does not serve MoE layer {state.layer_name}")
-        out = fp8_fallback_gemm(
-            x2d,
-            state.w_fp8,
-            state.w_fp8_scale,
-            bias,
-            torch.bfloat16,
-        )
+        out = fp8_fallback_gemm(x2d, state.w_fp8, state.w_fp8_scale, bias, torch.bfloat16)
     return out.reshape(*x.shape[:-1], out.shape[-1])
 
 
@@ -204,8 +161,4 @@ def _apply_linear_fake(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor:
     _validate_bf16_contract(x, bias)
-    return torch.empty(
-        (*x.shape[:-1], weight.shape[0]),
-        dtype=torch.bfloat16,
-        device=x.device,
-    )
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=torch.bfloat16, device=x.device)

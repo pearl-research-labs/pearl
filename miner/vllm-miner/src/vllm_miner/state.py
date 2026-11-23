@@ -1,26 +1,28 @@
-"""Per-layer GPU mining state: committed FP10 planes, steady per-job buffers,
-the published job context, and the weight-keyed registry the torch op uses."""
+"""Per-layer GPU mining state, FP8 serving fallback, autotune lookup, and dispatch registry."""
 
 import itertools
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
-from miner_base.block_submission import (
-    PROTOCOL_COMMITMENT_LEAF,
-    PrebuiltCommitment,
-    commit_planes_for_leaf,
-)
-from miner_base.commitment import Device, MiningConfiguration, PlanarCommitment
-from miner_base.commitment_hash import noise_seed_b
-from miner_base.devices import local_device
+from miner_base.block_submission import PrebuiltCommitment
+from miner_base.commitment import PlanarCommitment, commit_planes
 from miner_base.prequant import PrequantMatrix
+from miner_base.protocol import (
+    COMMITMENT_CHUNK_SIZE,
+    Device,
+    MiningConfiguration,
+    local_device,
+    noise_seed_b,
+)
 from miner_utils import get_logger
 from pearl_gateway.comm.dataclasses import MiningJob
 
-from .fp8_fallback import build_fp8_fallback
+from .capture import cuda_device_index
+from .cpu_b import shared_copy
 from .mining_config import (
     MOE_LOTTERY_N,
     PACKED_NOISE_K,
@@ -31,61 +33,164 @@ from .mining_config import (
     select_tile,
 )
 from .moe import validate_moe_dims
-from .shared_host import shared_copy
-from .tuning import device_config_name, tuned, with_committed_leaf
 
 _LOGGER = get_logger(__name__)
 _NEXT_LAYER_ID = itertools.count(1)
+_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+_BUILD_CHUNK_ROWS = 4096
+
+
+# ---------------------------------------------------------------------------
+# Autotune config helpers
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=32)
+def _device_config_name(index: int) -> str:
+    return torch.cuda.get_device_name(index).lower().replace(" ", "_").replace("-", "_")
+
+
+def device_config_name(device: torch.device) -> str:
+    return _device_config_name(cuda_device_index(device))
+
+
+@cache
+def _load_autotune_config(name: str) -> dict:
+    from pearl_gemm.autotune import load_config
+
+    return load_config(name) or {}
+
+
+def tuned(
+    config_name: str,
+    kernel: str,
+    *,
+    legal: Callable[[dict], bool] | None = None,
+    require_legal: bool = False,
+    exact: bool = False,
+    **shape: int,
+) -> dict:
+    from pearl_gemm.autotune import get_tuned
+
+    return get_tuned(
+        kernel,
+        _load_autotune_config(config_name),
+        legal=legal,
+        require_legal=require_legal,
+        exact=exact,
+        **shape,
+    )
+
+
+def with_committed_leaf(kwargs: dict, chunk_size: int) -> dict:
+    """Keep autotune launch knobs while pinning ``chunk_size`` to the committed leaf."""
+    from pearl_gemm.tensor_hash_plus_stats._merkle_host import SUPPORTED_THREAD_LOAD_SIZES
+
+    pinned = dict(kwargs)
+    pinned["chunk_size"] = chunk_size
+    load = pinned.get("thread_load_size", 128)
+    if chunk_size % load:
+        pinned["thread_load_size"] = max(
+            size for size in SUPPORTED_THREAD_LOAD_SIZES if chunk_size % size == 0
+        )
+    return pinned
+
+
+# ---------------------------------------------------------------------------
+# Job-independent W8A8-FP8 fallback GEMM (used by non-mined forwards & graphs)
+# ---------------------------------------------------------------------------
+
+
+def build_fp8_fallback(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row-scaled FP8 copy of the opened FP10 weight for ``torch._scaled_mm``."""
+    n, k = weight.shape
+    w_fp8 = torch.empty(n, k, dtype=torch.float8_e4m3fn, device=weight.device)
+    w_scale = torch.empty(1, n, dtype=torch.float32, device=weight.device)
+    for start in range(0, n, _BUILD_CHUNK_ROWS):
+        end = min(start + _BUILD_CHUNK_ROWS, n)
+        rows = end - start
+        blocks = weight[start:end].to(torch.float32).reshape(rows, -1, SCALE_BLOCK)
+        opened = (blocks * weight_scale[start:end].to(torch.float32).unsqueeze(-1)).reshape(rows, k)
+        scale = opened.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / _FP8_MAX
+        w_fp8[start:end] = (opened / scale).to(torch.float8_e4m3fn)
+        w_scale[0, start:end] = scale.squeeze(1)
+    return w_fp8, w_scale
+
+
+@cache
+def _resolve_vllm_fp8_quant():
+    try:
+        from vllm import _custom_ops as ops
+
+        return ops.scaled_fp8_quant
+    except Exception:
+        return None
+
+
+def fp8_fallback_gemm(
+    x2d: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_fp8_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dynamic per-token FP8 quant + rowwise ``torch._scaled_mm``."""
+    vllm_quant = _resolve_vllm_fp8_quant()
+    if vllm_quant is not None:
+        x_fp8, x_scale = vllm_quant(x2d, use_per_token_if_dynamic=True)
+    else:
+        x_f32 = x2d.to(torch.float32)
+        x_scale = x_f32.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / _FP8_MAX
+        x_fp8 = (x_f32 / x_scale).to(torch.float8_e4m3fn)
+    return torch._scaled_mm(
+        x_fp8,
+        w_fp8.t(),
+        scale_a=x_scale,
+        scale_b=w_fp8_scale,
+        bias=bias,
+        out_dtype=out_dtype,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-layer steady buffers, job context, and state registry
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class LayerBuffers:
-    """Per-layer GPU buffers for the current job's B-side operands.
-
-    Every tensor is allocated once at load (before KV-cache profiling) and
-    rewritten in place, on the mining stream, whenever the job changes
-    (:func:`~vllm_miner.job_prep.prepare_layer`). Launches read these exact
-    tensors, so their addresses never change.
-    """
+    """Per-layer GPU buffers allocated once at load and updated in place per job."""
 
     b_prime: torch.Tensor  # (n, k) float8_e4m3fn
-    # The complete job-constant peel: both F bases are keyed by seedB, so
-    # noisy_quant_b emits the mid half [0, R) and -(beta_b (.) E_B) in [R, 2R).
     b_peel: torch.Tensor  # (n, 2R) bfloat16
     alpha_b: torch.Tensor  # (n,) bfloat16
     beta_b: torch.Tensor  # (n,) bfloat16
     inv_alpha_b: torch.Tensor  # (n,) float32
-    e2: torch.Tensor  # (n, R) float8_e4m3fn  E_B rows
-    f1: torch.Tensor  # (R, k) float8_e4m3fn  F_A (noisy_quant_b's raw peel factor)
-    f1_hl: torch.Tensor  # (k, PACKED_NOISE_K) int8 packed F_A (noisy_quant's noise operand)
-    f2: torch.Tensor  # (R, k) float8_e4m3fn  F_B (noisy_quant's raw peel factor)
-    f2_hl: torch.Tensor  # (k, PACKED_NOISE_K) int8 packed F_B (noisy_quant_b's noise operand)
-    noise_lines: torch.Tensor  # (k, R) float8_e4m3fn scratch
+    e2: torch.Tensor  # (n, R) float8_e4m3fn
+    f1: torch.Tensor  # (R, k) float8_e4m3fn
+    f1_hl: torch.Tensor  # (k, PACKED_NOISE_K) int8
+    f2: torch.Tensor  # (R, k) float8_e4m3fn
+    f2_hl: torch.Tensor  # (k, PACKED_NOISE_K) int8
+    noise_lines: torch.Tensor  # (k, R) float8_e4m3fn
     root_codes: torch.Tensor  # (32,) uint8
     root_scales: torch.Tensor  # (32,) uint8
-    tensor_hash_workspace: torch.Tensor  # uint8 Merkle scratch
+    tensor_hash_workspace: torch.Tensor  # uint8
     commit_stats: torch.Tensor  # (2 * n*k/512,) float32
-    gram: torch.Tensor  # (R, R) float32 noisy_quant_b epilogue workspace
+    gram: torch.Tensor  # (R, R) float32
     commit_config: Any
     prepare_config: Any
-    key_a_dev: torch.Tensor  # (32,) uint8 keyA (the header's A-side opening key)
-    key_b_dev: torch.Tensor  # (32,) uint8 keyB (B's Merkle key)
-    seed_b_dev: torch.Tensor  # (32,) uint8 noise seedB (finalize input, hit-record stamp)
-    noise_key_b_dev: torch.Tensor  # (32,) uint8 Subkey("noise-line", seedB): E_B/F_A/F_B draw key
-    threshold_dev: torch.Tensor  # (32,) uint8 little-endian lottery threshold
+    key_a_dev: torch.Tensor  # (32,) uint8
+    key_b_dev: torch.Tensor  # (32,) uint8
+    seed_b_dev: torch.Tensor  # (32,) uint8
+    noise_key_b_dev: torch.Tensor  # (32,) uint8
+    threshold_dev: torch.Tensor  # (32,) uint8
 
 
 @dataclass
 class BProofContext:
-    """Retain B's opening tree while its complete ancestor stays in the state window.
-
-    ``commit_leaf`` is the Merkle leaf the GPU commit ran at (the resolved
-    commit config's ``chunk_size``); the CPU rebuild must open the same
-    tree, so it resolves through ``commit_planes_for_leaf``. ``p_b`` is the
-    committed ``pB`` the GPU-derived ``seed_b`` was chained under; the
-    rebuild re-derives the seed from the CPU tree to catch a GPU/CPU
-    commitment disagreement before a proof is built on it.
-    """
+    """Lazy B-side CPU Merkle tree verified against GPU/CPU ``seed_b``."""
 
     key_b: bytes
     ancestor_header: bytes
@@ -93,18 +198,15 @@ class BProofContext:
     p_b: bytes
     codes: torch.Tensor
     scales: torch.Tensor
-    commit_leaf: int = PROTOCOL_COMMITMENT_LEAF
+    commit_leaf: int = COMMITMENT_CHUNK_SIZE
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _commitment: PlanarCommitment | None = field(default=None, init=False, repr=False)
 
     def prebuilt_commitment(self) -> PrebuiltCommitment:
         with self._lock:
             if self._commitment is None:
-                commitment = commit_planes_for_leaf(
-                    [self.codes, self.scales], self.key_b, self.commit_leaf
-                )
-                derived = noise_seed_b(commitment.digest, self.key_b, self.p_b)
-                if derived != self.seed_b:
+                commitment = commit_planes([self.codes, self.scales], self.key_b, self.commit_leaf)
+                if noise_seed_b(commitment.digest, self.key_b, self.p_b) != self.seed_b:
                     raise RuntimeError("CPU B commitment disagrees with GPU plane roots")
                 self._commitment = commitment
             return PrebuiltCommitment(self._commitment, self.key_b)
@@ -112,16 +214,7 @@ class BProofContext:
 
 @dataclass(frozen=True)
 class JobContext:
-    """The host-side description of the job one layer's B operands were
-    prepared for.
-
-    The device tensors alias the layer's steady :class:`LayerBuffers`; the
-    bytes/ints are what the winner consumer needs to validate a hit against
-    the launch's job (``winners.py``). Published under ``LayerState.lock``
-    by :func:`~vllm_miner.job_prep.prepare_layer`, which rewrites the
-    operands on the mining stream before publishing, so a launch enqueued
-    after publication on that stream reads exactly this job's operands.
-    """
+    """Host-side metadata of the job currently loaded into ``LayerState.buffers``."""
 
     job: MiningJob
     config: MiningConfiguration
@@ -129,67 +222,40 @@ class JobContext:
     key_b: bytes
     seed_b: bytes
     target: int
-    key_a_dev: torch.Tensor
-    seed_b_dev: torch.Tensor
-    threshold_dev: torch.Tensor
-    f1_hl: torch.Tensor
-    f2: torch.Tensor
-    e2: torch.Tensor
-    beta_b: torch.Tensor
-    b_prime: torch.Tensor
-    b_peel: torch.Tensor
-    alpha_b: torch.Tensor
-    inv_alpha_b: torch.Tensor
     b_proof: BProofContext
 
 
 @dataclass
 class LayerState:
-    """Everything one mining-enabled linear layer carries across forwards."""
+    """Everything one mining-enabled linear or MoE layer carries across forwards."""
 
     layer_name: str
     layer_id: int
     weight: torch.Tensor  # (n, k) int8, contiguous, CUDA
     weight_scale: torch.Tensor  # (n, k/8) bfloat16, contiguous, CUDA
-    # Stable host planes for reference winner checks and lazy proof commitments.
     weight_cpu: torch.Tensor
     weight_scale_cpu: torch.Tensor
     n: int
     k: int
     mineable: bool
     buffers: LayerBuffers | None
-    # Dense unmined-forward operands: (n, k) float8_e4m3fn and its (1, n)
-    # float32 row scales. None for MoE layers, whose framework adapter serves
-    # its own unmined path from the retained BF16 weight.
     w_fp8: torch.Tensor | None
     w_fp8_scale: torch.Tensor | None
-    # The job the steady buffers currently hold, or None before the first
-    # preparation / after unpublication. Read and replaced under ``lock``.
     job_ctx: JobContext | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
-    mining_error_logged: bool = False
     disabled_reason: str | None = None
-    # MoE: ``weight`` stacks ``experts`` expert matrices of ``n // experts``
-    # rows each and every token routes to ``top_k`` of them (0 for dense).
     experts: int = 0
     top_k: int = 0
 
     @property
     def lottery_n(self) -> int:
-        """Columns the lottery lattice spans: ``n`` dense, ``n_e`` per expert for MoE."""
         return expert_n(self.n, self.experts)
 
     @property
     def committed_device(self) -> Device:
-        """The committed mining ``Device`` of the GPU this layer mines on."""
         return local_device(self.weight.device)
 
     def disable_mining(self, reason: str) -> None:
-        """Permanently isolate one deterministic layer failure from serving.
-
-        The layer serves the FP8 fallback from here on; crediting and hit
-        validation stop immediately.
-        """
         with self.lock:
             first_failure = self.disabled_reason is None
             if first_failure:
@@ -201,9 +267,6 @@ class LayerState:
 
 
 def _mines_on(device: torch.device) -> bool:
-    """Whether ``device`` belongs to a family the pearl_gemm kernels run on
-    (SM90 Hopper, SM100 datacenter Blackwell, SM120 workstation/consumer
-    Blackwell)."""
     from pearl_gemm.protocol_constants import SM90_CC_MAJOR, SM100_CC_MAJOR, SM120_CC_MAJOR
 
     return torch.cuda.get_device_capability(device)[0] in (
@@ -223,9 +286,6 @@ def _kernels_available() -> bool:
 
 
 def _grouped_kernel_available(device: torch.device) -> bool:
-    """Whether ``device`` has the MoE grouped GEMM. An unavailable package or
-    an unknown architecture is a refusal, the same fail-closed outcome as
-    ``_kernels_available``."""
     if not _kernels_available():
         return False
     from pearl_gemm import supports_grouped_mixed_gemm
@@ -251,79 +311,51 @@ def _b_configs(config_name: str, n: int, k: int):
                 m=n,
                 k=k,
             ),
-            PROTOCOL_COMMITMENT_LEAF,
+            COMMITMENT_CHUNK_SIZE,
         )
     )
-    # Records overlay the device family's library default, so a catalog miss
-    # never launches another family's topology.
     prepare = replace(default_noisy_quant_config(), **tuned(config_name, "noisy_quant", m=n, k=k))
     validate_noisy_quant_config(n, k, prepare)
     return commit, prepare
 
 
-def buffer_field_specs(
-    n: int, k: int, device: torch.device
-) -> tuple[dict[str, tuple[tuple[int, ...], torch.dtype]], Any, Any]:
-    """(tensor-field geometry, commit config, prepare config) for one shape.
-
-    The single source of truth for LayerBuffers' tensor fields:
-    :func:`_allocate_buffers` materializes exactly these tensors, and
-    ``memory._graph_scratch_bytes`` sizes the graph-publication scratch
-    reservation from the same table, so a future field addition cannot
-    silently under-reserve.
-    """
+def _allocate_buffers(n: int, k: int, device: torch.device) -> LayerBuffers:
     from pearl_gemm import tensor_hash_workspace_bytes
 
     commit_config, prepare_config = _b_configs(device_config_name(device), n, k)
-    specs: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
-        "b_prime": ((n, k), torch.float8_e4m3fn),
-        "b_peel": ((n, 2 * RANK), torch.bfloat16),
-        "alpha_b": ((n,), torch.bfloat16),
-        "beta_b": ((n,), torch.bfloat16),
-        "inv_alpha_b": ((n,), torch.float32),
-        "e2": ((n, RANK), torch.float8_e4m3fn),
-        "f1": ((RANK, k), torch.float8_e4m3fn),
-        "f1_hl": ((k, PACKED_NOISE_K), torch.int8),
-        "f2": ((RANK, k), torch.float8_e4m3fn),
-        "f2_hl": ((k, PACKED_NOISE_K), torch.int8),
-        "noise_lines": ((k, RANK), torch.float8_e4m3fn),
-        "root_codes": ((32,), torch.uint8),
-        "root_scales": ((32,), torch.uint8),
-        "tensor_hash_workspace": (
-            (tensor_hash_workspace_bytes(n, k, commit_config),),
-            torch.uint8,
-        ),
-        "commit_stats": ((2 * (n * k // 512),), torch.float32),
-        "gram": ((RANK, RANK), torch.float32),
-        "key_a_dev": ((32,), torch.uint8),
-        "key_b_dev": ((32,), torch.uint8),
-        "seed_b_dev": ((32,), torch.uint8),
-        "noise_key_b_dev": ((32,), torch.uint8),
-        "threshold_dev": ((32,), torch.uint8),
-    }
-    return specs, commit_config, prepare_config
-
-
-def _allocate_buffers(n: int, k: int, device: torch.device) -> LayerBuffers:
-    specs, commit_config, prepare_config = buffer_field_specs(n, k, device)
-    tensors = {
-        name: torch.zeros(shape, dtype=dtype, device=device)
-        for name, (shape, dtype) in specs.items()
-    }
-    tensors["alpha_b"].fill_(1)
-    tensors["inv_alpha_b"].fill_(1)
-    return LayerBuffers(commit_config=commit_config, prepare_config=prepare_config, **tensors)
+    z = lambda shape, dtype: torch.zeros(shape, dtype=dtype, device=device)  # noqa: E731
+    return LayerBuffers(
+        b_prime=z((n, k), torch.float8_e4m3fn),
+        b_peel=z((n, 2 * RANK), torch.bfloat16),
+        alpha_b=torch.ones((n,), dtype=torch.bfloat16, device=device),
+        beta_b=z((n,), torch.bfloat16),
+        inv_alpha_b=torch.ones((n,), dtype=torch.float32, device=device),
+        e2=z((n, RANK), torch.float8_e4m3fn),
+        f1=z((RANK, k), torch.float8_e4m3fn),
+        f1_hl=z((k, PACKED_NOISE_K), torch.int8),
+        f2=z((RANK, k), torch.float8_e4m3fn),
+        f2_hl=z((k, PACKED_NOISE_K), torch.int8),
+        noise_lines=z((k, RANK), torch.float8_e4m3fn),
+        root_codes=z((32,), torch.uint8),
+        root_scales=z((32,), torch.uint8),
+        tensor_hash_workspace=z((tensor_hash_workspace_bytes(n, k, commit_config),), torch.uint8),
+        commit_stats=z((2 * (n * k // 512),), torch.float32),
+        gram=z((RANK, RANK), torch.float32),
+        commit_config=commit_config,
+        prepare_config=prepare_config,
+        key_a_dev=z((32,), torch.uint8),
+        key_b_dev=z((32,), torch.uint8),
+        seed_b_dev=z((32,), torch.uint8),
+        noise_key_b_dev=z((32,), torch.uint8),
+        threshold_dev=z((32,), torch.uint8),
+    )
 
 
 def supports_layer_shape(n: int, k: int) -> bool:
-    """Whether a (n, k) linear can carry FP10 planes and the FP8 fallback."""
     return k % SCALE_BLOCK == 0 and n % 16 == 0 and k % 16 == 0
 
 
 def _lottery_family_available(n: int, k: int, device: torch.device) -> bool:
-    """Whether ``device`` ships a kernel for the tile ``(n, k)`` commits to
-    (SM120 has no tall 16x32 kernel, so 32-but-not-64-aligned ``n`` and
-    k > 42496 layers stay unquantized there)."""
     from pearl_gemm import supports_lottery_family
 
     tile = select_tile(n, k, device=local_device(device))
@@ -331,15 +363,6 @@ def _lottery_family_available(n: int, k: int, device: torch.device) -> bool:
 
 
 def can_mine_layer(n: int, k: int, device: torch.device, experts: int = 0) -> bool:
-    """Whether this device/shape runs the mined pipeline. Layers that cannot
-    mine must stay on their original unquantized path: encoding them would
-    trade serving quality for zero protocol value. ``experts`` is the MoE
-    expert count of a stacked ``(experts * n_e, k)`` weight; the grouped
-    mining kernel needs ``n_e`` on its 128-column lottery lattice and exists
-    only on SM90, SM100 and SM120, so other families leave expert layers
-    unquantized."""
-    # Architecture first: the committed-tile set is per device, and resolving
-    # it raises on a family without a committed device.
     if not _mines_on(device) or not _kernels_available():
         return False
     if experts and (n % (experts * MOE_LOTTERY_N) or not _grouped_kernel_available(device)):
@@ -352,17 +375,10 @@ def can_mine_layer(n: int, k: int, device: torch.device, experts: int = 0) -> bo
     )
 
 
-@dataclass(frozen=True)
-class _StaticLayerEncoding:
-    weight: torch.Tensor
-    weight_scale: torch.Tensor
-    weight_cpu: torch.Tensor
-    weight_scale_cpu: torch.Tensor
-    w_fp8: torch.Tensor | None
-    w_fp8_scale: torch.Tensor | None
-
-
-def _validate_bf16_weight(bf16_weight: torch.Tensor) -> tuple[int, int]:
+def create_layer_state(
+    layer_name: str, bf16_weight: torch.Tensor, *, experts: int = 0, top_k: int = 0
+) -> LayerState:
+    """Encode a loaded BF16 weight and allocate steady per-job mining buffers."""
     if bf16_weight.dtype != torch.bfloat16 or bf16_weight.dim() != 2 or not bf16_weight.is_cuda:
         raise ValueError(
             f"expected a 2D CUDA bfloat16 weight, got {bf16_weight.dtype} "
@@ -371,99 +387,35 @@ def _validate_bf16_weight(bf16_weight: torch.Tensor) -> tuple[int, int]:
     n, k = bf16_weight.shape
     if not supports_layer_shape(n, k):
         raise ValueError(f"unsupported mining shape n={n}, k={k}")
-    return n, k
+    if experts or top_k:
+        validate_moe_dims(experts, top_k)
 
-
-def _encode_static_weight(
-    bf16_weight: torch.Tensor, *, dense_fallback: bool = True
-) -> _StaticLayerEncoding:
-    """Encode the committed FP10 planes, plus the FP8 operands of the dense
-    unmined forward when ``dense_fallback`` (MoE layers never run it)."""
     pq = PrequantMatrix.encode(bf16_weight)
     weight = pq.int_values.contiguous()
     weight_scale = pq.scales.contiguous()
     w_fp8 = w_fp8_scale = None
-    if dense_fallback:
+    if not experts:
         w_fp8, w_fp8_scale = build_fp8_fallback(weight, weight_scale)
-    # CPU B preparation maps the host planes into its helper process.
-    return _StaticLayerEncoding(
-        weight=weight,
-        weight_scale=weight_scale,
-        weight_cpu=shared_copy(weight),
-        weight_scale_cpu=shared_copy(weight_scale),
-        w_fp8=w_fp8,
-        w_fp8_scale=w_fp8_scale,
-    )
 
-
-def create_layer_state(
-    layer_name: str, bf16_weight: torch.Tensor, *, experts: int = 0, top_k: int = 0
-) -> LayerState:
-    """Encode a loaded BF16 weight and build one graph-stable layer state.
-
-    An MoE layer passes its stacked ``(experts * n_e, k)`` gate/up weight with
-    ``experts`` and the router's ``top_k``; it is committed as one B. It gets
-    no dense FP8 fallback operands (``w_fp8`` is None).
-    """
-    n, k = _validate_bf16_weight(bf16_weight)
-    if type(experts) is not int or type(top_k) is not int:
-        raise ValueError(f"experts and top_k must be ints, got {experts!r}, {top_k!r}")
-    if experts or top_k:
-        validate_moe_dims(experts, top_k)
-    encoded = _encode_static_weight(bf16_weight, dense_fallback=not experts)
-    # Callers gate on can_mine_layer, so reaching here without it is a bug.
-    mineable = can_mine_layer(n, k, encoded.weight.device, experts)
-    if not mineable:
+    if not can_mine_layer(n, k, weight.device, experts):
         raise RuntimeError(f"layer {layer_name} (n={n}, k={k}) is not mineable on this device")
+
     return LayerState(
         experts=experts,
         top_k=top_k,
         layer_name=layer_name,
         layer_id=next(_NEXT_LAYER_ID),
-        weight=encoded.weight,
-        weight_scale=encoded.weight_scale,
-        weight_cpu=encoded.weight_cpu,
-        weight_scale_cpu=encoded.weight_scale_cpu,
+        weight=weight,
+        weight_scale=weight_scale,
+        weight_cpu=shared_copy(weight),
+        weight_scale_cpu=shared_copy(weight_scale),
         n=n,
         k=k,
-        mineable=mineable,
-        buffers=_allocate_buffers(n, k, encoded.weight.device),
-        w_fp8=encoded.w_fp8,
-        w_fp8_scale=encoded.w_fp8_scale,
+        mineable=True,
+        buffers=_allocate_buffers(n, k, weight.device),
+        w_fp8=w_fp8,
+        w_fp8_scale=w_fp8_scale,
     )
-
-
-def refresh_layer_state(state: LayerState, bf16_weight: torch.Tensor) -> None:
-    """Re-encode a checkpoint weight into an inactive graph-stable state.
-
-    Every tensor reachable from captured serving graphs is updated in place.
-    The layer's job context must already be unpublished and mining GPU work
-    drained by the framework lifecycle coordinator.
-    """
-    n, k = _validate_bf16_weight(bf16_weight)
-    if (n, k) != (state.n, state.k) or bf16_weight.device != state.weight.device:
-        raise ValueError(
-            f"reload changed {state.layer_name} from {(state.n, state.k)} on "
-            f"{state.weight.device} to {(n, k)} on {bf16_weight.device}"
-        )
-    with state.lock:
-        if state.job_ctx is not None:
-            raise RuntimeError(f"cannot refresh active mining layer {state.layer_name}")
-    encoded = _encode_static_weight(bf16_weight, dense_fallback=state.w_fp8 is not None)
-    with torch.no_grad():
-        state.weight.copy_(encoded.weight)
-        state.weight_scale.copy_(encoded.weight_scale)
-        if state.w_fp8 is not None and state.w_fp8_scale is not None:
-            state.w_fp8.copy_(encoded.w_fp8)
-            state.w_fp8_scale.copy_(encoded.w_fp8_scale)
-    with state.lock:
-        if state.job_ctx is not None:
-            raise RuntimeError(f"mining layer {state.layer_name} became active during reload")
-        state.weight_cpu = encoded.weight_cpu
-        state.weight_scale_cpu = encoded.weight_scale_cpu
-        state.mineable = True
-        state.disabled_reason = None
-        state.mining_error_logged = False
 
 
 _STATE_REGISTRY: dict[int, LayerState] = {}
@@ -522,7 +474,6 @@ def all_states() -> list[LayerState]:
 
 
 def clear_state_registry() -> None:
-    """Drop dispatch indexes only after terminal GPU-runtime quiescence."""
     with _REGISTRY_LOCK:
         _STATE_REGISTRY.clear()
         _LAYER_ID_REGISTRY.clear()

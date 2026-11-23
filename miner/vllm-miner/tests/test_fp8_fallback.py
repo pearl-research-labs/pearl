@@ -1,7 +1,7 @@
 from unittest.mock import Mock
 
 import torch
-from vllm_miner import fp8_fallback
+from vllm_miner import state as fp8_fallback
 
 
 def test_framework_quantizer_and_native_bias_are_used(monkeypatch):
@@ -14,7 +14,7 @@ def test_framework_quantizer_and_native_bias_are_used(monkeypatch):
     quantize = Mock(return_value=(q, scale))
     scaled_mm = Mock(return_value=torch.zeros(2, 4, dtype=torch.bfloat16))
 
-    monkeypatch.setattr(fp8_fallback, "_activation_quantizer", quantize)
+    monkeypatch.setattr(fp8_fallback, "_resolve_vllm_fp8_quant", lambda: quantize)
     monkeypatch.setattr(torch, "_scaled_mm", scaled_mm)
 
     fp8_fallback.fp8_fallback_gemm(x, weight, weight_scale, bias, torch.bfloat16)

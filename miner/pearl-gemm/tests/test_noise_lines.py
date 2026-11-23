@@ -10,7 +10,7 @@ by seedB.
 import pytest
 import torch
 from blake3 import blake3
-from miner_base.commitment_hash import noise_line_key
+from miner_base.protocol import noise_line_key
 
 from pearl_gemm import LABEL_E1, LABEL_E2, LABEL_F1, LABEL_F2, noise_lines
 from pearl_gemm.protocol_constants import R

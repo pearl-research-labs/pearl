@@ -22,15 +22,18 @@ Nothing on the B side depends on A: ``E_A`` is the only factor keyed by
 from dataclasses import dataclass
 
 import torch
-from miner_base.commitment import (
-    BlockHeader,
+from miner_base.protocol import (
     Device,
     MiningConfiguration,
     bits_to_target,
     commitment_keys,
+    default_mining_config,
+    noise_line_key,
+    noise_seed_b,
+    operand_digest,
+    tall_tile_mining_config,
 )
-from miner_base.commitment_hash import noise_line_key, noise_seed_b, operand_digest
-from miner_base.mining_config import default_mining_config, tall_tile_mining_config
+from pearl_mining import IncompleteBlockHeader as BlockHeader
 
 from pearl_gemm import (
     LABEL_F1,

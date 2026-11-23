@@ -2,18 +2,17 @@ from dataclasses import dataclass
 
 from pearl_mining import IncompleteBlockHeader
 
-# Size of proof_commitment in bytes
 PROOF_COMMITMENT_SIZE = 32
 
 
 @dataclass
 class PearlHeader:
-    """Pearl block header wrapping IncompleteBlockHeader + proof_commitment."""
+    """Pearl block header wrapping IncompleteBlockHeader + optional 32-byte proof_commitment."""
 
     incomplete_header: IncompleteBlockHeader
     proof_commitment: bytes | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (
             self.proof_commitment is not None
             and len(self.proof_commitment) != PROOF_COMMITMENT_SIZE
@@ -23,16 +22,8 @@ class PearlHeader:
             )
 
     @property
-    def version(self) -> int:
-        return self.incomplete_header.version
-
-    @property
     def previous_block_hash(self) -> bytes:
         return bytes(self.incomplete_header.prev_block)
-
-    @property
-    def merkle_root(self) -> bytes:
-        return bytes(self.incomplete_header.merkle_root)
 
     @property
     def timestamp(self) -> int:

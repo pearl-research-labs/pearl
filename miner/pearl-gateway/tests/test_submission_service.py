@@ -48,7 +48,9 @@ async def test_build_block_preserves_the_proof_chain(
     )
     pool = Mock(prove=AsyncMock(return_value=(b"public", b"proof"))) if pooled else None
     service = SubmissionService(mock_pearl_client, proof_pool=pool)
-    with patch("pearl_gateway.proof_generator.prove", return_value=(b"public", b"proof")):
+    with patch(
+        "pearl_gateway.submission_service.prove_in_process", return_value=(b"public", b"proof")
+    ):
         block = await service._build_block(plain_proof, template)
     certificate = ZKCertificate.deserialize(block.zk_certificate.serialize())
     assert tuple(h.serialize() for h in certificate.ancestor_headers) == headers
@@ -70,7 +72,8 @@ class TestBlockSubmission:
         mock_pearl_client.submit_block.return_value = "accepted"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.submission_service.SubmissionService._build_block",
+            new_callable=AsyncMock,
             return_value=sample_pearl_block,
         ):
             result = await submission_service.submit_plain_proof(
@@ -94,7 +97,8 @@ class TestBlockSubmission:
         mock_pearl_client.submit_block.return_value = "rejected: invalid proof"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.submission_service.SubmissionService._build_block",
+            new_callable=AsyncMock,
             return_value=sample_pearl_block,
         ):
             result = await submission_service.submit_plain_proof(
@@ -117,7 +121,8 @@ class TestBlockSubmission:
 
         with (
             patch(
-                "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+                "pearl_gateway.submission_service.SubmissionService._build_block",
+                new_callable=AsyncMock,
                 return_value=sample_pearl_block,
             ),
         ):
@@ -151,7 +156,8 @@ class TestBlockSubmission:
         mock_pearl_client.submit_block.side_effect = mock_submit_with_delay
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.submission_service.SubmissionService._build_block",
+            new_callable=AsyncMock,
             side_effect=[sample_pearl_block, sample_pearl_block],
         ):
             # Submit two blocks concurrently with same template
@@ -212,7 +218,8 @@ class TestCrossoverEnforcement:
         mock_pearl_client.submit_block.return_value = "accepted"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.submission_service.SubmissionService._build_block",
+            new_callable=AsyncMock,
             return_value=sample_pearl_block,
         ) as mock_generate:
             result = await submission_service.submit_plain_proof(sample_plain_proof, v1_template)
@@ -250,7 +257,7 @@ class TestSubmissionServiceIntegration:
         for _ in range(4):
             submission_service.submission_log.clear()  # Clear to simulate different blocks
             with patch(
-                "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+                "pearl_gateway.submission_service.SubmissionService._build_block",
                 return_value=sample_pearl_block,
             ):
                 try:

@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from miner_base.commitment import Device
+from miner_base.protocol import Device
 from vllm_miner.mining_config import (
     MOE_LOTTERY_N,
     effective_work_per_matmul,

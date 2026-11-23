@@ -3,17 +3,19 @@ from unittest.mock import Mock
 
 import pytest
 from miner_base.settings import MinerSettings
-from vllm_miner import mining_state as runtime
+from vllm_miner import runtime
 
 
 def test_init_async_manager_honors_env_rpc_transport(monkeypatch):
+    from vllm_miner import settings as settings_module
+
     manager = Mock()
     manager.started = True
     constructor = Mock(return_value=manager)
     monkeypatch.setattr(runtime, "AsyncLoopManager", constructor)
     monkeypatch.setattr(runtime, "_async_manager", None)
     monkeypatch.setattr(runtime, "_runtime_poisoned", False)
-    monkeypatch.setattr(runtime.config, "settings", runtime.config.settings)
+    monkeypatch.setattr(settings_module, "_miner_settings", None)
     monkeypatch.setenv("MINER_RPC_TRANSPORT", "tcp")
     monkeypatch.setenv("MINER_RPC_HOST", "gateway.internal")
     monkeypatch.setenv("MINER_RPC_PORT", "18445")
@@ -25,7 +27,7 @@ def test_init_async_manager_honors_env_rpc_transport(monkeypatch):
     assert rpc_config.host == "gateway.internal"
     assert rpc_config.port == 18445
     manager.start.assert_called_once_with()
-    assert runtime.config.settings is settings
+    assert settings_module.miner_settings() is settings
 
 
 def test_concurrent_initializers_publish_exactly_one_manager(monkeypatch):
@@ -59,7 +61,7 @@ def test_concurrent_initializers_publish_exactly_one_manager(monkeypatch):
     manager.start.side_effect = start
     constructor = Mock(return_value=manager)
     monkeypatch.setattr(runtime, "AsyncLoopManager", constructor)
-    monkeypatch.setattr(runtime, "_RUNTIME_LIFECYCLE_LOCK", ObservedLifecycleLock())
+    monkeypatch.setattr(runtime, "_lifecycle_lock", ObservedLifecycleLock())
     monkeypatch.setattr(runtime, "_async_manager", None)
     monkeypatch.setattr(runtime, "_runtime_poisoned", False)
     monkeypatch.setattr(runtime, "_runtime_startup_disabled", False)
@@ -153,12 +155,12 @@ def test_delete_state_cannot_reopen_admission_from_concurrent_flush(monkeypatch)
     close_admission = Mock()
     open_admission = Mock()
 
-    def submissions_and_hashes_idle() -> bool:
+    def wait_submissions(deadline, timeout, generation, stop_event) -> bool:
         phase_two_entered.set()
         assert release_phase_two.wait(timeout=5)
-        return True
+        return manager._is_current_lifecycle(generation, stop_event)
 
-    manager._submissions_drained = submissions_and_hashes_idle
+    manager._wait_submissions_empty = wait_submissions
     manager.register_drain_barrier(close_admission)
     manager.register_drain_release(open_admission)
 

@@ -7,7 +7,7 @@ import pytest
 import torch
 import vllm_miner.pipeline as pipeline
 import vllm_miner.state as state
-from miner_base.commitment import Device
+from miner_base.protocol import Device
 from pearl_gemm import supports_lottery_family
 from pearl_gemm.autotune import get_tuned
 
@@ -77,7 +77,7 @@ def test_with_committed_leaf_pins_chunk_size_and_clamps_load():
     """A-side autotune knobs stay; ``chunk_size`` is overwritten to the
     weight-side leaf hashed into ``MiningConfiguration`` (and
     ``thread_load_size`` is clamped when it would not divide that leaf)."""
-    from vllm_miner.tuning import with_committed_leaf
+    from vllm_miner.state import with_committed_leaf
 
     pinned = with_committed_leaf(
         {"chunk_size": 256, "thread_load_size": 128, "threads_per_block": 128},
@@ -338,7 +338,7 @@ def test_layer_commits_the_device_of_its_weight(monkeypatch):
 
 @pytest.mark.parametrize("name", ["NVIDIA H100 80GB HBM3", "NVIDIA H200", "NVIDIA H200 NVL"])
 def test_hopper_device_names_load_the_h100_records(monkeypatch, name):
-    from vllm_miner import tuning
+    from vllm_miner import state as tuning
 
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda _index=None: name)
     tuning._device_config_name.cache_clear()
@@ -346,4 +346,4 @@ def test_hopper_device_names_load_the_h100_records(monkeypatch, name):
         stem = tuning.device_config_name(torch.device("cuda", 0))
     finally:
         tuning._device_config_name.cache_clear()
-    assert tuning._load_config(stem).get("mixed_gemm")
+    assert tuning._load_autotune_config(stem).get("mixed_gemm")

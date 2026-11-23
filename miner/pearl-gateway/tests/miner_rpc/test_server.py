@@ -6,12 +6,12 @@ import asyncio
 import json
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
-from pearl_gateway.miner_rpc.server import ClientInfo, MinerRpcServer
+from pearl_gateway.miner_rpc.server import MinerRpcServer
 from pearl_gateway.submission_service import SubmissionService
 from pearl_gateway.work_cache import WorkCache
 
@@ -51,16 +51,6 @@ def uds_config():
 
 
 @pytest.fixture
-def no_auth_config():
-    """Configuration without authentication."""
-    return MinerRpcConfig(
-        transport="tcp",
-        socket_path="",  # Not used for TCP
-        port=18444,
-    )
-
-
-@pytest.fixture
 def sample_mining_job(sample_block_template):
     """Create a sample MiningJob for testing."""
     return MiningJob.from_template(sample_block_template)
@@ -77,7 +67,7 @@ class TestMinerRpcServerInit:
         assert server.submission_service == mock_submission_service
         assert server.config == tcp_config
         assert server.server is None  # Not started yet
-        assert server.clients == {}  # Empty client dict initially
+        assert server.clients == set()
 
     def test_init_with_uds_config(self, mock_work_cache, mock_submission_service, uds_config):
         """Test server initialization with UDS config."""
@@ -87,17 +77,7 @@ class TestMinerRpcServerInit:
         assert server.submission_service == mock_submission_service
         assert server.config == uds_config
         assert server.server is None  # Not started yet
-        assert server.clients == {}  # Empty client dict initially
-
-    def test_init_without_auth(self, mock_work_cache, mock_submission_service, no_auth_config):
-        """Test server initialization without authentication."""
-        server = MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
-
-        assert server.work_cache == mock_work_cache
-        assert server.submission_service == mock_submission_service
-        assert server.config == no_auth_config
-        assert server.server is None  # Not started yet
-        assert server.clients == {}  # Empty client dict initially
+        assert server.clients == set()
 
 
 class TestMinerRpcServerTransport:
@@ -155,8 +135,8 @@ class TestMinerRpcServerHandlers:
     """Test individual handler methods."""
 
     @pytest.fixture
-    def server(self, mock_work_cache, mock_submission_service, no_auth_config):
-        return MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
+    def server(self, mock_work_cache, mock_submission_service, tcp_config):
+        return MinerRpcServer(mock_work_cache, mock_submission_service, tcp_config)
 
     async def test_handle_submit_plain_proof(
         self, server, sample_plain_proof, sample_mining_job, sample_block_template
@@ -178,15 +158,10 @@ class TestMinerRpcServerJsonRpc:
     """Test JSON-RPC request handling."""
 
     @pytest.fixture
-    def server(self, mock_work_cache, mock_submission_service, no_auth_config):
-        return MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
+    def server(self, mock_work_cache, mock_submission_service, tcp_config):
+        return MinerRpcServer(mock_work_cache, mock_submission_service, tcp_config)
 
-    @pytest.fixture
-    def mock_client(self):
-        """Create a mock ClientInfo for testing."""
-        return ClientInfo(client_id=0, writer=MagicMock())
-
-    async def test_valid_get_mining_info_request(self, server, sample_mining_job, mock_client):
+    async def test_valid_get_mining_info_request(self, server, sample_mining_job):
         """Test valid getMiningInfo JSON-RPC request."""
         server.work_cache.get_mining_job.return_value = sample_mining_job
 
@@ -199,7 +174,7 @@ class TestMinerRpcServerJsonRpc:
             }
         )
 
-        response = await server._process_request(request_line, mock_client)
+        response = await server._process_request(request_line)
 
         assert response["jsonrpc"] == "2.0"
         assert response["id"] == 1
@@ -212,7 +187,6 @@ class TestMinerRpcServerJsonRpc:
         sample_mining_job,
         sample_block_template,
         submit_plain_proof_params,
-        mock_client,
     ):
         """Test valid submitPlainProof JSON-RPC request."""
         server.work_cache.get_mining_job.return_value = sample_mining_job
@@ -228,23 +202,23 @@ class TestMinerRpcServerJsonRpc:
             }
         )
 
-        response = await server._process_request(request_line, mock_client)
+        response = await server._process_request(request_line)
 
         assert response["jsonrpc"] == "2.0"
         assert response["id"] == 2
         assert response.get("error") is None
         assert response["result"] == "submitted"
 
-    async def test_invalid_json_request(self, server, mock_client):
+    async def test_invalid_json_request(self, server):
         """Test handling of invalid JSON."""
         request_line = "{ invalid json"
 
-        response = await server._process_request(request_line, mock_client)
+        response = await server._process_request(request_line)
 
         assert response["error"]["code"] == -32700
         assert response["error"]["message"] == "Parse error"
 
-    async def test_invalid_jsonrpc_envelope(self, server, mock_client):
+    async def test_invalid_jsonrpc_envelope(self, server):
         """Test handling of invalid JSON-RPC envelope."""
         request_line = json.dumps(
             {
@@ -254,12 +228,12 @@ class TestMinerRpcServerJsonRpc:
             }
         )
 
-        response = await server._process_request(request_line, mock_client)
+        response = await server._process_request(request_line)
 
         assert response["error"]["code"] == -32600
         assert response["error"]["message"] == "Invalid Request"
 
-    async def test_unknown_method(self, server, mock_client):
+    async def test_unknown_method(self, server):
         """Test handling of unknown method."""
         request_line = json.dumps(
             {
@@ -270,12 +244,12 @@ class TestMinerRpcServerJsonRpc:
             }
         )
 
-        response = await server._process_request(request_line, mock_client)
+        response = await server._process_request(request_line)
 
         assert response["error"]["code"] == -32601
         assert "Method unknownMethod not found" in response["error"]["message"]
 
-    async def test_invalid_method_params(self, server, mock_client):
+    async def test_invalid_method_params(self, server):
         """Test handling of invalid method parameters."""
         request_line = json.dumps(
             {
@@ -288,12 +262,12 @@ class TestMinerRpcServerJsonRpc:
             }
         )
 
-        response = await server._process_request(request_line, mock_client)
+        response = await server._process_request(request_line)
 
         assert response["error"]["code"] == -32602
         assert response["error"]["message"] == "Invalid params"
 
-    async def test_mining_paused_error(self, server, mock_client):
+    async def test_mining_paused_error(self, server):
         """Test handling of MiningPausedError."""
         server.work_cache.get_mining_job.side_effect = MiningPausedError("Node not ready")
 
@@ -306,12 +280,12 @@ class TestMinerRpcServerJsonRpc:
             }
         )
 
-        response = await server._process_request(request_line, mock_client)
+        response = await server._process_request(request_line)
 
         assert response["error"]["code"] == -32001
         assert "mining_paused" in response["error"]["message"]
 
-    async def test_general_exception_handling(self, server, mock_client):
+    async def test_general_exception_handling(self, server):
         """Test handling of general exceptions."""
         server.work_cache.get_mining_job.side_effect = Exception("Unexpected error")
 
@@ -324,7 +298,7 @@ class TestMinerRpcServerJsonRpc:
             }
         )
 
-        response = await server._process_request(request_line, mock_client)
+        response = await server._process_request(request_line)
 
         assert response["error"]["code"] == -32000
         assert "Unexpected error" in response["error"]["message"]

@@ -5,7 +5,7 @@ The activation is committed, seeded and noised once at its token addresses,
 exactly like a dense layer; only then are the noised rows gathered into
 expert order for ``grouped_mixed_gemm``. The routing table itself enters the
 A-side seed through its two keyed roots ``HR`` / ``HO``
-(``miner_base.transcript.noise_seeds``), so it is fixed before any A-side
+(``miner_base.protocol.noise_seed_a``), so it is fixed before any A-side
 noise is learned. Nothing here synchronizes with the host.
 """
 

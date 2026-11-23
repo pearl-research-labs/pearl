@@ -20,7 +20,13 @@ from quack.cute_dsl_utils import get_max_active_clusters
 from .._utils._arch import Arch, arch_of, require_arch
 from .._utils._compile import make_fake_stream, make_fake_tensor, single_flight_compile
 from .._utils._stream import get_stream
-from .._utils._validation import require_disjoint_writes, require_tensor
+from .._utils._validation import (
+    require_bool,
+    require_disjoint_writes,
+    require_hit_signal,
+    require_tensor,
+    require_u32,
+)
 from ..grouped_fp8_gemm._host import (
     WIDE_TILE_MIN_TOKENS_PER_GROUP,
     _problem_dims,
@@ -247,14 +253,6 @@ def _compile_variant(
     )
 
 
-def _validate_u32_tag(name: str, value: int) -> None:
-    if type(value) is not int or not 0 <= value < 2**32:
-        raise ValueError(
-            f"{name} must be an int fitting an unsigned 32-bit record word, got "
-            f"{value!r} ({type(value).__name__})"
-        )
-
-
 def _validate_output_operands(
     out: torch.Tensor,
     a_peel: torch.Tensor,
@@ -302,14 +300,6 @@ def _resolve_payload_planes(
         alignment=16,
     )
     return True
-
-
-def _validate_hit_signal(hit_signal: HitSignal, device: torch.device) -> None:
-    if not isinstance(hit_signal, HitSignal):
-        raise TypeError("hit_signal must be a pearl_gemm.pow.HitSignal")
-    if hit_signal.device != device:
-        raise ValueError(f"hit_signal must live on {device}, got {hit_signal.device}")
-    hit_signal.require_usable()
 
 
 def _require_fused_kernel_config(
@@ -423,10 +413,9 @@ def grouped_mixed_gemm(
     _validate_output_operands(
         out, a_peel, b_peel, alpha_a, inv_alpha_b, cum_m, num_groups, n, device
     )
-    _validate_u32_tag("layer_id", layer_id)
-    if type(record_hits) is not bool:
-        raise TypeError(f"record_hits must be bool, got {type(record_hits).__name__}")
-    _validate_hit_signal(hit_signal, device)
+    require_u32("layer_id", layer_id)
+    require_bool("record_hits", record_hits)
+    require_hit_signal(hit_signal, device)
     require_tensor(
         "a_prime",
         a_prime,

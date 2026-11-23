@@ -1,6 +1,5 @@
 import contextlib
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -29,24 +28,6 @@ def _worker_class() -> type[object]:
 
 def _is_wrapped(cls: type[object], method_name: str) -> bool:
     return bool(getattr(getattr(cls, method_name), "_pearl_wrapped_once", False))
-
-
-def test_vllm_injects_fused_per_token_fp8_quantizer(monkeypatch):
-    from vllm import _custom_ops as ops
-    from vllm_miner import fp8_fallback, runtime
-
-    captured = []
-    sentinel = (object(), object())
-    monkeypatch.setattr(fp8_fallback, "register_activation_quantizer", captured.append)
-    scaled = Mock(return_value=sentinel)
-    monkeypatch.setattr(ops, "scaled_fp8_quant", scaled)
-
-    runtime._install_fused_fp8_activation_quantizer()
-
-    assert len(captured) == 1
-    x = object()
-    assert captured[0](x) is sentinel
-    scaled.assert_called_once_with(x, use_per_token_if_dynamic=True)
 
 
 def test_iter_gpu_model_runner_classes_yields_both():
@@ -85,7 +66,7 @@ def test_worker_phase_hooks_choose_hard_profile_and_soft_warmup_gates(monkeypatc
     worker_cls = _worker_class()
     monkeypatch.setattr(worker_cls, "determine_available_memory", record("profile"))
     monkeypatch.setattr(worker_cls, "compile_or_warm_up_model", record("warmup"))
-    monkeypatch.setattr(runtime, "_mining_suspended_for_capture", _capture_scope)
+    monkeypatch.setattr(runtime, "mining_suspended_for_capture", _capture_scope)
     monkeypatch.setattr(runtime, "_prepare_mining", lambda: record("ready")(None))
 
     runtime._install_capture_phase_hook()
@@ -102,7 +83,7 @@ def test_worker_phase_hooks_choose_hard_profile_and_soft_warmup_gates(monkeypatc
 
 def test_local_shard_loading_defers_b_preparation_until_worker_readiness(monkeypatch):
     import vllm.distributed as distributed
-    from vllm_miner import cuda_graph_submission_gate, job_prep
+    from vllm_miner import job_prep
     from vllm_miner import vllm_pearl_config as quant_config
 
     state = SimpleNamespace(
@@ -123,10 +104,9 @@ def test_local_shard_loading_defers_b_preparation_until_worker_readiness(monkeyp
     )
     monkeypatch.setattr(quant_config, "can_mine_layer", lambda *_args: True)
     monkeypatch.setattr(quant_config, "create_layer_state", lambda *_args: state)
-    monkeypatch.setattr(quant_config, "_set_param", lambda *_args: None)
     monkeypatch.setattr(quant_config, "register_state", registered.append)
     monkeypatch.setattr(
-        cuda_graph_submission_gate,
+        quant_config,
         "suspend_submissions_until_capture_complete",
         lambda: None,
     )
@@ -272,112 +252,7 @@ def test_failed_state_install_restores_the_dropped_source_tensors(monkeypatch):
     assert layer.weight_scale is scale
     assert layer.bias is bias
     assert layer.workspace is workspace
-    assert not method._mined
     assert method._state is None
-
-
-def test_reload_oom_restores_previous_pearl_parameters(monkeypatch):
-    # Reload failure is terminal for the worker, but the layer must remain a
-    # coherent Pearl layer while scheduling is paused rather than retaining the
-    # temporary checkpoint-shaped BF16 parameter.
-    from vllm_miner import vllm_pearl_config as quant_config
-
-    old_weight = torch.nn.Parameter(
-        torch.zeros(128, 512, dtype=torch.int8),
-        requires_grad=False,
-    )
-    old_scale = torch.nn.Parameter(
-        torch.ones(128, dtype=torch.bfloat16),
-        requires_grad=False,
-    )
-    layer = torch.nn.Module()
-    layer.register_parameter("weight", old_weight)
-    layer.register_parameter("weight_scale", old_scale)
-
-    method = quant_config.PearlLinearMethod("model.layers.0.mlp.down_proj")
-    method._n, method._k = 128, 512
-    method._state = SimpleNamespace(
-        weight=old_weight.data,
-        weight_scale=old_scale.data,
-        mineable=True,
-    )
-    method._mined = True
-
-    temporary_weight = torch.nn.Parameter(
-        torch.zeros(128, 512, dtype=torch.bfloat16),
-        requires_grad=False,
-    )
-    layer._parameters["weight"] = temporary_weight
-    layer._parameters.pop("weight_scale")
-    monkeypatch.setattr(
-        quant_config,
-        "refresh_layer_state",
-        lambda *_args: (_ for _ in ()).throw(torch.cuda.OutOfMemoryError("injected")),
-    )
-
-    with pytest.raises(torch.cuda.OutOfMemoryError, match="injected"):
-        method._refresh_state_or_restore(layer, temporary_weight.data)
-
-    assert layer.weight.data_ptr() == method._state.weight.data_ptr()
-    assert layer.weight_scale.data_ptr() == method._state.weight_scale.data_ptr()
-    assert method._mined
-    assert method._state is not None
-
-
-def test_reload_synchronizes_the_device_before_in_place_tensor_mutation(monkeypatch):
-    # The per-layer reload path deletes source tensors and refreshes the mining
-    # state in place. A draining serving forward (or vLLM's own reload-time
-    # kernels) may still hold the compute stream, so the path must drain CUDA
-    # work before mutating tensors -- otherwise a concurrent ``apply`` can
-    # observe a half-installed layer. The worker lifecycle gates mining
-    # producers; this is the per-layer fence that complements it.
-    from vllm_miner import vllm_pearl_config as quant_config
-
-    synchronized: list[torch.device] = []
-    monkeypatch.setattr(
-        quant_config.PearlLinearMethod,
-        "_synchronize_layer_device",
-        staticmethod(lambda device: synchronized.append(device)),
-    )
-    layer = torch.nn.Module()
-    layer.register_parameter(
-        "weight",
-        torch.nn.Parameter(torch.zeros(128, 512, dtype=torch.bfloat16), requires_grad=False),
-    )
-    refreshed_state = SimpleNamespace(
-        weight=torch.zeros(128, 512, dtype=torch.int8),
-        weight_scale=torch.ones(128, dtype=torch.bfloat16),
-        mineable=True,
-    )
-    refresh_calls: list[object] = []
-    monkeypatch.setattr(quant_config, "can_mine_layer", lambda *_args: True)
-    monkeypatch.setattr(
-        quant_config,
-        "refresh_layer_state",
-        lambda state, _weight: refresh_calls.append(state) or None,
-    )
-    monkeypatch.setattr(quant_config, "_set_param", lambda *_args: None)
-
-    method = quant_config.PearlLinearMethod("model.layers.0.mlp.down_proj")
-    method._n, method._k = 128, 512
-    method._state = refreshed_state
-    method._mined = True
-
-    method.process_weights_after_loading(layer)
-
-    # The fence must run exactly once, on the layer's device, and *before* the
-    # in-place refresh (which would otherwise race an in-flight kernel).
-    assert len(synchronized) == 1
-    assert refresh_calls == [refreshed_state]
-
-
-def test_synchronize_layer_device_is_a_noop_on_cpu():
-    # The CPU tests build tiny layers; the host has no async stream to drain, so
-    # the fence must not touch torch.cuda (which would fail off a CUDA host).
-    from vllm_miner import vllm_pearl_config as quant_config
-
-    # Must not raise even though no CUDA context exists in this CPU test.
-    quant_config.PearlLinearMethod._synchronize_layer_device(torch.device("cpu"))
 
 
 def test_device_is_taken_from_the_weight_not_an_earlier_registered_param():
@@ -458,7 +333,7 @@ def test_quantized_source_returning_unquantized_for_linearbase_is_rejected():
         layer = LinearBase(64, 64, disable_tp=True)  # a real LinearBase
         assert isinstance(layer, LinearBase)
 
-        with pytest.raises(ValueError, match="refusing to mine it as BF16"):
+        with pytest.raises(ValueError, match="refusing to mine a packed weight as BF16"):
             config.get_quant_method(layer, "model.layers.0.mlp.gate_up_proj")
 
 
@@ -512,7 +387,7 @@ def test_unmineable_local_shard_falls_through_without_mining_state(monkeypatch):
     method.process_weights_after_loading(layer)
 
     assert fallthrough == [layer]
-    assert method._mined is False
+    assert method._state is None
 
 
 def test_capture_phase_hook_wraps_both_runners():
@@ -527,73 +402,7 @@ def test_capture_phase_hook_wraps_both_runners():
     assert _is_wrapped(_worker_class(), "compile_or_warm_up_model")
 
 
-def test_worker_sleep_wake_reload_hooks_use_lifecycle_owner(monkeypatch):
-    from vllm_miner import lifecycle as lifecycle_module
-    from vllm_miner import runtime
-
-    events = []
-
-    class Owner:
-        def before_sleep(self, level):
-            events.append(("before-sleep", level))
-
-        def sleep_failed(self):
-            events.append("sleep-failed")
-
-        def after_wake(self, tags):
-            events.append(("after-wake", tags))
-
-        def wake_failed(self):
-            events.append("wake-failed")
-
-        def before_reload(self, checkpoint):
-            events.append(("before-reload", checkpoint))
-            return True
-
-        def after_reload(self, *, owns_interval):
-            events.append(("after-reload", owns_interval))
-
-        def reload_failed(self):
-            events.append("reload-failed")
-
-    worker_cls = _worker_class()
-    monkeypatch.setattr(
-        worker_cls,
-        "sleep",
-        lambda _self, level=1: events.append(("sleep", level)) or "slept",
-    )
-    monkeypatch.setattr(
-        worker_cls,
-        "wake_up",
-        lambda _self, tags=None: events.append(("wake", tags)) or "woke",
-    )
-    monkeypatch.setattr(
-        worker_cls,
-        "reload_weights",
-        lambda _self, *args, **kwargs: events.append(("reload", args, kwargs)) or "loaded",
-    )
-    monkeypatch.setattr(lifecycle_module, "lifecycle", lambda: Owner())
-
-    runtime._install_weight_lifecycle_hooks()
-    worker = object.__new__(worker_cls)
-    assert worker.sleep(level=2) == "slept"
-    assert worker.wake_up(tags=["weights"]) == "woke"
-    assert worker.reload_weights(None, None, True) == "loaded"
-
-    assert events == [
-        ("before-sleep", 2),
-        ("sleep", 2),
-        ("wake", ["weights"]),
-        ("after-wake", ["weights"]),
-        ("before-reload", True),
-        ("reload", (None, None, True), {}),
-        ("after-reload", True),
-    ]
-
-
 def test_worker_shutdown_runs_native_cleanup_after_admission_close_failure(monkeypatch):
-    from vllm_miner import capture as runtime_capture
-
     events = []
     from vllm_miner import runtime
 
@@ -601,16 +410,13 @@ def test_worker_shutdown_runs_native_cleanup_after_admission_close_failure(monke
         events.append("close-admission")
         raise RuntimeError("close failed")
 
-    monkeypatch.setattr(runtime_capture, "close_mining_admission", fail_admission_close)
-    monkeypatch.setattr(
-        "vllm_miner.mining_state.delete_state",
-        lambda: events.append("delete-state"),
-    )
+    monkeypatch.setattr(runtime, "close_mining_admission", fail_admission_close)
+    monkeypatch.setattr(runtime, "delete_state", lambda: events.append("delete-state"))
     monkeypatch.setattr(
         "vllm_miner.state.clear_state_registry",
         lambda: events.append("clear-registry"),
     )
-    wrapped = runtime._make_worker_shutdown_lifecycle_wrapper(
+    wrapped = runtime._make_worker_shutdown_wrapper(
         lambda _self: events.append("native-shutdown") or "stopped"
     )
 
@@ -626,11 +432,10 @@ def test_worker_shutdown_runs_native_cleanup_after_admission_close_failure(monke
 
 
 def test_worker_shutdown_preserves_native_failure_after_mining_failure(monkeypatch):
-    from vllm_miner import mining_state as gpu_runtime
+    from vllm_miner import runtime
     from vllm_miner import state as runtime_state
 
     events = []
-    from vllm_miner import runtime
 
     def fail_mining_cleanup():
         events.append("delete-state")
@@ -640,18 +445,18 @@ def test_worker_shutdown_preserves_native_failure_after_mining_failure(monkeypat
         events.append("native-shutdown")
         raise ValueError("native cleanup failed")
 
-    monkeypatch.setattr(gpu_runtime, "delete_state", fail_mining_cleanup)
+    monkeypatch.setattr(runtime, "delete_state", fail_mining_cleanup)
     monkeypatch.setattr(
         runtime_state,
         "clear_state_registry",
         lambda: events.append("clear-registry"),
     )
-    wrapped = runtime._make_worker_shutdown_lifecycle_wrapper(fail_native_cleanup)
+    wrapped = runtime._make_worker_shutdown_wrapper(fail_native_cleanup)
 
     with pytest.raises(ValueError, match="native cleanup failed"):
         wrapped(object())
 
-    assert events == ["delete-state", "native-shutdown"]
+    assert events == ["delete-state", "clear-registry", "native-shutdown"]
 
 
 def test_worker_memory_profile_wrapper_uses_the_hard_gate(monkeypatch):
@@ -668,7 +473,7 @@ def test_worker_memory_profile_wrapper_uses_the_hard_gate(monkeypatch):
             observed.append((in_graph_setup_no_mining(), admitted))
         return "profiled"
 
-    monkeypatch.setattr(runtime, "_mining_suspended_for_capture", _capture_scope)
+    monkeypatch.setattr(runtime, "mining_suspended_for_capture", _capture_scope)
     wrapped = runtime._make_memory_profile_wrapper("determine_available_memory")(original)
 
     assert wrapped(object()) == "profiled"
@@ -681,7 +486,7 @@ def test_worker_memory_profile_reserves_bounded_mining_work(
 ):
     from vllm_miner import memory, runtime
 
-    monkeypatch.setattr(runtime, "_mining_suspended_for_capture", _capture_scope)
+    monkeypatch.setattr(runtime, "mining_suspended_for_capture", _capture_scope)
     monkeypatch.setattr(memory, "estimate_peak_mining_bytes", lambda: reserve)
     wrapped = runtime._make_memory_profile_wrapper(
         "determine_available_memory", reserve_mining_memory=True
@@ -705,7 +510,7 @@ def test_capture_timeout_refuses_to_call_vllm_capture(monkeypatch):
     def original(_self):
         events.append("capture")
 
-    monkeypatch.setattr(capture, "_producer_suspension_ids", set())
+    monkeypatch.setattr(capture, "_producer_permanently_suspended", False)
     monkeypatch.setattr(capture, "wait_for_mining_producers_idle", never_idle)
     monkeypatch.setattr(
         runtime,
@@ -731,7 +536,7 @@ def test_successful_capture_reopens_submissions(monkeypatch):
 
     events = []
 
-    monkeypatch.setattr(runtime, "_mining_suspended_for_capture", _capture_scope)
+    monkeypatch.setattr(runtime, "mining_suspended_for_capture", _capture_scope)
     monkeypatch.setattr(
         runtime,
         "resume_submissions_after_capture",
@@ -777,18 +582,13 @@ def test_serving_activity_hook_wraps_both_runners():
 
 
 def test_none_cudagraph_mode_never_pre_suspends_launches(monkeypatch):
-    from vllm_miner import cuda_graph_submission_gate as gate
+    from vllm_miner import capture as gate
 
-    monkeypatch.setattr(gate, "_CAPTURE_SUSPENSION_ID", None)
+    monkeypatch.setattr(gate, "_capture_launch_suspended", False)
     monkeypatch.setattr(gate, "_will_capture_cuda_graphs", lambda: False)
-    monkeypatch.setattr(
-        gate,
-        "suspend_mining_launches_until_resumed",
-        lambda _reason: pytest.fail("NONE mode suspended launches"),
-    )
 
     gate.suspend_submissions_until_capture_complete()
-    assert gate._CAPTURE_SUSPENSION_ID is None
+    assert gate._capture_launch_suspended is False
 
 
 def test_first_real_execute_resumes_when_capture_hook_never_runs(monkeypatch):

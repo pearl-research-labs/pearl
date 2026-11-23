@@ -15,10 +15,6 @@ from ._blake3 import (
     IV1,
     IV2,
     IV3,
-    IV4,
-    IV5,
-    IV6,
-    IV7,
     KEYED_HASH,
     ROOT,
     _blake3_permute,
@@ -26,11 +22,8 @@ from ._blake3 import (
     _rotr32,
 )
 
-# Flags of a one-shot (single-block, <= 64-byte message) blake3 hash.
-SINGLE_BLOCK_FLAGS = CHUNK_START | CHUNK_END | ROOT
-SINGLE_BLOCK_KEYED_FLAGS = SINGLE_BLOCK_FLAGS | KEYED_HASH
-
-_IV = (IV0, IV1, IV2, IV3, IV4, IV5, IV6, IV7)
+# Flags of a one-shot (single-block, <= 64-byte message) keyed blake3 hash.
+SINGLE_BLOCK_KEYED_FLAGS = CHUNK_START | CHUNK_END | ROOT | KEYED_HASH
 
 
 def compress(cv, m, block_len, flags):
@@ -56,11 +49,6 @@ def compress(cv, m, block_len, flags):
         msg = _blake3_permute(msg)
     _blake3_round(st, msg)
     return [st[i] ^ st[i + 8] for i in range(8)]
-
-
-def iv_cv():
-    """Fresh IV chaining value (unkeyed hash start)."""
-    return [cutlass.Uint32(w) for w in _IV]
 
 
 @cute.jit

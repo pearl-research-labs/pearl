@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'darwin'",
@@ -1496,7 +1496,6 @@ version = "0.1.0"
 source = { editable = "miner/miner-base" }
 dependencies = [
     { name = "blake3" },
-    { name = "loguru" },
     { name = "miner-utils" },
     { name = "numpy" },
     { name = "pearl-blake3" },
@@ -1522,7 +1521,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "blake3", specifier = ">=1.0.7" },
-    { name = "loguru", specifier = ">=0.7.3" },
     { name = "miner-utils", editable = "miner/miner-utils" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "pearl-blake3", directory = "pearl-blake3" },
@@ -2386,17 +2384,11 @@ source = { editable = "miner/pearl-gateway" }
 dependencies = [
     { name = "aiohttp" },
     { name = "bitcoin-utils" },
-    { name = "blake3" },
     { name = "fastjsonschema" },
     { name = "miner-utils" },
-    { name = "numpy" },
-    { name = "prometheus-client" },
     { name = "py-pearl-mining" },
-    { name = "pybase64" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "pyyaml" },
-    { name = "torch" },
 ]
 
 [package.dev-dependencies]
@@ -2411,17 +2403,11 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.10.0" },
     { name = "bitcoin-utils", specifier = ">=0.7.0" },
-    { name = "blake3", specifier = ">=1.0.7" },
     { name = "fastjsonschema", specifier = ">=2.16.0" },
     { name = "miner-utils", editable = "miner/miner-utils" },
-    { name = "numpy", specifier = ">=1.20.0" },
-    { name = "prometheus-client", specifier = ">=0.23.1" },
     { name = "py-pearl-mining", editable = "py-pearl-mining" },
-    { name = "pybase64", specifier = ">=1.4.0" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pydantic-settings", specifier = ">=2.12.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "torch", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu130" },
 ]
 
 [package.metadata.requires-dev]
@@ -2440,7 +2426,6 @@ dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "blake3" },
     { name = "cuda-python" },
-    { name = "numpy" },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
     { name = "quack-kernels" },
 ]
@@ -2453,6 +2438,7 @@ cuda = [
 [package.dev-dependencies]
 dev = [
     { name = "miner-base" },
+    { name = "numpy" },
     { name = "py-pearl-mining" },
     { name = "pytest" },
     { name = "pytest-xdist" },
@@ -2464,7 +2450,6 @@ requires-dist = [
     { name = "apache-tvm-ffi", specifier = ">=0.1.11,<0.1.12" },
     { name = "blake3", specifier = ">=1.0.7" },
     { name = "cuda-python", specifier = ">=13.0,<13.1" },
-    { name = "numpy", specifier = ">=1.24.0" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = ">=4.6.0" },
     { name = "quack-kernels", specifier = ">=0.6.4" },
     { name = "torch", marker = "extra == 'cuda'", specifier = "==2.13.0", index = "https://download.pytorch.org/whl/cu130" },
@@ -2474,6 +2459,7 @@ provides-extras = ["cuda"]
 [package.metadata.requires-dev]
 dev = [
     { name = "miner-base", editable = "miner/miner-base" },
+    { name = "numpy", specifier = ">=1.24.0" },
     { name = "py-pearl-mining", editable = "py-pearl-mining" },
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest-xdist", specifier = ">=3.0.0" },
@@ -3963,7 +3949,6 @@ dependencies = [
     { name = "pearl-gemm" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "pyyaml" },
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchvision" },
@@ -4004,7 +3989,6 @@ requires-dist = [
     { name = "pearl-gemm", editable = "miner/pearl-gemm" },
     { name = "pydantic", specifier = ">=2.8.1" },
     { name = "pydantic-settings", specifier = ">=2.8.1" },
-    { name = "pyyaml", specifier = ">=6.0.1" },
     { name = "torch", specifier = "==2.13.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchaudio", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchvision", specifier = "==0.28.0", index = "https://download.pytorch.org/whl/cu130" },

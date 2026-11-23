@@ -366,16 +366,16 @@ def test_supports_lottery_family_agrees_with_the_validator():
 )
 def test_malformed_record_tag_is_rejected(tag_name, tag_value):
     """The record tag rejects truncation, bool coercion, and leaked TypeError."""
-    from pearl_gemm.mixed_gemm._host import _validate_u32_tag
+    from pearl_gemm._utils._validation import require_u32
 
     with pytest.raises(ValueError, match=tag_name):
-        _validate_u32_tag(tag_name, tag_value)
+        require_u32(tag_name, tag_value)
 
 
 @pytest.mark.parametrize("tag_name", ["layer_id"])
 @pytest.mark.parametrize("tag_value", [0, 1, 2**32 - 1])
 def test_valid_record_tag_is_accepted(tag_name, tag_value):
     """The boundaries of the accepted domain."""
-    from pearl_gemm.mixed_gemm._host import _validate_u32_tag
+    from pearl_gemm._utils._validation import require_u32
 
-    _validate_u32_tag(tag_name, tag_value)
+    require_u32(tag_name, tag_value)
