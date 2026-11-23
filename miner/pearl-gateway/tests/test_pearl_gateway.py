@@ -249,3 +249,63 @@ class TestPearlGateway:
         mock_pearl_gateway_components["proof_pool"].stop.assert_called_once()
         mock_pearl_gateway_components["scheduler"].stop.assert_called_once()
         mock_pearl_gateway_components["pearl_client"].__aexit__.assert_called_once()
+
+
+class TestPearlGatewayPoolMode:
+    """POOL_STRATUM_URL switches the gateway to pool mode."""
+
+    @pytest.fixture
+    def pool_env(self, monkeypatch, mining_address):
+        monkeypatch.setenv("PEARLD_MINING_ADDRESS", mining_address)
+        monkeypatch.setenv("POOL_STRATUM_URL", "stratum+tcp://pool.example.com:3333")
+
+    @pytest.fixture
+    def pool_components(self, mock_pearl_gateway_components):
+        with (
+            patch("pearl_gateway.pearl_gateway.PoolStratumClient") as pool_client_cls,
+            patch("pearl_gateway.pearl_gateway.PoolSubmissionService") as pool_submission_cls,
+        ):
+            pool_client_cls.return_value = AsyncMock()
+            yield mock_pearl_gateway_components, pool_client_cls, pool_submission_cls
+
+    def test_pool_mode_wires_pool_components(self, pool_components, pool_env, mining_address):
+        mocks, pool_client_cls, pool_submission_cls = pool_components
+
+        gateway = PearlGateway(debug_mode=True)
+
+        # Payout address falls back to PEARLD_MINING_ADDRESS when POOL_ADDRESS is unset.
+        pool_client_cls.assert_called_once_with(
+            gateway.config.pool, mining_address, mocks["work_cache"]
+        )
+        pool_submission_cls.assert_called_once_with(
+            pool_client_cls.return_value, mocks["proof_pool"], mocks["work_cache"]
+        )
+        mocks["classes"]["PearlNodeClient"].assert_not_called()
+        mocks["classes"]["TemplateScheduler"].assert_not_called()
+        mocks["classes"]["SubmissionService"].assert_not_called()
+        assert gateway.pearl_client is None
+        assert gateway.scheduler is None
+
+    def test_pool_address_overrides_mining_address(self, pool_components, pool_env, monkeypatch):
+        _, pool_client_cls, _ = pool_components
+        monkeypatch.setenv("POOL_ADDRESS", "prl1payout")
+
+        gateway = PearlGateway()
+
+        assert pool_client_cls.call_args.args[1] == "prl1payout"
+        assert gateway.pool_client is pool_client_cls.return_value
+
+    async def test_pool_mode_start_and_stop(self, pool_components, pool_env):
+        mocks, pool_client_cls, _ = pool_components
+        pool_client = pool_client_cls.return_value
+
+        gateway = PearlGateway()
+        await gateway.start()
+        pool_client.start.assert_awaited_once()
+        mocks["proof_pool"].start.assert_awaited_once()
+        mocks["miner_rpc"].start.assert_awaited_once()
+        mocks["pearl_client"].__aenter__.assert_not_awaited()
+
+        await gateway.stop()
+        pool_client.stop.assert_awaited_once()
+        mocks["pearl_client"].__aexit__.assert_not_awaited()

@@ -77,9 +77,23 @@ def sample_block_template_data():
     }
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def sample_block_template(sample_block_template_data, mining_address):
-    """Create a sample BlockTemplate for testing."""
+    """Create a sample BlockTemplate for testing.
+
+    Function-scoped so tests that mutate fields (e.g. ``share_target``) get a
+    fresh instance per test.
+    """
+    return _build_sample_block_template(sample_block_template_data, mining_address)
+
+
+@pytest.fixture(scope="session")
+def session_sample_block_template(sample_block_template_data, mining_address):
+    """Session-scoped sample BlockTemplate for session fixtures; do not mutate."""
+    return _build_sample_block_template(sample_block_template_data, mining_address)
+
+
+def _build_sample_block_template(sample_block_template_data, mining_address):
     from pearl_gateway.rpc_types import GetBlockTemplateResponse
 
     return BlockTemplate.from_get_block_template(

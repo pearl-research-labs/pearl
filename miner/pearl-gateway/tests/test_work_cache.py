@@ -170,6 +170,56 @@ class TestMiningJob:
             assert job.target == sample_block_template.target
 
 
+class TestForceUpdate:
+    """Test forcing a template swap past the prev-block-hash dedup (clean_jobs)."""
+
+    @pytest.mark.asyncio
+    async def test_force_updates_even_when_unchanged(self, work_cache, sample_block_template):
+        assert await work_cache.update_template(sample_block_template) is True
+        # Same template again -> normally deduped by prev-block-hash.
+        assert await work_cache.update_template(sample_block_template) is False
+        # force overrides the dedup so a clean_jobs notify always takes effect.
+        assert await work_cache.update_template(sample_block_template, force=True) is True
+        assert work_cache.current_template is sample_block_template
+
+
+class TestShareTargetOverride:
+    """Test pool share difficulty stored on BlockTemplate."""
+
+    @pytest.mark.asyncio
+    async def test_share_target_overrides_job_target(self, work_cache, sample_block_template):
+        await work_cache.update_template(sample_block_template)
+        network_target = sample_block_template.target
+        sample_block_template.share_target = network_target * 100  # easier than network
+
+        job = await work_cache.get_mining_job()
+        assert job.target == network_target * 100
+
+    @pytest.mark.asyncio
+    async def test_no_share_target_uses_network_target(self, work_cache, sample_block_template):
+        await work_cache.update_template(sample_block_template)
+
+        job = await work_cache.get_mining_job()
+        assert job.target == sample_block_template.target
+
+    @pytest.mark.asyncio
+    async def test_update_share_target_sets_current_template(
+        self, work_cache, sample_block_template
+    ):
+        await work_cache.update_template(sample_block_template)
+
+        await work_cache.update_share_target(12345)
+
+        assert sample_block_template.share_target == 12345
+        assert (await work_cache.get_mining_job()).target == 12345
+
+    @pytest.mark.asyncio
+    async def test_update_share_target_without_template_is_noop(self, work_cache):
+        await work_cache.update_share_target(12345)
+
+        assert work_cache.current_template is None
+
+
 class TestCacheIntegration:
     """Test WorkCache integration scenarios."""
 

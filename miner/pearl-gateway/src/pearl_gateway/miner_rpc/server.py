@@ -8,7 +8,7 @@ from typing import Any
 
 import fastjsonschema
 from miner_utils import get_logger
-from pearl_mining import PlainProof
+from pearl_mining import IncompleteBlockHeader, PlainProof, verify_plain_proof_for_cert_version
 
 from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
@@ -306,6 +306,20 @@ class MinerRpcServer:
         if mining_job.incomplete_header_bytes != current_header:
             logger.info("Job changed since submission was queued; dropping stale proof")
             return
+        if template.share_bits is not None:
+            # Pool mode: check what the proof achieved, not the target the miner
+            # searched against, so a proof that still meets a raised share target
+            # (or the network target) is kept. Cheap next to proving, and the
+            # binding holds the GIL, so a thread hop would not unblock the loop.
+            ok, msg = verify_plain_proof_for_cert_version(
+                int(template.required_cert_version),
+                IncompleteBlockHeader.from_bytes(current_header),
+                plain_proof,
+                nbits_override=template.share_bits,
+            )
+            if not ok:
+                logger.info(f"Proof does not meet the current share target; dropping: {msg}")
+                return
 
         # Submit the block via the submission service
         result = await self.submission_service.submit_plain_proof(plain_proof, template)

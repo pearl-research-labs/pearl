@@ -7,7 +7,7 @@ import contextlib
 import json
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
@@ -206,6 +206,31 @@ class TestMinerRpcServerHandlers:
         await server.handle_submit_plain_proof(sample_plain_proof, stale_job)
 
         server.submission_service.submit_plain_proof.assert_not_called()
+
+    @pytest.mark.parametrize(("meets_target", "submitted"), [(True, True), (False, False)])
+    async def test_pool_share_is_checked_against_the_current_share_target(
+        self,
+        server,
+        sample_plain_proof,
+        sample_mining_job,
+        sample_block_template,
+        meets_target,
+        submitted,
+    ):
+        """After a difficulty increase, a proof is kept only if it meets the new target."""
+        sample_block_template.share_target = sample_mining_job.target - 1  # raised since mined
+        sample_block_template.share_bits = 0x1E010000
+        server.work_cache.current_template = sample_block_template
+        server.submission_service.submit_plain_proof.return_value = {"status": "accepted"}
+
+        with patch(
+            "pearl_gateway.miner_rpc.server.verify_plain_proof_for_cert_version",
+            return_value=(meets_target, "" if meets_target else "above target"),
+        ) as verify:
+            await server.handle_submit_plain_proof(sample_plain_proof, sample_mining_job)
+
+        assert verify.call_args.kwargs["nbits_override"] == 0x1E010000
+        assert server.submission_service.submit_plain_proof.called is submitted
 
     async def test_handle_submit_plain_proof_drops_without_template(
         self, server, sample_plain_proof, sample_mining_job

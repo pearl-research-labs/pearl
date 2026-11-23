@@ -10,6 +10,7 @@ from pearl_gateway.config import (
     MinerRpcConfig,
     PearlConfig,
     PearlGatewayConfig,
+    PoolConfig,
     load_config,
 )
 from pydantic import ValidationError
@@ -28,10 +29,12 @@ class TestPearlConfig:
         assert config.refresh_interval_seconds == 1
         assert config.mining_address == mining_address
 
-    def test_pearl_config_missing_mining_address(self):
-        """Test PearlConfig with missing mining address."""
-        with pytest.raises(ValidationError, match="mining_address"):
-            PearlConfig()
+    def test_solo_mode_requires_mining_address(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            pytest.raises(ValidationError, match="PEARLD_MINING_ADDRESS is required"),
+        ):
+            load_config()
 
     def test_pearl_config_custom_values(self, mining_address):
         """Test creating PearlConfig with custom values."""
@@ -178,3 +181,73 @@ class TestLoadConfig:
             assert config.pearl.rpc_url == "https://custom:8334"
             assert config.pearl.rpc_user == "custom_user"
             assert config.pearl.mining_address == mining_address
+
+
+class TestPoolConfig:
+    """Test PoolConfig and pool-mode selection."""
+
+    def test_pool_config_parses_stratum_url(self):
+        config = PoolConfig(stratum_url="stratum+ssl://pool.example.com:3443")
+
+        assert config.stratum_host == "pool.example.com"
+        assert config.stratum_port == 3443
+        assert config.stratum_tls is True
+        assert config.address is None
+        assert config.worker == "gateway"
+        assert config.password == "x"
+        assert config.difficulty is None
+
+    def test_pool_config_plain_tcp_default_port(self):
+        config = PoolConfig(stratum_url="stratum+tcp://pool.example.com")
+
+        assert config.stratum_port == 3333
+        assert config.stratum_tls is False
+
+    def test_pool_config_rejects_url_without_host(self):
+        with pytest.raises(ValidationError, match="must include a host"):
+            PoolConfig(stratum_url="stratum+tcp://")
+
+    @pytest.mark.parametrize("value", [0, -1, 0.5, "0.5", "1e3", float("inf"), float("nan")])
+    def test_pool_config_difficulty_rejects_invalid(self, value):
+        with pytest.raises(ValidationError, match="difficulty"):
+            PoolConfig(stratum_url="stratum+tcp://pool.example.com", difficulty=value)
+
+    def test_load_config_pool_mode(self, mining_address):
+        with patch.dict(
+            os.environ,
+            {
+                "PEARLD_MINING_ADDRESS": mining_address,
+                "POOL_STRATUM_URL": "stratum+tcp://pool.example.com:3333",
+                "POOL_WORKER": "rig-1",
+                "POOL_DIFFICULTY": "128",
+            },
+        ):
+            config = load_config()
+
+        assert config.pool is not None
+        assert config.pool.worker == "rig-1"
+        assert config.pool.difficulty == 128
+
+    def test_load_config_pool_mode_without_pearld(self, mining_address):
+        env = {"POOL_STRATUM_URL": "stratum+tcp://pool.example.com", "POOL_ADDRESS": mining_address}
+        with patch.dict(os.environ, env, clear=True):
+            config = load_config()
+
+        assert config.pearl.mining_address is None
+        assert config.pool is not None
+        assert config.pool.address == mining_address
+
+    def test_load_config_pool_mode_requires_an_address(self):
+        env = {"POOL_STRATUM_URL": "stratum+tcp://pool.example.com"}
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ValidationError, match="POOL_ADDRESS"),
+        ):
+            load_config()
+
+    def test_load_config_solo_mode_without_pool_url(self, mining_address):
+        with patch.dict(os.environ, {"PEARLD_MINING_ADDRESS": mining_address}):
+            os.environ.pop("POOL_STRATUM_URL", None)
+            config = load_config()
+
+        assert config.pool is None
