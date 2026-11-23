@@ -340,6 +340,21 @@ class TestPoolStratumClient:
         await stop_listener(listen_task)
 
     @pytest.mark.asyncio
+    async def test_handshake_holds_at_most_the_latest_notify_and_difficulty(
+        self, pool_config: PoolConfig, work_cache: WorkCache
+    ):
+        client, _, _ = make_connected_client(pool_config, work_cache)
+
+        for i in range(1000):  # a flood before the session is ready stays bounded
+            await client._handle_notification("mining.notify", mining_notify_params(f"j{i}"))
+            await client._handle_notification("mining.set_difficulty", [0x1E010000 + i])
+            await client._handle_notification("mining.unknown", ["x" * 100])
+
+        assert set(client._deferred) == {"mining.notify", "mining.set_difficulty"}
+        assert client._deferred["mining.notify"][0] == "j999"
+        assert client._deferred["mining.set_difficulty"] == [0x1E010000 + 999]
+
+    @pytest.mark.asyncio
     async def test_subscribe_and_authorize_sends_difficulty_in_password(
         self, work_cache: WorkCache
     ):

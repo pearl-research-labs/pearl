@@ -17,6 +17,9 @@ from pearl_gateway.work_cache import WorkCache
 
 logger = get_logger(__name__)
 
+# Notifications worth holding until the handshake finishes, in replay order.
+_DEFERRABLE = ("mining.set_difficulty", "mining.notify")
+
 
 class PoolStratumClient:
     """Persistent Stratum v1 TCP client that receives work from a pool
@@ -43,9 +46,11 @@ class PoolStratumClient:
         self.share_bits: int | None = None
 
         # Notifications are held until the handshake has stored the session's
-        # extranonce1: a pool may write work right behind the subscribe reply.
+        # extranonce1: a pool may write work right behind the subscribe reply. Only
+        # the latest of each kind matters, so at most two are held, whatever the
+        # peer sends.
         self._session_ready = False
-        self._deferred: list[tuple[str, list[Any]]] = []
+        self._deferred: dict[str, list[Any]] = {}
 
         self._conn = AsyncStratumConnection(
             config.stratum_host,
@@ -117,7 +122,7 @@ class PoolStratumClient:
     async def _subscribe_and_authorize(self) -> None:
         """Run the Stratum subscribe + authorize handshake."""
         self._session_ready = False
-        self._deferred = []
+        self._deferred = {}
 
         # 1. mining.subscribe -> [[subscriptions...], extranonce1, extranonce2_size?]
         result = await self._conn.call("mining.subscribe", ["pearl-gateway/1.0"])
@@ -136,8 +141,11 @@ class PoolStratumClient:
         logger.info(f"Authorized as {self.stratum_user}")
 
         # Replay work the pool sent during the handshake, now that it can be built.
-        while self._deferred:
-            method, params = self._deferred.pop(0)
+        # Difficulty first, so the replayed job carries the session's share target.
+        deferred, self._deferred = self._deferred, {}
+        for method in _DEFERRABLE:
+            if (params := deferred.get(method)) is None:
+                continue
             try:
                 await self._dispatch(method, params)
             except Exception:
@@ -147,13 +155,15 @@ class PoolStratumClient:
     async def _on_disconnect(self) -> None:
         """Session ended: its job and share target are dead, so miners must not use them."""
         self._session_ready = False
+        self._deferred = {}
         self.share_target = None
         self.share_bits = None
         await self.work_cache.clear()
 
     async def _handle_notification(self, method: str, params: list[Any]) -> None:
         if not self._session_ready:
-            self._deferred.append((method, params))
+            if method in _DEFERRABLE:
+                self._deferred[method] = params
             return
         await self._dispatch(method, params)
 
