@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+import stat
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,8 +87,10 @@ class MinerRpcServer:
 
     async def _start_uds(self):
         """Start the server on a Unix Domain Socket."""
-        # Ensure the socket file doesn't already exist
-        if os.path.exists(self.config.socket_path):
+        # A stale socket may be replaced, but never another kind of file.
+        if os.path.lexists(self.config.socket_path):
+            if not stat.S_ISSOCK(os.lstat(self.config.socket_path).st_mode):
+                raise FileExistsError(f"Socket path is not a socket: {self.config.socket_path}")
             os.unlink(self.config.socket_path)
 
         # Start the server
@@ -110,6 +113,7 @@ class MinerRpcServer:
 
     async def stop(self):
         """Stop the RPC server."""
+        uds_started = self.server is not None and self.config.transport == "uds"
         if self.server:
             # Close all client connections (use list() to avoid dict mutation during iteration)
             for client_info in list(self.clients.values()):
@@ -125,7 +129,11 @@ class MinerRpcServer:
             self.server = None
 
         # Clean up UDS file if applicable
-        if self.config.transport == "uds" and os.path.exists(self.config.socket_path):
+        if (
+            uds_started
+            and os.path.lexists(self.config.socket_path)
+            and stat.S_ISSOCK(os.lstat(self.config.socket_path).st_mode)
+        ):
             os.unlink(self.config.socket_path)
 
         logger.info("Miner RPC server stopped")
