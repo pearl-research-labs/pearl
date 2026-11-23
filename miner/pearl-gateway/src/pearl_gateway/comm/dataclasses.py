@@ -22,7 +22,7 @@ from pearl_gateway.rpc_types import (
     GetBlockTemplateResponse,
 )
 from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 
 def get_bytes(data: str | bytes) -> bytes:
@@ -143,6 +143,16 @@ class StratumSetDifficulty(BaseModel):
 
     bits: int = Field(ge=1, le=0xFFFFFFFF)
 
+    @field_validator("bits")
+    @classmethod
+    def _valid_compact(cls, bits: int) -> int:
+        # Same rules as the consensus decoders: no sign bit, and a target in (0, 2**256).
+        if bits & 0x00800000:
+            raise ValueError("compact target has the sign bit set")
+        if not 0 < bits_to_target(bits) < 1 << 256:
+            raise ValueError("compact target out of range")
+        return bits
+
     @classmethod
     def from_params(cls, params: list[Any]) -> "StratumSetDifficulty":
         """Validate positional Stratum mining.set_difficulty params."""
@@ -167,6 +177,8 @@ class BlockTemplate:
     # back in mining.submit (None when the pool advertises none).
     job_id: str | None = field(default=None)
     share_target: int | None = field(default=None)
+    # The same pool share target in compact form, as sent by mining.set_difficulty.
+    share_bits: int | None = field(default=None)
     extranonce2: bytes | None = field(default=None)
 
     @classmethod

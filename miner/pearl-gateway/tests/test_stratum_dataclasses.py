@@ -377,3 +377,17 @@ class TestStratumSetDifficulty:
     def test_from_params_rejects_zero_bits(self):
         with pytest.raises(ValueError):
             StratumSetDifficulty.from_params([0])
+
+
+class TestStratumSetDifficultyCompact:
+    @pytest.mark.parametrize(
+        "bits",
+        [0x21010000, 0x1D000000, 0x1E800000],  # >256-bit target, zero mantissa, sign bit
+    )
+    def test_rejects_compact_values_consensus_would_not_accept(self, bits):
+        with pytest.raises(ValueError):
+            StratumSetDifficulty.from_params([bits])
+
+    @pytest.mark.parametrize("bits", [0x1B00FFFF, 0x1A01FFFE, 0x1E010000])
+    def test_accepts_valid_compact_values(self, bits):
+        assert StratumSetDifficulty.from_params([bits]).bits == bits

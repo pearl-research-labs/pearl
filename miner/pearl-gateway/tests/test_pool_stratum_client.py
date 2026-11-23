@@ -279,7 +279,13 @@ class TestPoolStratumClient:
 
         await handshake("00000001")
         await client._on_mining_notify(mining_notify_params(job_id="job-1"))
+        await client._on_set_difficulty([0x1E010000])
         first = work_cache.current_template
+
+        # Disconnect: the dead session's job and share target are dropped.
+        await client._on_disconnect()
+        assert work_cache.current_template is None
+        assert client.share_target is None and client.share_bits is None
 
         # Reconnect: new extranonce1, and the pool re-sends the same job without clean_jobs.
         await handshake("00000002")
@@ -287,12 +293,49 @@ class TestPoolStratumClient:
         second = work_cache.current_template
 
         assert second is not first
-        assert second.coinbase_tx.serialize() != first.coinbase_tx.serialize()
         assert "00000002" in second.coinbase_tx.serialize()
+        assert second.coinbase_tx.serialize() != first.coinbase_tx.serialize()
 
-        # Within a session, a same-block notify without clean_jobs is still deduplicated.
-        await client._on_mining_notify(mining_notify_params(job_id="job-2"))
-        assert work_cache.current_template is second
+        await stop_listener(listen_task)
+
+    @pytest.mark.asyncio
+    async def test_new_job_id_on_the_same_block_replaces_the_template(
+        self, pool_config: PoolConfig, work_cache: WorkCache
+    ):
+        client, _, _ = make_connected_client(pool_config, work_cache)
+        client._extranonce = bytes(4)
+
+        await client._on_mining_notify(mining_notify_params(job_id="job-1"))
+        first = work_cache.current_template
+        await client._on_mining_notify(mining_notify_params(job_id="job-2"))  # same block
+        second = work_cache.current_template
+        await client._on_mining_notify(mining_notify_params(job_id="job-2"))  # repeat
+
+        assert second is not first and second.job_id == "job-2"
+        assert work_cache.current_template is second  # a repeat keeps proofs in flight valid
+
+    @pytest.mark.asyncio
+    async def test_notify_sent_during_the_handshake_uses_the_new_extranonce(
+        self, pool_config: PoolConfig, work_cache: WorkCache
+    ):
+        client, reader, writer = make_connected_client(pool_config, work_cache)
+        listen_task = start_listener(client)
+
+        task = asyncio.create_task(client._subscribe_and_authorize())
+        await wait_for_write_count(writer, 1)
+        # The pool writes the subscribe reply and work in one burst, before authorize.
+        reader.feed_line({"id": latest_request(writer)["id"], "result": [[], "00000003"]})
+        reader.feed_line({"method": "mining.set_difficulty", "params": [0x1E010000]})
+        reader.feed_line({"method": "mining.notify", "params": mining_notify_params(job_id="j")})
+        await wait_for_write_count(writer, 2)
+        assert work_cache.current_template is None  # held until the handshake finishes
+        reader.feed_line({"id": latest_request(writer)["id"], "result": True})
+        await task
+
+        template = work_cache.current_template
+        assert template is not None and template.job_id == "j"
+        assert "00000003" in template.coinbase_tx.serialize()
+        assert template.share_bits == 0x1E010000
 
         await stop_listener(listen_task)
 
@@ -447,7 +490,8 @@ class TestPoolStratumClient:
             await client._on_set_difficulty([0x1E010000])
 
         assert client.share_target == expected
-        mock_update.assert_called_once_with(expected)
+        assert client.share_bits == 0x1E010000
+        mock_update.assert_called_once_with(expected, 0x1E010000)
 
     @pytest.mark.asyncio
     async def test_listen_dispatches_pool_notifications(
@@ -455,6 +499,7 @@ class TestPoolStratumClient:
     ):
         client, reader, _ = make_connected_client(pool_config, work_cache)
         client._extranonce = bytes(4)
+        client._session_ready = True
         listen_task = start_listener(client)
 
         reader.feed_line("not-json\n")
@@ -476,21 +521,37 @@ class TestPoolStratumClient:
     ):
         client, reader, _ = make_connected_client(pool_config, work_cache)
         client._extranonce = bytes(4)
+        client._session_ready = True
         listen_task = start_listener(client)
 
         reader.feed_line({"method": "mining.notify", "params": ["too", "few"]})
-        reader.feed_line({"method": "mining.set_difficulty", "params": [0x02FFFFFF]})
+        reader.feed_line({"method": "mining.set_difficulty", "params": [0x02FFFFFF]})  # sign bit
         reader.feed_line(
             {"method": "mining.notify", "params": mining_notify_params(job_id="job-ok")}
         )
         await asyncio.sleep(0)
 
         assert not listen_task.done()
-        assert client.share_target == 0xFFFF  # exponent < 3 shifts down instead of raising
+        assert client.share_target is None  # invalid compact rejected, previous target kept
         assert work_cache.current_template is not None
         assert work_cache.current_template.job_id == "job-ok"
 
         await stop_listener(listen_task)
+
+    @pytest.mark.asyncio
+    async def test_submit_timeout_drops_the_connection(
+        self, pool_config: PoolConfig, work_cache: WorkCache
+    ):
+        client, _, _ = make_connected_client(pool_config, work_cache)
+
+        with (
+            patch.object(client._conn, "call", AsyncMock(side_effect=TimeoutError())),
+            patch.object(client._conn, "disconnect") as disconnect,
+        ):
+            accepted = await client.submit_zk_cert("job-1", "deadbeef", "cert")
+
+        assert accepted is False
+        disconnect.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_submit_zk_cert_accepted(self, pool_config: PoolConfig, work_cache: WorkCache):

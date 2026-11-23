@@ -59,11 +59,17 @@ class WorkCache:
             # Return a job with the current template
             return MiningJob.from_template(template=self.current_template)
 
-    async def update_share_target(self, share_target: int) -> None:
+    async def update_share_target(self, share_target: int, share_bits: int | None = None) -> None:
         """Update the pool share target on the current template, if one is cached."""
         async with self.lock:
             if self.current_template is not None:
                 self.current_template.share_target = share_target
+                self.current_template.share_bits = share_bits
+
+    async def clear(self) -> None:
+        """Drop the cached template (pool session ended); miners see mining paused."""
+        async with self.lock:
+            self.current_template = None
 
     async def get_template_age(self) -> float | None:
         """Get the age of the current template in seconds."""

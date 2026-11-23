@@ -278,7 +278,7 @@ class TestPearlGatewayPoolMode:
             gateway.config.pool, mining_address, mocks["work_cache"]
         )
         pool_submission_cls.assert_called_once_with(
-            pool_client_cls.return_value, mocks["proof_pool"], mocks["work_cache"], debug_mode=True
+            pool_client_cls.return_value, mocks["proof_pool"], mocks["work_cache"]
         )
         mocks["classes"]["PearlNodeClient"].assert_not_called()
         mocks["classes"]["TemplateScheduler"].assert_not_called()

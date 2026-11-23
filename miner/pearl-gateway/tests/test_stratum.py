@@ -224,9 +224,14 @@ class TestAsyncStratumConnection:
         port = await server.start()
 
         handshakes = 0
+        disconnects = 0
         notifications: list[tuple[str, list]] = []
 
         conn: AsyncStratumConnection | None = None
+
+        async def on_disconnect() -> None:
+            nonlocal disconnects
+            disconnects += 1
 
         async def handshake() -> None:
             nonlocal handshakes
@@ -245,11 +250,13 @@ class TestAsyncStratumConnection:
             max_reconnect_delay_seconds=1,
             handshake=handshake,
             on_notification=on_notification,
+            on_disconnect=on_disconnect,
         )
         try:
             await conn.start()
             await _wait_for(lambda: handshakes == 1)
             assert conn.is_connected
+            assert disconnects == 0
             assert server.requests[0]["method"] == "mining.subscribe"
 
             # Peer drops the connection: the loop must reconnect and re-run
@@ -257,6 +264,7 @@ class TestAsyncStratumConnection:
             server.drop_connection()
             await _wait_for(lambda: handshakes == 2)
             assert server.connections == 2
+            assert disconnects == 1  # the owner is told each session ended
 
             # disconnect() forces the same reconnect path from our side.
             conn.disconnect()

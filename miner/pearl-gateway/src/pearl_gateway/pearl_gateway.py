@@ -70,7 +70,7 @@ class PearlGateway:
                 pool, pool.address or self.config.pearl.mining_address, self.work_cache
             )
             self.submission_service = PoolSubmissionService(
-                self.pool_client, self.proof_pool, self.work_cache, debug_mode=debug_mode
+                self.pool_client, self.proof_pool, self.work_cache
             )
         else:
             self.pearl_client = PearlNodeClient(self.config.pearl)

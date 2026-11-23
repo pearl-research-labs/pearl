@@ -180,6 +180,7 @@ class AsyncStratumConnection:
         max_reconnect_delay_seconds: int,
         handshake: HandshakeCallback,
         on_notification: NotificationCallback,
+        on_disconnect: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -188,6 +189,7 @@ class AsyncStratumConnection:
         self._max_reconnect_delay_seconds = max_reconnect_delay_seconds
         self._handshake = handshake
         self._on_notification = on_notification
+        self._on_disconnect = on_disconnect
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -243,6 +245,11 @@ class AsyncStratumConnection:
                 logger.exception("Pool connection error, reconnecting")
             finally:
                 await self._close_connection()
+                if self._on_disconnect is not None:
+                    try:
+                        await self._on_disconnect()
+                    except Exception:
+                        logger.exception("Error in pool disconnect handler")
 
             if not self._running:
                 break

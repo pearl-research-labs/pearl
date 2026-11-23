@@ -38,11 +38,14 @@ class PoolStratumClient:
         # Extranonce2 byte size from mining.subscribe; 0 means the pool advertises none.
         self._extranonce2_size: int = 0
 
-        # Current share target pushed via mining.set_difficulty
+        # Current share target pushed via mining.set_difficulty (and its compact form)
         self.share_target: int | None = None
-        # Set at every (re)subscribe: the next mining.notify must replace the cached
-        # template, whose coinbase still holds the previous session's extranonce1.
-        self._new_session = False
+        self.share_bits: int | None = None
+
+        # Notifications are held until the handshake has stored the session's
+        # extranonce1: a pool may write work right behind the subscribe reply.
+        self._session_ready = False
+        self._deferred: list[tuple[str, list[Any]]] = []
 
         self._conn = AsyncStratumConnection(
             config.stratum_host,
@@ -52,6 +55,7 @@ class PoolStratumClient:
             max_reconnect_delay_seconds=config.max_reconnect_delay_seconds,
             handshake=self._subscribe_and_authorize,
             on_notification=self._handle_notification,
+            on_disconnect=self._on_disconnect,
         )
 
     @property
@@ -100,16 +104,24 @@ class PoolStratumClient:
         except JSONRPCError as e:
             logger.warning(f"Pool rejected share: {e}")
             return False
+        except (TimeoutError, ConnectionError, OSError):
+            # A pool that stops answering without closing the socket would otherwise
+            # keep us on a dead session; drop it so the connection loop reconnects.
+            logger.warning("Pool did not answer mining.submit; reconnecting")
+            self._conn.disconnect()
+            return False
         except Exception:
             logger.exception("Error submitting proof to pool")
             return False
 
     async def _subscribe_and_authorize(self) -> None:
         """Run the Stratum subscribe + authorize handshake."""
+        self._session_ready = False
+        self._deferred = []
+
         # 1. mining.subscribe -> [[subscriptions...], extranonce1, extranonce2_size?]
         result = await self._conn.call("mining.subscribe", ["pearl-gateway/1.0"])
         self._extranonce = bytes.fromhex(result[1])
-        self._new_session = True
         self._extranonce2_size = (
             parse_extranonce2_size(result[2]) if len(result) > 2 and result[2] is not None else 0
         )
@@ -123,7 +135,29 @@ class PoolStratumClient:
             raise ConnectionError(f"Pool authorization failed: {auth_result}")
         logger.info(f"Authorized as {self.stratum_user}")
 
+        # Replay work the pool sent during the handshake, now that it can be built.
+        while self._deferred:
+            method, params = self._deferred.pop(0)
+            try:
+                await self._dispatch(method, params)
+            except Exception:
+                logger.exception(f"Ignoring pool notification that failed to handle: {method}")
+        self._session_ready = True
+
+    async def _on_disconnect(self) -> None:
+        """Session ended: its job and share target are dead, so miners must not use them."""
+        self._session_ready = False
+        self.share_target = None
+        self.share_bits = None
+        await self.work_cache.clear()
+
     async def _handle_notification(self, method: str, params: list[Any]) -> None:
+        if not self._session_ready:
+            self._deferred.append((method, params))
+            return
+        await self._dispatch(method, params)
+
+    async def _dispatch(self, method: str, params: list[Any]) -> None:
         if method == "mining.notify":
             await self._on_mining_notify(params)
         elif method == "mining.set_difficulty":
@@ -156,16 +190,19 @@ class PoolStratumClient:
 
         template = BlockTemplate.from_stratum_notify(notify)
         template.share_target = self.share_target
+        template.share_bits = self.share_bits
 
-        # The pool re-sends its current job on a new connection, usually without
-        # clean_jobs; force the swap so miners stop working on the old extranonce1.
-        force = notify.clean_jobs or self._new_session
-        self._new_session = False
-        await self.work_cache.update_template(template, force=force)
+        # In pool mode every notify with a new job id is a new job, even on the same
+        # block. A repeat of the current job keeps the cached template (and its
+        # extranonce2), so proofs in flight for it stay valid.
+        current = self.work_cache.current_template
+        is_new = notify.clean_jobs or current is None or current.job_id != notify.job_id
+        await self.work_cache.update_template(template, force=is_new)
 
     async def _on_set_difficulty(self, params: list[Any]) -> None:
         """Handle mining.set_difficulty -- miners now find shares at the pool's difficulty."""
         set_difficulty = StratumSetDifficulty.from_params(params)
+        self.share_bits = set_difficulty.bits
         self.share_target = bits_to_target(set_difficulty.bits)
-        await self.work_cache.update_share_target(self.share_target)
+        await self.work_cache.update_share_target(self.share_target, self.share_bits)
         logger.info(f"Pool share difficulty updated: bits=0x{set_difficulty.bits:08x}")

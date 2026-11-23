@@ -104,9 +104,11 @@ class PoolSubmissionService(SubmissionService):
         pool_client: "PoolStratumClient",
         proof_pool: "ProofPool",
         work_cache: "WorkCache",
-        debug_mode: bool = False,
     ):
-        super().__init__(pearl_client=None, proof_pool=proof_pool, debug_mode=debug_mode)
+        # No block-level --debug verify here: it checks the network target, which
+        # every share that is not also a block fails. MinerRpcServer checks each
+        # proof against the share target before proving instead.
+        super().__init__(pearl_client=None, proof_pool=proof_pool)
         self.pool_client = pool_client
         self.work_cache = work_cache
 
