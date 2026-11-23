@@ -165,13 +165,13 @@ func TestMapSliceNewMapCapacity(t *testing.T) {
 		{
 			name:   "budget left",
 			budget: 8 << 20,
-			want:   []int{53_248, 26_624},
+			want:   []int{int(entriesForDirectory(16)), int(entriesForDirectory(16))},
 		},
 		{
 			name:        "entries exhaust budget",
 			budget:      8 << 20,
 			entryMemory: 8 << 20,
-			want:        []int{53_248, minMapEntries},
+			want:        []int{int(entriesForDirectory(16)), minMapEntries},
 		},
 	}
 	for _, tt := range tests {
@@ -184,6 +184,59 @@ func TestMapSliceNewMapCapacity(t *testing.T) {
 			assert.Equal(t, tt.want, cache.cachedEntries.maxEntries)
 		})
 	}
+}
+
+// TestMapSliceRetiredMap verifies a map stops absorbing inserts once it has
+// taken its capacity worth of them, even when deletes free up live slots.
+// Tombstones left by the deletes keep consuming the map's growth budget, so
+// refilling it could grow the map past its grown size charge.
+func TestMapSliceRetiredMap(t *testing.T) {
+	ms := &newUtxoCache(nil, 8<<20).cachedEntries
+
+	first := ms.maxEntries[0]
+	for i := 0; i < first; i++ {
+		ms.put(outpointFromInt(i), nil, 0)
+	}
+	require.Len(t, ms.maps, 1)
+
+	// Free every live slot: len drops back to zero but the map's insert
+	// count is exhausted, so the next put must land in a new map.
+	for i := 0; i < first; i++ {
+		ms.delete(outpointFromInt(i))
+	}
+	ms.put(outpointFromInt(first), nil, 0)
+	require.Len(t, ms.maps, 2)
+	require.Len(t, ms.maps[0], 0)
+	require.Len(t, ms.maps[1], 1)
+}
+
+// TestDeleteMaps verifies deleteMaps drops every map and the next put lazily
+// rebuilds a fresh, refillable one sized to the freed budget.
+func TestDeleteMaps(t *testing.T) {
+	ms := &newUtxoCache(nil, 8<<20).cachedEntries
+
+	first := ms.maxEntries[0]
+	for i := 0; i <= first; i++ {
+		ms.put(outpointFromInt(i), nil, 0)
+	}
+	require.Greater(t, len(ms.maps), 1)
+
+	// Delete every entry first so the dropped maps also cover the
+	// tombstone-laden state heavy churn or a non-erasing flush leaves.
+	for i := 0; i <= first; i++ {
+		ms.delete(outpointFromInt(i))
+	}
+	ms.deleteMaps()
+	require.Empty(t, ms.maps)
+	require.Empty(t, ms.maxEntries)
+	require.Empty(t, ms.inserts)
+
+	// The next put lazily creates a fresh map that must absorb inserts again.
+	ms.put(outpointFromInt(first+1), nil, 0)
+	require.Len(t, ms.maps, 1)
+	require.Equal(t, []int{first}, ms.maxEntries)
+	require.Equal(t, []int{1}, ms.inserts)
+	require.Len(t, ms.maps[0], 1)
 }
 
 func TestHaveUnspentInCacheDoesNotReadDatabase(t *testing.T) {

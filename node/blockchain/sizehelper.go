@@ -3,23 +3,28 @@
 // license that can be found in the LICENSE file.
 package blockchain
 
-// These constants are related to the wire protocol.
-const (
-	// outpointSize is the size of an outpoint.
-	//
-	// This value is calculated by running the following:
-	//	unsafe.Sizeof(wire.OutPoint{})
-	outpointSize = 36
+import (
+	"math"
+	"math/bits"
+)
 
+// These constants describe the size of the cache's entries and of the
+// Swiss-table groups the runtime builds for its maps.
+const (
 	// uint64Size is the size of an uint64 allocated in memory.
 	uint64Size = 8
 
-	// bucketSize is the size of the bucket in the cache map.  Exact
-	// calculation is (16 + keysize*8 + valuesize*8) where for the map of:
-	// map[wire.OutPoint]*UtxoEntry would have a keysize=36 and valuesize=8.
-	//
-	// https://github.com/golang/go/issues/34561#issuecomment-536115805
-	bucketSize = 16 + uint64Size*outpointSize + uint64Size*uint64Size
+	// slotSize is the size of one key/elem slot in the cache map's groups.
+	// Since Go 1.24 maps are Swiss tables, whose groups interleave
+	// mapGroupSlots {key, elem} slots with the key padded to the elem's
+	// alignment (internal/abi).  For map[wire.OutPoint]*UtxoEntry the key
+	// is 36 bytes and the elem an 8 byte pointer, so the elem sits at
+	// offset 40 and the slot takes 48 bytes.
+	slotSize = 40 + uint64Size
+
+	// groupSize is the size of a group in the cache map: an 8 byte control
+	// word plus mapGroupSlots slots.
+	groupSize = ctrlGroupSize + mapGroupSlots*slotSize
 
 	// This value is calculated by running the following on a 64-bit system:
 	//   unsafe.Sizeof(UtxoEntry{})
@@ -27,17 +32,11 @@ const (
 
 	// pubKeyHashLen is the length of a P2PKH script.
 	pubKeyHashLen = 25
-
-	// avgEntrySize is how much each entry we expect it to be.  Since most
-	// txs are p2pkh, we can assume the entry to be more or less the size
-	// of a p2pkh tx.  We add on 7 to make it 32 since 64 bit systems will
-	// align by 8 bytes.
-	avgEntrySize = baseEntrySize + (pubKeyHashLen + 7)
 )
 
-// The code here is shamelessly taken from the go runtime package.  All the relevant
-// code and variables are copied to here.  These values are only correct for a 64 bit
-// system.
+// The code here is shamelessly taken from the go runtime package.  All the
+// relevant code and variables are copied to here.  These values are only
+// correct for a 64 bit system.
 
 const (
 	_MaxSmallSize   = 32768
@@ -50,14 +49,40 @@ const (
 
 	MaxUintptr = ^uintptr(0)
 
-	// Maximum number of key/elem pairs a bucket can hold.
-	bucketCntBits = 3
-	bucketCnt     = 1 << bucketCntBits
+	// mapGroupSlots is abi.MapGroupSlots: the number of key/elem slots in a
+	// group.
+	mapGroupSlots = 8
 
-	// Maximum average load of a bucket that triggers growth is 6.5.
-	// Represent as loadFactorNum/loadFactorDen, to allow integer math.
-	loadFactorNum = 13
-	loadFactorDen = 2
+	// ctrlGroupSize is the byte size of a group's control word, which holds
+	// one control byte per slot.
+	ctrlGroupSize = uint64Size
+
+	// maxAvgGroupLoad is the maximum average number of used slots per group
+	// before a table grows (internal/runtime/maps/group.go).
+	maxAvgGroupLoad = 7
+
+	// maxTableCapacity is the maximum number of slots a single table holds
+	// before the map splits it at the directory level
+	// (internal/runtime/maps/table.go).
+	maxTableCapacity = 1024
+
+	// tableHeaderSize is the allocated size of a table struct: three uint16
+	// counters, localDepth, the directory index and the groupsReference.
+	tableHeaderSize = 32
+
+	// mapHeaderSize is the allocated size of the Map header struct on a 64
+	// bit system.  Refer to Map in internal/runtime/maps/map.go of the go
+	// standard library.
+	mapHeaderSize = 48
+
+	// mallocHeaderSize is gc.MallocHeaderSize: since Go 1.26,
+	// pointer-containing objects larger than minSizeForMallocHeader carry
+	// an 8-byte malloc header charged before size-class rounding.
+	mallocHeaderSize = 8
+
+	// minSizeForMallocHeader is gc.MinSizeForMallocHeader
+	// (goarch.PtrSize * goarch.PtrBits).
+	minSizeForMallocHeader = PtrSize * PtrSize * 8
 
 	// _64bit = 1 on 64-bit systems, 0 on 32-bit systems
 	_64bit = 1 << (^uintptr(0) >> 63) / 2
@@ -68,94 +93,79 @@ const (
 	PtrSize = 4 << (^uintptr(0) >> 63)
 
 	// heapAddrBits is the number of bits in a heap address that's actually
-	// available for memory allocation.
-	//
-	// NOTE (guggero): For 64-bit systems, we just assume 40 bits of address
-	// space available, as that seems to be the lowest common denominator.
-	// See heapAddrBits in runtime/malloc.go of the standard library for
-	// more details
-	heapAddrBits = 32 + (_64bit * 8)
+	// available for memory allocation.  See heapAddrBits in
+	// runtime/malloc.go of the standard library for more details; it is 48
+	// on most 64-bit systems (40 on ios/arm64, 32 on 32-bit systems).
+	heapAddrBits = 32 + (_64bit * 16)
 
 	// maxAlloc is the maximum size of an allocation on the heap.
-	//
-	// NOTE(guggero): With the somewhat simplified heapAddrBits calculation
-	// above, this will currently limit the maximum allocation size of the
-	// UTXO cache to around 300GiB on 64-bit systems. This should be more
-	// than enough for the foreseeable future, but if we ever need to
-	// increase it, we should probably use the same calculation as the
-	// standard library.
 	maxAlloc = (1 << heapAddrBits) - (1-_64bit)*1
-
-	// hmapSize is the number of bytes needed for the map header in a
-	// 64 bit system. Refer to hmap in runtime/map.go in the go
-	// standard library.
-	hmapSize = 48
 )
 
 var class_to_size = [_NumSizeClasses]uint16{0, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048, 2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912, 8192, 9472, 9728, 10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072, 20480, 21760, 24576, 27264, 28672, 32768}
 var size_to_class8 = [smallSizeMax/smallSizeDiv + 1]uint8{0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 19, 19, 20, 20, 20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 29, 29, 29, 29, 29, 30, 30, 30, 30, 30, 30, 30, 30, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32}
 var size_to_class128 = [(_MaxSmallSize-smallSizeMax)/largeSizeDiv + 1]uint8{32, 33, 34, 35, 36, 37, 37, 38, 38, 39, 39, 40, 40, 40, 41, 41, 41, 42, 43, 43, 44, 44, 44, 44, 44, 45, 45, 45, 45, 45, 45, 46, 46, 46, 46, 47, 47, 47, 47, 47, 47, 48, 48, 48, 49, 49, 50, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 52, 52, 52, 52, 52, 52, 52, 52, 52, 52, 53, 53, 54, 54, 54, 54, 55, 55, 55, 55, 55, 56, 56, 56, 56, 56, 56, 56, 56, 56, 56, 56, 57, 57, 57, 57, 57, 57, 57, 57, 57, 57, 58, 58, 58, 58, 58, 58, 59, 59, 59, 59, 59, 59, 59, 59, 59, 59, 59, 59, 59, 59, 59, 59, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 61, 61, 61, 61, 61, 62, 62, 62, 62, 62, 62, 62, 62, 62, 62, 62, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67, 67}
 
-// calculateRoughMapSize returns a close enough estimate of the
-// total memory allocated by a map.
-// hint should be the same value as the number you give when
-// making a map with the following syntax: make(map[k]v, hint)
+// calculateRoughMapSize returns a close enough estimate of the total memory
+// allocated by make(map[wire.OutPoint]*UtxoEntry, hint).  Since Go 1.24 the
+// runtime implements maps as Swiss tables, so the layout is a directory of
+// tables, each holding a power-of-two number of groups of 8 key/elem slots.
 //
-// bucketsize is (16 + keysize*8 + valuesize*8).  For a map of:
-// map[int64]int64, keysize=8 and valuesize=8.  There are edge cases
-// where the bucket size is different that I can't find the source code
-// for. https://github.com/golang/go/issues/34561#issuecomment-536115805
+// This code mirrors NewMap in internal/runtime/maps/map.go and newTable in
+// internal/runtime/maps/table.go: the hint becomes a target capacity at
+// maxAvgGroupLoad/mapGroupSlots load, which is split over a power-of-two
+// directory of tables capped at maxTableCapacity slots each.  Each table
+// allocates a header plus its group array, and the map allocates its header
+// plus the directory; mallocgc rounds each allocation to a size class or a
+// page boundary.
 //
-// I suspect it's because of alignment and how the compiler handles it but
-// when compared with how much the compiler allocates, it's a couple hundred
-// bytes off.
-func calculateRoughMapSize(hint int, bucketSize uintptr) int {
-	// This code is copied from makemap() in runtime/map.go.
-	//
-	// TODO check once in a while to see if this algorithm gets
-	// changed.
-	mem, overflow := mulUintptr(uintptr(hint), uintptr(bucketSize))
-	if overflow || mem > maxAlloc {
-		hint = 0
+// TODO check once in a while to see if this algorithm gets changed.
+func calculateRoughMapSize(hint int) int {
+	// The Map header is allocated even when NewMap returns an empty map,
+	// which includes hints that overflow the target capacity computation
+	// or exceed maxAlloc below.  The accumulator is 64 bits wide so the
+	// products below saturate on 32-bit platforms instead of wrapping.
+	total := uint64(mapHeaderSize)
+
+	if hint <= mapGroupSlots {
+		// NewMap defers allocation for maps that fit in a single group.
+		return int(total)
 	}
 
-	// Find the size parameter B which will hold the requested # of elements.
-	// For hint < 0 overLoadFactor returns false since hint < bucketCnt.
-	B := uint8(0)
-	for overLoadFactor(hint, B) {
-		B++
+	// This code is copied from NewMap() in internal/runtime/maps/map.go.
+	targetCapacity := uintptr(hint) * mapGroupSlots / maxAvgGroupLoad
+	if targetCapacity < uintptr(hint) {
+		return int(total)
 	}
-
-	// This code is copied from makeBucketArray() in runtime/map.go.
-	//
-	// TODO check once in a while to see if this algorithm gets
-	// changed.
-	//
-	// For small b, overflow buckets are unlikely.
-	// Avoid the overhead of the calculation.
-	base := bucketShift(B)
-	numBuckets := base
-	if B >= 4 {
-		// Add on the estimated number of overflow buckets
-		// required to insert the median number of elements
-		// used with this value of b.
-		numBuckets += bucketShift(B - 4)
-		sz := bucketSize * numBuckets
-		up := roundupsize(sz)
-		if up != sz {
-			numBuckets = up / bucketSize
-		}
+	dirSize := (uint64(targetCapacity) + maxTableCapacity - 1) / maxTableCapacity
+	dirSize, overflow := alignUpPow2(dirSize)
+	if overflow || dirSize > uint64(MaxUintptr) {
+		return int(total)
 	}
-	total, _ := mulUintptr(bucketSize, numBuckets)
-
-	if base != numBuckets {
-		// Add 24 for mapextra struct overhead. Refer to
-		// runtime/map.go in the std library for the struct.
-		total += 24
+	// The runtime's reject check multiplies the slot count (not the group
+	// count) by the group size, so it bails out 8x earlier than the real
+	// limit; it is mirrored here.
+	groups, overflow := mulUintptr(uintptr(dirSize), maxTableCapacity)
+	if overflow {
+		return int(total)
 	}
+	if mem, overflow := mulUintptr(groups, groupSize); overflow || mem > maxAlloc {
+		return int(total)
+	}
+	total += uint64(roundupsizeScan(uintptr(dirSize) * PtrSize))
 
-	total += hmapSize
-	return int(total)
+	// This code is copied from newTable() in internal/runtime/maps/table.go.
+	// Every table rounds its share of the target capacity up to a power of
+	// two slots, then allocates a header plus that many groups.
+	tableCapacity := uint64(targetCapacity) / dirSize
+	if tableCapacity < mapGroupSlots {
+		tableCapacity = mapGroupSlots
+	}
+	tableCapacity, _ = alignUpPow2(tableCapacity) // Cannot overflow.
+	tableSize := roundupsizeScan(uintptr(tableCapacity/mapGroupSlots)*groupSize) + tableHeaderSize
+	total += dirSize * uint64(tableSize)
+
+	return int(min(total, math.MaxInt))
 }
 
 // These constants bound the capacity of each map in the UTXO cache.
@@ -164,34 +174,75 @@ const (
 	// before its flush, from allocating one map per entry.
 	minMapEntries = 1024
 
+	// splitRefill is about how many fresh inserts a table produced by a
+	// split can absorb before it fills ~7/8 of its slots and splits again:
+	// the split distributes ~half of the parent's maxGrowthLeft entries.
+	splitRefill = maxTableCapacity * maxAvgGroupLoad / mapGroupSlots / 2
+
+	// maxDirSize bounds the number of tables in a single map's directory.
+	// It is the largest directory a ~45 GiB map budget allocates under the
+	// grown size charge.
+	maxDirSize = 1 << 17
+
 	// maxMapEntries keeps a large budget from preallocating one enormous map;
-	// past it the cache adds maps.  It is the full load of 2^24 buckets, the map
-	// a 16 GiB budget gets, and must stay at or below maxAlloc / bucketSize so
-	// calculateRoughMapSize still counts the map's memory.
-	maxMapEntries = 109_051_904
+	// past it the cache adds maps.  It is the full load of a maxDirSize map,
+	// and must stay small enough that the runtime does not reject the map as
+	// over maxAlloc.
+	maxMapEntries = maxDirSize * maxTableCapacity * maxAvgGroupLoad / mapGroupSlots
 )
 
-// mapCapacityFor returns how many entries to size a map for when it may use
-// budget bytes, clamped to [minMapEntries, maxMapEntries].  The map's buckets
-// get half the budget, each charged one average entry, which leaves room for
-// the entries the map holds.
-func mapCapacityFor(budget uint64) int {
-	bucketBudget := subOrZero(budget, hmapSize) / 2
-	maxBuckets := bucketBudget / (bucketSize + avgEntrySize)
-
-	// Maps allocate a power-of-two number of buckets, so use the largest that
-	// fits.
-	var capacity uint64
-	for buckets := uint64(1); buckets <= maxBuckets; buckets *= 2 {
-		capacity = entriesBeforeGrowth(buckets)
-	}
-	return int(min(max(capacity, minMapEntries), maxMapEntries))
+// entriesForDirectory returns how many entries a map with a directory of
+// dirSize tables holds before a table must grow: maxTableCapacity slots per
+// table at maxAvgGroupLoad/mapGroupSlots load.
+func entriesForDirectory(dirSize uint64) uint64 {
+	return dirSize * maxTableCapacity * maxAvgGroupLoad / mapGroupSlots
 }
 
-// entriesBeforeGrowth returns how many entries a map with the given
-// power-of-two number of buckets holds before it grows (see overLoadFactor).
-func entriesBeforeGrowth(buckets uint64) uint64 {
-	return max(bucketCnt, loadFactorNum*(buckets/loadFactorDen))
+// grownMapSize returns the estimate for the memory a map made with the given
+// hint consumes after absorbing hint inserts.  calculateRoughMapSize only
+// models the initial allocation, but Swiss tables split one table at a time
+// as they fill: each table splits once the entries and tombstones routed to
+// it fill ~7/8 of its slots, and a split replaces the table with two fully
+// allocated ones.  A table produced by a split already holds about half of
+// its parent's entries under uniform hashing, so each split consumes
+// ~splitRefill fresh inserts; while inserts stay capped at the hint the
+// table count stays around 3x the initial one under the same uniformity
+// assumption.
+func grownMapSize(hint int) int {
+	initial := calculateRoughMapSize(hint)
+	if hint <= mapGroupSlots {
+		// NewMap defers allocation for maps that fit in a single group;
+		// the first insert allocates it.
+		return initial + int(roundupsizeScan(groupSize))
+	}
+	splits := uint64(hint) / splitRefill
+	tableSize := roundupsizeScan(maxTableCapacity/mapGroupSlots*groupSize) + tableHeaderSize
+	// Clamp splits before multiplying so absurd hints cannot wrap the sum.
+	splits = min(splits, math.MaxInt/uint64(tableSize))
+	return int(min(uint64(initial)+splits*uint64(tableSize), math.MaxInt))
+}
+
+// mapCapacityFor returns how many entries to size a map for when it may use
+// budget bytes, clamped to [minMapEntries, maxMapEntries].  The map's grown
+// allocation gets half the budget, which leaves room for the entries the map
+// holds as they are charged separately on insert.
+func mapCapacityFor(budget uint64) int {
+	mapBudget := subOrZero(budget, mapHeaderSize) / 2
+
+	// A fully loaded map doubles in size with each power-of-two directory,
+	// so the largest map whose grown charge still fits the budget is found
+	// by growing the directory until it no longer does.  Hints between full
+	// loads are ignored on purpose: a hint past a directory boundary makes
+	// the runtime double the directory into half-full tables, which holds
+	// no more entries than the previous full load.
+	var capacity uint64
+	for dirSize := uint64(1); dirSize <= maxDirSize; dirSize *= 2 {
+		if uint64(grownMapSize(int(entriesForDirectory(dirSize)))) > mapBudget {
+			break
+		}
+		capacity = entriesForDirectory(dirSize)
+	}
+	return int(min(max(capacity, minMapEntries), maxMapEntries))
 }
 
 // mulUintptr returns a * b and whether the multiplication overflowed.
@@ -221,6 +272,27 @@ func alignUp(n, a uintptr) uintptr {
 	return (n + a - 1) &^ (a - 1)
 }
 
+// alignUpPow2 rounds n up to the next power of 2, reporting whether the
+// result overflowed.  Copied from internal/runtime/maps/group.go.
+func alignUpPow2(n uint64) (uint64, bool) {
+	if n == 0 {
+		return 0, false
+	}
+	v := uint64(1) << bits.Len64(n-1)
+	return v, v == 0
+}
+
+// roundupsizeScan returns the size mallocgc will charge for a
+// pointer-containing object: since Go 1.26 an 8-byte malloc header is added
+// to such allocations in the (minSizeForMallocHeader, _MaxSmallSize-8] byte
+// range before size-class rounding (roundupsize in runtime/msize.go).
+func roundupsizeScan(size uintptr) uintptr {
+	if size > minSizeForMallocHeader && size <= _MaxSmallSize-mallocHeaderSize {
+		size += mallocHeaderSize
+	}
+	return roundupsize(size)
+}
+
 // Returns size of the memory block that mallocgc will allocate if you ask for the size.
 func roundupsize(size uintptr) uintptr {
 	if size < _MaxSmallSize {
@@ -234,15 +306,4 @@ func roundupsize(size uintptr) uintptr {
 		return size
 	}
 	return alignUp(size, _PageSize)
-}
-
-// overLoadFactor reports whether count items placed in 1<<B buckets is over loadFactor.
-func overLoadFactor(count int, B uint8) bool {
-	return count > bucketCnt && uintptr(count) > loadFactorNum*(bucketShift(B)/loadFactorDen)
-}
-
-// bucketShift returns 1<<b, optimized for code generation.
-func bucketShift(b uint8) uintptr {
-	// Masking the shift amount allows overflow checks to be elided.
-	return uintptr(1) << (b & (8*8 - 1))
 }

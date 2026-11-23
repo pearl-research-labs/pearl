@@ -19,11 +19,11 @@ import (
 )
 
 // mapSlice is a slice of maps for utxo entries.  The slice of maps are needed to
-// guarantee that the map will only take up N amount of bytes.  As of v1.20, the
-// go runtime will allocate 2^N + few extra buckets, meaning that for large N, we'll
-// allocate a lot of extra memory if the amount of entries goes over the previously
-// allocated buckets.  A slice of maps allows us to have a better control of how much
-// total memory gets allocated by all the maps.
+// guarantee that the map will only take up N amount of bytes.  The go runtime
+// grows a map's allocation one table at a time as inserts accumulate, meaning
+// that for large N, we'll allocate a lot of extra memory.  A slice of maps
+// allows us to have a better control of how much total memory gets allocated
+// by all the maps.
 type mapSlice struct {
 	// mtx protects against concurrent access for the map slice.
 	mtx sync.Mutex
@@ -31,8 +31,16 @@ type mapSlice struct {
 	// maps are the underlying maps in the slice of maps.
 	maps []map[wire.OutPoint]*UtxoEntry
 
-	// maxEntries is the maximum amount of elements that the map is allocated for.
+	// maxEntries is the maximum amount of elements that the map is allocated
+	// for.  It is also the cap on the map's lifetime inserts: a map stops
+	// absorbing new outpoints once inserts reaches it, even if deletes have
+	// freed live slots, since its consumed growth budget is not reclaimed.
 	maxEntries []int
+
+	// inserts is the number of new outpoints each map has absorbed.  It
+	// bounds each map's growth: tombstones left by deletes consume a map's
+	// growth budget without showing up in len, so only inserts are counted.
+	inserts []int
 
 	// maxTotalMemoryUsage is the maximum memory usage in bytes that the state
 	// should contain in normal circumstances.
@@ -63,7 +71,7 @@ func (ms *mapSlice) size() int {
 
 	var size int
 	for _, num := range ms.maxEntries {
-		size += calculateRoughMapSize(num, bucketSize)
+		size += grownMapSize(num)
 	}
 
 	return size
@@ -113,14 +121,17 @@ func (ms *mapSlice) put(op wire.OutPoint, entry *UtxoEntry, totalEntryMemory uin
 
 	for i, maxNum := range ms.maxEntries {
 		m := ms.maps[i]
-		if len(m) >= maxNum {
-			// Don't try to insert if the map already at max since
-			// that'll force the map to allocate double the memory it's
-			// currently taking up.
+		if ms.inserts[i] >= maxNum {
+			// Don't try to insert if the map has already absorbed its
+			// capacity worth of inserts since that'll force the map to
+			// grow beyond what we accounted for it.  Deletes in full
+			// groups leave tombstones that keep consuming the map's
+			// growth budget, so inserts are what is capped.
 			continue
 		}
 
 		m[op] = entry
+		ms.inserts[i]++
 		return // Return as we were successful in adding the entry.
 	}
 
@@ -129,6 +140,7 @@ func (ms *mapSlice) put(op wire.OutPoint, entry *UtxoEntry, totalEntryMemory uin
 	// it.
 	m := ms.makeNewMap(totalEntryMemory)
 	m[op] = entry
+	ms.inserts[len(ms.inserts)-1]++
 }
 
 // delete attempts to delete the given outpoint in all of the maps. No-op if the
@@ -155,7 +167,7 @@ func (ms *mapSlice) remainingMemory(totalEntryMemory uint64) uint64 {
 		if remaining == 0 {
 			break
 		}
-		remaining = subOrZero(remaining, uint64(calculateRoughMapSize(capacity, bucketSize)))
+		remaining = subOrZero(remaining, uint64(grownMapSize(capacity)))
 	}
 	return remaining
 }
@@ -167,21 +179,24 @@ func (ms *mapSlice) remainingMemory(totalEntryMemory uint64) uint64 {
 func (ms *mapSlice) makeNewMap(totalEntryMemory uint64) map[wire.OutPoint]*UtxoEntry {
 	capacity := mapCapacityFor(ms.remainingMemory(totalEntryMemory))
 	ms.maxEntries = append(ms.maxEntries, capacity)
+	ms.inserts = append(ms.inserts, 0)
 	ms.maps = append(ms.maps, make(map[wire.OutPoint]*UtxoEntry, capacity))
 
 	return ms.maps[len(ms.maps)-1]
 }
 
-// deleteMaps deletes all maps except for the first one which should be the biggest.
+// deleteMaps deletes all maps along with any remaining entries; callers must
+// have already persisted anything they need.  The next put lazily creates a
+// fresh map sized to the freed budget.
 //
 // This function is safe for concurrent access.
 func (ms *mapSlice) deleteMaps() {
 	ms.mtx.Lock()
 	defer ms.mtx.Unlock()
 
-	size := ms.maxEntries[0]
-	ms.maxEntries = []int{size}
-	ms.maps = ms.maps[:1]
+	ms.maxEntries = nil
+	ms.inserts = nil
+	ms.maps = nil
 }
 
 const (
@@ -520,6 +535,11 @@ func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOu
 }
 
 // writeCache writes all the entries that are cached in memory to the database atomically.
+//
+// This function MUST be called with the chain state lock held (for writes) or
+// before the chain is shared: the cached maps are iterated and mutated
+// directly without the map slice lock, which is safe only because the chain
+// lock serializes cache writers.
 func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, eraseCache bool) error {
 	// Update commits and flushes the cache to the database.
 	// NOTE: The database has its own cache which gets atomically written
@@ -547,9 +567,11 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, eraseCach
 				}
 			}
 
-			if eraseCache {
-				delete(s.cachedEntries.maps[i], outpoint)
-			} else {
+			// An erasing flush drops the maps whole below, so deleting each
+			// entry would only waste tombstone-creating deletes.  Otherwise
+			// partially-empty maps keep their allocation and entries are
+			// deleted individually.
+			if !eraseCache {
 				if entry == nil {
 					delete(s.cachedEntries.maps[i], outpoint)
 				} else if entry.IsSpent() {
@@ -567,7 +589,7 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, eraseCach
 		s.totalEntryMemory = 0
 	} else {
 		// Non-erasing flush: partially-empty maps retain their allocated
-		// bucket memory.  Compaction is deferred to the next erasing flush
+		// memory.  Compaction is deferred to the next erasing flush
 		// (triggered by FlushRequired or when memory hits the max).
 		if s.totalEntryMemory >= deletedMem {
 			s.totalEntryMemory -= deletedMem
