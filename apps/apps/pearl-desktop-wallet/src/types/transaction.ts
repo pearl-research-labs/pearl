@@ -1,5 +1,6 @@
 export interface Transaction {
   txid: string;
+  vout: number;
   type: 'received' | 'sent';
   amount: number;
   fee: number;

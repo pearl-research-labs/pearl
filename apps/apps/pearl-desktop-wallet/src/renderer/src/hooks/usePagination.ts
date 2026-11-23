@@ -2,7 +2,9 @@ import { useCallback, useEffect, useState } from 'react';
 import { Transaction } from '../../../types/transaction';
 
 // A transaction can list several rows (a payment to several addresses), so match rows already shown by row, not txid.
-const rowKey = (tx: Transaction) => `${tx.type}_${tx.txid}_${tx.address}_${tx.amount}`;
+// The vout is part of the key: one transaction can pay the same address the same amount in two outputs, and those
+// rows differ only in vout — without it the second row is mistaken for a duplicate of the first.
+const rowKey = (tx: Transaction) => `${tx.type}_${tx.txid}_${tx.vout}_${tx.address}_${tx.amount}`;
 
 interface UsePaginationOptions {
   pageSize?: number;
