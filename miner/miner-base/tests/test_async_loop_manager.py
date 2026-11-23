@@ -489,3 +489,41 @@ class TestSubmissionBackpressureAndDrain:
             assert closed.is_set()
         finally:
             stopper.join(timeout=_TIMEOUT_S)
+
+    def test_poll_thread_crash_logs_closes_admission_and_retires_job(
+        self, miner_config, mock_mining_job, monkeypatch
+    ):
+        monkeypatch.setattr("miner_base.async_loop_manager._POLL_INTERVAL_SECONDS", 0.01)
+        client = Mock(spec=MiningClient)
+        client.get_mining_info.return_value = mock_mining_job
+
+        manager = AsyncLoopManager(miner_config, MinerSettings(no_gateway=False))
+        crashed = threading.Event()
+        real_publish = manager._publish_mining_job
+        publish_calls = 0
+
+        def flaky_publish(job):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 2:
+                crashed.set()
+                raise RuntimeError("unexpected publish failure")
+            return real_publish(job)
+
+        monkeypatch.setattr(manager, "_publish_mining_job", flaky_publish)
+
+        with (
+            patch("miner_base.async_loop_manager._make_client", return_value=client),
+            patch("miner_base.async_loop_manager._LOGGER") as logger,
+        ):
+            manager.start()
+            try:
+                assert crashed.wait(timeout=_TIMEOUT_S)
+                assert manager._thread is not None
+                manager._thread.join(timeout=_TIMEOUT_S)
+                assert not manager.started
+                assert manager.get_mining_job() is None
+                assert not manager._accepting_submissions
+                logger.exception.assert_called_with("Async loop manager thread crashed")
+            finally:
+                manager.stop()

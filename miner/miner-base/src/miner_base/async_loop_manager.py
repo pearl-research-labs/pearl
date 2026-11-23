@@ -267,7 +267,8 @@ class AsyncLoopManager:
 
     @property
     def started(self) -> bool:
-        return self._thread is not None
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
     def abort_pending_submissions(self) -> None:
         """Close sockets whose blocking RPC reads could stall shutdown."""
@@ -626,29 +627,38 @@ class AsyncLoopManager:
         return published
 
     def _poll_loop(self, stop_event: threading.Event) -> None:
-        while not stop_event.is_set():
-            client: MiningClient | None = None
-            try:
-                client = self._polling_client(stop_event)
-                if client is None:
-                    return
-                new_job = client.get_mining_info()
-                self._consecutive_job_failures = 0
-            except Exception:
-                if stop_event.is_set():
+        try:
+            while not stop_event.is_set():
+                client: MiningClient | None = None
+                try:
+                    client = self._polling_client(stop_event)
+                    if client is None:
+                        return
+                    new_job = client.get_mining_info()
+                    self._consecutive_job_failures = 0
+                except Exception:
+                    if stop_event.is_set():
+                        if client is not None:
+                            self._discard_client(client)
+                        return
+                    self._consecutive_job_failures += 1
+                    _LOGGER.exception("Failed to get mining info")
                     if client is not None:
                         self._discard_client(client)
-                    return
-                self._consecutive_job_failures += 1
-                _LOGGER.exception("Failed to get mining info")
-                if client is not None:
-                    self._discard_client(client)
-                if (
-                    self.get_mining_job() is not None
-                    and self._consecutive_job_failures >= _MAX_STALE_JOB_POLLS
-                ):
-                    _LOGGER.warning("Retiring a stale mining job after repeated poll failures.")
-                    self._publish_mining_job(None)
-            else:
-                self._publish_mining_job(new_job)
-            stop_event.wait(_POLL_INTERVAL_SECONDS)
+                    if (
+                        self.get_mining_job() is not None
+                        and self._consecutive_job_failures >= _MAX_STALE_JOB_POLLS
+                    ):
+                        _LOGGER.warning("Retiring a stale mining job after repeated poll failures.")
+                        self._publish_mining_job(None)
+                else:
+                    self._publish_mining_job(new_job)
+                stop_event.wait(_POLL_INTERVAL_SECONDS)
+        except Exception:
+            _LOGGER.exception("Async loop manager thread crashed")
+            client = self._detach_polling_client(stopping=True, close_admission=True)
+            if client is not None:
+                with suppress(Exception):
+                    client.close()
+            with suppress(Exception):
+                self._publish_mining_job(None)
