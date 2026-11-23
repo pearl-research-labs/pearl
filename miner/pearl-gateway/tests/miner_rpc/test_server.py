@@ -90,9 +90,7 @@ class TestMinerRpcServerInit:
 
     def test_init_with_tcp_config(self, mock_work_cache, mock_submission_service, tcp_config):
         """Test server initialization with TCP config."""
-        server = MinerRpcServer(
-            mock_work_cache, mock_submission_service, tcp_config, max_pending_submissions=64
-        )
+        server = MinerRpcServer(mock_work_cache, mock_submission_service, tcp_config)
 
         assert server.work_cache == mock_work_cache
         assert server.submission_service == mock_submission_service
@@ -102,9 +100,7 @@ class TestMinerRpcServerInit:
 
     def test_init_with_uds_config(self, mock_work_cache, mock_submission_service, uds_config):
         """Test server initialization with UDS config."""
-        server = MinerRpcServer(
-            mock_work_cache, mock_submission_service, uds_config, max_pending_submissions=64
-        )
+        server = MinerRpcServer(mock_work_cache, mock_submission_service, uds_config)
 
         assert server.work_cache == mock_work_cache
         assert server.submission_service == mock_submission_service
@@ -114,9 +110,7 @@ class TestMinerRpcServerInit:
 
     def test_init_without_auth(self, mock_work_cache, mock_submission_service, no_auth_config):
         """Test server initialization without authentication."""
-        server = MinerRpcServer(
-            mock_work_cache, mock_submission_service, no_auth_config, max_pending_submissions=64
-        )
+        server = MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
 
         assert server.work_cache == mock_work_cache
         assert server.submission_service == mock_submission_service
@@ -130,9 +124,7 @@ class TestMinerRpcServerTransport:
 
     @pytest.fixture
     def server(self, mock_work_cache, mock_submission_service, tcp_config):
-        return MinerRpcServer(
-            mock_work_cache, mock_submission_service, tcp_config, max_pending_submissions=64
-        )
+        return MinerRpcServer(mock_work_cache, mock_submission_service, tcp_config)
 
     @pytest.fixture
     def uds_server(self, mock_work_cache, mock_submission_service):
@@ -140,9 +132,7 @@ class TestMinerRpcServerTransport:
             transport="uds",
             socket_path=tempfile.mktemp(suffix=".sock"),
         )
-        return MinerRpcServer(
-            mock_work_cache, mock_submission_service, config, max_pending_submissions=64
-        )
+        return MinerRpcServer(mock_work_cache, mock_submission_service, config)
 
     async def test_start_stop_tcp(self, server):
         """Test starting and stopping TCP server."""
@@ -185,9 +175,7 @@ class TestMinerRpcServerHandlers:
 
     @pytest.fixture
     def server(self, mock_work_cache, mock_submission_service, no_auth_config):
-        return MinerRpcServer(
-            mock_work_cache, mock_submission_service, no_auth_config, max_pending_submissions=64
-        )
+        return MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
 
     async def test_handle_submit_plain_proof(
         self, server, sample_plain_proof, sample_mining_job, sample_block_template
@@ -268,9 +256,7 @@ class TestMinerRpcServerJsonRpc:
 
     @pytest.fixture
     def server(self, mock_work_cache, mock_submission_service, no_auth_config):
-        return MinerRpcServer(
-            mock_work_cache, mock_submission_service, no_auth_config, max_pending_submissions=64
-        )
+        return MinerRpcServer(mock_work_cache, mock_submission_service, no_auth_config)
 
     @pytest.fixture
     def mock_client(self):
@@ -500,9 +486,7 @@ class TestMinerRpcServerIntegration:
             socket_path="",  # Required field
             port=18445,  # Use different port to avoid conflicts
         )
-        server = MinerRpcServer(
-            mock_work_cache, mock_submission_service, config, max_pending_submissions=64
-        )
+        server = MinerRpcServer(mock_work_cache, mock_submission_service, config)
         await server.start()
         yield server
         await server.stop()

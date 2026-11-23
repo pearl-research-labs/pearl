@@ -2,7 +2,6 @@
 Test submission service functionality.
 """
 
-import asyncio
 import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -124,49 +123,6 @@ class TestBlockSubmission:
             )
 
         assert result["status"] == "error: Connection failed"
-
-    @pytest.mark.asyncio
-    async def test_submit_block_thread_safety(
-        self,
-        submission_service,
-        mock_pearl_client,
-        sample_plain_proof,
-        sample_block_template,
-        sample_pearl_block,
-    ):
-        """Test that block submissions are serialized."""
-        mock_pearl_client.submit_block.return_value = "accepted"
-
-        # Track call order
-        call_order = []
-
-        async def mock_submit_with_delay(block_hex):
-            call_order.append(f"start_{block_hex[:8]}")
-            await asyncio.sleep(0.1)  # Simulate network delay
-            call_order.append(f"end_{block_hex[:8]}")
-            return "accepted"
-
-        mock_pearl_client.submit_block.side_effect = mock_submit_with_delay
-
-        with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.build_block",
-            side_effect=[sample_pearl_block, sample_pearl_block],
-        ):
-            # Submit two blocks concurrently with same template
-            results = await asyncio.gather(
-                submission_service.submit_plain_proof(sample_plain_proof, sample_block_template),
-                submission_service.submit_plain_proof(sample_plain_proof, sample_block_template),
-            )
-
-        # First should be accepted, second should be detected as duplicate
-        statuses = [r["status"] for r in results]
-        assert "accepted" in statuses
-        assert "already_submitted" in statuses
-
-        # Only one actual submission should happen due to deduplication
-        assert len(call_order) == 2
-        assert call_order[0].startswith("start_")
-        assert call_order[1].startswith("end_")
 
 
 class TestCrossoverEnforcement:

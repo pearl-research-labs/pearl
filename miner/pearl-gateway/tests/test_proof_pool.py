@@ -11,6 +11,17 @@ from pearl_gateway.proof_pool import ProofPool
 
 
 @pytest.mark.asyncio
+async def test_start_spawns_the_worker_up_front():
+    pool = ProofPool()
+    await pool.start()
+    try:
+        workers = list(pool._executor._processes.values())
+        assert len(workers) == 1 and workers[0].is_alive()
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
 async def test_stop_kills_a_worker_busy_with_a_proof():
     pool = ProofPool()
     await pool.start()

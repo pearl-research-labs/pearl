@@ -1,4 +1,3 @@
-import asyncio
 from typing import TYPE_CHECKING, Any
 
 from miner_utils import get_logger
@@ -26,7 +25,6 @@ class SubmissionService:
     ):
         self.pearl_client = pearl_client
         self.proof_pool = proof_pool
-        self.submission_lock = asyncio.Lock()  # Ensure serialized submissions
         self.submission_log = set()
         self.debug_mode = debug_mode
         self.submitted_blocks = 0
@@ -50,42 +48,41 @@ class SubmissionService:
         Submit a block built from PlainProof and the current template.
         Returns the result of the submission.
         """
-        async with self.submission_lock:
+        try:
+            if template.header.serialize_without_proof_commitment() in self.submission_log:
+                logger.warning("Block already submitted, skipping")
+                return {"status": "already_submitted"}
+
+            logger.info(
+                f"Received PlainProof submission for template time {template.header.timestamp}"
+            )
+
+            # Reject proofs that cannot be certified at the version the block requires.
             try:
-                if template.header.serialize_without_proof_commitment() in self.submission_log:
-                    logger.warning("Block already submitted, skipping")
-                    return {"status": "already_submitted"}
+                check_cert_version_eligible(template.required_cert_version, plain_proof)
+            except ValueError as e:
+                logger.warning(f"Rejecting proof: {e}")
+                return {"status": f"error: {e}"}
 
-                logger.info(
-                    f"Received PlainProof submission for template time {template.header.timestamp}"
-                )
+            block = await self._build_block(plain_proof, template)
 
-                # Reject proofs that cannot be certified at the version the block requires.
-                try:
-                    check_cert_version_eligible(template.required_cert_version, plain_proof)
-                except ValueError as e:
-                    logger.warning(f"Rejecting proof: {e}")
-                    return {"status": f"error: {e}"}
+            # Submit to the Pearl node
+            self.submitted_blocks += 1
+            result = await self.pearl_client.submit_block(block.serialize().hex())
+            # Update counters based on result
+            if result == "accepted":
+                self.accepted_blocks += 1
+                self.submission_log.add(template.header.serialize_without_proof_commitment())
+                logger.info("Block accepted by node!")
+            else:
+                self.rejected_blocks += 1
+                logger.warning(f"Block rejected: {result}")
 
-                block = await self._build_block(plain_proof, template)
+            # Return result to miner
+            return {"status": result}
 
-                # Submit to the Pearl node
-                self.submitted_blocks += 1
-                result = await self.pearl_client.submit_block(block.serialize().hex())
-                # Update counters based on result
-                if result == "accepted":
-                    self.accepted_blocks += 1
-                    self.submission_log.add(template.header.serialize_without_proof_commitment())
-                    logger.info("Block accepted by node!")
-                else:
-                    self.rejected_blocks += 1
-                    logger.warning(f"Block rejected: {result}")
-
-                # Return result to miner
-                return {"status": result}
-
-            except Exception as e:
-                logger.exception(
-                    f"Error submitting block: {e=}, {type(e)=}, {plain_proof=}, {template=}"
-                )
-                return {"status": f"error: {str(e)}"}
+        except Exception as e:
+            logger.exception(
+                f"Error submitting block: {e=}, {type(e)=}, {plain_proof=}, {template=}"
+            )
+            return {"status": f"error: {str(e)}"}

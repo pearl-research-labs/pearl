@@ -340,7 +340,6 @@ async def performance_server(mock_work_cache, mock_submission_service_fast, perf
         mock_work_cache,
         mock_submission_service_fast,
         performance_config,
-        max_pending_submissions=64,
     )
     await server.start()
     yield server, performance_config

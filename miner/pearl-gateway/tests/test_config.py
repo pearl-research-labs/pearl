@@ -10,7 +10,6 @@ from pearl_gateway.config import (
     MinerRpcConfig,
     PearlConfig,
     PearlGatewayConfig,
-    ProofConfig,
     load_config,
 )
 from pydantic import ValidationError
@@ -80,6 +79,15 @@ class TestMinerRpcConfig:
         assert config.socket_path == "/tmp/pearlgw.sock"
         assert config.port == 8337
         assert config.host == "localhost"
+        assert config.max_pending == 64
+
+    def test_miner_rpc_config_rejects_non_positive_max_pending(self):
+        with pytest.raises(ValidationError, match="max_pending"):
+            MinerRpcConfig(max_pending=0)
+
+    def test_miner_rpc_config_max_pending_env_override(self):
+        with patch.dict(os.environ, {"MINER_RPC_MAX_PENDING": "8"}):
+            assert MinerRpcConfig().max_pending == 8
 
     def test_miner_rpc_config_uds_transport(self):
         """Test MinerRpcConfig with UDS transport."""
@@ -135,28 +143,6 @@ class TestMinerRpcConfig:
             assert config.host == "192.168.1.100"
 
 
-class TestProofConfig:
-    """Test ProofConfig."""
-
-    def test_proof_config_defaults(self):
-        """Test ProofConfig with default values."""
-        config = ProofConfig()
-
-        assert config.max_pending == 64
-
-    def test_proof_config_rejects_non_positive(self):
-        """Test ProofConfig rejects a non-positive in-flight cap."""
-        with pytest.raises(ValidationError, match="max_pending"):
-            ProofConfig(max_pending=0)
-
-    def test_proof_config_env_override(self):
-        """Test ProofConfig with environment variable overrides."""
-        with patch.dict(os.environ, {"GATEWAY_PROOF_MAX_PENDING": "8"}):
-            config = ProofConfig()
-
-            assert config.max_pending == 8
-
-
 class TestLoadConfig:
     """Test load_config function."""
 
@@ -171,12 +157,11 @@ class TestLoadConfig:
         assert isinstance(config, PearlGatewayConfig)
         assert isinstance(config.pearl, PearlConfig)
         assert isinstance(config.miner_rpc, MinerRpcConfig)
-        assert isinstance(config.proof, ProofConfig)
 
         # Verify some defaults
         assert config.pearl.rpc_url == "http://0.0.0.0:44107"
         assert config.miner_rpc.transport == "uds"
-        assert config.proof.max_pending == 64
+        assert config.miner_rpc.max_pending == 64
 
     def test_load_config_with_env_overrides(self, mining_address):
         """Test loading configuration with environment variable overrides."""

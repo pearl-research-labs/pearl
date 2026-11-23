@@ -51,7 +51,6 @@ class MinerRpcServer:
         work_cache: WorkCache,
         submission_service: SubmissionService,
         config: MinerRpcConfig,
-        max_pending_submissions: int,
     ):
         self.work_cache = work_cache
         self.submission_service = submission_service
@@ -63,7 +62,7 @@ class MinerRpcServer:
         # than queued unboundedly while the single proving worker catches up. A deque
         # (not asyncio.Queue) so stale entries can be evicted when it fills.
         self._pending: deque[tuple[PlainProof, MiningJob]] = deque()
-        self._max_pending = max(1, max_pending_submissions)
+        self._max_pending = max(1, config.max_pending)
         self._pending_ready = asyncio.Event()
         self._submission_consumer: asyncio.Task | None = None
 

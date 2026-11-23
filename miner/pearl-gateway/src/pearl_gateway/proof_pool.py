@@ -12,8 +12,6 @@ logger = get_logger(__name__)
 
 
 class ProofPool:
-    """Runs ``proof_worker`` functions in a dedicated worker process."""
-
     def __init__(self) -> None:
         # spawn, not fork: the native prover (Plonky2/rayon) spawns its own
         # threads, and forking a multithreaded process risks deadlock.
@@ -23,6 +21,9 @@ class ProofPool:
 
     async def start(self) -> None:
         self._executor = self._new_executor()
+        # Spawn the worker now: with spawn, interpreter boot plus the native prover
+        # import take seconds, which the first proof would otherwise wait out.
+        await asyncio.get_running_loop().run_in_executor(self._executor, proof_worker.prewarm)
 
     async def stop(self) -> None:
         if self._executor is not None:

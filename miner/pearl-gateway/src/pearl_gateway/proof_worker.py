@@ -14,6 +14,11 @@ from pearl_mining import (
 )
 
 
+def prewarm() -> None:
+    """No-op run at pool start, so the worker spawns and imports the prover then,
+    not on the first proof."""
+
+
 def prove(
     cert_version: int,
     incomplete_header_bytes: bytes,

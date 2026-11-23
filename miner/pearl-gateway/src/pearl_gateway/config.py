@@ -32,6 +32,7 @@ class MinerRpcConfig(BaseSettings):
     - MINER_RPC_SOCKET_PATH
     - MINER_RPC_PORT
     - MINER_RPC_HOST
+    - MINER_RPC_MAX_PENDING
     """
 
     model_config = SettingsConfigDict(env_prefix="MINER_RPC_")
@@ -40,6 +41,8 @@ class MinerRpcConfig(BaseSettings):
     socket_path: str | None = "/tmp/pearlgw.sock"
     port: int | None = 8337
     host: str | None = "localhost"
+    # Max proof submissions queued before new ones are rejected at the RPC boundary.
+    max_pending: int = Field(default=64, ge=1)
 
     def model_post_init(self, __context) -> None:
         """Validate configuration after initialization."""
@@ -47,23 +50,6 @@ class MinerRpcConfig(BaseSettings):
             raise ValueError("TCP transport requires port to be specified")
         elif self.transport == "uds" and not self.socket_path:
             raise ValueError("UDS transport requires socket_path")
-
-
-class ProofConfig(BaseSettings):
-    """ZK proof generation worker configuration.
-
-    Proof generation is CPU-bound and holds the GIL, so it runs in a dedicated
-    worker process off the gateway's event loop.
-
-    Environment variables override defaults:
-    - GATEWAY_PROOF_MAX_PENDING
-    """
-
-    model_config = SettingsConfigDict(env_prefix="GATEWAY_PROOF_")
-
-    # Max proof submissions queued before new ones are rejected (enforced at
-    # the RPC boundary), bounding gateway memory when miners outpace the worker.
-    max_pending: int = Field(default=64, ge=1)
 
 
 class PearlGatewayConfig(BaseModel):
@@ -75,7 +61,6 @@ class PearlGatewayConfig(BaseModel):
 
     pearl: PearlConfig
     miner_rpc: MinerRpcConfig
-    proof: ProofConfig
 
 
 def load_config() -> PearlGatewayConfig:
@@ -91,5 +76,4 @@ def load_config() -> PearlGatewayConfig:
     return PearlGatewayConfig(
         pearl=PearlConfig(),
         miner_rpc=MinerRpcConfig(),
-        proof=ProofConfig(),
     )

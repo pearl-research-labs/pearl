@@ -59,10 +59,7 @@ class PearlGateway:
             self.pearl_client, self.proof_pool, debug_mode=debug_mode
         )
         self.miner_rpc = MinerRpcServer(
-            self.work_cache,
-            self.submission_service,
-            self.config.miner_rpc,
-            max_pending_submissions=self.config.proof.max_pending,
+            self.work_cache, self.submission_service, self.config.miner_rpc
         )
         self.scheduler = TemplateScheduler(self.pearl_client, self.work_cache, self.config.pearl)
 
