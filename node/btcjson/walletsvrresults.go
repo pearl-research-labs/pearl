@@ -182,9 +182,14 @@ func (h *ScanningOrFalse) UnmarshalJSON(data []byte) error {
 	case bool:
 		h.Value = v
 	case map[string]interface{}:
+		duration, ok1 := v["duration"].(float64)
+		progress, ok2 := v["progress"].(float64)
+		if !ok1 || !ok2 {
+			return fmt.Errorf("invalid scanning value: %v", unmarshalled)
+		}
 		h.Value = ScanProgress{
-			Duration: int(v["duration"].(float64)),
-			Progress: v["progress"].(float64),
+			Duration: int(duration),
+			Progress: progress,
 		}
 	default:
 		return fmt.Errorf("invalid scanning value: %v", unmarshalled)
