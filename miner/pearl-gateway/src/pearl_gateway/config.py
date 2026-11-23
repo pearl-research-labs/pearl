@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +32,7 @@ class MinerRpcConfig(BaseSettings):
     - MINER_RPC_SOCKET_PATH
     - MINER_RPC_PORT
     - MINER_RPC_HOST
+    - MINER_RPC_MAX_PENDING
     """
 
     model_config = SettingsConfigDict(env_prefix="MINER_RPC_")
@@ -40,6 +41,8 @@ class MinerRpcConfig(BaseSettings):
     socket_path: str | None = "/tmp/pearlgw.sock"
     port: int | None = 8337
     host: str | None = "localhost"
+    # Max proof submissions queued before new ones are rejected at the RPC boundary.
+    max_pending: int = Field(default=64, ge=1)
 
     def model_post_init(self, __context) -> None:
         """Validate configuration after initialization."""

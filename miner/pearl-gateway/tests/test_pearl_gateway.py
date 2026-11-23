@@ -14,6 +14,7 @@ def mock_pearl_gateway_components():
     with (
         patch("pearl_gateway.pearl_gateway.WorkCache") as mock_work_cache_cls,
         patch("pearl_gateway.pearl_gateway.PearlNodeClient") as mock_pearl_client_cls,
+        patch("pearl_gateway.pearl_gateway.ProofPool") as mock_proof_pool_cls,
         patch("pearl_gateway.pearl_gateway.SubmissionService") as mock_submission_service_cls,
         patch("pearl_gateway.pearl_gateway.MinerRpcServer") as mock_miner_rpc_cls,
         patch("pearl_gateway.pearl_gateway.TemplateScheduler") as mock_scheduler_cls,
@@ -24,6 +25,7 @@ def mock_pearl_gateway_components():
         mock_pearl_client = AsyncMock()
         mock_pearl_client.__aenter__ = AsyncMock(return_value=mock_pearl_client)
         mock_pearl_client.__aexit__ = AsyncMock(return_value=None)
+        mock_proof_pool = AsyncMock()
         mock_submission_service = AsyncMock()
         mock_miner_rpc = AsyncMock()
         mock_scheduler = AsyncMock()
@@ -32,6 +34,7 @@ def mock_pearl_gateway_components():
         # Configure class constructors to return our mocks
         mock_work_cache_cls.return_value = mock_work_cache
         mock_pearl_client_cls.return_value = mock_pearl_client
+        mock_proof_pool_cls.return_value = mock_proof_pool
         mock_submission_service_cls.return_value = mock_submission_service
         mock_miner_rpc_cls.return_value = mock_miner_rpc
         mock_scheduler_cls.return_value = mock_scheduler
@@ -40,6 +43,7 @@ def mock_pearl_gateway_components():
         yield {
             "work_cache": mock_work_cache,
             "pearl_client": mock_pearl_client,
+            "proof_pool": mock_proof_pool,
             "submission_service": mock_submission_service,
             "miner_rpc": mock_miner_rpc,
             "scheduler": mock_scheduler,
@@ -47,6 +51,7 @@ def mock_pearl_gateway_components():
             "classes": {
                 "WorkCache": mock_work_cache_cls,
                 "PearlNodeClient": mock_pearl_client_cls,
+                "ProofPool": mock_proof_pool_cls,
                 "SubmissionService": mock_submission_service_cls,
                 "MinerRpcServer": mock_miner_rpc_cls,
                 "TemplateScheduler": mock_scheduler_cls,
@@ -108,6 +113,7 @@ class TestPearlGateway:
         # Verify components are started in order
         mock_pearl_gateway_components["pearl_client"].__aenter__.assert_called_once()
         mock_pearl_gateway_components["scheduler"].start.assert_called_once()
+        mock_pearl_gateway_components["proof_pool"].start.assert_called_once()
         mock_pearl_gateway_components["miner_rpc"].start.assert_called_once()
 
         # Verify log messages
@@ -143,6 +149,7 @@ class TestPearlGateway:
 
         # Verify components are stopped in reverse order
         mock_pearl_gateway_components["miner_rpc"].stop.assert_called_once()
+        mock_pearl_gateway_components["proof_pool"].stop.assert_called_once()
         mock_pearl_gateway_components["scheduler"].stop.assert_called_once()
         mock_pearl_gateway_components["pearl_client"].__aexit__.assert_called_once_with(
             None, None, None
@@ -235,8 +242,10 @@ class TestPearlGateway:
         # Verify all components were properly managed
         mock_pearl_gateway_components["pearl_client"].__aenter__.assert_called_once()
         mock_pearl_gateway_components["scheduler"].start.assert_called_once()
+        mock_pearl_gateway_components["proof_pool"].start.assert_called_once()
         mock_pearl_gateway_components["miner_rpc"].start.assert_called_once()
 
         mock_pearl_gateway_components["miner_rpc"].stop.assert_called_once()
+        mock_pearl_gateway_components["proof_pool"].stop.assert_called_once()
         mock_pearl_gateway_components["scheduler"].stop.assert_called_once()
         mock_pearl_gateway_components["pearl_client"].__aexit__.assert_called_once()

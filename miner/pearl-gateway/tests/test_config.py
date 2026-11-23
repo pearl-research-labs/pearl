@@ -79,6 +79,15 @@ class TestMinerRpcConfig:
         assert config.socket_path == "/tmp/pearlgw.sock"
         assert config.port == 8337
         assert config.host == "localhost"
+        assert config.max_pending == 64
+
+    def test_miner_rpc_config_rejects_non_positive_max_pending(self):
+        with pytest.raises(ValidationError, match="max_pending"):
+            MinerRpcConfig(max_pending=0)
+
+    def test_miner_rpc_config_max_pending_env_override(self):
+        with patch.dict(os.environ, {"MINER_RPC_MAX_PENDING": "8"}):
+            assert MinerRpcConfig().max_pending == 8
 
     def test_miner_rpc_config_uds_transport(self):
         """Test MinerRpcConfig with UDS transport."""
@@ -152,6 +161,7 @@ class TestLoadConfig:
         # Verify some defaults
         assert config.pearl.rpc_url == "http://0.0.0.0:44107"
         assert config.miner_rpc.transport == "uds"
+        assert config.miner_rpc.max_pending == 64
 
     def test_load_config_with_env_overrides(self, mining_address):
         """Test loading configuration with environment variable overrides."""

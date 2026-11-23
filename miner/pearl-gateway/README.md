@@ -48,6 +48,7 @@ sequenceDiagram
     participant Miner
     participant AsyncLoopManager
     participant Gateway
+    participant ProofPool
     participant ProofGenerator
     participant PearlNode
 
@@ -55,9 +56,16 @@ sequenceDiagram
     AsyncLoopManager->>AsyncLoopManager: secondary_testing (uses noised)
     AsyncLoopManager->>AsyncLoopManager: create_proof (uses non-noised A, B)
     AsyncLoopManager->>Gateway: submitPlainProof(base64_string)
-    Gateway->>ProofGenerator: generate_block(PlainProof)
-    ProofGenerator->>PearlNode: submit block
+    Gateway->>ProofPool: prove(cert_version, header, plain_proof) [worker process]
+    ProofPool-->>Gateway: (public_data, proof_data)
+    Gateway->>ProofGenerator: build_block(public_data, proof_data, template)
+    ProofGenerator-->>Gateway: PearlBlock
+    Gateway->>PearlNode: submit block
 ```
+
+ZK proof generation is CPU-bound and holds the GIL, so it runs in a separate
+worker process (the `ProofPool`) rather than on the gateway's event loop; the
+loop assembles and submits the block from the returned proof bytes.
 
 
 ### Installation
@@ -94,6 +102,9 @@ All configuration can be set via environment variables:
 - `MINER_RPC_SOCKET_PATH` - Unix socket path (default: `/tmp/pearlgw.sock`)
 - `MINER_RPC_PORT` - TCP port for miners (default: `8337`)
 - `MINER_RPC_HOST` - TCP host (default: `localhost`)
+- `MINER_RPC_MAX_PENDING` - Max proof submissions queued before new ones are
+  rejected (positive integer, default: `64`). Bounds gateway memory when miners
+  outpace the worker.
 
 **Logging:**
 - `LOGGING_LEVEL` - Log level: `debug`, `info`, `warning`, `error` (default: `info`)

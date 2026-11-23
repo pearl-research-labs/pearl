@@ -336,7 +336,11 @@ def mock_submission_service_fast():
 @pytest.fixture
 async def performance_server(mock_work_cache, mock_submission_service_fast, performance_config):
     """Server instance optimized for performance testing."""
-    server = MinerRpcServer(mock_work_cache, mock_submission_service_fast, performance_config)
+    server = MinerRpcServer(
+        mock_work_cache,
+        mock_submission_service_fast,
+        performance_config,
+    )
     await server.start()
     yield server, performance_config
     await server.stop()
