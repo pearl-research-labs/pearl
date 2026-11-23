@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { Copy, CheckCircle2, ArrowUpRight, ArrowDownLeft, Lock, Key, Loader2 } from 'lucide-react';
+import { Copy, CheckCircle2, ArrowUpRight, ArrowDownLeft, Lock, Key, PenLine, Loader2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useWalletStore } from '../store/walletStore';
 import { formatPearlAmount } from '../lib/crypto';
@@ -164,7 +164,7 @@ export default function WalletDashboard() {
               'The wallet is scanning blocks for your transactions and can\u2019t send, receive, or change the password right now. This should finish in less than a minute.';
             return (
               <TooltipProvider delayDuration={200}>
-                <div className="grid w-full grid-cols-2 gap-3 sm:gap-4">
+                <div className="grid w-full grid-cols-3 gap-3 sm:gap-4">
                   <ActionTile
                     onClick={() => navigate('/send')}
                     icon={<ArrowUpRight className="h-4 w-4 text-white sm:h-5 sm:w-5" />}
@@ -187,6 +187,12 @@ export default function WalletDashboard() {
                     label="Password"
                     disabled={actionsBlocked}
                     disabledTooltip={blockedTooltip}
+                  />
+
+                  <ActionTile
+                    onClick={() => navigate('/sign-message')}
+                    icon={<PenLine className="h-4 w-4 text-white sm:h-5 sm:w-5" />}
+                    label="Sign"
                   />
 
                   <ActionTile
