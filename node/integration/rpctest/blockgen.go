@@ -17,12 +17,6 @@ import (
 	"github.com/pearl-research-labs/pearl/node/wire"
 )
 
-// solveBlock generates a certificate for the given block header using the
-// height-aware SolveBlock which selects the correct certificate version.
-func solveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32) (wire.BlockCertificate, error) {
-	return blockchain.SolveBlock(header, params, height)
-}
-
 // standardCoinbaseScript returns a standard script suitable for use as the
 // signature script of the coinbase transaction of a new block. In particular,
 // it starts with the block height that is required by version 2 blocks.
@@ -76,6 +70,7 @@ func CreateBlock(prevBlock *btcutil.Block, inclusionTxs []*btcutil.Tx,
 
 	var (
 		prevHash      *chainhash.Hash
+		prevHeader    *wire.BlockHeader
 		blockHeight   int32
 		prevBlockTime time.Time
 	)
@@ -84,10 +79,12 @@ func CreateBlock(prevBlock *btcutil.Block, inclusionTxs []*btcutil.Tx,
 	// that builds off of the genesis block for the chain.
 	if prevBlock == nil {
 		prevHash = net.GenesisHash
+		prevHeader = net.GenesisBlock.BlockHeader()
 		blockHeight = 1
 		prevBlockTime = net.GenesisBlock.BlockHeader().Timestamp.Add(time.Minute)
 	} else {
 		prevHash = prevBlock.Hash()
+		prevHeader = prevBlock.MsgBlock().BlockHeader()
 		blockHeight = prevBlock.Height() + 1
 		prevBlockTime = prevBlock.MsgBlock().BlockHeader().Timestamp
 	}
@@ -149,7 +146,7 @@ func CreateBlock(prevBlock *btcutil.Block, inclusionTxs []*btcutil.Tx,
 		}
 	}
 
-	cert, solveErr := solveBlock(block.BlockHeader(), net, blockHeight)
+	cert, solveErr := blockchain.SolveBlock(block.BlockHeader(), prevHeader, net, blockHeight)
 	if solveErr != nil {
 		return nil, fmt.Errorf("unable to solve block: %w", solveErr)
 	}

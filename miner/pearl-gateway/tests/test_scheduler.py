@@ -2,7 +2,7 @@
 Test template scheduler functionality.
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from pearl_gateway.config import PearlConfig
@@ -22,7 +22,6 @@ def mock_work_cache():
     """Create a mock WorkCache."""
     cache = AsyncMock()
     cache.update_template = AsyncMock(return_value=True)
-    cache.invalidate = AsyncMock()
     return cache
 
 
@@ -102,11 +101,9 @@ class TestTemplateRefresh:
         mock_pearl_client.get_block_template.return_value = sample_block_template
         mock_work_cache.update_template.return_value = True
 
-        with patch("time.time", return_value=1000.0):
-            result = await scheduler.refresh_template()
+        result = await scheduler.refresh_template()
 
         assert result is True
-        assert scheduler.last_refresh_time == 1000.0
         mock_pearl_client.get_block_template.assert_called_once()
         mock_work_cache.update_template.assert_called_once_with(sample_block_template)
 
@@ -319,15 +316,3 @@ class TestSchedulerIntegration:
 
         assert result is True
         assert mock_pearl_client.get_block_template.call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_scheduler_metrics_tracking(
-        self, scheduler, mock_pearl_client, mock_work_cache, sample_block_template
-    ):
-        """Test that scheduler tracks refresh metrics."""
-        mock_pearl_client.get_block_template.return_value = sample_block_template
-
-        with patch("time.time", return_value=1234.5):
-            await scheduler.refresh_template()
-
-        assert scheduler.last_refresh_time == 1234.5

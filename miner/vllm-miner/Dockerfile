@@ -1,8 +1,14 @@
 # Version pins for reproducible builds (override with docker build --build-arg)
-# CUDA 13.0 user-space + PyTorch cu130 + vLLM 0.20.2 (see miner/vllm-miner/pyproject.toml).
+# CUDA 13.0 user-space + PyTorch cu130 (see miner/vllm-miner/pyproject.toml).
 ARG CUDA_VERSION=13.0.3
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS builder
+
+# libatomic1: gcc's atomics runtime; pearl_gemm's HitSignal binds it for the
+# doorbell's native acquire load (see pow/_hit_signal.py).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates git libatomic1 && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install uv
 COPY --from=docker.io/astral/uv:latest /uv /usr/local/bin/uv
@@ -29,13 +35,13 @@ WORKDIR /app
 
 # Copy all pyproject.toml and uv.lock files first for better layer caching
 COPY pyproject.toml uv.lock ./
-COPY miner/pearl-gemm/pyproject.toml miner/pearl-gemm/setup.py ./miner/pearl-gemm/
-COPY miner/pearl-gemm-build-utils/pyproject.toml ./miner/pearl-gemm-build-utils/
+COPY miner/pearl-gemm/pyproject.toml ./miner/pearl-gemm/
 COPY py-pearl-mining/pyproject.toml py-pearl-mining/Cargo.toml ./py-pearl-mining/
 COPY miner/vllm-miner/pyproject.toml ./miner/vllm-miner/
 COPY miner/miner-utils/pyproject.toml ./miner/miner-utils/
 COPY miner/miner-base/pyproject.toml ./miner/miner-base/
 COPY miner/pearl-gateway/pyproject.toml ./miner/pearl-gateway/
+COPY pearl-blake3/ ./pearl-blake3/
 
 # Sync remote packages ONLY (mainly download torch and vLLM)
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -43,34 +49,31 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/git \
     uv sync --package vllm-miner --no-editable --no-dev --no-install-workspace
 
-# Copy kernel source code and its build-time workspace dependency
+# Copy kernel source (CuTe DSL JIT-compiles at runtime; no C++ build)
 COPY miner/pearl-gemm/ ./miner/pearl-gemm/
-COPY miner/pearl-gemm-build-utils/ ./miner/pearl-gemm-build-utils/
-
-# Build CUDA kernels (pearl-gemm)
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    uv sync --package pearl-gemm --no-editable --no-dev
 
 # Copy the rest of the source code
 COPY miner/miner-utils/ ./miner/miner-utils/
 COPY miner/miner-base/ ./miner/miner-base/
 COPY miner/pearl-gateway/ ./miner/pearl-gateway/
 COPY miner/vllm-miner/src ./miner/vllm-miner/src
-COPY pearl-blake3/ ./pearl-blake3/
+COPY miner/vllm-miner/README.md ./miner/vllm-miner/
 COPY py-pearl-mining/ ./py-pearl-mining/
 COPY zk-pow/ ./zk-pow/
 COPY plonky2/ ./plonky2/
 
-# Install vllm-miner and remaining workspace dependencies (pearl-gateway, py-pearl-mining, etc.)
-# Also keep pearl-gemm in the sync so it isn't removed from the environment
+# Install vllm-miner and remaining workspace dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    uv sync --package vllm-miner --no-install-package pearl-gemm --no-editable --no-dev --inexact
+    uv sync --package vllm-miner --no-editable --no-dev --inexact
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
+
+# Runtime needs libatomic1 for the HitSignal doorbell (same as the builder).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libatomic1 && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

@@ -1,8 +1,7 @@
 import base64
-from dataclasses import dataclass
-from typing import Any, ClassVar
+from dataclasses import dataclass, field
+from typing import Any
 
-import torch
 from bitcoinutils.transactions import Transaction
 from pearl_gateway.blockchain_utils.blockchain_utils import (
     bits_to_target,
@@ -11,21 +10,11 @@ from pearl_gateway.blockchain_utils.blockchain_utils import (
 )
 from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
-from pearl_gateway.comm.mining_configuration import (
-    MiningConfiguration,
-    MoEConfig,
-    PearlMiningConfigurationFactory,
-)
-from pearl_gateway.rpc_types import (
-    GetBlockTemplateResponse,
-)
-from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
+from pearl_gateway.rpc_types import GetBlockTemplateResponse
+from pearl_mining import IncompleteBlockHeader
 
-
-def get_bytes(data: str | bytes) -> bytes:
-    if isinstance(data, str):
-        return bytes.fromhex(data)
-    return data
+# Matches zk-pow's STATE_WINDOW_DEPTH: the proposed header is excluded.
+STATE_WINDOW_DEPTH = 4
 
 
 def b64_encode(data: bytes) -> str:
@@ -36,70 +25,61 @@ def b64_decode(data: str) -> bytes:
     return base64.b64decode(data.encode("ascii"))
 
 
-def decode_dtype(encoded_dtype: str) -> torch.dtype:
-    # dtype is serialized as "torch.dtype"
-    return getattr(torch, encoded_dtype.replace("torch.", ""))
-
-
 @dataclass
 class BlockTemplate:
-    """Represents a block template fetched from the Pearl node."""
+    """Block template fetched from the Pearl node."""
 
     header: PearlHeader
     height: int
     raw_transactions: list[bytes]
     coinbase_tx: Transaction
-    # Certificate version this block must carry under the crossover cutover.
     required_cert_version: CertificateVersion
+    ancestor_headers: list[bytes] = field(default_factory=list)
 
     @classmethod
     def from_get_block_template(
         cls, data: GetBlockTemplateResponse, mining_address: str
     ) -> "BlockTemplate":
-        previousblockhash = data.previousblockhash
-        version = data.version
-        bits = data.bits
-        curtime = data.curtime
-
         coinbase_tx = create_coinbase_transaction(
             height=data.height,
             coinbase_value=data.coinbasevalue,
             mining_address=mining_address,
-            coinbase_aux=data.coinbaseaux.model_dump(),
+            coinbase_aux=data.coinbaseaux.model_dump() if data.coinbaseaux else None,
             default_witness_commitment=data.default_witness_commitment,
         )
         raw_transactions = [bytes.fromhex(tx.data) for tx in data.transactions]
         txids = [tx.txid for tx in data.transactions]
+        merkle_root = calculate_merkle_root([coinbase_tx.get_txid(), *txids])
 
-        coinbase_txid = coinbase_tx.get_txid()
-        merkle_root = calculate_merkle_root([coinbase_txid] + txids)
-        height = data.height
-
-        bits_translation = bits_to_target(int(bits, 16))
+        bits_int = int(data.bits, 16)
+        bits_translation = bits_to_target(bits_int)
         if int(data.target, 16) != bits_translation:
             raise ValueError(f"target and bits must match: {data.target} != {bits_translation}")
+
+        ancestor_headers = [bytes.fromhex(header) for header in data.ancestorheaders]
+        if any(len(h) != PearlHeader.get_serialized_header_size() for h in ancestor_headers):
+            raise ValueError("ancestor headers must be full 108-byte wire headers")
 
         return cls(
             header=PearlHeader(
                 incomplete_header=IncompleteBlockHeader(
-                    version=version,
-                    prev_block=bytes.fromhex(previousblockhash),
+                    version=data.version,
+                    prev_block=bytes.fromhex(data.previousblockhash),
                     merkle_root=merkle_root,
-                    timestamp=curtime,
-                    nbits=int(bits, 16),
+                    timestamp=data.curtime,
+                    nbits=bits_int,
                 ),
             ),
-            height=height,
+            height=data.height,
             raw_transactions=raw_transactions,
             coinbase_tx=coinbase_tx,
             required_cert_version=CertificateVersion(data.requiredcertversion),
+            ancestor_headers=ancestor_headers,
         )
 
     def get_raw_transactions(self) -> list[bytes]:
-        """Return all transactions as raw bytes, coinbase first."""
-        # Safe to use to_bytes() here: the coinbase is constructed by us.
         coinbase_bytes = self.coinbase_tx.to_bytes(self.coinbase_tx.has_segwit)
-        return [coinbase_bytes] + self.raw_transactions
+        return [coinbase_bytes, *self.raw_transactions]
 
     @property
     def bits(self) -> int:
@@ -111,123 +91,57 @@ class BlockTemplate:
 
 
 @dataclass
-class CommitmentHash:
-    noise_seed_A: bytes
-    noise_seed_B: bytes
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "noise_seed_A": b64_encode(self.noise_seed_A),
-            "noise_seed_B": b64_encode(self.noise_seed_B),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CommitmentHash":
-        return cls(
-            noise_seed_A=b64_decode(data["noise_seed_A"]),
-            noise_seed_B=b64_decode(data["noise_seed_B"]),
-        )
-
-
-@dataclass
-class MoEBlockInfo:
-    """MoE-specific data for block submission"""
-
-    expert_index: int
-    num_experts: int
-    n_per_expert: int
-    top_k: int
-    inner_a_rows: list[int]
-    inner_b_cols: list[int]
-    routing_data: torch.Tensor  # (m*top_k,) int32, expert-sorted token indices
-    expert_routing_offsets: list[int]  # routing exclusive end offsets as per ZK verifier
-
-
-@dataclass
-class OpenedBlockInfo:
-    A_row_indices: list[int]
-    B_column_indices: list[int]
-    A: torch.Tensor | None  # Non-noised matrix A, for PlainProof creation
-    B_t: torch.Tensor | None  # Non-noised matrix B transposed, for PlainProof creation
-    commitment_hash: CommitmentHash | None
-    noise_rank: int
-    moe: MoEBlockInfo | None = None
-    noise_range: ClassVar[int] = 128
-
-    def get_mining_config(self) -> MiningConfiguration:
-        if self.A is None or self.B_t is None:
-            raise ValueError("A and B must be provided")
-        if self.moe is not None:
-            return PearlMiningConfigurationFactory.create(
-                common_dim=self.A.shape[1],
-                rank=self.noise_rank,
-                row_indices=self.moe.inner_a_rows,
-                col_indices=self.moe.inner_b_cols,
-                moe=MoEConfig(e=self.moe.num_experts, top_k=self.moe.top_k),
-            )
-        return PearlMiningConfigurationFactory.create(
-            common_dim=self.A.shape[1],
-            rank=self.noise_rank,
-            row_indices=self.A_row_indices,
-            col_indices=self.B_column_indices,
-        )
-
-
-@dataclass
 class MiningJob:
     """Work unit provided to miners."""
 
     incomplete_header_bytes: bytes
     target: int
-    # Certificate version required for this block.
     cert_version: CertificateVersion
+    ancestor_headers: list[bytes] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for JSON-RPC response."""
         return {
             "incomplete_header_bytes": b64_encode(self.incomplete_header_bytes),
             "target": self.target,
             "cert_version": int(self.cert_version),
+            "ancestor_headers": [b64_encode(header) for header in self.ancestor_headers],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MiningJob":
-        """Create MiningJob from dictionary (JSON-RPC deserialization)."""
-
         return cls(
             incomplete_header_bytes=b64_decode(data["incomplete_header_bytes"]),
             target=data["target"],
             cert_version=CertificateVersion(data["cert_version"]),
+            ancestor_headers=[b64_decode(header) for header in data.get("ancestor_headers", [])],
         )
 
     @classmethod
     def from_template(cls, template: BlockTemplate) -> "MiningJob":
-        """Create MiningJob from BlockTemplate."""
         return cls(
             incomplete_header_bytes=template.header.serialize_without_proof_commitment(),
             target=template.target,
             cert_version=template.required_cert_version,
+            ancestor_headers=list(template.ancestor_headers),
         )
 
-    def adjust_target(self, mining_config: MiningConfiguration) -> int:
-        """Calculate the rank-penalized PoW target for the mining job."""
-        if mining_config.rank < PENALTY_BASE_RANK:
-            raise ValueError(
-                f"noise rank {mining_config.rank} is below the minimum "
-                f"{PENALTY_BASE_RANK}; blocks would be rejected by consensus"
-            )
-        bound = penalized_target_bound(self.target, mining_config)
-        if bound is None:
-            raise ValueError(
-                f"no penalized target for {self.target=} at rank "
-                f"{mining_config.rank}: degenerate config or target too easy"
-            )
-        return bound
+    @property
+    def parent_header(self) -> bytes:
+        if not self.ancestor_headers:
+            raise ValueError("mining job carries no ancestor headers to key B by")
+        return self.ancestor_headers[0]
+
+    def keeps_ancestor(self, ancestor: bytes) -> bool:
+        return ancestor in self.ancestor_headers[:STATE_WINDOW_DEPTH]
+
+    def ancestor_chain_to(self, ancestor: bytes) -> list[bytes]:
+        window = self.ancestor_headers[:STATE_WINDOW_DEPTH]
+        if ancestor not in window:
+            raise ValueError("ancestor header is outside this job's state window")
+        return window[: window.index(ancestor)]
 
 
 class MiningPausedError(Exception):
-    """Exception raised when mining should be paused."""
-
     code = -32001
     message = "mining_paused"
 

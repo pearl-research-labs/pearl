@@ -10,11 +10,11 @@ import asyncio
 import contextlib
 import json
 import os
+import statistics
 import tempfile
 import time
 from unittest.mock import AsyncMock
 
-import numpy as np
 import pytest
 from bitcoinutils.transactions import Transaction
 from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
@@ -141,21 +141,24 @@ class PerformanceMetrics:
         duration = self.end_time - self.start_time
         return self.total_requests / duration if duration > 0 else 0.0
 
+    def _percentile(self, p: float) -> float:
+        if not self.response_times:
+            return 0.0
+        ordered = sorted(self.response_times)
+        idx = min(len(ordered) - 1, int(round((p / 100.0) * (len(ordered) - 1))))
+        return ordered[idx]
+
     @property
     def avg_response_time(self) -> float:
-        return np.mean(self.response_times) if self.response_times else 0.0
+        return statistics.mean(self.response_times) if self.response_times else 0.0
 
     @property
     def p95_response_time(self) -> float:
-        if not self.response_times:
-            return 0.0
-        return np.percentile(self.response_times, 95)
+        return self._percentile(95)
 
     @property
     def p99_response_time(self) -> float:
-        if not self.response_times:
-            return 0.0
-        return np.percentile(self.response_times, 99)
+        return self._percentile(99)
 
 
 class RawJsonRpcClient:
@@ -177,7 +180,7 @@ class RawJsonRpcClient:
 
         # Pre-prepared requests
         self._get_mining_info_request = (
-            json.dumps({"jsonrpc": "2.0", "method": "getMiningInfo", "params": [], "id": 1}) + "\n"
+            json.dumps({"jsonrpc": "2.0", "method": "getMiningInfo", "params": {}, "id": 1}) + "\n"
         )
 
         sample_plain_proof = _create_sample_plain_proof_for_performance()

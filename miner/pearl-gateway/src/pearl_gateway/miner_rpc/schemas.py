@@ -39,6 +39,10 @@ SUBMIT_PLAIN_PROOF_SCHEMA = {
                 "incomplete_header_bytes": {"type": "string", "pattern": BASE64_PATTERN},
                 "target": {"type": "integer", "minimum": 0},
                 "cert_version": {"type": "integer", "minimum": 1},
+                "ancestor_headers": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": BASE64_PATTERN},
+                },
             },
         },
     },

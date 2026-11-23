@@ -3,7 +3,7 @@
 ## Getting Started
 
 1. Clone the repository
-2. Install prerequisites: Go 1.26+, Rust toolchain, C compiler, Python 3.12, [uv](https://docs.astral.sh/uv/), [Task](https://taskfile.dev), CUDA toolkit (for vLLM miner)
+2. Install prerequisites: Go 1.26+, Rust toolchain, C compiler, Python 3.12, [uv](https://docs.astral.sh/uv/), [Task](https://taskfile.dev), CUDA 13 toolkit and an SM100 (B200) GPU (for the vLLM miner and `miner/pearl-gemm`)
 3. Build: `task build`
 4. Test: `task test`
 
@@ -11,7 +11,7 @@ You can also build or test specific components:
 
 ```
 task build:blockchain   # pearld, prlctl, oyster
-task build:miner        # vLLM miner Python packages
+task build:miner        # Python miner packages (pearl-gateway, miner-base, vLLM miner, pearl_gemm)
 task test:go            # Go tests only
 task test:python        # full Python test suite
 task test:python:basic  # Python tests (excludes integration/perf/slow)

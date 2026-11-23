@@ -48,6 +48,7 @@ fn get_challenges<F, C, S: Stark<F, D>, const D: usize>(
     commit_phase_merkle_caps: &[MerkleCap<F, C::Hasher>],
     final_poly: &PolynomialCoeffs<F::Extension>,
     pow_witness: F,
+    batching_pow_witness: Option<F>,
     config: &StarkConfig,
     degree_bits: usize,
     verifier_circuit_fri_params: Option<FriParams>,
@@ -196,6 +197,7 @@ where
             commit_phase_merkle_caps,
             final_poly,
             pow_witness,
+            batching_pow_witness,
             degree_bits,
             &config.fri_config,
             final_poly_coeff_len,
@@ -205,7 +207,7 @@ where
 }
 
 /// Simulate the trace, ctl, and auxiliary polynomials using dummy values. This is used to bind the constraints before committing to the quotient polynomial.
-fn get_dummy_polys<F, C, const D: usize>(
+pub(crate) fn get_dummy_polys<F, C, const D: usize>(
     challenger: &mut Challenger<F, C::Hasher>,
     num_trace_polys: usize,
     num_aux_polys: usize,
@@ -297,6 +299,7 @@ where
                     commit_phase_merkle_caps,
                     final_poly,
                     pow_witness,
+                    batching_pow_witness,
                     ..
                 },
         } = &self;
@@ -321,6 +324,7 @@ where
             commit_phase_merkle_caps,
             final_poly,
             *pow_witness,
+            *batching_pow_witness,
             config,
             degree_bits,
             verifier_circuit_fri_params,
@@ -383,6 +387,7 @@ fn get_challenges_target<F, C, S: Stark<F, D>, const D: usize>(
     commit_phase_merkle_caps: &[MerkleCapTarget],
     final_poly: &PolynomialCoeffsExtTarget<D>,
     pow_witness: Target,
+    batching_pow_witness: Option<Target>,
     degree_bits: usize,
     degree_bits_target: Target,
     config: &StarkConfig,
@@ -506,7 +511,8 @@ where
 
     let stark_zeta = challenger.get_extension_challenge(builder);
 
-    challenger.observe_openings(&openings.to_fri_openings());
+    let zero = builder.zero();
+    challenger.observe_openings(&openings.to_fri_openings(zero));
 
     StarkProofChallengesTarget {
         lookup_challenge_set,
@@ -517,13 +523,14 @@ where
             commit_phase_merkle_caps,
             final_poly,
             pow_witness,
+            batching_pow_witness,
             &config.fri_config,
         ),
     }
 }
 
 // Simulate the trace, ctl, and auxiliary polynomials using dummy values. This is used to bind the constraints before committing to the quotient polynomial.
-fn get_dummy_polys_circuit<F, C, const D: usize>(
+pub(crate) fn get_dummy_polys_circuit<F, C, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     challenger: &mut RecursiveChallenger<F, C::Hasher, D>,
     num_trace_polys: usize,
@@ -623,6 +630,7 @@ impl<const D: usize> StarkProofTarget<D> {
                     commit_phase_merkle_caps,
                     final_poly,
                     pow_witness,
+                    batching_pow_witness,
                     ..
                 },
             ..
@@ -649,6 +657,7 @@ impl<const D: usize> StarkProofTarget<D> {
             commit_phase_merkle_caps,
             final_poly,
             *pow_witness,
+            *batching_pow_witness,
             degree_bits,
             self.degree_bits,
             config,

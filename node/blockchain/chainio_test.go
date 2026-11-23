@@ -60,7 +60,7 @@ func TestDbFetchCertificate(t *testing.T) {
 
 	maxCert := &wire.CertificateV2{
 		PublicDataLen: wire.PublicDataMaxSizeV2,
-		ProofData:     bytes.Repeat([]byte{0x0a}, wire.MaxZKProofSize),
+		ProofData:     bytes.Repeat([]byte{0x0a}, 60000), // Legacy proof limit.
 	}
 
 	padTx := wire.NewMsgTx(1)

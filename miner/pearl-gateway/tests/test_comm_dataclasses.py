@@ -6,8 +6,6 @@ from pearl_gateway.comm.dataclasses import (
     b64_decode,
     b64_encode,
 )
-from pearl_gateway.comm.mining_configuration import PearlMiningConfigurationFactory
-from pearl_mining import PENALTY_BASE_RANK
 from pydantic import ValidationError
 
 
@@ -21,7 +19,7 @@ class TestMiningJob:
         result = job.to_dict()
         expected_header_bytes = sample_block_template.header.serialize_without_proof_commitment()
 
-        expected_keys = {"incomplete_header_bytes", "target", "cert_version"}
+        expected_keys = {"incomplete_header_bytes", "target", "cert_version", "ancestor_headers"}
         assert set(result.keys()) == expected_keys
 
         assert b64_decode(result["incomplete_header_bytes"]) == expected_header_bytes
@@ -72,72 +70,43 @@ class TestMiningJob:
         assert job.target == sample_block_template.target
         assert job.cert_version == sample_block_template.required_cert_version
 
+    def test_mining_job_carries_the_template_ancestors(
+        self, sample_block_template_data, mining_address
+    ):
+        """The node's state-window headers reach the miner unchanged, parent first."""
+        from pearl_gateway.rpc_types import GetBlockTemplateResponse
 
-class TestAdjustTarget:
-    """The rank penalty applied when turning a block target into a mining target."""
-
-    ROW_INDICES = [0, 8, 64, 72]
-    COL_INDICES = [0, 1, 8, 9, 32, 33, 40, 41]
-    BLOCK_TARGET = 2**64
-    # Valid for every rank exercised here: 16 * rank <= COMMON_DIM <= 4 * rank**2.
-    COMMON_DIM = 8192
-
-    def _mining_config(self, rank: int):
-        return PearlMiningConfigurationFactory.create(
-            common_dim=self.COMMON_DIM,
-            rank=rank,
-            row_indices=self.ROW_INDICES,
-            col_indices=self.COL_INDICES,
+        ancestors = [bytes([i]) * 108 for i in range(1, 5)]
+        data = {
+            **sample_block_template_data,
+            "requiredcertversion": int(CertificateVersion.PLAIN_FP8),
+            "ancestorheaders": [header.hex() for header in ancestors],
+        }
+        template = BlockTemplate.from_get_block_template(
+            GetBlockTemplateResponse.model_validate(data), mining_address=mining_address
         )
+        assert template.ancestor_headers == ancestors
 
-    def _mining_job(self, target: int) -> MiningJob:
-        return MiningJob(
-            incomplete_header_bytes=b"",
-            target=target,
-            cert_version=CertificateVersion.ZK_MOE,
-        )
+        job = MiningJob.from_dict(MiningJob.from_template(template).to_dict())
+        assert job.ancestor_headers == ancestors
+        assert job.parent_header == ancestors[0]
 
-    def _adjusted_target(self, rank: int) -> int:
-        return self._mining_job(self.BLOCK_TARGET).adjust_target(self._mining_config(rank))
+        data["ancestorheaders"] = [bytes(76).hex()]
+        with pytest.raises(ValueError, match="108-byte"):
+            BlockTemplate.from_get_block_template(
+                GetBlockTemplateResponse.model_validate(data), mining_address=mining_address
+            )
 
-    def test_base_rank_is_unpenalized(self):
-        """A miner at the base rank searches the plain hash-tile-scaled target."""
-        config = self._mining_config(PENALTY_BASE_RANK)
-        expected = (
-            self.BLOCK_TARGET * config.hash_tile_h * config.hash_tile_w * config.rounded_common_dim
-        )
-        assert self._adjusted_target(PENALTY_BASE_RANK) == expected
-
-    def test_larger_rank_gets_a_proportionally_smaller_target(self):
-        """Doubling the rank halves the target, cancelling the nesting advantage."""
-        base = self._adjusted_target(PENALTY_BASE_RANK)
-        for multiple in (2, 4):
-            adjusted = self._adjusted_target(PENALTY_BASE_RANK * multiple)
-            assert adjusted == base // multiple
-
-    def test_rank_below_base_is_rejected(self):
-        with pytest.raises(ValueError, match="below the minimum"):
-            self._adjusted_target(PENALTY_BASE_RANK // 2)
-
-    def test_degenerate_config_is_rejected(self):
-        """A config whose common_dim is below the rank yields a zero adjustment
-        factor; adjust_target must surface that as a ValueError rather than
-        returning a zero bound."""
-        config = PearlMiningConfigurationFactory.create(
-            common_dim=PENALTY_BASE_RANK // 2,
-            rank=PENALTY_BASE_RANK,
-            row_indices=self.ROW_INDICES,
-            col_indices=self.COL_INDICES,
-        )
-        with pytest.raises(ValueError, match="degenerate"):
-            self._mining_job(self.BLOCK_TARGET).adjust_target(config)
-
-    def test_target_too_easy_is_rejected(self):
-        """A target whose penalized bound exceeds 256 bits must raise. Clamping it
-        to the maximum target would have the miner search a target every hash
-        satisfies."""
-        with pytest.raises(ValueError, match="too easy"):
-            self._mining_job(2**240).adjust_target(self._mining_config(PENALTY_BASE_RANK))
+    def test_ancestor_selection_is_limited_to_the_four_header_window(self):
+        headers = [bytes([i]) * 108 for i in range(1, 6)]
+        job = MiningJob(b"", 1, CertificateVersion.PLAIN_FP8, headers)
+        for depth in range(1, 5):
+            assert job.keeps_ancestor(headers[depth - 1])
+            assert job.ancestor_chain_to(headers[depth - 1]) == headers[: depth - 1]
+        for ancestor in (headers[4], bytes(108)):
+            assert not job.keeps_ancestor(ancestor)
+            with pytest.raises(ValueError, match="outside.*state window"):
+                job.ancestor_chain_to(ancestor)
 
 
 class TestBlockTemplateCertVersion:

@@ -23,8 +23,9 @@ func moeSimNetParams() chaincfg.Params {
 	params := chaincfg.SimNetParams
 	params.ReduceMinDifficulty = false
 	params.MoEForkHeight = moeForkTestHeight
-	// Exercise the V1/V2 cutover in isolation; disable the later V3 fork.
+	// Exercise the V1/V2 cutover in isolation; disable later forks.
 	params.SaltedSeedForkHeight = 0
+	params.Fp8ForkHeight = 0
 	return params
 }
 
@@ -144,24 +145,6 @@ func TestMoEForkActivationRejectsV1AtFork(t *testing.T) {
 	requireRuleError(t, err, ErrDisallowedCertVersion)
 
 	require.Equal(t, moeForkTestHeight-1, chain.BestSnapshot().Height)
-}
-
-// TestSolveBlockSelectsVersionSimNet asserts the height-aware SolveBlock picks
-// the certificate version required by the MoE cutover on SimNet (where it
-// returns a lightweight dummy certificate of the correct version).
-func TestSolveBlockSelectsVersionSimNet(t *testing.T) {
-	params := moeSimNetParams()
-	header := &wire.BlockHeader{}
-
-	cert, err := SolveBlock(header, &params, moeForkTestHeight-1)
-	require.NoError(t, err)
-	require.Equal(t, wire.CertificateVersionV1, cert.Version(),
-		"pre-fork height must use the V1 certificate")
-
-	cert, err = SolveBlock(header, &params, moeForkTestHeight)
-	require.NoError(t, err)
-	require.Equal(t, wire.CertificateVersionV2, cert.Version(),
-		"at/after fork height must use the V2 certificate")
 }
 
 // TestMoEForkBlockTemplateVersion verifies CheckConnectBlockTemplate enforces
