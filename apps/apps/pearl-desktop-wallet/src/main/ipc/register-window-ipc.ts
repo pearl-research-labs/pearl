@@ -11,6 +11,7 @@ function registerWindowIpc(was: WindowService) {
   ipcMain.handle('window-close', () => was.closeWindow());
   ipcMain.handle('window-is-maximized', () => was.isMaximized());
   ipcMain.handle('open-external', (_, url: string) => was.openExternal(url));
+  ipcMain.handle('window-set-native-theme', (_, theme) => was.setNativeTheme(theme));
 }
 
 export {registerWindowIpc};

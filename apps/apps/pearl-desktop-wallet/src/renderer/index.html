@@ -12,6 +12,12 @@
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap"
         rel="stylesheet">
     <title>Pearl Desktop Wallet</title>
+    <script>
+        // Apply the saved theme before first paint; next-themes only applies it after React mounts.
+        try {
+            if (localStorage.getItem('pearl-theme') === 'dark') document.documentElement.classList.add('dark');
+        } catch (e) { }
+    </script>
 </head>
 
 <body>

@@ -2,7 +2,8 @@ import { app, BrowserWindow } from 'electron';
 import { electronApp, optimizer } from '@electron-toolkit/utils';
 import log from 'electron-log';
 import { registerWalletIpc } from './ipc/register-wallet-ipc';
-import { WindowService } from './services/window-service/window-service';
+import { WindowService, applyNativeTheme } from './services/window-service/window-service';
+import { loadNativeTheme } from './config/appearance-settings';
 import { createMainWindow } from './services/window-service/create-window';
 import { registerWindowIpc } from './ipc/register-window-ipc';
 import { registerManagerIpc } from './ipc/register-manager-ipc';
@@ -88,6 +89,8 @@ app.whenReady().then(() => {
     optimizer.watchWindowShortcuts(window);
   });
 
+  // Before the window exists, so a dark title bar never starts out light
+  applyNativeTheme(loadNativeTheme());
   const windowAS = new WindowService(createMainWindow());
   registerWindowIpc(windowAS);
 

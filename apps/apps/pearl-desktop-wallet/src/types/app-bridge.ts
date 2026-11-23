@@ -26,6 +26,7 @@ interface WindowApi {
   showOpenDialog: (options: OpenDialogOptions) => Promise<OpenDialogReturnValue>;
   showSaveDialog: (options: SaveDialogOptions) => Promise<SaveDialogReturnValue>;
   openExternal: (url: string) => void;
+  setNativeTheme: (theme: 'light' | 'dark') => void;
 }
 
 interface WalletApi {
