@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,10 +60,11 @@ class MinerRpcServer:
         self.clients: dict[int, ClientInfo] = {}
         self._next_client_id = 0
         # Bounded intake: excess submissions are rejected at the RPC boundary rather
-        # than queued unboundedly while the single proving worker catches up.
-        self._submission_queue: asyncio.Queue[tuple[PlainProof, MiningJob]] = asyncio.Queue(
-            maxsize=max_pending_submissions
-        )
+        # than queued unboundedly while the single proving worker catches up. A deque
+        # (not asyncio.Queue) so stale entries can be evicted when it fills.
+        self._pending: deque[tuple[PlainProof, MiningJob]] = deque()
+        self._max_pending = max(1, max_pending_submissions)
+        self._pending_ready = asyncio.Event()
         self._submission_consumer: asyncio.Task | None = None
 
     def _allocate_client_id(self) -> int:
@@ -250,28 +252,45 @@ class MinerRpcServer:
         if error := self._validate_params(validate_submit_plain_proof, params, request_id):
             return error
 
-        # Checked before parsing the (miner-controlled) proof; no awaits until
-        # put_nowait, so the queue cannot fill in between.
-        if self._submission_queue.full():
+        # The job is cheap to parse; the (miner-controlled) proof is parsed only after
+        # the checks. No awaits until append, so the queue cannot fill in between.
+        mining_job = MiningJob.from_dict(params["mining_job"])
+        current = self._current_header()
+        if mining_job.incomplete_header_bytes != current:
+            logger.info("Rejecting submitPlainProof for a stale job")
+            return self._jsonrpc_error(-32000, "stale job", request_id)
+
+        if len(self._pending) >= self._max_pending:
+            # Entries for a previous job would be dropped at dequeue anyway; evict them
+            # so they cannot crowd out a proof for the current job.
+            self._pending = deque(
+                entry for entry in self._pending if entry[1].incomplete_header_bytes == current
+            )
+        if len(self._pending) >= self._max_pending:
             logger.warning("Proof submission queue full, rejecting submitPlainProof")
             return self._jsonrpc_error(-32000, "proof submission queue full", request_id)
 
         plain_proof = PlainProof.from_base64(params["plain_proof"])
-        mining_job = MiningJob.from_dict(params["mining_job"])
-        self._submission_queue.put_nowait((plain_proof, mining_job))
+        self._pending.append((plain_proof, mining_job))
+        self._pending_ready.set()
         return self._jsonrpc_success("submitted", request_id)
+
+    def _current_header(self) -> bytes | None:
+        template = self.work_cache.current_template
+        return template.header.serialize_without_proof_commitment() if template else None
 
     async def _consume_submissions(self) -> None:
         """Process queued submissions one at a time (there is a single proving worker)."""
         while True:
-            plain_proof, mining_job = await self._submission_queue.get()
+            while not self._pending:
+                self._pending_ready.clear()
+                await self._pending_ready.wait()
+            plain_proof, mining_job = self._pending.popleft()
             try:
                 await self.handle_submit_plain_proof(plain_proof, mining_job)
             except Exception:
                 # Keep consuming: one bad submission must not stall the pipeline.
                 logger.exception("Error handling queued submission")
-            finally:
-                self._submission_queue.task_done()
 
     async def handle_submit_plain_proof(
         self, plain_proof: PlainProof, mining_job: MiningJob

@@ -41,28 +41,39 @@ class ProofPool:
         plain_proof_b64: str,
         debug: bool = False,
     ) -> tuple[bytes, bytes]:
-        """Prove in the worker process; on worker death, recreate the pool and drop this proof."""
-        try:
-            return await self._run_prove(
-                cert_version, incomplete_header_bytes, plain_proof_b64, debug
-            )
-        except BrokenExecutor:
-            logger.warning("Proof worker died; recreating pool and dropping this proof")
-            await self._restart(self._executor)
-            raise
+        """Prove in the worker process.
+
+        If the worker is dead (it may have died while idle, before this job was
+        dispatched), recreate it and retry once. A proof that kills the worker itself
+        is tried twice and then dropped.
+        """
+        for attempt in range(2):
+            # Snapshot: stop() or a concurrent restart may replace _executor while we wait.
+            executor = self._executor
+            try:
+                return await self._run_prove(
+                    executor, cert_version, incomplete_header_bytes, plain_proof_b64, debug
+                )
+            except BrokenExecutor:
+                logger.warning("Proof worker died; recreating it")
+                await self._restart(executor)
+                if attempt:
+                    raise
+        raise AssertionError("unreachable")
 
     async def _run_prove(
         self,
+        executor: ProcessPoolExecutor | None,
         cert_version: int,
         incomplete_header_bytes: bytes,
         plain_proof_b64: str,
         debug: bool,
     ) -> tuple[bytes, bytes]:
-        if self._executor is None:
+        if executor is None:
             raise RuntimeError("ProofPool not started")
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._executor,
+            executor,
             proof_worker.prove,
             cert_version,
             incomplete_header_bytes,
@@ -78,8 +89,8 @@ class ProofPool:
     async def _restart(self, broken: ProcessPoolExecutor | None) -> None:
         """Replace a broken executor with a fresh one (idempotent under concurrency)."""
         async with self._restart_lock:
-            if self._executor is not broken:
+            # None: the pool was stopped. Not current: someone already replaced it.
+            if broken is None or self._executor is not broken:
                 return
-            if broken is not None:
-                broken.shutdown(wait=False, cancel_futures=True)
+            broken.shutdown(wait=False, cancel_futures=True)
             self._executor = self._new_executor()

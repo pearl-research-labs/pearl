@@ -68,6 +68,23 @@ def sample_mining_job(sample_block_template):
     return MiningJob.from_template(sample_block_template)
 
 
+def enqueue(server, *entries):
+    server._pending.extend(entries)
+    server._pending_ready.set()
+
+
+async def run_consumer_until(server, done, timeout=5.0):
+    consumer = asyncio.create_task(server._consume_submissions())
+    try:
+        async with asyncio.timeout(timeout):
+            while not done():
+                await asyncio.sleep(0.01)
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
 class TestMinerRpcServerInit:
     """Test MinerRpcServer initialization."""
 
@@ -219,14 +236,9 @@ class TestMinerRpcServerHandlers:
         server.work_cache.current_template = sample_block_template
         server.submission_service.submit_plain_proof.return_value = {"status": "accepted"}
 
-        server._submission_queue.put_nowait((sample_plain_proof, sample_mining_job))
-        consumer = asyncio.create_task(server._consume_submissions())
-        try:
-            await asyncio.wait_for(server._submission_queue.join(), timeout=5)
-        finally:
-            consumer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await consumer
+        enqueue(server, (sample_plain_proof, sample_mining_job))
+        service = server.submission_service.submit_plain_proof
+        await run_consumer_until(server, lambda: service.call_count == 1)
 
         server.submission_service.submit_plain_proof.assert_called_once_with(
             sample_plain_proof, sample_block_template
@@ -242,15 +254,11 @@ class TestMinerRpcServerHandlers:
             {"status": "accepted"},
         ]
 
-        server._submission_queue.put_nowait((sample_plain_proof, sample_mining_job))
-        server._submission_queue.put_nowait((sample_plain_proof, sample_mining_job))
-        consumer = asyncio.create_task(server._consume_submissions())
-        try:
-            await asyncio.wait_for(server._submission_queue.join(), timeout=5)
-        finally:
-            consumer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await consumer
+        enqueue(
+            server, (sample_plain_proof, sample_mining_job), (sample_plain_proof, sample_mining_job)
+        )
+        service = server.submission_service.submit_plain_proof
+        await run_consumer_until(server, lambda: service.call_count == 2)
 
         assert server.submission_service.submit_plain_proof.call_count == 2
 
@@ -318,13 +326,55 @@ class TestMinerRpcServerJsonRpc:
         assert response.get("error") is None
         assert response["result"] == "submitted"
 
-    async def test_submit_plain_proof_rejected_when_queue_full(
+    @staticmethod
+    def _submit_request(params, request_id):
+        return json.dumps(
+            {"jsonrpc": "2.0", "method": "submitPlainProof", "params": params, "id": request_id}
+        )
+
+    async def test_submit_plain_proof_rejects_stale_job_at_intake(
         self, server, sample_block_template, submit_plain_proof_params, mock_client
+    ):
+        """A proof for a job that is no longer current is rejected, not queued."""
+        server.work_cache.current_template = sample_block_template
+        stale = dict(submit_plain_proof_params)
+        stale["mining_job"] = MiningJob(
+            incomplete_header_bytes=b"\x00" * 76, target=1, cert_version=CertificateVersion.ZK_MOE
+        ).to_dict()
+
+        response = await server._process_request(self._submit_request(stale, 4), mock_client)
+
+        assert response["error"]["message"] == "stale job"
+        assert not server._pending
+
+    async def test_full_queue_of_stale_entries_is_evicted_for_a_fresh_proof(
+        self, server, sample_block_template, submit_plain_proof_params, mock_client
+    ):
+        """Entries for a previous job cannot crowd out a proof for the current one."""
+        server.work_cache.current_template = sample_block_template
+        old_job = MiningJob(
+            incomplete_header_bytes=b"\x00" * 76, target=1, cert_version=CertificateVersion.ZK_MOE
+        )
+        enqueue(server, *[(None, old_job)] * server._max_pending)
+
+        response = await server._process_request(
+            self._submit_request(submit_plain_proof_params, 5), mock_client
+        )
+
+        assert response["result"] == "submitted"
+        assert len(server._pending) == 1
+
+    async def test_submit_plain_proof_rejected_when_queue_full(
+        self,
+        server,
+        sample_block_template,
+        sample_mining_job,
+        submit_plain_proof_params,
+        mock_client,
     ):
         """A flood of submissions is rejected once the queue capacity is reached."""
         server.work_cache.current_template = sample_block_template
-        while not server._submission_queue.full():
-            server._submission_queue.put_nowait((None, None))
+        enqueue(server, *[(None, sample_mining_job)] * server._max_pending)
 
         request_line = json.dumps(
             {
