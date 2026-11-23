@@ -40,6 +40,9 @@ class PoolStratumClient:
 
         # Current share target pushed via mining.set_difficulty
         self.share_target: int | None = None
+        # Set at every (re)subscribe: the next mining.notify must replace the cached
+        # template, whose coinbase still holds the previous session's extranonce1.
+        self._new_session = False
 
         self._conn = AsyncStratumConnection(
             config.stratum_host,
@@ -106,6 +109,7 @@ class PoolStratumClient:
         # 1. mining.subscribe -> [[subscriptions...], extranonce1, extranonce2_size?]
         result = await self._conn.call("mining.subscribe", ["pearl-gateway/1.0"])
         self._extranonce = bytes.fromhex(result[1])
+        self._new_session = True
         self._extranonce2_size = (
             parse_extranonce2_size(result[2]) if len(result) > 2 and result[2] is not None else 0
         )
@@ -153,7 +157,11 @@ class PoolStratumClient:
         template = BlockTemplate.from_stratum_notify(notify)
         template.share_target = self.share_target
 
-        await self.work_cache.update_template(template, force=notify.clean_jobs)
+        # The pool re-sends its current job on a new connection, usually without
+        # clean_jobs; force the swap so miners stop working on the old extranonce1.
+        force = notify.clean_jobs or self._new_session
+        self._new_session = False
+        await self.work_cache.update_template(template, force=force)
 
     async def _on_set_difficulty(self, params: list[Any]) -> None:
         """Handle mining.set_difficulty -- miners now find shares at the pool's difficulty."""

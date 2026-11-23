@@ -131,8 +131,9 @@ class PoolSubmissionService(SubmissionService):
 
             block = await self._build_block(plain_proof, template)
 
-            current = self.work_cache.current_template
-            if current is None or current.job_id != template.job_id:
+            # Same object or stale: the pool keeps a job id across reconnects, but a
+            # new session's template carries a different extranonce1.
+            if self.work_cache.current_template is not template:
                 logger.info("Job changed during proving; skipping stale submission")
                 return {"status": "skipped: stale job"}
 

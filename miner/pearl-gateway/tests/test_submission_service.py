@@ -314,6 +314,27 @@ class TestPoolSubmission:
             result = await service.submit_plain_proof(sample_plain_proof, sample_block_template)
 
         assert result["status"].startswith("skipped")
+
+    async def test_pool_submission_skipped_when_template_replaced_under_same_job_id(
+        self,
+        pool_client,
+        fake_proof_pool,
+        sample_plain_proof,
+        sample_block_template,
+        sample_pearl_block,
+    ):
+        # After a reconnect the pool re-sends the same job id with a new extranonce1.
+        sample_block_template.job_id = "job-1"
+        service = self._service(pool_client, fake_proof_pool, MagicMock(job_id="job-1"))
+
+        with patch(
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
+            return_value=sample_pearl_block,
+        ):
+            result = await service.submit_plain_proof(sample_plain_proof, sample_block_template)
+
+        assert result["status"].startswith("skipped")
+        pool_client.submit_zk_cert.assert_not_called()
         pool_client.submit_zk_cert.assert_not_called()
 
     async def test_pool_rejection_is_counted(

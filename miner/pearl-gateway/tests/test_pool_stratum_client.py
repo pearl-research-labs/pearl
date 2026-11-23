@@ -262,6 +262,41 @@ class TestPoolStratumClient:
         await stop_listener(listen_task)
 
     @pytest.mark.asyncio
+    async def test_resubscribe_replaces_template_with_new_extranonce(
+        self, pool_config: PoolConfig, work_cache: WorkCache
+    ):
+        client, reader, writer = make_connected_client(pool_config, work_cache)
+        listen_task = start_listener(client)
+
+        async def handshake(extranonce1: str) -> None:
+            task = asyncio.create_task(client._subscribe_and_authorize())
+            start = len(writer.writes)
+            await wait_for_write_count(writer, start + 1)
+            reader.feed_line({"id": latest_request(writer)["id"], "result": [[], extranonce1]})
+            await wait_for_write_count(writer, start + 2)
+            reader.feed_line({"id": latest_request(writer)["id"], "result": True})
+            await task
+
+        await handshake("00000001")
+        await client._on_mining_notify(mining_notify_params(job_id="job-1"))
+        first = work_cache.current_template
+
+        # Reconnect: new extranonce1, and the pool re-sends the same job without clean_jobs.
+        await handshake("00000002")
+        await client._on_mining_notify(mining_notify_params(job_id="job-1"))
+        second = work_cache.current_template
+
+        assert second is not first
+        assert second.coinbase_tx.serialize() != first.coinbase_tx.serialize()
+        assert "00000002" in second.coinbase_tx.serialize()
+
+        # Within a session, a same-block notify without clean_jobs is still deduplicated.
+        await client._on_mining_notify(mining_notify_params(job_id="job-2"))
+        assert work_cache.current_template is second
+
+        await stop_listener(listen_task)
+
+    @pytest.mark.asyncio
     async def test_subscribe_and_authorize_sends_difficulty_in_password(
         self, work_cache: WorkCache
     ):
