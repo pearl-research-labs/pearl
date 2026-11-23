@@ -117,7 +117,7 @@ docker run --rm -it --gpus all \
   -p 8000:8000 -p 8337:8337 -p 8339:8339 \
   -e PEARLD_RPC_URL=<PEARLD URL> \
   -e PEARLD_RPC_USER=<USER> \
-  -e PEARLD_RPC_PASSWORD=<PASSWORD>
+  -e PEARLD_RPC_PASSWORD=<PASSWORD> \
   -e HF_TOKEN=<your-token> \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --shm-size 8g \
