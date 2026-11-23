@@ -209,7 +209,11 @@ class AsyncLoopManager:
             self._lifecycle_cond.wait_for(lambda: not self._stop_in_progress)
             self._stop_in_progress = True
         try:
-            self._stop(wait_for_submissions=wait_for_submissions)
+            self._stop(
+                wait_for_submissions=wait_for_submissions,
+                abort_submissions=not wait_for_submissions,
+                abandon_restart=not wait_for_submissions,
+            )
         finally:
             with self._lifecycle_cond:
                 self._stop_in_progress = False
@@ -235,11 +239,17 @@ class AsyncLoopManager:
             client, self._client = self._client, None
             return client
 
-    def _stop(self, *, wait_for_submissions: bool) -> None:
+    def _stop(
+        self,
+        *,
+        wait_for_submissions: bool,
+        abort_submissions: bool,
+        abandon_restart: bool,
+    ) -> None:
         client = self._detach_polling_client(
             stopping=True,
             close_admission=True,
-            abandon_restart=not wait_for_submissions,
+            abandon_restart=abandon_restart,
         )
         if client is not None:
             with suppress(Exception):
@@ -249,7 +259,7 @@ class AsyncLoopManager:
             if self._starting_thread_id != threading.get_ident():
                 self._lifecycle_cond.wait_for(lambda: not self._starting)
 
-        if not wait_for_submissions:
+        if abort_submissions:
             self.abort_pending_submissions()
 
         executor, self._submission_executor = self._submission_executor, None
@@ -658,9 +668,13 @@ class AsyncLoopManager:
                 return
             self._stop_in_progress = True
         try:
-            self._stop(wait_for_submissions=True)
             with suppress(Exception):
                 self._publish_mining_job(None)
+            self._stop(
+                wait_for_submissions=True,
+                abort_submissions=True,
+                abandon_restart=False,
+            )
         finally:
             with self._lifecycle_cond:
                 self._stop_in_progress = False
