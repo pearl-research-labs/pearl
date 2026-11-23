@@ -229,7 +229,9 @@ class BlockTemplate:
         """Build a BlockTemplate from a Stratum mining.notify message.
 
         Reconstructs coinbase = coinb1 + extranonce1 + extranonce2 + coinb2, then
-        hashes it and walks the merkle branch to get the merkle root.
+        hashes it and walks the merkle branch to get the merkle root. The raw
+        coinbase hash is its txid only because the pool sends a witness-free
+        coinb1/coinb2, as Stratum v1 pools do.
         """
         extranonce2 = notify.extranonce2
         coinbase_bytes = notify.coinb1 + notify.extranonce + extranonce2 + notify.coinb2

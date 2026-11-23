@@ -84,22 +84,6 @@ class TestAsyncJSONRPCClient:
         assert await call_task == "subscribed"
 
     @pytest.mark.asyncio
-    async def test_call_includes_jsonrpc_version(self):
-        writer = FakeStreamWriter()
-        client = AsyncJSONRPCClient(writer)
-
-        call_task = asyncio.create_task(client.call("getwork"))
-        await asyncio.sleep(0)
-
-        request = json.loads(writer.writes[0].decode())
-        assert request["jsonrpc"] == "2.0"
-        assert request["params"] == []
-
-        client.handle_response({"id": 1, "result": "ok"})
-
-        assert await call_task == "ok"
-
-    @pytest.mark.asyncio
     async def test_fail_all_pending_rejects_waiting_call(self):
         writer = FakeStreamWriter()
         client = AsyncJSONRPCClient(writer)

@@ -335,7 +335,6 @@ class TestPoolSubmission:
 
         assert result["status"].startswith("skipped")
         pool_client.submit_zk_cert.assert_not_called()
-        pool_client.submit_zk_cert.assert_not_called()
 
     async def test_pool_rejection_is_counted(
         self,

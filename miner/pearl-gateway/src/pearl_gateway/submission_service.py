@@ -117,8 +117,8 @@ class PoolSubmissionService(SubmissionService):
     ) -> dict[str, Any]:
         """Generate a ZK proof and submit the certificate to the pool.
 
-        zkcert_hex is ZKCertificate.serialize() hex-encoded: the same bytes that
-        lead PearlBlock.serialize() for a solo submit.
+        zkcert_hex is ZKCertificate.serialize() hex-encoded: the same leading
+        bytes of PearlBlock.serialize() for a solo submit.
         """
         if template.job_id is None:
             logger.error("Cannot submit to pool: template has no job_id")

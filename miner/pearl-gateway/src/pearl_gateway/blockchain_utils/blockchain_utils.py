@@ -79,21 +79,6 @@ def bits_to_target(bits: int) -> int:
     return mantissa * (1 << (8 * (exponent - 3)))
 
 
-def target_to_bits(target: int) -> int:
-    """Convert target to compact bits (inverse of bits_to_target for valid encodings)."""
-    if target <= 0:
-        return 0
-
-    size = (target.bit_length() + 7) // 8
-    compact = target << (8 * (3 - size)) if size <= 3 else target >> (8 * (size - 3))
-
-    if compact & 0x800000:
-        compact >>= 8
-        size += 1
-
-    return compact | (size << 24)
-
-
 def create_coinbase_transaction(
     height: int,
     coinbase_value: int,

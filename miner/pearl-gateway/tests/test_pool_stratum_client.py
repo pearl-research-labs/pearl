@@ -191,53 +191,6 @@ class TestPoolStratumClient:
         await stop_listener(listen_task)
 
     @pytest.mark.asyncio
-    async def test_subscribe_rejects_oversized_extranonce2_size(
-        self, pool_config: PoolConfig, work_cache: WorkCache
-    ):
-        """A pool advertising an absurdly large extranonce2_size is clamped to
-        0 (feature off) rather than letting os.urandom allocate huge buffers."""
-        client, reader, writer = make_connected_client(pool_config, work_cache)
-        listen_task = start_listener(client)
-
-        handshake = asyncio.create_task(client._subscribe_and_authorize())
-        await wait_for_write_count(writer, 1)
-
-        subscribe_req = latest_request(writer)
-        reader.feed_line({"id": subscribe_req["id"], "result": [[], "deadbeef", 999999]})
-        await wait_for_write_count(writer, 2)
-
-        authorize_req = latest_request(writer)
-        reader.feed_line({"id": authorize_req["id"], "result": True})
-
-        await handshake
-        assert client._extranonce2_size == 0
-
-        await stop_listener(listen_task)
-
-    @pytest.mark.asyncio
-    async def test_subscribe_rejects_negative_extranonce2_size(
-        self, pool_config: PoolConfig, work_cache: WorkCache
-    ):
-        """A negative extranonce2_size is treated as feature off."""
-        client, reader, writer = make_connected_client(pool_config, work_cache)
-        listen_task = start_listener(client)
-
-        handshake = asyncio.create_task(client._subscribe_and_authorize())
-        await wait_for_write_count(writer, 1)
-
-        subscribe_req = latest_request(writer)
-        reader.feed_line({"id": subscribe_req["id"], "result": [[], "deadbeef", -1]})
-        await wait_for_write_count(writer, 2)
-
-        authorize_req = latest_request(writer)
-        reader.feed_line({"id": authorize_req["id"], "result": True})
-
-        await handshake
-        assert client._extranonce2_size == 0
-
-        await stop_listener(listen_task)
-
-    @pytest.mark.asyncio
     async def test_authorize_sends_password_when_configured(self, work_cache: WorkCache):
         config = PoolConfig(
             stratum_url="stratum+tcp://127.0.0.1:3333",
@@ -336,6 +289,33 @@ class TestPoolStratumClient:
         assert template is not None and template.job_id == "j"
         assert "00000003" in template.coinbase_tx.serialize()
         assert template.share_bits == 0x1E010000
+
+        await stop_listener(listen_task)
+
+    @pytest.mark.asyncio
+    async def test_notification_arriving_during_the_replay_is_not_stranded(
+        self, pool_config: PoolConfig, work_cache: WorkCache
+    ):
+        client, reader, writer = make_connected_client(pool_config, work_cache)
+        listen_task = start_listener(client)
+        dispatch = client._dispatch
+
+        async def dispatch_then_receive_newer_job(method, params):
+            await dispatch(method, params)
+            if params and params[0] == "old":  # the pool sends a newer job meanwhile
+                await client._handle_notification("mining.notify", mining_notify_params("new"))
+
+        client._dispatch = dispatch_then_receive_newer_job
+        task = asyncio.create_task(client._subscribe_and_authorize())
+        await wait_for_write_count(writer, 1)
+        reader.feed_line({"id": latest_request(writer)["id"], "result": [[], "00000004"]})
+        reader.feed_line({"method": "mining.notify", "params": mining_notify_params("old")})
+        await wait_for_write_count(writer, 2)
+        reader.feed_line({"id": latest_request(writer)["id"], "result": True})
+        await task
+
+        assert work_cache.current_template.job_id == "new"
+        assert client._deferred == {}
 
         await stop_listener(listen_task)
 

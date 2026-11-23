@@ -64,10 +64,6 @@ class PoolStratumClient:
         )
 
     @property
-    def is_connected(self) -> bool:
-        return self._conn.is_connected
-
-    @property
     def stratum_user(self) -> str:
         return f"{self.address}.{self.config.worker}"
 
@@ -142,14 +138,17 @@ class PoolStratumClient:
 
         # Replay work the pool sent during the handshake, now that it can be built.
         # Difficulty first, so the replayed job carries the session's share target.
-        deferred, self._deferred = self._deferred, {}
-        for method in _DEFERRABLE:
-            if (params := deferred.get(method)) is None:
-                continue
-            try:
-                await self._dispatch(method, params)
-            except Exception:
-                logger.exception(f"Ignoring pool notification that failed to handle: {method}")
+        # Loop: a notification arriving during a replay lands in the fresh dict;
+        # without the loop it would stay stranded behind _session_ready.
+        while self._deferred:
+            deferred, self._deferred = self._deferred, {}
+            for method in _DEFERRABLE:
+                if (params := deferred.get(method)) is None:
+                    continue
+                try:
+                    await self._dispatch(method, params)
+                except Exception:
+                    logger.exception(f"Ignoring pool notification that failed to handle: {method}")
         self._session_ready = True
 
     async def _on_disconnect(self) -> None:

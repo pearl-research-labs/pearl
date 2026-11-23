@@ -309,9 +309,9 @@ class MinerRpcServer:
         if template.share_bits is not None:
             # Pool mode: check what the proof achieved, not the target the miner
             # searched against, so a proof that still meets a raised share target
-            # (or the network target) is kept. Cheap next to proving.
-            ok, msg = await asyncio.to_thread(
-                verify_plain_proof_for_cert_version,
+            # (or the network target) is kept. Cheap next to proving, and the
+            # binding holds the GIL, so a thread hop would not unblock the loop.
+            ok, msg = verify_plain_proof_for_cert_version(
                 int(template.required_cert_version),
                 IncompleteBlockHeader.from_bytes(current_header),
                 plain_proof,

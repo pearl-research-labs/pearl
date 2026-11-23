@@ -6,7 +6,6 @@ import pytest
 from pearl_gateway.blockchain_utils.blockchain_utils import (
     double_sha256,
     reconstruct_stratum_merkle_root,
-    target_to_bits,
 )
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import (
@@ -81,27 +80,6 @@ class TestFromStratumNotify:
 
         # The stored prev_block should match the hex string from the pool
         assert bytes(template.header.incomplete_header.prev_block) == bytes.fromhex(prev_hash)
-
-    def test_coinbase_txid_strips_witness(self):
-        """Coinbase hash for merkle tree must be txid (witness-stripped),
-        not the raw double-SHA256 of the full coinbase bytes.
-        """
-        from bitcoinutils.transactions import Transaction
-
-        # A simple non-witness coinbase
-        coinb1 = (
-            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704"
-        )
-        coinb2 = "0101ffffffff0100f2052a01000000232102deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefac00000000"
-        extranonce = bytes(4)
-
-        coinbase_bytes = bytes.fromhex(coinb1) + extranonce + bytes.fromhex(coinb2)
-        tx = Transaction.from_raw(coinbase_bytes.hex())
-        txid_bytes = bytes.fromhex(tx.get_txid())[::-1]
-        raw_hash = double_sha256(coinbase_bytes)
-
-        # For non-witness tx, txid == raw hash
-        assert txid_bytes == raw_hash
 
     def test_merkle_branch_reversal(self, stratum_notify_params):
         """Merkle branch siblings from the pool (sent via chainhash.Hash.String())
@@ -341,13 +319,7 @@ class TestPoolMiningJob:
         assert MiningJob.from_template(sample_block_template).target == sample_block_template.target
 
 
-class TestTargetToBits:
-    @pytest.mark.parametrize("bits", [0x1E010000, 0x1D00FFFF, 0x1F00FFFF, 0x1D010000])
-    def test_round_trips_with_bits_to_target(self, bits):
-        from pearl_gateway.blockchain_utils.blockchain_utils import bits_to_target
-
-        assert target_to_bits(bits_to_target(bits)) == bits
-
+class TestBitsToTarget:
     @pytest.mark.parametrize(
         ("bits", "target"), [(0x02FFFFFF, 0xFFFF), (0x01FFFFFF, 0xFF), (0x00123456, 0)]
     )
@@ -355,9 +327,6 @@ class TestTargetToBits:
         from pearl_gateway.blockchain_utils.blockchain_utils import bits_to_target
 
         assert bits_to_target(bits) == target
-
-    def test_non_positive_target_is_zero(self):
-        assert target_to_bits(0) == 0
 
 
 class TestStratumSetDifficulty:
