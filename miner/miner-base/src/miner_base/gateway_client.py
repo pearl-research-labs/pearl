@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
+import selectors
 import socket
+import threading
 from contextlib import AbstractContextManager, suppress
 from types import TracebackType
 from typing import Any, TextIO
@@ -17,6 +21,7 @@ from pearl_mining import BlockHeader, IncompleteBlockHeader, PlainProofV4
 from .protocol import bits_to_target
 
 _LOGGER = get_logger(__name__)
+_CONNECT_POLL_INTERVAL_SECONDS = 0.05
 
 # Valid 76-byte header + linked parent for MINER_NO_GATEWAY offline runs;
 # hard difficulty so benchmarks do not constantly hit the lottery.
@@ -45,26 +50,67 @@ _DUMMY_HEADER_BYTES = bytes(
 class JSONRPCClient:
     """Newline-delimited JSON-RPC 2.0 client over UDS or TCP."""
 
-    def __init__(self, gateway_params: MinerRpcConfig) -> None:
-        self._socket = self._connect_socket(gateway_params)
+    def __init__(
+        self,
+        gateway_params: MinerRpcConfig,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self._socket = self._connect_socket(gateway_params, stop_event)
         self._reader: TextIO = self._socket.makefile("r", encoding="utf-8")
         self._writer: TextIO = self._socket.makefile("w", encoding="utf-8")
         self._request_id = 0
 
-    def _connect_socket(self, gateway_params: MinerRpcConfig) -> socket.socket:
+    def _connect_socket(
+        self,
+        gateway_params: MinerRpcConfig,
+        stop_event: threading.Event | None = None,
+    ) -> socket.socket:
+        if stop_event is not None and stop_event.is_set():
+            raise ConnectionAbortedError("Connection aborted")
+        sock: socket.socket | None = None
         try:
             if gateway_params.transport == "tcp":
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.connect((gateway_params.host, gateway_params.port))
+                self._connect_tcp(sock, (gateway_params.host, gateway_params.port), stop_event)
                 _LOGGER.info(f"Connected to {gateway_params.host}:{gateway_params.port}")
             else:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 sock.connect(gateway_params.socket_path)
                 _LOGGER.info(f"Connected to {gateway_params.socket_path}")
         except Exception as e:
+            if sock is not None:
+                with suppress(OSError):
+                    sock.close()
             _LOGGER.warning(f"Failed to connect: {e}")
             raise
         return sock
+
+    @staticmethod
+    def _connect_tcp(
+        sock: socket.socket,
+        address: tuple[str, int],
+        stop_event: threading.Event | None,
+    ) -> None:
+        if stop_event is None:
+            sock.connect(address)
+            return
+        sock.setblocking(False)
+        try:
+            err = sock.connect_ex(address)
+            if err in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+                with selectors.DefaultSelector() as selector:
+                    selector.register(sock, selectors.EVENT_WRITE)
+                    while True:
+                        if stop_event.is_set():
+                            raise ConnectionAbortedError("Connection aborted")
+                        if selector.select(timeout=_CONNECT_POLL_INTERVAL_SECONDS):
+                            err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                            break
+            if err != 0:
+                raise OSError(err, os.strerror(err))
+        finally:
+            sock.setblocking(True)
 
     def close(self) -> None:
         # Shut down first so any blocked readline() in another thread wakes immediately.
@@ -102,8 +148,13 @@ class JSONRPCClient:
 class MiningClient(AbstractContextManager):
     """Persistent gateway connection for job polling and proof submission."""
 
-    def __init__(self, miner_rpc_config: MinerRpcConfig) -> None:
-        self.client = JSONRPCClient(miner_rpc_config)
+    def __init__(
+        self,
+        miner_rpc_config: MinerRpcConfig,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self.client = JSONRPCClient(miner_rpc_config, stop_event=stop_event)
 
     def get_mining_info(self) -> MiningJob:
         return MiningJob.from_dict(self.client.call("getMiningInfo"))

@@ -40,8 +40,17 @@ def _deadline_from_timeout(timeout: float | None) -> float | None:
     return time.monotonic() + timeout
 
 
-def _make_client(miner_settings: MinerSettings, config: MinerRpcConfig) -> MiningClient:
-    return DummyMiningClient() if miner_settings.no_gateway else MiningClient(config)
+def _make_client(
+    miner_settings: MinerSettings,
+    config: MinerRpcConfig,
+    *,
+    stop_event: threading.Event | None = None,
+) -> MiningClient:
+    return (
+        DummyMiningClient()
+        if miner_settings.no_gateway
+        else MiningClient(config, stop_event=stop_event)
+    )
 
 
 class AsyncLoopManager:
@@ -85,6 +94,7 @@ class AsyncLoopManager:
         self._inflight_clients: set[MiningClient] = set()
         self._inflight_lock = threading.Lock()
         self._aborting = False
+        self._abort_event = threading.Event()
 
         self._drain_predicates: list[Callable[[], bool]] = []
         self._drain_barriers: list[Callable[[], None]] = []
@@ -137,9 +147,9 @@ class AsyncLoopManager:
                 self._starting_thread_id = None
                 self._lifecycle_cond.notify_all()
 
-    def _get_initial_job(self) -> tuple[bool, MiningJob | None]:
+    def _get_initial_job(self, stop_event: threading.Event) -> tuple[bool, MiningJob | None]:
         try:
-            connected = _make_client(self._conf, self._client_config)
+            connected = _make_client(self._conf, self._client_config, stop_event=stop_event)
             with self._lifecycle_cond:
                 if self._stopping:
                     publish = False
@@ -172,12 +182,13 @@ class AsyncLoopManager:
         with self._inflight_lock:
             self._inflight_clients.clear()
             self._aborting = False
+            self._abort_event = threading.Event()
 
         self._submission_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._conf.submission_inflight_limit,
             thread_name_prefix="block-submit",
         )
-        continue_start, initial_job = self._get_initial_job()
+        continue_start, initial_job = self._get_initial_job(stop_event)
         if not continue_start:
             return
 
@@ -263,6 +274,7 @@ class AsyncLoopManager:
         polling_client = self._detach_polling_client(stopping=True, close_admission=True)
         with self._inflight_lock:
             self._aborting = True
+            self._abort_event.set()
             clients = list(self._inflight_clients)
         if polling_client is not None:
             clients.append(polling_client)
@@ -417,7 +429,12 @@ class AsyncLoopManager:
     def _submit_block(self, opened_block_info: OpenedBlockInfo, mining_job: MiningJob) -> bool:
         if self._conf.no_gateway or self._conf.skip_block_submission:
             return False
-        client = _make_client(self._conf, self._client_config)
+        with self._inflight_lock:
+            if self._aborting:
+                _LOGGER.warning("Dropping found block: async loop manager is shutting down.")
+                return False
+            abort_event = self._abort_event
+        client = _make_client(self._conf, self._client_config, stop_event=abort_event)
         with self._inflight_lock:
             if self._aborting:
                 client.close()
@@ -588,14 +605,14 @@ class AsyncLoopManager:
             with suppress(Exception):
                 client.close()
 
-    def _polling_client(self) -> MiningClient | None:
+    def _polling_client(self, stop_event: threading.Event) -> MiningClient | None:
         with self._lifecycle_cond:
             if self._stopping:
                 return None
             if self._client is not None:
                 return self._client
 
-        connected = _make_client(self._conf, self._client_config)
+        connected = _make_client(self._conf, self._client_config, stop_event=stop_event)
         with self._lifecycle_cond:
             if self._stopping:
                 published = None
@@ -612,12 +629,16 @@ class AsyncLoopManager:
         while not stop_event.is_set():
             client: MiningClient | None = None
             try:
-                client = self._polling_client()
+                client = self._polling_client(stop_event)
                 if client is None:
                     return
                 new_job = client.get_mining_info()
                 self._consecutive_job_failures = 0
             except Exception:
+                if stop_event.is_set():
+                    if client is not None:
+                        self._discard_client(client)
+                    return
                 self._consecutive_job_failures += 1
                 _LOGGER.exception("Failed to get mining info")
                 if client is not None:

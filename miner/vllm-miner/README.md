@@ -115,8 +115,7 @@ it, the first launch prepares a fresh B on the GPU inline, so every mined
 layer pays that preparation on the serving path at once. Instead, a helper process
 prepares the fresh B side on the host CPU ahead of time: the committed planes' digest,
 the noise lines, and B' and its peel, bit-identical to the GPU chain (the
-`pearl_mining` CPU B kernels, AVX-512 where the CPU has it, with a torch
-fallback). The next launch of that layer uploads
+`pearl_mining` CPU B kernels, AVX-512 where the CPU has it). The next launch of that layer uploads
 it in place on the serving stream instead of running the GPU chain; a layer
 whose result is not ready in time still prepares inline. The helper maps the
 layers' host planes once (about one byte per weight element plus scales) and

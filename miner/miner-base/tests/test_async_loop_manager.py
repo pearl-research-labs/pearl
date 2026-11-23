@@ -391,13 +391,101 @@ class TestSubmissionBackpressureAndDrain:
             manager.abort_pending_submissions()
             assert done.wait(timeout=_TIMEOUT_S)
             assert len(errors) == 1
-            # Submissions after abort are dropped immediately.
-            fake_client = Mock(spec=MiningClient)
-            with patch("miner_base.async_loop_manager._make_client", return_value=fake_client):
+            # Submissions after abort are dropped before opening a new connection.
+            with patch("miner_base.async_loop_manager._make_client") as mock_make:
                 assert manager._submit_block(Mock(), mock_mining_job) is False
-            fake_client.close.assert_called_once_with()
+            mock_make.assert_not_called()
         finally:
             for peer in peers:
                 peer.close()
             server.close()
             worker.join(timeout=_TIMEOUT_S)
+
+    def test_stop_aborts_in_flight_poll_reconnect(self, miner_config, mock_mining_job, monkeypatch):
+        monkeypatch.setattr("miner_base.async_loop_manager._POLL_INTERVAL_SECONDS", 0.01)
+        initial_client = Mock(spec=MiningClient)
+        initial_client.get_mining_info.side_effect = [mock_mining_job, ConnectionError("lost")]
+
+        reconnecting = threading.Event()
+        reconnect_aborted = threading.Event()
+        calls = 0
+
+        def make_client(_conf, _cfg, *, stop_event=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return initial_client
+            assert stop_event is not None
+            reconnecting.set()
+            if stop_event.wait(timeout=_TIMEOUT_S):
+                reconnect_aborted.set()
+                raise ConnectionAbortedError("Connection aborted")
+            raise AssertionError("stop_event was not set during reconnect")
+
+        manager = AsyncLoopManager(miner_config, MinerSettings(no_gateway=False))
+        with patch("miner_base.async_loop_manager._make_client", side_effect=make_client):
+            manager.start()
+            try:
+                assert reconnecting.wait(timeout=_TIMEOUT_S)
+                manager.stop()
+                assert reconnect_aborted.is_set()
+                assert not manager.started
+            finally:
+                if manager.started:
+                    manager.stop()
+
+    def test_tcp_connect_aborts_when_stop_event_is_set(self):
+        import errno
+
+        from miner_base.gateway_client import JSONRPCClient
+
+        stop_event = threading.Event()
+        connect_started = threading.Event()
+        closed = threading.Event()
+
+        class _PendingSocket:
+            def setblocking(self, _flag: bool) -> None:
+                pass
+
+            def connect_ex(self, _address) -> int:
+                connect_started.set()
+                return errno.EINPROGRESS
+
+            def close(self) -> None:
+                closed.set()
+
+        class _IdleSelector:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def register(self, _fileobj, _events) -> None:
+                pass
+
+            def select(self, timeout=None):
+                stop_event.wait(timeout=timeout)
+                return []
+
+        cfg = MinerRpcConfig(transport="tcp", host="127.0.0.1", port=1)
+
+        def trigger_stop():
+            assert connect_started.wait(timeout=_TIMEOUT_S)
+            stop_event.set()
+
+        stopper = threading.Thread(target=trigger_stop, daemon=True)
+        stopper.start()
+        try:
+            with (
+                patch("miner_base.gateway_client.socket.socket", return_value=_PendingSocket()),
+                patch(
+                    "miner_base.gateway_client.selectors.DefaultSelector",
+                    return_value=_IdleSelector(),
+                ),
+                pytest.raises(ConnectionAbortedError),
+            ):
+                JSONRPCClient(cfg, stop_event=stop_event)
+            assert closed.is_set()
+        finally:
+            stopper.join(timeout=_TIMEOUT_S)
