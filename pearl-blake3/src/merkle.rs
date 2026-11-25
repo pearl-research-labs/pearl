@@ -41,6 +41,11 @@ pub struct MerkleTree {
 impl MerkleTree {
     /// Build a Merkle tree from `data` using keyed BLAKE3.
     pub fn new(data: &[u8], key: Digest) -> Self {
+        Self::from_vec(data.to_vec(), key)
+    }
+
+    /// Build a Merkle tree from an existing buffer.
+    pub fn from_vec(data: Vec<u8>, key: Digest) -> Self {
         let hasher = Blake3Hasher::with_key(key);
         if data.is_empty() {
             return Self {
@@ -52,15 +57,15 @@ impl MerkleTree {
 
         // Single chunk or less: hash directly
         if data.len() <= CHUNK_LEN {
-            let root = hasher.hash(data);
+            let root = hasher.hash(&data);
             return Self {
                 key,
                 layers: vec![vec![root]],
-                data: data.to_vec(),
+                data,
             };
         }
 
-        let chunk_cvs = hasher.hash_chunks(data);
+        let chunk_cvs = hasher.hash_chunks(&data);
         let mut layers: Vec<Vec<Digest>> = vec![chunk_cvs];
 
         while layers.last().unwrap().len() > 2 {
@@ -74,11 +79,7 @@ impl MerkleTree {
             layers.push(vec![root]);
         }
 
-        Self {
-            key,
-            layers,
-            data: data.to_vec(),
-        }
+        Self { key, layers, data }
     }
 
     /// The BLAKE3 key this tree was built with.
@@ -469,6 +470,17 @@ mod tests {
             let data = test_data(size);
             let tree = MerkleTree::new(&data, key);
             let expected = Blake3Hasher::with_key(key).hash(&data);
+            assert_eq!(tree.root(), expected, "Root mismatch for size {size}");
+        }
+    }
+
+    #[test]
+    fn test_from_vec_matches_new() {
+        let key = test_key();
+        for size in [1, 100, 1023, 1025, 2000, 3000, 7777] {
+            let data = test_data(size);
+            let expected = MerkleTree::new(&data, key).root();
+            let tree = MerkleTree::from_vec(data, key);
             assert_eq!(tree.root(), expected, "Root mismatch for size {size}");
         }
     }

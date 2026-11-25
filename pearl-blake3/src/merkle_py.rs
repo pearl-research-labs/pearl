@@ -3,10 +3,12 @@
 //! Provides `#[pymethods]` implementations that extend the pyo3 classes defined in [`merkle`].
 
 use blake3::{CHUNK_LEN, OUT_LEN};
-use pyo3::{exceptions::PyValueError, pymethods, types::PyBytes, Bound, PyResult, Python};
+use pyo3::{
+    buffer::PyBuffer, exceptions::PyValueError, pymethods, types::PyBytes, Bound, PyResult, Python,
+};
 
 use crate::hasher::Digest;
-use crate::merkle::{MerkleProof, MerkleTree};
+use crate::merkle::{padded_chunk_len, MerkleProof, MerkleTree};
 
 #[pymethods]
 impl MerkleTree {
@@ -21,6 +23,17 @@ impl MerkleTree {
             ))
         })?;
         Ok(Self::new(data, key))
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_buffer", signature = (data, key))]
+    fn py_from_buffer(py: Python<'_>, data: PyBuffer<i8>, key: Digest) -> PyResult<Self> {
+        let len = data.item_count();
+        let mut padded = vec![0u8; padded_chunk_len(len)];
+        let target =
+            unsafe { std::slice::from_raw_parts_mut(padded.as_mut_ptr().cast::<i8>(), len) };
+        data.copy_to_slice(py, target)?;
+        Ok(py.allow_threads(|| Self::from_vec(padded, key)))
     }
 
     #[getter(root)]

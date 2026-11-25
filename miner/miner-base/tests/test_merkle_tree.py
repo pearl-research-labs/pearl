@@ -146,3 +146,10 @@ class TestMatrixMerkleTreeVsBlake3:
         expected_root = blake3(padded_tensor_bytes, key=sample_key).digest()
 
         assert tree.root == expected_root, f"Root mismatch for shape {m=}, {n=}"
+
+    def test_root_of_non_contiguous_tensor(self, sample_key):
+        """Test that a transposed view hashes the same as its contiguous copy."""
+        tensor = torch.randint(-128, 127, (300, 700), dtype=torch.int8).T
+        tree = MatrixMerkleTree(tensor, sample_key)
+        expected_root = blake3(tree.pad_tensor(tensor), key=sample_key).digest()
+        assert tree.root == expected_root
