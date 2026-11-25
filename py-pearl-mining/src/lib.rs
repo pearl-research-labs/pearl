@@ -25,7 +25,8 @@ use pyo3::prelude::*;
 // Module
 // ============================================================================
 
-const DEFAULT_RAYON_THREADS: usize = 6;
+// 0 lets Rayon size the global pool to all available cores.
+const DEFAULT_RAYON_THREADS: usize = 0;
 
 fn rayon_thread_count() -> usize {
     std::env::var("RAYON_NUM_THREADS")
