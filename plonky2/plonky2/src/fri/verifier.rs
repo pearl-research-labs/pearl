@@ -51,9 +51,17 @@ pub(crate) fn fri_verify_proof_of_work<F: RichField + Extendable<D>, const D: us
     fri_pow_response: F,
     config: &FriConfig,
 ) -> Result<()> {
+    verify_proof_of_work::<F, D>(fri_pow_response, config.proof_of_work_bits)
+}
+
+pub(crate) fn verify_proof_of_work<F: RichField + Extendable<D>, const D: usize>(
+    fri_pow_response: F,
+    proof_of_work_bits: u32,
+) -> Result<()> {
+    ensure!(proof_of_work_bits < F::order().bits() as u32);
     ensure!(
         fri_pow_response.to_canonical_u64().leading_zeros()
-            >= config.proof_of_work_bits + (64 - F::order().bits()) as u32,
+            >= proof_of_work_bits + (64 - F::order().bits()) as u32,
         "Invalid proof of work witness."
     );
 
@@ -82,6 +90,10 @@ pub fn verify_fri_proof<
     let n = params.lde_size();
 
     // Check PoW.
+    crate::fri::batching_pow::verify_batching_pow::<F, D>(
+        challenges.batching_pow_response,
+        &params.config,
+    )?;
     fri_verify_proof_of_work(challenges.fri_pow_response, &params.config)?;
 
     // Check that parameters are coherent.

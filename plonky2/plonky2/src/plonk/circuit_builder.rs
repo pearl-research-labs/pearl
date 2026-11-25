@@ -859,7 +859,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     }
 
     // Adds random generators to each witness polynomial, to blind the initial openings in FRI.
-    fn blind_and_pad(&mut self) {
+    // `connect_z_blinding` selects [`Self::add_z_blinding`]'s constrained variant.
+    fn blind_and_pad(&mut self, connect_z_blinding: bool) {
         if self.config.zero_knowledge {
             // The number of polynomial values that will be revealed per opening, both for the "regular"
             // polynomials (which are opened at only one location) and for the Z polynomials (which are
@@ -872,11 +873,12 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 self.add_regular_blinding();
             }
 
-            // For each z poly blinding factor, we add two new gates with the same random value, and
-            // enforce a copy constraint between them.
+            // For each Z-poly blinding factor, add two gates with the same random value.
+            // New circuits also enforce their equality through the permutation argument
+            // (see [`Self::build_with_z_blinding_copy_constraints`]).
             // See https://web.archive.org/web/20241007085249/https://mirprotocol.org/blog/Adding-zero-knowledge-to-Plonk-Halo
             for _ in 0..blinding_degree {
-                self.add_z_blinding();
+                self.add_z_blinding(connect_z_blinding);
             }
         }
 
@@ -907,29 +909,28 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         }
     }
 
-    /// Add a single Z polynomial blinding (adds 2 gates)
-    fn add_z_blinding(&mut self) {
+    /// Add a single Z polynomial blinding (adds 2 gates). `connect` additionally
+    /// constrains the two copies equal through the permutation argument rather than
+    /// only copying the witness value.
+    fn add_z_blinding(&mut self, connect: bool) {
         let num_routed_wires = self.config.num_routed_wires;
         let gate_1 = self.add_gate(NoopGate, vec![]);
         let gate_2 = self.add_gate(NoopGate, vec![]);
 
         for w in 0..num_routed_wires {
-            self.add_simple_generator(RandomValueGenerator {
-                target: Target::Wire(Wire {
-                    row: gate_1,
-                    column: w,
-                }),
+            let first = Target::Wire(Wire {
+                row: gate_1,
+                column: w,
             });
-            self.generate_copy(
-                Target::Wire(Wire {
-                    row: gate_1,
-                    column: w,
-                }),
-                Target::Wire(Wire {
-                    row: gate_2,
-                    column: w,
-                }),
-            );
+            let second = Target::Wire(Wire {
+                row: gate_2,
+                column: w,
+            });
+            self.add_simple_generator(RandomValueGenerator { target: first });
+            self.generate_copy(first, second);
+            if connect {
+                self.connect(first, second);
+            }
         }
     }
 
@@ -1040,8 +1041,16 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     }
 
     pub fn try_build_with_options<C: GenericConfig<D, F = F>>(
+        self,
+        commit_to_sigma: bool,
+    ) -> (CircuitData<F, C, D>, bool) {
+        self.try_build_internal(commit_to_sigma, false)
+    }
+
+    fn try_build_internal<C: GenericConfig<D, F = F>>(
         mut self,
         commit_to_sigma: bool,
+        connect_z_blinding: bool,
     ) -> (CircuitData<F, C, D>, bool) {
         let mut timing = TimingTree::new("preprocess", Level::Trace);
 
@@ -1096,7 +1105,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             self.add_simple_generator(const_gen);
         }
 
-        self.blind_and_pad();
+        self.blind_and_pad(connect_z_blinding);
         let degree = self.gate_instances.len();
         let degree_bits = log2_strict(degree);
         let fri_params = self.fri_params(degree_bits);
@@ -1286,6 +1295,25 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         self.build_with_options(true)
     }
 
+    /// Builds like [`Self::build`], but each pair of random Z-polynomial blinding values
+    /// is also constrained equal through the permutation argument instead of only being
+    /// copied at witness-generation time. New ZK circuits must build through here;
+    /// [`Self::build`] keeps the legacy unconstrained blinding so that already-deployed
+    /// circuit keys (V1/V2) are reproduced unchanged.
+    pub fn build_with_z_blinding_copy_constraints<C: GenericConfig<D, F = F>>(
+        self,
+    ) -> CircuitData<F, C, D> {
+        assert!(
+            self.config.zero_knowledge,
+            "Z blinding requires a ZK circuit"
+        );
+        let (circuit_data, success) = self.try_build_internal(true, true);
+        if !success {
+            panic!("Failed to build circuit");
+        }
+        circuit_data
+    }
+
     pub fn mock_build<C: GenericConfig<D, F = F>>(self) -> MockCircuitData<F, C, D> {
         let circuit_data = self.build_with_options(false);
         MockCircuitData {
@@ -1305,5 +1333,60 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+#[cfg(test)]
+mod z_blinding_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::iop::witness::PartialWitness;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn z_blinding_copy_constraints_are_opt_in() {
+        let mut config = CircuitConfig::standard_recursion_config();
+        config.zero_knowledge = true;
+        let num_blinding_pairs = witness_polynomial_blinding_degree::<2>(&config.fri_config);
+        let num_routed_wires = config.num_routed_wires;
+
+        let mut legacy = CircuitBuilder::<GoldilocksField, 2>::new(config.clone());
+        legacy.add_gate(NoopGate, vec![]);
+        legacy.blind_and_pad(false);
+        assert!(
+            legacy.copy_constraints.is_empty(),
+            "legacy circuits retain their original permutation"
+        );
+
+        let mut constrained = CircuitBuilder::<GoldilocksField, 2>::new(config);
+        constrained.add_gate(NoopGate, vec![]);
+        constrained.blind_and_pad(true);
+        assert_eq!(
+            constrained.copy_constraints.len(),
+            num_blinding_pairs * num_routed_wires
+        );
+        for constraint in &constrained.copy_constraints {
+            let (Target::Wire(first), Target::Wire(second)) = constraint.pair else {
+                panic!("Z blinding constraint must connect two wires");
+            };
+            assert_eq!(second.row, first.row + 1);
+            assert_eq!(second.column, first.column);
+        }
+    }
+
+    #[test]
+    fn constrained_z_blinding_proves_and_verifies() {
+        let mut config = CircuitConfig::standard_recursion_config();
+        config.zero_knowledge = true;
+        let mut builder = CircuitBuilder::<GoldilocksField, 2>::new(config);
+        let one = builder.one();
+        builder.register_public_input(one);
+        let circuit = builder.build_with_z_blinding_copy_constraints::<PoseidonGoldilocksConfig>();
+        let proof = circuit
+            .prove(PartialWitness::new())
+            .expect("generate a ZK proof");
+        circuit
+            .verify(proof)
+            .expect("verify constrained Z blinding");
     }
 }
