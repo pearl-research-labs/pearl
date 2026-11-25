@@ -34,6 +34,8 @@ func (m *mockWorker) Run(results chan<- *jobResult,
 			r.peer = m.peer
 
 			results <- r
+		case <-m.peer.OnDisconnect():
+			return
 		case <-quit:
 			return
 		}
@@ -42,6 +44,9 @@ func (m *mockWorker) Run(results chan<- *jobResult,
 
 type mockPeerRanking struct {
 	less func(i, j string) bool
+
+	// resets, if set, receives each peer passed to ResetRanking.
+	resets chan string
 }
 
 var _ PeerRanking = (*mockPeerRanking)(nil)
@@ -66,6 +71,9 @@ func (p *mockPeerRanking) Reward(peer string) {
 }
 
 func (p *mockPeerRanking) ResetRanking(peer string) {
+	if p.resets != nil {
+		p.resets <- peer
+	}
 }
 
 // startWorkManager starts a new workmanager with the given number of mock
@@ -103,6 +111,7 @@ func startWorkManager(t *testing.T, numWorkers int) (WorkManager,
 	for i := 0; i < numWorkers; i++ {
 		peer := &mockPeer{
 			addr: fmt.Sprintf("mock%v", i),
+			quit: make(chan struct{}),
 		}
 		select {
 		case peerChan <- peer:
@@ -658,5 +667,51 @@ func TestWorkManagerMaxRetries(t *testing.T) {
 	case <-wk.nextJob:
 		require.FailNow(t, "job retried past NumRetries")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestWorkManagerRemovesExitedWorker checks that a job skips a worker whose Run has returned.
+func TestWorkManagerRemovesExitedWorker(t *testing.T) {
+	workMgr, workers := startWorkManager(t, 2)
+	wm := workMgr.(*peerWorkManager) //nolint:forcetypeassert
+
+	// Offer jobs to mock0 first, so the dispatcher has to get past it.
+	wm.cfg.Ranking.(*mockPeerRanking).less = func(i, j string) bool { return i < j }
+
+	// Disconnect mock0's peer, which ends its worker.
+	close(workers[0].peer.(*mockPeer).quit) //nolint:forcetypeassert
+
+	wm.Query([]*Request{{}})
+
+	select {
+	case <-workers[1].nextJob:
+	case <-time.After(time.Second):
+		require.FailNow(t, "job not handed to the live worker")
+	}
+}
+
+// TestWorkManagerResetsRankOnDisconnect checks that a job failing with ErrPeerDisconnected resets that peer's rank.
+func TestWorkManagerResetsRankOnDisconnect(t *testing.T) {
+	workMgr, workers := startWorkManager(t, 1)
+	wm := workMgr.(*peerWorkManager) //nolint:forcetypeassert
+	wk := workers[0]
+
+	resets := make(chan string, 1)
+	wm.cfg.Ranking.(*mockPeerRanking).resets = resets
+
+	wm.Query([]*Request{{}})
+
+	select {
+	case job := <-wk.nextJob:
+		wk.results <- &jobResult{job: job, err: ErrPeerDisconnected}
+	case <-time.After(time.Second):
+		require.FailNow(t, "job not scheduled")
+	}
+
+	select {
+	case peer := <-resets:
+		require.Equal(t, wk.peer.Addr(), peer)
+	case <-time.After(time.Second):
+		require.FailNow(t, "rank not reset")
 	}
 }
