@@ -223,7 +223,7 @@ class TestFromStratumNotify:
         v1 = StratumNotify.from_params([*base, 1], extranonce=bytes(4))
         assert v1.cert_version == CertificateVersion.ZK_DENSE
 
-    @pytest.mark.parametrize("count", [8, 9, 11])
+    @pytest.mark.parametrize("count", [8, 9, 12])
     def test_stratum_notify_rejects_wrong_param_count(self, count):
         with pytest.raises(ValueError):
             StratumNotify.from_params(["x"] * count, extranonce=bytes(4))
@@ -299,9 +299,86 @@ class TestFromStratumNotify:
     def test_stratum_template_carries_notify_cert_version(self, stratum_notify_params):
         """The certificate version from mining.notify flows into the BlockTemplate."""
         for version in CertificateVersion:
-            notify = StratumNotify(**(stratum_notify_params | {"cert_version": version}))
+            # A cert-v4 job is only minable with the ancestor headers that key B.
+            ancestors = [bytes(108)] if version == CertificateVersion.PLAIN_FP8 else []
+            notify = StratumNotify(
+                **(stratum_notify_params | {"cert_version": version, "ancestor_headers": ancestors})
+            )
             template = BlockTemplate.from_stratum_notify(notify)
             assert template.required_cert_version == version
+
+
+class TestStratumNotifyCertV4:
+    """Cert-v4 (FP8) pool jobs carry ancestor headers as an optional 11th param."""
+
+    PARENT = bytes(range(108))
+    GRANDPARENT = bytes(reversed(range(108)))
+
+    def _params(self, cert_version, *extra):
+        return [
+            "job",
+            "00" * 32,
+            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704",
+            "0101ffffffff0100f2052a01000000232102deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            "deadbeefdeadbeefdeadbeefac00000000",
+            [],
+            "20000000",
+            "1e010000",
+            "69df47a7",
+            True,
+            cert_version,
+            *extra,
+        ]
+
+    def test_v4_job_carries_ancestors_into_template_and_mining_job(self):
+        params = self._params(4, [self.PARENT.hex(), self.GRANDPARENT.hex()])
+
+        notify = StratumNotify.from_params(params, extranonce=bytes(4))
+        template = BlockTemplate.from_stratum_notify(notify)
+        job = MiningJob.from_template(template)
+
+        assert notify.cert_version == CertificateVersion.PLAIN_FP8
+        assert template.ancestor_headers == [self.PARENT, self.GRANDPARENT]
+        assert job.ancestor_headers == [self.PARENT, self.GRANDPARENT]
+        assert job.parent_header == self.PARENT  # keys B
+
+    @pytest.mark.parametrize("cert_version", [1, 2, 3])
+    def test_pre_v4_ten_param_jobs_are_unchanged(self, cert_version):
+        notify = StratumNotify.from_params(self._params(cert_version), extranonce=bytes(4))
+
+        assert int(notify.cert_version) == cert_version
+        assert BlockTemplate.from_stratum_notify(notify).ancestor_headers == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            (),  # 10 params: no ancestors at all
+            ([],),  # 11th param present but empty
+        ],
+    )
+    def test_v4_job_without_ancestors_is_rejected(self, extra):
+        with pytest.raises(ValueError, match="ancestor"):
+            StratumNotify.from_params(self._params(4, *extra), extranonce=bytes(4))
+
+    @pytest.mark.parametrize("cert_version", [1, 2, 3])
+    def test_ancestors_on_a_pre_v4_job_are_rejected(self, cert_version):
+        with pytest.raises(ValueError, match="only valid on a cert-v4"):
+            StratumNotify.from_params(
+                self._params(cert_version, [self.PARENT.hex()]), extranonce=bytes(4)
+            )
+
+    def test_ancestors_beyond_the_state_window_are_dropped(self):
+        headers = [bytes([i]) * 108 for i in range(10)]
+
+        notify = StratumNotify.from_params(
+            self._params(4, [h.hex() for h in headers]), extranonce=bytes(4)
+        )
+
+        assert notify.ancestor_headers == headers[:4]
+
+    def test_ancestor_header_must_be_108_bytes(self):
+        with pytest.raises(ValueError, match="108-byte"):
+            StratumNotify.from_params(self._params(4, ["00" * 80]), extranonce=bytes(4))
 
 
 class TestPoolMiningJob:
