@@ -177,12 +177,3 @@ func TestCheckBlockSanityRejectsV4WithoutFp8Fork(t *testing.T) {
 	requireRuleError(t, err, ErrDisallowedCertVersion)
 	require.ErrorContains(t, err, "FP8 fork is not scheduled")
 }
-
-func TestNewRejectsFp8BeforeSaltedSeedFork(t *testing.T) {
-	params := fp8SimNetParams()
-	params.SaltedSeedForkHeight = 5
-	params.Fp8ForkHeight = 4
-	_, _, err := chainSetup("fp8_fork_ordering", &params)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "Fp8ForkHeight")
-}

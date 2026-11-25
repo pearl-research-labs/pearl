@@ -264,6 +264,28 @@ func TestShippedNetworksRankPenaltyOrdering(t *testing.T) {
 	}
 }
 
+// TestShippedNetworksFp8ForkOrdering asserts that no shipped network activates the FP8 fork before the cutover it
+// supersedes: V4 replaces V3, or V2 on a network where the salted-seed fork is disabled.
+func TestShippedNetworksFp8ForkOrdering(t *testing.T) {
+	for name, params := range map[string]*Params{
+		"mainnet":  &MainNetParams,
+		"testnet":  &TestNetParams,
+		"testnet2": &TestNet2Params,
+		"regtest":  &RegressionNetParams,
+		"simnet":   &SimNetParams,
+	} {
+		if params.Fp8ForkHeight == 0 {
+			continue
+		}
+		predecessor := params.SaltedSeedForkHeight
+		if predecessor == 0 {
+			predecessor = params.MoEForkHeight
+		}
+		require.GreaterOrEqualf(t, params.Fp8ForkHeight, predecessor,
+			"%s must not activate the FP8 fork before the V3/V2 cutover it supersedes", name)
+	}
+}
+
 // TestShippedNetworksMoEForkHeights pins the MoE hardfork activation heights
 // for the shipped networks so they cannot change accidentally.
 func TestShippedNetworksMoEForkHeights(t *testing.T) {
