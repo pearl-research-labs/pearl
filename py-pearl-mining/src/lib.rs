@@ -14,6 +14,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod cert_version;
 mod common;
+mod cpu_b;
 mod v1;
 mod v2;
 mod v4;
@@ -58,5 +59,6 @@ fn pearl_mining(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     v4::register_proofs(m)?;
     v1::register(m)?;
     cert_version::register(m)?;
+    cpu_b::register(m)?;
     Ok(())
 }

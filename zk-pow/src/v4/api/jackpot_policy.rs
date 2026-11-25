@@ -192,29 +192,99 @@ impl JackpotPolicy {
         Ok(Some(acc))
     }
 
+    /// Runs every check (even past the first failure) and formats a diagnostic
+    /// report naming the first failing check plus per-check quantities.
+    pub(crate) fn diagnose(&self, a: &OperandStrip, b: &OperandStrip, k: usize) -> Result<String> {
+        let mut checks: Vec<(&str, bool, String)> = Vec::with_capacity(7);
+
+        for (label, side) in [("liveness (A)", a), ("liveness (B)", b)] {
+            let dead = self.dead_count(side);
+            let limit = self.eps_idle * side.clean.len() as f64;
+            checks.push((label, (dead as f64) <= limit, format!("dead={dead} limit={limit}")));
+        }
+
+        let sigma_a = sigmas(&a.built, self.device);
+        let sigma_b = sigmas(&b.built, self.device);
+        for (label, sigs, rms_min) in [
+            ("noise floor (A)", &sigma_a, self.rms_min_a),
+            ("noise floor (B)", &sigma_b, self.rms_min_b),
+        ] {
+            let floor = self.device.delta() * rms_min;
+            let failing = sigs.iter().filter(|&&s| s < floor).count();
+            let min_sigma = sigs.iter().copied().fold(f64::INFINITY, f64::min);
+            let min_sigma = if min_sigma.is_finite() { min_sigma } else { 0.0 };
+            checks.push((
+                label,
+                failing == 0,
+                format!("min_sigma={min_sigma:.6} floor={floor:.6} failing_rows={failing}"),
+            ));
+        }
+
+        let (_, skippable) = self.census_counts(a, b, k, sigma_a.len(), sigma_b.len())?;
+        let cap = budget(k, sigma_a.len(), sigma_b.len());
+        checks.push((
+            "unpredictable summands",
+            skippable <= cap,
+            format!("skippable={skippable} budget={cap}"),
+        ));
+
+        let cov_threshold = (k as u64 * COVERAGE_SCALE * COVERAGE_SCALE).div_ceil(NOISE_COVERAGE_MIN_INVERSE);
+        for (label, side) in [("noise coverage (A)", a), ("noise coverage (B)", b)] {
+            let (failing, min_product) = self.coverage_stats(side, k, cov_threshold);
+            checks.push((
+                label,
+                failing == 0,
+                format!("min_product={min_product} threshold={cov_threshold} failing_rows={failing}"),
+            ));
+        }
+
+        let first_fail = checks
+            .iter()
+            .find(|(_, ok, _)| !*ok)
+            .map(|(name, _, _)| *name)
+            .unwrap_or("passed");
+        let mut out = format!("jackpot policy rejected ({first_fail})");
+        for (name, ok, details) in checks {
+            let status = if ok { "pass" } else { "fail" };
+            out.push_str(&format!("\n  {name}: {status} {details}"));
+        }
+        Ok(out)
+    }
+
     /// Check 1: the fraction of dead entries over all of the side's tile
     /// entries is at most `eps_idle`. Entry `u` of row `i` is dead iff
     /// `|X_bar_iu| >= tau_idle * sigma_i`. Since `X_bar_iu = alpha_i * X_iu`
     /// and `sigma_i = DELTA * alpha_i * l2_i` (with `alpha_i > 0`), this is
     /// `alpha`-free: `|X_iu| >= tau_idle * DELTA * l2_i`.
-    fn liveness_ok(&self, side: &OperandStrip) -> bool {
+    fn dead_count(&self, side: &OperandStrip) -> usize {
         let clean = &side.clean;
         let l2 = &side.built.l2;
         let k = clean.len() / l2.len();
-        let dead: usize = clean
+        clean
             .chunks(k)
             .zip(l2)
             .map(|(row, &l2)| {
                 let dead_bound = self.tau_idle * self.device.delta() * bf16_to_f32(l2) as f64;
                 row.iter().filter(|&&x| bf16_to_f32(x).abs() as f64 >= dead_bound).count()
             })
-            .sum();
-        dead as f64 <= self.eps_idle * clean.len() as f64
+            .sum()
+    }
+
+    fn liveness_ok(&self, side: &OperandStrip) -> bool {
+        self.dead_count(side) as f64 <= self.eps_idle * side.clean.len() as f64
     }
 
     /// Check 3: count skippable summands using the replay's M/Z magnitudes.
     /// Return the final matrix if the count is within budget, or `None` on rejection.
     fn census_ok(&self, a: &OperandStrip, b: &OperandStrip, k: usize, h: usize, w: usize) -> Result<Option<Vec<f32>>> {
+        let (acc, skippable) = self.census_counts(a, b, k, h, w)?;
+        if skippable > budget(k, h, w) {
+            return Ok(None);
+        }
+        Ok(Some(acc))
+    }
+
+    fn census_counts(&self, a: &OperandStrip, b: &OperandStrip, k: usize, h: usize, w: usize) -> Result<(Vec<f32>, u64)> {
         // Exact decodes of the noised FP8 codes (fp8 -> fp32 is exact).
         let a_prime: Vec<f32> = a.built.noised_part.iter().map(|&c| fp8_e4m3_to_f32(c)).collect();
         let b_prime: Vec<f32> = b.built.noised_part.iter().map(|&c| fp8_e4m3_to_f32(c)).collect();
@@ -282,10 +352,33 @@ impl JackpotPolicy {
             }
         }
 
-        if skippable > budget(k, h, w) {
-            return Ok(None);
+        Ok((acc, skippable))
+    }
+
+    fn coverage_stats(&self, side: &OperandStrip, k: usize, threshold: u64) -> (usize, u64) {
+        let mut failing = 0usize;
+        let mut min_product = u64::MAX;
+        for (row, (&alpha, &l2)) in side.clean.chunks(k).zip(side.built.alpha.iter().zip(&side.built.l2)) {
+            let Ok((coefficient, kernel_cap)) = gauss_row_constants(alpha, l2, self.device) else {
+                failing += 1;
+                min_product = 0;
+                continue;
+            };
+            let lambda_noise = lambda(self.device, alpha, 0, l2);
+            let kernel_sum: u64 = row
+                .iter()
+                .map(|&x| {
+                    let difference = lambda(self.device, alpha, x, l2) - lambda_noise;
+                    gauss_kernel(difference).min(kernel_cap)
+                })
+                .sum();
+            let product = coefficient.saturating_mul(kernel_sum);
+            min_product = min_product.min(product);
+            if product < threshold {
+                failing += 1;
+            }
         }
-        Ok(Some(acc))
+        (failing, if min_product == u64::MAX { 0 } else { min_product })
     }
 
     /// Check 4: every row's computed mean noise coverage is at least
