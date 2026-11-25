@@ -42,7 +42,9 @@ var oneHeaderEncoded = []byte{
 }
 
 func TestHeadersMaxPayloadLength(t *testing.T) {
-	want := uint32(MaxVarIntPayload + ((MaxBlockHeaderPayload + CertificateMaxSize) * MaxBlockHeadersPerMsg))
+	// Stated independently of the production expression, which would agree with any value the code produces.
+	// 6,510,809 is the count varint (9) plus 100 headers, each 108 bytes with a maximum-size certificate (65,000).
+	want := uint32(6510809)
 	require.Equal(t, want, NewMsgHeaders().MaxPayloadLength(ProtocolVersion))
 }
 

@@ -201,15 +201,13 @@ func TestFp8ForkDisabled(t *testing.T) {
 }
 
 func TestShippedNetworksFp8ForkHeights(t *testing.T) {
-	for name, params := range map[string]*Params{
-		"mainnet": &MainNetParams,
-	} {
-		require.Zerof(t, params.Fp8ForkHeight, "%s must ship with Fp8ForkHeight disabled", name)
-	}
+	require.Zero(t, MainNetParams.Fp8ForkHeight, "mainnet must ship with Fp8ForkHeight disabled")
 	require.Equal(t, int32(67415), TestNetParams.Fp8ForkHeight,
 		"testnet FP8 fork height changed")
 	require.Greater(t, TestNetParams.Fp8ForkHeight, TestNetParams.SaltedSeedForkHeight,
 		"testnet FP8 fork must follow the salted-seed fork")
+	require.Equal(t, int32(150283), TestNet2Params.Fp8ForkHeight,
+		"testnet2 FP8 fork height changed")
 	require.Equal(t, int32(1), RegressionNetParams.Fp8ForkHeight,
 		"regtest must require V4 certificates from genesis")
 	require.Equal(t, int32(1), SimNetParams.Fp8ForkHeight,

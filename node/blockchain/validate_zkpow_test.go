@@ -18,7 +18,8 @@ import (
 )
 
 func TestCertificateV4AncestorValidation(t *testing.T) {
-	// Fixture framing is header(76), public length(4), public data, proof.
+	// Fixture framing is header(76), public length(4), public data, chain length(1), ancestor chain, proof. Only the
+	// public data is used here.
 	raw, err := os.ReadFile("../zkpow/testdata/fp8_zk_proof_b200.bin")
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(raw), 80)
