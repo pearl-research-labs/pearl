@@ -10,6 +10,7 @@ import pearl_mining
 import torch
 from blake3 import blake3
 from miner_utils import get_logger
+from pearl_gateway.blockchain_utils.blockchain_utils import target_to_bits
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_mining import (
     CERT_VERSION_PLAIN_FP8,
@@ -444,8 +445,13 @@ def submit_opened_block(
     plain_proof = create_proof(
         opened_block_info, header, ancestor, mining_job.ancestor_chain_to(ancestor)
     )
+    # Check against the job's own target: in pool mode that is the share target,
+    # which most shares meet without meeting the network target in the header.
     is_valid, message = verify_plain_proof_for_cert_version(
-        mining_job.cert_version, header, plain_proof
+        mining_job.cert_version,
+        header,
+        plain_proof,
+        nbits_override=target_to_bits(mining_job.target),
     )
     if not is_valid:
         if message.startswith(_JACKPOT_INADMISSIBLE):

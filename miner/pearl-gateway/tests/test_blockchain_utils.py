@@ -1,6 +1,11 @@
+import pytest
 from bitcoinutils.bech32 import Encoding, bech32_encode, convertbits
 from bitcoinutils.transactions import Transaction
-from pearl_gateway.blockchain_utils.blockchain_utils import create_coinbase_transaction
+from pearl_gateway.blockchain_utils.blockchain_utils import (
+    bits_to_target,
+    create_coinbase_transaction,
+    target_to_bits,
+)
 
 
 class TestCreateCoinbaseTransaction:
@@ -35,3 +40,13 @@ class TestCreateCoinbaseTransaction:
         )
 
         assert our_coinbase.to_hex() == node_coinbase_hex
+
+
+@pytest.mark.parametrize("bits", [0x1B00FFFF, 0x1A7FFF80, 0x1D00FFFF, 0x1E010000, 0x207FFFFF])
+def test_target_to_bits_round_trips_compact_targets(bits):
+    assert bits_to_target(target_to_bits(bits_to_target(bits))) == bits_to_target(bits)
+
+
+def test_target_to_bits_keeps_the_sign_bit_clear():
+    # 0x800000 as a mantissa would be negative, so it moves to the next exponent.
+    assert target_to_bits(0x800000) == 0x04008000

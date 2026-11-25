@@ -28,6 +28,7 @@ from miner_base.protocol import (
     tall_tile_mining_config,
 )
 from miner_base.settings import MinerSettings
+from pearl_gateway.blockchain_utils.blockchain_utils import bits_to_target
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gateway.config import MinerRpcConfig
@@ -678,6 +679,26 @@ def test_submission_resolves_the_selected_b_ancestor(depth):
             opening, replace(job, ancestor_headers=job.ancestor_headers[:-1]), client
         )
     client.submit_plain_proof.assert_not_called()
+
+
+def test_submission_verifies_against_the_job_target_not_the_header():
+    # Pool mode: the job's target is the pool share target, far easier than the
+    # network nbits in the header, so most shares only meet the job target.
+    share_bits = 0x1D00FFFF
+    job = replace(_plain_job(), target=bits_to_target(share_bits))
+    client = Mock()
+    with (
+        patch("miner_base.block_submission.create_proof") as create,
+        patch(
+            "miner_base.block_submission.verify_plain_proof_for_cert_version",
+            return_value=(True, "ok"),
+        ) as verify,
+    ):
+        proof = submit_opened_block(_opening(), job, client)
+
+    assert verify.call_args.kwargs["nbits_override"] == share_bits
+    assert proof is create.return_value
+    client.submit_plain_proof.assert_called_once_with(proof, job)
 
 
 def test_submission_rejects_non_fp8_job_before_gateway_handoff():
