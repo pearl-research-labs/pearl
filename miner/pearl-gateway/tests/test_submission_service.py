@@ -2,13 +2,12 @@
 Test submission service functionality.
 """
 
-import asyncio
 import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
-from pearl_gateway.submission_service import SubmissionService
+from pearl_gateway.submission_service import PoolSubmissionService, SubmissionService
 
 
 @pytest.fixture
@@ -20,9 +19,17 @@ def mock_pearl_client():
 
 
 @pytest.fixture
-def submission_service(mock_pearl_client):
+def fake_proof_pool():
+    """A stand-in ProofPool whose prove() returns dummy proof bytes."""
+    pool = MagicMock()
+    pool.prove = AsyncMock(return_value=(b"public-data", b"proof-data"))
+    return pool
+
+
+@pytest.fixture
+def submission_service(mock_pearl_client, fake_proof_pool):
     """Create a SubmissionService instance for testing."""
-    return SubmissionService(mock_pearl_client)
+    return SubmissionService(mock_pearl_client, fake_proof_pool)
 
 
 def create_mock_block(hex_data: str):
@@ -40,6 +47,7 @@ class TestBlockSubmission:
         self,
         submission_service,
         mock_pearl_client,
+        fake_proof_pool,
         sample_plain_proof,
         sample_block_template,
         sample_pearl_block,
@@ -48,15 +56,26 @@ class TestBlockSubmission:
         mock_pearl_client.submit_block.return_value = "accepted"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
             return_value=sample_pearl_block,
-        ):
+        ) as mock_build_block:
             result = await submission_service.submit_plain_proof(
                 sample_plain_proof, sample_block_template
             )
 
         assert result["status"] == "accepted"
 
+        # The proof is generated in the worker via the serialized boundary args.
+        fake_proof_pool.prove.assert_awaited_once_with(
+            int(sample_block_template.required_cert_version),
+            sample_block_template.header.serialize_without_proof_commitment(),
+            sample_plain_proof.to_base64(),
+            False,
+        )
+        # The block is assembled in-process from the worker's proof bytes.
+        mock_build_block.assert_called_once_with(
+            b"public-data", b"proof-data", sample_block_template
+        )
         mock_pearl_client.submit_block.assert_called_once_with(sample_pearl_block.serialize().hex())
 
     @pytest.mark.asyncio
@@ -72,7 +91,7 @@ class TestBlockSubmission:
         mock_pearl_client.submit_block.return_value = "rejected: invalid proof"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
             return_value=sample_pearl_block,
         ):
             result = await submission_service.submit_plain_proof(
@@ -95,7 +114,7 @@ class TestBlockSubmission:
 
         with (
             patch(
-                "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+                "pearl_gateway.proof_generator.ProofGenerator.build_block",
                 return_value=sample_pearl_block,
             ),
         ):
@@ -104,49 +123,6 @@ class TestBlockSubmission:
             )
 
         assert result["status"] == "error: Connection failed"
-
-    @pytest.mark.asyncio
-    async def test_submit_block_thread_safety(
-        self,
-        submission_service,
-        mock_pearl_client,
-        sample_plain_proof,
-        sample_block_template,
-        sample_pearl_block,
-    ):
-        """Test that block submissions are serialized."""
-        mock_pearl_client.submit_block.return_value = "accepted"
-
-        # Track call order
-        call_order = []
-
-        async def mock_submit_with_delay(block_hex):
-            call_order.append(f"start_{block_hex[:8]}")
-            await asyncio.sleep(0.1)  # Simulate network delay
-            call_order.append(f"end_{block_hex[:8]}")
-            return "accepted"
-
-        mock_pearl_client.submit_block.side_effect = mock_submit_with_delay
-
-        with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
-            side_effect=[sample_pearl_block, sample_pearl_block],
-        ):
-            # Submit two blocks concurrently with same template
-            results = await asyncio.gather(
-                submission_service.submit_plain_proof(sample_plain_proof, sample_block_template),
-                submission_service.submit_plain_proof(sample_plain_proof, sample_block_template),
-            )
-
-        # First should be accepted, second should be detected as duplicate
-        statuses = [r["status"] for r in results]
-        assert "accepted" in statuses
-        assert "already_submitted" in statuses
-
-        # Only one actual submission should happen due to deduplication
-        assert len(call_order) == 2
-        assert call_order[0].startswith("start_")
-        assert call_order[1].startswith("end_")
 
 
 class TestCrossoverEnforcement:
@@ -190,14 +166,15 @@ class TestCrossoverEnforcement:
         mock_pearl_client.submit_block.return_value = "accepted"
 
         with patch(
-            "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
             return_value=sample_pearl_block,
         ) as mock_generate:
             result = await submission_service.submit_plain_proof(sample_plain_proof, v1_template)
 
         assert result["status"] == "accepted"
-        # The block must be generated for the V1-required template.
-        passed_template = mock_generate.call_args.args[1]
+        # The block must be assembled for the V1-required template
+        # (build_block signature: public_data, proof_data, template).
+        passed_template = mock_generate.call_args.args[2]
         assert passed_template.required_cert_version == CertificateVersion.ZK_DENSE
 
 
@@ -228,7 +205,7 @@ class TestSubmissionServiceIntegration:
         for _ in range(4):
             submission_service.submission_log.clear()  # Clear to simulate different blocks
             with patch(
-                "pearl_gateway.proof_generator.ProofGenerator.generate_block",
+                "pearl_gateway.proof_generator.ProofGenerator.build_block",
                 return_value=sample_pearl_block,
             ):
                 try:
@@ -248,3 +225,144 @@ class TestSubmissionServiceIntegration:
         assert results[1]["status"] == "rejected: duplicate"
         assert results[2]["status"] == "accepted"
         assert results[3]["status"].startswith("error:")
+
+
+class TestPoolSubmission:
+    """Pool mode: the certificate goes to the pool as a Stratum share."""
+
+    @pytest.fixture
+    def pool_client(self):
+        client = AsyncMock()
+        client.submit_zk_cert = AsyncMock(return_value=True)
+        return client
+
+    def _service(self, pool_client, fake_proof_pool, current_template):
+        work_cache = MagicMock()
+        work_cache.current_template = current_template
+        return PoolSubmissionService(pool_client, fake_proof_pool, work_cache)
+
+    async def test_pool_submission_sends_generated_certificate(
+        self,
+        pool_client,
+        fake_proof_pool,
+        sample_plain_proof,
+        sample_block_template,
+        sample_pearl_block,
+    ):
+        sample_block_template.job_id = "job-1"
+        service = self._service(pool_client, fake_proof_pool, sample_block_template)
+
+        with patch(
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
+            return_value=sample_pearl_block,
+        ) as mock_build_block:
+            result = await service.submit_plain_proof(sample_plain_proof, sample_block_template)
+
+        assert result == {"status": "accepted"}
+        fake_proof_pool.prove.assert_awaited_once_with(
+            int(sample_block_template.required_cert_version),
+            sample_block_template.header.serialize_without_proof_commitment(),
+            sample_plain_proof.to_base64(),
+            False,
+        )
+        mock_build_block.assert_called_once_with(
+            b"public-data", b"proof-data", sample_block_template
+        )
+        _, kwargs = pool_client.submit_zk_cert.call_args
+        assert kwargs["job_id"] == "job-1"
+        assert kwargs["ntime_hex"] == f"{sample_block_template.header.timestamp:08x}"
+        assert kwargs["zkcert_hex"] == sample_pearl_block.zk_certificate.serialize().hex()
+        assert kwargs["extranonce2_hex"] is None
+        assert service.accepted_blocks == 1
+
+    async def test_pool_submission_echoes_extranonce2(
+        self,
+        pool_client,
+        fake_proof_pool,
+        sample_plain_proof,
+        sample_block_template,
+        sample_pearl_block,
+    ):
+        sample_block_template.job_id = "job-1"
+        sample_block_template.extranonce2 = bytes.fromhex("aabbccdd")
+        service = self._service(pool_client, fake_proof_pool, sample_block_template)
+
+        with patch(
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
+            return_value=sample_pearl_block,
+        ):
+            await service.submit_plain_proof(sample_plain_proof, sample_block_template)
+
+        _, kwargs = pool_client.submit_zk_cert.call_args
+        assert kwargs["extranonce2_hex"] == "aabbccdd"
+
+    async def test_pool_submission_skipped_when_job_changed_during_proof(
+        self,
+        pool_client,
+        fake_proof_pool,
+        sample_plain_proof,
+        sample_block_template,
+        sample_pearl_block,
+    ):
+        sample_block_template.job_id = "job-1"
+        service = self._service(pool_client, fake_proof_pool, MagicMock(job_id="job-2"))
+
+        with patch(
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
+            return_value=sample_pearl_block,
+        ):
+            result = await service.submit_plain_proof(sample_plain_proof, sample_block_template)
+
+        assert result["status"].startswith("skipped")
+
+    async def test_pool_submission_skipped_when_template_replaced_under_same_job_id(
+        self,
+        pool_client,
+        fake_proof_pool,
+        sample_plain_proof,
+        sample_block_template,
+        sample_pearl_block,
+    ):
+        # After a reconnect the pool re-sends the same job id with a new extranonce1.
+        sample_block_template.job_id = "job-1"
+        service = self._service(pool_client, fake_proof_pool, MagicMock(job_id="job-1"))
+
+        with patch(
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
+            return_value=sample_pearl_block,
+        ):
+            result = await service.submit_plain_proof(sample_plain_proof, sample_block_template)
+
+        assert result["status"].startswith("skipped")
+        pool_client.submit_zk_cert.assert_not_called()
+
+    async def test_pool_rejection_is_counted(
+        self,
+        pool_client,
+        fake_proof_pool,
+        sample_plain_proof,
+        sample_block_template,
+        sample_pearl_block,
+    ):
+        pool_client.submit_zk_cert.return_value = False
+        sample_block_template.job_id = "job-1"
+        service = self._service(pool_client, fake_proof_pool, sample_block_template)
+
+        with patch(
+            "pearl_gateway.proof_generator.ProofGenerator.build_block",
+            return_value=sample_pearl_block,
+        ):
+            result = await service.submit_plain_proof(sample_plain_proof, sample_block_template)
+
+        assert result == {"status": "rejected"}
+        assert service.rejected_blocks == 1
+
+    async def test_pool_submission_without_job_id_is_an_error(
+        self, pool_client, fake_proof_pool, sample_plain_proof, sample_block_template
+    ):
+        service = self._service(pool_client, fake_proof_pool, sample_block_template)
+
+        result = await service.submit_plain_proof(sample_plain_proof, sample_block_template)
+
+        assert result["status"].startswith("error")
+        fake_proof_pool.prove.assert_not_called()

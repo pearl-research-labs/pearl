@@ -25,7 +25,6 @@ require (
 	github.com/lightningnetwork/lnd/clock v1.1.1
 	github.com/lightningnetwork/lnd/fn/v2 v2.0.10
 	github.com/lightningnetwork/lnd/queue v1.2.1
-	github.com/lightningnetwork/lnd/ticker v1.1.1
 	github.com/lightningnetwork/lnd/tlv v1.4.1
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/miekg/dns v1.1.73
@@ -166,6 +165,7 @@ require (
 	github.com/ldez/tagliatelle v0.7.1 // indirect
 	github.com/ldez/usetesting v0.4.2 // indirect
 	github.com/leonklingele/grouper v1.1.2 // indirect
+	github.com/lightningnetwork/lnd/ticker v1.1.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.1 // indirect
 	github.com/macabu/inamedparam v0.1.3 // indirect
 	github.com/magiconair/properties v1.8.10 // indirect

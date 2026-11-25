@@ -966,6 +966,10 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 		peer.PushRejectMsg(wire.CmdBlock, code, reason, blockHash, false)
 		return err
 	}
+	if isMainChain {
+		log.Infof("Block %v (height %d) from peer %s connected to main chain",
+			blockHash, bmsg.block.Height(), peer)
+	}
 
 	// Meta-data about the new block this peer is reporting. We use this
 	// below to update this peer's latest block height and the heights of

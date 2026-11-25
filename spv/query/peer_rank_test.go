@@ -3,6 +3,8 @@ package query
 import (
 	"fmt"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestPeerRank checks that the peerRanking correctly orders peers according to
@@ -77,4 +79,18 @@ func TestPeerRank(t *testing.T) {
 	if peers[len(peers)-1] == lowestScoredPeer {
 		t.Fatalf("peer0 should not be last.")
 	}
+}
+
+// TestPeerRankAddExisting checks that re-adding a peer keeps its score.
+func TestPeerRankAddExisting(t *testing.T) {
+	ranking := NewPeerRanking()
+	ranking.AddPeer("a")
+	ranking.AddPeer("b")
+	ranking.Punish("a")
+
+	ranking.AddPeer("a")
+
+	peers := []string{"a", "b"}
+	ranking.Order(peers)
+	require.Equal(t, []string{"b", "a"}, peers)
 }
