@@ -65,7 +65,8 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 // checkProofSize preserves the historical size bound for versions before V4.
 func checkProofSize(cert wire.BlockCertificate) error {
 	if cert != nil && cert.Version() < wire.CertificateVersionV4 && len(cert.ProofBytes()) > legacyMaxZKProofSize {
-		return fmt.Errorf("v%d proof rejected: legacy proof data too large: %d bytes (max %d)", cert.Version(), len(cert.ProofBytes()), legacyMaxZKProofSize)
+		return fmt.Errorf("v%d proof rejected: legacy proof data too large: %d bytes (max %d)",
+			cert.Version(), len(cert.ProofBytes()), legacyMaxZKProofSize)
 	}
 	return nil
 }
@@ -169,8 +170,6 @@ func VerifyZKProofFFI(
 		return fmt.Errorf("empty proof data")
 	}
 
-	cBlockHeader := blockHeaderToC(header)
-
 	var cZKProof C.CZKProof
 	cZKProof.public_data_len = C.uintptr_t(len(publicData))
 	C.memcpy(unsafe.Pointer(&cZKProof.public_data[0]), unsafe.Pointer(&publicData[0]), C.size_t(len(publicData)))
@@ -184,17 +183,18 @@ func VerifyZKProofFFI(
 	cZKProof.proof_blob_len = C.uintptr_t(len(proofData))
 	cZKProof.proof_blob = proofBlobPtr
 
-	nbits := header.Bits
-	if nbitsOverride != nil {
-		nbits = *nbitsOverride
+	if v4, ok := cert.(*wire.CertificateV4); ok {
+		nbits := header.Bits
+		if nbitsOverride != nil {
+			nbits = *nbitsOverride
+		}
+		return verifyV4FFI(header, v4, &cZKProof, nbits)
 	}
 
 	// Call Rust FFI
+	cBlockHeader := blockHeaderToC(header)
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
 	var result C.int32_t
-	if v4, ok := cert.(*wire.CertificateV4); ok {
-		return verifyV4FFI(header, v4, &cZKProof, nbits)
-	}
 	switch cert.Version() {
 	case wire.CertificateVersionV2:
 		if nbitsOverride != nil {

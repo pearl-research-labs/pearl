@@ -53,8 +53,10 @@ func MineV4(header, parent *wire.BlockHeader, device int) (*wire.CertificateV4, 
 	if result != 0 {
 		return nil, fmt.Errorf("V4 mining failed (code %d): %s", result, C.GoString(&errorBuf[0]))
 	}
-	if out.public_data_len != C.PublicParams_WIRE_SIZE || out.proof_blob_len == 0 || out.proof_blob_len > C.MAX_ZK_PROOF_SIZE {
-		return nil, fmt.Errorf("unexpected V4 mining output lengths: public=%d proof=%d", out.public_data_len, out.proof_blob_len)
+	if out.public_data_len != C.PublicParams_WIRE_SIZE ||
+		out.proof_blob_len == 0 || out.proof_blob_len > C.MAX_ZK_PROOF_SIZE {
+		return nil, fmt.Errorf("unexpected V4 mining output lengths: public=%d proof=%d",
+			out.public_data_len, out.proof_blob_len)
 	}
 	cert := &wire.CertificateV4{
 		PublicData: C.GoBytes(unsafe.Pointer(&out.public_data[0]), C.int(out.public_data_len)),

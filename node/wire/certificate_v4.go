@@ -143,13 +143,15 @@ func (c *CertificateV4) Deserialize(r io.Reader) error {
 		return fmt.Errorf("too many v4 ancestor headers: %d (max %d)",
 			count, MaxCertificateV4AncestorHeaders)
 	}
+	// A zero count decodes as nil, like the blobs above.
 	var ancestors []BlockHeader
-	for range count {
-		var header BlockHeader
-		if err := header.Deserialize(r); err != nil {
+	if count > 0 {
+		ancestors = make([]BlockHeader, count)
+	}
+	for i := range ancestors {
+		if err := ancestors[i].Deserialize(r); err != nil {
 			return err
 		}
-		ancestors = append(ancestors, header)
 	}
 	c.PublicData = publicData
 	c.ProofData = proofData
