@@ -6,7 +6,6 @@ package chain
 
 import (
 	"github.com/btcsuite/btclog"
-	"github.com/pearl-research-labs/pearl/spv/query"
 )
 
 // log is a logger that is initialized with no output filters.  This
@@ -30,7 +29,6 @@ func DisableLog() {
 // using btclog.
 func UseLogger(logger btclog.Logger) {
 	log = logger
-	query.UseLogger(logger)
 }
 
 // LogClosure is used to provide a closure over expensive logging operations so
