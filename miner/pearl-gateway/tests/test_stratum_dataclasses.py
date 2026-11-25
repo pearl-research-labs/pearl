@@ -15,19 +15,20 @@ from pearl_gateway.comm.dataclasses import (
     StratumSetDifficulty,
 )
 
+NOTIFY_COINB1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704"
+NOTIFY_COINB2 = (
+    "0101ffffffff0100f2052a01000000232102deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    "deadbeefdeadbeefdeadbeefac00000000"
+)
+
 
 @pytest.fixture
 def stratum_notify_params() -> dict[str, Any]:
     return {
         "job_id": "test",
         "prev_hash": "00" * 32,
-        "coinb1": (
-            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704"
-        ),
-        "coinb2": (
-            "0101ffffffff0100f2052a01000000232102deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-            "deadbeefdeadbeefdeadbeefac00000000"
-        ),
+        "coinb1": NOTIFY_COINB1,
+        "coinb2": NOTIFY_COINB2,
         "merkle_branch": [],
         "version": "20000000",
         "bits": "1e010000",
@@ -59,10 +60,6 @@ class TestFromStratumNotify:
         prev_hash = "c345c8a096b00cd8aa85d6f3c369a3496708680199804555797829e9000774c5"
 
         # Minimal stratum notify params (no merkle branch, trivial coinbase)
-        coinb1 = (
-            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704"
-        )
-        coinb2 = "0101ffffffff0100f2052a01000000232102deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefac00000000"
         extranonce = bytes(4)
 
         notify = StratumNotify(
@@ -70,8 +67,8 @@ class TestFromStratumNotify:
                 stratum_notify_params
                 | {
                     "prev_hash": prev_hash,
-                    "coinb1": coinb1,
-                    "coinb2": coinb2,
+                    "coinb1": NOTIFY_COINB1,
+                    "coinb2": NOTIFY_COINB2,
                     "extranonce": extranonce,
                 }
             )
@@ -318,9 +315,8 @@ class TestStratumNotifyCertV4:
         return [
             "job",
             "00" * 32,
-            "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704",
-            "0101ffffffff0100f2052a01000000232102deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-            "deadbeefdeadbeefdeadbeefac00000000",
+            NOTIFY_COINB1,
+            NOTIFY_COINB2,
             [],
             "20000000",
             "1e010000",

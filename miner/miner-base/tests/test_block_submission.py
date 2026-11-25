@@ -681,23 +681,15 @@ def test_submission_resolves_the_selected_b_ancestor(depth):
     client.submit_plain_proof.assert_not_called()
 
 
-def test_submission_verifies_against_the_job_target_not_the_header():
-    # Pool mode: the job's target is the pool share target, far easier than the
-    # network nbits in the header, so most shares only meet the job target.
-    share_bits = 0x1D00FFFF
-    job = replace(_plain_job(), target=bits_to_target(share_bits))
+def test_submission_accepts_a_share_that_only_meets_the_job_target():
+    # A pool share meets the job's share target but not the header's network
+    # nbits; verifying against the header dropped every pool share.
+    job = replace(_plain_job(), target=bits_to_target(0x207FFFFF))  # every tile wins
     client = Mock()
-    with (
-        patch("miner_base.block_submission.create_proof") as create,
-        patch(
-            "miner_base.block_submission.verify_plain_proof_for_cert_version",
-            return_value=(True, "ok"),
-        ) as verify,
-    ):
-        proof = submit_opened_block(_opening(), job, client)
 
-    assert verify.call_args.kwargs["nbits_override"] == share_bits
-    assert proof is create.return_value
+    proof = submit_opened_block(_opening(), job, client)
+
+    assert proof is not None
     client.submit_plain_proof.assert_called_once_with(proof, job)
 
 

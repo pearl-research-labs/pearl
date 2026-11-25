@@ -178,7 +178,9 @@ class PoolStratumClient:
         """Handle mining.notify -- build a BlockTemplate and push it to the WorkCache.
 
         params: [job_id, prev_hash, coinb1, coinb2, merkle_branch[],
-                 version, bits, ntime, clean_jobs, cert_version]
+                 version, bits, ntime, clean_jobs, cert_version,
+                 ancestor_headers[]?]  -- the 11th param is required for cert-v4
+                 jobs (108-byte headers, parent first) and rejected otherwise.
         """
         # One extranonce2 per job, shared by all this gateway's miners; the pool
         # only fixes its length and folds it into the coinbase.
