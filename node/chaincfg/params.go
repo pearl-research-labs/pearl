@@ -387,6 +387,11 @@ var MainNetParams = Params{
 
 	SaltedSeedForkHeight: 99000,
 
+	// The FP8 (V4) hardfork is not scheduled on mainnet: Fp8ForkHeight is unset.
+	//
+	// TODO: When Fp8ForkHeight is set here, increase wire.ProtocolVersion in the same release. Once that height has
+	// passed, raise peer.MinAcceptableProtocolVersion to that version.
+
 	// Checkpoints ordered from oldest to newest, one per 10000 blocks.
 	// Add the next multiple once it is at least CheckpointConfirmations
 	// deep; denser checkpoints cap how much headers-first sync progress a
