@@ -18,6 +18,7 @@ import (
 	"github.com/pearl-research-labs/pearl/node/database"
 	"github.com/pearl-research-labs/pearl/node/txscript"
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/pearl-research-labs/pearl/node/zkpow"
 )
 
 const (
@@ -106,6 +107,9 @@ type BlockChain struct {
 	indexManager        IndexManager
 	hashCache           *txscript.HashCache
 	metrics             Metrics
+
+	// verifyCertificate runs without chainLock held, so it must not read chain state.
+	verifyCertificate certificateVerifier
 
 	// chainLock protects concurrent access to the vast majority of the
 	// fields in this struct below this point.
@@ -2334,6 +2338,7 @@ func New(config *Config) (*BlockChain, error) {
 		utxoCache:           newUtxoCache(config.DB, config.UtxoCacheMaxSize),
 		hashCache:           config.HashCache,
 		metrics:             metrics,
+		verifyCertificate:   zkpow.VerifyCertificate,
 		bestChain:           newChainView(nil),
 		orphans:             make(map[chainhash.Hash]*orphanBlock),
 		prevOrphans:         make(map[chainhash.Hash][]*orphanBlock),
