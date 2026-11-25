@@ -71,6 +71,13 @@ type run struct {
 	stopOnce sync.Once
 }
 
+func newRun() *run {
+	return &run{
+		quit: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+}
+
 func (r *run) stop() {
 	r.stopOnce.Do(func() { close(r.quit) })
 }
@@ -84,12 +91,11 @@ func (r *run) stopped() bool {
 	}
 }
 
-func (r *run) waitBackoff() bool {
+// waitBackoff returns after failureBackoff, or at once when the run is stopped. Callers recheck stopped().
+func (r *run) waitBackoff() {
 	select {
 	case <-r.quit:
-		return true
 	case <-time.After(failureBackoff):
-		return false
 	}
 }
 
@@ -174,9 +180,7 @@ func (m *CPUMiner) generateBlocks(r *run) {
 
 	for !r.stopped() {
 		if m.cfg.ConnectedCount() == 0 {
-			if r.waitBackoff() {
-				return
-			}
+			r.waitBackoff()
 			continue
 		}
 
@@ -184,9 +188,7 @@ func (m *CPUMiner) generateBlocks(r *run) {
 		curHeight := m.g.BestSnapshot().Height
 		if curHeight != 0 && !m.cfg.IsCurrent() {
 			m.submitBlockLock.Unlock()
-			if r.waitBackoff() {
-				return
-			}
+			r.waitBackoff()
 			continue
 		}
 		payToAddr := m.cfg.MiningAddrs[rand.Intn(len(m.cfg.MiningAddrs))]
@@ -194,9 +196,7 @@ func (m *CPUMiner) generateBlocks(r *run) {
 		m.submitBlockLock.Unlock()
 		if err != nil {
 			log.Errorf("Failed to create new block template: %v", err)
-			if r.waitBackoff() {
-				return
-			}
+			r.waitBackoff()
 			continue
 		}
 
@@ -207,9 +207,7 @@ func (m *CPUMiner) generateBlocks(r *run) {
 			return
 		default:
 			log.Errorf("CPU miner: %v", err)
-			if r.waitBackoff() {
-				return
-			}
+			r.waitBackoff()
 		}
 	}
 }
@@ -237,10 +235,7 @@ func (m *CPUMiner) Start() {
 		return
 	}
 
-	r := &run{
-		quit: make(chan struct{}),
-		done: make(chan struct{}),
-	}
+	r := newRun()
 	m.run = r
 	go m.generateBlocks(r)
 
@@ -287,10 +282,7 @@ func (m *CPUMiner) GenerateNBlocks(n uint32) ([]*chainhash.Hash, error) {
 		return nil, errors.New("Server is already CPU mining. Please call " +
 			"`setgenerate 0` before calling discrete `generate` commands.")
 	}
-	r := &run{
-		quit: make(chan struct{}),
-		done: make(chan struct{}),
-	}
+	r := newRun()
 	m.run = r
 	m.Unlock()
 	defer m.endRun(r)
