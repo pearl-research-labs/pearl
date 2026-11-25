@@ -336,6 +336,8 @@ fn window_round(acc: i64, max_exp: i32, width: i32) -> f32 {
 
 // ---- Instruction sets ----
 
+// Only the x86_64 `vector` dispatch reads the fields.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 struct Isa {
     /// AVX-512 F and DQ: the row chain.
@@ -384,14 +386,7 @@ struct RowScales {
 fn prepare_row(isa: Isa, row: RowScales, code: &[i8], scale: &[u16], noises: &[f32], bp: &mut [u8], diff: &mut [u16]) {
     let cols = bp.len();
     assert!(code.len() == cols && noises.len() == cols && diff.len() == cols && scale.len() * BLOCK_SIZE == cols);
-    let mut c = 0;
-    #[cfg(target_arch = "x86_64")]
-    if isa.avx512 {
-        // SAFETY: the CPU reports AVX-512 F and DQ.
-        c = unsafe { simd::prepare_row(row, code, scale, noises, bp, diff) };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = isa;
+    let c = vector::prepare_row(isa, row, code, scale, noises, bp, diff);
     let mut coin = false;
     for c in c..cols {
         let coefficient = row.alpha * bf16_value(scale[c / BLOCK_SIZE]);
@@ -409,14 +404,7 @@ fn prepare_row(isa: Isa, row: RowScales, code: &[i8], scale: &[u16], noises: &[f
 /// exact in int32. `f_pairs` holds F_B's columns in groups of LANES as
 /// `[pair][lane]` int16 pairs.
 fn noise_tile(isa: Isa, e_ints: &[i16], rows: usize, f_ints: &[i16], f_pairs: &[u32], c0: usize, out: &mut [i32]) {
-    let mut r = 0;
-    #[cfg(target_arch = "x86_64")]
-    if isa.vnni {
-        // SAFETY: the CPU reports AVX-512 F and VNNI.
-        r = unsafe { simd::noise_tile(e_ints, rows, f_pairs, c0, out) };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = (isa, f_pairs);
+    let r = vector::noise_tile(isa, e_ints, rows, f_pairs, c0, out);
     for r in r..rows {
         for c in 0..TILE_COLS {
             out[r * TILE_COLS + c] = int_dot(&e_ints[r * RANK..], &f_ints[(c0 + c) * RANK..]);
@@ -428,14 +416,7 @@ fn noise_tile(isa: Isa, e_ints: &[i16], rows: usize, f_ints: &[i16], f_pairs: &[
 /// `f_terms` holds F_B as `(RANK, k)` terms.
 fn windowed_tile(isa: Isa, e_terms: &[E4m3Term], rows: usize, f_terms: &[E4m3Term], c0: usize, width: i32, out: &mut [f32]) {
     let k = f_terms.len() / RANK;
-    let mut r = 0;
-    #[cfg(target_arch = "x86_64")]
-    if isa.avx512 {
-        // SAFETY: the CPU reports AVX-512 F and DQ.
-        r = unsafe { simd::windowed_tile(e_terms, rows, f_terms, c0, width, out) };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = isa;
+    let r = vector::windowed_tile(isa, e_terms, rows, f_terms, c0, width, out);
     let mut column = [E4m3Term::default(); RANK];
     for c in 0..TILE_COLS {
         for (j, term) in column.iter_mut().enumerate() {
@@ -451,14 +432,7 @@ fn windowed_tile(isa: Isa, e_terms: &[E4m3Term], rows: usize, f_terms: &[E4m3Ter
 /// zero (scaling by the powers of two row and column scale is exact).
 /// `f_scale` holds the tile's column scales.
 fn integer_noise_values(isa: Isa, sums: &[i32], rows: usize, e_scale: &[f32], f_scale: &[f32], out: &mut [f32]) {
-    let mut r = 0;
-    #[cfg(target_arch = "x86_64")]
-    if isa.avx512 {
-        // SAFETY: the CPU reports AVX-512 F and DQ.
-        r = unsafe { simd::integer_noise_values(sums, rows, e_scale, f_scale, out) };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = isa;
+    let r = vector::integer_noise_values(isa, sums, rows, e_scale, f_scale, out);
     for i in r..rows {
         for c in 0..TILE_COLS {
             let exact = f64::from(sums[i * TILE_COLS + c]) * f64::from(e_scale[i]) * f64::from(f_scale[c]);
@@ -471,14 +445,7 @@ fn integer_noise_values(isa: Isa, sums: &[i32], rows: usize, e_scale: &[f32], f_
 /// `f_a_t` holds F_A as `(k, RANK)` fp32, `f_a_pairs` as BF16
 /// `[column pair][j][2]`.
 fn mid_tile(isa: Isa, diff: &[u16], rows: usize, f_a_t: &[f32], f_a_pairs: &[u16], c0: usize, acc: &mut [f32]) {
-    let mut r = 0;
-    #[cfg(target_arch = "x86_64")]
-    if isa.bf16 {
-        // SAFETY: the CPU reports AVX-512 F and BF16.
-        r = unsafe { simd::mid_tile(diff, rows, f_a_pairs, c0, acc) };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = (isa, f_a_pairs);
+    let r = vector::mid_tile(isa, diff, rows, f_a_pairs, c0, acc);
     for r in r..rows {
         for c in 0..TILE_COLS {
             let d = bf16_value(diff[r * TILE_COLS + c]);
@@ -642,6 +609,111 @@ fn prepare_rows_with(
             }
         });
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+mod vector {
+    //! Runs each AVX-512 path when the CPU has the instruction sets it needs
+    //! and returns how many leading rows (cells, for `prepare_row`) it
+    //! completed; the caller's scalar loop computes the rest.
+
+    use super::{E4m3Term, Isa, RowScales, simd};
+
+    pub(super) fn prepare_row(
+        isa: Isa,
+        row: RowScales,
+        code: &[i8],
+        scale: &[u16],
+        noises: &[f32],
+        bp: &mut [u8],
+        diff: &mut [u16],
+    ) -> usize {
+        if isa.avx512 {
+            // SAFETY: the CPU reports AVX-512 F and DQ.
+            unsafe { simd::prepare_row(row, code, scale, noises, bp, diff) }
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn noise_tile(isa: Isa, e_ints: &[i16], rows: usize, f_pairs: &[u32], c0: usize, out: &mut [i32]) -> usize {
+        if isa.vnni {
+            // SAFETY: the CPU reports AVX-512 F and VNNI.
+            unsafe { simd::noise_tile(e_ints, rows, f_pairs, c0, out) }
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn windowed_tile(
+        isa: Isa,
+        e_terms: &[E4m3Term],
+        rows: usize,
+        f_terms: &[E4m3Term],
+        c0: usize,
+        width: i32,
+        out: &mut [f32],
+    ) -> usize {
+        if isa.avx512 {
+            // SAFETY: the CPU reports AVX-512 F and DQ.
+            unsafe { simd::windowed_tile(e_terms, rows, f_terms, c0, width, out) }
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn integer_noise_values(
+        isa: Isa,
+        sums: &[i32],
+        rows: usize,
+        e_scale: &[f32],
+        f_scale: &[f32],
+        out: &mut [f32],
+    ) -> usize {
+        if isa.avx512 {
+            // SAFETY: the CPU reports AVX-512 F and DQ.
+            unsafe { simd::integer_noise_values(sums, rows, e_scale, f_scale, out) }
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn mid_tile(isa: Isa, diff: &[u16], rows: usize, f_a_pairs: &[u16], c0: usize, acc: &mut [f32]) -> usize {
+        if isa.bf16 {
+            // SAFETY: the CPU reports AVX-512 F and BF16.
+            unsafe { simd::mid_tile(diff, rows, f_a_pairs, c0, acc) }
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+mod vector {
+    //! This architecture has no vector paths: every function reports that it
+    //! completed nothing, so the caller's scalar loop computes everything.
+
+    use super::{E4m3Term, Isa, RowScales};
+
+    pub(super) fn prepare_row(_: Isa, _: RowScales, _: &[i8], _: &[u16], _: &[f32], _: &mut [u8], _: &mut [u16]) -> usize {
+        0
+    }
+
+    pub(super) fn noise_tile(_: Isa, _: &[i16], _: usize, _: &[u32], _: usize, _: &mut [i32]) -> usize {
+        0
+    }
+
+    pub(super) fn windowed_tile(_: Isa, _: &[E4m3Term], _: usize, _: &[E4m3Term], _: usize, _: i32, _: &mut [f32]) -> usize {
+        0
+    }
+
+    pub(super) fn integer_noise_values(_: Isa, _: &[i32], _: usize, _: &[f32], _: &[f32], _: &mut [f32]) -> usize {
+        0
+    }
+
+    pub(super) fn mid_tile(_: Isa, _: &[u16], _: usize, _: &[u16], _: usize, _: &mut [f32]) -> usize {
+        0
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
