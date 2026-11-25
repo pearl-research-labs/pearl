@@ -1,4 +1,3 @@
-import asyncio
 from collections import deque
 from copy import copy
 from typing import TYPE_CHECKING, Any
@@ -14,7 +13,9 @@ from pearl_gateway.pearl_client import PearlNodeClient
 from pearl_gateway.proof_worker import prove as prove_in_process
 
 if TYPE_CHECKING:
+    from pearl_gateway.pool_stratum_client import PoolStratumClient
     from pearl_gateway.proof_pool import ProofPool
+    from pearl_gateway.work_cache import WorkCache
 
 logger = get_logger(__name__)
 _MAX_SUBMISSION_LOG = 64
@@ -46,15 +47,17 @@ class SubmissionService:
 
     def __init__(
         self,
-        pearl_client: PearlNodeClient,
-        debug_mode: bool = False,
+        pearl_client: PearlNodeClient | None,
         proof_pool: "ProofPool | None" = None,
+        debug_mode: bool = False,
     ) -> None:
         self.pearl_client = pearl_client
-        self.submission_lock = asyncio.Lock()
-        self.submission_log: deque[bytes] = deque(maxlen=_MAX_SUBMISSION_LOG)
-        self.debug_mode = debug_mode
         self.proof_pool = proof_pool
+        self.debug_mode = debug_mode
+        self.submission_log: deque[bytes] = deque(maxlen=_MAX_SUBMISSION_LOG)
+        self.submitted_blocks = 0
+        self.accepted_blocks = 0
+        self.rejected_blocks = 0
 
     async def _build_block(
         self, plain_proof: PlainProof | PlainProofV4, template: BlockTemplate
@@ -79,30 +82,99 @@ class SubmissionService:
     async def submit_plain_proof(
         self, plain_proof: PlainProof | PlainProofV4, template: BlockTemplate
     ) -> dict[str, Any]:
-        async with self.submission_lock:
+        try:
+            header_bytes = template.header.serialize_without_proof_commitment()
+            if header_bytes in self.submission_log:
+                logger.warning("Block already submitted, skipping")
+                return {"status": "already_submitted"}
+
+            logger.info(
+                f"Received PlainProof submission for template time {template.header.timestamp}"
+            )
             try:
-                header_bytes = template.header.serialize_without_proof_commitment()
-                if header_bytes in self.submission_log:
-                    logger.warning("Block already submitted, skipping")
-                    return {"status": "already_submitted"}
-
-                logger.info(
-                    f"Received PlainProof submission for template time {template.header.timestamp}"
-                )
-                try:
-                    check_cert_version_eligible(template.required_cert_version, plain_proof)
-                except ValueError as e:
-                    logger.warning(f"Rejecting proof: {e}")
-                    return {"status": f"error: {e}"}
-
-                block = await self._build_block(plain_proof, template)
-                result = await self.pearl_client.submit_block(block.serialize().hex())
-                if result == "accepted":
-                    self.submission_log.append(header_bytes)
-                    logger.info("Block accepted by node!")
-                else:
-                    logger.warning(f"Block rejected: {result}")
-                return {"status": result}
-            except Exception as e:
-                logger.exception(f"Error submitting block: {e=}, {type(e)=}")
+                check_cert_version_eligible(template.required_cert_version, plain_proof)
+            except ValueError as e:
+                logger.warning(f"Rejecting proof: {e}")
                 return {"status": f"error: {e}"}
+
+            block = await self._build_block(plain_proof, template)
+            assert self.pearl_client is not None
+            self.submitted_blocks += 1
+            result = await self.pearl_client.submit_block(block.serialize().hex())
+            if result == "accepted":
+                self.accepted_blocks += 1
+                self.submission_log.append(header_bytes)
+                logger.info("Block accepted by node!")
+            else:
+                self.rejected_blocks += 1
+                logger.warning(f"Block rejected: {result}")
+            return {"status": result}
+        except Exception as e:
+            logger.exception(f"Error submitting block: {e=}, {type(e)=}")
+            return {"status": f"error: {e}"}
+
+
+class PoolSubmissionService(SubmissionService):
+    """Pool mode: certifies PlainProof and submits ZKCertificate to the pool as a share."""
+
+    def __init__(
+        self,
+        pool_client: "PoolStratumClient",
+        proof_pool: "ProofPool",
+        work_cache: "WorkCache",
+    ) -> None:
+        # No block-level --debug verify here: it checks the network target, which
+        # every share that is not also a block fails. MinerRpcServer checks each
+        # proof against the share target before proving instead.
+        super().__init__(pearl_client=None, proof_pool=proof_pool)
+        self.pool_client = pool_client
+        self.work_cache = work_cache
+
+    async def submit_plain_proof(
+        self, plain_proof: PlainProof | PlainProofV4, template: BlockTemplate
+    ) -> dict[str, Any]:
+        """Generate a ZK proof and submit the certificate to the pool.
+
+        zkcert_hex is ZKCertificate.serialize() hex-encoded: the same leading
+        bytes of PearlBlock.serialize() for a solo submit.
+        """
+        if template.job_id is None:
+            logger.error("Cannot submit to pool: template has no job_id")
+            return {"status": "error: missing job_id"}
+
+        try:
+            try:
+                check_cert_version_eligible(template.required_cert_version, plain_proof)
+            except ValueError as e:
+                logger.warning(f"Rejecting proof: {e}")
+                return {"status": f"error: {e}"}
+
+            block = await self._build_block(plain_proof, template)
+
+            # Same object or stale: the pool keeps a job id across reconnects, but a
+            # new session's template carries a different extranonce1.
+            if self.work_cache.current_template is not template:
+                logger.info("Job changed during proving; skipping stale submission")
+                return {"status": "skipped: stale job"}
+
+            self.submitted_blocks += 1
+            accepted = await self.pool_client.submit_zk_cert(
+                job_id=template.job_id,
+                ntime_hex=f"{template.header.timestamp:08x}",
+                zkcert_hex=block.zk_certificate.serialize().hex(),
+                extranonce2_hex=template.extranonce2.hex()
+                if template.extranonce2 is not None
+                else None,
+            )
+
+            if accepted:
+                self.accepted_blocks += 1
+                logger.info("Share accepted by pool")
+                return {"status": "accepted"}
+            self.rejected_blocks += 1
+            logger.warning("Share rejected by pool")
+            return {"status": "rejected"}
+
+        except Exception as e:
+            logger.exception(f"Error submitting proof to pool: {e}")
+            return {"status": f"error: {e}"}

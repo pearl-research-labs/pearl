@@ -22,6 +22,10 @@ class PearlHeader:
             )
 
     @property
+    def version(self) -> int:
+        return self.incomplete_header.version
+
+    @property
     def previous_block_hash(self) -> bytes:
         return bytes(self.incomplete_header.prev_block)
 

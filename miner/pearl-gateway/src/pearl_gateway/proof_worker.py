@@ -1,8 +1,10 @@
-"""ZK proving executed in a dedicated spawn worker process (see ProofPool).
+"""ZK proving that runs in a separate worker process (see ``ProofPool``).
 
-Objects cross the process boundary as bytes/str because native pearl_mining
-types are not picklable.
+Objects cross the process boundary as bytes/str -- the native ``pearl_mining``
+types are not picklable -- so callers pass serialized forms and we rebuild here.
 """
+
+import os
 
 from miner_utils import get_logger
 from pearl_mining import (
@@ -20,9 +22,9 @@ _LOGGER = get_logger(__name__)
 _fp8_prover: Fp8Prover | None = None
 
 
-def ready_probe() -> bool:
-    """Trivial task used to spawn the worker process before serving RPC."""
-    return True
+def prewarm() -> None:
+    """No-op run at pool start, so the worker spawns and imports the prover then,
+    not on the first proof."""
 
 
 def _prove_fp8(
@@ -48,15 +50,23 @@ def prove(
     plain_proof_b64: str,
     debug: bool = False,
 ) -> tuple[bytes, bytes]:
-    """Generate a ZK proof and return (public_data, proof_data) bytes."""
+    """Generate a ZK proof; return its ``(public_data, proof_data)`` bytes."""
     header = IncompleteBlockHeader.from_bytes(incomplete_header_bytes)
-    if cert_version == CERT_VERSION_PLAIN_FP8:
-        return _prove_fp8(header, PlainProofV4.from_base64(plain_proof_b64), debug)
+    try:
+        if cert_version == CERT_VERSION_PLAIN_FP8:
+            return _prove_fp8(header, PlainProofV4.from_base64(plain_proof_b64), debug)
 
-    plain_proof = PlainProof.from_base64(plain_proof_b64)
-    zk_proof = generate_proof_for_cert_version(cert_version, header, plain_proof)
-    if debug:
-        result, msg = verify_proof_for_cert_version(cert_version, header, zk_proof)
-        if not result:
-            raise AssertionError(f"Failed to verify proof: {msg}")
-    return bytes(zk_proof.public_data), bytes(zk_proof.proof_data)
+        plain_proof = PlainProof.from_base64(plain_proof_b64)
+        zk_proof = generate_proof_for_cert_version(cert_version, header, plain_proof)
+        if debug:
+            result, msg = verify_proof_for_cert_version(cert_version, header, zk_proof)
+            if not result:
+                raise AssertionError(f"Failed to verify proof: {msg}")
+        return bytes(zk_proof.public_data), bytes(zk_proof.proof_data)
+    except Exception:
+        raise
+    except BaseException:
+        # A Rust panic (PyO3 PanicException is a BaseException) poisons the prover's
+        # process-global circuit cache, so every later proof here would fail. Exit and
+        # let ProofPool's BrokenExecutor path start a fresh worker.
+        os._exit(1)

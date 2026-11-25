@@ -23,15 +23,25 @@ def calculate_merkle_root(txids: list[str]) -> bytes:
     return current_level[0][::-1]
 
 
+def reconstruct_stratum_merkle_root(coinbase_hash: bytes, merkle_branch: list[bytes]) -> bytes:
+    """Walk a Stratum merkle branch (internal-order hashes) up from the coinbase hash.
+
+    Returns the root in display order, matching calculate_merkle_root and what
+    IncompleteBlockHeader expects.
+    """
+    current = coinbase_hash
+    for sibling in merkle_branch:
+        current = double_sha256(current + sibling)
+    return current[::-1]
+
+
 def bits_to_target(bits: int) -> int:
-    """Decode compact nBits to the consensus unsigned 256-bit target."""
+    """Convert compact nBits representation to 256-bit target."""
     exponent = (bits >> 24) & 0xFF
     mantissa = bits & 0xFFFFFF
-    if exponent == 0 or mantissa == 0 or mantissa & 0x800000:
-        return 0
-    if exponent <= 3:
+    if exponent < 3:
         return mantissa >> (8 * (3 - exponent))
-    return (mantissa << (8 * (exponent - 3))) & ((1 << 256) - 1)
+    return mantissa * (1 << (8 * (exponent - 3)))
 
 
 def create_coinbase_transaction(

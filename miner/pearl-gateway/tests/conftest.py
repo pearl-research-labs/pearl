@@ -88,7 +88,7 @@ def sample_block_template_data():
     }
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def sample_block_template(sample_block_template_data, mining_address):
     return BlockTemplate.from_get_block_template(
         GetBlockTemplateResponse.model_validate(sample_block_template_data),
