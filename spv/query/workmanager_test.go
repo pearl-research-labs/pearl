@@ -1,6 +1,7 @@
 package query
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -623,5 +624,39 @@ func TestWorkManagerTimeOutBatch(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("next job not received")
 		}
+	}
+}
+
+// TestWorkManagerMaxRetries checks that a query failing NumRetries times returns its error and is not retried again.
+func TestWorkManagerMaxRetries(t *testing.T) {
+	const numRetries = 2
+	errFailed := errors.New("failed job")
+
+	wm, workers := startWorkManager(t, 1)
+	wk := workers[0]
+	errChan := wm.Query([]*Request{{}}, NumRetries(numRetries))
+
+	for range numRetries {
+		select {
+		case job := <-wk.nextJob:
+			wk.results <- &jobResult{job: job, err: errFailed}
+		case err := <-errChan:
+			require.FailNow(t, "query ended early", "err: %v", err)
+		case <-time.After(time.Second):
+			require.FailNow(t, "job not scheduled")
+		}
+	}
+
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, errFailed)
+	case <-time.After(time.Second):
+		require.FailNow(t, "expected the query to fail")
+	}
+
+	select {
+	case <-wk.nextJob:
+		require.FailNow(t, "job retried past NumRetries")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
