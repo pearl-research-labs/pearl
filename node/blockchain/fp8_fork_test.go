@@ -6,9 +6,12 @@ package blockchain
 
 import (
 	"testing"
+	"time"
 
+	"github.com/pearl-research-labs/pearl/node/blockchain/internal/testhelper"
 	"github.com/pearl-research-labs/pearl/node/btcutil"
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/stretchr/testify/require"
 )
@@ -174,6 +177,69 @@ func TestCheckBlockSanityRejectsV4WithoutFp8Fork(t *testing.T) {
 	unscheduled := params
 	unscheduled.Fp8ForkHeight = 0
 	err = CheckBlockSanity(block, &unscheduled, chain.timeSource)
+	requireRuleError(t, err, ErrDisallowedCertVersion)
+	require.ErrorContains(t, err, "FP8 fork is not scheduled")
+}
+
+// TestProcessBlockRejectsV4BelowFp8ForkBeforeVerifying asserts that ProcessBlock rejects a V4 certificate below the
+// FP8 fork height by its version, before certificate verification, when the parent is known. Regtest verifies proof
+// of work and the certificate here is not a valid proof, so ErrHighHash marks the cases that do reach verification.
+func TestProcessBlockRejectsV4BelowFp8ForkBeforeVerifying(t *testing.T) {
+	// junkV4Block builds a height 1 block on prevHash that is sane up to its certificate.
+	junkV4Block := func(chain *BlockChain, prevHash chainhash.Hash) *btcutil.Block {
+		coinbase := testhelper.CreateCoinbaseTx(1, CalcBlockSubsidy(1, chain.chainParams))
+		txns := []*wire.MsgTx{coinbase}
+		return btcutil.NewBlock(&wire.MsgBlock{
+			MsgHeader: wire.MsgHeader{
+				BlockHeader: wire.BlockHeader{
+					Version:    1,
+					PrevBlock:  prevHash,
+					MerkleRoot: calcMerkleRoot(txns),
+					Bits:       chain.chainParams.PowLimitBits,
+					Timestamp:  time.Unix(time.Now().Unix(), 0),
+				},
+				MsgCertificate: wire.MsgCertificate{Certificate: v4Cert([]byte{0x00}, nil)},
+			},
+			Transactions: txns,
+		})
+	}
+
+	// The fork activates at height 2, so a block on genesis is below it.
+	params := chaincfg.RegressionNetParams
+	params.Fp8ForkHeight = 2
+	chain, teardown, err := chainSetup("fp8_fork_early_v4", &params)
+	require.NoError(t, err)
+	defer teardown()
+	genesisHash := *chain.chainParams.GenesisHash
+
+	_, _, err = chain.ProcessBlock(junkV4Block(chain, genesisHash), BFNone)
+	requireRuleError(t, err, ErrDisallowedCertVersion)
+	require.ErrorContains(t, err, "certificate version 4 is not allowed at height 1 (require version 3)")
+
+	// A block whose parent is unknown has no height, so its certificate is still verified.
+	_, _, err = chain.ProcessBlock(junkV4Block(chain, chainhash.Hash{0x01}), BFNone)
+	requireRuleError(t, err, ErrHighHash)
+	require.ErrorContains(t, err, "certificate verification failed")
+
+	// At the fork height V4 is the required version, so the certificate is verified.
+	atFork := chaincfg.RegressionNetParams
+	atFork.Fp8ForkHeight = 1
+	chainAtFork, teardownAtFork, err := chainSetup("fp8_fork_early_v4_at_fork", &atFork)
+	require.NoError(t, err)
+	defer teardownAtFork()
+
+	_, _, err = chainAtFork.ProcessBlock(junkV4Block(chainAtFork, genesisHash), BFNone)
+	requireRuleError(t, err, ErrHighHash)
+	require.ErrorContains(t, err, "certificate verification failed")
+
+	// With no fork height, as on mainnet, the block sanity checks still reject the block themselves.
+	unscheduled := chaincfg.RegressionNetParams
+	unscheduled.Fp8ForkHeight = 0
+	chainUnscheduled, teardownUnscheduled, err := chainSetup("fp8_fork_early_v4_unscheduled", &unscheduled)
+	require.NoError(t, err)
+	defer teardownUnscheduled()
+
+	_, _, err = chainUnscheduled.ProcessBlock(junkV4Block(chainUnscheduled, genesisHash), BFNone)
 	requireRuleError(t, err, ErrDisallowedCertVersion)
 	require.ErrorContains(t, err, "FP8 fork is not scheduled")
 }

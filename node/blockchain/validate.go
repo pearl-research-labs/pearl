@@ -512,6 +512,37 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 	return checkBlockSanity(block, chainParams, timeSource, BFNone)
 }
 
+// checkCertVersionAtHeight enforces the certificate version that the height requires. It reads only the version, so
+// it is safe to run on a certificate that has not been verified yet.
+func checkCertVersionAtHeight(cert wire.BlockCertificate, height int32, params *chaincfg.Params) error {
+	want := params.RequiredCertVersion(height)
+	if cert.Version() != want {
+		str := fmt.Sprintf("certificate version %d is not allowed at height %d "+
+			"(require version %d)", cert.Version(), height, want)
+		return ruleError(ErrDisallowedCertVersion, str)
+	}
+	return nil
+}
+
+// checkV4CertHeight rejects a V4 certificate on a block whose parent is known and whose height is below the FP8 fork
+// height. ProcessBlock runs it ahead of checkBlockSanity, which verifies the certificate without knowing the height:
+// CheckCertificateRules rejects such a block anyway, but only after the V4 verifier has run on it.
+//
+// Two cases are left to the later checks. On a network with no FP8 fork height, checkBlockSanity rejects every V4
+// certificate. A block whose parent is unknown has no height yet, so it is still verified before it is kept as an
+// orphan.
+func (b *BlockChain) checkV4CertHeight(msgBlock *wire.MsgBlock) error {
+	cert := msgBlock.BlockCertificate()
+	if cert == nil || cert.Version() != wire.CertificateVersionV4 || b.chainParams.Fp8ForkHeight == 0 {
+		return nil
+	}
+	prevNode := b.index.LookupNode(&msgBlock.BlockHeader().PrevBlock)
+	if prevNode == nil {
+		return nil
+	}
+	return checkCertVersionAtHeight(cert, prevNode.height+1, b.chainParams)
+}
+
 // CheckCertificateRules enforces the height-gated rules a block certificate
 // must satisfy:
 //   - Before MoEForkHeight (or with the fork disabled): only V1 accepted
@@ -541,11 +572,8 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 	if cert == nil {
 		return ruleError(ErrCertificateMissing, "block has no certificate")
 	}
-	want := params.RequiredCertVersion(height)
-	if cert.Version() != want {
-		str := fmt.Sprintf("certificate version %d is not allowed at height %d "+
-			"(require version %d)", cert.Version(), height, want)
-		return ruleError(ErrDisallowedCertVersion, str)
+	if err := checkCertVersionAtHeight(cert, height, params); err != nil {
+		return err
 	}
 
 	if cert.IsMoE() && params.IsDenseOnlyForkActive(height) {
