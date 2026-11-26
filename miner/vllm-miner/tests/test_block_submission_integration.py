@@ -59,6 +59,10 @@ def reset_cuda():
         torch.cuda.synchronize()
 
 
+@pytest.mark.skip(
+    reason="simnet requires V4 (FP8) certificates from block 1 and this miner builds "
+    "V1 to V3 only; re-enable once the V4 miner lands (PR 311)"
+)
 @pytest.mark.integration
 def test_block_submission(real_gateway, async_manager_real, make_random_test_matrices):
     """

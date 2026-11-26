@@ -2506,10 +2506,8 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 		prevHash := prevNode.Header.BlockHash()
 		if prevHash.IsEqual(&blockHeader.PrevBlock) {
 			prevNodeHeight := prevNode.Height
-			prevNodeHeader := prevNode.Header
 			err := b.checkHeaderSanity(
-				blockHeader, cert, false, prevNodeHeight,
-				&prevNodeHeader,
+				blockHeader, &prevNode.Header, cert, false, prevNodeHeight,
 			)
 			if err != nil {
 				b.punishHeaderSanityErr(hmsg.peer, err)
@@ -2617,31 +2615,16 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 				Header: *backHead,
 				Height: int32(backHeight),
 			})
+
 			totalWork := big.NewInt(0)
 			for j, reorgMsgHeader := range msg.Headers[i:] {
 				reorgHeader := &reorgMsgHeader.BlockHeader
-				// We have to get the parent's height and
-				// header to be able to contextually validate
-				// this header.
-				prevNodeHeight := backHeight + uint32(j)
-
-				var prevNodeHeader *wire.BlockHeader
-				if i+j == 0 {
-					// Use backHead if we are using the
-					// first header in the Headers slice.
-					prevNodeHeader = backHead
-				} else {
-					// We can find the parent in the
-					// Headers slice by getting the header
-					// at index i+j-1.
-					prevNodeHeader = &msg.Headers[i+j-1].BlockHeader
-				}
-
+				parent := b.reorgList.Back()
 				reorgCert := msg.Headers[i+j].BlockCertificate()
 
 				err = b.checkHeaderSanity(
-					reorgHeader, reorgCert, true,
-					int32(prevNodeHeight), prevNodeHeader,
+					reorgHeader, &parent.Header, reorgCert, true,
+					parent.Height,
 				)
 				if err != nil {
 					b.punishHeaderSanityErr(hmsg.peer, err)
@@ -2895,19 +2878,21 @@ func (b *blockManager) punishHeaderSanityErr(p *ServerPeer, err error) {
 // checkHeaderSanity performs contextual and context-less checks on the passed
 // wire.BlockHeader and wire.BlockCertificate. This function calls blockchain.CheckBlockHeaderContext for
 // the contextual check and blockchain.CheckBlockHeaderSanity for context-less
-// checks.
-func (b *blockManager) checkHeaderSanity(blockHeader *wire.BlockHeader,
-	cert wire.BlockCertificate, reorgAttempt bool, prevNodeHeight int32,
-	prevNodeHeader *wire.BlockHeader) error {
+// checks. parent is the previous header on blockHeader's chain.
+func (b *blockManager) checkHeaderSanity(
+	blockHeader, parent *wire.BlockHeader,
+	cert wire.BlockCertificate, reorgAttempt bool,
+	prevNodeHeight int32,
+) error {
 
-	// Create the lightHeaderCtx for the blockHeader's parent.
+	// Create the lightHeaderCtx for the proposed header's parent.
 	hList := b.headerList
 	if reorgAttempt {
 		hList = b.reorgList
 	}
 
 	parentHeaderCtx := newLightHeaderCtx(
-		prevNodeHeight, prevNodeHeader, b.cfg.BlockHeaders, hList,
+		prevNodeHeight, parent, b.cfg.BlockHeaders, hList,
 	)
 
 	// Create a lightChainCtx as well.

@@ -5,6 +5,7 @@
 package blockchain
 
 import (
+	"crypto/rand"
 	"fmt"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg"
@@ -12,30 +13,25 @@ import (
 	"github.com/pearl-research-labs/pearl/node/zkpow"
 )
 
-// SolveBlock mines a block certificate for the given header at the given height,
-// producing the certificate version consensus requires at that height.
-//
-// On SimNet it returns a lightweight dummy certificate of the required version
-// (no actual mining). For real mining it modifies header.ProofCommitment to
-// match the mined certificate.
-func SolveBlock(header *wire.BlockHeader, params *chaincfg.Params, height int32) (wire.BlockCertificate, error) {
-	version := params.RequiredCertVersion(height)
+const v4DeviceH100 = 0
 
+// SolveBlock mines a V4 certificate for header and updates header.ProofCommitment to match. On SimNet, where proofs are
+// not verified, it commits to random public data so each solve yields a distinct block hash just as random matrix
+// iteration in zkpow.MineV4 does. Real mining runs an uninterruptible CPU search at header.Bits, so callers must only
+// invoke it at easy targets such as regtest's.
+func SolveBlock(header, parent *wire.BlockHeader, params *chaincfg.Params, height int32) (*wire.CertificateV4, error) {
+	if version := params.RequiredCertVersion(height); version != wire.CertificateVersionV4 {
+		return nil, fmt.Errorf("height %d requires certificate version %d, but only V4 can be mined", height, version)
+	}
 	if params.Net == wire.SimNet {
-		switch version {
-		case wire.CertificateVersionV3:
-			cert := &wire.CertificateV3{}
-			cert.ProofData = []byte{0x00}
-			return cert, nil
-		case wire.CertificateVersionV2:
-			return &wire.CertificateV2{ProofData: []byte{0x00}}, nil
-		default:
-			return &wire.CertificateV1{ProofData: []byte{0x00}}, nil
+		var publicData [32]byte
+		if _, err := rand.Read(publicData[:]); err != nil {
+			return nil, err
 		}
+		cert := &wire.CertificateV4{PublicData: publicData[:], ProofData: []byte{0x00}}
+		header.ProofCommitment = cert.ProofCommitment()
+		cert.Hash = header.BlockHash()
+		return cert, nil
 	}
-
-	if version == wire.CertificateVersionV1 {
-		return nil, fmt.Errorf("V1 mining not supported in this build; use a pre-fork binary")
-	}
-	return zkpow.Mine(header, version)
+	return zkpow.MineV4(header, parent, v4DeviceH100)
 }

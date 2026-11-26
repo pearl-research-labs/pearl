@@ -351,8 +351,7 @@ func CheckProofOfWork(block *btcutil.Block, powLimit *big.Int) error {
 // ensure it is sane before continuing with processing.  These checks are
 // context free.
 //
-// The flags do not modify the behavior of this function directly, however they
-// are needed to pass along to checkProofOfWork.
+// BFNoPoWCheck skips proof verification and certificate ancestor checks.
 func CheckBlockHeaderSanity(header *wire.BlockHeader, cert wire.BlockCertificate, powLimit *big.Int,
 	timeSource MedianTimeSource, maxTimeOffsetMinutes int64, flags BehaviorFlags) error {
 
@@ -361,8 +360,8 @@ func CheckBlockHeaderSanity(header *wire.BlockHeader, cert wire.BlockCertificate
 		return ruleError(ErrCertificateMissing, "block has no certificate")
 	}
 
-	// Verify certificate is not too large (4 bytes for version + certificate payload).
-	certSize := 4 + cert.SerializedSize()
+	// Verify certificate is not too large (version prefix + certificate payload).
+	certSize := wire.CertificateVersionSize + cert.SerializedSize()
 	if certSize > wire.CertificateMaxSize {
 		str := fmt.Sprintf("certificate too large: %d bytes (max %d)",
 			certSize, wire.CertificateMaxSize)
@@ -495,6 +494,14 @@ func checkBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 		existingTxHashes[*hash] = struct{}{}
 	}
 
+	// A V4 certificate can never be valid on a network with no FP8 fork height. These checks do not know the block
+	// height, so reject it here: otherwise the V4 verifier runs on the block before CheckCertificateRules rejects it.
+	if cert != nil && cert.Version() == wire.CertificateVersionV4 && chainParams.Fp8ForkHeight == 0 {
+		str := fmt.Sprintf("certificate version %d is not allowed: the FP8 fork is not scheduled on %s",
+			cert.Version(), chainParams.Name)
+		return ruleError(ErrDisallowedCertVersion, str)
+	}
+
 	// certificate verification is compute intensive, so we ensure it is performed last.
 	return CheckBlockHeaderSanity(header, cert, chainParams.PowLimit, timeSource, chainParams.MaxTimeOffsetMinutes, flags)
 }
@@ -505,16 +512,49 @@ func CheckBlockSanity(block *btcutil.Block, chainParams *chaincfg.Params, timeSo
 	return checkBlockSanity(block, chainParams, timeSource, BFNone)
 }
 
+// checkCertVersionAtHeight enforces the certificate version that the height requires. It reads only the version, so
+// it is safe to run on a certificate that has not been verified yet.
+func checkCertVersionAtHeight(cert wire.BlockCertificate, height int32, params *chaincfg.Params) error {
+	want := params.RequiredCertVersion(height)
+	if cert.Version() != want {
+		str := fmt.Sprintf("certificate version %d is not allowed at height %d "+
+			"(require version %d)", cert.Version(), height, want)
+		return ruleError(ErrDisallowedCertVersion, str)
+	}
+	return nil
+}
+
+// checkV4CertHeight rejects a V4 certificate on a block whose parent is known and whose height is below the FP8 fork
+// height. ProcessBlock runs it ahead of checkBlockSanity, which verifies the certificate without knowing the height:
+// CheckCertificateRules rejects such a block anyway, but only after the V4 verifier has run on it.
+//
+// Two cases are left to the later checks. On a network with no FP8 fork height, checkBlockSanity rejects every V4
+// certificate. A block whose parent is unknown has no height yet, so it is still verified before it is kept as an
+// orphan.
+func (b *BlockChain) checkV4CertHeight(msgBlock *wire.MsgBlock) error {
+	cert := msgBlock.BlockCertificate()
+	if cert == nil || cert.Version() != wire.CertificateVersionV4 || b.chainParams.Fp8ForkHeight == 0 {
+		return nil
+	}
+	prevNode := b.index.LookupNode(&msgBlock.BlockHeader().PrevBlock)
+	if prevNode == nil {
+		return nil
+	}
+	return checkCertVersionAtHeight(cert, prevNode.height+1, b.chainParams)
+}
+
 // CheckCertificateRules enforces the height-gated rules a block certificate
 // must satisfy:
 //   - Before MoEForkHeight (or with the fork disabled): only V1 accepted
 //   - At and after MoEForkHeight (hardfork): only V2 accepted
 //   - At and after SaltedSeedForkHeight (hardfork): only V3 accepted
+//   - At and after Fp8ForkHeight (hardfork): only V4 accepted
 //   - At and after DenseOnlyForkHeight (softfork): V2/V3 certificates must
 //     carry a dense (non-MoE) proof
 //   - At and after RankPenaltyForkHeight (softfork): the proof's noise rank
 //     must meet a minimum and its jackpot must meet a difficulty bound scaled
-//     for that rank
+//     for that rank. V4 fp8 public data is a different encoding, so this
+//     rule is not applied to V4.
 //
 // These rules run here rather than alongside the proof verification in
 // checkProofOfWork because activation depends on the block height, which the
@@ -532,11 +572,8 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 	if cert == nil {
 		return ruleError(ErrCertificateMissing, "block has no certificate")
 	}
-	want := params.RequiredCertVersion(height)
-	if cert.Version() != want {
-		str := fmt.Sprintf("certificate version %d is not allowed at height %d "+
-			"(require version %d)", cert.Version(), height, want)
-		return ruleError(ErrDisallowedCertVersion, str)
+	if err := checkCertVersionAtHeight(cert, height, params); err != nil {
+		return err
 	}
 
 	if cert.IsMoE() && params.IsDenseOnlyForkActive(height) {
@@ -546,7 +583,8 @@ func CheckCertificateRules(header *wire.BlockHeader, cert wire.BlockCertificate,
 		return ruleError(ErrDisallowedCertVersion, str)
 	}
 
-	if params.IsRankPenaltyForkActive(height) && flags&BFNoPoWCheck != BFNoPoWCheck {
+	if cert.Version() != wire.CertificateVersionV4 &&
+		params.IsRankPenaltyForkActive(height) && flags&BFNoPoWCheck != BFNoPoWCheck {
 		if err := zkpow.CheckRankPenalty(header.Bits, cert.PublicDataBytes()); err != nil {
 			str := fmt.Sprintf("certificate fails the rank penalty rule at "+
 				"height %d (fork active from height %d): %v",

@@ -170,6 +170,50 @@ func TestSaltedSeedForkDisabled(t *testing.T) {
 	}
 }
 
+func TestFp8ForkActivation(t *testing.T) {
+	const forkHeight = int32(300)
+	p := Params{MoEForkHeight: 100, SaltedSeedForkHeight: 200, Fp8ForkHeight: forkHeight}
+
+	tests := []struct {
+		name        string
+		height      int32
+		wantActive  bool
+		wantVersion wire.CertificateVersion
+	}{
+		{"just before fork", forkHeight - 1, false, wire.CertificateVersionV3},
+		{"at fork height", forkHeight, true, wire.CertificateVersionV4},
+		{"after fork height", forkHeight + 1, true, wire.CertificateVersionV4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantActive, p.IsFp8ForkActive(tt.height))
+			require.Equal(t, tt.wantVersion, p.RequiredCertVersion(tt.height))
+		})
+	}
+}
+
+func TestFp8ForkDisabled(t *testing.T) {
+	p := Params{MoEForkHeight: 1, SaltedSeedForkHeight: 1, Fp8ForkHeight: 0}
+	for _, height := range []int32{1, 100, 1_000_000} {
+		require.False(t, p.IsFp8ForkActive(height))
+		require.Equal(t, wire.CertificateVersionV3, p.RequiredCertVersion(height))
+	}
+}
+
+func TestShippedNetworksFp8ForkHeights(t *testing.T) {
+	require.Zero(t, MainNetParams.Fp8ForkHeight, "mainnet must ship with Fp8ForkHeight disabled")
+	require.Equal(t, int32(67415), TestNetParams.Fp8ForkHeight,
+		"testnet FP8 fork height changed")
+	require.Greater(t, TestNetParams.Fp8ForkHeight, TestNetParams.SaltedSeedForkHeight,
+		"testnet FP8 fork must follow the salted-seed fork")
+	require.Equal(t, int32(150283), TestNet2Params.Fp8ForkHeight,
+		"testnet2 FP8 fork height changed")
+	require.Equal(t, int32(1), RegressionNetParams.Fp8ForkHeight,
+		"regtest must require V4 certificates from genesis")
+	require.Equal(t, int32(1), SimNetParams.Fp8ForkHeight,
+		"simnet must require V4 certificates from genesis")
+}
+
 // TestRankPenaltyForkActivation verifies the activation boundary of the
 // rank-penalty softfork, including the disabled case.
 func TestRankPenaltyForkActivation(t *testing.T) {
@@ -215,6 +259,28 @@ func TestShippedNetworksRankPenaltyOrdering(t *testing.T) {
 		}
 		require.GreaterOrEqualf(t, params.RankPenaltyForkHeight, params.MoEForkHeight,
 			"%s must not activate the rank-penalty fork before the MoE fork", name)
+	}
+}
+
+// TestShippedNetworksFp8ForkOrdering asserts that no shipped network activates the FP8 fork before the cutover it
+// supersedes: V4 replaces V3, or V2 on a network where the salted-seed fork is disabled.
+func TestShippedNetworksFp8ForkOrdering(t *testing.T) {
+	for name, params := range map[string]*Params{
+		"mainnet":  &MainNetParams,
+		"testnet":  &TestNetParams,
+		"testnet2": &TestNet2Params,
+		"regtest":  &RegressionNetParams,
+		"simnet":   &SimNetParams,
+	} {
+		if params.Fp8ForkHeight == 0 {
+			continue
+		}
+		predecessor := params.SaltedSeedForkHeight
+		if predecessor == 0 {
+			predecessor = params.MoEForkHeight
+		}
+		require.GreaterOrEqualf(t, params.Fp8ForkHeight, predecessor,
+			"%s must not activate the FP8 fork before the V3/V2 cutover it supersedes", name)
 	}
 }
 

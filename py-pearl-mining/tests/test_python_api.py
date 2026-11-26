@@ -3,6 +3,7 @@ Tests for the pearl_mining Python API (PyO3 bindings).
 """
 
 import base64
+import hashlib
 
 import pearl_mining
 import pytest
@@ -368,15 +369,19 @@ _DUMMY_EXPERT_COUNT = 2
 _DUMMY_TOP_K = 1
 
 
-def make_dummy_plain_proof(*, moe: bool) -> pearl_mining.PlainProof:
-    """Lightweight (non-verifiable) PlainProof for eligibility checks only."""
-    merkle_proof = pearl_mining.MerkleProof(
+def _dummy_merkle_proof() -> pearl_mining.MerkleProof:
+    return pearl_mining.MerkleProof(
         total_leaves=1,
         leaf_data=[b"\x00" * _DUMMY_LEAF_SIZE_BYTES],
         leaf_indices=[0],
         root=b"\x00" * _DUMMY_HASH_SIZE_BYTES,
         siblings=[],
     )
+
+
+def make_dummy_plain_proof(*, moe: bool) -> pearl_mining.PlainProof:
+    """Lightweight (non-verifiable) PlainProof for eligibility checks only."""
+    merkle_proof = _dummy_merkle_proof()
     matrix_proof = pearl_mining.MatrixMerkleProof(proof=merkle_proof, row_indices=[0])
     moe_params = (
         pearl_mining.MoEProofParams(
@@ -399,6 +404,73 @@ def make_dummy_plain_proof(*, moe: bool) -> pearl_mining.PlainProof:
         bt_merkle_proof=matrix_proof,
         moe=moe_params,
     )
+
+
+def make_dummy_plain_proof_v4(
+    ancestor_chain: list[pearl_mining.BlockHeader] | None = None,
+) -> pearl_mining.PlainProofV4:
+    """Lightweight (non-verifiable) PlainProofV4 for eligibility checks only."""
+    matrix_proof = pearl_mining.MatrixMerkleProof(proof=_dummy_merkle_proof(), row_indices=[0])
+    header = pearl_mining.BlockHeader(
+        pearl_mining.IncompleteBlockHeader(
+            version=0,
+            prev_block=b"\x00" * 32,
+            merkle_root=b"\x00" * 32,
+            timestamp=0,
+            nbits=DEFAULT_NBITS,
+        ),
+        b"\x00" * 32,
+    )
+    common = pearl_mining.CommonParams(
+        2048,
+        32,
+        pearl_mining.Quant.Fp8E4M3Prequant,
+        pearl_mining.Device.B200,
+    )
+    a = pearl_mining.OperandParams(32, pearl_mining.HashId.Blake3Chunk1024, 16)
+    b = pearl_mining.OperandParams(32, pearl_mining.HashId.Blake3Chunk1024, 16)
+    return pearl_mining.PlainProofV4(
+        header,
+        common,
+        a,
+        b,
+        values_a=matrix_proof,
+        values_b=matrix_proof,
+        scales_a=matrix_proof,
+        scales_b=matrix_proof,
+        ancestor_chain=ancestor_chain,
+    )
+
+
+class TestBlockHeader:
+    """The complete 108-byte header that keys B and links the ancestor chain."""
+
+    def test_wire_round_trip_and_hash(self):
+        raw = bytes(range(108))
+        header = pearl_mining.BlockHeader.from_bytes(raw)
+        assert pearl_mining.BlockHeader.SERIALIZED_SIZE == 108
+        assert bytes(header.to_bytes()) == raw
+        assert bytes(header.incomplete.to_bytes()) == raw[:76]
+        assert bytes(header.proof_commitment) == raw[76:]
+        # SHA256d of the wire bytes, reversed into prev_block's display order.
+        expected = hashlib.sha256(hashlib.sha256(raw).digest()).digest()[::-1]
+        assert bytes(header.block_hash()) == expected
+
+    def test_rejects_partial_headers(self):
+        with pytest.raises(ValueError):
+            pearl_mining.BlockHeader.from_bytes(bytes(76))
+        with pytest.raises(ValueError, match="32 bytes"):
+            pearl_mining.BlockHeader(create_test_block_header(), b"\x00" * 31)
+
+    def test_plain_proof_v4_carries_the_ancestor_chain(self):
+        assert make_dummy_plain_proof_v4().ancestor_chain == []
+        chain = [pearl_mining.BlockHeader.from_bytes(bytes([i]) * 108) for i in (1, 2)]
+        proof = make_dummy_plain_proof_v4(ancestor_chain=chain)
+        restored = pearl_mining.PlainProofV4.from_base64(proof.to_base64())
+        assert [bytes(h.to_bytes()) for h in restored.ancestor_chain] == [
+            bytes(h.to_bytes()) for h in chain
+        ]
+        assert bytes(restored.ancestor_header.to_bytes()) == bytes(proof.ancestor_header.to_bytes())
 
 
 class TestLegacyV1Deserialization:
@@ -449,8 +521,10 @@ class TestCertVersionEligibility:
             pearl_mining.check_cert_version_eligible(pearl_mining.CERT_VERSION_ZK_DENSE, moe)
 
     def test_unknown_versions_rejected(self):
+        # Valid certificate versions are 1..=3 (ZK dense, ZK MoE, plain FP8),
+        # mirroring the Rust `unknown_cert_versions_rejected` test.
         dense = make_dummy_plain_proof(moe=False)
-        for version in (0, 4):
+        for version in (0, 5, 2**32 - 1):
             with pytest.raises(ValueError, match="unknown certificate version"):
                 pearl_mining.check_cert_version_eligible(version, dense)
 
@@ -487,6 +561,43 @@ class TestCertVersionDispatchers:
         with pytest.raises(ValueError, match="crossover"):
             pearl_mining.generate_proof_for_cert_version(
                 pearl_mining.CERT_VERSION_ZK_DENSE, block_header, moe
+            )
+
+
+class TestPlainFP8CertVersion:
+    """Cert v4 rejects Int7 proofs; FP8 uses PlainProofV4. Int7 ZK dispatchers fail closed."""
+
+    def test_cert_version_exported(self):
+        assert pearl_mining.CERT_VERSION_PLAIN_FP8 == 4
+
+    def test_int7_rejected_at_v4(self):
+        dense = make_dummy_plain_proof(moe=False)
+        v4 = pearl_mining.CERT_VERSION_PLAIN_FP8
+        header = create_test_block_header()
+        with pytest.raises(TypeError, match="PlainProofV4"):
+            pearl_mining.check_cert_version_eligible(v4, dense)
+        with pytest.raises(TypeError, match="PlainProofV4"):
+            pearl_mining.verify_plain_proof_for_cert_version(v4, header, dense)
+
+    def test_v4_eligible_only_at_cert_4(self):
+        v4 = make_dummy_plain_proof_v4()
+        assert v4.min_cert_version == pearl_mining.CERT_VERSION_PLAIN_FP8
+        pearl_mining.check_cert_version_eligible(pearl_mining.CERT_VERSION_PLAIN_FP8, v4)
+        for cert_version in VALID_CERT_VERSIONS:
+            with pytest.raises(TypeError, match="PlainProof"):
+                pearl_mining.check_cert_version_eligible(cert_version, v4)
+
+    def test_zk_entry_points_not_implemented(self):
+        block_header = create_test_block_header()
+        dense = make_dummy_plain_proof(moe=False)
+        with pytest.raises(ValueError, match="PlainProofV4"):
+            pearl_mining.generate_proof_for_cert_version(
+                pearl_mining.CERT_VERSION_PLAIN_FP8, block_header, dense
+            )
+        proof = pearl_mining.ZKProof(b"\x00" * pearl_mining.PUBLICDATA_SIZE, b"")
+        with pytest.raises(NotImplementedError, match="PlainFP8"):
+            pearl_mining.verify_proof_for_cert_version(
+                pearl_mining.CERT_VERSION_PLAIN_FP8, block_header, proof
             )
 
 

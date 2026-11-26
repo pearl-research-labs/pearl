@@ -91,14 +91,17 @@ pub(crate) fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUn
     }
 }
 
+/// Subtrees with at most this many leaves hash with a plain serial recursion;
+/// below this size the rayon `join` task-spawn overhead outweighs the work.
+const SUBTREE_PARALLEL_CUTOFF: usize = 1 << 6;
+
 pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     leaves: &[Vec<F>],
 ) -> H::Hash {
     assert_eq!(leaves.len(), digests_buf.len() / 2 + 1);
-    if digests_buf.is_empty() {
-        // Base case: single leaf
-        H::hash_or_noop(&leaves[0])
+    if leaves.len() <= SUBTREE_PARALLEL_CUTOFF {
+        fill_subtree_serial::<F, H>(digests_buf, leaves)
     } else {
         // Layout is: left recursive output || left child digest
         //             || right child digest || right recursive output.
@@ -114,6 +117,30 @@ pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
             || fill_subtree::<F, H>(left_digests_buf, left_leaves),
             || fill_subtree::<F, H>(right_digests_buf, right_leaves),
         );
+
+        left_digest_mem.write(left_digest);
+        right_digest_mem.write(right_digest);
+        H::two_to_one(left_digest, right_digest)
+    }
+}
+
+/// Serial twin of `fill_subtree`: identical buffer layout and digests, but no
+/// rayon `join` — small subtrees avoid the per-node task-spawn overhead.
+fn fill_subtree_serial<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [MaybeUninit<H::Hash>],
+    leaves: &[Vec<F>],
+) -> H::Hash {
+    if digests_buf.is_empty() {
+        // Base case: single leaf
+        H::hash_or_noop(&leaves[0])
+    } else {
+        let (left_digests_buf, right_digests_buf) = digests_buf.split_at_mut(digests_buf.len() / 2);
+        let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
+        let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
+        let (left_leaves, right_leaves) = leaves.split_at(leaves.len() / 2);
+
+        let left_digest = fill_subtree_serial::<F, H>(left_digests_buf, left_leaves);
+        let right_digest = fill_subtree_serial::<F, H>(right_digests_buf, right_leaves);
 
         left_digest_mem.write(left_digest);
         right_digest_mem.write(right_digest);
@@ -315,5 +342,71 @@ pub(crate) mod tests {
         verify_all_leaves::<F, C, D>(leaves, 1)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cutoff_tests {
+    use super::*;
+    use crate::field::types::Field;
+    fn full_parallel_reference<F: RichField, H: Hasher<F>>(
+        digests_buf: &mut [MaybeUninit<H::Hash>],
+        leaves: &[Vec<F>],
+    ) -> H::Hash {
+        assert_eq!(leaves.len(), digests_buf.len() / 2 + 1);
+        if digests_buf.is_empty() {
+            // Base case: single leaf
+            H::hash_or_noop(&leaves[0])
+        } else {
+            // Layout is: left recursive output || left child digest
+            //             || right child digest || right recursive output.
+            // Split `digests_buf` into the two recursive outputs (slices) and two child digests
+            // (references).
+            let (left_digests_buf, right_digests_buf) =
+                digests_buf.split_at_mut(digests_buf.len() / 2);
+            let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
+            let (right_digest_mem, right_digests_buf) =
+                right_digests_buf.split_first_mut().unwrap();
+            // Split `leaves` between both children.
+            let (left_leaves, right_leaves) = leaves.split_at(leaves.len() / 2);
+
+            let (left_digest, right_digest) = plonky2_maybe_rayon::join(
+                || full_parallel_reference::<F, H>(left_digests_buf, left_leaves),
+                || full_parallel_reference::<F, H>(right_digests_buf, right_leaves),
+            );
+
+            left_digest_mem.write(left_digest);
+            right_digest_mem.write(right_digest);
+            H::two_to_one(left_digest, right_digest)
+        }
+    }
+
+    #[test]
+    fn cutoff_preserves_digests_and_initializes_every_slot() {
+        type F = crate::field::goldilocks_field::GoldilocksField;
+        type H = crate::hash::poseidon::PoseidonHash;
+        for lg_n in 0..=9 {
+            let n = 1usize << lg_n;
+            for width in [0, 1, 4, 7, 12] {
+                let leaves: Vec<Vec<F>> = (0..n)
+                    .map(|i| {
+                        (0..width)
+                            .map(|j| F::from_canonical_usize(i * 17 + j))
+                            .collect()
+                    })
+                    .collect();
+                let mut expected = vec![MaybeUninit::new(H::hash_no_pad(&[])); 2 * (n - 1)];
+                let mut actual = vec![MaybeUninit::new(H::hash_no_pad(&[F::ONE])); 2 * (n - 1)];
+                let expected_root = full_parallel_reference::<F, H>(&mut expected, &leaves);
+                let actual_root = fill_subtree::<F, H>(&mut actual, &leaves);
+                assert_eq!(actual_root, expected_root);
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    // SAFETY: both buffers were initialized with valid sentinel hashes before filling.
+                    assert_eq!(unsafe { actual.assume_init() }, unsafe {
+                        expected.assume_init()
+                    });
+                }
+            }
+        }
     }
 }

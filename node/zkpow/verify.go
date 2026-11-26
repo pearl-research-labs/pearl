@@ -17,6 +17,7 @@ package zkpow
 import "C"
 
 import (
+	"bytes"
 	"fmt"
 	"runtime"
 	"unsafe"
@@ -29,17 +30,27 @@ import (
 // exports matches the one it enforces.
 const MinNoiseRank = C.MIN_NOISE_RANK
 
+// Legacy proof-format checks already reject larger blobs. Retain the old limit
+// explicitly so raising the receipt limit is trivially consensus-neutral.
+const legacyMaxZKProofSize = 60000
+
 // ================================================================================
 // CERTIFICATE VERIFICATION
 // ================================================================================
 
 // VerifyCertificate performs sanity checks followed by cryptographic proof verification.
 // It returns an error if the certificate is invalid or does not match the header.
+// V4 certificates are verified with complete headers by the Rust verifier.
 // V3 certificates (CertificateV3) share the V2 layout but use the salted noise-seed derivation.
 // V2 certificates (CertificateV2) handle both MoE and non-MoE new proofs.
 // V1 certificates (CertificateV1) are verified using the V1 proof format.
 func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) error {
+	if err := checkProofSize(cert); err != nil {
+		return err
+	}
 	switch c := cert.(type) {
+	case *wire.CertificateV4:
+		return verifyCertificateV4(header, c)
 	case *wire.CertificateV3:
 		return verifyCertificateV3(header, c)
 	case *wire.CertificateV2:
@@ -49,6 +60,15 @@ func VerifyCertificate(header *wire.BlockHeader, cert wire.BlockCertificate) err
 	default:
 		return fmt.Errorf("unknown certificate type: %T", cert)
 	}
+}
+
+// checkProofSize preserves the historical size bound for versions before V4.
+func checkProofSize(cert wire.BlockCertificate) error {
+	if cert != nil && cert.Version() < wire.CertificateVersionV4 && len(cert.ProofBytes()) > legacyMaxZKProofSize {
+		return fmt.Errorf("v%d proof rejected: legacy proof data too large: %d bytes (max %d)",
+			cert.Version(), len(cert.ProofBytes()), legacyMaxZKProofSize)
+	}
+	return nil
 }
 
 // ================================================================================
@@ -110,7 +130,14 @@ func verifyCertificateV3(header *wire.BlockHeader, c *wire.CertificateV3) error 
 	return VerifyZKProofFFI(header, c, nil)
 }
 
-// VerifyZKProofFFI verifies a V2/V3-layout ZK proof via the Rust FFI.
+func verifyCertificateV4(header *wire.BlockHeader, cert *wire.CertificateV4) error {
+	return VerifyZKProofFFI(header, cert, nil)
+}
+
+// VerifyZKProofFFI verifies a ZK proof via the Rust FFI. nbitsOverride, when
+// set, is the difficulty the proof is judged against. Consensus passes nil and
+// the header's own bits are used. A pool passes its share target: the block
+// hash covers the header, so that target cannot be written into the header.
 func VerifyZKProofFFI(
 	header *wire.BlockHeader,
 	cert wire.BlockCertificate,
@@ -133,13 +160,15 @@ func VerifyZKProofFFI(
 	if len(publicData) == 0 { // avoid publicData[0] index below
 		return fmt.Errorf("empty public data")
 	}
+	if cert.Version() == wire.CertificateVersionV4 && len(publicData) > C.PUBLICDATA_MAX_SIZE {
+		return fmt.Errorf("fp8 public data too large: %d bytes (max %d)",
+			len(publicData), C.PUBLICDATA_MAX_SIZE)
+	}
 
 	proofData := cert.ProofBytes()
 	if len(proofData) == 0 { // avoid proofData[0] index below
 		return fmt.Errorf("empty proof data")
 	}
-
-	cBlockHeader := blockHeaderToC(header)
 
 	var cZKProof C.CZKProof
 	cZKProof.public_data_len = C.uintptr_t(len(publicData))
@@ -154,7 +183,16 @@ func VerifyZKProofFFI(
 	cZKProof.proof_blob_len = C.uintptr_t(len(proofData))
 	cZKProof.proof_blob = proofBlobPtr
 
+	if v4, ok := cert.(*wire.CertificateV4); ok {
+		nbits := header.Bits
+		if nbitsOverride != nil {
+			nbits = *nbitsOverride
+		}
+		return verifyV4FFI(header, v4, &cZKProof, nbits)
+	}
+
 	// Call Rust FFI
+	cBlockHeader := blockHeaderToC(header)
 	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
 	var result C.int32_t
 	switch cert.Version() {
@@ -184,6 +222,39 @@ func VerifyZKProofFFI(
 		return fmt.Errorf("verification system error: %s", msg)
 	default:
 		return fmt.Errorf("unknown verification result %d: %s", result, msg)
+	}
+}
+
+// verifyV4FFI judges an already-checked V4 proof at nbits. The Rust verifier
+// authenticates the ancestor headers itself.
+func verifyV4FFI(header *wire.BlockHeader, cert *wire.CertificateV4, proof *C.CZKProof, nbits uint32) error {
+	var headers bytes.Buffer
+	headers.Grow((1 + len(cert.AncestorHeaders)) * wire.MaxBlockHeaderPayload)
+	if err := header.Serialize(&headers); err != nil {
+		return err
+	}
+	for i := range cert.AncestorHeaders {
+		if err := cert.AncestorHeaders[i].Serialize(&headers); err != nil {
+			return err
+		}
+	}
+	headerBytes := headers.Bytes()
+
+	var errorBuf [C.ERROR_MSG_MAX_SIZE]C.char
+	result := C.verify_zk_proof_v4(
+		(*C.uint8_t)(unsafe.Pointer(&headerBytes[0])), C.uintptr_t(len(headerBytes)),
+		proof, C.uint32_t(nbits), &errorBuf[0])
+	msg := C.GoString(&errorBuf[0])
+
+	switch result {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("v4 proof rejected: %s", msg)
+	case 2:
+		return fmt.Errorf("v4 verification system error: %s", msg)
+	default:
+		return fmt.Errorf("unknown v4 verification result %d: %s", result, msg)
 	}
 }
 

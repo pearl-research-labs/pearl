@@ -2297,6 +2297,9 @@ func New(config *Config) (*BlockChain, error) {
 		return nil, AssertError("blockchain.New SaltedSeedForkHeight must not " +
 			"precede MoEForkHeight")
 	}
+	if config.ChainParams.Fp8ForkHeight < 0 {
+		return nil, AssertError("blockchain.New Fp8ForkHeight must be >= 0")
+	}
 
 	// Generate a checkpoint by height map from the provided checkpoints
 	// and assert the provided checkpoints are sorted by height as required.
